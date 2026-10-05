@@ -67,6 +67,31 @@ pub fn npm_tarball_url(base: &str, name: &str, version: &str) -> String {
     format!("{base}/{name}/-/{leaf}-{version}.tgz")
 }
 
+/// Whether `url` is the tarball URL a package manager derives on its own
+/// for `name@version` under the registry `base` — and so leaves out of its
+/// lock. pnpm drops `tarball:` and yarn berry drops the
+/// `::__archiveUrl=` binding only for such a URL (pnpm's
+/// `toLockfileResolution`, yarn's `isConventionalTarballUrl`); every other
+/// `dist.tarball` is recorded. Both spell a scope as `@scope/name` or
+/// `@scope%2fname`, and pnpm ignores the scheme. Yarn treats
+/// registry.npmjs.org and registry.yarnpkg.com as one registry.
+pub fn npm_tarball_is_conventional(base: &str, name: &str, version: &str, url: &str) -> bool {
+    fn canonical(url: &str) -> String {
+        let rest = url
+            .strip_prefix("https://")
+            .or_else(|| url.strip_prefix("http://"))
+            .unwrap_or(url);
+        let rest = match rest.strip_prefix("registry.yarnpkg.com") {
+            Some(tail) if tail.is_empty() || tail.starts_with('/') => {
+                format!("registry.npmjs.org{tail}")
+            }
+            _ => rest.to_string(),
+        };
+        rest.replace("%2f", "/").replace("%2F", "/")
+    }
+    canonical(url) == canonical(&npm_tarball_url(base.trim_end_matches('/'), name, version))
+}
+
 /// Run one of the extractors on the blocking pool.
 ///
 /// A service archive is written out in full — tens of thousands of small
@@ -1535,6 +1560,89 @@ fn walk_tar_gz(
 
 #[cfg(test)]
 mod tests {
+    use super::npm_tarball_is_conventional as conventional;
+
+    #[test]
+    fn conventional_tarball_url_matches_what_pms_derive() {
+        let base = "https://registry.npmjs.org";
+        assert!(conventional(
+            base,
+            "left-pad",
+            "1.3.0",
+            "https://registry.npmjs.org/left-pad/-/left-pad-1.3.0.tgz"
+        ));
+        // pnpm ignores the scheme; yarn equates npmjs and yarnpkg.
+        assert!(conventional(
+            base,
+            "left-pad",
+            "1.3.0",
+            "http://registry.npmjs.org/left-pad/-/left-pad-1.3.0.tgz"
+        ));
+        assert!(conventional(
+            base,
+            "left-pad",
+            "1.3.0",
+            "https://registry.yarnpkg.com/left-pad/-/left-pad-1.3.0.tgz"
+        ));
+        // Scoped names: `/` or `%2f` between scope and name.
+        assert!(conventional(
+            base,
+            "@s/p",
+            "1.0.0",
+            "https://registry.npmjs.org/@s/p/-/p-1.0.0.tgz"
+        ));
+        assert!(conventional(
+            base,
+            "@s/p",
+            "1.0.0",
+            "https://registry.npmjs.org/@s%2fp/-/p-1.0.0.tgz"
+        ));
+        // A trailing slash on the base changes nothing.
+        assert!(conventional(
+            "https://r.example/npm/",
+            "a",
+            "1.0.0",
+            "https://r.example/npm/a/-/a-1.0.0.tgz"
+        ));
+    }
+
+    #[test]
+    fn unconventional_tarball_urls_are_recorded() {
+        let base = "https://r.example";
+        // Another host, another path, another leaf, another version.
+        assert!(!conventional(
+            base,
+            "a",
+            "1.0.0",
+            "https://cdn.example/a/-/a-1.0.0.tgz"
+        ));
+        assert!(!conventional(
+            base,
+            "a",
+            "1.0.0",
+            "https://r.example/files/a/1.0.0.tgz"
+        ));
+        assert!(!conventional(
+            base,
+            "@s/p",
+            "1.0.0",
+            "https://r.example/download/@s/p/1.0.0/abc"
+        ));
+        assert!(!conventional(
+            base,
+            "a",
+            "1.0.0",
+            "https://r.example/a/-/a-1.0.1.tgz"
+        ));
+        // yarnpkg is only npmjs's alias, not a prefix match.
+        assert!(!conventional(
+            "https://registry.npmjs.org",
+            "a",
+            "1.0.0",
+            "https://registry.yarnpkg.com.evil/a/-/a-1.0.0.tgz"
+        ));
+    }
+
     use super::*;
     use crate::crawlers::go_crawler::encode_module_path;
 

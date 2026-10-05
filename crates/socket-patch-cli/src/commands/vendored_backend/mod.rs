@@ -16,6 +16,7 @@ use std::collections::HashMap;
 use std::path::Path;
 
 use socket_patch_core::manifest::schema::{PatchManifest, PatchRecord};
+use socket_patch_core::utils::group_commit::CommittedFile;
 use socket_patch_core::vendor::{
     save_state, RevertOpts, VendorServiceConfig, VendorState, VendorWarning,
 };
@@ -47,6 +48,9 @@ pub(crate) struct ApplyRequest<'a> {
     /// The npm half of a crawl this process already made over an untouched
     /// tree (see [`vendor_records_reusing`]).
     pub(crate) prior: Option<&'a NpmCrawlSnapshot>,
+    /// Receives every project file the run's group commit wrote, with the
+    /// bytes it held before (the eject's rollback undoes exactly these).
+    pub(crate) committed: Option<&'a mut Vec<CommittedFile>>,
 }
 
 impl<'a> VendoredBackend<'a> {
@@ -81,6 +85,7 @@ impl<'a> VendoredBackend<'a> {
             self.service,
             req.ledger,
             req.prior,
+            req.committed,
         ))
         .await
     }

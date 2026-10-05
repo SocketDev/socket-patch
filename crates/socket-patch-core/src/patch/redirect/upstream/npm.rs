@@ -384,6 +384,60 @@ async fn restore_classic(
     }
 }
 
+/// Whether a package manager derives `tarball` for `name@version` itself,
+/// and so leaves it out of the lock: it is the conventional URL under the
+/// registry the version document came from, or under the project's
+/// configured registry (`project_registry`; npmjs when unset), which is
+/// the one the package manager compares against.
+fn registry_derives_tarball(
+    project_registry: Option<&str>,
+    name: &str,
+    version: &str,
+    tarball: &str,
+) -> bool {
+    use crate::vendor::registry_fetch::{
+        npm_registry_base, npm_tarball_is_conventional, DEFAULT_NPM_REGISTRY,
+    };
+    [
+        npm_registry_base().as_str(),
+        project_registry.unwrap_or(DEFAULT_NPM_REGISTRY),
+    ]
+    .iter()
+    .any(|base| npm_tarball_is_conventional(base, name, version, tarball))
+}
+
+/// The `npm:` locator yarn berry writes for `name@version` resolved from the
+/// registry: bare when yarn derives `tarball` itself, else bound to it with
+/// `::__archiveUrl=<encodeURIComponent>`.
+fn berry_registry_locator(
+    project_registry: Option<&str>,
+    name: &str,
+    version: &str,
+    tarball: &str,
+) -> String {
+    if registry_derives_tarball(project_registry, name, version, tarball) {
+        format!("{name}@npm:{version}")
+    } else {
+        format!(
+            "{name}@npm:{version}::__archiveUrl={}",
+            crate::utils::uri::encode_uri_component(tarball)
+        )
+    }
+}
+
+/// The value of the last top-level `key` in a YAML settings file
+/// (pnpm-workspace.yaml, .yarnrc.yml), quotes removed.
+fn yaml_top_level_value(text: &str, key: &str) -> Option<String> {
+    use crate::formats::pnpm::workspace::top_level_key;
+    text.strip_prefix('\u{feff}')
+        .unwrap_or(text)
+        .lines()
+        .filter_map(top_level_key)
+        .rfind(|(k, _)| k == key)
+        .map(|(_, value)| value.trim_matches(['"', '\'']).to_string())
+        .filter(|value| !value.is_empty())
+}
+
 async fn restore_berry(
     view: &mut View<'_>,
     rel: &str,
@@ -543,6 +597,16 @@ async fn restore_berry(
             selectors,
         });
     }
+    // The registry's `dist.tarball` decides the restored locator: yarn binds
+    // a tarball URL off the conventional path as `::__archiveUrl=` (#817).
+    let wanted = hits
+        .iter()
+        .map(|h| (h.uuid.clone(), h.name.clone(), h.version.clone()))
+        .collect();
+    let dists = fetch_dists(&wanted, ctx, result).await;
+    let project_registry = yarnrc
+        .as_deref()
+        .and_then(|text| yaml_top_level_value(text, "npmRegistryServer"));
     let mut changed = false;
     let mut moved: Vec<String> = Vec::new();
     for Hit {
@@ -576,7 +640,14 @@ async fn restore_berry(
                 continue;
             }
         };
-        let resolution = format!("\n  resolution: \"{name}@npm:{version}\"").replace('$', "$$");
+        let Some(dist) = dists.get(&(name.clone(), version.clone())) else {
+            continue;
+        };
+        let resolution = format!(
+            "\n  resolution: \"{}\"",
+            berry_registry_locator(project_registry.as_deref(), &name, &version, &dist.tarball)
+        )
+        .replace('$', "$$");
         let mut block = resolution_re
             .replace(&blocks[idx], resolution.as_str())
             .into_owned();
@@ -645,6 +716,51 @@ async fn restore_berry(
 
 // ── pnpm-lock.yaml ───────────────────────────────────────────────────────────
 
+/// What decides whether pnpm records a resolution's `tarball:` in the lock
+/// at `rel`, read from its sibling settings files.
+struct PnpmTarballPolicy {
+    /// `lockfileIncludeTarballUrl` in pnpm-workspace.yaml (pnpm 10+, which
+    /// wins over `.npmrc`), else `lockfile-include-tarball-url` in `.npmrc`:
+    /// every resolution carries its tarball.
+    always: bool,
+    /// The `.npmrc` `registry`, which pnpm derives tarball URLs from.
+    registry: Option<String>,
+}
+
+async fn pnpm_tarball_policy(view: &mut View<'_>, rel: &str) -> PnpmTarballPolicy {
+    use super::super::npmrc::npmrc_top_level_value;
+
+    let dir_prefix = match rel.rsplit_once('/') {
+        Some((dir, _)) => format!("{dir}/"),
+        None => String::new(),
+    };
+    let workspace = view
+        .read(&format!("{dir_prefix}pnpm-workspace.yaml"))
+        .await
+        .ok()
+        .flatten();
+    let npmrc = view
+        .read(&format!("{dir_prefix}.npmrc"))
+        .await
+        .ok()
+        .flatten();
+    let npmrc_value = |key: &str| {
+        npmrc
+            .as_deref()
+            .and_then(|text| npmrc_top_level_value(text, key))
+            .map(|value| value.trim().to_string())
+    };
+    let always = workspace
+        .as_deref()
+        .and_then(|text| yaml_top_level_value(text, "lockfileIncludeTarballUrl"))
+        .or_else(|| npmrc_value("lockfile-include-tarball-url"))
+        .is_some_and(|value| value == "true");
+    PnpmTarballPolicy {
+        always,
+        registry: npmrc_value("registry").filter(|value| !value.is_empty()),
+    }
+}
+
 pub(crate) async fn restore_pnpm_locks(
     view: &mut View<'_>,
     pins: &[&HostedPin],
@@ -692,6 +808,7 @@ pub(crate) async fn restore_pnpm_locks(
             .map(|(_, u, n, v)| (u.clone(), n.clone(), v.clone()))
             .collect();
         let dists = fetch_dists(&wanted, ctx, &mut result).await;
+        let policy = pnpm_tarball_policy(view, rel).await;
         let mut splices: Vec<(std::ops::Range<usize>, String)> = Vec::new();
         let mut handled: Vec<String> = Vec::new();
         for entry in pnpm::entries(&text) {
@@ -705,17 +822,30 @@ pub(crate) async fn restore_pnpm_locks(
             if result.refused.contains_key(uuid) {
                 continue;
             }
-            let Some(integrity) = dists
-                .get(&(name.clone(), version.clone()))
-                .and_then(|d| d.integrity.clone())
-            else {
+            let Some(dist) = dists.get(&(name.clone(), version.clone())) else {
+                continue;
+            };
+            let Some(integrity) = dist.integrity.as_deref() else {
                 result.refuse(
                     uuid,
                     format!("the registry records no integrity for {name}@{version}"),
                 );
                 continue;
             };
-            splices.push((resolution.range.clone(), resolution.restore(&integrity)));
+            // pnpm records `tarball:` under lockfileIncludeTarballUrl and for
+            // a URL it cannot derive from the registry (#557).
+            let restored = if policy.always
+                || !registry_derives_tarball(
+                    policy.registry.as_deref(),
+                    name,
+                    version,
+                    &dist.tarball,
+                ) {
+                resolution.rewrite(integrity, &dist.tarball)
+            } else {
+                resolution.restore(integrity)
+            };
+            splices.push((resolution.range.clone(), restored));
             handled.push(uuid.clone());
         }
         // A refusal recorded after a splice was planned (a second instance
@@ -923,5 +1053,67 @@ pub(crate) async fn cleanup_side_config(
                 ));
             }
         }
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::{berry_registry_locator, registry_derives_tarball, yaml_top_level_value};
+
+    #[test]
+    fn project_registry_decides_a_mirrors_tarball_urls() {
+        // A metadata mirror that hands back the project registry's own URLs:
+        // the package manager derives them, so they stay out of the lock.
+        assert!(registry_derives_tarball(
+            Some("https://r.example/npm/"),
+            "a",
+            "1.0.0",
+            "https://r.example/npm/a/-/a-1.0.0.tgz"
+        ));
+        // No configured registry means npmjs (yarnpkg is its alias).
+        assert!(registry_derives_tarball(
+            None,
+            "@s/p",
+            "2.0.0",
+            "https://registry.yarnpkg.com/@s%2fp/-/p-2.0.0.tgz"
+        ));
+        assert!(!registry_derives_tarball(
+            Some("https://r.example/npm"),
+            "a",
+            "1.0.0",
+            "https://cdn.example/files/a-1.0.0.tgz"
+        ));
+    }
+
+    #[test]
+    fn berry_locator_binds_only_an_underived_tarball() {
+        assert_eq!(
+            berry_registry_locator(
+                Some("https://r.example"),
+                "a",
+                "1.0.0",
+                "https://r.example/a/-/a-1.0.0.tgz"
+            ),
+            "a@npm:1.0.0"
+        );
+        assert_eq!(
+            berry_registry_locator(
+                Some("https://r.example"),
+                "a",
+                "1.0.0",
+                "https://cdn.example/f/a.tgz"
+            ),
+            "a@npm:1.0.0::__archiveUrl=https%3A%2F%2Fcdn.example%2Ff%2Fa.tgz"
+        );
+    }
+
+    #[test]
+    fn yaml_settings_read_the_last_top_level_key() {
+        let text = "\u{feff}npmRegistryServer: \"https://a.example\"\nnpmScopes:\n  s:\n    npmRegistryServer: https://s.example\nnpmRegistryServer: 'https://b.example' # last wins\n";
+        assert_eq!(
+            yaml_top_level_value(text, "npmRegistryServer").as_deref(),
+            Some("https://b.example")
+        );
+        assert_eq!(yaml_top_level_value("packages: []\n", "registry"), None);
     }
 }
