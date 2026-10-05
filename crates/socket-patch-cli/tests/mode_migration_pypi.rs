@@ -66,7 +66,7 @@ fn stage_manifest(root: &Path) {
     stage_manifest_with(root, UUID, PATCHED);
 }
 
-/// [`stage_manifest`] for patch `uuid` producing `patched` bytes.
+/// [`stage_manifest`] for patch `uuid` whose patched `six.py` is `patched`.
 fn stage_manifest_with(root: &Path, uuid: &str, patched: &[u8]) {
     let after = compute_git_sha256_from_bytes(patched);
     let manifest = json!({ "patches": { PURL: {
@@ -296,6 +296,86 @@ lock-version = "2.1"
 python-versions = ">=3.9"
 content-hash = "4b42a89b7ff7b26511b06acdc458dbd85312e5083db8f212b017482bc68cdd01"
 "#;
+
+/// #765: a vendored requirements.txt picks up a superseding patch. The
+/// manifest moves `six` from patch A to patch B (different patched bytes);
+/// the next `vendor` must re-wire the requirements line to B's wheel in
+/// place, remove A's uuid dir (`vendor_stale_artifact_removed`) and exit 0.
+/// Before the fix it failed `pypi_requirements_already_vendored` (exit 1)
+/// and pip kept installing patch A. `vendor --revert` afterwards restores
+/// the user's original pin, so the carried-over ledger record is intact.
+#[tokio::test]
+async fn requirements_vendored_revendors_superseding_patch() {
+    const UUID_B: &str = "5c3e1a2b-7d4f-4e6a-9b8c-1d2e3f4a5b6d";
+    const PATCHED_B: &[u8] = b"# six\nVERSION = '1.16.0'\nSOCKET_PATCHED = 2\n";
+    for original in [
+        "idna==3.7\nsix==1.16.0\n".to_string(),
+        format!(
+            "idna==3.7 --hash=sha256:{}\nsix==1.16.0 ; python_version >= \"3\" \\\n    --hash=sha256:{WHEEL_SHA}\n",
+            "1".repeat(64)
+        ),
+    ] {
+        let (_tmp, root) = project();
+        std::fs::write(root.join("requirements.txt"), &original).unwrap();
+        vendor_project(&root, &["requirements.txt"]);
+        let wired_a = std::fs::read_to_string(root.join("requirements.txt")).unwrap();
+
+        stage_manifest_with(&root, UUID_B, PATCHED_B);
+        let (code, env) = run_cli(&root, &["vendor"], &[]);
+        assert_eq!(code, 0, "re-vendor to the superseding patch: {env:#}");
+        let rendered = env.to_string();
+        assert!(
+            !rendered.contains("pypi_requirements_already_vendored"),
+            "{env:#}"
+        );
+        assert!(
+            rendered.contains("vendor_stale_artifact_removed"),
+            "patch A's artifact is reclaimed: {env:#}"
+        );
+        let wired_b = std::fs::read_to_string(root.join("requirements.txt")).unwrap();
+        assert!(!wired_b.contains(UUID), "uuid A is gone:\n{wired_b}");
+        assert_eq!(
+            wired_b.matches(&format!(".socket/vendor/pypi/{UUID_B}/")).count(),
+            1,
+            "one six line, on patch B:\n{wired_b}"
+        );
+        assert_eq!(
+            wired_b.lines().count(),
+            wired_a.lines().count(),
+            "re-wired in place:\n{wired_a}\n{wired_b}"
+        );
+        assert_eq!(
+            wired_b.contains("--hash="),
+            original.contains("--hash="),
+            "hash mode kept:\n{wired_b}"
+        );
+        assert!(!root.join(format!(".socket/vendor/pypi/{UUID}")).exists());
+        let wheel_b = wired_b
+            .split_whitespace()
+            .find(|t| t.contains(UUID_B))
+            .unwrap();
+        assert!(root.join(wheel_b).is_file(), "patch B's wheel: {wheel_b}");
+        let ledger = std::fs::read_to_string(root.join(".socket/vendor/state.json")).unwrap();
+        assert!(ledger.contains(UUID_B) && !ledger.contains(UUID), "{ledger}");
+
+        // Re-running is settled: in sync, nothing rewritten.
+        let (code, env) = run_cli(&root, &["vendor"], &[]);
+        assert_eq!(code, 0, "{env:#}");
+        assert_eq!(
+            std::fs::read_to_string(root.join("requirements.txt")).unwrap(),
+            wired_b
+        );
+
+        let (code, env) = run_cli(&root, &["vendor", "--revert"], &[]);
+        assert_eq!(code, 0, "revert after the re-vendor: {env:#}");
+        assert_eq!(
+            std::fs::read_to_string(root.join("requirements.txt")).unwrap(),
+            original,
+            "the user's own pin is restored"
+        );
+        assert!(!root.join(format!(".socket/vendor/pypi/{UUID_B}")).exists());
+    }
+}
 
 #[tokio::test]
 async fn requirements_vendored_to_hosted() {
