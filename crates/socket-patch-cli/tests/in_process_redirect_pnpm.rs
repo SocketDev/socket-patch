@@ -1329,3 +1329,104 @@ async fn hosted_scan_resolves_inherited_lockfile_dir_from_cwd() {
 async fn hosted_scan_workspace_yaml_overrides_member_npmrc() {
     assert_workspace_configured_lock_refused("root-yaml-precedence").await;
 }
+
+/// #880: a workspace member with its own lock (`sharedWorkspaceLockfile:
+/// false`) is pinned through its own lock, but pnpm reads `trustLockfile`
+/// only from the workspace root's `pnpm-workspace.yaml`. Hosted mode used
+/// to create a nested `packages: ['.']` + `trustLockfile: true` file in the
+/// member, which pnpm ignores, so every root install failed on pnpm 11/12
+/// while the scan reported success. It now refuses before any write and
+/// names the root file; once that file trusts the lock, the member pins
+/// with no nested file.
+#[tokio::test]
+#[serial]
+async fn hosted_scan_from_pnpm_member_with_own_lock_never_nests_trust_config() {
+    let server = MockServer::start().await;
+    mock_discovery(&server).await;
+    mock_reference(&server).await;
+    mock_view(&server).await;
+    let tmp = tempfile::tempdir().unwrap();
+    let root = std::fs::canonicalize(tmp.path()).unwrap();
+    std::fs::write(
+        root.join("package.json"),
+        r#"{ "name": "root", "private": true }"#,
+    )
+    .unwrap();
+    let root_ws = root.join("pnpm-workspace.yaml");
+    let ws_before = "packages:\n  - 'packages/*'\nsharedWorkspaceLockfile: false\n";
+    std::fs::write(&root_ws, ws_before).unwrap();
+    let member = root.join("packages/a");
+    std::fs::create_dir_all(&member).unwrap();
+    write_pnpm_project(&member);
+    let lock = member.join("pnpm-lock.yaml");
+    let lock_before = std::fs::read_to_string(&lock).unwrap();
+
+    let (code, doc) = run_hosted_json(&member, &server.uri());
+    assert_eq!(code, Some(1), "{doc}");
+    assert_eq!(doc["status"], "error", "{doc}");
+    assert_eq!(
+        doc["errorCode"], "redirect_pnpm_settings_elsewhere",
+        "{doc}"
+    );
+    let message = doc["error"].as_str().unwrap_or_default();
+    assert!(
+        message.contains(&root_ws.display().to_string())
+            && message.contains("trustLockfile: true")
+            && message.contains("nothing was written"),
+        "the error names the root file and the key to add: {message}"
+    );
+    assert_eq!(std::fs::read_to_string(&lock).unwrap(), lock_before);
+    assert_eq!(std::fs::read_to_string(&root_ws).unwrap(), ws_before);
+    assert!(!member.join("pnpm-workspace.yaml").exists());
+
+    // With the key in the root file (what pnpm reads), the member pins and
+    // no nested settings file is created.
+    let ws_trusted = format!("{ws_before}trustLockfile: true\n");
+    std::fs::write(&root_ws, &ws_trusted).unwrap();
+    let (code, doc) = run_hosted_json(&member, &server.uri());
+    assert_eq!(code, Some(0), "{doc}");
+    assert_eq!(doc["redirect"]["redirected"], 1, "{doc}");
+    assert!(std::fs::read_to_string(&lock).unwrap().contains(HOSTED_URL));
+    assert!(
+        !member.join("pnpm-workspace.yaml").exists(),
+        "pnpm ignores a member's settings file; none is created"
+    );
+    assert_eq!(std::fs::read_to_string(&root_ws).unwrap(), ws_trusted);
+    let warnings = doc["redirect"]["warnings"].to_string();
+    assert!(
+        warnings.contains(&root_ws.display().to_string()) && warnings.contains("already carries"),
+        "the trust warning names the root file: {warnings}"
+    );
+}
+
+/// #880: an explicit `trustLockfile: false` in the root file is the user's
+/// call, respected as in a single project: the member pins, nothing is
+/// nested, and the warning names the root file.
+#[tokio::test]
+#[serial]
+async fn hosted_scan_from_pnpm_member_respects_root_trust_opt_out() {
+    let server = MockServer::start().await;
+    mock_discovery(&server).await;
+    mock_reference(&server).await;
+    mock_view(&server).await;
+    let tmp = tempfile::tempdir().unwrap();
+    let root = std::fs::canonicalize(tmp.path()).unwrap();
+    let root_ws = root.join("pnpm-workspace.yaml");
+    let ws = "packages:\n  - 'packages/*'\ntrustLockfile: false\n";
+    std::fs::write(&root_ws, ws).unwrap();
+    let member = root.join("packages/a");
+    std::fs::create_dir_all(&member).unwrap();
+    write_pnpm_project(&member);
+
+    let (code, doc) = run_hosted_json(&member, &server.uri());
+    assert_eq!(code, Some(0), "{doc}");
+    assert_eq!(doc["redirect"]["redirected"], 1, "{doc}");
+    assert!(!member.join("pnpm-workspace.yaml").exists());
+    assert_eq!(std::fs::read_to_string(&root_ws).unwrap(), ws);
+    let warnings = doc["redirect"]["warnings"].to_string();
+    assert!(
+        warnings.contains(&root_ws.display().to_string())
+            && warnings.contains("trustLockfile: false"),
+        "{warnings}"
+    );
+}
