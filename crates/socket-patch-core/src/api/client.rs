@@ -13,8 +13,8 @@ use serde::Serialize;
 use crate::api::ranking::severity_order as get_severity_order;
 use crate::api::ranking::{cmp_batch_infos, cmp_search_results};
 use crate::api::retry::{
-    is_retryable_status, jitter_sample as retry_jitter, parse_retry_after, ApiRetry,
-    ApiRetryPolicy, ApiTimeouts, RetryHooks,
+    is_retryable_status, is_retryable_transport, jitter_sample as retry_jitter, parse_retry_after,
+    ApiRetry, ApiRetryPolicy, ApiTimeouts, RetryHooks,
 };
 use crate::api::types::*;
 use crate::api::vendor_prefetch::VendorPrefetch;
@@ -515,9 +515,42 @@ impl ApiClient {
         let max = retry.policy.max_retries;
         let mut retries = 0u32;
         loop {
-            let resp = build().send().await.map_err(|e| {
-                ApiError::Network(format!("Network error: {}", network_error_detail(&e)))
-            })?;
+            let resp = match build().send().await {
+                Ok(resp) => resp,
+                Err(e) => {
+                    let network = || {
+                        ApiError::Network(format!("Network error: {}", network_error_detail(&e)))
+                    };
+                    // A connection dropped before the request went out
+                    // shares the 429 / 503 budget and window; every other
+                    // transport error is final at once.
+                    if !is_retryable_transport(&e) || retries >= max {
+                        return Err(network());
+                    }
+                    let next = retries + 1;
+                    let Some(delay) = retry.policy.delay(
+                        next,
+                        None,
+                        retry_jitter(retry.hooks.jitter_seed, label, next),
+                    ) else {
+                        return Err(network());
+                    };
+                    if !retry.reserve(delay) {
+                        debug_log(&format!(
+                            "{label} failed to connect; not retrying: the run's {} s retry window has closed",
+                            retry.policy.retry_window.as_secs()
+                        ));
+                        return Err(network());
+                    }
+                    debug_log(&format!(
+                        "{label} failed to connect ({}); retry {next}/{max} in {delay:?}",
+                        network_error_detail(&e)
+                    ));
+                    (retry.hooks.sleep)(delay).await;
+                    retries = next;
+                    continue;
+                }
+            };
             let status = resp.status();
             if !is_retryable_status(status) {
                 return Ok(Sent::Response(resp));
