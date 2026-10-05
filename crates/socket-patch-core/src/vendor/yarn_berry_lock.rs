@@ -1412,9 +1412,15 @@ fn root_workspace_name(blocks: &[LockBlock]) -> Option<String> {
 /// (`compressionLevel: 0 # keep yarn default` is `0`, #370). A `#` with no
 /// whitespace before it stays part of a plain value, as in YAML.
 pub(crate) fn yarnrc_compression_level(rc: &str) -> Option<&str> {
+    yarnrc_scalar(rc, "compressionLevel")
+}
+
+/// The top-level `.yarnrc.yml` scalar `key`, when set, read as
+/// [`yarnrc_compression_level`] describes.
+pub(crate) fn yarnrc_scalar<'a>(rc: &'a str, key: &str) -> Option<&'a str> {
     let rc = rc.strip_prefix('\u{feff}').unwrap_or(rc);
     rc.lines().find_map(|line| {
-        let rest = line.strip_prefix("compressionLevel:")?.trim();
+        let rest = line.strip_prefix(key)?.strip_prefix(':')?.trim();
         if let Some(quote) = rest.chars().next().filter(|c| matches!(c, '\'' | '"')) {
             if let Some(end) = rest[1..].find(quote) {
                 return Some(&rest[1..1 + end]);
