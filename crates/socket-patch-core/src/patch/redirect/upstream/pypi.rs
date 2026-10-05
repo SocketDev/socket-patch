@@ -804,27 +804,6 @@ fn restore_hatch_envs(
     }
 }
 
-/// Remove `keys`' last table's `allow-direct-references = true` (the Hatch
-/// permission the hosted rewrite set), then every table on the path that is
-/// left empty.
-fn drop_direct_reference_permission(doc: &mut DocumentMut, keys: &[&str]) -> bool {
-    fn walk(table: &mut dyn toml_edit::TableLike, keys: &[&str]) -> bool {
-        let Some((first, rest)) = keys.split_first() else {
-            return table.get("allow-direct-references").and_then(Item::as_bool) == Some(true)
-                && table.remove("allow-direct-references").is_some();
-        };
-        let Some(child) = table.get_mut(first).and_then(Item::as_table_like_mut) else {
-            return false;
-        };
-        let removed = walk(child, rest);
-        if removed && child.is_empty() {
-            table.remove(first);
-        }
-        removed
-    }
-    walk(doc.as_table_mut(), keys)
-}
-
 pub(crate) async fn restore_hatch(
     view: &mut View<'_>,
     pins: &[&HostedPin],
@@ -908,13 +887,16 @@ pub(crate) async fn restore_hatch(
         let external = docs
             .get("hatch.toml")
             .is_some_and(|(_, doc)| doc.contains_key("metadata"));
-        let (file, keys): (&str, &[&str]) = if external {
-            ("hatch.toml", &["metadata"])
+        let file = if external {
+            "hatch.toml"
         } else {
-            ("pyproject.toml", &["tool", "hatch", "metadata"])
+            "pyproject.toml"
         };
         if let Some((_, doc)) = docs.get_mut(file) {
-            drop_direct_reference_permission(doc, keys);
+            crate::utils::hatch::drop_direct_reference_permission(
+                doc,
+                crate::utils::hatch::permission_keys(external),
+            );
         }
     }
     let restored: BTreeSet<String> = restored

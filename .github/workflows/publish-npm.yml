@@ -197,10 +197,10 @@ jobs:
         # script, which compiles the `./schema` export with tsc — the
         # `typescript` devDependency must be installed for that build.
         #
-        # NOT `npm ci`: version-sync.sh refreshes package-lock.json while the
-        # release's platform packages are not yet on the registry, so npm
-        # records the optionalDependencies as hollow stubs ("optional": true,
-        # no version/resolved/integrity) and `npm ci` refuses that lockfile
+        # NOT `npm ci`: version-sync.sh (the offline stamp) drops the lock's
+        # platform-package entries for any other version, and the release's
+        # platform packages are not yet on the registry when it runs, so the
+        # lock has no entries for them and `npm ci` refuses it
         # ("lock file's ...@ does not satisfy ...@X.Y.Z"). `npm install`
         # tolerates the stubs and skips unresolvable optional platform
         # packages (verified for both the published and unpublished-version

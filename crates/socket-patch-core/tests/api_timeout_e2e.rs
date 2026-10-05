@@ -11,7 +11,7 @@
 
 use std::time::{Duration, Instant};
 
-use socket_patch_core::api::client::{ApiClient, ApiClientOptions, ApiError};
+use socket_patch_core::api::client::{ApiClient, ApiClientOptions, ApiError, BinaryBody};
 use socket_patch_core::api::retry::{
     ApiRetryPolicy, ApiTimeouts, RetryHooks, API_CONNECT_TIMEOUT, API_READ_TIMEOUT,
 };
@@ -228,6 +228,41 @@ async fn stalled_json_bodies_are_network_errors_on_both_clients() {
     );
 }
 
+/// Read a blob/diff body to the end.
+async fn drain(mut body: BinaryBody) -> Result<Vec<u8>, ApiError> {
+    let mut bytes = Vec::new();
+    while let Some(chunk) = body.chunk().await? {
+        bytes.extend_from_slice(chunk.as_ref());
+    }
+    Ok(bytes)
+}
+
+#[tokio::test]
+async fn stalled_binary_bodies_are_network_errors_on_both_clients() {
+    // The headers arrive, then the body stalls: the idle bound fires on the
+    // streamed chunk read, not just on the wait for headers.
+    let uri = stalled_json_body_server().await;
+    for proxy in [false, true] {
+        let api = client(&uri, proxy);
+        for (what, body) in [
+            ("fetch_blob", api.fetch_blob(HASH).await),
+            ("fetch_diff", api.fetch_diff(UUID).await),
+        ] {
+            let body = body
+                .unwrap_or_else(|e| panic!("{what} proxy={proxy}: headers arrived: {e:?}"))
+                .expect("200 serves a body");
+            let error = tokio::time::timeout(GUARD, drain(body))
+                .await
+                .unwrap_or_else(|_| panic!("{what} proxy={proxy}: stalled body unbounded"))
+                .expect_err("partial body must fail");
+            assert!(
+                matches!(&error, ApiError::Network(message) if message.contains("timed out")),
+                "{what} proxy={proxy}: {error:?}"
+            );
+        }
+    }
+}
+
 #[tokio::test]
 async fn completed_malformed_json_remains_a_parse_error() {
     let server = wiremock::MockServer::start().await;
@@ -260,11 +295,13 @@ async fn a_body_that_keeps_streaming_past_the_bound_still_arrives() {
             proxy,
         );
         let started = Instant::now();
-        let body = tokio::time::timeout(GUARD, api.fetch_blob(HASH))
-            .await
-            .expect("trickled blob still pending")
-            .expect("a streaming body must not time out")
-            .expect("200 is a blob");
+        let body = tokio::time::timeout(GUARD, async {
+            let body = api.fetch_blob(HASH).await?.expect("200 is a blob");
+            drain(body).await
+        })
+        .await
+        .expect("trickled blob still pending")
+        .expect("a streaming body must not time out");
         assert_eq!(body.len(), total, "proxy={proxy}");
         assert!(
             started.elapsed() > READ * 3,
