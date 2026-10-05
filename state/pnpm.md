@@ -1,6 +1,6 @@
 [agent] Progress ledger for the scheduled pnpm bug-hunt routine (label pm:pnpm).
 
-Last updated: 2026-10-05 (run 19), main `045d7ec`, latest release 4.0.0.
+Last updated: 2026-10-05 (run 20), main `045d7ec`, latest release 4.0.0.
 
 Method: real pnpm installs. Hosted, vendored and global agent mode run against a local Python mock of the patch API (batch, by-package, view with inline blobs, package grant, hosted tarball, `/registry/<name>/<ver>` mirror). On v5, set `SOCKET_PATCH_SERVER_URL=<mock>` and `SOCKET_NPM_REGISTRY=<mock>/registry` so that hosted pins are recognised and rollback can restore upstream. The oracle is a marker prepended to `index.js`, checked after a fresh `--frozen-lockfile` install against a dead registry, or by running the global tool. The repo's pinned matrix (`.github/workflows/pnpm-compatibility.yml`) already covers plain hosted and vendored installs on pnpm 1–12. This ledger tracks what it doesn't.
 
@@ -186,6 +186,19 @@ Run 19 additions (main `045d7ec`, Linux):
 | 11.28.3 | pass (two-doc lock too) | untested | untested | untested | untested | pass | untested | untested | untested |
 | 12.8.1 | pass (two-doc, alias, conflict markers, `--offline`) | pass / pass | fail #590 | pass / pass | pass | pass | pass / pass | pass / pass | pass (`lock_held`, 3/3) |
 
+Run 20 additions (main `045d7ec`, Linux):
+
+| pnpm (lock) | Vendored parent + vendored dep (`debug`→`ms`): `remove <parent>` / takeover → hosted / `rollback` | `remove <child>` (control) | Hosted parent + dep: remove parent / rollback | Mixed-case names (`Base64`, `JSONStream`): hosted / agent / vendored | User parent-selector / range-selector override (vendored) | Agent `symlink=false` / `hoist=false` | `list -g` |
+| --- | --- | --- | --- | --- | --- | --- | --- |
+| 7.33.7 (5.4) | fail #830 / fail #830 / fail #830 | untested | untested | pass / pass / pass (in place) | untested | untested | n/a |
+| 8.15.9 (6.0) | fail #830 / fail #830 / fail #830 | untested | untested | pass / pass / pass (in place); rollback byte-exact | untested | untested | n/a |
+| 9.15.9 | fail #830 / fail #830 / fail #830 (`vendor --revert` exit 0, residue) | pass | pass / pass | pass / pass / pass; rollback byte-exact | refuses (`vendor_override_conflict`) / refuses | pass / pass | n/a |
+| 10.34.5 | fail #830 / fail #830 / fail #830 | untested | untested | pass / pass / pass | refuses / refuses | pass / pass | n/a |
+| 11.28.3 | fail #830 / fail #830 / fail #830 | untested | untested | pass / pass / pass | untested | untested | pass |
+| 12.8.1 | fail #830 / fail #830 / fail #830 (`vendor --revert` exit 0, residue) | pass | pass / pass | pass / pass / pass; rollback byte-exact | untested / refuses | pass / pass | pass |
+
+#830 isn't a regression: release 4.0.0's `remove <parent>` leaves the same broken lock. Run 20 also: a hosted scan SIGKILLed mid-run leaves no residue (12.8.1); agent + `list` with `sharedWorkspaceLockfile: false` pass (9 / 12); global `rc` `modules-dir` reproduces #661 on 10.34.5 (PR #698's `.modules.yaml` probe covers it).
+
 Run 19 also: hosted `pnpm deploy` on 11.28.3 pass; vendored workspace + `pnpm deploy` on 9.15.9 pass; agent `vex` on a lockfile-only checkout declines (9 / 12).
 
 Default isolated linker + alias: pass on 7.33.7 / 9.15.9 / 10.34.5 / 11.28.3 / 12.8.1 (one shared `.pnpm` copy).
@@ -220,7 +233,8 @@ Global mode (`-g`, v5 main `2463257`):
 6. #362 GVS transitive and #435 global `-g`: re-check exit codes under #555's skip semantics on 11.28.3 / 12.8.1.
 7. `package-import-method=clone` on reflink (needs CI).
 8. #556 follow-ups: merging branch lockfiles after a hosted pin, and agent `vex` on the branch.
-9. Re-verify #360, #362, #435, #466, #492, #556, #557, #590 (PR #598; include member-cwd `list`), #601 (PR #605), #626 (PR #634), #627 (pnpm vendored symlinks, PR #802), #662 (PR #810), #633, #636 (PR #672; include the takeover path from the run 16 comment), #661 / #696 (PR #698), #713, #714, #734, #754, #756 and #778 when fixes land.
+8a. #830 follow-ups: a three-level vendored chain, a `scan --mode vendored` re-run over the broken `remove` state, and the pnpm 7/8 workspace dialect.
+9. Re-verify #830, #360, #362, #435, #466, #492, #556, #557, #590 (PR #598; include member-cwd `list`), #601 (PR #605), #626 (PR #634), #627 (pnpm vendored symlinks, PR #802), #662 (PR #810), #633, #636 (PR #672; include the takeover path from the run 16 comment), #661 / #696 (PR #698), #713, #714, #734, #754, #756 and #778 when fixes land.
 10. Vendored on Windows and macOS (autocrlf: expect the `vendor_lockfile_crlf_unsupported` refusal; check that hosted handles the same checkout; hosted CRLF passes on Linux).
 
 ## Known non-bugs
@@ -278,3 +292,6 @@ Global mode (`-g`, v5 main `2463257`):
 - Hosted `vex` recognises a hosted pin only when the tarball URL is on the patch-server origin AND carries the patch uuid as a path segment. Mock fixtures need `/…/<uuid>/<file>.tgz` URLs.
 - Agent → hosted takeover keeps the agent-mode manifest beside the new hosted pin (`list` shows each patch twice). The layers coexist, and `rollback` unwinds both. Agent → vendored migrates the manifest record out, as documented.
 - Vendored `list` keeps listing a package after `pnpm remove <pkg>`, because pnpm keeps the override and the wiring is still live. `vex` omits it.
+- Fixture note: `scan -g` also covers the npm global root, so it patches npm's own bundled deps (for example `/opt/node22/lib/node_modules/npm/node_modules/jsonparse`). That isn't pnpm-specific, but it can make a pnpm-global copy look `already_patched` in `apply -g` output.
+- Vendored refuses a user parent-selector (`a>b`) or range-selector (`b@<2`) override for the target with `vendor_override_conflict` and writes nothing. The detail text is slightly off (it mentions an exact-pin takeover, or "package.json" on pnpm 12), which is cosmetic.
+- An API that answers with lowercased npm purls for a mixed-case installed name (`Base64`) isn't matched by agent apply (`package_not_installed`). There's no evidence the real API lowercases, so treat it as hypothetical (run 20).
