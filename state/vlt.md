@@ -1,6 +1,6 @@
 [agent] Progress ledger for the scheduled vlt bug-hunt routine (label pm:vlt).
 
-Last updated: 2026-10-03 (run 11), main `045d7ec`, latest release 4.0.0 (no vlt support; previous 3.3.0). Newest vlt: 1.3.6 (2026-10-03; manifest-picking change only, no lock-format change). Locally, run `vlt ci --allow-scripts :scripts` (otherwise vlt POSTs to api.socket.dev and the sandbox's 403 fails `ci` on 1.0.10 / 1.2.0; see #448). Run 9 mock adds `left-pad@1.2.0` (`'old'`) for bump tests. The run-11 mock adds a `time` map and `WDEP=` (wrapper's left-pad spec) for version-changing modifiers.
+Last updated: 2026-10-05 (run 12), main `6811b4e`, latest release 4.0.0 (no vlt support; previous 3.3.0). Newest vlt: 1.3.6 (2026-10-03; manifest-picking change only, no lock-format change). Locally, run `vlt ci --allow-scripts :scripts` (otherwise vlt POSTs to api.socket.dev and the sandbox's 403 fails `ci` on 1.0.10 / 1.2.0; see #448). Run 9 mock adds `left-pad@1.2.0` (`'old'`) for bump tests. The run-11 mock adds a `time` map and `WDEP=` (wrapper's left-pad spec) for version-changing modifiers. The run-12 mock (rebuilt from the run-2 mock) adds `ADD=1` (the patch adds `lib/extra/deep/new.js`) and `EMPTYDIR=1` (the tarball ships empty dir entries), plus `CDN=1` and `bundler`. Wait for ports 18555/18556 to free up before restarting the mock: a stale mock silently serves the previous mode.
 
 Method: real vlt installs (`scripts/install-vlt.sh`) against a local Node mock of the npm registry plus the patch API. It's a pure-JS tar writer, so it runs on every OS. The registry is on :18555 and the patch server on :18556 via `SOCKET_PATCH_SERVER_URL`; set `SOCKET_NPM_REGISTRY` to the registry for v5 rollback. The oracle is `require('left-pad')` printing `patched` / `pristine`. The 3-OS probe scripts are in the run-2 workflow (run 36803186961), the run-3 global-mode workflow (run 36834317384) and the run-4 bundled-copy workflow (run 36871535059, whose mock adds a `bundler@1.0.0` that bundles left-pad). Run 6 mock adds `PKG=` (scoped names) and `CDN=1` (non-conventional `dist.tarball`); the patch artifact leaf must be the unscoped basename. The mock's `/patches/batch` must answer only for purls in the request body, or `scan -g` shows false hits. CI already runs the capstones and the native backtest on 57 releases × 3 OS.
 
@@ -23,6 +23,7 @@ Method: real vlt installs (`scripts/install-vlt.sh`) against a local Node mock o
 | Linux | 1.0.0-rc.34 / 1.0.5 / 1.1.1 / 1.3.0 | pass (run-8 probe matrix; 1.3.0 without `tar.br`) | pass (run-8 probe matrix) | pass (run-8) | first local runs of these versions |
 | Linux | 1.3.6 | run-2 matrix: pass (run 10); graph-modifier DepIDs (incl. `:semver()` / `:v()` selectors, plus a direct copy): pass; root peer+dev and peer-only: pass; #372 still fails with `tar.br` | run-2 matrix: pass; modifier variant and peer-only root: refused `vendor_lock_entry_unsupported` (documented); peer+dev root: pass | run-2 matrix, modifier variant (+ direct copy), peer-only root: pass | new release |
 | Linux | 1.2.0 / 1.3.6 | version-changing modifier (1.2.0→1.3.0 via `:root > #wrapper > #left-pad`): scan / ci / vex / rollback, plus `get` / `repair` / `remove` (1.3.6): pass (run 11); modifier down to 1.2.0 + direct 1.3.0: pass | modifier-up refused (documented); modifier-down + direct, workspace chain (b → a@workspace:* → target), catalog bump after vendoring: pass (1.3.6) | modifier up / down, re-run: pass | run 11 |
+| Linux | 1.2.0 / 1.3.6 | run 12 (main `6811b4e`): #601 fixed; #521 still fails (cold `ci` 404); npm alias `lp`→left-pad: pass; pin survives `vlt install <other>` / `vlt uninstall <direct>`, rollback = fresh lock: pass; patch adds a file in a new dir: pass | alias, added-file: pass | added file in a new dir, rollback / remove prune exactly: pass; **added file under a shipped empty dir: fail #862** (rollback deletes the shipped dirs); linked workspace member of the same name@version refused (#634): pass, JSON gap is #424 | run 12 |
 | Linux | 1.3.5 | prerelease target, object-form workspace groups, `catalog:` specs, peer-shape `list` / `remove`: pass (run 8) | prerelease, object workspaces, `catalog:`, peer-shape takeover refusal: pass; named catalogs `catalog:<name>` in workspaces: pass (run 9, also 1.2.0) | prerelease, object workspaces, `catalog:`: pass | |
 
 ### Bundled copies (a package bundling the patched name@version; vlt-lock.json never records the bundled copy)
@@ -30,7 +31,7 @@ Method: real vlt installs (`scripts/install-vlt.sh`) against a local Node mock o
 | OS | vlt 1.0.10 | vlt 1.2.0 | vlt 1.3.3 |
 | --- | --- | --- | --- |
 | Linux / macOS / Windows | hosted + vendored: **fail #471** before #472. Linux on main `b1f9818`: pass (skip warning, vex refuses) | same as 1.0.10 | same as 1.0.10 (1.3.5 also passes on Linux) |
-| Linux (agent: bundled copy plus a normal install of the same name@version) | **fail #601** | **fail #601** | **fail #601** (1.3.5 too; pnpm 10.28 too). Bundled-only: pass |
+| Linux (agent: bundled copy plus a normal install of the same name@version) | fail #601 before #605 | pass on main `6811b4e` (run 12) | fail #601 before #605 (1.3.6 passes on `6811b4e`) |
 
 ### Global mode (`-g`; vlt has no global install, so this is an npm global prefix with a vlt project in the cwd)
 
@@ -42,16 +43,14 @@ Method: real vlt installs (`scripts/install-vlt.sh`) against a local Node mock o
 
 ## Backlog
 
-1. vlt 1.3.6 on macOS / Windows, plus 1.3.5 frozen / workspaces / catalog cells there (probe branches are blocked).
-2. #601 on macOS / Windows, with a bundled copy at a different version and a nested bundle; re-test once #605 merges.
-3. #562 (arch-audit, fix PR #574): re-run the 3-tuple / `config.registry` and #521 restore cells once it merges.
-4. #521 follow-ups: re-test once fixed, macOS / Windows, the 3-tuple project, and the hosted→vendored takeover with a non-conventional tarball.
-5. #434 (closed by #442): Windows with the default prefix. The rest of the **maintainer `-g` request** (20261001T040000Z): the Windows unwritable prefix, and the macOS / Windows re-check of `rollback -g` after #446 and of `vendor -g` after #499.
-6. #372 follow-ups once fixed: a mixed brotli / non-brotli lock, a brotli dev node (flag 6) heal, the restore putting bit 4 back, and VEX on brotli nodes.
+1. #862 once it's fixed: shipped empty dirs, nested new dirs under a shipped dir, `remove`, macOS / Windows.
+2. #372 once PR #820 merges: mixed brotli / non-brotli lock, brotli dev node (flag 6) heal, restore puts bit 4 back, VEX on brotli nodes.
+3. #521 once it's fixed (#818's derived-URL rule wasn't applied to `upstream/vlt.rs:266`), plus the 3-tuple `config.registry` restore after #574, and the hosted→vendored takeover with a non-conventional tarball.
+4. #603-style store peer-variant vex (`~peer.<hex>` ×2) on vlt after #605's `vex_consumed` rewrite; nested bundles and a bundled copy at a different version.
+5. vlt 1.3.6 on macOS / Windows, plus 1.3.5 frozen / workspaces / catalog cells there (probe branches are blocked).
+6. #434 (closed by #442): Windows with the default prefix. The rest of the **maintainer `-g` request** (20261001T040000Z): the Windows unwritable prefix, and the macOS / Windows re-check of `rollback -g` after #446 and of `vendor -g` after #499.
 7. vlt 1.3.6 `pickManifest` `time`-map skip: a packument with missing `time` entries against hosted pins and vendored specs.
-8. A hosted pin on a modifier DepID plus `vlt install <other>` / `vlt update` re-saves.
-9. Perf: #579 (vlt/hosted wall +127% after #472) isn't a bughunt issue; just watch it.
-10. Probe branches are blocked: branch deletion is denied, and 3 old `bughunt/vlt/*` branches still need a maintainer to delete them.
+8. Probe branches are blocked: branch deletion is denied, and 3 old `bughunt/vlt/*` branches still need a maintainer to delete them.
 
 ## Known non-bugs
 
@@ -83,3 +82,5 @@ Method: real vlt installs (`scripts/install-vlt.sh`) against a local Node mock o
 - Vendored refuses graph-modifier variants (`~<selector>` DepID suffix) and root peer-only edges with `vendor_lock_entry_unsupported` ("use --mode hosted"). That's loud and fail-closed; hosted and agent handle both.
 - Vendored `rollback` after a refused vendored scan returns "Manifest not found": nothing was written.
 - Vendoring a `catalog:` member rewrites its spec to `file:`, so a later catalog bump doesn't move it until rollback restores `catalog:` (consistent with vendored owning the spec).
+- Agent mode refuses a `node_modules` link to a first-party workspace member / `file:` dir that shares the patched name@version (#634, #626). That's intended. The missing failure count in `scan --json` is #424 (generic, not vlt).
+- A rerun that "passes" right after switching mock modes can be a stale mock still bound to the port. That's a harness artifact.
