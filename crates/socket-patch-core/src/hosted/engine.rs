@@ -584,6 +584,12 @@ pub async fn read_candidate_files(
         && crate::patch::redirect::gradle::gradle_build_present(&out.files)
     {
         read_gradle_files(view, unreadable, &mut out).await;
+        // The Gradle planner refuses a build over a file it cannot read as
+        // text and the scan carries on, so such a file is not a reason to
+        // refuse the whole run (#721).
+        let gradle_unreadable = &out.gradle_unreadable;
+        out.undecodable_reads
+            .retain(|rel| !gradle_unreadable.contains(rel));
     }
     out.symlinked_reads.sort();
     out.symlinked_reads.dedup();
@@ -2462,6 +2468,14 @@ mod tests {
                 read.gradle_unreadable.contains("settings.gradle"),
                 "{:?}",
                 read.gradle_unreadable
+            );
+            // Only the Gradle build is refused, not the whole run (#721).
+            assert!(
+                !read
+                    .undecodable_reads
+                    .contains(&"settings.gradle".to_string()),
+                "{:?}",
+                read.undecodable_reads
             );
             assert!(done.rewrite.refused_gradle_uuids.contains(GRADLE_UUID));
             assert!(
