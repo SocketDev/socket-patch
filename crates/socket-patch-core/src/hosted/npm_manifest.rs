@@ -46,7 +46,7 @@ pub async fn fetch_hosted_npm_manifest(
 #[cfg(test)]
 mod tests {
     use super::*;
-    use crate::patch::redirect::vlt_preflight::sha512_sri;
+    use crate::utils::digest::sha512_sri_of;
 
     fn tgz(entries: &[(&str, &[u8])]) -> Vec<u8> {
         let mut builder = tar::Builder::new(flate2::write::GzEncoder::new(
@@ -67,7 +67,7 @@ mod tests {
     fn decodes_the_manifest_and_checks_the_sha512() {
         let manifest = br#"{"name":"uuid","bin":{"uuid":"./dist/bin/uuid"}}"#;
         let bytes = tgz(&[("package/package.json", manifest)]);
-        let sri = sha512_sri(&bytes);
+        let sri = sha512_sri_of(&bytes);
         assert_eq!(
             decode_hosted_npm_manifest(&bytes, Some(&sri))
                 .unwrap()
@@ -78,7 +78,7 @@ mod tests {
             decode_hosted_npm_manifest(&bytes, None).unwrap().as_bytes(),
             manifest
         );
-        let other = sha512_sri(b"other");
+        let other = sha512_sri_of(b"other");
         assert!(decode_hosted_npm_manifest(&bytes, Some(&other))
             .unwrap_err()
             .contains("sha512"));

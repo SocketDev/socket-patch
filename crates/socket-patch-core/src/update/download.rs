@@ -18,8 +18,6 @@
 use std::io::Read;
 use std::path::{Path, PathBuf};
 
-use sha2::{Digest, Sha256};
-
 use super::release::{UpdateEndpoints, UpdateTimeouts};
 use super::UpdateError;
 use crate::utils::http::read_capped;
@@ -345,7 +343,7 @@ pub async fn download_and_stage(
     let archive = fetch_archive(endpoints, timeouts, version, asset).await?;
 
     // 3. Checksum BEFORE extraction.
-    let actual_sha = hex::encode(Sha256::digest(&archive));
+    let actual_sha = crate::utils::digest::sha256_hex_of(&archive);
     if actual_sha != expected_sha {
         return Err(UpdateError::ChecksumMismatch {
             asset: asset.to_string(),
