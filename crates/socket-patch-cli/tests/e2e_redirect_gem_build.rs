@@ -774,7 +774,7 @@ async fn redirect_scanned_project(
             server.uri()
         ),
         Driver::ScanVexSemicolonJoinedDeclaration => format!(
-            "source \"{}/upstream\"\n\ngem \"{DEP}\"; gem \"{TRANSITIVE}\"\n",
+            "source \"{}/upstream\"\n\ngem \"{DEP}\", \"{DEP_VERSION}\"; gem \"{TRANSITIVE}\", \"1.0.0\"\n",
             server.uri()
         ),
         Driver::ScanVexTrailingSemicolonDeclaration => format!(
