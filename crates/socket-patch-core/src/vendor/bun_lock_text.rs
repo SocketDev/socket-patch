@@ -27,11 +27,17 @@ const SUPPORTED_LOCK_VERSIONS: [u64; 3] = [0, 1, 2];
 /// install reads, plus the copy Bun mirrors at the top of a text `bun.lock`
 /// (`  "patchedDependencies": {` … `  },`, one `"key": "path"` line each).
 /// Either source alone is enough: a key missing from one is still a patch
-/// Bun applies. A manifest that is not JSON, or a lock section out of Bun's
-/// emitted shape, contributes only the keys it spells plainly.
+/// Bun applies. The manifest is read as Bun reads it, comments and trailing
+/// commas allowed ([`strip_jsonc`]); one Bun cannot parse either, and a lock
+/// section out of Bun's emitted shape, contribute only what they spell
+/// plainly.
 pub(crate) fn patched_dependency_keys(manifest: Option<&str>, lock: Option<&str>) -> Vec<String> {
     let mut keys: Vec<String> = manifest
-        .and_then(|text| serde_json::from_str::<serde_json::Value>(text).ok())
+        .and_then(|text| {
+            serde_json::from_str::<serde_json::Value>(text)
+                .or_else(|_| serde_json::from_str(&strip_jsonc(text)))
+                .ok()
+        })
         .and_then(|value| match value.get("patchedDependencies") {
             Some(serde_json::Value::Object(map)) => Some(map.keys().cloned().collect()),
             _ => None,
@@ -50,6 +56,58 @@ pub(crate) fn patched_dependency_keys(manifest: Option<&str>, lock: Option<&str>
         }
     }
     keys
+}
+
+/// `text` with the JSONC Bun accepts in a `package.json` removed: `//` and
+/// `/* */` comments and a comma before a closing `}` or `]`, all outside
+/// strings. Everything else, strings included, is kept byte for byte.
+fn strip_jsonc(text: &str) -> String {
+    let mut out = String::with_capacity(text.len());
+    let mut chars = text.chars().peekable();
+    let mut in_string = false;
+    while let Some(c) = chars.next() {
+        if in_string {
+            out.push(c);
+            if c == '\\' {
+                if let Some(escaped) = chars.next() {
+                    out.push(escaped);
+                }
+            } else if c == '"' {
+                in_string = false;
+            }
+            continue;
+        }
+        match c {
+            '"' => {
+                in_string = true;
+                out.push(c);
+            }
+            '/' if chars.peek() == Some(&'/') => {
+                while chars.peek().is_some_and(|&n| n != '\n') {
+                    chars.next();
+                }
+            }
+            '/' if chars.peek() == Some(&'*') => {
+                chars.next();
+                let mut prev = '\0';
+                for n in chars.by_ref() {
+                    if prev == '*' && n == '/' {
+                        break;
+                    }
+                    prev = n;
+                }
+            }
+            '}' | ']' => {
+                let kept = out.trim_end_matches(char::is_whitespace).len();
+                if out[..kept].ends_with(',') {
+                    out.remove(kept - 1);
+                }
+                out.push(c);
+            }
+            _ => out.push(c),
+        }
+    }
+    out
 }
 
 /// The `patchedDependencies` key that makes Bun apply a project-authored
@@ -613,6 +671,19 @@ mod tests {
             Some("left-pad")
         );
         assert!(patched_dependency_keys(Some("not json"), None).is_empty());
+        // Bun reads a JSONC manifest: comments and trailing commas, with
+        // the same characters inside strings left alone.
+        let jsonc = "{\n  // a comment, \"x\": 1\n  \"name\": \"a//b /* c */\",\n  /* block\n  */\n  \"patchedDependencies\": {\n    \"left-pad@1.3.0\": \"patches/x,}.patch\",\n  },\n}\n";
+        assert_eq!(
+            patched_dependency_keys(Some(jsonc), None),
+            vec!["left-pad@1.3.0"]
+        );
+        let stripped: serde_json::Value = serde_json::from_str(&strip_jsonc(jsonc)).unwrap();
+        assert_eq!(stripped["name"], "a//b /* c */");
+        assert_eq!(
+            stripped["patchedDependencies"]["left-pad@1.3.0"],
+            "patches/x,}.patch"
+        );
         assert!(patched_dependency_keys(Some(r#"{"patchedDependencies":[]}"#), None).is_empty());
         assert!(patched_dependency_keys(None, None).is_empty());
     }
