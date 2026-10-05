@@ -2858,6 +2858,181 @@ wheels = [
         );
     }
 
+    // ── two packages sharing a created [tool.uv.sources] (#670) ────────
+
+    const TWO_REGISTRY_PYPROJECT: &str = r#"[project]
+name = "proj"
+version = "0.1.0"
+requires-python = ">=3.10"
+dependencies = ["idna==3.7", "six==1.16.0"]
+"#;
+
+    const TWO_REGISTRY_LOCK: &str = r#"version = 1
+revision = 3
+requires-python = ">=3.10"
+
+[[package]]
+name = "idna"
+version = "3.7"
+source = { registry = "https://pypi.org/simple" }
+sdist = { url = "https://files.pythonhosted.org/packages/21/ed/f86a79a07470cb07819390452f178b3bef1d375f2ec021ecfc709fc7cf07/idna-3.7.tar.gz", hash = "sha256:028ff3aadf0609c1fd278d8ea3089299412a7a8b9bd005dd08b9f8285bcb5cfc", size = 189575, upload-time = "2024-04-11T03:34:43.276Z" }
+wheels = [
+    { url = "https://files.pythonhosted.org/packages/e5/3e/741d8c82801c347547f8a2a06aa57dbb1992be9e948df2ea0eda2c8b79e8/idna-3.7-py3-none-any.whl", hash = "sha256:82fee1fc78add43492d3a1898bfa6d8a904cc97d8427f683ed8e798d07761aa0", size = 66836, upload-time = "2024-04-11T03:34:41.447Z" },
+]
+
+[[package]]
+name = "proj"
+version = "0.1.0"
+source = { virtual = "." }
+dependencies = [
+    { name = "idna" },
+    { name = "six" },
+]
+
+[package.metadata]
+requires-dist = [
+    { name = "idna", specifier = "==3.7" },
+    { name = "six", specifier = "==1.16.0" },
+]
+
+[[package]]
+name = "six"
+version = "1.16.0"
+source = { registry = "https://pypi.org/simple" }
+sdist = { url = "https://files.pythonhosted.org/packages/71/39/171f1c67cd00715f190ba0b100d606d440a28c93c7714febeca8b79af85e/six-1.16.0.tar.gz", hash = "sha256:1e61c37477a1626458e36f7b1d82aa5c9b094fa4802892072e49de9c60c4c926", size = 34041, upload-time = "2021-05-05T14:18:18.379Z" }
+wheels = [
+    { url = "https://files.pythonhosted.org/packages/d9/5a/e7c31adbe875f2abbb91bd84cf2dc52d792b5a01506781dbcf25c91daf11/six-1.16.0-py2.py3-none-any.whl", hash = "sha256:8abb2f1d86890a2dfb989f9a77cfcfd3e47c2a354b01111771326f8aa26e0254", size = 11053, upload-time = "2021-05-05T14:18:17.237Z" },
+]
+"#;
+
+    const IDNA_UUID: &str = "2c7d1e5f-3b4a-4c6d-9e8f-0a1b2c3d4e5f";
+    const IDNA_SHA: &str = "82fee1fc78add43492d3a1898bfa6d8a904cc97d8427f683ed8e798d07761aa0";
+
+    /// Vendor idna then six into one project, persisting each entry the
+    /// way the vendor loop does; returns the ledger keys in wiring order
+    /// (idna, the entry that created `[tool.uv.sources]`, first).
+    async fn vendor_two(root: &Path) -> [&'static str; 2] {
+        let idna_rel = format!(".socket/vendor/pypi/{IDNA_UUID}/idna-3.7-py3-none-any.whl");
+        let mut state = crate::vendor::state::VendorState::new();
+        for (key, name, version, rel, wheel, sha, uuid) in [
+            (
+                "pkg:pypi/idna@3.7",
+                "idna",
+                "3.7",
+                idna_rel.as_str(),
+                "idna-3.7-py3-none-any.whl",
+                IDNA_SHA,
+                IDNA_UUID,
+            ),
+            (
+                "pkg:pypi/six@1.16.0",
+                "six",
+                "1.16.0",
+                REL_WHEEL,
+                WHEEL_NAME,
+                WHEEL_SHA,
+                UUID,
+            ),
+        ] {
+            let p = load_uv_project(root).await.unwrap();
+            let (wiring, meta, _) = wire_uv(&p, root, name, version, rel, wheel, sha, uuid)
+                .await
+                .unwrap();
+            let mut entry = entry_for(wiring, meta);
+            entry.base_purl = key.into();
+            entry.uuid = uuid.into();
+            entry.artifact.path = rel.into();
+            entry.artifact.sha256 = sha.into();
+            state.entries.insert(key.into(), entry);
+            crate::vendor::state::save_state(root, &state)
+                .await
+                .unwrap();
+        }
+        ["pkg:pypi/idna@3.7", "pkg:pypi/six@1.16.0"]
+    }
+
+    /// Revert `order` one ledger entry at a time, each from a freshly
+    /// loaded ledger and saved after its removal — the shape of both
+    /// `vendor --revert` (per-entry save) and successive `remove` runs.
+    async fn revert_in_order(root: &Path, order: [&str; 2]) {
+        for key in order {
+            let mut state = crate::vendor::state::load_state(root).await.unwrap();
+            let entry = state.entries.get(key).cloned().unwrap();
+            let outcome = revert_uv(&entry, root, false).await;
+            assert!(outcome.success, "{key}: {:?}", outcome.error);
+            assert!(outcome.warnings.is_empty(), "{key}: {:?}", outcome.warnings);
+            state.entries.remove(key);
+            crate::vendor::state::save_state(root, &state)
+                .await
+                .unwrap();
+        }
+    }
+
+    /// #670: the entry that created `[tool.uv.sources]` reverted FIRST
+    /// (purl order, as `vendor --revert` does) must not leave the empty
+    /// header behind once the second entry empties it.
+    #[tokio::test]
+    async fn revert_two_packages_creator_first_removes_created_sources_table() {
+        let tmp = write_pair(TWO_REGISTRY_PYPROJECT, TWO_REGISTRY_LOCK).await;
+        let [idna, six] = vendor_two(tmp.path()).await;
+        let (wired, _) = read_pair(tmp.path()).await;
+        assert!(wired.contains("[tool.uv.sources]"), "{wired}");
+
+        revert_in_order(tmp.path(), [idna, six]).await;
+        let (pyproject, lock) = read_pair(tmp.path()).await;
+        assert_eq!(pyproject, TWO_REGISTRY_PYPROJECT, "no empty header left");
+        assert_eq!(lock, TWO_REGISTRY_LOCK);
+    }
+
+    /// #670, `remove` in the other order: already clean before the fix,
+    /// and must stay so.
+    #[tokio::test]
+    async fn revert_two_packages_creator_last_removes_created_sources_table() {
+        let tmp = write_pair(TWO_REGISTRY_PYPROJECT, TWO_REGISTRY_LOCK).await;
+        let [idna, six] = vendor_two(tmp.path()).await;
+
+        revert_in_order(tmp.path(), [six, idna]).await;
+        let (pyproject, lock) = read_pair(tmp.path()).await;
+        assert_eq!(pyproject, TWO_REGISTRY_PYPROJECT);
+        assert_eq!(lock, TWO_REGISTRY_LOCK);
+    }
+
+    /// A ledger written before the flags were shared (only the creator
+    /// flagged) is repaired on load, so it unwinds cleanly too.
+    #[tokio::test]
+    async fn revert_two_packages_repairs_a_creator_only_ledger() {
+        let tmp = write_pair(TWO_REGISTRY_PYPROJECT, TWO_REGISTRY_LOCK).await;
+        let [idna, six] = vendor_two(tmp.path()).await;
+        let path = tmp.path().join(".socket/vendor/state.json");
+        let mut ledger: serde_json::Value =
+            serde_json::from_slice(&tokio::fs::read(&path).await.unwrap()).unwrap();
+        let six_uv = &mut ledger["entries"][six]["uv"];
+        six_uv
+            .as_object_mut()
+            .unwrap()
+            .remove("createdSourcesTable");
+        tokio::fs::write(&path, serde_json::to_vec_pretty(&ledger).unwrap())
+            .await
+            .unwrap();
+
+        revert_in_order(tmp.path(), [idna, six]).await;
+        let (pyproject, _) = read_pair(tmp.path()).await;
+        assert_eq!(pyproject, TWO_REGISTRY_PYPROJECT);
+    }
+
+    /// A `[tool.uv.sources]` the user wrote is never ours, however many
+    /// packages are vendored into it.
+    #[tokio::test]
+    async fn revert_two_packages_keeps_a_user_sources_table() {
+        let user = format!("{TWO_REGISTRY_PYPROJECT}\n[tool.uv.sources]\n");
+        let tmp = write_pair(&user, TWO_REGISTRY_LOCK).await;
+        let [idna, six] = vendor_two(tmp.path()).await;
+
+        revert_in_order(tmp.path(), [idna, six]).await;
+        let (pyproject, _) = read_pair(tmp.path()).await;
+        assert_eq!(pyproject, user);
+    }
+
     /// wire_uv must refuse an in-sync pair (defensive parity with the
     /// poetry/pdm/pipenv backends): re-wiring would append a SECOND `path`
     /// key to the requires-dist entry (duplicate-key TOML — the lock stops
