@@ -44,8 +44,13 @@ enum Arg<'t> {
     /// `key => v` / `key: v` in any spelling; `spelling` is the key as
     /// written (`gitlab:`, `:git`, `"git" =>`).
     Option { key: &'t str, spelling: &'t str },
-    /// Anything else (`**opts`, a `{ … }` hash, a method call): its text.
-    Opaque(&'t str),
+    /// A `**opts` double splat or a `{ … }` hash literal: options whose
+    /// keys cannot be read statically. Its text.
+    Dynamic(&'t str),
+    /// Any other argument (`*V`, `VERSION`, `ENV.fetch(…)`, `Rack::VERSION`,
+    /// a trailing `if` modifier): a positional version constraint, which
+    /// never selects a source.
+    Positional,
 }
 
 /// The code of a tail: everything before a `#` comment that sits outside a
@@ -162,7 +167,7 @@ fn classify(arg: &str) -> Arg<'_> {
                 spelling: &a[..end],
             };
         }
-        return Arg::Opaque(a);
+        return Arg::Positional;
     }
     // `:key => v`
     if let Some(sym) = a.strip_prefix(':') {
@@ -173,7 +178,7 @@ fn classify(arg: &str) -> Arg<'_> {
                 spelling: &a[..1 + n],
             };
         }
-        return Arg::Opaque(a);
+        return Arg::Positional;
     }
     // `key: v`
     let n = ident_len(a);
@@ -183,7 +188,10 @@ fn classify(arg: &str) -> Arg<'_> {
             spelling: &a[..n + 1],
         };
     }
-    Arg::Opaque(a)
+    if a.starts_with("**") || a.starts_with('{') {
+        return Arg::Dynamic(a);
+    }
+    Arg::Positional
 }
 
 /// The arguments of a tail, or `None` when it cannot be read (unbalanced
@@ -217,6 +225,12 @@ pub(crate) struct SourceOption {
     /// The key as the Gemfile spells it (`gitlab:`, `:git`, `"git" =>`), or
     /// the unreadable argument.
     pub(crate) spelling: String,
+    /// True for a `**opts` splat or `{ … }` hash whose keys cannot be read:
+    /// it MAY pick a source. The hosted redirect refuses it (a hidden source
+    /// would make the redirect a silent, attested no-op); the vendored
+    /// rewrite keeps it after `path:`, where a hidden source makes bundler
+    /// refuse the Gemfile loudly instead.
+    pub(crate) dynamic: bool,
 }
 
 /// The first option on a `gem` line's argument tail that picks the gem's
@@ -224,25 +238,30 @@ pub(crate) struct SourceOption {
 /// moved into the Socket source block overrides the block (hosted: the
 /// redirect becomes a silent no-op that still gets attested), and kept next
 /// to a vendored `path:` makes bundler refuse the Gemfile. Fails closed:
-/// an argument that cannot be read as an option (`**opts`, a hash literal)
-/// or an unreadable tail counts as source-selecting, since it may carry one.
+/// an unreadable tail counts as source-selecting, and so (flagged
+/// [`SourceOption::dynamic`]) does a `**opts` splat or hash literal, since
+/// it may carry one. Positional arguments (`*V`, constants, method calls)
+/// are version constraints and never do.
 pub(crate) fn source_option(tail: &str) -> Option<SourceOption> {
     let Some(args) = args(tail) else {
         return Some(SourceOption {
             key: tail.trim().to_string(),
             spelling: tail.trim().to_string(),
+            dynamic: false,
         });
     };
     args.into_iter().find_map(|(_, arg)| match arg {
-        Arg::Version => None,
+        Arg::Version | Arg::Positional => None,
         Arg::Option { key, .. } if NON_SOURCE_KEYS.contains(&key) => None,
         Arg::Option { key, spelling } => Some(SourceOption {
             key: key.to_string(),
             spelling: spelling.to_string(),
+            dynamic: false,
         }),
-        Arg::Opaque(text) => Some(SourceOption {
+        Arg::Dynamic(text) => Some(SourceOption {
             key: text.to_string(),
             spelling: text.to_string(),
+            dynamic: true,
         }),
     })
 }
@@ -327,10 +346,26 @@ mod tests {
 
     #[test]
     fn unreadable_arguments_fail_closed() {
-        assert!(source_option(", **opts").is_some());
-        assert!(source_option(", { git: \"x\" }").is_some());
-        assert!(source_option(", \"7.0").is_some());
-        assert!(source_option(", git_opts(\"x\")").is_some());
+        let dynamic = |t: &str| source_option(t).map(|o| o.dynamic);
+        assert_eq!(dynamic(", **opts"), Some(true));
+        assert_eq!(dynamic(", { git: \"x\" }"), Some(true));
+        assert_eq!(dynamic(", \"7.0"), Some(false));
+        assert_eq!(dynamic(", require: (\"x\""), Some(false));
+    }
+
+    /// #847: positional arguments are version constraints, never sources.
+    #[test]
+    fn positional_constraints_are_not_sources() {
+        for tail in [
+            ", *RV",
+            ", RACK_VERSION, require: false",
+            ", ENV.fetch(\"RV\", \"~> 3.1\")",
+            ", Rack::VERSION, group: :web",
+            ", \"~> 3.1\", *RV, :require => false # web",
+        ] {
+            assert_eq!(key(tail), None, "{tail}");
+        }
+        assert_eq!(key(", RV, gitlab: \"x\""), Some("gitlab:".into()));
     }
 
     #[test]
