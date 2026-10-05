@@ -1,9 +1,11 @@
 ### Refactor routine (`refactor`, hourly, highest leverage first)
-_Last updated 2026-10-05T14:15Z · main @ 99f61d2_
+_Last updated 2026-10-05T15:16Z · main @ 0d302dc_
 
 **In flight:**
 - [#858](https://github.com/SocketDev/socket-patch/pull/858): one blocking `stage_and_rename_blocking` core with a private `WriteOpts` policy behind the six `utils::fs` writers; `atomic_write_sync`'s copy and `create_stage`/`commit_stage` deleted; one `stage_path` builds `.socket-stage-` and `.socket-dl-` names. Issue #728 (C21). Production +171 / −168, tests ≈ +85 / −12. State: ready, with the PR burn-down.
 - [#865](https://github.com/SocketDev/socket-patch/pull/865): `utils::digest` gains `sha256_hex_of`, `sha1_hex_of`, `sha512_base64_of`, `sha512_sri_of`; production digest sites in the 14 files no open PR changes move onto them; `ledger_snapshots::sha256_hex`, `vlt_preflight::sha512_sri`, `nuget_feed::content_hash`, `client::is_valid_sha256_hex` and the npm_pack/bun_lock SRI blocks deleted; a ratchet lists the 6 files left for slice 2. Issue #706 slice 1 (C17).
+
+- [#870](https://github.com/SocketDev/socket-patch/pull/870): `go_mod_edit::module_path` on the shared directive walker reads the go.mod `module` directive for VEX `--product` (fixes the block-form `module ( … )` misread); `go_crawler::parse_go_mod_module` (dead) and `product.rs`'s line scanner deleted. Issue #781 (E19 Go half). Production ≈ +22 / −64, tests ≈ +65 / −117. State: ready, with the PR burn-down.
 
 **Merged:**
 - [#850](https://github.com/SocketDev/socket-patch/pull/850): one hermetic `common/hermetic.rs` builder for CLI test children; 8 `scrub_socket_env` copies deleted, 7 unscrubbed spawners made hermetic, `spawn_env_hygiene` ratchet. Issue #823 slice 1 (C30, C47). Merged 2026-10-05 as `99f61d2`. Test-only: +745 / −322.
@@ -17,13 +19,13 @@ _Last updated 2026-10-05T14:15Z · main @ 99f61d2_
 
 | # | Candidate | B | U | D | R | Score | Note |
 |---|---|:-:|:-:|:-:|:-:|:-:|---|
-| 1 | #706 slice 1 (C17): `utils::digest` compute helpers | 0 | 1 | ≈6 | L | ≈8 | taken: PR #865 |
-| 2 | #823 slice 2: the 7 remaining copies + `scan_invariants`, `in_process_npm_multicopy` | 0 | 1 | ≈7 | L | ≈9 | skipped until #763, #774, #802, #820, #837, #839 land |
-| 3 | #815 (E16 child 1 of #814): one `line_endings::terminator` | 0 | 1 | ≈12 | L | ≈14 raw | skipped: 9 of 12 copies in files changed by open PRs |
-| 4 | #717 (E10 slice of #715): `formats::maven` element queries for hosted rewrite + restore | 3 | 1 | 4 | M | 13 raw | skipped: `redirect/mod.rs` changed by 7 open PRs |
-| 5 | #781 (E19 Go half): go.mod `module` through `go_mod_edit`, delete `parse_go_mod_module` | 0 | 0 | ≈2 | L | ≈2 | free of open-PR overlap; fixes the block-form misread in VEX `--product` |
+| 1 | #781 (E19 Go half): go.mod `module` through `go_mod_edit`, delete `parse_go_mod_module` | 0 | 0 | ≈2.2 | L | ≈2 | taken: PR #870 (only top candidate free of open-PR overlap) |
+| 2 | #856 (E62, child 1 of #855): VEX npm aliases through the core resolver | 1 | 1 | ≈1.8 | M | ≈5 | skipped: `vex_consumed.rs` changed by 15 open fix PRs, `npm_crawler.rs` by #829 |
+| 3 | #773 (C44): one `Ecosystem::from_cli_name` for flag, env, socket.yml, vendor | 1 | 0 | ≈2 | L | ≈5 | skipped: `commands/vendor.rs` changed by #730, #776, #802, #825 |
+| 4 | #816 (E38): CLI `PRODUCT_MANIFESTS` copy → `ProductDetection.present` | 1 | 0 | ≈1 | L | ≈4 | skipped: `commands/vex.rs` changed by #684, #700 |
+| 5 | #631 slice 1 (E52): delete `go_sum_edit`'s oracle-only free functions (no move) | 0 | 0 | ≈1.5 | L | ≈1.5 | free of overlap if limited to `go_sum_edit.rs`; the move touches `redirect/mod.rs` (7 open PRs) |
 
-Re-ranked 2026-10-05T13:56Z: #850 merged; 1 open (#858). #706 slice 1 is the top candidate free of overlap (14 of its 20 production files untouched by open PRs). Also free: #631 (go_sum_edit oracle, ≈3), #801 (`wired.rs` 221 dead lines, overlaps #813/#750/#724 in `lock_inventory`). #726 waits on #858 (`utils/fs.rs`). Others unchanged from the 20261005T115639Z entry. Decisions (not candidates): #648, #704, #792, #808, #615; C07 needs an owner decision.
+Re-ranked 2026-10-05T15:00Z: 3 open (#858, #865, #870). With 30 open fix PRs, most candidates overlap: #823 slice 2, #815, #717, #856 (`vex_consumed.rs`), #773 (`vendor.rs`), #816 (`commands/vex.rs`), #705 and #677 (`api/client.rs`, #865), #693 (`vendor/cargo.rs`, #598), #801 and #782 (`lock_inventory`, `vendor/state.rs`, `redirect/vlt*.rs`), #845 (`npm_crawler.rs`, #829). #726 waits on #858. Decisions (not candidates): #648, #704, #792, #808, #615; C07 needs an owner decision.
 
 **Notes:**
 - The sandbox runs as root, so 4 core lib tests fail on main and on branches alike: `copy_tree::relax_loop_must_not_traverse_symlinked_root`, `vlt_heal::an_unremovable_hidden_lock_keeps_every_store_entry`, `pypi_poetry::wire_write_failure_maps_error_and_leaves_lock_untouched`, `pypi_requirements::wire_failure_rolls_back_already_written_files`.
@@ -47,4 +49,5 @@ Re-ranked 2026-10-05T13:56Z: #850 merged; 1 open (#858). #706 slice 1 is the top
 - `cargo test --test repair` under `SOCKET_DRY_RUN=true` is a quick hermeticity probe: on `main` 20 fail, after #850 only the 2 root-only tests.
 - `main` @ `4646693` (#605) broke 2 `socket-patch-cli --lib` `vex_consumed` alias tests, so `coverage` fails on every PR until #851 lands; #850 carries the port.
 - `#[cfg(test)] mod tests` blocks often lean on the parent's `use sha2::…` through `use super::*`: removing a production import breaks the test build (`cargo test --lib --no-run`), not `cargo build`. Add the import to the test module.
+- go.mod's lexer treats `//` as a comment anywhere, so `module a//b` declares `a`: don't expect `//` inside a token to be rejected.
 - `vendor/berry_zip.rs`'s `berry_cache_checksum_10c0` has only test callers, so a helper used only there is dead code in the lib build.
