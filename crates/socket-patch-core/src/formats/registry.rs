@@ -197,14 +197,18 @@ pub fn hosted_file_ecosystem(rel: &str) -> Option<&'static str> {
 }
 
 /// Files a vendored run writes that carry no [`VENDORED`] role (that role
-/// also scopes `repair`'s fingerprint): pnpm's workspace file and NuGet's
-/// config and lock, which the vendored feed rewrites.
+/// also scopes `repair`'s fingerprint): pnpm's workspace file, NuGet's
+/// config and lock (the vendored feed), the root `pom.xml` and
+/// `.mvn/maven.config` (vendored Maven), and `hatch.toml` (vendored Hatch).
 const VENDORED_WRITES_UNMARKED: &[&str] = &[
     "pnpm-workspace.yaml",
     "nuget.config",
     "NuGet.config",
     "NuGet.Config",
     "packages.lock.json",
+    "pom.xml",
+    ".mvn/maven.config",
+    "hatch.toml",
 ];
 
 /// The project-relative paths of `ecosystem` that a vendored run may
@@ -262,6 +266,9 @@ mod tests {
             "presence only"
         );
         assert!(!npm.contains(&"uv.lock"));
+        let maven = wiring_paths("maven");
+        assert!(maven.contains(&"pom.xml") && maven.contains(&".mvn/maven.config"));
+        assert!(wiring_paths("pypi").contains(&"hatch.toml"));
         // Read-only for a vendored run: never captured, never refused.
         for p in [
             ".yarnrc.yml",
