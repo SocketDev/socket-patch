@@ -1070,25 +1070,45 @@ pub(crate) async fn gem_takeover_preview_refusals<'a>(
     purls: impl Iterator<Item = &'a str>,
 ) -> HashMap<String, (&'static str, String)> {
     let gems: Vec<&str> = purls.filter(|p| p.starts_with("pkg:gem/")).collect();
-    let mut refusals = HashMap::new();
     if gems.is_empty() {
-        return refusals;
+        return HashMap::new();
     }
     let pins = HostedPin::all(&crate::commands::discover_wiring(common, &common.cwd).await);
+    gem_takeover_refusals_for(
+        &common.cwd,
+        gems.into_iter(),
+        &pins,
+        common.offline,
+        crate::commands::rollback::patch_server_origins(common),
+    )
+    .await
+}
+
+/// [`gem_takeover_preview_refusals`] over already-discovered hosted `pins`:
+/// the vendored download phase reads the pins itself, so it refuses these
+/// gems before fetching their views instead of after.
+pub(crate) async fn gem_takeover_refusals_for<'a>(
+    cwd: &Path,
+    purls: impl Iterator<Item = &'a str>,
+    pins: &[HostedPin],
+    offline: bool,
+    patch_server_origins: Vec<String>,
+) -> HashMap<String, (&'static str, String)> {
+    let mut refusals = HashMap::new();
     let restore_opts = socket_patch_core::patch::redirect::upstream::RestoreOptions {
         dry_run: true,
-        offline: common.offline,
-        patch_server_origins: crate::commands::rollback::patch_server_origins(common),
+        offline,
+        patch_server_origins,
         bun_lockb: true,
     };
-    for purl in gems {
+    for purl in purls.filter(|p| p.starts_with("pkg:gem/")) {
         let Some(pin) = pins
             .iter()
             .find(|pin| canonical_purl(&pin.purl) == canonical_purl(purl))
         else {
             continue;
         };
-        if let Some(refusal) = gem_takeover_refusal(&common.cwd, purl, pin, &restore_opts).await {
+        if let Some(refusal) = gem_takeover_refusal(cwd, purl, pin, &restore_opts).await {
             refusals.insert(purl.to_string(), refusal);
         }
     }

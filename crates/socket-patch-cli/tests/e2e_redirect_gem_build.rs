@@ -1727,7 +1727,19 @@ async fn gem_hosted_group_block_pin_survives_a_refused_vendored_takeover() {
     }
     for (command, selector) in [("get", Some(UUID)), ("scan", None)] {
         for dry_run in [true, false] {
+            let views = view_requests(&fx).await;
             vendor_takeover_keeps_the_hosted_group_pin(&fx, command, selector, dry_run);
+            // The refusal is known before the download phase: a wet scan
+            // never fetches the patch view (nor its files) of a gem it
+            // cannot vendor. `get <uuid>` fetches the view once to resolve
+            // its identifier, and that is all it fetches.
+            let fetched = view_requests(&fx).await - views;
+            let allowed = usize::from(command == "get");
+            assert!(
+                fetched <= allowed,
+                "{command} --mode vendored (dry_run={dry_run}) fetched the refused gem's \
+                 view {fetched} time(s)"
+            );
         }
     }
 }

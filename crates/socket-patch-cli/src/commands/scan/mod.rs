@@ -2717,12 +2717,13 @@ async fn run_scan(
     };
 
     // The rollout plan (§5.2): deferred NEW rows leave the selection here.
-    // Vendored eligibility is the wet run's Bun / vlt preflight; the agent
-    // partition above already removed what cannot land in place.
+    // Vendored eligibility is the wet run's Bun / vlt / npm-lock / gem
+    // takeover preflight; the agent partition above already removed what
+    // cannot land in place.
     let selected = if report_only {
         selected
     } else if vendor {
-        let refused = vendor_flow::preflight_refused_purls(&args.common.cwd, &selected).await;
+        let refused = vendor_flow::preflight_refused_purls(&args.common, &selected).await;
         stage.plan(&rows, |r| !refused.contains(&r.writer.purl));
         let deferred = stage.deferred_keys();
         selected
