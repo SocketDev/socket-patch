@@ -6,11 +6,12 @@
 //!
 //! The roles intentionally diverge per file (a binary Bun lock has a native
 //! reader and is never text-scanned for wiring; `pnpm-lock.yml` is only a
-//! package-manager marker; Gradle scripts are read by the hosted Maven
-//! planner for their presence only); each divergence is one flag on one
-//! row. Paths are root-relative with `/` separators. Dynamic sets — PEP 751
-//! / PEP 723 Python locks, vlt importer manifests, requirements `-r`
-//! includes, Rush's nested pnpm locks — are enumerated by their callers.
+//! package-manager marker; Gradle build scripts are read but never edited);
+//! each divergence is one flag on one row. Paths are root-relative with `/`
+//! separators. Dynamic sets — PEP 751 / PEP 723 Python locks, vlt importer
+//! manifests, requirements `-r` includes, Rush's nested pnpm locks, the
+//! Gradle script graph and its lock files — are enumerated by their
+//! callers.
 
 /// Read by the hosted planners (`scan --mode hosted`, the in-memory
 /// engine's candidate reads).
@@ -152,12 +153,38 @@ const REGISTRY: &[FormatFile] = &[
         "maven",
         HOSTED | PRESENCE_ONLY,
     ),
-    // Gradle build scripts are never edited — their presence only feeds the
-    // maven planner's paste-able `exclusiveContent` snippet warning.
-    row("settings.gradle", "maven", HOSTED | PRESENCE_ONLY),
-    row("settings.gradle.kts", "maven", HOSTED | PRESENCE_ONLY),
+    // ── gradle (the maven ecosystem's Gradle builds) ──
+    // Settings files carry the apply line of the hosted and the vendored
+    // owned scripts. Build scripts are never edited: their presence makes
+    // the root a Gradle build, and the hosted planner reads them (with the
+    // rest of the script graph, which the engine walks dynamically).
+    row("settings.gradle", "maven", HOSTED | VENDORED),
+    row("settings.gradle.kts", "maven", HOSTED | VENDORED),
     row("build.gradle", "maven", HOSTED | PRESENCE_ONLY),
     row("build.gradle.kts", "maven", HOSTED | PRESENCE_ONLY),
+    // The root project's lock files; every other project's are walked
+    // through the script graph. Never ROOT: the in-memory engine would
+    // take them for maven roots (`ecosystem_unsupported_in_memory`).
+    row("gradle.lockfile", "maven", HOSTED | PROBE),
+    row("buildscript-gradle.lockfile", "maven", HOSTED | PROBE),
+    row("settings-gradle.lockfile", "maven", HOSTED | PROBE),
+    // Never created; an existing one gets the suffixed component.
+    row("gradle/verification-metadata.xml", "maven", HOSTED),
+    // Read for the wrapper's Gradle version (hosted patches need 6.8+).
+    row(
+        "gradle/wrapper/gradle-wrapper.properties",
+        "maven",
+        HOSTED | PRESENCE_ONLY,
+    ),
+    // The hosted planner's owned index and script.
+    row(".socket/gradle/hosted-index.tsv", "maven", HOSTED | PROBE),
+    row(
+        ".socket/gradle/socket-patch.hosted.settings.gradle",
+        "maven",
+        HOSTED | PROBE,
+    ),
+    // The vendored Gradle index: ledger-less repair finds its rows.
+    row(".socket/vendor/gradle-index.tsv", "maven", VENDORED | PROBE),
     // deno.lock is deliberately absent: deno is its own ecosystem
     // (JSR-crawled) and no planner edits its integrity entries.
 ];
@@ -196,6 +223,37 @@ pub fn hosted_file_ecosystem(rel: &str) -> Option<&'static str> {
         .map(|f| f.ecosystem)
 }
 
+/// Files a vendored run writes that carry no [`VENDORED`] role (that role
+/// also scopes `repair`'s fingerprint): pnpm's workspace file, NuGet's
+/// config and lock (the vendored feed), the root `pom.xml` and
+/// `.mvn/maven.config` (vendored Maven), and `hatch.toml` (vendored Hatch).
+const VENDORED_WRITES_UNMARKED: &[&str] = &[
+    "pnpm-workspace.yaml",
+    "nuget.config",
+    "NuGet.config",
+    "NuGet.Config",
+    "packages.lock.json",
+    "pom.xml",
+    ".mvn/maven.config",
+    "hatch.toml",
+];
+
+/// The project-relative paths of `ecosystem` that a vendored run may
+/// rewrite: the files a vendored dry run checks for symbolic links, since
+/// the wet run's commit refuses to rename over one. Files a vendored run
+/// only reads (`.yarnrc.yml`, `vlt.json`, `node_modules/.modules.yaml`, …)
+/// are left out.
+pub fn wiring_paths(ecosystem: &str) -> Vec<&'static str> {
+    REGISTRY
+        .iter()
+        .filter(|f| {
+            f.ecosystem == ecosystem
+                && (f.has(VENDORED) || VENDORED_WRITES_UNMARKED.contains(&f.path))
+        })
+        .map(|f| f.path)
+        .collect()
+}
+
 /// The [`ROOT`] row a basename names.
 pub fn root_marker(base: &str) -> Option<&'static FormatFile> {
     REGISTRY.iter().find(|f| f.has(ROOT) && f.path == base)
@@ -218,6 +276,38 @@ mod tests {
     }
 
     #[test]
+    fn wiring_paths_name_every_rewritable_file_of_the_ecosystem() {
+        let npm = wiring_paths("npm");
+        for p in [
+            "package-lock.json",
+            "yarn.lock",
+            "package.json",
+            "pnpm-workspace.yaml",
+        ] {
+            assert!(npm.contains(&p), "{p}");
+        }
+        let nuget = wiring_paths("nuget");
+        assert!(nuget.contains(&"nuget.config") && nuget.contains(&"packages.lock.json"));
+        assert!(
+            !wiring_paths("maven").contains(&"build.gradle"),
+            "presence only"
+        );
+        assert!(!npm.contains(&"uv.lock"));
+        let maven = wiring_paths("maven");
+        assert!(maven.contains(&"pom.xml") && maven.contains(&".mvn/maven.config"));
+        assert!(wiring_paths("pypi").contains(&"hatch.toml"));
+        // Read-only for a vendored run: never captured, never refused.
+        for p in [
+            ".yarnrc.yml",
+            "vlt.json",
+            "node_modules/.modules.yaml",
+            "shrinkwrap.yaml",
+        ] {
+            assert!(!npm.contains(&p), "{p}");
+        }
+    }
+
+    #[test]
     fn hosted_file_ecosystem_matches_basenames_of_edited_files_only() {
         assert_eq!(hosted_file_ecosystem("package-lock.json"), Some("npm"));
         assert_eq!(
@@ -229,6 +319,15 @@ mod tests {
         assert_eq!(hosted_file_ecosystem(".cargo/config"), Some("cargo"));
         assert_eq!(hosted_file_ecosystem("checksums.sha256"), Some("maven"));
         assert_eq!(hosted_file_ecosystem("build.gradle"), None);
+        assert_eq!(hosted_file_ecosystem("settings.gradle.kts"), Some("maven"));
+        assert_eq!(hosted_file_ecosystem("sub/gradle.lockfile"), Some("maven"));
+        assert_eq!(hosted_file_ecosystem("hosted-index.tsv"), Some("maven"));
+        assert_eq!(
+            hosted_file_ecosystem("gradle/verification-metadata.xml"),
+            Some("maven")
+        );
+        assert_eq!(hosted_file_ecosystem("gradle-wrapper.properties"), None);
+        assert_eq!(hosted_file_ecosystem("gradle-index.tsv"), None);
         assert_eq!(hosted_file_ecosystem("Pipfile"), None);
         assert_eq!(hosted_file_ecosystem("package.json"), None);
         assert_eq!(hosted_file_ecosystem("NuGet.Config"), Some("nuget"));
