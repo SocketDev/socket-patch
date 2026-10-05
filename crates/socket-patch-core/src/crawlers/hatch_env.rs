@@ -541,10 +541,15 @@ fn expand(text: &str, var: &impl Fn(&str) -> Option<String>) -> String {
 fn absolutize(root: &Path, path: &str) -> PathBuf {
     let path = PathBuf::from(path);
     if path.is_absolute() {
-        path
-    } else {
-        root.join(path)
+        return path;
     }
+    // Push component by component: a canonical Windows root is a
+    // verbatim `\\?\` path, where `/` would not separate components.
+    let mut out = root.to_path_buf();
+    for part in path.components() {
+        out.push(part);
+    }
+    out
 }
 
 /// An env's explicit `path`, resolved like Hatch's `(root / path).resolve()`.
@@ -552,30 +557,12 @@ fn resolve_env_path(root: &Path, path: &str) -> PathBuf {
     resolve(&absolutize(root, path))
 }
 
-/// Python's `Path.resolve()` (non-strict): symlinks are followed in the
-/// longest existing prefix, and `.` / `..` in the rest are folded.
+/// Python's `Path.resolve()` (non-strict), with `.` / `..` folded first so
+/// verbatim Windows paths (where the OS does not fold them) resolve too;
+/// symlinks are then followed in the longest existing prefix.
 fn resolve(path: &Path) -> PathBuf {
-    if let Ok(real) = std::fs::canonicalize(path) {
-        return real;
-    }
-    let mut existing = path.to_path_buf();
-    let mut rest = Vec::new();
-    while let Some(name) = existing.file_name().map(|n| n.to_os_string()) {
-        if let Ok(real) = std::fs::canonicalize(&existing) {
-            existing = real;
-            break;
-        }
-        rest.push(name);
-        if !existing.pop() {
-            break;
-        }
-    }
-    let mut out = std::fs::canonicalize(&existing).unwrap_or(existing);
-    for name in rest.into_iter().rev() {
-        out.push(name);
-    }
     let mut folded = PathBuf::new();
-    for part in out.components() {
+    for part in path.components() {
         match part {
             std::path::Component::CurDir => {}
             std::path::Component::ParentDir => {
@@ -584,7 +571,21 @@ fn resolve(path: &Path) -> PathBuf {
             other => folded.push(other),
         }
     }
-    folded
+    let mut existing = folded.clone();
+    let mut rest = Vec::new();
+    loop {
+        if let Ok(real) = std::fs::canonicalize(&existing) {
+            let mut out = real;
+            for name in rest.into_iter().rev() {
+                out.push(name);
+            }
+            return out;
+        }
+        match existing.file_name().map(|n| n.to_os_string()) {
+            Some(name) if existing.pop() => rest.push(name),
+            _ => return folded,
+        }
+    }
 }
 
 fn same_path(a: &Path, b: &Path) -> bool {
