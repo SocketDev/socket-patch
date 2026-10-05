@@ -614,16 +614,11 @@ async fn pipenv_stale_install_warning(
     listings: &InstalledSiteListings,
     lock: &serde_json::Value,
 ) -> Option<VendorWarning> {
-    use crate::crawlers::hatch_env::{environment_of, hatch_environments};
-    use crate::crawlers::python_crawler::find_local_venv_site_packages;
-    // Pipenv's remedy cannot clear a Hatch env (Hatch never reads
-    // Pipfile.lock), so Hatch's own envs are not judged here (#335).
-    let hatch_envs = hatch_environments(project_root).await;
-    let sites: Vec<std::path::PathBuf> = find_local_venv_site_packages(project_root)
-        .await
-        .into_iter()
-        .filter(|site| environment_of(&hatch_envs, site).is_none())
-        .collect();
+    use crate::crawlers::python_crawler::non_hatch_local_venv_site_packages;
+    // Only the venvs Pipenv itself resolves: its remedy cannot clear an
+    // out-of-tree Hatch env (Hatch never reads Pipfile.lock, #335), while a
+    // venv the two share (`path = ".venv"`) is still Pipenv's and judged.
+    let sites = non_hatch_local_venv_site_packages(project_root).await;
     let stale_dirs = stale_install_sites(&sites, purl, record, listings).await;
     if stale_dirs.is_empty() {
         return None;
@@ -2434,6 +2429,18 @@ mod tests {
             // The fixture's stale `./.venv` (POSIX layout) is still named.
             let warning = probe().await.expect("the stale ./.venv is reported");
             assert!(!warning.detail.contains(".hatch-env"), "{}", warning.detail);
+        }
+        // A Hatch env that is Pipenv's own `./.venv` stays Pipenv's to judge.
+        if !cfg!(windows) {
+            touch(
+                &fx.root,
+                "pyproject.toml",
+                "[project]\nname = \"proj\"\nversion = \"0.1.0\"\n\n[tool.hatch.envs.default]\npath = \".venv\"\n",
+            )
+            .await;
+            touch(&fx.root.join(".venv"), "pyvenv.cfg", "home = /usr/bin\n").await;
+            let warning = probe().await.expect("the shared ./.venv is reported");
+            assert!(warning.detail.contains(".venv"), "{}", warning.detail);
         }
         // With only the Hatch env stale, there is nothing for Pipenv to say.
         tokio::fs::remove_dir_all(fx.root.join(".venv"))

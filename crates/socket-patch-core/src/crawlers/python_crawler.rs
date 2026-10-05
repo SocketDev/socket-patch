@@ -355,6 +355,14 @@ async fn find_local_venv_site_packages_with(
     found
 }
 
+/// Steps 0-5 of [`find_local_venv_site_packages`] (no Hatch envs): the env
+/// a package manager records or activates, else the project's local venvs.
+/// What a non-Hatch manager's own reinstall reaches, e.g. Pipenv's venv.
+pub async fn non_hatch_local_venv_site_packages(cwd: &Path) -> Vec<PathBuf> {
+    let var = |name: &str| std::env::var(name).ok();
+    managed_or_local_site_packages(cwd, &var).await
+}
+
 /// Steps 0-5 of [`find_local_venv_site_packages`]: the env a package
 /// manager records or activates, else the project's local venvs.
 async fn managed_or_local_site_packages(
