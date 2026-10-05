@@ -33,6 +33,8 @@ use wiremock::{Mock, MockServer, ResponseTemplate};
 
 #[path = "common/cache_env.rs"]
 mod cache_env;
+#[path = "common/hermetic.rs"]
+mod hermetic;
 #[path = "vex_e2e_common/mod.rs"]
 mod vex_e2e_common;
 use vex_e2e_common::{
@@ -90,21 +92,13 @@ fn has_command(cmd: &str) -> bool {
         .unwrap_or(false)
 }
 
-fn scrub_socket_env(cmd: &mut Command) {
-    for (k, _) in std::env::vars_os() {
-        if k.to_string_lossy().starts_with("SOCKET_") && k.to_string_lossy() != "SOCKET_NO_CONFIG" {
-            cmd.env_remove(&k);
-        }
-    }
-    cmd.env_remove("VIRTUAL_ENV");
-    cmd.env_remove("npm_config_store_dir");
-    cmd.env_remove("PNPM_HOME");
-}
-
 fn corepack(cwd: &Path, pm: &str, args: &[&str], extra_env: &[(&str, &str)]) -> Output {
     let mut cmd = Command::new("corepack");
     cmd.arg(pm).args(args).current_dir(cwd);
-    scrub_socket_env(&mut cmd);
+    hermetic::scrub_socket_vars(&mut cmd);
+    hermetic::scrub_extra(&mut cmd, &[hermetic::Extra::Venv]);
+    cmd.env_remove("npm_config_store_dir")
+        .env_remove("PNPM_HOME");
     // After the scrub: it strips ambient `PNPM_HOME` / `npm_config_store_dir`,
     // which would otherwise take the sandbox values back out again.
     cache_env::isolate(&mut cmd);
@@ -116,9 +110,11 @@ fn corepack(cwd: &Path, pm: &str, args: &[&str], extra_env: &[(&str, &str)]) -> 
 }
 
 fn run_socket(cwd: &Path, args: &[&str]) -> Output {
-    let mut cmd = Command::new(binary());
+    let mut cmd = hermetic::command(&binary());
     cmd.args(args).current_dir(cwd);
-    scrub_socket_env(&mut cmd);
+    hermetic::scrub_extra(&mut cmd, &[hermetic::Extra::Venv]);
+    cmd.env_remove("npm_config_store_dir")
+        .env_remove("PNPM_HOME");
     cmd.output().expect("failed to run socket-patch binary")
 }
 
@@ -644,7 +640,10 @@ async fn rush_hosted_real_rush_update_install() {
         full.extend_from_slice(args);
         let mut cmd = Command::new("npm");
         cmd.args(&full).current_dir(root);
-        scrub_socket_env(&mut cmd);
+        hermetic::scrub_socket_vars(&mut cmd);
+        hermetic::scrub_extra(&mut cmd, &[hermetic::Extra::Venv]);
+        cmd.env_remove("npm_config_store_dir")
+            .env_remove("PNPM_HOME");
         cache_env::isolate(&mut cmd);
         for (k, _) in std::env::vars_os() {
             if k.to_string_lossy().starts_with("RUSH_") {

@@ -1181,6 +1181,107 @@ fn declared_clauses(
     })
 }
 
+/// Which lock requirement array a vendored revert is restoring an entry
+/// of, for [`respell_lock_specifier`].
+#[derive(Clone, Copy, Debug)]
+pub(crate) enum LockRequirementArray<'a> {
+    /// The root `requires-dist`: `[project]` dependencies and extras.
+    RequiresDist,
+    /// The root `requires-dev.<group>`.
+    RequiresDev(&'a str),
+    /// `[manifest] constraints` / `build-constraints`.
+    Manifest(&'a str),
+}
+
+/// The `specifier` a vendored revert should restore for `name`'s entry
+/// in `array`, given the one it recorded when vendoring (`None` when the
+/// entry had none) and the entry's `marker`.
+///
+/// A path source records no specifier, so a user who changes the
+/// declaration while the package is vendored (`uv add "six>=1.16"`)
+/// leaves uv.lock byte-identical, and the recorded specifier goes stale
+/// (#840). The entry's declaration is picked the way hosted unwind picks
+/// it ([`declared_clauses`]: by the extra and environment marker uv
+/// lowered into the entry). Returns:
+/// * `Ok(None)`: keep the recorded entry as it is. The declaration still
+///   agrees with it, nothing declares the name, or no declaration of it is
+///   a plain version range (the recorded spelling was uv's own, so it
+///   stays the best answer);
+/// * `Ok(Some(spec))`: write `spec` instead, in uv's spelling (`None` is no
+///   specifier at all);
+/// * `Err`: the declaration changed but uv's spelling of it can't be
+///   derived (a multi-clause range), or which declaration the entry
+///   mirrors is ambiguous, so restoring any spelling may break `--locked`.
+pub(crate) fn respell_lock_specifier(
+    pyproject_text: &str,
+    array: LockRequirementArray<'_>,
+    name: &str,
+    recorded: Option<&str>,
+    marker: Option<&str>,
+) -> Result<Option<Option<String>>, String> {
+    let Ok(doc) = pyproject_text.parse::<DocumentMut>() else {
+        return Ok(None);
+    };
+    let meta = Metadata {
+        rel: "pyproject.toml".to_string(),
+        text: String::new(),
+        script: false,
+        doc,
+    };
+    let declared = match array {
+        LockRequirementArray::RequiresDist => Declared::Dist,
+        LockRequirementArray::RequiresDev(group) => Declared::Dev(group),
+        LockRequirementArray::Manifest(key) => Declared::Manifest(key),
+    };
+    let canon = canonicalize_pypi_name(name);
+    let recorded = match recorded {
+        None => Vec::new(),
+        Some(r) => match spec_clauses(&format!("{canon}{r}")) {
+            Ok(clauses) => clauses,
+            Err(_) => return Ok(None),
+        },
+    };
+    let clauses = match declared_clauses(&meta, declared, name, marker) {
+        Ok(Some(clauses)) => clauses,
+        Ok(None) => return Ok(None),
+        // Not one declaration of the name is a plain version range: the
+        // recorded spelling was uv's own, so it stays the best answer.
+        // Otherwise the marker narrowing left an unreadable or conflicting
+        // set, which is ambiguous: fail closed.
+        Err(reason) => {
+            let all_unreadable = declarations(&meta, declared)
+                .iter()
+                .filter(|d| canonicalize_pypi_name(pep508_name(d.spec)) == canon)
+                .all(|d| spec_clauses(d.spec).is_err());
+            return if all_unreadable {
+                Ok(None)
+            } else {
+                Err(reason)
+            };
+        }
+    };
+    let sorted = |clauses: &[String]| {
+        let mut c = clauses.to_vec();
+        c.sort();
+        c
+    };
+    if sorted(&clauses) == sorted(&recorded) {
+        return Ok(None);
+    }
+    match clauses.as_slice() {
+        [] => Ok(Some(None)),
+        [one] => Ok(Some(Some(one.clone()))),
+        // How uv orders and joins clauses differs between releases (0.8
+        // orders them by version: `>=20,!=21.1.0,<30`), and the lock no
+        // longer shows this entry's spelling, so any guess may break
+        // `--locked`.
+        _ => Err(format!(
+            "pyproject.toml now declares {name} with a multi-clause specifier, whose \
+             spelling in uv.lock is not derivable"
+        )),
+    }
+}
+
 /// Every lock requirement array with the declarations it mirrors
 /// (read-only twin of [`restore_requirements`]'s walk).
 fn requirement_arrays_ref(doc: &DocumentMut) -> Vec<(Declared<'_>, &toml_edit::Array)> {
