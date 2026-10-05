@@ -492,6 +492,57 @@ async fn revert_round_trip() {
     assert_eq!(env["summary"]["removed"], 0);
 }
 
+/// #665: `npm uninstall left-pad` after vendoring deletes the lock entry
+/// the wiring recorded, so nothing resolves through the vendored artifact
+/// any more. `rollback` used to report that as drift, keep the artifact
+/// and the ledger entry, and exit 1 on every run; `vendor --revert` then
+/// "succeeded" without cleaning anything up. Now the first rollback drops
+/// the unreferenced artifact and ledger entry, and every later run is a
+/// clean exit 0.
+#[tokio::test]
+async fn rollback_after_dependency_removed_cleans_up_and_converges() {
+    let fx = npm_fixture();
+    assert_eq!(vendor_run(vendor_args(fx.root())).await, 0);
+    assert!(fx.tgz_path().exists(), "sanity: vendored");
+
+    // What `npm uninstall left-pad` leaves behind.
+    let mut lock = fx.lock_value();
+    let packages = lock["packages"].as_object_mut().unwrap();
+    packages.remove("node_modules/left-pad");
+    packages[""]["dependencies"] = json!({});
+    let mut uninstalled = serde_json::to_vec_pretty(&lock).unwrap();
+    uninstalled.push(b'\n');
+    std::fs::write(fx.lock_path(), &uninstalled).unwrap();
+    std::fs::remove_dir_all(fx.root().join("node_modules/left-pad")).unwrap();
+
+    let cwd = fx.root().to_str().unwrap();
+    let (code, stdout, stderr) = run_cli(
+        fx.root(),
+        &["rollback", "--json", "--yes", "--offline", "--cwd", cwd],
+        &[],
+    );
+    assert_eq!(code, 0, "rollback must succeed:\n{stdout}\n{stderr}");
+    assert!(
+        !stdout.contains("vendor_artifact_kept"),
+        "nothing is kept:\n{stdout}"
+    );
+    assert!(
+        !fx.vendor_dir().exists(),
+        "the unreferenced artifact and ledger are cleaned up:\n{stdout}"
+    );
+    assert_eq!(fx.lock_bytes(), uninstalled, "the user's lock is untouched");
+
+    let (code, stdout, stderr) = run_cli(
+        fx.root(),
+        &["rollback", "--json", "--yes", "--offline", "--cwd", cwd],
+        &[],
+    );
+    assert_eq!(code, 0, "a second rollback is a no-op:\n{stdout}\n{stderr}");
+    let (code, env) = vendor_cli(fx.root(), &["--revert"]);
+    assert_eq!(code, 0, "{env:#}");
+    assert!(events(&env).is_empty(), "nothing left to revert: {env:#}");
+}
+
 // ─────────────────────────────────────────────────────────────────────
 // 5. revert works without a manifest
 // ─────────────────────────────────────────────────────────────────────
@@ -3722,6 +3773,58 @@ snapshots:
         assert!(
             !root.join(".socket/vendor/redirect-state.json").exists(),
             "no hosted ledger exists at any point"
+        );
+    }
+
+    /// Hosted → vendored over a linked `.socket/vendor/npm` (#664): the
+    /// refusal comes BEFORE the takeover restores the upstream entry, so
+    /// the hosted patch stays wired (lock and `.npmrc` byte-identical) and
+    /// nothing is written into the link's target.
+    #[cfg(unix)]
+    #[tokio::test]
+    #[serial]
+    async fn hosted_then_vendor_over_a_linked_vendor_dir_keeps_the_hosted_wiring() {
+        let server = MockServer::start().await;
+        mock_hosted_api(&server).await;
+        let registry = mock_registry(&server).await;
+        let tmp = tempfile::tempdir().unwrap();
+        let root = &tmp.path().join("project");
+        std::fs::create_dir_all(root).unwrap();
+        write_package_lock_project(root);
+        assert_eq!(scan_run(hosted_args(root, server.uri())).await, 0);
+        let hosted_lock = std::fs::read(root.join("package-lock.json")).unwrap();
+        let hosted_npmrc = std::fs::read(root.join(".npmrc")).unwrap();
+        assert!(String::from_utf8_lossy(&hosted_lock).contains(HOSTED_URL));
+
+        seed_manifest_and_blob(root);
+        let shared = tmp.path().join("shared-npm");
+        std::fs::create_dir_all(&shared).unwrap();
+        std::fs::create_dir_all(root.join(".socket/vendor")).unwrap();
+        std::os::unix::fs::symlink(&shared, root.join(".socket/vendor/npm")).unwrap();
+
+        let (code, env) = vendor_online_cli(root, &registry, PATCH_ORIGIN, &[]);
+        assert_eq!(code, 1, "{env:#}");
+        find_event(&env, "failed", Some("vendor_dir_symlink_unsupported"));
+        assert!(
+            events(&env)
+                .iter()
+                .all(|e| e["errorCode"] != "vendor_takeover_reverted_redirect"),
+            "the takeover must not run before the refusal: {env:#}"
+        );
+        assert_eq!(
+            std::fs::read(root.join("package-lock.json")).unwrap(),
+            hosted_lock,
+            "the hosted lock must be untouched"
+        );
+        assert_eq!(
+            std::fs::read(root.join(".npmrc")).unwrap(),
+            hosted_npmrc,
+            "the hosted .npmrc must be untouched"
+        );
+        assert_eq!(
+            std::fs::read_dir(&shared).unwrap().count(),
+            0,
+            "nothing is written through the link"
         );
     }
 }

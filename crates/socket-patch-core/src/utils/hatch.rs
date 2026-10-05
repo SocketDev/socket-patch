@@ -143,11 +143,16 @@ fn replacement(spec: &str, name: &str, version: &str, url: &str) -> Result<Optio
         if existing == url {
             return Ok(Some(spec.to_owned()));
         }
-        return Err(format!(
-            "{name}: an existing direct source must be reverted before patching"
-        ));
-    }
-    if !crate::utils::pep440::is_exact_pin_of(&constraint, version) {
+        // socket-patch's own earlier hosted reference (a rotated grant or a
+        // superseding patch uuid for this release) is re-pinned in place.
+        if !crate::vendor::lock_inventory::pypi::replaceable_hosted_pin(
+            existing, url, name, version,
+        ) {
+            return Err(format!(
+                "{name}: an existing direct source must be reverted before patching"
+            ));
+        }
+    } else if !crate::utils::pep440::is_exact_pin_of(&constraint, version) {
         return Err(format!(
             "{name}: Hatch patching requires an exact =={version} declaration"
         ));
@@ -265,8 +270,7 @@ fn rewrite_environments(
                     .is_some_and(|kind| kind != "virtual")
             {
                 return Err(
-                    "Hatch sources, overrides and custom environments require agent mode"
-                        .into(),
+                    "Hatch sources, overrides and custom environments require agent mode".into(),
                 );
             }
             for key in ["dependencies", "extra-dependencies"] {
@@ -303,11 +307,7 @@ pub fn rewrite(
 }
 
 fn enable_permission(document: &mut DocumentMut, external: bool) -> Result<(), String> {
-    let keys: &[&str] = if external {
-        &["metadata"]
-    } else {
-        &["tool", "hatch", "metadata"]
-    };
+    let keys = permission_keys(external);
     let mut table: &mut dyn toml_edit::TableLike = document.as_table_mut();
     for key in keys {
         if !table.contains_key(key) {
@@ -326,6 +326,40 @@ fn enable_permission(document: &mut DocumentMut, external: bool) -> Result<(), S
     }
     table.insert("allow-direct-references", toml_edit::value(true));
     Ok(())
+}
+
+/// The table path holding Hatch's direct-reference permission: hatch.toml's
+/// `[metadata]` when that file carries the key, else pyproject's
+/// `[tool.hatch.metadata]`.
+pub(crate) fn permission_keys(external: bool) -> &'static [&'static str] {
+    if external {
+        &["metadata"]
+    } else {
+        &["tool", "hatch", "metadata"]
+    }
+}
+
+/// Remove `keys`' last table's `allow-direct-references = true` (the
+/// permission a project direct reference needs), then every table on the
+/// path that is left empty. Shared by the hosted unwind and the vendored
+/// permission ledger, so both lanes agree on what the file looks like once
+/// no project direct reference is left.
+pub(crate) fn drop_direct_reference_permission(doc: &mut DocumentMut, keys: &[&str]) -> bool {
+    fn walk(table: &mut dyn toml_edit::TableLike, keys: &[&str]) -> bool {
+        let Some((first, rest)) = keys.split_first() else {
+            return table.get("allow-direct-references").and_then(Item::as_bool) == Some(true)
+                && table.remove("allow-direct-references").is_some();
+        };
+        let Some(child) = table.get_mut(first).and_then(Item::as_table_like_mut) else {
+            return false;
+        };
+        let removed = walk(child, rest);
+        if removed && child.is_empty() {
+            table.remove(first);
+        }
+        removed
+    }
+    walk(doc.as_table_mut(), keys)
 }
 
 pub fn has_project_direct_references(files: &BTreeMap<String, String>) -> bool {
@@ -506,6 +540,57 @@ mod tests {
             assert_eq!(
                 restored.replace("\r\n", "\n"),
                 original.replace("\r\n", "\n")
+            );
+        }
+    }
+
+    /// #650: a superseding patch (a new patch uuid for the same package and
+    /// version) re-pins socket-patch's OWN earlier hosted direct reference —
+    /// in `pyproject.toml` (project and env tables) and in `hatch.toml` —
+    /// instead of refusing it as an unknown user source.
+    #[test]
+    fn superseding_patch_repins_own_hosted_reference() {
+        const A: &str = "https://patch.socket.dev/patch/pypi/six/1.16.0/11111111-1111-4111-8111-111111111111/aaaaaaaa-0000-4000-8000-000000000001/six-1.16.0-py2.py3-none-any.whl#sha256=aaaa";
+        const B: &str = "https://patch.socket.dev/patch/pypi/six/1.16.0/22222222-2222-4222-8222-222222222222/aaaaaaaa-0000-4000-8000-000000000004/six-1.16.0-py2.py3-none-any.whl#sha256=bbbb";
+        let inputs: BTreeMap<String, String> = [
+            ("pyproject.toml".to_string(), "[project]\nname = \"app\"\nversion = \"0.1.0\"\ndependencies = [\"six==1.16.0 ; python_version >= '3'\"]\n[tool.hatch.envs.default]\ndependencies = [\"six==1.16.0\"]\n".to_string()),
+            ("hatch.toml".to_string(), "[envs.lint]\ndependencies = [\"Six[x]==1.16.0\"]\n".to_string()),
+        ]
+        .into_iter()
+        .collect();
+        // hatch.toml's `envs` replaces pyproject's whole env table, so the
+        // project dependency and the hatch.toml env are the two declarations.
+        let mut wired = inputs.clone();
+        wired.extend(rewrite(&inputs, "six", "1.16.0", A).unwrap());
+        let count = |files: &BTreeMap<String, String>, url: &str| -> usize {
+            files.values().map(|t| t.matches(url).count()).sum()
+        };
+        assert_eq!(count(&wired, A), 2);
+        let edits = rewrite(&wired, "six", "1.16.0", B)
+            .unwrap_or_else(|e| panic!("superseding patch refused: {e}"));
+        let mut repinned = wired.clone();
+        repinned.extend(edits);
+        for text in repinned.values() {
+            assert!(!text.contains(A), "{text}");
+        }
+        assert_eq!(count(&repinned, B), 2);
+        assert!(repinned["pyproject.toml"].contains(&format!("six @ {B} ; python_version >= '3'")));
+        assert!(repinned["hatch.toml"].contains(&format!("Six[x] @ {B}")));
+        assert!(rewrite(&repinned, "six", "1.16.0", B).unwrap().is_empty());
+        // Not ours: another host, another version, or credentials stay a
+        // user source that must be reverted first.
+        for foreign in [
+            A.replace("patch.socket.dev", "example.test"),
+            A.replace("1.16.0", "1.15.0"),
+            A.replace("https://", "https://user@"),
+        ] {
+            let user: BTreeMap<String, String> = wired
+                .iter()
+                .map(|(k, v)| (k.clone(), v.replace(A, &foreign)))
+                .collect();
+            assert!(
+                rewrite(&user, "six", "1.16.0", B).is_err(),
+                "{foreign} must stay a user source"
             );
         }
     }

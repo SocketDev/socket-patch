@@ -227,6 +227,24 @@ impl LegacyNpmCrawler {
                     _ => {}
                 }
             }
+            // Alias installs (`"lp": "npm:left-pad@1.3.0"`): a real
+            // importer-tree package dir whose own package.json names a
+            // pending target under a different dir name is a copy too.
+            if !store_entry {
+                for (index, pkg_path) in Self::alias_copies(&nm_path, &pending).await {
+                    let target = &pending[index];
+                    let copies = result.entry(target.purl.clone()).or_default();
+                    if !copies.iter().any(|c| c.path == pkg_path) {
+                        copies.push(CrawledPackage {
+                            name: target.name.clone(),
+                            version: target.version.clone(),
+                            namespace: target.namespace.clone(),
+                            purl: target.purl.clone(),
+                            path: pkg_path,
+                        });
+                    }
+                }
+            }
             // Descend importer-tree nested `node_modules` for ALL targets
             // (a duplicate copy lives at an unknown depth), but probe the
             // pnpm virtual store only for targets NOT YET found anywhere: a
@@ -245,6 +263,57 @@ impl LegacyNpmCrawler {
         // Only the targets with zero copies remain "pending" for pass 2.
         pending.retain(|t| !result.contains_key(&t.purl));
         pending
+    }
+
+    /// The alias installs directly below `nm_path` that are copies of a
+    /// pending target, as `(target index, path)` in listing order: real
+    /// package dirs (scoped ones one level down) whose package.json
+    /// `name@version` is a target's while the dir is named otherwise.
+    async fn alias_copies(nm_path: &Path, pending: &[Target]) -> Vec<(usize, PathBuf)> {
+        async fn package_dirs(dir: &Path) -> Vec<(String, PathBuf)> {
+            let mut out = Vec::new();
+            for entry in crate::utils::fs::list_dir_entries(dir).await {
+                let name = entry.file_name();
+                let name_str = name.to_string_lossy().into_owned();
+                if name_str.starts_with('.') || name_str == "node_modules" {
+                    continue;
+                }
+                let is_real_dir = crate::utils::fs::entry_file_type(&entry)
+                    .await
+                    .is_some_and(|ft| ft.is_dir());
+                if is_real_dir {
+                    out.push((name_str, dir.join(&name)));
+                }
+            }
+            out
+        }
+        let mut found = Vec::new();
+        for (entry_name, entry_path) in package_dirs(nm_path).await {
+            let candidates = if entry_name.starts_with('@') {
+                package_dirs(&entry_path)
+                    .await
+                    .into_iter()
+                    .map(|(scoped, path)| (format!("{entry_name}/{scoped}"), path))
+                    .collect()
+            } else {
+                vec![(entry_name, entry_path)]
+            };
+            for (dir_key, pkg_path) in candidates {
+                let Some((name, version)) = read_package_json(&pkg_path.join("package.json")).await
+                else {
+                    continue;
+                };
+                if name.eq_ignore_ascii_case(&dir_key) {
+                    continue;
+                }
+                for (index, target) in pending.iter().enumerate() {
+                    if target.dir_key == name && target.version == version {
+                        found.push((index, pkg_path.clone()));
+                    }
+                }
+            }
+        }
+        found
     }
 
     /// Append the `node_modules` dirs living one level below `nm_path`

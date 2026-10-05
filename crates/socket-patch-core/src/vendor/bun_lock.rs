@@ -543,6 +543,24 @@ pub(crate) async fn vendor_bun<'a>(
         changed = true;
     }
 
+    // A workspace lock Bun 1.4 migrated from a vendored `bun.lockb` keeps
+    // the member paths the binary normalization wrote as inter-workspace
+    // literals, so Bun re-resolves the workspace and drops the vendored
+    // tuples (#803). Restore each manifest's `workspace:` literal (Bun's own
+    // spelling) like the digest heal above: in place, with no wiring
+    // record, since a revert has no reason to put the path back.
+    let literal_heals = super::bun_lock_text::heal_workspace_literals(&mut lines, |dir| {
+        let rel = if dir.is_empty() {
+            "package.json".to_string()
+        } else {
+            format!("{dir}/package.json")
+        };
+        crate::utils::fs::read_regular_to_bytes_sync(&project_root.join(rel))
+            .ok()
+            .and_then(|bytes| String::from_utf8(bytes).ok())
+    });
+    healed |= !literal_heals.is_empty();
+
     if !changed {
         // Every instance already points at this uuid with the packed
         // integrity (or with the digest Bun dropped, now re-pinned): in
@@ -912,6 +930,17 @@ pub(crate) async fn revert_bun_opts(
     // ran; the artifact dir stays behind (and the caller keeps the ledger
     // entry), so only the deletion is skipped.
     if !keep_artifact {
+        if super::npm_flavor::keep_artifact_while_lock_references_it(
+            &mut outcome,
+            project_root,
+            &[BUN_LOCK],
+            &entry.uuid,
+            &uuid_dir_rel,
+        )
+        .await
+        {
+            return outcome;
+        }
         // The last npm-family entry leaves `.socket/vendor/npm/` (and
         // `.socket/vendor/`) empty: the shared helper prunes them so a
         // reverted project carries no vendor residue (non-recursive:
@@ -1001,9 +1030,13 @@ fn revert_one_record(
         }
         return;
     }
-    warnings.push(drifted(format!(
-        "lock entry `{key}` no longer exists; nothing to restore"
-    )));
+    // REMOVED, not drifted (#665): `bun remove` dropped the entry. The
+    // caller keeps the artifact only while the lock still resolves
+    // through it.
+    warnings.push(VendorWarning::new(
+        super::LOCK_ENTRY_REMOVED_CODE,
+        format!("lock entry `{key}` no longer exists; nothing to restore"),
+    ));
 }
 
 // ───────────────────────── vendor-specific classification ─────────────────
@@ -2391,6 +2424,96 @@ mod tests {
         (fx, entry, lock)
     }
 
+    /// A BN3 lock as Bun 1.4 migrates it from a vendored workspace
+    /// `bun.lockb` (#803): a `consumer` member the root depends on, spelled
+    /// with the member path the binary normalization wrote (`literal`).
+    fn migrated_workspace_lock(base: &str, version: u64, literal: &str) -> String {
+        let lock = base
+            .replace(
+                "        \"left-pad\": \"1.3.0\",\n      },\n    },\n",
+                &format!(
+                    "        \"consumer\": \"{literal}\",\n        \"left-pad\": \"1.3.0\",\n      \
+                     }},\n    }},\n    \"packages/consumer\": {{\n      \"name\": \"consumer\",\n      \
+                     \"version\": \"1.0.0\",\n    }},\n"
+                ),
+            )
+            .replace(
+                "  \"packages\": {\n",
+                &format!("  \"packages\": {{\n{}\n\n", workspace_entry_line(version)),
+            );
+        assert!(
+            lock.contains("packages/consumer\": {"),
+            "the splice must hit"
+        );
+        lock
+    }
+
+    async fn write_workspace_manifests(fx: &Fixture) {
+        tokio::fs::write(
+            fx.root().join("package.json"),
+            r#"{"name":"bn3-lockonly","workspaces":["packages/*"],"dependencies":{"consumer":"workspace:*","left-pad":"1.3.0"}}"#,
+        )
+        .await
+        .unwrap();
+        let member = fx.root().join("packages/consumer");
+        tokio::fs::create_dir_all(&member).await.unwrap();
+        tokio::fs::write(
+            member.join("package.json"),
+            r#"{"name":"consumer","version":"1.0.0"}"#,
+        )
+        .await
+        .unwrap();
+    }
+
+    /// #803: a vendored workspace `bun.lockb` that Bun 1.4 migrated to
+    /// text carries the member path as the literal. The in-sync re-run (the
+    /// only vendored write a text workspace lock admits) restores the
+    /// manifest's `workspace:` literal without a record, and a revert keeps
+    /// Bun's own spelling.
+    #[tokio::test]
+    async fn migrated_workspace_path_literal_is_healed_on_rerun() {
+        for version in [1u64, 2] {
+            let fx = fixture_with(
+                &as_lock_version(BN3_BEFORE_LOCK, version),
+                "node_modules/left-pad",
+            )
+            .await;
+            let (result, entry, _) = expect_done(fx.vendor(false).await);
+            assert!(result.success, "v{version}: {:?}", result.error);
+            let entry = entry.expect("fresh vendor records an entry");
+            write_workspace_manifests(&fx).await;
+            let wired = fx.read_lock().await;
+            let migrated = migrated_workspace_lock(&wired, version, "packages/consumer");
+            tokio::fs::write(fx.root().join(BUN_LOCK), &migrated)
+                .await
+                .unwrap();
+
+            let (result, rerun_entry, _) = expect_done(fx.vendor(false).await);
+            assert!(result.success, "v{version}: {:?}", result.error);
+            assert!(
+                rerun_entry.is_none(),
+                "v{version}: in-sync re-run records nothing"
+            );
+            assert_eq!(
+                fx.read_lock().await,
+                migrated_workspace_lock(&wired, version, "workspace:*"),
+                "v{version}: only the literal is healed"
+            );
+
+            let outcome = revert_bun(&entry, fx.root(), false).await;
+            assert!(outcome.success, "v{version}: {outcome:?}");
+            assert_eq!(
+                fx.read_lock().await,
+                migrated_workspace_lock(
+                    &as_lock_version(BN3_BEFORE_LOCK, version),
+                    version,
+                    "workspace:*"
+                ),
+                "v{version}: the registry tuple is back, Bun's literal kept"
+            );
+        }
+    }
+
     /// Every matching instance is already ours: the in-sync re-run must
     /// synthesize AlreadyPatched (exit-0 `already_vendored` upstream), not
     /// refuse — the lock already carries the local tuple whatever this run
@@ -3309,8 +3432,13 @@ mod tests {
         assert!(fx.root().join(fx.rel_tgz()).exists(), "artifact kept");
     }
 
+    /// #665: `bun remove left-pad` deleted the vendored entry line, so
+    /// nothing in bun.lock resolves through the artifact any more. A
+    /// vanished entry is not drift: the revert succeeds and removes the
+    /// unreferenced artifact instead of keeping it (and the ledger entry)
+    /// forever.
     #[tokio::test]
-    async fn vanished_entry_key_drift_keeps() {
+    async fn vanished_entry_drops_the_unreferenced_artifact() {
         let fx = fixture_with(BN3_BEFORE_LOCK, "node_modules/left-pad").await;
         let (_, entry, _) = expect_done(fx.vendor(false).await);
         let entry = entry.unwrap();
@@ -3329,17 +3457,50 @@ mod tests {
 
         let outcome = revert_bun(&entry, fx.root(), false).await;
         assert!(outcome.success, "{:?}", outcome.error);
+        assert!(!outcome.drift_skipped(), "{:?}", outcome.warnings);
         assert!(
             outcome
                 .warnings
                 .iter()
-                .any(|w| w.code == "vendor_lock_entry_drifted"
+                .any(|w| w.code == "vendor_lock_entry_removed"
                     && w.detail.contains("no longer exists; nothing to restore")),
             "{:?}",
             outcome.warnings
         );
-        assert!(outcome.kept_artifact, "drift-skip keeps the artifact");
+        assert!(!outcome.kept_artifact, "{:?}", outcome.warnings);
         assert_eq!(fx.read_lock().await, without_entry, "nothing rewritten");
+        assert!(
+            !fx.root().join(fx.rel_tgz()).exists(),
+            "unreferenced artifact removed"
+        );
+    }
+
+    /// #665 guard: the recorded entry vanished but another entry line still
+    /// resolves through the artifact, so it is kept like a drift-skip.
+    #[tokio::test]
+    async fn vanished_entry_keeps_the_artifact_while_the_lock_references_it() {
+        let fx = fixture_with(BN3_BEFORE_LOCK, "node_modules/left-pad").await;
+        let (_, entry, _) = expect_done(fx.vendor(false).await);
+        let entry = entry.unwrap();
+        let new_line = entry.wiring[0]
+            .new
+            .as_ref()
+            .and_then(Value::as_str)
+            .unwrap();
+        let live = fx.read_lock().await;
+        // Re-key the entry (`"left-pad"` → `"other/left-pad"`): the
+        // recorded key is gone, the tuple still points into our uuid dir.
+        let rekeyed_line = new_line.replacen("\"left-pad\"", "\"other/left-pad\"", 1);
+        assert_ne!(rekeyed_line, new_line, "the re-key must hit");
+        let rekeyed = live.replace(new_line, &rekeyed_line);
+        tokio::fs::write(fx.root().join(BUN_LOCK), &rekeyed)
+            .await
+            .unwrap();
+
+        let outcome = revert_bun(&entry, fx.root(), false).await;
+        assert!(outcome.success, "{:?}", outcome.error);
+        assert!(outcome.kept_artifact, "{:?}", outcome.warnings);
+        assert_eq!(fx.read_lock().await, rekeyed, "nothing rewritten");
         assert!(fx.root().join(fx.rel_tgz()).exists(), "artifact kept");
     }
 

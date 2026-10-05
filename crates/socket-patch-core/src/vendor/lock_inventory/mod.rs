@@ -71,8 +71,8 @@ pub(crate) mod wired;
 pub(crate) mod yarn;
 
 pub(crate) use self::npm::{
-    npm_legacy_identity, npm_lock_bundled_nodes, npm_lock_legacy_mirror_nodes, npm_lock_nodes,
-    NpmLockNode,
+    npm_legacy_identity, npm_lock_bundled_nodes, npm_lock_legacy_mirror_nodes,
+    npm_lock_located_nodes, NpmLockNode,
 };
 #[cfg(test)]
 pub(crate) use self::npm_family::inventory_npm_lock;

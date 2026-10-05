@@ -1086,8 +1086,8 @@ async fn pnpm_pinned_matrix_vendored_lifecycle_and_manifestless_vex() {
             run_pnpm_capstone(&pm, VendorDriver::VendorCli).await;
             run_pnpm_capstone(&pm, VendorDriver::GetUuid).await;
         }
-        7 => off_runtime(|| run_legacy_capstone(&pm, "lockfileVersion: 5.4")),
-        8 => off_runtime(|| run_legacy_capstone(&pm, "lockfileVersion: '6.0'")),
+        7 => off_runtime(|| run_legacy_capstone(&pm, "lockfileVersion: 5.4", "proj")),
+        8 => off_runtime(|| run_legacy_capstone(&pm, "lockfileVersion: '6.0'", "proj")),
         _ => off_runtime(|| run_unsupported_lock_refusal(&pm)),
     }
 }
@@ -1297,6 +1297,134 @@ fn pnpm8_lock_v60_hermetic_splice_idempotency_and_revert() {
     run_legacy_hermetic(PNPM8_LOCK, PNPM8_AFTER_TEMPLATE, "6.0");
 }
 
+/// #636: two packages vendored into a project with no `pnpm` table and no
+/// pnpm-workspace.yaml, then `vendor --revert` (purl order: is-number, the
+/// entry that created both, goes first). The lock was already byte-exact;
+/// package.json kept `"pnpm": { "overrides": {} }` and the scaffolded
+/// workspace file stayed behind. Both must now come back byte-identical.
+#[test]
+fn pnpm9_two_packages_vendor_revert_removes_created_scaffold() {
+    const LOCK: &str = "lockfileVersion: '9.0'
+
+settings:
+  autoInstallPeers: true
+  excludeLinksFromLockfile: false
+
+importers:
+
+  .:
+    dependencies:
+      is-number:
+        specifier: 7.0.0
+        version: 7.0.0
+      left-pad:
+        specifier: 1.3.0
+        version: 1.3.0
+
+packages:
+
+  is-number@7.0.0:
+    resolution: {integrity: sha512-41Cifkg6e8TylSpdtTpeLVMqvSBEVzTttHvERD741+pnZ8ANv0004MRL43QKPDlK9cGvNp6NZWZUBlbGXYxxng==}
+    engines: {node: '>=0.12.0'}
+
+  left-pad@1.3.0:
+    resolution: {integrity: sha512-XI5MPzVNApjAyhQzphX8BkmKsKUxD4LdyK24iZeQGinBN9yTQT3bFlCBy/aVx2HrNcqQGsdot8ghrjyrvMCoEA==}
+    deprecated: use String.prototype.padStart()
+
+snapshots:
+
+  is-number@7.0.0: {}
+
+  left-pad@1.3.0: {}
+";
+    let tmp = tempfile::tempdir().unwrap();
+    let proj = tmp.path().join("proj");
+    let orig = b"module.exports = function (x) { return x; };\n".to_vec();
+    let patched: Vec<u8> = [MARKER.as_bytes(), orig.as_slice()].concat();
+    let mut patches = serde_json::Map::new();
+    for (name, version, uuid) in [
+        ("left-pad", "1.3.0", UUID),
+        ("is-number", "7.0.0", "2b3c4d5e-6f70-4a1b-8c2d-0123456789ac"),
+    ] {
+        let dir = proj.join("node_modules").join(name);
+        std::fs::create_dir_all(&dir).unwrap();
+        std::fs::write(
+            dir.join("package.json"),
+            format!("{{\"name\":\"{name}\",\"version\":\"{version}\"}}\n"),
+        )
+        .unwrap();
+        std::fs::write(dir.join("index.js"), &orig).unwrap();
+        patches.insert(
+            format!("pkg:npm/{name}@{version}"),
+            serde_json::json!({
+                "uuid": uuid,
+                "exportedAt": "2026-01-01T00:00:00Z",
+                "files": { "package/index.js": {
+                    "beforeHash": git_sha256(&orig),
+                    "afterHash": git_sha256(&patched),
+                }},
+                "vulnerabilities": {},
+                "description": "two-package scaffold patch",
+                "license": "MIT",
+                "tier": "free",
+            }),
+        );
+    }
+    let socket = proj.join(".socket");
+    std::fs::create_dir_all(socket.join("blobs")).unwrap();
+    std::fs::write(
+        socket.join("manifest.json"),
+        serde_json::to_string_pretty(&serde_json::json!({ "patches": patches })).unwrap(),
+    )
+    .unwrap();
+    std::fs::write(socket.join("blobs").join(git_sha256(&patched)), &patched).unwrap();
+
+    let pkg_before = "{\n  \"name\": \"fx\",\n  \"version\": \"1.0.0\",\n  \"private\": true,\n  \
+                      \"dependencies\": {\n    \"left-pad\": \"1.3.0\",\n    \
+                      \"is-number\": \"7.0.0\"\n  }\n}\n";
+    std::fs::write(proj.join("package.json"), pkg_before).unwrap();
+    std::fs::write(proj.join("pnpm-lock.yaml"), LOCK).unwrap();
+    let cwd = proj.to_str().unwrap();
+
+    let (code, stdout, stderr) =
+        run_socket(&proj, &["vendor", "--json", "--offline", "--cwd", cwd]);
+    assert_eq!(code, 0, "vendor.\nstdout:\n{stdout}\nstderr:\n{stderr}");
+    let env = parse_envelope(&stdout);
+    assert_eq!(
+        env["summary"]["applied"], 2,
+        "both packages vendored: {env}"
+    );
+    assert!(
+        proj.join("pnpm-workspace.yaml").is_file(),
+        "a 9.0 lock mirrors overrides into a scaffolded workspace file"
+    );
+
+    let (code, stdout, stderr) = run_socket(
+        &proj,
+        &["vendor", "--revert", "--json", "--offline", "--cwd", cwd],
+    );
+    assert_eq!(code, 0, "revert.\nstdout:\n{stdout}\nstderr:\n{stderr}");
+    let renv = parse_envelope(&stdout);
+    assert_eq!(
+        renv["summary"]["removed"], 2,
+        "both entries reverted: {renv}"
+    );
+    assert_eq!(
+        std::fs::read_to_string(proj.join("package.json")).unwrap(),
+        pkg_before,
+        "no empty pnpm.overrides left behind"
+    );
+    assert_eq!(
+        std::fs::read_to_string(proj.join("pnpm-lock.yaml")).unwrap(),
+        LOCK
+    );
+    assert!(
+        !proj.join("pnpm-workspace.yaml").exists(),
+        "the scaffolded pnpm-workspace.yaml must be deleted"
+    );
+    assert!(!proj.join(".socket/vendor").exists());
+}
+
 /// The tarball's SRI (`sha512-<base64>`), the integrity spelling pnpm locks
 /// record.
 fn tarball_integrity(tgz: &Path) -> String {
@@ -1488,7 +1616,7 @@ fn pnpm7_real_lifecycle_same_path_frozen_and_moved_checkout_offline() {
         println!("SKIP: `corepack {PNPM_LEGACY_7}` unavailable");
         return;
     }
-    run_legacy_capstone(PNPM_LEGACY_7, "lockfileVersion: 5.4");
+    run_legacy_capstone(PNPM_LEGACY_7, "lockfileVersion: 5.4", "proj");
 }
 
 #[test]
@@ -1497,7 +1625,40 @@ fn pnpm8_real_lifecycle_same_path_frozen_and_moved_checkout_offline() {
         println!("SKIP: `corepack {PNPM_LEGACY_8}` unavailable");
         return;
     }
-    run_legacy_capstone(PNPM_LEGACY_8, "lockfileVersion: '6.0'");
+    run_legacy_capstone(PNPM_LEGACY_8, "lockfileVersion: '6.0'", "proj");
+}
+
+/// Project dir names holding a YAML indicator (#754). Windows forbids `:`
+/// in a path component, so the `: ` case runs on unix only.
+#[cfg(not(windows))]
+const YAML_INDICATOR_DIRS: &[&str] = &["hash #x", "colon: x"];
+#[cfg(windows)]
+const YAML_INDICATOR_DIRS: &[&str] = &["hash #x"];
+
+/// #754: the absolute specifier lands in the lock under a project path
+/// holding YAML indicators. Unquoted, ` #` turned the rest of the path
+/// into a comment (ERR_PNPM_OUTDATED_LOCKFILE) and `: ` broke the line
+/// (ERR_PNPM_BROKEN_LOCKFILE); the same-path frozen install must pass.
+#[test]
+fn pnpm7_real_lifecycle_under_yaml_indicator_paths() {
+    if !has_corepack_pm(PNPM_LEGACY_7) {
+        println!("SKIP: `corepack {PNPM_LEGACY_7}` unavailable");
+        return;
+    }
+    for dir in YAML_INDICATOR_DIRS {
+        run_legacy_capstone(PNPM_LEGACY_7, "lockfileVersion: 5.4", dir);
+    }
+}
+
+#[test]
+fn pnpm8_real_lifecycle_under_yaml_indicator_paths() {
+    if !has_corepack_pm(PNPM_LEGACY_8) {
+        println!("SKIP: `corepack {PNPM_LEGACY_8}` unavailable");
+        return;
+    }
+    for dir in YAML_INDICATOR_DIRS {
+        run_legacy_capstone(PNPM_LEGACY_8, "lockfileVersion: '6.0'", dir);
+    }
 }
 
 /// Full lifecycle against the REAL pinned legacy pnpm, spike-proven flags:
@@ -1515,9 +1676,9 @@ fn pnpm8_real_lifecycle_same_path_frozen_and_moved_checkout_offline() {
 ///    marker bytes (probe C);
 /// 5. idempotent re-vendor (byte-stable, already_vendored);
 /// 6. revert restores both files byte-identical and removes .socket/vendor.
-fn run_legacy_capstone(pm: &str, lock_head: &str) {
+fn run_legacy_capstone(pm: &str, lock_head: &str, proj_dir: &str) {
     let tmp = tempfile::tempdir().unwrap();
-    let proj = tmp.path().join("proj");
+    let proj = tmp.path().join(proj_dir);
     std::fs::create_dir_all(&proj).unwrap();
     let pkg_doc = serde_json::json!({
         "name": "pnpm-legacy-capstone",
@@ -1880,4 +2041,123 @@ fn pnpm_agent_apply_patches_a_transitive_dep_in_a_relocated_virtual_store() {
         assert_eq!(code, 0, "{setting}: rollback failed.\n{stdout}\n{stderr}");
         assert_eq!(std::fs::read(&index).unwrap(), orig, "{setting}");
     }
+}
+
+/// #360: on pnpm 10.5+ a project may keep its `overrides:` in
+/// pnpm-workspace.yaml, and a package.json `pnpm.overrides` then REPLACES
+/// them. Vendoring must wire only the workspace file and the lock, so the
+/// committable set still frozen-installs (no
+/// ERR_PNPM_LOCKFILE_CONFIG_MISMATCH) with the user's override intact and
+/// the patched bytes installed, and `vendor --revert` restores every file.
+#[test]
+fn pnpm_vendor_keeps_user_workspace_overrides_authoritative() {
+    if !has_corepack_pm(PNPM_PRIMARY) {
+        println!("SKIP: `corepack {PNPM_PRIMARY}` unavailable");
+        return;
+    }
+    let pm = PNPM_PRIMARY;
+    let tmp = tempfile::tempdir().unwrap();
+    let proj = tmp.path().join("proj");
+    std::fs::create_dir_all(&proj).unwrap();
+    let pkg_before = format!(
+        "{{\"name\":\"ws-overrides\",\"version\":\"0.0.0\",\"private\":true,\
+         \"dependencies\":{{\"{DEP}\":\"{DEP_VERSION}\",\"is-odd\":\"3.0.1\"}}}}\n"
+    );
+    let ws_before = "packages:\n  - '.'\noverrides:\n  is-number: 7.0.0\n";
+    std::fs::write(proj.join("package.json"), &pkg_before).unwrap();
+    std::fs::write(proj.join("pnpm-workspace.yaml"), ws_before).unwrap();
+
+    let store = tmp.path().join("pnpm-store");
+    let install = corepack(
+        &proj,
+        pm,
+        &["install", "--store-dir", store.to_str().unwrap()],
+    );
+    if !install.status.success() {
+        assert!(!pnpm_required(), "fixture install failed: {install:?}");
+        println!("SKIP: fixture `pnpm install` failed: {install:?}");
+        return;
+    }
+    let lock_path = proj.join("pnpm-lock.yaml");
+    let lock_before = std::fs::read_to_string(&lock_path).unwrap();
+    if !lock_before.contains("overrides:\n  is-number: 7.0.0\n") {
+        // pnpm 10.0-10.4 ignore workspace-file overrides; nothing to prove.
+        println!("SKIP: {pm} does not read overrides from pnpm-workspace.yaml");
+        return;
+    }
+
+    let index = proj.join("node_modules").join(DEP).join("index.js");
+    let orig = std::fs::read(&index).unwrap();
+    let patched: Vec<u8> = [MARKER.as_bytes(), orig.as_slice()].concat();
+    let purl = format!("pkg:npm/{DEP}@{DEP_VERSION}");
+    stage_patch(&proj, &purl, "package/index.js", &orig, &patched);
+    let cwd = proj.to_str().unwrap();
+
+    let (code, stdout, stderr) =
+        run_socket(&proj, &["vendor", "--json", "--offline", "--cwd", cwd]);
+    assert_eq!(code, 0, "vendor failed.\n{stdout}\n{stderr}");
+    let env = parse_envelope(&stdout);
+    assert_eq!(env["summary"]["applied"], 1, "{env}");
+    assert_eq!(
+        std::fs::read_to_string(proj.join("package.json")).unwrap(),
+        pkg_before,
+        "package.json must not gain a pnpm.overrides that shadows the workspace overrides"
+    );
+    let ws_after = std::fs::read_to_string(proj.join("pnpm-workspace.yaml")).unwrap();
+    assert!(
+        ws_after.starts_with(ws_before)
+            && ws_after.contains(&format!("{DEP}@{DEP_VERSION}: file:")),
+        "{ws_after}"
+    );
+
+    // Fresh checkout of the committable files, empty store.
+    let fresh = tmp.path().join("fresh");
+    std::fs::create_dir_all(&fresh).unwrap();
+    for file in ["package.json", "pnpm-lock.yaml", "pnpm-workspace.yaml"] {
+        std::fs::copy(proj.join(file), fresh.join(file)).unwrap();
+    }
+    copy_dir_recursive(&proj.join(".socket"), &fresh.join(".socket"));
+    let fresh_store = tmp.path().join("fresh-pnpm-store");
+    let ci = corepack(
+        &fresh,
+        pm,
+        &[
+            "install",
+            "--frozen-lockfile",
+            "--store-dir",
+            fresh_store.to_str().unwrap(),
+        ],
+    );
+    assert!(
+        ci.status.success(),
+        "fresh `pnpm install --frozen-lockfile` must accept the vendored wiring.\nstdout:\n{}\nstderr:\n{}",
+        String::from_utf8_lossy(&ci.stdout),
+        String::from_utf8_lossy(&ci.stderr),
+    );
+    assert_eq!(
+        std::fs::read(fresh.join("node_modules").join(DEP).join("index.js")).unwrap(),
+        patched,
+        "the patched bytes are installed"
+    );
+    // The user's override still applies: is-odd's is-number is 7.0.0.
+    let script = "const p=require('path');process.stdout.write(require(require.resolve(\
+         'is-number/package.json',{paths:[p.dirname(require.resolve('is-odd'))]})).version)";
+    let out = Command::new("node")
+        .args(["-e", script])
+        .current_dir(&fresh)
+        .output()
+        .expect("node runs");
+    assert_eq!(String::from_utf8_lossy(&out.stdout), "7.0.0", "{out:?}");
+
+    let (code, stdout, stderr) = run_socket(&proj, &["vendor", "--revert", "--json", "--cwd", cwd]);
+    assert_eq!(code, 0, "revert failed.\n{stdout}\n{stderr}");
+    assert_eq!(
+        std::fs::read_to_string(proj.join("package.json")).unwrap(),
+        pkg_before
+    );
+    assert_eq!(
+        std::fs::read_to_string(proj.join("pnpm-workspace.yaml")).unwrap(),
+        ws_before
+    );
+    assert_eq!(std::fs::read_to_string(&lock_path).unwrap(), lock_before);
 }
