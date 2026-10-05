@@ -2,7 +2,7 @@
 _Last updated 2026-10-05T13:30Z · main @ 4646693_
 
 **In flight:**
-- [#850](https://github.com/SocketDev/socket-patch/pull/850): one hermetic `common/hermetic.rs` builder for CLI test children; 8 `scrub_socket_env` copies deleted, 7 unscrubbed spawners made hermetic, `spawn_env_hygiene` ratchet. Issue #823 slice 1 (C30, C47). State: ready for review (2026-10-05T12:30Z), CI and Bugbot pending.
+- [#850](https://github.com/SocketDev/socket-patch/pull/850): one hermetic `common/hermetic.rs` builder for CLI test children; 8 `scrub_socket_env` copies deleted, 7 unscrubbed spawners made hermetic, `spawn_env_hygiene` ratchet. Issue #823 slice 1 (C30, C47). State: ready, handed to the PR burn-down 2026-10-05T13:16Z (CI green on `efa5cde`, 414 passed / 0 failed, macOS legs queued; Bugbot clean). Carries a port of #851 (the `vex_consumed` alias tests that `main` @ `4646693` broke).
 - [#858](https://github.com/SocketDev/socket-patch/pull/858): one blocking `stage_and_rename_blocking` core with a private `WriteOpts` policy behind the six `utils::fs` writers; `atomic_write_sync`'s copy and `create_stage`/`commit_stage` deleted; one `stage_path` builds `.socket-stage-` and `.socket-dl-` names. Issue #728 (C21). Production +171 / −168, tests ≈ +85 / −12. State: ready for review (2026-10-05T13:30Z), CI and Bugbot pending.
 
 **Merged:**
@@ -44,3 +44,4 @@ Re-ranked 2026-10-05T12:56Z: nothing merged since 11:56Z; 1 open (#850), so #728
 - CLI test targets: 145+ files spawn `socket-patch` with a bare `Command::new(binary())`; `tests/spawn_env_hygiene.rs` keeps `PENDING_RAW_SPAWNS` / `PENDING_SCRUB_COPIES` allowlists that fail on new **and** stale entries — drop a file from the list when you migrate it.
 - `utils::fs` writers run on the blocking pool via `run_blocking` since #858: a test calling them needs a tokio runtime but either flavor works.
 - `cargo test --test repair` under `SOCKET_DRY_RUN=true` is a quick hermeticity probe: on `main` 20 fail, after #850 only the 2 root-only tests.
+- `main` @ `4646693` (#605) broke 2 `socket-patch-cli --lib` `vex_consumed` alias tests, so `coverage` fails on every PR until #851 lands; #850 carries the port.
