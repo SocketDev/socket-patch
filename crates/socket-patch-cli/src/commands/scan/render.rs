@@ -303,7 +303,9 @@ pub(super) fn report_only_hint(common: &GlobalArgs) -> [String; 3] {
 /// `word` as one argument a user can paste into their shell: bare when it
 /// holds only characters no shell treats specially, otherwise quoted (POSIX
 /// single quotes; double quotes on Windows, which cmd and PowerShell both
-/// read as one argument).
+/// read as one argument). A trailing run of backslashes is doubled inside
+/// the Windows quotes: the argv parser would otherwise read the last one as
+/// escaping the closing quote.
 fn shell_word(word: &str) -> String {
     let plain = |c: char| {
         c.is_ascii_alphanumeric()
@@ -313,7 +315,8 @@ fn shell_word(word: &str) -> String {
     if !word.is_empty() && word.chars().all(plain) {
         word.to_string()
     } else if cfg!(windows) {
-        format!("\"{word}\"")
+        let trailing = word.len() - word.trim_end_matches('\\').len();
+        format!("\"{word}{}\"", "\\".repeat(trailing))
     } else {
         format!("'{}'", word.replace('\'', r"'\''"))
     }
@@ -843,6 +846,11 @@ mod tests {
                 r#""C:\Program Files\nodejs""#,
             ));
             rows.push((false, r"C:\nodejs\node_modules", r"C:\nodejs\node_modules"));
+            rows.push((
+                false,
+                r"C:\Program Files\nodejs\",
+                r#""C:\Program Files\nodejs\\""#,
+            ));
         } else {
             rows.push((false, "/tmp/global lib", "'/tmp/global lib'"));
             rows.push((false, "/tmp/it's", r"'/tmp/it'\''s'"));
