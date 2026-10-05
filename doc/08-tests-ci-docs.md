@@ -35,7 +35,7 @@ PR #277 has already started cleaning up: it deleted 237,608 lines, including 136
   - `fn binary()` in **103 files** (7 variants);
   - `fn git_sha256` in **86 files** (10 variants), although `common::git_sha256` exists and core exports `compute_git_sha256_from_bytes`;
   - `copy_dir_recursive` in 26 files;
-  - `scrub_socket_env` in 15 files with **14 different bodies**, which directly undermines hermeticity, and 10 more files spawn the binary with no scrub at all (see {{C47}}). {{C30}}
+  - `scrub_socket_env`: since #850, child processes are built by one `common/hermetic.rs` builder, and 7 per-file copies remain (the `PENDING_SCRUB_COPIES` list in `tests/spawn_env_hygiene.rs`); 2 files still spawn the binary with no scrub (see {{C47}}). {{C30}}
 - `vex_pdm_hatch_common` and `vex_pipenv_pip_common` share **977 identical non-blank lines** (78% similar).
 
 **Coverage-chasing tests.**
@@ -144,7 +144,7 @@ For `2463257` on `main`:
 
 ### New findings since the review
 
-- {{C47}} 10 test files spawn the CLI with no `SOCKET_*` scrub, beside the hermetic `common::run_bin_with_env`: on `045d7ec` an ambient `SOCKET_DRY_RUN=true` or `SOCKET_OFFLINE=true` turned 18 of the 19 `repair_vendor_e2e` tests red, while the scrubbed tests in the same target were unaffected.
+- {{C47}} Test files that spawned the CLI with no `SOCKET_*` scrub: on `045d7ec` an ambient `SOCKET_DRY_RUN=true` or `SOCKET_OFFLINE=true` turned 18 of the 19 `repair_vendor_e2e` tests red. Since #850, 8 of the 10 spawn through the hermetic `common/hermetic.rs` builder, and the `spawn_env_hygiene` ratchet fails on a new bare spawn. `scan_invariants` and `in_process_npm_multicopy` remain.
 - {{C40}} Env vars that core reads directly have no documentation guard: `SOCKET_API_CONCURRENCY` (the operator throttle for the patch API) and `SOCKET_WALK_THREADS` appear in no doc. Only clap-bound vars are checked, through `GLOBAL_ARG_ENV_VARS`/`LOCAL_ARG_ENV_VARS`. It is the env-var slice of 8.5 F.
 
 ---

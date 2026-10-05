@@ -1,11 +1,12 @@
 ### Refactor routine (`refactor`, hourly, highest leverage first)
-_Last updated 2026-10-05T13:30Z · main @ 4646693_
+_Last updated 2026-10-05T14:15Z · main @ 99f61d2_
 
 **In flight:**
-- [#850](https://github.com/SocketDev/socket-patch/pull/850): one hermetic `common/hermetic.rs` builder for CLI test children; 8 `scrub_socket_env` copies deleted, 7 unscrubbed spawners made hermetic, `spawn_env_hygiene` ratchet. Issue #823 slice 1 (C30, C47). State: ready, handed to the PR burn-down 2026-10-05T13:16Z (CI green on `efa5cde`, 414 passed / 0 failed, macOS legs queued; Bugbot clean). Carries a port of #851 (the `vex_consumed` alias tests that `main` @ `4646693` broke).
-- [#858](https://github.com/SocketDev/socket-patch/pull/858): one blocking `stage_and_rename_blocking` core with a private `WriteOpts` policy behind the six `utils::fs` writers; `atomic_write_sync`'s copy and `create_stage`/`commit_stage` deleted; one `stage_path` builds `.socket-stage-` and `.socket-dl-` names. Issue #728 (C21). Production +171 / −168, tests ≈ +85 / −12. State: ready for review (2026-10-05T13:30Z), CI and Bugbot pending.
+- [#858](https://github.com/SocketDev/socket-patch/pull/858): one blocking `stage_and_rename_blocking` core with a private `WriteOpts` policy behind the six `utils::fs` writers; `atomic_write_sync`'s copy and `create_stage`/`commit_stage` deleted; one `stage_path` builds `.socket-stage-` and `.socket-dl-` names. Issue #728 (C21). Production +171 / −168, tests ≈ +85 / −12. State: ready, with the PR burn-down.
+- [#865](https://github.com/SocketDev/socket-patch/pull/865): `utils::digest` gains `sha256_hex_of`, `sha1_hex_of`, `sha512_base64_of`, `sha512_sri_of`; production digest sites in the 14 files no open PR changes move onto them; `ledger_snapshots::sha256_hex`, `vlt_preflight::sha512_sri`, `nuget_feed::content_hash`, `client::is_valid_sha256_hex` and the npm_pack/bun_lock SRI blocks deleted; a ratchet lists the 6 files left for slice 2. Issue #706 slice 1 (C17).
 
 **Merged:**
+- [#850](https://github.com/SocketDev/socket-patch/pull/850): one hermetic `common/hermetic.rs` builder for CLI test children; 8 `scrub_socket_env` copies deleted, 7 unscrubbed spawners made hermetic, `spawn_env_hygiene` ratchet. Issue #823 slice 1 (C30, C47). Merged 2026-10-05 as `99f61d2`. Test-only: +745 / −322.
 - [#607](https://github.com/SocketDev/socket-patch/pull/607): blob and diff downloads stream to disk through `BinaryBody`; one `download_entries` loop replaces the blob and diff copies. Issue #571 (C37). Merged 2026-10-05 as `366b155`. Production ≈ +190 / −80 (`blob_fetcher.rs`, `client.rs`), tests ≈ +230.
 - [#602](https://github.com/SocketDev/socket-patch/pull/602): crawler project-tree reads go through `utils::fs::read_regular_*`, plus a `crawlers::architecture_tests` guard against bare reads. Issue #592 (E06). Merged 2026-10-05 as `2eae9a0`. Production +4 / −4, tests +241.
 - [#574](https://github.com/SocketDev/socket-patch/pull/574): one vlt `registry_base(era, segment, name, options)` for lock inventory and hosted restore, following vlt 1.3.5 DepID hydration (scoped registries, `~~` as `npm`, restore admission matching the rewrite). Issue #562 (E02, E03). Merged 2026-10-05 as `6ca92f5`.
@@ -16,13 +17,13 @@ _Last updated 2026-10-05T13:30Z · main @ 4646693_
 
 | # | Candidate | B | U | D | R | Score | Note |
 |---|---|:-:|:-:|:-:|:-:|:-:|---|
-| 1 | #728 (C21): one `utils::fs` stage-and-rename core | 0 | 1 | ≈3 | L | ≈5 | taken: PR #858 |
-| 2 | #823 slice 2: the 7 remaining copies + `scan_invariants`, `in_process_npm_multicopy` | 0 | 1 | ≈7 | L | ≈9 | skipped until #850 and #763, #774, #802, #820, #837, #839, #849 land |
-| 3 | #815 (E16 child 1 of #814): one `line_endings::terminator` | 0 | 1 | ≈12 | L | ≈14 raw | skipped: 9 of 12 copies in files changed by open PRs (#820, #827, #841, #690, #646, `redirect/mod.rs`) |
-| 4 | #717 (E10 slice of #715): `formats::maven` element queries for hosted rewrite + restore | 3 | 1 | 4 | M | 13 raw | skipped: `redirect/mod.rs` changed by open PRs #646, #657, #690 |
-| 5 | #726 (C42): `get` writes blobs through the verified cache writer | 1 | 0 | 1 | L | 4 | next after #858 merges (shares `utils/fs.rs`, `blob_fetcher.rs`) |
+| 1 | #706 slice 1 (C17): `utils::digest` compute helpers | 0 | 1 | ≈6 | L | ≈8 | taken: PR #865 |
+| 2 | #823 slice 2: the 7 remaining copies + `scan_invariants`, `in_process_npm_multicopy` | 0 | 1 | ≈7 | L | ≈9 | skipped until #763, #774, #802, #820, #837, #839 land |
+| 3 | #815 (E16 child 1 of #814): one `line_endings::terminator` | 0 | 1 | ≈12 | L | ≈14 raw | skipped: 9 of 12 copies in files changed by open PRs |
+| 4 | #717 (E10 slice of #715): `formats::maven` element queries for hosted rewrite + restore | 3 | 1 | 4 | M | 13 raw | skipped: `redirect/mod.rs` changed by 7 open PRs |
+| 5 | #781 (E19 Go half): go.mod `module` through `go_mod_edit`, delete `parse_go_mod_module` | 0 | 0 | ≈2 | L | ≈2 | free of open-PR overlap; fixes the block-form misread in VEX `--product` |
 
-Re-ranked 2026-10-05T12:56Z: nothing merged since 11:56Z; 1 open (#850), so #728 was the top candidate free of open-PR file overlap. Outside the top five unchanged from the previous run (see the entry for 20261005T115639Z): #706, #693, #707, #747, #773, #794, #746, #663, #757, #631, #809, #816, #832, #835, #834, #845, #844 and smaller. Decisions (not candidates): #648, #704, #792, #808; C07 needs an owner decision.
+Re-ranked 2026-10-05T13:56Z: #850 merged; 1 open (#858). #706 slice 1 is the top candidate free of overlap (14 of its 20 production files untouched by open PRs). Also free: #631 (go_sum_edit oracle, ≈3), #801 (`wired.rs` 221 dead lines, overlaps #813/#750/#724 in `lock_inventory`). #726 waits on #858 (`utils/fs.rs`). Others unchanged from the 20261005T115639Z entry. Decisions (not candidates): #648, #704, #792, #808, #615; C07 needs an owner decision.
 
 **Notes:**
 - The sandbox runs as root, so 4 core lib tests fail on main and on branches alike: `copy_tree::relax_loop_must_not_traverse_symlinked_root`, `vlt_heal::an_unremovable_hidden_lock_keeps_every_store_entry`, `pypi_poetry::wire_write_failure_maps_error_and_leaves_lock_untouched`, `pypi_requirements::wire_failure_rolls_back_already_written_files`.
@@ -45,3 +46,5 @@ Re-ranked 2026-10-05T12:56Z: nothing merged since 11:56Z; 1 open (#850), so #728
 - `utils::fs` writers run on the blocking pool via `run_blocking` since #858: a test calling them needs a tokio runtime but either flavor works.
 - `cargo test --test repair` under `SOCKET_DRY_RUN=true` is a quick hermeticity probe: on `main` 20 fail, after #850 only the 2 root-only tests.
 - `main` @ `4646693` (#605) broke 2 `socket-patch-cli --lib` `vex_consumed` alias tests, so `coverage` fails on every PR until #851 lands; #850 carries the port.
+- `#[cfg(test)] mod tests` blocks often lean on the parent's `use sha2::…` through `use super::*`: removing a production import breaks the test build (`cargo test --lib --no-run`), not `cargo build`. Add the import to the test module.
+- `vendor/berry_zip.rs`'s `berry_cache_checksum_10c0` has only test callers, so a helper used only there is dead code in the lib build.
