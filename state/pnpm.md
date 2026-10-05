@@ -1,6 +1,6 @@
 [agent] Progress ledger for the scheduled pnpm bug-hunt routine (label pm:pnpm).
 
-Last updated: 2026-10-05 (run 20), main `045d7ec`, latest release 4.0.0.
+Last updated: 2026-10-05 (run 21), main `4646693`, latest release 4.0.0.
 
 Method: real pnpm installs. Hosted, vendored and global agent mode run against a local Python mock of the patch API (batch, by-package, view with inline blobs, package grant, hosted tarball, `/registry/<name>/<ver>` mirror). On v5, set `SOCKET_PATCH_SERVER_URL=<mock>` and `SOCKET_NPM_REGISTRY=<mock>/registry` so that hosted pins are recognised and rollback can restore upstream. The oracle is a marker prepended to `index.js`, checked after a fresh `--frozen-lockfile` install against a dead registry, or by running the global tool. The repo's pinned matrix (`.github/workflows/pnpm-compatibility.yml`) already covers plain hosted and vendored installs on pnpm 1–12. This ledger tracks what it doesn't.
 
@@ -186,6 +186,19 @@ Run 19 additions (main `045d7ec`, Linux):
 | 11.28.3 | pass (two-doc lock too) | untested | untested | untested | untested | pass | untested | untested | untested |
 | 12.8.1 | pass (two-doc, alias, conflict markers, `--offline`) | pass / pass | fail #590 | pass / pass | pass | pass | pass / pass | pass / pass | pass (`lock_held`, 3/3) |
 
+Run 21 additions (main `4646693`, Linux):
+
+| pnpm (lock) | Hosted → vendored takeover over a vendored refusal (catalog / CRLF lock / workspace exact-pin override) | Vendored: workspace exact-pin override, bare key / versioned key | Vendored: `.gitignore` covers `*.tgz` / `vendor/` / `.socket/` (#831) | Vendored: path with `'`, `"`, ` #`, `: ` (#754 fix) |
+| --- | --- | --- | --- | --- |
+| 7.33.7 (5.4) | untested | untested | untested (absolute specifier) | pass |
+| 8.15.9 (6.0) | untested | untested | untested (absolute specifier) | pass (revert byte-exact) |
+| 9.15.9 | fail #853 / fail #853 / fail #853 | fail #854 / untested (package.json bare key: taken over) | fail #831 (PR #837: pass) | n/a |
+| 10.34.5 | untested / untested / fail #853 | fail #854 / pass | fail #831 | n/a |
+| 11.28.3 | fail #853 / fail #853 / fail #853 | fail #854 / untested | fail #831 | n/a |
+| 12.8.1 | fail #853 / fail #853 / fail #853 | fail #854 / pass | fail #831 (PR #837: pass) | n/a |
+
+Fixed on main `4646693` and re-verified with real pnpm in run 21: #356 (9 / 12), #360 (10.34.5), #557 (9 / 12), #626 (12), #636 (9 / 12), #661 / #696 (10.34.5 / 12.8.1), #662 (7 / 9 / 12), #754 (7 / 8). Read the older "fail" cells for those issues as fixed. #853 and #854 aren't regressions: release 4.0.0 behaves the same.
+
 Run 20 additions (main `045d7ec`, Linux):
 
 | pnpm (lock) | Vendored parent + vendored dep (`debug`→`ms`): `remove <parent>` / takeover → hosted / `rollback` | `remove <child>` (control) | Hosted parent + dep: remove parent / rollback | Mixed-case names (`Base64`, `JSONStream`): hosted / agent / vendored | User parent-selector / range-selector override (vendored) | Agent `symlink=false` / `hoist=false` | `list -g` |
@@ -224,28 +237,29 @@ Global mode (`-g`, v5 main `2463257`):
 
 0. **Maintainer request (global `-g` mode):** the Linux cells are done. Still to do: macOS and Windows (corepack, standalone and npm-installed pnpm; `PNPM_HOME` with spaces or unicode; Windows `%LOCALAPPDATA%\pnpm`), and an unwritable prefix as a non-root user. Full checklist in the 20261001T040000Z entry. Needs a probe branch.
 1. Delete the stale probe branch `bughunt/pnpm/20260930-virtual-store`. `git push --delete` failed through the git proxy in runs 1, 3, 10 and 16, and was denied by the permission policy in runs 2, 5–9, 11–14, 16, 17 and 19, so a maintainer needs to do it. macOS and Windows probes stay on hold until branch cleanup works.
-2. #754 follow-ups: a Windows `C:/…/My Project #2` checkout, and the moved-checkout heal path once the specifier is quoted. Needs a probe.
+2. #754 follow-ups: a Windows `C:/…/My Project #2` checkout, and the moved-checkout heal path now that the specifier is quoted. Needs a probe.
 2a. #778 follow-ups: pnpm 7 workspace layout, and `-g` absolute scopes vs `rollback -g` (`--sync`/`--prune` with a scope done in run 18: fails safe).
-3. #696 / #661 follow-ups: `modulesDir` in the global `config.yaml` / `rc` (`modulesDir` + `virtualStoreDir` together done in run 18: #661). When fixed, check that GVS and out-of-project `virtualStoreDir` transitive deps also stop attesting.
-3a. `list -g` on pnpm 11 / 12, and `list` under Rush and `sharedWorkspaceLockfile: false`.
+3. #696 / #661 follow-ups (both fixed in run 21): `modulesDir` in the global `config.yaml` / `rc`, and that GVS and out-of-project `virtualStoreDir` transitive deps also stop attesting.
+3a. `list` under Rush (`list -g` on 11 / 12 and `list` with `sharedWorkspaceLockfile: false` done in run 20: pass).
 4. Workspace-sensitive pnpm commands under the #734 scaffold on 9.x (`pnpm link`, `publish`, `-r`).
-5. #756 variants: in global mode, and on 9.15.9 / 10.34.5 (hoisted is n/a: one shared copy).
+5. #756 variants: in global mode, and on 9.15.9 / 10.34.5 (hoisted is n/a: one shared copy). Re-check after #605 with a mock package that has peer dependencies.
 6. #362 GVS transitive and #435 global `-g`: re-check exit codes under #555's skip semantics on 11.28.3 / 12.8.1.
 7. `package-import-method=clone` on reflink (needs CI).
 8. #556 follow-ups: merging branch lockfiles after a hosted pin, and agent `vex` on the branch.
 8a. #830 follow-ups: a three-level vendored chain, a `scan --mode vendored` re-run over the broken `remove` state, and the pnpm 7/8 workspace dialect.
-9. Re-verify #830, #360, #362, #435, #466, #492, #556, #557, #590 (PR #598; include member-cwd `list`), #601 (PR #605), #626 (PR #634), #627 (pnpm vendored symlinks, PR #802), #662 (PR #810), #633, #636 (PR #672; include the takeover path from the run 16 comment), #661 / #696 (PR #698), #713, #714, #734, #754, #756 and #778 when fixes land.
-10. Vendored on Windows and macOS (autocrlf: expect the `vendor_lockfile_crlf_unsupported` refusal; check that hosted handles the same checkout; hosted CRLF passes on Linux).
+8b. #853 follow-ups: the takeover over a peer-suffixed snapshot key and over a pnpm ≤6 legacy lock, and `vendor --dry-run` (manifest-driven) parity.
+9. Re-verify the open set when fixes land: #362, #435, #466, #492, #556, #590 (PR #598; include member-cwd `list`), #627 (PR #802), #633, #713, #714, #734, #756, #778, #830, #831 (PR #837, pnpm gitignore matrix), #853 and #854.
+10. Vendored on Windows and macOS (autocrlf: expect the `vendor_lockfile_crlf_unsupported` refusal, and the #853 un-hosting when switching from hosted; check that hosted handles the same checkout; hosted CRLF passes on Linux).
 
 ## Known non-bugs
 
 - `patches-api.socket.dev` and (for the Rust client) `registry.npmjs.org` are unreachable from the sandbox. Mock the API and point `SOCKET_NPM_REGISTRY` at a mirror.
 - v5 recognises hosted pins only on the configured patch server. Against a mock without `SOCKET_PATCH_SERVER_URL`, `rollback` says "Manifest not found". That's a fixture artifact.
-- v5 hosted rollback and takeover keep a user-edited `trustLockfile: true` and warn `pnpm_trust_lockfile_left`. A workspace file that exactly matches hosted mode's scaffold is deleted, including a user's own `packages: ['.']` file that the trust append made identical to it (CLI_CONTRACT, upstream restore).
+- v5 hosted rollback and takeover keep a user-edited `trustLockfile: true` and warn `pnpm_trust_lockfile_left`. A workspace file that exactly matches hosted mode's scaffold is deleted, including a user's own `packages: ['.']` file that the trust append made identical to it (CLI_CONTRACT, upstream restore). The same applies when the user's pre-existing workspace file held only other keys (for example `lockfileIncludeTarballUrl`): the hosted-added `trustLockfile: true` stays, with the warning (v5 records no provenance).
 - pnpm 10 ignores `enableGlobalVirtualStore` when `CI` is set, so the global-virtual-store cells don't engage on GH runners with pnpm 10.
 - pnpm 12 (and 11) ignore `.npmrc` for `virtual-store-dir` / `enable-global-virtual-store`. Put them in `pnpm-workspace.yaml`, or in the global `config.yaml`.
 - pnpm 11+ `pnpm root -g` / `pnpm add -g` fail unless `$PNPM_HOME/bin` is on `PATH`. Put it there in fixtures.
-- Vendored refusals that are intended, loud and fail-closed: a CRLF `pnpm-lock.yaml` or `pnpm-workspace.yaml` (`vendor_lockfile_crlf_unsupported`), a BOM package.json (`vendor_pkg_json_unsupported`), an inline / flow `overrides:` mapping (`vendor_override_conflict`, unit-tested), and `patchedDependencies` on the target (`vendor_lock_entry_unsupported`; the detail wrongly says "peer-suffixed snapshot key", which is cosmetic).
+- Vendored refusals that are intended, loud and fail-closed: a CRLF `pnpm-lock.yaml` or `pnpm-workspace.yaml` (`vendor_lockfile_crlf_unsupported`), a BOM package.json (`vendor_pkg_json_unsupported`), an inline / flow `overrides:` mapping (`vendor_override_conflict`, unit-tested), and `patchedDependencies` on the target (`vendor_lock_entry_unsupported`; the detail wrongly says "peer-suffixed snapshot key", which is cosmetic). On a hosted → vendored takeover these refusals fire after the hosted pin is already restored, which is #853.
 - Vendored `vex` attests from the committed artifact plus lock wiring even when the tree isn't installed. That's by design (CLI_CONTRACT "Manifest-less VEX").
 - `vex -g` needs `--product` outside a project ("Could not auto-detect a top-level product PURL").
 - Agent-mode `get <purl>` for an uninstalled package reports `success, applied: 1` when another manifest entry applies. The nested apply fails only when nothing matches. It's not pnpm-specific (noted on #362).
@@ -253,7 +267,7 @@ Global mode (`-g`, v5 main `2463257`):
 - Hosted on pnpm 9 over an existing upstream `node_modules`: a frozen install keeps the upstream bytes. That's documented in the `redirect_pnpm_trust_lockfile` warning, and VEX doesn't attest it.
 - pnpm 12 warns that `package.json` `pnpm.overrides` is ignored on vendored projects. The workspace-file override is what takes effect, so this is noise only.
 - A `vex --output /dev/stdout` hang when stdout is a pipe is not pnpm-specific.
-- Vendored refuses pnpm catalogs (`catalogs:` entry) and peer-suffixed snapshot keys with `vendor_lock_entry_unsupported` ("this lock shape is not supported yet"). It's loud and writes nothing. Hosted handles both.
+- Vendored refuses pnpm catalogs (`catalogs:` entry) and peer-suffixed snapshot keys with `vendor_lock_entry_unsupported` ("this lock shape is not supported yet"). It's loud and writes nothing. Hosted handles both. (The takeover from hosted un-hosts first: #853.)
 - pnpm 10's `configDependencies` copy (`node_modules/.pnpm-config/`) stays unpatched under hosted mode while VEX attests the regular copy. Config deps run only at install time, and pnpm 10 keeps their integrity in `pnpm-workspace.yaml`.
 - On v5, vendoring always downloads its artifact from the patch service (`--vendor-source build` was removed), so offline vendoring with only a staged manifest fails with `vendor_service_offline_conflict`. Fixtures need the mock grant to match the manifest UUID.
 - `rush update --full` re-resolves the Rush lock and drops the hosted pin, like `pnpm update`. VEX then honestly reports nothing to attest.
@@ -263,7 +277,7 @@ Global mode (`-g`, v5 main `2463257`):
 - Hosted on pnpm 11/12 respects an explicit `trustLockfile: false` (any YAML spelling) and warns `redirect_pnpm_trust_lockfile` with the remedy. The following frozen install fails, which is documented.
 - Vendored refuses pnpm ≤ 6 locks (5.x up to 5.3) with `vendor_lockfile_version_unsupported`, and pnpm 7/8 workspace locks with `vendor_lock_entry_unsupported`. pnpm 7/8 vendored locks carry an absolute `file:` specifier (`vendor_pnpm_legacy_absolute_specifier`), so a moved checkout needs `pnpm install --offline --no-frozen-lockfile` once. Both are documented.
 - pnpm 11+ ignores `package.json` `pnpm.patchedDependencies`. Put it in `pnpm-workspace.yaml`.
-- A dead-registry fresh install fails when the fixture has any unpatched dependency (it still needs the registry). Use the live registry for those fixtures, or patch every dependency.
+- A dead-registry fresh install fails when the fixture has any unpatched dependency (it still needs the registry). Use the live registry for those fixtures, or patch every dependency. The same goes for `--offline` with an empty store (`ERR_PNPM_NO_OFFLINE_TARBALL`).
 - Vendored from a workspace member cwd fails closed with `vendor_lockfile_missing` (`partial_failure`). Hosted's silent success in the same layout is #590.
 - A `package.json` without a trailing newline gains one after vendor + revert. That's a fixture artifact; files that end in a newline round-trip byte-exactly.
 - Bundled-copy fixtures need a registry-served host package. A `file:` tarball host (`.pnpm/bundler@file+…`) is patched correctly, so it doesn't reproduce #601.
@@ -293,5 +307,6 @@ Global mode (`-g`, v5 main `2463257`):
 - Agent → hosted takeover keeps the agent-mode manifest beside the new hosted pin (`list` shows each patch twice). The layers coexist, and `rollback` unwinds both. Agent → vendored migrates the manifest record out, as documented.
 - Vendored `list` keeps listing a package after `pnpm remove <pkg>`, because pnpm keeps the override and the wiring is still live. `vex` omits it.
 - Fixture note: `scan -g` also covers the npm global root, so it patches npm's own bundled deps (for example `/opt/node22/lib/node_modules/npm/node_modules/jsonparse`). That isn't pnpm-specific, but it can make a pnpm-global copy look `already_patched` in `apply -g` output.
-- Vendored refuses a user parent-selector (`a>b`) or range-selector (`b@<2`) override for the target with `vendor_override_conflict` and writes nothing. The detail text is slightly off (it mentions an exact-pin takeover, or "package.json" on pnpm 12), which is cosmetic.
+- Vendored refuses a user parent-selector (`a>b`) or range-selector (`b@<2`) override for the target with `vendor_override_conflict` and writes nothing. The detail text is slightly off (it mentions an exact-pin takeover, or "package.json" on pnpm 12), which is cosmetic. (A bare-key exact pin in `pnpm-workspace.yaml` is NOT a genuine conflict: #854.)
 - An API that answers with lowercased npm purls for a mixed-case installed name (`Base64`) isn't matched by agent apply (`package_not_installed`). There's no evidence the real API lowercases, so treat it as hypothetical (run 20).
+- `scan --mode vendored --dry-run` over a hosted pin previews only `would_vendor` (no `vendor_would_revert_redirect`). It's not pnpm-specific, so it isn't filed here (run 21).
