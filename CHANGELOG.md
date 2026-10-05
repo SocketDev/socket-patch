@@ -102,11 +102,6 @@ limits, and required install commands.
 
 ### Fixed
 
-- A failed hosted→vendored eject (`vendor` in a hosted project) puts back
-  only the files it wrote. `vendor --json > report.json` or
-  `vendor > vendor.log 2>&1` in the project root keeps the run's output, a
-  log another process appends to keeps its lines, and untouched root files
-  keep their inode and hard links (#687).
 - Global mode (`-g`) finds npm, yarn, pnpm, bun, RubyGems and Composer on
   Windows, where they install as `.cmd` / `.bat` shims, instead of reporting
   an empty scan. The yarn and npm-family global lookups no longer run from the
