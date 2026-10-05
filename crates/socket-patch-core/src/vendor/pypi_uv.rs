@@ -826,10 +826,20 @@ pub(super) async fn revert_uv(entry: &VendorEntry, root: &Path, dry_run: bool) -
             )
         };
         match rec.kind.as_str() {
-            "uv_lock_package"
-            | "uv_lock_requires_dist"
-            | "uv_lock_requires_dev"
-            | "uv_lock_manifest_constraints" => {
+            // Whole-array records are anchored on their key, never matched
+            // by text anywhere in the lock: a byte-identical array under
+            // another key (`build-constraints` holds `constraints = [`, a
+            // root `requires-dist` can equal the user's overrides) would
+            // otherwise splice the wrong array or fake convergence.
+            "uv_lock_requires_dev" | "uv_lock_manifest_constraints" => {
+                match revert_array_elements(&lock_text, &rec.kind, new_text, original_text, &needle)
+                {
+                    ArrayRevert::Reverted(t) => lock_text = t,
+                    ArrayRevert::Converged => {}
+                    ArrayRevert::Drift => warnings.push(drifted("uv.lock")),
+                }
+            }
+            "uv_lock_package" | "uv_lock_requires_dist" => {
                 match replace_fragment(&lock_text, new_text, original_text) {
                     Some(t) => lock_text = t,
                     None => {
@@ -843,21 +853,7 @@ pub(super) async fn revert_uv(entry: &VendorEntry, root: &Path, dry_run: bool) -
                         if original_text.is_some_and(|orig| lock_text.contains(orig)) {
                             continue;
                         }
-                        // A whole-array record whose array uv re-serialized
-                        // around our unchanged element (`uv add --dev x`
-                        // rewrites the group line, #821): revert just our
-                        // element inside the live array.
-                        match revert_array_elements(
-                            &lock_text,
-                            &rec.kind,
-                            new_text,
-                            original_text,
-                            &needle,
-                        ) {
-                            ArrayRevert::Reverted(t) => lock_text = t,
-                            ArrayRevert::Converged => {}
-                            ArrayRevert::Drift => warnings.push(drifted("uv.lock")),
-                        }
+                        warnings.push(drifted("uv.lock"));
                     }
                 }
             }
@@ -892,32 +888,21 @@ pub(super) async fn revert_uv(entry: &VendorEntry, root: &Path, dry_run: bool) -
                         }
                     }
                 }
-                WiringAction::Rewritten => {
-                    match replace_fragment(&lock_text, new_text, original_text) {
-                        Some(t) => lock_text = t,
-                        None => {
-                            // ALREADY CONVERGED: see the package-unit arm.
-                            if original_text.is_some_and(|orig| lock_text.contains(orig)) {
-                                continue;
-                            }
-                            // uv re-serializes `[manifest] overrides` sorted
-                            // and multi-line on any relock that touches it
-                            // (#806): remove just our element from the live
-                            // array.
-                            match revert_array_elements(
-                                &lock_text,
-                                &rec.kind,
-                                new_text,
-                                original_text,
-                                &needle,
-                            ) {
-                                ArrayRevert::Reverted(t) => lock_text = t,
-                                ArrayRevert::Converged => {}
-                                ArrayRevert::Drift => warnings.push(drifted("uv.lock")),
-                            }
-                        }
-                    }
-                }
+                // The record holds the bare array, so only the `overrides`
+                // key can anchor it (see the whole-array arm above). uv
+                // re-serializes it sorted and multi-line on any relock that
+                // touches it (#806).
+                WiringAction::Rewritten => match revert_array_elements(
+                    &lock_text,
+                    &rec.kind,
+                    new_text,
+                    original_text,
+                    &needle,
+                ) {
+                    ArrayRevert::Reverted(t) => lock_text = t,
+                    ArrayRevert::Converged => {}
+                    ArrayRevert::Drift => warnings.push(drifted("uv.lock")),
+                },
             },
             "uv_sources_entry" => {
                 let Some(new) = new_text else {
@@ -1057,14 +1042,15 @@ enum ArrayScope {
     Manifest,
 }
 
-/// Element-level revert of a record that captured a WHOLE lock array
+/// Key-anchored revert of a record that captured a WHOLE lock array
 /// (`uv_lock_requires_dev` / `uv_lock_manifest_constraints` as a `<key> =
 /// […]` line, `uv_lock_manifest_overrides` Rewritten as the bare array).
 /// uv re-serializes those arrays on any relock that touches a sibling
 /// element (`uv add --dev x`, `uv add y` sorting `[manifest] overrides`
 /// into its multi-line form), so the recorded text stops matching while
-/// our element is byte-identical inside. Diff the recorded old/new arrays
-/// into our element edits (an element rewritten in place, or one appended),
+/// our element is byte-identical inside. An array still holding exactly the
+/// recorded text is restored verbatim; otherwise diff the recorded old/new
+/// arrays into our element edits (an element rewritten in place, or one appended),
 /// apply them to the live array under the same key, and re-render the
 /// array the way uv writes it: one element inline, more one per line.
 fn revert_array_elements(
@@ -1124,6 +1110,12 @@ fn revert_array_elements(
         // routes through the artifact.
         return ArrayRevert::Converged;
     };
+    if lock_text[span.clone()] == *new_array {
+        // Untouched since vendoring: restore the recorded original verbatim.
+        let mut text = lock_text.to_string();
+        text.replace_range(span, old_array);
+        return ArrayRevert::Reverted(text);
+    }
     let mut live = elements(&lock_text[span.clone()]);
     let mut changed = false;
     for (ours, original) in &edits {
@@ -6328,6 +6320,62 @@ six = { path = ".socket/vendor/pypi/9f6b2c4e-1d3a-4f6b-8c2d-7e5a9b1c3d5f/six-1.1
         let (py, lock) = read_pair(tmp.path()).await;
         assert_eq!(py, TRANSITIVE_REGISTRY_PYPROJECT);
         assert_eq!(lock, input_lock);
+    }
+
+    /// The user's `[manifest] overrides` array is byte-identical to another
+    /// array in the lock (the root `requires-dist` pins the same package the
+    /// same way). After uv re-serializes the overrides, the recorded
+    /// original still appears elsewhere — that must NOT read as convergence:
+    /// revert decides from the `overrides` key itself, so our element is
+    /// removed instead of stranded pointing at a deleted artifact.
+    #[tokio::test]
+    async fn revert_converges_on_the_overrides_key_not_a_lookalike_array() {
+        let user_py = format!(
+            "{TRANSITIVE_REGISTRY_PYPROJECT}\n[tool.uv]\noverride-dependencies = [\"python-dateutil==2.8.2\"]\n"
+        );
+        let lookalike = "[{ name = \"python-dateutil\", specifier = \"==2.8.2\" }]";
+        assert!(
+            TRANSITIVE_REGISTRY_LOCK.contains(&format!("requires-dist = {lookalike}")),
+            "the root requires-dist must be the lookalike"
+        );
+        let input_lock = TRANSITIVE_REGISTRY_LOCK.replace(
+            "requires-python = \">=3.10\"\n",
+            &format!("requires-python = \">=3.10\"\n\n[manifest]\noverrides = {lookalike}\n"),
+        );
+        let tmp = write_pair(&user_py, &input_lock).await;
+        let p = load_uv_project(tmp.path()).await.unwrap();
+        let (wiring, meta, _) = wire_uv(
+            &p,
+            tmp.path(),
+            "six",
+            "1.16.0",
+            REL_WHEEL,
+            WHEEL_NAME,
+            WHEEL_SHA,
+            UUID,
+        )
+        .await
+        .unwrap();
+        let (_, wired_lock) = read_pair(tmp.path()).await;
+        let six_el = format!("{{ name = \"six\", path = \"{REL_WHEEL}\" }}");
+        let dateutil_el = "{ name = \"python-dateutil\", specifier = \"==2.8.2\" }";
+        let ours = format!("overrides = [{dateutil_el}, {six_el}]");
+        assert!(wired_lock.contains(&ours), "{wired_lock}");
+        let uv_spelling = format!("overrides = [\n    {dateutil_el},\n    {six_el},\n]");
+        tokio::fs::write(
+            tmp.path().join("uv.lock"),
+            wired_lock.replace(&ours, &uv_spelling),
+        )
+        .await
+        .unwrap();
+
+        let entry = entry_for(wiring, meta);
+        let outcome = revert_uv(&entry, tmp.path(), false).await;
+        assert!(outcome.success, "{:?}", outcome.error);
+        assert!(outcome.warnings.is_empty(), "{:?}", outcome.warnings);
+        let (py, lock) = read_pair(tmp.path()).await;
+        assert_eq!(py, user_py);
+        assert_eq!(lock, input_lock, "our element must not be stranded");
     }
 
     /// The pair gate: when a uv.lock record is GENUINELY drift-kept (our
