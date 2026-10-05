@@ -578,7 +578,8 @@ pub(crate) fn finish_writes(read: ReadFn<'_>, writes: Vec<FileWrite>) -> Vec<Fil
 }
 
 /// The text files the backend owns or derives whole (script, index,
-/// `.gitattributes`, derived `maven-metadata.xml`, `.mvn/maven.config`):
+/// `.gitattributes`, `.gitignore`, derived `maven-metadata.xml`,
+/// `.mvn/maven.config`, the generated sbt / scala-cli build files):
 /// compared line-ending-blind. Tree files stay byte-exact.
 pub(crate) fn eol_blind(rel: &str) -> bool {
     [
@@ -589,6 +590,13 @@ pub(crate) fn eol_blind(rel: &str) -> bool {
         gradle::VENDOR_GITATTRIBUTES_REL,
         maven_reactor::GITATTRIBUTES_REL,
         maven_reactor::MAVEN_CONFIG,
+        sbt::BUILD_FILE,
+        sbt::TREE_GITIGNORE_REL,
+        scala_cli::ROOT_FILE,
+        scala_cli::GUARD_REL,
+        coursier_tree::INDEX_REL,
+        coursier_tree::GITIGNORE_REL,
+        coursier_tree::GITATTRIBUTES_REL,
     ]
     .contains(&rel)
         || gradle::is_derived_metadata_path(rel)
@@ -743,6 +751,25 @@ pub(crate) mod testing {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn sbt_and_scala_cli_owned_files_are_unchanged_by_a_crlf_checkout() {
+        for rel in [
+            sbt::BUILD_FILE,
+            scala_cli::ROOT_FILE,
+            coursier_tree::INDEX_REL,
+        ] {
+            let lf = b"line one\nline two\n".to_vec();
+            let crlf = b"line one\r\nline two\r\n".to_vec();
+            let read = |r: &str| (r == rel).then(|| crlf.clone());
+            let writes = vec![FileWrite {
+                rel: rel.to_string(),
+                bytes: lf,
+                tree: false,
+            }];
+            assert!(finish_writes(&read, writes).is_empty(), "{rel}");
+        }
+    }
 
     fn patch() -> JvmPatch<'static> {
         JvmPatch {
