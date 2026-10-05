@@ -28,6 +28,7 @@ use crate::utils::purl::{percent_decode_purl_component, strip_purl_qualifiers};
 use super::common::{
     already_patched_result, done, failed_result, refused, service_offline_conflict,
 };
+use super::npm_dir;
 use super::npm_pack::PackedTarball;
 use super::path::vendor_uuid_dir_rel;
 use super::reuse;
@@ -177,8 +178,111 @@ pub(super) struct NpmStagedPack {
 /// Reuse a verified committed tarball or download its immutable service artifact.
 /// A dry run verifies the download without writing into the project. The
 /// backend wires the returned artifact only after acquisition succeeds.
+///
+/// The artifact must survive the commit the vendored workflow ends with, so
+/// git's ignore rules are checked on both sides of the write: a rule that
+/// ignores the uuid dir itself (`.socket/`, `vendor/`) refuses
+/// `vendor_artifact_gitignored` before anything is written, and once the
+/// tarball is in place `<uuid>/.gitignore` re-includes it against file rules
+/// such as Node.gitignore's `*.tgz`, then the written paths are probed again.
 #[allow(clippy::too_many_arguments)]
 pub(super) async fn stage_patch_pack(
+    purl: &str,
+    installed_dir: PackageSource<'_>,
+    project_root: &Path,
+    record: &PatchRecord,
+    sources: &PatchSources<'_>,
+    dry_run: bool,
+    force: bool,
+    warnings: &mut Vec<VendorWarning>,
+    service: Option<&VendorServiceConfig>,
+) -> Result<(Option<NpmStagedPack>, ApplyResult), Box<VendorOutcome>> {
+    let coords = guard_coordinates(purl, record)?;
+    if let Some(rules) =
+        npm_dir::gitignored(project_root, &[format!("{}/", coords.uuid_dir_rel)]).await
+    {
+        return Err(Box::new(refused(
+            npm_dir::GITIGNORED,
+            npm_dir::gitignored_detail(&coords.uuid_dir_rel, &rules),
+        )));
+    }
+    let (staged, result) = acquire_patch_pack(
+        purl,
+        installed_dir,
+        project_root,
+        record,
+        sources,
+        dry_run,
+        force,
+        warnings,
+        service,
+    )
+    .await?;
+    if let Some(staged) = &staged {
+        keep_pack_committable(purl, project_root, &coords, staged, warnings).await?;
+    }
+    Ok((staged, result))
+}
+
+/// Write `<uuid>/.gitignore` and `<uuid>/.gitattributes` next to the staged
+/// tarball, then ask git whether it would commit them. Still ignored (a rule
+/// the nested `.gitignore` cannot override) refuses and unwinds a uuid dir
+/// this run created; git failing to answer is only a warning.
+async fn keep_pack_committable(
+    purl: &str,
+    project_root: &Path,
+    coords: &NpmCoords,
+    staged: &NpmStagedPack,
+    warnings: &mut Vec<VendorWarning>,
+) -> Result<(), Box<VendorOutcome>> {
+    let unstage = |error: String| {
+        done_failure_unstage(
+            purl,
+            error,
+            project_root,
+            &coords.uuid_dir_rel,
+            staged.uuid_dir_preexisted,
+        )
+    };
+    let uuid_dir = project_root.join(&coords.uuid_dir_rel);
+    if let Err(e) = npm_dir::restore_uuid_metadata(&uuid_dir).await {
+        return Err(Box::new(
+            unstage(format!(
+                "cannot write {}/.gitignore: {e}",
+                coords.uuid_dir_rel
+            ))
+            .await,
+        ));
+    }
+    let probe = [
+        staged.rel_tgz.clone(),
+        format!("{}/.gitignore", coords.uuid_dir_rel),
+        format!("{}/.gitattributes", coords.uuid_dir_rel),
+    ];
+    match npm_dir::gitignore_probe(project_root, &probe).await {
+        Ok(Some(rules)) => {
+            if !staged.uuid_dir_preexisted {
+                let _ = remove_tree(&uuid_dir).await;
+                super::common::prune_empty_vendor_levels(&uuid_dir).await;
+            }
+            Err(Box::new(refused(
+                npm_dir::GITIGNORED,
+                npm_dir::gitignored_detail(&staged.rel_tgz, &rules),
+            )))
+        }
+        Ok(None) => Ok(()),
+        Err(why) => {
+            warnings.push(VendorWarning::new(
+                npm_dir::GITIGNORE_UNCHECKED,
+                npm_dir::gitignore_unchecked_detail(&staged.rel_tgz, &why),
+            ));
+            Ok(())
+        }
+    }
+}
+
+#[allow(clippy::too_many_arguments)]
+async fn acquire_patch_pack(
     purl: &str,
     _installed_dir: PackageSource<'_>,
     project_root: &Path,
@@ -1310,6 +1414,116 @@ mod tests {
             tgz,
             "the service bytes are written verbatim"
         );
+    }
+
+    // ──────────────── git ignore rules over the staged tarball ────────────────
+
+    /// A git work tree at `root` whose `.gitignore` is `rules`, or `None`
+    /// when git is not installed.
+    fn git_project(root: &Path, rules: &str) -> Option<()> {
+        let git = crate::utils::process::resolve_tool("git")?;
+        let ok = std::process::Command::new(git)
+            .arg("-C")
+            .arg(root)
+            .args(["init", "-q"])
+            .status()
+            .ok()?
+            .success();
+        assert!(ok, "git init");
+        std::fs::write(root.join(".gitignore"), rules).unwrap();
+        Some(())
+    }
+
+    async fn granted_service() -> wiremock::MockServer {
+        let tgz = build_tgz(&[("index.js", PATCHED_INDEX)]).await;
+        let sri = PackedTarball::from_bytes(&tgz).integrity;
+        let server = wiremock::MockServer::start().await;
+        mount_granted(&server, &sri, &tgz).await;
+        server
+    }
+
+    /// #831: GitHub's stock Node.gitignore ignores `*.tgz`. The staged
+    /// tarball gets a `<uuid>/.gitignore` that re-includes it, so git
+    /// commits it with the rewired lockfile.
+    #[tokio::test]
+    async fn a_tgz_ignore_rule_is_overridden_by_the_uuid_gitignore() {
+        let tmp = tempfile::tempdir().unwrap();
+        if git_project(tmp.path(), "node_modules\n*.tgz\n").is_none() {
+            return;
+        }
+        let server = granted_service().await;
+        let cfg = service_cfg(&server.uri(), VendorSource::Service);
+        let (staged, _) = run_pipeline(tmp.path(), &patched_index_record(), Some(&cfg))
+            .await
+            .unwrap_or_else(|e| panic!("a re-includable rule must not refuse: {e:?}"));
+        let staged = staged.expect("a wet run stages the tarball");
+        let uuid_dir = tmp.path().join(format!(".socket/vendor/npm/{UUID}"));
+        assert_eq!(
+            std::fs::read_to_string(uuid_dir.join(".gitignore")).unwrap(),
+            npm_dir::UUID_GITIGNORE
+        );
+        assert_eq!(
+            std::fs::read_to_string(uuid_dir.join(".gitattributes")).unwrap(),
+            npm_dir::UUID_GITATTRIBUTES
+        );
+        assert_eq!(
+            npm_dir::gitignored(tmp.path(), std::slice::from_ref(&staged.rel_tgz)).await,
+            None,
+            "git commits the vendored tarball"
+        );
+    }
+
+    /// #831: a rule ignoring the uuid dir itself (`vendor/`, `.socket/`)
+    /// can't be overridden from inside it, so vendoring refuses before
+    /// writing anything, dry run included.
+    #[tokio::test]
+    async fn a_directory_ignore_rule_refuses_before_any_write() {
+        for rule in ["vendor/", ".socket/", ".socket/vendor/"] {
+            for dry_run in [false, true] {
+                let tmp = tempfile::tempdir().unwrap();
+                if git_project(tmp.path(), &format!("node_modules\n{rule}\n")).is_none() {
+                    return;
+                }
+                let server = granted_service().await;
+                let cfg = service_cfg(&server.uri(), VendorSource::Service);
+                let blobs = tmp.path().join(".socket/blobs");
+                let sources = PatchSources::blobs_only(&blobs);
+                let mut warnings = Vec::new();
+                let err = expect_err(
+                    stage_patch_pack(
+                        LP_PURL,
+                        (&tmp.path().join("node_modules/left-pad")).into(),
+                        tmp.path(),
+                        &patched_index_record(),
+                        &sources,
+                        dry_run,
+                        false,
+                        &mut warnings,
+                        Some(&cfg),
+                    )
+                    .await,
+                );
+                expect_refusal(err, npm_dir::GITIGNORED);
+                assert!(
+                    !tmp.path().join(".socket/vendor").exists(),
+                    "{rule} (dry run {dry_run}): nothing is written"
+                );
+            }
+        }
+    }
+
+    /// Outside a git work tree there is nothing to commit, so no rule
+    /// applies and the pack stages as before (metadata included).
+    #[tokio::test]
+    async fn no_work_tree_stages_without_a_refusal() {
+        let tmp = tempfile::tempdir().unwrap();
+        std::fs::write(tmp.path().join(".gitignore"), ".socket/\n").unwrap();
+        let server = granted_service().await;
+        let cfg = service_cfg(&server.uri(), VendorSource::Service);
+        let (staged, _) = run_pipeline(tmp.path(), &patched_index_record(), Some(&cfg))
+            .await
+            .unwrap_or_else(|e| panic!("no work tree, no refusal: {e:?}"));
+        assert!(staged.is_some());
     }
 
     // ───────────────────────── small helper arms ─────────────────────────

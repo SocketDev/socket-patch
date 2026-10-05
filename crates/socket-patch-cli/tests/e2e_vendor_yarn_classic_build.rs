@@ -858,3 +858,205 @@ fn yarn_classic_detached_scan_vendored_fresh_checkout_manifestless_vex() {
     .run(&fresh);
     drop(server);
 }
+
+// ── #831: .gitignore rules over the vendored tarball ───────────────────
+
+fn git(cwd: &Path, args: &[&str]) -> Output {
+    let out = Command::new("git")
+        .args([
+            "-c",
+            "user.name=t",
+            "-c",
+            "user.email=t@t",
+            "-c",
+            "init.defaultBranch=main",
+        ])
+        .args(args)
+        .current_dir(cwd)
+        .output()
+        .expect("failed to run git");
+    assert!(
+        out.status.success(),
+        "git {args:?} failed:\n{}",
+        String::from_utf8_lossy(&out.stderr)
+    );
+    out
+}
+
+/// A yarn classic project inside a git work tree whose `.gitignore` adds
+/// `rule`, with left-pad installed and a marker patch staged. `None` when
+/// yarn or the registry is unavailable (after the skip line).
+fn gitignored_fixture(tmp: &Path, rule: &str) -> Option<(PathBuf, Vec<u8>)> {
+    if !require_yarn_classic("e2e_vendor_yarn_classic_build", |c| {
+        cache_env::isolate(c);
+    }) {
+        return None;
+    }
+    let proj = tmp.join("proj");
+    std::fs::create_dir_all(&proj).unwrap();
+    std::fs::write(
+        proj.join("package.json"),
+        format!(
+            r#"{{"name":"yarn-classic-gitignore","version":"0.0.0","private":true,"dependencies":{{"{DEP}":"{DEP_VERSION}"}}}}"#
+        ),
+    )
+    .unwrap();
+    let cache = tmp.join("yarn-cache");
+    let install = corepack(
+        &proj,
+        &yarn_classic(),
+        &["install", "--no-progress"],
+        &[("YARN_CACHE_FOLDER", cache.to_str().unwrap())],
+    );
+    if !install.status.success() {
+        skip!(
+            "fixture `yarn install` failed (registry unreachable?):\n{}",
+            String::from_utf8_lossy(&install.stderr)
+        );
+        return None;
+    }
+    let orig = std::fs::read(proj.join("node_modules").join(DEP).join("index.js")).unwrap();
+    let patched: Vec<u8> = [MARKER.as_bytes(), orig.as_slice()].concat();
+    stage_patch(
+        &proj,
+        &format!("pkg:npm/{DEP}@{DEP_VERSION}"),
+        "package/index.js",
+        &orig,
+        &patched,
+    );
+    std::fs::write(proj.join(".gitignore"), format!("node_modules\n{rule}\n")).unwrap();
+    git(&proj, &["init", "-q"]);
+    Some((proj, patched))
+}
+
+/// #831: GitHub's stock Node.gitignore ignores `*.tgz`. The vendored
+/// tarball must still reach the commit, so a fresh `git clone` installs the
+/// patched bytes with `--frozen-lockfile --offline` and an empty cache.
+#[test]
+fn yarn_classic_vendored_tarball_survives_a_tgz_gitignore_rule() {
+    let tmp = tempfile::tempdir().unwrap();
+    let Some((proj, patched)) = gitignored_fixture(tmp.path(), "*.tgz") else {
+        return;
+    };
+    let (code, stdout, stderr) = run_socket(
+        &proj,
+        &[
+            "vendor",
+            "--json",
+            "--offline",
+            "--cwd",
+            proj.to_str().unwrap(),
+        ],
+    );
+    assert_eq!(
+        code, 0,
+        "vendor failed.\nstdout:\n{stdout}\nstderr:\n{stderr}"
+    );
+    let env = parse_envelope(&stdout);
+    assert_eq!(env["summary"]["applied"], 1, "one package vendored: {env}");
+
+    git(&proj, &["add", "-A"]);
+    git(&proj, &["commit", "-qm", "vendored"]);
+    let tracked = String::from_utf8(git(&proj, &["ls-files", ".socket"]).stdout).unwrap();
+    let tgz_rel = format!(".socket/vendor/npm/{UUID}/{DEP}-{DEP_VERSION}.tgz");
+    assert!(
+        tracked.lines().any(|l| l == tgz_rel),
+        "the vendored tarball must be committed:\n{tracked}"
+    );
+
+    let fresh = tmp.path().join("fresh");
+    git(
+        tmp.path(),
+        &[
+            "clone",
+            "-q",
+            proj.to_str().unwrap(),
+            fresh.to_str().unwrap(),
+        ],
+    );
+    let fresh_cache = tmp.path().join("fresh-yarn-cache");
+    let ci = corepack(
+        &fresh,
+        &yarn_classic(),
+        &["install", "--frozen-lockfile", "--offline", "--no-progress"],
+        &[("YARN_CACHE_FOLDER", fresh_cache.to_str().unwrap())],
+    );
+    assert!(
+        ci.status.success(),
+        "a fresh clone must install from the committed tarball.\nstdout:\n{}\nstderr:\n{}",
+        String::from_utf8_lossy(&ci.stdout),
+        String::from_utf8_lossy(&ci.stderr),
+    );
+    if yarn_classic_vex::installs_file_tarballs(&yarn_classic_vex::yarn_classic_version()) {
+        assert_eq!(
+            std::fs::read(fresh.join("node_modules").join(DEP).join("index.js")).unwrap(),
+            patched,
+            "the clone installs the patched bytes"
+        );
+    }
+
+    // A checkout that lost the ledger and manifest (both ignored, or dropped
+    // from the commit) still has yarn.lock wired to the artifact: `vendor
+    // --check` must fail on that reference, not pass with nothing to check.
+    std::fs::remove_file(fresh.join(".socket/vendor/state.json")).unwrap();
+    std::fs::remove_file(fresh.join(".socket/manifest.json")).unwrap();
+    let (code, stdout, stderr) = run_socket(
+        &fresh,
+        &["vendor", "--check", "--json", "--cwd", fresh.to_str().unwrap()],
+    );
+    assert_eq!(
+        code, 1,
+        "vendor --check must fail on an unledgered lock reference.\nstdout:\n{stdout}\nstderr:\n{stderr}"
+    );
+    let env = parse_envelope(&stdout);
+    assert!(
+        env["events"].as_array().unwrap().iter().any(|e| {
+            e["errorCode"] == "vendor_ledger_missing"
+                && e["uuid"] == UUID
+                && e["details"]["ecosystem"] == "npm"
+        }),
+        "expected vendor_ledger_missing naming the referenced artifact: {env}"
+    );
+}
+
+/// #831: a rule ignoring the vendored uuid dir itself (`vendor/`,
+/// `.socket/`) can't be overridden from inside it. Vendoring refuses with
+/// `vendor_artifact_gitignored` and leaves `yarn.lock` untouched, instead of
+/// reporting success over a tarball the commit would drop.
+#[test]
+fn yarn_classic_vendor_refuses_a_gitignored_vendor_dir() {
+    for rule in ["vendor/", ".socket/"] {
+        let tmp = tempfile::tempdir().unwrap();
+        let Some((proj, _)) = gitignored_fixture(tmp.path(), rule) else {
+            return;
+        };
+        let lock_before = std::fs::read(proj.join("yarn.lock")).unwrap();
+        let (code, stdout, stderr) = run_socket(
+            &proj,
+            &[
+                "vendor",
+                "--json",
+                "--offline",
+                "--cwd",
+                proj.to_str().unwrap(),
+            ],
+        );
+        assert_eq!(
+            code, 1,
+            "{rule}: vendor must fail.\nstdout:\n{stdout}\nstderr:\n{stderr}"
+        );
+        assert!(
+            stdout.contains("vendor_artifact_gitignored"),
+            "{rule}: refusal code expected:\n{stdout}"
+        );
+        assert_eq!(
+            std::fs::read(proj.join("yarn.lock")).unwrap(),
+            lock_before,
+            "{rule}: yarn.lock stays untouched"
+        );
+        assert!(
+            !proj.join(format!(".socket/vendor/npm/{UUID}")).exists(),
+            "{rule}: no artifact is written"
+        );
+    }
+}
