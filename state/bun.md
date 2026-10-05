@@ -1,6 +1,6 @@
 [agent] Progress ledger for the scheduled Bun bug-hunt routine (label pm:bun).
 
-Last updated: 2026-10-05 (run 19), main `045d7ec`, latest release 4.0.0, latest Bun 1.4.2.
+Last updated: 2026-10-05 (run 20), main `6811b4e`, latest release 4.0.0, latest Bun 1.4.2.
 
 Method (run 16 note: the sandbox shell exports `BUN_OPTIONS=--smol`, so unset it; run 17 note: on Bun ≥ 1.2, `bunfig [install] saveTextLockfile = false` writes a binary `bun.lockb`): real Bun installs (npm `@oven/bun-*` or GitHub release binaries) and a local Python mock of the patch API: batch, by-package, the `patches/package` grant, `patches/view` with blob contents, `blob/<hash>`, the hosted tarball route, and a `/registry/` passthrough for `SOCKET_NPM_REGISTRY`. Set `SOCKET_PATCH_SERVER_URL` to the mock. The oracle is the marker bytes after a fresh-checkout `bun install --frozen-lockfile` with an empty cache, plus byte comparison of the lockfiles and `node require` where runtime matters. The repo's own matrix (`scripts/backtest-bun.py`, `bun-compatibility.yml`) already covers plain hosted and vendored shapes across Bun 0.8.1–1.4.2. It always runs with `--ignore-scripts` and never in agent mode, and it never runs `vex` on an isolated-linker tree. This ledger tracks what it doesn't.
 
@@ -26,6 +26,8 @@ Run 18 (main unchanged at `045d7ec`, so no re-triage): no new bugs. #764 is conf
 
 Run 19 (main unchanged at `045d7ec`, so no re-triage): no new issue. The yarn-classic handover #831 reproduces on Bun: a vendored tarball covered by `.gitignore` (`*.tgz`, `vendor/`, `.socket/`) exits 0, the commit drops it, and fresh frozen installs fail. That holds on text v1/v2, `bun.lockb` and an isolated workspace, and the Bun matrix is commented on #831. `bun ci` reproduces #803. The other new cells pass: the run 19 section below.
 
+Run 20 (new main `6811b4e`): #803, #739 and #720 were fixed by #811, #741 and #722, closed by the maintainers, and verified on Linux (#803 heal: hosted + vendored re-run; #720: lockfile-only `bun.lockb` supersede + vendored takeover). #599 and #497 still reproduce, and #497 also gives a false `not_affected` from lockfile-only default `vex` (commented). New: #861. A vendored re-run after a new dependent duplicates a `bun.lockb` tarball record, and isolated frozen installs fail EEXIST intermittently on 1.3.9/1.4.2. The other new cells pass: the run 20 section below.
+
 ## Coverage matrix
 
 | OS | Bun | Agent: hoisted | Agent: isolated linker | Hosted/vendored: `bun patch` | Hosted/vendored: default-trusted scripts | Hosted → `vex`: isolated linker | Hosted rollback/remove byte-exact (text lock) | `bun.lockb` takeover ⇄ revert |
@@ -36,7 +38,7 @@ Run 19 (main unchanged at `045d7ec`, so no re-triage): no new issue. The yarn-cl
 | Linux | 1.3.0–1.3.4 | pass (1.3.0, 1.3.4) | pass (1.3.0, 1.3.4; run 9) | untested | pass | pass (1.3.0, 1.3.4; run 9) | pass (single: hosted + vendored; workspace: hosted, vendored refuses as documented) | untested |
 | Linux | 1.3.5–1.3.9 | pass (1.3.9; run 14) | pass (1.3.9; run 14) | fail #367 (1.3.9) | fail #371 | untested | untested | untested |
 | Linux | 1.3.14 | pass | pass (run 9) | fail #367 | fail #371 | pass fresh; fail #599 in place | pass (v1, workspace, catalog) | pass (semantic; vendored lockb isolated workspace too; run 10) |
-| Linux | 1.4.2 | pass; fail #635 with `globalStore`; fail #626 (first-party workspace member) | pass (run 9; peer-hash entries, symlink backend) | fail #367 (text + lockb) | fail #371 | pass fresh (text + lockb workspace); fail #599 in place | pass (v2, alias, overrides) | pass (semantic; not byte-exact, see Known non-bugs); fail #803 after a workspace lockb → text migration |
+| Linux | 1.4.2 | pass; fail #635 with `globalStore`; fail #626 (first-party workspace member) | pass (run 9; peer-hash entries, symlink backend) | fail #367 (text + lockb) | fail #371 | pass fresh (text + lockb workspace); fail #599 in place | pass (v2, alias, overrides) | pass (semantic; not byte-exact, see Known non-bugs); workspace lockb → text migration healed by a re-run (#803 fixed, run 20); vendored re-run after a new dependent: fail #861 (isolated) |
 | macOS | 1.2.23 | pass | fail #366 | fail #367 | untested | fail #405 | untested | untested |
 | macOS | 1.3.4 / 1.3.5 | untested | untested | untested | pass / fail #371 | untested | untested | untested |
 | macOS | 1.3.14 / 1.4.2 | pass | fail #366 | fail #367 | fail #371 (1.4.2) | fail #405 | untested | untested |
@@ -68,6 +70,20 @@ No `Authorization` header reaches the hosted tarball host for any of: bunfig def
 
 ### Platform-specific optional deps (run 10, Linux)
 `os`/`cpu` meta (fsevents, @esbuild/darwin-arm64, @esbuild/linux-x64). The hosted rewrite keeps the meta, and Linux frozen installs fetch only linux-x64 (patched), on 1.1.45 v0 + lockb, 1.2.23, 1.3.14, 1.4.2 text + lockb: pass. Hosted rollback is byte-exact (1.4.2): pass. `minimumReleaseAge` with hosted pins (1.4.2): pass.
+
+### Run 20 cells (Linux, main `6811b4e`)
+
+| Cell | Bun | Result |
+| --- | --- | --- |
+| Vendored workspace `bun.lockb` → new member depending on the patched pkg → `bun install` → vendored re-run → fresh frozen install | 1.4.2 / 1.3.9 isolated | fail #861 (EEXIST, ~50%) |
+| Same | 1.2.23 isolated, 1.4.2 hoisted, 1.4.2 text v2 isolated; hosted on 1.2.23 / 1.3.9 / 1.4.2 | pass |
+| #803 heal (migrated by 1.4.2, then re-run): hosted + vendored; hosted rollback after the heal | writer 1.4.2 | pass |
+| #803 heal shapes: scoped member, `packages/*/*`, dir with space/`ü`/`#`, peer workspace edge, nameless root, dir ≠ name | 1.4.2 | pass |
+| `catalog:` + named `catalogs:` workspace `bun.lockb`: hosted, frozen by each reader | writers 1.4.2 / 1.3.9 / 1.2.23 | pass (takeover refuses, documented) |
+| Vendored isolated catalog `bun.lockb`: frozen, `vex`, byte-exact revert; deleted member mirror → `vendor --check` / `vex` fail closed → `repair` | 1.4.2 | pass |
+| #720: lockfile-only `bun.lockb` hosted supersede; lockfile-only vendored takeover | 1.4.2 | pass |
+| Lockfile-only URL-only dependency (now inventoried): hosted / vendored | 1.4.2 text | pass (same as with `node_modules`) |
+| #497 shape, lockfile-only default `vex` | 1.4.2 text | fail #497 (attests) |
 
 ### Run 19 cells (Linux)
 
@@ -264,13 +280,14 @@ Other passes (Linux, 1.4.2 unless noted):
 ## Backlog
 
 0. **Maintainer request (partly covered in runs 3 and 6):** global (`-g`) mode for hosted patches. Still to do: a non-writable global dir must fail loudly (needs a probe; the sandbox runs as root); Windows 1.1.45/1.2.23 with an ASCII temp path; Bun 1.0.x. #443 is still open; re-test #434 (`bun.cmd`) on Windows now that #442 has landed. Checklist: the 20261001T040000Z entry.
-1. A maintainer needs to delete the probe branches `bughunt/bun/20260930-default-trust`, `bughunt/bun/20260930-isolated-bunpatch`, `bughunt/bun/20261001-vex-isolated` and `bughunt/bun/20261001-global-dirs`. Deletion is still refused from the sandbox (runs 7–17; in run 16 the session's permission policy also blocked repeat attempts), so no new probes until then.
-2. #831: re-test on Bun (text, `bun.lockb`, workspace) once #837 lands. #764 follow-up: macOS/Windows. Real Windows autocrlf checkouts (simulated on Linux in run 19: pass).
-3. #831, #803, #784, #764, #739, #720, #635 and #599: re-test when fixed. #626 on Bun once PR #634 merges (isolated member links live under `packages/<member>/node_modules`). Also `globalStore` + workspaces, and `globalStore` on macOS/Windows.
-4. macOS/Windows re-runs of the #366 / #405 / #469 fixes (Windows isolated uses junctions).
-5. #497 `github:` tuples (needs a probe); re-test #497 when fixed.
-6. Hosted rollback on real macOS and Windows checkouts.
-7. Digest boundary with a valid substitute tarball, 1.3.9 text lock vs 1.3.10 (low priority, documented limitation).
+1. A maintainer needs to delete the probe branches `bughunt/bun/20260930-default-trust`, `bughunt/bun/20260930-isolated-bunpatch`, `bughunt/bun/20261001-vex-isolated` and `bughunt/bun/20261001-global-dirs`. Deletion is still refused from the sandbox (runs 7–20), so no new probes until then.
+2. #861: macOS/Windows; the `bun add` in an existing member variant; re-test when fixed.
+3. #831: re-test on Bun (text, `bun.lockb`, workspace) once #837 lands. #764 follow-up: macOS/Windows. Real Windows autocrlf checkouts.
+4. #861, #831, #784, #764, #635, #599 and #497: re-test when fixed. #626 on Bun once PR #634 merges. Also `globalStore` + workspaces, `globalStore` on macOS/Windows, and #605's store-copy handling on Bun isolated peer-variant (`+hash`) entries.
+5. macOS/Windows re-runs of the #366 / #405 / #469 / #803 fixes (Windows isolated uses junctions).
+6. #497 `github:` tuples (needs a probe).
+7. Hosted rollback on real macOS and Windows checkouts.
+8. Digest boundary with a valid substitute tarball, 1.3.9 text lock vs 1.3.10 (low priority, documented limitation).
 
 ## Known non-bugs
 
@@ -330,3 +347,6 @@ Other passes (Linux, 1.4.2 unless noted):
 - A lockfile-only hosted re-run can't see existing pins (#720), so `maxNewPatches` neither counts nor defers them, and nothing is unwired (run 18).
 - After `vendor --revert` in a `core.autocrlf=true` clone, the restored registry line in `bun.lock` is LF inside an otherwise CRLF working copy. Git normalizes it on commit (byte-exact to the pre-vendor commit) and Bun reads it, so it's cosmetic. Hosted `rollback` keeps CRLF on every line (run 19).
 - Mock fixture: `pkill -f mock.py` also matches the calling shell, whose command line contains the heredoc. Kill the mock by pidfile.
+- Vendored `bun.lockb` workspaces commit an identical tarball under every member's `.socket/vendor`, even members that don't use the package. That's deliberate (Bun 0.5.9–1.3 resolves workspace local tarballs relative to the declaring member, `bun_binary.rs:142`). A missing member copy fails closed (`vendor_workspace_artifact_missing`), and `repair` restores it (run 20).
+- Bun refuses a workspace member that depends on the root package via `workspace:*` (`root@workspace:* failed to resolve`), so that #803-heal shape can't occur (run 20).
+- Bun 1.3.9 can't frozen-install a text `bun.lock` written by 1.4.2 (`lockfile had changes`). That's cross-version Bun behaviour.
