@@ -106,6 +106,14 @@ limits, and required install commands.
 
 ### Fixed
 
+- `scan --vex` in hosted mode no longer attests an npm patch as
+  `not_affected` when `package-lock.json` also lists a bundled copy of the
+  same `name@version` (`inBundle`, or `bundled` in a v1 lock). npm unpacks
+  that copy from its parent's tarball, so it stays unpatched; the run
+  already warned `redirect_npm_bundled_instance_skipped` and now leaves the
+  patch out of its attestation, like a standalone `vex` run (#325). When a
+  `packages` map exists, stale bundled flags in the legacy `dependencies`
+  mirror do not suppress an attestation for the actual install tree.
 - `vex` no longer attests an npm or Bun patch as `not_affected` while a
   second entry for the same `name@version` in the same lockfile still
   resolves from the registry (for example a workspace member added after

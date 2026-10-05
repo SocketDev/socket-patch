@@ -934,6 +934,10 @@ fn rewrite_one_npm_lock(
     // Entries npm installs from a git / url / `file:` spec: see
     // `vendor::npm_origin` (#326).
     let non_registry = npm_non_registry_entries(&lock, manifest_overrides);
+    // npm 7+ reads `packages` when it exists; the legacy `dependencies`
+    // mirror must not suppress an attestation for that install tree.
+    // Match the shared npm lock inventory's object-valued-map precedence.
+    let legacy_is_install_tree = lock.get("packages").and_then(Value::as_object).is_none();
     let mut changed = false;
     for dep in npm {
         let fname = full_name(dep);
@@ -968,9 +972,12 @@ fn rewrite_one_npm_lock(
                 // here would put the hosted URL in the lockfile (confirming
                 // and VEX-attesting the patch) while the unpatched bundled
                 // bytes keep installing. Mirrors the vendored backend's
-                // `vendor_bundled_instance_skipped` refusal.
+                // `vendor_bundled_instance_skipped` refusal. The uuid is
+                // recorded so the in-run `--vex` verifies instead of
+                // assuming the patch applied (#325, as Bun's #469).
                 if entry.get("inBundle").and_then(Value::as_bool) == Some(true) {
                     matched_any = true;
+                    result.bundled_skipped_uuids.insert(dep.patch_uuid.clone());
                     result.warnings.push(RewriteWarning {
                         code: "redirect_npm_bundled_instance_skipped".into(),
                         detail: format!(
@@ -1021,6 +1028,7 @@ fn rewrite_one_npm_lock(
                 dep,
                 &sha512,
                 lockfile,
+                legacy_is_install_tree,
                 result,
                 &mut matched_any,
             ) || changed;
@@ -1102,6 +1110,7 @@ fn rewrite_npm_v2_deps(
     dep: &DepOverride,
     sha512: &str,
     lockfile: &str,
+    legacy_is_install_tree: bool,
     result: &mut RewriteResult,
     matched_any: &mut bool,
 ) -> bool {
@@ -1115,6 +1124,9 @@ fn rewrite_npm_v2_deps(
             // fail-open as the `packages` guard above.
             if entry.get("bundled").and_then(Value::as_bool) == Some(true) {
                 *matched_any = true;
+                if legacy_is_install_tree {
+                    result.bundled_skipped_uuids.insert(dep.patch_uuid.clone());
+                }
                 result.warnings.push(RewriteWarning {
                     code: "redirect_npm_bundled_instance_skipped".into(),
                     detail: format!(
@@ -1148,6 +1160,7 @@ fn rewrite_npm_v2_deps(
                 dep,
                 sha512,
                 lockfile,
+                legacy_is_install_tree,
                 result,
                 matched_any,
             ) || changed;
@@ -14102,6 +14115,10 @@ mod tests {
             "a bundled skip is a MATCH — not-found must stay quiet: {:?}",
             r.warnings
         );
+        assert!(
+            r.bundled_skipped_uuids.contains(&overrides[0].patch_uuid),
+            "#325: the skipped bundled copy must keep the patch out of the in-run VEX"
+        );
     }
 
     /// #326: npm installs a git, remote-tarball or `file:` dependency from
@@ -14466,6 +14483,10 @@ mod tests {
             "partial coverage must be surfaced: {:?}",
             r.warnings
         );
+        assert!(
+            r.bundled_skipped_uuids.contains(&overrides[0].patch_uuid),
+            "#325: a redirected sibling must not let the in-run VEX attest the patch"
+        );
     }
 
     /// The v1/v2 legacy `dependencies` tree spells the bundled flag
@@ -14513,6 +14534,62 @@ mod tests {
             "legacy bundled skip must warn: {:?}",
             r.warnings
         );
+        assert!(
+            r.bundled_skipped_uuids.contains(&overrides[0].patch_uuid),
+            "#325: the legacy bundled skip must be recorded like `inBundle`"
+        );
+    }
+
+    /// A stale v2 legacy mirror is not the install tree. Its bundled flag
+    /// must not suppress in-run VEX for a normal `packages` entry; genuine
+    /// bundled entries in `packages` still suppress the same patch.
+    #[test]
+    fn npm_stale_legacy_bundled_mirror_does_not_contest_packages() {
+        for nested in [false, true] {
+            for actual_bundle in [false, true] {
+                let bundled = json!({"version": "1.3.0", "bundled": true});
+                let legacy = if nested {
+                    json!({"parent": {"version": "2.0.0", "dependencies": {"left-pad": bundled}}})
+                } else {
+                    json!({"left-pad": bundled})
+                };
+                let mut lock = json!({
+                    "lockfileVersion": 2,
+                    "packages": {
+                        "": {"name": "app", "version": "1.0.0"},
+                        "node_modules/left-pad": {
+                            "version": "1.3.0",
+                            "resolved": "https://registry.npmjs.org/left-pad/-/left-pad-1.3.0.tgz",
+                            "integrity": "sha512-UPSTREAM=="
+                        }
+                    },
+                    "dependencies": legacy
+                });
+                if actual_bundle {
+                    lock["packages"]["node_modules/parent/node_modules/left-pad"] =
+                        json!({"version": "1.3.0", "inBundle": true});
+                }
+                let files = BTreeMap::from([("package-lock.json".into(), lock.to_string())]);
+                let overrides = vec![npm_override(
+                    "left-pad",
+                    "1.3.0",
+                    "http://patch.test/lp.tgz",
+                    "sha512-PATCHED==",
+                )];
+                let r = rewrite_registry_redirect(&files, &overrides);
+                assert_eq!(
+                    r.bundled_skipped_uuids.contains(&overrides[0].patch_uuid),
+                    actual_bundle,
+                    "nested mirror={nested}, actual bundled install={actual_bundle}"
+                );
+                let out: Value = serde_json::from_str(&r.files["package-lock.json"]).unwrap();
+                assert_eq!(
+                    out["packages"]["node_modules/left-pad"]["resolved"],
+                    "http://patch.test/lp.tgz"
+                );
+                assert_eq!(out["dependencies"], lock["dependencies"]);
+            }
+        }
     }
 
     /// An alias install (`npm i my-alias@npm:left-pad@1.3.0`) keys the lock
