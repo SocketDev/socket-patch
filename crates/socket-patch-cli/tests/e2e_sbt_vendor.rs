@@ -14,6 +14,8 @@
 //! drift, `repair`, a forged ledger, an escaping symlink, the subproject
 //! and build-edit refusals.
 
+#[path = "common/hermetic.rs"]
+mod hermetic;
 #[path = "prebuilt_common/mod.rs"]
 mod prebuilt_common;
 #[path = "sbt_common/mod.rs"]
@@ -22,7 +24,6 @@ mod sbt_common;
 use std::collections::BTreeMap;
 use std::io::Write as _;
 use std::path::{Path, PathBuf};
-use std::process::Command;
 
 use sbt_common::{copy_evidence, record_pinned_resolution, write_coursier_artifact, Gav, SbtHome};
 use socket_patch_core::formats::sbt::owned_file::{
@@ -169,10 +170,10 @@ impl Fixture {
 
     /// `socket-patch <args> --json --cwd <proj>/<dir>`; `(exit, envelope)`.
     fn run_in(&self, dir: &str, args: &[&str]) -> (Option<i32>, serde_json::Value) {
-        let mut cmd = Command::new(env!("CARGO_BIN_EXE_socket-patch"));
+        let mut cmd = hermetic::binary_command();
         for (k, _) in std::env::vars_os() {
             let k = k.to_string_lossy();
-            if k.starts_with("SOCKET_") || k.starts_with("COURSIER_") {
+            if k.starts_with("COURSIER_") {
                 cmd.env_remove(&*k);
             }
         }

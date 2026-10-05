@@ -20,7 +20,6 @@
 //! | e | no ledger | nothing attested; the tree check still runs |
 
 use std::path::{Path, PathBuf};
-use std::process::Command;
 use std::time::{Duration, SystemTime};
 
 use serde_json::Value;
@@ -134,10 +133,10 @@ impl Fx {
 
     /// `socket-patch <args> --json --cwd <proj>` in the isolated home.
     fn run(&self, args: &[&str]) -> (Option<i32>, Value) {
-        let mut cmd = Command::new(env!("CARGO_BIN_EXE_socket-patch"));
+        let mut cmd = super::hermetic::binary_command();
         for (k, _) in std::env::vars_os() {
             let k = k.to_string_lossy();
-            if k.starts_with("SOCKET_") || k.starts_with("COURSIER_") {
+            if k.starts_with("COURSIER_") {
                 cmd.env_remove(&*k);
             }
         }

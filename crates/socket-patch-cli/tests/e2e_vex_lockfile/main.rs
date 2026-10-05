@@ -20,6 +20,8 @@
 //! (with the PDM/Hatch and Pipenv/pip helpers beside it); `common_selftest`
 //! tests those helpers themselves.
 
+#[path = "../common/hermetic.rs"]
+mod hermetic;
 #[path = "../prebuilt_common/mod.rs"]
 mod prebuilt_common;
 #[path = "../sbt_common/mod.rs"]

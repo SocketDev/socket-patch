@@ -31,6 +31,8 @@
 //! VERSION,REQUIRED,SEED}` (`sbt_vendor_build_common`). Scratch trees go
 //! under `TMPDIR`.
 
+#[path = "common/hermetic.rs"]
+mod hermetic;
 #[path = "maven_build_common/mod.rs"]
 mod maven_build_common;
 #[path = "prebuilt_common/mod.rs"]
@@ -186,10 +188,10 @@ fn setup(
 impl Ctx {
     /// `socket-patch <args> --json --offline --cwd <dir>`; `(exit, envelope)`.
     fn socket(&self, dir: &Path, args: &[&str]) -> (Option<i32>, serde_json::Value) {
-        let mut cmd = Command::new(env!("CARGO_BIN_EXE_socket-patch"));
+        let mut cmd = hermetic::binary_command();
         for (k, _) in std::env::vars_os() {
             let k = k.to_string_lossy().into_owned();
-            if k.starts_with("SOCKET_") || k.starts_with("COURSIER_") {
+            if k.starts_with("COURSIER_") {
                 cmd.env_remove(&k);
             }
         }

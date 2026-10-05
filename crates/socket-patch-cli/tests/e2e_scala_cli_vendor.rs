@@ -27,6 +27,8 @@
 
 #![cfg_attr(windows, allow(dead_code, unused_imports))]
 
+#[path = "common/hermetic.rs"]
+mod hermetic_spawn;
 #[path = "prebuilt_common/mod.rs"]
 mod prebuilt_common;
 
@@ -214,10 +216,10 @@ fn socket_in_cache(
     args: &[&str],
     cache: &Path,
 ) -> (Option<i32>, serde_json::Value) {
-    let mut cmd = Command::new(env!("CARGO_BIN_EXE_socket-patch"));
+    let mut cmd = hermetic_spawn::binary_command();
     for (k, _) in std::env::vars_os() {
         let k = k.to_string_lossy().into_owned();
-        if k.starts_with("SOCKET_") || k.starts_with("COURSIER_") {
+        if k.starts_with("COURSIER_") {
             cmd.env_remove(&k);
         }
     }
