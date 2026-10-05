@@ -72,6 +72,8 @@ use wiremock::{Mock, MockServer, ResponseTemplate};
 
 #[path = "common/cache_env.rs"]
 mod cache_env;
+#[path = "common/hermetic.rs"]
+mod hermetic;
 #[path = "vex_e2e_common/mod.rs"]
 mod vex_e2e_common;
 use vex_e2e_common::{
@@ -149,31 +151,6 @@ fn has_corepack_pm(pm: &str) -> bool {
     ok
 }
 
-/// Remove ambient `SOCKET_*` / `PNPM_*` / `npm_config_*` vars.
-///
-/// Seed-then-scrub (mirrors e2e_vendor_pnpm_build.rs): pnpm lets EVERY
-/// `.npmrc` setting be overridden by an `npm_config_*` env var (env outranks
-/// the project npmrc), so an ambient `npm_config_node_linker=pnp` alone can
-/// turn a capstone red. The explicit env_remove below clears the seed too,
-/// but if the prefix scrub is ever dropped the seed (rather than a
-/// developer's ambient shell, which this suite can't rely on) turns the test
-/// red immediately.
-fn scrub_socket_env(cmd: &mut Command) {
-    cmd.env("npm_config_node_linker", "pnp");
-    for (k, _) in std::env::vars_os() {
-        let key = k.to_string_lossy();
-        if (key.starts_with("SOCKET_")
-            || key.starts_with("PNPM_")
-            || key.to_ascii_lowercase().starts_with("npm_config_"))
-            && key != "SOCKET_NO_CONFIG"
-        {
-            cmd.env_remove(&k);
-        }
-    }
-    cmd.env_remove("VIRTUAL_ENV");
-    cmd.env_remove("npm_config_node_linker");
-}
-
 fn corepack(cwd: &Path, pm: &str, args: &[&str]) -> Output {
     let mut cmd = pnpm_command(pm);
     let legacy = pm
@@ -207,7 +184,8 @@ fn corepack(cwd: &Path, pm: &str, args: &[&str]) -> Output {
             "--fetch-retry-maxtimeout=500",
         ]);
     }
-    scrub_socket_env(&mut cmd);
+    hermetic::scrub_socket_vars(&mut cmd);
+    hermetic::scrub_extra(&mut cmd, &[hermetic::Extra::Venv, hermetic::Extra::Pnpm]);
     // After the scrub: it strips ambient `PNPM_*` / `npm_config_*`, which
     // would otherwise take the sandbox values back out again.
     cache_env::isolate(&mut cmd);
@@ -221,9 +199,9 @@ fn run_socket(cwd: &Path, args: &[&str]) -> (i32, String, String) {
 
 /// [`run_socket`] with extra env applied after the scrub.
 fn run_socket_env(cwd: &Path, args: &[&str], env: &[(String, String)]) -> (i32, String, String) {
-    let mut cmd = Command::new(binary());
+    let mut cmd = hermetic::command(&binary());
     cmd.args(args).current_dir(cwd);
-    scrub_socket_env(&mut cmd);
+    hermetic::scrub_extra(&mut cmd, &[hermetic::Extra::Venv, hermetic::Extra::Pnpm]);
     for (k, v) in env {
         cmd.env(k, v);
     }
