@@ -129,6 +129,89 @@ pub(crate) fn unquote_value(value: &str) -> &str {
     }
 }
 
+/// Spell a string as a block-mapping VALUE the way pnpm's YAML writer
+/// (js-yaml `dump`) does: plain when the plain scalar reads back as the
+/// same string, single-quoted otherwise, double-quoted (escaped) when it
+/// holds a character single quotes can't carry. A value we splice in
+/// verbatim must not contain ` #` (the rest becomes a comment) or `: `
+/// (the line stops being valid YAML) unquoted — e.g. an absolute path
+/// under a directory named `My Project #2`.
+pub(crate) fn yaml_value(value: &str) -> std::borrow::Cow<'_, str> {
+    use std::borrow::Cow;
+    if !value.chars().all(is_yaml_printable) {
+        let mut out = String::with_capacity(value.len() + 2);
+        out.push('"');
+        for c in value.chars() {
+            match c {
+                '"' => out.push_str("\\\""),
+                '\\' => out.push_str("\\\\"),
+                '\n' => out.push_str("\\n"),
+                '\t' => out.push_str("\\t"),
+                '\r' => out.push_str("\\r"),
+                c if is_yaml_printable(c) => out.push(c),
+                c if (c as u32) <= 0xFF => out.push_str(&format!("\\x{:02X}", c as u32)),
+                c if (c as u32) <= 0xFFFF => out.push_str(&format!("\\u{:04X}", c as u32)),
+                c => out.push_str(&format!("\\U{:08X}", c as u32)),
+            }
+        }
+        out.push('"');
+        return Cow::Owned(out);
+    }
+    if is_plain_safe(value) {
+        Cow::Borrowed(value)
+    } else {
+        Cow::Owned(format!("'{}'", value.replace('\'', "''")))
+    }
+}
+
+/// js-yaml's `isPrintable`: what a single-quoted or plain scalar may hold.
+fn is_yaml_printable(c: char) -> bool {
+    let c = c as u32;
+    (0x20..=0x7E).contains(&c)
+        || ((0xA1..=0xD7FF).contains(&c) && c != 0x2028 && c != 0x2029)
+        || ((0xE000..=0xFFFD).contains(&c) && c != 0xFEFF)
+        || (0x10000..=0x10FFFF).contains(&c)
+}
+
+/// Would `value` (all printable) read back unchanged as a plain block
+/// scalar? Mirrors js-yaml's plain-style rules for block context: no
+/// indicator first character, no leading/trailing space or trailing `:`,
+/// no `#` after a space, no `:` before a space, and nothing YAML would
+/// resolve to a non-string (null, bool, number).
+fn is_plain_safe(value: &str) -> bool {
+    let Some(first) = value.chars().next() else {
+        return false;
+    };
+    if first == ' '
+        || "-?:,[]{}#&*!|>'\"%@`".contains(first)
+        || value.ends_with(' ')
+        || value.ends_with(':')
+        || value.contains(" #")
+        || value.contains(": ")
+    {
+        return false;
+    }
+    let lower = value.to_ascii_lowercase();
+    let implicit = matches!(
+        lower.as_str(),
+        "~" | "null"
+            | "true"
+            | "false"
+            | "yes"
+            | "no"
+            | "on"
+            | "off"
+            | "y"
+            | "n"
+            | ".inf"
+            | "-.inf"
+            | "+.inf"
+            | ".nan"
+    ) || value.parse::<f64>().is_ok()
+        || (value.starts_with("0x") || value.starts_with("0o") || value.starts_with("0b"));
+    !implicit
+}
+
 /// pnpm quotes `@`-leading keys with single quotes; everything we write is
 /// otherwise bare.
 pub(crate) fn yaml_key(key: &str) -> String {
@@ -145,5 +228,63 @@ pub(crate) fn yaml_key_like(key: &str, original_repr: &str) -> String {
         Some(b'\'') => format!("'{key}'"),
         Some(b'"') => format!("\"{key}\""),
         _ => yaml_key(key),
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    /// Values pnpm's writer leaves plain stay byte-identical — the spellings
+    /// the vendored legacy splice already round-trips (#754's passing cells).
+    #[test]
+    fn yaml_value_keeps_plain_safe_values_plain() {
+        for v in [
+            "file:/tmp/w/plain dir/.socket/vendor/npm/u/left-pad-1.3.0.tgz",
+            "file:/tmp/w/ünïcode/x.tgz",
+            "file:/tmp/w/a'quote/x.tgz",
+            "file:/tmp/w/[br]/x.tgz",
+            "file:/tmp/w/x#y/x.tgz",
+            "file:C:/Users/x/a:b/x.tgz",
+            "^1.3.0",
+            "1.3.0",
+            "npm:left-pad@1.2.0",
+        ] {
+            assert_eq!(yaml_value(v), v, "{v}");
+        }
+    }
+
+    /// ` #` and `: ` would truncate or break a plain scalar, so they are
+    /// single-quoted exactly as pnpm 7/8 write them (#754).
+    #[test]
+    fn yaml_value_single_quotes_comment_and_mapping_indicators() {
+        assert_eq!(
+            yaml_value("file:/tmp/w/hash #x/a.tgz"),
+            "'file:/tmp/w/hash #x/a.tgz'"
+        );
+        assert_eq!(
+            yaml_value("file:/tmp/w/colon: x/a.tgz"),
+            "'file:/tmp/w/colon: x/a.tgz'"
+        );
+        assert_eq!(
+            yaml_value("file:/tmp/My Project #2/it's.tgz"),
+            "'file:/tmp/My Project #2/it''s.tgz'"
+        );
+        assert_eq!(yaml_value("trailing:"), "'trailing:'");
+        assert_eq!(yaml_value(" lead"), "' lead'");
+        assert_eq!(yaml_value("@scope/x"), "'@scope/x'");
+        assert_eq!(yaml_value("catalog:"), "'catalog:'");
+        assert_eq!(yaml_value("true"), "'true'");
+        assert_eq!(yaml_value("1.0"), "'1.0'");
+        assert_eq!(yaml_value(""), "''");
+    }
+
+    /// Characters single quotes can't carry fall back to an escaped
+    /// double-quoted scalar.
+    #[test]
+    fn yaml_value_double_quotes_non_printables() {
+        assert_eq!(yaml_value("a\tb"), "\"a\\tb\"");
+        assert_eq!(yaml_value("a\nb\"c\\"), "\"a\\nb\\\"c\\\\\"");
+        assert_eq!(yaml_value("a\u{7f}"), "\"a\\x7F\"");
     }
 }

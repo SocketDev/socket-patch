@@ -175,6 +175,18 @@ JSON API leaves old Poetry's `[metadata.files]` empty), `crlf`, and `pep621`
 (Poetry's default out-of-tree virtualenv via `poetry run`) is
 informational.
 
+A case is re-run from a fresh directory only when every failed required
+check is explained by a terminal transport failure in its own operation
+(Poetry or pip giving up on PyPI, a CLI request error, patch API 5xx, or
+exhausted 429 retry). CLI errors reported in JSON with exit code zero also
+qualify. Recovered retry warnings, informational commands, and expected
+tamper failures do not trigger retries. Independent file invariants and
+earlier functional failures remain failures even if a later operation raises
+a transport exception. There are at most three attempts in total. Failed
+attempt logs stay under `attempts/<case>/<n>/`, and the final row lists them
+in `transportRetries`. A failing case prints each failed check's recorded
+detail to the job log.
+
 Rust coverage of the rewriters: `cargo test -p socket-patch-core --lib
 utils::poetry_lock vendor::pypi_poetry` and `cargo test -p socket-patch-core
 --test poetry_hosted`. The committed native locks under
