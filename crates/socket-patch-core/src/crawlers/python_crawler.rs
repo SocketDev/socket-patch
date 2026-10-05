@@ -1943,7 +1943,9 @@ async fn find_pipenv_virtualenv_site_packages_with(
     cwd: &Path,
     var: &impl Fn(&str) -> Option<String>,
 ) -> Vec<PathBuf> {
-    let workon_home = pipenv_workon_home(var);
+    // Pipenv runs from the project, so a relative WORKON_HOME (from `.env`
+    // or the process) is the project's, not this process's cwd (`--cwd`).
+    let workon_home = pipenv_workon_home(var).map(|home| cwd.join(home));
     find_pipenv_virtualenv_site_packages_at(cwd, workon_home.as_deref(), var).await
 }
 
@@ -4828,6 +4830,26 @@ mod tests {
             find_local_venv_site_packages_with(&project, &already_active).await,
             vec![default],
             "an existing ACTIVE marker still vetoes the active prefix"
+        );
+    }
+
+    /// A relative WORKON_HOME names a directory under the project, not
+    /// under this process's cwd: `--cwd` scans must still find the venv.
+    #[tokio::test]
+    async fn pipenv_relative_workon_home_resolves_from_the_project() {
+        let (_tmp, project, site, base_var) = pipenv_project_with_workon_venv(&[]);
+        let var = |name: &str| {
+            if name == "WORKON_HOME" {
+                Some("../wh".to_string())
+            } else {
+                base_var(name)
+            }
+        };
+        let found = find_pipenv_virtualenv_site_packages_with(&project, &var).await;
+        let canon = |p: &PathBuf| std::fs::canonicalize(p).unwrap();
+        assert_eq!(
+            found.iter().map(canon).collect::<Vec<_>>(),
+            vec![canon(&site)]
         );
     }
 
