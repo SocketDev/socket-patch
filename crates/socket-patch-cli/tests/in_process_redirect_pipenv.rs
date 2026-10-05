@@ -29,6 +29,8 @@
 
 use std::path::Path;
 
+#[path = "common/hermetic.rs"]
+mod hermetic;
 #[path = "vex_e2e_common/mod.rs"]
 mod vex_e2e_common;
 #[path = "vex_pipenv_pip_steps/mod.rs"]
@@ -646,7 +648,9 @@ async fn dotenv_selected_pipenv_install_is_checked_before_vex() {
         };
         std::fs::write(project.join(".env"), &dotenv).unwrap();
         let vex = project.join("out.vex.json");
-        let mut cmd = tokio::process::Command::new(env!("CARGO_BIN_EXE_socket-patch"));
+        let mut cmd = tokio::process::Command::from(hermetic::command(Path::new(env!(
+            "CARGO_BIN_EXE_socket-patch"
+        ))));
         for (key, _) in std::env::vars_os() {
             let key_text = key.to_string_lossy();
             if key_text.starts_with("SOCKET_")
@@ -755,7 +759,9 @@ async fn legacy_dotenv_workon_install_is_checked_before_vex() {
         };
         std::fs::write(project.join(".env"), dotenv).unwrap();
         let vex = project.join("out.vex.json");
-        let mut cmd = tokio::process::Command::new(env!("CARGO_BIN_EXE_socket-patch"));
+        let mut cmd = tokio::process::Command::from(hermetic::command(Path::new(env!(
+            "CARGO_BIN_EXE_socket-patch"
+        ))));
         for (key, _) in std::env::vars_os() {
             let text = key.to_string_lossy();
             if text.starts_with("SOCKET_")
