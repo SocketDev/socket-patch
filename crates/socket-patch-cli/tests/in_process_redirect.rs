@@ -4385,7 +4385,12 @@ async fn yarn_berry_rollback_restores_the_registry_archive_url_binding() {
             "https://registry.npmjs.org/{NAME}/-/{NAME}-{VERSION}.tgz"
         ))
     );
-    mock_npm_registry_advertising(&server, &vlt_hosted_common::sha512_sri(&upstream_tarball()), &advertised).await;
+    mock_npm_registry_advertising(
+        &server,
+        &vlt_hosted_common::sha512_sri(&upstream_tarball()),
+        &advertised,
+    )
+    .await;
     let binding = |t: &str| {
         t.replace(
             &format!("resolution: \"{NAME}@npm:{VERSION}\""),
@@ -4416,7 +4421,11 @@ async fn yarn_berry_rollback_restores_the_registry_archive_url_binding() {
 
     let (code, env) = rollback_json_with_origin(tmp.path(), &server, &server.uri());
     assert_eq!(code, Some(0), "rollback: {env:#}");
-    assert_eq!(env["hosted"]["reverted"], serde_json::json!([PURL]), "{env:#}");
+    assert_eq!(
+        env["hosted"]["reverted"],
+        serde_json::json!([PURL]),
+        "{env:#}"
+    );
     let restored = std::fs::read_to_string(&lock_path).unwrap();
     let checksum = berry_checksum_of(&restored);
     assert_eq!(
@@ -4439,8 +4448,16 @@ async fn yarn_berry_rollback_keeps_a_bare_locator_for_conventional_urls() {
     let hosted_url = HOSTED_URL.replace("http://patch.test", &server.uri());
     mock_reference_with_berry_url(&server, &hosted_url).await;
     mock_view(&server).await;
-    let conventional = format!("{}/npm-registry/{NAME}/-/{NAME}-{VERSION}.tgz", server.uri());
-    mock_npm_registry_advertising(&server, &vlt_hosted_common::sha512_sri(&upstream_tarball()), &conventional).await;
+    let conventional = format!(
+        "{}/npm-registry/{NAME}/-/{NAME}-{VERSION}.tgz",
+        server.uri()
+    );
+    mock_npm_registry_advertising(
+        &server,
+        &vlt_hosted_common::sha512_sri(&upstream_tarball()),
+        &conventional,
+    )
+    .await;
 
     let tmp = tempfile::tempdir().unwrap();
     write_berry_project(tmp.path());
@@ -4488,7 +4505,11 @@ fn pnpm_pin_and_rollback(root: &Path, server: &MockServer) -> String {
     assert!(pinned.contains("patch.test"), "{pinned}");
     let (code, env) = rollback_json(root, server);
     assert_eq!(code, Some(0), "rollback: {env:#}");
-    assert_eq!(env["hosted"]["reverted"], serde_json::json!([PURL]), "{env:#}");
+    assert_eq!(
+        env["hosted"]["reverted"],
+        serde_json::json!([PURL]),
+        "{env:#}"
+    );
     std::fs::read_to_string(root.join("pnpm-lock.yaml")).unwrap()
 }
 
@@ -4503,7 +4524,10 @@ async fn pnpm_rollback_keeps_tarball_under_npmrc_include_tarball_url() {
     mock_reference(&server).await;
     mock_view(&server).await;
     mock_npm_registry(&server, "sha512-UPSTREAMupstream==", None).await;
-    let tarball = format!("{}/npm-registry/{NAME}/-/{NAME}-{VERSION}.tgz", server.uri());
+    let tarball = format!(
+        "{}/npm-registry/{NAME}/-/{NAME}-{VERSION}.tgz",
+        server.uri()
+    );
 
     let tmp = tempfile::tempdir().unwrap();
     let pristine = write_pnpm_tarball_project(tmp.path(), &tarball);
@@ -4525,7 +4549,10 @@ async fn pnpm_rollback_keeps_tarball_under_workspace_include_tarball_url() {
     mock_reference(&server).await;
     mock_view(&server).await;
     mock_npm_registry(&server, "sha512-UPSTREAMupstream==", None).await;
-    let tarball = format!("{}/npm-registry/{NAME}/-/{NAME}-{VERSION}.tgz", server.uri());
+    let tarball = format!(
+        "{}/npm-registry/{NAME}/-/{NAME}-{VERSION}.tgz",
+        server.uri()
+    );
 
     let tmp = tempfile::tempdir().unwrap();
     let pristine = write_pnpm_tarball_project(tmp.path(), &tarball);
