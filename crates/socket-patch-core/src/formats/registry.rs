@@ -196,17 +196,28 @@ pub fn hosted_file_ecosystem(rel: &str) -> Option<&'static str> {
         .map(|f| f.ecosystem)
 }
 
-/// The project-relative paths of `ecosystem` that a hosted or vendored run
-/// may rewrite (plus pnpm's workspace file, which vendored pnpm writes):
-/// the files a vendored dry run checks for symbolic links, since the wet
-/// run's commit refuses to rename over one.
+/// Files a vendored run writes that carry no [`VENDORED`] role (that role
+/// also scopes `repair`'s fingerprint): pnpm's workspace file and NuGet's
+/// config and lock, which the vendored feed rewrites.
+const VENDORED_WRITES_UNMARKED: &[&str] = &[
+    "pnpm-workspace.yaml",
+    "nuget.config",
+    "NuGet.config",
+    "NuGet.Config",
+    "packages.lock.json",
+];
+
+/// The project-relative paths of `ecosystem` that a vendored run may
+/// rewrite: the files a vendored dry run checks for symbolic links, since
+/// the wet run's commit refuses to rename over one. Files a vendored run
+/// only reads (`.yarnrc.yml`, `vlt.json`, `node_modules/.modules.yaml`, …)
+/// are left out.
 pub fn wiring_paths(ecosystem: &str) -> Vec<&'static str> {
     REGISTRY
         .iter()
         .filter(|f| {
             f.ecosystem == ecosystem
-                && f.has(HOSTED | VENDORED | PNPM_MARKER)
-                && !f.has(PRESENCE_ONLY)
+                && (f.has(VENDORED) || VENDORED_WRITES_UNMARKED.contains(&f.path))
         })
         .map(|f| f.path)
         .collect()
@@ -251,6 +262,15 @@ mod tests {
             "presence only"
         );
         assert!(!npm.contains(&"uv.lock"));
+        // Read-only for a vendored run: never captured, never refused.
+        for p in [
+            ".yarnrc.yml",
+            "vlt.json",
+            "node_modules/.modules.yaml",
+            "shrinkwrap.yaml",
+        ] {
+            assert!(!npm.contains(&p), "{p}");
+        }
     }
 
     #[test]

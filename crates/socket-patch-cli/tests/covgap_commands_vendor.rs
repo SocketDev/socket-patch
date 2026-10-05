@@ -1267,6 +1267,43 @@ async fn vendor_refuses_a_symlinked_lock_instead_of_replacing_it() {
     }
 }
 
+/// #627 follow-up: an already-vendored package whose lock is LATER made a
+/// symlink writes nothing on a re-run, so neither the dry run nor the wet
+/// run may predict or raise the symlink refusal: the dry run previews it as
+/// in sync with no `vendor_would_refuse_symlinked_file` advisory, and the
+/// wet run is a no-op that keeps the link.
+#[cfg(unix)]
+#[tokio::test]
+async fn in_sync_vendor_over_a_symlinked_lock_neither_warns_nor_refuses() {
+    let fx = npm_fixture();
+    assert_eq!(vendor_run(vendor_args(fx.root())).await, 0, "stage vendor");
+    let shared = tempfile::tempdir().unwrap();
+    let target = shared.path().join("package-lock.json");
+    std::fs::rename(fx.lock_path(), &target).unwrap();
+    std::os::unix::fs::symlink(&target, fx.lock_path()).unwrap();
+    let wired = std::fs::read(&target).unwrap();
+
+    let (code, env) = vendor_cli(fx.root(), &["--dry-run"]);
+    assert_eq!(code, 0, "{env:#}");
+    assert!(
+        !events(&env)
+            .iter()
+            .any(|e| e["errorCode"] == "vendor_would_refuse_symlinked_file"),
+        "an in-sync package gets no symlink advisory: {env:#}"
+    );
+
+    let (code, env) = vendor_cli(fx.root(), &[]);
+    assert_eq!(code, 0, "an in-sync re-run writes nothing: {env:#}");
+    assert!(
+        std::fs::symlink_metadata(fx.lock_path())
+            .unwrap()
+            .file_type()
+            .is_symlink(),
+        "the link is kept"
+    );
+    assert_eq!(std::fs::read(&target).unwrap(), wired);
+}
+
 // ─────────────────────────────────────────────────────────────────────
 // 8. human-mode error/refusal stderr surfaces (no --json, no --silent)
 //

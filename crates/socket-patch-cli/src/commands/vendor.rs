@@ -2793,19 +2793,22 @@ pub(crate) async fn vendor_records_reusing(
                     // A dry run previews an in-sync package as `verified`
                     // (the backends cannot tell without writing); the
                     // ledger recording this exact patch is the tell.
-                    if common.dry_run
+                    let dry_previewed_in_sync = common.dry_run
                         && event.action == PatchAction::Verified
                         && lookup_entry(&state.entries, candidate)
-                            .is_some_and(|e| e.uuid == record.uuid)
-                    {
+                            .is_some_and(|e| e.uuid == record.uuid);
+                    if dry_previewed_in_sync {
                         dry_in_sync += 1;
                     }
                     let in_sync = event.error_code.as_deref() == Some("already_vendored");
-                    let symlinked = if common.dry_run && result.success && !in_sync {
-                        symlinked_wiring_warnings(&common.cwd, candidate)
-                    } else {
-                        Vec::new()
-                    };
+                    // An in-sync package's wet run writes nothing, so it
+                    // cannot hit the commit's symlink refusal.
+                    let symlinked =
+                        if common.dry_run && result.success && !in_sync && !dry_previewed_in_sync {
+                            symlinked_wiring_warnings(&common.cwd, candidate)
+                        } else {
+                            Vec::new()
+                        };
                     env.record(event);
                     for w in &symlinked {
                         record_warning(env, candidate, w, common);

@@ -1410,16 +1410,16 @@ async fn berry_crlf_takeovers_round_trip_both_directions() {
     // The vendored `resolutions` entry is gone and the hosted pin (#404
     // option C) took its place, in the manifest's own layout: BOM + CRLF.
     let hosted_pkg = std::fs::read_to_string(root.join("package.json")).unwrap();
-    assert!(hosted_pkg.starts_with('\u{feff}'), "BOM kept: {hosted_pkg:?}");
+    assert!(
+        hosted_pkg.starts_with('\u{feff}'),
+        "BOM kept: {hosted_pkg:?}"
+    );
     let pin_line = format!("    \"left-pad@npm:1.3.0\": \"{hosted_url}\"\r\n");
     assert!(
         hosted_pkg.contains(&pin_line) && !hosted_pkg.contains(".socket/vendor/"),
         "the hosted pin replaced the vendored resolutions entry: {hosted_pkg:?}"
     );
-    let unpinned = hosted_pkg.replace(
-        &format!(",\r\n  \"resolutions\": {{\r\n{pin_line}  }}"),
-        "",
-    );
+    let unpinned = hosted_pkg.replace(&format!(",\r\n  \"resolutions\": {{\r\n{pin_line}  }}"), "");
     assert_eq!(unpinned, pkg, "nothing else in package.json changed");
     let hosted_lock = std::fs::read_to_string(root.join("yarn.lock")).unwrap();
     assert!(
@@ -3018,6 +3018,66 @@ async fn scan_vendor_gem_end_to_end_and_reverts() {
         !fx.root().join(".socket/vendor").exists(),
         "the reverted vendor tree must be fully pruned"
     );
+}
+
+/// #627 follow-up: an in-sync package writes nothing on a re-run, so
+/// `vendor --dry-run` must not predict the symlink refusal for it: once
+/// the vendored `Gemfile.lock` is made a symlink, the dry run carries no
+/// `vendor_would_refuse_symlinked_file` advisory and the wet run is a
+/// no-op that keeps the link.
+#[cfg(unix)]
+#[tokio::test]
+async fn vendor_dry_run_skips_symlink_advisory_for_in_sync_gem() {
+    let mock = wiremock::MockServer::start().await;
+    mount_gem_patch_api(&mock, GEM_PURL).await;
+    let fx = gem_fixture();
+    let (code, env) = run_scan_vendor(fx.root(), &mock.uri(), &[]);
+    assert_eq!(code, 0, "stage vendor: {env:#}");
+    // `vendor` works from the manifest: record the same patch there.
+    let after = compute_git_sha256_from_bytes(GEM_PATCHED);
+    std::fs::create_dir_all(fx.root().join(".socket/blobs")).unwrap();
+    std::fs::write(fx.root().join(".socket/blobs").join(&after), GEM_PATCHED).unwrap();
+    std::fs::write(
+        fx.root().join(".socket/manifest.json"),
+        serde_json::to_vec_pretty(&json!({ "patches": { GEM_PURL: {
+            "uuid": GEM_UUID, "exportedAt": "2026-01-01T00:00:00Z",
+            "files": { "lib/demo_gem.rb": {
+                "beforeHash": compute_git_sha256_from_bytes(GEM_ORIG), "afterHash": after,
+            } },
+            "vulnerabilities": {}, "description": "gem vendor patch", "license": "MIT",
+            "tier": "free",
+        } } }))
+        .unwrap(),
+    )
+    .unwrap();
+
+    let shared = tempfile::tempdir().unwrap();
+    let target = shared.path().join("Gemfile.lock");
+    std::fs::rename(fx.lock_path(), &target).unwrap();
+    std::os::unix::fs::symlink(&target, fx.lock_path()).unwrap();
+    let wired = std::fs::read(&target).unwrap();
+
+    let (code, env) = vendor_cli(fx.root(), &["--dry-run"]);
+    assert_eq!(code, 0, "{env:#}");
+    assert!(
+        !env["events"]
+            .as_array()
+            .unwrap()
+            .iter()
+            .any(|e| e["errorCode"] == "vendor_would_refuse_symlinked_file"),
+        "an in-sync package gets no symlink advisory: {env:#}"
+    );
+
+    let (code, env) = vendor_cli(fx.root(), &[]);
+    assert_eq!(code, 0, "an in-sync re-run writes nothing: {env:#}");
+    assert!(
+        std::fs::symlink_metadata(fx.lock_path())
+            .unwrap()
+            .file_type()
+            .is_symlink(),
+        "the link is kept"
+    );
+    assert_eq!(std::fs::read(&target).unwrap(), wired);
 }
 
 /// Same in-process flow as [`scan_vendor_gem_end_to_end_and_reverts`], but
