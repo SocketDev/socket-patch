@@ -2,7 +2,7 @@
 
 The routine runs every 6 hours. Each run adds one comment here with the socket-patch commit it tested, the OS × Pipenv-version × mode cells it covered, the issues it filed, updated or closed, and what it plans to probe next. The routine treats this thread as its only memory.
 
-Last run: 2026-10-05 ~09:30Z, main `045d7ec` (CLI 4.0.0, unchanged). A Pipfile `[pipenv] venv_in_project = true` with no `./.venv` makes agent mode miss the WORKON_HOME venv on Pipenv 2018–2026.1 (only 2026.2+ read the key). It patches the system Python instead and vex attests `not_affected`: filed #842 (PR #654 doesn't fix it). PR #654 (#645 + #546), #730 (#725), #795 (#790) and #825 (#769) are still open.
+Last run: 2026-10-05 ~19:15Z, main `0d302dc` (CLI 4.0.0; main's history was rewritten, so older SHAs in this file no longer resolve). #795 merged, and #790 is re-verified fixed on 2018 / 2020 / 2026. #842's hosted shape is commented: the Pipfile `venv_in_project = true` key also suppresses the hosted stale-install warning on 2018–2026.1 (vex stays conservative). PRs #654 (#645 + #546), #730 (#725) and #825 (#769) are still open.
 
 ## Coverage matrix
 
@@ -64,11 +64,13 @@ Stale-install remedy followed verbatim, `15:30Z` run, `045d7ec`: `default` patch
 
 `09:32Z` run (2026-10-05), `045d7ec`: Pipfile `[pipenv] venv_in_project = true` with no `./.venv`, agent mode: fail #842 on 2018.11.26 / 2023.12.1 / 2025.1.3 / 2026.1.0 (WORKON venv unpatched, system Python patched, vex `not_affected`); pass on 2026.8.0 (`./.venv`) and on the key-less control; the PR #654 head `d8356ae` still fails. Relative `WORKON_HOME` with `--cwd` from another directory: misses the venv (see Known non-bugs).
 
+`19:15Z` run (2026-10-05), `0d302dc`: #790 remedy (`pipenv sync --dev`) followed verbatim on 2018.11.26 / 2020.11.15 / 2026.8.0 gives the patched six, vex `not_affected` (pass, #790 fixed). #842 hosted shape (Pipfile `venv_in_project = true`, warm WORKON venv): no stale-install warning on 2018.11.26 / 2023.12.1 / 2026.1.0 (fail #842); 2026.8.0 and the key-less control warn (pass); hosted vex fails closed (`file_not_found` / `not_applied`). Precedence on 2026.8.0, agent mode: key `true` + `PIPENV_VENV_IN_PROJECT=0` → WORKON; key `false` + `.venv` + env `1` → `.venv`; key `"false"` (a string) → `.venv`: all pass.
+
 macOS/Windows rows are from the 2026-09-30 probes on `f6b7fb9`. No probe ran on v5 because branch deletion through the git proxy still fails (re-checked 2026-10-03 03:30Z); `bughunt/pipenv/20260930-venv-discovery` and `bughunt/pipenv/20260930-virtualenv` still need a maintainer to delete them.
 
 ## Backlog
 
-000. Re-verify #790 on main once PR #795 merges (#795 `fbdfa6f` passes every Linux cell, see the #790 comment of 2026-10-04 21:42Z). Windows cmd / PowerShell quoting of `--categories "…"` is untested.
+000. (#790 re-verified fixed on main `0d302dc`, 2026-10-05 19:15Z.) Still untested: Windows cmd / PowerShell quoting of `--categories "…"`.
 00. Re-verify #769 once fixed (vendored re-vendor A → B: rewire in place, old uuid dir removed, revert byte-exact, no false `package_not_installed` with a venv). (Hosted supersede on 2018 / 2022 / 2023, develop / named categories and with a sibling requirements.txt: done 2026-10-04 15:30Z, pass.)
 0. Re-verify #645 once it's fixed (now including hosted in-run / standalone VEX, which gives a false `not_affected` on main and passes on `d8356ae`) (PR #654 `d8356ae` already passes the agent + hosted-warning repros on 2018 / 2022) (2018 / 2022 / 2023.10.24 with `PIPENV_VENV_IN_PROJECT=0`, `=false`, `PIPENV_NO_VENV_IN_PROJECT=1`; 2023.11.14+ must keep using WORKON). Also check its hosted shape: the stale warning and vex look at WORKON while Pipenv ≤ 2023.10 installs into `.venv`.
 1. #612 variants still open: `-r` includes in vendored mode. Re-verify once fixed. (Revert / rollback on the half-wired project pass.)
@@ -78,9 +80,10 @@ macOS/Windows rows are from the 2026-09-30 probes on `f6b7fb9`. No probe ran on 
 5. **Maintainer request (global `-g` mode):** still to do: macOS / Windows, `-g` on 2018 / 11, and `--global-prefix` as a venv root (scans 0; undocumented). Checklist in the 20261001T040000Z entry.
 6. Re-verify #725 once fixed (incl. the uuid-drift shapes), and #744. (`install <other>` on 2022 / 2023 and the vendor / apply dry-run VEX: done 2026-10-04 21:42Z, pass.) (Mirror-named `pypi` source and hosted path-prefix on 11 / 2018 / 2022 done 2026-10-03 21:36Z, pass.)
 6b. Re-verify #409 for Pipenv once fixed: `--site-packages` fresh + warm venv, hosted + vendored, 2018–2026 (stale warning or vex refusal expected). (Mixed-sources hosted rollback: done 2026-10-05, pass.)
-6c. Pipenv 2020 / 2021: the #790 `[dev-packages]` remedy, and include them in the #645 re-verification. (Relative `WORKON_HOME` with `--cwd`: done 2026-10-05 09:32Z, see Known non-bugs.)
-6d. #842: verify the hosted shape (stale-install warning with a warm WORKON venv + `venv_in_project = true` on ≤ 2026.1), and re-verify once fixed (2018 / 2023 / 2025 / 2026.1 fail, 2026.2+ use `./.venv`). Also Pipfile key × `PIPENV_VENV_IN_PROJECT` precedence on 2026.2+.
-7. A macOS/Windows probe re-verifying #333 / #334 / #384 / #529 / #546 / #645, and hosted / vendored on 2018 / 2022 there (CRLF on Windows). Blocked until branch deletion through the git proxy works (still denied 2026-10-05 03:30Z).
+6c. Pipenv 2020 / 2021: include them in the #645 re-verification. (The #790 `[dev-packages]` remedy on 2020.11.15: done 2026-10-05 19:15Z, pass.) (Relative `WORKON_HOME` with `--cwd`: done 2026-10-05 09:32Z, see Known non-bugs.)
+6d. Re-verify #842 once fixed: agent (2018 / 2023 / 2025 / 2026.1 fail; 2026.2+ use `./.venv`) and the hosted stale-install warning (2018 / 2023 / 2026.1 missing, commented 2026-10-05). (Pipfile key × env precedence on 2026.8: done, pass.) Still open: a non-boolean `PIPENV_VENV_IN_PROJECT` (e.g. `enabled`) + key `false` on 2026.2+ (Pipenv → WORKON, socket-patch → `.venv` only?); verify with real Pipenv.
+6e. #838 (rollback removing directories apply created) for a pypi agent patch that adds a file in a new directory.
+7. A macOS/Windows probe re-verifying #333 / #334 / #384 / #529 / #546 / #645, and hosted / vendored on 2018 / 2022 there (CRLF on Windows). Blocked until branch deletion through the git proxy works (still fails 2026-10-05 19:10Z).
 
 ## Known non-bugs
 
