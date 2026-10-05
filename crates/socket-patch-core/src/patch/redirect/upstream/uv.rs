@@ -1204,9 +1204,9 @@ pub(crate) enum LockRequirementArray<'a> {
 /// it ([`declared_clauses`]: by the extra and environment marker uv
 /// lowered into the entry). Returns:
 /// * `Ok(None)`: keep the recorded entry as it is. The declaration still
-///   agrees with it, nothing declares the name, or a declaration of it
-///   isn't a plain version range (the recorded spelling was uv's own, so
-///   it stays the best answer);
+///   agrees with it, nothing declares the name, or no declaration of it is
+///   a plain version range (the recorded spelling was uv's own, so it
+///   stays the best answer);
 /// * `Ok(Some(spec))`: write `spec` instead, in uv's spelling (`None` is no
 ///   specifier at all);
 /// * `Err`: the declaration changed but uv's spelling of it can't be
@@ -1234,12 +1234,6 @@ pub(crate) fn respell_lock_specifier(
         LockRequirementArray::Manifest(key) => Declared::Manifest(key),
     };
     let canon = canonicalize_pypi_name(name);
-    let unreadable = declarations(&meta, declared).iter().any(|d| {
-        canonicalize_pypi_name(pep508_name(d.spec)) == canon && spec_clauses(d.spec).is_err()
-    });
-    if unreadable {
-        return Ok(None);
-    }
     let recorded = match recorded {
         None => Vec::new(),
         Some(r) => match spec_clauses(&format!("{canon}{r}")) {
@@ -1247,8 +1241,20 @@ pub(crate) fn respell_lock_specifier(
             Err(_) => return Ok(None),
         },
     };
-    let Some(clauses) = declared_clauses(&meta, declared, name, marker)? else {
-        return Ok(None);
+    let clauses = match declared_clauses(&meta, declared, name, marker) {
+        Ok(Some(clauses)) => clauses,
+        Ok(None) => return Ok(None),
+        // Not one declaration of the name is a plain version range: the
+        // recorded spelling was uv's own, so it stays the best answer.
+        // Otherwise the marker narrowing left an unreadable or conflicting
+        // set, which is ambiguous: fail closed.
+        Err(reason) => {
+            let all_unreadable = declarations(&meta, declared)
+                .iter()
+                .filter(|d| canonicalize_pypi_name(pep508_name(d.spec)) == canon)
+                .all(|d| spec_clauses(d.spec).is_err());
+            return if all_unreadable { Ok(None) } else { Err(reason) };
+        }
     };
     let sorted = |clauses: &[String]| {
         let mut c = clauses.to_vec();

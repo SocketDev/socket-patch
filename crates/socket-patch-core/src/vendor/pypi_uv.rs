@@ -874,7 +874,15 @@ pub(super) async fn revert_uv(entry: &VendorEntry, root: &Path, dry_run: bool) -
                         // the fragment. Not drift: stay silent so the
                         // drift-keep gate can converge instead of keeping
                         // the artifact dir and ledger entry forever.
-                        if original_text.is_some_and(|orig| lock_text.contains(orig)) {
+                        // A requires-dist element is looked for in the root
+                        // unit's own array: a short one (`{ name = "six" }`)
+                        // also spells another package's dependency.
+                        let haystack = if rec.kind == "uv_lock_requires_dist" {
+                            root_requires_dist(&lock_text).unwrap_or("")
+                        } else {
+                            lock_text.as_str()
+                        };
+                        if original_text.is_some_and(|orig| haystack.contains(orig)) {
                             continue;
                         }
                         warnings.push(drifted("uv.lock"));
@@ -1094,6 +1102,19 @@ fn respell_original(
         }
     }
     Ok(out)
+}
+
+/// The root unit's `requires-dist = [ … ]` array text, if it has one.
+fn root_requires_dist(lock_text: &str) -> Option<&str> {
+    let unit = find_unit_span(lock_text, unit_is_root)?;
+    let unit_text = &lock_text[unit.clone()];
+    // requires-dist sits in [package.metadata], ahead of requires-dev.
+    let dist_scan = &unit_text[..unit_text
+        .find("[package.metadata.requires-dev]")
+        .unwrap_or(unit_text.len())];
+    let open = dist_scan.find("requires-dist = [")? + "requires-dist = ".len();
+    let end = balanced_span(unit_text, open)?;
+    Some(&unit_text[open..end])
 }
 
 /// The string value of `key` in a one-line `{ k = "v", … }` lock entry.
@@ -7068,6 +7089,82 @@ six = { path = ".socket/vendor/pypi/9f6b2c4e-1d3a-4f6b-8c2d-7e5a9b1c3d5f/six-1.1
         assert!(outcome.drift_skipped(), "{:?}", outcome.warnings);
         assert_eq!(py, edited_py);
         assert_eq!(lock, wired_lock);
+    }
+
+    /// Bugbot on #841: an extra pinning six with `===` (not a plain range)
+    /// must not stop the `dependencies` entry, which the marker narrowing
+    /// tells apart, from following its edited declaration.
+    #[tokio::test]
+    async fn revert_respells_past_an_unreadable_sibling_declaration() {
+        let py_in = EXTRAS_DUP_REGISTRY_PYPROJECT.replace(
+            "socks = [\"six==1.16.0\"]",
+            "socks = [\"six===1.16.0\"]",
+        );
+        let lock_in = EXTRAS_DUP_REGISTRY_LOCK.replace(
+            "marker = \"extra == 'socks'\", specifier = \"==1.16.0\"",
+            "marker = \"extra == 'socks'\", specifier = \"===1.16.0\"",
+        );
+        let (outcome, _, (_, lock)) = revert_after_declaration_edit(
+            &py_in,
+            &lock_in,
+            "dependencies = [\"six==1.16.0\"]",
+            "dependencies = [\"six>=1.15\"]",
+        )
+        .await;
+        assert!(outcome.success, "{:?}", outcome.error);
+        assert!(outcome.warnings.is_empty(), "{:?}", outcome.warnings);
+        assert_eq!(
+            lock,
+            lock_in.replace(
+                "    { name = \"six\", specifier = \"==1.16.0\" },",
+                "    { name = \"six\", specifier = \">=1.15\" },"
+            ),
+            "the extra's `===` entry keeps uv's own recorded spelling"
+        );
+    }
+
+    /// Bugbot on #841: after the bound is dropped, the restored element is
+    /// `{ name = "six" }`, which the root unit's `dependencies` array also
+    /// spells. If our wired requires-dist element was edited, that must
+    /// stay drift (both files kept), not pass as already converged.
+    #[tokio::test]
+    async fn revert_does_not_converge_on_a_lookalike_dependency_entry() {
+        let tmp = write_pair(DIRECT_REGISTRY_PYPROJECT, DIRECT_REGISTRY_LOCK).await;
+        let p = load_uv_project(tmp.path()).await.unwrap();
+        let (wiring, meta, _) = wire_uv(
+            &p,
+            tmp.path(),
+            "six",
+            "1.16.0",
+            REL_WHEEL,
+            WHEEL_NAME,
+            WHEEL_SHA,
+            UUID,
+        )
+        .await
+        .unwrap();
+        let (wired_py, wired_lock) = read_pair(tmp.path()).await;
+        let edited_py = wired_py.replace("\"six==1.16.0\"", "\"six\"");
+        let six_el = format!("{{ name = \"six\", path = \"{REL_WHEEL}\" }}");
+        let drifted_el = format!(
+            "{{ name = \"six\", marker = \"python_full_version >= '3.11'\", path = \"{REL_WHEEL}\" }}"
+        );
+        let drifted_lock = wired_lock.replace(&six_el, &drifted_el);
+        assert_ne!(drifted_lock, wired_lock);
+        assert!(drifted_lock.contains("{ name = \"six\" }"), "the lookalike");
+        tokio::fs::write(tmp.path().join("pyproject.toml"), &edited_py)
+            .await
+            .unwrap();
+        tokio::fs::write(tmp.path().join("uv.lock"), &drifted_lock)
+            .await
+            .unwrap();
+        let entry = entry_for(wiring, meta);
+        let outcome = revert_uv(&entry, tmp.path(), false).await;
+        assert!(outcome.success, "{:?}", outcome.error);
+        assert!(outcome.drift_skipped(), "{:?}", outcome.warnings);
+        let (py, lock) = read_pair(tmp.path()).await;
+        assert_eq!(py, edited_py);
+        assert_eq!(lock, drifted_lock);
     }
 
     /// An unchanged declaration, however it is spaced or ordered, still
