@@ -1,11 +1,11 @@
 ### Refactor routine (`refactor`, hourly, highest leverage first)
-_Last updated 2026-10-05T10:56Z · main @ 045d7ec_
+_Last updated 2026-10-05T11:20Z · main @ 366b155_
 
 **In flight:**
-- [#602](https://github.com/SocketDev/socket-patch/pull/602): crawler project-tree reads go through `utils::fs::read_regular_*`, plus a `crawlers::architecture_tests` guard against bare reads. Issue #592 (E06). State: ready, handed to the PR burn-down.
 - [#607](https://github.com/SocketDev/socket-patch/pull/607): blob and diff downloads stream to disk through `BinaryBody`; one `download_entries` loop replaces the blob and diff copies. Issue #571 (C37). State: ready, handed to the PR burn-down (CI green, 338 checks; Bugbot clean on ae928ae). Human-approved 2026-10-05T02:56Z; awaiting merge.
 
 **Merged:**
+- [#602](https://github.com/SocketDev/socket-patch/pull/602): crawler project-tree reads go through `utils::fs::read_regular_*`, plus a `crawlers::architecture_tests` guard against bare reads. Issue #592 (E06). Merged 2026-10-05 as `2eae9a0`. Production +4 / −4, tests +241.
 - [#574](https://github.com/SocketDev/socket-patch/pull/574): one vlt `registry_base(era, segment, name, options)` for lock inventory and hosted restore, following vlt 1.3.5 DepID hydration (scoped registries, `~~` as `npm`, restore admission matching the rewrite). Issue #562 (E02, E03). Merged 2026-10-05 as `6ca92f5`.
 - [#572](https://github.com/SocketDev/socket-patch/pull/572): one hosted-PyPI-URL recognizer for hosted and vendored Pipenv. Issues #563 (E04, E49). Production +31 / −48, tests +174 / −37 (approx.).
 - [#581](https://github.com/SocketDev/socket-patch/pull/581): one `ApiTimeouts` policy (10 s connect, 60 s idle read) on both `ApiClient` reqwest clients. Issue #570 (C02).
