@@ -1178,6 +1178,11 @@ pub(crate) async fn run_redirect_selected(
             common,
             &confirmed,
             &rewrite.confirmed_pipenv_uuids,
+            rewrite
+                .files
+                .get("Pipfile.lock")
+                .or_else(|| done.files.get("Pipfile.lock"))
+                .map(String::as_str),
             &records,
         )
         .await
