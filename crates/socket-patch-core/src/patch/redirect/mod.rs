@@ -4755,224 +4755,111 @@ const NUGET_ORG_URL: &str = "https://api.nuget.org/v3/index.json";
 /// caller must skip the dep fail-closed — writing the mapping without its
 /// source (or recording the edit at all) routes the patched id to a source
 /// that was never defined while the ledger claims the redirect landed.
-fn add_nuget_source(config: &str, reg: &str, index_url: &str, pkg_id: &str) -> Option<String> {
-    // Capture the pre-existing packageSource keys BEFORE the Socket source is
-    // added — the fallback below fans a `*` mapping out to them.
-    let mut pre_existing_keys = nuget_package_source_keys(config);
-    let mut out = config.to_string();
-
-    // A from-scratch <packageSourceMapping> is EXCLUSIVE: once it exists, every
-    // package must match some source's `*`/pattern or restore fails NU1100. If
-    // there are NO pre-existing sources to fan `*` out to, the mapping would be
-    // socket-only and every other package would fail. Seed the implicit default
-    // nuget.org source so the catch-all has a real target (unless the config
-    // already has one). Only relevant when we are about to CREATE the mapping.
-    // The open tag may carry whitespace or attributes (`<packageSourceMapping >`
-    // is valid XML); a literal probe reads it as absent and authors a
-    // DUPLICATE section.
-    let creating_mapping = nuget_mapping_open_end(&out).is_none();
-    // "Already has one" is decided by the parsed <packageSources> keys ALONE:
-    // a whole-file "nuget.org" probe is satisfied by text that defines no
-    // source (a defaultPushSource URL, a <disabledPackageSources> entry, a
-    // comment), and suppressing the seed on it leaves the from-scratch
-    // mapping socket-only — NU1100 for every other package.
+fn add_nuget_source(
+    config: &str,
+    parsed: &crate::formats::nuget::NugetConfig,
+    reg: &str,
+    index_url: &str,
+    pkg_id: &str,
+) -> Option<String> {
+    // The same source identities restore and VEX read, before Socket is added.
+    let mut pre_existing_keys: Vec<&str> =
+        parsed.sources.iter().map(|(key, _)| key.as_str()).collect();
+    let creating_mapping = parsed
+        .source_mapping
+        .as_ref()
+        .is_none_or(|section| section.close_start.is_none());
     let seed_nuget_org = creating_mapping && pre_existing_keys.is_empty();
-    if seed_nuget_org {
-        out = insert_nuget_source(&out, NUGET_ORG_KEY, NUGET_ORG_URL)?;
-        pre_existing_keys.push(NUGET_ORG_KEY.to_string());
-    }
-
-    out = insert_nuget_source(&out, reg, index_url)?;
-
-    let socket_mapping = format!(
-        "    <packageSource key=\"{reg}\">\n      <package pattern=\"{pkg_id}\" />\n    </packageSource>"
+    let reg = nuget_xml_attribute(reg);
+    let mut source_lines = format!(
+        "    <add key=\"{reg}\" value=\"{}\" />",
+        nuget_xml_attribute(index_url)
     );
-    if !creating_mapping {
-        // A mapping already exists (e.g. a prior patched dep, or the project's
-        // own): append ONLY this source's mapping — every other source is
-        // already covered.
-        // After any `<clear />` in the section: NuGet drops every mapping
-        // read before one, leaving the patched id routed nowhere.
-        let open_end = nuget_mapping_open_end(&out)?;
-        let at = nuget_after_last_clear(&out, open_end, "packageSourceMapping");
-        out = format!("{}\n{socket_mapping}{}", &out[..at], &out[at..]);
-    } else {
-        // Creating the mapping from scratch. Once ANY <packageSourceMapping>
-        // exists, NuGet requires EVERY package to match some source's pattern,
-        // so a mapping that routed only the patched id to the Socket source
-        // would make every OTHER package fail restore with NU1100. Fan a
-        // `<package pattern="*" />` out to each pre-existing source (which now
-        // includes the seeded nuget.org when the config had none) so the rest
-        // of the restore keeps resolving exactly where it did before.
-        let fallback_mappings = pre_existing_keys
-            .iter()
-            .map(|key| {
-                format!(
-                    "    <packageSource key=\"{key}\">\n      <package pattern=\"*\" />\n    </packageSource>"
-                )
-            })
-            .collect::<Vec<_>>()
-            .join("\n");
-        let inner = if fallback_mappings.is_empty() {
-            socket_mapping
-        } else {
-            format!("{socket_mapping}\n{fallback_mappings}")
-        };
-        let map_block = format!("  <packageSourceMapping>\n{inner}\n  </packageSourceMapping>");
-        // The close tag may carry whitespace (`</configuration >` is valid
-        // XML); a literal replacen would silently drop the mapping.
-        let close_re = Regex::new(r"</configuration\s*>")
-            .expect("static configuration close-tag regex is valid");
-        let m = close_re.find(&out)?;
-        let at = m.start();
-        out = format!("{}{map_block}\n{}", &out[..at], &out[at..]);
-    }
-    Some(out)
-}
-
-/// Insert an `<add key="…" value="…" />` source under `<packageSources>`,
-/// creating the element (right after the `<configuration>` root open tag,
-/// whatever whitespace or attributes it carries) when absent. A self-closing
-/// `<packageSources />` (any whitespace before `/>`) is expanded in place
-/// into an open/close pair rather than left dangling beside a duplicate
-/// element. `None` when no anchor exists at all — the caller must treat the
-/// insert as failed rather than proceed on unchanged text.
-fn insert_nuget_source(config: &str, key: &str, url: &str) -> Option<String> {
-    let source_line = format!("    <add key=\"{key}\" value=\"{url}\" />");
-    // A self-closing element carries no children, so expand it to an open/close
-    // pair holding the new source. Matched before the open-tag check because
-    // the tolerant open-tag regex below also matches the whitespace-carrying
-    // `<packageSources />` form, and inserting after its `>` would land the
-    // source OUTSIDE the element.
-    let self_closing = Regex::new(r"<packageSources\s*/>")
-        .expect("static self-closing packageSources regex is valid");
-    // The open tag may carry whitespace (`<packageSources >` is valid XML
-    // NuGet parses); a literal `<packageSources>` probe reads it as absent
-    // and the from-scratch branch below authors a DUPLICATE element — the
-    // vendor/nuget_feed twin already tolerates the spelling.
-    let open_tag = Regex::new(r"<packageSources(?:\s[^>]*)?>")
-        .expect("static packageSources open-tag regex is valid");
-    if let Some(m) = self_closing.find(config) {
-        let mut out = String::with_capacity(config.len() + source_line.len() + 40);
-        out.push_str(&config[..m.start()]);
-        out.push_str(&format!(
-            "<packageSources>\n{source_line}\n  </packageSources>"
+    if seed_nuget_org {
+        // Once a mapping exists, every package needs a matching source. Keep
+        // the implicit nuget.org fallback when this file defines none.
+        source_lines.push_str(&format!(
+            "\n    <add key=\"{NUGET_ORG_KEY}\" value=\"{NUGET_ORG_URL}\" />"
         ));
-        out.push_str(&config[m.end()..]);
-        Some(out)
-    } else if let Some(m) = open_tag
-        .find(config)
-        // An attribute-carrying self-closing form (`<packageSources … />`,
-        // schema-invalid but cheap to guard) has no children span: fall
-        // through to the from-scratch branch rather than insert outside it.
-        .filter(|m| !m.as_str().ends_with("/>"))
-    {
-        // After any `<clear />`: NuGet drops every source read before one,
-        // so the mapping would point at an undefined source (NU1100).
-        let end = nuget_after_last_clear(config, m.end(), "packageSources");
-        Some(format!(
-            "{}\n{source_line}{}",
-            &config[..end],
-            &config[end..]
+        pre_existing_keys.push(NUGET_ORG_KEY);
+    }
+    let out = if let Some(section) = &parsed.package_sources {
+        insert_nuget_children(config, section, "packageSources", &source_lines)
+    } else {
+        insert_nuget_children(
+            config,
+            parsed.configuration.as_ref()?,
+            "configuration",
+            &format!("  <packageSources>\n{source_lines}\n  </packageSources>"),
+        )
+    };
+
+    // Source insertion shifted the mapping's byte offsets. Re-read through
+    // the shared tokenizer, never a second grammar over the modified text.
+    let updated = crate::formats::nuget::parse_config(&out)?;
+    let socket_mapping = format!(
+        "    <packageSource key=\"{reg}\">\n      <package pattern=\"{}\" />\n    </packageSource>",
+        nuget_xml_attribute(pkg_id),
+    );
+    let mut inner = socket_mapping;
+    if creating_mapping {
+        for key in pre_existing_keys {
+            inner.push_str(&format!(
+                "\n    <packageSource key=\"{}\">\n      <package pattern=\"*\" />\n    </packageSource>",
+                nuget_xml_attribute(key),
+            ));
+        }
+    }
+    if let Some(section) = &updated.source_mapping {
+        Some(insert_nuget_children(
+            &out,
+            section,
+            "packageSourceMapping",
+            &inner,
         ))
     } else {
-        // The root open tag may carry whitespace or attributes
-        // (`<configuration >`, `<configuration xmlns=…>`) — all valid XML a
-        // literal `<configuration>` match would silently miss, leaving the
-        // source undefined while the mapping still lands.
-        let open_re = Regex::new(r"<configuration(\s[^>]*)?>")
-            .expect("static configuration open-tag regex is valid");
-        let end = open_re.find(config)?.end();
+        let at = updated.configuration.as_ref()?.close_start?;
         Some(format!(
-            "{}\n  <packageSources>\n{source_line}\n  </packageSources>{}",
-            &config[..end],
-            &config[end..]
+            "{}  <packageSourceMapping>\n{inner}\n  </packageSourceMapping>\n{}",
+            &out[..at],
+            &out[at..]
         ))
     }
 }
 
-/// The offset just past the `<packageSourceMapping>` open tag (any whitespace
-/// or attributes), or `None` when the config has no open/close section — a
-/// self-closing `<packageSourceMapping />` holds no children to append to.
-fn nuget_mapping_open_end(config: &str) -> Option<usize> {
-    static OPEN_RE: LazyLock<Regex> = LazyLock::new(|| {
-        Regex::new(r"<packageSourceMapping(?:\s[^>]*)?>")
-            .expect("static packageSourceMapping open-tag regex is valid")
-    });
-    OPEN_RE
-        .find(config)
-        .filter(|m| !m.as_str().ends_with("/>"))
-        .map(|m| m.end())
-}
-
-/// The offset just past the last `<clear />` between `from` and the `section`
-/// element's close tag (any whitespace before `>`), else `from`. Comments are
-/// skipped: a commented-out `<clear />` clears nothing, and anchoring on it
-/// would splice the new entry INSIDE the comment.
-fn nuget_after_last_clear(config: &str, from: usize, section: &str) -> usize {
-    static CLEAR_RE: LazyLock<Regex> =
-        LazyLock::new(|| Regex::new(r"<clear\s*/>").expect("static clear-tag regex is valid"));
-    static COMMENT_RE: LazyLock<Regex> =
-        LazyLock::new(|| Regex::new(r"(?s)<!--.*?-->").expect("static comment regex is valid"));
-    // Blank comment bytes in place so offsets still index `config`.
-    let mut masked = config.as_bytes()[from..].to_vec();
-    for m in COMMENT_RE.find_iter(&config[from..]) {
-        masked[m.range()].fill(b' ');
+/// Insert only at live, directly-scoped elements recorded by the XML reader.
+/// The model's insertion point follows the last `<clear>` child. Expanding a
+/// self-closing section keeps its opening attributes and all surrounding bytes.
+fn insert_nuget_children(
+    config: &str,
+    section: &crate::formats::nuget::ConfigSection,
+    name: &str,
+    children: &str,
+) -> String {
+    let mut out = config.to_string();
+    if section.close_start.is_some() {
+        out.insert_str(section.insert_at, &format!("\n{children}"));
+    } else {
+        let open = config[section.open.start..section.open.end - 2].trim_end();
+        out.replace_range(
+            section.open.clone(),
+            &format!("{open}>\n{children}\n  </{name}>"),
+        );
     }
-    let masked = String::from_utf8(masked).expect("only whole comments are blanked");
-    let close_re =
-        Regex::new(&format!(r"</{section}\s*>")).expect("section close-tag regex is valid");
-    let Some(close) = close_re.find(&masked) else {
-        return from;
-    };
-    CLEAR_RE
-        .find_iter(&masked[..close.start()])
-        .last()
-        .map_or(from, |m| from + m.end())
+    out
 }
 
-/// The `key` of every `<add … />` under `<packageSources>` (empty when there
-/// is no such element). Used to preserve resolution for non-patched packages
-/// when a `<packageSourceMapping>` is introduced.
-// The open tag may carry whitespace (`<packageSources >` is valid XML NuGet
-// parses); a literal match reads a real source list as "no sources" —
-// duplicate nuget.org seed, missed catch-all fan-out — while the
-// vendor/nuget_feed twin already tolerates the spelling. A self-closing
-// `<packageSources />` has no close tag, so the regex (correctly) finds no
-// children span.
-static NUGET_PACKAGE_SOURCES_REGION_RE: LazyLock<Regex> = LazyLock::new(|| {
-    Regex::new(r"(?s)<packageSources(?:\s[^>]*)?>(.*?)</packageSources>")
-        .expect("static packageSources region regex is valid")
-});
-// Tolerates any attribute order, whitespace around `=`, and single-quoted
-// values (all valid XML NuGet accepts): a real source the scan misses would
-// read as "no sources", triggering a duplicate nuget.org seed and leaving the
-// missed source out of the catch-all fan-out. `[^>]` keeps the match inside
-// one element.
-static NUGET_ADD_KEY_RE: LazyLock<Regex> = LazyLock::new(|| {
-    Regex::new(r#"<add\s[^>]*?key\s*=\s*(?:"([^"]+)"|'([^']+)')"#)
-        .expect("static add-key regex is valid")
-});
-
-fn nuget_package_source_keys(config: &str) -> Vec<String> {
-    let scope = NUGET_PACKAGE_SOURCES_REGION_RE
-        .captures(config)
-        .map(|c| {
-            c.get(1)
-                .expect("region_re always captures group 1")
-                .as_str()
-        })
-        .unwrap_or("");
-    NUGET_ADD_KEY_RE
-        .captures_iter(scope)
-        .map(|c| {
-            c.get(1)
-                .or_else(|| c.get(2))
-                .expect("one quote alternative always captures")
-                .as_str()
-                .to_string()
-        })
-        .collect()
+/// The reader returns decoded attribute values; encode them when writing so
+/// a source named `a&amp;b` still has the same identity in its mapping.
+fn nuget_xml_attribute(value: &str) -> String {
+    value
+        .replace('&', "&amp;")
+        .replace('"', "&quot;")
+        .replace('<', "&lt;")
+        // Literal XML attribute whitespace would be normalized to spaces.
+        .replace('\t', "&#x9;")
+        .replace('\n', "&#xA;")
+        .replace('\r', "&#xD;")
 }
 
 fn rewrite_nuget(
@@ -5051,28 +4938,35 @@ fn rewrite_nuget(
             .clone()
             .unwrap_or_else(|| dep.name.to_lowercase());
 
-        // Idempotency probe over the parsed `<packageSources>` keys — the
-        // same reader `add_nuget_source` fans the catch-all out with — so a
-        // hand-normalized spelling (`key = 'socket-patch-…'`) is recognized
-        // as already wired instead of being duplicated on a re-run.
-        if !nuget_package_source_keys(&config)
-            .iter()
-            .any(|key| key == &reg)
-        {
+        let unwritable = || RewriteWarning {
+            code: "redirect_nuget_config_unwritable".into(),
+            detail: format!(
+                "nuget.config has malformed XML or no unambiguous <configuration> layout \
+                 to wire {} into; not redirected",
+                dep.name
+            ),
+        };
+        // Validate even an apparently existing Socket source before re-pinning
+        // the lock. A partial parse must never turn into a claimed redirect.
+        let Some(parsed) = crate::formats::nuget::parse_config(&config).filter(|parsed| {
+            !parsed.repeated_sections
+                && parsed
+                    .configuration
+                    .as_ref()
+                    .is_some_and(|root| root.close_start.is_some())
+        }) else {
+            result.warnings.push(unwritable());
+            continue;
+        };
+        if !parsed.sources.iter().any(|(key, _)| key == &reg) {
             // A failed insert skips the WHOLE dep (no edit record, no lock
             // re-pin): a mapping without its source routes the patched id to
             // a source that was never defined, and a lock pinned at the
             // patched contentHash over an upstream fetch fails NU1403 — both
             // while the ledger would claim the redirect landed.
-            let Some(updated) = add_nuget_source(&config, &reg, &ov.index_url, &dep.name) else {
-                result.warnings.push(RewriteWarning {
-                    code: "redirect_nuget_config_unwritable".into(),
-                    detail: format!(
-                        "nuget.config has no <configuration> element to wire {} into; \
-                         not redirected",
-                        dep.name
-                    ),
-                });
+            let Some(updated) = add_nuget_source(&config, &parsed, &reg, &ov.index_url, &dep.name)
+            else {
+                result.warnings.push(unwritable());
                 continue;
             };
             config = updated;
@@ -7619,6 +7513,155 @@ mod tests {
                 ..Default::default()
             },
         }
+    }
+
+    #[test]
+    fn nuget_shared_model_ignores_commented_sources() {
+        for sources in [
+            r#"<packageSources><!-- <add key="old" value="https://old.test" /> --></packageSources>"#,
+            r#"<!-- <packageSources><add key="old" value="https://old.test" /></packageSources> -->
+  <packageSources><add key="nuget.org" value="https://api.nuget.org/v3/index.json" />
+    <!-- <add key="other" value="https://other.test" /> -->
+  </packageSources>"#,
+        ] {
+            let config = format!("<configuration>\n  {sources}\n</configuration>\n");
+            let files = BTreeMap::from([("nuget.config".into(), config)]);
+            let result = rewrite_registry_redirect(&files, &[nuget_override()]);
+            let out = result.files.get("nuget.config").expect("config rewritten");
+            let parsed = crate::formats::nuget::parse_config(out).unwrap();
+            assert_eq!(
+                parsed
+                    .sources
+                    .iter()
+                    .map(|(key, _)| key.as_str())
+                    .collect::<Vec<_>>(),
+                ["socket-patch-uuid", "nuget.org"],
+                "only live sources receive mappings: {out}"
+            );
+            assert_eq!(
+                parsed.mappings,
+                [
+                    ("socket-patch-uuid".into(), vec!["Newtonsoft.Json".into()]),
+                    ("nuget.org".into(), vec!["*".into()]),
+                ],
+                "every catch-all must name a source NuGet reads: {out}"
+            );
+        }
+    }
+
+    #[test]
+    fn nuget_shared_model_never_splices_into_inert_markup() {
+        let fake = "<packageSources></packageSources><packageSourceMapping></packageSourceMapping>";
+        for inert in [
+            format!("<!-- é {fake} -->"),
+            format!("<![CDATA[{fake}]]>"),
+            format!("<?example {fake}?>"),
+        ] {
+            let config = format!(
+                "<configuration>\n  {inert}\n  <packageSources>\n    \
+                 <add key=\"nuget.org\" value=\"https://api.nuget.org/v3/index.json\" />\n  \
+                 </packageSources>\n</configuration>\n"
+            );
+            let files = BTreeMap::from([("nuget.config".into(), config)]);
+            let result = rewrite_registry_redirect(&files, &[nuget_override()]);
+            let out = result.files.get("nuget.config").expect("config rewritten");
+            assert!(out.contains(&inert), "inert bytes must be preserved: {out}");
+            let parsed = crate::formats::nuget::parse_config(out).unwrap();
+            assert!(parsed
+                .sources
+                .iter()
+                .any(|(key, _)| key == "socket-patch-uuid"));
+            assert!(parsed.mappings.iter().any(|(key, patterns)| {
+                key == "socket-patch-uuid" && patterns == &["Newtonsoft.Json"]
+            }));
+            let rerun = rewrite_registry_redirect(&result.files, &[nuget_override()]);
+            assert!(
+                rerun.files.is_empty() && rerun.edits.is_empty(),
+                "idempotent: {rerun:?}"
+            );
+        }
+    }
+
+    #[test]
+    fn nuget_shared_model_refuses_malformed_config_without_repinning_lock() {
+        for config in [
+            "<configuration><packageSources></configuration>",
+            "<configuration><!-- unterminated </configuration>",
+            "<configuration><packageSources/><packageSources/></configuration>",
+            // Even an apparently existing Socket source cannot bypass validation.
+            r#"<configuration><packageSources><add key="socket-patch-uuid" value="https://patch.test/nuget/index.json" /></packageSources>"#,
+        ] {
+            let files = BTreeMap::from([
+                ("nuget.config".into(), config.into()),
+                ("packages.lock.json".into(), r#"{"version":1,"dependencies":{"net8.0":{"Newtonsoft.Json":{"type":"Direct","resolved":"13.0.3","contentHash":"ORIGINAL"}}}}"#.into()),
+            ]);
+            let result = rewrite_registry_redirect(&files, &[nuget_override()]);
+            assert!(
+                result.files.is_empty() && result.edits.is_empty(),
+                "no half-write: {result:?}"
+            );
+            assert!(warning_codes(&result).contains(&"redirect_nuget_config_unwritable"));
+        }
+    }
+
+    #[test]
+    fn nuget_shared_model_preserves_source_key_attribute_whitespace() {
+        for (raw, decoded, encoded) in [
+            ("corp&#x9;feed", "corp\tfeed", "corp&#x9;feed"),
+            ("corp&#10;feed", "corp\nfeed", "corp&#xA;feed"),
+            ("corp&#13;feed", "corp\rfeed", "corp&#xD;feed"),
+            ("corp\tfeed", "corp feed", "corp feed"),
+            ("corp\nfeed", "corp feed", "corp feed"),
+            ("corp\rfeed", "corp feed", "corp feed"),
+            ("corp\r\nfeed", "corp feed", "corp feed"),
+            (
+                "corp\r\n&#x9;&#xD;&#xA;feed",
+                "corp \t\r\nfeed",
+                "corp &#x9;&#xD;&#xA;feed",
+            ),
+        ] {
+            let source = format!("<add key=\"{raw}\" value=\"https://corp.test/index.json\" />");
+            let config = format!(
+                "<configuration><packageSources><clear/>{source}</packageSources></configuration>"
+            );
+            let files = BTreeMap::from([("nuget.config".into(), config)]);
+            let result = rewrite_registry_redirect(&files, &[nuget_override()]);
+            let out = result.files.get("nuget.config").expect("config rewritten");
+            assert!(out.contains(&source), "original source bytes preserved: {out}");
+            // XML normalizes literal attribute whitespace to spaces, but
+            // preserves character references. The fallback must keep the
+            // same source identity under a real XML reader, not just ours.
+            assert!(
+                out.contains(&format!("<packageSource key=\"{encoded}\">")),
+                "source {raw:?} needs an equivalent mapping: {out}"
+            );
+            let parsed = crate::formats::nuget::parse_config(out).unwrap();
+            assert_eq!(parsed.sources[1].0, decoded);
+            assert_eq!(parsed.mappings[1], (decoded.into(), vec!["*".into()]));
+        }
+    }
+
+    #[test]
+    fn nuget_shared_model_expands_empty_mapping_and_encodes_source_keys() {
+        let config = r#"<configuration note=">">
+  <packageSources>
+    <clear></clear>
+    <add key="a&amp;b&quot;&lt;" value="https://corp.test/index.json" />
+  </packageSources>
+  <!-- <packageSourceMapping /> -->
+  <packageSourceMapping />
+</configuration>
+"#;
+        let files = BTreeMap::from([("nuget.config".into(), config.into())]);
+        let result = rewrite_registry_redirect(&files, &[nuget_override()]);
+        let out = result.files.get("nuget.config").expect("config rewritten");
+        let parsed = crate::formats::nuget::parse_config(out).unwrap();
+        assert!(!parsed.repeated_sections, "reuse the empty mapping: {out}");
+        assert_eq!(parsed.sources[1].0, "a&b\"<");
+        assert_eq!(parsed.mappings[1], ("a&b\"<".into(), vec!["*".into()]));
+        assert!(out.contains("<clear></clear>\n    <add key=\"socket-patch-uuid\""));
+        assert!(out.contains("<!-- <packageSourceMapping /> -->"));
+        assert!(out.starts_with("<configuration note=\">\">"));
     }
 
     /// Creating a `<packageSourceMapping>` from scratch: once ANY mapping

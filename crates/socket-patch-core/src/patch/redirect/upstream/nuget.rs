@@ -440,6 +440,7 @@ mod tests {
     fn hosted_config(config: &str) -> String {
         super::super::super::add_nuget_source(
             config,
+            &parse_config(config).unwrap(),
             &format!("socket-patch-{UUID}"),
             &index_url(),
             "Newtonsoft.Json",
