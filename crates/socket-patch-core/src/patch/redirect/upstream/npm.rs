@@ -282,6 +282,8 @@ async fn restore_classic(
     ctx: &Ctx<'_>,
     result: &mut FormatResult,
 ) {
+    use crate::vendor::yarn_classic_lock::{classic_block_is_git, split_key_patterns};
+
     let eol = LineEndings::of(raw);
     if eol == LineEndings::Mixed {
         refuse_all_in(pins, rel, result, format!("{rel} mixes line endings"));
@@ -308,7 +310,25 @@ async fn restore_classic(
         if !pins.contains_key(uuid.as_str()) {
             continue;
         }
-        let name = super::super::yarn_classic_block_head(block).and_then(|(_, n)| n);
+        let head = super::super::yarn_classic_block_head(block);
+        // yarn 1 fetches a git pattern with git, from `resolved` (#363): a
+        // registry tarball there fails every install just as the hosted one
+        // does, and the block's own git source was never recorded.
+        let patterns = head
+            .as_ref()
+            .map(|(key, _)| split_key_patterns(key))
+            .unwrap_or_default();
+        if classic_block_is_git(&patterns, None) {
+            result.refuse(
+                &uuid,
+                format!(
+                    "the {rel} entry wiring it installs from git; a registry tarball there \
+                     would still be fetched with git"
+                ),
+            );
+            continue;
+        }
+        let name = head.and_then(|(_, n)| n);
         let version = version_re.captures(block).map(|c| c[1].to_string());
         match (name, version) {
             (Some(name), Some(version)) => hits.push((i, uuid, name, version)),

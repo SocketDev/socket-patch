@@ -2582,4 +2582,51 @@ mod tests {
             assert!(result.success, "{purl}: {:?}", result.error);
         }
     }
+
+    /// #626: rollback must not write the upstream original over first-party
+    /// source a `node_modules` link points at (left patched by an apply
+    /// from before the guard). Refused, dry run included, bytes kept.
+    #[cfg(unix)]
+    #[tokio::test]
+    async fn test_rollback_refuses_node_modules_link_to_first_party_source() {
+        let root = tempfile::tempdir().unwrap();
+        let ws = root.path().join("ws");
+        let nm = ws.join("node_modules");
+        std::fs::create_dir_all(&nm).unwrap();
+        let member = ws.join("packages").join("left-pad");
+        std::fs::create_dir_all(&member).unwrap();
+        std::os::unix::fs::symlink("../packages/left-pad", nm.join("left-pad")).unwrap();
+        let original = b"upstream original".to_vec();
+        let patched = b"upstream PATCHED".to_vec();
+        std::fs::write(member.join("index.js"), &patched).unwrap();
+        let blobs = root.path().join("blobs");
+        std::fs::create_dir_all(&blobs).unwrap();
+        let before_hash = compute_git_sha256_from_bytes(&original);
+        std::fs::write(blobs.join(&before_hash), &original).unwrap();
+        let mut files = HashMap::new();
+        files.insert(
+            "index.js".to_string(),
+            PatchFileInfo {
+                before_hash,
+                after_hash: compute_git_sha256_from_bytes(&patched),
+            },
+        );
+        for dry_run in [true, false] {
+            let result = rollback_package_patch(
+                "pkg:npm/left-pad@1.3.0",
+                &nm.join("left-pad"),
+                &files,
+                &blobs,
+                dry_run,
+            )
+            .await;
+            assert!(!result.success, "dry_run={dry_run}: must refuse");
+            let err = result.error.unwrap_or_default();
+            assert!(
+                err.contains(crate::patch::shared_store::LINKED_SOURCE_REFUSAL_MARKER),
+                "{err}"
+            );
+        }
+        assert_eq!(std::fs::read(member.join("index.js")).unwrap(), patched);
+    }
 }

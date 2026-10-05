@@ -24,6 +24,7 @@ pipenv = load_script("backtest-pipenv")
 pdm = load_script("backtest-pdm")
 bun = load_script("backtest-bun")
 vlt = load_script("backtest-vlt")
+poetry = load_script("backtest-poetry")
 
 
 class BunTransportRetryTests(unittest.TestCase):
@@ -222,6 +223,86 @@ class PipenvTransportRetryTests(unittest.TestCase):
             kind, payload, calls, _ = self.drive([{"passed": True, "log": self.PYPI_503}], Path(temp))
             self.assertEqual((kind, len(calls)), ("row", 1))
             self.assertNotIn("transportRetries", payload)
+
+
+class PoetryTransportRetryTests(unittest.TestCase):
+    JOB = ("1.8.5", "direct", "hosted")
+    POETRY_CONNECTION_ERROR = (
+        "729│             raise ConnectionError(e, request=request)\n"
+        "731│         except ClosedPoolError as e:\n"
+        "Cannot install urllib3.")
+
+    def drive(self, outcomes, root):
+        """Drive retry_transport with one scripted outcome per attempt."""
+        case = root / "captures" / "1.8.5-direct-hosted"
+        calls = []
+
+        def run_case(_job):
+            outcome = outcomes[len(calls)]
+            calls.append(outcome)
+            if case.exists():
+                poetry.shutil.rmtree(case)
+            case.mkdir(parents=True)
+            (case / "scan.log").write_text(outcome.get("log", ""))
+            operation = object.__new__(poetry.Run)
+            operation.cmd = ["poetry", "install"]
+            operation.rc = 0 if outcome.get("passed") else 1
+            operation.out = ""
+            operation.err = outcome.get("raise", outcome.get("log", ""))
+            if "raise" in outcome:
+                raise poetry.CommandFailure(operation, "fixture operation")
+            row = {"passed": outcome["passed"], "checks": {}, "info": {}}
+            poetry.record_check(row, "appliedExactlyOne", outcome["passed"], operation=operation)
+            return row
+
+        sleeps = []
+        kind, payload = poetry.retry_transport(run_case, self.JOB, case, root, sleep=sleeps.append)
+        return kind, payload, calls, sleeps
+
+    def test_poetry_connection_error_is_retried_from_a_fresh_case_and_keeps_evidence(self):
+        with tempfile.TemporaryDirectory() as temp:
+            root = Path(temp)
+            kind, payload, calls, sleeps = self.drive([{"raise": "poetry install failed (exit 1):\n" + self.POETRY_CONNECTION_ERROR}, {"passed": True}], root)
+            self.assertEqual((kind, payload["passed"], len(calls), sleeps), ("row", True, 2, [10]))
+            retry = payload["transportRetries"][0]
+            self.assertIn("Cannot install urllib3", retry["error"])
+            self.assertTrue((root / retry["evidence"] / "scan.log").is_file())
+            saved = json.loads((root / "captures/1.8.5-direct-hosted/result.json").read_text())
+            self.assertEqual(saved["transportRetries"], payload["transportRetries"])
+
+    def test_required_cli_transport_errors_are_retried(self):
+        for log in ("error sending request for url (https://patches-api.socket.dev/v0/orgs)",
+                    "API request failed with status 502: bad gateway",
+                    "Rate limit exceeded (HTTP 429, gave up after 3 retries). Please try again later."):
+            with self.subTest(log=log), tempfile.TemporaryDirectory() as temp:
+                kind, payload, calls, _ = self.drive([{"passed": False, "log": log}, {"passed": True}], Path(temp))
+                self.assertEqual((kind, payload["passed"], len(calls)), ("row", True, 2))
+                self.assertEqual(payload["transportRetries"][0]["failedChecks"], ["appliedExactlyOne"])
+
+    def test_functional_failures_are_never_retried(self):
+        with tempfile.TemporaryDirectory() as temp:
+            kind, payload, calls, sleeps = self.drive([{"passed": False, "log": "warning: pypi_poetry_lock_unsupported"}], Path(temp))
+            self.assertEqual((kind, payload["passed"], len(calls), sleeps), ("row", False, 1, []))
+            self.assertNotIn("transportRetries", payload)
+            kind, payload, calls, _ = self.drive([{"raise": "scan produced no JSON: Expecting value"}], Path(temp))
+            self.assertEqual((kind, len(calls)), ("error", 1))
+
+    def test_a_persistent_transport_failure_stays_red_after_three_attempts(self):
+        with tempfile.TemporaryDirectory() as temp:
+            kind, payload, calls, sleeps = self.drive([{"raise": self.POETRY_CONNECTION_ERROR}] * 3, Path(temp))
+            self.assertEqual((kind, len(calls), sleeps), ("error", 3, [10, 20]))
+            self.assertEqual([r["attempt"] for r in payload["transportRetries"]], [1, 2])
+
+    def test_a_passing_case_runs_once(self):
+        with tempfile.TemporaryDirectory() as temp:
+            kind, payload, calls, _ = self.drive([{"passed": True, "log": self.POETRY_CONNECTION_ERROR}], Path(temp))
+            self.assertEqual((kind, len(calls)), ("row", 1))
+            self.assertNotIn("transportRetries", payload)
+
+    def test_failure_details_list_only_failed_checks_with_notes(self):
+        row = {"checks": {"appliedExactlyOne": False, "pyprojectUnchanged": True, "lockRewritten": False},
+               "info": {"appliedExactlyOne": {"applied": 0, "status": "error"}, "pyprojectUnchanged": {"x": 1}}}
+        self.assertEqual(poetry.failure_details(row), ['  appliedExactlyOne: {"applied": 0, "status": "error"}'])
 
 
 class PipenvShimTests(unittest.TestCase):

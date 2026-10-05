@@ -13,8 +13,8 @@ use serde::Serialize;
 use crate::api::ranking::severity_order as get_severity_order;
 use crate::api::ranking::{cmp_batch_infos, cmp_search_results};
 use crate::api::retry::{
-    is_retryable_status, jitter_sample as retry_jitter, parse_retry_after, ApiRetry,
-    ApiRetryPolicy, ApiTimeouts, RetryHooks,
+    is_retryable_status, is_retryable_transport, jitter_sample as retry_jitter, parse_retry_after,
+    ApiRetry, ApiRetryPolicy, ApiTimeouts, RetryHooks,
 };
 use crate::api::types::*;
 use crate::api::vendor_prefetch::VendorPrefetch;
@@ -173,6 +173,34 @@ impl<T> HeldBack<T> {
 pub async fn hold_back_debug<T>(fut: impl std::future::Future<Output = T>) -> HeldBack<T> {
     let (value, debug) = with_deferred_debug(fut).await;
     HeldBack { value, debug }
+}
+
+/// The body of a 200 blob or diff response, read chunk by chunk.
+///
+/// [`ApiClient::fetch_blob`] / [`ApiClient::fetch_diff`] return this instead
+/// of the whole body so a large patch artifact streams to disk without being
+/// held in memory (#571). The per-read idle bound of [`ApiTimeouts`] applies
+/// to every chunk.
+#[derive(Debug)]
+pub struct BinaryBody {
+    resp: reqwest::Response,
+    kind: String,
+    identifier: String,
+}
+
+impl BinaryBody {
+    /// The next chunk of the body, or `Ok(None)` once it is complete. A
+    /// failed or stalled read is an [`ApiError::Network`].
+    pub async fn chunk(&mut self) -> Result<Option<impl AsRef<[u8]>>, ApiError> {
+        self.resp.chunk().await.map_err(|e| {
+            ApiError::Network(format!(
+                "Error reading {} body for {}: {}",
+                self.kind,
+                self.identifier,
+                network_error_detail(&e)
+            ))
+        })
+    }
 }
 
 /// Options for constructing an [`ApiClient`].
@@ -487,9 +515,42 @@ impl ApiClient {
         let max = retry.policy.max_retries;
         let mut retries = 0u32;
         loop {
-            let resp = build().send().await.map_err(|e| {
-                ApiError::Network(format!("Network error: {}", network_error_detail(&e)))
-            })?;
+            let resp = match build().send().await {
+                Ok(resp) => resp,
+                Err(e) => {
+                    let network = || {
+                        ApiError::Network(format!("Network error: {}", network_error_detail(&e)))
+                    };
+                    // A connection dropped before the request went out
+                    // shares the 429 / 503 budget and window; every other
+                    // transport error is final at once.
+                    if !is_retryable_transport(&e) || retries >= max {
+                        return Err(network());
+                    }
+                    let next = retries + 1;
+                    let Some(delay) = retry.policy.delay(
+                        next,
+                        None,
+                        retry_jitter(retry.hooks.jitter_seed, label, next),
+                    ) else {
+                        return Err(network());
+                    };
+                    if !retry.reserve(delay) {
+                        debug_log(&format!(
+                            "{label} failed to connect; not retrying: the run's {} s retry window has closed",
+                            retry.policy.retry_window.as_secs()
+                        ));
+                        return Err(network());
+                    }
+                    debug_log(&format!(
+                        "{label} failed to connect ({}); retry {next}/{max} in {delay:?}",
+                        network_error_detail(&e)
+                    ));
+                    (retry.hooks.sleep)(delay).await;
+                    retries = next;
+                    continue;
+                }
+            };
             let status = resp.status();
             if !is_retryable_status(status) {
                 return Ok(Sent::Response(resp));
@@ -989,10 +1050,10 @@ impl ApiClient {
 
     /// Fetch a blob by its SHA-256 hash.
     ///
-    /// Returns the raw binary content, or `Ok(None)` if not found.
-    /// Uses the authenticated endpoint when token and org slug are
-    /// available, otherwise falls back to the public proxy.
-    pub async fn fetch_blob(&self, hash: &str) -> Result<Option<Vec<u8>>, ApiError> {
+    /// Returns the response body as a [`BinaryBody`] stream, or `Ok(None)`
+    /// if not found. Uses the authenticated endpoint when token and org
+    /// slug are available, otherwise falls back to the public proxy.
+    pub async fn fetch_blob(&self, hash: &str) -> Result<Option<BinaryBody>, ApiError> {
         // Validate hash format: SHA-256 = 64 hex characters
         if !is_valid_sha256_hex(hash) {
             return Err(ApiError::InvalidHash(format!(
@@ -1005,10 +1066,11 @@ impl ApiClient {
 
     /// Fetch a per-file diff archive (tar.gz of bsdiff deltas) by patch UUID.
     ///
-    /// Returns the raw archive bytes, or `Ok(None)` if not found (404). The
-    /// public proxy serves these under `/patch/diff/<uuid>`; the
-    /// authenticated API serves them under `/v0/orgs/<slug>/patches/diff/<uuid>`.
-    pub async fn fetch_diff(&self, uuid: &str) -> Result<Option<Vec<u8>>, ApiError> {
+    /// Returns the archive body as a [`BinaryBody`] stream, or `Ok(None)` if
+    /// not found (404). The public proxy serves these under
+    /// `/patch/diff/<uuid>`; the authenticated API serves them under
+    /// `/v0/orgs/<slug>/patches/diff/<uuid>`.
+    pub async fn fetch_diff(&self, uuid: &str) -> Result<Option<BinaryBody>, ApiError> {
         if !is_valid_uuid(uuid) {
             return Err(ApiError::InvalidHash(format!(
                 "Invalid patch UUID: {}",
@@ -1062,12 +1124,13 @@ impl ApiClient {
     ///
     /// `kind` is the URL segment (`blob` / `diff`), doubling as the
     /// noun in log + error messages. `identifier` is the hash or UUID
-    /// interpolated into the URL.
+    /// interpolated into the URL. A 200 returns the unread body: callers
+    /// stream it to disk instead of buffering it whole.
     async fn fetch_binary(
         &self,
         kind: &str,
         identifier: &str,
-    ) -> Result<Option<Vec<u8>>, ApiError> {
+    ) -> Result<Option<BinaryBody>, ApiError> {
         let (url, use_auth) = self.binary_url(kind, identifier);
 
         debug_log(&format!("GET {} {}", kind, url));
@@ -1093,15 +1156,11 @@ impl ApiClient {
         let status = resp.status();
 
         if status == StatusCode::OK {
-            let bytes = resp.bytes().await.map_err(|e| {
-                ApiError::Network(format!(
-                    "Error reading {} body for {}: {}",
-                    kind,
-                    identifier,
-                    network_error_detail(&e)
-                ))
-            })?;
-            return Ok(Some(bytes.to_vec()));
+            return Ok(Some(BinaryBody {
+                resp,
+                kind: kind.to_string(),
+                identifier: identifier.to_string(),
+            }));
         }
         if status == StatusCode::NOT_FOUND {
             return Ok(None);
