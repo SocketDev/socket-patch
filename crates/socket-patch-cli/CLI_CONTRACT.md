@@ -1654,7 +1654,11 @@ See [the JVM design](../../docs/design/maven-vendoring.md) for supported shapes.
 
 `vendor --check` is an offline, read-only audit. Healthy entries emit `verified`
 with `vendor_check_ok`; drift emits `failed` with `vendor_check_failed`, a
-`partialFailure` envelope and exit 1. For a package-lock entry, drift includes a
+`partialFailure` envelope and exit 1. Drift covers the committed artifact and its
+wiring: an entry whose lockfile or config no longer references its
+`.socket/vendor/` artifact (for example after `pipenv lock`, `uv lock` or
+`npm install` re-resolved it) fails by the same liveness rule as `vex`'s
+`vendor_unwired`. For a package-lock entry, drift also includes a
 `package-lock.json` / `npm-shrinkwrap.json` entry for the vendored `name@version`
 that `vendor` would rewire but that does not resolve to the vendored artifact
 (#588); the reason names that entry. Missing ledger entries fail with

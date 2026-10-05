@@ -3992,6 +3992,33 @@ async fn revert_completes_when_lock_already_matches_the_original() {
     assert!(state_gone, "ledger entry pruned once the revert converges");
 }
 
+/// REGRESSION (#725): `vendor --check` is the CI gate for vendored wiring,
+/// but it only audited the committed tarball, so after `npm install`
+/// re-resolved the lock to the registry it still printed "committed
+/// artifact and wiring verified" and exited 0 while `vex` refused the same
+/// checkout (`vendor_unwired`). It must fail the unwired entry.
+#[tokio::test]
+async fn vendor_check_fails_when_lock_no_longer_wires_artifact() {
+    let fx = npm_fixture();
+    assert_eq!(vendor_run(vendor_args(fx.root())).await, 0, "vendor");
+    let (code, env) = vendor_cli(fx.root(), &["--check"]);
+    assert_eq!(code, 0, "{env:#}");
+    find_event(&env, "verified", Some("vendor_check_ok"));
+
+    // The lock re-resolved to the registry; the artifact is untouched.
+    std::fs::write(fx.lock_path(), &fx.original_lock).unwrap();
+    assert!(fx.tgz_path().is_file());
+    let (code, env) = vendor_cli(fx.root(), &["--check"]);
+    assert_eq!(code, 1, "{env:#}");
+    let event = find_event(&env, "failed", Some("vendor_check_failed"));
+    assert!(
+        event["reason"]
+            .as_str()
+            .is_some_and(|r| r.contains("wiring")),
+        "{env:#}"
+    );
+}
+
 /// Manifest-less VEX over the committed state of an in-process npm
 /// `vendor` (the in-process twin of `e2e_vendor_npm_build`'s tail): the
 /// committed tarball is the evidence, so the checkout attests `(vendored)`
