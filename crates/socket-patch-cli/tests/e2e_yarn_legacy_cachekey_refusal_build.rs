@@ -41,7 +41,7 @@
 //! install cannot reach the registry; every assertion after that is HARD.
 
 use std::path::{Path, PathBuf};
-use std::process::{Command, Output, Stdio};
+use std::process::{Output, Stdio};
 
 use base64::Engine as _;
 use socket_patch_core::hash::git_sha256::compute_git_sha256_from_bytes;
