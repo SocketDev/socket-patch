@@ -265,7 +265,8 @@ mod tests {
         let purl = "pkg:pypi/six@1.16.0";
         let confirmed = vec![(purl.to_string(), "six-uuid".to_string())];
         let ledger = BTreeMap::from([("k".into(), record("six-uuid", "six.py", b"patched"))]);
-        let out = stale_install_warnings(&common, &confirmed, &BTreeSet::new(), None, &ledger).await;
+        let out =
+            stale_install_warnings(&common, &confirmed, &BTreeSet::new(), None, &ledger).await;
         assert_eq!(out.stale_purls, BTreeSet::from([purl.to_string()]));
         assert_eq!(out.warnings.len(), 1);
         let detail = out.warnings[0]["detail"].as_str().unwrap();
@@ -277,7 +278,8 @@ mod tests {
 
         // Patched in the env: nothing to warn about.
         std::fs::write(site.join("six.py"), b"patched").unwrap();
-        let out = stale_install_warnings(&common, &confirmed, &BTreeSet::new(), None, &ledger).await;
+        let out =
+            stale_install_warnings(&common, &confirmed, &BTreeSet::new(), None, &ledger).await;
         assert!(out.warnings.is_empty());
     }
 
