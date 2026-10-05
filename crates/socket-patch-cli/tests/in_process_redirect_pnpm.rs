@@ -1330,6 +1330,33 @@ async fn hosted_scan_workspace_yaml_overrides_member_npmrc() {
     assert_workspace_configured_lock_refused("root-yaml-precedence").await;
 }
 
+/// The workspace root as refusals and warnings name it: canonical (Windows
+/// expands 8.3 names) without the verbatim `\\?\` prefix.
+fn member_root(tmp: &tempfile::TempDir) -> std::path::PathBuf {
+    socket_patch_core::utils::pnpm_workspace::without_verbatim_prefix(
+        std::fs::canonicalize(tmp.path()).unwrap(),
+    )
+}
+
+/// Every redirect warning's text, unescaped: a JSON dump doubles each
+/// Windows `\`, so a path would never match.
+fn warning_texts(doc: &serde_json::Value) -> String {
+    let mut out = String::new();
+    for warning in doc["redirect"]["warnings"].as_array().into_iter().flatten() {
+        for value in warning.as_object().into_iter().flat_map(|o| o.values()) {
+            if let Some(text) = value.as_str() {
+                out.push_str(text);
+                out.push('\n');
+            }
+        }
+        if let Some(text) = warning.as_str() {
+            out.push_str(text);
+            out.push('\n');
+        }
+    }
+    out
+}
+
 /// #880: a workspace member with its own lock (`sharedWorkspaceLockfile:
 /// false`) is pinned through its own lock, but pnpm reads `trustLockfile`
 /// only from the workspace root's `pnpm-workspace.yaml`. Hosted mode used
@@ -1346,7 +1373,7 @@ async fn hosted_scan_from_pnpm_member_with_own_lock_never_nests_trust_config() {
     mock_reference(&server).await;
     mock_view(&server).await;
     let tmp = tempfile::tempdir().unwrap();
-    let root = std::fs::canonicalize(tmp.path()).unwrap();
+    let root = member_root(&tmp);
     std::fs::write(
         root.join("package.json"),
         r#"{ "name": "root", "private": true }"#,
@@ -1392,7 +1419,7 @@ async fn hosted_scan_from_pnpm_member_with_own_lock_never_nests_trust_config() {
         "pnpm ignores a member's settings file; none is created"
     );
     assert_eq!(std::fs::read_to_string(&root_ws).unwrap(), ws_trusted);
-    let warnings = doc["redirect"]["warnings"].to_string();
+    let warnings = warning_texts(&doc);
     assert!(
         warnings.contains(&root_ws.display().to_string()) && warnings.contains("already carries"),
         "the trust warning names the root file: {warnings}"
@@ -1410,7 +1437,7 @@ async fn hosted_scan_from_pnpm_member_respects_root_trust_opt_out() {
     mock_reference(&server).await;
     mock_view(&server).await;
     let tmp = tempfile::tempdir().unwrap();
-    let root = std::fs::canonicalize(tmp.path()).unwrap();
+    let root = member_root(&tmp);
     let root_ws = root.join("pnpm-workspace.yaml");
     let ws = "packages:\n  - 'packages/*'\ntrustLockfile: false\n";
     std::fs::write(&root_ws, ws).unwrap();
@@ -1423,7 +1450,7 @@ async fn hosted_scan_from_pnpm_member_respects_root_trust_opt_out() {
     assert_eq!(doc["redirect"]["redirected"], 1, "{doc}");
     assert!(!member.join("pnpm-workspace.yaml").exists());
     assert_eq!(std::fs::read_to_string(&root_ws).unwrap(), ws);
-    let warnings = doc["redirect"]["warnings"].to_string();
+    let warnings = warning_texts(&doc);
     assert!(
         warnings.contains(&root_ws.display().to_string())
             && warnings.contains("trustLockfile: false"),

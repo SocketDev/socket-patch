@@ -3864,6 +3864,13 @@ snapshots:
             .unwrap();
         let blobs = ws_root.join(".socket/blobs");
         let sources = PatchSources::blobs_only(&blobs);
+        // As the refusal spells it: canonical (Windows expands 8.3 names),
+        // without the verbatim prefix.
+        let governing = crate::utils::pnpm_workspace::without_verbatim_prefix(
+            std::fs::canonicalize(&ws_root)
+                .unwrap()
+                .join(PNPM_WORKSPACE),
+        );
         for dry_run in [true, false] {
             let outcome = crate::vendor::test_support::vendor_pnpm(
                 "pkg:npm/left-pad@1.3.0",
@@ -3879,7 +3886,7 @@ snapshots:
             .await;
             let detail = expect_refused(outcome, VENDOR_PNPM_SETTINGS_ELSEWHERE);
             assert!(
-                detail.contains(&ws_root.join(PNPM_WORKSPACE).display().to_string()),
+                detail.contains(&governing.display().to_string()),
                 "the detail names the governing workspace file: {detail}"
             );
         }
