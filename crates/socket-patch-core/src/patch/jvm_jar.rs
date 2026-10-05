@@ -266,13 +266,17 @@ pub fn derived_copies_in(
     let pristine_sha1 = hash_dir.file_name()?.to_str()?;
     let found = cache.index(&home).query(jar_leaf, pristine_sha1);
     let jar = hash_dir.join(jar_leaf);
-    let current = std::fs::read(&jar).ok().map(|b| sha1_hex(&b));
+    // Both reads are of user-writable Gradle cache files: the FIFO-safe
+    // reader fails fast on a FIFO or device instead of wedging in open(2).
+    let current = crate::utils::fs::read_regular_to_bytes_sync(&jar)
+        .ok()
+        .map(|b| sha1_hex(&b));
     let written = std::fs::metadata(&jar).and_then(|m| m.modified()).ok();
     let unverified = found
         .unknown
         .into_iter()
         .filter(|p| {
-            let Ok(copy) = std::fs::read(p) else {
+            let Ok(copy) = crate::utils::fs::read_regular_to_bytes_sync(p) else {
                 return true;
             };
             if Some(sha1_hex(&copy)) == current {
