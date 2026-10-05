@@ -1065,6 +1065,31 @@ fn uv_vendor_revert_after_manifest_overrides_relock() {
     );
 }
 
+/// #840: `uv add "six>=1.16"` while six is vendored rewrites pyproject.toml
+/// but leaves uv.lock byte-identical (a path source records no specifier).
+/// The revert must write the NEW specifier back, not the recorded
+/// `==1.16.0` that leaves `uv sync --locked` red.
+#[test]
+#[serial_test::serial]
+fn uv_vendor_revert_after_declaration_edit() {
+    uv_relock_then_revert(
+        "uv-declaration-edit",
+        "[project]\nname = \"vendor-capstone\"\nversion = \"0.1.0\"\nrequires-python = \">=3.9\"\ndependencies = [\"six==1.16.0\", \"attrs>=20\"]\n",
+        &["add", "-q", "six>=1.16"],
+    );
+}
+
+/// #840 in a PEP 735 dev group: `uv add --dev "six>=1.16"`.
+#[test]
+#[serial_test::serial]
+fn uv_vendor_revert_after_dev_group_declaration_edit() {
+    uv_relock_then_revert(
+        "uv-dev-declaration-edit",
+        "[project]\nname = \"vendor-capstone\"\nversion = \"0.1.0\"\nrequires-python = \">=3.9\"\ndependencies = []\n\n[dependency-groups]\ndev = [\"six==1.16.0\", \"attrs>=20\"]\n",
+        &["add", "-q", "--dev", "six>=1.16"],
+    );
+}
+
 /// `get <uuid> --mode vendored` twin of the uv capstone above (v3.6): the
 /// SAME vendor engine and wiring, driven through get's uuid path — exempt
 /// from installed narrowing, so only the mocked `view/{uuid}` route is
