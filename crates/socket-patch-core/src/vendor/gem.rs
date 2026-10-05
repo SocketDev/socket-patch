@@ -1462,12 +1462,22 @@ fn plan_gemfile_edit(
     // Trailing options (`require: false`, `group: :test`, …) must survive the
     // rewrite: dropping `require: false` auto-requires the gem at boot,
     // changing app behavior while vendored.
+    // Positional arguments the tail keeps (`gem "x", *V`, `gem "x",
+    // VERSION`, `ENV.fetch(…)`) are version constraints, superseded by the
+    // exact pin exactly like quoted ones: carried after `path:` they are a
+    // Ruby syntax error, and carried before it bundler sees `(= v, ~> 1)`
+    // against the lock's `(= v)!` and refuses every frozen install (#847).
     let opts = gem_line_trailing_options(&rest);
-    let new_line = if opts.is_empty() {
-        format!("gem {q}{name}{q}, {q}{version}{q}, path: {q}{rel}{q}")
-    } else {
-        format!("gem {q}{name}{q}, {q}{version}{q}, path: {q}{rel}{q}, {opts}")
-    };
+    let tail = split_kept_tail(&opts);
+    let mut new_line = format!("gem {q}{name}{q}, {q}{version}{q}, path: {q}{rel}{q}");
+    if !tail.keywords.is_empty() {
+        new_line.push_str(", ");
+        new_line.push_str(tail.keywords);
+    }
+    if !tail.comment.is_empty() {
+        new_line.push(' ');
+        new_line.push_str(tail.comment);
+    }
     Ok(GemfilePlan::Rewrite {
         original_line: lines[idx].to_string(),
         new_line,
@@ -1563,6 +1573,103 @@ pub(crate) fn gem_declaration_any(trimmed: &str) -> Option<GemDecl<'_>> {
 /// [`gem_declaration_any`] for exactly the gem `name`.
 fn gem_declaration<'a>(trimmed: &'a str, name: &str) -> Option<GemDecl<'a>> {
     gem_declaration_any(trimmed).filter(|d| d.name == name)
+}
+
+/// The parts of a gem declaration's kept argument tail (what
+/// [`gem_line_trailing_options`] returns) that survive the vendored
+/// rewrite: the keyword options after any leading positional arguments,
+/// and a trailing `#` comment. Each is a verbatim slice, trimmed.
+struct KeptTail<'a> {
+    keywords: &'a str,
+    comment: &'a str,
+}
+
+/// Split the kept tail at the first keyword argument: a `key:` label, a
+/// `"key":` label, a `=>` pair or a `**` double splat. Everything before it
+/// (`*V`, `VERSION`, `ENV.fetch("V", "~> 1")`, a later quoted constraint) is
+/// positional and dropped. Commas, `=>` and `#` only count outside strings
+/// and brackets.
+fn split_kept_tail(opts: &str) -> KeptTail<'_> {
+    let bytes = opts.as_bytes();
+    let mut quote: Option<u8> = None;
+    let mut depth: i64 = 0;
+    let mut arg_start = 0;
+    let mut code_end = opts.len();
+    let mut keyword_start: Option<usize> = None;
+    let mut rocket = false;
+    let mut i = 0;
+    let close_arg = |start: usize, end: usize, rocket: bool, kw: &mut Option<usize>| {
+        if kw.is_none() && (rocket || is_keyword_arg(opts[start..end].trim())) {
+            *kw = Some(start);
+        }
+    };
+    while i < bytes.len() {
+        let c = bytes[i];
+        if let Some(q) = quote {
+            if c == b'\\' {
+                i += 1;
+            } else if c == q {
+                quote = None;
+            }
+            i += 1;
+            continue;
+        }
+        match c {
+            b'"' | b'\'' => quote = Some(c),
+            b'(' | b'[' | b'{' => depth += 1,
+            b')' | b']' | b'}' => depth -= 1,
+            b'=' if depth == 0 && bytes.get(i + 1) == Some(&b'>') => rocket = true,
+            b',' if depth == 0 => {
+                close_arg(arg_start, i, rocket, &mut keyword_start);
+                arg_start = i + 1;
+                rocket = false;
+            }
+            b'#' if depth == 0 => {
+                code_end = i;
+                break;
+            }
+            _ => {}
+        }
+        i += 1;
+    }
+    close_arg(arg_start, code_end, rocket, &mut keyword_start);
+    let code = &opts[..code_end];
+    let comment = opts[code_end..].trim();
+    match keyword_start {
+        Some(k) => KeptTail {
+            keywords: code[k..].trim(),
+            comment,
+        },
+        None => KeptTail {
+            keywords: "",
+            comment,
+        },
+    }
+}
+
+/// True when one top-level argument is a keyword argument: a `**` double
+/// splat or a `key:` / `"key":` label (not a `Const::Path`).
+fn is_keyword_arg(arg: &str) -> bool {
+    if arg.starts_with("**") {
+        return true;
+    }
+    let label_end = match arg.as_bytes().first() {
+        Some(q @ (b'"' | b'\'')) => arg[1..].find(*q as char).map(|e| e + 2),
+        Some(b) if b.is_ascii_alphabetic() || *b == b'_' => Some(
+            arg.find(|c: char| !(c.is_ascii_alphanumeric() || c == '_'))
+                .map(|e| match arg.as_bytes()[e] {
+                    b'?' | b'!' => e + 1,
+                    _ => e,
+                })
+                .unwrap_or(arg.len()),
+        ),
+        _ => None,
+    };
+    let Some(end) = label_end else {
+        return false;
+    };
+    let after = &arg.as_bytes()[end..];
+    after.first() == Some(&b':') && after.get(1) != Some(&b':')
 }
 
 /// Why the text after the gem name blocks an in-place rewrite (`None` = safe).
@@ -4533,6 +4640,87 @@ mod tests {
             tokio::fs::read_to_string(root.join(GEMFILE)).await.unwrap(),
             gemfile
         );
+    }
+
+    /// #847: positional arguments the kept tail leads with (a splat, a
+    /// constant, a method call) are version constraints the exact pin
+    /// supersedes, so the rewrite drops them like quoted ones. The old
+    /// `path: …, *V` rewrite left a Gemfile no `bundle` command could parse
+    /// (a positional argument after a keyword one). Keyword options and a
+    /// trailing comment still follow `path:`.
+    #[tokio::test]
+    async fn test_rewrite_drops_positional_constraints() {
+        let rel = copy_rel();
+        for (decl, want) in [
+            (
+                "gem \"rack\", *RV",
+                format!("gem \"rack\", \"3.2.6\", path: \"{rel}\""),
+            ),
+            (
+                "gem \"rack\", ENV.fetch(\"RV\", \"~> 3.1\")",
+                format!("gem \"rack\", \"3.2.6\", path: \"{rel}\""),
+            ),
+            (
+                "gem \"rack\", RACK_VERSION, require: false",
+                format!("gem \"rack\", \"3.2.6\", path: \"{rel}\", require: false"),
+            ),
+            (
+                "gem \"rack\", \"~> 3.1\", *RV, :require => false # web",
+                format!("gem \"rack\", \"3.2.6\", path: \"{rel}\", :require => false # web"),
+            ),
+            (
+                "gem \"rack\", RV, \"require\": false, **OPTS",
+                format!("gem \"rack\", \"3.2.6\", path: \"{rel}\", \"require\": false, **OPTS"),
+            ),
+            (
+                "gem \"rack\", Rack::VERSION, group: :web",
+                format!("gem \"rack\", \"3.2.6\", path: \"{rel}\", group: :web"),
+            ),
+        ] {
+            let gemfile = format!("source \"https://rubygems.org\"\n\nRV = [\"~> 3.1\"]\n{decl}\n");
+            let (_tmp, root, installed, blobs, record) = fixture(&gemfile, LOCK_DIRECT).await;
+
+            let (result, entry, _w) =
+                unwrap_done(run_vendor(&root, &blobs, &installed, &record, false).await);
+            assert!(result.success, "{decl}: {:?}", result.error);
+            assert_eq!(
+                tokio::fs::read_to_string(root.join(GEMFILE)).await.unwrap(),
+                format!("source \"https://rubygems.org\"\n\nRV = [\"~> 3.1\"]\n{want}\n"),
+                "{decl}: positional constraints are dropped, options kept after `path:`"
+            );
+
+            let outcome = revert_gem(&entry.unwrap(), &root, false).await;
+            assert!(outcome.success, "{decl}: {:?}", outcome.error);
+            assert_eq!(
+                tokio::fs::read_to_string(root.join(GEMFILE)).await.unwrap(),
+                gemfile,
+                "{decl}: revert restores the original line"
+            );
+        }
+    }
+
+    /// [`split_kept_tail`] leg by leg: commas, `=>` and `#` inside strings
+    /// or brackets never split, `Const::Path` is not a `key:` label, and
+    /// leading positional arguments are dropped.
+    #[test]
+    fn split_kept_tail_grammar() {
+        for (opts, keywords, comment) in [
+            ("", "", ""),
+            ("require: false", "require: false", ""),
+            ("*V", "", ""),
+            ("*V # pinned", "", "# pinned"),
+            ("ENV.fetch(\"a, b\", \"#x\")", "", ""),
+            ("V, require: false", "require: false", ""),
+            ("A::B, group: [:a, :b]", "group: [:a, :b]", ""),
+            ("V, :require => false", ":require => false", ""),
+            ("V, \"require\" => false", "\"require\" => false", ""),
+            ("V, **OPTS", "**OPTS", ""),
+            ("{x: 1}.fetch(:x), required?: 1", "required?: 1", ""),
+        ] {
+            let tail = split_kept_tail(opts);
+            assert_eq!(tail.keywords, keywords, "{opts:?}");
+            assert_eq!(tail.comment, comment, "{opts:?}");
+        }
     }
 
     /// `source:` selects a registry — carried alongside the `path:` we add it
