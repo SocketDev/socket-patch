@@ -221,6 +221,18 @@ runners) from the GitHub releases and verifies it against `SHASUMS256.txt`. Ever
   which converges on every release (version 1 on 1.2–1.3, 2 on 1.4); the
   in-place bump is a measured convenience for the matrix's shape only, and
   the root-independent shape is not in the matrix.
+- **Binary → text migration of a workspace lock.** Hosted and vendored
+  `bun.lockb` writes store each inter-workspace dependency literal as the
+  member's resolved path (older binary readers need it). Bun 1.4.2's
+  `bun install --save-text-lockfile` carries that path into `bun.lock`
+  (`"consumer": "packages/consumer"`), and its text reader then re-resolves
+  the workspace: frozen installs fail and an unfrozen install drops the
+  pins (#803). Bun 1.3.14 accepts the path. A hosted or vendored re-run on
+  the migrated lock restores the manifest's `workspace:` literal (Bun's own
+  spelling) whenever the lock holds a pin; version-0 locks, where Bun 1.1
+  writes the bare path itself, are left alone. Covered by
+  `e2e_bun_lockb::workspace_text_migration_heals_on_rerun`
+  on the 1.4.2 leg.
 - **Workspace-member local tarballs.** Bun 1.2.x–1.3.x resolve a
   local-tarball dependency declared by a workspace member relative to the
   member (`.socket/vendor/…` → ENOENT on `bun install`); 1.4.x resolve it
