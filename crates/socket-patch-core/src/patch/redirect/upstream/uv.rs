@@ -1229,23 +1229,22 @@ pub(crate) fn respell_lock_specifier(
     };
     let canon = canonicalize_pypi_name(name);
     let specs: Vec<&str> = match array {
-        LockRequirementArray::RequiresDist { extra: None } => {
-            strings(meta.doc.get("project").and_then(|p| p.get("dependencies")))
-        }
-        LockRequirementArray::RequiresDist { extra: Some(extra) } => {
-            let extra = canonicalize_pypi_name(extra);
-            meta.doc
-                .get("project")
-                .and_then(|p| p.get("optional-dependencies"))
-                .and_then(Item::as_table_like)
+        LockRequirementArray::RequiresDist { extra } => {
+            let extra = extra.map(canonicalize_pypi_name);
+            declarations(&meta, Declared::Dist)
                 .into_iter()
-                .flat_map(|groups| groups.iter())
-                .filter(|(group, _)| canonicalize_pypi_name(group) == extra)
-                .flat_map(|(_, group)| strings(Some(group)))
+                .filter(|d| d.extra == extra)
+                .map(|d| d.spec)
                 .collect()
         }
-        LockRequirementArray::RequiresDev(group) => declarations(&meta, Declared::Dev(group)),
-        LockRequirementArray::Manifest(key) => declarations(&meta, Declared::Manifest(key)),
+        LockRequirementArray::RequiresDev(group) => declarations(&meta, Declared::Dev(group))
+            .into_iter()
+            .map(|d| d.spec)
+            .collect(),
+        LockRequirementArray::Manifest(key) => declarations(&meta, Declared::Manifest(key))
+            .into_iter()
+            .map(|d| d.spec)
+            .collect(),
     };
     let sorted = |clauses: &[String]| {
         let mut c = clauses.to_vec();
