@@ -394,11 +394,7 @@ impl Stage {
                     "a patch lookup failed for a package that could get its first patch, so \
                      no new patches were added this run ({} deferred) and none can take the \
                      missing package's place; re-run once the API answers",
-                    if deferred == 1 {
-                        "1 package".to_string()
-                    } else {
-                        format!("{deferred} packages")
-                    }
+                    if deferred == 1 { "1 package".to_string() } else { format!("{deferred} packages") }
                 ),
             ));
         }
@@ -419,9 +415,7 @@ impl Stage {
                 purl: c.purl.clone(),
                 uuid: c.uuid.clone(),
                 reason: ROLLOUT_DEFERRED.to_string(),
-                detail: Some(format!(
-                    "rank {rank} in the rollout queue; a later scan adds it"
-                )),
+                detail: Some(format!("rank {rank} in the rollout queue; a later scan adds it")),
             })
             .collect()
     }
@@ -508,3 +502,4 @@ pub fn rollout_json(configured: &MaxNew, plan: Option<&RolloutPlan>) -> serde_js
         "deferred": deferred,
     })
 }
+

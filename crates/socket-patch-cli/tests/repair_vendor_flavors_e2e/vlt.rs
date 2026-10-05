@@ -221,10 +221,7 @@ async fn vlt_repair_reports_a_missing_ledger() {
             lock_bytes,
             "{lock:?}"
         );
-        assert!(
-            tmp.path().join(rel()).join("index.js").is_file(),
-            "{lock:?}"
-        );
+        assert!(tmp.path().join(rel()).join("index.js").is_file(), "{lock:?}");
     }
 }
 

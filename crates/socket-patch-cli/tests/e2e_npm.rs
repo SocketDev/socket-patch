@@ -286,11 +286,7 @@ fn test_npm_dry_run() {
     assert_eq!(git_sha256_file(&index_js), BEFORE_HASH);
 
     // Download the patch *without* applying.
-    assert_run_ok(
-        cwd,
-        &["get", NPM_UUID, "--mode", "agent", "--no-apply"],
-        "get --no-apply",
-    );
+    assert_run_ok(cwd, &["get", NPM_UUID, "--mode", "agent", "--no-apply"], "get --no-apply");
 
     // File should still be original.
     assert_eq!(
