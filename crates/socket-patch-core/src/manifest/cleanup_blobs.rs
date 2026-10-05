@@ -19,6 +19,73 @@ pub struct CleanupResult {
     pub failed: Vec<String>,
 }
 
+/// The blob hashes and patch archives a cleanup pass must preserve.
+/// These are references, not synthetic patch records: filenames and patch
+/// metadata cannot change which original or patched bytes remain reachable.
+pub struct ArtifactReferences {
+    blobs: HashSet<String>,
+    patch_uuids: HashSet<String>,
+}
+
+impl ArtifactReferences {
+    /// Repair and pruning retain the bytes needed to apply active patches.
+    pub fn for_apply(manifest: &PatchManifest) -> Self {
+        Self {
+            blobs: get_after_hash_blobs(manifest),
+            patch_uuids: manifest.patches.values().map(|r| r.uuid.clone()).collect(),
+        }
+    }
+
+    /// Remove and rollback also retain originals for every remaining patch
+    /// and removed-but-not-installed patch. A crawler miss must not destroy
+    /// the only local restore data. Other removed patches become collectible.
+    pub fn after_removal<'a>(
+        previous: &PatchManifest,
+        remaining: &PatchManifest,
+        removed_not_installed: impl IntoIterator<Item = &'a str>,
+    ) -> Self {
+        let mut references = Self::for_apply(remaining);
+        for record in remaining.patches.values().chain(
+            removed_not_installed
+                .into_iter()
+                .filter_map(|purl| previous.patches.get(purl)),
+        ) {
+            let mut has_original = false;
+            for file in record.files.values() {
+                if !file.before_hash.is_empty() {
+                    references.blobs.insert(file.before_hash.clone());
+                    has_original = true;
+                }
+            }
+            if has_original {
+                references.patch_uuids.insert(record.uuid.clone());
+            }
+        }
+        references
+    }
+
+    /// Sweep each artifact directory independently so a failed pass does not
+    /// stop another. Callers report partial counts and cleanup warnings.
+    pub async fn sweep(&self, socket_dir: &Path, dry_run: bool) -> ArtifactSweep {
+        ArtifactSweep {
+            blobs: cleanup_dir(&socket_dir.join("blobs"), dry_run, |name| {
+                self.blobs.contains(name)
+            })
+            .await,
+            diffs: cleanup_archives(&self.patch_uuids, &socket_dir.join("diffs"), dry_run).await,
+            // Nothing writes or reads legacy package archives any more.
+            packages: cleanup_dir(&socket_dir.join("packages"), dry_run, |_| false).await,
+        }
+    }
+}
+
+/// Results from the independent blob, diff and legacy package sweeps.
+pub struct ArtifactSweep {
+    pub blobs: std::io::Result<CleanupResult>,
+    pub diffs: std::io::Result<CleanupResult>,
+    pub packages: std::io::Result<CleanupResult>,
+}
+
 /// Shared core for `cleanup_unused_blobs` / `cleanup_unused_archives`.
 ///
 /// Walks `dir`, treats it as authoritative socket-patch state (so any
@@ -134,6 +201,14 @@ pub async fn cleanup_unused_archives(
     dry_run: bool,
 ) -> Result<CleanupResult, std::io::Error> {
     let used_uuids: HashSet<String> = manifest.patches.values().map(|r| r.uuid.clone()).collect();
+    cleanup_archives(&used_uuids, archives_dir, dry_run).await
+}
+
+async fn cleanup_archives(
+    used_uuids: &HashSet<String>,
+    archives_dir: &Path,
+    dry_run: bool,
+) -> Result<CleanupResult, std::io::Error> {
     cleanup_dir(archives_dir, dry_run, |name| {
         // Strip the .tar.gz suffix to recover the UUID. A file that does
         // not end in .tar.gz is never a valid archive, so it is always an
@@ -276,6 +351,104 @@ mod tests {
         PatchManifest {
             patches,
             setup: None,
+        }
+    }
+
+    #[tokio::test]
+    async fn artifact_retention_covers_active_removed_and_uninstalled_patches() {
+        for policy in [
+            "apply",
+            "remaining",
+            "not-installed",
+            "created-only",
+            "removed",
+        ] {
+            let dir = tempfile::tempdir().unwrap();
+            let mut manifest = create_test_manifest();
+            let purl = "pkg:npm/pkg-a@1.0.0";
+            let record = manifest.patches.get_mut(purl).unwrap();
+            // This is a real filename. Synthetic beforeHash-pin records used
+            // to overwrite its afterHash, making its patched bytes collectible.
+            record.files.insert(
+                "package/index.js#beforeHash-pin".into(),
+                PatchFileInfo {
+                    before_hash: String::new(),
+                    after_hash: "created-file".into(),
+                },
+            );
+            if policy == "created-only" {
+                for file in record.files.values_mut() {
+                    file.before_hash.clear();
+                }
+            }
+            let empty = PatchManifest::default();
+            let references = match policy {
+                "apply" => ArtifactReferences::for_apply(&manifest),
+                "remaining" => ArtifactReferences::after_removal(&manifest, &manifest, []),
+                "removed" => ArtifactReferences::after_removal(&manifest, &empty, []),
+                _ => ArtifactReferences::after_removal(&manifest, &empty, ["missing-purl", purl]),
+            };
+            let blobs = dir.path().join("blobs");
+            let diffs = dir.path().join("diffs");
+            let packages = dir.path().join("packages");
+            for path in [&blobs, &diffs, &packages] {
+                std::fs::create_dir(path).unwrap();
+            }
+            let hashes = [
+                BEFORE_HASH_1,
+                BEFORE_HASH_2,
+                AFTER_HASH_1,
+                AFTER_HASH_2,
+                "created-file",
+                ORPHAN_HASH,
+            ];
+            for hash in hashes {
+                std::fs::write(blobs.join(hash), b"blob").unwrap();
+            }
+            let archive = format!("{TEST_UUID}.tar.gz");
+            std::fs::write(diffs.join(&archive), b"diff").unwrap();
+            std::fs::write(diffs.join("orphan.tar.gz"), b"orphan").unwrap();
+            std::fs::write(packages.join(&archive), b"legacy").unwrap();
+            let keep_original = matches!(policy, "remaining" | "not-installed");
+            let keep_patched = matches!(policy, "apply" | "remaining");
+            let kept = 2 * usize::from(keep_original) + 3 * usize::from(keep_patched);
+            let keep_archive = keep_original || keep_patched;
+
+            let preview = references.sweep(dir.path(), true).await;
+            assert_eq!(
+                preview.blobs.unwrap().blobs_removed,
+                hashes.len() - kept,
+                "{policy}"
+            );
+            assert_eq!(
+                preview.diffs.unwrap().blobs_removed,
+                2 - usize::from(keep_archive)
+            );
+            assert_eq!(preview.packages.unwrap().blobs_removed, 1);
+            assert_eq!(std::fs::read_dir(&blobs).unwrap().count(), hashes.len());
+            assert_eq!(std::fs::read_dir(&diffs).unwrap().count(), 2);
+            assert!(packages.join(&archive).exists());
+
+            let swept = references.sweep(dir.path(), false).await;
+            assert_eq!(
+                swept.blobs.unwrap().blobs_removed,
+                hashes.len() - kept,
+                "{policy}"
+            );
+            assert_eq!(
+                swept.diffs.unwrap().blobs_removed,
+                2 - usize::from(keep_archive)
+            );
+            assert_eq!(swept.packages.unwrap().blobs_removed, 1);
+            for hash in [BEFORE_HASH_1, BEFORE_HASH_2] {
+                assert_eq!(blobs.join(hash).exists(), keep_original, "{policy}");
+            }
+            for hash in [AFTER_HASH_1, AFTER_HASH_2, "created-file"] {
+                assert_eq!(blobs.join(hash).exists(), keep_patched, "{policy}");
+            }
+            assert!(!blobs.join(ORPHAN_HASH).exists());
+            assert_eq!(diffs.join(archive).exists(), keep_archive, "{policy}");
+            assert!(!packages.exists());
         }
     }
 

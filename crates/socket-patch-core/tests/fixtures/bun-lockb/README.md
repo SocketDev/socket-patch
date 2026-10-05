@@ -17,6 +17,9 @@ and an empty `BUN_INSTALL_CACHE_DIR` to regenerate. Bun 1.2+ fixtures include
 - `0.8.1-production` / `1.0.0-production`: a production dependency and a
   different version aliased in dev dependencies, pinning production-filter
   string-pool reconstruction on early binary readers.
+- `prerelease-pair-*`: a release and a prerelease of the same version
+  (`uuid@8.0.0` + `uuid@8.0.0-beta.0`), written on Linux x64 by 0.8.1,
+  1.0.0, 1.1.45 and 1.3.14, pinning the metadata hash's semver order.
 - `0.8.1-production-complex`: two production patch targets, a transitive
   dependency with a bin, root lifecycle scripts, and development dependencies.
 

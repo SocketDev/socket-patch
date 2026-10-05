@@ -18,11 +18,16 @@ pub(super) async fn stale_install_warnings(
     common: &crate::args::GlobalArgs,
     confirmed: &[(String, String)],
     pipenv_uuids: &BTreeSet<String>,
+    // The run's final Pipfile.lock text: the remedy's `pipenv sync`
+    // arguments follow the categories that pin each package.
+    pipenv_lock: Option<&str>,
     // This run's fetched records MERGED with the ledger's persisted ones
     // (the caller hands the post-merge ledger map), looked up by uuid.
     records: &BTreeMap<String, PatchRecord>,
 ) -> StaleInstallOutcome {
     let mut out = StaleInstallOutcome::default();
+    let pipenv_lock: Option<serde_json::Value> =
+        pipenv_lock.and_then(|text| serde_json::from_str(text.trim_start_matches('\u{feff}')).ok());
     let candidates: Vec<_> = confirmed
         .iter()
         .filter(|(purl, _)| purl.starts_with("pkg:pypi/"))
@@ -111,15 +116,15 @@ pub(super) async fn stale_install_warnings(
                     .and_then(|rest| rest.split('@').next())
                     .unwrap_or("<package>")
                     .to_string();
+                let remedy = socket_patch_core::vendor::pypi_pipenv::stale_install_remedy(
+                    pipenv_lock.as_ref(),
+                    &name,
+                );
                 format!(
                     "Pipenv does not reinstall a release that is already present (`pipenv \
                      install`, `pipenv install --deploy` and `pipenv sync` all keep those \
                      bytes), so the rewritten Pipfile.lock only protects fresh installs. \
-                     Reinstall it from the lock without touching the Pipfile: `pipenv run pip \
-                     uninstall -y {name} && pipenv sync` (`pipenv install --deploy` before \
-                     Pipenv 2018), or `pipenv --rm && pipenv sync` for a clean virtualenv — \
-                     NOT `pipenv uninstall`, which rewrites the Pipfile and re-locks the \
-                     patch away; then `socket-patch vex --product <purl>` re-verifies the \
+                     {remedy}; then `socket-patch vex --product <purl>` re-verifies the \
                      installed files."
                 )
             } else {
@@ -194,7 +199,8 @@ mod tests {
             ("one".into(), record("first-uuid", "first.py", b"patched")),
             ("two".into(), record("second-uuid", "second.py", b"patched")),
         ]);
-        let out = stale_install_warnings(&common, &confirmed, &BTreeSet::new(), &ledger).await;
+        let out =
+            stale_install_warnings(&common, &confirmed, &BTreeSet::new(), None, &ledger).await;
         assert_eq!(out.stale_purls, BTreeSet::from([first.to_string()]));
         assert_eq!(out.warnings.len(), 1);
         assert!(out.warnings[0]["detail"]
@@ -209,7 +215,8 @@ mod tests {
             "variant".into(),
         ));
         ledger.insert("three".into(), record("variant", "first.py", b"upstream"));
-        let out = stale_install_warnings(&common, &confirmed, &BTreeSet::new(), &ledger).await;
+        let out =
+            stale_install_warnings(&common, &confirmed, &BTreeSet::new(), None, &ledger).await;
         assert!(out.stale_purls.is_empty());
         assert!(out.warnings.is_empty());
     }
@@ -233,8 +240,66 @@ mod tests {
         let purl = "pkg:pypi/six@1.16.0";
         let confirmed = vec![(purl.to_string(), "six-uuid".to_string())];
         let ledger = BTreeMap::from([("k".into(), record("six-uuid", "six.py", b"patched"))]);
-        let out = stale_install_warnings(&common, &confirmed, &BTreeSet::new(), &ledger).await;
+        let out =
+            stale_install_warnings(&common, &confirmed, &BTreeSet::new(), None, &ledger).await;
         assert_eq!(out.stale_purls, BTreeSet::from([purl.to_string()]));
         assert_eq!(out.warnings[0]["code"], "redirect_pypi_stale_install");
+    }
+
+    /// #790: the Pipenv remedy names the lock category that pins the
+    /// package. Plain `pipenv sync` installs only `default`, so for a
+    /// `[dev-packages]` entry it uninstalled the package and left it
+    /// uninstalled.
+    #[tokio::test]
+    async fn pipenv_remedy_resyncs_the_category_that_pins_the_package() {
+        let tmp = tempfile::tempdir().unwrap();
+        let site = tmp.path().join("site-packages");
+        std::fs::create_dir_all(site.join("six-1.16.0.dist-info")).unwrap();
+        std::fs::write(site.join("six.py"), b"upstream").unwrap();
+        let common = crate::args::GlobalArgs {
+            cwd: tmp.path().to_path_buf(),
+            global_prefix: Some(site.clone()),
+            ..Default::default()
+        };
+        let purl = "pkg:pypi/six@1.16.0";
+        let confirmed = vec![(purl.to_string(), "six-uuid".to_string())];
+        let ledger = BTreeMap::from([("k".into(), record("six-uuid", "six.py", b"patched"))]);
+        let pipenv = BTreeSet::from(["six-uuid".to_string()]);
+        let detail = |lock: &str| {
+            let lock = lock.to_string();
+            let (common, confirmed, ledger, pipenv) = (&common, &confirmed, &ledger, &pipenv);
+            async move {
+                let out =
+                    stale_install_warnings(common, confirmed, pipenv, Some(&lock), ledger).await;
+                assert_eq!(out.warnings.len(), 1);
+                out.warnings[0]["detail"].as_str().unwrap().to_string()
+            }
+        };
+
+        let develop = detail(
+            r#"{"_meta": {"pipfile-spec": 6}, "default": {}, "develop": {"six": {"file": "x"}}}"#,
+        )
+        .await;
+        assert!(
+            develop.contains("`pipenv run pip uninstall -y six && pipenv sync --dev`"),
+            "{develop}"
+        );
+        assert!(
+            develop.contains("`pipenv --rm && pipenv sync --dev`"),
+            "{develop}"
+        );
+
+        let docs = detail(
+            r#"{"_meta": {"pipfile-spec": 6}, "default": {"requests": {}}, "docs": {"six": {}}}"#,
+        )
+        .await;
+        assert!(
+            docs.contains("-y six && pipenv sync --categories \"docs\"`"),
+            "{docs}"
+        );
+        assert!(
+            docs.contains("`pipenv --rm && pipenv sync --categories \"packages docs\"`"),
+            "{docs}"
+        );
     }
 }

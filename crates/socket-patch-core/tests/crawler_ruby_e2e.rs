@@ -373,7 +373,7 @@ async fn get_gem_paths_with_gemfile_no_vendor_returns_gemdir() {
     // Hermetic seam: a developer's ambient BUNDLE_PATH/BUNDLE_APP_CONFIG
     // must not add install roots to this assertion.
     let result = crawler
-        .get_gem_paths_with_env(&options_at(tmp.path()), None, None, None)
+        .get_gem_paths_with_env(&options_at(tmp.path()), None, None, None, None)
         .await;
 
     if let Some(v) = prev {
@@ -415,7 +415,7 @@ async fn get_gem_paths_with_gemfile_lock_only_returns_gemdir() {
     // Hermetic seam: a developer's ambient BUNDLE_PATH/BUNDLE_APP_CONFIG
     // must not add install roots to this assertion.
     let result = crawler
-        .get_gem_paths_with_env(&options_at(tmp.path()), None, None, None)
+        .get_gem_paths_with_env(&options_at(tmp.path()), None, None, None, None)
         .await;
 
     if let Some(v) = prev {
@@ -461,7 +461,7 @@ async fn get_gem_paths_with_gems_rb_manifest_returns_gemdir() {
     // install roots to this assertion.
     let paths = with_path(bin.path(), || async {
         crawler
-            .get_gem_paths_with_env(&options_at(tmp.path()), None, None, None)
+            .get_gem_paths_with_env(&options_at(tmp.path()), None, None, None, None)
             .await
     })
     .await
@@ -497,7 +497,7 @@ async fn get_gem_paths_with_gems_locked_only_returns_gemdir() {
     // install roots to this assertion.
     let paths = with_path(bin.path(), || async {
         crawler
-            .get_gem_paths_with_env(&options_at(tmp.path()), None, None, None)
+            .get_gem_paths_with_env(&options_at(tmp.path()), None, None, None, None)
             .await
     })
     .await
@@ -553,14 +553,14 @@ async fn get_gem_paths_local_includes_every_gempath_home() {
         // Hermetic seam: ambient BUNDLE_PATH/BUNDLE_APP_CONFIG must not
         // add install roots to this assertion.
         let paths = crawler
-            .get_gem_paths_with_env(&options_at(tmp.path()), None, None, None)
+            .get_gem_paths_with_env(&options_at(tmp.path()), None, None, None, None)
             .await
             .unwrap();
         // Control: the gate still holds with `gem env` answerable — a
         // non-Ruby cwd must not pull in the ambient gem homes.
         let non_ruby = tempfile::tempdir().unwrap();
         let decoy = crawler
-            .get_gem_paths_with_env(&options_at(non_ruby.path()), None, None, None)
+            .get_gem_paths_with_env(&options_at(non_ruby.path()), None, None, None, None)
             .await
             .unwrap();
         let crawled = crawler.crawl_all(&options_at(tmp.path())).await;
@@ -646,6 +646,7 @@ async fn get_gem_paths_env_root_still_includes_gempath_homes() {
                 Some(env_root.as_os_str()),
                 None,
                 None,
+                None,
             )
             .await
     })
@@ -657,6 +658,59 @@ async fn get_gem_paths_env_root_still_includes_gempath_homes() {
         vec![env_flat, gems_a, gems_b],
         "env-root store first, then every gem-env home (fallback restored); got {paths:?}"
     );
+}
+
+/// Bundler stops before the global path when the environment supplies
+/// either path flag, even when the flag is false or an empty string.
+#[tokio::test]
+#[serial]
+async fn global_bundle_store_is_shadowed_by_environment_path_flags() {
+    let tmp = tempfile::tempdir().unwrap();
+    let root = tmp.path().join("project");
+    let store = root.join("global-store/ruby/3.3.0/gems");
+    std::fs::create_dir_all(&store).unwrap();
+    std::fs::write(root.join("Gemfile"), "gem 'rails'\n").unwrap();
+    let global = tmp.path().join("config");
+    std::fs::write(&global, "---\nBUNDLE_PATH: \"global-store\"\n").unwrap();
+
+    let keys = [
+        "BUNDLE_CONFIG",
+        "BUNDLE_USER_CONFIG",
+        "BUNDLE_APP_CONFIG",
+        "BUNDLE_IGNORE_CONFIG",
+        "BUNDLE_PATH",
+        "BUNDLE_PATH__SYSTEM",
+        "BUNDLE_DISABLE_SHARED_GEMS",
+    ];
+    let previous: Vec<_> = keys.iter().map(|key| std::env::var_os(key)).collect();
+    for key in keys {
+        std::env::remove_var(key);
+    }
+    std::env::set_var("BUNDLE_USER_CONFIG", &global);
+    let control = RubyCrawler::discover_bundle_stores(&root).await.stores;
+    let mut cases = Vec::new();
+    for key in ["BUNDLE_PATH__SYSTEM", "BUNDLE_DISABLE_SHARED_GEMS"] {
+        for value in ["true", "false", ""] {
+            std::env::set_var(key, value);
+            cases.push((
+                key,
+                value,
+                RubyCrawler::discover_bundle_stores(&root).await.stores,
+            ));
+        }
+        std::env::remove_var(key);
+    }
+    // Restore the ambient state before any assertion can panic.
+    for (key, value) in keys.into_iter().zip(previous) {
+        match value {
+            Some(value) => std::env::set_var(key, value),
+            None => std::env::remove_var(key),
+        }
+    }
+    assert_eq!(control, vec![store]);
+    for (key, value, stores) in cases {
+        assert!(stores.is_empty(), "{key}={value:?}: {stores:?}");
+    }
 }
 
 // ── global gem discovery ───────────────────────────────────────
@@ -755,7 +809,7 @@ async fn get_gem_paths_local_gemfile_no_gem_binary_returns_empty() {
     // Hermetic seam: ambient BUNDLE_PATH/BUNDLE_APP_CONFIG must not add
     // install roots to this assertion.
     let paths = crawler
-        .get_gem_paths_with_env(&options_at(tmp.path()), None, None, None)
+        .get_gem_paths_with_env(&options_at(tmp.path()), None, None, None, None)
         .await
         .unwrap();
 
