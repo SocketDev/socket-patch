@@ -682,3 +682,128 @@ async fn ledger_update_failure_after_revert_is_stranded() {
     assert_eq!(env["status"], "partial_failure", "{env:#}");
     assert_eq!(code, 1, "{env:#}");
 }
+
+/// #699: hosted mode rewrites only the ROOT `requirements.txt`, while
+/// vendored mode also wires a pin in a `-r` include or appends a managed
+/// `(transitive)` line. A vendored → hosted takeover of such a pin used to
+/// revert the vendored wiring first and then find no root entry to pin,
+/// stranding the package unpatched (exit 1). It must be refused BEFORE the
+/// revert — the vendored patch, ledger entry and wheel are kept — and the
+/// dry run must predict that refusal instead of a clean takeover.
+async fn assert_unreachable_takeover_refused(root: &Path, wired: &str, dry_run: bool) {
+    let before = std::fs::read_to_string(root.join(wired)).unwrap();
+    let root_before = std::fs::read_to_string(root.join("requirements.txt")).unwrap();
+    let state = root.join(".socket/vendor/state.json");
+    let server = MockServer::start().await;
+    mount_hosted_api(&server, true).await;
+    let uri = server.uri();
+    let mut args = hosted_scan_args(&uri);
+    if dry_run {
+        args.push("--dry-run");
+    }
+    let (code, env) = run_cli(root, &args, &[]);
+    let text = env.to_string();
+    assert!(
+        !text.contains("redirect_would_revert_vendored")
+            && !text.contains("redirect_takeover_reverted_vendored"),
+        "no takeover over an entry hosted mode cannot pin: {env:#}"
+    );
+    assert!(
+        !text.contains("redirect_takeover_unpatched"),
+        "the package is never stranded: {env:#}"
+    );
+    assert!(
+        text.contains("redirect_requirements_takeover_unreachable"),
+        "the refusal is named: {env:#}"
+    );
+    assert_eq!(env["redirect"]["redirected"], 0, "{env:#}");
+    assert_eq!(
+        code, 0,
+        "a refused takeover keeps the package vendored: {env:#}"
+    );
+    assert_eq!(
+        std::fs::read_to_string(root.join(wired)).unwrap(),
+        before,
+        "{wired}: the vendored line is kept"
+    );
+    assert_eq!(
+        std::fs::read_to_string(root.join("requirements.txt")).unwrap(),
+        root_before,
+        "requirements.txt is untouched"
+    );
+    assert!(
+        std::fs::read_to_string(&state).unwrap().contains(UUID),
+        "the ledger entry is kept"
+    );
+    assert!(
+        root.join(format!(".socket/vendor/pypi/{UUID}")).exists(),
+        "the vendored artifact is kept"
+    );
+}
+
+fn include_project() -> (tempfile::TempDir, std::path::PathBuf) {
+    let (tmp, root) = project();
+    std::fs::write(root.join("requirements.txt"), "-r base.txt\nidna==3.7\n").unwrap();
+    std::fs::write(root.join("base.txt"), "six==1.16.0\n").unwrap();
+    vendor_project(&root, &["base.txt"]);
+    (tmp, root)
+}
+
+fn transitive_project() -> (tempfile::TempDir, std::path::PathBuf) {
+    let (tmp, root) = project();
+    std::fs::write(root.join("requirements.txt"), "idna==3.7\n").unwrap();
+    std::fs::write(root.join("requirements-dev.txt"), "six==1.16.0\n").unwrap();
+    vendor_project(&root, &["requirements.txt"]);
+    assert!(
+        std::fs::read_to_string(root.join("requirements.txt"))
+            .unwrap()
+            .contains("(transitive)"),
+        "vendor appended a managed transitive line"
+    );
+    (tmp, root)
+}
+
+#[tokio::test]
+async fn include_pin_takeover_is_refused_before_revert() {
+    let (_tmp, root) = include_project();
+    assert_unreachable_takeover_refused(&root, "base.txt", false).await;
+}
+
+#[tokio::test]
+async fn dry_run_predicts_include_pin_takeover_refusal() {
+    let (_tmp, root) = include_project();
+    assert_unreachable_takeover_refused(&root, "base.txt", true).await;
+}
+
+#[tokio::test]
+async fn transitive_line_takeover_is_refused_before_revert() {
+    let (_tmp, root) = transitive_project();
+    assert_unreachable_takeover_refused(&root, "requirements.txt", false).await;
+}
+
+#[tokio::test]
+async fn dry_run_predicts_transitive_line_takeover_refusal() {
+    let (_tmp, root) = transitive_project();
+    assert_unreachable_takeover_refused(&root, "requirements.txt", true).await;
+}
+
+/// Control for #699: a vendored pin in the root file is still taken over,
+/// and the dry run still previews it.
+#[tokio::test]
+async fn dry_run_previews_root_pin_takeover() {
+    let (_tmp, root) = project();
+    std::fs::write(root.join("requirements.txt"), "idna==3.7\nsix==1.16.0\n").unwrap();
+    vendor_project(&root, &["requirements.txt"]);
+    let server = MockServer::start().await;
+    mount_hosted_api(&server, true).await;
+    let uri = server.uri();
+    let mut args = hosted_scan_args(&uri);
+    args.push("--dry-run");
+    let (code, env) = run_cli(&root, &args, &[]);
+    assert_eq!(code, 0, "{env:#}");
+    assert!(
+        env.to_string().contains("redirect_would_revert_vendored"),
+        "{env:#}"
+    );
+    assert_eq!(env["redirect"]["redirected"], 1, "{env:#}");
+}

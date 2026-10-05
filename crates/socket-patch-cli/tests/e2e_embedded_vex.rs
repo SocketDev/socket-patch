@@ -210,6 +210,85 @@ fn assert_not_affected_statement(
 // apply --vex
 // ──────────────────────────────────────────────────────────────────────
 
+/// Regression (#356): an npm alias (`"lp": "npm:vuln-pkg@1.0.0"`) installs
+/// the real `vuln-pkg@1.0.0` at `node_modules/lp`. `apply` must patch that
+/// copy, both on its own (it used to report `package_not_installed`) and
+/// beside a plain `node_modules/vuln-pkg` copy (it used to patch only the
+/// plain copy, and the in-run VEX attested the purl while `require('lp')`
+/// still loaded the unpatched file).
+#[test]
+fn apply_vex_patches_npm_alias_copies() {
+    for (label, with_plain_copy) in [("alias only", false), ("plain + alias", true)] {
+        let tmp = tempfile::tempdir().unwrap();
+        let cwd = tmp.path();
+        let after_hash = seed_offline_apply(cwd);
+        let plain = cwd.join("node_modules/vuln-pkg");
+        let alias = cwd.join("node_modules/lp");
+        let scoped_alias = cwd.join("node_modules/@x/vp");
+        for copy in [&alias, &scoped_alias] {
+            std::fs::create_dir_all(copy.parent().unwrap()).unwrap();
+            copy_dir(&plain, copy);
+        }
+        if !with_plain_copy {
+            std::fs::remove_dir_all(&plain).unwrap();
+        }
+        let vex_path = cwd.join("apply.vex.json");
+
+        let out = cli()
+            .args([
+                "apply",
+                "--cwd",
+                cwd.to_str().unwrap(),
+                "--offline",
+                "--vex",
+                vex_path.to_str().unwrap(),
+                "--vex-product",
+                "pkg:npm/my-app@1.0.0",
+            ])
+            .output()
+            .expect("invoke apply");
+        assert!(
+            out.status.success(),
+            "{label}: apply --vex should exit 0. stdout:\n{}\nstderr:\n{}",
+            String::from_utf8_lossy(&out.stdout),
+            String::from_utf8_lossy(&out.stderr)
+        );
+        let mut copies = vec![&alias, &scoped_alias];
+        if with_plain_copy {
+            copies.push(&plain);
+        }
+        for copy in copies {
+            let on_disk = std::fs::read(copy.join("index.js")).unwrap();
+            assert_eq!(
+                compute_git_sha256_from_bytes(&on_disk),
+                after_hash,
+                "{label}: {} must be patched",
+                copy.display()
+            );
+        }
+        let doc: Value =
+            serde_json::from_str(&std::fs::read_to_string(&vex_path).unwrap()).unwrap();
+        let stmts = doc["statements"].as_array().unwrap();
+        assert_eq!(stmts.len(), 1, "{label}: doc:\n{doc}");
+        assert_not_affected_statement(
+            &stmts[0],
+            "GHSA-aaaa-bbbb-cccc",
+            "CVE-2024-0001",
+            "pkg:npm/my-app@1.0.0",
+            "pkg:npm/vuln-pkg@1.0.0",
+        );
+    }
+}
+
+/// Copy the files of one flat package dir (`seed_offline_apply`'s layout).
+fn copy_dir(from: &Path, to: &Path) {
+    std::fs::create_dir_all(to).unwrap();
+    for entry in std::fs::read_dir(from).unwrap() {
+        let entry = entry.unwrap();
+        std::fs::copy(entry.path(), to.join(entry.file_name())).unwrap();
+    }
+}
+
 #[test]
 fn apply_vex_writes_document_on_success() {
     let tmp = tempfile::tempdir().unwrap();

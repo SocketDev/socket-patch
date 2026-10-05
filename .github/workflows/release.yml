@@ -70,13 +70,17 @@ jobs:
       - name: Release-readiness gate
         # scripts/release-lint.sh is the single source of truth for the
         # version chores, shared with CI's release-readiness job (which runs
-        # it on the version-bump PR, so failures surface at PR time, not
-        # here). Checks: version coherence (version-sync.sh is a no-op),
-        # CHANGELOG has a non-empty section for this version, and — via
-        # --tag-check, asked of the remote since this checkout is shallow
-        # and tagless — the tag doesn't exist at a different commit (a tag
-        # already at $GITHUB_SHA is a retry of a previous run and passes).
-        run: bash scripts/release-lint.sh --tag-check
+        # it on the PR that bumps the version, so failures surface at PR
+        # time, not here). Checks: version coherence (the offline stamp,
+        # scripts/release.py stamp, is a no-op), CHANGELOG has a non-empty
+        # section for this version, and — via --tag-check, asked of the
+        # remote since this checkout is shallow and tagless — the tag doesn't
+        # exist at a different commit (a tag already at $GITHUB_SHA is a
+        # retry of a previous run and passes). --stable-only: this legacy
+        # pipeline publishes as GitHub Latest / npm latest, so it must never
+        # see an X.Y.Z-rc.N version; rcs ship only through the release train
+        # (docs/release-train/DESIGN.md), which replaces this workflow.
+        run: bash scripts/release-lint.sh --stable-only --tag-check
 
   build:
     needs: version

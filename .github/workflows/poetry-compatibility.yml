@@ -124,4 +124,5 @@ jobs:
             native-poetry/summary.json
             native-poetry/summary.md
             native-poetry/captures/**/*.log
+            native-poetry/attempts/**/*.log
           retention-days: 14
