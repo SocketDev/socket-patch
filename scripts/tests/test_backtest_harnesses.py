@@ -305,6 +305,120 @@ class PoetryTransportRetryTests(unittest.TestCase):
         self.assertEqual(poetry.failure_details(row), ['  appliedExactlyOne: {"applied": 0, "status": "error"}'])
 
 
+class PdmTransportRetryTests(unittest.TestCase):
+    JOB = ("2.17.3", "space-unicode", "vendored")
+
+    @staticmethod
+    def operation(rc=0, out=""):
+        run = object.__new__(pdm.Run)
+        run.cmd, run.rc, run.out = ["socket-patch", "scan"], rc, out
+        return run
+
+    def drive(self, outcomes, root):
+        """Drive retry_transport with one scripted outcome per attempt:
+        `checks` maps a check to (passed, operation)."""
+        case = root / "cases" / "2.17.3" / "space-unicode" / "vendored"
+        calls = []
+
+        def run_case(_job):
+            outcome = outcomes[len(calls)]
+            calls.append(outcome)
+            if case.exists():
+                pdm.shutil.rmtree(case)
+            case.mkdir(parents=True)
+            (case / "rescan-after-relock.log").write_text(outcome.get("log", ""))
+            row = {"checks": {}, "info": {}, "caseDir": str(case)}
+            for name, (ok, op) in outcome.get("checks", {}).items():
+                pdm.record_check(row, name, ok, {"exit": getattr(op, "rc", None)}, op)
+            if "raise" in outcome:
+                error = RuntimeError(outcome["raise"])
+                error.row = row
+                raise error
+            row["outcome"] = "PASS" if all(row["checks"].values()) else "FAIL"
+            return row
+
+        sleeps = []
+        try:
+            result = pdm.retry_transport(run_case, self.JOB, case, root, sleep=sleeps.append)
+        except RuntimeError as error:
+            result = error
+        return result, calls, sleeps
+
+    def test_zero_exit_cli_transport_warning_is_retried_from_a_fresh_case(self):
+        # The CLI exits 0 and reports the exhausted patch API fetch in its
+        # envelope; `Run`'s exit-code retry never sees it.
+        envelope = json.dumps({"status": "partial_failure", "warnings": [{"code": "patch_details_failed",
+                               "message": "API request failed with status 503: service unavailable"}]})
+        blip = self.operation(0, envelope)
+        with tempfile.TemporaryDirectory() as temp:
+            root = Path(temp)
+            row, calls, sleeps = self.drive([
+                {"checks": {"rescanAfterRelockApplies": (False, blip), "rollbackAfterRelockPristine": (False, (self.operation(0, "{}"), blip))},
+                 "log": "first attempt"},
+                {"checks": {"rescanAfterRelockApplies": (True, self.operation())}},
+            ], root)
+            self.assertEqual((row["outcome"], len(calls), sleeps), ("PASS", 2, [10]))
+            retry = row["transportRetries"][0]
+            self.assertEqual(retry["failedChecks"], ["rescanAfterRelockApplies", "rollbackAfterRelockPristine"])
+            self.assertEqual((root / retry["evidence"] / "rescan-after-relock.log").read_text(), "first attempt")
+            self.assertEqual(retry["evidence"], "attempts/2.17.3-space-unicode-vendored/1")
+            saved = json.loads((Path(row["caseDir"]) / "result.json").read_text())
+            self.assertEqual(saved["transportRetries"], row["transportRetries"])
+
+    def test_nonzero_exit_cli_request_errors_are_retried(self):
+        for out in ("error sending request for url (https://patches-api.socket.dev/patch/view/x)",
+                    "Rate limit exceeded (HTTP 429, gave up after 3 retries). Please try again later.",
+                    "httpx.ConnectError: [Errno -3] Temporary failure in name resolution"):
+            with self.subTest(out=out), tempfile.TemporaryDirectory() as temp:
+                row, calls, _ = self.drive([{"checks": {"appliedExactlyOne": (False, self.operation(1, out))}},
+                                            {"checks": {"appliedExactlyOne": (True, self.operation())}}], Path(temp))
+                self.assertEqual((row["outcome"], len(calls)), ("PASS", 2))
+
+    def test_functional_failures_are_never_retried(self):
+        with tempfile.TemporaryDirectory() as temp:
+            # No operation, a refusal, a recovered retry warning, and a zero
+            # exit whose transport text sits outside any error record.
+            for checks in ({"lockRewritten": (False, None)},
+                           {"appliedExactlyOne": (False, self.operation(1, "error: pypi_pdm_lock_unsupported"))},
+                           {"nativeInstallOk": (False, self.operation(1, "Connection reset by peer, retrying\nResolutionImpossible"))},
+                           {"rescanIdempotent": (False, self.operation(0, json.dumps({"note": "error sending request for url ("})))}):
+                with self.subTest(checks=list(checks)):
+                    row, calls, sleeps = self.drive([{"checks": checks}], Path(temp))
+                    self.assertEqual((row["outcome"], len(calls), sleeps), ("FAIL", 1, []))
+                    self.assertNotIn("transportRetries", row)
+
+    def test_one_unexplained_failed_check_blocks_the_retry(self):
+        with tempfile.TemporaryDirectory() as temp:
+            row, calls, _ = self.drive([{"checks": {
+                "appliedExactlyOne": (False, self.operation(1, "error sending request for url (https://x)")),
+                "lockUnchanged": (False, None)}}], Path(temp))
+            self.assertEqual((row["outcome"], len(calls)), ("FAIL", 1))
+
+    def test_transport_exception_retries_only_without_an_earlier_functional_failure(self):
+        with tempfile.TemporaryDirectory() as temp:
+            row, calls, _ = self.drive([{"raise": "no JSON in output: error sending request for url (https://x)"},
+                                          {"checks": {"appliedExactlyOne": (True, self.operation())}}], Path(temp))
+            self.assertEqual((row["outcome"], len(calls)), ("PASS", 2))
+            error, calls, _ = self.drive([{"checks": {"lockRewritten": (False, None)},
+                                           "raise": "no JSON in output: error sending request for url (https://x)"}], Path(temp))
+            self.assertIsInstance(error, RuntimeError)
+            self.assertEqual(len(calls), 1)
+
+    def test_a_persistent_transport_failure_stays_red_after_three_attempts(self):
+        blip = (False, self.operation(1, "error sending request for url (https://x)"))
+        with tempfile.TemporaryDirectory() as temp:
+            row, calls, sleeps = self.drive([{"checks": {"appliedExactlyOne": blip}}] * 3, Path(temp))
+            self.assertEqual((row["outcome"], len(calls), sleeps), ("FAIL", 3, [10, 20]))
+            self.assertEqual([r["attempt"] for r in row["transportRetries"]], [1, 2])
+            error, calls, _ = self.drive([{"raise": "ReadTimeoutError: read timed out"}] * 3, Path(temp))
+            self.assertEqual((len(calls), [r["attempt"] for r in error.transport_retries]), (3, [1, 2]))
+
+    def test_failure_details_list_only_failed_checks_with_notes(self):
+        row = {"checks": {"appliedExactlyOne": False, "lockRewritten": True, "lockUnchanged": False},
+               "info": {"appliedExactlyOne": {"applied": 0}, "lockRewritten": {"x": 1}}}
+        self.assertEqual(pdm.failure_details(row), ['  appliedExactlyOne: {"applied": 0}'])
+
+
 class PipenvShimTests(unittest.TestCase):
     def test_parallel_first_use(self):
         # Force every worker to reach symlink creation before any can create

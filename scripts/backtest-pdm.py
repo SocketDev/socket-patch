@@ -328,6 +328,132 @@ class Run:
             return {}
 
 
+# Terminal transport diagnostics (the set backtest-poetry.py retries on):
+# PDM/pip/uv giving up on PyPI (requests/urllib3/httpx connection errors,
+# "too many 503 error responses") or the CLI's own report of a request error,
+# a patch API 5xx, or a 429 its retry loop gave up on. `Run`'s own one-shot
+# retry only covers a non-zero exit; the CLI reports most of these in its JSON
+# envelope while exiting zero, so the cell just fails a later check.
+TRANSPORT_FAILURE = re.compile(
+    r"too many 5\d\d error responses|Max retries exceeded with url|"
+    r"NewConnectionError|ConnectTimeoutError|ReadTimeoutError|ProtocolError\(|"
+    r"raise ConnectionError\(|requests\.exceptions\.ConnectionError|ClosedPoolError|"
+    r"httpx\.(?:ConnectError|ReadError|RemoteProtocolError|ConnectTimeout|ReadTimeout)|"
+    r"Temporary failure in name resolution|nodename nor servname provided|Connection reset by peer|RemoteDisconnected|"
+    r"error sending request for url \(|API request failed with status 5\d\d\b|Rate limit exceeded \(HTTP 429"
+)
+
+
+def transport_diagnostic(text):
+    # A recovered pip/PDM/CLI retry warning is not a terminal failure, even
+    # when a later part of the same command fails for another reason.
+    text = "\n".join(line for line in text.splitlines() if "retrying" not in line.lower())
+    match = TRANSPORT_FAILURE.search(text)
+    return match.group(0) if match else None
+
+
+def operation_transport_failure(run):
+    """Transport evidence from the one operation a check judged, not from
+    other case logs. A failed command's output counts; a zero-exit CLI run
+    counts only through its JSON error records (an `error`, a failed or
+    skipped event, an `api_batch_failed` / `patch_details_failed` warning),
+    never through arbitrary successful output."""
+    if run is None:
+        return None
+    if not run.ok():
+        return transport_diagnostic(run.out)
+
+    def diagnostic(value):
+        if isinstance(value, dict):
+            if value.get("error"):
+                found = transport_diagnostic(json.dumps(value["error"]))
+                if found:
+                    return found
+            if (value.get("errorCode") or value.get("code") in ("api_batch_failed", "patch_details_failed")
+                    or value.get("action") in ("failed", "skipped")):
+                found = transport_diagnostic(json.dumps(value))
+                if found:
+                    return found
+            return next((found for child in value.values() if (found := diagnostic(child))), None)
+        if isinstance(value, list):
+            return next((found for child in value if (found := diagnostic(child))), None)
+        return None
+
+    return diagnostic(run.json_or_empty())
+
+
+def record_check(row, name, value, note=None, operation=None):
+    """Record one check. `operation`: the command (or tuple of commands) it
+    judges; a failed check whose operation shows a transport failure makes
+    the case retryable (see retry_transport)."""
+    row["checks"][name] = bool(value)
+    if note is not None:
+        row["info"][name] = note
+    operations = operation if isinstance(operation, tuple) else (operation,)
+    evidence = None if value else next((found for op in operations if (found := operation_transport_failure(op))), None)
+    if evidence:
+        row.setdefault("transportFailures", {})[name] = evidence
+    elif "transportFailures" in row:
+        row["transportFailures"].pop(name, None)
+    return bool(value)
+
+
+def retry_transport(run_case, job, case, root, attempts=3, sleep=time.sleep):
+    """`run_case(job)`'s row, re-run from a clean case dir while the case
+    fails for transport reasons only: a FAIL row whose every failed check
+    recorded transport evidence from its own operation, or an exception whose
+    text carries a transport diagnostic. A functional failure is never
+    retried. A failed attempt's logs are kept under
+    <root>/attempts/<version>-<shape>-<mode>/<n>/ and listed on the row."""
+    history = []
+    for attempt in range(1, attempts + 1):
+        error = None
+        try:
+            row = run_case(job)
+            failed = [k for k, ok in row.get("checks", {}).items() if not ok]
+            causes = row.get("transportFailures", {})
+            retryable = row.get("outcome") == "FAIL" and bool(failed) and all(k in causes for k in failed)
+        except Exception as e:
+            # A check that failed before the exception must itself be a
+            # transport failure for the case to be retried.
+            error, row = e, None
+            partial = getattr(e, "row", None) or {}
+            failed = [k for k, ok in partial.get("checks", {}).items() if not ok]
+            causes = partial.get("transportFailures", {})
+            retryable = transport_diagnostic(str(e)) is not None and all(k in causes for k in failed)
+        if not retryable or attempt == attempts:
+            if error is not None:
+                if history:
+                    error.transport_retries = history
+                raise error
+            if history:
+                row["transportRetries"] = history
+                if row.get("caseDir"):
+                    save(Path(row["caseDir"]) / "result.json", row)
+            return row
+        evidence = root / "attempts" / "-".join(job) / str(attempt)
+        evidence.mkdir(parents=True, exist_ok=True)
+        for log in case.glob("*.log") if case.is_dir() else []:
+            shutil.copy2(log, evidence / log.name)
+        if row is not None and (case / "result.json").is_file():
+            shutil.copy2(case / "result.json", evidence / "result.json")
+        history.append({
+            "attempt": attempt,
+            "evidence": evidence.relative_to(root).as_posix(),
+            "failedChecks": failed,
+            "transport": (row or {}).get("transportFailures") or transport_diagnostic(str(error)),
+        })
+        print(f"{' '.join(job)}: transport failure; retrying fresh case ({attempt}/{attempts})", flush=True)
+        sleep(10 * attempt)
+
+
+def failure_details(row):
+    """One line per failed check with the note it recorded, so a job log
+    shows why a case failed without downloading the capture artifact."""
+    info = row.get("info", {})
+    return [f"  {k}: {json.dumps(info[k], default=str)[:500]}" for k, ok in row.get("checks", {}).items() if not ok and k in info]
+
+
 def require(r, what):
     if not r.ok():
         raise RuntimeError(f"{what} failed (exit {r.rc}):\n{r.tail(4000)}")
@@ -889,7 +1015,7 @@ def main():
         rs = Run(install_cmd(version, "sync", sync_groups, None), vdir, venv_env, case / "vex-install.log", timeout=900, retry=True)
         res = oracle(version, vdir, venv_env, hashes, case / "vex-oracle.log")
         info["vexCheckoutInstall"] = {"exit": rs.rc, "patched": patched(res, hashes)}
-        check("vexCheckoutInstallsPatched", (rs.ok() or self_install_only(rs.out)) and patched(res, hashes), info["vexCheckoutInstall"])
+        check("vexCheckoutInstallsPatched", (rs.ok() or self_install_only(rs.out)) and patched(res, hashes), info["vexCheckoutInstall"], rs)
         cenv_v = cli_env(version, vhome)
 
         def vex(log, *flags, via="vex"):
@@ -916,15 +1042,15 @@ def main():
         notes = info.setdefault("vex", {})
         r, env_, doc = vex("vex-manifest-deleted.log")
         notes["manifestDeleted"] = {"exit": r.rc, "status": env_.get("status"), "error": (env_.get("error") or {}).get("code")}
-        check("vexManifestDeleted", r.ok() and attested(doc), notes["manifestDeleted"])
+        check("vexManifestDeleted", r.ok() and attested(doc), notes["manifestDeleted"], r)
         for p in ledgers:
             p.unlink(missing_ok=True)
         r, env_, doc = vex("vex-ledgers-deleted.log")
         notes["ledgersDeleted"] = {"exit": r.rc, "status": env_.get("status"), "error": (env_.get("error") or {}).get("code")}
-        check("vexLedgersDeleted", r.ok() and attested(doc) and not (vdir / ".socket/manifest.json").exists(), notes["ledgersDeleted"])
+        check("vexLedgersDeleted", r.ok() and attested(doc) and not (vdir / ".socket/manifest.json").exists(), notes["ledgersDeleted"], r)
         r, env_, doc = vex("vex-apply-embedded.log", via="apply")
         notes["applyEmbedded"] = {"exit": r.rc, "vex": env_.get("vex")}
-        check("vexApplyEmbedded", r.ok() and attested(doc), notes["applyEmbedded"])
+        check("vexApplyEmbedded", r.ok() and attested(doc), notes["applyEmbedded"], r)
         r, env_, doc = vex("vex-offline.log", "--offline")
         notes["offlineNoLedger"] = {"exit": r.rc, "error": (env_.get("error") or {}).get("code")}
         check("vexOfflineUnavailable", r.rc == 1 and doc is None and omitted(env_, "record_unavailable"), notes["offlineNoLedger"])
@@ -951,17 +1077,29 @@ def main():
         for path in (project / ".venv", project / "__pypackages__", case / "home", case / "native-cache", case / "saved-socket", project / ".socket"):
             shutil.rmtree(path, ignore_errors=True)
 
+    def case_dir(job):
+        version, shape, mode = job
+        return root / "cases" / version / shape / mode
+
     def backtest(job):
         version, shape, mode = job
-        started = time.time()
         row = {"pdm": version, "python": python_for(version), "shape": shape, "mode": mode, "checks": {}, "info": {}, "passed": None, "outcome": None}
+        try:
+            return backtest_case(job, row)
+        except Exception as error:
+            # retry_transport must see the checks that already failed: a
+            # later transport exception must not retry away a functional
+            # failure.
+            error.row = row
+            raise
+
+    def backtest_case(job, row):
+        version, shape, mode = job
+        started = time.time()
         checks, info = row["checks"], row["info"]
 
-        def check(name, value, note=None):
-            checks[name] = bool(value)
-            if note is not None:
-                info[name] = note
-            return bool(value)
+        def check(name, value, note=None, operation=None):
+            return record_check(row, name, value, note, operation)
 
         def finish(outcome):
             row["outcome"] = outcome
@@ -991,7 +1129,7 @@ def main():
             info["skip"] = meta["skip"]
             return finish("SKIP")
         lockname = meta["lockfile"]
-        case = root / "cases" / version / shape / mode
+        case = case_dir(job)
         if case.exists():
             shutil.rmtree(case)
         case.mkdir(parents=True)
@@ -1115,7 +1253,7 @@ def main():
                 row["expected"] = f"refused: lock_version {row['lockVersion']!r} is not supported by the rewriter"
             check("appliedZero", applied == 0, {"applied": applied, "codes": codes})
             if shape != "custom-lockfile":
-                check("refusalCodeReported", bool(codes), codes)
+                check("refusalCodeReported", bool(codes), codes, r)
             check("lockUnchanged", lock_after == pristine_lock)
             if mode == "hosted":
                 check("noPatchWiring", ledger_cleared(project, "hosted"))
@@ -1131,7 +1269,7 @@ def main():
             r, ok = native_sync("native-install.log")
             if not ok and applied == 0:
                 return native_broken("pristine lock", r.out)
-            check("nativeInstallOk", ok, {"exit": r.rc, "tail": r.tail(300)})
+            check("nativeInstallOk", ok, {"exit": r.rc, "tail": r.tail(300)}, r)
             res = oracle(version, project, penv, {}, case / "oracle-native.log")
             check("nativeInstallsPackage", res.get("installed") is (not excluded), res)
             info["installedOrigin"] = res.get("origin")
@@ -1155,7 +1293,7 @@ def main():
         if mode == "agent":
             found = envelope.get("apply", {}).get("found", 0)
             info["found"] = found
-            if not check("appliedExactlyOne", applied == 1, {"applied": applied, "found": found, "codes": codes, "status": envelope.get("status")}):
+            if not check("appliedExactlyOne", applied == 1, {"applied": applied, "found": found, "codes": codes, "status": envelope.get("status")}, r):
                 return finish("FAIL")
             check("lockUnchanged", lock_after == pristine_lock)
             after, before, uuid = record_hashes(project, "agent")
@@ -1167,13 +1305,13 @@ def main():
             r2 = Run(cli_cmd(project, "scan", *scan_mode), project, cenv, case / "rescan.log", timeout=900, retry=True)
             e2 = r2.json_or_empty()
             res2 = oracle(version, project, penv, after, case / "oracle-2.log")
-            check("rescanIdempotent", r2.ok() and patched(res2, after) and (project / lockname).read_bytes() == pristine_lock, {"exit": r2.rc, "applied": applied_count("agent", e2)})
+            check("rescanIdempotent", r2.ok() and patched(res2, after) and (project / lockname).read_bytes() == pristine_lock, {"exit": r2.rc, "applied": applied_count("agent", e2)}, r2)
             rs, ok = native_sync("sync-again.log")
             res3 = oracle(version, project, penv, after, case / "oracle-3.log")
-            check("survivesSync", ok and patched(res3, after), {"exit": rs.rc, "oracle": res3})
+            check("survivesSync", ok and patched(res3, after), {"exit": rs.rc, "oracle": res3}, rs)
             ri = Run(install, project, penv, case / "install-again.log", timeout=900, retry=True)
             res4 = oracle(version, project, penv, after, case / "oracle-4.log")
-            check("survivesInstall", (ri.ok() or self_install_only(ri.out)) and patched(res4, after), {"exit": ri.rc, "oracle": res4})
+            check("survivesInstall", (ri.ok() or self_install_only(ri.out)) and patched(res4, after), {"exit": ri.rc, "oracle": res4}, ri)
             lock_now = (project / lockname).read_bytes()
             info["ordinaryInstall"] = {"exit": ri.rc, "lockStable": lock_now == pristine_lock, "baselineFresh": row["baselineFresh"]}
             # The agent never touches the lock; a regenerated lock here is
@@ -1182,17 +1320,19 @@ def main():
             check("lockUnchangedAfterInstalls", lock_now == pristine_lock or row["baselineFresh"] is not True, info["ordinaryInstall"])
             rb = Run(cli_cmd(project, "rollback"), project, cenv, case / "rollback.log", timeout=900)
             erb = rb.json_or_empty()
-            check("rollbackExit0", rb.ok(), rb.tail(600) if not rb.ok() else None)
+            check("rollbackExit0", rb.ok(), rb.tail(600) if not rb.ok() else None, rb)
             res5 = oracle(version, project, penv, before, case / "oracle-rollback.log")
-            check("rollbackRestoresUpstreamBytes", patched(res5, before), res5)
-            check("rollbackClearsManifest", ledger_cleared(project, "agent"))
+            # Both follow from the rollback: it restores the upstream bytes
+            # (fetched from the patch API) and then clears the manifest.
+            check("rollbackRestoresUpstreamBytes", patched(res5, before), res5, rb)
+            check("rollbackClearsManifest", ledger_cleared(project, "agent"), None, rb)
             check("rollbackKeepsPyproject", (project / "pyproject.toml").read_bytes() == pristine_pyproject)
             check("rollbackKeepsLock", (project / lockname).read_bytes() == lock_now)
             info["rollbackEnvelope"] = {k: erb.get(k) for k in ("status", "rolledBack", "failed") if k in erb}
             return finish("PASS" if all(checks.values()) else "FAIL")
 
         # ------------------------------------------------ hosted / vendored
-        if not check("appliedExactlyOne", applied == 1, {"applied": applied, "codes": codes, "status": envelope.get("status")}):
+        if not check("appliedExactlyOne", applied == 1, {"applied": applied, "codes": codes, "status": envelope.get("status")}, r):
             return finish("FAIL")
         check("lockRewritten", lock_after != pristine_lock)
         if shape == "crlf":
@@ -1211,7 +1351,7 @@ def main():
         # idempotent re-scan
         r2 = Run(cli_cmd(project, "scan", *scan_mode), project, cenv, case / "rescan.log", timeout=900, retry=True)
         e2 = r2.json_or_empty()
-        check("rescanIdempotent", r2.ok() and (project / lockname).read_bytes() == lock_after and (project / "pyproject.toml").read_bytes() == pristine_pyproject, {"exit": r2.rc, "applied": applied_count(mode, e2), "status": e2.get("status")})
+        check("rescanIdempotent", r2.ok() and (project / lockname).read_bytes() == lock_after and (project / "pyproject.toml").read_bytes() == pristine_pyproject, {"exit": r2.rc, "applied": applied_count(mode, e2), "status": e2.get("status")}, r2)
         # lock-driven install of the patched artifact
         uninstall("uninstall.log")
         r, ok = native_sync("install.log")
@@ -1226,7 +1366,7 @@ def main():
             info["nativeBaseline"] = {"exit": rb0.rc, "ok": ok0, "tail": rb0.tail(300)}
             if not ok0:
                 return native_broken("pristine lock fails too", rb0.out)
-        check("nativeInstallOk", ok, info["install"])
+        check("nativeInstallOk", ok, info["install"], r)
         res = oracle(version, project, penv, after, case / "oracle-1.log")
         info["installedOrigin"] = res.get("origin")
         if excluded:
@@ -1240,7 +1380,7 @@ def main():
         ri = Run(install, project, penv, case / "ordinary-install.log", timeout=900, retry=True)
         ordinary_stable = (project / lockname).read_bytes() == lock_after
         info["ordinaryInstall"] = {"exit": ri.rc, "lockStable": ordinary_stable, "baselineFresh": row["baselineFresh"], "tail": ri.tail(300)}
-        check("ordinaryInstallOk", ri.ok() or self_install_only(ri.out), info["ordinaryInstall"])
+        check("ordinaryInstallOk", ri.ok() or self_install_only(ri.out), info["ordinaryInstall"], ri)
         check("ordinaryInstallKeepsLock", ordinary_stable or row["baselineFresh"] is not True, info["ordinaryInstall"])
         if not ordinary_stable:
             shutil.copyfile(project / lockname, case / "ordinary-result.lock")
@@ -1270,7 +1410,7 @@ def main():
             check("integrityRejected", tam.rc != 0 and not info["tamper"]["installedPatchedAnyway"], info["tamper"])
             uninstall("tamper-uninstall2.log")
             r, ok = native_sync("reinstall.log")
-            check("reinstallOk", ok, r.tail(300))
+            check("reinstallOk", ok, r.tail(300), r)
         # relock -> re-scan -> rollback (must restore the relocked bytes)
         saved = case / "saved-socket"
         # v5 hosted mode may leave no `.socket/` at all.
@@ -1298,7 +1438,7 @@ def main():
             failures = (erb1.get("hosted") or {}).get("failed") or erb1.get("vendoredFailed") or []
             rollback_note = {"exit": rb1.rc, "status": erb1.get("status"), "failed": failures[:3], "lockEqualsRelocked": (project / lockname).read_bytes() == relocked}
             if target_kept:
-                check("rescanAfterRelockApplies", rs.ok() and marker in rescanned, info["rescanAfterRelock"])
+                check("rescanAfterRelockApplies", rs.ok() and marker in rescanned, info["rescanAfterRelock"], rs)
                 if mode == "vendored":
                     # The re-scan re-wires the COMMITTED wheel (no service
                     # call, no rebuild): the patched sha the first scan
@@ -1315,8 +1455,11 @@ def main():
                     reuse_event = "vendor_artifact_reused" in info["rescanAfterRelock"]["codes"]
                     reused = sha_kept and (reuse_event or not rewired)
                     info["rescanAfterRelock"].update({"shaKept": sha_kept, "rewired": rewired, "reuseEvent": reuse_event, "reusesWheel": reused})
-                    check("rescanReusesWheel", reused, info["rescanAfterRelock"])
-                check("rollbackAfterRelockPristine", rb1.ok() and rollback_note["lockEqualsRelocked"], rollback_note)
+                    check("rescanReusesWheel", reused, info["rescanAfterRelock"], rs)
+                # A re-scan that never re-wired the relocked lock leaves the
+                # first scan's state for this rollback to undo, so it fails
+                # with the re-scan: judge it by the re-scan's transport too.
+                check("rollbackAfterRelockPristine", rb1.ok() and rollback_note["lockEqualsRelocked"], rollback_note, (rb1, rs))
             else:
                 # The relock resolved urllib3 away from 1.26.18 (PDM < 2.0
                 # has no overrides, so the pinned transitive resolution does
@@ -1375,7 +1518,7 @@ def main():
 
     persist()
     with concurrent.futures.ThreadPoolExecutor(max_workers=args.jobs) as pool:
-        pending = {pool.submit(backtest, job): job for job in jobs}
+        pending = {pool.submit(retry_transport, backtest, job, case_dir(job), root): job for job in jobs}
         for fut in concurrent.futures.as_completed(pending):
             job = pending[fut]
             try:
@@ -1383,8 +1526,14 @@ def main():
                 results.append(row)
                 failed = [k for k, ok in row["checks"].items() if not ok]
                 say(*job, row["outcome"], ",".join(failed), f"{row.get('durationSeconds', '?')}s")
+                if row["outcome"] == "FAIL":
+                    details = failure_details(row)
+                    if details:
+                        say("\n".join(details))
             except Exception as e:
                 err = {"pdm": job[0], "shape": job[1], "mode": job[2], "outcome": "ERROR", "error": str(e)[-3000:], "trace": traceback.format_exc()[-2000:]}
+                if getattr(e, "transport_retries", None):
+                    err["transportRetries"] = e.transport_retries
                 errors.append(err)
                 results.append({"pdm": job[0], "python": python_for(job[0]), "shape": job[1], "mode": job[2], "outcome": "ERROR", "passed": False, "checks": {}, "info": {"error": str(e)[-600:]}})
                 say(*job, "ERROR", str(e)[-300:].replace("\n", " "))
