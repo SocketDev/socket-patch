@@ -17,10 +17,10 @@ use crate::constants::npm_family::{
     BUN_LOCK, BUN_LOCKB, NPM_LOCKS, PNPM_LOCK, VLT_CONFIG, VLT_HIDDEN_LOCK_REL, VLT_LOCK,
 };
 use crate::vendor::vlt_lock_text::{
-    entry_text, installs_outside_registry, is_default_registry, is_registry_url_segment,
-    nodes_block, parse_node_entry_text, parse_node_line, parse_vendored_path, render_entry_line,
-    render_tuple_with_slots, sniff_lock, split_dep_id, split_lines, DepId, DepIdKind, LockSniff,
-    NodeEntry, ParsedLock, SectionSpan,
+    brotli_for_slot3, entry_text, has_brotli_flag, installs_outside_registry, is_default_registry,
+    is_registry_url_segment, nodes_block, parse_node_entry_text, parse_node_line,
+    parse_vendored_path, render_entry_line, render_tuple_with_slots, sniff_lock, split_dep_id,
+    split_lines, DepId, DepIdKind, LockSniff, NodeEntry, ParsedLock, SectionSpan,
 };
 
 /// The ledger kind of a hosted vlt node splice.
@@ -490,10 +490,18 @@ fn rewrite_dep(
     for &(idx, id) in &located {
         let line = parse_node_line(&lines[idx]).expect("instance_line parsed this line");
         let elems = &line.entry.elems;
-        if elems.len() >= 4 && elems[2] == s2 && elems[3] == s3 {
+        // The hosted artifact is a `.tgz`, so a node that resolved vlt
+        // 1.3's `.tar.br` alternate drops the brotli bit with its URL, as
+        // `vlt install` would save it (#372).
+        let brotli = brotli_for_slot3(Some(&s3));
+        if elems.len() >= 4
+            && elems[2] == s2
+            && elems[3] == s3
+            && has_brotli_flag(elems[0]) == brotli
+        {
             continue;
         }
-        let tuple = render_tuple_with_slots(elems, Some(&s2), Some(&s3));
+        let tuple = render_tuple_with_slots(elems, brotli, Some(&s2), Some(&s3));
         let new_text = entry_text(id, &tuple);
         let extra = split_dep_id(id).and_then(|dep_id| dep_id.extra);
         splices.push(Splice {
@@ -668,6 +676,7 @@ pub fn carried_pin_original(fresh: &FileEdit, old: &FileEdit) -> Option<Value> {
     }
     let tuple = render_tuple_with_slots(
         &fresh_original.elems,
+        has_brotli_flag(old_original.elems[0]),
         old_original.slot(2).filter(|s| *s != "null"),
         old_original.slot(3).filter(|s| *s != "null"),
     );
@@ -986,4 +995,52 @@ mod tests {
         assert_eq!(carried_pin_original(&relocked, &old), None);
     }
 
+    /// #372: vlt 1.3 records the brotli bit (4) on a node that resolved
+    /// the registry's `.tar.br` alternate. Such a lock is canonical; the
+    /// pin points the node at the hosted `.tgz`, so it clears bit 4 (and
+    /// keeps dev/optional), which is what `vlt install` saves for it.
+    #[test]
+    fn a_vlt_1_3_brotli_lock_is_pinned_with_the_brotli_bit_cleared() {
+        const BR_URL: &str = "https://registry.npmjs.org/left-pad/-/left-pad-1.3.0.tar.br";
+        let peer = "~npm~left-pad@1.3.0~peer.1";
+        let lock = lock_with(&[
+            &format!("\"{ID}\": [4,\"left-pad\",\"{REG_SHA}\",\"{BR_URL}\"]"),
+            &format!("\"{peer}\": [6,\"left-pad\",\"{REG_SHA}\",\"{BR_URL}\"]"),
+            "\"~npm~other@1.0.0\": [5,\"other\",\"sha512-O==\"]",
+        ]);
+        assert!(preflight_vlt_hosted(&files(&[(VLT_LOCK, &lock)])).is_ok());
+
+        let result = rewrite(&lock, &[dep("left-pad", "1.3.0", Some(SHA))]);
+        assert!(codes(&result).is_empty(), "{:?}", result.warnings);
+        assert!(result.confirmed_vlt_uuids.contains("uuid-left-pad"));
+        let written = &result.files[VLT_LOCK];
+        assert!(written.contains(&format!("\"{ID}\": [0,\"left-pad\",\"{SHA}\",\"{URL}\"]")));
+        assert!(written.contains(&format!("\"{peer}\": [2,\"left-pad\",\"{SHA}\",\"{URL}\"]")));
+        assert!(written.contains("\"~npm~other@1.0.0\": [5,\"other\",\"sha512-O==\"]"));
+        let originals: Vec<_> = result.edits.iter().map(|e| e.original.clone()).collect();
+        assert!(originals.contains(&Some(Value::String(format!(
+            "\"{ID}\": [4,\"left-pad\",\"{REG_SHA}\",\"{BR_URL}\"]"
+        )))));
+
+        // A re-run over its own pin is a no-op.
+        let again = rewrite(written, &[dep("left-pad", "1.3.0", Some(SHA))]);
+        assert!(again.edits.is_empty(), "{:?}", again.edits);
+
+        // Superseding a carried brotli pin restores the brotli bit with
+        // the pristine `.tar.br` slots.
+        let old = vlt_edit(
+            &format!("\"{peer}\": [6,\"left-pad\",\"{REG_SHA}\",\"{BR_URL}\"]"),
+            &format!("\"{peer}\": [2,\"left-pad\",\"{SHA}\",\"{URL}\"]"),
+        );
+        let carried = vlt_edit(
+            &format!("\"{ID}\": [2,\"left-pad\",\"{SHA}\",\"{URL}\"]"),
+            &format!("\"{ID}\": [2,\"left-pad\",\"sha512-P2==\",\"u2\"]"),
+        );
+        assert_eq!(
+            carried_pin_original(&carried, &old),
+            Some(Value::String(format!(
+                "\"{ID}\": [6,\"left-pad\",\"{REG_SHA}\",\"{BR_URL}\"]"
+            )))
+        );
+    }
 }
