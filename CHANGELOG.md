@@ -102,10 +102,6 @@ limits, and required install commands.
 
 ### Fixed
 
-- `remove` and `rollback` share artifact-retention rules, preserving the original
-  blobs of patches left active. Removing one patch no longer destroys another
-  patch's offline rollback data (#559).
-
 - Global mode (`-g`) finds npm, yarn, pnpm, bun, RubyGems and Composer on
   Windows, where they install as `.cmd` / `.bat` shims, instead of reporting
   an empty scan. The yarn and npm-family global lookups no longer run from the
