@@ -60,7 +60,7 @@ use crate::manifest::schema::PatchRecord;
 use crate::patch::apply::{ApplyResult, PatchSources};
 use crate::patch::copy_tree::remove_tree;
 use crate::patch::path_safety::is_safe_single_segment;
-use crate::patch::redirect::gem_line_trailing_options;
+use crate::patch::redirect::{gem_line_tail_blocks_edit, gem_line_trailing_options};
 use crate::utils::fs::{atomic_write_bytes_preserving_mode, read_regular_to_string};
 use crate::utils::purl::{build_gem_purl, parse_gem_purl, purl_qualifier};
 use crate::utils::socket_dir::remove_tree_and_prune;
@@ -1530,15 +1530,12 @@ fn gem_declaration<'a>(trimmed: &'a str, name: &str) -> Option<GemDecl<'a>> {
 /// preserved `source:` (etc.) alongside the `path:` we add would fail every
 /// `bundle` invocation.
 fn rest_blocks_edit(rest: &str) -> Option<String> {
+    if let Some(reason) = gem_line_tail_blocks_edit(rest) {
+        return Some(reason);
+    }
     let code = rest.split('#').next().unwrap_or("").trim();
     if code.is_empty() {
         return None;
-    }
-    if !code.starts_with(',') {
-        return Some("unexpected tokens after the gem name".to_string());
-    }
-    if code.ends_with(',') {
-        return Some("the declaration continues on the next line".to_string());
     }
     for tok in [
         "path:",
@@ -1559,9 +1556,6 @@ fn rest_blocks_edit(rest: &str) -> Option<String> {
                 "the declaration already carries `{tok}` (revert any previous vendoring first)"
             ));
         }
-    }
-    if code.contains(" if ") || code.contains(" unless ") {
-        return Some("conditional declaration".to_string());
     }
     None
 }
@@ -6949,6 +6943,41 @@ mod tests {
         .expect("a conditional declaration must refuse");
         assert!(err.contains("conditional"), "{err}");
 
+        // #340: the shared tail guard also catches continuations and
+        // modifiers the old substring checks missed.
+        for (gemfile, want) in [
+            ("gem \"rack\", platforms: [\n  :mri]\n", "continues"),
+            ("gem \"rack\", :require =>\n  false\n", "continues"),
+            (
+                "gem \"rack\", \"~> 3.1\"\tunless ENV[\"CI\"]\n",
+                "conditional",
+            ),
+            ("gem \"rack\", require: false rescue nil\n", "rescue"),
+            ("gem \"rack\", \"~> 3.1\" if::FEATURE\n", "conditional"),
+            ("gem \"rack\", \"~> 3.1\" unless::FEATURE\n", "conditional"),
+            (
+                "gem \"rack\", \"~> 3.1\" if:enabled == ENV[\"MODE\"].to_sym\n",
+                "conditional",
+            ),
+            (
+                "gem \"rack\", require: <<~REQUIRE_PATH.chomp\n  rack\nREQUIRE_PATH\n",
+                "continues",
+            ),
+            (
+                "gem \"rack\", require: <<'REQUIRE_PATH'\nrack\nREQUIRE_PATH\n",
+                "continues",
+            ),
+            (
+                "gem \"rack\", require: \"#{<<~REQUIRE_PATH}\".chomp\n  rack\nREQUIRE_PATH\n",
+                "continues",
+            ),
+        ] {
+            let err = plan_gemfile_edit(gemfile, "rack", "3.2.6", &rel)
+                .err()
+                .expect("a multi-line or modified declaration must refuse");
+            assert!(err.contains(want), "{gemfile:?}: {err}");
+        }
+
         for gemfile in [
             "gem \"rack\", mypath: \"y\"\n",
             "gem \"rack\", path: File.expand_path(\"x\")\n",
@@ -6957,6 +6986,21 @@ mod tests {
                 .err()
                 .expect("path-shaped options must refuse");
             assert!(err.contains("path:"), "{gemfile:?}: {err}");
+        }
+
+        for options in [
+            "require: { if: \"rack\" }.values",
+            "require: \"<<REQUIRE_PATH\"",
+            "require: '#{<<REQUIRE_PATH}'",
+            "require: \"\\#{<<REQUIRE_PATH}\"",
+            "group: :unless",
+        ] {
+            let gemfile = format!("gem \"rack\", {options}\n");
+            let plan = plan_gemfile_edit(&gemfile, "rack", "3.2.6", &rel).unwrap();
+            let GemfilePlan::Rewrite { new_line, .. } = plan else {
+                panic!("a one-line declaration must rewrite: {gemfile}");
+            };
+            assert!(new_line.ends_with(options), "{new_line}");
         }
 
         // `gemspec name: "rack"` opens with the keyword but continues as an

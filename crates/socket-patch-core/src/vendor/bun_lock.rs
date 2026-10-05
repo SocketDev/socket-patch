@@ -912,6 +912,17 @@ pub(crate) async fn revert_bun_opts(
     // ran; the artifact dir stays behind (and the caller keeps the ledger
     // entry), so only the deletion is skipped.
     if !keep_artifact {
+        if super::npm_flavor::keep_artifact_while_lock_references_it(
+            &mut outcome,
+            project_root,
+            &[BUN_LOCK],
+            &entry.uuid,
+            &uuid_dir_rel,
+        )
+        .await
+        {
+            return outcome;
+        }
         // The last npm-family entry leaves `.socket/vendor/npm/` (and
         // `.socket/vendor/`) empty: the shared helper prunes them so a
         // reverted project carries no vendor residue (non-recursive:
@@ -1001,9 +1012,13 @@ fn revert_one_record(
         }
         return;
     }
-    warnings.push(drifted(format!(
-        "lock entry `{key}` no longer exists; nothing to restore"
-    )));
+    // REMOVED, not drifted (#665): `bun remove` dropped the entry. The
+    // caller keeps the artifact only while the lock still resolves
+    // through it.
+    warnings.push(VendorWarning::new(
+        super::LOCK_ENTRY_REMOVED_CODE,
+        format!("lock entry `{key}` no longer exists; nothing to restore"),
+    ));
 }
 
 // ───────────────────────── vendor-specific classification ─────────────────
@@ -3309,8 +3324,13 @@ mod tests {
         assert!(fx.root().join(fx.rel_tgz()).exists(), "artifact kept");
     }
 
+    /// #665: `bun remove left-pad` deleted the vendored entry line, so
+    /// nothing in bun.lock resolves through the artifact any more. A
+    /// vanished entry is not drift: the revert succeeds and removes the
+    /// unreferenced artifact instead of keeping it (and the ledger entry)
+    /// forever.
     #[tokio::test]
-    async fn vanished_entry_key_drift_keeps() {
+    async fn vanished_entry_drops_the_unreferenced_artifact() {
         let fx = fixture_with(BN3_BEFORE_LOCK, "node_modules/left-pad").await;
         let (_, entry, _) = expect_done(fx.vendor(false).await);
         let entry = entry.unwrap();
@@ -3329,17 +3349,50 @@ mod tests {
 
         let outcome = revert_bun(&entry, fx.root(), false).await;
         assert!(outcome.success, "{:?}", outcome.error);
+        assert!(!outcome.drift_skipped(), "{:?}", outcome.warnings);
         assert!(
             outcome
                 .warnings
                 .iter()
-                .any(|w| w.code == "vendor_lock_entry_drifted"
+                .any(|w| w.code == "vendor_lock_entry_removed"
                     && w.detail.contains("no longer exists; nothing to restore")),
             "{:?}",
             outcome.warnings
         );
-        assert!(outcome.kept_artifact, "drift-skip keeps the artifact");
+        assert!(!outcome.kept_artifact, "{:?}", outcome.warnings);
         assert_eq!(fx.read_lock().await, without_entry, "nothing rewritten");
+        assert!(
+            !fx.root().join(fx.rel_tgz()).exists(),
+            "unreferenced artifact removed"
+        );
+    }
+
+    /// #665 guard: the recorded entry vanished but another entry line still
+    /// resolves through the artifact, so it is kept like a drift-skip.
+    #[tokio::test]
+    async fn vanished_entry_keeps_the_artifact_while_the_lock_references_it() {
+        let fx = fixture_with(BN3_BEFORE_LOCK, "node_modules/left-pad").await;
+        let (_, entry, _) = expect_done(fx.vendor(false).await);
+        let entry = entry.unwrap();
+        let new_line = entry.wiring[0]
+            .new
+            .as_ref()
+            .and_then(Value::as_str)
+            .unwrap();
+        let live = fx.read_lock().await;
+        // Re-key the entry (`"left-pad"` → `"other/left-pad"`): the
+        // recorded key is gone, the tuple still points into our uuid dir.
+        let rekeyed_line = new_line.replacen("\"left-pad\"", "\"other/left-pad\"", 1);
+        assert_ne!(rekeyed_line, new_line, "the re-key must hit");
+        let rekeyed = live.replace(new_line, &rekeyed_line);
+        tokio::fs::write(fx.root().join(BUN_LOCK), &rekeyed)
+            .await
+            .unwrap();
+
+        let outcome = revert_bun(&entry, fx.root(), false).await;
+        assert!(outcome.success, "{:?}", outcome.error);
+        assert!(outcome.kept_artifact, "{:?}", outcome.warnings);
+        assert_eq!(fx.read_lock().await, rekeyed, "nothing rewritten");
         assert!(fx.root().join(fx.rel_tgz()).exists(), "artifact kept");
     }
 

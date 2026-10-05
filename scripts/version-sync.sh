@@ -1,64 +1,19 @@
 #!/usr/bin/env bash
 # Stamps the release version into every packaging artifact that carries one:
 #   - Cargo.toml (workspace version + socket-patch-core exact pin)
+#   - Cargo.lock (the source-less workspace-member entries, so --locked builds)
 #   - npm/socket-patch/package.json (+ optionalDependencies, package-lock.json)
 #   - npm/socket-patch-*/package.json (per-platform packages)
+#
+# Thin wrapper over `scripts/release.py stamp`, which is offline and
+# byte-deterministic: the npm lockfile is edited as JSON (stale platform
+# entries are dropped) instead of being re-resolved against the registry,
+# so the same version always produces the same bytes. Accepts X.Y.Z and
+# X.Y.Z-rc.N.
 set -euo pipefail
 
 VERSION="${1:?Usage: version-sync.sh <version>}"
 
 REPO_ROOT="$(cd "$(dirname "$0")/.." && pwd)"
 
-# Update workspace Cargo.toml version
-sed -i.bak "s/^version = \".*\"/version = \"$VERSION\"/" "$REPO_ROOT/Cargo.toml"
-rm -f "$REPO_ROOT/Cargo.toml.bak"
-
-# Update socket-patch-core workspace dependency version (needed for cargo publish).
-# The version spec is exact-pinned with a leading "=" per the repo's pinning policy.
-sed -i.bak "s/socket-patch-core = { path = \"crates\/socket-patch-core\", version = \".*\" }/socket-patch-core = { path = \"crates\/socket-patch-core\", version = \"=$VERSION\" }/" "$REPO_ROOT/Cargo.toml"
-rm -f "$REPO_ROOT/Cargo.toml.bak"
-
-# Update npm main package version and optionalDependencies versions
-pkg_json="$REPO_ROOT/npm/socket-patch/package.json"
-node -e "
-  const fs = require('fs');
-  const pkg = JSON.parse(fs.readFileSync('$pkg_json', 'utf8'));
-  pkg.version = '$VERSION';
-  if (pkg.optionalDependencies) {
-    for (const dep of Object.keys(pkg.optionalDependencies)) {
-      pkg.optionalDependencies[dep] = '$VERSION';
-    }
-  }
-  fs.writeFileSync('$pkg_json', JSON.stringify(pkg, null, 2) + '\n');
-"
-
-# Refresh the npm wrapper lockfile so package-lock.json stays in sync with the
-# bumped package.json (own version, optionalDependencies). Uses --package-lock-only
-# so node_modules is untouched.
-#
-# The npm major is pinned: the lock's byte shape depends on it (npm >= 11 adds
-# `libc` arrays to platform-package entries that npm 10 omits), and
-# release-lint.sh compares the regenerated lock byte-for-byte against the
-# committed one on every PR. An unpinned npm makes that gate depend on
-# whichever npm the runner or developer happens to have. Bumping this pin
-# requires refreshing the committed lock in the same commit.
-NPM_LOCK_REFRESH_VERSION="10"
-(
-  cd "$REPO_ROOT/npm/socket-patch"
-  npx --yes "npm@$NPM_LOCK_REFRESH_VERSION" install --package-lock-only --ignore-scripts >/dev/null
-)
-
-# Update all per-platform npm package versions
-for platform_dir in "$REPO_ROOT"/npm/socket-patch-*/; do
-  platform_pkg="$platform_dir/package.json"
-  if [ -f "$platform_pkg" ]; then
-    node -e "
-      const fs = require('fs');
-      const pkg = JSON.parse(fs.readFileSync('$platform_pkg', 'utf8'));
-      pkg.version = '$VERSION';
-      fs.writeFileSync('$platform_pkg', JSON.stringify(pkg, null, 2) + '\n');
-    "
-  fi
-done
-
-echo "Synced version to $VERSION"
+exec python3 "$REPO_ROOT/scripts/release.py" --root "$REPO_ROOT" stamp "$VERSION"
