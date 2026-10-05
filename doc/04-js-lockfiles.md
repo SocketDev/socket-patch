@@ -2,7 +2,7 @@
 
 ## Part 4: JavaScript lockfiles (npm, pnpm, yarn, bun, vlt)
 
-_Last checked against main @ 045d7ec on 2026-10-05 by audit-ecosystems (§4.4 pnpm, berry gates, package-lock walks, JSON writers, bun-lock presence, CRLF policies, wiring-kind and lines↔JSON helpers and the 4.5 #2 layering re-checked; the rest is as of `2463257`). Owner: `audit-ecosystems`._
+_Last checked against main @ 4646693 on 2026-10-05 by audit-ecosystems (§4.4 vendored pnpm `package.json` writer re-checked at `4646693`; as of `045d7ec`: pnpm, berry gates, package-lock walks, JSON writers, bun-lock presence, CRLF policies, wiring-kind and lines↔JSON helpers and the 4.5 #2 layering re-checked; the rest is as of `2463257`). Owner: `audit-ecosystems`._
 
 > Scope: `vendor/{npm_*,pnpm_*,yarn_*,bun_*,vlt_*,berry_zip}.rs`, `formats/{pnpm,yarn,bun,registry}`, `crawlers/npm_crawler*`, `vendor/lock_inventory/*`, `vex/discover/{npm,yarn,bun,vlt}.rs`, and the JS parts of `patch/redirect/` and `hosted/vlt.rs`. Line counts are production / inline-test, split at the first top-level `#[cfg(test)] mod`.
 
@@ -76,7 +76,7 @@ Each shares 55-67 distinct lines with `vendor_pnpm`. `read_project`, `preflight_
 - **JSON-pointer escape:** byte-identical `escape_json_pointer_token` (`npm_lock.rs:1022`) and `json_pointer_escape` (`upstream/npm.rs:136`).
 - **JSON re-serialization, three strategies:**
   - `common::JsonLayout`: keeps BOM, indent, EOL and trailer. Every package-lock writer (vendored, hosted, restore) and the npm and berry `package.json` writers use it since #357.
-  - `common::serialize_json(indent)`: detected indent, always LF, no BOM. It still writes vendored pnpm's root `package.json` on vendor and revert ([`pnpm_lock.rs#L326-L327`](https://github.com/SocketDev/socket-patch/blob/045d7ec783d788bf3c5a1310724b51e09fb6505d/crates/socket-patch-core/src/vendor/pnpm_lock.rs#L326-L327)), which is parsed without BOM support, so a CRLF `package.json` comes back LF after `vendor --revert`. {{E53}}
+  - `common::serialize_json(indent)`: detected indent, always LF, no BOM. Vendored pnpm's root `package.json` no longer uses it: it is written through `JsonLayout`, so CRLF and BOM survive vendor and revert (#810). {{E53}}
   - `redirect::serialize_json`: fixed 2-space, LF; now used only for NuGet `packages.lock.json` (hosted and restore).
 - **Wiring lines ↔ JSON:** two identical encoders (`yarn_classic_lock::lines_to_json`, `pnpm_lock::lines_value`) and three decoders that have drifted: yarn's `json_to_lines` refuses a non-string element, while `pnpm_lock::value_lines` and `recover::lines_of` silently drop it. {{E18}}
 - **sha512 SRI formatting** is inlined at `npm_pack.rs:27`, `bun_lock.rs:388` and `vlt_preflight.rs:70`. `utils/digest.rs` has no SRI helper.
@@ -92,7 +92,7 @@ Each shares 55-67 distinct lines with `vendor_pnpm`. `read_project`, `preflight_
 - vendored pnpm refuses CRLF, while hosted pnpm handles it;
 - vendored yarn classic keeps CRLF, while hosted classic normalizes it by hand;
 - berry uses `utils::line_endings::LineEndings`;
-- npm_lock keeps the file's layout through `JsonLayout` (#357), but vendored pnpm's `package.json` writer still normalizes to LF ({{E53}});
+- npm_lock keeps the file's layout through `JsonLayout` (#357), and so does vendored pnpm's `package.json` writer (#810, {{E53}});
 - vlt has its own `strip_cr`.
 
 Five different answers to one question, and every one of them is a bug class (see the open-issue appendix). Across the whole crate there are five terminator rules (any-CRLF, first line, majority, CRLF-only re-expansion, refuse); on main the any-CRLF rule alone is written 14 times, in `common::detect_eol`, a byte-identical `pypi_uv::newline_of` and 12 inline copies, and `gradle::newline_of` uses the first-line rule under the same name. A probe on `045d7ec` gives three answers for one mixed input. {{E16}}
@@ -165,7 +165,7 @@ Each format exposes `parse(&[u8]) -> Model`, `entries()`, `wired_refs()`, `plan_
 ### New findings since the review
 
 - Hosted yarn berry rewrites (majority-normalizes) a mixed-line-ending root `package.json` that vendored mode refuses with `vendor_yarn_berry_mixed_line_endings`; the gates live once per mode. {{E51}}
-- Vendored pnpm writes the root `package.json` with `serialize_json` instead of `JsonLayout`: a CRLF file is rewritten LF and stays LF after `vendor --revert`, and a BOM file is refused as "not a JSON object". npm and berry keep the layout. {{E53}}
+- Vendored pnpm wrote the root `package.json` with `serialize_json` instead of `JsonLayout`, losing CRLF and refusing a BOM; it now uses `JsonLayout` like npm and berry (#810). {{E53}}
 - {{E60}}: the "any `\r\n` → CRLF" terminator rule is written 14 times, mostly outside the npm family (gem, Maven, composer and Cargo restore, Pipenv, `.npmrc`, uv, PEP 723 scripts), and hosted Cargo refuses a mixed `Cargo.lock` that upstream restore re-expands wholesale to CRLF; folded into the line-ending tracking issue.
 
 ---

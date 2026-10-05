@@ -2,7 +2,7 @@
 
 ## Part 3: Hosted mode (redirect, hosted engine, upstream restore, Node addon)
 
-_Last checked against main @ 045d7ec on 2026-10-04 by audit-ecosystems (3.6 vlt dead helpers re-checked; the rest as of `203e092`). Owner: `audit-ecosystems`._
+_Last checked against main @ 4646693 on 2026-10-05 by audit-ecosystems (3.4 NuGet.config readers re-checked; 3.6 vlt dead helpers as of `045d7ec`; the rest as of `203e092`). Owner: `audit-ecosystems`._
 
 > Scope: `patch/redirect/**`, `hosted/**`, `crates/socket-patch-node/**`, CLI `scan/hosted.rs`, `scan/hosted/*`, `hosted_bundle.rs`.
 
@@ -105,8 +105,8 @@ A "one model per format" layer (`formats/`) has been started, and **hosted mode 
 
 - **package-lock.json: four walks and two serializers.** Hosted `serialize_json` (`mod.rs:273`) always writes 2-space JSON. Vendor's serializer preserves the file's indent. Upstream restore uses the hosted one, so hosted rewrites *and rollback* reformat a 4-space or tab-indented lock in full (open issue #324).
 - **yarn.lock: five copies of a `split("\n\n")` + regex grammar** (`mod.rs:2992`, `:3159`, `:3278`, `upstream/npm.rs:289`, `:390`), alongside the shared `scan_blocks` used by vendor, inventory and VEX.
-- **NuGet.config: three readers.** Hosted uses regexes (`mod.rs:4942-4975`), and its splice anchors (`insert_nuget_source`, `nuget_mapping_open_end`) are comment-blind regexes too (#585); vendor's `nuget_feed.rs` blanks comments and then scans; `formats::nuget::parse_config` is a bounded tokenizer used by upstream and VEX. Hosted restore's `remove_source` adds a fourth regex reader. {{E11}}
-  - **Likely bug (verified by reading the code):** hosted `nuget_package_source_keys` (`mod.rs:4956`) runs its regex over raw text without masking `<!-- -->`. A commented-out `<add key="…">` therefore suppresses the nuget.org seed. {{E01}}
+- **NuGet.config: two readers.** Hosted routing and splice anchors now go through `formats::nuget::parse_config`, the bounded tokenizer that upstream restore and VEX use; the hosted regex reader `nuget_package_source_keys` and the regex anchors were deleted (#597). Vendored `nuget_feed.rs` still keeps its own comment-blanking reader ([`parse_config_source_keys`](https://github.com/SocketDev/socket-patch/blob/4646693150cf5efca6222b87092e1620e58566f8/crates/socket-patch-core/src/vendor/nuget_feed.rs#L1053-L1112)) and `find`-based anchors. {{E11}}
+  - A commented-out `<add key="…">` no longer suppresses the nuget.org seed, because hosted reads through the shared reader (#597). {{E01}}
 - **requirements.txt:** `utils/requirements.rs:1-9` says vendor, inventory and VEX share `logical_lines`, but "the hosted requirements rewriter … keeps its own line splitter" (`redirect/requirements.rs:17`). Upstream has a fourth reader.
 - **Cargo.toml: two grammars inside one rewriter.** There are six `LazyLock` regexes plus `classify_cargo_section`, alongside four `toml_edit` parses of the same file. The dependency tables are walked five times across hosted, `utils/cargo_workspace` and VEX.
 - **Gemfile / Gemfile.lock:** `formats/gem` claims to be "the ONE read model", yet `rewrite_gem` still regex-scans CHECKSUMS and the Ruby source, compiling a `Regex::new` **per dependency inside the loop** (`mod.rs:4866-4945`). Open issue #340, which breaks multi-line `gem` declarations, lives here.

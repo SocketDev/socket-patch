@@ -2,7 +2,7 @@
 
 ## Part 6: Discovery, inventory and VEX
 
-_Last checked against main @ 045d7ec on 2026-10-05 by audit-ecosystems (gem lock selection, the go.mod row, 6.4 dead code and the product probe table re-checked). Owner: `audit-ecosystems`._
+_Last checked against main @ 4646693 on 2026-10-05 by audit-ecosystems (6.5 `vex_consumed.rs` and npm alias discovery re-checked at `4646693`; as of `045d7ec`: gem lock selection, the go.mod row, 6.4 dead code and the product probe table re-checked). Owner: `audit-ecosystems`._
 
 > Scope: `vex/**` (incl. `vex/discover/*`), `crawlers/**`, `formats/**`, `vendor/lock_inventory/*`, and the CLI consumers `vex.rs`, `vex_sources.rs`, `vex_consumed.rs`, `scan/discovery.rs`, `context.rs`, `list.rs`, `ecosystem_dispatch.rs`.
 
@@ -94,7 +94,7 @@ Across the repo that is **eight hand-rolled XML scanners**, 4–5 independent wa
 
 - **`verify.rs` is small** (346 production lines): a hash check per record, the vendored artifact basis, and `HostedCopies`. The complexity lives elsewhere:
   - **`vex_sources.rs`** (976) merges five sources: manifest, vendor ledger, *legacy* redirect ledger, discovery refs and API-fetched records. It has 5 omission gates, 7 note codes and 3 `Basis` kinds.
-  - **`vex_consumed.rs`** (596) decides "which installed copy the hosted build consumes". That covers cargo registry host-hash matching, Maven `-socket.<hex8>` dirs, the Go replacement module, and npm alias and store variants. **This is a third copy of package-manager layout knowledge** (after the crawlers and `vendor/*`), and it lives in the CLI.
+  - **`vex_consumed.rs`** (1,173 lines on `4646693`, up from 596) decides "which installed copy the hosted build consumes". That covers cargo registry host-hash matching, Maven `-socket.<hex8>` dirs, the Go replacement module, and npm alias and store variants. **This is a third copy of package-manager layout knowledge** (after the crawlers and `vendor/*`), and it lives in the CLI. Its npm alias walk now duplicates the core resolver's `alias_copies` (#738), and the Maven suffix is rebuilt beside two core builders and three parsers of the same grammar. {{E40}}
   - **Discovery liveness** (`discover/mod.rs:1490-1990`, ~500 lines), including the raw-text fallbacks `vendored_wiring_in_files` and `hosted_wiring_in_files`.
 - **`product.rs`** (659 production lines) only auto-detects the top-level product purl:
   - ~200 lines parse the git `origin` remote;
@@ -160,6 +160,8 @@ cli: ProjectContext owns ONE Inventory; one EmbeddedVex helper
 **Risks.** Discovery is fail-closed, security-sensitive code. The golden snapshots and the ~40K lines of end-to-end tests are the safety net, so migrate one format at a time behind them. The `CLI_CONTRACT` warning codes must not change. Scoping the cache crawls changes output for lockless cargo, Gradle and NuGet projects, so keep a fallback flag for those.
 
 ### New findings since the review
+
+- npm alias discovery is written twice: core `NpmCrawler::alias_copies` (apply, rollback, the VEX installed lookup) and the CLI's `vex_consumed` walk (hosted VEX). They have drifted on case: on Linux, an alias dir whose name differs from the package only by case is a copy for VEX but invisible to apply (proven by execution). This is behind #851 and #852. {{E62}}
 
 - Three rules pick the live Bundler lock: hosted, vendored and the crawler use `LoadedManifest::pair` (`gems.rb` → `gems.locked`); lock inventory reads only `Gemfile.lock`; VEX discovery reads both. A `gems.rb` project is invisible to the inventory (scan supplement, in-memory hosted engine, VEX liveness), and a stale `Gemfile.lock` twin is read instead. {{E56}}
 

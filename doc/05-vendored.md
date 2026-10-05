@@ -2,7 +2,7 @@
 
 ## Part 5: Vendored mode and the non-JS backends
 
-_Last checked against main @ 045d7ec on 2026-10-05 by audit-ecosystems (5.4 Python, Cargo, Maven XML, Gem, Go and CRLF helpers; 5.6 scaffolding; the vendored-reference scan behind repair and the orphan sweeps). Owner: audit-ecosystems._
+_Last checked against main @ 4646693 on 2026-10-05 by audit-ecosystems (5.4 NuGet, Poetry/PDM and Gem re-checked at `4646693`; as of `045d7ec`: 5.4 Python, Cargo, Maven XML, Gem, Go and CRLF helpers; 5.6 scaffolding; the vendored-reference scan behind repair and the orphan sweeps). Owner: audit-ecosystems._
 
 > Scope: `vendor/` framework (`mod`, `common`, `state`, `verify`, `registry_fetch`, `service_fetch`, `prestage`, `reuse`, `redownload`, `ledger_snapshots`, `parse_memo`, `path`, `source`, `toml_surgery`, `lock_inventory`); backends for cargo, gem, pypi (×10 files), golang, composer, nuget, maven and `jvm/`; related `utils/` parsers; and the CLI `vendor.rs` + `vendored_backend/`.
 
@@ -118,15 +118,12 @@ Revert/restore/unwind code in the non-npm backends totals **about 3,540 lines**:
   - `redirect/upstream/nuget.rs:39` uses a regex;
   - `jvm/gradle.rs:1538` checks for preceding whitespace;
   - `formats/nuget/mod.rs:41` does a real tag parse.
-- The NuGet writers (`nuget_feed.rs`, the hosted splicer) never use the shared reader `formats::nuget::parse_config` that VEX uses, **so reader and writer can disagree about what a file contains**. {{E11}}
+- The vendored NuGet writer (`nuget_feed.rs`) never uses the shared reader `formats::nuget::parse_config`, **so its reader and writer can disagree about what a file contains**. The hosted splicer now uses it (#597). {{E11}}
 - `pom.xml` alone has seven scanners (checked on `045d7ec`): `formats::maven::parse_pom` (VEX, restore gate); the hosted rewriter's raw regex (`MAVEN_DEPENDENCY_BLOCK_RE`, `insert_maven_*`), which upstream restore reuses and which masks nothing; vendored `maven_repo.rs` (`comment_spans`/`profiles_spans`, plus a second `declares_modules`); the reactor's `mask` + `Doc` tree and, in the same file, `scan_pom_project` (a depscan port); and the crawler's and `vex/product.rs`'s own readers. None of the three writers (hosted, restore, vendored single-pom) locates elements through a reader. Target: one masked element tree in `formats::maven` that readers and splicing writers both query. {{E10}}
 - The Maven share of the open backlog is mostly this: #259 "edits commented-out, plugin and profile markup", #342 "adds a second section when the existing one is self-closed or has a comment", #683 (`<exclusions>` first) and {{E55}}.
 
 **Python:**
-- `utils/poetry_lock.rs` and `utils/pdm_lock.rs` are near-twins with mirrored function sets (`rewrite_*_lock`, `*_with_edits`, `plan_*_rewrite`, `*_lock_edits`, `*_lock_fragments`, `extend_span`, `pair_*`).
-  - After renaming, `poetry_lock_edits` and `pdm_lock_edits` are **identical**.
-  - `pair_*` differs by three lines: pdm has a shape check that poetry lacks. For Poetry this is unreachable, because a rewrite pairs fragments of one document before and after its own edit, so the fragment count cannot change.
-  - `next_header_end`, the rewrite struct with `edits()`, the parse holder and the finish step (render → reparse → pair → splice) are also copied. The finish steps differ only in their line-ending rule, which is a real drift: on a mixed-line-ending lock, Poetry turns the edited unit CRLF and PDM turns it LF ([`poetry_lock.rs#L366-L369`](https://github.com/SocketDev/socket-patch/blob/045d7ec783d788bf3c5a1310724b51e09fb6505d/crates/socket-patch-core/src/utils/poetry_lock.rs#L366-L369), [`pdm_lock.rs#L268`](https://github.com/SocketDev/socket-patch/blob/045d7ec783d788bf3c5a1310724b51e09fb6505d/crates/socket-patch-core/src/utils/pdm_lock.rs#L268)). {{E13}} {{E54}}
+- `utils/poetry_lock.rs` and `utils/pdm_lock.rs` now share one fragment-splice engine, [`utils/lock_fragments.rs`](https://github.com/SocketDev/socket-patch/blob/4646693150cf5efca6222b87092e1620e58566f8/crates/socket-patch-core/src/utils/lock_fragments.rs) (344 lines: the parse holder, pairing, splicing and one `majority_terminator` line-ending rule). Only the per-format fragment ownership and refusals stay in each file (#703). {{E13}} {{E54}}
 - `vendor/pypi_{poetry,pdm,pipenv}.rs` repeat one skeleton:
   - `load_*_project`
   - `classify_dependency`
@@ -141,8 +138,8 @@ Revert/restore/unwind code in the non-npm backends totals **about 3,540 lines**:
   - They have drifted, proven by execution: a BOM manifest is invisible to the crawler but read by VEX and `cargo_tag`; `[project]` and dotted keys are read only by `cargo_tag`; `[package] junk` (invalid TOML) is accepted only by the crawler. {{E15}}
   - Hosted mode plans the dependency pin itself with a line scanner (`plan_cargo_toml`, six regexes), then re-checks it with a second, `toml_edit` classifier (`validate_cargo_toml_pins`). `CargoRegistryPins`, a `#[cfg(test)]` oracle and upstream restore's `unpin_line` are three more line-level readers of the same declarations. Vendored edits only through `toml_edit`. The scanner refuses an inline table whose `features` array spans lines, which is valid TOML and accepted by cargo, so hosted skips a crate that vendors fine. {{E57}}
 
-**Gem:** `vendor/gem.rs` imports three token helpers from `formats::gem` and keeps its own section model (`section_span` / `section_end`, which take the *first* line equal to a header). With `formats::gem::parse` and hosted's `GemLockSection` that makes three section models and three DEPENDENCIES-name parsers; the name rules agree on Bundler-written entries. {{E19}}
-  - The section models have drifted, proven by execution: Bundler 2 writes one `GEM` section per source, and vendored `edit_lock` looks only in the first, so a gem from any later source (rubygems.org, when a private source sorts first) is refused with "GEM specs has no entry", while hosted and the shared parser handle it. {{E59}}
+**Gem:** `vendor/gem.rs` imports three token helpers from `formats::gem` and keeps its own section model: `section_span` / `section_end` for DEPENDENCIES and CHECKSUMS, plus [`gem_section_spans` / `record_gem_section`](https://github.com/SocketDev/socket-patch/blob/4646693150cf5efca6222b87092e1620e58566f8/crates/socket-patch-core/src/vendor/gem.rs#L1947-L1975), added by #805. With `formats::gem::parse` and hosted's `GemLockSection`, that makes three section models and three DEPENDENCIES-name parsers; the name rules agree on Bundler-written entries. {{E19}}
+  - The models had drifted: vendored `edit_lock` looked only in the first `GEM` section, so a gem from a later source was refused. It now searches every GEM section, and refuses a spec listed in two (#805). {{E59}}
 
 **Go:** `go_mod_edit.rs` is properly shared (9 users) but lives under `vendor/`. `crawlers/go_crawler.rs:63` still has its own `parse_go_mod_module`, which has no production caller; the live `module` reader is `vex/product.rs`'s own, and both misread Go's block form `module ( … )` as the module `(`. {{E19}}
 
@@ -150,7 +147,7 @@ Revert/restore/unwind code in the non-npm backends totals **about 3,540 lines**:
 - **CRLF:** four policies for the same "`toml_edit` emits LF" problem:
   - `line_endings` refuses mixed files;
   - `python_lock` converts CRLF-only files and leaves mixed files as LF;
-  - `poetry_lock` has its own inline rule: any CRLF turns the whole rendering CRLF, which disagrees with `python_lock` on mixed files {{E54}};
+  - `utils/lock_fragments` (Poetry and PDM) re-terminates spliced lines with `majority_terminator` (#703) {{E54}};
   - `cargo_manifest` aligns lines with an LCS diff.
 
   There are also ad-hoc helpers in four more files: on main, `common::detect_eol`, `pypi_uv::newline_of` and `gradle::newline_of` (a different, first-line rule under the same name), plus inline any-CRLF copies in `maven_reactor.rs` (×2) and `pypi_pipenv.rs`. One classifier is the target. {{E16}}
@@ -251,10 +248,10 @@ Old `kind`s are translated into `SpliceRecord`s when the ledger loads, so legacy
 ### New findings since the review
 
 - {{E61}}: the vendored-reference scan behind `repair`, the `vendor` stranded-reference gate and the orphan sweeps never sees NuGet or Maven wiring. `nuget.config` and `pom.xml` lack the `VENDORED` registry role, and both backends reference the bare uuid directory, which `parse_vendor_path` rejects (it needs a leaf). So with a missing ledger entry, `vendor --revert` and the vendored gc delete a feed or repository that `nuget.config` / `pom.xml` still name (proven by execution). The `eco == "maven2"` arm of the stranded-reference gate is dead.
-- {{E59}}: vendored gem `edit_lock` searches only the first `GEM` section of `Gemfile.lock`. Bundler 2 writes one per source, so in a project with a private source that sorts first, every rubygems.org gem is refused with "GEM specs has no entry"; see 5.4.
+- {{E59}}: vendored gem `edit_lock` searched only the first `GEM` section of `Gemfile.lock`, so a gem from a later source was refused; fixed by #805; see 5.4.
 - {{E58}}: production `pub fn`s with no production caller, orphaned by #277: `VendorEntry::committed_artifact_intact` and `go_sum_edit::remove_lines` (no reference at all), plus test-only helpers compiled into production (`cargo_tag::copy_manifest_tag`, `jvm::apply::read_project_file`). The hosted-vlt half is in Part 3.
 - {{E55}}: vendored Maven decides "is this a reactor?" twice. `jvm::detect` uses the reactor's `Doc`-based `declares_modules`, which ignores plugin `<configuration><modules>`, then the legacy single-pom path re-checks with its own comment-stripping `declares_modules` and refuses `vendor_maven_multimodule_unsupported`. That refusal fires only on the disagreement, so every `maven-ear-plugin` project is refused; see 5.4.
-- {{E54}}: the Poetry and PDM lock rewriters restore line endings with different rules, so a mixed-line-ending lock's edited unit becomes CRLF under Poetry and LF under PDM; see 5.4.
+- {{E54}}: the Poetry and PDM lock rewriters restored line endings with different rules; they now share `lock_fragments` and its majority rule (#703); see 5.4.
 - {{E49}}: hosted Pipenv used to reject its own pins on path-prefixed `--patch-server-url` origins and sdists. Both private grammars (`owned_url`'s segment count, `is_socket_hosted_reference`) are deleted; Pipenv now uses `hosted_pypi_reference` (#572); see 5.4.
 
 ---
