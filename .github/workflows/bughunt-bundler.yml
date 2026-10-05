@@ -9,7 +9,7 @@ jobs:
     strategy:
       fail-fast: false
       matrix:
-        os: [macos-14, macos-15, windows-latest]
+        os: [macos-14]
     runs-on: ${{ matrix.os }}
     timeout-minutes: 45
     defaults:
@@ -82,11 +82,6 @@ jobs:
             cd "$W"
           }
           if [ "$RUNNER_OS" = macOS ]; then
-            # Cell 1: macOS system ruby, --user-install
-            /usr/bin/ruby -v; /usr/bin/gem env | grep -A4 "GEM PATHS"
-            /usr/bin/gem install --user-install colorize -v 0.8.1 --no-document
-            PATH="/usr/bin:$PATH" cycle sys-user /usr/bin/ruby
-            /usr/bin/gem uninstall --user-install colorize -x -a >/dev/null 2>&1
             # Cell 2: system ruby, root-owned /Library/Ruby/Gems (non-writable)
             sudo /usr/bin/gem install colorize -v 0.8.1 --no-document
             SG=$(/usr/bin/ruby -e 'print Gem.default_dir')
@@ -94,13 +89,10 @@ jobs:
             PATH="/usr/bin:$PATH" cycle sys-root /usr/bin/ruby
             PATH="/usr/bin:$PATH" cycle sys-root-prefix /usr/bin/ruby --global-prefix "$SG/gems"
             sudo /usr/bin/gem uninstall colorize -x -a >/dev/null 2>&1
-            # Cell 3: Homebrew ruby
-            brew install ruby >/dev/null 2>&1 || brew install ruby
-            BR="$(brew --prefix ruby)/bin"; "$BR/ruby" -v
-            "$BR/gem" install colorize -v 0.8.1 --no-document
-            PATH="$BR:$PATH" cycle brew "$BR/ruby"
-            PATH="$BR:$PATH" cycle brew-prefix "$BR/ruby" --global-prefix "$("$BR/ruby" -e 'print Gem.dir')/gems"
+            for f in "$W"/cwd-sys-root*/*.json "$W"/cwd-sys-root*/*.err "$W"/cwd-sys-root*/vex.out; do echo "===== $f"; cat "$f"; done
+            ls -la "$SG/gems/colorize-0.8.1/lib"; ls -la "$W"/cwd-sys-root/.socket 2>&1
           fi
+          exit 0
           RB=$(command -v ruby); ruby -v
           # Cell 4: unicode + space --global-prefix (GEM_HOME)
           GH="$RUNNER_TEMP/gh ü"; mkdir -p "$GH"
