@@ -691,3 +691,558 @@ fn vex_reports_an_unreadable_jvm_layout_instead_of_an_unwired_patch() {
         }
     }
 }
+
+// ── Gradle: one case per vendored-Gradle issue (#395 #428 #429 #461 #487
+// #511 #533), plus the repairs that restore what each adds ──
+
+const FOO_JAR: &str = "proj/.socket/vendor/gradle/org/example/foo/1.0/foo-1.0.jar";
+const FOO_TREE: &str = "proj/.socket/vendor/gradle/org/example/foo/1.0";
+const FOO_METADATA: &str = "proj/.socket/vendor/gradle/org/example/foo/maven-metadata.xml";
+const FOO_MAVEN_TREE: &str = "proj/.socket/vendor/maven2/org/example/foo/1.0-socket.1d3c1fd2";
+
+/// `socket(root, args)` run from `cwd` (relative to `root`) instead of
+/// the project root; the fixture service reads `cwd`'s manifest.
+fn socket_in(root: &Path, cwd: &str, args: &[&str]) -> (Option<i32>, serde_json::Value) {
+    let mut cmd = Command::new(env!("CARGO_BIN_EXE_socket-patch"));
+    for (k, _) in std::env::vars_os() {
+        if k.to_string_lossy().starts_with("SOCKET_") {
+            cmd.env_remove(&k);
+        }
+    }
+    let dir = root.join(cwd);
+    let _fixture = prebuilt_common::prepare_command(
+        &mut cmd,
+        &dir,
+        args,
+        &[("MAVEN_REPO_LOCAL", root.join("m2").to_str().unwrap())],
+    );
+    let out = cmd
+        .args(["--json", "--cwd", dir.to_str().unwrap()])
+        .env("SOCKET_TELEMETRY_DISABLED", "1")
+        .env("SOCKET_NO_CONFIG", "1")
+        .env("MAVEN_REPO_LOCAL", root.join("m2"))
+        .env_remove("M2_HOME")
+        .output()
+        .expect("run socket-patch");
+    let stdout = String::from_utf8_lossy(&out.stdout).into_owned();
+    let env = serde_json::from_str(&stdout).unwrap_or_else(|e| {
+        panic!(
+            "{args:?}: not JSON ({e})\n{stdout}\n{}",
+            String::from_utf8_lossy(&out.stderr)
+        )
+    });
+    (out.status.code(), env)
+}
+
+/// `vendor` refuses with `vendor_jvm_shape_unsupported` and `reason`, and
+/// writes nothing.
+fn assert_refused(root: &Path, reason: &str, also: &str) {
+    let before = snapshot(root);
+    let (code, env) = socket(root, &["vendor"]);
+    assert_ne!(code, Some(0), "{env}");
+    let event = env["events"]
+        .as_array()
+        .unwrap()
+        .iter()
+        .find(|e| e["action"] == "failed")
+        .unwrap_or_else(|| panic!("no failed event: {env}"));
+    let error = event["error"].as_str().unwrap_or_default();
+    assert!(
+        error.starts_with(&format!("reason: {reason}: ")) && error.contains(also),
+        "{env}"
+    );
+    assert_eq!(snapshot(root), before, "a refusal writes nothing");
+}
+
+fn write(root: &Path, rel: &str, body: &[u8]) {
+    let path = root.join(rel);
+    std::fs::create_dir_all(path.parent().unwrap()).unwrap();
+    std::fs::write(path, body).unwrap();
+}
+
+fn crlf(text: &[u8]) -> Vec<u8> {
+    String::from_utf8(text.to_vec())
+        .unwrap()
+        .replace("\r\n", "\n")
+        .replace('\n', "\r\n")
+        .into_bytes()
+}
+
+/// #395: a `pom.xml` beside the Gradle build vendors both builds in one
+/// entry: the suffixed Maven tree and pin, and the Gradle tree and apply
+/// line. `--check` and `vex` see both; the revert restores every byte.
+#[test]
+fn gradle_vendor_395_mixed_root_vendors_both_builds() {
+    let tmp = tempfile::tempdir().unwrap();
+    let root = tmp.path();
+    fixture(root, Shape::Gradle, &[("foo", FOO_UUID)]);
+    write(
+        root,
+        "proj/pom.xml",
+        b"<project>\n  <modelVersion>4.0.0</modelVersion>\n  <groupId>com.x</groupId>\n  <artifactId>app</artifactId>\n  <version>1</version>\n  <dependencies>\n    <dependency><groupId>org.example</groupId><artifactId>foo</artifactId><version>1.0</version></dependency>\n  </dependencies>\n</project>\n",
+    );
+    let pristine = snapshot(root);
+    let env = ok(root, &["vendor"]);
+    assert_eq!(env["summary"]["applied"], 1, "{env}");
+    assert!(root.join(FOO_JAR).is_file());
+    assert!(root
+        .join(FOO_MAVEN_TREE)
+        .join("foo-1.0-socket.1d3c1fd2.jar")
+        .is_file());
+    assert!(std::fs::read_to_string(root.join("proj/pom.xml"))
+        .unwrap()
+        .contains("1.0-socket.1d3c1fd2"));
+    assert!(std::fs::read_to_string(root.join("proj/settings.gradle"))
+        .unwrap()
+        .contains("apply from: '.socket/gradle/socket-patch.settings.gradle'"));
+    ok(root, &["vendor", "--check"]);
+    let vex = root.join("vex.json");
+    ok(
+        root,
+        &[
+            "vex",
+            "-O",
+            vex.to_str().unwrap(),
+            "--product",
+            "pkg:generic/x@1",
+        ],
+    );
+    let doc: serde_json::Value = serde_json::from_slice(&std::fs::read(&vex).unwrap()).unwrap();
+    assert_eq!(doc["statements"][0]["status"], "not_affected", "{doc}");
+    std::fs::remove_file(vex).unwrap();
+    ok(root, &["vendor", "--revert"]);
+    assert_eq!(snapshot(root), pristine);
+}
+
+/// #395 repair: both trees of a mixed root come back from one download.
+#[test]
+fn gradle_vendor_395_repair_mixed_root() {
+    let tmp = tempfile::tempdir().unwrap();
+    let root = tmp.path();
+    fixture(root, Shape::Gradle, &[("foo", FOO_UUID)]);
+    write(
+        root,
+        "proj/pom.xml",
+        b"<project><modelVersion>4.0.0</modelVersion><groupId>com.x</groupId><artifactId>app</artifactId><version>1</version><dependencies><dependency><groupId>org.example</groupId><artifactId>foo</artifactId><version>1.0</version></dependency></dependencies></project>\n",
+    );
+    ok(root, &["vendor"]);
+    let vendored = snapshot(root);
+    std::fs::remove_dir_all(root.join(FOO_TREE)).unwrap();
+    std::fs::remove_dir_all(root.join(FOO_MAVEN_TREE)).unwrap();
+    let env = ok(root, &["repair"]);
+    assert_eq!(env["events"][0]["action"], "rebuilt", "{env}");
+    let mut repaired = snapshot(root);
+    let mut want = vendored.clone();
+    repaired.remove(".socket/vendor/state.json");
+    want.remove(".socket/vendor/state.json");
+    assert_eq!(repaired, want);
+    ok(root, &["vendor", "--check"]);
+}
+
+/// #428: vendoring from a subproject refuses with `not_build_root` and
+/// writes nothing, the nested settings file included.
+#[test]
+fn gradle_vendor_428_subproject_refuses() {
+    let tmp = tempfile::tempdir().unwrap();
+    let root = tmp.path();
+    fixture(root, Shape::Gradle, &[("foo", FOO_UUID)]);
+    std::fs::create_dir_all(root.join("proj/.git")).unwrap();
+    for name in ["manifest.json", "blobs"] {
+        let from = root.join("proj/.socket").join(name);
+        let to = root.join("proj/app/.socket").join(name);
+        std::fs::create_dir_all(to.parent().unwrap()).unwrap();
+        if from.is_dir() {
+            std::fs::create_dir_all(&to).unwrap();
+            for e in std::fs::read_dir(&from).unwrap() {
+                let e = e.unwrap();
+                std::fs::copy(e.path(), to.join(e.file_name())).unwrap();
+            }
+        } else {
+            std::fs::copy(&from, &to).unwrap();
+        }
+    }
+    let before = snapshot(root);
+    let (code, env) = socket_in(root, "proj/app", &["vendor"]);
+    assert_ne!(code, Some(0), "{env}");
+    let event = &env["events"][0];
+    assert_eq!(event["errorCode"], "vendor_jvm_shape_unsupported", "{env}");
+    assert!(
+        event["error"]
+            .as_str()
+            .unwrap_or_default()
+            .starts_with("reason: not_build_root: run vendor from Gradle root "),
+        "{env}"
+    );
+    assert_eq!(snapshot(root), before);
+    assert!(!root.join("proj/app/settings.gradle").exists());
+}
+
+/// #429: a `core.autocrlf=true` checkout (every text file CRLF) passes
+/// `vendor --check`, and `vendor --revert` removes every owned file.
+#[test]
+fn gradle_vendor_429_crlf_checkout_checks_and_reverts_clean() {
+    let tmp = tempfile::tempdir().unwrap();
+    let root = tmp.path();
+    fixture(root, Shape::Gradle, &[("foo", FOO_UUID)]);
+    write(
+        root,
+        "proj/buildSrc/build.gradle",
+        b"plugins { id 'groovy-gradle-plugin' }\n",
+    );
+    let mut pristine = snapshot(root);
+    ok(root, &["vendor"]);
+    let text_files = [
+        "proj/settings.gradle",
+        "proj/app/build.gradle",
+        "proj/buildSrc/build.gradle",
+        "proj/buildSrc/settings.gradle",
+        "proj/.socket/gradle/socket-patch.settings.gradle",
+        "proj/.socket/gradle/.gitattributes",
+        "proj/.socket/vendor/.gitattributes",
+        "proj/.socket/vendor/gradle-index.tsv",
+        "proj/.socket/vendor/gradle/.gitattributes",
+        FOO_METADATA,
+    ];
+    for rel in text_files {
+        let bytes = std::fs::read(root.join(rel)).unwrap();
+        std::fs::write(root.join(rel), crlf(&bytes)).unwrap();
+        if let Some(Some(body)) = pristine.get_mut(rel.strip_prefix("proj/").unwrap()) {
+            *body = crlf(body);
+        }
+    }
+    let env = ok(root, &["vendor", "--check"]);
+    assert_eq!(env["summary"]["verified"], 1, "{env}");
+    ok(root, &["vendor", "--revert"]);
+    assert_eq!(snapshot(root), pristine);
+}
+
+/// #461: an `exclusiveContent` rule for the group in a subproject's build
+/// script refuses, naming that file.
+#[test]
+fn gradle_vendor_461_subproject_rule_refuses() {
+    let tmp = tempfile::tempdir().unwrap();
+    let root = tmp.path();
+    fixture(root, Shape::Gradle, &[("foo", FOO_UUID)]);
+    write(
+        root,
+        "proj/app/build.gradle",
+        b"plugins { id 'java' }\nrepositories {\n  exclusiveContent {\n    forRepository { mavenCentral() }\n    filter { includeGroup 'org.example' }\n  }\n}\ndependencies { implementation 'org.example:foo:1.0' }\n",
+    );
+    assert_refused(
+        root,
+        "gradle_exclusive_content_conflict",
+        "app/build.gradle",
+    );
+}
+
+/// #487: pgp-only verification entries of the vendored pom and its parent
+/// get a `sha256` beside the `<pgp>`; `--check` passes and the revert is
+/// byte-exact.
+#[test]
+fn gradle_vendor_487_pgp_only_entries_get_a_checksum() {
+    let tmp = tempfile::tempdir().unwrap();
+    let root = tmp.path();
+    fixture(root, Shape::Gradle, &[("foo", FOO_UUID)]);
+    let foo_pom = b"<project><modelVersion>4.0.0</modelVersion><parent><groupId>org.example</groupId><artifactId>parent</artifactId><version>1</version></parent><artifactId>foo</artifactId><version>1.0</version></project>";
+    write(root, "m2/org/example/foo/1.0/foo-1.0.pom", foo_pom);
+    let parent_pom = b"<project><modelVersion>4.0.0</modelVersion><groupId>org.example</groupId><artifactId>parent</artifactId><version>1</version><packaging>pom</packaging></project>";
+    write(root, "m2/org/example/parent/1/parent-1.pom", parent_pom);
+    let pgp = |name: &str| {
+        format!("         <artifact name=\"{name}\">\n            <pgp value=\"DD0CDDD2B4838EC95727B94B4C77A9C911D46A19\"/>\n         </artifact>\n")
+    };
+    let original = format!(
+        "<?xml version=\"1.0\" encoding=\"UTF-8\"?>\n<verification-metadata>\n   <configuration>\n      <verify-metadata>true</verify-metadata>\n      <verify-signatures>true</verify-signatures>\n   </configuration>\n   <components>\n      <component group=\"org.example\" name=\"foo\" version=\"1.0\">\n{}{}      </component>\n      <component group=\"org.example\" name=\"parent\" version=\"1\">\n{}      </component>\n   </components>\n</verification-metadata>\n",
+        pgp("foo-1.0.jar"),
+        pgp("foo-1.0.pom"),
+        pgp("parent-1.pom")
+    );
+    write(
+        root,
+        "proj/gradle/verification-metadata.xml",
+        original.as_bytes(),
+    );
+    ok(root, &["vendor"]);
+    let text = std::fs::read_to_string(root.join("proj/gradle/verification-metadata.xml")).unwrap();
+    for (name, bytes) in [
+        ("foo-1.0.pom", &foo_pom[..]),
+        ("parent-1.pom", &parent_pom[..]),
+    ] {
+        let want = format!(
+            "         <artifact name=\"{name}\">\n            <pgp value=\"DD0CDDD2B4838EC95727B94B4C77A9C911D46A19\"/>\n            <sha256 value=\"{}\" origin=\"socket-patch\"/>\n         </artifact>\n",
+            hex::encode(Sha256::digest(bytes))
+        );
+        assert!(text.contains(&want), "{name}:\n{text}");
+    }
+    ok(root, &["vendor", "--check"]);
+    ok(root, &["vendor", "--revert"]);
+    assert_eq!(
+        std::fs::read_to_string(root.join("proj/gradle/verification-metadata.xml")).unwrap(),
+        original
+    );
+}
+
+/// #511: the tree carries the GA's derived `maven-metadata.xml`; a
+/// deleted one is repaired; a range admitting no vendored version
+/// refuses.
+#[test]
+fn gradle_vendor_511_derived_metadata_repair_and_range_refusal() {
+    let tmp = tempfile::tempdir().unwrap();
+    let root = tmp.path();
+    fixture(root, Shape::Gradle, &[("foo", FOO_UUID)]);
+    write(
+        root,
+        "proj/app/build.gradle",
+        b"plugins { id 'java' }\nrepositories { mavenCentral() }\ndependencies { implementation 'org.example:foo:[0.9,1.1)' }\n",
+    );
+    let env = ok(root, &["vendor"]);
+    assert!(
+        env.to_string().contains("reason: range_declared:"),
+        "the range is noted: {env}"
+    );
+    let metadata = std::fs::read_to_string(root.join(FOO_METADATA)).unwrap();
+    assert!(
+        metadata.contains("<versions>\n      <version>1.0</version>\n    </versions>"),
+        "{metadata}"
+    );
+    std::fs::remove_file(root.join(FOO_METADATA)).unwrap();
+    let env = ok(root, &["repair"]);
+    assert_eq!(env["events"][0]["action"], "rebuilt", "{env}");
+    assert_eq!(
+        std::fs::read_to_string(root.join(FOO_METADATA)).unwrap(),
+        metadata
+    );
+    ok(root, &["vendor", "--check"]);
+
+    let tmp = tempfile::tempdir().unwrap();
+    let root = tmp.path();
+    fixture(root, Shape::Gradle, &[("foo", FOO_UUID)]);
+    write(
+        root,
+        "proj/app/build.gradle",
+        b"plugins { id 'java' }\nrepositories { mavenCentral() }\ndependencies { implementation 'org.example:foo:[2.0,3.0)' }\n",
+    );
+    assert_refused(root, "gradle_range_excludes_vendored", "app/build.gradle");
+}
+
+/// #533: a declared classifier is vendored beside the jar (and a deleted
+/// one repaired); one that exists nowhere refuses.
+#[test]
+fn gradle_vendor_533_repair_restores_classifier() {
+    let tmp = tempfile::tempdir().unwrap();
+    let root = tmp.path();
+    fixture(root, Shape::Gradle, &[("foo", FOO_UUID)]);
+    write(
+        root,
+        "proj/app/build.gradle",
+        b"plugins { id 'java' }\nrepositories { mavenCentral() }\ndependencies {\n  implementation 'org.example:foo:1.0'\n  testImplementation 'org.example:foo:1.0:tests'\n}\n",
+    );
+    let pristine = snapshot(root);
+    assert_refused(root, "classifier_unavailable", "foo:1.0:tests");
+    let tests_jar = jar(b"TESTS\n");
+    write(root, "m2/org/example/foo/1.0/foo-1.0-tests.jar", &tests_jar);
+    ok(root, &["vendor"]);
+    let vendored = root.join(FOO_TREE).join("foo-1.0-tests.jar");
+    assert_eq!(std::fs::read(&vendored).unwrap(), tests_jar);
+    let index = std::fs::read_to_string(root.join("proj/.socket/vendor/gradle-index.tsv")).unwrap();
+    assert!(
+        index.contains("org/example/foo/1.0/foo-1.0-tests.jar\t"),
+        "{index}"
+    );
+    ok(root, &["vendor", "--check"]);
+    // A re-run keeps the committed classifier, declared or not (an
+    // unindexed file in the tree would fail the build).
+    let env = ok(root, &["vendor"]);
+    assert_eq!(env["events"][0]["errorCode"], "already_vendored", "{env}");
+    let declared = std::fs::read(root.join("proj/app/build.gradle")).unwrap();
+    write(
+        root,
+        "proj/app/build.gradle",
+        b"plugins { id 'java' }\nrepositories { mavenCentral() }\ndependencies { implementation 'org.example:foo:1.0' }\n",
+    );
+    ok(root, &["vendor"]);
+    assert_eq!(std::fs::read(&vendored).unwrap(), tests_jar);
+    ok(root, &["vendor", "--check"]);
+    write(root, "proj/app/build.gradle", &declared);
+    std::fs::remove_file(&vendored).unwrap();
+    let env = ok(root, &["repair"]);
+    assert_eq!(env["events"][0]["action"], "rebuilt", "{env}");
+    assert_eq!(std::fs::read(&vendored).unwrap(), tests_jar);
+    ok(root, &["vendor", "--revert"]);
+    assert_eq!(snapshot(root), pristine);
+}
+
+/// #533 + VEX: a declared classifier holding its own unpatched copy of
+/// the patched member is vendored with a degraded warning, and `vex`
+/// does not attest the package (the build may consume that copy).
+#[test]
+fn gradle_vendor_533_unpatched_classifier_copy_withholds_vex() {
+    let tmp = tempfile::tempdir().unwrap();
+    let root = tmp.path();
+    fixture(root, Shape::Gradle, &[("foo", FOO_UUID)]);
+    write(
+        root,
+        "proj/app/build.gradle",
+        b"plugins { id 'java' }\nrepositories { mavenCentral() }\ndependencies { implementation 'org.example:foo:1.0:all' }\n",
+    );
+    write(
+        root,
+        "m2/org/example/foo/1.0/foo-1.0-all.jar",
+        &jar(b"NOTICE foo\n"),
+    );
+    let env = ok(root, &["vendor"]);
+    assert!(
+        env.to_string()
+            .contains("reason: classifier_unpatched_copy: foo-1.0-all.jar carries an unpatched copy of META-INF/NOTICE.txt"),
+        "{env}"
+    );
+    ok(root, &["vendor", "--check"]);
+    let vex = root.join("vex.json");
+    let (_, env) = socket(
+        root,
+        &[
+            "vex",
+            "-O",
+            vex.to_str().unwrap(),
+            "--product",
+            "pkg:generic/x@1",
+        ],
+    );
+    assert_eq!(
+        events(&env),
+        [(
+            purl("foo"),
+            "skipped".to_string(),
+            "vendor_unwired".to_string()
+        )],
+        "{env}"
+    );
+    assert!(!vex.exists(), "{env}");
+}
+
+/// #429 repair: a deleted owned `.gitattributes` (and nothing else) is
+/// rewritten by `repair` (no download), so the next autocrlf clone keeps the
+/// script and index LF.
+#[test]
+fn gradle_vendor_429_repair_restores_missing_gitattributes() {
+    let tmp = tempfile::tempdir().unwrap();
+    let root = tmp.path();
+    fixture(root, Shape::Gradle, &[("foo", FOO_UUID)]);
+    ok(root, &["vendor"]);
+    let vendored = snapshot(root);
+    for rel in [
+        "proj/.socket/gradle/.gitattributes",
+        "proj/.socket/vendor/.gitattributes",
+        "proj/.socket/vendor/gradle/.gitattributes",
+    ] {
+        std::fs::remove_file(root.join(rel)).unwrap();
+    }
+    let (code, env) = socket(root, &["vendor", "--check"]);
+    assert_ne!(code, Some(0), "{env}");
+    ok(root, &["repair"]);
+    assert_eq!(snapshot(root), vendored);
+    ok(root, &["vendor", "--check"]);
+}
+
+fn copy_dir(from: &Path, to: &Path) {
+    std::fs::create_dir_all(to).unwrap();
+    for e in std::fs::read_dir(from).unwrap() {
+        let e = e.unwrap();
+        if e.file_type().unwrap().is_dir() {
+            copy_dir(&e.path(), &to.join(e.file_name()));
+        } else {
+            std::fs::copy(e.path(), to.join(e.file_name())).unwrap();
+        }
+    }
+}
+
+/// #428 repair: a JVM ledger entry under a subproject of the Gradle build
+/// is not repaired there (the real build would never read the restored
+/// tree); nothing is written.
+#[test]
+fn gradle_vendor_428_repair_from_subproject_refuses() {
+    let tmp = tempfile::tempdir().unwrap();
+    let root = tmp.path();
+    fixture(root, Shape::Gradle, &[("foo", FOO_UUID)]);
+    std::fs::create_dir_all(root.join("proj/.git")).unwrap();
+    ok(root, &["vendor"]);
+    copy_dir(&root.join("proj/.socket"), &root.join("proj/app/.socket"));
+    std::fs::remove_file(
+        root.join("proj/app/.socket/vendor/gradle/org/example/foo/1.0/foo-1.0.jar"),
+    )
+    .unwrap();
+    let before = snapshot(root);
+    let (code, env) = socket_in(root, "proj/app", &["repair"]);
+    assert_ne!(code, Some(0), "{env}");
+    assert!(
+        env.to_string()
+            .contains("reason: not_build_root: run vendor from Gradle root "),
+        "{env}"
+    );
+    assert_eq!(snapshot(root), before);
+}
+
+/// A single-pom root vendored before a Gradle build sat beside it keeps
+/// its single-pom entry: the re-run warns that the Gradle build stays
+/// unpatched and writes no Gradle wiring, `--check` passes, and the
+/// revert restores every byte.
+#[test]
+fn gradle_vendor_395_legacy_single_pom_entry_is_not_migrated() {
+    let tmp = tempfile::tempdir().unwrap();
+    let root = tmp.path();
+    fixture(root, Shape::Gradle, &[("foo", FOO_UUID)]);
+    write(
+        root,
+        "proj/pom.xml",
+        b"<project>\n  <modelVersion>4.0.0</modelVersion>\n  <groupId>com.x</groupId>\n  <artifactId>app</artifactId>\n  <version>1</version>\n  <dependencies>\n    <dependency><groupId>org.example</groupId><artifactId>foo</artifactId><version>1.0</version></dependency>\n  </dependencies>\n</project>\n",
+    );
+    let pristine = snapshot(root);
+    let settings = root.join("proj/settings.gradle");
+    let parked = root.join("settings.gradle.parked");
+    std::fs::rename(&settings, &parked).unwrap();
+    ok(root, &["vendor"]);
+    let state = std::fs::read_to_string(root.join("proj/.socket/vendor/state.json")).unwrap();
+    assert!(state.contains("maven_pom_repository"), "{state}");
+    std::fs::rename(&parked, &settings).unwrap();
+    let legacy = snapshot(root);
+    let env = ok(root, &["vendor"]);
+    assert!(
+        env.to_string().contains("reason: legacy_maven_root: "),
+        "{env}"
+    );
+    assert_eq!(snapshot(root), legacy, "no Gradle wiring is added");
+    ok(root, &["vendor", "--check"]);
+    ok(root, &["vendor", "--revert"]);
+    assert_eq!(snapshot(root), pristine);
+}
+
+/// #395 repair: a mixed root whose Gradle tree directory is a link out of
+/// the checkout is not repaired through it (the swap would delete and
+/// rewrite the directory outside); the outside copy stays untouched.
+#[cfg(unix)]
+#[test]
+fn gradle_vendor_395_repair_refuses_a_linked_gradle_tree() {
+    let tmp = tempfile::tempdir().unwrap();
+    let root = tmp.path();
+    fixture(root, Shape::Gradle, &[("foo", FOO_UUID)]);
+    write(
+        root,
+        "proj/pom.xml",
+        b"<project><modelVersion>4.0.0</modelVersion><groupId>com.x</groupId><artifactId>app</artifactId><version>1</version><dependencies><dependency><groupId>org.example</groupId><artifactId>foo</artifactId><version>1.0</version></dependency></dependencies></project>\n",
+    );
+    ok(root, &["vendor"]);
+    let outside = root.join("outside");
+    std::fs::rename(root.join("proj/.socket/vendor/gradle"), &outside).unwrap();
+    std::fs::remove_file(outside.join("org/example/foo/1.0/foo-1.0.pom")).unwrap();
+    std::os::unix::fs::symlink(&outside, root.join("proj/.socket/vendor/gradle")).unwrap();
+    let listing = |dir: &Path| -> Vec<_> {
+        std::fs::read_dir(dir)
+            .unwrap()
+            .map(|e| e.unwrap().file_name())
+            .collect()
+    };
+    let before = listing(&outside.join("org/example/foo/1.0"));
+    let (code, env) = socket(root, &["repair"]);
+    assert_ne!(code, Some(0), "{env}");
+    assert!(env.to_string().contains("vendor_path_unsafe"), "{env}");
+    assert_eq!(listing(&outside.join("org/example/foo/1.0")), before);
+}

@@ -30,6 +30,7 @@ use crate::crawlers::python_crawler::canonicalize_pypi_name;
 // revert) forever in an `open(2)` that waits for a writer — the
 // flavor-routing probes ahead of the load are metadata-only, so these are
 // the first opens.
+use crate::patch::redirect::upstream::{respell_lock_specifier, LockRequirementArray};
 use crate::utils::fs::{atomic_write_bytes_preserving_mode, read_regular_to_string};
 use crate::utils::python_lock::preserve_line_endings;
 
@@ -815,7 +816,30 @@ pub(super) async fn revert_uv(entry: &VendorEntry, root: &Path, dry_run: bool) -
 
     for rec in entry.wiring.iter().rev() {
         let new_text = rec.new.as_ref().and_then(serde_json::Value::as_str);
-        let original_text = rec.original.as_ref().and_then(serde_json::Value::as_str);
+        let recorded = rec.original.as_ref().and_then(serde_json::Value::as_str);
+        // A root requirement entry lost its specifier to the path source,
+        // so a declaration the user changed since vendoring left the lock
+        // byte-identical: restore the specifier pyproject.toml declares
+        // NOW, never the recorded one blindly (#840).
+        let respelled = match (recorded, rec.key.as_deref()) {
+            (Some(orig), Some(key)) => {
+                match respell_original(orig, &rec.kind, key, &pyproject_text) {
+                    Ok(text) => Some(text),
+                    Err(reason) => {
+                        warnings.push(VendorWarning::new(
+                            "vendor_lock_entry_drifted",
+                            format!(
+                                "uv.lock entry for {key:?} can't be restored to match \
+                                 pyproject.toml ({reason}); left untouched"
+                            ),
+                        ));
+                        continue;
+                    }
+                }
+            }
+            (orig, _) => orig.map(str::to_string),
+        };
+        let original_text = respelled.as_deref();
         let drifted = |what: &str| {
             VendorWarning::new(
                 "vendor_lock_entry_drifted",
@@ -850,7 +874,15 @@ pub(super) async fn revert_uv(entry: &VendorEntry, root: &Path, dry_run: bool) -
                         // the fragment. Not drift: stay silent so the
                         // drift-keep gate can converge instead of keeping
                         // the artifact dir and ledger entry forever.
-                        if original_text.is_some_and(|orig| lock_text.contains(orig)) {
+                        // A requires-dist element is looked for in the root
+                        // unit's own array: a short one (`{ name = "six" }`)
+                        // also spells another package's dependency.
+                        let haystack = if rec.kind == "uv_lock_requires_dist" {
+                            root_requires_dist(&lock_text).unwrap_or("")
+                        } else {
+                            lock_text.as_str()
+                        };
+                        if original_text.is_some_and(|orig| haystack.contains(orig)) {
                             continue;
                         }
                         warnings.push(drifted("uv.lock"));
@@ -1020,6 +1052,107 @@ pub(super) async fn revert_uv(entry: &VendorEntry, root: &Path, dry_run: bool) -
 }
 
 // ── helpers ──────────────────────────────────────────────────────────────
+
+/// The recorded pre-vendor `original` of a root requirement record
+/// (`uv_lock_requires_dist` element, `uv_lock_requires_dev` group line,
+/// `uv_lock_manifest_constraints` key line) with every `canon` entry's
+/// `specifier` re-derived from the current pyproject.toml declaration
+/// ([`respell_lock_specifier`]). Other record kinds, other packages'
+/// entries and entries whose declaration still agrees come back
+/// unchanged, so an untouched project still reverts byte-for-byte. `Err`
+/// when the declaration changed but uv's spelling of it isn't derivable.
+fn respell_original(
+    orig: &str,
+    kind: &str,
+    canon: &str,
+    pyproject_text: &str,
+) -> Result<String, String> {
+    // (offset of the element list in `orig`, the array it mirrors).
+    let (offset, array) = match kind {
+        "uv_lock_requires_dist" => (0, None),
+        "uv_lock_requires_dev" | "uv_lock_manifest_constraints" => {
+            let Some((key, _)) = orig.split_once(" = ") else {
+                return Ok(orig.to_string());
+            };
+            let key = key.trim().trim_matches('"');
+            let array = if kind == "uv_lock_requires_dev" {
+                LockRequirementArray::RequiresDev(key)
+            } else {
+                LockRequirementArray::Manifest(key)
+            };
+            (orig.find(" = ").map_or(0, |i| i + " = ".len()), Some(array))
+        }
+        _ => return Ok(orig.to_string()),
+    };
+    let needle = format!("name = \"{canon}\"");
+    let mut out = orig.to_string();
+    // Back-to-front so the earlier spans stay valid.
+    for (s, e) in top_level_brace_groups(&orig[offset..]).into_iter().rev() {
+        let (s, e) = (offset + s, offset + e);
+        let element = &orig[s..e];
+        if !element.contains(&needle) {
+            continue;
+        }
+        let array = array.unwrap_or(LockRequirementArray::RequiresDist);
+        let specifier = entry_value(element, "specifier");
+        let marker = entry_value(element, "marker");
+        if let Some(spec) = respell_lock_specifier(pyproject_text, array, canon, specifier, marker)?
+        {
+            out.replace_range(s..e, &with_specifier(element, spec.as_deref()));
+        }
+    }
+    Ok(out)
+}
+
+/// The root unit's `requires-dist = [ … ]` array text, if it has one.
+fn root_requires_dist(lock_text: &str) -> Option<&str> {
+    let unit = find_unit_span(lock_text, unit_is_root)?;
+    let unit_text = &lock_text[unit.clone()];
+    // requires-dist sits in [package.metadata], ahead of requires-dev.
+    let dist_scan = &unit_text[..unit_text
+        .find("[package.metadata.requires-dev]")
+        .unwrap_or(unit_text.len())];
+    let open = dist_scan.find("requires-dist = [")? + "requires-dist = ".len();
+    let end = balanced_span(unit_text, open)?;
+    Some(&unit_text[open..end])
+}
+
+/// The string value of `key` in a one-line `{ k = "v", … }` lock entry.
+fn entry_value<'a>(entry: &'a str, key: &str) -> Option<&'a str> {
+    let inner = entry.trim().strip_prefix('{')?.strip_suffix('}')?;
+    split_top_level_commas(inner).into_iter().find_map(|part| {
+        part.trim()
+            .strip_prefix(key)?
+            .trim_start()
+            .strip_prefix('=')
+            .map(|v| v.trim().trim_matches('"'))
+    })
+}
+
+/// `entry` with its `specifier` replaced by `spec` (removed when `None`),
+/// in place, or appended last, where uv writes it, when it had none.
+fn with_specifier(entry: &str, spec: Option<&str>) -> String {
+    let inner = entry.trim().trim_start_matches('{').trim_end_matches('}');
+    let rendered = spec.map(|s| format!("specifier = \"{s}\""));
+    let mut parts: Vec<String> = Vec::new();
+    let mut placed = false;
+    for part in split_top_level_commas(inner) {
+        let part = part.trim();
+        if part.is_empty() {
+            continue;
+        }
+        if part.starts_with("specifier =") {
+            parts.extend(rendered.clone());
+            placed = true;
+            continue;
+        }
+        parts.push(part.to_string());
+    }
+    if !placed {
+        parts.extend(rendered);
+    }
+    format!("{{ {} }}", parts.join(", "))
+}
 
 /// Result of [`revert_array_elements`].
 enum ArrayRevert {
@@ -6682,5 +6815,369 @@ six = { path = ".socket/vendor/pypi/9f6b2c4e-1d3a-4f6b-8c2d-7e5a9b1c3d5f/six-1.1
         let (py, lock) = read_pair(tmp.path()).await;
         assert_eq!(py, wired_py, "pyproject.toml must stay wired with its lock");
         assert_eq!(lock, drifted_lock, "uv.lock is left exactly as found");
+    }
+
+    // ── #840: the user edits the vendored package's own declaration ──────
+
+    /// Vendor six from `pyproject`/`lock`, then do what `uv add "<to>"` (or
+    /// a hand edit plus `uv lock`) does while six is vendored: pyproject.toml
+    /// swaps the declaration `from` → `to`, and uv.lock stays byte-identical
+    /// (a path source records no specifier, so uv has nothing to relock).
+    /// Returns the revert outcome plus the wired pair and the reverted pair.
+    async fn revert_after_declaration_edit(
+        pyproject: &str,
+        lock: &str,
+        from: &str,
+        to: &str,
+    ) -> (RevertOutcome, (String, String), (String, String)) {
+        let tmp = write_pair(pyproject, lock).await;
+        let p = load_uv_project(tmp.path()).await.unwrap();
+        let (wiring, meta, _) = wire_uv(
+            &p,
+            tmp.path(),
+            "six",
+            "1.16.0",
+            REL_WHEEL,
+            WHEEL_NAME,
+            WHEEL_SHA,
+            UUID,
+        )
+        .await
+        .unwrap();
+        let (wired_py, wired_lock) = read_pair(tmp.path()).await;
+        let edited_py = wired_py.replace(from, to);
+        assert_ne!(edited_py, wired_py, "the edit must hit the declaration");
+        tokio::fs::write(tmp.path().join("pyproject.toml"), &edited_py)
+            .await
+            .unwrap();
+        let entry = entry_for(wiring, meta);
+        let outcome = revert_uv(&entry, tmp.path(), false).await;
+        let reverted = read_pair(tmp.path()).await;
+        (outcome, (edited_py, wired_lock), reverted)
+    }
+
+    /// #840: `uv add "six>=1.15"` after vendoring. The revert must write the
+    /// specifier pyproject.toml declares NOW, not the recorded `==1.16.0`
+    /// (which leaves `uv sync --locked` red behind a successful revert).
+    #[tokio::test]
+    async fn revert_respells_an_edited_requires_dist_specifier() {
+        let (outcome, _, (py, lock)) = revert_after_declaration_edit(
+            DIRECT_REGISTRY_PYPROJECT,
+            DIRECT_REGISTRY_LOCK,
+            "\"six==1.16.0\"",
+            "\"six>=1.15\"",
+        )
+        .await;
+        assert!(outcome.success, "{:?}", outcome.error);
+        assert!(outcome.warnings.is_empty(), "{:?}", outcome.warnings);
+        assert_eq!(
+            py,
+            DIRECT_REGISTRY_PYPROJECT.replace("\"six==1.16.0\"", "\"six>=1.15\"")
+        );
+        assert_eq!(
+            lock,
+            DIRECT_REGISTRY_LOCK.replace(
+                "{ name = \"six\", specifier = \"==1.16.0\" }",
+                "{ name = \"six\", specifier = \">=1.15\" }"
+            ),
+            "the restored element carries the current declaration"
+        );
+    }
+
+    /// #840, PEP 735 group (`uv add --dev "six==1.16.*"`): the requires-dev
+    /// group array is restored with the group's current specifier.
+    #[tokio::test]
+    async fn revert_respells_an_edited_requires_dev_specifier() {
+        let (outcome, _, (py, lock)) = revert_after_declaration_edit(
+            DEV_GROUP_REGISTRY_PYPROJECT,
+            DEV_GROUP_REGISTRY_LOCK,
+            "dev = [\"six==1.16.0\"]",
+            "dev = [\"six==1.16.*\"]",
+        )
+        .await;
+        assert!(outcome.success, "{:?}", outcome.error);
+        assert!(outcome.warnings.is_empty(), "{:?}", outcome.warnings);
+        assert_eq!(
+            py,
+            DEV_GROUP_REGISTRY_PYPROJECT.replace("\"six==1.16.0\"", "\"six==1.16.*\"")
+        );
+        assert_eq!(
+            lock,
+            DEV_GROUP_REGISTRY_LOCK.replace(
+                "dev = [{ name = \"six\", specifier = \"==1.16.0\" }]",
+                "dev = [{ name = \"six\", specifier = \"==1.16.*\" }]"
+            )
+        );
+    }
+
+    /// #840: dropping the version bound entirely (`six`) restores an element
+    /// with no `specifier`, which is how uv records an unconstrained
+    /// requirement.
+    #[tokio::test]
+    async fn revert_drops_the_specifier_of_an_unconstrained_declaration() {
+        let (outcome, _, (_, lock)) = revert_after_declaration_edit(
+            DIRECT_REGISTRY_PYPROJECT,
+            DIRECT_REGISTRY_LOCK,
+            "\"six==1.16.0\"",
+            "\"six\"",
+        )
+        .await;
+        assert!(outcome.success, "{:?}", outcome.error);
+        assert!(outcome.warnings.is_empty(), "{:?}", outcome.warnings);
+        assert_eq!(
+            lock,
+            DIRECT_REGISTRY_LOCK.replace(
+                "{ name = \"six\", specifier = \"==1.16.0\" }",
+                "{ name = \"six\" }"
+            )
+        );
+    }
+
+    /// #840, `[tool.uv] constraint-dependencies`: the `[manifest]
+    /// constraints` element follows the edited constraint, while the
+    /// unchanged `dependencies` element is restored byte-for-byte.
+    #[tokio::test]
+    async fn revert_respells_an_edited_manifest_constraint() {
+        let manifest =
+            "[manifest]\nconstraints = [{ name = \"six\", specifier = \"==1.16.0\" }]\n\n";
+        let registry_lock =
+            DIRECT_REGISTRY_LOCK.replacen("[[package]]", &format!("{manifest}[[package]]"), 1);
+        let (outcome, _, (_, lock)) = revert_after_declaration_edit(
+            CONSTRAINTS_REGISTRY_PYPROJECT,
+            &registry_lock,
+            "constraint-dependencies = [\"six==1.16.0\"]",
+            "constraint-dependencies = [\"six>=1.16\"]",
+        )
+        .await;
+        assert!(outcome.success, "{:?}", outcome.error);
+        assert!(outcome.warnings.is_empty(), "{:?}", outcome.warnings);
+        assert_eq!(
+            lock,
+            registry_lock.replace(
+                "constraints = [{ name = \"six\", specifier = \"==1.16.0\" }]",
+                "constraints = [{ name = \"six\", specifier = \">=1.16\" }]"
+            )
+        );
+    }
+
+    /// #840, multi-clause: uv's clause order differs between releases (0.8
+    /// orders by version, `>=20,!=21.1.0,<30`), so even a sibling entry
+    /// can't show how this edit would be spelled. Fail closed: keep the
+    /// wired pair and warn rather than guess.
+    #[tokio::test]
+    async fn revert_keeps_the_pair_on_a_multi_clause_edit_despite_sibling_evidence() {
+        let py_in = DIRECT_REGISTRY_PYPROJECT
+            .replace("[\"six==1.16.0\"]", "[\"attrs>=20,<30\", \"six==1.16.0\"]");
+        let lock_in = DIRECT_REGISTRY_LOCK.replace(
+            "requires-dist = [{ name = \"six\", specifier = \"==1.16.0\" }]",
+            "requires-dist = [\n    { name = \"attrs\", specifier = \">=20,<30\" },\n    { name = \"six\", specifier = \"==1.16.0\" },\n]",
+        );
+        let (outcome, (edited_py, wired_lock), (py, lock)) = revert_after_declaration_edit(
+            &py_in,
+            &lock_in,
+            "\"six==1.16.0\"",
+            "\"six<1.17,>=1.16\"",
+        )
+        .await;
+        assert!(outcome.success, "{:?}", outcome.error);
+        assert!(outcome.drift_skipped(), "{:?}", outcome.warnings);
+        assert_eq!(py, edited_py);
+        assert_eq!(lock, wired_lock);
+    }
+
+    /// #840, multi-clause with nothing in the lock showing uv's spelling:
+    /// the correct specifier can't be derived, so restoring the stale one
+    /// would break `--locked`. Treat it as drift: keep BOTH files wired (the
+    /// pair gate) and warn, never report a clean revert.
+    #[tokio::test]
+    async fn revert_keeps_the_pair_when_an_edited_specifier_is_not_derivable() {
+        let (outcome, (edited_py, wired_lock), (py, lock)) = revert_after_declaration_edit(
+            DIRECT_REGISTRY_PYPROJECT,
+            DIRECT_REGISTRY_LOCK,
+            "\"six==1.16.0\"",
+            "\"six>=1.16,<1.17\"",
+        )
+        .await;
+        assert!(outcome.success, "{:?}", outcome.error);
+        assert!(outcome.drift_skipped(), "{:?}", outcome.warnings);
+        assert!(
+            outcome
+                .warnings
+                .iter()
+                .any(|w| w.code == "vendor_lock_entry_drifted"),
+            "{:?}",
+            outcome.warnings
+        );
+        assert_eq!(py, edited_py, "pyproject.toml stays wired with its lock");
+        assert_eq!(lock, wired_lock, "uv.lock is left exactly as found");
+    }
+
+    /// #840 with six in both `dependencies` and an extra: each requires-dist
+    /// element follows its OWN declaration (uv marks the extra's with
+    /// `extra == 'socks'`), so editing only the extra respells only that
+    /// element.
+    #[tokio::test]
+    async fn revert_respells_only_the_edited_extra_element() {
+        let (outcome, _, (_, lock)) = revert_after_declaration_edit(
+            EXTRAS_DUP_REGISTRY_PYPROJECT,
+            EXTRAS_DUP_REGISTRY_LOCK,
+            "socks = [\"six==1.16.0\"]",
+            "socks = [\"six>=1.16\"]",
+        )
+        .await;
+        assert!(outcome.success, "{:?}", outcome.error);
+        assert!(outcome.warnings.is_empty(), "{:?}", outcome.warnings);
+        assert_eq!(
+            lock,
+            EXTRAS_DUP_REGISTRY_LOCK.replace(
+                "marker = \"extra == 'socks'\", specifier = \"==1.16.0\"",
+                "marker = \"extra == 'socks'\", specifier = \">=1.16\""
+            )
+        );
+    }
+
+    /// Bugbot on #841: six declared twice under complementary environment
+    /// markers, both `==1.16.0` when vendored. Editing only the second
+    /// must respell only the entry whose marker mirrors it, never keep the
+    /// stale pin because the OTHER declaration still matches it.
+    #[tokio::test]
+    async fn revert_respells_the_entry_whose_marker_mirrors_the_edit() {
+        let py_in = DIRECT_REGISTRY_PYPROJECT.replace(
+            "[\"six==1.16.0\"]",
+            "[\"six==1.16.0; python_version < '3.12'\", \"six==1.16.0; python_version >= '3.12'\"]",
+        );
+        let lock_in = DIRECT_REGISTRY_LOCK.replace(
+            "requires-dist = [{ name = \"six\", specifier = \"==1.16.0\" }]",
+            "requires-dist = [\n    { name = \"six\", marker = \"python_full_version < '3.12'\", specifier = \"==1.16.0\" },\n    { name = \"six\", marker = \"python_full_version >= '3.12'\", specifier = \"==1.16.0\" },\n]",
+        );
+        let (outcome, _, (_, lock)) = revert_after_declaration_edit(
+            &py_in,
+            &lock_in,
+            "\"six==1.16.0; python_version >= '3.12'\"",
+            "\"six>=1.16; python_version >= '3.12'\"",
+        )
+        .await;
+        assert!(outcome.success, "{:?}", outcome.error);
+        assert!(outcome.warnings.is_empty(), "{:?}", outcome.warnings);
+        assert_eq!(
+            lock,
+            lock_in.replace(
+                "marker = \"python_full_version >= '3.12'\", specifier = \"==1.16.0\"",
+                "marker = \"python_full_version >= '3.12'\", specifier = \">=1.16\""
+            )
+        );
+    }
+
+    /// Bugbot on #841: an `include-group` still carries the old pin after
+    /// the group's own declaration was edited. The two declarations now
+    /// disagree and the entry's marker can't tell them apart, so keep the
+    /// wired pair (drift) instead of restoring the stale specifier.
+    #[tokio::test]
+    async fn revert_keeps_the_pair_when_group_declarations_disagree() {
+        let py_in = DEV_GROUP_REGISTRY_PYPROJECT.replace(
+            "dev = [\"six==1.16.0\"]",
+            "base = [\"six==1.16.0\"]\ndev = [\"six==1.16.0\", { include-group = \"base\" }]",
+        );
+        let (outcome, (edited_py, wired_lock), (py, lock)) = revert_after_declaration_edit(
+            &py_in,
+            DEV_GROUP_REGISTRY_LOCK,
+            "dev = [\"six==1.16.0\",",
+            "dev = [\"six>=1.16\",",
+        )
+        .await;
+        assert!(outcome.success, "{:?}", outcome.error);
+        assert!(outcome.drift_skipped(), "{:?}", outcome.warnings);
+        assert_eq!(py, edited_py);
+        assert_eq!(lock, wired_lock);
+    }
+
+    /// Bugbot on #841: an extra pinning six with `===` (not a plain range)
+    /// must not stop the `dependencies` entry, which the marker narrowing
+    /// tells apart, from following its edited declaration.
+    #[tokio::test]
+    async fn revert_respells_past_an_unreadable_sibling_declaration() {
+        let py_in = EXTRAS_DUP_REGISTRY_PYPROJECT
+            .replace("socks = [\"six==1.16.0\"]", "socks = [\"six===1.16.0\"]");
+        let lock_in = EXTRAS_DUP_REGISTRY_LOCK.replace(
+            "marker = \"extra == 'socks'\", specifier = \"==1.16.0\"",
+            "marker = \"extra == 'socks'\", specifier = \"===1.16.0\"",
+        );
+        let (outcome, _, (_, lock)) = revert_after_declaration_edit(
+            &py_in,
+            &lock_in,
+            "dependencies = [\"six==1.16.0\"]",
+            "dependencies = [\"six>=1.15\"]",
+        )
+        .await;
+        assert!(outcome.success, "{:?}", outcome.error);
+        assert!(outcome.warnings.is_empty(), "{:?}", outcome.warnings);
+        assert_eq!(
+            lock,
+            lock_in.replace(
+                "    { name = \"six\", specifier = \"==1.16.0\" },",
+                "    { name = \"six\", specifier = \">=1.15\" },"
+            ),
+            "the extra's `===` entry keeps uv's own recorded spelling"
+        );
+    }
+
+    /// Bugbot on #841: after the bound is dropped, the restored element is
+    /// `{ name = "six" }`, which the root unit's `dependencies` array also
+    /// spells. If our wired requires-dist element was edited, that must
+    /// stay drift (both files kept), not pass as already converged.
+    #[tokio::test]
+    async fn revert_does_not_converge_on_a_lookalike_dependency_entry() {
+        let tmp = write_pair(DIRECT_REGISTRY_PYPROJECT, DIRECT_REGISTRY_LOCK).await;
+        let p = load_uv_project(tmp.path()).await.unwrap();
+        let (wiring, meta, _) = wire_uv(
+            &p,
+            tmp.path(),
+            "six",
+            "1.16.0",
+            REL_WHEEL,
+            WHEEL_NAME,
+            WHEEL_SHA,
+            UUID,
+        )
+        .await
+        .unwrap();
+        let (wired_py, wired_lock) = read_pair(tmp.path()).await;
+        let edited_py = wired_py.replace("\"six==1.16.0\"", "\"six\"");
+        let six_el = format!("{{ name = \"six\", path = \"{REL_WHEEL}\" }}");
+        let drifted_el = format!(
+            "{{ name = \"six\", marker = \"python_full_version >= '3.11'\", path = \"{REL_WHEEL}\" }}"
+        );
+        let drifted_lock = wired_lock.replace(&six_el, &drifted_el);
+        assert_ne!(drifted_lock, wired_lock);
+        assert!(drifted_lock.contains("{ name = \"six\" }"), "the lookalike");
+        tokio::fs::write(tmp.path().join("pyproject.toml"), &edited_py)
+            .await
+            .unwrap();
+        tokio::fs::write(tmp.path().join("uv.lock"), &drifted_lock)
+            .await
+            .unwrap();
+        let entry = entry_for(wiring, meta);
+        let outcome = revert_uv(&entry, tmp.path(), false).await;
+        assert!(outcome.success, "{:?}", outcome.error);
+        assert!(outcome.drift_skipped(), "{:?}", outcome.warnings);
+        let (py, lock) = read_pair(tmp.path()).await;
+        assert_eq!(py, edited_py);
+        assert_eq!(lock, drifted_lock);
+    }
+
+    /// An unchanged declaration, however it is spaced or ordered, still
+    /// restores the recorded element byte-for-byte.
+    #[tokio::test]
+    async fn revert_keeps_the_recorded_specifier_when_the_declaration_agrees() {
+        let (outcome, _, (_, lock)) = revert_after_declaration_edit(
+            DIRECT_REGISTRY_PYPROJECT,
+            DIRECT_REGISTRY_LOCK,
+            "\"six==1.16.0\"",
+            "\"six == 1.16.0 ; python_version >= '3.9'\"",
+        )
+        .await;
+        assert!(outcome.success, "{:?}", outcome.error);
+        assert!(outcome.warnings.is_empty(), "{:?}", outcome.warnings);
+        assert_eq!(lock, DIRECT_REGISTRY_LOCK);
     }
 }

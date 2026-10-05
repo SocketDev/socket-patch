@@ -297,6 +297,12 @@ python-versions = ">=3.9"
 content-hash = "4b42a89b7ff7b26511b06acdc458dbd85312e5083db8f212b017482bc68cdd01"
 "#;
 
+/// A requirements.txt project; returns its wiring files.
+fn stage_requirements(root: &Path) -> &'static [&'static str] {
+    std::fs::write(root.join("requirements.txt"), "idna==3.7\nsix==1.16.0\n").unwrap();
+    &["requirements.txt"]
+}
+
 /// #765: a vendored requirements.txt picks up a superseding patch. The
 /// manifest moves `six` from patch A to patch B (different patched bytes);
 /// the next `vendor` must re-wire the requirements line to B's wheel in
@@ -380,8 +386,8 @@ async fn requirements_vendored_revendors_superseding_patch() {
 #[tokio::test]
 async fn requirements_vendored_to_hosted() {
     let (_tmp, root) = project();
-    std::fs::write(root.join("requirements.txt"), "idna==3.7\nsix==1.16.0\n").unwrap();
-    assert_vendored_to_hosted(&root, &["requirements.txt"]).await;
+    let files = stage_requirements(&root);
+    assert_vendored_to_hosted(&root, files).await;
 }
 
 #[tokio::test]
@@ -391,9 +397,8 @@ async fn requirements_sole_pin_vendored_to_hosted() {
     assert_vendored_to_hosted(&root, &["requirements.txt"]).await;
 }
 
-#[tokio::test]
-async fn poetry_vendored_to_hosted() {
-    let (_tmp, root) = project();
+/// A Poetry project; returns its wiring files.
+fn stage_poetry(root: &Path) -> &'static [&'static str] {
     std::fs::write(
         root.join("pyproject.toml"),
         "[tool.poetry]\nname = \"demo\"\nversion = \"0.1.0\"\ndescription = \"\"\nauthors = [\"x <x@x>\"]\npackage-mode = false\n\n[tool.poetry.dependencies]\npython = \">=3.9\"\nsix = \"1.16.0\"\n",
@@ -406,13 +411,20 @@ async fn poetry_vendored_to_hosted() {
             .replace("SDIST_SHA", SDIST_SHA),
     )
     .unwrap();
-    assert_vendored_to_hosted(&root, &["poetry.lock", "pyproject.toml"]).await;
+    &["poetry.lock", "pyproject.toml"]
+}
+
+#[tokio::test]
+async fn poetry_vendored_to_hosted() {
+    let (_tmp, root) = project();
+    let files = stage_poetry(&root);
+    assert_vendored_to_hosted(&root, files).await;
 }
 
 const PIPFILE: &str = "[[source]]\nurl = \"https://pypi.org/simple\"\nverify_ssl = true\nname = \"pypi\"\n\n[packages]\nsix = \"==1.16.0\"\n\n[requires]\npython_version = \"3.11\"\n";
 
-/// Write a Pipenv project (Pipfile + a registry Pipfile.lock pinning six).
-fn write_pipenv_project(root: &Path) {
+/// A Pipenv project; returns its wiring files.
+fn stage_pipenv(root: &Path) -> &'static [&'static str] {
     std::fs::write(root.join("Pipfile"), PIPFILE).unwrap();
     let lock = json!({
         "_meta": {
@@ -434,13 +446,14 @@ fn write_pipenv_project(root: &Path) {
     let mut text = serde_json::to_string_pretty(&lock).unwrap();
     text.push('\n');
     std::fs::write(root.join("Pipfile.lock"), text).unwrap();
+    &["Pipfile.lock"]
 }
 
 #[tokio::test]
 async fn pipenv_vendored_to_hosted() {
     let (_tmp, root) = project();
-    write_pipenv_project(&root);
-    assert_vendored_to_hosted(&root, &["Pipfile.lock"]).await;
+    let files = stage_pipenv(&root);
+    assert_vendored_to_hosted(&root, files).await;
 }
 
 /// A superseding patch for the same release (a fixed patch, or one
@@ -488,7 +501,7 @@ async fn pipenv_revendors_to_a_superseding_patch() {
             "lock-only"
         };
         let (_tmp, root) = project();
-        write_pipenv_project(&root);
+        stage_pipenv(&root);
         let registry = std::fs::read_to_string(root.join("Pipfile.lock")).unwrap();
         vendor_project(&root, &["Pipfile.lock"]);
 
@@ -556,9 +569,8 @@ wheels = [
 ]
 "#;
 
-#[tokio::test]
-async fn uv_vendored_to_hosted() {
-    let (_tmp, root) = project();
+/// A uv project; returns its wiring files.
+fn stage_uv(root: &Path) -> &'static [&'static str] {
     std::fs::write(
         root.join("pyproject.toml"),
         "[project]\nname = \"demo\"\nversion = \"0.1.0\"\nrequires-python = \">=3.9\"\ndependencies = [\"six==1.16.0\"]\n",
@@ -571,18 +583,31 @@ async fn uv_vendored_to_hosted() {
             .replace("SDIST_SHA", SDIST_SHA),
     )
     .unwrap();
-    assert_vendored_to_hosted(&root, &["uv.lock", "pyproject.toml"]).await;
+    &["uv.lock", "pyproject.toml"]
 }
 
 #[tokio::test]
-async fn hatch_vendored_to_hosted() {
+async fn uv_vendored_to_hosted() {
     let (_tmp, root) = project();
+    let files = stage_uv(&root);
+    assert_vendored_to_hosted(&root, files).await;
+}
+
+/// A Hatch project; returns its wiring files.
+fn stage_hatch(root: &Path) -> &'static [&'static str] {
     std::fs::write(
         root.join("pyproject.toml"),
         "[build-system]\nrequires = [\"hatchling\"]\nbuild-backend = \"hatchling.build\"\n\n[project]\nname = \"demo\"\nversion = \"0.1.0\"\ndependencies = [\"six==1.16.0\"]\n",
     )
     .unwrap();
-    assert_vendored_to_hosted(&root, &["pyproject.toml"]).await;
+    &["pyproject.toml"]
+}
+
+#[tokio::test]
+async fn hatch_vendored_to_hosted() {
+    let (_tmp, root) = project();
+    let files = stage_hatch(&root);
+    assert_vendored_to_hosted(&root, files).await;
 }
 
 /// The uv lock rewrite needs the hosted wheel's METADATA, fetched only
@@ -774,6 +799,84 @@ async fn ledger_update_failure_after_revert_is_stranded() {
     assert!(text.contains("redirect_takeover_unpatched"), "{env:#}");
     assert_eq!(env["status"], "partial_failure", "{env:#}");
     assert_eq!(code, 1, "{env:#}");
+}
+
+// ── `vendor --check` wiring audit (#725) ─────────────────────────────────
+
+/// Vendor the staged project, confirm `vendor --check` passes, then put
+/// the wiring files back to their pre-vendor bytes — what `pipenv lock`,
+/// `poetry lock`, `uv lock` or a hand-edited requirements.txt leave behind —
+/// and require `vendor --check` to fail: the committed wheel is intact, but
+/// nothing installs it any more, so a fresh install is unpatched.
+fn assert_check_catches_relock(root: &Path, files: &[&str]) {
+    let pristine: Vec<Vec<u8>> = files
+        .iter()
+        .map(|f| std::fs::read(root.join(f)).unwrap())
+        .collect();
+    vendor_project(root, files);
+
+    let (code, env) = run_cli(root, &["vendor", "--check"], &[]);
+    assert_eq!(code, 0, "wired project passes: {env:#}");
+    assert_eq!(env["events"][0]["errorCode"], "vendor_check_ok", "{env:#}");
+
+    for (f, bytes) in files.iter().zip(&pristine) {
+        std::fs::write(root.join(f), bytes).unwrap();
+    }
+    let (code, env) = run_cli(root, &["vendor", "--check"], &[]);
+    assert_eq!(code, 1, "{files:?} no longer wire the artifact: {env:#}");
+    let event = &env["events"][0];
+    assert_eq!(event["action"], "failed", "{env:#}");
+    assert_eq!(event["errorCode"], "vendor_check_failed", "{env:#}");
+    assert!(
+        event["reason"]
+            .as_str()
+            .is_some_and(|r| r.contains("wiring")),
+        "the failure names the missing wiring: {env:#}"
+    );
+    assert_eq!(env["summary"]["failed"], 1, "{env:#}");
+}
+
+#[tokio::test]
+async fn vendor_check_fails_after_pipenv_relock() {
+    let (_tmp, root) = project();
+    let files = stage_pipenv(&root);
+    assert_check_catches_relock(&root, files);
+
+    // Human mode must not claim the wiring was verified.
+    let (code, stdout, stderr) = run_raw(&root, &["vendor", "--check"], &[]);
+    assert_eq!(code, 1, "stdout:\n{stdout}\nstderr:\n{stderr}");
+    assert!(
+        !stdout.contains("wiring verified"),
+        "stdout:\n{stdout}\nstderr:\n{stderr}"
+    );
+}
+
+#[tokio::test]
+async fn vendor_check_fails_after_requirements_rewrite() {
+    let (_tmp, root) = project();
+    let files = stage_requirements(&root);
+    assert_check_catches_relock(&root, files);
+}
+
+#[tokio::test]
+async fn vendor_check_fails_after_poetry_relock() {
+    let (_tmp, root) = project();
+    let files = stage_poetry(&root);
+    assert_check_catches_relock(&root, files);
+}
+
+#[tokio::test]
+async fn vendor_check_fails_after_uv_relock() {
+    let (_tmp, root) = project();
+    let files = stage_uv(&root);
+    assert_check_catches_relock(&root, files);
+}
+
+#[tokio::test]
+async fn vendor_check_fails_after_hatch_dependency_reset() {
+    let (_tmp, root) = project();
+    let files = stage_hatch(&root);
+    assert_check_catches_relock(&root, files);
 }
 
 /// #699: hosted mode rewrites only the ROOT `requirements.txt`, while

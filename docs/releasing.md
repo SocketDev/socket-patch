@@ -21,9 +21,14 @@ See the [migration instructions](migrating-to-v5.md#installation-channels).
 
 ## 1. Write the release notes
 
-Make sure `CHANGELOG.md`'s `[Unreleased]` section describes this release —
-`release.py changelog cut` refuses to run if it is empty, and `release-lint.sh`
-blocks a release whose CHANGELOG section is missing or empty.
+Release notes are written only at release time: PRs never touch
+`CHANGELOG.md`. The release agent (the release-train routine's `release-sync`
+PR, or whoever cuts the release by hand) writes the `[Unreleased]` section from
+the PRs merged since the last tag (`git log --first-parent <last-tag>..origin/main`)
+and from reading the code they changed. Describe user-visible behavior, not
+implementation details. `release.py changelog cut` refuses to run if the
+section is empty, and `release-lint.sh` blocks a release whose CHANGELOG
+section is missing or empty.
 
 ## 2. Open the version-bump PR
 
