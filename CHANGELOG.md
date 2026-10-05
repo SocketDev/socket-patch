@@ -102,14 +102,6 @@ limits, and required install commands.
 
 ### Fixed
 
-- Agent-mode `apply` and `rollback` now reach a copy of a package that is
-  bundled inside another package's pnpm, vlt, Bun or Deno store entry, even
-  when the same `name@version` is also installed normally. Before, only the
-  normal copy was patched, and `vex` attested the patch while the bundling
-  package loaded the unpatched copy (#601). Agent-mode `vex` now also checks
-  every store peer-variant copy that `apply` patches (a Deno `_1` copy, a pnpm
-  `(peer)` variant, a vlt `~peer` extra), so one unpatched copy omits the purl
-  instead of being attested (#603).
 - Global mode (`-g`) finds npm, yarn, pnpm, bun, RubyGems and Composer on
   Windows, where they install as `.cmd` / `.bat` shims, instead of reporting
   an empty scan. The yarn and npm-family global lookups no longer run from the
