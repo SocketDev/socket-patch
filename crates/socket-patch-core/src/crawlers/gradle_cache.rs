@@ -70,8 +70,7 @@ pub fn hash_eq(dir_name: &str, sha1_hex: &str) -> bool {
 /// Whether `bytes` are the pristine download Gradle stored in the hash
 /// directory `dir_name` (their sha1 names it).
 pub fn pristine(dir_name: &str, bytes: &[u8]) -> bool {
-    use sha1::{Digest, Sha1};
-    hash_eq(dir_name, &hex::encode(Sha1::digest(bytes)))
+    hash_eq(dir_name, &crate::utils::digest::sha1_hex_of(bytes))
 }
 
 /// Whether `path` is a version directory of a `files-2.1` tree
@@ -467,8 +466,6 @@ impl DerivedIndex {
     /// The [`DerivedCopies`] of the jar `jar_leaf` whose pristine bytes
     /// hash to `pristine_sha1`.
     pub fn query(&self, jar_leaf: &str, pristine_sha1: &str) -> DerivedCopies {
-        use sha1::{Digest, Sha1};
-
         let instrumented = format!("instrumented-{jar_leaf}");
         let mut out = DerivedCopies {
             incomplete: self.incomplete,
@@ -495,7 +492,9 @@ impl DerivedIndex {
                 out.stale.push(path.clone());
             } else if name == jar_leaf || name == instrumented {
                 match crate::utils::fs::read_regular_to_bytes_sync(path) {
-                    Ok(bytes) if hash_eq(&hex::encode(Sha1::digest(&bytes)), pristine_sha1) => {
+                    Ok(bytes)
+                        if hash_eq(&crate::utils::digest::sha1_hex_of(&bytes), pristine_sha1) =>
+                    {
                         out.stale.push(path.clone())
                     }
                     Ok(_) => out.unknown.push(path.clone()),
