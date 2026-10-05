@@ -383,6 +383,28 @@ pub fn parse_required_versions(content: &str) -> HashMap<String, String> {
     out
 }
 
+/// The module path the go.mod `module` directive declares, in its
+/// single-line (`module example.com/m`) or block (`module ( … )`) form,
+/// quoted or bare, with a trailing `//` comment and a leading BOM allowed.
+/// `None` when the directive is missing, takes other than exactly one
+/// token (`module foo bar`), or names an empty, still-quoted (`module ""`)
+/// or unsafe path.
+pub fn module_path(text: &str) -> Option<String> {
+    let text = normalize_for_read(text);
+    let mut first = None;
+    let _ = for_each_directive_body(&text, "module", |_, body| {
+        first.get_or_insert_with(|| body.to_string());
+        Ok(())
+    });
+    let body = first?;
+    let mut toks = body.split_whitespace();
+    let module = toks.next()?;
+    let plausible = toks.next().is_none()
+        && !module.contains(['"', '`'])
+        && crate::patch::path_safety::is_safe_multi_segment(module);
+    plausible.then(|| module.to_string())
+}
+
 /// A go.mod-grammar file (go.mod / go.work) as the go command tokenizes it,
 /// for the read-only parsers: a leading UTF-8 BOM dropped and every Go
 /// string literal whose contents need no unescaping (no `\`, no whitespace
@@ -926,6 +948,47 @@ mod tests {
     }
 
     // ── parse ────────────────────────────────────────────────────────
+    #[test]
+    fn module_path_reads_every_directive_form() {
+        let m = |t: &str| module_path(t);
+        let gin = Some("github.com/gin-gonic/gin".to_string());
+        assert_eq!(m("module github.com/gin-gonic/gin\n\ngo 1.21\n"), gin);
+        assert_eq!(m("module \"github.com/gin-gonic/gin\"\n"), gin);
+        assert_eq!(m("module `github.com/gin-gonic/gin`\n"), gin);
+        assert_eq!(m("module\tgithub.com/gin-gonic/gin\n"), gin);
+        assert_eq!(m("module github.com/gin-gonic/gin // note\n"), gin);
+        assert_eq!(m("module github.com/gin-gonic/gin   \n"), gin);
+        assert_eq!(m("\u{feff}module github.com/gin-gonic/gin\r\n"), gin);
+        assert_eq!(m("// header\n\nmodule github.com/gin-gonic/gin\n"), gin);
+        assert_eq!(
+            m("module (\n\tgithub.com/gin-gonic/gin\n)\n\ngo 1.21\n"),
+            gin
+        );
+        assert_eq!(m("module (\n\t\"github.com/gin-gonic/gin\" // c\n)\n"), gin);
+    }
+
+    #[test]
+    fn module_path_rejects_malformed_directives() {
+        for text in [
+            "",
+            "go 1.21\n\nrequire (\n\tgithub.com/gin-gonic/gin v1.9.1\n)\n",
+            "module\n",
+            "module \"\"\n\ngo 1.21\n",
+            "  module \"\"  \n",
+            "module \"foo bar\"\n",
+            "module github.com/foo/bar extra junk\n",
+            "modulepath github.com/should/not/match\n",
+            "modulepath = x\n",
+            "module ()\n",
+            "module (\n)\n",
+            "module ../x\n",
+            "module /abs/path\n",
+            "module C:/x\n",
+        ] {
+            assert_eq!(module_path(text), None, "{text:?}");
+        }
+    }
+
     #[test]
     fn test_parse_single_and_block() {
         let gomod = "\
