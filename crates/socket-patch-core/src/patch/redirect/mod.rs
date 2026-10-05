@@ -3101,8 +3101,9 @@ fn unquote_rc_value(raw: &str) -> &str {
     raw
 }
 
-/// The last `yarn-offline-mirror` value in a `.yarnrc` (`key value` lines,
-/// key optionally quoted, `#` comments); later lines override earlier ones.
+/// The last `yarn-offline-mirror` value in a `.yarnrc` (`key value` or
+/// `key: value` lines, key optionally quoted, `#` comments); later lines
+/// override earlier ones.
 fn yarnrc_value_of_offline_mirror(text: &str) -> Option<String> {
     let mut found = None;
     for line in text.lines() {
@@ -3115,12 +3116,16 @@ fn yarnrc_value_of_offline_mirror(text: &str) -> Option<String> {
                 Some((key, rest)) => (key, rest),
                 None => continue,
             },
-            None => match line.split_once(|c: char| c.is_whitespace()) {
+            // yarn's `.yarnrc` parser also ends an unquoted key at `:`, so
+            // `key: value` and `key:value` set the key like `key value`.
+            None => match line.split_once(|c: char| c.is_whitespace() || c == ':') {
                 Some((key, rest)) => (key, rest),
                 None => (line, ""),
             },
         };
         if key == YARN_OFFLINE_MIRROR_KEY {
+            let rest = rest.trim_start();
+            let rest = rest.strip_prefix(':').unwrap_or(rest);
             found = Some(unquote_rc_value(rest).to_string());
         }
     }
@@ -9395,6 +9400,10 @@ mod tests {
             (YARNRC_REL, "yarn-offline-mirror \"./mirror\"\n"),
             (YARNRC_REL, "# offline\n\"yarn-offline-mirror\" ./mirror\n"),
             (YARNRC_REL, "yarn-offline-mirror ./mirror\r\n"),
+            (YARNRC_REL, "yarn-offline-mirror: ./mirror\n"),
+            (YARNRC_REL, "yarn-offline-mirror:./mirror\n"),
+            (YARNRC_REL, "yarn-offline-mirror : \"./mirror\"\n"),
+            (YARNRC_REL, "\"yarn-offline-mirror\": \"./mirror\"\n"),
             (npmrc::NPMRC_REL, "yarn-offline-mirror = ./mirror\n"),
             (npmrc::NPMRC_REL, "yarn-offline-mirror=\"./mirror\"\n"),
         ];
@@ -9441,9 +9450,11 @@ mod tests {
             "http://p.test/lp.tgz",
             "sha512-PATCHED==",
         );
-        let cases: [&[(&str, &str)]; 6] = [
+        let cases: [&[(&str, &str)]; 8] = [
             &[],
             &[(YARNRC_REL, "yarn-offline-mirror false\n")],
+            &[(YARNRC_REL, "yarn-offline-mirror: false\n")],
+            &[(YARNRC_REL, "yarn-offline-mirror:\n")],
             &[(YARNRC_REL, "yarn-offline-mirror \"\"\n")],
             &[(YARNRC_REL, "yarn-offline-mirror-pruning true\n# yarn-offline-mirror ./m\n")],
             &[(npmrc::NPMRC_REL, "[scope]\nyarn-offline-mirror=./m\n")],
