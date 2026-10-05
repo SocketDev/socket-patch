@@ -1276,7 +1276,7 @@ async fn find_pipenv_virtualenv_site_packages_with(
     // name under WORKON_HOME; an empty file means the default placement.
     let dot_venv = cwd.join(".venv");
     if dot_venv.is_file() {
-        if let Ok(text) = std::fs::read_to_string(&dot_venv) {
+        if let Ok(text) = crate::utils::fs::read_regular_to_string_sync(&dot_venv) {
             let name = text.trim();
             if !name.is_empty() {
                 if name.contains('/') || name.contains('\\') {
