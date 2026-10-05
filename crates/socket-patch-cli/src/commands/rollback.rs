@@ -2,9 +2,7 @@ use clap::Args;
 use socket_patch_core::api::blob_fetcher::{fetch_blobs_by_hash, format_fetch_result};
 use socket_patch_core::api::client::{get_api_client_with_overrides, ApiClient};
 use socket_patch_core::crawlers::{CrawlerOptions, Ecosystem};
-use socket_patch_core::manifest::cleanup_blobs::{
-    cleanup_unused_archives, cleanup_unused_blobs, CleanupResult,
-};
+use socket_patch_core::manifest::cleanup_blobs::{ArtifactReferences, CleanupResult};
 use socket_patch_core::manifest::operations::{
     get_before_hash_blobs, read_manifest, write_manifest,
 };
@@ -30,54 +28,6 @@ use crate::ecosystem_dispatch::{find_all_packages_for_rollback, partition_purls}
 use crate::json_envelope::Command as EnvelopeCommand;
 use crate::looks_like_uuid;
 use crate::ui::{plural, StatusLine};
-
-/// Pin the beforeHash blobs of `purls` into `reference` as synthetic keep
-/// records: `cleanup_unused_blobs` keeps only afterHash blobs (beforeHash
-/// blobs are normally re-downloadable on demand), so each pinned
-/// before-hash is listed in an afterHash slot. Scoped to REVERT data only
-/// — the pinned entries' real afterHash blobs stay sweepable like any
-/// other orphan. Shared by rollback's default GC and `remove`'s
-/// crawler-miss guard.
-pub(crate) fn pin_before_hash_blobs<'a>(
-    reference: &mut PatchManifest,
-    source: &PatchManifest,
-    purls: impl IntoIterator<Item = &'a String>,
-) {
-    for purl in purls {
-        let Some(record) = source.patches.get(purl) else {
-            continue;
-        };
-        let pinned: HashMap<String, PatchFileInfo> = record
-            .files
-            .iter()
-            .filter(|(_, info)| !info.before_hash.is_empty())
-            .map(|(file, info)| {
-                // A synthetic key so pins never clobber the real file rows
-                // of an entry that REMAINS in the reference (whose afterHash
-                // blobs must stay kept). The sweep reads only the hash
-                // VALUES, never the keys, and this reference manifest is
-                // in-memory only.
-                (
-                    format!("{file}#beforeHash-pin"),
-                    PatchFileInfo {
-                        before_hash: String::new(),
-                        after_hash: info.before_hash.clone(),
-                    },
-                )
-            })
-            .collect();
-        if pinned.is_empty() {
-            continue; // every file was created-by-patch: no revert blobs
-        }
-        if let Some(existing) = reference.patches.get_mut(purl) {
-            existing.files.extend(pinned);
-        } else {
-            let mut keep_record = record.clone();
-            keep_record.files = pinned;
-            reference.patches.insert(purl.clone(), keep_record);
-        }
-    }
-}
 
 #[derive(Args)]
 pub struct RollbackArgs {
@@ -810,38 +760,6 @@ pub(crate) struct HostedLegOutcome {
     pub(crate) unsupported: Vec<String>,
     pub(crate) warnings: Vec<(String, String)>,
     pub(crate) edited_files: std::collections::BTreeSet<String>,
-}
-
-/// One GC pass over `.socket/blobs`, `diffs` and `packages` against
-/// `reference` (the post-removal manifest with the revert blobs a later
-/// rollback needs pinned in). Each directory reports separately: callers
-/// own the warn-and-continue posture and the wording. The core sweep
-/// removes an emptied directory, so a fully reverted project keeps none
-/// of the three. Shared by rollback's GC, remove's post-removal sweep and
-/// repair's cleanup phase.
-pub(crate) struct ArtifactSweep {
-    pub(crate) blobs: std::io::Result<CleanupResult>,
-    pub(crate) diffs: std::io::Result<CleanupResult>,
-    pub(crate) packages: std::io::Result<CleanupResult>,
-}
-
-pub(crate) async fn sweep_unused_artifacts(
-    reference: &PatchManifest,
-    socket_dir: &Path,
-    dry_run: bool,
-) -> ArtifactSweep {
-    ArtifactSweep {
-        blobs: cleanup_unused_blobs(reference, &socket_dir.join("blobs"), dry_run).await,
-        diffs: cleanup_unused_archives(reference, &socket_dir.join("diffs"), dry_run).await,
-        // Nothing writes or reads `.socket/packages/` any more; sweep the
-        // leftover directory whole.
-        packages: cleanup_unused_archives(
-            &PatchManifest::default(),
-            &socket_dir.join("packages"),
-            dry_run,
-        )
-        .await,
-    }
 }
 
 /// The `cleanup_failed` detail for one sweep pass labelled `label`: the
@@ -1661,35 +1579,19 @@ pub async fn run(args: RollbackArgs) -> i32 {
             }
 
             // ── GC ───────────────────────────────────────────────────────
-            // Sweep against the post-removal manifest, with beforeHash
-            // blobs pinned (synthetic afterHash-slot records — the sweep
-            // keeps only afterHash blobs) for (a) removed-but-not-installed
-            // entries — a crawler miss must not destroy the only local
-            // revert data — and (b) in-scope entries that FAILED this run:
-            // their entries stay, and the blobs the gate just downloaded
-            // must survive for an offline retry.
+            // Removal retains originals for active patches and crawler misses.
             let mut gc_json: serde_json::Value = serde_json::json!({ "skipped": true });
             let mut gc_bytes_freed: u64 = 0;
             if cleanup_allowed {
-                // Pin the beforeHash blobs of EVERY entry remaining in the
-                // manifest (still-active patches keep their revert data —
-                // an eco-scoped or failed run must never destroy the blobs
-                // a later rollback needs) plus removed-but-not-installed
-                // entries (remove's crawler-miss guard). Blobs referenced
-                // only by genuinely-removed entries are what gets swept.
-                let pinned_purls: Vec<String> = removed
-                    .iter()
-                    .filter(|p| not_installed.contains(p))
-                    .chain(updated_manifest.patches.keys())
-                    .cloned()
-                    .collect();
-                // The post-removal manifest is not needed past the sweep:
-                // it becomes the (pin-augmented) reference in place.
-                let mut cleanup_reference = updated_manifest;
-                pin_before_hash_blobs(&mut cleanup_reference, &manifest, pinned_purls.iter());
-                let sweep =
-                    sweep_unused_artifacts(&cleanup_reference, &socket_dir, args.common.dry_run)
-                        .await;
+                let references = ArtifactReferences::after_removal(
+                    &manifest,
+                    &updated_manifest,
+                    removed
+                        .iter()
+                        .filter(|p| not_installed.contains(p))
+                        .map(String::as_str),
+                );
+                let sweep = references.sweep(&socket_dir, args.common.dry_run).await;
                 let mut removed_counts = [0usize; 3];
                 for (slot, (label, result)) in removed_counts.iter_mut().zip([
                     ("blob", sweep.blobs),
@@ -4415,60 +4317,6 @@ mod tests {
             blob_entries,
             vec![index_before_hash],
             "the committable blobs dir must be untouched by a dry run"
-        );
-    }
-
-    /// A purl absent from the source manifest contributes nothing to the
-    /// GC reference: the pin loop skips it (the lookup-miss `continue`)
-    /// rather than inserting an empty synthetic keep record, and present
-    /// purls around it still pin normally.
-    #[test]
-    fn pin_before_hash_blobs_skips_purls_absent_from_source() {
-        let mut present = make_record("uuid-present");
-        present.files.insert(
-            "package/index.js".to_string(),
-            PatchFileInfo {
-                before_hash: "beefbeef".to_string(),
-                after_hash: "cafecafe".to_string(),
-            },
-        );
-        let mut source = PatchManifest {
-            patches: HashMap::new(),
-            setup: None,
-        };
-        source
-            .patches
-            .insert("pkg:npm/present@1.0.0".to_string(), present);
-
-        let mut reference = PatchManifest {
-            patches: HashMap::new(),
-            setup: None,
-        };
-        let purls = [
-            "pkg:npm/ghost@9.9.9".to_string(),
-            "pkg:npm/present@1.0.0".to_string(),
-        ];
-        pin_before_hash_blobs(&mut reference, &source, purls.iter());
-
-        assert!(
-            !reference.patches.contains_key("pkg:npm/ghost@9.9.9"),
-            "a purl the source manifest does not hold must not grow a \
-             synthetic record, got {:?}",
-            reference.patches.keys().collect::<Vec<_>>()
-        );
-        let pinned = reference
-            .patches
-            .get("pkg:npm/present@1.0.0")
-            .expect("the present purl must still pin");
-        assert_eq!(pinned.files.len(), 1, "got {:?}", pinned.files);
-        assert_eq!(
-            pinned
-                .files
-                .get("package/index.js#beforeHash-pin")
-                .expect("synthetic pin key")
-                .after_hash,
-            "beefbeef",
-            "the beforeHash must be pinned in an afterHash slot"
         );
     }
 

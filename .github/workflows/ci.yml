@@ -176,16 +176,22 @@ jobs:
           done
 
       - name: Shell — shellcheck the release scripts
-        run: shellcheck scripts/version-sync.sh scripts/bump-version.sh scripts/release-lint.sh scripts/dispatch-publish.sh
+        run: shellcheck scripts/version-sync.sh scripts/release-lint.sh scripts/dispatch-publish.sh
 
   # Release-readiness gate (scripts/release-lint.sh — the same checks the
   # Release workflow's `version` job runs before publishing anything):
   #   - every PR/push: version coherence — version-sync.sh must be a no-op,
   #     so a hand-edited version in any single packaging site fails CI here
   #     instead of surfacing mid-release;
-  #   - PRs that bump the workspace version (release/vX.Y.Z bump PRs): the
-  #     full gate — CHANGELOG has a dated, non-empty section for the new
-  #     version and the tag doesn't already exist.
+  #   - the release train's rolling `release-sync` PR (docs/release-train/
+  #     DESIGN.md §3.7), which moves main to the newest cut tag (rc or
+  #     stable): CHANGELOG has a non-empty section for that version and the
+  #     tag already exists. Only a same-repo `release-sync` branch targeting
+  #     main gets this path; the same branch name from a fork (or aimed at
+  #     another base) gets the full gate below;
+  #   - any other PR that bumps the workspace version: the full gate —
+  #     CHANGELOG has a dated, non-empty section for the new version and the
+  #     tag doesn't already exist.
   release-readiness:
     runs-on: ubuntu-latest
     steps:
@@ -198,7 +204,16 @@ jobs:
         env:
           EVENT_NAME: ${{ github.event_name }}
           BASE_SHA: ${{ github.event.pull_request.base.sha }}
+          HEAD_REF: ${{ github.head_ref }}
+          BASE_REF: ${{ github.base_ref }}
+          HEAD_REPO: ${{ github.event.pull_request.head.repo.full_name }}
+          REPO: ${{ github.repository }}
         run: |
+          if [ "$EVENT_NAME" = "pull_request" ] && [ "$HEAD_REF" = "release-sync" ] \
+              && [ "$HEAD_REPO" = "$REPO" ] && [ "$BASE_REF" = "main" ]; then
+            bash scripts/release-lint.sh --tag-exists
+            exit 0
+          fi
           if [ "$EVENT_NAME" = "pull_request" ]; then
             # Compare the workspace version against the PR base to detect a
             # version bump. The shallow checkout doesn't have the base
@@ -215,10 +230,14 @@ jobs:
           bash scripts/release-lint.sh --sync-only
 
   test:
+    # No ubuntu-latest leg: `coverage` runs this same `cargo test
+    # --workspace` (debug, default features, plus Go and vexctl) on ubuntu,
+    # instrumented, and fails on any test failure. A plain ubuntu leg ran
+    # every Linux test a second time for ~12 job-minutes per run.
     strategy:
       fail-fast: false
       matrix:
-        os: [ubuntu-latest, macos-latest, windows-latest]
+        os: [macos-latest, windows-latest]
     runs-on: ${{ matrix.os }}
     timeout-minutes: 50
     steps:
@@ -371,9 +390,10 @@ jobs:
   coverage:
     # Code coverage via cargo-llvm-cov (LLVM source-based instrumentation).
     # Reports as a markdown table in the job summary and uploads the raw
-    # lcov.info file as a workflow artifact. No threshold gating — this is
-    # report-only so contributors get visibility without flaky CI when
-    # coverage shifts naturally with test edits.
+    # lcov.info file as a workflow artifact. No threshold gating — the
+    # numbers are report-only so contributors get visibility without flaky
+    # CI when coverage shifts naturally with test edits. A failing TEST
+    # fails the job: this is the Linux leg of `test`.
     runs-on: ubuntu-latest
     timeout-minutes: 35
     permissions:
@@ -406,6 +426,29 @@ jobs:
         with:
           save-if: ${{ github.ref == 'refs/heads/main' }}
 
+      - name: Install Go (for vexctl and the real-go suites)
+        # This job is the Linux leg of `test` (see there): same Go pin.
+        uses: actions/setup-go@4a3601121dd01d1626a1e23e37211e3254c1c06c # v6.4.0
+        with:
+          go-version: '1.24'
+          cache: false
+
+      - name: Install vexctl
+        # The v0.3.0 Linux release binary, as in `test`'s vexctl step.
+        env:
+          VEXCTL_VERSION: v0.3.0
+          VEXCTL_SHA256_LINUX_AMD64: cd7f8b57d20642166ed4eb3dd1fd849bbb30bbd7c5b9f5b0316b6003b57ceaba
+        run: |
+          set -euo pipefail
+          dir="$RUNNER_TEMP/vexctl-bin"
+          mkdir -p "$dir"
+          curl -fsSL --retry 5 --retry-all-errors -o "$dir/vexctl" \
+            "https://github.com/openvex/vexctl/releases/download/$VEXCTL_VERSION/vexctl-linux-amd64"
+          echo "$VEXCTL_SHA256_LINUX_AMD64  $dir/vexctl" | sha256sum -c -
+          chmod +x "$dir/vexctl"
+          "$dir/vexctl" version
+          echo "$dir" >> "$GITHUB_PATH"
+
       - name: Run tests with coverage
         # Two-step pattern: `--no-report` runs instrumented tests and
         # collects the raw profile data, then the two `report` calls
@@ -418,8 +461,14 @@ jobs:
         # docker-e2e feature — those tests need Docker images this job
         # doesn't build. The coverage-docker matrix covers them
         # separately, and coverage-merge stitches everything together.
+        #
+        # This is also the gating Linux test run (`test` has no ubuntu
+        # leg), hence `test`'s Go env and `--no-fail-fast`.
+        env:
+          SOCKET_PATCH_GO_E2E_REQUIRED: '1'
+          SOCKET_PATCH_GO_E2E_VERSION: '1.24'
         run: |
-          cargo llvm-cov --workspace \
+          cargo llvm-cov --workspace --no-fail-fast \
             --no-report
           cargo llvm-cov report --lcov --output-path coverage-host.lcov
           cargo llvm-cov report --summary-only | tee coverage-summary.txt
@@ -968,6 +1017,9 @@ jobs:
           - {os: ubuntu-latest, suite: mode_migration_bun, bun: '1.2.23', test_filter: --include-ignored}
           - {os: ubuntu-latest, suite: e2e_bun_lockb, bun: '1.0.36', test_filter: --include-ignored}
           - {os: ubuntu-latest, suite: e2e_bun_lockb, bun: '1.1.45', test_filter: --include-ignored}
+          # Bun >= 1.4 migrating a hosted workspace bun.lockb to bun.lock
+          # (#803): the only binary-lock test whose reader must be 1.4+.
+          - {os: ubuntu-latest, suite: e2e_bun_lockb, bun: '1.4.2', test_filter: --include-ignored workspace_text_migration_heals_on_rerun}
           # Real-vlt capstones (DESIGN §8.4): wiremock patch service and a local
           # npm registry fed from npmjs, driven by the pinned vlt release
           # (`node vlt.js`, installed below from a sha512-checked `npm pack`).
@@ -1479,7 +1531,7 @@ jobs:
   # steps.
   e2e-full:
     if: github.event_name != 'pull_request' || github.head_ref == 'release/v5-prerelease'
-    needs: [test, e2e-build]
+    needs: [test, coverage, e2e-build]
     strategy:
       fail-fast: false
       matrix:
@@ -1616,7 +1668,7 @@ jobs:
   # ----------------------------------------------------------------------
   yarn-classic-matrix:
     name: yarn-classic ${{ matrix.release }}
-    needs: test
+    needs: [test, coverage]
     runs-on: ubuntu-latest
     timeout-minutes: 40
     strategy:
@@ -1652,7 +1704,7 @@ jobs:
 
   yarn-berry-e2e:
     name: yarn-berry ${{ matrix.yarn }} (${{ matrix.os }})
-    needs: test
+    needs: [test, coverage]
     strategy:
       fail-fast: false
       matrix:
@@ -1693,7 +1745,7 @@ jobs:
   yarn-berry-full:
     name: yarn-berry ${{ matrix.yarn }} (${{ matrix.os }})
     if: github.event_name != 'pull_request' || github.head_ref == 'release/v5-prerelease'
-    needs: test
+    needs: [test, coverage]
     strategy:
       fail-fast: false
       matrix:
@@ -1714,7 +1766,7 @@ jobs:
   # e2e_safety_cargo_build (its headline test honours the knobs).
   cargo-vex-matrix:
     name: cargo ${{ matrix.toolchain }} lock-v${{ matrix.lock || 'own' }} (${{ matrix.os }})
-    needs: [test, e2e-build]
+    needs: [test, coverage, e2e-build]
     runs-on: ${{ matrix.os }}
     timeout-minutes: 40
     # What .cargo/config.toml's [env] gives processes cargo launches; these
@@ -1785,7 +1837,7 @@ jobs:
   cargo-vex-matrix-full:
     name: cargo ${{ matrix.toolchain }} lock-v${{ matrix.lock || 'own' }} (${{ matrix.os }})
     if: github.event_name != 'pull_request' || github.head_ref == 'release/v5-prerelease'
-    needs: [test, e2e-build]
+    needs: [test, coverage, e2e-build]
     runs-on: ${{ matrix.os }}
     timeout-minutes: 40
     # What .cargo/config.toml's [env] gives processes cargo launches; these
@@ -1817,7 +1869,7 @@ jobs:
   # available; this leg pulls both images and requires them.
   cargo-old-toolchains:
     name: cargo old toolchains (manifest [patch])
-    needs: test
+    needs: [test, coverage]
     runs-on: ubuntu-latest
     timeout-minutes: 30
     steps:
