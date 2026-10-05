@@ -16,7 +16,7 @@ use socket_patch_core::manifest::operations::{read_manifest, write_manifest};
 pub(crate) use socket_patch_core::manifest::records::record_from_patch_response;
 use socket_patch_core::manifest::records::{build_patch_record, files_for_manifest};
 use socket_patch_core::manifest::schema::{PatchFileInfo, PatchManifest, PatchRecord};
-use socket_patch_core::patch::apply::{is_valid_blob_hash, select_installed_variants};
+use socket_patch_core::patch::apply::{is_valid_blob_hash, select_installed_variants_any};
 use socket_patch_core::patch::apply_lock::{LockError, LockGuard};
 use socket_patch_core::telemetry::{track_patch_fetch_failed, track_patch_fetched};
 use socket_patch_core::utils::concurrent::{api_concurrency_for, ordered_concurrent};
@@ -39,7 +39,8 @@ use crate::commands::vlt_preflight::{
     vlt_refusal_for, vlt_vendor_preflight_selected, VltVendorRefusal,
 };
 use crate::ecosystem_dispatch::{
-    crawl_all_ecosystems, find_packages_for_rollback, partition_purls,
+    crawl_all_ecosystems, find_all_packages_for_rollback, find_packages_for_rollback,
+    partition_purls,
 };
 use crate::ui::{print_json, select_one, SelectError};
 
@@ -1271,7 +1272,10 @@ async fn filter_to_installed_releases(
     // Release-variant PURLs only (PyPI / RubyGems / Maven); partition_purls
     // splits them by ecosystem, so no filter is needed.
     let partitioned = partition_purls(&all_qualified, None);
-    let paths = find_packages_for_rollback(&partitioned, crawler_options, true).await;
+    // Every copy: a Maven base can sit in `~/.m2` and in each Gradle cache,
+    // with different classifiers in each (narrowing takes a variant any copy
+    // holds); the other ecosystems narrow on their first copy, as before.
+    let paths = find_all_packages_for_rollback(&partitioned, crawler_options, true).await;
 
     // Every installed base's variant views, fetched concurrently (at most
     // `api_concurrency` in flight) in the order the loop below consumes
@@ -1294,10 +1298,20 @@ async fn filter_to_installed_releases(
     ));
 
     for (base, variants) in multi {
-        // Any variant's resolved path works — they all map to the same
-        // installed package directory.
-        let pkg_path = variants.iter().find_map(|s| paths.get(&s.purl)).cloned();
-        let Some(pkg_path) = pkg_path else {
+        // Any variant's resolved paths work — they all map to the same
+        // installed package directories.
+        let pkg_paths = variants
+            .iter()
+            .find_map(|s| paths.get(&s.purl))
+            .filter(|p| !p.is_empty())
+            .map(|p| {
+                if base.starts_with("pkg:maven/") {
+                    p.clone()
+                } else {
+                    p[..1].to_vec()
+                }
+            });
+        let Some(pkg_paths) = pkg_paths else {
             // Not installed: cannot determine the relevant release. Keep
             // every variant so the patch is still obtainable.
             warnings.push(format!(
@@ -1347,7 +1361,7 @@ async fn filter_to_installed_releases(
         // Keep every variant present on disk. PyPI/RubyGems install one
         // distribution per env (≤1 match); Maven classifier jars coexist
         // so several may match.
-        let matched = select_installed_variants(&pkg_path, &refs).await;
+        let matched = select_installed_variants_any(&pkg_paths, &refs).await;
         if matched.is_empty() {
             // Installed, but no variant matches the on-disk bytes. Fall
             // back to broad rather than silently dropping a package the

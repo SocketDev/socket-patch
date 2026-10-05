@@ -20,14 +20,15 @@
 //!   vendoring the lockfiles are byte-unchanged, `:app` runtimeClasspath
 //!   resolves the vendored jar online and `--offline`, a tampered vendored
 //!   jar fails the build with the socket-patch message, and
-//!   `vendor --revert` is byte-exact.
+//!   `vendor --revert` is byte-exact. It needs no Maven: the CLI reads the
+//!   registry bytes from the Gradle cache the build fills.
 //!
 //! Gated like the other real-toolchain capstones: `#[ignore]` (network to
 //! Maven Central), Maven via `SOCKET_PATCH_MAVEN_E2E_{MVN,VERSION,REQUIRED}`
 //! (`maven_build_common`), Gradle via `SOCKET_PATCH_GRADLE_E2E_GRADLE` (the
 //! launcher; default `gradle` on `PATH`), `SOCKET_PATCH_GRADLE_E2E_VERSION`
 //! (the version it must report) and `SOCKET_PATCH_GRADLE_E2E_REQUIRED` (no
-//! SKIP). Scratch trees go under `TMPDIR`.
+//! SKIP) (`gradle_build_common`). Scratch trees go under `TMPDIR`.
 
 #[path = "maven_build_common/mod.rs"]
 mod maven_build_common;
@@ -35,67 +36,59 @@ mod maven_build_common;
 #[path = "prebuilt_common/mod.rs"]
 mod prebuilt_common;
 
+#[path = "gradle_build_common/mod.rs"]
+mod gradle_build_common;
+
+#[path = "jvm_fixture_repo/mod.rs"]
+mod jvm_fixture_repo;
+
 use std::collections::BTreeMap;
-use std::ffi::OsString;
 use std::path::{Path, PathBuf};
 use std::process::{Command, Output};
 
+use gradle_build_common::{
+    assert_patched, configuration_reused, fixture_root, gradle_classpath, gradle_skip, init_script,
+    lockfiles, mirror_init_script, print_cp_task, probe_report, snapshot, write_both_dsls,
+    write_project, Dsl, Gradle,
+};
 use maven_build_common::*;
 
 const UUID: &str = "1d3c1fd2-7b4e-4c1a-9f0e-2a3b4c5d6e7f";
 const SV: &str = "1.10.0-socket.1d3c1fd2";
-
-const GRADLE_ENV: &str = "SOCKET_PATCH_GRADLE_E2E_GRADLE";
-const GRADLE_VERSION_ENV: &str = "SOCKET_PATCH_GRADLE_E2E_VERSION";
-const GRADLE_REQUIRED_ENV: &str = "SOCKET_PATCH_GRADLE_E2E_REQUIRED";
 
 /// The classpath probe. Not [`DEPENDENCY_PLUGIN`]: 3.6.x itself depends on
 /// `commons-text:1.10.0` (3.5.0 on 1.3), so purging the fixture version from
 /// the local repository would break the plugin realm, not the project.
 const CLASSPATH_PLUGIN: &str = "org.apache.maven.plugins:maven-dependency-plugin:3.5.0";
 
-/// Directories a build writes that a checkout never carries.
-const BUILD_OUTPUT_DIRS: &[&str] = &["target", "build", ".gradle", ".kotlin"];
-
 fn binary() -> PathBuf {
     env!("CARGO_BIN_EXE_socket-patch").into()
-}
-
-/// Java rejects the extended Windows paths returned by canonicalize.
-/// Keep a canonical root for symlinked macOS temp directories, but use the
-/// ordinary drive/UNC spelling when handing paths to Maven and Gradle.
-fn fixture_root(tmp: &tempfile::TempDir) -> PathBuf {
-    let root = tmp.path().canonicalize().unwrap();
-    #[cfg(windows)]
-    if let Some(path) = root.to_str() {
-        if let Some(rest) = path.strip_prefix(r"\\?\UNC\") {
-            return format!(r"\\{rest}").into();
-        }
-        if let Some(rest) = path.strip_prefix(r"\\?\") {
-            return rest.into();
-        }
-    }
-    root
 }
 
 fn git_sha256(bytes: &[u8]) -> String {
     socket_patch_core::hash::git_sha256::compute_git_sha256_from_bytes(bytes)
 }
 
-/// `socket-patch <args>` with ambient `SOCKET_*` scrubbed and `m2` as the Maven repo.
-fn socket(cwd: &Path, m2: &Path, args: &[&str]) -> (Option<i32>, serde_json::Value, String) {
+/// `socket-patch <args>` with ambient `SOCKET_*` scrubbed, `m2` as the Maven
+/// repo and, when given, `gradle_home` as the `GRADLE_USER_HOME` the CLI
+/// crawls (and the fixture registry serves).
+fn socket_in(
+    cwd: &Path,
+    m2: &Path,
+    gradle_home: Option<&Path>,
+    args: &[&str],
+) -> (Option<i32>, serde_json::Value, String) {
     let mut cmd = Command::new(binary());
     for (k, _) in std::env::vars_os() {
         if k.to_string_lossy().starts_with("SOCKET_") {
             cmd.env_remove(&k);
         }
     }
-    let _fixture = prebuilt_common::prepare_command(
-        &mut cmd,
-        cwd,
-        args,
-        &[("MAVEN_REPO_LOCAL", m2.to_str().unwrap())],
-    );
+    let mut caches = vec![("MAVEN_REPO_LOCAL", m2.to_str().unwrap())];
+    if let Some(home) = gradle_home {
+        caches.push(("GRADLE_USER_HOME", home.to_str().unwrap()));
+    }
+    let _fixture = prebuilt_common::prepare_command(&mut cmd, cwd, args, &caches);
     let out = cmd
         .current_dir(cwd)
         .env("SOCKET_TELEMETRY_DISABLED", "1")
@@ -113,9 +106,14 @@ fn socket(cwd: &Path, m2: &Path, args: &[&str]) -> (Option<i32>, serde_json::Val
 }
 
 fn vendor(proj: &Path, m2: &Path) -> serde_json::Value {
-    let (code, env, stderr) = socket(
+    vendor_in(proj, m2, None)
+}
+
+fn vendor_in(proj: &Path, m2: &Path, gradle_home: Option<&Path>) -> serde_json::Value {
+    let (code, env, stderr) = socket_in(
         proj,
         m2,
+        gradle_home,
         &[
             "vendor",
             "--json",
@@ -130,9 +128,14 @@ fn vendor(proj: &Path, m2: &Path) -> serde_json::Value {
 }
 
 fn revert(proj: &Path, m2: &Path) {
-    let (code, env, stderr) = socket(
+    revert_in(proj, m2, None)
+}
+
+fn revert_in(proj: &Path, m2: &Path, gradle_home: Option<&Path>) {
+    let (code, env, stderr) = socket_in(
         proj,
         m2,
+        gradle_home,
         &[
             "vendor",
             "--revert",
@@ -174,33 +177,6 @@ fn stage_manifest(proj: &Path, member_before: &[u8], member_after: &[u8]) {
         member_after,
     )
     .unwrap();
-}
-
-/// Every committable file under `root` (build output skipped), keyed by its
-/// forward-slash relative path.
-fn snapshot(root: &Path) -> BTreeMap<String, Vec<u8>> {
-    fn walk(root: &Path, dir: &Path, out: &mut BTreeMap<String, Vec<u8>>) {
-        for entry in std::fs::read_dir(dir).unwrap() {
-            let entry = entry.unwrap();
-            let name = entry.file_name().to_string_lossy().into_owned();
-            let path = entry.path();
-            if entry.file_type().unwrap().is_dir() {
-                if !BUILD_OUTPUT_DIRS.contains(&name.as_str()) {
-                    walk(root, &path, out);
-                }
-                continue;
-            }
-            let rel = path
-                .strip_prefix(root)
-                .unwrap()
-                .to_string_lossy()
-                .replace('\\', "/");
-            out.insert(rel, std::fs::read(&path).unwrap());
-        }
-    }
-    let mut out = BTreeMap::new();
-    walk(root, root, &mut out);
-    out
 }
 
 /// `(changed, added, removed)` paths from `before` to `after`.
@@ -578,109 +554,6 @@ fn maven_reactor_vendor_fresh_checkout_offline_build_and_byte_exact_revert() {
 
 // ── P2: Gradle multi-project with dependency locking ────────────────────
 
-fn gradle_flag(name: &str) -> bool {
-    std::env::var_os(name).is_some_and(|v| !v.is_empty())
-}
-
-fn gradle_skip(suite: &str, why: &str) {
-    assert!(
-        !gradle_flag(GRADLE_REQUIRED_ENV),
-        "{suite}: {GRADLE_REQUIRED_ENV} is set but the Gradle capstone cannot run: {why}"
-    );
-    println!("SKIP {suite}: {why}");
-}
-
-/// The selected Gradle launcher, run hermetically: a per-test
-/// `GRADLE_USER_HOME`, no daemon, plain console, ambient options scrubbed.
-struct Gradle {
-    program: OsString,
-    version: String,
-}
-
-impl Gradle {
-    fn command(program: &OsString, home: Option<&Path>) -> Command {
-        let mut cmd = Command::new(program);
-        for key in ["GRADLE_OPTS", "JAVA_OPTS", "GRADLE_USER_HOME"] {
-            cmd.env_remove(key);
-        }
-        for key in CI_DETECTOR_ENV {
-            cmd.env_remove(key);
-        }
-        if let Some(home) = home {
-            cmd.env("GRADLE_USER_HOME", home);
-        }
-        cmd
-    }
-
-    fn detect(suite: &str, home: &Path) -> Option<Gradle> {
-        let program: OsString = std::env::var_os(GRADLE_ENV)
-            .filter(|v| !v.is_empty())
-            .unwrap_or_else(|| {
-                if cfg!(windows) {
-                    "gradle.bat"
-                } else {
-                    "gradle"
-                }
-                .into()
-            });
-        let out = match Self::command(&program, Some(home))
-            .args(["--version", "--no-daemon"])
-            .output()
-        {
-            Ok(out) => out,
-            Err(e) => {
-                gradle_skip(
-                    suite,
-                    &format!("`{}` did not run: {e}", program.to_string_lossy()),
-                );
-                return None;
-            }
-        };
-        let banner = String::from_utf8_lossy(&out.stdout).into_owned();
-        let Some(version) = banner.lines().find_map(|l| {
-            l.trim()
-                .strip_prefix("Gradle ")
-                .map(|v| v.trim().to_string())
-        }) else {
-            gradle_skip(
-                suite,
-                &format!(
-                    "`{} --version` printed no `Gradle <v>` banner:\n{}{}",
-                    program.to_string_lossy(),
-                    banner,
-                    String::from_utf8_lossy(&out.stderr)
-                ),
-            );
-            return None;
-        };
-        if let Some(pin) = std::env::var(GRADLE_VERSION_ENV)
-            .ok()
-            .filter(|v| !v.is_empty())
-        {
-            assert_eq!(
-                version,
-                pin,
-                "{GRADLE_VERSION_ENV} pins Gradle {pin} but `{}` is Gradle {version}",
-                program.to_string_lossy()
-            );
-        }
-        println!(
-            "{suite}: driving Gradle {version} ({})",
-            program.to_string_lossy()
-        );
-        Some(Gradle { program, version })
-    }
-
-    fn run(&self, cwd: &Path, home: &Path, args: &[&str]) -> Output {
-        Self::command(&self.program, Some(home))
-            .current_dir(cwd)
-            .args(["--no-daemon", "--console=plain", "--stacktrace"])
-            .args(args)
-            .output()
-            .expect("spawn gradle")
-    }
-}
-
 const GRADLE_SETTINGS: &str = r#"buildscript {
     repositories { mavenCentral() }
     dependencies { classpath("org.apache.commons:commons-text:1.10.0") }
@@ -726,9 +599,9 @@ dependencyLocking {
 }
 
 tasks.register("printRuntimeClasspath") {
-    val runtime = configurations.named("runtimeClasspath")
+    val runtime: FileCollection = files(configurations.named("runtimeClasspath"))
     doLast {
-        runtime.get().files.forEach { println("SOCKET-CP " + it.absolutePath) }
+        runtime.files.forEach { println("SOCKET-CP " + it.absolutePath) }
     }
 }
 "#;
@@ -737,33 +610,32 @@ const APPLY_LINE: &str =
     r#"apply(from = ".socket/gradle/socket-patch.settings.gradle") // socket-patch"#;
 
 fn write_gradle_project(proj: &Path) {
-    for (rel, body) in [
-        ("settings.gradle.kts", GRADLE_SETTINGS),
-        ("lib/build.gradle.kts", GRADLE_LIB),
-        ("app/build.gradle.kts", GRADLE_APP),
-    ] {
-        let path = proj.join(rel);
-        std::fs::create_dir_all(path.parent().unwrap()).unwrap();
-        std::fs::write(path, body).unwrap();
-    }
+    write_project(
+        proj,
+        &[
+            ("settings.gradle.kts", GRADLE_SETTINGS),
+            ("lib/build.gradle.kts", GRADLE_LIB),
+            ("app/build.gradle.kts", GRADLE_APP),
+        ],
+    );
 }
 
-/// The `SOCKET-CP` lines `:app:printRuntimeClasspath` printed.
-fn gradle_classpath(out: &Output) -> Vec<PathBuf> {
-    String::from_utf8_lossy(&out.stdout)
-        .lines()
-        .filter_map(|l| l.strip_prefix("SOCKET-CP "))
-        .map(PathBuf::from)
-        .collect()
-}
-
-/// Every Gradle lockfile under `root`: `<project>/gradle.lockfile` on 7+,
-/// `<project>/gradle/dependency-locks/<configuration>.lockfile` on 6.x.
-fn lockfiles(root: &Path) -> BTreeMap<String, Vec<u8>> {
-    snapshot(root)
-        .into_iter()
-        .filter(|(rel, _)| rel.ends_with(".lockfile"))
-        .collect()
+/// The registry jar of the fixture GAV as the build cached it in
+/// `gradle_home`'s `files-2.1` (the multi-project capstone's only copy).
+fn gradle_cached_jar(gradle_home: &Path) -> Vec<u8> {
+    let version_dir = gradle_home
+        .join(prebuilt_common::GRADLE_FILES21)
+        .join(GROUP)
+        .join(ARTIFACT)
+        .join(VERSION);
+    let leaf = format!("{ARTIFACT}-{VERSION}.jar");
+    let jars: Vec<PathBuf> = std::fs::read_dir(&version_dir)
+        .unwrap_or_else(|e| panic!("{}: {e}", version_dir.display()))
+        .map(|e| e.unwrap().path().join(&leaf))
+        .filter(|p| p.is_file())
+        .collect();
+    assert_eq!(jars.len(), 1, "one cached {leaf}: {jars:?}");
+    std::fs::read(&jars[0]).unwrap()
 }
 
 fn gradle_tree_rel() -> String {
@@ -772,8 +644,11 @@ fn gradle_tree_rel() -> String {
 
 fn assert_gradle_vendored(out: &Output, checkout: &Path, patched: &[u8], what: &str) {
     assert!(ok(out), "{what}:\n{}", dump(out));
+    // A configuration-cache reuse (the CI `configuration-cache` rows) skips
+    // the settings script; the run that stored the entry asserted it.
     assert!(
-        String::from_utf8_lossy(&out.stdout).contains("SOCKET-SETTINGS-PATCHED true"),
+        configuration_reused(out)
+            || String::from_utf8_lossy(&out.stdout).contains("SOCKET-SETTINGS-PATCHED true"),
         "{what}: settings buildscript must load the patched jar:\n{}",
         dump(out)
     );
@@ -798,7 +673,7 @@ fn assert_gradle_vendored(out: &Output, checkout: &Path, patched: &[u8], what: &
 }
 
 #[test]
-#[ignore = "real Gradle + Maven + Maven Central (fixture); run with --ignored"]
+#[ignore = "real Gradle + Maven Central (fixture); run with --ignored"]
 fn gradle_multi_project_vendor_locked_offline_tamper_and_byte_exact_revert() {
     const SUITE: &str = "e2e_vendor_jvm_build::gradle";
     let tmp = tempfile::tempdir().unwrap();
@@ -807,50 +682,11 @@ fn gradle_multi_project_vendor_locked_offline_tamper_and_byte_exact_revert() {
     let Some(gradle) = Gradle::detect(SUITE, &gradle_home) else {
         return;
     };
-    // The crawler reads a maven repository: seed it with the registry bytes.
-    let Some(mvn) = Mvn::detect(SUITE) else {
-        return;
-    };
+    // No Maven seed: the crawler reads the Gradle cache the build fills, and
+    // the vendor plan sources parent poms and BOM metadata from it offline.
+    // `m2` stays empty so the user's own ~/.m2 is never consulted.
     let m2 = root.join("m2");
-    let settings = root.join("settings.xml");
-    write_settings(&settings, &[]);
-    std::fs::create_dir_all(root.join("seed")).unwrap();
-    let out = mvn.run(
-        &root.join("seed"),
-        &m2,
-        &settings,
-        &[
-            &format!("{DEPENDENCY_PLUGIN}:get"),
-            &format!("-Dartifact={GROUP}:{ARTIFACT}:{VERSION}"),
-        ],
-    );
-    if !ok(&out) {
-        skip(
-            SUITE,
-            &format!(
-                "seeding the maven repo from Central failed:\n{}",
-                dump(&out)
-            ),
-        );
-        return;
-    }
-    // Gradle verifies the standalone parent's import as well as the child's
-    // effective import. Maven does not fetch the former or their module metadata.
-    for version in ["5.9.0", "5.9.1"] {
-        let out = mvn.run(
-            &root.join("seed"),
-            &m2,
-            &settings,
-            &[
-                &format!("{DEPENDENCY_PLUGIN}:get"),
-                &format!("-Dartifact=org.junit:junit-bom:{version}:module"),
-                "-Dtransitive=false",
-            ],
-        );
-        assert!(ok(&out), "seeding imported BOM metadata:\n{}", dump(&out));
-    }
-    let jar =
-        std::fs::read(repo_dir(&m2, VERSION).join(format!("{ARTIFACT}-{VERSION}.jar"))).unwrap();
+    std::fs::create_dir_all(&m2).unwrap();
 
     let proj = root.join("proj");
     write_gradle_project(&proj);
@@ -869,6 +705,7 @@ fn gradle_multi_project_vendor_locked_offline_tamper_and_byte_exact_revert() {
         );
         return;
     }
+    let jar = gradle_cached_jar(&gradle_home);
     let locked = lockfiles(&proj);
     for project in ["app", "lib"] {
         assert!(
@@ -911,7 +748,7 @@ fn gradle_multi_project_vendor_locked_offline_tamper_and_byte_exact_revert() {
     stage_manifest(&proj, &orig, &patched);
     let before = snapshot(&proj);
 
-    let env = vendor(&proj, &m2);
+    let env = vendor_in(&proj, &m2, Some(&gradle_home));
     assert_eq!(env["summary"]["applied"], 1, "{env}");
     println!("vendor envelope: {env}");
     let vendored = snapshot(&proj);
@@ -921,6 +758,9 @@ fn gradle_multi_project_vendor_locked_offline_tamper_and_byte_exact_revert() {
         socket_patch_core::vendor::jvm::gradle::SCRIPT_REL.to_string(),
         socket_patch_core::vendor::jvm::gradle::INDEX_REL.to_string(),
         ".socket/vendor/gradle/.gitattributes".to_string(),
+        ".socket/gradle/.gitattributes".to_string(),
+        ".socket/vendor/.gitattributes".to_string(),
+        socket_patch_core::vendor::jvm::gradle::derived_metadata_rel(GROUP, ARTIFACT),
         format!("{tree}/{ARTIFACT}-{VERSION}.jar"),
         format!("{tree}/{ARTIFACT}-{VERSION}.pom"),
         format!("{tree}/socket-patch.vendor.json"),
@@ -955,7 +795,7 @@ fn gradle_multi_project_vendor_locked_offline_tamper_and_byte_exact_revert() {
     );
 
     // Idempotent: a second vendor run changes no project file.
-    vendor(&proj, &m2);
+    vendor_in(&proj, &m2, Some(&gradle_home));
     let (changed, added, removed) = diff(&vendored, &snapshot(&proj));
     assert!(
         changed.iter().all(|p| p == ".socket/vendor/state.json")
@@ -1035,7 +875,7 @@ fn gradle_multi_project_vendor_locked_offline_tamper_and_byte_exact_revert() {
     println!("{SUITE}: Gradle {} green", gradle.version);
 
     // Byte-exact revert of the source project.
-    revert(&proj, &m2);
+    revert_in(&proj, &m2, Some(&gradle_home));
     assert_restored(&proj, &before);
     assert!(
         !proj.join(".socket/vendor").exists(),
@@ -1045,4 +885,215 @@ fn gradle_multi_project_vendor_locked_offline_tamper_and_byte_exact_revert() {
         !proj.join(".socket/gradle").exists(),
         ".socket/gradle residue"
     );
+}
+
+// ── P3: the fake Central through the mirror init script ─────────────────
+
+/// Settings with a buildscript-classpath library whose class prints a
+/// marker from build logic, and `FAIL_ON_PROJECT_REPOS` + `mavenCentral()`.
+fn smoke_settings(dsl: Dsl) -> String {
+    let (classpath, mode) = match dsl {
+        Dsl::Groovy => (
+            "classpath 'com.socketfixture:buildlogic-plugin:1.0'",
+            "repositoriesMode.set(RepositoriesMode.FAIL_ON_PROJECT_REPOS)",
+        ),
+        Dsl::Kotlin => (
+            "classpath(\"com.socketfixture:buildlogic-plugin:1.0\")",
+            "repositoriesMode.set(RepositoriesMode.FAIL_ON_PROJECT_REPOS)",
+        ),
+    };
+    let (name, include) = match dsl {
+        Dsl::Groovy => ("rootProject.name = 'smoke'", "include 'app'"),
+        Dsl::Kotlin => ("rootProject.name = \"smoke\"", "include(\"app\")"),
+    };
+    format!(
+        "buildscript {{\n    repositories {{ mavenCentral() }}\n    dependencies {{ {classpath} }}\n}}\n\
+         com.socketfixture.buildlogic.BuildLogic.print()\n\
+         dependencyResolutionManagement {{\n    {mode}\n    repositories {{ mavenCentral() }}\n}}\n\
+         {name}\n{include}\n"
+    )
+}
+
+/// `:app` reaches the victim only through `consumer-range`'s pom range
+/// `[1.9,1.11)`, so Gradle lists versions from the artifact-level
+/// `maven-metadata.xml` and must pick 1.10.0 (the settings classpath
+/// requests it literally, through `buildlogic-plugin`).
+fn smoke_app(dsl: Dsl) -> String {
+    let body = match dsl {
+        Dsl::Groovy => {
+            "plugins { id 'java' }\n\ndependencies {\n    \
+             implementation 'com.socketfixture:consumer-range:2.0'\n}\n"
+        }
+        Dsl::Kotlin => {
+            "plugins { java }\n\ndependencies {\n    \
+             implementation(\"com.socketfixture:consumer-range:2.0\")\n}\n"
+        }
+    };
+    format!("{body}\n{}", print_cp_task(dsl, "runtimeClasspath"))
+}
+
+#[test]
+#[ignore = "real Gradle (the fake Central, no network); run with --ignored"]
+fn gradle_multi_project_fake_central_mirror_smoke_both_dsls() {
+    use jvm_fixture_repo::*;
+    const SUITE: &str = "e2e_vendor_jvm_build::fake_central";
+    let tmp = tempfile::tempdir().unwrap();
+    let root = fixture_root(&tmp);
+    let home = root.join("gradle-home");
+    let Some(gradle) = Gradle::detect(SUITE, &home) else {
+        return;
+    };
+    let central = FakeCentral::start();
+    let init = init_script(
+        &root.join("init"),
+        "mirror.gradle",
+        &mirror_init_script(&central.uri(), None),
+    );
+    let projects = write_both_dsls(&root.join("proj"), |dsl| {
+        vec![
+            (dsl.settings_file(), smoke_settings(dsl)),
+            (format!("app/{}", dsl.build_file()), smoke_app(dsl)),
+        ]
+    });
+    let pristine = notice(&format!("{GROUP}:{VICTIM}:{VICTIM_VERSION}"), "pristine");
+    let jar = generate()[&repo_path(VICTIM, VICTIM_VERSION, None, "jar")].clone();
+    for (dsl, proj) in projects {
+        let what = format!("Gradle {} {} DSL", gradle.version, dsl.name());
+        let out = gradle.run(
+            &proj,
+            &home,
+            &[&init[0], &init[1], ":app:printRuntimeClasspath"],
+        );
+        let consumed = assert_patched(&out, VICTIM, NOTICE, pristine.as_bytes(), &what);
+        assert!(
+            String::from_utf8_lossy(&out.stdout).contains(&format!(
+                "{BUILDLOGIC_MARKER}{}",
+                victim_marker(VICTIM_VERSION, "pristine")
+            )),
+            "{what}: the settings buildscript class prints the victim marker:\n{}",
+            gradle_build_common::dump(&out)
+        );
+        let files21 = home.join("caches/modules-2/files-2.1");
+        assert!(
+            consumed.starts_with(&files21),
+            "{what}: resolved into the per-test Gradle cache: {}",
+            consumed.display()
+        );
+        assert_eq!(
+            std::fs::read(&consumed).unwrap(),
+            jar,
+            "{what}: the fixture bytes"
+        );
+        let hash_dir = consumed
+            .parent()
+            .and_then(|p| p.file_name())
+            .unwrap()
+            .to_string_lossy()
+            .into_owned();
+        let sha1 = sha1_hex(&jar);
+        assert_eq!(
+            format!("{hash_dir:0>40}"),
+            sha1,
+            "{what}: the hash dir names the jar's sha1 (leading zeros may be dropped)"
+        );
+        probe_report(
+            &format!("fake-central-smoke-{}-{}", gradle.version, dsl.name()),
+            &serde_json::json!({
+                "gradle": gradle.version,
+                "jvm": gradle.jvm,
+                "dsl": dsl.name(),
+                "resolved": consumed.to_string_lossy(),
+                "sha256": sha256_hex(&jar),
+                "sha1": sha1,
+                "hashDir": hash_dir,
+                "leadingZeroKept": hash_dir.len() == 40,
+            }),
+        );
+    }
+    let requests = central.requests();
+    for leaf in [
+        repo_path(VICTIM, VICTIM_VERSION, None, "jar"),
+        repo_path(BUILDLOGIC, BUILDLOGIC_VERSION, None, "jar"),
+        format!("{GROUP_PATH}/{VICTIM}/maven-metadata.xml"),
+    ] {
+        assert!(
+            requests.contains(&format!("/{leaf}")),
+            "the fake Central served {leaf}: {requests:?}"
+        );
+    }
+    println!("{SUITE}: Gradle {} green", gradle.version);
+}
+
+/// [`print_cp_task`] is configuration-cache safe in both DSLs: the store run
+/// and the reuse run each print the classpath. This is what the
+/// gradle-compatibility.yml `configuration-cache` rows rely on for every
+/// suite's printRuntimeClasspath assertion.
+#[test]
+#[ignore = "real Gradle (the fake Central, no network); run with --ignored"]
+fn gradle_multi_project_print_cp_configuration_cache_both_dsls() {
+    use jvm_fixture_repo::*;
+    const SUITE: &str = "e2e_vendor_jvm_build::print_cp_configuration_cache";
+    let tmp = tempfile::tempdir().unwrap();
+    let root = fixture_root(&tmp);
+    let home = root.join("gradle-home");
+    let Some(gradle) = Gradle::detect(SUITE, &home) else {
+        return;
+    };
+    // Stable (and warning-free for the `java` plugin) from 8.1.
+    if !gradle.at_least(8, 1) {
+        println!(
+            "{SUITE}: Gradle {} predates the stable configuration cache; nothing to check",
+            gradle.version
+        );
+        return;
+    }
+    let central = FakeCentral::start();
+    let init = init_script(
+        &root.join("init"),
+        "mirror.gradle",
+        &mirror_init_script(&central.uri(), None),
+    );
+    let projects = write_both_dsls(&root.join("proj"), |dsl| {
+        vec![
+            (dsl.settings_file(), smoke_settings(dsl)),
+            (format!("app/{}", dsl.build_file()), smoke_app(dsl)),
+        ]
+    });
+    let pristine = notice(&format!("{GROUP}:{VICTIM}:{VICTIM_VERSION}"), "pristine");
+    for (dsl, proj) in projects {
+        for run in ["store", "reuse"] {
+            let what = format!(
+                "Gradle {} {} DSL configuration cache {run}",
+                gradle.version,
+                dsl.name()
+            );
+            let out = gradle.run(
+                &proj,
+                &home,
+                &[
+                    &init[0],
+                    &init[1],
+                    "--configuration-cache",
+                    ":app:printRuntimeClasspath",
+                ],
+            );
+            assert_patched(&out, VICTIM, NOTICE, pristine.as_bytes(), &what);
+            let log = format!(
+                "{}{}",
+                String::from_utf8_lossy(&out.stdout),
+                String::from_utf8_lossy(&out.stderr)
+            );
+            let want = if run == "store" {
+                "Configuration cache entry stored"
+            } else {
+                "Configuration cache entry reused"
+            };
+            assert!(
+                log.contains(want),
+                "{what}: expected `{want}`:\n{}",
+                gradle_build_common::dump(&out)
+            );
+        }
+    }
+    println!("{SUITE}: Gradle {} green", gradle.version);
 }

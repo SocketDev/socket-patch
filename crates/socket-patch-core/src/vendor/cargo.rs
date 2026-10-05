@@ -566,7 +566,9 @@ async fn cargo_prelude(
     if let Err(e) = cargo_manifest::check_source_alias(&manifest_doc) {
         return Err(refused(e.code(), e.detail().to_string()));
     }
-    if let Some(detail) = workspace_root_refusal(project_root, &manifest_doc).await {
+    if let Some(detail) =
+        workspace_root_refusal(project_root, &manifest_doc, VENDORED_ROOT_HINT).await
+    {
         return Err(refused(NOT_WORKSPACE_ROOT, detail));
     }
     let manifest_entries = cargo_manifest::crates_io_patch_entries(&manifest_doc);
@@ -1505,15 +1507,22 @@ async fn unwind_manifest(
 /// workspace root (cargo ignores `[patch]` in member manifests).
 pub const NOT_WORKSPACE_ROOT: &str = "cargo_manifest_not_workspace_root";
 
+const VENDORED_ROOT_HINT: &str = "cargo ignores `[patch]` outside the workspace-root manifest; \
+                                  run socket-patch from the workspace root (the directory \
+                                  holding its Cargo.toml and Cargo.lock)";
+
 /// `Some(detail)` when `<project_root>/Cargo.toml` is not the workspace
 /// root cargo reads `[patch]` from: it names another root
 /// (`package.workspace`), or — having no `[workspace]` table of its own —
 /// an ancestor directory's `[workspace]` claims it (cargo's own
 /// `find_root`: the nearest ancestor workspace that does not `exclude` it;
-/// an unparseable ancestor manifest is skipped).
-async fn workspace_root_refusal(
+/// an unparseable ancestor manifest is skipped). `hint` closes the
+/// detail: why the mode needs the root, and what to run instead. Hosted
+/// mode shares the check (`hosted::governing_root::refusal`).
+pub(crate) async fn workspace_root_refusal(
     project_root: &Path,
     doc: &toml_edit::DocumentMut,
+    hint: &str,
 ) -> Option<String> {
     if doc
         .get("workspace")
@@ -1521,8 +1530,6 @@ async fn workspace_root_refusal(
     {
         return None;
     }
-    let hint = "cargo ignores `[patch]` outside the workspace-root manifest; run socket-patch \
-                from the workspace root (the directory holding its Cargo.toml and Cargo.lock)";
     if let Some(ws) = doc
         .get("package")
         .and_then(toml_edit::Item::as_table_like)
@@ -1838,7 +1845,7 @@ async fn move_wiring_into_manifest(
         .map_err(|e| e.to_string())?;
     let doc = cargo_manifest::parse_manifest(&text).map_err(|e| e.to_string())?;
     cargo_manifest::check_source_alias(&doc).map_err(|e| e.to_string())?;
-    if let Some(detail) = workspace_root_refusal(project_root, &doc).await {
+    if let Some(detail) = workspace_root_refusal(project_root, &doc, VENDORED_ROOT_HINT).await {
         return Err(detail);
     }
     let manifest_entries = cargo_manifest::crates_io_patch_entries(&doc);
