@@ -2,7 +2,7 @@
 //! branches:
 //!
 //! * an uncreatable cache directory — the dir is created by the first
-//!   verified download inside `write_cache_entry_atomic`, never up front,
+//!   download inside `stream_cache_entry_atomic`, never up front,
 //!   so the failure is a per-entry "Failed to write ... to disk" and a
 //!   fetch that lands nothing leaves no `.socket/blobs/` husk — driven
 //!   cross-platform via ENOTDIR (the target directory is routed *through
@@ -11,7 +11,7 @@
 //!   twin is tested in `blob_fetcher_edges_e2e.rs`, this one never ran;
 //! * the "Failed to write blob/archive to disk" arms where the download
 //!   succeeded but the atomic cache write failed (unix-only, read-only directory);
-//! * mixed-outcome aggregation across `download_hashes` arms — each arm
+//! * mixed-outcome aggregation across `download_entries` arms — each arm
 //!   is individually covered by the sibling suite, but a single run
 //!   combining success + 404 + hash-mismatch never was.
 //!
@@ -497,7 +497,7 @@ async fn fetch_missing_sources_diff_disk_write_failure_is_per_archive_failure() 
 
 // ── Mixed-outcome aggregation ────────────────────────────────────────
 
-/// One run combining all three `download_hashes` arms: a good blob, a
+/// One run combining all three `download_entries` arms: a good blob, a
 /// 404, and a hash-mismatch. Counters aggregate per-arm, each entry
 /// carries its own arm's error, only the good blob lands on disk, and
 /// `format_fetch_result` renders the genuinely mixed result.

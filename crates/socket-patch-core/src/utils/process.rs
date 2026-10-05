@@ -24,7 +24,7 @@ use std::process::Command;
 /// no entry holds one.
 ///
 /// Shared by every tool the CLI spawns from inside a scanned project
-/// (`git`, `vlt`, `node`, `pipenv`): a relative `PATH`
+/// (`git`, `vlt`, `node`, `pipenv`, `hatch`): a relative `PATH`
 /// component (`.`, an empty string) resolves against the child's cwd, so a
 /// bare `Command::new("git")` would execute a `git` planted in the repository
 /// being scanned — and on macOS `posix_spawnp` can run BOTH the planted

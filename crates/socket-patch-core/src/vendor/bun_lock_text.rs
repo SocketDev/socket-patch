@@ -291,6 +291,237 @@ pub(crate) fn decode_json_string(token: &str) -> Option<String> {
     serde_json::from_str::<String>(token).ok()
 }
 
+/// The dependency groups a `workspaces` member lists, in both the lock and
+/// its `package.json`.
+const WORKSPACE_DEP_GROUPS: [&str; 4] = [
+    "dependencies",
+    "devDependencies",
+    "optionalDependencies",
+    "peerDependencies",
+];
+
+/// One `"key": "value"` line, decoded: `(indent, key, value, trailing_comma)`.
+fn parse_string_pair_line(line: &str) -> Option<(usize, String, String, bool)> {
+    let line = line.strip_suffix('\r').unwrap_or(line);
+    let indent = line.len() - line.trim_start().len();
+    let s = &line[indent..];
+    let key_end = scan_json_string(s).ok()?;
+    let key = decode_json_string(&s[..key_end])?;
+    let rest = s[key_end..].strip_prefix(": ")?;
+    let value_end = scan_json_string(rest).ok()?;
+    let value = decode_json_string(&rest[..value_end])?;
+    let trailing_comma = match &rest[value_end..] {
+        "" => false,
+        "," => true,
+        _ => return None,
+    };
+    Some((indent, key, value, trailing_comma))
+}
+
+/// A `"key": {` line at exactly `indent` spaces: the decoded key.
+fn object_open_key(line: &str, indent: usize) -> Option<String> {
+    let line = line.strip_suffix('\r').unwrap_or(line);
+    let s = line.strip_prefix(&" ".repeat(indent))?;
+    let key_end = scan_json_string(s).ok()?;
+    if &s[key_end..] != ": {" {
+        return None;
+    }
+    decode_json_string(&s[..key_end])
+}
+
+/// A `}` / `},` line at exactly `indent` spaces.
+fn is_object_close(line: &str, indent: usize) -> bool {
+    let line = line.strip_suffix('\r').unwrap_or(line);
+    line.strip_prefix(&" ".repeat(indent))
+        .is_some_and(|rest| matches!(rest, "}" | "},"))
+}
+
+/// One dependency line of a `workspaces` member.
+struct WorkspaceDepLine {
+    line_idx: usize,
+    /// The member's lock key (`""` is the root).
+    workspace: String,
+    group: String,
+    name: String,
+    literal: String,
+}
+
+/// The `workspaces` section in bun's emitted shape.
+struct WorkspacesSection {
+    /// Each member's `(key, name)`, in lock order.
+    members: Vec<(String, Option<String>)>,
+    deps: Vec<WorkspaceDepLine>,
+}
+
+/// Parse the `workspaces` section. `None` when there is no section or it
+/// deviates from bun's emitted shape anywhere (fail closed).
+fn parse_workspaces_section(lines: &[String]) -> Option<WorkspacesSection> {
+    let start = lines
+        .iter()
+        .position(|l| l.strip_suffix('\r').unwrap_or(l) == "  \"workspaces\": {")?;
+    let mut members = Vec::new();
+    let mut deps = Vec::new();
+    let mut idx = start + 1;
+    loop {
+        let line = lines.get(idx)?;
+        if is_object_close(line, 2) {
+            return Some(WorkspacesSection { members, deps });
+        }
+        let workspace = object_open_key(line, 4)?;
+        let mut name = None;
+        idx += 1;
+        loop {
+            let line = lines.get(idx)?;
+            if is_object_close(line, 4) {
+                break;
+            }
+            if let Some(group) = object_open_key(line, 6) {
+                // Only the dependency groups hold `name: literal` pairs;
+                // any other object member is skipped up to its close.
+                let is_dep_group = WORKSPACE_DEP_GROUPS.contains(&group.as_str());
+                idx += 1;
+                loop {
+                    let line = lines.get(idx)?;
+                    if is_object_close(line, 6) {
+                        break;
+                    }
+                    if is_dep_group {
+                        let (indent, dep, literal, _) = parse_string_pair_line(line)?;
+                        if indent != 8 {
+                            return None;
+                        }
+                        deps.push(WorkspaceDepLine {
+                            line_idx: idx,
+                            workspace: workspace.clone(),
+                            group: group.clone(),
+                            name: dep,
+                            literal,
+                        });
+                    }
+                    idx += 1;
+                }
+            } else if let Some((6, key, value, _)) = parse_string_pair_line(line) {
+                if key == "name" {
+                    name = Some(value);
+                }
+            } else if line
+                .strip_prefix("      \"")
+                .is_none_or(|rest| rest.starts_with(' '))
+            {
+                // Not a member field at the member's own indent.
+                return None;
+            }
+            idx += 1;
+        }
+        members.push((workspace, name));
+        idx += 1;
+    }
+}
+
+/// The member directories a `bun.lock` lists under `workspaces` (`""` is
+/// the project root), in lock order. Empty when the section is absent or
+/// not in bun's emitted shape.
+pub(crate) fn workspace_member_dirs(lines: &[String]) -> Vec<String> {
+    parse_workspaces_section(lines)
+        .map(|section| section.members.into_iter().map(|(dir, _)| dir).collect())
+        .unwrap_or_default()
+}
+
+/// Whether a `workspaces` key is a plain relative directory (`""` is the
+/// root): no `..`, no absolute or drive-prefixed path, no backslash. Only
+/// such a member's `package.json` is ever read.
+pub(crate) fn is_plain_member_dir(dir: &str) -> bool {
+    !dir.contains(['\\', ':'])
+        && std::path::Path::new(dir)
+            .components()
+            .all(|c| matches!(c, std::path::Component::Normal(_)))
+}
+
+/// One workspace dependency literal [`heal_workspace_literals`] rewrote.
+pub(crate) struct WorkspaceLiteralHeal {
+    /// `<member>:<group>:<dependency>`, e.g. `packages/m1:dependencies:m2`.
+    pub(crate) key: String,
+    pub(crate) original: String,
+    pub(crate) new: String,
+}
+
+/// Put back the `workspace:` literal a member's `package.json` declares
+/// wherever the lock spells that inter-workspace dependency as the
+/// target member's path instead.
+///
+/// A hosted or vendored `bun.lockb` stores the resolved member path as the
+/// dependency literal (`normalize_workspace_behaviors`, which older binary
+/// readers need). Bun 1.4 carries that path into `bun.lock` when it
+/// migrates the lock to text, and its text reader then compares it with
+/// the manifest's `workspace:*`, re-resolves the member and drops every
+/// hosted or vendored tuple (#803): frozen installs fail and an unfrozen
+/// one installs the unpatched registry bytes. Bun writes the manifest's
+/// literal itself, so this restores exactly its own output.
+///
+/// Only a line whose literal is the path of a member with the dependency's
+/// own name, and whose declaring manifest (read by `manifest`, keyed by
+/// member dir, `""` for the root) spells it `workspace:…`, is touched.
+/// Anything else, including a lock not in bun's emitted shape, is left
+/// alone. A version-0 lock is never touched either: Bun 1.1 writes the
+/// bare path there itself.
+pub(crate) fn heal_workspace_literals(
+    lines: &mut [String],
+    mut manifest: impl FnMut(&str) -> Option<String>,
+) -> Vec<WorkspaceLiteralHeal> {
+    let head = lines.iter().take(5).cloned().collect::<Vec<_>>().join("\n");
+    if lock_version(&head).is_none_or(|v| v < 1) {
+        return Vec::new();
+    }
+    let Some(WorkspacesSection { members, deps }) = parse_workspaces_section(lines) else {
+        return Vec::new();
+    };
+    let mut manifests = std::collections::HashMap::<String, Option<serde_json::Value>>::new();
+    let mut heals = Vec::new();
+    for dep in deps {
+        let points_at_member = members.iter().any(|(dir, name)| {
+            !dir.is_empty() && *dir == dep.literal && name.as_deref() == Some(dep.name.as_str())
+        });
+        if !points_at_member || !is_plain_member_dir(&dep.workspace) {
+            continue;
+        }
+        let declared = manifests
+            .entry(dep.workspace.clone())
+            .or_insert_with(|| {
+                manifest(&dep.workspace).and_then(|text| serde_json::from_str(&text).ok())
+            })
+            .as_ref()
+            .and_then(|json| json.get(&dep.group))
+            .and_then(|group| group.get(&dep.name))
+            .and_then(serde_json::Value::as_str)
+            .map(str::to_string);
+        let Some(declared) = declared.filter(|d| d.starts_with("workspace:")) else {
+            continue;
+        };
+        let original = lines[dep.line_idx].clone();
+        // Only the value token changes: the key, the comma and a CRLF
+        // lock's `\r` are re-emitted verbatim.
+        let encoded =
+            serde_json::to_string(&dep.literal).expect("a String serializes to JSON infallibly");
+        let Some(at) = original.rfind(&format!(": {encoded}")) else {
+            continue;
+        };
+        let start = at + 2;
+        let new = format!(
+            "{}{}{}",
+            &original[..start],
+            serde_json::to_string(&declared).expect("a String serializes to JSON infallibly"),
+            &original[start + encoded.len()..],
+        );
+        lines[dep.line_idx] = new.clone();
+        heals.push(WorkspaceLiteralHeal {
+            key: format!("{}:{}:{}", dep.workspace, dep.group, dep.name),
+            original,
+            new,
+        });
+    }
+    heals
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
@@ -556,5 +787,127 @@ mod tests {
                 "a head without an integer version must point at a Bun re-lock: {err}"
             );
         }
+    }
+
+    /// The lock Bun 1.4.2 writes when it migrates a hosted workspace
+    /// `bun.lockb` to text (#803): the inter-workspace literals are the
+    /// member paths the binary normalization interned.
+    const MIGRATED_WORKSPACE_LOCK: &str = r#"{
+  "lockfileVersion": 2,
+  "configVersion": 1,
+  "workspaces": {
+    "": {
+      "name": "w",
+      "dependencies": {
+        "m1": "packages/m1",
+      },
+    },
+    "packages/m1": {
+      "name": "m1",
+      "version": "1.0.0",
+      "dependencies": {
+        "is-number": "7.0.0",
+        "m2": "packages/m2",
+      },
+      "devDependencies": {
+        "gh": "packages/m2",
+      },
+    },
+    "packages/m2": {
+      "name": "m2",
+      "version": "1.0.0",
+      "dependencies": {
+        "left-pad": "1.3.0",
+      },
+    },
+  },
+  "packages": {
+    "is-number": ["is-number@https://patches.example/tok/is-number-7.0.0.tgz", {}, "sha512-AAAA"],
+
+    "m1": ["m1@workspace:packages/m1"],
+
+    "m2": ["m2@workspace:packages/m2"],
+  }
+}
+"#;
+
+    fn migrated_manifests(dir: &str) -> Option<String> {
+        Some(
+            match dir {
+                "" => r#"{"name":"w","workspaces":["packages/*"],"dependencies":{"m1":"workspace:*"}}"#,
+                "packages/m1" => {
+                    r#"{"name":"m1","dependencies":{"is-number":"7.0.0","m2":"workspace:^"},"devDependencies":{"gh":"packages/m2"}}"#
+                }
+                "packages/m2" => r#"{"name":"m2","dependencies":{"left-pad":"1.3.0"}}"#,
+                _ => return None,
+            }
+            .to_string(),
+        )
+    }
+
+    #[test]
+    fn workspace_path_literals_heal_back_to_the_manifest_literal() {
+        let mut lines = to_lines(MIGRATED_WORKSPACE_LOCK);
+        assert_eq!(
+            workspace_member_dirs(&lines),
+            ["", "packages/m1", "packages/m2"]
+        );
+        let heals = heal_workspace_literals(&mut lines, migrated_manifests);
+        let keys: Vec<&str> = heals.iter().map(|h| h.key.as_str()).collect();
+        assert_eq!(keys, [":dependencies:m1", "packages/m1:dependencies:m2"]);
+        let healed = lines.join("\n");
+        // Exactly what Bun writes for the manifests: `workspace:*` and
+        // `workspace:^` restored, everything else byte-identical.
+        let expected = MIGRATED_WORKSPACE_LOCK
+            .replace(r#""m1": "packages/m1","#, r#""m1": "workspace:*","#)
+            .replace(r#""m2": "packages/m2","#, r#""m2": "workspace:^","#);
+        assert_eq!(healed, expected);
+        assert_eq!(heals[0].original, r#"        "m1": "packages/m1","#);
+        assert_eq!(heals[0].new, r#"        "m1": "workspace:*","#);
+        // Converged: a second pass finds nothing.
+        assert!(heal_workspace_literals(&mut lines, migrated_manifests).is_empty());
+    }
+
+    #[test]
+    fn workspace_literal_heal_keeps_crlf_and_fails_closed() {
+        // CRLF: the `\r` stays on the healed line.
+        let mut lines = to_lines(&MIGRATED_WORKSPACE_LOCK.replace('\n', "\r\n"));
+        let heals = heal_workspace_literals(&mut lines, migrated_manifests);
+        assert_eq!(heals.len(), 2);
+        assert_eq!(heals[0].new, "        \"m1\": \"workspace:*\",\r");
+        // No readable manifest, or a manifest that does not spell the
+        // dependency `workspace:`: the literal is left alone.
+        let mut lines = to_lines(MIGRATED_WORKSPACE_LOCK);
+        assert!(heal_workspace_literals(&mut lines, |_| None).is_empty());
+        assert!(heal_workspace_literals(&mut lines, |_| Some("{".into())).is_empty());
+        assert_eq!(lines.join("\n"), MIGRATED_WORKSPACE_LOCK);
+        // A section not in bun's emitted shape is never touched.
+        let reindented =
+            MIGRATED_WORKSPACE_LOCK.replace("    \"packages/m1\": {", "   \"packages/m1\": {");
+        let mut lines = to_lines(&reindented);
+        assert!(heal_workspace_literals(&mut lines, migrated_manifests).is_empty());
+        assert!(workspace_member_dirs(&lines).is_empty());
+        assert_eq!(lines.join("\n"), reindented);
+        // A version-0 lock spells the literal as a path itself.
+        let v0 = MIGRATED_WORKSPACE_LOCK
+            .replace("\"lockfileVersion\": 2,", "\"lockfileVersion\": 0,")
+            .replace("  \"configVersion\": 1,\n", "");
+        let mut lines = to_lines(&v0);
+        assert!(heal_workspace_literals(&mut lines, migrated_manifests).is_empty());
+        // A member dir that leaves the project is never read.
+        assert!(is_plain_member_dir("") && is_plain_member_dir("packages/m1"));
+        for dir in [
+            "../m1",
+            "/abs/m1",
+            "C:/m1",
+            "packages/../../m1",
+            "packages\\m1",
+            "./m1",
+        ] {
+            assert!(!is_plain_member_dir(dir), "{dir}");
+        }
+        // No `workspaces` section at all.
+        let mut lines = to_lines("{\n  \"lockfileVersion\": 1,\n  \"packages\": {\n  }\n}\n");
+        assert!(heal_workspace_literals(&mut lines, migrated_manifests).is_empty());
     }
 }

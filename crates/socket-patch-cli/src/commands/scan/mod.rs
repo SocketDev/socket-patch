@@ -2733,8 +2733,11 @@ async fn run_scan(
         plan_kept_rows(&mut stage, rows, selected)
     };
 
-    // Drop selections the manifest already records at the same uuid.
-    // Agent mode only: vendored mode never reads the manifest.
+    // Set aside selections the manifest already records at the same uuid.
+    // A wet agent run still hands them to the download step below, whose
+    // nested apply re-applies them after a reinstall (#454, #732); a
+    // preview only names them. Agent mode only: vendored mode never reads
+    // the manifest.
     let recorded = |p: &PatchSearchResult| {
         existing_manifest
             .as_ref()
@@ -2746,17 +2749,18 @@ async fn run_scan(
     } else {
         selected.into_iter().partition(|p| recorded(p))
     };
+    let reapply = !report_only && !args.common.dry_run;
     if !silent {
         for p in &already_recorded {
             open_paragraph(&mut skip_paragraph);
             println!(
                 "{}",
-                render::already_recorded_line(&normalize_purl(&p.purl), &p.uuid)
+                render::already_recorded_line(&normalize_purl(&p.purl), &p.uuid, reapply)
             );
         }
     }
 
-    if selected.is_empty() {
+    if selected.is_empty() && (!reapply || already_recorded.is_empty()) {
         if !silent {
             open_paragraph(&mut skip_paragraph);
             if !stage.deferred_keys().is_empty() {
@@ -2767,6 +2771,8 @@ async fn run_scan(
                 }
             } else if already_recorded.is_empty() {
                 println!("No patches selected.");
+            } else if args.common.dry_run && !report_only {
+                println!("{}", render::ALL_ALREADY_RECORDED_DRY_RUN);
             } else {
                 println!("{}", render::ALL_ALREADY_RECORDED);
             }
@@ -2776,7 +2782,7 @@ async fn run_scan(
     }
 
     // Display detailed summary of selected patches (skipped under --silent).
-    if !silent {
+    if !silent && !selected.is_empty() {
         if vendor {
             println!("\nPatches to vendor:\n");
         } else {
@@ -2930,9 +2936,16 @@ async fn run_scan(
         )
         .await
     } else {
-        let (code, _) =
-            download_and_apply_patches_with(&selected, &params, &download_run(&args, &api_client))
-                .await;
+        // The recorded selections ride along: the fetch loop skips their
+        // record and the nested apply re-applies them (a no-op on disk
+        // when the installed copy is still patched).
+        let to_download: Vec<_> = selected.iter().chain(&already_recorded).cloned().collect();
+        let (code, _) = download_and_apply_patches_with(
+            &to_download,
+            &params,
+            &download_run(&args, &api_client),
+        )
+        .await;
         code
     };
 

@@ -343,6 +343,41 @@ pub(crate) async fn fetch_wheel_metadata(
         .collect()
 }
 
+/// Served npm tarballs' own package.json once per distinct `(url,
+/// sha512)`, for the yarn berry pin's `bin:` map: the disk flow's
+/// `fetch_hosted_npm_manifest` over the provider.
+pub(crate) async fn fetch_npm_manifests(
+    provider: &Provider,
+    wanted: &BTreeSet<(String, Option<String>)>,
+    max_bytes: u64,
+) -> BTreeMap<String, Result<Option<String>, String>> {
+    let ordered: Vec<&(String, Option<String>)> = wanted.iter().collect();
+    let futures: Vec<BoxFuture<'_, _>> = ordered
+        .iter()
+        .map(
+            |(url, sha512)| -> BoxFuture<'_, Result<Option<String>, String>> {
+                Box::pin(async move {
+                    let bytes = provider
+                        .download_artifact(url, max_bytes)
+                        .await
+                        .map_err(|error| format!("cannot fetch the hosted tarball: {error}"))?;
+                    crate::hosted::npm_manifest::decode_hosted_npm_manifest(
+                        &bytes,
+                        sha512.as_deref(),
+                    )
+                    .map(Some)
+                })
+            },
+        )
+        .collect();
+    let results = join_bounded(futures, provider.concurrency).await;
+    ordered
+        .into_iter()
+        .map(|(url, _)| url.clone())
+        .zip(results)
+        .collect()
+}
+
 /// Patch views for every distinct confirmed uuid (wet runs only).
 pub(crate) async fn fetch_records(
     provider: &Provider,

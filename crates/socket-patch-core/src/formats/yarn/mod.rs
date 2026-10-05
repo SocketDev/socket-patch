@@ -8,6 +8,8 @@
 //! probe, the lock-inventory view, repair's reference flavor, both hosted
 //! rewriters and lockfile discovery cannot disagree on it.
 
+pub(crate) mod berry_entry;
+
 /// Which grammar a `yarn.lock` head declares.
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub enum YarnLockGrammar {

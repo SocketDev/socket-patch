@@ -1279,13 +1279,18 @@ impl BunLockb {
                 .then_with(|| a.tag.cmp(&b.tag))
                 .then_with(|| {
                     if let (Some(a), Some(b)) = (&a.version, &b.version) {
-                        (a.0, a.1, a.2).cmp(&(b.0, b.1, b.2)).then_with(|| {
-                            if !legacy && !a.3.is_empty() && !b.3.is_empty() {
-                                compare_prerelease(&a.3, &b.3)
-                            } else {
-                                a.3.cmp(&b.3).then_with(|| a.4.cmp(&b.4))
-                            }
-                        })
+                        // Bun's `orderWithoutTag`: a prerelease precedes its
+                        // release (`1.0.0-beta.1` < `1.0.0`) in every dialect.
+                        (a.0, a.1, a.2)
+                            .cmp(&(b.0, b.1, b.2))
+                            .then_with(|| a.3.is_empty().cmp(&b.3.is_empty()))
+                            .then_with(|| {
+                                if !legacy && !a.3.is_empty() && !b.3.is_empty() {
+                                    compare_prerelease(&a.3, &b.3)
+                                } else {
+                                    a.3.cmp(&b.3).then_with(|| a.4.cmp(&b.4))
+                                }
+                            })
                     } else if !a.repository.is_empty() {
                         a.repository.cmp(&b.repository)
                     } else {
@@ -1979,6 +1984,50 @@ mod tests {
             reopened.validate_mutation().unwrap();
             assert!(reopened.workspace_literal_changes().unwrap().is_empty());
             assert_eq!(reopened.extensions.len(), lock.extensions.len());
+            lock.restore(package.id, &snapshot).unwrap();
+            assert!(lock.bytes() == original, "{version}");
+        }
+    }
+
+    /// REGRESSION (#739): a release and a prerelease of the same
+    /// `major.minor.patch` (`uuid@8.0.0` + `uuid@8.0.0-beta.0`) hash in
+    /// semver order, prerelease first, so Bun's own lock is not refused as
+    /// a stale metadata hash.
+    #[test]
+    fn release_and_same_triple_prerelease_keep_a_valid_metahash() {
+        for version in ["0.8.1", "1.0.0", "1.1.45", "1.3.14"] {
+            let original = fixture(&format!("prerelease-pair-{version}"));
+            let mut lock = BunLockb::parse(&original).unwrap();
+            lock.validate_mutation()
+                .unwrap_or_else(|e| panic!("{version}: {e}"));
+            let versions = lock
+                .packages()
+                .unwrap()
+                .into_iter()
+                .filter(|p| p.name == "uuid")
+                .filter_map(|p| p.version)
+                .collect::<Vec<_>>();
+            assert!(
+                versions.contains(&"8.0.0".into()),
+                "{version}: {versions:?}"
+            );
+            assert!(
+                versions.contains(&"8.0.0-beta.0".into()),
+                "{version}: {versions:?}"
+            );
+            let package = lock
+                .packages()
+                .unwrap()
+                .into_iter()
+                .find(|p| p.name == "minimist")
+                .unwrap();
+            let snapshot = lock.snapshot(package.id).unwrap();
+            lock.set_package(package.id, HOSTED, &digest())
+                .unwrap_or_else(|e| panic!("{version}: {e}"));
+            BunLockb::parse(&lock.bytes())
+                .unwrap()
+                .validate_mutation()
+                .unwrap_or_else(|e| panic!("{version}: {e}"));
             lock.restore(package.id, &snapshot).unwrap();
             assert!(lock.bytes() == original, "{version}");
         }
