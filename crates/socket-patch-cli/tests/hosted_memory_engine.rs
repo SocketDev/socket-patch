@@ -984,7 +984,8 @@ async fn a_vlt_project_is_withheld_as_offline() {
         .and_then(|w| w["detail"].as_str())
         .expect("the preflight warning is reported");
     assert!(
-        detail.contains("/patch/npm/<redacted>/") && detail.contains(": offline; nothing was written"),
+        detail.contains("/patch/npm/<redacted>/")
+            && detail.contains(": offline; nothing was written"),
         "the offline refusal quotes the redacted URL"
     );
     assert!(output.changed_files.is_empty());
@@ -1027,9 +1028,12 @@ fn changed_paths(output: &HostedScanOutput) -> Vec<&str> {
 /// names, which the rewriter never pins. With a leftover `Gemfile.lock`
 /// beside it, the run used to rewrite that ignored lock, report success,
 /// and break every frozen install; the project is refused with nothing
-/// written instead. (A memory tree only finds gem candidates through a
-/// default lock; the no-leftover shape is covered on disk by
-/// `ruby_crawler`'s `loaded_manifest_reads_the_lockfile_setting`.)
+/// written instead. A memory tree only finds gem candidates through the
+/// lock bundler loads (#736), and that lock is none of the default ones
+/// here, so the project yields no gem candidate at all (as with an
+/// unsupported `BUNDLE_GEMFILE`); the `redirect_gem_bundle_lockfile_unsupported`
+/// refusal itself is covered by `ruby_crawler`'s
+/// `loaded_manifest_reads_the_lockfile_setting` and the engine unit tests.
 #[tokio::test]
 async fn a_bundler4_custom_lockfile_is_refused() {
     let (server, input) = gem_server_and_input().await;
@@ -1043,12 +1047,6 @@ async fn a_bundler4_custom_lockfile_is_refused() {
     let project = &output.projects[0];
     assert!(project.error.is_none(), "{:?}", project.error);
     assert!(project.redirected.is_empty(), "{:?}", project.redirected);
-    assert!(
-        warning_codes(&project.redirect)
-            .contains(&"redirect_gem_bundle_lockfile_unsupported".into()),
-        "{:?}",
-        warning_codes(&project.redirect)
-    );
     assert!(
         changed_paths(&output).is_empty(),
         "{:?}",
@@ -1140,7 +1138,10 @@ async fn a_bundler2_twin_still_wires_gems_rb() {
 }
 
 /// #751: twin locks written by different bundler majors leave no safe
-/// spelling to wire: refused, nothing written.
+/// spelling to wire: refused, nothing written. No lock is the one bundler
+/// loads (#736), so the memory tree yields no gem candidate to warn about;
+/// the `redirect_gem_twin_bundler_versions_diverge` refusal is covered by the
+/// engine unit tests.
 #[tokio::test]
 async fn a_twin_with_diverging_bundler_majors_is_refused() {
     let (server, input) = gem_server_and_input().await;
@@ -1149,13 +1150,54 @@ async fn a_twin_with_diverging_bundler_majors_is_refused() {
         let output = run_engine(&server, build_input(&files, &[], options(false))).await;
         let project = &output.projects[0];
         assert!(project.redirected.is_empty(), "{versions:?}");
-        assert!(
-            warning_codes(&project.redirect)
-                .contains(&"redirect_gem_twin_bundler_versions_diverge".into()),
-            "{versions:?}: {:?}",
-            warning_codes(&project.redirect)
-        );
         assert!(changed_paths(&output).is_empty());
+    }
+}
+
+/// #736: the engine's purl set comes from the lock bundler loads. A
+/// `gems.rb` project's gems live in `gems.locked`; reading only
+/// `Gemfile.lock` found nothing to redirect, and a leftover `Gemfile.lock`
+/// beside it must not change that.
+#[tokio::test]
+async fn gems_rb_project_yields_its_gem_candidates() {
+    const GEM_FIXTURE: &str = "redirect/gem/bundler/basic";
+    let server = MockServer::start().await;
+    let patches = patches_from_overrides(
+        &fixtures_root().join(GEM_FIXTURE).join("overrides.json"),
+        None,
+    );
+    mount_api(&server, &patches).await;
+    let input = fixture_files(&fixtures_root().join(GEM_FIXTURE).join("input"));
+    let renamed = |stale_twin: bool| {
+        let mut files = BTreeMap::new();
+        files.insert("gems.rb".to_string(), input["Gemfile"].clone());
+        files.insert("gems.locked".to_string(), input["Gemfile.lock"].clone());
+        if stale_twin {
+            // Locks nothing the patch API knows about.
+            files.insert(
+                "Gemfile.lock".to_string(),
+                b"GEM\n  remote: https://rubygems.org/\n  specs:\n    rake (13.0.0)\n\n\
+                  PLATFORMS\n  ruby\n\nDEPENDENCIES\n  rake\n"
+                    .to_vec(),
+            );
+        }
+        files
+    };
+    for stale_twin in [false, true] {
+        let output = run_engine(
+            &server,
+            build_input(&renamed(stale_twin), &[], options(true)),
+        )
+        .await;
+        assert_eq!(output.projects.len(), 1);
+        let project = &output.projects[0];
+        assert!(project.error.is_none(), "{:?}", project.error);
+        assert_eq!(
+            project.redirected.len(),
+            1,
+            "stale twin {stale_twin}: {}",
+            serde_json::to_string_pretty(&comparable(&output)).unwrap()
+        );
     }
 }
 

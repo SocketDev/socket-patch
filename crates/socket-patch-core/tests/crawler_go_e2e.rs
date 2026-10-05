@@ -3,9 +3,7 @@
 use std::path::Path;
 
 use serial_test::serial;
-use socket_patch_core::crawlers::go_crawler::{
-    decode_module_path, encode_module_path, parse_go_mod_module,
-};
+use socket_patch_core::crawlers::go_crawler::{decode_module_path, encode_module_path};
 use socket_patch_core::crawlers::types::CrawlerOptions;
 use socket_patch_core::crawlers::GoCrawler;
 
@@ -63,31 +61,6 @@ fn decode_module_path_no_bang_passthrough() {
         decode_module_path("github.com/gin-gonic/gin"),
         "github.com/gin-gonic/gin"
     );
-}
-
-// ── parse_go_mod_module ────────────────────────────────────────
-
-#[test]
-#[serial_test::parallel]
-fn parse_go_mod_well_formed() {
-    let content = "module github.com/gin-gonic/gin\n\ngo 1.21\n";
-    assert_eq!(
-        parse_go_mod_module(content),
-        Some("github.com/gin-gonic/gin".to_string())
-    );
-}
-
-#[test]
-#[serial_test::parallel]
-fn parse_go_mod_missing_module_returns_none() {
-    let content = "go 1.21\n";
-    assert_eq!(parse_go_mod_module(content), None);
-}
-
-#[test]
-#[serial_test::parallel]
-fn parse_go_mod_empty_returns_none() {
-    assert_eq!(parse_go_mod_module(""), None);
 }
 
 // ── find_by_purls ──────────────────────────────────────────────
@@ -263,25 +236,6 @@ async fn go_crawler_default_and_new_construct_cleanly() {
         ra.get(ORG_PURL).unwrap().path,
         rb.get(ORG_PURL).unwrap().path,
         "default() and new() must behave identically"
-    );
-}
-
-/// A `module` directive with no path (`module`) must not match — the
-/// `!rest.is_empty()` guard in `parse_go_mod_module` keeps it from being
-/// returned.
-#[test]
-#[serial_test::parallel]
-fn parse_go_mod_module_directive_with_empty_path_returns_none() {
-    assert_eq!(parse_go_mod_module("module\n"), None);
-}
-
-/// Quoted module path with whitespace — the strip-quotes branch.
-#[test]
-#[serial_test::parallel]
-fn parse_go_mod_module_quoted_path() {
-    assert_eq!(
-        parse_go_mod_module(r#"module "github.com/foo/bar""#),
-        Some("github.com/foo/bar".to_string())
     );
 }
 

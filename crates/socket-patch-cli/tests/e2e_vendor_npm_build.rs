@@ -1177,93 +1177,21 @@ fn npm_vendor_shrinkwrap_fresh_checkout_npm_ci_and_manifestless_vex() {
 /// N/A for npm >= 7 (their own v2/v3 flows are the capstones above).
 #[test]
 fn npm6_installs_a_vendored_v2_lock_from_its_legacy_mirror() {
-    let suite = "e2e_vendor_npm_build (npm 6 × v2 lock)";
-    let Some(major) = npm_major_or_skip(suite) else {
+    let Some(cell) = Npm6Cell::vendor(
+        "e2e_vendor_npm_build (npm 6 × v2 lock)",
+        &format!("{DEP}@{DEP_VERSION}"),
+        DEP,
+    ) else {
         return;
     };
-    if major > 6 {
-        println!("N/A {suite}: npm {major} is not npm 6");
-        return;
-    }
-    let Some(writer) = npm_e2e_common::modern_npm_writer() else {
-        npm_e2e_common::skip(
-            suite,
-            "no npm >= 7 to write the v2 lock (set SOCKET_PATCH_NPM_E2E_LOCK_WRITER_BIN)",
-        );
-        return;
-    };
-    let tmp = tempfile::tempdir().unwrap();
-    let proj = tmp.path().join("proj");
-    std::fs::create_dir_all(&proj).unwrap();
-    std::fs::write(
-        proj.join("package.json"),
-        r#"{"name":"vendor-npm6","version":"0.0.0","private":true}"#,
-    )
-    .unwrap();
-    let cache = tmp.path().join("npm-cache");
-    let install = npm_e2e_common::npm_command_for(&writer, &proj)
-        .args([
-            "install",
-            &format!("{DEP}@{DEP_VERSION}"),
-            "--lockfile-version",
-            "2",
-            "--no-audit",
-            "--no-fund",
-            "--cache",
-            cache.to_str().unwrap(),
-        ])
-        .output()
-        .unwrap();
-    if !install.status.success() {
-        npm_e2e_common::skip(suite, &npm_e2e_common::output_text(&install));
-        return;
-    }
-    assert_eq!(npm_e2e_common::lockfile_version(&proj), Some(2));
-    let orig = std::fs::read(proj.join("node_modules").join(DEP).join("index.js")).unwrap();
-    let patched: Vec<u8> = [MARKER.as_bytes(), orig.as_slice()].concat();
-    let purl = format!("pkg:npm/{DEP}@{DEP_VERSION}");
-    stage_patch_with_vuln(&proj, &purl, "package/index.js", &orig, &patched, TAIL_GHSA);
-    let lock_before = std::fs::read(proj.join("package-lock.json")).unwrap();
-
-    let (code, stdout, stderr) = run_socket(
-        &proj,
-        &[
-            "vendor",
-            "--json",
-            "--offline",
-            "--cwd",
-            proj.to_str().unwrap(),
-        ],
-    );
-    assert_eq!(
-        code, 0,
-        "vendor failed.\nstdout:\n{stdout}\nstderr:\n{stderr}"
-    );
-    let lock: serde_json::Value =
-        serde_json::from_slice(&std::fs::read(proj.join("package-lock.json")).unwrap()).unwrap();
-    let want = format!("file:.socket/vendor/npm/{UUID}/{DEP}-{DEP_VERSION}.tgz");
-    assert_eq!(
-        lock["packages"][format!("node_modules/{DEP}")]["resolved"],
-        want
-    );
-    assert_eq!(
-        lock["dependencies"][DEP]["resolved"], want,
-        "the v2 legacy mirror (what npm 6 reads) must be rewired too"
-    );
-
-    let fresh = tmp.path().join("fresh");
-    npm_e2e_common::fresh_checkout(&proj, &fresh, &["package-lock.json"]);
-    let ci = npm_e2e_common::npm_ci(&fresh, &tmp.path().join("fresh-npm-cache"));
-    assert!(
-        ci.status.success(),
-        "npm {major} `npm ci` of the vendored v2 lock must succeed.\n{}",
-        npm_e2e_common::output_text(&ci)
-    );
-    assert_eq!(
-        std::fs::read(fresh.join("node_modules").join(DEP).join("index.js")).unwrap(),
+    // `_tmp` keeps the cell's temp dir alive through the tail.
+    let Npm6Cell {
+        tmp: _tmp,
+        fresh,
         patched,
-        "npm 6 must install the PATCHED bytes from the vendored tarball"
-    );
+        lock_before,
+        ..
+    } = cell;
     vendored_manifestless_tail(
         "flavor=package-lock-v2 install=patched",
         &fresh,
@@ -1272,6 +1200,160 @@ fn npm6_installs_a_vendored_v2_lock_from_its_legacy_mirror() {
         vec![("package-lock.json", lock_before)],
         &[VexVia::Apply, VexVia::Vendor],
     );
+}
+
+/// #432: the same npm 6 cell for an npm ALIAS install (`npm i
+/// lp@npm:left-pad@1.3.0`). The v2 mirror spells it `"lp": {"version":
+/// "npm:left-pad@1.3.0"}`; vendoring used to skip that node with
+/// `vendor_legacy_alias_skipped`, so npm 6 installed the unpatched registry
+/// bytes. npm 6 installs an alias node from its `file:` `resolved`, so it
+/// is rewired, npm 6 installs the PATCHED bytes, and revert restores the
+/// lock byte-for-byte.
+#[test]
+fn npm6_installs_a_vendored_v2_alias_from_its_legacy_mirror() {
+    let Some(cell) = Npm6Cell::vendor(
+        "e2e_vendor_npm_build (npm 6 × v2 lock × alias)",
+        &format!("lp@npm:{DEP}@{DEP_VERSION}"),
+        "lp",
+    ) else {
+        return;
+    };
+    assert!(
+        !cell.vendor_stdout.contains("vendor_legacy_alias_skipped"),
+        "{}",
+        cell.vendor_stdout
+    );
+    let (code, stdout, stderr) = run_socket(
+        &cell.proj,
+        &[
+            "vendor",
+            "--revert",
+            "--json",
+            "--offline",
+            "--cwd",
+            cell.proj.to_str().unwrap(),
+        ],
+    );
+    assert_eq!(
+        code, 0,
+        "revert failed.\nstdout:\n{stdout}\nstderr:\n{stderr}"
+    );
+    assert_eq!(
+        std::fs::read(cell.proj.join("package-lock.json")).unwrap(),
+        cell.lock_before,
+        "revert must restore the lock byte-for-byte"
+    );
+}
+
+/// One npm 6 × vendored v2 lock cell: a modern npm writes the v2 lock for
+/// `install` (landing in `node_modules/<dir>`), `vendor` rewires both lock
+/// halves, and npm 6's fresh `npm ci` must install the PATCHED bytes.
+/// `None` after a skip or an N/A (npm >= 7).
+struct Npm6Cell {
+    tmp: tempfile::TempDir,
+    proj: PathBuf,
+    fresh: PathBuf,
+    patched: Vec<u8>,
+    lock_before: Vec<u8>,
+    vendor_stdout: String,
+}
+
+impl Npm6Cell {
+    fn vendor(suite: &str, install: &str, dir: &str) -> Option<Npm6Cell> {
+        let major = npm_major_or_skip(suite)?;
+        if major > 6 {
+            println!("N/A {suite}: npm {major} is not npm 6");
+            return None;
+        }
+        let Some(writer) = npm_e2e_common::modern_npm_writer() else {
+            npm_e2e_common::skip(
+                suite,
+                "no npm >= 7 to write the v2 lock (set SOCKET_PATCH_NPM_E2E_LOCK_WRITER_BIN)",
+            );
+            return None;
+        };
+        let tmp = tempfile::tempdir().unwrap();
+        let proj = tmp.path().join("proj");
+        std::fs::create_dir_all(&proj).unwrap();
+        std::fs::write(
+            proj.join("package.json"),
+            r#"{"name":"vendor-npm6","version":"0.0.0","private":true}"#,
+        )
+        .unwrap();
+        let cache = tmp.path().join("npm-cache");
+        let output = npm_e2e_common::npm_command_for(&writer, &proj)
+            .args([
+                "install",
+                install,
+                "--lockfile-version",
+                "2",
+                "--no-audit",
+                "--no-fund",
+                "--cache",
+                cache.to_str().unwrap(),
+            ])
+            .output()
+            .unwrap();
+        if !output.status.success() {
+            npm_e2e_common::skip(suite, &npm_e2e_common::output_text(&output));
+            return None;
+        }
+        assert_eq!(npm_e2e_common::lockfile_version(&proj), Some(2));
+        let orig = std::fs::read(proj.join("node_modules").join(dir).join("index.js")).unwrap();
+        let patched: Vec<u8> = [MARKER.as_bytes(), orig.as_slice()].concat();
+        let purl = format!("pkg:npm/{DEP}@{DEP_VERSION}");
+        stage_patch_with_vuln(&proj, &purl, "package/index.js", &orig, &patched, TAIL_GHSA);
+        let lock_before = std::fs::read(proj.join("package-lock.json")).unwrap();
+
+        let (code, stdout, stderr) = run_socket(
+            &proj,
+            &[
+                "vendor",
+                "--json",
+                "--offline",
+                "--cwd",
+                proj.to_str().unwrap(),
+            ],
+        );
+        assert_eq!(
+            code, 0,
+            "vendor failed.\nstdout:\n{stdout}\nstderr:\n{stderr}"
+        );
+        let lock: serde_json::Value =
+            serde_json::from_slice(&std::fs::read(proj.join("package-lock.json")).unwrap())
+                .unwrap();
+        let want = format!("file:.socket/vendor/npm/{UUID}/{DEP}-{DEP_VERSION}.tgz");
+        assert_eq!(
+            lock["packages"][format!("node_modules/{dir}")]["resolved"],
+            want
+        );
+        assert_eq!(
+            lock["dependencies"][dir]["resolved"], want,
+            "the v2 legacy mirror (what npm 6 reads) must be rewired too"
+        );
+
+        let fresh = tmp.path().join("fresh");
+        npm_e2e_common::fresh_checkout(&proj, &fresh, &["package-lock.json"]);
+        let ci = npm_e2e_common::npm_ci(&fresh, &tmp.path().join("fresh-npm-cache"));
+        assert!(
+            ci.status.success(),
+            "npm {major} `npm ci` of the vendored v2 lock must succeed.\n{}",
+            npm_e2e_common::output_text(&ci)
+        );
+        assert_eq!(
+            std::fs::read(fresh.join("node_modules").join(dir).join("index.js")).unwrap(),
+            patched,
+            "npm 6 must install the PATCHED bytes from the vendored tarball"
+        );
+        Some(Npm6Cell {
+            tmp,
+            proj,
+            fresh,
+            patched,
+            lock_before,
+            vendor_stdout: stdout,
+        })
+    }
 }
 
 /// The one real package dir npm's linked store holds for `name@version`

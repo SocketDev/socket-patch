@@ -1,7 +1,16 @@
 //! Bundler lockfiles: `Gemfile.lock` and `gems.locked` (bundler's modern
 //! spelling, which the hosted rewriter edits instead of `Gemfile.lock` when
-//! `gems.rb` is present). BOTH are read when both exist (contract rule 1:
-//! no precedence between files). The Gemfile / `gems.rb` is NOT read: it is
+//! `gems.rb` is present). Unlike the cross-package-manager locks of rule 1,
+//! the two are not alternatives that different tools install from: bundler
+//! itself loads exactly ONE pair ([`bundler_loaded_lock_in`] — `gems.locked`
+//! beside a `gems.rb`, else `Gemfile.lock`, unless `BUNDLE_GEMFILE` says
+//! otherwise), and the hosted rewriter only edits that pair. So only the
+//! loaded lock yields refs. The twin bundler ignores is still read — its
+//! Socket identities stay recognized (rule 11), so a ledger claim cannot
+//! attest them — and each ref it WOULD yield is
+//! [`DIAG_REF_UNATTRIBUTABLE`] instead: a leftover redirected
+//! `Gemfile.lock` beside `gems.rb` + `gems.locked` is never installed
+//! (#736). The Gemfile / `gems.rb` is NOT read: it is
 //! Ruby source whose `source … do` blocks and `path:` options only become
 //! what bundler installs once they are locked, and every wiring our tools
 //! write lands in the lock as well (see below). A Gemfile-only wiring (the
@@ -125,27 +134,61 @@ use super::{
     names_vendor_dir, simple_purl, vendor_ref, vendored_leaf_purl, DiscoverCtx, Discovery,
     PatchedRef, DIAG_LOCKFILE_UNPARSEABLE, DIAG_REF_INVALID, DIAG_REF_UNATTRIBUTABLE,
 };
-use crate::vendor::gem::{gem_declaration_any, quoted_literal};
+use crate::crawlers::ruby_crawler::bundler_loaded_lock_in;
 use crate::formats::gem::{
     bundler_manifest_for, same_remote, GemfileLock, Section, SpecLine, BUNDLER_LOCKS,
 };
+use crate::vendor::gem::{gem_declaration_any, quoted_literal};
 
 pub(crate) async fn extract(ctx: &DiscoverCtx<'_>, out: &mut Discovery) {
-    // Both locks, legacy spelling first (order only affects diagnostics).
+    let loaded = bundler_loaded_lock_in(&ctx.view).await;
+    // Legacy spelling first (order only affects diagnostics).
     for file in BUNDLER_LOCKS {
-        let Some(text) = ctx.read_text(file, out).await else {
+        if loaded == Some(file) {
+            extract_file(ctx, file, out).await;
             continue;
+        }
+        // The twin bundler ignores: read into a scratch discovery (the
+        // guarded read still recognizes its identities) and explain every
+        // ref it would have yielded.
+        let mut ignored = Discovery::default();
+        extract_file(ctx, file, &mut ignored).await;
+        let why = match loaded {
+            Some(lock) => format!("bundler loads {lock}, not {file}"),
+            None => "bundler loads neither default pair here (BUNDLE_GEMFILE or BUNDLE_LOCKFILE \
+                     names another file, or a Gemfile + gems.rb twin's locks disagree on the \
+                     bundler major)"
+                .to_string(),
         };
-        let lock = GemfileLock::parse(&text);
-        // A readable lock with a `GEM` section listing several remotes.
-        let merged = lock.problems.is_empty() && lock.gem_sections().any(|s| s.remotes.len() > 1);
-        let blocks = if merged {
-            source_block_gems(ctx, bundler_manifest_for(file), out).await
-        } else {
-            Vec::new()
-        };
-        extract_lock(ctx, file, &lock, &blocks, out);
+        for r in ignored.refs {
+            out.diag(
+                DIAG_REF_UNATTRIBUTABLE,
+                file,
+                format!(
+                    "{file}: {} is wired to Socket patch {}, but {why}, so this wiring is never \
+                     installed and the patch is not attested; re-run `socket-patch scan` to wire \
+                     the lock bundler reads, or delete the stale {file}",
+                    r.purl, r.uuid
+                ),
+            );
+        }
     }
+}
+
+/// Every ref and diagnostic the bundler lock `file` yields on its own.
+async fn extract_file(ctx: &DiscoverCtx<'_>, file: &str, out: &mut Discovery) {
+    let Some(text) = ctx.read_text(file, out).await else {
+        return;
+    };
+    let lock = GemfileLock::parse(&text);
+    // A readable lock with a `GEM` section listing several remotes.
+    let merged = lock.problems.is_empty() && lock.gem_sections().any(|s| s.remotes.len() > 1);
+    let blocks = if merged {
+        source_block_gems(ctx, bundler_manifest_for(file), out).await
+    } else {
+        Vec::new()
+    };
+    extract_lock(ctx, file, &lock, &blocks, out);
 }
 
 /// `(source URL, gem name)` for every `gem` declared inside a `source "<url>"
@@ -765,34 +808,88 @@ mod tests {
         assert!(!r.lockfile_basis_ok());
     }
 
-    /// `gems.locked` (the `gems.rb` spelling the rewriter edits instead) is
-    /// read, and so is a `Gemfile.lock` beside it — no precedence.
+    /// #736: bundler loads ONE lock — `gems.locked` when the root holds a
+    /// `gems.rb`, else `Gemfile.lock` — so only that lock's wiring is a ref.
+    /// A Socket wiring in the twin bundler ignores is diagnosed, never
+    /// attested, and its uuid stays recognized (rule 11) so a ledger claim
+    /// cannot attest it either.
     #[tokio::test]
-    async fn gems_locked_and_gemfile_lock_are_both_read() {
+    async fn only_the_lock_bundler_loads_is_read() {
         let lock = |uuid: &str| {
             format!(
                 "GEM\n  remote: {}\n  specs:\n    rails (7.0.0)\n\nDEPENDENCIES\n  rails (= 7.0.0)!\n",
                 index(uuid)
             )
         };
+        for (gems_rb, loaded, ignored) in [
+            (true, ("gems.locked", UUID_A), ("Gemfile.lock", UUID_B)),
+            (false, ("Gemfile.lock", UUID_B), ("gems.locked", UUID_A)),
+        ] {
+            let p = Project::new();
+            if gems_rb {
+                p.write("gems.rb", "gem \"rails\"\n");
+            }
+            p.write("gems.locked", lock(UUID_A));
+            p.write("Gemfile.lock", lock(UUID_B));
+            let out = run(&p).await;
+            let r = only(&out);
+            assert_eq!(r.source_file, std::path::PathBuf::from(loaded.0));
+            assert_eq!(r.uuid, loaded.1);
+            assert_eq!(
+                diag_codes(&out),
+                vec![DIAG_REF_UNATTRIBUTABLE],
+                "{:?}",
+                out.diagnostics
+            );
+            let detail = &out.diagnostics[0].detail;
+            assert!(
+                detail.contains(ignored.0) && detail.contains(loaded.0),
+                "{detail}"
+            );
+            assert_eq!(
+                out.hosted_claim("pkg:gem/rails@7.0.0", ignored.1),
+                Some(false),
+                "the ignored twin's uuid is recognized, so its ledger claim is dead"
+            );
+        }
+    }
+
+    /// #736 repro: the project moved to `gems.rb`; `gems.locked` resolves
+    /// the gem from rubygems.org, and a leftover `Gemfile.lock` still holds
+    /// the hosted redirect. `bundle install` reads `gems.locked` and
+    /// installs the unpatched gem, so nothing may be attested.
+    #[tokio::test]
+    async fn a_stale_redirected_gemfile_lock_beside_gems_rb_is_not_attested() {
         let p = Project::new();
-        p.write("gems.locked", lock(UUID_A));
-        p.write("Gemfile.lock", lock(UUID_B));
-        let out = run(&p).await;
-        assert_refs(
-            &out,
-            &[
-                ("pkg:gem/rails@7.0.0", UUID_A, WiringMode::Hosted),
-                ("pkg:gem/rails@7.0.0", UUID_B, WiringMode::Hosted),
-            ],
+        p.write(
+            "gems.rb",
+            "source \"https://rubygems.org\"\ngem \"colorize\"\n",
         );
-        let files: Vec<_> = out
-            .refs
-            .iter()
-            .map(|r| (r.source_file.to_string_lossy().into_owned(), r.uuid.clone()))
-            .collect();
-        assert!(files.contains(&("gems.locked".into(), UUID_A.into())));
-        assert!(files.contains(&("Gemfile.lock".into(), UUID_B.into())));
+        p.write(
+            "gems.locked",
+            format!(
+                "GEM\n  remote: https://rubygems.org/\n  specs:\n    colorize (0.8.1)\n\n\
+                 PLATFORMS\n  ruby\n\nDEPENDENCIES\n  colorize (~> 0.8.1)\n\n\
+                 CHECKSUMS\n  colorize (0.8.1) sha256={SHA_UP}\n"
+            ),
+        );
+        p.write(
+            "Gemfile.lock",
+            format!(
+                "GEM\n  remote: {}\n  specs:\n    colorize (0.8.1)\n\n\
+                 GEM\n  remote: https://rubygems.org/\n  specs:\n\n\
+                 PLATFORMS\n  ruby\n\nDEPENDENCIES\n  colorize (= 0.8.1)!\n\n\
+                 CHECKSUMS\n  colorize (0.8.1) sha256={SHA_A}\n",
+                index(UUID_A)
+            ),
+        );
+        let out = run(&p).await;
+        assert!(out.refs.is_empty(), "{:#?}", out.refs);
+        assert_eq!(diag_codes(&out), vec![DIAG_REF_UNATTRIBUTABLE]);
+        assert_eq!(
+            out.hosted_claim("pkg:gem/colorize@0.8.1", UUID_A),
+            Some(false)
+        );
     }
 
     /// `--patch-server-url` deployments count (the e2e mock-server shape).
@@ -1172,6 +1269,7 @@ mod tests {
         p.write("Gemfile.lock", "");
         assert_eq!(diag_codes(&run(&p).await), vec![DIAG_LOCKFILE_UNPARSEABLE]);
         let p = Project::new();
+        p.write("gems.rb", "");
         p.write("gems.locked", [0xff, 0xfe, 0x00, b'G']);
         let out = run(&p).await;
         assert!(out.refs.is_empty());

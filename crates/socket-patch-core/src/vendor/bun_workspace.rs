@@ -1,8 +1,6 @@
 //! Integrity and repair for Bun's member-relative binary-lock tarballs.
 use std::path::{Path, PathBuf};
 
-use sha2::{Digest, Sha256};
-
 use super::bun_binary::{prune_mirror_parents, undo_mirrors, validate_mirror_path};
 use super::bun_lockb::BunLockb;
 use super::path::parse_vendor_path;
@@ -93,7 +91,7 @@ pub(super) async fn repair(
     }
     let bytes = read_regular_to_bytes_sync(&root.join(&entry.artifact.path))
         .map_err(|e| format!("cannot read canonical vendor tarball: {e}"))?;
-    let digest = hex::encode(Sha256::digest(&bytes));
+    let digest = crate::utils::digest::sha256_hex_of(&bytes);
     if entry.artifact.sha256.is_empty() || !digest.eq_ignore_ascii_case(&entry.artifact.sha256) {
         return Err("canonical vendor tarball does not match its recorded fingerprint".into());
     }
@@ -165,7 +163,9 @@ pub(super) async fn cleanup(root: &Path, entry: &VendorEntry, dry_run: bool) -> 
             .and_then(serde_json::Value::as_str)
             .ok_or("missing workspace tarball fingerprint")?;
         match read_regular_to_bytes_sync(&path) {
-            Ok(bytes) if hex::encode(Sha256::digest(&bytes)) == expected => paths.push(path),
+            Ok(bytes) if crate::utils::digest::sha256_hex_of(&bytes) == expected => {
+                paths.push(path)
+            }
             Ok(_) => return Err("workspace tarball changed; superseded artifacts kept".into()),
             Err(e) if e.kind() == std::io::ErrorKind::NotFound => {}
             Err(e) => return Err(format!("cannot read workspace tarball: {e}")),
@@ -186,6 +186,7 @@ pub(super) async fn cleanup(root: &Path, entry: &VendorEntry, dry_run: bool) -> 
 mod tests {
     use super::*;
     use base64::Engine as _;
+    use sha2::{Digest, Sha256};
 
     const UUID: &str = "11111111-1111-4111-8111-111111111111";
 

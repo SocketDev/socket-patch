@@ -169,25 +169,12 @@ fn parse_cargo_toml(content: &str) -> Option<String> {
     Some(format!("pkg:cargo/{name}@{version}"))
 }
 
-/// `go.mod` → `pkg:golang/<module>` from the `module` directive (quoted or
-/// bare, trailing `//` comment allowed). go.mod records no version, so the
-/// purl carries none.
+/// `go.mod` → `pkg:golang/<module>` from the `module` directive, read by
+/// [`go_mod_edit::module_path`](crate::vendor::go_mod_edit::module_path).
+/// go.mod records no version, so the purl carries none.
 fn parse_go_mod(content: &str) -> Option<String> {
-    for raw in strip_bom(content).lines() {
-        let line = raw.split("//").next().unwrap_or("").trim();
-        let Some(rest) = line.strip_prefix("module") else {
-            continue;
-        };
-        if !rest.starts_with([' ', '\t']) {
-            continue;
-        }
-        let module = rest.trim().trim_matches('"');
-        let plausible = !module.is_empty()
-            && !module.contains(char::is_whitespace)
-            && crate::patch::path_safety::is_safe_multi_segment(module);
-        return plausible.then(|| format!("pkg:golang/{module}"));
-    }
-    None
+    let module = crate::vendor::go_mod_edit::module_path(content)?;
+    Some(format!("pkg:golang/{module}"))
 }
 
 /// `composer.json` → `pkg:composer/<vendor>/<name>[@<version>]` (composer
@@ -2133,6 +2120,24 @@ mod tests {
             .purl
             .is_none());
         assert!(detect_in(&[("go.mod", "module ../x\n")])
+            .await
+            .purl
+            .is_none());
+    }
+
+    /// Go accepts the block form `module ( … )` (`go list -m` prints the
+    /// path inside). The former line reader returned `pkg:golang/(`.
+    #[tokio::test]
+    async fn detect_go_mod_block_form_module() {
+        let r = detect_in(&[("go.mod", "module (\n\texample.com/blk\n)\n\ngo 1.21\n")]).await;
+        assert_eq!(r.purl.as_deref(), Some("pkg:golang/example.com/blk"));
+        // A multi-token directive is malformed, and so is a BOM-led file's
+        // `module ""`.
+        assert!(detect_in(&[("go.mod", "module foo bar\n")])
+            .await
+            .purl
+            .is_none());
+        assert!(detect_in(&[("go.mod", "\u{feff}module \"\"\n")])
             .await
             .purl
             .is_none());
