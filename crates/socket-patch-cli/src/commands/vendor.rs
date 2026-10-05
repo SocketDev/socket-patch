@@ -113,6 +113,14 @@ fn refusal_is_benign(code: &str) -> bool {
     matches!(code, "vendor_unsupported_ecosystem" | "already_vendored")
 }
 
+/// The `vendor_dir_symlink_unsupported` detail when `purl`'s vendor dir
+/// (`.socket/vendor`, its ecosystem dir, or the `uuid` unit) is a link.
+fn linked_vendor_dir_refusal(project_root: &Path, purl: &str, uuid: &str) -> Option<String> {
+    let eco = ecosystem_dir_for_purl(purl)?;
+    vendor::path::vendor_dir_symlink(project_root, eco, Some(uuid))
+        .map(|link| vendor::path::vendor_dir_symlink_detail(&link))
+}
+
 /// Dispatch one purl to its ecosystem backend. `pkg_path` is the crawler's
 /// installed location (site-packages root for pypi, the package dir
 /// otherwise), or a fetched artifact the backend materialises only if it
@@ -133,6 +141,16 @@ pub(crate) async fn dispatch_vendor_one(
     installed_sites: &vendor::pypi::InstalledSiteListings,
 ) -> Option<VendorOutcome> {
     let eco = ecosystem_dir_for_purl(purl)?;
+    // Before any backend write: a linked vendor dir is never ours, and the
+    // unit would land in (and a later revert delete from) its target. The
+    // vendor loop refuses it earlier still, before a hosted takeover; this
+    // is the backstop for every other caller.
+    if let Some(detail) = linked_vendor_dir_refusal(project_root, purl, &record.uuid) {
+        return Some(VendorOutcome::Refused {
+            code: "vendor_dir_symlink_unsupported",
+            detail,
+        });
+    }
 
     const SERVICE_ECOSYSTEMS: &[&str] = &[
         "npm", "pypi", "cargo", "golang", "composer", "gem", "nuget", "maven",
@@ -238,6 +256,13 @@ pub(crate) async fn dispatch_revert_one_opts(
     project_root: &Path,
     opts: RevertOpts,
 ) -> RevertOutcome {
+    // Before any lock edit or delete: the unit removal would reach through
+    // a linked vendor dir into another project's artifacts (#664).
+    if let Some(link) =
+        vendor::path::vendor_dir_symlink(project_root, &entry.ecosystem, Some(&entry.uuid))
+    {
+        return RevertOutcome::failed(vendor::path::vendor_dir_symlink_detail(&link));
+    }
     match entry.ecosystem.as_str() {
         "npm" => vendor::npm_flavor::revert_npm_any_opts(entry, project_root, opts).await,
         "pypi" => vendor::pypi::revert_pypi_opts(entry, project_root, opts).await,
@@ -954,6 +979,11 @@ async fn run_check(args: &VendorArgs) -> i32 {
         };
         if failure.is_none() && vendor::jvm::apply::is_jvm_entry(entry) {
             failure = vendor::jvm::apply::check_entry(root, entry, local_repo.as_deref()).err();
+        }
+        if failure.is_none() && entry.ecosystem == "npm" {
+            failure = vendor::npm_flavor::check_npm_wiring(entry, root)
+                .await
+                .err();
         }
         if vendor::jvm::apply::upstream_unverified(entry) {
             env.warnings.push(RunWarning {code: "vendor_jvm_upstream_unverified".into(), detail: format!("{key}: upstream metadata was accepted offline; run vendor online to verify registry checksums")});
@@ -1954,6 +1984,10 @@ async fn plan_service_downloads(
             if bun_refusal.is_some_and(|r| r.applies_to(candidate)) {
                 continue;
             }
+            // The loop refuses a linked vendor dir; no grant on its behalf.
+            if linked_vendor_dir_refusal(cwd, candidate, &record.uuid).is_some() {
+                continue;
+            }
             if takeover_blocked(candidate) {
                 continue;
             }
@@ -2263,14 +2297,16 @@ pub(crate) async fn vendor_records_reusing(
             .find(|pin| canonical_purl(&pin.purl) == canonical_purl(purl))
     };
 
-    // Yarn berry takeover preflight (see
-    // `socket_patch_core::vendor::yarn_berry_vendor_preflight`): the berry
-    // backend's project-level refusals (mixed line endings in yarn.lock or
-    // package.json, cacheKey, `.yarnrc.yml` compressionLevel), computed at
+    // Yarn berry / npm package-lock takeover preflight (see
+    // `socket_patch_core::vendor::yarn_berry_vendor_preflight` and
+    // `npm_lock_vendor_preflight`): the backend's project-level refusals
+    // (berry: mixed line endings in yarn.lock or package.json, cacheKey,
+    // `.yarnrc.yml` compressionLevel; package-lock: a lock that is not
+    // v2/v3, #659), computed at
     // most once per run and only when a hosted-claimed npm purl reaches the
     // takeover below, which must refuse such a purl BEFORE reverting its
     // hosted edits.
-    let berry_takeover_refusal: tokio::sync::OnceCell<Option<(&'static str, String)>> =
+    let npm_takeover_refusal: tokio::sync::OnceCell<Option<(&'static str, String)>> =
         tokio::sync::OnceCell::new();
     let pipenv_version = tokio::sync::OnceCell::new();
     // The vlt store entries each hosted→vendored takeover unpinned, healed
@@ -2426,6 +2462,18 @@ pub(crate) async fn vendor_records_reusing(
                 report_vendor_failure(common, candidate, &refusal.detail);
                 continue;
             }
+            // A linked vendor dir (#664) is refused before the takeover
+            // below can restore a live hosted pin's upstream entry: the
+            // refusal must leave the hosted patch wired.
+            if let Some(detail) = linked_vendor_dir_refusal(&common.cwd, candidate, &record.uuid) {
+                has_errors = true;
+                env.record(
+                    PatchEvent::new(PatchAction::Failed, candidate.clone())
+                        .with_error("vendor_dir_symlink_unsupported", detail.clone()),
+                );
+                report_vendor_failure(common, candidate, &detail);
+                continue;
+            }
 
             // Cross-mode takeover: vendoring over a LIVE hosted pin must
             // first restore the upstream registry entry (v5 keeps no hosted
@@ -2466,9 +2514,21 @@ pub(crate) async fn vendor_records_reusing(
                     }
                 }
                 if candidate.starts_with("pkg:npm/") {
-                    let project = berry_takeover_refusal
-                        .get_or_init(|| {
-                            socket_patch_core::vendor::yarn_berry_vendor_preflight(&common.cwd)
+                    let project = npm_takeover_refusal
+                        .get_or_init(|| async {
+                            match socket_patch_core::vendor::yarn_berry_vendor_preflight(
+                                &common.cwd,
+                            )
+                            .await
+                            {
+                                Some(refusal) => Some(refusal),
+                                None => {
+                                    socket_patch_core::vendor::npm_lock_vendor_preflight(
+                                        &common.cwd,
+                                    )
+                                    .await
+                                }
+                            }
                         })
                         .await
                         .clone();
@@ -3792,6 +3852,75 @@ mod plan_gate_tests {
             vec![UUID_A, UUID_C],
             "one planned download per package the loop asks the service for, in loop \
              order, and none for the package its backend refuses first"
+        );
+    }
+
+    /// A record whose patch dir is a link (#664) is refused by the loop
+    /// before dispatch, so the plan leaves it out: a prefetch running ahead
+    /// of the loop must never stage or extract an archive through the link.
+    #[cfg(unix)]
+    #[tokio::test]
+    async fn the_plan_leaves_out_a_package_whose_vendor_dir_is_linked() {
+        let tmp = tempfile::tempdir().unwrap();
+        let root = &tmp.path().join("project");
+        std::fs::create_dir_all(root).unwrap();
+        std::fs::write(root.join("composer.json"), r#"{"require":{}}"#).unwrap();
+        let names = ["psr/cache", "psr/container", "psr/log"];
+        let locked: Vec<serde_json::Value> = names
+            .iter()
+            .map(|name| {
+                serde_json::json!({
+                    "name": name, "version": "1.0.0",
+                    "dist": {"type": "zip", "url": format!("https://example.invalid/{name}.zip"),
+                             "reference": "abc", "shasum": ""},
+                    "type": "library"
+                })
+            })
+            .collect();
+        std::fs::write(
+            root.join("composer.lock"),
+            serde_json::to_vec_pretty(&serde_json::json!({
+                "content-hash": "x", "packages": locked, "packages-dev": []
+            }))
+            .unwrap(),
+        )
+        .unwrap();
+        let mut all_packages: Vec<(String, StagedSource)> = Vec::new();
+        let mut records: HashMap<String, PatchRecord> = HashMap::new();
+        for (name, uuid) in names.iter().zip([UUID_A, UUID_B, UUID_C]) {
+            let purl = format!("pkg:composer/{name}@1.0.0");
+            let dir = root.join("vendor").join(name);
+            std::fs::create_dir_all(&dir).unwrap();
+            all_packages.push((purl.clone(), StagedSource::Installed(dir)));
+            records.insert(purl, record(uuid));
+        }
+        let other = tmp.path().join("other-project-unit");
+        std::fs::create_dir_all(&other).unwrap();
+        let eco_dir = root.join(".socket/vendor/composer");
+        std::fs::create_dir_all(&eco_dir).unwrap();
+        std::os::unix::fs::symlink(&other, eco_dir.join(UUID_B)).unwrap();
+
+        let planned = plan_service_downloads(
+            root,
+            false,
+            &all_packages,
+            &HashMap::new(),
+            &records,
+            &VendorState::default(),
+            &HashSet::new(),
+            None,
+            &|_| false,
+            (
+                &tokio::sync::OnceCell::new(),
+                &vendor::pypi::InstalledSiteListings::default(),
+            ),
+        )
+        .await;
+        let uuids: Vec<&str> = planned.iter().map(|d| d.uuid.as_str()).collect();
+        assert_eq!(
+            uuids,
+            vec![UUID_A, UUID_C],
+            "the linked package is never planned"
         );
     }
 }

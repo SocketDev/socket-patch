@@ -1,5 +1,5 @@
 //! npm-family projects. One deterministic dependency graph is written out
-//! as each package manager's lockfile and install layout, so the six
+//! as each package manager's lockfile and install layout, so the seven
 //! scenarios differ only in what each package manager puts on disk.
 
 use std::collections::BTreeMap;
@@ -685,6 +685,47 @@ pub fn build_bun(t: &mut Tree, size: Size) -> std::io::Result<Fixture> {
     t.write("project/package.json", g.package_json())?;
     t.write("project/bun.lock", bun_lock(&g))?;
     g.install_hoisted(t, "project/")?;
+    t.mkdir("home")?;
+    Ok(fixture(&g, g.patches(false), &["bun.lock"], &[]))
+}
+
+/// Bun's isolated linker (the default since Bun 1.3.2): the same text
+/// `bun.lock`, but every package lives only in the pnpm-shaped store
+/// `node_modules/.bun/<name>@<version>/node_modules/<name>` (scoped
+/// `@scope+leaf@…`), its dependencies linked beside it, the root linking
+/// direct dependencies only, and `.bun/node_modules` holding Bun's hoist
+/// links.
+pub fn build_bun_isolated(t: &mut Tree, size: Size) -> std::io::Result<Fixture> {
+    let g = graph("bun-isolated", size);
+    t.write("project/package.json", g.package_json())?;
+    t.write("project/bun.lock", bun_lock(&g))?;
+    let mut rng = Rng::new("bun-isolated-install");
+    for p in &g.pkgs {
+        let entry = format!("project/node_modules/.bun/{}/node_modules", p.store_key());
+        write_package(t, &format!("{entry}/{}", p.name), p, &mut rng)?;
+        for (d, v) in &p.deps {
+            let Some(dep) = g.resolve(p, d, v) else {
+                continue;
+            };
+            let up = "../".repeat(1 + d.matches('/').count());
+            let target = format!("{up}../{}/node_modules/{d}", dep.store_key());
+            t.symlink(&target, &format!("{entry}/{d}"))?;
+        }
+        if !p.is_nested() {
+            let up = "../".repeat(1 + p.name.matches('/').count());
+            t.symlink(
+                &format!("{up}{}/node_modules/{}", p.store_key(), p.name),
+                &format!("project/node_modules/.bun/node_modules/{}", p.name),
+            )?;
+        }
+    }
+    for p in g.direct() {
+        let up = "../".repeat(p.name.matches('/').count());
+        t.symlink(
+            &format!("{up}.bun/{}/node_modules/{}", p.store_key(), p.name),
+            &format!("project/node_modules/{}", p.name),
+        )?;
+    }
     t.mkdir("home")?;
     Ok(fixture(&g, g.patches(false), &["bun.lock"], &[]))
 }

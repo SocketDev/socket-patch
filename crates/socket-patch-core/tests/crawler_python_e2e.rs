@@ -1764,3 +1764,141 @@ async fn read_python_metadata_missing_version_falls_back_to_dir_name() {
     let result = read_python_metadata(&dist_info).await;
     assert_eq!(result, Some(("requests".to_string(), "2.28.0".to_string())));
 }
+
+// ── Poetry installer venv discovery (#640) ────────────────────
+
+/// Run `get_global_python_site_packages` with HOME, POETRY_HOME,
+/// XDG_DATA_HOME and APPDATA rebound (`None` unsets), restoring them
+/// after. Poetry's official installer resolves its venv from these.
+async fn global_site_packages_with_poetry_env(
+    home: &Path,
+    poetry_home: Option<&Path>,
+    xdg_data_home: Option<&Path>,
+    appdata: Option<&Path>,
+) -> Vec<std::path::PathBuf> {
+    let keys = ["HOME", "POETRY_HOME", "XDG_DATA_HOME", "APPDATA"];
+    let saved: Vec<(&str, Option<String>)> = keys
+        .into_iter()
+        .map(|k| (k, std::env::var(k).ok()))
+        .collect();
+    std::env::set_var("HOME", home);
+    for (key, value) in [
+        ("POETRY_HOME", poetry_home),
+        ("XDG_DATA_HOME", xdg_data_home),
+        ("APPDATA", appdata),
+    ] {
+        match value {
+            Some(v) => std::env::set_var(key, v),
+            None => std::env::remove_var(key),
+        }
+    }
+    let result = get_global_python_site_packages().await;
+    for (key, value) in saved {
+        match value {
+            Some(v) => std::env::set_var(key, v),
+            None => std::env::remove_var(key),
+        }
+    }
+    result
+}
+
+/// The site-packages of the installer venv under Poetry's data dir.
+fn poetry_installer_site_packages(data_dir: &Path) -> std::path::PathBuf {
+    let venv = data_dir.join("venv");
+    if cfg!(windows) {
+        venv.join("Lib").join("site-packages")
+    } else {
+        venv.join("lib").join("python3.11").join("site-packages")
+    }
+}
+
+/// The official installer (`install.python-poetry.org`) on Linux puts
+/// Poetry and its dependencies in `~/.local/share/pypoetry/venv`.
+#[cfg(all(not(target_os = "macos"), not(windows)))]
+#[tokio::test]
+#[serial]
+async fn get_global_python_site_packages_discovers_poetry_installer_venv_linux() {
+    let tmp = tempfile::tempdir().unwrap();
+    let sp =
+        poetry_installer_site_packages(&tmp.path().join(".local").join("share").join("pypoetry"));
+    tokio::fs::create_dir_all(&sp).await.unwrap();
+
+    let result = global_site_packages_with_poetry_env(tmp.path(), None, None, None).await;
+    assert!(
+        result.iter().any(|p| p == &sp),
+        "Poetry installer venv must surface; got {result:?}"
+    );
+}
+
+/// The installer follows `$XDG_DATA_HOME` on Linux.
+#[cfg(all(not(target_os = "macos"), not(windows)))]
+#[tokio::test]
+#[serial]
+async fn get_global_python_site_packages_discovers_poetry_installer_venv_under_xdg() {
+    let tmp = tempfile::tempdir().unwrap();
+    let xdg = tmp.path().join("xdg-data");
+    let sp = poetry_installer_site_packages(&xdg.join("pypoetry"));
+    tokio::fs::create_dir_all(&sp).await.unwrap();
+
+    let result = global_site_packages_with_poetry_env(tmp.path(), None, Some(&xdg), None).await;
+    assert!(
+        result.iter().any(|p| p == &sp),
+        "Poetry installer venv under XDG_DATA_HOME must surface; got {result:?}"
+    );
+}
+
+/// The installer's macOS default is `~/Library/Application Support/pypoetry`.
+#[cfg(target_os = "macos")]
+#[tokio::test]
+#[serial]
+async fn get_global_python_site_packages_discovers_poetry_installer_venv_macos() {
+    let tmp = tempfile::tempdir().unwrap();
+    let sp = poetry_installer_site_packages(
+        &tmp.path()
+            .join("Library")
+            .join("Application Support")
+            .join("pypoetry"),
+    );
+    tokio::fs::create_dir_all(&sp).await.unwrap();
+
+    let result = global_site_packages_with_poetry_env(tmp.path(), None, None, None).await;
+    assert!(
+        result.iter().any(|p| p == &sp),
+        "macOS Poetry installer venv must surface; got {result:?}"
+    );
+}
+
+/// The installer's Windows default is `%APPDATA%\pypoetry`.
+#[cfg(windows)]
+#[tokio::test]
+#[serial]
+async fn get_global_python_site_packages_discovers_poetry_installer_venv_windows() {
+    let tmp = tempfile::tempdir().unwrap();
+    let appdata = tmp.path().join("AppData").join("Roaming");
+    let sp = poetry_installer_site_packages(&appdata.join("pypoetry"));
+    tokio::fs::create_dir_all(&sp).await.unwrap();
+
+    let result = global_site_packages_with_poetry_env(tmp.path(), None, None, Some(&appdata)).await;
+    assert!(
+        result.iter().any(|p| p == &sp),
+        "%APPDATA%\\pypoetry venv must surface; got {result:?}"
+    );
+}
+
+/// `POETRY_HOME` relocates the installer venv to `$POETRY_HOME/venv`, on
+/// every OS.
+#[tokio::test]
+#[serial]
+async fn get_global_python_site_packages_discovers_poetry_installer_venv_under_poetry_home() {
+    let tmp = tempfile::tempdir().unwrap();
+    let poetry_home = tmp.path().join("opt").join("poetry");
+    let sp = poetry_installer_site_packages(&poetry_home);
+    tokio::fs::create_dir_all(&sp).await.unwrap();
+
+    let result =
+        global_site_packages_with_poetry_env(tmp.path(), Some(&poetry_home), None, None).await;
+    assert!(
+        result.iter().any(|p| p == &sp),
+        "$POETRY_HOME/venv must surface; got {result:?}"
+    );
+}

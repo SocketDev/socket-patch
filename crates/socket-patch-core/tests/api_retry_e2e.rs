@@ -785,3 +785,103 @@ async fn persistent_proxy_batch_throttle_errors_without_per_package_fallback() {
         // `expect(4)` / `expect(0)` are verified when `server` drops.
     }
 }
+
+/// A TLS endpoint whose peer resets every connection mid-handshake (after
+/// reading the ClientHello) — what a load balancer dropping fresh
+/// connections looks like (`client error (Connect): Connection reset by
+/// peer`). Returns its `https://` base URL and the accepted-connection
+/// count.
+async fn resetting_endpoint() -> (String, Arc<std::sync::atomic::AtomicUsize>) {
+    use std::sync::atomic::{AtomicUsize, Ordering};
+    use tokio::io::AsyncReadExt as _;
+    let listener = tokio::net::TcpListener::bind("127.0.0.1:0").await.unwrap();
+    let addr = listener.local_addr().unwrap();
+    let accepted = Arc::new(AtomicUsize::new(0));
+    let count = Arc::clone(&accepted);
+    tokio::spawn(async move {
+        while let Ok((mut stream, _)) = listener.accept().await {
+            count.fetch_add(1, Ordering::SeqCst);
+            let mut hello = [0u8; 5];
+            let _ = stream.read_exact(&mut hello).await;
+            // Linger 0: closing sends RST, not FIN.
+            let _ = stream.set_zero_linger();
+            drop(stream);
+        }
+    });
+    (format!("https://{addr}"), accepted)
+}
+
+/// A connection reset while it is being established is retried under the
+/// 429 / 503 budget (the request never went out, so this holds for the
+/// batch POST too), then surfaces as the same `Network error` as before.
+#[tokio::test]
+async fn a_connection_reset_mid_handshake_is_retried_then_reported() {
+    use std::sync::atomic::Ordering;
+    let p = purl(70);
+
+    let (url, accepted) = resetting_endpoint().await;
+    let (c, log) = client(&url, ApiRetryPolicy::default());
+    let err = c
+        .search_patches_by_package(&p)
+        .await
+        .expect_err("every connection is reset");
+    assert!(matches!(err, ApiError::Network(_)), "{err:?}");
+    assert!(err.to_string().starts_with("Network error: "), "{err}");
+    assert_eq!(
+        accepted.load(Ordering::SeqCst),
+        4,
+        "one attempt + 3 retries"
+    );
+    let w = waits(&log);
+    assert_eq!(w.len(), 3);
+    // The exponential steps (500 ms, 1 s, 2 s), each jittered into its
+    // upper half.
+    for (wait, step) in w.iter().zip([500u64, 1000, 2000]) {
+        let step = Duration::from_millis(step);
+        assert!(*wait >= step / 2 && *wait < step, "{wait:?} for {step:?}");
+    }
+
+    let (url, accepted) = resetting_endpoint().await;
+    let (hooks, log) = virtual_clock(0);
+    let c = ApiClient::new(options(&url, true)).with_api_retry(ApiRetryPolicy::default(), hooks);
+    let err = c
+        .search_patches_batch(std::slice::from_ref(&p))
+        .await
+        .expect_err("every connection is reset");
+    assert!(matches!(err, ApiError::Network(_)), "{err:?}");
+    assert_eq!(
+        accepted.load(Ordering::SeqCst),
+        4,
+        "the batch POST retries too"
+    );
+    assert_eq!(waits(&log).len(), 3);
+
+    // Retries off: one connection, no wait, the same error.
+    let (url, accepted) = resetting_endpoint().await;
+    let (c, log) = client(&url, ApiRetryPolicy::none());
+    let err = c.search_patches_by_package(&p).await.expect_err("reset");
+    assert!(matches!(err, ApiError::Network(_)), "{err:?}");
+    assert_eq!(accepted.load(Ordering::SeqCst), 1);
+    assert!(waits(&log).is_empty());
+}
+
+/// A refused connection (nothing listening) is final at once: offline
+/// runs and the tests that point the CLI at a dead port fail fast, as
+/// before.
+#[tokio::test]
+async fn a_refused_connection_is_not_retried() {
+    let port = {
+        let l = std::net::TcpListener::bind("127.0.0.1:0").unwrap();
+        l.local_addr().unwrap().port()
+    };
+    let (c, log) = client(
+        &format!("http://127.0.0.1:{port}"),
+        ApiRetryPolicy::default(),
+    );
+    let err = c
+        .search_patches_by_package(&purl(71))
+        .await
+        .expect_err("nothing listens there");
+    assert!(matches!(err, ApiError::Network(_)), "{err:?}");
+    assert!(waits(&log).is_empty());
+}

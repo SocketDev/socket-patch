@@ -107,7 +107,13 @@ pub(crate) async fn hosted_consumed_copies(
         let npm: Vec<&String> = shared.get(&Ecosystem::Npm).into_iter().flatten().collect();
         for purl in shared.values().flatten() {
             let mut paths = all.remove(purl).unwrap_or_default();
-            paths.extend(aliases.remove(purl).unwrap_or_default());
+            // The installed-tree lookup already resolves importer-tree
+            // aliases, so most of the walk's finds are in `paths` already.
+            for alias in aliases.remove(purl).unwrap_or_default() {
+                if !paths.contains(&alias) {
+                    paths.push(alias);
+                }
+            }
             if npm.contains(&purl) {
                 paths = with_store_variants(paths).await;
             }

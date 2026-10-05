@@ -6,7 +6,7 @@ use serde_json::{json, Value};
 
 use super::{DepOverride, FileEdit, RewriteResult, RewriteWarning};
 use crate::crawlers::python_crawler::canonicalize_pypi_name;
-use crate::vendor::lock_inventory::pypi::hosted_pypi_reference;
+use crate::vendor::lock_inventory::pypi::replaceable_hosted_pin;
 
 pub(super) struct Property {
     pub(super) name: String,
@@ -244,15 +244,12 @@ pub(super) fn rewrite(
 }
 
 /// Whether `value` is a Socket-issued hosted reference for `dep`: the shared
-/// recognizer ([`hosted_pypi_reference`]) accepts it on the grant's own
+/// recognizer ([`replaceable_hosted_pin`]) accepts it on the grant's own
 /// origin (patch.socket.dev, or a `--patch-server-url` host, path prefix
 /// included), and it names this package and version. Such an entry is ours
 /// to rotate; anything else is a user's or a fork's source.
 fn owned_url(value: &str, dep: &DepOverride) -> bool {
-    hosted_pypi_reference(value, std::slice::from_ref(&dep.artifact_url)).is_some_and(|coords| {
-        canonicalize_pypi_name(&coords.name) == canonicalize_pypi_name(&dep.name)
-            && coords.version == dep.version
-    })
+    replaceable_hosted_pin(value, &dep.artifact_url, &dep.name, &dep.version)
 }
 
 /// Why a Pipfile.lock plan did not happen. Only a [`PlanError::Conflict`]
