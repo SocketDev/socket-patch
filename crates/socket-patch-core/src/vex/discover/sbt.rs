@@ -91,9 +91,9 @@ async fn evidence(root: &Path) -> (Option<JvmResolution>, Option<String>) {
 /// enough (the same ones the hosted rewriter's `check_new` gate refuses a
 /// new pin on): a build source newer than some project's evidence, a
 /// declared project with no evidence (only part of the build resolved), a
-/// project definition that cannot be read statically, or a build source
-/// reassigning `dependencyOverrides`, which replaces the generated override
-/// where it applies.
+/// project definition that cannot be read statically, a build source
+/// reassigning `dependencyOverrides` (it replaces the generated override
+/// where it applies) or `resolvers`, or a `build.sbt.lock`.
 fn evidence_blocker(
     e: &crate::crawlers::sbt_evidence::SbtEvidence,
     res: &JvmResolution,
@@ -127,6 +127,18 @@ fn evidence_blocker(
         return Some(format!(
             "{} reassign(s) `dependencyOverrides`, which replaces the pin where it applies",
             findings.overrides_assignment.join(", ")
+        ));
+    }
+    if !findings.resolvers_assignment.is_empty() {
+        return Some(format!(
+            "{} reassign(s) `resolvers`, which can drop the pin's repository",
+            findings.resolvers_assignment.join(", ")
+        ));
+    }
+    if !findings.dependency_lock.is_empty() {
+        return Some(format!(
+            "{} locks the build's dependencies, which rejects the pinned version",
+            findings.dependency_lock.join(", ")
         ));
     }
     None
@@ -419,6 +431,12 @@ mod tests {
         )];
         let why = evidence_blocker(&e(&overrides, false), &all).unwrap();
         assert!(why.contains("app/build.sbt:1"), "{why}");
+        let resolvers = [("app/build.sbt", "resolvers := Nil\n")];
+        let why = evidence_blocker(&e(&resolvers, false), &all).unwrap();
+        assert!(why.contains("`resolvers`"), "{why}");
+        let lock = [("build.sbt.lock", "{}\n")];
+        let why = evidence_blocker(&e(&lock, false), &all).unwrap();
+        assert!(why.contains("build.sbt.lock"), "{why}");
     }
 
     #[tokio::test]
