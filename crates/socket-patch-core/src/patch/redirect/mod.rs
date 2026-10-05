@@ -242,6 +242,11 @@ pub struct RewriteResult {
     /// An incomplete pnpm rewrite must not be confirmed by finding its URL
     /// in another instance, a comment, or another lockfile.
     pub refused_pnpm_uuids: std::collections::BTreeSet<String>,
+    /// Patch uuids the bun rewriters left on their registry entry because
+    /// the project patches that package itself with `bun patch` (#367).
+    /// Never confirmed, not even by the URL landing in a sibling npm-family
+    /// lock: Bun keeps installing the registry bytes.
+    pub refused_bun_uuids: std::collections::BTreeSet<String>,
     /// Patch uuids whose package version a yarn berry `yarn.lock` locks, so
     /// the berry rewriter alone decides them: the hosted pin is the
     /// URL-keyed lock entry AND the root `package.json` `resolutions`
@@ -564,6 +569,7 @@ fn merge_group_delta(result: &mut RewriteResult, delta: RewriteResult) {
         confirmed_pdm_uuids,
         refused_pdm_uuids,
         refused_pnpm_uuids,
+        refused_bun_uuids,
         yarn_berry_uuids,
         confirmed_yarn_berry_uuids,
         python_lock_uuids,
@@ -592,6 +598,7 @@ fn merge_group_delta(result: &mut RewriteResult, delta: RewriteResult) {
     result.confirmed_pdm_uuids.extend(confirmed_pdm_uuids);
     result.refused_pdm_uuids.extend(refused_pdm_uuids);
     result.refused_pnpm_uuids.extend(refused_pnpm_uuids);
+    result.refused_bun_uuids.extend(refused_bun_uuids);
     result.yarn_berry_uuids.extend(yarn_berry_uuids);
     result
         .confirmed_yarn_berry_uuids
@@ -4320,8 +4327,9 @@ fn parse_bun_hosted_lock(
 /// Leave `dep` on its registry resolution when the project's own
 /// `patchedDependencies` patches it (#367): Bun applies that patch only to
 /// the registry `name@version`, so a hosted pin would silently drop it from
-/// every install. Warns, and keeps the in-run VEX from assuming the uuid
-/// patched. `true` when `dep` was skipped.
+/// every install. Warns, keeps the in-run VEX from assuming the uuid
+/// patched, and keeps any other lock from confirming it. `true` when `dep`
+/// was skipped.
 pub(crate) fn skip_bun_user_patched(
     user_patched: &[String],
     name: &str,
@@ -4333,6 +4341,7 @@ pub(crate) fn skip_bun_user_patched(
         return false;
     };
     result.bundled_skipped_uuids.insert(dep.patch_uuid.clone());
+    result.refused_bun_uuids.insert(dep.patch_uuid.clone());
     result.warnings.push(RewriteWarning {
         code: "redirect_bun_patched_dependency_skipped".into(),
         detail: patched_dependency_detail(key, name, &dep.version),

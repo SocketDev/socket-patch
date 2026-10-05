@@ -502,9 +502,12 @@ pub async fn read_candidate_files(
         }
         // The root manifest's `patchedDependencies` names the packages the
         // project patches itself with `bun patch`, which the bun rewriters
-        // must leave on their registry tuple (#367). A text lock already
-        // read it above; a binary-only project reads it here, advisory too.
-        if !out.files.contains_key("package.json") && super::vlt::bun_lockb_present(view) {
+        // must leave on their registry tuple (#367). Read beside either bun
+        // lock, advisory too: the member walk above reaches the root only
+        // through a `workspaces` section in bun's emitted shape.
+        if !out.files.contains_key("package.json")
+            && (out.files.contains_key("bun.lock") || super::vlt::bun_lockb_present(view))
+        {
             if let Some(text) = read_advisory(view, unreadable, "package.json").await {
                 out.files.insert("package.json".to_string(), text);
             }
@@ -1494,7 +1497,8 @@ fn confirm(
             let uuid = c.dep.patch_uuid.as_str();
             // vlt decides before the binary-bun rule, so `bun.lockb` beside
             // a vlt-driven `vlt-lock.json` never confirms an npm purl.
-            if rewrite.refused_vlt_uuids.contains(uuid) {
+            if rewrite.refused_vlt_uuids.contains(uuid) || rewrite.refused_bun_uuids.contains(uuid)
+            {
                 return ProbeStep::Decided(false);
             }
             if rewrite.vlt_drives && purl.starts_with("pkg:npm/") {
@@ -2166,6 +2170,56 @@ mod tests {
                 assert!(skipped.is_none(), "{:?}", done.rewrite.warnings);
             }
             assert!(!done.rewrite.files.contains_key("package.json"));
+        }
+    }
+
+    /// REGRESSION (#367), text lock: the root manifest is read beside a
+    /// `bun.lock` even when the lock has no `workspaces` section to reach it
+    /// through, and a package the project patches itself is never
+    /// confirmed, not even when a sibling `package-lock.json` takes the
+    /// hosted URL: Bun keeps installing the registry bytes.
+    #[tokio::test]
+    async fn issue_367_bun_lock_user_patched_package_is_never_confirmed() {
+        let bun_lock = "{\n  \"lockfileVersion\": 1,\n  \"packages\": {\n    \"left-pad\": \
+                        [\"left-pad@1.3.0\", \"\", {}, \"sha512-UPSTREAM==\"],\n  }\n}\n";
+        let npm_lock = r#"{
+  "name": "app",
+  "lockfileVersion": 3,
+  "requires": true,
+  "packages": {
+    "": { "name": "app", "dependencies": { "left-pad": "1.3.0" } },
+    "node_modules/left-pad": {
+      "version": "1.3.0",
+      "resolved": "https://registry.npmjs.org/left-pad/-/left-pad-1.3.0.tgz",
+      "integrity": "sha512-UPSTREAM=="
+    }
+  }
+}
+"#;
+        let manifest = r#"{"name":"app","dependencies":{"left-pad":"1.3.0"},"patchedDependencies":{"left-pad@1.3.0":"patches/left-pad@1.3.0.patch"}}"#;
+        // Without the sibling npm lock nothing else reads the manifest.
+        for with_npm_lock in [false, true] {
+            let tmp = tempfile::tempdir().unwrap();
+            std::fs::write(tmp.path().join("bun.lock"), bun_lock).unwrap();
+            if with_npm_lock {
+                std::fs::write(tmp.path().join("package-lock.json"), npm_lock).unwrap();
+            }
+            std::fs::write(tmp.path().join("package.json"), manifest).unwrap();
+            let (read, done) = npm_rewrite(&ProjectView::Disk(tmp.path()), &BTreeSet::new()).await;
+            assert!(read.files.contains_key("package.json"));
+            assert!(
+                !done.rewrite.files.contains_key("bun.lock"),
+                "the user-patched entry keeps its registry tuple"
+            );
+            assert!(
+                done.rewrite
+                    .warnings
+                    .iter()
+                    .any(|w| w.code == "redirect_bun_patched_dependency_skipped"),
+                "{:?}",
+                done.rewrite.warnings
+            );
+            assert!(done.confirmed.is_empty(), "{:?}", done.confirmed);
         }
     }
 
