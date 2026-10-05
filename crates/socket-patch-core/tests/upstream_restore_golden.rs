@@ -1762,6 +1762,66 @@ async fn pylock_whole_second_upload_times_round_trip() {
     assert_pypi_round_trip("uv export pylock", &input, &[urllib3_dep()], None).await;
 }
 
+/// Native uv 0.11.19 gives these two different declarations the same
+/// `extra == 'x'` marker. Once hosted URLs replace their specifiers, their
+/// provenance is ambiguous: refusing must retain both files byte for byte.
+#[tokio::test]
+#[serial]
+async fn uv_explicit_extra_collision_refuses_without_writing() {
+    let pyproject = include_str!("fixtures/upstream/uv-explicit-extra/pyproject.toml");
+    let lock = include_str!("fixtures/upstream/uv-explicit-extra/uv.lock");
+    let wheel = "six-1.16.0-py2.py3-none-any.whl";
+    let dep = pypi_dep("six", "1.16.0", wheel, PYPI_UUID);
+    let (_server, _env) = pypi_mock(&[(
+        "six",
+        "1.16.0",
+        vec![
+            (
+                wheel,
+                "8abb2f1d86890a2dfb989f9a77cfcfd3e47c2a354b01111771326f8aa26e0254",
+                11053,
+                "2021-05-05T14:18:17.237Z",
+            ),
+            (
+                "six-1.16.0.tar.gz",
+                "1e61c37477a1626458e36f7b1d82aa5c9b094fa4802892072e49de9c60c4c926",
+                34041,
+                "2021-05-05T14:18:18.379Z",
+            ),
+        ],
+    )])
+    .await;
+    for own_marker in ["extra == 'x'", "'x' == extra"] {
+        let pyproject = pyproject.replace("extra == 'x'", own_marker);
+        for eol in ["\n", "\r\n"] {
+            let input = tree(&[
+                ("uv.lock", lock.replace('\n', eol)),
+                ("pyproject.toml", pyproject.replace('\n', eol)),
+            ]);
+            for dry_run in [false, true] {
+                println!("uv extra-marker refusal: {own_marker:?}, eol={eol:?}, dry_run={dry_run}");
+                let (why, rewritten, after) = pypi_refusal(
+                    &input,
+                    std::slice::from_ref(&dep),
+                    &RestoreOptions {
+                        dry_run,
+                        ..Default::default()
+                    },
+                )
+                .await;
+                assert!(why.contains("different specifiers"), "{why}");
+                assert!(why.contains("git checkout -- uv.lock"), "{why}");
+                assert!(rewritten["uv.lock"].contains("patch.socket.dev"));
+                assert!(rewritten["pyproject.toml"].contains("patch.socket.dev"));
+                assert_eq!(
+                    after, rewritten,
+                    "refused unwind changed files ({eol:?}, dry_run={dry_run})"
+                );
+            }
+        }
+    }
+}
+
 #[tokio::test]
 #[serial]
 async fn uv_refusals() {
@@ -2011,4 +2071,38 @@ async fn nuget_non_invertible_goldens_restore_or_refuse_as_documented() {
             assert!(!config.contains("socket-patch") && !config.contains("packageSourceMapping"));
         }
     }
+}
+
+/// #363: yarn 1 fetches a git-pattern block with git from its `resolved`,
+/// so restoring a registry tarball there would still fail every install.
+/// Handed such a pin directly (discovery already refuses to attribute it),
+/// the restorer refuses it and leaves the lock byte-identical, with no
+/// registry lookup.
+#[tokio::test]
+#[serial]
+async fn yarn_classic_git_pattern_pin_is_refused() {
+    let uuid = "55555555-5555-4555-8555-555555555555";
+    let lock = format!(
+        "# yarn lockfile v1\n\n\n\"left-pad@git+https://github.com/stevemao/left-pad.git#v1.3.0\":\n  \
+         version \"1.3.0\"\n  \
+         resolved \"https://patch.socket.dev/patch/npm/left-pad/1.3.0/66666666-6666-4666-8666-666666666666/{uuid}/left-pad-1.3.0.tgz\"\n  \
+         integrity sha512-PATCHEDpatched==\n"
+    );
+    let tmp = tempfile::tempdir().unwrap();
+    fs::write(tmp.path().join("yarn.lock"), &lock).unwrap();
+    let pin = HostedPin {
+        purl: "pkg:npm/left-pad@1.3.0".into(),
+        uuid: uuid.into(),
+        files: vec!["yarn.lock".into()],
+    };
+    let outcome = restore_upstream(tmp.path(), &[pin], &RestoreOptions::default()).await;
+    assert!(outcome.flush_error.is_none(), "{:?}", outcome.flush_error);
+    match &outcome.pins[..] {
+        [p] => match &p.status {
+            PinStatus::Refused(why) => assert!(why.contains("installs from git"), "{why}"),
+            other => panic!("expected a refusal, got {other:?}"),
+        },
+        other => panic!("one pin expected: {other:?}"),
+    }
+    assert_eq!(fs::read_to_string(tmp.path().join("yarn.lock")).unwrap(), lock);
 }

@@ -555,7 +555,7 @@ async fn keep_bundler_loaded_gem_files(view: &ProjectView<'_>, out: &mut Candida
             let config = view.read_text(".bundle/config").await.ok();
             let value = config.as_deref().and_then(manifest::config_gemfile);
             let root = std::path::Path::new("/");
-            manifest::classify(root, None, value.as_deref())
+            manifest::classify(root, None, value.as_deref(), None)
         }
     };
     let keep: &[&str] = match &loaded {

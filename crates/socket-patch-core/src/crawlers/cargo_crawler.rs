@@ -286,7 +286,7 @@ impl CargoCrawler {
     /// name and version.
     async fn verify_crate_at_path(&self, path: &Path, name: &str, version: &str) -> bool {
         let cargo_toml_path = path.join("Cargo.toml");
-        let content = match tokio::fs::read_to_string(&cargo_toml_path).await {
+        let content = match crate::utils::fs::read_regular_to_string(&cargo_toml_path).await {
             Ok(c) => c,
             Err(_) => return false,
         };
@@ -398,7 +398,7 @@ fn scan_crate_source(src_path: &Path, seen: &mut HashSet<String>) -> Vec<Crawled
 /// when the Cargo.toml has `version.workspace = true`.
 fn read_crate_cargo_toml(crate_path: &Path, dir_name: &str) -> Option<(String, String)> {
     let cargo_toml_path = crate_path.join("Cargo.toml");
-    let content = std::fs::read_to_string(&cargo_toml_path).ok()?;
+    let content = crate::utils::fs::read_regular_to_string_sync(&cargo_toml_path).ok()?;
 
     // Fallback: parse directory name as <name>-<version>
     parse_cargo_toml_name_version(&content)
@@ -1230,5 +1230,99 @@ version = "fake"
             assert!(!old.is_empty());
             assert_eq!(rows(&new), rows(&old));
         }
+    }
+
+    /// mkfifo(2) directly (no child process; spawning `mkfifo` flakes
+    /// under heavy parallel load).
+    #[cfg(unix)]
+    fn make_fifo(path: &Path) {
+        use std::os::unix::ffi::OsStrExt;
+        let c_path =
+            std::ffi::CString::new(path.as_os_str().as_bytes()).expect("fifo path has no NUL");
+        let rc = unsafe { libc::mkfifo(c_path.as_ptr(), 0o644) };
+        assert_eq!(
+            rc,
+            0,
+            "mkfifo(2) failed: {}",
+            std::io::Error::last_os_error()
+        );
+    }
+
+    /// On timeout the open is wedged in a blocking-pool thread that the
+    /// runtime waits for on shutdown; connecting a writer releases it so
+    /// the test FAILS instead of hanging the whole suite.
+    #[cfg(unix)]
+    async fn within_deadline<F: std::future::Future>(fifo: &Path, what: &str, fut: F) -> F::Output {
+        match tokio::time::timeout(std::time::Duration::from_secs(5), fut).await {
+            Ok(out) => out,
+            Err(_) => {
+                // O_NONBLOCK: with no reader blocked on the FIFO (the
+                // timeout had another cause) a blocking writer open would
+                // itself hang; non-blocking it just fails with ENXIO.
+                use std::os::unix::fs::OpenOptionsExt;
+                let _ = std::fs::OpenOptions::new()
+                    .write(true)
+                    .custom_flags(libc::O_NONBLOCK)
+                    .open(fifo);
+                panic!("{what} must not block on a FIFO at {}", fifo.display());
+            }
+        }
+    }
+
+    /// Regression (#592): a FIFO at `vendor/<crate>/Cargo.toml` in the
+    /// project tree used to wedge `crawl_all` (blocking-pool
+    /// `read_crate_cargo_toml`) and `find_by_purls` (`verify_crate_at_path`)
+    /// in open(2). Both now go through the FIFO-safe reader and skip the
+    /// unreadable crate, exactly like any other unreadable manifest.
+    #[cfg(unix)]
+    #[tokio::test]
+    async fn fifo_crate_manifest_is_skipped_not_blocked_on() {
+        let dir = tempfile::tempdir().unwrap();
+        tokio::fs::write(
+            dir.path().join("Cargo.toml"),
+            "[package]\nname = \"root\"\nversion = \"0.1.0\"\n",
+        )
+        .await
+        .unwrap();
+        let vendor = dir.path().join("vendor");
+        let left = vendor.join("left-1.0.0");
+        tokio::fs::create_dir_all(&left).await.unwrap();
+        let fifo = left.join("Cargo.toml");
+        make_fifo(&fifo);
+        // A readable crate beside the FIFO proves the crawl continues.
+        let serde_dir = vendor.join("serde");
+        tokio::fs::create_dir_all(&serde_dir).await.unwrap();
+        tokio::fs::write(
+            serde_dir.join("Cargo.toml"),
+            "[package]\nname = \"serde\"\nversion = \"1.0.200\"\n",
+        )
+        .await
+        .unwrap();
+
+        let crawler = CargoCrawler::new();
+        let options = CrawlerOptions {
+            cwd: dir.path().to_path_buf(),
+            global: false,
+            global_prefix: None,
+        };
+        let packages = within_deadline(&fifo, "crawl_all", crawler.crawl_all(&options)).await;
+        let purls: Vec<_> = packages.iter().map(|p| p.purl.as_str()).collect();
+        assert_eq!(purls, vec!["pkg:cargo/serde@1.0.200"]);
+
+        let found = within_deadline(
+            &fifo,
+            "find_by_purls",
+            crawler.find_by_purls(
+                &vendor,
+                &[
+                    "pkg:cargo/left@1.0.0".to_string(),
+                    "pkg:cargo/serde@1.0.200".to_string(),
+                ],
+            ),
+        )
+        .await
+        .unwrap();
+        assert!(!found.contains_key("pkg:cargo/left@1.0.0"));
+        assert!(found.contains_key("pkg:cargo/serde@1.0.200"));
     }
 }

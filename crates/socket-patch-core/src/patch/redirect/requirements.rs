@@ -6,6 +6,7 @@ use serde_json::Value;
 use super::{DepOverride, FileEdit, RewriteResult, RewriteWarning};
 use crate::crawlers::python_crawler::canonicalize_pypi_name;
 use crate::utils::purl::percent_decode_purl_component;
+use crate::vendor::state::{VendorEntry, WiringAction};
 
 pub(super) struct LogicalRequirement {
     pub(super) original: String,
@@ -363,6 +364,187 @@ pub(super) fn rewrite(
             .map(|requirement| requirement.original + &requirement.ending)
             .collect();
         result.files.insert("requirements.txt".into(), output);
+    }
+}
+
+/// Whether the hosted requirements rewriter can take over a vendored
+/// requirements.txt entry (#699). The rewriter edits only an existing pin
+/// in the ROOT `requirements.txt` (anything else is
+/// `redirect_requirements_entry_not_found`), but vendored mode also
+/// rewrites a pin inside a `-r` include and appends a managed
+/// `(transitive)` line when no file pins the package. Reverting either
+/// leaves the root with no pin to redirect, so the takeover must refuse
+/// BEFORE the revert — keeping the vendored patch — on wet and dry runs
+/// alike. Only `requirements`-flavored PyPI entries are gated; every other
+/// entry passes.
+pub fn preflight_requirements_takeover(entry: &VendorEntry) -> Result<(), RewriteWarning> {
+    if entry.ecosystem != "pypi" || entry.flavor.as_deref() != Some("requirements") {
+        return Ok(());
+    }
+    let unreachable = entry.wiring.iter().find(|record| {
+        record.file != "requirements.txt" || record.action != WiringAction::Rewritten
+    });
+    let Some(record) = unreachable else {
+        return Ok(());
+    };
+    // `vendor --revert` has no per-package form, so the remedy names its
+    // full reach; the pin must then live ONLY in the root file, or the
+    // include's unpatched pin stays in the install alongside the hosted
+    // one.
+    let (wired, relocate) = if record.action == WiringAction::Added {
+        (
+            format!(
+                "a `(transitive)` line socket-patch appended to {}",
+                record.file
+            ),
+            "add an exact `==` pin for it to the root requirements.txt".to_string(),
+        )
+    } else {
+        (
+            format!("a pin in {}", record.file),
+            format!(
+                "move its pin from {} into the root requirements.txt (delete it from {})",
+                record.file, record.file
+            ),
+        )
+    };
+    Err(RewriteWarning {
+        code: "redirect_requirements_takeover_unreachable".into(),
+        detail: format!(
+            "{} is vendored through {wired}; hosted mode only rewrites an existing pin in \
+             the root requirements.txt, so it is kept vendored (not switched to hosted). To \
+             switch it: run `socket-patch vendor --revert` (this reverts EVERY vendored \
+             package in the project, not just this one), {relocate}, then re-run \
+             `scan --mode hosted`",
+            entry.base_purl
+        ),
+    })
+}
+
+#[cfg(test)]
+mod takeover_reach_tests {
+    use super::*;
+    use crate::vendor::state::{VendorArtifact, WiringRecord};
+
+    fn record(file: &str, action: WiringAction) -> WiringRecord {
+        WiringRecord {
+            file: file.into(),
+            kind: "requirements_line".into(),
+            action,
+            key: Some(format!("{file}:1")),
+            original: None,
+            new: None,
+        }
+    }
+
+    fn entry(flavor: &str, wiring: Vec<WiringRecord>) -> VendorEntry {
+        VendorEntry {
+            ecosystem: "pypi".into(),
+            base_purl: "pkg:pypi/six@1.16.0".into(),
+            uuid: "5c3e1a2b-7d4f-4e6a-9b8c-1d2e3f4a5b6c".into(),
+            artifact: VendorArtifact {
+                yarn_berry10c0: None,
+                path: ".socket/vendor/pypi/5c3e1a2b-7d4f-4e6a-9b8c-1d2e3f4a5b6c/six-1.16.0-py3-none-any.whl"
+                    .into(),
+                sha256: "0".repeat(64),
+                size: None,
+                platform_locked: None,
+                file_inventory: None,
+            },
+            wiring,
+            lock: None,
+            took_over_go_patches: false,
+            detached: false,
+            record: None,
+            flavor: Some(flavor.into()),
+            uv: None,
+            pnpm: None,
+            poetry: None,
+            pdm: None,
+            pipenv: None,
+        }
+    }
+
+    #[test]
+    fn root_pins_are_reachable() {
+        let e = entry(
+            "requirements",
+            vec![
+                record("requirements.txt", WiringAction::Rewritten),
+                record("requirements.txt", WiringAction::Rewritten),
+            ],
+        );
+        assert!(preflight_requirements_takeover(&e).is_ok());
+    }
+
+    #[test]
+    fn include_pin_is_unreachable() {
+        let e = entry(
+            "requirements",
+            vec![record("base.txt", WiringAction::Rewritten)],
+        );
+        let w = preflight_requirements_takeover(&e).unwrap_err();
+        assert_eq!(w.code, "redirect_requirements_takeover_unreachable");
+        assert!(w.detail.contains("a pin in base.txt"), "{}", w.detail);
+        assert!(w.detail.contains("pkg:pypi/six@1.16.0"), "{}", w.detail);
+        assert!(
+            w.detail.contains("reverts EVERY vendored package"),
+            "the remedy names `vendor --revert`'s full reach: {}",
+            w.detail
+        );
+        assert!(
+            w.detail.contains("delete it from base.txt"),
+            "the include pin must not survive next to the hosted one: {}",
+            w.detail
+        );
+    }
+
+    #[test]
+    fn root_and_include_pins_are_unreachable() {
+        let e = entry(
+            "requirements",
+            vec![
+                record("requirements.txt", WiringAction::Rewritten),
+                record("requirements/base.txt", WiringAction::Rewritten),
+            ],
+        );
+        assert!(preflight_requirements_takeover(&e).is_err());
+    }
+
+    #[test]
+    fn transitive_line_is_unreachable() {
+        let e = entry(
+            "requirements",
+            vec![record("requirements.txt", WiringAction::Added)],
+        );
+        let w = preflight_requirements_takeover(&e).unwrap_err();
+        assert!(w.detail.contains("`(transitive)` line"), "{}", w.detail);
+        assert!(
+            w.detail.contains("reverts EVERY vendored package"),
+            "{}",
+            w.detail
+        );
+        assert!(
+            w.detail
+                .contains("add an exact `==` pin for it to the root requirements.txt"),
+            "{}",
+            w.detail
+        );
+    }
+
+    #[test]
+    fn other_flavors_and_ecosystems_pass() {
+        let e = entry(
+            "poetry",
+            vec![record("poetry.lock", WiringAction::Rewritten)],
+        );
+        assert!(preflight_requirements_takeover(&e).is_ok());
+        let mut e = entry(
+            "requirements",
+            vec![record("base.txt", WiringAction::Rewritten)],
+        );
+        e.ecosystem = "npm".into();
+        assert!(preflight_requirements_takeover(&e).is_ok());
     }
 }
 

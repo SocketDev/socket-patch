@@ -265,8 +265,7 @@ fn rewrite_environments(
                     .is_some_and(|kind| kind != "virtual")
             {
                 return Err(
-                    "Hatch sources, overrides and custom environments require agent mode"
-                        .into(),
+                    "Hatch sources, overrides and custom environments require agent mode".into(),
                 );
             }
             for key in ["dependencies", "extra-dependencies"] {
@@ -303,11 +302,7 @@ pub fn rewrite(
 }
 
 fn enable_permission(document: &mut DocumentMut, external: bool) -> Result<(), String> {
-    let keys: &[&str] = if external {
-        &["metadata"]
-    } else {
-        &["tool", "hatch", "metadata"]
-    };
+    let keys = permission_keys(external);
     let mut table: &mut dyn toml_edit::TableLike = document.as_table_mut();
     for key in keys {
         if !table.contains_key(key) {
@@ -326,6 +321,40 @@ fn enable_permission(document: &mut DocumentMut, external: bool) -> Result<(), S
     }
     table.insert("allow-direct-references", toml_edit::value(true));
     Ok(())
+}
+
+/// The table path holding Hatch's direct-reference permission: hatch.toml's
+/// `[metadata]` when that file carries the key, else pyproject's
+/// `[tool.hatch.metadata]`.
+pub(crate) fn permission_keys(external: bool) -> &'static [&'static str] {
+    if external {
+        &["metadata"]
+    } else {
+        &["tool", "hatch", "metadata"]
+    }
+}
+
+/// Remove `keys`' last table's `allow-direct-references = true` (the
+/// permission a project direct reference needs), then every table on the
+/// path that is left empty. Shared by the hosted unwind and the vendored
+/// permission ledger, so both lanes agree on what the file looks like once
+/// no project direct reference is left.
+pub(crate) fn drop_direct_reference_permission(doc: &mut DocumentMut, keys: &[&str]) -> bool {
+    fn walk(table: &mut dyn toml_edit::TableLike, keys: &[&str]) -> bool {
+        let Some((first, rest)) = keys.split_first() else {
+            return table.get("allow-direct-references").and_then(Item::as_bool) == Some(true)
+                && table.remove("allow-direct-references").is_some();
+        };
+        let Some(child) = table.get_mut(first).and_then(Item::as_table_like_mut) else {
+            return false;
+        };
+        let removed = walk(child, rest);
+        if removed && child.is_empty() {
+            table.remove(first);
+        }
+        removed
+    }
+    walk(doc.as_table_mut(), keys)
 }
 
 pub fn has_project_direct_references(files: &BTreeMap<String, String>) -> bool {

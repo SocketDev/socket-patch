@@ -999,6 +999,17 @@ pub(super) async fn revert_pnpm_dialect(
     // ran; the artifact dir stays behind (and the caller keeps the ledger
     // entry), so only the deletion is skipped.
     if !keep_artifact {
+        if super::npm_flavor::keep_artifact_while_lock_references_it(
+            &mut outcome,
+            project_root,
+            &[PNPM_LOCK, PACKAGE_JSON, PNPM_WORKSPACE],
+            &entry.uuid,
+            &uuid_dir_rel,
+        )
+        .await
+        {
+            return outcome;
+        }
         // The last npm-family entry leaves `.socket/vendor/npm/` (and
         // `.socket/vendor/`) empty: the shared helper prunes them so a
         // reverted project carries no vendor residue (non-recursive:
@@ -3108,7 +3119,7 @@ fn revert_importer_dep(
         }
         break;
     }
-    warnings.push(drifted(format!(
+    warnings.push(removed(format!(
         "importer dep `{key}` no longer exists; nothing to restore"
     )));
 }
@@ -3187,7 +3198,7 @@ fn revert_block(
             j = block.end;
         }
     }
-    warnings.push(drifted(format!(
+    warnings.push(removed(format!(
         "{section} entry `{new_key}` no longer exists; nothing to restore"
     )));
 }
@@ -3251,13 +3262,20 @@ fn revert_snapshot_ref(
         }
         break;
     }
-    warnings.push(drifted(format!(
+    warnings.push(removed(format!(
         "snapshot ref `{key}` no longer exists; nothing to restore"
     )));
 }
 
 pub(super) fn drifted(detail: impl Into<String>) -> VendorWarning {
     VendorWarning::new("vendor_lock_entry_drifted", detail.into())
+}
+
+/// A recorded lock entry that no longer exists (`pnpm remove` dropped the
+/// dependency). Not drift (#665): the revert keeps the artifact only while
+/// a wired file still resolves through it.
+pub(super) fn removed(detail: impl Into<String>) -> VendorWarning {
+    VendorWarning::new(super::LOCK_ENTRY_REMOVED_CODE, detail.into())
 }
 
 // ────────────────────────── surfaces commit + unwind ──────────────────────
@@ -6579,23 +6597,24 @@ snapshots:
             .await
             .unwrap();
 
+        // #665: a vanished block is not drift. Once the other recorded
+        // fragments are restored nothing resolves through the artifact, so
+        // it is removed instead of kept forever.
         let outcome = revert_pnpm(&entry, fx.root(), false).await;
         assert!(outcome.success, "{:?}", outcome.error);
         assert_warning(
             &outcome.warnings,
-            "vendor_lock_entry_drifted",
-            "no longer exists; nothing to restore",
-        );
-        assert_warning(
-            &outcome.warnings,
-            "vendor_lock_entry_drifted",
+            "vendor_lock_entry_removed",
             "packages entry `left-pad@file:",
         );
-        assert!(outcome.kept_artifact);
+        assert!(!outcome.drift_skipped(), "{:?}", outcome.warnings);
+        assert!(!outcome.kept_artifact, "{:?}", outcome.warnings);
+        assert!(!uuid_dir(&fx).exists(), "unreferenced artifact removed");
     }
 
-    /// Snapshot dep refs: the re-resolved (foreign value) arm and the
-    /// line-vanished arm both warn and keep.
+    /// Snapshot dep refs: the re-resolved (foreign value) arm warns and
+    /// keeps; the line-vanished arm warns `vendor_lock_entry_removed` and,
+    /// with nothing left resolving through the artifact, removes it (#665).
     #[tokio::test]
     async fn snapshot_ref_drift_and_vanished_arms_warn() {
         // Re-resolved behind our back.
@@ -6636,13 +6655,16 @@ snapshots:
         assert!(outcome.success, "{:?}", outcome.error);
         assert_warning(
             &outcome.warnings,
-            "vendor_lock_entry_drifted",
+            "vendor_lock_entry_removed",
             "snapshot ref `consumer@file:consumer|left-pad` no longer exists; nothing to restore",
         );
-        assert!(outcome.kept_artifact);
+        assert!(!outcome.kept_artifact, "{:?}", outcome.warnings);
+        assert!(!uuid_dir(&fx).exists(), "unreferenced artifact removed");
     }
 
-    /// The whole importer dep entry deleted since vendoring: warn + keep.
+    /// The whole importer dep entry deleted since vendoring: warned as
+    /// removed, and the artifact goes once nothing resolves through it
+    /// (#665).
     #[tokio::test]
     async fn vanished_importer_dep_entry_warns_nothing_to_restore() {
         let fx = fixture_with(P1_BEFORE_PKG, P1_BEFORE_LOCK).await;
@@ -6665,10 +6687,11 @@ snapshots:
         assert!(outcome.success, "{:?}", outcome.error);
         assert_warning(
             &outcome.warnings,
-            "vendor_lock_entry_drifted",
+            "vendor_lock_entry_removed",
             "importer dep `.|left-pad` no longer exists; nothing to restore",
         );
-        assert!(outcome.kept_artifact);
+        assert!(!outcome.kept_artifact, "{:?}", outcome.warnings);
+        assert!(!uuid_dir(&fx).exists(), "unreferenced artifact removed");
     }
 
     /// The user hand-restored the importer dep to its pre-vendor pair before
@@ -7973,7 +7996,7 @@ snapshots:
             &mut warnings,
         );
         assert!(!dirty);
-        assert_warning(&warnings, "vendor_lock_entry_drifted", "no longer exists");
+        assert_warning(&warnings, "vendor_lock_entry_removed", "no longer exists");
     }
 
     /// A record whose `original` lost its `specifier`/`version` fields
@@ -8015,8 +8038,9 @@ snapshots:
     }
 
     /// A rekeyed block that vanished, where the recorded original ALSO
-    /// matches no live block, is drift ("no longer exists") — the converged
-    /// silent return applies only when the original block is live verbatim.
+    /// matches no live block, is warned as removed ("no longer exists") —
+    /// the converged silent return applies only when the original block is
+    /// live verbatim.
     #[test]
     fn packages_block_revert_with_no_live_or_original_match_warns_vanished() {
         let mut lines =
@@ -8047,10 +8071,10 @@ snapshots:
             &mut warnings,
         );
         assert!(!dirty);
-        assert_warning(&warnings, "vendor_lock_entry_drifted", "no longer exists");
+        assert_warning(&warnings, "vendor_lock_entry_removed", "no longer exists");
 
         // Same vanish with NO recorded original (a stripped/reconstructed
-        // record): the converged probe is skipped — still the same drift
+        // record): the converged probe is skipped — still the same removed
         // warning, never a silent pass.
         let rec = WiringRecord {
             original: None,
@@ -8068,7 +8092,7 @@ snapshots:
             &mut warnings,
         );
         assert!(!dirty);
-        assert_warning(&warnings, "vendor_lock_entry_drifted", "no longer exists");
+        assert_warning(&warnings, "vendor_lock_entry_removed", "no longer exists");
     }
 
     /// The unwind helper restores exactly what was written: with no
@@ -8859,5 +8883,197 @@ snapshots:
                 assert!(err.contains(PNPM_WORKSPACE), "{text:?}: {err}");
             }
         }
+    }
+
+    // ── two packages sharing created scaffolding (#636) ──────────────────
+
+    const TWO_PKG: &str = r#"{
+  "name": "fx",
+  "version": "1.0.0",
+  "private": true,
+  "dependencies": {
+    "left-pad": "1.3.0",
+    "is-number": "7.0.0"
+  }
+}
+"#;
+
+    const TWO_LOCK: &str = "lockfileVersion: '9.0'
+
+settings:
+  autoInstallPeers: true
+  excludeLinksFromLockfile: false
+
+importers:
+
+  .:
+    dependencies:
+      is-number:
+        specifier: 7.0.0
+        version: 7.0.0
+      left-pad:
+        specifier: 1.3.0
+        version: 1.3.0
+
+packages:
+
+  is-number@7.0.0:
+    resolution: {integrity: sha512-41Cifkg6e8TylSpdtTpeLVMqvSBEVzTttHvERD741+pnZ8ANv0004MRL43QKPDlK9cGvNp6NZWZUBlbGXYxxng==}
+    engines: {node: '>=0.12.0'}
+
+  left-pad@1.3.0:
+    resolution: {integrity: sha512-XI5MPzVNApjAyhQzphX8BkmKsKUxD4LdyK24iZeQGinBN9yTQT3bFlCBy/aVx2HrNcqQGsdot8ghrjyrvMCoEA==}
+    deprecated: use String.prototype.padStart()
+
+snapshots:
+
+  is-number@7.0.0: {}
+
+  left-pad@1.3.0: {}
+";
+
+    const IS_NUMBER_UUID: &str = "4d5e6f70-8a9b-4c0d-9e1f-2a3b4c5d6e7f";
+    const IS_NUMBER: &str = "pkg:npm/is-number@7.0.0";
+    const LEFT_PAD: &str = "pkg:npm/left-pad@1.3.0";
+
+    /// Vendor is-number then left-pad (is-number creates every scaffold),
+    /// persisting the ledger after each the way the vendor loop does.
+    async fn vendor_two(pkg_json: &str, workspace: Option<&str>) -> Fixture {
+        let fx = fixture_with(pkg_json, TWO_LOCK).await;
+        if let Some(ws) = workspace {
+            tokio::fs::write(fx.root().join(PNPM_WORKSPACE), ws)
+                .await
+                .unwrap();
+        }
+        let is_number = fx.root().join("node_modules/is-number");
+        tokio::fs::create_dir_all(&is_number).await.unwrap();
+        tokio::fs::write(
+            is_number.join("package.json"),
+            br#"{"name":"is-number","version":"7.0.0"}"#,
+        )
+        .await
+        .unwrap();
+        tokio::fs::write(is_number.join("index.js"), ORIG_INDEX)
+            .await
+            .unwrap();
+        let mut is_number_record = fx.record.clone();
+        is_number_record.uuid = IS_NUMBER_UUID.to_string();
+
+        let blobs = fx.root().join(".socket/blobs");
+        let sources = PatchSources::blobs_only(&blobs);
+        let mut state = crate::vendor::state::VendorState::new();
+        for (purl, dir, record) in [
+            (IS_NUMBER, is_number.clone(), &is_number_record),
+            (LEFT_PAD, fx.installed(), &fx.record),
+        ] {
+            let outcome = crate::vendor::test_support::vendor_pnpm(
+                purl,
+                &dir,
+                fx.root(),
+                record,
+                &sources,
+                "2026-06-09T00:00:00Z",
+                false,
+                false,
+                None,
+            )
+            .await;
+            let (result, entry, _) = expect_done(outcome);
+            assert!(result.success, "{purl}: {:?}", result.error);
+            state.entries.insert(purl.to_string(), entry.unwrap());
+            crate::vendor::state::save_state(fx.root(), &state)
+                .await
+                .unwrap();
+        }
+        fx
+    }
+
+    /// Revert `order` one entry at a time from a freshly loaded ledger,
+    /// saving after each removal (`vendor --revert`, `rollback` and
+    /// successive `remove` runs all persist per entry).
+    async fn revert_in_order(fx: &Fixture, order: [&str; 2]) {
+        for key in order {
+            let mut state = crate::vendor::state::load_state(fx.root()).await.unwrap();
+            let entry = state.entries.get(key).cloned().unwrap();
+            let outcome = revert_pnpm(&entry, fx.root(), false).await;
+            assert!(outcome.success, "{key}: {:?}", outcome.error);
+            assert!(outcome.warnings.is_empty(), "{key}: {:?}", outcome.warnings);
+            state.entries.remove(key);
+            crate::vendor::state::save_state(fx.root(), &state)
+                .await
+                .unwrap();
+        }
+    }
+
+    /// #636: the creator (is-number, first in purl order) reverted first
+    /// must not leave `"pnpm": { "overrides": {} }` or the scaffolded
+    /// pnpm-workspace.yaml behind once left-pad empties them.
+    #[tokio::test]
+    async fn revert_two_packages_creator_first_removes_created_scaffold() {
+        let fx = vendor_two(TWO_PKG, None).await;
+        assert!(fx.root().join(PNPM_WORKSPACE).exists());
+
+        revert_in_order(&fx, [IS_NUMBER, LEFT_PAD]).await;
+        assert_eq!(fx.read(PACKAGE_JSON).await, TWO_PKG);
+        assert_eq!(fx.read(PNPM_LOCK).await, TWO_LOCK);
+        assert!(
+            !fx.root().join(PNPM_WORKSPACE).exists(),
+            "scaffolded workspace file left behind"
+        );
+    }
+
+    /// #636, `remove` in the other order: clean before the fix too.
+    #[tokio::test]
+    async fn revert_two_packages_creator_last_removes_created_scaffold() {
+        let fx = vendor_two(TWO_PKG, None).await;
+
+        revert_in_order(&fx, [LEFT_PAD, IS_NUMBER]).await;
+        assert_eq!(fx.read(PACKAGE_JSON).await, TWO_PKG);
+        assert!(!fx.root().join(PNPM_WORKSPACE).exists());
+    }
+
+    /// The `overrides:` section vendoring added to the user's own
+    /// pnpm-workspace.yaml goes too, in creator-first order; the file and
+    /// the user's keys stay.
+    #[tokio::test]
+    async fn revert_two_packages_removes_created_workspace_overrides() {
+        let ws = "packages:\n  - '.'\n";
+        let fx = vendor_two(TWO_PKG, Some(ws)).await;
+
+        revert_in_order(&fx, [IS_NUMBER, LEFT_PAD]).await;
+        assert_eq!(fx.read(PNPM_WORKSPACE).await, ws);
+        assert_eq!(fx.read(PACKAGE_JSON).await, TWO_PKG);
+    }
+
+    /// A ledger written before the flags were shared (only the creator
+    /// flagged) is repaired on load, so it unwinds cleanly too.
+    #[tokio::test]
+    async fn revert_two_packages_repairs_a_creator_only_ledger() {
+        let fx = vendor_two(TWO_PKG, None).await;
+        let path = fx.root().join(".socket/vendor/state.json");
+        let mut ledger: serde_json::Value =
+            serde_json::from_slice(&tokio::fs::read(&path).await.unwrap()).unwrap();
+        ledger["entries"][LEFT_PAD]["pnpm"] = serde_json::json!({});
+        tokio::fs::write(&path, serde_json::to_vec_pretty(&ledger).unwrap())
+            .await
+            .unwrap();
+
+        revert_in_order(&fx, [IS_NUMBER, LEFT_PAD]).await;
+        assert_eq!(fx.read(PACKAGE_JSON).await, TWO_PKG);
+        assert!(!fx.root().join(PNPM_WORKSPACE).exists());
+    }
+
+    /// A user's own `pnpm` table keeps its keys; only the overrides table
+    /// vendoring created goes.
+    #[tokio::test]
+    async fn revert_two_packages_keeps_a_user_pnpm_table() {
+        let pkg = TWO_PKG.replace(
+            "  }\n}\n",
+            "  },\n  \"pnpm\": {\n    \"onlyBuiltDependencies\": []\n  }\n}\n",
+        );
+        let fx = vendor_two(&pkg, None).await;
+
+        revert_in_order(&fx, [IS_NUMBER, LEFT_PAD]).await;
+        assert_eq!(fx.read(PACKAGE_JSON).await, pkg);
     }
 }
