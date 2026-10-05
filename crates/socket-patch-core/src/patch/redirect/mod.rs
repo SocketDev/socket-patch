@@ -246,6 +246,10 @@ pub struct RewriteResult {
     /// the project patches that package itself with `bun patch` (#367).
     /// Never confirmed, not even by the URL landing in a sibling npm-family
     /// lock: Bun keeps installing the registry bytes.
+    #[cfg_attr(
+        test,
+        serde(skip_serializing_if = "std::collections::BTreeSet::is_empty")
+    )]
     pub refused_bun_uuids: std::collections::BTreeSet<String>,
     /// Patch uuids whose package version a yarn berry `yarn.lock` locks, so
     /// the berry rewriter alone decides them: the hosted pin is the
