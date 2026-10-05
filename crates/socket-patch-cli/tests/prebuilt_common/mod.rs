@@ -15,6 +15,9 @@ use socket_patch_core::vendor::test_support::service_fixture::{
 use wiremock::matchers::{method, path, path_regex};
 use wiremock::{Mock, MockServer, ResponseTemplate};
 
+#[path = "../common/jvm_env.rs"]
+pub mod jvm_env;
+
 type Package = (String, Vec<u8>, Secondary);
 static PUBLISHED: OnceLock<Mutex<HashMap<(PathBuf, String), Package>>> = OnceLock::new();
 static MAVEN_METADATA: OnceLock<Mutex<HashMap<PathBuf, HashMap<String, Vec<u8>>>>> =
@@ -81,19 +84,16 @@ impl Server {
         let root = root.to_path_buf();
         let extra: Vec<_> = env
             .iter()
-            .filter(|(k, _)| {
-                matches!(
-                    *k,
-                    "CARGO_HOME"
-                        | "GOMODCACHE"
-                        | "MAVEN_REPO_LOCAL"
-                        | "NUGET_PACKAGES"
-                        | "GEM_HOME"
-                        | "VIRTUAL_ENV"
-                        | "BUNDLE_PATH"
-                )
+            .filter_map(|(k, v)| match *k {
+                "CARGO_HOME" | "GOMODCACHE" | "MAVEN_REPO_LOCAL" | "NUGET_PACKAGES"
+                | "GEM_HOME" | "VIRTUAL_ENV" | "BUNDLE_PATH" => Some(PathBuf::from(v)),
+                // The explicit JVM caches (`jvm_env::EXPLICIT`) are served
+                // as maven2 repositories from their `files-2.1` trees.
+                "GRADLE_USER_HOME" => Some(PathBuf::from(v).join(GRADLE_FILES21)),
+                "GRADLE_RO_DEP_CACHE" => Some(PathBuf::from(v).join(RO_FILES21)),
+                // sbt: "COURSIER_CACHE" => …
+                _ => None,
             })
-            .map(|(_, v)| PathBuf::from(v))
             .collect();
         let (ready_tx, ready_rx) = mpsc::channel();
         let (stop, stopped) = mpsc::channel();
@@ -184,12 +184,17 @@ async fn mount_project_with_roots(server: &MockServer, root: &Path, extra: Vec<P
                     )
                 {
                     if let Ok(relative) = path.strip_prefix(&repository) {
-                        metadata
-                            .entry(format!(
-                                "/{}",
-                                relative.to_string_lossy().replace('\\', "/")
-                            ))
-                            .or_insert_with(|| std::fs::read(path).unwrap());
+                        let relative = relative.to_string_lossy().replace('\\', "/");
+                        let route = if repository.ends_with(GRADLE_FILES21_LEAF) {
+                            files21_route(&relative)
+                        } else {
+                            Some(format!("/{relative}"))
+                        };
+                        if let Some(route) = route {
+                            metadata
+                                .entry(route)
+                                .or_insert_with(|| std::fs::read(path).unwrap());
+                        }
                     }
                 }
             }
@@ -260,7 +265,8 @@ async fn mount_project_with_roots(server: &MockServer, root: &Path, extra: Vec<P
             if let Some((ga, v)) = gav.rsplit_once('@') {
                 if let Some((g, a)) = ga.split_once('/') {
                     for ext in ["pom", "module", "jar"] {
-                        if let Ok(bytes) = std::fs::read(source.join(format!("{a}-{v}.{ext}"))) {
+                        let file = maven_sibling(&source, &format!("{a}-{v}.{ext}"));
+                        if let Some(bytes) = file.and_then(|f| std::fs::read(f).ok()) {
                             let route = format!("/{}/{a}/{v}/{a}-{v}.{ext}", g.replace('.', "/"));
                             Mock::given(method("GET"))
                                 .and(path(format!("{route}.sha512")))
@@ -474,12 +480,18 @@ fn source_dir(root: &Path, paths: &[PathBuf], purl: &str) -> PathBuf {
             "golang" => dir
                 .to_string_lossy()
                 .ends_with(&format!("{name}@{version}")),
-            "maven" => dir
-                .join(format!(
-                    "{}-{version}.jar",
-                    name.rsplit('/').next().unwrap()
-                ))
-                .is_file(),
+            "maven" => {
+                let jar = format!("{}-{version}.jar", name.rsplit('/').next().unwrap());
+                if dir.join(&jar).is_file() {
+                    true
+                } else if let Some(child) = files21_hash_child(dir, &jar) {
+                    // A Gradle `files-2.1` version dir: the jar sits in its
+                    // `<sha1>/` child, which is the archive source.
+                    return child;
+                } else {
+                    false
+                }
+            }
             "nuget" => dir
                 .join(format!("{}.{}.nupkg", name.to_lowercase(), version))
                 .is_file(),
@@ -575,13 +587,24 @@ pub async fn mount_view_from_source(
 }
 
 /// Download fixtures for lifecycle setup. Package-manager offline checks are
-/// separate commands and retain their original flags.
+/// separate commands and retain their original flags. Every command also
+/// gets the JVM isolation of `jvm_env::isolate_cli`: ambient Gradle / JVM
+/// options scrubbed, `HOME` / `USERPROFILE` pinned to an empty stand-in, and
+/// only the `jvm_env::EXPLICIT` caches named in `env` passed through.
 pub fn prepare_command(
     command: &mut std::process::Command,
     root: &Path,
     args: &[&str],
     env: &[(&str, &str)],
 ) -> Option<Server> {
+    // No ambient Gradle / JVM options and no real home (`common/jvm_env.rs`);
+    // the explicit JVM caches a test hands over are kept.
+    jvm_env::isolate_cli(command);
+    for (key, value) in env {
+        if jvm_env::EXPLICIT.contains(key) {
+            command.env(key, value);
+        }
+    }
     let download =
         matches!(args.first(), Some(&"vendor") | Some(&"repair")) && !args.contains(&"--revert");
     if download {
@@ -597,6 +620,105 @@ pub fn prepare_command(
         command.args(args);
         None
     }
+}
+
+// ── Gradle `files-2.1` caches ─────────────────────────────────────────
+
+/// The `files-2.1` tree under a `GRADLE_USER_HOME`.
+pub const GRADLE_FILES21: &str = "caches/modules-2/files-2.1";
+/// The `files-2.1` tree under a `GRADLE_RO_DEP_CACHE`.
+pub const RO_FILES21: &str = "modules-2/files-2.1";
+const GRADLE_FILES21_LEAF: &str = "files-2.1";
+
+/// A `files-2.1` hash-dir name: 1-40 lowercase hex (Gradle may drop the
+/// sha1's leading zeros).
+pub fn is_sha1_dir(name: &str) -> bool {
+    (1..=40).contains(&name.len())
+        && name
+            .bytes()
+            .all(|b| b.is_ascii_digit() || (b'a'..=b'f').contains(&b))
+}
+
+/// `<group>/<artifact>/<version>/<sha1>/<leaf>` (relative to `files-2.1`)
+/// → the maven2 route `/<group path>/<artifact>/<version>/<leaf>`.
+fn files21_route(relative: &str) -> Option<String> {
+    let parts: Vec<&str> = relative.split('/').collect();
+    let [group, artifact, version, hash, leaf] = parts.as_slice() else {
+        return None;
+    };
+    is_sha1_dir(hash).then(|| format!("/{}/{artifact}/{version}/{leaf}", group.replace('.', "/")))
+}
+
+/// The `<sha1>/` child of a `files-2.1` version dir that holds `leaf`.
+fn files21_hash_child(dir: &Path, leaf: &str) -> Option<PathBuf> {
+    let mut children: Vec<PathBuf> = std::fs::read_dir(dir)
+        .ok()?
+        .flatten()
+        .filter(|e| e.file_name().to_str().is_some_and(is_sha1_dir))
+        .map(|e| e.path())
+        .filter(|p| p.join(leaf).is_file())
+        .collect();
+    children.sort();
+    children.into_iter().next()
+}
+
+/// `leaf` beside an installed jar: in `source` itself, or — for a
+/// `files-2.1` hash dir — in a sibling hash dir of the same version.
+fn maven_sibling(source: &Path, leaf: &str) -> Option<PathBuf> {
+    let direct = source.join(leaf);
+    if direct.is_file() {
+        return Some(direct);
+    }
+    let name = source.file_name()?.to_str()?;
+    if !is_sha1_dir(name) {
+        return None;
+    }
+    files21_hash_child(source.parent()?, leaf).map(|dir| dir.join(leaf))
+}
+
+fn sha1_hex(bytes: &[u8]) -> String {
+    hex::encode(sha1::Sha1::digest(bytes))
+}
+
+/// Lay `files` (`(leaf, bytes)`) out the way Gradle caches a download:
+/// `<home>/caches/modules-2/files-2.1/<group>/<artifact>/<version>/<sha1>/<leaf>`,
+/// each file under its own real sha1. `gav` is `group:artifact:version`.
+/// Returns the version dir (what the crawler reports as the package path).
+pub fn fabricate_files21(home: &Path, gav: &str, files: &[(&str, &[u8])]) -> PathBuf {
+    fabricate_files21_named(home, gav, files, |sha1| sha1.to_string())
+}
+
+/// [`fabricate_files21`] with the hash dirs named the way Gradle releases
+/// that format the sha1 as a number do: leading zeros dropped.
+pub fn fabricate_files21_unpadded(home: &Path, gav: &str, files: &[(&str, &[u8])]) -> PathBuf {
+    fabricate_files21_named(home, gav, files, |sha1| {
+        let trimmed = sha1.trim_start_matches('0');
+        if trimmed.is_empty() { "0" } else { trimmed }.to_string()
+    })
+}
+
+fn fabricate_files21_named(
+    home: &Path,
+    gav: &str,
+    files: &[(&str, &[u8])],
+    name: impl Fn(&str) -> String,
+) -> PathBuf {
+    let mut parts = gav.splitn(3, ':');
+    let (Some(group), Some(artifact), Some(version)) = (parts.next(), parts.next(), parts.next())
+    else {
+        panic!("fabricate_files21: `{gav}` is not group:artifact:version");
+    };
+    let dir = home
+        .join(GRADLE_FILES21)
+        .join(group)
+        .join(artifact)
+        .join(version);
+    for (leaf, bytes) in files {
+        let hash_dir = dir.join(name(&sha1_hex(bytes)));
+        std::fs::create_dir_all(&hash_dir).unwrap();
+        std::fs::write(hash_dir.join(leaf), bytes).unwrap();
+    }
+    dir
 }
 
 fn copy_tree(from: &Path, to: &Path) {
@@ -634,4 +756,109 @@ pub async fn mount_download(server: &MockServer, purl: &str, uuid: &str, leaf: &
         )
         .mount(server)
         .await;
+}
+
+// ── self-tests (integration crates get no cfg(test)) ───────────────────
+
+mod prebuilt_common_selftests {
+    use super::*;
+
+    fn envs(cmd: &std::process::Command) -> HashMap<String, Option<String>> {
+        cmd.get_envs()
+            .map(|(k, v)| {
+                (
+                    k.to_string_lossy().into_owned(),
+                    v.map(|v| v.to_string_lossy().into_owned()),
+                )
+            })
+            .collect()
+    }
+
+    /// A stray GRADLE_OPTS (`-Dgradle.user.home` beats GRADLE_USER_HOME)
+    /// never reaches the CLI; HOME is the empty stand-in; an explicit
+    /// GRADLE_USER_HOME handed to `prepare_command` survives.
+    #[test]
+    fn prepare_command_scrubs_a_stray_gradle_opts() {
+        let tmp = tempfile::tempdir().unwrap();
+        let mut cmd = std::process::Command::new("socket-patch");
+        cmd.env("GRADLE_OPTS", "-Dgradle.user.home=/real/.gradle")
+            .env("GRADLE_USER_HOME", "/real/.gradle")
+            .env("JAVA_OPTS", "-Xmx1g");
+        let gradle_home = tmp.path().join("gradle-home");
+        let fixture = prepare_command(
+            &mut cmd,
+            tmp.path(),
+            &["scan", "--json"],
+            &[("GRADLE_USER_HOME", gradle_home.to_str().unwrap())],
+        );
+        assert!(fixture.is_none(), "scan needs no fixture server");
+        let envs = envs(&cmd);
+        assert_eq!(envs["GRADLE_OPTS"], None);
+        assert_eq!(envs["JAVA_OPTS"], None);
+        assert_eq!(envs["GRADLE_RO_DEP_CACHE"], None);
+        assert_eq!(
+            envs["GRADLE_USER_HOME"].as_deref(),
+            gradle_home.to_str(),
+            "the explicit cache wins"
+        );
+        let home = jvm_env::stand_in_home().to_string_lossy().into_owned();
+        assert_eq!(envs["HOME"].as_deref(), Some(home.as_str()));
+        assert_eq!(envs["USERPROFILE"].as_deref(), Some(home.as_str()));
+        let args: Vec<_> = cmd.get_args().collect();
+        assert_eq!(args, ["scan", "--json"]);
+    }
+
+    #[test]
+    fn files21_layout_routes_and_install_detection() {
+        assert!(is_sha1_dir("0a1b") && is_sha1_dir(&"f".repeat(40)));
+        assert!(!is_sha1_dir("") && !is_sha1_dir(&"a".repeat(41)) && !is_sha1_dir("ABC"));
+        assert_eq!(
+            files21_route("com.socketfixture/victim/1.10.0/0abc/victim-1.10.0.jar").as_deref(),
+            Some("/com/socketfixture/victim/1.10.0/victim-1.10.0.jar")
+        );
+        assert_eq!(
+            files21_route("com.socketfixture/victim/1.10.0/victim.jar"),
+            None
+        );
+        assert_eq!(files21_route("g/a/v/not-a-hash/a-v.jar"), None);
+
+        let tmp = tempfile::tempdir().unwrap();
+        let home = tmp.path().join("gradle-home");
+        let jar: &[u8] = b"jar bytes";
+        let pom: &[u8] = b"<project/>";
+        let version_dir = fabricate_files21(
+            &home,
+            "com.socketfixture:victim:1.10.0",
+            &[("victim-1.10.0.jar", jar), ("victim-1.10.0.pom", pom)],
+        );
+        assert_eq!(
+            version_dir,
+            home.join("caches/modules-2/files-2.1/com.socketfixture/victim/1.10.0")
+        );
+        let jar_dir = version_dir.join(sha1_hex(jar));
+        assert_eq!(
+            std::fs::read(jar_dir.join("victim-1.10.0.jar")).unwrap(),
+            jar
+        );
+        assert!(version_dir
+            .join(sha1_hex(pom))
+            .join("victim-1.10.0.pom")
+            .is_file());
+
+        // The version dir resolves to the jar's hash dir, and the pom is
+        // found beside it in its own hash dir.
+        let purl = "pkg:maven/com.socketfixture/victim@1.10.0";
+        let found = source_dir(tmp.path(), std::slice::from_ref(&version_dir), purl);
+        assert_eq!(found, jar_dir);
+        assert_eq!(
+            maven_sibling(&found, "victim-1.10.0.pom"),
+            Some(version_dir.join(sha1_hex(pom)).join("victim-1.10.0.pom"))
+        );
+        assert_eq!(maven_sibling(&found, "victim-1.10.0.module"), None);
+
+        // Unpadded naming drops the sha1's leading zeros.
+        let unpadded = fabricate_files21_unpadded(&home, "g:a:1", &[("a-1.jar", jar)]);
+        let want = sha1_hex(jar).trim_start_matches('0').to_string();
+        assert!(unpadded.join(want).join("a-1.jar").is_file());
+    }
 }

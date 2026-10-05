@@ -19,6 +19,12 @@
 //!   surfaces an advisory ALONGSIDE the metadata deletion.
 //! - **PyPI / gem / Go**: advisory only — emit a structured
 //!   advisory so downstream tooling consequences are programmatic.
+//! - **Maven** ([`maven`]): a `~/.m2` artifact's `.sha1` / `.md5`
+//!   checksum files are rewritten to the patched bytes — only when
+//!   present AND matching the pre-patch bytes, and put back exactly on
+//!   rollback. A Gradle `files-2.1` copy has no checksum file (its hash
+//!   directory names the download's sha1); it gets Info advisories
+//!   ([`maven::gradle_advisories`]) instead.
 //!
 //! All ecosystems return a [`SidecarRecord`] via [`dispatch_fixup`].
 //! The record is the canonical JSON-envelope shape — see
@@ -29,6 +35,7 @@ use std::path::Path;
 use crate::crawlers::Ecosystem;
 
 pub(crate) mod cargo;
+pub mod maven;
 pub(crate) mod nuget;
 mod types;
 
@@ -122,6 +129,19 @@ pub async fn dispatch_fixup(
     pkg_path: &Path,
     patched: &[String],
 ) -> Result<Option<SidecarRecord>, SidecarError> {
+    dispatch_fixup_with(package_key, pkg_path, patched, None).await
+}
+
+/// [`dispatch_fixup`] with the Maven checksum files `maven_pre` captured
+/// BEFORE the write ([`maven::snapshot`]): a checksum file is rewritten only
+/// when it described the pre-patch bytes, which only a pre-write read can
+/// tell. `None` (or a non-Maven package) behaves as [`dispatch_fixup`].
+pub async fn dispatch_fixup_with(
+    package_key: &str,
+    pkg_path: &Path,
+    patched: &[String],
+    maven_pre: Option<&maven::Snapshot>,
+) -> Result<Option<SidecarRecord>, SidecarError> {
     if patched.is_empty() {
         return Ok(None);
     }
@@ -152,6 +172,7 @@ pub async fn dispatch_fixup(
             "Go: `go mod verify` will report a checksum mismatch against \
              go.sum. `go build` works as long as the module cache stays warm.",
         )),
+        Ecosystem::Maven => maven::fixup(pkg_path, maven_pre).await?,
         _ => None,
     };
 

@@ -20,6 +20,7 @@ use crate::api::types::*;
 use crate::api::vendor_prefetch::VendorPrefetch;
 pub use crate::api::vendor_prefetch::VendorPrefetchGuard;
 use crate::constants::USER_AGENT as USER_AGENT_VALUE;
+use crate::utils::digest::is_hex;
 use crate::utils::env_compat::{is_debug_enabled, is_offline_env, proxy_url_from_env};
 use crate::utils::notice::{notice_once, Notice};
 use crate::utils::socket_cli_config;
@@ -1055,7 +1056,7 @@ impl ApiClient {
     /// slug are available, otherwise falls back to the public proxy.
     pub async fn fetch_blob(&self, hash: &str) -> Result<Option<BinaryBody>, ApiError> {
         // Validate hash format: SHA-256 = 64 hex characters
-        if !is_valid_sha256_hex(hash) {
+        if !is_hex(hash, 64) {
             return Err(ApiError::InvalidHash(format!(
                 "Invalid hash format: {}. Expected SHA256 hash (64 hex characters).",
                 hash
@@ -2541,11 +2542,6 @@ fn truncate_to_chars(s: &str, max_chars: usize) -> String {
     format!("{}...", truncated)
 }
 
-/// Validate that a string is a 64-character hex string (SHA-256).
-fn is_valid_sha256_hex(s: &str) -> bool {
-    s.len() == 64 && s.bytes().all(|b| b.is_ascii_hexdigit())
-}
-
 /// Validate the standard 8-4-4-4-12 UUID hex grouping.
 fn is_valid_uuid(s: &str) -> bool {
     let parts: Vec<&str> = s.split('-').collect();
@@ -3120,13 +3116,14 @@ mod tests {
     #[test]
     fn test_is_valid_sha256_hex() {
         let valid = "abcdef0123456789abcdef0123456789abcdef0123456789abcdef0123456789";
-        assert!(is_valid_sha256_hex(valid));
+        assert!(is_hex(valid, 64));
 
         // Too short
-        assert!(!is_valid_sha256_hex("abcdef"));
+        assert!(!is_hex("abcdef", 64));
         // Non-hex
-        assert!(!is_valid_sha256_hex(
-            "zzzzzzzzzzzzzzzzzzzzzzzzzzzzzzzzzzzzzzzzzzzzzzzzzzzzzzzzzzzzzzzz"
+        assert!(!is_hex(
+            "zzzzzzzzzzzzzzzzzzzzzzzzzzzzzzzzzzzzzzzzzzzzzzzzzzzzzzzzzzzzzzzz",
+            64
         ));
     }
 
@@ -3232,7 +3229,7 @@ mod tests {
 
     /// `fetch_blob` must reject a malformed hash *before* any network I/O:
     /// the client points at a closed port, so a regression that bypasses the
-    /// `is_valid_sha256_hex` guard surfaces as `ApiError::Network` instead
+    /// `is_hex(hash, 64)` guard surfaces as `ApiError::Network` instead
     /// of `InvalidHash` (mirrors `invalid_uuid_is_failed_without_network`;
     /// `fetch_diff`'s twin guard is already covered).
     #[tokio::test]
@@ -3635,31 +3632,31 @@ mod tests {
     #[test]
     fn test_sha256_uppercase_valid() {
         let upper = "ABCDEF0123456789ABCDEF0123456789ABCDEF0123456789ABCDEF0123456789";
-        assert!(is_valid_sha256_hex(upper));
+        assert!(is_hex(upper, 64));
     }
 
     #[test]
     fn test_sha256_65_chars_invalid() {
         let too_long = "a".repeat(65);
-        assert!(!is_valid_sha256_hex(&too_long));
+        assert!(!is_hex(&too_long, 64));
     }
 
     #[test]
     fn test_sha256_63_chars_invalid() {
         let too_short = "a".repeat(63);
-        assert!(!is_valid_sha256_hex(&too_short));
+        assert!(!is_hex(&too_short, 64));
     }
 
     #[test]
     fn test_sha256_empty_invalid() {
-        assert!(!is_valid_sha256_hex(""));
+        assert!(!is_hex("", 64));
     }
 
     #[test]
     fn test_sha256_mixed_case_valid() {
         let mixed = "aAbBcCdDeEfF0123456789aAbBcCdDeEfF0123456789aAbBcCdDeEfF01234567";
         assert_eq!(mixed.len(), 64);
-        assert!(is_valid_sha256_hex(mixed));
+        assert!(is_hex(mixed, 64));
     }
 
     // ── UUID validation tests ───────────────────────────────────────

@@ -288,7 +288,6 @@ impl VendorEntry {
     /// `sha256`), only when its bytes still hash to that pin; a copy dir
     /// (no `sha256`) is only stat-ed. Read-only, no network.
     pub async fn committed_artifact_intact(&self, project_root: &Path) -> bool {
-        use sha2::Digest as _;
         if self.artifact.path.is_empty() {
             return false;
         }
@@ -297,7 +296,7 @@ impl VendorEntry {
             return tokio::fs::metadata(&path).await.is_ok();
         }
         match read_regular_to_bytes(&path).await {
-            Ok(bytes) => hex::encode(sha2::Sha256::digest(&bytes))
+            Ok(bytes) => crate::utils::digest::sha256_hex_of(&bytes)
                 .eq_ignore_ascii_case(&self.artifact.sha256),
             Err(_) => false,
         }

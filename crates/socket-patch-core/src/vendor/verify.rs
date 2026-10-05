@@ -325,19 +325,19 @@ async fn vlt_manifest_matches(
     pin: &str,
     after_hash: &str,
 ) -> bool {
-    use sha2::{Digest, Sha256};
     let Ok(on_disk) = crate::utils::fs::read_regular_to_bytes(&dir.join("package.json")).await
     else {
         return false;
     };
-    if !hex::encode(Sha256::digest(&on_disk)).eq_ignore_ascii_case(pin) {
+    if !crate::utils::digest::sha256_hex_of(&on_disk).eq_ignore_ascii_case(pin) {
         return false;
     }
     let Some(blob) = local_after_blob(project_root, after_hash).await else {
         return true;
     };
-    stripped_manifest(blob)
-        .is_some_and(|stripped| hex::encode(Sha256::digest(&stripped)).eq_ignore_ascii_case(pin))
+    stripped_manifest(blob).is_some_and(|stripped| {
+        crate::utils::digest::sha256_hex_of(&stripped).eq_ignore_ascii_case(pin)
+    })
 }
 
 /// The vlt manifest exemption for an entry with no inventory pin (one
@@ -655,7 +655,6 @@ pub(super) async fn verify_dir_inventory(
 /// Socket tag dropped — `None` unless the manifest is tagged for exactly
 /// `uuid`.
 async fn untagged_manifest_sha256(dir: &Path, uuid: &str) -> Option<String> {
-    use sha2::{Digest, Sha256};
     let text = crate::utils::fs::read_regular_to_string(&dir.join("Cargo.toml"))
         .await
         .ok()?;
@@ -663,7 +662,7 @@ async fn untagged_manifest_sha256(dir: &Path, uuid: &str) -> Option<String> {
         return None;
     }
     super::cargo_tag::untagged_manifest_bytes(text.as_bytes())
-        .map(|b| hex::encode(Sha256::digest(&b)))
+        .map(|b| crate::utils::digest::sha256_hex_of(&b))
 }
 
 /// Classified health of one ledger entry's committed artifact, for

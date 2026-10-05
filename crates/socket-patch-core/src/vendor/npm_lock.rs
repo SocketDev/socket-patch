@@ -26,6 +26,7 @@ use crate::utils::fs::{atomic_write_bytes_preserving_mode, read_regular_to_bytes
 use crate::utils::socket_dir::remove_tree_and_prune;
 
 use super::common::{already_patched_result, done, parse_json_manifest, refused, JsonLayout};
+use super::lock_inventory::npm_legacy_identity;
 use super::npm_common::{
     done_failure_unstage, guard_coordinates, guard_revert_uuid_dir, stage_patch_pack,
 };
@@ -253,7 +254,6 @@ pub async fn vendor_npm<'a>(
         &mut wiring,
         &mut changed,
         &mut recomputed_deps,
-        &mut warnings,
     ) {
         return done_failure_unstage(purl, e, project_root, &uuid_dir_rel, uuid_dir_preexisted)
             .await;
@@ -273,7 +273,6 @@ pub async fn vendor_npm<'a>(
             &mut wiring,
             &mut sib_changed,
             &mut recomputed_deps,
-            &mut warnings,
         ) {
             return done_failure_unstage(purl, e, project_root, &uuid_dir_rel, uuid_dir_preexisted)
                 .await;
@@ -1084,56 +1083,32 @@ fn rewrite_legacy_tree(
     lock_name: &str,
     wiring: &mut Vec<WiringRecord>,
     changed: &mut bool,
-    warnings: &mut Vec<VendorWarning>,
 ) {
-    // npm 6 spells an alias install `"<alias>": {"version": "npm:real@ver"}`
-    // in the legacy tree (no `name` field like the `packages` entries carry).
-    let alias_version = format!("npm:{name}@{version}");
     for (dep_name, node) in deps.iter_mut() {
         let Some(obj) = node.as_object_mut() else {
             continue;
         };
         let pointer = format!("{pointer_base}/{}", escape_json_pointer_token(dep_name));
         let packages_key = legacy_packages_key(parent_key, dep_name);
-        let node_version = obj.get("version").and_then(Value::as_str);
-        if node_version == Some(alias_version.as_str()) {
-            // An aliased consumer of the patched package. The modern
-            // `packages` twin was rewritten via its `name` field, but this
-            // legacy spelling has no proven equivalent rewrite — LOUD: an
-            // npm 6 client reading the v2 mirror still installs the
-            // UNPATCHED registry bytes through the alias (npm >= 7 is
-            // unaffected).
-            warnings.push(VendorWarning::new(
-                "vendor_legacy_alias_skipped",
-                format!(
-                    "legacy `dependencies` node `{pointer}` aliases {name}@{version} \
-                     (`{alias_version}`) and was NOT rewritten — npm 6 clients reading \
-                     the v2 legacy mirror still install the UNPATCHED registry bytes \
-                     through it"
-                ),
-            ));
-        }
-        if dep_name == name
-            && node_version == Some(version)
-            && obj.get("bundled").and_then(Value::as_bool) == Some(true)
-        {
+        // npm 6 spells an alias install `"<alias>": {"version":
+        // "npm:real@ver"}`; it installs that node from a `file:` `resolved`
+        // like any other (verified against real npm 6.14.18), so it is
+        // rewired with the rest (#432).
+        let (node_name, node_version) =
+            npm_legacy_identity(dep_name, obj.get("version").and_then(Value::as_str));
+        let is_match = node_name == name && node_version == Some(version);
+        if is_match && obj.get("bundled").and_then(Value::as_bool) == Some(true) {
             // Parity with the `packages` scan's inBundle skip: this copy
             // ships inside its parent's tarball, npm never installs it from
             // `resolved`, and rewriting it would desync the two lock halves.
             // (The `packages` twin carries `inBundle` and already pushed the
             // stays-UNPATCHED warning.)
-        } else if dep_name == name
-            && node_version == Some(version)
-            && non_registry.contains_key(&packages_key)
-        {
+        } else if is_match && non_registry.contains_key(&packages_key) {
             // The mirror of a `packages` entry npm installs from a git / url
             // / `file:` spec (#326): its twin was skipped with
             // `vendor_non_registry_entry_skipped`, so rewiring this copy
             // would record wiring for bytes that never install.
-        } else if dep_name == name
-            && node_version == Some(version)
-            && !entry_in_sync(obj, resolved, integrity)
-        {
+        } else if is_match && !entry_in_sync(obj, resolved, integrity) {
             let was_vendored = entry_points_into_vendor(obj);
             let original = Value::Object(obj.clone());
             obj.insert("resolved".to_string(), Value::String(resolved.to_string()));
@@ -1164,7 +1139,6 @@ fn rewrite_legacy_tree(
                 lock_name,
                 wiring,
                 changed,
-                warnings,
             );
         }
     }
@@ -1379,7 +1353,6 @@ impl LockRewire<'_> {
         wiring: &mut Vec<WiringRecord>,
         changed: &mut bool,
         recomputed_deps: &mut bool,
-        warnings: &mut Vec<VendorWarning>,
     ) -> Result<(), String> {
         // Taken before any rewrite, for the legacy mirror below.
         let non_registry = npm_non_registry_entries(lock, self.overrides);
@@ -1442,7 +1415,6 @@ impl LockRewire<'_> {
                     lock_name,
                     wiring,
                     changed,
-                    warnings,
                 );
             }
         }
@@ -2916,12 +2888,14 @@ mod tests {
         );
     }
 
-    /// v2 legacy mirror: an alias consumer (`"aliased": {"version":
-    /// "npm:left-pad@1.3.0"}`) has no proven equivalent rewrite — it must be
-    /// left untouched AND loudly warned, since npm 6 reading the mirror
-    /// still installs the unpatched registry bytes through it.
+    /// #432, v2 legacy mirror: an alias consumer (`"aliased": {"version":
+    /// "npm:left-pad@1.3.0"}`) is rewired like every other mirror node.
+    /// npm 6 installs an alias node from its `file:` `resolved` (verified
+    /// against real npm 6.14.18), so leaving it on the registry shipped the
+    /// unpatched bytes to npm 6 while VEX attested the patch. The revert
+    /// restores the node byte-for-byte.
     #[tokio::test]
-    async fn v2_legacy_alias_node_warns_and_keeps_registry_resolution() {
+    async fn v2_legacy_alias_node_is_rewired_and_reverted() {
         let lock = json!({
             "name": "fixture",
             "version": "1.0.0",
@@ -2935,6 +2909,12 @@ mod tests {
                     "resolved": REG_RESOLVED,
                     "integrity": "sha512-orig=="
                 },
+                "node_modules/@x/lp": {
+                    "name": "left-pad",
+                    "version": "1.3.0",
+                    "resolved": REG_RESOLVED,
+                    "integrity": "sha512-orig=="
+                },
                 "node_modules/left-pad": {
                     "version": "1.3.0",
                     "resolved": REG_RESOLVED,
@@ -2942,6 +2922,11 @@ mod tests {
                 }
             },
             "dependencies": {
+                "@x/lp": {
+                    "version": "npm:left-pad@1.3.0",
+                    "resolved": REG_RESOLVED,
+                    "integrity": "sha512-orig=="
+                },
                 "aliased": {
                     "version": "npm:left-pad@1.3.0",
                     "resolved": REG_RESOLVED,
@@ -2958,40 +2943,49 @@ mod tests {
         let (result, entry, warnings) = expect_done(fx.vendor(false).await);
         assert!(result.success, "{:?}", result.error);
         let entry = entry.unwrap();
-
-        let alias_warning = warnings
-            .iter()
-            .find(|w| w.code == "vendor_legacy_alias_skipped")
-            .unwrap_or_else(|| panic!("missing alias warning: {warnings:?}"));
         assert!(
-            alias_warning.detail.contains("UNPATCHED"),
-            "loud advisory: {}",
-            alias_warning.detail
-        );
-        assert!(
-            alias_warning.detail.contains("/dependencies/aliased"),
-            "names the node: {}",
-            alias_warning.detail
+            warnings
+                .iter()
+                .all(|w| w.code != "vendor_legacy_alias_skipped"),
+            "{warnings:?}"
         );
 
-        // The modern `packages` alias entry IS rewritten (name-field match);
-        // the legacy alias node stays at the registry resolution.
         let live = fx.read_lock().await;
-        assert_eq!(
-            live["packages"]["node_modules/aliased"]["resolved"],
-            json!(format!("file:{}", fx.expected_rel_tgz()))
-        );
-        assert_eq!(
-            live["dependencies"]["aliased"], lock["dependencies"]["aliased"],
-            "legacy alias node byte-untouched"
-        );
-        let legacy_keys: Vec<&str> = entry
+        let vendored = json!(format!("file:{}", fx.expected_rel_tgz()));
+        for alias in ["aliased", "@x/lp"] {
+            assert_eq!(
+                live["packages"][format!("node_modules/{alias}")]["resolved"],
+                vendored
+            );
+            let node = &live["dependencies"][alias];
+            assert_eq!(node["resolved"], vendored, "{alias}: {node}");
+            assert_ne!(node["integrity"], json!("sha512-orig=="), "{alias}");
+            assert_eq!(
+                node["version"],
+                json!("npm:left-pad@1.3.0"),
+                "the alias spelling npm 6 reads is kept"
+            );
+        }
+        let mut legacy_keys: Vec<&str> = entry
             .wiring
             .iter()
             .filter(|r| r.kind == KIND_LOCK_LEGACY_ENTRY)
             .map(|r| r.key.as_deref().unwrap())
             .collect();
-        assert_eq!(legacy_keys, vec!["/dependencies/left-pad"]);
+        legacy_keys.sort_unstable();
+        assert_eq!(
+            legacy_keys,
+            vec![
+                "/dependencies/@x~1lp",
+                "/dependencies/aliased",
+                "/dependencies/left-pad"
+            ]
+        );
+
+        let outcome = revert_npm(&entry, fx.root(), false).await;
+        assert!(outcome.success, "{:?}", outcome.error);
+        assert!(outcome.warnings.is_empty(), "{:?}", outcome.warnings);
+        assert_eq!(fx.read_lock().await, lock, "lock restored");
     }
 
     /// Hand-mangled locks with non-object nodes (e.g. `null`) are tolerated:

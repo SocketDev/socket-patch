@@ -74,6 +74,8 @@ use wiremock::{Mock, MockServer, ResponseTemplate};
 
 #[path = "common/cache_env.rs"]
 mod cache_env;
+#[path = "common/hermetic.rs"]
+mod hermetic;
 #[path = "vex_e2e_common/mod.rs"]
 mod vex_e2e_common;
 use vex_e2e_common::{
@@ -191,44 +193,18 @@ fn corepack(cwd: &Path, pm: &str, args: &[&str]) -> Output {
     cmd.args(&args)
         .current_dir(cwd)
         .env("COREPACK_ENABLE_DOWNLOAD_PROMPT", "0");
-    scrub_socket_env(&mut cmd);
+    hermetic::scrub_socket_vars(&mut cmd);
+    hermetic::scrub_extra(&mut cmd, &[hermetic::Extra::Venv, hermetic::Extra::Pnpm]);
     // After the scrub: it strips ambient `PNPM_*` and `npm_config_*`, which
     // would otherwise take the sandbox values back out again.
     cache_env::isolate(&mut cmd);
     cmd.output().expect("failed to run corepack")
 }
 
-/// Remove ambient `SOCKET_*` / `PNPM_*` / `npm_config_*` vars (the
-/// `--store-dir` flag is always passed explicitly).
-///
-/// Seed-then-scrub (mirrors e2e_redirect_yarn_berry_build.rs): pnpm lets
-/// EVERY `.npmrc` setting be overridden by an `npm_config_*` env var (env
-/// outranks the project npmrc), so an ambient `npm_config_node_linker=pnp`
-/// was verified to turn the capstone red — pnpm emits a `.pnp.cjs` and
-/// `vendor` refuses the project as unsupported Plug'n'Play. The explicit
-/// env_remove below clears the seed too, but if the prefix scrub is ever
-/// dropped the seed (rather than a developer's ambient shell, which this
-/// suite can't rely on) turns the test red immediately.
-fn scrub_socket_env(cmd: &mut Command) {
-    cmd.env("npm_config_node_linker", "pnp");
-    for (k, _) in std::env::vars_os() {
-        let key = k.to_string_lossy();
-        if (key.starts_with("SOCKET_")
-            || key.starts_with("PNPM_")
-            || key.to_ascii_lowercase().starts_with("npm_config_"))
-            && key != "SOCKET_NO_CONFIG"
-        {
-            cmd.env_remove(&k);
-        }
-    }
-    cmd.env_remove("VIRTUAL_ENV");
-    cmd.env_remove("npm_config_node_linker");
-}
-
 fn run_socket(cwd: &Path, args: &[&str]) -> (i32, String, String) {
-    let mut cmd = Command::new(binary());
+    let mut cmd = hermetic::command(&binary());
     cmd.current_dir(cwd);
-    scrub_socket_env(&mut cmd);
+    hermetic::scrub_extra(&mut cmd, &[hermetic::Extra::Venv, hermetic::Extra::Pnpm]);
     let _fixture = prebuilt_common::prepare_command(&mut cmd, cwd, args, &[]);
     let out = cmd.output().expect("failed to run socket-patch binary");
     (

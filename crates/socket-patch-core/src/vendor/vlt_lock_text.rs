@@ -851,11 +851,49 @@ pub(crate) fn parse_node_entry_text(text: &str) -> Option<NodeEntry<'_>> {
     let is_string = |raw: &str| raw.starts_with('"') && serde_json::from_str::<String>(raw).is_ok();
     let string_or_null = |raw: &&str| *raw == "null" || is_string(raw);
     let well_formed = elems.len() >= 2
-        && matches!(elems[0], "0" | "1" | "2" | "3")
+        && node_flags(elems[0]).is_some()
         && is_string(elems[1])
         && elems.get(2).is_none_or(string_or_null)
         && elems.get(3).is_none_or(string_or_null);
     well_formed.then_some(NodeEntry { key, tuple, elems })
+}
+
+/// Slot [0] bit vlt 1.3 sets when a node's artifact is the registry's
+/// Brotli (`.tar.br`) alternate, making slot [2] that artifact's hash. vlt
+/// derives it from slot [3] whenever slot [3] is written, and only reads
+/// the stored bit to rebuild an omitted URL with the right extension.
+pub(crate) const NODE_FLAG_BROTLI: u64 = 4;
+
+/// Slot [0] as vlt's flag bitset: optional (1), dev (2) and brotli (4).
+/// `None` for anything vlt does not write, so a lock from a vlt with more
+/// flag bits is refused rather than misread.
+pub(crate) fn node_flags(raw: &str) -> Option<u64> {
+    match raw.as_bytes() {
+        [digit @ b'0'..=b'7'] => Some(u64::from(digit - b'0')),
+        _ => None,
+    }
+}
+
+/// vlt's `tarballFormat`: does `url` name a Brotli tarball? The extension
+/// is read before any `?query` or `#fragment`.
+pub(crate) fn is_brotli_artifact(url: &str) -> bool {
+    let end = url.find(['?', '#']).unwrap_or(url.len());
+    url[..end].ends_with(".tar.br")
+}
+
+/// The brotli bit for a node whose slot [3] is now `slot3` (a raw JSON
+/// slice or absent), as vlt would save it. An absent slot [3] means the
+/// registry's default `.tgz`: every writer that drops the URL also writes
+/// that artifact's hash.
+pub(crate) fn brotli_for_slot3(slot3: Option<&str>) -> bool {
+    slot3
+        .and_then(|raw| serde_json::from_str::<String>(raw).ok())
+        .is_some_and(|url| is_brotli_artifact(&url))
+}
+
+/// Does a node's slot [0] carry the brotli bit?
+pub(crate) fn has_brotli_flag(raw_flags: &str) -> bool {
+    node_flags(raw_flags).is_some_and(|flags| flags & NODE_FLAG_BROTLI != 0)
 }
 
 /// Raw top-level elements of a tuple `[e0,e1,…]`: the text must parse as a
@@ -904,16 +942,34 @@ pub(crate) fn split_tuple_elements(tuple: &str) -> Option<Vec<&str>> {
     (elems.len() == expected && elems.iter().all(tight)).then_some(elems)
 }
 
-/// A tuple with slots [2] and [3] replaced and `E0`, `E1`, `E4…` kept raw.
-/// An absent slot is `null` when a later element follows and is dropped
-/// otherwise, which is how vlt lays out unused slots.
+/// A tuple with slots [2] and [3] replaced, slot [0]'s brotli bit set to
+/// `brotli`, and the other flag bits, `E1` and `E4…` kept raw. Slots [2]
+/// and [3] name one artifact and its hash, so a caller replacing them also
+/// says which kind of artifact that is ([`brotli_for_slot3`] for a fresh
+/// one, the recorded bit when restoring an entry). An absent slot is
+/// `null` when a later element follows and is dropped otherwise, which is
+/// how vlt lays out unused slots.
 pub(crate) fn render_tuple_with_slots(
     elems: &[&str],
+    brotli: bool,
     slot2: Option<&str>,
     slot3: Option<&str>,
 ) -> String {
     let tail = elems.get(4..).unwrap_or_default();
-    let mut out: Vec<&str> = elems.iter().take(2).copied().collect();
+    let flags = elems.first().and_then(|raw| node_flags(raw)).map(|flags| {
+        let flags = if brotli {
+            flags | NODE_FLAG_BROTLI
+        } else {
+            flags & !NODE_FLAG_BROTLI
+        };
+        flags.to_string()
+    });
+    let mut out: Vec<&str> = match &flags {
+        Some(flags) => std::iter::once(flags.as_str())
+            .chain(elems.get(1).copied())
+            .collect(),
+        None => elems.iter().take(2).copied().collect(),
+    };
     let slots = [slot2, slot3];
     let kept = if tail.is_empty() {
         slots.iter().rposition(Option::is_some).map_or(0, |i| i + 1)
@@ -2098,6 +2154,53 @@ mod tests {
         assert_eq!(escaped.entry.name().as_deref(), Some("a\"b"));
     }
 
+    /// #372: vlt 1.3 sets the brotli bit (4) in slot [0] when a node
+    /// resolved the registry's `.tar.br` alternate, so flags 4–7 are
+    /// canonical vlt output.
+    #[test]
+    fn node_line_grammar_accepts_vlt_1_3_brotli_flags() {
+        for flags in 4..=7 {
+            let line = format!(
+                "    \"~npm~left-pad@1.3.0\": [{flags},\"left-pad\",\"sha512-p3Lt==\",\
+                 \"http://127.0.0.1:18555/left-pad/-/left-pad-1.3.0.tar.br\"],"
+            );
+            let parsed = node(&line);
+            assert_eq!(parsed.entry.elems[0], flags.to_string());
+            assert_eq!(node_flags(parsed.entry.elems[0]), Some(flags));
+            assert!(has_brotli_flag(parsed.entry.elems[0]));
+        }
+        assert!(!has_brotli_flag("3"));
+    }
+
+    #[test]
+    fn brotli_bit_follows_the_artifact_slot_three_names() {
+        assert!(brotli_for_slot3(Some("\"https://r/a/-/a-1.0.0.tar.br\"")));
+        assert!(brotli_for_slot3(Some("\"https://r/a-1.0.0.tar.br?x=1#y\"")));
+        assert!(!brotli_for_slot3(Some("\"https://r/a/-/a-1.0.0.tgz\"")));
+        assert!(!brotli_for_slot3(Some("\"https://r/a.tgz?f=.tar.br\"")));
+        assert!(!brotli_for_slot3(Some("\".socket/vendor/npm/u/a.tgz\"")));
+        assert!(!brotli_for_slot3(Some("null")));
+        assert!(!brotli_for_slot3(None));
+
+        let brotli = ["6", "\"a\"", "\"sha512-br\"", "\"https://r/a.tar.br\""];
+        assert_eq!(
+            render_tuple_with_slots(
+                &brotli,
+                false,
+                Some("\"sha512-p\""),
+                Some("\"https://h/a.tgz\"")
+            ),
+            "[2,\"a\",\"sha512-p\",\"https://h/a.tgz\"]",
+            "pointing a brotli node at a .tgz clears bit 4 and keeps dev"
+        );
+        let pinned = ["1", "\"a\"", "\"sha512-p\"", "\"https://h/a.tgz\""];
+        assert_eq!(
+            render_tuple_with_slots(&pinned, true, Some("\"sha512-br\""), None),
+            "[5,\"a\",\"sha512-br\"]",
+            "restoring a brotli entry puts bit 4 back and keeps optional"
+        );
+    }
+
     #[test]
     fn node_line_grammar_rejects_deviations() {
         for line in [
@@ -2117,7 +2220,9 @@ mod tests {
             "    \"~npm~a@1.0.0\": [0,,\"a\"]",
             "    \"~npm~a@1.0.0\": []",
             "    \"~npm~a@1.0.0\": [0]",
-            "    \"~npm~a@1.0.0\": [4,\"a\"]",
+            "    \"~npm~a@1.0.0\": [8,\"a\"]",
+            "    \"~npm~a@1.0.0\": [07,\"a\"]",
+            "    \"~npm~a@1.0.0\": [-1,\"a\"]",
             "    \"~npm~a@1.0.0\": [\"0\",\"a\"]",
             "    \"~npm~a@1.0.0\": [0.0,\"a\"]",
             "    \"~npm~a@1.0.0\": [0,null]",
@@ -2172,33 +2277,36 @@ mod tests {
         let s2 = Some("\"sha512-new\"");
         let s3 = Some("\"https://h/a.tgz\"");
         assert_eq!(
-            render_tuple_with_slots(&["0", "\"a\""], s2, s3),
+            render_tuple_with_slots(&["0", "\"a\""], false, s2, s3),
             "[0,\"a\",\"sha512-new\",\"https://h/a.tgz\"]"
         );
         assert_eq!(
-            render_tuple_with_slots(&three, s2, s3),
+            render_tuple_with_slots(&three, false, s2, s3),
             "[0,\"a\",\"sha512-new\",\"https://h/a.tgz\"]"
         );
         assert_eq!(
-            render_tuple_with_slots(&five[..6], Some("\"sha512-x\""), Some("\"u\"")),
+            render_tuple_with_slots(&five[..6], false, Some("\"sha512-x\""), Some("\"u\"")),
             "[2,\"a\",\"sha512-x\",\"u\",null,null]"
         );
         let old = Some("\"sha512-old\"");
         assert_eq!(
-            render_tuple_with_slots(&four, old, None),
+            render_tuple_with_slots(&four, false, old, None),
             "[0,\"a\",\"sha512-old\"]"
         );
         assert_eq!(
-            render_tuple_with_slots(&five, old, None),
+            render_tuple_with_slots(&five, false, old, None),
             "[2,\"a\",\"sha512-old\",null,null,null,null,null,{  \"a\": \"cli.js\"}]"
         );
-        assert_eq!(render_tuple_with_slots(&four, None, None), "[0,\"a\"]");
         assert_eq!(
-            render_tuple_with_slots(&four, None, Some("\"rel\"")),
+            render_tuple_with_slots(&four, false, None, None),
+            "[0,\"a\"]"
+        );
+        assert_eq!(
+            render_tuple_with_slots(&four, false, None, Some("\"rel\"")),
             "[0,\"a\",null,\"rel\"]"
         );
         assert_eq!(
-            render_tuple_with_slots(&three, Some("null"), Some("\"rel\"")),
+            render_tuple_with_slots(&three, false, Some("null"), Some("\"rel\"")),
             "[0,\"a\",null,\"rel\"]"
         );
     }

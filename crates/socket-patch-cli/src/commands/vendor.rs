@@ -391,6 +391,35 @@ pub(crate) fn ecosystem_in_scope(common: &GlobalArgs, eco: &str) -> bool {
 /// [`Envelope::record`], so it stays visible to JSON consumers but does NOT
 /// bump `summary.skipped`, which counts genuinely skipped packages.
 /// `Skipped` never flips the run status, so no status signal is lost.
+/// A dry run captures nothing, so it cannot see which files the wet run
+/// would rewrite: one `vendor_would_refuse_symlinked_file` advisory per
+/// symlinked wiring file of `purl`'s ecosystem, which the wet run's group
+/// commit refuses to rename over (`redirect_symlinked_file_unsupported`).
+/// Shared by `vendor --dry-run` and the `scan` / `get --mode vendored`
+/// dry-run preview.
+pub(crate) fn symlinked_wiring_warnings(cwd: &Path, purl: &str) -> Vec<VendorWarning> {
+    let Some(eco) = Ecosystem::from_purl(purl) else {
+        return Vec::new();
+    };
+    socket_patch_core::utils::group_commit::symlinked_paths(
+        cwd,
+        socket_patch_core::formats::registry::wiring_paths(eco.cli_name()),
+    )
+    .into_iter()
+    .map(|linked| {
+        VendorWarning::new(
+            "vendor_would_refuse_symlinked_file",
+            format!(
+                "{linked} is a symbolic link; a non-dry-run vendor refuses with \
+                 redirect_symlinked_file_unsupported if it must rewrite it (an atomic \
+                 rename would replace the link) — replace the link with a regular file, \
+                 or run socket-patch in the directory it points to"
+            ),
+        )
+    })
+    .collect()
+}
+
 pub(crate) fn record_warning(
     env: &mut Envelope,
     purl: &str,
@@ -970,6 +999,17 @@ async fn run_check(args: &VendorArgs) -> i32 {
     };
     let mut entries: Vec<_> = state.entries.iter().collect();
     entries.sort_by_key(|(key, _)| *key);
+    // The lockfile view `vex` and `scan` judge vendor-ledger liveness from;
+    // JVM entries are checked against their own layout instead.
+    let discovery = if state
+        .entries
+        .values()
+        .any(|e| !vendor::jvm::apply::is_jvm_entry(e))
+    {
+        Some(crate::commands::discover_wiring(&args.common, root).await)
+    } else {
+        None
+    };
     for (key, entry) in entries {
         let record = entry.record.as_ref().or_else(|| manifest.patches.get(key));
         let mut failure = match record {
@@ -982,10 +1022,28 @@ async fn run_check(args: &VendorArgs) -> i32 {
         if failure.is_none() && vendor::jvm::apply::is_jvm_entry(entry) {
             failure = vendor::jvm::apply::check_entry(root, entry, local_repo.as_deref()).err();
         }
+        // The npm check names the exact unwired lock entry, so it runs
+        // before the generic liveness rule below.
         if failure.is_none() && entry.ecosystem == "npm" {
             failure = vendor::npm_flavor::check_npm_wiring(entry, root)
                 .await
                 .err();
+        }
+        if let (None, Some(discovery), false) = (
+            &failure,
+            &discovery,
+            vendor::jvm::apply::is_jvm_entry(entry),
+        ) {
+            // A relock (`pipenv lock`, `npm install`, `uv lock`, …) can
+            // drop the `.socket/vendor/` reference while the artifact stays
+            // intact; a fresh install is then unpatched. Same rule as
+            // `vex`'s `vendor_unwired`.
+            if !discovery.vendor_entry_live(root, entry).await {
+                failure = Some(format!(
+                    "wiring missing: no lockfile or config references .socket/vendor/{}/{} any more, so a fresh install gets the unpatched package; re-run `socket-patch vendor` to rewire it",
+                    entry.ecosystem, entry.uuid
+                ));
+            }
         }
         if vendor::jvm::apply::upstream_unverified(entry) {
             env.warnings.push(RunWarning {code: "vendor_jvm_upstream_unverified".into(), detail: format!("{key}: upstream metadata was accepted offline; run vendor online to verify registry checksums")});
@@ -1081,9 +1139,10 @@ fn hosted_pins_in_scope(common: &GlobalArgs, pins: Vec<HostedPin>) -> Vec<Hosted
 
 /// What a wet eject can touch, captured before it touches anything: every
 /// regular file directly in the project root, the hosted pins' files and
-/// the restore's files (nested locks included), the project's cargo and
-/// maven config files, the vendor ledger, and the set of vendored uuid
-/// directories.
+/// the restore's files (nested locks included), the project's cargo,
+/// maven and Gradle config and owned files (every Gradle build's settings
+/// and lock files when the project has a hosted Gradle index), the vendor
+/// ledger, and the set of vendored uuid directories.
 ///
 /// [`EjectSnapshot::restore`] puts back only what the eject WROTE: the
 /// files above that the upstream restore planned or wrote, and every file
@@ -1104,12 +1163,21 @@ struct EjectSnapshot {
 }
 
 impl EjectSnapshot {
-    const EXTRA: [&'static str; 5] = [
+    const EXTRA: [&'static str; 12] = [
         ".cargo/config",
         ".cargo/config.toml",
         ".mvn/maven.config",
         ".mvn/checksums/checksums.sha256",
         socket_patch_core::vendor::VENDOR_STATE_REL,
+        // The Gradle owned files: the hosted ones the restore removes and
+        // the vendored ones the vendor step writes.
+        socket_patch_core::patch::redirect::gradle::HOSTED_INDEX_REL,
+        socket_patch_core::patch::redirect::gradle::HOSTED_SCRIPT_REL,
+        socket_patch_core::patch::redirect::gradle::GITATTRIBUTES_REL,
+        socket_patch_core::vendor::jvm::gradle::SCRIPT_REL,
+        socket_patch_core::vendor::jvm::gradle::INDEX_REL,
+        socket_patch_core::vendor::jvm::gradle::VENDOR_GITATTRIBUTES_REL,
+        socket_patch_core::vendor::jvm::gradle::VERIFICATION_REL,
     ];
 
     async fn root_file_names(root: &Path) -> std::io::Result<std::collections::BTreeSet<String>> {
@@ -1144,6 +1212,21 @@ impl EjectSnapshot {
         let root_files = Self::root_file_names(root).await?;
         let mut planned: std::collections::BTreeSet<String> = touched.iter().cloned().collect();
         planned.extend(Self::EXTRA.iter().map(|s| s.to_string()));
+        // A Gradle pin's restore also rewrites (or deletes) files below
+        // the root: every build's settings file and every build's lock
+        // files. The same files are where the vendored wiring goes.
+        if tokio::fs::symlink_metadata(
+            root.join(socket_patch_core::patch::redirect::gradle::HOSTED_INDEX_REL),
+        )
+        .await
+        .is_ok()
+        {
+            let build =
+                socket_patch_core::patch::redirect::gradle::read_build_from_disk(root).await;
+            planned.extend(socket_patch_core::patch::redirect::gradle::wiring_files(
+                &build.files,
+            ));
+        }
         let mut files = std::collections::BTreeMap::new();
         for rel in root_files.iter().chain(planned.iter()) {
             if files.contains_key(rel) {
@@ -1160,9 +1243,11 @@ impl EjectSnapshot {
         })
     }
 
-    /// A file's bytes, `None` when it does not exist.
+    /// A file's bytes, `None` when it does not exist. Read through the
+    /// FIFO-safe opener: a FIFO or device at a snapshotted workspace path
+    /// fails the snapshot (and the eject refuses) instead of wedging open(2).
     async fn read(path: &Path) -> std::io::Result<Option<Vec<u8>>> {
-        match tokio::fs::read(path).await {
+        match socket_patch_core::utils::fs::read_regular_to_bytes(path).await {
             Ok(bytes) => Ok(Some(bytes)),
             Err(e) if e.kind() == std::io::ErrorKind::NotFound => Ok(None),
             Err(e) => Err(e),
@@ -1207,6 +1292,12 @@ impl EjectSnapshot {
         }
         match want {
             Some(bytes) => {
+                // The upstream restore may have removed the file's
+                // directory with it (the hosted Gradle files under
+                // `.socket/gradle/`).
+                if let Some(parent) = path.parent() {
+                    let _ = tokio::fs::create_dir_all(parent).await;
+                }
                 socket_patch_core::utils::fs::atomic_write_bytes_preserving_mode(&path, bytes).await
             }
             None => match tokio::fs::remove_file(&path).await {
@@ -2864,15 +2955,26 @@ pub(crate) async fn vendor_records_reusing(
                     // A dry run previews an in-sync package as `verified`
                     // (the backends cannot tell without writing); the
                     // ledger recording this exact patch is the tell.
-                    if common.dry_run
+                    let dry_previewed_in_sync = common.dry_run
                         && event.action == PatchAction::Verified
                         && lookup_entry(&state.entries, candidate)
-                            .is_some_and(|e| e.uuid == record.uuid)
-                    {
+                            .is_some_and(|e| e.uuid == record.uuid);
+                    if dry_previewed_in_sync {
                         dry_in_sync += 1;
                     }
                     let in_sync = event.error_code.as_deref() == Some("already_vendored");
+                    // An in-sync package's wet run writes nothing, so it
+                    // cannot hit the commit's symlink refusal.
+                    let symlinked =
+                        if common.dry_run && result.success && !in_sync && !dry_previewed_in_sync {
+                            symlinked_wiring_warnings(&common.cwd, candidate)
+                        } else {
+                            Vec::new()
+                        };
                     env.record(event);
+                    for w in &symlinked {
+                        record_warning(env, candidate, w, common);
+                    }
                     for w in &warnings {
                         // "vendored X from the patch service" on a package
                         // this run left untouched would contradict the
@@ -2970,6 +3072,18 @@ pub(crate) async fn vendor_records_reusing(
                 for stale in stale_artifacts {
                     sweep_stale_artifact(common, env, &state, stale).await;
                 }
+            }
+            Err(e) if socket_patch_core::utils::group_commit::symlinked_target(&e).is_some() => {
+                // Refused before anything was written: the hosted refusal,
+                // same code and wording.
+                has_errors = true;
+                let linked = socket_patch_core::utils::group_commit::symlinked_target(&e)
+                    .unwrap_or_default();
+                let refusal = socket_patch_core::hosted::engine::symlink_refusal(linked);
+                if !common.json {
+                    eprintln!("Error: {}", refusal.message);
+                }
+                env.mark_error(EnvelopeError::new(refusal.code, refusal.message));
             }
             Err(e) => {
                 has_errors = true;
@@ -6098,6 +6212,24 @@ mod eject_snapshot_tests {
     /// snapshot holds them; deleted when the commit created them) — and
     /// leaves every other root file as it is now, even one whose bytes
     /// changed during the run (another process's log).
+    /// A FIFO at a snapshotted path fails the snapshot promptly (the eject
+    /// then refuses) instead of blocking in open(2).
+    #[cfg(unix)]
+    #[tokio::test]
+    async fn snapshot_refuses_a_fifo_instead_of_wedging() {
+        let tmp = tempfile::tempdir().unwrap();
+        let root = tmp.path();
+        let c = std::ffi::CString::new(root.join("package-lock.json").to_str().unwrap()).unwrap();
+        assert_eq!(unsafe { libc::mkfifo(c.as_ptr(), 0o600) }, 0);
+        let result = tokio::time::timeout(
+            std::time::Duration::from_secs(10),
+            EjectSnapshot::take(root, &["package-lock.json".to_string()]),
+        )
+        .await
+        .expect("the snapshot must not block on a FIFO");
+        assert!(result.is_err());
+    }
+
     #[tokio::test]
     async fn restore_undoes_only_what_the_eject_wrote() {
         let tmp = tempfile::tempdir().unwrap();
