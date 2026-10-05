@@ -1,6 +1,6 @@
 [agent] Progress ledger for the scheduled npm bug-hunt routine (label pm:npm).
 
-Last updated: 2026-10-04 (run 17 with a ledger), main `045d7ec` (re-run 2026-10-04T18Z, unchanged; v5 + the #324/#326/#359/#403/#434/#454/#490/#516/#541 fixes and #570 API timeouts; the binary still reports 4.0.0), latest release v4.0.0 (previous v3.3.0, both from npm `@socketsecurity/socket-patch`). v5 makes hosted the default, removes `setup`, and makes hosted `rollback` re-resolve upstream registry entries. Cells marked (v4) were last verified on `f6b7fb9`.
+Last updated: 2026-10-05 (run 18 with a ledger), main `045d7ec` (re-run 2026-10-05T00Z, unchanged; v5 + the #324/#326/#359/#403/#434/#454/#490/#516/#541 fixes and #570 API timeouts; the binary still reports 4.0.0), latest release v4.0.0 (previous v3.3.0, both from npm `@socketsecurity/socket-patch`). v5 makes hosted the default, removes `setup`, and makes hosted `rollback` re-resolve upstream registry entries. Cells marked (v4) were last verified on `f6b7fb9`.
 
 ## Coverage matrix
 
@@ -22,12 +22,20 @@ Cells are "pass", "fail #N" or "untested". Every cell uses a real npm install. H
 | Windows | 12.1.0 / 12.2.0 | pass: linked `.store` apply/vex/rollback (main). fail #356, #403 (v4) | pass: cycle + `--omit=dev`, revert (main) | pass: cycle, linked cycle (probe) | **fail #434** |
 | Windows 2022 | 10.9.7 / 12.2.0 | pass: linked `.store` apply/vex/rollback (main) | pass: cycle + `--omit=dev`, revert (main) | pass: linked cycle (probe) | **fail #434** |
 
+## npm config that rewrites hosted pins (#812)
+
+`replace-registry-host=always` (npm ≥ 8) rewrites the hosted pin's origin to the configured registry, so `npm ci` / `npm install` fail E404. The hosted scan exits 0 with no warning. **fail #812** on Linux npm 8.19.4 / 10.9.4 / 12.2.0 (project `.npmrc` and env). Vendored isn't affected; npm 6 / 7 don't have the setting.
+
+Other 2026-10-05 passes (Linux): prerelease version (`ms@3.0.0-canary.1`) hosted / vendored / agent cycles (npm 10.9.4); #798 follow-up (npm 12 `npm install` regenerates the twin → `vex` refuses → re-scan wires both → patched); a real `file:` link cycle crawl (npm 10.9.4).
+
 ## Agent writes through links (#626)
 
 Agent mode follows a `node_modules` link into a workspace member, a `file:` dir or an `npm link` target, overwrites first-party source, and rollback restores upstream bytes. **fail #626** on Linux npm 6 (`file:`) / 8 / 10 / 12, macOS npm 10.9.7, and Windows npm 8 / 10 / 12, also on v4.0.0. Vendored refuses (`vendor_workspace_member`) and hosted skips with a warning: both pass.
 
 ## Backlog
 
+- **#812 variants:** `replace-registry-host=always` in `~/.npmrc` / global npmrc; a hostname value; a `registry=` mirror + `always`. macOS / Windows once probe branches are allowed again.
+- (#798 re-scan follow-up done 2026-10-05T00Z: pass. Re-check when #799 lands.)
 - (#753 follow-ups done 2026-10-04T12Z: npm 12 `npm install` pass, workspace member same as #753 on 10/11 and pass on 12, agent mode pass, hosted→vendored takeover on npm 12 pass.)
 - (Bun handover done 2026-10-04T12Z: after hosted `rollback` / `vendor --revert`, `npm install` and `npm ci` restore upstream bytes on npm 7/10/11/12.)
 - (Done 2026-10-04T18Z: npm 9.2.0 `install-links` `file:` cycle, `peer: true` / `devOptional` pins: all pass.)
@@ -46,6 +54,8 @@ Agent mode follows a `node_modules` link into a workspace member, a `file:` dir 
 
 ## Known non-bugs
 
+- Mocks of the public proxy need `SOCKET_PROXY_URL` (and `NO_PROXY=127.0.0.1`); `--api-url` alone still reaches `patches-api.socket.dev`.
+- Project `.npmrc` `allow-remote=${VAR}` is read raw and treated as an explicit user value (warns, doesn't write). Fails safe.
 - `patches-api.socket.dev` is unreachable from the sandbox. Use hand-staged manifests, a local mock API, or the wiremock suites.
 - Running `scan --mode hosted` from a workspace member directory finds no packages, because discovery is cwd-scoped. It's loud and writes nothing.
 - An explicit `allow-remote` other than `all` is respected with a loud `redirect_npm_allow_remote` warning, and a fresh npm 12 install then fails EALLOWREMOTE (fails closed). This is documented.
