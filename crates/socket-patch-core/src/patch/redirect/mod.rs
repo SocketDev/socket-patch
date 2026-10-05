@@ -26,6 +26,7 @@ use serde_json::{json, Value};
 use crate::utils::digest::is_hex64_lower;
 use crate::utils::line_endings::{to_lf, LineEndings};
 use crate::vendor::common::{parse_json_text, JsonLayout};
+use crate::vendor::lock_inventory::npm_legacy_identity;
 use crate::vendor::npm_origin::{legacy_packages_key, npm_non_registry_entries, NpmOverrides};
 use crate::vendor::yarn_berry_lock::yarnrc_compression_level;
 
@@ -1045,6 +1046,8 @@ fn rewrite_one_npm_lock(
     // Match the shared npm lock inventory's object-valued-map precedence.
     let legacy_is_install_tree = lock.get("packages").and_then(Value::as_object).is_none();
     let mut changed = false;
+    // Legacy `dependencies` alias nodes rewired this run (#432).
+    let mut aliased: Vec<String> = Vec::new();
     for dep in npm {
         let fname = full_name(dep);
         let Some(sha512) = dep.integrity.sha512.clone() else {
@@ -1137,6 +1140,7 @@ fn rewrite_one_npm_lock(
                 legacy_is_install_tree,
                 result,
                 &mut matched_any,
+                &mut aliased,
             ) || changed;
         }
         // Parity with the pnpm/berry/uv rewriters: a granted dep the
@@ -1157,7 +1161,31 @@ fn rewrite_one_npm_lock(
         // redirected lock therefore fails EINTEGRITY against the patched
         // sha512 pin (fail-closed: the unpatched bytes never install). Say
         // so instead of letting an npm 6 CI discover it.
-        if lock.get("lockfileVersion").and_then(Value::as_u64) == Some(1) {
+        let v1 = lock.get("lockfileVersion").and_then(Value::as_u64) == Some(1);
+        // A v2 lock's legacy mirror is what npm 6 installs from. npm 6
+        // installs a plain mirror node from its rewritten `resolved`, but an
+        // ALIAS node from the configured registry (verified against real
+        // npm 6.14.18), so its installs fail EINTEGRITY against the patched
+        // pin. The v1 caveat below already says this for every node.
+        if !v1 && !aliased.is_empty() {
+            result.warnings.push(RewriteWarning {
+                code: "redirect_npm_legacy_alias_client".into(),
+                detail: format!(
+                    "{lockfile}'s legacy `dependencies` mirror (read by npm <= 6) installs \
+                     {} through an npm alias; npm <= 6 fetches an aliased dependency from the \
+                     configured registry and ignores the redirected `resolved` url, so its \
+                     installs fail EINTEGRITY against the patched sha512 pin (the unpatched \
+                     bytes are never installed). npm >= 7 installs the hosted patch; use \
+                     vendored mode to patch npm 6 installs",
+                    aliased
+                        .iter()
+                        .map(|a| format!("`{a}`"))
+                        .collect::<Vec<_>>()
+                        .join(", ")
+                ),
+            });
+        }
+        if v1 {
             result.warnings.push(RewriteWarning {
                 code: "redirect_npm_legacy_client".into(),
                 detail: format!(
@@ -1219,13 +1247,17 @@ fn rewrite_npm_v2_deps(
     legacy_is_install_tree: bool,
     result: &mut RewriteResult,
     matched_any: &mut bool,
+    aliased: &mut Vec<String>,
 ) -> bool {
     let mut changed = false;
     for (name, entry) in deps.iter_mut() {
         let packages_key = legacy_packages_key(parent_key, name);
-        if name == fname
-            && entry.get("version").and_then(Value::as_str) == Some(dep.version.as_str())
-        {
+        // An alias node (`"lp": {"version": "npm:left-pad@1.3.0"}`) is an
+        // install of its target, like the `packages` twin's `name` field.
+        let (node_name, node_version) =
+            npm_legacy_identity(name, entry.get("version").and_then(Value::as_str));
+        let is_alias = node_name != name.as_str();
+        if node_name == fname && node_version == Some(dep.version.as_str()) {
             // Legacy spelling of `inBundle`: same npm-ignores-the-rewrite
             // fail-open as the `packages` guard above.
             if entry.get("bundled").and_then(Value::as_bool) == Some(true) {
@@ -1254,6 +1286,9 @@ fn rewrite_npm_v2_deps(
                 {
                     result.edits.push(edit);
                     changed = true;
+                    if is_alias {
+                        aliased.push(name.clone());
+                    }
                 }
             }
         }
@@ -1269,6 +1304,7 @@ fn rewrite_npm_v2_deps(
                 legacy_is_install_tree,
                 result,
                 matched_any,
+                aliased,
             ) || changed;
         }
     }
@@ -14520,6 +14556,159 @@ mod tests {
             "{:?}",
             r.warnings
         );
+    }
+
+    /// #432: a lockfileVersion 2 lock's legacy `dependencies` mirror
+    /// spells an alias install `"lp": {"version": "npm:left-pad@1.3.0"}`.
+    /// It is rewired with the `packages` half (plain and scoped alias keys)
+    /// instead of silently staying on the registry, and the run says that
+    /// npm 6 installs of an aliased hosted pin fail closed.
+    #[test]
+    fn npm_v2_legacy_alias_mirror_is_rewired_and_warned() {
+        let registry = "https://registry.npmjs.org/left-pad/-/left-pad-1.3.0.tgz";
+        let node = json!({ "version": "npm:left-pad@1.3.0", "resolved": registry,
+                           "integrity": "sha512-UPSTREAM==" });
+        let entry = json!({ "name": "left-pad", "version": "1.3.0", "resolved": registry,
+                            "integrity": "sha512-UPSTREAM==" });
+        let lock = json!({
+            "name": "app",
+            "lockfileVersion": 2,
+            "requires": true,
+            "packages": {
+                "": { "name": "app", "version": "0.0.0",
+                      "dependencies": { "lp": "npm:left-pad@1.3.0",
+                                        "@x/lp": "npm:left-pad@1.3.0" } },
+                "node_modules/@x/lp": entry,
+                "node_modules/lp": entry
+            },
+            "dependencies": { "@x/lp": node, "lp": node }
+        });
+        let mut files = BTreeMap::new();
+        files.insert(
+            "package-lock.json".to_string(),
+            serde_json::to_string_pretty(&lock).unwrap(),
+        );
+        let overrides = vec![npm_override(
+            "left-pad",
+            "1.3.0",
+            "http://patch.test/lp.tgz",
+            "sha512-PATCHED==",
+        )];
+        let r = rewrite_registry_redirect(&files, &overrides);
+        let mut keys: Vec<_> = r
+            .edits
+            .iter()
+            .map(|e| (e.kind.as_str(), e.key.as_deref()))
+            .collect();
+        keys.sort_unstable();
+        assert_eq!(
+            keys,
+            [
+                ("redirect_npm_lock_dep", Some("@x/lp")),
+                ("redirect_npm_lock_dep", Some("lp")),
+                ("redirect_npm_lock_entry", Some("node_modules/@x/lp")),
+                ("redirect_npm_lock_entry", Some("node_modules/lp")),
+            ]
+        );
+        let out: Value = serde_json::from_str(&r.files["package-lock.json"]).unwrap();
+        for alias in ["lp", "@x/lp"] {
+            assert_eq!(
+                out["dependencies"][alias]["resolved"],
+                "http://patch.test/lp.tgz"
+            );
+            assert_eq!(out["dependencies"][alias]["integrity"], "sha512-PATCHED==");
+            assert_eq!(out["dependencies"][alias]["version"], "npm:left-pad@1.3.0");
+        }
+        let codes = warning_codes(&r);
+        assert!(
+            !codes.contains(&"redirect_npm_entry_not_found"),
+            "{codes:?}"
+        );
+        let w = r
+            .warnings
+            .iter()
+            .find(|w| w.code == "redirect_npm_legacy_alias_client")
+            .unwrap_or_else(|| panic!("missing npm 6 alias caveat: {:?}", r.warnings));
+        assert!(
+            w.detail.contains("npm <= 6") && w.detail.contains("EINTEGRITY"),
+            "{}",
+            w.detail
+        );
+        // A plain (non-alias) mirror carries no alias caveat.
+        let plain = lock_v2_plain_left_pad(registry);
+        let mut files = BTreeMap::new();
+        files.insert("package-lock.json".to_string(), plain);
+        let r = rewrite_registry_redirect(&files, &overrides);
+        assert!(r.files.contains_key("package-lock.json"));
+        assert!(
+            !warning_codes(&r).contains(&"redirect_npm_legacy_alias_client"),
+            "{:?}",
+            r.warnings
+        );
+    }
+
+    fn lock_v2_plain_left_pad(registry: &str) -> String {
+        let node = json!({ "version": "1.3.0", "resolved": registry,
+                           "integrity": "sha512-UPSTREAM==" });
+        serde_json::to_string_pretty(&json!({
+            "name": "app",
+            "lockfileVersion": 2,
+            "packages": {
+                "": { "name": "app", "version": "0.0.0" },
+                "node_modules/left-pad": node
+            },
+            "dependencies": { "left-pad": node }
+        }))
+        .unwrap()
+    }
+
+    /// #432, lockfileVersion 1: npm 6 writes an alias install as
+    /// `"lp": {"version": "npm:left-pad@1.3.0"}` and nothing else. The
+    /// hosted run used to find no entry (`redirect_npm_entry_not_found`,
+    /// exit 0) and pin nothing; it now rewires the node (npm >= 7 installs
+    /// the hosted patch from it, verified against npm 8 and 10) with the
+    /// v1 npm 6 caveat.
+    #[test]
+    fn npm_v1_alias_entry_is_rewired() {
+        let v1 = r#"{
+  "name": "app",
+  "version": "0.0.0",
+  "lockfileVersion": 1,
+  "requires": true,
+  "dependencies": {
+    "lp": {
+      "version": "npm:left-pad@1.3.0",
+      "resolved": "https://registry.npmjs.org/left-pad/-/left-pad-1.3.0.tgz",
+      "integrity": "sha512-UPSTREAM=="
+    }
+  }
+}
+"#;
+        let mut files = BTreeMap::new();
+        files.insert("package-lock.json".to_string(), v1.to_string());
+        let ovr = npm_override(
+            "left-pad",
+            "1.3.0",
+            "http://patch.test/left-pad-1.3.0.tgz",
+            "sha512-PATCHED==",
+        );
+        let r = rewrite_registry_redirect(&files, std::slice::from_ref(&ovr));
+        let codes = warning_codes(&r);
+        assert!(
+            !codes.contains(&"redirect_npm_entry_not_found"),
+            "{codes:?}"
+        );
+        assert!(codes.contains(&"redirect_npm_legacy_client"), "{codes:?}");
+        assert!(
+            !codes.contains(&"redirect_npm_legacy_alias_client"),
+            "the v1 caveat already covers every npm 6 install: {codes:?}"
+        );
+        let out: Value = serde_json::from_str(&r.files["package-lock.json"]).unwrap();
+        assert_eq!(
+            out["dependencies"]["lp"]["resolved"],
+            "http://patch.test/left-pad-1.3.0.tgz"
+        );
+        assert_eq!(out["dependencies"]["lp"]["version"], "npm:left-pad@1.3.0");
     }
 
     /// npm 12 removed `npm shrinkwrap` and now auto-creates a
