@@ -8,6 +8,7 @@ use crate::utils::fs::{
     entry_is_dir, home_dir, is_dir, is_file, list_dir_entries, normalize_lexically, run_blocking,
 };
 use crate::utils::process::{CommandRunner, SystemCommandRunner};
+use crate::vendor::lock_inventory::{DiskSnapshot, ProjectView};
 
 /// Ruby/RubyGems ecosystem crawler for discovering gems in Bundler vendor
 /// directories or global gem installation paths.
@@ -1024,6 +1025,40 @@ pub async fn bundler_loaded_manifest(root: &Path) -> crate::formats::gem::manife
         ambient_bundler_global_config_file(root).as_deref(),
     )
     .await
+}
+
+/// [`bundler_loaded_manifest`] for the project `view` shows. A disk view
+/// (or a snapshot of one) reads the ambient environment and the app config
+/// like bundler; a memory view has no environment, so only its own
+/// `.bundle/config` counts.
+pub(crate) async fn bundler_loaded_manifest_in(
+    view: &ProjectView<'_>,
+) -> crate::formats::gem::manifest::LoadedManifest {
+    use crate::formats::gem::manifest;
+    match view {
+        ProjectView::Disk(root) | ProjectView::Snapshot(DiskSnapshot { root, .. }) => {
+            bundler_loaded_manifest(root).await
+        }
+        ProjectView::Memory(_) => {
+            let config = view.read_text(".bundle/config").await.ok();
+            let value = config.as_deref().and_then(manifest::config_gemfile);
+            manifest::classify(Path::new("/"), None, value.as_deref(), None)
+        }
+    }
+}
+
+/// The ONE lockfile bundler reads for the project `view` shows: the lock of
+/// [`LoadedManifest::pair`](crate::formats::gem::manifest::LoadedManifest::pair)
+/// — `gems.locked` when the root holds a `gems.rb` file and nothing
+/// configures `BUNDLE_GEMFILE`, else `Gemfile.lock` — or `None` when
+/// `BUNDLE_GEMFILE` names a manifest outside the two default pairs. Every
+/// lock READER asks this (lock inventory, ledger recovery, VEX discovery),
+/// so none reads a twin bundler ignores (#736).
+pub(crate) async fn bundler_loaded_lock_in(view: &ProjectView<'_>) -> Option<&'static str> {
+    bundler_loaded_manifest_in(view)
+        .await
+        .pair(view.is_file("gems.rb"))
+        .map(|(_, lock)| lock)
 }
 
 /// [`bundler_loaded_manifest`] with the environment passed explicitly (hermetic

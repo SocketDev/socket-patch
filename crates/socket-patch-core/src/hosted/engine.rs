@@ -664,19 +664,8 @@ const GEM_MANIFEST_FILES: [&str; 4] = ["Gemfile", "Gemfile.lock", "gems.rb", "ge
 ///
 /// A memory view has no environment: only its own app config is read.
 async fn keep_bundler_loaded_gem_files(view: &ProjectView<'_>, out: &mut CandidateFiles) {
-    use crate::formats::gem::manifest::{self, LoadedManifest};
-    let loaded = match view {
-        ProjectView::Disk(root)
-        | ProjectView::Snapshot(crate::vendor::lock_inventory::DiskSnapshot { root, .. }) => {
-            crate::crawlers::ruby_crawler::bundler_loaded_manifest(root).await
-        }
-        ProjectView::Memory(_) => {
-            let config = view.read_text(".bundle/config").await.ok();
-            let value = config.as_deref().and_then(manifest::config_gemfile);
-            let root = std::path::Path::new("/");
-            manifest::classify(root, None, value.as_deref(), None)
-        }
-    };
+    use crate::formats::gem::manifest::LoadedManifest;
+    let loaded = crate::crawlers::ruby_crawler::bundler_loaded_manifest_in(view).await;
     let keep: &[&str] = match &loaded {
         LoadedManifest::Default => return,
         LoadedManifest::Configured { .. } => {
