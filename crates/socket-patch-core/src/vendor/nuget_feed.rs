@@ -1,9 +1,8 @@
 use std::path::{Path, PathBuf};
 use std::sync::Arc;
 
-use base64::Engine as _;
+use crate::utils::digest::sha512_base64_of;
 use serde_json::Value;
-use sha2::{Digest as _, Sha512};
 
 use crate::constants::SOCKET_DIR;
 use crate::manifest::schema::PatchRecord;
@@ -269,7 +268,7 @@ async fn nuget_prelude(
         let lock_ok = match (&lock_text, &nupkg_bytes) {
             (None, _) => true,
             (Some(text), Some(bytes)) if nupkg_ok => {
-                let expected = content_hash(bytes);
+                let expected = sha512_base64_of(bytes);
                 // Pinned at our bytes, or no matching resolved entry at
                 // all — the same absence `edit_lock` tolerates with a
                 // warning on the first run. Treating absence as stale
@@ -418,7 +417,7 @@ pub async fn vendor_nuget(
             // re-attaches the untouched config records.
             let mut wiring: Vec<WiringRecord> = Vec::new();
             if let Some(text) = &lock_text {
-                let new_hash = content_hash(&bytes);
+                let new_hash = sha512_base64_of(&bytes);
                 match edit_lock(text, name, &version_norm, &new_hash) {
                     Ok(Some(edit)) => {
                         LOCK_VALUE_MEMO.invalidate();
@@ -512,7 +511,7 @@ pub async fn vendor_nuget(
         return done(result, None, warnings);
     }
     result.package_path = nupkg_path.display().to_string();
-    let new_hash = content_hash(&nupkg_bytes);
+    let new_hash = sha512_base64_of(&nupkg_bytes);
 
     // ── nuget.config wiring (runs after the artifact) ─────────────────────
     let config_edit =
@@ -659,7 +658,7 @@ fn nuget_entry(
             // for tooling (harvest re-derives per-entry git hashes from the
             // zip, so the vendored copy is self-describing without a network).
             path: copy_rel,
-            sha256: hex::encode(sha2::Sha256::digest(nupkg_bytes)),
+            sha256: crate::utils::digest::sha256_hex_of(nupkg_bytes),
             size: Some(nupkg_bytes.len() as u64),
             platform_locked: None,
             file_inventory: None,
@@ -851,12 +850,6 @@ async fn write_nupkg(uuid_dir: &Path, nupkg_path: &Path, bytes: &[u8]) -> Result
     atomic_write_artifact(nupkg_path, bytes)
         .await
         .map_err(|e| format!("cannot write {}: {e}", nupkg_path.display()))
-}
-
-/// The `content_hash` NuGet pins in `packages.lock.json`: base64 of the
-/// sha512 of the whole `.nupkg`.
-fn content_hash(bytes: &[u8]) -> String {
-    base64::engine::general_purpose::STANDARD.encode(Sha512::digest(bytes))
 }
 
 // ── nuget.config editing ───────────────────────────────────────────────────────
@@ -1389,6 +1382,7 @@ mod tests {
     use crate::manifest::schema::PatchFileInfo;
     use crate::vendor::state::VENDOR_MARKER_FILE;
     use serde_json::json;
+    use sha2::Digest as _;
 
     const UUID: &str = "9f6b2c4e-1d3a-4f6b-8c2d-7e5a9b1c3d5f";
     const PURL: &str = "pkg:nuget/Newtonsoft.Json@13.0.3";
@@ -2051,7 +2045,7 @@ mod tests {
         assert!(cfg.contains("<package pattern=\"Newtonsoft.Json\" />"));
 
         // packages.lock.json repinned to base64(sha512(nupkg)).
-        let want_hash = content_hash(&nupkg);
+        let want_hash = sha512_base64_of(&nupkg);
         let lock = tokio::fs::read_to_string(root.join(PACKAGES_LOCK))
             .await
             .unwrap();
@@ -3571,7 +3565,7 @@ mod tests {
         let lock = tokio::fs::read_to_string(root.join(PACKAGES_LOCK))
             .await
             .unwrap();
-        assert!(lock.contains(&content_hash(&nupkg)));
+        assert!(lock.contains(&sha512_base64_of(&nupkg)));
     }
 
     // ── revert entry validation edges ──────────────────────────────────────
@@ -3993,7 +3987,7 @@ mod tests {
             .await
             .unwrap();
         assert!(
-            lock.contains(&content_hash(&served)),
+            lock.contains(&sha512_base64_of(&served)),
             "lock pinned at the served bytes"
         );
         assert_eq!(entry.expect("ledger entry").wiring.len(), 3);
@@ -4807,7 +4801,7 @@ mod tests {
             .await
             .unwrap();
         assert!(
-            lock.contains(&content_hash(&rebuilt)),
+            lock.contains(&sha512_base64_of(&rebuilt)),
             "lock re-pinned at the rebuild"
         );
 
