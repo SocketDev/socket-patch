@@ -2136,6 +2136,45 @@ packages:
         }
     }
 
+    /// A CRLF, BOM or BOM+CRLF+tab `package.json` keeps its layout through
+    /// vendor and a byte-exact revert, for BOTH legacy grammars (#662).
+    #[tokio::test]
+    async fn vendor_and_revert_keep_package_json_layout() {
+        use crate::vendor::test_support::{relayout, JSON_LAYOUTS};
+        for (before_lock, after_lock, grammar) in [
+            (T7_BEFORE_LOCK, T7_AFTER_LOCK, "5.4"),
+            (T8_BEFORE_LOCK, T8_AFTER_LOCK, "6.0"),
+        ] {
+            for (layout, bom, crlf, tab) in JSON_LAYOUTS {
+                let tag = format!("{grammar} {layout}");
+                let before = relayout(T_BEFORE_PKG, bom, crlf, tab);
+                let fx = fixture_with(&before, before_lock).await;
+                let (result, entry, _) = expect_done(fx.vendor(false).await);
+                assert!(result.success, "{tag}: {:?}", result.error);
+                assert_eq!(
+                    fx.read(PACKAGE_JSON).await,
+                    relayout(T_AFTER_PKG, bom, crlf, tab),
+                    "{tag}: vendored package.json keeps its layout"
+                );
+                assert_eq!(
+                    fx.read(PNPM_LOCK).await,
+                    fx.expected_lock(after_lock).await,
+                    "{tag}: lock unaffected by the manifest layout"
+                );
+
+                let outcome = revert_pnpm_legacy(&entry.unwrap(), fx.root(), false).await;
+                assert!(outcome.success, "{tag}: {:?}", outcome.error);
+                assert!(outcome.warnings.is_empty(), "{tag}: {:?}", outcome.warnings);
+                assert_eq!(
+                    fx.read(PACKAGE_JSON).await,
+                    before,
+                    "{tag}: package.json byte-restored"
+                );
+                assert_eq!(fx.read(PNPM_LOCK).await, before_lock, "{tag}");
+            }
+        }
+    }
+
     #[tokio::test]
     async fn legacy_lifecycle_leaves_an_unreadable_workspace_file_untouched() {
         for lock in [T7_BEFORE_LOCK, T8_BEFORE_LOCK] {
