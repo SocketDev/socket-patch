@@ -50,6 +50,7 @@ pub mod presence;
 use crate::formats::pnpm::plan_hosted;
 use crate::formats::cargo::CargoLock;
 use crate::formats::composer::hosted::rewrite_composer_lock;
+use crate::formats::gem::gemfile;
 use crate::formats::gem::hosted::{checksum_entry_span, converge_gem_lock_source};
 use crate::formats::gem::lock_lists_direct_dependency;
 pub(crate) use crate::formats::yarn::is_berry_lock;
@@ -5281,28 +5282,25 @@ fn rewrite_nuget(
 
 // ── rubygems (Gemfile + Gemfile.lock) ────────────────────────────────────────
 
-/// The argument tail of a `gem "name", …` line minus any leading quoted
-/// version-constraint args (`"7.0.0"`, `'~> 7.0'`, `">= 1", "< 2"`) — i.e. the
-/// options (`require: false`, `group: :test`, …) that must survive the move
-/// into the source block. Empty when the line carries none; bails to empty on
-/// an unparseable tail (unbalanced quote).
-/// Shared with the vendor backend's Gemfile rewrite (`vendor::gem`),
-/// which has the same drop-the-options failure mode.
-pub(crate) fn gem_line_trailing_options(tail: &str) -> String {
-    let mut rest = tail.trim_start();
-    loop {
-        let Some(after_comma) = rest.strip_prefix(',') else {
-            return String::new();
-        };
-        let arg = after_comma.trim_start();
-        match arg.chars().next() {
-            Some(q @ ('"' | '\'')) => match arg[1..].find(q) {
-                Some(end) => rest = arg[1 + end + 1..].trim_start(),
-                None => return String::new(),
-            },
-            Some(_) => return arg.trim_end().to_string(),
-            None => return String::new(),
-        }
+/// The `redirect_gem_source_option` detail. `what` names the thing that
+/// picks the gem's own source (a Gemfile option, a lock section). When it is
+/// socket-patch's OWN vendored wiring, prescribe the eject path instead of
+/// leaving the user to puzzle over a line the tool itself wrote.
+fn gem_source_option_detail(dep: &DepOverride, what: &str, socket_vendored: bool) -> String {
+    if socket_vendored {
+        format!(
+            "{what} pointing into .socket/vendor — socket-patch's own vendored \
+             wiring, which would override the Socket source block; un-vendor this \
+             gem first (`socket-patch remove pkg:gem/{}@{}`, or `socket-patch \
+             vendor --revert` to revert EVERY vendored dependency in the \
+             project), then re-run the hosted scan",
+            dep.name, dep.version
+        )
+    } else {
+        format!(
+            "{what}, which selects the gem's own source and would override the \
+             Socket source block; redirect skipped"
+        )
     }
 }
 
@@ -5418,31 +5416,6 @@ pub(crate) fn gem_line_tail_blocks_edit(tail: &str) -> Option<String> {
         }
     }
     None
-}
-
-/// The source-selecting option a `gem` line's argument tail carries, if any
-/// (only the code before any `#` comment counts). Bundler allows ONE source
-/// per gem, so an option like `git:` preserved into the Socket source block
-/// OVERRIDES the block and the redirect becomes a silent no-op. Mirrors the
-/// token list `vendor::gem::rest_blocks_edit` refuses for the same reason.
-fn gem_tail_source_option(tail: &str) -> Option<&'static str> {
-    let code = tail.split('#').next().unwrap_or("");
-    [
-        "path:",
-        ":path",
-        "git:",
-        ":git",
-        "github:",
-        ":github",
-        "source:",
-        ":source",
-        "gist:",
-        ":gist",
-        "bitbucket:",
-        ":bitbucket",
-    ]
-    .into_iter()
-    .find(|tok| code.contains(tok))
 }
 
 /// The grant-token path segment of a hosted patch URL: the path level
@@ -5703,6 +5676,23 @@ fn rewrite_gem(
     // frozen-installable as written.
     let mut mixed_state = false;
     let mut warned_no_gemfile = false;
+    // The gems the lock resolves from a non-registry section (`GIT`,
+    // `PATH`, `PLUGIN SOURCE`): header + whether it is socket-patch's own
+    // vendored wiring. Read once — the rewrites below only touch `GEM`
+    // sections and CHECKSUMS, never these.
+    let non_registry: BTreeMap<String, (String, bool)> = lock
+        .as_deref()
+        .map(|lk| {
+            crate::formats::gem::parse(lk)
+                .non_registry_sources()
+                .into_iter()
+                .map(|(name, s)| {
+                    let vendored = s.remotes.iter().any(|r| r.contains(".socket/vendor/"));
+                    (name.to_string(), (s.header.to_string(), vendored))
+                })
+                .collect()
+        })
+        .unwrap_or_default();
 
     for dep in &gem {
         let Some(ov) = registry_override_of_kind(dep, "rubygems-compact-index") else {
@@ -5780,6 +5770,27 @@ fn rewrite_gem(
                 });
                 continue;
             }
+        }
+
+        // The lock is what bundler resolves from: a gem it lists under a
+        // `GIT` / `PATH` / `PLUGIN SOURCE` section is served from there
+        // however the Gemfile spells the declaration (a plain `gem` line in
+        // a `git "…" do` block, an option the line reader cannot see), so a
+        // Socket source block cannot redirect it (#652). Fail closed.
+        if let Some((header, socket_vendored)) = non_registry.get(dep.name.as_str()) {
+            let (header, socket_vendored) = (header.as_str(), *socket_vendored);
+            result.warnings.push(RewriteWarning {
+                code: "redirect_gem_source_option".into(),
+                detail: gem_source_option_detail(
+                    dep,
+                    &format!(
+                        "{lock_name} resolves {} from a `{header}` section",
+                        dep.name
+                    ),
+                    socket_vendored,
+                ),
+            });
+            continue;
         }
 
         // Whether THIS dep's Gemfile source redirect is in place (just
@@ -5905,45 +5916,11 @@ fn rewrite_gem(
                     } else {
                         raw_tail
                     };
-                    // A source-selecting option would move into the block and
-                    // OVERRIDE it in bundler's DSL, leaving the redirect a
-                    // silent no-op that still gets attested. Fail closed —
-                    // and when the blocking `path:` is socket-patch's OWN
-                    // vendored wiring, prescribe the eject path instead of
-                    // leaving the user to puzzle over their own Gemfile.
-                    if let Some(tok) = gem_tail_source_option(&tail) {
-                        let socket_vendored = matches!(tok, "path:" | ":path")
-                            && tail
-                                .split('#')
-                                .next()
-                                .unwrap_or("")
-                                .contains(".socket/vendor/");
-                        let detail = if socket_vendored {
-                            format!(
-                                "the `gem \"{}\"` declaration carries `{tok}` pointing into \
-                                 .socket/vendor — socket-patch's own vendored wiring, which \
-                                 would override the Socket source block; un-vendor this gem \
-                                 first (`socket-patch remove pkg:gem/{}@{}`, or `socket-patch \
-                                 vendor --revert` to revert EVERY vendored dependency in the \
-                                 project), then re-run the hosted scan",
-                                dep.name, dep.name, dep.version
-                            )
-                        } else {
-                            format!(
-                                "the `gem \"{}\"` declaration carries `{tok}`, which would \
-                                 override the Socket source block; redirect skipped",
-                                dep.name
-                            )
-                        };
-                        result.warnings.push(RewriteWarning {
-                            code: "redirect_gem_source_option".into(),
-                            detail,
-                        });
-                        continue;
-                    }
                     // Only a whole one-line declaration can move into the
                     // block: a continuation would be orphaned after `end`
-                    // and a modifier silently dropped (#340).
+                    // and a modifier silently dropped (#340). Checked before
+                    // the source-option reader, which fails closed on any
+                    // tail it cannot parse.
                     if let Some(reason) = gem_line_tail_blocks_edit(&tail) {
                         result.warnings.push(RewriteWarning {
                             code: "redirect_gem_unrecognized_declaration".into(),
@@ -5955,10 +5932,35 @@ fn rewrite_gem(
                         });
                         continue;
                     }
+                    // A source-selecting option would move into the block and
+                    // OVERRIDE it in bundler's DSL, leaving the redirect a
+                    // silent no-op that still gets attested. Fail closed —
+                    // and when the blocking `path:` is socket-patch's OWN
+                    // vendored wiring, prescribe the eject path instead of
+                    // leaving the user to puzzle over their own Gemfile.
+                    if let Some(opt) = gemfile::source_option(&tail) {
+                        let tok = opt.spelling;
+                        let socket_vendored = opt.key == "path"
+                            && tail
+                                .split('#')
+                                .next()
+                                .unwrap_or("")
+                                .contains(".socket/vendor/");
+                        let detail = gem_source_option_detail(
+                            dep,
+                            &format!("the `gem \"{}\"` declaration carries `{tok}`", dep.name),
+                            socket_vendored,
+                        );
+                        result.warnings.push(RewriteWarning {
+                            code: "redirect_gem_source_option".into(),
+                            detail,
+                        });
+                        continue;
+                    }
                     // Trailing options (`require: false`, `group: …`) must
                     // survive the move into the source block — dropping
                     // `require: false` auto-requires the gem at boot.
-                    let opts = gem_line_trailing_options(&tail);
+                    let opts = gemfile::trailing_options(&tail);
                     let block = if opts.is_empty() {
                         format!(
                             "source \"{}\" do\n  gem \"{}\", \"{}\"\nend",
@@ -12600,6 +12602,142 @@ mod tests {
             "skip must warn: {:?}",
             r.warnings
         );
+    }
+
+    /// #652: the source-option refusal must catch every option that picks a
+    /// git source — bundler's built-in `gitlab:`, a custom
+    /// `git_source(:name)` key, and the string-keyed `"git" =>` / quoted
+    /// symbol `"git":` spellings — not only a fixed token list. Each one,
+    /// moved into the Socket block, overrides it: bundler keeps loading the
+    /// unpatched git checkout while VEX attests `not_affected`.
+    #[test]
+    fn gemfile_git_source_options_in_every_spelling_fail_closed() {
+        for (gemfile, tok) in [
+            (
+                "source \"https://rubygems.org\"\n\ngem \"rails\", gitlab: \"rails/rails\"\n",
+                "gitlab:",
+            ),
+            (
+                "source \"https://rubygems.org\"\n\n\
+                 git_source(:local) { |r| \"/srv/repos/#{r}\" }\n\n\
+                 gem \"rails\", local: \"rails\"\n",
+                "local:",
+            ),
+            (
+                "source \"https://rubygems.org\"\n\n\
+                 gem \"rails\", \"7.0.0\", require: false, :internal => \"rails\"\n",
+                ":internal",
+            ),
+            (
+                "source \"https://rubygems.org\"\n\ngem \"rails\", \"git\" => \"/srv/repos/rails\"\n",
+                "\"git\" =>",
+            ),
+            (
+                "source \"https://rubygems.org\"\n\ngem \"rails\", 'path' => '../rails'\n",
+                "'path' =>",
+            ),
+            (
+                "source \"https://rubygems.org\"\n\ngem \"rails\", \"git\": \"/srv/repos/rails\"\n",
+                "\"git\":",
+            ),
+        ] {
+            let mut files = BTreeMap::new();
+            files.insert("Gemfile".to_string(), gemfile.to_string());
+            files.insert(
+                "Gemfile.lock".to_string(),
+                gem_lock(&format!("  rails (7.0.0) sha256={}", "2".repeat(64))),
+            );
+            let r = rewrite_registry_redirect(&files, &[gem_override("rails", "7.0.0")]);
+            assert!(
+                r.files.is_empty() && r.edits.is_empty(),
+                "{tok}: a git-source option must skip the redirect: files={:?} edits={:?}",
+                r.files,
+                r.edits
+            );
+            let warning = r
+                .warnings
+                .iter()
+                .find(|w| w.code == "redirect_gem_source_option")
+                .unwrap_or_else(|| panic!("{tok}: skip must warn: {:?}", r.warnings));
+            assert!(
+                warning.detail.contains(&format!("`{tok}`")),
+                "{tok}: the refusal names the option as written: {}",
+                warning.detail
+            );
+        }
+    }
+
+    /// #652: a string-keyed option that does NOT pick a source
+    /// (`"require" => false`) is an option, not a version constraint — it
+    /// must ride into the Socket block instead of being silently dropped.
+    #[test]
+    fn gemfile_string_keyed_options_survive_the_redirect() {
+        let mut files = BTreeMap::new();
+        files.insert(
+            "Gemfile".to_string(),
+            "source \"https://rubygems.org\"\n\n\
+             gem \"rails\", \"7.0.0\", \"require\" => false\n"
+                .to_string(),
+        );
+        files.insert(
+            "Gemfile.lock".to_string(),
+            gem_lock(&format!("  rails (7.0.0) sha256={}", "2".repeat(64))),
+        );
+        let r = rewrite_registry_redirect(&files, &[gem_override("rails", "7.0.0")]);
+        let out = r
+            .files
+            .get("Gemfile")
+            .unwrap_or_else(|| panic!("redirect applies: {:?}", r.warnings));
+        assert!(
+            out.contains("  gem \"rails\", \"7.0.0\", \"require\" => false\n"),
+            "string-keyed option preserved inside the block: {out}"
+        );
+    }
+
+    /// #652: the lock is what bundler resolves from. A gem the lock lists
+    /// under a `GIT` (or `PATH`) section is served from there whatever the
+    /// Gemfile line looks like — e.g. a plain `gem "rails"` inside a
+    /// `git "…" do` block — so moving the line into a Socket source block
+    /// cannot redirect it. Fail closed instead of attesting a no-op.
+    #[test]
+    fn gem_locked_from_git_or_path_section_fails_closed() {
+        for (gemfile, section) in [
+            (
+                "source \"https://rubygems.org\"\n\n\
+                 git \"https://gitlab.com/rails/rails.git\" do\n  gem \"rails\"\nend\n",
+                "GIT\n  remote: https://gitlab.com/rails/rails.git\n  \
+                 revision: 0123456789abcdef0123456789abcdef01234567\n  specs:\n    \
+                 rails (7.0.0)\n\n",
+            ),
+            (
+                "source \"https://rubygems.org\"\n\n\
+                 path \"vendor/engines\" do\n  gem \"rails\"\nend\n",
+                "PATH\n  remote: vendor/engines\n  specs:\n    rails (7.0.0)\n\n",
+            ),
+        ] {
+            let lock = format!(
+                "{section}GEM\n  remote: https://rubygems.org/\n  specs:\n\n\
+                 PLATFORMS\n  ruby\n\nDEPENDENCIES\n  rails!\n\nBUNDLED WITH\n   2.6.2\n"
+            );
+            let mut files = BTreeMap::new();
+            files.insert("Gemfile".to_string(), gemfile.to_string());
+            files.insert("Gemfile.lock".to_string(), lock);
+            let r = rewrite_registry_redirect(&files, &[gem_override("rails", "7.0.0")]);
+            assert!(
+                r.files.is_empty() && r.edits.is_empty(),
+                "a gem locked from a non-registry section must skip the redirect: \
+                 files={:?} edits={:?}",
+                r.files,
+                r.edits
+            );
+            assert!(
+                r.warnings
+                    .iter()
+                    .any(|w| w.code == "redirect_gem_source_option"),
+                "skip must warn: {:?}",
+                r.warnings
+            );
+        }
     }
 
     /// When the blocking `path:` option is socket-patch's OWN vendored wiring
@@ -20014,19 +20152,6 @@ packages:
             ],
             "{:?}",
             r.warnings
-        );
-    }
-
-    /// The documented bail-to-empty legs of `gem_line_trailing_options`: a
-    /// dangling comma and an unbalanced quote both yield "" (options dropped
-    /// rather than a panic or a mangled tail). Shared with vendor::gem.
-    #[test]
-    fn gem_line_trailing_options_bails_empty_on_unparseable_tails() {
-        assert_eq!(gem_line_trailing_options(","), "");
-        assert_eq!(gem_line_trailing_options(", \"7.0"), "");
-        assert_eq!(
-            gem_line_trailing_options(", \"7.0\", require: false"),
-            "require: false"
         );
     }
 
