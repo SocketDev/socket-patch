@@ -71,9 +71,11 @@ type VendorStepResult = Result<(bool, Envelope), VendorStepError>;
 /// Action values are part of the CLI contract: `would_vendor` (no ledger
 /// entry), `already_vendored` (entry at this uuid), `would_revendor` +
 /// `oldUuid` (entry at an older uuid), and — additive — `would_refuse` +
-/// `errorCode` + `error` for npm purls the wet run's Bun or vlt preflight
+/// `errorCode` + `error` for npm purls the wet run's Bun, vlt or npm
+/// package-lock preflight
 /// ([`crate::commands::bun_preflight::BunVendorRefusal`],
-/// [`crate::commands::vlt_preflight`]) would refuse before any download.
+/// [`crate::commands::vlt_preflight`], [`npm_lock_refusal`]) would refuse
+/// before any download.
 /// The preview stays a ledger classification otherwise (engine refusals
 /// outside the preflights are not predicted), and `would_refuse` never
 /// flips the run's status or exit code. The preflights (the only disk
@@ -90,6 +92,7 @@ pub(crate) async fn preview_vendor_json(
         bun_vendor_preflight_with_ledger(cwd, selected, state.as_ref().map(|s| &s.entries)).await;
     let vlt_refusals =
         vlt_vendor_preflight_selected(cwd, selected, state.as_ref().map(|s| &s.entries)).await;
+    let npm_lock_refusal = npm_lock_refusal(cwd, selected).await;
     let state = state.unwrap_or_default();
     let mut patches: Vec<serde_json::Value> = selected
         .iter()
@@ -108,6 +111,13 @@ pub(crate) async fn preview_vendor_json(
                 serde_json::json!({
                     "purl": p.purl, "uuid": p.uuid, "action": "would_refuse",
                     "errorCode": r.code, "error": r.detail,
+                })
+            }
+            _ if p.purl.starts_with("pkg:npm/") && npm_lock_refusal.is_some() => {
+                let (code, detail) = npm_lock_refusal.as_ref().expect("checked by the guard");
+                serde_json::json!({
+                    "purl": p.purl, "uuid": p.uuid, "action": "would_refuse",
+                    "errorCode": code, "error": detail,
                 })
             }
             Some(e) if e.uuid == p.uuid => serde_json::json!({
@@ -148,7 +158,7 @@ fn with_symlink_warnings(cwd: &Path, purl: &str, mut row: serde_json::Value) -> 
     row
 }
 
-/// The purls of `selected` the wet run's Bun or vlt preflight would refuse
+/// The purls of `selected` the wet run's Bun, vlt or npm package-lock preflight would refuse
 /// before any download (the `would_refuse` rows of
 /// [`preview_vendor_json`]): the vendored planning pass, so a refused NEW
 /// patch holds no rollout slot.
@@ -161,14 +171,30 @@ pub(super) async fn preflight_refused_purls(
         bun_vendor_preflight_with_ledger(cwd, selected, state.as_ref().map(|s| &s.entries)).await;
     let vlt_refusals =
         vlt_vendor_preflight_selected(cwd, selected, state.as_ref().map(|s| &s.entries)).await;
+    let npm_lock_refusal = npm_lock_refusal(cwd, selected).await;
     selected
         .iter()
         .filter(|p| {
             refusal.as_ref().is_some_and(|r| r.applies_to(&p.purl))
                 || vlt_refusal_for(&vlt_refusals, &p.purl).is_some()
+                || (p.purl.starts_with("pkg:npm/") && npm_lock_refusal.is_some())
         })
         .map(|p| p.purl.clone())
         .collect()
+}
+
+/// The npm package-lock backend's project-level refusal (a lock that is
+/// not v2/v3, see [`socket_patch_core::vendor::npm_lock_vendor_preflight`]),
+/// which refuses every npm purl of the project before any download or
+/// takeover. Read only when the selection holds an npm purl.
+async fn npm_lock_refusal(
+    cwd: &Path,
+    selected: &[PatchSearchResult],
+) -> Option<(&'static str, String)> {
+    if !selected.iter().any(|p| p.purl.starts_with("pkg:npm/")) {
+        return None;
+    }
+    socket_patch_core::vendor::npm_lock_vendor_preflight(cwd).await
 }
 
 /// Human rendering of the vendored dry-run preview's `would_refuse` records

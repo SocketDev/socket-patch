@@ -41,6 +41,11 @@ const SKIP_DIRS: &[&str] = &[
 ///   store and the projects' own `node_modules` hold only links to their
 ///   direct deps.
 ///
+/// - pnpm's `modulesDir` (see [`pnpm_modules_dirs`]): pnpm installs the
+///   project there instead of `node_modules`, and from pnpm 10.12 its
+///   virtual store follows (`<modulesDir>/.pnpm`), so nothing of the
+///   install is under a dir named `node_modules` (#661).
+///
 /// Only existing directories are returned.
 pub(super) fn configured_install_roots(start_path: &Path) -> Vec<PathBuf> {
     let mut roots = Vec::new();
@@ -50,8 +55,111 @@ pub(super) fn configured_install_roots(start_path: &Path) -> Vec<PathBuf> {
     if start_path.join("rush.json").is_file() {
         roots.push(start_path.join("common").join("temp").join("node_modules"));
     }
+    roots.extend(pnpm_modules_dirs(start_path));
     roots.retain(|root| root.is_dir());
+    let mut seen = HashSet::new();
+    roots.retain(|root| seen.insert(root.clone()));
     roots
+}
+
+/// The project's pnpm `modulesDir` install roots, other than
+/// `node_modules` itself:
+/// - the configured setting ([`pnpm_modules_dir_setting`]), resolved
+///   against the project like pnpm does, and honored only strictly inside
+///   it (the value comes from the scanned project and names a tree apply
+///   WRITES into; see [`resolve_modules_folder`]);
+/// - any direct child dir holding pnpm's `.modules.yaml` install record,
+///   which pnpm writes into whatever modules dir it used. That finds an
+///   install whose `modulesDir` came from pnpm's global config or the
+///   environment, which the project's files do not show.
+fn pnpm_modules_dirs(start_path: &Path) -> Vec<PathBuf> {
+    let mut dirs = Vec::new();
+    if let Some(dir) =
+        pnpm_modules_dir_setting(start_path).and_then(|raw| resolve_modules_folder(&[], &raw))
+    {
+        dirs.push(start_path.join(dir));
+    }
+    let Some((entries, _)) = read_dir_entries_sync(start_path) else {
+        return dirs;
+    };
+    for entry in entries {
+        let name = entry.file_name();
+        if name == OsStr::new("node_modules") || !entry.file_type().is_ok_and(|t| t.is_dir()) {
+            continue;
+        }
+        let dir = start_path.join(name);
+        if std::fs::symlink_metadata(dir.join(PNPM_MODULES_YAML)).is_ok_and(|m| m.is_file()) {
+            dirs.push(dir);
+        }
+    }
+    dirs
+}
+
+/// The raw pnpm `modulesDir` setting that applies to the project at
+/// `start_path`: `modulesDir:` in the nearest `pnpm-workspace.yaml` at or
+/// above it (the workspace's settings file on pnpm 10+, which wins over
+/// `.npmrc`), else `modules-dir` from the nearest `.npmrc` at or above it
+/// that sets it (pnpm up to 10). Read with
+/// [`crate::utils::fs::read_regular_to_string_sync`]: the files belong to
+/// the (untrusted) project.
+fn pnpm_modules_dir_setting(start_path: &Path) -> Option<String> {
+    let read = |path: PathBuf| crate::utils::fs::read_regular_to_string_sync(&path).ok();
+    let from_workspace = start_path
+        .ancestors()
+        .find_map(|dir| read(dir.join("pnpm-workspace.yaml")))
+        .and_then(|yaml| {
+            crate::utils::serde::strip_bom(&yaml)
+                .lines()
+                .filter_map(crate::formats::pnpm::workspace::top_level_key)
+                .rfind(|(key, _)| key == "modulesDir")
+                .map(|(_, value)| unquote_yaml_scalar(value))
+        });
+    from_workspace
+        .or_else(|| {
+            start_path.ancestors().find_map(|dir| {
+                let npmrc = read(dir.join(".npmrc"))?;
+                crate::patch::redirect::npmrc::npmrc_top_level_value(&npmrc, "modules-dir")
+            })
+        })
+        .filter(|value| !value.is_empty())
+}
+
+/// A YAML flow scalar's value: quotes removed (`''` is a literal quote
+/// inside single quotes), a plain scalar as is.
+fn unquote_yaml_scalar(raw: &str) -> String {
+    if raw.starts_with('"') {
+        if let Ok(value) = serde_json::from_str::<String>(raw) {
+            return value;
+        }
+    } else if let Some(inner) = raw.strip_prefix('\'').and_then(|r| r.strip_suffix('\'')) {
+        return inner.replace("''", "'");
+    }
+    raw.to_string()
+}
+
+/// Whether the installed pnpm tree of the project at `project` keeps its
+/// virtual store where the crawler does not look: a `.modules.yaml` in
+/// `node_modules` or a pnpm modules dir ([`pnpm_modules_dirs`]) records a
+/// `virtualStoreDir` outside the project, as pnpm's global virtual store
+/// (`enableGlobalVirtualStore`) and a `virtualStoreDir` that climbs out
+/// do. Only direct deps are linked into the project then, so a package
+/// the crawler does not find may still be installed (as a transitive dep)
+/// and must not be read as absent (#696). `false` with no pnpm install.
+pub fn pnpm_store_outside_project(project: &Path) -> bool {
+    let mut modules_dirs = vec![project.join("node_modules")];
+    modules_dirs.extend(pnpm_modules_dirs(project));
+    modules_dirs.iter().any(|nm| {
+        let Ok(text) = crate::utils::fs::read_regular_to_string_sync(&nm.join(PNPM_MODULES_YAML))
+        else {
+            return false;
+        };
+        let Some(recorded) = parse_modules_yaml_virtual_store_dir(&text) else {
+            return false;
+        };
+        let importer = normalize_lexically(project);
+        let store = normalize_lexically(&nm.join(recorded));
+        store_below_importer(&importer, &store).is_none()
+    })
 }
 
 /// Append the `configured` roots to the walk's `walked` roots. A walked
@@ -5149,6 +5257,142 @@ mod tests {
             .await
             .unwrap();
         assert!(roots.is_empty(), "{roots:?}");
+    }
+
+    /// REGRESSION (#661, #696): pnpm's `modulesDir` (`modulesDir:` in
+    /// `pnpm-workspace.yaml`, `modules-dir=` in `.npmrc` up to pnpm 10)
+    /// renames `node_modules`, and from pnpm 10.12 the virtual store moves
+    /// with it to `<modulesDir>/.pnpm`. The walk only collects dirs named
+    /// `node_modules`, so agent mode read the install as absent and hosted
+    /// `vex` attested the lock over it. The configured dir is a crawl root,
+    /// as is a project child holding pnpm's `.modules.yaml` (a value from
+    /// pnpm's global config or the environment).
+    #[tokio::test]
+    async fn test_pnpm_modules_dir_is_a_crawl_root() {
+        let configs = [
+            ("pnpm-workspace.yaml", "modulesDir: deps\n"),
+            (
+                "pnpm-workspace.yaml",
+                "packages:\n  - packages/*\n'modulesDir' : \"./deps\" # moved\n",
+            ),
+            (".npmrc", "modules-dir=deps\n"),
+            ("deps/.modules.yaml", "{\"virtualStoreDir\": \".pnpm\"}"),
+        ];
+        for (file, text) in configs {
+            let tmp = tempfile::tempdir().unwrap();
+            let root = tmp.path();
+            std::fs::write(root.join("package.json"), r#"{"name":"app"}"#).unwrap();
+            let store_copy = root.join("deps/.pnpm/left-pad@1.3.0/node_modules/left-pad");
+            write_pkg(&store_copy, "left-pad", "1.3.0");
+            let crawler = NpmCrawler::new();
+            let options = local_options(root);
+            let has_left_pad = |pkgs: &[CrawledPackage]| {
+                pkgs.iter()
+                    .any(|p| p.purl == "pkg:npm/left-pad@1.3.0" && p.path == store_copy)
+            };
+            // Control: unconfigured, deps/ is not an install root.
+            assert!(!has_left_pad(&crawler.crawl_all(&options).await), "{file}");
+
+            std::fs::write(root.join(file), text).unwrap();
+            let roots = crawler.get_node_modules_paths(&options).await.unwrap();
+            assert_eq!(roots, vec![root.join("deps")], "{file}: {text}");
+            assert!(has_left_pad(&crawler.crawl_all(&options).await), "{file}");
+            let found = crawler
+                .find_by_purls(&root.join("deps"), &["pkg:npm/left-pad@1.3.0".to_string()])
+                .await
+                .unwrap();
+            assert_eq!(found.len(), 1, "{file}: {found:?}");
+        }
+    }
+
+    /// The `modulesDir` setting is read from the nearest
+    /// `pnpm-workspace.yaml` (pnpm resolves it against each project, so a
+    /// workspace member installs into its own `deps/`), wins over `.npmrc`,
+    /// and fails closed when it leaves the project.
+    #[test]
+    fn test_pnpm_modules_dir_setting_resolution() {
+        let tmp = tempfile::tempdir().unwrap();
+        let repo = tmp.path();
+        let member = repo.join("packages/member");
+        std::fs::create_dir_all(member.join("deps")).unwrap();
+        std::fs::create_dir_all(member.join("lib")).unwrap();
+        std::fs::create_dir_all(repo.join("deps")).unwrap();
+        std::fs::write(repo.join("pnpm-workspace.yaml"), "modulesDir: deps\n").unwrap();
+        assert_eq!(configured_install_roots(&member), vec![member.join("deps")]);
+        assert_eq!(configured_install_roots(repo), vec![repo.join("deps")]);
+
+        std::fs::write(member.join(".npmrc"), "modules-dir=lib\n").unwrap();
+        assert_eq!(configured_install_roots(&member), vec![member.join("deps")]);
+        std::fs::write(repo.join("pnpm-workspace.yaml"), "packages: [packages/*]\n").unwrap();
+        assert_eq!(configured_install_roots(&member), vec![member.join("lib")]);
+
+        for outside in ["../deps", "/tmp/deps", "."] {
+            std::fs::write(member.join(".npmrc"), format!("modules-dir={outside}\n")).unwrap();
+            assert!(configured_install_roots(&member).is_empty(), "{outside}");
+        }
+    }
+
+    /// REGRESSION (#696): an installed pnpm tree whose virtual store pnpm
+    /// recorded OUTSIDE the project (the global virtual store, or a
+    /// `virtualStoreDir` that climbs out) holds copies the crawler never
+    /// sees, so "not found" there does not mean "not installed". A store
+    /// inside the project, or no install at all, is not such a blind spot.
+    #[test]
+    fn test_pnpm_store_outside_project() {
+        let outside = tempfile::tempdir().unwrap();
+        let shared: PathBuf = outside.path().components().collect();
+        let tmp = tempfile::tempdir().unwrap();
+        let root: PathBuf = tmp.path().components().collect();
+        assert!(!pnpm_store_outside_project(&root), "nothing installed");
+
+        let nm = root.join("node_modules");
+        std::fs::create_dir_all(&nm).unwrap();
+        assert!(!pnpm_store_outside_project(&root), "not a pnpm install");
+        let record = |dir: &Path, store: &str| {
+            let store = store.replace('\\', "\\\\");
+            std::fs::write(
+                dir.join(".modules.yaml"),
+                format!("{{\"virtualStoreDir\": \"{store}\"}}"),
+            )
+            .unwrap();
+        };
+        record(&nm, ".pnpm");
+        assert!(!pnpm_store_outside_project(&root), "default store");
+        std::fs::create_dir_all(root.join(".vstore")).unwrap();
+        record(&nm, "../.vstore");
+        assert!(
+            !pnpm_store_outside_project(&root),
+            "store inside the project"
+        );
+        record(&nm, &format!("{}", shared.join("v11/links").display()));
+        assert!(pnpm_store_outside_project(&root), "global virtual store");
+        record(&nm, "../../outside-vs");
+        assert!(
+            pnpm_store_outside_project(&root),
+            "virtualStoreDir climbs out"
+        );
+        std::fs::write(
+            nm.join(".modules.yaml"),
+            "layoutVersion: 5\nvirtualStoreDir: ../../outside-vs\n",
+        )
+        .unwrap();
+        assert!(pnpm_store_outside_project(&root), "YAML .modules.yaml");
+
+        // The same record under a configured `modulesDir`.
+        std::fs::remove_dir_all(&nm).unwrap();
+        std::fs::write(root.join("pnpm-workspace.yaml"), "modulesDir: deps\n").unwrap();
+        let deps = root.join("deps");
+        std::fs::create_dir_all(&deps).unwrap();
+        record(&deps, ".pnpm");
+        assert!(
+            !pnpm_store_outside_project(&root),
+            "modulesDir default store"
+        );
+        record(&deps, "../../outside-vs");
+        assert!(
+            pnpm_store_outside_project(&root),
+            "modulesDir, store outside"
+        );
     }
 
     /// REVIEW (#520): `--install.modules-folder` wins over
