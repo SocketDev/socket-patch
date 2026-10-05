@@ -1,6 +1,6 @@
 [agent] Progress ledger for the scheduled Yarn classic (1.x) bug-hunt routine (label pm:yarn-classic).
 
-Last updated: 2026-10-05 (run 20), main `4646693`, latest release v4.0.0. Runs 5–20 added the cells in "Run 5 cells" through "Run 20 cells" below. The project-mode matrix below was measured on `f6b7fb9` (v4); cells marked "(v5)", the global matrix and the "v5 project-mode cells" list were re-run on v5.
+Last updated: 2026-10-05 (run 21), main `9c43dfc`, latest release v4.0.0. Runs 5–21 added the cells in "Run 5 cells" through "Run 21 cells" below. The project-mode matrix below was measured on `f6b7fb9` (v4); cells marked "(v5)", the global matrix and the "v5 project-mode cells" list were re-run on v5.
 
 ## Coverage matrix
 
@@ -135,13 +135,23 @@ Other cells that pass on Linux 1.22.22 (some also on older releases; see the ent
 - #758 still reproduces (1.10.1 / 1.22.22). Run-18 battery (agent, V + mirror) on `4646693`: pass. #336 still fails.
 - GitHub shorthand after #710: blocked (no codeload access in the sandbox).
 
+### Run 21 cells (Linux, `9c43dfc`)
+- **Hosted scan / `get --mode hosted` from a workspace member with a non-hoisted copy (version conflict or `nohoist`): exit 0 `success`, `redirected: 0`, npm-only `redirect_npm_no_lockfile`: fail #884** on 1.0.2 / 1.7.0 / 1.10.1 / 1.22.22 (×2 each). #598 refuses only pnpm and cargo members. npm workspaces have the same symptom, handed to the npm ledger.
+- #627 verified fixed (#802): vendored refuses a symlinked yarn.lock with `redirect_symlinked_file_unsupported`, and the target is untouched: pass.
+- #467 still reproduces (H and V mixed-EOL rewrite / rollback not byte-exact). #692 still reproduces, and the code is now `vendor_lock_entry_removed` (commented).
+- GitHub shorthand `owner/repo#tag` and `github:owner/repo#tag` (synthetic codeload lock, real yarn installs from the hosted / vendored URL): H rewire + frozen fresh install on 1.7.0 / 1.22.22 + vex: pass. V rewire + frozen install + byte-exact rollback: pass. H rollback lands on the npm **registry** tarball, not the original codeload URL (contract: "default upstream entry"); recorded as a design question.
+- #858 atomic writes: yarn.lock mode 0640 preserved (H/V): pass. A hard-linked yarn.lock is split from its other link (expected for stage-and-rename; not filed).
+- #865 digests: a vendored grant without `sha1` computes the right `#sha1` (it matches `sha1sum`), and frozen installs on 1.7.0 / 1.22.22 pass.
+- `nohoist` workspace from the root: A apply / rollback, H and V frozen fresh installs patched in the member, vex: pass.
+- Twin lock (yarn.lock + package-lock.json) after #799: vendored wires yarn.lock with `vendor_multiple_lockfiles`, and vex refuses `patched_ref_unattributable` (fail-closed, as #799 intends).
+
 ## Backlog
 
-1. Re-check #364 (PR #839) / #831 (PR #837) once merged, and #828's yarn git-sibling shape once fixed. Then #467 / #519 / #558 / #591 / #627 / #691 / #692 / #758 / #857.
-2. Hosted-git shorthands (`owner/repo`, `github:`, `bitbucket:`, `gitlab:`) after #710, via a probe (the sandbox can't reach codeload).
+1. Re-check #884 / #364 (PR #839) / #831 (PR #837) once fixed, and #828's yarn git-sibling shape. Then #467 / #519 / #558 / #591 / #691 / #692 / #758 / #857.
+2. GitHub shorthands with a real codeload install (probe branch, macOS / Windows): check what lock yarn 1.10+ actually writes (an `integrity` line?), and also `bitbucket:` / `gitlab:`.
 3. Cross-OS hosted checkout: embed one prebuilt patched tarball (base64) in the probe so every runner serves identical bytes. Add workspaces to the cross-OS vendored probe.
 4. #758 follow-ups: a real registry package with `bundledDependencies`.
-5. **Maintainer request (global mode), what's left:** the Windows MSI install of yarn, and a read-only prefix on Windows with a non-admin user. #437 (1.0.x) is still open. macOS case-insensitive name collisions. Same-size patched files on yarn ≤1.9 in-place installs.
+5. **Maintainer request (global mode), what's left:** the Windows MSI install of yarn, and a read-only prefix on Windows with a non-admin user. #437 (1.0.x) is still open. macOS case-insensitive name collisions.
 
 ## Known non-bugs
 
@@ -151,7 +161,7 @@ Other cells that pass on Linux 1.22.22 (some also on older releases; see the ent
 - A BOM plus no yarn header comment makes the first entry `entry_not_found`. Yarn always writes the header, so this is synthetic.
 - `file:` directory and `link:` deps are skipped by design. (`file:` **tarball** deps are rewired and work.)
 - The GitHub shorthand `owner/repo#tag` locks as a codeload tarball and is correctly rewired; only `git+…` patterns are #363.
-- Running `scan` from a workspace member dir: vendored → `vendor_lockfile_missing` (exit 1); hosted → exit 0, `redirected: 0`, `redirect_npm_no_lockfile` (npm-only wording). This is the documented hosted refusal posture.
+- Running `scan` from a workspace member dir whose deps are all hoisted: hosted says "No packages found" (exit 0, nothing to pin). Vendored refuses `vendor_lockfile_missing` (exit 1). *Reclassified in run 21:* when the member has its own non-hoisted copy, hosted's silent success is #884 (the #590 shape), not a documented posture.
 - hosted→agent / vendored→agent keep the existing wiring (`hosted_wiring_retained` / `vendored_ownership_retained`), as documented.
 - Concurrent scans: the extras fail with `lock_held` (intended).
 - Probe branches can't be deleted from the sandbox (the git proxy rejects ref deletion). Leftovers: `bughunt/yarn-classic/20260930-mirror-git`, `bughunt/yarn-classic/20261001-win-crlf-git`.
@@ -212,3 +222,4 @@ Other cells that pass on Linux 1.22.22 (some also on older releases; see the ent
 - #363 / #664 / #665 were closed by #710 / #666 / #689. Don't re-file the git-rewire shape; a git block is now skipped by design (docs/ecosystems.md "yarn classic git dependencies").
 - yarn 1.0.2 installs a single copy (the git one, at the root) for a workspace that has both a registry block and a git block of the same `name@version`. The hosted pin then never reaches `node_modules`, but the scan's `redirect_yarn_classic_git_skipped` warning covers it and `vex` doesn't attest.
 - The sandbox can't reach codeload.github.com, so GitHub-shorthand deps need a probe branch.
+- Hosted rollback of a GitHub-shorthand dep (`owner/repo#tag`, codeload lock) restores the npm registry tarball, not the codeload URL. CLI_CONTRACT "Hosted unwind coverage" says pins go back to the default upstream registry entry. Vendored rollback is byte-exact. Whether a non-registry origin should be refused (as composer does) is a design question.
