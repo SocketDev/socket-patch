@@ -7,6 +7,7 @@ use std::path::PathBuf;
 
 use crate::args::GlobalArgs;
 
+use socket_patch_core::crawlers::npm_crawler::with_store_peer_variant_copies;
 use socket_patch_core::crawlers::walk_pool;
 use socket_patch_core::crawlers::CargoCrawler;
 use socket_patch_core::crawlers::ComposerCrawler;
@@ -593,8 +594,8 @@ pub(crate) fn npm_paths_by_identity_in(
 /// patch would silently resolve as `package_not_found`. The rollback
 /// variant fans each base path back out to every qualified manifest PURL
 /// — the same mapping the manifest was written with (`get` uses the same
-/// resolver). `vex` hashes the first copy of a manifest purl and every copy
-/// of a hosted one from this one lookup.
+/// resolver). `vex` hashes every copy of a manifest purl and of a hosted
+/// one from this one lookup; npm copies include their store variants.
 ///
 /// With `prior`, the npm `node_modules` roots come
 /// from it (a crawl of the same options earlier in this process, over
@@ -612,14 +613,23 @@ pub async fn find_manifest_package_copies_reusing(
     let partitioned = partition_purls(purls, common.ecosystems.as_deref());
     let crawler_options = common.crawler_options();
     let npm_roots = prior.and_then(|p| p.roots_for(&crawler_options));
-    dispatch_find(
+    let mut copies = dispatch_find(
         &partitioned,
         &crawler_options,
         quiet,
         merge_qualified,
         npm_roots,
     )
-    .await
+    .await;
+    // `apply` also writes every store variant of each npm copy (a pnpm peer
+    // suffix, a Deno `_N` copy index, a vlt peer extra), so "every copy"
+    // includes them (#603).
+    for (purl, paths) in copies.iter_mut() {
+        if purl.starts_with("pkg:npm/") {
+            *paths = with_store_peer_variant_copies(std::mem::take(paths)).await;
+        }
+    }
+    copies
 }
 
 /// Box the future `make` returns, constructing it inside this (non-async)
