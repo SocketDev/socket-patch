@@ -440,6 +440,13 @@ enum Driver {
     ScanVexHeredocDeclaration,
     /// A double-quoted interpolation can itself contain a heredoc opener.
     ScanVexInterpolatedHeredocDeclaration,
+    /// A second declaration joined to the gem's line by `;` (#826): the
+    /// line rewrite would delete it. Same contract as
+    /// [`Driver::ScanVexDuplicateDeclaration`].
+    ScanVexSemicolonJoinedDeclaration,
+    /// [`Driver::ScanVex`] on a declaration ending in a bare `;` and a
+    /// comment (#826): a complete declaration, so it is redirected.
+    ScanVexTrailingSemicolonDeclaration,
     /// [`Driver::ScanVexDualBoot`] with `BUNDLE_GEMFILE=Gemfile` exported to
     /// socket-patch too (#507): bundler's local app config outranks the
     /// environment, so bundler still loads `Gemfile.next` and the run must
@@ -464,6 +471,12 @@ impl Driver {
             }
             Driver::ScanVexDualBootEnvGemfile => {
                 "scan --mode hosted (config Gemfile.next, env BUNDLE_GEMFILE=Gemfile)"
+            }
+            Driver::ScanVexSemicolonJoinedDeclaration => {
+                "scan --mode hosted (two `;`-joined gem declarations)"
+            }
+            Driver::ScanVexTrailingSemicolonDeclaration => {
+                "scan --mode hosted (gem line ending in `;`)"
             }
         }
     }
@@ -760,6 +773,14 @@ async fn redirect_scanned_project(
             "source \"{}/upstream\"\n\ngem \"{DEP}\", require: \"#{{<<~REQUIRE_PATH}}\".chomp\n  vuln_gem\nREQUIRE_PATH\n",
             server.uri()
         ),
+        Driver::ScanVexSemicolonJoinedDeclaration => format!(
+            "source \"{}/upstream\"\n\ngem \"{DEP}\"; gem \"{TRANSITIVE}\"\n",
+            server.uri()
+        ),
+        Driver::ScanVexTrailingSemicolonDeclaration => format!(
+            "source \"{}/upstream\"\n\ngem \"{DEP}\"; # the vulnerable one\n",
+            server.uri()
+        ),
         _ => format!("source \"{}/upstream\"\n\ngem \"{DEP}\"\n", server.uri()),
     };
     std::fs::write(proj.join(gemfile_name), gemfile_body).unwrap();
@@ -871,7 +892,9 @@ async fn redirect_scanned_project(
         | Driver::ScanVexConditionalDeclaration
         | Driver::ScanVexScopedConstantModifier
         | Driver::ScanVexHeredocDeclaration
-        | Driver::ScanVexInterpolatedHeredocDeclaration => vec![
+        | Driver::ScanVexInterpolatedHeredocDeclaration
+        | Driver::ScanVexSemicolonJoinedDeclaration
+        | Driver::ScanVexTrailingSemicolonDeclaration => vec![
             "scan",
             "--mode",
             "hosted",
@@ -932,7 +955,8 @@ async fn redirect_scanned_project(
         | Driver::ScanVexConditionalDeclaration
         | Driver::ScanVexScopedConstantModifier
         | Driver::ScanVexHeredocDeclaration
-        | Driver::ScanVexInterpolatedHeredocDeclaration => {
+        | Driver::ScanVexInterpolatedHeredocDeclaration
+        | Driver::ScanVexSemicolonJoinedDeclaration => {
             Some("redirect_gem_unrecognized_declaration")
         }
         _ => None,
@@ -1013,7 +1037,7 @@ async fn redirect_scanned_project(
         );
     }
     match driver {
-        Driver::ScanVex => {
+        Driver::ScanVex | Driver::ScanVexTrailingSemicolonDeclaration => {
             assert_eq!(env["vex"]["statements"], 1, "vex block: {env}");
             assert_eq!(
                 env["vex"]["verified"], false,
@@ -1028,7 +1052,8 @@ async fn redirect_scanned_project(
         | Driver::ScanVexConditionalDeclaration
         | Driver::ScanVexScopedConstantModifier
         | Driver::ScanVexHeredocDeclaration
-        | Driver::ScanVexInterpolatedHeredocDeclaration => {
+        | Driver::ScanVexInterpolatedHeredocDeclaration
+        | Driver::ScanVexSemicolonJoinedDeclaration => {
             unreachable!("asserted and returned above")
         }
         Driver::GetUuid => {
@@ -1795,6 +1820,53 @@ async fn gem_hosted_multi_line_declaration_is_refused_and_still_installs() {
     )
     .await;
     assert!(fx.is_none(), "the multi-line driver asserts in place");
+}
+
+/// #826: `gem "x"; gem "y"` must not be rewritten. The line rewrite
+/// deleted `gem "y"`, so the next frozen install failed.
+#[tokio::test(flavor = "multi_thread")]
+#[ignore = "host capstone: shells out to a real ruby/gem/bundler (>= 1.17); \
+            run with a pinned toolchain via --ignored"]
+async fn gem_hosted_semicolon_joined_declarations_are_refused_and_still_install() {
+    let fx = redirect_scanned_project(
+        "semicolon-joined",
+        Spelling::Gemfile,
+        false,
+        true,
+        None,
+        Driver::ScanVexSemicolonJoinedDeclaration,
+    )
+    .await;
+    assert!(fx.is_none(), "the `;`-joined driver asserts in place");
+}
+
+/// #826: `gem "x"; # c` is a complete declaration. Since #637 it was
+/// refused as continuing on the next line; it must redirect, and a fresh
+/// checkout must install the patched bytes.
+#[tokio::test(flavor = "multi_thread")]
+#[ignore = "host capstone: shells out to a real ruby/gem/bundler (>= 1.17); \
+            run with a pinned toolchain via --ignored"]
+async fn gem_hosted_trailing_semicolon_declaration_redirects_and_installs() {
+    let Some(fx) = redirect_scanned_project(
+        "trailing-semicolon",
+        Spelling::Gemfile,
+        false,
+        true,
+        None,
+        Driver::ScanVexTrailingSemicolonDeclaration,
+    )
+    .await
+    else {
+        return;
+    };
+    let (fresh, install) = fresh_checkout_bundle_install(&fx);
+    assert!(
+        install.status.success(),
+        "fresh-checkout `bundle install` must succeed from the patch registry.\nstdout:\n{}\nstderr:\n{}",
+        String::from_utf8_lossy(&install.stdout),
+        String::from_utf8_lossy(&install.stderr),
+    );
+    assert_patched_install(&fx, &fresh);
 }
 
 /// #340: a `gem` declaration with an `if` modifier must not be rewritten

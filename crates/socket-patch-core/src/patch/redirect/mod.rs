@@ -5200,10 +5200,47 @@ pub(crate) fn gem_line_trailing_options(tail: &str) -> String {
                 Some(end) => rest = arg[1 + end + 1..].trim_start(),
                 None => return String::new(),
             },
-            Some(_) => return arg.trim_end().to_string(),
+            Some(_) => return without_statement_end(arg.trim_end()),
             None => return String::new(),
         }
     }
+}
+
+/// `opts` minus a top-level `;` statement terminator (and any extra `;`s),
+/// keeping a trailing `#` comment. [`gem_line_tail_blocks_edit`] has already
+/// refused a tail where another statement follows the `;`, so only `;`s,
+/// whitespace and a comment can follow it here (#826).
+fn without_statement_end(opts: &str) -> String {
+    let mut quote: Option<char> = None;
+    let mut depth: i64 = 0;
+    let mut chars = opts.char_indices();
+    while let Some((i, c)) = chars.next() {
+        if let Some(q) = quote {
+            if c == '\\' {
+                chars.next();
+            } else if c == q {
+                quote = None;
+            }
+            continue;
+        }
+        match c {
+            '#' => break,
+            '"' | '\'' => quote = Some(c),
+            '(' | '[' | '{' => depth += 1,
+            ')' | ']' | '}' => depth -= 1,
+            ';' if depth == 0 => {
+                let code = opts[..i].trim_end();
+                let rest = opts[i..].trim_start_matches(|c: char| c == ';' || c.is_whitespace());
+                return if rest.is_empty() {
+                    code.to_string()
+                } else {
+                    format!("{code} {rest}")
+                };
+            }
+            _ => {}
+        }
+    }
+    opts.to_string()
 }
 
 /// Why the argument tail of a one-line `gem "name"…` declaration can't be
@@ -5216,7 +5253,9 @@ pub(crate) fn gem_line_trailing_options(tail: &str) -> String {
 ///   after the rewrite, and bundler refuses the Gemfile;
 /// - a modifier (`if` / `unless` / `while` / `until` / `rescue` / `and` /
 ///   `or`) or a `do` block would be dropped, silently changing when the gem
-///   is declared.
+///   is declared;
+/// - another statement after a top-level `;` would be deleted with the line
+///   (#826). A bare trailing `;` ends the declaration and is fine.
 ///
 /// Only code outside ordinary string literals and before a `#` comment
 /// counts, so a keyword or `,` inside `require: "…"` or a comment is fine.
@@ -5249,6 +5288,18 @@ pub(crate) fn gem_line_tail_blocks_edit(tail: &str) -> Option<String> {
         }
         match c {
             '#' => break,
+            // A top-level `;` ends the declaration's statement. Anything
+            // after it but more `;`s or a comment is another statement on
+            // the line the rewrite replaces, so it would be deleted (#826).
+            ';' if depth == 0 => {
+                let rest = chars
+                    .as_str()
+                    .trim_start_matches(|c: char| c == ';' || c.is_whitespace());
+                if rest.is_empty() || rest.starts_with('#') {
+                    break;
+                }
+                return Some("another statement follows the declaration on its line".to_string());
+            }
             '"' | '\'' => quote = Some(c),
             '(' | '[' | '{' => depth += 1,
             ')' | ']' | '}' => depth -= 1,
@@ -12979,6 +13030,128 @@ mod tests {
             ", require: false # if::FEATURE, <<REQUIRE_PATH",
         ] {
             assert_eq!(gem_line_tail_blocks_edit(tail), None, "{tail:?}");
+        }
+    }
+
+    /// #826: a top-level `;` ends the declaration's statement. Another
+    /// statement after it (`gem "a", "1"; gem "b", "2"`) shares the line the
+    /// rewrite replaces, so it would be deleted: refuse. A bare trailing
+    /// `;` (optionally before a comment) ends nothing else, so it is a
+    /// complete one-line declaration, not a continuation.
+    #[test]
+    fn gem_line_tail_semicolon_statements() {
+        for tail in [
+            ", \"0.8.1\"; gem \"rainbow\", \"3.1.1\"",
+            ", \"0.8.1\";gem \"rainbow\"",
+            ", require: false; gem \"rainbow\" # c",
+            ";gem \"rainbow\"",
+            ", \"0.8.1\"; ; puts 1",
+        ] {
+            let reason = gem_line_tail_blocks_edit(tail);
+            assert!(
+                reason
+                    .as_deref()
+                    .is_some_and(|r| r.contains("another statement")),
+                "{tail:?}: {reason:?}"
+            );
+        }
+        for tail in [
+            ", \"0.8.1\";",
+            ", \"0.8.1\"; ",
+            ", \"0.8.1\"; # c",
+            ", \"0.8.1\";; ",
+            ", require: false;",
+            ", require: \"a;b\"",
+            ", require: \"a\" # x; gem \"b\"",
+            ";",
+        ] {
+            assert_eq!(gem_line_tail_blocks_edit(tail), None, "{tail:?}");
+        }
+        // The kept options drop the terminator but keep a comment and any
+        // `;` inside a string or the comment.
+        for (tail, opts) in [
+            (", \"0.8.1\";", ""),
+            (", require: false;", "require: false"),
+            (
+                ", require: false ;; # lazy; ok",
+                "require: false # lazy; ok",
+            ),
+            (", require: \"a;b\";", "require: \"a;b\""),
+            (", require: \"a;b\"", "require: \"a;b\""),
+            (", require: false # x;", "require: false # x;"),
+        ] {
+            assert_eq!(gem_line_trailing_options(tail), opts, "{tail:?}");
+        }
+    }
+
+    /// #826: the hosted rewrite replaces the whole physical line, so a
+    /// second `;`-joined declaration on it must refuse instead of being
+    /// deleted (the next `bundle install` would drop that dependency).
+    #[test]
+    fn gemfile_semicolon_joined_declarations_fail_closed() {
+        let lock = "GEM\n  remote: https://rubygems.org/\n  specs:\n    rainbow (3.1.1)\n    \
+                    vuln-gem (1.0.0)\n\nPLATFORMS\n  ruby\n\nDEPENDENCIES\n  rainbow (= 3.1.1)\n  \
+                    vuln-gem (= 1.0.0)\n\nBUNDLED WITH\n   4.0.17\n";
+        for decl in [
+            "gem \"vuln-gem\", \"1.0.0\"; gem \"rainbow\", \"3.1.1\"",
+            "gem \"vuln-gem\", \"1.0.0\";gem \"rainbow\", \"3.1.1\" # pair",
+            "gem \"vuln-gem\", require: false; gem \"rainbow\", \"3.1.1\"",
+        ] {
+            let gemfile = format!("source \"https://rubygems.org\"\n\n{decl}\n");
+            let files = BTreeMap::from([
+                ("Gemfile".to_string(), gemfile),
+                ("Gemfile.lock".to_string(), lock.to_string()),
+            ]);
+            let r = rewrite_registry_redirect(&files, &[gem_override("vuln-gem", "1.0.0")]);
+            assert!(
+                r.files.is_empty() && r.edits.is_empty(),
+                "{decl:?} must not be rewritten: files={:?}",
+                r.files
+            );
+            assert_eq!(
+                warning_codes(&r),
+                vec!["redirect_gem_unrecognized_declaration"],
+                "{decl:?}: {:?}",
+                r.warnings
+            );
+        }
+    }
+
+    /// #826 (the #637 regression): a declaration ending in a bare `;`,
+    /// with or without a trailing comment, is complete and still rewrites.
+    #[test]
+    fn gemfile_trailing_semicolon_declaration_rewrites() {
+        let lock = "GEM\n  remote: https://rubygems.org/\n  specs:\n    vuln-gem (1.0.0)\n\n\
+                    PLATFORMS\n  ruby\n\nDEPENDENCIES\n  vuln-gem\n\n\
+                    BUNDLED WITH\n   4.0.17\n";
+        for (decl, want) in [
+            (
+                "gem \"vuln-gem\", \"1.0.0\";",
+                "  gem \"vuln-gem\", \"1.0.0\"\nend",
+            ),
+            (
+                "gem \"vuln-gem\", \"1.0.0\"; # c",
+                "  gem \"vuln-gem\", \"1.0.0\"\nend",
+            ),
+            (
+                "gem \"vuln-gem\", require: false;",
+                "  gem \"vuln-gem\", \"1.0.0\", require: false\nend",
+            ),
+        ] {
+            let gemfile = format!("source \"https://rubygems.org\"\n\n{decl}\n");
+            let files = BTreeMap::from([
+                ("Gemfile".to_string(), gemfile),
+                ("Gemfile.lock".to_string(), lock.to_string()),
+            ]);
+            let r = rewrite_registry_redirect(&files, &[gem_override("vuln-gem", "1.0.0")]);
+            assert!(
+                !warning_codes(&r).contains(&"redirect_gem_unrecognized_declaration"),
+                "{decl:?}: {:?}",
+                r.warnings
+            );
+            let out = r.files.get("Gemfile").expect("declaration rewritten");
+            assert!(out.contains(want), "{decl:?}: {out}");
+            assert!(!out.contains(';'), "{decl:?}: {out}");
         }
     }
 
