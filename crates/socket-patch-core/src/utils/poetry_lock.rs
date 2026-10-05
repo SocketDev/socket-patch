@@ -15,6 +15,9 @@
 use toml_edit::{value, Array, DocumentMut, InlineTable, Item, Table, TableLike, Value};
 
 use crate::crawlers::python_crawler::canonicalize_pypi_name;
+use crate::utils::lock_fragments::{
+    extend_span, finish, fragments_of, next_header_end, pair_fragments, FragmentRewrite, LockParse,
+};
 use crate::utils::python_lock::{is_prior_hosted_url, table_likes};
 
 /// The `{file, hash}` tables Poetry records in `package`'s own
@@ -195,32 +198,10 @@ pub fn rewrite_poetry_lock(
     .map(|rewrite| rewrite.text))
 }
 
-/// A successful [`rewrite_poetry_lock_with_edits`].
-pub struct PoetryLockRewrite<'a> {
-    /// The rewritten lock text.
-    pub text: String,
-    original: &'a str,
-    name: &'a str,
-    /// The original's fragments, already taken to build `text`.
-    before: Vec<String>,
-    /// The fragment edits, when `text` is byte-identical to the serialized
-    /// document they were derived against (the common case: toml_edit
-    /// round-trips the untouched bytes) — then they are also the edits
-    /// against `text`.
-    known_edits: Option<Vec<(String, String)>>,
-}
-
-impl PoetryLockRewrite<'_> {
-    /// Exactly `poetry_lock_edits(original, &self.text, name)`, without
-    /// re-deriving what the rewrite already did.
-    pub fn edits(&self) -> Result<Vec<(String, String)>, String> {
-        if let Some(edits) = &self.known_edits {
-            return Ok(edits.clone());
-        }
-        let after = poetry_lock_fragments(&self.text, self.name)?;
-        pair_poetry_lock_fragments(self.original, &self.before, &self.text, after)
-    }
-}
+/// A successful [`rewrite_poetry_lock_with_edits`]; its
+/// [`edits`](FragmentRewrite::edits) are exactly
+/// `poetry_lock_edits(original, &text, name)`.
+pub type PoetryLockRewrite<'a> = FragmentRewrite<'a>;
 
 /// [`rewrite_poetry_lock`], also handing back what the caller needs to
 /// record the rewrite's fragment edits ([`PoetryLockRewrite::edits`]).
@@ -245,17 +226,9 @@ pub fn rewrite_poetry_lock_with_edits<'a>(
     )
 }
 
-/// The parse of the lock text a [`rewrite_poetry_lock_in`] call last saw or
-/// produced, handed to the next call so a caller rewriting one lock dep by
-/// dep parses each state once: a rewrite parses its own output anyway (to
-/// take the output's fragments), and when the splice reproduces that output
-/// byte for byte — the common case — it is the next dep's input. Reused only
-/// for byte-identical text, and `DocumentMut`'s own parser is exactly
-/// `Document::parse(..).into_mut()`, so every result is the fresh parse's.
-#[derive(Default)]
-pub struct PoetryLockParse {
-    doc: Option<toml_edit::Document<String>>,
-}
+/// The parse of the `poetry.lock` text a [`rewrite_poetry_lock_in`] call
+/// last saw or produced, handed to the next call (see [`LockParse`]).
+pub type PoetryLockParse = LockParse;
 
 /// Where [`rewrite_poetry_lock_in`] rewrites, settled before it mutates.
 struct PoetryLockPlan {
@@ -289,16 +262,12 @@ pub fn rewrite_poetry_lock_in<'a>(
     if !crate::vendor::pypi_distribution::matches(filename, name, version) {
         return Err("Poetry patch wheel does not match the locked package".into());
     }
-    let doc = match parse.doc.take() {
-        Some(doc) if doc.raw() == text => doc,
-        _ => toml_edit::Document::parse(text.to_owned())
-            .map_err(|e| format!("invalid Poetry lock: {e}"))?,
-    };
+    let doc = parse.take(text, "Poetry")?;
     let plan = match plan_poetry_rewrite(&doc, name, version, source_type, source_url, &sha256) {
         Ok(Some(plan)) => plan,
         verdict => {
             // Nothing was mutated: the parse still describes `text`.
-            parse.doc = Some(doc);
+            parse.restore(doc);
             return verdict.map(|_| None);
         }
     };
@@ -363,31 +332,16 @@ pub fn rewrite_poetry_lock_in<'a>(
             table.insert(&package_name, entry);
         }
     }
-    let mut rewritten = lock.to_string();
-    if text.contains("\r\n") {
-        rewritten = rewritten.replace("\r\n", "\n").replace('\n', "\r\n");
-    }
-    let before = before?;
-    let after_doc = toml_edit::Document::parse(rewritten).map_err(|e| e.to_string())?;
-    let rewritten = after_doc.raw();
-    let after = poetry_lock_fragments_in(&after_doc, rewritten, name)?;
-    let edits = pair_poetry_lock_fragments(text, &before, rewritten, after)?;
-    let mut result = text.to_string();
-    for (original, replacement) in &edits {
-        result = result.replacen(original, replacement, 1);
-    }
-    let known_edits = (result == rewritten).then_some(edits);
-    if known_edits.is_some() {
-        // The output IS the rendered text just parsed: the next dep's input.
-        parse.doc = Some(after_doc);
-    }
-    Ok(Some(PoetryLockRewrite {
-        text: result,
-        original: text,
+    finish(
+        "Poetry",
+        parse,
+        text,
         name,
+        lock.to_string(),
         before,
-        known_edits,
-    }))
+        poetry_lock_fragments_in::<String>,
+    )
+    .map(Some)
 }
 
 /// Every refusal and not-applicable verdict of [`rewrite_poetry_lock_in`]
@@ -468,28 +422,6 @@ fn plan_poetry_rewrite(
     }))
 }
 
-/// End (exclusive, before its line break) of the first top-level TOML header
-/// line at or after `from`, skipping blank lines; `text.len()` at EOF; `from`
-/// itself when the next non-blank line is not a header (a shape Poetry never
-/// writes — the fragment is then not extended).
-fn next_header_end(text: &str, from: usize) -> usize {
-    let mut pos = from;
-    for line in text[from..].split_inclusive('\n') {
-        let content = line.trim_end_matches(['\r', '\n']);
-        // Blank lines and comments sit between units (toml_edit clones carry
-        // the file's leading comment as decor); they belong to the boundary.
-        if content.trim().is_empty() || content.trim_start().starts_with('#') {
-            pos += line.len();
-            continue;
-        }
-        if content.starts_with('[') {
-            return pos + content.len();
-        }
-        return from;
-    }
-    text.len()
-}
-
 /// The verbatim `(original, replacement)` fragments that turn `original` into
 /// `rewritten` for `name`: the package's `[[package]]` unit (with its
 /// sub-tables) and, for legacy formats, its `[metadata.files]` /
@@ -503,14 +435,13 @@ pub fn poetry_lock_edits(
 ) -> Result<Vec<(String, String)>, String> {
     let before = poetry_lock_fragments(original, name)?;
     let after = poetry_lock_fragments(rewritten, name)?;
-    pair_poetry_lock_fragments(original, &before, rewritten, after)
+    pair_fragments("Poetry", original, &before, rewritten, after)
 }
 
 /// The fragments of `text` for `name` that [`poetry_lock_edits`] pairs up:
 /// the `[[package]]` unit and, for legacy formats, the integrity entry.
 fn poetry_lock_fragments(text: &str, name: &str) -> Result<Vec<String>, String> {
-    let lock = toml_edit::Document::parse(text).map_err(|e| e.to_string())?;
-    poetry_lock_fragments_in(&lock, text, name)
+    fragments_of(text, name, poetry_lock_fragments_in::<String>)
 }
 
 /// [`poetry_lock_fragments`] of `text` from its (spanned) parse `lock`.
@@ -533,21 +464,6 @@ fn poetry_lock_fragments_in<S>(
             })
         })
         .ok_or("missing Poetry package")?;
-    fn extend_span(table: &Table, span: &mut std::ops::Range<usize>) {
-        if let Some(own) = table.span() {
-            span.start = span.start.min(own.start);
-            span.end = span.end.max(own.end);
-        }
-        for (_, item) in table.iter() {
-            if let Some(own) = item.span() {
-                span.start = span.start.min(own.start);
-                span.end = span.end.max(own.end);
-            }
-            if let Some(child) = item.as_table() {
-                extend_span(child, span);
-            }
-        }
-    }
     let mut span = package.span().ok_or("missing Poetry package span")?;
     extend_span(package, &mut span);
     span.end += text[span.end..]
@@ -602,26 +518,6 @@ fn poetry_lock_fragments_in<S>(
     Ok(result)
 }
 
-/// [`poetry_lock_edits`] over fragments already taken from both sides.
-fn pair_poetry_lock_fragments(
-    original: &str,
-    before: &[String],
-    rewritten: &str,
-    after: Vec<String>,
-) -> Result<Vec<(String, String)>, String> {
-    let mut edits = Vec::new();
-    for (old, new) in before.iter().zip(after) {
-        if *old == new {
-            continue;
-        }
-        if original.matches(old.as_str()).count() != 1 || rewritten.matches(&new).count() != 1 {
-            return Err("ambiguous Poetry rollback fragment".into());
-        }
-        edits.push((old.clone(), new));
-    }
-    Ok(edits)
-}
-
 #[cfg(test)]
 mod tests {
     use super::*;
@@ -644,6 +540,74 @@ mod tests {
 
     fn hosted(text: &str) -> Result<Option<String>, String> {
         rewrite_poetry_lock(text, "urllib3", "1.26.18", "url", URL, WHEEL, &sha())
+    }
+
+    /// #695: a mixed-ending lock's rewritten unit (and legacy integrity
+    /// entry) takes the ending most of its own lines had, every other line
+    /// keeps its own, and the recorded edits replay back byte for byte
+    /// (hosted `url` and vendored `file`).
+    #[test]
+    fn mixed_line_ending_unit_keeps_its_majority_ending() {
+        use crate::utils::pdm_lock::tests::{count_breaks, mixed_endings};
+        let path = "./.socket/vendor/pypi/e828efa5-5c6d-43f3-9909-03f5ac232b98/urllib3-1.26.18-py2.py3-none-any.whl";
+        for version in [
+            "0.12.17", "1.0.10", "1.1.15", "1.2.2", "1.8.5", "2.0.1", "2.4.3",
+        ] {
+            for (base, odd) in [("\r\n", "\n"), ("\n", "\r\n")] {
+                let original = mixed_endings(&fixture(version), base, odd);
+                assert!(count_breaks(&original, odd) > 0);
+                for (kind, source) in [("file", path), ("url", URL)] {
+                    if version == "0.12.17" && kind == "url" {
+                        continue;
+                    }
+                    let rewrite = rewrite_poetry_lock_with_edits(
+                        &original,
+                        "urllib3",
+                        "1.26.18",
+                        kind,
+                        source,
+                        WHEEL,
+                        &sha(),
+                    )
+                    .unwrap()
+                    .unwrap();
+                    assert_eq!(
+                        count_breaks(&rewrite.text, odd),
+                        0,
+                        "{version} {kind} base {base:?}: {:?}",
+                        rewrite.text
+                    );
+                    let edits = rewrite.edits().unwrap();
+                    assert_eq!(
+                        edits,
+                        poetry_lock_edits(&original, &rewrite.text, "urllib3").unwrap()
+                    );
+                    let mut reverted = rewrite.text.clone();
+                    for (before, after) in edits.into_iter().rev() {
+                        reverted = reverted.replacen(&after, &before, 1);
+                    }
+                    assert_eq!(reverted, original, "{version} {kind}");
+                }
+            }
+        }
+    }
+
+    /// #694: the shared pairing refuses fragments that changed shape.
+    #[test]
+    fn pairing_refuses_a_fragment_shape_change() {
+        let original = fixture("1.2.2");
+        let before = poetry_lock_fragments(&original, "urllib3").unwrap();
+        assert_eq!(before.len(), 2);
+        assert_eq!(
+            pair_fragments(
+                "Poetry",
+                &original,
+                &before,
+                &original,
+                before[..1].to_vec()
+            ),
+            Err("Poetry package fragments changed shape".to_string())
+        );
     }
 
     /// A user-editable lock with a malformed integrity table must be refused,

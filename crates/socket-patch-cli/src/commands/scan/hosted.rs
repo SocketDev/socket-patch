@@ -1714,14 +1714,21 @@ async fn vendored_takeover(
         None
     };
     // The takeover refusal (if any) for one candidate: bun gates every
-    // npm purl, berry and vlt only their own vendored entries. Berry also
-    // runs the rewriter's per-dep grant gate (a grant without the berry
-    // cache checksum is skipped by the rewriter, so reverting first would
-    // leave the package in neither mode). A refused purl is never
+    // npm purl, berry and vlt only their own vendored entries, and a
+    // requirements.txt entry is gated on the hosted rewriter's reach (it
+    // pins only the root file, #699). Berry also runs the rewriter's
+    // per-dep grant gate (a grant without the berry cache checksum is
+    // skipped by the rewriter, so reverting first would leave the package
+    // in neither mode). A refused purl is never
     // dispatched (see the loop), so its wiring is not a write target here.
     let takeover_refusal = |c: &Candidate,
                             entry: Option<&socket_patch_core::vendor::VendorEntry>|
      -> Option<socket_patch_core::patch::redirect::RewriteWarning> {
+        if c.purl.starts_with("pkg:pypi/") {
+            return entry.and_then(|e| {
+                socket_patch_core::patch::redirect::preflight_requirements_takeover(e).err()
+            });
+        }
         if !c.purl.starts_with("pkg:npm/") {
             return None;
         }
@@ -2214,6 +2221,11 @@ fn describe_skip_reason(reason: &str) -> String {
         }
         "redirect_vlt_lock_unsupported" => {
             "vlt-lock.json blocks the vendored-to-hosted migration (see the warning)".into()
+        }
+        "redirect_requirements_takeover_unreachable" => {
+            "hosted mode cannot pin it where vendored mode wired it, so it stays vendored \
+             (see the warning)"
+                .into()
         }
         "redirect_vlt_artifact_unverifiable" => {
             "vlt could not verify the hosted artifact (see the warning)".into()
@@ -3929,6 +3941,11 @@ mod tests {
         assert_eq!(
             describe_skip_reason("redirect_vlt_lock_unsupported"),
             "vlt-lock.json blocks the vendored-to-hosted migration (see the warning)"
+        );
+        assert_eq!(
+            describe_skip_reason("redirect_requirements_takeover_unreachable"),
+            "hosted mode cannot pin it where vendored mode wired it, so it stays vendored \
+             (see the warning)"
         );
         assert_eq!(describe_skip_reason("mystery"), "server status `mystery`");
         for code in [

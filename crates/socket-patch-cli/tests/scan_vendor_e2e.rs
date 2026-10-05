@@ -1024,20 +1024,15 @@ async fn scan_vendor_resolves_percent_encoded_scoped_purl() {
 // ───────────────────── prune reconciles vendored state ─────────────────────
 
 /// After a dependency is removed and re-locked, `scan --prune` (without
-/// `--vendor`) honors the drift-keep contract, then completes the reclaim
-/// once the drift is undone:
+/// `--vendor`) reclaims its vendored entry in one run (#665):
 ///
-/// 1. The wired lock entry VANISHED (an uninstall is one drift flavor —
-///    the live lock no longer matches anything the wiring recorded), so
-///    the backend revert keeps the artifacts (`RevertOutcome::
-///    kept_artifact`) and the GC must keep the ledger entry too — pruning
-///    it would let the orphan sweep destroy the kept artifacts (with the
-///    recorded pre-vendor originals, the state a later `git checkout` of
-///    the vendored lock still points at).
-/// 2. Undoing the drift (restoring the pre-vendor registry lock — the
-///    keep warning's documented remediation) converges every recorded
-///    fragment, and the same prune then reverts fully: ledger entry
-///    dropped, artifact dir removed, lock untouched.
+/// 1. The wired lock entry VANISHED (`npm uninstall`). That is not drift:
+///    nothing in the lock resolves through the artifact any more, so the
+///    backend revert removes it and the GC drops the ledger entry, leaving
+///    the user's re-locked lock byte-identical. (Before #665 the vanished
+///    entry was drift-kept forever and the `scan --prune` remedy the
+///    vendored rescan prints never converged.)
+/// 2. A second prune is a no-op.
 ///
 /// Every vendored entry is ledger-owned (`detached`), and the lockfile-
 /// usage leg of the GC judges entries by the LIVE lock, so being detached
@@ -1048,7 +1043,6 @@ async fn scan_prune_reverts_unused_vendored_entry() {
     mount_patch_api(&mock, UUID).await;
     let tmp = tempfile::tempdir().unwrap();
     write_fixture(tmp.path());
-    let original_lock = std::fs::read(tmp.path().join("package-lock.json")).unwrap();
 
     // A second installed package so the later prune run's crawl is
     // non-empty (left-pad itself gets removed below).
@@ -1108,43 +1102,17 @@ async fn scan_prune_reverts_unused_vendored_entry() {
         serde_json::from_str::<serde_json::Value>(stdout.trim()).expect("valid JSON")
     };
 
-    // 1. Drifted (vanished) lock entry: everything is KEPT — nothing may
-    //    be reported reverted, and the artifacts must survive the sweep.
-    let v = run_prune();
-    assert_eq!(
-        v["gc"]["revertedVendoredEntries"],
-        serde_json::json!([]),
-        "a drift-kept entry must not be reported reverted: {v}"
-    );
-    let state: serde_json::Value = serde_json::from_str(
-        &std::fs::read_to_string(tmp.path().join(".socket/vendor/state.json")).unwrap(),
-    )
-    .unwrap();
-    assert!(
-        state["entries"][PURL].is_object(),
-        "ledger entry must be kept: {state}"
-    );
-    assert!(
-        tmp.path()
-            .join(format!(".socket/vendor/npm/{UUID}"))
-            .exists(),
-        "kept artifacts must survive the orphan sweep"
-    );
-    // The (already left-pad-free) lock stays exactly as the user re-locked
-    // it — the keep never edits a lock it refused to own.
-    assert_eq!(
-        std::fs::read(tmp.path().join("package-lock.json")).unwrap(),
-        lock_bytes
-    );
-
-    // 2. Undo the drift: restore the pre-vendor registry lock, so every
-    //    recorded fragment is converged. The same prune now reclaims fully.
-    std::fs::write(tmp.path().join("package-lock.json"), &original_lock).unwrap();
+    // 1. Vanished lock entry: reverted in one run.
     let v = run_prune();
     assert_eq!(
         v["gc"]["revertedVendoredEntries"],
         serde_json::json!([PURL]),
         "gc must report the reverted entry: {v}"
+    );
+    assert_eq!(
+        v["gc"]["keptVendoredEntries"],
+        serde_json::json!([]),
+        "nothing resolves through the artifact, so nothing is kept: {v}"
     );
 
     // Ledger empty (an emptied state file is removed outright), artifact
@@ -1166,11 +1134,22 @@ async fn scan_prune_reverts_unused_vendored_entry() {
             .exists(),
         "artifact dir removed"
     );
-    // The converged revert restores nothing (the lock already equals every
-    // recorded original), so the restored lock survives byte-for-byte.
+    // The user's re-locked lock is left exactly as they wrote it.
     assert_eq!(
         std::fs::read(tmp.path().join("package-lock.json")).unwrap(),
-        original_lock
+        lock_bytes
+    );
+
+    // 2. Nothing left to reclaim.
+    let v = run_prune();
+    assert_eq!(
+        v["gc"]["revertedVendoredEntries"],
+        serde_json::json!([]),
+        "{v}"
+    );
+    assert_eq!(
+        std::fs::read(tmp.path().join("package-lock.json")).unwrap(),
+        lock_bytes
     );
 }
 
@@ -1288,26 +1267,7 @@ async fn scan_vendor_prune_reconciles_unwired_entry_on_an_empty_crawl() {
     assert_eq!(v["scannedPackages"], 0, "envelope={v}");
     assert_eq!(unwired(&v), 1, "envelope={v}");
     assert!(v.get("gc").is_none(), "no --prune, no GC: {v}");
-
-    let (code, stdout, stderr) = run_scan_vendor(tmp.path(), &mock.uri(), &["--prune"]);
-    assert_eq!(code, 0, "stdout={stdout}; stderr={stderr}");
-    let v: serde_json::Value = serde_json::from_str(stdout.trim()).expect("valid JSON");
-    assert_eq!(unwired(&v), 0, "the pruning run reconciles instead: {v}");
-    // npm re-locked the entry away, so the wet revert drift-keeps it (see
-    // `scan_prune_reverts_unused_vendored_entry`): the point here is that
-    // the vendored GC ran at all on an empty crawl.
-    assert_eq!(
-        v["gc"]["keptVendoredEntries"],
-        serde_json::json!([PURL]),
-        "envelope={v}"
-    );
-
-    // The drift-kept entry is still unwired, so the next plain rescan warns
-    // again; its detail names the purl and the prune's `GC: kept` report
-    // instead of a lock edit that could unwire other vendored entries.
-    let (code, stdout, stderr) = run_scan_vendor(tmp.path(), &mock.uri(), &[]);
-    assert_eq!(code, 0, "stdout={stdout}; stderr={stderr}");
-    let v: serde_json::Value = serde_json::from_str(stdout.trim()).expect("valid JSON");
+    // The detail names the purl and the prune that reverts it.
     let detail = v["warnings"]
         .as_array()
         .into_iter()
@@ -1317,9 +1277,33 @@ async fn scan_vendor_prune_reconciles_unwired_entry_on_an_empty_crawl() {
         .unwrap_or_else(|| panic!("envelope={v}"))
         .to_string();
     assert!(
-        detail.contains(&format!("({PURL})")) && detail.contains("`GC: kept`"),
+        detail.contains(&format!("({PURL})")) && detail.contains("scan --prune"),
         "{detail}"
     );
+
+    let (code, stdout, stderr) = run_scan_vendor(tmp.path(), &mock.uri(), &["--prune"]);
+    assert_eq!(code, 0, "stdout={stdout}; stderr={stderr}");
+    let v: serde_json::Value = serde_json::from_str(stdout.trim()).expect("valid JSON");
+    assert_eq!(unwired(&v), 0, "the pruning run reconciles instead: {v}");
+    // The vendored GC ran on an empty crawl, and since npm re-locked the
+    // entry away (nothing resolves through the artifact) it reverts it
+    // (#665; see `scan_prune_reverts_unused_vendored_entry`).
+    assert_eq!(
+        v["gc"]["revertedVendoredEntries"],
+        serde_json::json!([PURL]),
+        "envelope={v}"
+    );
+    assert_eq!(
+        v["gc"]["keptVendoredEntries"],
+        serde_json::json!([]),
+        "envelope={v}"
+    );
+
+    // Reconciled: the next plain rescan has nothing left to warn about.
+    let (code, stdout, stderr) = run_scan_vendor(tmp.path(), &mock.uri(), &[]);
+    assert_eq!(code, 0, "stdout={stdout}; stderr={stderr}");
+    let v: serde_json::Value = serde_json::from_str(stdout.trim()).expect("valid JSON");
+    assert_eq!(unwired(&v), 0, "envelope={v}");
 }
 
 /// Interactive (non-JSON) `scan --vendor` pre-verifies patch baselines:
