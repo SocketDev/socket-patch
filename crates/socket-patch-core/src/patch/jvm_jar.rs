@@ -105,7 +105,9 @@ pub fn verify_member_bytes(
             let member = normalize_file_path(key);
             let content = archive.as_mut().and_then(|a| {
                 let mut entry = a.by_name(member).ok()?;
-                let mut buf = Vec::with_capacity(entry.size() as usize);
+                // Not `with_capacity(entry.size())`: the size is the jar's own claim,
+                // and a crafted one would abort the allocation.
+                let mut buf = Vec::new();
                 entry.read_to_end(&mut buf).ok()?;
                 Some(buf)
             });
