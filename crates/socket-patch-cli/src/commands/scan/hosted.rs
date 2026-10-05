@@ -192,12 +192,14 @@ struct StaleInstallOutcome {
 /// behind silently reinstates the stale bytes) — while a SHARED gem-env
 /// home affects every project on the machine, so that flavor prefers moving
 /// the project to a local bundle path and only conditionally names the
-/// shared files.
+/// shared files. `project_local` is the caller's call: under the project
+/// root, or under the project's own `.bundle/config` path even when that
+/// path sits outside the tree (#709).
 fn gem_stale_install_warning(
     purl: &str,
     gem_dir: &Path,
     leaf: &str,
-    cwd: &Path,
+    project_local: bool,
     project_cache_gem: Option<&Path>,
 ) -> serde_json::Value {
     let home = gem_dir
@@ -215,7 +217,7 @@ fn gem_stale_install_warning(
         paths.push(extra.display().to_string());
     }
     let list = paths.join(", ");
-    let detail = if gem_dir.starts_with(cwd) {
+    let detail = if project_local {
         format!(
             "{purl} was switched to its hosted patch, but a stale \
              UNPATCHED install is already materialized at {} — `bundle install` \
@@ -293,7 +295,9 @@ async fn installed_stale_positive_evidence(
 /// * Discovery is [`socket_patch_core::crawlers::RubyCrawler`] — the same
 ///   installed-gem APIs `apply` uses, honoring `--global`/`--global-prefix`
 ///   exactly like scan's own discovery; layouts the crawler grows into are
-///   covered automatically.
+///   covered automatically. A `.bundle/config` path the containment guard
+///   refuses as a write root is still READ here
+///   (`verification_only_gem_paths`): bundler installs into it.
 /// * Records are found BY UUID (the fetch key, stable across purl
 ///   spellings): this run's fetched records first, then the redirect
 ///   ledger's persisted ones — a re-scan whose `/patches/view` fetch failed
@@ -364,7 +368,17 @@ async fn gem_stale_install_warnings(
         global,
         global_prefix,
     };
-    let gem_paths = crawler.get_gem_paths(&options).await.unwrap_or_default();
+    let mut gem_paths = crawler.get_gem_paths(&options).await.unwrap_or_default();
+    // A `.bundle/config` path outside the project is refused as a write
+    // root, yet bundler installs into and loads from it: read it too, or a
+    // stale materialization there never warns (#709). It is this project's
+    // own bundle path, so it takes the project-local remedy.
+    let config_stores = crawler.verification_only_gem_paths(&options).await;
+    for gems_dir in &config_stores {
+        if !gem_paths.contains(gems_dir) {
+            gem_paths.push(gems_dir.clone());
+        }
+    }
     // Every candidate's installed dir in every gem home, one blocking pass
     // (and at most one listing) per home — the per-candidate lookups the
     // loop below consumes, in the same (candidate, home) order.
@@ -419,8 +433,10 @@ async fn gem_stale_install_warnings(
         if j.patched || !j.positive {
             continue;
         }
+        let project_local =
+            dir.starts_with(cwd) || config_stores.iter().any(|store| dir.starts_with(store));
         let mut folded_cache: Option<std::path::PathBuf> = None;
-        if dir.starts_with(cwd) {
+        if project_local {
             let project_cache = app_cache.join(format!("{}.gem", j.leaf));
             if project_cache.is_file() {
                 let proven_patched = match (
@@ -446,7 +462,7 @@ async fn gem_stale_install_warnings(
             &j.purl,
             dir,
             &j.leaf,
-            cwd,
+            project_local,
             folded_cache.as_deref(),
         ));
         out.stale_purls.insert(j.purl.clone());
@@ -3291,7 +3307,13 @@ mod tests {
         let cwd = PathBuf::from("proj");
         let home = gem_home(&cwd);
         let gem_dir = home.join("gems").join(GEM_LEAF);
-        let w = gem_stale_install_warning(GEM_PURL, &gem_dir, GEM_LEAF, &cwd, None);
+        let w = gem_stale_install_warning(
+            GEM_PURL,
+            &gem_dir,
+            GEM_LEAF,
+            gem_dir.starts_with(&cwd),
+            None,
+        );
         let detail = detail_of(&w);
         assert!(detail.contains(GEM_PURL), "{detail}");
         assert!(detail.contains(&gem_dir.display().to_string()), "{detail}");
@@ -3326,7 +3348,13 @@ mod tests {
         let cwd = PathBuf::from("proj");
         let home = PathBuf::from("shared-gem-home").join("ruby").join("3.3.0");
         let gem_dir = home.join("gems").join(GEM_LEAF);
-        let w = gem_stale_install_warning(GEM_PURL, &gem_dir, GEM_LEAF, &cwd, None);
+        let w = gem_stale_install_warning(
+            GEM_PURL,
+            &gem_dir,
+            GEM_LEAF,
+            gem_dir.starts_with(&cwd),
+            None,
+        );
         let detail = detail_of(&w);
         assert!(detail.contains("shared gem home"), "{detail}");
         assert!(
@@ -3356,7 +3384,13 @@ mod tests {
             .join("vendor")
             .join("cache")
             .join(format!("{GEM_LEAF}.gem"));
-        let w = gem_stale_install_warning(GEM_PURL, &gem_dir, GEM_LEAF, &cwd, Some(&committed));
+        let w = gem_stale_install_warning(
+            GEM_PURL,
+            &gem_dir,
+            GEM_LEAF,
+            gem_dir.starts_with(&cwd),
+            Some(&committed),
+        );
         let detail = detail_of(&w);
         assert!(
             detail.contains(&committed.display().to_string()),
@@ -3482,6 +3516,57 @@ mod tests {
         let npm_confirmed = vec![("pkg:npm/x@1.0.0".to_string(), GEM_UUID.to_string())];
         let out = probe(stale.path(), &npm_confirmed, &records).await;
         assert!(out.warnings.is_empty());
+    }
+
+    /// #709: a `.bundle/config` `path` outside the project is refused as an
+    /// install (write) root, but bundler still installs into and loads
+    /// from it — so the probe must read it, or a stale materialization
+    /// there never warns and the purl stays in the same-run `--vex`
+    /// `assume_applied` set.
+    #[tokio::test]
+    async fn gem_stale_probe_reads_refused_out_of_tree_config_path() {
+        let proj = tempfile::tempdir().unwrap();
+        let outside = tempfile::tempdir().unwrap();
+        std::fs::write(proj.path().join("Gemfile"), b"gem \"stale-unit\"\n").unwrap();
+        std::fs::create_dir_all(proj.path().join(".bundle")).unwrap();
+        std::fs::write(
+            proj.path().join(".bundle").join("config"),
+            format!("---\nBUNDLE_PATH: \"{}\"\n", outside.path().display()),
+        )
+        .unwrap();
+        // Bundler's scoped layout under the configured root.
+        let gem_dir = outside
+            .path()
+            .join("ruby")
+            .join("3.3.0")
+            .join("gems")
+            .join(GEM_LEAF);
+        std::fs::create_dir_all(gem_dir.join("lib")).unwrap();
+        std::fs::write(gem_dir.join("lib").join("stale_unit.rb"), GEM_UPSTREAM).unwrap();
+
+        let out = probe(proj.path(), &one_confirmed(), &one_record()).await;
+        assert_eq!(out.warnings.len(), 1, "{:?}", out.warnings);
+        let detail = detail_of(&out.warnings[0]);
+        assert!(detail.contains(&gem_dir.display().to_string()), "{detail}");
+        // The project's own bundle path, not a machine-wide gem home: the
+        // verified delete-list remedy, not the shared-home caveat.
+        assert!(detail.contains("Remove the stale"), "{detail}");
+        assert!(!detail.contains("shared gem home"), "{detail}");
+        assert_eq!(
+            out.stale_purls,
+            std::collections::BTreeSet::from([GEM_PURL.to_string()])
+        );
+        // Read-only: the refused root is never written.
+        assert_eq!(
+            std::fs::read(gem_dir.join("lib").join("stale_unit.rb")).unwrap(),
+            GEM_UPSTREAM
+        );
+
+        // A patched materialization there stays quiet.
+        std::fs::write(gem_dir.join("lib").join("stale_unit.rb"), GEM_PATCHED).unwrap();
+        let out = probe(proj.path(), &one_confirmed(), &one_record()).await;
+        assert!(out.warnings.is_empty(), "{:?}", out.warnings);
+        assert!(out.stale_purls.is_empty());
     }
 
     /// FALSE-POSITIVE hardening: an install whose record file is MISSING
