@@ -28,3 +28,63 @@ pub use pkg_managers::{detect_npm_pkg_manager, NpmPkgManager};
 pub use python_crawler::PythonCrawler;
 pub use ruby_crawler::RubyCrawler;
 pub use types::*;
+
+/// ARCHITECTURE GUARD (#592): crawlers read project-tree files only through
+/// the FIFO-safe `utils::fs::read_regular_*` readers, so a FIFO planted in a
+/// checkout can never wedge `scan`, `get` or `apply` in open(2).
+#[cfg(test)]
+mod architecture_tests {
+    use std::path::Path;
+
+    const BARE_READS: [&str; 3] = ["fs::read_to_string(", "fs::read(", "File::open("];
+
+    /// Reads of the machine-wide Maven repository (not the project tree),
+    /// out of scope for #592: file name and number of allowed bare reads.
+    const ALLOWED: [(&str, usize); 1] = [("maven_crawler.rs", 2)];
+
+    #[test]
+    fn crawlers_read_project_files_fifo_safely() {
+        let dir = Path::new(env!("CARGO_MANIFEST_DIR")).join("src/crawlers");
+        let mut checked = 0;
+        for entry in std::fs::read_dir(&dir).expect("read crawlers dir") {
+            let path = entry.expect("dir entry").path();
+            if path.extension().is_none_or(|e| e != "rs") {
+                continue;
+            }
+            let name = path.file_name().unwrap().to_string_lossy().into_owned();
+            // A Windows (core.autocrlf) checkout has CRLF lines; normalize so
+            // the `\n`-joined test-module markers below still match.
+            let src = std::fs::read_to_string(&path)
+                .expect("read crawler source")
+                .replace("\r\n", "\n");
+            // Production code ends at the first in-file test module
+            // (`mod tests`, or this guard in `mod.rs`); earlier
+            // `#[cfg(test)] mod oracle;` declarations are only one line.
+            let prod_end = [
+                "#[cfg(test)]\nmod tests",
+                "#[cfg(test)]\nmod architecture_tests",
+            ]
+            .iter()
+            .filter_map(|marker| src.find(marker))
+            .min()
+            .unwrap_or(src.len());
+            let prod = &src[..prod_end];
+            let bare = prod
+                .lines()
+                .filter(|l| !l.trim_start().starts_with("//"))
+                .filter(|l| BARE_READS.iter().any(|r| l.contains(r)))
+                .count();
+            let allowed = ALLOWED
+                .iter()
+                .find(|(file, _)| *file == name)
+                .map_or(0, |(_, n)| *n);
+            assert_eq!(
+                bare, allowed,
+                "{name} has {bare} bare file reads in production code (allowed {allowed}); \
+                 use utils::fs::read_regular_to_string{{,_sync}} instead"
+            );
+            checked += 1;
+        }
+        assert!(checked >= 10, "only {checked} crawler files found");
+    }
+}

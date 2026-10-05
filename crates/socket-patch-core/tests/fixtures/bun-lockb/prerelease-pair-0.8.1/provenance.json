@@ -1,0 +1,7 @@
+{
+  "bun": "0.8.1",
+  "os": "linux",
+  "arch": "x64",
+  "command": "bun install --ignore-scripts",
+  "sha256": "8a76190c46f43d29ae3e1aa8c0474854d6b599a7acee39f51075be38cb4a432f"
+}

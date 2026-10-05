@@ -47,7 +47,12 @@ import on modern Pythons); 2018–2022 on Python 3.8; 2023+ on Python 3.12.
   (`redirect_pypi_stale_install` / `pypi_pipenv_stale_install`) while a
   venv still holds the upstream release. Verified remedies (Pipfile
   byte-untouched): `pipenv run pip uninstall -y <pkg> && pipenv sync`, or
-  `pipenv --rm && pipenv sync`. `pipenv uninstall <pkg>` is **not** a remedy:
+  `pipenv --rm && pipenv sync`, for a `default` package. Plain `pipenv sync`
+  installs only `default`, so the printed `sync` arguments follow the lock:
+  `--dev` when the package is pinned in `develop`, and
+  `--categories "<names>"` (Pipfile names: `packages`, `dev-packages`,
+  `<category>`) when it is pinned in a named category. The `--rm` form
+  re-syncs every non-empty category (#790). `pipenv uninstall <pkg>` is **not** a remedy:
   it rewrites the Pipfile and re-locks the patch away. `PIP_FORCE_REINSTALL=1
   pipenv sync` works on 2018 but is ignored by 2026.
 - **Relocking drops the reference.** `pipenv lock` (and `update`, and

@@ -397,3 +397,176 @@ fn apply_and_rollback_reach_both_transitive_only_vlt_store_copies() {
     assert_eq!(v["alreadyOriginal"], 1, "envelope={v}");
     assert_vlt_copies([&primary, &twin], false, "after rollback");
 }
+
+/// #601: a copy bundled inside ANOTHER package's vlt or pnpm store entry
+/// (`.vlt/~npm~bundler@1.0.0/node_modules/bundler/node_modules/dupvuln`)
+/// is what that package loads, so apply must patch it even when the same
+/// `name@version` is also installed normally, and rollback must restore
+/// it. Before the fix only the normal copy was patched.
+#[cfg(unix)]
+#[test]
+fn apply_and_rollback_reach_a_bundled_copy_beside_a_normal_install() {
+    for (store, normal_id, host_id) in [
+        (".vlt", "~npm~dupvuln@1.0.0", "~npm~bundler@1.0.0"),
+        (".pnpm", "dupvuln@1.0.0", "bundler@1.0.0"),
+    ] {
+        let tmp = tempfile::tempdir().unwrap();
+        let root = tmp.path();
+        let name = "dupvuln";
+        let original = b"module.exports = function(){ return 'VULNERABLE'; };\n";
+        let mut patched = original.to_vec();
+        patched.extend_from_slice(b"// SOCKET-PATCHED-MULTICOPY\n");
+        std::fs::write(
+            root.join("package.json"),
+            r#"{ "name": "bundled-root", "version": "0.0.0" }"#,
+        )
+        .unwrap();
+        let nm = root.join("node_modules");
+        let store_dir = nm.join(store);
+        let normal = write_copy(
+            &store_dir.join(normal_id).join("node_modules").join(name),
+            name,
+            "1.0.0",
+            original,
+        );
+        let host = store_dir.join(host_id).join("node_modules").join("bundler");
+        write_copy(
+            &host,
+            "bundler",
+            "1.0.0",
+            b"module.exports = require('dupvuln');\n",
+        );
+        let bundled = write_copy(
+            &host.join("node_modules").join(name),
+            name,
+            "1.0.0",
+            original,
+        );
+        std::os::unix::fs::symlink(
+            store_dir.join(normal_id).join("node_modules").join(name),
+            nm.join(name),
+        )
+        .unwrap();
+        std::os::unix::fs::symlink(&host, nm.join("bundler")).unwrap();
+        stage_manifest_and_blob(
+            root,
+            "pkg:npm/dupvuln@1.0.0",
+            &git_sha256(original),
+            &git_sha256(&patched),
+            &patched,
+        );
+        std::fs::write(
+            root.join(".socket")
+                .join("blobs")
+                .join(git_sha256(original)),
+            original,
+        )
+        .unwrap();
+
+        let (code, v) = run_apply(root);
+        assert_eq!(code, 0, "{store}: apply must succeed; envelope={v}");
+        assert_eq!(v["status"], "success", "{store}: envelope={v}");
+        assert_vlt_copies([&normal, &bundled], true, &format!("{store} after apply"));
+
+        let (code, v) = run_rollback(root);
+        assert_eq!(code, 0, "{store}: rollback must succeed; envelope={v}");
+        assert_vlt_copies(
+            [&normal, &bundled],
+            false,
+            &format!("{store} after rollback"),
+        );
+    }
+}
+
+/// #626: a `node_modules/<name>` link to first-party source (an npm
+/// workspace member, which a `file:` directory dependency lays out the
+/// same way) that shares a patched package's `name@version` is the user's
+/// own code, not an installed copy. Agent-mode apply (dry run included)
+/// and rollback refuse it with a diagnostic and never overwrite the fork,
+/// even though the default mismatch policy would otherwise replace it.
+#[cfg(unix)]
+#[test]
+fn apply_and_rollback_refuse_a_node_modules_link_to_first_party_source() {
+    let tmp = tempfile::tempdir().unwrap();
+    let root = tmp.path();
+    let name = "dupvuln";
+    let original = b"module.exports = function(){ return 'VULNERABLE'; };\n";
+    let mut patched = original.to_vec();
+    patched.extend_from_slice(b"// SOCKET-PATCHED-MULTICOPY\n");
+    std::fs::write(
+        root.join("package.json"),
+        r#"{ "name": "ws-root", "version": "0.0.0", "private": true, "workspaces": ["packages/*"] }"#,
+    )
+    .unwrap();
+    let fork = b"module.exports = 'first-party fork';\n";
+    let fork_index = write_copy(&root.join("packages").join(name), name, "1.0.0", fork);
+    std::fs::create_dir_all(root.join("node_modules")).unwrap();
+    std::os::unix::fs::symlink(
+        format!("../packages/{name}"),
+        root.join("node_modules").join(name),
+    )
+    .unwrap();
+    stage_manifest_and_blob(
+        root,
+        "pkg:npm/dupvuln@1.0.0",
+        &git_sha256(original),
+        &git_sha256(&patched),
+        &patched,
+    );
+    std::fs::write(
+        root.join(".socket")
+            .join("blobs")
+            .join(git_sha256(original)),
+        original,
+    )
+    .unwrap();
+
+    let assert_refused = |code: i32, v: &serde_json::Value, stage: &str| {
+        assert_ne!(code, 0, "{stage}: must fail closed; envelope={v}");
+        assert!(
+            v.to_string().contains("outside every node_modules tree"),
+            "{stage}: the refusal must name the cause; envelope={v}"
+        );
+        assert_eq!(
+            std::fs::read(&fork_index).unwrap(),
+            fork,
+            "{stage}: the first-party fork was overwritten"
+        );
+    };
+
+    let out = Command::new(binary())
+        .args([
+            "apply",
+            "--json",
+            "--offline",
+            "--dry-run",
+            "--ecosystems",
+            "npm",
+            "--cwd",
+        ])
+        .arg(root)
+        .output()
+        .expect("run apply --dry-run");
+    let stdout = String::from_utf8_lossy(&out.stdout).to_string();
+    let v: serde_json::Value = serde_json::from_str(stdout.trim())
+        .unwrap_or_else(|e| panic!("apply must emit JSON: {e}; stdout={stdout}"));
+    assert_refused(out.status.code().unwrap_or(-1), &v, "apply --dry-run");
+
+    let (code, v) = run_apply(root);
+    assert_refused(code, &v, "apply");
+
+    // A fork left patched by an apply from before the guard: rollback must
+    // not write the upstream original over it either.
+    std::fs::write(&fork_index, &patched).unwrap();
+    let (code, v) = run_rollback(root);
+    assert_ne!(code, 0, "rollback must fail closed; envelope={v}");
+    assert!(
+        v.to_string().contains("outside every node_modules tree"),
+        "rollback: envelope={v}"
+    );
+    assert_eq!(
+        std::fs::read(&fork_index).unwrap(),
+        patched,
+        "rollback wrote through the link"
+    );
+}
