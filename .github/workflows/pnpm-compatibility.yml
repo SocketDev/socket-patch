@@ -28,6 +28,13 @@ on:
 permissions:
   contents: read
 
+# A newer push to the same PR supersedes the older run. Every other event
+# gets its own group (run_id), so no main push is cancelled, even while
+# pending behind another.
+concurrency:
+  group: pnpm-compat-${{ github.event.pull_request.number || github.run_id }}
+  cancel-in-progress: ${{ github.event_name == 'pull_request' }}
+
 jobs:
   build:
     runs-on: ubuntu-latest
