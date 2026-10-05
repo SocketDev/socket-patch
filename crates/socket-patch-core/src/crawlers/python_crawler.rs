@@ -336,7 +336,9 @@ async fn find_site_packages_under(
 /// 4. `.venv` directory in `cwd`
 /// 5. `venv` directory in `cwd` (a PDM project with neither: PEP 582)
 /// 6. Hatch's out-of-tree envs for the project (see
-///    [`super::hatch_env::hatch_environments`]), added to 4/5
+///    [`super::hatch_env::hatch_environments`]), added to whichever of the
+///    above answered: `hatch run` never uses an env another manager
+///    records or activates, so its envs stay the project's (#335)
 pub async fn find_local_venv_site_packages(cwd: &Path) -> Vec<PathBuf> {
     let var = |name: &str| std::env::var(name).ok();
     find_local_venv_site_packages_with(cwd, &var).await
@@ -348,15 +350,22 @@ async fn find_local_venv_site_packages_with(
     cwd: &Path,
     var: &impl Fn(&str) -> Option<String>,
 ) -> Vec<PathBuf> {
+    let mut found = managed_or_local_site_packages(cwd, var).await;
+    add_hatch_site_packages(cwd, var, &mut found).await;
+    found
+}
+
+/// Steps 0-5 of [`find_local_venv_site_packages`]: the env a package
+/// manager records or activates, else the project's local venvs.
+async fn managed_or_local_site_packages(
+    cwd: &Path,
+    var: &impl Fn(&str) -> Option<String>,
+) -> Vec<PathBuf> {
     let mut results = Vec::new();
 
     // 0. PDM and uv record where they install a project, and that record
     // beats both an activated `VIRTUAL_ENV` and a `./.venv` they don't use.
-    if let Some(mut found) = package_manager_recorded_site_packages(cwd, var).await {
-        // Hatch never installs into the env PDM or uv records (a Hatch
-        // project's pyproject alone reads as a uv project): its own envs
-        // stay the project's (#335).
-        add_hatch_site_packages(cwd, var, &mut found).await;
+    if let Some(found) = package_manager_recorded_site_packages(cwd, var).await {
         return found;
     }
 
@@ -384,12 +393,8 @@ async fn find_local_venv_site_packages_with(
             None
         };
         if let Some(prefix) = active_prefix {
-            let mut found = find_site_packages_under(Path::new(&prefix), "site-packages").await;
+            let found = find_site_packages_under(Path::new(&prefix), "site-packages").await;
             if !found.is_empty() {
-                // `hatch run` / `hatch shell` never use an activated venv
-                // that is not one of Hatch's own (#335): its envs stay the
-                // project's.
-                add_hatch_site_packages(cwd, var, &mut found).await;
                 return found;
             }
         }
@@ -417,11 +422,6 @@ async fn find_local_venv_site_packages_with(
     if results.is_empty() && pdm_drives_project(cwd).await {
         results = pdm_pep582_dirs(cwd).await;
     }
-
-    // 6. Hatch never installs into `./.venv` / `./venv`: `hatch run` uses
-    // its own out-of-tree envs (#335). Every existing one belongs to the
-    // project, next to whatever a generic probe found.
-    add_hatch_site_packages(cwd, var, &mut results).await;
 
     results
 }
@@ -3063,6 +3063,12 @@ mod tests {
         let found = find_local_venv_site_packages_with(&project, &uv_vars).await;
         assert_eq!(found.first(), Some(&uv_site), "{found:?}");
         assert!(found.iter().any(|s| sites.contains(s)), "{found:?}");
+
+        // Nor does Pipenv's own resolution (a `Pipfile` beside pyproject).
+        std::fs::write(project.join("Pipfile"), "[packages]\n").unwrap();
+        let found = find_local_venv_site_packages_with(&project, &var).await;
+        assert!(found.iter().any(|s| sites.contains(s)), "{found:?}");
+        std::fs::remove_file(project.join("Pipfile")).unwrap();
 
         // A `./.venv` beside them is kept too.
         let dot = fake_venv(&project, ".venv");
