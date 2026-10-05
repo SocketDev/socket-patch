@@ -1,5 +1,5 @@
 ### Refactor routine (`refactor`, hourly, highest leverage first)
-_Last updated 2026-10-05T20:10Z · main @ 9c43dfc_
+_Last updated 2026-10-05T22:05Z · main @ 9c43dfc_
 
 **In flight:**
 - [#876](https://github.com/SocketDev/socket-patch/pull/876): registry clients (`build_registry_client`, Maven `fetch_registry_bytes`) built through one `registry_client_builder` under `ApiTimeouts`; `registry_fetch::download` onto `read_capped`. Also ports the base-red digest-ratchet fix for #646's JVM files. Issue #872 (C49). `ready`.
@@ -17,13 +17,13 @@ _Last updated 2026-10-05T20:10Z · main @ 9c43dfc_
 
 | # | Candidate | B | U | D | R | Score | Note |
 |---|---|:-:|:-:|:-:|:-:|:-:|---|
-| 1 | #677 (C15 child 1): vendor retries onto `api::retry`'s `Retry-After` parser and seeded jitter | 0 | 1 | ≈2 | L | ≈4 | taken: #889 (fixes HTTP-date `Retry-After` on vendor calls) |
+| 1 | #893 (C50): `repair` and `scan --prune` keep active patches' beforeHash blobs through one retention policy | 1 | 0 | ≈1 | L | ≈4 | overlap-free (`cleanup_blobs.rs`); take when a slot frees unless the fixer claims it |
 | 2 | #773 (C44): one `Ecosystem::from_cli_name` for flag, env, socket.yml, vendor | 1 | 0 | ≈2 | L | ≈5 | skipped: `commands/vendor.rs` changed by #690, #776, #825, #837, #877 |
 | 3 | #856 (E62, child 1 of #855): VEX npm aliases through the core resolver | 1 | 1 | ≈1.8 | M | ≈5 | skipped: `vex_consumed.rs` changed by #690 |
 | 4 | #883 (E39 PyPI-name half): `canonicalize_pypi_name` + `pep508_name` into one PyPI name module | 0 | 1 | ≈3 | L | ≈5 | skipped: 13 of its files changed by #700, #724, #768, #825, #827, #877, #690 |
 | 5 | #871: vendoring-service client out of `api/client.rs` into its own submodule (move only) | 0 | 1 | ≈0.5 | L | ≈2.5 | eligible after #889 (same file); then #705 (C18, ≈2.4) |
 
-Re-ranked 2026-10-05T20:00Z: #773, #856, #883, #780 and #663 still overlap open PRs; #677 was the best overlap-free candidate (`api/client.rs` only) and is in #889. 3 of 3 slots used. Decisions (not candidates): #648, #704, #792, #808, #615; C07 needs an owner decision.
+Re-ranked 2026-10-05T22:05Z: no change on main; #773, #856, #883, #780, #663 and #895 (C12 child 1; `ecosystem_dispatch.rs`, #690) still overlap open PRs. 3 of 3 slots used (#876, #886, #889 all `ready`). Decisions (not candidates): #648, #704, #792, #808, #615; C07 needs an owner decision.
 
 **Notes:**
 - The sandbox runs as root, so 4 core lib tests fail on main and on branches alike: `copy_tree::relax_loop_must_not_traverse_symlinked_root`, `vlt_heal::an_unremovable_hidden_lock_keeps_every_store_entry`, `pypi_poetry::wire_write_failure_maps_error_and_leaves_lock_untouched`, `pypi_requirements::wire_failure_rolls_back_already_written_files`.
