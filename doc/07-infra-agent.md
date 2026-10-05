@@ -2,7 +2,7 @@
 
 ## Part 7: Core infrastructure and agent (in-place) mode
 
-_Last checked against main @ 045d7ec on 2026-10-04 by audit-core. Owner: audit-core._ Only the timeout, blob/diff body, zip-read, process-spawning, API-pacing, URL-builder, retry, batching, hashing, UUID, env/home-dir, atomic-write, purl, dead-code, telemetry, apply/rollback-engine, diff-download, `apply.lock`, Maven-sidecar and group-commit-reader passages have been re-checked; the rest is as of `2463257`.
+_Last checked against main @ 045d7ec on 2026-10-05 by audit-core. Owner: audit-core._ Only the timeout, blob/diff body, zip-read, process-spawning, API-pacing, URL-builder, retry, batching, hashing, UUID, env/home-dir, atomic-write, purl, dead-code, telemetry, apply/rollback-engine, diff-download, `apply.lock`, Maven-sidecar, group-commit-reader and socket.yml passages have been re-checked; the rest is as of `2463257`.
 
 > Scope: `api/*`, `manifest/*`, `ledgers.rs`, `constants.rs`, `patch/` (excluding `redirect/`), `policy/*`, `rollout*`, `update/*`, the CLI `update_notifier.rs`/`update.rs`, `telemetry.rs`, and the generic `utils/*` and `hash/*`.
 
@@ -125,7 +125,7 @@ Agent mode writes no Maven sidecar, and needs none: Maven 3.9.11 doesn't verify 
 | **Telemetry** | 891 / 864 | 19 near-identical public wrappers (17 `track_*` + 2 `spawn_*`, ~450 lines); a new HTTP client per event; endpoint logic duplicated. The CLI passes token/org at ~45 call sites in 10 command files, plus 5 helper signatures (not 125), and resolves them two ways: `telemetry_credentials()` in `list`/`vex`, the API client's getters elsewhere. **Collapse to one `Telemetry` handle with `track(Event)` and a shared client** (~−300). {{C22}} |
 | **Failpoints** | 65 | Fine (compiled out of release). But `switched_off("group_commit")` keeps the *old non-group-commit path* alive as a test oracle. |
 | **group_commit + durability** | 1,376 / 1,287 | A process-wide virtual filesystem: every `utils::fs` read and write consults it. It renders typed values lazily via `Any`, does three-way hand-edit reconciliation in `recover`, and still journals `redirect-state.json`, which nothing writes. Writes that bypass `utils::fs` are silently not captured. High-cost machinery for a vendored-run speedup; see 5.7 for the root-cause fix. |
-| **socket.yml policy** | 1,942 / 2,211 | Real value. But `socket_yml.rs` builds its own YAML node tree on serde-saphyr's *event* parser (`:36-320`) to read **8 keys**, with edit-distance "did you mean" hints and repository-ownership trust checks. The `deserialize` feature is enabled, but nothing uses it through serde. **Replace with serde + `deny_unknown_fields`** plus a small strictness check (~−500). |
+| **socket.yml policy** | 1,942 / 2,211 | Real value. `socket_yml.rs` builds its own YAML node tree on serde-saphyr's *event* parser (`:36-320`, ~285 lines) to read **8 keys**. Re-checked on `045d7ec`: the tree is what implements the contract's validation rules (CLI_CONTRACT "Validation (fail closed)"): no alias expansion outside the keys read, anchors, aliases, merge keys and custom tags refused only inside `patches`/`projectIgnorePaths`, YAML 1.2 core-schema scalars (`enabled: yes` is an error), and per-key paths with did-you-mean hints. serde with `deny_unknown_fields` can't scope those refusals to one subtree of a file other Socket tools share, and the ~300 lines of validators would stay. Not a defect. {{C28}} |
 | **Rollout / `--max-new-patches`** | ~1,090 / ~2,640 | Pure planning, threaded through the hosted `Gate`, the agent stage and a cross-directory carry. The in-memory engine (PR bots) uses it. Keep it in socket.yml; consider dropping the flag and env layering. |
 | **socket-cli config reuse** | 232 / 1,022 | Cheap and valuable. Keep. |
 | **Legacy redirect ledger** | spread across vex, rollback, group_commit | Read-only since v5. Set a sunset date. |
@@ -149,7 +149,7 @@ Agent mode writes no Maven sidecar, and needs none: Maven 3.9.11 doesn't verify 
 
    Saves about −200.
 8. **Split `client.rs`** into client, vendor_service and credentials, and give it a single auth-vs-proxy URL policy.
-9. **Replace the hand-rolled socket.yml tree with serde:** −500.
+9. **Keep the socket.yml event tree:** on re-check it is the contract's validator, so serde would save little and lose the scoped refusals. {{C28}}
 10. **Re-scope self-update:** keep the notifier, consider dropping the binary swap.
 
 ### New findings since the review

@@ -2,7 +2,7 @@
 
 ## Part 8: Tests, CI, docs and distribution
 
-_Last checked against main @ 045d7ec on 2026-10-04 by audit-core. Owner: audit-core._ Only the repository-hygiene passages (stray `launch.json`, "DESIGN §" references) the contract's env-var tables and the `#[serial]` count have been re-checked; the rest is as of `2463257`.
+_Last checked against main @ 045d7ec on 2026-10-05 by audit-core. Owner: audit-core._ Only the repository-hygiene passages (stray `launch.json`, "DESIGN §" references), the contract's env-var tables, the `#[serial]` count and the duplicated-helper counts have been re-checked; the rest is as of `2463257`.
 
 > Scope: `crates/*/tests/**`, `tests/` (docker fixtures), `.github/workflows/*`, `.github/actions/*`, `scripts/`, `docs/`, `CLI_CONTRACT.md`, `CHANGELOG.md`, `npm/`, `crates/socket-patch-node/npm/`, and the Cargo profiles. CI timings come from the GitHub Actions run for `2463257` on `main`.
 
@@ -32,10 +32,10 @@ PR #277 has already started cleaning up: it deleted 237,608 lines, including 136
 **Duplicated helpers.**
 - `common/mod.rs` (792 lines) is `#[path]`-included and recompiled by ~60 binaries, and `vex_e2e_common` (876) by ~53. 34 helper files carry `#![allow(dead_code)]`.
 - Helpers that `common` already exports are redefined locally:
-  - `fn binary()` in **102 files** (6 variants);
-  - `fn git_sha256` in **84 files** (9 variants), although core exports `compute_git_sha256_from_bytes`;
+  - `fn binary()` in **103 files** (7 variants);
+  - `fn git_sha256` in **86 files** (10 variants), although `common::git_sha256` exists and core exports `compute_git_sha256_from_bytes`;
   - `copy_dir_recursive` in 26 files;
-  - `scrub_socket_env` in 15 files with **14 different bodies**, which directly undermines hermeticity.
+  - `scrub_socket_env` in 15 files with **14 different bodies**, which directly undermines hermeticity, and 10 more files spawn the binary with no scrub at all (see {{C47}}). {{C30}}
 - `vex_pdm_hatch_common` and `vex_pipenv_pip_common` share **977 identical non-blank lines** (78% similar).
 
 **Coverage-chasing tests.**
@@ -144,6 +144,7 @@ For `2463257` on `main`:
 
 ### New findings since the review
 
+- {{C47}} 10 test files spawn the CLI with no `SOCKET_*` scrub, beside the hermetic `common::run_bin_with_env`: on `045d7ec` an ambient `SOCKET_DRY_RUN=true` or `SOCKET_OFFLINE=true` turned 18 of the 19 `repair_vendor_e2e` tests red, while the scrubbed tests in the same target were unaffected.
 - {{C40}} Env vars that core reads directly have no documentation guard: `SOCKET_API_CONCURRENCY` (the operator throttle for the patch API) and `SOCKET_WALK_THREADS` appear in no doc. Only clap-bound vars are checked, through `GLOBAL_ARG_ENV_VARS`/`LOCAL_ARG_ENV_VARS`. It is the env-var slice of 8.5 F.
 
 ---

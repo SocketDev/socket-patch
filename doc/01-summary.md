@@ -100,7 +100,7 @@
 | `--help` | 150–219 lines per subcommand; `list --help` lists 27 options, most of which do nothing for `list` |
 | CI per push | ~516 jobs; the CI workflow alone is 237 jobs and 348 runner-minutes; Windows `test` is the 28-minute critical path |
 | `CLI_CONTRACT.md` | 343 KB; the longest *line* is 10,530 characters (at `045d7ec`, 2026-10-03; 332 KB / 9,320 at the snapshot) |
-| Open issues | 250 on 2026-10-04 (222 labelled `bug`, 43 `arch-audit`; main still at `045d7ec`, so the code numbers above stand). At the snapshot: 88, filed mostly in the last 5 days by a bug hunt; JS 26, JVM 22, Python 18, Go 6, Cargo 5, NuGet 5, Ruby 3, Composer 3 |
+| Open issues | 302 on 2026-10-05 (255 labelled `bug`, 65 `arch-audit`; main still at `045d7ec`, so the code numbers above stand). At the snapshot: 88, filed mostly in the last 5 days by a bug hunt; JS 26, JVM 22, Python 18, Go 6, Cargo 5, NuGet 5, Ruby 3, Composer 3 |
 | PR size | Recent squash merges of +53K, +85K and +94K lines |
 
 ---
@@ -263,7 +263,7 @@ Several patterns show code that outlived its purpose:
 | 13 | C | **Embedded `--vex`** (15 flag instances on 3 commands, ~600 lines of glue, plus bypass sets that couple VEX correctness to each caller) → `fix && vex -O`. | 0.6K prod | L (MAJOR) | Parts 2, 6 | {{E42,C35}} |
 | 14 | S | **Simplify per-package-manager auto-config:** npm `allow-remote` (re-implements npm's `ini` and config layering, ~900 lines), pnpm `trustLockfile` (~450; three open corruption bugs), the vlt warm-tree heal (installed-tree surgery in a lockfile-only mode), parallel rewriter groups (benchmark them or drop them). | 1–1.5K prod | M | Part 3 | {{E34}} |
 | 15 | C | **Self-update:** keep the notifier; replace the binary swap with "re-run install.sh" (only the standalone channel can self-update). **Telemetry:** one `track(Event)` + a shared client instead of 19 wrappers and ~45 token/org call sites. | 1.3–2.3K prod, 3K+ test | L-M (product) | Parts 2, 7 | {{C22,C36}} |
-| 16 | M | **Tests:** 207 → ~25 binaries (needs `RunCtx` first, to drop the env-mutating `#[serial]`); a `socket-patch-test-support` crate (`binary()` is defined in 102 files, `git_sha256` in 84, and 14 divergent `scrub_socket_env`); retire the oracles; triage covgap; snapshots instead of 328 sentence assertions. | 15–25K test lines; minutes off the Windows critical path | M | Part 8 | {{C30,C31,C32,E35}} |
+| 16 | M | **Tests:** 207 → ~25 binaries (needs `RunCtx` first, to drop the env-mutating `#[serial]`); a `socket-patch-test-support` crate (`binary()` is defined in 103 files, `git_sha256` in 86, 14 divergent `scrub_socket_env`, and 10 test files with no env scrub at all); retire the oracles; triage covgap; snapshots instead of 328 sentence assertions. | 15–25K test lines; minutes off the Windows critical path | M | Part 8 | {{C30,C31,C32,E35}} |
 | 17 | C | **CI:** report-only coverage + LTO `docker-base` off PRs (≈74 runner-min/run); PR e2e 148 legs → ~50 boundary versions; reusable compat workflow; no per-leg compiles. | ~200 fewer jobs per PR | L | Part 8 | handed off to the CI janitor |
 | 18 | S | **Docs:** a generated CLI reference plus ≤300 lines of contract prose; move ecosystem narratives into `ecosystems.md` and history into the CHANGELOG; decouple `docs/testing` from validation scripts. | — | L | Part 8 | {{C33}} |
 
