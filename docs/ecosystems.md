@@ -86,7 +86,11 @@ The backticked slug in each row is the value `-e`/`--ecosystems` accepts (e.g.
   entry (cacheKey `10c0` / yarn 4): `package.json` routes the locked descriptor
   (`"left-pad@npm:^1.3.0"`) to the hosted tarball and only that `yarn.lock` entry
   is re-keyed by it. Yarn then fetches it without npm registry credentials and
-  hardened mode accepts it. A user-authored `resolutions` entry for the package
+  hardened mode accepts it. The re-keyed entry is written the way yarn writes
+  it, with its fields in yarn's order and its `bin:` map taken from the served
+  tarball's own `package.json`. For an entry that has a `bin:` map, the scan
+  downloads the served tarball to read it. If that download fails, the patch
+  is skipped as `npm_manifest_unavailable`. A user-authored `resolutions` entry for the package
   is never overwritten (`redirect_yarn_berry_resolutions_conflict`), and
   `.yarnrc.yml`'s `compressionLevel` must stay 0. The node-modules linker
   is e2e-covered; PnP is untested for hosted — the lock rewrite fires, but PnP's

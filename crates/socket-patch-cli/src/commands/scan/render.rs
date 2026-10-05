@@ -300,17 +300,26 @@ pub(super) fn not_installed_skip_line(purl: &str) -> String {
     )
 }
 
-/// `[skip]` line for a selection the manifest already records.
-pub(super) fn already_recorded_line(purl: &str, uuid: &str) -> String {
+/// Line for a selection the manifest already records: `[re-apply]` on a
+/// wet agent run (the nested apply re-applies it), `[skip]` in a preview.
+pub(super) fn already_recorded_line(purl: &str, uuid: &str, reapply: bool) -> String {
+    let tag = if reapply { "re-apply" } else { "skip" };
     format!(
-        "  [skip] {purl} (already recorded: {})",
+        "  [{tag}] {purl} (already recorded: {})",
         super::super::get::short_uuid(uuid)
     )
 }
 
-/// Printed when every selection is already recorded (agent mode).
+/// Printed when every selection is already recorded and nothing is applied
+/// (report-only scan).
 pub(super) const ALL_ALREADY_RECORDED: &str =
     "All selected patches are already recorded in the manifest; run `socket-patch apply` to re-apply them.";
+
+/// [`ALL_ALREADY_RECORDED`] for an agent-mode `--dry-run`. A report-only
+/// dry run keeps [`ALL_ALREADY_RECORDED`]: dropping `--dry-run` there still
+/// only reports.
+pub(super) const ALL_ALREADY_RECORDED_DRY_RUN: &str =
+    "All selected patches are already recorded in the manifest; a run without --dry-run re-applies them.";
 
 /// The terminal error when no package's patch details could be fetched.
 pub(super) fn fetch_details_failed(failed: &[(String, String)]) -> String {
@@ -746,7 +755,10 @@ mod tests {
 
     #[test]
     fn report_only_hint_names_agent_mode() {
-        assert_eq!(report_only_hint()[0], "To apply these patches in place, run:");
+        assert_eq!(
+            report_only_hint()[0],
+            "To apply these patches in place, run:"
+        );
         assert!(report_only_hint()[1].contains("--mode agent"));
     }
 
@@ -760,8 +772,12 @@ mod tests {
         assert!(l.contains("`socket-patch scan --mode vendored`"), "{l}");
         assert!(!l.contains("--vendor`"), "{l}");
         assert_eq!(
-            already_recorded_line("pkg:npm/x@1", "884e9f6d-aaaa"),
+            already_recorded_line("pkg:npm/x@1", "884e9f6d-aaaa", false),
             "  [skip] pkg:npm/x@1 (already recorded: 884e9f6d)"
+        );
+        assert_eq!(
+            already_recorded_line("pkg:npm/x@1", "884e9f6d-aaaa", true),
+            "  [re-apply] pkg:npm/x@1 (already recorded: 884e9f6d)"
         );
     }
 

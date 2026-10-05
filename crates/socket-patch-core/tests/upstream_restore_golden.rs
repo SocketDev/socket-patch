@@ -1684,6 +1684,49 @@ async fn uv_script_lock_round_trips() {
     assert_pypi_round_trip("uv script", &input, &[urllib3_dep()], None).await;
 }
 
+/// uv 0.6.15–0.6.17 lock revision 2 spells the artifact timestamp
+/// `upload_time` (#788): the unwind re-derives the entry in that spelling
+/// instead of refusing the key, for project and script locks alike.
+#[tokio::test]
+#[serial]
+async fn uv_underscore_upload_time_locks_round_trip() {
+    let (_server, _env) = pypi_mock(&[urllib3_release()]).await;
+    let lock = uv_lock(
+        "    { name = \"idna\" },\n    { name = \"urllib3\" },\n",
+        "    { name = \"idna\", specifier = \">=3\" },\n    { name = \"urllib3\", specifier = \"==1.26.18\" },\n",
+        "",
+    )
+    .replace("upload-time", "upload_time");
+    assert!(!lock.contains("upload-time"), "{lock}");
+    let pyproject = "[project]\nname = \"proj\"\nversion = \"0.1.0\"\ndependencies = [\"idna>=3\", \"urllib3==1.26.18\"]\n";
+    for eol in ["\n", "\r\n"] {
+        let input = tree(&[
+            ("uv.lock", lock.replace('\n', eol)),
+            ("pyproject.toml", pyproject.replace('\n', eol)),
+        ]);
+        assert_pypi_round_trip(
+            &format!("uv 0.6.17 project {eol:?}"),
+            &input,
+            &[urllib3_dep()],
+            None,
+        )
+        .await;
+    }
+    let script = "#!/usr/bin/env python3\n# /// script\n# dependencies = [\"idna>=3\", \"urllib3==1.26.18\"]\n# ///\nprint('hi')\n";
+    let lock = uv_lock("", "", "\n[manifest]\nrequirements = [\n    { name = \"idna\", specifier = \">=3\" },\n    { name = \"urllib3\", specifier = \"==1.26.18\" },\n]\n")
+        .replace(
+            "[[package]]\nname = \"proj\"\nversion = \"0.1.0\"\nsource = { virtual = \".\" }\ndependencies = [\n]\n\n[package.metadata]\nrequires-dist = [\n]\n\n",
+            "",
+        )
+        .replace("upload-time", "upload_time");
+    assert!(
+        !lock.contains("proj") && !lock.contains("upload-time"),
+        "{lock}"
+    );
+    let input = tree(&[("tool.py", script.into()), ("tool.py.lock", lock)]);
+    assert_pypi_round_trip("uv 0.6.17 script", &input, &[urllib3_dep()], None).await;
+}
+
 #[tokio::test]
 #[serial]
 async fn pylock_round_trips() {

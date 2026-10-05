@@ -63,7 +63,7 @@ use crate::utils::fs::{
 };
 use crate::utils::socket_dir::remove_tree_and_prune;
 
-use super::common::{already_patched_result, detect_indent, done, refused, serialize_json};
+use super::common::{already_patched_result, done, parse_json_manifest, refused, JsonLayout};
 use super::npm_common::{
     done_failure_unstage, gate_packages, guard_coordinates, guard_revert_uuid_dir, refusal_code,
     stage_patch_pack, tgz_rel_leaf,
@@ -255,7 +255,16 @@ pub(super) async fn vendor_pnpm_dialect(
     };
     let mut wiring: Vec<WiringRecord> = Vec::new();
 
-    let (pkg_changed, created_pnpm_table, created_overrides_table) =
+    // The package.json copy is a back-compat surface for pnpm that reads
+    // overrides only from package.json. When the lock shows the project's
+    // pnpm reads them from pnpm-workspace.yaml, a new package.json
+    // `pnpm.overrides` would REPLACE the user's workspace overrides on
+    // pnpm 10 (#360), so only the workspace file and the lock are wired.
+    let skip_pkg_copy = dialect == PnpmDialect::V9
+        && workspace_overrides_govern(&pkg, ws_text.as_deref(), lock.lines());
+    let (pkg_changed, created_pnpm_table, created_overrides_table) = if skip_pkg_copy {
+        (false, false, false)
+    } else {
         match apply_pkg_override(&mut pkg, &effective_key, &spec, &mut wiring) {
             Ok(out) => out,
             Err(e) => {
@@ -268,7 +277,8 @@ pub(super) async fn vendor_pnpm_dialect(
                 )
                 .await
             }
-        };
+        }
+    };
     let (lock_changed, lock_warning) = match lock.edit(&ctx, &mut wiring) {
         Ok(edit) => edit,
         Err(e) => {
@@ -323,8 +333,9 @@ pub(super) async fn vendor_pnpm_dialect(
 
     // ── 6. Commit: package.json + pnpm-workspace.yaml FIRST, lock second,
     //    unwind the override surfaces on a lock failure (P3 desync safety).
-    let pkg_indent = detect_indent(&String::from_utf8_lossy(&pkg_bytes));
-    let new_pkg_bytes = match serialize_json(&pkg, &pkg_indent) {
+    // Re-render package.json in its own layout (BOM, indent, line ending,
+    // trailer) so a Windows / autocrlf manifest diffs only in the override.
+    let new_pkg_bytes = match JsonLayout::of(&String::from_utf8_lossy(&pkg_bytes)).render(&pkg) {
         Ok(bytes) => bytes,
         Err(e) => {
             return done_failure_unstage(
@@ -480,7 +491,7 @@ async fn read_project(
             )));
         }
     };
-    let pkg: Value = match serde_json::from_slice(&pkg_bytes) {
+    let pkg: Value = match parse_json_manifest(&pkg_bytes) {
         Ok(Value::Object(map)) => Value::Object(map),
         Ok(_) | Err(_) => {
             return Err(Box::new(refused(
@@ -845,13 +856,13 @@ pub(super) async fn revert_pnpm_dialect(
             Err(e) => return RevertOutcome::failed(format!("cannot read {PNPM_LOCK}: {e}")),
         }
     }
-    let mut pkg_state: Option<(Value, String)> = None; // (doc, indent)
+    let mut pkg_state: Option<(Value, JsonLayout)> = None;
     if touches_pkg {
         match read_regular_to_bytes(&project_root.join(PACKAGE_JSON)).await {
-            Ok(bytes) => match serde_json::from_slice::<Value>(&bytes) {
+            Ok(bytes) => match parse_json_manifest(&bytes) {
                 Ok(doc) if doc.is_object() => {
-                    let indent = detect_indent(&String::from_utf8_lossy(&bytes));
-                    pkg_state = Some((doc, indent));
+                    let layout = JsonLayout::of(&String::from_utf8_lossy(&bytes));
+                    pkg_state = Some((doc, layout));
                 }
                 // Fail-closed: editing a manifest we cannot parse risks
                 // destroying it; the user must repair it first.
@@ -944,8 +955,8 @@ pub(super) async fn revert_pnpm_dialect(
         }
     }
     if pkg_dirty {
-        if let Some((doc, indent)) = &pkg_state {
-            let bytes = match serialize_json(doc, indent) {
+        if let Some((doc, layout)) = &pkg_state {
+            let bytes = match layout.render(doc) {
                 Ok(b) => b,
                 Err(e) => {
                     return RevertOutcome::failed(format!("cannot serialize {PACKAGE_JSON}: {e}"))
@@ -1708,6 +1719,38 @@ pub(super) fn apply_pkg_override(
         new: Some(Value::String(spec.to_string())),
     });
     Ok((true, created_pnpm_table, created_overrides_table))
+}
+
+/// Does the pnpm that wrote this lock read `overrides:` from
+/// pnpm-workspace.yaml (pnpm 10.5+) rather than package.json? True when
+/// package.json has no `pnpm.overrides` of its own and the lock's
+/// `overrides:` records a user-authored (non-vendored) key of the
+/// workspace file's `overrides:` section. pnpm 9 and 10.0–10.4 ignore the
+/// workspace block, so their locks never record it; and with no user
+/// workspace override both surfaces agree anyway, so the package.json
+/// copy stays harmless there.
+fn workspace_overrides_govern(pkg: &Value, ws_text: Option<&str>, lock: &[String]) -> bool {
+    if pkg.get("pnpm").and_then(|p| p.get("overrides")).is_some() {
+        return false;
+    }
+    let Some(text) = ws_text else {
+        return false;
+    };
+    let ws_lines = split_lines(text);
+    let Some((ws_start, ws_end, indent)) = ws_overrides_section(&ws_lines) else {
+        return false;
+    };
+    let Some((lock_start, lock_end)) = section_bounds(lock, "overrides") else {
+        return false;
+    };
+    let lock_keys: Vec<&str> = lock[lock_start + 1..lock_end]
+        .iter()
+        .filter_map(|l| parse_key_line(l, 2).map(|(key, _, _)| key))
+        .collect();
+    ws_lines[ws_start + 1..ws_end]
+        .iter()
+        .filter_map(|l| parse_key_line(l, indent))
+        .any(|(key, _, rest)| !is_vendor_value(rest) && lock_keys.contains(&key))
 }
 
 // ─────────────────────── pnpm-workspace.yaml override ─────────────────────
@@ -5066,6 +5109,41 @@ snapshots:
             .exists());
     }
 
+    /// A CRLF, BOM or BOM+CRLF+tab `package.json` (a Windows / autocrlf
+    /// checkout) keeps its layout: the vendored file differs from the
+    /// original only in `pnpm.overrides`, and the revert is byte-exact
+    /// (#662).
+    #[tokio::test]
+    async fn vendor_and_revert_keep_package_json_layout() {
+        use crate::vendor::test_support::{relayout, JSON_LAYOUTS};
+        for (tag, bom, crlf, tab) in JSON_LAYOUTS {
+            let before = relayout(P1_BEFORE_PKG, bom, crlf, tab);
+            let fx = fixture_with(&before, P1_BEFORE_LOCK).await;
+            let (result, entry, _) = expect_done(fx.vendor(false).await);
+            assert!(result.success, "{tag}: {:?}", result.error);
+            assert_eq!(
+                fx.read(PACKAGE_JSON).await,
+                relayout(P1_AFTER_PKG, bom, crlf, tab),
+                "{tag}: vendored package.json keeps its layout"
+            );
+            assert_eq!(
+                fx.read(PNPM_LOCK).await,
+                P1_AFTER_LOCK.replace(SPIKE_INTEGRITY, &fx.actual_integrity().await),
+                "{tag}: lock unaffected by the manifest layout"
+            );
+
+            let outcome = revert_pnpm(&entry.unwrap(), fx.root(), false).await;
+            assert!(outcome.success, "{tag}: {:?}", outcome.error);
+            assert!(outcome.warnings.is_empty(), "{tag}: {:?}", outcome.warnings);
+            assert_eq!(
+                fx.read(PACKAGE_JSON).await,
+                before,
+                "{tag}: package.json byte-restored"
+            );
+            assert_eq!(fx.read(PNPM_LOCK).await, P1_BEFORE_LOCK, "{tag}");
+        }
+    }
+
     #[tokio::test]
     async fn revert_allowlist_is_fail_closed() {
         let fx = fixture_with(P1_BEFORE_PKG, P1_BEFORE_LOCK).await;
@@ -5550,6 +5628,118 @@ snapshots:
             original,
             "revert leaves the user's override intact and drops only ours"
         );
+    }
+
+    /// [`P1_BEFORE_LOCK`] as pnpm 10.5+ writes it when the user's
+    /// `is-number: 6.0.0` override lives in pnpm-workspace.yaml: the lock's
+    /// `overrides:` records the workspace-file override.
+    fn p1_lock_with_ws_user_override() -> String {
+        P1_BEFORE_LOCK.replacen(
+            "\nimporters:\n",
+            "\noverrides:\n  is-number: 6.0.0\n\nimporters:\n",
+            1,
+        )
+    }
+    const WS_WITH_USER_OVERRIDE: &str = "packages:\n  - '.'\noverrides:\n  is-number: 6.0.0\n";
+
+    /// #360: when the lock shows pnpm reads `overrides:` from
+    /// pnpm-workspace.yaml (pnpm 10.5+), a new package.json
+    /// `pnpm.overrides` would REPLACE the user's workspace overrides on
+    /// pnpm 10 (frozen installs fail ERR_PNPM_LOCKFILE_CONFIG_MISMATCH, a
+    /// re-lock drops them). Vendor wires the workspace file and the lock
+    /// only, leaving package.json byte-identical; revert restores both.
+    #[tokio::test]
+    async fn workspace_read_overrides_skip_the_package_json_copy() {
+        let lock = p1_lock_with_ws_user_override();
+        let fx = fixture_with(P1_BEFORE_PKG, &lock).await;
+        write_ws(&fx, WS_WITH_USER_OVERRIDE).await;
+
+        let (_, entry, _) = expect_done(fx.vendor(false).await);
+        let entry = entry.unwrap();
+        let spec = format!("file:{}", fx.rel_tgz());
+        assert_eq!(
+            fx.read(PACKAGE_JSON).await,
+            P1_BEFORE_PKG,
+            "package.json must not gain a pnpm.overrides that shadows the workspace overrides"
+        );
+        assert!(
+            entry.wiring.iter().all(|r| r.kind != KIND_PKG_OVERRIDE),
+            "no package.json wiring is recorded"
+        );
+        assert_eq!(
+            fx.read(PNPM_WORKSPACE).await,
+            format!("{WS_WITH_USER_OVERRIDE}  left-pad@1.3.0: {spec}\n"),
+        );
+        let new_lock = fx.read(PNPM_LOCK).await;
+        assert!(
+            new_lock.contains(&format!(
+                "overrides:\n  is-number: 6.0.0\n  left-pad@1.3.0: {spec}\n"
+            )),
+            "the lock's override map equals the workspace file's: {new_lock}"
+        );
+
+        // A re-run is in sync and still leaves package.json alone.
+        let (result, again, _) = expect_done(fx.vendor(false).await);
+        assert!(result.success, "{:?}", result.error);
+        assert!(again.is_none(), "in-sync re-run records nothing");
+        assert!(result
+            .files_verified
+            .iter()
+            .all(|v| v.status == crate::patch::apply::VerifyStatus::AlreadyPatched));
+        assert_eq!(fx.read(PACKAGE_JSON).await, P1_BEFORE_PKG);
+
+        let outcome = revert_pnpm(&entry, fx.root(), false).await;
+        assert!(outcome.success, "{:?}", outcome.error);
+        assert_eq!(fx.read(PACKAGE_JSON).await, P1_BEFORE_PKG);
+        assert_eq!(fx.read(PNPM_WORKSPACE).await, WS_WITH_USER_OVERRIDE);
+        assert_eq!(
+            fx.read(PNPM_LOCK).await,
+            lock,
+            "lock restored byte-for-byte"
+        );
+    }
+
+    /// Control for #360: workspace overrides the lock does NOT record were
+    /// ignored by the pnpm that wrote it (pnpm 9, 10.0–10.4 read only
+    /// package.json), so the package.json copy is still written there.
+    #[tokio::test]
+    async fn workspace_overrides_unrecorded_in_lock_keep_the_package_json_copy() {
+        let fx = fixture_with(P1_BEFORE_PKG, P1_BEFORE_LOCK).await;
+        write_ws(&fx, WS_WITH_USER_OVERRIDE).await;
+
+        let (_, entry, _) = expect_done(fx.vendor(false).await);
+        assert_eq!(fx.read(PACKAGE_JSON).await, P1_AFTER_PKG);
+        assert!(entry
+            .unwrap()
+            .wiring
+            .iter()
+            .any(|r| r.kind == KIND_PKG_OVERRIDE));
+    }
+
+    /// Control for #360: a project that already keeps a package.json
+    /// `pnpm.overrides` (which pnpm 10 reads in place of the workspace
+    /// block) keeps getting the package.json copy.
+    #[tokio::test]
+    async fn existing_package_json_overrides_keep_the_package_json_copy() {
+        let pkg = P1_BEFORE_PKG.replacen(
+            "\n  }\n}\n",
+            "\n  },\n  \"pnpm\": {\n    \"overrides\": {\n      \"is-number\": \"6.0.0\"\n    }\n  }\n}\n",
+            1,
+        );
+        let fx = fixture_with(&pkg, &p1_lock_with_ws_user_override()).await;
+        write_ws(&fx, WS_WITH_USER_OVERRIDE).await;
+
+        let (_, entry, _) = expect_done(fx.vendor(false).await);
+        let pkg_after: Value = serde_json::from_str(&fx.read(PACKAGE_JSON).await).unwrap();
+        assert_eq!(
+            pkg_after["pnpm"]["overrides"]["left-pad@1.3.0"],
+            Value::String(format!("file:{}", fx.rel_tgz()))
+        );
+        assert!(entry
+            .unwrap()
+            .wiring
+            .iter()
+            .any(|r| r.kind == KIND_PKG_OVERRIDE));
     }
 
     /// A flow-style/inline `overrides:` mapping the line surgery cannot
