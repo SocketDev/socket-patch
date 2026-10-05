@@ -13,6 +13,10 @@ crates/socket-patch-core/tests/fixtures/poetry/** -text
 crates/socket-patch-core/tests/fixtures/pipenv/** -text
 crates/socket-patch-core/tests/fixtures/pipenv-shapes/** -text
 
+# The native uv fixtures under upstream/ are real `uv lock` output: the
+# restore tests derive their CRLF variants from the LF bytes themselves.
+crates/socket-patch-core/tests/fixtures/upstream/** -text
+
 # The captured pnpm 1-12 locks are byte-real: the hosted/vendored rewriters
 # refuse CRLF by design (vendor_lockfile_crlf_unsupported), and the tests
 # derive their CRLF variants from the LF bytes themselves.

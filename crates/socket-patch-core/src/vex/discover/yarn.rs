@@ -87,7 +87,7 @@ use serde_json::Value;
 use super::{
     npm_purl, npm_vendored_tarball_names, parse_json, root_anchored_spelling, vendor_ref_decorated,
     DiscoverCtx, Discovery, LocateOpts, PatchedRef, VendorRef, Wired, DIAG_LOCKFILE_UNPARSEABLE,
-    DIAG_REF_INVALID,
+    DIAG_REF_INVALID, DIAG_REF_UNATTRIBUTABLE,
 };
 use crate::patch::redirect::is_berry_lock;
 use crate::utils::digest::is_sri_pin;
@@ -97,7 +97,7 @@ use crate::vendor::lock_inventory::yarn::{
 use crate::vendor::lock_inventory::LockIntegrity;
 use crate::vendor::yarn_berry_lock::{berry_field, resolution_selector_target, BerryLocator};
 use crate::vendor::yarn_classic_lock::{
-    classic_field, pattern_real_name, split_pattern, split_resolved_sha1,
+    classic_block_is_git, classic_field, pattern_real_name, split_pattern, split_resolved_sha1,
 };
 
 const YARN_LOCK: &str = "yarn.lock";
@@ -138,18 +138,82 @@ fn stray_top_level_line(text: &str) -> Option<&str> {
 // ── classic ──────────────────────────────────────────────────────────────
 
 fn extract_classic(ctx: &DiscoverCtx<'_>, entries: Vec<YarnEntry>, out: &mut Discovery) {
+    // (purl, key) of every live git-fetched block: that copy installs the
+    // git bytes, so no wiring of the same package in this lock is attested.
+    let mut git_copies: Vec<(String, String)> = Vec::new();
     for entry in entries {
         if entry.live && !entry.patterns.is_empty() {
-            classic_block(ctx, &entry, out);
+            classic_block(ctx, &entry, &mut git_copies, out);
+        }
+    }
+    if git_copies.is_empty() {
+        return;
+    }
+    let refs = std::mem::take(&mut out.refs);
+    for r in refs {
+        let git_key = (r.source_file == std::path::Path::new(YARN_LOCK))
+            .then(|| git_copies.iter().find(|(purl, _)| *purl == r.purl))
+            .flatten();
+        match git_key {
+            Some((_, key)) => out.diag(
+                DIAG_REF_UNATTRIBUTABLE,
+                YARN_LOCK,
+                format!(
+                    "{YARN_LOCK}: {} is wired to a Socket patch but lock entry `{key}` \
+                     installs from git, which yarn fetches from the git source rather than \
+                     a tarball; that copy stays UNPATCHED and nothing is attested",
+                    r.purl
+                ),
+            ),
+            None => out.refs.push(r),
         }
     }
 }
 
-fn classic_block(ctx: &DiscoverCtx<'_>, entry: &YarnEntry, out: &mut Discovery) {
+fn classic_block(
+    ctx: &DiscoverCtx<'_>,
+    entry: &YarnEntry,
+    git_copies: &mut Vec<(String, String)>,
+    out: &mut Discovery,
+) {
     let YarnEntry {
         block, patterns, ..
     } = entry;
-    let Some(resolved) = classic_field(&block.lines, "resolved") else {
+    let resolved = classic_field(&block.lines, "resolved");
+    // yarn 1 fetches a git pattern with git, from `resolved` (#363): the
+    // copy is the git bytes, whatever `resolved` names.
+    if classic_block_is_git(patterns, resolved) {
+        let purl = match (
+            patterns.first().and_then(|p| pattern_real_name(p)),
+            classic_field(&block.lines, "version"),
+        ) {
+            (Some(name), Some(version))
+                if patterns.iter().all(|p| pattern_real_name(p) == Some(name)) =>
+            {
+                npm_purl(name, version)
+            }
+            _ => None,
+        };
+        // A Socket wiring here (an older release rewired it) is inert.
+        if resolved.is_some_and(|r| classify(ctx, r, YARN_LOCK, &block.key, out).is_some()) {
+            out.diag(
+                DIAG_REF_UNATTRIBUTABLE,
+                YARN_LOCK,
+                format!(
+                    "{YARN_LOCK}: Socket-wired entry `{}` installs from git, which yarn \
+                     fetches from the git source rather than the wired tarball; it is not \
+                     attested",
+                    block.key
+                ),
+            );
+        }
+        if let Some(purl) = purl {
+            out.resolved_elsewhere(YARN_LOCK, Some(purl.clone()));
+            git_copies.push((purl, block.key.clone()));
+        }
+        return;
+    }
+    let Some(resolved) = resolved else {
         return;
     };
     // `link:` ranges install from the working tree; `resolved` is inert.
@@ -926,6 +990,45 @@ mod tests {
         let out = run(&p).await;
         assert!(out.refs.is_empty(), "{:#?}", out.refs);
         assert!(out.diagnostics.is_empty(), "{:?}", out.diagnostics);
+    }
+
+    /// #363: yarn 1 fetches a git-pattern block with git from its
+    /// `resolved`, so that copy is the git bytes whatever `resolved` says.
+    /// A Socket wiring of such a block (left by an older release) is never
+    /// attested, and a git copy beside a wired registry block leaves the
+    /// package unpatched there too: no ref, a named diagnostic, and the copy
+    /// counts as resolved elsewhere for other locks.
+    #[tokio::test]
+    async fn classic_git_pattern_copies_are_never_attested() {
+        let lp = hosted_url("npm", "left-pad", "1.3.0", UUID_A, "left-pad-1.3.0.tgz");
+        let git_key = "\"left-pad@git+https://github.com/stevemao/left-pad.git#v1.3.0\"";
+        let git_resolved =
+            "git+https://github.com/stevemao/left-pad.git#ff8e7ba5b0b3a5ad2f1bb06a4e6aef1c6b2c3d4e";
+        for (case, blocks) in [
+            (
+                "git block wired",
+                vec![classic_block(git_key, "1.3.0", &lp, Some(SRI))],
+            ),
+            (
+                "registry wired beside a git copy",
+                vec![
+                    classic_block("left-pad@^1.3.0", "1.3.0", &lp, Some(SRI)),
+                    classic_block(git_key, "1.3.0", git_resolved, None),
+                ],
+            ),
+        ] {
+            let p = Project::new();
+            p.write("yarn.lock", classic(&blocks));
+            let out = run(&p).await;
+            assert!(out.refs.is_empty(), "{case}: {:#?}", out.refs);
+            assert!(
+                out.diagnostics
+                    .iter()
+                    .any(|d| d.code == DIAG_REF_UNATTRIBUTABLE && d.detail.contains("git")),
+                "{case}: {:?}",
+                out.diagnostics
+            );
+        }
     }
 
     /// Socket-shaped blocks that fail validation are DIAGNOSED, never refs:

@@ -434,7 +434,8 @@ fn forged_ledger_entries_touch_nothing() {
 }
 
 /// A build directory symlinked out of the checkout is refused with
-/// `build_file_outside_root`, and nothing is written through it.
+/// `build_file_outside_root` (a linked `.socket/vendor` with the shared
+/// `vendor_dir_symlink_unsupported`), and nothing is written through it.
 #[cfg(unix)]
 #[test]
 fn escaping_symlinks_are_refused() {
@@ -459,17 +460,25 @@ fn escaping_symlinks_are_refused() {
             .collect();
         let (code, env) = socket(root, &["vendor"]);
         assert_ne!(code, Some(0), "{link}: {env}");
-        assert_eq!(
-            env["events"][0]["errorCode"], "vendor_jvm_shape_unsupported",
-            "{link}: {env}"
-        );
-        assert!(
-            env["events"][0]["error"]
-                .as_str()
-                .unwrap_or_default()
-                .starts_with("reason: build_file_outside_root: "),
-            "{link}: {env}"
-        );
+        if link == ".socket/vendor" {
+            // Every ecosystem refuses a linked vendor dir up front (#664).
+            assert_eq!(
+                env["events"][0]["errorCode"], "vendor_dir_symlink_unsupported",
+                "{link}: {env}"
+            );
+        } else {
+            assert_eq!(
+                env["events"][0]["errorCode"], "vendor_jvm_shape_unsupported",
+                "{link}: {env}"
+            );
+            assert!(
+                env["events"][0]["error"]
+                    .as_str()
+                    .unwrap_or_default()
+                    .starts_with("reason: build_file_outside_root: "),
+                "{link}: {env}"
+            );
+        }
         let after: Vec<_> = std::fs::read_dir(&outside)
             .unwrap()
             .map(|e| e.unwrap().path())

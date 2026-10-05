@@ -7,6 +7,7 @@ use std::path::PathBuf;
 
 use crate::args::GlobalArgs;
 
+use socket_patch_core::crawlers::npm_crawler::with_store_peer_variant_copies;
 use socket_patch_core::crawlers::walk_pool;
 use socket_patch_core::crawlers::CargoCrawler;
 use socket_patch_core::crawlers::ComposerCrawler;
@@ -599,8 +600,8 @@ pub(crate) fn npm_paths_by_identity_in(
 /// patch would silently resolve as `package_not_found`. The rollback
 /// variant fans each base path back out to every qualified manifest PURL
 /// — the same mapping the manifest was written with (`get` uses the same
-/// resolver). `vex` hashes the first copy of a manifest purl and every copy
-/// of a hosted one from this one lookup.
+/// resolver). `vex` hashes every copy of a manifest purl and of a hosted
+/// one from this one lookup; npm copies include their store variants.
 ///
 /// With `prior`, the npm `node_modules` roots come
 /// from it (a crawl of the same options earlier in this process, over
@@ -618,14 +619,23 @@ pub async fn find_manifest_package_copies_reusing(
     let partitioned = partition_purls(purls, common.ecosystems.as_deref());
     let crawler_options = common.crawler_options();
     let npm_roots = prior.and_then(|p| p.roots_for(&crawler_options));
-    dispatch_find(
+    let mut copies = dispatch_find(
         &partitioned,
         &crawler_options,
         quiet,
         merge_qualified,
         npm_roots,
     )
-    .await
+    .await;
+    // `apply` also writes every store variant of each npm copy (a pnpm peer
+    // suffix, a Deno `_N` copy index, a vlt peer extra), so "every copy"
+    // includes them (#603).
+    for (purl, paths) in copies.iter_mut() {
+        if purl.starts_with("pkg:npm/") {
+            *paths = with_store_peer_variant_copies(std::mem::take(paths)).await;
+        }
+    }
+    copies
 }
 
 // ── JVM copies ──────────────────────────────────────────────────────────
@@ -1798,15 +1808,16 @@ mod tests {
             find_packages_for_rollback_reusing(&partitioned, &options, true, Some(&snapshot)).await;
         assert_eq!(reused, crawled);
         assert!(crawled.contains_key("pkg:npm/baz@3.0.0"), "{crawled:?}");
+        // The resolver finds the alias install itself (#356).
+        let left_pad = "pkg:npm/left-pad@1.3.0".to_string();
+        assert_eq!(crawled.get(&left_pad), Some(&root.join("node_modules/lp")));
 
         let missing: Vec<&String> = purls.iter().filter(|p| !crawled.contains_key(*p)).collect();
-        assert!(
-            missing.iter().any(|p| p.contains("left-pad")),
-            "{missing:?}"
-        );
-        let by_crawl = npm_paths_by_identity(&options, &missing).await;
+        assert_eq!(missing, vec!["pkg:npm/absent@9.9.9"]);
+        let lookup: Vec<&String> = missing.into_iter().chain([&left_pad]).collect();
+        let by_crawl = npm_paths_by_identity(&options, &lookup).await;
         let by_snapshot =
-            npm_paths_by_identity_in(snapshot.packages_for(&options).unwrap(), &missing);
+            npm_paths_by_identity_in(snapshot.packages_for(&options).unwrap(), &lookup);
         assert_eq!(by_snapshot, by_crawl);
         assert_eq!(
             by_crawl.get("pkg:npm/left-pad@1.3.0"),
