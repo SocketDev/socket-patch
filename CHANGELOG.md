@@ -242,6 +242,10 @@ limits, and required install commands.
   half-open connection. A connect now fails after 10 s, and a connection that
   sends nothing for 60 s fails as a network error. Downloads that keep
   streaming are not cut off (#570).
+- Patch blob and diff downloads stream straight to the `.socket` cache instead
+  of being held in memory whole first, so a large patch artifact no longer
+  costs its full size in RAM during `apply`, `get`, `repair` or `rollback`
+  (#571).
 
 ### Maintenance
 
