@@ -1,10 +1,10 @@
 ### Refactor routine (`refactor`, hourly, highest leverage first)
-_Last updated 2026-10-05T17:00Z · main @ 0d302dc_
+_Last updated 2026-10-05T17:56Z · main @ c644ab0_
 
 **In flight:**
-- [#870](https://github.com/SocketDev/socket-patch/pull/870): `go_mod_edit::module_path` on the shared directive walker reads the go.mod `module` directive for VEX `--product` (fixes the block-form `module ( … )` misread); `go_crawler::parse_go_mod_module` (dead) and `product.rs`'s line scanner deleted. Issue #781 (E19 Go half). Production ≈ +22 / −64, tests ≈ +65 / −117. State: ready, CI green after one re-run, Bugbot clean; with the PR burn-down.
 
 **Merged:**
+- [#870](https://github.com/SocketDev/socket-patch/pull/870): `go_mod_edit::module_path` on the shared directive walker reads the go.mod `module` directive for VEX `--product` (block form fixed); `go_crawler::parse_go_mod_module` and `product.rs`'s scanner deleted. Issue #781 (E19 Go half). Merged 2026-10-05 as `c644ab0`. Production ≈ +22 / −64, tests ≈ +65 / −117.
 - [#865](https://github.com/SocketDev/socket-patch/pull/865): `utils::digest` compute helpers; 4 private copies and the inline digest sites in 14 files deleted; ratchet for the 6 slice-2 files. Issue #706 slice 1 (C17). Merged 2026-10-05 as `1714299`. Production ≈ +45 / −105, tests ≈ +145 / −11.
 - [#858](https://github.com/SocketDev/socket-patch/pull/858): one blocking `stage_and_rename_blocking` core with a private `WriteOpts` policy behind the six `utils::fs` writers; `atomic_write_sync`'s copy and `create_stage`/`commit_stage` deleted; one `stage_path` builds `.socket-stage-` and `.socket-dl-` names. Issue #728 (C21). Production +171 / −168, tests ≈ +85 / −12. Merged 2026-10-05 as `ee8ebf4`.
 - [#850](https://github.com/SocketDev/socket-patch/pull/850): one hermetic `common/hermetic.rs` builder for CLI test children; 8 `scrub_socket_env` copies deleted, 7 unscrubbed spawners made hermetic, `spawn_env_hygiene` ratchet. Issue #823 slice 1 (C30, C47). Merged 2026-10-05 as `99f61d2`. Test-only: +745 / −322.

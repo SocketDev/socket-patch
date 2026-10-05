@@ -141,7 +141,7 @@ Revert/restore/unwind code in the non-npm backends totals **about 3,540 lines**:
 **Gem:** `vendor/gem.rs` imports three token helpers from `formats::gem` and keeps its own section model: `section_span` / `section_end` for DEPENDENCIES and CHECKSUMS, plus [`gem_section_spans` / `record_gem_section`](https://github.com/SocketDev/socket-patch/blob/4646693150cf5efca6222b87092e1620e58566f8/crates/socket-patch-core/src/vendor/gem.rs#L1947-L1975), added by #805. With `formats::gem::parse` and hosted's `GemLockSection`, that makes three section models and three DEPENDENCIES-name parsers; the name rules agree on Bundler-written entries. {{E19}}
   - The models had drifted: vendored `edit_lock` looked only in the first `GEM` section, so a gem from a later source was refused. It now searches every GEM section, and refuses a spec listed in two (#805). {{E59}}
 
-**Go:** `go_mod_edit.rs` is properly shared (9 users) but lives under `vendor/`. `crawlers/go_crawler.rs:63` still has its own `parse_go_mod_module`, which has no production caller; the live `module` reader is `vex/product.rs`'s own, and both misread Go's block form `module ( … )` as the module `(`. {{E19}}
+**Go:** `go_mod_edit.rs` is properly shared (VEX `--product` now included) but lives under `vendor/`. Since #870 the go.mod `module` directive has one reader, `go_mod_edit::module_path`, built on the same directive walker as `require` and `replace` (block form included); the crawler's dead `parse_go_mod_module` is gone. {{E19}}
 
 **Small helpers:**
 - **CRLF:** four policies for the same "`toml_edit` emits LF" problem:
