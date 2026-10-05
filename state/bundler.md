@@ -1,6 +1,6 @@
 [agent] Progress ledger for the scheduled Bundler (RubyGems) bug-hunt routine (label pm:bundler).
 
-Last updated: 2026-10-05 (run 20), main `045d7ec` (includes #532, #552, #517, #442), latest release tag v4.0.0.
+Last updated: 2026-10-05 (run 21), main `0d302dc` (includes #637, #621, #797, #805, #849), latest release tag v4.0.0. Newest Bundler tested: 4.0.22.
 
 ## Coverage matrix
 
@@ -11,9 +11,9 @@ Cells are "pass", "fail #N" or "untested". Hosted and vendored cells use a local
 | OS | Ruby | Bundler | Hosted: single-line decl | Hosted: multi-line decl / `if` modifier | Hosted: decl in `group` block | Hosted: platform gem, no CHECKSUMS | Hosted: CHECKSUMS lock | Hosted: stale-install guard | Hosted: `BUNDLE_GEMFILE` in `.bundle/config` | Vendored: `Gemfile` only | Vendored: `gems.rb` + `Gemfile` twin | Vendored: `BUNDLE_GEMFILE` | Vendored: `gems.rb` only | Agent: multi-home `vex` |
 | --- | --- | --- | --- | --- | --- | --- | --- | --- | --- | --- | --- | --- | --- | --- |
 | Linux | 3.3.6 | 1.17.x | blocked (1.17 needs Ruby ≤ 3.1) | untested | untested | untested | n/a | untested | untested | untested | untested | untested | untested | untested |
-| Linux | 3.3.6 | 2.2–2.4 | untested | fail #340 (2.4) | untested | untested | n/a | untested | fixed #390 (#431) | untested | fixed #341 (#431) | untested | untested | untested |
+| Linux | 3.3.6 | 2.2–2.4 | untested | fixed #340 (#637) | untested | untested | n/a | untested | fixed #390 (#431) | untested | fixed #341 (#431) | untested | untested | untested |
 | Linux | 3.3.6 | 2.6.9 | pass | untested | untested | untested | pass | untested | untested | untested | untested | untested | untested | untested |
-| Linux | 3.3.6 | 4.0.17 | pass | fail #340 | pass | pass (switches to patched ruby gem) | pass | pass | fixed #390 (#431) | pass | fixed #341 (#431) | fixed #390 (#431) | refused (documented) | fixed #420 (#517) |
+| Linux | 3.3.6 | 4.0.17 | pass | fixed #340 (#637) | pass | pass (switches to patched ruby gem) | pass | pass | fixed #390 (#431) | pass | fixed #341 (#431) | fixed #390 (#431) | refused (documented) | fixed #420 (#517) |
 | Linux (CI) | 2.7 / 3.3 / 3.4 | 2.4 / 2.5 / 2.6 | untested | untested (OS-independent) | untested | untested | untested | untested | untested (OS-independent) | untested | untested (OS-independent) | untested | untested | fixed #420 (#517) |
 | macOS (CI) | 2.7 / 3.3 / 3.4 | 2.4 / 2.5 / 2.6 | untested | untested (OS-independent) | untested | untested | untested | untested | untested (OS-independent) | untested | untested (OS-independent) | untested | untested | fixed #420 (#517, probe pass) |
 | Windows (CI) | 2.7 / 3.3 / 3.4 | 2.4 / 4.0 | untested | untested (OS-independent) | untested | untested | untested | untested | untested (OS-independent) | untested | untested (OS-independent) | untested | untested | fixed #420 (#517, probe pass) |
@@ -67,8 +67,8 @@ Cells are "pass", "fail #N" or "untested". Hosted and vendored cells use a local
 
 | Bundler | Hosted: global `cache_path` (`~/.bundle/config`) | Hosted: global `cache_path` (`BUNDLE_USER_CONFIG`) | Hosted: global `gemfile Gemfile.next` | Agent: global `path` |
 | --- | --- | --- | --- | --- |
-| 4.0.17 | fail #577 | fail #577 | fail #577 | fail #577 (patches the system copy; false VEX) |
-| 2.4.22 | fail #577 (real install picks up the cached bytes) | fail #577 (OS/version-independent) | fail #577 | fail #577 |
+| 4.0.17 | fixed #577 (#621) | fixed #577 (#621) | fixed #577 (#621) | fixed #577 (#621) |
+| 2.4.22 | fixed #577 (#621) | fixed #577 (#621) | fixed #577 (#621) | fixed #577 (#621) |
 
 ### Run 10 (agent mode, Bundler project on system gems, `colorize@0.8.1` mock patch)
 
@@ -140,16 +140,16 @@ Also on 4.0.17: BOM `Gemfile` passes; symlinked `Gemfile` / lock is refused (pas
 
 | Bundler | Vendored `repair` (corrupt / missing file / missing dir / extra file) | Vendored `lockfile custom.lock` | Agent `apply` + `vex` on `bundle install --standalone` |
 | --- | --- | --- | --- |
-| 4.0.17 | pass | pass (fails closed) | fail #796 |
+| 4.0.17 | pass | pass (fails closed) | fixed #796 (#797) |
 | 2.7.2 / 2.6.9 / 2.5.22 / 2.4.22 | untested | n/a | pass |
 
 ### Run 18: multi-gem hosted lifecycle and takeover (Linux, Ruby 3.3.6, real rubygems.org upstream)
 
 | Bundler | Hosted: 3 gems one scan (frozen fresh install) | Hosted: incremental + byte-identical re-run | Hosted: `rollback` 1 of 3, then all | H→V takeover, 1 gem | H→V takeover, 3 gems | H→V takeover, mixed no-CHECKSUMS pair |
 | --- | --- | --- | --- | --- | --- | --- |
-| 4.0.17 | pass | pass | pass | pass | fail #779 (PR #805 fixes) | n/a |
+| 4.0.17 | pass | pass | pass | pass | fixed #779 (#805) | n/a |
 | 2.6.9 | pass | untested | pass | untested | untested | untested |
-| 2.4.22 | pass (after the documented unfrozen install) | untested | untested | untested | fail #779 after the converge install (PR #805 fixes) | fails closed (documented mixed state) |
+| 2.4.22 | pass (after the documented unfrozen install) | untested | untested | untested | fixed #779 (#805) | fails closed (documented mixed state) |
 
 ### Run 19: single-line declaration shapes, deployment config, 2.6.9 suites (Linux, Ruby 3.3.6, real rubygems.org upstream)
 
@@ -163,8 +163,27 @@ Also on 4.0.17: BOM `Gemfile` passes; symlinked `Gemfile` / lock is refused (pas
 
 | Bundler | Hosted: `gem "x", "1"; # c` / `# …; gem "y"` in a comment | Hosted: one-line `group … do gem … end` / `gem %q(x)` | Hosted: `*V` / `ENV.fetch(…)` / tab / `:require =>` / `platforms: [...]` / `group: [...]` / `"x" ,` | Hosted `rollback` of those shapes | Hosted: decl duplicated in `=begin`/heredoc/`__END__` | Hosted: `gem "x-y", path:` next to the patched `gem "x"` | Hosted: 3 concurrent scans | Hosted: env `BUNDLE_GEMFILE` (6 spellings) | Vendored: `*V` / `ENV.fetch(…)` / `CONST, require: false` |
 | --- | --- | --- | --- | --- | --- | --- | --- | --- | --- |
-| 4.0.17 | pass | pass (refused: `redirect_gem_declaration_not_visible`) | pass | pass (exact pin + kept args, documented) | pass (refused: `declared_more_than_once`) | pass | pass (apply.lock) | pass | fail #847 |
-| 2.4.22 | untested | untested | untested | untested | untested | untested | untested | untested | fail #847 |
+| 4.0.17 | fail #826 (`;` now refused since #637, comment) | pass (refused: `redirect_gem_declaration_not_visible`) | pass | pass (exact pin + kept args, documented) | pass (refused: `declared_more_than_once`) | pass | pass (apply.lock) | pass | fixed #847 (#849) |
+| 2.6.9 | fail #826 (`;` refused) | untested | pass | untested | untested | untested | untested | untested | untested |
+| 2.4.22 | fail #826 (`;` refused) | untested | pass (after the documented unfrozen install) | untested | untested | untested | untested | untested | fixed #847 (#849) |
+
+### Run 21 (main `0d302dc`; Linux Ruby 3.3.6 unless noted; real rubygems.org upstream)
+
+| Cell | 4.0.22 | 4.0.17 | 2.6.9 | 2.4.22 |
+| --- | --- | --- | --- | --- |
+| Repo gem e2e suites (redirect 25 / vendor 18 / stale 29) | pass | — | — | — |
+| Hosted single-line CHECKSUMS cycle, `Gemfile` and `gems.rb` | pass | pass | — | — |
+| Hosted transitive (via `path:` gem) / `group` block / CRLF `Gemfile`, then `rollback` → frozen install | pass (lock byte-restored) | — | — | — |
+| Hosted, lock `PLATFORMS` = `x86_64-linux` only | pass | — | — | — |
+| Hosted, 9 one-line shapes after #637 (`gem(...)`, trailing `# … if …`, 2 constraints, `%i[]`, `"#{…}"`, `!=`, `!true`, `group:` + `require:`) | — | pass | — | — |
+| Hosted `gem "x", "1";` / `gem "x", "1"; # c` | — | fail #826 (refused since #637) | fail #826 | fail #826 |
+| Hosted `rollback` after a user `bundle update` of another gem | — | pass (the other gem's update kept) | — | — |
+| Hosted stale guard, `--standalone` install (`./bundle`) | — | pass (warns, VEX withheld; remedy wording, see Known non-bugs) | — | — |
+| Hosted stale guard, system-gems install (no `path`) | — | pass | — | — |
+| Vendored `CONST` / `*%w[]` / `*EXTRA` / `**OPTS` / two constants (after #849) | — | pass | — | — |
+| Vendored transitive gem from the lock's 2nd GEM section (after #805) | — | pass | — | — |
+| Agent: locked default gem (`uri 0.13.1`), system gems | — | pass (Bundler installs a regular copy, which is patched) | — | — |
+| Windows (RubyInstaller 3.4.9) Bundler 4.0.22 agent cycle, path with a space | pass | — | — | — |
 
 ### Global mode (`-g`)
 
@@ -180,18 +199,21 @@ Also on 4.0.17: BOM `Gemfile` passes; symlinked `Gemfile` / lock is refused (pas
 | macos-14 / macos-15 Homebrew Ruby 4.0.6 | 4.0.6 / bundled | pass | pass (`-g` inside a project leaves `vendor/bundle` alone) | untested | pass | pass | pass | pass | untested |
 | macOS / Windows / Linux unicode + space `--global-prefix` | 3.3 | pass | n/a | n/a | pass | pass | pass | pass | n/a |
 | windows-latest `-g` inside a Bundler project | 3.3.12 | pass | pass | untested | pass | pass | untested | untested | untested |
-| rvm, chruby, asdf | any | untested | untested | untested | untested | untested | untested | untested | untested |
+| Linux, chruby layout (`GEM_HOME=~/.gem/ruby/<v>`) | 3.3.6 | pass | n/a | untested | pass | pass | pass | untested | n/a |
+| Linux, rvm layout (`@app` + `@global` gemsets, incl. a shadowing gemset copy) | 3.3.6 | pass | n/a | untested | pass (patches both) | pass (both) | pass (refuses while the shadowing copy is unpatched) | untested | n/a |
+| asdf | any | untested (same layout as the rbenv rows) | untested | untested | untested | untested | untested | untested | untested |
+| windows-latest, deny-write ACE on the gem dir | 3.4.9 | pass | n/a | n/a | pass (exit 1 `partial_failure`, nothing written) | n/a | pass (refuses) | n/a | pass (fails closed; the ACE also blocks Ruby's own load) |
+| macos-14 system Ruby 2.6 / Bundler 1.17, `-g` inside a project | 2.6 | pass | pass (project `vendor/bundle` untouched) | untested | pass | pass | pass | n/a | n/a |
 
 ## Backlog
 
-1. Re-run #340 / #577 / #652 / #681 / #709 / #729 / #736 / #749 / #751 / #775 / #779 / #796 / #826 / #847 when fixes merge (open PRs #637 (doesn't cover #826 / #847), #684, #712, #731 (doesn't cover #847), #750, #768, #776, #797 (verified for #796), #805 (verified for #779)).
-2. Vendored: other positional-tail shapes (`gem "x", ">= 1", CONST`, `gem "x", *%w[...]`); the run-20 hosted shapes on 2.6.9 / 2.4.22.
-3. Takeover over shapes hosted accepts but vendored refuses: platform gem on a no-CHECKSUMS lock, `eval_gemfile`, `install_if` / `platforms:` blocks; multi-gem takeover on 2.6.9.
-4. Windows: `x64-mingw-ucrt` platform gems in hosted and vendored modes; `BUNDLE_DEPLOYMENT=true` with a CRLF lock; vendored cells and `repair` on Windows and macOS.
-5. **Maintainer request (still open):** global (`-g`) mode remaining cells: rvm / chruby / asdf layouts; a non-writable gem dir on Windows; `-g` inside a project on macOS system Ruby.
-6. Hosted stale-install guard on a Bundler 4 standalone project once #797 lands.
-7. A symlinked env `BUNDLE_GEMFILE` next to a config `gemfile` (macOS `/var` vs `/private/var`).
-8. #340 on Bundler 2.2–2.5; Bundler 1.17 hosted unwind (Ruby ≤ 3.1 probe); `rollback` / `remove` on a custom-lock project.
+1. Re-run #652 / #681 / #709 / #729 / #736 / #749 / #751 / #775 / #826 when fixes merge (open PRs #684, #712, #731, #750, #768, #776, if still open). #826's fix should also accept a bare trailing `;` (see the comment there).
+2. Run the earlier 4.0.17-only cells on 4.0.22: 4.0.19+ now fails frozen installs where 4.0.17 only warned, so a non-canonical lock socket-patch writes would show up there. Priority: multi-gem hosted, H→V takeover, `eval_gemfile`, multi-platform locks, `BUNDLE_DEPLOYMENT`.
+3. Takeover over shapes hosted accepts but vendored refuses: platform gem on a no-CHECKSUMS lock, `eval_gemfile`, `install_if` / `platforms:` blocks.
+4. Windows: `x64-mingw-ucrt` platform gems in hosted and vendored modes; vendored cells and `repair` on Windows and macOS.
+5. Global (`-g`) mode: real rvm / chruby installs on macOS (the Linux env-layout emulation passes); a Windows read-only gem dir that Ruby can still load (an `(R)`-only ACE instead of a deny ACE).
+6. A symlinked env `BUNDLE_GEMFILE` next to a config `gemfile` (macOS `/var` vs `/private/var`).
+7. Bundler 1.17 hosted unwind (Ruby ≤ 3.1 probe); `rollback` / `remove` on a custom-lock project.
 
 ## Known non-bugs
 
@@ -254,3 +276,11 @@ Also on 4.0.17: BOM `Gemfile` passes; symlinked `Gemfile` / lock is refused (pas
 - A hosted declaration whose name is also mentioned inside `=begin`/`=end`, a heredoc or after `__END__` is refused with `redirect_gem_declared_more_than_once` (nothing written). It's fail-closed, so it's not filed (run 20).
 - Hosted `rollback` of `gem "x", *V` / `gem "x", ENV.fetch(…)` leaves `gem "x", "<ver>", *V`: the documented exact-pin restore plus the kept argument. The lock is byte-restored and frozen installs pass (run 20).
 - `bughunt/bundler/20261005-global-macos` is left behind if `git push --delete` fails; its workflow is push-triggered only.
+- Bundler 4.0.19+ fails a frozen install with exit 16 ("Your lockfile needs to be updated, but it can't be because frozen mode is set") for any CRLF lock, including a pristine one with no socket-patch involvement (4.0.17 only printed "Cannot write a changed lockfile while frozen." and exited 0). It's Bundler's own change (rubygems #9750), so CRLF-lock cells on 4.0.19+ can't use frozen installs.
+- Bundler 4.0.18+ `cooldown` ignores versions with no `created_at` and never retracts a locked version, so it doesn't affect a hosted exact pin (checked in the 4.0.22 source, run 21).
+- The hosted stale-install remedy for a Bundler 4 `--standalone` project says "run `bundle install`". Plain `bundle install` then installs into system gems, and the standalone app fails loudly (`LoadError`) until `bundle install --standalone` is re-run, which yields the patched copy. That's a remedy wording nit with no silent unpatching, so it's not filed (run 21).
+- Hosted `rollback` can leave one extra blank line after the `source` line in the Gemfile. That's cosmetic; the lock is byte-restored (run 21).
+- A Bundler project that locks a Ruby default gem (e.g. `uri 0.13.1` on Ruby 3.3.6) gets a regular installed copy from Bundler 4, so the crawler sees and patches it. Default gems only exist as stdlib files (`gems/<name>-<ver>/` empty) outside Bundler (run 21). Clean up after agent tests on system gems: they patch the real system copy.
+- In the Windows probe's MSYS bash, `icacls` needs `MSYS2_ARG_CONV_EXCL="*"`, or `/deny` is converted into a path. A deny-write ACE `(OI)(CI)(W,D,DC)` on the gem dir also makes Ruby's `require` fail, so it only tests fail-closed behavior. Don't check writability by appending to the gem file (`echo >>`): it changes the hash and breaks the cell (run 21).
+- `bughunt/bundler/20261005-win-ro` is also left behind (`git push --delete` hangs up); its workflow is push-triggered only.
+
