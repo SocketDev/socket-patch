@@ -32,7 +32,10 @@ pub fn vulnerabilities_for_manifest(
 /// `patch`. `files` is the (purl-keyed) before/after-hash map the
 /// caller built — semantics for what counts as a "patchable file" differ
 /// between the get and download flows, so the caller owns that decision.
-pub fn build_patch_record(patch: &PatchResponse, files: HashMap<String, PatchFileInfo>) -> PatchRecord {
+pub fn build_patch_record(
+    patch: &PatchResponse,
+    files: HashMap<String, PatchFileInfo>,
+) -> PatchRecord {
     PatchRecord {
         uuid: patch.uuid.clone(),
         exported_at: patch.published_at.clone(),
