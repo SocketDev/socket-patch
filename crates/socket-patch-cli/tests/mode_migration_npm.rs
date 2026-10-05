@@ -34,6 +34,8 @@ use wiremock::{Mock, MockServer, ResponseTemplate};
 
 #[path = "common/cache_env.rs"]
 mod cache_env;
+#[path = "common/hermetic.rs"]
+mod hermetic;
 // yarn legs: release selection (classic) + the manifest-less VEX matrices.
 #[path = "vex_e2e_common/mod.rs"]
 mod vex_e2e_common;
@@ -81,28 +83,12 @@ fn has_corepack_pm(pm: &str) -> bool {
         .unwrap_or(false)
 }
 
-/// Remove ambient `SOCKET_*` (except the hermetic `SOCKET_NO_CONFIG`) and
-/// every `YARN_*` var. Seed-then-scrub for `YARN_NODE_LINKER` (mirrors
-/// `e2e_redirect_yarn_berry_build.rs`): berry lets any yarnrc setting be
-/// overridden by env, so an ambient `YARN_NODE_LINKER=pnp` would silently
-/// build a PnP tree and void the node_modules probes.
-fn scrub_socket_env(cmd: &mut Command) {
-    cmd.env("YARN_NODE_LINKER", "pnp");
-    for (k, _) in std::env::vars_os() {
-        let key = k.to_string_lossy();
-        if (key.starts_with("SOCKET_") || key.starts_with("YARN_")) && key != "SOCKET_NO_CONFIG" {
-            cmd.env_remove(&k);
-        }
-    }
-    cmd.env_remove("VIRTUAL_ENV");
-    cmd.env_remove("YARN_NODE_LINKER");
-}
-
 fn corepack(cwd: &Path, pm: &str, args: &[&str], extra_env: &[(&str, &str)]) -> Output {
     let mut cmd = Command::new("corepack");
     cmd.arg(pm).args(args).current_dir(cwd);
     // Scrub FIRST, then the hermetic flags, then per-call env (last wins).
-    scrub_socket_env(&mut cmd);
+    hermetic::scrub_socket_vars(&mut cmd);
+    hermetic::scrub_extra(&mut cmd, &[hermetic::Extra::Venv, hermetic::Extra::Yarn]);
     cache_env::isolate(&mut cmd);
     cmd.env("COREPACK_ENABLE_DOWNLOAD_PROMPT", "0")
         // No global mirror/cache: the fresh-checkout legs must not be able to
@@ -120,9 +106,9 @@ fn run_socket(cwd: &Path, args: &[&str]) -> (i32, String, String) {
 
 /// [`run_socket`] with extra env applied after the scrub.
 fn run_socket_env(cwd: &Path, args: &[&str], env: &[(&str, &str)]) -> (i32, String, String) {
-    let mut cmd = Command::new(binary());
+    let mut cmd = hermetic::command(&binary());
     cmd.current_dir(cwd);
-    scrub_socket_env(&mut cmd);
+    hermetic::scrub_extra(&mut cmd, &[hermetic::Extra::Venv, hermetic::Extra::Yarn]);
     for (k, v) in env {
         cmd.env(k, v);
     }
