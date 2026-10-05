@@ -78,10 +78,10 @@
    A seven-verb model (`scan` read-only, `fix`, `undo`, `sync`, `check`, `list`, `vex`) with mode inferred from the project would cover everything (§4).
 
 6. **There are a few real defects to fix now** (§1), regardless of any refactor:
-   - no HTTP timeouts on the main API client;
-   - a ledger-loss bug in the vendored→hosted takeover;
-   - a planted-binary spawn;
-   - a comment-blind NuGet config reader;
+   - no HTTP timeouts on the main API client (fixed, #581);
+   - a ledger-loss bug in the vendored→hosted takeover (fixed, #708);
+   - a planted-binary spawn (fixed, #617);
+   - a comment-blind NuGet config reader (fixed, #597);
    - `SOCKET_FORCE` bound to three unrelated `--force` flags.
 
 ---
@@ -111,7 +111,7 @@
 |---|---|---|---|---|
 | 1 | **Zip member inflate on committed artifacts** (fixed) | `zip_bytes_match_after_hashes` now streams each member through the Git SHA-256 reader with an 8 KiB buffer and checks the declared length against the bytes read, instead of inflating it into a `Vec` (#587). The maintainer ruled that this data is trusted not to be too big, so the goal was streaming, not a cap. | The three archive caps (512/256/128 MiB) remain; see C15/C21. | {{C01}} |
 | 2 | **No HTTP timeouts on the main API paths** (fixed) | Both `ApiClient` reqwest clients now take `api::retry::ApiTimeouts` (10 s connect, 60 s idle read), and a stalled JSON body reports `ApiError::Network` (#581). Blob/diff downloads still have **no retry**. | One retry and timeout primitive for every HTTP path (Part 7). | {{C02}} |
-| 3 | **Vendored→hosted takeover drops the ledger entry on a drift-keep** | `RevertOutcome.kept_artifact` says callers "must ALSO keep the state.json entry" (`core/vendor/mod.rs:664-673`). `vendored_takeover` (`cli/scan/hosted.rs:1732-1790`) never reads it, deletes the entry, and tells the user that the "committed artifact" was reverted. Every other revert caller honors the flag. | Route takeover through `VendoredBackend`, and add a regression test. | {{C03}} |
+| 3 | **Vendored→hosted takeover drops the ledger entry on a drift-keep** (fixed) | `vendored_takeover` now checks `revert_keeps_wiring` (`kept_artifact`, drift skips, residual references) after each revert and refuses the purl while keeping the ledger entry, like every other revert caller (#708). | The takeover still calls `dispatch_revert_one` directly rather than `VendoredBackend` (Part 2.4). | {{C03}} |
 | 4 | **Planted-binary spawn** (fixed) | Vendored Hatch now resolves `hatch` through `utils::process::resolve_tool_with` and spawns it with `command_for`, so a `hatch` planted in the scanned repo no longer runs (#617). On `0d302dc` no production bare-name `Command::new("<tool>")` remains. | Keep every spawn on `resolve_tool` (Part 7). | {{C04}} |
 | 5 | **Comment-blind NuGet config reader in hosted mode** (fixed) | Hosted routing and its splice anchors now read `nuget.config` through `formats::nuget::parse_config`, so commented-out `<add key>` entries are ignored (#597). The vendored `nuget_feed.rs` reader remains. | Move the vendored reader onto `formats::nuget` too (E11). | {{E01}} |
 | 6 | **`SOCKET_FORCE` is bound to three unrelated flags** | `vendor --force`, `apply --force` and `--update --force` (`vendor.rs:80`, `apply.rs:339`, `update.rs:61` at `045d7ec`). Exporting it to force a self-update also forces `apply`/`vendor` past hash checks. | Per-command env names. | {{C05}} |

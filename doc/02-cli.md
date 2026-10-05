@@ -2,7 +2,7 @@
 
 ## Part 2: CLI command layer and user experience
 
-_Last checked against main @ 045d7ec on 2026-10-05 by audit-core. Owner: audit-core._
+_Last checked against main @ 9c43dfc on 2026-10-05 by audit-core. Owner: audit-core._ Re-checked on `9c43dfc`: the god-function sizes for `vendor_records_reusing`, `run_redirect_selected` and `rollback::run`, the get ↔ scan cycle, `ecosystem_dispatch`'s size and the takeover bypass; the rest is as of `045d7ec` or earlier.
 
 > Scope: `crates/socket-patch-cli/src/` — `args.rs`, `lib.rs`/`main.rs`, `ecosystem_dispatch.rs`, `json_envelope.rs`, `ui/*`, `update_notifier.rs`, and every `commands/*` module.
 
@@ -23,9 +23,9 @@ _Last checked against main @ 045d7ec on 2026-10-05 by audit-core. Owner: audit-c
 | Function | Location | Lines |
 |---|---|---:|
 | `run_scan` | `scan/mod.rs:1429–2968` | **1,540** |
-| `rollback::run` | `rollback.rs:1069–2052` | 984 |
-| `vendor_records_reusing` | `vendor.rs:1971–2932` | 962 |
-| `run_redirect_selected` | `scan/hosted.rs:639–1474` | 836 |
+| `rollback::run` | `rollback.rs:994–2005` (on `9c43dfc`) | 1,012 |
+| `vendor_records_reusing` | `vendor.rs:2189–3232` (on `9c43dfc`) | 1,044 |
+| `run_redirect_selected` | `scan/hosted.rs:652–1583` (on `9c43dfc`) | 932 |
 | `remove::run` | `remove.rs:315–1111` | 797 |
 | `get::run` | `get.rs:2507–3141` | 635 |
 | `rollback_patches_inner` | `rollback.rs:2059–2658` | 600 |
@@ -45,7 +45,7 @@ Mode is three booleans (`apply`/`vendor`/`hosted`). They are referenced 91 times
 ### 2.3 No service layer: commands call each other
 
 Command modules double as libraries and form a dense web:
-- **get ↔ scan cycle:** `get.rs` references `super::scan::` 28 times (hosted engine, vendor step, `ScanMode`), and scan's agent mode imports `get::download_and_apply_patches_with`/`DownloadParams`/`DownloadRun`.
+- **get ↔ scan cycle:** `get.rs` references `scan::` 33 times on `9c43dfc` (hosted engine, vendor step, `ScanMode`), and scan's agent mode imports `get::download_and_apply_patches_with`/`DownloadParams`/`DownloadRun` (plus `decide_patch_action`, `short_uuid`, and `download_patch_records_reusing` in `vendor_flow`). Breaking it is child 2 of the engine-to-core tracking issue. {{C12}}
 - **Other edges:** remove→rollback (8 refs), vendor→vex (8), apply→vex (6), vendor↔rollback, repair→rollback+list, vex_sources→get.
 - **`get` runs the agent apply by building fake CLI args:** `ApplyArgs { nested: Some(NestedApply{..}) }`, then calling `apply::run_locked` (`get.rs:2314–2341`).
 - **A lossy argument round trip:** GlobalArgs → `DownloadParams` → GlobalArgs.
@@ -57,12 +57,7 @@ Command modules double as libraries and form a dense web:
 
 - **`ProjectContext`.** Its doc says "`scan`, `vendor`, `vex`, `list` and `get` read these through one ProjectContext". It actually has **3 call sites** (list, scan, get). `vex` calls `LoadedLedgers::load` directly; `vendor` calls `inventory_project*` and `discover_wiring` directly. `load_state(` appears 27 times across 12 command files, and `read_manifest(` 15 times across 9.
 - **`VendoredBackend`** ("the one vendored-mode backend") has 8 users, but `run_vendor_gc` (`vendor.rs:3400, 3436`) and the hosted takeover (`scan/hosted.rs:1700, 1733`) call `dispatch_revert_one` directly.
-- **A bug caused by the bypass (verified by reading).**
-  - Core's `RevertOutcome.kept_artifact` (`core/vendor/mod.rs:664–673`) says that after a drift-keep, callers "must ALSO keep the state.json entry".
-  - `vendored_takeover` (`scan/hosted.rs:1732–1790`) never reads `kept_artifact`. On success it drops the ledger entry, saves, and emits `redirect_takeover_reverted_vendored` ("reverted its vendored wiring, ledger entry, and committed artifact"). Reproduced on `1169ae6`: after the takeover the ledger entry is gone and the artifact dir is still there. {{C03}}
-  - On a drifted lock this orphans the artifact and loses the only recorded originals.
-  - Every other revert caller handles the flag (vendor.rs ×6, gc.rs, `vendored_backend`).
-  - Needs a regression test.
+- **The takeover bypass no longer loses ledger entries.** `vendored_takeover` still calls `dispatch_revert_one` directly, but since #708 it checks `revert_keeps_wiring` (`kept_artifact`, a drift-skipped record, or a residual-reference warning) after every successful revert, dry and wet, and refuses the purl with the drifted-takeover warning while keeping the ledger entry, like the other revert callers. `mode_migration_pypi::drifted_vendored_line_refuses_takeover` guards it. {{C03}}
 
 ### 2.5 Configuration flows through process environment
 
@@ -172,7 +167,7 @@ That is **7 verbs instead of 9 visible + 2 hidden + 2 aliases + 3 hidden flag sp
 | R8 | Per-command flags: delete `--vendor-source`; move hosted `--no-*`, vendor and agent knobs to the commands that read them; validate `--download-mode` at parse time; reject unused flags (warn for one minor first) | −150 | MAJOR |
 | R9 | Drop deprecated spellings (`--apply`, `--vendor`, `--no-apply`, `download`, `gc`); give `SOCKET_FORCE` per-command names | −100 + tests | MAJOR |
 | R10 | Drop embedded `--vex` in favor of `fix && vex -O` | −600 and 15 flag instances | MAJOR, technically low |
-| R11 | Move `ecosystem_dispatch` (816 production lines of pure crawler fan-out), `vendor_records_reusing` and the disk hosted orchestration into core behind one orchestrator over `ProjectView` | −2K to −4K over time | High; incremental |
+| R11 | Move `ecosystem_dispatch` (950 production lines of pure crawler fan-out on `9c43dfc`; its only CLI dependency is `GlobalArgs`), `vendor_records_reusing` and the disk hosted orchestration into core behind one orchestrator over `ProjectView` | −2K to −4K over time | High; incremental. {{C12}} |
 
 ### New findings since the review
 
