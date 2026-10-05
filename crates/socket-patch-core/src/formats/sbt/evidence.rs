@@ -441,7 +441,14 @@ fn xml_unescape(raw: &str) -> String {
     while let Some(at) = rest.find('&') {
         out.push_str(&rest[..at]);
         rest = &rest[at..];
-        let Some(end) = rest.find(';') else { break };
+        // Entities are short (`&#x10FFFF;` is the longest), so look for the
+        // `;` only that far: scanning the whole remainder for every stray
+        // `&` is quadratic on a crafted report.
+        let Some(end) = rest.as_bytes().iter().take(12).position(|&b| b == b';') else {
+            out.push('&');
+            rest = &rest[1..];
+            continue;
+        };
         let entity = &rest[1..end];
         let decoded = match entity {
             "amp" => Some('&'),

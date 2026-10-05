@@ -62,9 +62,16 @@ pub(crate) fn gate(
     base: &str,
 ) -> Result<Vec<JvmWarning>, GateStop> {
     let vendored = already_vendored(project_root, g, a, base);
+    // An already vendored GAV skips the evidence checks below, but a
+    // repository directive needs only the sources, so it is checked first:
+    // adding one must refuse even before the next build refreshes evidence.
+    let early_directive = || {
+        let sources = evidence.map(|e| e.sources.as_slice()).unwrap_or_default();
+        directive_refusal(project_root, sources, g, a)
+    };
     let Some(e) = evidence.filter(|e| !e.resolution.is_empty()) else {
         if vendored {
-            return Ok(Vec::new());
+            return early_directive().map_or(Ok(Vec::new()), Err);
         }
         return Err(skip(
             "vendor_scala_cli_resolution_missing",
@@ -76,7 +83,7 @@ pub(crate) fn gate(
         ));
     };
     if e.stale && vendored {
-        return Ok(Vec::new());
+        return early_directive().map_or(Ok(Vec::new()), Err);
     }
     if e.stale {
         return Err(skip(
@@ -133,20 +140,8 @@ pub(crate) fn gate(
             ))
         }
     }
-    if let Some((file, found)) = repository_directive(project_root, &e.sources, g) {
-        let detail = match found {
-            Directive::Repository => format!(
-                "{file} declares a repository; scala-cli consults it before the vendored tree, so \
-                 a copy of {g}:{a} there would win silently. Move it to COURSIER_REPOSITORIES \
-                 (consulted after the tree) or use hosted mode"
-            ),
-            Directive::DepUrl => format!(
-                "{file} pins a {g} dependency to a direct `url=`, which scala-cli fetches \
-                 instead of resolving it from any repository, so the vendored tree would never \
-                 serve it. Drop the `url=` or use hosted mode"
-            ),
-        };
-        return Err(refuse("vendor_scala_cli_repository_shadowed", detail));
+    if let Some(stop) = directive_refusal(project_root, &e.sources, g, a) {
+        return Err(stop);
     }
     if let Some(path) = resolved_elsewhere(project_root, e, g, a, base) {
         return Err(refuse(
@@ -160,6 +155,30 @@ pub(crate) fn gate(
         ));
     }
     Ok(Vec::new())
+}
+
+/// `vendor_scala_cli_repository_shadowed` when an input declares a
+/// repository or pins `g` to a direct `url=`.
+fn directive_refusal(
+    project_root: &Path,
+    sources: &[PathBuf],
+    g: &str,
+    a: &str,
+) -> Option<GateStop> {
+    let (file, found) = repository_directive(project_root, sources, g)?;
+    let detail = match found {
+        Directive::Repository => format!(
+            "{file} declares a repository; scala-cli consults it before the vendored tree, so \
+             a copy of {g}:{a} there would win silently. Move it to COURSIER_REPOSITORIES \
+             (consulted after the tree) or use hosted mode"
+        ),
+        Directive::DepUrl => format!(
+            "{file} pins a {g} dependency to a direct `url=`, which scala-cli fetches \
+             instead of resolving it from any repository, so the vendored tree would never \
+             serve it. Drop the `url=` or use hosted mode"
+        ),
+    };
+    Some(refuse("vendor_scala_cli_repository_shadowed", detail))
 }
 
 /// Whether the committed tree's index already lists `g:a:base` (under any
@@ -429,6 +448,21 @@ mod tests {
         assert_eq!(
             code(gate(root, None, "com.typesafe", "config", "1.4.4")),
             ("vendor_scala_cli_resolution_missing", true)
+        );
+        // A repository directive needs no evidence to refuse: adding one
+        // (which also makes the evidence stale) is caught before a rebuild.
+        std::fs::write(
+            root.join("Main.scala"),
+            "//> using repository https://nexus.corp/maven\nobject Main\n",
+        )
+        .unwrap();
+        assert_eq!(
+            code(gate(root, None, "com.typesafe", "config", "1.4.3")),
+            ("vendor_scala_cli_repository_shadowed", false)
+        );
+        assert_eq!(
+            code(gate(root, Some(&stale), "com.typesafe", "config", "1.4.3")),
+            ("vendor_scala_cli_repository_shadowed", false)
         );
     }
 

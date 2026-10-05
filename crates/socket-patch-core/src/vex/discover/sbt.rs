@@ -51,35 +51,98 @@ pub(crate) async fn extract(ctx: &DiscoverCtx<'_>, out: &mut Discovery) {
     if hosted.is_none() && vendored.is_none() {
         return;
     }
-    let res = evidence(ctx.root).await;
+    let (res, blocker) = evidence(ctx.root).await;
+    let blocker = blocker.as_deref();
     let mut hashes = Hashes::default();
     if let Some(text) = hosted {
         if let Some(pins) = strict(SbtFileMode::Hosted, &text, out) {
             for pin in pins {
-                hosted_ref(ctx, &pin, res.as_ref(), &mut hashes, out).await;
+                hosted_ref(ctx, &pin, res.as_ref(), blocker, &mut hashes, out).await;
             }
         }
     }
     if let Some(text) = vendored {
         if let Some(pins) = strict(SbtFileMode::Vendored, &text, out) {
             for pin in pins {
-                vendored_check(ctx, &pin, res.as_ref(), &mut hashes, out).await;
+                vendored_check(ctx, &pin, res.as_ref(), blocker, &mut hashes, out).await;
             }
         }
     }
 }
 
 /// The build's resolution evidence, read off disk (`None` when there is
-/// none).
-async fn evidence(root: &Path) -> Option<JvmResolution> {
+/// none), and why it cannot vouch for any pin even where it shows one
+/// ([`evidence_blocker`]).
+async fn evidence(root: &Path) -> (Option<JvmResolution>, Option<String>) {
     let root = root.to_path_buf();
     tokio::task::spawn_blocking(move || {
-        let e = crate::crawlers::sbt_evidence::discover(&root)?;
-        crate::crawlers::sbt_evidence::resolution(&e)
+        let Some(e) = crate::crawlers::sbt_evidence::discover(&root) else {
+            return (None, None);
+        };
+        let res = crate::crawlers::sbt_evidence::resolution(&e);
+        let blocker = res.as_ref().and_then(|res| evidence_blocker(&e, res));
+        (res, blocker)
     })
     .await
-    .ok()
-    .flatten()
+    .unwrap_or_default()
+}
+
+/// The build-wide conditions under which evidence showing the pin is not
+/// enough (the same ones the hosted rewriter's `check_new` gate refuses a
+/// new pin on): a build source newer than some project's evidence, a
+/// declared project with no evidence (only part of the build resolved), a
+/// project definition that cannot be read statically, or a build source
+/// reassigning `dependencyOverrides`, which replaces the generated override
+/// where it applies.
+fn evidence_blocker(
+    e: &crate::crawlers::sbt_evidence::SbtEvidence,
+    res: &JvmResolution,
+) -> Option<String> {
+    use crate::formats::sbt::build::{declared_projects, scan_build_sources};
+    if e.stale {
+        return Some(
+            "a build source changed after the last `sbt update`; run `sbt update`".to_string(),
+        );
+    }
+    let Some(declared) = declared_projects(&e.build_sources) else {
+        return Some(
+            "the build's project definitions cannot be read statically, so its evidence may \
+             not cover every project"
+                .to_string(),
+        );
+    };
+    let missing: Vec<&str> = declared
+        .values()
+        .filter(|dir| !res.projects_seen.contains(*dir))
+        .map(String::as_str)
+        .collect();
+    if !missing.is_empty() {
+        return Some(format!(
+            "no resolution evidence for project(s) {}; run `sbt update` for the whole build",
+            missing.join(", ")
+        ));
+    }
+    let findings = scan_build_sources(&e.build_sources);
+    if !findings.overrides_assignment.is_empty() {
+        return Some(format!(
+            "{} reassign(s) `dependencyOverrides`, which replaces the pin where it applies",
+            findings.overrides_assignment.join(", ")
+        ));
+    }
+    None
+}
+
+/// [`verify`], unless the evidence as a whole cannot vouch for a pin.
+async fn verify_with(
+    pin: &SbtPin,
+    res: Option<&JvmResolution>,
+    blocker: Option<&str>,
+    hashes: &mut Hashes,
+) -> Result<(), String> {
+    match (res, blocker) {
+        (Some(_), Some(why)) => Err(why.to_string()),
+        _ => verify(pin, res, hashes).await,
+    }
 }
 
 /// The pins of a generated file of `mode`, or `None` after a diagnostic.
@@ -188,6 +251,7 @@ async fn hosted_ref(
     ctx: &DiscoverCtx<'_>,
     pin: &SbtPin,
     res: Option<&JvmResolution>,
+    blocker: Option<&str>,
     hashes: &mut Hashes,
     out: &mut Discovery,
 ) {
@@ -217,7 +281,7 @@ async fn hosted_ref(
         );
         return;
     }
-    let locked = match verify(pin, res, hashes).await {
+    let locked = match verify_with(pin, res, blocker, hashes).await {
         Ok(()) => Some(LockIntegrity::Sha256Hex(pin.jar_sha256.clone())),
         Err(why) => {
             out.diag(
@@ -242,6 +306,7 @@ async fn vendored_check(
     ctx: &DiscoverCtx<'_>,
     pin: &SbtPin,
     res: Option<&JvmResolution>,
+    blocker: Option<&str>,
     hashes: &mut Hashes,
     out: &mut Discovery,
 ) {
@@ -261,7 +326,7 @@ async fn vendored_check(
             return;
         }
     }
-    if let Err(why) = verify(pin, res, hashes).await {
+    if let Err(why) = verify_with(pin, res, blocker, hashes).await {
         out.diag(
             DIAG_SBT_RESOLUTION_UNVERIFIED,
             VENDORED_FILE,
@@ -317,6 +382,43 @@ mod tests {
         r.in_scope.insert(ga);
         r.projects_seen.insert(".".into());
         r
+    }
+
+    /// #690 review: evidence that shows the pin still cannot vouch for it
+    /// when only part of the build resolved, a source changed since, or a
+    /// project reassigns `dependencyOverrides`.
+    #[test]
+    fn evidence_blocker_mirrors_the_new_pin_gate() {
+        use crate::crawlers::sbt_evidence::SbtEvidence;
+        let sources = |extra: &[(&str, &str)]| {
+            let mut v = vec![(
+                "build.sbt".to_string(),
+                "lazy val core = project\nlazy val app = project\n".to_string(),
+            )];
+            v.extend(extra.iter().map(|(a, b)| (a.to_string(), b.to_string())));
+            v
+        };
+        let e = |extra: &[(&str, &str)], stale: bool| SbtEvidence {
+            build_sources: sources(extra),
+            stale,
+            ..Default::default()
+        };
+        let mut all = res(&[SV], None);
+        all.projects_seen = [".", "core", "app"].map(String::from).into();
+        let mut core_only = all.clone();
+        core_only.projects_seen.remove("app");
+
+        assert_eq!(evidence_blocker(&e(&[], false), &all), None);
+        let why = evidence_blocker(&e(&[], false), &core_only).unwrap();
+        assert!(why.contains("app"), "{why}");
+        let why = evidence_blocker(&e(&[], true), &all).unwrap();
+        assert!(why.contains("sbt update"), "{why}");
+        let overrides = [(
+            "app/build.sbt",
+            "dependencyOverrides := Seq(\"org.apache.commons\" % \"commons-text\" % \"1.9\")\n",
+        )];
+        let why = evidence_blocker(&e(&overrides, false), &all).unwrap();
+        assert!(why.contains("app/build.sbt:1"), "{why}");
     }
 
     #[tokio::test]

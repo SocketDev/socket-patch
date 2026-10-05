@@ -337,6 +337,27 @@ fn hosted_grant_writes_the_owned_file_and_reruns_idempotently() {
     assert_eq!(again["redirect"]["redirected"], 1, "{again}");
 }
 
+/// A `socket-patch.sbt` on disk that is not UTF-8 is not absent: the run
+/// refuses (`redirect_sbt_owned_file_unreadable`) and leaves it
+/// byte-identical instead of writing a fresh file over it.
+#[test]
+fn hosted_unreadable_owned_file_is_refused_untouched() {
+    let tmp = tempfile::tempdir().unwrap();
+    let home = SbtHome::new(tmp.path());
+    let project = evidence_project(tmp.path());
+    let latin1: &[u8] = b"// Auteur: Andr\xe9\n";
+    std::fs::write(project.join(HOSTED_FILE), latin1).unwrap();
+    let api = Api::start();
+    api.grant(UUID, GROUP, ARTIFACT, BASE);
+    let (_, json) = get_hosted(&home, &project, &api, UUID);
+    assert!(
+        codes(&json).contains(&"redirect_sbt_owned_file_unreadable".to_string()),
+        "{json}"
+    );
+    assert_eq!(std::fs::read(project.join(HOSTED_FILE)).unwrap(), latin1);
+    assert_eq!(json["redirect"]["redirected"], 0, "{json}");
+}
+
 #[test]
 fn hosted_version_conflict_is_refused() {
     let tmp = tempfile::tempdir().unwrap();

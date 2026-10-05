@@ -567,25 +567,31 @@ pub fn scan_build_sources(sources: &[(String, String)]) -> BuildFindings {
     static OVERRIDE_REPOS: LazyLock<Regex> = LazyLock::new(|| {
         Regex::new(r"(?m)^[^#!\n]*sbt\.override\.build\.repos\s*=\s*true\b").expect("regex")
     });
-    let line_of = |text: &str, at: usize| text[..at].matches('\n').count() + 1;
+    // 1-based line of byte offset `at`, from the text's newline offsets (a
+    // binary search, so many matches in a large file are not quadratic).
+    let newlines =
+        |text: &str| -> Vec<usize> { text.match_indices('\n').map(|(i, _)| i).collect() };
+    let line_of = |nl: &[usize], at: usize| nl.partition_point(|&i| i < at) + 1;
     let mut out = BuildFindings::default();
     for (rel, text) in sources {
         match source_kind(rel) {
             Some(SourceKind::Definition | SourceKind::Subproject) => {
                 let skeleton = lex(text).skeleton;
+                let nl = newlines(&skeleton);
                 for m in OVERRIDES.find_iter(&skeleton) {
                     out.overrides_assignment
-                        .push(format!("{rel}:{}", line_of(&skeleton, m.start())));
+                        .push(format!("{rel}:{}", line_of(&nl, m.start())));
                 }
                 for m in RESOLVERS.find_iter(&skeleton) {
                     out.resolvers_assignment
-                        .push(format!("{rel}:{}", line_of(&skeleton, m.start())));
+                        .push(format!("{rel}:{}", line_of(&nl, m.start())));
                 }
             }
             Some(SourceKind::Opts | SourceKind::Properties) => {
+                let nl = newlines(text);
                 for m in OVERRIDE_REPOS.find_iter(text) {
                     out.override_build_repos
-                        .push(format!("{rel}:{}", line_of(text, m.start())));
+                        .push(format!("{rel}:{}", line_of(&nl, m.start())));
                 }
             }
             Some(SourceKind::Lock) => out.dependency_lock.push(rel.clone()),

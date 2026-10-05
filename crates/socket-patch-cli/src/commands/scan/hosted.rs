@@ -2386,13 +2386,19 @@ fn join_names(names: &[String], max: usize) -> String {
 /// artifacts, then verify with `vex`. After a vendored→hosted takeover
 /// (`vendored_removed`) the commit also has to carry the deleted vendored
 /// ledger entries and artifacts.
-fn format_next_steps(files: &[String], edits: &[socket_patch_core::patch::redirect::FileEdit], vendored_removed: bool) -> Vec<String> {
+fn format_next_steps(
+    files: &[String],
+    edits: &[socket_patch_core::patch::redirect::FileEdit],
+    vendored_removed: bool,
+) -> Vec<String> {
     if files.is_empty() && !vendored_removed {
         return Vec::new();
     }
     let mut commit: Vec<String> = Vec::new();
     if vendored_removed {
-        commit.push(".socket/vendor/ (the removed vendored ledger entries and artifacts)".to_string());
+        commit.push(
+            ".socket/vendor/ (the removed vendored ledger entries and artifacts)".to_string(),
+        );
     }
     commit.extend(files.iter().cloned());
     let npm = files
@@ -2481,30 +2487,43 @@ pub(crate) fn npm_allow_remote_one_line(detail: &str) -> String {
     }
 }
 
-/// The refusal for a Gradle settings file the hosted rewrite writes
-/// without having read it (the planner took it for absent and creates it)
-/// while one is on disk: writing it would replace the user's settings.
+/// The refusal for a generated file the hosted rewrite writes without
+/// having read it (the planner took it for absent and creates it) while one
+/// is on disk: a Gradle settings file or `socket-patch.sbt`. Writing it would
+/// replace the user's file (and a later restore would delete it).
 fn created_settings_over_existing(
     cwd: &std::path::Path,
     done: &socket_patch_core::hosted::engine::Rewritten,
 ) -> Option<socket_patch_core::hosted::engine::Refusal> {
+    use socket_patch_core::formats::sbt::owned_file::HOSTED_FILE as SBT_HOSTED_FILE;
     done.rewrite
         .files
         .keys()
         .filter(|rel| {
             let base = rel.rsplit('/').next().unwrap_or(rel);
-            matches!(base, "settings.gradle" | "settings.gradle.kts")
+            (matches!(base, "settings.gradle" | "settings.gradle.kts") || base == SBT_HOSTED_FILE)
                 && !done.files.contains_key(rel.as_str())
         })
         .find(|rel| std::fs::symlink_metadata(cwd.join(rel)).is_ok())
-        .map(|rel| socket_patch_core::hosted::engine::Refusal {
-            code: socket_patch_core::patch::redirect::gradle::UNREADABLE_REFUSAL_CODE.to_string(),
-            message: format!(
-                "{rel} exists but could not be read, so the hosted Gradle wiring would replace \
-                 it; make it a readable UTF-8 file and re-run; nothing was written"
-            ),
+        .map(|rel| {
+            let sbt = rel.rsplit('/').next() == Some(SBT_HOSTED_FILE);
+            socket_patch_core::hosted::engine::Refusal {
+                code: if sbt {
+                    SBT_OWNED_FILE_UNREADABLE.to_string()
+                } else {
+                    socket_patch_core::patch::redirect::gradle::UNREADABLE_REFUSAL_CODE.to_string()
+                },
+                message: format!(
+                    "{rel} exists but could not be read, so the hosted {} wiring would replace \
+                     it; make it a readable UTF-8 file and re-run; nothing was written",
+                    if sbt { "sbt" } else { "Gradle" }
+                ),
+            }
         })
 }
+
+/// [`created_settings_over_existing`]'s code for `socket-patch.sbt`.
+const SBT_OWNED_FILE_UNREADABLE: &str = "redirect_sbt_owned_file_unreadable";
 
 #[cfg(test)]
 mod tests {

@@ -62,8 +62,8 @@ fn text<'a>(read: ReadFn<'a>) -> impl Fn(&str) -> Option<String> + 'a {
 
 /// [`Shape::Sbt`] for a directory holding an sbt marker, unless the
 /// project is already vendored through the Maven reactor, the legacy
-/// single-pom path or the Gradle backend (its wiring stays on that backend;
-/// a new pin there then plans as before).
+/// single-pom path, the Gradle backend or the scala-cli backend (its wiring
+/// stays on that backend; a new pin there then plans as before).
 pub fn detect(read: ReadFn<'_>) -> Option<Shape> {
     let read_text = text(read);
     if !is_sbt_build(&read_text) {
@@ -75,7 +75,18 @@ pub fn detect(read: ReadFn<'_>) -> Option<Shape> {
     if other_build && read(BUILD_SBT).is_none() && !is_sbt_build_root(&read_text) {
         return None;
     }
-    (!reactor_wired(read) && !legacy_pom_wired(read) && !gradle_wired(read)).then_some(Shape::Sbt)
+    (!reactor_wired(read)
+        && !legacy_pom_wired(read)
+        && !gradle_wired(read)
+        && !scala_cli_wired(read))
+    .then_some(Shape::Sbt)
+}
+
+/// The scala-cli backend already wired this root (its `socket-patch.scala`
+/// or the Coursier tree's index): re-planning it as sbt would replace its
+/// ledger entry and orphan that wiring, which `--revert` then never removes.
+fn scala_cli_wired(read: ReadFn<'_>) -> bool {
+    read(super::scala_cli::ROOT_FILE).is_some() || read(super::coursier_tree::INDEX_REL).is_some()
 }
 
 /// The legacy single-pom path (`vendor/maven_repo.rs`, `Shape::Other`)
@@ -708,6 +719,21 @@ mod tests {
         let read = |p: &str| gradle.get(p).cloned();
         assert_eq!(detect(&read), None);
         assert_eq!(super::super::detect(&read), Shape::Gradle);
+        // A scala-cli build already wired keeps scala-cli when it gains
+        // sbt files.
+        let scala = build(
+            "1.9.9",
+            &[
+                ("project.scala", "//> using scala 3.3.1\n"),
+                (
+                    super::super::scala_cli::ROOT_FILE,
+                    super::super::scala_cli::ROOT_BYTES,
+                ),
+            ],
+        );
+        let read = |p: &str| scala.get(p).cloned();
+        assert_eq!(detect(&read), None);
+        assert_eq!(super::super::detect(&read), Shape::ScalaCli);
         // A single-module pom the legacy path already wired stays legacy
         // (`Shape::Other`); an unwired one beside sbt routes to sbt.
         let legacy = build(
