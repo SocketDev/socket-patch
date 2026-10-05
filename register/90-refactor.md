@@ -1,7 +1,8 @@
 ### Refactor routine (`refactor`, hourly, highest leverage first)
-_Last updated 2026-10-05T17:56Z · main @ c644ab0_
+_Last updated 2026-10-05T18:25Z · main @ a1d4260_
 
 **In flight:**
+- [#876](https://github.com/SocketDev/socket-patch/pull/876): registry clients (`build_registry_client`, Maven `fetch_registry_bytes`) built through one `registry_client_builder` under `ApiTimeouts`; `registry_fetch::download` onto `read_capped`. Also ports the base-red digest-ratchet fix for #646's JVM files. Issue #872 (C49). `ready`.
 
 **Merged:**
 - [#870](https://github.com/SocketDev/socket-patch/pull/870): `go_mod_edit::module_path` on the shared directive walker reads the go.mod `module` directive for VEX `--product` (block form fixed); `go_crawler::parse_go_mod_module` and `product.rs`'s scanner deleted. Issue #781 (E19 Go half). Merged 2026-10-05 as `c644ab0`. Production ≈ +22 / −64, tests ≈ +65 / −117.
@@ -18,13 +19,13 @@ _Last updated 2026-10-05T17:56Z · main @ c644ab0_
 
 | # | Candidate | B | U | D | R | Score | Note |
 |---|---|:-:|:-:|:-:|:-:|:-:|---|
-| 1 | #872 (C49): registry clients onto `ApiTimeouts`; `registry_fetch::download` onto `utils::http::read_capped`; Maven reuses one client | 1 | 0 | ≈2.1 | L | ≈5.1 | skipped: `registry_fetch.rs` changed by #865 (mine), `maven_repo.rs` by #646, #690; p1, filed 2026-10-05T15:52Z |
-| 2 | #856 (E62, child 1 of #855): VEX npm aliases through the core resolver | 1 | 1 | ≈1.8 | M | ≈5 | skipped: `vex_consumed.rs` changed by 20 open PRs, `npm_crawler.rs` by #829 |
-| 3 | #773 (C44): one `Ecosystem::from_cli_name` for flag, env, socket.yml, vendor | 1 | 0 | ≈2 | L | ≈5 | skipped: `commands/vendor.rs` changed by 7 open PRs (#646, #690, #730, #776, #802, #825, #837) |
-| 4 | #816 (E38): CLI `PRODUCT_MANIFESTS` copy → `ProductDetection.present` | 1 | 0 | ≈1 | L | ≈4 | skipped: `commands/vex.rs` changed by #646, #684, #690, #700 |
-| 5 | #871: vendoring-service client out of `api/client.rs` into its own submodule (move only) | 0 | 1 | ≈0.5 | L | ≈2.5 | skipped: `api/client.rs` changed by #865; new 2026-10-05T15:47Z |
+| 1 | #773 (C44): one `Ecosystem::from_cli_name` for flag, env, socket.yml, vendor | 1 | 0 | ≈2 | L | ≈5 | skipped: `commands/vendor.rs` changed by #690, #776, #825, #837 |
+| 2 | #856 (E62, child 1 of #855): VEX npm aliases through the core resolver | 1 | 1 | ≈1.8 | M | ≈5 | skipped: `vex_consumed.rs` changed by 9 open PRs |
+| 3 | #816 (E38): CLI `PRODUCT_MANIFESTS` copy → `ProductDetection.present` | 1 | 0 | ≈1 | L | ≈4 | skipped: `commands/vex.rs` changed by #684, #690, #700 |
+| 4 | #871: vendoring-service client out of `api/client.rs` into its own submodule (move only) | 0 | 1 | ≈0.5 | L | ≈2.5 | eligible since #865 merged |
+| 5 | #631 slice 1 (E52): delete `go_sum_edit` oracle-only free functions | 0 | 0 | ≈1.5 | L | ≈1.5 | eligible |
 
-Re-ranked 2026-10-05T17:00Z: at capacity, 3 open (#858, #865, #870), all `ready` with the burn-down (#865 and #870 approved). #872 takes first place once #865 lands. #631 slice 1 (E52, score ≈1.5) stays the only overlap-free candidate. With 30 other open PRs, most candidates overlap: #823 slice 2, #815, #717, #856 (`vex_consumed.rs`), #773 (`vendor.rs`), #816 (`commands/vex.rs`), #705 and #677 (`api/client.rs`, #865), #693 (`vendor/cargo.rs`, #598), #801 and #782 (`lock_inventory`, `vendor/state.rs`, `redirect/vlt*.rs`), #845 (`npm_crawler.rs`, #829). #726 waits on #858. Decisions (not candidates): #648, #704, #792, #808, #615; C07 needs an owner decision.
+Re-ranked 2026-10-05T18:25Z: #872 won (p1, overlap-free once #865 merged; score ≈5.1) and is in #876. 1 of 3 slots used. With 17 open PRs, #773, #856 and #816 still overlap; #871 and #631 slice 1 are the best overlap-free candidates for the next run. Decisions (not candidates): #648, #704, #792, #808, #615; C07 needs an owner decision.
 
 **Notes:**
 - The sandbox runs as root, so 4 core lib tests fail on main and on branches alike: `copy_tree::relax_loop_must_not_traverse_symlinked_root`, `vlt_heal::an_unremovable_hidden_lock_keeps_every_store_entry`, `pypi_poetry::wire_write_failure_maps_error_and_leaves_lock_untouched`, `pypi_requirements::wire_failure_rolls_back_already_written_files`.
@@ -52,3 +53,5 @@ Re-ranked 2026-10-05T17:00Z: at capacity, 3 open (#858, #865, #870), all `ready`
 - Bugbot may review the PR's start commit when a draft opens; check the review's commit SHA and re-trigger on the real head.
 - go.mod's lexer treats `//` as a comment anywhere, so `module a//b` declares `a`: don't expect `//` inside a token to be rejected.
 - `vendor/berry_zip.rs`'s `berry_cache_checksum_10c0` has only test callers, so a helper used only there is dead code in the lib build.
+- #646 merged inline digests after the `utils::digest` ratchet, so `production_digests_go_through_the_helpers` failed on `main` @ `a1d4260`; #876 carries the fix (`gradle_cache.rs` added to `PENDING_INLINE_DIGESTS` because #690 edits it). Drop it from the list when #706 slice 2 migrates it.
+- A process-global `reqwest::Client` (`LazyLock`) is unsafe in core tests: pooled connections stay bound to the tokio runtime that opened them, and each `#[tokio::test]` has its own runtime. Build per call through a shared builder instead.
