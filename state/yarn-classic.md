@@ -1,6 +1,6 @@
 [agent] Progress ledger for the scheduled Yarn classic (1.x) bug-hunt routine (label pm:yarn-classic).
 
-Last updated: 2026-10-05 (run 19), main `045d7ec`, latest release v4.0.0. Runs 5–19 added the cells in "Run 5 cells" through "Run 19 cells" below. The project-mode matrix below was measured on `f6b7fb9` (v4); cells marked "(v5)", the global matrix and the "v5 project-mode cells" list were re-run on v5.
+Last updated: 2026-10-05 (run 20), main `4646693`, latest release v4.0.0. Runs 5–20 added the cells in "Run 5 cells" through "Run 20 cells" below. The project-mode matrix below was measured on `f6b7fb9` (v4); cells marked "(v5)", the global matrix and the "v5 project-mode cells" list were re-run on v5.
 
 ## Coverage matrix
 
@@ -8,13 +8,13 @@ Cells are "pass", "fail #N", "n/a", "CI" or "untested". H = hosted, V = vendored
 
 | OS | yarn | H baseline | H offline mirror | H/V git dep (`git+…`) | H/V multi-version workspaces + scoped | H⇄V takeover + rollback | H/V CRLF lock + rollback | V baseline | V offline mirror (+pruning, rollback) | A apply + setup |
 | --- | --- | --- | --- | --- | --- | --- | --- | --- | --- | --- |
-| Linux | 1.0.2 | pass | n/a (yarn limitation) | fail #363 | H pass | untested | H pass (run 16) | n/a (yarn ≤1.6 can't install `file:` tarballs) | n/a | pass |
+| Linux | 1.0.2 | pass | n/a (yarn limitation) | H pass (run 20, #363 fixed) | H pass | untested | H pass (run 16) | n/a (yarn ≤1.6 can't install `file:` tarballs) | n/a | pass |
 | Linux | 1.6.0 | pass | n/a (yarn limitation) | untested | H pass | untested | H pass (run 16) | n/a (yarn ≤1.6) | n/a | pass (run 17) |
-| Linux | 1.7.0 | CI | fail #364 (`--offline`) | fail #363 | pass | pass (run 16) | pass (run 16) | pass | untested | pass (run 17) |
+| Linux | 1.7.0 | CI | fail #364 (`--offline`) | pass (run 20, #363 fixed; V git-only: #857) | pass | pass (run 16) | pass (run 16) | pass | untested | pass (run 17) |
 | Linux | 1.9.4 | CI | fail #364 (`--offline`) | untested | untested | untested | untested | CI | pass (run 16) | pass (run 17) |
-| Linux | 1.10.1 | pass | fail #364 | fail #363 | pass | pass | pass (run 16, + BOM) | pass | pass | pass (+ `--install.modules-folder`, run 9) |
+| Linux | 1.10.1 | pass | fail #364 | V git-only: #857 (run 20) | pass | pass | pass (run 16, + BOM) | pass | pass | pass (+ `--install.modules-folder`, run 9) |
 | Linux | 1.17.3 | pass (in-place) | fail #364 | untested | untested | untested | untested | pass (in-place) | pass (run 16) | pass (run 17) |
-| Linux | 1.22.22 | pass (v5, + hosted rollback pass) | fail #364 (v5) | fail #363 (v5; rollback also wrong; still fails on `203e092`) | pass | pass | pass | pass | pass | pass |
+| Linux | 1.22.22 | pass (v5, + hosted rollback pass) | fail #364 (v5) | pass (run 20, #363 fixed by #710; V git-only: #857; H pin + git sibling: #828) | pass | pass | pass | pass | pass | pass |
 | macOS | 1.7.0 | untested | untested | fail #363 | pass | pass | pass | pass | pass (run 18) | pass (run 18) |
 | macOS | 1.10.1 / 1.22.22 | pass (probe) | fail #364 | fail #363 | pass | pass | pass | pass | pass (run 18) | pass (run 18) |
 | Windows | 1.7.0 / 1.10.1 / 1.22.22 | pass (probe) | fail #364 (1.10.1/1.22.22) | fail #363 (vendored: `Couldn't find the binary git`) | pass | pass | pass | pass | pass (run 18) | pass (run 18) |
@@ -128,12 +128,19 @@ Other cells that pass on Linux 1.22.22 (some also on older releases; see the ent
 - **Vendored + `.gitignore` covering the artifact** (`*.tgz`, `vendor/`, `.socket/`), then commit, fresh clone and frozen install: **fail #831** on 1.7.0 / 1.10.1 / 1.22.22. The scan exits 0 silently. With `vendor/` or `.socket/` ignored, `vendor --check` in the clone also exits 0.
 - Vendored + `.gitattributes` `* text eol=lf` / `* text=auto eol=crlf`: pass (1.22.22). `* text eol=crlf` corrupts the `.tgz` (see Known non-bugs).
 
+### Run 20 cells (Linux, `4646693`)
+- #363 verified fixed on real yarn: git-only dep, H (1.0.2 / 1.7.0 / 1.22.22) and V (1.7.0 / 1.22.22), lock untouched, frozen installs OK, nothing attested: pass.
+- **Hosted pin beside a git sibling (workspace registry + `git+…` copies): rollback / remove / list refuse, the takeover skips the restore, and `vendor --revert` lands on hosted: fail, #828 (commented)** on 1.0.2 / 1.7.0 / 1.10.1 / 1.22.22. Pure vendored on the same shape: pass.
+- **Vendored git-only dep: misleading `vendor_lock_entry_not_found` and the git warning dropped: fail #857** (1.7.0 / 1.10.1 / 1.22.22).
+- #758 still reproduces (1.10.1 / 1.22.22). Run-18 battery (agent, V + mirror) on `4646693`: pass. #336 still fails.
+- GitHub shorthand after #710: blocked (no codeload access in the sandbox).
+
 ## Backlog
 
-1. Re-check #363 (PR #710) / #665 (PR #689, including `scan --prune`) / #664 (PR #666) / #627 (PR #802) once merged; re-run #364 on macOS/Windows; re-check #467 / #519 / #558 / #591 / #691 / #692 / #758 / #831 once fixed.
-2. Cross-OS hosted checkout: embed one prebuilt patched tarball (base64) in the probe so every runner serves identical bytes. Add workspaces to the cross-OS vendored probe.
-3. #758 follow-ups: a real registry package with `bundledDependencies`.
-4. Windows directory junctions as `.socket/vendor/npm` (#664 shape), via a probe, after #666.
+1. Re-check #364 (PR #839) / #831 (PR #837) once merged, and #828's yarn git-sibling shape once fixed. Then #467 / #519 / #558 / #591 / #627 / #691 / #692 / #758 / #857.
+2. Hosted-git shorthands (`owner/repo`, `github:`, `bitbucket:`, `gitlab:`) after #710, via a probe (the sandbox can't reach codeload).
+3. Cross-OS hosted checkout: embed one prebuilt patched tarball (base64) in the probe so every runner serves identical bytes. Add workspaces to the cross-OS vendored probe.
+4. #758 follow-ups: a real registry package with `bundledDependencies`.
 5. **Maintainer request (global mode), what's left:** the Windows MSI install of yarn, and a read-only prefix on Windows with a non-admin user. #437 (1.0.x) is still open. macOS case-insensitive name collisions. Same-size patched files on yarn ≤1.9 in-place installs.
 
 ## Known non-bugs
@@ -202,3 +209,6 @@ Other cells that pass on Linux 1.22.22 (some also on older releases; see the ent
 - Leftover probe branch (deletion blocked): `bughunt/yarn-classic/20261005-agent-xos`.
 - **Self-contained mock (run 18):** one Python file serving `left-pad@1.3.0` for all modes (batch, by-package, view with `blobContent`, `…/package` grant with a sha512+sha1 tarball artifact, `/artifacts/<uuid>/…`, `blob/<hash>` for before and after). It lives in the run-18 probe workflow on `bughunt/yarn-classic/20261005-agent-xos`.
 - A `.gitattributes` `* text eol=crlf` (forced text for every file) corrupts the vendored `.tgz` on checkout. The same setting corrupts every binary in the repo, so it's not filed; `vendor --check` reports it (`vendor_artifact_unreadable`). vlt guards it with a `<uuid>/.gitattributes` `* -text`, and the tarball backend doesn't. `* text=auto …` and `* text eol=lf` are fine.
+- #363 / #664 / #665 were closed by #710 / #666 / #689. Don't re-file the git-rewire shape; a git block is now skipped by design (docs/ecosystems.md "yarn classic git dependencies").
+- yarn 1.0.2 installs a single copy (the git one, at the root) for a workspace that has both a registry block and a git block of the same `name@version`. The hosted pin then never reaches `node_modules`, but the scan's `redirect_yarn_classic_git_skipped` warning covers it and `vex` doesn't attest.
+- The sandbox can't reach codeload.github.com, so GitHub-shorthand deps need a probe branch.
