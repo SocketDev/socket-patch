@@ -1,6 +1,6 @@
 [agent] Progress ledger for the scheduled npm bug-hunt routine (label pm:npm).
 
-Last updated: 2026-10-05T12Z (run 20 with a ledger), main `4646693` (about 30 fixes past `045d7ec`, including #356, #732, #325, #665, #687, #557/#817 and #601/#603), latest release v4.0.0 (previous v3.3.0, both from npm `@socketsecurity/socket-patch`). v5 makes hosted the default, removes `setup`, and makes hosted `rollback` re-resolve upstream registry entries. Cells marked (v4) were last verified on `f6b7fb9`.
+Last updated: 2026-10-05T18Z (run 21 with a ledger), main `c644ab0` (adds #813 (#432 fix), #799 (#798 fix), #730 (#725 fix) and more since `4646693`), including #356, #732, #325, #665, #687, #557/#817 and #601/#603), latest release v4.0.0 (previous v3.3.0, both from npm `@socketsecurity/socket-patch`). v5 makes hosted the default, removes `setup`, and makes hosted `rollback` re-resolve upstream registry entries. Cells marked (v4) were last verified on `f6b7fb9`.
 
 ## Coverage matrix
 
@@ -28,6 +28,10 @@ Cells are "pass", "fail #N" or "untested". Every cell uses a real npm install. H
 
 Other 2026-10-05 passes (Linux): prerelease version (`ms@3.0.0-canary.1`) hosted / vendored / agent cycles (npm 10.9.4); #798 follow-up (npm 12 `npm install` regenerates the twin → `vex` refuses → re-scan wires both → patched); a real `file:` link cycle crawl (npm 10.9.4).
 
+## Vendored v2 lock after `npm install` (#879, regression from #813)
+
+npm 7–10 `npm install` on a lockfileVersion 2 lock drops `resolved` from `file:` mirror nodes. Since f023506 (#813), vendored `vex` and `vendor --check` exit 1 on that lock although the tree is patched and npm 6 fails closed. **fail #879** on Linux npm 7.24.2 / 8.19.4 / 10.9.4 (plain and alias). Hosted passes. `1714299` passes. #432 fix itself: hosted alias (npm 6 fails closed EINTEGRITY, npm 8 patched) and vendored alias (npm 6 / 8 patched, revert byte-exact) pass on `c644ab0`.
+
 ## Agent writes through links (#626)
 
 Agent mode follows a `node_modules` link into a workspace member, a `file:` dir or an `npm link` target, overwrites first-party source, and rollback restores upstream bytes. **fail #626** on Linux npm 6 (`file:`) / 8 / 10 / 12, macOS npm 10.9.7, and Windows npm 8 / 10 / 12, also on v4.0.0. Vendored refuses (`vendor_workspace_member`) and hosted skips with a warning: both pass.
@@ -41,6 +45,9 @@ npm 9–11 store an alias as `node_modules/.store/lp@<v>-<h>/node_modules/lp`. A
 `*.tgz`, `vendor/` and `.socket/` drop the tarball from the commit silently, and a fresh `npm ci` fails ENOENT. With `.socket/` ignored, `vendor --check` exits 0. **fail #831** on Linux npm 8.19.4 / 10.9.4 / 12.2.0 (matrix on #831; draft fix #837).
 
 ## Backlog
+
+- **#879 follow-ups:** `npm shrinkwrap` v2 mirror, workspaces, npm 12 on an existing v2 lock; hosted alias `rollback` of the mirror `lp` node (#813).
+- (#852 and #812 re-checked on `c644ab0` 2026-10-05T18Z: both still reproduce.)
 
 - **#852 follow-ups:** agent `rollback` over the alias store copy; a scoped alias; a transitive alias in `.store`.
 - **#732 fix re-check** (human `scan --mode agent` after `npm ci`): needs a mock API, because `--offline` scan is refused. Also re-check #828 on main `4646693`.
@@ -66,6 +73,9 @@ npm 9–11 store an alias as `node_modules/.store/lp@<v>-<h>/node_modules/lp`. A
 8. Stale probe branches the proxy can't delete (2026-10-04T06Z: the session permission policy now refuses `git push --delete` outright, so no new probe branches are pushed until a maintainer allows it or deletes these) (`git push --delete` fails with "remote end hung up" / "Everything up-to-date"; re-checked 2026-10-03T12Z): `bughunt/npm/20260930-alias-linked`, `20260930-win-mac-e2e`, `20260930-win-old-npm`, `20261001-crlf-paths`, `20261001-optional-dep`, `20261001-v5-hosted-global`, `20261001-win-global`, `20261002-v5-agent-vendored-winmac`, `20261003-ws-link-agent`, `20261003-ws-link-mac`. A maintainer needs to delete them.
 
 ## Known non-bugs
+
+- npm 6 `npm ci` that fails EINTEGRITY on a hosted alias pin (#813's fail-closed path) leaves the unpatched registry bytes extracted in `node_modules`. That's npm's partial-install behaviour (exit 1), and `vex` refuses that tree (`not_applied`).
+- Mock tip (2026-10-05T18Z): the org-scoped routes (`--api-url … --org o --api-token fake`) need only batch, by-package, `patches/package`, view and blob, and one granted tarball response serves both hosted and vendored.
 
 - Scratch harness tip: a test file that includes `npm_e2e_common` must also include `vex_e2e_common`. `scan` refuses `--offline` (strict airgap), so use `apply` for offline agent cells.
 
