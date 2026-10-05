@@ -14,7 +14,9 @@ use std::time::Duration;
 
 use crate::api::client::{ApiError, ApiFuture, PatchApi};
 use crate::api::ranking::cmp_search_results;
-use crate::api::types::{BatchPackagePatches, PackageVendorResult, PatchResponse, SearchResponse};
+use crate::api::types::{
+    BatchPackagePatches, PackageVendorResult, PatchResponse, SearchResponse,
+};
 use crate::utils::purl::{normalize_purl, strip_purl_qualifiers};
 
 use super::types::MAX_REFERENCE_BATCH;

@@ -1156,10 +1156,7 @@ async fn workspace_text_migration_heals_on_rerun() {
     }
     let output = command(&fixture.reader, &checkout)
         .args(["install", "--frozen-lockfile", "--ignore-scripts"])
-        .env(
-            "BUN_INSTALL_CACHE_DIR",
-            fixture.temp.path().join("text-cache"),
-        )
+        .env("BUN_INSTALL_CACHE_DIR", fixture.temp.path().join("text-cache"))
         .env("BUN_INSTALL", fixture.temp.path().join("text-home"))
         .output()
         .unwrap();

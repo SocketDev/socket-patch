@@ -1787,11 +1787,7 @@ async fn report_only_scan_json_redirect_state_keys_on_lock_pins() {
         serde_json::json!([{ "purl": purl, "uuid": AGENT_WARN_UUID }]),
         "the lock pin is the record; envelope={v}"
     );
-    assert_eq!(
-        state["wiringLive"],
-        serde_json::json!([purl]),
-        "envelope={v}"
-    );
+    assert_eq!(state["wiringLive"], serde_json::json!([purl]), "envelope={v}");
 
     // No pin, no ledger: the key must stay absent (additive contract).
     let clean = tempfile::tempdir().expect("tempdir");
@@ -1836,8 +1832,7 @@ async fn report_only_scan_json_ignores_a_stale_pre_v5_ledger_record() {
          integrity sha512-orig==\n",
     )
     .unwrap();
-    let ledger_before =
-        std::fs::read(tmp.path().join(".socket/vendor/redirect-state.json")).unwrap();
+    let ledger_before = std::fs::read(tmp.path().join(".socket/vendor/redirect-state.json")).unwrap();
 
     for extra in [&["--prune"][..], &["--mode", "agent", "--dry-run"][..]] {
         let (code, stdout, stderr) = run_scan(tmp.path(), &mock.uri(), extra);
@@ -2058,7 +2053,10 @@ async fn scan_ignores_a_malformed_pre_v5_ledger() {
             "{extra:?}: a pre-v5 ledger is never read, so never reported: {stderr}"
         );
         let v: serde_json::Value = serde_json::from_str(stdout.trim()).expect("valid JSON");
-        assert!(v.get("redirectState").is_none(), "{extra:?}: envelope={v}");
+        assert!(
+            v.get("redirectState").is_none(),
+            "{extra:?}: envelope={v}"
+        );
         assert_eq!(
             std::fs::read(vendor_dir.join("redirect-state.json")).unwrap(),
             b"{ torn ledger",
@@ -2092,11 +2090,7 @@ async fn ecosystems_filter_keeps_records_but_not_wiring_live() {
         /*with_record=*/ true,
     );
 
-    let (code, stdout, stderr) = run_scan(
-        tmp.path(),
-        &mock.uri(),
-        &["--mode", "agent", "--dry-run", "--ecosystems", "pypi"],
-    );
+    let (code, stdout, stderr) = run_scan(tmp.path(), &mock.uri(), &["--mode", "agent", "--dry-run", "--ecosystems", "pypi"]);
     assert_eq!(code, 0, "stdout={stdout}; stderr={stderr}");
     let v: serde_json::Value = serde_json::from_str(stdout.trim()).expect("valid JSON");
     let state = &v["redirectState"];

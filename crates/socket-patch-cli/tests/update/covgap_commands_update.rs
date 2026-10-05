@@ -268,8 +268,9 @@ mod pty {
         let mut child = pair.slave.spawn_command(cmd).expect("spawn in PTY");
         drop(pair.slave);
 
-        let reader_handle =
-            crate::pty_io::PtyOutput::spawn(pair.master.try_clone_reader().expect("clone reader"));
+        let reader_handle = crate::pty_io::PtyOutput::spawn(
+            pair.master.try_clone_reader().expect("clone reader"),
+        );
 
         let mut killer = child.clone_killer();
         std::thread::spawn(move || {
@@ -337,8 +338,7 @@ mod pty {
             "a declined update exits 1 (codebase convention); got: {output}"
         );
         assert!(
-            !output.contains("Updated socket-patch")
-                && !output.contains("Reinstalled socket-patch"),
+            !output.contains("Updated socket-patch") && !output.contains("Reinstalled socket-patch"),
             "a declined update must not report a swap; got: {output}"
         );
 

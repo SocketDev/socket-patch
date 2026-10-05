@@ -16,9 +16,9 @@ use super::get::short_uuid;
 use super::rollback::{
     rollback_patches_inner, run_hosted_leg, sweep_failure, HostedLegOutcome, InnerSelection,
 };
+use crate::commands::vendored_backend::{RevertedEntry, VendorRevertStep, VendoredBackend};
 use crate::args::{apply_env_toggles, GlobalArgs};
 use crate::commands::lock_cli::acquire_or_emit;
-use crate::commands::vendored_backend::{RevertedEntry, VendorRevertStep, VendoredBackend};
 use crate::json_envelope::{Command, Envelope, EnvelopeError, PatchAction, PatchEvent, Status};
 use crate::ui::plural;
 

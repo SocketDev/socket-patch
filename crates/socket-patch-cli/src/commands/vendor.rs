@@ -283,7 +283,10 @@ pub(crate) async fn dispatch_revert_one_opts(
 /// entry (fail-safe): ecosystems other than npm, cargo and pypi (whose
 /// probe covers the requirements flavor only) have no in-use probe yet,
 /// and a missing/unreadable lockfile proves nothing.
-pub(crate) async fn dispatch_in_use_one(entry: &VendorEntry, project_root: &Path) -> Option<bool> {
+pub(crate) async fn dispatch_in_use_one(
+    entry: &VendorEntry,
+    project_root: &Path,
+) -> Option<bool> {
     match entry.ecosystem.as_str() {
         "npm" => vendor::npm_flavor::vendored_entry_in_use(entry, project_root).await,
         // Cargo probes the lock entry's shape: detached + `[patch]` pointing

@@ -590,7 +590,9 @@ async fn pdm_saved_interpreter(cwd: &Path) -> Option<PathBuf> {
     let saved = match read_regular_to_string(&cwd.join(".pdm-python")).await {
         Ok(text) => text.trim().to_string(),
         Err(_) => {
-            let text = read_regular_to_string(&cwd.join(".pdm.toml")).await.ok()?;
+            let text = read_regular_to_string(&cwd.join(".pdm.toml"))
+                .await
+                .ok()?;
             let doc = text.parse::<toml_edit::DocumentMut>().ok()?;
             doc.get("python")?.get("path")?.as_str()?.trim().to_string()
         }
@@ -3213,11 +3215,7 @@ mod tests {
         fake_venv(&tmp.path().join("uv-env"), "venv");
         let uv_env = env_of(&[(
             "UV_PROJECT_ENVIRONMENT",
-            tmp.path()
-                .join("uv-env")
-                .join("venv")
-                .to_string_lossy()
-                .into_owned(),
+            tmp.path().join("uv-env").join("venv").to_string_lossy().into_owned(),
         )]);
         assert_eq!(
             find_local_venv_site_packages_with(&project, &uv_env).await,
