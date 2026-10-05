@@ -113,7 +113,7 @@ pub async fn refusal(
 /// as in a single project.
 fn pnpm_settings_elsewhere(root: &Path) -> Option<Refusal> {
     let lock = read_regular_to_string_sync(&root.join(PNPM_LOCK)).ok()?;
-    if !pnpm_lock_version_major(&lock).is_some_and(|major| major >= 9) {
+    if pnpm_lock_version_major(&lock).is_none_or(|major| major < 9) {
         return None;
     }
     let file = governing_workspace_file(root)?;
