@@ -191,6 +191,11 @@ pub(crate) const NOTE_RECORD_FETCH_FAILED: &str = "vex_record_fetch_failed";
 /// the retry (free patches only) — `get` / `scan`'s fallback.
 pub(crate) const NOTE_API_AUTH_FALLBACK: &str = "api_auth_fallback";
 
+/// Omission tag and note: a hosted Gradle pin is wired, but a lock file
+/// records a release above its base, which that build resolves instead
+/// (`vex::Unattested`).
+pub(crate) const NOTE_LOCK_ABOVE_BASE: &str = "vex_gradle_lock_above_base";
+
 fn note(code: &'static str, detail: String) -> PlanNote {
     PlanNote { code, detail }
 }
@@ -324,6 +329,29 @@ pub(crate) async fn plan(common: &GlobalArgs, sources: Sources, assume_live: &[S
         }
     }
     let superseded = attach_discovered(&mut cands, &discovery, &vendor, &conflicts);
+    // Wired, but a build bypasses the pin (`Unattested`: a Gradle lock
+    // above the hosted base resolves the newer upstream release): the ref
+    // keeps rollback, remove and list working, and the patch is omitted.
+    cands.retain(|c| {
+        let pkg = canonical_base_purl(&c.key);
+        let Some(u) = discovery
+            .unattested
+            .iter()
+            .find(|u| u.uuid == c.uuid && same_package(&u.purl, &pkg))
+        else {
+            return true;
+        };
+        gated.push(failed(&c.key, NOTE_LOCK_ABOVE_BASE));
+        notes.push(note(
+            NOTE_LOCK_ABOVE_BASE,
+            format!(
+                "{}: patch {} is wired, but {}; not attested until that build resolves the \
+                 patch (re-lock it, or roll the patch back once upstream ships the fix)",
+                c.key, c.uuid, u.detail
+            ),
+        ));
+        false
+    });
     for (key, old_uuid, wired) in &superseded {
         notes.push(note(
             NOTE_RECORD_SUPERSEDED,
@@ -1514,6 +1542,47 @@ mod tests {
         assert_eq!(wiring.refs.len(), 1);
         assert_eq!(wiring.refs[0].uuid, U1);
         assert_eq!(plan.hosted.len(), plan.redirected.len());
+    }
+
+    /// #646 review: a hosted ref discovery marks unattested (a Gradle lock
+    /// above the pin's base) is omitted with `vex_gradle_lock_above_base`,
+    /// while the same ref without the mark attests through its wiring.
+    #[tokio::test]
+    async fn an_unattested_hosted_ref_is_gated() {
+        const PURL: &str = "pkg:maven/com.socketfixture/victim@1.10.0";
+        let tmp = tempfile::tempdir().unwrap();
+        let mut redirect = RedirectState::new();
+        redirect.records.insert(PURL.into(), record(U1));
+        let mut found = discovery(vec![hosted_ref(PURL, U1, true)]);
+        found.unattested.push(socket_patch_core::vex::Unattested {
+            purl: PURL.into(),
+            uuid: U1.into(),
+            file: "b/gradle.lockfile".into(),
+            detail: "b/gradle.lockfile:1 locks it above the patched 1.10.0".into(),
+        });
+        let sources = |discovery: Discovery| Sources {
+            manifest: PatchManifest::new(),
+            vendor: VendorState::new(),
+            redirect: Some(redirect.clone()),
+            discovery,
+        };
+        let gated = plan(&common(tmp.path()), sources(found), &[]).await;
+        assert!(gated.view.patches.is_empty() && gated.hosted.is_empty());
+        assert_eq!(gated.gated, vec![failed(PURL, NOTE_LOCK_ABOVE_BASE)]);
+        assert!(
+            gated.notes.iter().any(|n| n.code == NOTE_LOCK_ABOVE_BASE
+                && n.detail.contains("b/gradle.lockfile:1")),
+            "{:?}",
+            gated.notes
+        );
+        let live = plan(
+            &common(tmp.path()),
+            sources(discovery(vec![hosted_ref(PURL, U1, true)])),
+            &[],
+        )
+        .await;
+        assert!(live.gated.is_empty(), "{:?}", live.gated);
+        assert!(live.hosted.contains_key(PURL));
     }
 
     /// Ledger-only records with no wiring anywhere are gated, except the

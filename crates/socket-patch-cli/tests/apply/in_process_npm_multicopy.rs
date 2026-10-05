@@ -398,6 +398,121 @@ fn apply_and_rollback_reach_both_transitive_only_vlt_store_copies() {
     assert_vlt_copies([&primary, &twin], false, "after rollback");
 }
 
+/// pnpm twin: one store entry per peer combination
+/// (`.pnpm/dupvuln@1.0.0_react@18.2.0/` and `…_react@18.3.1/`), the
+/// importer linking the first. Returns `(root, primary index.js, twin
+/// index.js)`; the before and after blobs are both staged.
+#[cfg(unix)]
+fn build_pnpm_peer_variant_tree(tmp: &Path) -> (PathBuf, PathBuf, PathBuf) {
+    let name = "dupvuln";
+    let purl = "pkg:npm/dupvuln@1.0.0";
+    let original = b"module.exports = function(){ return 'VULNERABLE'; };\n";
+    let mut patched = original.to_vec();
+    patched.extend_from_slice(b"// SOCKET-PATCHED-MULTICOPY\n");
+    std::fs::write(
+        tmp.join("package.json"),
+        r#"{ "name": "pnpm-root", "version": "0.0.0" }"#,
+    )
+    .unwrap();
+    let store = tmp.join("node_modules").join(".pnpm");
+    let entry = |id: &str| store.join(id).join("node_modules").join(name);
+    let primary = write_copy(
+        &entry("dupvuln@1.0.0_react@18.2.0"),
+        name,
+        "1.0.0",
+        original,
+    );
+    let twin = write_copy(
+        &entry("dupvuln@1.0.0_react@18.3.1"),
+        name,
+        "1.0.0",
+        original,
+    );
+    std::os::unix::fs::symlink(
+        ".pnpm/dupvuln@1.0.0_react@18.2.0/node_modules/dupvuln",
+        tmp.join("node_modules").join(name),
+    )
+    .unwrap();
+    stage_manifest_and_blob(
+        tmp,
+        purl,
+        &git_sha256(original),
+        &git_sha256(&patched),
+        &patched,
+    );
+    std::fs::write(
+        tmp.join(".socket").join("blobs").join(git_sha256(original)),
+        original,
+    )
+    .unwrap();
+    (tmp.to_path_buf(), primary, twin)
+}
+
+/// The `dupvuln` events of an envelope, as `(action, errorCode)` pairs.
+fn dupvuln_events(v: &serde_json::Value) -> Vec<(String, String)> {
+    v["events"]
+        .as_array()
+        .expect("events array")
+        .iter()
+        .filter(|e| e["purl"] == "pkg:npm/dupvuln@1.0.0")
+        .map(|e| {
+            (
+                e["action"].as_str().unwrap_or_default().to_string(),
+                e["errorCode"].as_str().unwrap_or_default().to_string(),
+            )
+        })
+        .collect()
+}
+
+/// #756: with the primary already patched and only a store twin
+/// unpatched, apply writes the twin and must report the package as
+/// applied (it used to say `already_patched` / `applied: 0`). Rollback is
+/// the mirror: with the primary already original and only the twin
+/// patched, it restores the twin and must count it as rolled back (it used
+/// to say `rolledBack: 0` / `alreadyOriginal: 1`). Covered for both pnpm
+/// and vlt store layouts, which share the fan-out.
+#[cfg(unix)]
+#[test]
+fn apply_and_rollback_report_a_write_to_only_a_store_twin() {
+    for layout in ["pnpm", "vlt"] {
+        let tmp = tempfile::tempdir().unwrap();
+        let (root, primary, twin) = if layout == "pnpm" {
+            build_pnpm_peer_variant_tree(tmp.path())
+        } else {
+            build_vlt_peer_variant_tree(tmp.path(), true)
+        };
+        let original = std::fs::read(&twin).unwrap();
+
+        let (code, v) = run_apply(&root);
+        assert_eq!(code, 0, "{layout}: first apply; envelope={v}");
+        assert_vlt_copies([&primary, &twin], true, "after first apply");
+
+        // A re-created twin: upstream bytes back in the twin only.
+        std::fs::remove_file(&twin).unwrap();
+        std::fs::write(&twin, &original).unwrap();
+        let (code, v) = run_apply(&root);
+        assert_eq!(code, 0, "{layout}: heal apply; envelope={v}");
+        assert_vlt_copies([&primary, &twin], true, "after heal apply");
+        assert_eq!(v["summary"]["applied"], 1, "{layout}: envelope={v}");
+        assert_eq!(v["summary"]["skipped"], 0, "{layout}: envelope={v}");
+        assert_eq!(
+            dupvuln_events(&v),
+            vec![("applied".to_string(), String::new())],
+            "{layout}: envelope={v}"
+        );
+
+        // Upstream bytes back in the primary only: rollback restores the
+        // twin and must say so.
+        std::fs::remove_file(&primary).unwrap();
+        std::fs::write(&primary, &original).unwrap();
+        let (code, v) = run_rollback(&root);
+        assert_eq!(code, 0, "{layout}: rollback; envelope={v}");
+        assert_vlt_copies([&primary, &twin], false, "after rollback");
+        assert_eq!(v["rolledBack"], 1, "{layout}: envelope={v}");
+        assert_eq!(v["alreadyOriginal"], 0, "{layout}: envelope={v}");
+    }
+}
+
 /// #601: a copy bundled inside ANOTHER package's vlt or pnpm store entry
 /// (`.vlt/~npm~bundler@1.0.0/node_modules/bundler/node_modules/dupvuln`)
 /// is what that package loads, so apply must patch it even when the same

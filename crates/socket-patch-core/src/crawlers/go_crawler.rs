@@ -57,54 +57,6 @@ pub fn decode_module_path(encoded: &str) -> String {
     decoded
 }
 
-/// Parse the `module` directive from a go.mod file.
-///
-/// Returns the module path, e.g., `"github.com/gin-gonic/gin"`.
-pub fn parse_go_mod_module(content: &str) -> Option<String> {
-    for line in content.lines() {
-        let trimmed = line.trim();
-        if let Some(rest) = trimmed.strip_prefix("module") {
-            // `module` must be a whole token: the directive is followed by
-            // whitespace. Without this guard, lines like `modulepath = x`
-            // would be misparsed as a module declaration.
-            if !rest.is_empty() && !rest.starts_with(char::is_whitespace) {
-                continue;
-            }
-            // Strip a trailing line comment (`module foo // note`). Module
-            // paths never contain `//`, so the first occurrence is the comment.
-            let rest = match rest.find("//") {
-                Some(idx) => &rest[..idx],
-                None => rest,
-            };
-            let rest = rest.trim();
-            // Handle quoted module paths
-            if rest.len() >= 2 && rest.starts_with('"') && rest.ends_with('"') {
-                let inner = &rest[1..rest.len() - 1];
-                // A quoted-but-empty path (`module ""`) is malformed: Go
-                // module paths are never empty. Treat it as absent rather
-                // than returning `Some("")`, which would later build a
-                // bogus PURL like `pkg:golang/@<version>`. A go.mod has at
-                // most one `module` directive, so skipping here falls
-                // through to `None`.
-                if inner.is_empty() {
-                    continue;
-                }
-                return Some(inner.to_string());
-            }
-            // Unquoted module path. The `module` directive takes a SINGLE
-            // token, so a line like `module foo bar` is malformed (Go rejects
-            // it outright). Return only the first whitespace-delimited token
-            // rather than the whole remainder (`"foo bar"`), which would build
-            // a bogus PURL with a space in the module path and break the later
-            // `split_module_path` namespace/name split.
-            if let Some(token) = rest.split_whitespace().next() {
-                return Some(token.to_string());
-            }
-        }
-    }
-    None
-}
-
 // ---------------------------------------------------------------------------
 // GoCrawler
 // ---------------------------------------------------------------------------
@@ -532,57 +484,6 @@ mod tests {
     }
 
     #[test]
-    fn test_parse_go_mod_module_basic() {
-        let content = "module github.com/gin-gonic/gin\n\ngo 1.21\n";
-        assert_eq!(
-            parse_go_mod_module(content),
-            Some("github.com/gin-gonic/gin".to_string())
-        );
-    }
-
-    #[test]
-    fn test_parse_go_mod_module_quoted() {
-        let content = "module \"github.com/gin-gonic/gin\"\n\ngo 1.21\n";
-        assert_eq!(
-            parse_go_mod_module(content),
-            Some("github.com/gin-gonic/gin".to_string())
-        );
-    }
-
-    #[test]
-    fn test_parse_go_mod_module_missing() {
-        let content = "go 1.21\n\nrequire (\n\tgithub.com/gin-gonic/gin v1.9.1\n)\n";
-        assert_eq!(parse_go_mod_module(content), None);
-    }
-
-    #[test]
-    fn test_parse_go_mod_module_empty_quoted_path() {
-        // A quoted-but-empty module path is malformed and must not yield
-        // `Some("")` (which would later build a bogus `pkg:golang/@...`
-        // PURL). Mirrors the bare-`module` empty-path regression test.
-        assert_eq!(parse_go_mod_module("module \"\"\n\ngo 1.21\n"), None);
-        // Whitespace-padded variant is equally malformed.
-        assert_eq!(parse_go_mod_module("  module \"\"  \n"), None);
-    }
-
-    #[test]
-    fn test_parse_go_mod_module_multi_token_unquoted() {
-        // `module` takes a single token; a multi-token unquoted line is
-        // malformed. We must not return the whole remainder (`"foo bar"`),
-        // which would build a bogus PURL with an embedded space. Take the
-        // first token only.
-        assert_eq!(
-            parse_go_mod_module("module github.com/foo/bar extra junk\ngo 1.21\n"),
-            Some("github.com/foo/bar".to_string())
-        );
-        // Trailing whitespace alone must not be treated as a second token.
-        assert_eq!(
-            parse_go_mod_module("module github.com/foo/bar   \n"),
-            Some("github.com/foo/bar".to_string())
-        );
-    }
-
-    #[test]
     fn test_decode_module_path_lone_trailing_bang_preserved() {
         // A lone trailing `!` is not a valid Go escape. Decoding must not
         // silently drop it (data loss on a corrupt directory name) — it is
@@ -813,23 +714,6 @@ mod tests {
     }
 
     // -- Regression tests -------------------------------------------------
-
-    #[test]
-    fn test_parse_go_mod_module_trailing_comment() {
-        // A trailing line comment must not leak into the module path.
-        let content = "module github.com/gin-gonic/gin // indirect note\n\ngo 1.21\n";
-        assert_eq!(
-            parse_go_mod_module(content),
-            Some("github.com/gin-gonic/gin".to_string())
-        );
-    }
-
-    #[test]
-    fn test_parse_go_mod_module_word_boundary() {
-        // `module` must be a whole token; `modulepath` is not the directive.
-        let content = "modulepath github.com/should/not/match\ngo 1.21\n";
-        assert_eq!(parse_go_mod_module(content), None);
-    }
 
     #[tokio::test]
     async fn test_crawl_finds_module_with_cache_path_component() {

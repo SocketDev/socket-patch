@@ -8,7 +8,8 @@ Socket service.
 
 The existing single-POM backend remains supported. This change adds reactor and
 Gradle support without automatically migrating existing single-POM repositories.
-Hosted mode keeps its existing behavior.
+Hosted Gradle wiring is a separate backend; see
+[ecosystem support](../ecosystems.md#gradle).
 
 ## Commands
 
@@ -21,10 +22,14 @@ socket-patch vendor --revert
 ```
 
 `scan --mode vendored`, `get --mode vendored`, `vendor`, `repair`, `remove` and
-`rollback` share the v5 vendored backend. Maven discovery still uses the Maven
-local repository; a Gradle-only cache is not a Maven discovery source. An online
-service-backed vendoring request can obtain the upstream POM and Gradle module
-metadata from the registry when they are not cached locally.
+`rollback` share the v5 vendored backend. Discovery reads the Maven local
+repository and the Gradle cache (`<Gradle user home>/caches/modules-2/files-2.1`,
+plus the read-only cache); Gradle-only builds use the Maven local repository
+only when the build can consume it. Upstream POMs, Gradle module metadata and
+classifier jars are taken from any local cache (a Gradle copy must hash to its
+hash directory, a Maven copy with a `.sha1` sidecar must match it); an online
+service-backed request downloads what no cache holds and checks every file
+against the registry's checksums.
 
 `vendor --check` is read-only and offline even without `--offline`. It checks
 artifact hashes, recorded tree files, wiring, Gradle's index and script, and
@@ -84,12 +89,51 @@ builds, buildSrc, and literal `includeBuild` paths inside the checkout. A
 wrapper proving a version below 6.8 is refused before writes; the generated
 script also checks the running Gradle version.
 
+Run vendoring from the Gradle root. A directory an ancestor settings file
+includes (literally, through a relocated `projectDir`, or possibly, when its
+includes cannot be read literally), and a project without a settings file of
+its own below an ancestor settings file, produce `not_build_root`; nothing is
+written, and `repair` refuses there too. A root holding both a `pom.xml` and a
+Gradle build vendors both, in one ledger entry: the Maven half as a one-POM
+reactor (suffixed tree, pin, `maven.config`), the Gradle half as below. A
+refusal of either half writes nothing, and `--check`, `vex`, revert and repair
+always handle both. A single-POM root whose ledger already holds a single-POM
+(`<repository>`) entry stays on the single-POM backend, with a
+`legacy_maven_root` degraded warning that the Gradle build stays unpatched:
+nothing migrates that wiring, so revert and vendor again to wire both builds.
+
 The original GAV is retained under
-`.socket/vendor/gradle/<group-path>/<artifact>/<version>/`. Lockfiles, version
-catalogs and project build scripts stay unchanged. Settings files receive an
-apply line for `.socket/gradle/socket-patch.settings.gradle`. Settings plugin
-and buildscript classpaths receive an in-block exclusive repository entry
-because those classpaths resolve before the apply line runs.
+`.socket/vendor/gradle/<group-path>/<artifact>/<version>/`, with the jar, the
+upstream POM and module, and every classifier jar a build script or catalog
+declares (plus the `sources` jar when a cache or the registry has it, so IDE
+source attachment keeps working). A declared classifier that cannot be sourced
+refuses with `classifier_unavailable`: `exclusiveContent` claims every file of
+the GAV, so a missing one would stop resolving. A classifier jar that carries
+an unpatched copy of a patched member is degraded (`classifier_unpatched_copy`).
+The tree marker lists the patched members beside classifier jars, so `vex`
+re-runs that check from the committed tree and withholds attestation.
+
+Each vendored GA also gets `.socket/vendor/gradle/<group-path>/<artifact>/maven-metadata.xml`,
+derived from the index: every vendored version in Gradle's version order, the
+highest as latest and release, and no `lastUpdated`. Range, prefix and rich
+selectors list versions from it, so vendoring never changes the version Gradle
+selects (`range_declared` notes such a declaration). A declaration set in which
+no selector admits the vendored version is refused with
+`gradle_range_excludes_vendored`. The file is recomputed when a version is
+reverted and removed with the GA's last one.
+
+Lockfiles, version catalogs and project build scripts stay unchanged. Settings
+files receive an apply line for `.socket/gradle/socket-patch.settings.gradle`.
+Settings plugin and buildscript classpaths receive an in-block exclusive
+repository entry because those classpaths resolve before the apply line runs.
+
+The script, the index, the derived metadata and the `.gitattributes` files are
+owned text and are compared line-ending blind, so a `core.autocrlf` checkout
+passes `--check` and reverts clean. `.socket/gradle/.gitattributes` (`* -text`,
+kept while a hosted script remains) and `.socket/vendor/.gitattributes`
+(`gradle-index.tsv -text`, merged into an existing file) keep them out of EOL
+conversion on new checkouts. A settings file vendor created is deleted on
+revert once only whitespace is left of it.
 
 The static script:
 
@@ -103,15 +147,31 @@ The static script:
 When `gradle/verification-metadata.xml` already exists, vendoring updates the
 patched jar's checksum and, when metadata verification is enabled, adds missing
 POM and module entries for the artifact, its parents and imported BOMs.
+An existing entry that holds only a `<pgp>` signature gets a `sha256` beside
+it: the vendored repository has no signatures, so Gradle falls back to
+checksums. With metadata verification on, `--check` and the parent-chain
+check require a checksum, so a tree vendored before this rule fails `--check`.
 Metadata traversal is bounded and covers parent defaults and child property overrides. The backend
 records supplementary entries as shared fragments so either patch can be
 reverted first. Existing verification policy and unrelated checksums are kept.
 A verification file is never created automatically.
 
-Android, Kotlin Multiplatform, `available-at` module redirects, conflicting
-exclusive-content rules and paths leaving the checkout are refused. Nonliteral
-included builds are warned about rather than evaluated. The backend never
-executes user build code to discover settings or metadata.
+The checks read the whole statically known script graph: settings, every
+project's build script, buildSrc and included builds with their convention
+plugins and plugin sources, `apply from` targets and version catalogs.
+Android and Kotlin Multiplatform plugins anywhere, `available-at` module
+redirects, a user `exclusiveContent` rule claiming the patched module
+(`gradle_exclusive_content_conflict`, naming the file; group, subgroup, regex,
+module and version rules) and paths leaving the checkout are refused. Build
+logic the graph cannot follow (a computed `apply from`, a script that is not
+UTF-8) is degraded as `gradle_unscanned_build_logic`, and nonliteral included
+builds as `unwired_build_logic`. A settings file that is not UTF-8 is refused;
+one with a byte-order mark keeps it. The backend never executes user build
+code to discover settings or metadata.
+
+`vex` attests a Gradle entry only while its wiring is live: the apply line and
+index rows are present, the script is intact, and a re-plan over the committed
+tree is refused nowhere and degraded nowhere.
 
 ## Artifact identity and integrity
 
@@ -144,7 +204,7 @@ ledger. Patch updates remove superseded Maven trees after the new wiring is
 committed. Gradle updates keep the same artifact paths. Unrecognized or forged
 paths cannot direct writes outside the backend's allowed files.
 
-`repair` redownloads the exact recorded jar and checks regenerated repository metadata against the ledger, preserving project wiring. Offline repair cannot restore missing or corrupt artifacts. The
+`repair` redownloads the exact recorded jar and checks regenerated repository metadata against the ledger, preserving project wiring. A missing classifier jar, POM or derived `maven-metadata.xml` also triggers it: classifier jars are downloaded and checked against registry checksums, a mixed root's two trees come back from one download, and the derived metadata and the owned `.gitattributes` are rewritten when missing (for an otherwise healthy entry too, without a download). Tree directories reached through a link out of the checkout are refused (`vendor_path_unsafe`). Offline repair cannot restore missing or corrupt artifacts. The
 ledger is required for exact reversal; restore a deleted ledger from version
 control. In-place ledger reconstruction remains outside v5's repair contract.
 
@@ -154,10 +214,14 @@ The implementation is covered by planner, disk-safety, lifecycle and command
 integration tests. Real-tool capstones exercise a Maven reactor from fresh
 checkouts, root and module invocations, Gradle strict locking and repository
 mode, existing verification metadata, offline builds, tamper detection and
-byte-exact revert. CI pins Maven 3.6.3, 3.8.9, 3.9.2, 3.9.16 and 4.0.0-rc-6,
-and Gradle 6.9.4, 7.6.4, 8.14.3 and 9.8.0, with macOS and Windows coverage.
+byte-exact revert; `e2e_vendor_gradle_build` covers each Gradle rule above
+against a fake Central, asserting on the jar Gradle actually consumes. The PR
+tier pins Maven 3.6.3, 3.8.9, 3.9.2, 3.9.16 and 4.0.0-rc-6 (macOS and Windows on
+3.9.16), and Gradle 6.9.4, 7.6.6, 8.14.3 and 9.8.0 on Linux, plus a Windows
+8.14.3 row; `gradle-compatibility.yml` runs every Gradle version on Linux,
+macOS and Windows nightly.
 
 Automatic single-POM migration, Maven 4 implicit subproject discovery,
-build-time Maven strict pins, dynamic-version repository metadata, classifier
-artifacts, creating Gradle verification policy, and online dependency-graph
-resolution checks remain separate work. They are not enabled by this release.
+build-time Maven strict pins, creating Gradle verification policy, and online
+dependency-graph resolution checks remain separate work. They are not enabled
+by this release.

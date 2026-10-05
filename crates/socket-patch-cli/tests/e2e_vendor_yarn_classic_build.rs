@@ -859,6 +859,126 @@ fn yarn_classic_detached_scan_vendored_fresh_checkout_manifestless_vex() {
     drop(server);
 }
 
+/// #627: with `yarn.lock` a symbolic link to a lock shared with another
+/// checkout, `vendor` refuses as hosted mode does
+/// (`redirect_symlinked_file_unsupported`, exit 1) instead of renaming its
+/// rewrite over the link: the link survives, the shared lock keeps its
+/// pre-run bytes, and real yarn still installs through the link.
+/// `--dry-run` predicts it with a `vendor_would_refuse_symlinked_file`
+/// advisory.
+#[test]
+fn yarn_classic_vendor_refuses_a_symlinked_lock() {
+    if !require_yarn_classic("e2e_vendor_yarn_classic_build", |c| {
+        cache_env::isolate(c);
+    }) {
+        return;
+    }
+
+    let tmp = tempfile::tempdir().unwrap();
+    let proj = tmp.path().join("proj");
+    let shared = tmp.path().join("shared");
+    std::fs::create_dir_all(&proj).unwrap();
+    std::fs::create_dir_all(&shared).unwrap();
+    std::fs::write(
+        proj.join("package.json"),
+        format!(
+            r#"{{"name":"yarn-classic-symlink","version":"0.0.0","private":true,"dependencies":{{"{DEP}":"{DEP_VERSION}"}}}}"#
+        ),
+    )
+    .unwrap();
+    let cache = tmp.path().join("yarn-cache");
+    let cache_env = [("YARN_CACHE_FOLDER", cache.to_str().unwrap())];
+    let install = corepack(
+        &proj,
+        &yarn_classic(),
+        &["install", "--no-progress"],
+        &cache_env,
+    );
+    if !install.status.success() {
+        skip!(
+            "fixture `yarn install` failed (registry unreachable?):\n{}",
+            String::from_utf8_lossy(&install.stderr)
+        );
+        return;
+    }
+    let orig = std::fs::read(proj.join("node_modules").join(DEP).join("index.js")).unwrap();
+    let patched: Vec<u8> = [MARKER.as_bytes(), orig.as_slice()].concat();
+    let purl = format!("pkg:npm/{DEP}@{DEP_VERSION}");
+    stage_patch(&proj, &purl, "package/index.js", &orig, &patched);
+
+    let link = proj.join("yarn.lock");
+    let target = shared.join("yarn.lock");
+    std::fs::rename(&link, &target).unwrap();
+    let lock_before = std::fs::read(&target).unwrap();
+    #[cfg(unix)]
+    std::os::unix::fs::symlink(&target, &link).unwrap();
+    #[cfg(windows)]
+    if std::os::windows::fs::symlink_file(&target, &link).is_err() {
+        skip!("cannot create a file symlink (no SeCreateSymbolicLinkPrivilege)");
+        return;
+    }
+    let cwd = proj.to_str().unwrap();
+
+    let (code, stdout, stderr) = run_socket(
+        &proj,
+        &["vendor", "--json", "--offline", "--dry-run", "--cwd", cwd],
+    );
+    assert_eq!(code, 0, "dry run.\nstdout:\n{stdout}\nstderr:\n{stderr}");
+    let env = parse_envelope(&stdout);
+    assert!(
+        env["events"].as_array().unwrap().iter().any(|e| {
+            e["errorCode"] == "vendor_would_refuse_symlinked_file"
+                && e.to_string().contains("yarn.lock is a symbolic link")
+        }),
+        "dry run predicts the refusal: {env}"
+    );
+
+    let (code, stdout, stderr) =
+        run_socket(&proj, &["vendor", "--json", "--offline", "--cwd", cwd]);
+    assert_eq!(code, 1, "vendor.\nstdout:\n{stdout}\nstderr:\n{stderr}");
+    let env = parse_envelope(&stdout);
+    assert_eq!(
+        env["error"]["code"], "redirect_symlinked_file_unsupported",
+        "{env}"
+    );
+    assert!(
+        std::fs::symlink_metadata(&link)
+            .unwrap()
+            .file_type()
+            .is_symlink(),
+        "the link is kept"
+    );
+    assert_eq!(
+        std::fs::read(&target).unwrap(),
+        lock_before,
+        "the shared lock is untouched"
+    );
+    assert!(
+        !proj.join(".socket/vendor/state.json").exists(),
+        "no ledger entry was committed"
+    );
+
+    // Yarn itself still installs through the link, from the shared lock.
+    let frozen = corepack(
+        &proj,
+        &yarn_classic(),
+        &["install", "--frozen-lockfile", "--offline", "--no-progress"],
+        &cache_env,
+    );
+    assert!(
+        frozen.status.success(),
+        "yarn install --frozen-lockfile through the link:\n{}",
+        String::from_utf8_lossy(&frozen.stderr)
+    );
+    assert!(
+        std::fs::symlink_metadata(&link)
+            .unwrap()
+            .file_type()
+            .is_symlink(),
+        "yarn keeps the link"
+    );
+}
+
 /// #664: two yarn classic projects whose `.socket/vendor/npm` links point
 /// at one shared store, both vendored with the same patch. `rollback` in
 /// project A used to delete the shared uuid dir through the link and

@@ -42,7 +42,8 @@ const MAX_LEGACY_NPM_DEPTH: usize = 64;
 ///   `packages` exists, so it is ignored there;
 /// * otherwise the lockfileVersion 1 `dependencies` tree, recursive
 ///   through nested `dependencies`, `bundled: true` entries skipped (their
-///   nested trees are still walked).
+///   nested trees are still walked), alias nodes decoded
+///   ([`npm_legacy_identity`]).
 pub(crate) fn npm_lock_nodes(doc: &Value) -> Vec<NpmLockNode<'_>> {
     walk_npm_lock(doc, Bundled::Skip, false)
         .into_iter()
@@ -70,6 +71,21 @@ pub(crate) fn npm_lock_located_nodes(doc: &Value) -> Vec<(String, NpmLockNode<'_
 /// (`vex::discover::npm`) weighs it against the rewired entries.
 pub(crate) fn npm_lock_bundled_nodes(doc: &Value) -> Vec<(String, NpmLockNode<'_>)> {
     walk_npm_lock(doc, Bundled::Only, true)
+}
+
+/// The non-bundled nodes of a lockfileVersion 2 lock's legacy
+/// `dependencies` mirror: the tree npm 6 installs from, which
+/// [`npm_lock_nodes`] ignores because npm >= 7 reads `packages`. Empty for
+/// a lock without `packages` (there the tree IS what [`npm_lock_nodes`]
+/// walks). Lockfile discovery weighs these against the `packages` refs.
+pub(crate) fn npm_lock_legacy_mirror_nodes(doc: &Value) -> Vec<NpmLockNode<'_>> {
+    let mut out = Vec::new();
+    if doc.get("packages").and_then(Value::as_object).is_some() {
+        if let Some(deps) = doc.get("dependencies").and_then(Value::as_object) {
+            walk_npm_legacy_dependencies(deps, 0, Bundled::Skip, false, "", &mut out);
+        }
+    }
+    out.into_iter().map(|(_, node)| node).collect()
 }
 
 /// Which side of the bundled split [`walk_npm_lock`] returns.
@@ -119,6 +135,43 @@ impl<'a> NpmLockNode<'a> {
             integrity: field("integrity"),
         }
     }
+
+    /// A legacy `dependencies` node keyed `key`, with an npm alias decoded
+    /// ([`npm_legacy_identity`]).
+    fn legacy(key: &'a str, node: &'a Value) -> Self {
+        let mut out = NpmLockNode::of(key, node);
+        let (name, version) = npm_legacy_identity(key, out.version);
+        out.name = name;
+        out.version = version;
+        out
+    }
+}
+
+/// The package a legacy `dependencies` node (lockfileVersion 1, and the v2
+/// mirror) stands for. npm 6 keys the node by the name it installs under
+/// and, for an alias install (`npm i lp@npm:left-pad@1.3.0`), spells the
+/// target in `version`: `"lp": {"version": "npm:left-pad@1.3.0"}` is an
+/// install of `left-pad@1.3.0` (the `packages` entries carry a `name` field
+/// instead). Anything else is the key at its own `version`. Every reader and
+/// writer of the legacy tree identifies nodes through this one rule (#432).
+pub(crate) fn npm_legacy_identity<'a>(
+    key: &'a str,
+    version: Option<&'a str>,
+) -> (&'a str, Option<&'a str>) {
+    let alias = version
+        .and_then(|v| v.strip_prefix("npm:"))
+        // `@` at index 0 opens a scope; the version follows the LAST `@`.
+        .and_then(|spec| {
+            spec.rfind('@')
+                .filter(|&at| at > 0)
+                .map(|at| spec.split_at(at))
+        })
+        .map(|(name, at_version)| (name, &at_version[1..]))
+        .filter(|(_, v)| !v.is_empty());
+    match alias {
+        Some((name, version)) => (name, Some(version)),
+        None => (key, version),
+    }
 }
 
 fn npm_flag(node: &Value, key: &str) -> bool {
@@ -145,7 +198,7 @@ fn walk_npm_legacy_dependencies<'a>(
             false => String::new(),
         };
         if npm_flag(node, "bundled") == (bundled == Bundled::Only) {
-            out.push((location.clone(), NpmLockNode::of(name, node)));
+            out.push((location.clone(), NpmLockNode::legacy(name, node)));
         }
         if let Some(nested) = node.get("dependencies").and_then(Value::as_object) {
             walk_npm_legacy_dependencies(nested, depth + 1, bundled, locate, &location, out);

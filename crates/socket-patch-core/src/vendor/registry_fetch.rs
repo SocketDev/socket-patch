@@ -1231,7 +1231,7 @@ fn verify_integrity(bytes: &[u8], integrity: &LockIntegrity) -> Result<(), Fetch
     match integrity {
         LockIntegrity::Sri(sri) => verify_sri(bytes, sri).map_err(FetchError::Failed),
         LockIntegrity::Sha1Hex(expect) => {
-            let actual = hex::encode(Sha1::digest(bytes));
+            let actual = crate::utils::digest::sha1_hex_of(bytes);
             if &actual == expect {
                 Ok(())
             } else {
@@ -1241,7 +1241,7 @@ fn verify_integrity(bytes: &[u8], integrity: &LockIntegrity) -> Result<(), Fetch
             }
         }
         LockIntegrity::Sha256Hex(expect) => {
-            let actual = hex::encode(Sha256::digest(bytes));
+            let actual = crate::utils::digest::sha256_hex_of(bytes);
             if actual.eq_ignore_ascii_case(expect) {
                 Ok(())
             } else {
@@ -1251,7 +1251,7 @@ fn verify_integrity(bytes: &[u8], integrity: &LockIntegrity) -> Result<(), Fetch
             }
         }
         LockIntegrity::Sha256AnyOf(expected) => {
-            let actual = hex::encode(Sha256::digest(bytes));
+            let actual = crate::utils::digest::sha256_hex_of(bytes);
             if expected.iter().any(|e| actual.eq_ignore_ascii_case(e)) {
                 Ok(())
             } else {
