@@ -1470,6 +1470,221 @@ mod tests {
             .unwrap();
     }
 
+    /// Build a new-file manifest (empty `beforeHash`) for `names`, writing
+    /// each file under `pkg` with its content so it verifies as patched.
+    async fn write_added_files(pkg: &Path, names: &[&str]) -> HashMap<String, PatchFileInfo> {
+        let mut files = HashMap::new();
+        for name in names {
+            let body = format!("added {name}\n");
+            let path = pkg.join(name);
+            tokio::fs::create_dir_all(path.parent().unwrap())
+                .await
+                .unwrap();
+            tokio::fs::write(&path, body.as_bytes()).await.unwrap();
+            files.insert(
+                name.to_string(),
+                PatchFileInfo {
+                    before_hash: String::new(),
+                    after_hash: compute_git_sha256_from_bytes(body.as_bytes()),
+                },
+            );
+        }
+        files
+    }
+
+    /// #838: a patch that added `six_safe/__init__.py` (a new top-level
+    /// directory in site-packages) must leave no `six_safe/` behind after
+    /// rollback, or Python keeps importing it as a namespace package.
+    #[tokio::test]
+    async fn test_rollback_new_file_prunes_created_top_level_dir() {
+        let site = tempfile::tempdir().unwrap();
+        let blobs = tempfile::tempdir().unwrap();
+        let files = write_added_files(site.path(), &["six_safe/__init__.py"]).await;
+
+        let result = rollback_package_patch(
+            "pkg:pypi/six@1.16.0",
+            site.path(),
+            &files,
+            blobs.path(),
+            false,
+        )
+        .await;
+
+        assert!(result.success, "{:?}", result.error);
+        assert!(
+            tokio::fs::symlink_metadata(site.path().join("six_safe"))
+                .await
+                .is_err(),
+            "the directory apply created must be removed"
+        );
+        assert!(site.path().exists(), "the package root is never removed");
+    }
+
+    /// #838 nested variant: `six_safe/sub/__init__.py` leaves neither
+    /// `six_safe/sub/` nor `six_safe/`, including a `__pycache__/` that
+    /// only holds bytecode for the deleted module.
+    #[tokio::test]
+    async fn test_rollback_new_file_prunes_nested_dirs_and_stale_pycache() {
+        let site = tempfile::tempdir().unwrap();
+        let blobs = tempfile::tempdir().unwrap();
+        let files = write_added_files(site.path(), &["six_safe/sub/__init__.py"]).await;
+        let cache = site.path().join("six_safe/sub/__pycache__");
+        tokio::fs::create_dir_all(&cache).await.unwrap();
+        tokio::fs::write(cache.join("__init__.cpython-313.pyc"), b"pyc")
+            .await
+            .unwrap();
+        tokio::fs::write(cache.join("__init__.cpython-313.opt-1.pyc"), b"pyc")
+            .await
+            .unwrap();
+
+        let result = rollback_package_patch(
+            "pkg:pypi/six@1.16.0",
+            site.path(),
+            &files,
+            blobs.path(),
+            false,
+        )
+        .await;
+
+        assert!(result.success, "{:?}", result.error);
+        assert!(
+            tokio::fs::symlink_metadata(site.path().join("six_safe"))
+                .await
+                .is_err(),
+            "every directory apply created must be removed, deepest first"
+        );
+    }
+
+    /// Pruning stops at the first directory that still holds something
+    /// the patch did not add: an unrelated file, or bytecode for a module
+    /// that still exists.
+    #[tokio::test]
+    async fn test_rollback_new_file_keeps_dirs_that_are_not_empty() {
+        let site = tempfile::tempdir().unwrap();
+        let blobs = tempfile::tempdir().unwrap();
+        let files = write_added_files(site.path(), &["pkg/sub/added.py"]).await;
+        tokio::fs::write(site.path().join("pkg/keep.py"), b"x")
+            .await
+            .unwrap();
+        let cache = site.path().join("pkg/sub/__pycache__");
+        tokio::fs::create_dir_all(&cache).await.unwrap();
+        tokio::fs::write(cache.join("added.cpython-313.pyc"), b"pyc")
+            .await
+            .unwrap();
+        tokio::fs::write(cache.join("other.cpython-313.pyc"), b"pyc")
+            .await
+            .unwrap();
+
+        let result = rollback_package_patch(
+            "pkg:pypi/pkg@1.0.0",
+            site.path(),
+            &files,
+            blobs.path(),
+            false,
+        )
+        .await;
+
+        assert!(result.success, "{:?}", result.error);
+        assert!(!cache.join("added.cpython-313.pyc").exists());
+        assert!(cache.join("other.cpython-313.pyc").exists());
+        assert!(site.path().join("pkg/keep.py").exists());
+    }
+
+    /// Several added files in one new directory: the directory goes once
+    /// the last of them is deleted, whatever order they are processed in.
+    #[tokio::test]
+    async fn test_rollback_new_files_sharing_a_created_dir_prune_it() {
+        let pkg = tempfile::tempdir().unwrap();
+        let blobs = tempfile::tempdir().unwrap();
+        let files = write_added_files(pkg.path(), &["lib/new/a.js", "lib/new/b.js"]).await;
+        tokio::fs::write(pkg.path().join("index.js"), b"x")
+            .await
+            .unwrap();
+        tokio::fs::create_dir_all(pkg.path().join("lib/old"))
+            .await
+            .unwrap();
+        tokio::fs::write(pkg.path().join("lib/old/c.js"), b"x")
+            .await
+            .unwrap();
+
+        let result =
+            rollback_package_patch("pkg:npm/x@1.0.0", pkg.path(), &files, blobs.path(), false)
+                .await;
+
+        assert!(result.success, "{:?}", result.error);
+        assert!(!pkg.path().join("lib/new").exists());
+        assert!(pkg.path().join("lib/old/c.js").exists());
+    }
+
+    /// A symlinked parent directory is never removed or followed by the
+    /// prune: only real, empty directories inside the package go.
+    #[cfg(unix)]
+    #[tokio::test]
+    async fn test_rollback_new_file_prune_never_follows_a_symlinked_dir() {
+        let pkg = tempfile::tempdir().unwrap();
+        let outside = tempfile::tempdir().unwrap();
+        let blobs = tempfile::tempdir().unwrap();
+        let target = outside.path().join("real");
+        tokio::fs::create_dir_all(target.join("inner"))
+            .await
+            .unwrap();
+        std::os::unix::fs::symlink(&target, pkg.path().join("link")).unwrap();
+        let files = write_added_files(pkg.path(), &["link/inner/added.js"]).await;
+
+        let result =
+            rollback_package_patch("pkg:npm/x@1.0.0", pkg.path(), &files, blobs.path(), false)
+                .await;
+
+        assert!(result.success, "{:?}", result.error);
+        assert!(!target.join("inner/added.js").exists());
+        // `inner` is reached through the symlink, so it lives outside the
+        // package and stays; so does `link` itself.
+        assert!(target.join("inner").is_dir());
+        assert!(tokio::fs::symlink_metadata(pkg.path().join("link"))
+            .await
+            .unwrap()
+            .file_type()
+            .is_symlink());
+        assert!(target.exists());
+    }
+
+    /// The prune also works under a read-only (Go cache style) package
+    /// root: the parent is relaxed for the rmdir and its mode restored.
+    #[cfg(unix)]
+    #[tokio::test]
+    async fn test_rollback_new_file_prunes_created_dir_under_readonly_root() {
+        use std::os::unix::fs::PermissionsExt;
+
+        let pkg = tempfile::tempdir().unwrap();
+        let blobs = tempfile::tempdir().unwrap();
+        let files = write_added_files(pkg.path(), &["newdir/added.go"]).await;
+        tokio::fs::set_permissions(pkg.path(), std::fs::Permissions::from_mode(0o555))
+            .await
+            .unwrap();
+
+        let result = rollback_package_patch(
+            "pkg:golang/example.com/x@1.0.0",
+            pkg.path(),
+            &files,
+            blobs.path(),
+            false,
+        )
+        .await;
+
+        let mode = tokio::fs::metadata(pkg.path())
+            .await
+            .unwrap()
+            .permissions()
+            .mode()
+            & 0o7777;
+        tokio::fs::set_permissions(pkg.path(), std::fs::Permissions::from_mode(0o755))
+            .await
+            .unwrap();
+        assert!(result.success, "{:?}", result.error);
+        assert!(!pkg.path().join("newdir").exists());
+        assert_eq!(mode, 0o555);
+    }
+
     /// SECURITY (before-blob hash path-escape at verify): `beforeHash`
     /// comes from the same untrusted manifest as the file keys, but is
     /// joined onto the blobs directory as a path component. A traversal
