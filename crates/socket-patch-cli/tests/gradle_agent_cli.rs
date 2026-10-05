@@ -993,6 +993,15 @@ fn rollback_before_blob_not_matching_the_hash_dir_fails() {
     std::fs::create_dir_all(&dir).unwrap();
     std::fs::write(dir.join(JAR), &patched).unwrap();
     f.manifest(&[(PURL, &[(&format!("package/{JAR}"), &before, &patched)])]);
+    let dry = f.run(&["rollback", "--offline", "--dry-run"]);
+    dry.failed();
+    assert!(
+        dry.json
+            .to_string()
+            .contains("gradle_rollback_hash_mismatch"),
+        "a dry run predicts the refusal: {}",
+        dry.json
+    );
     let out = f.run(&["rollback", "--offline"]);
     out.failed();
     assert!(

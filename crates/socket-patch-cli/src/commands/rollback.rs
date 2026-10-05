@@ -3029,12 +3029,24 @@ async fn rollback_maven_target(
         .file_name()
         .and_then(|n| n.to_str())
         .unwrap_or_default();
-    if gradle && !common.dry_run {
+    if gradle {
         // Check the before-blobs before anything is written, so a refusal
-        // really leaves the patched file in place (and a re-run refuses again).
-        // A missing blob is left to `rollback_package_patch` to report.
+        // really leaves the patched file in place (and a re-run refuses
+        // again); read-only, so a dry run predicts it too. A blob that is
+        // missing, not a regular file or named by an invalid hash is left
+        // to `rollback_package_patch`, whose verify step refuses it without
+        // reading through it.
         for (file, info) in files {
+            if !socket_patch_core::patch::apply::is_valid_blob_hash(&info.before_hash) {
+                continue;
+            }
             let blob = blobs_path.join(&info.before_hash);
+            if !tokio::fs::symlink_metadata(&blob)
+                .await
+                .is_ok_and(|m| m.is_file())
+            {
+                continue;
+            }
             let Ok(bytes) = socket_patch_core::utils::fs::read_regular_to_bytes(&blob).await else {
                 continue;
             };
