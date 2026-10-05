@@ -18,6 +18,8 @@
 //! with `SOCKET_PATCH_GRADLE_E2E_REQUIRED` (`gradle_build_common`). Maven
 //! for #395 via `SOCKET_PATCH_MAVEN_E2E_{MVN,VERSION,REQUIRED}`.
 
+#[path = "common/hermetic.rs"]
+mod hermetic;
 #[path = "prebuilt_common/mod.rs"]
 mod prebuilt_common;
 
@@ -115,12 +117,7 @@ impl World {
     /// `socket-patch <args> --json --cwd <cwd>` with the Gradle user home
     /// as the only JVM cache: `(exit, envelope)`.
     fn socket(&self, cwd: &Path, args: &[&str]) -> (Option<i32>, serde_json::Value) {
-        let mut cmd = Command::new(binary());
-        for (k, _) in std::env::vars_os() {
-            if k.to_string_lossy().starts_with("SOCKET_") {
-                cmd.env_remove(&k);
-            }
-        }
+        let mut cmd = hermetic::command(&binary());
         let mut all: Vec<&str> = args.to_vec();
         let cwd_text = cwd.to_string_lossy().into_owned();
         all.extend(["--json", "--cwd", &cwd_text]);
