@@ -59,11 +59,11 @@ The vendor policy also has three separate hand-written retry loops, plus a first
 ### 7.3 Duplicated utilities (verified)
 
 - **Hashing:**
-  - About 23 production sites inline `hex::encode(Sha256::digest(..))`, and 3 inline `hex::encode(Sha1::digest(..))`. {{C17}}
-  - Private `sha256_hex` copies exist in `ledger_snapshots.rs`, `jvm/mod.rs` and `group_commit.rs`, and `sha1_hex` copies in `maven_repo.rs` and `jvm/mod.rs`.
-  - **Name collision:** `utils::digest::sha256_hex` *validates* that a string is 64-hex, while the copies *compute* a digest. Same name, different meaning.
-  - `sha512_sri` is public in `redirect/vlt_preflight.rs`, yet two vendor files re-inline it, and six test modules each define their own.
-  - The 64-hex validator exists three times: `apply::is_valid_blob_hash`, `client::is_valid_sha256_hex` and `digest::is_hex(s, 64)`.
+  - Since #865, `utils::digest` holds the computations beside the validators: `sha256_hex_of`, `sha1_hex_of`, `sha512_base64_of` and `sha512_sri_of`. Production code in 14 files goes through them, and the ratchet test `production_digests_go_through_the_helpers` fails on a new inline copy. {{C17}}
+  - Six production files still compute inline (its `PENDING_INLINE_DIGESTS` list): `group_commit.rs`, `jvm/mod.rs`, `maven_repo.rs`, `pypi.rs`, `redownload.rs` and `yarn_berry_lock.rs`. Private `sha256_hex` copies remain in `jvm/mod.rs` and `group_commit.rs`, and `sha1_hex` copies in `maven_repo.rs` and `jvm/mod.rs`.
+  - **Name collision:** `utils::digest::sha256_hex` still *validates* a 64-hex string, while the `jvm` and `group_commit` copies *compute* a digest. The new helpers avoid it with an `_of` suffix.
+  - `vlt_preflight::sha512_sri` and the inline SRI blocks in `npm_pack` and `bun_lock` are gone; test modules still define their own.
+  - The 64-hex validator exists twice: `apply::is_valid_blob_hash` and `digest::is_hex(s, 64)` (`client::is_valid_sha256_hex` was folded into the latter by #865).
 - **UUID checks:** five grammars. `client.rs` has one, with a near byte-identical copy in CLI `lib.rs`; `path_safety.rs` accepts lowercase only; `apply.rs` accepts any alphanumeric plus `-` and `_`; `utils/python_script.rs` uses `uuid::Uuid::parse_str`, which also takes simple, braced and `urn:uuid:` forms. {{C18}}
 - **Line endings:** `utils/line_endings.rs` has 7 users, but `python_lock`, `vendor/common::detect_eol` (which contradicts `LineEndings::Mixed`), `redirect::crlf_to_lf` and `poetry_lock` each implement their own rules.
 - **Purls:** `utils/purl.rs` has two builder families (7 unvalidated `build_*` with 21 production callers, and the validated `*_purl`). `vex/product.rs` hand-rolls a third. 42 production `format!("pkg:…")` sites outside `utils/purl.rs` and 24 `starts_with("pkg:<type>/")` checks outside `Ecosystem::from_purl` (counted at `045d7ec`, production code only). The type checks agree today, but the builders already disagree on canonicalization (PyPI names and composer case). {{C20}}
