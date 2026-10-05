@@ -726,8 +726,11 @@ mod tests {
             None,
         )
         .await;
-        assert_eq!(installed_again, installed);
-        let (paths, calls) = tracked_npm_hosted(&common, &installed_again).await;
+        // Since #605 the name-keyed resolver probes bundled trees itself, so
+        // it already returns the aliases and the nested store's peers. Feed
+        // the earlier, alias-free set to keep exercising alias expansion;
+        // the resolver's own set is checked against the same result below.
+        let (paths, calls) = tracked_npm_hosted(&common, &installed).await;
         assert_eq!(calls.len(), 1);
         let mut inputs = calls[0].clone();
         inputs.sort();
@@ -749,6 +752,9 @@ mod tests {
                 .len(),
             paths.len()
         );
+        let (mut resolved, _) = tracked_npm_hosted(&common, &installed_again).await;
+        resolved.sort();
+        assert_eq!(resolved, expected, "the resolver's own copy set");
     }
 
     #[cfg(unix)]
@@ -779,14 +785,19 @@ mod tests {
             None,
         )
         .await;
-        assert!(installed.is_empty(), "{installed:?}");
-        let (mut paths, calls) = tracked_npm_hosted(&common, &installed).await;
+        // Since #605 the name-keyed resolver reaches the alias and its
+        // sibling peers on its own. An alias-only set (what an alias-blind
+        // resolver returns) must still expand to the same copies.
+        let (mut paths, calls) = tracked_npm_hosted(&common, &HashMap::new()).await;
         assert_eq!(calls, vec![vec![alias.clone()]]);
         let mut expected = peers;
         expected.push(alias);
         paths.sort();
         expected.sort();
         assert_eq!(paths, expected);
+        let (mut resolved, _) = tracked_npm_hosted(&common, &installed).await;
+        resolved.sort();
+        assert_eq!(resolved, expected, "the resolver's own copy set");
     }
 
     #[cfg(unix)]
