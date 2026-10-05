@@ -992,7 +992,19 @@ async fn run_check(args: &VendorArgs) -> i32 {
         };
         if failure.is_none() && vendor::jvm::apply::is_jvm_entry(entry) {
             failure = vendor::jvm::apply::check_entry(root, entry, local_repo.as_deref()).err();
-        } else if let (None, Some(discovery)) = (&failure, &discovery) {
+        }
+        // The npm check names the exact unwired lock entry, so it runs
+        // before the generic liveness rule below.
+        if failure.is_none() && entry.ecosystem == "npm" {
+            failure = vendor::npm_flavor::check_npm_wiring(entry, root)
+                .await
+                .err();
+        }
+        if let (None, Some(discovery), false) = (
+            &failure,
+            &discovery,
+            vendor::jvm::apply::is_jvm_entry(entry),
+        ) {
             // A relock (`pipenv lock`, `npm install`, `uv lock`, …) can
             // drop the `.socket/vendor/` reference while the artifact stays
             // intact; a fresh install is then unpatched. Same rule as
@@ -1003,11 +1015,6 @@ async fn run_check(args: &VendorArgs) -> i32 {
                     entry.ecosystem, entry.uuid
                 ));
             }
-        }
-        if failure.is_none() && entry.ecosystem == "npm" {
-            failure = vendor::npm_flavor::check_npm_wiring(entry, root)
-                .await
-                .err();
         }
         if vendor::jvm::apply::upstream_unverified(entry) {
             env.warnings.push(RunWarning {code: "vendor_jvm_upstream_unverified".into(), detail: format!("{key}: upstream metadata was accepted offline; run vendor online to verify registry checksums")});
