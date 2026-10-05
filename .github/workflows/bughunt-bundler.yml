@@ -79,7 +79,7 @@ jobs:
             GD=$(ruby -e 'print Gem::Specification.find_by_name("colorize").gem_dir')
             WGD=$(cygpath -w "$GD"); echo "gem dir: $GD ($WGD)"
             MSYS2_ARG_CONV_EXCL="*" icacls "$WGD" /deny "${USERNAME}:(OI)(CI)(W,D,DC)" /T; MSYS2_ARG_CONV_EXCL="*" icacls "$WGD\\lib\\colorize.rb"
-            echo hi >> "$GD/lib/colorize.rb" && echo "WARNING: still writable" || echo "confirmed not writable"
+            ( : >> "$GD/lib/colorize.rb" ) 2>/dev/null && echo "WARNING: still writable" || echo "confirmed not writable"; sha256sum "$GD/lib/colorize.rb" "$W/orig_colorize.rb"; ruby -e 'require "colorize"; puts :load_ok'
             D="$W/cwd-ro"; mkdir -p "$D"; cd "$D"
             "$BIN" scan -g --mode agent --json $A > scan.json 2>scan.err; echo "scan exit $?"; grep -E '"(scannedPackages|packagesWithPatches)"' scan.json
             "$BIN" get -g pkg:gem/colorize@0.8.1 --yes --json $A > get.json 2>get.err; echo "get exit $?"; cat get.json | head -60; cat get.err | tail -5
