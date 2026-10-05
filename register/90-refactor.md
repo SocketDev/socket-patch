@@ -1,8 +1,9 @@
 ### Refactor routine (`refactor`, hourly, highest leverage first)
-_Last updated 2026-10-05T12:30Z · main @ 4646693_
+_Last updated 2026-10-05T13:30Z · main @ 4646693_
 
 **In flight:**
 - [#850](https://github.com/SocketDev/socket-patch/pull/850): one hermetic `common/hermetic.rs` builder for CLI test children; 8 `scrub_socket_env` copies deleted, 7 unscrubbed spawners made hermetic, `spawn_env_hygiene` ratchet. Issue #823 slice 1 (C30, C47). State: ready for review (2026-10-05T12:30Z), CI and Bugbot pending.
+- [#858](https://github.com/SocketDev/socket-patch/pull/858): one blocking `stage_and_rename_blocking` core with a private `WriteOpts` policy behind the six `utils::fs` writers; `atomic_write_sync`'s copy and `create_stage`/`commit_stage` deleted; one `stage_path` builds `.socket-stage-` and `.socket-dl-` names. Issue #728 (C21). Production +171 / −168, tests ≈ +85 / −12. State: ready for review (2026-10-05T13:30Z), CI and Bugbot pending.
 
 **Merged:**
 - [#607](https://github.com/SocketDev/socket-patch/pull/607): blob and diff downloads stream to disk through `BinaryBody`; one `download_entries` loop replaces the blob and diff copies. Issue #571 (C37). Merged 2026-10-05 as `366b155`. Production ≈ +190 / −80 (`blob_fetcher.rs`, `client.rs`), tests ≈ +230.
@@ -15,13 +16,13 @@ _Last updated 2026-10-05T12:30Z · main @ 4646693_
 
 | # | Candidate | B | U | D | R | Score | Note |
 |---|---|:-:|:-:|:-:|:-:|:-:|---|
-| 1 | #823 slice 1 (C30/C47, child of #824): one `common/hermetic.rs` builder; delete 8 `scrub_socket_env` copies | 0 | 1 | ≈10 | L | ≈12 | taken: PR #850 |
-| 2 | #823 slice 2: the 7 remaining copies + `scan_invariants`, `in_process_npm_multicopy` | 0 | 1 | ≈7 | L | ≈9 | skipped until #763, #774, #802, #820, #837, #839, #849 land |
-| 3 | #815 (E16 child 1 of #814): one `line_endings::terminator` | 0 | 1 | ≈12 | L | ≈14 raw | skipped: copies in files changed by open PRs; take a non-overlapping sub-slice next |
-| 4 | #728 (C21): one `utils::fs` stage-and-rename core | 0 | 1 | ≈3.5 | L | 5.5 | eligible; `utils/fs.rs` untouched by open PRs |
-| 5 | #717 (E10 slice of #715): `formats::maven` element queries for hosted rewrite + restore | 3 | 1 | 4 | M | 13 raw | skipped: `redirect/mod.rs` changed by open PRs #646, #657, #690 |
+| 1 | #728 (C21): one `utils::fs` stage-and-rename core | 0 | 1 | ≈3 | L | ≈5 | taken: PR #858 |
+| 2 | #823 slice 2: the 7 remaining copies + `scan_invariants`, `in_process_npm_multicopy` | 0 | 1 | ≈7 | L | ≈9 | skipped until #850 and #763, #774, #802, #820, #837, #839, #849 land |
+| 3 | #815 (E16 child 1 of #814): one `line_endings::terminator` | 0 | 1 | ≈12 | L | ≈14 raw | skipped: 9 of 12 copies in files changed by open PRs (#820, #827, #841, #690, #646, `redirect/mod.rs`) |
+| 4 | #717 (E10 slice of #715): `formats::maven` element queries for hosted rewrite + restore | 3 | 1 | 4 | M | 13 raw | skipped: `redirect/mod.rs` changed by open PRs #646, #657, #690 |
+| 5 | #726 (C42): `get` writes blobs through the verified cache writer | 1 | 0 | 1 | L | 4 | next after #858 merges (shares `utils/fs.rs`, `blob_fetcher.rs`) |
 
-Re-ranked 2026-10-05T11:56Z: #607 and #602 merged, capacity freed (0 open); #823 had no test-file overlap for 15 of its 25 files, so slice 1 took those. Outside the top five unchanged from the previous run (see the entry for 20261005T115639Z): #706, #693, #707, #747, #773, #794, #746, #663, #757, #631, #809, #816, #832, #835, #834, #845, #844 and smaller. Decisions (not candidates): #648, #704, #792, #808; C07 needs an owner decision.
+Re-ranked 2026-10-05T12:56Z: nothing merged since 11:56Z; 1 open (#850), so #728 was the top candidate free of open-PR file overlap. Outside the top five unchanged from the previous run (see the entry for 20261005T115639Z): #706, #693, #707, #747, #773, #794, #746, #663, #757, #631, #809, #816, #832, #835, #834, #845, #844 and smaller. Decisions (not candidates): #648, #704, #792, #808; C07 needs an owner decision.
 
 **Notes:**
 - The sandbox runs as root, so 4 core lib tests fail on main and on branches alike: `copy_tree::relax_loop_must_not_traverse_symlinked_root`, `vlt_heal::an_unremovable_hidden_lock_keeps_every_store_entry`, `pypi_poetry::wire_write_failure_maps_error_and_leaves_lock_untouched`, `pypi_requirements::wire_failure_rolls_back_already_written_files`.
@@ -41,4 +42,5 @@ Re-ranked 2026-10-05T11:56Z: #607 and #602 merged, capacity freed (0 open); #823
 - `cargo test -p socket-patch-cli --test repair` has 2 root-only failures (`repair_exits_zero_and_stays_quiet_when_lock_file_unremovable`, `repair_cleanup_failure_is_reported_in_json_and_silent_modes`). They chmod a directory read-only.
 - Windows: `DirEntry::metadata().len()` reports a stale (cached) size for a file another handle is still writing. Size live files with `std::fs::metadata(path)` in tests.
 - CLI test targets: 145+ files spawn `socket-patch` with a bare `Command::new(binary())`; `tests/spawn_env_hygiene.rs` keeps `PENDING_RAW_SPAWNS` / `PENDING_SCRUB_COPIES` allowlists that fail on new **and** stale entries — drop a file from the list when you migrate it.
+- `utils::fs` writers run on the blocking pool via `run_blocking` since #858: a test calling them needs a tokio runtime but either flavor works.
 - `cargo test --test repair` under `SOCKET_DRY_RUN=true` is a quick hermeticity probe: on `main` 20 fail, after #850 only the 2 root-only tests.
