@@ -27,12 +27,13 @@ const SUPPORTED_LOCK_VERSIONS: [u64; 3] = [0, 1, 2];
 /// install reads, plus the copy Bun mirrors at the top of a text `bun.lock`
 /// (`  "patchedDependencies": {` … `  },`, one `"key": "path"` line each).
 /// Either source alone is enough: a key missing from one is still a patch
-/// Bun applies. The manifest is read as Bun reads it, comments and trailing
-/// commas allowed ([`strip_jsonc`]); one Bun cannot parse either, and a lock
+/// Bun applies. The manifest is read as Bun reads it, a leading BOM,
+/// comments and trailing commas allowed ([`strip_jsonc`]); one Bun cannot parse either, and a lock
 /// section out of Bun's emitted shape, contribute only what they spell
 /// plainly.
 pub(crate) fn patched_dependency_keys(manifest: Option<&str>, lock: Option<&str>) -> Vec<String> {
     let mut keys: Vec<String> = manifest
+        .map(crate::utils::serde::strip_bom)
         .and_then(|text| {
             serde_json::from_str::<serde_json::Value>(text)
                 .or_else(|_| serde_json::from_str(&strip_jsonc(text)))
@@ -676,6 +677,11 @@ mod tests {
         let jsonc = "{\n  // a comment, \"x\": 1\n  \"name\": \"a//b /* c */\",\n  /* block\n  */\n  \"patchedDependencies\": {\n    \"left-pad@1.3.0\": \"patches/x,}.patch\",\n  },\n}\n";
         assert_eq!(
             patched_dependency_keys(Some(jsonc), None),
+            vec!["left-pad@1.3.0"]
+        );
+        // A Windows-saved manifest leads with a UTF-8 BOM, which Bun skips.
+        assert_eq!(
+            patched_dependency_keys(Some(&format!("\u{feff}{jsonc}")), None),
             vec!["left-pad@1.3.0"]
         );
         let stripped: serde_json::Value = serde_json::from_str(&strip_jsonc(jsonc)).unwrap();
