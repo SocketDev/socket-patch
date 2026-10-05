@@ -98,6 +98,16 @@ pub struct SidecarAdvisory {
 ///   restore` may flag.
 /// * `SidecarFixupFailed` — the fixup itself raised an error
 ///   (I/O, parse). The patch is on disk; the sidecar is not.
+/// * `GradleRefreshReverts` — a jar patched in Gradle's `files-2.1`
+///   cache: `--refresh-dependencies` (or a changed upstream) makes
+///   Gradle download it again, and a new download reverts the patch.
+/// * `GradleDaemonStale` — a Gradle daemon of this user home may
+///   still hold the pre-patch jar (or classes derived from it) in
+///   memory until `gradle --stop`.
+/// * `GradleGlobalCacheShared` — the patched cache is the Gradle user
+///   home every build of this account reads, not just this project.
+/// * `GradleJarLockedByDaemon` — Windows refused the write because a
+///   process (normally a Gradle daemon) holds the jar open.
 #[derive(Debug, Clone, Copy, Serialize, PartialEq, Eq)]
 #[serde(rename_all = "snake_case")]
 pub enum SidecarAdvisoryCode {
@@ -106,6 +116,10 @@ pub enum SidecarAdvisoryCode {
     GoModVerifyFails,
     NugetSignedPackageTampered,
     SidecarFixupFailed,
+    GradleRefreshReverts,
+    GradleDaemonStale,
+    GradleGlobalCacheShared,
+    GradleJarLockedByDaemon,
 }
 
 /// Severity bucket. UI consumers use this for badge color; jq
@@ -197,6 +211,22 @@ mod tests {
             (
                 SidecarAdvisoryCode::SidecarFixupFailed,
                 "sidecar_fixup_failed",
+            ),
+            (
+                SidecarAdvisoryCode::GradleRefreshReverts,
+                "gradle_refresh_reverts",
+            ),
+            (
+                SidecarAdvisoryCode::GradleDaemonStale,
+                "gradle_daemon_stale",
+            ),
+            (
+                SidecarAdvisoryCode::GradleGlobalCacheShared,
+                "gradle_global_cache_shared",
+            ),
+            (
+                SidecarAdvisoryCode::GradleJarLockedByDaemon,
+                "gradle_jar_locked_by_daemon",
             ),
         ];
         for (variant, expected) in cases {

@@ -11,7 +11,6 @@
 
 use std::collections::HashSet;
 use std::path::{Path, PathBuf};
-use std::process::Command;
 
 use wiremock::matchers::{method, path, path_regex};
 use wiremock::{Mock, MockServer, ResponseTemplate};
@@ -23,28 +22,6 @@ fn binary() -> PathBuf {
 const ORG_SLUG: &str = "test-org";
 const UUID_A: &str = "aaaaaaaa-aaaa-4aaa-8aaa-aaaaaaaaaaaa";
 const UUID_B: &str = "bbbbbbbb-bbbb-4bbb-8bbb-bbbbbbbbbbbb";
-
-/// Scrub the binary's entire `SOCKET_*` env surface (keeping telemetry
-/// opt-outs, so an opted-out dev stays opted out) before spawning. These
-/// subprocess tests assert an EXACT envelope, so any `#[arg(env=…)]`
-/// fallback leaking in from the ambient shell (CI, a dev's `.envrc`, …)
-/// can silently redirect the command to a different path (offline mode, a
-/// real api-url, …) — or, for value-parsed args like `SOCKET_LOCK_TIMEOUT`
-/// (u64) and `SOCKET_VENDOR_SOURCE` (enum), turn every invocation into an
-/// exit-2 usage error before `get` even runs. A fixed allowlist here
-/// rotted as flags were added (it predated `SOCKET_LOCK_TIMEOUT`,
-/// `SOCKET_STRICT`, `SOCKET_VENDOR_*`, `SOCKET_PATCH_SERVER_URL` —
-/// ambient `SOCKET_LOCK_TIMEOUT=bogus` failed 6 of these 7 tests); the
-/// prefix scrub can't rot.
-fn scrub_socket_env(cmd: &mut Command) {
-    for (key, _) in std::env::vars_os() {
-        let name = key.to_string_lossy();
-        if name.starts_with("SOCKET_") && !name.contains("TELEMETRY") && name != "SOCKET_NO_CONFIG"
-        {
-            cmd.env_remove(&key);
-        }
-    }
-}
 
 /// Run `socket-patch get <identifier>` with `--json --save-only --yes`
 /// against `api_url` (authenticated mode). Returns (code, stdout, stderr).
@@ -68,9 +45,8 @@ fn run_get_auth(
         ORG_SLUG,
     ];
     args.extend_from_slice(extra);
-    let mut cmd = Command::new(binary());
+    let mut cmd = crate::common::hermetic_command(&binary());
     cmd.args(&args).current_dir(cwd);
-    scrub_socket_env(&mut cmd);
     let out = cmd.output().expect("run socket-patch");
     (
         out.status.code().unwrap_or(-1),

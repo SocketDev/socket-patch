@@ -107,7 +107,7 @@ async fn update_without_resolvable_state_dir_proceeds_unlocked() {
             "unlocked swap must still be a rename, not an overwrite"
         );
     }
-    let out = std::process::Command::new(&install.bin)
+    let out = crate::common::hermetic_command(&install.bin)
         .arg("--version")
         .output()
         .expect("spawn updated binary");

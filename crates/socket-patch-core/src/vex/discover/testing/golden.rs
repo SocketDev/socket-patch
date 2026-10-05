@@ -37,7 +37,7 @@ use std::path::{Path, PathBuf};
 use serde_json::{json, Map, Value};
 
 use crate::vex::discover::{
-    Diag, Discovery, PatchedRef, Recognized, ResolvedElsewhere, UnlockedPin, WiringMode,
+    Diag, Discovery, PatchedRef, Recognized, ResolvedElsewhere, Unattested, UnlockedPin, WiringMode,
 };
 
 /// Set to `1` to (re)write the goldens instead of comparing against them.
@@ -119,6 +119,7 @@ fn render(out: &Discovery, root: &Path) -> Value {
         recognized,
         unlocked_pins,
         elsewhere,
+        unattested,
     } = out;
     let refs: Vec<Value> = refs
         .iter()
@@ -194,14 +195,37 @@ fn render(out: &Discovery, root: &Path) -> Value {
             json!({ "purl": purl, "file": path_str(file) })
         })
         .collect();
-    json!({
+    let mut rendered = json!({
         "refs": refs,
         "diagnostics": diagnostics,
         "recognized": recognized_rendered,
         "unlocked_pins": unlocked_pins,
         "elsewhere": elsewhere_rendered,
         "live_claims": live_claims(out),
-    })
+    });
+    // Only when present, so goldens of formats that never emit one stay
+    // byte-identical.
+    if !unattested.is_empty() {
+        rendered["unattested"] = unattested
+            .iter()
+            .map(|u| {
+                let Unattested {
+                    purl,
+                    uuid,
+                    file,
+                    detail,
+                } = u;
+                json!({
+                    "purl": purl,
+                    "uuid": uuid,
+                    "file": path_str(file),
+                    "detail": normalize(detail, &roots),
+                })
+            })
+            .collect::<Vec<_>>()
+            .into();
+    }
+    rendered
 }
 
 /// The ledger claims discovery answers `Some(true)` for, over every

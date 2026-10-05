@@ -28,9 +28,9 @@ use serde_json::{Map, Value};
 use super::npm::{by_uuid, fetch_dists, read_or_refuse, refuse_all_in};
 use super::{Ctx, FormatResult, HostedPin, View};
 use crate::vendor::vlt_lock_text::{
-    default_registry_alias, entry_text, is_default_registry, nodes_block, parse_node_line,
-    registry_base, render_entry_line, render_tuple_with_slots, sniff_lock, split_dep_id,
-    split_lines, DepIdEra, DepIdKind, LockSniff,
+    brotli_for_slot3, default_registry_alias, entry_text, is_default_registry, nodes_block,
+    parse_node_line, registry_base, render_entry_line, render_tuple_with_slots, sniff_lock,
+    split_dep_id, split_lines, DepIdEra, DepIdKind, LockSniff,
 };
 
 /// One hosted node line to restore.
@@ -269,6 +269,7 @@ pub(crate) async fn restore(
             };
             let tuple = render_tuple_with_slots(
                 &line.entry.elems,
+                brotli_for_slot3(slot3.as_deref()),
                 Some(&json(&integrity)),
                 slot3.as_deref(),
             );

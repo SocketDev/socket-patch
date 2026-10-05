@@ -327,7 +327,8 @@ async fn gem_hosted_redirect_over_stale_install_warns_loudly() {
     );
     assert_eq!(code, 0, "human re-scan must succeed:\n{stderr}");
     assert!(
-        stderr.contains("Warning: ") && stderr.contains("was switched to its hosted patch, but a stale"),
+        stderr.contains("Warning: ")
+            && stderr.contains("was switched to its hosted patch, but a stale"),
         "human mode must print the stale-install warning on stderr:\n{stderr}"
     );
     assert!(
@@ -538,6 +539,82 @@ async fn gem_hosted_stale_purl_is_not_vex_attested_in_the_same_run() {
         "an all-stale --vex run must fail, not attest.\nstdout:\n{stdout}\nstderr:\n{stderr}"
     );
     assert_eq!(env["status"], "error", "envelope: {env}");
+}
+
+/// #796: Bundler 4's `bundle install --standalone` installs into
+/// `<proj>/bundle/ruby/<abi>/` and writes `bundle/bundler/setup.rb`, but no
+/// `.bundle/config` (bundler 4 no longer remembers CLI flags). That tree is
+/// what the app loads, so a stale UNPATCHED copy there must trip the guard
+/// with the project-local remedy, and the same run's `--vex` must not
+/// attest the purl.
+#[tokio::test(flavor = "multi_thread")]
+async fn gem_hosted_stale_bundler4_standalone_install_warns_and_is_not_attested() {
+    let server = MockServer::start().await;
+    mount_api(&server, None).await;
+    let tmp = tempfile::tempdir().unwrap();
+    let proj = tmp.path().join("proj");
+    std::fs::create_dir_all(&proj).unwrap();
+    write_manifest_pair(&proj);
+    let home = proj.join("bundle").join("ruby").join("3.3.0");
+    let gem_dir = home.join("gems").join(format!("{DEP}-{DEP_VERSION}"));
+    std::fs::create_dir_all(gem_dir.join("lib")).unwrap();
+    std::fs::write(gem_dir.join("lib").join("stale_probe_gem.rb"), UPSTREAM_LIB).unwrap();
+    std::fs::create_dir_all(proj.join("bundle").join("bundler")).unwrap();
+    std::fs::write(
+        proj.join("bundle").join("bundler").join("setup.rb"),
+        "require 'rbconfig'\n",
+    )
+    .unwrap();
+    assert!(!proj.join(".bundle").exists(), "bundler 4 writes no config");
+
+    let vex_path = proj.join("out.vex.json");
+    let (code, stdout, stderr) = common::run_with_env(
+        &proj,
+        &[
+            "scan",
+            "--mode",
+            "hosted",
+            "--json",
+            "--yes",
+            "--cwd",
+            proj.to_str().unwrap(),
+            "--api-url",
+            &server.uri(),
+            "--org",
+            ORG,
+            "--api-token",
+            "fake",
+            "--vex",
+            vex_path.to_str().unwrap(),
+            "--vex-product",
+            "pkg:gem/app@1.0.0",
+        ],
+        &[],
+    );
+    let env = common::parse_json_envelope(&stdout);
+    assert_eq!(env["redirect"]["redirected"], 1, "envelope: {env}");
+    let details = stale_warnings(&env);
+    assert_eq!(
+        details.len(),
+        1,
+        "the stale standalone copy must trip the guard: {env}\nstderr:\n{stderr}"
+    );
+    assert!(
+        details[0].contains(&gem_dir.display().to_string())
+            && !details[0].contains("shared gem home"),
+        "the warning must name the standalone copy as project-local: {}",
+        details[0]
+    );
+    if let Ok(doc) = std::fs::read_to_string(&vex_path) {
+        assert!(
+            !doc.contains(PURL),
+            "a stale standalone copy must never be attested:\n{doc}"
+        );
+    }
+    assert_ne!(
+        code, 0,
+        "an all-stale --vex run must fail, not attest.\nstdout:\n{stdout}\nstderr:\n{stderr}"
+    );
 }
 
 /// #483: bundler's cache dir is the `cache_path` setting — `bundle config
@@ -1018,4 +1095,83 @@ async fn gem_hosted_manifest_less_vex_follows_the_installed_tree() {
         assert_ne!(out.code, Some(0), "reverted no_verify={no_verify}: {out}");
         assert_absent(out.doc.as_ref(), PURL);
     }
+}
+
+/// #709: `bundle config set --local path <dir>` with `<dir>` OUTSIDE the
+/// project. The crawler refuses that root as an apply write target (a
+/// committed `.bundle/config` is untrusted), but bundler installs into and
+/// loads from it, so the read-only guard must still look there: the stale
+/// copy warns with the project-local remedy, and the same run's `--vex`
+/// does not attest the purl.
+#[tokio::test(flavor = "multi_thread")]
+async fn gem_hosted_stale_install_under_out_of_tree_config_path_is_not_attested() {
+    let server = MockServer::start().await;
+    mount_api(&server, None).await;
+    let tmp = tempfile::tempdir().unwrap();
+    let proj = tmp.path().join("proj");
+    let bundle = tmp.path().join("outside bundle");
+    std::fs::create_dir_all(proj.join(".bundle")).unwrap();
+    write_manifest_pair(&proj);
+    std::fs::write(
+        proj.join(".bundle").join("config"),
+        format!("---\nBUNDLE_PATH: \"{}\"\n", bundle.display()),
+    )
+    .unwrap();
+    let gem_dir = bundle
+        .join("ruby")
+        .join("3.3.0")
+        .join("gems")
+        .join(format!("{DEP}-{DEP_VERSION}"));
+    std::fs::create_dir_all(gem_dir.join("lib")).unwrap();
+    std::fs::write(gem_dir.join("lib").join("stale_probe_gem.rb"), UPSTREAM_LIB).unwrap();
+
+    let vex_path = proj.join("out.vex.json");
+    let (code, stdout, stderr) = common::run_with_env(
+        &proj,
+        &[
+            "scan",
+            "--mode",
+            "hosted",
+            "--json",
+            "--yes",
+            "--cwd",
+            proj.to_str().unwrap(),
+            "--api-url",
+            &server.uri(),
+            "--org",
+            ORG,
+            "--api-token",
+            "fake",
+            "--vex",
+            vex_path.to_str().unwrap(),
+            "--vex-product",
+            "pkg:gem/app@1.0.0",
+        ],
+        &[],
+    );
+    let env = common::parse_json_envelope(&stdout);
+    let warnings = stale_warnings(&env);
+    assert_eq!(warnings.len(), 1, "{env}");
+    assert!(
+        warnings[0].contains(&gem_dir.display().to_string()),
+        "the warning must name the configured install: {}",
+        warnings[0]
+    );
+    assert!(
+        warnings[0].contains("Remove the stale"),
+        "the project's own bundle path takes the project-local remedy: {}",
+        warnings[0]
+    );
+    if let Ok(doc) = std::fs::read_to_string(&vex_path) {
+        assert!(!doc.contains(PURL), "stale purl attested:\n{doc}");
+    }
+    assert_ne!(
+        code, 0,
+        "an all-stale --vex run must fail, not attest.\nstdout:\n{stdout}\nstderr:\n{stderr}"
+    );
+    // Read-only: the refused root is never written.
+    assert_eq!(
+        std::fs::read_to_string(gem_dir.join("lib").join("stale_probe_gem.rb")).unwrap(),
+        UPSTREAM_LIB
+    );
 }

@@ -16,6 +16,7 @@ use serde_json::Value;
 use super::client::NpmDist;
 use super::{Ctx, FormatResult, HostedPin, View};
 use crate::utils::line_endings::{to_lf, LineEndings};
+use crate::vendor::lock_inventory::npm_legacy_identity;
 
 /// The pins by uuid.
 pub(super) fn by_uuid<'p>(pins: &[&'p HostedPin]) -> BTreeMap<&'p str, &'p HostedPin> {
@@ -107,17 +108,21 @@ fn v2_hits(
     }
     for (name, entry) in deps {
         let pointer = format!("{prefix}/{}", json_pointer_escape(name));
+        // An alias node (`"lp": {"version": "npm:left-pad@1.3.0"}`) restores
+        // its target's registry dist (#432).
+        let (node_name, node_version) =
+            npm_legacy_identity(name, entry.get("version").and_then(Value::as_str));
         if let (Some(uuid), Some(version)) = (
             entry
                 .get("resolved")
                 .and_then(Value::as_str)
                 .and_then(|u| ctx.hosted_uuid(u)),
-            entry.get("version").and_then(Value::as_str),
+            node_version,
         ) {
             hits.push(NpmHit {
                 pointer: pointer.clone(),
                 uuid,
-                name: name.clone(),
+                name: node_name.to_string(),
                 version: version.to_string(),
             });
         }

@@ -157,13 +157,9 @@ fn shared_store_of_blocking(pkg_path: &Path) -> Option<SharedStore> {
             continue;
         };
         let parent = dir.parent();
-        let parent_name = parent.and_then(|p| p.file_name()).and_then(|n| n.to_str());
 
         // pnpm: <store>/v<N>/links, with the store's `files/` beside it.
-        if name == "links"
-            && parent_name.is_some_and(is_pnpm_store_version_dir)
-            && parent.is_some_and(|p| p.join("files").is_dir())
-        {
+        if is_pnpm_global_virtual_store_dir(dir) {
             return Some(SharedStore {
                 kind: SharedStoreKind::PnpmGlobalVirtualStore,
                 real_path: real.clone(),
@@ -313,6 +309,19 @@ fn is_yarn_copy_slug(entry: &str) -> bool {
 
 fn is_node_modules(dir: &Path) -> bool {
     dir.file_name().is_some_and(|n| n == "node_modules")
+}
+
+/// Whether `dir` is the `links` directory of pnpm's global virtual store:
+/// `<store>/v<N>/links`, with the store's `files/` content directory
+/// beside it. Callers pass a real (canonical) path.
+pub(crate) fn is_pnpm_global_virtual_store_dir(dir: &Path) -> bool {
+    let parent = dir.parent();
+    dir.file_name().is_some_and(|n| n == "links")
+        && parent
+            .and_then(|p| p.file_name())
+            .and_then(|n| n.to_str())
+            .is_some_and(is_pnpm_store_version_dir)
+        && parent.is_some_and(|p| p.join("files").is_dir())
 }
 
 /// `v3`, `v10`, `v11`, …: the layout-version directory of a pnpm store.
