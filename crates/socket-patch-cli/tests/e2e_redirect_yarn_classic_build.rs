@@ -65,7 +65,8 @@ mod vex_e2e_common;
 mod yarn_classic_vex;
 
 use yarn_classic_vex::{
-    require_yarn_classic, via_apply, yarn_classic, Embedded, ManifestlessVex, Wiring,
+    installs_file_tarballs, require_yarn_classic, via_apply, yarn_classic, yarn_classic_version,
+    Embedded, ManifestlessVex, Wiring,
 };
 
 const ORG: &str = "test-org";
@@ -833,6 +834,27 @@ async fn classic_offline_mirror_refuses_hosted_and_keeps_installs_working() {
     }
     copy_dir_recursive(&fx.proj.join("mirror"), &fresh.join("mirror"));
     let fresh_cache = fx.tmp.path().join("fresh-yarn-cache");
+    // yarn 1.0–1.6 install nothing from a mirror (a local tarball), with or
+    // without socket-patch: the control the issue measured. Pin that
+    // limitation there instead of the upstream bytes.
+    if !installs_file_tarballs(&yarn_classic_version()) {
+        let ci = corepack(
+            &fresh,
+            &yarn_classic(),
+            &["install", "--frozen-lockfile", "--no-progress"],
+            &[("YARN_CACHE_FOLDER", fresh_cache.to_str().unwrap())],
+        );
+        assert!(
+            ci.status.success(),
+            "stderr:\n{}",
+            String::from_utf8_lossy(&ci.stderr)
+        );
+        assert!(
+            !fresh.join("node_modules").join(DEP).join("index.js").exists(),
+            "yarn < 1.7 is expected to install nothing from the mirror"
+        );
+        return;
+    }
     for extra in [&[][..], &["--offline"][..]] {
         let mut args = vec!["install", "--frozen-lockfile", "--no-progress"];
         args.extend_from_slice(extra);
