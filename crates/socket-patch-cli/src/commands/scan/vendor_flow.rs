@@ -146,26 +146,33 @@ pub(crate) async fn preview_vendor_json(
     serde_json::json!({ "dryRun": true, "patches": patches })
 }
 
-/// The purls of `selected` the wet run's Bun, vlt or npm package-lock preflight would refuse
-/// before any download (the `would_refuse` rows of
-/// [`preview_vendor_json`]): the vendored planning pass, so a refused NEW
-/// patch holds no rollout slot.
+/// The purls of `selected` the wet run's Bun, vlt or npm package-lock
+/// preflight, or the gem hosted→vendored takeover gate, would refuse before
+/// any download (the `would_refuse` rows of [`preview_vendor_json`]): the
+/// vendored planning pass, so a refused NEW patch holds no rollout slot.
 pub(super) async fn preflight_refused_purls(
-    cwd: &Path,
+    common: &GlobalArgs,
     selected: &[PatchSearchResult],
 ) -> HashSet<String> {
+    let cwd = common.cwd.as_path();
     let state = load_state(cwd).await;
     let refusal =
         bun_vendor_preflight_with_ledger(cwd, selected, state.as_ref().map(|s| &s.entries)).await;
     let vlt_refusals =
         vlt_vendor_preflight_selected(cwd, selected, state.as_ref().map(|s| &s.entries)).await;
     let npm_lock_refusal = npm_lock_refusal(cwd, selected).await;
+    let gem_refusals = crate::commands::vendor::gem_takeover_preview_refusals(
+        common,
+        selected.iter().map(|p| p.purl.as_str()),
+    )
+    .await;
     selected
         .iter()
         .filter(|p| {
             refusal.as_ref().is_some_and(|r| r.applies_to(&p.purl))
                 || vlt_refusal_for(&vlt_refusals, &p.purl).is_some()
                 || (p.purl.starts_with("pkg:npm/") && npm_lock_refusal.is_some())
+                || gem_refusals.contains_key(&p.purl)
         })
         .map(|p| p.purl.clone())
         .collect()
@@ -552,7 +559,7 @@ async fn run_vendor_json_path(
     // The planning pass: a patch the preflight refuses holds no slot (it
     // still reaches the engine, which reports the refusal).
     let writers = writers_of(&rows);
-    let refused = preflight_refused_purls(&args.common.cwd, &writers).await;
+    let refused = preflight_refused_purls(&args.common, &writers).await;
     stage.plan(&rows, |r| !refused.contains(&r.writer.purl));
     let deferred = stage.deferred_keys();
     let selected: Vec<PatchSearchResult> = writers
