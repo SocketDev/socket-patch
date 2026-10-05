@@ -9,8 +9,7 @@
 use std::collections::{BTreeMap, BTreeSet};
 use std::time::Duration;
 
-use base64::Engine as _;
-use sha2::{Digest, Sha512};
+use crate::utils::digest::sha512_sri_of;
 
 use super::{vlt, DepOverride};
 use crate::api::client::{ApiClient, MAX_VENDOR_PACKAGE_BYTES};
@@ -64,14 +63,6 @@ impl ArtifactProbe {
         }
         None
     }
-}
-
-/// The SRI form of `bytes`' sha512.
-pub fn sha512_sri(bytes: &[u8]) -> String {
-    format!(
-        "sha512-{}",
-        base64::engine::general_purpose::STANDARD.encode(Sha512::digest(bytes))
-    )
 }
 
 fn fetch_error(error: impl Into<String>) -> ArtifactProbe {
@@ -131,7 +122,7 @@ async fn fetch_capped(client: &reqwest::Client, url: &str, max: u64) -> Artifact
         Ok(bytes) => ArtifactProbe {
             status: Some(status),
             content_encoding,
-            sha512: Some(sha512_sri(&bytes)),
+            sha512: Some(sha512_sri_of(&bytes)),
             body: Some(bytes),
             error: None,
         },
@@ -270,7 +261,7 @@ mod tests {
             .mount(&server)
             .await;
         let probe = probe_of(&server, "/a.tgz").await;
-        assert_eq!(probe.failure(&sha512_sri(BODY)), None);
+        assert_eq!(probe.failure(&sha512_sri_of(BODY)), None);
         assert_eq!(probe.body.as_deref(), Some(BODY));
     }
 
@@ -286,7 +277,9 @@ mod tests {
             .mount(&server)
             .await;
         assert_eq!(
-            probe_of(&server, "/a.tgz").await.failure(&sha512_sri(BODY)),
+            probe_of(&server, "/a.tgz")
+                .await
+                .failure(&sha512_sri_of(BODY)),
             None
         );
     }
@@ -319,7 +312,7 @@ mod tests {
             .respond_with(ResponseTemplate::new(500))
             .mount(&server)
             .await;
-        let expected = sha512_sri(BODY);
+        let expected = sha512_sri_of(BODY);
 
         let gz_probe = probe_of(&server, "/gz.tgz").await;
         assert_eq!(
@@ -328,7 +321,7 @@ mod tests {
         );
         assert_eq!(
             gz_probe.sha512,
-            Some(sha512_sri(&gz)),
+            Some(sha512_sri_of(&gz)),
             "the body is hashed as received, never decoded"
         );
         assert_eq!(
@@ -411,7 +404,7 @@ mod tests {
             .respond_with(ResponseTemplate::new(200).set_body_bytes(BODY))
             .mount(&server)
             .await;
-        let expected = sha512_sri(BODY);
+        let expected = sha512_sri_of(BODY);
         assert_eq!(probe_of(&server, "/r1").await.failure(&expected), None);
         assert!(probe_of(&server, "/r0")
             .await
@@ -430,7 +423,7 @@ mod tests {
         let probe = fetch_capped(api(None).plain_http(), &url, 4).await;
         assert!(
             probe
-                .failure(&sha512_sri(BODY))
+                .failure(&sha512_sri_of(BODY))
                 .is_some_and(|r| r.starts_with("fetch error ") && r.contains("too large")),
             "{probe:?}"
         );

@@ -32,9 +32,7 @@
 
 use std::path::Path;
 
-use base64::Engine as _;
 use serde_json::Value;
-use sha2::{Digest, Sha512};
 
 use crate::constants::SOCKET_DIR;
 use crate::formats::bun::{BunTextError, BunTextLock};
@@ -401,12 +399,10 @@ pub(crate) async fn vendor_bun<'a>(
     let prior_artifact_integrity: Option<String> = if has_digestless_own_tuple {
         let abs = project_root.join(&coords.uuid_dir_rel).join(&target_leaf);
         match tokio::fs::metadata(&abs).await {
-            Ok(meta) if meta.is_file() => tokio::fs::read(&abs).await.ok().map(|bytes| {
-                format!(
-                    "sha512-{}",
-                    base64::engine::general_purpose::STANDARD.encode(Sha512::digest(&bytes))
-                )
-            }),
+            Ok(meta) if meta.is_file() => tokio::fs::read(&abs)
+                .await
+                .ok()
+                .map(|bytes| crate::utils::digest::sha512_sri_of(&bytes)),
             _ => None,
         }
     } else {
@@ -1164,6 +1160,8 @@ mod tests {
     use crate::manifest::schema::PatchFileInfo;
     use crate::patch::apply::{ApplyResult, VerifyStatus};
     use crate::patch::copy_tree::remove_tree;
+    use base64::Engine as _;
+    use sha2::{Digest, Sha512};
     use std::collections::HashMap;
     use std::path::PathBuf;
 

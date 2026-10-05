@@ -78,8 +78,8 @@
 //! (plugin classpaths) are not project resolution and are skipped silently;
 //! `<profiles>` are only read when activated, so a Socket repository or pin
 //! there is diagnosed, never a ref. Submodule poms and parent poms are not
-//! read (root-only). Gradle builds are out of scope (the hosted rewriter
-//! only prints a manual snippet; vendoring refuses them).
+//! read (root-only). Gradle builds are discovered by `gradle.rs` (the
+//! hosted index) and the vendored JVM backend's own probes.
 
 use std::collections::{BTreeMap, BTreeSet};
 

@@ -194,9 +194,11 @@ pub fn lock_flags(lock_text: &str, dep_id: &str) -> Option<u64> {
 /// (flags 1 or 3) as a skipped optional dependency, so every release from
 /// 0.0.0-32 to 1.2.0 leaves it missing (its importer link dangling) unless
 /// the same install also reinstalls a non-optional node; `vlt ci` restores
-/// it. Unknown flags are not guaranteed either.
+/// it. Unknown flags are not guaranteed either. vlt 1.3's brotli bit (4)
+/// only says which artifact the node fetches, so a brotli prod or dev node
+/// (4 or 6) is reinstalled like any other (#372).
 pub fn reinstalls_after_removal(flags: Option<u64>) -> bool {
-    matches!(flags, Some(0 | 2))
+    flags.is_some_and(|flags| flags <= 7 && flags & 1 == 0)
 }
 
 /// vlt's `isDepID` path-safety rule: the id is used as one path segment.
@@ -1080,7 +1082,10 @@ mod tests {
     fn only_prod_and_dev_nodes_are_reinstalled_after_removal() {
         assert!(reinstalls_after_removal(Some(0)));
         assert!(reinstalls_after_removal(Some(2)));
-        for flags in [Some(1), Some(3), Some(4), None] {
+        // #372: vlt 1.3's brotli bit leaves a prod or dev node reinstalled.
+        assert!(reinstalls_after_removal(Some(4)));
+        assert!(reinstalls_after_removal(Some(6)));
+        for flags in [Some(1), Some(3), Some(5), Some(7), Some(8), None] {
             assert!(!reinstalls_after_removal(flags), "{flags:?}");
         }
     }

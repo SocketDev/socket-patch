@@ -289,8 +289,7 @@ impl UpstreamClient {
                 if let Some(sri) = dist.integrity.as_deref() {
                     crate::vendor::registry_fetch::verify_sri(&bytes, sri)?;
                 } else if let Some(sha1) = dist.shasum.as_deref() {
-                    use sha1::Digest as _;
-                    if hex::encode(sha1::Sha1::digest(&bytes)) != sha1 {
+                    if crate::utils::digest::sha1_hex_of(&bytes) != sha1 {
                         return Err("registry archive checksum mismatch".into());
                     }
                 } else {
@@ -659,7 +658,7 @@ fn gosumdb_base(module: &str) -> Option<String> {
 pub(crate) fn go_mod_h1(go_mod: &[u8]) -> String {
     use base64::Engine as _;
     use sha2::{Digest, Sha256};
-    let file_sum = hex::encode(Sha256::digest(go_mod));
+    let file_sum = crate::utils::digest::sha256_hex_of(go_mod);
     let summary = format!("{file_sum}  go.mod\n");
     format!(
         "h1:{}",

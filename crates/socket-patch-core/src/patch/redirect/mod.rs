@@ -26,6 +26,7 @@ use serde_json::{json, Value};
 use crate::utils::digest::is_hex64_lower;
 use crate::utils::line_endings::{to_lf, LineEndings};
 use crate::vendor::common::{parse_json_text, JsonLayout};
+use crate::vendor::lock_inventory::npm_legacy_identity;
 use crate::vendor::npm_origin::{legacy_packages_key, npm_non_registry_entries, NpmOverrides};
 use crate::vendor::yarn_berry_lock::yarnrc_compression_level;
 
@@ -50,6 +51,7 @@ pub mod presence;
 use crate::formats::pnpm::plan_hosted;
 use crate::formats::cargo::CargoLock;
 use crate::formats::composer::hosted::rewrite_composer_lock;
+use crate::formats::gem::gemfile;
 use crate::formats::gem::hosted::{checksum_entry_span, converge_gem_lock_source};
 use crate::formats::gem::lock_lists_direct_dependency;
 pub(crate) use crate::formats::yarn::is_berry_lock;
@@ -65,6 +67,7 @@ mod poetry;
 #[cfg(test)]
 mod python_lock_equivalence_tests;
 mod requirements;
+pub mod gradle;
 pub use requirements::preflight_requirements_takeover;
 mod staged;
 mod state;
@@ -146,6 +149,14 @@ pub struct RegistryOverrideIdentifiers {
     /// `maven_suffixed_version`, pinned as a Maven trusted checksum. Only
     /// meaningful alongside `maven_suffixed_version`.
     pub maven_pom_sha256: Option<String>,
+    /// sha256 hex of the exact suffixed Gradle `.module` bytes the serve
+    /// route returns (`<a>-<suffixed>.module`). `None` exactly when that
+    /// route 404s (the upstream release published no module metadata, or
+    /// the deployed service predates serving it); never set without
+    /// `maven_suffixed_version`. The hosted Gradle planner pins it in
+    /// `gradle/verification-metadata.xml`.
+    #[cfg_attr(test, serde(skip_serializing_if = "Option::is_none"))]
+    pub maven_module_sha256: Option<String>,
     pub gem_checksum_sha256: Option<String>,
 }
 
@@ -200,7 +211,7 @@ pub struct RewriteWarning {
     pub detail: String,
 }
 
-#[derive(Debug, Default, Clone, PartialEq)]
+#[derive(Default, Clone, PartialEq)]
 #[cfg_attr(test, derive(Serialize))]
 pub struct RewriteResult {
     /// Rewritten file contents keyed by repo-relative path — only CHANGED files.
@@ -301,6 +312,82 @@ pub struct RewriteResult {
     /// [`vlt::vlt_drives`] over the rewriter's input files and the
     /// caller's `bun_lockb_present`.
     pub vlt_drives: bool,
+    /// Maven patch uuids the hosted Gradle planner decided (a Gradle build
+    /// is present): each is also in exactly one of the two sets below.
+    /// Hosted confirmation of a maven purl keys off these, never off
+    /// substring presence (a pasted snippet pins nothing). The three Gradle
+    /// sets serialize (and print) only when non-empty, so the equivalence
+    /// goldens of the other rewriters keep their digests.
+    #[cfg_attr(
+        test,
+        serde(skip_serializing_if = "std::collections::BTreeSet::is_empty")
+    )]
+    pub gradle_uuids: std::collections::BTreeSet<String>,
+    /// The owned script, the apply line with the current index digest in
+    /// every build's settings, the index row and every lock entry of the
+    /// GA are final (written by this run or already in place).
+    #[cfg_attr(
+        test,
+        serde(skip_serializing_if = "std::collections::BTreeSet::is_empty")
+    )]
+    pub confirmed_gradle_uuids: std::collections::BTreeSet<String>,
+    /// Refused: nothing was written for them, and the fallback snippet was
+    /// printed (`redirect_gradle_manual_snippet`).
+    #[cfg_attr(
+        test,
+        serde(skip_serializing_if = "std::collections::BTreeSet::is_empty")
+    )]
+    pub refused_gradle_uuids: std::collections::BTreeSet<String>,
+}
+
+/// The derived `Debug` shape, with the Gradle sets shown only when
+/// non-empty: the equivalence goldens digest this rendering for the other
+/// rewriters, which never fill them.
+impl std::fmt::Debug for RewriteResult {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        let mut d = f.debug_struct("RewriteResult");
+        d.field("files", &self.files);
+        d.field("binary_files", &self.binary_files);
+        d.field(
+            "confirmed_bun_binary_uuids",
+            &self.confirmed_bun_binary_uuids,
+        );
+        d.field("edits", &self.edits);
+        d.field("warnings", &self.warnings);
+        d.field("confirmed_cargo_uuids", &self.confirmed_cargo_uuids);
+        d.field("confirmed_golang_uuids", &self.confirmed_golang_uuids);
+        d.field("confirmed_pipenv_uuids", &self.confirmed_pipenv_uuids);
+        d.field("refused_pipenv_uuids", &self.refused_pipenv_uuids);
+        d.field("confirmed_pdm_uuids", &self.confirmed_pdm_uuids);
+        d.field("refused_pdm_uuids", &self.refused_pdm_uuids);
+        d.field("refused_pnpm_uuids", &self.refused_pnpm_uuids);
+        d.field("python_lock_uuids", &self.python_lock_uuids);
+        d.field(
+            "confirmed_python_lock_uuids",
+            &self.confirmed_python_lock_uuids,
+        );
+        d.field("refused_python_lock_uuids", &self.refused_python_lock_uuids);
+        d.field("hatch_uuids", &self.hatch_uuids);
+        d.field("confirmed_hatch_uuids", &self.confirmed_hatch_uuids);
+        d.field(
+            "confirmed_requirements_uuids",
+            &self.confirmed_requirements_uuids,
+        );
+        d.field("confirmed_vlt_uuids", &self.confirmed_vlt_uuids);
+        d.field("refused_vlt_uuids", &self.refused_vlt_uuids);
+        d.field("vlt_foreign_uuids", &self.vlt_foreign_uuids);
+        d.field("vlt_drives", &self.vlt_drives);
+        for (name, set) in [
+            ("gradle_uuids", &self.gradle_uuids),
+            ("confirmed_gradle_uuids", &self.confirmed_gradle_uuids),
+            ("refused_gradle_uuids", &self.refused_gradle_uuids),
+        ] {
+            if !set.is_empty() {
+                d.field(name, set);
+            }
+        }
+        d.finish()
+    }
 }
 
 /// Combined name as it appears in registry coordinates / lock keys.
@@ -428,13 +515,16 @@ pub fn rewrite_registry_redirect_with_pipenv_version(
         pipenv_major,
         bun_lockb_present,
         &std::collections::BTreeSet::new(),
+        &std::collections::BTreeSet::new(),
     )
 }
 
 /// [`rewrite_registry_redirect_with_pipenv_version`] with the patch uuids
 /// in `vlt_withheld` kept out of the vlt rewrite only: their artifact
 /// failed vlt's preflight while another npm-family lock may be the one the
-/// project installs from.
+/// project installs from. `gradle_unreadable` are the Gradle build files
+/// the host found but could not read as text: the Gradle planner refuses
+/// the build rather than take them for absent.
 pub fn rewrite_registry_redirect_withholding_vlt(
     files: &BTreeMap<String, String>,
     overrides: &[DepOverride],
@@ -442,6 +532,7 @@ pub fn rewrite_registry_redirect_withholding_vlt(
     pipenv_major: Option<u32>,
     bun_lockb_present: bool,
     vlt_withheld: &std::collections::BTreeSet<String>,
+    gradle_unreadable: &std::collections::BTreeSet<String>,
 ) -> RewriteResult {
     let mut result = RewriteResult::default();
     // pdm runs FIRST, but only when `pdm.lock` is the project's PyPI install
@@ -464,6 +555,7 @@ pub fn rewrite_registry_redirect_withholding_vlt(
         &vlt_overrides,
         bun_lockb_present,
         artifact_metadata,
+        gradle_unreadable,
     );
     let mut result = rewrite_groups_parallel(result, &groups);
     result.vlt_drives = vlt::vlt_drives(files, bun_lockb_present);
@@ -488,6 +580,7 @@ fn rewriter_groups<'a>(
     vlt_overrides: &'a [DepOverride],
     bun_lockb_present: bool,
     artifact_metadata: &'a BTreeMap<String, String>,
+    gradle_unreadable: &'a std::collections::BTreeSet<String>,
 ) -> Vec<RewriterGroup<'a>> {
     vec![
         Box::new(move |result| {
@@ -511,6 +604,9 @@ fn rewriter_groups<'a>(
         Box::new(move |result| rewrite_nuget(files, overrides, result)),
         Box::new(move |result| rewrite_gem(files, overrides, result)),
         Box::new(move |result| rewrite_maven_pom(files, overrides, result)),
+        Box::new(move |result| {
+            gradle::rewrite_gradle_hosted(files, gradle_unreadable, overrides, result)
+        }),
         Box::new(move |result| rewrite_golang(files, overrides, result)),
     ]
 }
@@ -587,6 +683,9 @@ fn merge_group_delta(result: &mut RewriteResult, delta: RewriteResult) {
         vlt_foreign_uuids,
         bundled_skipped_uuids,
         vlt_drives: _,
+        gradle_uuids,
+        confirmed_gradle_uuids,
+        refused_gradle_uuids,
     } = delta;
     result.files.extend(files);
     result.binary_files.extend(binary_files);
@@ -622,6 +721,9 @@ fn merge_group_delta(result: &mut RewriteResult, delta: RewriteResult) {
     result.confirmed_vlt_uuids.extend(confirmed_vlt_uuids);
     result.refused_vlt_uuids.extend(refused_vlt_uuids);
     result.vlt_foreign_uuids.extend(vlt_foreign_uuids);
+    result.gradle_uuids.extend(gradle_uuids);
+    result.confirmed_gradle_uuids.extend(confirmed_gradle_uuids);
+    result.refused_gradle_uuids.extend(refused_gradle_uuids);
     result.bundled_skipped_uuids.extend(bundled_skipped_uuids);
 }
 
@@ -955,6 +1057,8 @@ fn rewrite_one_npm_lock(
     // Match the shared npm lock inventory's object-valued-map precedence.
     let legacy_is_install_tree = lock.get("packages").and_then(Value::as_object).is_none();
     let mut changed = false;
+    // Legacy `dependencies` alias nodes rewired this run (#432).
+    let mut aliased: Vec<String> = Vec::new();
     for dep in npm {
         let fname = full_name(dep);
         let Some(sha512) = dep.integrity.sha512.clone() else {
@@ -1047,6 +1151,7 @@ fn rewrite_one_npm_lock(
                 legacy_is_install_tree,
                 result,
                 &mut matched_any,
+                &mut aliased,
             ) || changed;
         }
         // Parity with the pnpm/berry/uv rewriters: a granted dep the
@@ -1067,7 +1172,31 @@ fn rewrite_one_npm_lock(
         // redirected lock therefore fails EINTEGRITY against the patched
         // sha512 pin (fail-closed: the unpatched bytes never install). Say
         // so instead of letting an npm 6 CI discover it.
-        if lock.get("lockfileVersion").and_then(Value::as_u64) == Some(1) {
+        let v1 = lock.get("lockfileVersion").and_then(Value::as_u64) == Some(1);
+        // A v2 lock's legacy mirror is what npm 6 installs from. npm 6
+        // installs a plain mirror node from its rewritten `resolved`, but an
+        // ALIAS node from the configured registry (verified against real
+        // npm 6.14.18), so its installs fail EINTEGRITY against the patched
+        // pin. The v1 caveat below already says this for every node.
+        if !v1 && !aliased.is_empty() {
+            result.warnings.push(RewriteWarning {
+                code: "redirect_npm_legacy_alias_client".into(),
+                detail: format!(
+                    "{lockfile}'s legacy `dependencies` mirror (read by npm <= 6) installs \
+                     {} through an npm alias; npm <= 6 fetches an aliased dependency from the \
+                     configured registry and ignores the redirected `resolved` url, so its \
+                     installs fail EINTEGRITY against the patched sha512 pin (the unpatched \
+                     bytes are never installed). npm >= 7 installs the hosted patch; use \
+                     vendored mode to patch npm 6 installs",
+                    aliased
+                        .iter()
+                        .map(|a| format!("`{a}`"))
+                        .collect::<Vec<_>>()
+                        .join(", ")
+                ),
+            });
+        }
+        if v1 {
             result.warnings.push(RewriteWarning {
                 code: "redirect_npm_legacy_client".into(),
                 detail: format!(
@@ -1129,13 +1258,17 @@ fn rewrite_npm_v2_deps(
     legacy_is_install_tree: bool,
     result: &mut RewriteResult,
     matched_any: &mut bool,
+    aliased: &mut Vec<String>,
 ) -> bool {
     let mut changed = false;
     for (name, entry) in deps.iter_mut() {
         let packages_key = legacy_packages_key(parent_key, name);
-        if name == fname
-            && entry.get("version").and_then(Value::as_str) == Some(dep.version.as_str())
-        {
+        // An alias node (`"lp": {"version": "npm:left-pad@1.3.0"}`) is an
+        // install of its target, like the `packages` twin's `name` field.
+        let (node_name, node_version) =
+            npm_legacy_identity(name, entry.get("version").and_then(Value::as_str));
+        let is_alias = node_name != name.as_str();
+        if node_name == fname && node_version == Some(dep.version.as_str()) {
             // Legacy spelling of `inBundle`: same npm-ignores-the-rewrite
             // fail-open as the `packages` guard above.
             if entry.get("bundled").and_then(Value::as_bool) == Some(true) {
@@ -1164,6 +1297,9 @@ fn rewrite_npm_v2_deps(
                 {
                     result.edits.push(edit);
                     changed = true;
+                    if is_alias {
+                        aliased.push(name.clone());
+                    }
                 }
             }
         }
@@ -1179,6 +1315,7 @@ fn rewrite_npm_v2_deps(
                 legacy_is_install_tree,
                 result,
                 matched_any,
+                aliased,
             ) || changed;
         }
     }
@@ -3526,6 +3663,9 @@ fn rewrite_yarn_berry_with_manifests(
     // the hosted tarball (see the section header). Parsed once; written back
     // in its own layout when a pin changes it.
     let manifest_text = files.get(BERRY_MANIFEST).map(String::as_str);
+    // Its `catalog:` / `catalogs:` tables: a dependency declared `catalog:`
+    // needs a selector yarn matches before it expands the catalog.
+    let yarnrc = files.get(".yarnrc.yml").map(String::as_str);
     let mut manifest: Option<Value> = manifest_text
         .and_then(|t| serde_json::from_str::<Value>(t.strip_prefix('\u{feff}').unwrap_or(t)).ok())
         .filter(Value::is_object);
@@ -3837,6 +3977,7 @@ fn rewrite_yarn_berry_with_manifests(
         };
         let pin = match berry_resolutions_pin(
             manifest_obj,
+            yarnrc,
             &fname,
             &dep.version,
             &key_ranges,
@@ -4140,6 +4281,17 @@ impl BerryResolutionsPin {
 /// tarball URL they are empty and recovered from our selectors routed to
 /// `current_url`.
 ///
+/// Yarn matches `resolutions` against a dependency's descriptor as the
+/// manifest spells it, before a `catalog:` descriptor is expanded to its
+/// catalog range (#632): a dependency declared `"left-pad": "catalog:"` is
+/// never matched by `left-pad@npm:^1.3.0`, though the lock keys its entry by
+/// that expanded range. So every `.yarnrc.yml` catalog (`yarnrc`) whose range
+/// for `name` is one of the pinned npm ranges is also routed, as
+/// `name@catalog:` (the default `catalog:` table) or `name@catalog:<named>`
+/// (`catalogs.<named>`). The `npm:` selectors stay: transitive dependents
+/// still ask for the expanded range, and rollback rebuilds the lock key from
+/// them.
+///
 /// Refuses (fail closed, nothing written) when the manifest already carries
 /// a user-authored `resolutions` entry for the package — any selector whose
 /// target is `name`, bare or scoped — since yarn would apply it alongside
@@ -4147,6 +4299,7 @@ impl BerryResolutionsPin {
 /// user pinned.
 fn berry_resolutions_pin(
     manifest: &serde_json::Map<String, Value>,
+    yarnrc: Option<&str>,
     name: &str,
     version: &str,
     key_ranges: &[String],
@@ -4186,7 +4339,7 @@ fn berry_resolutions_pin(
             ),
         });
     }
-    let selectors: Vec<String> = if key_ranges.is_empty() {
+    let mut selectors: Vec<String> = if key_ranges.is_empty() {
         ours.iter()
             .filter(|(_, value)| value.as_str().is_some() && value.as_str() == current_url)
             .map(|(selector, _)| (*selector).clone())
@@ -4206,6 +4359,17 @@ fn berry_resolutions_pin(
             ),
         });
     }
+    let ranges: Vec<&str> = selectors
+        .iter()
+        .filter_map(|selector| crate::vendor::yarn_classic_lock::split_pattern(selector))
+        .filter(|(n, range)| *n == name && range.starts_with("npm:"))
+        .map(|(_, range)| range)
+        .collect();
+    for selector in berry_catalog_selectors(yarnrc, name, &ranges) {
+        if !selectors.contains(&selector) {
+            selectors.push(selector);
+        }
+    }
     let stale = ours
         .iter()
         .filter(|(selector, value)| {
@@ -4217,6 +4381,57 @@ fn berry_resolutions_pin(
         .map(|(selector, _)| (*selector).clone())
         .collect();
     Ok(BerryResolutionsPin { selectors, stale })
+}
+
+/// The `name@catalog:` / `name@catalog:<named>` selectors of every
+/// `.yarnrc.yml` catalog that maps `name` to one of `ranges` (yarn's `npm:`
+/// spellings, as the lock keys them). A catalog range is normalized the way
+/// yarn normalizes a manifest range: one without a protocol is an `npm:`
+/// range. Yarn reads `.yarnrc.yml` with the failsafe schema, so an unquoted
+/// range is its source text (`1.10` stays `1.10`, never the number `1.1`):
+/// the catalog tables are deserialized as string tables, never
+/// type-inferred. A `.yarnrc.yml` that is absent, not YAML, or whose catalogs
+/// are not string tables has no catalogs (yarn itself refuses to run on one
+/// it cannot parse).
+fn berry_catalog_selectors(yarnrc: Option<&str>, name: &str, ranges: &[&str]) -> Vec<String> {
+    type Table = BTreeMap<String, Option<String>>;
+    #[derive(serde::Deserialize, Default)]
+    struct Catalogs {
+        #[serde(default)]
+        catalog: Option<Table>,
+        #[serde(default)]
+        catalogs: Option<BTreeMap<String, Option<Table>>>,
+    }
+    let Some(rc) = yarnrc else {
+        return Vec::new();
+    };
+    let rc = rc.strip_prefix('\u{feff}').unwrap_or(rc);
+    let Ok(parsed) = serde_saphyr::from_str::<Option<Catalogs>>(rc) else {
+        return Vec::new();
+    };
+    let parsed = parsed.unwrap_or_default();
+    let pins = |table: Option<&Table>| {
+        let Some(range) = table.and_then(|t| t.get(name)).and_then(Option::as_deref) else {
+            return false;
+        };
+        let range = range.trim();
+        let range = if range.contains(':') {
+            range.to_string()
+        } else {
+            format!("npm:{range}")
+        };
+        ranges.contains(&range.as_str())
+    };
+    let mut selectors = Vec::new();
+    if pins(parsed.catalog.as_ref()) {
+        selectors.push(format!("{name}@catalog:"));
+    }
+    for (catalog, table) in parsed.catalogs.iter().flatten() {
+        if pins(table.as_ref()) {
+            selectors.push(format!("{name}@catalog:{catalog}"));
+        }
+    }
+    selectors
 }
 
 /// Move each entry keyed `moved` to where yarn sorts it. Yarn writes lock
@@ -5225,28 +5440,25 @@ fn rewrite_nuget(
 
 // ── rubygems (Gemfile + Gemfile.lock) ────────────────────────────────────────
 
-/// The argument tail of a `gem "name", …` line minus any leading quoted
-/// version-constraint args (`"7.0.0"`, `'~> 7.0'`, `">= 1", "< 2"`) — i.e. the
-/// options (`require: false`, `group: :test`, …) that must survive the move
-/// into the source block. Empty when the line carries none; bails to empty on
-/// an unparseable tail (unbalanced quote).
-/// Shared with the vendor backend's Gemfile rewrite (`vendor::gem`),
-/// which has the same drop-the-options failure mode.
-pub(crate) fn gem_line_trailing_options(tail: &str) -> String {
-    let mut rest = tail.trim_start();
-    loop {
-        let Some(after_comma) = rest.strip_prefix(',') else {
-            return String::new();
-        };
-        let arg = after_comma.trim_start();
-        match arg.chars().next() {
-            Some(q @ ('"' | '\'')) => match arg[1..].find(q) {
-                Some(end) => rest = arg[1 + end + 1..].trim_start(),
-                None => return String::new(),
-            },
-            Some(_) => return arg.trim_end().to_string(),
-            None => return String::new(),
-        }
+/// The `redirect_gem_source_option` detail. `what` names the thing that
+/// picks the gem's own source (a Gemfile option, a lock section). When it is
+/// socket-patch's OWN vendored wiring, prescribe the eject path instead of
+/// leaving the user to puzzle over a line the tool itself wrote.
+fn gem_source_option_detail(dep: &DepOverride, what: &str, socket_vendored: bool) -> String {
+    if socket_vendored {
+        format!(
+            "{what} pointing into .socket/vendor — socket-patch's own vendored \
+             wiring, which would override the Socket source block; un-vendor this \
+             gem first (`socket-patch remove pkg:gem/{}@{}`, or `socket-patch \
+             vendor --revert` to revert EVERY vendored dependency in the \
+             project), then re-run the hosted scan",
+            dep.name, dep.version
+        )
+    } else {
+        format!(
+            "{what}, which selects the gem's own source and would override the \
+             Socket source block; redirect skipped"
+        )
     }
 }
 
@@ -5362,31 +5574,6 @@ pub(crate) fn gem_line_tail_blocks_edit(tail: &str) -> Option<String> {
         }
     }
     None
-}
-
-/// The source-selecting option a `gem` line's argument tail carries, if any
-/// (only the code before any `#` comment counts). Bundler allows ONE source
-/// per gem, so an option like `git:` preserved into the Socket source block
-/// OVERRIDES the block and the redirect becomes a silent no-op. Mirrors the
-/// token list `vendor::gem::rest_blocks_edit` refuses for the same reason.
-fn gem_tail_source_option(tail: &str) -> Option<&'static str> {
-    let code = tail.split('#').next().unwrap_or("");
-    [
-        "path:",
-        ":path",
-        "git:",
-        ":git",
-        "github:",
-        ":github",
-        "source:",
-        ":source",
-        "gist:",
-        ":gist",
-        "bitbucket:",
-        ":bitbucket",
-    ]
-    .into_iter()
-    .find(|tok| code.contains(tok))
 }
 
 /// The grant-token path segment of a hosted patch URL: the path level
@@ -5647,6 +5834,23 @@ fn rewrite_gem(
     // frozen-installable as written.
     let mut mixed_state = false;
     let mut warned_no_gemfile = false;
+    // The gems the lock resolves from a non-registry section (`GIT`,
+    // `PATH`, `PLUGIN SOURCE`): header + whether it is socket-patch's own
+    // vendored wiring. Read once — the rewrites below only touch `GEM`
+    // sections and CHECKSUMS, never these.
+    let non_registry: BTreeMap<String, (String, bool)> = lock
+        .as_deref()
+        .map(|lk| {
+            crate::formats::gem::parse(lk)
+                .non_registry_sources()
+                .into_iter()
+                .map(|(name, s)| {
+                    let vendored = s.remotes.iter().any(|r| r.contains(".socket/vendor/"));
+                    (name.to_string(), (s.header.to_string(), vendored))
+                })
+                .collect()
+        })
+        .unwrap_or_default();
 
     for dep in &gem {
         let Some(ov) = registry_override_of_kind(dep, "rubygems-compact-index") else {
@@ -5724,6 +5928,27 @@ fn rewrite_gem(
                 });
                 continue;
             }
+        }
+
+        // The lock is what bundler resolves from: a gem it lists under a
+        // `GIT` / `PATH` / `PLUGIN SOURCE` section is served from there
+        // however the Gemfile spells the declaration (a plain `gem` line in
+        // a `git "…" do` block, an option the line reader cannot see), so a
+        // Socket source block cannot redirect it (#652). Fail closed.
+        if let Some((header, socket_vendored)) = non_registry.get(dep.name.as_str()) {
+            let (header, socket_vendored) = (header.as_str(), *socket_vendored);
+            result.warnings.push(RewriteWarning {
+                code: "redirect_gem_source_option".into(),
+                detail: gem_source_option_detail(
+                    dep,
+                    &format!(
+                        "{lock_name} resolves {} from a `{header}` section",
+                        dep.name
+                    ),
+                    socket_vendored,
+                ),
+            });
+            continue;
         }
 
         // Whether THIS dep's Gemfile source redirect is in place (just
@@ -5849,45 +6074,11 @@ fn rewrite_gem(
                     } else {
                         raw_tail
                     };
-                    // A source-selecting option would move into the block and
-                    // OVERRIDE it in bundler's DSL, leaving the redirect a
-                    // silent no-op that still gets attested. Fail closed —
-                    // and when the blocking `path:` is socket-patch's OWN
-                    // vendored wiring, prescribe the eject path instead of
-                    // leaving the user to puzzle over their own Gemfile.
-                    if let Some(tok) = gem_tail_source_option(&tail) {
-                        let socket_vendored = matches!(tok, "path:" | ":path")
-                            && tail
-                                .split('#')
-                                .next()
-                                .unwrap_or("")
-                                .contains(".socket/vendor/");
-                        let detail = if socket_vendored {
-                            format!(
-                                "the `gem \"{}\"` declaration carries `{tok}` pointing into \
-                                 .socket/vendor — socket-patch's own vendored wiring, which \
-                                 would override the Socket source block; un-vendor this gem \
-                                 first (`socket-patch remove pkg:gem/{}@{}`, or `socket-patch \
-                                 vendor --revert` to revert EVERY vendored dependency in the \
-                                 project), then re-run the hosted scan",
-                                dep.name, dep.name, dep.version
-                            )
-                        } else {
-                            format!(
-                                "the `gem \"{}\"` declaration carries `{tok}`, which would \
-                                 override the Socket source block; redirect skipped",
-                                dep.name
-                            )
-                        };
-                        result.warnings.push(RewriteWarning {
-                            code: "redirect_gem_source_option".into(),
-                            detail,
-                        });
-                        continue;
-                    }
                     // Only a whole one-line declaration can move into the
                     // block: a continuation would be orphaned after `end`
-                    // and a modifier silently dropped (#340).
+                    // and a modifier silently dropped (#340). Checked before
+                    // the source-option reader, which fails closed on any
+                    // tail it cannot parse.
                     if let Some(reason) = gem_line_tail_blocks_edit(&tail) {
                         result.warnings.push(RewriteWarning {
                             code: "redirect_gem_unrecognized_declaration".into(),
@@ -5899,10 +6090,35 @@ fn rewrite_gem(
                         });
                         continue;
                     }
+                    // A source-selecting option would move into the block and
+                    // OVERRIDE it in bundler's DSL, leaving the redirect a
+                    // silent no-op that still gets attested. Fail closed —
+                    // and when the blocking `path:` is socket-patch's OWN
+                    // vendored wiring, prescribe the eject path instead of
+                    // leaving the user to puzzle over their own Gemfile.
+                    if let Some(opt) = gemfile::source_option(&tail) {
+                        let tok = opt.spelling;
+                        let socket_vendored = opt.key == "path"
+                            && tail
+                                .split('#')
+                                .next()
+                                .unwrap_or("")
+                                .contains(".socket/vendor/");
+                        let detail = gem_source_option_detail(
+                            dep,
+                            &format!("the `gem \"{}\"` declaration carries `{tok}`", dep.name),
+                            socket_vendored,
+                        );
+                        result.warnings.push(RewriteWarning {
+                            code: "redirect_gem_source_option".into(),
+                            detail,
+                        });
+                        continue;
+                    }
                     // Trailing options (`require: false`, `group: …`) must
                     // survive the move into the source block — dropping
                     // `require: false` auto-requires the gem at boot.
-                    let opts = gem_line_trailing_options(&tail);
+                    let opts = gemfile::trailing_options(&tail);
                     let block = if opts.is_empty() {
                         format!(
                             "source \"{}\" do\n  gem \"{}\", \"{}\"\nend",
@@ -6134,18 +6350,10 @@ fn rewrite_gem(
 //   warns `redirect_maven_same_gav_fallback` (a Socket-repo outage/tamper falls
 //   back to the UNPATCHED artifact — NOT fail-closed).
 //
-// Gradle has no equivalent surgical single-line edit, so a present build script
-// gets a paste-able `exclusiveContent { … }` snippet warning instead of an
-// edit. pom.xml + `.mvn/*` are authored surgically (mirrors the cargo/nuget
-// rewriters): every byte not touched by an edit is preserved.
-
-/// Gradle build scripts (Groovy + Kotlin DSL) that trigger the manual snippet.
-const GRADLE_FILES: &[&str] = &[
-    "settings.gradle",
-    "settings.gradle.kts",
-    "build.gradle",
-    "build.gradle.kts",
-];
+// A Gradle build is wired by its own planner ([`gradle`]): the owned hosted
+// settings script, its index and the lockfile surgery. pom.xml + `.mvn/*`
+// are authored surgically (mirrors the cargo/nuget rewriters): every byte
+// not touched by an edit is preserved.
 
 /// The six `-Daether.*` args that enable Maven's Trusted Checksums resolver
 /// post-processor (twin of the TS `MVN_CONFIG_ARGS`), one per `.mvn/maven.config`
@@ -6315,7 +6523,7 @@ fn rewrite_maven_pom(
     let mut mvn_config_changed = false;
     // (local-repo-relative path, bare sha256 hex) entries to merge in.
     let mut checksum_entries: Vec<(String, String)> = vec![];
-    let gradle_build_present = GRADLE_FILES.iter().any(|f| files.contains_key(*f));
+    let gradle_build_present = gradle::gradle_build_present(files);
     let mut warned_no_pom = false;
     // Local-repo paths of the suffixed jars this run's Trusted Checksums pin
     // covers, whether the pin lands now or a prior run wrote it: the
@@ -6345,27 +6553,10 @@ fn rewrite_maven_pom(
         let pom_sha256 = ov.identifiers.maven_pom_sha256.clone();
         let jar_sha256 = dep.integrity.sha256.clone();
 
-        // Gradle: emit a paste-able exclusiveContent snippet (never edit a
-        // build script). Independent of the pom edit — a project may ship both.
-        // Pin the suffixed version when fail-closed; the legacy base otherwise.
-        if gradle_build_present {
-            let gradle_version = suffixed_version.as_deref().unwrap_or(&dep.version);
-            result.warnings.push(RewriteWarning {
-                code: "redirect_gradle_manual_snippet".into(),
-                detail: gradle_snippet(
-                    &ov.index_url,
-                    &group_id,
-                    &artifact_id,
-                    gradle_version,
-                    suffixed_version.is_some(),
-                ),
-            });
-        }
-
         // The pom for the rest of this iteration; edits land in place.
         let Some(pom_text) = pom.as_mut() else {
-            // A Gradle-only project is legitimately pom-less — the snippet
-            // above IS its redirect path. Otherwise say why nothing landed
+            // A Gradle-only project is legitimately pom-less — the Gradle
+            // planner is its redirect path. Otherwise say why nothing landed
             // (parity with `redirect_npm_no_lockfile`), once per run.
             if !gradle_build_present && !warned_no_pom {
                 warned_no_pom = true;
@@ -6833,31 +7024,6 @@ pub(crate) fn local_repo_artifact_path(
     format!(
         "{}/{artifact_id}/{version}/{artifact_id}-{version}.{ext}",
         group_id.replace('.', "/")
-    )
-}
-
-/// A paste-able Gradle `exclusiveContent` block that pins ONLY the patched
-/// artifact to the socket maven2 repository (Groovy DSL — the common case; the
-/// Kotlin DSL differs only in quoting). Uses the SUFFIXED version when
-/// fail-closed; the message reminds the user to also bump the dependency
-/// declaration. Emitted as a warning detail; the rewriter never edits a build
-/// script.
-fn gradle_snippet(
-    index_url: &str,
-    group_id: &str,
-    artifact_id: &str,
-    version: &str,
-    suffixed: bool,
-) -> String {
-    let bump = if suffixed {
-        format!(
-            " Also bump the {group_id}:{artifact_id} dependency declaration to version {version} — exclusiveContent is fail-closed by repo exclusivity."
-        )
-    } else {
-        String::new()
-    };
-    format!(
-        "Gradle build detected — add this per-dependency repository manually (no automatic edit):\nrepositories {{\n    exclusiveContent {{\n        forRepository {{\n            maven {{ url \"{index_url}\" }}\n        }}\n        filter {{\n            includeVersion(\"{group_id}\", \"{artifact_id}\", \"{version}\")\n        }}\n    }}\n}}{bump}"
     )
 }
 
@@ -7768,8 +7934,10 @@ mod tests {
         assert_eq!(kinds, vec!["redirect_maven_repository"]);
     }
 
-    /// A present Gradle build script yields a paste-able snippet pinning the
-    /// SUFFIXED version, with no file edits.
+    /// A Gradle build the hosted Gradle planner refuses (here: a grant whose
+    /// uuid does not name its suffix) writes nothing and prints the
+    /// fallback snippet pinning the SUFFIXED version, request rewrite and
+    /// reject block included.
     #[test]
     fn maven_pom_gradle_manual_snippet() {
         let mut files = BTreeMap::new();
@@ -7779,17 +7947,30 @@ mod tests {
         );
         let r = rewrite_registry_redirect(&files, &[maven_override()]);
         assert!(r.files.is_empty() && r.edits.is_empty());
-        assert_eq!(warning_codes(&r), vec!["redirect_gradle_manual_snippet"]);
-        let detail = &r.warnings[0].detail;
+        assert_eq!(
+            warning_codes(&r),
+            vec![
+                "redirect_gradle_override_invalid",
+                "redirect_gradle_manual_snippet"
+            ]
+        );
+        assert!(r.refused_gradle_uuids.contains("uuid"));
+        let detail = &r.warnings[1].detail;
         assert!(
             detail.contains(&format!(
-                "includeVersion(\"org.slf4j\", \"slf4j-api\", \"{MAVEN_SUFFIXED}\")"
+                "includeVersion('org.slf4j', 'slf4j-api', '{MAVEN_SUFFIXED}')"
             )),
             "snippet pins the suffixed version: {detail}"
         );
         assert!(
-            detail.contains("bump the org.slf4j:slf4j-api dependency declaration"),
-            "snippet reminds to bump the declaration: {detail}"
+            detail.contains(&format!("d.useVersion('{MAVEN_SUFFIXED}')"))
+                && detail.contains("vs.accept('1.7.36')")
+                && detail.contains("selection.reject("),
+            "snippet carries the pin, the request rewrite and the reject block: {detail}"
+        );
+        assert!(
+            !detail.contains("fail-closed by repo exclusivity"),
+            "the false exclusivity claim is gone: {detail}"
         );
     }
 
@@ -8541,6 +8722,205 @@ mod tests {
         assert_eq!(
             r.edits.iter().filter(|e| e.kind == "redirect_yarn_berry_resolution").count(),
             2
+        );
+    }
+
+    /// A root manifest consuming left-pad through the default catalog.
+    fn berry_catalog_manifest() -> String {
+        "{\n  \"name\": \"app\",\n  \"version\": \"1.0.0\",\n  \"dependencies\": {\n    \
+         \"left-pad\": \"catalog:\"\n  }\n}\n"
+            .to_string()
+    }
+
+    /// #632: yarn matches `resolutions` against the manifest's `catalog:`
+    /// descriptor before it expands the catalog, so a pin keyed only by the
+    /// lock's expanded `left-pad@npm:^1.3.0` never applies to a catalog
+    /// dependency: `yarn install --immutable` fails YN0028 and a mutable
+    /// install is unpatched. The catalog's own selector is routed too; the
+    /// `npm:` one stays for transitive descriptors and for rollback.
+    #[test]
+    fn yarn_berry_pin_routes_a_default_catalog_dependency() {
+        let checksum = format!("10c0/{}", "7".repeat(128));
+        let url = berry_hosted_url("left-pad", "left-pad", "1.3.0");
+        let ovr = berry_override("left-pad", "1.3.0", &url, &checksum);
+        for yarnrc in [
+            "nodeLinker: node-modules\ncatalog:\n  left-pad: ^1.3.0\n",
+            "\u{feff}catalog:\r\n  left-pad: \"npm:^1.3.0\"\r\n",
+        ] {
+            let mut files = berry_files(berry_lock("10c0"), berry_catalog_manifest());
+            files.insert(".yarnrc.yml".to_string(), yarnrc.to_string());
+            let mut r = RewriteResult::default();
+            rewrite_yarn_berry(&files, std::slice::from_ref(&ovr), &mut r);
+            assert!(r.warnings.is_empty(), "{yarnrc:?}: {:?}", r.warnings);
+            let manifest: Value = serde_json::from_str(&r.files["package.json"]).unwrap();
+            assert_eq!(
+                manifest["resolutions"],
+                json!({"left-pad@npm:^1.3.0": url, "left-pad@catalog:": url}),
+                "{yarnrc:?}: {manifest}"
+            );
+            assert_eq!(manifest["dependencies"]["left-pad"], "catalog:");
+            let keys: Vec<_> = r
+                .edits
+                .iter()
+                .filter(|e| e.kind == "redirect_yarn_berry_resolution")
+                .filter_map(|e| e.key.as_deref())
+                .collect();
+            assert_eq!(
+                keys,
+                ["left-pad@npm:^1.3.0", "left-pad@catalog:"],
+                "{yarnrc:?}"
+            );
+            assert!(r.confirmed_yarn_berry_uuids.contains(&ovr.patch_uuid));
+        }
+    }
+
+    /// Yarn reads `.yarnrc.yml` with the failsafe schema: an unquoted range
+    /// that looks like a number is its source text, so `1.10` must match the
+    /// lock's `npm:1.10` (not `npm:1.1`), and an integer, a null or a
+    /// non-string entry of another package must not hide the catalogs.
+    #[test]
+    fn yarn_berry_catalog_ranges_keep_their_source_text() {
+        let yarnrc = "nodeLinker: node-modules\npackageExtensions:\n  x@*:\n    \
+                      dependencies:\n      y: 1\ncatalog:\n  left-pad: 1.10\n  other: ~\n\
+                      catalogs:\n  ints:\n    left-pad: 2\n  nulls:\n  bare:\n    \
+                      left-pad: 1.10.0\n";
+        assert_eq!(
+            berry_catalog_selectors(Some(yarnrc), "left-pad", &["npm:1.10"]),
+            ["left-pad@catalog:"]
+        );
+        assert!(berry_catalog_selectors(Some(yarnrc), "left-pad", &["npm:1.1"]).is_empty());
+        assert_eq!(
+            berry_catalog_selectors(Some(yarnrc), "left-pad", &["npm:2", "npm:1.10.0"]),
+            ["left-pad@catalog:bare", "left-pad@catalog:ints"]
+        );
+        assert!(
+            berry_catalog_selectors(Some("catalog: [1, 2]\n"), "left-pad", &["npm:1"]).is_empty()
+        );
+        assert!(berry_catalog_selectors(Some(": : :"), "left-pad", &["npm:1"]).is_empty());
+    }
+
+    /// #632, workspace shape: the default catalog and a named one
+    /// (`catalogs.legacy`) both lock into one merged entry, so both catalog
+    /// selectors are routed; a catalog whose range locks another entry, a
+    /// catalog of another package and one with a non-npm protocol are not.
+    #[test]
+    fn yarn_berry_pin_routes_every_catalog_locking_the_entry() {
+        let checksum = format!("10c0/{}", "7".repeat(128));
+        let url = berry_hosted_url("left-pad", "left-pad", "1.3.0");
+        let ovr = berry_override("left-pad", "1.3.0", &url, &checksum);
+        let lock = format!(
+            "# header\n\n__metadata:\n  version: 8\n  cacheKey: 10c0\n\n\
+             \"left-pad@npm:1.3.0, left-pad@npm:^1.3.0\":\n  version: 1.3.0\n  \
+             resolution: \"left-pad@npm:1.3.0\"\n  checksum: 10c0/{}\n  languageName: node\n  \
+             linkType: hard\n",
+            "3".repeat(128)
+        );
+        let mut files = berry_files(lock, berry_catalog_manifest());
+        files.insert(
+            ".yarnrc.yml".to_string(),
+            "catalog:\n  left-pad: ^1.3.0\n  is-number: 1.3.0\ncatalogs:\n  legacy:\n    \
+             left-pad: 1.3.0\n  old:\n    left-pad: ^1.0.0\n  forked:\n    \
+             left-pad: \"patch:left-pad@npm%3A1.3.0#./p.patch\"\n"
+                .to_string(),
+        );
+        let mut r = RewriteResult::default();
+        rewrite_yarn_berry(&files, std::slice::from_ref(&ovr), &mut r);
+        assert!(r.warnings.is_empty(), "{:?}", r.warnings);
+        let manifest: Value = serde_json::from_str(&r.files["package.json"]).unwrap();
+        assert_eq!(
+            manifest["resolutions"],
+            json!({
+                "left-pad@npm:1.3.0": url,
+                "left-pad@npm:^1.3.0": url,
+                "left-pad@catalog:": url,
+                "left-pad@catalog:legacy": url,
+            }),
+            "{manifest}"
+        );
+    }
+
+    /// #632: a re-run over its own catalog pin changes nothing, and a re-run
+    /// over a pin written before the fix (lock keyed by the URL, only the
+    /// `npm:` selector) adds the missing catalog selector without touching
+    /// the lock.
+    #[test]
+    fn yarn_berry_catalog_pin_rerun_is_stable_and_heals_an_old_pin() {
+        let checksum = format!("10c0/{}", "7".repeat(128));
+        let url = berry_hosted_url("left-pad", "left-pad", "1.3.0");
+        let ovr = berry_override("left-pad", "1.3.0", &url, &checksum);
+        let yarnrc = "catalog:\n  left-pad: ^1.3.0\n";
+        let mut files = berry_files(berry_lock("10c0"), berry_catalog_manifest());
+        files.insert(".yarnrc.yml".to_string(), yarnrc.to_string());
+        let mut first = RewriteResult::default();
+        rewrite_yarn_berry(&files, std::slice::from_ref(&ovr), &mut first);
+        assert!(first.warnings.is_empty(), "{:?}", first.warnings);
+        let pinned_lock = first.files["yarn.lock"].clone();
+        let pinned_manifest = first.files["package.json"].clone();
+
+        let mut rerun_files = berry_files(pinned_lock.clone(), pinned_manifest);
+        rerun_files.insert(".yarnrc.yml".to_string(), yarnrc.to_string());
+        let mut rerun = RewriteResult::default();
+        rewrite_yarn_berry(&rerun_files, std::slice::from_ref(&ovr), &mut rerun);
+        assert!(rerun.warnings.is_empty(), "{:?}", rerun.warnings);
+        assert!(
+            rerun.files.is_empty(),
+            "re-run is a no-op: {:?}",
+            rerun.files
+        );
+        assert!(rerun.confirmed_yarn_berry_uuids.contains(&ovr.patch_uuid));
+
+        let old_manifest = serde_json::to_string_pretty(&json!({
+            "name": "app",
+            "version": "1.0.0",
+            "dependencies": {"left-pad": "catalog:"},
+            "resolutions": {"left-pad@npm:^1.3.0": url},
+        }))
+        .unwrap()
+            + "\n";
+        let mut old_files = berry_files(pinned_lock, old_manifest);
+        old_files.insert(".yarnrc.yml".to_string(), yarnrc.to_string());
+        let mut healed = RewriteResult::default();
+        rewrite_yarn_berry(&old_files, std::slice::from_ref(&ovr), &mut healed);
+        assert!(healed.warnings.is_empty(), "{:?}", healed.warnings);
+        assert!(
+            !healed.files.contains_key("yarn.lock"),
+            "lock already pinned"
+        );
+        let manifest: Value = serde_json::from_str(&healed.files["package.json"]).unwrap();
+        assert_eq!(
+            manifest["resolutions"],
+            json!({"left-pad@npm:^1.3.0": url, "left-pad@catalog:": url}),
+            "{manifest}"
+        );
+    }
+
+    /// A user-authored catalog selector is the user's pin: the hosted
+    /// redirect refuses rather than overwrite it.
+    #[test]
+    fn yarn_berry_pin_refuses_a_user_catalog_resolution() {
+        let checksum = format!("10c0/{}", "7".repeat(128));
+        let url = berry_hosted_url("left-pad", "left-pad", "1.3.0");
+        let ovr = berry_override("left-pad", "1.3.0", &url, &checksum);
+        let manifest = serde_json::to_string_pretty(&json!({
+            "name": "app",
+            "dependencies": {"left-pad": "catalog:"},
+            "resolutions": {"left-pad@catalog:": "npm:1.3.0"},
+        }))
+        .unwrap();
+        let mut files = berry_files(berry_lock("10c0"), manifest);
+        files.insert(
+            ".yarnrc.yml".to_string(),
+            "catalog:\n  left-pad: ^1.3.0\n".into(),
+        );
+        let mut r = RewriteResult::default();
+        rewrite_yarn_berry(&files, std::slice::from_ref(&ovr), &mut r);
+        assert!(r.files.is_empty(), "{:?}", r.files);
+        assert_eq!(
+            r.warnings
+                .iter()
+                .map(|w| w.code.as_str())
+                .collect::<Vec<_>>(),
+            ["redirect_yarn_berry_resolutions_conflict"]
         );
     }
 
@@ -12648,6 +13028,142 @@ mod tests {
         );
     }
 
+    /// #652: the source-option refusal must catch every option that picks a
+    /// git source — bundler's built-in `gitlab:`, a custom
+    /// `git_source(:name)` key, and the string-keyed `"git" =>` / quoted
+    /// symbol `"git":` spellings — not only a fixed token list. Each one,
+    /// moved into the Socket block, overrides it: bundler keeps loading the
+    /// unpatched git checkout while VEX attests `not_affected`.
+    #[test]
+    fn gemfile_git_source_options_in_every_spelling_fail_closed() {
+        for (gemfile, tok) in [
+            (
+                "source \"https://rubygems.org\"\n\ngem \"rails\", gitlab: \"rails/rails\"\n",
+                "gitlab:",
+            ),
+            (
+                "source \"https://rubygems.org\"\n\n\
+                 git_source(:local) { |r| \"/srv/repos/#{r}\" }\n\n\
+                 gem \"rails\", local: \"rails\"\n",
+                "local:",
+            ),
+            (
+                "source \"https://rubygems.org\"\n\n\
+                 gem \"rails\", \"7.0.0\", require: false, :internal => \"rails\"\n",
+                ":internal",
+            ),
+            (
+                "source \"https://rubygems.org\"\n\ngem \"rails\", \"git\" => \"/srv/repos/rails\"\n",
+                "\"git\" =>",
+            ),
+            (
+                "source \"https://rubygems.org\"\n\ngem \"rails\", 'path' => '../rails'\n",
+                "'path' =>",
+            ),
+            (
+                "source \"https://rubygems.org\"\n\ngem \"rails\", \"git\": \"/srv/repos/rails\"\n",
+                "\"git\":",
+            ),
+        ] {
+            let mut files = BTreeMap::new();
+            files.insert("Gemfile".to_string(), gemfile.to_string());
+            files.insert(
+                "Gemfile.lock".to_string(),
+                gem_lock(&format!("  rails (7.0.0) sha256={}", "2".repeat(64))),
+            );
+            let r = rewrite_registry_redirect(&files, &[gem_override("rails", "7.0.0")]);
+            assert!(
+                r.files.is_empty() && r.edits.is_empty(),
+                "{tok}: a git-source option must skip the redirect: files={:?} edits={:?}",
+                r.files,
+                r.edits
+            );
+            let warning = r
+                .warnings
+                .iter()
+                .find(|w| w.code == "redirect_gem_source_option")
+                .unwrap_or_else(|| panic!("{tok}: skip must warn: {:?}", r.warnings));
+            assert!(
+                warning.detail.contains(&format!("`{tok}`")),
+                "{tok}: the refusal names the option as written: {}",
+                warning.detail
+            );
+        }
+    }
+
+    /// #652: a string-keyed option that does NOT pick a source
+    /// (`"require" => false`) is an option, not a version constraint — it
+    /// must ride into the Socket block instead of being silently dropped.
+    #[test]
+    fn gemfile_string_keyed_options_survive_the_redirect() {
+        let mut files = BTreeMap::new();
+        files.insert(
+            "Gemfile".to_string(),
+            "source \"https://rubygems.org\"\n\n\
+             gem \"rails\", \"7.0.0\", \"require\" => false\n"
+                .to_string(),
+        );
+        files.insert(
+            "Gemfile.lock".to_string(),
+            gem_lock(&format!("  rails (7.0.0) sha256={}", "2".repeat(64))),
+        );
+        let r = rewrite_registry_redirect(&files, &[gem_override("rails", "7.0.0")]);
+        let out = r
+            .files
+            .get("Gemfile")
+            .unwrap_or_else(|| panic!("redirect applies: {:?}", r.warnings));
+        assert!(
+            out.contains("  gem \"rails\", \"7.0.0\", \"require\" => false\n"),
+            "string-keyed option preserved inside the block: {out}"
+        );
+    }
+
+    /// #652: the lock is what bundler resolves from. A gem the lock lists
+    /// under a `GIT` (or `PATH`) section is served from there whatever the
+    /// Gemfile line looks like — e.g. a plain `gem "rails"` inside a
+    /// `git "…" do` block — so moving the line into a Socket source block
+    /// cannot redirect it. Fail closed instead of attesting a no-op.
+    #[test]
+    fn gem_locked_from_git_or_path_section_fails_closed() {
+        for (gemfile, section) in [
+            (
+                "source \"https://rubygems.org\"\n\n\
+                 git \"https://gitlab.com/rails/rails.git\" do\n  gem \"rails\"\nend\n",
+                "GIT\n  remote: https://gitlab.com/rails/rails.git\n  \
+                 revision: 0123456789abcdef0123456789abcdef01234567\n  specs:\n    \
+                 rails (7.0.0)\n\n",
+            ),
+            (
+                "source \"https://rubygems.org\"\n\n\
+                 path \"vendor/engines\" do\n  gem \"rails\"\nend\n",
+                "PATH\n  remote: vendor/engines\n  specs:\n    rails (7.0.0)\n\n",
+            ),
+        ] {
+            let lock = format!(
+                "{section}GEM\n  remote: https://rubygems.org/\n  specs:\n\n\
+                 PLATFORMS\n  ruby\n\nDEPENDENCIES\n  rails!\n\nBUNDLED WITH\n   2.6.2\n"
+            );
+            let mut files = BTreeMap::new();
+            files.insert("Gemfile".to_string(), gemfile.to_string());
+            files.insert("Gemfile.lock".to_string(), lock);
+            let r = rewrite_registry_redirect(&files, &[gem_override("rails", "7.0.0")]);
+            assert!(
+                r.files.is_empty() && r.edits.is_empty(),
+                "a gem locked from a non-registry section must skip the redirect: \
+                 files={:?} edits={:?}",
+                r.files,
+                r.edits
+            );
+            assert!(
+                r.warnings
+                    .iter()
+                    .any(|w| w.code == "redirect_gem_source_option"),
+                "skip must warn: {:?}",
+                r.warnings
+            );
+        }
+    }
+
     /// When the blocking `path:` option is socket-patch's OWN vendored wiring
     /// (`.socket/vendor/gem/<uuid>/…`), the refusal must prescribe the eject
     /// paths instead of pointing the user at a Gemfile line the tool itself
@@ -14151,6 +14667,159 @@ mod tests {
             "{:?}",
             r.warnings
         );
+    }
+
+    /// #432: a lockfileVersion 2 lock's legacy `dependencies` mirror
+    /// spells an alias install `"lp": {"version": "npm:left-pad@1.3.0"}`.
+    /// It is rewired with the `packages` half (plain and scoped alias keys)
+    /// instead of silently staying on the registry, and the run says that
+    /// npm 6 installs of an aliased hosted pin fail closed.
+    #[test]
+    fn npm_v2_legacy_alias_mirror_is_rewired_and_warned() {
+        let registry = "https://registry.npmjs.org/left-pad/-/left-pad-1.3.0.tgz";
+        let node = json!({ "version": "npm:left-pad@1.3.0", "resolved": registry,
+                           "integrity": "sha512-UPSTREAM==" });
+        let entry = json!({ "name": "left-pad", "version": "1.3.0", "resolved": registry,
+                            "integrity": "sha512-UPSTREAM==" });
+        let lock = json!({
+            "name": "app",
+            "lockfileVersion": 2,
+            "requires": true,
+            "packages": {
+                "": { "name": "app", "version": "0.0.0",
+                      "dependencies": { "lp": "npm:left-pad@1.3.0",
+                                        "@x/lp": "npm:left-pad@1.3.0" } },
+                "node_modules/@x/lp": entry,
+                "node_modules/lp": entry
+            },
+            "dependencies": { "@x/lp": node, "lp": node }
+        });
+        let mut files = BTreeMap::new();
+        files.insert(
+            "package-lock.json".to_string(),
+            serde_json::to_string_pretty(&lock).unwrap(),
+        );
+        let overrides = vec![npm_override(
+            "left-pad",
+            "1.3.0",
+            "http://patch.test/lp.tgz",
+            "sha512-PATCHED==",
+        )];
+        let r = rewrite_registry_redirect(&files, &overrides);
+        let mut keys: Vec<_> = r
+            .edits
+            .iter()
+            .map(|e| (e.kind.as_str(), e.key.as_deref()))
+            .collect();
+        keys.sort_unstable();
+        assert_eq!(
+            keys,
+            [
+                ("redirect_npm_lock_dep", Some("@x/lp")),
+                ("redirect_npm_lock_dep", Some("lp")),
+                ("redirect_npm_lock_entry", Some("node_modules/@x/lp")),
+                ("redirect_npm_lock_entry", Some("node_modules/lp")),
+            ]
+        );
+        let out: Value = serde_json::from_str(&r.files["package-lock.json"]).unwrap();
+        for alias in ["lp", "@x/lp"] {
+            assert_eq!(
+                out["dependencies"][alias]["resolved"],
+                "http://patch.test/lp.tgz"
+            );
+            assert_eq!(out["dependencies"][alias]["integrity"], "sha512-PATCHED==");
+            assert_eq!(out["dependencies"][alias]["version"], "npm:left-pad@1.3.0");
+        }
+        let codes = warning_codes(&r);
+        assert!(
+            !codes.contains(&"redirect_npm_entry_not_found"),
+            "{codes:?}"
+        );
+        let w = r
+            .warnings
+            .iter()
+            .find(|w| w.code == "redirect_npm_legacy_alias_client")
+            .unwrap_or_else(|| panic!("missing npm 6 alias caveat: {:?}", r.warnings));
+        assert!(
+            w.detail.contains("npm <= 6") && w.detail.contains("EINTEGRITY"),
+            "{}",
+            w.detail
+        );
+        // A plain (non-alias) mirror carries no alias caveat.
+        let plain = lock_v2_plain_left_pad(registry);
+        let mut files = BTreeMap::new();
+        files.insert("package-lock.json".to_string(), plain);
+        let r = rewrite_registry_redirect(&files, &overrides);
+        assert!(r.files.contains_key("package-lock.json"));
+        assert!(
+            !warning_codes(&r).contains(&"redirect_npm_legacy_alias_client"),
+            "{:?}",
+            r.warnings
+        );
+    }
+
+    fn lock_v2_plain_left_pad(registry: &str) -> String {
+        let node = json!({ "version": "1.3.0", "resolved": registry,
+                           "integrity": "sha512-UPSTREAM==" });
+        serde_json::to_string_pretty(&json!({
+            "name": "app",
+            "lockfileVersion": 2,
+            "packages": {
+                "": { "name": "app", "version": "0.0.0" },
+                "node_modules/left-pad": node
+            },
+            "dependencies": { "left-pad": node }
+        }))
+        .unwrap()
+    }
+
+    /// #432, lockfileVersion 1: npm 6 writes an alias install as
+    /// `"lp": {"version": "npm:left-pad@1.3.0"}` and nothing else. The
+    /// hosted run used to find no entry (`redirect_npm_entry_not_found`,
+    /// exit 0) and pin nothing; it now rewires the node (npm >= 7 installs
+    /// the hosted patch from it, verified against npm 8 and 10) with the
+    /// v1 npm 6 caveat.
+    #[test]
+    fn npm_v1_alias_entry_is_rewired() {
+        let v1 = r#"{
+  "name": "app",
+  "version": "0.0.0",
+  "lockfileVersion": 1,
+  "requires": true,
+  "dependencies": {
+    "lp": {
+      "version": "npm:left-pad@1.3.0",
+      "resolved": "https://registry.npmjs.org/left-pad/-/left-pad-1.3.0.tgz",
+      "integrity": "sha512-UPSTREAM=="
+    }
+  }
+}
+"#;
+        let mut files = BTreeMap::new();
+        files.insert("package-lock.json".to_string(), v1.to_string());
+        let ovr = npm_override(
+            "left-pad",
+            "1.3.0",
+            "http://patch.test/left-pad-1.3.0.tgz",
+            "sha512-PATCHED==",
+        );
+        let r = rewrite_registry_redirect(&files, std::slice::from_ref(&ovr));
+        let codes = warning_codes(&r);
+        assert!(
+            !codes.contains(&"redirect_npm_entry_not_found"),
+            "{codes:?}"
+        );
+        assert!(codes.contains(&"redirect_npm_legacy_client"), "{codes:?}");
+        assert!(
+            !codes.contains(&"redirect_npm_legacy_alias_client"),
+            "the v1 caveat already covers every npm 6 install: {codes:?}"
+        );
+        let out: Value = serde_json::from_str(&r.files["package-lock.json"]).unwrap();
+        assert_eq!(
+            out["dependencies"]["lp"]["resolved"],
+            "http://patch.test/left-pad-1.3.0.tgz"
+        );
+        assert_eq!(out["dependencies"]["lp"]["version"], "npm:left-pad@1.3.0");
     }
 
     /// npm 12 removed `npm shrinkwrap` and now auto-creates a
@@ -17638,8 +18307,8 @@ packages:
     }
 
     /// No pom.xml and no Gradle build script: the maven grants are SAID once.
-    /// (A Gradle-only project is legitimately pom-less — its snippet IS the
-    /// redirect path; see `maven_pom_gradle_manual_snippet`.)
+    /// (A Gradle-only project is legitimately pom-less — the Gradle planner
+    /// is its redirect path; see `redirect::gradle`.)
     #[test]
     fn maven_without_pom_or_gradle_warns_once_and_skips() {
         let files = BTreeMap::new();
@@ -19443,8 +20112,8 @@ packages:
         );
     }
 
-    /// The LEGACY gradle snippet pins the BASE version and omits the "Also
-    /// bump" sentence (there is no suffixed version to bump to).
+    /// The LEGACY (same-GAV) grant is refused for a Gradle build; its
+    /// snippet routes the BASE version and carries no pin to bump to.
     #[test]
     fn maven_legacy_gradle_snippet_pins_base_version() {
         let mut files = BTreeMap::new();
@@ -19454,15 +20123,21 @@ packages:
         );
         let r = rewrite_registry_redirect(&files, &[legacy_maven_override()]);
         assert!(r.files.is_empty() && r.edits.is_empty());
-        assert_eq!(warning_codes(&r), vec!["redirect_gradle_manual_snippet"]);
-        let detail = &r.warnings[0].detail;
+        assert_eq!(
+            warning_codes(&r),
+            vec![
+                "redirect_gradle_same_gav_unsupported",
+                "redirect_gradle_manual_snippet"
+            ]
+        );
+        let detail = &r.warnings[1].detail;
         assert!(
-            detail.contains("includeVersion(\"org.slf4j\", \"slf4j-api\", \"1.7.36\")"),
+            detail.contains("includeVersion('org.slf4j', 'slf4j-api', '1.7.36')"),
             "snippet pins the BASE version: {detail}"
         );
         assert!(
-            !detail.contains("Also bump"),
-            "no bump reminder in legacy mode: {detail}"
+            !detail.contains("strictly"),
+            "no pin to bump to in legacy mode: {detail}"
         );
     }
 
@@ -20054,19 +20729,6 @@ packages:
             ],
             "{:?}",
             r.warnings
-        );
-    }
-
-    /// The documented bail-to-empty legs of `gem_line_trailing_options`: a
-    /// dangling comma and an unbalanced quote both yield "" (options dropped
-    /// rather than a panic or a mangled tail). Shared with vendor::gem.
-    #[test]
-    fn gem_line_trailing_options_bails_empty_on_unparseable_tails() {
-        assert_eq!(gem_line_trailing_options(","), "");
-        assert_eq!(gem_line_trailing_options(", \"7.0"), "");
-        assert_eq!(
-            gem_line_trailing_options(", \"7.0\", require: false"),
-            "require: false"
         );
     }
 

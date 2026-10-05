@@ -15,7 +15,6 @@ use super::{RevertOpts, RevertOutcome, VendorOutcome, VendorWarning};
 use crate::manifest::schema::PatchRecord;
 use crate::patch::apply::PatchSources;
 use crate::utils::fs::{atomic_write_bytes_preserving_mode, read_regular_to_bytes_sync};
-use sha2::{Digest, Sha256};
 use std::path::{Path, PathBuf};
 
 pub(crate) const LOCK: &str = "bun.lockb";
@@ -484,7 +483,9 @@ pub(crate) async fn revert(entry: &VendorEntry, root: &Path, opts: RevertOpts) -
                     .and_then(serde_json::Value::as_str)
                     .ok_or("missing workspace tarball fingerprint")?;
                 match read_regular_to_bytes_sync(&path) {
-                    Ok(bytes) if hex::encode(Sha256::digest(&bytes)) == expected => Ok(Some(path)),
+                    Ok(bytes) if crate::utils::digest::sha256_hex_of(&bytes) == expected => {
+                        Ok(Some(path))
+                    }
                     Ok(_) => Err("workspace tarball has changed; left alone".into()),
                     Err(e) if e.kind() == std::io::ErrorKind::NotFound => Ok(None),
                     Err(e) => Err(format!("cannot read workspace tarball: {e}")),

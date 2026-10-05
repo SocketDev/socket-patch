@@ -27,6 +27,10 @@ use sha2::{Digest, Sha256};
 /// `#[path = "common/cache_env.rs"] mod cache_env;`.
 pub mod cache_env;
 
+/// JVM build-tool env scrub + stand-in home for the CLI children (shared
+/// with `prebuilt_common`).
+pub mod jvm_env;
+
 /// The hermetic `SOCKET_*` environment every test child is spawned with.
 /// Files that don't need the rest of this module pull it in on its own with
 /// `#[path = "common/hermetic.rs"] mod hermetic;`.
@@ -86,6 +90,10 @@ pub fn run_bin_with_env(
 ) -> (i32, String, String) {
     let mut cmd = hermetic_command(bin);
     cmd.args(args).current_dir(cwd);
+    // No ambient Gradle / JVM options and no real home: the JVM crawlers
+    // would otherwise read the developer's `~/.gradle` / `~/.m2` (and any
+    // `GRADLE_USER_HOME` / `GRADLE_RO_DEP_CACHE`) into every test.
+    jvm_env::isolate_cli(&mut cmd);
     // Caller-supplied env lands last so explicit injections (runtime
     // gates, discovery roots) survive the scrub.
     for (k, v) in env {
