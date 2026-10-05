@@ -9,7 +9,7 @@ use toml_edit::DocumentMut;
 
 use super::{DepOverride, FileEdit, RewriteResult, RewriteWarning};
 use crate::utils::poetry_lock::{
-    generated_by_version, lock_version, rewrite_poetry_lock_in, PoetryLockParse,
+    generated_by_version, lock_version, rewrite_poetry_lock_all, LockBatch, LockStep, PoetryLockDep,
 };
 
 /// Whether the lock was written by a Poetry release older than 1.4. Those
@@ -56,56 +56,42 @@ pub(super) fn rewrite_poetry(
         }
     }
     for (path, original) in locks {
-        let mut content = original.clone();
+        let deps: Vec<PoetryLockDep> = usable
+            .iter()
+            .map(|&(dep, sha256)| PoetryLockDep {
+                name: &dep.name,
+                version: &dep.version,
+                source_type: "url",
+                source_url: &dep.artifact_url,
+                filename: dep.artifact_url.rsplit('/').next().unwrap_or(""),
+                sha256,
+            })
+            .collect();
+        // Every dep is rewritten over one parse and one render of the lock.
+        let LockBatch {
+            text: content,
+            steps,
+        } = rewrite_poetry_lock_all(original, &deps);
         let mut stale_warned = false;
         // `pre_1_4_writer` reads only the first line and `[metadata]
-        // lock-version`, which no package rewrite touches: judged once, on the
-        // lock as of its first rewrite (where it was always first judged).
+        // lock-version`, which no package rewrite touches: judged once.
         let mut writer_format: Option<Option<&'static str>> = None;
-        // Each lock state is parsed once: a rewrite hands its parsed output
-        // to the next dep.
-        let mut parse = PoetryLockParse::default();
-        for &(dep, sha256) in &usable {
-            let filename = dep.artifact_url.rsplit('/').next().unwrap_or("");
-            match rewrite_poetry_lock_in(
-                &mut parse,
-                &content,
-                &dep.name,
-                &dep.version,
-                "url",
-                &dep.artifact_url,
-                filename,
-                sha256,
-            ) {
-                Ok(Some(rewrite)) if rewrite.text != content => {
-                    match rewrite.edits() {
-                        Ok(edits) => {
-                            for (original, new) in edits {
-                                result.edits.push(FileEdit {
-                                    path: path.clone(),
-                                    kind: "redirect_poetry_lock_package".into(),
-                                    action: "rewritten".into(),
-                                    key: Some(format!("{}@{}", dep.name, dep.version)),
-                                    original: Some(Value::String(original)),
-                                    new: Some(Value::String(new)),
-                                });
-                            }
-                        }
-                        Err(detail) => {
-                            result
-                                .refused_python_lock_uuids
-                                .insert(dep.patch_uuid.clone());
-                            result.warnings.push(RewriteWarning {
-                                code: "redirect_poetry_lock_unsupported".into(),
-                                detail: format!("{path}: {detail}"),
-                            });
-                            continue;
-                        }
+        for (&(dep, _), step) in usable.iter().zip(steps) {
+            match step {
+                LockStep::Rewritten(edits) => {
+                    for (original, new) in edits {
+                        result.edits.push(FileEdit {
+                            path: path.clone(),
+                            kind: "redirect_poetry_lock_package".into(),
+                            action: "rewritten".into(),
+                            key: Some(format!("{}@{}", dep.name, dep.version)),
+                            original: Some(Value::String(original)),
+                            new: Some(Value::String(new)),
+                        });
                     }
                     result
                         .confirmed_python_lock_uuids
                         .insert(dep.patch_uuid.clone());
-                    content = rewrite.text;
                     if !stale_warned {
                         if let Some(format) =
                             *writer_format.get_or_insert_with(|| pre_1_4_writer(&content))
@@ -139,16 +125,16 @@ pub(super) fn rewrite_poetry(
                     }
                 }
                 // Already redirected to this artifact (idempotent re-scan).
-                Ok(Some(_)) => {
+                LockStep::Unchanged => {
                     result
                         .confirmed_python_lock_uuids
                         .insert(dep.patch_uuid.clone());
                 }
-                Ok(None) => result.warnings.push(RewriteWarning {
+                LockStep::NotFound => result.warnings.push(RewriteWarning {
                     code: "redirect_poetry_entry_not_found".into(),
                     detail: format!("no {path} entry for {}@{}", dep.name, dep.version),
                 }),
-                Err(detail) => {
+                LockStep::Refused(detail) => {
                     result
                         .refused_python_lock_uuids
                         .insert(dep.patch_uuid.clone());
@@ -295,6 +281,16 @@ mod equivalence_tests {
         for version in VERSIONS.iter().filter(|version| !version.starts_with("0.")) {
             for crlf in [false, true] {
                 let mut lock = grown(version, 11);
+                // Give every clone its own populated legacy integrity entry,
+                // as Poetry writes them.
+                if let Some(start) = lock.find("\nurllib3 = [\n") {
+                    let end = start + lock[start..].find("\n]").unwrap() + 2;
+                    let entry = lock[start..end].to_string();
+                    let clones: String = (0..11)
+                        .map(|i| entry.replacen("urllib3 =", &format!("pkg{i} ="), 1))
+                        .collect();
+                    lock.insert_str(end, &clones);
+                }
                 if crlf {
                     lock = lock.replace('\n', "\r\n");
                 }
