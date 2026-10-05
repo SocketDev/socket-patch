@@ -1762,6 +1762,66 @@ async fn pylock_whole_second_upload_times_round_trip() {
     assert_pypi_round_trip("uv export pylock", &input, &[urllib3_dep()], None).await;
 }
 
+/// Native uv 0.11.19 gives these two different declarations the same
+/// `extra == 'x'` marker. Once hosted URLs replace their specifiers, their
+/// provenance is ambiguous: refusing must retain both files byte for byte.
+#[tokio::test]
+#[serial]
+async fn uv_explicit_extra_collision_refuses_without_writing() {
+    let pyproject = include_str!("fixtures/upstream/uv-explicit-extra/pyproject.toml");
+    let lock = include_str!("fixtures/upstream/uv-explicit-extra/uv.lock");
+    let wheel = "six-1.16.0-py2.py3-none-any.whl";
+    let dep = pypi_dep("six", "1.16.0", wheel, PYPI_UUID);
+    let (_server, _env) = pypi_mock(&[(
+        "six",
+        "1.16.0",
+        vec![
+            (
+                wheel,
+                "8abb2f1d86890a2dfb989f9a77cfcfd3e47c2a354b01111771326f8aa26e0254",
+                11053,
+                "2021-05-05T14:18:17.237Z",
+            ),
+            (
+                "six-1.16.0.tar.gz",
+                "1e61c37477a1626458e36f7b1d82aa5c9b094fa4802892072e49de9c60c4c926",
+                34041,
+                "2021-05-05T14:18:18.379Z",
+            ),
+        ],
+    )])
+    .await;
+    for own_marker in ["extra == 'x'", "'x' == extra"] {
+        let pyproject = pyproject.replace("extra == 'x'", own_marker);
+        for eol in ["\n", "\r\n"] {
+            let input = tree(&[
+                ("uv.lock", lock.replace('\n', eol)),
+                ("pyproject.toml", pyproject.replace('\n', eol)),
+            ]);
+            for dry_run in [false, true] {
+                println!("uv extra-marker refusal: {own_marker:?}, eol={eol:?}, dry_run={dry_run}");
+                let (why, rewritten, after) = pypi_refusal(
+                    &input,
+                    std::slice::from_ref(&dep),
+                    &RestoreOptions {
+                        dry_run,
+                        ..Default::default()
+                    },
+                )
+                .await;
+                assert!(why.contains("different specifiers"), "{why}");
+                assert!(why.contains("git checkout -- uv.lock"), "{why}");
+                assert!(rewritten["uv.lock"].contains("patch.socket.dev"));
+                assert!(rewritten["pyproject.toml"].contains("patch.socket.dev"));
+                assert_eq!(
+                    after, rewritten,
+                    "refused unwind changed files ({eol:?}, dry_run={dry_run})"
+                );
+            }
+        }
+    }
+}
+
 #[tokio::test]
 #[serial]
 async fn uv_refusals() {
