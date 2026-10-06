@@ -1,6 +1,6 @@
 [agent] Progress ledger for the scheduled Bundler (RubyGems) bug-hunt routine (label pm:bundler).
 
-Last updated: 2026-10-06 (run 24), main `9c43dfc` (includes #637, #621, #797, #805, #849, #731, #750, #712), latest release tag v4.0.0. Newest Bundler tested: 4.1.0.beta1 (repo gem e2e suites pass).
+Last updated: 2026-10-06 (run 25), main `9c43dfc` (includes #637, #621, #797, #805, #849, #731, #750, #712), latest release tag v4.0.0. Newest Bundler tested: 4.1.0.beta1 (repo gem e2e suites pass).
 
 ## Coverage matrix
 
@@ -82,8 +82,8 @@ Cells are "pass", "fail #N" or "untested". Hosted and vendored cells use a local
 
 | Bundler | Custom `git_source` key | Built-in `gitlab:` | String-keyed `"git" =>` | `"github" =>` |
 | --- | --- | --- | --- | --- |
-| 4.0.17 | fail #652 | fail #652 | fail #652 (option dropped) | untested (needs network) |
-| 2.5.22 | fail #652 | untested | untested | untested |
+| 4.0.17 | fixed #652 (#731) | fixed #652 (#731) | fixed #652 (#731) | untested (needs network) |
+| 2.5.22 | fixed #652 (#731) | untested | untested | untested |
 
 ### Run 12 (Linux, Ruby 3.3.6)
 
@@ -99,11 +99,11 @@ Cells are "pass", "fail #N" or "untested". Hosted and vendored cells use a local
 
 | OS | Ruby | Bundler | `gems.rb` redirect → install → `rollback` → frozen install | `Gemfile` + `gems.rb` twin unwind | CRLF manifest + CRLF lock cycle | `remove` purl / uuid (CRLF `gems.rb`) | Unwind: direct `~>` / `group` + opts | Uppercase name (`ZenTest`), 2-constraint decl | Config `path` outside the project (stale guard + VEX) |
 | --- | --- | --- | --- | --- | --- | --- | --- | --- | --- |
-| Linux | 3.3.6 | 4.0.17 | pass | pass | pass | pass | pass | pass | fail #709 |
-| Linux | 3.3.6 | 2.6.9 | pass | untested | pass | untested | pass | pass | fail #709 |
-| Linux | 3.3.6 | 2.4.22 | converged-lock unwind pass | untested | untested | untested | untested | untested | fail #709 |
-| windows-latest | 3.3 / 3.4 | 2.6.9 / 4.0.17 | pass (`Gemfile` too) | untested | pass | untested | untested | untested | fail #709 (4.0.17, `D:/…`) |
-| macos-latest | 3.3 / 3.4 | 2.6.9 / 4.0.17 | pass (`Gemfile` too) | untested | pass | untested | untested | untested | fail #709 (4.0.17) |
+| Linux | 3.3.6 | 4.0.17 | pass | pass | pass | pass | pass | pass | fixed #709 (#712) |
+| Linux | 3.3.6 | 2.6.9 | pass | untested | pass | untested | pass | pass | fixed #709 (#712) |
+| Linux | 3.3.6 | 2.4.22 | converged-lock unwind pass | untested | untested | untested | untested | untested | fixed #709 (#712) |
+| windows-latest | 3.3 / 3.4 | 2.6.9 / 4.0.17 | pass (`Gemfile` too) | untested | pass | untested | untested | untested | fixed #709 (#712; was 4.0.17, `D:/…`) |
+| macos-latest | 3.3 / 3.4 | 2.6.9 / 4.0.17 | pass (`Gemfile` too) | untested | pass | untested | untested | untested | fixed #709 (#712) |
 
 Controls for #709 (Linux, 4.0.17): config `path` relative, config `path` absolute inside the project, env `BUNDLE_PATH` absolute outside the project, and `path.system: true` all pass (stale warning; `vex` refuses `not_applied`).
 
@@ -123,8 +123,8 @@ Controls for #709 (Linux, 4.0.17): config `path` relative, config `path` absolut
 | windows-latest | 2.7 | 1.17.3 | pass | pass | fail #751 | untested | n/a | untested |
 | ubuntu-latest / windows-latest | 2.7 / 3.1 | 2.2.33 | pass | pass | pass | untested | n/a | untested |
 | Linux | 3.3.6 | 2.2.33 / 2.3.27 | pass | pass | untested | pass | n/a | untested |
-| Linux | 3.3.6 | 2.6.9 | — | — | — | — | n/a | fail #736 |
-| Linux | 3.3.6 | 4.0.17 | — | — | — | — | fail #749 | fail #736 |
+| Linux | 3.3.6 | 2.6.9 | — | — | — | — | n/a | fixed #736 (#750) |
+| Linux | 3.3.6 | 4.0.17 | — | — | — | — | fail #749 | fixed #736 (#750) |
 
 Also on 4.0.17: BOM `Gemfile` passes; symlinked `Gemfile` / lock is refused (pass); `--dry-run` writes nothing (pass).
 
@@ -213,6 +213,16 @@ Also on 4.0.17: BOM `Gemfile` passes; symlinked `Gemfile` / lock is refused (pas
 | Config readers on main vs 4.1 `.bundle/config` (`BUNDLE_PATH` / `GEMFILE` / `CACHE_PATH` / `PATH__SYSTEM`) | pass |
 | URL-scoped `mirror.<patch source>` quoted key vs PR #684 | gap in the PR (comment on #681) |
 
+### Run 25 (main `9c43dfc`; Linux Ruby 3.3.6; agent `apply --offline` + `vex` with a hand-written manifest, real `bundle install` / `bundle exec`)
+
+| Cell | 4.1.0.beta1 | 4.0.22 | 2.6.9 | 2.4.22 |
+| --- | --- | --- | --- | --- |
+| Agent: `.bundle/config` `BUNDLE_PATH: .gems # comment` (system copy also present) | fail #951 | fail #951 (×2) | fail #951 | fail #951 |
+| Agent: `BUNDLE_PATH: .gems` control | — | pass | pass | pass |
+| Hosted stale guard: `BUNDLE_CACHE_PATH: vendor/gems # comment` + stale archive (e2e harness case) | — | fail #951 (2/2, OS/version-independent) | — | — |
+| Agent: env `BUNDLE_GEMFILE=gemfiles/alt.gemfile`, `path vendor/bundle` in `gemfiles/.bundle/config` | — | fail #952 (×2) | fail #952 | — |
+| Agent: env `BUNDLE_GEMFILE=gemfiles/alt.gemfile` + env `BUNDLE_PATH=vendor/bundle` (relative) | — | fail #952 | fail #952 | — |
+
 ### Global mode (`-g`)
 
 | OS | Ruby / Bundler | `scan -g` report | `-g` vs project scoping | `scan -g --mode hosted` refused | `get -g` / `apply -g` | `rollback -g` byte-exact | `vex -g` | `--global-prefix <gems dir>` / `SOCKET_GLOBAL=1` | Non-writable gem dir |
@@ -235,13 +245,12 @@ Also on 4.0.17: BOM `Gemfile` passes; symlinked `Gemfile` / lock is refused (pas
 
 ## Backlog
 
-1. Re-run #681 / #729 / #749 / #751 / #775 / #826 / #896 / #915 when fixes merge (open PRs #684, #768, #776, #875, #916). #875 head `5b9953d3` already passes every #826 shape; #916 covers the `to_bool` spellings and the hosted stale guard; #776 covers every vendored-refused block shape; #684 head `0e1e6cda` misses 4.1's quoted URL-scoped mirror keys.
-2. RubyGems 4.1 + Bundler 4.1 (setup-ruby probe): content-addressed installs (`gems/<name>-<ver>-<hex>`), the `CONTENT ADDRESSES` lock section through a hosted rewrite + `rollback`, `specifications/<abi>/` for agent `vex`.
-3. Hosted 4.1 by hand: an `override "x", version:` next to a hosted pin, then `rollback`.
-4. Run the remaining 4.0.17-only cells on 4.0.22 / 4.1: H→V takeover, `eval_gemfile`, multi-gem hosted.
-5. Windows: `x64-mingw-ucrt` platform gems in hosted and vendored modes; vendored cells and `repair` on Windows and macOS.
-6. Global (`-g`) mode: real rvm / chruby installs on macOS.
-7. Bundler 1.17 hosted unwind (Ruby ≤ 3.1 probe); `rollback` / `remove` on a custom-lock project.
+1. Re-run #681 / #729 / #749 / #751 / #775 / #826 / #896 / #915 / #951 / #952 when fixes merge (open PRs #684, #768, #776, #875, #916). #875 head `5b9953d3` already passes every #826 shape. #916 covers the `to_bool` spellings and the hosted stale guard. #776 covers every vendored-refused block shape. #684 head `0e1e6cda` misses 4.1's quoted URL-scoped mirror keys. #684 and #916 also read config through the comment-keeping helper (#951).
+2. #952 neighbours: under `BUNDLE_GEMFILE=gemfiles/x.gemfile`, check `cache_path` in `gemfiles/.bundle/config` for the hosted stale guard (hosted refuses `BUNDLE_GEMFILE` there, but `vex` may not), and the env `BUNDLE_APP_CONFIG` relative to the moved root.
+3. More `.bundle/config` parser divergences from Bundler's `YAMLSerializer`: `KEY:"v"` with no space (Bundler ignores the key), a value with trailing spaces after the closing quote (Bundler keeps the quotes), `#` inside a quoted value (Bundler ≥ 2.5 truncates). All contrived, so low priority.
+4. RubyGems 4.1 + Bundler 4.1 (setup-ruby probe): content-addressed installs only apply to platform gems pinned to one ABI (`gems/<name>-<ver>-<hex8>`, `specifications/<abi>/`). Nothing on rubygems.org is published that way yet. Revisit when one is: `locate_gem_dir` returns the first `<name>-<ver>-*` match, but several addresses can coexist.
+5. Windows `x64-mingw-ucrt` platform gems in hosted and vendored modes; vendored cells and `repair` on Windows and macOS.
+6. Bundler 1.17 hosted unwind (Ruby ≤ 3.1 probe); `rollback` / `remove` on a custom-lock project.
 
 ## Known non-bugs
 
@@ -320,3 +329,7 @@ Also on 4.0.17: BOM `Gemfile` passes; symlinked `Gemfile` / lock is refused (pas
 - `parse_dir_name_version` misparses gem names that contain `-<digits>.<…>` (32 of 197k rubygems.org names, all obscure, e.g. `citus-rails-4.2`). Not filed (run 24).
 - Bundler 4.1 writes `.bundle/config` with unquoted values and double-quotes any key containing `:` (URL-scoped `mirror.` / credential keys). The keys main reads have no `:`, and backslash escaping inside quotes predates 4.1 (4.0's `inspect` did it too) (run 24).
 - Bundler 4.1's Gemfile `override` DSL can't silently unpatch a hosted pin (the pinned source only serves the patched version), and it isn't counted as a `gem` declaration (run 24).
+- Bundler's config loader keeps the double quotes when a quoted value is followed by a comment (`BUNDLE_PATH: ".gems" # c` → `"\".gems\""`) or by trailing spaces. Bundler itself breaks there, so only the unquoted `value # comment` shape (#951) is a socket-patch bug (run 25).
+- Bundler's config loader doesn't unescape `inspect`-written values (`"D:\\a\\proj"`, `"\u00FC"`), and neither does socket-patch, so they agree (run 25).
+- Under `BUNDLE_GEMFILE=gemfiles/x.gemfile`, Bundler reads `gemfiles/.bundle/config` and ignores the root `.bundle/config` (verified with 4.0.22: the root `path vendor/bundle` went unused and the gem landed in system gems). setup-ruby's `bundler-cache` writes an absolute `$PWD/vendor/bundle`, so the crawler's default `vendor/bundle` probe happens to find it; only relative paths hit #952 (run 25).
+
