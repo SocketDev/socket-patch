@@ -191,12 +191,15 @@ const WORKSPACE_ROOT_LOCKS: [&str; 5] = [
 /// would find the member's copy, pin nothing and report success.
 ///
 /// The nearest ancestor whose `workspaces` patterns match the member is
-/// its workspace root, as npm and yarn resolve it. A root with no lock
-/// (never installed) refuses nothing: there is nothing to pin anywhere.
+/// its workspace root, as npm and yarn resolve it. A matching root with no
+/// lock may itself be a member of an outer workspace (yarn berry's nested
+/// worktrees), so the walk goes on with that root as the member; a chain
+/// that ends without a lock (never installed) refuses nothing.
 async fn package_json_workspace_refusal(root: &Path) -> Option<Refusal> {
     let canonical = tokio::fs::canonicalize(root)
         .await
         .unwrap_or_else(|_| root.to_path_buf());
+    let mut member: &Path = &canonical;
     for ancestor in canonical.ancestors().skip(1) {
         let Ok(text) = read_regular_to_string(&ancestor.join("package.json")).await else {
             continue;
@@ -204,7 +207,7 @@ async fn package_json_workspace_refusal(root: &Path) -> Option<Refusal> {
         let Some(patterns) = workspace_patterns(&text) else {
             continue;
         };
-        let Ok(rel) = canonical.strip_prefix(ancestor) else {
+        let Ok(rel) = member.strip_prefix(ancestor) else {
             continue;
         };
         let rel: Vec<String> = rel
@@ -220,7 +223,8 @@ async fn package_json_workspace_refusal(root: &Path) -> Option<Refusal> {
             .filter(|name| ancestor.join(name).is_file())
             .collect();
         if locks.is_empty() {
-            return None;
+            member = ancestor;
+            continue;
         }
         return Some(Refusal {
             code: WORKSPACE_LOCKFILE_ELSEWHERE.to_string(),
@@ -676,6 +680,46 @@ mod tests {
             "{}",
             refusal.message
         );
+    }
+
+    /// Bugbot on #901: a lockless workspace root that is itself a member
+    /// of an outer workspace (yarn berry nested worktrees) hands the walk
+    /// to the outer root, whose lock governs both.
+    #[tokio::test]
+    async fn nested_lockless_workspace_defers_to_the_outer_root() {
+        let tmp = tempfile::tempdir().unwrap();
+        write(
+            tmp.path(),
+            "package.json",
+            r#"{"private":true,"workspaces":["packages/*"]}"#,
+        );
+        write(tmp.path(), "yarn.lock", "");
+        write(
+            tmp.path(),
+            "packages/inner/package.json",
+            r#"{"private":true,"workspaces":["pkgs/*"]}"#,
+        );
+        write(tmp.path(), "packages/inner/pkgs/a/package.json", "{}");
+        let member = tmp.path().join("packages/inner/pkgs/a");
+        let refusal = refusal(&ProjectView::Disk(&member), &[candidate("npm")])
+            .await
+            .expect("nested member refused");
+        assert_eq!(refusal.code, WORKSPACE_LOCKFILE_ELSEWHERE);
+        let root = std::fs::canonicalize(tmp.path()).unwrap();
+        assert!(
+            refusal
+                .message
+                .contains(&format!("run socket-patch from {}", root.display())),
+            "{}",
+            refusal.message
+        );
+        // The outer root must list the inner root, not just any path.
+        write(
+            tmp.path(),
+            "package.json",
+            r#"{"private":true,"workspaces":["apps/*"]}"#,
+        );
+        assert_eq!(code(&member, "npm").await, None);
     }
 
     #[test]
