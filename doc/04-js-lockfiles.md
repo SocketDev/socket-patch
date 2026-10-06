@@ -2,7 +2,7 @@
 
 ## Part 4: JavaScript lockfiles (npm, pnpm, yarn, bun, vlt)
 
-_Last checked against main @ 9c43dfc on 2026-10-06 by audit-ecosystems (pnpm BOM handling in `formats::pnpm` re-checked at `9c43dfc`; §4.4 vendored pnpm `package.json` writer re-checked at `4646693`; as of `045d7ec`: pnpm, berry gates, package-lock walks, JSON writers, bun-lock presence, CRLF policies, wiring-kind and lines↔JSON helpers and the 4.5 #2 layering re-checked; the rest is as of `2463257`). Owner: `audit-ecosystems`._
+_Last checked against main @ 9c43dfc on 2026-10-06 by audit-ecosystems (vendor driver skeleton re-checked at `9c43dfc`; pnpm BOM handling in `formats::pnpm` re-checked at `9c43dfc`; §4.4 vendored pnpm `package.json` writer re-checked at `4646693`; as of `045d7ec`: pnpm, berry gates, package-lock walks, JSON writers, bun-lock presence, CRLF policies, wiring-kind and lines↔JSON helpers and the 4.5 #2 layering re-checked; the rest is as of `2463257`). Owner: `audit-ecosystems`._
 
 > Scope: `vendor/{npm_*,pnpm_*,yarn_*,bun_*,vlt_*,berry_zip}.rs`, `formats/{pnpm,yarn,bun,registry}`, `crawlers/npm_crawler*`, `vendor/lock_inventory/*`, `vex/discover/{npm,yarn,bun,vlt}.rs`, and the JS parts of `patch/redirect/` and `hosted/vlt.rs`. Line counts are production / inline-test, split at the first top-level `#[cfg(test)] mod`.
 
@@ -62,9 +62,9 @@ The question "which lockfile drives installs?" is also answered in **five places
 
 **pnpm v9 vs pnpm legacy.** The drivers are now shared (#583): `vendor_pnpm_legacy` and `revert_pnpm_legacy_opts` are thin wrappers over `pnpm_lock::vendor_pnpm_dialect` / `revert_pnpm_dialect` with `PnpmDialect::Legacy` ([`pnpm_lock_legacy.rs#L200-L223`](https://github.com/SocketDev/socket-patch/blob/045d7ec783d788bf3c5a1310724b51e09fb6505d/crates/socket-patch-core/src/vendor/pnpm_lock_legacy.rs#L200-L223), [`#L894-L900`](https://github.com/SocketDev/socket-patch/blob/045d7ec783d788bf3c5a1310724b51e09fb6505d/crates/socket-patch-core/src/vendor/pnpm_lock_legacy.rs#L894-L900)), and `KIND_LOCK_PACKAGE` is imported, not redefined. What stays per dialect is the legacy line grammar: `read_lock`, `preflight_package(s)`, `lock_has_target_package`, `edit_*_v54/v60`, `revert_lock_record` and the `Ctx` methods. {{E12}}
 
-**The vendor driver skeleton is copied eight times.** npm_lock, pnpm, pnpm-legacy, yarn-berry, yarn-classic, bun_lock, bun_binary and vlt all repeat the same sequence:
-`guard_coordinates` → `read_project` → `stage_patch_pack` (×2) → `already_patched_result` → `write_marker_or_warn` → a literal `VendorEntry { … pdm: None, pipenv: None, poetry: None, uv: None, … }`.
-Each shares 55-67 distinct lines with `vendor_pnpm`. `read_project`, `preflight_package(s)` and `revert_*_opts` exist in 7-9 files each. {{E12}}
+**The vendor driver skeleton is copied seven times.** npm_lock, pnpm (both dialects since #583), yarn-berry, yarn-classic, bun_lock, bun_binary and vlt (about 1,940 lines) all repeat the same sequence:
+`guard_coordinates` → read the lock → preflight → `stage_patch_pack` (`stage_patch_dir` for vlt) → `already_patched_result` → `write_marker_or_warn` → a literal 20-field `VendorEntry { … pdm: None, pipenv: None, poetry: None, uv: None, … }`.
+The copies have drifted: the "patch rewrites `package.json`" warning has two codes (`vendor_dep_manifest_rewritten` vs `_stale`) and fires on in-sync re-runs for pnpm and bun only, and `bun_binary` computes its own `uuid_dir_preexisted`. `read_project`, `preflight_package(s)` and `revert_*_opts` exist in 7-9 files each. {{E22}}
 
 **Yarn berry project gates are written twice.** {{E09}}
 - cacheKey `10c0` appears as `SUPPORTED_CACHE_KEY` ([`yarn_berry_lock.rs#L89`](https://github.com/SocketDev/socket-patch/blob/045d7ec783d788bf3c5a1310724b51e09fb6505d/crates/socket-patch-core/src/vendor/yarn_berry_lock.rs#L89)) and as `YARN_BERRY_SUPPORTED_CACHE_KEY` ([`redirect/mod.rs#L3289`](https://github.com/SocketDev/socket-patch/blob/045d7ec783d788bf3c5a1310724b51e09fb6505d/crates/socket-patch-core/src/patch/redirect/mod.rs#L3287-L3289)).
@@ -107,7 +107,7 @@ Five different answers to one question, and every one of them is a bug class (se
    - Several codecs are already pure and are simply in the wrong place. `bun_lockb.rs`, `bun_lock_text.rs` and `vlt_lock_text.rs` do no I/O and would pass the `formats` purity guard (`formats/mod.rs:43-91`) unchanged. {{E20}}
 3. **God files and long functions.**
    - `pnpm_lock.rs` is 8,515 lines.
-   - Longest drivers: `vendor_yarn_berry` 396 lines, `vendor_npm` 314, `vendor_bun` 304, `vendor_pnpm_legacy` 290, `vendor_pnpm` 251, `revert_pnpm_opts` 234, `rewrite_yarn_berry` 272, `plan_hosted` 236, `recover_lock_entry` 221, `bun_lockb::meta_hash` 187.
+   - Longest drivers: `vendor_yarn_berry` 402 lines, `vendor_bun` 332, `vendor_npm` 325, `vendor_pnpm_dialect` 259 (both dialects; as of `9c43dfc`), `revert_pnpm_opts` 234, `rewrite_yarn_berry` 272, `plan_hosted` 236, `recover_lock_entry` 221, `bun_lockb::meta_hash` 187.
 4. **Two lookup paths in pnpm v9.** A linear scan and a memoized index (`LockLines`/`LockIndex`, `INDEX_AFTER_PROBES = 2`) coexist. That doubles the functions: `lock_has_target_package` vs `…_in`, `check_rewritable_refs` vs `…_with`.
 5. **Stale docs.** `berry_zip` compiles only under `cfg(any(test, feature = "test-fixtures"))` (`vendor/mod.rs:51`), so cache-zip surgery does not ship; production gets the checksum from the patch service. Yet `yarn_berry_lock.rs:15` and `npm_flavor.rs:323-325` still say berry's checksum is "rebuilt by berry_zip".
 

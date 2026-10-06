@@ -1,5 +1,5 @@
 ### Ecosystems and formats (`audit-ecosystems`)
-_Last updated 2026-10-06T00:53Z · main @ 9c43dfc_
+_Last updated 2026-10-06T07:30Z · main @ 9c43dfc_
 
 | ID | P | Problem | Source | Issues | Status |
 |---|:-:|---|---|---|---|
@@ -24,7 +24,7 @@ _Last updated 2026-10-06T00:53Z · main @ 9c43dfc_
 | E19 | 3 | Gem has three section models and three DEPENDENCIES-name parsers (vendored sees only the first `GEM` section, so #779). Go: `go_crawler::parse_go_mod_module` has no production caller; `vex/product.rs` has its own `module` reader that misreads the block form; `go_mod_edit.rs` lives in `vendor/`. | 5.4 | #780, #781 | filed #780; gem models (#780) open, go.mod `module` reader (#781) fixed (#870) |
 | E20 | 3 | Pure codecs (`bun_lockb.rs`, `bun_lock_text.rs`, `vlt_lock_text.rs`) and the neutral types (`Edit`, `Warning`, `LockfileEntry`) live outside `formats/`, which creates `formats`↔`vendor`/`redirect`/`vex` cycles. | 2.1; 4.5 #2; 4.7 J | #833, #834 | filed #833, #834; tracking #833, child 1 #834 (entry types) |
 | E21 | 2 | Tracking: `VendorBackend` trait + registry. The ecosystem list is enumerated at 16 production sites, and the `vend!` / `vend_installed!` macros stand in for the trait. | 2.1; 5.2; 5.8 | | to verify |
-| E22 | 2 | The JS vendor driver skeleton is copied eight times (`guard_coordinates` → … → a literal `VendorEntry`). Target: one generic driver + `NpmLockBackend`. | 4.4; 4.7 C | | to verify |
+| E22 | 2 | The JS vendor driver skeleton is copied seven times (`guard_coordinates` → … → a literal `VendorEntry`; pnpm legacy shares v9's since #583). Target: one generic driver + `NpmLockBackend`. | 4.4; 4.7 C | #920, #922 | filed #920, #922; tracking #920, child 1 #922 (entry constructor) |
 | E23 | 2 | The `pypi_{poetry,pdm,pipenv}.rs` backends repeat one skeleton: `load_*_project`, `classify_dependency`, `check_target_guards`, `wire_*`, `revert_*`. | 5.4 | | to verify |
 | E24 | 2 | There are nine revert mechanisms (~3.5K lines). Target: one splice-record revert engine, with legacy ledger kinds adapted at load. | 2.1; 5.3; 5.8 | | to verify |
 | E25 | 3 | Per-backend copies: `cleanup_failed_stage`, `<eco>_service_copy` (cargo, composer, gem, golang), and the `service_preflight_names_exactly_*` test copied seven times. | 5.4; 5.8 | #906 | filed #906; service-copy pipeline + cleanup (preflight test copies now share `plan_matches_grants`, out of scope) |
@@ -66,7 +66,8 @@ _Last updated 2026-10-06T00:53Z · main @ 9c43dfc_
 | E61 | 2 | The vendored-reference scan (`scan_vendor_references`, behind `repair`, the `vendor` stranded-ref gate and the orphan sweeps) never sees NuGet or Maven wiring: `nuget.config`/`pom.xml` lack the `VENDORED` role, and both reference the bare uuid dir, which `parse_vendor_path` rejects. With a missing ledger entry, the sweep deletes a still-wired feed or repository. | new finding | #832 | filed #832 |
 | E62 | 2 | npm alias discovery is written twice: core `NpmCrawler::alias_copies` (#738; apply, rollback, VEX installed lookup) and `vex_consumed`'s own walk (hosted VEX). They drifted on case: on Linux a case-only alias dir (`node_modules/Left-Pad` holding `left-pad`) is a copy for VEX but invisible to apply (executed twice). Symptoms #851, #852. | new finding; 6.5 | #856 | filed #856; child 1 of #855 |
 | E63 | 2 | Hosted Maven splices the API `maven_suffixed_version` into `pom.xml` unchecked (any string, even markup), while hosted Gradle refuses the same grant unless it is `<base>-socket.<uuid[..8]>` (`redirect_gradle_override_invalid`); the suffix grammar has four builders and no shared validator, and the Maven/Gradle coordinate derivation is written twice (executed twice). | new finding | #882 | filed #882 |
-| E64 | 2 | BOM handling has no shared helper: 4 named `strip_bom` copies and ~50 inline strips (one-vs-many drift). `formats::pnpm`'s three `lockfileVersion` readers and `workspace::top_level_key` never strip it, so one BOM pnpm lock is readable (entries), not a pnpm lock (VEX), unversioned (hosted trust gate) and unsupported (vendored router), executed twice. Symptoms #903, #904, #623. | new finding; 4.4 | #905 | filed #905 |
+| E64 | 2 | BOM handling has no shared helper: 4 named `strip_bom` copies and ~50 inline strips (one-vs-many drift). `formats::pnpm`'s three `lockfileVersion` readers and `workspace::top_level_key` never strip it, so one BOM pnpm lock is readable (entries), not a pnpm lock (VEX), unversioned (hosted trust gate) and unsupported (vendored router), executed twice. Symptoms #903, #904, #623. | new finding; 4.4 | #905 | in PR #909 |
+| E65 | 3 | Every vendored backend sink discards `force` and `sources` (`_force`/`_sources` at 10 sinks) since acquisition went service-only, yet `vendor --force` help and `CLI_CONTRACT.md` promise missing-file tolerance and a `vendor_content_mismatch_overwritten` warning that nothing emits; `--force` only bypasses the variant probe (executed twice). Bears on #615. | new finding; 5.2 | #923 | filed #923 |
 
 **Handed off:** none yet.
 

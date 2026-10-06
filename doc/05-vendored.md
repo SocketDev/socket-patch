@@ -2,7 +2,7 @@
 
 ## Part 5: Vendored mode and the non-JS backends
 
-_Last checked against main @ 9c43dfc on 2026-10-06 by audit-ecosystems (per-backend service-copy and cleanup copies re-checked at `9c43dfc`; 5.4 NuGet, Poetry/PDM and Gem re-checked at `4646693`; as of `045d7ec`: 5.4 Python, Cargo, Maven XML, Gem, Go and CRLF helpers; 5.6 scaffolding; the vendored-reference scan behind repair and the orphan sweeps). Owner: audit-ecosystems._
+_Last checked against main @ 9c43dfc on 2026-10-06 by audit-ecosystems (5.2 dead `force`/`sources` parameters re-checked at `9c43dfc`; per-backend service-copy and cleanup copies re-checked at `9c43dfc`; 5.4 NuGet, Poetry/PDM and Gem re-checked at `4646693`; as of `045d7ec`: 5.4 Python, Cargo, Maven XML, Gem, Go and CRLF helpers; 5.6 scaffolding; the vendored-reference scan behind repair and the orphan sweeps). Owner: audit-ecosystems._
 
 > Scope: `vendor/` framework (`mod`, `common`, `state`, `verify`, `registry_fetch`, `service_fetch`, `prestage`, `reuse`, `redownload`, `ledger_snapshots`, `parse_memo`, `path`, `source`, `toml_surgery`, `lock_inventory`); backends for cargo, gem, pypi (×10 files), golang, composer, nuget, maven and `jvm/`; related `utils/` parsers; and the CLI `vendor.rs` + `vendored_backend/`.
 
@@ -37,7 +37,7 @@ The only traits under `vendor/` are a private `EditLines` and a test-helper trai
 The signatures are close but not identical:
 - nuget and maven take `&Path` where the others take `impl Into<PackageSource>`;
 - pypi takes two extra cache arguments;
-- cargo, golang and composer ignore three of their parameters (`_sources`, `_force`, `let _pristine_src = …into()` at `cargo.rs:768-779`).
+- every backend now discards `sources` and `force` at its acquisition sink (10 `_sources`/`_force` parameters, since acquisition went service-only), so `vendor --force` only bypasses the CLI variant probe, although its help and `CLI_CONTRACT.md` still promise missing-file tolerance. {{E65}}
 
 The CLI papers over the differences with two macros, `vend!` and `vend_installed!` (`cli/commands/vendor.rs:153-192`).
 
@@ -247,6 +247,7 @@ Old `kind`s are translated into `SpliceRecord`s when the ledger loads, so legacy
 
 ### New findings since the review
 
+- {{E65}}: `vendor --force` documents a missing-file tolerance and a `vendor_content_mismatch_overwritten` warning that no backend implements; every acquisition sink takes `_force`/`_sources`, and `vendor` with and without `--force` behave the same (executed twice). Bears on #615; see 5.2.
 - {{E61}}: the vendored-reference scan behind `repair`, the `vendor` stranded-reference gate and the orphan sweeps never sees NuGet or Maven wiring. `nuget.config` and `pom.xml` lack the `VENDORED` registry role, and both backends reference the bare uuid directory, which `parse_vendor_path` rejects (it needs a leaf). So with a missing ledger entry, `vendor --revert` and the vendored gc delete a feed or repository that `nuget.config` / `pom.xml` still name (proven by execution). The `eco == "maven2"` arm of the stranded-reference gate is dead.
 - {{E59}}: vendored gem `edit_lock` searched only the first `GEM` section of `Gemfile.lock`, so a gem from a later source was refused; fixed by #805; see 5.4.
 - {{E58}}: production `pub fn`s with no production caller, orphaned by #277: `VendorEntry::committed_artifact_intact` and `go_sum_edit::remove_lines` (no reference at all), plus test-only helpers compiled into production (`cargo_tag::copy_manifest_tag`, `jvm::apply::read_project_file`). The hosted-vlt half is in Part 3.
