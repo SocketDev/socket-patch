@@ -57,7 +57,7 @@
    **A support-tier policy would let the core get simpler.**
 
 4. **The code is large for what it does, and much of the size is duplication and scaffolding.**
-   - ~118K lines of production code plus 35K comment lines.
+   - ~134K lines of production code on `9c43dfc` (~118K at the snapshot, plus 35K comment lines then).
    - ~450K lines of tests.
    - Nine functions over 500 lines; `run_scan` alone is 1,540 (on `045d7ec`).
    - A 17.5K-line `redirect/mod.rs`.
@@ -90,17 +90,17 @@
 
 | | Value |
 |---|---|
-| Production code (non-blank, non-comment) | **117.6K lines** + 34.8K comment lines + 9K blank |
-| Inline `#[cfg(test)]` code in `src/` | ~194K lines |
-| Integration tests (`crates/*/tests`) | ~255K lines in **212 separate test executables** (201 top-level files + 11 directory binaries; recounted at `045d7ec`, 2026-10-03) |
+| Production code (non-blank, non-comment) | **134.5K lines** in `socket-patch-core` + `socket-patch-cli` on `9c43dfc` (2026-10-06; the same script gives 117.8K at the snapshot, which the review reported as 117.6K + 34.8K comment + 9K blank). The growth is mostly the Gradle landing (#646) |
+| Inline `#[cfg(test)]` code in `src/` | ~228K lines on `9c43dfc` (~197K at the snapshot) |
+| Integration tests (`crates/*/tests`) | ~283K lines in **224 separate test executables** in core + CLI (top-level files plus directory binaries; recounted at `9c43dfc`, 2026-10-06; ~255K at the snapshot) |
 | Test : production ratio | ~2.8 : 1 overall; ~7 : 1 for the CLI crate |
-| Largest file | `patch/redirect/mod.rs`: 19,571 lines at `045d7ec` (2026-10-03; 17,517 at the snapshot, 6.2K production then) |
+| Largest file | `patch/redirect/mod.rs`: 21,255 lines at `9c43dfc` (2026-10-06; 17,517 at the snapshot, 6.2K production then) |
 | Functions > 200 / > 500 lines | 61 / 9 (`run_scan` 1,540 on `045d7ec`, `rollback::run` 984, `vendor_records_reusing` 962, `run_redirect_selected` 836, `remove::run` 797, `get::run` 635, memory `engine` 604, …) |
 | CLI surface | 9 visible + 2 hidden subcommands; 57 visible long flags; 27 globals on every command; 43 env bindings (84 `SOCKET_*` names in source); 156 documented `errorCode`s; ~570 code-like strings in source |
 | `--help` | 150–219 lines per subcommand; `list --help` lists 27 options, most of which do nothing for `list` |
 | CI per push | ~516 jobs; the CI workflow alone is 237 jobs and 348 runner-minutes; Windows `test` is the 28-minute critical path |
-| `CLI_CONTRACT.md` | 343 KB; the longest *line* is 10,530 characters (at `045d7ec`, 2026-10-03; 332 KB / 9,320 at the snapshot) |
-| Open issues | 302 on 2026-10-05 (255 labelled `bug`, 65 `arch-audit`; main still at `045d7ec`, so the code numbers above stand). At the snapshot: 88, filed mostly in the last 5 days by a bug hunt; JS 26, JVM 22, Python 18, Go 6, Cargo 5, NuGet 5, Ruby 3, Composer 3 |
+| `CLI_CONTRACT.md` | 379 KB; the longest *line* is 11,338 characters (at `9c43dfc`, 2026-10-06; 332 KB / 9,320 at the snapshot) |
+| Open issues | 273 on 2026-10-06 (217 labelled `bug`, 69 `arch-audit`). At the snapshot: 88, filed mostly in the last 5 days by a bug hunt; JS 26, JVM 22, Python 18, Go 6, Cargo 5, NuGet 5, Ruby 3, Composer 3 |
 | PR size | Recent squash merges of +53K, +85K and +94K lines |
 
 ---

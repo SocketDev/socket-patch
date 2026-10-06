@@ -1,5 +1,5 @@
 ### CLI layer, core infrastructure, agent mode, tests and docs (`audit-core`)
-_Last updated 2026-10-05T21:52Z · main @ 9c43dfc_
+_Last updated 2026-10-06T04:05Z · main @ 9c43dfc_
 
 | ID | P | Problem | Source | Issues | Status |
 |---|:-:|---|---|---|---|
@@ -31,7 +31,7 @@ _Last updated 2026-10-05T21:52Z · main @ 9c43dfc_
 | C26 | 3 | `apply.lock` spends ~554 lines deleting the lock file on exit, and taking the lock replays the vendored group-commit journal, coupling vendored crash recovery to every command. | 7.4 | #808 | decision #808; layering (replay + barrier out of the lock) is option-independent |
 | C27 | 3 | Agent-mode sidecars don't handle Maven files at all. Verify whether in-place Maven patches leave stale checksum files behind. | 7.4 | | rejected; Maven 3.9.11 ignores stale local `.jar.sha1` (built twice on 045d7ec); Gradle gap is #551 |
 | C28 | 3 | socket.yml builds a hand-made YAML tree on serde-saphyr's event parser to read 8 keys. Target: serde with `deny_unknown_fields`. | 7.5 | | rejected; the tree implements the contract's scoped YAML refusals |
-| C29 | 3 | The `client.rs` split (2.8K lines) into client, vendor_service and credentials; the debug-ordering machinery (`HeldBack`) has 45 call sites. | 7.2; 7.6 #8 | #871 | filed #871; vendor-service move (child 1); credentials move (~330 lines) not filed yet |
+| C29 | 3 | The `client.rs` split (2.8K lines) into client, vendor_service and credentials; the debug-ordering machinery (`HeldBack`) has 45 call sites. | 7.2; 7.6 #8 | #871, #913 | filed #871, #913; #871 vendor-service move, #913 credentials move (~330 lines) |
 | C30 | 2 | No shared test-support: `binary()` is defined in 103 files and `git_sha256` in 86, there are 15 `scrub_socket_env` (14 bodies), xorshift is implemented four times, and the VEX helpers are forked. | 6.4; 8.5 D | #824, #823 | filed #824, #823; #823 slice 1 merged as #850 (`common/hermetic.rs`, 8 of 15 `scrub_socket_env` copies deleted); slice 2 is the other 7 |
 | C31 | 3 | There are 207 test executables; the target is ~25. This needs C10 first. | 8.5 A | | to verify |
 | C32 | 3 | 328 exact-sentence assertions should become `--json`/`errorCode` checks plus snapshots. Triage the 402 covgap tests, 136 of which assert human text. | 2.5; 8.5 G/H | | to verify |
@@ -53,6 +53,7 @@ _Last updated 2026-10-05T21:52Z · main @ 9c43dfc_
 | C48 | 2 | Child processes have no shared deadline: the crawler probe runners (`gem env`, `python --version`, `npm root -g`, …) call `output()` unbounded, while 4 sites hand-roll `timeout` + `kill_on_drop` (10/10/10/30–60 s); a hung `gem` shim hangs a local `scan` forever. | new finding | #845 | in PR #886 |
 | C49 | 2 | Registry downloads use a 60 s whole-request deadline (`build_registry_client`, `maven_repo::fetch_registry_bytes`), not `ApiTimeouts`' idle bound: hosted upstream restore and vendored Maven abort a still-progressing artifact download at 60 s (128 MiB cap needs ≈2.2 MB/s); `registry_fetch::download` hand-rolls `read_capped`. | new finding | #872 | in PR #876 |
 | C50 | 2 | Artifact GC has two retention policies: `after_removal` (rollback, remove) keeps active patches' beforeHash blobs for offline rollback, `for_apply` (repair, `scan --prune`) drops them; offline rollback then fails and names `repair`, which never fetches beforeHash blobs. `cleanup_unused_blobs`/`_archives` are dead. | new finding | #893 | filed #893 |
+| C51 | 3 | Agent-mode jar verification (`jvm_jar::verify_member_bytes`; apply, rollback, vex) buffers each patched member before hashing, while vendored `zip_bytes_match_after_hashes` streams since #587: 1,067 MiB vs 26 MiB peak RSS on a 1 GiB member. | new finding | #914 | filed #914 |
 
 **Handed off** (to the CI janitor): report-only coverage and LTO `docker-base` off PRs; e2e from 148 to ~50 legs; a reusable compat workflow; no per-leg compiles; dead CI path filters (review 8.2, 8.5 B/C/E).
 
