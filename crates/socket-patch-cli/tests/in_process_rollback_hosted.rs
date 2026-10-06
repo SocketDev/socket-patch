@@ -1394,7 +1394,11 @@ const B_PATCHED_INDEX: &[u8] = b"module.exports = 'patched by B';\n";
 /// record A left in the manifest (its before-blob cached, as agent apply
 /// leaves it) and `installed` as the installed `index.js`. Returns the
 /// pristine lock bytes.
-async fn write_superseded_agent_fixture(root: &Path, server: &MockServer, installed: &[u8]) -> String {
+async fn write_superseded_agent_fixture(
+    root: &Path,
+    server: &MockServer,
+    installed: &[u8],
+) -> String {
     let pristine = write_npm_project(root);
     let pkg = root.join("node_modules").join(NAME);
     std::fs::write(pkg.join("index.js"), A_PATCHED_INDEX).unwrap();
@@ -1491,7 +1495,10 @@ async fn rollback_drops_an_agent_record_superseded_by_a_hosted_pin() {
     let pristine = write_superseded_agent_fixture(tmp.path(), &server, B_PATCHED_INDEX).await;
 
     let (code, envelope) = run_rollback_subprocess_online(tmp.path(), &server, &[]);
-    assert_eq!(code, 0, "rollback must not fail on the superseded record:\n{envelope:#}");
+    assert_eq!(
+        code, 0,
+        "rollback must not fail on the superseded record:\n{envelope:#}"
+    );
     assert!(
         warning_codes(&envelope).contains(&"rollback_record_superseded".to_string()),
         "the superseded record is named in warnings[]:\n{envelope:#}"
@@ -1502,7 +1509,8 @@ async fn rollback_drops_an_agent_record_superseded_by_a_hosted_pin() {
         manifest_patch_keys(tmp.path()).is_empty(),
         "the superseded record leaves the manifest"
     );
-    let installed = std::fs::read(tmp.path().join("node_modules").join(NAME).join("index.js")).unwrap();
+    let installed =
+        std::fs::read(tmp.path().join("node_modules").join(NAME).join("index.js")).unwrap();
     assert_eq!(
         installed, B_PATCHED_INDEX,
         "B's installed bytes are the reinstall's to replace, never overwritten with A's original"
@@ -1530,7 +1538,8 @@ async fn rollback_restores_a_superseded_agent_record_still_installed() {
     let restored = std::fs::read_to_string(tmp.path().join("package-lock.json")).unwrap();
     assert_eq!(restored, pristine);
     assert!(manifest_patch_keys(tmp.path()).is_empty());
-    let installed = std::fs::read(tmp.path().join("node_modules").join(NAME).join("index.js")).unwrap();
+    let installed =
+        std::fs::read(tmp.path().join("node_modules").join(NAME).join("index.js")).unwrap();
     assert_eq!(installed, ORIGINAL_INDEX);
 }
 
@@ -1544,7 +1553,10 @@ async fn remove_unhosts_a_package_whose_agent_record_is_superseded() {
     let pristine = write_superseded_agent_fixture(tmp.path(), &server, B_PATCHED_INDEX).await;
 
     let (code, envelope) = run_remove_subprocess_online(tmp.path(), &server, PURL);
-    assert_eq!(code, 0, "remove must not refuse the superseded record:\n{envelope:#}");
+    assert_eq!(
+        code, 0,
+        "remove must not refuse the superseded record:\n{envelope:#}"
+    );
     let restored = std::fs::read_to_string(tmp.path().join("package-lock.json")).unwrap();
     assert_eq!(
         restored, pristine,

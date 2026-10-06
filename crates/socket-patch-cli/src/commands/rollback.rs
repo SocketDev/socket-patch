@@ -14,8 +14,10 @@ use socket_patch_core::patch::rollback::{
     VerifyRollbackResult, VerifyRollbackStatus,
 };
 use socket_patch_core::telemetry::{track_patch_rollback_failed, track_patch_rolled_back};
+use socket_patch_core::utils::composer_version::composer_purls_equivalent;
 use socket_patch_core::utils::purl::{patch_matches, strip_purl_qualifiers};
 use socket_patch_core::vendor::{purl_keys_cover, RevertOpts, VendorState};
+use socket_patch_core::vex::discover::canonical_base_purl;
 use std::collections::{HashMap, HashSet};
 use std::path::{Path, PathBuf};
 use std::time::Duration;
@@ -441,8 +443,13 @@ pub(crate) struct RollbackOutcome {
     /// the revert data the retry needs.
     pub(crate) aborted: bool,
     /// Run warnings `(code, detail)` for copies left alone without failing
-    /// the run (today: `gradle_m2_copy_not_restored`).
+    /// the run (`gradle_m2_copy_not_restored`, `rollback_record_superseded`).
     pub(crate) warnings: Vec<(String, String)>,
+    /// In-scope manifest entries superseded by a live hosted pin whose
+    /// installed copies hold neither side of the recorded patch (#933):
+    /// left to the hosted leg's lock restore instead of failing, and
+    /// removable from the manifest like a rolled-back entry. Sorted.
+    pub(crate) superseded: Vec<String>,
 }
 
 /// How `rollback_patches_inner` selects manifest entries.
@@ -1449,6 +1456,7 @@ pub async fn run(args: RollbackArgs) -> i32 {
         &manifest,
         &vendored_keys,
         selection,
+        &superseded_by_hosted(&manifest, &hosted_pins),
         Some(&telemetry_client),
     )
     .await
@@ -1461,6 +1469,7 @@ pub async fn run(args: RollbackArgs) -> i32 {
             narrowed_out,
             aborted,
             warnings: agent_warnings,
+            superseded,
         }) => {
             // Copies left alone without failing the run (an unconsumed
             // `~/.m2` copy: `gradle_m2_copy_not_restored`).
@@ -1562,6 +1571,7 @@ pub async fn run(args: RollbackArgs) -> i32 {
                     }
                     succeeded_purls.contains(*purl)
                         || not_installed.contains(purl)
+                        || superseded.contains(purl)
                         || (narrowed_out.contains(purl)
                             && !failed_bases.contains(strip_purl_qualifiers(purl)))
                 })
@@ -2015,6 +2025,10 @@ pub(crate) async fn rollback_patches_inner(
     manifest: &PatchManifest,
     vendored_keys: &HashSet<String>,
     selection: InnerSelection<'_>,
+    // Manifest purl -> the hosted uuid a live lockfile pin superseded its
+    // record with ([`superseded_by_hosted`]); empty when no hosted pin
+    // replaces a recorded patch.
+    superseded: &HashMap<String, String>,
     // The client the caller already built. Constructing one per phase
     // printed the core client's "No SOCKET_API_TOKEN set" notice once per
     // construction — twice in a single rollback. `None` builds one on
@@ -2064,6 +2078,7 @@ pub(crate) async fn rollback_patches_inner(
             narrowed_out: Vec::new(),
             aborted: false,
             warnings: Vec::new(),
+            superseded: Vec::new(),
         });
     }
 
@@ -2091,6 +2106,7 @@ pub(crate) async fn rollback_patches_inner(
             narrowed_out: Vec::new(),
             aborted: false,
             warnings: Vec::new(),
+            superseded: Vec::new(),
         });
     }
 
@@ -2490,6 +2506,7 @@ pub(crate) async fn rollback_patches_inner(
                 narrowed_out: Vec::new(),
                 aborted: true,
                 warnings: Vec::new(),
+                superseded: Vec::new(),
             });
         }
 
@@ -2570,6 +2587,7 @@ pub(crate) async fn rollback_patches_inner(
                 narrowed_out: Vec::new(),
                 aborted: true,
                 warnings: Vec::new(),
+                superseded: Vec::new(),
             });
         }
     }
@@ -2590,6 +2608,7 @@ pub(crate) async fn rollback_patches_inner(
             narrowed_out: narrowed_out.clone(),
             aborted: false,
             warnings: Vec::new(),
+            superseded: Vec::new(),
         });
     }
 
@@ -2597,6 +2616,7 @@ pub(crate) async fn rollback_patches_inner(
     let mut results: Vec<RollbackResult> = Vec::new();
     let mut has_errors = false;
     let mut warnings: Vec<(String, String)> = Vec::new();
+    let mut superseded_left: Vec<String> = Vec::new();
 
     for target in &rollback_targets {
         let (purl, pkg_path) = (&target.purl, &target.dir);
@@ -2636,6 +2656,11 @@ pub(crate) async fn rollback_patches_inner(
 
         if let Some(warning) = unconsumed_m2_skip(target, &result) {
             warnings.push(warning);
+            continue;
+        }
+        if let Some(warning) = superseded_record_skip(target, &result, superseded) {
+            warnings.push(warning);
+            superseded_left.push(purl.clone());
             continue;
         }
         if !result.success {
@@ -2685,6 +2710,8 @@ pub(crate) async fn rollback_patches_inner(
         results.push(result);
     }
 
+    superseded_left.sort();
+    superseded_left.dedup();
     Ok(RollbackOutcome {
         success: !has_errors,
         results,
@@ -2693,6 +2720,7 @@ pub(crate) async fn rollback_patches_inner(
         narrowed_out,
         aborted: false,
         warnings,
+        superseded: superseded_left,
     })
 }
 
@@ -2766,6 +2794,76 @@ fn unconsumed_m2_skip(target: &CopyTarget, result: &RollbackResult) -> Option<(S
                 target.purl,
                 target.dir.display(),
                 result.error.as_deref().unwrap_or("it cannot be restored")
+            ),
+        )
+    })
+}
+
+/// Manifest records a live hosted pin has superseded (#933): purl -> the
+/// hosted uuid the lockfiles wire for the same package release, when no
+/// hosted pin for that release carries the record's own uuid. An agent →
+/// hosted migration whose patch was replaced meanwhile leaves exactly this:
+/// record A in the manifest, the lock pinning B. `vex` reports the same
+/// state as `vex_record_superseded`.
+pub(crate) fn superseded_by_hosted(
+    manifest: &PatchManifest,
+    pins: &[HostedPin],
+) -> HashMap<String, String> {
+    manifest
+        .patches
+        .iter()
+        .filter_map(|(purl, record)| {
+            let pkg = canonical_base_purl(purl);
+            let same: Vec<&HostedPin> = pins
+                .iter()
+                .filter(|pin| pin.purl == pkg || composer_purls_equivalent(&pin.purl, &pkg))
+                .collect();
+            if same.iter().any(|pin| pin.uuid == record.uuid) {
+                return None;
+            }
+            same.first().map(|pin| (purl.clone(), pin.uuid.clone()))
+        })
+        .collect()
+}
+
+/// The run warning that replaces a failed in-place restore of a manifest
+/// record a live hosted pin superseded ([`superseded_by_hosted`]), when it
+/// failed before writing anything because the installed copy holds bytes
+/// that are neither side of the record (the superseding patch's, after a
+/// reinstall) or lacks a file. The hosted leg's lock restore and the
+/// reinstall it asks for unwind that copy; restoring the record's original
+/// bytes over the superseding patch's would only mix the two. `None` for
+/// any other result — a copy still holding the record's patched bytes is
+/// restored as usual, and a file that cannot be read fails as usual.
+fn superseded_record_skip(
+    target: &CopyTarget,
+    result: &RollbackResult,
+    superseded: &HashMap<String, String>,
+) -> Option<(String, String)> {
+    let wired = superseded.get(&target.purl)?;
+    if result.success || !result.files_rolled_back.is_empty() {
+        return None;
+    }
+    if result
+        .files_verified
+        .iter()
+        .any(|v| v.status == VerifyRollbackStatus::NotFound && !v.is_absent())
+    {
+        return None;
+    }
+    let replaced = result
+        .files_verified
+        .iter()
+        .any(|v| v.status == VerifyRollbackStatus::HashMismatch || v.is_absent());
+    replaced.then(|| {
+        (
+            "rollback_record_superseded".to_string(),
+            format!(
+                "{}: the recorded patch is superseded by the lockfile-wired hosted patch {wired}; \
+                 left the installed copy at {} to the lockfile restore (the next \
+                 package-manager install puts the original files back)",
+                target.purl,
+                target.dir.display()
             ),
         )
     })
@@ -3083,6 +3181,7 @@ mod tests {
             &manifest,
             &vendored_keys,
             InnerSelection::Identifier(identifier),
+            &HashMap::new(),
             None,
         )
         .await?;
