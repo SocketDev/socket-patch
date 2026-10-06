@@ -984,8 +984,7 @@ async fn a_vlt_project_is_withheld_as_offline() {
         .and_then(|w| w["detail"].as_str())
         .expect("the preflight warning is reported");
     assert!(
-        detail.contains("/patch/npm/<redacted>/")
-            && detail.contains(": offline; nothing was written"),
+        detail.contains("/patch/npm/<redacted>/") && detail.contains(": offline; nothing was written"),
         "the offline refusal quotes the redacted URL"
     );
     assert!(output.changed_files.is_empty());
