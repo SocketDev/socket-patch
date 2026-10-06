@@ -1,6 +1,6 @@
 [agent] Progress ledger for the scheduled npm bug-hunt routine (label pm:npm).
 
-Last updated: 2026-10-06T00Z (run 22 with a ledger), main `9c43dfc` (3 non-npm commits past `c644ab0`), latest release v4.0.0 (previous v3.3.0, both from npm `@socketsecurity/socket-patch`). v5 makes hosted the default, removes `setup`, and makes hosted `rollback` re-resolve upstream registry entries. Cells marked (v4) were last verified on `f6b7fb9`. Re-triaged this run: #464 and #433 still reproduce.
+Last updated: 2026-10-06T06Z (run 23 with a ledger), main `9c43dfc` (unchanged since 00Z), latest release v4.0.0 (previous v3.3.0, both from npm `@socketsecurity/socket-patch`). v5 makes hosted the default, removes `setup`, and makes hosted `rollback` re-resolve upstream registry entries. Cells marked (v4) were last verified on `f6b7fb9`. Re-triaged at 00Z: #464 and #433 still reproduce.
 
 ## Coverage matrix
 
@@ -58,12 +58,24 @@ A hosted `scan` / `get <uuid>` run from an npm workspace member exits 0 with `re
 - `package-lock.json` + `yarn.lock` (vendored wires `yarn.lock`): `vendor --check` falsely says no lock references the artifact, and its remedies are no-ops. **fail #900** on Linux npm 10 + yarn 1.22.22.
 - #879 also covers npm 12 `npm install` on an existing v2 lock (keeps v2, drops mirror `resolved`) and an npm 8 v2 shrinkwrap (commented 2026-10-06).
 
+## Run 23 passes (Linux, 2026-10-06T06Z, main `9c43dfc`)
+
+- Hosted pins survive `npm dedupe`, `install --package-lock-only`, `install <new dep>` and `prune` on npm 8.19.4 / 10.9.4 / 12.2.0 (plain and scoped alias). Vendored passes on npm 10 / 12. On npm 8 (v2), everything except `dedupe` hits #879.
+- Plain in-place `npm install` after a hosted / vendored scan replaces the tree with patched bytes (npm 8 / 10 / 12).
+- Hosted alias `rollback` (v2 mirror `lp` node, scoped alias) is byte-exact on npm 6 / 8 / 10 / 12.
+- A hosted v1 lock (npm 6) installs patched bytes under npm 8 / 10 / 12 via both `ci` and `install`.
+- `bin` linking (semver@7.6.0, plain + alias), hosted and vendored, npm 8 / 10 / 12.
+- Workspace member with a non-hoisted alias (`packages/a/node_modules/lp`), hosted and vendored, npm 8 / 10 / 12: cycle, `vendor --check` and `rollback` pass.
+- SIGKILL-interrupted hosted / vendored scans (0.02–0.3 s) recover on re-scan, and `rollback` is byte-exact. Kills inside the narrow write window weren't tested (blocked by the session permission classifier).
+
 ## Backlog
 
+- **New 2026-10-06T06Z:** patch superseding (same `name@version`, newer UUID with different bytes) across hosted / vendored / agent re-scans, which has never been covered. It needs a mock with a switchable second-generation patch. Also interrupted runs inside the write window.
+- (Hosted alias `rollback` of the v2 mirror `lp` node: done 2026-10-06T06Z, pass.)
 - **New 2026-10-06:** #899 follow-ups (dual lock without a twin, workspace shrinkwrap); #898 on other group-commit refusals (`vendor_commit_failed`, a symlinked `.npmrc`); Bun handover #2 (a `bun.lock` + stale `package-lock.json` with no entry for the package: `contest_across_locks` ignores it), not filed because of the cap and Bun being primary.
 - (#879 npm 12 / shrinkwrap v2 follow-ups done 2026-10-06T00Z: both affected, commented.)
 
-- **#879 follow-ups:** workspaces; hosted alias `rollback` of the mirror `lp` node (#813).
+- **#879 follow-ups:** workspaces.
 - (#852 and #812 re-checked on `c644ab0` 2026-10-05T18Z: both still reproduce.)
 
 - **#852 follow-ups:** agent `rollback` over the alias store copy; a scoped alias; a transitive alias in `.store`.
