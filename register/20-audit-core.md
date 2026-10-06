@@ -1,5 +1,5 @@
 ### CLI layer, core infrastructure, agent mode, tests and docs (`audit-core`)
-_Last updated 2026-10-06T03:52Z · main @ 9c43dfc_
+_Last updated 2026-10-06T09:48Z · main @ 9c43dfc_
 
 | ID | P | Problem | Source | Issues | Status |
 |---|:-:|---|---|---|---|
@@ -15,7 +15,7 @@ _Last updated 2026-10-06T03:52Z · main @ 9c43dfc_
 | C10 | 2 | Tracking: `RunCtx { config, client, telemetry, lock }`, built once in `main`. It would delete `apply_env_toggles` (flags written back into process env, which has a documented token-leak history) and unblock removing 553 `#[serial]`. | 2.5; R3 | #793, #794 | filed #793, #794; tracking #793, child 1 #794; `#[serial]` now 993 in tests + 185 in src |
 | C11 | 2 | Tracking: split `run_scan` (1,540 lines on `045d7ec`; JSON and human arms each dispatch all three modes) into discover → select → `ModeBackend::consume` → render. | 2.2; R5 | #843, #844 | filed #843, #844; tracking #843, child 1 #844 |
 | C12 | 2 | Tracking: move engine code out of the CLI and into core behind one orchestrator over `ProjectView`. That covers `vendor_records_reusing` (962 lines), `run_redirect_selected` (836) and `ecosystem_dispatch.rs` (816). Coordinate with E32. | 2.1; R11 | #894, #895 | filed #894, #895; tracking #894, child 1 #895 (`ecosystem_dispatch` → `crawlers::locate`, 950 lines); sizes now 1,044 / 932 / 950 |
-| C13 | 2 | Error codes are untyped. Target: a typed registry (`enum Reason × Ecosystem`) that generates the contract's code tables, plus a freshness test. Today ~65 codes are undocumented and 1 is phantom. | 2.8; 3.7 #8; 8.5 F | | to verify |
+| C13 | 2 | Error codes are untyped. Target: a typed registry (`enum Reason × Ecosystem`) that generates the contract's code tables, plus a freshness test. Today ~65 codes are undocumented and 1 is phantom. | 2.8; 3.7 #8; 8.5 F | #930, #931 | filed #930, #931; tracking #930, child 1 #931; ~43 undocumented codes on 9c43dfc |
 | C14 | 2 | Decide: one JSON envelope. `scan`, `get` and `rollback` still emit a bare-string `error`, while the other commands emit `{code, message}`. | 2.8; R4 | #704 | decision #704 |
 | C15 | 2 | There are three HTTP retry systems, and blob and diff fetches have none. A 206-line HTTP-date parser, two near-identical downloaders, and per-fetch or per-event clients round it out. Target: one retry + timeout primitive. | 7.2; R12 | #676, #677 | filed #676; #677 in PR #889 |
 | C16 | 2 | Batch limits are split across crates. The CLI owns 500 / 100 / 256 KiB, and `search_patches_batch` documents a maximum of 500 without enforcing it. The in-memory engine keeps a third copy (default 100, no body cap). | 7.2 | #675 | filed #675 |
@@ -54,6 +54,7 @@ _Last updated 2026-10-06T03:52Z · main @ 9c43dfc_
 | C49 | 2 | Registry downloads use a 60 s whole-request deadline (`build_registry_client`, `maven_repo::fetch_registry_bytes`), not `ApiTimeouts`' idle bound: hosted upstream restore and vendored Maven abort a still-progressing artifact download at 60 s (128 MiB cap needs ≈2.2 MB/s); `registry_fetch::download` hand-rolls `read_capped`. | new finding | #872 | in PR #876 |
 | C50 | 2 | Artifact GC has two retention policies: `after_removal` (rollback, remove) keeps active patches' beforeHash blobs for offline rollback, `for_apply` (repair, `scan --prune`) drops them; offline rollback then fails and names `repair`, which never fetches beforeHash blobs. `cleanup_unused_blobs`/`_archives` are dead. | new finding | #893 | filed #893 |
 | C51 | 3 | Agent-mode jar verification (`jvm_jar::verify_member_bytes`; apply, rollback, vex) buffers each patched member before hashing, while vendored `zip_bytes_match_after_hashes` streams since #587: 1,067 MiB vs 26 MiB peak RSS on a 1 GiB member. | new finding | #914 | filed #914 |
+| C52 | 3 | One unparseable `.socket/manifest.json`, five `--json` codes: `manifest_invalid` (list, remove; two hand-written splits), `manifest_unreadable` (`apply --check`, `vendor --check`, vex), `apply_failed`, `repair_failed`, undocumented `invalid_manifest` (vendor), bare string (rollback). | new finding | #931 | filed #931 |
 
 **Handed off** (to the CI janitor): report-only coverage and LTO `docker-base` off PRs; e2e from 148 to ~50 legs; a reusable compat workflow; no per-leg compiles; dead CI path filters (review 8.2, 8.5 B/C/E).
 

@@ -103,7 +103,7 @@ For `2463257` on `main`:
 - **Misordered:** "Vendored JVM support (v5)" sits after "How the contract is enforced".
 - **Drift from the code:**
   - One documented code no longer exists in `src`: `vendor_lock_checksums_unsupported`.
-  - About 65 `redirect_*` codes that `src` emits are undocumented, e.g. `redirect_cargo_missing_cksum`.
+  - Undocumented codes: on `9c43dfc`, 43 code-shaped literals in emitting positions appear nowhere in the contract, among them `rollback_not_installed`, `vendor_service_unsupported_ecosystem`, `hosted_restore_failed`, `invalid_manifest` and the `redirect_composer_*`/`redirect_pnpm_*`/`redirect_requirements_*` families. {{C13}}
   - Only the vlt codes are checked mechanically.
 
 **User docs are lean, with rough spots.**

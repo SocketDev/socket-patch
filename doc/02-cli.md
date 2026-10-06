@@ -2,7 +2,7 @@
 
 ## Part 2: CLI command layer and user experience
 
-_Last checked against main @ 9c43dfc on 2026-10-05 by audit-core. Owner: audit-core._ Re-checked on `9c43dfc`: the god-function sizes for `vendor_records_reusing`, `run_redirect_selected` and `rollback::run`, the get ↔ scan cycle, `ecosystem_dispatch`'s size and the takeover bypass; the rest is as of `045d7ec` or earlier.
+_Last checked against main @ 9c43dfc on 2026-10-06 by audit-core. Owner: audit-core._ Re-checked on `9c43dfc`: the manifest-load error codes of every command (2.8), the god-function sizes for `vendor_records_reusing`, `run_redirect_selected` and `rollback::run`, the get ↔ scan cycle, `ecosystem_dispatch`'s size and the takeover bypass; the rest is as of `045d7ec` or earlier.
 
 > Scope: `crates/socket-patch-cli/src/` — `args.rs`, `lib.rs`/`main.rs`, `ecosystem_dispatch.rs`, `json_envelope.rs`, `ui/*`, `update_notifier.rs`, and every `commands/*` module.
 
@@ -113,6 +113,7 @@ $ socket-patch get nope --offline --json             → {"status":"error","erro
 
 - `repair`, `remove` and `vex` use the envelope, with an `error` object that carries a stable `code`.
 - `scan`, `get` and `rollback` have no fixed `error` type. `rollback` always emits a bare string, but `scan` and `get` each emit a bare string on some paths and a `{code, message}` object on others (scan's embedded-VEX failure, get's vendored failure); `get`'s lock failure adds a sibling `errorCode`. A script must type-check `.error` before reading it. {{C14}}
+- Codes are free strings, so one condition gets a different code per command: an unparseable `.socket/manifest.json` is `manifest_invalid` (list, remove), `manifest_unreadable` (`apply --check`, `vendor --check`, vex), `apply_failed`, `repair_failed`, the undocumented `invalid_manifest` (vendor) or a bare string (rollback) on `9c43dfc`. {{C52}} The typed-registry plan is {{C13}}.
 - Status is `partialFailure` in the envelope but `partial_failure` in the legacy shapes.
 - `get --mode vendored` nests an `Envelope` inside a legacy object.
 - The contract's "Migration status (v3.0)" section still says scan, get and rollback "will migrate in a follow-up PR". That was two majors ago.
@@ -178,6 +179,8 @@ That is **7 verbs instead of 9 visible + 2 hidden + 2 aliases + 3 hidden flag sp
 - {{C44}} The ecosystem-name parser is written three times. `--ecosystems`/`SOCKET_ECOSYSTEMS` require an exact, case-sensitive `cli_name()` with no trim, socket.yml `patches.ecosystems` trims and lowercases, and `vendor::ecosystem_in_scope` has its own exact lookup. On `045d7ec`, `-e NPM`, `-e "npm, pypi"` and `SOCKET_ECOSYSTEMS=PyPI` exit 2, while `ecosystems: [NPM, pypi]` parses. `--min-severity` and `minSeverity` already share one parser.
 
 - {{C45}} `--download-mode` typos are runtime failures in two commands only (see 2.7): `apply`/`repair` exit 1 with a generic command code, and the rest accept them. This narrows the review's R8 note to a non-breaking fix (a typed clap parser).
+
+- {{C52}} One corrupt manifest, five `--json` codes: only `list` and `remove` implement the contract's `manifest_invalid`/`manifest_unreadable` split (two hand-written copies); `apply` and `vendor` each disagree with their own `--check` path. Child 1 of the typed-code tracking issue ({{C13}}).
 
 (The `C38` pacing finding is in Part 7.)
 
