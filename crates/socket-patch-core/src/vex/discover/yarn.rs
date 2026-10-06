@@ -97,7 +97,7 @@ use crate::vendor::lock_inventory::yarn::{
 use crate::vendor::lock_inventory::LockIntegrity;
 use crate::vendor::yarn_berry_lock::{berry_field, resolution_selector_target, BerryLocator};
 use crate::vendor::yarn_classic_lock::{
-    classic_block_is_git, classic_field, pattern_real_name, split_pattern, split_resolved_sha1,
+    classic_block_source, classic_field, pattern_real_name, split_resolved_sha1, ClassicBlockSource,
 };
 
 const YARN_LOCK: &str = "yarn.lock";
@@ -138,30 +138,31 @@ fn stray_top_level_line(text: &str) -> Option<&str> {
 // ── classic ──────────────────────────────────────────────────────────────
 
 fn extract_classic(ctx: &DiscoverCtx<'_>, entries: Vec<YarnEntry>, out: &mut Discovery) {
-    // (purl, key) of every live git-fetched block: that copy installs the
-    // git bytes, so no wiring of the same package in this lock is attested.
-    let mut git_copies: Vec<(String, String)> = Vec::new();
+    // (purl, key, how it installs) of every live block the lock rewrite
+    // can't repoint — fetched with git, or a `file:` directory yarn copies
+    // (#921): that copy keeps its own bytes, so no wiring of the same
+    // package in this lock is attested.
+    let mut unpatched_copies: Vec<(String, String, &'static str)> = Vec::new();
     for entry in entries {
         if entry.live && !entry.patterns.is_empty() {
-            classic_block(ctx, &entry, &mut git_copies, out);
+            classic_block(ctx, &entry, &mut unpatched_copies, out);
         }
     }
-    if git_copies.is_empty() {
+    if unpatched_copies.is_empty() {
         return;
     }
     let refs = std::mem::take(&mut out.refs);
     for r in refs {
-        let git_key = (r.source_file == std::path::Path::new(YARN_LOCK))
-            .then(|| git_copies.iter().find(|(purl, _)| *purl == r.purl))
+        let copy = (r.source_file == std::path::Path::new(YARN_LOCK))
+            .then(|| unpatched_copies.iter().find(|(purl, ..)| *purl == r.purl))
             .flatten();
-        match git_key {
-            Some((_, key)) => out.diag(
+        match copy {
+            Some((_, key, how)) => out.diag(
                 DIAG_REF_UNATTRIBUTABLE,
                 YARN_LOCK,
                 format!(
                     "{YARN_LOCK}: {} is wired to a Socket patch but lock entry `{key}` \
-                     installs from git, which yarn fetches from the git source rather than \
-                     a tarball; that copy stays UNPATCHED and nothing is attested",
+                     {how}; that copy stays UNPATCHED and nothing is attested",
                     r.purl
                 ),
             ),
@@ -170,59 +171,81 @@ fn extract_classic(ctx: &DiscoverCtx<'_>, entries: Vec<YarnEntry>, out: &mut Dis
     }
 }
 
+/// The purl a block stands for when every key pattern names one package.
+fn classic_block_purl(entry: &YarnEntry) -> Option<String> {
+    let patterns = &entry.patterns;
+    match (
+        patterns.first().and_then(|p| pattern_real_name(p)),
+        classic_field(&entry.block.lines, "version"),
+    ) {
+        (Some(name), Some(version))
+            if patterns.iter().all(|p| pattern_real_name(p) == Some(name)) =>
+        {
+            npm_purl(name, version)
+        }
+        _ => None,
+    }
+}
+
 fn classic_block(
     ctx: &DiscoverCtx<'_>,
     entry: &YarnEntry,
-    git_copies: &mut Vec<(String, String)>,
+    unpatched_copies: &mut Vec<(String, String, &'static str)>,
     out: &mut Discovery,
 ) {
     let YarnEntry {
         block, patterns, ..
     } = entry;
     let resolved = classic_field(&block.lines, "resolved");
-    // yarn 1 fetches a git pattern with git, from `resolved` (#363): the
-    // copy is the git bytes, whatever `resolved` names.
-    if classic_block_is_git(patterns, resolved) {
-        let purl = match (
-            patterns.first().and_then(|p| pattern_real_name(p)),
-            classic_field(&block.lines, "version"),
-        ) {
-            (Some(name), Some(version))
-                if patterns.iter().all(|p| pattern_real_name(p) == Some(name)) =>
-            {
-                npm_purl(name, version)
+    match classic_block_source(patterns, resolved) {
+        // yarn 1 fetches a git pattern with git, from `resolved` (#363): the
+        // copy is the git bytes, whatever `resolved` names.
+        ClassicBlockSource::Git => {
+            // A Socket wiring here (an older release rewired it) is inert.
+            if resolved.is_some_and(|r| classify(ctx, r, YARN_LOCK, &block.key, out).is_some()) {
+                out.diag(
+                    DIAG_REF_UNATTRIBUTABLE,
+                    YARN_LOCK,
+                    format!(
+                        "{YARN_LOCK}: Socket-wired entry `{}` installs from git, which yarn \
+                         fetches from the git source rather than the wired tarball; it is not \
+                         attested",
+                        block.key
+                    ),
+                );
             }
-            _ => None,
-        };
-        // A Socket wiring here (an older release rewired it) is inert.
-        if resolved.is_some_and(|r| classify(ctx, r, YARN_LOCK, &block.key, out).is_some()) {
-            out.diag(
-                DIAG_REF_UNATTRIBUTABLE,
-                YARN_LOCK,
-                format!(
-                    "{YARN_LOCK}: Socket-wired entry `{}` installs from git, which yarn \
-                     fetches from the git source rather than the wired tarball; it is not \
-                     attested",
-                    block.key
-                ),
-            );
+            if let Some(purl) = classic_block_purl(entry) {
+                out.resolved_elsewhere(YARN_LOCK, Some(purl.clone()));
+                unpatched_copies.push((
+                    purl,
+                    block.key.clone(),
+                    "installs from git, which yarn fetches from the git source rather than \
+                     a tarball",
+                ));
+            }
+            return;
         }
-        if let Some(purl) = purl {
-            out.resolved_elsewhere(YARN_LOCK, Some(purl.clone()));
-            git_copies.push((purl, block.key.clone()));
+        // yarn 1 copies a `file:` directory into node_modules (#921): that
+        // copy is the directory's bytes, and no `resolved` there is fetched.
+        ClassicBlockSource::Directory => {
+            if let Some(purl) = classic_block_purl(entry) {
+                out.resolved_elsewhere(YARN_LOCK, Some(purl.clone()));
+                unpatched_copies.push((
+                    purl,
+                    block.key.clone(),
+                    "installs from a file: directory, which yarn copies into node_modules \
+                     rather than fetching a tarball",
+                ));
+            }
+            return;
         }
-        return;
+        // `link:` ranges install from the working tree; `resolved` is inert.
+        ClassicBlockSource::Link => return,
+        ClassicBlockSource::Tarball => {}
     }
     let Some(resolved) = resolved else {
         return;
     };
-    // `link:` ranges install from the working tree; `resolved` is inert.
-    if patterns
-        .iter()
-        .any(|p| split_pattern(p).is_some_and(|(_, range)| range.starts_with("link:")))
-    {
-        return;
-    }
     let names: std::collections::BTreeSet<Option<&str>> =
         patterns.iter().map(|p| pattern_real_name(p)).collect();
     let names: Vec<Option<&str>> = names.into_iter().collect();
@@ -1025,6 +1048,53 @@ mod tests {
                 out.diagnostics
                     .iter()
                     .any(|d| d.code == DIAG_REF_UNATTRIBUTABLE && d.detail.contains("git")),
+                "{case}: {:?}",
+                out.diagnostics
+            );
+        }
+    }
+
+    /// #921: yarn 1 COPIES a `file:` directory dependency into
+    /// node_modules, so a `file:` block of the wired name@version (no
+    /// `resolved`, alone or merged into the registry block's key) is an
+    /// unpatched copy: the registry wiring beside it is not attested, the
+    /// diagnostic names the block, and the copy counts as resolved
+    /// elsewhere. Control: the same wiring without that copy is a ref.
+    #[tokio::test]
+    async fn classic_file_directory_copies_are_never_attested() {
+        let lp = hosted_url("npm", "left-pad", "1.3.0", UUID_A, "left-pad-1.3.0.tgz");
+        let wired = classic_block("left-pad@^1.3.0", "1.3.0", &lp, Some(SRI));
+        let p = Project::new();
+        p.write("yarn.lock", classic(std::slice::from_ref(&wired)));
+        assert_eq!(run(&p).await.refs.len(), 1, "control: the wiring is a ref");
+
+        let file_copy = "\"left-pad@file:forks/left-pad\":\n  version \"1.3.0\"\n\n".to_string();
+        let merged_key =
+            "left-pad@^1.3.0, \"left-pad@file:forks/left-pad\":\n  version \"1.3.0\"\n\n"
+                .to_string();
+        for (case, blocks) in [
+            (
+                "registry wired beside a file: copy",
+                vec![wired.clone(), file_copy],
+            ),
+            (
+                "file: copy merged with another range, no resolved",
+                vec![
+                    classic_block("left-pad@~1.3.0", "1.3.0", &lp, Some(SRI)),
+                    merged_key,
+                ],
+            ),
+        ] {
+            let p = Project::new();
+            p.write("yarn.lock", classic(&blocks));
+            let out = run(&p).await;
+            assert!(out.refs.is_empty(), "{case}: {:#?}", out.refs);
+            assert!(
+                out.diagnostics
+                    .iter()
+                    .any(|d| d.code == DIAG_REF_UNATTRIBUTABLE
+                        && d.detail.contains("file: directory")
+                        && d.detail.contains("left-pad@file:forks/left-pad")),
                 "{case}: {:?}",
                 out.diagnostics
             );

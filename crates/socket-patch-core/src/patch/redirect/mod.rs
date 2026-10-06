@@ -3278,7 +3278,7 @@ fn rewrite_yarn_classic(
                 .expect("version regex from the escaped version is valid");
         let mut matched_any = false;
         let mut alias_skipped = false;
-        let mut git_skipped = false;
+        let mut copy_skipped = false;
         for (i, block) in blocks.iter_mut().enumerate() {
             // The block's key line names its consumers; resolve every
             // comma-joined pattern to the REAL package it stands for
@@ -3305,8 +3305,28 @@ fn rewrite_yarn_classic(
                 .lines()
                 .find_map(|l| l.strip_prefix("  resolved "))
                 .map(|v| v.trim().trim_matches('"'));
-            if crate::vendor::yarn_classic_lock::classic_block_is_git(&patterns, resolved) {
-                git_skipped = true;
+            use crate::vendor::yarn_classic_lock::{classic_block_source, ClassicBlockSource};
+            let source = classic_block_source(&patterns, resolved);
+            // yarn 1 COPIES a `file:` directory (or a block with no
+            // `resolved`) into node_modules (#921): there is no tarball to
+            // repoint, so that copy keeps the directory's unpatched bytes —
+            // named, and never assumed applied by the in-run VEX.
+            if source == ClassicBlockSource::Directory {
+                copy_skipped = true;
+                result.bundled_skipped_uuids.insert(dep.patch_uuid.clone());
+                result.warnings.push(RewriteWarning {
+                    code: "redirect_yarn_classic_directory_skipped".into(),
+                    detail: format!(
+                        "lock entry `{key}` installs {fname}@{} from a file: directory, which \
+                         yarn copies into node_modules rather than fetching a tarball; the \
+                         hosted redirect leaves it untouched, so this copy stays unpatched",
+                        dep.version
+                    ),
+                });
+                continue;
+            }
+            if source == ClassicBlockSource::Git {
+                copy_skipped = true;
                 result.bundled_skipped_uuids.insert(dep.patch_uuid.clone());
                 result.warnings.push(RewriteWarning {
                     code: "redirect_yarn_classic_git_skipped".into(),
@@ -3390,7 +3410,7 @@ fn rewrite_yarn_classic(
                 changed = true;
             }
         }
-        if !matched_any && !alias_skipped && !git_skipped {
+        if !matched_any && !alias_skipped && !copy_skipped {
             result.warnings.push(RewriteWarning {
                 code: "redirect_yarn_classic_entry_not_found".into(),
                 detail: format!("no yarn.lock entry resolving {fname}@{}", dep.version),
@@ -9750,6 +9770,68 @@ mod tests {
             r.files
         );
         assert_eq!(r.warnings[0].code, "redirect_yarn_classic_entry_not_found");
+    }
+
+    /// #921: yarn 1 COPIES a `file:` directory dependency into
+    /// node_modules, so its block (no `resolved`) has nothing to repoint.
+    /// Beside a registry block, the registry block is wired and the copy is
+    /// named and kept out of the in-run VEX; as the only copy (alone, or
+    /// merged into one key with a registry range), the scan says so with
+    /// the same code instead of reporting nothing.
+    #[test]
+    fn yarn_classic_file_directory_block_is_skipped() {
+        let ovr = npm_override(
+            "left-pad",
+            "1.3.0",
+            "http://p.test/lp.tgz",
+            "sha512-PATCHED==",
+        );
+        let registry_block = "left-pad@^1.3.0:\n  version \"1.3.0\"\n  \
+             resolved \"https://registry.yarnpkg.com/left-pad/-/left-pad-1.3.0.tgz#bbbb\"\n  \
+             integrity sha512-UPSTREAMupstream==\n";
+        let file_block = "\"left-pad@file:forks/left-pad\":\n  version \"1.3.0\"\n";
+        let skipped = |r: &RewriteResult| {
+            r.warnings
+                .iter()
+                .filter(|w| w.code == "redirect_yarn_classic_directory_skipped")
+                .count()
+        };
+
+        let mut files = BTreeMap::new();
+        files.insert(
+            "yarn.lock".to_string(),
+            format!("# yarn lockfile v1\n\n\n{registry_block}\n{file_block}"),
+        );
+        let mut r = RewriteResult::default();
+        rewrite_yarn_classic(&files, std::slice::from_ref(&ovr), &mut r);
+        assert_eq!(r.edits.len(), 1, "{:?}", r.edits);
+        let out = &r.files["yarn.lock"];
+        assert!(out.contains("resolved \"http://p.test/lp.tgz\""), "{out}");
+        assert!(
+            out.contains(file_block),
+            "file: block byte-identical:\n{out}"
+        );
+        assert_eq!(skipped(&r), 1, "{:?}", r.warnings);
+        assert!(r.warnings[0]
+            .detail
+            .contains("left-pad@file:forks/left-pad"));
+        assert!(r.bundled_skipped_uuids.contains(&ovr.patch_uuid));
+
+        for only in [
+            file_block.to_string(),
+            "left-pad@^1.3.0, \"left-pad@file:forks/left-pad\":\n  version \"1.3.0\"\n".to_string(),
+        ] {
+            files.insert(
+                "yarn.lock".to_string(),
+                format!("# yarn lockfile v1\n\n\n{only}"),
+            );
+            let mut r = RewriteResult::default();
+            rewrite_yarn_classic(&files, std::slice::from_ref(&ovr), &mut r);
+            assert!(r.files.is_empty() && r.edits.is_empty(), "{:?}", r.files);
+            let codes: Vec<&str> = r.warnings.iter().map(|w| w.code.as_str()).collect();
+            assert_eq!(codes, ["redirect_yarn_classic_directory_skipped"], "{only}");
+            assert!(r.bundled_skipped_uuids.contains(&ovr.patch_uuid));
+        }
     }
 
     /// #363: yarn 1 fetches a git-pattern block with its git fetcher from
