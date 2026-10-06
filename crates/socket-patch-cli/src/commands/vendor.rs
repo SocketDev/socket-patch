@@ -121,6 +121,105 @@ fn linked_vendor_dir_refusal(project_root: &Path, purl: &str, uuid: &str) -> Opt
         .map(|link| vendor::path::vendor_dir_symlink_detail(&link))
 }
 
+/// A wet hosted → vendored takeover held open until the backend's outcome
+/// is known: the group-commit savepoint taken before the upstream restore,
+/// and what the restore reported, recorded only once the restore stands.
+struct TakeoverUndo {
+    savepoint: Option<socket_patch_core::utils::group_commit::Savepoint>,
+    advisories: Vec<VendorWarning>,
+    vlt_targets: Vec<socket_patch_core::patch::redirect::vlt_heal::LedgerTarget>,
+}
+
+impl TakeoverUndo {
+    /// The restore stands: record its advisories and queue the vlt heal.
+    fn settle(
+        self,
+        env: &mut Envelope,
+        common: &GlobalArgs,
+        candidate: &str,
+        vlt_takeover_targets: &mut HashMap<
+            String,
+            Vec<socket_patch_core::patch::redirect::vlt_heal::LedgerTarget>,
+        >,
+    ) {
+        if !self.vlt_targets.is_empty() {
+            vlt_takeover_targets.insert(candidate.to_string(), self.vlt_targets);
+        }
+        for advisory in &self.advisories {
+            record_warning(env, candidate, advisory, common);
+        }
+    }
+}
+
+/// The dry-run twin of the wet takeover's rollback: the vendored backend's
+/// refusal over the project as `restore` would leave it, or `None` when it
+/// would vendor (or the restored project cannot be previewed). The
+/// restored text is staged in a throwaway group commit that is never
+/// committed, so nothing reaches the disk: a restore touching a file the
+/// overlay does not capture, or a binary lock (no staged text), is not
+/// previewed.
+#[allow(clippy::too_many_arguments)]
+async fn takeover_dry_refusal(
+    restore: &socket_patch_core::patch::redirect::upstream::RestoreOutcome,
+    purl: &str,
+    pkg_path: PackageSource<'_>,
+    project_root: &Path,
+    record: &PatchRecord,
+    sources: &PatchSources<'_>,
+    vendored_at: &str,
+    force: bool,
+    service: Option<&VendorServiceConfig>,
+    pipenv_version: &tokio::sync::OnceCell<Option<u32>>,
+    installed_sites: &vendor::pypi::InstalledSiteListings,
+) -> Option<(&'static str, String)> {
+    if restore.reverted_files.is_empty()
+        || !restore.reverted_files.iter().all(|f| {
+            socket_patch_core::utils::group_commit::captures(f)
+                && restore.staged_text.contains_key(f)
+        })
+    {
+        return None;
+    }
+    let probe = GroupCommit::begin(project_root);
+    for (rel, text) in &restore.staged_text {
+        let path = project_root.join(rel);
+        let staged = match text {
+            Some(text) => {
+                socket_patch_core::utils::fs::atomic_write_bytes_preserving_mode(
+                    &path,
+                    text.as_bytes(),
+                )
+                .await
+            }
+            None => socket_patch_core::utils::fs::remove_file(&path).await,
+        };
+        if staged.is_err() {
+            return None;
+        }
+    }
+    let outcome = Box::pin(dispatch_vendor_one(
+        purl,
+        pkg_path,
+        project_root,
+        record,
+        sources,
+        vendored_at,
+        true,
+        force,
+        service,
+        pipenv_version,
+        installed_sites,
+    ))
+    .await;
+    drop(probe);
+    match outcome {
+        Some(VendorOutcome::Refused { code, detail }) if !refusal_is_benign(code) => {
+            Some((code, detail))
+        }
+        _ => None,
+    }
+}
+
 /// Dispatch one purl to its ecosystem backend. `pkg_path` is the crawler's
 /// installed location (site-packages root for pypi, the package dir
 /// otherwise), or a fetched artifact the backend materialises only if it
@@ -2579,6 +2678,11 @@ pub(crate) async fn vendor_records_reusing(
             // vendor detach the PRISTINE registry entry to record. A purl
             // whose upstream entry cannot be restored is REFUSED; the cargo
             // backend's `hosted_redirect_live` guard backstops the rest.
+            // A wet takeover whose restore stayed in the group commit's
+            // overlay: the point to roll back to when the backend below
+            // does not vendor the purl, and the advisories that only hold
+            // once it does (see `TakeoverUndo`).
+            let mut takeover_undo: Option<TakeoverUndo> = None;
             if let Some(pin) = hosted_pin_of(candidate) {
                 let origins = crate::commands::rollback::patch_server_origins(common);
                 let restore_opts = socket_patch_core::patch::redirect::upstream::RestoreOptions {
@@ -2664,12 +2768,22 @@ pub(crate) async fn vendor_records_reusing(
                         )
                     })
                     .unwrap_or_default();
+                let savepoint = group.as_ref().map(GroupCommit::savepoint);
                 let restore = socket_patch_core::patch::redirect::upstream::restore_upstream(
                     &common.cwd,
                     std::slice::from_ref(pin),
                     &restore_opts,
                 )
                 .await;
+                // Undoable only when every file the restore wrote is still
+                // in the overlay (a `.socket/gradle/hosted-index.tsv` is
+                // written straight to disk).
+                let savepoint = savepoint.filter(|_| {
+                    restore
+                        .reverted_files
+                        .iter()
+                        .all(|f| socket_patch_core::utils::group_commit::captures(f))
+                });
                 let refusal = restore
                     .refused()
                     .map(|(_, why)| why.to_string())
@@ -2690,15 +2804,41 @@ pub(crate) async fn vendor_records_reusing(
                     );
                     continue;
                 }
-                for (code, detail) in &restore.warnings {
-                    record_warning(
-                        env,
-                        candidate,
-                        &VendorWarning::new(code, detail.clone()),
-                        common,
-                    );
-                }
+                let mut advisories: Vec<VendorWarning> = restore
+                    .warnings
+                    .iter()
+                    .map(|(code, detail)| VendorWarning::new(code, detail.clone()))
+                    .collect();
                 if common.dry_run {
+                    // The refusal the backend would raise over the restored
+                    // project, previewed here with the wet run's code (the
+                    // wet run rolls the restore back on it, below).
+                    if let Some((code, detail)) = takeover_dry_refusal(
+                        &restore,
+                        candidate,
+                        pkg_source,
+                        &common.cwd,
+                        record,
+                        sources,
+                        &vendored_at,
+                        force,
+                        service,
+                        &pipenv_version,
+                        &installed_sites,
+                    )
+                    .await
+                    {
+                        has_errors = true;
+                        env.record(
+                            PatchEvent::new(PatchAction::Failed, candidate.clone())
+                                .with_error(code, detail.clone()),
+                        );
+                        report_vendor_failure(common, candidate, &detail);
+                        continue;
+                    }
+                    for advisory in &advisories {
+                        record_warning(env, candidate, advisory, common);
+                    }
                     record_warning(
                         env,
                         candidate,
@@ -2726,23 +2866,25 @@ pub(crate) async fn vendor_records_reusing(
                         continue;
                     }
                 } else {
-                    if !targets.is_empty() {
-                        vlt_takeover_targets.insert(candidate.clone(), targets);
-                    }
-                    record_warning(
-                        env,
-                        candidate,
-                        &VendorWarning::new(
-                            "vendor_takeover_reverted_redirect",
-                            format!(
-                                "{} was hosted; restored its upstream registry entry ({}) \
-                                 before vendoring (mode takeover)",
-                                normalize_purl(candidate),
-                                restore.reverted_files.join(", ")
-                            ),
+                    advisories.push(VendorWarning::new(
+                        "vendor_takeover_reverted_redirect",
+                        format!(
+                            "{} was hosted; restored its upstream registry entry ({}) \
+                             before vendoring (mode takeover)",
+                            normalize_purl(candidate),
+                            restore.reverted_files.join(", ")
                         ),
-                        common,
-                    );
+                    ));
+                    let undo = TakeoverUndo {
+                        savepoint,
+                        advisories,
+                        vlt_targets: targets,
+                    };
+                    if undo.savepoint.is_some() {
+                        takeover_undo = Some(undo);
+                    } else {
+                        undo.settle(env, common, candidate, &mut vlt_takeover_targets);
+                    }
                 }
             }
 
@@ -2830,6 +2972,18 @@ pub(crate) async fn vendor_records_reusing(
             status.finish();
             let vendored =
                 matches!(&outcome, Some(VendorOutcome::Done { result, .. }) if result.success);
+            if let Some(mut undo) = takeover_undo.take() {
+                // A takeover the backend did not carry through keeps the
+                // hosted pin: its restore is rolled back in the overlay, so
+                // the purl is never left un-hosted AND unvendored (#853,
+                // #944). One the backend recorded keeps the restore.
+                let recorded =
+                    matches!(&outcome, Some(VendorOutcome::Done { entry, .. }) if entry.is_some());
+                match (vendored || recorded, undo.savepoint.take(), group.as_ref()) {
+                    (false, Some(savepoint), Some(group)) => group.rollback_to(savepoint),
+                    _ => undo.settle(env, common, candidate, &mut vlt_takeover_targets),
+                }
+            }
 
             match outcome {
                 None => {
