@@ -994,6 +994,10 @@ pub(crate) struct ApplyRunReport {
     /// `(errorCode, error)`. Set only when `code != 0` and `failures`
     /// alone would not explain it.
     pub run_error: Option<(String, String)>,
+    /// The package keys apply patched or found already patched, so a
+    /// failed run's caller can count exactly what applied. Filled only
+    /// when `code != 0`.
+    pub applied: Vec<String>,
 }
 
 impl ApplyRunReport {
@@ -1002,6 +1006,7 @@ impl ApplyRunReport {
             code,
             failures: Vec::new(),
             run_error: Some((error_code.to_string(), error.into())),
+            applied: Vec::new(),
         }
     }
 }
@@ -1431,10 +1436,17 @@ pub(crate) async fn run_locked(
             } else {
                 None
             };
+            // Vendor-owned results are skips, not applies.
+            let applied = results
+                .iter()
+                .filter(|r| r.success && r.package_path != VENDOR_OWNED_MARKER)
+                .map(|r| r.package_key.clone())
+                .collect();
             ApplyRunReport {
                 code: 1,
                 failures,
                 run_error,
+                applied,
             }
         }
         Err(e) => {

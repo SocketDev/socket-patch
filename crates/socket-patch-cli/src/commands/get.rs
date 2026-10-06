@@ -2358,79 +2358,92 @@ async fn run_nested_apply(
     report
 }
 
+/// Whether apply's package key `key` covers the patch record purl
+/// `record`: the same purl, or `key` is the unqualified base of a
+/// qualified record (apply keys a release-variant base by its base purl).
+/// A qualified key never covers a sibling variant.
+fn apply_key_covers(key: &str, record: &str) -> bool {
+    let (key, record) = (normalize_purl(key), normalize_purl(record));
+    key == record || (!key.contains(['?', '#']) && record.split(['?', '#']).next() == Some(&*key))
+}
+
 /// Fold a failed nested apply into a `get` / `scan --mode agent` JSON
 /// envelope, so `--json` says what the human run prints (#424). Each
 /// `patches[]` record the apply failed becomes the `failed` record shape
 /// (`purl`, `uuid`, `action: "failed"`, `errorCode`, `error`; no metadata,
-/// as on every `failed` record); a failed manifest patch this run did not
-/// select gets its own `failed` record (`uuid_of` looks up its uuid); a
-/// run-level reason rides the envelope's top-level `errorCode` / `error`.
-/// `failed` grows by every record marked or appended here. Returns how
-/// many of the run's own (selected) records failed, for `applied`.
+/// as on every `failed` record); any other failed manifest patch (one this
+/// run did not select) gets its own `failed` record (`uuid_of` looks up
+/// its uuid); a run-level reason rides the envelope's top-level
+/// `errorCode` / `error`. `failed` grows by every record marked or
+/// appended here. Returns `applied`: how many of the run's recorded
+/// patches apply really patched (or found already patched).
 fn fold_apply_failures(
     envelope: &mut serde_json::Value,
     report: &ApplyRunReport,
     uuid_of: impl Fn(&str) -> Option<String>,
 ) -> usize {
-    fn base(purl: &str) -> &str {
-        purl.split(['?', '#']).next().unwrap_or(purl)
-    }
-    fn rec_purl(rec: &serde_json::Value) -> String {
-        normalize_purl(rec["purl"].as_str().unwrap_or_default()).into_owned()
-    }
+    let Some(patches) = envelope["patches"].as_array_mut() else {
+        return 0;
+    };
+    let selected = patches.len();
     let mut marked = 0usize;
-    if let Some(patches) = envelope["patches"].as_array_mut() {
-        let selected = patches.len();
-        for failure in &report.failures {
-            let fpurl = normalize_purl(&failure.purl).into_owned();
-            let live = |i: &usize| patches[*i]["action"].as_str() != Some("failed");
-            // An exact purl match first; a qualified variant's failure
-            // otherwise maps to the records of its base purl.
-            let mut hits: Vec<usize> = (0..selected)
-                .filter(live)
-                .filter(|&i| rec_purl(&patches[i]) == fpurl)
-                .collect();
-            if hits.is_empty() {
-                hits = (0..selected)
-                    .filter(live)
-                    .filter(|&i| base(&rec_purl(&patches[i])) == base(&fpurl))
-                    .collect();
+    for failure in &report.failures {
+        let mut hit = false;
+        for rec in patches.iter_mut().take(selected) {
+            let purl = rec["purl"].as_str().unwrap_or_default();
+            if !apply_key_covers(&failure.purl, purl) {
+                continue;
             }
-            for &i in &hits {
-                patches[i] = serde_json::json!({
-                    "purl": patches[i]["purl"],
-                    "uuid": patches[i]["uuid"],
+            hit = true;
+            if rec["action"].as_str() != Some("failed") {
+                *rec = serde_json::json!({
+                    "purl": rec["purl"],
+                    "uuid": rec["uuid"],
                     "action": "failed",
                     "errorCode": failure.code,
                     "error": failure.error,
                 });
                 marked += 1;
             }
-            let already_failed = patches.iter().any(|r| {
-                r["action"].as_str() == Some("failed") && base(&rec_purl(r)) == base(&fpurl)
-            });
-            if !already_failed {
-                let mut rec = serde_json::json!({
-                    "purl": failure.purl,
-                    "action": "failed",
-                    "errorCode": failure.code,
-                    "error": failure.error,
-                });
-                if let Some(uuid) = uuid_of(&failure.purl) {
-                    rec["uuid"] = serde_json::json!(uuid);
-                }
-                patches.push(rec);
-            }
         }
-        let added = marked + (patches.len() - selected);
-        let failed = envelope["failed"].as_u64().unwrap_or(0) as usize + added;
-        envelope["failed"] = serde_json::json!(failed);
+        let appended = patches[selected..].iter().any(|r| {
+            normalize_purl(r["purl"].as_str().unwrap_or_default()) == normalize_purl(&failure.purl)
+        });
+        if !hit && !appended {
+            let mut rec = serde_json::json!({
+                "purl": failure.purl,
+                "action": "failed",
+                "errorCode": failure.code,
+                "error": failure.error,
+            });
+            if let Some(uuid) = uuid_of(&failure.purl) {
+                rec["uuid"] = serde_json::json!(uuid);
+            }
+            patches.push(rec);
+        }
     }
+    // Recorded patches (added / updated, or the plain already-recorded
+    // skip) that apply reports as patched.
+    let applied = patches[..selected]
+        .iter()
+        .filter(|r| match r["action"].as_str() {
+            Some("added" | "updated") => true,
+            Some("skipped") => r.get("errorCode").is_none(),
+            _ => false,
+        })
+        .filter(|r| {
+            let purl = r["purl"].as_str().unwrap_or_default();
+            report.applied.iter().any(|k| apply_key_covers(k, purl))
+        })
+        .count();
+    let added = marked + (patches.len() - selected);
+    let failed = envelope["failed"].as_u64().unwrap_or(0) as usize + added;
+    envelope["failed"] = serde_json::json!(failed);
     if let Some((code, error)) = &report.run_error {
         envelope["errorCode"] = serde_json::json!(code);
         envelope["error"] = serde_json::json!(error);
     }
-    marked
+    applied
 }
 
 /// Download the selected patches into `.socket/` (manifest records +
@@ -2604,14 +2617,9 @@ pub async fn download_and_apply_patches_with(
     });
     // A failed apply: name what failed, and count only what applied.
     if let Some(report) = apply_report.as_ref().filter(|r| r.code != 0) {
-        let failed_selected = fold_apply_failures(&mut result_json, report, |purl| {
+        let applied = fold_apply_failures(&mut result_json, report, |purl| {
             manifest.patches.get(purl).map(|r| r.uuid.clone())
         });
-        let applied = if report.failures.is_empty() {
-            0
-        } else {
-            to_apply.saturating_sub(failed_selected)
-        };
         result_json["applied"] = serde_json::json!(applied);
     }
     // Surface release-narrowing fallbacks (uninstalled package / no
@@ -3618,8 +3626,14 @@ async fn save_and_apply_patch(args: &GetArgs, client: &ApiClient, patch: &PatchR
         // A failed apply names what failed (#424); `failed` appears only
         // then, so a clean run's envelope is unchanged.
         if let Some(report) = apply_report.as_ref().filter(|r| r.code != 0) {
+            // The manifest names the uuid of any other failing record.
+            let recorded = Box::pin(read_manifest(&manifest_path)).await.ok().flatten();
             result_json["failed"] = serde_json::json!(0);
-            fold_apply_failures(&mut result_json, report, |_| None);
+            let applied = fold_apply_failures(&mut result_json, report, |purl| {
+                let record = recorded.as_ref()?.patches.get(purl)?;
+                Some(record.uuid.clone())
+            });
+            result_json["applied"] = serde_json::json!(applied);
         }
         // Same contract as `download_and_apply_patches_with`: omitted when clean.
         if !warnings.is_empty() {
@@ -4742,11 +4756,15 @@ mod tests {
         }
     }
 
-    fn report_with(failures: Vec<crate::commands::apply::ApplyFailure>) -> ApplyRunReport {
+    fn report_with(
+        failures: Vec<crate::commands::apply::ApplyFailure>,
+        applied: &[&str],
+    ) -> ApplyRunReport {
         ApplyRunReport {
             code: 1,
             failures,
             run_error: None,
+            applied: applied.iter().map(|p| p.to_string()).collect(),
         }
     }
 
@@ -4759,8 +4777,15 @@ mod tests {
                 {"purl": "pkg:npm/b@1.0.0", "uuid": "ub", "action": "updated", "oldUuid": "o"},
             ],
         });
-        let report = report_with(vec![failure("pkg:npm/a@1.0.0", "apply_failed", "denied")]);
-        assert_eq!(fold_apply_failures(&mut env, &report, |_| None), 1);
+        let report = report_with(
+            vec![failure("pkg:npm/a@1.0.0", "apply_failed", "denied")],
+            &["pkg:npm/b@1.0.0"],
+        );
+        assert_eq!(
+            fold_apply_failures(&mut env, &report, |_| None),
+            1,
+            "b applied"
+        );
         assert_eq!(
             env["patches"][0],
             serde_json::json!({
@@ -4774,7 +4799,7 @@ mod tests {
     }
 
     #[test]
-    fn fold_apply_failures_matches_percent_encoded_and_qualified_purls() {
+    fn fold_apply_failures_matches_percent_encoded_and_base_purl_keys() {
         let mut env = serde_json::json!({
             "failed": 0,
             "patches": [
@@ -4782,11 +4807,15 @@ mod tests {
                 {"purl": "pkg:pypi/six@1.16.0?artifact_id=w", "uuid": "u2", "action": "added"},
             ],
         });
-        let report = report_with(vec![
-            failure("pkg:npm/@scope/a@1.0.0", "apply_failed", "x"),
-            failure("pkg:pypi/six@1.16.0", "package_not_installed", "y"),
-        ]);
-        assert_eq!(fold_apply_failures(&mut env, &report, |_| None), 2);
+        // An unqualified (base) key covers its qualified release variants.
+        let report = report_with(
+            vec![
+                failure("pkg:npm/@scope/a@1.0.0", "apply_failed", "x"),
+                failure("pkg:pypi/six@1.16.0", "package_not_installed", "y"),
+            ],
+            &[],
+        );
+        assert_eq!(fold_apply_failures(&mut env, &report, |_| None), 0);
         assert_eq!(env["patches"][0]["action"], "failed", "{env}");
         assert_eq!(env["patches"][1]["action"], "failed", "{env}");
         assert_eq!(env["patches"][1]["errorCode"], "package_not_installed");
@@ -4795,19 +4824,81 @@ mod tests {
     }
 
     #[test]
+    fn fold_apply_failures_never_blames_a_sibling_variant() {
+        // A qualified failure that matches no selected record must not be
+        // pinned on a selected sibling variant that applied: it gets its
+        // own record, and the sibling stays applied.
+        let mut env = serde_json::json!({
+            "failed": 0,
+            "patches": [
+                {"purl": "pkg:pypi/six@1.16.0?artifact_id=w", "uuid": "u1", "action": "added"},
+            ],
+        });
+        let report = report_with(
+            vec![failure(
+                "pkg:pypi/six@1.16.0?artifact_id=s",
+                "apply_failed",
+                "boom",
+            )],
+            &["pkg:pypi/six@1.16.0?artifact_id=w"],
+        );
+        let uuid_of = |p: &str| p.ends_with("=s").then(|| "u0".to_string());
+        assert_eq!(fold_apply_failures(&mut env, &report, uuid_of), 1);
+        assert_eq!(env["patches"][0]["action"], "added", "{env}");
+        assert_eq!(
+            env["patches"][1]["purl"],
+            "pkg:pypi/six@1.16.0?artifact_id=s"
+        );
+        assert_eq!(env["patches"][1]["uuid"], "u0", "{env}");
+        assert_eq!(env["patches"][1]["action"], "failed", "{env}");
+        assert_eq!(env["failed"], 1, "{env}");
+    }
+
+    #[test]
+    fn fold_apply_failures_counts_only_patches_apply_reported_applied() {
+        // `c` is selected and recorded but apply never patched it (not
+        // installed: only a warning beside `a`'s real failure), so it must
+        // not count as applied.
+        let mut env = serde_json::json!({
+            "failed": 0,
+            "patches": [
+                {"purl": "pkg:npm/a@1.0.0", "uuid": "ua", "action": "added"},
+                {"purl": "pkg:npm/b@1.0.0", "uuid": "ub", "action": "skipped"},
+                {"purl": "pkg:npm/c@1.0.0", "uuid": "uc", "action": "added"},
+                {"purl": "pkg:npm/d@1.0.0", "uuid": "ud", "action": "skipped",
+                 "errorCode": "package_not_installed"},
+            ],
+        });
+        let report = report_with(
+            vec![failure("pkg:npm/a@1.0.0", "apply_failed", "x")],
+            &["pkg:npm/b@1.0.0", "pkg:npm/d@1.0.0"],
+        );
+        assert_eq!(
+            fold_apply_failures(&mut env, &report, |_| None),
+            1,
+            "only the already-recorded b applied: {env}"
+        );
+        assert_eq!(env["patches"][2]["action"], "added", "{env}");
+        assert_eq!(env["failed"], 1, "{env}");
+    }
+
+    #[test]
     fn fold_apply_failures_appends_an_unselected_manifest_failure() {
         // The nested apply covers the whole (ecosystem-scoped) manifest: a
         // failing record this run did not select still gets named, without
-        // counting against this run's `applied`.
+        // costing this run's own patch its `applied` count.
         let mut env = serde_json::json!({
             "failed": 1,
             "patches": [
                 {"purl": "pkg:npm/a@1.0.0", "uuid": "ua", "action": "added"},
             ],
         });
-        let report = report_with(vec![failure("pkg:npm/old@2.0.0", "apply_failed", "z")]);
+        let report = report_with(
+            vec![failure("pkg:npm/old@2.0.0", "apply_failed", "z")],
+            &["pkg:npm/a@1.0.0"],
+        );
         let uuid_of = |p: &str| (p == "pkg:npm/old@2.0.0").then(|| "uo".to_string());
-        assert_eq!(fold_apply_failures(&mut env, &report, uuid_of), 0);
+        assert_eq!(fold_apply_failures(&mut env, &report, uuid_of), 1);
         assert_eq!(env["patches"][0]["action"], "added", "{env}");
         assert_eq!(
             env["patches"][1],
@@ -4829,6 +4920,7 @@ mod tests {
             code: 1,
             failures: Vec::new(),
             run_error: Some(("yarn_pnp_unsupported".to_string(), "pnp".to_string())),
+            applied: Vec::new(),
         };
         assert_eq!(fold_apply_failures(&mut env, &report, |_| None), 0);
         assert_eq!(env["errorCode"], "yarn_pnp_unsupported", "{env}");
