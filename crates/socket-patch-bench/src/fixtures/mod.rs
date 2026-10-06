@@ -230,6 +230,13 @@ pub static ALL: &[Pm] = &[
         patched: 25,
         build: other::build_maven,
     },
+    Pm {
+        name: "gradle",
+        description: "Gradle (build.gradle + gradle.lockfile, ~/.gradle/caches)",
+        packages: 1000,
+        patched: 25,
+        build: other::build_gradle,
+    },
 ];
 
 #[cfg(test)]
