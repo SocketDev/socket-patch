@@ -150,13 +150,15 @@ pub(crate) const OFFLINE: &str =
 
 type Cache<T> = Mutex<HashMap<(String, String), Result<T, String>>>;
 
+/// [`Cache`] keyed by (registry base, name, version).
+type RegistryCache<T> = Mutex<HashMap<(String, String, String), Result<T, String>>>;
+
 /// One client per restore run; every lookup is cached (success and
 /// failure alike) so a pin wired in several files costs one request.
 pub(crate) struct UpstreamClient {
     http: RegistryClient,
     offline: bool,
-    /// Keyed by (registry base, name, version).
-    npm: Mutex<HashMap<(String, String, String), Result<NpmDist, String>>>,
+    npm: RegistryCache<NpmDist>,
     npm_berry: Cache<String>,
     cargo: Cache<String>,
     go: Cache<GoSums>,
