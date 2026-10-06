@@ -369,6 +369,25 @@ impl RubyCrawler {
         let default_root = cwd.join("vendor").join("bundle");
         let default_root = normalize_lexically(&default_root).unwrap_or(default_root);
 
+        // A truthy `path.system` in the tier Bundler reads sends it to the
+        // system gem home, which ignores every bundle path: the env
+        // `BUNDLE_PATH` it shadows (or that sits in the same tier) and the
+        // default `vendor/bundle`. A leftover store there must not be
+        // crawled, nor switch off the `gem env` homes where the loaded
+        // copy lives (#915). Gated like the explicit roots: config only
+        // counts for a Ruby project. (A recorded local path never coexists
+        // with it: [`parse_bundle_config_path`] already drops it.)
+        let uses_system_gems = Self::has_bundler_manifest(cwd).await
+            && Self::bundler_path_system(
+                cwd,
+                bundle_path_env,
+                path_system_env,
+                app_config_env,
+                global_config,
+                ignore_config,
+            )
+            .await;
+
         let mut roots: Vec<PathBuf> = Vec::new();
         let mut skipped_config_path = None;
         let mut skipped_config_root = None;
@@ -391,7 +410,7 @@ impl RubyCrawler {
                     }
                 }
             }
-            if let Some(v) = bundle_path_env.filter(|v| !v.is_empty()) {
+            if let Some(v) = bundle_path_env.filter(|v| !v.is_empty() && !uses_system_gems) {
                 roots.push(resolve_bundle_path(cwd, Path::new(v), home));
             }
             let standalone_root = cwd.join("bundle");
@@ -420,22 +439,6 @@ impl RubyCrawler {
                 }
             }
         }
-        // A truthy `path.system` in the tier Bundler reads sends it to the
-        // system gem home, which ignores `vendor/bundle` as much as any
-        // recorded path. A leftover store there must not be crawled, nor
-        // switch off the `gem env` homes where the loaded copy lives
-        // (#915). Gated like the explicit roots: config only counts for a
-        // Ruby project.
-        let uses_system_gems = Self::has_bundler_manifest(cwd).await
-            && Self::bundler_path_system(
-                cwd,
-                bundle_path_env,
-                path_system_env,
-                app_config_env,
-                global_config,
-                ignore_config,
-            )
-            .await;
         if !uses_system_gems {
             roots.push(default_root.clone());
         }
@@ -3363,6 +3366,24 @@ mod tests {
                 discovery.stores
             );
             assert!(!discovery.default_root_has_stores, "{value}");
+
+            // The local tier also shadows an env `BUNDLE_PATH`, even one
+            // naming the leftover `vendor/bundle` itself.
+            let vendor_bundle = dir.path().join("vendor").join("bundle");
+            let discovery = RubyCrawler::discover_bundle_stores_with_env(
+                dir.path(),
+                Some(vendor_bundle.as_os_str()),
+                None,
+                None,
+                None,
+            )
+            .await;
+            assert!(
+                discovery.stores.is_empty(),
+                "{value}: {:?}",
+                discovery.stores
+            );
+            assert!(!discovery.default_root_has_stores, "{value}");
         }
     }
 
@@ -3375,6 +3396,20 @@ mod tests {
         let discovery = RubyCrawler::discover_bundle_stores_with_path_system_env(
             dir.path(),
             None,
+            Some(OsStr::new("true")),
+            None,
+        )
+        .await;
+        assert!(discovery.stores.is_empty(), "{:?}", discovery.stores);
+        assert!(!discovery.default_root_has_stores);
+
+        // Same tier as an env `BUNDLE_PATH`: Bundler goes to the system
+        // gem home (4.0.18 refuses the combination outright), so the env
+        // root must not bring the leftover store back.
+        let vendor_bundle = dir.path().join("vendor").join("bundle");
+        let discovery = RubyCrawler::discover_bundle_stores_with_path_system_env(
+            dir.path(),
+            Some(vendor_bundle.as_os_str()),
             Some(OsStr::new("true")),
             None,
         )
