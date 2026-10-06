@@ -149,6 +149,18 @@ fn absolutizes_file_overrides(pm: &str) -> bool {
     matches!(parts.as_slice(), [9, 0, patch] if *patch <= 4)
 }
 
+/// pnpm 8.0.0-8.1.0 refuse their OWN lock for a scoped `file:` tarball
+/// override under `--frozen-lockfile` (ERR_PNPM_LOCKFILE_MISSING_DEPENDENCY
+/// on the `file:` key they just wrote; measured 2026-10-06: 8.1.0 refuses,
+/// 8.1.1 accepts), so no vendored scoped lock can pass there.
+fn refuses_own_scoped_file_override(pm: &str) -> bool {
+    let Some(v) = pm.strip_prefix("pnpm@") else {
+        return false;
+    };
+    let parts: Vec<u32> = v.split('.').filter_map(|p| p.parse().ok()).collect();
+    matches!(parts.as_slice(), [8, 0, _] | [8, 1, 0])
+}
+
 fn has_corepack_pm(pm: &str) -> bool {
     // Isolated too: this probe is what actually downloads the package manager
     // the first time, and corepack stores it under `COREPACK_HOME`.
@@ -1078,6 +1090,10 @@ async fn pnpm_pinned_matrix_vendored_lifecycle_and_manifestless_vex() {
         }),
         8 => off_runtime(|| {
             run_legacy_capstone(&pm, "lockfileVersion: '6.0'", "proj");
+            if refuses_own_scoped_file_override(&pm) {
+                println!("SKIP scoped legacy leg ({pm}): pnpm refuses its own scoped file: lock");
+                return;
+            }
             run_legacy_capstone_for(
                 &pm,
                 "lockfileVersion: '6.0'",
