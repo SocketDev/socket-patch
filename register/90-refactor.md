@@ -1,5 +1,5 @@
 ### Refactor routine (`refactor`, hourly, highest leverage first)
-_Last updated 2026-10-06T05:02Z · main @ 9c43dfc_
+_Last updated 2026-10-06T06:56Z · main @ 9c43dfc_
 
 **In flight:**
 - [#876](https://github.com/SocketDev/socket-patch/pull/876): registry clients (`build_registry_client`, Maven `fetch_registry_bytes`) built through one `registry_client_builder` under `ApiTimeouts`; `registry_fetch::download` onto `read_capped`. Also ports the base-red digest-ratchet fix for #646's JVM files. Issue #872 (C49). `ready`.
@@ -17,13 +17,13 @@ _Last updated 2026-10-06T05:02Z · main @ 9c43dfc_
 
 | # | Candidate | B | U | D | R | Score | Note |
 |---|---|:-:|:-:|:-:|:-:|:-:|---|
-| 1 | #773 (C44): one `Ecosystem::from_cli_name` for flag, env, socket.yml, vendor | 1 | 0 | ≈2 | L | ≈5 | skipped: `commands/vendor.rs` changed by #690, #776, #825, #837, #877 |
-| 2 | #856 (E62, child 1 of #855): VEX npm aliases through the core resolver | 1 | 1 | ≈1.8 | M | ≈5 | skipped: `vex_consumed.rs` changed by #690 |
-| 3 | #883 (E39): `canonicalize_pypi_name` + `pep508_name` into one PyPI name module | 0 | 1 | ≈3 | L | ≈5 | skipped: 13 files changed by open PRs |
-| 4 | #893 (C50): `repair` and `scan --prune` keep active patches' beforeHash blobs | 1 | 0 | ≈1 | L | ≈4 | best eligible (`cleanup_blobs.rs`); take when a slot frees |
-| 5 | #906 (E25): service-copy pipeline, cargo/composer/go slice | 0 | 1 | ≈0.5 | L | ≈2.5 | eligible; gem copy waits for #768, #776, #875 |
+| 1 | #922 (E22, child 1 of #920): one `VendorEntry::npm` constructor for the 7 npm-family ledger tails | 0 | 1 | ≈7 | L | ≈9 | skipped: drivers changed by #657, #873, #888, #909 |
+| 2 | #773 (C44): one `Ecosystem::from_cli_name` for flag, env, socket.yml, vendor | 1 | 0 | ≈2 | L | ≈5 | skipped: `commands/vendor.rs` changed by #690, #776, #825, #837, #877 |
+| 3 | #856 (E62, child 1 of #855): VEX npm aliases through the core resolver | 1 | 1 | ≈1.8 | M | ≈5 | skipped: `vex_consumed.rs` changed by #690 |
+| 4 | #883 (E39): `canonicalize_pypi_name` + `pep508_name` into one PyPI name module | 0 | 1 | ≈3 | L | ≈5 | skipped: 13 files changed by open PRs |
+| 5 | #893 (C50): `repair` and `scan --prune` keep active patches' beforeHash blobs | 1 | 0 | ≈1 | L | ≈4 | best eligible (`cleanup_blobs.rs`); take when a slot frees |
 
-Re-ranked 2026-10-06T05:02Z: no change on main and no new `arch-audit`/`refactor` issue. #914 (C51, ≈1) is now also skipped: fixer PRs #911 and #916 edit `jvm_jar.rs`. #913 (C29, ≈0.5, move-only, after #871) stays below the top five. #905 stays with the fixer in #909. #871 (≈2.5) eligible after #889; then #705 (≈2.4). #780, #663, #895 still overlap open PRs. 3 of 3 slots used (#876, #886, #889 `ready`, approved). Decisions: #648, #704, #792, #808, #615; C07.
+Re-ranked 2026-10-06T06:56Z: main unchanged. New: #922 (E22) tops the score but its 7 drivers overlap 4 open PRs; #920 (tracking) ranks through #922; #923 (E65, dead `force`/`sources` params, ≈0.5) touches `npm_common.rs`/`npm_dir.rs` (#837, #909). #893 (≈4, `cleanup_blobs.rs`) stays the best eligible. #906 (≈2.5) drops to sixth. #914 skipped (#911, #916 edit `jvm_jar.rs`). #871 eligible after #889; then #705. 3 of 3 slots used (#876, #886, #889 `ready`). Decisions: #648, #704, #792, #808, #615; C07.
 
 **Notes:**
 - The sandbox runs as root, so 4 core lib tests fail on main and on branches alike: `copy_tree::relax_loop_must_not_traverse_symlinked_root`, `vlt_heal::an_unremovable_hidden_lock_keeps_every_store_entry`, `pypi_poetry::wire_write_failure_maps_error_and_leaves_lock_untouched`, `pypi_requirements::wire_failure_rolls_back_already_written_files`.
