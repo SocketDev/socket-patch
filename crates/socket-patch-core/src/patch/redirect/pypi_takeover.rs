@@ -59,9 +59,11 @@ fn preflight_uv_takeover(entry: &VendorEntry) -> Result<(), RewriteWarning> {
                     "{} is vendored over {}'s {} entry for version {locked}, which vendored \
                      mode pinned down to the patch's {patch_version}; reverting it brings \
                      {locked} back, and hosted mode only pins the version the lock resolves, \
-                     so it is kept vendored (not switched to hosted). To switch it: make the \
-                     project resolve {patch_version} (for example an exact `=={patch_version}` \
-                     requirement), re-lock, then re-run `scan --mode hosted`",
+                     so it is kept vendored (not switched to hosted). To switch it: run \
+                     `socket-patch vendor --revert` (this reverts EVERY vendored package in the \
+                     project, not just this one), make the project resolve {patch_version} (for \
+                     example an exact `=={patch_version}` requirement) and re-lock, then re-run \
+                     `scan --mode hosted`",
                     entry.base_purl, record.file, record.file,
                 ),
             });
@@ -105,8 +107,10 @@ async fn preflight_poetry_takeover(root: &Path, entry: &VendorEntry) -> Result<(
         code: "redirect_poetry_lock_unsupported".into(),
         detail: format!(
             "{lock_file}: Poetry 0.x ignores URL sources; hosted patches require Poetry >= 1.0, \
-             so {} is kept vendored (not switched to hosted). To switch it: upgrade the \
-             project to Poetry >= 1.0 and re-lock, then re-run `scan --mode hosted`",
+             so {} is kept vendored (not switched to hosted). To switch it: run \
+             `socket-patch vendor --revert` (this reverts EVERY vendored package in the \
+             project, not just this one), upgrade the project to Poetry >= 1.0 and re-lock, \
+             then re-run `scan --mode hosted`",
             entry.base_purl
         ),
     })
@@ -165,6 +169,17 @@ mod tests {
         let err = preflight_uv_takeover(&entry("uv", vec![uv_package("1.17.0")])).unwrap_err();
         assert_eq!(err.code, "redirect_uv_takeover_version_unreachable");
         assert!(err.detail.contains("1.17.0"), "{}", err.detail);
+        assert_remedy_reverts_first(&err.detail);
+    }
+
+    /// Re-locking while the package is still vendored can't clear the
+    /// refusal and makes the later revert see drift, so the remedy must
+    /// unwind the vendored wiring first.
+    fn assert_remedy_reverts_first(detail: &str) {
+        let revert = detail.find("vendor --revert").expect(detail);
+        let relock = detail.find("re-lock").expect(detail);
+        assert!(revert < relock, "{detail}");
+        assert!(detail.contains("EVERY vendored package"), "{detail}");
     }
 
     #[test]
@@ -208,6 +223,7 @@ mod tests {
             .await
             .unwrap_err();
         assert_eq!(err.code, "redirect_poetry_lock_unsupported");
+        assert_remedy_reverts_first(&err.detail);
     }
 
     #[tokio::test]
