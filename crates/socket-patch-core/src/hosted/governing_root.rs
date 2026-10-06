@@ -188,18 +188,16 @@ fn has_own_npm_family_lock(root: &Path) -> bool {
         || root.join("rush.json").exists()
 }
 
-/// npm-family locks a `workspaces` root can install its members from. Any
-/// of them at a matching root governs the member from outside its
-/// directory (a pnpm root without `pnpm-workspace.yaml` included).
-const WORKSPACE_ROOT_LOCKS: [&str; 8] = [
+/// Locks of the package managers that read `package.json` `workspaces`
+/// (npm, yarn, Bun). pnpm reads only `pnpm-workspace.yaml` and vlt only
+/// `vlt.json`, so their locks at a `workspaces` root govern no member
+/// through that field; the pnpm check owns pnpm workspaces.
+const WORKSPACE_ROOT_LOCKS: [&str; 5] = [
     "package-lock.json",
     "npm-shrinkwrap.json",
     "yarn.lock",
     "bun.lock",
     "bun.lockb",
-    PNPM_LOCK,
-    "shrinkwrap.yaml",
-    VLT_LOCK,
 ];
 
 /// #884: the project directory is a member of an npm, yarn (classic or
@@ -212,8 +210,9 @@ const WORKSPACE_ROOT_LOCKS: [&str; 8] = [
 /// its workspace root, as npm and yarn resolve it. A matching root with no
 /// lock may itself be a member of an outer workspace (yarn berry's nested
 /// worktrees), so the walk goes on with that root as the member and
-/// refuses at the first root that holds a lock; a chain that ends without
-/// one (never installed), or at a Rush root, refuses nothing. Returns the
+/// refuses at the first root that holds an npm, yarn or Bun lock; a chain
+/// that ends without one (never installed), or at a Rush root, refuses
+/// nothing. Returns the
 /// governing root with the refusal, so [`refusal`] can weigh it against
 /// the pnpm check (the nearer root wins; a tie goes to pnpm's message).
 async fn package_json_workspace_refusal(root: &Path) -> Option<(PathBuf, Refusal)> {
@@ -783,20 +782,20 @@ mod tests {
             Some(PNPM_LOCKFILE_ELSEWHERE)
         );
 
-        // Bugbot on #901: a pnpm lock at the inner root with no
-        // `pnpm-workspace.yaml` still fails closed, naming the inner root
-        // (the nearest lock), not the outer yarn root.
+        // Bugbot on #901: a stray pnpm lock at the inner root with no
+        // `pnpm-workspace.yaml` governs nothing (pnpm ignores
+        // `package.json` workspaces), so the outer yarn root is named.
         std::fs::remove_file(tmp.path().join("packages/inner/pnpm-workspace.yaml")).unwrap();
         let refusal = refusal(&ProjectView::Disk(&member), &[candidate("npm")])
             .await
-            .expect("inner lock root refused");
+            .expect("outer yarn root refused");
         assert_eq!(refusal.code, WORKSPACE_LOCKFILE_ELSEWHERE);
-        let inner = std::fs::canonicalize(tmp.path().join("packages/inner")).unwrap();
+        let outer = std::fs::canonicalize(tmp.path()).unwrap();
         assert!(
             refusal
                 .message
-                .contains(&format!("run socket-patch from {}", inner.display()))
-                && refusal.message.contains(PNPM_LOCK),
+                .contains(&format!("run socket-patch from {}", outer.display()))
+                && refusal.message.contains("yarn.lock"),
             "{}",
             refusal.message
         );
@@ -838,6 +837,30 @@ mod tests {
         write(tmp.path(), "tools/t/package.json", "{}");
         assert_eq!(
             code(&tmp.path().join("tools/t"), "npm").await.as_deref(),
+            Some(PNPM_LOCKFILE_ELSEWHERE)
+        );
+    }
+
+    /// Bugbot on #901: a stray `pnpm-lock.yaml` at a nested `workspaces`
+    /// root does not beat the outer pnpm workspace pnpm installs from.
+    #[tokio::test]
+    async fn stray_inner_pnpm_lock_does_not_beat_the_outer_pnpm_workspace() {
+        let tmp = tempfile::tempdir().unwrap();
+        write(tmp.path(), PNPM_WORKSPACE, "packages:\n  - apps/**\n");
+        write(tmp.path(), PNPM_LOCK, "lockfileVersion: '9.0'\n");
+        write(
+            tmp.path(),
+            "apps/package.json",
+            r#"{"private":true,"workspaces":["web"]}"#,
+        );
+        write(
+            tmp.path(),
+            "apps/pnpm-lock.yaml",
+            "lockfileVersion: '9.0'\n",
+        );
+        write(tmp.path(), "apps/web/package.json", "{}");
+        assert_eq!(
+            code(&tmp.path().join("apps/web"), "npm").await.as_deref(),
             Some(PNPM_LOCKFILE_ELSEWHERE)
         );
     }
