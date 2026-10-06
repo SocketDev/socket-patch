@@ -44,9 +44,7 @@ Re-ranked 2026-10-06T21:56Z: main, discussion steering and queue unchanged since
 - Windows: `DirEntry::metadata().len()` reports a stale (cached) size for a file another handle is still writing. Size live files with `std::fs::metadata(path)` in tests.
 - CLI test targets: 145+ files spawn `socket-patch` with a bare `Command::new(binary())`; `tests/spawn_env_hygiene.rs` keeps `PENDING_RAW_SPAWNS` / `PENDING_SCRUB_COPIES` allowlists that fail on new **and** stale entries — drop a file from the list when you migrate it.
 - `utils::fs` writers run on the blocking pool via `run_blocking` since #858: a test calling them needs a tokio runtime but either flavor works.
-- `cargo test --test repair` under `SOCKET_DRY_RUN=true` is a quick hermeticity probe: on `main` 20 fail, after #850 only the 2 root-only tests.
 - `#[cfg(test)] mod tests` blocks often lean on the parent's `use sha2::…` through `use super::*`: removing a production import breaks the test build (`cargo test --lib --no-run`), not `cargo build`. Add the import to the test module.
-- Bun backtest `native (macos-latest, 1.3.10)` cell `preexisting-manifest vendored` is flaky (failed once on #870, passed on re-run).
 - Bugbot may review the PR's start commit when a draft opens; check the review's commit SHA and re-trigger on the real head.
 - go.mod's lexer treats `//` as a comment anywhere, so `module a//b` declares `a`: don't expect `//` inside a token to be rejected.
 - #646 merged inline digests after the `utils::digest` ratchet, so `production_digests_go_through_the_helpers` failed on `main` @ `a1d4260`; #876 carries the fix (`gradle_cache.rs` added to `PENDING_INLINE_DIGESTS` because #690 edits it). Drop it from the list when #706 slice 2 migrates it.
