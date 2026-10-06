@@ -2,7 +2,7 @@
 
 ## Part 5: Vendored mode and the non-JS backends
 
-_Last checked against main @ 9c43dfc on 2026-10-06 by audit-ecosystems (5.4 Poetry/PDM/Pipenv backend skeleton and Poetry forward splicers re-checked at `9c43dfc`; 5.2 dead `force`/`sources` parameters re-checked at `9c43dfc`; per-backend service-copy and cleanup copies re-checked at `9c43dfc`; 5.4 NuGet, Poetry/PDM and Gem re-checked at `4646693`; as of `045d7ec`: 5.4 Python, Cargo, Maven XML, Gem, Go and CRLF helpers; 5.6 scaffolding; the vendored-reference scan behind repair and the orphan sweeps). Owner: audit-ecosystems._
+_Last checked against main @ 9c43dfc on 2026-10-06 by audit-ecosystems (5.2 ecosystem enumeration sites and dispatch re-checked at `9c43dfc`; the vendored-reference scan's file list re-checked at `9c43dfc`; 5.4 Poetry/PDM/Pipenv backend skeleton and Poetry forward splicers re-checked at `9c43dfc`; 5.2 dead `force`/`sources` parameters re-checked at `9c43dfc`; per-backend service-copy and cleanup copies re-checked at `9c43dfc`; 5.4 NuGet, Poetry/PDM and Gem re-checked at `4646693`; as of `045d7ec`: 5.4 Python, Cargo, Maven XML, Gem, Go and CRLF helpers; 5.6 scaffolding; the vendored-reference scan behind repair and the orphan sweeps). Owner: audit-ecosystems._
 
 > Scope: `vendor/` framework (`mod`, `common`, `state`, `verify`, `registry_fetch`, `service_fetch`, `prestage`, `reuse`, `redownload`, `ledger_snapshots`, `parse_memo`, `path`, `source`, `toml_surgery`, `lock_inventory`); backends for cargo, gem, pypi (×10 files), golang, composer, nuget, maven and `jvm/`; related `utils/` parsers; and the CLI `vendor.rs` + `vendored_backend/`.
 
@@ -39,25 +39,25 @@ The signatures are close but not identical:
 - pypi takes two extra cache arguments;
 - every backend now discards `sources` and `force` at its acquisition sink (10 `_sources`/`_force` parameters, since acquisition went service-only), so `vendor --force` only bypasses the CLI variant probe, although its help and `CLI_CONTRACT.md` still promise missing-file tolerance. {{E65}}
 
-The CLI papers over the differences with two macros, `vend!` and `vend_installed!` (`cli/commands/vendor.rs:153-192`).
+The CLI papers over the differences with two macros, `vend!` and `vend_installed!` (`cli/commands/vendor.rs:171-210`).
 
-**16 production sites enumerate the ecosystems**, and each is a place a new ecosystem must be added:
+**16 production sites enumerate the ecosystems** (line numbers re-checked at `9c43dfc`), and each is a place a new ecosystem must be added. Target: one core `VendorBackend` enum that every site asks, starting with the revert and in-use dispatch. {{E21}}
 1. `vendor/path.rs:43` `ECOSYSTEM_DIRS`
-2. `vendor/path.rs:233-320` `leaf_to_purl` (8 arms)
-3. `vendor/mod.rs:754-772` `service_preflight` (7 arms)
-4. `vendor/mod.rs` `lock_text_refusals`
-5. `vendor/mod.rs:~395-410` harvest suffix branches
+2. `vendor/path.rs:281-383` `leaf_to_purl` (8 arms)
+3. `vendor/mod.rs:779-800` `service_preflight` (7 arms)
+4. `vendor/npm_flavor.rs:516` `lock_text_refusals`
+5. `vendor/mod.rs:392-417` harvest suffix branches
 6. `verify.rs:526` `artifact_is_file_shaped`
-7. `redownload.rs:166-302`
-8. `prestage.rs:350` `PRESTAGED_ECOSYSTEMS`
-9. `lock_inventory/mod.rs:250`
-10. `lock_inventory/recover.rs:42-144`
-11. `ledger_snapshots.rs:55` `WHOLE_FILE_KINDS`
-12. `state.rs:439+` `carry_forward_wiring`
-13. CLI `vendor.rs:137` `SERVICE_ECOSYSTEMS`
-14. CLI `vendor.rs:194` vendor dispatch
-15. CLI `vendor.rs:241` revert dispatch
-16. CLI `vendor.rs:261` in-use dispatch
+7. `redownload.rs:195`
+8. `prestage.rs:352` `PRESTAGED_ECOSYSTEMS`
+9. `lock_inventory/mod.rs:252` (`lookup`, 6 types)
+10. `lock_inventory/recover.rs:41`
+11. `ledger_snapshots.rs:56` `WHOLE_FILE_KINDS`
+12. `state.rs:502` `carry_forward_wiring`
+13. CLI `vendor.rs:155` `SERVICE_ECOSYSTEMS`
+14. CLI `vendor.rs:212` vendor dispatch
+15. CLI `vendor.rs:254` revert dispatch
+16. CLI `vendor.rs:286` in-use dispatch
 
 Inside backends there is a second dispatch layer: `PypiFlavor` has 7 variants, matched at `pypi.rs:727, 744, 1123` and again as strings at `:1545`; `NpmLockFlavor` does the same for npm.
 
@@ -250,6 +250,7 @@ Old `kind`s are translated into `SpliceRecord`s when the ledger loads, so legacy
 
 ### New findings since the review
 
+- {{E67}}: the vendored-reference scan (repair, the orphan sweeps, the `vendor` stranded-reference gate) reads only `VENDORED`-role files, but `hatch.toml` is one of the vendored writes listed in `registry::VENDORED_WRITES_UNMARKED`. With a missing ledger entry, the sweep deletes a wheel that a `hatch.toml` environment still names, while VEX (`PROBE`) sees it live (executed twice). The same split hides NuGet and Maven ({{E61}}); the register's two notions of "vendored writes this file" are the root cause.
 - {{E66}}: vendored Poetry wires a 2.x lock through the `toml_edit` engine when it is CRLF and through a `toml_surgery` line scanner when it is LF. For the same lock the two give different `files` shapes, and only the engine checks the wheel name and lowercases the digest (executed twice); see 5.4.
 - {{E65}}: `vendor --force` documents a missing-file tolerance and a `vendor_content_mismatch_overwritten` warning that no backend implements; every acquisition sink takes `_force`/`_sources`, and `vendor` with and without `--force` behave the same (executed twice). Bears on #615; see 5.2.
 - {{E61}}: the vendored-reference scan behind `repair`, the `vendor` stranded-reference gate and the orphan sweeps never sees NuGet or Maven wiring. `nuget.config` and `pom.xml` lack the `VENDORED` registry role, and both backends reference the bare uuid directory, which `parse_vendor_path` rejects (it needs a leaf). So with a missing ledger entry, `vendor --revert` and the vendored gc delete a feed or repository that `nuget.config` / `pom.xml` still name (proven by execution). The `eco == "maven2"` arm of the stranded-reference gate is dead.

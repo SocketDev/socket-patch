@@ -1,5 +1,5 @@
 ### Ecosystems and formats (`audit-ecosystems`)
-_Last updated 2026-10-06T12:51Z · main @ 9c43dfc_
+_Last updated 2026-10-06T18:54Z · main @ 9c43dfc_
 
 | ID | P | Problem | Source | Issues | Status |
 |---|:-:|---|---|---|---|
@@ -23,7 +23,7 @@ _Last updated 2026-10-06T12:51Z · main @ 9c43dfc_
 | E18 | 3 | JS helper copies: JSON-pointer escape ×2, wiring lines↔JSON ×3, `name@spec` split ×2, `KIND_*` re-spelled as literals, uneven recursion bounds, and regexes compiled inside per-dependency loops. | 4.4 | #835 | filed #835; wiring kinds + lines↔JSON codec (pointer escape in #663; `name@spec`, recursion, regex still to verify) |
 | E19 | 3 | Gem has three section models and three DEPENDENCIES-name parsers (vendored sees only the first `GEM` section, so #779). Go: `go_crawler::parse_go_mod_module` has no production caller; `vex/product.rs` has its own `module` reader that misreads the block form; `go_mod_edit.rs` lives in `vendor/`. | 5.4 | #780, #781 | filed #780; gem models (#780) open, go.mod `module` reader (#781) fixed (#870) |
 | E20 | 3 | Pure codecs (`bun_lockb.rs`, `bun_lock_text.rs`, `vlt_lock_text.rs`) and the neutral types (`Edit`, `Warning`, `LockfileEntry`) live outside `formats/`, which creates `formats`↔`vendor`/`redirect`/`vex` cycles. | 2.1; 4.5 #2; 4.7 J | #833, #834 | filed #833, #834; tracking #833, child 1 #834 (entry types) |
-| E21 | 2 | Tracking: `VendorBackend` trait + registry. The ecosystem list is enumerated at 16 production sites, and the `vend!` / `vend_installed!` macros stand in for the trait. | 2.1; 5.2; 5.8 | | to verify |
+| E21 | 2 | Tracking: `VendorBackend` trait + registry. The ecosystem list is enumerated at 16 production sites, and the `vend!` / `vend_installed!` macros stand in for the trait. | 2.1; 5.2; 5.8 | #959, #960 | filed #959, #960; tracking #959 (enum dispatch first), child 1 #960 (revert/in-use) |
 | E22 | 2 | The JS vendor driver skeleton is copied seven times (`guard_coordinates` → … → a literal `VendorEntry`; pnpm legacy shares v9's since #583). Target: one generic driver + `NpmLockBackend`. | 4.4; 4.7 C | #920, #922 | filed #920, #922; tracking #920, child 1 #922 (entry constructor) |
 | E23 | 2 | The `pypi_{poetry,pdm,pipenv}.rs` backends repeat one skeleton: `load_*_project`, `classify_dependency`, `check_target_guards`, `wire_*`, `revert_*`. | 5.4 | #937 | filed #937; shared wire/revert envelope + one `LockTarget` (no drift proven) |
 | E24 | 2 | There are nine revert mechanisms (~3.5K lines). Target: one splice-record revert engine, with legacy ledger kinds adapted at load. | 2.1; 5.3; 5.8 | | to verify |
@@ -69,6 +69,7 @@ _Last updated 2026-10-06T12:51Z · main @ 9c43dfc_
 | E64 | 2 | BOM handling has no shared helper: 4 named `strip_bom` copies and ~50 inline strips (one-vs-many drift). `formats::pnpm`'s three `lockfileVersion` readers and `workspace::top_level_key` never strip it, so one BOM pnpm lock is readable (entries), not a pnpm lock (VEX), unversioned (hosted trust gate) and unsupported (vendored router), executed twice. Symptoms #903, #904, #623. | new finding; 4.4 | #905 | in PR #909 |
 | E65 | 3 | Every vendored backend sink discards `force` and `sources` (`_force`/`_sources` at 10 sinks) since acquisition went service-only, yet `vendor --force` help and `CLI_CONTRACT.md` promise missing-file tolerance and a `vendor_content_mismatch_overwritten` warning that nothing emits; `--force` only bypasses the variant probe (executed twice). Bears on #615. | new finding; 5.2 | #923 | filed #923 |
 | E66 | 2 | Vendored Poetry has two forward splicers chosen by line ending: CRLF/legacy locks use the shared `utils::poetry_lock` engine (as hosted does), LF 2.x locks use the `toml_surgery` line scanner `rewrite_target_package_unit`. They write different `files` shapes for one lock, and only the engine checks the wheel name and lowercases the digest (executed twice). | new finding; 5.4 | #936 | filed #936 |
+| E67 | 2 | The vendored-reference scan reads only `VENDORED`-role files, but `registry::VENDORED_WRITES_UNMARKED` lists `hatch.toml` as a vendored write: with a missing ledger entry, the orphan sweep deletes a wheel a `hatch.toml` environment still names, while VEX (`PROBE`) sees it live (executed twice). Same root as E61. | new finding | #958 | filed #958 |
 
 **Handed off:** none yet.
 
