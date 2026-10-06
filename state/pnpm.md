@@ -1,8 +1,8 @@
 [agent] Progress ledger for the scheduled pnpm bug-hunt routine (label pm:pnpm).
 
-Last updated: 2026-10-05 (run 22), main `9c43dfc`, latest release 4.0.0.
+Last updated: 2026-10-06 (run 23), main `9c43dfc`, latest release 4.0.0.
 
-Method: real pnpm installs. Hosted, vendored and global agent mode run against a local Python mock of the patch API (batch, by-package, view with inline blobs, package grant, hosted tarball, `/registry/<name>/<ver>` mirror). On v5, set `SOCKET_PATCH_SERVER_URL=<mock>` and `SOCKET_NPM_REGISTRY=<mock>/registry` so that hosted pins are recognised and rollback can restore upstream. The oracle is a marker prepended to `index.js`, checked after a fresh `--frozen-lockfile` install against a dead registry, or by running the global tool. The repo's pinned matrix (`.github/workflows/pnpm-compatibility.yml`) already covers plain hosted and vendored installs on pnpm 1–12. This ledger tracks what it doesn't.
+Method: real pnpm installs. Hosted, vendored and global agent mode run against a local Python mock of the patch API (batch, by-package, view with inline blobs, `patches/blob/<hash>`, package grant, hosted tarball, `/registry/<name>/<ver>` mirror; `ajv-keywords@3.5.2` serves as the peer-dependency package). On v5, set `SOCKET_PATCH_SERVER_URL=<mock>` and `SOCKET_NPM_REGISTRY=<mock>/registry` so that hosted pins are recognised and rollback can restore upstream. The oracle is a marker prepended to `index.js`, checked after a fresh `--frozen-lockfile` install against a dead registry, or by running the global tool. The repo's pinned matrix (`.github/workflows/pnpm-compatibility.yml`) already covers plain hosted and vendored installs on pnpm 1–12. This ledger tracks what it doesn't.
 
 ## Coverage matrix
 
@@ -210,6 +210,20 @@ Run 22 additions (main `9c43dfc`, Linux):
 
 Fixed on main `9c43dfc` and re-verified with real pnpm in run 22: #362 (11 / 12), #590 (9). #435 (12.8.1) and #734 (9.15.9) still reproduce. #880 and #881 aren't regressions: release 4.0.0 behaves the same.
 
+Run 23 additions (main `9c43dfc`, Linux):
+
+| pnpm (lock) | Agent: apply / rollback / store pristine | Hosted: pin → fresh frozen → vex → rollback | Hosted: hashed peer suffix (`peersSuffixMaxLength`) | Agent / hosted `node-linker=hoisted` | Hosted + unversioned `patchedDependencies` key | Rollback byte-exact with `lockfileIncludeTarballUrl` in an ignored file | BOM `pnpm-lock.yaml` (hosted) | BOM `pnpm-workspace.yaml`, edited key first (hosted / vendored) |
+| --- | --- | --- | --- | --- | --- | --- | --- | --- |
+| 1.43.1 (shrinkwrap v3, Node 10) | pass / pass / pass | pass, byte-exact | n/a | untested | n/a | n/a | untested | n/a |
+| 7.33.7 (5.4) | (run 8) | (run 7) | untested | pass / untested | n/a | untested | untested | n/a |
+| 8.15.9 (6.0) | (run 6) | (run 7) | untested | pass / untested | n/a | untested | install ok; wrong (pnpm 11) advice, #903 | n/a |
+| 9.15.9 | — | — | untested | (run 6) | n/a | fail #902 (workspace file) | untested | untested |
+| 10.34.5 | — | — | pass | untested / pass | pass | pass (both files read) | untested | untested |
+| 11.28.3 | — | — | untested | untested / pass | untested | fail #902 (`.npmrc`) | fail #903 | fail #904 / untested |
+| 12.8.1 | — | — | pass (vendored refuses, documented) | (run 6) | pass | fail #902 (`.npmrc`) | fail #903 (rollback / list / remove error) | fail #904 / fail #904 |
+
+Fixed on main `9c43dfc` and re-verified with real pnpm in run 23: #756 (12.8.1, peer variants of `ajv-keywords`) and #627 (9.15.9 / 12.8.1: a symlinked lock, `package.json` or workspace file makes vendored fail closed). #903 and #904 aren't regressions: release 4.0.0 behaves the same. #902 comes from the #557 fix (#818).
+
 Run 20 additions (main `045d7ec`, Linux):
 
 | pnpm (lock) | Vendored parent + vendored dep (`debug`→`ms`): `remove <parent>` / takeover → hosted / `rollback` | `remove <child>` (control) | Hosted parent + dep: remove parent / rollback | Mixed-case names (`Base64`, `JSONStream`): hosted / agent / vendored | User parent-selector / range-selector override (vendored) | Agent `symlink=false` / `hoist=false` | `list -g` |
@@ -253,14 +267,16 @@ Global mode (`-g`, v5 main `2463257`):
 3. #696 / #661 follow-ups (both fixed in run 21): `modulesDir` in the global `config.yaml` / `rc`, and that GVS and out-of-project `virtualStoreDir` transitive deps also stop attesting.
 3a. `list` under Rush (`list -g` on 11 / 12 and `list` with `sharedWorkspaceLockfile: false` done in run 20: pass).
 4. Workspace-sensitive pnpm commands under the #734 scaffold on 9.x (`pnpm link`, `publish`, `-r`).
-5. #756 variants: in global mode, and on 9.15.9 / 10.34.5 (hoisted is n/a: one shared copy). Re-check after #605 with a mock package that has peer dependencies.
+5. #756 (fixed, run 23) variants: in global mode, and on 9.15.9 / 10.34.5 with the `ajv-keywords` peer mock.
 6. #362 GVS transitive and #435 global `-g`: re-check exit codes under #555's skip semantics on 11.28.3 / 12.8.1.
 7. `package-import-method=clone` on reflink (needs CI).
 8. #556 follow-ups: merging branch lockfiles after a hosted pin, and agent `vex` on the branch.
 8a. #830 follow-ups: a three-level vendored chain, a `scan --mode vendored` re-run over the broken `remove` state, and the pnpm 7/8 workspace dialect.
 8c. #880 / #881 follow-ups: a member of a workspace whose root uses `catalogs`, and the pnpm 7/8 dialect.
 8b. #853 follow-ups: the takeover over a peer-suffixed snapshot key and over a pnpm ≤6 legacy lock, and `vendor --dry-run` (manifest-driven) parity.
-9. Re-verify the open set when fixes land: #435, #466, #492, #556, #633, #713, #714, #734, #756 (closed by #774; re-verify with a peer-dependency mock), #627 (closed by #802; re-verify), #778, #830, #831 (PR #837, pnpm gitignore matrix), #853, #854, #880 and #881.
+9. Re-verify the open set when fixes land: #435, #466, #492, #556, #633, #713, #714, #734, #778, #830, #831 (PR #837, pnpm gitignore matrix), #853, #854, #880, #881, #902, #903 and #904.
+9a. BOM follow-ups (#903 / #904): a BOM `package.json` with hosted, a BOM workspace file with vendored on 9.15.9 / 10.34.5, and Windows checkouts (needs a probe).
+9b. #902 follow-ups: `.npmrc` `registry=` mirror + `lockfile-include-tarball-url` on 10.34.5 (the restore writes the npmjs URL, not the mirror's; check whether `SOCKET_NPM_REGISTRY` is the documented answer), and the setting in the global `rc` / `config.yaml`.
 10. Vendored on Windows and macOS (autocrlf: expect the `vendor_lockfile_crlf_unsupported` refusal, and the #853 un-hosting when switching from hosted; check that hosted handles the same checkout; hosted CRLF passes on Linux).
 
 ## Known non-bugs
@@ -324,3 +340,6 @@ Global mode (`-g`, v5 main `2463257`):
 - `scan --mode vendored --dry-run` over a hosted pin previews only `would_vendor` (no `vendor_would_revert_redirect`). It's not pnpm-specific, so it isn't filed here (run 21).
 - Fixture note: global (`-g`) cells must put the pnpm under test first on `PATH`. The sandbox ships pnpm 10.28.0 in `/opt/node22/bin`, and the CLI reads the global root from whichever `pnpm` it finds (run 22).
 - pnpm 9 ignores `sharedWorkspaceLockfile: false` in `pnpm-workspace.yaml` (only `.npmrc` `shared-workspace-lockfile=false` works there), so a 9.x member then has no lock of its own and the #590 refusal is correct.
+- Fixture note (run 23): pnpm 1.x needs Node 10 (it crashes in graceful-fs on Node 22). Its layout is `node_modules/.registry.npmjs.org/<name>/<ver>/node_modules/<name>`, its lock is `shrinkwrap.yaml`, and it takes `--frozen-shrinkwrap` and `--store`.
+- Vendored on a pnpm 1/2 `shrinkwrap.yaml` project fails closed with `vendor_lockfile_missing`, whose message lists `pnpm-lock.yaml` but not `shrinkwrap.yaml` (cosmetic; vendoring pnpm ≤ 6 is refused as documented).
+- Fixture note (run 23): the Python mock rebuilds the patched tarball on every restart (the gzip mtime changes), so a pin's sha512 changes between mock restarts. Re-scan after restarting the mock.
