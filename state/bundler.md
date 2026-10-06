@@ -1,6 +1,6 @@
 [agent] Progress ledger for the scheduled Bundler (RubyGems) bug-hunt routine (label pm:bundler).
 
-Last updated: 2026-10-05 (run 22), main `9c43dfc` (includes #637, #621, #797, #805, #849, #731, #750, #712), latest release tag v4.0.0. Newest Bundler tested: 4.0.22.
+Last updated: 2026-10-06 (run 23), main `9c43dfc` (includes #637, #621, #797, #805, #849, #731, #750, #712), latest release tag v4.0.0. Newest Bundler tested: 4.0.22.
 
 ## Coverage matrix
 
@@ -196,6 +196,14 @@ Also on 4.0.17: BOM `Gemfile` passes; symlinked `Gemfile` / lock is refused (pas
 | Hosted `BUNDLE_GEMFILE` = project Gemfile via symlinked dir (env / `--cwd` / config); `vex` / `rollback` | fail #896 (also macos-latest `/tmp`, ubuntu-latest) | — | — | — |
 | Hosted `gem "x", "1"; gem "y"` (bare 2nd gem) | fail #826 (new shape; PR #875 passes) | — | — | — |
 
+### Run 23 (main `9c43dfc`; Linux Ruby 3.3.6; agent mode, hand-written manifest + `apply --offline`)
+
+| Cell | 4.0.22 | 2.6.9 | 2.4.22 |
+| --- | --- | --- | --- |
+| Local `path.system: true` + leftover `vendor/bundle`: `apply` / `vex` | fail #915 | fail #915 | fail #915 |
+| Env `BUNDLE_PATH__SYSTEM=true` + leftover `vendor/bundle` | fail #915 | fail #915 | fail #915 |
+| Local `path.system: true`, no leftover (control) | pass | pass | untested |
+
 ### Global mode (`-g`)
 
 | OS | Ruby / Bundler | `scan -g` report | `-g` vs project scoping | `scan -g --mode hosted` refused | `get -g` / `apply -g` | `rollback -g` byte-exact | `vex -g` | `--global-prefix <gems dir>` / `SOCKET_GLOBAL=1` | Non-writable gem dir |
@@ -218,13 +226,14 @@ Also on 4.0.17: BOM `Gemfile` passes; symlinked `Gemfile` / lock is refused (pas
 
 ## Backlog
 
-1. Re-run #681 / #729 / #749 / #751 / #775 / #826 / #896 when fixes merge (open PRs #684, #768, #776, #875). #875 head `5b9953d3` already passes every #826 shape.
-2. Run the remaining 4.0.17-only cells on 4.0.22: H→V takeover, `eval_gemfile`, `BUNDLE_DEPLOYMENT`, multi-gem hosted.
-3. Takeover over shapes hosted accepts but vendored refuses: platform gem on a no-CHECKSUMS lock, `eval_gemfile`, `install_if` / `platforms:` blocks.
-4. Windows: `x64-mingw-ucrt` platform gems in hosted and vendored modes; vendored cells and `repair` on Windows and macOS; a read-only `(R)` ACE gem dir.
-5. Global (`-g`) mode: real rvm / chruby installs on macOS.
-6. Vendored mode with a symlinked `BUNDLE_GEMFILE` (shares `classify` with #896; unverified).
-7. Bundler 1.17 hosted unwind (Ruby ≤ 3.1 probe); `rollback` / `remove` on a custom-lock project.
+1. Re-run #681 / #729 / #749 / #751 / #775 / #826 / #896 / #915 when fixes merge (open PRs #684, #768, #776, #875). #875 head `5b9953d3` already passes every #826 shape.
+2. The #915 family: the hosted stale-install guard under `path.system` (wrong copy warned?), a global-config `path.system`, and non-`"true"` bool spellings (`"1"`, `"yes"`) that Bundler's `to_bool` accepts.
+3. Run the remaining 4.0.17-only cells on 4.0.22: H→V takeover, `eval_gemfile`, multi-gem hosted.
+4. Takeover over shapes hosted accepts but vendored refuses: platform gem on a no-CHECKSUMS lock, `eval_gemfile`, `install_if` / `platforms:` blocks.
+5. Windows: `x64-mingw-ucrt` platform gems in hosted and vendored modes; vendored cells and `repair` on Windows and macOS.
+6. Global (`-g`) mode: real rvm / chruby installs on macOS.
+7. Vendored mode with a symlinked `BUNDLE_GEMFILE` (shares `classify` with #896; unverified).
+8. Bundler 1.17 hosted unwind (Ruby ≤ 3.1 probe); `rollback` / `remove` on a custom-lock project.
 
 ## Known non-bugs
 
@@ -297,3 +306,5 @@ Also on 4.0.17: BOM `Gemfile` passes; symlinked `Gemfile` / lock is refused (pas
 - Hand-rolled hosted harness: commit the project *after* the scan and before cloning the "fresh checkout"; committing before it clones the pristine Gemfile and fakes an "UNPATCHED" result (run 22 near-miss). A manifest-less `vex` needs `--patch-server-url <mock>` too, or it finds no hosted references.
 - A Gemfile reverted by hand while the lock still carries the hosted wiring: `vex` attests as long as the installed bytes are patched (verified on disk), and refuses once `bundle install` re-resolves the lock to upstream (Bundler keeps the patched installed copy, but the reference is gone). That's fail-safe, so it's not filed (run 22).
 - `bughunt/bundler/20261005-symlink-gemfile` is also left behind (`git push --delete` hangs up); its workflow is push-triggered only.
+- Agent cells need no mock API: write `.socket/manifest.json` (`files` keys `package/<rel>`, git-sha256 `beforeHash`/`afterHash`) plus `.socket/blobs/<afterHash>` by hand and run `apply --offline` (run 23). Restore a patched system gem with `gem pristine <gem> -v <ver>`.
+- A leftover populated `vendor/bundle` with **no** config while Bundler uses system gems makes agent `apply` patch the unused copy and `vex` attest. That matches the documented "`vendor/bundle` holds stores, so no `gem env` homes" heuristic and isn't filed; #915 covers only the explicit `path.system` signal (run 23).
