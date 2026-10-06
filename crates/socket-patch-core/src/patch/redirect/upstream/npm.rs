@@ -23,26 +23,108 @@ pub(super) fn by_uuid<'p>(pins: &[&'p HostedPin]) -> BTreeMap<&'p str, &'p Hoste
     pins.iter().map(|p| (p.uuid.as_str(), *p)).collect()
 }
 
-/// Resolve the dist of every `(uuid, name, version)` wanted, concurrently.
-/// A failed lookup refuses its pin.
+/// Resolve the dist of every `(uuid, name, version)` wanted from the
+/// default registry, concurrently. A failed lookup refuses its pin.
 pub(super) async fn fetch_dists(
     wanted: &BTreeSet<(String, String, String)>,
     ctx: &Ctx<'_>,
     result: &mut FormatResult,
 ) -> BTreeMap<(String, String), NpmDist> {
-    let lookups = wanted.iter().map(|(uuid, name, version)| async move {
-        (
-            uuid.clone(),
-            name.clone(),
-            version.clone(),
-            ctx.client.npm_dist(name, version).await,
-        )
+    fetch_dists_on(wanted, |_| None, ctx, result)
+        .await
+        .into_iter()
+        .map(|(key, found)| (key, found.dist))
+        .collect()
+}
+
+/// A version's `dist`, and whether it is the document of the registry the
+/// project resolves the package against (rather than the default one).
+pub(super) struct ProjectDist {
+    pub dist: NpmDist,
+    pub from_project: bool,
+}
+
+/// The registry base a project names, unless it is the default registry
+/// (npmjs, its registry.yarnpkg.com alias, or `SOCKET_NPM_REGISTRY`), whose
+/// document [`fetch_dists`] already reads.
+pub(super) fn non_default_registry(base: &str) -> Option<String> {
+    use crate::vendor::registry_fetch::npm_registry_base;
+    let base = base.trim().trim_end_matches('/');
+    let host = base
+        .strip_prefix("https://")
+        .or_else(|| base.strip_prefix("http://"))
+        .unwrap_or(base);
+    let npmjs = matches!(host, "registry.npmjs.org" | "registry.yarnpkg.com");
+    (!base.is_empty() && !npmjs && base != npm_registry_base()).then(|| base.to_string())
+}
+
+/// [`fetch_dists`], reading each version document from the registry the
+/// project resolves `name` against (`registry(name)`; `None` means the
+/// default registry), since a mirror's `dist.tarball` need not be the
+/// default registry's (#521, #908). When the project's registry can't be
+/// read (a private mirror that wants credentials the restore does not
+/// send), the default registry's document is used, as before, and
+/// `upstream_registry_fallback` says so.
+pub(super) async fn fetch_dists_on(
+    wanted: &BTreeSet<(String, String, String)>,
+    registry: impl Fn(&str) -> Option<String>,
+    ctx: &Ctx<'_>,
+    result: &mut FormatResult,
+) -> BTreeMap<(String, String), ProjectDist> {
+    let lookups = wanted.iter().map(|(uuid, name, version)| {
+        let project = registry(name).as_deref().and_then(non_default_registry);
+        async move {
+            let mut fell_back = None;
+            let found = match project {
+                Some(base) => match ctx.client.npm_dist_on(&base, name, version).await {
+                    Ok(dist) => Ok(ProjectDist {
+                        dist,
+                        from_project: true,
+                    }),
+                    Err(why) => {
+                        fell_back = Some((base, why));
+                        ctx.client
+                            .npm_dist(name, version)
+                            .await
+                            .map(|dist| ProjectDist {
+                                dist,
+                                from_project: false,
+                            })
+                    }
+                },
+                None => ctx
+                    .client
+                    .npm_dist(name, version)
+                    .await
+                    .map(|dist| ProjectDist {
+                        dist,
+                        from_project: false,
+                    }),
+            };
+            (
+                uuid.clone(),
+                name.clone(),
+                version.clone(),
+                found,
+                fell_back,
+            )
+        }
     });
     let mut out = BTreeMap::new();
-    for (uuid, name, version, dist) in futures_util::future::join_all(lookups).await {
-        match dist {
-            Ok(dist) => {
-                out.insert((name, version), dist);
+    for (uuid, name, version, found, fell_back) in futures_util::future::join_all(lookups).await {
+        match found {
+            Ok(found) => {
+                if let Some((base, why)) = fell_back {
+                    result.warnings.push((
+                        "upstream_registry_fallback",
+                        format!(
+                            "{name}@{version}: the project's registry {base} could not be read \
+                             ({why}), so the entry was restored from the default registry's \
+                             version document; check its tarball URL against {base}"
+                        ),
+                    ));
+                }
+                out.insert((name, version), found);
             }
             Err(why) => result.refuse(&uuid, format!("{name}@{version}: {why}")),
         }
@@ -608,10 +690,10 @@ async fn restore_berry(
         .iter()
         .map(|h| (h.uuid.clone(), h.name.clone(), h.version.clone()))
         .collect();
-    let dists = fetch_dists(&wanted, ctx, result).await;
     let project_registry = yarnrc
         .as_deref()
         .and_then(|text| yaml_top_level_value(text, "npmRegistryServer"));
+    let dists = fetch_dists_on(&wanted, |_| project_registry.clone(), ctx, result).await;
     let mut changed = false;
     let mut moved: Vec<String> = Vec::new();
     for Hit {
@@ -645,7 +727,7 @@ async fn restore_berry(
                 continue;
             }
         };
-        let Some(dist) = dists.get(&(name.clone(), version.clone())) else {
+        let Some(dist) = dists.get(&(name.clone(), version.clone())).map(|d| &d.dist) else {
             continue;
         };
         let resolution = format!(
