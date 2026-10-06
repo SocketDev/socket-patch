@@ -615,15 +615,14 @@ impl Discovery {
             return;
         };
         self.resolved_elsewhere(file, Some(purl.clone()));
-        let copy = UnpatchedCopy {
+        // Deduplicated once, in `finalize`: a per-push scan is quadratic
+        // over a lock with thousands of registry blocks.
+        self.unpatched_copies.push(UnpatchedCopy {
             purl: canonical_base_purl(&purl),
             file: PathBuf::from(file),
             key: key.to_string(),
             how: how.to_string(),
-        };
-        if !self.unpatched_copies.contains(&copy) {
-            self.unpatched_copies.push(copy);
-        }
+        });
     }
 
     /// Drop every ref whose OWN lock also installs an unpatched copy of the
