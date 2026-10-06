@@ -522,6 +522,9 @@ async fn hatch_vendored_to_hosted() {
     assert_vendored_to_hosted(&root, files).await;
 }
 
+/// Stages one flavor's project files; returns its wiring files.
+type StageFn = fn(&Path) -> &'static [&'static str];
+
 /// A uv PEP 723 script with its `.py.lock`; returns its wiring files.
 fn stage_script_lock(root: &Path) -> &'static [&'static str] {
     std::fs::write(
@@ -551,7 +554,7 @@ fn stage_script_lock(root: &Path) -> &'static [&'static str] {
 async fn pyproject_flavors_vendored_revendor_superseding_patch() {
     const UUID_B: &str = "5c3e1a2b-7d4f-4e6a-9b8c-1d2e3f4a5b6d";
     const PATCHED_B: &[u8] = b"# six\nVERSION = '1.16.0'\nSOCKET_PATCHED = 2\n";
-    let stages: [(&str, fn(&Path) -> &'static [&'static str]); 3] = [
+    let stages: [(&str, StageFn); 3] = [
         ("uv", stage_uv),
         ("script lock", stage_script_lock),
         ("hatch", stage_hatch),
@@ -629,6 +632,51 @@ async fn pyproject_flavors_vendored_revendor_superseding_patch() {
             "{flavor}"
         );
     }
+}
+
+/// A Hatch guard unrelated to the old wiring (here the uv installer, which
+/// Hatch reports under the same `pypi_hatch_unsupported` code) refuses the
+/// superseding patch BEFORE patch A's wiring is unwound: the project files,
+/// the ledger and patch A's artifact are left exactly as they were, and no
+/// patch B wheel is built.
+#[tokio::test]
+async fn hatch_unrelated_guard_refuses_superseding_patch_before_unwinding() {
+    const UUID_B: &str = "5c3e1a2b-7d4f-4e6a-9b8c-1d2e3f4a5b6d";
+    const PATCHED_B: &[u8] = b"# six\nVERSION = '1.16.0'\nSOCKET_PATCHED = 2\n";
+    let (_tmp, root) = project();
+    let files = stage_hatch(&root);
+    vendor_project(&root, files);
+    let wired_a: Vec<String> = files
+        .iter()
+        .map(|f| std::fs::read_to_string(root.join(f)).unwrap())
+        .collect();
+    let ledger_a = std::fs::read_to_string(root.join(".socket/vendor/state.json")).unwrap();
+
+    stage_manifest_with(&root, UUID_B, PATCHED_B);
+    let (code, env) = run_cli(
+        &root,
+        &["vendor"],
+        &[("HATCH_ENV_TYPE_VIRTUAL_UV_PATH", "/usr/bin/uv")],
+    );
+    assert_eq!(code, 1, "{env:#}");
+    let rendered = env.to_string();
+    assert!(
+        rendered.contains("pypi_hatch_unsupported") && rendered.contains("pip installer"),
+        "the installer guard is the reported refusal: {env:#}"
+    );
+    for (f, text) in files.iter().zip(&wired_a) {
+        assert_eq!(
+            &std::fs::read_to_string(root.join(f)).unwrap(),
+            text,
+            "{f} untouched"
+        );
+    }
+    assert_eq!(
+        std::fs::read_to_string(root.join(".socket/vendor/state.json")).unwrap(),
+        ledger_a
+    );
+    assert!(root.join(format!(".socket/vendor/pypi/{UUID}")).is_dir());
+    assert!(!root.join(format!(".socket/vendor/pypi/{UUID_B}")).exists());
 }
 
 /// The uv lock rewrite needs the hosted wheel's METADATA, fetched only

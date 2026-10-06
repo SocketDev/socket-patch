@@ -1384,9 +1384,9 @@ pub async fn vendor_pypi_with_pipenv_version<'a>(
     };
     let (wiring, meta) = match wired {
         Ok(pair) => pair,
-        Err((code, detail)) => {
+        Err((code, mut detail)) => {
             if let Some(snapshot) = &snapshot {
-                restore_snapshot(project_root, snapshot).await;
+                restore_snapshot(project_root, snapshot, &mut detail).await;
             }
             // A REUSED wheel is the committed artifact the live ledger entry
             // still names: never sweep it (nothing was acquired to undo).
@@ -1458,7 +1458,7 @@ async fn supersede_or_refuse(
     record: &PatchRecord,
     (code, detail): (&'static str, String),
 ) -> Result<WiringPlan, VendorOutcome> {
-    match superseded_entry(
+    let Some(prev) = superseded_entry(
         project_root,
         flavor,
         canon_name,
@@ -1467,13 +1467,21 @@ async fn supersede_or_refuse(
         code,
     )
     .await
-    {
-        Some(prev) => Ok(WiringPlan::Supersede(Box::new(Superseded {
-            prev,
-            refusal: (code, detail),
-        }))),
-        None => Err(refused(code, detail)),
+    else {
+        return Err(refused(code, detail));
+    };
+    // Hatch reports its installer and Hatch-version guards under the same
+    // code as a foreign direct reference: settle those first, before any
+    // unwind rewrites the project only for the fresh plan to refuse again.
+    if flavor == PypiFlavor::Hatch {
+        if let Err((code, detail)) = super::pypi_hatch::preflight(project_root, canon_name).await {
+            return Err(refused(code, detail));
+        }
     }
+    Ok(WiringPlan::Supersede(Box::new(Superseded {
+        prev,
+        refusal: (code, detail),
+    })))
 }
 
 /// The single ledger entry vendoring `canon_name==version` under ANOTHER
@@ -1548,18 +1556,31 @@ fn superseded_files(prev: &VendorEntry, flavor: PypiFlavor) -> Option<Vec<String
 /// Each superseded file's bytes before the unwind (`None`: absent).
 type Snapshot = Vec<(String, Option<Vec<u8>>)>;
 
-/// Put every snapshotted file back. Best effort: this runs on a failure
-/// path whose error is already being reported.
-async fn restore_snapshot(project_root: &Path, snapshot: &Snapshot) {
+/// Put every snapshotted file back, attempting each even after one fails,
+/// and append any file left unrestored to `detail`, the failure being
+/// reported. A vendor run holds these writes in its group commit, so they
+/// land together; without one, a failed write is named instead of leaving
+/// a silently half-unwound project.
+async fn restore_snapshot(project_root: &Path, snapshot: &Snapshot, detail: &mut String) {
+    let mut unrestored = Vec::new();
     for (file, bytes) in snapshot {
         let path = project_root.join(file);
-        let _ = match bytes {
+        let restored = match bytes {
             Some(bytes) => crate::utils::fs::atomic_write_bytes_preserving_mode(&path, bytes).await,
             None if crate::utils::fs::file_exists(&path).await => {
                 crate::utils::fs::remove_file(&path).await
             }
             None => Ok(()),
         };
+        if let Err(e) = restored {
+            unrestored.push(format!("{file}: {e}"));
+        }
+    }
+    if !unrestored.is_empty() {
+        detail.push_str(&format!(
+            "; could not restore {}; restore them from version control",
+            unrestored.join(", ")
+        ));
     }
 }
 
@@ -1632,13 +1653,14 @@ async fn unwire_superseded(
         residual.map(|file| format!("{file} still references {needle}"))
     };
     if let Some(why) = why {
-        restore_snapshot(project_root, &snapshot).await;
-        return Err(fail(why));
+        let mut failure = fail(why);
+        restore_snapshot(project_root, &snapshot, &mut failure.1).await;
+        return Err(failure);
     }
     match fresh_pyproject_plan(project_root, flavor, canon_name, version, uuid).await {
         Ok((plan, warnings)) => Ok((plan, snapshot, warnings)),
-        Err(failure) => {
-            restore_snapshot(project_root, &snapshot).await;
+        Err(mut failure) => {
+            restore_snapshot(project_root, &snapshot, &mut failure.1).await;
             Err(failure)
         }
     }
@@ -5925,14 +5947,7 @@ wheels = [
             let surfaces = |e: &VendorEntry| {
                 e.wiring
                     .iter()
-                    .map(|r| {
-                        (
-                            r.file.clone(),
-                            r.kind.clone(),
-                            r.action.clone(),
-                            r.original.clone(),
-                        )
-                    })
+                    .map(|r| (r.file.clone(), r.kind.clone(), r.action, r.original.clone()))
                     .collect::<Vec<_>>()
             };
             assert_eq!(
@@ -6025,6 +6040,47 @@ wheels = [
             );
             assert!(fx.root.join(&first.artifact.path).is_file(), "{flavor}");
         }
+    }
+
+    /// A snapshot file that cannot be written back is named in the failure
+    /// being reported, and the files after it are still restored.
+    #[tokio::test]
+    async fn restore_snapshot_reports_unrestored_files_and_restores_the_rest() {
+        let tmp = tempfile::tempdir().unwrap();
+        let root = tmp.path();
+        // A directory where pyproject.toml was: writing it back fails.
+        tokio::fs::create_dir(root.join("pyproject.toml"))
+            .await
+            .unwrap();
+        tokio::fs::write(root.join("uv.lock"), "wired")
+            .await
+            .unwrap();
+        tokio::fs::write(root.join("new.txt"), "created by the unwind")
+            .await
+            .unwrap();
+        let snapshot: Snapshot = vec![
+            ("pyproject.toml".into(), Some(b"original".to_vec())),
+            ("uv.lock".into(), Some(b"original lock".to_vec())),
+            ("new.txt".into(), None),
+        ];
+        let mut detail = String::from("fresh plan refused");
+        restore_snapshot(root, &snapshot, &mut detail).await;
+        assert!(
+            detail.starts_with("fresh plan refused; could not restore pyproject.toml: "),
+            "{detail}"
+        );
+        assert!(!detail.contains("uv.lock"), "{detail}");
+        assert_eq!(
+            tokio::fs::read_to_string(root.join("uv.lock"))
+                .await
+                .unwrap(),
+            "original lock"
+        );
+        assert!(!root.join("new.txt").exists());
+
+        let mut clean = String::from("refused");
+        restore_snapshot(root, &snapshot[1..].to_vec(), &mut clean).await;
+        assert_eq!(clean, "refused");
     }
 
     /// Without a ledger entry for the older uuid there is no recorded
