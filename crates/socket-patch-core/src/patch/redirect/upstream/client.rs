@@ -767,7 +767,9 @@ mod tests {
         let h1 = go_mod_h1(b"module example.com/m\n");
         assert!(h1.starts_with("h1:") && h1.ends_with('='), "{h1}");
     }
+    // The npm cache key reads `SOCKET_NPM_REGISTRY`, which serial tests set.
     #[tokio::test]
+    #[serial_test::serial]
     async fn berry_metadata_is_registry_anchored_without_repacking() {
         use base64::Engine as _;
         use sha2::Digest as _;
@@ -814,7 +816,9 @@ mod tests {
         }
     }
 
+    // The npm cache key reads `SOCKET_NPM_REGISTRY`, which serial tests set.
     #[tokio::test]
+    #[serial_test::serial]
     async fn berry_metadata_refuses_wrong_identity_integrity_and_unavailable_service() {
         use base64::Engine as _;
         use sha2::Digest as _;
