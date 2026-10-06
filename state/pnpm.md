@@ -1,6 +1,6 @@
 [agent] Progress ledger for the scheduled pnpm bug-hunt routine (label pm:pnpm).
 
-Last updated: 2026-10-06 (run 23), main `9c43dfc`, latest release 4.0.0.
+Last updated: 2026-10-06 (run 24), main `9c43dfc`, latest release 4.0.0.
 
 Method: real pnpm installs. Hosted, vendored and global agent mode run against a local Python mock of the patch API (batch, by-package, view with inline blobs, `patches/blob/<hash>`, package grant, hosted tarball, `/registry/<name>/<ver>` mirror; `ajv-keywords@3.5.2` serves as the peer-dependency package). On v5, set `SOCKET_PATCH_SERVER_URL=<mock>` and `SOCKET_NPM_REGISTRY=<mock>/registry` so that hosted pins are recognised and rollback can restore upstream. The oracle is a marker prepended to `index.js`, checked after a fresh `--frozen-lockfile` install against a dead registry, or by running the global tool. The repo's pinned matrix (`.github/workflows/pnpm-compatibility.yml`) already covers plain hosted and vendored installs on pnpm 1–12. This ledger tracks what it doesn't.
 
@@ -224,6 +224,16 @@ Run 23 additions (main `9c43dfc`, Linux):
 
 Fixed on main `9c43dfc` and re-verified with real pnpm in run 23: #756 (12.8.1, peer variants of `ajv-keywords`) and #627 (9.15.9 / 12.8.1: a symlinked lock, `package.json` or workspace file makes vendored fail closed). #903 and #904 aren't regressions: release 4.0.0 behaves the same. #902 comes from the #557 fix (#818).
 
+Run 24 additions (main `9c43dfc`, Linux; project on an `.npmrc` `registry=` mirror, `SOCKET_NPM_REGISTRY` at npmjs unless noted):
+
+| pnpm | Hosted rollback, conventional mirror | Hosted rollback / remove, CDN-style mirror (`tarball:` in lock) | Hosted rollback / remove, mirror + tarball-URL setting | Control: `SOCKET_NPM_REGISTRY` = mirror | Hosted BOM `package.json` (pin, rollback) |
+| --- | --- | --- | --- | --- | --- |
+| 9.15.9 | untested | fail #919 / untested | fail #919 (`.npmrc`) / untested | untested | untested |
+| 10.34.5 | pass, byte-exact | fail #919 / fail #919 | fail #919 (`.npmrc`) / fail #919 (workspace file) | pass | pass |
+| 12.8.1 | untested | fail #919 / untested | fail #919 (workspace file) / untested | pass | pass |
+
+#919 isn't a regression (pre-#818 the pnpm restore never wrote `tarball:`). It shares its root cause with #908 / #521, but PR #918 covers berry and vlt only.
+
 Run 20 additions (main `045d7ec`, Linux):
 
 | pnpm (lock) | Vendored parent + vendored dep (`debug`→`ms`): `remove <parent>` / takeover → hosted / `rollback` | `remove <child>` (control) | Hosted parent + dep: remove parent / rollback | Mixed-case names (`Base64`, `JSONStream`): hosted / agent / vendored | User parent-selector / range-selector override (vendored) | Agent `symlink=false` / `hoist=false` | `list -g` |
@@ -274,9 +284,10 @@ Global mode (`-g`, v5 main `2463257`):
 8a. #830 follow-ups: a three-level vendored chain, a `scan --mode vendored` re-run over the broken `remove` state, and the pnpm 7/8 workspace dialect.
 8c. #880 / #881 follow-ups: a member of a workspace whose root uses `catalogs`, and the pnpm 7/8 dialect.
 8b. #853 follow-ups: the takeover over a peer-suffixed snapshot key and over a pnpm ≤6 legacy lock, and `vendor --dry-run` (manifest-driven) parity.
-9. Re-verify the open set when fixes land: #435, #466, #492, #556, #633, #713, #714, #734, #778, #830, #831 (PR #837, pnpm gitignore matrix), #853, #854, #880, #881, #902, #903 and #904.
+9. Re-verify the open set when fixes land: #435, #466, #492, #556, #633, #713, #714, #734, #778, #830, #831 (PR #837, pnpm gitignore matrix), #853, #854, #880, #881, #902, #903, #904 and #919.
 9a. BOM follow-ups (#903 / #904): a BOM `package.json` with hosted, a BOM workspace file with vendored on 9.15.9 / 10.34.5, and Windows checkouts (needs a probe).
-9b. #902 follow-ups: `.npmrc` `registry=` mirror + `lockfile-include-tarball-url` on 10.34.5 (the restore writes the npmjs URL, not the mirror's; check whether `SOCKET_NPM_REGISTRY` is the documented answer), and the setting in the global `rc` / `config.yaml`.
+9b. #902 follow-ups: the setting in the global `rc` / `config.yaml`. (Mirror + tarball URLs became #919 in run 24.)
+9c. #919 follow-ups: scoped `@scope:registry=` mirrors, the hosted → vendored takeover + `vendor --revert` on a mirror, pnpm 7/8 lock dialects, and re-verification once PR #918 (or a successor) covers `restore_pnpm_locks`.
 10. Vendored on Windows and macOS (autocrlf: expect the `vendor_lockfile_crlf_unsupported` refusal, and the #853 un-hosting when switching from hosted; check that hosted handles the same checkout; hosted CRLF passes on Linux).
 
 ## Known non-bugs
@@ -342,4 +353,5 @@ Global mode (`-g`, v5 main `2463257`):
 - pnpm 9 ignores `sharedWorkspaceLockfile: false` in `pnpm-workspace.yaml` (only `.npmrc` `shared-workspace-lockfile=false` works there), so a 9.x member then has no lock of its own and the #590 refusal is correct.
 - Fixture note (run 23): pnpm 1.x needs Node 10 (it crashes in graceful-fs on Node 22). Its layout is `node_modules/.registry.npmjs.org/<name>/<ver>/node_modules/<name>`, its lock is `shrinkwrap.yaml`, and it takes `--frozen-shrinkwrap` and `--store`.
 - Vendored on a pnpm 1/2 `shrinkwrap.yaml` project fails closed with `vendor_lockfile_missing`, whose message lists `pnpm-lock.yaml` but not `shrinkwrap.yaml` (cosmetic; vendoring pnpm ≤ 6 is refused as documented).
+- Fixture note (run 24): pnpm caches registry metadata per host in `~/.cache/pnpm/metadata/<host>+<port>`. Give each mirror cell its own `XDG_CACHE_HOME`, or a mirror that changes its `dist.tarball` style serves stale URLs. For fresh-install checks, copy the working tree; a git clone takes the committed lock.
 - Fixture note (run 23): the Python mock rebuilds the patched tarball on every restart (the gzip mtime changes), so a pin's sha512 changes between mock restarts. Re-scan after restarting the mock.
