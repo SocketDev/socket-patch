@@ -69,11 +69,6 @@ pub async fn refusal(view: &ProjectView<'_>, candidates: &[Candidate]) -> Option
         }
     }
     if candidates.iter().any(|c| c.dep.ecosystem == "npm") {
-        if !has_own_npm_family_lock(root) {
-            if let Some(refusal) = package_json_workspace_refusal(root).await {
-                return Some(refusal);
-            }
-        }
         if let Some(lock) = pnpm_lock_elsewhere(root).await {
             let dir = lock.parent().unwrap_or(&lock);
             return Some(Refusal {
@@ -87,6 +82,11 @@ pub async fn refusal(view: &ProjectView<'_>, candidates: &[Candidate]) -> Option
                     dir.display()
                 ),
             });
+        }
+        if !has_own_npm_family_lock(root) {
+            if let Some(refusal) = package_json_workspace_refusal(root).await {
+                return Some(refusal);
+            }
         }
     }
     None
@@ -174,14 +174,18 @@ fn has_own_npm_family_lock(root: &Path) -> bool {
         || root.join("rush.json").exists()
 }
 
-/// Locks an npm, yarn or Bun workspace root installs its members from.
-/// (vlt declares its workspaces in `vlt.json`, not here.)
-const WORKSPACE_ROOT_LOCKS: [&str; 5] = [
+/// npm-family locks a `workspaces` root can install its members from. Any
+/// of them at a matching root governs the member from outside its
+/// directory (a pnpm root without `pnpm-workspace.yaml` included).
+const WORKSPACE_ROOT_LOCKS: [&str; 8] = [
     "package-lock.json",
     "npm-shrinkwrap.json",
     "yarn.lock",
     "bun.lock",
     "bun.lockb",
+    PNPM_LOCK,
+    "shrinkwrap.yaml",
+    VLT_LOCK,
 ];
 
 /// #884: the project directory is a member of an npm, yarn (classic or
@@ -193,9 +197,10 @@ const WORKSPACE_ROOT_LOCKS: [&str; 5] = [
 /// The nearest ancestor whose `workspaces` patterns match the member is
 /// its workspace root, as npm and yarn resolve it. A matching root with no
 /// lock may itself be a member of an outer workspace (yarn berry's nested
-/// worktrees), so the walk goes on with that root as the member; a chain
-/// that ends without a lock (never installed), or at a root holding some
-/// other npm-family lock (pnpm, vlt, Rush), refuses nothing here.
+/// worktrees), so the walk goes on with that root as the member and
+/// refuses at the first root that holds a lock; a chain that ends without
+/// one (never installed), or at a Rush root, refuses nothing. Runs after
+/// the pnpm check, which names a pnpm workspace's root more precisely.
 async fn package_json_workspace_refusal(root: &Path) -> Option<Refusal> {
     let canonical = tokio::fs::canonicalize(root)
         .await
@@ -224,10 +229,9 @@ async fn package_json_workspace_refusal(root: &Path) -> Option<Refusal> {
             .filter(|name| ancestor.join(name).is_file())
             .collect();
         if locks.is_empty() {
-            // A root that holds another npm-family lock (pnpm, vlt, Rush)
-            // governs the member itself: the pnpm check, or the rewriters
-            // run from there, own it.
-            if has_own_npm_family_lock(ancestor) {
+            // Rush keeps its locks under common/config: the rewriters own
+            // a run from the Rush root.
+            if ancestor.join("rush.json").exists() {
                 return None;
             }
             member = ancestor;
@@ -730,8 +734,8 @@ mod tests {
     }
 
     /// Bugbot on #901: a pnpm workspace nested in an outer yarn workspace
-    /// is the member's lock root; the walk stops there and the pnpm check
-    /// names it, not the outer yarn root.
+    /// is the member's lock root; the pnpm check names it, not the outer
+    /// yarn root.
     #[tokio::test]
     async fn nested_pnpm_root_stops_the_package_json_walk() {
         let tmp = tempfile::tempdir().unwrap();
@@ -758,10 +762,27 @@ mod tests {
         );
         write(tmp.path(), "packages/inner/pkgs/a/package.json", "{}");
         let member = tmp.path().join("packages/inner/pkgs/a");
-        assert_eq!(package_json_workspace_refusal(&member).await, None);
         assert_eq!(
             code(&member, "npm").await.as_deref(),
             Some(PNPM_LOCKFILE_ELSEWHERE)
+        );
+
+        // Bugbot on #901: a pnpm lock at the inner root with no
+        // `pnpm-workspace.yaml` still fails closed, naming the inner root
+        // (the nearest lock), not the outer yarn root.
+        std::fs::remove_file(tmp.path().join("packages/inner/pnpm-workspace.yaml")).unwrap();
+        let refusal = refusal(&ProjectView::Disk(&member), &[candidate("npm")])
+            .await
+            .expect("inner lock root refused");
+        assert_eq!(refusal.code, WORKSPACE_LOCKFILE_ELSEWHERE);
+        let inner = std::fs::canonicalize(tmp.path().join("packages/inner")).unwrap();
+        assert!(
+            refusal
+                .message
+                .contains(&format!("run socket-patch from {}", inner.display()))
+                && refusal.message.contains(PNPM_LOCK),
+            "{}",
+            refusal.message
         );
     }
 
