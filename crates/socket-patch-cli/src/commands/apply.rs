@@ -1006,10 +1006,11 @@ impl ApplyRunReport {
     }
 }
 
-/// The per-patch failures of a finished apply loop: every failed result
-/// (one per package, the first error wins) and, when they fail the run,
+/// The per-patch failures of a failed apply loop: every failed result (one
+/// per package, the first error wins). With none, what failed the run is
 /// the in-scope manifest purls with no installed package that the
-/// project's lockfiles do not resolve either.
+/// project's lockfiles do not resolve either; beside a failed result those
+/// are only the "no matching installed package" warning, never a failure.
 fn collect_apply_failures(
     results: &[ApplyResult],
     unmatched: &[String],
@@ -1028,6 +1029,9 @@ fn collect_apply_failures(
                 .clone()
                 .unwrap_or_else(|| "unknown error".to_string()),
         });
+    }
+    if !failures.is_empty() {
+        return failures;
     }
     for purl in unresolved_purls(unmatched, lockfile_only) {
         failures.push(ApplyFailure {
@@ -4195,5 +4199,70 @@ mod tests {
             panic!("unexpected_gradle_bytes must not wedge on a FIFO leaf");
         }
         assert_eq!(result.unwrap(), None);
+    }
+
+    // --- collect_apply_failures (#424) -------------------------------------
+
+    fn failed_result(purl: &str, error: Option<&str>) -> ApplyResult {
+        ApplyResult {
+            package_key: purl.to_string(),
+            package_path: "/tmp/node_modules/x".to_string(),
+            success: false,
+            files_verified: Vec::new(),
+            files_patched: Vec::new(),
+            applied_via: HashMap::new(),
+            error: error.map(str::to_string),
+            sidecar: None,
+        }
+    }
+
+    #[test]
+    fn collect_apply_failures_reports_each_failed_package_once() {
+        let results = vec![
+            failed_result("pkg:npm/a@1.0.0", Some("Permission denied (os error 13)")),
+            failed_result("pkg:npm/a@1.0.0", Some("second copy")),
+            failed_result("pkg:npm/b@1.0.0", None),
+            sample_applied(VerifyStatus::Ready),
+        ];
+        let failures = collect_apply_failures(&results, &[], &HashSet::new());
+        assert_eq!(
+            failures,
+            vec![
+                ApplyFailure {
+                    purl: "pkg:npm/a@1.0.0".to_string(),
+                    code: "apply_failed".to_string(),
+                    error: "Permission denied (os error 13)".to_string(),
+                },
+                ApplyFailure {
+                    purl: "pkg:npm/b@1.0.0".to_string(),
+                    code: "apply_failed".to_string(),
+                    error: "unknown error".to_string(),
+                },
+            ]
+        );
+    }
+
+    #[test]
+    fn collect_apply_failures_names_unresolved_purls_only_when_nothing_else_failed() {
+        let unmatched = vec![
+            "pkg:npm/gone@1.0.0".to_string(),
+            "pkg:npm/opt@1.0.0".to_string(),
+        ];
+        let lockfile_only = HashSet::from(["pkg:npm/opt@1.0.0".to_string()]);
+        let failures = collect_apply_failures(&[], &unmatched, &lockfile_only);
+        assert_eq!(
+            failures,
+            vec![ApplyFailure {
+                purl: "pkg:npm/gone@1.0.0".to_string(),
+                code: "package_not_installed".to_string(),
+                error: "No installed package matches this PURL".to_string(),
+            }],
+            "a lockfile-resolved purl never fails the run (#403)"
+        );
+        // Beside a real failure, an uninstalled patch is only a warning.
+        let results = vec![failed_result("pkg:npm/a@1.0.0", Some("boom"))];
+        let failures = collect_apply_failures(&results, &unmatched, &lockfile_only);
+        assert_eq!(failures.len(), 1, "{failures:?}");
+        assert_eq!(failures[0].purl, "pkg:npm/a@1.0.0");
     }
 }
