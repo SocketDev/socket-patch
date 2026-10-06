@@ -131,6 +131,15 @@ struct TakeoverUndo {
 }
 
 impl TakeoverUndo {
+    /// The purl is not vendored: roll the restore back in `group`'s
+    /// overlay, so the hosted pin stays and nothing of the restore is
+    /// reported.
+    fn abandon(self, group: Option<&GroupCommit>) {
+        if let (Some(savepoint), Some(group)) = (self.savepoint, group) {
+            group.rollback_to(savepoint);
+        }
+    }
+
     /// The restore stands: record its advisories and queue the vlt heal.
     fn settle(
         self,
@@ -2790,6 +2799,11 @@ pub(crate) async fn vendor_records_reusing(
                     .next()
                     .or_else(|| restore.flush_error.clone());
                 if let Some(detail) = refusal {
+                    // A flush that failed partway may have staged some of
+                    // the restore: put the hosted wiring back.
+                    if let (Some(savepoint), Some(group)) = (savepoint, group.as_ref()) {
+                        group.rollback_to(savepoint);
+                    }
                     has_errors = true;
                     env.record(
                         PatchEvent::new(PatchAction::Failed, candidate.clone()).with_error(
@@ -2943,6 +2957,9 @@ pub(crate) async fn vendor_records_reusing(
                                     .with_error("vendor_redownload_failed", detail.clone()),
                             );
                             report_vendor_failure(common, candidate, &detail);
+                            if let Some(undo) = takeover_undo.take() {
+                                undo.abandon(group.as_ref());
+                            }
                             continue;
                         }
                     }
@@ -2972,16 +2989,17 @@ pub(crate) async fn vendor_records_reusing(
             status.finish();
             let vendored =
                 matches!(&outcome, Some(VendorOutcome::Done { result, .. }) if result.success);
-            if let Some(mut undo) = takeover_undo.take() {
+            if let Some(undo) = takeover_undo.take() {
                 // A takeover the backend did not carry through keeps the
                 // hosted pin: its restore is rolled back in the overlay, so
                 // the purl is never left un-hosted AND unvendored (#853,
                 // #944). One the backend recorded keeps the restore.
                 let recorded =
                     matches!(&outcome, Some(VendorOutcome::Done { entry, .. }) if entry.is_some());
-                match (vendored || recorded, undo.savepoint.take(), group.as_ref()) {
-                    (false, Some(savepoint), Some(group)) => group.rollback_to(savepoint),
-                    _ => undo.settle(env, common, candidate, &mut vlt_takeover_targets),
+                if vendored || recorded || undo.savepoint.is_none() || group.is_none() {
+                    undo.settle(env, common, candidate, &mut vlt_takeover_targets);
+                } else {
+                    undo.abandon(group.as_ref());
                 }
             }
 
