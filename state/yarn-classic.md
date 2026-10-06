@@ -1,6 +1,6 @@
 [agent] Progress ledger for the scheduled Yarn classic (1.x) bug-hunt routine (label pm:yarn-classic).
 
-Last updated: 2026-10-06 (run 23), main `9c43dfc`, latest release v4.0.0. Runs 5–23 added the cells in "Run 5 cells" through "Run 23 cells" below. The project-mode matrix below was measured on `f6b7fb9` (v4); cells marked "(v5)", the global matrix and the "v5 project-mode cells" list were re-run on v5.
+Last updated: 2026-10-06 (run 24), main `9c43dfc`, latest release v4.0.0. Runs 5–24 added the cells in "Run 5 cells" through "Run 24 cells" below. The project-mode matrix below was measured on `f6b7fb9` (v4); cells marked "(v5)", the global matrix and the "v5 project-mode cells" list were re-run on v5.
 
 ## Coverage matrix
 
@@ -14,6 +14,7 @@ Cells are "pass", "fail #N", "n/a", "CI" or "untested". H = hosted, V = vendored
 | Linux | 1.7.0 | CI | fail #364 (`--offline`) | pass (run 20, #363 fixed; V git-only: #857) | pass | pass (run 16) | pass (run 16) | pass | untested | pass (run 17) |
 | Linux | 1.9.4 | CI | fail #364 (`--offline`) | untested | untested | untested | untested | CI | pass (run 16) | pass (run 17) |
 | Linux | 1.10.1 | pass | fail #364 | V git-only: #857 (run 20) | pass | pass | pass (run 16, + BOM) | pass | pass | pass (+ `--install.modules-folder`, run 9) |
+| Linux | 1.10.0 / 1.19.0 / 1.19.1 / 1.22.0 (run 24) | pass (+ warm in-place, vex) | untested | untested | untested | untested | untested | pass (+ byte-exact rollback) | untested | pass |
 | Linux | 1.17.3 | pass (in-place) | fail #364 | untested | untested | untested | untested | pass (in-place) | pass (run 16) | pass (run 17) |
 | Linux | 1.22.22 | pass (v5, + hosted rollback pass) | fail #364 (v5) | pass (run 20, #363 fixed by #710; V git-only: #857; H pin + git sibling: #828) | pass | pass | pass | pass | pass | pass |
 | macOS | 1.7.0 | untested | untested | fail #363 | pass | pass | pass | pass | pass (run 18) | pass (run 18) |
@@ -159,14 +160,22 @@ Other cells that pass on Linux 1.22.22 (some also on older releases; see the ent
 - **`file:` directory copy of the patched name@version beside a registry copy (workspace member `file:../forks/left-pad`): fail #921.** H / V give no warning; lock-only `vex` (H and V) and V post-install `vex` attest `not_affected` while `b/node_modules/left-pad` stays unpatched. 1.0.2 (H) / 1.7.0 / 1.10.1 / 1.22.22. H post-install vex and agent: correct. When the `file:` block is the only copy, hosted `--json` is silent (`redirected: 0`, no warning) and V says `vendor_lock_entry_not_found` (same issue).
 - 1.3.2 / 1.5.1: H baseline + vex, A apply + vex + rollback: pass. Global `-g` report / agent / rollback on 1.1.0 / 1.3.2: pass.
 
+### Run 24 cells (Linux, `9c43dfc`)
+- **A registry block beside the pin for the same name@version, after `yarn add -W left-pad --exact`: fail #938.** A fresh frozen install installs only the unpatched registry copy. Lock-only `vex` (H/V), V post-install `vex` and `vendor --check` all pass it as patched. 1.7.0 / 1.10.1 / 1.22.22. Non-exact re-adds, `upgrade` and member ranges merge into the pinned block: pass.
+- `--package` (name / scoped / purl ± version), `--min-severity` (+ `--package`), agent `--sync` after `yarn remove`, agent `--strict` with a local edit, vendored 3-package `remove <purl>` + byte-exact rollback: pass (1.22.22).
+- Boundary releases 1.10.0 / 1.19.0 / 1.19.1 / 1.22.0, H / V / A with 3 packages incl. scoped: pass.
+- A lockfile-less yarn project (`--install.no-lockfile`): hosted `success` / `redirected: 0` with the npm-only `redirect_npm_no_lockfile` text. Naming nit, not filed (see Known non-bugs).
+
 ## Backlog
 
-1. Re-check #884 (PR #901, verified on its head in run 22) / #364 (PR #839, verified as a skip) / #831 (PR #837) once merged, plus #907 (PR #917) and #828's yarn git-sibling shape. Then #467 / #519 / #558 / #591 / #691 / #692 / #758 / #857 / #921.
-2. #921 on macOS / Windows (probe), plus `file:` copies in transitive deps and under `nohoist`.
-3. `bitbucket:` / `gitlab:` shorthands (needs a package mirrored there). The GitHub forms are done (run 22).
-4. Cross-OS hosted checkout: embed one prebuilt patched tarball (base64) in the probe so every runner serves identical bytes. Add workspaces to the cross-OS vendored probe.
-5. #758 follow-ups: a real registry package with `bundledDependencies`.
-6. **Maintainer request (global mode), what's left:** the Windows MSI install of yarn, and a read-only prefix on Windows with a non-admin user. #437 (1.0.x) is still open. macOS case-insensitive name collisions.
+1. Re-check #884 (PR #901, verified on its head in run 22) / #364 (PR #839, verified as a skip) / #831 (PR #837) / #907 (PR #917) once merged, plus #828's yarn git-sibling shape. Then #467 / #519 / #558 / #591 / #691 / #692 / #758 / #857 / #921 / #938.
+2. #938 variants: a non-workspace project with a transitive dep on the pinned range; a lock merge that brings in a separately keyed block; check whether npm / pnpm have a same-lock analogue (hand over if so).
+3. #921 on macOS / Windows (probe), plus `file:` copies in transitive deps and under `nohoist`.
+4. `bitbucket:` / `gitlab:` shorthands (needs a package mirrored there). The GitHub forms are done (run 22).
+5. Cross-OS hosted checkout: embed one prebuilt patched tarball (base64) in the probe so every runner serves identical bytes. Add workspaces to the cross-OS vendored probe.
+6. #758 follow-ups: a real registry package with `bundledDependencies`.
+7. **Maintainer request (global mode), what's left:** the Windows MSI install of yarn, and a read-only prefix on Windows with a non-admin user. #437 (1.0.x) is still open. macOS case-insensitive name collisions.
+8. Not yet covered: `--manifest-path`, `--all-releases`, `--download-mode`, `get <CVE|GHSA>` on yarn projects.
 
 ## Known non-bugs
 
@@ -244,3 +253,8 @@ Other cells that pass on Linux 1.22.22 (some also on older releases; see the ent
 - Agent-mode first-party refusal: JSON `apply.failed` is 0 while the human summary says "1 failed" (`status: partial_failure`, exit 1). Cross-ecosystem and minor; not filed.
 - Keep yarn's `--cache-folder` outside the project in harnesses, or agent mode also patches the cache copies under it.
 - `file:` **directory** deps are first-party source for link-based managers, but yarn 1 *copies* them into `node_modules`, and agent mode patches that copy. The hosted / vendored / VEX gap for that copy is #921, not a non-bug.
+- A yarn project with no lockfile (`--install.no-lockfile`) gets hosted `success` / `redirected: 0` with `redirect_npm_no_lockfile`, whose text names only npm locks. The human stderr says nothing was switched, and vendored refuses with a message listing yarn.lock. Low-severity naming nit, not filed (pnpm has its own `redirect_pnpm_no_lockfile`).
+- `--min-severity` judges severity from `vulnerabilities[].severity` in `/patch/by-package`. A mock that returns `vulnerabilities: {}` there makes every patch "unknown", so all of them are filtered. That's a harness artifact.
+- `--package pkg:npm/<name>@<version not installed>` scans nothing and exits 0 `success`. That's expected filtering.
+- After a hosted scan, `yarn add` / `yarn upgrade` / member installs with a range that matches the pinned version merge into the pinned block (pin kept). Only an exact root re-add (`yarn add -W <pkg> --exact`) writes a separate registry block (#938).
+- Run-24 mock: a 3-package variant of the run-18 mock (left-pad high, ms low, scoped `@isaacs/string-locale-compare` medium, tarballs read from a local dir). Kill the mock in its own Bash call; `pkill -f mock.py` in a command line that also contains `mock.py` kills the calling shell.
