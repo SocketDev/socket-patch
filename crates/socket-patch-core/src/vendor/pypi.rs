@@ -431,9 +431,22 @@ enum WiringPlan {
     Poetry(Box<PoetryProject>),
     Pdm(Box<PdmProject>),
     Pipenv(Box<PipenvProject>),
+    /// The uv, script-lock or Hatch wiring routes this package through an
+    /// OLDER patch uuid's vendored wheel that the ledger still records
+    /// (#742, #650): replay that entry's revert, then wire this uuid fresh
+    /// ([`unwire_superseded`]).
+    Supersede(Box<Superseded>),
     /// The lock already routes this package through THIS patch uuid's
     /// vendored wheel: no wiring — verify (or rebuild) the artifact only.
     InSync,
+}
+
+/// The older vendored entry a [`WiringPlan::Supersede`] replaces, with the
+/// flavor guard's refusal of its wiring (still the answer when the replay
+/// can't run).
+struct Superseded {
+    prev: VendorEntry,
+    refusal: (&'static str, String),
 }
 
 /// Which `VendorEntry` meta slot a flavor's wiring produced.
@@ -763,11 +776,14 @@ async fn pypi_prelude<'p>(
                     warnings.extend(project.warnings.iter().cloned());
                     WiringPlan::Uv(Box::new(project))
                 }
-                Err((code, detail)) => return Err(refused(code, detail)),
+                Err(refusal) => {
+                    supersede_or_refuse(project_root, flavor, &canon_name, version, record, refusal)
+                        .await?
+                }
             }
         }
         PypiFlavor::PythonLocks => {
-            let project = match super::pypi_lock::load_python_locks(
+            match super::pypi_lock::load_python_locks(
                 project_root,
                 &canon_name,
                 version,
@@ -775,14 +791,15 @@ async fn pypi_prelude<'p>(
             )
             .await
             {
-                Ok(project) => project,
-                Err((code, detail)) => return Err(refused(code, detail)),
-            };
-            if project.in_sync {
-                wired_pin = project.pin;
-                WiringPlan::InSync
-            } else {
-                WiringPlan::PythonLocks(project)
+                Ok(project) if project.in_sync => {
+                    wired_pin = project.pin;
+                    WiringPlan::InSync
+                }
+                Ok(project) => WiringPlan::PythonLocks(project),
+                Err(refusal) => {
+                    supersede_or_refuse(project_root, flavor, &canon_name, version, record, refusal)
+                        .await?
+                }
             }
         }
         PypiFlavor::Hatch => {
@@ -792,7 +809,10 @@ async fn pypi_prelude<'p>(
                     WiringPlan::InSync
                 }
                 Ok(project) => WiringPlan::Hatch(project),
-                Err((code, detail)) => return Err(refused(code, detail)),
+                Err(refusal) => {
+                    supersede_or_refuse(project_root, flavor, &canon_name, version, record, refusal)
+                        .await?
+                }
             }
         }
         PypiFlavor::Requirements => {
@@ -1219,6 +1239,43 @@ pub async fn vendor_pypi_with_pipenv_version<'a>(
 
     // Wiring LAST. On failure the wheel artifact is swept back out so a
     // failed vendor leaves no committed residue.
+    //
+    // A superseded older uuid's wiring is unwound first (#742, #650); every
+    // file it touched is snapshotted, and put back if anything below fails.
+    let mut snapshot: Option<Snapshot> = None;
+    let plan = match plan {
+        WiringPlan::Supersede(superseded) => {
+            match unwire_superseded(
+                project_root,
+                flavor,
+                &superseded,
+                &canon_name,
+                version,
+                &record.uuid,
+            )
+            .await
+            {
+                Ok((fresh, snap, fresh_warnings)) => {
+                    warnings.extend(fresh_warnings);
+                    snapshot = Some(snap);
+                    fresh
+                }
+                // Nothing is left wired: sweep the new wheel back out, as
+                // a wiring failure below does.
+                Err((code, detail)) => {
+                    if !reused {
+                        let _ = tokio::fs::remove_dir_all(project_root.join(&uuid_dir_rel)).await;
+                        prune_empty_vendor_levels(&project_root.join(&uuid_dir_rel)).await;
+                    }
+                    let mut result = result;
+                    result.success = false;
+                    result.error = Some(format!("{code}: {detail}"));
+                    return done(result, None, warnings);
+                }
+            }
+        }
+        plan => plan,
+    };
     let wired: Result<(Vec<_>, MetaSlot), (&'static str, String)> = match plan {
         WiringPlan::Uv(project) => wire_uv(
             &project,
@@ -1322,10 +1379,15 @@ pub async fn vendor_pypi_with_pipenv_version<'a>(
         .map(|(wiring, meta)| (wiring, MetaSlot::Pipenv(meta))),
         // Returned right after the wheel build above.
         WiringPlan::InSync => unreachable!("in-sync rebuilds never reach wiring"),
+        // Replaced by its fresh plan just above.
+        WiringPlan::Supersede(_) => unreachable!("superseded wiring is unwound before wiring"),
     };
     let (wiring, meta) = match wired {
         Ok(pair) => pair,
         Err((code, detail)) => {
+            if let Some(snapshot) = &snapshot {
+                restore_snapshot(project_root, snapshot).await;
+            }
             // A REUSED wheel is the committed artifact the live ledger entry
             // still names: never sweep it (nothing was acquired to undo).
             if !reused {
@@ -1371,6 +1433,264 @@ pub async fn vendor_pypi_with_pipenv_version<'a>(
         MetaSlot::None => {}
     }
     done(result, Some(entry), warnings)
+}
+
+/// The flavor-guard refusals that name socket-patch's own wiring at another
+/// patch uuid of the release (alongside user sources the same codes cover):
+/// uv's `[tool.uv.sources]` path, a script lock / pylock `path` source, and
+/// Hatch's `{root:uri}` direct reference.
+const SUPERSEDABLE_REFUSALS: [&str; 3] = [
+    "pypi_uv_source_already_exists",
+    "pypi_lock_source_already_exists",
+    "pypi_hatch_unsupported",
+];
+
+/// A pyproject-family flavor guard refused the wiring it found. When that
+/// wiring is socket-patch's own, for an OLDER patch uuid of this release
+/// that the ledger still records, it is a superseding patch to re-vendor
+/// (#742, #650) — the same promise the requirements flavor keeps (#765).
+/// Otherwise the refusal stands.
+async fn supersede_or_refuse(
+    project_root: &Path,
+    flavor: PypiFlavor,
+    canon_name: &str,
+    version: &str,
+    record: &PatchRecord,
+    (code, detail): (&'static str, String),
+) -> Result<WiringPlan, VendorOutcome> {
+    match superseded_entry(
+        project_root,
+        flavor,
+        canon_name,
+        version,
+        &record.uuid,
+        code,
+    )
+    .await
+    {
+        Some(prev) => Ok(WiringPlan::Supersede(Box::new(Superseded {
+            prev,
+            refusal: (code, detail),
+        }))),
+        None => Err(refused(code, detail)),
+    }
+}
+
+/// The single ledger entry vendoring `canon_name==version` under ANOTHER
+/// patch uuid with this flavor, whose wiring the project still carries.
+/// `None` (keep refusing) without one: with no recorded pre-vendor
+/// originals a re-wire could never be reverted.
+async fn superseded_entry(
+    project_root: &Path,
+    flavor: PypiFlavor,
+    canon_name: &str,
+    version: &str,
+    uuid: &str,
+    code: &str,
+) -> Option<VendorEntry> {
+    if !SUPERSEDABLE_REFUSALS.contains(&code) {
+        return None;
+    }
+    let state = super::state::load_state_shared(project_root).await.ok()?;
+    let mut hits = state.entries.values().filter(|e| {
+        e.ecosystem == "pypi"
+            && e.uuid != uuid
+            && e.flavor.as_deref() == Some(flavor.as_str())
+            && !e.wiring.is_empty()
+            && vendor_uuid_dir_rel("pypi", &e.uuid).is_some()
+            && parse_pypi_purl(strip_purl_qualifiers(&e.base_purl))
+                .is_some_and(|(n, v)| canonicalize_pypi_name(&n) == canon_name && v == version)
+    });
+    let prev = hits.next()?.clone();
+    if hits.next().is_some() {
+        return None;
+    }
+    let files = superseded_files(&prev, flavor)?;
+    let needle = format!(".socket/vendor/pypi/{}/", prev.uuid);
+    for file in &files {
+        if read_regular_to_string(&project_root.join(file))
+            .await
+            .is_ok_and(|text| text.contains(&needle))
+        {
+            return Some(prev);
+        }
+    }
+    None
+}
+
+/// Every project file a superseded entry's revert may write: the files its
+/// wiring records plus the flavor's own pair. `None` when a recorded path
+/// (from the committed, tamper-able ledger) is not a plain project-relative
+/// path outside `.socket/`.
+fn superseded_files(prev: &VendorEntry, flavor: PypiFlavor) -> Option<Vec<String>> {
+    use std::path::Component;
+    let fixed: &[&str] = match flavor {
+        PypiFlavor::UvProject => &["pyproject.toml", "uv.lock"],
+        PypiFlavor::Hatch => &["pyproject.toml", "hatch.toml"],
+        _ => &[],
+    };
+    let mut files: Vec<String> = fixed.iter().map(|f| f.to_string()).collect();
+    for rec in &prev.wiring {
+        let plain = Path::new(&rec.file).components().all(|c| match c {
+            Component::Normal(part) => part != SOCKET_DIR,
+            _ => false,
+        });
+        if rec.file.is_empty() || !plain {
+            return None;
+        }
+        if !files.contains(&rec.file) {
+            files.push(rec.file.clone());
+        }
+    }
+    Some(files)
+}
+
+/// Each superseded file's bytes before the unwind (`None`: absent).
+type Snapshot = Vec<(String, Option<Vec<u8>>)>;
+
+/// Put every snapshotted file back. Best effort: this runs on a failure
+/// path whose error is already being reported.
+async fn restore_snapshot(project_root: &Path, snapshot: &Snapshot) {
+    for (file, bytes) in snapshot {
+        let path = project_root.join(file);
+        let _ = match bytes {
+            Some(bytes) => crate::utils::fs::atomic_write_bytes_preserving_mode(&path, bytes).await,
+            None if crate::utils::fs::file_exists(&path).await => {
+                crate::utils::fs::remove_file(&path).await
+            }
+            None => Ok(()),
+        };
+    }
+}
+
+/// Unwind a superseded older uuid's wiring (#742, #650) and plan this uuid
+/// fresh over the restored pre-vendor files, so the new entry records the
+/// user's real originals and `vendor --revert` still restores them. The
+/// older entry's own revert does the unwind (its artifact is kept; the
+/// caller sweeps it once the new ledger entry lands). It must restore every
+/// recorded fragment and leave no reference to the old uuid dir; otherwise,
+/// or when the restored files refuse a fresh wiring, every file is put back
+/// and the run fails as it did before.
+async fn unwire_superseded(
+    project_root: &Path,
+    flavor: PypiFlavor,
+    superseded: &Superseded,
+    canon_name: &str,
+    version: &str,
+    uuid: &str,
+) -> Result<(WiringPlan, Snapshot, Vec<VendorWarning>), (&'static str, String)> {
+    let Superseded { prev, refusal } = superseded;
+    let fail = |why: String| {
+        (
+            refusal.0,
+            format!(
+                "{} (re-vendoring over patch {}'s wiring failed: {why})",
+                refusal.1, prev.uuid
+            ),
+        )
+    };
+    let files = superseded_files(prev, flavor).ok_or_else(|| fail("unsafe wiring path".into()))?;
+    let mut snapshot: Snapshot = Vec::new();
+    for file in files {
+        let bytes = match crate::utils::fs::read_regular_to_bytes(&project_root.join(&file)).await {
+            Ok(bytes) => Some(bytes),
+            Err(e) if e.kind() == std::io::ErrorKind::NotFound => None,
+            Err(e) => return Err(fail(format!("cannot read {file}: {e}"))),
+        };
+        snapshot.push((file, bytes));
+    }
+    let reverted = revert_pypi_opts(
+        prev,
+        project_root,
+        RevertOpts {
+            dry_run: false,
+            keep_artifact: true,
+        },
+    )
+    .await;
+    let needle = format!(".socket/vendor/pypi/{}/", prev.uuid);
+    let mut residual = None;
+    for (file, _) in &snapshot {
+        if read_regular_to_string(&project_root.join(file))
+            .await
+            .is_ok_and(|text| text.contains(&needle))
+        {
+            residual = Some(file.clone());
+            break;
+        }
+    }
+    let why = if !reverted.success {
+        Some(
+            reverted
+                .error
+                .clone()
+                .unwrap_or_else(|| "revert failed".into()),
+        )
+    } else if reverted.drift_skipped() {
+        Some("its wiring changed since vendoring".into())
+    } else {
+        residual.map(|file| format!("{file} still references {needle}"))
+    };
+    if let Some(why) = why {
+        restore_snapshot(project_root, &snapshot).await;
+        return Err(fail(why));
+    }
+    match fresh_pyproject_plan(project_root, flavor, canon_name, version, uuid).await {
+        Ok((plan, warnings)) => Ok((plan, snapshot, warnings)),
+        Err(failure) => {
+            restore_snapshot(project_root, &snapshot).await;
+            Err(failure)
+        }
+    }
+}
+
+/// The fresh wiring plan of a pyproject-family flavor, re-run over the
+/// pre-vendor files [`unwire_superseded`] restored.
+async fn fresh_pyproject_plan(
+    project_root: &Path,
+    flavor: PypiFlavor,
+    canon_name: &str,
+    version: &str,
+    uuid: &str,
+) -> Result<(WiringPlan, Vec<VendorWarning>), (&'static str, String)> {
+    let not_fresh = |code: &'static str| {
+        Err((
+            code,
+            format!("{canon_name} is still wired after reverting the superseded patch"),
+        ))
+    };
+    match flavor {
+        PypiFlavor::UvProject => {
+            let project = load_uv_project(project_root).await?;
+            match check_target_guards(&project, canon_name, uuid)? {
+                UvTarget::Fresh => {
+                    let warnings = project.warnings.clone();
+                    Ok((WiringPlan::Uv(Box::new(project)), warnings))
+                }
+                UvTarget::InSync => not_fresh("pypi_uv_source_already_exists"),
+            }
+        }
+        PypiFlavor::PythonLocks => {
+            let project =
+                super::pypi_lock::load_python_locks(project_root, canon_name, version, uuid)
+                    .await?;
+            if project.in_sync {
+                return not_fresh("pypi_lock_source_already_exists");
+            }
+            Ok((WiringPlan::PythonLocks(project), Vec::new()))
+        }
+        PypiFlavor::Hatch => {
+            let project = super::pypi_hatch::load(project_root, canon_name, version, uuid).await?;
+            if project.in_sync {
+                return not_fresh("pypi_hatch_unsupported");
+            }
+            Ok((WiringPlan::Hatch(project), Vec::new()))
+        }
+        other => Err((
+            "pypi_vendor_flavor_mismatch",
+            format!("{} wiring cannot supersede a patch", other.as_str()),
+        )),
+    }
 }
 
 /// Revert one pypi vendor entry: reverse the wiring per flavor, then remove
@@ -5526,6 +5846,222 @@ wheels = [
             .root
             .join(format!(".socket/vendor/pypi/{UUID2}"))
             .exists());
+    }
+
+    const SUPERSEDING_UUID: &str = "0a1b2c3d-4e5f-4a6b-8c7d-9e0f1a2b3c4d";
+    const SCRIPT_PY: &str = "# /// script\n# requires-python = \">=3.9\"\n# dependencies = [\"six==1.16.0\"]\n# ///\nprint('preserved')\n";
+    const SCRIPT_LOCK: &str = "version = 1\nrevision = 3\nrequires-python = \">=3.9\"\n\n[manifest]\nrequirements = [{name = \"six\", specifier = \"==1.16.0\"}]\n\n[[package]]\nname = \"six\"\nversion = \"1.16.0\"\nsource = {registry = \"https://pypi.org/simple\"}\nwheels = [{url = \"https://files.pythonhosted.org/six.whl\", hash = \"sha256:upstream\"}]\n";
+    const HATCH_PROJECT: &str = "[build-system]\nrequires = [\"hatchling\"]\nbuild-backend = \"hatchling.build\"\n\n[project]\nname = \"proj\"\nversion = \"0.1.0\"\ndependencies = [\"six==1.16.0\"]\n";
+
+    /// The pyproject-family flavors #742 (uv project, PEP 723 script lock)
+    /// and #650 (Hatch) cover, each with the files it wires.
+    fn superseding_flavors() -> Vec<(&'static str, Vec<(&'static str, &'static str)>)> {
+        vec![
+            (
+                "uv",
+                vec![
+                    ("pyproject.toml", UV_PYPROJECT),
+                    ("uv.lock", UV_LOCK_REGISTRY),
+                ],
+            ),
+            (
+                "python-lock",
+                vec![("example.py", SCRIPT_PY), ("example.py.lock", SCRIPT_LOCK)],
+            ),
+            ("hatch", vec![("pyproject.toml", HATCH_PROJECT)]),
+        ]
+    }
+
+    async fn vendor_six_as(
+        fx: &E2eFixture,
+        sources: &PatchSources<'_>,
+        uuid: &str,
+    ) -> VendorOutcome {
+        let mut record = fx.record.clone();
+        record.uuid = uuid.to_string();
+        crate::vendor::test_support::vendor_pypi(
+            "pkg:pypi/six@1.16.0",
+            &fx.site_packages,
+            &fx.root,
+            &record,
+            sources,
+            "2026-06-09T00:00:00Z",
+            false,
+            false,
+            None,
+        )
+        .await
+    }
+
+    /// #742 / #650: a uv project, a uv script lock and a Hatch project already
+    /// vendored under an EARLIER patch uuid re-vendor to the superseding uuid
+    /// (the CLI contract's "re-vendored automatically"), instead of refusing
+    /// socket-patch's own wiring as a user source. The new entry records the
+    /// user's PRE-VENDOR originals, so `vendor --revert` of the new entry
+    /// restores every file byte for byte.
+    #[tokio::test]
+    async fn pyproject_flavors_revendor_to_a_superseding_uuid() {
+        for (flavor, files) in superseding_flavors() {
+            let fx = e2e_fixture().await;
+            swap_to_lock_flavor(&fx, &files).await;
+            let sources = PatchSources::blobs_only(&fx.blobs);
+            let VendorOutcome::Done { result, entry, .. } = vendor_six(&fx, &sources, None).await
+            else {
+                panic!("{flavor}: first vendor must be Done");
+            };
+            assert!(result.success, "{flavor}: {:?}", result.error);
+            let first = entry.expect("entry on success");
+            assert_eq!(first.flavor.as_deref(), Some(flavor));
+            save_ledger_entry(&fx.root, &first).await;
+
+            let outcome = vendor_six_as(&fx, &sources, SUPERSEDING_UUID).await;
+            let VendorOutcome::Done { result, entry, .. } = outcome else {
+                panic!("{flavor}: superseding uuid must re-vendor, got {outcome:?}");
+            };
+            assert!(result.success, "{flavor}: {:?}", result.error);
+            let second = entry.expect("entry on success");
+            assert_eq!(second.uuid, SUPERSEDING_UUID, "{flavor}");
+            assert_eq!(second.flavor.as_deref(), Some(flavor));
+            let surfaces = |e: &VendorEntry| {
+                e.wiring
+                    .iter()
+                    .map(|r| {
+                        (
+                            r.file.clone(),
+                            r.kind.clone(),
+                            r.action.clone(),
+                            r.original.clone(),
+                        )
+                    })
+                    .collect::<Vec<_>>()
+            };
+            assert_eq!(
+                surfaces(&first),
+                surfaces(&second),
+                "{flavor}: the new entry records the pre-vendor originals"
+            );
+            let mut wired = String::new();
+            for (name, _) in &files {
+                let text = tokio::fs::read_to_string(fx.root.join(name)).await.unwrap();
+                assert!(
+                    !text.contains(UUID),
+                    "{flavor}: {name} kept the old uuid:\n{text}"
+                );
+                wired.push_str(&text);
+            }
+            assert!(wired.contains(SUPERSEDING_UUID), "{flavor}:\n{wired}");
+            assert!(fx.root.join(&second.artifact.path).is_file(), "{flavor}");
+            assert!(second.artifact.path.contains(SUPERSEDING_UUID), "{flavor}");
+
+            save_ledger_entry(&fx.root, &second).await;
+            let reverted = revert_pypi(&second, &fx.root, false).await;
+            assert!(reverted.success, "{flavor}: {:?}", reverted.error);
+            assert!(
+                !reverted.drift_skipped(),
+                "{flavor}: {:?}",
+                reverted.warnings
+            );
+            for (name, text) in &files {
+                assert_eq!(
+                    &tokio::fs::read_to_string(fx.root.join(name)).await.unwrap(),
+                    text,
+                    "{flavor}: {name} restored"
+                );
+            }
+        }
+    }
+
+    /// #742 / #650: the re-vendor replays only the wiring the older entry's
+    /// ledger recorded. When that wiring was hand-edited since vendoring, its
+    /// revert can't restore the pre-vendor originals, so the re-vendor still
+    /// refuses: every wired file stays byte-identical and no new uuid dir is
+    /// left behind.
+    #[tokio::test]
+    async fn pyproject_flavors_superseding_uuid_with_drifted_wiring_refuses() {
+        for (flavor, files) in superseding_flavors() {
+            let fx = e2e_fixture().await;
+            swap_to_lock_flavor(&fx, &files).await;
+            let sources = PatchSources::blobs_only(&fx.blobs);
+            let VendorOutcome::Done { result, entry, .. } = vendor_six(&fx, &sources, None).await
+            else {
+                panic!("{flavor}: first vendor must be Done");
+            };
+            assert!(result.success, "{flavor}: {:?}", result.error);
+            let first = entry.expect("entry on success");
+            save_ledger_entry(&fx.root, &first).await;
+            // Hand-edit the hash every wired file pins for the old wheel.
+            let mut drifted = Vec::new();
+            for (name, _) in &files {
+                let text = tokio::fs::read_to_string(fx.root.join(name)).await.unwrap();
+                let edited = text.replace(&first.artifact.sha256, &"f".repeat(64));
+                touch(&fx.root, name, &edited).await;
+                drifted.push((name, edited));
+            }
+            assert!(
+                drifted.iter().any(|(name, text)| {
+                    files.iter().any(|(n, orig)| n == *name && orig != text)
+                }),
+                "{flavor}: the drift must touch a wired file"
+            );
+
+            let outcome = vendor_six_as(&fx, &sources, SUPERSEDING_UUID).await;
+            let failed = match &outcome {
+                VendorOutcome::Refused { .. } => true,
+                VendorOutcome::Done { result, .. } => !result.success,
+            };
+            assert!(failed, "{flavor}: expected a refusal, got {outcome:?}");
+            for (name, text) in &drifted {
+                assert_eq!(
+                    &tokio::fs::read_to_string(fx.root.join(name)).await.unwrap(),
+                    text,
+                    "{flavor}: {name} untouched"
+                );
+            }
+            assert!(
+                !fx.root
+                    .join(format!(".socket/vendor/pypi/{SUPERSEDING_UUID}"))
+                    .exists(),
+                "{flavor}: no new uuid dir"
+            );
+            assert!(fx.root.join(&first.artifact.path).is_file(), "{flavor}");
+        }
+    }
+
+    /// Without a ledger entry for the older uuid there is no recorded
+    /// pre-vendor original to carry forward, so the script-lock and Hatch
+    /// lanes keep refusing, before anything is written (the uv lane is
+    /// `uv_stale_uuid_vendor_refuses_through_orchestrator`).
+    #[tokio::test]
+    async fn pyproject_flavors_superseding_uuid_without_ledger_refuses() {
+        for (flavor, files) in superseding_flavors() {
+            let fx = e2e_fixture().await;
+            swap_to_lock_flavor(&fx, &files).await;
+            let sources = PatchSources::blobs_only(&fx.blobs);
+            let VendorOutcome::Done { result, .. } = vendor_six(&fx, &sources, None).await else {
+                panic!("{flavor}: first vendor must be Done");
+            };
+            assert!(result.success, "{flavor}: {:?}", result.error);
+            let mut wired = Vec::new();
+            for (name, _) in &files {
+                wired.push(tokio::fs::read(fx.root.join(name)).await.unwrap());
+            }
+            let outcome = vendor_six_as(&fx, &sources, SUPERSEDING_UUID).await;
+            assert!(
+                matches!(outcome, VendorOutcome::Refused { .. }),
+                "{flavor}: expected Refused, got {outcome:?}"
+            );
+            for ((name, _), bytes) in files.iter().zip(&wired) {
+                assert_eq!(
+                    &tokio::fs::read(fx.root.join(name)).await.unwrap(),
+                    bytes,
+                    "{flavor}: {name}"
+                );
+            }
+            assert!(!fx
+                .root
+                .join(format!(".socket/vendor/pypi/{SUPERSEDING_UUID}"))
+                .exists());
+        }
     }
 
     /// Deleting ONLY the committed wheel (the marker file survives) must
