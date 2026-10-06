@@ -3404,10 +3404,11 @@ fn rewrite_yarn_classic(
     // carries (rewritten this run or already pinned) — the packages then
     // install unpatched with nothing printed. The vendored probe
     // (`vendor::yarn_classic_berry_migration_risk`) warns about the same
-    // trap; warn here too, once per run, unless corepack pins yarn 1.
-    if any_pinned
-        && !crate::vendor::manifest_pins_yarn_classic(files.get("package.json").map(String::as_str))
-    {
+    // trap; warn here too, once per run, unless corepack pins yarn 1. The
+    // engine reads the root manifest beside a classic lock; with none there
+    // is no project for yarn to install, so nothing to warn about.
+    let manifest = files.get("package.json").map(String::as_str);
+    if any_pinned && manifest.is_some() && !crate::vendor::manifest_pins_yarn_classic(manifest) {
         result.warnings.push(RewriteWarning {
             code: "redirect_yarn_classic_berry_migration_risk".into(),
             detail: "yarn.lock is yarn-classic (v1) with hosted pins: installing with yarn 2+ \
@@ -9665,7 +9666,7 @@ mod tests {
     /// exactly like vendored wiring, so the hosted rewrite must warn the
     /// way the vendored probe does — with no `packageManager` pin, with a
     /// non-1 yarn declared (`yarn@10` must not prefix-match `yarn@1`), and
-    /// when the manifest is missing or unparseable (fail toward warning).
+    /// when the manifest is unparseable (fail toward warning).
     #[test]
     fn yarn_classic_hosted_pin_warns_berry_migration_risk() {
         let ovr = npm_override(
@@ -9680,7 +9681,6 @@ mod tests {
             Some(r#"{"name":"p","packageManager":"yarn@10.0.0"}"#),
             Some(r#"{"name":"p","packageManager":"pnpm@9.0.0"}"#),
             Some("{not json"),
-            None,
         ] {
             let mut r = RewriteResult::default();
             rewrite_yarn_classic(&classic_files(manifest), std::slice::from_ref(&ovr), &mut r);
@@ -9767,6 +9767,18 @@ mod tests {
         rewrite_yarn_classic(&classic_files(Some(r#"{"name":"p"}"#)), &[missing], &mut r);
         let codes: Vec<&str> = r.warnings.iter().map(|w| w.code.as_str()).collect();
         assert_eq!(codes, ["redirect_yarn_classic_entry_not_found"]);
+
+        // No root manifest: no project for yarn to install, nothing to warn.
+        let lp = npm_override(
+            "left-pad",
+            "1.3.0",
+            "http://p.test/lp.tgz",
+            "sha512-PATCHED==",
+        );
+        let mut r = RewriteResult::default();
+        rewrite_yarn_classic(&classic_files(None), std::slice::from_ref(&lp), &mut r);
+        assert!(r.files.contains_key("yarn.lock"));
+        assert_eq!(berry_risk_count(&r), 0, "{:?}", r.warnings);
 
         let lp = npm_override(
             "left-pad",
