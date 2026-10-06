@@ -630,8 +630,11 @@ async fn gem_hosted_stale_archive_at_configured_cache_path_warns_and_is_not_atte
     let server = MockServer::start().await;
     mount_api(&server, None).await;
     let moved = "---\nBUNDLE_CACHE_PATH: \"vendor/gems\"\n";
+    // #951: Bundler drops a trailing `# comment` from the value.
+    let commented = "---\nBUNDLE_CACHE_PATH: vendor/gems # committed gem cache\n";
     for (label, config, env, cache_dir) in [
         ("app-config", Some(moved), &[][..], "gems"),
+        ("app-config-commented", Some(commented), &[][..], "gems"),
         (
             "env",
             None,
