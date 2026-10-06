@@ -1,6 +1,8 @@
 [agent] Progress ledger for the scheduled Cargo bug-hunt routine (label pm:cargo).
 
-Last updated: 2026-10-05 (run 13), main `99f61d2` (main was rewritten; 52 new commits, none of them cargo-behavioural; repo cargo suites pass), CLI 4.0.0, latest release v4.0.0. Re-triage: #616 and #338 still reproduce.
+Last updated: 2026-10-06 (run 14), main `9c43dfc` (22 new commits; cargo-relevant: #598 hosted workspace-member refusal, which closed #417), CLI 4.0.0, latest release v4.0.0. Re-triage: #386 and #480 still reproduce.
+
+Run 14 added these cells (Linux; not yet in the table): hosted #598 refusal edges against real cargo 1.97 (ancestor `exclude`, `./`-prefixed exclude, glob member + exclude, non-matching member path, empty `[workspace]` opt-out): pass, no false refusals. Hosted symlinked `Cargo.lock` / `Cargo.toml` / `.cargo/config.toml`: refused correctly; symlinked `.cargo/` dir: written through (non-bug). Hosted direct 1.0.4 + transitive 0.1.x on lock v1/v3/v4: pass. Agent `vex` after a registry-src prune and after re-extract: pass. Vendored CRLF ×BOM × lock v1–v3 on cargo 1.45.1: pass. Vendored + `cargo vendor` source replacement on stable (single-crate graph): pass.
 
 Run 13 added these cells (Linux; not yet in the table): hosted superseding patch uuid A→B: re-pin pass on 5 shapes, stale old-uuid registry block fail #864; hosted `remove` on the #679 contested lock (registry or path sibling; 1.74.1 v3, 1.93.1 v4, 1.97.0 v3/v4): fail #863; contested-lock `scan` re-run / `list` / `repair`: no warning (commented on #679).
 
@@ -26,10 +28,10 @@ Cells marked (pre-v5) were last verified on `f6b7fb9` and need a re-check on v5.
 ## Backlog
 
 0. **Maintainer request (Linux done in runs 3 and 11):** global `-g` mode on macOS and Windows across the Cargo majors: scan report, hosted refusal, apply, rollback and vex. The full checklist is in the 20261001T040000Z entry.
-1. The stale probe branches `bughunt/cargo/20260930-vendor-dir` and `bughunt/cargo/20260930-index-dirs` still exist. Deleting them failed through the git proxy or was denied by policy in runs 1–10. A maintainer needs to delete them. Until then, avoid new probe branches.
+1. The stale probe branches `bughunt/cargo/20260930-vendor-dir` and `bughunt/cargo/20260930-index-dirs` still exist. Deleting them failed through the git proxy or was denied by policy in runs 1–14. A maintainer needs to delete them. Until then, avoid new probe branches.
 2. (done run 13: #863, #864, #679 comment) Next: `rollback` (no purl) and the hosted→vendored takeover on the #679 contested lock (same `restore` as #863); a v1 contested lock from an old cargo; #864 with two crates where only one is superseded.
 2b. Hosted with a `[patch]` override in `$CARGO_HOME/config.toml` or an ancestor config: same root cause as #480, so only worth a live check once #480 is fixed.
-3. Vendored on old cargo (`+1.41` / `+1.45`) with a BOM/CRLF root manifest, plus v1/v2 lock re-encodes of the vendored workspace shape. Also vendored on Windows and macOS.
+3. (1.45 BOM/CRLF × lock v1–v3 done in run 14) Vendored on `+1.41`, the vendored workspace shape on old cargo, and vendored on Windows and macOS. Also vendored + `cargo vendor` with a multi-crate graph.
 4. Re-triage #387 and #339 live once cargo code changes on main.
 5. #616: a target-gated crate (`cfg(windows)` dependency on Linux) should stay a calm skip once the fix lands. Verify that.
 6. `-g` default `~/.cargo` on macOS and Windows (Linux passed in run 11).
@@ -66,3 +68,6 @@ Cells marked (pre-v5) were last verified on `f6b7fb9` and need a re-check on v5.
 - An agent apply on a `cargo vendor --versioned-dirs` tree finds `vendor/<name>-<version>` correctly (run 11).
 - Hosted `list` shows nothing unless the pin's origin is `patch.socket.dev` or `--patch-server-url` / `SOCKET_PATCH_SERVER_URL`: documented (run 13).
 - The hosted restore lowercases the crates.io sparse-index path, so uppercase crate names (`Inflector`) restore correctly (run 13).
+- Hosted with a symlinked `.cargo/` **directory** writes the registry block into the link target. The symlink guard is documented as leaf-only: a stage-and-rename inside the target dir doesn't replace a link. A symlinked `.cargo/config.toml`, `Cargo.toml` or `Cargo.lock` is refused (run 14).
+- The hosted / vendored workspace-root check doesn't stop its ancestor walk at `$CARGO_HOME` as cargo does. That only matters for a project inside `CARGO_HOME`, so it isn't filed (run 14).
+- `[registry] default` affects only publish/login, not dependency resolution, so there is no hosted alt-registry case (run 14).
