@@ -715,7 +715,14 @@ fn edit_packages(
             "    resolution: {{integrity: {}, tarball: {}}}",
             ctx.integrity, ctx.spec
         );
-        if block.key == new_key && original_lines.iter().any(|l| l == &expected_resolution) {
+        // pnpm quotes a scoped `@scope/pkg` name: a bare `@` can't start a
+        // plain YAML scalar (#956). An older release wrote it unquoted, so a
+        // lock carrying that spelling is stale, not in sync.
+        let expected_name = format!("    name: {}", yaml_value(ctx.name));
+        if block.key == new_key
+            && original_lines.iter().any(|l| l == &expected_resolution)
+            && original_lines.iter().any(|l| l == &expected_name)
+        {
             return Ok(false); // in sync
         }
         let mut new_lines = Vec::with_capacity(original_lines.len() + 2);
@@ -727,9 +734,7 @@ fn edit_packages(
                 match field {
                     "resolution" => {
                         new_lines.push(expected_resolution.clone());
-                        // pnpm quotes a scoped `@scope/pkg` name: a bare
-                        // `@` can't start a plain YAML scalar (#956).
-                        new_lines.push(format!("    name: {}", yaml_value(ctx.name)));
+                        new_lines.push(expected_name.clone());
                         new_lines.push(format!("    version: {}", ctx.version));
                         replaced_resolution = true;
                         continue;
@@ -2079,6 +2084,36 @@ packages:
             assert!(outcome.success, "{:?}", outcome.error);
             assert_eq!(fx.read(PNPM_LOCK).await, before);
             assert_eq!(fx.read(PACKAGE_JSON).await, SCOPED_PKG);
+        }
+    }
+
+    /// A lock vendored by a release before #956 carries the unquoted
+    /// `name: @scope/pkg` that pnpm can't load. A re-vendor must treat it
+    /// as stale and rewrite it, not report the wiring in sync.
+    #[tokio::test]
+    async fn revendor_heals_an_unquoted_scoped_name() {
+        for (before, after) in [
+            (S7_BEFORE_LOCK, S7_AFTER_LOCK),
+            (S8_BEFORE_LOCK, S8_AFTER_LOCK),
+        ] {
+            let fx = scoped_fixture(before).await;
+            let (result, _, _) = expect_done(vendor_scoped(&fx).await);
+            assert!(result.success, "{:?}", result.error);
+            let vendored = fx.read(PNPM_LOCK).await;
+
+            let quoted = "    name: '@isaacs/string-locale-compare'";
+            assert!(vendored.contains(quoted), "{vendored}");
+            let stale = vendored.replace(quoted, "    name: @isaacs/string-locale-compare");
+            tokio::fs::write(fx.root().join(PNPM_LOCK), &stale)
+                .await
+                .unwrap();
+
+            let (rerun, _, _) = expect_done(vendor_scoped(&fx).await);
+            assert!(rerun.success, "{:?}", rerun.error);
+            assert_eq!(
+                fx.read(PNPM_LOCK).await,
+                expected_scoped_lock(&fx, after).await
+            );
         }
     }
 
