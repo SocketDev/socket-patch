@@ -1,6 +1,6 @@
 [agent] Progress ledger for the scheduled npm bug-hunt routine (label pm:npm).
 
-Last updated: 2026-10-06T06Z (run 23 with a ledger), main `9c43dfc` (unchanged since 00Z), latest release v4.0.0 (previous v3.3.0, both from npm `@socketsecurity/socket-patch`). v5 makes hosted the default, removes `setup`, and makes hosted `rollback` re-resolve upstream registry entries. Cells marked (v4) were last verified on `f6b7fb9`. Re-triaged at 00Z: #464 and #433 still reproduce.
+Last updated: 2026-10-06T12Z (run 24 with a ledger), main `9c43dfc` (unchanged since 00Z), latest release v4.0.0 (previous v3.3.0, both from npm `@socketsecurity/socket-patch`). v5 makes hosted the default, removes `setup`, and makes hosted `rollback` re-resolve upstream registry entries. Cells marked (v4) were last verified on `f6b7fb9`. Re-triaged at 00Z: #464 and #433 still reproduce.
 
 ## Coverage matrix
 
@@ -58,6 +58,13 @@ A hosted `scan` / `get <uuid>` run from an npm workspace member exits 0 with `re
 - `package-lock.json` + `yarn.lock` (vendored wires `yarn.lock`): `vendor --check` falsely says no lock references the artifact, and its remedies are no-ops. **fail #900** on Linux npm 10 + yarn 1.22.22.
 - #879 also covers npm 12 `npm install` on an existing v2 lock (keeps v2, drops mirror `resolved`) and an npm 8 v2 shrinkwrap (commented 2026-10-06).
 
+## Patch superseding (2026-10-06T12Z, main `9c43dfc`)
+
+The same `name@version` gets a new patch UUID with different bytes. Mock: left-pad@1.3.0 A→B, cold-cache `npm ci`.
+- Same-mode re-scan: hosted / vendored on npm 8.19.4 / 10.9.4 / 12.2.0 (plain + alias), agent on 10.9.4: **pass** (`updates[]`, the lock re-pinned in every node, the old artifact GC'd, `npm ci` installs B, `vex` attests B, rollback byte-exact).
+- Cross-mode: hosted→vendored, vendored→hosted, agent→vendored **pass**. hosted→agent and vendored→agent keep the other mode's wiring (documented; `vex` fails closed or attests A).
+- agent→hosted: **fail #933**. Manifest record A survives, so `rollback` exits 1 until a reinstall and `remove` exits 1 with pin B live (npm 8 / 10 / 12, and a v4.0.0 manifest).
+
 ## Run 23 passes (Linux, 2026-10-06T06Z, main `9c43dfc`)
 
 - Hosted pins survive `npm dedupe`, `install --package-lock-only`, `install <new dep>` and `prune` on npm 8.19.4 / 10.9.4 / 12.2.0 (plain and scoped alias). Vendored passes on npm 10 / 12. On npm 8 (v2), everything except `dedupe` hits #879.
@@ -70,7 +77,8 @@ A hosted `scan` / `get <uuid>` run from an npm workspace member exits 0 with `re
 
 ## Backlog
 
-- **New 2026-10-06T06Z:** patch superseding (same `name@version`, newer UUID with different bytes) across hosted / vendored / agent re-scans, which has never been covered. It needs a mock with a switchable second-generation patch. Also interrupted runs inside the write window.
+- **New 2026-10-06T12Z:** #933 follow-ups (path-scoped `rollback <purl>`, agent re-scan after the takeover, other PMs → handover); a withdrawn patch (API offers nothing for a pinned package); superseding to a paid / forbidden B. Interrupted runs inside the write window.
+- (Patch superseding done 2026-10-06T12Z: pass except agent→hosted, #933.)
 - (Hosted alias `rollback` of the v2 mirror `lp` node: done 2026-10-06T06Z, pass.)
 - **New 2026-10-06:** #899 follow-ups (dual lock without a twin, workspace shrinkwrap); #898 on other group-commit refusals (`vendor_commit_failed`, a symlinked `.npmrc`); Bun handover #2 (a `bun.lock` + stale `package-lock.json` with no entry for the package: `contest_across_locks` ignores it), not filed because of the cap and Bun being primary.
 - (#879 npm 12 / shrinkwrap v2 follow-ups done 2026-10-06T00Z: both affected, commented.)
@@ -127,7 +135,7 @@ A hosted `scan` / `get <uuid>` run from an npm workspace member exits 0 with `re
 - On Windows, npm/node can't run in a cwd longer than the Win32 limit, so deep-path cells there can't run.
 - Hosted pins on any host other than `patch.socket.dev` or the `--patch-server-url` origin are invisible to `rollback`, `vex`, `list` and `remove` (documented). Mock runs must pass `--patch-server-url`.
 - In the sandbox, hosted `rollback` can't reach registry.npmjs.org (the Rust client doesn't trust the proxy CA). Use `SOCKET_NPM_REGISTRY` pointed at a local passthrough.
-- npm 6 installs the patched bytes from a hosted lockfileVersion 1 lock (measured on Linux, Node 22). npm-compatibility.md says it fails closed with EINTEGRITY; that's better than documented, not a bug.
+- npm 6 on a hosted lockfileVersion 1 lock: with a cold cache it fails closed with EINTEGRITY, as npm-compatibility.md documents (re-measured 2026-10-06T12Z). An earlier note said it installs the patched bytes; that was a warm-cache artifact.
 - `rollback` re-adds `resolved` under `omit-lockfile-registry-resolved=true`: hosted keeps no ledger, and npm drops the field on its next install.
 - A failed hosted lock write (an immutable lock) leaves `allow-remote=all` in `.npmrc`: exit 1, the documented mid-flush I/O residual.
 - A bare hosted `scan` wires only the cwd project's lock. A nested non-workspace project warns `redirect_npm_entry_not_found`. `scan . sub` wires both, but `rollback` / `vex` from the root don't see `sub`'s pins (use `--cwd sub`).
@@ -146,6 +154,7 @@ A hosted `scan` / `get <uuid>` run from an npm workspace member exits 0 with `re
 - A vendored v2 lock re-saved by npm 7/8 (`npm install`) loses `resolved` in the legacy `dependencies` mirror, because npm's serializer never writes it for a `file:` resolution. A cold-cache npm 6 `npm ci` then fails closed with EINTEGRITY. That's npm's behaviour; npm-compatibility.md's npm 6 + vendored v2 claim holds only until such a re-save.
 - `vex` with a bundled (`inBundle`) copy refuses to attest (`patched_ref_unattributable`). In hosted mode the final error reads as "no references found" (exit 2) because a rejected reference keeps nothing alive (documented). Only the diagnostic is misleading.
 - `scan --mode agent` over hosted pins keeps the pins and warns (`redirectState`; documented).
+- Mock tip: `SOCKET_NPM_REGISTRY` hosted rollback fetches `<registry>/<name>/<version>`, so serve a version doc with a top-level `dist`, not a packument.
 - (Retired 2026-10-03T12Z: npm vendored `scan --prune` / `vendor --revert` / `remove` keeping an entry whose lock entry vanished after `npm uninstall` is now tracked as a bug in #665.)
 - `package-lock=false` in `.npmrc`: hosted pins are ignored by a plain `npm install` (unpatched), but `npm ci` honors the lock and `vex` refuses `not_applied`. Fails closed; the user's config choice.
 - A symlinked `.npmrc` isn't written through (hosted warns that `allow-remote` must be set). A symlinked lock is refused `redirect_symlinked_file_unsupported`.
