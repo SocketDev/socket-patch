@@ -1,6 +1,6 @@
 [agent] Progress ledger for the scheduled Yarn classic (1.x) bug-hunt routine (label pm:yarn-classic).
 
-Last updated: 2026-10-05 (run 21), main `9c43dfc`, latest release v4.0.0. Runs 5–21 added the cells in "Run 5 cells" through "Run 21 cells" below. The project-mode matrix below was measured on `f6b7fb9` (v4); cells marked "(v5)", the global matrix and the "v5 project-mode cells" list were re-run on v5.
+Last updated: 2026-10-06 (run 22), main `9c43dfc`, latest release v4.0.0. Runs 5–22 added the cells in "Run 5 cells" through "Run 22 cells" below. The project-mode matrix below was measured on `f6b7fb9` (v4); cells marked "(v5)", the global matrix and the "v5 project-mode cells" list were re-run on v5.
 
 ## Coverage matrix
 
@@ -30,6 +30,8 @@ Report = `scan -g` report-only + no leakage; refusal = `scan -g/--global-prefix/
 | macOS | 1.6.0 / 1.9.4 / 1.10.1 / 1.22.22 (+ corepack), run 10 | pass (after warming the mock, see Known non-bugs) | pass | pass | pass (#436 fixed) | pass | pass |
 | Windows | 1.0.2 | fail #437 (run 10; #434 fixed) | pass | fail #437 | pass (run 10) | untested | pass (run 10) |
 | Windows | 1.6.0 / 1.9.4 / 1.10.1 / 1.22.22 (+ corepack), run 10 | pass (#434 fixed) | pass | pass | pass (#436 fixed) | untested | pass (space+unicode) |
+
+GitHub deps with a real codeload install (`owner/repo#tag`, `github:`, archive URL), H and V + frozen + vex + V rollback: pass on Linux / macOS / Windows × 1.7.0 / 1.10.1 / 1.22.22 (run 22 probe).
 
 Other cells that pass on Linux 1.22.22 (some also on older releases; see the entries): spaces + unicode project paths (also macOS and Windows), `npm:` alias (H skipped as documented, V rewired), `resolutions`, a `resolved` without the `#sha1` fragment / `integrity`, a local `file:` tarball dep, a non-deduplicated lock, a superseding patch on re-scan, `remove` / `repair`, VEX (installed and lock-only, after `yarn upgrade`), `yarn add` then a frozen reinstall (1.7.0 too), `yarn check --integrity` / `--verify-tree`, in-place reinstalls on 1.7–1.22, concurrent scans (`lock_held`), the GitHub shorthand dep on all 3 OSes.
 
@@ -145,10 +147,16 @@ Other cells that pass on Linux 1.22.22 (some also on older releases; see the ent
 - `nohoist` workspace from the root: A apply / rollback, H and V frozen fresh installs patched in the member, vex: pass.
 - Twin lock (yarn.lock + package-lock.json) after #799: vendored wires yarn.lock with `vendor_multiple_lockfiles`, and vex refuses `patched_ref_unattributable` (fail-closed, as #799 intends).
 
+### Run 22 cells (`9c43dfc`)
+- **Hosted pin on a v1 lock, then a berry (4.18.1) install: fail #907.** Berry migrates the lock and installs unpatched, and hosted gives no warning (even with `packageManager: yarn@4`). Vendored warns with `yarn_classic_berry_migration_risk`. Locks from 1.7.0 / 1.10.1 / 1.22.22.
+- GitHub shorthand / `github:` / archive-URL deps with real codeload (probe run 37395884885): 27/27 pass on all 3 OSes × 1.7.0 / 1.10.1 / 1.22.22. yarn writes no `integrity` for codeload entries.
+- PR #901 (unmerged) fixes #884 on yarn 1.7.0 / 1.22.22: plain, object-form + `nohoist`, and `**`-glob members are refused, and a nested separate project still pins. PR #839 (unmerged) turns #364 into a `redirect_yarn_classic_offline_mirror` skip; frozen online and `--offline` installs work, unpatched.
+- Agent + `yarn add` (re-copy) then vex: `not_applied`, pass. A first-party workspace member named like the patched package: refused in all modes, pass. The vendored migration warning is suppressed by `yarn@1…` pins, pass.
+
 ## Backlog
 
-1. Re-check #884 / #364 (PR #839) / #831 (PR #837) once fixed, and #828's yarn git-sibling shape. Then #467 / #519 / #558 / #591 / #691 / #692 / #758 / #857.
-2. GitHub shorthands with a real codeload install (probe branch, macOS / Windows): check what lock yarn 1.10+ actually writes (an `integrity` line?), and also `bitbucket:` / `gitlab:`.
+1. Re-check #884 (PR #901, verified on its head in run 22) / #364 (PR #839, verified as a skip) / #831 (PR #837) once merged, plus #907 and #828's yarn git-sibling shape. Then #467 / #519 / #558 / #591 / #691 / #692 / #758 / #857.
+2. `bitbucket:` / `gitlab:` shorthands (needs a package mirrored there). The GitHub forms are done (run 22).
 3. Cross-OS hosted checkout: embed one prebuilt patched tarball (base64) in the probe so every runner serves identical bytes. Add workspaces to the cross-OS vendored probe.
 4. #758 follow-ups: a real registry package with `bundledDependencies`.
 5. **Maintainer request (global mode), what's left:** the Windows MSI install of yarn, and a read-only prefix on Windows with a non-admin user. #437 (1.0.x) is still open. macOS case-insensitive name collisions.
@@ -223,3 +231,7 @@ Other cells that pass on Linux 1.22.22 (some also on older releases; see the ent
 - yarn 1.0.2 installs a single copy (the git one, at the root) for a workspace that has both a registry block and a git block of the same `name@version`. The hosted pin then never reaches `node_modules`, but the scan's `redirect_yarn_classic_git_skipped` warning covers it and `vex` doesn't attest.
 - The sandbox can't reach codeload.github.com, so GitHub-shorthand deps need a probe branch.
 - Hosted rollback of a GitHub-shorthand dep (`owner/repo#tag`, codeload lock) restores the npm registry tarball, not the codeload URL. CLI_CONTRACT "Hosted unwind coverage" says pins go back to the default upstream registry entry. Vendored rollback is byte-exact. Whether a non-registry origin should be refused (as composer does) is a design question.
+- Leftover probe branch (deletion blocked): `bughunt/yarn-classic/20261006-gh-shorthand`.
+- yarn 1.22.x refuses to install when `package.json` declares a berry `packageManager` (corepack guard). To build a mid-migration fixture, install first and then add the `packageManager` field.
+- Building two PR worktrees into one `CARGO_TARGET_DIR` can reuse the first binary unchanged ("Finished in 0.18s"). Touch the sources or use separate target dirs, and `cmp` the binaries.
+- Agent-mode first-party refusal: JSON `apply.failed` is 0 while the human summary says "1 failed" (`status: partial_failure`, exit 1). Cross-ecosystem and minor; not filed.
