@@ -1,6 +1,6 @@
 [agent] Progress ledger for the scheduled Yarn classic (1.x) bug-hunt routine (label pm:yarn-classic).
 
-Last updated: 2026-10-06 (run 24), main `9c43dfc`, latest release v4.0.0. Runs 5–24 added the cells in "Run 5 cells" through "Run 24 cells" below. The project-mode matrix below was measured on `f6b7fb9` (v4); cells marked "(v5)", the global matrix and the "v5 project-mode cells" list were re-run on v5.
+Last updated: 2026-10-06 (run 25), main `9c43dfc`, latest release v4.0.0. Runs 5–25 added the cells in "Run 5 cells" through "Run 25 cells" below. The project-mode matrix below was measured on `f6b7fb9` (v4); cells marked "(v5)", the global matrix and the "v5 project-mode cells" list were re-run on v5.
 
 ## Coverage matrix
 
@@ -166,16 +166,28 @@ Other cells that pass on Linux 1.22.22 (some also on older releases; see the ent
 - Boundary releases 1.10.0 / 1.19.0 / 1.19.1 / 1.22.0, H / V / A with 3 packages incl. scoped: pass.
 - A lockfile-less yarn project (`--install.no-lockfile`): hosted `success` / `redirected: 0` with the npm-only `redirect_npm_no_lockfile` text. Naming nit, not filed (see Known non-bugs).
 
+### Run 25 cells (Linux, `9c43dfc`)
+- **Agent `scan <PATH>` in a workspace with nested duplicate copies** (members `a` and `b` both have their own `left-pad@1.3.0`, and the root has 1.2.0): `scan packages/a` (also `/**`, `./`, absolute, and the copy path) scans 0 packages, exits 0 and patches nothing, while `scan packages/b` selects it and `rollback packages/a` selects both copies. Fail, **commented on #778** (pnpm, same `seen` dedup root; yarn's case has real copies, not links). 1.7.0 / 1.10.1 / 1.22.22, ×2 each.
+- Hosted `scan <member>` / `scan 'packages/*'` (positional PATH = per-dir `--cwd`): the #884 shape, commented on #884.
+- PR #940 (`980b7b6`) fixes #938 on 1.7.0 / 1.10.1 / 1.22.22 (H and V lock-only vex omit it, V post-install vex omits it, `vendor --check` exits 1). Controls (merged pinned block in a workspace; non-workspace transitive `^1.3.0` + exact root re-add) still attest, and their installs are patched. Commented on #938.
+- PR #924 (`f791612`) fixes #921 on 1.7.0 / 1.22.22: H warns `redirect_yarn_classic_directory_skipped`, V warns via `events[].reason`, vex omits it, and the `file:`-only V refusal names the copy. Commented on #921 (the V warning is not a coded warning, a minor asymmetry).
+- #938 variant, non-workspace: a transitive `^1.3.0` + `yarn add left-pad@1.3.0 --exact` merges into the pinned block (patched, attested): pass. #938 needs the workspace `-W` shape.
+- `get CVE-…` / `get GHSA-…` in H / V / A + frozen install + vex: pass (1.22.22). `--download-mode file|diff` agent apply + vex + re-apply after deleting blobs: pass.
+- `--manifest-path custom/m.json`: hosted writes no manifest; vendored ignores it (ledger + lock at `--cwd`). `vex` attests either way. `list --manifest-path custom/m.json` resolves the project root from the manifest path (documented), so it says "No patches".
+- Same-basename tarballs (`left-pad@1.2.0` + `@types/left-pad@1.2.0`): V + offline mirror + pruning (fresh offline frozen, in-place, vex, byte-exact rollback) and H cold / warm-cache frozen installs on 1.7.0 / 1.10.1 / 1.22.22: pass. The vendored path is `<uuid>/@types/left-pad-1.2.0.tgz`.
+- `link:` copy beside a registry range: yarn 1.22.22 links *every* range of that name (lock `version "0.0.0"`), so there's no registry block to pin. That's yarn's behaviour; nothing to test.
+
 ## Backlog
 
-1. Re-check #884 (PR #901, verified on its head in run 22) / #364 (PR #839, verified as a skip) / #831 (PR #837) / #907 (PR #917) once merged, plus #828's yarn git-sibling shape. Then #467 / #519 / #558 / #591 / #691 / #692 / #758 / #857 / #921 / #938.
-2. #938 variants: a non-workspace project with a transitive dep on the pinned range; a lock merge that brings in a separately keyed block; check whether npm / pnpm have a same-lock analogue (hand over if so).
-3. #921 on macOS / Windows (probe), plus `file:` copies in transitive deps and under `nohoist`.
-4. `bitbucket:` / `gitlab:` shorthands (needs a package mirrored there). The GitHub forms are done (run 22).
-5. Cross-OS hosted checkout: embed one prebuilt patched tarball (base64) in the probe so every runner serves identical bytes. Add workspaces to the cross-OS vendored probe.
-6. #758 follow-ups: a real registry package with `bundledDependencies`.
-7. **Maintainer request (global mode), what's left:** the Windows MSI install of yarn, and a read-only prefix on Windows with a non-admin user. #437 (1.0.x) is still open. macOS case-insensitive name collisions.
-8. Not yet covered: `--manifest-path`, `--all-releases`, `--download-mode`, `get <CVE|GHSA>` on yarn projects.
+1. Re-check once merged: #938 (PR #940, verified run 25), #921 / #857 (PR #924, #921 verified run 25), #884 (PR #901, verified run 22; also covers the positional PATH form), #364 (PR #839), #831 (PR #837), #907 (PR #917), #778 (yarn classic nested copies, run 25), plus #828's yarn git-sibling shape. Then #467 / #519 / #558 / #591 / #691 / #692 / #758.
+2. #857 on PR #924 (vendored git-only dep; needs a git dep, which worked in run 20 via github.com).
+3. npm-workspace analogue of the #778 nested-copy scope miss (hand over to npm if it reproduces). Also `rollback <PATH>` / `--sync <PATH>` / `--prune <PATH>` on the same yarn layout.
+4. #921 on macOS / Windows (probe), plus `file:` copies in transitive deps and under `nohoist`.
+5. `bitbucket:` / `gitlab:` shorthands (needs a package mirrored there).
+6. Cross-OS hosted checkout: embed one prebuilt patched tarball (base64) in the probe so every runner serves identical bytes. Add workspaces to the cross-OS vendored probe.
+7. #758 follow-ups: a real registry package with `bundledDependencies`.
+8. **Maintainer request (global mode), what's left:** the Windows MSI install of yarn, and a read-only prefix on Windows with a non-admin user. #437 (1.0.x) is still open. macOS case-insensitive name collisions.
+9. Packages whose upstream tarball root isn't `package/` (old `@types/*`, e.g. `@types/left-pad@1.2.0` uses `left-pad/`): the vendored prebuilt check requires `package/…` paths. Whether the real patch service normalizes the root can't be checked from the sandbox.
 
 ## Known non-bugs
 
@@ -258,3 +270,6 @@ Other cells that pass on Linux 1.22.22 (some also on older releases; see the ent
 - `--package pkg:npm/<name>@<version not installed>` scans nothing and exits 0 `success`. That's expected filtering.
 - After a hosted scan, `yarn add` / `yarn upgrade` / member installs with a range that matches the pinned version merge into the pinned block (pin kept). Only an exact root re-add (`yarn add -W <pkg> --exact`) writes a separate registry block (#938).
 - Run-24 mock: a 3-package variant of the run-18 mock (left-pad high, ms low, scoped `@isaacs/string-locale-compare` medium, tarballs read from a local dir). Kill the mock in its own Bash call; `pkill -f mock.py` in a command line that also contains `mock.py` kills the calling shell.
+- `link:` deps: yarn 1 links every range of the same name to the `link:` target (`version "0.0.0"` blocks), so a `link:` copy can't sit beside a registry block.
+- Run-25 multi-package mock (`mockm.py <port> name@ver,…`): downloads each upstream tarball, re-roots it to `package/`, patches `index.js` / `index.d.ts` / `package.json`, one uuid per package. Vendored service artifacts must use a `package/` root, or vendored refuses `vendor_prebuilt_layout_mismatch`.
+- `scan <PATH>` in hosted / vendored mode is a per-directory `--cwd` run (CLI_CONTRACT "Path-scoped scans"); with `--json` it takes one directory, so `'packages/*'` with two members is a usage error (exit 2) by design.
