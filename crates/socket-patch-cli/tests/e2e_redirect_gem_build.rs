@@ -1856,7 +1856,10 @@ async fn gem_hosted_custom_git_source_is_refused_and_still_installs() {
         Driver::ScanVexCustomGitSource,
     )
     .await;
-    assert!(fx.is_none(), "the custom git_source driver asserts in place");
+    assert!(
+        fx.is_none(),
+        "the custom git_source driver asserts in place"
+    );
 }
 
 /// #340: a `gem` declaration that continues on the next line must not be

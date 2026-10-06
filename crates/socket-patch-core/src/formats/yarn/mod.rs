@@ -64,7 +64,10 @@ mod tests {
 
     #[test]
     fn sniff_prefers_berry_and_skips_a_bom() {
-        assert_eq!(sniff_grammar("__metadata:\n  version: 8\n"), Some(YarnLockGrammar::Berry));
+        assert_eq!(
+            sniff_grammar("__metadata:\n  version: 8\n"),
+            Some(YarnLockGrammar::Berry)
+        );
         assert_eq!(
             sniff_grammar("\u{feff}# yarn lockfile v1\r\n"),
             Some(YarnLockGrammar::Classic)
