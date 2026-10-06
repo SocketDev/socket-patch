@@ -183,22 +183,9 @@ pub fn yarn_classic_berry_migration_risk(project_root: &Path) -> Option<VendorWa
     if !lock.contains("# yarn lockfile v1") || !lock.contains(".socket/vendor/") {
         return None;
     }
-    if let Some(pm) = read_regular_to_string_sync(&project_root.join("package.json"))
-        .ok()
-        .and_then(|pkg| serde_json::from_str::<serde_json::Value>(&pkg).ok())
-        .and_then(|v| {
-            v.get("packageManager")
-                .and_then(|p| p.as_str().map(String::from))
-        })
-    {
-        let major = pm.trim().strip_prefix("yarn@").map(|rest| {
-            rest.chars()
-                .take_while(char::is_ascii_digit)
-                .collect::<String>()
-        });
-        if major.as_deref() == Some("1") {
-            return None;
-        }
+    let manifest = read_regular_to_string_sync(&project_root.join("package.json")).ok();
+    if manifest_pins_yarn_classic(manifest.as_deref()) {
+        return None;
     }
     Some(VendorWarning::new(
         "yarn_classic_berry_migration_risk",
@@ -207,6 +194,30 @@ pub fn yarn_classic_berry_migration_risk(project_root: &Path) -> Option<VendorWa
          from the registry. Pin yarn classic (e.g. \"packageManager\": \"yarn@1.22.22\" in \
          package.json) so every install uses yarn 1.",
     ))
+}
+
+/// Whether a root `package.json` text pins yarn classic through corepack's
+/// `packageManager: yarn@1…`, which makes a stray yarn 2+ (berry) install
+/// refuse instead of migrating a classic `yarn.lock` and dropping its
+/// pins. A missing, unreadable or malformed manifest vouches for nothing
+/// (`false`), so callers fail toward warning. Shared by the vendored probe
+/// above and the hosted yarn classic rewriter, so both modes warn alike.
+pub(crate) fn manifest_pins_yarn_classic(manifest: Option<&str>) -> bool {
+    let Some(pm) = manifest
+        .and_then(|pkg| serde_json::from_str::<serde_json::Value>(pkg).ok())
+        .and_then(|v| {
+            v.get("packageManager")
+                .and_then(|p| p.as_str().map(String::from))
+        })
+    else {
+        return false;
+    };
+    let major = pm.trim().strip_prefix("yarn@").map(|rest| {
+        rest.chars()
+            .take_while(char::is_ascii_digit)
+            .collect::<String>()
+    });
+    major.as_deref() == Some("1")
 }
 
 /// Vendoring acquires immutable artifacts from the patch service.
