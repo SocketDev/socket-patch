@@ -1,6 +1,6 @@
 [agent] Progress ledger for the scheduled Yarn classic (1.x) bug-hunt routine (label pm:yarn-classic).
 
-Last updated: 2026-10-06 (run 22), main `9c43dfc`, latest release v4.0.0. Runs 5–22 added the cells in "Run 5 cells" through "Run 22 cells" below. The project-mode matrix below was measured on `f6b7fb9` (v4); cells marked "(v5)", the global matrix and the "v5 project-mode cells" list were re-run on v5.
+Last updated: 2026-10-06 (run 23), main `9c43dfc`, latest release v4.0.0. Runs 5–23 added the cells in "Run 5 cells" through "Run 23 cells" below. The project-mode matrix below was measured on `f6b7fb9` (v4); cells marked "(v5)", the global matrix and the "v5 project-mode cells" list were re-run on v5.
 
 ## Coverage matrix
 
@@ -9,6 +9,7 @@ Cells are "pass", "fail #N", "n/a", "CI" or "untested". H = hosted, V = vendored
 | OS | yarn | H baseline | H offline mirror | H/V git dep (`git+…`) | H/V multi-version workspaces + scoped | H⇄V takeover + rollback | H/V CRLF lock + rollback | V baseline | V offline mirror (+pruning, rollback) | A apply + setup |
 | --- | --- | --- | --- | --- | --- | --- | --- | --- | --- | --- |
 | Linux | 1.0.2 | pass | n/a (yarn limitation) | H pass (run 20, #363 fixed) | H pass | untested | H pass (run 16) | n/a (yarn ≤1.6 can't install `file:` tarballs) | n/a | pass |
+| Linux | 1.3.2 / 1.5.1 (run 23) | pass | untested | untested | untested | untested | untested | n/a (yarn ≤1.6) | n/a | pass |
 | Linux | 1.6.0 | pass | n/a (yarn limitation) | untested | H pass | untested | H pass (run 16) | n/a (yarn ≤1.6) | n/a | pass (run 17) |
 | Linux | 1.7.0 | CI | fail #364 (`--offline`) | pass (run 20, #363 fixed; V git-only: #857) | pass | pass (run 16) | pass (run 16) | pass | untested | pass (run 17) |
 | Linux | 1.9.4 | CI | fail #364 (`--offline`) | untested | untested | untested | untested | CI | pass (run 16) | pass (run 17) |
@@ -24,6 +25,7 @@ Report = `scan -g` report-only + no leakage; refusal = `scan -g/--global-prefix/
 
 | OS | yarn | report | refusal | A apply/vex/rollback | get-mode | RO | custom global-folder (space+unicode) |
 | --- | --- | --- | --- | --- | --- | --- | --- |
+| Linux | 1.1.0 / 1.3.2 (run 23) | pass | untested | pass | untested | untested | untested |
 | Linux | 1.0.2 | fail #437 (still on `203e092`) | pass | fail #437 | fixed (#436 closed by #446; not re-run) | n/a (nothing found) | untested |
 | Linux | 1.6.0 / 1.9.4 / 1.10.1 / 1.22.22 (+ corepack 1.22.22), run 10 | pass | pass | pass | pass (#436 fixed) | pass (CI runner) | pass (all) |
 | macOS | 1.0.2 | fail #437 (run 10) | pass | fail #437 | pass (run 10) | n/a | pass (run 10) |
@@ -153,13 +155,18 @@ Other cells that pass on Linux 1.22.22 (some also on older releases; see the ent
 - PR #901 (unmerged) fixes #884 on yarn 1.7.0 / 1.22.22: plain, object-form + `nohoist`, and `**`-glob members are refused, and a nested separate project still pins. PR #839 (unmerged) turns #364 into a `redirect_yarn_classic_offline_mirror` skip; frozen online and `--offline` installs work, unpatched.
 - Agent + `yarn add` (re-copy) then vex: `not_applied`, pass. A first-party workspace member named like the patched package: refused in all modes, pass. The vendored migration warning is suppressed by `yarn@1…` pins, pass.
 
+### Run 23 cells (Linux, `9c43dfc`)
+- **`file:` directory copy of the patched name@version beside a registry copy (workspace member `file:../forks/left-pad`): fail #921.** H / V give no warning; lock-only `vex` (H and V) and V post-install `vex` attest `not_affected` while `b/node_modules/left-pad` stays unpatched. 1.0.2 (H) / 1.7.0 / 1.10.1 / 1.22.22. H post-install vex and agent: correct. When the `file:` block is the only copy, hosted `--json` is silent (`redirected: 0`, no warning) and V says `vendor_lock_entry_not_found` (same issue).
+- 1.3.2 / 1.5.1: H baseline + vex, A apply + vex + rollback: pass. Global `-g` report / agent / rollback on 1.1.0 / 1.3.2: pass.
+
 ## Backlog
 
-1. Re-check #884 (PR #901, verified on its head in run 22) / #364 (PR #839, verified as a skip) / #831 (PR #837) once merged, plus #907 and #828's yarn git-sibling shape. Then #467 / #519 / #558 / #591 / #691 / #692 / #758 / #857.
-2. `bitbucket:` / `gitlab:` shorthands (needs a package mirrored there). The GitHub forms are done (run 22).
-3. Cross-OS hosted checkout: embed one prebuilt patched tarball (base64) in the probe so every runner serves identical bytes. Add workspaces to the cross-OS vendored probe.
-4. #758 follow-ups: a real registry package with `bundledDependencies`.
-5. **Maintainer request (global mode), what's left:** the Windows MSI install of yarn, and a read-only prefix on Windows with a non-admin user. #437 (1.0.x) is still open. macOS case-insensitive name collisions.
+1. Re-check #884 (PR #901, verified on its head in run 22) / #364 (PR #839, verified as a skip) / #831 (PR #837) once merged, plus #907 (PR #917) and #828's yarn git-sibling shape. Then #467 / #519 / #558 / #591 / #691 / #692 / #758 / #857 / #921.
+2. #921 on macOS / Windows (probe), plus `file:` copies in transitive deps and under `nohoist`.
+3. `bitbucket:` / `gitlab:` shorthands (needs a package mirrored there). The GitHub forms are done (run 22).
+4. Cross-OS hosted checkout: embed one prebuilt patched tarball (base64) in the probe so every runner serves identical bytes. Add workspaces to the cross-OS vendored probe.
+5. #758 follow-ups: a real registry package with `bundledDependencies`.
+6. **Maintainer request (global mode), what's left:** the Windows MSI install of yarn, and a read-only prefix on Windows with a non-admin user. #437 (1.0.x) is still open. macOS case-insensitive name collisions.
 
 ## Known non-bugs
 
@@ -235,3 +242,5 @@ Other cells that pass on Linux 1.22.22 (some also on older releases; see the ent
 - yarn 1.22.x refuses to install when `package.json` declares a berry `packageManager` (corepack guard). To build a mid-migration fixture, install first and then add the `packageManager` field.
 - Building two PR worktrees into one `CARGO_TARGET_DIR` can reuse the first binary unchanged ("Finished in 0.18s"). Touch the sources or use separate target dirs, and `cmp` the binaries.
 - Agent-mode first-party refusal: JSON `apply.failed` is 0 while the human summary says "1 failed" (`status: partial_failure`, exit 1). Cross-ecosystem and minor; not filed.
+- Keep yarn's `--cache-folder` outside the project in harnesses, or agent mode also patches the cache copies under it.
+- `file:` **directory** deps are first-party source for link-based managers, but yarn 1 *copies* them into `node_modules`, and agent mode patches that copy. The hosted / vendored / VEX gap for that copy is #921, not a non-bug.

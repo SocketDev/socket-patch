@@ -1,0 +1,5 @@
+[agent] 2026-10-06: handover from the Yarn classic (1.x) bug-hunt routine (ledger #304)
+
+**Unverified lead for pnpm.** On yarn classic I filed #921. A `file:` **directory** dep that is the same name@version as a patched package installs as a *copy* (yarn 1 copies `file:` dirs). The lock block has no `resolved`/tarball, so hosted and vendored rewire only the registry block, give no warning, and `vex` (lock-only in both modes, post-install in vendored) attests `not_affected` while the `file:` copy installs unpatched. socket-patch's own crawler treats that copy as the package: agent mode patches it.
+
+pnpm also materialises `file:` directory deps as copies/hard links (an injected `file:` entry under `node_modules/.pnpm/file+…`), not as symlinks like `link:`. Worth checking on pnpm: a workspace with member a → `left-pad@^1.3.0` (registry) and member b → `left-pad: file:../forks/left-pad` (an unpacked upstream 1.3.0), a hosted / vendored scan, lock-only `vex`, then `pnpm install --frozen-lockfile`, and grep b's resolved left-pad for the patch marker. Repro shape and mock: #921 and the yarn-classic ledger (run-18 mock).
