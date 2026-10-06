@@ -2654,3 +2654,48 @@ async fn scan_vendored_ignores_a_degraded_pre_v5_vlt_ledger_edit() {
         );
     }
 }
+
+/// `scan --mode agent --json` whose nested apply fails (the installed copy
+/// is a symlink to a first-party `packages/` directory, which apply refuses
+/// to patch): the `apply` block must carry
+/// the per-patch failure — `action: "failed"`, `errorCode`, `error` — and
+/// count it in `failed`, not report the patch as a clean `added` (#424).
+#[cfg(unix)]
+#[tokio::test]
+async fn scan_agent_json_nested_apply_failure_reaches_the_apply_block() {
+    let mock = MockServer::start().await;
+    let purl = "pkg:npm/apply-fails@1.0.0";
+    mount_one_patch_api(&mock, purl, b"before\n").await;
+
+    let tmp = tempfile::tempdir().unwrap();
+    write_root_package_json(tmp.path());
+    write_npm_package(tmp.path(), "apply-fails", "1.0.0", b"before\n");
+    let member = tmp.path().join("packages/apply-fails");
+    std::fs::create_dir_all(member.parent().unwrap()).unwrap();
+    std::fs::rename(tmp.path().join("node_modules/apply-fails"), &member).unwrap();
+    std::os::unix::fs::symlink(
+        "../packages/apply-fails",
+        tmp.path().join("node_modules/apply-fails"),
+    )
+    .unwrap();
+
+    let (code, stdout, stderr) = run_scan_agent(tmp.path(), &mock.uri(), &["--json"]);
+    assert_eq!(code, 1, "stdout={stdout}\nstderr={stderr}");
+    let v: serde_json::Value = serde_json::from_str(stdout.trim()).expect("one JSON envelope");
+    assert_eq!(v["status"], "partial_failure", "{v}");
+    let apply = &v["apply"];
+    assert_eq!(apply["failed"], 1, "the apply failure must be counted: {v}");
+    assert_eq!(apply["applied"], 0, "{v}");
+    let rec = &apply["patches"][0];
+    assert_eq!(rec["purl"], purl, "{v}");
+    assert_eq!(rec["action"], "failed", "{v}");
+    assert_eq!(rec["errorCode"], "apply_failed", "{v}");
+    assert!(
+        rec["error"].as_str().is_some_and(|e| !e.is_empty()),
+        "the apply error text must reach the envelope: {v}"
+    );
+    assert_eq!(
+        std::fs::read(member.join("index.js")).unwrap(),
+        b"before\n",
+    );
+}

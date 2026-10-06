@@ -3125,3 +3125,145 @@ async fn get_vendored_dry_run_human_prints_the_vlt_would_refuse_line() {
     assert_eq!(hosted::read(root, "vlt-lock.json"), lock);
     assert!(!root.join(".socket").exists());
 }
+
+// ===========================================================================
+// Nested apply failures in the JSON envelope (#424)
+// ===========================================================================
+
+/// The npm project fixture, except `node_modules/covgap-pkg` is a symlink
+/// to a first-party `packages/covgap-pkg` (a workspace member that shares
+/// the patched name@version). Apply refuses to patch it (it lies outside
+/// every `node_modules` tree), a deterministic apply failure that needs no
+/// read-only filesystem.
+#[cfg(unix)]
+fn write_first_party_link_project(root: &Path) {
+    write_project(root);
+    let installed = root.join("node_modules").join(NAME);
+    let member = root.join("packages").join(NAME);
+    std::fs::create_dir_all(member.parent().unwrap()).unwrap();
+    std::fs::rename(&installed, &member).unwrap();
+    std::os::unix::fs::symlink(Path::new("../packages").join(NAME), &installed).unwrap();
+}
+
+/// The agent engine with the nested apply ON, over a project whose
+/// installed copy apply refuses to patch (a first-party link): the
+/// apply step fails, and the envelope must say so per patch — the same
+/// `{action: "failed", errorCode, error}` a standalone `apply --json`
+/// reports — with `failed` counting it and nothing counted as applied.
+#[cfg(unix)]
+#[tokio::test]
+#[serial]
+async fn engine_nested_apply_failure_reaches_the_json_envelope() {
+    let server = MockServer::start().await;
+    mount_real_view(&server, UUID, PURL).await;
+
+    let tmp = tempfile::tempdir().unwrap();
+    write_first_party_link_project(tmp.path());
+    let mut params = engine_params(tmp.path());
+    params.save_only = false;
+    let selected = vec![search_result(UUID, PURL)];
+    let (code, json) = download_and_apply_patches(&selected, &params, &server.uri()).await;
+
+    assert_eq!(code, 1, "json={json}");
+    assert_eq!(json["status"], "partial_failure", "json={json}");
+    assert_eq!(json["downloaded"], 1, "the download itself worked: {json}");
+    assert_eq!(json["failed"], 1, "the apply failure must be counted: {json}");
+    assert_eq!(json["applied"], 0, "json={json}");
+    let rec = &json["patches"][0];
+    assert_eq!(rec["purl"], PURL, "json={json}");
+    assert_eq!(rec["uuid"], UUID, "json={json}");
+    assert_eq!(rec["action"], "failed", "json={json}");
+    assert_eq!(rec["errorCode"], "apply_failed", "json={json}");
+    assert!(
+        rec["error"].as_str().is_some_and(|e| !e.is_empty()),
+        "the apply error text must reach the envelope: {json}"
+    );
+    // The record stays saved: only the apply degraded.
+    assert_eq!(manifest_json(tmp.path())["patches"][PURL]["uuid"], UUID);
+    assert_eq!(
+        std::fs::read(tmp.path().join("packages").join(NAME).join("index.js")).unwrap(),
+        BEFORE_BYTES,
+        "a failed apply leaves the first-party bytes alone"
+    );
+}
+
+/// Nested apply over a project with nothing installed: apply fails because
+/// the recorded patch has no installed package. The envelope names that
+/// patch and the reason instead of reporting it as a clean `added`.
+#[tokio::test]
+#[serial]
+async fn engine_nested_apply_not_installed_reaches_the_json_envelope() {
+    let server = MockServer::start().await;
+    mount_view_files(&server, UUID, PURL, good_files()).await;
+
+    let tmp = tempfile::tempdir().unwrap();
+    let mut params = engine_params(tmp.path());
+    params.save_only = false;
+    let selected = vec![search_result(UUID, PURL)];
+    let (code, json) = download_and_apply_patches(&selected, &params, &server.uri()).await;
+
+    assert_eq!(code, 1, "json={json}");
+    assert_eq!(json["status"], "partial_failure", "json={json}");
+    assert_eq!(json["failed"], 1, "json={json}");
+    assert_eq!(json["applied"], 0, "json={json}");
+    let rec = &json["patches"][0];
+    assert_eq!(rec["action"], "failed", "json={json}");
+    assert_eq!(rec["errorCode"], "package_not_installed", "json={json}");
+    assert!(
+        rec["error"].as_str().is_some_and(|e| !e.is_empty()),
+        "json={json}"
+    );
+}
+
+/// A successful nested apply still reports a clean envelope: the patch
+/// keeps its `added` action and counts as applied.
+#[tokio::test]
+#[serial]
+async fn engine_nested_apply_success_keeps_added_and_counts_applied() {
+    let server = MockServer::start().await;
+    mount_real_view(&server, UUID, PURL).await;
+
+    let tmp = tempfile::tempdir().unwrap();
+    write_project(tmp.path());
+    let mut params = engine_params(tmp.path());
+    params.save_only = false;
+    let selected = vec![search_result(UUID, PURL)];
+    let (code, json) = download_and_apply_patches(&selected, &params, &server.uri()).await;
+
+    assert_eq!(code, 0, "json={json}");
+    assert_eq!(json["status"], "success", "json={json}");
+    assert_eq!(json["failed"], 0, "json={json}");
+    assert_eq!(json["applied"], 1, "json={json}");
+    assert_eq!(json["patches"][0]["action"], "added", "json={json}");
+    assert!(json["patches"][0].get("errorCode").is_none(), "json={json}");
+    assert_eq!(
+        std::fs::read(tmp.path().join("node_modules").join(NAME).join("index.js")).unwrap(),
+        AFTER_BYTES,
+    );
+}
+
+/// `get <uuid> --json` (the single-patch path) with the nested apply ON
+/// over a first-party link: one JSON document whose patch record carries
+/// the apply failure, and `failed: 1`.
+#[cfg(unix)]
+#[tokio::test]
+async fn get_uuid_json_nested_apply_failure_names_the_patch() {
+    let server = MockServer::start().await;
+    mount_real_view(&server, UUID, PURL).await;
+
+    let tmp = tempfile::tempdir().unwrap();
+    write_first_party_link_project(tmp.path());
+    let (code, stdout, stderr) = run_get_bin(tmp.path(), &server.uri(), &[UUID, "--json"]);
+    assert_eq!(code, 1, "stdout={stdout}\nstderr={stderr}");
+    let json = parse_single_json_doc(&stdout);
+    assert_eq!(json["status"], "partial_failure", "json={json}");
+    assert_eq!(json["failed"], 1, "json={json}");
+    assert_eq!(json["applied"], 0, "json={json}");
+    let rec = &json["patches"][0];
+    assert_eq!(rec["action"], "failed", "json={json}");
+    assert_eq!(rec["errorCode"], "apply_failed", "json={json}");
+    assert!(
+        rec["error"].as_str().is_some_and(|e| !e.is_empty()),
+        "json={json}"
+    );
+}
