@@ -2,7 +2,7 @@
 
 The routine runs every 6 hours. Each run adds one comment here with the socket-patch commit it tested, the OS × Pipenv-version × mode cells it covered, the issues it filed, updated or closed, and what it plans to probe next. The routine treats this thread as its only memory.
 
-Last run: 2026-10-06 ~03:37Z, main `9c43dfc` (CLI 4.0.0, unchanged). New: #912 (Pipenv 2026.4+ installs a pylock-only project from `pylock.toml` and ignores the `archive` entry socket-patch writes). Previous run: 2026-10-05 ~21:44Z. #654 and #730 merged: #645, #546 and #725 are re-verified fixed with real Pipenv (agent apply / vex and vendored `vendor --check`). #842 still fails on 2023.12.1. PR #825 (#769) is still open.
+Last run: 2026-10-06 ~09:49Z, main `9c43dfc` (CLI 4.0.0, unchanged). New: #932 (hosted rewrites a Pipfile.lock entry to a single platform-specific patched wheel without a warning, so `pipenv sync` fails on other Pythons / OSes; Pipenv counterpart of uv's #701). `.env` VIRTUAL_ENV / IGNORE / ACTIVE agent shapes and the #838 multi-venv rollback pass. Previous run: 2026-10-06 ~03:37Z (#912).
 
 ## Coverage matrix
 
@@ -70,17 +70,20 @@ Stale-install remedy followed verbatim, `15:30Z` run, `045d7ec`: `default` patch
 
 `03:37Z` run (2026-10-06), `9c43dfc`: Pipenv `[pipenv] use_pylock = true`. With `Pipfile.lock` + `pylock.toml` both present, hosted on 2026.8.0 passes. pylock-only, hosted / vendored: `pipenv sync` installs upstream on 2026.4.0 / 2026.6.0 / 2026.7.1 / 2026.8.0 (fail #912; vendored vex gives a false `not_affected`); 2026.0.0–2026.2.2 fail loudly (`Pipfile.lock not found`). Hosted stale warning with `.env` WORKON_HOME (2026.8.0), stale warning + remedy + vex on 2024.4.1, `pipenv upgrade <other>` keeping the reference, and Pipfile.lock mode preservation: pass.
 
+`09:49Z` run (2026-10-06), `9c43dfc`: hosted with a platform-specific patched wheel (cp311 manylinux MarkupSafe) on 2018.11.26 / 2023.12.1 / 2026.8.0: entry narrowed to one wheel, no warning, `sync` py3.12 and `pip download --platform macosx / win_amd64` fail (fail #932); py3.11 PATCHED. `.env` `VIRTUAL_ENV` (absolute / relative), `.env` `PIPENV_IGNORE_VIRTUALENVS=1` / `PIPENV_ACTIVE=1` with an exported VIRTUAL_ENV, agent apply on 2026.8.0 (Pipenv behaviour also checked on 2023.12.1): pass. #838-style new-directory patch over two venvs + rollback: pass.
+
 macOS/Windows rows are from the 2026-09-30 probes on `f6b7fb9`. No probe ran on v5 because branch deletion through the git proxy still fails (re-checked 2026-10-03 03:30Z); `bughunt/pipenv/20260930-venv-discovery` and `bughunt/pipenv/20260930-virtualenv` still need a maintainer to delete them.
 
 ## Backlog
 
+00000. #932 variants: `develop` / named categories, Pipenv 11 `path` form, hosted rollback of the narrowed entry (refused by the session policy on 2026-10-06); re-verify once fixed.
 0000. #912 variants: `pylock.<name>.toml` (`pylock_name`), dev packages in pylock, rollback / remove / repair on a pylock-only Pipenv project; re-verify once fixed.
 
 000. (#790 re-verified fixed on main `0d302dc`, 2026-10-05 19:15Z.) Still untested: Windows cmd / PowerShell quoting of `--categories "…"`.
 00. Re-verify #769 once fixed (vendored re-vendor A → B: rewire in place, old uuid dir removed, revert byte-exact, no false `package_not_installed` with a venv). (Hosted supersede on 2018 / 2022 / 2023, develop / named categories and with a sibling requirements.txt: done 2026-10-04 15:30Z, pass.)
 0. #645 re-verified fixed for agent mode and agent vex (2026-10-05 21:44Z). Still to do: its hosted shape (the stale-install warning and hosted vex with `.venv` + WORKON + IN_PROJECT=0 on 2018 / 2022 / 2023.10).
 1. #612 variants still open: `-r` includes in vendored mode. Re-verify once fixed. (Revert / rollback on the half-wired project pass.)
-2. #546 re-verified fixed for agent mode (2026-10-05 21:44Z, 12 `.env` shapes). Still to do: the hosted stale warning with `.env`-placed venvs, and `VIRTUAL_ENV` / `PIPENV_ACTIVE` set inside `.env`.
+2. #546 re-verified fixed for agent mode (2026-10-05 21:44Z, 12 `.env` shapes); `VIRTUAL_ENV` / `PIPENV_ACTIVE` / IGNORE inside `.env` done 2026-10-06, pass. Still to do: the hosted stale warning with `.env` custom-name / IN_PROJECT venvs.
 3. Re-verify #504 and the #454 human-mode gap once they're fixed.
 4. #567 variants: vendored mode with an `-r` include, `remove`, `-c` constraints; re-verify once fixed.
 5. **Maintainer request (global `-g` mode):** still to do: macOS / Windows, `-g` on 2018 / 11, and `--global-prefix` as a venv root (scans 0; undocumented). Checklist in the 20261001T040000Z entry.
@@ -88,7 +91,7 @@ macOS/Windows rows are from the 2026-09-30 probes on `f6b7fb9`. No probe ran on 
 6b. Re-verify #409 for Pipenv once fixed: `--site-packages` fresh + warm venv, hosted + vendored, 2018–2026 (stale warning or vex refusal expected). (Mixed-sources hosted rollback: done 2026-10-05, pass.)
 6c. Pipenv 2020 / 2021: include them in the #645 re-verification. (The #790 `[dev-packages]` remedy on 2020.11.15: done 2026-10-05 19:15Z, pass.) (Relative `WORKON_HOME` with `--cwd`: done 2026-10-05 09:32Z, see Known non-bugs.)
 6d. Re-verify #842 once fixed: agent (2018 / 2023 / 2025 / 2026.1 fail; 2026.2+ use `./.venv`) and the hosted stale-install warning (2018 / 2023 / 2026.1 missing, commented 2026-10-05). (Pipfile key × env precedence on 2026.8: done, pass.) (The non-boolean `PIPENV_VENV_IN_PROJECT` × key question: done 2026-10-05 21:44Z, pass; socket-patch scans both venvs.)
-6e. #838 (rollback removing directories apply created) for a pypi agent patch that adds a file in a new directory.
+6e. (#838 Pipenv multi-venv rollback: done 2026-10-06 09:49Z, pass.)
 7. A macOS/Windows probe re-verifying #333 / #334 / #384 / #529 / #546 / #645, and hosted / vendored on 2018 / 2022 there (CRLF on Windows). Blocked: branch deletion fails through the git proxy, and as of 2026-10-05 21:44Z it is also refused by the session's permission policy.
 
 ## Known non-bugs
@@ -147,3 +150,4 @@ macOS/Windows rows are from the 2026-09-30 probes on `f6b7fb9`. No probe ran on 
 - Mock-API notes: the blob route must return the content for the requested hash (before or after), or agent rollback fails with a hash mismatch; `get CVE-…` needs a `/patches/by-cve/` route.
 - (Superseded by #654, which now joins it to the project and passes with `--cwd` from the parent; kept for history.) A relative `WORKON_HOME` (e.g. `.venvs`) is resolved against socket-patch's process cwd, as Python does, not against `--cwd`. So `scan --cwd app` run from the parent misses `app/.venvs/…`, while running inside `app/` passes. Not filed: the env var means whatever the reading process's cwd makes it, and Pipenv run from a subdirectory would differ too. The system-Python write that follows is #504.
 - Harness note: scan's batch purls include Pipfile.lock entries, so they can't show which venv was found. Use an apply-based oracle (local manifest + blobs, then check which copies are patched). Agent rollback needs the before blob locally, and it deletes `.socket/blobs` and the manifest entry.
+- Agent mode with `PIPENV_IGNORE_VIRTUALENVS=1` or `PIPENV_ACTIVE=1` in `.env` and `VIRTUAL_ENV` exported: socket-patch patches the activated venv as well as the project's venv, though current Pipenv ignores the activated one. That's the documented union of settings-timing profiles (the 2020 shell caches IGNORE before dotenv). The venv Pipenv uses is always patched, so it's over-coverage, not a miss.
