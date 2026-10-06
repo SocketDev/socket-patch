@@ -9,9 +9,11 @@
 //!
 //! Hermetic: the patch API and the hosted wheel are a wiremock.
 
+#[path = "common/hermetic.rs"]
+mod hermetic;
+
 use std::io::Write as _;
 use std::path::{Path, PathBuf};
-use std::process::Command;
 
 use serde_json::{json, Value};
 use sha2::{Digest, Sha256};
@@ -127,11 +129,11 @@ fn project(socket_yml: Option<&str>) -> (tempfile::TempDir, PathBuf) {
     (tmp, root)
 }
 
-/// `scan --json` with every ambient `SOCKET_*` var scrubbed and
+/// `scan --json` through the hermetic test environment, with
 /// `VIRTUAL_ENV` at the fixture venv.
 fn scan(root: &Path, server: &MockServer, extra: &[&str]) -> (i32, Value) {
     let uri = server.uri();
-    let mut cmd = Command::new(env!("CARGO_BIN_EXE_socket-patch"));
+    let mut cmd = hermetic::binary_command();
     cmd.args([
         "scan",
         "--yes",
@@ -151,11 +153,6 @@ fn scan(root: &Path, server: &MockServer, extra: &[&str]) -> (i32, Value) {
     .arg("--cwd")
     .arg(root)
     .current_dir(root);
-    for (key, _) in std::env::vars() {
-        if key.starts_with("SOCKET_") {
-            cmd.env_remove(key);
-        }
-    }
     cmd.env("SOCKET_TELEMETRY_DISABLED", "1")
         .env("VIRTUAL_ENV", root.join("../venv"));
     let out = cmd.output().expect("spawn socket-patch");
