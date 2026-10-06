@@ -1,5 +1,5 @@
 ### CLI layer, core infrastructure, agent mode, tests and docs (`audit-core`)
-_Last updated 2026-10-06T15:50Z · main @ 9c43dfc_
+_Last updated 2026-10-06T21:50Z · main @ 9c43dfc_
 
 | ID | P | Problem | Source | Issues | Status |
 |---|:-:|---|---|---|---|
@@ -16,7 +16,7 @@ _Last updated 2026-10-06T15:50Z · main @ 9c43dfc_
 | C11 | 2 | Tracking: split `run_scan` (1,540 lines on `045d7ec`; JSON and human arms each dispatch all three modes) into discover → select → `ModeBackend::consume` → render. | 2.2; R5 | #843, #844 | filed #843, #844; tracking #843, child 1 #844 |
 | C12 | 2 | Tracking: move engine code out of the CLI and into core behind one orchestrator over `ProjectView`. That covers `vendor_records_reusing` (962 lines), `run_redirect_selected` (836) and `ecosystem_dispatch.rs` (816). Coordinate with E32. | 2.1; R11 | #894, #895 | filed #894, #895; tracking #894, child 1 #895 (`ecosystem_dispatch` → `crawlers::locate`, 950 lines); sizes now 1,044 / 932 / 950 |
 | C13 | 2 | Error codes are untyped. Target: a typed registry (`enum Reason × Ecosystem`) that generates the contract's code tables, plus a freshness test. Today ~65 codes are undocumented and 1 is phantom. | 2.8; 3.7 #8; 8.5 F | #930, #931 | filed #930, #931; tracking #930, child 1 #931; ~43 undocumented codes on 9c43dfc |
-| C14 | 2 | Decide: one JSON envelope. `scan`, `get` and `rollback` still emit a bare-string `error`, while the other commands emit `{code, message}`. | 2.8; R4 | #704 | decision #704 |
+| C14 | 2 | Decide: one JSON envelope. `scan`, `get` and `rollback` still emit a bare-string `error`, while the other commands emit `{code, message}`. | 2.8; R4 | #704 | decision #704; exit-2 channel (C53) added |
 | C15 | 2 | There are three HTTP retry systems, and blob and diff fetches have none. A 206-line HTTP-date parser, two near-identical downloaders, and per-fetch or per-event clients round it out. Target: one retry + timeout primitive. | 7.2; R12 | #676, #677 | filed #676; #677 in PR #889 |
 | C16 | 2 | Batch limits are split across crates. The CLI owns 500 / 100 / 256 KiB, and `search_patches_batch` documents a maximum of 500 without enforcing it. The in-memory engine keeps a third copy (default 100, no body cap). | 7.2 | #675 | filed #675 |
 | C17 | 2 | Digest helpers are duplicated: ~30 inline `hex::encode(Sha256::digest(..))` sites, and `sha256_hex` copies that *compute* beside a `utils::digest::sha256_hex` that *validates*. `sha1_hex` exists twice, and SRI formatting is inlined three times. | 4.4; 7.3 | #706 | filed #706; slice 1 merged as #865 (helpers + 14 files); slice 2 is the 6 files in `PENDING_INLINE_DIGESTS` |
@@ -37,7 +37,7 @@ _Last updated 2026-10-06T15:50Z · main @ 9c43dfc_
 | C32 | 3 | 328 exact-sentence assertions should become `--json`/`errorCode` checks plus snapshots. Triage the covgap tests (32 files, 407 tests, 27.2K lines on `9c43dfc`; review: 402), 136 of which (at review) assert human text. | 2.5; 8.5 G/H | | to verify |
 | C33 | 3 | Tracking: `CLI_CONTRACT.md` (379 KB on `9c43dfc`; 332 KB at review) should be a checked reference (flags, env vars, codes, exit codes) plus ≤300 lines of prose, with freshness tests. Also decouple `docs/testing` from the validation scripts. | 8.3; 8.5 F/I | #948, #949 | filed #948, #949; tracking #948 (folds in #678, #930), child 1 #949 (flag/env tables pinned to `Cli::command()`) |
 | C34 | 3 | Decide: the command model. A read-only `scan`, plus `fix`, `undo`, `sync` and `check`, with mode inferred from project state. This folds `remove`, `rollback` and `vendor --revert`, and per-command flags replace the 27 globals. | §4; 2.9; R6/R8 | | to verify |
-| C35 | 3 | Decide: drop the deprecated spellings and embedded `--vex`, and give `SOCKET_FORCE` per-command names. | R9; R10 | | to verify; `SOCKET_FORCE` part is #615 |
+| C35 | 3 | Decide: drop the deprecated spellings and embedded `--vex`, and give `SOCKET_FORCE` per-command names. | R9; R10 | #966 | decision #966; `--apply`/`--vendor` run with no warning; hosted `--vex` needs `assume_applied`; `SOCKET_FORCE` part is #615 |
 | C36 | 3 | Decide: the futures of agent mode and of the self-update binary swap. | §6 Q2; 7.5 | | to verify |
 | C37 | 2 | Patch blob/diff downloads (`fetch_binary`) buffer the whole body with no size cap; vendor and self-update use the shared `read_capped`. | new finding | #571 | fixed (#607) |
 | C38 | 2 | The public-proxy per-package fallback keeps a private cap of 10, ignoring `SOCKET_API_CONCURRENCY`, the proxy cap of 4 and the fd-limit rule; `registry_concurrency()` has no caller. | new finding | #614 | filed #614 |
@@ -55,6 +55,7 @@ _Last updated 2026-10-06T15:50Z · main @ 9c43dfc_
 | C50 | 2 | Artifact GC has two retention policies: `after_removal` (rollback, remove) keeps active patches' beforeHash blobs for offline rollback, `for_apply` (repair, `scan --prune`) drops them; offline rollback then fails and names `repair`, which never fetches beforeHash blobs. `cleanup_unused_blobs`/`_archives` are dead. | new finding | #893 | filed #893 |
 | C51 | 3 | Agent-mode jar verification (`jvm_jar::verify_member_bytes`; apply, rollback, vex) buffers each patched member before hashing, while vendored `zip_bytes_match_after_hashes` streams since #587: 1,067 MiB vs 26 MiB peak RSS on a 1 GiB member. | new finding | #914 | filed #914 |
 | C52 | 3 | One unparseable `.socket/manifest.json`, five `--json` codes: `manifest_invalid` (list, remove; two hand-written splits), `manifest_unreadable` (`apply --check`, `vendor --check`, vex), `apply_failed`, `repair_failed`, undocumented `invalid_manifest` (vendor), bare string (rollback). | new finding | #931 | filed #931 |
+| C53 | 3 | Exit-2 usage errors pick their `--json` channel per site: `scan`, `remove` and `rollback` write nothing on stdout, `get` a bare string, `vendor`, `repair` and `vex` a coded envelope; `--global --mode vendored` gives three stdouts on `scan`/`get`/`vendor`. | new finding | #704 | decision #704; folded in as its second question |
 
 **Handed off** (to the CI janitor): report-only coverage and LTO `docker-base` off PRs; e2e from 148 to ~50 legs; a reusable compat workflow; no per-leg compiles; dead CI path filters (review 8.2, 8.5 B/C/E).
 

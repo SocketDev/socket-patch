@@ -2,7 +2,7 @@
 
 ## Part 2: CLI command layer and user experience
 
-_Last checked against main @ 9c43dfc on 2026-10-06 by audit-core. Owner: audit-core._ Re-checked on `9c43dfc`: the manifest-load error codes of every command (2.8), the god-function sizes for `vendor_records_reusing`, `run_redirect_selected` and `rollback::run`, the get ↔ scan cycle, `ecosystem_dispatch`'s size and the takeover bypass; the rest is as of `045d7ec` or earlier.
+_Last checked against main @ 9c43dfc on 2026-10-06 by audit-core. Owner: audit-core._ Re-checked on `9c43dfc`: the manifest-load error codes of every command and the exit-2 usage-error output under `--json` (2.8), the legacy mode spellings and embedded `--vex` (2.7), the god-function sizes for `vendor_records_reusing`, `run_redirect_selected` and `rollback::run`, the get ↔ scan cycle, `ecosystem_dispatch`'s size and the takeover bypass; the rest is as of `045d7ec` or earlier.
 
 > Scope: `crates/socket-patch-cli/src/` — `args.rs`, `lib.rs`/`main.rs`, `ecosystem_dispatch.rs`, `json_envelope.rs`, `ui/*`, `update_notifier.rs`, and every `commands/*` module.
 
@@ -93,12 +93,12 @@ A sliding-window copy-paste detector finds little *literal* duplication. **The d
 - **Dead or vestigial flags:**
   - `--vendor-source`: core's `VendorSource` has **one variant**, and `build` is an error.
   - `--download-mode` is an unvalidated `String`, checked only where it is used. That breaks the "fail loud on typo" posture the same file applies to `--ecosystems`. On `045d7ec` a bad value fails `apply` and `repair` with exit 1 and `apply_failed`/`repair_failed`, while `apply --check`, `rollback`, `list` and `vendor` exit 0; `--vendor-source bogus` is a clap usage error (exit 2). {{C45}}
-- **Deprecated spellings and aliases:** `scan --apply` (hidden), `scan --vendor` (hidden), `--sync`, `get --no-apply`, and the `download` and `gc` aliases. `resolve_mode_flags` (`scan/mod.rs:205–255`) exists mainly to reconcile these.
+- **Deprecated spellings and aliases:** `scan --apply` (hidden), `scan --vendor` (hidden), `get --no-apply`, and the `download` and `gc` aliases. `resolve_mode_flags` (`scan/mod.rs:184–246` on `9c43dfc`) exists mainly to reconcile these. Only `--apply`/`--vendor` are called deprecated, and nothing warns: on `9c43dfc` both run silently with no removal date, while the contract makes `--no-apply`, `download` and `gc` permanent (MAJOR to remove). `--sync` is a documented shorthand, not a deprecated spelling. {{C35}}
 - **Name collisions:**
   - `--package` is a value list on `scan` but a boolean type-forcer (`-p`) on `get`.
   - `--check` on `apply` audits *Go `replace` redirects only*; on `vendor` it audits artifacts and JVM wiring.
   - **`SOCKET_FORCE` is bound to three unrelated `--force` flags** (`vendor.rs:80`, `apply.rs:339`, `update.rs:61`; verified on `045d7ec`). Exporting it to force a self-update also forces `apply` and `vendor`. {{C05}}
-- **VEX passthroughs:** 5 `--vex-*` flags × 3 host commands = 15 flag instances, with the env vars bound twice.
+- **VEX passthroughs:** 5 `--vex-*` flags × 3 host commands = 15 flag instances, with the env vars bound twice. Hosted `scan --vex` attests before install through `assume_applied`, which the standalone `vex` can't do, so dropping the embedded form needs a replacement. {{C35}}
 - **Hosted-only opt-outs are globals:** `--no-trust-lockfile-config`, `--no-npm-allow-remote-config` and `--no-vlt-install-cleanup` appear on `apply`, `list`, `vex`, `repair` and the rest.
 - **Two env mechanisms:** clap `env=` vs manual reads in `rollout_args.rs`/`socket_yml_args.rs`. `SOCKET_NO_SOCKET_YML` is missing from `LOCAL_ARG_ENV_VARS`, which is meant to be the single source of truth.
 
@@ -114,6 +114,7 @@ $ socket-patch get nope --offline --json             → {"status":"error","erro
 - `repair`, `remove` and `vex` use the envelope, with an `error` object that carries a stable `code`.
 - `scan`, `get` and `rollback` have no fixed `error` type. `rollback` always emits a bare string, but `scan` and `get` each emit a bare string on some paths and a `{code, message}` object on others (scan's embedded-VEX failure, get's vendored failure); `get`'s lock failure adds a sibling `errorCode`. A script must type-check `.error` before reading it. {{C14}}
 - Codes are free strings, so one condition gets a different code per command: an unparseable `.socket/manifest.json` is `manifest_invalid` (list, remove), `manifest_unreadable` (`apply --check`, `vendor --check`, vex), `apply_failed`, `repair_failed`, the undocumented `invalid_manifest` (vendor) or a bare string (rollback) on `9c43dfc`. {{C52}} The typed-registry plan is {{C13}}.
+- Exit-2 usage errors under `--json` have no single channel. `scan`, `remove` and `rollback` print nothing on stdout, as clap does; `get` prints a bare-string object; `vendor`, `repair` and `vex` print a full envelope with a code. The same `--global --mode vendored` refusal gives three different stdouts on `scan`, `get` and `vendor`. {{C53}}
 - Status is `partialFailure` in the envelope but `partial_failure` in the legacy shapes.
 - `get --mode vendored` nests an `Envelope` inside a legacy object.
 - The contract's "Migration status (v3.0)" section still says scan, get and rollback "will migrate in a follow-up PR". That was two majors ago.
@@ -181,6 +182,8 @@ That is **7 verbs instead of 9 visible + 2 hidden + 2 aliases + 3 hidden flag sp
 - {{C45}} `--download-mode` typos are runtime failures in two commands only (see 2.7): `apply`/`repair` exit 1 with a generic command code, and the rest accept them. This narrows the review's R8 note to a non-breaking fix (a typed clap parser).
 
 - {{C52}} One corrupt manifest, five `--json` codes: only `list` and `remove` implement the contract's `manifest_invalid`/`manifest_unreadable` split (two hand-written copies); `apply` and `vendor` each disagree with their own `--check` path. Child 1 of the typed-code tracking issue ({{C13}}).
+
+- {{C53}} Usage errors (exit 2) choose their own `--json` channel per site: 4 of the ~17 `return 2` sites in `commands/` write JSON, the rest stderr only. This is folded into the envelope decision as its second question.
 
 (The `C38` pacing finding is in Part 7.)
 
