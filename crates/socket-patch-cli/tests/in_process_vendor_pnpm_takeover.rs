@@ -409,3 +409,47 @@ async fn scan_vendored_over_hosted_pnpm_plain_dep_still_takes_over() {
         "the lock must point at the vendored artifact:\n{lock}"
     );
 }
+
+/// `vendor --dry-run` over the hosted pin previews the backend's refusal of
+/// the RESTORED project (staged in memory, never written) with the wet
+/// run's code, instead of promising the takeover; the wet `vendor` then
+/// keeps the hosted pin.
+#[tokio::test(flavor = "multi_thread")]
+async fn vendor_dry_run_over_hosted_pnpm_catalog_dep_previews_the_refusal() {
+    let server = MockServer::start().await;
+    mock_api(&server).await;
+    let tmp = tempfile::tempdir().unwrap();
+    let root = tmp.path();
+    host_project(root, &server.uri(), Shape::Catalog);
+    let manifest = json!({ "patches": { PURL: patch_record() } });
+    std::fs::create_dir_all(root.join(".socket/blobs")).unwrap();
+    std::fs::write(
+        root.join(".socket/manifest.json"),
+        serde_json::to_vec_pretty(&manifest).unwrap(),
+    )
+    .unwrap();
+    std::fs::write(
+        root.join(".socket/blobs")
+            .join(compute_git_sha256_from_bytes(PATCHED_INDEX)),
+        PATCHED_INDEX,
+    )
+    .unwrap();
+    let hosted = snapshot(root);
+    let vendor = |extra: &[&str]| {
+        let mut args = vec!["vendor", "--json", "--cwd", root.to_str().unwrap()];
+        args.extend_from_slice(extra);
+        run_json(root, &server.uri(), &args)
+    };
+
+    let (exit, env) = vendor(&["--dry-run"]);
+    assert_still_hosted(root, &hosted, &env);
+    assert_refused(&env, exit, "vendor_lock_entry_unsupported");
+    assert!(
+        !has_event_code(&env, "vendor_would_revert_redirect"),
+        "the refused takeover is not promised: {env:#}"
+    );
+
+    let (exit, env) = vendor(&[]);
+    assert_refused(&env, exit, "vendor_lock_entry_unsupported");
+    assert_still_hosted(root, &hosted, &env);
+}
