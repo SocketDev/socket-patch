@@ -522,6 +522,115 @@ async fn hatch_vendored_to_hosted() {
     assert_vendored_to_hosted(&root, files).await;
 }
 
+/// A uv PEP 723 script with its `.py.lock`; returns its wiring files.
+fn stage_script_lock(root: &Path) -> &'static [&'static str] {
+    std::fs::write(
+        root.join("job.py"),
+        "# /// script\n# requires-python = \">=3.9\"\n# dependencies = [\"six==1.16.0\"]\n# ///\nimport six\n",
+    )
+    .unwrap();
+    std::fs::write(
+        root.join("job.py.lock"),
+        format!(
+            "version = 1\nrevision = 3\nrequires-python = \">=3.9\"\n\n[manifest]\nrequirements = [{{name = \"six\", specifier = \"==1.16.0\"}}]\n\n[[package]]\nname = \"six\"\nversion = \"1.16.0\"\nsource = {{registry = \"https://pypi.org/simple\"}}\nwheels = [{{url = \"https://files.pythonhosted.org/six-1.16.0-py2.py3-none-any.whl\", hash = \"sha256:{WHEEL_SHA}\"}}]\n"
+        ),
+    )
+    .unwrap();
+    &["job.py", "job.py.lock"]
+}
+
+/// #742 / #650: a vendored uv project, uv script lock and Hatch project pick
+/// up a superseding patch. The manifest moves `six` from patch A to patch B
+/// (different patched bytes); the next `vendor` must wire B's wheel, remove
+/// A's uuid dir (`vendor_stale_artifact_removed`) and exit 0. Before the fix
+/// it failed `pypi_uv_source_already_exists`,
+/// `pypi_lock_source_already_exists` or `pypi_hatch_unsupported` (exit 1)
+/// and the project kept installing patch A. `vendor --revert` afterwards
+/// restores the user's original files byte for byte.
+#[tokio::test]
+async fn pyproject_flavors_vendored_revendor_superseding_patch() {
+    const UUID_B: &str = "5c3e1a2b-7d4f-4e6a-9b8c-1d2e3f4a5b6d";
+    const PATCHED_B: &[u8] = b"# six\nVERSION = '1.16.0'\nSOCKET_PATCHED = 2\n";
+    let stages: [(&str, fn(&Path) -> &'static [&'static str]); 3] = [
+        ("uv", stage_uv),
+        ("script lock", stage_script_lock),
+        ("hatch", stage_hatch),
+    ];
+    for (flavor, stage) in stages {
+        let (_tmp, root) = project();
+        let files = stage(&root);
+        let originals: Vec<String> = files
+            .iter()
+            .map(|f| std::fs::read_to_string(root.join(f)).unwrap())
+            .collect();
+        vendor_project(&root, files);
+
+        stage_manifest_with(&root, UUID_B, PATCHED_B);
+        let (code, env) = run_cli(&root, &["vendor"], &[]);
+        assert_eq!(
+            code, 0,
+            "{flavor}: re-vendor to the superseding patch: {env:#}"
+        );
+        let rendered = env.to_string();
+        assert!(!rendered.contains("already_exists"), "{flavor}: {env:#}");
+        assert!(
+            rendered.contains("vendor_stale_artifact_removed"),
+            "{flavor}: patch A's artifact is reclaimed: {env:#}"
+        );
+        let wired_b: Vec<String> = files
+            .iter()
+            .map(|f| std::fs::read_to_string(root.join(f)).unwrap())
+            .collect();
+        for (f, text) in files.iter().zip(&wired_b) {
+            assert!(!text.contains(UUID), "{flavor}: {f} kept uuid A:\n{text}");
+        }
+        assert!(
+            wired_b
+                .iter()
+                .any(|t| t.contains(&format!(".socket/vendor/pypi/{UUID_B}/"))),
+            "{flavor}: wired to patch B: {wired_b:#?}"
+        );
+        assert!(
+            !root.join(format!(".socket/vendor/pypi/{UUID}")).exists(),
+            "{flavor}"
+        );
+        assert!(
+            root.join(format!(".socket/vendor/pypi/{UUID_B}")).is_dir(),
+            "{flavor}"
+        );
+        let ledger = std::fs::read_to_string(root.join(".socket/vendor/state.json")).unwrap();
+        assert!(
+            ledger.contains(UUID_B) && !ledger.contains(UUID),
+            "{flavor}: {ledger}"
+        );
+
+        // Re-running is settled: in sync, nothing rewritten.
+        let (code, env) = run_cli(&root, &["vendor"], &[]);
+        assert_eq!(code, 0, "{flavor}: {env:#}");
+        for (f, text) in files.iter().zip(&wired_b) {
+            assert_eq!(
+                &std::fs::read_to_string(root.join(f)).unwrap(),
+                text,
+                "{flavor}: {f}"
+            );
+        }
+
+        let (code, env) = run_cli(&root, &["vendor", "--revert"], &[]);
+        assert_eq!(code, 0, "{flavor}: revert after the re-vendor: {env:#}");
+        for (f, text) in files.iter().zip(&originals) {
+            assert_eq!(
+                &std::fs::read_to_string(root.join(f)).unwrap(),
+                text,
+                "{flavor}: {f} restored to the user's original"
+            );
+        }
+        assert!(
+            !root.join(format!(".socket/vendor/pypi/{UUID_B}")).exists(),
+            "{flavor}"
+        );
+    }
+}
+
 /// The uv lock rewrite needs the hosted wheel's METADATA, fetched only
 /// after the takeover reverted the vendored wiring. When it is unavailable
 /// the package is left on the unpatched registry release in both modes, so
