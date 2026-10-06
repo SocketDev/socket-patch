@@ -799,8 +799,25 @@ async fn vendor_check_fails_after_hatch_dependency_reset() {
 /// revert — the vendored patch, ledger entry and wheel are kept — and the
 /// dry run must predict that refusal instead of a clean takeover.
 async fn assert_unreachable_takeover_refused(root: &Path, wired: &str, dry_run: bool) {
-    let before = std::fs::read_to_string(root.join(wired)).unwrap();
-    let root_before = std::fs::read_to_string(root.join("requirements.txt")).unwrap();
+    assert_takeover_refused(
+        root,
+        &[wired, "requirements.txt"],
+        "redirect_requirements_takeover_unreachable",
+        dry_run,
+    )
+    .await;
+}
+
+/// A vendored → hosted takeover the hosted rewriter cannot carry through
+/// is refused BEFORE the revert, in the wet run and the dry run alike:
+/// the refusal `code` is named, nothing is redirected, the run exits 0,
+/// and every wiring file in `files`, the ledger entry and the vendored
+/// wheel are kept byte for byte.
+async fn assert_takeover_refused(root: &Path, files: &[&str], code_name: &str, dry_run: bool) {
+    let before: Vec<String> = files
+        .iter()
+        .map(|f| std::fs::read_to_string(root.join(f)).unwrap())
+        .collect();
     let state = root.join(".socket/vendor/state.json");
     let server = MockServer::start().await;
     mount_hosted_api(&server, true).await;
@@ -820,25 +837,19 @@ async fn assert_unreachable_takeover_refused(root: &Path, wired: &str, dry_run: 
         !text.contains("redirect_takeover_unpatched"),
         "the package is never stranded: {env:#}"
     );
-    assert!(
-        text.contains("redirect_requirements_takeover_unreachable"),
-        "the refusal is named: {env:#}"
-    );
+    assert!(text.contains(code_name), "the refusal is named: {env:#}");
     assert_eq!(env["redirect"]["redirected"], 0, "{env:#}");
     assert_eq!(
         code, 0,
         "a refused takeover keeps the package vendored: {env:#}"
     );
-    assert_eq!(
-        std::fs::read_to_string(root.join(wired)).unwrap(),
-        before,
-        "{wired}: the vendored line is kept"
-    );
-    assert_eq!(
-        std::fs::read_to_string(root.join("requirements.txt")).unwrap(),
-        root_before,
-        "requirements.txt is untouched"
-    );
+    for (f, before) in files.iter().zip(&before) {
+        assert_eq!(
+            &std::fs::read_to_string(root.join(f)).unwrap(),
+            before,
+            "{f}: the vendored wiring is kept"
+        );
+    }
     assert!(
         std::fs::read_to_string(&state).unwrap().contains(UUID),
         "the ledger entry is kept"
@@ -914,4 +925,199 @@ async fn dry_run_previews_root_pin_takeover() {
         "{env:#}"
     );
     assert_eq!(env["redirect"]["redirected"], 1, "{env:#}");
+}
+
+/// uv.lock resolving `six` 1.17.0, either as a direct `six>=1.15` or
+/// through `python-dateutil`. Vendoring the manifest's `six@1.16.0` pins
+/// the lock entry down to 1.16.0, so the revert brings 1.17.0 back.
+const UV_LOCK_DRIFTED_DIRECT: &str = r#"version = 1
+revision = 2
+requires-python = ">=3.9"
+
+[[package]]
+name = "demo"
+version = "0.1.0"
+source = { virtual = "." }
+dependencies = [
+    { name = "six" },
+]
+
+[package.metadata]
+requires-dist = [{ name = "six", specifier = ">=1.15" }]
+
+[[package]]
+name = "six"
+version = "1.17.0"
+source = { registry = "https://pypi.org/simple" }
+sdist = { url = "https://files.pythonhosted.org/packages/94/e7/b2c673351809dca68a0e064b6af791aa332cf192da575fd474ed7d6f16a2/six-1.17.0.tar.gz", hash = "sha256:ff70335d468e7eb6ec65b95b99d3a2836546063f63acc5171de367e834932a81", size = 34031, upload-time = "2024-12-04T17:35:28.174Z" }
+wheels = [
+    { url = "https://files.pythonhosted.org/packages/b7/ce/149a00dd41f10bc29e5921b496af8b574d8413afcd5e30dfa0ed46c2cc5e/six-1.17.0-py2.py3-none-any.whl", hash = "sha256:4721f391ed90541fddacab5acf947aa0d3dc7d27b2e1e8eda2be8970586c3274", size = 11050, upload-time = "2024-12-04T17:35:26.475Z" },
+]
+"#;
+
+const UV_LOCK_DRIFTED_TRANSITIVE: &str = r#"version = 1
+revision = 2
+requires-python = ">=3.9"
+
+[[package]]
+name = "demo"
+version = "0.1.0"
+source = { virtual = "." }
+dependencies = [
+    { name = "python-dateutil" },
+]
+
+[package.metadata]
+requires-dist = [{ name = "python-dateutil", specifier = "==2.9.0.post0" }]
+
+[[package]]
+name = "python-dateutil"
+version = "2.9.0.post0"
+source = { registry = "https://pypi.org/simple" }
+dependencies = [
+    { name = "six" },
+]
+sdist = { url = "https://files.pythonhosted.org/packages/66/c0/0c8b6ad9f17a802ee498c46e004a0eb49bc148f2fd230864601a86dcf6db/python-dateutil-2.9.0.post0.tar.gz", hash = "sha256:37dd54208da7e1cd875388217d5e00ebd4179249f90fb72437e91a35459a0ad3", size = 342432, upload-time = "2024-03-01T18:36:20.211Z" }
+wheels = [
+    { url = "https://files.pythonhosted.org/packages/ec/57/56b9bcc3c9c6a792fcbaf139543cee77261f3651ca9da0c93f5c1221264b/python_dateutil-2.9.0.post0-py2.py3-none-any.whl", hash = "sha256:a8b2bc7bffae282281c8140a97d3aa9c14da0b136dfe83f850eea9a5f7470427", size = 229892, upload-time = "2024-03-01T18:36:18.57Z" },
+]
+
+[[package]]
+name = "six"
+version = "1.17.0"
+source = { registry = "https://pypi.org/simple" }
+sdist = { url = "https://files.pythonhosted.org/packages/94/e7/b2c673351809dca68a0e064b6af791aa332cf192da575fd474ed7d6f16a2/six-1.17.0.tar.gz", hash = "sha256:ff70335d468e7eb6ec65b95b99d3a2836546063f63acc5171de367e834932a81", size = 34031, upload-time = "2024-12-04T17:35:28.174Z" }
+wheels = [
+    { url = "https://files.pythonhosted.org/packages/b7/ce/149a00dd41f10bc29e5921b496af8b574d8413afcd5e30dfa0ed46c2cc5e/six-1.17.0-py2.py3-none-any.whl", hash = "sha256:4721f391ed90541fddacab5acf947aa0d3dc7d27b2e1e8eda2be8970586c3274", size = 11050, upload-time = "2024-12-04T17:35:26.475Z" },
+]
+"#;
+
+/// #723: vendor a uv project whose lock resolves `six` 1.17.0 while the
+/// manifest patches `six@1.16.0`; vendored uv pins the lock down to the
+/// patch version.
+fn drifted_uv_project(dependency: &str, lock: &str) -> (tempfile::TempDir, std::path::PathBuf) {
+    let (tmp, root) = project();
+    std::fs::write(
+        root.join("pyproject.toml"),
+        format!(
+            "[project]\nname = \"demo\"\nversion = \"0.1.0\"\nrequires-python = \">=3.9\"\ndependencies = [\"{dependency}\"]\n"
+        ),
+    )
+    .unwrap();
+    std::fs::write(root.join("uv.lock"), lock).unwrap();
+    vendor_project(&root, &["uv.lock", "pyproject.toml"]);
+    (tmp, root)
+}
+
+fn drifted_uv_direct() -> (tempfile::TempDir, std::path::PathBuf) {
+    drifted_uv_project("six>=1.15", UV_LOCK_DRIFTED_DIRECT)
+}
+
+fn drifted_uv_transitive() -> (tempfile::TempDir, std::path::PathBuf) {
+    drifted_uv_project("python-dateutil==2.9.0.post0", UV_LOCK_DRIFTED_TRANSITIVE)
+}
+
+#[tokio::test]
+async fn uv_pinned_down_direct_takeover_is_refused_before_revert() {
+    let (_tmp, root) = drifted_uv_direct();
+    assert_takeover_refused(
+        &root,
+        &["uv.lock", "pyproject.toml"],
+        "redirect_uv_takeover_version_unreachable",
+        false,
+    )
+    .await;
+}
+
+#[tokio::test]
+async fn dry_run_predicts_uv_pinned_down_direct_takeover_refusal() {
+    let (_tmp, root) = drifted_uv_direct();
+    assert_takeover_refused(
+        &root,
+        &["uv.lock", "pyproject.toml"],
+        "redirect_uv_takeover_version_unreachable",
+        true,
+    )
+    .await;
+}
+
+#[tokio::test]
+async fn uv_pinned_down_transitive_takeover_is_refused_before_revert() {
+    let (_tmp, root) = drifted_uv_transitive();
+    assert_takeover_refused(
+        &root,
+        &["uv.lock", "pyproject.toml"],
+        "redirect_uv_takeover_version_unreachable",
+        false,
+    )
+    .await;
+}
+
+#[tokio::test]
+async fn dry_run_predicts_uv_pinned_down_transitive_takeover_refusal() {
+    let (_tmp, root) = drifted_uv_transitive();
+    assert_takeover_refused(
+        &root,
+        &["uv.lock", "pyproject.toml"],
+        "redirect_uv_takeover_version_unreachable",
+        true,
+    )
+    .await;
+}
+
+/// A Poetry 0.12 lock: no `lock-version`, hashes in `[metadata.hashes]`.
+const POETRY_0_LOCK: &str = r#"[[package]]
+category = "main"
+description = "Python 2 and 3 compatibility utilities"
+name = "six"
+optional = false
+python-versions = ">=2.7, !=3.0.*, !=3.1.*, !=3.2.*"
+version = "1.16.0"
+
+[metadata]
+content-hash = "4b42a89b7ff7b26511b06acdc458dbd85312e5083db8f212b017482bc68cdd01"
+python-versions = ">=3.9"
+
+[metadata.hashes]
+six = ["sha256:WHEEL_SHA", "sha256:SDIST_SHA"]
+"#;
+
+/// #945: vendored mode supports a Poetry 0.12 lock, hosted mode refuses
+/// every one of them.
+fn poetry_0_project() -> (tempfile::TempDir, std::path::PathBuf) {
+    let (tmp, root) = project();
+    let files = stage_poetry(&root);
+    std::fs::write(
+        root.join("poetry.lock"),
+        POETRY_0_LOCK
+            .replace("WHEEL_SHA", WHEEL_SHA)
+            .replace("SDIST_SHA", SDIST_SHA),
+    )
+    .unwrap();
+    vendor_project(&root, files);
+    (tmp, root)
+}
+
+#[tokio::test]
+async fn poetry_0_lock_takeover_is_refused_before_revert() {
+    let (_tmp, root) = poetry_0_project();
+    assert_takeover_refused(
+        &root,
+        &["poetry.lock", "pyproject.toml"],
+        "redirect_poetry_lock_unsupported",
+        false,
+    )
+    .await;
+}
+
+#[tokio::test]
+async fn dry_run_predicts_poetry_0_lock_takeover_refusal() {
+    let (_tmp, root) = poetry_0_project();
+    assert_takeover_refused(
+        &root,
+        &["poetry.lock", "pyproject.toml"],
+        "redirect_poetry_lock_unsupported",
+        true,
+    )
+    .await;
 }
