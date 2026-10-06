@@ -69,8 +69,24 @@ pub async fn refusal(view: &ProjectView<'_>, candidates: &[Candidate]) -> Option
         }
     }
     if candidates.iter().any(|c| c.dep.ecosystem == "npm") {
+        let workspace = if has_own_npm_family_lock(root) {
+            None
+        } else {
+            package_json_workspace_refusal(root).await
+        };
         if let Some(lock) = pnpm_lock_elsewhere(root).await {
             let dir = lock.parent().unwrap_or(&lock);
+            // A `package.json` workspace root nested inside the pnpm lock's
+            // directory is nearer the member and owns its lock (Bugbot on
+            // #901); otherwise pnpm's workspace or `lockfile-dir` governs.
+            if let Some((ws_root, refusal)) = workspace {
+                let pnpm_dir = tokio::fs::canonicalize(dir)
+                    .await
+                    .unwrap_or_else(|_| dir.to_path_buf());
+                if ws_root != pnpm_dir && ws_root.starts_with(&pnpm_dir) {
+                    return Some(refusal);
+                }
+            }
             return Some(Refusal {
                 code: PNPM_LOCKFILE_ELSEWHERE.to_string(),
                 message: format!(
@@ -83,10 +99,8 @@ pub async fn refusal(view: &ProjectView<'_>, candidates: &[Candidate]) -> Option
                 ),
             });
         }
-        if !has_own_npm_family_lock(root) {
-            if let Some(refusal) = package_json_workspace_refusal(root).await {
-                return Some(refusal);
-            }
+        if let Some((_, refusal)) = workspace {
+            return Some(refusal);
         }
     }
     None
@@ -199,9 +213,10 @@ const WORKSPACE_ROOT_LOCKS: [&str; 8] = [
 /// lock may itself be a member of an outer workspace (yarn berry's nested
 /// worktrees), so the walk goes on with that root as the member and
 /// refuses at the first root that holds a lock; a chain that ends without
-/// one (never installed), or at a Rush root, refuses nothing. Runs after
-/// the pnpm check, which names a pnpm workspace's root more precisely.
-async fn package_json_workspace_refusal(root: &Path) -> Option<Refusal> {
+/// one (never installed), or at a Rush root, refuses nothing. Returns the
+/// governing root with the refusal, so [`refusal`] can weigh it against
+/// the pnpm check (the nearer root wins; a tie goes to pnpm's message).
+async fn package_json_workspace_refusal(root: &Path) -> Option<(PathBuf, Refusal)> {
     let canonical = tokio::fs::canonicalize(root)
         .await
         .unwrap_or_else(|_| root.to_path_buf());
@@ -237,7 +252,7 @@ async fn package_json_workspace_refusal(root: &Path) -> Option<Refusal> {
             member = ancestor;
             continue;
         }
-        return Some(Refusal {
+        let refusal = Refusal {
             code: WORKSPACE_LOCKFILE_ELSEWHERE.to_string(),
             message: format!(
                 "{} is a workspace member with no lockfile of its own: the workspace \
@@ -253,7 +268,8 @@ async fn package_json_workspace_refusal(root: &Path) -> Option<Refusal> {
                     .join(", "),
                 ancestor.display()
             ),
-        });
+        };
+        return Some((ancestor.to_path_buf(), refusal));
     }
     None
 }
@@ -783,6 +799,46 @@ mod tests {
                 && refusal.message.contains(PNPM_LOCK),
             "{}",
             refusal.message
+        );
+    }
+
+    /// Bugbot on #901: a yarn workspace nested inside a pnpm workspace is
+    /// nearer the member and owns its lock, so it is the root named.
+    #[tokio::test]
+    async fn nearer_package_json_root_beats_an_outer_pnpm_workspace() {
+        let tmp = tempfile::tempdir().unwrap();
+        write(tmp.path(), PNPM_WORKSPACE, "packages:\n  - tools/*\n");
+        write(tmp.path(), PNPM_LOCK, "lockfileVersion: '9.0'\n");
+        write(
+            tmp.path(),
+            "apps/package.json",
+            r#"{"private":true,"workspaces":["web"]}"#,
+        );
+        write(tmp.path(), "apps/yarn.lock", "");
+        write(tmp.path(), "apps/web/package.json", "{}");
+        let member = tmp.path().join("apps/web");
+        let refusal = refusal(&ProjectView::Disk(&member), &[candidate("npm")])
+            .await
+            .expect("member refused");
+        assert_eq!(refusal.code, WORKSPACE_LOCKFILE_ELSEWHERE);
+        let apps = std::fs::canonicalize(tmp.path().join("apps")).unwrap();
+        assert!(
+            refusal
+                .message
+                .contains(&format!("run socket-patch from {}", apps.display())),
+            "{}",
+            refusal.message
+        );
+        // Same directory: pnpm's own message wins the tie.
+        write(
+            tmp.path(),
+            "package.json",
+            r#"{"private":true,"workspaces":["tools/*"]}"#,
+        );
+        write(tmp.path(), "tools/t/package.json", "{}");
+        assert_eq!(
+            code(&tmp.path().join("tools/t"), "npm").await.as_deref(),
+            Some(PNPM_LOCKFILE_ELSEWHERE)
         );
     }
 
