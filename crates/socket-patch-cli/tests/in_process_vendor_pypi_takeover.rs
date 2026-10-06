@@ -14,12 +14,13 @@
 //! The patch API, the hosted wheel and PyPI's JSON API are wiremock; no
 //! Python toolchain is needed.
 
+#[path = "common/hermetic.rs"]
+mod hermetic;
 #[path = "prebuilt_common/mod.rs"]
 mod prebuilt_common;
 
 use std::io::Write as _;
 use std::path::Path;
-use std::process::Command;
 
 use base64::Engine as _;
 use serde_json::{json, Value};
@@ -279,7 +280,7 @@ fn run_scan(root: &Path, server: &MockServer, mode: &str, extra: &[&str]) -> (i3
     .unwrap();
     std::fs::write(info.join("RECORD"), "six.py,,\n").unwrap();
     let uri = server.uri();
-    let mut cmd = Command::new(env!("CARGO_BIN_EXE_socket-patch"));
+    let mut cmd = hermetic::binary_command();
     cmd.args([
         "scan",
         "--mode",
@@ -299,11 +300,6 @@ fn run_scan(root: &Path, server: &MockServer, mode: &str, extra: &[&str]) -> (i3
     .arg("--cwd")
     .arg(root)
     .current_dir(root);
-    for (key, _) in std::env::vars() {
-        if key.starts_with("SOCKET_") {
-            cmd.env_remove(key);
-        }
-    }
     cmd.env("SOCKET_TELEMETRY_DISABLED", "1")
         .env("SOCKET_PYPI_JSON_API", format!("{uri}/pypi"))
         .env("VIRTUAL_ENV", &venv)
