@@ -525,6 +525,24 @@ fn yaml_top_level_value(text: &str, key: &str) -> Option<String> {
         .filter(|value| !value.is_empty())
 }
 
+/// The registry a berry restore reads `name`'s version document from:
+/// `.yarnrc.yml`'s `npmRegistryServer`. A scoped package may resolve
+/// against an `npmScopes` registry instead, so with such a block present
+/// it keeps the default registry's document.
+fn berry_lookup_registry(yarnrc: Option<&str>, name: &str) -> Option<String> {
+    let text = yarnrc?;
+    let has_scopes = text
+        .strip_prefix('\u{feff}')
+        .unwrap_or(text)
+        .lines()
+        .filter_map(crate::formats::pnpm::workspace::top_level_key)
+        .any(|(key, _)| key == "npmScopes");
+    if has_scopes && name.starts_with('@') {
+        return None;
+    }
+    yaml_top_level_value(text, "npmRegistryServer")
+}
+
 async fn restore_berry(
     view: &mut View<'_>,
     rel: &str,
@@ -693,7 +711,8 @@ async fn restore_berry(
     let project_registry = yarnrc
         .as_deref()
         .and_then(|text| yaml_top_level_value(text, "npmRegistryServer"));
-    let dists = fetch_dists_on(&wanted, |_| project_registry.clone(), ctx, result).await;
+    let registry = |name: &str| berry_lookup_registry(yarnrc.as_deref(), name);
+    let dists = fetch_dists_on(&wanted, registry, ctx, result).await;
     let mut changed = false;
     let mut moved: Vec<String> = Vec::new();
     for Hit {
@@ -1145,7 +1164,46 @@ pub(crate) async fn cleanup_side_config(
 
 #[cfg(test)]
 mod tests {
-    use super::{berry_registry_locator, registry_derives_tarball, yaml_top_level_value};
+    use super::{
+        berry_lookup_registry, berry_registry_locator, non_default_registry,
+        registry_derives_tarball, yaml_top_level_value,
+    };
+
+    #[test]
+    fn berry_reads_the_project_registry_except_for_npm_scopes() {
+        let rc = "npmRegistryServer: \"https://m.example/npm/\"\n";
+        assert_eq!(
+            berry_lookup_registry(Some(rc), "a").as_deref(),
+            Some("https://m.example/npm/")
+        );
+        assert_eq!(
+            berry_lookup_registry(Some(rc), "@s/a").as_deref(),
+            Some("https://m.example/npm/")
+        );
+        let scoped = format!("{rc}npmScopes:\n  s:\n    npmRegistryServer: https://s.example\n");
+        assert_eq!(
+            berry_lookup_registry(Some(&scoped), "a").as_deref(),
+            Some("https://m.example/npm/")
+        );
+        assert_eq!(berry_lookup_registry(Some(&scoped), "@s/a"), None);
+        assert_eq!(berry_lookup_registry(None, "a"), None);
+    }
+
+    #[test]
+    fn npmjs_and_its_yarnpkg_alias_are_the_default_registry() {
+        for base in [
+            "https://registry.npmjs.org",
+            "https://registry.npmjs.org/",
+            "http://registry.yarnpkg.com/",
+            "",
+        ] {
+            assert_eq!(non_default_registry(base), None, "{base:?}");
+        }
+        assert_eq!(
+            non_default_registry("https://m.example/npm/").as_deref(),
+            Some("https://m.example/npm")
+        );
+    }
 
     #[test]
     fn project_registry_decides_a_mirrors_tarball_urls() {
