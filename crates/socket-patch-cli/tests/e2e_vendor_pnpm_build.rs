@@ -888,9 +888,13 @@ fn assert_manifestless_vendored_vex(
         let state = fresh.join(".socket/vendor/state.json");
         let lock_wired = std::fs::read(&lock).expect("fresh checkout lock");
         let pkg_wired = std::fs::read(fresh.join("package.json")).unwrap();
+        let (dep, version) = purl
+            .strip_prefix("pkg:npm/")
+            .and_then(|nv| nv.rsplit_once('@'))
+            .expect("an npm purl");
         assert!(
             fresh
-                .join(format!(".socket/vendor/npm/{UUID}/{DEP}-{DEP_VERSION}.tgz"))
+                .join(format!(".socket/vendor/npm/{UUID}/{dep}-{version}.tgz"))
                 .is_file(),
             "[{tag}] the committed tarball must travel with the checkout"
         );
@@ -1025,7 +1029,7 @@ fn assert_manifestless_vendored_vex(
         );
         assert!(plain.status.success(), "[{tag}] plain install: {plain:?}");
         assert_eq!(
-            std::fs::read(fresh.join("node_modules").join(DEP).join("index.js")).unwrap(),
+            std::fs::read(fresh.join("node_modules").join(dep).join("index.js")).unwrap(),
             patched,
             "[{tag}] a plain install must re-apply the overrides (vendored bytes)"
         );
@@ -1062,8 +1066,26 @@ async fn pnpm_pinned_matrix_vendored_lifecycle_and_manifestless_vex() {
             run_pnpm_capstone(&pm, VendorDriver::VendorCli).await;
             run_pnpm_capstone(&pm, VendorDriver::GetUuid).await;
         }
-        7 => off_runtime(|| run_legacy_capstone(&pm, "lockfileVersion: 5.4", "proj")),
-        8 => off_runtime(|| run_legacy_capstone(&pm, "lockfileVersion: '6.0'", "proj")),
+        7 => off_runtime(|| {
+            run_legacy_capstone(&pm, "lockfileVersion: 5.4", "proj");
+            run_legacy_capstone_for(
+                &pm,
+                "lockfileVersion: 5.4",
+                "proj",
+                SCOPED_DEP,
+                SCOPED_DEP_VERSION,
+            );
+        }),
+        8 => off_runtime(|| {
+            run_legacy_capstone(&pm, "lockfileVersion: '6.0'", "proj");
+            run_legacy_capstone_for(
+                &pm,
+                "lockfileVersion: '6.0'",
+                "proj",
+                SCOPED_DEP,
+                SCOPED_DEP_VERSION,
+            );
+        }),
         _ => off_runtime(|| run_unsupported_lock_refusal(&pm)),
     }
 }
@@ -1637,6 +1659,43 @@ fn pnpm8_real_lifecycle_under_yaml_indicator_paths() {
     }
 }
 
+/// #956: a scoped package's rekeyed packages entry must keep the lock
+/// loadable. An unquoted `name: @scope/pkg` is invalid YAML, so every
+/// frozen install failed with ERR_PNPM_BROKEN_LOCKFILE after a successful
+/// vendor.
+const SCOPED_DEP: &str = "@isaacs/string-locale-compare";
+const SCOPED_DEP_VERSION: &str = "1.1.0";
+
+#[test]
+fn pnpm7_real_lifecycle_scoped_package() {
+    if !has_corepack_pm(PNPM_LEGACY_7) {
+        println!("SKIP: `corepack {PNPM_LEGACY_7}` unavailable");
+        return;
+    }
+    run_legacy_capstone_for(
+        PNPM_LEGACY_7,
+        "lockfileVersion: 5.4",
+        "proj",
+        SCOPED_DEP,
+        SCOPED_DEP_VERSION,
+    );
+}
+
+#[test]
+fn pnpm8_real_lifecycle_scoped_package() {
+    if !has_corepack_pm(PNPM_LEGACY_8) {
+        println!("SKIP: `corepack {PNPM_LEGACY_8}` unavailable");
+        return;
+    }
+    run_legacy_capstone_for(
+        PNPM_LEGACY_8,
+        "lockfileVersion: '6.0'",
+        "proj",
+        SCOPED_DEP,
+        SCOPED_DEP_VERSION,
+    );
+}
+
 /// Full lifecycle against the REAL pinned legacy pnpm, spike-proven flags:
 ///
 /// 1. online fixture install (skip when the registry is unreachable);
@@ -1653,6 +1712,11 @@ fn pnpm8_real_lifecycle_under_yaml_indicator_paths() {
 /// 5. idempotent re-vendor (byte-stable, already_vendored);
 /// 6. revert restores both files byte-identical and removes .socket/vendor.
 fn run_legacy_capstone(pm: &str, lock_head: &str, proj_dir: &str) {
+    run_legacy_capstone_for(pm, lock_head, proj_dir, DEP, DEP_VERSION);
+}
+
+/// [`run_legacy_capstone`] for any registry package `dep@version`.
+fn run_legacy_capstone_for(pm: &str, lock_head: &str, proj_dir: &str, dep: &str, version: &str) {
     let tmp = tempfile::tempdir().unwrap();
     let proj = tmp.path().join(proj_dir);
     std::fs::create_dir_all(&proj).unwrap();
@@ -1660,7 +1724,7 @@ fn run_legacy_capstone(pm: &str, lock_head: &str, proj_dir: &str) {
         "name": "pnpm-legacy-capstone",
         "version": "0.0.0",
         "private": true,
-        "dependencies": { DEP: DEP_VERSION },
+        "dependencies": { dep: version },
     });
     std::fs::write(
         proj.join("package.json"),
@@ -1688,10 +1752,10 @@ fn run_legacy_capstone(pm: &str, lock_head: &str, proj_dir: &str) {
         return;
     }
 
-    let installed_index = proj.join("node_modules").join(DEP).join("index.js");
+    let installed_index = proj.join("node_modules").join(dep).join("index.js");
     let orig = std::fs::read(&installed_index).expect("installed index.js");
     let patched: Vec<u8> = [MARKER.as_bytes(), orig.as_slice()].concat();
-    let purl = format!("pkg:npm/{DEP}@{DEP_VERSION}");
+    let purl = format!("pkg:npm/{dep}@{version}");
     stage_patch(&proj, &purl, "package/index.js", &orig, &patched);
 
     let lock_path = proj.join("pnpm-lock.yaml");
@@ -1722,18 +1786,24 @@ fn run_legacy_capstone(pm: &str, lock_head: &str, proj_dir: &str) {
     let env = parse_envelope(&stdout);
     assert_eq!(env["status"], "success", "envelope: {env}");
     assert_eq!(env["summary"]["applied"], 1, "{env}");
-    let tgz_rel = format!(".socket/vendor/npm/{UUID}/{DEP}-{DEP_VERSION}.tgz");
+    let tgz_rel = format!(".socket/vendor/npm/{UUID}/{dep}-{version}.tgz");
     assert!(proj.join(&tgz_rel).is_file());
     assert!(
         !proj.join("pnpm-workspace.yaml").exists(),
         "legacy wiring must not create pnpm-workspace.yaml ({pm})"
     );
     let lock_after = std::fs::read_to_string(&lock_path).unwrap();
+    // pnpm single-quotes an `@`-leading (scoped) key.
+    let override_key = if dep.starts_with('@') {
+        format!("'{dep}@{version}'")
+    } else {
+        format!("{dep}@{version}")
+    };
     let abs = socket_patch_core::vendor::pnpm_lock_legacy::normalize_canonical_root(
         &std::fs::canonicalize(&proj).unwrap().display().to_string(),
     );
     assert!(
-        lock_after.contains(&format!("{DEP}@{DEP_VERSION}: file:{tgz_rel}")),
+        lock_after.contains(&format!("{override_key}: file:{tgz_rel}")),
         "lock overrides must point at the vendored tarball ({pm}):\n{lock_after}"
     );
     assert!(
@@ -1857,7 +1927,7 @@ fn run_legacy_capstone(pm: &str, lock_head: &str, proj_dir: &str) {
         String::from_utf8_lossy(&plain.stderr),
     );
     let fresh_installed =
-        std::fs::read(fresh.join("node_modules").join(DEP).join("index.js")).unwrap();
+        std::fs::read(fresh.join("node_modules").join(dep).join("index.js")).unwrap();
     assert_eq!(
         fresh_installed, patched,
         "moved-checkout install must land the patched bytes ({pm})"
