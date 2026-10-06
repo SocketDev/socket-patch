@@ -2,7 +2,7 @@
 
 The routine runs every 6 hours. Each run adds one comment here with the socket-patch commit it tested, the OS × Pipenv-version × mode cells it covered, the issues it filed, updated or closed, and what it plans to probe next. The routine treats this thread as its only memory.
 
-Last run: 2026-10-05 ~21:44Z, main `9c43dfc` (CLI 4.0.0). #654 and #730 merged: #645, #546 and #725 are re-verified fixed with real Pipenv (agent apply / vex and vendored `vendor --check`). #842 still fails on 2023.12.1. PR #825 (#769) is still open.
+Last run: 2026-10-06 ~03:37Z, main `9c43dfc` (CLI 4.0.0, unchanged). New: #912 (Pipenv 2026.4+ installs a pylock-only project from `pylock.toml` and ignores the `archive` entry socket-patch writes). Previous run: 2026-10-05 ~21:44Z. #654 and #730 merged: #645, #546 and #725 are re-verified fixed with real Pipenv (agent apply / vex and vendored `vendor --check`). #842 still fails on 2023.12.1. PR #825 (#769) is still open.
 
 ## Coverage matrix
 
@@ -68,9 +68,13 @@ Stale-install remedy followed verbatim, `15:30Z` run, `045d7ec`: `default` patch
 
 `21:44Z` run (2026-10-05), `9c43dfc`, with an apply-based oracle (offline `apply` from a local manifest, checking which `six.py` copies are patched): #645 shape (`.venv` + WORKON + `PIPENV_VENV_IN_PROJECT=0` / `NO_VENV_IN_PROJECT=1`) on 2018.11.26 / 2023.10.24 / 2023.12.1 / 2026.8.0 patches both venvs, and agent vex with either copy stale gives `not_applied` (pass). `.env` shapes (plain, CRLF, export, quoted, `${VAR}`, override, custom name, DOTENV_LOCATION, IN_PROJECT=1, relative WORKON_HOME incl. `--cwd` from the parent, BOM, DONT_LOAD_ENV) on 2023.12.1 / 2026.8.0, plus 2018.11.26: pass, and agent vex is honest. Non-boolean `PIPENV_VENV_IN_PROJECT` × Pipfile key on 2026.8.0: pass. `vendor --check` after a real `pipenv lock` (2018 / 2026) and uuid drift: pass (#725 fixed). #842 agent on 2023.12.1: still fails.
 
+`03:37Z` run (2026-10-06), `9c43dfc`: Pipenv `[pipenv] use_pylock = true`. With `Pipfile.lock` + `pylock.toml` both present, hosted on 2026.8.0 passes. pylock-only, hosted / vendored: `pipenv sync` installs upstream on 2026.4.0 / 2026.6.0 / 2026.7.1 / 2026.8.0 (fail #912; vendored vex gives a false `not_affected`); 2026.0.0–2026.2.2 fail loudly (`Pipfile.lock not found`). Hosted stale warning with `.env` WORKON_HOME (2026.8.0), stale warning + remedy + vex on 2024.4.1, `pipenv upgrade <other>` keeping the reference, and Pipfile.lock mode preservation: pass.
+
 macOS/Windows rows are from the 2026-09-30 probes on `f6b7fb9`. No probe ran on v5 because branch deletion through the git proxy still fails (re-checked 2026-10-03 03:30Z); `bughunt/pipenv/20260930-venv-discovery` and `bughunt/pipenv/20260930-virtualenv` still need a maintainer to delete them.
 
 ## Backlog
+
+0000. #912 variants: `pylock.<name>.toml` (`pylock_name`), dev packages in pylock, rollback / remove / repair on a pylock-only Pipenv project; re-verify once fixed.
 
 000. (#790 re-verified fixed on main `0d302dc`, 2026-10-05 19:15Z.) Still untested: Windows cmd / PowerShell quoting of `--categories "…"`.
 00. Re-verify #769 once fixed (vendored re-vendor A → B: rewire in place, old uuid dir removed, revert byte-exact, no false `package_not_installed` with a venv). (Hosted supersede on 2018 / 2022 / 2023, develop / named categories and with a sibling requirements.txt: done 2026-10-04 15:30Z, pass.)
@@ -88,6 +92,9 @@ macOS/Windows rows are from the 2026-09-30 probes on `f6b7fb9`. No probe ran on 
 7. A macOS/Windows probe re-verifying #333 / #334 / #384 / #529 / #546 / #645, and hosted / vendored on 2018 / 2022 there (CRLF on Windows). Blocked: branch deletion fails through the git proxy, and as of 2026-10-05 21:44Z it is also refused by the session's permission policy.
 
 ## Known non-bugs
+
+- `pipenv install` / `install --deploy` on a pylock-only Pipenv 2026 project relocks and drops the reference (documented relock behaviour). Pipenv 2026.0–2026.2.x `sync` refuses a pylock-only project (`Pipfile.lock not found`), so that's not silent. Only 2026.4+ `sync` is #912.
+- Hosted scan from a monorepo root ignores `services/*/Pipfile.lock`: documented CLI scope (`<cwd>/Pipfile.lock` only, use `--cwd`).
 
 - Hosted vex with `.venv` + WORKON venv under `PIPENV_VENV_IN_PROJECT=0` checks both copies, so it gives `not_applied` when either is stale. That's correct; only the stale warning is #645.
 
