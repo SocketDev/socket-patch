@@ -122,6 +122,80 @@ fn capture(kind: &str, origin: Origin) -> MirrorCapture {
     }
 }
 
+/// Split a flat `.bundle/config` mapping line into its decoded key and the
+/// text after the separator. URI keys contain colons, so only a YAML mapping
+/// separator ends a plain key. Bundler 4.1 double-quotes keys that contain
+/// `:` (every URL-scoped mirror key), escaping them as its YAML serializer
+/// writes and reads them; a single-quoted key doubles its quotes.
+fn config_key(line: &str) -> Option<(String, &str)> {
+    let rest_after = |rest: &str| -> Option<usize> {
+        (rest.starts_with(':') && (rest.len() == 1 || rest[1..].starts_with([' ', '\t'])))
+            .then_some(1)
+    };
+    if let Some(quoted) = line.strip_prefix('"') {
+        let mut key = String::new();
+        let mut chars = quoted.char_indices();
+        while let Some((index, ch)) = chars.next() {
+            match ch {
+                '"' => {
+                    let rest = &quoted[index + 1..];
+                    return rest_after(rest).map(|n| (key, &rest[n..]));
+                }
+                '\\' => {
+                    let (_, escaped) = chars.next()?;
+                    match escaped {
+                        '\\' | '"' => key.push(escaped),
+                        '0' => key.push('\0'),
+                        'a' => key.push('\u{7}'),
+                        'b' => key.push('\u{8}'),
+                        't' => key.push('\t'),
+                        'n' => key.push('\n'),
+                        'v' => key.push('\u{b}'),
+                        'f' => key.push('\u{c}'),
+                        'r' => key.push('\r'),
+                        'e' => key.push('\u{1b}'),
+                        'x' => {
+                            let hex: String = chars.by_ref().take(2).map(|(_, c)| c).collect();
+                            let byte = (hex.len() == 2)
+                                .then(|| u8::from_str_radix(&hex, 16).ok())
+                                .flatten()?;
+                            key.push(char::from(byte));
+                        }
+                        // Bundler leaves an unknown escape as written.
+                        other => {
+                            key.push('\\');
+                            key.push(other);
+                        }
+                    }
+                }
+                _ => key.push(ch),
+            }
+        }
+        return None;
+    }
+    if let Some(quoted) = line.strip_prefix('\'') {
+        let mut key = String::new();
+        let mut rest = quoted;
+        loop {
+            let end = rest.find('\'')?;
+            key.push_str(&rest[..end]);
+            rest = &rest[end + 1..];
+            match rest.strip_prefix('\'') {
+                Some(after) => {
+                    key.push('\'');
+                    rest = after;
+                }
+                None => return rest_after(rest).map(|n| (key, &rest[n..])),
+            }
+        }
+    }
+    let index = line.char_indices().find_map(|(index, ch)| {
+        (ch == ':' && (line[index + 1..].is_empty() || line[index + 1..].starts_with([' ', '\t'])))
+            .then_some(index)
+    })?;
+    Some((line[..index].to_owned(), &line[index + 1..]))
+}
+
 /// Detect a capturing mirror in the app config and explicit environment
 /// settings. `config` is absent when `BUNDLE_IGNORE_CONFIG` is set. Environment
 /// keys use Bundler's encoded `BUNDLE_MIRROR__...` spelling.
@@ -138,17 +212,12 @@ pub fn capturing_mirror(
     }
     if let Some(config) = config {
         for line in config.lines() {
-            // URI keys contain colons, so only a YAML mapping separator ends
-            // the key. Preserve empty values so a local key still shadows env.
-            if let Some(index) = line.char_indices().find_map(|(index, ch)| {
-                (ch == ':'
-                    && (line[index + 1..].is_empty() || line[index + 1..].starts_with([' ', '\t'])))
-                .then_some(index)
-            }) {
+            // Preserve empty values so a local key still shadows env.
+            if let Some((key, value)) = config_key(line) {
                 // Settings#load_config also accepts legacy literal dots and
                 // dashes, and appends a missing slash to HTTP(S) source keys.
                 // Environment keys do not get this file-only normalization.
-                let mut key = line[..index].to_owned();
+                let mut key = key;
                 let lower = key.to_ascii_lowercase();
                 if (lower.contains("http:") || lower.contains("https:"))
                     && !key.ends_with('/')
@@ -160,13 +229,7 @@ pub fn capturing_mirror(
                 if !key.starts_with(MIRROR_PREFIX) {
                     continue;
                 }
-                settings.insert(
-                    key,
-                    (
-                        unquote_bundle_config_value(&line[index + 1..]),
-                        Origin::AppConfig,
-                    ),
-                );
+                settings.insert(key, (unquote_bundle_config_value(value), Origin::AppConfig));
             }
         }
     }
@@ -463,6 +526,46 @@ mod tests {
                 }
             }
         }
+    }
+
+    #[test]
+    fn bundler_4_1_quoted_url_keys_are_read() {
+        // Bundler 4.1 double-quotes every config key that contains `:`, so a
+        // URL-scoped mirror key arrives quoted; keys without `:` stay bare.
+        let key = encoded_key(SRC);
+        for cfg in [
+            format!("---\n\"{key}\": \"{URL}\"\n"),
+            format!("---\n\"{key}\": {URL}\n"),
+            format!("'{key}': '{URL}'\n"),
+        ] {
+            let c = capturing_mirror(Some(&cfg), &[], &[SRC]).unwrap();
+            assert!(c.setting.contains("exact patch-source"), "{cfg}: {c:?}");
+        }
+        // A quoted empty value still shadows the environment mirror.
+        let empty = format!("\"{key}\": \"\"\n");
+        assert_eq!(capturing_mirror(Some(&empty), &[(&key, URL)], &[SRC]), None);
+        // A quoted exact fallback-only key still shadows the host mirror.
+        let fallback = encoded_key(&format!("{SRC}{FALLBACK_SUFFIX}"));
+        let cfg = format!("{}\"{fallback}\": \"3\"\n", config("patch.socket.dev"));
+        assert_eq!(capturing_mirror(Some(&cfg), &[], &[SRC]), None);
+        // Legacy slash-less quoted keys get the same file normalization.
+        let legacy = format!("\"{}\": \"{URL}\"\n", key.trim_end_matches('/'));
+        assert!(capturing_mirror(Some(&legacy), &[], &[SRC]).is_some());
+    }
+
+    #[test]
+    fn quoted_config_keys_unescape_like_bundler_writes_them() {
+        assert_eq!(
+            config_key(r#""A\"B\\C": x"#),
+            Some(("A\"B\\C".into(), " x"))
+        );
+        assert_eq!(config_key(r#""A": x"#), Some(("A".into(), " x")));
+        assert_eq!(config_key("'A''B': x"), Some(("A'B".into(), " x")));
+        assert_eq!(config_key("A: x"), Some(("A".into(), " x")));
+        assert_eq!(config_key("A:"), Some(("A".into(), "")));
+        // An unterminated or unseparated quoted key is not a mapping entry.
+        assert_eq!(config_key(r#""A: x"#), None);
+        assert_eq!(config_key(r#""A"x: y"#), None);
     }
 
     #[test]

@@ -458,6 +458,10 @@ enum Driver {
     ScanVexMirrorAll,
     /// Hostname app-config and exact/all environment mirrors use the same gate.
     ScanVexMirrorHost,
+    /// An exact patch-source mirror set with `bundle config set --local`.
+    /// Bundler 4.1 double-quotes that key in `.bundle/config` because it
+    /// contains `:`.
+    ScanVexMirrorSource,
     ScanVexMirrorSourceEnv,
     ScanVexMirrorAllEnv,
     /// [`Driver::ScanVex`] on a Gemfile that pulls the gem from a custom
@@ -478,6 +482,7 @@ impl Driver {
             Driver::ScanVexEvalGemfile => "scan --mode hosted (gem via eval_gemfile)",
             Driver::ScanVexMirrorAll => "scan --mode hosted (bundler mirror.all)",
             Driver::ScanVexMirrorHost => "scan --mode hosted (bundler hostname mirror)",
+            Driver::ScanVexMirrorSource => "scan --mode hosted (bundler source mirror)",
             Driver::ScanVexMirrorSourceEnv => "scan --mode hosted (bundler source mirror env)",
             Driver::ScanVexMirrorAllEnv => "scan --mode hosted (bundler mirror.all env)",
             Driver::ScanVexMultiLineDeclaration => "scan --mode hosted (multi-line gem line)",
@@ -945,13 +950,16 @@ async fn redirect_scanned_project(
         "http://review-user:review-secret@",
         1,
     );
-    if matches!(driver, Driver::ScanVexMirrorAll | Driver::ScanVexMirrorHost) {
-        let setting = if driver == Driver::ScanVexMirrorAll {
-            "mirror.all"
-        } else {
-            "mirror.127.0.0.1"
+    if matches!(
+        driver,
+        Driver::ScanVexMirrorAll | Driver::ScanVexMirrorHost | Driver::ScanVexMirrorSource
+    ) {
+        let setting = match driver {
+            Driver::ScanVexMirrorAll => "mirror.all".to_owned(),
+            Driver::ScanVexMirrorHost => "mirror.127.0.0.1".to_owned(),
+            _ => format!("mirror.{index_url}"),
         };
-        let args = bundler.config_local_args(setting, &mirror);
+        let args = bundler.config_local_args(&setting, &mirror);
         let args: Vec<&str> = args.iter().map(String::as_str).collect();
         let cfg = bundle(&proj, &args);
         assert!(
@@ -964,6 +972,7 @@ async fn redirect_scanned_project(
         Driver::ScanVex
         | Driver::ScanVexMirrorAll
         | Driver::ScanVexMirrorHost
+        | Driver::ScanVexMirrorSource
         | Driver::ScanVexMirrorSourceEnv
         | Driver::ScanVexMirrorAllEnv
         | Driver::ScanVexDualBoot
@@ -1043,6 +1052,7 @@ async fn redirect_scanned_project(
         Driver::ScanVexEvalGemfile => Some("redirect_gem_declaration_not_visible"),
         Driver::ScanVexMirrorAll
         | Driver::ScanVexMirrorHost
+        | Driver::ScanVexMirrorSource
         | Driver::ScanVexMirrorSourceEnv
         | Driver::ScanVexMirrorAllEnv => Some("redirect_gem_mirror_overrides_source"),
         Driver::ScanVexCustomGitSource => Some("redirect_gem_source_option"),
@@ -1150,6 +1160,7 @@ async fn redirect_scanned_project(
         | Driver::ScanVexEvalGemfile
         | Driver::ScanVexMirrorAll
         | Driver::ScanVexMirrorHost
+        | Driver::ScanVexMirrorSource
         | Driver::ScanVexMirrorSourceEnv
         | Driver::ScanVexMirrorAllEnv
         | Driver::ScanVexCustomGitSource
@@ -2035,13 +2046,14 @@ async fn gem_hosted_bundler_mirror_all_redirects_nothing() {
     assert!(fx.is_none(), "the mirror.all driver asserts in place");
 }
 
-/// Native hostname and environment mirrors must refuse before writing or
+/// Native hostname, exact-source and environment mirrors must refuse before writing or
 /// attesting, and credentialed values must stay out of JSON and stderr.
 #[tokio::test(flavor = "multi_thread")]
 #[ignore = "host capstone: shells out to real ruby/gem/bundler; pinned e2e job runs --ignored"]
 async fn gem_hosted_bundler_host_and_environment_mirrors_redirect_nothing() {
     for (label, driver) in [
         ("mirror-host", Driver::ScanVexMirrorHost),
+        ("mirror-source", Driver::ScanVexMirrorSource),
         ("mirror-source-env", Driver::ScanVexMirrorSourceEnv),
         ("mirror-all-env", Driver::ScanVexMirrorAllEnv),
     ] {
