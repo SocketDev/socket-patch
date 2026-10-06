@@ -64,6 +64,8 @@ use crate::formats::yarn::berry_entry::{manifest_bin, render_pinned_entry, Pin};
 #[cfg(test)]
 mod pnpm_equivalence_tests;
 mod poetry;
+mod pypi_takeover;
+pub use pypi_takeover::preflight_pypi_takeover;
 #[cfg(test)]
 mod python_lock_equivalence_tests;
 mod requirements;

@@ -1822,10 +1822,29 @@ async fn vendored_takeover(
     } else {
         std::collections::HashMap::new()
     };
+    // A PyPI entry is gated on the hosted rewriter's reach after the
+    // revert: requirements.txt pins only the root file (#699), uv pins
+    // only the version the restored lock resolves (#723), and Poetry
+    // refuses every 0.x lock (#945). Checked once per purl, here, because
+    // the uv and Poetry checks read the ledger and the lock on disk.
+    let mut pypi_takeover_refusals: std::collections::HashMap<
+        String,
+        socket_patch_core::patch::redirect::RewriteWarning,
+    > = std::collections::HashMap::new();
+    for (c, entry) in &takeover {
+        let Some(entry) = entry.as_ref().filter(|_| c.purl.starts_with("pkg:pypi/")) else {
+            continue;
+        };
+        if let Err(warning) =
+            socket_patch_core::patch::redirect::preflight_pypi_takeover(&common.cwd, entry).await
+        {
+            pypi_takeover_refusals.insert(c.purl.clone(), warning);
+        }
+    }
     // The takeover refusal (if any) for one candidate: bun gates every
     // npm purl, berry and vlt only their own vendored entries, Gradle each
-    // of its own purls, and a requirements.txt entry is gated on the hosted
-    // rewriter's reach (it pins only the root file, #699). Berry also runs
+    // of its own purls, and a PyPI entry on the hosted rewriter's reach
+    // (`pypi_takeover_refusals` above). Berry also runs
     // the rewriter's per-dep grant gate (a grant without the berry cache
     // checksum is skipped by the rewriter, so reverting first would leave
     // the package in neither mode). A refused purl is never dispatched (see
@@ -1837,9 +1856,7 @@ async fn vendored_takeover(
             return gradle_takeover_refusals.get(&c.purl).cloned();
         }
         if c.purl.starts_with("pkg:pypi/") {
-            return entry.and_then(|e| {
-                socket_patch_core::patch::redirect::preflight_requirements_takeover(e).err()
-            });
+            return entry.and_then(|_| pypi_takeover_refusals.get(&c.purl).cloned());
         }
         if !c.purl.starts_with("pkg:npm/") {
             return None;
