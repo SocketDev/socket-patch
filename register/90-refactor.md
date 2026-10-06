@@ -1,5 +1,5 @@
 ### Refactor routine (`refactor`, hourly, highest leverage first)
-_Last updated 2026-10-06T08:58Z · main @ 9c43dfc_
+_Last updated 2026-10-06T09:58Z · main @ 9c43dfc_
 
 **In flight:**
 - [#876](https://github.com/SocketDev/socket-patch/pull/876): registry clients (`build_registry_client`, Maven `fetch_registry_bytes`) built through one `registry_client_builder` under `ApiTimeouts`; `registry_fetch::download` onto `read_capped`. Also ports the base-red digest-ratchet fix for #646's JVM files. Issue #872 (C49). `ready`.
@@ -18,12 +18,12 @@ _Last updated 2026-10-06T08:58Z · main @ 9c43dfc_
 | # | Candidate | B | U | D | R | Score | Note |
 |---|---|:-:|:-:|:-:|:-:|:-:|---|
 | 1 | #922 (E22, child 1 of #920): one `VendorEntry::npm` constructor for the 7 npm-family ledger tails | 0 | 1 | ≈7 | L | ≈9 | skipped: drivers changed by #657, #873, #888, #909 |
-| 2 | #773 (C44): one `Ecosystem::from_cli_name` for flag, env, socket.yml, vendor | 1 | 0 | ≈2 | L | ≈5 | skipped: `commands/vendor.rs` changed by #690, #776, #825, #837, #877 |
-| 3 | #856 (E62, child 1 of #855): VEX npm aliases through the core resolver | 1 | 1 | ≈1.8 | M | ≈5 | skipped: `vex_consumed.rs` changed by #690 |
-| 4 | #883 (E39): `canonicalize_pypi_name` + `pep508_name` into one PyPI name module | 0 | 1 | ≈3 | L | ≈5 | skipped: 13 files changed by open PRs |
-| 5 | #893 (C50): `repair` and `scan --prune` keep active patches' beforeHash blobs | 1 | 0 | ≈1 | L | ≈4 | best eligible (`cleanup_blobs.rs`); take when a slot frees |
+| 2 | #931 (C52, child 1 of #930): one manifest-read error mapper (`manifest_invalid`/`manifest_unreadable`) for every command | 1 | 1 | ≈2.5 | M | ≈5.5 | skipped: `commands/vendor.rs` changed by #690, #776, #825, #837, #877 |
+| 3 | #773 (C44): one `Ecosystem::from_cli_name` for flag, env, socket.yml, vendor | 1 | 0 | ≈2 | L | ≈5 | skipped: `commands/vendor.rs` changed by #690, #776, #825, #837, #877 |
+| 4 | #856 (E62, child 1 of #855): VEX npm aliases through the core resolver | 1 | 1 | ≈1.8 | M | ≈5 | skipped: `vex_consumed.rs` changed by #690 |
+| 5 | #883 (E39): `canonicalize_pypi_name` + `pep508_name` into one PyPI name module | 0 | 1 | ≈3 | L | ≈5 | skipped: 13 files changed by open PRs |
 
-Re-ranked 2026-10-06T08:58Z: main unchanged, ranking unchanged. No new `arch-audit`/`refactor` issues since 06:56Z; #883 now also overlaps #911 and #927 (PyPI name normalisation). #893 (≈4, `cleanup_blobs.rs`) stays the best eligible; #871 eligible after #889; then #705. 3 of 3 slots used (#876, #886, #889 `ready`, no review questions). Decisions: #648, #704, #792, #808, #615; C07.
+Re-ranked 2026-10-06T09:58Z: main unchanged. New: tracking #930 (C13, typed `ErrorCode` registry) and its child #931 (≈5.5, skipped on file overlap). #893 (≈4, `cleanup_blobs.rs`) is still the best eligible; then #871 after #889, then #705. 3 of 3 slots used (#876, #886, #889 `ready`, approved, no review questions). Decisions: #648, #704, #792, #808, #615; C07.
 
 **Notes:**
 - The sandbox runs as root, so 4 core lib tests fail on main and on branches alike: `copy_tree::relax_loop_must_not_traverse_symlinked_root`, `vlt_heal::an_unremovable_hidden_lock_keeps_every_store_entry`, `pypi_poetry::wire_write_failure_maps_error_and_leaves_lock_untouched`, `pypi_requirements::wire_failure_rolls_back_already_written_files`.
