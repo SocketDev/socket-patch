@@ -108,7 +108,7 @@ fn pnpm_modules_dir_setting(start_path: &Path) -> Option<String> {
         .ancestors()
         .find_map(|dir| read(dir.join("pnpm-workspace.yaml")))
         .and_then(|yaml| {
-            crate::utils::serde::strip_bom(&yaml)
+            crate::formats::text::strip_bom(&yaml)
                 .lines()
                 .filter_map(crate::formats::pnpm::workspace::top_level_key)
                 .rfind(|(key, _)| key == "modulesDir")
@@ -367,7 +367,7 @@ fn parse_package_json_identity(content: &str) -> Option<(String, String)> {
     // (Windows-authored packages ship them), but serde_json rejects it —
     // a BOM'd install would be invisible to scan and unpatchable.
     let pkg: PackageJsonPartial =
-        serde_json::from_str(crate::utils::serde::strip_bom(content)).ok()?;
+        serde_json::from_str(crate::formats::text::strip_bom(content)).ok()?;
     let name = pkg.name?;
     let version = pkg.version?;
     if name.is_empty() || version.is_empty() {
@@ -591,7 +591,7 @@ const PNPM_MODULES_YAML: &str = ".modules.yaml";
 /// The `virtualStoreDir` value of a `.modules.yaml`: JSON on pnpm 10+,
 /// YAML before (a top-level `virtualStoreDir:` scalar, maybe quoted).
 fn parse_modules_yaml_virtual_store_dir(text: &str) -> Option<String> {
-    let text = crate::utils::serde::strip_bom(text);
+    let text = crate::formats::text::strip_bom(text);
     if let Ok(value) = serde_json::from_str::<serde_json::Value>(text) {
         return value
             .get("virtualStoreDir")?

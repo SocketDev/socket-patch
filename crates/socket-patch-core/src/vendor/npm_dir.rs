@@ -777,7 +777,7 @@ async fn read_manifest(dir: &Path) -> Result<Value, String> {
     let text = crate::utils::fs::read_regular_to_string(&dir.join("package.json"))
         .await
         .map_err(|e| format!("package.json unreadable: {e}"))?;
-    serde_json::from_str(crate::utils::serde::strip_bom(&text))
+    serde_json::from_str(crate::formats::text::strip_bom(&text))
         .map_err(|e| format!("package.json is not parseable JSON: {e}"))
 }
 
