@@ -1188,59 +1188,81 @@ async fn get_site_packages_paths_falls_back_via_uv_lock_marker() {
     let _ = (result, staged);
 }
 
-/// A pipenv-managed project ships `Pipfile`/`Pipfile.lock` and commonly has
-/// NO pyproject.toml / setup.py / requirements.txt — the marker list must
-/// include it or a fresh clone (pipenv keeps its venvs out-of-tree under
-/// `~/.local/share/virtualenvs`) returns zero packages via the no-marker
-/// early-out. The vendor layer already treats `Pipfile.lock` as a
-/// first-class pypi flavor; discovery must agree.
+/// #504 / #947: a Pipenv project's env is the one Pipenv resolves for it
+/// (#388). With no Pipenv venv yet nothing is installed for the project, and
+/// its lock-only packages come from `Pipfile.lock`, so a project-scoped crawl
+/// must return nothing rather than fall back to the global interpreters
+/// (which agent mode would patch in place, and vendored mode would try to
+/// vendor). Holds for a `Pipfile`, a lone `Pipfile.lock`, and a `venv/`
+/// Pipenv never uses.
 #[tokio::test]
 #[serial]
-async fn get_site_packages_paths_falls_back_via_pipfile_marker() {
-    let project = tempfile::tempdir().unwrap();
-    let home = tempfile::tempdir().unwrap();
-    tokio::fs::write(
-        project.path().join("Pipfile"),
-        b"[packages]\nrequests = \"*\"\n",
-    )
-    .await
-    .unwrap();
+async fn get_site_packages_paths_pipenv_without_venv_never_falls_back_to_global() {
+    for (marker, body, stray_venv) in [
+        ("Pipfile", "[packages]\nsix = \"*\"\n", false),
+        (
+            "Pipfile.lock",
+            "{\"default\": {}, \"develop\": {}}\n",
+            false,
+        ),
+        ("Pipfile", "[packages]\nsix = \"*\"\n", true),
+    ] {
+        let project = tempfile::tempdir().unwrap();
+        let home = tempfile::tempdir().unwrap();
+        let workon = tempfile::tempdir().unwrap();
+        tokio::fs::write(project.path().join(marker), body)
+            .await
+            .unwrap();
+        if stray_venv {
+            let stray = project
+                .path()
+                .join("venv")
+                .join("lib")
+                .join("python3.11")
+                .join("site-packages");
+            tokio::fs::create_dir_all(&stray).await.unwrap();
+        }
 
-    // Stage an anaconda3 layout under the stubbed HOME — scanned by global
-    // discovery on every platform, so this test needs no per-OS forks.
-    let staged = home
-        .path()
-        .join("anaconda3")
-        .join("lib")
-        .join("python3.11")
-        .join("site-packages");
-    tokio::fs::create_dir_all(&staged).await.unwrap();
+        // Stage an anaconda3 layout under the stubbed HOME: global discovery
+        // scans it on every platform, so seeing it means the fallback ran.
+        let staged = home
+            .path()
+            .join("anaconda3")
+            .join("lib")
+            .join("python3.11")
+            .join("site-packages");
+        tokio::fs::create_dir_all(&staged).await.unwrap();
 
-    let prev_virtual_env = std::env::var("VIRTUAL_ENV").ok();
-    std::env::remove_var("VIRTUAL_ENV");
-    let prev_home = std::env::var("HOME").ok();
-    std::env::set_var("HOME", home.path());
-    let crawler = PythonCrawler;
-    let opts = CrawlerOptions {
-        cwd: project.path().to_path_buf(),
-        global: false,
-        global_prefix: None,
-    };
-    let result = crawler.get_site_packages_paths(&opts).await.unwrap();
-    if let Some(v) = prev_home {
-        std::env::set_var("HOME", v);
+        let prev_virtual_env = std::env::var("VIRTUAL_ENV").ok();
+        std::env::remove_var("VIRTUAL_ENV");
+        let prev_workon = std::env::var("WORKON_HOME").ok();
+        std::env::set_var("WORKON_HOME", workon.path());
+        let prev_home = std::env::var("HOME").ok();
+        std::env::set_var("HOME", home.path());
+        let crawler = PythonCrawler;
+        let opts = CrawlerOptions {
+            cwd: project.path().to_path_buf(),
+            global: false,
+            global_prefix: None,
+        };
+        let result = crawler.get_site_packages_paths(&opts).await.unwrap();
+        if let Some(v) = prev_home {
+            std::env::set_var("HOME", v);
+        }
+        match prev_workon {
+            Some(v) => std::env::set_var("WORKON_HOME", v),
+            None => std::env::remove_var("WORKON_HOME"),
+        }
+        if let Some(v) = prev_virtual_env {
+            std::env::set_var("VIRTUAL_ENV", v);
+        }
+
+        assert!(
+            result.is_empty(),
+            "{marker} (stray venv/: {stray_venv}) must not fall back to the \
+             global site-packages; got {result:?}"
+        );
     }
-    if let Some(v) = prev_virtual_env {
-        std::env::set_var("VIRTUAL_ENV", v);
-    }
-
-    #[cfg(not(windows))]
-    assert!(
-        result.iter().any(|p| p == &staged),
-        "Pipfile marker must trigger global fallback; got {result:?}"
-    );
-    #[cfg(windows)]
-    let _ = (result, staged);
 }
 
 /// Without any Python-project marker AND without a venv, local-mode
