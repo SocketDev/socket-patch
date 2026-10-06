@@ -1,6 +1,6 @@
 [agent] Progress ledger for the scheduled Bundler (RubyGems) bug-hunt routine (label pm:bundler).
 
-Last updated: 2026-10-06 (run 23), main `9c43dfc` (includes #637, #621, #797, #805, #849, #731, #750, #712), latest release tag v4.0.0. Newest Bundler tested: 4.0.22.
+Last updated: 2026-10-06 (run 24), main `9c43dfc` (includes #637, #621, #797, #805, #849, #731, #750, #712), latest release tag v4.0.0. Newest Bundler tested: 4.1.0.beta1 (repo gem e2e suites pass).
 
 ## Coverage matrix
 
@@ -204,6 +204,15 @@ Also on 4.0.17: BOM `Gemfile` passes; symlinked `Gemfile` / lock is refused (pas
 | Env `BUNDLE_PATH__SYSTEM=true` + leftover `vendor/bundle` | fail #915 | fail #915 | fail #915 |
 | Local `path.system: true`, no leftover (control) | pass | pass | untested |
 
+### Run 24 (main `9c43dfc`; Linux Ruby 3.3.6; Bundler 4.1.0.beta1)
+
+| Cell | 4.1.0.beta1 |
+| --- | --- |
+| Repo gem e2e suites (redirect 26 / vendor 22 / stale 32) | pass |
+| Agent `apply --offline` + `vex`, unquoted `BUNDLE_PATH: vendor/my bundle` (4.1 config spelling) | pass |
+| Config readers on main vs 4.1 `.bundle/config` (`BUNDLE_PATH` / `GEMFILE` / `CACHE_PATH` / `PATH__SYSTEM`) | pass |
+| URL-scoped `mirror.<patch source>` quoted key vs PR #684 | gap in the PR (comment on #681) |
+
 ### Global mode (`-g`)
 
 | OS | Ruby / Bundler | `scan -g` report | `-g` vs project scoping | `scan -g --mode hosted` refused | `get -g` / `apply -g` | `rollback -g` byte-exact | `vex -g` | `--global-prefix <gems dir>` / `SOCKET_GLOBAL=1` | Non-writable gem dir |
@@ -226,14 +235,13 @@ Also on 4.0.17: BOM `Gemfile` passes; symlinked `Gemfile` / lock is refused (pas
 
 ## Backlog
 
-1. Re-run #681 / #729 / #749 / #751 / #775 / #826 / #896 / #915 when fixes merge (open PRs #684, #768, #776, #875). #875 head `5b9953d3` already passes every #826 shape.
-2. The #915 family: the hosted stale-install guard under `path.system` (wrong copy warned?), a global-config `path.system`, and non-`"true"` bool spellings (`"1"`, `"yes"`) that Bundler's `to_bool` accepts.
-3. Run the remaining 4.0.17-only cells on 4.0.22: H→V takeover, `eval_gemfile`, multi-gem hosted.
-4. Takeover over shapes hosted accepts but vendored refuses: platform gem on a no-CHECKSUMS lock, `eval_gemfile`, `install_if` / `platforms:` blocks.
+1. Re-run #681 / #729 / #749 / #751 / #775 / #826 / #896 / #915 when fixes merge (open PRs #684, #768, #776, #875, #916). #875 head `5b9953d3` already passes every #826 shape; #916 covers the `to_bool` spellings and the hosted stale guard; #776 covers every vendored-refused block shape; #684 head `0e1e6cda` misses 4.1's quoted URL-scoped mirror keys.
+2. RubyGems 4.1 + Bundler 4.1 (setup-ruby probe): content-addressed installs (`gems/<name>-<ver>-<hex>`), the `CONTENT ADDRESSES` lock section through a hosted rewrite + `rollback`, `specifications/<abi>/` for agent `vex`.
+3. Hosted 4.1 by hand: an `override "x", version:` next to a hosted pin, then `rollback`.
+4. Run the remaining 4.0.17-only cells on 4.0.22 / 4.1: H→V takeover, `eval_gemfile`, multi-gem hosted.
 5. Windows: `x64-mingw-ucrt` platform gems in hosted and vendored modes; vendored cells and `repair` on Windows and macOS.
 6. Global (`-g`) mode: real rvm / chruby installs on macOS.
-7. Vendored mode with a symlinked `BUNDLE_GEMFILE` (shares `classify` with #896; unverified).
-8. Bundler 1.17 hosted unwind (Ruby ≤ 3.1 probe); `rollback` / `remove` on a custom-lock project.
+7. Bundler 1.17 hosted unwind (Ruby ≤ 3.1 probe); `rollback` / `remove` on a custom-lock project.
 
 ## Known non-bugs
 
@@ -308,3 +316,7 @@ Also on 4.0.17: BOM `Gemfile` passes; symlinked `Gemfile` / lock is refused (pas
 - `bughunt/bundler/20261005-symlink-gemfile` is also left behind (`git push --delete` hangs up); its workflow is push-triggered only.
 - Agent cells need no mock API: write `.socket/manifest.json` (`files` keys `package/<rel>`, git-sha256 `beforeHash`/`afterHash`) plus `.socket/blobs/<afterHash>` by hand and run `apply --offline` (run 23). Restore a patched system gem with `gem pristine <gem> -v <ver>`.
 - A leftover populated `vendor/bundle` with **no** config while Bundler uses system gems makes agent `apply` patch the unused copy and `vex` attest. That matches the documented "`vendor/bundle` holds stores, so no `gem env` homes" heuristic and isn't filed; #915 covers only the explicit `path.system` signal (run 23).
+- Bundler refuses `path` together with `path.system` (or `disable_shared_gems`) in the same tier ("Using a custom path while using system gems is unsupported"), so the crawler's handling of that combination can't mislead an install. Only the #915 shape (no `path`, leftover `vendor/bundle`) matters (run 24).
+- `parse_dir_name_version` misparses gem names that contain `-<digits>.<…>` (32 of 197k rubygems.org names, all obscure, e.g. `citus-rails-4.2`). Not filed (run 24).
+- Bundler 4.1 writes `.bundle/config` with unquoted values and double-quotes any key containing `:` (URL-scoped `mirror.` / credential keys). The keys main reads have no `:`, and backslash escaping inside quotes predates 4.1 (4.0's `inspect` did it too) (run 24).
+- Bundler 4.1's Gemfile `override` DSL can't silently unpatch a hosted pin (the pinned source only serves the patched version), and it isn't counted as a `gem` declaration (run 24).
