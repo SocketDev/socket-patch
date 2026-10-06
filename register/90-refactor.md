@@ -23,7 +23,7 @@ _Last updated 2026-10-06T12:58Z · main @ 9c43dfc_
 | 4 | #856 (E62, child 1 of #855): VEX npm aliases through the core resolver | 1 | 1 | ≈1.8 | M | ≈5 | skipped: `vex_consumed.rs` changed by #690 |
 | 5 | #883 (E39): `canonicalize_pypi_name` + `pep508_name` into one PyPI name module | 0 | 1 | ≈3 | L | ≈5 | skipped: 13 files changed by open PRs |
 
-Re-ranked 2026-10-06T12:58Z: main and discussion steering unchanged since 11:58Z. New: #936 (E66, Poetry LF-2.x line splicer vs the shared `toml_edit` engine, ≈4) and #937 (E23, shared single-lock wire envelope for Poetry/PDM/Pipenv; #936 is its natural first slice), both below the top five and in `vendor/pypi_*` files that open PRs touch. #893 (≈4, `cleanup_blobs.rs`) is still the best eligible; then #871 after #889, then #705. 3 of 3 slots used (#876, #886, #889 `ready`, approved, no review questions). Decisions: #648, #704, #792, #808, #615; C07.
+Re-ranked 2026-10-06T12:58Z: main and discussion steering unchanged since 11:58Z. New #936 (E66, ≈4) and #937 (E23; #936 is its first slice) rank below the top five. #893 (≈4, `cleanup_blobs.rs`) is still the best eligible; then #871 after #889, then #705. 3 of 3 slots used (#876, #886, #889 `ready`, approved, no review questions). Decisions: #648, #704, #792, #808, #615; C07.
 
 **Notes:**
 - The sandbox runs as root, so 4 core lib tests fail on main and on branches alike: `copy_tree::relax_loop_must_not_traverse_symlinked_root`, `vlt_heal::an_unremovable_hidden_lock_keeps_every_store_entry`, `pypi_poetry::wire_write_failure_maps_error_and_leaves_lock_untouched`, `pypi_requirements::wire_failure_rolls_back_already_written_files`.
@@ -49,7 +49,6 @@ Re-ranked 2026-10-06T12:58Z: main and discussion steering unchanged since 11:58Z
 - Bun backtest `native (macos-latest, 1.3.10)` cell `preexisting-manifest vendored` failed `refusalCodesExact` once on #870 (unrelated diff) and passed on re-run: a known flaky cell.
 - Bugbot may review the PR's start commit when a draft opens; check the review's commit SHA and re-trigger on the real head.
 - go.mod's lexer treats `//` as a comment anywhere, so `module a//b` declares `a`: don't expect `//` inside a token to be rejected.
-- `vendor/berry_zip.rs`'s `berry_cache_checksum_10c0` has only test callers, so a helper used only there is dead code in the lib build.
 - #646 merged inline digests after the `utils::digest` ratchet, so `production_digests_go_through_the_helpers` failed on `main` @ `a1d4260`; #876 carries the fix (`gradle_cache.rs` added to `PENDING_INLINE_DIGESTS` because #690 edits it). Drop it from the list when #706 slice 2 migrates it.
 - A process-global `reqwest::Client` (`LazyLock`) is unsafe in core tests: pooled connections stay bound to the tokio runtime that opened them, and each `#[tokio::test]` has its own runtime. Build per call through a shared builder instead.
 - Probe spawns go through `utils::process::output_within` since #886 (blocking; async callers wrap it in `utils::fs::run_blocking`). It nulls stderr; don't add a new `tokio::time::timeout` + `kill_on_drop` site.
