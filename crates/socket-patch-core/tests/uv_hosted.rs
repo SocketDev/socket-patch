@@ -1,8 +1,6 @@
 use std::collections::BTreeMap;
 
-use socket_patch_core::patch::redirect::{
-    rewrite_registry_redirect, DepOverride, Integrity,
-};
+use socket_patch_core::patch::redirect::{rewrite_registry_redirect, DepOverride, Integrity};
 
 fn patch(name: &str) -> DepOverride {
     DepOverride {
