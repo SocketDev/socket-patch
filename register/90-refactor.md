@@ -1,5 +1,5 @@
 ### Refactor routine (`refactor`, hourly, highest leverage first)
-_Last updated 2026-10-06T06:56Z · main @ 9c43dfc_
+_Last updated 2026-10-06T08:58Z · main @ 9c43dfc_
 
 **In flight:**
 - [#876](https://github.com/SocketDev/socket-patch/pull/876): registry clients (`build_registry_client`, Maven `fetch_registry_bytes`) built through one `registry_client_builder` under `ApiTimeouts`; `registry_fetch::download` onto `read_capped`. Also ports the base-red digest-ratchet fix for #646's JVM files. Issue #872 (C49). `ready`.
@@ -23,7 +23,7 @@ _Last updated 2026-10-06T06:56Z · main @ 9c43dfc_
 | 4 | #883 (E39): `canonicalize_pypi_name` + `pep508_name` into one PyPI name module | 0 | 1 | ≈3 | L | ≈5 | skipped: 13 files changed by open PRs |
 | 5 | #893 (C50): `repair` and `scan --prune` keep active patches' beforeHash blobs | 1 | 0 | ≈1 | L | ≈4 | best eligible (`cleanup_blobs.rs`); take when a slot frees |
 
-Re-ranked 2026-10-06T06:56Z: main unchanged. New: #922 (E22) tops the score but its 7 drivers overlap 4 open PRs; #920 (tracking) ranks through #922; #923 (E65, dead `force`/`sources` params, ≈0.5) touches `npm_common.rs`/`npm_dir.rs` (#837, #909). #893 (≈4, `cleanup_blobs.rs`) stays the best eligible. #871 eligible after #889; then #705. 3 of 3 slots used (#876, #886, #889 `ready`). Decisions: #648, #704, #792, #808, #615; C07.
+Re-ranked 2026-10-06T08:58Z: main unchanged, ranking unchanged. No new `arch-audit`/`refactor` issues since 06:56Z; #883 now also overlaps #911 and #927 (PyPI name normalisation). #893 (≈4, `cleanup_blobs.rs`) stays the best eligible; #871 eligible after #889; then #705. 3 of 3 slots used (#876, #886, #889 `ready`, no review questions). Decisions: #648, #704, #792, #808, #615; C07.
 
 **Notes:**
 - The sandbox runs as root, so 4 core lib tests fail on main and on branches alike: `copy_tree::relax_loop_must_not_traverse_symlinked_root`, `vlt_heal::an_unremovable_hidden_lock_keeps_every_store_entry`, `pypi_poetry::wire_write_failure_maps_error_and_leaves_lock_untouched`, `pypi_requirements::wire_failure_rolls_back_already_written_files`.
