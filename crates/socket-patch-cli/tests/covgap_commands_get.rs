@@ -3167,7 +3167,10 @@ async fn engine_nested_apply_failure_reaches_the_json_envelope() {
     assert_eq!(code, 1, "json={json}");
     assert_eq!(json["status"], "partial_failure", "json={json}");
     assert_eq!(json["downloaded"], 1, "the download itself worked: {json}");
-    assert_eq!(json["failed"], 1, "the apply failure must be counted: {json}");
+    assert_eq!(
+        json["failed"], 1,
+        "the apply failure must be counted: {json}"
+    );
     assert_eq!(json["applied"], 0, "json={json}");
     let rec = &json["patches"][0];
     assert_eq!(rec["purl"], PURL, "json={json}");

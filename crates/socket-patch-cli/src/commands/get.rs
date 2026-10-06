@@ -31,6 +31,7 @@ use std::sync::LazyLock;
 use std::time::Duration;
 
 use crate::args::{apply_env_toggles, GlobalArgs};
+use crate::commands::apply::ApplyRunReport;
 use crate::commands::bun_preflight::{
     bun_vendor_preflight, bun_vendor_preflight_with_ledger, BunVendorRefusal,
 };
@@ -2326,18 +2327,20 @@ fn nested_apply_args_from_params(
 /// on the caller's `client`, under the apply `lock` the caller took for
 /// its manifest write — one lock window for download → manifest write →
 /// apply (a same-process re-acquire would contend), released by apply once
-/// its last mutation is done. Returns whether apply exited 0. Callers print
-/// their own "Applying patches..." line. `json` is the caller's flag: a
-/// JSON caller gets no human error lines, from this function or from the
-/// nested apply (`common` itself is never JSON). The read-only `--check`
-/// redirect verifier stays off and embedded VEX is opt-in on the top-level
-/// command only, never on this internal invocation.
+/// its last mutation is done. Returns apply's report: its exit code and
+/// what failed, for the caller's envelope (see [`fold_apply_failures`]).
+/// Callers print their own "Applying patches..." line. `json` is the
+/// caller's flag: a JSON caller gets no human error lines, from this
+/// function or from the nested apply (`common` itself is never JSON). The
+/// read-only `--check` redirect verifier stays off and embedded VEX is
+/// opt-in on the top-level command only, never on this internal
+/// invocation.
 async fn run_nested_apply(
     common: GlobalArgs,
     json: bool,
     client: &ApiClient,
     lock: LockGuard,
-) -> bool {
+) -> ApplyRunReport {
     let manifest_path = common.resolved_manifest_path();
     let apply_args = super::apply::ApplyArgs {
         common,
@@ -2346,13 +2349,88 @@ async fn run_nested_apply(
         vex: Default::default(),
         nested: Some(super::apply::NestedApply { caller_json: json }),
     };
-    let code = super::apply::run_locked(apply_args, manifest_path, client, lock).await;
+    let report = super::apply::run_locked(apply_args, manifest_path, client, lock).await;
     // An error, so exempt from --silent ("errors only": a failing exit must
     // say why); JSON runs carry the failure in the envelope instead.
-    if code != 0 && !json {
+    if report.code != 0 && !json {
         eprintln!("{APPLY_FAILED}");
     }
-    code == 0
+    report
+}
+
+/// Fold a failed nested apply into a `get` / `scan --mode agent` JSON
+/// envelope, so `--json` says what the human run prints (#424). Each
+/// `patches[]` record the apply failed becomes the `failed` record shape
+/// (`purl`, `uuid`, `action: "failed"`, `errorCode`, `error`; no metadata,
+/// as on every `failed` record); a failed manifest patch this run did not
+/// select gets its own `failed` record (`uuid_of` looks up its uuid); a
+/// run-level reason rides the envelope's top-level `errorCode` / `error`.
+/// `failed` grows by every record marked or appended here. Returns how
+/// many of the run's own (selected) records failed, for `applied`.
+fn fold_apply_failures(
+    envelope: &mut serde_json::Value,
+    report: &ApplyRunReport,
+    uuid_of: impl Fn(&str) -> Option<String>,
+) -> usize {
+    fn base(purl: &str) -> &str {
+        purl.split(['?', '#']).next().unwrap_or(purl)
+    }
+    fn rec_purl(rec: &serde_json::Value) -> String {
+        normalize_purl(rec["purl"].as_str().unwrap_or_default()).into_owned()
+    }
+    let mut marked = 0usize;
+    if let Some(patches) = envelope["patches"].as_array_mut() {
+        let selected = patches.len();
+        for failure in &report.failures {
+            let fpurl = normalize_purl(&failure.purl).into_owned();
+            let live = |i: &usize| patches[*i]["action"].as_str() != Some("failed");
+            // An exact purl match first; a qualified variant's failure
+            // otherwise maps to the records of its base purl.
+            let mut hits: Vec<usize> = (0..selected)
+                .filter(live)
+                .filter(|&i| rec_purl(&patches[i]) == fpurl)
+                .collect();
+            if hits.is_empty() {
+                hits = (0..selected)
+                    .filter(live)
+                    .filter(|&i| base(&rec_purl(&patches[i])) == base(&fpurl))
+                    .collect();
+            }
+            for &i in &hits {
+                patches[i] = serde_json::json!({
+                    "purl": patches[i]["purl"],
+                    "uuid": patches[i]["uuid"],
+                    "action": "failed",
+                    "errorCode": failure.code,
+                    "error": failure.error,
+                });
+                marked += 1;
+            }
+            let already_failed = patches.iter().any(|r| {
+                r["action"].as_str() == Some("failed") && base(&rec_purl(r)) == base(&fpurl)
+            });
+            if !already_failed {
+                let mut rec = serde_json::json!({
+                    "purl": failure.purl,
+                    "action": "failed",
+                    "errorCode": failure.code,
+                    "error": failure.error,
+                });
+                if let Some(uuid) = uuid_of(&failure.purl) {
+                    rec["uuid"] = serde_json::json!(uuid);
+                }
+                patches.push(rec);
+            }
+        }
+        let added = marked + (patches.len() - selected);
+        let failed = envelope["failed"].as_u64().unwrap_or(0) as usize + added;
+        envelope["failed"] = serde_json::json!(failed);
+    }
+    if let Some((code, error)) = &report.run_error {
+        envelope["errorCode"] = serde_json::json!(code);
+        envelope["error"] = serde_json::json!(error);
+    }
+    marked
 }
 
 /// Download the selected patches into `.socket/` (manifest records +
@@ -2488,20 +2566,23 @@ pub async fn download_and_apply_patches_with(
     }
 
     // Auto-apply unless --save-only (the lock decision above).
-    let mut apply_succeeded = false;
+    let mut apply_report: Option<ApplyRunReport> = None;
     if let Some(lock) = apply_lock {
         if !quiet {
             eprintln!();
             eprintln!("Applying patches...");
         }
-        apply_succeeded = run_nested_apply(
-            nested_apply_args_from_params(params, run, &manifest_path),
-            params.json,
-            run.api_client,
-            lock,
-        )
-        .await;
+        apply_report = Some(
+            run_nested_apply(
+                nested_apply_args_from_params(params, run, &manifest_path),
+                params.json,
+                run.api_client,
+                lock,
+            )
+            .await,
+        );
     }
+    let apply_succeeded = apply_report.as_ref().is_some_and(|r| r.code == 0);
 
     // An apply step that ran (recorded patches selected, not --save-only)
     // but failed is a partial failure too — not just download failures. The
@@ -2521,6 +2602,18 @@ pub async fn download_and_apply_patches_with(
         "updated": updated,
         "patches": batch.patches_json,
     });
+    // A failed apply: name what failed, and count only what applied.
+    if let Some(report) = apply_report.as_ref().filter(|r| r.code != 0) {
+        let failed_selected = fold_apply_failures(&mut result_json, report, |purl| {
+            manifest.patches.get(purl).map(|r| r.uuid.clone())
+        });
+        let applied = if report.failures.is_empty() {
+            0
+        } else {
+            to_apply.saturating_sub(failed_selected)
+        };
+        result_json["applied"] = serde_json::json!(applied);
+    }
     // Surface release-narrowing fallbacks (uninstalled package / no
     // matching variant) so JSON consumers can see why all variants were
     // kept. Omitted entirely when narrowing was clean.
@@ -3474,20 +3567,23 @@ async fn save_and_apply_patch(args: &GetArgs, client: &ApiClient, patch: &PatchR
         );
     }
 
-    let mut apply_succeeded = false;
+    let mut apply_report: Option<ApplyRunReport> = None;
     if let Some(lock) = apply_lock {
         if !quiet {
             eprintln!();
             eprintln!("Applying patches...");
         }
-        apply_succeeded = run_nested_apply(
-            nested_apply_args(&args.common, &manifest_path, quiet),
-            args.common.json,
-            client,
-            lock,
-        )
-        .await;
+        apply_report = Some(
+            run_nested_apply(
+                nested_apply_args(&args.common, &manifest_path, quiet),
+                args.common.json,
+                client,
+                lock,
+            )
+            .await,
+        );
     }
+    let apply_succeeded = apply_report.as_ref().is_some_and(|r| r.code == 0);
 
     // The apply step ran (not --save-only) but failed →
     // partial failure. The `status` field must agree with the exit code
@@ -3519,6 +3615,12 @@ async fn save_and_apply_patch(args: &GetArgs, client: &ApiClient, patch: &PatchR
             "applied": if apply_succeeded { 1 } else { 0 },
             "patches": [patch_record],
         });
+        // A failed apply names what failed (#424); `failed` appears only
+        // then, so a clean run's envelope is unchanged.
+        if let Some(report) = apply_report.as_ref().filter(|r| r.code != 0) {
+            result_json["failed"] = serde_json::json!(0);
+            fold_apply_failures(&mut result_json, report, |_| None);
+        }
         // Same contract as `download_and_apply_patches_with`: omitted when clean.
         if !warnings.is_empty() {
             result_json["warnings"] = serde_json::json!(warnings);
@@ -4628,6 +4730,110 @@ mod tests {
                 );
             }
         }
+    }
+
+    // --- fold_apply_failures (#424) ---------------------------------------
+
+    fn failure(purl: &str, code: &str, error: &str) -> crate::commands::apply::ApplyFailure {
+        crate::commands::apply::ApplyFailure {
+            purl: purl.to_string(),
+            code: code.to_string(),
+            error: error.to_string(),
+        }
+    }
+
+    fn report_with(failures: Vec<crate::commands::apply::ApplyFailure>) -> ApplyRunReport {
+        ApplyRunReport {
+            code: 1,
+            failures,
+            run_error: None,
+        }
+    }
+
+    #[test]
+    fn fold_apply_failures_marks_the_failed_record_and_drops_metadata() {
+        let mut env = serde_json::json!({
+            "failed": 0,
+            "patches": [
+                {"purl": "pkg:npm/a@1.0.0", "uuid": "ua", "action": "added", "license": "MIT"},
+                {"purl": "pkg:npm/b@1.0.0", "uuid": "ub", "action": "updated", "oldUuid": "o"},
+            ],
+        });
+        let report = report_with(vec![failure("pkg:npm/a@1.0.0", "apply_failed", "denied")]);
+        assert_eq!(fold_apply_failures(&mut env, &report, |_| None), 1);
+        assert_eq!(
+            env["patches"][0],
+            serde_json::json!({
+                "purl": "pkg:npm/a@1.0.0", "uuid": "ua", "action": "failed",
+                "errorCode": "apply_failed", "error": "denied",
+            })
+        );
+        assert_eq!(env["patches"][1]["action"], "updated", "{env}");
+        assert_eq!(env["failed"], 1, "{env}");
+        assert!(env.get("errorCode").is_none(), "{env}");
+    }
+
+    #[test]
+    fn fold_apply_failures_matches_percent_encoded_and_qualified_purls() {
+        let mut env = serde_json::json!({
+            "failed": 0,
+            "patches": [
+                {"purl": "pkg:npm/%40scope/a@1.0.0", "uuid": "u1", "action": "added"},
+                {"purl": "pkg:pypi/six@1.16.0?artifact_id=w", "uuid": "u2", "action": "added"},
+            ],
+        });
+        let report = report_with(vec![
+            failure("pkg:npm/@scope/a@1.0.0", "apply_failed", "x"),
+            failure("pkg:pypi/six@1.16.0", "package_not_installed", "y"),
+        ]);
+        assert_eq!(fold_apply_failures(&mut env, &report, |_| None), 2);
+        assert_eq!(env["patches"][0]["action"], "failed", "{env}");
+        assert_eq!(env["patches"][1]["action"], "failed", "{env}");
+        assert_eq!(env["patches"][1]["errorCode"], "package_not_installed");
+        assert_eq!(env["patches"].as_array().unwrap().len(), 2, "{env}");
+        assert_eq!(env["failed"], 2, "{env}");
+    }
+
+    #[test]
+    fn fold_apply_failures_appends_an_unselected_manifest_failure() {
+        // The nested apply covers the whole (ecosystem-scoped) manifest: a
+        // failing record this run did not select still gets named, without
+        // counting against this run's `applied`.
+        let mut env = serde_json::json!({
+            "failed": 1,
+            "patches": [
+                {"purl": "pkg:npm/a@1.0.0", "uuid": "ua", "action": "added"},
+            ],
+        });
+        let report = report_with(vec![failure("pkg:npm/old@2.0.0", "apply_failed", "z")]);
+        let uuid_of = |p: &str| (p == "pkg:npm/old@2.0.0").then(|| "uo".to_string());
+        assert_eq!(fold_apply_failures(&mut env, &report, uuid_of), 0);
+        assert_eq!(env["patches"][0]["action"], "added", "{env}");
+        assert_eq!(
+            env["patches"][1],
+            serde_json::json!({
+                "purl": "pkg:npm/old@2.0.0", "uuid": "uo", "action": "failed",
+                "errorCode": "apply_failed", "error": "z",
+            })
+        );
+        assert_eq!(env["failed"], 2, "download failures stay counted: {env}");
+    }
+
+    #[test]
+    fn fold_apply_failures_carries_a_run_level_error() {
+        let mut env = serde_json::json!({
+            "failed": 0,
+            "patches": [{"purl": "pkg:npm/a@1.0.0", "uuid": "ua", "action": "added"}],
+        });
+        let report = ApplyRunReport {
+            code: 1,
+            failures: Vec::new(),
+            run_error: Some(("yarn_pnp_unsupported".to_string(), "pnp".to_string())),
+        };
+        assert_eq!(fold_apply_failures(&mut env, &report, |_| None), 0);
+        assert_eq!(env["errorCode"], "yarn_pnp_unsupported", "{env}");
+        assert_eq!(env["error"], "pnp", "{env}");
+        assert_eq!(env["failed"], 0, "{env}");
     }
 
     // --- write_blob_entry ------------------------------------------------

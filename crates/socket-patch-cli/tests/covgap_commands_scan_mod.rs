@@ -2694,8 +2694,5 @@ async fn scan_agent_json_nested_apply_failure_reaches_the_apply_block() {
         rec["error"].as_str().is_some_and(|e| !e.is_empty()),
         "the apply error text must reach the envelope: {v}"
     );
-    assert_eq!(
-        std::fs::read(member.join("index.js")).unwrap(),
-        b"before\n",
-    );
+    assert_eq!(std::fs::read(member.join("index.js")).unwrap(), b"before\n",);
 }

@@ -1363,7 +1363,7 @@ rely on these keys.
   ],
 
   // ----- failure path (only on action=failed) -----
-  "errorCode":   "vendor_bun_workspace_unsupported", // additive; today only the vendored-mode Bun preflight refusals (+ vendor_state_unreadable)
+  "errorCode":   "vendor_bun_workspace_unsupported", // additive; the vendored-mode Bun preflight refusals (+ vendor_state_unreadable) and agent-mode apply failures (apply_failed, package_not_installed)
   "error":       "could not fetch details"
 }
 ```
@@ -1398,8 +1398,25 @@ and `vendor_state_unreadable` when the preflight cannot read
 `.socket/vendor/state.json`)
 that `get --mode vendored` and `scan --mode vendored` (`download.patches[]`)
 emit before any download; see "get --mode and installed narrowing" →
-Vendored → Bun vendored preflight. Every other `failed` record carries only
-`error`. The dry-run preview's `would_refuse` records carry the same pair.
+Vendored → Bun vendored preflight. Every other download-phase `failed`
+record carries only `error`. The dry-run preview's `would_refuse` records
+carry the same pair.
+
+Agent-mode apply failures (#424): when the nested apply that follows the
+download (`get` / `scan --mode agent`, not `--save-only`) fails a patch,
+that patch's record becomes `action: "failed"` with the same `errorCode` /
+`error` pair the standalone `apply --json` reports — `apply_failed` (the
+apply error text, e.g. `Permission denied (os error 13)`) or
+`package_not_installed` (no installed copy, and the project's lockfiles
+do not resolve it either). The record keeps `purl` and `uuid`, drops the
+metadata like every `failed` record, and stays saved in the manifest (only
+the apply failed). A failing manifest patch the run did not select (the
+nested apply covers the whole `--ecosystems`-scoped manifest) is appended
+as its own `failed` record. `failed` counts these records beside the
+download failures, and `applied` counts only the patches that did apply.
+A failure no single patch explains (an unreadable manifest, the yarn PnP
+refusal, unavailable patch sources) sets top-level `errorCode` / `error`
+on the same object (`apply` in `scan`'s envelope).
 
 `vulnerabilities[]` is always sorted by `id` so consumer diffs and
 test snapshots are stable. `severity` at the top level is the max
