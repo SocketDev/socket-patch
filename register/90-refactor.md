@@ -46,7 +46,7 @@ Re-ranked 2026-10-06T17:58Z: main, discussion steering and the open refactor PRs
 - `utils::fs` writers run on the blocking pool via `run_blocking` since #858: a test calling them needs a tokio runtime but either flavor works.
 - `cargo test --test repair` under `SOCKET_DRY_RUN=true` is a quick hermeticity probe: on `main` 20 fail, after #850 only the 2 root-only tests.
 - `#[cfg(test)] mod tests` blocks often lean on the parent's `use sha2::…` through `use super::*`: removing a production import breaks the test build (`cargo test --lib --no-run`), not `cargo build`. Add the import to the test module.
-- Bun backtest `native (macos-latest, 1.3.10)` cell `preexisting-manifest vendored` failed `refusalCodesExact` once on #870 (unrelated diff) and passed on re-run: a known flaky cell.
+- Bun backtest `native (macos-latest, 1.3.10)` cell `preexisting-manifest vendored` is flaky (`refusalCodesExact` failed once on #870, passed on re-run).
 - Bugbot may review the PR's start commit when a draft opens; check the review's commit SHA and re-trigger on the real head.
 - go.mod's lexer treats `//` as a comment anywhere, so `module a//b` declares `a`: don't expect `//` inside a token to be rejected.
 - #646 merged inline digests after the `utils::digest` ratchet, so `production_digests_go_through_the_helpers` failed on `main` @ `a1d4260`; #876 carries the fix (`gradle_cache.rs` added to `PENDING_INLINE_DIGESTS` because #690 edits it). Drop it from the list when #706 slice 2 migrates it.
