@@ -1,6 +1,6 @@
 [agent] Progress ledger for the scheduled Bundler (RubyGems) bug-hunt routine (label pm:bundler).
 
-Last updated: 2026-10-06 (run 25), main `9c43dfc` (includes #637, #621, #797, #805, #849, #731, #750, #712), latest release tag v4.0.0. Newest Bundler tested: 4.1.0.beta1 (repo gem e2e suites pass).
+Last updated: 2026-10-06 (run 26), main `9c43dfc` (includes #637, #621, #797, #805, #849, #731, #750, #712), latest release tag v4.0.0. Newest Bundler tested: 4.1.0.beta1 (repo gem e2e suites pass).
 
 ## Coverage matrix
 
@@ -223,6 +223,15 @@ Also on 4.0.17: BOM `Gemfile` passes; symlinked `Gemfile` / lock is refused (pas
 | Agent: env `BUNDLE_GEMFILE=gemfiles/alt.gemfile`, `path vendor/bundle` in `gemfiles/.bundle/config` | — | fail #952 (×2) | fail #952 | — |
 | Agent: env `BUNDLE_GEMFILE=gemfiles/alt.gemfile` + env `BUNDLE_PATH=vendor/bundle` (relative) | — | fail #952 | fail #952 | — |
 
+### Run 26 (main `9c43dfc`; Linux Ruby 3.3.6; agent `apply --offline` + `vex`, real `bundle install` / `bundle exec`)
+
+| Cell | 4.0.22 | 2.6.9 | 2.5.22 |
+| --- | --- | --- | --- |
+| Agent: Bundler's `.bundle` default path (local `simulate_version 5` on 4.x / `default_install_uses_path true` on 2.x) | fail #967 (×2) | fail #967 (×2) | fail #967 |
+| Same, env spelling (`BUNDLE_SIMULATE_VERSION=5` / `BUNDLE_DEFAULT_INSTALL_USES_PATH=true`) | fail #967 | fail #967 | — |
+| Control: no setting (system install) | pass | — | — |
+| PR #953 head `52542db` on the #951 agent shape | pass (fixes #951) | — | — |
+
 ### Global mode (`-g`)
 
 | OS | Ruby / Bundler | `scan -g` report | `-g` vs project scoping | `scan -g --mode hosted` refused | `get -g` / `apply -g` | `rollback -g` byte-exact | `vex -g` | `--global-prefix <gems dir>` / `SOCKET_GLOBAL=1` | Non-writable gem dir |
@@ -245,12 +254,13 @@ Also on 4.0.17: BOM `Gemfile` passes; symlinked `Gemfile` / lock is refused (pas
 
 ## Backlog
 
-1. Re-run #681 / #729 / #749 / #751 / #775 / #826 / #896 / #915 / #951 / #952 when fixes merge (open PRs #684, #768, #776, #875, #916). #875 head `5b9953d3` already passes every #826 shape. #916 covers the `to_bool` spellings and the hosted stale guard. #776 covers every vendored-refused block shape. #684 head `0e1e6cda` misses 4.1's quoted URL-scoped mirror keys. #684 and #916 also read config through the comment-keeping helper (#951).
-2. #952 neighbours: under `BUNDLE_GEMFILE=gemfiles/x.gemfile`, check `cache_path` in `gemfiles/.bundle/config` for the hosted stale guard (hosted refuses `BUNDLE_GEMFILE` there, but `vex` may not), and the env `BUNDLE_APP_CONFIG` relative to the moved root.
-3. More `.bundle/config` parser divergences from Bundler's `YAMLSerializer`: `KEY:"v"` with no space (Bundler ignores the key), a value with trailing spaces after the closing quote (Bundler keeps the quotes), `#` inside a quoted value (Bundler ≥ 2.5 truncates). All contrived, so low priority.
-4. RubyGems 4.1 + Bundler 4.1 (setup-ruby probe): content-addressed installs only apply to platform gems pinned to one ABI (`gems/<name>-<ver>-<hex8>`, `specifications/<abi>/`). Nothing on rubygems.org is published that way yet. Revisit when one is: `locate_gem_dir` returns the first `<name>-<ver>-*` match, but several addresses can coexist.
-5. Windows `x64-mingw-ucrt` platform gems in hosted and vendored modes; vendored cells and `repair` on Windows and macOS.
-6. Bundler 1.17 hosted unwind (Ruby ≤ 3.1 probe); `rollback` / `remove` on a custom-lock project.
+1. Re-run #681 / #729 / #749 / #751 / #775 / #826 / #896 / #915 / #951 / #952 / #967 when fixes merge (open PRs #684, #768, #776, #875, #916, #953). #875 head `5b9953d3` already passes every #826 shape. #953 head `52542db` fixes the #951 agent shape. #916 covers the `to_bool` spellings and the hosted stale guard. #776 covers every vendored-refused block shape. #684 head `0e1e6cda` misses 4.1's quoted URL-scoped mirror keys.
+2. #967 neighbours: the hosted stale guard with a stale `.bundle/ruby/<abi>` copy; `rollback` under `simulate_version 5`; other Bundler 5-mode defaults socket-patch models. When Bundler 5 ships, `.bundle` becomes the plain default, so re-run everything there.
+3. #952 neighbours: under `BUNDLE_GEMFILE=gemfiles/x.gemfile`, check `cache_path` in `gemfiles/.bundle/config` for the hosted stale guard and `vex`, and the env `BUNDLE_APP_CONFIG` relative to the moved root.
+4. More `.bundle/config` parser divergences from Bundler's `YAMLSerializer`: `KEY:"v"` with no space, a value with trailing spaces after the closing quote, `#` inside a quoted value. All contrived, so low priority.
+5. RubyGems 4.1 + Bundler 4.1 content-addressed installs (`gems/<name>-<ver>-<hex8>`): revisit when a gem is published that way.
+6. Windows `x64-mingw-ucrt` platform gems in hosted and vendored modes; vendored cells and `repair` on Windows and macOS.
+7. Bundler 1.17 hosted unwind (Ruby ≤ 3.1 probe); `rollback` / `remove` on a custom-lock project.
 
 ## Known non-bugs
 
