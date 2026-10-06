@@ -1,6 +1,6 @@
 [agent] Progress ledger for the scheduled npm bug-hunt routine (label pm:npm).
 
-Last updated: 2026-10-05T18Z (run 21 with a ledger), main `c644ab0` (adds #813 (#432 fix), #799 (#798 fix), #730 (#725 fix) and more since `4646693`; earlier fixes include #356, #732, #325, #665, #687, #557/#817 and #601/#603), latest release v4.0.0 (previous v3.3.0, both from npm `@socketsecurity/socket-patch`). v5 makes hosted the default, removes `setup`, and makes hosted `rollback` re-resolve upstream registry entries. Cells marked (v4) were last verified on `f6b7fb9`.
+Last updated: 2026-10-06T00Z (run 22 with a ledger), main `9c43dfc` (3 non-npm commits past `c644ab0`), latest release v4.0.0 (previous v3.3.0, both from npm `@socketsecurity/socket-patch`). v5 makes hosted the default, removes `setup`, and makes hosted `rollback` re-resolve upstream registry entries. Cells marked (v4) were last verified on `f6b7fb9`. Re-triaged this run: #464 and #433 still reproduce.
 
 ## Coverage matrix
 
@@ -44,9 +44,26 @@ npm 9–11 store an alias as `node_modules/.store/lp@<v>-<h>/node_modules/lp`. A
 
 `*.tgz`, `vendor/` and `.socket/` drop the tarball from the commit silently, and a fresh `npm ci` fails ENOENT. With `.socket/` ignored, `vendor --check` exits 0. **fail #831** on Linux npm 8.19.4 / 10.9.4 / 12.2.0 (matrix on #831; draft fix #837).
 
+## npm 12 ignores npm-shrinkwrap.json (#899)
+
+npm 12.0.0 / 12.1.0 / 12.2.0 don't read a root `npm-shrinkwrap.json` (npm's own docs). On a shrinkwrap-only project, hosted and vendored scans rewrite only the shrinkwrap with no warning, lockfile-only `vex` attests `not_affected`, and npm 12 `npm install` installs unpatched (`npm ci` fails EUSAGE). **fail #899** on Linux (shrinkwrap v2 from npm 8, v3 from npm 10). npm 8 / 10 consumers: pass. After the npm 12 install, `vex` refuses (the #799 twin rule): pass.
+
+## Workspace member hosted scan (#884)
+
+A hosted `scan` / `get <uuid>` run from an npm workspace member exits 0 with `redirected: 0` and `redirect_npm_no_lockfile`, and the root lock is untouched. **fail #884** (commented) on Linux npm 7.24.2 / 8.19.4 / 10.9.4 / 12.2.0, non-hoisted and hoisted (`get`). Vendored from the member exits 1: pass (fails closed).
+
+## Vendored refusal diagnostics (#898, #900)
+
+- A symlinked `package-lock.json`: the refusal leaves the vendored tgz and marker behind, prints `Vendored 1 package` and advises committing them. **fail #898** on Linux npm 8 / 10 / 12.
+- `package-lock.json` + `yarn.lock` (vendored wires `yarn.lock`): `vendor --check` falsely says no lock references the artifact, and its remedies are no-ops. **fail #900** on Linux npm 10 + yarn 1.22.22.
+- #879 also covers npm 12 `npm install` on an existing v2 lock (keeps v2, drops mirror `resolved`) and an npm 8 v2 shrinkwrap (commented 2026-10-06).
+
 ## Backlog
 
-- **#879 follow-ups:** `npm shrinkwrap` v2 mirror, workspaces, npm 12 on an existing v2 lock; hosted alias `rollback` of the mirror `lp` node (#813).
+- **New 2026-10-06:** #899 follow-ups (dual lock without a twin, workspace shrinkwrap); #898 on other group-commit refusals (`vendor_commit_failed`, a symlinked `.npmrc`); Bun handover #2 (a `bun.lock` + stale `package-lock.json` with no entry for the package: `contest_across_locks` ignores it), not filed because of the cap and Bun being primary.
+- (#879 npm 12 / shrinkwrap v2 follow-ups done 2026-10-06T00Z: both affected, commented.)
+
+- **#879 follow-ups:** workspaces; hosted alias `rollback` of the mirror `lp` node (#813).
 - (#852 and #812 re-checked on `c644ab0` 2026-10-05T18Z: both still reproduce.)
 
 - **#852 follow-ups:** agent `rollback` over the alias store copy; a scoped alias; a transitive alias in `.store`.
@@ -135,3 +152,5 @@ npm 9–11 store an alias as `node_modules/.store/lp@<v>-<h>/node_modules/lp`. A
 - The sandbox sets `NPM_CONFIG_USERCONFIG=/root/.npmrc`, so a scratch `$HOME/.npmrc` is ignored unless you repoint that variable (a harness artifact).
 - `vex -o` is `--org`; the output flag is `-O` / `--output`.
 - `vendor --check` verifying only the artifact (not the lock wiring) for npm is tracked in #725 (generic root cause, draft fix #730). Don't re-file it per npm shape.
+- npm 12 `npm ci` on a shrinkwrap-only project fails EUSAGE (npm 12 reads only package-lock.json). That's npm behaviour; the socket-patch side is #899.
+- A vendored `package-lock.json` symlink refusal: re-running after replacing the link with a regular file reuses the orphan artifact and works (#898 covers the orphan itself).
