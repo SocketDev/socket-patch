@@ -505,7 +505,12 @@ the model is **not uniform** today:
   "nothing installed" absence the hosted lockfile basis excuses), while `apply`/`rollback` never
   touch it (#709). Explicit env/config/standalone roots only count when `--cwd` holds a Bundler
   manifest/lockfile. When the default `vendor/bundle` root holds no store, the gem homes `gem env`
-  reports are appended (default gems like rexml/json only ever live there). When several roots hold
+  reports are appended (default gems like rexml/json only ever live there). When the Bundler tier that
+  decides the install path (the first of the app config, the environment and the global config that
+  sets `path`, `path.system` or `disable_shared_gems`) sets a truthy `path.system` (Bundler's own
+  coercion: anything but `false`/`f`/`no`/`n`/`0`/empty), bundler installs into and loads from the
+  system gem home, so the default `vendor/bundle` root is not probed at all: a leftover store there
+  is neither crawled nor allowed to hide the `gem env` homes (#915). When several roots hold
   **coexisting physical copies of one `gem@version`** (bundler-2's scoped store beside bundler-1's
   flat store), `apply`/`rollback` patch/restore **every copy** — one summary event per copy,
   mirroring npm's multi-copy fan-out — while single-representative consumers (`get`, `vendor`,
