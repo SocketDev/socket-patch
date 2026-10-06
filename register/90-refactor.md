@@ -1,5 +1,5 @@
 ### Refactor routine (`refactor`, hourly, highest leverage first)
-_Last updated 2026-10-06T03:58Z · main @ 9c43dfc_
+_Last updated 2026-10-06T05:02Z · main @ 9c43dfc_
 
 **In flight:**
 - [#876](https://github.com/SocketDev/socket-patch/pull/876): registry clients (`build_registry_client`, Maven `fetch_registry_bytes`) built through one `registry_client_builder` under `ApiTimeouts`; `registry_fetch::download` onto `read_capped`. Also ports the base-red digest-ratchet fix for #646's JVM files. Issue #872 (C49). `ready`.
@@ -23,7 +23,7 @@ _Last updated 2026-10-06T03:58Z · main @ 9c43dfc_
 | 4 | #893 (C50): `repair` and `scan --prune` keep active patches' beforeHash blobs | 1 | 0 | ≈1 | L | ≈4 | best eligible (`cleanup_blobs.rs`); take when a slot frees |
 | 5 | #906 (E25): service-copy pipeline, cargo/composer/go slice | 0 | 1 | ≈0.5 | L | ≈2.5 | eligible; gem copy waits for #768, #776, #875 |
 
-Re-ranked 2026-10-06T03:58Z: no change on main. New since last run: #914 (C51, agent-mode jar hashing onto the streaming zip comparator, ≈1: B 0, D ≈1, L) and #913 (C29, credentials move out of `api/client.rs`, ≈0.5, move-only, after #871); neither enters the top five. #905 stays with the fixer in #909. #871 (≈2.5) eligible after #889; then #705 (≈2.4). #780, #663, #895 still overlap open PRs. 3 of 3 slots used (#876, #886, #889 `ready`, approved). Decisions: #648, #704, #792, #808, #615; C07.
+Re-ranked 2026-10-06T05:02Z: no change on main and no new `arch-audit`/`refactor` issue. #914 (C51, ≈1) is now also skipped: fixer PRs #911 and #916 edit `jvm_jar.rs`. #913 (C29, ≈0.5, move-only, after #871) stays below the top five. #905 stays with the fixer in #909. #871 (≈2.5) eligible after #889; then #705 (≈2.4). #780, #663, #895 still overlap open PRs. 3 of 3 slots used (#876, #886, #889 `ready`, approved). Decisions: #648, #704, #792, #808, #615; C07.
 
 **Notes:**
 - The sandbox runs as root, so 4 core lib tests fail on main and on branches alike: `copy_tree::relax_loop_must_not_traverse_symlinked_root`, `vlt_heal::an_unremovable_hidden_lock_keeps_every_store_entry`, `pypi_poetry::wire_write_failure_maps_error_and_leaves_lock_untouched`, `pypi_requirements::wire_failure_rolls_back_already_written_files`.
