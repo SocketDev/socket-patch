@@ -2,7 +2,7 @@
 
 ## Part 5: Vendored mode and the non-JS backends
 
-_Last checked against main @ 9c43dfc on 2026-10-06 by audit-ecosystems (5.2 dead `force`/`sources` parameters re-checked at `9c43dfc`; per-backend service-copy and cleanup copies re-checked at `9c43dfc`; 5.4 NuGet, Poetry/PDM and Gem re-checked at `4646693`; as of `045d7ec`: 5.4 Python, Cargo, Maven XML, Gem, Go and CRLF helpers; 5.6 scaffolding; the vendored-reference scan behind repair and the orphan sweeps). Owner: audit-ecosystems._
+_Last checked against main @ 9c43dfc on 2026-10-06 by audit-ecosystems (5.4 Poetry/PDM/Pipenv backend skeleton and Poetry forward splicers re-checked at `9c43dfc`; 5.2 dead `force`/`sources` parameters re-checked at `9c43dfc`; per-backend service-copy and cleanup copies re-checked at `9c43dfc`; 5.4 NuGet, Poetry/PDM and Gem re-checked at `4646693`; as of `045d7ec`: 5.4 Python, Cargo, Maven XML, Gem, Go and CRLF helpers; 5.6 scaffolding; the vendored-reference scan behind repair and the orphan sweeps). Owner: audit-ecosystems._
 
 > Scope: `vendor/` framework (`mod`, `common`, `state`, `verify`, `registry_fetch`, `service_fetch`, `prestage`, `reuse`, `redownload`, `ledger_snapshots`, `parse_memo`, `path`, `source`, `toml_surgery`, `lock_inventory`); backends for cargo, gem, pypi (×10 files), golang, composer, nuget, maven and `jvm/`; related `utils/` parsers; and the CLI `vendor.rs` + `vendored_backend/`.
 
@@ -130,6 +130,9 @@ Revert/restore/unwind code in the non-npm backends totals **about 3,540 lines**:
   - `check_target_guards` (missing / forked / ours-in-sync / ours-stale / user-authored)
   - `wire_*`
   - `revert_*`
+
+  The wire and revert envelope around each format edit is identical in all three, verified on `9c43dfc`: symlink refusal → guards → a defensive `InSync` refusal → edit → `ensure_unchanged` → memo invalidate → mode-preserving write. Each also has its own `{Fresh, InSync}` enum. Target: one shared envelope with flavor-derived error codes. {{E23}}
+- Vendored Poetry has **two forward splicers**. Legacy and CRLF locks go through the shared `utils::poetry_lock` engine; LF 2.x locks go through a private `toml_surgery` line scanner (`rewrite_target_package_unit`). The scanner writes a different `files` shape and skips the engine's wheel-name and lowercase-digest gates (executed twice). {{E66}}
 - Pipfile.lock is read through one shared parser but **written two ways**: vendored reserializes canonically, hosted splices spans.
 - Hosted-URL recognition for Pipenv is shared: hosted `owned_url` and the vendored Pipenv guard both ask `lock_inventory::pypi::hosted_pypi_reference`, which applies `hosted_patch_uuid`'s origin allowlist to `hosted_artifact_url`'s tail grammar; the vendored guard gets the run's `--patch-server-url` origin (#572). {{E04}}
 
@@ -247,6 +250,7 @@ Old `kind`s are translated into `SpliceRecord`s when the ledger loads, so legacy
 
 ### New findings since the review
 
+- {{E66}}: vendored Poetry wires a 2.x lock through the `toml_edit` engine when it is CRLF and through a `toml_surgery` line scanner when it is LF. For the same lock the two give different `files` shapes, and only the engine checks the wheel name and lowercases the digest (executed twice); see 5.4.
 - {{E65}}: `vendor --force` documents a missing-file tolerance and a `vendor_content_mismatch_overwritten` warning that no backend implements; every acquisition sink takes `_force`/`_sources`, and `vendor` with and without `--force` behave the same (executed twice). Bears on #615; see 5.2.
 - {{E61}}: the vendored-reference scan behind `repair`, the `vendor` stranded-reference gate and the orphan sweeps never sees NuGet or Maven wiring. `nuget.config` and `pom.xml` lack the `VENDORED` registry role, and both backends reference the bare uuid directory, which `parse_vendor_path` rejects (it needs a leaf). So with a missing ledger entry, `vendor --revert` and the vendored gc delete a feed or repository that `nuget.config` / `pom.xml` still name (proven by execution). The `eco == "maven2"` arm of the stranded-reference gate is dead.
 - {{E59}}: vendored gem `edit_lock` searched only the first `GEM` section of `Gemfile.lock`, so a gem from a later source was refused; fixed by #805; see 5.4.
