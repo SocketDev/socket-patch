@@ -2,7 +2,7 @@
 
 ## Part 5: Vendored mode and the non-JS backends
 
-_Last checked against main @ 4646693 on 2026-10-05 by audit-ecosystems (5.4 NuGet, Poetry/PDM and Gem re-checked at `4646693`; as of `045d7ec`: 5.4 Python, Cargo, Maven XML, Gem, Go and CRLF helpers; 5.6 scaffolding; the vendored-reference scan behind repair and the orphan sweeps). Owner: audit-ecosystems._
+_Last checked against main @ 9c43dfc on 2026-10-06 by audit-ecosystems (per-backend service-copy and cleanup copies re-checked at `9c43dfc`; 5.4 NuGet, Poetry/PDM and Gem re-checked at `4646693`; as of `045d7ec`: 5.4 Python, Cargo, Maven XML, Gem, Go and CRLF helpers; 5.6 scaffolding; the vendored-reference scan behind repair and the orphan sweeps). Owner: audit-ecosystems._
 
 > Scope: `vendor/` framework (`mod`, `common`, `state`, `verify`, `registry_fetch`, `service_fetch`, `prestage`, `reuse`, `redownload`, `ledger_snapshots`, `parse_memo`, `path`, `source`, `toml_surgery`, `lock_inventory`); backends for cargo, gem, pypi (×10 files), golang, composer, nuget, maven and `jvm/`; related `utils/` parsers; and the CLI `vendor.rs` + `vendored_backend/`.
 
@@ -152,8 +152,8 @@ Revert/restore/unwind code in the non-npm backends totals **about 3,540 lines**:
 
   There are also ad-hoc helpers in four more files: on main, `common::detect_eol`, `pypi_uv::newline_of` and `gradle::newline_of` (a different, first-line rule under the same name), plus inline any-CRLF copies in `maven_reactor.rs` (×2) and `pypi_pipenv.rs`. One classifier is the target. {{E16}}
 - **Per-backend copies:**
-  - `cleanup_failed_stage` is byte-identical in cargo and gem, and one line different in composer.
-  - `<eco>_service_copy` (fetch → settle → claim_prestaged-or-extract → afterHash check → swap) is repeated for cargo, composer, gem and golang.
+  - `cleanup_failed_stage` is byte-identical in cargo and gem, and one line different in composer; golang has its own `cleanup_failed_service_stage`.
+  - `<eco>_service_copy` (fetch → settle → claim_prestaged-or-extract → afterHash check → swap) is repeated for cargo, composer, gem and golang (`go_service_redirect`): about 500 lines, with the layout-mismatch message spelled four times. No drift proven yet. {{E25}}
 - **Process-global memo caches:** 22 `static …: ParseMemo` across 16 files. They exist because backends are called once per package and would otherwise re-parse the same lock each time.
 - **Atomic writes:** centralized in `utils/fs.rs`, but in seven variants.
 
@@ -238,7 +238,7 @@ struct Plan { writes: Vec<FileWrite>, records: Vec<SpliceRecord { file, anchor, 
 
 Old `kind`s are translated into `SpliceRecord`s when the ledger loads, so legacy ledgers keep reverting byte for byte. The JVM `JvmPlan`/`JvmUnplan` design is the in-repo precedent.
 
-**Estimated saving:** about 6–8K production lines of the ~44K in this slice (15–18%), and more in tests. Per-backend conformance tests collapse into one suite; for example, `service_preflight_names_exactly_the_*_that_ask_for_a_grant` is copied into seven files.
+**Estimated saving:** about 6–8K production lines of the ~44K in this slice (15–18%), and more in tests. Per-backend conformance tests collapse into one suite; for example, `service_preflight_names_exactly_the_*_that_ask_for_a_grant` is copied into seven files, though its body now shares `test_support::plan_matches_grants`, so only the fixture remains per backend.
 
 **Risks:**
 - committed ledgers are a permanent API, so the legacy-kind adapters must stay;

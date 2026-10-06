@@ -1,5 +1,5 @@
 ### Ecosystems and formats (`audit-ecosystems`)
-_Last updated 2026-10-05T18:49Z · main @ 9c43dfc_
+_Last updated 2026-10-06T01:20Z · main @ 9c43dfc_
 
 | ID | P | Problem | Source | Issues | Status |
 |---|:-:|---|---|---|---|
@@ -27,7 +27,7 @@ _Last updated 2026-10-05T18:49Z · main @ 9c43dfc_
 | E22 | 2 | The JS vendor driver skeleton is copied eight times (`guard_coordinates` → … → a literal `VendorEntry`). Target: one generic driver + `NpmLockBackend`. | 4.4; 4.7 C | | to verify |
 | E23 | 2 | The `pypi_{poetry,pdm,pipenv}.rs` backends repeat one skeleton: `load_*_project`, `classify_dependency`, `check_target_guards`, `wire_*`, `revert_*`. | 5.4 | | to verify |
 | E24 | 2 | There are nine revert mechanisms (~3.5K lines). Target: one splice-record revert engine, with legacy ledger kinds adapted at load. | 2.1; 5.3; 5.8 | | to verify |
-| E25 | 3 | Per-backend copies: `cleanup_failed_stage`, `<eco>_service_copy` (cargo, composer, gem, golang), and the `service_preflight_names_exactly_*` test copied seven times. | 5.4; 5.8 | | to verify |
+| E25 | 3 | Per-backend copies: `cleanup_failed_stage`, `<eco>_service_copy` (cargo, composer, gem, golang), and the `service_preflight_names_exactly_*` test copied seven times. | 5.4; 5.8 | #906 | filed #906; service-copy pipeline + cleanup (preflight test copies now share `plan_matches_grants`, out of scope) |
 | E26 | 3 | JVM has two Maven backends. Target: merge `maven_repo.rs` into `jvm/` as `Shape::Single`. Its three artifact roots don't follow `<eco>/<uuid>`. | 5.7 | | to verify |
 | E27 | 3 | The per-package call model needs ~3K lines of compensating machinery (`group_commit`, `durability`, `prestage`, `vendor_prefetch`, 22 `ParseMemo` statics, `ledger_snapshots`). Target: batched pure planners, after E21 and E24. | 2.4; 5.7 | | to verify |
 | E28 | 2 | Dead vendored scaffolding: `VendorSource` / `PackageSource` have one variant each, the `SERVICE_ECOSYSTEMS` refusal can never fire, `ServicePolicy::new` ignores its config, `vend_installed!` has no target, and several docs are stale. | 5.6; R11 | #800, #746 | filed #800, #746; `VendorSource` predicates and `mem_blobs` are #746 (C23) |
@@ -66,6 +66,7 @@ _Last updated 2026-10-05T18:49Z · main @ 9c43dfc_
 | E61 | 2 | The vendored-reference scan (`scan_vendor_references`, behind `repair`, the `vendor` stranded-ref gate and the orphan sweeps) never sees NuGet or Maven wiring: `nuget.config`/`pom.xml` lack the `VENDORED` role, and both reference the bare uuid dir, which `parse_vendor_path` rejects. With a missing ledger entry, the sweep deletes a still-wired feed or repository. | new finding | #832 | filed #832 |
 | E62 | 2 | npm alias discovery is written twice: core `NpmCrawler::alias_copies` (#738; apply, rollback, VEX installed lookup) and `vex_consumed`'s own walk (hosted VEX). They drifted on case: on Linux a case-only alias dir (`node_modules/Left-Pad` holding `left-pad`) is a copy for VEX but invisible to apply (executed twice). Symptoms #851, #852. | new finding; 6.5 | #856 | filed #856; child 1 of #855 |
 | E63 | 2 | Hosted Maven splices the API `maven_suffixed_version` into `pom.xml` unchecked (any string, even markup), while hosted Gradle refuses the same grant unless it is `<base>-socket.<uuid[..8]>` (`redirect_gradle_override_invalid`); the suffix grammar has four builders and no shared validator, and the Maven/Gradle coordinate derivation is written twice (executed twice). | new finding | #882 | filed #882 |
+| E64 | 2 | BOM handling has no shared helper: 4 named `strip_bom` copies and ~50 inline strips (one-vs-many drift). `formats::pnpm`'s three `lockfileVersion` readers and `workspace::top_level_key` never strip it, so one BOM pnpm lock is readable (entries), not a pnpm lock (VEX), unversioned (hosted trust gate) and unsupported (vendored router), executed twice. Symptoms #903, #904, #623. | new finding; 4.4 | #905 | filed #905 |
 
 **Handed off:** none yet.
 
