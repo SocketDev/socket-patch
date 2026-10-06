@@ -2899,7 +2899,10 @@ async fn holds_patched_bytes(target: &CopyTarget, files: &HashMap<String, PatchF
         {
             return true;
         }
-        match tokio::fs::read(target.dir.join(rel)).await {
+        // FIFO-safe: a FIFO or device planted at the leaf is refused, not
+        // opened (a bare read would block forever), and counts as possibly
+        // patched below.
+        match socket_patch_core::utils::fs::read_regular_to_bytes(&target.dir.join(rel)).await {
             Ok(bytes) => {
                 if socket_patch_core::hash::git_sha256::compute_git_sha256_from_bytes(&bytes)
                     == info.after_hash
@@ -3475,6 +3478,28 @@ mod tests {
                 "{error}"
             );
         }
+    }
+
+    #[cfg(unix)]
+    #[tokio::test]
+    async fn superseded_skip_never_blocks_on_a_fifo() {
+        // A FIFO where the record's file should be is unverifiable: the
+        // check must refuse it, not block in open(2), and must not skip.
+        let (tmp, target, files) = superseded_copy(b"patched by B");
+        std::fs::remove_file(tmp.path().join("index.js")).unwrap();
+        let made = std::process::Command::new("mkfifo")
+            .arg(tmp.path().join("index.js"))
+            .status()
+            .expect("run mkfifo");
+        assert!(made.success());
+        let result = refused("gradle_rollback_hash_mismatch: the before-blob for x does not hash");
+        let skip = tokio::time::timeout(
+            std::time::Duration::from_secs(10),
+            superseded_record_skip(&target, &result, &files, &superseded_map()),
+        )
+        .await
+        .expect("the patched-bytes probe must not block on a FIFO");
+        assert!(skip.is_none());
     }
 
     #[tokio::test]
