@@ -240,7 +240,7 @@ fn classic_block(
             return;
         }
         // `link:` ranges install from the working tree; `resolved` is inert.
-        ClassicBlockSource::Link => return,
+        ClassicBlockSource::Link | ClassicBlockSource::Unresolved => return,
         ClassicBlockSource::Tarball => {}
     }
     let Some(resolved) = resolved else {

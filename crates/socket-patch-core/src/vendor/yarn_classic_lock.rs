@@ -298,21 +298,30 @@ fn rewritable_candidates(
 ) -> Result<(Vec<String>, Vec<VendorWarning>), Box<VendorOutcome>> {
     let mut candidate_keys: Vec<String> = Vec::new();
     let mut skipped: Vec<VendorWarning> = Vec::new();
+    // The skipped blocks that are real installed copies no re-lock changes.
+    let mut unrewritable: Vec<String> = Vec::new();
     for block in blocks {
         match classify_classic_block(block, name, version) {
             BlockClass::Candidate => candidate_keys.push(block.key.clone()),
             BlockClass::LinkSkip(detail) => {
+                unrewritable.push(detail.clone());
                 skipped.push(VendorWarning::new("vendor_link_entry_skipped", detail));
             }
-            BlockClass::GitSkip(detail) => skipped.push(VendorWarning::new(
-                "vendor_yarn_classic_git_entry_skipped",
-                detail,
-            )),
+            BlockClass::GitSkip(detail) => {
+                unrewritable.push(detail.clone());
+                skipped.push(VendorWarning::new(
+                    "vendor_yarn_classic_git_entry_skipped",
+                    detail,
+                ));
+            }
+            BlockClass::UnresolvedSkip(detail) => {
+                skipped.push(VendorWarning::new("vendor_link_entry_skipped", detail));
+            }
             BlockClass::NoMatch => {}
         }
     }
-    if candidate_keys.is_empty() && !skipped.is_empty() {
-        let details: Vec<&str> = skipped.iter().map(|w| w.detail.as_str()).collect();
+    if candidate_keys.is_empty() && !unrewritable.is_empty() {
+        let details: Vec<&str> = unrewritable.iter().map(String::as_str).collect();
         return Err(Box::new(refused(
             "vendor_lock_entry_not_rewritable",
             format!(
@@ -686,6 +695,9 @@ enum BlockClass {
     /// Matches the target but yarn fetches it with git (#363); carries the
     /// warning detail.
     GitSkip(String),
+    /// Matches the target but has no `resolved` (a stale lock `yarn install`
+    /// re-locks); carries the warning detail.
+    UnresolvedSkip(String),
     NoMatch,
 }
 
@@ -713,19 +725,15 @@ fn classify_classic_block(block: &LockBlock, name: &str, version: &str) -> Block
             "lock block `{}` is a link: dependency; skipped",
             block.key
         )),
-        ClassicBlockSource::Directory => BlockClass::LinkSkip(if resolved.is_none() {
-            format!(
-                "lock block `{}` has no resolved tarball (a file: directory copy); \
-                 skipped, so that copy stays unpatched",
-                block.key
-            )
-        } else {
-            format!(
-                "lock block `{}` is a file: directory dependency; skipped, so that copy \
-                 stays unpatched",
-                block.key
-            )
-        }),
+        ClassicBlockSource::Directory => BlockClass::LinkSkip(format!(
+            "lock block `{}` is a file: directory dependency; skipped, so that copy \
+             stays unpatched",
+            block.key
+        )),
+        ClassicBlockSource::Unresolved => BlockClass::UnresolvedSkip(format!(
+            "lock block `{}` has no resolved tarball; skipped",
+            block.key
+        )),
         // yarn fetches a git pattern with git, from `resolved` (#363): a
         // vendored tarball there makes every install fail, and the copy is
         // the git bytes.
@@ -1084,11 +1092,14 @@ pub(crate) enum ClassicBlockSource {
     Tarball,
     /// A `link:` range: a symlink into the working tree.
     Link,
-    /// A `file:` directory range, or no `resolved` at all: yarn COPIES the
-    /// directory into `node_modules`, so that copy keeps its own bytes.
+    /// A `file:` directory range: yarn COPIES the directory into
+    /// `node_modules`, so that copy keeps its own bytes.
     Directory,
     /// Fetched by yarn's git fetcher ([`classic_block_is_git`]).
     Git,
+    /// Any other range with no `resolved`: not something yarn writes for a
+    /// locked package, so the lock is stale and `yarn install` re-locks it.
+    Unresolved,
 }
 
 /// [`ClassicBlockSource`] of a block from its key patterns and `resolved`.
@@ -1112,7 +1123,7 @@ pub(crate) fn classic_block_source(
     }
     match resolved {
         Some(_) => ClassicBlockSource::Tarball,
-        None => ClassicBlockSource::Directory,
+        None => ClassicBlockSource::Unresolved,
     }
 }
 
