@@ -2830,7 +2830,9 @@ pub(crate) fn superseded_by_hosted(
 /// record a live hosted pin superseded ([`superseded_by_hosted`]), when it
 /// failed before writing anything because the installed copy holds bytes
 /// that are neither side of the record (the superseding patch's, after a
-/// reinstall) or lacks a file. The hosted leg's lock restore and the
+/// reinstall), lacks a file, or is a JVM copy this record never patched
+/// (`gradle_rollback_hash_mismatch`, `jvm_jar_backup_missing`). The hosted
+/// leg's lock restore and the
 /// reinstall it asks for unwind that copy; restoring the record's original
 /// bytes over the superseding patch's would only mix the two. `None` for
 /// any other result — a copy still holding the record's patched bytes is
@@ -2851,10 +2853,19 @@ fn superseded_record_skip(
     {
         return None;
     }
+    // JVM copies are refused before verification: a Gradle hash directory
+    // the record's before-blob does not hash to is not the download this
+    // record patched (the superseding patch's jar lands in its own hash
+    // directory), and a swapped jar with no backup here was not swapped by
+    // this record. Neither refusal writes anything.
     let replaced = result
         .files_verified
         .iter()
-        .any(|v| v.status == VerifyRollbackStatus::HashMismatch || v.is_absent());
+        .any(|v| v.status == VerifyRollbackStatus::HashMismatch || v.is_absent())
+        || result.error.as_deref().is_some_and(|e| {
+            e.starts_with("gradle_rollback_hash_mismatch")
+                || e.starts_with("jvm_jar_backup_missing")
+        });
     replaced.then(|| {
         (
             "rollback_record_superseded".to_string(),
@@ -3346,6 +3357,85 @@ mod tests {
             error: None,
             sidecar: None,
         }
+    }
+
+    fn superseded_map() -> HashMap<String, String> {
+        HashMap::from([(
+            "pkg:npm/foo@1.0.0".to_string(),
+            "bbbbbbbb-bbbb-4bbb-8bbb-bbbbbbbbbbbb".to_string(),
+        )])
+    }
+
+    #[test]
+    fn superseded_skip_covers_a_copy_holding_neither_side() {
+        let target = CopyTarget::plain("pkg:npm/foo@1.0.0", Path::new("/tmp/foo"));
+        let result = make_result(&[VerifyRollbackStatus::HashMismatch], &[]);
+        let (code, detail) = superseded_record_skip(&target, &result, &superseded_map())
+            .expect("a superseded record's mismatched copy is left to the hosted leg");
+        assert_eq!(code, "rollback_record_superseded");
+        assert!(
+            detail.contains("bbbbbbbb-bbbb-4bbb-8bbb-bbbbbbbbbbbb"),
+            "{detail}"
+        );
+    }
+
+    #[test]
+    fn superseded_skip_covers_jvm_copies_the_record_never_patched() {
+        let target = CopyTarget::plain("pkg:npm/foo@1.0.0", Path::new("/tmp/foo"));
+        for error in [
+            "gradle_rollback_hash_mismatch: the before-blob for x does not hash",
+            "jvm_jar_backup_missing: no backup of the original jar",
+        ] {
+            let mut result = make_result(&[], &[]);
+            result.success = false;
+            result.error = Some(error.to_string());
+            assert!(
+                superseded_record_skip(&target, &result, &superseded_map()).is_some(),
+                "{error}"
+            );
+        }
+    }
+
+    #[test]
+    fn superseded_skip_leaves_other_failures_and_records_alone() {
+        let target = CopyTarget::plain("pkg:npm/foo@1.0.0", Path::new("/tmp/foo"));
+        let mismatch = make_result(&[VerifyRollbackStatus::HashMismatch], &[]);
+        // Not superseded: the mismatch fails as before.
+        assert!(superseded_record_skip(&target, &mismatch, &HashMap::new()).is_none());
+        // A missing before-blob is a real failure even when superseded.
+        let missing = make_result(&[VerifyRollbackStatus::MissingBlob], &[]);
+        assert!(superseded_record_skip(&target, &missing, &superseded_map()).is_none());
+        // A file that exists but cannot be read may still hold A's bytes.
+        let mut unreadable = make_result(&[VerifyRollbackStatus::NotFound], &[]);
+        unreadable.files_verified[0].message = Some("Failed to hash file: EACCES".to_string());
+        assert!(superseded_record_skip(&target, &unreadable, &superseded_map()).is_none());
+    }
+
+    #[test]
+    fn superseded_by_hosted_needs_a_pin_with_another_uuid() {
+        let mut manifest = PatchManifest::new();
+        manifest
+            .patches
+            .insert("pkg:npm/foo@1.0.0".to_string(), make_record("aaaa"));
+        manifest
+            .patches
+            .insert("pkg:npm/bar@2.0.0".to_string(), make_record("cccc"));
+        let pin = |purl: &str, uuid: &str| HostedPin {
+            purl: purl.to_string(),
+            uuid: uuid.to_string(),
+            files: vec!["package-lock.json".to_string()],
+        };
+        let pins = vec![
+            pin("pkg:npm/foo@1.0.0", "bbbb"),
+            // bar's hosted pin carries the record's own uuid: not superseded.
+            pin("pkg:npm/bar@2.0.0", "cccc"),
+        ];
+        let map = superseded_by_hosted(&manifest, &pins);
+        assert_eq!(
+            map,
+            HashMap::from([("pkg:npm/foo@1.0.0".to_string(), "bbbb".to_string())])
+        );
+        assert!(superseded_by_hosted(&manifest, &[]).is_empty());
     }
 
     #[test]
