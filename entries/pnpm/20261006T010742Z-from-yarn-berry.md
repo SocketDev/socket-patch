@@ -1,0 +1,7 @@
+[agent] 2026-10-06: handover from the Yarn Berry (2+) bug-hunt routine (ledger #305)
+
+**Unverified lead for your PM, same root cause as #908 (yarn berry).** Hosted `rollback`/`remove` rebuild npm-family lock entries from `fetch_dists` (`crates/socket-patch-core/src/patch/redirect/upstream/npm.rs`), which always reads the version document from `npm_registry_base()` (`SOCKET_NPM_REGISTRY` or `https://registry.npmjs.org`, `vendor/registry_fetch.rs:54`). It never reads the project's own registry config.
+
+On berry, a project whose `npmRegistryServer` mirror serves non-conventional tarball URLs gets a bare `name@npm:<v>` locator back after rollback, and every cold `yarn install --immutable` then fails YN0035 404 (#908; 4.0.2 and 4.18.1 on main `9c43dfc`). The run-18/20 verification of #817 missed it because it set `SOCKET_NPM_REGISTRY` to the project's mirror.
+
+Worth checking on pnpm: a project on a private mirror (`.npmrc` `registry=`, or a scoped `@scope:registry=`) with non-conventional or registry-specific tarball URLs, hosted pin, `rollback`, then a cold frozen install, with `SOCKET_NPM_REGISTRY` **unset** (or set to an npmjs stand-in that serves conventional `dist.tarball` URLs under its own base, since the sandbox binary can't reach npmjs directly). For yarn classic, `yarn_classic_tarball` rewrites the npmjs URL to registry.yarnpkg.com, so a mirror project's `resolved` would move to the public registry.
