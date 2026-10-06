@@ -194,7 +194,8 @@ const WORKSPACE_ROOT_LOCKS: [&str; 5] = [
 /// its workspace root, as npm and yarn resolve it. A matching root with no
 /// lock may itself be a member of an outer workspace (yarn berry's nested
 /// worktrees), so the walk goes on with that root as the member; a chain
-/// that ends without a lock (never installed) refuses nothing.
+/// that ends without a lock (never installed), or at a root holding some
+/// other npm-family lock (pnpm, vlt, Rush), refuses nothing here.
 async fn package_json_workspace_refusal(root: &Path) -> Option<Refusal> {
     let canonical = tokio::fs::canonicalize(root)
         .await
@@ -223,6 +224,12 @@ async fn package_json_workspace_refusal(root: &Path) -> Option<Refusal> {
             .filter(|name| ancestor.join(name).is_file())
             .collect();
         if locks.is_empty() {
+            // A root that holds another npm-family lock (pnpm, vlt, Rush)
+            // governs the member itself: the pnpm check, or the rewriters
+            // run from there, own it.
+            if has_own_npm_family_lock(ancestor) {
+                return None;
+            }
             member = ancestor;
             continue;
         }
@@ -720,6 +727,42 @@ mod tests {
             r#"{"private":true,"workspaces":["apps/*"]}"#,
         );
         assert_eq!(code(&member, "npm").await, None);
+    }
+
+    /// Bugbot on #901: a pnpm workspace nested in an outer yarn workspace
+    /// is the member's lock root; the walk stops there and the pnpm check
+    /// names it, not the outer yarn root.
+    #[tokio::test]
+    async fn nested_pnpm_root_stops_the_package_json_walk() {
+        let tmp = tempfile::tempdir().unwrap();
+        write(
+            tmp.path(),
+            "package.json",
+            r#"{"private":true,"workspaces":["packages/*"]}"#,
+        );
+        write(tmp.path(), "yarn.lock", "");
+        write(
+            tmp.path(),
+            "packages/inner/package.json",
+            r#"{"private":true,"workspaces":["pkgs/*"]}"#,
+        );
+        write(
+            tmp.path(),
+            "packages/inner/pnpm-workspace.yaml",
+            "packages:\n  - pkgs/*\n",
+        );
+        write(
+            tmp.path(),
+            "packages/inner/pnpm-lock.yaml",
+            "lockfileVersion: '9.0'\n",
+        );
+        write(tmp.path(), "packages/inner/pkgs/a/package.json", "{}");
+        let member = tmp.path().join("packages/inner/pkgs/a");
+        assert_eq!(package_json_workspace_refusal(&member).await, None);
+        assert_eq!(
+            code(&member, "npm").await.as_deref(),
+            Some(PNPM_LOCKFILE_ELSEWHERE)
+        );
     }
 
     #[test]
