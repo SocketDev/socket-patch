@@ -1600,25 +1600,29 @@ fn strip_bundle_config_comment(v: &str) -> &str {
 /// is not known here. Bundler creates the directory it uses, so take the
 /// current reading unless only the legacy reading's directory exists.
 /// Values without a comment read the same in both eras.
+///
+/// Only two directory readings are weighed against each other. When the
+/// current reading is unset — e.g. a commented `path.system: true` that
+/// only the current loader honours — the legacy path's directory is no
+/// evidence of the era (it may be a leftover install, the #915 shape), so
+/// the current reading stands.
 async fn bundle_config_dir_reading(
     current: Option<String>,
     legacy: Option<String>,
     resolve: impl Fn(&str) -> PathBuf,
 ) -> Option<String> {
-    let Some(legacy) = legacy.filter(|legacy| current.as_ref() != Some(legacy)) else {
+    let (Some(value), Some(legacy)) = (current.as_deref(), legacy) else {
         return current;
     };
+    if value == legacy {
+        return current;
+    }
     let is_dir = |path: PathBuf| async move {
         tokio::fs::metadata(path)
             .await
             .is_ok_and(|meta| meta.is_dir())
     };
-    if let Some(value) = &current {
-        if is_dir(resolve(value)).await {
-            return current;
-        }
-    }
-    if is_dir(resolve(&legacy)).await {
+    if !is_dir(resolve(value)).await && is_dir(resolve(&legacy)).await {
         Some(legacy)
     } else {
         current
@@ -4278,6 +4282,30 @@ mod tests {
         assert_eq!(
             bundler_app_cache_dir_with_env(dir.path(), None, None, false, None).await,
             legacy_cache
+        );
+    }
+
+    /// Bugbot on #953: a commented `path.system: true` drops the recorded
+    /// path under the current loader. A leftover directory at that
+    /// recorded path must not bring it back through the legacy reading.
+    #[tokio::test]
+    async fn commented_path_system_true_ignores_a_leftover_recorded_path() {
+        let dir = tempfile::tempdir().unwrap();
+        std::fs::write(dir.path().join("Gemfile"), b"gem \"foo\"\n").unwrap();
+        std::fs::create_dir_all(dir.path().join(".bundle")).unwrap();
+        std::fs::write(
+            dir.path().join(".bundle").join("config"),
+            "---\nBUNDLE_PATH: vendor/mygems\nBUNDLE_PATH__SYSTEM: true # use system gems\n",
+        )
+        .unwrap();
+        let root = dir.path().join("vendor").join("mygems");
+        std::fs::create_dir_all(root.join("gems").join("foo-1.0.0").join("lib")).unwrap();
+        std::fs::create_dir_all(root.join("specifications")).unwrap();
+
+        let paths = RubyCrawler::get_vendor_bundle_paths_with_env(dir.path(), None, None).await;
+        assert!(
+            paths.is_empty(),
+            "a commented path.system=true must still drop the config root: {paths:?}"
         );
     }
 }
