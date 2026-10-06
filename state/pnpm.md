@@ -1,6 +1,6 @@
 [agent] Progress ledger for the scheduled pnpm bug-hunt routine (label pm:pnpm).
 
-Last updated: 2026-10-06 (run 25), main `9c43dfc`, latest release 4.0.0.
+Last updated: 2026-10-06 (run 26), main `9c43dfc`, latest release 4.0.0.
 
 Method: real pnpm installs. Hosted, vendored and global agent mode run against a local Python mock of the patch API (batch, by-package, view with inline blobs, `patches/blob/<hash>`, package grant, hosted tarball, `/registry/<name>/<ver>` mirror; `ajv-keywords@3.5.2` serves as the peer-dependency package). On v5, set `SOCKET_PATCH_SERVER_URL=<mock>` and `SOCKET_NPM_REGISTRY=<mock>/registry` so that hosted pins are recognised and rollback can restore upstream. The oracle is a marker prepended to `index.js`, checked after a fresh `--frozen-lockfile` install against a dead registry, or by running the global tool. The repo's pinned matrix (`.github/workflows/pnpm-compatibility.yml`) already covers plain hosted and vendored installs on pnpm 1–12. This ledger tracks what it doesn't.
 
@@ -246,6 +246,19 @@ Run 25 additions (main `9c43dfc`, Linux; yarn-classic handover lead from #921):
 
 #935 isn't a regression: release 4.0.0 has no manifest-less lockfile VEX.
 
+Run 26 additions (main `9c43dfc`, Linux; scoped packages and `npm:` aliases):
+
+| pnpm (lock) | Vendored: scoped `@isaacs/string-locale-compare` (scan, fresh frozen, vex) | Vendored: unscoped `left-pad` (control) | Vendored: scoped `npm:` alias | Vendored: unscoped `npm:` alias | Hosted: scoped + unscoped `npm:` alias (fresh frozen, vex) |
+| --- | --- | --- | --- | --- | --- |
+| 7.33.7 (5.4) | fail #956 (unquoted `name: @scope/pkg`, `ERR_PNPM_BROKEN_LOCKFILE`) | pass | untested | untested | untested |
+| 8.15.9 (6.0) | fail #956 | pass | pass (refused: `aliased root dependency`) | pass (refused) | untested |
+| 9.15.9 | pass | pass | fail #957 (success, dangling importer ref, vex attests) | pass (refused) | pass / pass |
+| 10.34.5 | pass | pass | untested | untested | untested |
+| 11.28.3 | pass | pass | untested | untested | untested |
+| 12.8.1 | pass | pass | fail #957 | pass (refused) | pass / pass |
+
+#956 and #957 aren't regressions: release 4.0.0 behaves the same (3.3.0 has no pnpm vendored mode).
+
 Run 20 additions (main `045d7ec`, Linux):
 
 | pnpm (lock) | Vendored parent + vendored dep (`debug`→`ms`): `remove <parent>` / takeover → hosted / `rollback` | `remove <child>` (control) | Hosted parent + dep: remove parent / rollback | Mixed-case names (`Base64`, `JSONStream`): hosted / agent / vendored | User parent-selector / range-selector override (vendored) | Agent `symlink=false` / `hoist=false` | `list -g` |
@@ -296,11 +309,13 @@ Global mode (`-g`, v5 main `2463257`):
 8a. #830 follow-ups: a three-level vendored chain, a `scan --mode vendored` re-run over the broken `remove` state, and the pnpm 7/8 workspace dialect.
 8c. #880 / #881 follow-ups: a member of a workspace whose root uses `catalogs`, and the pnpm 7/8 dialect.
 8b. #853 follow-ups: the takeover over a peer-suffixed snapshot key and over a pnpm ≤6 legacy lock, and `vendor --dry-run` (manifest-driven) parity.
-9. Re-verify the open set when fixes land: #435, #466, #492, #556, #633, #713, #714, #734, #778, #830, #831 (PR #837, pnpm gitignore matrix), #853, #854, #880, #881, #902, #903, #904 (fix PR #909), #919 and #935.
+9. Re-verify the open set when fixes land: #435, #466, #492, #556, #633, #713, #714, #734, #778, #830, #831 (PR #837, pnpm gitignore matrix), #853, #854, #880, #881, #902, #903, #904 (fix PR #909), #919, #935, #956 and #957.
 9a. BOM follow-ups (#903 / #904): a fresh install of a hosted BOM-`package.json` pin, and Windows checkouts (needs a probe). (Vendored BOM workspace file on 9.15.9 / 10.34.5 done in run 25: #904 reproduces.)
 9b. #902 follow-ups: the setting in the global `rc` / `config.yaml`. (Mirror + tarball URLs became #919 in run 24.)
 9c. #919 follow-ups: scoped `@scope:registry=` mirrors, the hosted → vendored takeover + `vendor --revert` on a mirror, pnpm 7/8 lock dialects, and re-verification once PR #918 (or a successor) covers `restore_pnpm_locks`.
 9d. #935 follow-ups: a `git+` / `github:` dependency sharing the patched name@version beside a registry copy, the pnpm 7 (5.4) dialect, a `link:` copy (should not contest), and `vex --product` on a member path.
+9e. #956 / #957 follow-ups: a scoped alias inside a transitive dependency's snapshot (`rest == reg_key` has the same quoting gap), scoped vendored in a pnpm 7/8 workspace layout, and re-verification once fixed.
+9f. Vendored scoped package with its own scoped transitive deps on 9.x / 12.x, and agent `apply` on a scoped `npm:` alias.
 10. Vendored on Windows and macOS (autocrlf: expect the `vendor_lockfile_crlf_unsupported` refusal, and the #853 un-hosting when switching from hosted; check that hosted handles the same checkout; hosted CRLF passes on Linux).
 
 ## Known non-bugs
