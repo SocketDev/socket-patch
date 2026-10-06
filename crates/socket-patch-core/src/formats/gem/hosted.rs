@@ -304,3 +304,4 @@ pub(crate) fn checksum_entry_span(lock: &str, name: &str, version: &str) -> Opti
     }
     None
 }
+

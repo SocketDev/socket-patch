@@ -851,10 +851,9 @@ async fn scan_redirect_rewrites_crlf_and_bom_yarn_berry_locks_and_rollback_resto
             "{label}: rollback restores the pristine CRLF lock (upstream checksum \
              re-derived from the registry tarball)"
         );
-        let pkg: serde_json::Value = serde_json::from_str(
-            &std::fs::read_to_string(tmp.path().join("package.json")).unwrap(),
-        )
-        .unwrap();
+        let pkg: serde_json::Value =
+            serde_json::from_str(&std::fs::read_to_string(tmp.path().join("package.json")).unwrap())
+                .unwrap();
         assert!(
             pkg.get("resolutions").is_none(),
             "{label}: rollback drops the resolutions pin: {pkg}"

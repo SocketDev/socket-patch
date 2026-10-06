@@ -304,9 +304,9 @@ where
     // write the lock edits beside the pre-run ledger. Put the caller's value
     // back before the unwind continues — the same value a caught-and-
     // continued caller holds.
-    if let Err(panic) =
-        std::panic::catch_unwind(std::panic::AssertUnwindSafe(|| edit(Arc::make_mut(value))))
-    {
+    if let Err(panic) = std::panic::catch_unwind(std::panic::AssertUnwindSafe(|| {
+        edit(Arc::make_mut(value))
+    })) {
         files.insert(key, captured(value));
         drop(files);
         std::panic::resume_unwind(panic);
@@ -1766,10 +1766,7 @@ mod tests {
             .unwrap();
         remove_dir_after_commit(&dir).await;
         drop(dropped);
-        assert!(
-            dir.join("config.toml").exists(),
-            "an abandoned commit removes nothing"
-        );
+        assert!(dir.join("config.toml").exists(), "an abandoned commit removes nothing");
 
         let group = GroupCommit::begin(root);
         super::super::fs::remove_file(&dir.join("config.toml"))
@@ -1778,10 +1775,7 @@ mod tests {
         remove_dir_after_commit(&dir).await;
         assert!(dir.join("config.toml").exists(), "captured, still on disk");
         group.commit().await.unwrap();
-        assert!(
-            !dir.exists(),
-            "the emptied directory is removed after the commit"
-        );
+        assert!(!dir.exists(), "the emptied directory is removed after the commit");
 
         std::fs::create_dir_all(&dir).unwrap();
         std::fs::write(dir.join("config.toml"), b"[patch]\n").unwrap();
@@ -1793,10 +1787,7 @@ mod tests {
         remove_dir_after_commit(&dir).await;
         group.commit().await.unwrap();
         assert!(!dir.join("config.toml").exists());
-        assert!(
-            dir.join("credentials.toml").exists(),
-            "a non-empty directory is kept"
-        );
+        assert!(dir.join("credentials.toml").exists(), "a non-empty directory is kept");
 
         remove_dir_after_commit(&root.join("gone")).await;
         std::fs::remove_file(dir.join("credentials.toml")).unwrap();

@@ -592,9 +592,9 @@ async fn berry_hosted_project_with(
     let root_pkg = std::fs::read_to_string(proj.join("package.json")).unwrap();
     let root_pkg: serde_json::Value = serde_json::from_str(&root_pkg).unwrap();
     assert!(
-        root_pkg["resolutions"].as_object().is_some_and(|r| r
-            .iter()
-            .any(|(sel, v)| sel.starts_with(&format!("{DEP}@npm:"))
+        root_pkg["resolutions"]
+            .as_object()
+            .is_some_and(|r| r.iter().any(|(sel, v)| sel.starts_with(&format!("{DEP}@npm:"))
                 && v.as_str() == Some(hosted_url.as_str()))),
         "package.json must route {DEP} to the hosted tarball: {root_pkg}"
     );
