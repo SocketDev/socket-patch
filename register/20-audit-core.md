@@ -1,5 +1,5 @@
 ### CLI layer, core infrastructure, agent mode, tests and docs (`audit-core`)
-_Last updated 2026-10-06T09:48Z · main @ 9c43dfc_
+_Last updated 2026-10-06T15:50Z · main @ 9c43dfc_
 
 | ID | P | Problem | Source | Issues | Status |
 |---|:-:|---|---|---|---|
@@ -33,9 +33,9 @@ _Last updated 2026-10-06T09:48Z · main @ 9c43dfc_
 | C28 | 3 | socket.yml builds a hand-made YAML tree on serde-saphyr's event parser to read 8 keys. Target: serde with `deny_unknown_fields`. | 7.5 | | rejected; the tree implements the contract's scoped YAML refusals |
 | C29 | 3 | The `client.rs` split (2.8K lines) into client, vendor_service and credentials; the debug-ordering machinery (`HeldBack`) has 45 call sites. | 7.2; 7.6 #8 | #871, #913 | filed #871, #913; #871 vendor-service move, #913 credentials move (~330 lines) |
 | C30 | 2 | No shared test-support: `binary()` is defined in 103 files and `git_sha256` in 86, there are 15 `scrub_socket_env` (14 bodies), xorshift is implemented four times, and the VEX helpers are forked. | 6.4; 8.5 D | #824, #823 | filed #824, #823; #823 slice 1 merged as #850 (`common/hermetic.rs`, 8 of 15 `scrub_socket_env` copies deleted); slice 2 is the other 7 |
-| C31 | 3 | There are 207 test executables; the target is ~25. This needs C10 first. | 8.5 A | | to verify |
-| C32 | 3 | 328 exact-sentence assertions should become `--json`/`errorCode` checks plus snapshots. Triage the 402 covgap tests, 136 of which assert human text. | 2.5; 8.5 G/H | | to verify |
-| C33 | 3 | `CLI_CONTRACT.md` (332 KB) should be a generated reference (flags, env vars, codes, exit codes) plus ≤300 lines of prose, with a freshness test. Also decouple `docs/testing` from the validation scripts. | 8.3; 8.5 F/I | | to verify |
+| C31 | 3 | There are 224 test executables on `9c43dfc` (review: 207; no `[[test]]` entries); the target is ~25. This needs C10 first. | 8.5 A | | to verify |
+| C32 | 3 | 328 exact-sentence assertions should become `--json`/`errorCode` checks plus snapshots. Triage the covgap tests (32 files, 407 tests, 27.2K lines on `9c43dfc`; review: 402), 136 of which (at review) assert human text. | 2.5; 8.5 G/H | | to verify |
+| C33 | 3 | Tracking: `CLI_CONTRACT.md` (379 KB on `9c43dfc`; 332 KB at review) should be a checked reference (flags, env vars, codes, exit codes) plus ≤300 lines of prose, with freshness tests. Also decouple `docs/testing` from the validation scripts. | 8.3; 8.5 F/I | #948, #949 | filed #948, #949; tracking #948 (folds in #678, #930), child 1 #949 (flag/env tables pinned to `Cli::command()`) |
 | C34 | 3 | Decide: the command model. A read-only `scan`, plus `fix`, `undo`, `sync` and `check`, with mode inferred from project state. This folds `remove`, `rollback` and `vendor --revert`, and per-command flags replace the 27 globals. | §4; 2.9; R6/R8 | | to verify |
 | C35 | 3 | Decide: drop the deprecated spellings and embedded `--vex`, and give `SOCKET_FORCE` per-command names. | R9; R10 | | to verify; `SOCKET_FORCE` part is #615 |
 | C36 | 3 | Decide: the futures of agent mode and of the self-update binary swap. | §6 Q2; 7.5 | | to verify |

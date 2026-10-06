@@ -2,7 +2,7 @@
 
 ## Part 8: Tests, CI, docs and distribution
 
-_Last checked against main @ 045d7ec on 2026-10-05 by audit-core. Owner: audit-core._ Only the repository-hygiene passages (stray `launch.json`, "DESIGN §" references), the contract's env-var tables, the `#[serial]` count and the duplicated-helper counts have been re-checked; the rest is as of `2463257`.
+_Last checked against main @ 9c43dfc on 2026-10-06 by audit-core. Owner: audit-core._ Only the repository-hygiene passages (stray `launch.json`, "DESIGN §" references), §8.3's `CLI_CONTRACT.md` measurements and guards, the contract's argument and env-var tables, the test-binary and covgap counts, the `#[serial]` count and the duplicated-helper counts have been re-checked; the rest is as of `2463257`.
 
 > Scope: `crates/*/tests/**`, `tests/` (docker fixtures), `.github/workflows/*`, `.github/actions/*`, `scripts/`, `docs/`, `CLI_CONTRACT.md`, `CHANGELOG.md`, `npm/`, `crates/socket-patch-node/npm/`, and the Cargo profiles. CI timings come from the GitHub Actions run for `2463257` on `main`.
 
@@ -18,7 +18,7 @@ PR #277 has already started cleaning up: it deleted 237,608 lines, including 136
 
 - **Ratio:** roughly 2.7 test lines per production line overall, and **about 7:1 for the CLI crate** (235.6K integration lines against 33.7K production lines).
 - **Test counts:** ~2,753 CLI integration tests, 523 core integration tests and 5,442 inline tests. 242 are `#[ignore]`-gated.
-- **207 test executables per `cargo test --workspace`.** There are no `[[test]]` entries, so every file links its own binary. The repo's own comments disagree on the count ("~240" in `ci.yml`, 159 in `Cargo.toml`, "~90" in `.cargo/config.toml`).
+- **207 test executables per `cargo test --workspace`** at the review; **224** on `9c43dfc` (189 CLI, 35 core). {{C31}} There are no `[[test]]` entries, so every file links its own binary. The repo's own comments disagree on the count ("~240" in `ci.yml`, 159 in `Cargo.toml`, "~90" in `.cargo/config.toml`).
 - **Disk cost:** `Cargo.toml` notes that macOS split-debuginfo "grew target/ to 99 GB".
 - **Docker binaries are always linked.** The 14 `docker_e2e_*.rs` files are gated with `#![cfg(feature = "docker-e2e")]`, so they still compile and link as empty binaries on every default run.
 
@@ -39,7 +39,7 @@ PR #277 has already started cleaning up: it deleted 237,608 lines, including 136
 - `vex_pdm_hatch_common` and `vex_pipenv_pip_common` share **977 identical non-blank lines** (78% similar).
 
 **Coverage-chasing tests.**
-- 32 `covgap_*`/`coverage_fix_*` files hold 26,916 lines and 402 tests. 136 of those test names are about human output (`human`, `message`, `prints`, `summary`, …).
+- 32 `covgap_*`/`coverage_fix_*` files hold 27,226 lines and 407 tests (on `9c43dfc`; the review counted 26,916 and 402). {{C32}} 136 of those test names are about human output (`human`, `message`, `prints`, `summary`, …).
 - 43 test files import `socket_patch_cli::commands::*` internals, which only works because `lib.rs` makes `commands` `pub`.
 - The coverage job does not gate anything ("No threshold gating").
 - In fairness, the sweep that produced them found 39 real bugs (#236). **Keep the regressions, rename them by behavior, and drop the rest.**
@@ -97,14 +97,15 @@ For `2463257` on `main`:
 ### 8.3 Docs
 
 **`CLI_CONTRACT.md` is not maintainable as written.**
-- **Size:** 1,638 lines and 332 KB. 48 lines exceed 1,000 characters, 12 exceed 3,000, and the longest is **9,320 characters** (line 164).
-- **History mixed into reference:** 177 `v5.0` annotations and 40 `MAJOR`/`BREAKING` markers.
+- **Size:** 1,940 lines and 379 KB on `9c43dfc` (1,638 and 332 KB at the review). 54 lines exceed 1,000 characters, 13 exceed 3,000, and the longest is **11,338 characters** (line 166). {{C33}}
+- **History mixed into reference:** 155 lines carry a `v5.0` annotation and 29 a `MAJOR`/`BREAKING` marker (counted per line on `9c43dfc`).
 - **Stale:** "Migration status (v3.0)" still promises a follow-up PR.
 - **Misordered:** "Vendored JVM support (v5)" sits after "How the contract is enforced".
 - **Drift from the code:**
   - One documented code no longer exists in `src`: `vendor_lock_checksums_unsupported`.
   - Undocumented codes: on `9c43dfc`, 43 code-shaped literals in emitting positions appear nowhere in the contract, among them `rollback_not_installed`, `vendor_service_unsupported_ecosystem`, `hosted_restore_failed`, `invalid_manifest` and the `redirect_composer_*`/`redirect_pnpm_*`/`redirect_requirements_*` families. {{C13}}
-  - Only the vlt codes are checked mechanically.
+  - Only the vlt codes (`scripts/tests/test_vlt_coverage.py`) and the Gradle/JVM codes (`tests/contract_gradle_codes.rs`) are checked mechanically. "How the contract is enforced" credits the `cli_parse_*` tests, which assert the parser, not the document.
+  - The argument and env-var tables match `--help` on `9c43dfc`, except that four `SOCKET_VEX_*` names are only abbreviated in the env table. Nothing pins them, and the scrub list `LOCAL_ARG_ENV_VARS` lacks `SOCKET_NO_SOCKET_YML` and `SOCKET_MIN_SEVERITY`. {{C33}}
 
 **User docs are lean, with rough spots.**
 - The good: `README.md` (6.7 KB) has a clear scan → install → vex flow, and `usage.md`, `configuration.md` and `migrating-to-v5.md` are well scoped.
@@ -136,7 +137,7 @@ For `2463257` on `main`:
 | C | **Cut the PR e2e tier from 148 to ~50 legs** (boundary versions only); move the vlt/bun sweeps to nightly | Up to ~200 fewer jobs per PR | Low–Med |
 | D | **A `socket-patch-test-support` dev crate**: delete the 102 `binary()`, 84 `git_sha256` and 14 divergent env scrubbers; merge the forked VEX helpers | ~3–6K lines; hermeticity | Low |
 | E | **A reusable compat workflow** plus a `setup-pm` composite action; no per-leg compiles; fix the dead path filters | ~2,041 → ~900 workflow lines | Medium |
-| F | **Split `CLI_CONTRACT.md`**: a *generated* reference (flags from `Cli::command()`, env vars, an `errorCode` registry in code, exit codes) plus 300 lines or less of prose, with a freshness test | Fixes the measured drift | Low |
+| F | {{C33}} **Split `CLI_CONTRACT.md`**: a *generated* reference (flags from `Cli::command()`, env vars, an `errorCode` registry in code, exit codes) plus 300 lines or less of prose, with a freshness test | Fixes the measured drift | Low |
 | G | **Replace the 328 sentence assertions** with `--json`/`errorCode` checks plus a few `insta` snapshots | Copy edits stop touching dozens of files | Low |
 | H | **Triage the 402 covgap tests**: keep the regressions, drop the ~136 output-text cases, stop importing `pub` internals | ~8–12K lines | Medium |
 | I | **Decouple `docs/testing` from validation**: data in `tests/specs/`, generate markdown from it; fix or remove the 39 "DESIGN §" refs | Lower coupling | Low |
