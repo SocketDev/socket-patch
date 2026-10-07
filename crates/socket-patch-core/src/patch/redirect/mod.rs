@@ -3608,8 +3608,17 @@ fn rewrite_yarn_classic(
                     .refused_yarn_classic_uuids
                     .insert(dep.patch_uuid.clone());
                 // The refusal leaves this entry as it was, so it carries a
-                // hosted pin only if an earlier run already wrote one.
-                pinned_any |= block.contains(dep.artifact_url.as_str());
+                // hosted pin only if an earlier run already wrote one — this
+                // run's URL, or one on the same patch server from an earlier
+                // grant token or patch uuid.
+                pinned_any |= resolved_re.find(block).is_some_and(|m| {
+                    let url = m
+                        .as_str()
+                        .trim_start_matches("\n  resolved \"")
+                        .trim_end_matches('"');
+                    let url = url.split_once('#').map_or(url, |(u, _)| u);
+                    berry_hosted_pin_is_ours(url, &fname, Some(&dep.version), &dep.artifact_url)
+                });
                 continue;
             }
             pinned_any = true;
@@ -10162,6 +10171,30 @@ mod tests {
         rewrite_yarn_classic(&files, std::slice::from_ref(&lp), &mut r);
         assert!(r.files.is_empty(), "{:?}", r.files);
         assert_eq!(berry_risk_count(&r), 1, "{:?}", r.warnings);
+
+        // A pin from an earlier grant token or uuid on the same patch server
+        // is still lost on a berry migrate, so it is still warned about; a
+        // same-named tarball on another origin (a user mirror) is not ours.
+        let host = "https://patch.test/patch/npm/left-pad/1.3.0";
+        let current = npm_override(
+            "left-pad",
+            "1.3.0",
+            &format!("{host}/tok-new/uuid-new/left-pad-1.3.0.tgz"),
+            "sha512-PATCHED==",
+        );
+        for (old_url, expect) in [
+            (format!("{host}/tok-old/uuid-old/left-pad-1.3.0.tgz"), 1),
+            ("https://mirror.test/left-pad-1.3.0.tgz".to_string(), 0),
+        ] {
+            let pinned = classic_lock_two_entries().replace(
+                "https://registry.yarnpkg.com/left-pad/-/left-pad-1.3.0.tgz",
+                &old_url,
+            );
+            files.insert("yarn.lock".into(), pinned);
+            let mut r = RewriteResult::default();
+            rewrite_yarn_classic(&files, std::slice::from_ref(&current), &mut r);
+            assert_eq!(berry_risk_count(&r), expect, "{old_url}: {:?}", r.warnings);
+        }
     }
 
     /// A CRLF classic lock (Windows `core.autocrlf` checkout) must rewrite
