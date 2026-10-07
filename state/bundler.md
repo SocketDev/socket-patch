@@ -1,6 +1,6 @@
 [agent] Progress ledger for the scheduled Bundler (RubyGems) bug-hunt routine (label pm:bundler).
 
-Last updated: 2026-10-07 (run 27), main `9c43dfc` (includes #637, #621, #797, #805, #849, #731, #750, #712), latest release tag v4.0.0. Newest Bundler tested: 4.1.0.beta1 (repo gem e2e suites pass).
+Last updated: 2026-10-07 (run 28), main `9c43dfc` (includes #637, #621, #797, #805, #849, #731, #750, #712), latest release tag v4.0.0. Newest Bundler tested: 4.1.0.beta1 (repo gem e2e suites pass).
 
 ## Coverage matrix
 
@@ -241,6 +241,17 @@ Also on 4.0.17: BOM `Gemfile` passes; symlinked `Gemfile` / lock is refused (pas
 | Hosted: gemspec runtime dep + Gemfile `gem` line → fresh frozen install | pass | — | — | — |
 | Vendored: gemspec dev dep + Gemfile `gem` line → fresh frozen install | fail #985 (×2) | — | fail #985 | pass |
 
+### Run 28 (main `9c43dfc`; Linux Ruby 3.3.6; hosted mock + real rubygems.org upstream)
+
+| Cell | 4.0.22 | 2.6.9 |
+| --- | --- | --- |
+| Hosted stale guard: config/env `path vendor/bundle` not installed + unused system copy | fail #1001 (×3; also v4.0.0, PR #968) | fail #1001 |
+| Hosted stale guard: `simulate_version 5`, unpatched `.bundle` install | fail #967 (false VEX; PR #968 pass) | — |
+| Agent #967 shapes on PR #968 `25e3ca6` | pass | pass |
+| Hosted gemspec dev-dep: converge → `rollback` → frozen install | pass | — |
+| Hosted transitive via `git:` gem: cycle + `rollback` | pass (lock byte-identical) | — |
+| Agent env `BUNDLE_PATH='~/x'` | pass | — |
+
 ### Global mode (`-g`)
 
 | OS | Ruby / Bundler | `scan -g` report | `-g` vs project scoping | `scan -g --mode hosted` refused | `get -g` / `apply -g` | `rollback -g` byte-exact | `vex -g` | `--global-prefix <gems dir>` / `SOCKET_GLOBAL=1` | Non-writable gem dir |
@@ -263,11 +274,11 @@ Also on 4.0.17: BOM `Gemfile` passes; symlinked `Gemfile` / lock is refused (pas
 
 ## Backlog
 
-1. Re-run #681 / #729 / #749 / #751 / #775 / #826 / #896 / #915 / #951 / #952 / #967 / #985 when fixes merge (open PRs #684, #768, #776, #875, #916, #953). #875 head `5b9953d3` already passes every #826 shape. #953 head `52542db` fixes the #951 agent shape. #916 covers the `to_bool` spellings and the hosted stale guard. #776 covers every vendored-refused block shape. #684 head `0e1e6cda` misses 4.1's quoted URL-scoped mirror keys.
-2. #985 neighbours: hosted `rollback` on the gemspec dev-dep shape (the exact-pin restore may then fail frozen installs), `get <uuid> --mode hosted`, and H→V takeover on that shape.
-3. #967 neighbours: the hosted stale guard with a stale `.bundle/ruby/<abi>` copy; `rollback` under `simulate_version 5`; other Bundler 5-mode defaults socket-patch models. When Bundler 5 ships, `.bundle` becomes the plain default, so re-run everything there.
+1. Re-run #681 / #729 / #749 / #751 / #775 / #826 / #896 / #915 / #951 / #952 / #967 / #985 / #1001 when fixes merge (open PRs #684, #768, #776, #875, #916, #953, #968). #875 head `5b9953d3` already passes every #826 shape. #953 head `52542db` fixes the #951 agent shape. #968 head `25e3ca6` fixes #967 in agent mode and in the hosted stale guard, but not #1001. #916 covers the `to_bool` spellings and the hosted stale guard. #776 covers every vendored-refused block shape. #684 head `0e1e6cda` misses 4.1's quoted URL-scoped mirror keys.
+2. #1001 neighbours: `path.system: false` / `disable_shared_gems true`, `deployment true` without `path`, and a global-tier `path` with the stale guard.
+3. #985 neighbours: `get <uuid> --mode hosted` and H→V takeover on the gemspec dev-dep shape (`rollback` passes, run 28).
 4. #952 neighbours: under `BUNDLE_GEMFILE=gemfiles/x.gemfile`, check `cache_path` in `gemfiles/.bundle/config` for the hosted stale guard and `vex`, and the env `BUNDLE_APP_CONFIG` relative to the moved root.
-5. More `.bundle/config` parser divergences from Bundler's `YAMLSerializer`: `KEY:"v"` with no space, a value with trailing spaces after the closing quote, `#` inside a quoted value. All contrived, so low priority.
+5. More `.bundle/config` parser divergences from Bundler's `YAMLSerializer` (contrived, so low priority).
 6. RubyGems 4.1 + Bundler 4.1 content-addressed installs (`gems/<name>-<ver>-<hex8>`): revisit when a gem is published that way.
 7. Windows `x64-mingw-ucrt` platform gems in hosted and vendored modes; vendored cells and `repair` on Windows and macOS.
 8. Bundler 1.17 hosted unwind (Ruby ≤ 3.1 probe); `rollback` / `remove` on a custom-lock project.
@@ -353,3 +364,6 @@ Also on 4.0.17: BOM `Gemfile` passes; symlinked `Gemfile` / lock is refused (pas
 - Bundler's config loader doesn't unescape `inspect`-written values (`"D:\\a\\proj"`, `"\u00FC"`), and neither does socket-patch, so they agree (run 25).
 - Under `BUNDLE_GEMFILE=gemfiles/x.gemfile`, Bundler reads `gemfiles/.bundle/config` and ignores the root `.bundle/config` (verified with 4.0.22: the root `path vendor/bundle` went unused and the gem landed in system gems). setup-ruby's `bundler-cache` writes an absolute `$PWD/vendor/bundle`, so the crawler's default `vendor/bundle` probe happens to find it; only relative paths hit #952 (run 25).
 - Gemspec-library cells (run 27): the hosted/vendored harness copies must also copy `mylib.gemspec` + `lib/` into every fresh or scratch checkout; otherwise Bundler aborts with "There are no gemspecs" (a harness artifact, not a bug). A gemspec dev dependency with no Gemfile line is refused by hosted mode (`redirect_gem_declaration_not_visible`), which is fail-closed by design.
+- Agent `.bundle/config` `path "~/x"` (tilde, so out of tree) is skipped as a write root with `gem_bundle_config_path_ignored`, and `vex` refuses `not_applied`. Documented (#709 contract); env `BUNDLE_PATH='~/x'` is expanded and works (run 28).
+- In mock dirs, never run `gem install <gem>` from a cwd that holds a rebuilt `*.gem` of the same name and version: RubyGems installs the local file first, which silently patches the system copy and fakes "pass" results. Reinstall from an empty dir, and check the system cache `.gem` sha (run 28 near-miss).
+- Bundler with an explicit `path` doesn't reuse a non-default gem from the system home (verified with `rexml 3.3.9`: it fetches into `vendor/bundle`). Default gems can still come from the system homes (run 28).
