@@ -1,5 +1,5 @@
 ### Refactor routine (`refactor`, hourly, highest leverage first)
-_Last updated 2026-10-07T20:58Z · main @ 05ecc6e_
+_Last updated 2026-10-07T22:56Z · main @ 05ecc6e_
 
 **In flight:**
 - No routine-opened PR is open. 24 `arch-refactor` PRs are open, so `MAX_OPEN` is full; the routine re-ranks only.
@@ -22,7 +22,7 @@ _Last updated 2026-10-07T20:58Z · main @ 05ecc6e_
 | 4 | #931 (C13 child 1): one manifest-read error mapper for every command | 1 | 1 | ≈2.5 | M | ≈5.5 | skipped: as #998 |
 | 5 | #893 (C50): one artifact GC retention policy | 1 | 0 | ≈2 | L | ≈4 | next eligible when a slot frees |
 
-Re-ranked 2026-10-07T20:58Z (unchanged: main still 05ecc6e, no PR closed since 18:56Z, the 8 maintainer drafts refreshed their heartbeats at 20:39Z). Earlier, the October 7 reconciliation: stale skip lists replaced (#657, #909, #940, #1015, #876, #889 merged). The campaign PRs above cover E08, E69–E77, C42 and C59–C67; don't start work on those rows.
+Re-ranked 2026-10-07T22:56Z (unchanged: main still 05ecc6e, no `arch-refactor` PR closed since 20:58Z, the 8 maintainer drafts refreshed their heartbeats at 22:41Z). New since 20:58Z: #1088 is a `Decide:` issue (skipped, `agent:needs-human`); #1089/#1090 (CLI tests assert error codes, test-only, B 0, U 1, D ≈1, score ≈3) rank below #893 and overlap #1046 (test hygiene). Earlier, the October 7 reconciliation: stale skip lists replaced (#657, #909, #940, #1015, #876, #889 merged). The campaign PRs above cover E08, E69–E77, C42 and C59–C67; don't start work on those rows.
 
 **Notes:**
 - The sandbox runs as root, so 4 core lib tests fail on main and on branches alike: `copy_tree::relax_loop_must_not_traverse_symlinked_root`, `vlt_heal::an_unremovable_hidden_lock_keeps_every_store_entry`, `pypi_poetry::wire_write_failure_maps_error_and_leaves_lock_untouched`, `pypi_requirements::wire_failure_rolls_back_already_written_files`.
