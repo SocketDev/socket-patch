@@ -27,7 +27,9 @@ use socket_patch_core::manifest::operations::{read_manifest, write_manifest};
 use socket_patch_core::manifest::schema::{PatchManifest, PatchRecord};
 use socket_patch_core::patch::apply::{verify_file_patch, PatchSources};
 use socket_patch_core::patch::redirect::upstream::HostedPin;
-use socket_patch_core::telemetry::{track_patch_vendor_failed, track_patch_vendored};
+use socket_patch_core::telemetry::{
+    track_patch_vendor_failed, track_patch_vendored, TelemetryAuth,
+};
 use socket_patch_core::utils::composer_version::composer_purls_equivalent;
 use socket_patch_core::utils::concurrent::ordered_concurrent;
 use socket_patch_core::utils::group_commit::{CommittedFile, GroupCommit};
@@ -953,7 +955,7 @@ pub async fn run(args: VendorArgs) -> i32 {
         }
         let vex_result = match args.vex.vex.as_ref() {
             Some(_) if !args.common.dry_run => {
-                let params = args.vex.to_build_params();
+                let params = args.vex.to_build_params(None);
                 Some(generate_vex_without_manifest(&args.common, &params, &manifest_path).await)
             }
             _ => None,
@@ -1025,11 +1027,11 @@ pub async fn run(args: VendorArgs) -> i32 {
     } else {
         let (client, use_public_proxy) =
             get_api_client_with_overrides(args.common.api_client_overrides()).await;
-        let telemetry_ids = (client.api_token().cloned(), client.org_slug().cloned());
+        let telemetry = TelemetryAuth::for_client(&client);
         Some((
             args.common
                 .vendor_service_config(Some(client), use_public_proxy),
-            telemetry_ids,
+            telemetry,
         ))
     };
 
@@ -1075,7 +1077,11 @@ pub async fn run(args: VendorArgs) -> i32 {
                     );
                 }
             } else {
-                let params = args.vex.to_build_params();
+                let params = args.vex.to_build_params(
+                    vendor_service
+                        .as_ref()
+                        .and_then(|(svc, _)| svc.client.as_ref()),
+                );
                 match generate_vex_from_manifest_path(&args.common, &params, &manifest_path).await {
                     Ok(summary) => {
                         env.vex = Some(VexSummary {
@@ -1115,15 +1121,8 @@ pub async fn run(args: VendorArgs) -> i32 {
         println!("{}", env.to_pretty_json());
     }
 
-    if let Some((_, (api_token, org_slug))) = &vendor_service {
-        track_outcomes_for_vendor(
-            exit != 0,
-            &env,
-            args.common.dry_run,
-            api_token.as_deref(),
-            org_slug.as_deref(),
-        )
-        .await;
+    if let Some((_, telemetry)) = &vendor_service {
+        track_outcomes_for_vendor(exit != 0, &env, args.common.dry_run, telemetry).await;
     }
 
     exit
@@ -1607,7 +1606,7 @@ async fn run_eject(args: &VendorArgs, pins: Vec<HostedPin>) -> i32 {
     let common = &args.common;
     let (client, use_public_proxy) =
         get_api_client_with_overrides(common.api_client_overrides()).await;
-    let (api_token, org_slug) = (client.api_token().cloned(), client.org_slug().cloned());
+    let telemetry = TelemetryAuth::for_client(&client);
     if !common.json && !common.silent {
         println!(
             "{} {} into .socket/vendor/...",
@@ -1674,14 +1673,7 @@ async fn run_eject(args: &VendorArgs, pins: Vec<HostedPin>) -> i32 {
         if common.json {
             println!("{}", env.to_pretty_json());
         }
-        track_outcomes_for_vendor(
-            true,
-            &env,
-            common.dry_run,
-            api_token.as_deref(),
-            org_slug.as_deref(),
-        )
-        .await;
+        track_outcomes_for_vendor(true, &env, common.dry_run, &telemetry).await;
         return 1;
     }
 
@@ -1736,14 +1728,7 @@ async fn run_eject(args: &VendorArgs, pins: Vec<HostedPin>) -> i32 {
         if common.json {
             println!("{}", env.to_pretty_json());
         }
-        track_outcomes_for_vendor(
-            true,
-            &env,
-            common.dry_run,
-            api_token.as_deref(),
-            org_slug.as_deref(),
-        )
-        .await;
+        track_outcomes_for_vendor(true, &env, common.dry_run, &telemetry).await;
         return 1;
     }
 
@@ -1779,8 +1764,7 @@ async fn run_eject(args: &VendorArgs, pins: Vec<HostedPin>) -> i32 {
         if common.json {
             println!("{}", env.to_pretty_json());
         }
-        track_outcomes_for_vendor(false, &env, true, api_token.as_deref(), org_slug.as_deref())
-            .await;
+        track_outcomes_for_vendor(false, &env, true, &telemetry).await;
         return 0;
     }
 
@@ -1941,7 +1925,7 @@ async fn run_eject(args: &VendorArgs, pins: Vec<HostedPin>) -> i32 {
                     );
                 }
             } else {
-                let params = args.vex.to_build_params();
+                let params = args.vex.to_build_params(Some(&client));
                 let manifest_path = common.resolved_manifest_path();
                 match generate_vex_without_manifest(common, &params, &manifest_path).await {
                     ManifestlessVex::Written(summary) => {
@@ -1974,14 +1958,7 @@ async fn run_eject(args: &VendorArgs, pins: Vec<HostedPin>) -> i32 {
     if common.json {
         println!("{}", env.to_pretty_json());
     }
-    track_outcomes_for_vendor(
-        exit != 0,
-        &env,
-        common.dry_run,
-        api_token.as_deref(),
-        org_slug.as_deref(),
-    )
-    .await;
+    track_outcomes_for_vendor(exit != 0, &env, common.dry_run, &telemetry).await;
     exit
 }
 
@@ -2017,13 +1994,12 @@ pub(crate) async fn track_outcomes_for_vendor(
     has_errors: bool,
     env: &Envelope,
     dry_run: bool,
-    token: Option<&str>,
-    org: Option<&str>,
+    telemetry: &TelemetryAuth,
 ) {
     if has_errors {
-        track_patch_vendor_failed("vendor completed with failures", dry_run, token, org).await;
+        track_patch_vendor_failed("vendor completed with failures", dry_run, telemetry).await;
     } else {
-        track_patch_vendored(env.summary.applied, dry_run, token, org).await;
+        track_patch_vendored(env.summary.applied, dry_run, telemetry).await;
     }
 }
 

@@ -1034,8 +1034,7 @@ mod tests {
         let client = crate::api::client::ApiClient::new(crate::api::client::ApiClientOptions {
             api_url: server.uri(),
             api_token: None,
-            use_public_proxy: true,
-            org_slug: None,
+            route: crate::api::client::ApiRoute::Proxy,
         });
         let cfg = VendorServiceConfig {
             maven_config: None,

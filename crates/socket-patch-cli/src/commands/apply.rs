@@ -13,7 +13,7 @@ use socket_patch_core::patch::redirect::golang_local::{
     apply_go_redirect, reconcile_go_redirects, verify_go_redirect_state,
 };
 use socket_patch_core::patch::sidecars::{maven as maven_sidecars, SidecarAdvisoryCode};
-use socket_patch_core::telemetry::{track_patch_applied, track_patch_apply_failed};
+use socket_patch_core::telemetry::{track_patch_applied, track_patch_apply_failed, TelemetryAuth};
 use socket_patch_core::utils::purl::parse_golang_purl;
 use socket_patch_core::utils::purl::{normalize_purl, purl_eq, strip_purl_qualifiers};
 use socket_patch_core::vendor::purl_keys_cover;
@@ -878,7 +878,7 @@ pub async fn run(args: ApplyArgs) -> i32 {
             println!("No patch manifest found; nothing to apply.");
         }
         let vex_result = if !args.common.dry_run && !args.check && args.vex.vex.is_some() {
-            let params = args.vex.to_build_params();
+            let params = args.vex.to_build_params(None);
             Some(generate_vex_without_manifest(&args.common, &params, &manifest_path).await)
         } else {
             None
@@ -1065,8 +1065,7 @@ pub(crate) async fn run_locked(
     client: &ApiClient,
     lock: LockGuard,
 ) -> ApplyRunReport {
-    let api_token = client.api_token().cloned();
-    let org_slug = client.org_slug().cloned();
+    let telemetry = TelemetryAuth::for_client(client);
 
     // ONE parse of the manifest for the whole run — the PnP gate and the
     // apply loop (embedded VEX re-reads it by design, after the writes).
@@ -1077,13 +1076,13 @@ pub(crate) async fn run_locked(
         Ok(Some(m)) => m,
         Ok(None) => {
             lock.release();
-            let code = report_apply_failure(&args, "Invalid manifest", &api_token, &org_slug).await;
+            let code = report_apply_failure(&args, "Invalid manifest", &telemetry).await;
             return ApplyRunReport::run_failure(code, "apply_failed", "Invalid manifest");
         }
         Err(e) => {
             lock.release();
             let error = e.to_string();
-            let code = report_apply_failure(&args, &error, &api_token, &org_slug).await;
+            let code = report_apply_failure(&args, &error, &telemetry).await;
             return ApplyRunReport::run_failure(code, "apply_failed", error);
         }
     };
@@ -1243,7 +1242,7 @@ pub(crate) async fn run_locked(
             // `no_applicable_patches`, and would write an attestation
             // file during --dry-run. Skip instead.
             let vex_result = if success && !args.common.dry_run && args.vex.vex.is_some() {
-                let params = args.vex.to_build_params();
+                let params = args.vex.to_build_params(Some(client));
                 Some(generate_vex_from_manifest_path(&args.common, &params, &manifest_path).await)
             } else {
                 None
@@ -1389,19 +1388,12 @@ pub(crate) async fn run_locked(
 
             // Track telemetry
             if success {
-                track_patch_applied(
-                    patched_count,
-                    args.common.dry_run,
-                    api_token.as_deref(),
-                    org_slug.as_deref(),
-                )
-                .await;
+                track_patch_applied(patched_count, args.common.dry_run, &telemetry).await;
             } else {
                 track_patch_apply_failed(
                     "One or more patches failed to apply",
                     args.common.dry_run,
-                    api_token.as_deref(),
-                    org_slug.as_deref(),
+                    &telemetry,
                 )
                 .await;
             }
@@ -1451,7 +1443,7 @@ pub(crate) async fn run_locked(
         }
         Err(e) => {
             lock.release();
-            let code = report_apply_failure(&args, &e, &api_token, &org_slug).await;
+            let code = report_apply_failure(&args, &e, &telemetry).await;
             ApplyRunReport::run_failure(code, "apply_failed", e)
         }
     }
@@ -1462,19 +1454,8 @@ pub(crate) async fn run_locked(
 /// `--silent` ("errors only", never "nothing" — exit 1 with no message
 /// would be undiagnosable), exit 1. Shared by the manifest read in `run`
 /// and `apply_patches_inner`'s `Err` arm.
-async fn report_apply_failure(
-    args: &ApplyArgs,
-    error: &str,
-    api_token: &Option<String>,
-    org_slug: &Option<String>,
-) -> i32 {
-    track_patch_apply_failed(
-        error,
-        args.common.dry_run,
-        api_token.as_deref(),
-        org_slug.as_deref(),
-    )
-    .await;
+async fn report_apply_failure(args: &ApplyArgs, error: &str, telemetry: &TelemetryAuth) -> i32 {
+    track_patch_apply_failed(error, args.common.dry_run, telemetry).await;
     if args.common.json {
         let mut env = Envelope::new(Command::Apply);
         env.dry_run = args.common.dry_run;

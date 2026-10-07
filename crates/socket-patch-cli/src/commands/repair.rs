@@ -9,7 +9,9 @@ use socket_patch_core::manifest::cleanup_blobs::{
 };
 use socket_patch_core::manifest::operations::read_manifest;
 use socket_patch_core::patch::apply::PatchSources;
-use socket_patch_core::telemetry::{track_patch_repair_failed, track_patch_repaired};
+use socket_patch_core::telemetry::{
+    track_patch_repair_failed, track_patch_repaired, TelemetryAuth,
+};
 use std::path::Path;
 use std::time::Duration;
 
@@ -182,9 +184,10 @@ pub async fn run(args: RepairArgs) -> i32 {
                 .0,
         );
     }
-    let (api_token, org_slug) = client.as_ref().map_or((None, None), |c| {
-        (c.api_token().cloned(), c.org_slug().cloned())
-    });
+    let telemetry = client.as_ref().map_or_else(
+        || TelemetryAuth::from_credentials(None, None),
+        TelemetryAuth::for_client,
+    );
 
     match result {
         Ok((env, counts)) => {
@@ -195,19 +198,14 @@ pub async fn run(args: RepairArgs) -> i32 {
             // the exit code doesn't treat a half-finished repair as success.
             let had_failure = matches!(env.status, Status::PartialFailure | Status::Error);
             if had_failure {
-                track_patch_repair_failed(
-                    "One or more artifacts failed to download",
-                    api_token.as_deref(),
-                    org_slug.as_deref(),
-                )
-                .await;
+                track_patch_repair_failed("One or more artifacts failed to download", &telemetry)
+                    .await;
             } else {
                 track_patch_repaired(
                     counts.downloaded,
                     counts.cleaned,
                     counts.bytes_freed,
-                    api_token.as_deref(),
-                    org_slug.as_deref(),
+                    &telemetry,
                 )
                 .await;
             }
@@ -221,7 +219,7 @@ pub async fn run(args: RepairArgs) -> i32 {
             }
         }
         Err(e) => {
-            track_patch_repair_failed(&e, api_token.as_deref(), org_slug.as_deref()).await;
+            track_patch_repair_failed(&e, &telemetry).await;
             if args.common.json {
                 let env = error_envelope(Command::Repair, args.common.dry_run, "repair_failed", &e);
                 println!("{}", env.to_pretty_json());
@@ -606,7 +604,7 @@ async fn repair_inner(
                     manifest: manifest.as_ref(),
                     references: &vendor_references,
                     ledger,
-                    client: client.as_ref(),
+                    client: &mut *client,
                 },
                 &mut env,
             )

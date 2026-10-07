@@ -18,7 +18,7 @@ use socket_patch_core::manifest::records::{build_patch_record, files_for_manifes
 use socket_patch_core::manifest::schema::{PatchFileInfo, PatchManifest, PatchRecord};
 use socket_patch_core::patch::apply::{is_valid_blob_hash, select_installed_variants_any};
 use socket_patch_core::patch::apply_lock::{LockError, LockGuard};
-use socket_patch_core::telemetry::{track_patch_fetch_failed, track_patch_fetched};
+use socket_patch_core::telemetry::{track_patch_fetch_failed, track_patch_fetched, TelemetryAuth};
 use socket_patch_core::utils::concurrent::{api_concurrency_for, ordered_concurrent};
 use socket_patch_core::utils::purl::{
     canonical_purl, is_purl, normalize_purl, strip_purl_qualifiers,
@@ -222,12 +222,11 @@ async fn report_fetch_failure(
     identifier: &str,
     error: impl std::fmt::Display,
     fallback_to_proxy: bool,
-    api_token: Option<&str>,
-    org_slug: Option<&str>,
+    telemetry: &TelemetryAuth,
     json: bool,
 ) -> i32 {
     let msg = error.to_string();
-    track_patch_fetch_failed(identifier, &msg, fallback_to_proxy, api_token, org_slug).await;
+    track_patch_fetch_failed(identifier, &msg, fallback_to_proxy, telemetry).await;
     report_error(json, msg);
     1
 }
@@ -2744,8 +2743,17 @@ pub async fn run(args: GetArgs) -> i32 {
     let overrides = args.common.api_client_overrides();
     let (mut api_client, mut use_public_proxy) =
         get_api_client_with_overrides(overrides.clone()).await;
-    let telemetry_token = api_client.api_token().cloned();
-    let telemetry_org = api_client.org_slug().cloned();
+    let telemetry = TelemetryAuth::for_client(&api_client);
+    // A token whose org could not be resolved put the whole run on the
+    // public proxy (the client already warned on stderr): `--json`
+    // consumers get it in `warnings[]` too.
+    let org_warnings: Vec<(String, String)> = match api_client.org_unresolved() {
+        Some(reason) if args.common.json => vec![(
+            crate::commands::vex_sources::NOTE_API_AUTH_FALLBACK.to_string(),
+            reason.to_string(),
+        )],
+        _ => Vec::new(),
+    };
     let download_mode = args.common.download_mode.clone();
     // Set to `true` after the first 401/403 from the authenticated
     // endpoint triggered a rebuild against the public proxy. Plumbed
@@ -2796,8 +2804,7 @@ pub async fn run(args: GetArgs) -> i32 {
                         Some(&patch.purl),
                         &patch.uuid,
                         fallback_to_proxy,
-                        telemetry_token.as_deref(),
-                        telemetry_org.as_deref(),
+                        &telemetry,
                     )
                     .await;
                 }
@@ -2825,8 +2832,7 @@ pub async fn run(args: GetArgs) -> i32 {
                     &ecosystem_from_purl(&patch.purl),
                     &download_mode,
                     fallback_to_proxy,
-                    telemetry_token.as_deref(),
-                    telemetry_org.as_deref(),
+                    &telemetry,
                 )
                 .await;
                 // Mode dispatch. All three reuse THIS fetched patch and
@@ -2841,7 +2847,7 @@ pub async fn run(args: GetArgs) -> i32 {
                     }
                     super::scan::ScanMode::Hosted => {
                         let selected = vec![search_result_from_response(&patch)];
-                        run_get_hosted(&args, &api_client, &selected, &[], &[]).await
+                        run_get_hosted(&args, &api_client, &selected, &[], &org_warnings).await
                     }
                     super::scan::ScanMode::Vendored => {
                         let selected = vec![search_result_from_response(&patch)];
@@ -2852,9 +2858,8 @@ pub async fn run(args: GetArgs) -> i32 {
                             &selected,
                             Some(&patch),
                             &[],
-                            &[],
-                            telemetry_token.as_deref(),
-                            telemetry_org.as_deref(),
+                            &org_warnings,
+                            &telemetry,
                         )
                         .await
                     }
@@ -2869,8 +2874,7 @@ pub async fn run(args: GetArgs) -> i32 {
                     None,
                     &args.identifier,
                     fallback_to_proxy,
-                    telemetry_token.as_deref(),
-                    telemetry_org.as_deref(),
+                    &telemetry,
                 )
                 .await;
             }
@@ -2879,8 +2883,7 @@ pub async fn run(args: GetArgs) -> i32 {
                     &args.identifier,
                     "not_found",
                     fallback_to_proxy,
-                    telemetry_token.as_deref(),
-                    telemetry_org.as_deref(),
+                    &telemetry,
                 )
                 .await;
                 if args.common.json {
@@ -2895,8 +2898,7 @@ pub async fn run(args: GetArgs) -> i32 {
                     &args.identifier,
                     e,
                     fallback_to_proxy,
-                    telemetry_token.as_deref(),
-                    telemetry_org.as_deref(),
+                    &telemetry,
                     args.common.json,
                 )
                 .await;
@@ -2929,8 +2931,7 @@ pub async fn run(args: GetArgs) -> i32 {
                         &args.identifier,
                         e,
                         fallback_to_proxy,
-                        telemetry_token.as_deref(),
-                        telemetry_org.as_deref(),
+                        &telemetry,
                         args.common.json,
                     )
                     .await;
@@ -2986,8 +2987,7 @@ pub async fn run(args: GetArgs) -> i32 {
                         &args.identifier,
                         e,
                         fallback_to_proxy,
-                        telemetry_token.as_deref(),
-                        telemetry_org.as_deref(),
+                        &telemetry,
                         args.common.json,
                     )
                     .await;
@@ -3098,6 +3098,8 @@ pub async fn run(args: GetArgs) -> i32 {
             eprintln!("Warning: {detail}");
         }
     }
+    // Already on stderr from the client: JSON only, after the print above.
+    narrow_warnings.extend(org_warnings);
     if accessible.is_empty() {
         // Every accessible patch was narrowed out. Additive status (never
         // `no_match`, which is pinned to the fuzzy package-name path):
@@ -3265,8 +3267,7 @@ pub async fn run(args: GetArgs) -> i32 {
                 None,
                 &narrow_skips,
                 &narrow_warnings,
-                telemetry_token.as_deref(),
-                telemetry_org.as_deref(),
+                &telemetry,
             )
             .await;
         }
@@ -3307,17 +3308,9 @@ async fn report_paid_required_uuid(
     purl: Option<&str>,
     patch_id: &str,
     fallback_to_proxy: bool,
-    telemetry_token: Option<&str>,
-    telemetry_org: Option<&str>,
+    telemetry: &TelemetryAuth,
 ) -> i32 {
-    track_patch_fetch_failed(
-        patch_id,
-        "paid_required",
-        fallback_to_proxy,
-        telemetry_token,
-        telemetry_org,
-    )
-    .await;
+    track_patch_fetch_failed(patch_id, "paid_required", fallback_to_proxy, telemetry).await;
     if args.common.json {
         let mut record = serde_json::json!({ "uuid": patch_id, "tier": "paid" });
         if let Some(purl) = purl {
@@ -3778,8 +3771,7 @@ async fn run_get_vendored(
     prefetched: Option<&PatchResponse>,
     narrow_skips: &[serde_json::Value],
     narrow_warnings: &[(String, String)],
-    telemetry_token: Option<&str>,
-    telemetry_org: Option<&str>,
+    telemetry: &TelemetryAuth,
 ) -> i32 {
     // Dry run: ledger-classification preview only (scan's posture) — no
     // download, no vendor step, no writes.
@@ -3851,8 +3843,7 @@ async fn run_get_vendored(
             socket_patch_core::telemetry::track_patch_vendor_failed(
                 &detail,
                 args.common.dry_run,
-                telemetry_token,
-                telemetry_org,
+                telemetry,
             )
             .await;
             if args.common.json {
@@ -3931,8 +3922,7 @@ async fn run_get_vendored(
         report_empty: true,
         prior: None,
         download_errors: dl_code != 0,
-        telemetry_token,
-        telemetry_org,
+        telemetry_auth: telemetry,
     })
     .await
     {
@@ -7020,8 +7010,7 @@ mod tests {
         let client = ApiClient::new(socket_patch_core::api::client::ApiClientOptions {
             api_url: "http://127.0.0.1:1".into(),
             api_token: None,
-            use_public_proxy: false,
-            org_slug: None,
+            route: socket_patch_core::api::client::ApiRoute::Proxy,
         });
         let run = DownloadRun {
             api_client: &client,

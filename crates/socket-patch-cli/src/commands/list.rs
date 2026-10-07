@@ -456,13 +456,7 @@ pub async fn run(args: ListArgs) -> i32 {
     // to its consumers, so it counts the manifest ONLY (0 on a ledger-only
     // project) rather than the listed entries.
     let manifest_patch_count = manifest.map_or(0, |m| m.patches.len());
-    let (api_token, org_slug) = args.common.telemetry_credentials();
-    track_patch_listed(
-        manifest_patch_count,
-        api_token.as_deref(),
-        org_slug.as_deref(),
-    )
-    .await;
+    track_patch_listed(manifest_patch_count, &args.common.telemetry_auth()).await;
 
     if args.common.json {
         let mut env = build_list_envelope(&entries);

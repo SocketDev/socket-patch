@@ -1665,8 +1665,7 @@ mod tests {
             socket_patch_core::api::client::ApiClientOptions {
                 api_url: uri.to_string(),
                 api_token: None,
-                use_public_proxy: true,
-                org_slug: None,
+                route: socket_patch_core::api::client::ApiRoute::Proxy,
             },
         )
     }

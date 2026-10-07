@@ -1305,7 +1305,7 @@ pub(crate) async fn run_redirect_selected(
     let mut vex_error: Option<crate::commands::vex::VexGenError> = None;
     let mut vex_code = 0;
     if vex.vex.is_some() && !common.dry_run {
-        let mut params = vex.to_build_params();
+        let mut params = vex.to_build_params(Some(api_client));
         // Hosted mode wrote only lockfiles and config files since scan's
         // crawl, never a directory the npm root walk descends into, so its
         // roots and packages still describe the tree (the snapshot checks

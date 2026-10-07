@@ -73,7 +73,7 @@ use futures_util::StreamExt;
 
 use socket_patch_core::api::client::{
     build_proxy_fallback_client, get_api_client_with_overrides, hold_back_debug,
-    is_fallback_candidate,
+    is_fallback_candidate, ApiClient,
 };
 use socket_patch_core::manifest::schema::{PatchManifest, PatchRecord};
 use socket_patch_core::patch::redirect::RedirectState;
@@ -265,10 +265,22 @@ impl Cand {
     }
 }
 
+/// The run's API client, built at most once: a host command (`scan`,
+/// `apply`, `vendor`) seeds it with the client it already built, so
+/// embedded `--vex` reuses the run's one org resolution; standalone `vex`
+/// leaves it empty and [`fetch_records`] builds it on first need.
+pub(crate) type RunApiClient = tokio::sync::OnceCell<ApiClient>;
+
 /// Merge `sources` into a verified-input [`Plan`]. `assume_live` is the
 /// in-run `scan --mode hosted --vex` confirmed set (qualifier-insensitive):
 /// those ledger records were just proven wired by the run itself.
-pub(crate) async fn plan(common: &GlobalArgs, sources: Sources, assume_live: &[String]) -> Plan {
+/// `api_client` is the run's client (see [`RunApiClient`]).
+pub(crate) async fn plan(
+    common: &GlobalArgs,
+    sources: Sources,
+    assume_live: &[String],
+    api_client: &RunApiClient,
+) -> Plan {
     let root = common.cwd.as_path();
     let Sources {
         manifest,
@@ -485,7 +497,7 @@ pub(crate) async fn plan(common: &GlobalArgs, sources: Sources, assume_live: &[S
         u.dedup();
         u
     };
-    let fetched = fetch_records(common, &uuids, &mut notes).await;
+    let fetched = fetch_records(common, api_client, &uuids, &mut notes).await;
     let mut mismatched: HashSet<usize> = HashSet::new();
     for &i in &need_api {
         let cand = &mut based[i].0;
@@ -902,6 +914,7 @@ fn local_record_by_uuid(
 /// (the caller omits those references as `record_unavailable`) and noted.
 async fn fetch_records(
     common: &GlobalArgs,
+    api_client: &RunApiClient,
     uuids: &[String],
     notes: &mut Vec<PlanNote>,
 ) -> HashMap<String, (String, PatchRecord)> {
@@ -923,7 +936,12 @@ async fn fetch_records(
         return out;
     }
     let overrides = common.api_client_overrides();
-    let (mut client, mut use_public_proxy) = get_api_client_with_overrides(overrides.clone()).await;
+    // The run's client: the host's, or built here once (standalone `vex`).
+    let mut client = api_client
+        .get_or_init(|| async { get_api_client_with_overrides(overrides.clone()).await.0 })
+        .await
+        .clone();
+    let mut use_public_proxy = client.uses_public_proxy();
     let mut pending: Vec<String> = uuids.to_vec();
     // Each view is a heavy response: say what the run is waiting on (a live
     // line only on a terminal, never under --json / --silent; the VEX
@@ -1140,7 +1158,13 @@ mod tests {
             ..GlobalArgs::default()
         };
         let mut notes: Vec<PlanNote> = Vec::new();
-        let out = fetch_records(&common, &[U1.to_string(), U2.to_string()], &mut notes).await;
+        let out = fetch_records(
+            &common,
+            &RunApiClient::new(),
+            &[U1.to_string(), U2.to_string()],
+            &mut notes,
+        )
+        .await;
 
         let fallback = notes
             .iter()
@@ -1210,7 +1234,7 @@ mod tests {
             redirect: Some(redirect),
             discovery: discovery(vec![hosted_ref("pkg:npm/x@1.0.0", U2, true)]),
         };
-        let plan = plan(&common(tmp.path()), sources, &[]).await;
+        let plan = plan(&common(tmp.path()), sources, &[], &RunApiClient::new()).await;
         assert_eq!(plan.view.patches["pkg:npm/x@1.0.0"].uuid, U2);
         assert_eq!(plan.redirected, vec!["pkg:npm/x@1.0.0".to_string()]);
         assert!(plan.lockfile_basis.contains("pkg:npm/x@1.0.0"));
@@ -1233,7 +1257,7 @@ mod tests {
             redirect: None,
             discovery: discovery(vec![hosted_ref("pkg:npm/x@1.0.0", U2, true)]),
         };
-        let plan = plan(&common(tmp.path()), sources, &[]).await;
+        let plan = plan(&common(tmp.path()), sources, &[], &RunApiClient::new()).await;
         assert!(
             plan.view.patches.is_empty(),
             "{:?}",
@@ -1268,7 +1292,7 @@ mod tests {
             redirect: Some(redirect),
             discovery: discovery(vec![hosted_ref("pkg:npm/x@1.0.0", U1, true)]),
         };
-        let plan = plan(&common(tmp.path()), sources, &[]).await;
+        let plan = plan(&common(tmp.path()), sources, &[], &RunApiClient::new()).await;
         assert!(plan
             .gated
             .contains(&failed("pkg:npm/x@1.0.0", RECORD_MISMATCH)));
@@ -1310,7 +1334,7 @@ mod tests {
                 hosted_ref("pkg:npm/y@1.0.0", U2, true),
             ]),
         };
-        let plan = plan(&common(tmp.path()), sources, &[]).await;
+        let plan = plan(&common(tmp.path()), sources, &[], &RunApiClient::new()).await;
         assert_eq!(plan.gated, vec![failed("pkg:npm/x@1.0.0", WIRING_CONFLICT)]);
         assert!(!plan.view.patches.contains_key("pkg:npm/x@1.0.0"));
         assert!(!plan.redirected.contains(&"pkg:npm/x@1.0.0".to_string()));
@@ -1364,13 +1388,19 @@ mod tests {
             redirect: Some(redirect.clone()),
             discovery: Discovery::default(),
         };
-        let live = plan(&common(tmp.path()), mk(), &[key.to_string()]).await;
+        let live = plan(
+            &common(tmp.path()),
+            mk(),
+            &[key.to_string()],
+            &RunApiClient::new(),
+        )
+        .await;
         assert_eq!(live.view.patches[key].uuid, U2);
         assert_eq!(live.redirected, vec![key.to_string()]);
         assert!(live.vendor_entries.is_empty());
         assert!(live.gated.is_empty(), "{:?}", live.gated);
 
-        let dead = plan(&common(tmp.path()), mk(), &[]).await;
+        let dead = plan(&common(tmp.path()), mk(), &[], &RunApiClient::new()).await;
         assert!(dead.view.patches.is_empty());
         assert_eq!(dead.gated, vec![failed(key, VENDOR_UNWIRED)]);
     }
@@ -1460,7 +1490,13 @@ mod tests {
 
         // Control — nothing recognized: the ledgers' own recorded files
         // decide, and both claims are live.
-        let live = plan(&common(root), sources(Discovery::default()), &[]).await;
+        let live = plan(
+            &common(root),
+            sources(Discovery::default()),
+            &[],
+            &RunApiClient::new(),
+        )
+        .await;
         assert!(live.gated.is_empty(), "{:?}", live.gated);
         assert!(live.view.patches.contains_key("pkg:npm/x@1.0.0"));
         assert_eq!(live.redirected, vec!["pkg:cargo/y@1.0.0".to_string()]);
@@ -1488,7 +1524,7 @@ mod tests {
             }],
             ..Discovery::default()
         };
-        let dead = plan(&common(root), sources(rejected), &[]).await;
+        let dead = plan(&common(root), sources(rejected), &[], &RunApiClient::new()).await;
         assert!(
             dead.view.patches.is_empty(),
             "{:?}",
@@ -1536,7 +1572,7 @@ mod tests {
             redirect: Some(redirect),
             discovery: discovery(vec![hosted_ref("pkg:npm/x@1.0.0", U1, true)]),
         };
-        let plan = plan(&common(tmp.path()), sources, &[]).await;
+        let plan = plan(&common(tmp.path()), sources, &[], &RunApiClient::new()).await;
         let wiring = &plan.hosted["pkg:npm/x@1.0.0"];
         assert_eq!(wiring.uuid, U1);
         assert_eq!(wiring.refs.len(), 1);
@@ -1566,7 +1602,13 @@ mod tests {
             redirect: Some(redirect.clone()),
             discovery,
         };
-        let gated = plan(&common(tmp.path()), sources(found), &[]).await;
+        let gated = plan(
+            &common(tmp.path()),
+            sources(found),
+            &[],
+            &RunApiClient::new(),
+        )
+        .await;
         assert!(gated.view.patches.is_empty() && gated.hosted.is_empty());
         assert_eq!(gated.gated, vec![failed(PURL, NOTE_LOCK_ABOVE_BASE)]);
         assert!(
@@ -1579,6 +1621,7 @@ mod tests {
             &common(tmp.path()),
             sources(discovery(vec![hosted_ref(PURL, U1, true)])),
             &[],
+            &RunApiClient::new(),
         )
         .await;
         assert!(live.gated.is_empty(), "{:?}", live.gated);
@@ -1615,6 +1658,7 @@ mod tests {
             &common(tmp.path()),
             sources,
             &["pkg:pypi/confirmed@1.0".to_string()],
+            &RunApiClient::new(),
         )
         .await;
         assert!(plan.view.patches.contains_key("pkg:npm/owned@1.0.0"));
@@ -1686,7 +1730,7 @@ mod tests {
                     // not a discovery input: the ledger fallback decides.
                     discovery: Discovery::default(),
                 };
-                let plan = plan(&common(root), sources, &[]).await;
+                let plan = plan(&common(root), sources, &[], &RunApiClient::new()).await;
                 if gemfile_wired {
                     assert_eq!(plan.redirected, vec![purl.to_string()], "{gemfile}");
                     assert!(plan.gated.is_empty(), "{gemfile}: {:?}", plan.gated);
