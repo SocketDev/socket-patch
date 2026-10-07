@@ -1401,7 +1401,14 @@ mod rebuild_tests {
                 super::super::bun_lock::revert_bun_opts(&entry, fx.root(), RevertOpts::new(false))
                     .await;
             assert!(outcome.success, "{bun}: {outcome:?}");
-            assert!(outcome.warnings.is_empty(), "{bun}: {outcome:?}");
+            // The fixture's hoisted node_modules/minimist is the only
+            // advisory: Bun keeps it after the restore (#764).
+            let codes: Vec<&str> = outcome.warnings.iter().map(|w| w.code).collect();
+            assert_eq!(
+                codes,
+                [super::super::bun_lock::REINSTALL_REQUIRED],
+                "{bun}: {outcome:?}"
+            );
             assert_eq!(
                 std::fs::read_to_string(fx.root().join(TEXT_LOCK)).unwrap(),
                 pristine,
@@ -1457,7 +1464,14 @@ mod rebuild_tests {
                 super::super::bun_lock::revert_bun_opts(&entry, fx.root(), RevertOpts::new(false))
                     .await;
             assert!(outcome.success, "{bun}: {outcome:?}");
-            assert!(outcome.warnings.is_empty(), "{bun}: {outcome:?}");
+            // The fixture's hoisted node_modules/minimist is the only
+            // advisory: Bun keeps it after the restore (#764).
+            let codes: Vec<&str> = outcome.warnings.iter().map(|w| w.code).collect();
+            assert_eq!(
+                codes,
+                [super::super::bun_lock::REINSTALL_REQUIRED],
+                "{bun}: {outcome:?}"
+            );
             assert_eq!(
                 std::fs::read_to_string(fx.root().join(TEXT_LOCK)).unwrap(),
                 pristine,
@@ -1517,7 +1531,14 @@ mod rebuild_tests {
                 super::super::bun_lock::revert_bun_opts(&entry, fx.root(), RevertOpts::new(false))
                     .await;
             assert!(outcome.success, "{bun}: {outcome:?}");
-            assert!(outcome.warnings.is_empty(), "{bun}: {outcome:?}");
+            // The fixture's hoisted node_modules/minimist is the only
+            // advisory: Bun keeps it after the restore (#764).
+            let codes: Vec<&str> = outcome.warnings.iter().map(|w| w.code).collect();
+            assert_eq!(
+                codes,
+                [super::super::bun_lock::REINSTALL_REQUIRED],
+                "{bun}: {outcome:?}"
+            );
             assert_eq!(
                 std::fs::read_to_string(fx.root().join(TEXT_LOCK)).unwrap(),
                 pristine,
