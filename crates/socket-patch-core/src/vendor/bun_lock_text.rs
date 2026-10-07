@@ -80,6 +80,12 @@ const DEFAULT_TRUSTED: &str = include_str!("bun_default_trusted.txt");
 /// at the top of a text `bun.lock`) already decides trust by name alone,
 /// so the rewire changes nothing there.
 pub(crate) fn loses_default_trust(manifest: Option<&str>, lock: Option<&str>, name: &str) -> bool {
+    // The list lookup is cheap and almost always false, so it runs first:
+    // the hosted rewriter calls this per wired dep, and the manifest parse
+    // plus whole-lock scan must not land in its per-dep loop (#578).
+    if !DEFAULT_TRUSTED.lines().any(|trusted| trusted == name) {
+        return false;
+    }
     let declared = manifest.and_then(parse_manifest).is_some_and(|value| {
         value
             .get("trustedDependencies")
@@ -89,7 +95,7 @@ pub(crate) fn loses_default_trust(manifest: Option<&str>, lock: Option<&str>, na
             .map(|l| l.strip_suffix('\r').unwrap_or(l))
             .any(|l| l.starts_with("  \"trustedDependencies\": ["))
     });
-    !declared && DEFAULT_TRUSTED.lines().any(|trusted| trusted == name)
+    !declared
 }
 
 /// The user-facing warning for a rewired package that loses Bun's default
