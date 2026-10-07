@@ -9,9 +9,9 @@ use socket_patch_core::api::types::{
     BatchPackagePatches, BatchPatchInfo, PatchResponse, PatchSearchResult,
 };
 use socket_patch_core::manifest::schema::{PatchManifest, PatchRecord};
-use socket_patch_core::utils::composer_version::{composer_purl_identity, purl_identity_key};
 use socket_patch_core::utils::concurrent::{api_concurrency_for, ordered_concurrent};
-use socket_patch_core::utils::purl::{normalize_purl, purl_eq, strip_purl_qualifiers};
+use socket_patch_core::utils::purl::{canonical_purl, normalize_purl, strip_purl_qualifiers};
+use socket_patch_core::utils::purl_key::PurlKey;
 use socket_patch_core::vendor::lock_inventory::LockfileEntry;
 use socket_patch_core::vendor::VendorState;
 use std::collections::{HashMap, HashSet};
@@ -97,15 +97,17 @@ pub(crate) async fn lockfile_supplement(
 
 /// Whether an API-spelled purl (percent-encoded, possibly qualified) names
 /// a lockfile-only package: `purls` holds the crawler's literal spelling, so
-/// the comparison bridges the two via `normalize_purl`. The ONE predicate
-/// behind the `notInstalled` flag, the `[NOT INSTALLED]` marker, the
+/// the comparison bridges the two by [`PurlKey`] (encoding, qualifiers,
+/// PyPI/NuGet name folding, composer release identity: the API may serve
+/// the padded `@3.0.2.0` for a lock's `3.0.2`). The ONE predicate behind the
+/// `notInstalled` flag, the `[NOT INSTALLED]` marker, the
 /// `package_not_installed` skip partition and the vendor baseline pre-check.
-/// A composer purl also matches its lock spelling of the same release (the
-/// API may serve the padded `@3.0.2.0` for a lock's `3.0.2`).
 pub(super) fn lockfile_only_contains(purls: &HashSet<String>, api_purl: &str) -> bool {
-    let base = strip_purl_qualifiers(api_purl);
-    purls.contains(normalize_purl(base).as_ref())
-        || (base.starts_with("pkg:composer/") && purls.iter().any(|p| purl_eq(p, base)))
+    if purls.contains(&canonical_purl(api_purl)) {
+        return true;
+    }
+    let key = PurlKey::new(api_purl);
+    purls.iter().any(|p| PurlKey::new(p) == key)
 }
 
 /// A displayable crawl entry fabricated from a purl (decoded form). The
@@ -191,13 +193,13 @@ pub(crate) async fn vendored_ledger_supplement(
                 .map(|base| (base.clone(), base, None))
                 .collect(),
         };
-    // Composer by release identity: a ledger `@3.0.2.0` is the crawled
-    // `@3.0.2`, not a second package to supplement.
-    let key = |p: &str| composer_purl_identity(p).unwrap_or_else(|| normalize_purl(p).into_owned());
-    let crawled_norm: HashSet<String> = crawled.iter().map(|p| key(&p.purl)).collect();
-    let mut seen: HashSet<String> = HashSet::new();
+    // By release identity: a ledger `@3.0.2.0` is the crawled composer
+    // `@3.0.2`, a ledger `Newtonsoft.Json` the crawled `newtonsoft.json` —
+    // not a second package to supplement.
+    let crawled_norm: HashSet<PurlKey> = crawled.iter().map(|p| PurlKey::new(&p.purl)).collect();
+    let mut seen: HashSet<PurlKey> = HashSet::new();
     for (ledger_key, base, entry) in &candidates {
-        let norm = key(base);
+        let norm = PurlKey::new(base);
         if crawled_norm.contains(&norm) || seen.contains(&norm) {
             continue;
         }
@@ -288,7 +290,7 @@ pub(super) async fn preverify_vendor_baselines<W: std::io::Write>(
         .iter()
         .map(|patch| {
             // API purls come percent-encoded, crawler purls literal —
-            // purl_eq bridges the two spellings.
+            // PurlKey bridges the two spellings.
             let base = strip_purl_qualifiers(&patch.purl);
             // Lockfile-only packages have no installed bytes to compare
             // — the vendor engine fetches them pristine (nothing to
@@ -296,7 +298,7 @@ pub(super) async fn preverify_vendor_baselines<W: std::io::Write>(
             if lockfile_only_contains(lockfile_only, base) {
                 return None;
             }
-            let pkg = crawled.iter().find(|c| purl_eq(&c.purl, base))?;
+            let pkg = crawled.iter().find(|c| PurlKey::same(&c.purl, base))?;
             // The same predicate as the download phase's ledger
             // idempotency skip: its no-fetch set and this one must be
             // the same set.
@@ -424,19 +426,20 @@ pub(super) fn detect_updates(
         // artifact-pinned ecosystems, qualified (`?artifact_id=...`); the
         // batch *package* purl is the crawler's literal spelling. Bridge
         // both divergences like the lockfile-only partition does: exact hit
-        // first, then a normalized qualifier-stripped comparison (composer
-        // by release identity: a `@3.0.2.0` key is the crawler's `@3.0.2`).
+        // first, then by [`PurlKey`] (a composer `@3.0.2.0` key is the
+        // crawler's `@3.0.2`, a NuGet `Newtonsoft.Json` key its lowercase
+        // global-cache spelling).
         //
         // Qualifier TWINS (e.g. a pypi wheel + sdist pair) all match the
         // stripped form: any stale twin means an update, so prefer the
         // first (sorted-key order, for stability) whose uuid differs.
         let existing = manifest.patches.get(&pkg.purl).or_else(|| {
-            let want = purl_identity_key(&pkg.purl);
+            let want = PurlKey::new(&pkg.purl);
             let mut twins: Vec<(&String, &socket_patch_core::manifest::schema::PatchRecord)> =
                 manifest
                     .patches
                     .iter()
-                    .filter(|(k, _)| purl_identity_key(k) == want)
+                    .filter(|(k, _)| PurlKey::new(k) == want)
                     .collect();
             twins.sort_by(|a, b| a.0.cmp(b.0));
             twins

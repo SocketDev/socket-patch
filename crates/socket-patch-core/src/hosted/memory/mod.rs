@@ -65,8 +65,9 @@ use crate::rollout::stage::{
 };
 use discover::Provider;
 use stages::{Planned, RewriteRefused, Rewritten, StageOptions};
+use crate::utils::purl_key::PurlKey;
 use crate::policy::{
-    canon, patch_severity_order, policy_block, FilterReason, FilteredEntry, MemoryPolicyFs, PolicyError,
+    patch_severity_order, policy_block, FilterReason, FilteredEntry, MemoryPolicyFs, PolicyError,
     PolicySource, Root, RootFile, SelectionPolicy, PATCHES_DISABLED, POLICY_FILE_NAMES,
 };
 
@@ -586,7 +587,7 @@ async fn engine(
             match policy.admits_purl(&purl) {
                 Ok(()) => admitted.push(purl),
                 Err(reason) => policy_filtered.push(FilteredEntry {
-                    purl: Some(canon(&purl)),
+                    purl: Some(PurlKey::new(&purl).into_string()),
                     uuid: None,
                     project: state.root.clone(),
                     reason,
@@ -1139,7 +1140,7 @@ fn select_with_policy(
             detail: Some(reason.detail()),
         });
         filtered.push(FilteredEntry {
-            purl: Some(canon(&purl)),
+            purl: Some(PurlKey::new(&purl).into_string()),
             uuid: Some(winner.uuid.clone()),
             project: root.to_string(),
             severity: Some(patch_severity_order(&winner)),

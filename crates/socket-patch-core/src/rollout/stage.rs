@@ -13,11 +13,9 @@ use crate::api::types::PatchSearchResult;
 use crate::crawlers::Ecosystem;
 use crate::manifest::schema::PatchManifest;
 pub use crate::policy::Offers;
+use crate::utils::purl_key::PurlKey;
 
-use super::{
-    canonical_base_purl, plan_rollout, severity_label, Candidate, MaxNew, MaxNewSource, Recorded,
-    RolloutPlan,
-};
+use super::{plan_rollout, severity_label, Candidate, MaxNew, MaxNewSource, Recorded, RolloutPlan};
 
 /// The env binding of `scan --max-new-patches`.
 pub const MAX_NEW_PATCHES_ENV: &str = "SOCKET_MAX_NEW_PATCHES";
@@ -119,7 +117,7 @@ pub struct RecordedState<'a> {
 /// same qualified purl (percent-encoding, case where it does not matter).
 pub fn qualified_key(purl: &str) -> String {
     let suffix = purl.find(['?', '#']).map_or("", |i| &purl[i..]);
-    format!("{}{suffix}", canonical_base_purl(purl))
+    format!("{}{suffix}", PurlKey::new(purl).into_string())
 }
 
 impl RecordedIndex {
@@ -142,7 +140,7 @@ impl RecordedIndex {
                 .push(uuid.to_string());
             index
                 .by_base
-                .entry(canonical_base_purl(key))
+                .entry(PurlKey::new(key).into_string())
                 .or_default()
                 .push(uuid.to_string());
         }
@@ -164,13 +162,13 @@ impl RecordedIndex {
         self.exact
             .get(purl)
             .or_else(|| self.qualified.get(&qualified_key(purl)))
-            .or_else(|| self.by_base.get(&canonical_base_purl(purl)))
+            .or_else(|| self.by_base.get(&PurlKey::new(purl).into_string()))
             .map_or(&[], Vec::as_slice)
     }
 
     /// Whether any patch is recorded for `purl`'s base purl.
     pub fn records_package(&self, purl: &str) -> bool {
-        self.by_base.contains_key(&canonical_base_purl(purl))
+        self.by_base.contains_key(&PurlKey::new(purl).into_string())
     }
 }
 
@@ -204,7 +202,7 @@ pub fn classify(offers: &Offers, recorded: &RecordedIndex, project: &str) -> Vec
                 candidate: Candidate {
                     project: project.to_string(),
                     purl: purl.clone(),
-                    base_purl: canonical_base_purl(purl),
+                    base_purl: PurlKey::new(purl).into_string(),
                     uuid: selected.uuid.clone(),
                     ecosystem: Ecosystem::from_purl(purl).map_or("", |e| e.cli_name()),
                     severity_order: max_severity_order(

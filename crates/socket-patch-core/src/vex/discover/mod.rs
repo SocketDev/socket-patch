@@ -183,10 +183,10 @@ use std::collections::BTreeSet;
 use std::path::{Path, PathBuf};
 use std::sync::Mutex;
 
-use crate::crawlers::python_crawler::canonicalize_pypi_name;
 use crate::crawlers::Ecosystem;
 use crate::patch::path_safety::{is_canonical_uuid, is_safe_multi_segment};
-use crate::utils::purl::{normalize_purl, strip_purl_qualifiers};
+use crate::utils::purl_key::canonical_base_purl;
+use crate::utils::purl_key::PurlKey;
 use crate::vendor::go_mod_edit::HOSTED_GO_MODULE_PREFIX;
 use crate::vendor::lock_inventory::{
     inventory_project_every_lock, lookup, LockIntegrity, LockfileEntry, SourceKind,
@@ -576,7 +576,7 @@ impl Discovery {
         let key = canonical_base_purl(purl);
         self.refs
             .iter()
-            .any(|r| r.uuid == uuid && r.mode == mode && same_package(&r.purl, &key))
+            .any(|r| r.uuid == uuid && r.mode == mode && PurlKey::same(&r.purl, &key))
     }
 
     /// Whether some file discovery read mentions patch `uuid` as a `mode`
@@ -783,7 +783,7 @@ impl Discovery {
             self.refs.iter().any(|r| {
                 r.uuid == uuid
                     && r.mode == WiringMode::Vendored
-                    && same_package(&r.purl, &key)
+                    && PurlKey::same(&r.purl, &key)
                     && r.artifact_rel.as_deref() == Some(artifact)
             })
         })
@@ -797,7 +797,7 @@ impl Discovery {
     pub fn vendored_contest(&self, purl: &str, uuid: &str) -> Option<&ContestedRef> {
         let key = canonical_base_purl(purl);
         self.contested.iter().find(|c| {
-            c.uuid == uuid && c.mode == WiringMode::Vendored && same_package(&c.purl, &key)
+            c.uuid == uuid && c.mode == WiringMode::Vendored && PurlKey::same(&c.purl, &key)
         })
     }
 
@@ -806,9 +806,9 @@ impl Discovery {
     /// ([`Discovery::resolved_elsewhere`]).
     pub fn resolves_package(&self, purl: &str) -> bool {
         let key = canonical_base_purl(purl);
-        self.refs.iter().any(|r| same_package(&r.purl, &key))
-            || self.contested.iter().any(|c| same_package(&c.purl, &key))
-            || self.elsewhere.iter().any(|e| same_package(&e.purl, &key))
+        self.refs.iter().any(|r| PurlKey::same(&r.purl, &key))
+            || self.contested.iter().any(|c| PurlKey::same(&c.purl, &key))
+            || self.elsewhere.iter().any(|e| PurlKey::same(&e.purl, &key))
     }
 
     fn recognize(&mut self, uuid: &str, mode: WiringMode, file: &str) {
@@ -1619,42 +1619,6 @@ pub(crate) fn toml_or_diag(
 
 // ── purl helpers ─────────────────────────────────────────────────────────
 
-/// The comparison key for "the same package" across purl spellings:
-/// qualifiers and subpath stripped, components percent-decoded, the type
-/// lowercased, and the name folded where the ecosystem's own resolution is
-/// insensitive — pypi (PEP 503: case + `-`/`_`/`.` runs), composer and
-/// nuget (case). Used to match discovered refs against manifest / ledger
-/// keys and API purls; it is also the form [`PatchedRef::purl`] carries.
-/// Never used to build filesystem paths.
-pub fn canonical_base_purl(purl: &str) -> String {
-    let base = normalize_purl(strip_purl_qualifiers(purl.trim())).into_owned();
-    let Some(rest) = base.strip_prefix("pkg:") else {
-        return base;
-    };
-    let Some((ty, tail)) = rest.split_once('/') else {
-        return base;
-    };
-    let ty = ty.to_ascii_lowercase();
-    match ty.as_str() {
-        "pypi" => match tail.rsplit_once('@') {
-            Some((name, version)) => {
-                format!("pkg:pypi/{}@{version}", canonicalize_pypi_name(name))
-            }
-            None => format!("pkg:pypi/{}", canonicalize_pypi_name(tail)),
-        },
-        "composer" | "nuget" => format!("pkg:{ty}/{}", tail.to_lowercase()),
-        _ => format!("pkg:{ty}/{tail}"),
-    }
-}
-
-/// Whether a ref's [`canonical_base_purl`] and `key` (another canonical
-/// base) name the same package release: equal, or for composer the same
-/// release in another version spelling (a ledger's `@3.0.2.0` is the lock's
-/// `@3.0.2`).
-fn same_package(ref_purl: &str, key: &str) -> bool {
-    ref_purl == key || crate::utils::composer_version::composer_purls_equivalent(ref_purl, key)
-}
-
 /// [`canonical_base_purl`] for a ref about to be pushed, plus shape checks:
 /// a known ecosystem type and a non-empty name and version (the version
 /// after the LAST `@`, containing no `/`).
@@ -1685,7 +1649,7 @@ impl Discovery {
         let key = canonical_base_purl(purl);
         self.refs
             .iter()
-            .any(|r| r.mode == mode && same_package(&r.purl, &key))
+            .any(|r| r.mode == mode && PurlKey::same(&r.purl, &key))
     }
 
     /// Liveness of a VENDOR-ledger entry — the ONE rule every reader of the
@@ -2530,35 +2494,6 @@ mod tests {
             Some("pkg:cargo/serde@1.0.0")
         );
         assert_eq!(vendored_leaf_purl("npm", "not-a-tarball"), None);
-    }
-
-    #[test]
-    fn canonical_base_purl_folds_only_insensitive_ecosystems() {
-        assert_eq!(
-            canonical_base_purl("pkg:pypi/Python_Dateutil@2.8.2?artifact_id=py3-none-any-whl"),
-            "pkg:pypi/python-dateutil@2.8.2"
-        );
-        assert_eq!(
-            canonical_base_purl("pkg:npm/%40scope/Name@1.0.0"),
-            "pkg:npm/@scope/Name@1.0.0",
-            "npm is case-sensitive; only percent-decoding applies"
-        );
-        assert_eq!(
-            canonical_base_purl("pkg:nuget/Newtonsoft.Json@13.0.1"),
-            "pkg:nuget/newtonsoft.json@13.0.1"
-        );
-        assert_eq!(
-            canonical_base_purl("pkg:composer/Monolog/Monolog@2.0.0"),
-            "pkg:composer/monolog/monolog@2.0.0"
-        );
-        assert_eq!(
-            canonical_base_purl("pkg:gem/nokogiri@1.16.5?platform=java"),
-            "pkg:gem/nokogiri@1.16.5"
-        );
-        assert_eq!(
-            canonical_base_purl("pkg:golang/github.com/Foo/bar@v1.0.0#sub/dir"),
-            "pkg:golang/github.com/Foo/bar@v1.0.0"
-        );
     }
 
     #[test]

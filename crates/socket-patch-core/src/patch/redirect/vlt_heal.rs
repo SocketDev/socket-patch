@@ -20,7 +20,8 @@ use crate::manifest::schema::PatchRecord;
 use crate::patch::apply::{is_safe_relative_subpath, normalize_file_path};
 use crate::patch::file_hash::compute_file_git_sha256;
 use crate::patch::package::read_archive_bytes_to_map_strict;
-use crate::utils::purl::{canonical_purl, purl_parts};
+use crate::utils::purl::purl_parts;
+use crate::utils::purl_key::PurlKey;
 use crate::vendor::vlt_lock_text::{
     is_default_registry, is_registry_package_name, parse_node_entry_text, sniff_lock, split_dep_id,
     DepIdKind, LockSniff,
@@ -465,13 +466,13 @@ pub async fn invalidate(root: &Path, state: &InstallState, stale: &[String]) -> 
 /// targets. No patch record rides along (v5 keeps no hosted ledger), so the
 /// heal judges each installed copy against the lock's own pins.
 pub fn lock_targets(lock: &str, origins: &[String], purls: &[String]) -> Vec<LedgerTarget> {
-    let wanted: Vec<String> = purls.iter().map(|p| canonical_purl(p)).collect();
+    let wanted: Vec<PurlKey> = purls.iter().map(|p| PurlKey::new(p)).collect();
     socket_owned_instances(lock, origins)
         .into_iter()
         .filter_map(|instance| {
             let purl = crate::utils::purl::npm_purl(&instance.name, &instance.version)?;
-            let canon = canonical_purl(&purl);
-            let at = wanted.iter().position(|w| *w == canon)?;
+            let key = PurlKey::new(&purl);
+            let at = wanted.iter().position(|w| *w == key)?;
             Some(LedgerTarget {
                 purl: purls[at].clone(),
                 dep_id: instance.dep_id,
@@ -500,11 +501,10 @@ pub fn ledger_targets(
         if ecosystem != "npm" {
             continue;
         }
-        let canon = canonical_purl(purl);
         let record = state
             .records
             .iter()
-            .find(|(key, _)| canonical_purl(key) == canon)
+            .find(|(key, _)| PurlKey::same(key, purl))
             .map(|(_, record)| record.clone());
         for edit in &state.edits {
             if edit.kind != vlt::KIND

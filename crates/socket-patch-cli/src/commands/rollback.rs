@@ -16,6 +16,7 @@ use socket_patch_core::patch::rollback::{
 use socket_patch_core::telemetry::{track_patch_rollback_failed, track_patch_rolled_back};
 use socket_patch_core::utils::composer_version::composer_purls_equivalent;
 use socket_patch_core::utils::purl::{patch_matches, strip_purl_qualifiers};
+use socket_patch_core::utils::purl_key::PurlKey;
 use socket_patch_core::vendor::{purl_keys_cover, RevertOpts, VendorState};
 use socket_patch_core::vex::discover::canonical_base_purl;
 use std::collections::{HashMap, HashSet};
@@ -1169,7 +1170,7 @@ pub async fn run(args: RollbackArgs) -> i32 {
     // runs, and the ledger does not own the global copies, so the in-place
     // leg restores them.
     let loaded_vendor_state = socket_patch_core::vendor::load_state(&cwd).await;
-    let project_vendored_keys: HashSet<String> = loaded_vendor_state
+    let project_vendored_keys: HashSet<PurlKey> = loaded_vendor_state
         .as_ref()
         .map(VendorState::purl_keys)
         .unwrap_or_default();
@@ -1182,7 +1183,7 @@ pub async fn run(args: RollbackArgs) -> i32 {
     let vendor_corrupt = vendor_state_result.is_err();
     // An unreadable ledger degrades to "nothing vendored" for the in-place
     // leg (its own containment is the `vendor_state_unreadable` exit below).
-    let vendored_keys: HashSet<String> = vendor_state_result
+    let vendored_keys: HashSet<PurlKey> = vendor_state_result
         .as_ref()
         .map(VendorState::purl_keys)
         .unwrap_or_default();
@@ -2023,7 +2024,7 @@ pub(crate) async fn rollback_patches_inner(
     common: &GlobalArgs,
     socket_dir: &Path,
     manifest: &PatchManifest,
-    vendored_keys: &HashSet<String>,
+    vendored_keys: &HashSet<PurlKey>,
     selection: InnerSelection<'_>,
     // Manifest purl -> the hosted uuid a live lockfile pin superseded its
     // record with ([`superseded_by_hosted`]); empty when no hosted pin

@@ -28,7 +28,7 @@ use std::path::Path;
 
 use crate::manifest::schema::{PatchManifest, PatchRecord};
 use crate::patch::redirect::{CorruptRedirectState, RedirectState};
-use crate::utils::purl::{normalize_purl, patch_matches, strip_purl_qualifiers};
+use crate::utils::purl::{canonical_purl, patch_matches};
 use crate::vendor::{VendorEntry, VendorState};
 
 /// A patch store, in owner-precedence order (a lower store wins a key).
@@ -328,9 +328,10 @@ impl<'a> Ledgers<'a> {
         }
     }
 
-    /// The purls both the hosted records and the vendored ledger claim,
-    /// canonical (qualifiers dropped, percent-decoded), sorted: each is
-    /// stale in exactly one store, which only the live lockfile can tell.
+    /// The purls both the hosted records and the vendored ledger claim, in
+    /// the records' display spelling ([`canonical_purl`]: qualifiers
+    /// dropped, percent-decoded), sorted and deduplicated: each is stale in
+    /// exactly one store, which only the live lockfile can tell.
     pub fn hosted_vendored_overlap(&self) -> Vec<String> {
         let (Some(redirect), Some(vendor)) = (self.redirect, self.vendor) else {
             return Vec::new();
@@ -338,21 +339,16 @@ impl<'a> Ledgers<'a> {
         if vendor.entries.is_empty() {
             return Vec::new();
         }
-        // Canonicalize both sides (drop qualifiers, percent-decode) so the API
-        // purl form the redirect records carry matches the vendor entry's base
-        // purl — mirrors `vendored_ledger_supplement`.
-        let canon = |p: &str| normalize_purl(strip_purl_qualifiers(p)).into_owned();
-        let mut vendor_purls: std::collections::BTreeSet<String> =
-            std::collections::BTreeSet::new();
-        for (key, entry) in &vendor.entries {
-            vendor_purls.insert(canon(key));
-            vendor_purls.insert(canon(&entry.base_purl));
-        }
-        let redirect_purls: std::collections::BTreeSet<String> =
-            redirect.records.keys().map(|p| canon(p)).collect();
-        redirect_purls
-            .intersection(&vendor_purls)
-            .cloned()
+        // Match by `PurlKey`, so the API purl form the redirect records carry
+        // matches the vendor entry's key or base purl in any spelling.
+        let vendor_purls = vendor.purl_keys();
+        redirect
+            .records
+            .keys()
+            .filter(|p| crate::vendor::purl_keys_cover(&vendor_purls, p))
+            .map(|p| canonical_purl(p))
+            .collect::<std::collections::BTreeSet<String>>()
+            .into_iter()
             .collect()
     }
 }

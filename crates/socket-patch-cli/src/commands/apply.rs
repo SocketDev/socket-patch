@@ -15,7 +15,8 @@ use socket_patch_core::patch::redirect::golang_local::{
 use socket_patch_core::patch::sidecars::{maven as maven_sidecars, SidecarAdvisoryCode};
 use socket_patch_core::telemetry::{track_patch_applied, track_patch_apply_failed};
 use socket_patch_core::utils::purl::parse_golang_purl;
-use socket_patch_core::utils::purl::{normalize_purl, purl_eq, strip_purl_qualifiers};
+use socket_patch_core::utils::purl::{normalize_purl, strip_purl_qualifiers};
+use socket_patch_core::utils::purl_key::PurlKey;
 use socket_patch_core::vendor::purl_keys_cover;
 use std::collections::{BTreeMap, HashMap, HashSet};
 use std::path::{Path, PathBuf};
@@ -103,7 +104,7 @@ async fn ensure_blobs_for_mismatches(
     args: &ApplyArgs,
     manifest: &PatchManifest,
     all_packages: &HashMap<String, Vec<PathBuf>>,
-    vendored_purls: &HashSet<String>,
+    vendored_purls: &HashSet<PurlKey>,
     staged: &mut StagedSources,
     client: &ApiClient,
 ) {
@@ -224,7 +225,7 @@ fn format_mismatch_fetch_result(downloaded: usize, needed: usize) -> String {
 async fn mismatch_blob_gaps(
     manifest: &PatchManifest,
     all_packages: &HashMap<String, Vec<PathBuf>>,
-    vendored_purls: &HashSet<String>,
+    vendored_purls: &HashSet<PurlKey>,
     blobs_path: &Path,
     force: bool,
 ) -> HashSet<String> {
@@ -546,18 +547,13 @@ async fn run_check(args: &ApplyArgs, manifest_path: &Path) -> i32 {
             // entries) and their state is audited by `vendor`, not `--check`.
             let vendored = socket_patch_core::vendor::load_state(&args.common.cwd)
                 .await
-                .map(|s| {
-                    s.entries
-                        .iter()
-                        .flat_map(|(k, e)| [k.clone(), e.base_purl.clone()])
-                        .collect::<HashSet<String>>()
-                })
+                .map(|s| s.purl_keys())
                 .unwrap_or_default();
             let desired: HashSet<String> = manifest
                 .patches
                 .keys()
                 .filter(|p| Ecosystem::from_purl(p) == Some(Ecosystem::Golang))
-                .filter(|p| !vendored.contains(*p))
+                .filter(|p| !purl_keys_cover(&vendored, p))
                 .cloned()
                 .collect();
             checked += desired.len();
@@ -1501,7 +1497,7 @@ async fn report_apply_failure(
 /// main-thread stack in debug builds.
 fn synthesize_vendor_owned_results(
     target_manifest_purls: &HashSet<String>,
-    vendored_purls: &HashSet<String>,
+    vendored_purls: &HashSet<PurlKey>,
 ) -> (Vec<ApplyResult>, HashSet<String>, HashSet<String>) {
     let is_vendored = |p: &str| purl_keys_cover(vendored_purls, p);
     let mut results: Vec<ApplyResult> = Vec::new();
@@ -3018,18 +3014,10 @@ async fn lockfile_resolved(common: &GlobalArgs, unmatched: &[String]) -> HashSet
     }
     let ctx = crate::commands::context::ProjectContext::new(common);
     let entries = &ctx.locks().await.entries;
-    let lock_purls: HashSet<String> = entries
-        .iter()
-        .map(|e| normalize_purl(strip_purl_qualifiers(&e.purl)).into_owned())
-        .collect();
+    let lock_purls: HashSet<PurlKey> = entries.iter().map(|e| PurlKey::new(&e.purl)).collect();
     unmatched
         .iter()
-        .filter(|p| {
-            let base = strip_purl_qualifiers(p);
-            lock_purls.contains(normalize_purl(base).as_ref())
-                || (base.starts_with("pkg:composer/")
-                    && entries.iter().any(|e| purl_eq(&e.purl, base)))
-        })
+        .filter(|p| lock_purls.contains(&PurlKey::new(p)))
         .cloned()
         .collect()
 }
@@ -3746,7 +3734,7 @@ mod tests {
             "without a vendor claim the drifted singleton must queue (fixture sanity)"
         );
 
-        let vendored = HashSet::from(["pkg:gem/foo@1.0.0".to_string()]);
+        let vendored = HashSet::from([PurlKey::new("pkg:gem/foo@1.0.0")]);
         let needed = mismatch_blob_gaps(&manifest, &all_packages, &vendored, &blobs, false).await;
         assert!(
             needed.is_empty(),

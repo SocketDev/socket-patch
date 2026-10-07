@@ -28,10 +28,10 @@ use socket_patch_core::manifest::schema::{PatchManifest, PatchRecord};
 use socket_patch_core::patch::apply::{verify_file_patch, PatchSources};
 use socket_patch_core::patch::redirect::upstream::HostedPin;
 use socket_patch_core::telemetry::{track_patch_vendor_failed, track_patch_vendored};
-use socket_patch_core::utils::composer_version::composer_purls_equivalent;
 use socket_patch_core::utils::concurrent::ordered_concurrent;
 use socket_patch_core::utils::group_commit::{CommittedFile, GroupCommit};
-use socket_patch_core::utils::purl::{canonical_purl, normalize_purl, strip_purl_qualifiers};
+use socket_patch_core::utils::purl::{normalize_purl, strip_purl_qualifiers};
+use socket_patch_core::utils::purl_key::PurlKey;
 use socket_patch_core::utils::socket_dir::remove_tree_and_prune;
 use socket_patch_core::vendor::{
     self, ecosystem_dir_for_purl, load_state, lock_inventory, lookup_entry, lookup_entry_kv,
@@ -2740,7 +2740,7 @@ pub(crate) async fn vendor_records_reusing(
     let hosted_pin_of = |purl: &str| {
         hosted_pins
             .iter()
-            .find(|pin| canonical_purl(&pin.purl) == canonical_purl(purl))
+            .find(|pin| PurlKey::same(&pin.purl, purl))
     };
 
     // Yarn berry / npm package-lock takeover preflight (see
@@ -3539,11 +3539,8 @@ pub(crate) async fn vendor_records_reusing(
         .collect();
     unmatched.sort();
     // A base that vendored one variant accounts for its qualified siblings.
-    let vendored_bases: HashSet<String> = matched
-        .iter()
-        .map(|p| strip_purl_qualifiers(p).to_string())
-        .collect();
-    unmatched.retain(|p| !vendored_bases.contains(strip_purl_qualifiers(p)));
+    let vendored_bases: HashSet<PurlKey> = matched.iter().map(|p| PurlKey::new(p)).collect();
+    unmatched.retain(|p| !vendored_bases.contains(&PurlKey::new(p)));
     has_errors |= !fetch_failed.is_empty();
     if !unmatched.is_empty() {
         has_errors = true;
@@ -4010,16 +4007,16 @@ async fn run_revert(args: &VendorArgs, env: &mut Envelope) -> i32 {
     // to their upstream registry entries too (a wet run only — a dry revert
     // wrote nothing to inspect).
     if !common.dry_run {
-        let reverted: HashSet<String> = env
+        let reverted: HashSet<PurlKey> = env
             .events
             .iter()
             .filter(|e| e.action == PatchAction::Removed)
-            .filter_map(|e| e.purl.as_deref().map(canonical_purl))
+            .filter_map(|e| e.purl.as_deref().map(PurlKey::new))
             .collect();
         let rehosted: Vec<HostedPin> =
             HostedPin::all(&crate::commands::discover_wiring(common, &common.cwd).await)
                 .into_iter()
-                .filter(|pin| reverted.contains(&canonical_purl(&pin.purl)))
+                .filter(|pin| reverted.contains(&PurlKey::new(&pin.purl)))
                 .collect();
         if !rehosted.is_empty() {
             let leg = crate::commands::rollback::run_hosted_leg(common, &rehosted).await;
@@ -4271,15 +4268,11 @@ pub(crate) async fn run_vendor_gc(
         state.entries.remove(&purl);
         ledger_dirty = true;
         if let Some(m) = manifest.as_mut() {
-            let base = strip_purl_qualifiers(&entry.base_purl).to_string();
+            let base = PurlKey::new(&entry.base_purl);
             let dropped: Vec<String> = m
                 .patches
                 .keys()
-                .filter(|k| {
-                    *k == &purl
-                        || strip_purl_qualifiers(k) == base
-                        || composer_purls_equivalent(k, &base)
-                })
+                .filter(|k| *k == &purl || PurlKey::new(k) == base)
                 .cloned()
                 .collect();
             for k in dropped {

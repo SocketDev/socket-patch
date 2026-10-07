@@ -6,6 +6,7 @@ use socket_patch_core::manifest::schema::PatchManifest;
 use socket_patch_core::patch::redirect::upstream::HostedPin;
 use socket_patch_core::telemetry::{track_patch_remove_failed, track_patch_removed};
 use socket_patch_core::utils::purl::patch_matches;
+use socket_patch_core::utils::purl_key::PurlKey;
 use socket_patch_core::vendor::{
     load_state, RevertOpts, VendorEntry, VendorState, VENDOR_STATE_REL,
 };
@@ -565,7 +566,7 @@ pub async fn run(args: RemoveArgs) -> i32 {
     // Vendor-owned purls are excluded from the in-place restore (the
     // vendored leg below reverts them); an unreadable ledger degrades to
     // "nothing vendored" here and fails closed at that leg.
-    let vendored_keys: HashSet<String> = vendor_state_result
+    let vendored_keys: HashSet<PurlKey> = vendor_state_result
         .as_ref()
         .map(socket_patch_core::vendor::VendorState::purl_keys)
         .unwrap_or_default();
