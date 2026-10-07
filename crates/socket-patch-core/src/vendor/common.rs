@@ -450,6 +450,13 @@ pub(crate) async fn any_live_file_references(
     false
 }
 
+/// The repair remedy for wiring an earlier socket-patch vendoring left in a
+/// stale or foreign shape. `vendor --revert` takes no package argument, so
+/// the remedy names its whole-project reach instead of implying a
+/// per-package form that does not exist (B80).
+pub(crate) const REVERT_ALL_AND_REVENDOR: &str = "run `socket-patch vendor --revert` (it reverts \
+     EVERY vendored package in the project, not just this one), then vendor again";
+
 // ── pre-write guards shared by the pypi lock flavors ────────────────────────
 
 /// Refuse (with the flavor's stable `code`) when any of `files` (root-relative)

@@ -284,9 +284,9 @@ fn check_target_unit(
                 "pypi_pdm_source_already_exists",
                 format!(
                     "{LOCK_FILE} already routes {canon_name} through \
-                     .socket/vendor/pypi/{} (an earlier socket-patch vendor); run \
-                     `socket-patch vendor --revert` for it and re-vendor",
-                    parts.uuid
+                     .socket/vendor/pypi/{} (an earlier socket-patch vendor); {}",
+                    parts.uuid,
+                    super::common::REVERT_ALL_AND_REVENDOR,
                 ),
             )),
             // A user-authored local path dependency.

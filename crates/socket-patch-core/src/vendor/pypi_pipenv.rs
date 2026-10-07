@@ -255,9 +255,9 @@ pub(super) fn check_target_guards_superseding(
                         "pypi_pipenv_source_already_exists",
                         format!(
                             "{LOCK_FILE} already routes {section}.{key} through \
-                             .socket/vendor/pypi/{} (an earlier socket-patch vendor){why}; run \
-                             `socket-patch vendor --revert` for it and re-vendor",
-                            parts.uuid
+                             .socket/vendor/pypi/{} (an earlier socket-patch vendor){why}; {}",
+                            parts.uuid,
+                            super::common::REVERT_ALL_AND_REVENDOR,
                         ),
                     ));
                 }
