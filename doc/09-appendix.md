@@ -2,7 +2,9 @@
 
 ## Appendix A: The open-issue backlog, mapped to architecture
 
-_Last checked against `main`: not yet re-checked; the content is as of `2463257`. Owner: `audit-core and audit-ecosystems`._
+_Last checked against `main` @ 431b818 on 2026-10-07 by the October 7 reconciliation (backlog shape only; the tables below are still the `2463257` snapshot). Owner: `audit-core and audit-ecosystems`._
+
+**Status on 2026-10-07:** about 304 issues are open (~194 `bughunt`, ~94 `arch-audit`). 51 of the 88 issues below are now closed, and 162 of the 194 open `bughunt` issues are not mapped in this appendix. JVM now has 34 open Maven issues plus 2 Gradle. Priority labels follow the maintainers' ecosystem triage (Maven and NuGet below Composer, Go and Cargo), which is intended. The register rows E70–E88 and C59–C73 map the clusters the October 7 audit found.
 
 The repository had **88 open issues** when this review was written. Most were filed between 2026-09-26 and 2026-10-01 by a bug hunt (`bughunt` label). They are classified below **by title** into the architectural cause they point to. The classification is the reviewer's judgment and is approximate. Several issues fit more than one bucket; each is listed once, under its dominant cause.
 

@@ -2,7 +2,7 @@
 
 ## Part 5: Vendored mode and the non-JS backends
 
-_Last checked against main @ db83f01 on 2026-10-07 by audit-ecosystems (5.6 `registry_fetch.rs` contents and importers re-checked at `db83f01`; 5.3 revert envelope, finish steps and keep policies re-checked at `9c43dfc`; 5.7 JVM backends and the single-module routing re-checked at `9c43dfc`; 5.2 ecosystem enumeration sites and dispatch re-checked at `9c43dfc`; the vendored-reference scan's file list re-checked at `9c43dfc`; 5.4 Poetry/PDM/Pipenv backend skeleton and Poetry forward splicers re-checked at `9c43dfc`; 5.2 dead `force`/`sources` parameters re-checked at `9c43dfc`; per-backend service-copy and cleanup copies re-checked at `9c43dfc`; 5.4 NuGet, Poetry/PDM and Gem re-checked at `4646693`; as of `045d7ec`: 5.4 Python, Cargo, Maven XML, Gem, Go and CRLF helpers; 5.6 scaffolding; the vendored-reference scan behind repair and the orphan sweeps). Owner: audit-ecosystems._
+_Last checked against main @ 431b818 on 2026-10-07 by the October 7 reconciliation (5.5 zip inflate and 5.7 JVM scope re-checked). Earlier: `db83f01` by audit-ecosystems (5.6 `registry_fetch.rs` contents and importers re-checked at `db83f01`; 5.3 revert envelope, finish steps and keep policies re-checked at `9c43dfc`; 5.7 JVM backends and the single-module routing re-checked at `9c43dfc`; 5.2 ecosystem enumeration sites and dispatch re-checked at `9c43dfc`; the vendored-reference scan's file list re-checked at `9c43dfc`; 5.4 Poetry/PDM/Pipenv backend skeleton and Poetry forward splicers re-checked at `9c43dfc`; 5.2 dead `force`/`sources` parameters re-checked at `9c43dfc`; per-backend service-copy and cleanup copies re-checked at `9c43dfc`; 5.4 NuGet, Poetry/PDM and Gem re-checked at `4646693`; as of `045d7ec`: 5.4 Python, Cargo, Maven XML, Gem, Go and CRLF helpers; 5.6 scaffolding; the vendored-reference scan behind repair and the orphan sweeps). Owner: audit-ecosystems._
 
 > Scope: `vendor/` framework (`mod`, `common`, `state`, `verify`, `registry_fetch`, `service_fetch`, `prestage`, `reuse`, `redownload`, `ledger_snapshots`, `parse_memo`, `path`, `source`, `toml_surgery`, `lock_inventory`); backends for cargo, gem, pypi (×10 files), golang, composer, nuget, maven and `jvm/`; related `utils/` parsers; and the CLI `vendor.rs` + `vendored_backend/`.
 
@@ -123,9 +123,9 @@ Revert/restore/unwind code in the non-npm backends totals **about 3,540 lines**:
   - `redirect/upstream/nuget.rs:39` uses a regex;
   - `jvm/gradle.rs:1538` checks for preceding whitespace;
   - `formats/nuget/mod.rs:41` does a real tag parse.
-- The vendored NuGet writer (`nuget_feed.rs`) never uses the shared reader `formats::nuget::parse_config`, **so its reader and writer can disagree about what a file contains**. The hosted splicer now uses it (#597). {{E11}}
+- The vendored NuGet writer (`nuget_feed.rs`) never uses the shared reader `formats::nuget::parse_config`, **so its reader and writer can disagree about what a file contains**. The hosted splicer now uses it (#597). {{E10}}
 - `pom.xml` alone has seven scanners (checked on `045d7ec`): `formats::maven::parse_pom` (VEX, restore gate); the hosted rewriter's raw regex (`MAVEN_DEPENDENCY_BLOCK_RE`, `insert_maven_*`), which upstream restore reuses and which masks nothing; vendored `maven_repo.rs` (`comment_spans`/`profiles_spans`, plus a second `declares_modules`); the reactor's `mask` + `Doc` tree and, in the same file, `scan_pom_project` (a depscan port); and the crawler's and `vex/product.rs`'s own readers. None of the three writers (hosted, restore, vendored single-pom) locates elements through a reader. Target: one masked element tree in `formats::maven` that readers and splicing writers both query. {{E10}}
-- The Maven share of the open backlog is mostly this: #259 "edits commented-out, plugin and profile markup", #342 "adds a second section when the existing one is self-closed or has a comment", #683 (`<exclusions>` first) and {{E55}}.
+- The Maven share of the open backlog is mostly this: #259 "edits commented-out, plugin and profile markup", #342 "adds a second section when the existing one is self-closed or has a comment", #683 (`<exclusions>` first) and {{E10}}.
 
 **Python:**
 - `utils/poetry_lock.rs` and `utils/pdm_lock.rs` now share one fragment-splice engine, [`utils/lock_fragments.rs`](https://github.com/SocketDev/socket-patch/blob/4646693150cf5efca6222b87092e1620e58566f8/crates/socket-patch-core/src/utils/lock_fragments.rs) (344 lines: the parse holder, pairing, splicing and one `majority_terminator` line-ending rule). Only the per-format fragment ownership and refusals stay in each file (#703). {{E13}} {{E54}}
@@ -144,7 +144,7 @@ Revert/restore/unwind code in the non-npm backends totals **about 3,540 lines**:
 **Cargo:**
 - `Cargo.toml` `[package]` is read in five places. Two are line scanners: [`crawlers/cargo_crawler.rs#L12-L113`](https://github.com/SocketDev/socket-patch/blob/045d7ec783d788bf3c5a1310724b51e09fb6505d/crates/socket-patch-core/src/crawlers/cargo_crawler.rs#L12-L113) ("no TOML crate dependency") and `vex/product.rs` `scan_toml_section`. Three are ad hoc `toml_edit` lookups: `cargo_tag::version_literal` (`[package]` or legacy `[project]`; it now finds the literal's span through `toml_edit` and splices only those bytes), `cargo.rs` `path_crate_version` (`[package]` only) and `declared_cargo_minor` (#651).
   - They have drifted, proven by execution: a BOM manifest is invisible to the crawler but read by VEX and `cargo_tag`; `[project]` and dotted keys are read only by `cargo_tag`; `[package] junk` (invalid TOML) is accepted only by the crawler. {{E15}}
-  - Hosted mode plans the dependency pin itself with a line scanner (`plan_cargo_toml`, six regexes), then re-checks it with a second, `toml_edit` classifier (`validate_cargo_toml_pins`). `CargoRegistryPins`, a `#[cfg(test)]` oracle and upstream restore's `unpin_line` are three more line-level readers of the same declarations. Vendored edits only through `toml_edit`. The scanner refuses an inline table whose `features` array spans lines, which is valid TOML and accepted by cargo, so hosted skips a crate that vendors fine. {{E57}}
+  - Hosted mode plans the dependency pin itself with a line scanner (`plan_cargo_toml`, six regexes), then re-checks it with a second, `toml_edit` classifier (`validate_cargo_toml_pins`). `CargoRegistryPins`, a `#[cfg(test)]` oracle and upstream restore's `unpin_line` are three more line-level readers of the same declarations. Vendored edits only through `toml_edit`. The scanner refuses an inline table whose `features` array spans lines, which is valid TOML and accepted by cargo, so hosted skips a crate that vendors fine. {{E15}}
 
 **Gem:** `vendor/gem.rs` imports three token helpers from `formats::gem` and keeps its own section model: `section_span` / `section_end` for DEPENDENCIES and CHECKSUMS, plus [`gem_section_spans` / `record_gem_section`](https://github.com/SocketDev/socket-patch/blob/4646693150cf5efca6222b87092e1620e58566f8/crates/socket-patch-core/src/vendor/gem.rs#L1947-L1975), added by #805. With `formats::gem::parse` and hosted's `GemLockSection`, that makes three section models and three DEPENDENCIES-name parsers; the name rules agree on Bundler-written entries. {{E19}}
   - The models had drifted: vendored `edit_lock` looked only in the first `GEM` section, so a gem from a later source was refused. It now searches every GEM section, and refuses a spec listed in two (#805). {{E59}}
@@ -165,17 +165,15 @@ Revert/restore/unwind code in the non-npm backends totals **about 3,540 lines**:
 - **Process-global memo caches:** 22 `static …: ParseMemo` across 16 files. They exist because backends are called once per package and would otherwise re-parse the same lock each time.
 - **Atomic writes:** centralized in `utils/fs.rs`, but in seven variants.
 
-### 5.5 Security: unbounded zip inflate (verified)
+### 5.5 Security: zip inflate on committed artifacts (fixed, #587)
 
-`vendor/common.rs:305-330 zip_bytes_match_after_hashes` decompresses archive members with **no size cap**. It also pre-allocates `Vec::with_capacity(entry.size() as usize)` from the archive's *own declared* size.
+`zip_bytes_match_after_hashes` now streams each member through the Git SHA-256 reader with an 8 KiB buffer and checks the declared length against the bytes read; it no longer inflates members into a `Vec` sized by the archive's own header (#587). The maintainer ruled that this data is trusted not to be too big, so the fix streams instead of capping. {{C01}} Agent-mode jar verification still buffers each member (C51).
 
 It runs on:
 - committed, tamperable artifacts (the NuGet hot path, `nuget_feed.rs:266`; the committed Maven jar, `maven_repo.rs:736` and `:1464`);
 - service archives (`service_fetch.rs:312`).
 
-Its twin `vendor/mod.rs:526 capped()` explicitly guards against zip bombs with a 64 MiB cap. The codebase also has three different archive size caps: 512 MiB (`common.rs:278`), 256 MiB (`mod.rs:342`) and 128 MiB (`registry_fetch.rs:22`).
-
-A malicious PR that commits a crafted `.nupkg` can make CI's `vendor --check` / `vex` allocate without bound. **Fix:** route every zip read through one capped reader with one cap constant.
+The codebase still has three different archive size caps on downloads: 512 MiB (`common.rs`), 256 MiB (`mod.rs`) and 128 MiB (`registry_fetch.rs`).
 
 ### 5.6 Scaffolding left over from the removed local-build path
 
@@ -197,7 +195,7 @@ v5 removed local artifact building, but the scaffolding remains:
 
 ### 5.7 Complexity vs value
 
-- **JVM (7,451 production lines; ~6,300 inline tests; ~1.7K CLI e2e): two backends for one ecosystem.**
+- **JVM (7,451 production lines at the snapshot; `maven_repo.rs` alone is 5,504 lines at `1c6c509`): two backends for one ecosystem.** This section predates sbt and scala-cli (#690): there are now five planners (Maven reactor, Gradle, sbt, scala-cli, Coursier tree) and four artifact roots, and the layout is spelled in ~13 places (PR #1032 adds one `vendor::jvm::layout`). {{E77}}
   - The legacy single-POM backend (`maven_repo.rs`) uses whole-file pom snapshots and wires the **unsuffixed** GAV through a trailing `<repository>`, so a warm `~/.m2`, an earlier repository or `mirrorOf *` can shadow it (#263, #274, #622; closed for new vendors by #973, which retires the always-on `vendor_maven_local_cache_shadow` warning).
   - The v5 `jvm/*` handles reactor and Gradle builds and is the best-designed code in vendored mode: pure planners over a `ReadFn` that return file writes plus fragment records, with an order-independent unplan. Its orchestrator, though (`vendor_maven_jvm`, acquisition, metadata, materialisation; about 1,170 raw lines), lives inside `maven_repo.rs`, and `redownload.rs`, agent-mode `jvm_jar.rs` and VEX import from there.
   - The planner already plans a single-module pom: `Shape::Mixed` runs `maven_reactor::plan` on one. Only `Detected::shape` mapping a lone single-module pom to `Shape::Other` keeps it on the legacy path. On `9c43dfc`, a lone CRLF single-module pom planned with no warnings, re-planned to nothing and unplanned byte for byte (executed twice).
@@ -256,16 +254,20 @@ Old `kind`s are translated into `SpliceRecord`s when the ledger loads, so legacy
 
 ### New findings since the review
 
+- {{E74}} October 7: "is this vendored entry still in use" has four answers; entries of six ecosystems are never pruned and scan resurrects them (PR #1050).
+- {{E71}} October 7: a re-pin or remove leaves the older patch generation's wiring behind (Cargo registry block, go.sum pair, Maven `-socket.<hex8>` repository, older vendored entry; PR #1035).
+- {{E80}} Maven `.jar` and NuGet `.nupkg` vendored artifacts can be git-ignored by stock templates with no warning.
+- {{E86}} Vendored JVM fetches upstream artifacts and checksums only from Central or `SOCKET_MAVEN_REGISTRY`.
 - {{E68}}: vendored gem treats a Gemfile that merely contains the copy path as wired, but its revert needs the exact recorded line and reverts the lock records anyway: a trailing comment on the wired line leaves `Gemfile.lock` restored to the registry while the Gemfile keeps `path:`, and every later revert drift-keeps (executed three times). Same forward/revert split as #977; see 5.3.
-- {{E67}}: the vendored-reference scan (repair, the orphan sweeps, the `vendor` stranded-reference gate, rollback) now reads every file whose registry entry carries the `VENDORED` role; `hatch.toml` and the other seven files that `registry::VENDORED_WRITES_UNMARKED` used to list got the role and the list was deleted, so a wheel a `hatch.toml` environment still names counts as wired (#1015).
+- {{E61}}: the vendored-reference scan (repair, the orphan sweeps, the `vendor` stranded-reference gate, rollback) now reads every file whose registry entry carries the `VENDORED` role; `hatch.toml` and the other seven files that `registry::VENDORED_WRITES_UNMARKED` used to list got the role and the list was deleted, so a wheel a `hatch.toml` environment still names counts as wired (#1015).
 - {{E66}}: vendored Poetry wires a 2.x lock through the `toml_edit` engine when it is CRLF and through a `toml_surgery` line scanner when it is LF. For the same lock the two give different `files` shapes, and only the engine checks the wheel name and lowercases the digest (executed twice); see 5.4.
 - {{E65}}: `vendor --force` documents a missing-file tolerance and a `vendor_content_mismatch_overwritten` warning that no backend implements; every acquisition sink takes `_force`/`_sources`, and `vendor` with and without `--force` behave the same (executed twice). #615 decided to remove `SOCKET_FORCE`; the flag cleanup stays in #923; see 5.2.
 - {{E61}}: `nuget.config` and `pom.xml` carry the `VENDORED` role, and the scan parses wiring through `vendor::path::parse_vendor_reference`, which accepts the bare uuid directory that NuGet feeds and Maven repositories name, so a still-wired feed or repository is no longer swept (#1015). The `eco == "maven2"` arm of the stranded-reference gate in `commands/vendor.rs` is still dead (the directory is `maven`).
 - {{E59}}: vendored gem `edit_lock` searched only the first `GEM` section of `Gemfile.lock`, so a gem from a later source was refused; fixed by #805; see 5.4.
 - {{E58}}: production `pub fn`s with no production caller, orphaned by #277: `VendorEntry::committed_artifact_intact` and `go_sum_edit::remove_lines` (no reference at all), plus test-only helpers compiled into production (`cargo_tag::copy_manifest_tag`, `jvm::apply::read_project_file`). The hosted-vlt half is in Part 3.
-- {{E55}}: vendored Maven decides "is this a reactor?" twice. `jvm::detect` uses the reactor's `Doc`-based `declares_modules`, which ignores plugin `<configuration><modules>`, then the legacy single-pom path re-checks with its own comment-stripping `declares_modules` and refuses `vendor_maven_multimodule_unsupported`. That refusal fires only on the disagreement, so every `maven-ear-plugin` project is refused; see 5.4.
+- {{E10}}: vendored Maven decides "is this a reactor?" twice. `jvm::detect` uses the reactor's `Doc`-based `declares_modules`, which ignores plugin `<configuration><modules>`, then the legacy single-pom path re-checks with its own comment-stripping `declares_modules` and refuses `vendor_maven_multimodule_unsupported`. That refusal fires only on the disagreement, so every `maven-ear-plugin` project is refused; see 5.4.
 - {{E54}}: the Poetry and PDM lock rewriters restored line endings with different rules; they now share `lock_fragments` and its majority rule (#703); see 5.4.
-- {{E49}}: hosted Pipenv used to reject its own pins on path-prefixed `--patch-server-url` origins and sdists. Both private grammars (`owned_url`'s segment count, `is_socket_hosted_reference`) are deleted; Pipenv now uses `hosted_pypi_reference` (#572); see 5.4.
+- {{E04}}: hosted Pipenv used to reject its own pins on path-prefixed `--patch-server-url` origins and sdists. Both private grammars (`owned_url`'s segment count, `is_socket_hosted_reference`) are deleted; Pipenv now uses `hosted_pypi_reference` (#572); see 5.4.
 
 ---
 _Generated by [Claude Code](https://claude.ai/code)_

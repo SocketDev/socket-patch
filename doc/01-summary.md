@@ -9,12 +9,14 @@
 > - **Work items:** [issues labelled `arch-audit`](https://github.com/SocketDev/socket-patch/issues?q=label%3Aarch-audit) · [refactoring PRs labelled `arch-refactor`](https://github.com/SocketDev/socket-patch/pulls?q=label%3Aarch-refactor)
 > - **Steering:** reply here or on an issue. The routines read maintainers' replies on their next run.
 >
+> - **October 7 campaign:** a one-day pass fixed the audit's critical defects and its duplicated business logic, one draft PR per seam, each deleting the duplicate copies it replaces: credentials redaction (#1026, C59), trust signals (#1029, C61), JVM layout (#1032, E77), VEX attestation over PnP/bundled/deno copies (#1033, E72), one target grammar (#1034, C62), the supersede lifecycle (#1035, E71), paths and repo roots (#1038, C64), an atomic takeover (#1039, E70), `.socket` containment (#1042, C60), command cycles and remedy text (#1043, C65), governing locks (#1044, E75), `PurlKey` (#1045, C63), test hygiene (#1046, C66), vendored liveness (#1050, E74), the yarn grammar (#1057, E08/E76) and one pinned check (#1058, E73). Main went green again with #1016 (stale digest entries); #1018 adds a merge queue and per-SHA push concurrency so it stays green (C67). Maintainer decisions still open: #704 exit policy, #966 Q2 (embedded `--vex`), C34 and E44–E47.
+>
 > _Rendered {{UPDATED}} from `doc/` on the [`arch-audit/ledger`](https://github.com/SocketDev/socket-patch/tree/arch-audit/ledger) branch. The original snapshot is in `review/2026-10/` on the same branch._
 
 # Architecture review of socket-patch v5: what to cut, combine, refactor and simplify
 
 > **Originally written against** `main` @ `2463257` ("feat!: consolidate the v5 patching workflow (#277)") on 2026-10-01. Since then, sections are updated as the code changes, and each part says when it was last checked against `main`.
-> **Method:** a read-only review split into seven areas: the CLI layer, hosted mode, JS lockfiles, vendored backends, discovery/VEX, core infrastructure and agent mode, and tests/CI/docs. Every area was measured with scripts: production and test lines are split at each file's inline `#[cfg(test)] mod`, and function lengths come from a brace-matcher that understands string literals. The highest-impact claims were then re-checked by hand against the source and a debug build. The 88 open issues were cross-referenced to architectural causes.
+> **Method:** a read-only review split into seven areas: the CLI layer, hosted mode, JS lockfiles, vendored backends, discovery/VEX, core infrastructure and agent mode, and tests/CI/docs. Every area was measured with scripts: production and test lines are split at each file's inline `#[cfg(test)] mod`, and function lengths come from a brace-matcher that understands string literals. The highest-impact claims were then re-checked by hand against the source and a debug build. The 88 issues open at the snapshot were cross-referenced to architectural causes (Appendix A); on 2026-10-07 about 300 are open.
 > **Layout:** this post is the executive summary. The detailed findings, each with `file:line` evidence, are in the comments below:
 > - Part 2: CLI layer and UX
 > - Part 3: hosted mode
@@ -40,7 +42,7 @@
 
    Each cell is hand-written text surgery. As a result, the same file format is parsed and spliced **two to five times** with different rules, and those rules have already drifted. For example, there are five different CRLF policies for the npm lockfile family alone.
 
-2. **Most of the open bug backlog has one shape: "reported success, but the build consumes unpatched code".** Of 88 open issues, roughly 29 are a success or a `not_affected` VEX attestation that the installed bytes don't back up. Another 15 are discovery missing what the package manager actually installed. The root cause is architectural:
+2. **Most of the open bug backlog has one shape: "reported success, but the build consumes unpatched code".** Of the 88 issues open at the snapshot, roughly 29 were a success or a `not_affected` VEX attestation that the installed bytes don't back up (about 46 such false attestations are open on 2026-10-07; #1033 and #940 address the largest groups). Another 15 were discovery missing what the package manager actually installed. The root cause is architectural:
    - the tool **re-implements package-manager behavior** (install layouts, venv naming, config layering, resolution precedence);
    - it then **reports success based on its own model of what the package manager will do**;
    - every package-manager release or config knob it doesn't model becomes a silent false negative.
@@ -72,7 +74,7 @@
    - 9 verbs, 2 hidden subcommands, 2 aliases and 3 hidden flag spellings;
    - defaults that change with unrelated flags;
    - `scan` writing lockfiles by default;
-   - mode that is not project state: a plain `scan` performs the documented "mode takeover" and switches vendored npm, Cargo and Go packages back to hosted;
+   - mode that is not project state: a plain `scan` performs the documented "mode takeover" and switches vendored npm, Cargo, Go, PyPI and Gradle-built Maven packages back to hosted (made atomic in #1039, E70);
    - `remove`, `rollback` and `vendor --revert` as three ways to undo.
 
    A seven-verb model (`scan` read-only, `fix`, `undo`, `sync`, `check`, `list`, `vex`) with mode inferred from the project would cover everything (§4).
@@ -82,7 +84,9 @@
    - a ledger-loss bug in the vendored→hosted takeover (fixed, #708);
    - a planted-binary spawn (fixed, #617);
    - a comment-blind NuGet config reader (fixed, #597);
-   - `SOCKET_FORCE` bound to three unrelated `--force` flags (decided #615: removed).
+   - a stale digest ratchet that turned `main` red for every PR (fixed, #1016; a merge queue follows in #1018).
+
+   The October 7 audit added credential leaks (C59), `.socket` containment (C60) and the non-atomic takeover (E70); each has a PR. `SOCKET_FORCE` (#615, PR #1021) and the `bun.lockb` registry override (E02, fixed by #574) are no longer open defects.
 
 ---
 
@@ -95,12 +99,12 @@
 | Integration tests (`crates/*/tests`) | ~283K lines in **224 separate test executables** in core + CLI (top-level files plus directory binaries; recounted at `9c43dfc`, 2026-10-06; ~255K at the snapshot) |
 | Test : production ratio | ~2.8 : 1 overall; ~7 : 1 for the CLI crate |
 | Largest file | `patch/redirect/mod.rs`: 21,936 lines at `db83f01` (2026-10-07; 7.6K production, 14.3K inline tests; 17,517 at the snapshot, 6.2K production then) |
-| Functions > 200 / > 500 lines | 61 / 9 (`run_scan` 1,540 on `045d7ec`, `rollback::run` 984, `vendor_records_reusing` 962, `run_redirect_selected` 836, `remove::run` 797, `get::run` 635, memory `engine` 604, …) |
+| Functions > 200 / > 500 lines | 74 / 11 at `1c6c509` (61 / 9 at the snapshot: `run_scan` 1,540 on `045d7ec`, now 1,577; `rollback::run` 984, `vendor_records_reusing` 962, `run_redirect_selected` 836, `remove::run` 797, `get::run` 635, memory `engine` 604, …) |
 | CLI surface | 9 visible + 2 hidden subcommands; 57 visible long flags; 27 globals on every command; 43 env bindings (84 `SOCKET_*` names in source); 156 documented `errorCode`s; ~570 code-like strings in source |
 | `--help` | 150–219 lines per subcommand; `list --help` lists 27 options, most of which do nothing for `list` |
 | CI per push | ~516 jobs; the CI workflow alone is 237 jobs and 348 runner-minutes; Windows `test` is the 28-minute critical path |
-| `CLI_CONTRACT.md` | 415 KB; the longest *line* is 12,077 characters (at `c5be5d1`, 2026-10-07; 332 KB / 9,320 at the snapshot) |
-| Open issues | 319 on 2026-10-07 (246 labelled `bug`, 89 `arch-audit`). At the snapshot: 88, filed mostly in the last 5 days by a bug hunt; JS 26, JVM 22, Python 18, Go 6, Cargo 5, NuGet 5, Ruby 3, Composer 3 |
+| `CLI_CONTRACT.md` | 417 KB at `431b818` (2026-10-07; 415 KB at `c5be5d1`, 332 KB at the snapshot); the longest *line* is 12,077 characters at `c5be5d1` |
+| Open issues | About 304 on 2026-10-07 after the October 7 campaign (~194 `bughunt`, ~94 `arch-audit` before nine new `arch-audit` issues #1061–#1069). At the snapshot: 88, filed mostly in the last 5 days by a bug hunt; JS 26, JVM 22, Python 18, Go 6, Cargo 5, NuGet 5, Ruby 3, Composer 3 |
 | PR size | Recent squash merges of +53K, +85K and +94K lines |
 
 ---
@@ -113,9 +117,12 @@
 | 2 | **No HTTP timeouts on the main API paths** (fixed) | Both `ApiClient` reqwest clients now take `api::retry::ApiTimeouts` (10 s connect, 60 s idle read), and a stalled JSON body reports `ApiError::Network` (#581). Blob/diff downloads still have **no retry**. | One retry and timeout primitive for every HTTP path (Part 7). | {{C02}} |
 | 3 | **Vendored→hosted takeover drops the ledger entry on a drift-keep** (fixed) | `vendored_takeover` now checks `revert_keeps_wiring` (`kept_artifact`, drift skips, residual references) after each revert and refuses the purl while keeping the ledger entry, like every other revert caller (#708). | The takeover still calls `dispatch_revert_one` directly rather than `VendoredBackend` (Part 2.4). | {{C03}} |
 | 4 | **Planted-binary spawn** (fixed) | Vendored Hatch now resolves `hatch` through `utils::process::resolve_tool_with` and spawns it with `command_for`, so a `hatch` planted in the scanned repo no longer runs (#617). On `0d302dc` no production bare-name `Command::new("<tool>")` remains. | Keep every spawn on `resolve_tool` (Part 7). | {{C04}} |
-| 5 | **Comment-blind NuGet config reader in hosted mode** (fixed) | Hosted routing and its splice anchors now read `nuget.config` through `formats::nuget::parse_config`, so commented-out `<add key>` entries are ignored (#597). The vendored `nuget_feed.rs` reader remains. | Move the vendored reader onto `formats::nuget` too (E11). | {{E01}} |
-| 6 | **`SOCKET_FORCE` is bound to three unrelated flags** | `vendor --force`, `apply --force` and `--update --force` (`vendor.rs:80`, `apply.rs:339`, `update.rs:61` at `045d7ec`). Exporting it to force a self-update also forces `apply`/`vendor` past hash checks. | Remove the `SOCKET_FORCE` binding; `--force` is flag-only (decision #615). | {{C05}} |
-| 7 | **`bun.lockb` ignores the registry override** | `vendor/bun_lockb.rs:235` hard-codes `registry.npmjs.org` instead of `registry_fetch::npm_tarball_url`, ignoring `SOCKET_NPM_REGISTRY`. vlt's two `registry_base` copies are now one (#574). | Use the shared helpers. | {{E02,E03}} |
+| 5 | **Comment-blind NuGet config reader in hosted mode** (fixed) | Hosted routing and its splice anchors now read `nuget.config` through `formats::nuget::parse_config`, so commented-out `<add key>` entries are ignored (#597). The vendored `nuget_feed.rs` reader remains. | Move the vendored reader onto `formats::nuget` too (E10, #594). | {{E01}} |
+| 6 | **`SOCKET_FORCE` is bound to three unrelated flags** (decided) | `vendor --force`, `apply --force` and `self-update --force`. Exporting it to force a self-update also forces `apply`/`vendor` past hash checks. | Decided (#615): the `SOCKET_FORCE` binding is removed and `--force` is flag-only; the change is in PR #1021. | {{C05}} |
+| 7 | **`bun.lockb` registry override** (fixed) | The duplicated npm tarball URL and `NPM_REGISTRY` spellings are now one helper, and vlt's two `registry_base` copies are one (#574). The format-1 URL that `bun_lockb.rs` synthesizes is lock semantics and is never fetched, so that part is not a defect. | — | {{E02,E03}} |
+| 9 | **Credentials leak to logs, `--json`, telemetry and the patch host** (October 7) | Hosted Composer keeps `transport-options` auth (#399); grant tokens and URL userinfo appear in warnings and debug output; the VEX product `@id` carries git-remote credentials. | One `utils::redact` for every URL shown or logged (PR #1026). | {{C59}} |
+| 10 | **`.socket` links and agent writes escape the project** (October 7) | The symlink guard starts below `.socket` and guards deletes only (#887); `get` writes inline blobs through a planted link (#726); agent writes follow links out of the package. | One containment helper for every write (PR #1042). | {{C60}} |
+| 11 | **The vendored→hosted takeover reverts before it plans** (October 7) | A refused rewrite leaves the package patched in neither mode, and `--dry-run` predicts success. | Stage the revert, rewrite against the overlay, commit both together (PR #1039). | {{E70}} |
 | 8 | **Repo hygiene** | A stray `.github/actions/actions/cache/<sha>/.vscode/launch.json` (accidentally committed in #358); 2 dead CI path filters (CI janitor); 39 references in 20 files to a "DESIGN §x.y" document that isn't in this repository. The README now says plainly that its installer selects the latest release (verified on `045d7ec`). | Delete or fix. | {{C08}} |
 
 ---
@@ -260,11 +267,11 @@ Several patterns show code that outlived its purpose:
 | 10 | C | **Retire `--download-mode` and the diff path** (decided #792, v5): `diff` re-downloads every blob anyway on a cold cache; delete the diff machinery, the flag and `qbsdiff`. | ~0.4K prod, 1K test, −1 dep | L | Part 7 | {{C25}} |
 | 11 | C | **Delete verified dead/vestigial code:** `--vendor-source`, `VendorSource`, `PackageSource`, `vend_installed!`, `mem_blobs`, `lock_inventory/wired.rs`, dead vlt ledger helpers, `save_redirect_state` + its group-commit entry, the empty Deno extractor, the `switched_off("group_commit")` oracle path. | ~1K prod, ~1K test | L | Parts 4–7 | {{E28,E41,C23}} |
 | 12 | M | **Utility consolidation:** one HTTP retry/timeout primitive; one validated purl builder family (42 hand-built `format!("pkg:…")` and 24 prefix checks in production code); one digest/SRI helper set (fixing the `sha256_hex` name collision: one copy validates, three compute); one line-ending policy; one env-truthiness vocabulary (there are three); one UUID grammar (there are four). | 1–1.5K prod | L | Parts 4, 7 | {{C15,C17,C18,C19,C20,E16}} |
-| 13 | C | **Embedded `--vex`** (15 flag instances on 3 commands, ~600 lines of glue, plus bypass sets that couple VEX correctness to each caller) → `fix && vex -O`. | 0.6K prod | L (MAJOR) | Parts 2, 6 | {{E42,C35}} (spellings half decided #966) |
+| 13 | C | **Embedded `--vex`** (15 flag instances on 3 commands, ~600 lines of glue, plus bypass sets that couple VEX correctness to each caller) → `fix && vex -O`. | 0.6K prod | L (MAJOR) | Parts 2, 6 | {{E42,C05}} (spellings half decided #966) |
 | 14 | S | **Simplify per-package-manager auto-config:** npm `allow-remote` (re-implements npm's `ini` and config layering, ~900 lines), pnpm `trustLockfile` (~450; three open corruption bugs), the vlt warm-tree heal (installed-tree surgery in a lockfile-only mode), parallel rewriter groups (benchmark them or drop them). | 1–1.5K prod | M | Part 3 | {{E34}} |
 | 15 | C | **Self-update:** keep the binary swap and the notifier (decided #983); harden it: retry, stall timeout, streaming download, live post-release test. **Telemetry:** one `track(Event)` + a shared client instead of 19 wrappers and ~45 token/org call sites. | ~0.3K prod | L | Parts 2, 7 | {{C22,C36}} |
 | 16 | M | **Tests:** 207 → ~25 binaries (needs `RunCtx` first, to drop the env-mutating `#[serial]`); a `socket-patch-test-support` crate (`binary()` is defined in 103 files, `git_sha256` in 86, 14 divergent `scrub_socket_env`, and 10 test files with no env scrub at all); retire the oracles; triage covgap; snapshots instead of 328 sentence assertions. | 15–25K test lines; minutes off the Windows critical path | M | Part 8 | {{C30,C31,C32,E35}} |
-| 17 | C | **CI:** report-only coverage + LTO `docker-base` off PRs (≈74 runner-min/run); PR e2e 148 legs → ~50 boundary versions; reusable compat workflow; no per-leg compiles. | ~200 fewer jobs per PR | L | Part 8 | handed off to the CI janitor |
+| 17 | C | **CI:** de-instrument the coverage legs and drop the LTO `docker-base` build where it gates nothing, **keeping** the gating Linux tests and the per-PR Docker e2e on PRs; PR e2e 157 legs → ~50 boundary versions; reusable compat workflow; no per-leg compiles; required checks plus a merge queue (#1018). | ~150 fewer jobs per PR | L | Part 8 | handed off to the CI janitor; merge queue {{C67}} |
 | 18 | S | **Docs:** a generated CLI reference plus ≤300 lines of contract prose; move ecosystem narratives into `ecosystems.md` and version history into `docs/migrating-to-v5.md`; decouple `docs/testing` from validation scripts. | — | L | Part 8 | {{C33}} |
 
 **Estimated total:** ~25–35K production lines (20–30%) and 50K+ test lines. About 20K is pure consolidation (recommendations 1–3, 6, 8, 10–12, 14); the rest depends on the tier and product decisions (recommendations 4, 5, 9, 13; the self-update half of 15 was decided as keep, #983). Agent mode stays for every ecosystem (#1000), so its ~10K is not on the table. The per-recommendation numbers overlap: for example, recommendation 1 shares work with 2 and 9.
@@ -323,9 +330,9 @@ This is a MAJOR change. Because v5 is still a prerelease, **now is the cheapest 
 ## 6. Suggested sequencing
 
 - **Phase 0, this week: no behavior change except bug fixes.**
-  - §1 fixes 1–8.
+  - §1 fixes 1–11 (the October 7 campaign PRs).
   - Recommendation 11 (dead code).
-  - CI cost cuts (recommendation 17).
+  - Required checks and a merge queue (#1018), then the CI cost cuts (recommendation 17).
   - Re-triage the open issues that still describe the removed `setup` command (#351, #390, #403).
 - **Phase 1, v5.x minors: internal restructuring behind the existing goldens and e2e suites.**
   1. `formats/` codecs, one format per PR, each PR deleting the duplicate walks it replaces.

@@ -2,7 +2,7 @@
 
 ## Part 2: CLI command layer and user experience
 
-_Last checked against main @ c5be5d1 on 2026-10-07 by audit-core. Owner: audit-core._ Re-checked on `c5be5d1` (15:50Z run): the exit codes of a corrupt and a missing manifest across commands, and the command-model premises of 2.9 (unchanged). Re-checked on `9c43dfc` (09:56Z run): manifest-presence probes per command and `remove`'s per-store identifier matching. Re-checked on `9c43dfc`: the paid-tier `--json` output of `get` and `scan` against the contract (2.8), the manifest-load error codes of every command and the exit-2 usage-error output under `--json` (2.8), the legacy mode spellings and embedded `--vex` (2.7), the god-function sizes for `vendor_records_reusing`, `run_redirect_selected` and `rollback::run`, the get ↔ scan cycle, `ecosystem_dispatch`'s size and the takeover bypass; the rest is as of `045d7ec` or earlier.
+_Last checked against main @ 431b818 on 2026-10-07 by the October 7 reconciliation (command cycles, takeover scope, envelope shapes and client sites re-checked; function sizes from `1c6c509`). Owner: audit-core._ Earlier: `c5be5d1` by audit-core. Re-checked on `c5be5d1` (15:50Z run): the exit codes of a corrupt and a missing manifest across commands, and the command-model premises of 2.9 (unchanged). Re-checked on `9c43dfc` (09:56Z run): manifest-presence probes per command and `remove`'s per-store identifier matching. Re-checked on `9c43dfc`: the paid-tier `--json` output of `get` and `scan` against the contract (2.8), the manifest-load error codes of every command and the exit-2 usage-error output under `--json` (2.8), the legacy mode spellings and embedded `--vex` (2.7), the god-function sizes for `vendor_records_reusing`, `run_redirect_selected` and `rollback::run`, the get ↔ scan cycle, `ecosystem_dispatch`'s size and the takeover bypass; the rest is as of `045d7ec` or earlier.
 
 > Scope: `crates/socket-patch-cli/src/` — `args.rs`, `lib.rs`/`main.rs`, `ecosystem_dispatch.rs`, `json_envelope.rs`, `ui/*`, `update_notifier.rs`, and every `commands/*` module.
 
@@ -20,16 +20,21 @@ _Last checked against main @ c5be5d1 on 2026-10-07 by audit-core. Owner: audit-c
 
 ### 2.2 God functions
 
+Sizes measured at `1c6c509` (2026-10-07); the functions keep growing.
+
 | Function | Location | Lines |
 |---|---|---:|
-| `run_scan` | `scan/mod.rs:1429–2968` | **1,540** |
-| `rollback::run` | `rollback.rs:994–2005` (on `9c43dfc`) | 1,012 |
-| `vendor_records_reusing` | `vendor.rs:2189–3232` (on `9c43dfc`) | 1,044 |
-| `run_redirect_selected` | `scan/hosted.rs:652–1583` (on `9c43dfc`) | 932 |
-| `remove::run` | `remove.rs:315–1111` | 797 |
-| `get::run` | `get.rs:2507–3141` | 635 |
-| `rollback_patches_inner` | `rollback.rs:2059–2658` | 600 |
-| `apply_patches_inner` | `apply.rs:1633–2205` | 573 |
+| `run_scan` | `scan/mod.rs` | **1,577** |
+| `rollback::run` | `rollback.rs` (on `9c43dfc`) | 1,012 |
+| `vendor_records_reusing` | `vendor.rs` | 1,154 |
+| `run_redirect_selected` | `scan/hosted.rs` | 949 |
+| `remove::run` | `remove.rs` | 809 |
+| `rollback_patches_inner` | `rollback.rs` | 686 |
+| `apply_patches_inner` | `apply.rs` | 651 |
+| `get::run` | `get.rs` | 641 |
+| `vendored_takeover` | `scan/hosted.rs` | 493 |
+
+74 functions exceed 200 lines and 11 exceed 500.
 
 `run_scan` does all of this in one function body:
 - mode folding and socket.yml policy loading;
@@ -46,7 +51,8 @@ Mode is three booleans (`apply`/`vendor`/`hosted`). They are referenced 91 times
 
 Command modules double as libraries and form a dense web:
 - **get ↔ scan cycle:** `get.rs` references `scan::` 33 times on `9c43dfc` (hosted engine, vendor step, `ScanMode`), and scan's agent mode imports `get::download_and_apply_patches_with`/`DownloadParams`/`DownloadRun` (plus `decide_patch_action`, `short_uuid`, and `download_patch_records_reusing` in `vendor_flow`). Breaking it is child 2 of the engine-to-core tracking issue. {{C12}}
-- **Other edges:** remove→rollback (8 refs), vendor→vex (8), apply→vex (6), vendor↔rollback, repair→rollback+list, vex_sources→get.
+- **Five cycles, not one** (at `1c6c509`): get↔scan, scan↔vendor, vendor↔rollback, apply↔rollback (through UI helpers) and scan↔rollback; `vendored_backend` also points back into commands. PR #1043 breaks all five by moving the shared code into `agent_download`, `hosted_unwind`, `vlt_heal` and `ui/`, with an allowlist test for the remaining edges. {{C65}}
+- **Other edges:** remove→rollback (8 refs), vendor→vex (8), apply→vex (6), repair→rollback+list, vex_sources→get.
 - **`get` runs the agent apply by building fake CLI args:** `ApplyArgs { nested: Some(NestedApply{..}) }`, then calling `apply::run_locked` (`get.rs:2314–2341`).
 - **A lossy argument round trip:** GlobalArgs → `DownloadParams` → GlobalArgs.
   - `DownloadParams` re-declares 10 `GlobalArgs` fields.
@@ -65,7 +71,7 @@ Command modules double as libraries and form a dense web:
 - Its own doc comment records the bug this caused: an on-prem `--api-url` run "POSTed the event — Bearer token included — to the default `api.socket.dev`".
 - It is called separately in 10 command entry points rather than once in `main`, and `vendor --check` returns before calling it.
 - It is why the test suites carry **993 `#[serial]` attributes** in `tests/` (plus 185 in `src`), counted on `045d7ec`; the review counted 553 + 182.
-- The lock timeout is converted by hand at 12 sites, and the API client is built at 13 production sites.
+- The lock timeout is converted by hand at 12 sites, and the API client is built at 15 production sites (13 at review).
 - **Fix:** an explicit `RunCtx { config, client, telemetry, lock }` built once in `main` and passed down. Core should not read ambient env except at the edge. {{C10}}
 
 ### 2.6 Structural duplication
@@ -78,7 +84,7 @@ A sliding-window copy-paste detector finds little *literal* duplication. **The d
 | `remove` vs `rollback` | `remove::run` (797) + `remove_hosted_only` (94) + `remove_ledger_only` (127) vs `rollback::run` (984). Both run agent leg → vendored leg → hosted leg → manifest cleanup → GC over the same primitives. The contract itself says "remove parity" repeatedly. |
 | `get` agent mode, twice | `save_and_apply_patch` (UUID path, `get.rs:3365`) vs `download_and_apply_patches_with` (search path, `:2343`) |
 | Vendored revert ×4 | `VendoredBackend::revert`, `vendor.rs:3400`, `vendor.rs:3436`, `hosted.rs:1700/1733` |
-| 401/403 → public-proxy fallback ×3 | `scan/mod.rs:2014–2035`, `get.rs:2625–2647` (UUID path only), `vex_sources.rs:944–970`. **`get`'s CVE/GHSA/PURL/name search path has none**, and neither do `apply`, `rollback`, `repair` or `vendor` eject, whose blob, diff and view fetches fail on a stale token (verified by execution on `045d7ec`). {{C09}} {{C39}} |
+| 401/403 → public-proxy fallback ×3 | `scan/mod.rs:2014–2035`, `get.rs:2625–2647` (UUID path only), `vex_sources.rs:944–970`. **`get`'s CVE/GHSA/PURL/name search path has none**, and neither do `apply`, `rollback`, `repair` or `vendor` eject, whose blob, diff and view fetches fail on a stale token (verified by execution on `045d7ec`). {{C09}} |
 | Lock acquisition ×2 families | `acquire_or_emit` in 5 envelope commands vs `acquire_with_status` + bespoke rendering in 7 sites. `Duration::from_secs(lock_timeout.unwrap_or(0))` appears 11 times. |
 | "Which origins count as hosted" ×3, **divergent** | `discover_options` and `rollback::patch_server_origins` use only `patch_server_url`; `scan/hosted/vlt.rs:69` also adds `api_url` |
 | Ecosystem filter ×4, **divergent** | `GlobalArgs::ecosystem_selected` treats an empty list as "all"; `crawl_selects` treats `Some(empty)` as "none" |
@@ -93,12 +99,12 @@ A sliding-window copy-paste detector finds little *literal* duplication. **The d
 - **Dead or vestigial flags:**
   - `--vendor-source`: core's `VendorSource` has **one variant**, and `build` is an error.
   - `--download-mode` is an unvalidated `String`, checked only where it is used. That breaks the "fail loud on typo" posture the same file applies to `--ecosystems`. On `045d7ec` a bad value fails `apply` and `repair` with exit 1 and `apply_failed`/`repair_failed`, while `apply --check`, `rollback`, `list` and `vendor` exit 0; `--vendor-source bogus` is a clap usage error (exit 2). {{C45}}
-- **Deprecated spellings and aliases:** `scan --apply` (hidden), `scan --vendor` (hidden), `get --no-apply`, and the `download` and `gc` aliases. `resolve_mode_flags` (`scan/mod.rs:184–246` on `9c43dfc`) exists mainly to reconcile these. Only `--apply`/`--vendor` are called deprecated, and nothing warns: on `9c43dfc` both run silently with no removal date, while the contract makes `--no-apply`, `download` and `gc` permanent (MAJOR to remove). `--sync` is a documented shorthand, not a deprecated spelling. **Decided (#966):** all five are removed in v5 with no warning release; `resolve_mode_flags` shrinks to the `--sync` vs `--mode` check, the hosted default and the global-scope check; `--sync` stays. {{C35}}
+- **Deprecated spellings and aliases:** `scan --apply` (hidden), `scan --vendor` (hidden), `get --no-apply`, and the `download` and `gc` aliases. `resolve_mode_flags` (`scan/mod.rs:184–246` on `9c43dfc`) exists mainly to reconcile these. Only `--apply`/`--vendor` are called deprecated, and nothing warns: on `9c43dfc` both run silently with no removal date, while the contract makes `--no-apply`, `download` and `gc` permanent (MAJOR to remove). `--sync` is a documented shorthand, not a deprecated spelling. **Decided (#966):** all five are removed in v5 with no warning release; `resolve_mode_flags` shrinks to the `--sync` vs `--mode` check, the hosted default and the global-scope check; `--sync` stays. {{C05}}
 - **Name collisions:**
   - `--package` is a value list on `scan` but a boolean type-forcer (`-p`) on `get`.
   - `--check` on `apply` audits *Go `replace` redirects only*; on `vendor` it audits artifacts and JVM wiring.
   - **`SOCKET_FORCE` is bound to three unrelated `--force` flags** (`vendor.rs:80`, `apply.rs:339`, `update.rs:61`; verified on `045d7ec`). Exporting it to force a self-update also forces `apply` and `vendor`. Decided in #615: no per-command names. The env binding is removed in v5 because nothing sets it (no hook, wrapper, CI or depscan use), and `--force` stays as a flag. {{C05}}
-- **VEX passthroughs:** 5 `--vex-*` flags × 3 host commands = 15 flag instances, with the env vars bound twice. Hosted `scan --vex` attests before install through `assume_applied`, which the standalone `vex` can't do, so dropping the embedded form needs a replacement. Still open: #966 left embedded `--vex` unchanged; E42 carries the shared-helper refactor. {{C35}}
+- **VEX passthroughs:** 5 `--vex-*` flags × 3 host commands = 15 flag instances, with the env vars bound twice. Hosted `scan --vex` attests before install through `assume_applied`, which the standalone `vex` can't do, so dropping the embedded form needs a replacement. Still open: #966 left embedded `--vex` unchanged; E42 carries the shared-helper refactor. {{C05}}
 - **Hosted-only opt-outs are globals:** `--no-trust-lockfile-config`, `--no-npm-allow-remote-config` and `--no-vlt-install-cleanup` appear on `apply`, `list`, `vex`, `repair` and the rest.
 - **Two env mechanisms:** clap `env=` vs manual reads in `rollout_args.rs`/`socket_yml_args.rs`. `SOCKET_NO_SOCKET_YML` is missing from `LOCAL_ARG_ENV_VARS`, which is meant to be the single source of truth.
 
@@ -112,9 +118,9 @@ $ socket-patch get nope --offline --json             → {"status":"error","erro
 ```
 
 - `repair`, `remove` and `vex` use the envelope, with an `error` object that carries a stable `code`.
-- `scan`, `get` and `rollback` have no fixed `error` type. `rollback` always emits a bare string, but `scan` and `get` each emit a bare string on some paths and a `{code, message}` object on others (scan's embedded-VEX failure, get's vendored failure); `get`'s lock failure adds a sibling `errorCode`. A script must type-check `.error` before reading it. Decided (#704): option 1, every top-level `error` becomes `{code, message}`; fix pending. {{C14}}
-- Codes are free strings, so one condition gets a different code per command: an unparseable `.socket/manifest.json` is `manifest_invalid` (list, remove), `manifest_unreadable` (`apply --check`, `vendor --check`, vex), `apply_failed`, `repair_failed`, the undocumented `invalid_manifest` (vendor) or a bare string (rollback) on `9c43dfc`. {{C52}} The typed-registry plan is {{C13}}. A manifest that exists but can't be stat'd (ENOTDIR, ELOOP, EACCES) is worse: five commands probe with `metadata().is_err()` ahead of `read_manifest`, so `apply`, `apply --check` and `vendor` report `noManifest` and exit 0, and `repair`/`remove`/`rollback` say `manifest_not_found`. {{C56}}
-- Exit-2 usage errors under `--json` have no single channel. `scan`, `remove` and `rollback` print nothing on stdout, as clap does; `get` prints a bare-string object; `vendor`, `repair` and `vex` print a full envelope with a code. The same `--global --mode vendored` refusal gives three different stdouts on `scan`, `get` and `vendor`. Decided (#704): every self-enforced exit 2 prints the coded error on stdout under `--json` through one `usage_error` helper; clap errors stay stdout-free; fix pending. {{C53}}
+- `scan`, `get` and `rollback` have no fixed `error` type. `rollback` emits a bare string except for its lock failure, which `acquire_or_emit` writes as a coded envelope (`rollback.rs:1145`); `scan` and `get` each emit a bare string on some paths and a `{code, message}` object on others (scan's embedded-VEX failure, get's vendored failure); `get`'s lock failure adds a sibling `errorCode`. A script must type-check `.error` before reading it. Decided (#704): option 1, every top-level `error` becomes `{code, message}`; fix pending. {{C14}}
+- Codes are free strings, so one condition gets a different code per command: an unparseable `.socket/manifest.json` is `manifest_invalid` (list, remove), `manifest_unreadable` (`apply --check`, `vendor --check`, vex), `apply_failed`, `repair_failed`, the undocumented `invalid_manifest` (vendor) or a bare string (rollback) on `9c43dfc`. {{C13}} The typed-registry plan is. A manifest that exists but can't be stat'd (ENOTDIR, ELOOP, EACCES) is worse: five commands probe with `metadata().is_err()` ahead of `read_manifest`, so `apply`, `apply --check` and `vendor` report `noManifest` and exit 0, and `repair`/`remove`/`rollback` say `manifest_not_found`. {{C56}}
+- Exit-2 usage errors under `--json` have no single channel. `scan`, `remove` and `rollback` print nothing on stdout, as clap does; `get` prints a bare-string object; `vendor`, `repair` and `vex` print a full envelope with a code. The same `--global --mode vendored` refusal gives three different stdouts on `scan`, `get` and `vendor`. Decided (#704): every self-enforced exit 2 prints the coded error on stdout under `--json` through one `usage_error` helper; clap errors stay stdout-free; fix pending. {{C14}}
 - Status is `partialFailure` in the envelope but `partial_failure` in the legacy shapes.
 - The paid-plan refusal is documented but not emitted: the contract lists `status: "paidRequired"` and an `errorCode` `paid_required` for get and scan, but `get` writes the legacy `{"status":"paid_required",…}` from two hand-written blocks, `scan` reports only `paidPatches`, and `Status::PaidRequired` is never constructed. {{C54}}
 - `get --mode vendored` nests an `Envelope` inside a legacy object.
@@ -130,7 +136,7 @@ $ socket-patch get nope --offline --json             → {"status":"error","erro
 2. **The verb `scan` writes to lockfiles by default.** Most users and most CI templates expect a "scan" to be read-only. The safe preview is opt-in (`--dry-run`).
 3. **Mode is not project state.**
    - `mode` is deliberately rejected in socket.yml.
-   - Bare `scan` is hosted, and the hosted path performs the vendored→hosted takeover for npm, cargo and golang. This is documented ("vendored → hosted conversions both work in place").
+   - Bare `scan` is hosted, and the hosted path performs the vendored→hosted takeover for npm, cargo, golang, PyPI and Gradle-built Maven entries (`takeover_capable`, `scan/hosted.rs`); PR #1039 makes it atomic. {{E70}} This is documented ("vendored → hosted conversions both work in place").
    - So a project vendored for airgapped installs silently becomes hosted the next time someone runs the quick-start command.
    - `rollback` and `list`, by contrast, infer mode from on-disk state.
 4. **Overlapping verbs:**
@@ -177,7 +183,7 @@ That is **7 verbs instead of 9 visible + 2 hidden + 2 aliases + 3 hidden flag sp
 - {{C56}} One manifest-presence rule, five copies: `apply`, `vendor`, `repair`, `remove` and `rollback` each treat any stat error on `.socket/manifest.json` as "no manifest" while core's `read_manifest` treats only NotFound so. `apply` and `vendor` fail open (exit 0, `noManifest`) on a `.socket` that is a file or a looping symlink (run twice on `9c43dfc`).
 - {{C57}} `remove` resolves its identifier once per store instead of deriving the ledger targets from the manifest entries it deletes: `remove <uuid>` with an older vendored generation removes the manifest entry, keeps the vendoring and reports success (#708's RED test, run twice on `9c43dfc`).
 
-- {{C39}} The stale-token fallback is wider than get's search gap: `apply`, `rollback` and `repair` blob/diff downloads and `vendor` eject view fetches never fall back, although `CLI_CONTRACT.md` promises eject the same fallback as `get`. On `045d7ec`, with the auth API answering 401, `apply` reported `sources_download_failed` without trying the proxy; without a token, the same run fetched from the proxy.
+- {{C09}} The stale-token fallback is wider than get's search gap: `apply`, `rollback` and `repair` blob/diff downloads and `vendor` eject view fetches never fall back, although `CLI_CONTRACT.md` promises eject the same fallback as `get`. On `045d7ec`, with the auth API answering 401, `apply` reported `sources_download_failed` without trying the proxy; without a token, the same run fetched from the proxy.
 
 - {{C43}} `--manifest-path` interleaves two projects' state. `GlobalArgs::project_root()` documents that every multi-store command derives its stores from the manifest's project, and `list`, `apply` and `vendor --check` do. But `rollback`, `remove`, `repair`, `apply --check`, `vex`, `scan` and `get` load the vendored ledger from `--cwd`. `rollback` also locks the manifest's `.socket/` while writing the cwd ledger. On `045d7ec`, with a corrupt ledger in `--cwd` and `--manifest-path ../b/.socket/manifest.json`, `list` succeeded while `vex`, `rollback` and `repair` failed on the cwd ledger; with the corruption moved to `b`, the results inverted.
 
@@ -185,13 +191,18 @@ That is **7 verbs instead of 9 visible + 2 hidden + 2 aliases + 3 hidden flag sp
 
 - {{C45}} `--download-mode` typos are runtime failures in two commands only (see 2.7): `apply`/`repair` exit 1 with a generic command code, and the rest accept them. This narrows the review's R8 note to a non-breaking fix (a typed clap parser).
 
-- {{C52}} One corrupt manifest, five `--json` codes: only `list` and `remove` implement the contract's `manifest_invalid`/`manifest_unreadable` split (two hand-written copies); `apply` and `vendor` each disagree with their own `--check` path. Child 1 of the typed-code tracking issue ({{C13}}).
+- {{C13}} One corrupt manifest, five `--json` codes: only `list` and `remove` implement the contract's `manifest_invalid`/`manifest_unreadable` split (two hand-written copies); `apply` and `vendor` each disagree with their own `--check` path. Child 1 of the typed-code tracking issue ().
 
-- {{C53}} Usage errors (exit 2) choose their own `--json` channel per site: 4 of the ~17 `return 2` sites in `commands/` write JSON, the rest stderr only. This is folded into the envelope decision as its second question; decided (#704, rule b), fix pending.
+- {{C14}} Usage errors (exit 2) choose their own `--json` channel per site: 4 of the ~17 `return 2` sites in `commands/` write JSON, the rest stderr only. This is folded into the envelope decision as its second question; decided (#704, rule b), fix pending.
 
 - {{C54}} The contract's paid-tier codes match no command: `get` emits `status: "paid_required"` (snake_case, no events or `errorCode`) and `scan` emits nothing paid-specific, while `CLI_CONTRACT.md` documents `status=paidRequired` for both. The fix is documentation plus one shared `get` emitter.
 
 - {{C58}} `vex` is the one command whose exit `2` is not a usage error: every runtime failure but "nothing attested" exits `2` (`manifest_unreadable`, `manifest_not_found`, `write_failed`, …), while the same corrupt or missing manifest exits `1` on `apply --check`, `vendor --check`, `remove`, `repair` and embedded `--vex` (run twice on `c5be5d1`).
+
+- {{C61}} October 7: `--cwd`, `--global-prefix` and `--manifest-path` were never validated, so `list`, `apply`, `vendor --check`, `scan` and `get` exit 0 on `/nonexistent`; `apply --check` checked Go only; hosted `--json` has no per-purl pin data (PR #1029).
+- {{C62}} October 7: four package-target grammars; `get <name>` fuzzy-substitutes (`get yaml` patched yaml-ast-parser) and searched one version; the UUID path skipped socket.yml silently (#453; PR #1034).
+- {{C70}} The JSON and human arms of `run_scan` apply different `fetched == 0` rules (exit 0 vs 1).
+- {{C73}} `rollback --json` counters cover only the agent leg.
 
 (The `C38` pacing finding is in Part 7.)
 

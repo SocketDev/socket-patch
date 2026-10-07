@@ -2,7 +2,7 @@
 
 ## Part 4: JavaScript lockfiles (npm, pnpm, yarn, bun, vlt)
 
-_Last checked against main @ 9c43dfc on 2026-10-06 by audit-ecosystems (vendor driver skeleton re-checked at `9c43dfc`; pnpm BOM handling in `formats::pnpm` re-checked at `9c43dfc`; §4.4 vendored pnpm `package.json` writer re-checked at `4646693`; as of `045d7ec`: pnpm, berry gates, package-lock walks, JSON writers, bun-lock presence, CRLF policies, wiring-kind and lines↔JSON helpers and the 4.5 #2 layering re-checked; the rest is as of `2463257`). Owner: `audit-ecosystems`._
+_Last checked against main @ 431b818 on 2026-10-07 by the October 7 reconciliation (`formats/yarn` contents, the governing-lock count, the pnpm-legacy row and the yarn grammar copies re-checked; sizes and line references in 4.1–4.4 are still from the snapshot and drift by 200–1,000 lines). Earlier: `9c43dfc` by audit-ecosystems (vendor driver skeleton re-checked at `9c43dfc`; pnpm BOM handling in `formats::pnpm` re-checked at `9c43dfc`; §4.4 vendored pnpm `package.json` writer re-checked at `4646693`; as of `045d7ec`: pnpm, berry gates, package-lock walks, JSON writers, bun-lock presence, CRLF policies, wiring-kind and lines↔JSON helpers and the 4.5 #2 layering re-checked; the rest is as of `2463257`). Owner: `audit-ecosystems`._
 
 > Scope: `vendor/{npm_*,pnpm_*,yarn_*,bun_*,vlt_*,berry_zip}.rs`, `formats/{pnpm,yarn,bun,registry}`, `crawlers/npm_crawler*`, `vendor/lock_inventory/*`, `vex/discover/{npm,yarn,bun,vlt}.rs`, and the JS parts of `patch/redirect/` and `hosted/vlt.rs`. Line counts are production / inline-test, split at the first top-level `#[cfg(test)] mod`.
 
@@ -15,7 +15,7 @@ _Last checked against main @ 9c43dfc on 2026-10-06 by audit-ecosystems (vendor d
   - VEX calls every extractor in turn (`vex/discover/mod.rs:727-730`).
 - **`formats/` is a half-finished migration.** Its module doc promises each format owns "the entry grammar, the key rules, the version sniff and the planners" (`formats/mod.rs:1-24`). Reality:
   - pnpm partly conforms.
-  - `formats/yarn` is only the version sniff (58 production lines), and its doc says the grammars "are still read through their current homes" (`formats/yarn/mod.rs:4-6`).
+  - `formats/yarn` now holds the version sniff plus the shared berry entry reader (`berry_entry.rs`) and the berry project gates (`berry_gates.rs`, #657), ~760 lines in all; the classic and berry block grammars and the seven `split("\n\n")` rewriter grammars still live in `vendor/` and `redirect/` (PR #1057 moves them). {{E08}}
   - `formats/bun` is a 49-line wrapper around `vendor::bun_lock_text`.
   - package-lock and vlt have no `formats` module at all.
 - **Legacy and rare formats are the cost centers.** Vendored pnpm-legacy, `bun.lockb` and vlt together are about 11.2K production lines and more than 15K inline-test lines, with roughly 10K more lines of CLI integration tests.
@@ -26,7 +26,7 @@ _Last checked against main @ 9c43dfc on 2026-10-06 by audit-ecosystems (vendor d
 |---|---|---:|---:|---:|
 | package-lock | `npm_lock.rs` 1291/3230; redirect §745-1049 (305); `upstream/npm.rs` 21-240 (~220); `lock_inventory/npm.rs` 155; `vex/discover/npm.rs` 57-301 (~245) | ~2.2K | 3.2K+ | — |
 | pnpm v9 + hosted (all generations) | `pnpm_lock.rs` 3174/5341; `formats/pnpm` 1431/85; `lock_inventory/pnpm.rs` 151; upstream 478-583; vex 302-491 | ~5.0K | 5.4K + 544 equivalence | 6.1K (all pnpm) |
-| **pnpm legacy (5.4/6.0, vendored)** | `pnpm_lock_legacy.rs` | **1,853** | **3,217** | (in 6.1K) |
+| **pnpm legacy (5.4/6.0, vendored)** | `pnpm_lock_legacy.rs` (thin dialect wrappers over `pnpm_lock.rs` since #583; 4,918 lines with tests at `431b818`) | **1,853** at the snapshot | **3,217** | (in 6.1K) |
 | yarn classic | `yarn_classic_lock.rs` 1099/1916; redirect §2952-3140 (189); upstream 241-364 | ~1.8K | 1.9K+ | 7.3K (yarn total) |
 | yarn berry | `yarn_berry_lock.rs` 1417/2723; redirect §3141-3510 (370); upstream 365-477 | ~2.3K | 2.7K + 1,061 layering | (in 7.3K) |
 | bun.lock (text) | `bun_lock.rs` 1033/2838; `bun_lock_text.rs` 275/245; redirect §3511-3768 (258); upstream 584-686 | ~1.7K | 3.1K | 6.6K |
@@ -49,7 +49,7 @@ Shared npm-family infrastructure adds `npm_common.rs` 613/832, `npm_flavor.rs` 7
 | bun.lockb | `bun_lockb.rs` | same | same | same | snapshot JSON | 1 codec (good) |
 | vlt-lock.json | `vlt_lock_text` | same | same | same | `parse_node_entry_text` | 1 codec (good) |
 
-The question "which lockfile drives installs?" is also answered in **five places** with different rules:
+The question "which lockfile drives installs?" is also answered in **at least eight places** with different rules (the five below, plus `vlt_drives` with `SIBLING_LOCKS`, the bun presence probes and the PyPI precedence that hosted ignores). PR #1044 replaces them with one `formats::governing_locks` table. {{E75}}
 1. `vendor/npm_flavor.rs:151-300`.
 2. A hand-written copy for in-memory projects, `detect_npm_lock_flavor_in` (`lock_inventory/view.rs:360-447`). It re-spells the refusal strings, never emits `vendor_multiple_lockfiles`, and lacks the pnpm-PnP carve-out.
 3. `LOCKFILE_FAMILIES` (`npm_flavor.rs:98`).
@@ -70,7 +70,7 @@ The copies have drifted: the "patch rewrites `package.json`" warning has two cod
 - cacheKey `10c0` appears as `SUPPORTED_CACHE_KEY` ([`yarn_berry_lock.rs#L89`](https://github.com/SocketDev/socket-patch/blob/045d7ec783d788bf3c5a1310724b51e09fb6505d/crates/socket-patch-core/src/vendor/yarn_berry_lock.rs#L89)) and as `YARN_BERRY_SUPPORTED_CACHE_KEY` ([`redirect/mod.rs#L3289`](https://github.com/SocketDev/socket-patch/blob/045d7ec783d788bf3c5a1310724b51e09fb6505d/crates/socket-patch-core/src/patch/redirect/mod.rs#L3287-L3289)).
 - cacheKey extraction exists as `berry_metadata` + `berry_field` and as `berry_cache_key` (split-based, [`#L3291-L3306`](https://github.com/SocketDev/socket-patch/blob/045d7ec783d788bf3c5a1310724b51e09fb6505d/crates/socket-patch-core/src/patch/redirect/mod.rs#L3291-L3306)). The latter's own comment says it is "mirroring the vendored backend's `berry_field`".
 - The gate drivers are implemented twice (`yarn_berry_lock.rs:1001-1103` vs `preflight_yarn_berry_hosted`, `redirect/mod.rs:3355-3398`), with per-mode codes and differently worded details. Only the `.yarnrc.yml` reader `yarnrc_compression_level` is shared, so #370 was fixed once (#508); hosted imports it from `vendor/`.
-- The copies have drifted: vendored refuses a mixed-EOL root `package.json` and an unreadable `.yarnrc.yml`, while hosted checks only `yarn.lock` and treats an unreadable `.yarnrc.yml` as absent. {{E51}}
+- The copies have drifted: vendored refuses a mixed-EOL root `package.json` and an unreadable `.yarnrc.yml`, while hosted checks only `yarn.lock` and treats an unreadable `.yarnrc.yml` as absent. {{E09}}
 
 **Small helpers that have already drifted apart:**
 - **JSON-pointer escape:** byte-identical `escape_json_pointer_token` (`npm_lock.rs:1022`) and `json_pointer_escape` (`upstream/npm.rs:136`).
@@ -164,9 +164,11 @@ Each format exposes `parse(&[u8]) -> Model`, `entries()`, `wired_refs()`, `plan_
 
 ### New findings since the review
 
-- Hosted yarn berry rewrites (majority-normalizes) a mixed-line-ending root `package.json` that vendored mode refuses with `vendor_yarn_berry_mixed_line_endings`; the gates live once per mode. {{E51}}
+- Hosted yarn berry rewrites (majority-normalizes) a mixed-line-ending root `package.json` that vendored mode refuses with `vendor_yarn_berry_mixed_line_endings`; the gates live once per mode. {{E09}}
 - Vendored pnpm wrote the root `package.json` with `serialize_json` instead of `JsonLayout`, losing CRLF and refusing a BOM; it now uses `JsonLayout` like npm and berry (#810). {{E53}}
-- {{E60}}: the "any `\r\n` → CRLF" terminator rule is written 14 times, mostly outside the npm family (gem, Maven, composer and Cargo restore, Pipenv, `.npmrc`, uv, PEP 723 scripts), and hosted Cargo refuses a mixed `Cargo.lock` that upstream restore re-expands wholesale to CRLF; folded into the line-ending tracking issue.
+- {{E16}}: the "any `\r\n` → CRLF" terminator rule is written 14 times, mostly outside the npm family (gem, Maven, composer and Cargo restore, Pipenv, `.npmrc`, uv, PEP 723 scripts), and hosted Cargo refuses a mixed `Cargo.lock` that upstream restore re-expands wholesale to CRLF; folded into the line-ending tracking issue.
+- {{E76}} October 7: hosted yarn classic replaces `file:`, URL and codeload copies with the Socket artifact, and rollback corrupts the key (PR #1057 adds one copy-source classifier).
+- {{E78}} October 7: pnpm readers and writers ignore `---`, so a two-document pnpm lock gets the wrong document edited (#466, pnpm workstream).
 - {{E64}}: BOM handling has no shared helper (4 named `strip_bom` copies, about 50 inline strips that disagree on one vs. many BOMs). `formats::pnpm`'s three `lockfileVersion` readers and `workspace::top_level_key` never skip it, so one BOM pnpm lock reads as having entries, as not a pnpm lock (VEX), as unversioned (hosted trust gate) and as unsupported (vendored router); executed twice. Symptoms #903, #904 and #623.
 
 ---

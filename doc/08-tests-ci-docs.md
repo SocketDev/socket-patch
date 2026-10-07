@@ -2,7 +2,7 @@
 
 ## Part 8: Tests, CI, docs and distribution
 
-_Last checked against main @ c5be5d1 on 2026-10-07 by audit-core. Owner: audit-core._ Re-checked on `c5be5d1` (15:50Z run): the covgap counts and the contract size. Re-checked on `9c43dfc` (09:56Z run): the `#[ignore]` reasons across both crates (a RED/gap test has no CI leg). Only the repository-hygiene passages (stray `launch.json`, "DESIGN §" references), §8.3's `CLI_CONTRACT.md` measurements and guards, the contract's argument and env-var tables, the test-binary and covgap counts, the `#[serial]` count and the duplicated-helper counts have been re-checked; the rest is as of `2463257`.
+_Last checked against main @ 431b818 on 2026-10-07 by the October 7 reconciliation (8.2 compile count, e2e legs, compat workflows, the coverage legs' gating role, and recommendation B). Owner: audit-core._ Earlier: `c5be5d1` by audit-core. Re-checked on `c5be5d1` (15:50Z run): the covgap counts and the contract size. Re-checked on `9c43dfc` (09:56Z run): the `#[ignore]` reasons across both crates (a RED/gap test has no CI leg). Only the repository-hygiene passages (stray `launch.json`, "DESIGN §" references), §8.3's `CLI_CONTRACT.md` measurements and guards, the contract's argument and env-var tables, the test-binary and covgap counts, the `#[serial]` count and the duplicated-helper counts have been re-checked; the rest is as of `2463257`.
 
 > Scope: `crates/*/tests/**`, `tests/` (docker fixtures), `.github/workflows/*`, `.github/actions/*`, `scripts/`, `docs/`, `CLI_CONTRACT.md`, `CHANGELOG.md`, `npm/`, `crates/socket-patch-node/npm/`, and the Cargo profiles. CI timings come from the GitHub Actions run for `2463257` on `main`.
 
@@ -52,8 +52,8 @@ PR #277 has already started cleaning up: it deleted 237,608 lines, including 136
 
 For `2463257` on `main`:
 - **CI workflow:** 237 jobs and **348 runner-minutes** over 31.9 minutes of wall time.
-- **Critical path:** `test (windows-latest)` at **28.1 min**. Ubuntu took 14.0 and macOS 20.0. #278 raised the Windows timeout from 35 to 50 minutes.
-- **Repeated compiles:** every PR compiles the full test tree **8 times**: `test` ×3, `test-release`, `coverage`, and `e2e-build` ×3 (with `--all-features`, which is another feature set).
+- **Critical path:** `test (windows-latest)` at **28.1 min** (still about 28 min on 2026-10-07). Ubuntu took 14.0 and macOS 20.0. #278 raised the Windows timeout from 35 to 50 minutes.
+- **Repeated compiles:** every PR compiled the full test tree **8 times** at the snapshot: `test` ×3 (×2 on 2026-10-07), `test-release`, `coverage`, and `e2e-build` ×3 (with `--all-features`, which is another feature set).
 - `test` also runs `cargo build --workspace`, which builds the napi addon on all three OSes for no test benefit.
 
 **About 516 jobs per push across all workflows:**
@@ -71,15 +71,15 @@ For `2463257` on `main`:
 | go | ~6 | |
 | pipenv | ~3 | |
 
-- **The PR `e2e` matrix has 148 legs** (108 ubuntu, 23 macOS, 17 windows). They total 99 runner-minutes at about 40 seconds each, so scheduling overhead dominates. Most legs are version sweeps: vlt 35, bun 20, maven 17, ruby 14, uv 10. An `e2e-full` off-PR tier already exists.
-- **Report-only coverage still runs on every PR:**
+- **The PR `e2e` matrix has 157 legs** on 2026-10-07 (148 at the snapshot: 108 ubuntu, 23 macOS, 17 windows). They total 99 runner-minutes at about 40 seconds each, so scheduling overhead dominates. Most legs are version sweeps: vlt 35, bun 20, maven 17, ruby 14, uv 10. An `e2e-full` off-PR tier already exists.
+- **Coverage instrumentation runs on every PR,** but the coverage legs are not only report-only: on 2026-10-07 the `coverage` job is where the gating Linux tests run (`ci.yml:232-236, 425-431, 497-503`), and `coverage-docker` is the only per-PR Docker e2e run (`ci.yml:574-588`; `e2e-docker` is nightly). Moving them off PRs would delete those gates.
   - `coverage` 11.7 min;
   - `coverage-docker` ×9, 56 min;
   - `docker-base` 5.3 min, which compiles a full-LTO binary that the PR consumer then overrides;
   - `coverage-merge`.
 
-  That is **≈74 runner-minutes (21% of the run)** that gate nothing.
-- **Nine `*-compatibility.yml` files (2,041 lines) re-implement the same shape:** build, upload, download, install a pinned package manager, run.
+  That is **≈74 runner-minutes (21% of the run)**; the instrumentation overhead, not the tests, is the cost to cut.
+- **Nine `*-compatibility.yml` files at the snapshot (eleven on 2026-10-07; 2,041 lines then) re-implement the same shape:** build, upload, download, install a pinned package manager, run.
   - The same inline Python "copy executables from cargo `--message-format=json`" snippet appears four times, and `scripts/ci-e2e-bundle.py` is a fifth copy.
   - go, composer and pipenv compile on every leg instead of building once: 25 per-leg compiles.
 - **Path filters:** 204 hand-maintained patterns, two of them dead (they reference files deleted in #277).
@@ -133,8 +133,8 @@ For `2463257` on `main`:
 | # | Action | Impact | Risk |
 |---|---|---|---|
 | A | **Merge 207 test executables into ~25.** Finish the per-command directories; put the docker suites behind `[[test]] required-features`; group e2e by mode | Largest compile/link saving; shortens the 28-min Windows critical path; much smaller `target/` | Medium (the 553 `#[serial]` env tests must be fixed first; see Part 2.5) |
-| B | **Move report-only coverage and `docker-base` off PRs** | ≈74 runner-min and 12 jobs per run | Low |
-| C | **Cut the PR e2e tier from 148 to ~50 legs** (boundary versions only); move the vlt/bun sweeps to nightly | Up to ~200 fewer jobs per PR | Low–Med |
+| B | **De-instrument, don't move:** keep the gating Linux tests and the per-PR Docker e2e on PRs, run them without coverage instrumentation, and collect coverage on `main`/nightly; drop the LTO `docker-base` build that the PR consumer overrides | most of ≈74 runner-min per run | Low |
+| C | **Cut the PR e2e tier from 157 to ~50 legs** (boundary versions only); move the vlt/bun sweeps to nightly | Up to ~200 fewer jobs per PR | Low–Med |
 | D | **A `socket-patch-test-support` dev crate**: delete the 102 `binary()`, 84 `git_sha256` and 14 divergent env scrubbers; merge the forked VEX helpers | ~3–6K lines; hermeticity | Low |
 | E | **A reusable compat workflow** plus a `setup-pm` composite action; no per-leg compiles; fix the dead path filters | ~2,041 → ~900 workflow lines | Medium |
 | F | {{C33}} **Split `CLI_CONTRACT.md`**: a *generated* reference (flags from `Cli::command()`, env vars, an `errorCode` registry in code, exit codes) plus 300 lines or less of prose, with a freshness test | Fixes the measured drift | Low |
@@ -145,10 +145,13 @@ For `2463257` on `main`:
 
 ### New findings since the review
 
+- {{C67}} October 7: `main` went red for every PR because three stale `PENDING_INLINE_DIGESTS` entries tripped a two-sided ratchet after a merge burst (fixed by #1016). Nothing required checks on `main`, and push CI cancelled about 87% of `main` verdicts; #1018 runs CI on a merge queue with per-SHA push concurrency (the ruleset itself needs an org admin).
+- {{C66}} October 7: test children sent telemetry to production, the e2e zero-tests guard covered Gradle only, and the Windows npm leg ran nothing (PR #1046).
+
 - {{C56}} {{C57}} Known bugs are pinned as `#[ignore = "RED: …"]` tests with no issue and no CI leg: #708 added two (`apply_with_unreadable_socket_dir_fails_closed`, `remove_by_uuid_reverts_vendoring_when_ledger_generation_is_older`); both bugs reproduce on `9c43dfc` and are now filed. A third ignored test, `crawler_monorepo_gaps`, documents a contract gap. A RED test should land with its issue number in the ignore reason.
 
 - {{C47}} Test files that spawned the CLI with no `SOCKET_*` scrub: on `045d7ec` an ambient `SOCKET_DRY_RUN=true` or `SOCKET_OFFLINE=true` turned 18 of the 19 `repair_vendor_e2e` tests red. Since #850, 8 of the 10 spawn through the hermetic `common/hermetic.rs` builder, and the `spawn_env_hygiene` ratchet fails on a new bare spawn. `scan_invariants` and `in_process_npm_multicopy` remain.
-- {{C40}} Env vars that core reads directly have no documentation guard: `SOCKET_API_CONCURRENCY` (the operator throttle for the patch API) and `SOCKET_WALK_THREADS` appear in no doc. Only clap-bound vars are checked, through `GLOBAL_ARG_ENV_VARS`/`LOCAL_ARG_ENV_VARS`. It is the env-var slice of 8.5 F.
+- {{C38}} Env vars that core reads directly have no documentation guard: `SOCKET_API_CONCURRENCY` (the operator throttle for the patch API) and `SOCKET_WALK_THREADS` appear in no doc. Only clap-bound vars are checked, through `GLOBAL_ARG_ENV_VARS`/`LOCAL_ARG_ENV_VARS`. It is the env-var slice of 8.5 F.
 
 ---
 _Generated by [Claude Code](https://claude.ai/code)_

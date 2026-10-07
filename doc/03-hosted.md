@@ -2,7 +2,7 @@
 
 ## Part 3: Hosted mode (redirect, hosted engine, upstream restore, Node addon)
 
-_Last checked against main @ db83f01 on 2026-10-07 by audit-ecosystems (3.2 `redirect/mod.rs` size and layout re-checked at `db83f01`; hosted Maven/Gradle grant handling checked at `9c43dfc`; 3.4 NuGet.config readers as of `4646693`; 3.6 vlt dead helpers as of `045d7ec`; the rest as of `203e092`). Owner: `audit-ecosystems`._
+_Last checked against main @ 431b818 on 2026-10-07 by the October 7 reconciliation (3.1 scope note, 3.3 memory takeovers, 3.5 restore size and credentials re-checked). Earlier: `db83f01` by audit-ecosystems (3.2 `redirect/mod.rs` size and layout re-checked at `db83f01`; hosted Maven/Gradle grant handling checked at `9c43dfc`; 3.4 NuGet.config readers as of `4646693`; 3.6 vlt dead helpers as of `045d7ec`; the rest as of `203e092`). Owner: `audit-ecosystems`._
 
 > Scope: `patch/redirect/**`, `hosted/**`, `crates/socket-patch-node/**`, CLI `scan/hosted.rs`, `scan/hosted/*`, `hosted_bundle.rs`.
 
@@ -16,7 +16,9 @@ _Last checked against main @ db83f01 on 2026-10-07 by audit-ecosystems (3.2 `red
 | `socket-patch-node` | 651 Rust + 517 JS/TS | 479 |
 | CLI hosted (`scan/hosted.rs` 2,267, `hosted/*` 601, `hosted_bundle.rs` 184) | 3,052 | 2,166 |
 
-That is **about 27K production lines** for hosted mode, plus about 23.6K lines of inline tests and about 42K lines of hosted integration tests (`e2e_redirect_*`, `in_process_redirect*`, `hosted_memory_*`, rollback-hosted, core goldens).
+The table predates Gradle (#646), sbt (#690) and `hosted/governing_root.rs`; at `1c6c509` `redirect/mod.rs` alone is 21.9K lines (7.6K production) and upstream restore is ~8.8K production lines. {{E30}}
+
+That is **about 27K production lines** for hosted mode at the snapshot (more now), plus about 23.6K lines of inline tests and about 42K lines of hosted integration tests (`e2e_redirect_*`, `in_process_redirect*`, `hosted_memory_*`, rollback-hosted, core goldens).
 
 ### 3.2 How the redirect logic is organized
 
@@ -47,7 +49,7 @@ That is **about 27K production lines** for hosted mode, plus about 23.6K lines o
 | 836 | `run_redirect_selected` (CLI `scan/hosted.rs:639`) |
 | 604 | `engine` (`hosted/memory/mod.rs:430`) |
 | 455 | `rewrite_gem` (`mod.rs:4750`) |
-| 439 | `plan_cargo_toml` (`mod.rs:2516`) {{E57}} |
+| 439 | `plan_cargo_toml` (`mod.rs:2516`) {{E15}} |
 | 394 | `rewrite_cargo` (`mod.rs:1062`) |
 | 361 | `vendored_takeover` (`scan/hosted.rs:1497`) |
 | 357 | `rewrite_maven_pom` (`mod.rs:5341`) |
@@ -95,7 +97,7 @@ The shared stages are good: `build_candidates`, `read_candidate_files`, `rewrite
 
 **The parity suites exist only because there are two orchestrators:** `hosted_memory_parity.rs` (1,113 lines, 31 tests), `hosted_memory_common` (473) and `hosted_memory_rollout.rs` (639). Some outputs even need normalizing before they compare equal (`without_pipenv_advice`).
 
-**The memory engine also cannot reach several rewriters:** vlt is always offline-withheld, maven and nuget raise `ecosystem_unsupported_in_memory`, and takeovers are refused. So about 1,060 lines of maven/nuget rewriter plus the vlt rewriter are disk-only.
+**The memory engine also cannot reach several rewriters:** vlt is always offline-withheld, maven and nuget raise `ecosystem_unsupported_in_memory`, and only npm, cargo and golang takeovers are refused (`refuse_takeovers`, `memory/stages.rs`): a vendored PyPI or Gradle-built Maven entry, which the disk flow takes over, is not on the memory list (B15; PR #1039 shares one predicate). {{E70}} So about 1,060 lines of maven/nuget rewriter plus the vlt rewriter are disk-only.
 
 **Recommendation.** Both paths converge on `selected: &[(purl, uuid)]`. Build the disk path as `DiskSnapshot` → `MemoryProject`, then run a single `redirect_root(view, selected, api, hooks)`. Host-only effects become hooks: the apply lock, performing versus refusing a takeover, online versus offline vlt preflight, the pipenv probe, write-back, the stale-install probe, vlt heal and VEX. That saves roughly 700–900 production lines, and the parity suite becomes ordinary tests.
 
@@ -105,7 +107,7 @@ A "one model per format" layer (`formats/`) has been started, and **hosted mode 
 
 - **package-lock.json: four walks and two serializers.** Hosted `serialize_json` (`mod.rs:273`) always writes 2-space JSON. Vendor's serializer preserves the file's indent. Upstream restore uses the hosted one, so hosted rewrites *and rollback* reformat a 4-space or tab-indented lock in full (open issue #324).
 - **yarn.lock: five copies of a `split("\n\n")` + regex grammar** (`mod.rs:2992`, `:3159`, `:3278`, `upstream/npm.rs:289`, `:390`), alongside the shared `scan_blocks` used by vendor, inventory and VEX.
-- **NuGet.config: two readers.** Hosted routing and splice anchors now go through `formats::nuget::parse_config`, the bounded tokenizer that upstream restore and VEX use; the hosted regex reader `nuget_package_source_keys` and the regex anchors were deleted (#597). Vendored `nuget_feed.rs` still keeps its own comment-blanking reader ([`parse_config_source_keys`](https://github.com/SocketDev/socket-patch/blob/4646693150cf5efca6222b87092e1620e58566f8/crates/socket-patch-core/src/vendor/nuget_feed.rs#L1053-L1112)) and `find`-based anchors. {{E11}}
+- **NuGet.config: two readers.** Hosted routing and splice anchors now go through `formats::nuget::parse_config`, the bounded tokenizer that upstream restore and VEX use; the hosted regex reader `nuget_package_source_keys` and the regex anchors were deleted (#597). Vendored `nuget_feed.rs` still keeps its own comment-blanking reader ([`parse_config_source_keys`](https://github.com/SocketDev/socket-patch/blob/4646693150cf5efca6222b87092e1620e58566f8/crates/socket-patch-core/src/vendor/nuget_feed.rs#L1053-L1112)) and `find`-based anchors. {{E10}}
   - A commented-out `<add key="…">` no longer suppresses the nuget.org seed, because hosted reads through the shared reader (#597). {{E01}}
 - **requirements.txt:** `utils/requirements.rs:1-9` says vendor, inventory and VEX share `logical_lines`, but "the hosted requirements rewriter … keeps its own line splitter" (`redirect/requirements.rs:17`). Upstream has a fourth reader.
 - **Cargo.toml: two grammars inside one rewriter.** There are six `LazyLock` regexes plus `classify_cargo_section`, alongside four `toml_edit` parses of the same file. The dependency tables are walked five times across hosted, `utils/cargo_workspace` and VEX.
@@ -125,7 +127,7 @@ A "one model per format" layer (`formats/`) has been started, and **hosted mode 
 
 ### 3.5 Upstream restore: rebuilding what was thrown away
 
-**Cost.** 7,446 production lines: Python 2,474 (`uv` 1,152), infrastructure 1,395, gem 743, npm 754, maven 400, composer 373, cargo 361, nuget 350, vlt 329, bun.lockb 153, golang 114. Tests add 1,605 inline lines, 1,913 lines of golden tests and about 1.9K lines of `in_process_rollback_hosted`.
+**Cost.** ~8.8K production lines at `1c6c509` (7,446 at the snapshot: Python 2,474 (`uv` 1,152), infrastructure 1,395, gem 743, npm 754, maven 400, composer 373, cargo 361, nuget 350, vlt 329, bun.lockb 153, golang 114). PR #918 has since taken over part of this section's npm restore; #919 and #992 remain open. Tests add 1,605 inline lines, 1,913 lines of golden tests and about 1.9K lines of `in_process_rollback_hosted`.
 
 **Why it exists.** v5 dropped the redirect ledger. Yet every rewriter still computes `FileEdit { original, new }`, with 30 `FileEdit {` literals in `mod.rs`. In production, `original` is read only by the Composer reinstall hint (`cli composer_hints.rs:69-99`). **So the original bytes are computed, discarded, and later re-derived from the network.**
 
@@ -133,6 +135,7 @@ A "one model per format" layer (`formats/`) has been started, and **hosted mode 
 
 **Failure modes:**
 - refused when offline;
+- registry fetches never send credentials, so a private registry that needs auth is unreachable;
 - **private registries and mirrors are ignored.** npm restore always uses `SOCKET_NPM_REGISTRY` or the public registry, so an Artifactory project comes back with public URLs;
 - heuristic re-derivation of package-manager output (uv re-derives specifiers "in uv's spelling" and the sdist/wheel shape from sibling entries);
 - `bun.lockb` is always refused;
@@ -201,8 +204,10 @@ For uv, pylock, poetry, pdm, hatch, vlt, maven and bun.lockb, the module's own f
 
 - {{E50}}: hosted `rewrite_nuget` and upstream restore rewrite every `packages.lock.json` entry of the patched id, in every target framework, whatever its `resolved` version; vendored `locked_at` only touches entries at the patched version. `packages.lock.json` has four walkers (hosted, restore, vendored, VEX).
 - {{E52}}: `vendor/go_sum_edit.rs` keeps free `upsert_module_lines` / `has_module_version` / `remove_exact_module_version_lines` with no production caller, re-implemented by the `GoSumEditor` the hosted Go rewriter uses; the free copies survive only as a test oracle, and the pure hosted codec lives in `vendor/`.
-- {{E57}}: the hosted cargo planner `plan_cargo_toml` is a line scanner, gated by a second `toml_edit` classifier of the same declarations. It refuses `serde = { version = "1", features = [⏎ "derive",⏎] }` as "inline table does not close on its line", although cargo and `toml_edit` accept it, so hosted skips a crate that vendored mode handles. Upstream restore unpins with a third, line-level grammar.
+- {{E15}}: the hosted cargo planner `plan_cargo_toml` is a line scanner, gated by a second `toml_edit` classifier of the same declarations. It refuses `serde = { version = "1", features = [⏎ "derive",⏎] }` as "inline table does not close on its line", although cargo and `toml_edit` accept it, so hosted skips a crate that vendored mode handles. Upstream restore unpins with a third, line-level grammar.
 - {{E58}}: the hosted-vlt ledger helpers `edit_dep_id`, `lock_node_ids`, `carried_pin_original` and `vlt_heal::ledger_targets` have no production caller since #277 deleted `rebase_vlt_edits` and the ledger heal; `UpstreamClient::seed_rubygems_sha256` is a test helper compiled into production.
+- {{E73}} October 7: "is this hosted patch pinned" is decided four ways (`confirm`, `mark_pinned`, `memory_recorded`, discovery); lockless NuGet/Cargo pins are attested in-run then reported contested forever (PR #1058).
+- {{E85}} The NuGet lock writer and its restore drop CRLF and BOM (`serialize_json`), unlike every other hosted JSON writer.
 - {{E63}}: hosted Maven splices the API's `maven_suffixed_version` into every matching `pom.xml` `<version>` without checking it (proven with `-socket.DEADBEEF`, `-patched` and markup), while the hosted Gradle planner (#646) refuses the same grant unless it is `<base>-socket.<uuid[..8]>`. The suffix grammar has four builders (vendored `jvm::Coords`, hosted Gradle, the CLI `vex_consumed` copy and the server) and no shared validator.
 
 ---
