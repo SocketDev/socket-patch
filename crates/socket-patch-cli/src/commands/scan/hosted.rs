@@ -778,6 +778,28 @@ pub(crate) async fn run_redirect_selected(
         &vlt_preflight.withheld_everywhere,
         &mut skipped,
     );
+    // A NEW row the lockfiles already pin on the patch server these
+    // references name (not a configured one, so the recorded view's
+    // discovery could not see it) is ALREADY: decided here, before the lock
+    // decision below, so a run that will write such a row locks before it
+    // reads anything it writes.
+    if let Some(gate) = rollout.as_mut() {
+        if super::rollout::any_new(&gate.rows) {
+            let configured = crate::commands::rollback::patch_server_origins(common);
+            let foreign = socket_patch_core::patch::redirect::upstream::foreign_dep_origins(
+                candidates.iter().map(|c| &c.dep),
+                &configured,
+            );
+            if !foreign.is_empty() {
+                let origins: Vec<String> = configured.into_iter().chain(foreign).collect();
+                let pins = socket_patch_core::patch::redirect::upstream::HostedPin::discover(
+                    view, &origins,
+                )
+                .await;
+                super::rollout::mark_pinned(&mut gate.rows, &pins);
+            }
+        }
+    }
 
     // The apply lock (see `acquire_hosted_lock`), taken only by a WET run
     // that holds at least one granted reference — the only runs that can
@@ -795,7 +817,7 @@ pub(crate) async fn run_redirect_selected(
             !new.contains(&(sel_purl(c), c.dep.patch_uuid.clone())) || gate.may_admit(&sel_purl(c))
         })
     });
-    let mut lock: Option<LockGuard> = if !common.dry_run && !candidates.is_empty() && may_write {
+    let lock: Option<LockGuard> = if !common.dry_run && !candidates.is_empty() && may_write {
         match acquire_hosted_lock(common, &mut scan_result) {
             Ok(guard) => Some(guard),
             Err(code) => return code,
@@ -1030,8 +1052,6 @@ pub(crate) async fn run_redirect_selected(
                 (purl.to_string(), uuid.clone())
             })
             .collect();
-        let texts: Vec<&str> = done.files.values().map(String::as_str).collect();
-        super::rollout::mark_pinned(&mut gate.rows, &texts);
         let unknown = gate.stage.reference_failed.is_some();
         gate.stage.plan(&gate.rows, |row| {
             unknown || eligible.contains(&(row.writer.purl.clone(), row.writer.uuid.clone()))
@@ -1051,15 +1071,6 @@ pub(crate) async fn run_redirect_selected(
                 rewrite_options(),
             )
             .await;
-        }
-        // A row that turned out to be pinned already (`mark_pinned`: a pin
-        // discovery did not recognize) still gets written: take the lock
-        // skipped above. Only NEW rows ran without it, so no takeover did.
-        if lock.is_none() && !common.dry_run && !candidates.is_empty() {
-            match acquire_hosted_lock(common, &mut scan_result) {
-                Ok(guard) => lock = Some(guard),
-                Err(code) => return code,
-            }
         }
     }
     // Held to the end of the function.

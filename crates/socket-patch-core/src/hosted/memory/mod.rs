@@ -59,7 +59,7 @@ pub use select::{candidate_files, safe_repo_path, select_paths};
 pub use types::*;
 
 use crate::rollout::stage::{
-    classify, lookup_incomplete, mentioned_uuids, offers_from_results, Offers, RecordedIndex, Row,
+    classify, lookup_incomplete, mark_pinned, offers_from_results, Offers, RecordedIndex, Row,
     Stage,
     ROLLOUT_DEFERRED,
 };
@@ -378,47 +378,26 @@ fn unrooted_unsupported_warnings<'a>(
 }
 
 /// One root's recorded view (§5.1) in memory: its `.socket/manifest.json`,
-/// the hosted pins its lockfiles name, and its vendor ledger — the disk
-/// merge's precedence. A pin is a mention of an offered uuid for the purl
-/// in one of the root's own files (a nested root's files are its own); a
-/// pin to a patch the API no longer offers reads as NEW, which costs one
-/// slot once instead of stalling.
-fn memory_recorded(
-    project: &MemoryProject,
-    root: &str,
-    roots: &[String],
-    offers: &Offers,
-) -> RecordedIndex {
+/// the hosted pins its lockfiles carry, and its vendor ledger — the disk
+/// merge's precedence. The pins are discovery's over the root's files
+/// ([`HostedPin::discover`], the one "is this pinned" answer the disk scan
+/// uses too), so a uuid a stale or inactive file merely mentions pins
+/// nothing. Pins on a patch server other than Socket's are recognized once
+/// the run's references name it ([`stage::mark_pinned`]).
+///
+/// [`HostedPin::discover`]: crate::patch::redirect::upstream::HostedPin::discover
+/// [`stage::mark_pinned`]: crate::rollout::stage::mark_pinned
+async fn memory_recorded(project: &MemoryProject) -> RecordedIndex {
     let manifest = project
         .text(select::MANIFEST_REL)
         .and_then(|text| serde_json::from_str(text).ok());
     let vendor = stages::vendored_entries(project);
-    let nested: Vec<String> = roots
-        .iter()
-        .filter(|other| other.as_str() != root)
-        .filter_map(|other| roots::strip_root(root, other).map(|rel| format!("{rel}/")))
-        .filter(|rel| rel != "/")
-        .collect();
-    let mut mentioned = std::collections::HashSet::new();
-    for (path, entry) in project.entries() {
-        if path.starts_with(".socket/") || nested.iter().any(|n| path.starts_with(n.as_str())) {
-            continue;
-        }
-        if let MemoryEntry::Text(text) = entry {
-            mentioned_uuids(text, &mut mentioned);
-        }
-    }
-    let pins: Vec<(String, String)> = offers
-        .selected
-        .iter()
-        .filter_map(|(purl, selected)| {
-            let offered = offers.unfiltered.get(purl)?;
-            std::iter::once(selected)
-                .chain(offered.iter())
-                .find(|p| mentioned.contains(&p.uuid.to_ascii_lowercase()))
-                .map(|p| (purl.clone(), p.uuid.clone()))
-        })
-        .collect();
+    let pins: Vec<(String, String)> =
+        crate::patch::redirect::upstream::HostedPin::discover(ProjectView::Memory(project), &[])
+            .await
+            .into_iter()
+            .map(|pin| (pin.purl, pin.uuid))
+            .collect();
     let merged = crate::ledgers::merge_ledger_records_for_updates(
         manifest.as_ref(),
         vendor.as_ref(),
@@ -728,12 +707,14 @@ async fn engine(
     stage.incomplete |= states
         .iter()
         .any(|s| s.error.as_ref().is_some_and(|e| e.code == "patch_lookup_failed"));
-    let roots_by_path: Vec<String> = states.iter().map(|s| s.root.clone()).collect();
-    for state in states.iter_mut().filter(|s| s.error.is_none()) {
+    for state in states.iter_mut() {
+        if state.error.is_some() {
+            continue;
+        }
         let Some(project) = state.project.as_ref() else {
             continue;
         };
-        let recorded = memory_recorded(project, &state.root, &roots_by_path, &state.offers);
+        let recorded = memory_recorded(project).await;
         stage.incomplete |= lookup_incomplete(
             &recorded,
             &state.failed_details,
@@ -801,6 +782,26 @@ async fn engine(
             Ok(plan) => planned.push((index, plan)),
             Err(refusal) => state.error = Some(ProjectError::from(refusal)),
         }
+    }
+    // A pin on the patch server these references name, when that is not
+    // Socket's own, is recognized only now (see `mark_pinned`).
+    for (index, plan) in &planned {
+        if !crate::rollout::stage::any_new(&states[*index].rows) {
+            continue;
+        }
+        let origins = crate::patch::redirect::upstream::foreign_dep_origins(
+            plan.candidates.iter().map(|c| &c.dep),
+            &[],
+        );
+        if origins.is_empty() {
+            continue;
+        }
+        let pins = crate::patch::redirect::upstream::HostedPin::discover(
+            ProjectView::Memory(&plan.project),
+            &origins,
+        )
+        .await;
+        mark_pinned(&mut states[*index].rows, &pins);
     }
     let wheels: BTreeSet<(String, String)> = planned
         .iter()

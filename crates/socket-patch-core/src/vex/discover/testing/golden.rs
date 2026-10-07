@@ -181,6 +181,7 @@ fn render(out: &Discovery, root: &Path) -> Value {
                 uuid,
                 file,
                 version_reqs,
+                index_url: _,
             } = p;
             json!({
                 "ecosystem": ecosystem,

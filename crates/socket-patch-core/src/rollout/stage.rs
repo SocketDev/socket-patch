@@ -238,47 +238,31 @@ pub fn lookup_incomplete(
             .any(|purl| !recorded.records_package(purl))
 }
 
-/// Every canonical-shaped uuid (`8-4-4-4-12` hex) `text` mentions,
-/// lowercased, in one linear pass.
-pub fn mentioned_uuids(text: &str, out: &mut HashSet<String>) {
-    let bytes = text.as_bytes();
-    if bytes.len() < 36 {
-        return;
-    }
-    let mut i = 0;
-    while i + 36 <= bytes.len() {
-        let window = &bytes[i..i + 36];
-        let shaped = window.iter().enumerate().all(|(k, b)| match k {
-            8 | 13 | 18 | 23 => *b == b'-',
-            _ => b.is_ascii_hexdigit(),
-        });
-        if shaped {
-            out.insert(String::from_utf8_lossy(window).to_ascii_lowercase());
-            i += 36;
-        } else {
-            i += 1;
+/// Mark NEW rows whose selected uuid discovery already finds pinned
+/// ([`HostedPin::discover`]) as ALREADY. The recorded view is discovery
+/// over the configured patch servers; a pin on the server THIS run's
+/// references name (an origin missing from `--patch-server-url`) is only
+/// recognized once those references are known, so the caller re-runs
+/// discovery with their origins ([`dep_origins`]) and hands the pins here.
+/// Without it such a pin would read as NEW on every run and hold its slot
+/// forever. Only discovery's attributable pins count: a uuid a stale or
+/// inactive file merely mentions (an unused `pdm.lock`, a `package.json`
+/// `resolutions` leftover, a comment) pins nothing and stays NEW.
+///
+/// [`HostedPin::discover`]: crate::patch::redirect::upstream::HostedPin::discover
+/// [`dep_origins`]: crate::patch::redirect::upstream::dep_origins
+pub fn mark_pinned(rows: &mut [Row], pins: &[crate::patch::redirect::upstream::HostedPin]) {
+    let pinned: HashSet<String> = pins.iter().map(|p| p.uuid.to_ascii_lowercase()).collect();
+    for row in rows.iter_mut().filter(|r| r.candidate.recorded.is_new()) {
+        if pinned.contains(&row.candidate.uuid.to_ascii_lowercase()) {
+            row.candidate.recorded = Recorded::Same;
         }
     }
 }
 
-/// Mark NEW rows whose selected uuid the project's lockfile texts already
-/// mention as ALREADY. A hosted pin on a patch server discovery does not
-/// recognize (an origin missing from `--patch-server-url`) would otherwise
-/// read as NEW on every run and hold its slot forever; patch uuids are
-/// unique, so a mention is a pin.
-pub fn mark_pinned(rows: &mut [Row], texts: &[&str]) {
-    if !rows.iter().any(|r| r.candidate.recorded.is_new()) {
-        return;
-    }
-    let mut mentioned = HashSet::new();
-    for text in texts {
-        mentioned_uuids(text, &mut mentioned);
-    }
-    for row in rows.iter_mut().filter(|r| r.candidate.recorded.is_new()) {
-        if mentioned.contains(&row.candidate.uuid.to_ascii_lowercase()) {
-            row.candidate.recorded = Recorded::Same;
-        }
-    }
+/// Whether any row is NEW (only then can [`mark_pinned`] change anything).
+pub fn any_new(rows: &[Row]) -> bool {
+    rows.iter().any(|r| r.candidate.recorded.is_new())
 }
 
 /// One directory's budget and the outcome of its plan.

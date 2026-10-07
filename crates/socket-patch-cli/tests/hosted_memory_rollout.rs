@@ -363,6 +363,41 @@ async fn one_root_disk_and_memory_admit_and_defer_the_same_rows_until_converged(
     );
 }
 
+/// A patch uuid a file merely MENTIONS — here a stale hosted URL left in
+/// a `package.json` field no installer reads — is not a pin: the row stays
+/// NEW and costs its slot, on disk and in memory alike. Both engines used
+/// to count any mention as ALREADY, which let the row ride past the cap.
+#[tokio::test]
+async fn a_uuid_mentioned_outside_a_pin_is_new_not_already() {
+    let server = MockServer::start().await;
+    mount(&server).await;
+    let mut files = BTreeMap::new();
+    let names: Vec<&str> = PACKAGES.iter().map(|(n, _)| *n).collect();
+    lock(&mut files, "", &names);
+    let mut manifest: Value = serde_json::from_slice(&files["package.json"]).unwrap();
+    manifest["description"] = json!(format!("was pinned to {}", url("mem-e")));
+    files.insert(
+        "package.json".to_string(),
+        serde_json::to_vec(&manifest).unwrap(),
+    );
+
+    let want = json!({ "new": 1, "deferred": 4, "upgrade": 0, "already": 0 });
+    let mem = memory(&server, &files, options(Some(1))).await;
+    assert!(
+        mem.projects[0].error.is_none(),
+        "{:?}",
+        mem.projects[0].error
+    );
+    assert_eq!(mem.rollout["counts"], want);
+    assert_eq!(pinned(&apply(&files, &mem), "package-lock.json"), ["mem-e"]);
+
+    let disk = run_disk_with(&server, &files, false, &["--max-new-patches", "1"]);
+    assert_eq!(disk.envelope["rollout"]["counts"], want, "{}", disk.stderr);
+    let mut disk_files = files.clone();
+    disk_files.extend(disk.changed);
+    assert_eq!(pinned(&disk_files, "package-lock.json"), ["mem-e"]);
+}
+
 #[tokio::test]
 async fn two_roots_spend_one_budget_in_memory_and_one_per_directory_on_disk() {
     let server = MockServer::start().await;

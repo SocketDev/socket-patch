@@ -599,6 +599,7 @@ fn unresolved_manifest_pins(
                             uuid: uuid.clone(),
                             file: CARGO_TOML.into(),
                             version_reqs,
+                            index_url: definitions.get(reg.as_str()).cloned(),
                         });
                     }
                     format!("there is no {CARGO_LOCK} to fix its version")

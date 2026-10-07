@@ -420,27 +420,7 @@ mod tests {
     }
 
     #[test]
-    fn mentioned_uuids_finds_every_canonical_shape_once() {
-        let mut out = HashSet::new();
-        mentioned_uuids(
-            "https://h/p/22222222-2222-4222-8222-222222222222/AAAAAAAA-1111-4111-8111-00000000000A/x.tgz \
-             not-a-uuid 1234 socket-patch-bbbbbbbb-1111-4111-8111-00000000000b",
-            &mut out,
-        );
-        let mut got: Vec<&str> = out.iter().map(String::as_str).collect();
-        got.sort();
-        assert_eq!(
-            got,
-            [
-                "22222222-2222-4222-8222-222222222222",
-                "aaaaaaaa-1111-4111-8111-00000000000a",
-                "bbbbbbbb-1111-4111-8111-00000000000b",
-            ]
-        );
-    }
-
-    #[test]
-    fn a_lock_naming_the_selected_uuid_marks_the_row_already() {
+    fn a_discovered_pin_of_the_selected_uuid_marks_the_row_already() {
         let results = vec![
             offer(
                 "pkg:npm/a@1",
@@ -459,7 +439,11 @@ mod tests {
         let mut rows = classify(&offers, &RecordedIndex::default(), "");
         mark_pinned(
             &mut rows,
-            &["resolved: https://x/AAAAAAAA-1111-4111-8111-00000000000A/a.tgz"],
+            &[socket_patch_core::patch::redirect::upstream::HostedPin {
+                purl: "pkg:npm/a@1".into(),
+                uuid: "aaaaaaaa-1111-4111-8111-00000000000a".into(),
+                files: vec!["package-lock.json".into()],
+            }],
         );
         assert_eq!(rows[0].candidate.recorded, Recorded::Same);
         assert_eq!(rows[1].candidate.recorded, Recorded::None);

@@ -439,6 +439,7 @@ fn emit_hosted(
                     uuid: src.uuid.clone(),
                     file: cfg_rel.into(),
                     version_reqs: Vec::new(),
+                    index_url: Some(src.value.clone()),
                 });
             }
             None

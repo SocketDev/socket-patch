@@ -369,6 +369,10 @@ pub struct UnlockedPin {
     /// `version = "…"`); a ledger version must satisfy every one. Empty =
     /// none to check (nuget: the csproj `Version` is only a minimum).
     pub version_reqs: Vec<String>,
+    /// The Socket index url the pin routes to (the nuget source value, the
+    /// cargo registry's `index`): its grant-token segment is part of this
+    /// pin, not other hosted wiring.
+    pub index_url: Option<String>,
 }
 
 impl UnlockedPin {
