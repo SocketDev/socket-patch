@@ -2,7 +2,7 @@
 
 ## Part 3: Hosted mode (redirect, hosted engine, upstream restore, Node addon)
 
-_Last checked against main @ 431b818 on 2026-10-07 by the October 7 reconciliation (3.1 scope note, 3.3 memory takeovers, 3.5 restore size and credentials re-checked). Earlier: `db83f01` by audit-ecosystems (3.2 `redirect/mod.rs` size and layout re-checked at `db83f01`; hosted Maven/Gradle grant handling checked at `9c43dfc`; 3.4 NuGet.config readers as of `4646693`; 3.6 vlt dead helpers as of `045d7ec`; the rest as of `203e092`). Owner: `audit-ecosystems`._
+_Last checked against main @ 05ecc6e on 2026-10-07 by audit-ecosystems (3.2 `RewriteResult` sets, `merge_group_delta` and `confirm()` re-checked for E31; hosted NuGet lock walk and Maven suffix splice re-checked). Earlier: `431b818` by the October 7 reconciliation (3.1 scope note, 3.3 memory takeovers, 3.5 restore size and credentials re-checked). Earlier: `db83f01` by audit-ecosystems (3.2 `redirect/mod.rs` size and layout re-checked at `db83f01`; hosted Maven/Gradle grant handling checked at `9c43dfc`; 3.4 NuGet.config readers as of `4646693`; 3.6 vlt dead helpers as of `045d7ec`; the rest as of `203e092`). Owner: `audit-ecosystems`._
 
 > Scope: `patch/redirect/**`, `hosted/**`, `crates/socket-patch-node/**`, CLI `scan/hosted.rs`, `scan/hosted/*`, `hosted_bundle.rs`.
 
@@ -28,9 +28,9 @@ That is **about 27K production lines** for hosted mode at the snapshot (more now
 - A serial "withholding prefix" runs first: pdm, then pipenv, then `withhold` (`:379-412`).
 - Each rewriter filters its own dependencies with `o.ecosystem == "npm"`-style string compares: 12 in `mod.rs`, 7 in `engine.rs`.
 
-**`RewriteResult` is a cross-ecosystem grab bag** (`mod.rs:200-260`). It holds 20 per-ecosystem uuid sets, such as `confirmed_cargo_uuids`, `refused_pdm_uuids` and `vlt_foreign_uuids`. Two places consume them:
-- `merge_group_delta`, which destructures every field (`:503-557`);
-- `engine::confirm`, an ordered if-chain of about 16 per-ecosystem rules keyed on purl prefixes and those sets (`hosted/engine.rs:1239-1315`).
+**`RewriteResult` is a cross-ecosystem grab bag** (`mod.rs:220-370` at `05ecc6e`). It holds 27 per-ecosystem uuid sets (20 at the review; sbt and Gradle added the rest), such as `confirmed_cargo_uuids`, `refused_pdm_uuids` and `vlt_foreign_uuids`. The CLI (`scan/hosted.rs`) and `vex/discover/gradle.rs` read some of them directly. Two places consume them all: {{E31}}
+- `merge_group_delta`, which destructures every field (`:753-831`);
+- `engine::confirm`, a 225-line ordered chain of 25 `ProbeStep` outcomes keyed on purl prefixes, driver predicates and those sets (`hosted/engine.rs:1652-1876`).
 
 **Adding an ecosystem to hosted mode means editing at least eight parallel tables:**
 - `formats::registry::REGISTRY`;
@@ -184,7 +184,7 @@ For uv, pylock, poetry, pdm, hatch, vlt, maven and bun.lockb, the module's own f
    - merge the hosted-URL and token helpers into `hosted_url.rs`;
    - move `golang_local.rs` to agent mode;
    - move the 11.4K test lines into sibling `tests.rs` files.
-2. **Introduce `trait HostedRewriter { ecosystem(); drives(&FileSet) -> bool; rewrite(&FileSet, &[&DepOverride]) -> Outcome }`**, with `Outcome { files, edits, warnings, per_dep: BTreeMap<Uuid, DepStatus> }` where `DepStatus` is Confirmed, Refused, Foreign or Unclaimed. It replaces the 20 `RewriteResult` sets, `merge_group_delta` and most of `confirm()`. The "driver" rules for pdm/vlt/uv become `drives()`.
+2. **Introduce `trait HostedRewriter { ecosystem(); drives(&FileSet) -> bool; rewrite(&FileSet, &[&DepOverride]) -> Outcome }`**, with `Outcome { files, edits, warnings, per_dep: BTreeMap<Uuid, DepStatus> }` where `DepStatus` is Confirmed, Refused, Foreign or Unclaimed. It replaces the 27 `RewriteResult` sets, `merge_group_delta` and most of `confirm()`. The "driver" rules for pdm/vlt/uv/sbt become `drives()`. {{E31}}: tracking #1075, step 1 (one report map, mechanical) is #1076.
 3. **Finish one codec per format** in `formats/`, in this order:
    - package-lock (4 walks → 1, indent-preserving);
    - yarn (five `split("\n\n")` sites → `scan_blocks`);

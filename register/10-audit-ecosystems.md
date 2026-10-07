@@ -1,5 +1,5 @@
 ### Ecosystems and formats (`audit-ecosystems`)
-_Last updated 2026-10-07T17:49Z · main @ 431b818 (October 7 reconciliation; duplicate rows merged)_
+_Last updated 2026-10-07T18:54Z · main @ 05ecc6e_
 
 | ID | P | Problem | Source | Issues | Status |
 |---|:-:|---|---|---|---|
@@ -32,7 +32,7 @@ _Last updated 2026-10-07T17:49Z · main @ 431b818 (October 7 reconciliation; dup
 | E28 | 2 | Dead vendored scaffolding: one-variant `VendorSource`/`PackageSource`, an unreachable `SERVICE_ECOSYSTEMS` refusal, `ServicePolicy::new` ignoring its config, an unused `vend_installed!`. | 5.6; R11 | #800, #746 | filed #800, #746 |
 | E29 | 3 | `registry_fetch.rs` (1.5K lines) is really archive extraction, integrity checks and the hosted-restore HTTP client, so it is misnamed and in the wrong place. | 5.6 | #1012 | filed #1012; archive + Go module zip move; integrity (after #834) and registry bases (after #876) remain |
 | E30 | 2 | Split `redirect/mod.rs` (21.9K lines at `db83f01`: 7.6K prod, 14.3K inline tests) mechanically: `model`, `driver`, one file per ecosystem, `hosted_url`, sibling test files. | 3.7 #1 | #1010, #1011 | filed #1010, #1011; tracking #1010, child 1 #1011 (inline tests out) |
-| E31 | 2 | Tracking: `trait HostedRewriter` + `Outcome { per_dep }`. It replaces the 27 uuid sets in `RewriteResult` (20 at review), `merge_group_delta`, the 16-rule `confirm()` and eight parallel tables. | 2.1; 3.7 #2 | | to verify; 27 sets counted at `1c6c509`, no tracking issue yet |
+| E31 | 2 | Tracking: `trait HostedRewriter` + `Outcome { per_dep }`. It replaces 27 `RewriteResult` uuid sets, `merge_group_delta` and the 25-outcome `confirm()`. | 2.1; 3.7 #2 | #1075, #1076 | filed #1075, #1076; tracking #1075, child 1 #1076 (one report map, mechanical) |
 | E32 | 2 | There are two hosted orchestrators, disk (`run_redirect_selected`) and in-memory (`hosted/memory`), kept equal by parity tests. Target: one pipeline. Depends on E44. | 3.3; 3.7 #4 | | to verify |
 | E33 | 3 | Upstream restore rebuilds originals from the network (~8.8K production lines at `1c6c509`, ignores mirrors, re-pins integrity from the registry: B72). Target: an originals sidecar or a narrowed restore. Depends on E45. | 2.3; 3.5 | | to verify |
 | E34 | 3 | Per-PM auto-config costs more than it's worth: npm `allow-remote` (~900 lines re-implementing npm config), pnpm `trustLockfile`, the vlt warm-tree heal, and the unbenchmarked parallel rewriter groups. | 3.6; 3.7 #7 | #782 | to verify; dead vlt ledger helpers in #782 (E58) |
@@ -64,28 +64,29 @@ _Last updated 2026-10-07T17:49Z · main @ 431b818 (October 7 reconciliation; dup
 | E66 | 2 | Vendored Poetry picks its forward splicer by line ending (CRLF/legacy: `utils::poetry_lock`; LF 2.x: `toml_surgery` scanner); different `files` shapes, and only the engine checks wheel name and digest case (executed twice). | new finding; 5.4 | #936 | filed #936 |
 | E68 | 2 | Vendored gem: forward treats any Gemfile containing the copy path as wired, revert needs the exact recorded line, and records revert non-atomically: a trailing comment leaves the lock restored and the Gemfile on `path:`, drift-keeping forever (executed 3×). Same class as #977. | new finding; 5.3 | #988 | filed #988 |
 | E69 | 2 | "Is this an sbt/Mill/scala-cli build" is six marker lists (#690); a scala-cli dir with only `.scala-build` or an sbt root with only `project/build.properties` gets no Coursier roots (executed twice). | new finding | #1014 | in PR #1032; defects A and B, the `.mill-version` rule remains |
-| E70 | 1 | The vendored→hosted takeover reverts first and plans later (six pre-gates): a refused rewrite leaves the package patched in neither mode; the disk write isn't transactional (B14); the memory takeover list drifts (B15); `--dry-run` counts every takeover as redirected (B37). | audit B03, B14, B15, B37 | #945, #723 | in PR #1039; dry-run residuals #668, #744, #891, #979 open |
+| E70 | 1 | The vendored→hosted takeover reverts first and plans later: a refused rewrite leaves the package patched in neither mode; the disk write isn't transactional (B14); the memory list drifts (B15); `--dry-run` counts every takeover (B37). | audit B03, B14, B15, B37 | #945, #723 | in PR #1039; dry-run residuals #668, #744, #891, #979 open |
 | E71 | 1 | The supersede/re-pin lifecycle has no owned-pin generation model: an older uuid's vendored entry, Cargo registry block, Go go.sum pair or Maven `-socket.<hex8>` repository survives a re-pin or remove. | audit B07 | #999, #864, #682, #266 | in PR #1035; #954 in #1008, #742/#650 in #943 |
 | E72 | 1 | VEX attests `not_affected` from wiring the package manager doesn't consume: yarn Plug'n'Play loaders, pnpm bundled copies and deno.lock npm copies. | audit B04, B05 | #519, #406 | in PR #1033; Maven `integrity_required = false` waits on E46 |
 | E73 | 2 | "Is this hosted patch pinned" is decided four ways (`confirm`, `mark_pinned`, `memory_recorded`, discovery); lockless NuGet/Cargo pins are attested in-run, then reported contested forever with a looping remedy. | audit B13, B58 | #567, #260 | in PR #1058; lockless pins wait on E45 |
-| E74 | 2 | "Is this vendored entry still in use" has four answers; gem, golang, composer, nuget, maven/jvm and non-requirements pypi entries are never pruned and scan resurrects them; JVM orphans are invisible unless the ledger is empty; legacy Maven/NuGet "wired" is a substring check. | audit B19, B61, B62 | | in PR #1050 |
+| E74 | 2 | "Is this vendored entry still in use" has four answers; six ecosystems' entries are never pruned and scan resurrects them; JVM orphans are invisible unless the ledger is empty; legacy Maven/NuGet "wired" is a substring check. | audit B19, B61, B62 | | in PR #1050 |
 | E75 | 2 | Which lockfile governs installs is decided in ≥8 places; vendored and hosted patch different PyPI locks and a takeover restores the losers unpatched. | audit B31 | #612 | in PR #1044; vlt and Pipenv precedence policy needs a maintainer call |
 | E76 | 2 | Hosted yarn classic replaces `file:`, URL and codeload copies with the Socket artifact and rollback corrupts the key; there is no shared copy-source classifier. | audit B16 | | in PR #1057 |
 | E77 | 2 | JVM layout is spelled in ~13 places with two coordinate grammars; `--ecosystems maven` skips `jvm` ledger entries (B17); `service_preflight` grants downloads the backend then skips (B18); sbt roots with only `project/build.properties` get no crawl (B65). | audit B17, B18, B65 | #1014 | in PR #1032 |
 | E78 | 1 | pnpm readers and writers ignore `---`, so a two-document pnpm 11+ lock gets the wrong document edited and success reported. | audit B06 | #466 | in PR #1007 (pnpm workstream) |
 | E79 | 2 | Hosted mode meeting a vendored package has 4+ outcomes per ecosystem (auto-takeover, refusal, Composer rewrites in place, NuGet `socket-patch-<uuid>` key collision). Target: one pre-rewrite decision. Depends on C34. | audit B30 | #536 | filed #536 |
 | E80 | 3 | The gitignore guard for vendored artifacts covers npm and sbt/Coursier only; Maven `.jar` and NuGet `.nupkg` are dropped by stock templates. | audit B32 | #1061, #620 | filed #1061, #620 |
-| E81 | 2 | Go writers ignore `go.work` and `go env -w`, and leave a read-only module-cache copy on Windows. | audit B34 | #458, #393, #531, #343, #344, #391, #392, #549, #618, #346 | filed #458, #393, #531, #343, #344, #391, #392, #549, #618, #346 |
+| E81 | 2 | Go writers ignore `go.work` and `go env -w`, and leave a read-only module-cache copy on Windows. | audit B34 | #458, #393, #531, #343, #344, #391, #392, #549, #618, #346 | filed #458 and 9 symptom issues |
 | E82 | 2 | Cargo dual-source registries and a user's own `[patch.crates-io]` aren't modelled. | audit B35 | #480, #506, #679, #863 | filed #480, #506, #679, #863 |
-| E83 | 3 | The Maven reactor re-implements the effective POM (properties, BOM imports, parents, profiles). | audit B36 | #459, #488, #513, #535, #550, #584, #622, #655 | filed #459, #488, #513, #535, #550, #584, #622, #655; Maven is lower priority (maintainer triage) |
+| E83 | 3 | The Maven reactor re-implements the effective POM (properties, BOM imports, parents, profiles). | audit B36 | #459, #488, #513, #535, #550, #584, #622, #655 | filed #459 and 7 symptom issues; Maven is lower priority (maintainer triage) |
 | E84 | 2 | Composer vendor-dir and global-home resolution ignore the global config and the XDG home. | audit §5 | #439, #586 | filed #439, #586 |
 | E85 | 3 | Hosted NuGet forward and restore write `packages.lock.json` with LF, 2-space and no BOM; every other hosted JSON writer keeps the layout. | audit B59 | #1068, #623 | filed #1068 |
 | E86 | 3 | Vendored JVM fetches upstream artifacts and checksums only from Central or `SOCKET_MAVEN_REGISTRY`, ignoring mirrors and the build's repositories. | audit B63 | #1069 | filed #1069 |
 | E87 | 2 | VEX product detection has no Gradle or sbt probe, and `scan --vex` resolves the product only after writing. | audit B64 | #1064 | filed #1064 |
 | E88 | 3 | Small duplicates: hosted patch origins, max-severity ordering, "ecosystem filter is empty", and the inventory matching vendored-router refusal-code strings (#975). | audit §3.A, §3.B | #975 | to verify |
+| E89 | 3 | Pure-wheel rule written 4× (inventory and recovery skip `wheel_platform_from_filename`); recovery's uv.lock scanner pairs a hashless pure wheel with another wheel's hash (executed twice). | new finding | #1079 | filed #1079 |
 
 **Handed off:** none yet.
 
 **Rejected / not a defect:** E02, in part: the `bun.lockb` format-1 URL synthesized at `bun_lockb.rs:235` is lock semantics and never fetched; the duplicate spellings were folded into #562.
 
-**Already fixed:** none; every fixed row was fixed after it was filed.
+**Already fixed:** none.

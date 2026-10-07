@@ -2,7 +2,7 @@
 
 ## Part 6: Discovery, inventory and VEX
 
-_Last checked against main @ 431b818 on 2026-10-07 by the October 7 reconciliation (extractor count and the false-attestation backlog re-checked; this part does not yet cover the JVM-cache crawl or `formats::registry`). Earlier: `db83f01` by audit-ecosystems (6.6 JVM crawler build-tool markers and npm alias discovery re-checked at `db83f01`; 6.4 layering inversion and the Bundler lock rule re-checked at `9c43dfc`; 6.5 `vex_consumed.rs` and npm alias discovery as of `4646693`; as of `045d7ec`: gem lock selection, the go.mod row, 6.4 dead code and the product probe table re-checked). Owner: `audit-ecosystems`._
+_Last checked against main @ 05ecc6e on 2026-10-07 by audit-ecosystems (PyPI pure-wheel selection in `lock_inventory` and ledger recovery checked for E89). Earlier: `431b818` by the October 7 reconciliation (extractor count and the false-attestation backlog re-checked; this part does not yet cover the JVM-cache crawl or `formats::registry`). Earlier: `db83f01` by audit-ecosystems (6.6 JVM crawler build-tool markers and npm alias discovery re-checked at `db83f01`; 6.4 layering inversion and the Bundler lock rule re-checked at `9c43dfc`; 6.5 `vex_consumed.rs` and npm alias discovery as of `4646693`; as of `045d7ec`: gem lock selection, the go.mod row, 6.4 dead code and the product probe table re-checked). Owner: `audit-ecosystems`._
 
 > Scope: `vex/**` (incl. `vex/discover/*`), `crawlers/**`, `formats/**`, `vendor/lock_inventory/*`, and the CLI consumers `vex.rs`, `vex_sources.rs`, `vex_consumed.rs`, `scan/discovery.rs`, `context.rs`, `list.rs`, `ecosystem_dispatch.rs`.
 
@@ -167,6 +167,7 @@ cli: ProjectContext owns ONE Inventory; one EmbeddedVex helper
 
 - {{E72}} October 7: VEX attested over yarn Plug'n'Play loaders, pnpm bundled copies and deno.lock npm copies (#519, #406; PR #1033).
 - {{E87}} Product detection has no Gradle or sbt probe, and `scan --vex` resolves the product only after writing.
+- {{E89}} The pure-wheel rule is written four times: lock inventory and ledger recovery use `ends_with("-none-any.whl")` instead of the shared `wheel_platform_from_filename` (so the #1053 fix won't reach them), and recovery re-parses the uv.lock unit with a string scanner that paired a hashless pure wheel with the next wheel's hash (executed twice).
 
 - One rule now picks the live Bundler lock: lock inventory and VEX discovery follow Bundler's loaded pair (`gems.rb` → `gems.locked`, a stale `Gemfile.lock` twin ignored), as hosted, vendored and the crawler do through `LoadedManifest::pair` (#750). {{E56}}
 
