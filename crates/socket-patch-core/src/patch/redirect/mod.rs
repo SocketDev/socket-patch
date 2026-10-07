@@ -3660,7 +3660,8 @@ fn rewrite_yarn_classic(
                 detail: format!("no yarn.lock entry resolving {fname}@{}", dep.version),
             });
         }
-        any_pinned |= matched_any;
+        // A mirror-refused entry carries no hosted pin.
+        any_pinned |= matched_any && mirror_refusal.is_none();
     }
     // Yarn 2+ (berry) migrates a classic lock on install and re-resolves
     // every entry from the registry, dropping the hosted pins this lock now
@@ -9990,6 +9991,31 @@ mod tests {
                 w.detail
             );
         }
+    }
+
+    /// An offline mirror refuses every pin (#364), so nothing is pinned and
+    /// there is no hosted pin for a berry install to drop: the refusal is
+    /// the only warning. A vendored-to-hosted takeover reports a retracted
+    /// purl's first warning as its cause, which must be the mirror.
+    #[test]
+    fn yarn_classic_offline_mirror_refusal_skips_the_berry_risk_warning() {
+        let ovr = npm_override(
+            "left-pad",
+            "1.3.0",
+            "http://p.test/lp.tgz",
+            "sha512-PATCHED==",
+        );
+        let mut files = classic_files(Some(r#"{"name":"p"}"#));
+        files.insert(
+            YARNRC_REL.to_string(),
+            "yarn-offline-mirror \"./mirror\"\n".to_string(),
+        );
+        let mut r = RewriteResult::default();
+        rewrite_yarn_classic(&files, std::slice::from_ref(&ovr), &mut r);
+        assert!(r.files.is_empty() && r.edits.is_empty(), "{:?}", r.edits);
+        assert!(r.refused_yarn_classic_uuids.contains(&ovr.patch_uuid));
+        let codes: Vec<&str> = r.warnings.iter().map(|w| w.code.as_str()).collect();
+        assert_eq!(codes, ["redirect_yarn_classic_offline_mirror"], "{codes:?}");
     }
 
     /// #907: a corepack `packageManager: yarn@1…` pin makes a stray berry
