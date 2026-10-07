@@ -17,6 +17,7 @@ use crate::crawlers::python_crawler::canonicalize_pypi_name;
 use crate::manifest::schema::PatchRecord;
 use crate::patch::apply::{ApplyResult, PatchSources};
 use crate::utils::fs::{atomic_write_artifact, read_regular_to_string};
+use crate::utils::group_commit::{self, GroupCommit};
 use crate::utils::purl::{parse_pypi_purl, strip_purl_qualifiers};
 use crate::utils::socket_dir::remove_tree_and_prune;
 use crate::utils::toml_edit_ext::has_table;
@@ -1243,6 +1244,26 @@ pub async fn vendor_pypi_with_pipenv_version<'a>(
         return done(result, None, warnings);
     }
     if dry_run {
+        // A superseding re-vendor fails on the wet run when the older
+        // wiring drifted, a wiring path is unsafe, or the restored files
+        // refuse a fresh plan: run that unwind now, in memory only.
+        if let WiringPlan::Supersede(superseded) = &plan {
+            if let Err((code, detail)) = probe_supersede(
+                project_root,
+                flavor,
+                superseded,
+                &canon_name,
+                version,
+                &record.uuid,
+            )
+            .await
+            {
+                let mut result = result;
+                result.success = false;
+                result.error = Some(format!("{code}: {detail}"));
+                return done(result, None, warnings);
+            }
+        }
         return done(result, None, warnings);
     }
     let Some(artifact) = artifact else {
@@ -1669,6 +1690,38 @@ async fn restore_snapshot(project_root: &Path, snapshot: &Snapshot, detail: &mut
             unrestored.join(", ")
         ));
     }
+}
+
+/// Dry-run [`unwire_superseded`]: the same unwind and fresh plan, inside a
+/// throwaway group commit that is dropped unwritten, so `--dry-run` reports
+/// the refusal the wet run would hit. Every file it touches is a captured
+/// commit point (never under `.socket/`); a successful unwind is restored
+/// too, so an enclosing group (the takeover probe) is left as it was.
+async fn probe_supersede(
+    project_root: &Path,
+    flavor: PypiFlavor,
+    superseded: &Superseded,
+    canon_name: &str,
+    version: &str,
+    uuid: &str,
+) -> Result<(), (&'static str, String)> {
+    let captured = superseded_files(&superseded.prev, flavor)
+        .is_some_and(|files| files.iter().all(|f| group_commit::captures(f)));
+    if !captured {
+        let (code, detail) = &superseded.refusal;
+        return Err((
+            code,
+            format!(
+                "{detail} (re-vendoring over patch {}'s wiring failed: unsafe wiring path)",
+                superseded.prev.uuid
+            ),
+        ));
+    }
+    let _probe = GroupCommit::begin(project_root);
+    let (_, snapshot, _) =
+        unwire_superseded(project_root, flavor, superseded, canon_name, version, uuid).await?;
+    restore_snapshot(project_root, &snapshot, &mut String::new()).await;
+    Ok(())
 }
 
 /// Unwind a superseded older uuid's wiring (#742, #650) and plan this uuid
@@ -6264,6 +6317,15 @@ wheels = [
         sources: &PatchSources<'_>,
         uuid: &str,
     ) -> VendorOutcome {
+        vendor_six_as_opts(fx, sources, uuid, false).await
+    }
+
+    async fn vendor_six_as_opts(
+        fx: &E2eFixture,
+        sources: &PatchSources<'_>,
+        uuid: &str,
+        dry_run: bool,
+    ) -> VendorOutcome {
         let mut record = fx.record.clone();
         record.uuid = uuid.to_string();
         crate::vendor::test_support::vendor_pypi(
@@ -6273,7 +6335,7 @@ wheels = [
             &record,
             sources,
             "2026-06-09T00:00:00Z",
-            false,
+            dry_run,
             false,
             None,
         )
@@ -6300,6 +6362,30 @@ wheels = [
             let first = entry.expect("entry on success");
             assert_eq!(first.flavor.as_deref(), Some(flavor));
             save_ledger_entry(&fx.root, &first).await;
+
+            // A dry run previews the re-vendor and writes nothing.
+            let mut wired_a = Vec::new();
+            for (name, _) in &files {
+                wired_a.push(tokio::fs::read(fx.root.join(name)).await.unwrap());
+            }
+            let outcome = vendor_six_as_opts(&fx, &sources, SUPERSEDING_UUID, true).await;
+            let VendorOutcome::Done { result, .. } = &outcome else {
+                panic!("{flavor}: dry run must preview the re-vendor, got {outcome:?}");
+            };
+            assert!(result.success, "{flavor}: dry run: {:?}", result.error);
+            for ((name, _), bytes) in files.iter().zip(&wired_a) {
+                assert_eq!(
+                    &tokio::fs::read(fx.root.join(name)).await.unwrap(),
+                    bytes,
+                    "{flavor}: dry run left {name} untouched"
+                );
+            }
+            assert!(
+                !fx.root
+                    .join(format!(".socket/vendor/pypi/{SUPERSEDING_UUID}"))
+                    .exists(),
+                "{flavor}: dry run created no uuid dir"
+            );
 
             let outcome = vendor_six_as(&fx, &sources, SUPERSEDING_UUID).await;
             let VendorOutcome::Done { result, entry, .. } = outcome else {
@@ -6384,18 +6470,24 @@ wheels = [
                 "{flavor}: the drift must touch a wired file"
             );
 
-            let outcome = vendor_six_as(&fx, &sources, SUPERSEDING_UUID).await;
-            let failed = match &outcome {
-                VendorOutcome::Refused { .. } => true,
-                VendorOutcome::Done { result, .. } => !result.success,
-            };
-            assert!(failed, "{flavor}: expected a refusal, got {outcome:?}");
-            for (name, text) in &drifted {
-                assert_eq!(
-                    &tokio::fs::read_to_string(fx.root.join(name)).await.unwrap(),
-                    text,
-                    "{flavor}: {name} untouched"
+            // The dry run reports the refusal the wet run hits.
+            for dry_run in [true, false] {
+                let outcome = vendor_six_as_opts(&fx, &sources, SUPERSEDING_UUID, dry_run).await;
+                let failed = match &outcome {
+                    VendorOutcome::Refused { .. } => true,
+                    VendorOutcome::Done { result, .. } => !result.success,
+                };
+                assert!(
+                    failed,
+                    "{flavor} dry_run={dry_run}: expected a refusal, got {outcome:?}"
                 );
+                for (name, text) in &drifted {
+                    assert_eq!(
+                        &tokio::fs::read_to_string(fx.root.join(name)).await.unwrap(),
+                        text,
+                        "{flavor} dry_run={dry_run}: {name} untouched"
+                    );
+                }
             }
             assert!(
                 !fx.root
