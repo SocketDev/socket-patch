@@ -469,12 +469,16 @@ pub async fn read_candidate_files(
     {
         out.read(view, unreadable, "package.json").await;
     // Otherwise the root manifest's `overrides` decide which git / url /
-    // `file:` dependent specs npm really installs from (#490). Only the npm
-    // lock rewriter reads it, as advisory input: no rewriter edits it, so a
-    // link or an unreadable in-memory entry is left out (the rewriter then
-    // keeps its conservative reading) rather than refused.
+    // `file:` dependent specs npm really installs from (#490), and beside a
+    // classic `yarn.lock` its `packageManager` says whether a yarn 2+ install
+    // could migrate the lock and drop the hosted pins (#907). The npm lock
+    // and yarn classic rewriters read it as advisory input only: no
+    // rewriter edits it, so a link or an unreadable in-memory entry is left
+    // out (the rewriters then keep their conservative reading) rather than
+    // refused.
     } else if candidates.iter().any(|c| c.dep.ecosystem == "npm")
-        && NPM_LOCKS.iter().any(|lock| out.files.contains_key(*lock))
+        && (NPM_LOCKS.iter().any(|lock| out.files.contains_key(*lock))
+            || out.files.contains_key("yarn.lock"))
     {
         let rel = crate::hosted::memory::select::NPM_MANIFEST_REL;
         if let Some(text) = read_advisory(view, unreadable, rel).await {
