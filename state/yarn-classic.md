@@ -1,6 +1,6 @@
 [agent] Progress ledger for the scheduled Yarn classic (1.x) bug-hunt routine (label pm:yarn-classic).
 
-Last updated: 2026-10-07 (run 26), main `9c43dfc`, latest release v4.0.0. Runs 5–26 added the cells in "Run 5 cells" through "Run 26 cells" below. The project-mode matrix below was measured on `f6b7fb9` (v4); cells marked "(v5)", the global matrix and the "v5 project-mode cells" list were re-run on v5.
+Last updated: 2026-10-07 (run 27), main `9c43dfc`, latest release v4.0.0. Runs 5–27 added the cells in "Run 5 cells" through "Run 27 cells" below. The project-mode matrix below was measured on `f6b7fb9` (v4); cells marked "(v5)", the global matrix and the "v5 project-mode cells" list were re-run on v5.
 
 ## Coverage matrix
 
@@ -9,7 +9,7 @@ Cells are "pass", "fail #N", "n/a", "CI" or "untested". H = hosted, V = vendored
 | OS | yarn | H baseline | H offline mirror | H/V git dep (`git+…`) | H/V multi-version workspaces + scoped | H⇄V takeover + rollback | H/V CRLF lock + rollback | V baseline | V offline mirror (+pruning, rollback) | A apply + setup |
 | --- | --- | --- | --- | --- | --- | --- | --- | --- | --- | --- |
 | Linux | 1.0.2 | pass | n/a (yarn limitation) | H pass (run 20, #363 fixed) | H pass | untested | H pass (run 16) | n/a (yarn ≤1.6 can't install `file:` tarballs) | n/a | pass |
-| Linux | 1.1.0 / 1.2.1 / 1.4.0 (run 26) | pass | untested | untested | H pass (run 26) | H→V→H pass (V n/a ≤1.6) | H pass (run 26) | n/a (yarn ≤1.6) | n/a | untested |
+| Linux | 1.1.0 / 1.2.1 / 1.4.0 (run 26) | pass | untested | untested | H pass (run 26) | H→V→H pass (V n/a ≤1.6) | H pass (run 26) | n/a (yarn ≤1.6) | n/a | pass (run 27) |
 | Linux | 1.3.2 / 1.5.1 (run 23, 26) | pass | untested | untested | H pass (run 26) | H→V→H pass (V n/a ≤1.6) | H pass (run 26) | n/a (yarn ≤1.6) | n/a | pass |
 | Linux | 1.6.0 | pass | n/a (yarn limitation) | untested | H pass | untested | H pass (run 16) | n/a (yarn ≤1.6) | n/a | pass (run 17) |
 | Linux | 1.7.0 | CI | fail #364 (`--offline`) | pass (run 20, #363 fixed; V git-only: #857) | pass | pass (run 16) | pass (run 16) | pass | untested | pass (run 17) |
@@ -186,13 +186,20 @@ Other cells that pass on Linux 1.22.22 (some also on older releases; see the ent
 - `npm:` self-alias copy (`"lp": "npm:left-pad@1.3.0"`) beside a direct `left-pad@1.3.0`: H pins the direct block, warns `redirect_yarn_classic_alias_skipped` and vex refuses (no attestation); V wires both blocks and both install patched; vex attests: pass (1.22.22).
 - Agent `rollback packages/a` with nested copies in `a` and `b` rolls back both: documented (CLI_CONTRACT "Path-scoped scans": a selected purl is handled with all its copies).
 
+### Run 27 cells (`9c43dfc`)
+- **Git merge of two branches that each vendored a different package, `state.json` resolved with `--ours` / `--theirs`: fail #991.** `vendor --check` and `rollback` exit 0 while the other package stays wired. Rollback deletes the ledger, which strands that package (later rollback / re-vendor refuse with an inapplicable "restore from version control" remedy). 1.7.0 / 1.10.1 / 1.22.22 ×2. A manual JSON union of `entries`: pass. The conflicted ledger fails loudly everywhere except `list` (stderr warning, exit 0).
+- Upgrade path, v4.0.0-written hosted / vendored state operated by main (list, vex, check, re-scan, takeover, rollback, frozen install): pass (1.22.22).
+- Agent apply + vex + rollback on 1.1.0 / 1.2.1 / 1.4.0: pass.
+- PR #976 fixes #974 on x64 + arm64 Alpine (Node 18 / 22, yarn 1.7.0 / 1.22.22, local + global) (probe run 37582882236). PR #978 would drop the yarn-1 PnP diagnosis under an ancestor `.yarnrc.yml` `nodeLinker` or `YARN_NODE_LINKER` (commented on #975).
+
 ## Backlog
 
-1. Re-check #974 once the wrapper changes (also arm64 Alpine, and `yarn global add` on Alpine). Re-check once merged: #938 (PR #940, verified run 25), #921 / #857 (PR #924, #921 verified run 25), #884 (PR #901, verified run 22; also covers the positional PATH form), #364 (PR #839), #831 (PR #837), #907 (PR #917), #778 (yarn classic nested copies, run 25), plus #828's yarn git-sibling shape. Then #467 / #519 / #558 / #591 / #691 / #692 / #758.
+1. Re-check #991 on npm / pnpm vendored, and hand it over if it's family-wide. Re-check #974 once PR #976 merges (verified run 27), and #975's yarn-1 PnP cell once PR #978 merges. Re-check once merged: #938 (PR #940, verified run 25), #921 / #857 (PR #924, #921 verified run 25), #884 (PR #901, verified run 22; also covers the positional PATH form), #364 (PR #839), #831 (PR #837), #907 (PR #917), #778 (yarn classic nested copies, run 25), plus #828's yarn git-sibling shape. Then #467 / #519 / #558 / #591 / #691 / #692 / #758.
 2. #857 on PR #924 (vendored git-only dep; needs a git dep, which worked in run 20 via github.com).
 3. npm-workspace analogue of the #778 nested-copy scope miss (hand over to npm if it reproduces). Also `rollback <PATH>` / `--sync <PATH>` / `--prune <PATH>` on the same yarn layout.
 4. #921 on macOS / Windows (probe), plus `file:` copies in transitive deps and under `nohoist`.
-5. `bitbucket:` / `gitlab:` shorthands (needs a package mirrored there).
+5. Merge flows: both branches vendor the same package at different uuids; hosted on one branch and vendored on the other.
+10. `bitbucket:` / `gitlab:` shorthands (needs a package mirrored there).
 6. Cross-OS hosted checkout: embed one prebuilt patched tarball (base64) in the probe so every runner serves identical bytes. Add workspaces to the cross-OS vendored probe.
 7. #758 follow-ups: a real registry package with `bundledDependencies`.
 8. **Maintainer request (global mode), what's left:** the Windows MSI install of yarn, and a read-only prefix on Windows with a non-admin user. #437 (1.0.x) is still open. macOS case-insensitive name collisions.
@@ -286,3 +293,7 @@ Other cells that pass on Linux 1.22.22 (some also on older releases; see the ent
 - `rollback <PATH>` / agent `scan <PATH>` select at purl level: every copy of a selected package is handled, even copies outside the PATH (CLI_CONTRACT "Path-scoped scans"). Only the *zero-selection* miss is #778.
 - Hosted rollback in the sandbox needs `SOCKET_NPM_REGISTRY=http://127.0.0.1:<port>` with a plain-HTTP passthrough to registry.npmjs.org (python `urllib` with `/root/.ccr/ca-bundle.crt`) and `HTTPS_PROXY` unset. The restored `resolved` then reads registry.npmjs.org + an `integrity` line, so compare by a post-rollback frozen install, not `cmp`.
 - The sandbox has a docker CLI but no daemon, and dl-cdn.alpinelinux.org / unofficial-builds.nodejs.org are blocked. Use a probe branch with `docker run node:22-alpine` for musl cells.
+- Leftover probe branch (deletion blocked): `bughunt/yarn-classic/20261007-musl-pr976`.
+- Probe harness: `cp` from a read-only bind mount drops the exec bit on busybox, so overlay files with `cat src > dst` to keep the mode.
+- v4.0.0 has no `scan --package` and no `vendor --check`. Its vendored state (manifest + ledger) and hosted `redirect-state.json` are read correctly by main (run 27).
+- Run-27 mock: the `mock.py` multi-package variant (`mock.py <port> <left-pad tgz> [<is-number tgz>]`, one uuid per package, routes: batch / by-package / view / blob / package / artifacts). Use it with `SOCKET_PROXY_URL` + `SOCKET_PATCH_SERVER_URL` + `SOCKET_API_URL` pointed at the mock.
