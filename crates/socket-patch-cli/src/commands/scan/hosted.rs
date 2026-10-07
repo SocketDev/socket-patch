@@ -1593,10 +1593,11 @@ pub(crate) async fn run_redirect_selected(
 /// Write the hosted pins and commit `group` (see `run_redirect_selected`):
 /// the takeover's staged reverts, the pins and the vendored ledger reach
 /// the disk together. A file the group does not capture (the Gradle hosted
-/// index under `.socket/gradle/`, which only the captured settings line makes
-/// live) is written first, straight to disk. `Err` is the error line: on a failed
-/// commit nothing it captured was left changed, or an interrupted commit's
-/// journal is kept for the next locked command to finish.
+/// index and script under `.socket/gradle/`, which only the captured settings
+/// line makes live) is written first, straight to disk, and put back when a
+/// later step fails. `Err` is the error line: on a failed commit nothing was
+/// left changed, or an interrupted commit's journal is kept for the next
+/// locked command to finish.
 async fn commit_hosted_writes(
     common: &crate::args::GlobalArgs,
     group: socket_patch_core::utils::group_commit::GroupCommit,
@@ -1612,53 +1613,88 @@ async fn commit_hosted_writes(
         .chain(rewrite.binary_files.iter().map(|(p, b)| (p, b.as_slice())))
         .collect();
     // Uncaptured files first: the commit below is the step that makes the
-    // pins live.
+    // pins live. Each one's previous bytes are kept to put it back.
     let (staged, direct): (Vec<_>, Vec<_>) = files.into_iter().partition(|(rel, _)| captures(rel));
-    for (rel, content) in direct.into_iter().chain(staged) {
-        let path = common.cwd.join(rel);
-        if !captures(rel) {
-            if let Some(parent) = path.parent() {
-                std::fs::create_dir_all(parent)
-                    .map_err(|e| format!("failed to create the directory of {rel}: {e}"))?;
+    let mut written: Vec<(std::path::PathBuf, Option<Vec<u8>>)> = Vec::new();
+    let result = async {
+        for (rel, content) in direct.into_iter().chain(staged) {
+            let path = common.cwd.join(rel);
+            if !captures(rel) {
+                if let Some(parent) = path.parent() {
+                    std::fs::create_dir_all(parent)
+                        .map_err(|e| format!("failed to create the directory of {rel}: {e}"))?;
+                }
+                let previous =
+                    match socket_patch_core::utils::fs::read_regular_to_bytes(&path).await {
+                        Ok(bytes) => Some(bytes),
+                        Err(e) if e.kind() == std::io::ErrorKind::NotFound => None,
+                        Err(e) => {
+                            return Err(format!("failed to read {rel}: {e} (nothing was changed)"))
+                        }
+                    };
+                written.push((path.clone(), previous));
+            }
+            // Atomic stage+rename, mode-preserving (the vendored backend's
+            // writer); captured by the group until the commit.
+            socket_patch_core::utils::fs::atomic_write_bytes_preserving_mode(&path, content)
+                .await
+                .map_err(|e| format!("failed to write {rel}: {e} (nothing was changed)"))?;
+        }
+        if !takeover_migrated.is_empty() {
+            if let Ok(state) = vendor_state {
+                socket_patch_core::vendor::save_state(&common.cwd, state)
+                    .await
+                    .map_err(|e| {
+                        format!(
+                            "failed to update .socket/vendor/state.json: {e} (nothing was \
+                             changed: the vendored packages stay vendored)"
+                        )
+                    })?;
             }
         }
-        // Atomic stage+rename, mode-preserving (the vendored backend's
-        // writer); captured by the group until the commit.
-        socket_patch_core::utils::fs::atomic_write_bytes_preserving_mode(&path, content)
-            .await
-            .map_err(|e| format!("failed to write {rel}: {e} (no lockfile was changed)"))?;
+        Ok(())
     }
-    if !takeover_migrated.is_empty() {
-        if let Ok(state) = vendor_state {
-            socket_patch_core::vendor::save_state(&common.cwd, state)
-                .await
-                .map_err(|e| {
-                    format!(
-                        "failed to update .socket/vendor/state.json: {e} (nothing was \
-                         changed: the vendored packages stay vendored)"
-                    )
-                })?;
-        }
+    .await;
+    if let Err(e) = result {
+        put_back(&written).await;
+        return Err(e);
     }
     // A takeover's commit spans the project and the vendored ledger, so it
     // is journaled (`.socket/vendor/` is in use anyway). A hosted-only run
-    // writes nothing under `.socket/`: its files are replaced one by one
-    // and put back if one fails.
+    // writes nothing under `.socket/vendor/`: its files are replaced one by
+    // one and put back if one fails.
     let committed = if takeover_migrated.is_empty() {
         group.commit_unjournaled().await
     } else {
         group.commit().await
     };
-    committed.map(drop).map_err(|e| {
-        if is_pending(&e) {
-            format!(
-                "failed to write the hosted pins: {e} (the interrupted write is journaled; \
-                 the next socket-patch command finishes it)"
-            )
-        } else {
-            format!("failed to write the hosted pins: {e} (nothing was changed)")
+    match committed {
+        Ok(_) => Ok(()),
+        // The journal finishes the commit, which the direct writes belong to.
+        Err(e) if is_pending(&e) => Err(format!(
+            "failed to write the hosted pins: {e} (the interrupted write is journaled; \
+             the next socket-patch command finishes it)"
+        )),
+        Err(e) => {
+            put_back(&written).await;
+            Err(format!(
+                "failed to write the hosted pins: {e} (nothing was changed)"
+            ))
         }
-    })
+    }
+}
+
+/// Put the files [`commit_hosted_writes`] wrote straight to disk back to
+/// their previous bytes (removing the ones it created), best-effort.
+async fn put_back(written: &[(std::path::PathBuf, Option<Vec<u8>>)]) {
+    for (path, previous) in written.iter().rev() {
+        let _ = match previous {
+            Some(bytes) => {
+                socket_patch_core::utils::fs::atomic_write_bytes_preserving_mode(path, bytes).await
+            }
+            None => tokio::fs::remove_file(path).await,
+        };
+    }
 }
 
 // ── Human-output formatting ────────────────────────────────────────────────
