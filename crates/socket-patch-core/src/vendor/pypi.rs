@@ -617,43 +617,12 @@ async fn pipenv_stale_install_warning(
     listings: &InstalledSiteListings,
     lock: &serde_json::Value,
 ) -> Option<VendorWarning> {
-    use crate::crawlers::python_crawler::{find_local_venv_site_packages, PythonCrawler};
-    use crate::patch::apply::{verify_file_patch, VerifyStatus};
-    if record.files.is_empty() {
-        return None;
-    }
-    // Judged over the PROJECT'S venvs (VIRTUAL_ENV, ./.venv, ./venv, Pipenv's
-    // WORKON_HOME venv) — never the staging dir a lock-only vendor fetched
-    // the pristine wheel into, and never the global interpreters.
-    // The caller refused an unparseable purl long before this probe, so the
-    // lookup below is never the empty one `find_by_purls` short-circuits on.
-    let base = strip_purl_qualifiers(purl).to_string();
-    let crawler = PythonCrawler::new();
-    let mut stale_dirs: Vec<std::path::PathBuf> = Vec::new();
-    for site in find_local_venv_site_packages(project_root).await {
-        let listed = listings.of(&site).await;
-        let found = crawler.find_by_purls_listed(&site, &listed, std::slice::from_ref(&base));
-        if !found.contains_key(&base) {
-            continue;
-        }
-        if crate::vex::verify::verify_patch_record(&site, record)
-            .await
-            .is_ok()
-        {
-            continue;
-        }
-        for (file, info) in &record.files {
-            let result = verify_file_patch(&site, file, info).await;
-            if matches!(
-                result.status,
-                VerifyStatus::Ready | VerifyStatus::HashMismatch
-            ) && result.current_hash.is_some()
-            {
-                stale_dirs.push(site.clone());
-                break;
-            }
-        }
-    }
+    use crate::crawlers::python_crawler::non_hatch_local_venv_site_packages;
+    // Only the venvs Pipenv itself resolves: its remedy cannot clear an
+    // out-of-tree Hatch env (Hatch never reads Pipfile.lock, #335), while a
+    // venv the two share (`path = ".venv"`) is still Pipenv's and judged.
+    let sites = non_hatch_local_venv_site_packages(project_root).await;
+    let stale_dirs = stale_install_sites(&sites, purl, record, listings).await;
     if stale_dirs.is_empty() {
         return None;
     }
@@ -672,6 +641,95 @@ async fn pipenv_stale_install_warning(
             "{purl}: the UNPATCHED upstream release is still installed in {listed}. Pipenv does not reinstall a release that is already present (`pipenv install`, `pipenv install --deploy` and `pipenv sync` all keep those bytes), so the wired Pipfile.lock only protects fresh installs. {remedy}; then `socket-patch vex` re-verifies the installed files."
         ),
     ))
+}
+
+/// The Hatch twin of [`pipenv_stale_install_warning`]: Hatch keeps the
+/// upstream release installed in an existing env (#335), so each env that
+/// still holds it gets `pypi_hatch_stale_install` with the env-recreating
+/// remedy. Only Hatch's own envs are judged (an activated one included): a
+/// `./.venv` another tool made is not where `hatch run` installs.
+async fn hatch_stale_install_warning(
+    project_root: &Path,
+    purl: &str,
+    record: &PatchRecord,
+    listings: &InstalledSiteListings,
+) -> Vec<VendorWarning> {
+    use crate::crawlers::hatch_env::{environment_of, hatch_environments, stale_install_remedy};
+    let envs = hatch_environments(project_root).await;
+    if envs.is_empty() {
+        return Vec::new();
+    }
+    // Judged over Hatch's own envs only (an activated one is among them): a
+    // `./.venv` another tool made is not where `hatch run` installs.
+    let mut sites: Vec<std::path::PathBuf> = Vec::new();
+    for env in &envs {
+        sites.extend(crate::crawlers::python_crawler::hatch_env_site_packages(env).await);
+    }
+    stale_install_sites(&sites, purl, record, listings)
+        .await
+        .into_iter()
+        .filter_map(|site| {
+            let env = environment_of(&envs, &site)?;
+            Some(VendorWarning::new(
+                "pypi_hatch_stale_install",
+                format!(
+                    "{purl}: the UNPATCHED upstream release is still installed in the Hatch environment `{}` ({}). {}",
+                    env.name,
+                    site.display(),
+                    stale_install_remedy(&env.name)
+                ),
+            ))
+        })
+        .collect()
+}
+
+/// The `sites` that hold the package of `purl` with positive evidence of
+/// unpatched bytes (a readable file at the upstream or another hash), and no
+/// copy that verifies as patched.
+async fn stale_install_sites(
+    sites: &[std::path::PathBuf],
+    purl: &str,
+    record: &PatchRecord,
+    listings: &InstalledSiteListings,
+) -> Vec<std::path::PathBuf> {
+    use crate::crawlers::python_crawler::PythonCrawler;
+    use crate::patch::apply::{verify_file_patch, VerifyStatus};
+    if record.files.is_empty() {
+        return Vec::new();
+    }
+    // Judged over the PROJECT'S venvs (VIRTUAL_ENV, ./.venv, ./venv, Pipenv's
+    // WORKON_HOME venv) — never the staging dir a lock-only vendor fetched
+    // the pristine wheel into, and never the global interpreters.
+    // The caller refused an unparseable purl long before this probe, so the
+    // lookup below is never the empty one `find_by_purls` short-circuits on.
+    let base = strip_purl_qualifiers(purl).to_string();
+    let crawler = PythonCrawler::new();
+    let mut stale_dirs: Vec<std::path::PathBuf> = Vec::new();
+    for site in sites {
+        let listed = listings.of(site).await;
+        let found = crawler.find_by_purls_listed(site, &listed, std::slice::from_ref(&base));
+        if !found.contains_key(&base) {
+            continue;
+        }
+        if crate::vex::verify::verify_patch_record(site, record)
+            .await
+            .is_ok()
+        {
+            continue;
+        }
+        for (file, info) in &record.files {
+            let result = verify_file_patch(site, file, info).await;
+            if matches!(
+                result.status,
+                VerifyStatus::Ready | VerifyStatus::HashMismatch
+            ) && result.current_hash.is_some()
+            {
+                stale_dirs.push(site.clone());
+                break;
+            }
+        }
+    }
+    stale_dirs
 }
 
 /// Everything [`vendor_pypi_with_pipenv_version`] decides before it can
@@ -789,7 +847,17 @@ async fn pypi_prelude<'p>(
             }
         }
         PypiFlavor::Hatch => {
-            match super::pypi_hatch::load(project_root, &canon_name, version, &record.uuid).await {
+            let loaded =
+                super::pypi_hatch::load(project_root, &canon_name, version, &record.uuid).await;
+            // Both a fresh vendor and a re-run over already-wired
+            // dependencies keep warning while a Hatch env still holds the
+            // upstream release (#335). A refusal probes nothing.
+            if loaded.is_ok() {
+                warnings.extend(
+                    hatch_stale_install_warning(project_root, purl, record, installed_sites).await,
+                );
+            }
+            match loaded {
                 Ok(project) if project.in_sync => {
                     wired_pin = project.pin;
                     WiringPlan::InSync
@@ -2308,6 +2376,73 @@ mod tests {
             blobs,
             record,
         }
+    }
+
+    /// #335 review: Pipenv's remedy cannot clear a stale Hatch env (Hatch
+    /// never reads Pipfile.lock), so the Pipenv probe must not judge one;
+    /// the project's own venv still gets the warning.
+    #[tokio::test]
+    async fn pipenv_stale_install_skips_hatch_envs() {
+        let fx = e2e_fixture().await;
+        touch(
+            &fx.root,
+            "pyproject.toml",
+            "[project]\nname = \"proj\"\nversion = \"0.1.0\"\n\n[tool.hatch.envs.default]\npath = \".hatch-env\"\n",
+        )
+        .await;
+        let env = fx.root.join(".hatch-env");
+        let site = if cfg!(windows) {
+            env.join("Lib").join("site-packages")
+        } else {
+            env.join("lib").join("python3.12").join("site-packages")
+        };
+        tokio::fs::create_dir_all(site.join("six-1.16.0.dist-info"))
+            .await
+            .unwrap();
+        touch(&env, "pyvenv.cfg", "home = /usr/bin\n").await;
+        touch(&site, "six.py", std::str::from_utf8(ORIG).unwrap()).await;
+        touch(
+            &site.join("six-1.16.0.dist-info"),
+            "METADATA",
+            "Metadata-Version: 2.1\nName: six\nVersion: 1.16.0\n",
+        )
+        .await;
+        let lock: serde_json::Value = serde_json::from_str(
+            r#"{"_meta": {"pipfile-spec": 6}, "default": {"six": {"version": "==1.16.0"}}, "develop": {}}"#,
+        )
+        .unwrap();
+        let probe = || async {
+            pipenv_stale_install_warning(
+                &fx.root,
+                "pkg:pypi/six@1.16.0",
+                &fx.record,
+                &InstalledSiteListings::default(),
+                &lock,
+            )
+            .await
+        };
+        if !cfg!(windows) {
+            // The fixture's stale `./.venv` (POSIX layout) is still named.
+            let warning = probe().await.expect("the stale ./.venv is reported");
+            assert!(!warning.detail.contains(".hatch-env"), "{}", warning.detail);
+        }
+        // A Hatch env that is Pipenv's own `./.venv` stays Pipenv's to judge.
+        if !cfg!(windows) {
+            touch(
+                &fx.root,
+                "pyproject.toml",
+                "[project]\nname = \"proj\"\nversion = \"0.1.0\"\n\n[tool.hatch.envs.default]\npath = \".venv\"\n",
+            )
+            .await;
+            touch(&fx.root.join(".venv"), "pyvenv.cfg", "home = /usr/bin\n").await;
+            let warning = probe().await.expect("the shared ./.venv is reported");
+            assert!(warning.detail.contains(".venv"), "{}", warning.detail);
+        }
+        // With only the Hatch env stale, there is nothing for Pipenv to say.
+        tokio::fs::remove_dir_all(fx.root.join(".venv"))
+            .await
+            .unwrap();
+        assert!(probe().await.is_none());
     }
 
     /// #790: the vendored stale-install remedy re-syncs the lock category
@@ -5473,6 +5608,85 @@ wheels = [
         for (name, text) in files {
             touch(&fx.root, name, text).await;
         }
+    }
+
+    /// #335: Hatch keeps the upstream release in an existing env (pip, and
+    /// uv before Hatch 1.16, never reinstall it), so vendoring a Hatch
+    /// project — fresh and re-run in sync — must name each such env with
+    /// the `hatch env remove` remedy. A `./.venv` Hatch does not use stays
+    /// out of it; a patched env gets nothing.
+    #[tokio::test]
+    async fn hatch_vendor_warns_about_a_stale_hatch_env() {
+        let fx = e2e_fixture().await;
+        swap_to_lock_flavor(
+            &fx,
+            &[(
+                "pyproject.toml",
+                "[build-system]\nrequires = [\"hatchling\"]\nbuild-backend = \"hatchling.build\"\n\n[project]\nname = \"proj\"\nversion = \"0.1.0\"\ndependencies = [\"six==1.16.0\"]\n\n[tool.hatch.envs.default]\npath = \".hatch-env\"\n",
+            )],
+        )
+        .await;
+        let env = fx.root.join(".hatch-env");
+        let site = if cfg!(windows) {
+            env.join("Lib").join("site-packages")
+        } else {
+            env.join("lib").join("python3.12").join("site-packages")
+        };
+        tokio::fs::create_dir_all(site.join("six-1.16.0.dist-info"))
+            .await
+            .unwrap();
+        touch(&env, "pyvenv.cfg", "home = /usr/bin\n").await;
+        touch(&site, "six.py", std::str::from_utf8(ORIG).unwrap()).await;
+        touch(
+            &site.join("six-1.16.0.dist-info"),
+            "METADATA",
+            "Metadata-Version: 2.1\nName: six\nVersion: 1.16.0\n",
+        )
+        .await;
+
+        let stale = |warnings: &[VendorWarning]| -> Vec<String> {
+            warnings
+                .iter()
+                .filter(|w| w.code == "pypi_hatch_stale_install")
+                .map(|w| w.detail.clone())
+                .collect()
+        };
+        let VendorOutcome::Done {
+            result,
+            entry,
+            warnings,
+        } = vendor_six(&fx, &PatchSources::blobs_only(&fx.blobs), None).await
+        else {
+            panic!("vendor must be Done");
+        };
+        assert!(result.success, "{:?}", result.error);
+        crate::vendor::test_support::persist(&fx.root, "pkg:pypi/six@1.16.0", entry.unwrap()).await;
+        let details = stale(&warnings);
+        assert_eq!(details.len(), 1, "{warnings:?}");
+        assert!(
+            details[0].contains("hatch env remove default"),
+            "{}",
+            details[0]
+        );
+        assert!(details[0].contains("six.py") || details[0].contains("site-packages"));
+        assert!(!details[0].contains(".venv"), "{}", details[0]);
+
+        // The in-sync re-run keeps warning while the env is stale.
+        let VendorOutcome::Done { warnings, .. } =
+            vendor_six(&fx, &PatchSources::blobs_only(&fx.blobs), None).await
+        else {
+            panic!("re-run must be Done");
+        };
+        assert_eq!(stale(&warnings).len(), 1, "{warnings:?}");
+
+        // Once the env holds the patched bytes there is nothing to say.
+        touch(&site, "six.py", std::str::from_utf8(PATCHED).unwrap()).await;
+        let VendorOutcome::Done { warnings, .. } =
+            vendor_six(&fx, &PatchSources::blobs_only(&fx.blobs), None).await
+        else {
+            panic!("re-run must be Done");
+        };
+        assert!(stale(&warnings).is_empty(), "{warnings:?}");
     }
 
     /// One full vendor → revert cycle through `vendor_pypi` for a lock-splice

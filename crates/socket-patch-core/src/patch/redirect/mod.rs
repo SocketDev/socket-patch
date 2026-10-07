@@ -23,12 +23,12 @@ use regex::Regex;
 use serde::{Deserialize, Serialize};
 use serde_json::{json, Value};
 
+use crate::formats::yarn::berry_gates::{self, Yarnrc};
 use crate::utils::digest::is_hex64_lower;
 use crate::utils::line_endings::{to_lf, LineEndings};
 use crate::vendor::common::{parse_json_text, JsonLayout};
 use crate::vendor::lock_inventory::npm_legacy_identity;
 use crate::vendor::npm_origin::{legacy_packages_key, npm_non_registry_entries, NpmOverrides};
-use crate::vendor::yarn_berry_lock::yarnrc_compression_level;
 
 mod bun_binary;
 pub use bun_binary::{preflight_bun_binary, rewrite_bun_binary};
@@ -3760,31 +3760,15 @@ fn yarn_berry_tarball_url_ok(url: &str) -> bool {
         && (url.ends_with(".tgz") || url.ends_with(".tar.gz"))
 }
 
-/// Only cacheKey `10c0` (yarn 4, compressionLevel 0 default) has a checksum we
-/// can reproduce offline; matches the vendored backend's `SUPPORTED_CACHE_KEY`.
-const YARN_BERRY_SUPPORTED_CACHE_KEY: &str = "10c0";
-
-/// The `cacheKey:` value from the `__metadata` block (berry writes it unquoted:
-/// `  cacheKey: 10c0`), mirroring the vendored backend's `berry_field`.
-fn berry_cache_key(content: &str) -> Option<String> {
-    let meta = content.split("\n\n").find(|b| {
-        b.lines()
-            .next()
-            .is_some_and(|l| l.trim_end() == "__metadata:")
-    })?;
-    for line in meta.lines().skip(1) {
-        if let Some(rest) = line.strip_prefix("  cacheKey:") {
-            return Some(rest.trim().trim_matches('"').to_string());
-        }
-    }
-    None
-}
-
 /// The project-level refusals of the yarn berry hosted rewriter — the gates
 /// that hold for every dep of the lock, whatever the overrides: a MIXED
-/// line-ending lock, an unsupported `cacheKey`, and a `.yarnrc.yml`
-/// `compressionLevel` other than 0. `Ok` for a lock that is not berry (the
-/// classic rewriter owns those).
+/// line-ending lock or root `package.json` (`manifest`, the file the
+/// rewriter's `resolutions` land in), an unsupported `cacheKey`, and a
+/// `.yarnrc.yml` `compressionLevel` other than 0. The same
+/// [`berry_gates::check`] the vendored backend raises, under this mode's
+/// `redirect_yarn_berry_*` codes, so the two modes take one decision on the
+/// files both edit (#628). `Ok` for a lock that is not berry (the classic
+/// rewriter owns those).
 ///
 /// Exposed so the vendored→hosted mode takeover (`scan`/`get --mode hosted`
 /// over a vendored berry purl) can refuse BEFORE it reverts the vendored
@@ -3830,46 +3814,18 @@ pub fn preflight_yarn_berry_hosted_dep(dep: &DepOverride) -> Result<(), RewriteW
     })
 }
 
-pub fn preflight_yarn_berry_hosted(lock: &str, yarnrc: Option<&str>) -> Result<(), RewriteWarning> {
+pub fn preflight_yarn_berry_hosted(
+    lock: &str,
+    manifest: Option<&str>,
+    yarnrc: Option<&str>,
+) -> Result<(), RewriteWarning> {
     if !is_berry_lock(lock) {
         return Ok(());
     }
-    let body = lock.strip_prefix('\u{feff}').unwrap_or(lock);
-    if LineEndings::of(body) == LineEndings::Mixed {
-        return Err(RewriteWarning {
-            code: "redirect_yarn_berry_mixed_line_endings".into(),
-            detail: "yarn.lock mixes CRLF and LF line endings (or holds a bare carriage \
-                     return), so no single line ending can be kept, and yarn itself \
-                     rejects it under `--immutable` (YN0028) — run `yarn install` once to \
-                     normalize the lock, then re-run; leaving it untouched"
-                .into(),
-        });
-    }
-    // Refuse any lock whose cache checksum we can't reproduce
-    // offline. A guessed `checksum:` bricks installs (YN0018).
-    let key = berry_cache_key(&to_lf(body));
-    if key.as_deref() != Some(YARN_BERRY_SUPPORTED_CACHE_KEY) {
-        return Err(RewriteWarning {
-            code: "redirect_yarn_berry_cache_unsupported".into(),
-            detail: format!(
-                "yarn.lock cacheKey is `{}`; only `{YARN_BERRY_SUPPORTED_CACHE_KEY}` \
-                 (yarn 4, compressionLevel 0 default) has an offline-reproducible cache checksum",
-                key.as_deref().unwrap_or("(missing)")
-            ),
-        });
-    }
-    if let Some(level) = yarnrc.and_then(yarnrc_compression_level) {
-        if level != "0" {
-            return Err(RewriteWarning {
-                code: "redirect_yarn_berry_cache_unsupported".into(),
-                detail: format!(
-                    ".yarnrc.yml sets `compressionLevel: {level}`, which changes berry's \
-                     cache checksums; only compressionLevel 0 (the yarn 4 default) is supported"
-                ),
-            });
-        }
-    }
-    Ok(())
+    berry_gates::check(lock, manifest, Yarnrc::from_option(yarnrc)).map_err(|gate| RewriteWarning {
+        code: format!("redirect_yarn_berry_{}", gate.code_suffix()),
+        detail: gate.detail(),
+    })
 }
 
 /// The berry hosted pin without served manifests (every pin keeps the
@@ -3914,12 +3870,14 @@ fn rewrite_yarn_berry_with_manifests(
         Some(rest) => ("\u{feff}", rest),
         None => ("", raw.as_str()),
     };
-    // Project-level gates (line endings, cacheKey, compressionLevel), shared
-    // with the vendored→hosted takeover preflight so a takeover never
+    // Project-level gates (lock and manifest line endings, cacheKey,
+    // compressionLevel), shared with the vendored→hosted takeover preflight so a takeover never
     // reverts vendored wiring this rewriter then refuses.
-    if let Err(warning) =
-        preflight_yarn_berry_hosted(raw, files.get(".yarnrc.yml").map(String::as_str))
-    {
+    if let Err(warning) = preflight_yarn_berry_hosted(
+        raw,
+        files.get(BERRY_MANIFEST).map(String::as_str),
+        files.get(".yarnrc.yml").map(String::as_str),
+    ) {
         result.warnings.push(warning);
         // Nothing is verified, so nothing is confirmed — but a dep this lock
         // locks is still this rewriter's to decide: an earlier run's URL in
@@ -9726,6 +9684,46 @@ mod tests {
             assert!(out.contains(&want), "want {want:?} in:\n{out}");
             assert_eq!(out.matches("checksum:").count(), 1, "{out}");
         }
+    }
+
+    /// #628: a root `package.json` mixing CRLF and LF is refused untouched,
+    /// like a mixed lock and like vendored mode (`JsonLayout` would re-render
+    /// every minority line in the majority ending). A uniform CRLF manifest
+    /// is still rewritten in its own ending.
+    #[test]
+    fn berry_mixed_root_manifest_is_refused_untouched() {
+        let checksum = format!("10c0/{}", "7".repeat(128));
+        let ovr = berry_override("left-pad", "1.3.0", "http://p.test/lp.tgz", &checksum);
+        let mut files = BTreeMap::new();
+        files.insert("yarn.lock".to_string(), berry_lock("10c0"));
+        files.insert(
+            "package.json".to_string(),
+            "{\r\n  \"name\": \"app\",\n  \"version\": \"1.0.0\"\r\n}\r\n".to_string(),
+        );
+        let mut r = RewriteResult::default();
+        rewrite_yarn_berry(&files, std::slice::from_ref(&ovr), &mut r);
+        assert!(r.files.is_empty(), "nothing written: {:?}", r.files.keys());
+        assert_eq!(
+            r.warnings.first().map(|w| w.code.as_str()),
+            Some("redirect_yarn_berry_mixed_line_endings"),
+            "{:?}",
+            r.warnings
+        );
+        assert!(r.warnings[0].detail.contains("package.json"));
+        assert!(r.confirmed_yarn_berry_uuids.is_empty());
+
+        files.insert(
+            "package.json".to_string(),
+            "{\r\n  \"name\": \"app\",\r\n  \"version\": \"1.0.0\"\r\n}\r\n".to_string(),
+        );
+        let mut r = RewriteResult::default();
+        rewrite_yarn_berry(&files, std::slice::from_ref(&ovr), &mut r);
+        let manifest = r.files.get("package.json").expect("uniform CRLF rewritten");
+        assert_eq!(
+            LineEndings::of(manifest),
+            LineEndings::Crlf,
+            "kept CRLF: {manifest:?}"
+        );
     }
 
     #[test]
@@ -18189,13 +18187,13 @@ packages:
             classic_lock_two_entries().replacen("\n", "\r\n", 1),
         ] {
             assert_eq!(
-                preflight_yarn_berry_hosted(&ok, None).map_err(|w| w.code),
+                preflight_yarn_berry_hosted(&ok, None, None).map_err(|w| w.code),
                 Ok(()),
                 "{ok:?}"
             );
         }
         let code = |lock: &str, rc: Option<&str>| {
-            preflight_yarn_berry_hosted(lock, rc).map_err(|w| w.code)
+            preflight_yarn_berry_hosted(lock, None, rc).map_err(|w| w.code)
         };
         assert_eq!(
             code(&crlf.replacen("\r\n", "\n", 1), None),
