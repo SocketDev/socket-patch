@@ -123,6 +123,8 @@ fn render(out: &Discovery, root: &Path) -> Value {
         unpatched_copies,
         unattested,
         contested,
+        // Already folded into `unattested` by the time a run returns.
+        unwired_copies: _,
     } = out;
     let refs: Vec<Value> = refs
         .iter()
@@ -217,12 +219,14 @@ fn render(out: &Discovery, root: &Path) -> Value {
                     uuid,
                     file,
                     detail,
+                    kind,
                 } = u;
                 json!({
                     "purl": purl,
                     "uuid": uuid,
                     "file": path_str(file),
                     "detail": normalize(detail, &roots),
+                    "kind": format!("{kind:?}"),
                 })
             })
             .collect::<Vec<_>>()

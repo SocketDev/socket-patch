@@ -10,20 +10,31 @@
 //! explicit and a future backend has an obvious home; Deno patches attest
 //! only through the manifest + installed tree (agent mode, `setup.manual`).
 //!
-//! It still reads `deno.lock`'s npm section as a CONTESTING lock: Deno
-//! installs a `package.json` project's npm dependencies from `deno.lock`
-//! and never reads `package-lock.json`, so a Socket pin in the npm lock
-//! does not reach the copy Deno runs. Every `name@version` there is
-//! [`Discovery::resolved_elsewhere`] evidence, and the cross-lock contest
-//! drops an npm-family ref of the same version (#406). The npm section is
-//! the top-level `npm` map in lockfile versions 4 and 5, `npm.packages`
-//! in version 2 and `packages.npm` in version 3; a key may carry Deno's
-//! peer suffix (`name@1.0.0_peer@2.0.0`). The read is advisory: an
-//! unreadable or unparseable `deno.lock` contests nothing.
+//! It still reads `deno.lock`'s npm section as evidence AGAINST an
+//! npm-family wiring: `deno install` installs a `package.json` project's
+//! npm dependencies from `deno.lock` and never reads `package-lock.json` /
+//! `pnpm-lock.yaml` / `yarn.lock`, so a Socket pin there does not reach
+//! the copy Deno installs (#406). Every `name@version` of that section is
+//! an [`UnwiredCopy`]: a ref of the same version in any lock is marked
+//! [`Unattested`](super::Unattested) (`vex` omits it) but stays a ref.
+//! Whether Deno or another package manager populates `node_modules`
+//! (`nodeModulesDir: "manual"` allows either) is not in the files, so
+//! this is a missed attestation at worst; and since re-running `scan` /
+//! `vendor` cannot clear it, the ledgers' liveness gates (`vendor
+//! --check`, `scan`) are left alone. The npm section is the top-level
+//! `npm` map in lockfile versions 4 and 5, `npm.packages` in version 2
+//! and `packages.npm` in version 3; a key may carry Deno's peer suffix
+//! (`name@1.0.0_peer@2.0.0`). The read is advisory: an unreadable or
+//! unparseable `deno.lock` marks nothing.
 
 use serde_json::Value;
 
-use super::{npm_purl, parse_json, DiscoverCtx, Discovery};
+use std::path::PathBuf;
+
+use super::{
+    canonical_base_purl, npm_purl, parse_json, CopyTarget, DiscoverCtx, Discovery, UnattestedKind,
+    UnwiredCopy,
+};
 
 const DENO_LOCK: &str = "deno.lock";
 
@@ -34,8 +45,17 @@ pub(crate) async fn extract(ctx: &DiscoverCtx<'_>, out: &mut Discovery) {
     let Ok(lock) = parse_json(DENO_LOCK, text.as_bytes()) else {
         return;
     };
-    for key in deno_npm_keys(&lock) {
-        out.resolved_elsewhere(DENO_LOCK, deno_npm_purl(key));
+    for purl in deno_npm_keys(&lock).into_iter().filter_map(deno_npm_purl) {
+        out.unwired_copy(UnwiredCopy {
+            scope: None,
+            target: CopyTarget::Purl(canonical_base_purl(&purl)),
+            file: PathBuf::from(DENO_LOCK),
+            detail: format!(
+                "{DENO_LOCK} also locks it, and `deno install` installs this project's npm \
+                 dependencies from {DENO_LOCK}, where no Socket wiring reaches"
+            ),
+            kind: UnattestedKind::DenoLock,
+        });
     }
 }
 
@@ -63,6 +83,7 @@ fn deno_npm_purl(key: &str) -> Option<String> {
 #[cfg(test)]
 mod tests {
     use super::super::testing::*;
+    use super::super::WiringMode;
 
     const SRI: &str = "sha512-PATCHEDpatchedPATCHEDpatched0123456789==";
 
@@ -114,18 +135,20 @@ mod tests {
         assert_eq!(super::deno_npm_purl("nonsense"), None);
     }
 
-    /// REGRESSION (#406): Deno installs a `package.json` project's npm deps
-    /// from `deno.lock` and never reads `package-lock.json`, so a hosted pin
-    /// in the npm lock beside a deno.lock registry entry of the same version
-    /// is contested, not attested. Another version in deno.lock is not.
+    /// REGRESSION (#406): `deno install` installs a `package.json`
+    /// project's npm deps from `deno.lock` and never reads
+    /// `package-lock.json`, so a hosted pin in the npm lock beside a
+    /// deno.lock entry of the same version is marked unattested — but stays
+    /// a ref with a live claim (no rewire could clear it). Another version
+    /// in deno.lock marks nothing.
     #[tokio::test]
-    async fn deno_lock_contests_an_npm_lock_pin_of_the_same_version() {
+    async fn deno_lock_marks_an_npm_lock_pin_of_the_same_version_unattested() {
         let url = hosted_url("npm", "left-pad", "1.3.0", UUID_A, "left-pad-1.3.0.tgz");
         let npm_lock = format!(
             r#"{{"name":"m","lockfileVersion":3,"packages":{{"":{{"name":"m"}},
             "node_modules/left-pad":{{"version":"1.3.0","resolved":"{url}","integrity":"{SRI}"}}}}}}"#
         );
-        for (deno_version, contested) in [("1.3.0", true), ("1.2.0", false)] {
+        for (deno_version, marked) in [("1.3.0", true), ("1.2.0", false)] {
             let p = Project::new();
             p.write("package-lock.json", npm_lock.clone());
             p.write(
@@ -135,20 +158,28 @@ mod tests {
                 ),
             );
             let out = p.discover().await;
-            assert_eq!(
-                out.refs.is_empty(),
-                contested,
-                "{deno_version}: {:#?}",
-                out.refs
+            assert_refs(
+                &out,
+                &[("pkg:npm/left-pad@1.3.0", UUID_A, WiringMode::Hosted)],
             );
-            if contested {
-                assert!(
-                    out.diagnostics
-                        .iter()
-                        .any(|d| d.detail.contains("deno.lock")),
-                    "{:#?}",
-                    out.diagnostics
-                );
+            assert_eq!(
+                out.hosted_claim("pkg:npm/left-pad@1.3.0", UUID_A),
+                Some(true),
+                "{deno_version}"
+            );
+            assert!(out.contested.is_empty(), "{:#?}", out.contested);
+            assert_eq!(
+                out.unattested.len(),
+                usize::from(marked),
+                "{deno_version}: {:#?}",
+                out.unattested
+            );
+            if marked {
+                let u = &out.unattested[0];
+                assert_eq!(u.kind, super::super::UnattestedKind::DenoLock);
+                assert_eq!(u.uuid, UUID_A);
+                assert_eq!(u.file, std::path::Path::new("deno.lock"));
+                assert!(u.detail.contains("deno.lock"), "{}", u.detail);
             }
         }
     }
