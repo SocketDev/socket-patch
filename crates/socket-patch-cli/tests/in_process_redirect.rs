@@ -4926,6 +4926,67 @@ async fn pnpm_rollback_keeps_an_unconventional_registry_tarball() {
     assert_eq!(pnpm_pin_and_rollback(tmp.path(), &server), pristine);
 }
 
+/// Mount the version document of the project's `.npmrc` mirror at
+/// `<server>/mirror`, advertising `tarball` as `dist.tarball`, and return
+/// the mirror's base URL.
+async fn mock_pnpm_mirror(server: &MockServer, tarball: &str) -> String {
+    Mock::given(method("GET"))
+        .and(path(format!("/mirror/{NAME}/{VERSION}")))
+        .respond_with(ResponseTemplate::new(200).set_body_json(serde_json::json!({
+            "name": NAME,
+            "version": VERSION,
+            "dist": { "tarball": tarball, "integrity": "sha512-UPSTREAMupstream==" },
+        })))
+        .mount(server)
+        .await;
+    format!("{}/mirror/", server.uri())
+}
+
+/// #919: pnpm's restore reads `dist.tarball` from the registry the
+/// project's `.npmrc` names, not from the default registry. A CDN-style
+/// mirror tarball pnpm recorded as `tarball:` stays, even though the
+/// default registry (`SOCKET_NPM_REGISTRY` here, npmjs normally) serves a
+/// conventional URL pnpm would derive — and the mirror would 404 on.
+#[tokio::test]
+#[serial]
+async fn pnpm_rollback_reads_the_npmrc_mirror_document_for_an_offpath_tarball() {
+    let server = MockServer::start().await;
+    mock_discovery(&server).await;
+    mock_reference(&server).await;
+    mock_view(&server).await;
+    mock_npm_registry(&server, "sha512-UPSTREAMupstream==", None).await;
+    let advertised = format!("{}/cdn/files/{NAME}-{VERSION}.tgz", server.uri());
+    let mirror = mock_pnpm_mirror(&server, &advertised).await;
+
+    let tmp = tempfile::tempdir().unwrap();
+    let pristine = write_pnpm_tarball_project(tmp.path(), &advertised);
+    std::fs::write(tmp.path().join(".npmrc"), format!("registry={mirror}\n")).unwrap();
+    assert_eq!(pnpm_pin_and_rollback(tmp.path(), &server), pristine);
+}
+
+/// #919, under `lockfile-include-tarball-url=true`: the restored `tarball:`
+/// is the mirror's URL pnpm wrote, not the default registry's.
+#[tokio::test]
+#[serial]
+async fn pnpm_rollback_keeps_the_mirror_tarball_under_include_tarball_url() {
+    let server = MockServer::start().await;
+    mock_discovery(&server).await;
+    mock_reference(&server).await;
+    mock_view(&server).await;
+    mock_npm_registry(&server, "sha512-UPSTREAMupstream==", None).await;
+    let advertised = format!("{}/mirror/{NAME}/-/{NAME}-{VERSION}.tgz", server.uri());
+    let mirror = mock_pnpm_mirror(&server, &advertised).await;
+
+    let tmp = tempfile::tempdir().unwrap();
+    let pristine = write_pnpm_tarball_project(tmp.path(), &advertised);
+    std::fs::write(
+        tmp.path().join(".npmrc"),
+        format!("registry={mirror}\nlockfile-include-tarball-url=true\n"),
+    )
+    .unwrap();
+    assert_eq!(pnpm_pin_and_rollback(tmp.path(), &server), pristine);
+}
+
 /// #417: hosted `scan` from a cargo workspace MEMBER treated it as a
 /// lockless project, wrote `registry = …` into the member's Cargo.toml and
 /// a `[registries]` block into the member's `.cargo/config.toml`, left the

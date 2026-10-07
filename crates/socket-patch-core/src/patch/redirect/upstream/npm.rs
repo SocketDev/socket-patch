@@ -829,8 +829,39 @@ struct PnpmTarballPolicy {
     /// wins over `.npmrc`), else `lockfile-include-tarball-url` in `.npmrc`:
     /// every resolution carries its tarball.
     always: bool,
-    /// The `.npmrc` `registry`, which pnpm derives tarball URLs from.
-    registry: Option<String>,
+    /// The sibling `.npmrc`, whose `registry` / `@scope:registry` name the
+    /// registry pnpm resolves a package against (see [`pnpm_lookup_registry`]).
+    npmrc: Option<String>,
+}
+
+impl PnpmTarballPolicy {
+    fn registry(&self, name: &str) -> Option<String> {
+        pnpm_lookup_registry(self.npmrc.as_deref(), name)
+    }
+}
+
+/// The registry pnpm resolves `name` against, per the lock's sibling
+/// `.npmrc`: `@scope:registry` for a scoped name when set, else `registry`
+/// (`None`: the default registry). pnpm both reads the version document
+/// from it and derives conventional tarball URLs under it (#919). A value
+/// still holding a `${VAR}` reference is read as unset: the restore does
+/// not expand the user's environment, and must not fetch it as a URL.
+fn pnpm_lookup_registry(npmrc: Option<&str>, name: &str) -> Option<String> {
+    use super::super::npmrc::npmrc_top_level_value;
+
+    let text = npmrc?;
+    let value = |key: &str| {
+        npmrc_top_level_value(text, key)
+            .map(|value| value.trim().to_string())
+            .filter(|value| !value.is_empty())
+    };
+    let scoped = name
+        .strip_prefix('@')
+        .and_then(|rest| rest.split_once('/'))
+        .and_then(|(scope, _)| value(&format!("@{scope}:registry")));
+    scoped
+        .or_else(|| value("registry"))
+        .filter(|value| !value.contains("${"))
 }
 
 async fn pnpm_tarball_policy(view: &mut View<'_>, rel: &str) -> PnpmTarballPolicy {
@@ -861,10 +892,7 @@ async fn pnpm_tarball_policy(view: &mut View<'_>, rel: &str) -> PnpmTarballPolic
         .and_then(|text| yaml_top_level_value(text, "lockfileIncludeTarballUrl"))
         .or_else(|| npmrc_value("lockfile-include-tarball-url"))
         .is_some_and(|value| value == "true");
-    PnpmTarballPolicy {
-        always,
-        registry: npmrc_value("registry").filter(|value| !value.is_empty()),
-    }
+    PnpmTarballPolicy { always, npmrc }
 }
 
 pub(crate) async fn restore_pnpm_locks(
@@ -913,8 +941,8 @@ pub(crate) async fn restore_pnpm_locks(
             .iter()
             .map(|(_, u, n, v)| (u.clone(), n.clone(), v.clone()))
             .collect();
-        let dists = fetch_dists(&wanted, ctx, &mut result).await;
         let policy = pnpm_tarball_policy(view, rel).await;
+        let dists = fetch_dists_on(&wanted, |name| policy.registry(name), ctx, &mut result).await;
         let mut splices: Vec<(std::ops::Range<usize>, String)> = Vec::new();
         let mut handled: Vec<String> = Vec::new();
         for entry in pnpm::entries(&text) {
@@ -928,7 +956,7 @@ pub(crate) async fn restore_pnpm_locks(
             if result.refused.contains_key(uuid) {
                 continue;
             }
-            let Some(dist) = dists.get(&(name.clone(), version.clone())) else {
+            let Some(dist) = dists.get(&(name.clone(), version.clone())).map(|d| &d.dist) else {
                 continue;
             };
             let Some(integrity) = dist.integrity.as_deref() else {
@@ -942,7 +970,7 @@ pub(crate) async fn restore_pnpm_locks(
             // a URL it cannot derive from the registry (#557).
             let restored = if policy.always
                 || !registry_derives_tarball(
-                    policy.registry.as_deref(),
+                    policy.registry(name).as_deref(),
                     name,
                     version,
                     &dist.tarball,
@@ -1165,9 +1193,55 @@ pub(crate) async fn cleanup_side_config(
 #[cfg(test)]
 mod tests {
     use super::{
-        berry_lookup_registry, berry_registry_locator, non_default_registry,
+        berry_lookup_registry, berry_registry_locator, non_default_registry, pnpm_lookup_registry,
         registry_derives_tarball, yaml_top_level_value,
     };
+
+    #[test]
+    fn pnpm_reads_the_npmrc_registry_and_scope_registries() {
+        let rc = "registry=https://m.example/npm/\n@s:registry = https://s.example/\n";
+        assert_eq!(
+            pnpm_lookup_registry(Some(rc), "a").as_deref(),
+            Some("https://m.example/npm/")
+        );
+        assert_eq!(
+            pnpm_lookup_registry(Some(rc), "@s/a").as_deref(),
+            Some("https://s.example/")
+        );
+        // Another scope, and a name merely starting with the scope's text,
+        // resolve against `registry`.
+        assert_eq!(
+            pnpm_lookup_registry(Some(rc), "@t/a").as_deref(),
+            Some("https://m.example/npm/")
+        );
+        assert_eq!(
+            pnpm_lookup_registry(Some("@s:registry=https://s.example\n"), "a"),
+            None
+        );
+        assert_eq!(pnpm_lookup_registry(None, "@s/a"), None);
+        // An unexpanded `${VAR}` is never fetched as a URL; a scoped name
+        // whose scope registry holds one keeps the default, not `registry`.
+        assert_eq!(
+            pnpm_lookup_registry(Some("registry=${MIRROR}\n"), "a"),
+            None
+        );
+        assert_eq!(
+            pnpm_lookup_registry(
+                Some("registry=https://m.example\n@s:registry=${S}/npm\n"),
+                "@s/a"
+            ),
+            None
+        );
+        // pnpm derives a scoped package's tarball under its scope registry,
+        // so that registry's conventional URL stays out of the lock.
+        let scope = pnpm_lookup_registry(Some(rc), "@s/a");
+        assert!(registry_derives_tarball(
+            scope.as_deref(),
+            "@s/a",
+            "1.0.0",
+            "https://s.example/@s/a/-/a-1.0.0.tgz"
+        ));
+    }
 
     #[test]
     fn berry_reads_the_project_registry_except_for_npm_scopes() {
