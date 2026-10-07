@@ -25,9 +25,7 @@ const CRATES_IO_SOURCE: &str = "registry+https://github.com/rust-lang/crates.io-
 /// The project cargo configs, in cargo's read preference.
 const CARGO_CONFIGS: [&str; 2] = [".cargo/config", ".cargo/config.toml"];
 
-fn registry_name(uuid: &str) -> String {
-    format!("socket-patch-{uuid}")
-}
+use crate::patch::redirect::generation::{self, hosted_pin_name as registry_name};
 
 struct LockHit {
     uuid: String,
@@ -206,29 +204,41 @@ pub(crate) async fn restore(
     }
 
     // ── cargo config registry blocks ──
+    // Every hosted generation a config defines is a candidate, not only the
+    // pins found in the lock: a superseded generation's block an older CLI
+    // left behind on re-pin is referenced by nothing and would otherwise
+    // outlive the restore (#864). A block any manifest or the lock still
+    // names stays.
+    let mut configs: Vec<(&str, String)> = Vec::new();
+    for rel in CARGO_CONFIGS {
+        if let Ok(Some(config)) = view.read(rel).await {
+            configs.push((rel, config));
+        }
+    }
     let mut referenced: BTreeSet<String> = BTreeSet::new();
     for rel in manifests.iter().map(String::as_str).chain(["Cargo.lock"]) {
         if let Ok(Some(text)) = view.read(rel).await {
-            for pin in pins {
-                let reg = registry_name(&pin.uuid);
-                if text.contains(&reg) || lock_names_index(&text, &pin.uuid) {
-                    referenced.insert(pin.uuid.clone());
+            referenced.extend(generation::named_generations(&text));
+            for (_, config) in &configs {
+                for uuid in generation::named_generations(config) {
+                    if lock_names_index(&text, &uuid) {
+                        referenced.insert(uuid);
+                    }
                 }
             }
         }
     }
-    for rel in CARGO_CONFIGS {
-        let Ok(Some(config)) = view.read(rel).await else {
-            continue;
-        };
+    for (rel, config) in configs {
         let mut next = config.clone();
-        for pin in pins {
-            if result.refused.contains_key(&pin.uuid) || referenced.contains(&pin.uuid) {
+        for uuid in generation::named_generations(&config) {
+            if result.refused.contains_key(&uuid) || referenced.contains(&uuid) {
                 continue;
             }
-            if let Some(removed) = remove_registry_block(&next, &registry_name(&pin.uuid)) {
+            if let Some(removed) = remove_registry_block(&next, &registry_name(&uuid)) {
                 next = removed;
-                result.handled.insert(pin.uuid.clone());
+                if by_uuid.contains_key(uuid.as_str()) {
+                    result.handled.insert(uuid);
+                }
             }
         }
         if next != config {
@@ -239,7 +249,6 @@ pub(crate) async fn restore(
             }
         }
     }
-    let _ = by_uuid;
     result
 }
 
@@ -300,7 +309,7 @@ fn unpin_line(line: &str, reg: &str) -> Option<Option<String>> {
 
 /// The config with its `[registries.<reg>]` block (and the blank separator
 /// the rewriter put before it) removed; `None` when absent.
-fn remove_registry_block(config: &str, reg: &str) -> Option<String> {
+pub(crate) fn remove_registry_block(config: &str, reg: &str) -> Option<String> {
     let crlf = config.contains("\r\n");
     let lf = config.replace("\r\n", "\n");
     let header = format!("[registries.{reg}]");

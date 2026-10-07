@@ -26,8 +26,8 @@ use regex::Regex;
 use super::npm::{by_uuid, read_or_refuse, refuse_all_in};
 use super::{Ctx, FormatResult, HostedPin, View};
 use crate::patch::redirect::{
-    maven_tag_inner_range, maven_tag_text_in, MAVEN_DEPENDENCY_BLOCK_RE, MVN_CHECKSUMS, MVN_CONFIG,
-    MVN_CONFIG_ARGS,
+    generation, maven_repositories_with_id, maven_tag_inner_range, maven_tag_text_in,
+    remove_maven_repository, MAVEN_DEPENDENCY_BLOCK_RE, MVN_CHECKSUMS, MVN_CONFIG, MVN_CONFIG_ARGS,
 };
 
 /// The line break and indent `insert_maven_dependency_management` writes
@@ -111,16 +111,9 @@ fn dm_sections(pom: &str) -> Vec<(usize, usize)> {
 /// the line break before it (the rewriter's own insertion), when it sits
 /// on lines of its own.
 fn remove_repository(pom: &str, uuid: &str, ctx: &Ctx<'_>) -> Result<String, String> {
-    let re =
-        Regex::new(r"(?s)<repository>.*?</repository>").expect("static repository regex is valid");
-    let id = format!("socket-patch-{uuid}");
-    let found: Vec<(usize, usize)> = re
-        .find_iter(pom)
-        .filter(|m| maven_tag_text_in(pom, "id", m.start(), m.end()).as_deref() == Some(&id))
-        .map(|m| (m.start(), m.end()))
-        .collect();
-    let (start, end) = match found.as_slice() {
-        [one] => *one,
+    let id = generation::hosted_pin_name(uuid);
+    let (start, end) = match maven_repositories_with_id(pom, &id)[..] {
+        [one] => one,
         [] => return Err(format!("pom.xml has no <repository> with id {id}")),
         _ => {
             return Err(format!(
@@ -134,20 +127,8 @@ fn remove_repository(pom: &str, uuid: &str, ctx: &Ctx<'_>) -> Result<String, Str
             "the pom.xml repository {id} does not point at the Socket patch server"
         ));
     }
-    let line_start = pom[..start].rfind('\n');
-    let own_line = line_start.is_some_and(|ls| pom[ls + 1..start].trim().is_empty())
-        && (pom[end..].starts_with('\n') || pom[end..].starts_with("\r\n"));
-    let Some(line_start) = line_start.filter(|_| own_line) else {
-        return Err(format!(
-            "the pom.xml repository {id} is not on lines of its own"
-        ));
-    };
-    let cut = if pom[..line_start].ends_with('\r') {
-        line_start - 1
-    } else {
-        line_start
-    };
-    Ok(format!("{}{}", &pom[..cut], &pom[end..]))
+    remove_maven_repository(pom, &id)
+        .ok_or_else(|| format!("the pom.xml repository {id} is not on lines of its own"))
 }
 
 /// Restore one pin in `pom`, or say why not.
@@ -211,7 +192,7 @@ fn restore_pin(
              plugin configuration socket-patch did not write)"
         ));
     }
-    if text.contains(&format!("socket-patch-{uuid}")) {
+    if text.contains(&generation::hosted_pin_name(uuid)) {
         return Err(format!("pom.xml still names socket-patch-{uuid}"));
     }
     Ok(text)
