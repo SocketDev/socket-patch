@@ -122,6 +122,37 @@ fn check_fails_on_a_tampered_npm_package() {
     );
 }
 
+/// A record with an empty `files` map offers nothing to hash, so an
+/// installed copy of it is drift (`no_files`), never `already_patched`:
+/// `apply` and `get` count such a record as failed, and `--check` exit 0
+/// is the remediation attestation.
+#[test]
+fn check_fails_on_a_zero_file_record() {
+    let tmp = project(Some(ORIGINAL));
+    let path = tmp.path().join(".socket/manifest.json");
+    let mut manifest: Value = serde_json::from_slice(&std::fs::read(&path).unwrap()).unwrap();
+    manifest["patches"][PURL]["files"] = json!({});
+    std::fs::write(&path, serde_json::to_vec_pretty(&manifest).unwrap()).unwrap();
+
+    let (code, stdout, stderr) = run_check(tmp.path(), &["--json"]);
+    assert_eq!(code, 1, "stdout={stdout}\nstderr={stderr}");
+    let env = parse_json_envelope(stdout.trim());
+    let evs = events(&env);
+    assert!(
+        evs.iter()
+            .any(|e| e["action"] == "failed" && e["purl"] == PURL && e["errorCode"] == "no_files"),
+        "{env}"
+    );
+    assert!(
+        !evs.iter().any(|e| e["errorCode"] == "already_patched"),
+        "{env}"
+    );
+
+    let (code, _stdout, stderr) = run_check(tmp.path(), &[]);
+    assert_eq!(code, 1, "{stderr}");
+    assert!(stderr.contains("OUT OF SYNC"), "{stderr}");
+}
+
 /// Anti-vacuous half: the same project with the patch in place is in sync,
 /// and says how many patches it checked.
 #[test]

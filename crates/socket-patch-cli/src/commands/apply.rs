@@ -616,8 +616,9 @@ async fn run_check(args: &ApplyArgs, manifest_path: &Path) -> i32 {
         for failed in outcome.failed {
             match failed.reason.as_str() {
                 "package_not_found" => not_installed.push(failed.purl),
-                // A zero-file record has nothing on disk to drift from.
-                "no_files" => in_sync.push(failed.purl),
+                // A zero-file record (`no_files`) is drift, not in sync:
+                // nothing was hashed, and `apply` / `get` count such a
+                // record as failed, so `--check` must not attest it.
                 reason => {
                     let detail = format!("{}: {}", failed.purl, describe_check_failure(reason));
                     drifts.push((failed.purl, reason.to_string(), detail));
@@ -792,6 +793,7 @@ fn describe_check_failure(reason: &str) -> &'static str {
         "not_applied" => "patch not applied (an installed copy is still unpatched)",
         "hash_mismatch" => "an installed copy matches neither the original nor the patched bytes",
         "file_not_found" => "a patched file is missing from an installed copy",
+        "no_files" => "the patch record lists no files to verify",
         "no_matching_variant" => {
             "an installed copy matches none of the manifest's release variants \
              (no matching variant found)"
