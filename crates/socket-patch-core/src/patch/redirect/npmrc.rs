@@ -506,6 +506,43 @@ pub fn resolve_outer_allow_remote(
     env: &NpmConfigEnv,
     read: impl Fn(&std::path::Path) -> Option<String>,
 ) -> OuterAllowRemote {
+    let layers = outer_config_layers(env, read);
+    OuterAllowRemote {
+        env: env.npm_config("allow-remote", "all"),
+        file: outer_file_value(&layers, "allow-remote"),
+        replace_registry_host: OuterSetting {
+            env: env.npm_config(REPLACE_REGISTRY_HOST, "npmjs"),
+            file: outer_file_value(&layers, REPLACE_REGISTRY_HOST),
+        },
+    }
+}
+
+/// [`resolve_outer_allow_remote`] for any npm config `key` (e.g. the
+/// vendored flow's `allow-file`): the same layers, located the same way.
+/// `benign` is the key's permissive value, used to pick among several env
+/// spellings (a non-`benign` one wins).
+pub fn resolve_outer_npm_setting(
+    env: &NpmConfigEnv,
+    read: impl Fn(&std::path::Path) -> Option<String>,
+    key: &str,
+    benign: &str,
+) -> OuterSetting {
+    let layers = outer_config_layers(env, read);
+    OuterSetting {
+        env: env.npm_config(key, benign),
+        file: outer_file_value(&layers, key),
+    }
+}
+
+/// One non-project npm config file: `(layer, path, text)`.
+type OuterLayer = (&'static str, Option<std::path::PathBuf>, Option<String>);
+
+/// The user, global and builtin config files (highest precedence first),
+/// located as [`resolve_outer_allow_remote`] documents.
+fn outer_config_layers(
+    env: &NpmConfigEnv,
+    read: impl Fn(&std::path::Path) -> Option<String>,
+) -> [OuterLayer; 3] {
     use std::path::{Path, PathBuf};
     let home = env.home.as_deref();
     // The directory holding node (Windows) / its `bin` parent (Unix).
@@ -552,29 +589,23 @@ pub fn resolve_outer_allow_remote(
                 .map(|prefix| prefix.join("etc").join("npmrc"))
         });
     let global_text = global_path.as_deref().and_then(&read);
-    let layers = [
+    [
         ("user", user_path, user_text),
         ("global", global_path, global_text),
         ("builtin", builtin_path, builtin_text),
-    ];
-    let file_setting = |key: &str| {
-        layers.iter().find_map(|(layer, path, text)| {
-            let value = npmrc_top_level_value(text.as_deref()?, key)?;
-            Some(OuterFileValue {
-                layer,
-                path: path.clone()?,
-                value,
-            })
+    ]
+}
+
+/// The highest-precedence top-level `key` assignment among `layers`.
+fn outer_file_value(layers: &[OuterLayer], key: &str) -> Option<OuterFileValue> {
+    layers.iter().find_map(|(layer, path, text)| {
+        let value = npmrc_top_level_value(text.as_deref()?, key)?;
+        Some(OuterFileValue {
+            layer,
+            path: path.clone()?,
+            value,
         })
-    };
-    OuterAllowRemote {
-        env: env.npm_config("allow-remote", "all"),
-        file: file_setting("allow-remote"),
-        replace_registry_host: OuterSetting {
-            env: env.npm_config(REPLACE_REGISTRY_HOST, "npmjs"),
-            file: file_setting(REPLACE_REGISTRY_HOST),
-        },
-    }
+    })
 }
 
 /// npm's (>= 8) `replace-registry-host` config key. npm rewrites the origin

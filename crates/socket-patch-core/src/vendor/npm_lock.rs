@@ -1521,6 +1521,221 @@ impl LockRewire<'_> {
     }
 }
 
+// ── npm `allow-file` (#969) ─────────────────────────────────────────────
+//
+// npm >= 11.14 gates every dependency that resolves to a local tarball
+// (`file:` spec) by `allow-file`: `all` (the default) admits them, `none`
+// refuses every one, and any other value (`root`) admits only a node that
+// satisfies a dependency DECLARED by the project root or a workspace
+// (arborist's `#checkAllow` / reify `_isRoot`) — EALLOWFILE otherwise. The
+// vendored rewiring writes exactly such specs, so an explicit non-`all`
+// setting in any npm config layer makes every install of the vendored lock
+// fail. The setting is respected (never rewritten — the hosted
+// `allow-remote` precedent) and SAID: a vendor advisory and a `vendor
+// --check` failure.
+
+/// Advisory code for a vendored lock entry npm's `allow-file` refuses.
+pub const ALLOW_FILE_WARNING: &str = "vendor_npm_allow_file";
+
+/// Where the effective non-`all` `allow-file` value comes from.
+#[derive(Debug, Clone, PartialEq)]
+enum AllowFileSource {
+    /// An `npm_config_allow_file` environment variable (beats every file).
+    Env(String),
+    /// The project `.npmrc`.
+    Project,
+    /// The user / global / builtin config file.
+    Outer {
+        layer: &'static str,
+        path: std::path::PathBuf,
+    },
+}
+
+/// The effective `allow-file` value npm would read, in its layer order
+/// (env > project > user > global > builtin), when it is NOT `all`.
+fn effective_allow_file(
+    project_npmrc: Option<&str>,
+    outer: &crate::patch::redirect::npmrc::OuterSetting,
+) -> Option<(AllowFileSource, String)> {
+    use crate::patch::redirect::npmrc::npmrc_top_level_value;
+    let (source, value) = if let Some((var, value)) = &outer.env {
+        (AllowFileSource::Env(var.clone()), value.clone())
+    } else if let Some(value) = project_npmrc.and_then(|t| npmrc_top_level_value(t, "allow-file")) {
+        (AllowFileSource::Project, value)
+    } else {
+        let file = outer.file.as_ref()?;
+        (
+            AllowFileSource::Outer {
+                layer: file.layer,
+                path: file.path.clone(),
+            },
+            file.value.clone(),
+        )
+    };
+    (value != "all").then_some((source, value))
+}
+
+/// Does an importer (`""` = the project root, or a workspace entry) declare
+/// `folder` as a dependency of any kind?
+fn importer_declares(importer: &serde_json::Map<String, Value>, folder: &str) -> bool {
+    [
+        "dependencies",
+        "devDependencies",
+        "optionalDependencies",
+        "peerDependencies",
+    ]
+    .iter()
+    .any(|field| {
+        importer
+            .get(*field)
+            .and_then(Value::as_object)
+            .is_some_and(|deps| deps.contains_key(folder))
+    })
+}
+
+/// The `packages` key node resolution reaches for `folder` from the
+/// importer at `dir` (walking up `node_modules` dirs like Node), if any.
+fn resolve_from<'a>(
+    packages: &'a serde_json::Map<String, Value>,
+    dir: &str,
+    folder: &str,
+) -> Option<&'a str> {
+    let mut dir = dir;
+    loop {
+        let candidate = if dir.is_empty() {
+            format!("{NODE_MODULES_SEG}{folder}")
+        } else {
+            format!("{dir}/{NODE_MODULES_SEG}{folder}")
+        };
+        if let Some((key, _)) = packages.get_key_value(&candidate) {
+            return Some(key.as_str());
+        }
+        if dir.is_empty() {
+            return None;
+        }
+        dir = dir.rfind('/').map_or("", |i| &dir[..i]);
+    }
+}
+
+/// Is the lock node at `key` a dependency npm counts as "root" for
+/// `allow-file=root`: one the project root or a workspace declares and
+/// resolves to this very node?
+fn is_root_dependency(packages: &serde_json::Map<String, Value>, key: &str) -> bool {
+    let Some(idx) = key.rfind(NODE_MODULES_SEG) else {
+        return false;
+    };
+    let folder = &key[idx + NODE_MODULES_SEG.len()..];
+    packages.iter().any(|(importer_key, importer)| {
+        (importer_key.is_empty() || !importer_key.contains(NODE_MODULES_SEG))
+            && importer
+                .as_object()
+                .is_some_and(|obj| importer_declares(obj, folder))
+            && resolve_from(packages, importer_key, folder) == Some(key)
+    })
+}
+
+/// The `<lock> `<key>`` instances of `name@version` (the set vendoring
+/// rewires) npm's `allow-file=<value>` refuses, across every present npm lock.
+async fn allow_file_refused_instances(
+    project_root: &Path,
+    name: &str,
+    version: &str,
+    value: &str,
+) -> Vec<String> {
+    let overrides = NpmOverrides::read(project_root).await;
+    let mut refused = Vec::new();
+    for lock_name in NPM_LOCKS {
+        let Ok(bytes) = read_regular_to_bytes(&project_root.join(lock_name)).await else {
+            continue;
+        };
+        let Ok(lock) = parse_json_manifest(&bytes) else {
+            continue;
+        };
+        let LockScan::Matches(matches) =
+            scan_lock_matches(&lock, &overrides, name, version, &mut Vec::new())
+        else {
+            continue;
+        };
+        let Some(packages) = lock.get("packages").and_then(Value::as_object) else {
+            continue;
+        };
+        refused.extend(
+            matches
+                .iter()
+                .filter(|m| value == "none" || !is_root_dependency(packages, &m.key))
+                .map(|m| format!("{lock_name} `{}`", m.key)),
+        );
+    }
+    refused
+}
+
+/// The human reason npm >= 11.14 refuses `name@version`'s vendored `file:`
+/// tarball under the effective `allow-file` setting, or `None` when it
+/// installs. `env` locates npm's config layers ([`NpmConfigEnv`]).
+///
+/// [`NpmConfigEnv`]: crate::patch::redirect::npmrc::NpmConfigEnv
+pub(super) async fn allow_file_refusal_with(
+    project_root: &Path,
+    name: &str,
+    version: &str,
+    env: &crate::patch::redirect::npmrc::NpmConfigEnv,
+) -> Option<String> {
+    use crate::patch::redirect::npmrc::{resolve_outer_npm_setting, NPMRC_REL};
+    use crate::utils::fs::read_regular_to_string_sync;
+    let read = |path: &Path| read_regular_to_string_sync(path).ok();
+    let outer = resolve_outer_npm_setting(env, read, "allow-file", "all");
+    let project = read(&project_root.join(NPMRC_REL));
+    let (source, value) = effective_allow_file(project.as_deref(), &outer)?;
+    let refused = allow_file_refused_instances(project_root, name, version, &value).await;
+    if refused.is_empty() {
+        return None;
+    }
+    let setter = match &source {
+        AllowFileSource::Env(var) => format!("the environment variable {var}={value}"),
+        AllowFileSource::Project => format!("the project .npmrc (`allow-file={value}`)"),
+        AllowFileSource::Outer { layer, path } => format!(
+            "the {layer} npm config ({}: `allow-file={value}`)",
+            path.display()
+        ),
+    };
+    let why = if value == "none" {
+        "which refuses every `file:` dependency".to_string()
+    } else {
+        "which admits a `file:` dependency only when the project root or a workspace \
+         declares it, and these vendored copies are transitive"
+            .to_string()
+    };
+    let remedy = match &source {
+        AllowFileSource::Env(var) => {
+            format!("unset {var} (or install with `npm ci --allow-file=all`)")
+        }
+        AllowFileSource::Project => "set `allow-file=all` in the project .npmrc (or install \
+                                     with `npm ci --allow-file=all`)"
+            .to_string(),
+        AllowFileSource::Outer { layer, .. } => format!(
+            "set `allow-file=all` in the project .npmrc (it outranks the {layer} config) or \
+             install with `npm ci --allow-file=all`"
+        ),
+    };
+    Some(format!(
+        "npm >= 11.14 refuses {name}@{version}'s vendored `file:` tarball (EALLOWFILE): \
+         {setter} sets `allow-file`, {why} ({}), so every `npm ci` / `npm install` of this \
+         lock fails until it is lifted — {remedy}. The setting was respected and left \
+         untouched (npm <= 11.13 has no such setting)",
+        refused.join(", ")
+    ))
+}
+
+/// [`allow_file_refusal_with`] against this process's npm config layers.
+pub(super) async fn allow_file_refusal(
+    project_root: &Path,
+    name: &str,
+    version: &str,
+) -> Option<String> {
+    let env = crate::patch::redirect::npmrc::NpmConfigEnv::from_process();
+    allow_file_refusal_with(project_root, name, version, &env).await
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
@@ -5387,5 +5602,169 @@ mod tests {
         let (planned, looped) = preflight_then_vendor(&fx).await;
         assert_eq!(planned, Ok(()), "the plan cannot see a staged-copy gate");
         assert_eq!(looped, Ok(()));
+    }
+
+    /// #969: a project lock with a direct `left-pad` and a transitive
+    /// `is-number` (via `to-regex-range`), plus a workspace that declares
+    /// `is-number` with its own nested copy.
+    async fn allow_file_project(npmrc: Option<&str>) -> (tempfile::TempDir, std::path::PathBuf) {
+        let tmp = tempfile::tempdir().unwrap();
+        let root = tmp.path().join("proj");
+        let home = tmp.path().join("home");
+        tokio::fs::create_dir_all(&root).await.unwrap();
+        tokio::fs::create_dir_all(&home).await.unwrap();
+        let lock = json!({
+            "name": "t",
+            "lockfileVersion": 3,
+            "packages": {
+                "": {
+                    "name": "t",
+                    "workspaces": ["ws/a"],
+                    "dependencies": {"to-regex-range": "5.0.1", "left-pad": "1.3.0"}
+                },
+                "ws/a": {"name": "a", "dependencies": {"is-number": "6.0.0"}},
+                "node_modules/a": {"resolved": "ws/a", "link": true},
+                "node_modules/left-pad": {
+                    "version": "1.3.0",
+                    "resolved": "https://registry.npmjs.org/left-pad/-/left-pad-1.3.0.tgz"
+                },
+                "node_modules/to-regex-range": {
+                    "version": "5.0.1",
+                    "resolved": "https://registry.npmjs.org/to-regex-range/-/to-regex-range-5.0.1.tgz",
+                    "dependencies": {"is-number": "^7.0.0"}
+                },
+                "node_modules/is-number": {
+                    "version": "7.0.0",
+                    "resolved": "https://registry.npmjs.org/is-number/-/is-number-7.0.0.tgz"
+                },
+                "ws/a/node_modules/is-number": {
+                    "version": "6.0.0",
+                    "resolved": "https://registry.npmjs.org/is-number/-/is-number-6.0.0.tgz"
+                }
+            }
+        });
+        tokio::fs::write(
+            root.join(PACKAGE_LOCK),
+            serde_json::to_vec_pretty(&lock).unwrap(),
+        )
+        .await
+        .unwrap();
+        if let Some(npmrc) = npmrc {
+            tokio::fs::write(root.join(".npmrc"), npmrc).await.unwrap();
+        }
+        (tmp, home)
+    }
+
+    fn allow_file_env(
+        home: &Path,
+        extra: &[(&str, &str)],
+    ) -> crate::patch::redirect::npmrc::NpmConfigEnv {
+        let mut vars = vec![("HOME".to_string(), home.display().to_string())];
+        vars.extend(extra.iter().map(|(k, v)| (k.to_string(), v.to_string())));
+        crate::patch::redirect::npmrc::NpmConfigEnv::from_parts(vars, None, false)
+    }
+
+    /// #969: npm >= 11.14 refuses a vendored `file:` tarball under
+    /// `allow-file=root` when the copy is transitive, and under
+    /// `allow-file=none` always; the default `all` (or no setting) admits it.
+    #[tokio::test]
+    async fn allow_file_refusal_follows_npms_root_rule() {
+        let (tmp, home) = allow_file_project(Some("allow-file=root\n")).await;
+        let root = tmp.path().join("proj");
+        let env = allow_file_env(&home, &[]);
+        // Transitive (pulled in by to-regex-range): refused, remedy named.
+        let detail = allow_file_refusal_with(&root, "is-number", "7.0.0", &env)
+            .await
+            .expect("transitive copy is refused under allow-file=root");
+        assert!(detail.contains("EALLOWFILE"), "{detail}");
+        assert!(detail.contains("`node_modules/is-number`"), "{detail}");
+        assert!(
+            detail.contains("project .npmrc (`allow-file=root`)"),
+            "{detail}"
+        );
+        assert!(detail.contains("npm ci --allow-file=all"), "{detail}");
+        // Direct root dependency and a workspace's own nested dependency:
+        // both are "root" to npm.
+        assert_eq!(
+            allow_file_refusal_with(&root, "left-pad", "1.3.0", &env).await,
+            None
+        );
+        assert_eq!(
+            allow_file_refusal_with(&root, "is-number", "6.0.0", &env).await,
+            None
+        );
+
+        // `none` refuses even the direct dependency.
+        let (tmp, home) = allow_file_project(Some("allow-file=none\n")).await;
+        let root = tmp.path().join("proj");
+        let detail =
+            allow_file_refusal_with(&root, "left-pad", "1.3.0", &allow_file_env(&home, &[]))
+                .await
+                .expect("allow-file=none refuses every file: dependency");
+        assert!(
+            detail.contains("refuses every `file:` dependency"),
+            "{detail}"
+        );
+
+        // Default / explicit `all`: nothing to say.
+        for npmrc in [None, Some("allow-file=all\n"), Some("allow-remote=none\n")] {
+            let (tmp, home) = allow_file_project(npmrc).await;
+            let root = tmp.path().join("proj");
+            assert_eq!(
+                allow_file_refusal_with(&root, "is-number", "7.0.0", &allow_file_env(&home, &[]))
+                    .await,
+                None,
+                "{npmrc:?}"
+            );
+        }
+    }
+
+    /// #969: every npm config layer counts, in npm's precedence order — the
+    /// env var beats the project file, which beats the user config.
+    #[tokio::test]
+    async fn allow_file_refusal_reads_every_npm_config_layer() {
+        let (tmp, home) = allow_file_project(None).await;
+        let root = tmp.path().join("proj");
+        let detail = allow_file_refusal_with(
+            &root,
+            "is-number",
+            "7.0.0",
+            &allow_file_env(&home, &[("npm_config_allow_file", "root")]),
+        )
+        .await
+        .expect("env layer refuses");
+        assert!(detail.contains("npm_config_allow_file=root"), "{detail}");
+        assert!(detail.contains("unset npm_config_allow_file"), "{detail}");
+
+        tokio::fs::write(home.join(".npmrc"), "allow-file=none\n")
+            .await
+            .unwrap();
+        let detail =
+            allow_file_refusal_with(&root, "left-pad", "1.3.0", &allow_file_env(&home, &[]))
+                .await
+                .expect("user layer refuses");
+        assert!(detail.contains("the user npm config"), "{detail}");
+        // A project `allow-file=all` outranks the user config…
+        tokio::fs::write(root.join(".npmrc"), "allow-file=all\n")
+            .await
+            .unwrap();
+        assert_eq!(
+            allow_file_refusal_with(&root, "left-pad", "1.3.0", &allow_file_env(&home, &[])).await,
+            None
+        );
+        // …and an env `all` outranks a project `none`.
+        tokio::fs::write(root.join(".npmrc"), "allow-file=none\n")
+            .await
+            .unwrap();
+        assert_eq!(
+            allow_file_refusal_with(
+                &root,
+                "left-pad",
+                "1.3.0",
+                &allow_file_env(&home, &[("npm_config_allow_file", "all")])
+            )
+            .await,
+            None
+        );
     }
 }

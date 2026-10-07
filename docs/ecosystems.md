@@ -60,13 +60,18 @@ The backticked slug in each row is the value `-e`/`--ecosystems` accepts (e.g.
   overridden) — in the project `.npmrc`, the user / global / builtin npm config,
   or an `npm_config_allow_remote` environment variable — and
   `--no-npm-allow-remote-config` opts out (install with
-  `npm ci --allow-remote=all`). Vendored `file:` tarballs are unaffected (npm
-  gates them by `allow-file`, default `all`). npm >= 8's `replace-registry-host`
-  set to `always` (or to the hosted patch host) makes npm rewrite the hosted
-  pins to the configured registry, so every install fails E404: the hosted run
-  reads it from the same env / project / user / global / builtin layers and
-  warns `redirect_npm_replace_registry_host` (set `replace-registry-host=npmjs`
-  in the project `.npmrc`, or use vendored mode). npm 6 ignores `resolved` for registry
+  `npm ci --allow-remote=all`). Vendored `file:` tarballs are unaffected by
+  `allow-remote`: npm >= 11.14 gates them by `allow-file` (default `all`). An
+  explicit `allow-file=none`, or `allow-file=root` while a vendored copy is
+  transitive, makes every install fail EALLOWFILE; the vendored run keeps the
+  setting, warns `vendor_npm_allow_file` with the remedy (`allow-file=all` in
+  `.npmrc`, or `npm ci --allow-file=all`), and `vendor --check` fails. npm >= 8's
+  `replace-registry-host` set to `always` (or to the hosted patch host) makes npm
+  rewrite the hosted pins to the configured registry, so every install fails
+  E404: the hosted run reads it from the same env / project / user / global /
+  builtin layers and warns `redirect_npm_replace_registry_host` (set
+  `replace-registry-host=npmjs` in the project `.npmrc`, or use vendored mode).
+  npm 6 ignores `resolved` for registry
   dependencies, so a redirected lockfileVersion 1 lock fails closed with
   EINTEGRITY under npm 6 (`redirect_npm_legacy_client`) and installs under npm
   >= 7. A lockfileVersion 2 lock's legacy `dependencies` mirror is rewired with

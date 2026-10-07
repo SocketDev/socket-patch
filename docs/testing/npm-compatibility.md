@@ -68,7 +68,10 @@ npm 12 notes:
   (missing, or only another version that may no longer satisfy
   `package.json`), which npm can re-resolve from the registry
   (`patched_ref_unattributable`).
-- `allow-file` defaults to `all`: vendored `file:` tarballs install unchanged.
+- `allow-file` (npm >= 11.14) defaults to `all`: vendored `file:` tarballs
+  install unchanged. An explicit `none` (or `root` with a transitive vendored
+  copy) refuses them with EALLOWFILE; the vendored run warns
+  `vendor_npm_allow_file` and `vendor --check` fails (#969).
 
 Dependencies that ship their own `npm-shrinkwrap.json` (#753): the lock marks
 such a package `"hasShrinkwrap": true` (`firebase-tools`, `netlify-cli`), and

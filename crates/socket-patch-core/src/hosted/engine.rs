@@ -1561,7 +1561,9 @@ fn governing_workspace(view: &ProjectView<'_>) -> Option<std::path::PathBuf> {
 /// opts out entirely; every variant still WARNS
 /// (`redirect_npm_allow_remote`) with the whole-tree tradeoff. Vendored
 /// mode is unaffected: its `file:.socket/vendor/…` specs are npm `file`
-/// specs, gated by `allow-file` (default `all`), not `allow-remote`.
+/// specs, gated by `allow-file` (default `all`), not `allow-remote` — an
+/// explicit refusing `allow-file` is the vendored flow's own advisory
+/// (`vendor_npm_allow_file`, #969).
 fn npm_allow_remote(
     view: &ProjectView<'_>,
     files: &BTreeMap<String, String>,

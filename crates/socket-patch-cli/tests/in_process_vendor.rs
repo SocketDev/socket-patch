@@ -3977,7 +3977,8 @@ snapshots:
     /// refuses the hosted tarball otherwise); the vendor takeover restores
     /// the last hosted pin to its upstream registry entry and, in the same transaction, deletes
     /// the `.npmrc` it created — vendored `file:` specs never need it (npm
-    /// gates them by `allow-file`, default `all`).
+    /// gates them by `allow-file`, default `all`; a refusing value is the
+    /// `vendor_npm_allow_file` advisory, #969).
     #[tokio::test]
     #[serial]
     async fn hosted_then_vendor_takeover_removes_the_npmrc_allow_remote_config() {
@@ -4069,7 +4070,10 @@ snapshots:
             hosted_npmrc,
             "the hosted .npmrc must be untouched"
         );
-        assert!(!root.join(".socket/vendor/npm").exists(), "nothing is staged");
+        assert!(
+            !root.join(".socket/vendor/npm").exists(),
+            "nothing is staged"
+        );
     }
 
     /// Hosted → vendored over a linked `.socket/vendor/npm` (#664): the
@@ -4313,6 +4317,32 @@ async fn vendor_check_fails_when_lock_no_longer_wires_artifact() {
             .is_some_and(|r| r.contains("wiring")),
         "{env:#}"
     );
+}
+
+/// REGRESSION (#969): npm >= 11.14 refuses a vendored `file:` tarball
+/// (EALLOWFILE) under a project `allow-file=none`, so every install of the
+/// lock fails — but `vendor --check` verified it. It must fail the entry,
+/// name the setting and the remedy, and pass again once it is lifted.
+#[tokio::test]
+async fn vendor_check_fails_when_npm_allow_file_refuses_the_tarball() {
+    let fx = npm_fixture();
+    assert_eq!(vendor_run(vendor_args(fx.root())).await, 0, "vendor");
+    std::fs::write(fx.root().join(".npmrc"), "allow-file=none\n").unwrap();
+
+    let (code, env) = vendor_cli(fx.root(), &["--check"]);
+    assert_eq!(code, 1, "{env:#}");
+    let event = find_event(&env, "failed", Some("vendor_check_failed"));
+    let reason = event["reason"].as_str().unwrap_or_default();
+    assert!(
+        reason.contains("EALLOWFILE") && reason.contains("`allow-file=none`"),
+        "{env:#}"
+    );
+    assert!(reason.contains("npm ci --allow-file=all"), "{env:#}");
+
+    std::fs::write(fx.root().join(".npmrc"), "allow-file=all\n").unwrap();
+    let (code, env) = vendor_cli(fx.root(), &["--check"]);
+    assert_eq!(code, 0, "{env:#}");
+    find_event(&env, "verified", Some("vendor_check_ok"));
 }
 
 /// REGRESSION (#900, `npm uninstall` trigger): once the dependency leaves
