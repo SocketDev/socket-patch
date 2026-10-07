@@ -458,8 +458,12 @@ pub(crate) fn tree_snapshot(root: &Path) -> std::collections::BTreeMap<String, V
             if p.is_dir() {
                 walk(base, &p, out);
             } else {
+                // `/`-separated keys on every OS, so a caller can name one.
                 out.insert(
-                    p.strip_prefix(base).unwrap().to_string_lossy().into_owned(),
+                    p.strip_prefix(base)
+                        .unwrap()
+                        .to_string_lossy()
+                        .replace('\\', "/"),
                     std::fs::read(&p).unwrap(),
                 );
             }

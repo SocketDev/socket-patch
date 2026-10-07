@@ -405,7 +405,15 @@ fn maven_vendor_fresh_checkout_install_and_manifestless_vex() {
     // `maven.repo.local.tail` tree, a local repository Maven does not
     // checksum, so the tampered jar is what builds; there the gate is the
     // committed tree's review and VEX, which never attests it (below).
+    // A COLD re-resolve: step 3 cached the suffixed artifact in the local
+    // repository, which Maven serves without re-reading (or re-checksumming)
+    // any remote, so the cached copy is dropped first. Central's pristine
+    // 1.10.0 stays warm (it cannot shadow the suffixed version).
     std::fs::write(&sidecar, &good_sidecar).unwrap();
+    let cached = repo_dir(&m2, SV);
+    if cached.exists() {
+        std::fs::remove_dir_all(&cached).unwrap();
+    }
     let out = mvn.copy_dependencies(&fresh, &m2, &settings, "target/tamper");
     if mvn.numeric() >= vec![3, 9, 2] {
         assert!(ok(&out), "{}", dump(&out));
