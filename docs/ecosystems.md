@@ -68,7 +68,11 @@ The backticked slug in each row is the value `-e`/`--ecosystems` accepts (e.g.
   whatever its `resolved` says, so under npm 6 an aliased hosted pin in a v2
   lock fails closed with EINTEGRITY too (`redirect_npm_legacy_alias_client`).
   Lockfile-only `vex` attests nothing for a package whose `packages` entry is
-  wired while the v2 mirror still resolves it from the registry. Vendoring
+  wired while the v2 mirror still resolves it from the registry. A mirror
+  node with no `resolved` but the patched `integrity` (what npm 7–12
+  `npm install` leaves on a vendored v2 lock, since npm never writes a
+  `file:` `resolved` there) still counts as wired for `vex` and
+  `vendor --check`: npm 6 fails closed on that pin. Vendoring
   needs a lockfileVersion 2/3 lock (npm 6 still installs a vendored v2 lock
   from its legacy mirror, alias nodes included) and rewires both locks in npm
   12's dual-lock state. Majors 6–12 are measured in

@@ -1608,6 +1608,112 @@ fn vendored_npm_patch_with_an_unwired_registry_copy_in_the_same_lock() {
     }
 }
 
+/// REGRESSION (#879): npm 7-12 `npm install` on a vendored lockfileVersion
+/// 2 lock (or shrinkwrap) re-saves the legacy `dependencies` mirror node
+/// WITHOUT `resolved` (npm never writes one for a `file:` resolution
+/// there) but with the patched `integrity`. npm 6 fails closed on that pin
+/// and npm 7+ installs from the still-wired `packages` entry, so `vex`
+/// attests and `vendor --check` passes. The same node pinned to the
+/// registry tarball's integrity is what npm 6 installs unpatched: both
+/// still fail (#432).
+#[test]
+fn vendored_npm_v2_mirror_without_resolved_keeps_the_patch_wired() {
+    let purl = "pkg:npm/lodash@4.17.21";
+    let uuid = "0a0a0a0a-8790-4879-8879-0a0a0a0a0a0a";
+    let patched = b"patched npm bytes\n";
+    let after_hash = compute_git_sha256_from_bytes(patched);
+    for lock_name in ["package-lock.json", "npm-shrinkwrap.json"] {
+        for (label, mirror_pin, wired) in [
+            ("patched pin", "sha512-cGF0Y2hlZA==", true),
+            ("registry pin", "sha512-T1JJR0lOQUw=", false),
+        ] {
+            let label = format!("{lock_name} {label}");
+            let tmp = tempfile::tempdir().expect("create tempdir");
+            let cwd = tmp.path();
+            let rel = format!(".socket/vendor/npm/{uuid}/lodash-4.17.21.tgz");
+            let sha256 = sha256_hex(&write_member_tgz(
+                &cwd.join(&rel),
+                "package/index.js",
+                patched,
+            ));
+            let record = make_record(
+                uuid,
+                "package/index.js",
+                &after_hash,
+                "GHSA-mirr-aaaa",
+                &["CVE-2026-879"],
+            );
+            let mut wiring = write_matrix_wiring(cwd, "npm", uuid, &rel);
+            // What npm 8's `npm install` leaves: lockfileVersion 2 with a
+            // `resolved`-less mirror node.
+            let written = cwd.join("package-lock.json");
+            let mut lock: Value =
+                serde_json::from_str(&std::fs::read_to_string(&written).unwrap()).unwrap();
+            lock["lockfileVersion"] = serde_json::json!(2);
+            lock["dependencies"] = serde_json::json!({
+                "lodash": { "version": "4.17.21", "integrity": mirror_pin }
+            });
+            std::fs::remove_file(&written).unwrap();
+            std::fs::write(cwd.join(lock_name), lock.to_string()).unwrap();
+            wiring.file = lock_name.to_string();
+            let mut state = VendorState::new();
+            state.entries.insert(
+                purl.to_string(),
+                detached_matrix_entry("npm", purl, uuid, &rel, sha256, record, wiring),
+            );
+            let dir = cwd.join(".socket/vendor");
+            std::fs::create_dir_all(&dir).unwrap();
+            std::fs::write(
+                dir.join("state.json"),
+                serde_json::to_string_pretty(&state).unwrap(),
+            )
+            .unwrap();
+
+            let vex_path = cwd.join("out.vex.json");
+            let out = cli()
+                .args([
+                    "vex",
+                    "--cwd",
+                    cwd.to_str().unwrap(),
+                    "--json",
+                    "--output",
+                    vex_path.to_str().unwrap(),
+                    "--product",
+                    "pkg:npm/app@1.0.0",
+                ])
+                .output()
+                .expect("invoke vex");
+            let env = String::from_utf8_lossy(&out.stdout).into_owned();
+            let check = cli()
+                .args([
+                    "vendor",
+                    "--check",
+                    "--cwd",
+                    cwd.to_str().unwrap(),
+                    "--json",
+                ])
+                .output()
+                .expect("invoke vendor --check");
+            let check_env = String::from_utf8_lossy(&check.stdout).into_owned();
+            if wired {
+                assert!(out.status.success(), "{label}: {env}");
+                let doc: Value =
+                    serde_json::from_str(&std::fs::read_to_string(&vex_path).unwrap()).unwrap();
+                assert_eq!(
+                    doc["statements"].as_array().unwrap().len(),
+                    1,
+                    "{label}: {doc}"
+                );
+                assert!(check.status.success(), "{label}: {check_env}");
+            } else {
+                assert_eq!(out.status.code(), Some(1), "{label}: {env}");
+                assert!(!vex_path.exists(), "{label}: {env}");
+                assert_eq!(check.status.code(), Some(1), "{label}: {check_env}");
+            }
+        }
+    }
+}
+
 // ──────────────────────────────────────────────────────────────────────
 // 8. an applied, byte-verified agent-mode patch attests whether or not its
 // ecosystem has an install hook (there is no setup-state filter).

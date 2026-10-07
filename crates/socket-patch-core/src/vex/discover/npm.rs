@@ -276,6 +276,14 @@ async fn extract_package_lock(
 /// mirror node that agrees, or a mirror that does not mention the package,
 /// contests nothing; a mirror node wired while `packages` is not is never a
 /// ref (see [`npm_lock_nodes`]).
+///
+/// A mirror node with NO `resolved` but the wired ref's (patched)
+/// `integrity` agrees too (#879): npm 7-12's serializer never writes
+/// `resolved` for a `file:` resolution in the mirror, so every `npm install`
+/// on a vendored v2 lock leaves exactly that shape. npm 6 cannot install
+/// unpatched bytes from it: it fetches `name@version` from the registry and
+/// fails closed on the patched pin (EINTEGRITY), the same outcome accepted
+/// for a hosted alias mirror node.
 fn drop_mirror_unwired(
     ctx: &DiscoverCtx<'_>,
     file: &str,
@@ -288,6 +296,9 @@ fn drop_mirror_unwired(
         let Some(purl) = node.version.and_then(|v| npm_purl(node.name, v)) else {
             continue;
         };
+        if node.resolved.is_none() && pins_a_wired_ref(read, &purl, node.sri_pin()) {
+            continue;
+        }
         let located = node.resolved.map_or_else(Located::default, |r| {
             ctx.locate(r, LocateOpts::LITERAL_CHECKED)
         });
@@ -323,6 +334,17 @@ fn drop_mirror_unwired(
         );
         false
     });
+}
+
+/// Whether `pin` is the integrity a `packages` ref of this lock pins `purl`
+/// to — the patched bytes, so nothing installs unpatched against it.
+fn pins_a_wired_ref(read: &NpmLockRefs, purl: &str, pin: Option<&str>) -> bool {
+    let Some(pin) = pin else {
+        return false;
+    };
+    read.refs.iter().any(|r| {
+        r.purl == purl && matches!(&r.locked_integrity, Some(LockIntegrity::Sri(sri)) if sri == pin)
+    })
 }
 
 /// npm installs a git / url / `file:` dependency from the dependent's spec
@@ -1365,6 +1387,82 @@ mod tests {
             &[("pkg:npm/left-pad@1.3.0", UUID_A, WiringMode::Hosted)],
         );
         assert!(out.diagnostics.is_empty(), "{:?}", out.diagnostics);
+    }
+
+    /// #879: npm 7-12 `npm install` on a vendored lockfileVersion 2 lock (or
+    /// shrinkwrap) re-saves the legacy mirror node without `resolved` (npm
+    /// never writes one for a `file:` resolution there), keeping the patched
+    /// `integrity`. npm 6 fails closed on that pin, so the mirror agrees and
+    /// the `packages` ref is attested — for a plain dep and an alias alike.
+    #[tokio::test]
+    async fn v2_mirror_without_resolved_but_the_patched_pin_attests() {
+        let vendored = format!("file:.socket/vendor/npm/{UUID_B}/left-pad-1.3.0.tgz");
+        for lock in ["package-lock.json", "npm-shrinkwrap.json"] {
+            for (key, mirror_version) in [("left-pad", "1.3.0"), ("lp", "npm:left-pad@1.3.0")] {
+                let p = Project::new();
+                p.write(
+                    lock,
+                    serde_json::json!({
+                        "lockfileVersion": 2,
+                        "packages": {
+                            "": { "name": "app", "version": "1.0.0" },
+                            format!("node_modules/{key}"): {
+                                "name": "left-pad", "version": "1.3.0",
+                                "resolved": vendored, "integrity": SRI
+                            }
+                        },
+                        "dependencies": {
+                            key: { "version": mirror_version, "integrity": SRI }
+                        }
+                    })
+                    .to_string(),
+                );
+                let out = run(&p).await;
+                assert_refs(
+                    &out,
+                    &[("pkg:npm/left-pad@1.3.0", UUID_B, WiringMode::Vendored)],
+                );
+                assert!(
+                    out.diagnostics.is_empty(),
+                    "{lock} {key}: {:?}",
+                    out.diagnostics
+                );
+            }
+        }
+    }
+
+    /// #879's boundary: a `resolved`-less mirror node pinned to OTHER bytes
+    /// (the registry tarball's integrity) is what npm 6 installs unpatched,
+    /// so it still contests the ref (#432).
+    #[tokio::test]
+    async fn v2_mirror_without_resolved_on_another_pin_contests_the_ref() {
+        let vendored = format!("file:.socket/vendor/npm/{UUID_B}/left-pad-1.3.0.tgz");
+        let p = Project::new();
+        p.write(
+            "package-lock.json",
+            serde_json::json!({
+                "lockfileVersion": 2,
+                "packages": {
+                    "": { "name": "app", "version": "1.0.0" },
+                    "node_modules/left-pad": {
+                        "version": "1.3.0", "resolved": vendored, "integrity": SRI
+                    }
+                },
+                "dependencies": {
+                    "left-pad": { "version": "1.3.0", "integrity": "sha512-ORIG" }
+                }
+            })
+            .to_string(),
+        );
+        let out = run(&p).await;
+        assert!(out.refs.is_empty(), "{:#?}", out.refs);
+        assert!(
+            out.diagnostics
+                .iter()
+                .any(|d| d.code == DIAG_REF_UNATTRIBUTABLE && d.detail.contains("npm <= 6")),
+            "{:?}",
+            out.diagnostics
+        );
     }
 
     /// link / inBundle / bundled entries install from somewhere else, so a
