@@ -1601,6 +1601,7 @@ fn check_rewritable_refs_with(
                     let Some((dep, _repr, rest)) = parse_key_line(&lines[line], 6) else {
                         continue;
                     };
+                    let rest = unquote_value(rest);
                     if rest == reg_key || rest.starts_with(&key_peer_prefix) {
                         return refuse("an aliased snapshot reference", rest);
                     }
@@ -1612,7 +1613,7 @@ fn check_rewritable_refs_with(
         }
         for entry in index.importer_ref_candidates(&reg_key, name, version) {
             let dep = entry.dep.as_str();
-            if let Some(v) = entry.ver.as_deref() {
+            if let Some(v) = entry.ver.as_deref().map(unquote_value) {
                 if v == reg_key || v.starts_with(&key_peer_prefix) {
                     return refuse("an aliased importer version", v);
                 }
@@ -1643,6 +1644,7 @@ fn check_rewritable_refs_with(
                 let Some((dep, _repr, rest)) = parse_key_line(line, 6) else {
                     continue;
                 };
+                let rest = unquote_value(rest);
                 if rest == reg_key || rest.starts_with(&key_peer_prefix) {
                     return refuse("an aliased snapshot reference", rest);
                 }
@@ -1667,12 +1669,13 @@ fn check_rewritable_refs_with(
                     continue;
                 }
                 let (spec, ver, f) = dep_field_lines(lines, k + 1, importer.end, 8);
-                if let Some((_, v)) = ver {
+                if let Some((_, v)) = &ver {
+                    let v = unquote_value(v);
                     if v == reg_key || v.starts_with(&key_peer_prefix) {
-                        return refuse("an aliased importer version", &v);
+                        return refuse("an aliased importer version", v);
                     }
                     if dep == name && v.starts_with(&val_peer_prefix) {
-                        return refuse("a peer-suffixed importer version", &v);
+                        return refuse("a peer-suffixed importer version", v);
                     }
                     if dep == name && v == version {
                         if let Some((_, s)) = spec {
@@ -2783,6 +2786,9 @@ impl LockIndex {
                     .entry(dep.to_string())
                     .or_default()
                     .push((k, at));
+                // Keyed like the scan compares: pnpm quotes a value that
+                // starts with `@` (a scoped alias target).
+                let rest = unquote_value(rest);
                 index
                     .first_snapshot_rest
                     .entry(rest.to_string())
@@ -2816,7 +2822,8 @@ impl LockIndex {
                     let (spec, ver, f) = dep_field_lines(lines, k + 1, importer.end, 8);
                     if let Some((_, v)) = &ver {
                         let at = index.importer_deps.len();
-                        index.first_importer_ver.entry(v.clone()).or_insert(at);
+                        let v = unquote_value(v);
+                        index.first_importer_ver.entry(v.to_string()).or_insert(at);
                         for prefix in paren_prefixes(v) {
                             index
                                 .first_importer_ver_paren
@@ -2833,7 +2840,7 @@ impl LockIndex {
                         {
                             index
                                 .first_importer_catalog
-                                .entry((dep.to_string(), v.clone()))
+                                .entry((dep.to_string(), v.to_string()))
                                 .or_insert(at);
                         }
                         index.importer_deps.push(ImporterDep {
@@ -5741,6 +5748,56 @@ snapshots:
         );
     }
 
+    /// #903 / #905 (vendored): a BOM-prefixed lock is the lock pnpm reads.
+    /// The flavor sniff used to refuse it as having "no lockfileVersion";
+    /// it now vendors like its plain twin, keeps the BOM, and reverts
+    /// byte-exact.
+    #[tokio::test]
+    async fn bom_lock_vendors_and_reverts_byte_exact() {
+        let bom_lock = format!("\u{feff}{P1_BEFORE_LOCK}");
+        let fx = fixture_with(P1_BEFORE_PKG, &bom_lock).await;
+
+        let (_, entry, _) = expect_done(fx.vendor(false).await);
+        let entry = entry.unwrap();
+        let lock = fx.read(PNPM_LOCK).await;
+        assert!(lock.starts_with("\u{feff}lockfileVersion:"), "{lock}");
+        assert!(lock.contains(&fx.rel_tgz()), "{lock}");
+        assert_eq!(lock.matches('\u{feff}').count(), 1, "{lock}");
+
+        let outcome = revert_pnpm(&entry, fx.root(), false).await;
+        assert!(outcome.success, "{:?}", outcome.error);
+        assert_eq!(fx.read(PNPM_LOCK).await, bom_lock, "revert is byte-exact");
+        assert_eq!(fx.read(PACKAGE_JSON).await, P1_BEFORE_PKG);
+    }
+
+    /// #904 (vendored): a BOM-prefixed `overrides:` first line is the
+    /// user's existing section. The override goes in beside theirs and the
+    /// BOM stays byte-exact; before the fix the section was missed and a
+    /// duplicate top-level `overrides:` appended, which pnpm refuses to parse.
+    #[tokio::test]
+    async fn bom_workspace_override_inserted_beside_existing_not_duplicated() {
+        let fx = fixture_with(P1_BEFORE_PKG, P1_BEFORE_LOCK).await;
+        let original = "\u{feff}overrides:\n  other-pkg: 2.0.0\npackages:\n  - 'packages/*'\n";
+        write_ws(&fx, original).await;
+
+        let (_, entry, _) = expect_done(fx.vendor(false).await);
+        let entry = entry.unwrap();
+        let spec = format!("file:{}", fx.rel_tgz());
+        assert_eq!(
+            fx.read(PNPM_WORKSPACE).await,
+            format!("\u{feff}overrides:\n  other-pkg: 2.0.0\n  left-pad@1.3.0: {spec}\npackages:\n  - 'packages/*'\n"),
+        );
+        assert!(!entry.pnpm.as_ref().unwrap().created_workspace_overrides);
+
+        let outcome = revert_pnpm(&entry, fx.root(), false).await;
+        assert!(outcome.success, "{:?}", outcome.error);
+        assert_eq!(
+            fx.read(PNPM_WORKSPACE).await,
+            original,
+            "revert is byte-exact"
+        );
+    }
+
     /// [`P1_BEFORE_LOCK`] as pnpm 10.5+ writes it when the user's
     /// `is-number: 6.0.0` override lives in pnpm-workspace.yaml: the lock's
     /// `overrides:` records the workspace-file override.
@@ -7381,6 +7438,93 @@ catalogs:
         );
     }
 
+    /// #957: pnpm 9+ single-quotes a value that starts with `@`, so a
+    /// scoped `npm:` alias reaches the lock as
+    /// `version: '@scope/pkg@1.1.0'` (root importer) or
+    /// `sl: '@scope/pkg@1.1.0'` (a dependent's snapshot). Both are
+    /// references the pair surgery cannot rewrite, and must refuse exactly
+    /// as the unquoted unscoped alias does — on the scan AND the indexed
+    /// path, peer-suffixed spellings included.
+    #[test]
+    fn quoted_scoped_alias_references_refuse() {
+        let name = "@isaacs/string-locale-compare";
+        let importer = "lockfileVersion: '9.0'
+
+importers:
+
+  .:
+    dependencies:
+      sl:
+        specifier: npm:@isaacs/string-locale-compare@1.1.0
+        version: '@isaacs/string-locale-compare@1.1.0'
+
+packages:
+
+  '@isaacs/string-locale-compare@1.1.0':
+    resolution: {integrity: sha512-x}
+
+snapshots:
+
+  '@isaacs/string-locale-compare@1.1.0': {}
+";
+        let snapshot = "lockfileVersion: '9.0'
+
+importers:
+
+  .:
+    dependencies:
+      host:
+        specifier: file:./host-1.0.0.tgz
+        version: file:host-1.0.0.tgz
+
+packages:
+
+  '@isaacs/string-locale-compare@1.1.0':
+    resolution: {integrity: sha512-x}
+
+  host@file:host-1.0.0.tgz:
+    resolution: {integrity: sha512-y, tarball: file:host-1.0.0.tgz}
+    version: 1.0.0
+
+snapshots:
+
+  '@isaacs/string-locale-compare@1.1.0': {}
+
+  host@file:host-1.0.0.tgz:
+    dependencies:
+      sl: '@isaacs/string-locale-compare@1.1.0'
+";
+        let peer_snapshot = snapshot.replace(
+            "      sl: '@isaacs/string-locale-compare@1.1.0'\n",
+            "      sl: '@isaacs/string-locale-compare@1.1.0(peer@1.0.0)'\n",
+        );
+        let peer_importer = importer.replace(
+            "        version: '@isaacs/string-locale-compare@1.1.0'\n",
+            "        version: \"@isaacs/string-locale-compare@1.1.0(peer@1.0.0)\"\n",
+        );
+        for (text, what) in [
+            (importer, "an aliased importer version"),
+            (snapshot, "an aliased snapshot reference"),
+            (peer_importer.as_str(), "an aliased importer version"),
+            (peer_snapshot.as_str(), "an aliased snapshot reference"),
+        ] {
+            let lines = split_lines(text);
+            let index = LockIndex::build(&lines);
+            for (indexed, path) in [(None, "scan"), (Some(&index), "indexed")] {
+                let err = check_rewritable_refs_with(&lines, name, "1.1.0", indexed)
+                    .expect_err(&format!("{what} must refuse ({path}):\n{text}"));
+                assert!(err.contains(what), "{err}");
+                assert!(
+                    err.contains("(`@isaacs/string-locale-compare@1.1.0"),
+                    "the refusal names the unquoted reference: {err}"
+                );
+            }
+        }
+        // The unscoped control and an unrelated version still behave.
+        let lines = split_lines(snapshot);
+        assert!(check_rewritable_refs(&lines, name, "1.0.0").is_ok());
+    }
+
     /// KNOWN GAP (coverage-audit suspected bug, needs triage): an importer
     /// dep entry that lost its `specifier:` field (keeping `version:`) is
     /// neither refused by `check_rewritable_refs` nor rewritten by
@@ -8686,13 +8830,19 @@ snapshots:
     fn random_value(rng: &mut Lcg) -> String {
         let name = rng.pick(&NAMES);
         let version = rng.pick(&VERSIONS);
-        match rng.next() % 7 {
+        let value = match rng.next() % 7 {
             0 | 1 => version.to_string(),
             2 => format!("{version}(peer@1.0.0)"),
             3 => format!("{name}@{version}"),
             4 => format!("{name}@{version}(x@1.0.0)"),
             5 => vendor_spec(rng, name, version),
             _ => format!("npm:{name}@{version}"),
+        };
+        // pnpm quotes a value starting with `@` (a scoped alias target).
+        if value.starts_with('@') {
+            format!("'{value}'")
+        } else {
+            value
         }
     }
 

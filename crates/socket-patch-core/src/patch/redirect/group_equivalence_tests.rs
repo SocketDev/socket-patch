@@ -15,6 +15,8 @@ fn serial_oracle(
     bun_lockb_present: bool,
 ) -> RewriteResult {
     let mut result = RewriteResult::default();
+    let overrides = withhold_pypi_platform_wheels(overrides, &mut result);
+    let overrides: &[DepOverride] = &overrides;
     if pdm_drives(files) {
         pdm::rewrite(files, overrides, &mut result);
     }
@@ -118,6 +120,8 @@ fn assert_same_with_metadata(
         // And the parallel merge itself — not the serial fallback — is what
         // produced it: real rewriters only append, to files of their own.
         let mut prefix = RewriteResult::default();
+        let overrides = withhold_pypi_platform_wheels(overrides, &mut prefix);
+        let overrides: &[DepOverride] = &overrides;
         if pdm_drives(files) {
             pdm::rewrite(files, overrides, &mut prefix);
         }
