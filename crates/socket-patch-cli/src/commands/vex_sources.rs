@@ -360,7 +360,8 @@ pub(crate) async fn plan(common: &GlobalArgs, sources: Sources, assume_live: &[S
             UnattestedWhy::NpmShrinkwrapOnly => (
                 NOTE_NPM_SHRINKWRAP_ONLY,
                 format!(
-                    "{}: patch {} is wired, but {}; not attested until it is",
+                    "{}: patch {} is wired, but {}; not attested until a package-lock.json \
+                     wires it",
                     c.key, c.uuid, u.detail
                 ),
             ),

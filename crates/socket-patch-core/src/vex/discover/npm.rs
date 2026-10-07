@@ -71,12 +71,18 @@ use crate::vendor::npm_origin::{
 
 pub(crate) async fn extract(ctx: &DiscoverCtx<'_>, out: &mut Discovery) {
     let mut locks: Vec<NpmLockRefs> = Vec::new();
+    let mut twin_present = false;
     for lock in NPM_LOCKS {
         if let Some(read) = extract_package_lock(ctx, lock, out).await {
             locks.push(read);
+        } else if lock == NPM_LOCKS[1] {
+            // Present but unreadable / unparseable (already diagnosed):
+            // npm 12 cannot install from it either, but the shrinkwrap-only
+            // detail must not claim it is missing.
+            twin_present = ctx.exists(lock).await;
         }
     }
-    push_uncontested(locks, out);
+    push_uncontested(locks, twin_present, out);
     extract_pnpm(ctx, out).await;
 }
 
@@ -136,10 +142,12 @@ impl NpmLockRefs {
 /// the rewire, then `npm install`): npm installs every entry, and that one
 /// fetches the unpatched registry bytes.
 ///
-/// A ref in a lone `npm-shrinkwrap.json` (no package-lock.json twin) is
-/// pushed but marked [`UnattestedWhy::NpmShrinkwrapOnly`] (#899): npm 12
-/// never reads the shrinkwrap and installs from the registry instead.
-fn push_uncontested(locks: Vec<NpmLockRefs>, out: &mut Discovery) {
+/// A ref in a lone `npm-shrinkwrap.json` (no usable package-lock.json
+/// twin) is pushed but marked [`UnattestedWhy::NpmShrinkwrapOnly`] (#899):
+/// npm 12 never reads the shrinkwrap and installs from the registry
+/// instead. `twin_present`: a package-lock.json exists but could not be
+/// read or parsed (the detail says so instead of calling it missing).
+fn push_uncontested(locks: Vec<NpmLockRefs>, twin_present: bool, out: &mut Discovery) {
     let wired: Vec<BTreeSet<String>> = locks
         .iter()
         .map(|l| l.refs.iter().map(|r| r.purl.clone()).collect())
@@ -228,19 +236,30 @@ fn push_uncontested(locks: Vec<NpmLockRefs>, out: &mut Discovery) {
                     // its own package-lock.json — so the wiring reaches npm
                     // <= 11 only. The ref stays (rollback, remove and list
                     // still manage it); VEX omits it.
+                    let detail = if twin_present {
+                        format!(
+                            "its {} twin cannot be read or parsed — npm >= 12 never reads \
+                             {}, so only npm <= 11 installs the patched bytes; repair {} \
+                             (e.g. `npm install --package-lock-only`) and re-run the scan \
+                             (`scan --mode hosted` / `scan --mode vendored`)",
+                            NPM_LOCKS[1], NPM_LOCKS[0], NPM_LOCKS[1],
+                        )
+                    } else {
+                        format!(
+                            "{} has no {} twin — npm >= 12 never reads {}, resolves the \
+                             package from the registry and writes a fresh {}, so only npm \
+                             <= 11 installs the patched bytes; rename the lock to {} (or \
+                             commit a copy under that name) and re-run the scan (`scan \
+                             --mode hosted` / `scan --mode vendored`)",
+                            lock.file, NPM_LOCKS[1], NPM_LOCKS[0], NPM_LOCKS[1], NPM_LOCKS[1],
+                        )
+                    };
                     out.unattested(
                         &r.purl,
                         &r.uuid,
                         lock.file,
                         UnattestedWhy::NpmShrinkwrapOnly,
-                        format!(
-                            "{} has no {} twin — npm >= 12 never reads {}, resolves the \
-                             package from the registry and writes a fresh {}, so only npm \
-                             <= 11 installs the patched bytes; rename the lock to {} (or \
-                             commit a copy under that name) and re-run `socket-patch vendor` \
-                             / `scan --mode hosted`",
-                            lock.file, NPM_LOCKS[1], NPM_LOCKS[0], NPM_LOCKS[1], NPM_LOCKS[1],
-                        ),
+                        detail,
                     );
                 }
                 out.push(r.clone());
@@ -1194,9 +1213,25 @@ mod tests {
                     && u.why == UnattestedWhy::NpmShrinkwrapOnly
                     && u.file == std::path::Path::new("npm-shrinkwrap.json")
                     && u.detail.contains("no package-lock.json")
-                    && u.detail.contains("npm >= 12")),
+                    && u.detail.contains("npm >= 12")
+                    && u.detail.contains("re-run the scan")),
                 "{purl}: {:#?}",
                 out.unattested
+            );
+        }
+
+        // A twin that exists but does not parse is unusable to npm 12 too,
+        // but the detail must not call it missing (or say to create it).
+        p.write("package-lock.json", "{ not json");
+        let out = run(&p).await;
+        assert_eq!(out.unattested.len(), 2, "{:#?}", out.unattested);
+        for u in &out.unattested {
+            assert!(
+                u.why == UnattestedWhy::NpmShrinkwrapOnly
+                    && u.detail.contains("cannot be read or parsed")
+                    && !u.detail.contains("no package-lock.json")
+                    && !u.detail.contains("rename the lock"),
+                "{u:#?}"
             );
         }
 
