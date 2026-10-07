@@ -1880,11 +1880,30 @@ async fn vendored_takeover(
     } else {
         std::collections::HashMap::new()
     };
+    // A PyPI entry is gated on the hosted rewriter's reach after the
+    // revert: requirements.txt pins only the root file (#699), uv pins
+    // only the version the restored lock resolves (#723), and Poetry
+    // refuses every 0.x lock (#945). Checked once per purl, here, because
+    // the uv and Poetry checks read the ledger and the lock on disk.
+    let mut pypi_takeover_refusals: std::collections::HashMap<
+        String,
+        socket_patch_core::patch::redirect::RewriteWarning,
+    > = std::collections::HashMap::new();
+    for (c, entry) in &takeover {
+        let Some(entry) = entry.as_ref().filter(|_| c.purl.starts_with("pkg:pypi/")) else {
+            continue;
+        };
+        if let Err(warning) =
+            socket_patch_core::patch::redirect::preflight_pypi_takeover(&common.cwd, entry).await
+        {
+            pypi_takeover_refusals.insert(c.purl.clone(), warning);
+        }
+    }
     // The takeover refusal (if any) for one candidate: bun gates every
     // npm purl, berry and vlt only their own vendored entries, Gradle each
     // of its own purls, a pypi purl on a platform-tagged grant (#701), and a
-    // requirements.txt entry on the hosted rewriter's reach (it pins only
-    // the root file, #699). Berry also runs
+    // PyPI entry on the hosted rewriter's reach (`pypi_takeover_refusals`
+    // above). Berry also runs
     // the rewriter's per-dep grant gate (a grant without the berry cache
     // checksum is skipped by the rewriter, so reverting first would leave
     // the package in neither mode). A refused purl is never dispatched (see
@@ -1898,10 +1917,9 @@ async fn vendored_takeover(
         if c.purl.starts_with("pkg:pypi/") {
             // A platform-tagged grant is never pinned (#701 / #932): keep
             // the vendored patch rather than revert it to nothing.
-            return entry.and_then(|e| {
-                socket_patch_core::patch::redirect::pypi_platform_wheel_refusal(&c.dep).or_else(
-                    || socket_patch_core::patch::redirect::preflight_requirements_takeover(e).err(),
-                )
+            return entry.and_then(|_| {
+                socket_patch_core::patch::redirect::pypi_platform_wheel_refusal(&c.dep)
+                    .or_else(|| pypi_takeover_refusals.get(&c.purl).cloned())
             });
         }
         if !c.purl.starts_with("pkg:npm/") {
