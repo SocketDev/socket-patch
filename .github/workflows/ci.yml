@@ -1699,7 +1699,8 @@ jobs:
   # v5 landings, the nightly schedule and dispatch run them with the `e2e`
   # steps.
   e2e-full:
-    if: github.event_name != 'pull_request' || github.head_ref == 'release/v5-prerelease'
+    # merge_group runs the pull_request tier: the queue gates on ci-ok.
+    if: (github.event_name != 'pull_request' && github.event_name != 'merge_group') || github.head_ref == 'release/v5-prerelease'
     needs: [test, coverage, e2e-build]
     strategy:
       fail-fast: false
@@ -1920,7 +1921,8 @@ jobs:
   # Skipped on pull_request (except v5 landings), like e2e-full.
   yarn-berry-full:
     name: yarn-berry ${{ matrix.yarn }} (${{ matrix.os }})
-    if: github.event_name != 'pull_request' || github.head_ref == 'release/v5-prerelease'
+    # merge_group runs the pull_request tier: the queue gates on ci-ok.
+    if: (github.event_name != 'pull_request' && github.event_name != 'merge_group') || github.head_ref == 'release/v5-prerelease'
     needs: [test, coverage]
     strategy:
       fail-fast: false
@@ -2012,7 +2014,8 @@ jobs:
 
   cargo-vex-matrix-full:
     name: cargo ${{ matrix.toolchain }} lock-v${{ matrix.lock || 'own' }} (${{ matrix.os }})
-    if: github.event_name != 'pull_request' || github.head_ref == 'release/v5-prerelease'
+    # merge_group runs the pull_request tier: the queue gates on ci-ok.
+    if: (github.event_name != 'pull_request' && github.event_name != 'merge_group') || github.head_ref == 'release/v5-prerelease'
     needs: [test, coverage, e2e-build]
     runs-on: ${{ matrix.os }}
     timeout-minutes: 40
@@ -2114,8 +2117,10 @@ jobs:
     timeout-minutes: 30
     concurrency:
       # These are real requests against a real production service — keep it to
-      # one run per ref rather than one per push.
-      group: hosted-e2e-${{ github.ref }}
+      # one run per PR ref rather than one per push. Main pushes group per
+      # commit like the workflow: a group holds ONE pending job, so a shared
+      # main group cancelled queued pushes and ci-ok failed them.
+      group: hosted-e2e-${{ (github.event_name == 'push' && github.sha) || github.ref }}
       cancel-in-progress: ${{ github.event_name == 'pull_request' }}
     env:
       HOSTED_E2E_DISABLED: ${{ vars.HOSTED_E2E_DISABLED }}
