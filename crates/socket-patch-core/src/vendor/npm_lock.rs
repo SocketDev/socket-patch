@@ -1528,7 +1528,7 @@ fn is_root_dependency(packages: &serde_json::Map<String, Value>, key: &str) -> b
     };
     let folder = &key[idx + NODE_MODULES_SEG.len()..];
     packages.iter().any(|(importer_key, importer)| {
-        (importer_key.is_empty() || !importer_key.contains(NODE_MODULES_SEG))
+        !importer_key.contains(NODE_MODULES_SEG)
             && importer
                 .as_object()
                 .is_some_and(|obj| importer_declares(obj, folder))
@@ -1629,12 +1629,19 @@ pub(super) async fn allow_file_refusal_with(
 }
 
 /// [`allow_file_refusal_with`] against this process's npm config layers.
+/// Unit tests see only the project `.npmrc`: the developer's or runner's
+/// own layers (an `npm_config_allow_file` variable, a `~/.npmrc`) must not
+/// decide them; the layer order itself is tested through
+/// [`allow_file_refusal_with`].
 pub(super) async fn allow_file_refusal(
     project_root: &Path,
     name: &str,
     version: &str,
 ) -> Option<String> {
+    #[cfg(not(test))]
     let env = crate::patch::redirect::npmrc::NpmConfigEnv::from_process();
+    #[cfg(test)]
+    let env = crate::patch::redirect::npmrc::NpmConfigEnv::default();
     allow_file_refusal_with(project_root, name, version, &env).await
 }
 
