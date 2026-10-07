@@ -375,18 +375,21 @@ pub(crate) async fn detect_npm_lock_flavor_in(
     };
 
     // A loader the configured `nodeLinker` disowns is stale (#975). Only the
-    // project's own `.yarnrc.yml` is in a memory snapshot.
+    // project's own rc file is in a memory snapshot; the home folder's rc
+    // file is the environment's, read from disk as yarn does. A classic
+    // lock is yarn 1, which has no `nodeLinker`.
     let linker = || {
-        std::env::var("YARN_NODE_LINKER")
-            .ok()
-            .map(|v| v.trim().to_string())
-            .filter(|v| !v.is_empty())
-            .or_else(|| {
-                let rc = project.read_text(".yarnrc.yml").ok()?;
-                crate::vendor::yarn_berry_lock::yarnrc_scalar(&rc, "nodeLinker")
-                    .filter(|v| !v.is_empty())
-                    .map(str::to_string)
-            })
+        let env = crate::crawlers::pkg_managers::YarnEnv::current();
+        let lock = project.read_text("yarn.lock").ok();
+        crate::crawlers::pkg_managers::effective_yarn_linker(lock.as_deref(), || {
+            env.node_linker
+                .clone()
+                .or_else(|| {
+                    let rc = project.read_text(&env.rc_filename).ok()?;
+                    env.rc_node_linker(&rc)
+                })
+                .or_else(|| env.home_node_linker())
+        })
     };
     if let Some(marker) = crate::crawlers::pkg_managers::live_pnp_marker_with(linker, exists) {
         return Err((
@@ -577,6 +580,20 @@ mod tests {
                 .unwrap()
                 .0,
             NpmLockFlavor::YarnBerry
+        );
+        // Yarn 1 PnP: a classic lock has no `nodeLinker`, so a berry
+        // setting beside it does not disown the loader.
+        let yarn1_pnp = project(&[
+            (".pnp.js", MemoryEntry::Present),
+            (".yarnrc.yml", text("nodeLinker: node-modules\n")),
+            ("yarn.lock", text("# yarn lockfile v1\n")),
+        ]);
+        assert_eq!(
+            detect_npm_lock_flavor_in(&ProjectView::Memory(&yarn1_pnp))
+                .await
+                .unwrap_err()
+                .0,
+            "vendor_yarn_berry_unsupported"
         );
         let pnp = project(&[(".pnp.cjs", MemoryEntry::Present), ("yarn.lock", text(""))]);
         assert_eq!(

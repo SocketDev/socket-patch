@@ -31,7 +31,7 @@
 //! Classic yarn (`yarn.lock` + a real `node_modules/`) behaves like
 //! npm at the filesystem level, so no special handling is needed.
 
-use std::path::Path;
+use std::path::{Path, PathBuf};
 
 /// Identified Node.js package manager / layout flavor.
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
@@ -161,27 +161,90 @@ pub fn detect_npm_pkg_manager(project_root: &Path) -> NpmPkgManager {
     NpmPkgManager::Unknown
 }
 
-/// The `nodeLinker` yarn resolves for `project_root`: `YARN_NODE_LINKER`
-/// when set (yarn lets every setting be overridden from the environment),
-/// else the nearest `.yarnrc.yml` at or above the project that sets
-/// `nodeLinker` (yarn merges every rc file up to the filesystem root, the
-/// closest winning). `None` when nothing sets it: yarn berry then uses its
-/// default linker, `pnp`.
-pub fn yarn_node_linker(project_root: &Path) -> Option<String> {
-    yarn_node_linker_with(project_root, std::env::var("YARN_NODE_LINKER").ok())
+/// The yarn environment that decides which rc files yarn berry reads:
+/// `YARN_NODE_LINKER`, `YARN_RC_FILENAME` (the rc file name yarn looks for
+/// in every folder, `.yarnrc.yml` by default) and the home folder, whose
+/// rc file yarn reads last.
+#[derive(Debug, Clone)]
+pub(crate) struct YarnEnv {
+    pub node_linker: Option<String>,
+    pub rc_filename: String,
+    pub home: Option<PathBuf>,
 }
 
-fn yarn_node_linker_with(project_root: &Path, env: Option<String>) -> Option<String> {
-    if let Some(linker) = env.map(|v| v.trim().to_string()).filter(|v| !v.is_empty()) {
+impl YarnEnv {
+    pub(crate) fn current() -> Self {
+        let set = |k: &str| {
+            std::env::var(k)
+                .ok()
+                .map(|v| v.trim().to_string())
+                .filter(|v| !v.is_empty())
+        };
+        Self {
+            node_linker: set("YARN_NODE_LINKER"),
+            rc_filename: set("YARN_RC_FILENAME").unwrap_or_else(|| ".yarnrc.yml".to_string()),
+            home: Some(crate::utils::fs::home_dir()),
+        }
+    }
+
+    /// The `nodeLinker` the rc file text `rc` sets, if any.
+    pub(crate) fn rc_node_linker(&self, rc: &str) -> Option<String> {
+        crate::vendor::yarn_berry_lock::yarnrc_scalar(rc, "nodeLinker")
+            .filter(|v| !v.is_empty())
+            .map(str::to_string)
+    }
+
+    /// The `nodeLinker` the home folder's rc file sets: yarn reads it after
+    /// every project-side rc file, so it applies only when none of those
+    /// sets the key.
+    pub(crate) fn home_node_linker(&self) -> Option<String> {
+        let rc = crate::utils::fs::read_regular_to_string_sync(
+            &self.home.as_ref()?.join(&self.rc_filename),
+        )
+        .ok()?;
+        self.rc_node_linker(&rc)
+    }
+}
+
+/// The `nodeLinker` yarn berry resolves for `project_root`:
+/// `YARN_NODE_LINKER` when set (yarn lets every setting be overridden from
+/// the environment), else the nearest rc file at or above the project that
+/// sets `nodeLinker` (yarn merges every rc file up to the filesystem root,
+/// the closest winning), else the home folder's rc file. The rc file name
+/// is `YARN_RC_FILENAME` when set. `None` when nothing sets it: yarn berry
+/// then uses its default linker, `pnp`.
+pub fn yarn_node_linker(project_root: &Path) -> Option<String> {
+    yarn_node_linker_in(project_root, &YarnEnv::current())
+}
+
+pub(crate) fn yarn_node_linker_in(project_root: &Path, env: &YarnEnv) -> Option<String> {
+    if let Some(linker) = env.node_linker.clone() {
         return Some(linker);
     }
     let start = std::path::absolute(project_root).unwrap_or_else(|_| project_root.to_path_buf());
-    start.ancestors().find_map(|dir| {
-        let rc = crate::utils::fs::read_regular_to_string_sync(&dir.join(".yarnrc.yml")).ok()?;
-        crate::vendor::yarn_berry_lock::yarnrc_scalar(&rc, "nodeLinker")
-            .filter(|v| !v.is_empty())
-            .map(str::to_string)
-    })
+    start
+        .ancestors()
+        .find_map(|dir| {
+            let rc =
+                crate::utils::fs::read_regular_to_string_sync(&dir.join(&env.rc_filename)).ok()?;
+            env.rc_node_linker(&rc)
+        })
+        .or_else(|| env.home_node_linker())
+}
+
+/// The linker that decides whether a PnP loader is live: yarn 1 has no
+/// `nodeLinker` (its PnP mode is `installConfig.pnp` in package.json, and
+/// it reads neither `.yarnrc.yml` nor `YARN_NODE_LINKER`), so a loader
+/// beside a classic `yarn.lock` is always live and reports `pnp`. Any
+/// other project asks `linker` for yarn berry's configured `nodeLinker`.
+pub(crate) fn effective_yarn_linker(
+    yarn_lock: Option<&str>,
+    linker: impl FnOnce() -> Option<String>,
+) -> Option<String> {
+    match yarn_lock.and_then(crate::formats::yarn::sniff_grammar) {
+        Some(crate::formats::yarn::YarnLockGrammar::Classic) => Some("pnp".to_string()),
+        _ => linker(),
+    }
 }
 
 /// Whether a yarn `nodeLinker` setting (`None` = unset) is Plug'n'Play:
@@ -195,10 +258,19 @@ pub fn yarn_linker_is_pnp(linker: Option<&str>) -> bool {
 /// the configured linker is still `pnp` (or unset): a Yarn 2 → Yarn 4
 /// migration that switched `nodeLinker` to `node-modules` or `pnpm` keeps
 /// the old `.pnp.js`, which yarn ignores, and so must every caller (#975).
+/// Yarn 1 PnP (a classic `yarn.lock`) has no `nodeLinker`, so its loader
+/// always counts ([`effective_yarn_linker`]).
 /// Every `PNP_MARKERS` decision goes through here or
 /// [`live_pnp_marker_with`].
 pub fn live_pnp_marker(project_root: &Path, exists: impl Fn(&str) -> bool) -> Option<&'static str> {
-    live_pnp_marker_with(|| yarn_node_linker(project_root), exists)
+    live_pnp_marker_with(
+        || {
+            let lock =
+                crate::utils::fs::read_regular_to_string_sync(&project_root.join("yarn.lock"));
+            effective_yarn_linker(lock.ok().as_deref(), || yarn_node_linker(project_root))
+        },
+        exists,
+    )
 }
 
 /// [`live_pnp_marker`] over any file view: `linker` supplies the configured
@@ -261,7 +333,7 @@ mod tests {
             .unwrap();
             assert_eq!(
                 live_pnp_marker_with(
-                    || yarn_node_linker_with(d.path(), None),
+                    || yarn_node_linker_in(d.path(), &bare_env(None)),
                     |m| d.path().join(m).is_file()
                 ),
                 None,
@@ -276,12 +348,12 @@ mod tests {
         std::fs::write(d.path().join(".pnp.cjs"), "").unwrap();
         let exists = |m: &str| d.path().join(m).is_file();
         assert_eq!(
-            live_pnp_marker_with(|| yarn_node_linker_with(d.path(), None), exists),
+            live_pnp_marker_with(|| yarn_node_linker_in(d.path(), &bare_env(None)), exists),
             Some(".pnp.cjs")
         );
         std::fs::write(d.path().join(".yarnrc.yml"), "nodeLinker: \"pnp\"\n").unwrap();
         assert_eq!(
-            live_pnp_marker_with(|| yarn_node_linker_with(d.path(), None), exists),
+            live_pnp_marker_with(|| yarn_node_linker_in(d.path(), &bare_env(None)), exists),
             Some(".pnp.cjs")
         );
     }
@@ -293,23 +365,112 @@ mod tests {
         let d = tempfile::tempdir().unwrap();
         let member = d.path().join("packages/a");
         std::fs::create_dir_all(&member).unwrap();
-        assert_eq!(yarn_node_linker_with(&member, None), None);
+        assert_eq!(yarn_node_linker_in(&member, &bare_env(None)), None);
         std::fs::write(d.path().join(".yarnrc.yml"), "nodeLinker: node-modules\n").unwrap();
         std::fs::write(member.join(".yarnrc.yml"), "enableGlobalCache: false\n").unwrap();
         assert_eq!(
-            yarn_node_linker_with(&member, None).as_deref(),
+            yarn_node_linker_in(&member, &bare_env(None)).as_deref(),
             Some("node-modules")
         );
         std::fs::write(member.join(".yarnrc.yml"), "nodeLinker: pnp\n").unwrap();
-        assert_eq!(yarn_node_linker_with(&member, None).as_deref(), Some("pnp"));
         assert_eq!(
-            yarn_node_linker_with(&member, Some(" pnpm ".into())).as_deref(),
-            Some("pnpm")
-        );
-        assert_eq!(
-            yarn_node_linker_with(&member, Some(String::new())).as_deref(),
+            yarn_node_linker_in(&member, &bare_env(None)).as_deref(),
             Some("pnp")
         );
+        assert_eq!(
+            yarn_node_linker_in(&member, &bare_env(Some("pnpm"))).as_deref(),
+            Some("pnpm")
+        );
+        // `YarnEnv::current` drops an empty `YARN_NODE_LINKER`.
+        assert_eq!(
+            yarn_node_linker_in(&member, &bare_env(None)).as_deref(),
+            Some("pnp")
+        );
+    }
+
+    /// A [`YarnEnv`] with no home folder and the default rc file name.
+    fn bare_env(node_linker: Option<&str>) -> YarnEnv {
+        YarnEnv {
+            node_linker: node_linker.map(str::to_string),
+            rc_filename: ".yarnrc.yml".into(),
+            home: None,
+        }
+    }
+
+    /// yarn reads the home folder's rc file after every project-side one,
+    /// and `YARN_RC_FILENAME` renames the rc file it looks for everywhere.
+    #[test]
+    fn yarn_node_linker_reads_home_rc_and_rc_filename() {
+        let home = tempfile::tempdir().unwrap();
+        let project = tempfile::tempdir().unwrap();
+        let mut env = bare_env(None);
+        env.home = Some(home.path().to_path_buf());
+        assert_eq!(yarn_node_linker_in(project.path(), &env), None);
+        std::fs::write(
+            home.path().join(".yarnrc.yml"),
+            "nodeLinker: node-modules\n",
+        )
+        .unwrap();
+        assert_eq!(
+            yarn_node_linker_in(project.path(), &env).as_deref(),
+            Some("node-modules"),
+            "home rc applies to a project outside the home folder"
+        );
+        std::fs::write(project.path().join(".yarnrc.yml"), "nodeLinker: pnp\n").unwrap();
+        assert_eq!(
+            yarn_node_linker_in(project.path(), &env).as_deref(),
+            Some("pnp"),
+            "a project rc wins over the home rc"
+        );
+
+        env.rc_filename = ".yarnrc.ci.yml".into();
+        assert_eq!(
+            yarn_node_linker_in(project.path(), &env),
+            None,
+            "a renamed rc file skips .yarnrc.yml everywhere"
+        );
+        std::fs::write(home.path().join(".yarnrc.ci.yml"), "nodeLinker: pnpm\n").unwrap();
+        assert_eq!(
+            yarn_node_linker_in(project.path(), &env).as_deref(),
+            Some("pnpm")
+        );
+        std::fs::write(
+            project.path().join(".yarnrc.ci.yml"),
+            "nodeLinker: node-modules\n",
+        )
+        .unwrap();
+        assert_eq!(
+            yarn_node_linker_in(project.path(), &env).as_deref(),
+            Some("node-modules")
+        );
+    }
+
+    /// Yarn 1 PnP (`installConfig.pnp`) has no `nodeLinker`, and yarn 1
+    /// reads neither `.yarnrc.yml` nor `YARN_NODE_LINKER`: a loader beside
+    /// a classic lock stays live whatever a berry setting says. The same
+    /// setting still disowns a loader beside a berry lock (#975).
+    #[test]
+    fn yarn1_pnp_loader_ignores_berry_linker_settings() {
+        let w = tempfile::tempdir().unwrap();
+        let proj = w.path().join("proj");
+        std::fs::create_dir_all(&proj).unwrap();
+        std::fs::write(w.path().join(".yarnrc.yml"), "nodeLinker: node-modules\n").unwrap();
+        std::fs::write(proj.join(".pnp.js"), "").unwrap();
+        let exists = |m: &str| proj.join(m).is_file();
+        for env in [bare_env(None), bare_env(Some("node-modules"))] {
+            let probe = |lock: &str| {
+                live_pnp_marker_with(
+                    || effective_yarn_linker(Some(lock), || yarn_node_linker_in(&proj, &env)),
+                    exists,
+                )
+            };
+            assert_eq!(
+                probe("# THIS IS AN AUTOGENERATED FILE.\n# yarn lockfile v1\n"),
+                Some(".pnp.js"),
+                "{env:?}"
+            );
+            assert_eq!(probe("__metadata:\n  version: 8\n"), None, "{env:?}");
+        }
     }
 
     #[test]

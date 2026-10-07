@@ -351,17 +351,32 @@ async fn sniff_yarn_lock(project_root: &Path) -> Result<NpmLockFlavor, (&'static
 pub(crate) async fn detect_vendorable_npm_flavor(
     project_root: &Path,
 ) -> Result<(NpmLockFlavor, Vec<VendorWarning>), (&'static str, String)> {
+    detect_vendorable_npm_flavor_with(project_root, || {
+        crate::crawlers::pkg_managers::yarn_node_linker(project_root)
+    })
+    .await
+}
+
+/// [`detect_vendorable_npm_flavor`] with the configured `nodeLinker`
+/// supplied by `linker`.
+async fn detect_vendorable_npm_flavor_with(
+    project_root: &Path,
+    linker: impl FnOnce() -> Option<String>,
+) -> Result<(NpmLockFlavor, Vec<VendorWarning>), (&'static str, String)> {
     let found = detect_npm_lock_flavor(project_root).await?;
     if found.0 != NpmLockFlavor::YarnBerry {
         return Ok(found);
     }
-    let linker = crate::crawlers::pkg_managers::yarn_node_linker(project_root);
+    let linker = linker();
     if !crate::crawlers::pkg_managers::yarn_linker_is_pnp(linker.as_deref()) {
         return Ok(found);
     }
     let why = match linker {
         Some(_) => "the configured yarn linker is `nodeLinker: pnp`",
-        None => "no `.yarnrc.yml` sets `nodeLinker`, so yarn berry uses its default `pnp` linker",
+        None => {
+            "no yarn rc file (the project's, its parents' or the home folder's) \
+             sets `nodeLinker`, so yarn berry uses its default `pnp` linker"
+        }
     };
     Err((
         "vendor_yarn_berry_unsupported",
@@ -1095,6 +1110,44 @@ mod tests {
         touch(tmp.path(), "yarn.lock", YARN_V1).await;
         let (flavor, _) = detect_vendorable_npm_flavor(tmp.path()).await.unwrap();
         assert_eq!(flavor, NpmLockFlavor::YarnClassic);
+    }
+
+    /// The up-front PnP refusal follows every rc file yarn reads: a
+    /// `nodeLinker: node-modules` in the home folder's rc file, or in the
+    /// file `YARN_RC_FILENAME` names, is a node-modules project, which
+    /// vendor wires (#539 follow-up: these were refused as PnP).
+    #[tokio::test]
+    async fn vendorable_probe_follows_home_rc_and_rc_filename() {
+        use crate::crawlers::pkg_managers::{yarn_node_linker_in, YarnEnv};
+        let home = tempfile::tempdir().unwrap();
+        touch(home.path(), ".yarnrc.yml", "nodeLinker: node-modules\n").await;
+        let tmp = tempfile::tempdir().unwrap();
+        touch(tmp.path(), "yarn.lock", YARN_BERRY).await;
+        touch(tmp.path(), ".yarnrc.yml", "enableGlobalCache: false\n").await;
+        let env = YarnEnv {
+            node_linker: None,
+            rc_filename: ".yarnrc.yml".into(),
+            home: Some(home.path().to_path_buf()),
+        };
+        let (flavor, _) =
+            detect_vendorable_npm_flavor_with(tmp.path(), || yarn_node_linker_in(tmp.path(), &env))
+                .await
+                .unwrap();
+        assert_eq!(flavor, NpmLockFlavor::YarnBerry, "home rc");
+
+        let tmp = tempfile::tempdir().unwrap();
+        touch(tmp.path(), "yarn.lock", YARN_BERRY).await;
+        touch(tmp.path(), ".yarnrc.ci.yml", "nodeLinker: node-modules\n").await;
+        let env = YarnEnv {
+            node_linker: None,
+            rc_filename: ".yarnrc.ci.yml".into(),
+            home: None,
+        };
+        let (flavor, _) =
+            detect_vendorable_npm_flavor_with(tmp.path(), || yarn_node_linker_in(tmp.path(), &env))
+                .await
+                .unwrap();
+        assert_eq!(flavor, NpmLockFlavor::YarnBerry, "YARN_RC_FILENAME");
     }
 
     /// Stage the root markers a real `pnpm install` with
