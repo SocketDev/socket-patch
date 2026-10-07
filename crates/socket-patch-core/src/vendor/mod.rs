@@ -874,8 +874,11 @@ pub async fn lock_text_refusals(
 /// `pnpm-workspace.yaml` scaffold hosted mode created, which the restore
 /// deletes; a gate that depended on it would make this under-predict, and
 /// the wet run still refuses. Yarn's restores rewrite key and checksum
-/// text, and legacy pnpm locks are not lock-text gated at all, so neither
-/// is predicted here.
+/// text, and legacy pnpm 7/8 locks (5.4 / 6.0) are not lock-text gated at
+/// all, so neither is predicted here: a CRLF legacy lock, an override
+/// conflict or an unsupported legacy entry previews `would_vendor` while
+/// the wet takeover refuses it (keeping the hosted pin, #963) — a known
+/// preview gap the contract names.
 pub async fn pnpm_takeover_lock_text_refusals(
     project_root: &Path,
     candidates: &[(&str, &str)],
@@ -2072,6 +2075,21 @@ mod pnpm_takeover_lock_text_refusal_tests {
         let lock = "# yarn lockfile v1\r\n\r\n\r\nleft-pad@1.3.0:\r\n  version \"1.3.0\"\r\n  \
             resolved \"https://registry.yarnpkg.com/left-pad/-/left-pad-1.3.0.tgz#abc\"\r\n";
         let tmp = project("yarn.lock", lock);
+        let refused = pnpm_takeover_lock_text_refusals(tmp.path(), &[(PURL, UUID)]).await;
+        assert!(refused.is_empty(), "{refused:?}");
+    }
+
+    /// A known preview gap (CLI_CONTRACT, #853): a legacy pnpm 7/8 lock
+    /// (5.4 / 6.0) is not lock-text gated, so even a CRLF one the wet
+    /// takeover refuses (`vendor_lockfile_crlf_unsupported`) previews
+    /// `would_vendor`. The wet run's refusal keeps the hosted pin (#963).
+    #[tokio::test]
+    async fn legacy_pnpm_project_is_out_of_scope() {
+        let lock = "lockfileVersion: '6.0'\r\n\r\ndependencies:\r\n  left-pad:\r\n    \
+            specifier: 1.3.0\r\n    version: 1.3.0\r\n\r\npackages:\r\n\r\n  \
+            /left-pad@1.3.0:\r\n    resolution: {integrity: sha512-x==, tarball: \
+            https://patch.socket.dev/patch/npm/left-pad/1.3.0/a/{UUID}/left-pad-1.3.0.tgz}\r\n";
+        let tmp = project("pnpm-lock.yaml", &lock.replace("{UUID}", UUID));
         let refused = pnpm_takeover_lock_text_refusals(tmp.path(), &[(PURL, UUID)]).await;
         assert!(refused.is_empty(), "{refused:?}");
     }

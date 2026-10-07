@@ -842,15 +842,22 @@ impl PnpmTarballPolicy {
 
 /// The pnpm major whose settings reading applies to the lock `text`: the
 /// installed / pinned `pm_major`, else 8 for a pre-9 lock or a shrinkwrap
-/// (only pnpm <= 8 writes those).
+/// (only pnpm <= 8 writes those), else 11 for a lock carrying pnpm 11+'s
+/// env lockfile document ahead of the project lock (only pnpm >= 11
+/// writes one, so its `.npmrc` pnpm settings are ignored).
 fn pnpm_settings_major(text: &str, pm_major: Option<u32>) -> Option<u32> {
+    use crate::formats::pnpm::grammar::{is_pnpm_lock_text, main_document};
     use crate::formats::pnpm::lock_version_major;
 
     let legacy_lock = lock_version_major(text).is_some_and(|major| major < 9)
         || text
             .lines()
             .any(|line| line.starts_with("shrinkwrapVersion:"));
-    pm_major.or(legacy_lock.then_some(8))
+    let main = main_document(text);
+    let env_document = is_pnpm_lock_text(&text[..text.len() - main.len()]);
+    pm_major
+        .or(legacy_lock.then_some(8))
+        .or(env_document.then_some(11))
 }
 
 /// The value of `key` in the top-level block mapping `section` of the YAML
@@ -1491,6 +1498,16 @@ mod tests {
         let pinned_only = format!("{env}{}", lock(""));
         assert!(include(&pinned_only, Some(WS_ON), None, Some(11)));
         assert!(!include(&pinned_only, None, None, Some(11)));
+        // With no install record or pin, the env document itself proves
+        // pnpm >= 11, which ignores `.npmrc`'s lockfile-include-tarball-url
+        // (a fresh clone of the issue's repro).
+        assert!(!include(&pinned_only, None, Some(RC_ON), None));
+        assert!(include(&pinned_only, Some(WS_ON), Some(RC_ON), None));
+        // A one-document lock with no pin keeps pnpm 10's reading.
+        assert!(include(&lock(""), None, Some(RC_ON), None));
+        // A lone leading `---` marker is no env document.
+        let marker_only = format!("---\n{}", lock(""));
+        assert!(include(&marker_only, None, Some(RC_ON), None));
         // A bare entry in the main document still proves it off.
         let bare = "  b@2.0.0:\n    resolution: {integrity: sha512-B==}\n";
         assert!(!include(

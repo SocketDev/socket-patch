@@ -25,8 +25,10 @@
 
 use std::path::{Path, PathBuf};
 
-use crate::formats::pnpm::workspace::package_globs;
-use crate::utils::cargo_workspace::{expand_glob, DirTree, DiskTree, MemoryTree};
+use crate::formats::pnpm::workspace::read_package_globs;
+use crate::utils::cargo_workspace::{
+    expand_glob_bounded, DirTree, DiskTree, MemoryTree, MAX_MANIFESTS,
+};
 use crate::utils::fs::{read_regular_to_string, read_regular_to_string_sync};
 use crate::utils::workspace_globs::{glob_matches_no_dot, split_negation};
 use crate::vendor::lock_inventory::view::ProjectView;
@@ -181,7 +183,7 @@ pub fn root_lock_lists_members(lock: &str) -> bool {
 
 /// Whether pnpm's project finder lists the directory at `rel` (relative
 /// to the workspace root, one entry per component) under `globs`
-/// (`pnpm-workspace.yaml` `packages:`, as [`package_globs`] reads them), as
+/// (`pnpm-workspace.yaml` `packages:`, as [`read_package_globs`] reads them), as
 /// pnpm 11.28+/12 decide it: some pattern matches and no `!` pattern does
 /// (pnpm's globber reads every negation as an ignore, wherever it sits),
 /// and no component is one of the finder's default ignores
@@ -224,12 +226,21 @@ fn modeled(globs: &[String]) -> Result<(), String> {
 /// root-relative and sorted. The positive globs are expanded against the
 /// tree for candidates, and [`lists_member`] decides each one, so this
 /// lists exactly the existing directories it calls members. A directory
-/// reached through a symbolic link is not a member.
+/// reached through a symbolic link is not a member. `Err` when a glob
+/// names more than [`MAX_MANIFESTS`] directories: the bounded walk stopped
+/// before listing them all, and part of the members is no answer.
 pub(crate) fn member_dirs(tree: &dyn DirTree, globs: &[String]) -> Result<Vec<String>, String> {
     modeled(globs)?;
     let mut candidates = std::collections::BTreeSet::new();
     for glob in globs.iter().filter(|g| !g.starts_with('!')) {
-        candidates.extend(expand_glob(tree, glob, MEMBER_SKIP));
+        let (dirs, truncated) = expand_glob_bounded(tree, glob, MEMBER_SKIP);
+        if truncated {
+            return Err(format!(
+                "`packages:` glob {glob:?} names more than {MAX_MANIFESTS} directories, \
+                 more than socket-patch walks"
+            ));
+        }
+        candidates.extend(dirs);
     }
     let mut dirs = Vec::new();
     for dir in candidates {
@@ -310,7 +321,7 @@ async fn workspace_members(view: &ProjectView<'_>) -> Members {
     if root_lock.as_deref().is_some_and(root_lock_lists_members) {
         return Members::Shared;
     }
-    let globs = match crate::formats::pnpm::workspace::package_globs(&workspace) {
+    let globs = match read_package_globs(&workspace) {
         Ok(Some(globs)) => globs,
         // pnpm <= 8 then finds projects in every directory (`**`), more
         // than a bounded walk can promise to list.
@@ -346,12 +357,27 @@ async fn workspace_members(view: &ProjectView<'_>) -> Members {
             ))
         }
     };
+    // pnpm's project finder matches `<glob>/package.{json,yaml,json5}`: a
+    // directory without a manifest is no project, and pnpm never installs
+    // from a lock in it.
+    let mut projects = Vec::new();
+    for dir in dirs {
+        for manifest in PROJECT_MANIFESTS {
+            if view.exists_no_follow(&format!("{dir}/{manifest}")).await {
+                projects.push(dir);
+                break;
+            }
+        }
+    }
     Members::Dirs {
-        dirs,
+        dirs: projects,
         globs,
         root_lock: root_lock.is_some(),
     }
 }
+
+/// The manifest names that make a directory a pnpm project.
+const PROJECT_MANIFESTS: [&str; 3] = ["package.json", "package.yaml", "package.json5"];
 
 /// pnpm's per-branch locks (`gitBranchLockfile`, #556), found at a project
 /// root: the setting is on and at least one `pnpm-lock.<branch>.yaml`
@@ -531,10 +557,10 @@ pub fn governing_workspace_file(project_root: &Path) -> Option<PathBuf> {
 /// null one or an empty list: the workspace is the root alone, so no.
 ///
 /// Errs toward "member", the refusing side, whenever it cannot decide: a
-/// `packages:` value [`package_globs`] cannot read, or a pattern using
+/// `packages:` value [`read_package_globs`] cannot read, or a pattern using
 /// glob syntax the shared matcher does not model.
-fn lists_as_member(yaml: &str, rel: &[String]) -> bool {
-    match package_globs(yaml) {
+pub(crate) fn lists_as_member(yaml: &str, rel: &[String]) -> bool {
+    match read_package_globs(yaml) {
         Ok(None) => false,
         Ok(Some(globs)) => lists_member(&globs, rel).unwrap_or(true),
         Err(_) => true,
@@ -565,6 +591,7 @@ pub fn without_verbatim_prefix(path: PathBuf) -> PathBuf {
 #[cfg(test)]
 mod tests {
     use super::*;
+    use crate::formats::pnpm::workspace::package_globs;
 
     fn write(root: &Path, rel: &str, text: &str) {
         let path = root.join(rel);
@@ -684,7 +711,7 @@ mod tests {
             .iter()
             .map(|g| g.to_string())
             .collect();
-        let expected = vec![
+        let expected = [
             "apps",
             "apps/web",
             "apps/web/nested",
@@ -722,6 +749,31 @@ mod tests {
             Ok(vec!["packages/.hidden".to_string()])
         );
         assert!(member_dirs(&DiskTree(root), &globs(&["packages/{a,b}"])).is_err());
+    }
+
+    #[test]
+    fn member_dirs_refuse_a_glob_the_bounded_walk_cannot_finish() {
+        // More directories below `packages/` than the walk visits: the
+        // late members would go unlisted, so the answer is an error, never
+        // a partial list.
+        struct Wide(usize);
+        impl DirTree for Wide {
+            fn is_real_dir(&self, rel: &str) -> bool {
+                rel == "packages" || rel.starts_with("packages/")
+            }
+            fn child_dirs(&self, rel: &str) -> Option<Vec<String>> {
+                Some(match rel {
+                    "" => vec!["packages".to_string()],
+                    "packages" => (0..self.0).map(|i| format!("p{i:05}")).collect(),
+                    _ => Vec::new(),
+                })
+            }
+        }
+        let globs = vec!["packages/**".to_string()];
+        let err = member_dirs(&Wide(MAX_MANIFESTS + 1), &globs).unwrap_err();
+        assert!(err.contains("packages/**"), "{err}");
+        let listed = member_dirs(&Wide(10), &globs).unwrap();
+        assert_eq!(listed.len(), 11, "packages itself plus its ten children");
     }
 
     #[test]
@@ -779,13 +831,31 @@ mod tests {
             "packages/a/pnpm-lock.yaml",
             "lockfileVersion: '9.0'\n",
         );
+        write(root, "packages/a/package.json", "{}");
         write(root, "packages/b/package.json", "{}");
+        // A lock in a directory with no package manifest is no member's:
+        // pnpm's finder never makes that directory a project.
+        write(
+            root,
+            "packages/scratch/pnpm-lock.yaml",
+            "lockfileVersion: '9.0'\n",
+        );
         assert_eq!(member_locks(&view).await, MemberLocks::Shared);
         write(root, ".npmrc", "shared-workspace-lockfile=false\n");
         assert_eq!(
             member_locks(&view).await,
             MemberLocks::PerMember(vec!["packages/a/pnpm-lock.yaml".to_string()])
         );
+        // package.yaml / package.json5 manifests count too.
+        write(root, "packages/scratch/package.yaml", "name: scratch\n");
+        assert_eq!(
+            member_locks(&view).await,
+            MemberLocks::PerMember(vec![
+                "packages/a/pnpm-lock.yaml".to_string(),
+                "packages/scratch/pnpm-lock.yaml".to_string()
+            ])
+        );
+        std::fs::remove_file(root.join("packages/scratch/pnpm-lock.yaml")).unwrap();
         write(
             root,
             PNPM_LOCK,
@@ -961,10 +1031,27 @@ mod tests {
         }
         // No `packages:` (a settings-only file), a null or an empty list:
         // pnpm's workspace is the root alone.
-        for ws in ["trustLockfile: true\n", "packages:\n", "packages: []\n", ""] {
+        for ws in [
+            "trustLockfile: true\n",
+            "packages:\n",
+            "packages: []\n",
+            "",
+            "packages: ~\ntrustLockfile: true\n",
+            "packages: null\n",
+            "packages: NULL # root only\n",
+        ] {
             write(&root, PNPM_WORKSPACE, ws);
             assert_eq!(governed("examples/demo"), None, "{ws:?}");
         }
+        // A flow list spread over several lines is read in full: it lists
+        // only what it names (#1006).
+        write(
+            &root,
+            PNPM_WORKSPACE,
+            "packages: [\n  'packages/*',\n  'tools/*'\n]\n",
+        );
+        assert_eq!(governed("examples/demo"), None);
+        assert_eq!(governed("packages/a"), file);
         // `**` lists every directory below the root.
         write(&root, PNPM_WORKSPACE, "packages:\n  - '**'\n");
         assert_eq!(governed("examples/demo"), file);

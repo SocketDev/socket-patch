@@ -22,7 +22,7 @@ use crate::vendor::parse_memo::ParseMemo;
 
 /// Upper bound on discovered manifests — a runaway glob (or a hostile tree)
 /// must not turn one scan into an unbounded walk.
-const MAX_MANIFESTS: usize = 4096;
+pub(crate) const MAX_MANIFESTS: usize = 4096;
 
 /// Repo-relative `<dir>/Cargo.toml` keys of the workspace members and
 /// in-root path dependencies of the project at `root`, sorted. Empty when
@@ -367,15 +367,27 @@ const CARGO_SKIP: &[&str] = &["target"];
 /// dot-directory (unless the segment itself starts with `.`, as `.*` does)
 /// or a name in `skip`; a literal segment names any real directory.
 pub(crate) fn expand_glob(tree: &dyn DirTree, pattern: &str, skip: &[&str]) -> Vec<String> {
+    expand_glob_bounded(tree, pattern, skip).0
+}
+
+/// [`expand_glob`], plus whether the walk stopped at [`MAX_MANIFESTS`]
+/// before it was done, so a caller that must list every match can refuse
+/// a truncated answer rather than act on part of it.
+pub(crate) fn expand_glob_bounded(
+    tree: &dyn DirTree,
+    pattern: &str,
+    skip: &[&str],
+) -> (Vec<String>, bool) {
     let Some(normalized) = normalize_rel("", pattern.trim_end_matches('/')) else {
-        return Vec::new();
+        return (Vec::new(), false);
     };
     let segments: Vec<&str> = normalized.split('/').filter(|s| !s.is_empty()).collect();
     let mut out = Vec::new();
     expand_from(tree, String::new(), &segments, skip, &mut out);
+    let truncated = out.len() >= MAX_MANIFESTS;
     out.sort();
     out.dedup();
-    out
+    (out, truncated)
 }
 
 fn expand_from(

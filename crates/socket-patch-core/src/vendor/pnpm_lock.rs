@@ -4310,7 +4310,7 @@ snapshots:
         // As the refusal spells it: canonical (Windows expands 8.3 names),
         // without the verbatim prefix.
         let governing = crate::utils::pnpm_workspace::without_verbatim_prefix(
-            std::fs::canonicalize(&ws_root)
+            std::fs::canonicalize(ws_root)
                 .unwrap()
                 .join(PNPM_WORKSPACE),
         );

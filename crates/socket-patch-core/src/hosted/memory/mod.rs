@@ -289,6 +289,78 @@ fn demote_cargo_members(states: &mut [RootState], warnings: &mut Vec<EngineWarni
     }
 }
 
+/// A pnpm root with a v9 lock but no `pnpm-workspace.yaml` of its own that
+/// the nearest ancestor `pnpm-workspace.yaml` lists as a workspace project
+/// (#492, #880): pnpm reads `trustLockfile` only from that ancestor file,
+/// so the trust auto-config's `pnpm-workspace.yaml` in the member would be
+/// ignored and pnpm >= 11 would reject the hosted pins. The disk run
+/// refuses a member run the same way (`redirect_pnpm_settings_elsewhere`)
+/// and, from the workspace root, pins the member locks and trusts them in
+/// the root file; the in-memory engine treats each member lock as a root
+/// of its own, so it refuses the member instead of writing a file pnpm
+/// never reads. A governing file it cannot read (a symlink, oversize)
+/// counts as listing the member, the refusing side.
+fn refuse_governed_pnpm_members(files: &BTreeMap<String, SharedFile>, states: &mut [RootState]) {
+    use crate::hosted::governing_root::PNPM_SETTINGS_ELSEWHERE;
+    use crate::hosted::guidance::PNPM_WORKSPACE_REL;
+    for state in states.iter_mut() {
+        let Some(project) = state.project.as_ref() else {
+            continue;
+        };
+        if state.root.is_empty() || project.contains(PNPM_WORKSPACE_REL) {
+            continue;
+        }
+        let v9 = matches!(
+            project.get("pnpm-lock.yaml"),
+            Some(MemoryEntry::Text(lock))
+                if crate::formats::pnpm::lock_version_major(lock).is_some_and(|major| major >= 9)
+        );
+        if !v9 {
+            continue;
+        }
+        let mut dir = state.root.as_str();
+        let governing = loop {
+            dir = roots::split_path(dir).0;
+            let path = roots::join_root(dir, PNPM_WORKSPACE_REL);
+            if let Some(file) = files.get(&path) {
+                break Some((dir, path, file));
+            }
+            if dir.is_empty() {
+                break None;
+            }
+        };
+        let Some((dir, path, file)) = governing else {
+            continue;
+        };
+        let rel: Vec<String> = roots::strip_root(dir, &state.root)
+            .unwrap_or(&state.root)
+            .split('/')
+            .map(str::to_string)
+            .collect();
+        let member = match &file.entry {
+            MemoryEntry::Text(text) if !file.unreadable => {
+                crate::utils::pnpm_workspace::lists_as_member(text, &rel)
+            }
+            _ => true,
+        };
+        if member {
+            state.fail(
+                PNPM_SETTINGS_ELSEWHERE,
+                format!(
+                    "{} is a project of the pnpm workspace whose settings live in {path}: \
+                     pnpm reads `trustLockfile` only from that file, so a \
+                     pnpm-workspace.yaml created in {} would be ignored and pnpm >= 11 \
+                     would reject the hosted pins (ERR_PNPM_TARBALL_URL_MISMATCH); the \
+                     in-memory engine does not pin a workspace member's own lock — run \
+                     hosted mode from the workspace root on a checkout, or turn the trust \
+                     auto-config off to pin without it; nothing was written",
+                    state.root, state.root
+                ),
+            );
+        }
+    }
+}
+
 fn ecosystem_allowed(ecosystems: Option<&[String]>, purl: &str) -> bool {
     match ecosystems {
         None => true,
@@ -559,6 +631,9 @@ async fn engine(
             error: None,
         })
         .collect();
+    if options.trust_lockfile_config {
+        refuse_governed_pnpm_members(&files, &mut states);
+    }
     drop(files);
     demote_cargo_members(&mut states, &mut warnings);
     phases.mark("roots");

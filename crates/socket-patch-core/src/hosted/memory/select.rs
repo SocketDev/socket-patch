@@ -370,6 +370,26 @@ pub fn select_paths(entries: &[TreeEntryInput], options: &SelectOptions) -> Path
         }
     }
 
+    // A pnpm root with no pnpm-workspace.yaml of its own reads its settings
+    // from the nearest ancestor one when that file lists it (#492): the
+    // session needs that file to tell a workspace member from a standalone
+    // project (see `refuse_governed_pnpm_members`).
+    for (root, files) in &per_root {
+        if !files.contains("pnpm-lock.yaml") || files.contains(PNPM_WORKSPACE_REL) {
+            continue;
+        }
+        let mut dir: &str = root;
+        while !dir.is_empty() {
+            dir = split_path(dir).0;
+            let path = join_root(dir, PNPM_WORKSPACE_REL);
+            if blobs.contains_key(&path) {
+                let slot = needs.entry(path).or_insert(Need::Text);
+                *slot = (*slot).min(Need::Text);
+                break;
+            }
+        }
+    }
+
     for (eco, markers) in UNSUPPORTED_MARKERS {
         if !options
             .ecosystems

@@ -147,9 +147,12 @@ pub(crate) fn block_section_bounds(lines: &[String], name: &str) -> Option<(usiz
 /// negation keeps its leading `!`), from a block sequence (items indented
 /// or at column 0) or a one-line flow sequence. `Ok(None)` when the file
 /// has no top-level `packages:` key (pnpm <= 8 then finds projects in
-/// every directory); `Err` names a value this reader cannot follow (a
-/// scalar, a multi-line flow, an anchor or alias, a nested node), which a
-/// caller must not take for "no members".
+/// every directory) or a null one (`packages:` spelled `~` or `null`,
+/// which pnpm reads as an absent key); `Err` names a value this reader
+/// cannot follow (a scalar, a multi-line flow, an anchor or alias, a
+/// nested node), which a caller must not take for "no members". Callers
+/// read through [`read_package_globs`], which falls back to a full YAML
+/// parse for those.
 pub(crate) fn package_globs(text: &str) -> Result<Option<Vec<String>>, String> {
     let text = text.strip_prefix('\u{feff}').unwrap_or(text);
     let lines: Vec<&str> = text
@@ -163,6 +166,9 @@ pub(crate) fn package_globs(text: &str) -> Result<Option<Vec<String>>, String> {
         return Ok(None);
     };
     let inline = top_level_key(lines[start]).map_or("", |(_, value)| value);
+    if matches!(inline, "~" | "null" | "Null" | "NULL") {
+        return Ok(None);
+    }
     if !inline.is_empty() {
         let inner = inline
             .strip_prefix('[')
@@ -195,6 +201,23 @@ pub(crate) fn package_globs(text: &str) -> Result<Option<Vec<String>>, String> {
         }
     }
     Ok(Some(out))
+}
+
+/// The `packages:` globs as [`package_globs`] reads them, falling back to a
+/// full YAML parse of the file when the line reader cannot follow the
+/// value (a flow list spread over several lines, an anchor and its alias).
+/// `Err` (the line reader's reason) only when neither reader can: a value
+/// that is not a list of strings, or a file that does not parse.
+pub(crate) fn read_package_globs(text: &str) -> Result<Option<Vec<String>>, String> {
+    #[derive(serde::Deserialize)]
+    struct Workspace {
+        packages: Option<Vec<String>>,
+    }
+    package_globs(text).or_else(|why| {
+        serde_saphyr::from_str::<Option<Workspace>>(strip_bom(text))
+            .map(|workspace| workspace.and_then(|w| w.packages))
+            .map_err(|_| why)
+    })
 }
 
 /// One `packages:` item: a plain or quoted scalar, quotes removed.
@@ -362,6 +385,12 @@ mod tests {
         // An absent key is not an empty list.
         assert_eq!(package_globs("packages: []\n"), Ok(Some(Vec::new())));
         assert_eq!(package_globs("trustLockfile: true\n"), Ok(None));
+        // A null value is an absent key, in every spelling (#1006).
+        for null in ["~", "null", "Null", "NULL", "~ # root only"] {
+            let text = format!("packages: {null}\ntrustLockfile: true\n");
+            assert_eq!(package_globs(&text), Ok(None), "{text:?}");
+            assert_eq!(read_package_globs(&text), Ok(None), "{text:?}");
+        }
         // Shapes this reader cannot follow are errors, never "no members".
         for text in [
             "packages: *members\n",
@@ -373,6 +402,23 @@ mod tests {
             "packages:\n  - 'unterminated\n",
         ] {
             assert!(globs(text).is_err(), "{text:?}");
+        }
+        // The full parse reads what the line reader cannot follow...
+        assert_eq!(
+            read_package_globs("packages: [\n  'a',\n  \"!b\"\n]\nx: 1\n"),
+            Ok(Some(vec!["a".to_string(), "!b".to_string()]))
+        );
+        assert_eq!(
+            read_package_globs("packages: [a,\n  b]\n"),
+            Ok(Some(vec!["a".to_string(), "b".to_string()]))
+        );
+        // ...and the line reader's reason stands when it cannot either.
+        for text in [
+            "packages: packages/*\n",
+            "packages:\n  key: value\n",
+            "packages:\n  - 'unterminated\n",
+        ] {
+            assert!(read_package_globs(text).is_err(), "{text:?}");
         }
     }
 

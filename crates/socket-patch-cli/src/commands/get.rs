@@ -1770,16 +1770,8 @@ async fn lock_text_refusals_for(
         .filter(|url| !url.trim().is_empty())
         .cloned()
         .collect();
-    let pins = socket_patch_core::patch::redirect::upstream::HostedPin::all(
-        &socket_patch_core::vex::discover_patched_refs_with(
-            cwd,
-            &socket_patch_core::vex::DiscoverOptions {
-                patch_server_origins: origins.clone(),
-            },
-        )
-        .await,
-    );
-    let claimed: Vec<String> = pins.iter().map(|pin| canonical_purl(&pin.purl)).collect();
+    let pins = hosted_pins(cwd, origins.clone()).await;
+    let claimed = claimed_purls(&pins);
     let fetchable: Vec<&PatchSearchResult> = selected
         .iter()
         .filter(|sr| bun_refusal.filter(|r| r.applies_to(&sr.purl)).is_none())
@@ -1828,7 +1820,18 @@ async fn lock_text_refusals_for(
 /// The canonical purls the project's lockfiles pin hosted (a patch-server
 /// tarball, Socket's own or one of `origins`): the purls whose vendored
 /// run is a hosted → vendored takeover.
+/// The fetch-phase gate ([`lock_text_refusals_for`]) and the scan preview
+/// (`scan/vendor_flow.rs`) both read the takeovers through here, so the dry
+/// run and the wet run agree on which purls they are.
 pub(crate) async fn hosted_claimed_purls(cwd: &Path, origins: Vec<String>) -> Vec<String> {
+    claimed_purls(&hosted_pins(cwd, origins).await)
+}
+
+/// The project's hosted pins (see [`hosted_claimed_purls`]).
+async fn hosted_pins(
+    cwd: &Path,
+    origins: Vec<String>,
+) -> Vec<socket_patch_core::patch::redirect::upstream::HostedPin> {
     socket_patch_core::patch::redirect::upstream::HostedPin::all(
         &socket_patch_core::vex::discover_patched_refs_with(
             cwd,
@@ -1838,9 +1841,11 @@ pub(crate) async fn hosted_claimed_purls(cwd: &Path, origins: Vec<String>) -> Ve
         )
         .await,
     )
-    .into_iter()
-    .map(|pin| canonical_purl(&pin.purl))
-    .collect()
+}
+
+/// The canonical purls of `pins`.
+fn claimed_purls(pins: &[socket_patch_core::patch::redirect::upstream::HostedPin]) -> Vec<String> {
+    pins.iter().map(|pin| canonical_purl(&pin.purl)).collect()
 }
 
 /// The record a detached ledger entry already carries for `purl` at

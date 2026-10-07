@@ -634,7 +634,9 @@ pub async fn read_candidate_files(
 /// the Rush locks above. Members whose list cannot be read leave the root
 /// lock out too and refuse (see [`CandidateFiles::pnpm_refusal`]).
 /// Disk only: the in-memory engine detects each member lock as a root of
-/// its own.
+/// its own, and refuses one the trust auto-config would scaffold a nested
+/// pnpm-workspace.yaml for (`refuse_governed_pnpm_members` in
+/// [`super::memory`]).
 async fn read_pnpm_member_locks(
     view: &ProjectView<'_>,
     unreadable: &BTreeSet<String>,
@@ -1448,6 +1450,7 @@ type ConfigWrite = Option<(String, FileEdit)>;
 /// pnpm-only one (#713); a run that also spliced a non-Rush pnpm lock keeps
 /// the generic text plus a Rush note. The warning names the host(s) the
 /// lock now points at (they follow --api-url).
+#[allow(clippy::too_many_arguments)]
 fn pnpm_trust(
     view: &ProjectView<'_>,
     files: &BTreeMap<String, String>,
@@ -1653,7 +1656,18 @@ fn pnpm_trust(
                 }
                 TrustPlan::AlreadyTrue => {
                     pnpm_rerun_only = spliced_pnpm_locks == 0;
-                    pnpm_trust_already_true_detail(&server, PNPM_WORKSPACE_REL)
+                    let detail = pnpm_trust_already_true_detail(&server, PNPM_WORKSPACE_REL);
+                    // The root-only scaffold an earlier run created (4.x and
+                    // early v5 did so whatever the pnpm), in a project pinned
+                    // to a pnpm that refuses `pnpm add` there (#734).
+                    match ws_existing
+                        .as_deref()
+                        .filter(|text| is_trust_scaffold(text))
+                        .and_then(|_| root_only_workspace_breaks_add(view))
+                    {
+                        Some(pins) => format!("{detail} {}", pnpm_scaffold_breaks_add_note(&pins)),
+                        None => detail,
+                    }
                 }
                 TrustPlan::UserSet(value) => {
                     pnpm_trust_user_set_detail(&server, PNPM_WORKSPACE_REL, &value)
@@ -1713,6 +1727,29 @@ fn pnpm_trust_already_true_detail(server: &str, file: &str) -> String {
          alongside the lock; installs need no extra flags. \
          {PNPM_TRUST_TRADEOFF_AND_CAUTION}",
         pnpm_trust_policy_preamble(server),
+    )
+}
+
+/// Whether a pnpm-workspace.yaml is exactly the root-only scaffold the
+/// trust auto-config creates ([`plan_workspace_trust`] with no file), in
+/// either line ending.
+fn is_trust_scaffold(text: &str) -> bool {
+    let TrustPlan::Create(scaffold) = plan_workspace_trust(None) else {
+        return false;
+    };
+    text == scaffold || text == scaffold.replace('\n', "\r\n")
+}
+
+/// The note added when a project pinned to pnpm 9.0–10.4 (`pins`, as
+/// prose) still carries the root-only scaffold (#734).
+fn pnpm_scaffold_breaks_add_note(pins: &str) -> String {
+    format!(
+        "Note: {PNPM_WORKSPACE_REL} is the root-only file an earlier socket-patch run \
+         created, but the project's pnpm ({pins}) does not read `trustLockfile`, and \
+         in a root-only workspace pnpm 9.0–10.4 refuse `pnpm add <pkg>` \
+         (ERR_PNPM_ADDING_TO_ROOT). Delete {PNPM_WORKSPACE_REL} (re-run after \
+         upgrading to pnpm >= 11 to recreate it), or add dependencies with \
+         `pnpm add -w <pkg>`."
     )
 }
 
