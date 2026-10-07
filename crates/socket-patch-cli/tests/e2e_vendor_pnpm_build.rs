@@ -149,6 +149,18 @@ fn absolutizes_file_overrides(pm: &str) -> bool {
     matches!(parts.as_slice(), [9, 0, patch] if *patch <= 4)
 }
 
+/// pnpm 8.0.0-8.1.0 refuse their OWN lock for a scoped `file:` tarball
+/// override under `--frozen-lockfile` (ERR_PNPM_LOCKFILE_MISSING_DEPENDENCY
+/// on the `file:` key they just wrote; measured 2026-10-06: 8.1.0 refuses,
+/// 8.1.1 accepts), so no vendored scoped lock can pass there.
+fn refuses_own_scoped_file_override(pm: &str) -> bool {
+    let Some(v) = pm.strip_prefix("pnpm@") else {
+        return false;
+    };
+    let parts: Vec<u32> = v.split('.').filter_map(|p| p.parse().ok()).collect();
+    matches!(parts.as_slice(), [8, 0, _] | [8, 1, 0])
+}
+
 fn has_corepack_pm(pm: &str) -> bool {
     // Isolated too: this probe is what actually downloads the package manager
     // the first time, and corepack stores it under `COREPACK_HOME`.
@@ -888,9 +900,13 @@ fn assert_manifestless_vendored_vex(
         let state = fresh.join(".socket/vendor/state.json");
         let lock_wired = std::fs::read(&lock).expect("fresh checkout lock");
         let pkg_wired = std::fs::read(fresh.join("package.json")).unwrap();
+        let (dep, version) = purl
+            .strip_prefix("pkg:npm/")
+            .and_then(|nv| nv.rsplit_once('@'))
+            .expect("an npm purl");
         assert!(
             fresh
-                .join(format!(".socket/vendor/npm/{UUID}/{DEP}-{DEP_VERSION}.tgz"))
+                .join(format!(".socket/vendor/npm/{UUID}/{dep}-{version}.tgz"))
                 .is_file(),
             "[{tag}] the committed tarball must travel with the checkout"
         );
@@ -1025,7 +1041,7 @@ fn assert_manifestless_vendored_vex(
         );
         assert!(plain.status.success(), "[{tag}] plain install: {plain:?}");
         assert_eq!(
-            std::fs::read(fresh.join("node_modules").join(DEP).join("index.js")).unwrap(),
+            std::fs::read(fresh.join("node_modules").join(dep).join("index.js")).unwrap(),
             patched,
             "[{tag}] a plain install must re-apply the overrides (vendored bytes)"
         );
@@ -1062,8 +1078,30 @@ async fn pnpm_pinned_matrix_vendored_lifecycle_and_manifestless_vex() {
             run_pnpm_capstone(&pm, VendorDriver::VendorCli).await;
             run_pnpm_capstone(&pm, VendorDriver::GetUuid).await;
         }
-        7 => off_runtime(|| run_legacy_capstone(&pm, "lockfileVersion: 5.4", "proj")),
-        8 => off_runtime(|| run_legacy_capstone(&pm, "lockfileVersion: '6.0'", "proj")),
+        7 => off_runtime(|| {
+            run_legacy_capstone(&pm, "lockfileVersion: 5.4", "proj");
+            run_legacy_capstone_for(
+                &pm,
+                "lockfileVersion: 5.4",
+                "proj",
+                SCOPED_DEP,
+                SCOPED_DEP_VERSION,
+            );
+        }),
+        8 => off_runtime(|| {
+            run_legacy_capstone(&pm, "lockfileVersion: '6.0'", "proj");
+            if refuses_own_scoped_file_override(&pm) {
+                println!("SKIP scoped legacy leg ({pm}): pnpm refuses its own scoped file: lock");
+                return;
+            }
+            run_legacy_capstone_for(
+                &pm,
+                "lockfileVersion: '6.0'",
+                "proj",
+                SCOPED_DEP,
+                SCOPED_DEP_VERSION,
+            );
+        }),
         _ => off_runtime(|| run_unsupported_lock_refusal(&pm)),
     }
 }
@@ -1637,6 +1675,43 @@ fn pnpm8_real_lifecycle_under_yaml_indicator_paths() {
     }
 }
 
+/// #956: a scoped package's rekeyed packages entry must keep the lock
+/// loadable. An unquoted `name: @scope/pkg` is invalid YAML, so every
+/// frozen install failed with ERR_PNPM_BROKEN_LOCKFILE after a successful
+/// vendor.
+const SCOPED_DEP: &str = "@isaacs/string-locale-compare";
+const SCOPED_DEP_VERSION: &str = "1.1.0";
+
+#[test]
+fn pnpm7_real_lifecycle_scoped_package() {
+    if !has_corepack_pm(PNPM_LEGACY_7) {
+        println!("SKIP: `corepack {PNPM_LEGACY_7}` unavailable");
+        return;
+    }
+    run_legacy_capstone_for(
+        PNPM_LEGACY_7,
+        "lockfileVersion: 5.4",
+        "proj",
+        SCOPED_DEP,
+        SCOPED_DEP_VERSION,
+    );
+}
+
+#[test]
+fn pnpm8_real_lifecycle_scoped_package() {
+    if !has_corepack_pm(PNPM_LEGACY_8) {
+        println!("SKIP: `corepack {PNPM_LEGACY_8}` unavailable");
+        return;
+    }
+    run_legacy_capstone_for(
+        PNPM_LEGACY_8,
+        "lockfileVersion: '6.0'",
+        "proj",
+        SCOPED_DEP,
+        SCOPED_DEP_VERSION,
+    );
+}
+
 /// Full lifecycle against the REAL pinned legacy pnpm, spike-proven flags:
 ///
 /// 1. online fixture install (skip when the registry is unreachable);
@@ -1653,6 +1728,11 @@ fn pnpm8_real_lifecycle_under_yaml_indicator_paths() {
 /// 5. idempotent re-vendor (byte-stable, already_vendored);
 /// 6. revert restores both files byte-identical and removes .socket/vendor.
 fn run_legacy_capstone(pm: &str, lock_head: &str, proj_dir: &str) {
+    run_legacy_capstone_for(pm, lock_head, proj_dir, DEP, DEP_VERSION);
+}
+
+/// [`run_legacy_capstone`] for any registry package `dep@version`.
+fn run_legacy_capstone_for(pm: &str, lock_head: &str, proj_dir: &str, dep: &str, version: &str) {
     let tmp = tempfile::tempdir().unwrap();
     let proj = tmp.path().join(proj_dir);
     std::fs::create_dir_all(&proj).unwrap();
@@ -1660,7 +1740,7 @@ fn run_legacy_capstone(pm: &str, lock_head: &str, proj_dir: &str) {
         "name": "pnpm-legacy-capstone",
         "version": "0.0.0",
         "private": true,
-        "dependencies": { DEP: DEP_VERSION },
+        "dependencies": { dep: version },
     });
     std::fs::write(
         proj.join("package.json"),
@@ -1688,10 +1768,10 @@ fn run_legacy_capstone(pm: &str, lock_head: &str, proj_dir: &str) {
         return;
     }
 
-    let installed_index = proj.join("node_modules").join(DEP).join("index.js");
+    let installed_index = proj.join("node_modules").join(dep).join("index.js");
     let orig = std::fs::read(&installed_index).expect("installed index.js");
     let patched: Vec<u8> = [MARKER.as_bytes(), orig.as_slice()].concat();
-    let purl = format!("pkg:npm/{DEP}@{DEP_VERSION}");
+    let purl = format!("pkg:npm/{dep}@{version}");
     stage_patch(&proj, &purl, "package/index.js", &orig, &patched);
 
     let lock_path = proj.join("pnpm-lock.yaml");
@@ -1722,18 +1802,24 @@ fn run_legacy_capstone(pm: &str, lock_head: &str, proj_dir: &str) {
     let env = parse_envelope(&stdout);
     assert_eq!(env["status"], "success", "envelope: {env}");
     assert_eq!(env["summary"]["applied"], 1, "{env}");
-    let tgz_rel = format!(".socket/vendor/npm/{UUID}/{DEP}-{DEP_VERSION}.tgz");
+    let tgz_rel = format!(".socket/vendor/npm/{UUID}/{dep}-{version}.tgz");
     assert!(proj.join(&tgz_rel).is_file());
     assert!(
         !proj.join("pnpm-workspace.yaml").exists(),
         "legacy wiring must not create pnpm-workspace.yaml ({pm})"
     );
     let lock_after = std::fs::read_to_string(&lock_path).unwrap();
+    // pnpm single-quotes an `@`-leading (scoped) key.
+    let override_key = if dep.starts_with('@') {
+        format!("'{dep}@{version}'")
+    } else {
+        format!("{dep}@{version}")
+    };
     let abs = socket_patch_core::vendor::pnpm_lock_legacy::normalize_canonical_root(
         &std::fs::canonicalize(&proj).unwrap().display().to_string(),
     );
     assert!(
-        lock_after.contains(&format!("{DEP}@{DEP_VERSION}: file:{tgz_rel}")),
+        lock_after.contains(&format!("{override_key}: file:{tgz_rel}")),
         "lock overrides must point at the vendored tarball ({pm}):\n{lock_after}"
     );
     assert!(
@@ -1857,7 +1943,7 @@ fn run_legacy_capstone(pm: &str, lock_head: &str, proj_dir: &str) {
         String::from_utf8_lossy(&plain.stderr),
     );
     let fresh_installed =
-        std::fs::read(fresh.join("node_modules").join(DEP).join("index.js")).unwrap();
+        std::fs::read(fresh.join("node_modules").join(dep).join("index.js")).unwrap();
     assert_eq!(
         fresh_installed, patched,
         "moved-checkout install must land the patched bytes ({pm})"
@@ -2136,4 +2222,155 @@ fn pnpm_vendor_keeps_user_workspace_overrides_authoritative() {
         ws_before
     );
     assert_eq!(std::fs::read_to_string(&lock_path).unwrap(), lock_before);
+}
+
+/// #957: pnpm 9+ writes a scoped `npm:` alias's target quoted
+/// (`version: '@isaacs/string-locale-compare@1.1.0'` in the root
+/// importer, `sl: '@isaacs/…@1.1.0'` in a dependent's snapshot). Vendoring
+/// can't rewrite that reference, so it must refuse the package — exactly as
+/// it refuses the unscoped `npm:left-pad@1.3.0` alias — instead of
+/// reporting success over a lock whose frozen install fails with
+/// ERR_PNPM_LOCKFILE_MISSING_DEPENDENCY. The lock, package.json and
+/// `.socket/vendor` stay untouched, and the untouched lock still
+/// frozen-installs.
+#[test]
+fn pnpm_vendor_refuses_quoted_scoped_alias_references() {
+    if !has_corepack_pm(PNPM_PRIMARY) {
+        println!("SKIP: `corepack {PNPM_PRIMARY}` unavailable");
+        return;
+    }
+    let pm = PNPM_PRIMARY;
+    const SCOPED: &str = "@isaacs/string-locale-compare";
+    const SCOPED_VERSION: &str = "1.1.0";
+    let alias = format!("npm:{SCOPED}@{SCOPED_VERSION}");
+
+    for shape in ["importer", "snapshot"] {
+        let tmp = tempfile::tempdir().unwrap();
+        let proj = tmp.path().join("proj");
+        std::fs::create_dir_all(&proj).unwrap();
+        let deps = if shape == "importer" {
+            serde_json::json!({ "sl": alias })
+        } else {
+            // A local tarball dependency that itself aliases the scoped
+            // package, so the quoted reference lands in its snapshot.
+            let pkg = tmp.path().join("host").join("package");
+            std::fs::create_dir_all(&pkg).unwrap();
+            let host = serde_json::json!({
+                "name": "host",
+                "version": "1.0.0",
+                "dependencies": { "sl": alias },
+            });
+            std::fs::write(pkg.join("package.json"), host.to_string()).unwrap();
+            std::fs::write(pkg.join("index.js"), "module.exports = require('sl');\n").unwrap();
+            let tar = Command::new("tar")
+                .args(["-czf"])
+                .arg(proj.join("host-1.0.0.tgz"))
+                .arg("package")
+                .current_dir(tmp.path().join("host"))
+                .output()
+                .expect("tar runs");
+            assert!(tar.status.success(), "{tar:?}");
+            serde_json::json!({ "host": "file:./host-1.0.0.tgz" })
+        };
+        let pkg_doc = serde_json::json!({
+            "name": "scoped-alias",
+            "version": "0.0.0",
+            "private": true,
+            "dependencies": deps,
+        });
+        let pkg_before = format!("{}\n", serde_json::to_string_pretty(&pkg_doc).unwrap());
+        std::fs::write(proj.join("package.json"), &pkg_before).unwrap();
+
+        let store = tmp.path().join("pnpm-store");
+        let install = corepack(
+            &proj,
+            pm,
+            &["install", "--store-dir", store.to_str().unwrap()],
+        );
+        if !install.status.success() {
+            assert!(!pnpm_required(), "fixture install failed: {install:?}");
+            println!("SKIP: fixture `pnpm install` failed: {install:?}");
+            return;
+        }
+        let lock_path = proj.join("pnpm-lock.yaml");
+        let lock_before = std::fs::read_to_string(&lock_path).unwrap();
+        let quoted = format!("'{SCOPED}@{SCOPED_VERSION}'");
+        let reference = if shape == "importer" {
+            format!("        version: {quoted}\n")
+        } else {
+            format!("      sl: {quoted}\n")
+        };
+        assert!(
+            lock_before.contains(&reference),
+            "{shape}: pnpm wrote the quoted alias reference:\n{lock_before}"
+        );
+
+        let installed = if shape == "importer" {
+            proj.join("node_modules/sl/index.js")
+        } else {
+            proj.join(format!(
+                "node_modules/.pnpm/{}@{SCOPED_VERSION}/node_modules/{SCOPED}/index.js",
+                SCOPED.replace('/', "+")
+            ))
+        };
+        let orig = std::fs::read(&installed)
+            .unwrap_or_else(|e| panic!("{shape}: installed {}: {e}", installed.display()));
+        let patched: Vec<u8> = [MARKER.as_bytes(), orig.as_slice()].concat();
+        let purl = format!("pkg:npm/{SCOPED}@{SCOPED_VERSION}");
+        stage_patch(&proj, &purl, "package/index.js", &orig, &patched);
+        let cwd = proj.to_str().unwrap();
+
+        let (code, stdout, stderr) =
+            run_socket(&proj, &["vendor", "--json", "--offline", "--cwd", cwd]);
+        let env = parse_envelope(&stdout);
+        assert_ne!(code, 0, "{shape}: the refusal fails the run.\n{env}");
+        assert_eq!(
+            env["summary"]["applied"], 0,
+            "{shape}: a quoted scoped alias must not vendor.\n{env}\nstderr:\n{stderr}"
+        );
+        assert!(
+            stdout.contains("vendor_lock_entry_unsupported") && stdout.contains("aliased"),
+            "{shape}: the refusal names the aliased reference: {env}"
+        );
+        assert_eq!(
+            std::fs::read_to_string(&lock_path).unwrap(),
+            lock_before,
+            "{shape}: lock untouched"
+        );
+        assert_eq!(
+            std::fs::read_to_string(proj.join("package.json")).unwrap(),
+            pkg_before,
+            "{shape}: package.json untouched"
+        );
+        assert!(
+            !proj.join(format!(".socket/vendor/npm/{UUID}")).exists(),
+            "{shape}: a refused vendor leaves no artifact"
+        );
+
+        // The untouched lock still frozen-installs from a fresh checkout.
+        let fresh = tmp.path().join("fresh");
+        std::fs::create_dir_all(&fresh).unwrap();
+        for file in ["package.json", "pnpm-lock.yaml"] {
+            std::fs::copy(proj.join(file), fresh.join(file)).unwrap();
+        }
+        if shape == "snapshot" {
+            std::fs::copy(proj.join("host-1.0.0.tgz"), fresh.join("host-1.0.0.tgz")).unwrap();
+        }
+        let ci = corepack(
+            &fresh,
+            pm,
+            &[
+                "install",
+                "--frozen-lockfile",
+                "--store-dir",
+                store.to_str().unwrap(),
+            ],
+        );
+        assert!(
+            ci.status.success(),
+            "{shape}: fresh frozen install of the untouched lock.\nstdout:\n{}\nstderr:\n{}",
+            String::from_utf8_lossy(&ci.stdout),
+            String::from_utf8_lossy(&ci.stderr),
+        );
+    }
 }

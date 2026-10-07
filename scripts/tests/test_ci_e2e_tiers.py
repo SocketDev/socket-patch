@@ -178,6 +178,8 @@ class GradleRows(unittest.TestCase):
                         self.assertEqual(row.get("jvm_tool"), "gradle")
                     elif "maven" in row:
                         self.assertEqual(row.get("jvm_tool"), "maven")
+                    elif "sbt" in row:
+                        self.assertEqual(row.get("jvm_tool"), "sbt")
                     else:
                         self.assertNotIn("jvm_tool", row)
                     self.assertIn(row.get("jvm_tool", "gradle"), ("gradle", "maven", "sbt"))

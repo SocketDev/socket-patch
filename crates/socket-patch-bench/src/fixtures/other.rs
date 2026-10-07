@@ -712,9 +712,11 @@ pub fn build_nuget(t: &mut Tree, size: Size) -> std::io::Result<Fixture> {
 
 // ── Maven ──────────────────────────────────────────────────────────────
 
-pub fn build_maven(t: &mut Tree, size: Size) -> std::io::Result<Fixture> {
-    let arts = universe(
-        "maven",
+/// The Maven-coordinate universe the Maven and Gradle fixtures share
+/// (`group:artifact` names).
+fn jvm_universe(seed: &str, size: Size) -> Vec<Pkg> {
+    universe(
+        seed,
         size,
         0.2,
         |r, i| {
@@ -731,11 +733,27 @@ pub fn build_maven(t: &mut Tree, size: Size) -> std::io::Result<Fixture> {
             format!("{g}:{a}")
         },
         gen::version,
-    );
-    let ga = |p: &Pkg| -> (String, String) {
-        let (g, a) = p.name.split_once(':').unwrap();
-        (g.to_string(), a.to_string())
-    };
+    )
+}
+
+fn ga(p: &Pkg) -> (String, String) {
+    let (g, a) = p.name.split_once(':').unwrap();
+    (g.to_string(), a.to_string())
+}
+
+/// A dependency's pom, listing its own dependencies.
+fn jvm_pom(arts: &[Pkg], p: &Pkg) -> String {
+    let (g, a) = ga(p);
+    let mut deps = String::new();
+    for &j in &p.deps {
+        let (dg, da) = ga(&arts[j]);
+        let _ = write!(deps, "    <dependency>\n      <groupId>{dg}</groupId>\n      <artifactId>{da}</artifactId>\n      <version>{}</version>\n    </dependency>\n", arts[j].version);
+    }
+    format!("<?xml version=\"1.0\" encoding=\"UTF-8\"?>\n<project>\n  <modelVersion>4.0.0</modelVersion>\n  <groupId>{g}</groupId>\n  <artifactId>{a}</artifactId>\n  <version>{}</version>\n  <dependencies>\n{deps}  </dependencies>\n</project>\n", p.version)
+}
+
+pub fn build_maven(t: &mut Tree, size: Size) -> std::io::Result<Fixture> {
+    let arts = jvm_universe("maven", size);
     let mut pom = String::from("<?xml version=\"1.0\" encoding=\"UTF-8\"?>\n<project xmlns=\"http://maven.apache.org/POM/4.0.0\" xmlns:xsi=\"http://www.w3.org/2001/XMLSchema-instance\" xsi:schemaLocation=\"http://maven.apache.org/POM/4.0.0 https://maven.apache.org/xsd/maven-4.0.0.xsd\">\n  <modelVersion>4.0.0</modelVersion>\n  <groupId>dev.socket.bench</groupId>\n  <artifactId>bench-app</artifactId>\n  <version>1.0.0</version>\n  <packaging>jar</packaging>\n\n  <properties>\n    <maven.compiler.release>17</maven.compiler.release>\n  </properties>\n\n  <dependencies>\n");
     for p in arts.iter().filter(|p| p.direct) {
         let (g, a) = ga(p);
@@ -754,12 +772,7 @@ pub fn build_maven(t: &mut Tree, size: Size) -> std::io::Result<Fixture> {
             g.replace('.', "/"),
             p.version
         );
-        let mut deps = String::new();
-        for &j in &p.deps {
-            let (dg, da) = ga(&arts[j]);
-            let _ = write!(deps, "    <dependency>\n      <groupId>{dg}</groupId>\n      <artifactId>{da}</artifactId>\n      <version>{}</version>\n    </dependency>\n", arts[j].version);
-        }
-        let pom = format!("<?xml version=\"1.0\" encoding=\"UTF-8\"?>\n<project>\n  <modelVersion>4.0.0</modelVersion>\n  <groupId>{g}</groupId>\n  <artifactId>{a}</artifactId>\n  <version>{}</version>\n  <dependencies>\n{deps}  </dependencies>\n</project>\n", p.version);
+        let pom = jvm_pom(&arts, p);
         t.write(
             &format!("{dir}/{a}-{}.pom.sha1", p.version),
             gen::sha1_hex(&pom),
@@ -778,36 +791,10 @@ pub fn build_maven(t: &mut Tree, size: Size) -> std::io::Result<Fixture> {
         .iter()
         .filter(|p| p.patched)
         .map(|p| {
-            let (g, a) = ga(p);
-            let purl = format!("pkg:maven/{g}/{a}@{}", p.version);
-            let (uuid, token) = grant(&purl);
-            let suffixed = format!("{}-socket.{}", p.version, &uuid[..8]);
-            let url = format!("{PATCH_HOST}/patch/maven/{g}/{a}/{}/{token}/{uuid}/{a}-{suffixed}.jar", p.version);
-            spec(
-                purl.clone(),
-                uuid.clone(),
-                &format!("package/{a}.class"),
-                json!({
-                    "status": "granted",
-                    "url": url,
-                    "purl": purl,
-                    "artifacts": [{ "kind": "tarball", "url": url, "integrity": {
-                        "sha256": gen::sha256_hex(&format!("patched-jar:{}", p.name)),
-                        "sha1": gen::sha1_hex(&format!("patched-jar:{}", p.name)),
-                    } }],
-                    "registryOverride": {
-                        "kind": "maven2",
-                        "indexUrl": format!("{PATCH_HOST}/patch-registry/maven/{token}/{uuid}/maven2"),
-                        "identifiers": {
-                            "name": format!("{g}/{a}"),
-                            "version": p.version,
-                            "mavenGroupId": g,
-                            "mavenArtifactId": a,
-                            "mavenSuffixedVersion": suffixed,
-                            "mavenPomSha256": gen::sha256_hex(&format!("patched-pom:{}", p.name)),
-                        },
-                    },
-                }),
+            jvm_patch(
+                p,
+                |token, uuid| format!("{PATCH_HOST}/patch-registry/maven/{token}/{uuid}/maven2"),
+                false,
             )
         })
         .collect();
@@ -821,4 +808,140 @@ pub fn build_maven(t: &mut Tree, size: Size) -> std::io::Result<Fixture> {
         ],
         &[],
     ))
+}
+
+/// The mock's patch for one Maven coordinate: a suffixed-version maven2
+/// registry override. `index_url` builds the override's repository URL
+/// from the grant token and patch uuid.
+fn jvm_patch(p: &Pkg, index_url: impl Fn(&str, &str) -> String, module_sha: bool) -> PatchSpec {
+    let (g, a) = ga(p);
+    let purl = format!("pkg:maven/{g}/{a}@{}", p.version);
+    let (uuid, token) = grant(&purl);
+    let suffixed = format!("{}-socket.{}", p.version, &uuid[..8]);
+    let url = format!(
+        "{PATCH_HOST}/patch/maven/{g}/{a}/{}/{token}/{uuid}/{a}-{suffixed}.jar",
+        p.version
+    );
+    let mut identifiers = json!({
+        "name": format!("{g}/{a}"),
+        "version": p.version,
+        "mavenGroupId": g,
+        "mavenArtifactId": a,
+        "mavenSuffixedVersion": suffixed,
+        "mavenPomSha256": gen::sha256_hex(&format!("patched-pom:{}", p.name)),
+    });
+    if module_sha {
+        identifiers["mavenModuleSha256"] =
+            json!(gen::sha256_hex(&format!("patched-module:{}", p.name)));
+    }
+    spec(
+        purl.clone(),
+        uuid.clone(),
+        &format!("package/{a}.class"),
+        json!({
+            "status": "granted",
+            "url": url,
+            "purl": purl,
+            "artifacts": [{ "kind": "tarball", "url": url, "integrity": {
+                "sha256": gen::sha256_hex(&format!("patched-jar:{}", p.name)),
+                "sha1": gen::sha1_hex(&format!("patched-jar:{}", p.name)),
+            } }],
+            "registryOverride": {
+                "kind": "maven2",
+                "indexUrl": index_url(&token, &uuid),
+                "identifiers": identifiers,
+            },
+        }),
+    )
+}
+
+// ── Gradle ─────────────────────────────────────────────────────────────
+
+/// A single-project Groovy-DSL build with dependency locking, its
+/// dependencies in Gradle's own cache (`modules-2/files-2.1`, jar and pom
+/// in separate sha1 dirs). Hosted mode wires the build through an owned
+/// settings script and index under `.socket/gradle/` and pins the
+/// suffixed versions in `gradle.lockfile`.
+pub fn build_gradle(t: &mut Tree, size: Size) -> std::io::Result<Fixture> {
+    let arts = jvm_universe("gradle", size);
+    t.write(
+        "project/settings.gradle",
+        "rootProject.name = 'bench-app'\n",
+    )?;
+    let mut build = String::from(
+        "plugins {\n    id 'java'\n}\n\nrepositories {\n    mavenCentral()\n}\n\ndependencyLocking {\n    lockAllConfigurations()\n}\n\ndependencies {\n",
+    );
+    for p in arts.iter().filter(|p| p.direct) {
+        let _ = writeln!(build, "    implementation '{}:{}'", p.name, p.version);
+    }
+    build.push_str("}\n");
+    t.write("project/build.gradle", build)?;
+    let mut sorted: Vec<&Pkg> = arts.iter().collect();
+    sorted.sort_by(|a, b| a.name.cmp(&b.name));
+    let mut lock = String::from(
+        "# This is a Gradle generated file for dependency locking.\n# Manual edits can break the build and are not advised.\n# This file is expected to be part of source control.\n",
+    );
+    for p in &sorted {
+        let _ = writeln!(
+            lock,
+            "{}:{}=compileClasspath,runtimeClasspath",
+            p.name, p.version
+        );
+    }
+    lock.push_str("empty=annotationProcessor,testAnnotationProcessor\n");
+    t.write("project/gradle.lockfile", lock)?;
+    t.write(
+        "project/gradle/wrapper/gradle-wrapper.properties",
+        "distributionBase=GRADLE_USER_HOME\ndistributionPath=wrapper/dists\ndistributionUrl=https\\://services.gradle.org/distributions/gradle-8.10.2-bin.zip\nzipStoreBase=GRADLE_USER_HOME\nzipStorePath=wrapper/dists\n",
+    )?;
+    t.write(
+        "project/src/main/java/App.java",
+        "public class App { public static void main(String[] a) {} }\n",
+    )?;
+    for p in &arts {
+        let (g, a) = ga(p);
+        let dir = format!(
+            "home/.gradle/caches/modules-2/files-2.1/{g}/{a}/{}",
+            p.version
+        );
+        let pom = jvm_pom(&arts, p);
+        let jar = format!("PK synthetic {}", p.name);
+        t.write(
+            &format!("{dir}/{}/{a}-{}.pom", gen::sha1_hex(&pom), p.version),
+            pom,
+        )?;
+        t.write(
+            &format!("{dir}/{}/{a}-{}.jar", gen::sha1_hex(&jar), p.version),
+            jar,
+        )?;
+    }
+    // Gradle's planner only takes https repositories; the CLI never
+    // fetches the index during a scan, so it need not be the mock.
+    let patches = arts
+        .iter()
+        .filter(|p| p.patched)
+        .map(|p| {
+            jvm_patch(
+                p,
+                |token, uuid| {
+                    format!("https://patch.socket.dev/patch-registry/maven/{token}/{uuid}/maven2")
+                },
+                true,
+            )
+        })
+        .collect();
+    let mut f = fixture(
+        arts.len(),
+        patches,
+        &[
+            ".socket/gradle/.gitattributes",
+            ".socket/gradle/hosted-index.tsv",
+            ".socket/gradle/socket-patch.hosted.settings.gradle",
+            "gradle.lockfile",
+            "settings.gradle",
+        ],
+        &["redirect_gradle_detached_configs_unguarded"],
+    );
+    f.env_paths = vec![("GRADLE_USER_HOME", "home/.gradle")];
+    Ok(f)
 }

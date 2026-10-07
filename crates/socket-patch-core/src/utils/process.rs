@@ -17,8 +17,81 @@
 //! runner or thread a singleton.
 
 use std::ffi::OsString;
+use std::io::Read;
 use std::path::{Path, PathBuf};
-use std::process::Command;
+use std::process::{Command, Output, Stdio};
+use std::time::{Duration, Instant};
+
+/// How long a crawler probe (`gem env gemdir`, `npm root -g`, `python3
+/// --version`, ...) may run before it is killed and answers "no
+/// information". The same budget the Pipenv and Hatch version probes and the
+/// self-update `--version` check use.
+pub const PROBE_TIMEOUT: Duration = Duration::from_secs(10);
+
+/// Why [`output_within`] produced no [`Output`].
+#[derive(Debug)]
+pub enum BoundedError {
+    /// The child could not be spawned (missing program, ETXTBSY, ...).
+    Spawn(std::io::Error),
+    /// The child did not exit and close stdout within the budget; it was
+    /// killed.
+    TimedOut,
+}
+
+/// Run `command` to completion within `budget`: the one bounded spawn every
+/// probe goes through.
+///
+/// stdin is null (the child can't wait for input), stdout is captured and
+/// stderr is discarded. When the child has not exited and closed stdout by
+/// the deadline it is killed and reaped, and the call returns
+/// [`BoundedError::TimedOut`] without waiting for a grandchild that still
+/// holds the pipe (a `#!/bin/sh` shim's `sleep`). A wedged toolchain shim (a
+/// version manager prompting for an install, a Ruby waiting on a network
+/// gem home) therefore costs at most `budget`, never the whole run.
+///
+/// Blocking: async callers run it through `utils::fs::run_blocking`.
+pub fn output_within(mut command: Command, budget: Duration) -> Result<Output, BoundedError> {
+    let deadline = Instant::now() + budget;
+    let mut child = command
+        .stdin(Stdio::null())
+        .stdout(Stdio::piped())
+        .stderr(Stdio::null())
+        .spawn()
+        .map_err(BoundedError::Spawn)?;
+    let mut stdout = child.stdout.take().expect("stdout is piped");
+    let (sender, receiver) = std::sync::mpsc::channel();
+    std::thread::spawn(move || {
+        let mut bytes = Vec::new();
+        let _ = stdout.read_to_end(&mut bytes);
+        let _ = sender.send(bytes);
+    });
+    let timed_out = |child: &mut std::process::Child| {
+        let _ = child.kill();
+        let _ = child.wait();
+        Err(BoundedError::TimedOut)
+    };
+    let Ok(stdout) = receiver.recv_timeout(deadline.saturating_duration_since(Instant::now()))
+    else {
+        return timed_out(&mut child);
+    };
+    loop {
+        match child.try_wait() {
+            Ok(Some(status)) => {
+                return Ok(Output {
+                    status,
+                    stdout,
+                    stderr: Vec::new(),
+                })
+            }
+            Ok(None) if Instant::now() < deadline => std::thread::sleep(Duration::from_millis(5)),
+            Ok(None) => return timed_out(&mut child),
+            Err(error) => {
+                let _ = child.kill();
+                return Err(BoundedError::Spawn(error));
+            }
+        }
+    }
+}
 
 /// The executable `name` on ABSOLUTE `PATH` entries only, or `None` when
 /// no entry holds one.
@@ -212,6 +285,16 @@ pub(crate) fn neutral_probe_dir_with(var: &impl Fn(&str) -> Option<OsString>) ->
 /// names a path is spawned as given) with `args`, optionally from `cwd`,
 /// and return its trimmed stdout under the [`CommandRunner`] contract.
 fn run_resolved(bin: &str, args: &[&str], cwd: Option<&Path>) -> Option<String> {
+    run_resolved_within(bin, args, cwd, PROBE_TIMEOUT)
+}
+
+/// [`run_resolved`] under an explicit budget (tests).
+fn run_resolved_within(
+    bin: &str,
+    args: &[&str],
+    cwd: Option<&Path>,
+    budget: Duration,
+) -> Option<String> {
     let program = if Path::new(bin).components().count() > 1 {
         PathBuf::from(bin)
     } else {
@@ -233,7 +316,19 @@ fn run_resolved(bin: &str, args: &[&str], cwd: Option<&Path>) -> Option<String> 
     if let Some(cwd) = cwd {
         command.current_dir(cwd);
     }
-    let output = command.output().ok()?;
+    let output = match output_within(command, budget) {
+        Ok(output) => output,
+        Err(BoundedError::TimedOut) => {
+            if crate::utils::env_compat::is_debug_enabled() {
+                eprintln!(
+                    "[socket-patch debug] probe `{bin} {}` did not answer within {budget:?}; treating it as absent",
+                    args.join(" ")
+                );
+            }
+            return None;
+        }
+        Err(BoundedError::Spawn(_)) => return None,
+    };
     if !output.status.success() {
         return None;
     }
@@ -258,6 +353,79 @@ mod tests {
         let runner = SystemCommandRunner;
         let out = runner.run("echo", &["hello"]).expect("echo should succeed");
         assert_eq!(out, "hello");
+    }
+
+    /// A probe that never answers (a wedged `gem` shim) is killed at the
+    /// budget and answers "no information" instead of hanging the crawl.
+    /// On `main` `run_resolved` waited on `output()` with no deadline.
+    #[cfg(unix)]
+    #[test]
+    fn a_hung_probe_answers_none_within_its_budget() {
+        let tmp = tempfile::tempdir().unwrap();
+        let shim = tmp.path().join("gem");
+        std::fs::write(&shim, "#!/bin/sh\nexec sleep 30\n").unwrap();
+        set_executable(&shim);
+        let start = Instant::now();
+        let out = run_resolved_within(
+            shim.to_str().unwrap(),
+            &["env", "gemdir"],
+            None,
+            Duration::from_millis(300),
+        );
+        assert_eq!(out, None);
+        assert!(
+            start.elapsed() < Duration::from_secs(10),
+            "the budget must bound the probe, took {:?}",
+            start.elapsed()
+        );
+    }
+
+    /// A shim that forks its child (no `exec`) leaves a grandchild holding
+    /// stdout after the shim is killed: the deadline still returns.
+    #[cfg(unix)]
+    #[test]
+    fn output_within_does_not_wait_for_a_grandchild_holding_stdout() {
+        let mut command = Command::new("sh");
+        command.args(["-c", "sleep 30; echo late"]);
+        let start = Instant::now();
+        let result = output_within(command, Duration::from_millis(300));
+        assert!(matches!(result, Err(BoundedError::TimedOut)), "{result:?}");
+        assert!(
+            start.elapsed() < Duration::from_secs(10),
+            "{:?}",
+            start.elapsed()
+        );
+    }
+
+    /// The bounded spawn keeps the `output()` contract the former callers
+    /// relied on: stdout captured, stderr dropped, exit status reported,
+    /// stdin null, a missing program surfaced as a spawn error.
+    #[cfg(unix)]
+    #[test]
+    fn output_within_reports_status_stdout_and_spawn_errors() {
+        let mut ok = Command::new("sh");
+        ok.args(["-c", "printf out; printf err >&2"]);
+        let output = output_within(ok, PROBE_TIMEOUT).unwrap();
+        assert!(output.status.success());
+        assert_eq!(output.stdout, b"out");
+        assert!(output.stderr.is_empty());
+
+        let mut failing = Command::new("sh");
+        failing.args(["-c", "printf partial; exit 3"]);
+        let output = output_within(failing, PROBE_TIMEOUT).unwrap();
+        assert_eq!(output.status.code(), Some(3));
+        assert_eq!(output.stdout, b"partial");
+
+        let mut reads_stdin = Command::new("sh");
+        reads_stdin.args(["-c", "cat; printf done"]);
+        let output = output_within(reads_stdin, PROBE_TIMEOUT).unwrap();
+        assert_eq!(output.stdout, b"done", "stdin is null, so `cat` sees EOF");
+
+        let missing = Command::new("/definitely/not/a/real/binary-1234567");
+        assert!(matches!(
+            output_within(missing, PROBE_TIMEOUT),
+            Err(BoundedError::Spawn(_))
+        ));
     }
 
     /// Spawn failure → None. The binary name is intentionally one
