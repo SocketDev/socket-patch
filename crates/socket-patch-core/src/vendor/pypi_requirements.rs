@@ -1592,7 +1592,9 @@ mod tests {
     /// root; a pin there must refuse exactly like a `../` include. Mangling it
     /// into an in-root relative path silently skips the file pip *can* read,
     /// and the transitive line appended at the root EOF gives pip a "double
-    /// requirement" error.
+    /// requirement" error. The path is quoted, as pip needs it on Windows:
+    /// pip `shlex`-splits the line, so an unquoted `C:\…` loses its
+    /// backslashes (#994).
     #[tokio::test]
     async fn pin_in_absolute_include_refuses() {
         let outer = tempfile::tempdir().unwrap();
@@ -1600,7 +1602,7 @@ mod tests {
         tokio::fs::create_dir_all(&root).await.unwrap();
         let shared = outer.path().join("shared.txt");
         tokio::fs::write(&shared, "six==1.16.0\n").await.unwrap();
-        let root_content = format!("-r {}\n", shared.display());
+        let root_content = format!("-r \"{}\"\n", shared.display());
         tokio::fs::write(root.join("requirements.txt"), &root_content)
             .await
             .unwrap();
