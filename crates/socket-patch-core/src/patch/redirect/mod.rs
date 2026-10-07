@@ -6817,18 +6817,16 @@ fn rewrite_maven_pom(
     // is an earlier generation of OUR pin. A vendored reactor / sbt pin
     // writes the same `-socket.<hex8>` suffix under a
     // `socket-patch-vendor-<uuid>` repository, which stays a mismatch.
-    let hosted_repo_generations: std::collections::BTreeSet<String> = pom
-        .as_deref()
-        .map(|text| {
-            generation::named_generations(text)
-                .into_iter()
-                .filter(|uuid| {
-                    !maven_repositories_with_id(text, &generation::hosted_pin_name(uuid))
-                        .is_empty()
-                })
-                .collect()
-        })
-        .unwrap_or_default();
+    //
+    // One pass over the pom's repositories: `(id, url)` of each, which also
+    // answers the per-dep URL-refresh check below while the pom is still
+    // unchanged (a no-op rescan then never re-scans the pom per dep).
+    let original_repos: Vec<(String, Option<String>)> =
+        pom.as_deref().map(maven_repository_ids_and_urls).unwrap_or_default();
+    let hosted_repo_generations: std::collections::BTreeSet<String> = original_repos
+        .iter()
+        .filter_map(|(id, _)| generation::pin_name_uuid(id, false).map(str::to_string))
+        .collect();
     let mut mvn_config = files.get(MVN_CONFIG).cloned().unwrap_or_default();
     let mut mvn_config_changed = false;
     // (local-repo-relative path, bare sha256 hex) entries to merge in.
@@ -7135,7 +7133,19 @@ fn rewrite_maven_pom(
         // A rotated grant token keeps the uuid but changes the repository
         // URL: refresh the existing `socket-patch-<uuid>` repository in place
         // so the pin keeps resolving through the current grant.
-        if pin_landed || versioned.iter().any(|(_, _, v)| *v == suffixed_version) {
+        // While the pom is unchanged, `original_repos` already says whether
+        // the refresh would change anything (exactly one such repository,
+        // with a `<url>` that differs); skip the scan when it would not.
+        let refresh_may_apply = pom_changed || {
+            let mut ours = original_repos.iter().filter(|(id, _)| *id == repo_id);
+            match (ours.next(), ours.next()) {
+                (Some((_, Some(url))), None) => *url != ov.index_url,
+                _ => false,
+            }
+        };
+        if refresh_may_apply
+            && (pin_landed || versioned.iter().any(|(_, _, v)| *v == suffixed_version))
+        {
             if let Some(next) = refresh_maven_repository_url(pom_text, &repo_id, &ov.index_url) {
                 *pom_text = next;
                 pom_changed = true;
@@ -7285,12 +7295,28 @@ fn rewrite_maven_pom(
     }
 }
 
+static MAVEN_REPOSITORY_RE: LazyLock<Regex> = LazyLock::new(|| {
+    Regex::new(r"(?s)<repository>.*?</repository>").expect("static repository regex is valid")
+});
+
+/// The trimmed `<id>` and `<url>` texts of every `<repository>` element of
+/// `pom` that has an `<id>`, in document order: the same elements, ids and
+/// URLs [`maven_repositories_with_id`] and [`refresh_maven_repository_url`]
+/// read, in one pass.
+fn maven_repository_ids_and_urls(pom: &str) -> Vec<(String, Option<String>)> {
+    MAVEN_REPOSITORY_RE
+        .find_iter(pom)
+        .filter_map(|m| {
+            let id = maven_tag_text_in(pom, "id", m.start(), m.end())?;
+            let url = maven_tag_text_in(pom, "url", m.start(), m.end());
+            Some((id, url))
+        })
+        .collect()
+}
+
 /// The `<repository>` elements of `pom` whose `<id>` is `id`, as byte spans.
 pub(crate) fn maven_repositories_with_id(pom: &str, id: &str) -> Vec<(usize, usize)> {
-    static REPOSITORY_RE: LazyLock<Regex> = LazyLock::new(|| {
-        Regex::new(r"(?s)<repository>.*?</repository>").expect("static repository regex is valid")
-    });
-    REPOSITORY_RE
+    MAVEN_REPOSITORY_RE
         .find_iter(pom)
         .filter(|m| maven_tag_text_in(pom, "id", m.start(), m.end()).as_deref() == Some(id))
         .map(|m| (m.start(), m.end()))
