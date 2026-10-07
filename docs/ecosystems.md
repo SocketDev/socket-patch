@@ -78,8 +78,15 @@ The backticked slug in each row is the value `-e`/`--ecosystems` accepts (e.g.
   matching package instance is rewritten; an unsupported instance prevents
   confirming that dependency across the lockfile set. Rollback preserves the
   original resolution fragments.
-  For root 9.0 locks, the CLI configures `trustLockfile: true` in
-  `pnpm-workspace.yaml` unless opted out with `--no-trust-lockfile-config` or
+  A workspace with `sharedWorkspaceLockfile: false` (`shared-workspace-lockfile=false`
+  in `.npmrc` on pnpm 10 and older) installs each member from its own lock:
+  run from the workspace root, every `packages:` member's `pnpm-lock.yaml` is
+  pinned beside the root's (pnpm 7 writes no root lock at all), and `list`,
+  `vex` and `rollback` read the member locks too. Member locks beside a root
+  lock that lists member importers are stale and ignored. A member list the
+  CLI cannot read is refused with `redirect_pnpm_member_locks_unresolved`.
+  For 9.0 root or member locks, the CLI configures `trustLockfile: true` in
+  the root `pnpm-workspace.yaml` unless opted out with `--no-trust-lockfile-config` or
   explicitly disabled by the project. pnpm >=11 needs this for hosted URLs.
   This skips registry re-verification for the whole lock; tarball integrity
   remains enforced. pnpm <=10 does not need the setting.

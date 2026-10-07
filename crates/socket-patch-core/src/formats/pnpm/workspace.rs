@@ -51,6 +51,18 @@ pub(crate) fn top_level_key(line: &str) -> Option<(String, &str)> {
     Some((key, strip_comment(rest).trim()))
 }
 
+/// The value of the last top-level `key` in a YAML settings file
+/// (pnpm-workspace.yaml, .yarnrc.yml), quotes removed.
+pub(crate) fn yaml_top_level_value(text: &str, key: &str) -> Option<String> {
+    text.strip_prefix('\u{feff}')
+        .unwrap_or(text)
+        .lines()
+        .filter_map(top_level_key)
+        .rfind(|(k, _)| k == key)
+        .map(|(_, value)| value.trim_matches(['"', '\'']).to_string())
+        .filter(|value| !value.is_empty())
+}
+
 /// The line index a new top-level key is inserted at: after the document's
 /// last non-blank line, before a `...` end marker. `Err` names why the
 /// document is not a single block mapping a line append can extend.
@@ -123,6 +135,77 @@ pub(crate) fn block_section_bounds(lines: &[String], name: &str) -> Option<(usiz
         .map(|(i, _)| i)
         .unwrap_or(lines.len());
     Some((start, end))
+}
+
+/// The `packages:` globs of a pnpm-workspace.yaml, quotes removed (a
+/// negation keeps its leading `!`), from a block sequence (items indented
+/// or at column 0) or a one-line flow sequence. `Ok` and empty when the
+/// file has no top-level `packages:` key; `Err` names a value this reader
+/// cannot follow (a scalar, a multi-line flow, an anchor or alias, a nested
+/// node), which a caller must not take for "no members".
+pub(crate) fn package_globs(text: &str) -> Result<Vec<String>, String> {
+    let text = text.strip_prefix('\u{feff}').unwrap_or(text);
+    let lines: Vec<&str> = text
+        .lines()
+        .map(|l| l.strip_suffix('\r').unwrap_or(l))
+        .collect();
+    let Some(start) = lines
+        .iter()
+        .rposition(|l| top_level_key(l).is_some_and(|(key, _)| key == "packages"))
+    else {
+        return Ok(Vec::new());
+    };
+    let inline = top_level_key(lines[start]).map_or("", |(_, value)| value);
+    if !inline.is_empty() {
+        let inner = inline
+            .strip_prefix('[')
+            .and_then(|rest| rest.strip_suffix(']'))
+            .ok_or_else(|| format!("`packages: {inline}` is not a one-line list"))?;
+        return inner
+            .split(',')
+            .map(str::trim)
+            .filter(|item| !item.is_empty())
+            .map(glob_scalar)
+            .collect();
+    }
+    let mut out = Vec::new();
+    for line in &lines[start + 1..] {
+        let trimmed = line.trim_start_matches([' ', '\t']);
+        if trimmed.is_empty() || trimmed.starts_with('#') {
+            continue;
+        }
+        let item = trimmed
+            .strip_prefix('-')
+            .filter(|rest| rest.is_empty() || rest.starts_with([' ', '\t']));
+        match item {
+            Some(item) => out.push(glob_scalar(strip_comment(item).trim())?),
+            None if line.starts_with([' ', '\t']) => {
+                return Err(format!("`packages:` holds a non-list line {trimmed:?}"));
+            }
+            // The next top-level key (or a document marker) ends the list.
+            None => break,
+        }
+    }
+    Ok(out)
+}
+
+/// One `packages:` item: a plain or quoted scalar, quotes removed.
+fn glob_scalar(raw: &str) -> Result<String, String> {
+    let quoted = match raw.as_bytes().first() {
+        Some(b'"') => double_quoted(raw),
+        Some(b'\'') => single_quoted(raw),
+        // An anchor, alias, block scalar, nested node, or tag (YAML reads an
+        // unquoted `!x` as a tag, so a negation must be quoted).
+        Some(b'&' | b'*' | b'|' | b'>' | b'{' | b'[' | b'?' | b'!' | b'%' | b'@' | b'`') => {
+            return Err(format!("`packages:` item {raw:?} is not a plain glob"));
+        }
+        Some(_) => return Ok(raw.to_string()),
+        None => return Err("`packages:` holds an empty item".to_string()),
+    };
+    match quoted {
+        Some((value, len)) if len == raw.len() && !value.is_empty() => Ok(value),
+        _ => Err(format!("`packages:` item {raw:?} is not a plain glob")),
+    }
 }
 
 /// Whether `line` is the document marker `marker` (`---` / `...`), alone or
@@ -244,6 +327,42 @@ mod tests {
             "key:value",
         ] {
             assert_eq!(top_level_key(line), None, "{line:?}");
+        }
+    }
+
+    #[test]
+    fn package_globs_read_block_flow_quoted_and_negated_items() {
+        let globs = |text: &str| package_globs(text);
+        assert_eq!(
+            globs("packages:\n  - packages/*\n  - 'apps/**' # web\n  - \"!**/fixtures/**\"\nsharedWorkspaceLockfile: false\n"),
+            Ok(vec![
+                "packages/*".to_string(),
+                "apps/**".to_string(),
+                "!**/fixtures/**".to_string()
+            ])
+        );
+        // Items at column 0, CRLF, a BOM, comments between items.
+        assert_eq!(
+            globs("\u{feff}packages:\r\n# members\r\n- a\r\n\r\n- b\r\ncatalog: {}\r\n"),
+            Ok(vec!["a".to_string(), "b".to_string()])
+        );
+        assert_eq!(
+            globs("packages: ['packages/*', \"!packages/x\"]\n"),
+            Ok(vec!["packages/*".to_string(), "!packages/x".to_string()])
+        );
+        assert_eq!(globs("packages: []\n"), Ok(Vec::new()));
+        assert_eq!(globs("trustLockfile: true\n"), Ok(Vec::new()));
+        // Shapes this reader cannot follow are errors, never "no members".
+        for text in [
+            "packages: *members\n",
+            "packages: packages/*\n",
+            "packages: [a,\n  b]\n",
+            "packages:\n  - !packages/x\n",
+            "packages:\n  - *alias\n",
+            "packages:\n  key: value\n",
+            "packages:\n  - 'unterminated\n",
+        ] {
+            assert!(globs(text).is_err(), "{text:?}");
         }
     }
 

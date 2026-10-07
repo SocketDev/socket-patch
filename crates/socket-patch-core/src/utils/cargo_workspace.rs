@@ -45,24 +45,31 @@ pub fn member_manifests_in(view: &ProjectView<'_>) -> Vec<String> {
     }
 }
 
-/// The three filesystem questions the member walk asks, keyed by
-/// `/`-separated root-relative paths (`""` is the root).
-trait Tree {
-    /// A regular (non-symlink) manifest file's walk facts.
-    fn read_manifest(&self, rel: &str) -> Option<Arc<ManifestFacts>>;
+/// The two directory questions a glob walk asks, keyed by `/`-separated
+/// root-relative paths (`""` is the root). Shared with the pnpm workspace
+/// member walk ([`crate::utils::pnpm_workspace`]).
+pub(crate) trait DirTree {
     /// A real directory (not a symbolic link).
     fn is_real_dir(&self, rel: &str) -> bool;
     /// The real sub-directory names of `rel`, or `None` when unreadable.
     fn child_dirs(&self, rel: &str) -> Option<Vec<String>>;
 }
 
-struct DiskTree<'a>(&'a Path);
+/// The member walk's questions: the directory ones plus a manifest read.
+trait Tree: DirTree {
+    /// A regular (non-symlink) manifest file's walk facts.
+    fn read_manifest(&self, rel: &str) -> Option<Arc<ManifestFacts>>;
+}
+
+pub(crate) struct DiskTree<'a>(pub(crate) &'a Path);
 
 impl Tree for DiskTree<'_> {
     fn read_manifest(&self, rel: &str) -> Option<Arc<ManifestFacts>> {
         read_manifest(&self.0.join(rel))
     }
+}
 
+impl DirTree for DiskTree<'_> {
     fn is_real_dir(&self, rel: &str) -> bool {
         is_real_dir(&self.0.join(rel))
     }
@@ -79,14 +86,16 @@ impl Tree for DiskTree<'_> {
     }
 }
 
-struct MemoryTree<'a>(&'a MemoryProject);
+pub(crate) struct MemoryTree<'a>(pub(crate) &'a MemoryProject);
 
 impl Tree for MemoryTree<'_> {
     fn read_manifest(&self, rel: &str) -> Option<Arc<ManifestFacts>> {
         let doc: DocumentMut = self.0.text(rel)?.parse().ok()?;
         Some(Arc::new(ManifestFacts::of(&doc)))
     }
+}
 
+impl DirTree for MemoryTree<'_> {
     fn is_real_dir(&self, rel: &str) -> bool {
         self.0.is_dir(rel)
     }
@@ -119,10 +128,12 @@ fn member_manifests_with(tree: &dyn Tree) -> Vec<String> {
     let mut queue: Vec<(String, Arc<ManifestFacts>)> = Vec::new();
 
     if let Some((members, exclude)) = &facts.workspace {
-        let excluded: BTreeSet<String> =
-            exclude.iter().flat_map(|p| expand_glob(tree, p)).collect();
+        let excluded: BTreeSet<String> = exclude
+            .iter()
+            .flat_map(|p| expand_glob(tree, p, CARGO_SKIP))
+            .collect();
         for pattern in members {
-            for dir in expand_glob(tree, pattern) {
+            for dir in expand_glob(tree, pattern, CARGO_SKIP) {
                 if !excluded.contains(&dir) {
                     enqueue(tree, dir, &mut dirs, &mut queue);
                 }
@@ -220,7 +231,9 @@ fn member_manifests_unmemoized(root: &Path) -> Vec<String> {
             let doc: DocumentMut = std::fs::read_to_string(path).ok()?.parse().ok()?;
             Some(Arc::new(ManifestFacts::of(&doc)))
         }
+    }
 
+    impl DirTree for UnmemoizedDiskTree<'_> {
         fn is_real_dir(&self, rel: &str) -> bool {
             DiskTree(self.0).is_real_dir(rel)
         }
@@ -240,7 +253,7 @@ fn is_real_dir(path: &Path) -> bool {
 
 /// Every component of repo-relative `dir` is a real directory under
 /// the root — none is a symbolic link (which may lead outside the root).
-fn is_real_dir_path(tree: &dyn Tree, dir: &str) -> bool {
+pub(crate) fn is_real_dir_path(tree: &dyn DirTree, dir: &str) -> bool {
     let mut at = String::new();
     dir.split('/').all(|seg| {
         at = join_rel(&at, seg);
@@ -345,21 +358,33 @@ pub(crate) fn normalize_rel(base: &str, rel: &str) -> Option<String> {
     Some(parts.join("/"))
 }
 
+/// The directory names a cargo glob never descends into: its build
+/// directory.
+const CARGO_SKIP: &[&str] = &["target"];
+
 /// Expand a cargo `members` / `exclude` glob (`*`, `?`, `**`) to the
-/// repo-relative directories it names.
-fn expand_glob(tree: &dyn Tree, pattern: &str) -> Vec<String> {
+/// repo-relative directories it names. A wildcard segment never matches a
+/// dot-directory or a name in `skip`; a literal segment names any real
+/// directory.
+pub(crate) fn expand_glob(tree: &dyn DirTree, pattern: &str, skip: &[&str]) -> Vec<String> {
     let Some(normalized) = normalize_rel("", pattern.trim_end_matches('/')) else {
         return Vec::new();
     };
     let segments: Vec<&str> = normalized.split('/').filter(|s| !s.is_empty()).collect();
     let mut out = Vec::new();
-    expand_from(tree, String::new(), &segments, &mut out);
+    expand_from(tree, String::new(), &segments, skip, &mut out);
     out.sort();
     out.dedup();
     out
 }
 
-fn expand_from(tree: &dyn Tree, at: String, rest: &[&str], out: &mut Vec<String>) {
+fn expand_from(
+    tree: &dyn DirTree,
+    at: String,
+    rest: &[&str],
+    skip: &[&str],
+    out: &mut Vec<String>,
+) {
     if out.len() >= MAX_MANIFESTS {
         return;
     }
@@ -370,7 +395,7 @@ fn expand_from(tree: &dyn Tree, at: String, rest: &[&str], out: &mut Vec<String>
     if !seg.contains(['*', '?']) {
         let next = join_rel(&at, seg);
         if tree.is_real_dir(&next) {
-            expand_from(tree, next, tail, out);
+            expand_from(tree, next, tail, skip, out);
         }
         return;
     }
@@ -379,19 +404,19 @@ fn expand_from(tree: &dyn Tree, at: String, rest: &[&str], out: &mut Vec<String>
     };
     let mut children: Vec<String> = entries
         .into_iter()
-        .filter(|name| !name.starts_with('.') && name != "target")
+        .filter(|name| !name.starts_with('.') && !skip.contains(&name.as_str()))
         .collect();
     children.sort();
     if *seg == "**" {
-        expand_from(tree, at.clone(), tail, out);
+        expand_from(tree, at.clone(), tail, skip, out);
         for child in children {
-            expand_from(tree, join_rel(&at, &child), rest, out);
+            expand_from(tree, join_rel(&at, &child), rest, skip, out);
         }
         return;
     }
     for child in children {
         if wildcard_match(seg.as_bytes(), child.as_bytes()) {
-            expand_from(tree, join_rel(&at, &child), tail, out);
+            expand_from(tree, join_rel(&at, &child), tail, skip, out);
         }
     }
 }
