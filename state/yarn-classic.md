@@ -1,6 +1,6 @@
 [agent] Progress ledger for the scheduled Yarn classic (1.x) bug-hunt routine (label pm:yarn-classic).
 
-Last updated: 2026-10-07 (run 27), main `9c43dfc`, latest release v4.0.0. Runs 5–27 added the cells in "Run 5 cells" through "Run 27 cells" below. The project-mode matrix below was measured on `f6b7fb9` (v4); cells marked "(v5)", the global matrix and the "v5 project-mode cells" list were re-run on v5.
+Last updated: 2026-10-07 (run 28), main `1c6c509`, latest release v4.0.0. Runs 5–28 added the cells in "Run 5 cells" through "Run 28 cells" below. Since run 28, #364, #921, #857, #884, #831 and #974 are closed by merged fixes; the old `fail #364` cells now mean a project-level mirror is refused (pass), and #1013 is the remaining gap. The project-mode matrix below was measured on `f6b7fb9` (v4); cells marked "(v5)", the global matrix and the "v5 project-mode cells" list were re-run on v5.
 
 ## Coverage matrix
 
@@ -12,15 +12,15 @@ Cells are "pass", "fail #N", "n/a", "CI" or "untested". H = hosted, V = vendored
 | Linux | 1.1.0 / 1.2.1 / 1.4.0 (run 26) | pass | untested | untested | H pass (run 26) | H→V→H pass (V n/a ≤1.6) | H pass (run 26) | n/a (yarn ≤1.6) | n/a | pass (run 27) |
 | Linux | 1.3.2 / 1.5.1 (run 23, 26) | pass | untested | untested | H pass (run 26) | H→V→H pass (V n/a ≤1.6) | H pass (run 26) | n/a (yarn ≤1.6) | n/a | pass |
 | Linux | 1.6.0 | pass | n/a (yarn limitation) | untested | H pass | untested | H pass (run 16) | n/a (yarn ≤1.6) | n/a | pass (run 17) |
-| Linux | 1.7.0 | CI | fail #364 (`--offline`) | pass (run 20, #363 fixed; V git-only: #857) | pass | pass (run 16) | pass (run 16) | pass | untested | pass (run 17) |
-| Linux | 1.9.4 | CI | fail #364 (`--offline`) | untested | H pass (run 26) | pass (run 26) | H pass (run 26) | CI | pass (run 16) | pass (run 17) |
-| Linux | 1.10.1 | pass | fail #364 | V git-only: #857 (run 20) | pass | pass | pass (run 16, + BOM) | pass | pass | pass (+ `--install.modules-folder`, run 9) |
+| Linux | 1.7.0 | CI | refused (#364 fixed, untested on run 28) | pass (run 20, #363 fixed; V git-only: #857) | pass | pass (run 16) | pass (run 16) | pass | untested | pass (run 17) |
+| Linux | 1.9.4 | CI | refused (#364 fixed, untested on run 28) | untested | H pass (run 26) | pass (run 26) | H pass (run 26) | CI | pass (run 16) | pass (run 17) |
+| Linux | 1.10.1 | pass | refused (#364 fixed); outside-project mirror: fail #1013 | V git-only: #857 (run 20) | pass | pass | pass (run 16, + BOM) | pass | pass | pass (+ `--install.modules-folder`, run 9) |
 | Linux | 1.10.0 / 1.19.0 / 1.19.1 / 1.22.0 (run 24) | pass (+ warm in-place, vex) | untested | untested | untested | untested | untested | pass (+ byte-exact rollback) | untested | pass |
-| Linux | 1.17.3 | pass (in-place) | fail #364 | untested | untested | untested | untested | pass (in-place) | pass (run 16) | pass (run 17) |
-| Linux | 1.22.22 | pass (v5, + hosted rollback pass) | fail #364 (v5) | pass (run 20, #363 fixed by #710; V git-only: #857; H pin + git sibling: #828) | pass | pass | pass | pass | pass | pass |
+| Linux | 1.17.3 | pass (in-place) | refused (#364 fixed, untested on run 28) | untested | untested | untested | untested | pass (in-place) | pass (run 16) | pass (run 17) |
+| Linux | 1.22.22 | pass (v5, + hosted rollback pass) | refused (#364 fixed); outside-project mirror: fail #1013 | pass (run 20, #363 fixed by #710; V git-only: #857; H pin + git sibling: #828) | pass | pass | pass | pass | pass | pass |
 | macOS | 1.7.0 | untested | untested | fail #363 | pass | pass | pass | pass | pass (run 18) | pass (run 18) |
-| macOS | 1.10.1 / 1.22.22 | pass (probe) | fail #364 | fail #363 | pass | pass | pass | pass | pass (run 18) | pass (run 18) |
-| Windows | 1.7.0 / 1.10.1 / 1.22.22 | pass (probe) | fail #364 (1.10.1/1.22.22) | fail #363 (vendored: `Couldn't find the binary git`) | pass | pass | pass | pass | pass (run 18) | pass (run 18) |
+| macOS | 1.10.1 / 1.22.22 | pass (probe) | refused (#364 fixed, untested on run 28) | fail #363 | pass | pass | pass | pass | pass (run 18) | pass (run 18) |
+| Windows | 1.7.0 / 1.10.1 / 1.22.22 | pass (probe) | refused (#364 fixed, untested on run 28) | fail #363 (vendored: `Couldn't find the binary git`) | pass | pass | pass | pass | pass (run 18) | pass (run 18) |
 
 ### Global mode (`-g`) on v5 `2463257` (rows marked run 10 re-measured on `045d7ec`)
 Report = `scan -g` report-only + no leakage; refusal = `scan -g/--global-prefix/SOCKET_GLOBAL --mode hosted` exits 2; A = agent apply + import + `vex -g` + `rollback -g` byte-exact; get-mode = `get -g --mode hosted|vendored` / `scan -g --mode vendored`; RO = read-only global folder fails loudly.
@@ -192,9 +192,17 @@ Other cells that pass on Linux 1.22.22 (some also on older releases; see the ent
 - Agent apply + vex + rollback on 1.1.0 / 1.2.1 / 1.4.0: pass.
 - PR #976 fixes #974 on x64 + arm64 Alpine (Node 18 / 22, yarn 1.7.0 / 1.22.22, local + global) (probe run 37582882236). PR #978 would drop the yarn-1 PnP diagnosis under an ancestor `.yarnrc.yml` `nodeLinker` or `YARN_NODE_LINKER` (commented on #975).
 
+### Run 28 cells (Linux, `1c6c509`)
+- **Hosted with `yarn-offline-mirror` set outside the project (parent-dir `.yarnrc`, `~/.yarnrc`, `~/.npmrc`, `yarn config set` user config): fail #1013.** The #839 refusal reads only `<project>/.yarnrc` / `.npmrc`, so the scan reports success with no warning, every frozen install fails the integrity check, and VEX attests. Seen on 1.10.1 / 1.22.22, ×2 each. On 1.7.0 the install passes without `--offline` (no `integrity` line) and VEX still attests.
+- #364 fix (#839), project `.yarnrc` mirror: refused, lock untouched, no attestation (1.22.22): pass.
+- #884 fix (#901), hosted scan from a member with its own nested copy: exits 1 `redirect_workspace_lockfile_elsewhere`, nothing written (1.22.22): pass.
+- #921 fix (#924), `file:` member copy beside a root registry block: H warns `redirect_yarn_classic_directory_skipped` and VEX omits the package (1.22.22): pass.
+- Re-triage: #467 (mixed EOL, hosted) and #691 (vendored install from a member dir) still reproduce; commented on both.
+
 ## Backlog
 
-1. Re-check #991 on npm / pnpm vendored, and hand it over if it's family-wide. Re-check #974 once PR #976 merges (verified run 27), and #975's yarn-1 PnP cell once PR #978 merges. Re-check once merged: #938 (PR #940, verified run 25), #921 / #857 (PR #924, #921 verified run 25), #884 (PR #901, verified run 22; also covers the positional PATH form), #364 (PR #839), #831 (PR #837), #907 (PR #917), #778 (yarn classic nested copies, run 25), plus #828's yarn git-sibling shape. Then #467 / #519 / #558 / #591 / #691 / #692 / #758.
+0. #1013 follow-ups: env vars (`npm_config_yarn_offline_mirror`, `YARN_YARN_OFFLINE_MIRROR`) broke the initial yarn install in the harness, so retest them; also check the vendored→hosted takeover preflight with a user-level mirror, and the macOS/Windows home config paths.
+1. Re-check #991 on npm / pnpm vendored, and hand it over if it's family-wide. #974 / #921 / #857 / #884 / #364 / #831 are closed (run 28 verified #364 / #884 / #921 on main). Re-check #975's yarn-1 PnP cell once PR #978 merges. Re-check once merged: #938 (PR #940, verified run 25), #921 / #857 (PR #924, #921 verified run 25), #884 (PR #901, verified run 22; also covers the positional PATH form), #364 (PR #839), #831 (PR #837), #907 (PR #917), #778 (yarn classic nested copies, run 25), plus #828's yarn git-sibling shape. Then #467 / #519 / #558 / #591 / #691 / #692 / #758.
 2. #857 on PR #924 (vendored git-only dep; needs a git dep, which worked in run 20 via github.com).
 3. npm-workspace analogue of the #778 nested-copy scope miss (hand over to npm if it reproduces). Also `rollback <PATH>` / `--sync <PATH>` / `--prune <PATH>` on the same yarn layout.
 4. #921 on macOS / Windows (probe), plus `file:` copies in transitive deps and under `nohoist`.
@@ -297,3 +305,4 @@ Other cells that pass on Linux 1.22.22 (some also on older releases; see the ent
 - Probe harness: `cp` from a read-only bind mount drops the exec bit on busybox, so overlay files with `cat src > dst` to keep the mode.
 - v4.0.0 has no `scan --package` and no `vendor --check`. Its vendored state (manifest + ledger) and hosted `redirect-state.json` are read correctly by main (run 27).
 - Run-27 mock: the `mock.py` multi-package variant (`mock.py <port> <left-pad tgz> [<is-number tgz>]`, one uuid per package, routes: batch / by-package / view / blob / package / artifacts). Use it with `SOCKET_PROXY_URL` + `SOCKET_PATCH_SERVER_URL` + `SOCKET_API_URL` pointed at the mock.
+- Running `yarn config set` as root writes `/usr/local/share/.yarnrc` (yarn's root user home), not `$HOME/.yarnrc`. In run 28 the sandbox was left with `yarn-offline-mirror false` there, which is the same as no mirror.
