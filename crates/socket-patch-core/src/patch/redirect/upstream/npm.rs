@@ -918,16 +918,18 @@ fn pnpm_include_tarball(
 /// bare one proves it off, whatever else the lock holds (a conventional
 /// URL can still appear with it off, under a second registry). With no
 /// bare one, a tarball pnpm could have derived proves it on. `None`: no
-/// such resolution (an unconventional URL is recorded either way).
+/// such resolution (an unconventional URL is recorded either way). Only
+/// the main document counts: pnpm 11+'s env lockfile document records its
+/// resolutions bare whatever the setting.
 fn pnpm_lock_tarball_evidence(
     text: &str,
     npmrc: Option<&str>,
     is_hosted: impl Fn(&str) -> bool,
 ) -> Option<bool> {
-    use crate::formats::pnpm::{classify_pnpm_key, pnpm_packages, PnpmKey};
+    use crate::formats::pnpm::{classify_pnpm_key, grammar::main_document, pnpm_packages, PnpmKey};
 
     let mut derived = false;
-    for package in pnpm_packages(text) {
+    for package in pnpm_packages(main_document(text)) {
         let PnpmKey::Registry { name, version } = classify_pnpm_key(package.key) else {
             continue;
         };
@@ -1382,6 +1384,30 @@ mod tests {
             assert!(include(&lock(silent), None, Some(RC_ON), None), "{silent}");
             assert!(!include(&lock(silent), None, None, None), "{silent}");
         }
+    }
+
+    /// #902: pnpm 11+'s env lockfile document (as `pnpm add --config`
+    /// writes it, pnpm 11.27.0) records config dependencies bare even under
+    /// lockfileIncludeTarballUrl; only the main document is evidence.
+    #[test]
+    fn pnpm_include_tarball_ignores_the_env_lockfile_document() {
+        let env = "---\nlockfileVersion: '9.0'\n\nimporters:\n\n  .:\n    \
+                   configDependencies:\n      is-number:\n        specifier: 7.0.0\n        \
+                   version: 7.0.0\n\npackages:\n\n  is-number@7.0.0:\n    \
+                   resolution: {integrity: sha512-N==}\n\nsnapshots:\n\n  \
+                   is-number@7.0.0: {}\n\n---\n";
+        let conventional = "  c@3.0.0:\n    resolution: {integrity: sha512-C==, \
+                            tarball: https://registry.npmjs.org/c/-/c-3.0.0.tgz}\n";
+        let two_docs = format!("{env}{}", lock(conventional));
+        assert!(include(&two_docs, None, None, Some(11)));
+        // No evidence in the main document: the settings decide, not the
+        // env document's bare entry.
+        let pinned_only = format!("{env}{}", lock(""));
+        assert!(include(&pinned_only, Some(WS_ON), None, Some(11)));
+        assert!(!include(&pinned_only, None, None, Some(11)));
+        // A bare entry in the main document still proves it off.
+        let bare = "  b@2.0.0:\n    resolution: {integrity: sha512-B==}\n";
+        assert!(!include(&format!("{env}{}", lock(bare)), Some(WS_ON), None, Some(11)));
     }
 
     /// #902 tier 2: the settings file the installed pnpm major reads.
