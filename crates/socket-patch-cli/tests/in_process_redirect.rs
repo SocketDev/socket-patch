@@ -5072,7 +5072,9 @@ async fn pnpm_rollback_reads_the_scope_registry_for_a_scoped_name() {
 
         let tmp = tempfile::tempdir().unwrap();
         let pristine = scoped_pnpm_lock(&match recorded {
-            Some(tarball) => format!("{{integrity: sha512-UPSTREAMupstream==, tarball: {tarball}}}"),
+            Some(tarball) => {
+                format!("{{integrity: sha512-UPSTREAMupstream==, tarball: {tarball}}}")
+            }
             None => "{integrity: sha512-UPSTREAMupstream==}".to_string(),
         });
         let pinned = scoped_pnpm_lock(&format!(
@@ -5096,7 +5098,9 @@ async fn pnpm_rollback_reads_the_scope_registry_for_a_scoped_name() {
             "{env:#}"
         );
         assert!(
-            !env["warnings"].to_string().contains("upstream_registry_fallback"),
+            !env["warnings"]
+                .to_string()
+                .contains("upstream_registry_fallback"),
             "{env:#}"
         );
         let restored = std::fs::read_to_string(tmp.path().join("pnpm-lock.yaml")).unwrap();

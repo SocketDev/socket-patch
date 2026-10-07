@@ -879,7 +879,10 @@ fn yaml_block_value(text: &str, section: &str, key: &str) -> Option<String> {
     })?;
     children
         .iter()
-        .filter_map(|line| line.get(indent..).filter(|_| line[..indent].trim().is_empty()))
+        .filter_map(|line| {
+            line.get(indent..)
+                .filter(|_| line[..indent].trim().is_empty())
+        })
         .filter_map(top_level_key)
         .rfind(|(k, _)| k == key)
         .map(|(_, value)| value.trim_matches(['"', '\'']).to_string())
@@ -913,7 +916,7 @@ fn pnpm_lookup_registry(
     use super::super::npmrc::npmrc_top_level_value;
     use crate::formats::pnpm::workspace::top_level_key;
 
-    let workspace = workspace.filter(|_| !major.is_some_and(|major| major <= 9));
+    let workspace = workspace.filter(|_| major.is_none_or(|major| major > 9));
     let scope = name
         .strip_prefix('@')
         .and_then(|rest| rest.split_once('/'))
@@ -924,7 +927,8 @@ fn pnpm_lookup_registry(
             .map(|value| value.trim().to_string())
             .filter(|value| !value.is_empty())
     };
-    let registries = |key: &str| workspace.and_then(|text| yaml_block_value(text, "registries", key));
+    let registries =
+        |key: &str| workspace.and_then(|text| yaml_block_value(text, "registries", key));
     let from_npmrc = || {
         scope
             .as_ref()
@@ -1037,12 +1041,8 @@ fn pnpm_lock_tarball_evidence(
             None => return Some(false),
             Some(tarball) if tarball.starts_with("file:") || is_hosted(tarball) => {}
             Some(tarball) => {
-                derived |= registry_derives_tarball(
-                    registry(name).as_deref(),
-                    name,
-                    version,
-                    tarball,
-                );
+                derived |=
+                    registry_derives_tarball(registry(name).as_deref(), name, version, tarball);
             }
         }
     }
@@ -1501,7 +1501,12 @@ mod tests {
         assert!(!include(&pinned_only, None, None, Some(11)));
         // A bare entry in the main document still proves it off.
         let bare = "  b@2.0.0:\n    resolution: {integrity: sha512-B==}\n";
-        assert!(!include(&format!("{env}{}", lock(bare)), Some(WS_ON), None, Some(11)));
+        assert!(!include(
+            &format!("{env}{}", lock(bare)),
+            Some(WS_ON),
+            None,
+            Some(11)
+        ));
     }
 
     /// #902 tier 2: the settings file the installed pnpm major reads.
@@ -1588,10 +1593,7 @@ mod tests {
         assert_eq!(rc_lookup(None, "@s/a"), None);
         // An unexpanded `${VAR}` is never fetched as a URL; a scoped name
         // whose scope registry holds one keeps the default, not `registry`.
-        assert_eq!(
-            rc_lookup(Some("registry=${MIRROR}\n"), "a"),
-            None
-        );
+        assert_eq!(rc_lookup(Some("registry=${MIRROR}\n"), "a"), None);
         assert_eq!(
             rc_lookup(
                 Some("registry=https://m.example\n@s:registry=${S}/npm\n"),
@@ -1642,8 +1644,13 @@ mod tests {
             Some("https://ws-s.example/")
         );
         assert_eq!(
-            get(Some("registries:\n  default: https://d.example/\n"), Some(rc), ten, "@s/a")
-                .as_deref(),
+            get(
+                Some("registries:\n  default: https://d.example/\n"),
+                Some(rc),
+                ten,
+                "@s/a"
+            )
+            .as_deref(),
             Some("https://d.example/")
         );
         assert_eq!(
