@@ -2643,6 +2643,42 @@ mod tests {
         assert_eq!(discovery.vendor_entry_in_use(root, &entry).await, None);
     }
 
+    /// A `jvm` ledger row with no wiring records (stripped by hand) is not
+    /// [`crate::vendor::jvm::apply::is_jvm_entry`], so no tree layout is
+    /// checked; its trees are not `.socket/vendor/<eco>/<uuid>` dirs a lock
+    /// could reference, and readable Maven/Gradle files must not decide it
+    /// unused: discovery reads no `jvm`-ecosystem file, so the prune GC
+    /// keeps it.
+    #[tokio::test]
+    async fn empty_wiring_jvm_entries_stay_undecidable() {
+        let tmp = tempfile::tempdir().unwrap();
+        let root = tmp.path();
+        std::fs::write(
+            root.join("pom.xml"),
+            "<project><modelVersion>4.0.0</modelVersion><groupId>g</groupId>\
+             <artifactId>app</artifactId><version>1</version></project>\n",
+        )
+        .unwrap();
+        std::fs::write(root.join("settings.gradle"), "").unwrap();
+        std::fs::write(root.join("gradle.lockfile"), "# Gradle lockfile\nempty=\n").unwrap();
+        let discovery = discover_patched_refs(root).await;
+        let entry: VendorEntry = serde_json::from_value(serde_json::json!({
+            "ecosystem": "jvm",
+            "basePurl": "pkg:maven/com.google.code.gson/gson@2.10.1",
+            "uuid": UUID_A,
+            "artifact": {
+                "path": format!(
+                    ".socket/vendor/maven2/com/google/code/gson/gson/2.10.1-socket.{}/gson-2.10.1-socket.{}.jar",
+                    &UUID_A[..8], &UUID_A[..8]
+                ),
+                "sha256": "",
+            },
+            "wiring": [],
+        }))
+        .unwrap();
+        assert_eq!(discovery.vendor_entry_in_use(root, &entry).await, None);
+    }
+
     #[test]
     fn vendor_ref_strips_lock_suffixes_and_requires_a_root_anchor() {
         let a = UUID_A;

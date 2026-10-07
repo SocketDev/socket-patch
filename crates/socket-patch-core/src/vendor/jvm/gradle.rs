@@ -1171,30 +1171,52 @@ fn undo_replace_eol(text: &str, from: &str, to: &str) -> Option<String> {
 }
 
 /// Whether the root settings file applies the script and the index lists
-/// `c`'s rows (the wiring revert and peers rely on).
+/// `c`'s rows (the wiring revert and peers rely on). A malformed index or
+/// non-UTF-8 settings file reads as unreferenced here; see
+/// [`references_checked`] for the undecidable verdict.
 pub fn references(read: ReadFn<'_>, c: &Coords<'_>) -> bool {
+    references_checked(read, c).unwrap_or(false)
+}
+
+/// [`references`], `None` when a file it decides by exists but cannot be
+/// parsed (a malformed index, a non-UTF-8 settings file): that proves
+/// nothing absent, so a GC must keep the tree.
+pub fn references_checked(read: ReadFn<'_>, c: &Coords<'_>) -> Option<bool> {
     let gav = format!("{}:{}:{}", c.group_id, c.artifact_id, c.version);
-    let indexed = read(INDEX_REL)
-        .and_then(|b| String::from_utf8(b).ok())
-        .and_then(|index| index_rows(&index))
-        .is_some_and(|rows| {
-            rows.iter().any(|r| {
-                let cols: Vec<&str> = r.split('\t').collect();
-                cols.first() == Some(&gav.as_str()) && cols.get(3) == Some(&c.uuid)
-            })
-        });
-    let wiring = WiringTarget::vendored();
-    let applied = ["settings.gradle", "settings.gradle.kts"]
-        .iter()
-        .any(|rel| {
-            read(rel)
-                .and_then(|b| String::from_utf8(b).ok())
-                .is_some_and(|text| {
-                    let dsl = dsl::dsl_of(rel).unwrap_or(Dsl::Groovy);
-                    has_apply_line(&text, dsl, &wiring, "")
+    let indexed = match read(INDEX_REL) {
+        None => Some(false),
+        Some(bytes) => String::from_utf8(bytes)
+            .ok()
+            .and_then(|index| index_rows(&index))
+            .map(|rows| {
+                rows.iter().any(|r| {
+                    let cols: Vec<&str> = r.split('\t').collect();
+                    cols.first() == Some(&gav.as_str()) && cols.get(3) == Some(&c.uuid)
                 })
-        });
-    indexed && applied
+            }),
+    };
+    let wiring = WiringTarget::vendored();
+    let mut applied = Some(false);
+    for rel in ["settings.gradle", "settings.gradle.kts"] {
+        let Some(bytes) = read(rel) else {
+            continue;
+        };
+        match String::from_utf8(bytes) {
+            Ok(text) => {
+                let dsl = dsl::dsl_of(rel).unwrap_or(Dsl::Groovy);
+                if has_apply_line(&text, dsl, &wiring, "") {
+                    applied = Some(true);
+                    break;
+                }
+            }
+            Err(_) => applied = None,
+        }
+    }
+    match (indexed, applied) {
+        (Some(false), _) | (_, Some(false)) => Some(false),
+        (Some(true), Some(true)) => Some(true),
+        _ => None,
+    }
 }
 
 /// The liveness proof `vex` needs for this layout: `c` is
