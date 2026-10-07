@@ -1341,6 +1341,7 @@ mod tests {
                 rewrite,
                 rewritten: files.iter().map(|(rel, _)| (*rel).to_string()).collect(),
                 confirmed: vec![("pkg:cargo/serde@1.0.190".into(), "u".into())],
+                unattributed: Vec::new(),
                 binary_bun: false,
                 rush_warnings: Vec::new(),
                 pnpm_warnings: Vec::new(),

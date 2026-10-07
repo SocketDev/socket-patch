@@ -30,11 +30,14 @@ pub async fn bundled_copies(root: &Path) -> BTreeMap<String, String> {
     let Ok(lock) = vlt_lock_model(&text) else {
         return BTreeMap::new();
     };
-    store_bundled_copies(
-        root,
-        lock.nodes.iter().map(|n| (n.key.as_str(), n.name.as_str())),
-    )
-    .await
+    // Collected first: a closure-mapped iterator held across the walk's
+    // awaits would keep the caller's future from being `Send`.
+    let pairs: Vec<(&str, &str)> = lock
+        .nodes
+        .iter()
+        .map(|n| (n.key.as_str(), n.name.as_str()))
+        .collect();
+    store_bundled_copies(root, pairs).await
 }
 
 /// The scan warning detail for a bundled copy at `location` that a hosted

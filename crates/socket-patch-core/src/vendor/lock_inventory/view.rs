@@ -195,6 +195,9 @@ type ReadCache = std::collections::HashMap<String, Result<Arc<[u8]>, (io::ErrorK
 pub struct DiskSnapshot<'a> {
     pub root: &'a Path,
     reads: std::sync::Mutex<ReadCache>,
+    /// Paths [`Self::overlay`] put in place of the disk content (they exist
+    /// in this view even when the disk has no such file yet).
+    overlaid: std::sync::Mutex<std::collections::BTreeSet<String>>,
 }
 
 impl<'a> DiskSnapshot<'a> {
@@ -202,7 +205,26 @@ impl<'a> DiskSnapshot<'a> {
         Self {
             root,
             reads: std::sync::Mutex::new(std::collections::HashMap::new()),
+            overlaid: std::sync::Mutex::new(std::collections::BTreeSet::new()),
         }
+    }
+
+    /// Read `rel` as `content` instead of the disk's: the project as a
+    /// pending write would leave it. Content reads and existence probes see
+    /// the overlay; directory listings still list the disk.
+    pub fn overlay(&self, rel: &str, content: &[u8]) {
+        self.remember(rel, &Ok(content.to_vec()));
+        self.overlaid
+            .lock()
+            .unwrap_or_else(std::sync::PoisonError::into_inner)
+            .insert(rel.to_string());
+    }
+
+    fn is_overlaid(&self, rel: &str) -> bool {
+        self.overlaid
+            .lock()
+            .unwrap_or_else(std::sync::PoisonError::into_inner)
+            .contains(rel)
     }
 
     fn lock(&self) -> std::sync::MutexGuard<'_, ReadCache> {
@@ -311,6 +333,7 @@ impl<'a> ProjectView<'a> {
     /// `metadata` (follows links) succeeds.
     pub async fn exists(&self, rel: &str) -> bool {
         match self {
+            ProjectView::Snapshot(snap) if snap.is_overlaid(rel) => true,
             ProjectView::Disk(root) | ProjectView::Snapshot(DiskSnapshot { root, .. }) => {
                 tokio::fs::metadata(root.join(rel)).await.is_ok()
             }
@@ -321,6 +344,7 @@ impl<'a> ProjectView<'a> {
     /// `symlink_metadata` (does not follow links) succeeds.
     pub async fn exists_no_follow(&self, rel: &str) -> bool {
         match self {
+            ProjectView::Snapshot(snap) if snap.is_overlaid(rel) => true,
             ProjectView::Disk(root) | ProjectView::Snapshot(DiskSnapshot { root, .. }) => {
                 tokio::fs::symlink_metadata(root.join(rel)).await.is_ok()
             }
@@ -331,6 +355,7 @@ impl<'a> ProjectView<'a> {
     /// A regular file (following links on disk).
     pub fn is_file(&self, rel: &str) -> bool {
         match self {
+            ProjectView::Snapshot(snap) if snap.is_overlaid(rel) => true,
             ProjectView::Disk(root) | ProjectView::Snapshot(DiskSnapshot { root, .. }) => {
                 root.join(rel).is_file()
             }

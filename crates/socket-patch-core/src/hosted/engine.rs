@@ -885,6 +885,7 @@ pub struct TakeoverPreview {
 }
 
 /// The host-dependent inputs of [`rewrite`].
+#[derive(Clone)]
 pub struct RewriteOptions<'a> {
     pub dry_run: bool,
     /// Whether a pypi candidate targets `Pipfile.lock`
@@ -923,6 +924,10 @@ pub struct Rewritten {
     /// `(purl, uuid)` of each candidate whose redirect is pinned by the
     /// project's final files, in candidate order.
     pub confirmed: Vec<(String, String)>,
+    /// Candidates left out of the rewrite because lockfile discovery could
+    /// not attribute the pin they would land (see [`rewrite`]): reported as
+    /// skipped, written nowhere.
+    pub unattributed: Vec<SkippedPatch>,
     /// A `bun.lockb` without a text `bun.lock` drives npm.
     pub binary_bun: bool,
     pub rush_warnings: Vec<RewriteWarning>,
@@ -1051,6 +1056,209 @@ pub fn candidate_presence_needles(dep: &DepOverride) -> Vec<String> {
 /// `withheld_from_vlt` are the uuids the vlt preflight kept out of the vlt
 /// rewrite; `takeover_previews` are the disk dry run's withheld takeovers.
 pub async fn rewrite(
+    view: &ProjectView<'_>,
+    read: CandidateFiles,
+    candidates: &[Candidate],
+    python_metadata: BTreeMap<String, String>,
+    withheld_from_vlt: &BTreeSet<String>,
+    takeover_previews: &[TakeoverPreview],
+    options: RewriteOptions<'_>,
+) -> Rewritten {
+    // The run must never leave wiring that lockfile discovery — what `vex`,
+    // `list`, `rollback`, `remove` and `vendor` read — calls contested. A
+    // candidate the rewriters confirm but discovery cannot attribute to one
+    // package version (another lock resolving the same version elsewhere, a
+    // pin Maven never consumes) would be refused by every later command, so
+    // it is dropped and the rest rewritten without it. Each pass drops at
+    // least one candidate, so this ends.
+    let mut kept: Vec<Candidate> = candidates.to_vec();
+    let mut unattributed: Vec<SkippedPatch> = Vec::new();
+    loop {
+        let mut done = rewrite_once(
+            view,
+            read.clone(),
+            &kept,
+            python_metadata.clone(),
+            withheld_from_vlt,
+            takeover_previews,
+            options.clone(),
+        )
+        .await;
+        let (vetoed, lockless) = unattributed_pins(view, &done, &kept, withheld_from_vlt).await;
+        if vetoed.is_empty() {
+            done.unattributed = unattributed;
+            done.rewrite.warnings.extend(lockless);
+            return done;
+        }
+        kept.retain(|c| !vetoed.iter().any(|skip| skip.uuid == c.dep.patch_uuid));
+        unattributed.extend(vetoed);
+    }
+}
+
+/// Lockfile discovery over the project as `done` would leave it, read as
+/// the management commands read it ([`HostedInventory`]): the skips for
+/// the confirmed candidates whose pin would be contested wiring, and a
+/// [`REDIRECT_PIN_LOCKLESS`] warning per lockless pin. A lockless NuGet /
+/// Cargo pin ([`UnlockedPin`]) is written as before — whether such a pin
+/// may be written at all is the open hosted-rollback decision (E45) — but
+/// the run says that nothing can manage it until a lockfile exists.
+///
+/// A deliberate partial redirect keeps its behavior too: a dep whose
+/// bundled or user-patched copy the rewriters knowingly left on the
+/// registry (`bundled_skipped_uuids`, or a bundled copy in vlt's store;
+/// both are warned and kept out of the in-run VEX), or one withheld from
+/// the vlt rewrite while a sibling lock takes it (`withheld_from_vlt`). Which unreachable copies should block a
+/// redirect is the copy-source policy (audit B16), not decided here.
+///
+/// [`HostedInventory`]: crate::patch::redirect::upstream::HostedInventory
+/// [`UnlockedPin`]: crate::vex::discover::UnlockedPin
+async fn unattributed_pins(
+    view: &ProjectView<'_>,
+    done: &Rewritten,
+    candidates: &[Candidate],
+    withheld_from_vlt: &BTreeSet<String>,
+) -> (Vec<SkippedPatch>, Vec<RewriteWarning>) {
+    if done.confirmed.is_empty() {
+        return (Vec::new(), Vec::new());
+    }
+    let opts = crate::vex::DiscoverOptions {
+        patch_server_origins: crate::patch::redirect::upstream::dep_origins(
+            candidates.iter().map(|c| &c.dep),
+        ),
+    };
+    let mut written: Vec<(&str, &[u8])> = Vec::new();
+    for (rel, text) in &done.rewrite.files {
+        if !crate::patch::redirect::sbt::is_synthetic_key(rel) {
+            written.push((rel.as_str(), text.as_bytes()));
+        }
+    }
+    for (rel, bytes) in &done.rewrite.binary_files {
+        written.push((rel.as_str(), bytes.as_slice()));
+    }
+    let discovery = match view.disk_root() {
+        None => {
+            let ProjectView::Memory(project) = *view else {
+                unreachable!("only a memory view has no disk root")
+            };
+            let mut after = project.clone();
+            for (rel, bytes) in written {
+                let entry = match std::str::from_utf8(bytes) {
+                    Ok(text) => crate::vendor::lock_inventory::MemoryEntry::Text(text.into()),
+                    Err(_) => crate::vendor::lock_inventory::MemoryEntry::Binary(bytes.into()),
+                };
+                after.insert(rel, entry);
+            }
+            crate::vex::discover::discover_patched_refs_view(ProjectView::Memory(&after), &opts)
+                .await
+        }
+        Some(root) => {
+            let after = crate::vendor::lock_inventory::DiskSnapshot::new(root);
+            for (rel, bytes) in written {
+                after.overlay(rel, bytes);
+            }
+            crate::vex::discover::discover_patched_refs_view(ProjectView::Snapshot(&after), &opts)
+                .await
+        }
+    };
+    // The management commands' own view of the result: an attributable
+    // pin, or contested wiring they would refuse around.
+    let inventory = crate::patch::redirect::upstream::HostedInventory::of(&discovery);
+    let attributed: BTreeSet<&str> = inventory.pins.iter().map(|p| p.uuid.as_str()).collect();
+    let lockless: Vec<RewriteWarning> = discovery
+        .unlocked_pins
+        .iter()
+        .filter(|pin| {
+            !attributed.contains(pin.uuid.as_str())
+                && done.confirmed.iter().any(|(_, uuid)| *uuid == pin.uuid)
+        })
+        .map(|pin| {
+            let create = match pin.ecosystem.as_str() {
+                "nuget" => "create packages.lock.json (`dotnet restore --use-lock-file`)",
+                "cargo" => "create Cargo.lock (`cargo generate-lockfile`)",
+                _ => "create the lockfile",
+            };
+            warning(
+                REDIRECT_PIN_LOCKLESS,
+                format!(
+                    "{}: {} is pinned to patch {} without a lockfile that records its version, \
+                     so `vex` cannot attest it and `rollback`, `remove` and `vendor` refuse it \
+                     as unattributable; {create} and re-run `socket-patch scan --mode hosted` \
+                     to make it manageable",
+                    pin.file.display(),
+                    pin.name,
+                    pin.uuid
+                ),
+            )
+        })
+        .collect();
+    // Contested wiring (not a lockless pin, see above) is what the run must
+    // never leave behind. A pin discovery does not see at all (a file it
+    // does not read, such as a pre-2.6 bundler Gemfile the next `bundle
+    // install` locks) is no such wiring and keeps the rewriters' verdict.
+    let contested: BTreeSet<&str> = inventory
+        .contested
+        .iter()
+        .filter(|c| c.lockless.is_empty())
+        .map(|c| c.uuid.as_str())
+        .collect();
+    // vlt's bundled copies live only in its installed store, which the
+    // rewriters never read (the scan warns about them after the writes).
+    let vlt_bundled: BTreeSet<String> = match view.disk_root() {
+        Some(root) if !contested.is_empty() => crate::vendor::vlt_bundled::bundled_copies(root)
+            .await
+            .into_keys()
+            .collect(),
+        _ => BTreeSet::new(),
+    };
+    let vetoed = done
+        .confirmed
+        .iter()
+        .filter(|(purl, uuid)| {
+            !attributed.contains(uuid.as_str())
+                && contested.contains(uuid.as_str())
+                && !done.rewrite.bundled_skipped_uuids.contains(uuid)
+                && !withheld_from_vlt.contains(uuid)
+                && !vlt_bundled.contains(&crate::vex::discover::canonical_base_purl(purl))
+        })
+        .map(|(purl, uuid)| {
+            let findings: Vec<&str> = discovery
+                .diagnostics
+                .iter()
+                .filter(|d| d.detail.contains(uuid.as_str()) || d.detail.contains(purl.as_str()))
+                .map(|d| d.detail.as_str())
+                .collect::<BTreeSet<_>>()
+                .into_iter()
+                .collect();
+            let why = if findings.is_empty() {
+                String::new()
+            } else {
+                format!(" ({})", findings.join("; "))
+            };
+            SkippedPatch {
+                purl: purl.clone(),
+                uuid: uuid.clone(),
+                reason: REDIRECT_UNATTRIBUTABLE.to_string(),
+                detail: Some(format!(
+                    "the rewrite would wire patch {uuid} for {purl}, but lockfile discovery (what \
+                     `vex`, `list`, `rollback` and `vendor` read) cannot attribute that pin to \
+                     one package version{why}, so nothing was changed for it; reconcile the \
+                     project's lockfiles and re-run"
+                )),
+            }
+        })
+        .collect();
+    (vetoed, lockless)
+}
+
+/// Warning: a confirmed pin no lockfile records a version for (a lockless
+/// NuGet / Cargo redirect), which no later command can attribute.
+pub const REDIRECT_PIN_LOCKLESS: &str = "redirect_pin_lockless";
+
+/// `skipped[].reason` of a candidate whose pin lockfile discovery would not
+/// attribute (see [`rewrite`]).
+pub const REDIRECT_UNATTRIBUTABLE: &str = "redirect_unattributable";
+
+async fn rewrite_once(
     view: &ProjectView<'_>,
     read: CandidateFiles,
     candidates: &[Candidate],
@@ -1244,6 +1452,7 @@ pub async fn rewrite(
         rewrite,
         rewritten,
         confirmed,
+        unattributed: Vec::new(),
         binary_bun,
         rush_warnings,
         pnpm_warnings,
@@ -2215,6 +2424,16 @@ mod tests {
         assert!(confirmed.is_empty(), "{confirmed:?}");
     }
 
+    /// The grant token and patch uuid of the engine fixtures' hosted urls:
+    /// real uuids, so lockfile discovery recognizes the pins the rewrite
+    /// lands (the engine keeps only the ones it attributes).
+    const FIXTURE_TOKEN: &str = "11111111-1111-4111-8111-111111111111";
+    const FIXTURE_UUID: &str = "77777777-7777-4777-8777-777777777777";
+
+    fn left_pad_url() -> String {
+        format!("https://patch.test/{FIXTURE_TOKEN}/{FIXTURE_UUID}/left-pad-1.3.0.tgz")
+    }
+
     fn left_pad_candidate() -> Candidate {
         use crate::patch::redirect::Integrity;
         Candidate {
@@ -2224,9 +2443,9 @@ mod tests {
                 name: "left-pad".into(),
                 namespace: None,
                 version: "1.3.0".into(),
-                token: "tok".into(),
-                patch_uuid: "uuid".into(),
-                artifact_url: "https://patch.test/left-pad-1.3.0.tgz".into(),
+                token: FIXTURE_TOKEN.into(),
+                patch_uuid: FIXTURE_UUID.into(),
+                artifact_url: left_pad_url(),
                 registry_override: None,
                 integrity: Integrity {
                     sha512: Some("sha512-PATCHED==".into()),
@@ -2294,7 +2513,7 @@ mod tests {
             done.rewrite
                 .files
                 .get("package-lock.json")
-                .is_some_and(|lock| lock.contains("https://patch.test/left-pad-1.3.0.tgz"))
+                .is_some_and(|lock| lock.contains(&left_pad_url()))
         };
         // In memory.
         let mut p = MemoryProject::new();
@@ -2352,9 +2571,11 @@ mod tests {
                 name: "is-number".into(),
                 namespace: None,
                 version: "7.0.0".into(),
-                token: "tok".into(),
-                patch_uuid: "uuid".into(),
-                artifact_url: "https://patch.test/is-number-7.0.0.tgz".into(),
+                token: FIXTURE_TOKEN.into(),
+                patch_uuid: FIXTURE_UUID.into(),
+                artifact_url: format!(
+                    "https://patch.test/{FIXTURE_TOKEN}/{FIXTURE_UUID}/is-number-7.0.0.tgz"
+                ),
                 registry_override: None,
                 integrity: Integrity {
                     sha512: Some(format!("sha512-{}==", "A".repeat(86))),
@@ -2420,7 +2641,7 @@ mod tests {
                     "{}",
                     skipped.detail
                 );
-                assert!(done.rewrite.bundled_skipped_uuids.contains("uuid"));
+                assert!(done.rewrite.bundled_skipped_uuids.contains(FIXTURE_UUID));
             } else {
                 assert!(
                     done.rewrite.binary_files.contains_key("bun.lockb"),
@@ -2492,12 +2713,14 @@ mod tests {
                 name: "rails".into(),
                 namespace: None,
                 version: "7.0.0".into(),
-                token: "tok".into(),
-                patch_uuid: "uuid".into(),
-                artifact_url: "https://patch.test/rails-7.0.0.gem".into(),
+                token: FIXTURE_TOKEN.into(),
+                patch_uuid: FIXTURE_UUID.into(),
+                artifact_url: format!(
+                    "https://patch.test/gem/{FIXTURE_TOKEN}/{FIXTURE_UUID}/gems/rails-7.0.0.gem"
+                ),
                 registry_override: Some(RegistryOverride {
                     kind: "rubygems-compact-index".into(),
-                    index_url: "https://patch.test/gem/tok/uuid/".into(),
+                    index_url: format!("https://patch.test/gem/{FIXTURE_TOKEN}/{FIXTURE_UUID}/"),
                     identifiers: RegistryOverrideIdentifiers {
                         name: "rails".into(),
                         version: "7.0.0".into(),
@@ -2897,9 +3120,9 @@ mod tests {
     #[tokio::test]
     async fn bundler_mirror_for_the_patch_source_redirects_nothing() {
         for key in [
-            "BUNDLE_MIRROR__HTTPS://PATCH__TEST/GEM/TOK/UUID/",
-            "BUNDLE_MIRROR__PATCH__TEST",
-            "BUNDLE_MIRROR__PATCH__TEST/",
+            format!("BUNDLE_MIRROR__HTTPS://PATCH__TEST/GEM/{FIXTURE_TOKEN}/{FIXTURE_UUID}/"),
+            "BUNDLE_MIRROR__PATCH__TEST".to_string(),
+            "BUNDLE_MIRROR__PATCH__TEST/".to_string(),
         ] {
             let mut p = MemoryProject::new();
             p.insert_text("Gemfile", GEMFILE);

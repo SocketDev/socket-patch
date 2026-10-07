@@ -1073,6 +1073,9 @@ pub(crate) async fn run_redirect_selected(
             .await;
         }
     }
+    // Candidates the rewrite left out because discovery would not attribute
+    // their pin (`engine::rewrite`).
+    skipped.extend(done.unattributed.iter().cloned());
     // Held to the end of the function.
     let _lock = lock;
     // Dry-run mode-takeover previews were withheld from the rewriters (their

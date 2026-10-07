@@ -339,6 +339,7 @@ pub(crate) async fn rewrite(
             skipped: skipped_before,
         });
     }
+    skipped.extend(done.unattributed.iter().cloned());
     Ok(Rewritten {
         project,
         skipped,
