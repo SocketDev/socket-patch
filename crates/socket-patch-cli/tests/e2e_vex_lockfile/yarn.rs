@@ -1250,6 +1250,77 @@ fn pnp_layout_contract() {
     }
 }
 
+/// #1033 review: the PnP loader check matches the patch anywhere in the
+/// loader text, so a loader that resolves BOTH the hosted locator and a
+/// registry locator of the same `name@version` (scoped `resolutions`, a
+/// workspace member added after the rewire) still "names the patch". What
+/// keeps that from attesting is the yarn same-lock rule: the lock's
+/// registry entry of the same version contests the hosted ref. Pinned here
+/// for berry 4 and yarn 1, the two flavors whose hosted pin is read.
+#[test]
+fn pnp_loader_naming_hosted_and_registry_copies_is_not_attested() {
+    for flavor in [Flavor::Classic, Flavor::Berry4] {
+        let tmp = tempfile::tempdir().unwrap();
+        let cwd = tmp.path();
+        write_project(cwd, flavor, None);
+        let hosted = hosted_lock(flavor, "https://patch.socket.dev", UUID);
+        let (lock, loader_name, loader) = if flavor.is_berry() {
+            put(
+                cwd,
+                ".yarnrc.yml",
+                b"nodeLinker: pnp\nenableGlobalCache: false\n",
+            );
+            let archive = format!(
+                "npm:1.3.0::__archiveUrl={}",
+                encode_uri_component(&berry_hosted_url("https://patch.socket.dev", UUID))
+            );
+            (
+                format!(
+                    "{hosted}\n\"left-pad@npm:^1.3.0\":\n  version: 1.3.0\n  resolution: \
+                     \"left-pad@npm:1.3.0\"\n  checksum: {}\n  languageName: node\n  \
+                     linkType: hard\n",
+                    flavor.berry_checksum('3')
+                ),
+                ".pnp.cjs",
+                format!(
+                    "/* yarn PnP loader */\n[\"left-pad\", [[\"{archive}\", \
+                     {{\"packageLocation\": \"./.yarn/cache/a.zip/node_modules/left-pad/\"}}], \
+                     [\"npm:1.3.0\", {{\"packageLocation\": \
+                     \"./.yarn/cache/b.zip/node_modules/left-pad/\"}}]]]\n"
+                ),
+            )
+        } else {
+            (
+                format!(
+                    "{hosted}\nleft-pad@^1.3.0:\n  version \"1.3.0\"\n  resolved \
+                     \"https://registry.yarnpkg.com/left-pad/-/left-pad-1.3.0.tgz#5b8a3a7765dfe001261dde915589e782f8c94d1e\"\n  \
+                     integrity sha512-XI5MPzVNApjAyhQzphX8BkmKsKUxD4LdyK24iZeQGinBN9yTQT3bFlCBy/aVx2HrNcqQGsdot8ghrjyrvMCoEA==\n"
+                ),
+                ".pnp.js",
+                "/* yarn PnP loader */\n\
+                 packageLocation: \"/c/v6/npm-left-pad-1.3.0-abcdef0123456789abcdef0123456789abcdef01-integrity/\"\n\
+                 packageLocation: \"/c/v6/npm-left-pad-1.3.0-5b8a3a7765dfe001261dde915589e782f8c94d1e-integrity/\"\n"
+                    .to_string(),
+            )
+        };
+        put(cwd, "yarn.lock", lock.as_bytes());
+        put(cwd, loader_name, loader.as_bytes());
+        let (_rt, server) = serve_left_pad();
+        let (code, env) = vex_json(cwd, &["--proxy-url", &server.uri()]);
+        let cell = format!("{flavor:?} PnP, hosted + registry copies");
+        assert_ne!(code, Some(0), "{cell}: {env}");
+        let doc = read_doc(&cwd.join("out.vex.json"));
+        assert!(
+            doc.as_ref().is_none_or(|d| !d.to_string().contains(PURL)),
+            "{cell}: nothing may attest left-pad: {doc:?}"
+        );
+        assert!(
+            env.to_string().contains("patched_ref_unattributable"),
+            "{cell}: the run says why: {env}"
+        );
+    }
+}
+
 // ──────────────────────────────────────────────────────────────────────
 // EMBEDDED — scan --vex / scan --mode hosted --vex / scan --vendor --vex /
 // apply --vex, manifest-less
