@@ -227,6 +227,19 @@ const SETUP_ALTERNATIVE: &str =
     "use agent mode instead (`scan --mode agent`, then `socket-patch apply` after each \
      install), which patches installed site-packages without lockfile edits";
 
+/// Whether the root `requirements.txt` pins the package being vendored (any
+/// spec naming it; with no target, whether the file exists at all). An
+/// unreadable file pins nothing.
+async fn requirements_pins_target(project_root: &Path, target: Option<(&str, &str)>) -> bool {
+    let path = project_root.join(crate::formats::governing_locks::PYPI_REQUIREMENTS);
+    match target {
+        None => tokio::fs::metadata(&path).await.is_ok(),
+        Some((name, _)) => read_regular_to_string(&path)
+            .await
+            .is_ok_and(|text| super::pypi_requirements::names_package(&text, name)),
+    }
+}
+
 /// Route the project to a wiring flavor, first match wins. Lockfiles are the
 /// authoritative "this tool manages installs" signal, so locks are compared
 /// with locks (precedence follows migration direction / ecosystem currency:
@@ -246,10 +259,12 @@ const SETUP_ALTERNATIVE: &str =
 /// The tool-lock order is the shared table
 /// [`crate::formats::governing_locks::PYPI_TOOL_LOCKS`].
 ///
-/// When more than one tool lockfile coexists, the winner is wired and a LOUD
-/// `pypi_multiple_lockfiles` warning names the ignored locks — they go
-/// stale-but-valid, which is otherwise invisible. Standalone locks that don't
-/// contain the package get a `pypi_unmatched_lockfiles` warning instead.
+/// When more than one tool lockfile coexists, or a `requirements.txt` that
+/// pins the package sits beside the winning tool lock (#612), the winner is
+/// wired and a LOUD `pypi_multiple_lockfiles` warning names the ignored
+/// files — they go stale-but-valid, which is otherwise invisible. Standalone
+/// locks that don't contain the package get a `pypi_unmatched_lockfiles`
+/// warning instead.
 async fn detect_pypi_flavor(
     project_root: &Path,
     target: Option<(&str, &str)>,
@@ -309,7 +324,15 @@ async fn detect_pypi_flavor(
     }
     if has_uv_lock {
         present.extend(additional_locks.iter().map(String::as_str));
-    } else if !additional_locks.is_empty() {
+    }
+    // #612: a `requirements.txt` exported beside the governing tool lock
+    // (`pipenv requirements`, `uv export`) is an install source the
+    // single-lock wiring leaves untouched — name it among the losers when it
+    // pins this package.
+    if governing.is_some() && requirements_pins_target(project_root, target).await {
+        present.push(PYPI_REQUIREMENTS);
+    }
+    if !has_uv_lock && !additional_locks.is_empty() {
         warnings.push(VendorWarning::new(
             "pypi_unmatched_lockfiles",
             format!(
@@ -1996,6 +2019,55 @@ mod tests {
 
     async fn touch(root: &Path, name: &str, content: &str) {
         tokio::fs::write(root.join(name), content).await.unwrap();
+    }
+
+    /// #612 / B31: a `requirements.txt` exported beside the governing tool
+    /// lock (`pipenv requirements`, `uv export`) is an install source the
+    /// single-lock wiring leaves UNPATCHED, so it must be named by the
+    /// documented `pypi_multiple_lockfiles` warning — but only when it pins
+    /// the package being vendored.
+    #[tokio::test]
+    async fn requirements_beside_the_governing_lock_is_a_loud_loser() {
+        for (lock, content, flavor) in [
+            ("Pipfile.lock", "{}", PypiFlavor::Pipenv),
+            ("uv.lock", "version = 1\n", PypiFlavor::UvProject),
+            ("poetry.lock", "", PypiFlavor::Poetry),
+            ("pdm.lock", "", PypiFlavor::Pdm),
+        ] {
+            let tmp = tempfile::tempdir().unwrap();
+            touch(tmp.path(), lock, content).await;
+            touch(
+                tmp.path(),
+                "requirements.txt",
+                "idna==3.7\nsix==1.16.0 ; python_version >= \"3\"\n",
+            )
+            .await;
+            let (selected, warnings) = detect_pypi_flavor(tmp.path(), Some(("six", "1.16.0")))
+                .await
+                .unwrap();
+            assert_eq!(selected, flavor, "{lock}");
+            let loud: Vec<_> = warnings
+                .iter()
+                .filter(|w| w.code == "pypi_multiple_lockfiles")
+                .collect();
+            assert_eq!(loud.len(), 1, "{lock}: {warnings:?}");
+            assert!(
+                loud[0].detail.contains(&format!("wiring `{lock}`"))
+                    && loud[0].detail.contains("requirements.txt")
+                    && loud[0].detail.contains("UNPATCHED"),
+                "{lock}: {}",
+                loud[0].detail
+            );
+
+            // A requirements file that never names the package stays quiet.
+            let (_, warnings) = detect_pypi_flavor(tmp.path(), Some(("urllib3", "2.0.0")))
+                .await
+                .unwrap();
+            assert!(
+                warnings.iter().all(|w| w.code != "pypi_multiple_lockfiles"),
+                "{lock}: {warnings:?}"
+            );
+        }
     }
 
     /// One assert per row of the routing table (locks > lock-less markers
