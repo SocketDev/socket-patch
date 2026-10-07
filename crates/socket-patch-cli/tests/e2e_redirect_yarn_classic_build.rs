@@ -104,6 +104,16 @@ fn scrub_socket_env(cmd: &mut Command) {
     }
     cmd.env_remove("VIRTUAL_ENV");
     cmd.env_remove("YARN_CACHE_FOLDER");
+    // An ambient yarn 1 mirror setting, or a redirected rc file, would make
+    // both yarn and the hosted scan see a mirror the leg did not set up.
+    for (k, _) in std::env::vars_os() {
+        let lower = k.to_string_lossy().to_ascii_lowercase();
+        let config = lower.starts_with("yarn_") || lower.starts_with("npm_config_");
+        if config && (lower.contains("offline_mirror") || lower.ends_with("userconfig")) {
+            cmd.env_remove(&k);
+        }
+    }
+    cmd.env_remove("PREFIX");
 }
 
 fn corepack(cwd: &Path, pm: &str, args: &[&str], extra_env: &[(&str, &str)]) -> Output {
@@ -128,6 +138,9 @@ fn run_socket_env(cwd: &Path, args: &[&str], extra_env: &[(&str, &str)]) -> (i32
     let mut cmd = Command::new(binary());
     cmd.args(args).current_dir(cwd);
     scrub_socket_env(&mut cmd);
+    // The hosted scan reads yarn 1's user rc files, so it must see the same
+    // sandboxed HOME the fixture's `yarn install` ran under.
+    cache_env::isolate(&mut cmd);
     for (k, v) in extra_env {
         cmd.env(k, v);
     }
@@ -953,7 +966,7 @@ async fn classic_offline_mirror_outside_project_rc_refuses_hosted() {
         ("offline-mirror-env", Mirror::Env),
     ] {
         let Some(fx) = classic_hosted_project(tag, false, mirror, HostedDriver::Scan).await else {
-            return;
+            continue;
         };
         assert!(
             fx.proj
