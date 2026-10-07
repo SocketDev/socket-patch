@@ -1,6 +1,5 @@
 use std::collections::HashMap;
 use std::path::{Path, PathBuf};
-use std::time::Duration;
 
 use serde_json::Value;
 use sha1::Sha1;
@@ -1830,9 +1829,7 @@ pub(crate) async fn fetch_registry_bytes(url: &str, cap: u64) -> Result<Vec<u8>,
 }
 
 async fn fetch_registry_bytes_unredacted(url: &str, cap: u64) -> Result<Vec<u8>, String> {
-    let client = reqwest::Client::builder()
-        .user_agent(MAVEN_USER_AGENT)
-        .timeout(Duration::from_secs(60))
+    let client = super::registry_fetch::registry_client_builder(MAVEN_USER_AGENT)
         .build()
         .map_err(|e| format!("build http client: {e}"))?;
     let resp = client

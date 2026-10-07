@@ -291,8 +291,8 @@ const PROXY_BATCH_PATH_CONCURRENCY: usize = 10;
 
 /// Retry policy for the vendoring service's package-reference POST and
 /// archive GET: `attempts` tries in total, exponential delays from `base`
-/// with ±25% jitter, each capped at `max_delay` (a `Retry-After` in seconds
-/// is honored under the same cap). Retried: transport errors (per-attempt
+/// with ±25% jitter, each capped at `max_delay` (a `Retry-After`, in
+/// seconds or as an HTTP-date, is honored under the same cap). Retried: transport errors (per-attempt
 /// timeouts and bodies cut off mid-transfer included) and HTTP 429,
 /// 500, 502, 503, 504. Never retried: auth (401/403), terminal misses
 /// (404/410), still-building (408), other 4xx, parse errors.
@@ -352,30 +352,13 @@ impl VendorRetryPolicy {
 /// `service` fails closed — the existing miss policy).
 pub(crate) const VENDOR_BREAKER_THRESHOLD: u32 = 2;
 
-/// A jitter sample in `[0, 1)` from std's randomly keyed hasher (no RNG
-/// dependency; the quality needed here is "not synchronized").
-fn jitter_sample() -> f64 {
-    use std::hash::{BuildHasher as _, Hasher as _};
-    let mut hasher = std::collections::hash_map::RandomState::new().build_hasher();
-    hasher.write_u64(0);
-    (hasher.finish() >> 11) as f64 / (1u64 << 53) as f64
-}
+/// The jitter key of the package-reference POST's retries (archive and
+/// artifact downloads are keyed by their URL).
+const VENDOR_REFERENCES_KEY: &str = "POST vendor package references";
 
 /// Is this vendor-service HTTP status worth another attempt?
 fn vendor_status_retryable(status: StatusCode) -> bool {
     matches!(status.as_u16(), 429 | 500 | 502 | 503 | 504)
-}
-
-/// A `Retry-After: <seconds>` header (the HTTP-date form is ignored).
-fn retry_after_secs(headers: &HeaderMap) -> Option<Duration> {
-    headers
-        .get(header::RETRY_AFTER)?
-        .to_str()
-        .ok()?
-        .trim()
-        .parse::<u64>()
-        .ok()
-        .map(Duration::from_secs)
 }
 
 /// One vendor-service attempt's failure: the error, and — when the failure
@@ -1497,11 +1480,27 @@ impl ApiClient {
         }
     }
 
-    /// Pause before retry number `retry` (see [`VendorRetryPolicy`]).
-    async fn vendor_backoff(&self, retry: u32, retry_after: Option<Duration>) {
-        let delay = self.vendor_retry.delay(retry, retry_after, jitter_sample());
+    /// The retry hint for a vendor-service answer with this `status`:
+    /// `None` when the status isn't retried, else its `Retry-After` (either
+    /// form, read on the client's [`RetryHooks`] clock), if any.
+    fn vendor_retry_hint(
+        &self,
+        status: StatusCode,
+        headers: &HeaderMap,
+    ) -> Option<Option<Duration>> {
+        let hooks = &self.api_retry.hooks;
+        vendor_status_retryable(status).then(|| parse_retry_after(headers, (hooks.now_unix_secs)()))
+    }
+
+    /// Pause before retry number `retry` of the request `key` (see
+    /// [`VendorRetryPolicy`]), on the client's [`RetryHooks`] jitter seed
+    /// and sleep.
+    async fn vendor_backoff(&self, key: &str, retry: u32, retry_after: Option<Duration>) {
+        let hooks = &self.api_retry.hooks;
+        let jitter = retry_jitter(hooks.jitter_seed, key, retry);
+        let delay = self.vendor_retry.delay(retry, retry_after, jitter);
         debug_log(&format!("vendor service retry {retry} in {delay:?}"));
-        tokio::time::sleep(delay).await;
+        (hooks.sleep)(delay).await;
     }
 
     /// Step 1 of [`Self::fetch_vendor_package`], retried per the client's
@@ -1558,7 +1557,8 @@ impl ApiClient {
                     debug_log(&format!(
                         "vendor package request attempt {attempt} failed: {e}"
                     ));
-                    self.vendor_backoff(attempt, retry_after).await;
+                    self.vendor_backoff(VENDOR_REFERENCES_KEY, attempt, retry_after)
+                        .await;
                     attempt += 1;
                 }
                 Err((e, hint)) => return Err((e, hint.is_some())),
@@ -1623,7 +1623,7 @@ impl ApiClient {
         }
         // 429 classifies as RateLimited but is still retried (the hint);
         // 401/403 carry no hint.
-        let hint = vendor_status_retryable(status).then(|| retry_after_secs(resp.headers()));
+        let hint = self.vendor_retry_hint(status, resp.headers());
         if let Some(err) = classify_auth_error(status, !use_auth) {
             return Err((err, hint));
         }
@@ -1658,7 +1658,8 @@ impl ApiClient {
         loop {
             match self.download_vendor_archive_once(url).await {
                 (ServeDownload::Failed(e), Some(retry_after)) if attempt < attempts => {
-                    self.vendor_download_retry(attempt, &e, retry_after).await;
+                    self.vendor_download_retry(url, attempt, &e, retry_after)
+                        .await;
                     attempt += 1;
                 }
                 (outcome, hint) => return (outcome, hint.is_some()),
@@ -1670,6 +1671,7 @@ impl ApiClient {
     /// next one.
     async fn vendor_download_retry(
         &self,
+        url: &str,
         attempt: u32,
         e: &ApiError,
         retry_after: Option<Duration>,
@@ -1677,7 +1679,7 @@ impl ApiClient {
         debug_log(&format!(
             "vendor package download attempt {attempt} failed: {e}"
         ));
-        self.vendor_backoff(attempt, retry_after).await;
+        self.vendor_backoff(url, attempt, retry_after).await;
     }
 
     /// [`Self::download_vendor_archive_retrying`] without the flag.
@@ -1743,8 +1745,7 @@ impl ApiClient {
             // caller's pending policy, never retried here.
             StatusCode::REQUEST_TIMEOUT => return (ServeDownload::Pending, None),
             _ => {
-                let hint =
-                    vendor_status_retryable(status).then(|| retry_after_secs(resp.headers()));
+                let hint = self.vendor_retry_hint(status, resp.headers());
                 if let Some(err) = classify_auth_error(status, true) {
                     return (ServeDownload::Failed(err), hint);
                 }
@@ -1822,7 +1823,7 @@ impl ApiClient {
         url: &str,
         deferred: DeferredAttempt,
     ) -> Result<Vec<u8>, ApiError> {
-        self.vendor_download_retry(1, &deferred.error, deferred.retry_after)
+        self.vendor_download_retry(url, 1, &deferred.error, deferred.retry_after)
             .await;
         artifact_download_result(self.download_vendor_archive_from(url, 2).await.0, url)
     }
@@ -2825,7 +2826,7 @@ impl ApiClient {
         loop {
             match self.download_artifact_capped_once(url, max_bytes).await {
                 (Err(_), Some(retry_after)) if attempt < attempts => {
-                    self.vendor_backoff(attempt, retry_after).await;
+                    self.vendor_backoff(url, attempt, retry_after).await;
                     attempt += 1;
                 }
                 (outcome, _) => return outcome,
@@ -2886,8 +2887,7 @@ impl ApiClient {
                 )
             }
             _ => {
-                let hint =
-                    vendor_status_retryable(status).then(|| retry_after_secs(resp.headers()));
+                let hint = self.vendor_retry_hint(status, resp.headers());
                 let err = classify_auth_error(status, true).unwrap_or_else(|| {
                     ApiError::Other(format!(
                         "artifact download failed with status {}",
@@ -5793,8 +5793,6 @@ mod vendor_retry_tests {
             p.delay(1, Some(Duration::from_secs(60)), 0.5),
             Duration::from_secs(4)
         );
-        let j = jitter_sample();
-        assert!((0.0..1.0).contains(&j));
         assert_eq!(VendorRetryPolicy::none().attempts, 1);
     }
 
@@ -5868,6 +5866,179 @@ mod vendor_retry_tests {
             c.vendor_outage.store(1, Ordering::Relaxed);
             let _ = c.fetch_vendor_package(UUID_A, false, None, None).await;
             assert_eq!(c.vendor_outage.load(Ordering::Relaxed), 0, "{status}");
+        }
+    }
+
+    /// The server's HTTP-date `Retry-After` and the clock reading 2 s
+    /// before it.
+    const RETRY_DATE: &str = "Fri, 27 Mar 2026 19:12:42 GMT";
+
+    /// A client on `policy` whose retry hooks read "now" as 2 s before
+    /// [`RETRY_DATE`] and record each backoff instead of sleeping.
+    fn hooked(
+        uri: &str,
+        policy: VendorRetryPolicy,
+        seed: u64,
+    ) -> (ApiClient, Arc<std::sync::Mutex<Vec<Duration>>>) {
+        let now = crate::api::date::parse_timestamp_secs(RETRY_DATE).unwrap() - 2;
+        let slept = Arc::new(std::sync::Mutex::new(Vec::new()));
+        let record = Arc::clone(&slept);
+        let hooks = RetryHooks {
+            sleep: Arc::new(move |d| {
+                record.lock().unwrap().push(d);
+                Box::pin(async {})
+            }),
+            now_unix_secs: Arc::new(move || now),
+            jitter_seed: seed,
+            ..RetryHooks::default()
+        };
+        let c = client(uri, policy).with_api_retry(ApiRetryPolicy::default(), hooks);
+        (c, slept)
+    }
+
+    /// A policy whose cap (10 s) leaves a 2 s `Retry-After` uncapped.
+    fn roomy() -> VendorRetryPolicy {
+        VendorRetryPolicy {
+            max_delay: Duration::from_secs(10),
+            ..fast()
+        }
+    }
+
+    /// Answer `route` once with `status` and an HTTP-date `Retry-After`,
+    /// then with `then`.
+    async fn mount_once_then(
+        server: &MockServer,
+        verb: &str,
+        route: &str,
+        status: u16,
+        then: ResponseTemplate,
+    ) {
+        Mock::given(method(verb))
+            .and(path(route))
+            .respond_with(ResponseTemplate::new(status).insert_header("retry-after", RETRY_DATE))
+            .up_to_n_times(1)
+            .with_priority(1)
+            .mount(server)
+            .await;
+        Mock::given(method(verb))
+            .and(path(route))
+            .respond_with(then)
+            .with_priority(2)
+            .mount(server)
+            .await;
+    }
+
+    /// Every vendor-service retry loop (the reference POST, the archive
+    /// GET, the capped artifact GET, and a deferred artifact GET resumed)
+    /// waits out an HTTP-date `Retry-After` through `api::retry`: 2 s, not
+    /// the policy's millisecond backoff. Before the shared parser, each
+    /// read delta-seconds only and backed off 1-5 ms here.
+    #[tokio::test]
+    async fn every_vendor_retry_loop_honors_an_http_date_retry_after() {
+        let server = MockServer::start().await;
+        mount_once_then(&server, "POST", POST_PATH, 429, granted(&server, UUID_A)).await;
+        let bytes = || ResponseTemplate::new(200).set_body_bytes(BYTES.to_vec());
+        for route in ["/archive", "/capped", "/deferred"] {
+            mount_once_then(&server, "GET", route, 503, bytes()).await;
+        }
+        let url = |route: &str| format!("{}{route}", server.uri());
+
+        let (c, slept) = hooked(&server.uri(), roomy(), 7);
+        c.request_vendor_references(&[UUID_A.to_string()], false, None)
+            .await
+            .expect("the retry after the 429 succeeds");
+        assert_eq!(
+            *slept.lock().unwrap(),
+            [Duration::from_secs(2)],
+            "reference POST"
+        );
+
+        let (c, slept) = hooked(&server.uri(), roomy(), 7);
+        let (outcome, _) = c.download_vendor_archive_retrying(&url("/archive")).await;
+        assert!(matches!(outcome, ServeDownload::Ok(ref b) if b == BYTES));
+        assert_eq!(
+            *slept.lock().unwrap(),
+            [Duration::from_secs(2)],
+            "archive GET"
+        );
+
+        let (c, slept) = hooked(&server.uri(), roomy(), 7);
+        let got = c.download_artifact_capped(&url("/capped"), 1 << 20).await;
+        assert_eq!(got.expect("the retry succeeds"), BYTES);
+        assert_eq!(
+            *slept.lock().unwrap(),
+            [Duration::from_secs(2)],
+            "capped artifact GET"
+        );
+
+        let (c, slept) = hooked(&server.uri(), roomy(), 7);
+        let deferred = c
+            .download_artifact_first_attempt(&url("/deferred"))
+            .await
+            .expect_err("a 503 defers");
+        assert!(slept.lock().unwrap().is_empty(), "a deferral doesn't wait");
+        let got = c
+            .download_artifact_resuming(&url("/deferred"), deferred)
+            .await;
+        assert_eq!(got.expect("the resumed retry succeeds"), BYTES);
+        assert_eq!(
+            *slept.lock().unwrap(),
+            [Duration::from_secs(2)],
+            "resumed artifact GET"
+        );
+    }
+
+    /// An HTTP-date `Retry-After` is still capped at the policy's
+    /// `max_delay`, as delta-seconds always were.
+    #[tokio::test]
+    async fn an_http_date_retry_after_is_capped_at_max_delay() {
+        let server = MockServer::start().await;
+        mount_once_then(&server, "POST", POST_PATH, 503, granted(&server, UUID_A)).await;
+        let (c, slept) = hooked(&server.uri(), fast(), 7);
+        c.request_vendor_references(&[UUID_A.to_string()], false, None)
+            .await
+            .expect("the retry succeeds");
+        assert_eq!(*slept.lock().unwrap(), [fast().max_delay]);
+    }
+
+    /// Without a `Retry-After`, the backoff's ±25% jitter comes from the
+    /// hooks' seed: one seed replays the same waits, and every wait stays
+    /// inside the policy's spread.
+    #[tokio::test]
+    async fn vendor_backoff_jitter_replays_from_the_hook_seed() {
+        let server = MockServer::start().await;
+        Mock::given(method("GET"))
+            .and(path("/down"))
+            .respond_with(ResponseTemplate::new(503))
+            .mount(&server)
+            .await;
+        let policy = VendorRetryPolicy {
+            attempts: 4,
+            base: Duration::from_millis(400),
+            max_delay: Duration::from_secs(10),
+            ..VendorRetryPolicy::default()
+        };
+        let url = format!("{}/down", server.uri());
+        let waits = |seed: u64| {
+            let (uri, url) = (server.uri(), url.clone());
+            async move {
+                let (c, slept) = hooked(&uri, policy, seed);
+                c.download_artifact(&url).await.expect_err("always 503");
+                let waits = slept.lock().unwrap().clone();
+                waits
+            }
+        };
+        let a = waits(1).await;
+        assert_eq!(a, waits(1).await, "one seed, one sequence");
+        assert_ne!(a, waits(2).await, "another seed, other waits");
+        assert_eq!(a.len(), 3);
+        for (i, w) in a.iter().enumerate() {
+            let nominal = policy.base * (1u32 << i);
+            assert!(
+                *w >= nominal.mul_f64(0.75) && *w < nominal.mul_f64(1.25),
+                "retry {}: {w:?}",
+                i + 1
+            );
         }
     }
 }

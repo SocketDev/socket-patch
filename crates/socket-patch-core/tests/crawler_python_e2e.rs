@@ -1113,51 +1113,111 @@ async fn get_site_packages_paths_falls_back_via_pyproject_marker() {
     let _ = result;
 }
 
-/// `uv.lock` alone is also a valid Python-project marker — a fresh
-/// clone of a uv-managed repo shouldn't need a venv to be scannable.
-///
-/// Stages a real global layout under the stubbed HOME and asserts it
-/// surfaces — which can ONLY happen if the `uv.lock` marker triggered
-/// the global fallback (no marker returns an empty Vec).
+/// #964: a uv project (`uv.lock`) and a PEP 723 script lock (`*.py.lock`)
+/// only ever install into uv's own env: `.venv` / `UV_PROJECT_ENVIRONMENT`
+/// for a project, uv's cache for a script. With none synced yet nothing is
+/// installed for the project, and its lock-only packages come from the lock,
+/// so a project-scoped crawl must return nothing rather than fall back to
+/// the global interpreters (which vendored mode would then try to vendor).
 #[tokio::test]
 #[serial]
-async fn get_site_packages_paths_falls_back_via_uv_lock_marker() {
+async fn get_site_packages_paths_uv_without_env_never_falls_back_to_global() {
+    for (files, uv_project_env) in [
+        (&[("uv.lock", "version = 1\n")][..], None),
+        (
+            &[
+                ("pyproject.toml", "[project]\nname = \"app\"\n"),
+                ("uv.lock", "version = 1\n"),
+            ][..],
+            None,
+        ),
+        // A CI-configured env path that hasn't been synced yet.
+        (&[("uv.lock", "version = 1\n")][..], Some("not-synced")),
+        // A script-only directory: script envs live in uv's cache.
+        (
+            &[
+                ("tool.py", "# /// script\n# dependencies = []\n# ///\n"),
+                ("tool.py.lock", "version = 1\n"),
+            ][..],
+            None,
+        ),
+    ] {
+        let project = tempfile::tempdir().unwrap();
+        let home = tempfile::tempdir().unwrap();
+        for (name, body) in files {
+            tokio::fs::write(project.path().join(name), body)
+                .await
+                .unwrap();
+        }
+
+        // Stage an anaconda3 layout under the stubbed HOME: global discovery
+        // scans it on every platform, so seeing it means the fallback ran.
+        let staged = home
+            .path()
+            .join("anaconda3")
+            .join("lib")
+            .join("python3.11")
+            .join("site-packages");
+        tokio::fs::create_dir_all(&staged).await.unwrap();
+
+        let prev_virtual_env = std::env::var("VIRTUAL_ENV").ok();
+        std::env::remove_var("VIRTUAL_ENV");
+        let prev_uv_env = std::env::var("UV_PROJECT_ENVIRONMENT").ok();
+        match uv_project_env {
+            Some(v) => std::env::set_var("UV_PROJECT_ENVIRONMENT", v),
+            None => std::env::remove_var("UV_PROJECT_ENVIRONMENT"),
+        }
+        let prev_home = std::env::var("HOME").ok();
+        std::env::set_var("HOME", home.path());
+        let crawler = PythonCrawler;
+        let opts = CrawlerOptions {
+            cwd: project.path().to_path_buf(),
+            global: false,
+            global_prefix: None,
+        };
+        let result = crawler.get_site_packages_paths(&opts).await.unwrap();
+        if let Some(v) = prev_home {
+            std::env::set_var("HOME", v);
+        }
+        match prev_uv_env {
+            Some(v) => std::env::set_var("UV_PROJECT_ENVIRONMENT", v),
+            None => std::env::remove_var("UV_PROJECT_ENVIRONMENT"),
+        }
+        if let Some(v) = prev_virtual_env {
+            std::env::set_var("VIRTUAL_ENV", v);
+        }
+
+        let names: Vec<&str> = files.iter().map(|(name, _)| *name).collect();
+        assert!(
+            result.is_empty(),
+            "{names:?} (UV_PROJECT_ENVIRONMENT={uv_project_env:?}) must not \
+             fall back to the global site-packages; got {result:?}"
+        );
+    }
+}
+
+/// A `uv.lock` beside another manager's record is not uv's alone: Poetry
+/// with `virtualenvs.create = false` installs into the interpreter it runs
+/// on, so that project keeps the marker fallback.
+#[tokio::test]
+#[serial]
+async fn get_site_packages_paths_uv_lock_beside_poetry_keeps_fallback() {
     let project = tempfile::tempdir().unwrap();
     let home = tempfile::tempdir().unwrap();
     tokio::fs::write(project.path().join("uv.lock"), b"version = 1\n")
         .await
         .unwrap();
-
-    // Stage a uv-tools layout under the stubbed HOME so global
-    // discovery has something concrete to find.
-    #[cfg(target_os = "macos")]
+    tokio::fs::write(project.path().join("poetry.lock"), b"")
+        .await
+        .unwrap();
     let staged = home
         .path()
-        .join("Library")
-        .join("Application Support")
-        .join("uv")
-        .join("tools")
-        .join("black")
+        .join("anaconda3")
         .join("lib")
         .join("python3.11")
         .join("site-packages");
-    #[cfg(all(not(target_os = "macos"), not(windows)))]
-    let staged = home
-        .path()
-        .join(".local")
-        .join("share")
-        .join("uv")
-        .join("tools")
-        .join("black")
-        .join("lib")
-        .join("python3.11")
-        .join("site-packages");
-    #[cfg(windows)]
-    let staged = home.path().join("uv-fake-staged");
     tokio::fs::create_dir_all(&staged).await.unwrap();
 
-    // Ensure an ambient VIRTUAL_ENV can't satisfy discovery via a
-    // different (venv) arm — the fallback must be the marker path.
     let prev_virtual_env = std::env::var("VIRTUAL_ENV").ok();
     std::env::remove_var("VIRTUAL_ENV");
     let prev_home = std::env::var("HOME").ok();
@@ -1179,11 +1239,8 @@ async fn get_site_packages_paths_falls_back_via_uv_lock_marker() {
     #[cfg(not(windows))]
     assert!(
         result.iter().any(|p| p == &staged),
-        "uv.lock marker must trigger global fallback; got {result:?}"
+        "uv.lock + poetry.lock must keep the global fallback; got {result:?}"
     );
-    // On Windows the staged layout doesn't match the global crawler's
-    // search paths (different env var), so the marker-fallback path is
-    // covered by the pyproject test on Unix only.
     #[cfg(windows)]
     let _ = (result, staged);
 }

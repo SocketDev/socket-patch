@@ -184,6 +184,63 @@ pub async fn gem_manifest_refusal(project_root: &Path) -> Option<(&'static str, 
     }
 }
 
+/// The per-gem twin of [`gem_manifest_refusal`] for the hosted→vendored
+/// takeover: the backend's Gemfile declaration gate ([`plan_gemfile_edit`]
+/// and [`refuse_append_of_direct_dependency`], refused as
+/// `gemfile_declaration_not_editable`) for `purl`. Evaluated on the files
+/// as the takeover's restore of `pin` will leave them: a dry-run
+/// [`restore_upstream`] supplies the restored `Gemfile` / `Gemfile.lock`
+/// text, so the hosted `source … do` block socket-patch itself wrote is
+/// never mistaken for the user's declaration. A gem declared inside a
+/// `group` block is the common case: hosted mode wires it, vendored mode
+/// cannot, and without this gate the takeover un-hosts it first (#775).
+/// Returns `(code, detail)`, exactly the refusal the backend would raise
+/// after the restore; `None` when it would not refuse, when the restore
+/// itself would refuse (the takeover reports that), or when the files are
+/// unreadable (which the backend reports itself).
+///
+/// [`restore_upstream`]: crate::patch::redirect::upstream::restore_upstream
+pub async fn gem_vendor_target_preflight(
+    project_root: &Path,
+    purl: &str,
+    pin: &crate::patch::redirect::upstream::HostedPin,
+    opts: &crate::patch::redirect::upstream::RestoreOptions,
+) -> Option<(&'static str, String)> {
+    use crate::patch::redirect::upstream::{restore_upstream, RestoreOptions};
+    let (name, version) = parse_gem_purl(purl)?;
+    // The copy path only shapes a plan that passes; any refusal is decided
+    // by the declaration alone, so an unsafe uuid is left to the backend.
+    let copy_rel = format!(
+        "{}/{name}-{version}",
+        vendor_uuid_dir_rel("gem", &pin.uuid)?
+    );
+    let dry = RestoreOptions {
+        dry_run: true,
+        ..opts.clone()
+    };
+    let restore = restore_upstream(project_root, std::slice::from_ref(pin), &dry).await;
+    if restore.refused().next().is_some() {
+        return None;
+    }
+    let restored = |file: &str| restore.staged_text.get(file).cloned();
+    let gemfile_text = match restored(GEMFILE) {
+        Some(text) => text?,
+        None => read_regular_to_string(&project_root.join(GEMFILE))
+            .await
+            .ok()?,
+    };
+    let lock_text = match restored(GEMFILE_LOCK) {
+        Some(text) => text?,
+        None => read_regular_to_string(&project_root.join(GEMFILE_LOCK))
+            .await
+            .ok()?,
+    };
+    plan_gemfile_edit(&gemfile_text, &name, &version, &copy_rel)
+        .and_then(|plan| refuse_append_of_direct_dependency(plan, &lock_text, &name))
+        .err()
+        .map(|detail| ("gemfile_declaration_not_editable", detail))
+}
+
 async fn gem_prelude(
     purl: &str,
     installed_path: &Path,
@@ -7927,6 +7984,87 @@ mod tests {
         };
         assert_eq!(code, "vendor_prebuilt_required");
         assert!(!root.join(".socket").exists(), "nothing written");
+    }
+
+    // ── #775: the takeover's declaration preflight ─────────────────────
+
+    const TAKEOVER_IDX: &str = "https://patch.socket.dev/patch-registry/gem/11111111-1111-1111-1111-111111111111/9f6b2c4e-1d3a-4f6b-8c2d-7e5a9b1c3d5f/";
+
+    /// A converged, CHECKSUMS-less hosted lock (restoring it needs no
+    /// registry lookup, so the preflight runs offline).
+    fn hosted_takeover_lock() -> String {
+        format!(
+            "GEM\n  remote: {TAKEOVER_IDX}\n  specs:\n    rails (7.0.0)\n\nGEM\n  remote: \
+             https://rubygems.org/\n  specs:\n    puma (6.0.0)\n\nPLATFORMS\n  ruby\n\n\
+             DEPENDENCIES\n  puma\n  rails (= 7.0.0)!\n\nBUNDLED WITH\n   2.4.0\n"
+        )
+    }
+
+    async fn takeover_preflight(gemfile: &str) -> (Option<(&'static str, String)>, PathBuf) {
+        let dir = tempfile::tempdir().unwrap().keep();
+        std::fs::write(dir.join(GEMFILE), gemfile).unwrap();
+        std::fs::write(dir.join(GEMFILE_LOCK), hosted_takeover_lock()).unwrap();
+        let pin = crate::patch::redirect::upstream::HostedPin {
+            purl: "pkg:gem/rails@7.0.0".to_string(),
+            uuid: UUID.to_string(),
+            files: vec![GEMFILE.to_string(), GEMFILE_LOCK.to_string()],
+        };
+        let opts = crate::patch::redirect::upstream::RestoreOptions {
+            dry_run: false,
+            offline: true,
+            patch_server_origins: Vec::new(),
+            bun_lockb: true,
+        };
+        let refusal = gem_vendor_target_preflight(&dir, "pkg:gem/rails@7.0.0", &pin, &opts).await;
+        (refusal, dir)
+    }
+
+    #[tokio::test]
+    async fn takeover_preflight_refuses_a_hosted_gem_inside_a_group_block() {
+        let gemfile = format!(
+            "source \"https://rubygems.org\"\n\ngem \"puma\"\n\ngroup :development do\n\
+             source \"{TAKEOVER_IDX}\" do\n  gem \"rails\", \"7.0.0\"\nend\nend\n"
+        );
+        let (refusal, dir) = takeover_preflight(&gemfile).await;
+        let (code, detail) = refusal.expect("an indented declaration is not editable");
+        assert_eq!(code, "gemfile_declaration_not_editable");
+        assert!(detail.contains("indented"), "{detail}");
+        // A preflight: the hosted pair is never written, even though the
+        // caller's options are a wet run.
+        assert_eq!(std::fs::read_to_string(dir.join(GEMFILE)).unwrap(), gemfile);
+        assert_eq!(
+            std::fs::read_to_string(dir.join(GEMFILE_LOCK)).unwrap(),
+            hosted_takeover_lock()
+        );
+        std::fs::remove_dir_all(dir).ok();
+    }
+
+    #[tokio::test]
+    async fn takeover_preflight_passes_a_top_level_hosted_gem() {
+        // The hosted source block is socket-patch's own wiring: evaluated on
+        // the restored Gemfile, the declaration is a plain top-level line.
+        let gemfile = format!(
+            "source \"https://rubygems.org\"\n\ngem \"puma\"\n\nsource \"{TAKEOVER_IDX}\" do\n  \
+             gem \"rails\", \"7.0.0\"\nend\n"
+        );
+        let (refusal, dir) = takeover_preflight(&gemfile).await;
+        assert_eq!(refusal, None);
+        assert_eq!(std::fs::read_to_string(dir.join(GEMFILE)).unwrap(), gemfile);
+        std::fs::remove_dir_all(dir).ok();
+    }
+
+    #[tokio::test]
+    async fn takeover_preflight_leaves_a_refused_restore_to_the_takeover() {
+        // A hand-edited hosted block the restore cannot unwind: the restore
+        // refuses, and the takeover reports that itself
+        // (`redirect_revert_failed`), not this gate.
+        let gemfile = format!(
+            "source \"https://rubygems.org\"\n\ngroup :test do\nsource \"{TAKEOVER_IDX}\" do\n  \
+             gem \"rails\", \"~> 7.0\"\nend\nend\n"
+        );
+        let (refusal, dir) = takeover_preflight(&gemfile).await;
+        assert_eq!(refusal, None);
+        std::fs::remove_dir_all(dir).ok();
     }
 
     // ── #779: a gem outside the lock's first GEM section ──────────────────

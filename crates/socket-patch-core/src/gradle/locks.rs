@@ -153,7 +153,7 @@ fn split_confs(confs: &str) -> Vec<String> {
 /// Parse a lock file (either format; CRLF and a BOM are fine).
 pub fn parse(text: &str) -> LockState {
     let mut state = LockState::default();
-    for (idx, raw) in super::dsl::strip_bom(text).lines().enumerate() {
+    for (idx, raw) in crate::formats::text::strip_bom(text).lines().enumerate() {
         let line = raw.trim();
         if line.is_empty() || line.starts_with('#') {
             continue;

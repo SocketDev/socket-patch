@@ -1,12 +1,12 @@
 //! Bounded archive readers, integrity verification and registry metadata transport.
 
 use std::path::{Path, PathBuf};
-use std::time::Duration;
 
 use base64::Engine as _;
 use sha1::Sha1;
 use sha2::{Digest, Sha256, Sha384, Sha512};
 
+use crate::api::retry::ApiTimeouts;
 use crate::constants::USER_AGENT;
 use crate::patch::apply::is_safe_relative_subpath;
 
@@ -43,11 +43,59 @@ pub enum FetchError {
 pub type RegistryClient = reqwest::Client;
 
 pub fn build_registry_client() -> RegistryClient {
-    reqwest::Client::builder()
-        .user_agent(USER_AGENT)
-        .timeout(Duration::from_secs(60))
+    registry_client_builder(USER_AGENT)
         .build()
         .unwrap_or_else(|_| reqwest::Client::new())
+}
+
+/// The one builder behind every registry client (npm-family, PyPI, Go,
+/// NuGet, Maven), sending `user_agent`. It applies the shared
+/// [`ApiTimeouts`] transport policy: a connect bound plus an idle read
+/// bound that restarts on every chunk, and no total deadline, so a large
+/// artifact that keeps streaming is never cut off while a stalled host
+/// still fails the fetch.
+pub(crate) fn registry_client_builder(user_agent: &str) -> reqwest::ClientBuilder {
+    registry_timeouts().apply(reqwest::Client::builder().user_agent(user_agent))
+}
+
+fn registry_timeouts() -> ApiTimeouts {
+    #[cfg(test)]
+    if let Some(t) = test_timeouts::get() {
+        return t;
+    }
+    ApiTimeouts::default()
+}
+
+/// Test-only override of [`registry_timeouts`] for the current thread, so a
+/// test can prove the idle bound and the absence of a total deadline in
+/// seconds rather than minutes. `#[tokio::test]` runs on one thread.
+#[cfg(test)]
+pub(crate) mod test_timeouts {
+    use std::cell::Cell;
+
+    use crate::api::retry::ApiTimeouts;
+
+    thread_local! {
+        static OVERRIDE: Cell<Option<ApiTimeouts>> = const { Cell::new(None) };
+    }
+
+    pub(crate) fn get() -> Option<ApiTimeouts> {
+        OVERRIDE.with(Cell::get)
+    }
+
+    /// Shortens the bounds until the returned guard drops.
+    pub(crate) fn set(t: ApiTimeouts) -> Guard {
+        OVERRIDE.with(|c| c.set(Some(t)));
+        Guard
+    }
+
+    pub(crate) struct Guard;
+
+    impl Drop for Guard {
+        fn drop(&mut self) {
+            OVERRIDE.with(|c| c.set(None));
+        }
+    }
 }
 
 /// The npm registry base after the env override.
@@ -1170,11 +1218,11 @@ fn walk_zip_with_prefix(
     Ok(())
 }
 
-/// Capped download. http(s) only; the cap is enforced on the declared
-/// Content-Length AND the actual stream (a lying server cannot blow past
-/// it). Every error quotes the URL redacted (userinfo from a GOPROXY or
-/// `.npmrc` registry, a grant token, a signed query), reqwest's own error
-/// text included.
+/// Capped download. http(s) only; [`crate::utils::http::read_capped`]
+/// enforces [`MAX_DOWNLOAD_BYTES`] on the declared Content-Length AND the
+/// actual stream (a lying server cannot blow past it). Every error quotes
+/// the URL redacted (userinfo from a GOPROXY or `.npmrc` registry, a grant
+/// token, a signed query), reqwest's own error text included.
 pub(crate) async fn download(client: &reqwest::Client, url: &str) -> Result<Vec<u8>, String> {
     download_unredacted(client, url)
         .await
@@ -1185,7 +1233,7 @@ async fn download_unredacted(client: &reqwest::Client, url: &str) -> Result<Vec<
     if !(url.starts_with("https://") || url.starts_with("http://")) {
         return Err(format!("refusing non-http(s) artifact URL `{url}`"));
     }
-    let mut resp = client
+    let resp = client
         .get(url)
         .send()
         .await
@@ -1194,27 +1242,9 @@ async fn download_unredacted(client: &reqwest::Client, url: &str) -> Result<Vec<
     if !status.is_success() {
         return Err(format!("GET {url}: HTTP {status}"));
     }
-    if let Some(len) = resp.content_length() {
-        if len > MAX_DOWNLOAD_BYTES {
-            return Err(format!(
-                "{url}: artifact is {len} bytes (cap {MAX_DOWNLOAD_BYTES})"
-            ));
-        }
-    }
-    let mut bytes: Vec<u8> = Vec::new();
-    while let Some(chunk) = resp
-        .chunk()
+    crate::utils::http::read_capped(resp, MAX_DOWNLOAD_BYTES, "registry artifact")
         .await
-        .map_err(|e| format!("reading {url}: {e}"))?
-    {
-        if bytes.len() as u64 + chunk.len() as u64 > MAX_DOWNLOAD_BYTES {
-            return Err(format!(
-                "{url}: artifact exceeds the {MAX_DOWNLOAD_BYTES}-byte cap"
-            ));
-        }
-        bytes.extend_from_slice(&chunk);
-    }
-    Ok(bytes)
+        .map_err(|e| format!("{url}: {e}"))
 }
 
 /// Verify archive bytes against lock-recorded integrity. Berry cache checksums
@@ -3001,8 +3031,102 @@ mod tests {
             .await
             .unwrap_err();
         assert!(
-            err.contains("exceeds the") && err.contains("cap"),
+            err.contains("exceeded") && err.contains("cap"),
             "the stream cap must fire without a Content-Length: {err}"
+        );
+        server.abort();
+    }
+
+    /// Serves one GET per accepted connection: a 200 head declaring
+    /// `chunks × 1 KiB`, then each 1 KiB chunk after its `gaps` delay.
+    async fn paced_server(
+        gaps: Vec<std::time::Duration>,
+    ) -> (std::net::SocketAddr, tokio::task::JoinHandle<()>) {
+        use tokio::io::{AsyncReadExt as _, AsyncWriteExt as _};
+        let listener = tokio::net::TcpListener::bind("127.0.0.1:0").await.unwrap();
+        let addr = listener.local_addr().unwrap();
+        let server = tokio::spawn(async move {
+            loop {
+                let Ok((mut sock, _)) = listener.accept().await else {
+                    return;
+                };
+                let gaps = gaps.clone();
+                tokio::spawn(async move {
+                    let mut buf = [0u8; 4096];
+                    let _ = sock.read(&mut buf).await; // request head
+                    let head = format!(
+                        "HTTP/1.1 200 OK\r\nContent-Length: {}\r\nConnection: close\r\n\r\n",
+                        gaps.len() * 1024
+                    );
+                    if sock.write_all(head.as_bytes()).await.is_err() {
+                        return;
+                    }
+                    for gap in gaps {
+                        tokio::time::sleep(gap).await;
+                        if sock.write_all(&[b'x'; 1024]).await.is_err() {
+                            return;
+                        }
+                    }
+                });
+            }
+        });
+        (addr, server)
+    }
+
+    /// Every registry client: hosted upstream restore's
+    /// `build_registry_client` + `download`, and vendored Maven's
+    /// `fetch_registry_bytes` (which sends Maven's own user agent).
+    async fn fetch_through_every_registry_client(url: &str) -> Vec<Result<Vec<u8>, String>> {
+        vec![
+            download(&build_registry_client(), url).await,
+            crate::vendor::maven_repo::fetch_registry_bytes(url, MAX_DOWNLOAD_BYTES).await,
+        ]
+    }
+
+    const SHORT_BOUNDS: ApiTimeouts = ApiTimeouts {
+        connect: std::time::Duration::from_secs(2),
+        read: std::time::Duration::from_millis(400),
+    };
+
+    #[tokio::test]
+    async fn registry_clients_have_no_total_deadline() {
+        // #872: the registry clients set a 60 s whole-request deadline, so
+        // a slow but steady download was aborted mid-body. Under the shared
+        // `ApiTimeouts` policy only silence counts: a body that trickles
+        // for 4× the (shortened) idle bound, never pausing that long,
+        // arrives whole through every registry client.
+        let _bounds = test_timeouts::set(SHORT_BOUNDS);
+        let gaps = vec![std::time::Duration::from_millis(100); 16];
+        let (addr, server) = paced_server(gaps).await;
+        let url = format!("http://{addr}/slow.tgz");
+        for got in fetch_through_every_registry_client(&url).await {
+            assert_eq!(
+                got.expect("a progressing body must not time out").len(),
+                16 * 1024
+            );
+        }
+        server.abort();
+    }
+
+    #[tokio::test]
+    async fn registry_clients_fail_a_body_that_stalls_past_the_idle_bound() {
+        // A connection that goes silent mid-body fails at the idle bound
+        // instead of holding the run until the server resumes (here 5 s
+        // later; on `main` both clients waited it out and succeeded).
+        let _bounds = test_timeouts::set(SHORT_BOUNDS);
+        let mut gaps = vec![std::time::Duration::ZERO; 4];
+        gaps.push(std::time::Duration::from_secs(5));
+        let (addr, server) = paced_server(gaps).await;
+        let url = format!("http://{addr}/stall.tgz");
+        let started = std::time::Instant::now();
+        for got in fetch_through_every_registry_client(&url).await {
+            let err = got.expect_err("a stalled body must fail at the idle bound");
+            assert!(err.contains("error reading"), "{err}");
+        }
+        assert!(
+            started.elapsed() < std::time::Duration::from_secs(4),
+            "both fetches must give up at the idle bound, took {:?}",
+            started.elapsed()
         );
         server.abort();
     }
