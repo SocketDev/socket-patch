@@ -2,7 +2,7 @@
 
 ## Part 5: Vendored mode and the non-JS backends
 
-_Last checked against main @ 9c43dfc on 2026-10-07 by audit-ecosystems (5.3 revert envelope, finish steps and keep policies re-checked at `9c43dfc`; 5.7 JVM backends and the single-module routing re-checked at `9c43dfc`; 5.2 ecosystem enumeration sites and dispatch re-checked at `9c43dfc`; the vendored-reference scan's file list re-checked at `9c43dfc`; 5.4 Poetry/PDM/Pipenv backend skeleton and Poetry forward splicers re-checked at `9c43dfc`; 5.2 dead `force`/`sources` parameters re-checked at `9c43dfc`; per-backend service-copy and cleanup copies re-checked at `9c43dfc`; 5.4 NuGet, Poetry/PDM and Gem re-checked at `4646693`; as of `045d7ec`: 5.4 Python, Cargo, Maven XML, Gem, Go and CRLF helpers; 5.6 scaffolding; the vendored-reference scan behind repair and the orphan sweeps). Owner: audit-ecosystems._
+_Last checked against main @ db83f01 on 2026-10-07 by audit-ecosystems (5.6 `registry_fetch.rs` contents and importers re-checked at `db83f01`; 5.3 revert envelope, finish steps and keep policies re-checked at `9c43dfc`; 5.7 JVM backends and the single-module routing re-checked at `9c43dfc`; 5.2 ecosystem enumeration sites and dispatch re-checked at `9c43dfc`; the vendored-reference scan's file list re-checked at `9c43dfc`; 5.4 Poetry/PDM/Pipenv backend skeleton and Poetry forward splicers re-checked at `9c43dfc`; 5.2 dead `force`/`sources` parameters re-checked at `9c43dfc`; per-backend service-copy and cleanup copies re-checked at `9c43dfc`; 5.4 NuGet, Poetry/PDM and Gem re-checked at `4646693`; as of `045d7ec`: 5.4 Python, Cargo, Maven XML, Gem, Go and CRLF helpers; 5.6 scaffolding; the vendored-reference scan behind repair and the orphan sweeps). Owner: audit-ecosystems._
 
 > Scope: `vendor/` framework (`mod`, `common`, `state`, `verify`, `registry_fetch`, `service_fetch`, `prestage`, `reuse`, `redownload`, `ledger_snapshots`, `parse_memo`, `path`, `source`, `toml_surgery`, `lock_inventory`); backends for cargo, gem, pypi (×10 files), golang, composer, nuget, maven and `jvm/`; related `utils/` parsers; and the CLI `vendor.rs` + `vendored_backend/`.
 
@@ -26,7 +26,7 @@ Production lines per backend:
 | NuGet | 1,406 |
 | Composer | 1,393 |
 
-Framework files: `registry_fetch` 1,535, `mod` 838, `common` 831, `state` 824, `verify` 823, `redownload` 462, `prestage` 425, `path` 421, `service_fetch` 386, `ledger_snapshots` 352, `reuse` 349, `toml_surgery` 292, `parse_memo` 147.
+Framework files: `registry_fetch` 1,560 (at `db83f01`), `mod` 838, `common` 831, `state` 824, `verify` 823, `redownload` 462, `prestage` 425, `path` 421, `service_fetch` 386, `ledger_snapshots` 352, `reuse` 349, `toml_surgery` 292, `parse_memo` 147.
 
 ### 5.2 No backend trait
 
@@ -190,7 +190,7 @@ v5 removed local artifact building, but the scaffolding remains:
   - `args.rs:59` still lists `build` as valid;
   - `lock_inventory/mod.rs:9-12` says vendor fetches from the registry;
   - `gem.rs` refers to a `FallBack` variant that does not exist.
-- `registry_fetch.rs` (1,535 lines) is now really archive extraction plus integrity checks plus the hosted-restore HTTP client. It is misnamed and misplaced.
+- `registry_fetch.rs` (3,048 lines at `db83f01`: 1,560 production, up from 1,535) is really archive extraction, the Go module-zip walk and `h1` hash, integrity checks, and the registry bases plus HTTP client for hosted restore. It is misnamed and misplaced: agent mode (`patch/jvm_jar.rs`), hosted restore (`redirect/upstream/`), `hosted/` and `api/` all import it from `vendor/`. {{E29}}
 - **`--vendor-source` accepts only `service` or its alias `auto`.** It is a user-facing flag with exactly one behavior.
 
 **Value: negative. Delete it** (about 250 lines, near-zero risk).

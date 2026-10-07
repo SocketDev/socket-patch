@@ -2,7 +2,7 @@
 
 ## Part 3: Hosted mode (redirect, hosted engine, upstream restore, Node addon)
 
-_Last checked against main @ 9c43dfc on 2026-10-05 by audit-ecosystems (hosted Maven/Gradle grant handling checked at `9c43dfc`; 3.4 NuGet.config readers as of `4646693`; 3.6 vlt dead helpers as of `045d7ec`; the rest as of `203e092`). Owner: `audit-ecosystems`._
+_Last checked against main @ db83f01 on 2026-10-07 by audit-ecosystems (3.2 `redirect/mod.rs` size and layout re-checked at `db83f01`; hosted Maven/Gradle grant handling checked at `9c43dfc`; 3.4 NuGet.config readers as of `4646693`; 3.6 vlt dead helpers as of `045d7ec`; the rest as of `203e092`). Owner: `audit-ecosystems`._
 
 > Scope: `patch/redirect/**`, `hosted/**`, `crates/socket-patch-node/**`, CLI `scan/hosted.rs`, `scan/hosted/*`, `hosted_bundle.rs`.
 
@@ -61,13 +61,13 @@ Other symptoms:
 - Four telescoping public entry points each add one parameter: `rewrite_registry_redirect` → `_with_python_metadata` → `_with_pipenv_version` → `_withholding_vlt` (`mod.rs:292-412`).
 - `boxed_run_redirect_selected` exists only because the async future is too large for the 1 MiB Windows main-thread stack (`scan/hosted.rs:2213`). That is a direct symptom of the 836-line function.
 
-**`redirect/mod.rs` is a 17.5K-line god module.** Its 6.2K production lines mix six concerns:
+**`redirect/mod.rs` is a 21.9K-line god module** (21,936 lines at `db83f01`; 17.5K at the snapshot). Its 7.6K production lines (L1–L7622) mix six concerns: {{E30}}
 1. wire types (`Integrity`, `DepOverride`, `FileEdit`, `RewriteWarning`, `RewriteResult`);
 2. orchestration: entry points, withholding, and a parallel-groups engine that runs each group on a `prefix.clone()` in a scoped thread, merges the deltas, and falls back to serial;
 3. **eleven ecosystem rewriters**, where cargo alone takes lines 1050–2952 (1,903 lines);
 4. hosted-URL ownership and grant-token redaction, separate from the 47-line `hosted_url.rs` beside it;
-5. a utility library for *other modes*: `cargo_socket_registry_pin`, `TRUSTED_CHECKSUMS_ON`, `local_repo_artifact_path` and `gem_line_trailing_options` are imported by `vendor/cargo.rs`, `vendor/gem.rs`, `vendor/nuget_feed.rs` and `vex/discover/maven.rs`;
-6. 11.4K lines of tests (262 tests, 80 of them for cargo).
+5. a utility library for *other modes*: `cargo_socket_registry_pin`, `TRUSTED_CHECKSUMS_ON`, `local_repo_artifact_path` and `gem_line_trailing_options` are imported by `vendor/cargo.rs`, `vendor/gem.rs`, `vendor/nuget_feed.rs` and `vex/discover/maven.rs`; since #690, `formats/sbt/owned_file.rs` also imports `bare_sha256_hex` from it (a new `formats → redirect` edge);
+6. 14.3K lines of inline tests at `db83f01` (L7623–L21936; 322 tests in six modules). Moving them to sibling files is #1011, the first step of the split (#1010).
 
 **Misplaced and dead code.**
 - `redirect/golang_local.rs` (690 prod / 1,733 test) documents itself as the "Project-local Go replace-redirect engine (local mode only)". It is called from `apply.rs`, `vendor/golang.rs`, `rollback.rs` and `vex.rs`; it is not hosted code.
@@ -174,7 +174,7 @@ For uv, pylock, poetry, pdm, hatch, vlt, maven and bun.lockb, the module's own f
 
 ### 3.7 Recommendations
 
-1. **Split `redirect/mod.rs` mechanically** (net ~0 lines, low risk):
+1. **Split `redirect/mod.rs` mechanically** (net ~0 lines, low risk): {{E30}}
    - `model.rs` for the DTOs;
    - `driver.rs` for orchestration;
    - one file per ecosystem, with `cargo/` split into `{manifest, config, lock, pins}`;

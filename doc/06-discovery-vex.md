@@ -2,7 +2,7 @@
 
 ## Part 6: Discovery, inventory and VEX
 
-_Last checked against main @ 9c43dfc on 2026-10-05 by audit-ecosystems (6.4 layering inversion and the Bundler lock rule re-checked at `9c43dfc`; 6.5 `vex_consumed.rs` and npm alias discovery as of `4646693`; as of `045d7ec`: gem lock selection, the go.mod row, 6.4 dead code and the product probe table re-checked). Owner: `audit-ecosystems`._
+_Last checked against main @ db83f01 on 2026-10-07 by audit-ecosystems (6.6 JVM crawler build-tool markers and npm alias discovery re-checked at `db83f01`; 6.4 layering inversion and the Bundler lock rule re-checked at `9c43dfc`; 6.5 `vex_consumed.rs` and npm alias discovery as of `4646693`; as of `045d7ec`: gem lock selection, the go.mod row, 6.4 dead code and the product probe table re-checked). Owner: `audit-ecosystems`._
 
 > Scope: `vex/**` (incl. `vex/discover/*`), `crawlers/**`, `formats/**`, `vendor/lock_inventory/*`, and the CLI consumers `vex.rs`, `vex_sources.rs`, `vex_consumed.rs`, `scan/discovery.rs`, `context.rs`, `list.rs`, `ecosystem_dispatch.rs`.
 
@@ -160,6 +160,8 @@ cli: ProjectContext owns ONE Inventory; one EmbeddedVex helper
 **Risks.** Discovery is fail-closed, security-sensitive code. The golden snapshots and the ~40K lines of end-to-end tests are the safety net, so migrate one format at a time behind them. The `CLI_CONTRACT` warning codes must not change. Scoping the cache crawls changes output for lockless cargo, Gradle and NuGet projects, so keep a fallback flag for those.
 
 ### New findings since the review
+
+- "Is this an sbt / Mill / scala-cli build?" has six marker lists since #690 (`JVM_PROJECT_MARKERS`, `SCALA_TOOL_MARKERS`, `is_sbt_build`, `sbt_evidence::cache_roots`, `MILL_MARKERS` and scala-cli's `MILL_MARKERS` minus `.mill-version`). The agent JVM crawl gates on the narrow list before the wide one, so a scala-cli directory with only `.scala-build`, or an sbt root with only `project/build.properties`, gets no Coursier roots, while `m2_gate`, vendored `sbt::detect` and hosted `is_sbt_build` treat it as a Scala build (executed). {{E69}}
 
 - npm alias discovery is written twice: core `NpmCrawler::alias_copies` (apply, rollback, the VEX installed lookup) and the CLI's `vex_consumed` walk (hosted VEX). They have drifted on case: on Linux, an alias dir whose name differs from the package only by case is a copy for VEX but invisible to apply (proven by execution). This is behind #851 and #852. {{E62}}
 

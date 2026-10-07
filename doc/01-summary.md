@@ -60,7 +60,7 @@
    - ~134K lines of production code on `9c43dfc` (~118K at the snapshot, plus 35K comment lines then).
    - ~450K lines of tests.
    - Nine functions over 500 lines; `run_scan` alone is 1,540 (on `045d7ec`).
-   - A 17.5K-line `redirect/mod.rs`.
+   - A 21.9K-line `redirect/mod.rs` on `db83f01` (17.5K at the snapshot). {{E30}}
    - Two hosted orchestrators kept equal by parity tests.
    - Four discovery systems.
    - Nine different revert mechanisms. {{E24}}
@@ -94,7 +94,7 @@
 | Inline `#[cfg(test)]` code in `src/` | ~228K lines on `9c43dfc` (~197K at the snapshot) |
 | Integration tests (`crates/*/tests`) | ~283K lines in **224 separate test executables** in core + CLI (top-level files plus directory binaries; recounted at `9c43dfc`, 2026-10-06; ~255K at the snapshot) |
 | Test : production ratio | ~2.8 : 1 overall; ~7 : 1 for the CLI crate |
-| Largest file | `patch/redirect/mod.rs`: 21,255 lines at `9c43dfc` (2026-10-06; 17,517 at the snapshot, 6.2K production then) |
+| Largest file | `patch/redirect/mod.rs`: 21,936 lines at `db83f01` (2026-10-07; 7.6K production, 14.3K inline tests; 17,517 at the snapshot, 6.2K production then) |
 | Functions > 200 / > 500 lines | 61 / 9 (`run_scan` 1,540 on `045d7ec`, `rollback::run` 984, `vendor_records_reusing` 962, `run_redirect_selected` 836, `remove::run` 797, `get::run` 635, memory `engine` 604, …) |
 | CLI surface | 9 visible + 2 hidden subcommands; 57 visible long flags; 27 globals on every command; 43 env bindings (84 `SOCKET_*` names in source); 156 documented `errorCode`s; ~570 code-like strings in source |
 | `--help` | 150–219 lines per subcommand; `list --help` lists 27 options, most of which do nothing for `list` |
