@@ -364,40 +364,50 @@ pub(super) fn apply_dist_edit(
             SourcePlan::None => {}
         }
     }
+    // Every change falls inside the entry object (from its `{`, or the dist
+    // when there is none, to its closing `}`), so the edits are made on a
+    // copy of that region alone and spliced back once: the work per
+    // redirected package is bounded by its entry, not by the lock.
+    let lo = object_open.map_or(dist_start, |open| open.min(dist_start));
+    let region = &content[lo..=entry_end];
     // Splice the dist, then drop the members one at a time, re-scanning
     // after each so two adjacent removals never leave a dangling comma.
-    let mut updated = content.clone();
-    updated.replace_range(dist_start..=dist_end, &dist);
+    let mut updated = region.to_string();
+    updated.replace_range(dist_start - lo..=dist_end - lo, &dist);
     for key in super::ORIGIN_BOUND_ENTRY_KEYS {
-        let end = (entry_end + updated.len()).saturating_sub(content.len());
-        if let SourcePlan::Remove(r) = plan(&updated, end, key) {
+        let end = (entry_end - lo + updated.len()).saturating_sub(region.len());
+        let drop = match object_open {
+            Some(open) => plan_member_drop(&updated, open - lo, end, key),
+            None => SourcePlan::None,
+        };
+        if let SourcePlan::Remove(r) = drop {
             updated.replace_range(r, "");
         }
     }
-    if updated == *content {
+    if updated == region {
         return None;
     }
     // Widen the span to cover every byte that changed (a removal that took
     // the comma before it reaches past its own planned range).
-    let prefix = content
+    let prefix = region
         .bytes()
         .zip(updated.bytes())
         .take_while(|(a, b)| a == b)
         .count();
-    let max_suffix = content.len().min(updated.len()) - prefix;
-    let suffix = content
+    let max_suffix = region.len().min(updated.len()) - prefix;
+    let suffix = region
         .bytes()
         .rev()
         .zip(updated.bytes().rev())
         .take(max_suffix)
         .take_while(|(a, b)| a == b)
         .count();
-    let span_start = span_start.min(prefix);
-    let span_end = span_end.max(content.len() - suffix - 1);
-    let new_end = span_end + updated.len() - content.len();
+    let span_start = span_start.min(lo + prefix);
+    let span_end = span_end.max(lo + region.len() - suffix - 1);
+    let new_end = span_end + updated.len() - region.len();
     let original = content[span_start..=span_end].to_string();
-    let replacement = updated[span_start..=new_end].to_string();
-    *content = updated;
+    let replacement = updated[span_start - lo..=new_end - lo].to_string();
+    content.replace_range(lo..=entry_end, &updated);
     Some(FileEdit {
         path: "composer.lock".into(),
         kind: "redirect_composer_dist".into(),
