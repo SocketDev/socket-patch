@@ -167,7 +167,8 @@ impl Mvn {
         Some(Mvn { program, version })
     }
 
-    fn numeric(&self) -> Vec<u32> {
+    /// `[major, minor, patch]` (a pre-release tail such as `-rc-6` dropped).
+    pub fn numeric(&self) -> Vec<u32> {
         self.version
             .split(['.', '-'])
             .take(3)
