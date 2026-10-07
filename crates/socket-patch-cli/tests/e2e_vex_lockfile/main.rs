@@ -20,6 +20,12 @@
 //! (with the PDM/Hatch and Pipenv/pip helpers beside it); `common_selftest`
 //! tests those helpers themselves.
 
+#[path = "../common/hermetic.rs"]
+mod hermetic;
+#[path = "../prebuilt_common/mod.rs"]
+mod prebuilt_common;
+#[path = "../sbt_common/mod.rs"]
+mod sbt_common;
 #[path = "../vex_e2e_common/mod.rs"]
 mod vex_e2e_common;
 #[path = "../vex_pdm_hatch_common/mod.rs"]
@@ -44,6 +50,8 @@ mod pip;
 mod pipenv;
 mod pnpm;
 mod poetry;
+mod sbt;
+mod sbt_vendored;
 mod uv;
 mod vlt;
 mod yarn;

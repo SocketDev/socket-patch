@@ -63,6 +63,16 @@ async fn run(args: &[&str], cwd: &Path, m2_repo: &Path, proxy_url: &str) -> Outp
             .current_dir(&cwd)
             // Point the crawler at the fake local repo.
             .env("MAVEN_REPO_LOCAL", &m2_repo)
+            // And keep it off the machine's Coursier / Ivy caches, which a
+            // Maven marker also makes it crawl (their homes are derived
+            // from these; none exists below the fixture).
+            .env("HOME", m2_repo.with_file_name("no-home"))
+            .env("USERPROFILE", m2_repo.with_file_name("no-home"))
+            .env("XDG_CACHE_HOME", m2_repo.with_file_name("no-xdg-cache"))
+            .env("LOCALAPPDATA", m2_repo.with_file_name("no-localappdata"))
+            .env_remove("COURSIER_CACHE")
+            .env_remove("SBT_OPTS")
+            .env_remove("JAVA_OPTS")
             // Keep the run hermetic: no ambient token, no inherited repo path.
             .env_remove("SOCKET_API_TOKEN")
             .env_remove("SOCKET_CLI_API_TOKEN")
@@ -177,8 +187,7 @@ async fn scan_discovers_maven_artifacts() {
     // Must NOT have hit the empty-crawl path — that line *also* contains
     // the word "packages".
     assert!(
-        !combined.contains("No packages found")
-            && !combined.contains("No packages found"),
+        !combined.contains("No packages found") && !combined.contains("No packages found"),
         "scan reported zero packages — Maven discovery did not run:\n{combined}"
     );
     assert!(

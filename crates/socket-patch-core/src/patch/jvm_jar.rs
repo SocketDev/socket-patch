@@ -34,7 +34,6 @@ use crate::patch::apply::{
 };
 use crate::patch::rollback::{RollbackResult, VerifyRollbackResult, VerifyRollbackStatus};
 use crate::patch::sidecars::{self, maven as maven_sidecars};
-use crate::utils::digest::{sha1_hex_of, sha256_hex_of};
 use crate::utils::purl::{parse_maven_purl, purl_qualifier};
 use crate::vendor::VendorServiceConfig;
 
@@ -269,7 +268,7 @@ pub fn derived_copies_in(
     // reader fails fast on a FIFO or device instead of wedging in open(2).
     let current = crate::utils::fs::read_regular_to_bytes_sync(&jar)
         .ok()
-        .map(|b| sha1_hex_of(&b));
+        .map(|b| sha1_hex(&b));
     let written = std::fs::metadata(&jar).and_then(|m| m.modified()).ok();
     let unverified = found
         .unknown
@@ -278,7 +277,7 @@ pub fn derived_copies_in(
             let Ok(copy) = crate::utils::fs::read_regular_to_bytes_sync(p) else {
                 return true;
             };
-            if Some(sha1_hex_of(&copy)) == current {
+            if Some(sha1_hex(&copy)) == current {
                 return false;
             }
             let made = std::fs::metadata(p).and_then(|m| m.modified()).ok();
@@ -351,11 +350,19 @@ fn unpatched_members(
     Ok(members)
 }
 
+fn sha256_hex(bytes: &[u8]) -> String {
+    crate::utils::digest::sha256_hex_of(bytes)
+}
+
+fn sha1_hex(bytes: &[u8]) -> String {
+    crate::utils::digest::sha1_hex_of(bytes)
+}
+
 /// `<socket_dir>/jvm-originals/<sha256>.jar`.
 pub fn backup_path(socket_dir: &Path, original: &[u8]) -> PathBuf {
     socket_dir
         .join(ORIGINALS_DIR)
-        .join(format!("{}.jar", sha256_hex_of(original)))
+        .join(format!("{}.jar", sha256_hex(original)))
 }
 
 /// Keep `original` under [`ORIGINALS_DIR`] (content-addressed: an existing
@@ -615,7 +622,7 @@ async fn find_backup(restore: &JarRestore<'_>, dir: &Path, current: &[u8]) -> Op
             continue;
         };
         if let Some(hash) = &gradle_hash {
-            if !gradle_cache::hash_eq(hash, &sha1_hex_of(&bytes)) {
+            if !gradle_cache::hash_eq(hash, &sha1_hex(&bytes)) {
                 continue;
             }
         }
@@ -653,7 +660,7 @@ async fn upstream_for_gradle_copy(purl: &str, jar_leaf: &str, dir: &Path) -> Opt
     )
     .await
     .ok()?;
-    gradle_cache::hash_eq(hash, &sha1_hex_of(&bytes)).then_some(bytes)
+    gradle_cache::hash_eq(hash, &sha1_hex(&bytes)).then_some(bytes)
 }
 
 fn rollback_result(purl: &str, dir: &Path) -> RollbackResult {
@@ -1056,7 +1063,7 @@ mod tests {
         std::fs::create_dir_all(&copy).unwrap();
         let original = pristine_jar();
         std::fs::write(copy.join("lib-1.0.jar"), &original).unwrap();
-        let sha1_text = format!("{}\n", sha1_hex_of(&original));
+        let sha1_text = format!("{}\n", sha1_hex(&original));
         std::fs::write(copy.join("lib-1.0.jar.sha1"), &sha1_text).unwrap();
 
         let files = record();
@@ -1072,7 +1079,7 @@ mod tests {
         );
         assert_eq!(
             std::fs::read_to_string(copy.join("lib-1.0.jar.sha1")).unwrap(),
-            format!("{}\n", sha1_hex_of(&service))
+            format!("{}\n", sha1_hex(&service))
         );
 
         let restore = JarRestore {
@@ -1113,7 +1120,7 @@ mod tests {
         let version = d
             .path()
             .join(".gradle/caches/modules-2/files-2.1/com.example/lib/1.0");
-        let hash_dir = version.join(sha1_hex_of(&original));
+        let hash_dir = version.join(sha1_hex(&original));
         std::fs::create_dir_all(&hash_dir).unwrap();
         std::fs::write(hash_dir.join("lib-1.0.jar"), patched_jar()).unwrap();
 

@@ -1,3 +1,4 @@
+use crate::crawlers::python_crawler::canonicalize_pypi_name;
 use crate::crawlers::types::CrawledPackage;
 
 /// Match type for sorting results by relevance; declaration order is the
@@ -28,8 +29,14 @@ fn get_full_name(pkg: &CrawledPackage) -> String {
     }
 }
 
+/// Whether `pkg` is a PyPI distribution, whose name is PEP 503-insensitive.
+fn is_pypi(pkg: &CrawledPackage) -> bool {
+    pkg.purl.starts_with("pkg:pypi/")
+}
+
 /// Determine the match type for a package against a query, or `None` if there
-/// is no match. All inputs must already be lowercased.
+/// is no match. All inputs must already be lowercased (and, for PyPI,
+/// PEP 503-canonicalized).
 fn get_match_type(full_name: &str, name: &str, query: &str) -> Option<MatchType> {
     if full_name == query {
         Some(MatchType::ExactFull)
@@ -68,12 +75,22 @@ pub fn fuzzy_match_packages(
     if query.is_empty() {
         return Vec::new();
     }
+    // PyPI names are compared in PEP 503 form on both sides: the crawler
+    // stores `ruamel-yaml`, while pip, requirements.txt and the dist-info
+    // spell it `ruamel.yaml` / `ruamel_yaml` / `Ruamel.YAML`.
+    let pypi_query = canonicalize_pypi_name(&query);
 
     let mut matches: Vec<(MatchType, String, CrawledPackage)> = packages
         .iter()
         .filter_map(|pkg| {
             let full_name = get_full_name(pkg).to_lowercase();
-            let match_type = get_match_type(&full_name, &pkg.name.to_lowercase(), &query)?;
+            let match_type = if is_pypi(pkg) {
+                let full = canonicalize_pypi_name(&full_name);
+                let name = canonicalize_pypi_name(&pkg.name);
+                get_match_type(&full, &name, &pypi_query)?
+            } else {
+                get_match_type(&full_name, &pkg.name.to_lowercase(), &query)?
+            };
             Some((match_type, full_name, pkg.clone()))
         })
         .collect();
@@ -106,6 +123,70 @@ mod tests {
             purl,
             path: PathBuf::from("/fake"),
         }
+    }
+
+    fn make_pypi(name: &str, version: &str) -> CrawledPackage {
+        // The Python crawler stores PEP 503 canonical names.
+        CrawledPackage {
+            name: name.to_string(),
+            version: version.to_string(),
+            namespace: None,
+            purl: format!("pkg:pypi/{name}@{version}"),
+            path: PathBuf::from("/fake"),
+        }
+    }
+
+    #[test]
+    fn test_pypi_query_is_pep503_canonicalized() {
+        // #926: pip, requirements.txt and dist-info spell these names with
+        // `.` / `_` and any case; the crawler stores the canonical form.
+        let packages = vec![
+            make_pypi("ruamel-yaml", "0.18.6"),
+            make_pypi("typing-extensions", "4.12.2"),
+            make_pypi("zope-interface", "6.0"),
+        ];
+        for (query, want) in [
+            ("ruamel.yaml", "ruamel-yaml"),
+            ("ruamel_yaml", "ruamel-yaml"),
+            ("Ruamel.YAML", "ruamel-yaml"),
+            ("typing_extensions", "typing-extensions"),
+            ("Typing.Extensions", "typing-extensions"),
+            ("typing__extensions", "typing-extensions"),
+            ("zope.interface", "zope-interface"),
+            (" typing_extensions ", "typing-extensions"),
+        ] {
+            let results = fuzzy_match_packages(query, &packages, 20);
+            assert_eq!(results.len(), 1, "{query}: {results:?}");
+            assert_eq!(results[0].name, want, "{query}");
+        }
+    }
+
+    #[test]
+    fn test_pypi_separator_spelling_ranks_as_exact() {
+        // The `_` spelling of an installed name is an exact match, so it
+        // must outrank a longer name it is a prefix of.
+        let packages = vec![
+            make_pypi("typing-extensions-backport", "1.0"),
+            make_pypi("typing-extensions", "4.12.2"),
+        ];
+        let results = fuzzy_match_packages("typing_extensions", &packages, 20);
+        assert_eq!(results.len(), 2);
+        assert_eq!(results[0].name, "typing-extensions");
+    }
+
+    #[test]
+    fn test_pypi_prefix_and_contains_use_canonical_form() {
+        let packages = vec![make_pypi("ruamel-yaml-clib", "0.2.8")];
+        assert_eq!(fuzzy_match_packages("ruamel.yaml", &packages, 20).len(), 1);
+        assert_eq!(fuzzy_match_packages("yaml_clib", &packages, 20).len(), 1);
+    }
+
+    #[test]
+    fn test_npm_names_keep_their_separators() {
+        // npm names are not PEP 503: `_` and `.` are distinct characters.
+        let packages = vec![make_pkg("lodash-es", "4.17.21", None)];
+        assert!(fuzzy_match_packages("lodash_es", &packages, 20).is_empty());
+        assert!(fuzzy_match_packages("lodash.es", &packages, 20).is_empty());
     }
 
     #[test]

@@ -42,7 +42,8 @@ use crate::utils::fs::{atomic_write_bytes_preserving_mode, read_regular_to_strin
 use crate::utils::socket_dir::remove_tree_and_prune;
 use crate::vendor::bun_lock_text::{
     decode_json_string, has_workspace_packages, is_bundled_entry, lock_version, packages_bounds,
-    parse_entry_line, split_name_spec, BunEntry,
+    parse_entry_line, patched_dependency_detail, patched_dependency_key, patched_dependency_keys,
+    split_name_spec, BunEntry,
 };
 
 use super::common::{already_patched_result, refused};
@@ -663,6 +664,35 @@ pub(super) struct BunProject {
     lock_text: String,
     lines: Vec<String>,
     entries: Vec<BunEntry>,
+    /// The project's own `patchedDependencies` keys (#367).
+    user_patched: Vec<String>,
+}
+
+/// The root manifest's `patchedDependencies` keys, unioned with the copy
+/// Bun mirrors into the text `lock` when there is one. An unreadable or
+/// non-JSON manifest contributes none; the lock read stands on its own.
+pub(super) async fn read_user_patched(project_root: &Path, lock: Option<&str>) -> Vec<String> {
+    let manifest = read_regular_to_string(&project_root.join("package.json"))
+        .await
+        .ok();
+    patched_dependency_keys(manifest.as_deref(), lock)
+}
+
+/// Refuse to vendor a package the project patches itself with `bun patch`
+/// (#367): Bun applies that patch only to the registry `name@version`, so
+/// a local tarball tuple would silently drop it from every install.
+pub(super) fn refuse_user_patched(
+    user_patched: &[String],
+    name: &str,
+    version: &str,
+) -> Result<(), Box<VendorOutcome>> {
+    match patched_dependency_key(user_patched, name, version) {
+        Some(key) => Err(Box::new(refused(
+            "vendor_lock_entry_unsupported",
+            patched_dependency_detail(key, name, version),
+        ))),
+        None => Ok(()),
+    }
 }
 
 /// Read the lock, refusing (before any write) one that is missing,
@@ -694,10 +724,12 @@ pub(super) async fn read_project(project_root: &Path) -> Result<BunProject, Box<
             )));
         }
     };
+    let user_patched = read_user_patched(project_root, Some(&lock_text)).await;
     Ok(BunProject {
         lock_text,
         lines,
         entries,
+        user_patched,
     })
 }
 
@@ -711,6 +743,7 @@ pub(super) fn preflight_package(
     name: &str,
     version: &str,
 ) -> Result<(String, String), Box<VendorOutcome>> {
+    refuse_user_patched(&project.user_patched, name, version)?;
     let target_spec = format!("{name}@{version}");
     let target_leaf = tgz_rel_leaf(name, version);
     let has_match = project
@@ -2132,6 +2165,114 @@ mod tests {
                 .any(|w| w.code == "vendor_bundled_instance_skipped"),
             "{warnings:?}"
         );
+    }
+
+    /// REGRESSION (#367): a package the project patches itself with
+    /// `bun patch` (package.json `patchedDependencies`, mirrored in
+    /// bun.lock) is keyed on its registry `name@version`; a local tarball
+    /// tuple would make Bun drop that patch from every install with exit
+    /// 0. Vendoring refuses before any write and names the key, from
+    /// either source, and the download plan's pre-flight agrees.
+    #[tokio::test]
+    async fn user_bun_patch_refuses_before_any_write() {
+        let key = "left-pad@1.3.0";
+        let with_manifest_key = |manifest: &str| {
+            let mut value: Value = serde_json::from_str(manifest).unwrap();
+            value["patchedDependencies"] =
+                serde_json::json!({ key: "patches/left-pad@1.3.0.patch" });
+            serde_json::to_string_pretty(&value).unwrap()
+        };
+        let mirrored_lock = BN3_BEFORE_LOCK.replacen(
+            "  \"packages\": {",
+            "  \"patchedDependencies\": {\n    \"left-pad@1.3.0\": \"patches/left-pad@1.3.0.patch\",\n  },\n  \"packages\": {",
+            1,
+        );
+        assert_ne!(
+            mirrored_lock, BN3_BEFORE_LOCK,
+            "fixture has a packages section"
+        );
+
+        for (manifest_key, lock) in [
+            (true, BN3_BEFORE_LOCK),
+            (false, mirrored_lock.as_str()),
+            (true, mirrored_lock.as_str()),
+        ] {
+            let fx = fixture_with(lock, "node_modules/left-pad").await;
+            if manifest_key {
+                tokio::fs::write(fx.root().join("package.json"), with_manifest_key(BN3_PKG))
+                    .await
+                    .unwrap();
+            }
+            let (planned, looped) = preflight_then_vendor(&fx).await;
+            assert_eq!(planned, Err("vendor_lock_entry_unsupported"));
+            assert_eq!(looped, Err("vendor_lock_entry_unsupported"));
+            let detail = expect_refused(fx.vendor(true).await, "vendor_lock_entry_unsupported");
+            assert!(
+                detail.contains(key) && detail.contains("bun patch"),
+                "{detail}"
+            );
+            assert_eq!(fx.read_lock().await, lock, "refusal writes nothing");
+            assert!(!fx.root().join(".socket/vendor").exists());
+        }
+
+        // A patch for another version of the package does not gate this one.
+        let fx = fixture_with(BN3_BEFORE_LOCK, "node_modules/left-pad").await;
+        tokio::fs::write(
+            fx.root().join("package.json"),
+            with_manifest_key(BN3_PKG).replace(key, "left-pad@1.2.0"),
+        )
+        .await
+        .unwrap();
+        let (result, _, _) = expect_done(fx.vendor(false).await);
+        assert!(result.success, "{:?}", result.error);
+    }
+
+    /// REGRESSION (#367), `bun.lockb`: the binary lock has no text mirror,
+    /// so the root manifest's `patchedDependencies` alone gates vendoring.
+    #[tokio::test]
+    async fn binary_user_bun_patch_refuses_before_any_write() {
+        let fx = fixture_with("", "node_modules/is-number").await;
+        let dir = std::path::Path::new(env!("CARGO_MANIFEST_DIR"))
+            .join("tests/fixtures/bun-lockb-bundled/both");
+        tokio::fs::remove_file(fx.root().join(BUN_LOCK))
+            .await
+            .unwrap();
+        tokio::fs::copy(dir.join("bun.lockb"), fx.root().join("bun.lockb"))
+            .await
+            .unwrap();
+        tokio::fs::write(
+            fx.root().join("package.json"),
+            r#"{"name":"p","version":"1.0.0","dependencies":{"@bh/bund":"1.0.0","is-number":"7.0.0"},"patchedDependencies":{"is-number@7.0.0":"patches/is-number@7.0.0.patch"}}"#,
+        )
+        .await
+        .unwrap();
+        let before = tokio::fs::read(fx.root().join("bun.lockb")).await.unwrap();
+        let packages = [("pkg:npm/is-number@7.0.0", &fx.record)];
+        assert_eq!(
+            preflight_packages(fx.root(), &packages).await,
+            vec![Err("vendor_lock_entry_unsupported")]
+        );
+        let blobs = fx.root().join(".socket/blobs");
+        let outcome = crate::vendor::test_support::vendor_bun(
+            "pkg:npm/is-number@7.0.0",
+            &fx.installed,
+            fx.root(),
+            &fx.record,
+            &PatchSources::blobs_only(&blobs),
+            "2026-06-09T00:00:00Z",
+            false,
+            false,
+            None,
+        )
+        .await;
+        let detail = expect_refused(outcome, "vendor_lock_entry_unsupported");
+        assert!(detail.contains("is-number@7.0.0"), "{detail}");
+        assert_eq!(
+            tokio::fs::read(fx.root().join("bun.lockb")).await.unwrap(),
+            before,
+            "refusal writes nothing"
+        );
+        assert!(!fx.root().join(".socket/vendor").exists());
     }
 
     #[tokio::test]
