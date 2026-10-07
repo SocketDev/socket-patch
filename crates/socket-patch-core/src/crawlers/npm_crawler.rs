@@ -558,6 +558,26 @@ fn is_bun_global_store_link_sync(store: &Path, entry_name: &str) -> bool {
     })
 }
 
+/// Whether `project_root` was installed with Bun's global store (#635):
+/// some `node_modules/.bun/<entry>` is a link into
+/// `<cache>/links/<entry>-<hash>`. Read from the installed tree rather
+/// than bunfig.toml or `BUN_INSTALL_GLOBAL_STORE`, which may not match
+/// the layout the last install actually wrote. Stops at the first such
+/// link; only links are resolved.
+pub fn bun_uses_global_store(project_root: &Path) -> bool {
+    let store = project_root.join("node_modules").join(".bun");
+    let Ok(entries) = std::fs::read_dir(&store) else {
+        return false;
+    };
+    entries.flatten().any(|entry| {
+        entry.file_type().is_ok_and(|ft| ft.is_symlink())
+            && entry
+                .file_name()
+                .to_str()
+                .is_some_and(|name| is_bun_global_store_link_sync(&store, name))
+    })
+}
+
 /// The `node_modules` child that is npm's `install-strategy=linked` store,
 /// also written by Yarn 4's pnpm linker (see
 /// [`store_entry_own_package_sync`]).

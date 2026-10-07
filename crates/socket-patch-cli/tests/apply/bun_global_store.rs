@@ -194,3 +194,34 @@ fn rollback_refuses_bun_global_store_packages() {
     assert_eq!(std::fs::read(left_pad.join("index.js")).unwrap(), AFTER);
     assert_eq!(std::fs::read(number.join("index.js")).unwrap(), AFTER);
 }
+
+/// #635: the human-mode Bun note must not promise that copy-on-write
+/// keeps the install cache untouched when the installed packages ARE the
+/// cache's shared `links` dirs; it says they are refused and how to fix.
+#[test]
+fn apply_note_names_the_bun_global_store() {
+    let tmp = tempfile::tempdir().unwrap();
+    let (proj, left_pad, _) = stage(tmp.path(), BEFORE);
+    std::fs::write(proj.join("bun.lock"), "{}\n").unwrap();
+    write_manifest(&proj, &["pkg:npm/left-pad@1.3.0"]);
+
+    let (code, _stdout, stderr) = run_with_env(
+        &proj,
+        &["apply", "--offline"],
+        &[("SOCKET_TELEMETRY_DISABLED", "1")],
+    );
+    assert_ne!(
+        code, 0,
+        "the shared-store refusal fails the apply; {stderr}"
+    );
+    assert!(
+        stderr.contains("Note: bun global store detected")
+            && stderr.contains("globalStore = false"),
+        "{stderr}"
+    );
+    assert!(
+        !stderr.contains("will keep ~/.bun/install/cache/ untouched"),
+        "{stderr}"
+    );
+    assert_eq!(std::fs::read(left_pad.join("index.js")).unwrap(), BEFORE);
+}
