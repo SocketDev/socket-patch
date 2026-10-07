@@ -382,11 +382,20 @@ impl Takeover {
     }
 }
 
+/// Rewriter warnings that accompany pins which landed (install guidance,
+/// not refusals), so they never stand as a lock-level skip reason.
+const LANDED_PIN_ADVISORIES: &[&str] = &[
+    "redirect_npm_allow_remote",
+    "redirect_pnpm_trust_lockfile",
+    "redirect_yarn_classic_berry_migration_risk",
+];
+
 /// Why the rewrite did not pin a staged purl: the skip reason, and the
 /// rewriter warnings that say so. In order: for a requirements entry wired
 /// outside the root file, the reach the hosted rewriter lacks (#699); a
 /// rewriter warning naming the package; the rewrite's first warning (a
-/// lock-level refusal names no package); else [`NOT_PINNED`].
+/// lock-level refusal names no package), skipping
+/// [`LANDED_PIN_ADVISORIES`]; else [`NOT_PINNED`].
 fn explain(
     entry: &VendorEntry,
     dep: Option<&socket_patch_core::patch::redirect::DepOverride>,
@@ -402,7 +411,12 @@ fn explain(
     }) {
         return (w.code.clone(), vec![w.clone()]);
     }
-    match warnings.first() {
+    // A pin that did land can carry a success advisory; it never explains
+    // a pin that did not.
+    match warnings
+        .iter()
+        .find(|w| !LANDED_PIN_ADVISORIES.contains(&w.code.as_str()))
+    {
         Some(w) => (w.code.clone(), vec![w.clone()]),
         None => (NOT_PINNED.to_string(), Vec::new()),
     }
@@ -461,7 +475,15 @@ fn names_package(detail: &str, name: &str) -> bool {
     detail.match_indices(name).any(|(at, _)| {
         let before = detail[..at].chars().next_back();
         let after = detail[at + name.len()..].chars().next();
-        !before.is_some_and(|c| is_word(c) && c != '@' && c != '/')
+        // A `/` is a boundary after a path segment (`node_modules/six`),
+        // but not after a scope: `node` is not named by `@types/node`.
+        let scoped = before == Some('/')
+            && detail[..at - 1]
+                .rsplit(|c: char| !is_word(c) || c == '/')
+                .next()
+                .is_some_and(|seg| seg.starts_with('@'));
+        !scoped
+            && !before.is_some_and(|c| is_word(c) && c != '@' && c != '/')
             && !after.is_some_and(|c| is_word(c) && c != '@' && c != '.')
     })
 }
@@ -502,5 +524,39 @@ mod tests {
         assert!(!names_package("sixteen entries", "six"));
         assert!(!names_package("left-pad-extra@1", "left-pad"));
         assert!(!names_package("anything", ""));
+        assert!(names_package("node_modules/six is stale", "six"));
+        assert!(!names_package("@types/node@20.0.0 is missing", "node"));
+        assert!(!names_package("node_modules/@types/node is stale", "node"));
+        assert!(names_package(
+            "@types/node@20.0.0 is missing",
+            "@types/node"
+        ));
+    }
+
+    #[test]
+    fn explain_skips_landed_pin_advisories_as_the_lock_level_cause() {
+        let warn = |code: &str| RewriteWarning {
+            code: code.into(),
+            detail: "lock-wide detail".into(),
+        };
+        let entry: VendorEntry = serde_json::from_value(serde_json::json!({
+            "ecosystem": "npm",
+            "basePurl": "pkg:npm/left-pad@1.3.0",
+            "uuid": "u1",
+            "artifact": { "path": ".socket/vendor/npm/u1/left-pad.tgz" },
+            "wiring": [],
+        }))
+        .expect("minimal vendor entry");
+        let warnings = [
+            warn("redirect_npm_allow_remote"),
+            warn("redirect_pnpm_trust_lockfile"),
+            warn("redirect_yarn_classic_berry_migration_risk"),
+        ];
+        assert_eq!(explain(&entry, None, &warnings).0, NOT_PINNED);
+        let mut with_refusal = warnings.to_vec();
+        with_refusal.push(warn("redirect_lock_refused"));
+        let (code, explained) = explain(&entry, None, &with_refusal);
+        assert_eq!(code, "redirect_lock_refused");
+        assert_eq!(explained, vec![warn("redirect_lock_refused")]);
     }
 }
