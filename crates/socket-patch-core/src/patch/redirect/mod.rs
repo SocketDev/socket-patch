@@ -64,8 +64,8 @@ use crate::formats::yarn::berry_entry::{manifest_bin, render_pinned_entry, Pin};
 #[cfg(test)]
 use crate::formats::yarn::blocks::berry_bin_entries;
 use crate::formats::yarn::blocks::{
-    berry_field, berry_lock_locks, block_eol, classic_field, classic_line_endings_supported,
-    repin_classic_block, replace_block, scan_blocks, LockBlock,
+    berry_field, berry_lock_locks, berry_stanza_field, block_eol, classic_field,
+    classic_line_endings_supported, repin_classic_block, scan_blocks, LockBlock,
 };
 use crate::formats::yarn::is_berry_lock;
 use crate::formats::yarn::patterns::{
@@ -3458,6 +3458,78 @@ pub fn preflight_yarn_classic_hosted(
     }
 }
 
+/// Where each classic block sits among the lock's blank-line separated
+/// segments, for the `original` / `new` strings of a
+/// `redirect_yarn_classic_entry` edit.
+///
+/// The record is a cross-language contract: depscan's TS rewriter and the
+/// shared `tests/fixtures/redirect/npm/yarn-classic/*/expected-edits.json`
+/// fixtures record the segment (`split("\n\n")` over the LF-normalized
+/// lock) that holds the block, so a block that follows two blank lines
+/// carries a leading `\n` and the last block carries the file's final
+/// newline. Both sides of the record keep that surrounding text and differ
+/// only in the block's own lines. Built once per lock, from the lock as
+/// read (a re-pin never moves a separator).
+struct ClassicSegments {
+    /// The LF-normalized lock.
+    lf: String,
+    /// Start offsets (in `lf`) of the non-overlapping `\n\n` separators,
+    /// scanned left to right as `str::split` does.
+    seps: Vec<usize>,
+    /// Each block's `(start, end)` in `lf`: its lines joined by `\n`.
+    spans: Vec<(usize, usize)>,
+}
+
+impl ClassicSegments {
+    fn new(text: &str, blocks: &[LockBlock]) -> Self {
+        let lf = text.replace("\r\n", "\n");
+        let seps = lf.match_indices("\n\n").map(|(i, _)| i).collect();
+        let mut spans = Vec::with_capacity(blocks.len());
+        let (mut at, mut crs) = (0, 0);
+        for block in blocks {
+            crs += text[at..block.start].matches("\r\n").count();
+            at = block.start;
+            let start = block.start - crs;
+            let len = block.lines.iter().map(String::len).sum::<usize>()
+                + block.lines.len().saturating_sub(1);
+            spans.push((start, start + len));
+        }
+        Self { lf, seps, spans }
+    }
+
+    /// The edit record of block `i` going from `current` to `pinned`, both
+    /// in the block's line ending `eol`.
+    fn edit_record(
+        &self,
+        i: usize,
+        current: &[String],
+        pinned: &[String],
+        eol: &str,
+    ) -> (String, String) {
+        let (start, end) = self.spans[i];
+        let first_after = self.seps.partition_point(|&p| p + 2 <= start);
+        let seg_start = first_after.checked_sub(1).map_or(0, |k| self.seps[k] + 2);
+        let seg_end = self.seps[self.seps.partition_point(|&p| p < end)..]
+            .first()
+            .copied()
+            .unwrap_or(self.lf.len());
+        let (prefix, suffix) = if seg_start <= start && end <= seg_end {
+            (&self.lf[seg_start..start], &self.lf[end..seg_end])
+        } else {
+            ("", "")
+        };
+        let render = |lines: &[String]| {
+            let seg = format!("{prefix}{}{suffix}", lines.join("\n"));
+            if eol == "\r\n" {
+                seg.replace('\n', "\r\n")
+            } else {
+                seg
+            }
+        };
+        (render(current), render(pinned))
+    }
+}
+
 fn rewrite_yarn_classic(
     files: &BTreeMap<String, String>,
     overrides: &[DepOverride],
@@ -3482,7 +3554,7 @@ fn rewrite_yarn_classic(
     )
     .err();
     // Line endings: the rewrite splices each pinned block over its own byte
-    // span ([`replace_block`]), in the line ending that block is written in,
+    // span ([`splice_blocks`]), in the line ending that block is written in,
     // so every byte outside it — CRLF lines (`core.autocrlf` Windows
     // checkouts; yarn v1 parses them fine), a mixed lock's LF lines, a BOM
     // — round-trips verbatim. A bare `\r` is not a line break yarn 1's
@@ -3496,13 +3568,19 @@ fn rewrite_yarn_classic(
         });
         return;
     }
-    let mut text = raw.clone();
-    let mut blocks = scan_blocks(&text);
+    let text = raw.as_str();
+    let mut blocks = scan_blocks(text);
     // Each block's key patterns and the one real package they all stand
-    // for, computed once per block and redone only for a block this run
-    // rewrites — not re-split per block per dep.
-    let mut heads: Vec<(Vec<String>, Option<String>)> =
+    // for, computed once per block — not re-split per block per dep. A
+    // re-pin never changes a block's key line.
+    let heads: Vec<(Vec<String>, Option<String>)> =
         blocks.iter().map(|b| classic_block_head(&b.key)).collect();
+    // A pinned block's new lines are kept in `blocks[i].lines` (so a later
+    // dep reads the pinned fields) and spliced over the block's original
+    // byte span once, at the end: re-scanning and re-copying the whole lock
+    // per pinned block is quadratic in a large lock.
+    let mut pinned_blocks: Vec<bool> = vec![false; blocks.len()];
+    let mut segments: Option<ClassicSegments> = None;
     let mut changed = false;
     let mut any_pinned = false;
     for dep in &npm {
@@ -3676,18 +3754,19 @@ fn rewrite_yarn_classic(
             if pinned != block.lines {
                 // Edits record the block's on-disk bytes (CRLF lines for a
                 // CRLF block), so they match what the file really held.
-                let eol = block_eol(&text, block);
+                let eol = block_eol(text, block);
+                let segments = segments.get_or_insert_with(|| ClassicSegments::new(text, &blocks));
+                let (original, new) = segments.edit_record(i, &blocks[i].lines, &pinned, eol);
                 result.edits.push(FileEdit {
                     path: "yarn.lock".into(),
                     kind: "redirect_yarn_classic_entry".into(),
                     action: "rewritten".into(),
                     key: Some(format!("{fname}@{}", dep.version)),
-                    original: Some(Value::String(block.lines.join(eol))),
-                    new: Some(Value::String(pinned.join(eol))),
+                    original: Some(Value::String(original)),
+                    new: Some(Value::String(new)),
                 });
-                text = replace_block(&text, block, &pinned, eol);
-                blocks = scan_blocks(&text);
-                heads[i] = classic_block_head(&blocks[i].key);
+                blocks[i].lines = pinned;
+                pinned_blocks[i] = true;
                 changed = true;
             }
         }
@@ -3724,8 +3803,30 @@ fn rewrite_yarn_classic(
         }
     }
     if changed {
-        result.files.insert("yarn.lock".into(), text);
+        result.files.insert(
+            "yarn.lock".into(),
+            splice_blocks(text, &blocks, &pinned_blocks),
+        );
     }
+}
+
+/// `text` with every block flagged in `pinned` replaced by its (new)
+/// `lines`, in the line ending that block is written in; every other byte
+/// is kept verbatim. One pass over the lock, whatever the number of pins.
+fn splice_blocks(text: &str, blocks: &[LockBlock], pinned: &[bool]) -> String {
+    let mut out = String::with_capacity(text.len() + 256 * pinned.len());
+    let mut at = 0;
+    for (block, _) in blocks.iter().zip(pinned).filter(|(_, p)| **p) {
+        let eol = block_eol(text, block);
+        out.push_str(&text[at..block.start]);
+        out.push_str(&block.lines.join(eol));
+        if block.terminated {
+            out.push_str(eol);
+        }
+        at = block.end;
+    }
+    out.push_str(&text[at..]);
+    out
 }
 
 /// A classic block key's patterns and the one real package they all stand
@@ -3926,10 +4027,8 @@ fn rewrite_yarn_berry_with_manifests(
             .yarn_berry10c0
             .as_deref()
             .map(|c| crate::vendor::yarn_berry_lock::checksum_in_lock_spelling(content, c));
-        let locks_version = |stanza: &str| {
-            let lines: Vec<&str> = stanza.lines().collect();
-            berry_field(&lines, "version") == Some(dep.version.as_str())
-        };
+        let locks_version =
+            |stanza: &str| berry_stanza_field(stanza, "version") == Some(dep.version.as_str());
         let mut matched_any = false;
         let mut alias_skipped = false;
         // Every entry this dep's pin would re-key: `(index, npm ranges)` —
@@ -3968,14 +4067,13 @@ fn rewrite_yarn_berry_with_manifests(
                 // never rewrites those, but that must not be silent — this
                 // copy keeps installing the unpatched artifact, and the
                 // generic not-found warning would point at the wrong cause.
-                if locks_version(block)
-                    && parsed.iter().any(|p| {
-                        p.expect("every pattern parsed — None-bearing keys are skipped above")
-                            .1
-                            .strip_prefix("npm:")
-                            .and_then(split_pattern)
-                            .is_some_and(|(real, _)| real == fname)
-                    })
+                if parsed.iter().any(|p| {
+                    p.expect("every pattern parsed — None-bearing keys are skipped above")
+                        .1
+                        .strip_prefix("npm:")
+                        .and_then(split_pattern)
+                        .is_some_and(|(real, _)| real == fname)
+                }) && locks_version(block)
                 {
                     alias_skipped = true;
                     result.warnings.push(RewriteWarning {

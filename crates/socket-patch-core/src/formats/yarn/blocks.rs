@@ -220,19 +220,23 @@ pub(crate) fn live_blocks(patterns: &[Vec<String>]) -> Vec<bool> {
 
 /// Read a berry scalar field (`<name>: <value>`, value possibly quoted).
 pub(crate) fn berry_field<'a, S: AsRef<str>>(lines: &'a [S], field: &str) -> Option<&'a str> {
-    for line in lines.iter().skip(1) {
-        let Some(rest) = body_field_line(line.as_ref()) else {
-            continue;
-        };
-        let Some(value) = rest.strip_prefix(field) else {
-            continue;
-        };
-        let Some(value) = value.strip_prefix(':') else {
-            continue;
-        };
-        return Some(value.trim().trim_matches('"'));
-    }
-    None
+    berry_field_of(lines.iter().map(AsRef::as_ref), field)
+}
+
+/// [`berry_field`] over a block's text (key line first), without
+/// collecting its lines: for a per-dep scan of every stanza of a lock.
+pub(crate) fn berry_stanza_field<'a>(stanza: &'a str, field: &str) -> Option<&'a str> {
+    berry_field_of(stanza.lines(), field)
+}
+
+fn berry_field_of<'a>(mut lines: impl Iterator<Item = &'a str>, field: &str) -> Option<&'a str> {
+    lines.next()?;
+    lines.find_map(|line| {
+        let value = body_field_line(line)?
+            .strip_prefix(field)?
+            .strip_prefix(':')?;
+        Some(value.trim().trim_matches('"'))
+    })
 }
 
 /// The lock's exact `__metadata` block (its `version` / `cacheKey` header).
