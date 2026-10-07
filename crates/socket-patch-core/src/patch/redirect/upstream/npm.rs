@@ -829,39 +829,132 @@ struct PnpmTarballPolicy {
     /// lock, so every resolution carries its tarball
     /// (see [`pnpm_include_tarball`]).
     always: bool,
-    /// The sibling `.npmrc`, whose `registry` / `@scope:registry` name the
-    /// registry pnpm resolves a package against (see [`pnpm_lookup_registry`]).
+    /// The sibling pnpm-workspace.yaml and `.npmrc`, and the pnpm major
+    /// that reads them ([`pnpm_settings_major`]), which name the registry
+    /// pnpm resolves a package against (see [`pnpm_lookup_registry`]).
+    workspace: Option<String>,
     npmrc: Option<String>,
+    major: Option<u32>,
 }
 
 impl PnpmTarballPolicy {
     fn registry(&self, name: &str) -> Option<String> {
-        pnpm_lookup_registry(self.npmrc.as_deref(), name)
+        pnpm_lookup_registry(
+            self.workspace.as_deref(),
+            self.npmrc.as_deref(),
+            self.major,
+            name,
+        )
     }
 }
 
-/// The registry pnpm resolves `name` against, per the lock's sibling
-/// `.npmrc`: `@scope:registry` for a scoped name when set, else `registry`
-/// (`None`: the default registry). pnpm both reads the version document
-/// from it and derives conventional tarball URLs under it (#919). A value
-/// still holding a `${VAR}` reference is read as unset: the restore does
-/// not expand the user's environment, and must not fetch it as a URL.
-fn pnpm_lookup_registry(npmrc: Option<&str>, name: &str) -> Option<String> {
-    use super::super::npmrc::npmrc_top_level_value;
+/// The pnpm major whose settings reading applies to the lock `text`: the
+/// installed / pinned `pm_major`, else 8 for a pre-9 lock or a shrinkwrap
+/// (only pnpm <= 8 writes those).
+fn pnpm_settings_major(text: &str, pm_major: Option<u32>) -> Option<u32> {
+    use crate::formats::pnpm::lock_version_major;
 
-    let text = npmrc?;
-    let value = |key: &str| {
-        npmrc_top_level_value(text, key)
+    let legacy_lock = lock_version_major(text).is_some_and(|major| major < 9)
+        || text
+            .lines()
+            .any(|line| line.starts_with("shrinkwrapVersion:"));
+    pm_major.or(legacy_lock.then_some(8))
+}
+
+/// The value of `key` in the top-level block mapping `section` of the YAML
+/// `text` (its direct children only, the last one winning, quotes
+/// removed); `None` when absent, empty or flow-styled.
+fn yaml_block_value(text: &str, section: &str, key: &str) -> Option<String> {
+    use crate::formats::pnpm::workspace::{block_section_bounds, top_level_key};
+
+    let lines: Vec<String> = crate::utils::serde::strip_bom(text)
+        .lines()
+        .map(str::to_string)
+        .collect();
+    let (start, end) = block_section_bounds(&lines, section)?;
+    let children = &lines[start + 1..end];
+    let indent = children.iter().find_map(|line| {
+        let rest = line.trim_start_matches(' ');
+        (!rest.trim().is_empty() && !rest.starts_with('#')).then(|| line.len() - rest.len())
+    })?;
+    children
+        .iter()
+        .filter_map(|line| line.get(indent..).filter(|_| line[..indent].trim().is_empty()))
+        .filter_map(top_level_key)
+        .rfind(|(k, _)| k == key)
+        .map(|(_, value)| value.trim_matches(['"', '\'']).to_string())
+        .filter(|value| !value.is_empty())
+}
+
+/// The registry pnpm resolves `name` against (`None`: the default
+/// registry). pnpm both reads the version document from it and derives
+/// conventional tarball URLs under it (#919). Which settings file names it
+/// follows the pnpm `major` ([`pnpm_settings_major`]):
+///
+/// - pnpm <= 9: the lock's sibling `.npmrc`, `@scope:registry` for a
+///   scoped name when set, else `registry`;
+/// - pnpm 10: pnpm-workspace.yaml's `registries` map when present (it
+///   replaces `.npmrc`'s registries wholesale: the scope's key, else
+///   `default`), else `.npmrc`; a workspace `registry:` is ignored;
+/// - pnpm 11+ (and an unknown major, since a workspace `registry:` only
+///   takes effect there): the two merged, the workspace file winning per
+///   key: `registries."@scope"`, `.npmrc` `@scope:registry`, then
+///   `registry:`, `registries.default`, `.npmrc` `registry`.
+///
+/// (Measured with pnpm 9.15, 10.34 and 11.27.) A value still holding a
+/// `${VAR}` reference is read as unset: the restore does not expand the
+/// user's environment, and must not fetch it as a URL.
+fn pnpm_lookup_registry(
+    workspace: Option<&str>,
+    npmrc: Option<&str>,
+    major: Option<u32>,
+    name: &str,
+) -> Option<String> {
+    use super::super::npmrc::npmrc_top_level_value;
+    use crate::formats::pnpm::workspace::top_level_key;
+
+    let workspace = workspace.filter(|_| !major.is_some_and(|major| major <= 9));
+    let scope = name
+        .strip_prefix('@')
+        .and_then(|rest| rest.split_once('/'))
+        .map(|(scope, _)| format!("@{scope}"));
+    let rc = |key: &str| {
+        npmrc
+            .and_then(|text| npmrc_top_level_value(text, key))
             .map(|value| value.trim().to_string())
             .filter(|value| !value.is_empty())
     };
-    let scoped = name
-        .strip_prefix('@')
-        .and_then(|rest| rest.split_once('/'))
-        .and_then(|(scope, _)| value(&format!("@{scope}:registry")));
-    scoped
-        .or_else(|| value("registry"))
-        .filter(|value| !value.contains("${"))
+    let registries = |key: &str| workspace.and_then(|text| yaml_block_value(text, "registries", key));
+    let from_npmrc = || {
+        scope
+            .as_ref()
+            .and_then(|scope| rc(&format!("{scope}:registry")))
+            .or_else(|| rc("registry"))
+    };
+    let value = if major == Some(10) {
+        let has_registries = workspace.is_some_and(|text| {
+            crate::utils::serde::strip_bom(text)
+                .lines()
+                .filter_map(top_level_key)
+                .any(|(key, _)| key == "registries")
+        });
+        if has_registries {
+            scope
+                .as_deref()
+                .and_then(registries)
+                .or_else(|| registries("default"))
+        } else {
+            from_npmrc()
+        }
+    } else {
+        scope
+            .as_ref()
+            .and_then(|scope| registries(scope).or_else(|| rc(&format!("{scope}:registry"))))
+            .or_else(|| workspace.and_then(|text| yaml_top_level_value(text, "registry")))
+            .or_else(|| registries("default"))
+            .or_else(|| rc("registry"))
+    };
+    value.filter(|value| !value.contains("${"))
 }
 
 /// Whether pnpm wrote the lock `text` under `lockfileIncludeTarballUrl`
@@ -886,9 +979,10 @@ fn pnpm_include_tarball(
     is_hosted: impl Fn(&str) -> bool,
 ) -> bool {
     use super::super::npmrc::npmrc_top_level_value;
-    use crate::formats::pnpm::lock_version_major;
 
-    if let Some(evidence) = pnpm_lock_tarball_evidence(text, npmrc, is_hosted) {
+    let major = pnpm_settings_major(text, pm_major);
+    let registry = |name: &str| pnpm_lookup_registry(workspace, npmrc, major, name);
+    if let Some(evidence) = pnpm_lock_tarball_evidence(text, registry, is_hosted) {
         return evidence;
     }
     let from_workspace =
@@ -898,11 +992,6 @@ fn pnpm_include_tarball(
             .and_then(|text| npmrc_top_level_value(text, "lockfile-include-tarball-url"))
             .map(|value| value.trim().to_string())
     };
-    let legacy_lock = lock_version_major(text).is_some_and(|major| major < 9)
-        || text
-            .lines()
-            .any(|line| line.starts_with("shrinkwrapVersion:"));
-    let major = pm_major.or(legacy_lock.then_some(8));
     let value = match major {
         Some(major) if major <= 9 => from_npmrc(),
         Some(major) if major >= 11 => from_workspace(),
@@ -923,7 +1012,7 @@ fn pnpm_include_tarball(
 /// resolutions bare whatever the setting.
 fn pnpm_lock_tarball_evidence(
     text: &str,
-    npmrc: Option<&str>,
+    registry: impl Fn(&str) -> Option<String>,
     is_hosted: impl Fn(&str) -> bool,
 ) -> Option<bool> {
     use crate::formats::pnpm::{classify_pnpm_key, grammar::main_document, pnpm_packages, PnpmKey};
@@ -949,7 +1038,7 @@ fn pnpm_lock_tarball_evidence(
             Some(tarball) if tarball.starts_with("file:") || is_hosted(tarball) => {}
             Some(tarball) => {
                 derived |= registry_derives_tarball(
-                    pnpm_lookup_registry(npmrc, name).as_deref(),
+                    registry(name).as_deref(),
                     name,
                     version,
                     tarball,
@@ -1034,7 +1123,12 @@ async fn pnpm_tarball_policy(
         pm_major,
         |url| ctx.hosted_uuid(url).is_some(),
     );
-    PnpmTarballPolicy { always, npmrc }
+    PnpmTarballPolicy {
+        always,
+        workspace,
+        npmrc,
+        major: pnpm_settings_major(text, pm_major),
+    }
 }
 
 pub(crate) async fn restore_pnpm_locks(
@@ -1471,34 +1565,35 @@ mod tests {
 
     #[test]
     fn pnpm_reads_the_npmrc_registry_and_scope_registries() {
+        let rc_lookup = |rc, name| pnpm_lookup_registry(None, rc, None, name);
         let rc = "registry=https://m.example/npm/\n@s:registry = https://s.example/\n";
         assert_eq!(
-            pnpm_lookup_registry(Some(rc), "a").as_deref(),
+            rc_lookup(Some(rc), "a").as_deref(),
             Some("https://m.example/npm/")
         );
         assert_eq!(
-            pnpm_lookup_registry(Some(rc), "@s/a").as_deref(),
+            rc_lookup(Some(rc), "@s/a").as_deref(),
             Some("https://s.example/")
         );
         // Another scope, and a name merely starting with the scope's text,
         // resolve against `registry`.
         assert_eq!(
-            pnpm_lookup_registry(Some(rc), "@t/a").as_deref(),
+            rc_lookup(Some(rc), "@t/a").as_deref(),
             Some("https://m.example/npm/")
         );
         assert_eq!(
-            pnpm_lookup_registry(Some("@s:registry=https://s.example\n"), "a"),
+            rc_lookup(Some("@s:registry=https://s.example\n"), "a"),
             None
         );
-        assert_eq!(pnpm_lookup_registry(None, "@s/a"), None);
+        assert_eq!(rc_lookup(None, "@s/a"), None);
         // An unexpanded `${VAR}` is never fetched as a URL; a scoped name
         // whose scope registry holds one keeps the default, not `registry`.
         assert_eq!(
-            pnpm_lookup_registry(Some("registry=${MIRROR}\n"), "a"),
+            rc_lookup(Some("registry=${MIRROR}\n"), "a"),
             None
         );
         assert_eq!(
-            pnpm_lookup_registry(
+            rc_lookup(
                 Some("registry=https://m.example\n@s:registry=${S}/npm\n"),
                 "@s/a"
             ),
@@ -1506,13 +1601,89 @@ mod tests {
         );
         // pnpm derives a scoped package's tarball under its scope registry,
         // so that registry's conventional URL stays out of the lock.
-        let scope = pnpm_lookup_registry(Some(rc), "@s/a");
+        let scope = rc_lookup(Some(rc), "@s/a");
         assert!(registry_derives_tarball(
             scope.as_deref(),
             "@s/a",
             "1.0.0",
             "https://s.example/@s/a/-/a-1.0.0.tgz"
         ));
+    }
+
+    /// #919: pnpm 10+ also read registries from pnpm-workspace.yaml, each
+    /// major its own way (measured with pnpm 9.15, 10.34 and 11.27).
+    #[test]
+    fn pnpm_reads_the_workspace_registries_of_the_pnpm_major() {
+        let rc = "registry=https://rc.example/\n@s:registry=https://rc-s.example/\n";
+        let ws_registry = "packages:\n  - '.'\nregistry: https://ws.example/\n";
+        let ws_map = "registries:\n  default: https://ws-default.example/\n  \
+                      '@s': https://ws-s.example/\n  # '@t': x\n  \
+                      \"@u\": \"https://ws-u.example/\" # c\n";
+        let get = pnpm_lookup_registry;
+        // pnpm <= 9 reads only .npmrc.
+        for major in [Some(8), Some(9)] {
+            assert_eq!(get(Some(ws_registry), None, major, "a"), None);
+            assert_eq!(get(Some(ws_map), None, major, "@s/a"), None);
+            assert_eq!(
+                get(Some(ws_map), Some(rc), major, "@s/a").as_deref(),
+                Some("https://rc-s.example/")
+            );
+        }
+        // pnpm 10: a workspace `registries` map replaces .npmrc's wholesale;
+        // a workspace `registry:` is ignored.
+        let ten = Some(10);
+        assert_eq!(
+            get(Some(ws_registry), Some(rc), ten, "a").as_deref(),
+            Some("https://rc.example/")
+        );
+        assert_eq!(get(Some(ws_registry), None, ten, "a"), None);
+        assert_eq!(
+            get(Some(ws_map), Some(rc), ten, "@s/a").as_deref(),
+            Some("https://ws-s.example/")
+        );
+        assert_eq!(
+            get(Some("registries:\n  default: https://d.example/\n"), Some(rc), ten, "@s/a")
+                .as_deref(),
+            Some("https://d.example/")
+        );
+        assert_eq!(
+            get(Some(ws_map), Some(rc), ten, "a").as_deref(),
+            Some("https://ws-default.example/")
+        );
+        // pnpm 11+ and an unknown major: merged, the workspace winning per key.
+        for major in [Some(11), Some(12), None] {
+            assert_eq!(
+                get(Some(ws_registry), Some(rc), major, "a").as_deref(),
+                Some("https://ws.example/")
+            );
+            // .npmrc's scope registry beats the workspace's `registry:`.
+            assert_eq!(
+                get(Some(ws_registry), Some(rc), major, "@s/a").as_deref(),
+                Some("https://rc-s.example/")
+            );
+            assert_eq!(
+                get(Some(ws_map), Some(rc), major, "@s/a").as_deref(),
+                Some("https://ws-s.example/")
+            );
+            assert_eq!(
+                get(Some(ws_map), Some(rc), major, "@u/a").as_deref(),
+                Some("https://ws-u.example/")
+            );
+            // A commented-out scope falls through to `default`.
+            assert_eq!(
+                get(Some(ws_map), Some(rc), major, "@t/a").as_deref(),
+                Some("https://ws-default.example/")
+            );
+            let both = format!("{ws_registry}{ws_map}");
+            assert_eq!(
+                get(Some(&both), Some(rc), major, "a").as_deref(),
+                Some("https://ws.example/")
+            );
+            assert_eq!(
+                get(Some("registry: ${MIRROR}\n"), Some(rc), major, "a"),
+                None
+            );
+        }
     }
 
     #[test]
