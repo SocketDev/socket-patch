@@ -26,7 +26,8 @@ use std::path::{Path, PathBuf};
 use crate::crawlers::python_crawler::canonicalize_pypi_name;
 use crate::utils::fs::{atomic_write_bytes_preserving_mode, read_regular_to_string};
 use crate::utils::requirements::{
-    hash_options, logical_lines, requires_hashes, split_comment, strip_comment, vendor_tag,
+    expand_env_vars, hash_options, logical_lines, requires_hashes, shlex_split, split_comment,
+    strip_comment, vendor_tag,
 };
 
 use super::common::{detect_eol, refuse_symlinked};
@@ -966,7 +967,7 @@ pub(crate) fn requirements_includes(rel: &str, content: &str) -> Vec<String> {
         .filter_map(|ll| include_target(&ll.text))
         .map(|target| {
             let joined = if include_dir.is_empty() {
-                target.to_string()
+                target
             } else {
                 format!("{include_dir}/{target}")
             };
@@ -975,21 +976,41 @@ pub(crate) fn requirements_includes(rel: &str, content: &str) -> Vec<String> {
         .collect()
 }
 
-/// The `-r`/`--requirement` include target of a logical line, if any.
-fn include_target(text: &str) -> Option<&str> {
-    let code = strip_comment(text).trim();
-    if let Some(rest) = code.strip_prefix("--requirement=") {
-        return Some(rest.trim()).filter(|s| !s.is_empty());
-    }
-    let mut tokens = code.split_whitespace();
-    match tokens.next() {
-        Some("-r") | Some("--requirement") => tokens.next(),
-        // pip's optparse also accepts the attached short form (`-rdev.txt`);
-        // the bare `-r` was consumed by the arm above, so the value here is
-        // never empty. (No other requirements-file option starts with `-r`.)
-        Some(t) if t.starts_with("-r") && !t.starts_with("--") => Some(&t[2..]),
-        _ => None,
-    }
+/// The `-r`/`--requirement` include target of a logical line, if any,
+/// read the way pip's `req_file.py` reads it: comment stripped, `${NAME}`
+/// expanded from the environment, then the options `shlex`-split, so
+/// `-r "dev reqs.txt"`, `-r dev\\ reqs.txt`, `--requirement="dev.txt"` and
+/// `-r ${REQDIR}/dev.txt` name the file pip opens (#994).
+fn include_target(text: &str) -> Option<String> {
+    include_target_with(text, |name| std::env::var(name).ok())
+}
+
+/// [`include_target`] with the environment lookup injected (tests).
+fn include_target_with(text: &str, env: impl Fn(&str) -> Option<String>) -> Option<String> {
+    let code = expand_env_vars(strip_comment(text), env);
+    // An unbalanced quote is pip's "Could not split options" error: there
+    // is no file to follow.
+    let mut words = shlex_split(&code)?.into_iter();
+    let first = words.next()?;
+    let target = if let Some(rest) = first.strip_prefix("--requirement=") {
+        // `--requirement= dev.txt` (a space after the `=`) is read as
+        // the next word, as before the shlex split.
+        if rest.is_empty() {
+            words.next()
+        } else {
+            Some(rest.to_string())
+        }
+    } else {
+        match first.as_str() {
+            "-r" | "--requirement" => words.next(),
+            // pip's optparse also accepts the attached short form
+            // (`-rdev.txt`, `-r"dev reqs.txt"`). No other
+            // requirements-file option starts with `-r`.
+            t if t.starts_with("-r") && !t.starts_with("--") => Some(t[2..].to_string()),
+            _ => None,
+        }
+    };
+    target.filter(|t| !t.is_empty())
 }
 
 /// Lexically normalize a relative path (`a/../b` → `b`); escapes above the
@@ -2332,14 +2353,17 @@ mod tests {
     #[tokio::test]
     async fn requirement_equals_long_form_include_is_followed() {
         // Unit shape checks for the `=` arm.
-        assert_eq!(include_target("--requirement=dev.txt"), Some("dev.txt"));
         assert_eq!(
-            include_target("--requirement= dev.txt "),
+            include_target("--requirement=dev.txt").as_deref(),
+            Some("dev.txt")
+        );
+        assert_eq!(
+            include_target("--requirement= dev.txt ").as_deref(),
             Some("dev.txt"),
             "the attached value is trimmed"
         );
         assert_eq!(
-            include_target("--requirement="),
+            include_target("--requirement=").as_deref(),
             None,
             "an empty attached value is not an include"
         );
@@ -2363,6 +2387,59 @@ mod tests {
                 .await
                 .unwrap(),
             format!("{}\n", expected_unhashed_line())
+        );
+    }
+
+    /// #994: an include target is read the way pip reads it — `${NAME}`
+    /// expanded, then the options `shlex`-split — so quotes, backslash
+    /// escapes and env references name the file pip opens.
+    #[test]
+    fn include_target_unquotes_and_expands_like_pip() {
+        let env = |name: &str| (name == "REQDIR").then(|| "sub".to_string());
+        let cases: &[(&str, Option<&str>)] = &[
+            ("-r dev.txt", Some("dev.txt")),
+            ("-r\tdev.txt", Some("dev.txt")),
+            ("-r \"dev reqs.txt\"", Some("dev reqs.txt")),
+            ("-r 'dev reqs.txt'", Some("dev reqs.txt")),
+            ("-r \"dev.txt\"", Some("dev.txt")),
+            ("-r dev\\ reqs.txt", Some("dev reqs.txt")),
+            ("-r ${REQDIR}/dev.txt", Some("sub/dev.txt")),
+            ("-r ${UNSET}/dev.txt", Some("${UNSET}/dev.txt")),
+            ("--requirement \"dev.txt\"", Some("dev.txt")),
+            ("--requirement=\"dev.txt\"", Some("dev.txt")),
+            ("--requirement='dev reqs.txt'", Some("dev reqs.txt")),
+            ("-r\"dev reqs.txt\"", Some("dev reqs.txt")),
+            ("-rdev.txt", Some("dev.txt")),
+            ("-r \"dev reqs.txt\" # comment", Some("dev reqs.txt")),
+            ("-r \"dev.txt", None),
+            ("-r \"\"", None),
+            ("-r", None),
+            ("-c constraints.txt", None),
+            ("six==1.16.0", None),
+            ("--require-hashes", None),
+        ];
+        for (line, want) in cases {
+            assert_eq!(include_target_with(line, env).as_deref(), *want, "{line:?}");
+        }
+    }
+
+    /// #994: the planner follows a quoted include with a space in its name
+    /// and wires the pin there instead of appending a duplicate at the root.
+    #[tokio::test]
+    async fn quoted_include_with_space_is_followed() {
+        let tmp = write_root("-r \"dev reqs.txt\"\n").await;
+        tokio::fs::write(tmp.path().join("dev reqs.txt"), "six==1.16.0\n")
+            .await
+            .unwrap();
+        let wiring = wire_requirements(tmp.path(), "six", "1.16.0", REL_WHEEL, SHA)
+            .await
+            .unwrap();
+        assert_eq!(wiring.len(), 1);
+        assert_eq!(wiring[0].file, "dev reqs.txt");
+        assert_eq!(read_root(tmp.path()).await, "-r \"dev reqs.txt\"\n");
+        assert_eq!(
+            requirements_include_names(tmp.path()).await.unwrap(),
+            vec!["requirements.txt".to_string(), "dev reqs.txt".to_string()]
         );
     }
 
