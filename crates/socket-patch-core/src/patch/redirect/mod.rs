@@ -1109,19 +1109,23 @@ fn rewrite_npm_lock(
     // `patchedDependencies` key, or the `"patched": {integrity, path}`
     // record npm writes on the lock entry (lockfileVersion 4). npm applies
     // that diff to every install of the entry, so rewriting a sibling lock
-    // would still stack the user's diff on the hosted bytes. Only a lock
-    // that spells `"patched"` at all is parsed here, so the common case
-    // costs one substring scan.
+    // would still stack the user's diff on the hosted bytes. Each present
+    // lock is parsed ONCE, here, and the parse is handed to its rewrite;
+    // only a lock that spells `"patched"` at all is walked for the gate.
     let user_patched = crate::vendor::bun_lock_text::patched_dependency_keys(
         files.get("package.json").map(String::as_str),
         None,
     );
-    let lock_patched: Vec<(String, String, &str, String)> = present
+    let parsed: Vec<(&str, Option<Value>)> = present
         .iter()
-        .filter(|lockfile| files[**lockfile].contains("\"patched\""))
-        .filter_map(|lockfile| Some((*lockfile, parse_json_text(&files[*lockfile]).ok()?)))
+        .map(|lockfile| (*lockfile, parse_json_text(&files[*lockfile]).ok()))
+        .collect();
+    let lock_patched: Vec<(String, String, &str, String)> = parsed
+        .iter()
+        .filter(|(lockfile, _)| files[*lockfile].contains("\"patched\""))
+        .filter_map(|(lockfile, lock)| Some((*lockfile, lock.as_ref()?)))
         .flat_map(|(lockfile, lock)| {
-            npm_lock_entries(&lock)
+            npm_lock_entries(lock)
                 .into_iter()
                 .filter(|e| e.section == NpmLockSection::Packages && e.is_dependency())
                 .filter(|e| e.value.get("patched").is_some_and(|p| !p.is_null()))
@@ -1167,9 +1171,10 @@ fn rewrite_npm_lock(
             false
         })
         .collect();
-    for lockfile in &present {
+    for (lockfile, lock) in parsed {
         rewrite_one_npm_lock(
-            &files[*lockfile],
+            &files[lockfile],
+            lock,
             lockfile,
             &npm,
             &manifest_overrides,
@@ -1302,13 +1307,15 @@ impl From<NpmLockEntry<'_>> for NpmLockTarget {
 /// the identical override rewrite (see the dual-lock note there).
 fn rewrite_one_npm_lock(
     content: &str,
+    lock: Option<Value>,
     lockfile: &str,
     npm: &[&DepOverride],
     manifest_overrides: &NpmOverrides,
     result: &mut RewriteResult,
 ) {
-    // npm reads past a leading UTF-8 BOM; so do we.
-    let Ok(mut lock) = parse_json_text(content) else {
+    // `lock` is `content` parsed (npm reads past a leading UTF-8 BOM; so
+    // does that parse), `None` when it is not JSON.
+    let Some(mut lock) = lock else {
         // A corrupt lockfile is strictly worse than a missing one (which
         // warns in the caller) — never skip the whole npm redirect silently.
         result.warnings.push(RewriteWarning {
