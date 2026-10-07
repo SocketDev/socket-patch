@@ -17,6 +17,7 @@ use std::path::{Path, PathBuf};
 
 use crate::api::ranking::max_severity_order;
 use crate::api::types::PatchSearchResult;
+use crate::crawlers::python_crawler::canonicalize_pypi_name;
 use crate::crawlers::Ecosystem;
 use crate::utils::purl::{normalize_purl, strip_purl_qualifiers};
 
@@ -740,14 +741,16 @@ pub struct Offers {
 /// bare spec matches the package's full name (`@scope/pkg`, `group/name`)
 /// or its last segment. Qualifiers are ignored and names compare
 /// case-insensitively (PyPI, NuGet and Composer names are case-insensitive;
-/// npm forbids uppercase).
+/// npm forbids uppercase). PyPI names compare by their PEP 503 canonical
+/// form, so `typing_extensions` and `typing.extensions` name the project
+/// whose purl is `pkg:pypi/typing-extensions`.
 pub fn package_spec_matches(spec: &str, purl: &str) -> bool {
     // Versioned Composer specs name a release, including its pretty/padded
     // spellings. Compare before lowercasing: dev branch names retain case.
     if crate::utils::composer_version::composer_purl_identity(spec.trim()).is_some() {
         return crate::utils::composer_version::composer_purls_equivalent(spec.trim(), purl);
     }
-    let decoded = normalize_purl(strip_purl_qualifiers(purl)).to_lowercase();
+    let decoded = canonical_pypi_purl(normalize_purl(strip_purl_qualifiers(purl)).to_lowercase());
     let spec = spec.trim().to_lowercase();
     if spec.is_empty() {
         return false;
@@ -755,7 +758,7 @@ pub fn package_spec_matches(spec: &str, purl: &str) -> bool {
     let Some(rest) = decoded.strip_prefix("pkg:") else {
         return false;
     };
-    let Some((_eco, name_version)) = rest.split_once('/') else {
+    let Some((eco, name_version)) = rest.split_once('/') else {
         return false;
     };
     let name = match name_version.rfind('@').filter(|&i| i > 0) {
@@ -763,8 +766,9 @@ pub fn package_spec_matches(spec: &str, purl: &str) -> bool {
         None => name_version,
     };
     if let Some(spec_rest) = spec.strip_prefix("pkg:") {
-        let spec_purl =
-            normalize_purl(strip_purl_qualifiers(&format!("pkg:{spec_rest}"))).to_lowercase();
+        let spec_purl = canonical_pypi_purl(
+            normalize_purl(strip_purl_qualifiers(&format!("pkg:{spec_rest}"))).to_lowercase(),
+        );
         let spec_rest = &spec_purl[4..];
         let has_version = spec_rest
             .split_once('/')
@@ -777,8 +781,24 @@ pub fn package_spec_matches(spec: &str, purl: &str) -> bool {
                 .is_some_and(|tail| tail.starts_with('@'))
         };
     }
+    if eco == "pypi" {
+        return name == canonicalize_pypi_name(&spec);
+    }
     let spec = spec.replace(':', "/");
     name == spec || name.rsplit('/').next() == Some(spec.as_str())
+}
+
+/// Rewrite the name of a lowercased `pkg:pypi/<name>[@<version>]` purl to
+/// its PEP 503 canonical form; any other purl is returned unchanged.
+fn canonical_pypi_purl(purl: String) -> String {
+    let Some(name_version) = purl.strip_prefix("pkg:pypi/") else {
+        return purl;
+    };
+    let (name, version) = match name_version.rfind('@').filter(|&i| i > 0) {
+        Some(at) => name_version.split_at(at),
+        None => (name_version, ""),
+    };
+    format!("pkg:pypi/{}{version}", canonicalize_pypi_name(name))
 }
 
 fn home_dir() -> Option<PathBuf> {

@@ -1,0 +1,26 @@
+[
+  {
+    "ecosystem": "maven",
+    "name": "scala-library",
+    "namespace": "org.scala-lang",
+    "version": "2.12.18",
+    "token": "11111111-1111-4111-8111-111111111111",
+    "patchUuid": "abcdef12-0000-4000-8000-000000000001",
+    "artifactUrl": "https://patch.socket.dev/patch/maven/org.scala-lang/scala-library/2.12.18/11111111-1111-4111-8111-111111111111/abcdef12-0000-4000-8000-000000000001/scala-library-2.12.18-socket.abcdef12.jar",
+    "registryOverride": {
+      "kind": "maven2",
+      "indexUrl": "https://patch.socket.dev/patch-registry/maven/11111111-1111-4111-8111-111111111111/abcdef12-0000-4000-8000-000000000001/maven2",
+      "identifiers": {
+        "name": "org.scala-lang/scala-library",
+        "version": "2.12.18",
+        "mavenGroupId": "org.scala-lang",
+        "mavenArtifactId": "scala-library",
+        "mavenSuffixedVersion": "2.12.18-socket.abcdef12",
+        "mavenPomSha256": "b3b3b3b3b3b3b3b3b3b3b3b3b3b3b3b3b3b3b3b3b3b3b3b3b3b3b3b3b3b3b3b3"
+      }
+    },
+    "integrity": {
+      "sha256": "c3c3c3c3c3c3c3c3c3c3c3c3c3c3c3c3c3c3c3c3c3c3c3c3c3c3c3c3c3c3c3c3"
+    }
+  }
+]

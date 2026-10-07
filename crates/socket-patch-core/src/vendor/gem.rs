@@ -7164,6 +7164,45 @@ mod tests {
         );
     }
 
+    /// #826: the vendored rewrite replaces the declaration's whole line, so
+    /// a second `;`-joined statement on it must refuse rather than vanish;
+    /// a bare trailing `;` is a complete declaration and still rewrites.
+    #[test]
+    fn plan_gemfile_edit_semicolon_statements() {
+        let rel = copy_rel();
+        for gemfile in [
+            "gem \"rack\", \"~> 3.1\"; gem \"rainbow\", \"3.1.1\"\n",
+            "gem \"rack\", require: false;gem \"rainbow\" # pair\n",
+        ] {
+            let err = plan_gemfile_edit(gemfile, "rack", "3.2.6", &rel)
+                .err()
+                .expect("a second statement on the line must refuse");
+            assert!(err.contains("another statement"), "{gemfile:?}: {err}");
+        }
+        for (gemfile, want) in [
+            (
+                "gem \"rack\", \"~> 3.1\";\n",
+                format!("gem \"rack\", \"3.2.6\", path: \"{rel}\""),
+            ),
+            (
+                "gem \"rack\", \"~> 3.1\"; # web\n",
+                format!("gem \"rack\", \"3.2.6\", path: \"{rel}\""),
+            ),
+            (
+                "gem \"rack\", require: false;\n",
+                format!("gem \"rack\", \"3.2.6\", path: \"{rel}\", require: false"),
+            ),
+        ] {
+            match plan_gemfile_edit(gemfile, "rack", "3.2.6", &rel) {
+                Ok(GemfilePlan::Rewrite { new_line, .. }) => {
+                    assert_eq!(new_line, want, "{gemfile:?}")
+                }
+                Ok(_) => panic!("{gemfile:?}: expected an in-place rewrite"),
+                Err(e) => panic!("{gemfile:?}: {e}"),
+            }
+        }
+    }
+
     /// [`plan_gemfile_edit`]'s refusal grammar, leg by leg — a wrong Gemfile
     /// rewrite executes on every `bundle`, so each unsafe shape must name
     /// its refusal (and the `gemspec` keyword must NOT block the Append).
