@@ -962,7 +962,7 @@ async fn fetch_records(
                     Ok(Some(view)) => {
                         out.insert(
                             uuid,
-                            crate::commands::get::record_from_patch_response(&view),
+                            socket_patch_core::manifest::records::record_from_patch_response(&view),
                         );
                     }
                     Ok(None) => notes.push(note(

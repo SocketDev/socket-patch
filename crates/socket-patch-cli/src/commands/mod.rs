@@ -1,3 +1,4 @@
+pub(crate) mod agent_download;
 pub mod apply;
 pub(crate) mod bun_preflight;
 pub(crate) mod context;
@@ -5,6 +6,7 @@ pub(crate) mod composer_hints;
 pub(crate) mod fetch_stage;
 pub mod get;
 pub mod hosted_bundle;
+pub(crate) mod hosted_unwind;
 pub mod list;
 pub(crate) mod lock_cli;
 pub mod remove;
@@ -17,6 +19,7 @@ pub mod vendor;
 pub mod vex;
 pub(crate) mod vex_consumed;
 pub(crate) mod vex_sources;
+pub(crate) mod vlt_heal;
 pub(crate) mod vlt_preflight;
 
 use std::path::Path;

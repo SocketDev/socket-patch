@@ -701,6 +701,13 @@ impl Default for GlobalArgs {
     }
 }
 
+/// True for a golang PURL in local mode (no `--global` / `--global-prefix`):
+/// `apply` redirects it to a project-local patched copy via a `go.mod`
+/// `replace`, and `rollback` drops the same redirect.
+pub(crate) fn is_local_go(purl: &str, common: &GlobalArgs) -> bool {
+    !common.is_global() && Ecosystem::from_purl(purl) == Some(Ecosystem::Golang)
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;

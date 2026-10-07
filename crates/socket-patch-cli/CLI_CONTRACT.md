@@ -1395,7 +1395,7 @@ One command is **intentionally not** plain-envelope and will stay that way (not 
 Per-patch records emitted in `patches[]` (and in `scan --apply`'s
 `apply.patches[*]`) carry the same metadata regardless of which command
 produced them — both flow through `download_and_apply_patches_with` in
-`src/commands/get.rs`. The shape is stable as of v3.0; consumers can
+`src/commands/agent_download.rs`. The shape is stable as of v3.0; consumers can
 rely on these keys.
 
 ```jsonc

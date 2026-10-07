@@ -12,15 +12,14 @@ use socket_patch_core::vendor::{
 use std::collections::HashSet;
 use std::time::Duration;
 
-use super::get::short_uuid;
-use super::rollback::{
-    rollback_patches_inner, run_hosted_leg, sweep_failure, HostedLegOutcome, InnerSelection,
-};
+use super::rollback::{rollback_patches_inner, InnerSelection};
 use crate::args::{apply_env_toggles, GlobalArgs};
+use crate::commands::hosted_unwind::{run_hosted_leg, HostedLegOutcome};
 use crate::commands::lock_cli::acquire_or_emit;
 use crate::commands::vendored_backend::{RevertedEntry, VendorRevertStep, VendoredBackend};
 use crate::json_envelope::{Command, Envelope, EnvelopeError, PatchAction, PatchEvent, Status};
-use crate::ui::plural;
+use crate::ui::short_uuid;
+use crate::ui::{plural, sweep_failure};
 
 /// Vendor-ledger entries matching a remove identifier
 /// ([`socket_patch_core::ledgers::Ledgers::matching`]), sorted by key for
@@ -116,7 +115,7 @@ fn emit_error_envelope(json: bool, dry_run: bool, code: &str, message: String) {
         env.mark_error(EnvelopeError::new(code, message));
         println!("{}", env.to_pretty_json());
     } else {
-        eprintln!("Error: {}", super::rollback::capitalize_first(&message));
+        eprintln!("Error: {}", crate::ui::sentence_case(&message));
     }
 }
 
