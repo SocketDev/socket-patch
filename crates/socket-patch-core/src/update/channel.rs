@@ -59,7 +59,7 @@ impl ChannelEnv {
         ChannelEnv {
             cargo_home: path_var("CARGO_HOME"),
             xdg_cache_home: path_var("XDG_CACHE_HOME"),
-            home: path_var("HOME").or_else(|| path_var("USERPROFILE")),
+            home: crate::utils::fs::home_dir(),
             local_app_data: path_var("LOCALAPPDATA"),
         }
     }

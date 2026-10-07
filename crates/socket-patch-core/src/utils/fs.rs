@@ -374,24 +374,22 @@ pub(crate) async fn entry_file_type(entry: &DirEntry) -> Option<std::fs::FileTyp
     entry.file_type().await.ok()
 }
 
-/// Resolve the user's home directory: `HOME`, then `USERPROFILE`
-/// (Windows), then a literal `"~"` — a harmless non-existent path so
-/// downstream joins probe nothing rather than panic. A set-but-empty
-/// variable counts as unset: honoring `""` would turn every
-/// `home_dir().join(…)` probe into a CWD-relative path, pointing the
-/// crawlers at directories inside the user's project. The shared
-/// fallback chain for every crawler that scans well-known per-user
-/// package roots (`~/.cargo`, `~/.m2`, `~/.nuget`, …) and for
-/// telemetry's home-dir redaction.
-/// The go/composer crawlers deliberately use a stricter
-/// no-home-means-no-path chain instead.
-pub(crate) fn home_dir() -> PathBuf {
-    let home = std::env::var("HOME")
-        .ok()
-        .filter(|h| !h.is_empty())
-        .or_else(|| std::env::var("USERPROFILE").ok().filter(|h| !h.is_empty()))
-        .unwrap_or_else(|| "~".to_string());
-    PathBuf::from(home)
+/// The user's home directory: `HOME`, then `USERPROFILE` (Windows), each
+/// only when set, non-empty and ABSOLUTE; otherwise `None`. A relative or
+/// empty value (stripped CI/container/sudo environments, `env -i`) would
+/// turn every `home_dir().join(…)` probe into a CWD-relative path,
+/// pointing the crawlers at directories inside the user's project as if
+/// they were the per-user package roots (`~/.cargo`, `~/.m2`, `~/.nuget`,
+/// …), so a caller with no home probes nothing there.
+///
+/// The one home resolver for the crawlers' well-known per-user roots,
+/// telemetry's home-dir redaction and the repository walk's home stop.
+pub(crate) fn home_dir() -> Option<PathBuf> {
+    ["HOME", "USERPROFILE"]
+        .into_iter()
+        .filter_map(std::env::var_os)
+        .map(PathBuf::from)
+        .find(|home| home.is_absolute())
 }
 
 /// Atomically commit `content` to `path` via stage + fsync + rename.
@@ -1064,20 +1062,18 @@ mod tests {
         );
     }
 
-    /// Regression: a set-but-empty `HOME` (stripped CI/container/sudo
-    /// environments) must be treated as unset, exactly like the documented
-    /// no-home fallback. Honoring `""` made `home_dir()` return an empty
-    /// `PathBuf`, so every `home_dir().join(".cargo")`-style probe became a
-    /// CWD-relative path and the crawlers scanned directories inside the
-    /// user's project as if they were the per-user package roots.
-    #[test]
-    #[serial_test::serial]
-    fn home_dir_treats_empty_home_as_unset() {
-        let prev_home = std::env::var("HOME").ok();
-        let prev_profile = std::env::var("USERPROFILE").ok();
-        std::env::set_var("HOME", "");
-        std::env::set_var("USERPROFILE", "");
-        let home = home_dir();
+    /// Run `f` with `HOME`/`USERPROFILE` set to `home`/`profile`
+    /// (`None` = unset), restoring both.
+    fn with_home_env<T>(home: Option<&str>, profile: Option<&str>, f: impl FnOnce() -> T) -> T {
+        let prev_home = std::env::var_os("HOME");
+        let prev_profile = std::env::var_os("USERPROFILE");
+        let set = |name: &str, v: Option<&str>| match v {
+            Some(v) => std::env::set_var(name, v),
+            None => std::env::remove_var(name),
+        };
+        set("HOME", home);
+        set("USERPROFILE", profile);
+        let out = f();
         match prev_home {
             Some(v) => std::env::set_var("HOME", v),
             None => std::env::remove_var("HOME"),
@@ -1086,10 +1082,39 @@ mod tests {
             Some(v) => std::env::set_var("USERPROFILE", v),
             None => std::env::remove_var("USERPROFILE"),
         }
+        out
+    }
+
+    /// Regression: a set-but-empty `HOME` (stripped CI/container/sudo
+    /// environments) must be treated as unset. Honoring `""` made
+    /// `home_dir()` return an empty `PathBuf`, so every
+    /// `home_dir().join(".cargo")`-style probe became a CWD-relative path
+    /// and the crawlers scanned directories inside the user's project as
+    /// if they were the per-user package roots.
+    #[test]
+    #[serial_test::serial]
+    fn home_dir_treats_empty_home_as_unset() {
+        assert_eq!(with_home_env(Some(""), Some(""), home_dir), None);
+    }
+
+    /// B66: with no usable home the resolver used to fall back to the
+    /// literal RELATIVE path `~`, which every caller joined onto and so
+    /// probed `./~/.cargo`, `./~/.nuget/packages`, … under the process
+    /// working directory. A relative value is no home either.
+    #[test]
+    #[serial_test::serial]
+    fn home_dir_never_returns_a_relative_path() {
+        assert_eq!(with_home_env(None, None, home_dir), None);
+        assert_eq!(with_home_env(Some("rel/home"), None, home_dir), None);
+        let abs = std::env::temp_dir();
+        let abs = abs.to_str().unwrap();
         assert_eq!(
-            home,
-            PathBuf::from("~"),
-            "empty HOME/USERPROFILE must fall back to the harmless `~` sentinel"
+            with_home_env(Some("~"), Some(abs), home_dir),
+            Some(PathBuf::from(abs))
+        );
+        assert_eq!(
+            with_home_env(Some(abs), Some("elsewhere"), home_dir),
+            Some(PathBuf::from(abs))
         );
     }
 

@@ -731,14 +731,16 @@ impl RubyCrawler {
         let mut paths = Self::gem_env_gems_dirs().await;
         let mut seen: HashSet<PathBuf> = paths.iter().cloned().collect();
 
-        // Fallback well-known paths
-        let home = home_dir();
-
-        let fallback_globs = [
-            home.join(".gem").join("ruby"),
-            home.join(".rbenv").join("versions"),
-            home.join(".rvm").join("gems"),
-        ];
+        // Fallback well-known paths (none without a home directory)
+        let fallback_globs: Vec<PathBuf> = home_dir()
+            .map(|home| {
+                vec![
+                    home.join(".gem").join("ruby"),
+                    home.join(".rbenv").join("versions"),
+                    home.join(".rvm").join("gems"),
+                ]
+            })
+            .unwrap_or_default();
 
         for base in &fallback_globs {
             for entry in list_dir_entries(base).await {
@@ -1107,13 +1109,11 @@ pub fn config_path_ignored_warning(value: &str) -> (&'static str, String) {
     )
 }
 
-/// The ambient home directory as an env value (`HOME`, else Windows'
-/// `USERPROFILE`), `None` when unset or empty — the `~`-expansion base for
-/// ambient runs; tests inject theirs through the `_with_env` seams.
+/// The ambient home directory ([`home_dir`]) as an env value — the
+/// `~`-expansion base for ambient runs; tests inject theirs through the
+/// `_with_env` seams.
 fn ambient_home() -> Option<std::ffi::OsString> {
-    std::env::var_os("HOME")
-        .filter(|v| !v.is_empty())
-        .or_else(|| std::env::var_os("USERPROFILE").filter(|v| !v.is_empty()))
+    home_dir().map(PathBuf::into_os_string)
 }
 
 /// Pure parser for `gem env <key>` stdout. Returns the trimmed path
