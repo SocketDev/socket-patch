@@ -7,10 +7,13 @@
 
 use std::ops::Range;
 
+use crate::formats::text::strip_bom;
+
 /// Early pnpm 1 writes shrinkwrapVersion 3 without a minor version and
 /// unconditionally drops registry tarball URLs on install. Its frozen flag
 /// cannot preserve this redirect (verified with pnpm 1.0.0).
 pub(crate) fn unsupported_early_shrinkwrap(content: &str) -> bool {
+    let content = strip_bom(content);
     let version = content
         .lines()
         .find_map(|line| line.strip_prefix("shrinkwrapVersion:"));
@@ -77,9 +80,11 @@ pub(crate) fn unquote(s: &str) -> &str {
 
 /// Whether `text` is a pnpm lock at all: a column-0 `lockfileVersion:`
 /// (pnpm >= 3) or `shrinkwrapVersion:` (pnpm 1 / 2) line — lockfile
-/// discovery's sniff before it reads any entry.
+/// discovery's sniff before it reads any entry. A leading BOM is encoding,
+/// not key text: pnpm reads a BOM lock like its plain twin (#903).
 pub(crate) fn is_pnpm_lock_text(text: &str) -> bool {
-    text.lines()
+    strip_bom(text)
+        .lines()
         .any(|line| line.starts_with("lockfileVersion:") || line.starts_with("shrinkwrapVersion:"))
 }
 

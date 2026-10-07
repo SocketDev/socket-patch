@@ -35,10 +35,10 @@ pub(crate) use hosted::plan_hosted;
 use std::collections::HashSet;
 
 use crate::constants::npm_family::PNPM_LOCK;
+use crate::formats::text::strip_bom;
 use crate::utils::digest::is_sri_pin;
 use crate::vendor::lock_inventory::{http_url, LockIntegrity, LockfileEntry};
 use crate::vendor::path::parse_vendor_path;
-
 
 // ── entry model ──
 
@@ -235,9 +235,10 @@ impl PnpmLockGrammar {
 }
 
 /// The `lockfileVersion:` a lock head (its first five lines) declares,
-/// unquoted.
+/// unquoted. A leading BOM is encoding, not key text (#903).
 fn head_lock_version(text: &str) -> Option<String> {
-    text.lines()
+    strip_bom(text)
+        .lines()
         .take(5)
         .find_map(|line| line.strip_prefix("lockfileVersion:"))
         .map(|rest| rest.trim().trim_matches(['\'', '"']).to_string())
@@ -276,14 +277,18 @@ pub fn sniff_lock_grammar(text: &str) -> Result<PnpmLockGrammar, String> {
 }
 
 /// The `(major, minor)` of every `lockfileVersion:` line of a lock (the
-/// first one decides), unquoted; a missing minor reads as 0.
+/// first one decides), unquoted; a missing minor reads as 0. A leading BOM
+/// is encoding, not key text (#903).
 fn lock_versions(text: &str) -> impl Iterator<Item = (Option<u32>, u32)> + '_ {
-    text.lines().filter_map(|line| {
+    strip_bom(text).lines().filter_map(|line| {
         let rest = line.strip_prefix("lockfileVersion:")?;
         let value = rest.trim().trim_matches(|c| c == '\'' || c == '"');
         let mut parts = value.split('.');
         let major = parts.next().and_then(|m| m.parse::<u32>().ok());
-        let minor = parts.next().and_then(|m| m.parse::<u32>().ok()).unwrap_or(0);
+        let minor = parts
+            .next()
+            .and_then(|m| m.parse::<u32>().ok())
+            .unwrap_or(0);
         Some((major, minor))
     })
 }
@@ -303,8 +308,16 @@ pub fn lock_version_major(text: &str) -> Option<u32> {
 /// rejects it): a `shrinkwrapVersion` lock (pnpm 1–2) or lockfileVersion
 /// 5.0–5.2 (pnpm 3–5). Later locks never get the `--store` note.
 pub fn may_need_store_flag(text: &str) -> bool {
-    text.lines().any(|line| line.starts_with("shrinkwrapVersion:"))
+    is_shrinkwrap_lock(text)
         || lock_versions(text).any(|(major, minor)| major == Some(5) && minor <= 2)
+}
+
+/// Whether a pnpm lock is a pnpm 1–2 `shrinkwrapVersion:` lock (a leading
+/// BOM skipped).
+pub fn is_shrinkwrap_lock(text: &str) -> bool {
+    strip_bom(text)
+        .lines()
+        .any(|line| line.starts_with("shrinkwrapVersion:"))
 }
 
 /// The lockfileVersion the v9 vendored planner splices.
@@ -491,7 +504,9 @@ pub(crate) fn vendored_npm_uuids(text: &str) -> HashSet<String> {
         if !in_section {
             continue;
         }
-        if let Some(uuid) = lines::parse_key_line(line, 2).and_then(|(key, _, _)| vendored_npm_uuid(key)) {
+        if let Some(uuid) =
+            lines::parse_key_line(line, 2).and_then(|(key, _, _)| vendored_npm_uuid(key))
+        {
             out.insert(uuid);
         }
     }
@@ -508,17 +523,52 @@ mod tests {
     fn resolves_reads_every_key_generation_boundary_anchored() {
         let lock = |keys: &str| format!("lockfileVersion: '9.0'\n\npackages:\n\n{keys}");
         let yes = [
-            ("  left-pad@1.3.0:\n    resolution: {integrity: sha512-x}\n", "left-pad", "1.3.0"),
-            ("  /left-pad@1.3.0:\n    resolution: {}\n", "left-pad", "1.3.0"),
-            ("  /left-pad/1.3.0:\n    resolution: {}\n", "left-pad", "1.3.0"),
-            ("  'left-pad@1.3.0(react@18.0.0)':\n    dev: false\n", "left-pad", "1.3.0"),
-            ("  /left-pad/1.3.0_react@18.0.0:\n    dev: false\n", "left-pad", "1.3.0"),
-            ("  '@scope/name@1.0.0':\n    dev: false\n", "@scope/name", "1.0.0"),
-            ("  /@scope/name@1.0.0:\n    dev: false\n", "@scope/name", "1.0.0"),
-            ("  /@scope/name/1.0.0:\n    dev: false\n", "@scope/name", "1.0.0"),
+            (
+                "  left-pad@1.3.0:\n    resolution: {integrity: sha512-x}\n",
+                "left-pad",
+                "1.3.0",
+            ),
+            (
+                "  /left-pad@1.3.0:\n    resolution: {}\n",
+                "left-pad",
+                "1.3.0",
+            ),
+            (
+                "  /left-pad/1.3.0:\n    resolution: {}\n",
+                "left-pad",
+                "1.3.0",
+            ),
+            (
+                "  'left-pad@1.3.0(react@18.0.0)':\n    dev: false\n",
+                "left-pad",
+                "1.3.0",
+            ),
+            (
+                "  /left-pad/1.3.0_react@18.0.0:\n    dev: false\n",
+                "left-pad",
+                "1.3.0",
+            ),
+            (
+                "  '@scope/name@1.0.0':\n    dev: false\n",
+                "@scope/name",
+                "1.0.0",
+            ),
+            (
+                "  /@scope/name@1.0.0:\n    dev: false\n",
+                "@scope/name",
+                "1.0.0",
+            ),
+            (
+                "  /@scope/name/1.0.0:\n    dev: false\n",
+                "@scope/name",
+                "1.0.0",
+            ),
         ];
         for (keys, name, version) in yes {
-            assert!(PnpmLock::parse(&lock(keys)).resolves(name, version), "{keys}");
+            assert!(
+                PnpmLock::parse(&lock(keys)).resolves(name, version),
+                "{keys}"
+            );
         }
         let no = [
             ("  left-pad@1.3.0-beta.1:\n    dev: false\n", "left-pad", "1.3.0"),
@@ -534,7 +584,10 @@ mod tests {
             ),
         ];
         for (keys, name, version) in no {
-            assert!(!PnpmLock::parse(&lock(keys)).resolves(name, version), "{keys}");
+            assert!(
+                !PnpmLock::parse(&lock(keys)).resolves(name, version),
+                "{keys}"
+            );
         }
         // Keys outside `packages:` (importers, overrides) resolve nothing.
         let importers = "lockfileVersion: '9.0'\n\nimporters:\n\n  left-pad@1.3.0:\n    x: y\n";
@@ -557,7 +610,10 @@ mod tests {
             let other = "22222222-2222-4222-8222-222222222222";
             assert!(!PnpmLock::parse(text).vendored_in_use(other));
             let crlf = text.replace('\n', "\r\n");
-            assert!(PnpmLock::parse(&crlf).vendored_in_use(UUID), "CRLF reads like LF");
+            assert!(
+                PnpmLock::parse(&crlf).vendored_in_use(UUID),
+                "CRLF reads like LF"
+            );
         }
         // An overrides declaration alone is not usage.
         let overrides = format!(
@@ -581,5 +637,66 @@ mod tests {
             "lockfileVersion: '9.0'\n\npackages:\n\n  a@file:{rel}:\n    version: 1.0.0\n\n  b@1.0.0:\n    resolution: {{integrity: {sri}}}\n"
         );
         assert_eq!(PnpmLock::parse(&neighbour).wired_integrity(&rel), None);
+    }
+
+    /// #903 / #905: a leading UTF-8 BOM is encoding, not content — pnpm
+    /// reads a BOM lock like its plain twin, so every sniff here must too.
+    /// Before the fix the BOM twin read as "not a pnpm lock", unversioned
+    /// and unsupported while its entries still parsed.
+    #[test]
+    fn bom_lock_reads_like_its_plain_twin() {
+        let v9 = "lockfileVersion: '9.0'\n\nimporters:\n\n  .:\n    dependencies:\n      left-pad:\n        specifier: 1.3.0\n        version: 1.3.0\n\npackages:\n\n  left-pad@1.3.0:\n    resolution: {integrity: sha512-x}\n";
+        let v6 = "lockfileVersion: '6.0'\n\ndependencies:\n  left-pad:\n    specifier: 1.3.0\n    version: 1.3.0\n\npackages:\n\n  /left-pad@1.3.0:\n    resolution: {integrity: sha512-x}\n    dev: false\n";
+        let v54 = "lockfileVersion: 5.4\n\nspecifiers:\n  left-pad: 1.3.0\n\ndependencies:\n  left-pad: 1.3.0\n\npackages:\n\n  /left-pad/1.3.0:\n    resolution: {integrity: sha512-x}\n    dev: false\n";
+        let v52 = "lockfileVersion: 5.2\n\npackages:\n\n  /left-pad/1.3.0:\n    resolution: {integrity: sha512-x}\n";
+        let shrinkwrap = "shrinkwrapVersion: 3\nshrinkwrapMinorVersion: 7\n\npackages:\n\n  /left-pad/1.3.0:\n    resolution: {integrity: sha512-x}\n";
+        for plain in [v9, v6, v54, v52, shrinkwrap] {
+            let bom = format!("\u{feff}{plain}");
+            assert!(PnpmLock::parse(plain).is_pnpm_lock(), "{plain}");
+            assert!(PnpmLock::parse(&bom).is_pnpm_lock(), "BOM twin of {plain}");
+            assert!(is_pnpm_lock_text(&bom), "{plain}");
+            assert_eq!(
+                sniff_lock_grammar(&bom),
+                sniff_lock_grammar(plain),
+                "{plain}"
+            );
+            assert_eq!(
+                lock_version_major(&bom),
+                lock_version_major(plain),
+                "{plain}"
+            );
+            assert_eq!(
+                may_need_store_flag(&bom),
+                may_need_store_flag(plain),
+                "{plain}"
+            );
+            assert_eq!(
+                check_v9_lock_version(&bom),
+                check_v9_lock_version(plain),
+                "{plain}"
+            );
+            let keys = |text: &str| {
+                PnpmLock::parse(text).entries().map(|e| {
+                    e.into_iter()
+                        .map(|e| (e.name, e.version))
+                        .collect::<Vec<_>>()
+                })
+            };
+            assert_eq!(keys(&bom), keys(plain), "{plain}");
+        }
+        assert_eq!(
+            sniff_lock_grammar(&format!("\u{feff}{v9}")),
+            Ok(PnpmLockGrammar::V9)
+        );
+        assert_eq!(lock_version_major(&format!("\u{feff}{v9}")), Some(9));
+        assert!(may_need_store_flag(&format!("\u{feff}{v52}")));
+        assert!(may_need_store_flag(&format!("\u{feff}{shrinkwrap}")));
+        assert!(grammar::unsupported_early_shrinkwrap(
+            "\u{feff}shrinkwrapVersion: 3\n"
+        ));
+        // Exactly one BOM is encoding; a second one is content, as for pnpm.
+        assert!(!is_pnpm_lock_text(
+            "\u{feff}\u{feff}lockfileVersion: '9.0'\n"
+        ));
     }
 }
