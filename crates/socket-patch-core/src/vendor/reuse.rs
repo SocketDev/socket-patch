@@ -2,7 +2,6 @@ use std::collections::HashMap;
 use std::path::Path;
 
 use crate::manifest::schema::PatchRecord;
-use crate::utils::env_compat::is_debug_enabled;
 
 use super::state::{load_state_shared, VendorEntry};
 use super::verify::{
@@ -46,9 +45,10 @@ pub(crate) enum ReuseMiss {
 
 /// Debug-log a reuse miss (`SOCKET_DEBUG`); the caller then acquires.
 pub(crate) fn log_miss(purl: &str, miss: &ReuseMiss) {
-    if is_debug_enabled() {
-        eprintln!("[socket-patch debug] vendor reuse skipped for {purl}: {miss:?}");
-    }
+    crate::utils::env_compat::debug_log(
+        "debug",
+        &format!("vendor reuse skipped for {purl}: {miss:?}"),
+    );
 }
 
 fn norm(path: &str) -> String {

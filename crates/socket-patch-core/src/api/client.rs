@@ -21,7 +21,7 @@ use crate::api::vendor_prefetch::VendorPrefetch;
 pub use crate::api::vendor_prefetch::VendorPrefetchGuard;
 use crate::constants::USER_AGENT as USER_AGENT_VALUE;
 use crate::utils::digest::is_hex;
-use crate::utils::env_compat::{is_debug_enabled, is_offline_env, proxy_url_from_env};
+use crate::utils::env_compat::{is_offline_env, proxy_url_from_env};
 use crate::utils::notice::{notice_once, Notice};
 use crate::utils::redact::{redact_url, redact_urls_in};
 use crate::utils::socket_cli_config;
@@ -101,10 +101,9 @@ fn status_error(head: &str, status: StatusCode, text: &str) -> String {
 /// is redacted first: debug lines quote grant URLs and `--api-url`s, and
 /// debug output is routinely pasted into CI logs and bug reports.
 fn debug_log(message: &str) {
-    if !is_debug_enabled() {
+    let Some(message) = crate::utils::env_compat::debug_message(message) else {
         return;
-    }
-    let message = redact_urls_in(message);
+    };
     if !defer_debug_line(&message) {
         eprintln!("[socket-patch debug] {}", message);
     }
@@ -5053,6 +5052,36 @@ mod vendor_package_tests {
                 );
             }
             other => panic!("expected Other, got {other:?}"),
+        }
+    }
+
+    /// The artifact errors quote the grant URL redacted: neither the grant
+    /// token nor userinfo reaches the error a caller shows.
+    #[tokio::test]
+    async fn download_artifact_errors_never_carry_a_credential() {
+        const GRANT: &str = "grant-level";
+        const UUID: &str = "7c8d9e0f-1a2b-4a1b-8c2d-3e4f5a6b7c8d";
+        let grant_path = format!("/patch/pypi/a/1.0.0/{GRANT}/{UUID}/a.whl");
+        let server = MockServer::start().await;
+        Mock::given(method("GET"))
+            .and(path(grant_path.as_str()))
+            .respond_with(ResponseTemplate::new(404))
+            .mount(&server)
+            .await;
+        let client = auth_client(server.uri());
+        for url in [
+            format!("ftp://u:pw@h.example{grant_path}"),
+            format!(
+                "{}{grant_path}",
+                server.uri().replace("http://", "http://u:pw@")
+            ),
+        ] {
+            let msg = match client.download_artifact(&url).await {
+                Err(ApiError::Other(msg)) => msg,
+                other => panic!("expected Other, got {other:?}"),
+            };
+            assert!(!msg.contains(GRANT) && !msg.contains("u:pw"), "{msg}");
+            assert!(msg.contains(&format!("/<redacted>/{UUID}/")), "{msg}");
         }
     }
 
