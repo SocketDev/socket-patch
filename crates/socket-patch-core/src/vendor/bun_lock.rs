@@ -1249,11 +1249,12 @@ fn bundled_matches(
 
 /// Keys of the non-bundled entries that install `name@version` from a user
 /// URL / `file:` tarball (#497): bun installs those from their own spec, so
-/// no vendored tuple reaches them.
+/// no vendored tuple reaches them. The spec check runs first: the bundled
+/// check JSON-parses the meta, so it may run only on a match (#578).
 fn user_tarball_matches(entries: &[BunEntry], name: &str, version: &str) -> Vec<String> {
     entries
         .iter()
-        .filter(|e| !is_bundled_entry(e) && is_user_tarball_entry(e, name, version))
+        .filter(|e| is_user_tarball_entry(e, name, version) && !is_bundled_entry(e))
         .map(|e| e.key.clone())
         .collect()
 }
@@ -4860,11 +4861,15 @@ mod tests {
             .filter(|e| classify_rewritable(e, spec, "pkg0", &leaf).is_some())
             .count();
         let bundled = bundled_matches(&entries, spec, "pkg0", &leaf);
+        // The #497 user-tarball scan is a third per-target pass; with no
+        // tarball entry for the target it must make no bundled check.
+        let user_tarballs = user_tarball_matches(&entries, "pkg0", "1.0.0");
         let checks = BUNDLED_CHECKS.with(std::cell::Cell::get);
 
         assert_eq!(rewritable, 1, "only the registry tuple is rewritable");
         assert_eq!(bundled, vec!["parent/pkg0".to_string()]);
-        // Two matching entries, two scans: at most four checks, not 2 × 201.
+        assert!(user_tarballs.is_empty());
+        // Two matching entries, two scans: at most four checks, not 3 × 201.
         assert!(
             checks <= 4,
             "{checks} bundled checks over {} entries",
