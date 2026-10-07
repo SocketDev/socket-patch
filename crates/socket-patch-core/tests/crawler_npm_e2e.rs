@@ -2376,6 +2376,16 @@ async fn find_by_purls_returns_bundled_copy_of_an_already_found_target() {
                     .unwrap();
                 nm.join("left-pad")
             } else {
+                // Bun counts only linked entries as installed (#599); its
+                // hoist dir links a transitive-only package.
+                if store_name == ".bun" {
+                    std::fs::create_dir_all(store.join("node_modules")).unwrap();
+                    std::os::unix::fs::symlink(
+                        normal_nm.join("left-pad"),
+                        store.join("node_modules/left-pad"),
+                    )
+                    .unwrap();
+                }
                 normal_nm.join("left-pad")
             };
 

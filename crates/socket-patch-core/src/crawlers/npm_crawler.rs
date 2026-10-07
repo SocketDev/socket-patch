@@ -578,6 +578,240 @@ pub fn bun_uses_global_store(project_root: &Path) -> bool {
     })
 }
 
+/// Keep only the `.bun` store entries an install can still load (#599).
+/// Bun never prunes its store: an in-place `bun install` that re-resolves
+/// a package (a hosted tarball rewire, a version bump) writes a new entry,
+/// re-links every dependent to it and leaves the old `<name>@<version>`
+/// dir behind with nothing pointing at it. Such an orphan is not an
+/// installed copy: apply must not fan out to it, and vex must not judge
+/// the install by its stale bytes.
+///
+/// An entry is live when a link reaches it from the `node_modules`
+/// holding the store, from Bun's hidden hoist dir `.bun/node_modules`
+/// (every store package resolves through it), from a workspace member's
+/// `node_modules` (the crawler's own workspace walk, run only when the
+/// cheaper seeds leave some entry unreached), or from a live entry's
+/// `node_modules`. A stale link Bun left behind still counts: the runtime
+/// resolves through it. A store no link reaches at all gives no evidence
+/// either way, so every entry is kept.
+///
+/// A first, quick walk guesses link targets by name (see
+/// [`BunStoreNames`]), which keeps a clean store's walk to the listings
+/// the scan reads anyway. The guesses only ever over-reach, except that an
+/// alias link can defeat one (`lp` linking `left-pad@…` while an `lp@…`
+/// entry exists), so when the quick walk leaves any entry unreached, the
+/// store is walked again reading every link before anything is dropped.
+///
+/// Returns the `node_modules` listings of the entries the walk read, by
+/// entry name, so the scan does not list them a second time.
+fn retain_live_bun_store_entries_sync(
+    store_path: &Path,
+    candidates: &mut Vec<ListedEntry>,
+) -> HashMap<OsString, Listing> {
+    let (Ok(real_store), Some(importer)) = (std::fs::canonicalize(store_path), store_path.parent())
+    else {
+        return HashMap::new();
+    };
+    if candidates.is_empty() {
+        return HashMap::new();
+    }
+    let names = BunStoreNames::new(candidates);
+    let walk = |unique: Option<&BunStoreNames>| {
+        let mut live: HashSet<OsString> = HashSet::new();
+        let mut listings = HashMap::new();
+        let seeds = [store_path.join("node_modules"), importer.to_path_buf()];
+        reach_bun_store_entries_sync(&seeds, &real_store, unique, &mut live, &mut listings);
+        if !live.is_empty() && candidates.iter().any(|e| !live.contains(&e.name)) {
+            let root = match importer.parent() {
+                Some(root) if !root.as_os_str().is_empty() => root,
+                _ => Path::new("."),
+            };
+            let members = NpmCrawler::find_workspace_node_modules(root, list_dir_sync(root));
+            reach_bun_store_entries_sync(&members, &real_store, unique, &mut live, &mut listings);
+        }
+        (live, listings)
+    };
+    let (mut live, mut listings) = walk(Some(&names));
+    if candidates.iter().any(|e| !live.contains(&e.name)) {
+        (live, listings) = walk(None);
+    }
+    if !live.is_empty() {
+        candidates.retain(|e| live.contains(&e.name));
+    }
+    listings
+}
+
+/// The quick walk's guesses: a link named for a package only one `.bun`
+/// entry holds points at that entry, and a `@scope` dir none of whose
+/// packages has a second entry links (at most) that scope's entries, so
+/// neither is read. Only a package with several entries (where an orphan
+/// hides) needs its links read.
+struct BunStoreNames {
+    unique: HashMap<String, OsString>,
+    scopes: HashMap<String, Vec<OsString>>,
+}
+
+impl BunStoreNames {
+    fn new(candidates: &[ListedEntry]) -> Self {
+        let mut by_package: HashMap<String, Option<&OsString>> = HashMap::new();
+        for entry in candidates {
+            if let Some(package) = bun_store_entry_package(&entry.name_str) {
+                by_package
+                    .entry(package)
+                    .and_modify(|only| *only = None)
+                    .or_insert(Some(&entry.name));
+            }
+        }
+        let mut unique = HashMap::new();
+        let mut scopes: HashMap<String, Option<Vec<OsString>>> = HashMap::new();
+        for (package, only) in by_package {
+            let scope = package.split_once('/').map(|(scope, _)| scope.to_string());
+            match only {
+                Some(entry) => {
+                    if let Some(scope) = scope {
+                        if let Some(entries) = scopes.entry(scope).or_insert(Some(Vec::new())) {
+                            entries.push(entry.clone());
+                        }
+                    }
+                    unique.insert(package, entry.clone());
+                }
+                None => {
+                    if let Some(scope) = scope {
+                        scopes.insert(scope, None);
+                    }
+                }
+            }
+        }
+        let scopes = scopes
+            .into_iter()
+            .filter_map(|(scope, entries)| Some((scope, entries?)))
+            .collect();
+        Self { unique, scopes }
+    }
+}
+
+/// The package a `.bun` entry name is for, spelled the way a link to it
+/// is named (`@scope+leaf@…` is `@scope/leaf`); `None` without a version.
+fn bun_store_entry_package(entry_name: &str) -> Option<String> {
+    let skip = usize::from(entry_name.starts_with('@'));
+    let at = skip + entry_name.get(skip..)?.find('@')?;
+    let package = entry_name.get(..at).filter(|p| p.len() > skip)?;
+    Some(if skip == 1 {
+        package.replacen('+', "/", 1)
+    } else {
+        package.to_string()
+    })
+}
+
+/// Add to `live` every `.bun` entry (by name) reachable through links from
+/// the `seeds` dirs, following each reached entry's own `node_modules`
+/// links, and record each entry's listing in `listings`. Read one
+/// frontier at a time, each frontier's dirs in parallel. With `names`,
+/// targets are guessed by name where they can be.
+fn reach_bun_store_entries_sync(
+    seeds: &[PathBuf],
+    real_store: &Path,
+    names: Option<&BunStoreNames>,
+    live: &mut HashSet<OsString>,
+    listings: &mut HashMap<OsString, Listing>,
+) {
+    let mut frontier: Vec<(Option<OsString>, PathBuf)> = seeds
+        .iter()
+        .filter_map(|nm| Some((None, std::fs::canonicalize(nm).ok()?)))
+        .collect();
+    while !frontier.is_empty() {
+        let visited = par_map(frontier, |(entry, nm)| {
+            let listing = read_dir_entries_sync(&nm)
+                .map(|(entries, complete)| Listing::from_entries(entries, complete));
+            let targets = listing
+                .as_ref()
+                .map(|listing| bun_store_link_targets_sync(&nm, listing, real_store, names))
+                .unwrap_or_default();
+            (entry, listing, targets)
+        });
+        frontier = Vec::new();
+        for (entry, listing, targets) in visited {
+            if let (Some(entry), Some(listing)) = (entry, listing) {
+                listings.insert(entry, listing);
+            }
+            for target in targets {
+                if live.insert(target.clone()) {
+                    let nm = real_store.join(&target).join("node_modules");
+                    frontier.push((Some(target), nm));
+                }
+            }
+        }
+    }
+}
+
+/// The `.bun` entries the package links in `listing` (of the real dir
+/// `nm`; scoped ones under `@scope/`) point into. With `names`, a link
+/// or scope dir it can guess is not read (see [`BunStoreNames`]); any
+/// other link is read and
+/// resolved lexically first (Bun writes relative targets, and `nm` is
+/// real, so each `..` climbs a real dir), and one that lands outside the
+/// store that way (an absolute Windows junction, a linked `node_modules`)
+/// is canonicalized instead.
+fn bun_store_link_targets_sync(
+    nm: &Path,
+    listing: &Listing,
+    real_store: &Path,
+    names: Option<&BunStoreNames>,
+) -> Vec<OsString> {
+    let mut targets = Vec::new();
+    // (link, the package its name spells)
+    let mut links: Vec<(PathBuf, String)> = Vec::new();
+    for entry in &listing.entries {
+        let Some(file_type) = entry.file_type else {
+            continue;
+        };
+        if entry.name_str.starts_with('.') {
+            continue;
+        }
+        if file_type.is_symlink() {
+            links.push((nm.join(&entry.name), entry.name_str.clone()));
+        } else if file_type.is_dir() && entry.name_str.starts_with('@') {
+            if let Some(entries) = names.and_then(|names| names.scopes.get(&entry.name_str)) {
+                targets.extend(entries.iter().cloned());
+                continue;
+            }
+            let scope = nm.join(&entry.name);
+            for scoped in list_dir_sync(&scope).entries {
+                if scoped.file_type.is_some_and(|ft| ft.is_symlink()) {
+                    let package = format!("{}/{}", entry.name_str, scoped.name_str);
+                    links.push((scope.join(&scoped.name), package));
+                }
+            }
+        }
+    }
+    let links: Vec<PathBuf> = links
+        .into_iter()
+        .filter_map(
+            |(link, package)| match names.and_then(|names| names.unique.get(&package)) {
+                Some(entry) => {
+                    targets.push(entry.clone());
+                    None
+                }
+                None => Some(link),
+            },
+        )
+        .collect();
+    let entry_of = |path: &Path| match path.strip_prefix(real_store).ok()?.components().next() {
+        Some(std::path::Component::Normal(name)) => Some(name.to_os_string()),
+        _ => None,
+    };
+    targets.extend(links.iter().filter_map(|link| {
+        let lexical = std::fs::read_link(link)
+            .ok()
+            .and_then(|target| Some(normalize_lexically(&link.parent()?.join(target))));
+        lexical
+            .as_deref()
+            .and_then(entry_of)
+            .or_else(|| entry_of(&std::fs::canonicalize(link).ok()?))
+    }));
+    targets
+}
+
 /// The `node_modules` child that is npm's `install-strategy=linked` store,
 /// also written by Yarn 4's pnpm linker (see
 /// [`store_entry_own_package_sync`]).
@@ -2609,7 +2843,7 @@ impl NpmCrawler {
         read_listings: bool,
     ) -> Vec<StoreEntryDir> {
         let decode = |name: &str| layout.decode_pnpm_shaped(name);
-        let candidates: Vec<ListedEntry> = list_dir_sync(store_path)
+        let mut candidates: Vec<ListedEntry> = list_dir_sync(store_path)
             .entries
             .into_iter()
             .filter(|entry| {
@@ -2622,17 +2856,34 @@ impl NpmCrawler {
                     })
             })
             .collect();
+        // pnpm prunes its store on install; Bun never does (#599).
+        let mut listings = if layout == StoreLayout::Bun {
+            retain_live_bun_store_entries_sync(store_path, &mut candidates)
+        } else {
+            HashMap::new()
+        };
+        let candidates: Vec<(ListedEntry, Option<Listing>)> = candidates
+            .into_iter()
+            .map(|entry| {
+                let listing = listings.remove(&entry.name).filter(|_| read_listings);
+                (entry, listing)
+            })
+            .collect();
 
-        par_map(candidates, |entry| {
+        par_map(candidates, |(entry, listing)| {
             let entry_path = store_path.join(&entry.name);
             let entry_nm = entry_path.join("node_modules");
             if read_listings {
-                if let Some((entries, complete)) = read_dir_entries_sync(&entry_nm) {
+                let listing = listing.or_else(|| {
+                    read_dir_entries_sync(&entry_nm)
+                        .map(|(entries, complete)| Listing::from_entries(entries, complete))
+                });
+                if let Some(listing) = listing {
                     return vec![StoreEntryDir {
                         advertised: decode(&entry.name_str),
                         name: entry.name_str,
                         node_modules: entry_nm,
-                        listing: Some(Listing::from_entries(entries, complete)),
+                        listing: Some(listing),
                     }];
                 }
             }
@@ -5649,9 +5900,17 @@ mod tests {
         link_dir(&number, &odd_entry.join("is-number"));
         let frame = store.join("@babel+code-frame@7.0.0/node_modules/@babel/code-frame");
         write_pkg(&frame, "@babel/code-frame", "7.0.0");
-        std::fs::create_dir_all(store.join("node_modules")).unwrap();
+        std::fs::create_dir_all(store.join("node_modules/@babel")).unwrap();
         link_dir(&number, &store.join("node_modules/is-number"));
+        link_dir(&hosted, &store.join("node_modules/to-regex-range"));
+        link_dir(&frame, &store.join("node_modules/@babel/code-frame"));
         link_dir(&odd_entry.join("is-odd"), &nm.join("is-odd"));
+        // Every entry is linked from somewhere, as Bun writes it (an
+        // unlinked one is an orphan, #599); the peer twin from a workspace
+        // member's importer.
+        let member_nm = root.join("packages/a/node_modules");
+        std::fs::create_dir_all(&member_nm).unwrap();
+        link_dir(&number_twin, &member_nm.join("is-number"));
 
         assert_store_copies_found(
             &root,
@@ -5733,6 +5992,161 @@ mod tests {
             vec![number_twin.clone()],
         )
         .await;
+    }
+
+    /// #599: Bun never prunes `.bun`. After an in-place `bun install` that
+    /// rewires packages to hosted tarballs (or bumps a version), the old
+    /// `<name>@<version>` entries stay on disk with nothing linking to
+    /// them, while the importers, the `.bun/node_modules` hoist links and
+    /// the dependents' entries all point at the new entries (the layout
+    /// real Bun 1.3.14 / 1.4.2 writes). An orphan is no installed copy:
+    /// scan, the resolver and the peer-variant finder must all skip it, or
+    /// vex judges the install by stale bytes nothing can load. A live entry
+    /// linked only from a workspace member (an unhoisted second version)
+    /// stays found.
+    #[tokio::test]
+    async fn test_bun_isolated_store_orphaned_entries_are_not_copies() {
+        let tmp = tempfile::tempdir().unwrap();
+        let root: PathBuf = tmp.path().components().collect();
+        let nm = root.join("node_modules");
+        let store = nm.join(".bun");
+        let hoist = store.join("node_modules");
+        let member_a = root.join("packages/a/node_modules");
+        let member_b = root.join("packages/b/node_modules");
+        for dir in [&hoist.join("@s"), &member_a, &member_b] {
+            std::fs::create_dir_all(dir).unwrap();
+        }
+
+        // Live: the hosted rewires, and two left-pad versions (1.3.0
+        // hoisted, 1.2.0 linked only from member b).
+        let odd = store.join("is-odd@http+++127.0.0.1+is-odd.tgz/node_modules");
+        write_pkg(&odd.join("is-odd"), "is-odd", "3.0.1");
+        let number = store.join("is-number@http+++127.0.0.1+is-number.tgz/node_modules/is-number");
+        write_pkg(&number, "is-number", "6.0.0");
+        link_dir(&number, &odd.join("is-number"));
+        let pad = store.join("left-pad@1.3.0/node_modules/left-pad");
+        write_pkg(&pad, "left-pad", "1.3.0");
+        let old_pad = store.join("left-pad@1.2.0/node_modules/left-pad");
+        write_pkg(&old_pad, "left-pad", "1.2.0");
+        link_dir(&odd.join("is-odd"), &nm.join("is-odd"));
+        link_dir(&odd.join("is-odd"), &hoist.join("is-odd"));
+        link_dir(&number, &hoist.join("is-number"));
+        link_dir(&pad, &hoist.join("left-pad"));
+        link_dir(&number, &member_a.join("is-number"));
+        link_dir(&pad, &member_a.join("left-pad"));
+        link_dir(&old_pad, &member_b.join("left-pad"));
+        let frame = store.join("@s+frame@http+++127.0.0.1+frame.tgz/node_modules/@s/frame");
+        write_pkg(&frame, "@s/frame", "7.0.0");
+        link_dir(&frame, &hoist.join("@s/frame"));
+
+        // Orphans: the pre-rewire registry entries (still linked to each
+        // other) and a churned-away version.
+        let stale_odd = store.join("is-odd@3.0.1/node_modules");
+        write_pkg(&stale_odd.join("is-odd"), "is-odd", "3.0.1");
+        let stale_number = store.join("is-number@6.0.0/node_modules/is-number");
+        write_pkg(&stale_number, "is-number", "6.0.0");
+        link_dir(&stale_number, &stale_odd.join("is-number"));
+        let stale_frame = store.join("@s+frame@7.0.0/node_modules/@s/frame");
+        write_pkg(&stale_frame, "@s/frame", "7.0.0");
+        write_pkg(
+            &store.join("left-pad@1.1.0/node_modules/left-pad"),
+            "left-pad",
+            "1.1.0",
+        );
+
+        let scanned = scan_paths(&root).await;
+        for (purl, path) in &scanned {
+            assert!(
+                !path.starts_with(&stale_odd)
+                    && !path.starts_with(stale_number.parent().unwrap())
+                    && !path.starts_with(&stale_frame)
+                    && purl != "pkg:npm/left-pad@1.1.0",
+                "an orphaned entry was scanned: {scanned:?}"
+            );
+        }
+        assert!(
+            scanned.contains(&("pkg:npm/left-pad@1.2.0".to_string(), old_pad.clone())),
+            "{scanned:?}"
+        );
+
+        let purls: Vec<String> = [
+            "pkg:npm/@s/frame@7.0.0",
+            "pkg:npm/is-number@6.0.0",
+            "pkg:npm/is-odd@3.0.1",
+            "pkg:npm/left-pad@1.1.0",
+            "pkg:npm/left-pad@1.2.0",
+        ]
+        .map(String::from)
+        .to_vec();
+        let found = NpmCrawler::new().find_by_purls(&nm, &purls).await.unwrap();
+        let paths = |purl: &str| -> Vec<PathBuf> {
+            let mut got: Vec<PathBuf> = found
+                .get(purl)
+                .map(|copies| copies.iter().map(|p| p.path.clone()).collect())
+                .unwrap_or_default();
+            got.sort();
+            got
+        };
+        assert_eq!(paths("pkg:npm/@s/frame@7.0.0"), vec![frame.clone()]);
+        assert_eq!(paths("pkg:npm/is-number@6.0.0"), vec![number.clone()]);
+        assert_eq!(paths("pkg:npm/is-odd@3.0.1"), vec![nm.join("is-odd")]);
+        assert_eq!(paths("pkg:npm/left-pad@1.1.0"), Vec::<PathBuf>::new());
+        assert_eq!(paths("pkg:npm/left-pad@1.2.0"), vec![old_pad.clone()]);
+
+        assert_eq!(
+            find_store_peer_variant_copies(&number).await,
+            Vec::<PathBuf>::new()
+        );
+    }
+
+    /// #599: the orphan filter's quick walk takes a link named for a
+    /// package only one entry holds to be that entry. An alias link
+    /// (`node_modules/lp` -> `left-pad@1.3.0`) beside an unrelated `lp@…`
+    /// entry defeats the guess, so the entry it really reaches must still
+    /// be found (by the exact re-walk) and the never-linked `lp@` dropped.
+    #[tokio::test]
+    async fn test_bun_isolated_store_alias_link_is_resolved_exactly() {
+        let tmp = tempfile::tempdir().unwrap();
+        let root: PathBuf = tmp.path().components().collect();
+        let nm = root.join("node_modules");
+        let store = nm.join(".bun");
+        let pad = store.join("left-pad@1.3.0/node_modules/left-pad");
+        write_pkg(&pad, "left-pad", "1.3.0");
+        write_pkg(&store.join("lp@2.0.0/node_modules/lp"), "lp", "2.0.0");
+        std::fs::create_dir_all(store.join("node_modules")).unwrap();
+        link_dir(&pad, &nm.join("lp"));
+
+        let purls = ["pkg:npm/left-pad@1.3.0", "pkg:npm/lp@2.0.0"].map(String::from);
+        let found = NpmCrawler::new().find_by_purls(&nm, &purls).await.unwrap();
+        let paths: Vec<_> = found["pkg:npm/left-pad@1.3.0"]
+            .iter()
+            .map(|p| p.path.clone())
+            .collect();
+        assert_eq!(paths, vec![pad.clone()]);
+        assert!(!found.contains_key("pkg:npm/lp@2.0.0"), "{found:?}");
+        let scanned = scan_paths(&root).await;
+        assert!(
+            scanned.iter().all(|(purl, _)| purl != "pkg:npm/lp@2.0.0"),
+            "{scanned:?}"
+        );
+    }
+
+    #[test]
+    fn test_bun_store_entry_package() {
+        for (entry, want) in [
+            ("is-number@6.0.0", Some("is-number")),
+            ("is-number@http+++127.0.0.1+t.tgz", Some("is-number")),
+            ("@babel+code-frame@7.0.0", Some("@babel/code-frame")),
+            (
+                "@babel+code-frame@7.0.0+3c4e1d2a",
+                Some("@babel/code-frame"),
+            ),
+            ("no-version", None),
+            ("@scope+only", None),
+            ("@1.0.0", None),
+        ] {
+            assert_eq!(bun_store_entry_package(entry).as_deref(), want, "{entry}");
+        }
     }
 
     /// #373: Deno's isolated `nodeModulesDir` keeps every npm package in
