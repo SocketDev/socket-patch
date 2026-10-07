@@ -1849,6 +1849,23 @@ async fn vendored_takeover(
     } else {
         None
     };
+    // pnpm twin: under `gitBranchLockfile` with a branch lock, the hosted
+    // rewrite leaves every pnpm lock alone (#556), so a vendored pnpm entry
+    // stays vendored rather than be reverted into neither mode.
+    let pnpm_entry = |entry: &socket_patch_core::vendor::VendorEntry| {
+        entry.ecosystem == "npm" && matches!(entry.flavor.as_deref(), Some("pnpm" | "pnpm-legacy"))
+    };
+    let pnpm_takeover_refusal = if takeover
+        .iter()
+        .any(|(_, entry)| entry.as_ref().is_some_and(pnpm_entry))
+    {
+        let view = socket_patch_core::vendor::lock_inventory::ProjectView::Disk(&common.cwd);
+        socket_patch_core::utils::pnpm_workspace::git_branch_locks(&view)
+            .await
+            .map(|branch| socket_patch_core::hosted::engine::git_branch_lock_refusal(&branch))
+    } else {
+        None
+    };
     // Gradle twin: the hosted Gradle planner refuses builds and grants the
     // vendored backend accepts (a custom `lockFile`, a settings-classpath
     // GA, a same-GAV or incomplete grant, ...). Each refusal must be known
@@ -1881,7 +1898,7 @@ async fn vendored_takeover(
         std::collections::HashMap::new()
     };
     // The takeover refusal (if any) for one candidate: bun gates every
-    // npm purl, berry and vlt only their own vendored entries, Gradle each
+    // npm purl, berry, vlt and pnpm only their own vendored entries, Gradle each
     // of its own purls, a pypi purl on a platform-tagged grant (#701), and a
     // requirements.txt entry on the hosted rewriter's reach (it pins only
     // the root file, #699). Berry also runs
@@ -1928,6 +1945,11 @@ async fn vendored_takeover(
                 vlt_takeover_refusal
                     .clone()
                     .filter(|_| entry.is_some_and(vlt_entry))
+            })
+            .or_else(|| {
+                pnpm_takeover_refusal
+                    .clone()
+                    .filter(|_| entry.is_some_and(pnpm_entry))
             })
     };
     // SYMLINK PRE-CHECK for the takeover reverts — the same rule as the

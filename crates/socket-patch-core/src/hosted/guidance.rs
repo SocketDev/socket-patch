@@ -229,10 +229,11 @@ pub fn npm_lock_url_needles(artifact_url: &str) -> Vec<String> {
     needles
 }
 
-/// The HEAL-ON-RERUN gate: when this run spliced no root pnpm-lock.yaml
-/// (`root_spliced` false) but the on-disk root lock is v9 and already
-/// carries a granted hosted artifact URL, return its text so the trust
-/// block engages anyway. Legacy (<9) and unparseable-version locks stay
+/// The HEAL-ON-RERUN gate: when this run spliced no governing pnpm lock
+/// (`root_spliced` false; the root pnpm-lock.yaml, or a member's own lock
+/// under `sharedWorkspaceLockfile: false`) but the on-disk lock is v9 and
+/// already carries a granted hosted artifact URL, return its text so the
+/// trust block engages anyway. Legacy (<9) and unparseable-version locks stay
 /// `None` (fail closed: never write config for a lock era we can't read),
 /// as does a root lock this run DID splice (the splice path covers it).
 pub fn pnpm_heal_root<'a>(

@@ -78,8 +78,25 @@ The backticked slug in each row is the value `-e`/`--ecosystems` accepts (e.g.
   matching package instance is rewritten; an unsupported instance prevents
   confirming that dependency across the lockfile set. Rollback preserves the
   original resolution fragments.
-  For root 9.0 locks, the CLI configures `trustLockfile: true` in
-  `pnpm-workspace.yaml` unless opted out with `--no-trust-lockfile-config` or
+  A workspace with `sharedWorkspaceLockfile: false` (`shared-workspace-lockfile=false`
+  in `.npmrc` on pnpm 10 and older) installs each member from its own lock:
+  run from the workspace root, every `packages:` member's `pnpm-lock.yaml` is
+  pinned beside the root's (pnpm 7 writes no root lock at all), and `list`,
+  `vex` and `rollback` read the member locks too. Member locks beside a root
+  lock that lists member importers are stale and ignored. A member list the
+  CLI cannot read (including a `pnpm-workspace.yaml` with no `packages:` key)
+  is refused with `redirect_pnpm_member_locks_unresolved`.
+  With `gitBranchLockfile` on (`git-branch-lockfile=true` in `.npmrc` on
+  pnpm 10 and older), pnpm installs a branch from its own
+  `pnpm-lock.<branch>.yaml` (in each member's directory too, when members
+  keep their own locks), which neither mode can pin: while such a lock
+  exists, hosted mode refuses the pnpm pins with
+  `redirect_pnpm_git_branch_lockfile` and vendored mode with
+  `vendor_pnpm_git_branch_lockfile`. Turn the setting off and run
+  `pnpm install --merge-git-branch-lockfiles`, then re-run. With no branch
+  lock, `pnpm-lock.yaml` is the lock pnpm installs from and is pinned as usual.
+  For 9.0 root or member locks, the CLI configures `trustLockfile: true` in
+  the root `pnpm-workspace.yaml` unless opted out with `--no-trust-lockfile-config` or
   explicitly disabled by the project. pnpm >=11 needs this for hosted URLs.
   This skips registry re-verification for the whole lock; tarball integrity
   remains enforced. pnpm <=10 does not need the setting. A project with no

@@ -428,6 +428,77 @@ async fn scan_vendored_over_hosted_pnpm_workspace_override_keeps_the_hosted_pin(
     refused_takeover_keeps_hosted_pin(Shape::Override, "scan", "vendor_override_conflict").await;
 }
 
+/// #556: a hosted pin in `pnpm-lock.yaml` after the project turned
+/// `gitBranchLockfile` on and pnpm wrote a branch lock. The vendored
+/// backend refuses that project (it wires `pnpm-lock.yaml` only), so the
+/// takeover must refuse before the restore rather than strip the pin.
+#[tokio::test(flavor = "multi_thread")]
+async fn scan_vendored_over_hosted_pnpm_git_branch_lockfile_keeps_the_hosted_pin() {
+    let server = MockServer::start().await;
+    mock_api(&server).await;
+    let tmp = tempfile::tempdir().unwrap();
+    let root = tmp.path();
+    host_project(root, &server.uri(), Shape::Plain);
+    let ws = root.join("pnpm-workspace.yaml");
+    let mut workspace = std::fs::read_to_string(&ws).unwrap_or_default();
+    workspace.push_str("gitBranchLockfile: true\n");
+    std::fs::write(&ws, workspace).unwrap();
+    let lock = std::fs::read(root.join("pnpm-lock.yaml")).unwrap();
+    std::fs::write(root.join("pnpm-lock.feature.yaml"), lock).unwrap();
+    let hosted = snapshot(root);
+
+    let (_, env) = run_mode(root, &server.uri(), "scan", "vendored", &["--dry-run"]);
+    assert_still_hosted(root, &hosted, &env);
+    let (exit, env) = run_mode(root, &server.uri(), "scan", "vendored", &[]);
+    assert_refused(&env, exit, "vendor_pnpm_git_branch_lockfile");
+    assert_still_hosted(root, &hosted, &env);
+}
+
+/// #556, the other direction: `scan --mode hosted` over a vendored pnpm
+/// entry once `gitBranchLockfile` is on with a branch lock. Hosted mode
+/// pins no pnpm lock there, so reverting the vendored wiring first would
+/// leave the package in neither mode: the takeover is refused and the
+/// vendored wiring and ledger stay byte-for-byte.
+#[tokio::test(flavor = "multi_thread")]
+async fn scan_hosted_over_vendored_pnpm_git_branch_lockfile_keeps_the_vendored_wiring() {
+    let server = MockServer::start().await;
+    mock_api(&server).await;
+    let tmp = tempfile::tempdir().unwrap();
+    let root = tmp.path();
+    write_pnpm_project(root, Shape::Plain);
+    let (exit, env) = run_mode(root, &server.uri(), "scan", "vendored", &[]);
+    assert_eq!(exit, 0, "the plain project vendors: {env:#}");
+    let ws = root.join("pnpm-workspace.yaml");
+    let mut workspace = std::fs::read_to_string(&ws).unwrap_or_default();
+    workspace.push_str("gitBranchLockfile: true\n");
+    std::fs::write(&ws, workspace).unwrap();
+    let lock = std::fs::read(root.join("pnpm-lock.yaml")).unwrap();
+    std::fs::write(root.join("pnpm-lock.feature.yaml"), lock).unwrap();
+    let vendored = snapshot(root);
+    let state = std::fs::read(root.join(".socket/vendor/state.json")).unwrap();
+
+    for extra in [&["--dry-run"][..], &[]] {
+        let (exit, env) = run_mode(root, &server.uri(), "scan", "hosted", extra);
+        assert_eq!(exit, 0, "{env:#}");
+        assert!(
+            has_event_code(&env, "redirect_pnpm_git_branch_lockfile"),
+            "{env:#}"
+        );
+        assert!(
+            !has_event_code(&env, "redirect_takeover_unpatched"),
+            "{env:#}"
+        );
+        for ((file, before), (_, now)) in vendored.iter().zip(snapshot(root)) {
+            assert_eq!(before, &now, "{file} keeps the vendored wiring: {env:#}");
+        }
+        assert_eq!(
+            std::fs::read(root.join(".socket/vendor/state.json")).unwrap(),
+            state,
+            "{env:#}"
+        );
+    }
+}
+
 /// Control: a plain dependency is supported by both modes, so the takeover
 /// still restores the registry entry and vendors it.
 #[tokio::test(flavor = "multi_thread")]

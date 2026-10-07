@@ -56,7 +56,10 @@ async fn rollback_hosted(cwd: &Path, server: &MockServer) -> i32 {
         })))
         .mount(server)
         .await;
-    std::env::set_var("SOCKET_NPM_REGISTRY", format!("{}/npm-registry", server.uri()));
+    std::env::set_var(
+        "SOCKET_NPM_REGISTRY",
+        format!("{}/npm-registry", server.uri()),
+    );
     let code = rollback::run(RollbackArgs {
         targets: Vec::new(),
         common: socket_patch_cli::args::GlobalArgs {
@@ -877,7 +880,11 @@ async fn hosted_pnpm_manifestless_vex_from_lockfile_legacy_ledger_and_api() {
                         ..VexRun::offline()
                     },
                 );
-                assert_eq!(out.code, Some(0), "[{lock_name}] legacy ledger, offline: {out}");
+                assert_eq!(
+                    out.code,
+                    Some(0),
+                    "[{lock_name}] legacy ledger, offline: {out}"
+                );
                 assert_attested(out.doc(), PURL, UUID, Marker::Redirected, vulns);
                 assert_eq!(api.request_count(), seen);
 
@@ -1832,5 +1839,311 @@ async fn hosted_unknown_or_later_pnpm_still_gets_the_trust_scaffold() {
         );
         let warnings = warning_texts(&doc);
         assert!(warnings.contains("`pnpm add -w <pkg>`"), "{warnings}");
+    }
+}
+
+
+/// A pnpm workspace that keeps one lock per member
+/// (`sharedWorkspaceLockfile: false`): `packages/a` depends on the patched
+/// package directly, `packages/b` through `dep-b`, each through its own
+/// lock and installed tree. `lock` renders a member's lock from its
+/// importer block and the extra packages entries.
+fn write_member_lock_workspace(
+    root: &Path,
+    workspace: &str,
+    npmrc: &str,
+    root_lock: Option<&str>,
+    lock: impl Fn(&str, &str) -> String,
+) {
+    std::fs::write(
+        root.join("package.json"),
+        r#"{ "name": "root", "private": true }"#,
+    )
+    .unwrap();
+    std::fs::write(root.join("pnpm-workspace.yaml"), workspace).unwrap();
+    std::fs::write(root.join(".npmrc"), npmrc).unwrap();
+    if let Some(text) = root_lock {
+        std::fs::write(root.join("pnpm-lock.yaml"), text).unwrap();
+    }
+    for (member, dep) in [("a", NAME), ("b", "dep-b")] {
+        let dir = root.join("packages").join(member);
+        let pkg = dir.join("node_modules").join(NAME);
+        std::fs::create_dir_all(&pkg).unwrap();
+        std::fs::write(
+            dir.join("package.json"),
+            format!(
+                r#"{{ "name": "{member}", "version": "1.0.0", "dependencies": {{ "{dep}": "1.0.0" }} }}"#
+            ),
+        )
+        .unwrap();
+        std::fs::write(
+            pkg.join("package.json"),
+            format!(r#"{{ "name": "{NAME}", "version": "{VERSION}" }}"#),
+        )
+        .unwrap();
+        let version = if dep == NAME { VERSION } else { "1.0.0" };
+        std::fs::write(dir.join("pnpm-lock.yaml"), lock(dep, version)).unwrap();
+    }
+}
+
+/// A member's lockfileVersion 9.0 lock: `dep@version` is its importer's
+/// direct dependency; the patched package is always resolved.
+fn v9_member_lock(dep: &str, version: &str) -> String {
+    let extra = if dep == NAME {
+        String::new()
+    } else {
+        format!("  {dep}@{version}:\n    resolution: {{integrity: sha512-DEPb==}}\n\n")
+    };
+    format!(
+        "lockfileVersion: '9.0'
+
+importers:
+
+  .:
+    dependencies:
+      {dep}:
+        specifier: {version}
+        version: {version}
+
+packages:
+
+{extra}  {NAME}@{VERSION}:
+    resolution: {{integrity: {UPSTREAM_SHA512}}}
+
+snapshots:
+
+  {NAME}@{VERSION}: {{}}
+"
+    )
+}
+
+/// #492: a hosted scan from the root of a `sharedWorkspaceLockfile: false`
+/// workspace read only the root lock (`importers: .: {}`), redirected
+/// nothing and reported success. Every member lock is now pinned, the trust
+/// key goes to the root workspace file (the one pnpm reads), discovery sees
+/// the member pins, and `rollback` restores every member lock byte for byte.
+#[tokio::test]
+#[serial]
+async fn hosted_scan_pins_every_member_lock_with_shared_workspace_lockfile_false() {
+    let server = MockServer::start().await;
+    mock_discovery(&server).await;
+    mock_reference(&server).await;
+    mock_view(&server).await;
+    let tmp = tempfile::tempdir().unwrap();
+    let root = tmp.path();
+    let ws = "packages:\n  - 'packages/*'\nsharedWorkspaceLockfile: false\n";
+    write_member_lock_workspace(
+        root,
+        ws,
+        "shared-workspace-lockfile=false\n",
+        Some("lockfileVersion: '9.0'\n\nimporters:\n\n  .: {}\n"),
+        v9_member_lock,
+    );
+    let locks = [
+        root.join("packages/a/pnpm-lock.yaml"),
+        root.join("packages/b/pnpm-lock.yaml"),
+    ];
+    let pristine: Vec<String> = locks
+        .iter()
+        .map(|l| std::fs::read_to_string(l).unwrap())
+        .collect();
+    let root_lock_before = std::fs::read_to_string(root.join("pnpm-lock.yaml")).unwrap();
+
+    let (code, doc) = run_hosted_json(root, &server.uri());
+    assert_eq!(code, Some(0), "{doc}");
+    assert_eq!(doc["status"], "success", "{doc}");
+    assert_eq!(doc["redirect"]["redirected"], 1, "{doc}");
+    for lock in &locks {
+        let text = std::fs::read_to_string(lock).unwrap();
+        assert!(
+            text.contains(&format!("tarball: {HOSTED_URL}")) && text.contains(PATCHED_SHA512),
+            "{} must be pinned:\n{text}",
+            lock.display()
+        );
+    }
+    assert_eq!(
+        std::fs::read_to_string(root.join("pnpm-lock.yaml")).unwrap(),
+        root_lock_before,
+        "the root lock holds no instance and is left alone"
+    );
+    let warnings = warning_texts(&doc);
+    assert!(
+        !warnings.contains("no resolution for"),
+        "no entry_not_found: {warnings}"
+    );
+    assert_eq!(
+        std::fs::read_to_string(root.join("pnpm-workspace.yaml")).unwrap(),
+        format!("{ws}trustLockfile: true\n"),
+        "the trust key goes to the root file"
+    );
+    for member in ["a", "b"] {
+        assert!(!root
+            .join(format!("packages/{member}/pnpm-workspace.yaml"))
+            .exists());
+    }
+    assert_no_ledger(root);
+
+    // Discovery reads the member pins: rollback restores both locks.
+    let code = rollback_hosted(root, &server).await;
+    assert_eq!(code, 0, "rollback must restore the member pins");
+    for (lock, before) in locks.iter().zip(&pristine) {
+        assert_eq!(
+            &std::fs::read_to_string(lock).unwrap(),
+            before,
+            "rollback restores {} byte for byte",
+            lock.display()
+        );
+    }
+}
+
+/// #492 on pnpm 7: `shared-workspace-lockfile=false` in `.npmrc` writes no
+/// root lock at all, only lockfile 5.4 member locks. The run used to warn
+/// `redirect_pnpm_no_lockfile` ("run `pnpm install`", which never writes a
+/// root lock here) and succeed with nothing pinned.
+#[tokio::test]
+#[serial]
+async fn hosted_scan_pins_pnpm7_member_locks_without_a_root_lock() {
+    let server = MockServer::start().await;
+    mock_discovery(&server).await;
+    mock_reference(&server).await;
+    mock_view(&server).await;
+    let tmp = tempfile::tempdir().unwrap();
+    let root = tmp.path();
+    let v5 = |dep: &str, version: &str| {
+        let extra = if dep == NAME {
+            String::new()
+        } else {
+            format!("  /{dep}/{version}:\n    resolution: {{integrity: sha512-DEPb==}}\n    dev: false\n\n")
+        };
+        format!(
+            "lockfileVersion: 5.4\n\nspecifiers:\n  {dep}: {version}\n\ndependencies:\n  \
+             {dep}: {version}\n\npackages:\n\n{extra}  /{NAME}/{VERSION}:\n    \
+             resolution: {{integrity: {UPSTREAM_SHA512}}}\n    dev: false\n"
+        )
+    };
+    write_member_lock_workspace(
+        root,
+        "packages:\n  - packages/*\n",
+        "shared-workspace-lockfile=false\n",
+        None,
+        v5,
+    );
+    let (code, doc) = run_hosted_json(root, &server.uri());
+    assert_eq!(code, Some(0), "{doc}");
+    assert_eq!(doc["redirect"]["redirected"], 1, "{doc}");
+    for member in ["a", "b"] {
+        let text = std::fs::read_to_string(root.join(format!("packages/{member}/pnpm-lock.yaml")))
+            .unwrap();
+        assert!(text.contains(HOSTED_URL), "{member}:\n{text}");
+    }
+    let codes: Vec<&str> = doc["redirect"]["warnings"]
+        .as_array()
+        .into_iter()
+        .flatten()
+        .filter_map(|w| w["code"].as_str())
+        .collect();
+    assert!(
+        !codes.contains(&"redirect_pnpm_no_lockfile")
+            && !codes.contains(&"redirect_npm_no_lockfile")
+            && !codes.contains(&"redirect_pnpm_entry_not_found"),
+        "{codes:?}"
+    );
+    assert!(!root.join("pnpm-lock.yaml").exists());
+}
+
+/// #556: with `gitBranchLockfile` on, pnpm installs a branch from its own
+/// `pnpm-lock.<branch>.yaml` whenever one exists. Hosted mode pinned the
+/// stale `pnpm-lock.yaml` beside it and reported success while every fresh
+/// install on the branch stayed upstream; with only the branch lock it said
+/// "run `pnpm install`", which just rewrites the branch lock. Both now
+/// refuse with `redirect_pnpm_git_branch_lockfile`, confirm nothing and
+/// write nothing (a rewriter-level refusal: the run itself still exits 0,
+/// like `redirect_pnpm_member_locks_unresolved`).
+#[tokio::test]
+#[serial]
+async fn hosted_scan_refuses_a_git_branch_lockfile_project() {
+    let server = MockServer::start().await;
+    mock_discovery(&server).await;
+    mock_reference(&server).await;
+    for (case, root_lock, workspace, npmrc) in [
+        (
+            "both locks",
+            true,
+            "packages:\n  - '.'\ngitBranchLockfile: true\n",
+            None,
+        ),
+        (
+            "branch lock only",
+            false,
+            "packages:\n  - '.'\ngitBranchLockfile: true\n",
+            None,
+        ),
+        (
+            "pnpm 10 .npmrc",
+            true,
+            "packages:\n  - '.'\n",
+            Some("git-branch-lockfile=true\n"),
+        ),
+    ] {
+        let tmp = tempfile::tempdir().unwrap();
+        let root = tmp.path();
+        write_pnpm_project(root);
+        let lock = std::fs::read_to_string(root.join("pnpm-lock.yaml")).unwrap();
+        std::fs::write(root.join("pnpm-lock.feature.yaml"), &lock).unwrap();
+        if !root_lock {
+            std::fs::remove_file(root.join("pnpm-lock.yaml")).unwrap();
+        }
+        std::fs::write(root.join("pnpm-workspace.yaml"), workspace).unwrap();
+        if let Some(npmrc) = npmrc {
+            std::fs::write(root.join(".npmrc"), npmrc).unwrap();
+        }
+        let pkg = std::fs::read_to_string(root.join("package.json")).unwrap();
+
+        let (code, doc) = run_hosted_json(root, &server.uri());
+        assert_eq!(code, Some(0), "{case}: {doc}");
+        assert_eq!(doc["redirect"]["redirected"], 0, "{case}: {doc}");
+        assert_eq!(
+            doc["redirect"]["rewrittenFiles"],
+            serde_json::json!([]),
+            "{case}"
+        );
+        let codes: Vec<&str> = doc["redirect"]["warnings"]
+            .as_array()
+            .into_iter()
+            .flatten()
+            .filter_map(|w| w["code"].as_str())
+            .collect();
+        assert!(
+            codes.contains(&"redirect_pnpm_git_branch_lockfile")
+                && !codes.contains(&"redirect_pnpm_no_lockfile"),
+            "{case}: {codes:?}"
+        );
+        assert!(
+            warning_texts(&doc).contains("pnpm-lock.feature.yaml"),
+            "{case}: {doc}"
+        );
+        if root_lock {
+            assert_eq!(
+                std::fs::read_to_string(root.join("pnpm-lock.yaml")).unwrap(),
+                lock,
+                "{case}: the stale root lock is left alone"
+            );
+        }
+        assert_eq!(
+            std::fs::read_to_string(root.join("pnpm-lock.feature.yaml")).unwrap(),
+            lock,
+            "{case}"
+        );
+        assert_eq!(
+            std::fs::read_to_string(root.join("pnpm-workspace.yaml")).unwrap(),
+            workspace,
+            "{case}: no trust key"
+        );
+        assert_eq!(
+            std::fs::read_to_string(root.join("package.json")).unwrap(),
+            pkg,
+            "{case}"
+        );
+        assert_no_ledger(root);
     }
 }

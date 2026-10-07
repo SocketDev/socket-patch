@@ -512,18 +512,7 @@ fn berry_registry_locator(
     }
 }
 
-/// The value of the last top-level `key` in a YAML settings file
-/// (pnpm-workspace.yaml, .yarnrc.yml), quotes removed.
-fn yaml_top_level_value(text: &str, key: &str) -> Option<String> {
-    use crate::formats::pnpm::workspace::top_level_key;
-    text.strip_prefix('\u{feff}')
-        .unwrap_or(text)
-        .lines()
-        .filter_map(top_level_key)
-        .rfind(|(k, _)| k == key)
-        .map(|(_, value)| value.trim_matches(['"', '\'']).to_string())
-        .filter(|value| !value.is_empty())
-}
+use crate::formats::pnpm::workspace::yaml_top_level_value;
 
 /// The registry a berry restore reads `name`'s version document from:
 /// `.yarnrc.yml`'s `npmRegistryServer`. A scoped package may resolve
