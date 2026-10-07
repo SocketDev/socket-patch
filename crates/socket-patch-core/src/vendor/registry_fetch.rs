@@ -2961,6 +2961,39 @@ mod tests {
         assert!(err.contains("sha256"), "{err}");
     }
 
+    /// Every `download` error quotes its URL redacted: a refused scheme, an
+    /// HTTP error status and a transport failure (reqwest's own text).
+    #[tokio::test]
+    async fn download_errors_never_carry_a_credential() {
+        const UUID: &str = "7c8d9e0f-1a2b-4a1b-8c2d-3e4f5a6b7c8d";
+        use wiremock::{matchers::method, Mock, MockServer, ResponseTemplate};
+        let server = MockServer::start().await;
+        Mock::given(method("GET"))
+            .respond_with(ResponseTemplate::new(404))
+            .mount(&server)
+            .await;
+        let served = server.uri().replace("http://", "http://u:pw@");
+        // A port nothing listens on: the connect fails.
+        let dead = {
+            let listener = std::net::TcpListener::bind("127.0.0.1:0").unwrap();
+            listener.local_addr().unwrap()
+        };
+        for url in [
+            format!("ftp://u:pw@h.example/patch/npm/a/1.0.0/GRANTTOKEN/{UUID}/a.tgz"),
+            format!("{served}/patch/npm/a/1.0.0/GRANTTOKEN/{UUID}/a.tgz?token=QSECRET"),
+            format!("http://u:pw@{dead}/patch/npm/a/1.0.0/GRANTTOKEN/{UUID}/a.tgz"),
+        ] {
+            let err = download(&build_registry_client(), &url).await.unwrap_err();
+            for secret in ["GRANTTOKEN", "u:pw", "QSECRET"] {
+                assert!(!err.contains(secret), "{secret} in {err}");
+            }
+            assert!(
+                err.contains(UUID),
+                "the error still names the artifact: {err}"
+            );
+        }
+    }
+
     #[tokio::test]
     async fn download_refuses_lying_content_length() {
         // wiremock cannot send a mismatched Content-Length, so script a raw

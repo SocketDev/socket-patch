@@ -1871,6 +1871,28 @@ mod harvest_tests {
 }
 
 #[cfg(test)]
+mod vendor_warning_redaction_tests {
+    use super::*;
+
+    /// A vendor warning lands in `--json` events and CI logs: every URL its
+    /// detail quotes is redacted at construction, whoever builds it.
+    #[test]
+    fn a_vendor_warning_never_carries_a_credential() {
+        let w = VendorWarning::new(
+            "vendor_registry_fetch_failed",
+            "GET https://u:p@h.example/patch/npm/a/1.0.0/TOK/7c8d9e0f-1a2b-4a1b-8c2d-3e4f5a6b7c8d/a.tgz: \
+             HTTP 404 (GOPROXY=https://proxy.golang.org,https://bot:ghp_X@goproxy.corp,direct)",
+        );
+        for secret in ["TOK", "u:p", "bot:ghp_X"] {
+            assert!(!w.detail.contains(secret), "{secret}: {}", w.detail);
+        }
+        assert!(w.detail.contains("HTTP 404"), "{}", w.detail);
+        let plain = VendorWarning::new("c", "no url here");
+        assert_eq!(plain.detail, "no url here");
+    }
+}
+
+#[cfg(test)]
 mod berry_migration_risk_tests {
     use super::*;
 

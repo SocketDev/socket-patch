@@ -402,6 +402,35 @@ mod tests {
     const UUID: &str = "22222222-2222-2222-2222-222222222222";
     const SERVE_PATH: &str = "/patch/npm/x/1.0.0/tok/uuid/x-1.0.0.tgz";
 
+    /// The `vendor_prebuilt_downloaded` advisory quotes the service URL the
+    /// bytes came from, which carries the org's grant token: the token (and
+    /// any userinfo) never reaches the `--json` event, the uuid and file
+    /// name do.
+    #[test]
+    fn the_download_advisory_quotes_the_grant_url_redacted() {
+        let archive = VerifiedArchive {
+            yarn_berry10c0: None,
+            bytes: Vec::new(),
+            integrity_sri: String::new(),
+            sha256_hex: std::sync::OnceLock::new(),
+            source_url: format!(
+                "https://u:pw@patch.socket.dev/patch/npm/x/1.0.0/GRANTTOKEN/{UUID}/x-1.0.0.tgz"
+            ),
+            secondary: Vec::new(),
+            prestaged: Default::default(),
+        };
+        let w = archive.downloaded_warning("x@1.0.0");
+        assert_eq!(w.code, "vendor_prebuilt_downloaded");
+        assert!(!w.detail.contains("GRANTTOKEN"), "{}", w.detail);
+        assert!(!w.detail.contains("u:pw"), "{}", w.detail);
+        assert!(
+            w.detail
+                .contains(&format!("/<redacted>/{UUID}/x-1.0.0.tgz")),
+            "{}",
+            w.detail
+        );
+    }
+
     /// A files-less record for [`UUID`]: the Tier-A afterHash gate then only
     /// requires the served bytes to be a readable zip.
     fn record() -> PatchRecord {
