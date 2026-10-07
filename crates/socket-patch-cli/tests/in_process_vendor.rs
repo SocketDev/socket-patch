@@ -1113,7 +1113,10 @@ async fn berry_stale_pnp_loader_under_non_pnp_linker_vendors() {
 #[tokio::test]
 async fn berry_lock_only_pnp_project_refused_up_front() {
     for (label, yarnrc) in [
-        ("explicit pnp", Some("nodeLinker: pnp\nenableGlobalCache: false\n")),
+        (
+            "explicit pnp",
+            Some("nodeLinker: pnp\nenableGlobalCache: false\n"),
+        ),
         ("default linker", Some("enableGlobalCache: false\n")),
         ("no yarnrc", None),
     ] {

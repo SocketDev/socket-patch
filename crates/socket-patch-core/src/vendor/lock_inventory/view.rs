@@ -12,13 +12,11 @@ use std::io;
 use std::path::Path;
 use std::sync::Arc;
 
-use crate::constants::npm_family::{
-    BUN_LOCK, BUN_LOCKB, NPM_LOCKS, PNPM_LOCK, PNP_MARKERS, VLT_LOCK,
-};
-use crate::utils::fs::{read_regular_to_bytes, read_regular_to_string};
-use crate::vendor::npm_flavor::NpmLockFlavor;
+use crate::constants::npm_family::{BUN_LOCK, BUN_LOCKB, NPM_LOCKS, PNPM_LOCK, VLT_LOCK};
 use crate::formats::pnpm::{sniff_lock_grammar, PnpmLockGrammar};
 use crate::formats::yarn::{sniff_grammar, YarnLockGrammar, UNIDENTIFIED_DETAIL};
+use crate::utils::fs::{read_regular_to_bytes, read_regular_to_string};
+use crate::vendor::npm_flavor::NpmLockFlavor;
 use crate::vendor::VendorWarning;
 
 /// One in-memory file.
@@ -376,7 +374,21 @@ pub(crate) async fn detect_npm_lock_flavor_in(
         })
     };
 
-    if let Some(marker) = PNP_MARKERS.iter().find(|m| exists(m)) {
+    // A loader the configured `nodeLinker` disowns is stale (#975). Only the
+    // project's own `.yarnrc.yml` is in a memory snapshot.
+    let linker = || {
+        std::env::var("YARN_NODE_LINKER")
+            .ok()
+            .map(|v| v.trim().to_string())
+            .filter(|v| !v.is_empty())
+            .or_else(|| {
+                let rc = project.read_text(".yarnrc.yml").ok()?;
+                crate::vendor::yarn_berry_lock::yarnrc_scalar(&rc, "nodeLinker")
+                    .filter(|v| !v.is_empty())
+                    .map(str::to_string)
+            })
+    };
+    if let Some(marker) = crate::crawlers::pkg_managers::live_pnp_marker_with(linker, &exists) {
         return Err((
             "vendor_yarn_berry_unsupported",
             format!(
@@ -552,6 +564,19 @@ mod tests {
                 .unwrap()
                 .0,
             NpmLockFlavor::Vlt
+        );
+        // #975: a stale Yarn 2 loader under a non-pnp linker is ignored.
+        let stale = project(&[
+            (".pnp.js", MemoryEntry::Present),
+            (".yarnrc.yml", text("nodeLinker: node-modules\n")),
+            ("yarn.lock", text("__metadata:\n  version: 8\n")),
+        ]);
+        assert_eq!(
+            detect_npm_lock_flavor_in(&ProjectView::Memory(&stale))
+                .await
+                .unwrap()
+                .0,
+            NpmLockFlavor::YarnBerry
         );
         let pnp = project(&[(".pnp.cjs", MemoryEntry::Present), ("yarn.lock", text(""))]);
         assert_eq!(

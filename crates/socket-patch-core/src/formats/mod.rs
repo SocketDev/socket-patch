@@ -26,13 +26,13 @@
 //! [`registry()`] is the one table of which project files carry a lock or
 //! its wiring, and in which roles.
 
+pub(crate) mod bun;
 pub mod cargo;
 pub mod composer;
 pub mod gem;
 pub(crate) mod maven;
 pub(crate) mod nuget;
 pub mod pnpm;
-pub(crate) mod bun;
 pub mod registry;
 pub mod yarn;
 
@@ -81,7 +81,11 @@ mod architecture_tests {
                 .filter(|l| !l.trim_start().starts_with("//"))
                 .collect::<Vec<_>>()
                 .join("\n");
-            let used: Vec<&str> = IMPURE.iter().copied().filter(|n| code.contains(n)).collect();
+            let used: Vec<&str> = IMPURE
+                .iter()
+                .copied()
+                .filter(|n| code.contains(n))
+                .collect();
             assert!(
                 used.is_empty(),
                 "{}: a format model uses {used:?} — models are pure (module docs)",

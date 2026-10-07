@@ -73,7 +73,8 @@ pub enum NpmPkgManager {
 ///
 /// Precedence (first match wins):
 ///
-/// 1. `.pnp.cjs`, `.pnp.js`, or `.pnp.loader.mjs` → yarn-berry PnP —
+/// 1. `.pnp.cjs`, `.pnp.js`, or `.pnp.loader.mjs`, while the configured
+///    yarn `nodeLinker` is `pnp` or unset ([`live_pnp_marker`]) → yarn-berry PnP —
 ///    unless the tree is pnpm's own `node-linker=pnp` layout (see
 ///    [`pnpm_pnp_layout`]), which also writes a `.pnp.cjs` but keeps
 ///    real package dirs in the pnpm virtual store → pnpm.
@@ -102,10 +103,7 @@ pub fn detect_npm_pkg_manager(project_root: &Path) -> NpmPkgManager {
     //    mean "packages aren't on disk" — refuse rather than silently
     //    fall through to Unknown (a Yarn 2 PnP tree has no
     //    `node_modules/`, so it would otherwise escape the refusal).
-    if crate::constants::npm_family::PNP_MARKERS
-        .iter()
-        .any(|m| project_root.join(m).is_file())
-    {
+    if live_pnp_marker(project_root, |m| project_root.join(m).is_file()).is_some() {
         // Carve-out: pnpm has its OWN PnP mode (`node-linker=pnp` in
         // `.npmrc`) which also writes a `.pnp.cjs` loader at the root
         // — but unlike yarn-berry the packages are real directories in
@@ -163,6 +161,58 @@ pub fn detect_npm_pkg_manager(project_root: &Path) -> NpmPkgManager {
     NpmPkgManager::Unknown
 }
 
+/// The `nodeLinker` yarn resolves for `project_root`: `YARN_NODE_LINKER`
+/// when set (yarn lets every setting be overridden from the environment),
+/// else the nearest `.yarnrc.yml` at or above the project that sets
+/// `nodeLinker` (yarn merges every rc file up to the filesystem root, the
+/// closest winning). `None` when nothing sets it: yarn berry then uses its
+/// default linker, `pnp`.
+pub fn yarn_node_linker(project_root: &Path) -> Option<String> {
+    yarn_node_linker_with(project_root, std::env::var("YARN_NODE_LINKER").ok())
+}
+
+fn yarn_node_linker_with(project_root: &Path, env: Option<String>) -> Option<String> {
+    if let Some(linker) = env.map(|v| v.trim().to_string()).filter(|v| !v.is_empty()) {
+        return Some(linker);
+    }
+    let start = std::path::absolute(project_root).unwrap_or_else(|_| project_root.to_path_buf());
+    start.ancestors().find_map(|dir| {
+        let rc = crate::utils::fs::read_regular_to_string_sync(&dir.join(".yarnrc.yml")).ok()?;
+        crate::vendor::yarn_berry_lock::yarnrc_scalar(&rc, "nodeLinker")
+            .filter(|v| !v.is_empty())
+            .map(str::to_string)
+    })
+}
+
+/// Whether a yarn `nodeLinker` setting (`None` = unset) is Plug'n'Play:
+/// `pnp` itself, or nothing set at all (berry's default).
+pub fn yarn_linker_is_pnp(linker: Option<&str>) -> bool {
+    linker.is_none_or(|l| l == "pnp")
+}
+
+/// The PnP loader file that makes `project_root` a live yarn Plug'n'Play
+/// tree, as `exists` sees the files, or `None`. A loader only counts while
+/// the configured linker is still `pnp` (or unset): a Yarn 2 → Yarn 4
+/// migration that switched `nodeLinker` to `node-modules` or `pnpm` keeps
+/// the old `.pnp.js`, which yarn ignores, and so must every caller (#975).
+/// Every `PNP_MARKERS` decision goes through here or
+/// [`live_pnp_marker_with`].
+pub fn live_pnp_marker(project_root: &Path, exists: impl Fn(&str) -> bool) -> Option<&'static str> {
+    live_pnp_marker_with(|| yarn_node_linker(project_root), exists)
+}
+
+/// [`live_pnp_marker`] over any file view: `linker` supplies the configured
+/// `nodeLinker`, only asked for when a loader file exists.
+pub fn live_pnp_marker_with(
+    linker: impl FnOnce() -> Option<String>,
+    exists: impl Fn(&str) -> bool,
+) -> Option<&'static str> {
+    let marker = crate::constants::npm_family::PNP_MARKERS
+        .into_iter()
+        .find(|m| exists(m))?;
+    yarn_linker_is_pnp(linker().as_deref()).then_some(marker)
+}
+
 /// Is a PnP-marker-bearing project root actually pnpm's own PnP mode
 /// (`node-linker=pnp` in `.npmrc`) rather than yarn-berry?
 ///
@@ -194,6 +244,73 @@ pub(crate) fn pnpm_pnp_layout(project_root: &Path) -> bool {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    /// #975: yarn 4 keeps a Yarn 2 `.pnp.js` after a switch to the
+    /// node-modules or pnpm linker; yarn ignores it, so must detection.
+    #[test]
+    fn stale_pnp_loader_under_non_pnp_linker_is_not_pnp() {
+        for linker in ["node-modules", "pnpm", "'node-modules' # migrated"] {
+            let d = tempfile::tempdir().unwrap();
+            std::fs::create_dir_all(d.path().join("node_modules")).unwrap();
+            std::fs::write(d.path().join("yarn.lock"), "__metadata:\n").unwrap();
+            std::fs::write(d.path().join(".pnp.js"), "").unwrap();
+            std::fs::write(
+                d.path().join(".yarnrc.yml"),
+                format!("nodeLinker: {linker}\n"),
+            )
+            .unwrap();
+            assert_eq!(
+                live_pnp_marker_with(
+                    || yarn_node_linker_with(d.path(), None),
+                    |m| d.path().join(m).is_file()
+                ),
+                None,
+                "{linker}"
+            );
+        }
+    }
+
+    #[test]
+    fn pnp_loader_counts_under_pnp_or_unset_linker() {
+        let d = tempfile::tempdir().unwrap();
+        std::fs::write(d.path().join(".pnp.cjs"), "").unwrap();
+        let exists = |m: &str| d.path().join(m).is_file();
+        assert_eq!(
+            live_pnp_marker_with(|| yarn_node_linker_with(d.path(), None), exists),
+            Some(".pnp.cjs")
+        );
+        std::fs::write(d.path().join(".yarnrc.yml"), "nodeLinker: \"pnp\"\n").unwrap();
+        assert_eq!(
+            live_pnp_marker_with(|| yarn_node_linker_with(d.path(), None), exists),
+            Some(".pnp.cjs")
+        );
+    }
+
+    /// yarn's own precedence: the env var, then the nearest rc file that
+    /// sets the key, walking up past rc files that don't.
+    #[test]
+    fn yarn_node_linker_follows_yarn_precedence() {
+        let d = tempfile::tempdir().unwrap();
+        let member = d.path().join("packages/a");
+        std::fs::create_dir_all(&member).unwrap();
+        assert_eq!(yarn_node_linker_with(&member, None), None);
+        std::fs::write(d.path().join(".yarnrc.yml"), "nodeLinker: node-modules\n").unwrap();
+        std::fs::write(member.join(".yarnrc.yml"), "enableGlobalCache: false\n").unwrap();
+        assert_eq!(
+            yarn_node_linker_with(&member, None).as_deref(),
+            Some("node-modules")
+        );
+        std::fs::write(member.join(".yarnrc.yml"), "nodeLinker: pnp\n").unwrap();
+        assert_eq!(yarn_node_linker_with(&member, None).as_deref(), Some("pnp"));
+        assert_eq!(
+            yarn_node_linker_with(&member, Some(" pnpm ".into())).as_deref(),
+            Some("pnpm")
+        );
+        assert_eq!(
+            yarn_node_linker_with(&member, Some(String::new())).as_deref(),
+            Some("pnp")
+        );
+    }
 
     #[test]
     fn unknown_for_empty_dir() {
