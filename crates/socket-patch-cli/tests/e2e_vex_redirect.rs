@@ -2299,6 +2299,12 @@ fn bun_hosted_ref_is_judged_by_a_global_store_copy() {
 /// (real Bun 1.3.14 / 1.4.2 layout). Nothing can load the orphan, so it is
 /// no installed copy: the patched live copy attests, where vex used to
 /// refuse the patch as `not_applied` until `rm -rf node_modules`.
+///
+/// With Bun's global store (#635, `globalStore = true`) every `.bun` entry
+/// is instead an absolute link into `<cache>/links/<entry>-<hash>`, and
+/// the dependency entry's cache dir links left-pad at its sibling cache
+/// dir, never back into `.bun`; Bun leaves the orphaned link behind just
+/// the same, and it is no copy either.
 #[cfg(unix)]
 #[test]
 fn bun_hosted_ref_ignores_orphaned_registry_store_entry() {
@@ -2308,76 +2314,99 @@ fn bun_hosted_ref_ignores_orphaned_registry_store_entry() {
     );
     let purl = "pkg:npm/left-pad@1.3.0";
     let url = hosted_npm_url("left-pad", "1.3.0", UUID);
-    let tmp = tempfile::tempdir().unwrap();
-    let cwd = tmp.path();
-    put(
-        cwd,
-        "package.json",
-        br#"{ "name": "app", "version": "1.0.0", "dependencies": { "dep": "1.0.0" } }"#,
-    );
-    put(
-        cwd,
-        "bun.lock",
-        format!(
-            "{{\n  \"lockfileVersion\": 1,\n  \"workspaces\": {{\n    \"\": {{\n      \
-             \"name\": \"app\",\n      \"dependencies\": {{\n        \"dep\": \"1.0.0\",\n      \
-             }},\n    }},\n  }},\n  \"packages\": {{\n    \
-             \"dep\": [\"dep@1.0.0\", \"\", {{ \"dependencies\": {{ \"left-pad\": \"1.3.0\" }} }}, \
-             \"sha512-{dep}==\"],\n\n    \
-             \"left-pad\": [\"left-pad@{url}\", {{}}, \"{SRI}\"],\n  }}\n}}\n",
-            dep = "D".repeat(86),
-        )
-        .as_bytes(),
-    );
-    let live_entry = format!("left-pad@{}", url.replace([':', '/'], "+"));
-    for (entry, bytes) in [("left-pad@1.3.0", pristine), (live_entry.as_str(), patched)] {
-        let store = format!("node_modules/.bun/{entry}/node_modules/left-pad");
+    for global in [false, true] {
+        let tmp = tempfile::tempdir().unwrap();
+        let cwd = &tmp.path().join("app");
         put(
             cwd,
-            &format!("{store}/package.json"),
-            br#"{ "name": "left-pad", "version": "1.3.0" }"#,
+            "package.json",
+            br#"{ "name": "app", "version": "1.0.0", "dependencies": { "dep": "1.0.0" } }"#,
         );
-        put(cwd, &format!("{store}/index.js"), bytes);
-    }
-    put(
-        cwd,
-        "node_modules/.bun/dep@1.0.0/node_modules/dep/package.json",
-        br#"{ "name": "dep", "version": "1.0.0" }"#,
-    );
-    let link = |target: String, at: &str| {
-        let at = cwd.join(at);
-        std::fs::create_dir_all(at.parent().unwrap()).unwrap();
-        std::os::unix::fs::symlink(target, at).unwrap();
-    };
-    link(
-        format!("../../{live_entry}/node_modules/left-pad"),
-        "node_modules/.bun/dep@1.0.0/node_modules/left-pad",
-    );
-    link(
-        format!("../{live_entry}/node_modules/left-pad"),
-        "node_modules/.bun/node_modules/left-pad",
-    );
-    link(
-        "../dep@1.0.0/node_modules/dep".to_string(),
-        "node_modules/.bun/node_modules/dep",
-    );
-    link(
-        ".bun/dep@1.0.0/node_modules/dep".to_string(),
-        "node_modules/dep",
-    );
-    let (_rt, server) = serve_patch_views(vec![(
-        UUID.to_string(),
-        one_file_view(UUID, purl, "package/index.js", pristine, patched),
-    )]);
+        put(
+            cwd,
+            "bun.lock",
+            format!(
+                "{{\n  \"lockfileVersion\": 1,\n  \"workspaces\": {{\n    \"\": {{\n      \
+                 \"name\": \"app\",\n      \"dependencies\": {{\n        \"dep\": \"1.0.0\",\n      \
+                 }},\n    }},\n  }},\n  \"packages\": {{\n    \
+                 \"dep\": [\"dep@1.0.0\", \"\", {{ \"dependencies\": {{ \"left-pad\": \"1.3.0\" }} }}, \
+                 \"sha512-{dep}==\"],\n\n    \
+                 \"left-pad\": [\"left-pad@{url}\", {{}}, \"{SRI}\"],\n  }}\n}}\n",
+                dep = "D".repeat(86),
+            )
+            .as_bytes(),
+        );
+        let live_entry = format!("left-pad@{}", url.replace([':', '/'], "+"));
+        // Where each `.bun` entry's files live: the store itself, or a
+        // global store cache dir the entry links to.
+        let entry_dir = |entry: &str, hash: &str| {
+            if global {
+                let shared = tmp.path().join(format!("bun-cache/links/{entry}-{hash}"));
+                std::fs::create_dir_all(&shared).unwrap();
+                std::fs::create_dir_all(cwd.join("node_modules/.bun")).unwrap();
+                std::os::unix::fs::symlink(&shared, cwd.join("node_modules/.bun").join(entry))
+                    .unwrap();
+                shared
+            } else {
+                cwd.join("node_modules/.bun").join(entry)
+            }
+        };
+        for (entry, hash, bytes) in [
+            ("left-pad@1.3.0", "6a490709ba3c5c8f", pristine),
+            (live_entry.as_str(), "70aa8f1dde99846b", patched),
+        ] {
+            let dir = entry_dir(entry, hash);
+            put(
+                &dir,
+                "node_modules/left-pad/package.json",
+                br#"{ "name": "left-pad", "version": "1.3.0" }"#,
+            );
+            put(&dir, "node_modules/left-pad/index.js", bytes);
+        }
+        let dep = entry_dir("dep@1.0.0", "59cbc6610791e74a");
+        put(
+            &dep,
+            "node_modules/dep/package.json",
+            br#"{ "name": "dep", "version": "1.0.0" }"#,
+        );
+        let link = |target: String, at: &Path| {
+            std::fs::create_dir_all(at.parent().unwrap()).unwrap();
+            std::os::unix::fs::symlink(target, at).unwrap();
+        };
+        link(
+            if global {
+                format!("../../{live_entry}-70aa8f1dde99846b/node_modules/left-pad")
+            } else {
+                format!("../../{live_entry}/node_modules/left-pad")
+            },
+            &dep.join("node_modules/left-pad"),
+        );
+        link(
+            format!("../{live_entry}/node_modules/left-pad"),
+            &cwd.join("node_modules/.bun/node_modules/left-pad"),
+        );
+        link(
+            "../dep@1.0.0/node_modules/dep".to_string(),
+            &cwd.join("node_modules/.bun/node_modules/dep"),
+        );
+        link(
+            ".bun/dep@1.0.0/node_modules/dep".to_string(),
+            &cwd.join("node_modules/dep"),
+        );
+        let (_rt, server) = serve_patch_views(vec![(
+            UUID.to_string(),
+            one_file_view(UUID, purl, "package/index.js", pristine, patched),
+        )]);
 
-    let (code, env) = vex_json(cwd, &["--proxy-url", &server.uri()]);
-    assert_attested(
-        cwd,
-        code,
-        &env,
-        UUID,
-        "the orphaned registry entry is no copy",
-    );
+        let (code, env) = vex_json(cwd, &["--proxy-url", &server.uri()]);
+        assert_attested(
+            cwd,
+            code,
+            &env,
+            UUID,
+            &format!("global store {global}: the orphaned registry entry is no copy"),
+        );
+    }
 }
 
 /// The patch view for `name@version` (the [`left_pad_view`] shape).
