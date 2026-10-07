@@ -140,6 +140,16 @@ pub struct VendorPathParts {
 /// This is the documented external-tool recovery rule; `None` means the
 /// string is not a Socket-vendored path.
 pub fn parse_vendor_path(s: &str) -> Option<VendorPathParts> {
+    parse_vendor_reference(s).filter(|parts| !parts.leaf.is_empty())
+}
+
+/// [`parse_vendor_path`]'s grammar, also accepting a reference to the uuid
+/// directory itself (`leaf` empty): NuGet's vendored feed
+/// (`value=".socket/vendor/nuget/<uuid>"`) and Maven's vendored repository
+/// (`<url>file://${project.basedir}/.socket/vendor/maven/<uuid></url>`)
+/// name the unit, not a file inside it. The vendored-reference scan reads
+/// wiring through this, so a directory-wired unit counts as still wired.
+pub fn parse_vendor_reference(s: &str) -> Option<VendorPathParts> {
     let norm = s.replace('\\', "/");
     let norm = norm.strip_prefix("file:").unwrap_or(&norm);
     let norm = norm.strip_prefix("./").unwrap_or(norm);
@@ -155,8 +165,8 @@ pub fn parse_vendor_path(s: &str) -> Option<VendorPathParts> {
     let mut it = rest.splitn(3, '/');
     let eco = it.next()?;
     let uuid = it.next()?;
-    let leaf = it.next()?.trim_end_matches('/');
-    if !ECOSYSTEM_DIRS.contains(&eco) || !is_canonical_uuid(uuid) || leaf.is_empty() {
+    let leaf = it.next().unwrap_or("").trim_end_matches('/');
+    if !ECOSYSTEM_DIRS.contains(&eco) || !is_canonical_uuid(uuid) {
         return None;
     }
     Some(VendorPathParts {
@@ -637,6 +647,32 @@ mod tests {
         assert!(parse_vendor_path(".socket/vendor/npm/not-a-uuid/x.tgz").is_none());
         assert!(parse_vendor_path(&format!(".socket/vendor/jsr/{UUID}/x")).is_none());
         assert!(parse_vendor_path(&format!("x.socket/vendor/npm/{UUID}/y.tgz")).is_none());
+    }
+
+    /// `parse_vendor_reference` is `parse_vendor_path`'s grammar plus the
+    /// bare uuid dir (NuGet's feed, Maven's repository); `parse_vendor_path`
+    /// itself still needs a leaf.
+    #[test]
+    fn parse_vendor_reference_accepts_the_uuid_dir_itself() {
+        for s in [
+            format!(".socket/vendor/nuget/{UUID}"),
+            format!(".socket/vendor/nuget/{UUID}/"),
+            format!(".socket\\vendor\\nuget\\{UUID}"),
+            format!("file://${{project.basedir}}/.socket/vendor/nuget/{UUID}"),
+        ] {
+            let p = parse_vendor_reference(&s).unwrap_or_else(|| panic!("{s}"));
+            assert_eq!(
+                (p.eco.as_str(), p.uuid.as_str(), p.leaf.as_str()),
+                ("nuget", UUID, "")
+            );
+            assert!(parse_vendor_path(&s).is_none(), "{s}");
+        }
+        let p = parse_vendor_reference(&format!(".socket/vendor/npm/{UUID}/a/b.tgz")).unwrap();
+        assert_eq!(p.leaf, "a/b.tgz");
+        assert!(parse_vendor_reference(".socket/vendor/nuget").is_none());
+        assert!(parse_vendor_reference(".socket/vendor/nuget/not-a-uuid").is_none());
+        assert!(parse_vendor_reference(&format!(".socket/vendor/maven2/{UUID}")).is_none());
+        assert!(parse_vendor_reference(&format!("x.socket/vendor/nuget/{UUID}")).is_none());
     }
 
     /// The re-vendor carry-forward matches wiring keys ACROSS a patch-uuid

@@ -111,8 +111,9 @@ The backticked slug in each row is the value `-e`/`--ecosystems` accepts (e.g.
   is e2e-covered; PnP is untested for hosted — the lock rewrite fires, but PnP's
   `.yarn/cache` resolution isn't exercised. CRLF locks — what yarn writes on Windows,
   and what a `core.autocrlf` checkout produces anywhere — are rewritten in their own
-  line ending (a BOM is kept); a lock mixing CRLF and LF is refused
-  (`redirect_yarn_berry_mixed_line_endings`) until `yarn install` normalizes it. See
+  line ending (a BOM is kept); a lock or root `package.json` mixing CRLF and LF is
+  refused (`redirect_yarn_berry_mixed_line_endings`, the same decision vendored mode
+  takes) until `yarn install` normalizes it. See
   [yarn berry compatibility](testing/yarn-berry-compatibility.md).
 - **yarn `npm:` aliases (classic & berry)** — a lock entry that consumes the patched
   package only through an alias descriptor (`"safe-pad@npm:left-pad@^1.3.0"`) is left
@@ -121,6 +122,11 @@ The backticked slug in each row is the value `-e`/`--ecosystems` accepts (e.g.
   unpatched artifact. The reverse shape — an alias of the patched NAME pointing at a
   different package (`"left-pad@npm:some-fork@^1.3.0"`, the fork-substitution idiom) —
   is never rewritten: it resolves a different package.
+- **yarn classic and yarn 2+** — installing with yarn 2+ (berry) migrates a classic (v1)
+  `yarn.lock` and re-resolves every entry from the registry, dropping hosted pins and
+  vendored wiring alike, so the packages install unpatched. A run that leaves such a pin
+  warns (`redirect_yarn_classic_berry_migration_risk` / `yarn_classic_berry_migration_risk`)
+  unless `package.json` pins yarn classic through `"packageManager": "yarn@1…"`.
 - **yarn classic git dependencies** — yarn 1 fetches a git pattern (`git+https:`,
   `git+ssh:`, `git:`, `ssh:`, a `….git` url, or a bare `https://github.com/<owner>/<repo>`)
   with git, using the lock entry's `resolved` as the remote, so a rewritten `resolved`
