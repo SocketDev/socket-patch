@@ -219,7 +219,9 @@ async fn maven_prelude(
 }
 
 /// Whether [`vendor_maven`] — a wet run with the service enabled — asks the
-/// patch service for `record`: past every refusal it raises first and not
+/// patch service for `record`: past every refusal and skip it raises first
+/// (`not_build_root`, and for a JVM shape [`jvm_prelude`]'s coordinate,
+/// ledger and sbt / scala-cli gate stops), not the empty patch, and not
 /// answered by the in-sync hot path. The vendor loop's download plan
 /// consults this.
 pub(crate) async fn service_preflight(
@@ -227,7 +229,12 @@ pub(crate) async fn service_preflight(
     project_root: &Path,
     record: &PatchRecord,
 ) -> Option<crate::api::client::PlannedDownload> {
+    if not_build_root(project_root).is_some() {
+        return None;
+    }
     if let Some(shape) = jvm_shape(project_root).await {
+        jvm_prelude(shape, purl, project_root, record).await.ok()?;
+        (!record.files.is_empty()).then_some(())?;
         jvm_committed_patch(shape, purl, project_root, record)
             .await
             .is_none()
@@ -1007,7 +1014,8 @@ struct JvmPrelude {
 
 /// Every refusal and skip [`vendor_maven_jvm`] raises before it can first
 /// ask the patch service (bar the empty patch's no-op and the committed
-/// tree's hot path).
+/// tree's hot path), so its download plan ([`service_preflight`]) grants
+/// nothing the vendor loop then stops short of.
 async fn jvm_prelude(
     shape: super::jvm::Shape,
     purl: &str,
@@ -2405,6 +2413,72 @@ mod tests {
         match o {
             VendorOutcome::Refused { code, detail } => (code, detail),
             VendorOutcome::Done { result, .. } => panic!("not refused: {result:?}"),
+        }
+    }
+
+    /// The JVM shapes' plan entry asks for a grant exactly when the JVM
+    /// backend would: never for a Gradle subproject (`not_build_root`) nor
+    /// for an sbt build the resolution gate skips, both of which stop
+    /// before the service is asked; a Gradle root does ask. A granted
+    /// download the loop then skips is a leaked server-side build.
+    #[tokio::test]
+    #[serial_test::serial]
+    async fn jvm_service_preflight_matches_what_the_backend_asks_for() {
+        use crate::vendor::test_support::{granted_uuids, mount_no_results, service_cfg};
+        let server = wiremock::MockServer::start().await;
+        mount_no_results(&server).await;
+        let cfg = service_cfg(&server.uri(), crate::vendor::VendorSource::Service, false);
+
+        let (sub_dir, blobs, installed, record) = fixture(None, true, true).await;
+        std::fs::create_dir_all(sub_dir.path().join(".git")).unwrap();
+        std::fs::write(sub_dir.path().join("settings.gradle"), "include 'app'\n").unwrap();
+        let subproject = sub_dir.path().join("app");
+        std::fs::create_dir_all(&subproject).unwrap();
+        std::fs::write(subproject.join("build.gradle"), "plugins { id 'java' }\n").unwrap();
+
+        let (sbt_dir, ..) = fixture(None, true, true).await;
+        std::fs::create_dir_all(sbt_dir.path().join("project")).unwrap();
+        std::fs::write(
+            sbt_dir.path().join("build.sbt"),
+            "scalaVersion := \"2.13.12\"\n",
+        )
+        .unwrap();
+        std::fs::write(
+            sbt_dir.path().join("project/build.properties"),
+            "sbt.version=1.9.7\n",
+        )
+        .unwrap();
+
+        let (gradle_dir, ..) = fixture(None, true, true).await;
+        std::fs::write(
+            gradle_dir.path().join("build.gradle"),
+            "plugins { id 'java' }\n",
+        )
+        .unwrap();
+
+        let sources = PatchSources::blobs_only(&blobs);
+        for (project, asks) in [
+            (subproject.as_path(), false),
+            (sbt_dir.path(), false),
+            (gradle_dir.path(), true),
+        ] {
+            let planned = service_preflight(PURL, project, &record).await.is_some();
+            let before = granted_uuids(&server).await.len();
+            let _ = crate::vendor::test_support::vendor_maven(
+                PURL,
+                installed.as_path(),
+                project,
+                &record,
+                &sources,
+                "2026-06-09T00:00:00Z",
+                false,
+                false,
+                Some(&cfg),
+            )
+            .await;
+            let asked = granted_uuids(&server).await.len() > before;
+            assert_eq!(asked, asks, "{}: the backend's own ask", project.display());
+            assert_eq!(planned, asked, "{}: plan vs backend", project.display());
         }
     }
 
