@@ -162,7 +162,8 @@ fn npm_family_global_probes_find_the_installed_shims() {
     let bun_bin = l.home.join(".bun").join("bin");
     fake_tool(&l.bin, "npm", Some(&npm_root.to_string_lossy()));
     fake_tool(&l.bin, "pnpm", Some(&pnpm_root.to_string_lossy()));
-    fake_tool(&l.bin, "bun", Some(&bun_bin.to_string_lossy()));
+    let bun_global = l.home.join(".bun").join("install").join("global");
+    fake_bun(&l.bin, &bun_bin, &bun_global);
     let mut env = Env::new();
     point_env_at(&mut env, &l);
 
@@ -174,13 +175,7 @@ fn npm_family_global_probes_find_the_installed_shims() {
     assert_eq!(get_pnpm_global_prefix().map(PathBuf::from), Some(pnpm_root));
     assert_eq!(
         get_bun_global_prefix().map(PathBuf::from),
-        Some(
-            l.home
-                .join(".bun")
-                .join("install")
-                .join("global")
-                .join("node_modules")
-        )
+        Some(bun_global.join("node_modules"))
     );
 }
 
@@ -365,4 +360,160 @@ async fn composer_home_falls_back_to_xdg_config_home() {
         .await
         .unwrap();
     assert_eq!(paths, vec![vendor]);
+}
+
+// ──────────────────────────── bun global dir (#443) ────────────────────────────
+
+/// A fake `bun` that answers like real Bun with `BUN_INSTALL_BIN` and/or
+/// `BUN_INSTALL_GLOBAL_DIR` set: `bun pm bin -g` prints the (relocated)
+/// bin dir, `bun pm ls -g` heads its tree with the global dir the packages
+/// actually live in (`<dir> node_modules (N installed)` on 1.4.x).
+fn fake_bun(bin: &Path, bin_dir: &Path, global_dir: &Path) {
+    std::fs::create_dir_all(bin).unwrap();
+    let (bin_dir, global_dir) = (bin_dir.display(), global_dir.display());
+    #[cfg(unix)]
+    {
+        use std::os::unix::fs::PermissionsExt;
+        let path = bin.join("bun");
+        std::fs::write(
+            &path,
+            format!(
+                "#!/bin/sh\n\
+                 if [ \"$2\" = ls ]; then\n\
+                 printf '%s\\n' '{global_dir} node_modules (1 installed)' '└── semver@7.6.0'\n\
+                 else\n\
+                 printf '%s\\n' '{bin_dir}'\n\
+                 fi\n"
+            ),
+        )
+        .unwrap();
+        std::fs::set_permissions(&path, std::fs::Permissions::from_mode(0o755)).unwrap();
+    }
+    #[cfg(windows)]
+    std::fs::write(
+        bin.join("bun.cmd"),
+        format!(
+            "@echo off\r\n\
+             if \"%2\"==\"ls\" goto ls\r\n\
+             echo {bin_dir}\r\n\
+             exit /b 0\r\n\
+             :ls\r\n\
+             echo {global_dir} node_modules ^(1 installed^)\r\n\
+             echo semver@7.6.0\r\n"
+        ),
+    )
+    .unwrap();
+}
+
+/// #443: with `BUN_INSTALL_BIN` moved (here to `~/.local/bin`), the global
+/// packages stay in `$BUN_INSTALL/install/global/node_modules`. The probe
+/// must report where Bun keeps the packages, not guess `<bin>/..`.
+#[test]
+#[serial]
+fn bun_global_probe_ignores_a_relocated_bin_dir() {
+    let l = layout();
+    let global = l.home.join(".bun").join("install").join("global");
+    fake_bun(&l.bin, &l.home.join(".local").join("bin"), &global);
+    let mut env = Env::new();
+    point_env_at(&mut env, &l);
+
+    assert_eq!(
+        get_bun_global_prefix().map(PathBuf::from),
+        Some(global.join("node_modules"))
+    );
+}
+
+/// #443: with `BUN_INSTALL_GLOBAL_DIR` set, `bun pm bin -g` still prints
+/// the default bin dir, while the packages live in `<dir>/node_modules`.
+#[test]
+#[serial]
+fn bun_global_probe_follows_bun_install_global_dir() {
+    let l = layout();
+    let global = l.home.join("gdir with space ü");
+    fake_bun(&l.bin, &l.home.join(".bun").join("bin"), &global);
+    let mut env = Env::new();
+    point_env_at(&mut env, &l);
+
+    assert_eq!(
+        get_bun_global_prefix().map(PathBuf::from),
+        Some(global.join("node_modules"))
+    );
+}
+
+/// #443: with no `bun` to ask, Bun's own resolution of its global dir is
+/// followed (`BUN_INSTALL_GLOBAL_DIR`, then `$BUN_INSTALL/install/global`,
+/// then `$XDG_CACHE_HOME/.bun/install/global`, then `~/.bun/install/global`),
+/// so a global scan still finds the packages instead of reporting a clean,
+/// empty result.
+#[tokio::test]
+#[serial]
+async fn bun_global_dir_falls_back_to_bun_env_resolution() {
+    use socket_patch_core::crawlers::NpmCrawler;
+
+    let l = layout();
+    let mut env = Env::new();
+    point_env_at(&mut env, &l);
+    let nm = |dir: &Path| {
+        let nm = dir.join("node_modules");
+        std::fs::create_dir_all(nm.join("semver")).unwrap();
+        nm
+    };
+    let explicit = nm(&l.home.join("gdir"));
+    let bun_install = nm(&l.home.join("bun-install").join("install").join("global"));
+    let xdg = nm(&l
+        .home
+        .join("xdg")
+        .join(".bun")
+        .join("install")
+        .join("global"));
+    let home = nm(&l.home.join(".bun").join("install").join("global"));
+    let cases: [(&[(&'static str, PathBuf)], &PathBuf); 4] = [
+        (
+            &[
+                ("BUN_INSTALL_GLOBAL_DIR", l.home.join("gdir")),
+                ("BUN_INSTALL", l.home.join("bun-install")),
+                ("XDG_CACHE_HOME", l.home.join("xdg")),
+            ],
+            &explicit,
+        ),
+        (
+            &[
+                ("BUN_INSTALL", l.home.join("bun-install")),
+                ("XDG_CACHE_HOME", l.home.join("xdg")),
+            ],
+            &bun_install,
+        ),
+        (&[("XDG_CACHE_HOME", l.home.join("xdg"))], &xdg),
+        (&[], &home),
+    ];
+    for (vars, want) in cases {
+        let mut case_env = Env::new();
+        for name in ["BUN_INSTALL_GLOBAL_DIR", "BUN_INSTALL", "XDG_CACHE_HOME"] {
+            let value = vars.iter().find(|(n, _)| *n == name).map(|(_, v)| v);
+            case_env.set(name, value.map(|v| v.as_os_str()));
+        }
+        let paths = NpmCrawler
+            .get_node_modules_paths(&CrawlerOptions {
+                cwd: l.proj.clone(),
+                global: true,
+                global_prefix: None,
+            })
+            .await
+            .unwrap();
+        assert!(
+            paths.contains(want),
+            "{vars:?}: global paths must include {}; got {paths:?}",
+            want.display()
+        );
+        for other in [&explicit, &bun_install, &xdg, &home] {
+            if other != want {
+                assert!(
+                    !paths.contains(other),
+                    "{vars:?}: Bun does not use {}; got {paths:?}",
+                    other.display()
+                );
+            }
+        }
+        drop(case_env);
+    }
 }

@@ -1227,45 +1227,77 @@ pub fn parse_pnpm_root_output(stdout: &str) -> Option<String> {
     Some(path)
 }
 
-/// Get the bun global `node_modules` path via `bun pm bin -g`.
+/// Get the bun global `node_modules` path: the global dir `bun pm ls -g`
+/// reports, else (no `bun` to ask, or an answer we can't read) the one
+/// Bun's own resolution picks from the environment, see
+/// [`bun_global_dir_from_env`].
+///
+/// The packages' dir is never derived from `bun pm bin -g` (#443): Bun
+/// moves its bin dir (`BUN_INSTALL_BIN`, bunfig `globalBinDir`) and its
+/// global dir (`BUN_INSTALL_GLOBAL_DIR`) independently, so `<bin>/..`
+/// named a dir that didn't exist and every Bun global vanished from a
+/// global scan.
 pub fn get_bun_global_prefix() -> Option<String> {
-    get_bun_global_prefix_with(&GlobalProbeRunner)
+    get_bun_global_prefix_with(&GlobalProbeRunner).or_else(|| {
+        bun_global_dir_from_env(&|var| std::env::var_os(var))
+            .map(|dir| dir.join("node_modules").to_string_lossy().to_string())
+    })
 }
 
 /// Version of `get_bun_global_prefix` that accepts an injected
-/// `CommandRunner`. See `get_npm_global_prefix_with`.
+/// `CommandRunner` and only asks `bun` (no environment fallback). See
+/// `get_npm_global_prefix_with`.
 pub fn get_bun_global_prefix_with(runner: &dyn CommandRunner) -> Option<String> {
-    parse_bun_bin_output(
+    parse_bun_ls_global_output(
         runner
-            .run("bun", &["pm", "bin", "-g"])
+            .run("bun", &["pm", "ls", "-g"])
             .as_deref()
             .unwrap_or(""),
     )
 }
 
-/// Pure parser for `bun pm bin -g` stdout. Extracted so the
-/// derive-the-global-node_modules-path logic is unit-testable
-/// without shelling out.
-///
-/// Given output like `"/Users/foo/.bun/bin\n"` returns
-/// `Some("/Users/foo/.bun/install/global/node_modules")`. Returns
-/// `None` on empty input or a root-only path with no parent.
-pub fn parse_bun_bin_output(stdout: &str) -> Option<String> {
-    let bin_path = stdout.trim().to_string();
-    if bin_path.is_empty() {
+/// Pure parser for `bun pm ls -g` stdout, whose first line names the
+/// global dir: `<dir> node_modules (N)` (Bun 1.0 - 1.3) or
+/// `<dir> node_modules (N installed)` (1.4). Returns `<dir>/node_modules`,
+/// or `None` when the first line has no such shape. The dir may itself
+/// contain spaces, so the LAST ` node_modules (` splits it off.
+pub fn parse_bun_ls_global_output(stdout: &str) -> Option<String> {
+    let first = stdout.trim().lines().next()?;
+    let (dir, _) = first.rsplit_once(" node_modules (")?;
+    let dir = dir.trim();
+    if dir.is_empty() {
         return None;
     }
-
-    let bun_root = PathBuf::from(&bin_path);
-    let bun_root = bun_root.parent()?;
     Some(
-        bun_root
-            .join("install")
-            .join("global")
+        PathBuf::from(dir)
             .join("node_modules")
             .to_string_lossy()
             .to_string(),
     )
+}
+
+/// The global dir Bun installs `bun add -g` packages into, resolved the way
+/// Bun does it (`openGlobalDir`): `BUN_INSTALL_GLOBAL_DIR`, else
+/// `$BUN_INSTALL/install/global`, else `.bun/install/global` under
+/// `XDG_CACHE_HOME` or the home dir (`USERPROFILE` on Windows).
+///
+/// A set-but-empty or relative variable counts as unset, the same rule as
+/// `composer_home_candidates`: it would otherwise name a dir relative to
+/// the scanned project.
+pub fn bun_global_dir_from_env(var: &impl Fn(&str) -> Option<OsString>) -> Option<PathBuf> {
+    let absolute = |name: &str| {
+        var(name)
+            .map(PathBuf::from)
+            .filter(|path| path.is_absolute())
+    };
+    let home_var = if cfg!(windows) { "USERPROFILE" } else { "HOME" };
+    absolute("BUN_INSTALL_GLOBAL_DIR")
+        .or_else(|| absolute("BUN_INSTALL").map(|dir| dir.join("install").join("global")))
+        .or_else(|| {
+            absolute("XDG_CACHE_HOME")
+                .or_else(|| absolute(home_var))
+                .map(|dir| dir.join(".bun").join("install").join("global"))
+        })
 }
 
 // ---------------------------------------------------------------------------
