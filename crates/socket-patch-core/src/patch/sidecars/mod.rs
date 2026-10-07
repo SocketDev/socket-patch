@@ -24,7 +24,10 @@
 //!   present AND matching the pre-patch bytes, and put back exactly on
 //!   rollback. A Gradle `files-2.1` copy has no checksum file (its hash
 //!   directory names the download's sha1); it gets Info advisories
-//!   ([`maven::gradle_advisories`]) instead.
+//!   ([`maven::gradle_advisories`]) instead. A Coursier cache copy (sbt,
+//!   Mill, scala-cli) gets its `.<file>__<algo>` sidecars resynced
+//!   ([`coursier::resync`]) after apply and rollback alike; an Ivy copy
+//!   has neither.
 //!
 //! All ecosystems return a [`SidecarRecord`] via [`dispatch_fixup`].
 //! The record is the canonical JSON-envelope shape — see
@@ -35,6 +38,7 @@ use std::path::Path;
 use crate::crawlers::Ecosystem;
 
 pub(crate) mod cargo;
+pub mod coursier;
 pub mod maven;
 pub(crate) mod nuget;
 mod types;
@@ -172,7 +176,13 @@ pub async fn dispatch_fixup_with(
             "Go: `go mod verify` will report a checksum mismatch against \
              go.sum. `go build` works as long as the module cache stays warm.",
         )),
-        Ecosystem::Maven => maven::fixup(pkg_path, maven_pre).await?,
+        // One arm for every JVM copy: the `~/.m2` checksum files (Gradle
+        // advisories), then a Coursier copy's `.<file>__<algo>` sidecars.
+        // Each half has nothing to do (`None`) for the other kinds of copy.
+        Ecosystem::Maven => merge_payloads(
+            maven::fixup(pkg_path, maven_pre).await?,
+            coursier::fixup(pkg_path, patched)?,
+        ),
         _ => None,
     };
 
@@ -182,6 +192,18 @@ pub async fn dispatch_fixup_with(
         files: p.files,
         advisory: p.advisory,
     }))
+}
+
+/// Both halves of a payload: the files of each, the first advisory.
+fn merge_payloads(a: Option<SidecarPayload>, b: Option<SidecarPayload>) -> Option<SidecarPayload> {
+    match (a, b) {
+        (Some(mut a), Some(b)) => {
+            a.files.extend(b.files);
+            a.advisory = a.advisory.or(b.advisory);
+            Some(a)
+        }
+        (a, b) => a.or(b),
+    }
 }
 
 /// Run the post-*rollback* integrity resync for the package's ecosystem.
@@ -214,6 +236,9 @@ pub(crate) async fn dispatch_rollback_fixup(
 
     let payload: Option<SidecarPayload> = match ecosystem {
         Ecosystem::Cargo => cargo::resync_after_rollback(pkg_path, rolled_back).await?,
+        // Coursier copies only: the `~/.m2` checksum files are put back by
+        // the rollback itself.
+        Ecosystem::Maven => coursier::fixup(pkg_path, rolled_back)?,
         _ => None,
     };
 

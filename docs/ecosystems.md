@@ -17,9 +17,10 @@ The backticked slug in each row is the value `-e`/`--ecosystems` accepts (e.g.
 | npm (`npm`) — pnpm / yarn / berry / bun / vlt | ✅ any install layout, vlt's `node_modules/.vlt` store included (every store copy, copy-on-write) | ✅ seven lockfile flavors: package-lock, yarn classic, yarn berry (node-modules linker; PnP refused), pnpm v9, pnpm legacy v5.4/v6.0 (`pnpm 7/8` — frozen installs are path-bound because those majors absolutize `file:` override specifiers; moved checkouts run one `pnpm install --offline --no-frozen-lockfile`, surfaced as `vendor_pnpm_legacy_absolute_specifier`), bun text `bun.lock` lockfileVersion 0/1/2 and native binary `bun.lockb` revisions 1/2/3 (binary locks stay binary; text workspace vendoring requires lockfileVersion 2 — see [Bun compatibility](testing/bun-compatibility.md)), vlt `vlt-lock.json` lockfileVersion 0/1 (patched package directories for direct dependencies of the root or a workspace member; transitive targets refused — see [vlt notes](#npm-vlt-notes)). Rush monorepos refused (`vendor_rush_unsupported`) — see [Rush notes](#npm-rush-monorepos) | ✅ package-lock / npm-shrinkwrap, pnpm-lock.yaml and legacy shrinkwrap.yaml (pnpm majors 1–12; block and flow resolutions), yarn classic, yarn berry, bun, vlt (`vlt-lock.json` without `lockfileVersion`, 0 or 1) — pnpm, berry, bun and vlt carry constraints, see [npm hosted-mode notes](#npm-hosted-mode-notes) and [vlt notes](#npm-vlt-notes) |
 | PyPI (`pypi`) — uv / poetry / pdm / pipenv / pip | ✅ in place | ✅ uv project/script locks, PEP 751 `pylock.toml` / `pylock.<name>.toml`, poetry, pdm, pipenv (Pipenv 2018 or later — every `Pipfile.lock` category is rewired, lock-only checkouts included; Pipenv 2023+ does not hash-check local wheels — `vendor_integrity_unverified`; a venv still holding the upstream release is reported as `pypi_pipenv_stale_install`; see [Pipenv compatibility](testing/pipenv-compatibility.md)), and requirements.txt. Native uv vendoring requires uv ≥ 0.2.35 (the `[[package]]` lock grammar); hosted mode covers native `uv.lock` from uv 0.1.45 (the first release whose `uv lock` writes one) and requirements from uv 0.0.5; see [uv compatibility](testing/uv-compatibility.md). | ✅ requirements.txt including hash continuations, uv project/script locks, and PEP 751 locks. Version/source ambiguity is refused; see [uv compatibility](testing/uv-compatibility.md). Poetry 1.x and 2.x locks are supported; Poetry 0.x ignores URL sources and is refused. See [Poetry compatibility](testing/poetry-compatibility.md). Pipenv `Pipfile.lock` (pipfile-spec 6 — Pipenv 7 and later; `path` references for 7–11, `file` from 2018; lock-only checkouts and Pipenv's out-of-tree venv are discovered; a warm venv that Pipenv will not reinstall over warns `redirect_pypi_stale_install`; see [Pipenv compatibility](testing/pipenv-compatibility.md)). `pdm.lock` is supported for the lock formats PDM 0.12–1.4 and 2.8.1+ write (`lock_version` 2 / 4.3–4.5.1); the identity-losing 3.1 / 4.0–4.2 formats (PDM 1.8–2.7) are refused. PDM 2.8.0 writes an indistinguishable `4.3` lock but shares that identity-loss bug, so a rewritten 2.8.0 lock crashes `pdm sync` — upgrade to ≥ 2.8.1. See [PDM compatibility](testing/pdm-compatibility.md). |
 | Cargo (`cargo`) | ✅ in-place + `.cargo-checksum.json` rewrite (shared registry-cache caveat — see [Cargo: shared registry cache](#cargo-shared-registry-cache)) | ✅ `[patch.crates-io]` path entry in the root `Cargo.toml` (v5; per-version Socket keys; pre-v5 `.cargo/config*` wiring migrates on re-run) | ✅ per-patch sparse registry (`[registries.socket-patch-<uuid>]` + Cargo.lock source/checksum); direct dependencies only — a crate another dependency also pulls in is refused, use `--mode vendored`; with no `Cargo.lock` the graph is unknown, so only a project whose sole dependency is the patched crate is redirected |
-| RubyGems (`gem`) | ✅ in place | ✅ Gemfile + Gemfile.lock path pair (`Gemfile` spelling only — a `gems.rb` twin, which bundler ≥ 2 loads instead, or a `BUNDLE_GEMFILE`-configured manifest makes vendoring refuse with `gemfile_not_loaded` before any write) | ✅ per-dep `source` block — edits `gems.rb` + `gems.locked` when present (bundler prefers them over `Gemfile`; spellings that diverge beyond Socket's own edits fail closed with `redirect_gem_gemfile_spellings_diverge`; `BUNDLE_GEMFILE` from `.bundle/config` (which outranks the environment, as in bundler), the environment, or the global `~/.bundle/config` / `$BUNDLE_USER_CONFIG` (lowest, as in bundler) is followed when it names the project's `Gemfile` / `gems.rb`, and any other configured manifest is refused with `redirect_gem_bundle_gemfile_unsupported`); the `CHECKSUMS` pin needs bundler ≥ 2.6 (older locks get a `redirect_gem_no_checksums_section` warning); a stale pre-redirect materialization that `bundle install` would reuse instead of refetching is flagged `redirect_gem_stale_install` with a prescriptive remedy (see CLI_CONTRACT.md's "Gem stale-install guard") |
+| RubyGems (`gem`) | ✅ in place | ✅ Gemfile + Gemfile.lock path pair (`Gemfile` spelling only — a `gems.rb` twin, which bundler ≥ 2 loads instead, or a `BUNDLE_GEMFILE`-configured manifest makes vendoring refuse with `gemfile_not_loaded` before any write) | ✅ per-dep `source` block — edits `gems.rb` + `gems.locked` when present (bundler prefers them over `Gemfile`; spellings that diverge beyond Socket's own edits fail closed with `redirect_gem_gemfile_spellings_diverge`; `BUNDLE_GEMFILE` from `.bundle/config` (which outranks the environment, as in bundler), the environment, or the global `~/.bundle/config` / `$BUNDLE_USER_CONFIG` (lowest, as in bundler) is followed when it names the project's `Gemfile` / `gems.rb`, and any other configured manifest is refused with `redirect_gem_bundle_gemfile_unsupported`); a Bundler all-source, exact-source or hostname mirror in app config or the scan environment can capture the patch registry, so the redirect is refused with `redirect_gem_mirror_overrides_source` without printing mirror URLs (scope mirrors to `mirror.https://rubygems.org`; user-global config and mirrors set only in a later install environment are not inspected); the `CHECKSUMS` pin needs bundler ≥ 2.6 (older locks get a `redirect_gem_no_checksums_section` warning); a stale pre-redirect materialization that `bundle install` would reuse instead of refetching is flagged `redirect_gem_stale_install` with a prescriptive remedy (see CLI_CONTRACT.md's "Gem stale-install guard") |
 | Go (`golang`) | ✅ `go.mod` `replace` → `.socket/go-patches/` — see [Go: directory replaces and go.sum](#go-directory-replaces-and-gosum) | ✅ `replace` → the committed vendor tree | ✅ (free tier) fork-style `replace` → `patch.socket.dev/gopatch/<uuid>` + committed `go.sum` pin; see [Go notes](#go-directory-replaces-and-gosum). Paid hosted patches are unsupported; `redirect_golang_unsupported` names the vendored remedy |
 | Maven (`maven`) — Maven and Gradle | ✅ in place in every copy the build consumes: each `~/.m2` copy it reads and each Gradle `files-2.1` copy; `~/.m2` `.sha1`/`.md5` sidecars are rewritten, Gradle copies get advisories; jar-member records swap in the patch service's whole jar — prefer vendored / hosted, see [Maven & NuGet caveats](#maven--nuget-caveats) and [Gradle](#gradle) | ✅ single-POM repository, suffixed Maven reactor repository, or Gradle 6.8+ same-GAV repository with settings wiring and SHA-256 checks (a root with both `pom.xml` and a Gradle build wires both); see [JVM vendoring](design/maven-vendoring.md) and [Gradle](#gradle) | ✅ fail-closed by a Socket-only `<version>-socket.<hex8>` suffix: pom projects get a pinned `<version>` (`${property}` versions are refused); Gradle 6.8+ builds get an owned settings script, lock-entry rewrites and a resolution tripwire — see [Maven & NuGet caveats](#maven--nuget-caveats) and [Gradle](#gradle) |
+| sbt / Mill / scala-cli (`maven`) | ✅ Coursier caches (sbt 1.3+, sbt 2, Mill, scala-cli) and Ivy caches (sbt 0.13–1.2, `useCoursier := false`) patched in place, Coursier checksum sidecars resynced — see [Scala build tools](#scala-build-tools-sbt-mill-scala-cli) | ✅ sbt 0.13.18+: generated `socket-patch-vendor.sbt` over the committed suffixed `.socket/vendor/maven2` tree; scala-cli directory builds: owned `socket-patch.scala` + same-GAV `.socket/vendor/coursier` tree (Linux / macOS); Mill: not wired (agent or hosted guidance) | ✅ sbt 0.13.18+: one generated `socket-patch.sbt`, gated on sbt's own `sbt update` records; Mill / scala-cli: paste-able snippets only (`redirect_mill_manual_snippet`, `redirect_scala_cli_manual_snippet`) |
 | NuGet (`nuget`) | ✅ in-place patching deletes `.nupkg.metadata` and advises on the `.nupkg.sha512` tamper-evidence sidecar — prefer vendored / hosted, see [Maven & NuGet caveats](#maven--nuget-caveats) | ✅ committed folder feed + `packageSourceMapping` + `packages.lock.json` contentHash pin | ✅ `nuget.config` source + source-mapping, `packages.lock.json` contentHash rewrite. See the locked-mode note in [Maven & NuGet caveats](#maven--nuget-caveats) |
 | Composer (`composer`) | ✅ in place (`vendor/`) | ✅ `composer.lock` `dist: path` rewrite | ✅ `composer.lock` dist url + shasum rewrite; the entry's `source` and `dist.mirrors` are removed. See [composer-compatibility.md](testing/composer-compatibility.md) |
 | Deno (`deno`) | ✅ in place (the only mode for Deno) | ❌ refused (`vendor_unsupported_ecosystem`) | ❌ not supported |
@@ -86,6 +87,13 @@ The backticked slug in each row is the value `-e`/`--ecosystems` accepts (e.g.
   upstream bytes. Use a clean install tree and an empty store; `--force` is not
   a reliable substitute. Run `socket-patch vex` after installation to verify
   the patched files. See the [compatibility matrix and workflow](testing/pnpm-compatibility.md).
+- **yarn classic** — the `yarn.lock` entry's `resolved` / `integrity` are
+  rewritten to the hosted tarball. A project that sets `yarn-offline-mirror`
+  (in `.yarnrc` or `.npmrc`) is refused with
+  `redirect_yarn_classic_offline_mirror`. Yarn looks mirror tarballs up by
+  file name, and the hosted tarball has the same name as the upstream one
+  already in the mirror, so installs would get the unpatched bytes and fail
+  the integrity check. Use `--mode vendored` there; it works with a mirror.
 - **yarn berry** — the redirect pins the way yarn does for a root `resolutions`
   entry (cacheKey `10c0` / yarn 4): `package.json` routes the locked descriptor
   (`"left-pad@npm:^1.3.0"`) to the hosted tarball and only that `yarn.lock` entry
@@ -123,6 +131,14 @@ The backticked slug in each row is the value `-e`/`--ecosystems` accepts (e.g.
   git copy is there, and rollback refuses a hosted pin an older release wrote on one.
   The hosted-git shorthands (`owner/repo`, `github:owner/repo`) lock to a codeload
   tarball and are rewired normally.
+- **yarn classic `file:` directory dependencies** — yarn 1 copies a `file:` directory
+  (an entry with no `resolved` tarball) into `node_modules`, so no lock rewrite reaches
+  that copy. Hosted and vendored modes leave the entry untouched
+  (`redirect_yarn_classic_directory_skipped` / `vendor_link_entry_skipped`, naming it) and
+  that copy stays unpatched; `vex` never attests the package from that lock while the
+  copy is there. When every entry of the package is such a copy (git, `file:` directory
+  or `link:`), vendoring refuses with `vendor_lock_entry_not_rewritable` naming them,
+  since `yarn install` can't help.
 - **bun** — text `bun.lock` lockfileVersion 0, 1 or 2: 0 is the `--save-text-lockfile`
   opt-in lock of Bun 1.1.39–1.1.45, 1 the 1.2–1.3 default, 2 the 1.4+ default; all three
   emit one `packages` grammar, so registry entries rewrite identically. Any other or
@@ -628,6 +644,155 @@ to come from the unpatched jar, or an older one that does not match the patched 
 withholds the statement (`vex_gradle_unpatched_copy`). A derived-cache walk cut short
 on a very large cache warns `vex_gradle_derived_cache_unchecked` and does not
 withhold.
+
+## Scala build tools: sbt, Mill, scala-cli
+
+sbt, Mill and scala-cli resolve `pkg:maven` artifacts, so they are build shapes
+inside the `maven` ecosystem, not an ecosystem of their own: `--ecosystems maven`
+covers them, and their PURLs, rollout budgets and ledgers are Maven's. A root
+holding `build.sbt`, `build.mill`, `build.mill.yaml`, `build.sc` or
+`project.scala` counts as a Maven project for discovery. Design, probes and the
+exact generated bytes: [sbt, Mill and scala-cli support](design/sbt-support.md);
+the tested versions: [sbt compatibility](testing/sbt-compatibility.md).
+
+| Tool | Agent | Hosted | Vendored |
+|---|---|---|---|
+| sbt 0.13.18 – 1.2 (Ivy) | Ivy cache | `socket-patch.sbt` | `socket-patch-vendor.sbt` + suffixed tree |
+| sbt 1.3 – 1.13, 2.0 (Coursier) | Coursier cache | `socket-patch.sbt` | `socket-patch-vendor.sbt` + suffixed tree |
+| sbt older than 0.13.18 | Ivy cache (untested) | refused (`redirect_sbt_unsupported_version`) | refused (`vendor_sbt_unsupported_version`) |
+| Mill 0.11 – 1.x | Coursier cache | snippet | not wired |
+| scala-cli, directory build | Coursier cache | snippet | owned files + same-GAV tree |
+| scala-cli, single file | Coursier cache | snippet | pass the tree with `-r` (below) |
+
+Tested: sbt 0.13.18, 1.2.8, 1.3.13, 1.9.9, 1.13.0 and 2.0.9 in every sbt mode
+(JDK 8 up to 1.3.x, 17 after), Mill 1.1.10 and scala-cli 1.17.1. sbt 2.1 and
+later is wired with a `*_version_untested` warning.
+
+### Agent mode: Coursier and Ivy caches
+
+Agent mode patches the shared caches the tools resolve into, next to `~/.m2`
+(only for an sbt, Mill or scala-cli project: a Maven or Gradle project keeps
+crawling `~/.m2` alone; `--global` crawls every cache):
+
+- **Coursier** (sbt 1.3+, sbt 2, Mill, scala-cli): `$COURSIER_CACHE`, a
+  `-Dcoursier.cache=` in `JAVA_OPTS` / `SBT_OPTS` / `.jvmopts` / `.sbtopts`,
+  `-Dsbt.coursier.home`, then the OS default (`~/.cache/coursier/v1`,
+  `~/Library/Caches/Coursier/v1`, `%LOCALAPPDATA%\Coursier\cache\v1`).
+  Coursier keeps hidden checksum files beside each cached file and silently
+  re-downloads a file that disagrees with them, so `apply` and `rollback`
+  rewrite them to the new bytes (the envelope's `sidecars[]` lists them).
+- **Ivy** (sbt 0.13 – 1.2, or `useCoursier := false`): `-Dsbt.ivy.home` /
+  `-Divy.home`, then `~/.ivy2/cache`.
+
+The crawl is not scoped to the build: as with `~/.m2`, every cached GAV is
+queried (a Coursier directory holding only the `.pom` of a version it
+considered but did not pick is no copy), and a GAV cached in several roots is
+patched (and restored) in every one, since the build loads whichever copy its
+resolver picks: the same every-copy fan-out as [Gradle](#gradle), and `vex`
+re-hashes each copy. An Ivy module's sources jar under `srcs/` is found for a
+`?classifier=sources` patch. Every project on
+the machine sees the patch. A running sbt server, Bloop or Metals holds the old
+classpath: restart it after `apply`. Agent patches are matched as whole jar
+files.
+
+### Hosted mode: `socket-patch.sbt`
+
+`scan` (hosted is the default) and `get --mode hosted` wire an sbt build root
+(`project/build.properties` naming `sbt.version` 0.13.18 or later) through one
+generated root file, `socket-patch.sbt`. No user file is edited. For each
+patched GA it:
+
+- forces the Socket-only `<base>-socket.<hex8>` version build-wide with
+  `dependencyOverrides`;
+- adds a `file:` resolver over the gitignored `.socket/sbt-hosted/maven2/`,
+  moved ahead of the default repositories on sbt 0.13 / 1.x, and downloads the
+  sha256-pinned jar and pom there on the first sbt load;
+- installs a load-time verifier that fails `sbt update` when a project
+  resolves another version or a pinned artifact whose bytes are not pinned,
+  or declares the GA at a version newer than the patched base (the override
+  would otherwise force it back down).
+
+Commit `socket-patch.sbt`. The first load after a fresh checkout needs to reach
+the patch server; later loads work offline from the downloaded copies.
+
+A new pin is gated on what sbt itself resolved, read from `target/` (never by
+running sbt): **run `sbt update` (for the whole build) before
+`socket-patch scan`.** With no evidence, or any project's evidence older than
+the build files, nothing is written and the run warns once
+(`redirect_sbt_no_resolution_evidence`, `redirect_sbt_resolution_stale`) and
+exits 0. A patch whose GA some project
+resolves at another version, the Scala runtime, or a build that reassigns
+`dependencyOverrides` / `resolvers` (`:=`, `~=`) is refused. Re-runs re-check
+existing pins against fresh evidence: after a dependency edit, `sbt update`
+then a re-run re-verifies the pin and records the build's new dependency
+digest; a build that now declares the GA newer than the patched base is
+refused (`redirect_sbt_pin_declared_newer`: roll the patch back, or declare
+the base again). `rollback` / `remove` restore the file
+offline. The full code list is in
+[`CLI_CONTRACT.md`](../crates/socket-patch-cli/CLI_CONTRACT.md) (**Hosted
+sbt**).
+
+### Vendored mode: `socket-patch-vendor.sbt`
+
+`vendor` / `scan --mode vendored` write the patched jar and its pom into the
+committed tree `.socket/vendor/maven2/<g>/<a>/<base>-socket.<hex8>/` and one
+generated root file, `socket-patch-vendor.sbt`, which pins every tree file's
+sha256, resolves from the tree (ahead of the default repositories on 0.13 /
+1.x, so the build resolves the patch with the network down) and forces the
+suffixed version. Its load-time check fails the sbt build closed on a tampered
+tree or a replaced pin. Commit both (`socket-patch-vendor.sbt` and
+`.socket/vendor/`: without the root file the build resolves the unpatched
+upstream), then run `sbt update`; the tree carries its own `.gitignore`
+(`!*`, so a `*.jar` rule cannot drop the jar) and `.gitattributes`. The same
+`sbt update` evidence gate as hosted applies (`vendor_sbt_*` codes; a skip is
+reported `skipped`, exit 0). Vendoring over a hosted pin runs the gate before
+the hosted pin is restored, so a pin the gate would stop stays hosted. The hosted
+and vendored files never pin the same GA. Revert, `rollback`, `vendor --check`
+and `repair` cover the generated file and tree.
+
+### scala-cli directory builds (vendored)
+
+A root holding `project.scala` and no `pom.xml`, Gradle or Mill build is a
+scala-cli directory build. `vendor` writes only files socket-patch owns: a root
+`socket-patch.scala` that includes a guard inside the committed same-GAV tree
+`.socket/vendor/coursier/`, plus `.socket/vendor/coursier-index.tsv`. Deleting
+the tree fails the build (`File not found`) instead of resolving upstream. The
+gate reads scala-cli's Bloop project files under `.scala-build/.bloop/`: run
+`scala-cli compile --test .` (with the default Bloop server) first. A build
+that declares its own repository (`//> using repository`, `-r`) is refused,
+because scala-cli would consult it before the tree; move it to
+`COURSIER_REPOSITORIES`, which is consulted after. Windows and project paths
+holding `%` or a non-ASCII character are refused.
+
+**Single-file runs** (`scala-cli run main.scala`) ignore the directory wiring.
+After vendoring the directory, pass the tree explicitly:
+`scala-cli run main.scala -r file://$PWD/.socket/vendor/coursier`.
+
+### Mill
+
+Mill builds get agent mode and, in hosted mode, a paste-able snippet per patch
+(`redirect_mill_manual_snippet`): a repository plus the forced suffixed version
+(Mill 1.x: `repositories` + `depManagement`, each appended to the module's own
+inside `Task { … }`; 0.11 / 0.12: `repositoriesTask` + `.forceVersion()`). Nothing is written. `vendor` does not wire a Mill build: the
+only committable mechanism found edits the user's `.mill-jvm-opts` and replaces
+the repository list, so it is left as a
+[documented manual recipe](design/sbt-support.md#mill-vendored-mode-deferred).
+
+### Limitations
+
+- Pins need fresh `sbt update` evidence for every declared project; a build
+  whose project definitions cannot be read statically is skipped
+  (`*_resolution_incomplete`).
+- `-Dsbt.override.build.repos=true` drops the build's resolvers, so the
+  generated file fails the load (warned at wiring time).
+- A `build.sbt.lock` (sbt-dependency-lock) is refused; run
+  `sbt dependencyLockWrite` after wiring by hand.
+- Classified artifacts other than `sources` / `javadoc`, and the Scala runtime
+  (`org.scala-lang`), are refused.
+- The in-memory hosted engine (GitHub App) has no `target/` evidence, so it
+  never wires sbt.
+- Vendored sbt VEX attests through the vendor ledger; the generated file alone
+  is not a VEX reference.
 
 ## Cargo: shared registry cache
 

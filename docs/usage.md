@@ -128,6 +128,25 @@ that tail. The choice persists in the ledger. See [JVM vendoring](design/maven-v
 for supported shapes, committed files, Maven mirror and `-f` limitations, and
 offline operation.
 
+### sbt and scala-cli
+
+sbt and scala-cli builds are Maven projects to the CLI. Both modes read what the
+tool itself resolved, so resolve first:
+
+```sh
+sbt update                          # sbt: record the resolution under target/
+socket-patch scan                   # hosted: writes socket-patch.sbt
+socket-patch scan --mode vendored   # or vendored: socket-patch-vendor.sbt + .socket/vendor/maven2
+
+scala-cli compile --test .          # scala-cli directory build (Bloop records the resolution)
+socket-patch scan --mode vendored   # socket-patch.scala + .socket/vendor/coursier
+```
+
+Commit the generated root file with `.socket/`. No user build file is edited.
+With no or stale resolution records the run warns once, writes nothing and
+exits 0; resolve again and re-run. Mill builds get agent mode or a hosted
+snippet to paste. See [Scala build tools](ecosystems.md#scala-build-tools-sbt-mill-scala-cli).
+
 ## OpenVEX
 
 Generate an attestation after installing the patched dependencies:
@@ -185,8 +204,10 @@ Once the required patch data is committed, `socket-patch apply --offline` works
 without downloading it again. `get <identifier> --save-only` records a patch without
 applying it. `apply` skips packages owned by the vendor ledger.
 
-Deno uses agent mode. Cargo agent patches can affect a shared registry cache; Go
-uses project-local copies and `replace` directives. Read the
+Deno uses agent mode. Cargo agent patches can affect a shared registry cache; so
+do Maven ones in `~/.m2` and the Coursier and Ivy caches sbt, Mill and
+scala-cli resolve into (restart a running sbt server, Bloop or Metals after
+`apply`). Go uses project-local copies and `replace` directives. Read the
 [ecosystem caveats](ecosystems.md) before using agent mode in shared environments.
 The removed `setup` command is covered in the [migration guide](migrating-to-v5.md).
 
