@@ -1621,6 +1621,19 @@ async fn berry_takeovers_refuse_before_reverting_the_old_mode() {
         )
         .unwrap();
     };
+    // #539 (Bugbot on #978): the project switches to Plug'n'Play, explicitly
+    // or by dropping `nodeLinker` (berry's default), before `yarn install`
+    // writes a loader — a lock-only PnP project vendored mode refuses.
+    let pnp_linker: Break = |root, _| {
+        std::fs::write(
+            root.join(".yarnrc.yml"),
+            "nodeLinker: pnp\r\nenableGlobalCache: false\r\n",
+        )
+        .unwrap();
+    };
+    let default_linker: Break = |root, _| {
+        std::fs::write(root.join(".yarnrc.yml"), "enableGlobalCache: false\r\n").unwrap();
+    };
 
     // ── vendored → hosted ──
     for (label, breakage, rel, code) in [
@@ -1706,6 +1719,18 @@ async fn berry_takeovers_refuse_before_reverting_the_old_mode() {
             compression,
             "",
             "vendor_yarn_berry_cache_unsupported",
+        ),
+        (
+            "pnp linker",
+            pnp_linker,
+            "",
+            "vendor_yarn_berry_unsupported",
+        ),
+        (
+            "default pnp linker",
+            default_linker,
+            "",
+            "vendor_yarn_berry_unsupported",
         ),
     ] {
         for dry in [true, false] {
@@ -4033,7 +4058,10 @@ snapshots:
             hosted_npmrc,
             "the hosted .npmrc must be untouched"
         );
-        assert!(!root.join(".socket/vendor/npm").exists(), "nothing is staged");
+        assert!(
+            !root.join(".socket/vendor/npm").exists(),
+            "nothing is staged"
+        );
     }
 
     /// Hosted → vendored over a linked `.socket/vendor/npm` (#664): the
