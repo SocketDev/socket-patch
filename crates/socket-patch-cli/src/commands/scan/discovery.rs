@@ -75,7 +75,29 @@ pub(crate) async fn lockfile_supplement(
     if entries.is_empty() {
         return out;
     }
-    let crawled_purls: HashSet<&str> = crawled.iter().map(|p| p.purl.as_str()).collect();
+    (out.packages, out.purls) = lockfile_only_packages(entries, crawled, only, &common.cwd);
+    out.entries = entries.clone();
+    out
+}
+
+/// The lockfile entries with no crawled counterpart, fabricated as crawl
+/// entries, plus their [`PurlKey`]s. "Crawled" is by [`PurlKey`], the same
+/// relation [`lockfile_only_contains`] answers by: a lock spelling that
+/// differs from the installed crawl's only in encoding, NuGet case, PEP 503
+/// form or composer padding is the installed package, not a lockfile-only
+/// one — keyed in, its every spelling would read as not installed.
+fn lockfile_only_packages(
+    entries: &[LockfileEntry],
+    crawled: &[socket_patch_core::crawlers::types::CrawledPackage],
+    only: Option<&[String]>,
+    cwd: &std::path::Path,
+) -> (
+    Vec<socket_patch_core::crawlers::types::CrawledPackage>,
+    HashSet<PurlKey>,
+) {
+    let mut packages = Vec::new();
+    let mut purls = HashSet::new();
+    let crawled_keys: HashSet<PurlKey> = crawled.iter().map(|p| PurlKey::new(&p.purl)).collect();
     let in_scope = |purl: &str| {
         only.is_none_or(|list| {
             socket_patch_core::crawlers::Ecosystem::from_purl(purl)
@@ -83,17 +105,17 @@ pub(crate) async fn lockfile_supplement(
         })
     };
     for entry in entries {
-        if crawled_purls.contains(entry.purl.as_str()) || !in_scope(&entry.purl) {
+        let key = PurlKey::new(&entry.purl);
+        if crawled_keys.contains(&key) || !in_scope(&entry.purl) {
             continue;
         }
-        let Some(pkg) = crawled_from_purl(&entry.purl, &common.cwd) else {
+        let Some(pkg) = crawled_from_purl(&entry.purl, cwd) else {
             continue;
         };
-        out.purls.insert(PurlKey::new(&entry.purl));
-        out.packages.push(pkg);
+        purls.insert(key);
+        packages.push(pkg);
     }
-    out.entries = entries.clone();
-    out
+    (packages, purls)
 }
 
 /// Whether an API-spelled purl (percent-encoded, possibly qualified) names
@@ -550,6 +572,56 @@ mod tests {
     use std::borrow::Cow;
 
     use crate::commands::scan::tests::manifest_with;
+
+    // ---- lockfile_only_packages --------------------------------------------
+
+    fn lock_entry(ecosystem: &'static str, purl: &str) -> LockfileEntry {
+        use socket_patch_core::vendor::lock_inventory::{LockIntegrity, SourceKind};
+        LockfileEntry {
+            ecosystem,
+            name: String::new(),
+            version: String::new(),
+            purl: purl.to_string(),
+            resolved: None,
+            integrity: LockIntegrity::None,
+            source_kind: SourceKind::Unspecified,
+        }
+    }
+
+    fn crawled_from(purl: &str) -> socket_patch_core::crawlers::types::CrawledPackage {
+        crawled_from_purl(purl, std::path::Path::new("/p")).unwrap()
+    }
+
+    /// An installed package whose lock spelling differs from the crawl's
+    /// (NuGet case, PEP 503 form, composer padding) is NOT lockfile-only:
+    /// keyed in, [`lockfile_only_contains`] would mark every spelling of the
+    /// live install `package_not_installed`. A truly absent one still is.
+    #[test]
+    fn lockfile_only_packages_excludes_crawled_spelling_variants() {
+        let entries = vec![
+            lock_entry("nuget", "pkg:nuget/Newtonsoft.Json@13.0.1"),
+            lock_entry("pypi", "pkg:pypi/typing_extensions@4.12.2"),
+            lock_entry("composer", "pkg:composer/psr/log@3.0.2"),
+            lock_entry("npm", "pkg:npm/lockonly@1.0.0"),
+        ];
+        let crawled = vec![
+            crawled_from("pkg:nuget/newtonsoft.json@13.0.1"),
+            crawled_from("pkg:pypi/typing-extensions@4.12.2"),
+            crawled_from("pkg:composer/psr/log@3.0.2.0"),
+        ];
+        let (packages, purls) =
+            lockfile_only_packages(&entries, &crawled, None, std::path::Path::new("/p"));
+        let got: Vec<&str> = packages.iter().map(|p| p.purl.as_str()).collect();
+        assert_eq!(got, vec!["pkg:npm/lockonly@1.0.0"]);
+        assert!(lockfile_only_contains(&purls, "pkg:npm/lockonly@1.0.0"));
+        for api in [
+            "pkg:nuget/Newtonsoft.Json@13.0.1",
+            "pkg:pypi/typing-extensions@4.12.2",
+            "pkg:composer/psr/log@3.0.2.0",
+        ] {
+            assert!(!lockfile_only_contains(&purls, api), "{api}");
+        }
+    }
 
     // ---- severity_order ----------------------------------------------------
 

@@ -313,9 +313,22 @@ async fn preview_apply_gc(
     };
     // Mirror the wet pass, which drops an unused vendored entry's manifest
     // keys before the blob sweep, or the preview under-reports orphans.
-    for purl in &vendor_gc.unused_reverted {
-        for k in crate::commands::vendor::unused_vendored_manifest_keys(&manifest.patches, purl) {
-            manifest.patches.remove(&k);
+    // The dry pass reverted nothing, so the ledger still holds each entry
+    // (its base purl is part of the relation: a `!x`-encoded golang key).
+    if !vendor_gc.unused_reverted.is_empty() {
+        if let Ok(state) = socket_patch_core::vendor::load_state(&common.cwd).await {
+            for purl in &vendor_gc.unused_reverted {
+                let Some(entry) = state.entries.get(purl) else {
+                    continue;
+                };
+                for k in crate::commands::vendor::unused_vendored_manifest_keys(
+                    &manifest.patches,
+                    purl,
+                    entry,
+                ) {
+                    manifest.patches.remove(&k);
+                }
+            }
         }
     }
     let prunable = detect_prunable(&manifest, scanned_purls, vendored);

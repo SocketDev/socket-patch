@@ -4150,23 +4150,26 @@ pub(crate) struct VendorGcSummary {
     /// happened on disk; the stale record is what the caller must report.
     pub write_failures: Vec<(&'static str, String)>,
 }
-/// The manifest keys an unused vendored entry `purl` owns: every key with
-/// the same [`PurlKey`] (any qualifier set, encoding, NuGet case, PEP 503
-/// spelling or composer release padding). The ONE relation behind the wet
-/// vendor GC's manifest drop and `scan --prune --dry-run`'s preview of it,
-/// so the two never report different prune sets.
+/// The manifest keys an unused vendored `entry`, stored under ledger key
+/// `purl`, owns: every key with the same [`PurlKey`] as the ledger key OR
+/// the entry's base purl ([`VendorEntry::covers_purl`]: any qualifier set,
+/// encoding, NuGet case, PEP 503 spelling or composer release padding). The
+/// base purl matters for golang, whose ledger key may keep the module
+/// proxy's `!x` case encoding (`!burnt!sushi`) while the manifest holds the
+/// decoded `BurntSushi` spelling. The ONE relation behind the wet vendor
+/// GC's manifest drop and `scan --prune --dry-run`'s preview of it, so the
+/// two never report different prune sets.
 pub(crate) fn unused_vendored_manifest_keys<V>(
     patches: &std::collections::HashMap<String, V>,
     purl: &str,
+    entry: &VendorEntry,
 ) -> Vec<String> {
-    let base = PurlKey::new(purl);
     patches
         .keys()
-        .filter(|k| k.as_str() == purl || PurlKey::new(k) == base)
+        .filter(|k| k.as_str() == purl || entry.covers_purl(purl, k))
         .cloned()
         .collect()
 }
-
 
 /// The vendored-state GC behind `scan --prune`:
 ///
@@ -4282,7 +4285,7 @@ pub(crate) async fn run_vendor_gc(
         state.entries.remove(&purl);
         ledger_dirty = true;
         if let Some(m) = manifest.as_mut() {
-            for k in unused_vendored_manifest_keys(&m.patches, &purl) {
+            for k in unused_vendored_manifest_keys(&m.patches, &purl, &entry) {
                 m.patches.remove(&k);
                 manifest_dirty = true;
             }
@@ -6885,7 +6888,66 @@ mod eject_snapshot_tests {
 #[cfg(test)]
 mod unused_vendored_manifest_keys_tests {
     use super::unused_vendored_manifest_keys;
+    use socket_patch_core::vendor::state::{VendorArtifact, VendorEntry};
     use std::collections::HashMap;
+
+    /// A ledger entry whose base purl is `base_purl`; only the purl
+    /// matters to the manifest-key relation.
+    fn entry(ecosystem: &str, base_purl: &str) -> VendorEntry {
+        VendorEntry {
+            ecosystem: ecosystem.into(),
+            base_purl: base_purl.into(),
+            uuid: "11111111-1111-4111-8111-111111111111".into(),
+            artifact: VendorArtifact {
+                yarn_berry10c0: None,
+                path: String::new(),
+                sha256: String::new(),
+                size: None,
+                platform_locked: None,
+                file_inventory: None,
+            },
+            wiring: Vec::new(),
+            lock: None,
+            took_over_go_patches: false,
+            detached: false,
+            record: None,
+            flavor: None,
+            uv: None,
+            pnpm: None,
+            poetry: None,
+            pdm: None,
+            pipenv: None,
+        }
+    }
+
+    /// The keys an unused ledger entry `key` (base purl = the key) owns.
+    fn keys_for(patches: &HashMap<String, ()>, eco: &str, key: &str) -> Vec<String> {
+        let mut out = unused_vendored_manifest_keys(patches, key, &entry(eco, key));
+        out.sort();
+        out
+    }
+
+    /// A golang ledger key may keep the module proxy's `!x` case encoding
+    /// while the entry's base purl and the manifest key are the decoded
+    /// spelling; [`PurlKey`](socket_patch_core::utils::purl_key::PurlKey)
+    /// does not decode `!x`, so the base purl must be matched too or the
+    /// manifest entry (and its blobs) survive the revert.
+    #[test]
+    fn covers_the_decoded_golang_base_purl_of_a_bang_encoded_key() {
+        let patches: HashMap<String, ()> = [
+            "pkg:golang/github.com/BurntSushi/toml@v1.0.0",
+            "pkg:golang/github.com/BurntSushi/toml@v1.1.0",
+        ]
+        .into_iter()
+        .map(|k| (k.to_string(), ()))
+        .collect();
+        let key = "pkg:golang/github.com/!burnt!sushi/toml@v1.0.0";
+        let e = entry("golang", "pkg:golang/github.com/BurntSushi/toml@v1.0.0");
+        assert_eq!(
+            unused_vendored_manifest_keys(&patches, key, &e),
+            vec!["pkg:golang/github.com/BurntSushi/toml@v1.0.0".to_string()]
+        );
+    }
 
     /// The wet vendor GC and `scan --prune --dry-run`'s preview both drop
     /// these keys, so they must cover every spelling of the release and
@@ -6902,21 +6964,19 @@ mod unused_vendored_manifest_keys_tests {
         .into_iter()
         .map(|k| (k.to_string(), ()))
         .collect();
-        let mut nuget = unused_vendored_manifest_keys(&patches, "pkg:nuget/newtonsoft.json@13.0.1");
-        nuget.sort();
         assert_eq!(
-            nuget,
+            keys_for(&patches, "nuget", "pkg:nuget/newtonsoft.json@13.0.1"),
             vec![
                 "pkg:nuget/Newtonsoft.Json@13.0.1".to_string(),
                 "pkg:nuget/newtonsoft.json@13.0.1?x=1".to_string(),
             ]
         );
         assert_eq!(
-            unused_vendored_manifest_keys(&patches, "pkg:pypi/typing_extensions@4.12.2"),
+            keys_for(&patches, "pypi", "pkg:pypi/typing_extensions@4.12.2"),
             vec!["pkg:pypi/typing-extensions@4.12.2".to_string()]
         );
         assert_eq!(
-            unused_vendored_manifest_keys(&patches, "pkg:composer/psr/log@3.0.2.0"),
+            keys_for(&patches, "composer", "pkg:composer/psr/log@3.0.2.0"),
             vec!["pkg:composer/psr/log@3.0.2".to_string()]
         );
     }
