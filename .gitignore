@@ -144,6 +144,9 @@ vite.config.ts.timestamp-*
 
 # Rust
 target/
+# sbt resolution-evidence fixtures are copies of real sbt `target/` trees.
+!crates/socket-patch-core/tests/fixtures/sbt/evidence/**/target/
+!crates/socket-patch-core/tests/fixtures/sbt/evidence/**/target/out/
 
 # npm binaries (populated at publish time)
 npm/socket-patch/bin/socket-patch-*

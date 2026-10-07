@@ -712,6 +712,106 @@ async fn pipenv_dotenv_settings_pick_the_scanned_venv() {
     assert_not_discovered(&batch_bodies(&server).await, "pkg:pypi/pipenv-pkg@1.0.0");
 }
 
+/// A Pipenv project at `<tmp>/proj` (Pipfile + Pipfile.lock locking
+/// `urllib3 1.26.18`) with no Pipenv venv yet, under a stubbed HOME whose
+/// conda root holds `system_decoy 6.6.6` (a package the global crawler
+/// would find in the OS Python). Returns `(tmp, project, home)`.
+fn pipenv_project_without_venv() -> (tempfile::TempDir, std::path::PathBuf, std::path::PathBuf) {
+    let tmp = tempfile::tempdir().unwrap();
+    let project = tmp.path().join("proj");
+    std::fs::create_dir_all(&project).unwrap();
+    std::fs::write(
+        project.join("Pipfile"),
+        include_str!("../../socket-patch-core/tests/fixtures/pipenv/2026.8.0/Pipfile"),
+    )
+    .unwrap();
+    std::fs::write(
+        project.join("Pipfile.lock"),
+        include_str!("../../socket-patch-core/tests/fixtures/pipenv/2026.8.0/Pipfile.lock"),
+    )
+    .unwrap();
+    let home = tmp.path().join("home");
+    let system = home
+        .join("anaconda3")
+        .join("lib")
+        .join("python3.11")
+        .join("site-packages");
+    std::fs::create_dir_all(&system).unwrap();
+    write_dist_info(&system, "system_decoy", "6.6.6");
+    std::fs::create_dir_all(tmp.path().join("wh")).unwrap();
+    (tmp, project, home)
+}
+
+/// Run `scan` from a Pipenv project with an empty WORKON_HOME and HOME
+/// stubbed to `home`, and return `(exit code, batch bodies)`.
+async fn scan_pipenv_without_venv(
+    project: &Path,
+    home: &Path,
+    mode: Option<socket_patch_cli::commands::scan::ScanMode>,
+) -> (i32, Vec<String>) {
+    let server = MockServer::start().await;
+    mock_batch_empty(&server).await;
+    let prev_home = std::env::var_os("HOME");
+    let prev_profile = std::env::var_os("USERPROFILE");
+    std::env::set_var("HOME", home);
+    std::env::set_var("USERPROFILE", home);
+    let workon = project.parent().unwrap().join("wh");
+    let mut args = default_args(project, server.uri());
+    args.mode = mode;
+    let code = scan_with_pipenv_env(args, &[("WORKON_HOME", &workon)]).await;
+    match prev_home {
+        Some(v) => std::env::set_var("HOME", v),
+        None => std::env::remove_var("HOME"),
+    }
+    match prev_profile {
+        Some(v) => std::env::set_var("USERPROFILE", v),
+        None => std::env::remove_var("USERPROFILE"),
+    }
+    (code, batch_bodies(&server).await)
+}
+
+/// #504: a Pipenv project with no Pipenv venv has nothing installed for
+/// it. A project-scoped scan must not fall back to the OS Python's
+/// site-packages (which agent mode would then patch in place), whether or
+/// not a `venv/` Pipenv never uses sits in the project.
+#[tokio::test]
+#[serial]
+async fn pipenv_without_a_venv_never_scans_the_system_python() {
+    for with_stray_venv in [false, true] {
+        let (_tmp, project, home) = pipenv_project_without_venv();
+        if with_stray_venv {
+            let stray = venv_site_packages(&project.join("venv"), "python3.12");
+            std::fs::create_dir_all(&stray).unwrap();
+            write_dist_info(&stray, "stray_decoy", "6.6.6");
+        }
+        let (code, bodies) = scan_pipenv_without_venv(
+            &project,
+            &home,
+            Some(socket_patch_cli::commands::scan::ScanMode::Agent),
+        )
+        .await;
+        assert_eq!(code, 0, "stray venv/: {with_stray_venv}");
+        assert_not_discovered(&bodies, "pkg:pypi/system-decoy@6.6.6");
+        assert_not_discovered(&bodies, "pkg:pypi/stray-decoy@6.6.6");
+    }
+}
+
+/// #947: a vendored (or hosted) scan of a fresh Pipenv checkout takes its
+/// candidates from Pipfile.lock alone; a package that exists only in the
+/// OS Python is not the project's and must never reach the patch query.
+#[tokio::test]
+#[serial]
+async fn pipenv_fresh_checkout_candidates_come_from_the_lock_only() {
+    use socket_patch_cli::commands::scan::ScanMode;
+    for mode in [ScanMode::Vendored, ScanMode::Hosted] {
+        let (_tmp, project, home) = pipenv_project_without_venv();
+        let (code, bodies) = scan_pipenv_without_venv(&project, &home, Some(mode)).await;
+        assert_eq!(code, 0, "{mode:?}");
+        assert_discovered(&bodies, "pkg:pypi/urllib3@1.26.18");
+        assert_not_discovered(&bodies, "pkg:pypi/system-decoy@6.6.6");
+    }
+}
+
 // ---------------------------------------------------------------------------
 // Package-manager-recorded envs: PDM's saved interpreter / PEP 582, and uv's
 // UV_PROJECT_ENVIRONMENT, ahead of a stray `./.venv` the manager never uses

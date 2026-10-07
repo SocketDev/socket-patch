@@ -64,11 +64,20 @@ type PinSpan = (usize, usize, Option<String>, bool);
 
 /// Scan one file for the target package: every clean exact
 /// `canon_name==version` pin, plus whether any occurrence carries extras or
-/// a non-exact specifier.
+/// names the package ambiguously.
+///
+/// An exact pin of a DIFFERENT version is not ambiguous when it sits on its
+/// own environment-marker branch and every target pin does too: that is
+/// the shape `uv pip compile --universal` writes when a package resolves
+/// differently per Python (#928), and pip installs exactly one branch.
+/// Only the target branches are rewritten; the other branch is left alone,
+/// as hosted requirements and vendored pylock already do. Without markers
+/// on both sides pip could see both pins at once, so it stays a refusal.
 fn scan_pins(content: &str, canon_name: &str, version: &str) -> (Vec<PinSpan>, bool, bool) {
-    let mut exact = Vec::new();
+    let mut exact: Vec<PinSpan> = Vec::new();
     let mut found_extras = false;
     let mut found_range = false;
+    let mut other_branches = false;
     for ll in logical_lines(content) {
         let Some(req) = parse_requirement_line(&ll.text) else {
             continue;
@@ -88,16 +97,22 @@ fn scan_pins(content: &str, canon_name: &str, version: &str) -> (Vec<PinSpan>, b
         // pip resolves `==` under PEP 440 (`==1.16` installs 1.16.0).
         if crate::utils::pep440::is_exact_pin_of(&spec_no_ws, version) {
             exact.push((ll.start, ll.physical.len(), req.marker, req.hashed));
+        } else if req.marker.is_some() && crate::utils::pep440::is_exact_pin(&spec_no_ws) {
+            other_branches = true;
         } else {
             found_range = true;
         }
+    }
+    if other_branches && (exact.is_empty() || exact.iter().any(|(_, _, m, _)| m.is_none())) {
+        found_range = true;
     }
     (exact, found_extras, found_range)
 }
 
 /// Find the target pin in one file's content. Precedence is fail-closed:
 /// any extras occurrence wins over any non-pin occurrence wins over a clean
-/// exact pin — a file that names the package ambiguously is never rewritten.
+/// exact pin — a file that names the package ambiguously is never rewritten
+/// (a marker-split other version is not ambiguous; see [`scan_pins`]).
 fn find_pin(content: &str, canon_name: &str, version: &str) -> PinSearch {
     let (exact, found_extras, found_range) = scan_pins(content, canon_name, version);
     if found_extras {
@@ -1268,6 +1283,54 @@ mod tests {
         assert_eq!(find_pin("six\n", "six", "1.16.0"), PinSearch::Range);
         // Pinned, but to a different version than the one being vendored.
         assert_eq!(find_pin("six==1.15.0\n", "six", "1.16.0"), PinSearch::Range);
+        // #928: `uv pip compile --universal` splits a package across marker
+        // branches; the other branch's exact pin is disjoint, not ambiguous.
+        match find_pin(
+            "six==1.16.0 ; python_full_version < '3.12'\n\
+             six==1.17.0 ; python_full_version >= '3.12'\n",
+            "six",
+            "1.16.0",
+        ) {
+            PinSearch::Exact {
+                line_start, marker, ..
+            } => {
+                assert_eq!(line_start, 0);
+                assert_eq!(marker.as_deref(), Some("python_full_version < '3.12'"));
+            }
+            other => panic!("expected Exact, got {other:?}"),
+        }
+        // The other branch first in the file is the same split.
+        assert!(matches!(
+            find_pin(
+                "six==1.17.0 ; python_version >= \"3.12\"\nsix==1.16.0 ; python_version < \"3.12\"\n",
+                "six",
+                "1.16.0"
+            ),
+            PinSearch::Exact { line_start: 1, .. }
+        ));
+        // Still fail-closed whenever pip could see both pins at once, or
+        // the other branch is not itself an exact pin.
+        for content in [
+            // Other version unmarked.
+            "six==1.16.0 ; python_version < \"3.12\"\nsix==1.17.0\n",
+            // Target unmarked.
+            "six==1.16.0\nsix==1.17.0 ; python_version >= \"3.12\"\n",
+            // One target occurrence unmarked among marked ones.
+            "six==1.16.0 ; python_version < \"3.12\"\nsix==1.16.0\n\
+             six==1.17.0 ; python_version >= \"3.12\"\n",
+            // Other branch is a range / arbitrary equality / wildcard.
+            "six==1.16.0 ; python_version < \"3.12\"\nsix>=1.17 ; python_version >= \"3.12\"\n",
+            "six==1.16.0 ; python_version < \"3.12\"\nsix===1.17.0 ; python_version >= \"3.12\"\n",
+            "six==1.16.0 ; python_version < \"3.12\"\nsix==1.17.* ; python_version >= \"3.12\"\n",
+            // No target pin at all: appending an unmarked line would clash.
+            "six==1.17.0 ; python_version >= \"3.12\"\n",
+        ] {
+            assert_eq!(
+                find_pin(content, "six", "1.16.0"),
+                PinSearch::Range,
+                "{content}"
+            );
+        }
         assert_eq!(
             find_pin("requests==2.31.0\n", "six", "1.16.0"),
             PinSearch::Absent
@@ -1407,6 +1470,60 @@ mod tests {
             read_root(tmp.path()).await,
             format!(
                 "./{REL_WHEEL} ; python_version >= \"3.8\"  # socket-patch vendor: six==1.16.0\n"
+            )
+        );
+    }
+
+    /// #928: a `uv pip compile --universal --generate-hashes` file splits six
+    /// across marker branches. Only the vendored version's branch is
+    /// rewritten (marker kept); the other branch is left alone, and revert
+    /// is byte-identical.
+    #[tokio::test]
+    async fn marker_split_rewrites_only_the_vendored_branch() {
+        let original = "six==1.16.0 ; python_full_version < '3.12' \\\r\n    \
+             --hash=sha256:1111\r\n\
+             six==1.17.0 ; python_full_version >= '3.12' \\\r\n    \
+             --hash=sha256:2222\r\n";
+        let tmp = write_root(original).await;
+        let wiring = wire_requirements(tmp.path(), "six", "1.16.0", REL_WHEEL, SHA)
+            .await
+            .unwrap();
+        assert_eq!(wiring.len(), 1);
+        assert_eq!(
+            read_root(tmp.path()).await,
+            format!(
+                "./{REL_WHEEL} ; python_full_version < '3.12' --hash=sha256:{SHA}  \
+                 # socket-patch vendor: six==1.16.0\r\n\
+                 six==1.17.0 ; python_full_version >= '3.12' \\\r\n    \
+                 --hash=sha256:2222\r\n"
+            )
+        );
+
+        let outcome = revert_requirements(&entry_for(wiring), tmp.path(), false).await;
+        assert!(outcome.success, "{:?}", outcome.error);
+        assert_eq!(read_root(tmp.path()).await, original);
+    }
+
+    /// #928: the split with no hashes, as `uv pip compile --universal`
+    /// writes it, also passes the preflight the orchestrator runs first.
+    #[tokio::test]
+    async fn marker_split_preflights_fresh_and_wires_unhashed() {
+        let original = "six==1.16.0 ; python_full_version < '3.12'\n\
+             six==1.17.0 ; python_full_version >= '3.12'\n";
+        let tmp = write_root(original).await;
+        assert!(matches!(
+            preflight_requirements(tmp.path(), "six", "1.16.0", "u").await,
+            Ok(RequirementsTarget::Fresh)
+        ));
+        wire_requirements(tmp.path(), "six", "1.16.0", REL_WHEEL, SHA)
+            .await
+            .unwrap();
+        assert_eq!(
+            read_root(tmp.path()).await,
+            format!(
+                "./{REL_WHEEL} ; python_full_version < '3.12'  \
+                 # socket-patch vendor: six==1.16.0\n\
+                 six==1.17.0 ; python_full_version >= '3.12'\n"
             )
         );
     }

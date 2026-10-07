@@ -98,13 +98,16 @@ Vendored mode stores **patched dependencies**, not the entire dependency graph.
 Other dependencies still need their normal registry, mirror, or offline cache.
 Hosted and vendored installs do not need an install hook or the Socket Patch CLI.
 
-The CLI supports npm, PyPI, Cargo, Go, RubyGems, Maven, Composer, NuGet, and Deno.
+The CLI supports npm, PyPI, Cargo, Go, RubyGems, Maven (including sbt, Mill and
+scala-cli builds), Composer, NuGet, and Deno.
 Mode and package-manager support vary: Deno uses agent mode, for example. Check the
 [ecosystem support matrix](docs/ecosystems.md) before choosing a mode.
 
 Vendored Maven reactors and Gradle 6.8+ builds are supported. See
 [JVM vendoring](docs/design/maven-vendoring.md) for supported project shapes,
-cache behavior, and offline checks.
+cache behavior, and offline checks. sbt 0.13.18+ builds are wired through one
+generated `socket-patch.sbt` (hosted) or `socket-patch-vendor.sbt` (vendored);
+see [Scala build tools](docs/ecosystems.md#scala-build-tools-sbt-mill-scala-cli).
 
 ## Common commands
 

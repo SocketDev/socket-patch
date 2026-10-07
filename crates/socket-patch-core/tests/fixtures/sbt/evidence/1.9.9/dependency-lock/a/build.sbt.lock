@@ -1,0 +1,61 @@
+{
+  "lockVersion" : 1,
+  "timestamp" : "2026-10-02T17:00:25.176328429Z",
+  "configurations" : [
+    "compile",
+    "optional",
+    "provided",
+    "runtime",
+    "test"
+  ],
+  "dependencies" : [
+    {
+      "org" : "org.apache.commons",
+      "name" : "commons-lang3",
+      "version" : "3.11",
+      "artifacts" : [
+        {
+          "name" : "commons-lang3.jar",
+          "hash" : "sha1:68e9a6adf7cf8eb7e9d31bbc554c7c75eeaac568"
+        }
+      ],
+      "configurations" : [
+        "compile",
+        "runtime",
+        "test"
+      ]
+    },
+    {
+      "org" : "org.apache.commons",
+      "name" : "commons-text",
+      "version" : "1.9",
+      "artifacts" : [
+        {
+          "name" : "commons-text.jar",
+          "hash" : "sha1:ba6ac8c2807490944a0a27f6f8e68fb5ed2e80e2"
+        }
+      ],
+      "configurations" : [
+        "compile",
+        "runtime",
+        "test"
+      ]
+    },
+    {
+      "org" : "org.scala-lang",
+      "name" : "scala-library",
+      "version" : "2.12.18",
+      "artifacts" : [
+        {
+          "name" : "scala-library.jar",
+          "hash" : "sha1:fa825f984172f6801e3d8c476071b1823c0a925b"
+        }
+      ],
+      "configurations" : [
+        "compile",
+        "runtime",
+        "test"
+      ]
+    }
+  ]
+}

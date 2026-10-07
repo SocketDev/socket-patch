@@ -1,0 +1,34 @@
+<?xml version="1.0" encoding="UTF-8"?>
+<ivy-report version="1.0">
+<info organisation="a" module="a_2.12" revision="0.1.0-SNAPSHOT" conf="compile"/>
+<dependencies>
+<module organisation="org.apache.commons" name="commons-lang3">
+<revision name="3.12.0">
+<artifacts>
+<artifact name="commons-lang3" type="jar" ext="jar" location="/root/.ivy2/cache/org.apache.commons/commons-lang3/jars/commons-lang3-3.12.0.jar">
+</artifact>
+</artifacts>
+</revision>
+<revision name="3.11" evicted="latest-revision">
+<artifacts>
+</artifacts>
+</revision>
+</module>
+<module organisation="org.apache.commons" name="commons-text">
+<revision name="1.9">
+<artifacts>
+<artifact name="commons-text" type="jar" ext="jar" location="/root/.ivy2/cache/org.apache.commons/commons-text/jars/commons-text-1.9.jar">
+</artifact>
+</artifacts>
+</revision>
+</module>
+<module organisation="org.scala-lang" name="scala-library">
+<revision name="2.12.18">
+<artifacts>
+<artifact name="scala-library" type="jar" ext="jar" location="/root/.ivy2/cache/org.scala-lang/scala-library/jars/scala-library-2.12.18.jar">
+</artifact>
+</artifacts>
+</revision>
+</module>
+</dependencies>
+</ivy-report>
