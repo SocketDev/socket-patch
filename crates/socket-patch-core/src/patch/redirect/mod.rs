@@ -25,6 +25,7 @@ use serde_json::{json, Value};
 
 use crate::formats::yarn::berry_gates::{self, Yarnrc};
 use crate::utils::digest::is_hex64_lower;
+#[cfg(test)]
 use crate::utils::line_endings::LineEndings;
 use crate::vendor::common::{parse_json_text, JsonLayout};
 use crate::vendor::lock_inventory::npm_legacy_identity;
@@ -62,7 +63,7 @@ use crate::formats::cargo::hosted::CARGO_LOCK_REFERENCE_KIND;
 use crate::formats::pnpm::hosted::pnpm_unrewritten_instances;
 use crate::formats::yarn::berry_entry::{manifest_bin, render_pinned_entry, Pin};
 use crate::formats::yarn::blocks::{
-    berry_field, berry_metadata, block_eol, classic_field, is_body_field, repin_classic_block,
+    berry_field, block_eol, classic_field, is_body_field, repin_classic_block,
     replace_block, scan_blocks, LockBlock,
 };
 use crate::formats::yarn::patterns::{

@@ -5,7 +5,7 @@
 use std::path::Path;
 
 use crate::formats::yarn::blocks::{
-    berry_field, berry_metadata, classic_field, live_blocks, scan_blocks, LockBlock,
+    berry_field, classic_field, live_blocks, scan_blocks, LockBlock,
 };
 use crate::formats::yarn::patterns::{
     parse_berry_locator, pattern_real_name, split_berry_key_patterns, split_key_patterns,
@@ -81,7 +81,7 @@ pub(crate) struct BerryLock {
 /// discovery share (see [`classic_entries`]).
 pub(crate) fn berry_entries(text: &str) -> BerryLock {
     let blocks = scan_blocks(text);
-    let cache_key = crate::formats::yarn::berry_gates::cache_key(text).map(str::to_string);
+    let cache_key = crate::formats::yarn::berry_gates::cache_key(&blocks).map(str::to_string);
     let mut entries = yarn_entries(blocks, split_berry_key_patterns);
     entries.retain(|e| e.block.key != "__metadata");
     BerryLock { cache_key, entries }
