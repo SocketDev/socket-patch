@@ -5893,6 +5893,61 @@ wheels = [
             .exists());
     }
 
+    /// #979: an inline `[tool.uv] sources = {…}` table is refused by the
+    /// preflight, so the dry run previews the same `pypi_uv_lock_parse_failed`
+    /// refusal as the real run (which refuses before any download or write)
+    /// instead of previewing a clean vendor.
+    #[tokio::test]
+    async fn uv_inline_sources_table_refused_in_dry_and_wet_runs() {
+        let pyproject =
+            format!("{UV_PYPROJECT}\n[tool.uv]\nsources = {{ idna = {{ index = \"pypi\" }} }}\n");
+        let fx = e2e_fixture().await;
+        swap_to_lock_flavor(
+            &fx,
+            &[
+                ("pyproject.toml", pyproject.as_str()),
+                ("uv.lock", UV_LOCK_REGISTRY),
+            ],
+        )
+        .await;
+        let sources = PatchSources::blobs_only(&fx.blobs);
+        for dry_run in [true, false] {
+            let outcome = crate::vendor::test_support::vendor_pypi(
+                "pkg:pypi/six@1.16.0",
+                &fx.site_packages,
+                &fx.root,
+                &fx.record,
+                &sources,
+                "2026-06-09T00:00:00Z",
+                dry_run,
+                false,
+                None,
+            )
+            .await;
+            let VendorOutcome::Refused { code, detail } = outcome else {
+                panic!("dry_run={dry_run}: expected Refused, got {outcome:?}");
+            };
+            assert_eq!(code, "pypi_uv_lock_parse_failed", "dry_run={dry_run}");
+            assert_eq!(
+                detail, "pyproject.toml [tool.uv.sources] is not a standard table",
+                "dry_run={dry_run}"
+            );
+            assert_eq!(
+                tokio::fs::read_to_string(fx.root.join("pyproject.toml"))
+                    .await
+                    .unwrap(),
+                pyproject
+            );
+            assert_eq!(
+                tokio::fs::read_to_string(fx.root.join("uv.lock"))
+                    .await
+                    .unwrap(),
+                UV_LOCK_REGISTRY
+            );
+            assert!(!uuid_dir_of(&fx).exists(), "dry_run={dry_run}");
+        }
+    }
+
     /// Deleting ONLY the committed wheel (the marker file survives) must
     /// still take the artifact-only rebuild: `uuid_dir_has_wheel` scans the
     /// surviving entries for a `.whl` rather than keying on dir existence.

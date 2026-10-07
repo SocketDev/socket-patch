@@ -682,6 +682,19 @@ async fn uv_project_environment_site_packages(
     var: &impl Fn(&str) -> Option<String>,
 ) -> Option<Vec<PathBuf>> {
     let env = var("UV_PROJECT_ENVIRONMENT").filter(|v| !v.trim().is_empty())?;
+    let uv_project = cwd.join("uv.lock").is_file()
+        || (cwd.join("pyproject.toml").is_file() && !claimed_by_non_uv_manager(cwd).await);
+    if !uv_project {
+        return None;
+    }
+    let found = find_site_packages_under(&cwd.join(env), "site-packages").await;
+    (!found.is_empty()).then_some(found)
+}
+
+/// Whether a manager other than uv records or locks the project at `cwd`:
+/// Poetry, PDM or Pipenv files, or a lockless Poetry (`[tool.poetry]`) or
+/// PDM project.
+async fn claimed_by_non_uv_manager(cwd: &Path) -> bool {
     let other_lock = [
         "poetry.lock",
         "poetry.toml",
@@ -692,19 +705,34 @@ async fn uv_project_environment_site_packages(
     ]
     .iter()
     .any(|marker| cwd.join(marker).exists());
-    // A lockless Poetry (`[tool.poetry]`) or PDM project is still theirs.
-    let other_manager = other_lock
+    other_lock
         || is_pdm_project(cwd).await
         || read_regular_to_string(&cwd.join("pyproject.toml"))
             .await
-            .is_ok_and(|text| text.contains("[tool.poetry"));
-    let uv_project =
-        cwd.join("uv.lock").is_file() || (cwd.join("pyproject.toml").is_file() && !other_manager);
-    if !uv_project {
-        return None;
+            .is_ok_and(|text| text.contains("[tool.poetry"))
+}
+
+/// Whether only uv installs for `cwd`, so its env is only ever uv's own: a
+/// `uv.lock` no other manager shares (uv syncs it into `./.venv` or
+/// `UV_PROJECT_ENVIRONMENT`), or a directory whose only Python markers are
+/// PEP 723 script locks (`*.py.lock`, whose envs live in uv's cache).
+async fn uv_owns_project_env(cwd: &Path) -> bool {
+    if claimed_by_non_uv_manager(cwd).await {
+        return false;
     }
-    let found = find_site_packages_under(&cwd.join(env), "site-packages").await;
-    (!found.is_empty()).then_some(found)
+    if cwd.join("uv.lock").is_file() {
+        return true;
+    }
+    let other_marker = [
+        "pyproject.toml",
+        "setup.py",
+        "setup.cfg",
+        "requirements.txt",
+    ]
+    .iter()
+    .any(|marker| cwd.join(marker).exists());
+    let locks = crate::utils::python_lock::python_lock_paths(cwd).unwrap_or_default();
+    !other_marker && !locks.is_empty() && locks.iter().all(|name| name.ends_with(".py.lock"))
 }
 
 /// Whether `cwd` is a Pipenv project: a `Pipfile` or a `Pipfile.lock`.
@@ -3065,15 +3093,15 @@ impl PythonCrawler {
     ///      `.venv`, and `venv` directories, then Poetry's and Pipenv's
     ///      out-of-tree virtualenvs.
     ///   2. If no venv was found AND the cwd looks like a Python
-    ///      project (see `is_python_project`) that is not a Pipenv
-    ///      project (whose env is only ever Pipenv's own), fall through
+    ///      project (see `is_python_project`) whose env is not only ever
+    ///      Pipenv's own (`is_pipenv_project`) or uv's own (see
+    ///      `uv_owns_project_env`), fall through
     ///      to `get_global_python_site_packages`. This mirrors the
     ///      cargo / ruby / go pattern where a project marker
     ///      indicates "scan this ecosystem globally for this project".
     ///
-    /// Without the marker fallback, a fresh clone with
-    /// `pyproject.toml` + `uv.lock` but no `.venv` would silently
-    /// return zero packages.
+    /// A fresh uv clone (`uv.lock`, no `.venv` yet) returns nothing:
+    /// its lock-only packages come from `uv.lock` instead.
     pub async fn get_site_packages_paths(
         &self,
         options: &CrawlerOptions,
@@ -3093,6 +3121,12 @@ impl PythonCrawler {
         // installed for the project, and its lock-only packages come from
         // `Pipfile.lock`; the OS Python is never its env (#504, #947).
         if is_pipenv_project(&options.cwd) {
+            return Ok(Vec::new());
+        }
+        // A uv project or script lock installs only into uv's own env. With
+        // none synced yet nothing is installed for it, and its lock-only
+        // packages come from the lock; the OS Python is never its env (#964).
+        if uv_owns_project_env(&options.cwd).await {
             return Ok(Vec::new());
         }
         if is_python_project(&options.cwd).await {
