@@ -641,10 +641,14 @@ pub async fn read_candidate_files(
             .retain(|rel| !gradle_unreadable.contains(rel));
     } else {
         // No readable Gradle build: the Gradle planner never runs, so a
-        // stray Gradle file it would own (a lone settings script, a lock)
-        // is never rewritten and must not refuse the rest of the run.
-        out.undecodable_reads
-            .retain(|rel| !is_gradle_owned_file(rel));
+        // stray Gradle file it would own (a lock, a nested script) is never
+        // rewritten and must not refuse the rest of the run. A root build
+        // or settings script still refuses: it may be the build itself,
+        // unreadable, which the planner would otherwise skip silently.
+        out.undecodable_reads.retain(|rel| {
+            !is_gradle_owned_file(rel)
+                || crate::patch::redirect::gradle::GRADLE_ROOT_FILES.contains(&rel.as_str())
+        });
     }
     // An sbt build's resolution evidence rides a synthetic key (see
     // `patch::redirect::sbt::SBT_RESOLUTION_KEY`).
@@ -1990,8 +1994,14 @@ pub fn undecodable_guard(undecodable: &[String], candidates: &[Candidate]) -> Op
         .find(|rel| {
             // The root manifest is read strictly only as a yarn berry
             // rewrite target (its `resolutions`); advisory reads never
-            // record it, so here it is always an npm rewrite target.
-            let eco = file_ecosystem(rel).or((rel.as_str() == "package.json").then_some("npm"));
+            // record it, so here it is always an npm rewrite target. A root
+            // Gradle script left here (no readable build beside it) may be
+            // the build itself, which only maven candidates could patch.
+            let eco = file_ecosystem(rel)
+                .or((rel.as_str() == "package.json").then_some("npm"))
+                .or(crate::patch::redirect::gradle::GRADLE_ROOT_FILES
+                    .contains(&rel.as_str())
+                    .then_some("maven"));
             eco.is_some_and(|eco| candidates.iter().any(|c| c.dep.ecosystem == eco))
         })
         .map(|rel| undecodable_refusal(rel))
@@ -2958,22 +2968,26 @@ mod tests {
     }
 
     /// #721 review: with no readable Gradle build the Gradle planner never
-    /// runs, so a stray non-UTF-8 Gradle file (a lone settings script, a
-    /// lock) does not refuse the rest of a Maven run.
+    /// runs, so a stray non-UTF-8 Gradle lock does not refuse the rest of a
+    /// Maven run. A non-UTF-8 root build or settings script does: it may be
+    /// the whole build, unreadable, which would otherwise be skipped
+    /// silently (a Gradle-only project exiting 0 unpatched).
     #[tokio::test]
-    async fn a_stray_non_utf8_gradle_file_does_not_refuse_a_maven_run() {
+    async fn non_utf8_gradle_files_without_a_readable_build() {
         const POM: &str = "<project><dependencies><dependency><groupId>com.socketfixture</groupId><artifactId>victim</artifactId><version>1.10.0</version></dependency></dependencies></project>\n";
         let latin1: &[u8] = b"rootProject.name = 'Andr\xe9'\n";
+        let candidates = vec![gradle_candidate()];
+
+        // A stray lock beside a pom.xml: not refused.
         let tmp = tempfile::tempdir().unwrap();
         std::fs::write(tmp.path().join("pom.xml"), POM).unwrap();
-        std::fs::write(tmp.path().join("settings.gradle"), latin1).unwrap();
         std::fs::write(tmp.path().join("gradle.lockfile"), latin1).unwrap();
         let mut memory = MemoryProject::new();
         memory.insert_text("pom.xml", POM);
-        for rel in ["settings.gradle", "gradle.lockfile"] {
-            memory.insert(rel, MemoryEntry::Binary(latin1.to_vec().into()));
-        }
-        let candidates = vec![gradle_candidate()];
+        memory.insert(
+            "gradle.lockfile",
+            MemoryEntry::Binary(latin1.to_vec().into()),
+        );
         for view in [ProjectView::Disk(tmp.path()), ProjectView::Memory(&memory)] {
             let (read, done) = gradle_rewrite_in(&view).await;
             assert!(
@@ -2982,6 +2996,21 @@ mod tests {
                 read.undecodable_reads
             );
             assert!(guard(&view, &done, &candidates).is_none());
+        }
+
+        // A Gradle-only project whose root scripts are all non-UTF-8:
+        // refused, never skipped.
+        for root in ["settings.gradle", "build.gradle", "build.gradle.kts"] {
+            let tmp = tempfile::tempdir().unwrap();
+            std::fs::write(tmp.path().join(root), latin1).unwrap();
+            let mut memory = MemoryProject::new();
+            memory.insert(root, MemoryEntry::Binary(latin1.to_vec().into()));
+            for view in [ProjectView::Disk(tmp.path()), ProjectView::Memory(&memory)] {
+                let (read, done) = gradle_rewrite_in(&view).await;
+                assert_eq!(read.undecodable_reads, vec![root.to_string()]);
+                let refusal = guard(&view, &done, &candidates).expect("refused");
+                assert_eq!(refusal.code, UNREADABLE_REFUSAL);
+            }
         }
     }
 
