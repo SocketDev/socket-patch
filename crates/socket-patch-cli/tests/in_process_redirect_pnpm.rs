@@ -1241,10 +1241,10 @@ fn assert_refused_lock_elsewhere(
     );
     assert_eq!(doc["status"], "error", "{doc}");
     assert_eq!(
-        doc["errorCode"], "redirect_pnpm_lockfile_elsewhere",
+        doc["error"]["code"], "redirect_pnpm_lockfile_elsewhere",
         "{doc}"
     );
-    let message = doc["error"].as_str().unwrap_or_default();
+    let message = doc["error"]["message"].as_str().unwrap_or_default();
     assert!(
         message.contains("pnpm-lock.yaml") && message.contains("nothing was written"),
         "the error names the governing lock: {message}"
@@ -1464,10 +1464,10 @@ async fn hosted_scan_from_pnpm_member_with_own_lock_never_nests_trust_config() {
     assert_eq!(code, Some(1), "{doc}");
     assert_eq!(doc["status"], "error", "{doc}");
     assert_eq!(
-        doc["errorCode"], "redirect_pnpm_settings_elsewhere",
+        doc["error"]["code"], "redirect_pnpm_settings_elsewhere",
         "{doc}"
     );
-    let message = doc["error"].as_str().unwrap_or_default();
+    let message = doc["error"]["message"].as_str().unwrap_or_default();
     assert!(
         message.contains(&root_ws.display().to_string())
             && message.contains("trustLockfile: true")
@@ -1650,10 +1650,10 @@ fn assert_refused_workspace_lock_elsewhere(
     );
     assert_eq!(doc["status"], "error", "{case}: {doc}");
     assert_eq!(
-        doc["errorCode"], "redirect_workspace_lockfile_elsewhere",
+        doc["error"]["code"], "redirect_workspace_lockfile_elsewhere",
         "{case}: {doc}"
     );
-    let message = doc["error"].as_str().unwrap_or_default();
+    let message = doc["error"]["message"].as_str().unwrap_or_default();
     let lock_name = lock.file_name().unwrap().to_str().unwrap();
     assert!(
         message.contains(lock_name) && message.contains("nothing was written"),

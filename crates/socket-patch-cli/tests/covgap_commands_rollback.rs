@@ -514,7 +514,7 @@ fn corrupt_manifest_json_errors_in_both_modes() {
     let v = parse_envelope(&stdout, &stderr);
     assert_eq!(v["status"], "error", "stdout=\n{stdout}");
     assert!(
-        v["error"]
+        v["error"]["message"]
             .as_str()
             .is_some_and(|e| e.contains("Failed to parse manifest JSON")),
         "the error must name the parse failure; stdout=\n{stdout}"
@@ -572,7 +572,9 @@ fn blobs_path_as_file_yields_legacy_error_envelope() {
     let v = parse_envelope(&stdout, &stderr);
     assert_eq!(v["status"], "error", "stdout=\n{stdout}");
     assert!(
-        v["error"].as_str().is_some_and(|e| !e.is_empty()),
+        v["error"]["message"]
+            .as_str()
+            .is_some_and(|e| !e.is_empty()),
         "the envelope carries the io error; stdout=\n{stdout}"
     );
     assert_eq!(v["rolledBack"], 0, "stdout=\n{stdout}");
@@ -705,7 +707,7 @@ fn ledgerless_wired_lock_errors_with_state_json_guidance() {
     let v = parse_envelope(&stdout, &stderr);
     assert_eq!(v["status"], "error", "stdout=\n{stdout}");
     assert!(
-        v["error"].as_str().is_some_and(|e| {
+        v["error"]["message"].as_str().is_some_and(|e| {
             e.contains("lockfiles still reference .socket/vendor/ artifacts")
                 && e.contains("restore .socket/vendor/state.json")
         }),
@@ -2499,7 +2501,7 @@ fn manifest_deleted_under_held_lock_fails_with_invalid_manifest() {
         );
         let v = parse_envelope(&stdout, &stderr);
         assert_eq!(v["status"], "error", "stdout=\n{stdout}");
-        match v["error"].as_str() {
+        match v["error"]["message"].as_str() {
             Some("Invalid manifest") => return, // target interleaving reached
             Some("Manifest not found") => continue, // probed after the delete — retry
             other => panic!(

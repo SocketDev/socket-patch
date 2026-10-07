@@ -678,8 +678,8 @@ async fn takeover_refuses_symlinked_wiring_file_before_reverting() {
             "dry_run={dry_run}: a symlinked revert target fails the run: {doc:#}"
         );
         assert_eq!(doc["status"], "error", "dry_run={dry_run}: {doc:#}");
-        assert_eq!(doc["errorCode"], CODE, "dry_run={dry_run}: {doc:#}");
-        let error = doc["error"].as_str().unwrap_or_default();
+        assert_eq!(doc["error"]["code"], CODE, "dry_run={dry_run}: {doc:#}");
+        let error = doc["error"]["message"].as_str().unwrap_or_default();
         assert!(
             error.starts_with("package-lock.json is a symbolic link")
                 && error.ends_with("nothing was written"),
@@ -738,9 +738,9 @@ async fn hosted_lock_held_refuses_before_any_write() {
     let (code, doc) = scan_hosted_json(root, &server.uri(), &[], &[]);
     assert_eq!(code, 1, "a held lock refuses the wet run: {doc:#}");
     assert_eq!(doc["status"], "error", "{doc:#}");
-    assert_eq!(doc["errorCode"], "lock_held", "{doc:#}");
+    assert_eq!(doc["error"]["code"], "lock_held", "{doc:#}");
     assert_eq!(
-        doc["error"], HELD,
+        doc["error"]["message"], HELD,
         "no --lock-timeout: no waited clause; {doc:#}"
     );
     assert_eq!(
@@ -845,7 +845,7 @@ async fn zero_grant_wet_run_ignores_a_malformed_pre_v5_ledger() {
             .unwrap();
     let (code, doc) = scan_hosted_json(root, &no_grant.uri(), &[], &[]);
     assert_ne!(
-        doc["errorCode"], "lock_held",
+        doc["error"]["code"], "lock_held",
         "a zero-grant run never contends: {doc:#}"
     );
     assert_ignored(code, &doc, "held lock");
@@ -894,8 +894,8 @@ async fn hosted_lock_io_when_a_file_squats_on_socket_dir() {
     let (code, doc) = scan_hosted_json(root, &server.uri(), &[], &[]);
     assert_eq!(code, 1, "{doc:#}");
     assert_eq!(doc["status"], "error", "{doc:#}");
-    assert_eq!(doc["errorCode"], "lock_io", "{doc:#}");
-    let error = doc["error"].as_str().unwrap_or_default();
+    assert_eq!(doc["error"]["code"], "lock_io", "{doc:#}");
+    let error = doc["error"]["message"].as_str().unwrap_or_default();
     assert!(
         error.starts_with("failed to open lock file at ") && error.contains(".socket"),
         "the fault names the squatting path: {error}"
