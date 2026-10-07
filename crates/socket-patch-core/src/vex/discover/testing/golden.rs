@@ -301,8 +301,9 @@ fn corpus() -> Vec<CorpusEntry> {
         let name = top.file_name().unwrap().to_string_lossy().into_owned();
         match name.as_str() {
             GOLDEN_DIR => {}
-            // Tables and store listings, not projects.
-            "vlt" | "vlt-trees" | "vendor" => {}
+            // Tables and store listings, not projects (`sbt`: build-tool
+            // resolution records, read by the sbt evidence parser only).
+            "vlt" | "vlt-trees" | "vendor" | "sbt" => {}
             // Redirect cases: `<eco>/<flavor>/<case>/{input,expected}` —
             // each side is a project root (nested files included).
             "redirect" => {
@@ -521,7 +522,7 @@ mod tests {
     #[test]
     fn table_fixture_dirs_are_not_corpus_projects() {
         let corpus = corpus();
-        for skipped in ["vlt", "vlt-trees", "vendor"] {
+        for skipped in ["vlt", "vlt-trees", "vendor", "sbt"] {
             let nested = format!("{skipped}/");
             assert!(
                 corpus

@@ -2557,23 +2557,27 @@ async fn apply_maven_base(m: &MavenBase<'_>) -> MavenApplied {
     // a mavenLocal() artifact in files-2.1, so this is also exactly what a
     // build reading the module from mavenLocal() looks like: warn, not
     // refuse. `vex` re-hashes the Gradle cache copy that build makes.
+    // Only the `~/.m2` copies are named: a Coursier / Ivy copy beside them
+    // (an sbt build in the same root) is no Maven local repository.
+    let m2_copies: Vec<String> = copies
+        .consumed
+        .iter()
+        .filter(|c| c.starts_with(&m.scope.env.m2_repo))
+        .map(|p| p.display().to_string())
+        .collect();
     if matches!(
         m.scope.gate,
         Some(socket_patch_core::crawlers::maven_crawler::M2Gate::Declared(_))
             | Some(socket_patch_core::crawlers::maven_crawler::M2Gate::Undetermined(_))
-    ) && copies.consumed.iter().all(|c| !is_gradle_version_dir(c))
+    ) && !m2_copies.is_empty()
+        && copies.consumed.iter().all(|c| !is_gradle_version_dir(c))
     {
         out.warn(
             "gradle_m2_may_be_unconsumed",
             format!(
                 "{}: the only patched copy is in the Maven local repository ({}). This Gradle                  build reads it only when no repository declared before mavenLocal() has the                  module; otherwise its next build downloads the unpatched jar. Run the build                  once and apply again so the Gradle cache copy is patched too.",
                 normalize_purl(m.base_purl),
-                copies
-                    .consumed
-                    .iter()
-                    .map(|p| p.display().to_string())
-                    .collect::<Vec<_>>()
-                    .join(", ")
+                m2_copies.join(", ")
             ),
         );
     }
@@ -2646,16 +2650,22 @@ async fn apply_maven_base(m: &MavenBase<'_>) -> MavenApplied {
             // holds are applied against the version dir, where they are
             // not found and fail the copy as they would on `~/.m2` (the
             // build still loads the held jar, so a silent skip would leave
-            // it unpatched behind a clean exit).
-            let (targets, absent) = if is_gradle_version_dir(copy) {
+            // it unpatched behind a clean exit). An Ivy copy expands the
+            // same way over its module's type dirs (`jars/`, `srcs/`, …).
+            let (targets, absent) = if gradle_cache::expands(copy) {
                 let detailed = gradle_cache::installed_copies_detailed(copy, &patch.files);
                 if detailed.targets.is_empty() {
                     continue;
                 }
+                // Only a Gradle hash dir's name proves its bytes are the
+                // pristine download; an Ivy type dir no variant matches is
+                // skipped as a `~/.m2` or Coursier copy is.
                 for (dir, _) in &detailed.targets {
-                    held.entry(dir.clone())
-                        .or_default()
-                        .push((*variant).clone());
+                    if maven_sidecars::is_gradle_hash_dir(dir) {
+                        held.entry(dir.clone())
+                            .or_default()
+                            .push((*variant).clone());
+                    }
                 }
                 let absent: HashMap<String, PatchFileInfo> = detailed
                     .missing
@@ -2751,11 +2761,12 @@ async fn apply_maven_base(m: &MavenBase<'_>) -> MavenApplied {
     }
     out.matched.sort();
     out.matched.dedup();
-    // Nothing attempted. Gradle version dirs that hold none of a record's
-    // files (a pom-only entry, another classifier) are not installs of it:
-    // the variants stay unmatched (`package_not_installed`). A `~/.m2` copy
-    // no variant matches is a different distribution: an error, as before.
-    let gradle_only = copies.consumed.iter().all(|c| is_gradle_version_dir(c));
+    // Nothing attempted. Gradle version dirs and Ivy artifact dirs that
+    // hold none of a record's files (a pom-only entry, another classifier)
+    // are not installs of it: the variants stay unmatched
+    // (`package_not_installed`). A `~/.m2` copy no variant matches is a
+    // different distribution: an error, as before.
+    let gradle_only = copies.consumed.iter().all(|c| gradle_cache::expands(c));
     if !attempted && !out.failed && !gradle_only {
         out.failed = true;
         if args.prints_errors() {
@@ -3300,6 +3311,75 @@ mod tests {
             HashSet::from(["3".repeat(64)]),
             "the qualified variant's mismatched file must have its afterHash blob queued"
         );
+    }
+
+    /// A Maven GAV in two caches: only the second (Coursier) copy holds the
+    /// classifier jar, with a locally modified sibling file. The variant
+    /// gate runs per copy, as the apply loop attempts it per copy, so the
+    /// sibling's afterHash blob is queued although the first copy lacks the
+    /// classifier.
+    #[tokio::test]
+    async fn mismatch_blob_gaps_gates_each_maven_copy() {
+        use socket_patch_core::hash::git_sha256::compute_git_sha256_from_bytes;
+
+        let dir = tempfile::tempdir().unwrap();
+        let m2 = dir.path().join("m2/g/a/1");
+        let csr = dir.path().join("csr/https/h/g/a/1");
+        for copy in [&m2, &csr] {
+            tokio::fs::create_dir_all(copy).await.unwrap();
+            tokio::fs::write(copy.join("a-1.jar"), b"jar\n")
+                .await
+                .unwrap();
+        }
+        tokio::fs::write(csr.join("a-1-tests.jar"), b"tests\n")
+            .await
+            .unwrap();
+        tokio::fs::write(csr.join("z-tests.txt"), b"locally modified\n")
+            .await
+            .unwrap();
+        let blobs = dir.path().join("blobs");
+        tokio::fs::create_dir_all(&blobs).await.unwrap();
+        let mut base = HashMap::new();
+        base.insert(
+            "a-1.jar".to_string(),
+            PatchFileInfo {
+                before_hash: compute_git_sha256_from_bytes(b"jar\n"),
+                after_hash: "1".repeat(64),
+            },
+        );
+        let mut manifest = manifest_with_record("pkg:maven/g/a@1", base);
+        let mut tests = HashMap::new();
+        tests.insert(
+            "a-1-tests.jar".to_string(),
+            PatchFileInfo {
+                before_hash: compute_git_sha256_from_bytes(b"tests\n"),
+                after_hash: "2".repeat(64),
+            },
+        );
+        tests.insert(
+            "z-tests.txt".to_string(),
+            PatchFileInfo {
+                before_hash: compute_git_sha256_from_bytes(b"pristine\n"),
+                after_hash: "3".repeat(64),
+            },
+        );
+        manifest.patches.insert(
+            "pkg:maven/g/a@1?classifier=tests".to_string(),
+            PatchRecord {
+                uuid: "22222222-2222-4222-8222-222222222222".to_string(),
+                exported_at: "2024-01-01T00:00:00Z".to_string(),
+                files: tests,
+                vulnerabilities: HashMap::new(),
+                description: "fixture".to_string(),
+                license: "MIT".to_string(),
+                tier: "free".to_string(),
+            },
+        );
+        let mut all_packages = HashMap::new();
+        all_packages.insert("pkg:maven/g/a@1".to_string(), vec![m2.clone(), csr.clone()]);
+        let needed =
+            mismatch_blob_gaps(&manifest, &all_packages, &HashSet::new(), &blobs, false).await;
+        assert_eq!(needed, HashSet::from(["3".repeat(64)]));
     }
 
     /// The counterpart guard: a sibling variant that does NOT describe the

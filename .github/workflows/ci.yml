@@ -587,13 +587,14 @@ jobs:
     # the highest base that's forward-compatible with debian:12.
     needs: docker-base
     runs-on: ubuntu-22.04
-    timeout-minutes: 30
+    # sbt's image bakes three JDKs and warm sbt / Mill / scala-cli caches.
+    timeout-minutes: ${{ matrix.ecosystem == 'sbt' && 45 || 30 }}
     permissions:
       contents: read
     strategy:
       fail-fast: false
       matrix:
-        ecosystem: [npm, pypi, gem, cargo, golang, maven, composer, nuget, deno]
+        ecosystem: [npm, pypi, gem, cargo, golang, maven, composer, nuget, deno, sbt]
     steps:
       - name: Checkout
         uses: actions/checkout@de0fac2e4500dabe0009e67214ff5f5447ce83dd # v6.0.2
@@ -673,18 +674,29 @@ jobs:
           # Vendor build-proof capstones ride the same image as their
           # ecosystem's main suite (extend the case as new vendor suites land).
           EXTRA=""
+          # libtest arguments after `--`.
+          FILTER=""
           case "${{ matrix.ecosystem }}" in
             composer) EXTRA="--test docker_e2e_vendor_composer" ;;
             gem)      EXTRA="--test docker_e2e_vendor_gem" ;;
             maven)    EXTRA="--test docker_e2e_vendor_maven" ;;
             nuget)    EXTRA="--test docker_e2e_vendor_nuget" ;;
             pypi)     EXTRA="--test docker_e2e_vendor_pypi_pm" ;;
+            # The blocking sbt slice: the agent cells on 1.2.8 (Ivy) and
+            # 1.13.0 (Coursier, plus the `useCoursier := false` Ivy cell).
+            # Mill, scala-cli and the other sbt lines run nightly in
+            # e2e-docker and in sbt-compatibility.yml.
+            sbt)
+              export SOCKET_PATCH_SBT_DOCKER_VERSIONS="1.2.8 1.13.0"
+              export SOCKET_PATCH_DOCKER_E2E_REQUIRED=1
+              FILTER="agent_sbt_ --test-threads=1" ;;
           esac
-          # shellcheck disable=SC2086 # EXTRA is intentionally word-split
+          # shellcheck disable=SC2086 # EXTRA and FILTER are intentionally word-split
           cargo llvm-cov \
             --features docker-e2e \
             --no-report \
-            --test docker_e2e_${{ matrix.ecosystem }} $EXTRA
+            --test docker_e2e_${{ matrix.ecosystem }} $EXTRA \
+            -- $FILTER
 
       - name: Generate per-ecosystem lcov
         run: |
@@ -1209,6 +1221,12 @@ jobs:
           - {os: ubuntu-latest, suite: 'e2e_gradle_discovery_build e2e_gradle_agent_build e2e_redirect_gradle_build', jvm_tool: gradle, gradle: '9.8.0', java: '21', test_filter: '--ignored gradle_agent_ gradle_hosted_'}
           - {os: ubuntu-latest, suite: 'e2e_vendor_gradle_build e2e_vendor_jvm_build', jvm_tool: gradle, gradle: '9.8.0', java: '21', test_filter: '--ignored gradle_vendor_ gradle_multi_project'}
           - {os: windows-latest, suite: e2e_vendor_jvm_build, jvm_tool: gradle, gradle: '8.14.3', java: '17', test_filter: '--ignored gradle_multi_project'}
+          # Real-sbt hosted (socket-patch.sbt) + vendored
+          # (socket-patch-vendor.sbt) capstones on the current 1.x line. The
+          # other sbt lines, JDK 21, the agent cells beyond coverage-docker's,
+          # Mill, scala-cli and macOS / Windows are sbt-compatibility.yml.
+          - {os: ubuntu-latest, suite: e2e_sbt_build, jvm_tool: sbt, sbt: '1.13.0', test_filter: '--ignored --test-threads=1'}
+          - {os: ubuntu-latest, suite: e2e_sbt_vendor_build, jvm_tool: sbt, sbt: '1.13.0', test_filter: '--ignored --test-threads=1'}
           # Real .NET SDK capstones: hosted + vendored nuget, one leg per SDK
           # major (the suite pins the major through a sandbox global.json):
           # the oldest and newest here, 7-9 on ubuntu in e2e-full.
@@ -1425,6 +1443,25 @@ jobs:
           distribution: temurin
           java-version: ${{ matrix.java || '17' }}
 
+      - name: Setup sbt (sbt legs)
+        if: matrix.sbt != ''
+        # The sbt launcher script; it boots whatever `sbt.version` each
+        # fixture's project/build.properties pins.
+        uses: sbt/setup-sbt@6158cb0903b8ceeae04f830055f3155e1b6a5ad7 # v1.5.11
+        with:
+          sbt-runner-version: 1.13.0
+          disk-cache: false
+
+      - name: Warm the sbt seed (sbt legs)
+        if: matrix.sbt != ''
+        # Boots the pinned sbt once into a seed the suites hard-link into
+        # each test's private caches (SOCKET_PATCH_SBT_E2E_SEED), and names
+        # the launcher (SOCKET_PATCH_SBT_E2E_SBT).
+        shell: bash
+        env:
+          SBT_TEST_VERSION: ${{ matrix.sbt }}
+        run: scripts/sbt-warm-seed.sh "$SBT_TEST_VERSION" "$RUNNER_TEMP/sbt-seed" >> "$GITHUB_ENV"
+
       - name: Install Maven ${{ matrix.maven || '3.9.16' }}
         if: steps.jvm.outputs.maven == 'true'
         # Straight from the Apache archive (sha512-verified), so a leg gets
@@ -1570,6 +1607,8 @@ jobs:
           SOCKET_PATCH_DOTNET_E2E_VERSION: ${{ matrix.dotnet }}
           SOCKET_PATCH_DENO_E2E_REQUIRED: ${{ matrix.deno != '' && '1' || '' }}
           SOCKET_PATCH_DENO_E2E_VERSION: ${{ matrix.deno }}
+          SOCKET_PATCH_SBT_E2E_REQUIRED: ${{ matrix.sbt != '' && '1' || '' }}
+          SOCKET_PATCH_SBT_E2E_VERSION: ${{ matrix.sbt }}
           E2E_SUITE: ${{ matrix.suite }}
           E2E_TEST_FILTER: ${{ matrix.test_filter || '--ignored' }}
           E2E_JVM_TOOL: ${{ matrix.jvm_tool }}
@@ -1716,13 +1755,13 @@ jobs:
     if: github.event_name == 'schedule' || github.event_name == 'workflow_dispatch' || github.head_ref == 'release/v5-prerelease'
     needs: docker-base
     runs-on: ubuntu-latest
-    timeout-minutes: 35
+    timeout-minutes: ${{ matrix.ecosystem == 'sbt' && 45 || 35 }}
     permissions:
       contents: read
     strategy:
       fail-fast: false
       matrix:
-        ecosystem: [npm, pypi, gem, cargo, golang, maven, composer, nuget, deno]
+        ecosystem: [npm, pypi, gem, cargo, golang, maven, composer, nuget, deno, sbt]
     steps:
       - name: Checkout
         uses: actions/checkout@de0fac2e4500dabe0009e67214ff5f5447ce83dd # v6.0.2
@@ -1771,13 +1810,20 @@ jobs:
         # run only in coverage-docker.
         run: |
           EXTRA=""
+          FILTER=""
           case "${{ matrix.ecosystem }}" in
             composer) EXTRA="--test docker_e2e_vendor_composer" ;;
             nuget)    EXTRA="--test docker_e2e_vendor_nuget" ;;
             pypi)     EXTRA="--test docker_e2e_vendor_pypi_pm" ;;
+            # Every sbt / Mill / scala-cli agent cell (the full sbt version
+            # x mode matrix is sbt-compatibility.yml).
+            sbt)
+              export SOCKET_PATCH_SBT_DOCKER_VERSIONS="1.2.8 1.13.0"
+              export SOCKET_PATCH_DOCKER_E2E_REQUIRED=1
+              FILTER="--test-threads=1" ;;
           esac
-          # shellcheck disable=SC2086 # EXTRA is intentionally word-split
-          cargo test -p socket-patch-cli --features docker-e2e --test "docker_e2e_${{ matrix.ecosystem }}" $EXTRA
+          # shellcheck disable=SC2086 # EXTRA and FILTER are intentionally word-split
+          cargo test -p socket-patch-cli --features docker-e2e --test "docker_e2e_${{ matrix.ecosystem }}" $EXTRA -- $FILTER
 
   # ----------------------------------------------------------------------
   # Per-release real-toolchain matrices for the manifest-less VEX work that

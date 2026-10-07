@@ -70,8 +70,7 @@ pub fn hash_eq(dir_name: &str, sha1_hex: &str) -> bool {
 /// Whether `bytes` are the pristine download Gradle stored in the hash
 /// directory `dir_name` (their sha1 names it).
 pub fn pristine(dir_name: &str, bytes: &[u8]) -> bool {
-    use sha1::{Digest, Sha1};
-    hash_eq(dir_name, &hex::encode(Sha1::digest(bytes)))
+    hash_eq(dir_name, &crate::utils::digest::sha1_hex_of(bytes))
 }
 
 /// Whether `path` is a version directory of a `files-2.1` tree
@@ -209,15 +208,21 @@ pub struct GradleTargets {
 /// file name (`package/` prefix dropped) is looked up in every hash
 /// directory: a file present in two hash dirs (a re-download whose bytes
 /// changed) yields two targets, and a jar and its pom in different hash
-/// dirs yield one target each, keyed by the bare file name. Keys no hash
-/// dir holds stay joined onto the version dir itself, so verification
-/// reports them as not found instead of dropping them. Any other path is
-/// returned as is: `[(pkg_path, files)]`.
+/// dirs yield one target each, keyed by the bare file name. An Ivy
+/// artifact directory ([`ivy_cache::is_artifact_dir`]) expands the same
+/// way over its module's artifact type directories (`jars/`, `bundles/`,
+/// `orbits/`, `srcs/`, `docs/`): a sources jar sits in `srcs/`, beside the
+/// `jars/` the crawler reports. Keys no directory holds stay joined onto
+/// `pkg_path` itself, so verification reports them as not found instead
+/// of dropping them. Any other path is returned as is:
+/// `[(pkg_path, files)]`.
+///
+/// [`ivy_cache::is_artifact_dir`]: super::ivy_cache::is_artifact_dir
 pub fn installed_copies(
     pkg_path: &Path,
     files: &HashMap<String, PatchFileInfo>,
 ) -> Vec<(PathBuf, HashMap<String, PatchFileInfo>)> {
-    if !is_gradle_version_dir(pkg_path) {
+    if !expands(pkg_path) {
         return vec![(pkg_path.to_path_buf(), files.clone())];
     }
     let GradleTargets {
@@ -234,12 +239,30 @@ pub fn installed_copies(
     targets
 }
 
-/// [`installed_copies`] with the keys no hash directory holds reported
-/// apart. For a non-Gradle path every key is in the one identity target.
+/// Whether [`installed_copies`] expands `pkg_path` (a Gradle version
+/// directory or an Ivy artifact directory) instead of joining the keys
+/// onto it as is.
+pub fn expands(pkg_path: &Path) -> bool {
+    is_gradle_version_dir(pkg_path) || super::ivy_cache::is_artifact_dir(pkg_path)
+}
+
+/// [`installed_copies`] with the keys no hash (or Ivy type) directory
+/// holds reported apart. For any other path every key is in the one
+/// identity target.
 pub fn installed_copies_detailed(
     pkg_path: &Path,
     files: &HashMap<String, PatchFileInfo>,
 ) -> GradleTargets {
+    if super::ivy_cache::is_artifact_dir(pkg_path) {
+        // Directories are siblings of `pkg_path`, joined onto its parent.
+        let Some(module_dir) = pkg_path.parent() else {
+            return GradleTargets {
+                targets: vec![(pkg_path.to_path_buf(), files.clone())],
+                missing: Vec::new(),
+            };
+        };
+        return expand_into(module_dir, &super::ivy_cache::type_dirs(module_dir), files);
+    }
     if !is_gradle_version_dir(pkg_path) {
         return GradleTargets {
             targets: vec![(pkg_path.to_path_buf(), files.clone())],
@@ -251,6 +274,18 @@ pub fn installed_copies_detailed(
         .filter(|(name, is_dir)| *is_dir && is_hash_dir_name(name))
         .map(|(name, _)| name)
         .collect();
+    expand_into(pkg_path, &hash_dirs, files)
+}
+
+/// Each of `files`' keys looked up by file name in every one of `dirs`
+/// (children of `base`): one target per directory holding at least one of
+/// them, keyed by the bare file name, sorted by directory; keys none holds
+/// (and keys that are not a single file name) are `missing`.
+fn expand_into(
+    base: &Path,
+    dirs: &[String],
+    files: &HashMap<String, PatchFileInfo>,
+) -> GradleTargets {
     let mut by_dir: BTreeMap<String, HashMap<String, PatchFileInfo>> = BTreeMap::new();
     let mut missing = Vec::new();
     let mut keys: Vec<&String> = files.keys().collect();
@@ -260,9 +295,8 @@ pub fn installed_copies_detailed(
         let holders: Vec<&String> = if leaf.is_empty() || leaf.contains(['/', '\\']) {
             Vec::new()
         } else {
-            hash_dirs
-                .iter()
-                .filter(|dir| pkg_path.join(dir).join(leaf).is_file())
+            dirs.iter()
+                .filter(|dir| base.join(dir).join(leaf).is_file())
                 .collect()
         };
         if holders.is_empty() {
@@ -279,7 +313,7 @@ pub fn installed_copies_detailed(
     GradleTargets {
         targets: by_dir
             .into_iter()
-            .map(|(dir, files)| (pkg_path.join(dir), files))
+            .map(|(dir, files)| (base.join(dir), files))
             .collect(),
         missing,
     }
@@ -432,8 +466,6 @@ impl DerivedIndex {
     /// The [`DerivedCopies`] of the jar `jar_leaf` whose pristine bytes
     /// hash to `pristine_sha1`.
     pub fn query(&self, jar_leaf: &str, pristine_sha1: &str) -> DerivedCopies {
-        use sha1::{Digest, Sha1};
-
         let instrumented = format!("instrumented-{jar_leaf}");
         let mut out = DerivedCopies {
             incomplete: self.incomplete,
@@ -460,7 +492,9 @@ impl DerivedIndex {
                 out.stale.push(path.clone());
             } else if name == jar_leaf || name == instrumented {
                 match crate::utils::fs::read_regular_to_bytes_sync(path) {
-                    Ok(bytes) if hash_eq(&hex::encode(Sha1::digest(&bytes)), pristine_sha1) => {
+                    Ok(bytes)
+                        if hash_eq(&crate::utils::digest::sha1_hex_of(&bytes), pristine_sha1) =>
+                    {
                         out.stale.push(path.clone())
                     }
                     Ok(_) => out.unknown.push(path.clone()),
