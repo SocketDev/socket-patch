@@ -395,7 +395,7 @@ fn path_glob_matches(pattern: &[&str], path: &[String]) -> bool {
     }
 }
 
-fn segment_glob_matches(pattern: &[u8], name: &[u8]) -> bool {
+pub(crate) fn segment_glob_matches(pattern: &[u8], name: &[u8]) -> bool {
     match pattern.split_first() {
         None => name.is_empty(),
         Some((b'*', rest)) => {

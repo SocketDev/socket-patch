@@ -7,7 +7,9 @@ use std::path::PathBuf;
 
 use crate::args::GlobalArgs;
 
-use socket_patch_core::crawlers::npm_crawler::with_store_peer_variant_copies;
+use socket_patch_core::crawlers::npm_crawler::{
+    retain_live_store_copies, with_store_peer_variant_copies,
+};
 use socket_patch_core::crawlers::walk_pool;
 use socket_patch_core::crawlers::CargoCrawler;
 use socket_patch_core::crawlers::ComposerCrawler;
@@ -640,6 +642,17 @@ pub async fn find_manifest_package_copies_reusing(
             *paths = with_store_peer_variant_copies(std::mem::take(paths)).await;
         }
     }
+    // A Bun store entry nothing links any more (Bun never prunes `.bun`)
+    // is no copy the install loads, so the check skips it (#599). Rollback
+    // and remove, which resolve without this, still restore it.
+    retain_live_store_copies(
+        copies
+            .iter_mut()
+            .filter(|(purl, _)| purl.starts_with("pkg:npm/"))
+            .map(|(_, paths)| paths),
+    )
+    .await;
+    copies.retain(|_, paths| !paths.is_empty());
     // Verification also READS a `.bundle/config` bundle path the crawler
     // refused as a write root (it resolves outside the project): bundler
     // installs into and loads from it, so a copy there must verify too —

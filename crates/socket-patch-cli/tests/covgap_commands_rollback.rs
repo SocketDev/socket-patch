@@ -3472,3 +3472,76 @@ fn vlt_hosted_rollback_dry_run_keeps_the_store_and_wet_human_run_heals() {
     assert!(!store.exists());
     assert!(!root.join("node_modules/.vlt-lock.json").exists());
 }
+
+/// #599: Bun never prunes `node_modules/.bun`. A patched `is-number@6.0.0`
+/// entry the project has since moved off (an in-place `bun install` of
+/// 7.0.0 re-linked the importer and hoist dir to the new entry) is an
+/// orphan nothing loads now, but a later install that resolves back to
+/// 6.0.0 re-links it as it is ("no changes"). Rollback must still restore
+/// it, or the rolled-back patch silently returns: the orphan filter that
+/// keeps `vex` from judging the install by such an entry is for checks of
+/// the live install only.
+#[cfg(unix)]
+#[test]
+fn bun_orphaned_store_entry_is_still_rolled_back() {
+    let before: &[u8] = b"module.exports = 'original'\n";
+    let after: &[u8] = b"module.exports = 'original' // PATCHED-599\n";
+    let (before_hash, after_hash) = (git_sha256(before), git_sha256(after));
+    let purl = "pkg:npm/is-number@6.0.0";
+
+    let tmp = tempfile::tempdir().expect("tempdir");
+    let root = tmp.path();
+    std::fs::write(
+        root.join("package.json"),
+        r#"{ "name": "app", "version": "0.0.0", "dependencies": { "is-number": "7.0.0" } }"#,
+    )
+    .expect("write root package.json");
+    let orphan = install_npm_pkg(
+        root,
+        "node_modules/.bun/is-number@6.0.0/node_modules",
+        "is-number",
+        "6.0.0",
+        after,
+    );
+    install_npm_pkg(
+        root,
+        "node_modules/.bun/is-number@7.0.0/node_modules",
+        "is-number",
+        "7.0.0",
+        b"module.exports = 7\n",
+    );
+    std::fs::create_dir_all(root.join("node_modules/.bun/node_modules")).expect("hoist dir");
+    std::os::unix::fs::symlink(
+        "../is-number@7.0.0/node_modules/is-number",
+        root.join("node_modules/.bun/node_modules/is-number"),
+    )
+    .expect("hoist link");
+    std::os::unix::fs::symlink(
+        ".bun/is-number@7.0.0/node_modules/is-number",
+        root.join("node_modules/is-number"),
+    )
+    .expect("importer link");
+    let socket = write_socket_manifest(
+        root,
+        &[manifest_entry(
+            purl,
+            "dddddddd-dddd-4ddd-8ddd-dddddddddddd",
+            &before_hash,
+            &after_hash,
+        )],
+    );
+    stage_blob(&socket, &before_hash, before);
+    stage_blob(&socket, &after_hash, after);
+
+    let (code, stdout, stderr) = run(root, &["rollback", "--offline", "--yes"]);
+    assert_eq!(code, 0, "stdout=\n{stdout}\nstderr=\n{stderr}");
+    assert!(
+        !stderr.contains("no matching installed package"),
+        "the orphaned entry must be found; stderr=\n{stderr}"
+    );
+    assert_eq!(
+        std::fs::read(orphan.join("index.js")).expect("read orphan index.js"),
+        before,
+        "the orphaned entry keeps its patched bytes; stdout=\n{stdout}\nstderr=\n{stderr}"
+    );
+}
