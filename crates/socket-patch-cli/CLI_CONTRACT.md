@@ -1666,7 +1666,11 @@ with `vendor_check_ok`; drift emits `failed` with `vendor_check_failed`, a
 wiring: an entry whose lockfile or config no longer references its
 `.socket/vendor/` artifact (for example after `pipenv lock`, `uv lock` or
 `npm install` re-resolved it) fails by the same liveness rule as `vex`'s
-`vendor_unwired`. For a package-lock entry, drift also includes a
+`vendor_unwired`. The reason names the cause: another lock resolving the same
+version from elsewhere (`wiring contested`, naming both locks; delete the one
+the project does not install from), or, for npm and PyPI, a dependency no lock
+resolves any more (`dependency removed`; `scan --mode vendored --prune` reverts
+the entry). For a package-lock entry, drift also includes a
 `package-lock.json` / `npm-shrinkwrap.json` entry for the vendored `name@version`
 that `vendor` would rewire but that does not resolve to the vendored artifact
 (#588); the reason names that entry. Missing ledger entries fail with
