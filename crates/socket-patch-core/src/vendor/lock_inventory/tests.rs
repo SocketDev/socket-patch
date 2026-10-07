@@ -3516,3 +3516,41 @@ async fn bun_text_lock_directory_still_shadows_the_binary_lock() {
     assert!(!super::super::bun_lock::binary_lock_drives(tmp.path()));
     assert!(bun_text_lock_drives(&ProjectView::Disk(tmp.path())));
 }
+
+/// The #735 errno control: Bun falls back to `bun.lockb` only when opening
+/// `bun.lock` fails with ENOENT. A self-referencing link fails with ELOOP
+/// and a link through a regular file with ENOTDIR; Bun then prints
+/// "Ignoring lockfile" and installs from NEITHER lock (Bun 1.2.23 and
+/// 1.3.14). So the text lock keeps shadowing the binary one and nothing is
+/// inventoried from a `bun.lockb` Bun would not install from.
+#[cfg(unix)]
+#[tokio::test]
+async fn bun_text_lock_link_failing_with_other_errno_still_shadows_the_binary_lock() {
+    let bytes = include_bytes!("../../../tests/fixtures/bun-lockb/1.3.14/bun.lockb");
+    for target in ["bun.lock", "package.json/x"] {
+        let tmp = tempfile::tempdir().unwrap();
+        tokio::fs::write(tmp.path().join("bun.lockb"), bytes)
+            .await
+            .unwrap();
+        tokio::fs::write(tmp.path().join("package.json"), "{}")
+            .await
+            .unwrap();
+        std::os::unix::fs::symlink(target, tmp.path().join("bun.lock")).unwrap();
+
+        let (entries, _) = inventory_project_diagnosed(tmp.path()).await;
+        assert!(entries.is_empty(), "{target}: {entries:?}");
+        assert!(
+            !super::super::bun_lock::binary_lock_drives(tmp.path()),
+            "{target}"
+        );
+        assert!(
+            bun_text_lock_drives(&ProjectView::Disk(tmp.path())),
+            "{target}"
+        );
+        let snapshot = DiskSnapshot::new(tmp.path());
+        assert!(
+            bun_text_lock_drives(&ProjectView::Snapshot(&snapshot)),
+            "{target}"
+        );
+    }
+}

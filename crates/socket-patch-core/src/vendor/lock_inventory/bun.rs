@@ -34,18 +34,24 @@ pub(crate) fn bun_text_entries(text: &str) -> Result<Vec<BunEntry>, String> {
 /// through (inventory, hosted, vendored, GC, repair, lockfile discovery).
 ///
 /// Bun opens `bun.lock` following symlinks and falls back to `bun.lockb`
-/// only when that open finds nothing, so this is `stat`, not `lstat`: a
-/// dangling link is absent and leaves the binary lock live (#735).
-/// Anything the open does find shadows the binary lock even when bun
-/// cannot read it — a directory (bun then ignores BOTH locks: "Ignoring
-/// lockfile"), a FIFO — so the text lock is chosen and its guarded read
-/// refuses rather than wiring a `bun.lockb` bun would not install from.
-/// (Bun 1.2.23 and 1.3.14, `bun install --frozen-lockfile`.) An
-/// in-memory link has no target to follow, so it keeps shadowing.
+/// only when that open fails with ENOENT, so this is `stat`, not `lstat`,
+/// and only `NotFound` means absent: a dangling link leaves the binary
+/// lock live (#735). An open that fails with anything but ENOENT — a
+/// self-referencing link (ELOOP), a link through a regular file
+/// (ENOTDIR), a link into an unreadable directory (EACCES) — shadows the
+/// binary lock just like an entry bun finds but cannot read (a directory,
+/// a FIFO): bun then ignores BOTH locks ("Ignoring lockfile"), so the
+/// text lock is chosen and its guarded read refuses rather than wiring a
+/// `bun.lockb` bun would not install from. (Bun 1.2.23 and 1.3.14,
+/// `bun install --frozen-lockfile`.) An in-memory link has no target to
+/// follow, so it keeps shadowing.
 pub fn bun_text_lock_drives(view: &ProjectView<'_>) -> bool {
     match view {
         ProjectView::Disk(root) | ProjectView::Snapshot(DiskSnapshot { root, .. }) => {
-            std::fs::metadata(root.join(BUN_LOCK)).is_ok()
+            match std::fs::metadata(root.join(BUN_LOCK)) {
+                Ok(_) => true,
+                Err(error) => error.kind() != std::io::ErrorKind::NotFound,
+            }
         }
         ProjectView::Memory(project) => project.contains(BUN_LOCK) || project.is_dir(BUN_LOCK),
     }
