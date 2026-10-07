@@ -33,12 +33,7 @@ const SUPPORTED_LOCK_VERSIONS: [u64; 3] = [0, 1, 2];
 /// plainly.
 pub(crate) fn patched_dependency_keys(manifest: Option<&str>, lock: Option<&str>) -> Vec<String> {
     let mut keys: Vec<String> = manifest
-        .map(crate::utils::serde::strip_bom)
-        .and_then(|text| {
-            serde_json::from_str::<serde_json::Value>(text)
-                .or_else(|_| serde_json::from_str(&strip_jsonc(text)))
-                .ok()
-        })
+        .and_then(parse_manifest)
         .and_then(|value| match value.get("patchedDependencies") {
             Some(serde_json::Value::Object(map)) => Some(map.keys().cloned().collect()),
             _ => None,
@@ -57,6 +52,59 @@ pub(crate) fn patched_dependency_keys(manifest: Option<&str>, lock: Option<&str>
         }
     }
     keys
+}
+
+/// A root `package.json` parsed as Bun reads it: a leading BOM, comments
+/// and trailing commas allowed. `None` when Bun could not parse it either.
+fn parse_manifest(text: &str) -> Option<serde_json::Value> {
+    let text = crate::utils::serde::strip_bom(text);
+    serde_json::from_str(text)
+        .or_else(|_| serde_json::from_str(&strip_jsonc(text)))
+        .ok()
+}
+
+/// Bun's built-in default-trusted package names, the union of every release
+/// up to 1.4.2 (`src/install/default-trusted-dependencies.txt` upstream).
+const DEFAULT_TRUSTED: &str = include_str!("bun_default_trusted.txt");
+
+/// Whether Bun runs `name`'s lifecycle scripts only through its built-in
+/// default trust, which a hosted or vendored rewire takes away (#371).
+///
+/// Bun trusts a package when the project's `trustedDependencies` lists it,
+/// or, when the project declares no `trustedDependencies` at all, when its
+/// name is on Bun's default list. From Bun 1.3.5 on that default applies
+/// only to packages resolved from the npm registry, so a package on a hosted
+/// URL or a local tarball loses it: `bun install` skips its `install` /
+/// `postinstall` script without failing, and a native addon is left
+/// unbuilt. An explicit list (in the root manifest, or the copy Bun mirrors
+/// at the top of a text `bun.lock`) already decides trust by name alone,
+/// so the rewire changes nothing there.
+pub(crate) fn loses_default_trust(manifest: Option<&str>, lock: Option<&str>, name: &str) -> bool {
+    let declared = manifest.and_then(parse_manifest).is_some_and(|value| {
+        value
+            .get("trustedDependencies")
+            .is_some_and(|v| v.is_array())
+    }) || lock.is_some_and(|lock| {
+        lock.split('\n')
+            .map(|l| l.strip_suffix('\r').unwrap_or(l))
+            .any(|l| l.starts_with("  \"trustedDependencies\": ["))
+    });
+    !declared && DEFAULT_TRUSTED.lines().any(|trusted| trusted == name)
+}
+
+/// The user-facing warning for a rewired package that loses Bun's default
+/// trust ([`loses_default_trust`]), shared by the hosted and vendored paths.
+/// `target` names what the package now resolves to.
+pub(crate) fn default_trust_detail(name: &str, version: &str, target: &str) -> String {
+    format!(
+        "{name}@{version} is on Bun's default trusted list, which Bun 1.3.5 and later apply \
+         only to packages installed from the npm registry; now that it resolves to {target}, \
+         `bun install` skips its install scripts without failing (`bun pm untrusted` lists \
+         it), which can leave native bindings unbuilt. Add \"{name}\" to \
+         \"trustedDependencies\" in package.json and run `bun install`. Declaring \
+         trustedDependencies replaces Bun's default list, so also list any other \
+         default-trusted dependency whose scripts you rely on"
+    )
 }
 
 /// `text` with the JSONC Bun accepts in a `package.json` removed: `//` and

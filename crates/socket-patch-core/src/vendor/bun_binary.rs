@@ -128,8 +128,16 @@ pub(crate) async fn vendor(
         Ok(v) => v,
         Err(o) => return *o,
     };
-    let BinaryProject { mut lock, .. } = project;
+    let BinaryProject {
+        mut lock, manifest, ..
+    } = project;
     let mut warnings = Vec::new();
+    warnings.extend(super::bun_lock::default_trust_warning(
+        manifest.as_deref(),
+        None,
+        &coords.name,
+        &coords.version,
+    ));
     for package in bundled {
         // LOUD: this copy ships inside its PARENT's tarball, which we do not
         // repack — it stays the unpatched bytes after vendor (#469).
@@ -356,6 +364,8 @@ pub(super) struct BinaryProject {
     packages: Vec<BinaryPackage>,
     /// The project's own `patchedDependencies` keys (#367).
     user_patched: Vec<String>,
+    /// The root `package.json` text, `None` when unreadable.
+    manifest: Option<String>,
 }
 
 /// Read the lock, refusing (before any write) a symlinked, unreadable,
@@ -381,11 +391,13 @@ pub(super) async fn read_project(root: &Path) -> Result<BinaryProject, Box<Vendo
         Ok(v) => v,
         Err(e) => return Err(Box::new(refused("vendor_bun_lockb_invalid", e))),
     };
-    let user_patched = super::bun_lock::read_user_patched(root, None).await;
+    let manifest = super::bun_lock::read_manifest(root).await;
+    let user_patched = super::bun_lock_text::patched_dependency_keys(manifest.as_deref(), None);
     Ok(BinaryProject {
         lock,
         packages,
         user_patched,
+        manifest,
     })
 }
 

@@ -41,9 +41,10 @@ use crate::patch::apply::PatchSources;
 use crate::utils::fs::{atomic_write_bytes_preserving_mode, read_regular_to_string};
 use crate::utils::socket_dir::remove_tree_and_prune;
 use crate::vendor::bun_lock_text::{
-    decode_json_string, has_workspace_packages, is_bundled_entry, lock_version, packages_bounds,
-    parse_entry_line, patched_dependency_detail, patched_dependency_key, patched_dependency_keys,
-    split_name_spec, BunEntry,
+    decode_json_string, default_trust_detail, has_workspace_packages, is_bundled_entry,
+    lock_version, loses_default_trust, packages_bounds, parse_entry_line,
+    patched_dependency_detail, patched_dependency_key, patched_dependency_keys, split_name_spec,
+    BunEntry,
 };
 
 use super::common::{already_patched_result, refused};
@@ -372,6 +373,12 @@ pub(crate) async fn vendor_bun<'a>(
             ),
         ));
     }
+    warnings.extend(default_trust_warning(
+        project.manifest.as_deref(),
+        Some(&project.lock_text),
+        name,
+        version,
+    ));
     let BunProject {
         mut lines, entries, ..
     } = project;
@@ -666,16 +673,33 @@ pub(super) struct BunProject {
     entries: Vec<BunEntry>,
     /// The project's own `patchedDependencies` keys (#367).
     user_patched: Vec<String>,
+    /// The root `package.json` text, `None` when unreadable.
+    manifest: Option<String>,
 }
 
-/// The root manifest's `patchedDependencies` keys, unioned with the copy
-/// Bun mirrors into the text `lock` when there is one. An unreadable or
-/// non-JSON manifest contributes none; the lock read stands on its own.
-pub(super) async fn read_user_patched(project_root: &Path, lock: Option<&str>) -> Vec<String> {
-    let manifest = read_regular_to_string(&project_root.join("package.json"))
+/// The root `package.json` text, `None` when unreadable: the manifest
+/// lookups ([`patched_dependency_keys`], [`loses_default_trust`]) then fall
+/// back on what the lock mirrors.
+pub(super) async fn read_manifest(project_root: &Path) -> Option<String> {
+    read_regular_to_string(&project_root.join("package.json"))
         .await
-        .ok();
-    patched_dependency_keys(manifest.as_deref(), lock)
+        .ok()
+}
+
+/// The warning for a package vendored to a local tarball that Bun 1.3.5+ no
+/// longer trusts by default (#371); `None` when its trust is unchanged.
+pub(super) fn default_trust_warning(
+    manifest: Option<&str>,
+    lock: Option<&str>,
+    name: &str,
+    version: &str,
+) -> Option<VendorWarning> {
+    loses_default_trust(manifest, lock, name).then(|| {
+        VendorWarning::new(
+            "vendor_bun_default_trust_lost",
+            default_trust_detail(name, version, "a vendored local tarball"),
+        )
+    })
 }
 
 /// Refuse to vendor a package the project patches itself with `bun patch`
@@ -724,12 +748,14 @@ pub(super) async fn read_project(project_root: &Path) -> Result<BunProject, Box<
             )));
         }
     };
-    let user_patched = read_user_patched(project_root, Some(&lock_text)).await;
+    let manifest = read_manifest(project_root).await;
+    let user_patched = patched_dependency_keys(manifest.as_deref(), Some(&lock_text));
     Ok(BunProject {
         lock_text,
         lines,
         entries,
         user_patched,
+        manifest,
     })
 }
 
@@ -2359,6 +2385,109 @@ mod tests {
             "refusal writes nothing"
         );
         assert!(!fx.root().join(".socket/vendor").exists());
+    }
+
+    /// Vendor `purl` from `fx` and return the run's
+    /// `vendor_bun_default_trust_lost` details.
+    async fn trust_lost_details(fx: &Fixture, purl: &str) -> Vec<String> {
+        let blobs = fx.root().join(".socket/blobs");
+        let outcome = crate::vendor::test_support::vendor_bun(
+            purl,
+            &fx.installed,
+            fx.root(),
+            &fx.record,
+            &PatchSources::blobs_only(&blobs),
+            "2026-06-09T00:00:00Z",
+            false,
+            false,
+            None,
+        )
+        .await;
+        let (result, _, warnings) = expect_done(outcome);
+        assert!(result.success, "{:?}", result.error);
+        warnings
+            .into_iter()
+            .filter(|w| w.code == "vendor_bun_default_trust_lost")
+            .map(|w| w.detail)
+            .collect()
+    }
+
+    /// REGRESSION (#371): from Bun 1.3.5 on, Bun's default trusted list
+    /// applies only to packages resolved from the npm registry, so a
+    /// default-trusted package vendored to a local tarball has its install
+    /// scripts skipped with exit 0. Vendoring says so, unless the project
+    /// declares `trustedDependencies` (package.json, or bun.lock's mirror),
+    /// which decides trust by name alone.
+    #[tokio::test]
+    async fn default_trusted_package_warns_that_trust_is_lost() {
+        let lock = BN3_BEFORE_LOCK.replace("left-pad", "simple-git-hooks");
+        let purl = "pkg:npm/simple-git-hooks@1.3.0";
+        let fx = fixture_with(&lock, "node_modules/simple-git-hooks").await;
+        let lost = trust_lost_details(&fx, purl).await;
+        assert_eq!(lost.len(), 1, "{lost:?}");
+        assert!(
+            lost[0].contains("simple-git-hooks@1.3.0") && lost[0].contains("trustedDependencies"),
+            "{}",
+            lost[0]
+        );
+
+        let mirrored = lock.replacen(
+            "  \"packages\": {",
+            "  \"trustedDependencies\": [\n    \"simple-git-hooks\",\n  ],\n  \"packages\": {",
+            1,
+        );
+        assert_ne!(mirrored, lock);
+        let fx = fixture_with(&mirrored, "node_modules/simple-git-hooks").await;
+        assert!(trust_lost_details(&fx, purl).await.is_empty());
+
+        let fx = fixture_with(&lock, "node_modules/simple-git-hooks").await;
+        tokio::fs::write(
+            fx.root().join("package.json"),
+            BN3_PKG.replacen(
+                "\"version\": \"1.0.0\",",
+                "\"version\": \"1.0.0\",\n  \"trustedDependencies\": [],",
+                1,
+            ),
+        )
+        .await
+        .unwrap();
+        assert!(trust_lost_details(&fx, purl).await.is_empty());
+
+        // A package off the default list keeps the plain run quiet.
+        let fx = fixture_with(BN3_BEFORE_LOCK, "node_modules/left-pad").await;
+        assert!(trust_lost_details(&fx, "pkg:npm/left-pad@1.3.0")
+            .await
+            .is_empty());
+    }
+
+    /// REGRESSION (#371), `bun.lockb`: the binary lock has no text mirror,
+    /// so the root manifest's `trustedDependencies` alone decides. Real Bun
+    /// 1.4.2 fixture: `simple-git-hooks` is on the default list.
+    #[tokio::test]
+    async fn binary_default_trusted_package_warns_that_trust_is_lost() {
+        let dir = std::path::Path::new(env!("CARGO_MANIFEST_DIR"))
+            .join("tests/fixtures/bun-lockb-trusted");
+        let manifest = std::fs::read_to_string(dir.join("package.json")).unwrap();
+        let declared = manifest.replacen(
+            "\"private\": true,",
+            "\"private\": true,\n  \"trustedDependencies\": [\"simple-git-hooks\"],",
+            1,
+        );
+        assert_ne!(declared, manifest);
+        for (manifest, warns) in [(&manifest, true), (&declared, false)] {
+            let fx = fixture_with("", "node_modules/simple-git-hooks").await;
+            tokio::fs::remove_file(fx.root().join(BUN_LOCK))
+                .await
+                .unwrap();
+            tokio::fs::copy(dir.join("bun.lockb"), fx.root().join("bun.lockb"))
+                .await
+                .unwrap();
+            tokio::fs::write(fx.root().join("package.json"), manifest)
+                .await
+                .unwrap();
+            let lost = trust_lost_details(&fx, "pkg:npm/simple-git-hooks@2.11.1").await;
+            assert_eq!(lost.len(), usize::from(warns), "{lost:?}");
+        }
     }
 
     #[tokio::test]

@@ -4804,6 +4804,19 @@ fn parse_bun_hosted_lock(
     Ok((lines, entries))
 }
 
+/// The warning for a package the bun rewriters pinned to its hosted URL that
+/// Bun 1.3.5+ no longer trusts by default (#371).
+pub(crate) fn bun_default_trust_warning(name: &str, version: &str) -> RewriteWarning {
+    RewriteWarning {
+        code: "redirect_bun_default_trust_lost".into(),
+        detail: crate::vendor::bun_lock_text::default_trust_detail(
+            name,
+            version,
+            "a hosted tarball URL",
+        ),
+    }
+}
+
 /// Leave `dep` on its registry resolution when the project's own
 /// `patchedDependencies` patches it (#367): Bun applies that patch only to
 /// the registry `name@version`, so a hosted pin would silently drop it from
@@ -4887,6 +4900,8 @@ fn rewrite_bun_lock(
         let target_spec = format!("{fname}@{}", dep.version);
         let url_spec = format!("{fname}@{}", dep.artifact_url);
         let mut matched_any = false;
+        // A non-bundled instance now resolves to the hosted URL.
+        let mut wired = false;
         for entry in &entries {
             let Some(spec) = entry.elems.first().and_then(|e| decode_json_string(e)) else {
                 continue;
@@ -4938,6 +4953,7 @@ fn rewrite_bun_lock(
                 // `new` (`bun_lock_text::same_wiring_modulo_integrity`), so
                 // the chain still unwinds to the pristine registry line.
                 matched_any = true;
+                wired = true;
                 if entry.elems.len() == 3 && entry.elems[2] == format!("\"{sha512}\"") {
                     continue;
                 }
@@ -4963,6 +4979,7 @@ fn rewrite_bun_lock(
                 continue;
             }
             matched_any = true;
+            wired = true;
             let original = lines[entry.line_idx].clone();
             // Lines come from a bare `split('\n')`, so a CRLF lock's lines
             // carry a trailing `\r` (the grammar trims it away when parsing).
@@ -4997,6 +5014,17 @@ fn rewrite_bun_lock(
             changed = true;
         }
         pinned_any |= matched_any;
+        if wired
+            && crate::vendor::bun_lock_text::loses_default_trust(
+                files.get("package.json").map(String::as_str),
+                Some(content),
+                &fname,
+            )
+        {
+            result
+                .warnings
+                .push(bun_default_trust_warning(&fname, &dep.version));
+        }
         if !matched_any {
             // Mirrors the pnpm/berry/uv rewriters: a granted dep that matched
             // no rewritable tuple (lock re-resolved to another version, entry
@@ -11193,6 +11221,106 @@ mod tests {
         rewrite_bun_lock(&files, std::slice::from_ref(&ovr), &mut r);
         assert_eq!(r.edits.len(), 1, "{:?}", r.edits);
         assert!(r.warnings.is_empty(), "{:?}", r.warnings);
+    }
+
+    /// REGRESSION (#371): from Bun 1.3.5 on, Bun's default trusted list
+    /// (better-sqlite3, esbuild, sharp, simple-git-hooks, …) applies only to
+    /// packages resolved from the npm registry, so a default-trusted package
+    /// rewired to a hosted URL has its install scripts skipped with exit 0.
+    /// The rewrite says so, on the first run and on an already-wired re-run;
+    /// a project that declares `trustedDependencies` (in package.json or
+    /// bun.lock's mirror) decides trust by name alone and is not warned, nor
+    /// is a package off the default list.
+    #[test]
+    fn bun_lock_default_trusted_package_warns_that_trust_is_lost() {
+        let sha512 = format!("sha512-{}==", "A".repeat(86));
+        let hooks = npm_override(
+            "simple-git-hooks",
+            "2.11.1",
+            "http://p.test/simple-git-hooks-2.11.1.tgz",
+            &sha512,
+        );
+        let mut other = npm_override("is-number", "7.0.0", "http://p.test/isn.tgz", &sha512);
+        other.patch_uuid = "22222222-2222-4222-8222-222222222222".into();
+        let entries = "\"is-number\": [\"is-number@7.0.0\", \"\", {}, \"sha512-UP==\"],\n    \
+                       \"simple-git-hooks\": [\"simple-git-hooks@2.11.1\", \"\", { \"bin\": \
+                       { \"simple-git-hooks\": \"cli.js\" } }, \"sha512-OLD==\"],";
+        let manifest =
+            r#"{"name":"app","dependencies":{"is-number":"7.0.0","simple-git-hooks":"2.11.1"}}"#;
+        let overrides = [hooks.clone(), other.clone()];
+        let run = |lock: &str, manifest: Option<&str>| {
+            let mut files = BTreeMap::new();
+            files.insert("bun.lock".to_string(), lock.to_string());
+            if let Some(manifest) = manifest {
+                files.insert("package.json".to_string(), manifest.to_string());
+            }
+            let mut r = RewriteResult::default();
+            rewrite_bun_lock(&files, &overrides, &mut r);
+            r
+        };
+
+        let lock = bun_lock_file(entries, 1);
+        let first = run(&lock, Some(manifest));
+        let wired = first.files.get("bun.lock").expect("both rewired").clone();
+        assert_eq!(first.edits.len(), 2, "{:?}", first.edits);
+        assert_eq!(
+            warning_codes(&first),
+            vec!["redirect_bun_default_trust_lost"],
+            "{:?}",
+            first.warnings
+        );
+        let detail = &first.warnings[0].detail;
+        assert!(
+            detail.contains("simple-git-hooks@2.11.1")
+                && detail.contains("trustedDependencies")
+                && detail.contains("1.3.5"),
+            "{detail}"
+        );
+        // Without a readable manifest Bun still has no explicit list.
+        assert_eq!(
+            warning_codes(&run(&lock, None)),
+            vec!["redirect_bun_default_trust_lost"]
+        );
+        // An already-wired re-run keeps saying so until trust is declared.
+        let rerun = run(&wired, Some(manifest));
+        assert!(rerun.files.is_empty() && rerun.edits.is_empty());
+        assert_eq!(
+            warning_codes(&rerun),
+            vec!["redirect_bun_default_trust_lost"]
+        );
+
+        // An explicit list (even one that omits the package: Bun then never
+        // trusted it by default) leaves trust unchanged by the rewire.
+        for declared in [
+            r#"{"name":"app","trustedDependencies":["simple-git-hooks"]}"#,
+            r#"{"name":"app","trustedDependencies":[]}"#,
+            "{\n  // JSONC, as Bun reads it\n  \"trustedDependencies\": [\"simple-git-hooks\",],\n}",
+        ] {
+            let r = run(&lock, Some(declared));
+            assert_eq!(r.edits.len(), 2);
+            assert!(r.warnings.is_empty(), "{declared}: {:?}", r.warnings);
+        }
+        let mirrored = lock.replacen(
+            "  \"packages\": {",
+            "  \"trustedDependencies\": [\n    \"simple-git-hooks\",\n  ],\n  \"packages\": {",
+            1,
+        );
+        assert_ne!(mirrored, lock);
+        assert!(run(&mirrored, None).warnings.is_empty());
+
+        // A bundled copy is not rewired, so its trust is not the rewire's
+        // to lose (its own warning says it stays unpatched).
+        let bundled = bun_lock_file(
+            "\"p/simple-git-hooks\": [\"simple-git-hooks@2.11.1\", \"\", { \"bundled\": true }, \
+             \"sha512-OLD==\"],",
+            1,
+        );
+        let r = run(&bundled, Some(manifest));
+        assert!(
+            !warning_codes(&r).contains(&"redirect_bun_default_trust_lost"),
+            "{:?}",
+            r.warnings
+        );
     }
 
     /// A CRLF bun.lock (Windows `core.autocrlf` checkout) must keep CRLF on

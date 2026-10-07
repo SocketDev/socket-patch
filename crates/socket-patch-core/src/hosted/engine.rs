@@ -1163,7 +1163,25 @@ pub async fn rewrite(
                     })
                     .cloned()
                     .collect();
-                crate::patch::redirect::rewrite_bun_binary(&bytes, &binary_overrides, &mut rewrite)
+                crate::patch::redirect::rewrite_bun_binary(&bytes, &binary_overrides, &mut rewrite);
+                // A pinned default-trusted package loses Bun's default trust
+                // (#371); the text rewriter warns the same way.
+                for o in &binary_overrides {
+                    let name = crate::patch::redirect::full_name(o);
+                    if rewrite.confirmed_bun_binary_uuids.contains(&o.patch_uuid)
+                        && crate::vendor::bun_lock_text::loses_default_trust(
+                            files.get("package.json").map(String::as_str),
+                            None,
+                            &name,
+                        )
+                    {
+                        rewrite
+                            .warnings
+                            .push(crate::patch::redirect::bun_default_trust_warning(
+                                &name, &o.version,
+                            ));
+                    }
+                }
             }
             Err(warning) => rewrite.warnings.push(warning),
         }
@@ -2435,6 +2453,101 @@ mod tests {
                 assert!(skipped.is_none(), "{:?}", done.rewrite.warnings);
             }
             assert!(!done.rewrite.files.contains_key("package.json"));
+        }
+    }
+
+    /// REGRESSION (#371), binary lock: a default-trusted package pinned to
+    /// its hosted URL in a `bun.lockb` loses Bun 1.3.5+'s default trust, so
+    /// its install scripts are silently skipped; the run says so unless the
+    /// root manifest declares `trustedDependencies`. The fixture is real Bun
+    /// 1.4.2 output: `simple-git-hooks` is on the default list, `is-number`
+    /// is not.
+    #[tokio::test]
+    async fn issue_371_bun_lockb_default_trusted_package_warns_that_trust_is_lost() {
+        use crate::patch::redirect::Integrity;
+        let fixture = std::path::Path::new(env!("CARGO_MANIFEST_DIR"))
+            .join("tests/fixtures/bun-lockb-trusted");
+        let candidate = |name: &str, version: &str, uuid: &str| Candidate {
+            purl: format!("pkg:npm/{name}@{version}"),
+            dep: DepOverride {
+                ecosystem: "npm".into(),
+                name: name.into(),
+                namespace: None,
+                version: version.into(),
+                token: "tok".into(),
+                patch_uuid: uuid.into(),
+                artifact_url: format!("https://patch.test/{name}-{version}.tgz"),
+                registry_override: None,
+                integrity: Integrity {
+                    sha512: Some(format!("sha512-{}==", "A".repeat(86))),
+                    ..Default::default()
+                },
+            },
+        };
+        let candidates = vec![
+            candidate("simple-git-hooks", "2.11.1", "uuid-hooks"),
+            candidate("is-number", "7.0.0", "uuid-isn"),
+        ];
+        let manifest = std::fs::read_to_string(fixture.join("package.json")).unwrap();
+        let declared = manifest.replacen(
+            "\"private\": true,",
+            "\"private\": true,\n  \"trustedDependencies\": [\"simple-git-hooks\"],",
+            1,
+        );
+        assert_ne!(declared, manifest);
+        for trusted in [false, true] {
+            let tmp = tempfile::tempdir().unwrap();
+            std::fs::copy(fixture.join("bun.lockb"), tmp.path().join("bun.lockb")).unwrap();
+            std::fs::write(
+                tmp.path().join("package.json"),
+                if trusted { &declared } else { &manifest },
+            )
+            .unwrap();
+            let view = ProjectView::Disk(tmp.path());
+            let outer = OuterAllowRemote::default;
+            let options = RewriteOptions {
+                dry_run: false,
+                targets_pipenv_lock: false,
+                pipenv_major: None,
+                pipenv_unknown_detail: String::new(),
+                trust_lockfile_config: true,
+                npm_allow_remote_config: true,
+                npm_outer: &outer,
+                blocking: false,
+            };
+            let read = read_candidate_files(&view, &BTreeSet::new(), &candidates).await;
+            let done = rewrite(
+                &view,
+                read,
+                &candidates,
+                BTreeMap::new(),
+                &BTreeSet::new(),
+                &[],
+                options,
+            )
+            .await;
+            assert!(
+                done.rewrite.binary_files.contains_key("bun.lockb"),
+                "{:?}",
+                done.rewrite.warnings
+            );
+            assert_eq!(done.confirmed.len(), 2, "{:?}", done.confirmed);
+            let lost: Vec<&RewriteWarning> = done
+                .rewrite
+                .warnings
+                .iter()
+                .filter(|w| w.code == "redirect_bun_default_trust_lost")
+                .collect();
+            if trusted {
+                assert!(lost.is_empty(), "{:?}", done.rewrite.warnings);
+            } else {
+                assert_eq!(lost.len(), 1, "{:?}", done.rewrite.warnings);
+                assert!(
+                    lost[0].detail.contains("simple-git-hooks@2.11.1"),
+                    "{}",
+                    lost[0].detail
+                );
+            }
         }
     }
 
