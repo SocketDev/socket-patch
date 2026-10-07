@@ -1642,6 +1642,111 @@ async fn hosted_scan_from_package_json_workspace_member_refuses() {
     }
 }
 
+/// A workspace member `packages/a` holding the patched package, under a
+/// root whose `manifest` (`package.json` or `vlt.json`) declares
+/// `workspaces` and whose lock is `lock_name`.
+fn write_workspace_member(
+    root: &Path,
+    manifest: &str,
+    manifest_text: &str,
+    lock_name: &str,
+) -> std::path::PathBuf {
+    std::fs::write(root.join(manifest), manifest_text).unwrap();
+    if manifest != "package.json" {
+        std::fs::write(
+            root.join("package.json"),
+            r#"{ "name": "root", "private": true }"#,
+        )
+        .unwrap();
+    }
+    std::fs::write(root.join(lock_name), format!("# root lock {lock_name}\n")).unwrap();
+    let member = root.join("packages/a");
+    let pkg = member.join("node_modules").join(NAME);
+    std::fs::create_dir_all(&pkg).unwrap();
+    std::fs::write(
+        member.join("package.json"),
+        format!(
+            r#"{{ "name": "a", "version": "1.0.0", "dependencies": {{ "{NAME}": "{VERSION}" }} }}"#
+        ),
+    )
+    .unwrap();
+    std::fs::write(
+        pkg.join("package.json"),
+        format!(r#"{{ "name": "{NAME}", "version": "{VERSION}" }}"#),
+    )
+    .unwrap();
+    member
+}
+
+/// #1071: npm, yarn and Bun resolve `workspaces` with full glob syntax, so
+/// a root listing `packages/{a,b}` or `packages/[a-c]` governs
+/// `packages/a`. The member matcher compared `{` and `[` literally, so a
+/// hosted run from the member pinned nothing and exited 0.
+#[tokio::test]
+#[serial]
+async fn hosted_scan_from_brace_or_class_glob_workspace_member_refuses() {
+    let server = MockServer::start().await;
+    mock_discovery(&server).await;
+    mock_reference(&server).await;
+    mock_view(&server).await;
+    for pattern in [
+        "packages/{a,b}",
+        "packages/[a-c]",
+        "{apps,packages}/*",
+        "packages/[!b]",
+    ] {
+        let tmp = tempfile::tempdir().unwrap();
+        let member = write_workspace_member(
+            tmp.path(),
+            "package.json",
+            &format!(r#"{{ "name": "root", "private": true, "workspaces": ["{pattern}"] }}"#),
+            "package-lock.json",
+        );
+        let lock = tmp.path().join("package-lock.json");
+        let before = std::fs::read_to_string(&lock).unwrap();
+        let (code, doc) = run_hosted_json(&member, &server.uri());
+        assert_refused_workspace_lock_elsewhere(pattern, code, &doc, &lock, &before, &member);
+    }
+}
+
+/// #942: vlt reads its workspaces from `vlt.json` and keeps one
+/// `vlt-lock.json` at that root, so a hosted run from a member found the
+/// member's copy, read no lock, pinned nothing and exited 0. It now
+/// refuses and names the vlt workspace root, for every `workspaces` shape
+/// vlt accepts (a string, an array, an object of groups).
+#[tokio::test]
+#[serial]
+async fn hosted_scan_from_vlt_workspace_member_refuses() {
+    let server = MockServer::start().await;
+    mock_discovery(&server).await;
+    mock_reference(&server).await;
+    mock_view(&server).await;
+    for workspaces in [
+        r#""packages/*""#,
+        r#"["packages/*"]"#,
+        r#"{ "apps": "apps/*", "libs": ["packages/{a,b}"] }"#,
+    ] {
+        let tmp = tempfile::tempdir().unwrap();
+        let member = write_workspace_member(
+            tmp.path(),
+            "vlt.json",
+            &format!(r#"{{ "workspaces": {workspaces} }}"#),
+            "vlt-lock.json",
+        );
+        let lock = tmp.path().join("vlt-lock.json");
+        let before = std::fs::read_to_string(&lock).unwrap();
+        let (code, doc) = run_hosted_json(&member, &server.uri());
+        assert_refused_workspace_lock_elsewhere(workspaces, code, &doc, &lock, &before, &member);
+        assert!(
+            doc["error"]
+                .as_str()
+                .unwrap_or_default()
+                .contains("vlt.json"),
+            "{workspaces}: the error names vlt.json: {doc}"
+        );
+    }
+}
+
 fn assert_refused_workspace_lock_elsewhere(
     case: &str,
     code: Option<i32>,
