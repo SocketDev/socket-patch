@@ -1144,8 +1144,9 @@ async fn a_git_pattern_hosted_pin_is_refused_not_restored_to_the_registry() {
     assert!(
         envelope["hosted"]["failed"][0]["error"]
             .as_str()
-            .is_some_and(|e| e.contains("installs from git")
-                && e.contains("`git checkout -- yarn.lock`")),
+            .is_some_and(
+                |e| e.contains("installs from git") && e.contains("`git checkout -- yarn.lock`")
+            ),
         "{envelope}"
     );
     assert_eq!(
@@ -1566,5 +1567,127 @@ async fn remove_unhosts_a_package_whose_agent_record_is_superseded() {
     assert!(
         envelope.to_string().contains("rollback_record_superseded"),
         "the superseded record is reported:\n{envelope:#}"
+    );
+}
+
+/// Re-shape the superseded fixture as Bun's isolated linker leaves it
+/// after `bun install` of the hosted pin (#1084): `node_modules/<name>`
+/// links to the new store entry holding B's bytes, and the old
+/// `node_modules/.bun/<name>@<version>` entry Bun never prunes still holds
+/// agent record A's patched bytes. Returns the orphan's `index.js`.
+#[cfg(unix)]
+fn orphan_bun_store_copy(root: &Path) -> std::path::PathBuf {
+    let nm = root.join("node_modules");
+    let top = nm.join(NAME);
+    let store = nm.join(".bun");
+    let live = store
+        .join(format!("{NAME}@http+++patch.test+bbbbbbbb"))
+        .join("node_modules")
+        .join(NAME);
+    let orphan = store
+        .join(format!("{NAME}@{VERSION}"))
+        .join("node_modules")
+        .join(NAME);
+    for (dir, index) in [(&live, B_PATCHED_INDEX), (&orphan, A_PATCHED_INDEX)] {
+        std::fs::create_dir_all(dir).unwrap();
+        std::fs::copy(top.join("package.json"), dir.join("package.json")).unwrap();
+        std::fs::write(dir.join("index.js"), index).unwrap();
+    }
+    std::fs::remove_dir_all(&top).unwrap();
+    std::os::unix::fs::symlink(&live, &top).unwrap();
+    orphan.join("index.js")
+}
+
+/// #1084: the live copy holds B's bytes, but an orphaned Bun store copy
+/// still holds A's. Rollback restores that copy before dropping record A,
+/// so the next `bun install` cannot relink agent patch A unrecorded.
+#[cfg(unix)]
+#[tokio::test]
+#[serial]
+async fn rollback_restores_an_orphaned_store_copy_of_a_superseded_record() {
+    let server = MockServer::start().await;
+    let tmp = tempfile::tempdir().unwrap();
+    let pristine = write_superseded_agent_fixture(tmp.path(), &server, B_PATCHED_INDEX).await;
+    let orphan = orphan_bun_store_copy(tmp.path());
+
+    let (code, envelope) = run_rollback_subprocess_online(tmp.path(), &server, &[]);
+    assert_eq!(code, 0, "{envelope:#}");
+    assert_eq!(
+        std::fs::read(&orphan).unwrap(),
+        ORIGINAL_INDEX,
+        "the orphaned store copy at A's patched bytes is restored:\n{envelope:#}"
+    );
+    let live = tmp.path().join("node_modules").join(NAME).join("index.js");
+    assert_eq!(
+        std::fs::read(live).unwrap(),
+        B_PATCHED_INDEX,
+        "B's live copy is still the reinstall's to replace"
+    );
+    assert!(
+        warning_codes(&envelope).contains(&"rollback_record_superseded".to_string()),
+        "{envelope:#}"
+    );
+    let restored = std::fs::read_to_string(tmp.path().join("package-lock.json")).unwrap();
+    assert_eq!(restored, pristine);
+    assert!(manifest_patch_keys(tmp.path()).is_empty());
+}
+
+/// #1084: `remove <purl>` restores the orphaned copy the same way.
+#[cfg(unix)]
+#[tokio::test]
+#[serial]
+async fn remove_restores_an_orphaned_store_copy_of_a_superseded_record() {
+    let server = MockServer::start().await;
+    let tmp = tempfile::tempdir().unwrap();
+    let pristine = write_superseded_agent_fixture(tmp.path(), &server, B_PATCHED_INDEX).await;
+    let orphan = orphan_bun_store_copy(tmp.path());
+
+    let (code, envelope) = run_remove_subprocess_online(tmp.path(), &server, PURL);
+    assert_eq!(code, 0, "{envelope:#}");
+    assert_eq!(
+        std::fs::read(&orphan).unwrap(),
+        ORIGINAL_INDEX,
+        "the orphaned store copy at A's patched bytes is restored:\n{envelope:#}"
+    );
+    let restored = std::fs::read_to_string(tmp.path().join("package-lock.json")).unwrap();
+    assert_eq!(restored, pristine);
+    assert!(manifest_patch_keys(tmp.path()).is_empty());
+}
+
+/// #1084: a store copy that holds A's bytes but cannot be restored (its
+/// before-blob is gone) fails the run and keeps record A, instead of
+/// dropping the only data that could restore it.
+#[cfg(unix)]
+#[tokio::test]
+#[serial]
+async fn an_unrestorable_orphaned_store_copy_keeps_the_superseded_record() {
+    let server = MockServer::start().await;
+    let tmp = tempfile::tempdir().unwrap();
+    write_superseded_agent_fixture(tmp.path(), &server, B_PATCHED_INDEX).await;
+    let orphan = orphan_bun_store_copy(tmp.path());
+    std::fs::write(&orphan, b"module.exports = 'patched by A'; // and edited\n").unwrap();
+    // A second file of the copy still at A's patched bytes keeps it A's.
+    let before = socket_patch_core::hash::git_sha256::compute_git_sha256_from_bytes(ORIGINAL_INDEX);
+    let after = socket_patch_core::hash::git_sha256::compute_git_sha256_from_bytes(A_PATCHED_INDEX);
+    let manifest_path = tmp.path().join(".socket/manifest.json");
+    let mut manifest: Value =
+        serde_json::from_str(&std::fs::read_to_string(&manifest_path).unwrap()).unwrap();
+    manifest["patches"][PURL]["files"]["package/lib.js"] =
+        serde_json::json!({ "beforeHash": before, "afterHash": after });
+    std::fs::write(&manifest_path, manifest.to_string()).unwrap();
+    std::fs::write(orphan.with_file_name("lib.js"), A_PATCHED_INDEX).unwrap();
+    // B's live copy never carried A's lib.js change.
+    let live = tmp.path().join("node_modules").join(NAME).join("lib.js");
+    std::fs::write(live, ORIGINAL_INDEX).unwrap();
+
+    let (code, envelope) = run_rollback_subprocess_online(tmp.path(), &server, &[]);
+    assert_eq!(
+        code, 1,
+        "a copy still holding A's bytes that cannot be restored fails:\n{envelope:#}"
+    );
+    assert_eq!(
+        manifest_patch_keys(tmp.path()),
+        vec![PURL.to_string()],
+        "record A and its blobs stay for a later rollback"
     );
 }
