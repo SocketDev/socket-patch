@@ -234,6 +234,13 @@ fn check_fails_on_a_qualified_gem_matching_no_variant() {
             && e["errorCode"] == "no_matching_variant"),
         "{env}"
     );
+    // The installed mismatch is not also reported as not installed.
+    assert!(
+        !events(&env)
+            .iter()
+            .any(|e| e["errorCode"] == "package_not_installed"),
+        "{env}"
+    );
 
     // Parity: `apply` exits 1 on the same tree.
     let (code, stdout, stderr) = run_with_env(

@@ -727,6 +727,7 @@ async fn verify_installed_tree(
             .push(purl.clone());
     }
     let mut unmatched: Vec<FailedPatch> = Vec::new();
+    let mut mismatched_keys: std::collections::BTreeSet<String> = Default::default();
     for (base, mut keys) in groups {
         if keys.len() == 1 && keys[0] == base {
             // An unqualified singleton names no distribution: `apply`
@@ -760,6 +761,9 @@ async fn verify_installed_tree(
         }
         for key in &keys {
             let paths = kept.remove(key.as_str()).unwrap_or_default();
+            if !stray.is_empty() && paths.is_empty() {
+                mismatched_keys.insert(key.clone());
+            }
             copies.insert(key.clone(), paths);
         }
         if !stray.is_empty() {
@@ -772,6 +776,12 @@ async fn verify_installed_tree(
 
     let mut outcome =
         socket_patch_core::vex::applied_patches_with_copies(tree, &copies, None).await;
+    // A key left copy-less only because its release's installed copy
+    // matched no variant is that `no_matching_variant` failure, not a
+    // second "not installed" skip.
+    outcome
+        .failed
+        .retain(|f| !(f.reason == "package_not_found" && mismatched_keys.contains(&f.purl)));
     outcome.failed.extend(unmatched);
     outcome
 }
