@@ -2,7 +2,7 @@
 
 The routine runs every 6 hours. Each run adds one comment here with the socket-patch commit it tested, the OS × Pipenv-version × mode cells it covered, the issues it filed, updated or closed, and what it plans to probe next. The routine treats this thread as its only memory.
 
-Last run: 2026-10-07 ~15:55Z, main `6fe81ad`. #504 / #947 / #932 re-verified fixed. Filed #1048: hosted still pins an interpreter-bound `cp311-none-any` wheel, so `pipenv sync` fails on py3.12 (Pipenv 2023.12.1 / 2026.8.0). Previous run: 2026-10-07 ~09:46Z (bisected #981, Pipenv evidence on #477).
+Last run: 2026-10-07 ~21:50Z, main `05ecc6e`. #769 re-verified fixed (vendored supersede). #1048 vendored variant reproduced on 2023 / 2026, and PR #1053 verified for hosted + vendored. #515 symptom (repair loses `socket-patch.vendor.json`) seen in the PyPI lane (commented). #1025 spellings pass in all three modes. Previous run: 2026-10-07 ~15:55Z (filed #1048).
 
 ## Coverage matrix
 
@@ -82,18 +82,20 @@ Stale-install remedy followed verbatim, `15:30Z` run, `045d7ec`: `default` patch
 
 `15:55Z` run (2026-10-07), `6fe81ad`: hosted platform-wheel refusal (#984) on 2023.12.1 / 2026.8.0 with sync on py3.11 + py3.12: `py2.py3-none-any` pass, manylinux withheld pass, `cp311-none-any` pinned with no warning and py3.12 sync fails (fail #1048). #504 / #947: a Pipenv project with system-only packages scans only the lock in agent / hosted / vendored (pass). #744 still fails.
 
+`21:50Z` run (2026-10-07), `05ecc6e`, with a mock that does full service vendoring: #1048 vendored (`cp311-none-any` committed, no advisory, py3.12 sync fails) on 2023.12.1 / 2026.8.0 (fail #1048); PR #1053 `6bff12d` withholds hosted and warns vendored (pass). #769 supersede A → B (2022 / 2026, lock-only + warm venv): pass. #1025 spellings in `remove` / `rollback` (hosted, vendored, agent) and `[dev-packages]` / `[docs]` keys (`Typing_Extensions`, a literal `typing.extensions` key kept by Pipenv 2026): pass. Hosted warm venv with partial remedy (vex attests only the patched package): pass. Lost `state.json`: every command refuses (pass); the `vendor --revert` remedy loops (#1072). Deleted uuid dir → `repair`: wheel rebuilt, marker not restored (#515, commented).
+
 macOS/Windows rows are from the 2026-09-30 probes on `f6b7fb9`. No probe ran on v5 because branch deletion through the git proxy still fails (re-checked 2026-10-03 03:30Z); `bughunt/pipenv/20260930-venv-discovery` and `bughunt/pipenv/20260930-virtualenv` still need a maintainer to delete them.
 
 ## Backlog
 
-00000000. #1048: vendored variant (`vendor_platform_locked` uses the same rule; needs a full vendoring mock), then re-verify once fixed. Re-verify #769 (closed by #825) with a vendoring mock.
+00000000. Re-verify #1048 (hosted + vendored) once PR #1053 merges; variants: `develop` / named categories, Pipenv 11 `path`. (Vendored variant reproduced and #769 re-verified fixed, 2026-10-07 21:50Z.) The mock now does full service vendoring: reuse it for #912 / #612 / #567 vendored variants.
 0000000. #981: re-verify once fixed. (Bisect: first bad 2023.7.9; `--dev` / `--categories` exports also have no hash. Done 2026-10-07 09:46Z.) Re-verify #477 for Pipenv once fixed (the rollback / remove / `vendor --revert` remedy should name `pipenv run pip uninstall -y <pkg> && pipenv sync` with the lock's category args).
 000000. (#947 / #504 re-verified fixed on `6fe81ad`, 2026-10-07 15:55Z; the budget variant is still to check.) (`get --mode vendored` / `vendor` from a manifest: done 2026-10-07 09:46Z, pass.) (The 2020 / 2021 hosted ↔ vendored takeovers: done 2026-10-07, pass.)
 00000. #932 fixed by #984 (manylinux withheld, re-verified 2026-10-07 15:55Z); the interpreter-tag gap is #1048. Variants: `develop` / named categories, Pipenv 11 `path` form, hosted rollback of the narrowed entry (refused by the session policy on 2026-10-06); re-verify once fixed.
 0000. #912 variants: `pylock.<name>.toml` (`pylock_name`), dev packages in pylock, rollback / remove / repair on a pylock-only Pipenv project; re-verify once fixed.
 
 000. (#790 re-verified fixed on main `0d302dc`, 2026-10-05 19:15Z.) Still untested: Windows cmd / PowerShell quoting of `--categories "…"`.
-00. Re-verify #769 once fixed (vendored re-vendor A → B: rewire in place, old uuid dir removed, revert byte-exact, no false `package_not_installed` with a venv). (Hosted supersede on 2018 / 2022 / 2023, develop / named categories and with a sibling requirements.txt: done 2026-10-04 15:30Z, pass.)
+00. (#769 re-verified fixed on `05ecc6e`, 2026-10-07 21:50Z.) (Hosted supersede on 2018 / 2022 / 2023, develop / named categories and with a sibling requirements.txt: done 2026-10-04 15:30Z, pass.)
 0. (#645 re-verified fixed for agent mode and agent vex on 2026-10-05 21:44Z, and for the hosted stale warning and hosted vex on 2026-10-06 15:37Z.)
 1. #612 variants still open: `-r` includes in vendored mode. Re-verify once fixed. (Revert / rollback on the half-wired project pass.)
 2. #546 re-verified fixed for agent mode (2026-10-05 21:44Z, 12 `.env` shapes); `VIRTUAL_ENV` / `PIPENV_ACTIVE` / IGNORE inside `.env` done 2026-10-06, pass. (The hosted stale warning with `.env` custom-name / IN_PROJECT venvs: done 2026-10-07 09:46Z, pass.)
@@ -175,3 +177,6 @@ macOS/Windows rows are from the 2026-09-30 probes on `f6b7fb9`. No probe ran on 
 - Mock harness: restarting `tools/mock.py` rebuilds the patched wheel with new zip timestamps (a different sha256). Don't kill it with `pkill -f` from a shell whose command line names it.
 - **Maintainer question (since #950):** in the Docker `pipenv install --system` shape, an agent `scan` without `-g` now patches nothing and says "not installed; run your package manager's install first", with no hint that `-g` covers a system install. That's deliberate (#504's fix); the hint wording could name `-g`. Not filed.
 - Harness note: Pipenv 2018.11.26 needs py3.8 (on 3.11 its requirementslib crashes on `file` entries).
+- Vendored supersede A → B over a venv holding patch A: the stale warning says "the UNPATCHED upstream release is still installed", though the bytes are patch A's. The wording is imprecise and the remedy is correct, so it isn't filed.
+- `remove` / `rollback` need a versioned purl or a uuid; `remove pkg:pypi/six` / `remove six` → "No patch found" in every spelling. That's cross-PM identifier behaviour.
+- The lost-ledger `vendor --revert` remedy loop is #1072 (pm:npm), and the same message appears for Pipenv. Don't re-file it.
