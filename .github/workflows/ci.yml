@@ -1252,6 +1252,7 @@ jobs:
     env:
       SOCKET_NO_CONFIG: '1'
       SOCKET_NO_UPDATE_CHECK: '1'
+      SOCKET_TELEMETRY_DISABLED: '1'
     # e2e-full runs these same steps over its rows.
     steps: &e2e-steps
       - name: Checkout
@@ -1737,6 +1738,7 @@ jobs:
     env:
       SOCKET_NO_CONFIG: '1'
       SOCKET_NO_UPDATE_CHECK: '1'
+      SOCKET_TELEMETRY_DISABLED: '1'
     steps: *e2e-steps
 
   # ----------------------------------------------------------------------
@@ -1945,6 +1947,7 @@ jobs:
     env:
       SOCKET_NO_CONFIG: '1'
       SOCKET_NO_UPDATE_CHECK: '1'
+      SOCKET_TELEMETRY_DISABLED: '1'
     strategy:
       fail-fast: false
       matrix:
@@ -2016,6 +2019,7 @@ jobs:
     env:
       SOCKET_NO_CONFIG: '1'
       SOCKET_NO_UPDATE_CHECK: '1'
+      SOCKET_TELEMETRY_DISABLED: '1'
     strategy:
       fail-fast: false
       matrix:

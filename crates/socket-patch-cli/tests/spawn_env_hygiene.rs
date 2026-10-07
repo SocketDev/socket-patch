@@ -327,6 +327,82 @@ fn cargo_config_env_carries_the_opt_outs() {
     }
 }
 
+/// B69: CI legs that run the prebuilt test binaries directly (not through
+/// cargo) do not get the `[env]` table, so their workflow env blocks copy it
+/// by hand. Any env block that copies one opt-out must copy all three.
+#[test]
+fn workflow_env_copies_carry_every_opt_out() {
+    const OPT_OUTS: [&str; 3] = [
+        "SOCKET_NO_CONFIG",
+        "SOCKET_NO_UPDATE_CHECK",
+        "SOCKET_TELEMETRY_DISABLED",
+    ];
+    let dir = Path::new(env!("CARGO_MANIFEST_DIR")).join("../../.github/workflows");
+    let mut entries: Vec<_> = std::fs::read_dir(&dir)
+        .unwrap_or_else(|e| panic!("read {}: {e}", dir.display()))
+        .map(|e| e.expect("workflow dir entry").path())
+        .filter(|p| p.extension().is_some_and(|x| x == "yml" || x == "yaml"))
+        .collect();
+    entries.sort();
+    let mut copies = 0;
+    let mut missing = Vec::new();
+    for path in entries {
+        let text = std::fs::read_to_string(&path)
+            .unwrap_or_else(|e| panic!("read {}: {e}", path.display()))
+            .replace("\r\n", "\n");
+        let lines: Vec<&str> = text.lines().collect();
+        // An env block is a run of `KEY: value` lines at one indent; find
+        // every run that sets any opt-out and check it sets them all.
+        let mut i = 0;
+        while i < lines.len() {
+            let line = lines[i];
+            let Some(var) = OPT_OUTS
+                .iter()
+                .find(|v| line.trim_start().starts_with(&format!("{v}:")))
+            else {
+                i += 1;
+                continue;
+            };
+            let indent = line.len() - line.trim_start().len();
+            let same_block = |l: &&str| {
+                let t = l.trim_start();
+                l.len() - t.len() == indent && !t.is_empty() && !t.starts_with('-')
+            };
+            let mut start = i;
+            while start > 0 && same_block(&lines[start - 1]) {
+                start -= 1;
+            }
+            let mut end = i;
+            while end + 1 < lines.len() && same_block(&lines[end + 1]) {
+                end += 1;
+            }
+            let block = &lines[start..=end];
+            copies += 1;
+            for want in OPT_OUTS {
+                let set = block.iter().any(|l| l.trim() == format!("{want}: '1'"));
+                if !set {
+                    missing.push(format!(
+                        "{}:{} (block with {var}) lacks {want}: '1'",
+                        path.display(),
+                        start + 1
+                    ));
+                }
+            }
+            i = end + 1;
+        }
+    }
+    assert!(
+        copies > 0,
+        "found no workflow env copy of the [env] opt-outs"
+    );
+    assert!(
+        missing.is_empty(),
+        "workflow env blocks that copy .cargo/config.toml [env] must set all \
+         three opt-outs:\n{}",
+        missing.join("\n")
+    );
+}
+
 #[test]
 #[serial]
 fn command_never_leaks_its_hostile_seeds() {

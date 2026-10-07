@@ -35,6 +35,7 @@ concurrency:
 env:
   SOCKET_NO_CONFIG: '1'
   SOCKET_NO_UPDATE_CHECK: '1'
+  SOCKET_TELEMETRY_DISABLED: '1'
 
 jobs:
   go:

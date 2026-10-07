@@ -118,6 +118,7 @@ jobs:
           SOCKET_PATCH_PNPM_E2E_REQUIRED: '1'
           SOCKET_NO_CONFIG: '1'
           SOCKET_NO_UPDATE_CHECK: '1'
+          SOCKET_TELEMETRY_DISABLED: '1'
         run: |
           chmod +x bin/socket-patch bin/pnpm-e2e bin/pnpm-vendor-e2e
           export SOCKET_PATCH_PNPM_E2E_SOCKET_BIN="$PWD/bin/socket-patch"
