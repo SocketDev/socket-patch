@@ -311,6 +311,22 @@ impl VendorEntry {
         target.matches_patch(key, &self.uuid) || target.matches_patch(&self.base_purl, &self.uuid)
     }
 
+    /// The purl that names this entry's package for
+    /// [`Target::ambiguity`]: the decoded `base_purl` when `target`
+    /// reaches the entry through it, otherwise the ledger `key`. A golang
+    /// key is case-encoded (`!core`) and so can miss a last-segment name
+    /// that its `base_purl` (`Core`) matches; feeding the key alone would
+    /// skip the refusal while [`Self::matches_target`] still selects the
+    /// entry. One purl per entry, so an encoded key and its decoded base
+    /// never count as two packages.
+    pub fn ambiguity_purl<'a>(&'a self, key: &'a str, target: &Target) -> &'a str {
+        if target.matches_patch(&self.base_purl, &self.uuid) {
+            &self.base_purl
+        } else {
+            key
+        }
+    }
+
     /// Does this entry, stored under ledger `key`, own the manifest purl
     /// `purl`? The ledger-key / qualifier-stripped-key / base-purl triple,
     /// plus composer release identity (`@3.0.2` owns `@3.0.2.0`) — the
@@ -1109,6 +1125,24 @@ mod tests {
             &Target::parse("pkg:golang/github.com/BurntSushi/toml@2.0.0")
         ));
         assert!(!entry.matches_target(key, &Target::parse("00000000-0000-4000-8000-000000000000")));
+
+        // A last-segment name reaching the entry only through its decoded
+        // base purl is counted under that purl, never under the encoded key.
+        let name = Target::parse("Toml");
+        assert_eq!(entry.ambiguity_purl(key, &name), entry.base_purl);
+        let mut core = sample_entry();
+        core.ecosystem = "golang".into();
+        core.base_purl = "pkg:golang/github.com/x/Core@1.0.0".into();
+        let core_key = "pkg:golang/github.com/x/!core@1.0.0";
+        let other = "pkg:npm/core@1.0.0";
+        let core_name = Target::parse("core");
+        assert!(core.matches_target(core_key, &core_name));
+        assert!(core_name
+            .ambiguity([core.ambiguity_purl(core_key, &core_name), other])
+            .is_some());
+        // One entry, encoded key plus decoded base: one package.
+        let sushi = Target::parse("toml");
+        assert_eq!(sushi.ambiguity([entry.ambiguity_purl(key, &sushi)]), None);
 
         // A qualified pypi key: the base identifier covers it, another
         // variant's qualifier does not.

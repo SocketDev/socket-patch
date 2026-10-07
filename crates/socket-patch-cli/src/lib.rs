@@ -239,6 +239,66 @@ pub fn try_parse_cli(argv: &[String]) -> Result<Cli, clap::Error> {
     Cli::from_arg_matches_mut(&mut matches).map_err(|e| e.format(&mut cli_command()))
 }
 
+/// Is there a UUID-shaped operand among `args` (argv without argv[0])
+/// before the first subcommand name? A value-taking flag's value
+/// (`--org <UUID>`, `-o<v>`) is not an operand, so a UUID-shaped org slug
+/// or token never turns `socket-patch --org <UUID> scan --help` into
+/// `get`. After `--` every token is an operand.
+fn first_operand_is_uuid(args: &[String], subcommands: &[String]) -> bool {
+    // The rewrite parses `args` as `get`'s, so `get`'s value-taking flags
+    // (the shared global options included) decide what is a flag value.
+    let cmd = cli_command();
+    let get = cmd.find_subcommand("get").expect("get subcommand");
+    let mut longs: Vec<&str> = Vec::new();
+    let mut shorts: Vec<char> = Vec::new();
+    for arg in cmd.get_arguments().chain(get.get_arguments()) {
+        if !arg.get_action().takes_values() || arg.is_positional() {
+            continue;
+        }
+        longs.extend(arg.get_long());
+        longs.extend(arg.get_all_aliases().unwrap_or_default());
+        shorts.extend(arg.get_short());
+        shorts.extend(arg.get_all_short_aliases().unwrap_or_default());
+    }
+    let mut options_ended = false;
+    let mut i = 0;
+    while i < args.len() {
+        let a = args[i].as_str();
+        i += 1;
+        if !options_ended {
+            if a == "--" {
+                options_ended = true;
+                continue;
+            }
+            if subcommands.iter().any(|s| s == a) {
+                return false;
+            }
+            if let Some(long) = a.strip_prefix("--") {
+                if !long.contains('=') && longs.contains(&long) {
+                    i += 1;
+                }
+                continue;
+            }
+            if let Some(cluster) = a.strip_prefix('-').filter(|c| !c.is_empty()) {
+                // `-xo VALUE` or `-xoVALUE`: the first value-taking short
+                // consumes the rest of the cluster, or the next token
+                // when it ends the cluster.
+                let chars: Vec<char> = cluster.chars().collect();
+                if let Some(at) = chars.iter().position(|c| shorts.contains(c)) {
+                    if at + 1 == chars.len() {
+                        i += 1;
+                    }
+                }
+                continue;
+            }
+        }
+        if is_uuid_shaped(a) {
+            return true;
+        }
+    }
+    false
+}
+
 /// Parse a full argv vector with two convenience rewrites on failure:
 /// `--update [...]` becomes the hidden `self-update` subcommand, and a
 /// bare `<UUID>` becomes `get <UUID>`. Returns the original clap error if
@@ -309,11 +369,7 @@ pub fn parse_argv_with_shortcuts(argv: Vec<String>) -> Result<Cli, clap::Error> 
                 .flat_map(|c| std::iter::once(c.get_name()).chain(c.get_all_aliases()))
                 .map(str::to_string)
                 .collect();
-            let uuid_operand = argv
-                .iter()
-                .skip(1)
-                .take_while(|a| !subcommands.contains(a))
-                .any(|a| is_uuid_shaped(a));
+            let uuid_operand = first_operand_is_uuid(&argv[1..], &subcommands);
             if uuid_operand {
                 let mut new_args = vec![argv[0].clone(), "get".into()];
                 new_args.extend_from_slice(&argv[1..]);
@@ -480,6 +536,45 @@ mod tests {
         }
         // A UUID after a real subcommand is that subcommand's operand.
         assert!(parse_argv_with_shortcuts(argv(&["socket-patch", "list", UUID])).is_err());
+    }
+
+    #[test]
+    fn fallback_skips_a_uuid_shaped_flag_value() {
+        // A UUID-shaped flag value is the flag's value, not the shortcut
+        // operand: `--org <UUID> scan` must fail exactly as `--org acme
+        // scan` does, never parse as `get scan` (which would run `get`
+        // with `scan` as its identifier).
+        for flags in [
+            vec!["--org", UUID],
+            vec!["-o", UUID],
+            vec!["--api-token", UUID],
+        ] {
+            for tail in [vec!["scan"], vec!["scan", "--help"]] {
+                let mut args = vec!["socket-patch"];
+                args.extend(flags.iter().copied());
+                args.extend(tail.iter().copied());
+                let err = match parse_argv_with_shortcuts(argv(&args)) {
+                    Ok(cli) => panic!(
+                        "{args:?} was rewritten to {:?}",
+                        std::mem::discriminant(&cli.command)
+                    ),
+                    Err(e) => e,
+                };
+                assert_eq!(
+                    err.kind(),
+                    clap::error::ErrorKind::UnknownArgument,
+                    "{args:?}"
+                );
+            }
+        }
+        assert!(!first_operand_is_uuid(
+            &argv(&["--org", UUID, "-o", UUID, "--org=x"]),
+            &[]
+        ));
+        assert!(first_operand_is_uuid(&argv(&["--org", "acme", UUID]), &[]));
+        assert!(first_operand_is_uuid(&argv(&["-oacme", UUID]), &[]));
+        assert!(first_operand_is_uuid(&argv(&["--org=acme", UUID]), &[]));
+        assert!(first_operand_is_uuid(&argv(&["--", UUID]), &[]));
     }
 
     #[test]

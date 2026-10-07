@@ -466,7 +466,13 @@ pub async fn run(args: RemoveArgs) -> i32 {
     {
         let ledger_purls: Vec<&str> = vendor_state_result
             .as_ref()
-            .map(|state| state.entries.keys().map(String::as_str).collect())
+            .map(|state| {
+                state
+                    .entries
+                    .iter()
+                    .map(|(key, entry)| entry.ambiguity_purl(key, &target))
+                    .collect()
+            })
             .unwrap_or_default();
         let candidates = manifest
             .patches

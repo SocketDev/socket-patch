@@ -1301,7 +1301,7 @@ pub async fn run(args: RollbackArgs) -> i32 {
                 .manifest
                 .iter()
                 .map(String::as_str)
-                .chain(found.vendor.iter().map(|(k, _)| k.as_str()))
+                .chain(found.vendor.iter().map(|(k, e)| e.ambiguity_purl(k, id)))
                 .chain(hosted_found),
         );
         manifest_scope.extend(found.manifest);
