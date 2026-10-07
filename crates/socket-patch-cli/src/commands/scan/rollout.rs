@@ -42,11 +42,28 @@ pub(super) fn upgrades(rows: &[Row], package_purls: &[String]) -> Vec<UpdateInfo
 pub(crate) struct Gate<'a> {
     pub(crate) stage: &'a mut Stage,
     pub(crate) rows: Vec<Row>,
+    /// Scan's lockfile discovery of `--cwd`, made before the redirect
+    /// (with the configured patch-server origins): the rewrite's
+    /// attribution gate reuses it when nothing changed the project since.
+    pub(crate) prior: Option<&'a socket_patch_core::vex::discover::Discovery>,
 }
 
 impl<'a> Gate<'a> {
     pub(crate) fn new(stage: &'a mut Stage, rows: Vec<Row>) -> Self {
-        Gate { stage, rows }
+        Gate {
+            stage,
+            rows,
+            prior: None,
+        }
+    }
+
+    /// This gate carrying scan's pre-redirect discovery (see [`Self::prior`]).
+    pub(crate) fn with_prior(
+        mut self,
+        prior: Option<&'a socket_patch_core::vex::discover::Discovery>,
+    ) -> Self {
+        self.prior = prior;
+        self
     }
 
     /// `(purl, uuid)` of every NEW row, for O(1) [`Self::is_new`] checks.

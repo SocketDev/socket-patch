@@ -919,6 +919,15 @@ pub struct RewriteOptions<'a> {
     /// configured server even when this run's grants live on another host.
     /// Empty for the in-memory engine, which has no such knob.
     pub patch_server_origins: Vec<String>,
+    /// Lockfile discovery of the project exactly as this rewrite reads it,
+    /// made with exactly `patch_server_origins` (the caller's pre-rewrite
+    /// discovery, `None` when nothing was discovered or the project may
+    /// have changed since). The attribution gate reuses it instead of
+    /// discovering again when a pass writes nothing and this run's grants
+    /// name no origin beyond `patch_server_origins` (see
+    /// [`reusable_prior`]): the project it would discover is then the
+    /// same, read the same way.
+    pub prior_discovery: Option<&'a crate::vex::discover::Discovery>,
 }
 
 /// One project's rewrite, ready for the guard, the record fetch and the
@@ -1103,8 +1112,15 @@ pub async fn rewrite(
             options.clone(),
         )
         .await;
-        let (vetoed, lockless) =
-            unattributed_pins(view, &done, &kept, &exempt, &options.patch_server_origins).await;
+        let (vetoed, lockless) = unattributed_pins(
+            view,
+            &done,
+            &kept,
+            &exempt,
+            &options.patch_server_origins,
+            options.prior_discovery,
+        )
+        .await;
         if vetoed.is_empty() {
             done.unattributed = unattributed;
             done.rewrite.warnings.extend(lockless);
@@ -1140,6 +1156,7 @@ async fn unattributed_pins(
     candidates: &[Candidate],
     exempt: &BTreeSet<String>,
     configured: &[String],
+    prior: Option<&crate::vex::discover::Discovery>,
 ) -> (Vec<SkippedPatch>, Vec<RewriteWarning>) {
     if done.confirmed.is_empty() {
         return (Vec::new(), Vec::new());
@@ -1164,34 +1181,48 @@ async fn unattributed_pins(
     for (rel, bytes) in &done.rewrite.binary_files {
         written.push((rel.as_str(), bytes.as_slice()));
     }
-    let discovery = match view.disk_root() {
-        None => {
-            let ProjectView::Memory(project) = *view else {
-                unreachable!("only a memory view has no disk root")
-            };
-            let mut after = project.clone();
-            for (rel, bytes) in written {
-                let entry = match std::str::from_utf8(bytes) {
-                    Ok(text) => crate::vendor::lock_inventory::MemoryEntry::Text(text.into()),
-                    Err(_) => crate::vendor::lock_inventory::MemoryEntry::Binary(bytes.into()),
+    let fresh;
+    let discovery = if let Some(prior) = reusable_prior(
+        prior,
+        written.is_empty(),
+        &opts.patch_server_origins,
+        configured,
+    ) {
+        prior
+    } else {
+        fresh = match view.disk_root() {
+            None => {
+                let ProjectView::Memory(project) = *view else {
+                    unreachable!("only a memory view has no disk root")
                 };
-                after.insert(rel, entry);
+                let mut after = project.clone();
+                for (rel, bytes) in written {
+                    let entry = match std::str::from_utf8(bytes) {
+                        Ok(text) => crate::vendor::lock_inventory::MemoryEntry::Text(text.into()),
+                        Err(_) => crate::vendor::lock_inventory::MemoryEntry::Binary(bytes.into()),
+                    };
+                    after.insert(rel, entry);
+                }
+                crate::vex::discover::discover_patched_refs_view(ProjectView::Memory(&after), &opts)
+                    .await
             }
-            crate::vex::discover::discover_patched_refs_view(ProjectView::Memory(&after), &opts)
+            Some(root) => {
+                let after = crate::vendor::lock_inventory::DiskSnapshot::new(root);
+                for (rel, bytes) in written {
+                    after.overlay(rel, bytes);
+                }
+                crate::vex::discover::discover_patched_refs_view(
+                    ProjectView::Snapshot(&after),
+                    &opts,
+                )
                 .await
-        }
-        Some(root) => {
-            let after = crate::vendor::lock_inventory::DiskSnapshot::new(root);
-            for (rel, bytes) in written {
-                after.overlay(rel, bytes);
             }
-            crate::vex::discover::discover_patched_refs_view(ProjectView::Snapshot(&after), &opts)
-                .await
-        }
+        };
+        &fresh
     };
     // The management commands' own view of the result: an attributable
     // pin, or contested wiring they would refuse around.
-    let inventory = crate::patch::redirect::upstream::HostedInventory::of(&discovery);
+    let inventory = crate::patch::redirect::upstream::HostedInventory::of(discovery);
     let attributed: BTreeSet<&str> = inventory.pins.iter().map(|p| p.uuid.as_str()).collect();
     let lockless: Vec<RewriteWarning> = discovery
         .unlocked_pins
@@ -1277,6 +1308,19 @@ async fn unattributed_pins(
         })
         .collect();
     (vetoed, lockless)
+}
+
+/// The caller's pre-rewrite discovery, when it is exactly what the gate
+/// would discover: the pass writes nothing (so the project is the one the
+/// caller discovered) and the gate's origins (`origins`: `configured` plus
+/// the grants' hosts) are the ones the caller discovered with.
+fn reusable_prior<'d>(
+    prior: Option<&'d crate::vex::discover::Discovery>,
+    nothing_written: bool,
+    origins: &[String],
+    configured: &[String],
+) -> Option<&'d crate::vex::discover::Discovery> {
+    prior.filter(|_| nothing_written && origins == configured)
 }
 
 /// Warning: a confirmed pin no lockfile records a version for (a lockless
@@ -2291,6 +2335,7 @@ mod tests {
             blocking: false,
             takeover_uuids: Default::default(),
             patch_server_origins: Vec::new(),
+            prior_discovery: None,
         };
         let mut skipped = Vec::new();
         let candidates = build_candidates(&selected, &refs, &mut skipped);
@@ -2524,6 +2569,7 @@ mod tests {
             blocking: false,
             takeover_uuids: Default::default(),
             patch_server_origins: Vec::new(),
+            prior_discovery: None,
         };
         let candidates = vec![left_pad_candidate()];
         let read = read_candidate_files(view, unreadable, &candidates).await;
@@ -2647,6 +2693,7 @@ mod tests {
                 blocking: false,
                 takeover_uuids: Default::default(),
                 patch_server_origins: Vec::new(),
+                prior_discovery: None,
             };
             let read = read_candidate_files(&view, &BTreeSet::new(), &candidates).await;
             assert!(read.files.contains_key("package.json"));
@@ -2825,6 +2872,7 @@ mod tests {
             blocking: false,
             takeover_uuids: Default::default(),
             patch_server_origins: Vec::new(),
+            prior_discovery: None,
         };
         let candidates = vec![gradle_candidate()];
         let read = read_candidate_files(view, &BTreeSet::new(), &candidates).await;
@@ -3036,6 +3084,22 @@ mod tests {
         assert!(done.confirmed.is_empty(), "{:?}", done.confirmed);
     }
 
+    /// The gate reuses the caller's discovery only for a pass that writes
+    /// nothing and whose origins are exactly the ones it was made with.
+    #[test]
+    fn the_prior_discovery_is_reused_only_unwritten_with_the_same_origins() {
+        let prior = crate::vex::discover::Discovery::default();
+        let configured = vec!["https://patch.test".to_string()];
+        let extra = vec![
+            "https://patch.test".to_string(),
+            "https://other.test".to_string(),
+        ];
+        assert!(reusable_prior(Some(&prior), true, &configured, &configured).is_some());
+        assert!(reusable_prior(Some(&prior), false, &configured, &configured).is_none());
+        assert!(reusable_prior(Some(&prior), true, &extra, &configured).is_none());
+        assert!(reusable_prior(None, true, &configured, &configured).is_none());
+    }
+
     /// A lockless NuGet pin (a Socket source mapping, no
     /// `packages.lock.json`) is still written, but the run says no later
     /// command can manage it and names the lockfile that fixes that.
@@ -3092,6 +3156,7 @@ mod tests {
             blocking: false,
             takeover_uuids: Default::default(),
             patch_server_origins: Vec::new(),
+            prior_discovery: None,
         };
         let candidates = vec![candidate];
         let view = ProjectView::Memory(&p);
@@ -3140,6 +3205,7 @@ mod tests {
             blocking: false,
             takeover_uuids: Default::default(),
             patch_server_origins: Vec::new(),
+            prior_discovery: None,
         };
         let candidates = vec![gem_candidate()];
         let view = ProjectView::Memory(p);

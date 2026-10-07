@@ -1885,6 +1885,13 @@ async fn run_scan(
         } else {
             socket_patch_core::patch::redirect::upstream::HostedPin::all(ctx.discovery().await)
         };
+    // The same discovery, handed to the hosted redirect's attribution gate
+    // (nothing below writes before it; see `rollout::Gate::prior`).
+    let prior_discovery = if args.common.is_global() {
+        None
+    } else {
+        Some(ctx.discovery().await)
+    };
     let hosted_state = (!args.common.is_global())
         .then(|| crate::commands::hosted_state_from_pins(&hosted_pin_list));
     let redirect_state = hosted_state.as_ref();
@@ -2424,6 +2431,7 @@ async fn run_scan(
                 &recorded,
                 batch_error_count > 0,
                 &mut stage,
+                prior_discovery,
             )
             .await;
         }
@@ -2905,7 +2913,7 @@ async fn run_scan(
             &pairs,
             None,
             npm_crawl.as_ref(),
-            Some(rollout::Gate::new(&mut stage, rows)),
+            Some(rollout::Gate::new(&mut stage, rows).with_prior(prior_discovery)),
         )
         .await;
     }

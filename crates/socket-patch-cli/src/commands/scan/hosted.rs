@@ -561,6 +561,8 @@ pub(super) async fn run_redirect(
     recorded: &super::rollout::RecordedState<'_>,
     batch_failed: bool,
     stage: &mut super::rollout::Stage,
+    // Scan's pre-redirect lockfile discovery (see `rollout::Gate::prior`).
+    prior: Option<&socket_patch_core::vex::discover::Discovery>,
 ) -> i32 {
     // Same discovery/selection as `--apply`/`--vendor`.
     let discovered = match discover_selected(
@@ -618,7 +620,7 @@ pub(super) async fn run_redirect(
         &pairs,
         scan_result,
         npm_prior,
-        Some(super::rollout::Gate::new(stage, rows)),
+        Some(super::rollout::Gate::new(stage, rows).with_prior(prior)),
     )
     .await
 }
@@ -1024,6 +1026,15 @@ pub(crate) async fn run_redirect_selected(
             .collect()
     };
     let patch_server_origins = crate::commands::rollback::patch_server_origins(common);
+    // Scan's discovery predates this run's writes, and only the takeover's
+    // revert above changes the project before the rewrite (scan writes
+    // nothing between its discovery and this call): it still describes the
+    // project the rewrite reads unless a takeover touched files. It was
+    // made with `patch_server_origins` (`discover_wiring`).
+    let prior_discovery = rollout
+        .as_ref()
+        .and_then(|gate| gate.prior)
+        .filter(|_| takeover_files.is_empty() && takeover_migrated.is_empty());
     let rewrite_options = || RewriteOptions {
         dry_run: common.dry_run,
         targets_pipenv_lock,
@@ -1038,6 +1049,7 @@ pub(crate) async fn run_redirect_selected(
         blocking: true,
         takeover_uuids: takeover_uuids.clone(),
         patch_server_origins: patch_server_origins.clone(),
+        prior_discovery,
     };
     // The rollout gate plans again without its deferred rows: keep what
     // the second pass needs.

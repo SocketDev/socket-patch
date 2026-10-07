@@ -332,6 +332,7 @@ pub(crate) async fn rewrite(
             blocking: false,
             takeover_uuids: Default::default(),
             patch_server_origins: Vec::new(),
+            prior_discovery: None,
         },
     )
     .await;
