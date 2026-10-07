@@ -620,6 +620,19 @@ pub async fn read_candidate_files(
         let gradle_unreadable = &out.gradle_unreadable;
         out.undecodable_reads
             .retain(|rel| !gradle_unreadable.contains(rel));
+    } else {
+        // No readable Gradle build: the Gradle planner never runs, so a
+        // stray Gradle file it would own (a lone settings script, a lock)
+        // is never rewritten and must not refuse the rest of the run.
+        out.undecodable_reads
+            .retain(|rel| !is_gradle_owned_file(rel));
+    }
+    // `socket-patch.sbt` the sbt planner takes for absent and would create:
+    // on disk the scan refuses that write with its own
+    // `redirect_sbt_owned_file_unreadable`, so leave it to that refusal.
+    if !matches!(view, ProjectView::Memory(_)) {
+        out.undecodable_reads
+            .retain(|rel| rel != crate::formats::sbt::owned_file::HOSTED_FILE);
     }
     // An sbt build's resolution evidence rides a synthetic key (see
     // `patch::redirect::sbt::SBT_RESOLUTION_KEY`).
@@ -1945,6 +1958,19 @@ fn file_ecosystem(rel: &str) -> Option<&'static str> {
         .then_some("pypi")
 }
 
+/// A file only the hosted Gradle planner reads or writes: a settings or
+/// build script, a dependency lock, the verification metadata, the wrapper
+/// properties, or the planner's own owned files.
+fn is_gradle_owned_file(rel: &str) -> bool {
+    let base = rel.rsplit('/').next().unwrap_or(rel);
+    base.ends_with(".gradle")
+        || base.ends_with(".gradle.kts")
+        || base.ends_with(".lockfile")
+        || rel == "gradle/verification-metadata.xml"
+        || rel == "gradle/wrapper/gradle-wrapper.properties"
+        || rel.starts_with(".socket/gradle/")
+}
+
 /// The [`guard`]'s non-UTF-8 rule on its own (#721): the first of
 /// `undecodable` (a [`CandidateFiles::undecodable_reads`]) whose ecosystem
 /// has a candidate refuses the run. The vendored→hosted takeover runs it
@@ -2866,6 +2892,34 @@ mod tests {
         assert!(read.gradle_unreadable.is_empty());
         let text = &done.rewrite.files["settings.gradle"];
         assert!(text.contains("include 'core'"), "{text}");
+    }
+
+    /// #721 review: with no readable Gradle build the Gradle planner never
+    /// runs, so a stray non-UTF-8 Gradle file (a lone settings script, a
+    /// lock) does not refuse the rest of a Maven run.
+    #[tokio::test]
+    async fn a_stray_non_utf8_gradle_file_does_not_refuse_a_maven_run() {
+        const POM: &str = "<project><dependencies><dependency><groupId>com.socketfixture</groupId><artifactId>victim</artifactId><version>1.10.0</version></dependency></dependencies></project>\n";
+        let latin1: &[u8] = b"rootProject.name = 'Andr\xe9'\n";
+        let tmp = tempfile::tempdir().unwrap();
+        std::fs::write(tmp.path().join("pom.xml"), POM).unwrap();
+        std::fs::write(tmp.path().join("settings.gradle"), latin1).unwrap();
+        std::fs::write(tmp.path().join("gradle.lockfile"), latin1).unwrap();
+        let mut memory = MemoryProject::new();
+        memory.insert_text("pom.xml", POM);
+        for rel in ["settings.gradle", "gradle.lockfile"] {
+            memory.insert(rel, MemoryEntry::Binary(latin1.to_vec().into()));
+        }
+        let candidates = vec![gradle_candidate()];
+        for view in [ProjectView::Disk(tmp.path()), ProjectView::Memory(&memory)] {
+            let (read, done) = gradle_rewrite_in(&view).await;
+            assert!(
+                read.undecodable_reads.is_empty(),
+                "{:?}",
+                read.undecodable_reads
+            );
+            assert!(guard(&view, &done, &candidates).is_none());
+        }
     }
 
     /// A refused Gradle build is never confirmed by a snippet pasted into a
