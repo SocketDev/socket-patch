@@ -62,6 +62,50 @@ Remove only the Socket-managed portions of old hooks, preserving other commands:
 Use `socket-patch list` to inspect the remaining patch set. For agent projects,
 run `socket-patch apply` once after migration to confirm the manifest still applies.
 
+## Vendored Maven
+
+v5 vendors every Maven project through the suffixed backend that reactors
+already used. A single-module `pom.xml` is now handled as a reactor of one.
+Vendoring it changes these files:
+
+- `pom.xml`: the dependency's `<version>` becomes `<version>-socket.<hex8>`. A
+  `<dependencyManagement>` pin is added, and a `socket-patch-vendor` fallback
+  `<repository>` inside `<!-- socket-patch:begin -->` / `<!-- socket-patch:end -->`
+  markers.
+- `.mvn/maven.config`: two lines that let Maven 3.9.2+ read the committed tree.
+- `.socket/vendor/maven2/<group-path>/<artifact>/<version>-socket.<hex8>/`: the
+  patched jar, its pom and checksums. This replaces `.socket/vendor/maven/<uuid>/`.
+
+A project vendored before v5 still has the old wiring: a
+`socket-patch-vendor-<uuid>` `<repository>` in `pom.xml` and a
+`maven_pom_repository` entry in `.socket/vendor/state.json`. v5 does not
+migrate it. `vendor`, `scan --mode vendored` and `get --mode vendored` refuse
+that project with `vendor_jvm_shape_unsupported` (reason `legacy_maven_root`)
+and change nothing. Migrate it once:
+
+```sh
+socket-patch vendor --revert   # restores pom.xml byte for byte
+socket-patch vendor            # or: socket-patch scan --mode vendored
+```
+
+`remove`, `rollback` and switching to hosted mode still unwind the old wiring.
+
+Without a Maven Wrapper (`.mvn/wrapper/maven-wrapper.properties`) the CLI can't
+tell which Maven builds the project, so `vendor` reports two
+`vendor_jvm_degraded` warnings, `maven_f_outside_root` and
+`maven_mirror_of_all`. The patch is still applied. To clear them, add a Maven
+Wrapper pinned to Maven 3.9.9 or later. On older Maven, make sure no
+`mirrorOf *` mirror captures the `socket-patch-vendor` repository.
+
+These codes are no longer emitted: `vendor_maven_local_cache_shadow` (a cached
+original version can't shadow the suffixed pin),
+`vendor_maven_multimodule_unsupported`, `vendor_maven_pom_project_missing` and
+`vendor_gradle_unsupported` (a root with no JVM build is now
+`vendor_jvm_shape_unsupported` with reason `no_build_file`),
+`vendor_maven_pom_unreadable`, `vendor_maven_pom_unavailable` and
+`vendor_maven_pom_downloaded`. `legacy_maven_root` is now a refusal for the
+whole root, not a `vendor_jvm_degraded` warning on mixed Maven + Gradle roots.
+
 ## Retired spellings
 
 | Removed | Replacement |
