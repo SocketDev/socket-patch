@@ -167,7 +167,7 @@ The backticked slug in each row is the value `-e`/`--ecosystems` accepts (e.g.
   hosted bun packages to its upstream registry entry. A hosted `bun.lockb` entry is not
   rolled back (v5.0 keeps no hosted ledger, and a rebuilt binary record is not byte-exact
   for every lock): rollback and remove refuse it with the `git checkout -- bun.lockb`
-  remedy, while the hosted → vendored takeover rebuilds its npm registry record natively
+  remedy (then `bun install --force`: a plain install keeps the patched copy), while the hosted → vendored takeover rebuilds its npm registry record natively
   and vendors over it. Each restore reads the package's version document from the
   registry Bun resolves it against (`.npmrc` / `bunfig.toml` scope and default
   registries, `BUN_CONFIG_REGISTRY` / `NPM_CONFIG_REGISTRY`), sending the credentials
