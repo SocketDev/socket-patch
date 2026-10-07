@@ -856,6 +856,13 @@ mod tests {
                 "ssh://deploy@git.example.com/team/repo.git",
             ),
             ("https://ghp_SECRET@github.com/o/r.git", "pkg:github/o/r"),
+            // A username-only https userinfo (Bitbucket Server, Azure
+            // DevOps clones) can be a token, so it is dropped too: such a
+            // remote's product @id changed when credentials were stripped.
+            (
+                "https://user@git.selfhosted.example/team/repo.git",
+                "https://git.selfhosted.example/team/repo.git",
+            ),
         ] {
             let id = remote_url_to_purl(remote);
             assert_eq!(id, want, "{remote}");

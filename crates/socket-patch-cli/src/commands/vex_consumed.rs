@@ -516,15 +516,10 @@ fn registry_host(source: &str) -> Option<String> {
     let url = source
         .strip_prefix("sparse+")
         .or_else(|| source.strip_prefix("registry+"))?;
-    let (_, rest) = url.split_once("://")?;
-    let authority = &rest[..rest.find(['/', '?', '#']).unwrap_or(rest.len())];
-    let hostport = authority.rsplit_once('@').map_or(authority, |(_, h)| h);
-    let host = if hostport.starts_with('[') {
-        &hostport[..=hostport.find(']')?]
-    } else {
-        hostport.split(':').next()?
-    };
-    (!host.is_empty()).then(|| host.to_ascii_lowercase())
+    if !url.contains("://") {
+        return None;
+    }
+    socket_patch_core::utils::redact::url_hostname(url).map(str::to_ascii_lowercase)
 }
 
 /// The `<host>-<hash>` name of a `…/registry/src/<host>-<hash>` source dir,

@@ -64,6 +64,17 @@ pub fn url_host(url: &str) -> Option<&str> {
     (!host.is_empty()).then_some(host)
 }
 
+/// [`url_host`] without the port: `host`, or `[v6]` with its brackets.
+pub fn url_hostname(url: &str) -> Option<&str> {
+    let host = url_host(url)?;
+    let host = if host.starts_with('[') {
+        &host[..=host.find(']')?]
+    } else {
+        host.split(':').next()?
+    };
+    (!host.is_empty()).then_some(host)
+}
+
 /// A uuid-shaped path level (any hex case).
 fn is_uuid_shaped(s: &str) -> bool {
     s.len() == 36
@@ -73,13 +84,41 @@ fn is_uuid_shaped(s: &str) -> bool {
         })
 }
 
-/// A query parameter whose value is a secret, by name.
+/// A query parameter whose value is a secret, by name. A long marker
+/// counts anywhere in the name (`accesstoken`, `X-Amz-Signature`); a short
+/// one only as a whole word of it (`auth`, `api_key`, `sig`, but not
+/// `author`, `keyword` or `design`). Words split at `-`, `_`, `.` and a
+/// lower-to-upper case change (`apiKey`).
 fn is_secret_param(name: &str) -> bool {
-    const MARKERS: &[&str] = &[
-        "token", "auth", "key", "sig", "secret", "pass", "pwd", "cred", "session",
+    const ANYWHERE: &[&str] = &[
+        "token",
+        "secret",
+        "password",
+        "passwd",
+        "signature",
+        "credential",
+        "session",
+        "apikey",
     ];
-    let name = name.to_ascii_lowercase();
-    MARKERS.iter().any(|m| name.contains(m))
+    const WORDS: &[&str] = &["auth", "key", "sig", "pass", "pwd", "cred", "jwt"];
+    let lower = name.to_ascii_lowercase();
+    if ANYWHERE.iter().any(|m| lower.contains(m)) {
+        return true;
+    }
+    let mut words = Vec::new();
+    let mut word = String::new();
+    let mut prev_lower = false;
+    for c in name.chars() {
+        if !c.is_ascii_alphanumeric() || (prev_lower && c.is_ascii_uppercase()) {
+            words.push(std::mem::take(&mut word));
+        }
+        prev_lower = c.is_ascii_lowercase();
+        if c.is_ascii_alphanumeric() {
+            word.push(c.to_ascii_lowercase());
+        }
+    }
+    words.push(word);
+    words.iter().any(|w| WORDS.contains(&w.as_str()))
 }
 
 /// Byte range of the grant-token path level of a Socket-served URL: the
@@ -169,10 +208,22 @@ fn replace_spans<'a>(url: &'a str, mut spans: Vec<Range<usize>>, with: &str) -> 
     Cow::Owned(out)
 }
 
+/// Whether `userinfo` of `url` is a bare ssh login name (`git` in
+/// `ssh://git@github.com/…`): an ssh URL authenticates with a key, so a
+/// userinfo without a `:password` names the account, not a secret.
+fn is_ssh_login(url: &str, userinfo: &str) -> bool {
+    url.split_once("://")
+        .is_some_and(|(scheme, _)| scheme.to_ascii_lowercase().ends_with("ssh"))
+        && !userinfo.contains(':')
+}
+
 /// `url` safe to show: userinfo, the Socket grant token and secret query
 /// values each replaced with [`REDACTED`].
 pub fn redact_url(url: &str) -> Cow<'_, str> {
-    let mut spans: Vec<Range<usize>> = userinfo_span(url).into_iter().collect();
+    let mut spans: Vec<Range<usize>> = userinfo_span(url)
+        .filter(|r| !is_ssh_login(url, &url[r.clone()]))
+        .into_iter()
+        .collect();
     spans.extend(grant_token_span(url));
     spans.extend(secret_query_spans(url));
     replace_spans(url, spans, REDACTED)
@@ -233,9 +284,34 @@ fn ends_url(c: char) -> bool {
     c.is_whitespace() || matches!(c, '"' | '\'' | '`' | '<' | '>' | ')' | ']' | '}' | '|')
 }
 
+/// Start of the scheme that ends at `sep` (the byte offset of a `://`),
+/// scanning back no further than `floor`.
+fn scheme_start(text: &str, floor: usize, sep: usize) -> usize {
+    text[floor..sep]
+        .rfind(|c: char| !(c.is_ascii_alphanumeric() || matches!(c, '+' | '-' | '.')))
+        .map_or(floor, |j| floor + j + 1)
+}
+
+/// Where a URL starting with the `://` at `sep` and running to at most
+/// `end` stops because the next element of a comma-joined list begins (a
+/// GOPROXY value: `https://a,https://u:p@b,direct`): the `,` before the
+/// next `scheme://`. A `scheme://` after anything else (`?next=https://…`)
+/// is part of the URL, so a query secret after it stays in its query.
+fn list_element_end(text: &str, sep: usize, end: usize) -> usize {
+    let mut from = sep + 3;
+    while let Some(j) = text[from..end].find("://").map(|j| from + j) {
+        let scheme = scheme_start(text, from, j);
+        if scheme > from && scheme < j && text[..scheme].ends_with(',') {
+            return scheme - 1;
+        }
+        from = j + 3;
+    }
+    end
+}
+
 /// `text` with every `scheme://…` URL in it passed through [`redact_url`].
 /// Trailing sentence punctuation (`.`, `,`, `;`, `:`) is not taken as part
-/// of a URL.
+/// of a URL, and each element of a comma-joined URL list is its own URL.
 pub fn redact_urls_in(text: &str) -> Cow<'_, str> {
     if !text.contains("://") {
         return Cow::Borrowed(text);
@@ -244,11 +320,10 @@ pub fn redact_urls_in(text: &str) -> Cow<'_, str> {
     let mut at = 0;
     let mut changed = false;
     while let Some(i) = text[at..].find("://").map(|i| at + i) {
-        let start = text[at..i]
-            .rfind(|c: char| !(c.is_ascii_alphanumeric() || matches!(c, '+' | '-' | '.')))
-            .map_or(at, |j| at + j + 1);
+        let start = scheme_start(text, at, i);
         let tail = &text[i..];
         let end = i + tail.find(ends_url).unwrap_or(tail.len());
+        let end = list_element_end(text, i, end);
         let end = start
             + text[start..end]
                 .trim_end_matches(['.', ',', ';', ':'])
@@ -329,6 +404,28 @@ mod tests {
         assert_eq!(
             redact_url("https://s3/b/x.zip?X-Amz-Signature=abc&v=1&access_token=t#f"),
             "https://s3/b/x.zip?X-Amz-Signature=<redacted>&v=1&access_token=<redacted>#f"
+        );
+        assert_eq!(
+            redact_url("https://h/x?apiKey=a&sig=b&auth=c&accesstoken=d&api-key=e"),
+            "https://h/x?apiKey=<redacted>&sig=<redacted>&auth=<redacted>\
+             &accesstoken=<redacted>&api-key=<redacted>"
+        );
+        let plain = "https://h/x?author=a&keyword=b&design=c&monkey=d";
+        assert_eq!(redact_url(plain), plain, "a marker inside another word");
+    }
+
+    /// An ssh login name is not a secret; an ssh password is.
+    #[test]
+    fn an_ssh_login_name_is_kept() {
+        for kept in [
+            "git+ssh://git@github.com/o/r.git",
+            "ssh://git@git.corp:7999/t/r.git",
+        ] {
+            assert_eq!(redact_url(kept), kept);
+        }
+        assert_eq!(
+            redact_url("ssh://git:hunter2@git.corp/r.git"),
+            "ssh://<redacted>@git.corp/r.git"
         );
     }
 
@@ -418,6 +515,24 @@ mod tests {
         assert_eq!(builders, vec!["vendor/service_fetch.rs".to_string()]);
     }
 
+    /// A comma-joined URL list (GOPROXY) is redacted element by element;
+    /// a URL nested in a query is still part of its URL.
+    #[test]
+    fn every_element_of_a_url_list_is_redacted() {
+        assert_eq!(
+            redact_urls_in("GOPROXY=https://proxy.golang.org,https://u:p@goproxy.corp,direct"),
+            "GOPROXY=https://proxy.golang.org,https://<redacted>@goproxy.corp,direct"
+        );
+        assert_eq!(
+            redact_urls_in("https://a:b@x,https://c:d@y|https://e:f@z"),
+            "https://<redacted>@x,https://<redacted>@y|https://<redacted>@z"
+        );
+        assert_eq!(
+            redact_urls_in("https://h/x?next=https://n/y&token=SECRET"),
+            "https://h/x?next=https://n/y&token=<redacted>"
+        );
+    }
+
     #[test]
     fn url_host_never_returns_userinfo() {
         assert_eq!(
@@ -426,5 +541,12 @@ mod tests {
         );
         assert_eq!(url_host("h.example/x"), Some("h.example"));
         assert_eq!(url_host("https:///x"), None);
+        assert_eq!(
+            url_hostname("https://u:p@h.example:8443/x"),
+            Some("h.example")
+        );
+        assert_eq!(url_hostname("https://u@[::1]:8443/x"), Some("[::1]"));
+        assert_eq!(url_hostname("https://h.example?q"), Some("h.example"));
+        assert_eq!(url_hostname("https://u@:80/x"), None);
     }
 }
