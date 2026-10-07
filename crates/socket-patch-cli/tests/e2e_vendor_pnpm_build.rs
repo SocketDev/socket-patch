@@ -1622,6 +1622,183 @@ fn run_legacy_hermetic(lock_text: &str, after_template: &str, version: &str) {
     );
 }
 
+// ── gated real-pnpm two-document lock legs (#466) ─────────────────────
+
+/// pnpm 12 with `packageManager` set: `pnpm-lock.yaml` is two documents
+/// (pnpm's `packageManagerDependencies` env document, then the project
+/// lock). Vendoring used to refuse `vendor_lock_entry_not_found` here.
+#[test]
+fn pnpm12_package_manager_two_document_lock_vendors_and_reverts() {
+    run_two_document_capstone("pnpm@12.8.1", DEP, DEP_VERSION, true, false);
+}
+
+/// pnpm 11 config dependency sharing the vendored package's key: the env
+/// document carries its own `is-number@7.0.0`. Vendoring used to report
+/// success after rewriting the env document, and a fresh frozen install
+/// then failed.
+#[test]
+fn pnpm11_config_dependency_two_document_lock_vendors_the_project_copy() {
+    run_two_document_capstone("pnpm@11.27.0", "is-number", "7.0.0", false, true);
+}
+
+/// pnpm 12 with both: `packageManager` set and a config dependency sharing
+/// the vendored package's key.
+#[test]
+fn pnpm12_config_dependency_and_package_manager_two_document_lock() {
+    run_two_document_capstone("pnpm@12.8.1", "is-number", "7.0.0", true, true);
+}
+
+/// Vendor `dep` into a real two-document lock, prove a fresh checkout's
+/// frozen install lands the patched bytes in the project copy (the env
+/// document byte-untouched; a config dependency's own copy stays the
+/// registry's, with a `vendor_config_dependency_unpatched` warning), and
+/// revert byte-for-byte.
+fn run_two_document_capstone(
+    pm: &str,
+    dep: &str,
+    version: &str,
+    package_manager: bool,
+    config_dep: bool,
+) {
+    if !has_corepack_pm(pm) {
+        println!("SKIP: `corepack {pm}` unavailable");
+        return;
+    }
+    let tmp = tempfile::tempdir().unwrap();
+    let proj = tmp.path().join("proj");
+    std::fs::create_dir_all(&proj).unwrap();
+    let mut pkg_doc = serde_json::json!({
+        "name": "pnpm-two-doc",
+        "version": "0.0.0",
+        "private": true,
+        "dependencies": { dep: version },
+    });
+    if package_manager {
+        pkg_doc["packageManager"] = serde_json::json!(pm);
+    }
+    std::fs::write(
+        proj.join("package.json"),
+        format!("{}\n", serde_json::to_string_pretty(&pkg_doc).unwrap()),
+    )
+    .unwrap();
+    let store = tmp.path().join("pnpm-store");
+    let store = store.to_str().unwrap();
+    let config = format!("{dep}@{version}");
+    let mut steps: Vec<Vec<&str>> = Vec::new();
+    if config_dep {
+        steps.push(vec!["add", "--config", &config, "--store-dir", store]);
+    }
+    steps.push(vec!["install", "--store-dir", store]);
+    for args in steps {
+        let out = corepack(&proj, pm, &args);
+        if !out.status.success() {
+            assert!(!pnpm_required(), "required {pm} fixture failed: {out:?}");
+            println!("SKIP ({pm}): fixture `pnpm {args:?}` failed: {out:?}");
+            return;
+        }
+    }
+
+    let lock_path = proj.join("pnpm-lock.yaml");
+    let ws_path = proj.join("pnpm-workspace.yaml");
+    let pkg_path = proj.join("package.json");
+    let lock_before = std::fs::read_to_string(&lock_path).unwrap();
+    let ws_before = std::fs::read(&ws_path).ok();
+    let pkg_before = std::fs::read(&pkg_path).unwrap();
+    let env_doc = |lock: &str| {
+        let docs: Vec<&str> = lock.split("\n---\n").collect();
+        assert!(
+            lock.starts_with("---\n") && docs.len() == 2,
+            "{pm} must write a two-document lock:\n{lock}"
+        );
+        (docs[0].to_string(), docs[1].to_string())
+    };
+    let (env_before, _) = env_doc(&lock_before);
+
+    let installed_index = proj.join("node_modules").join(dep).join("index.js");
+    let orig = std::fs::read(&installed_index).expect("installed index.js");
+    let patched: Vec<u8> = [MARKER.as_bytes(), orig.as_slice()].concat();
+    let purl = format!("pkg:npm/{dep}@{version}");
+    stage_patch(&proj, &purl, "package/index.js", &orig, &patched);
+    let (code, stdout, stderr) = run_socket(
+        &proj,
+        &[
+            "vendor",
+            "--json",
+            "--offline",
+            "--cwd",
+            proj.to_str().unwrap(),
+        ],
+    );
+    assert_eq!(code, 0, "vendor failed ({pm}):\n{stdout}\n{stderr}");
+    let env = parse_envelope(&stdout);
+    assert_eq!(env["status"], "success", "{env}");
+    assert_eq!(env["summary"]["applied"], 1, "{env}");
+    assert_eq!(
+        stdout.contains("vendor_config_dependency_unpatched"),
+        config_dep,
+        "{env}"
+    );
+    let lock_after = std::fs::read_to_string(&lock_path).unwrap();
+    let (env_after, project_after) = env_doc(&lock_after);
+    assert_eq!(env_after, env_before, "the env document is never edited");
+    assert!(
+        project_after.contains(&format!("{dep}@file:.socket/vendor/npm/{UUID}/")),
+        "the project document is wired:\n{lock_after}"
+    );
+
+    // Fresh checkout: committable files only, empty store, frozen.
+    let fresh = tmp.path().join("fresh");
+    std::fs::create_dir_all(&fresh).unwrap();
+    for file in ["package.json", "pnpm-lock.yaml", "pnpm-workspace.yaml"] {
+        std::fs::copy(proj.join(file), fresh.join(file)).unwrap();
+    }
+    copy_dir_recursive(&proj.join(".socket"), &fresh.join(".socket"));
+    let fresh_store = tmp.path().join("fresh-store");
+    let ci = corepack(
+        &fresh,
+        pm,
+        &[
+            "install",
+            "--frozen-lockfile",
+            "--store-dir",
+            fresh_store.to_str().unwrap(),
+        ],
+    );
+    assert!(ci.status.success(), "fresh frozen install ({pm}): {ci:?}");
+    let landed = std::fs::read(fresh.join("node_modules").join(dep).join("index.js")).unwrap();
+    assert!(
+        landed.starts_with(MARKER.as_bytes()),
+        "the project copy installs the vendored bytes ({pm})"
+    );
+    if config_dep {
+        let config_copy = fresh
+            .join("node_modules/.pnpm-config")
+            .join(dep)
+            .join("index.js");
+        let config_bytes = std::fs::read(&config_copy).expect("config dependency installed");
+        assert!(
+            !config_bytes.starts_with(MARKER.as_bytes()),
+            "the config dependency's copy is the registry's, as the warning says"
+        );
+    }
+
+    let (code, stdout, stderr) = run_socket(
+        &proj,
+        &[
+            "vendor",
+            "--revert",
+            "--json",
+            "--cwd",
+            proj.to_str().unwrap(),
+        ],
+    );
+    assert_eq!(code, 0, "revert failed ({pm}):\n{stdout}\n{stderr}");
+    assert_eq!(std::fs::read_to_string(&lock_path).unwrap(), lock_before);
+    assert_eq!(std::fs::read(&pkg_path).unwrap(), pkg_before);
+    assert_eq!(std::fs::read(&ws_path).ok(), ws_before);
+    assert!(!proj.join(".socket/vendor").exists());
+}
+
 // ── gated real-pnpm legacy lifecycle legs ─────────────────────────────
 
 #[test]

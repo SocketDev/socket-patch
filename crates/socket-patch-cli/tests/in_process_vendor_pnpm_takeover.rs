@@ -13,6 +13,8 @@
 //! and a workspace exact pin equal to the vendored version (#854) still
 //! take over. The `--dry-run` preview of the same runs lists a refused
 //! pin `would_refuse` with the wet run's code, never `would_vendor`.
+//! pnpm 12's two-document lock (#466) takes over both ways, editing the
+//! project document only.
 //!
 //! The API and the npm registry are wiremock; no pnpm binary is needed.
 //! Every child process gets the ambient `SOCKET_*` vars scrubbed and
@@ -61,7 +63,14 @@ enum Shape {
     ExactPin,
     /// A plain dependency: the control both modes accept.
     Plain,
+    /// A plain dependency in pnpm 12's two-document lock (`packageManager`
+    /// set): pnpm's env document ahead of the project lock (#466).
+    TwoDocument,
 }
+
+/// The env document pnpm 12.8.1 writes ahead of the project lock when
+/// `packageManager` is set (the `@pnpm/exe.*` platform entries trimmed).
+const ENV_DOC: &str = "lockfileVersion: '9.0'\n\nimporters:\n\n  .:\n    configDependencies: {}\n    packageManagerDependencies:\n      pnpm:\n        specifier: 12.8.1\n        version: 12.8.1\n\npackages:\n\n  pnpm@12.8.1:\n    resolution: {integrity: sha512-9kupB1B/XOr+BsjTjmBS0BeURFgOwSed3Vv8EctIqoomRLZlmOB+dh2oSHKp/FfV+QK4f6SdAkGY1VhhKqu+RQ==}\n    engines: {node: '>=18.*'}\n    hasBin: true\n\nsnapshots:\n\n  pnpm@12.8.1: {}\n";
 
 /// package.json, pnpm-workspace.yaml, the installed (unpatched) copy and
 /// the pristine lockfileVersion 9.0 lock pnpm writes for `shape`.
@@ -81,7 +90,7 @@ fn write_pnpm_project(root: &Path, shape: Shape) {
         Shape::Catalog => format!("packages:\n  - .\ncatalog:\n  {NAME}: {VERSION}\n"),
         Shape::Override => format!("overrides:\n  {NAME}: ^{VERSION}\n"),
         Shape::ExactPin => format!("overrides:\n  {NAME}: {VERSION}\n"),
-        Shape::Crlf | Shape::Plain => String::new(),
+        Shape::Crlf | Shape::Plain | Shape::TwoDocument => String::new(),
     };
     if !workspace.is_empty() {
         std::fs::write(root.join("pnpm-workspace.yaml"), workspace).unwrap();
@@ -95,7 +104,11 @@ fn write_pnpm_project(root: &Path, shape: Shape) {
     .unwrap();
     std::fs::write(pkg.join("index.js"), ORIG_INDEX).unwrap();
 
-    let mut lock = String::from(
+    let mut lock = match shape {
+        Shape::TwoDocument => format!("---\n{ENV_DOC}\n---\n"),
+        _ => String::new(),
+    };
+    lock.push_str(
         "lockfileVersion: '9.0'\n\nsettings:\n  autoInstallPeers: true\n  excludeLinksFromLockfile: false\n\n",
     );
     match shape {
@@ -104,7 +117,7 @@ fn write_pnpm_project(root: &Path, shape: Shape) {
         )),
         Shape::Override => lock.push_str(&format!("overrides:\n  {NAME}: ^{VERSION}\n\n")),
         Shape::ExactPin => lock.push_str(&format!("overrides:\n  {NAME}: {VERSION}\n\n")),
-        Shape::Crlf | Shape::Plain => {}
+        Shape::Crlf | Shape::Plain | Shape::TwoDocument => {}
     }
     let specifier = match shape {
         Shape::Catalog => "'catalog:'".to_string(),
@@ -481,6 +494,57 @@ async fn scan_vendored_over_hosted_pnpm_workspace_exact_pin_takes_over() {
     );
     let pkg = std::fs::read_to_string(root.join("package.json")).unwrap();
     assert!(!pkg.contains("overrides"), "{pkg}");
+}
+
+/// #466: pnpm 12's two-document lock (`packageManager` set). Hosted →
+/// vendored takes over in the project document, and the default hosted
+/// `scan` takes the vendored project back: the vendored revert used to
+/// read pnpm's env document, find every lock record "drifted", and unwind
+/// the override surfaces around a lock left wired to the artifact — so the
+/// takeover reported `redirected: 0`, dropped the vendor ledger, and left a
+/// lock frozen installs reject. The env document is never edited.
+#[tokio::test(flavor = "multi_thread")]
+async fn two_document_lock_takes_over_both_ways() {
+    let server = MockServer::start().await;
+    mock_api(&server).await;
+    let tmp = tempfile::tempdir().unwrap();
+    let root = tmp.path();
+    host_project(root, &server.uri(), Shape::TwoDocument);
+    let lock_path = root.join("pnpm-lock.yaml");
+    let env_doc = |lock: &str| -> String {
+        let (env, _) = lock
+            .strip_prefix("---\n")
+            .and_then(|rest| rest.split_once("\n---\n"))
+            .unwrap_or_else(|| panic!("two documents expected:\n{lock}"));
+        env.to_string()
+    };
+    let read_lock = || std::fs::read_to_string(&lock_path).unwrap();
+    assert_eq!(env_doc(&read_lock()), ENV_DOC);
+
+    let (exit, env) = run_mode(root, &server.uri(), "scan", "vendored", &[]);
+    assert_eq!(exit, 0, "the two-document takeover must succeed: {env:#}");
+    let lock = read_lock();
+    assert_eq!(env_doc(&lock), ENV_DOC, "{lock}");
+    assert!(!lock.contains(HOSTED_URL), "{lock}");
+    assert!(
+        lock.contains(&format!("{NAME}@file:.socket/vendor/npm/{UUID}/")),
+        "the project document is wired:\n{lock}\n{env:#}"
+    );
+
+    let (exit, env) = run_mode(root, &server.uri(), "scan", "hosted", &[]);
+    assert_eq!(exit, 0, "{env:#}");
+    assert!(
+        has_event_code(&env, "redirect_takeover_reverted_vendored"),
+        "{env:#}"
+    );
+    assert_eq!(env["redirect"]["redirected"], 1, "{env:#}");
+    let lock = read_lock();
+    assert_eq!(env_doc(&lock), ENV_DOC, "{lock}");
+    assert!(lock.contains(HOSTED_URL), "{lock}");
+    assert!(!lock.contains(".socket/vendor"), "{lock}");
+    let pkg = std::fs::read_to_string(root.join("package.json")).unwrap();
+    assert!(!pkg.contains(".socket/vendor"), "{pkg}");
+    assert!(!root.join(".socket/vendor/npm").exists(), "{env:#}");
 }
 
 /// `vendor --dry-run` over the hosted pin previews the backend's refusal of
