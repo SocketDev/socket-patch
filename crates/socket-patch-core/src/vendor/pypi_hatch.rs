@@ -147,21 +147,18 @@ async fn require_environment_context_support_with(
     var: &impl Fn(&str) -> Option<std::ffi::OsString>,
 ) -> Result<(), Failure> {
     let output = match crate::utils::process::resolve_tool_with("hatch", var) {
-        Some(program) => Some(
-            tokio::time::timeout(
-                std::time::Duration::from_secs(10),
-                tokio::process::Command::from(crate::utils::process::command_for(&program))
-                    .arg("--version")
-                    .current_dir(root)
-                    .stdin(std::process::Stdio::null())
-                    .kill_on_drop(true)
-                    .output(),
-            )
-            .await,
-        ),
+        Some(program) => {
+            let mut command = crate::utils::process::command_for(&program);
+            command.arg("--version").current_dir(root);
+            crate::utils::fs::run_blocking(move || {
+                crate::utils::process::output_within(command, crate::utils::process::PROBE_TIMEOUT)
+            })
+            .await
+            .ok()
+        }
         None => None,
     };
-    if let Some(Ok(Ok(output))) = output {
+    if let Some(output) = output {
         if output.status.success()
             && String::from_utf8_lossy(&output.stdout)
                 .split_whitespace()
@@ -939,5 +936,33 @@ mod tests {
         .await
         .unwrap();
         assert!(marker.exists(), "the resolved hatch was not run");
+    }
+
+    /// A `hatch` that never answers is killed at the shared probe budget
+    /// and takes the same refusal as one too old.
+    #[cfg(unix)]
+    #[tokio::test]
+    async fn a_hung_hatch_is_refused_within_the_probe_budget() {
+        use std::os::unix::fs::PermissionsExt;
+        let temp = tempfile::tempdir().unwrap();
+        let root = temp.path().join("project");
+        let bin = temp.path().join("bin");
+        std::fs::create_dir(&root).unwrap();
+        std::fs::create_dir(&bin).unwrap();
+        let hatch = bin.join("hatch");
+        std::fs::write(&hatch, "#!/bin/sh\nexec sleep 60\n").unwrap();
+        std::fs::set_permissions(&hatch, std::fs::Permissions::from_mode(0o755)).unwrap();
+        let path = std::env::join_paths([bin.as_path()]).unwrap();
+        let start = std::time::Instant::now();
+        let result = require_environment_context_support_with(&root, &|var| {
+            (var == "PATH").then(|| path.clone())
+        })
+        .await;
+        assert_eq!(result.unwrap_err().0, "pypi_hatch_unsupported");
+        assert!(
+            start.elapsed() < std::time::Duration::from_secs(40),
+            "the probe budget must bound hatch, took {:?}",
+            start.elapsed()
+        );
     }
 }

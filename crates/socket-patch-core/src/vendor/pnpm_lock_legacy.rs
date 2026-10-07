@@ -715,7 +715,14 @@ fn edit_packages(
             "    resolution: {{integrity: {}, tarball: {}}}",
             ctx.integrity, ctx.spec
         );
-        if block.key == new_key && original_lines.iter().any(|l| l == &expected_resolution) {
+        // pnpm quotes a scoped `@scope/pkg` name: a bare `@` can't start a
+        // plain YAML scalar (#956). An older release wrote it unquoted, so a
+        // lock carrying that spelling is stale, not in sync.
+        let expected_name = format!("    name: {}", yaml_value(ctx.name));
+        if block.key == new_key
+            && original_lines.iter().any(|l| l == &expected_resolution)
+            && original_lines.iter().any(|l| l == &expected_name)
+        {
             return Ok(false); // in sync
         }
         let mut new_lines = Vec::with_capacity(original_lines.len() + 2);
@@ -727,7 +734,7 @@ fn edit_packages(
                 match field {
                     "resolution" => {
                         new_lines.push(expected_resolution.clone());
-                        new_lines.push(format!("    name: {}", ctx.name));
+                        new_lines.push(expected_name.clone());
                         new_lines.push(format!("    version: {}", ctx.version));
                         replaced_resolution = true;
                         continue;
@@ -1908,6 +1915,206 @@ packages:
             "{warnings:?}"
         );
         assert!(!fx.root().join("pnpm-workspace.yaml").exists());
+    }
+
+    // ── scoped package (#956) ─────────────────────────────────────────────
+    // Provenance: `@isaacs/string-locale-compare@1.1.0` installed by REAL
+    // `pnpm@7.33.7` / `pnpm@8.15.9`, then a `file:` tarball pnpm.overrides
+    // entry added and re-installed. pnpm quotes the `@`-leading `name:` of
+    // the rekeyed packages entry; a bare `name: @isaacs/…` is not valid
+    // YAML and pnpm refuses the whole lock (ERR_PNPM_BROKEN_LOCKFILE).
+
+    const SCOPED_PURL: &str = "pkg:npm/@isaacs/string-locale-compare@1.1.0";
+    const SCOPED_PKG: &str = r#"{
+  "name": "cell",
+  "version": "0.0.0",
+  "private": true,
+  "dependencies": {
+    "@isaacs/string-locale-compare": "1.1.0"
+  }
+}
+"#;
+    const S7_BEFORE_LOCK: &str = "lockfileVersion: 5.4
+
+specifiers:
+  '@isaacs/string-locale-compare': 1.1.0
+
+dependencies:
+  '@isaacs/string-locale-compare': 1.1.0
+
+packages:
+
+  /@isaacs/string-locale-compare/1.1.0:
+    resolution: {integrity: sha512-SQ7Kzhh9+D+ZW9MA0zkYv3VXhIDNx+LzM6EJ+/65I3QY+enU6Itte7E5XX7EWrqLW2FN4n06GWzBnPoC3th2aQ==}
+    dev: false
+";
+    const S7_AFTER_LOCK: &str = "lockfileVersion: 5.4
+
+overrides:
+  '@isaacs/string-locale-compare@1.1.0': file:.socket/vendor/npm/1a2b3c4d-5e6f-4a1b-8c2d-0123456789ab/@isaacs/string-locale-compare-1.1.0.tgz
+
+specifiers:
+  '@isaacs/string-locale-compare': file:__PROJECT_ROOT__/.socket/vendor/npm/1a2b3c4d-5e6f-4a1b-8c2d-0123456789ab/@isaacs/string-locale-compare-1.1.0.tgz
+
+dependencies:
+  '@isaacs/string-locale-compare': file:.socket/vendor/npm/1a2b3c4d-5e6f-4a1b-8c2d-0123456789ab/@isaacs/string-locale-compare-1.1.0.tgz
+
+packages:
+
+  file:.socket/vendor/npm/1a2b3c4d-5e6f-4a1b-8c2d-0123456789ab/@isaacs/string-locale-compare-1.1.0.tgz:
+    resolution: {integrity: sha512-pceaN98Av+E8ugNGKlqbfzvbJWVAdWx3RKI7kc7jPThP6QHZg7c2xbZhCqV8N42Jf9hKWdLW4ZNDnFHQinZ0Hw==, tarball: file:.socket/vendor/npm/1a2b3c4d-5e6f-4a1b-8c2d-0123456789ab/@isaacs/string-locale-compare-1.1.0.tgz}
+    name: '@isaacs/string-locale-compare'
+    version: 1.1.0
+    dev: false
+";
+    const S8_BEFORE_LOCK: &str = "lockfileVersion: '6.0'
+
+settings:
+  autoInstallPeers: true
+  excludeLinksFromLockfile: false
+
+dependencies:
+  '@isaacs/string-locale-compare':
+    specifier: 1.1.0
+    version: 1.1.0
+
+packages:
+
+  /@isaacs/string-locale-compare@1.1.0:
+    resolution: {integrity: sha512-SQ7Kzhh9+D+ZW9MA0zkYv3VXhIDNx+LzM6EJ+/65I3QY+enU6Itte7E5XX7EWrqLW2FN4n06GWzBnPoC3th2aQ==}
+    dev: false
+";
+    const S8_AFTER_LOCK: &str = "lockfileVersion: '6.0'
+
+settings:
+  autoInstallPeers: true
+  excludeLinksFromLockfile: false
+
+overrides:
+  '@isaacs/string-locale-compare@1.1.0': file:.socket/vendor/npm/1a2b3c4d-5e6f-4a1b-8c2d-0123456789ab/@isaacs/string-locale-compare-1.1.0.tgz
+
+dependencies:
+  '@isaacs/string-locale-compare':
+    specifier: file:__PROJECT_ROOT__/.socket/vendor/npm/1a2b3c4d-5e6f-4a1b-8c2d-0123456789ab/@isaacs/string-locale-compare-1.1.0.tgz
+    version: file:.socket/vendor/npm/1a2b3c4d-5e6f-4a1b-8c2d-0123456789ab/@isaacs/string-locale-compare-1.1.0.tgz
+
+packages:
+
+  file:.socket/vendor/npm/1a2b3c4d-5e6f-4a1b-8c2d-0123456789ab/@isaacs/string-locale-compare-1.1.0.tgz:
+    resolution: {integrity: sha512-pceaN98Av+E8ugNGKlqbfzvbJWVAdWx3RKI7kc7jPThP6QHZg7c2xbZhCqV8N42Jf9hKWdLW4ZNDnFHQinZ0Hw==, tarball: file:.socket/vendor/npm/1a2b3c4d-5e6f-4a1b-8c2d-0123456789ab/@isaacs/string-locale-compare-1.1.0.tgz}
+    name: '@isaacs/string-locale-compare'
+    version: 1.1.0
+    dev: false
+";
+
+    /// A project whose only dependency is the scoped package, installed
+    /// under `node_modules/@isaacs/string-locale-compare`.
+    async fn scoped_fixture(lock: &str) -> Fixture {
+        let fx = fixture_with(SCOPED_PKG, lock).await;
+        let installed = fx.root().join("node_modules/@isaacs/string-locale-compare");
+        tokio::fs::create_dir_all(&installed).await.unwrap();
+        tokio::fs::write(
+            installed.join("package.json"),
+            br#"{"name":"@isaacs/string-locale-compare","version":"1.1.0"}"#,
+        )
+        .await
+        .unwrap();
+        tokio::fs::write(installed.join("index.js"), ORIG_INDEX)
+            .await
+            .unwrap();
+        fx
+    }
+
+    async fn vendor_scoped(fx: &Fixture) -> VendorOutcome {
+        let blobs = fx.root().join(".socket/blobs");
+        crate::vendor::test_support::vendor_pnpm_legacy(
+            SCOPED_PURL,
+            &fx.root().join("node_modules/@isaacs/string-locale-compare"),
+            fx.root(),
+            &fx.record,
+            &PatchSources::blobs_only(&blobs),
+            "2026-08-18T00:00:00Z",
+            false,
+            false,
+            None,
+        )
+        .await
+    }
+
+    /// [`Fixture::expected_lock`] for the scoped tarball.
+    async fn expected_scoped_lock(fx: &Fixture, fixture: &str) -> String {
+        let rel = format!(".socket/vendor/npm/{UUID}/@isaacs/string-locale-compare-1.1.0.tgz");
+        let tgz = tokio::fs::read(fx.root().join(rel)).await.unwrap();
+        let integrity = format!(
+            "sha512-{}",
+            base64::engine::general_purpose::STANDARD.encode(Sha512::digest(&tgz))
+        );
+        fixture
+            .replace(SPIKE_INTEGRITY, &integrity)
+            .replace(ROOT_TOKEN, &fx.canon_root_str())
+    }
+
+    /// #956: a scoped package's rekeyed packages entry carries a quoted
+    /// `name: '@scope/pkg'`, byte-identical to pnpm's own serialization, on
+    /// both legacy grammars — and the lock round-trips on revert.
+    #[tokio::test]
+    async fn scoped_package_name_is_yaml_quoted_both_grammars() {
+        for (before, after) in [
+            (S7_BEFORE_LOCK, S7_AFTER_LOCK),
+            (S8_BEFORE_LOCK, S8_AFTER_LOCK),
+        ] {
+            let fx = scoped_fixture(before).await;
+            let (result, entry, _warnings) = expect_done(vendor_scoped(&fx).await);
+            assert!(result.success, "{:?}", result.error);
+            let entry = entry.expect("success carries a ledger entry");
+
+            let lock = fx.read(PNPM_LOCK).await;
+            assert!(
+                !lock.lines().any(|l| l.trim_start().starts_with("name: @")),
+                "unquoted scoped name is invalid YAML:\n{lock}"
+            );
+            assert_eq!(lock, expected_scoped_lock(&fx, after).await);
+
+            // A re-run is in sync and leaves the lock byte-stable.
+            let (rerun, _, _) = expect_done(vendor_scoped(&fx).await);
+            assert!(rerun.success, "{:?}", rerun.error);
+            assert_eq!(fx.read(PNPM_LOCK).await, lock);
+
+            let outcome = revert_pnpm_legacy(&entry, fx.root(), false).await;
+            assert!(outcome.success, "{:?}", outcome.error);
+            assert_eq!(fx.read(PNPM_LOCK).await, before);
+            assert_eq!(fx.read(PACKAGE_JSON).await, SCOPED_PKG);
+        }
+    }
+
+    /// A lock vendored by a release before #956 carries the unquoted
+    /// `name: @scope/pkg` that pnpm can't load. A re-vendor must treat it
+    /// as stale and rewrite it, not report the wiring in sync.
+    #[tokio::test]
+    async fn revendor_heals_an_unquoted_scoped_name() {
+        for (before, after) in [
+            (S7_BEFORE_LOCK, S7_AFTER_LOCK),
+            (S8_BEFORE_LOCK, S8_AFTER_LOCK),
+        ] {
+            let fx = scoped_fixture(before).await;
+            let (result, _, _) = expect_done(vendor_scoped(&fx).await);
+            assert!(result.success, "{:?}", result.error);
+            let vendored = fx.read(PNPM_LOCK).await;
+
+            let quoted = "    name: '@isaacs/string-locale-compare'";
+            assert!(vendored.contains(quoted), "{vendored}");
+            let stale = vendored.replace(quoted, "    name: @isaacs/string-locale-compare");
+            tokio::fs::write(fx.root().join(PNPM_LOCK), &stale)
+                .await
+                .unwrap();
+
+            let (rerun, _, _) = expect_done(vendor_scoped(&fx).await);
+            assert!(rerun.success, "{:?}", rerun.error);
+            assert_eq!(
+                fx.read(PNPM_LOCK).await,
+                expected_scoped_lock(&fx, after).await
+            );
+        }
     }
 
     /// The transitive-ONLY capture (x7): no root section mentions the
