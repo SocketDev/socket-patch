@@ -1,6 +1,6 @@
 [agent] Progress ledger for the scheduled pnpm bug-hunt routine (label pm:pnpm).
 
-Last updated: 2026-10-07 (run 29), main `1c6c509`, latest release 4.0.0.
+Last updated: 2026-10-07 (run 30), main `05ecc6e`, latest release 4.0.0.
 
 Method: real pnpm installs. Hosted, vendored and global agent mode run against a local Python mock of the patch API (batch, by-package, view with inline blobs, `patches/blob/<hash>`, package grant, hosted tarball, `/registry/<name>/<ver>` mirror; `ajv-keywords@3.5.2` serves as the peer-dependency package). On v5, set `SOCKET_PATCH_SERVER_URL=<mock>` and `SOCKET_NPM_REGISTRY=<mock>/registry` so that hosted pins are recognised and rollback can restore upstream. The oracle is a marker prepended to `index.js`, checked after a fresh `--frozen-lockfile` install against a dead registry, or by running the global tool. The repo's pinned matrix (`.github/workflows/pnpm-compatibility.yml`) already covers plain hosted and vendored installs on pnpm 1–12. This ledger tracks what it doesn't.
 
@@ -290,6 +290,19 @@ Run 29 additions (main `1c6c509`, Linux):
 
 #1006 is a regression: first bad commit `8e8daf0` (#888); release 4.0.0 passes. #853's `--dry-run` preview remainder still reproduces (9.15.9 / 11.28.5).
 
+Run 30 additions (main `05ecc6e`, Linux):
+
+| pnpm (lock) | Hosted with pnpm's lockfile disabled (`.npmrc` `lockfile=false` / workspace `lockfile: false`) | Vendored, same setting | Vendored ledger-less (#1015): `repair` / `vendor --revert` / `rollback` | Takeover vendored → hosted / hosted → vendored → rollback | Vendored transitive under a `pnpm patch`-ed parent | Vendored → `pnpm install` → re-scan → rollback | Agent `node-linker=hoisted` | BOM lock hosted / vendored (#903 fix) |
+| --- | --- | --- | --- | --- | --- | --- | --- | --- |
+| 7.33.7 (5.4) | untested | untested | untested | untested | untested | untested | pass | untested |
+| 8.15.9 (6.0) | untested | untested | untested | untested | untested | untested | pass | untested |
+| 9.15.9 | fail #1074 (`.npmrc`) | untested | untested | pass / residue (warned, non-bug) | pass | pass | (run 6) | pass / pass |
+| 10.34.6 | fail #1074 (`.npmrc`); workspace key ignored by pnpm 10 | untested | untested | pass / residue (warned, non-bug) | untested | untested | pass | untested |
+| 11.28.5 | fail #1074 (workspace file) | untested | untested | untested | untested | untested | untested | BOM workspace file (#904 fix): pass / pass |
+| 12.10.1 | fail #1074 (workspace file) | pass | pass / pass (keeps artifacts wired only from the workspace file) / pass (refuses) | untested | pass | pass | (run 6) | pass / pass; BOM workspace file pass / pass |
+
+#1074 isn't a regression: release 4.0.0 behaves the same. Re-verified fixed in run 30: #935 VEX half (12.10.1; scan half still open), #956 (7.33.7 / 8.15.9), #903 / #904 (9 / 11 / 12). Vendored from a member with its own lock refuses `vendor_pnpm_settings_elsewhere` (11.28.5 / 12.10.1, pass).
+
 Run 20 additions (main `045d7ec`, Linux):
 
 | pnpm (lock) | Vendored parent + vendored dep (`debug`→`ms`): `remove <parent>` / takeover → hosted / `rollback` | `remove <child>` (control) | Hosted parent + dep: remove parent / rollback | Mixed-case names (`Base64`, `JSONStream`): hosted / agent / vendored | User parent-selector / range-selector override (vendored) | Agent `symlink=false` / `hoist=false` | `list -g` |
@@ -326,6 +339,7 @@ Global mode (`-g`, v5 main `2463257`):
 
 ## Backlog
 
+00. #1074 follow-ups: the setting in the global `rc` / `config.yaml`, the pnpm 7/8 dialect, `.npmrc` `lockfile=false` on pnpm 11/12, Rush, and vendored on 9/10 (12 passes). Handed an unverified npm lead (`package-lock=false`) to discussion #302.
 0. **Maintainer request (global `-g` mode):** the Linux cells are done. Still to do: macOS and Windows (corepack, standalone and npm-installed pnpm; `PNPM_HOME` with spaces or unicode; Windows `%LOCALAPPDATA%\pnpm`), and an unwritable prefix as a non-root user. Full checklist in the 20261001T040000Z entry. Needs a probe branch.
 1. Delete the stale probe branch `bughunt/pnpm/20260930-virtual-store`. `git push --delete` failed through the git proxy in runs 1, 3, 10 and 16, and was denied by the permission policy in runs 2, 5–9, 11–14, 16, 17, 19 and 28, so a maintainer needs to do it. macOS and Windows probes stay on hold until branch cleanup works.
 2. #754 follow-ups: a Windows `C:/…/My Project #2` checkout, and the moved-checkout heal path now that the specifier is quoted. Needs a probe.
@@ -343,7 +357,7 @@ Global mode (`-g`, v5 main `2463257`):
 8d. v5 rollout and policy over pnpm locks: `--max-new-patches 1` convergence over 3 hosted pins (9.15.9 / 12.10.1, then a two-document lock on 12.x), and socket.yml `includePaths` in a workspace with `sharedWorkspaceLockfile: false`. Blocked by the permission classifier in run 28.
 8e. #935 follow-up: `git+` / `github:` copies (`link:` copy done in run 29: pass).
 8f. #1006 follow-ups: a settings-only parent `pnpm-workspace.yaml` (no `packages:`), negated globs (`!examples/**`), pnpm 10 `ignore-workspace`, and vendored from a real member on 11/12 (expect `vendor_pnpm_settings_elsewhere`).
-9. Re-verify the open set when fixes land (#853 core and #880/#881 verified in run 29; #956 closed by #961, re-check on pnpm 7/8): #435, #466, #492, #556, #633, #713, #714, #734, #778, #830, #831 (PR #837, pnpm gitignore matrix), #853, #854, #880, #881, #902, #903, #904 (fix PR #909), #919, #935, #957 and #1006.
+9. Re-verify the open set when fixes land (#853 core and #880/#881 verified in run 29; #956, #903, #904 and the #935 VEX half verified in run 30): #435, #466, #492, #556, #633, #713, #714, #734, #778, #830, #831 (PR #837, pnpm gitignore matrix), #853, #854, #880, #881, #902, #903, #904 (fix PR #909), #919, #935 (scan half), #1006 and #1074.
 9a. BOM follow-ups (#903 / #904): a fresh install of a hosted BOM-`package.json` pin, and Windows checkouts (needs a probe). (Vendored BOM workspace file on 9.15.9 / 10.34.5 done in run 25: #904 reproduces.)
 9b. #902 follow-ups: the setting in the global `rc` / `config.yaml`. (Mirror + tarball URLs became #919 in run 24.)
 9c. #919 follow-ups: scoped `@scope:registry=` mirrors, the hosted → vendored takeover + `vendor --revert` on a mirror, pnpm 7/8 lock dialects, and re-verification once PR #918 (or a successor) covers `restore_pnpm_locks`.
@@ -418,3 +432,7 @@ Global mode (`-g`, v5 main `2463257`):
 - Fixture note (run 23): the Python mock rebuilds the patched tarball on every restart (the gzip mtime changes), so a pin's sha512 changes between mock restarts. Re-scan after restarting the mock.
 - Fixture note (run 29): `vex --json` needs `--output`, and a workspace root without a `version` needs `--product`.
 - Fixture note (run 27): agent `rollback --offline` needs the before blob staged in `.socket/blobs`; without it, rollback fails with `Before blob not found` (`missing_blob`). That's documented (`repair` fetches it).
+- Hosted → vendored takeover of 2+ packages keeps the hosted `packages: ['.']` + `trustLockfile: true` scaffold, because the second un-host sees the first package's vendored overrides in the file. It warns `pnpm_trust_lockfile_left`, and a later `rollback` leaves the scaffold (run 30, 9.15.9 / 10.34.6). The vendored → hosted → rollback order deletes it.
+- A pnpm major upgrade over hosted pins: pnpm 10/12 (and pnpm 9 over a 5.4 lock) can't read a 5.x / 6.0 lock. `--frozen-lockfile` fails loudly, and a plain install discards the lock, re-resolves and drops the pins (like `pnpm update`). Re-run the hosted scan after upgrading. pnpm 9 migrates a 6.0 lock and keeps the pins.
+- Fixture note (run 30): agent `rollback` needs the mock to serve the "before" blob on `patches/blob/<hash>` (otherwise `missing_blob`).
+- `vendor --revert` with a missing ledger skips with `vendor_orphan_still_wired` and says to "run `socket-patch repair` to re-adopt them", but `repair` answers `vendor_ledger_missing` ("does not rebuild the ledger from lockfiles"). The remedies contradict each other, but it's cosmetic and not pnpm-specific (run 30).
