@@ -62,28 +62,17 @@ fn wheel_metadata_concurrency(use_public_proxy: bool) -> usize {
 /// the success path — folding in `status`/`error` and a minimal `redirect`
 /// block — instead of a bare shape that flips the schema. When absent (never
 /// in JSON mode today) the bare envelope is emitted. A `--json` consumer must
-/// always get parseable stdout — never empty output plus an exit code.
-fn emit_json_error(scan_result: Option<serde_json::Value>, message: &str) {
-    emit_json_error_with_code(scan_result, None, message);
-}
-
-/// `emit_json_error` plus an additive top-level `errorCode` (the stable
-/// routing tag the CLI contract gives every classified failure) when the
-/// refusal has one; `error` stays the human message.
-fn emit_json_error_with_code(
-    scan_result: Option<serde_json::Value>,
-    code: Option<&str>,
-    message: &str,
-) {
-    let mut result = scan_result.unwrap_or_else(|| serde_json::json!({ "status": "error" }));
-    result["status"] = serde_json::json!("error");
-    result["error"] = serde_json::json!(message);
+/// always get parseable stdout — never empty output plus an exit code. The
+/// top-level `error` is `{code, message}` like every command's (v5.0).
+fn emit_json_error(scan_result: Option<serde_json::Value>, code: &str, message: &str) {
+    let mut result = scan_result.unwrap_or_else(|| serde_json::json!({}));
+    crate::json_envelope::set_error(
+        &mut result,
+        crate::json_envelope::EnvelopeError::new(code, message),
+    );
     // The rollout block describes a successful run only.
     if let Some(obj) = result.as_object_mut() {
         obj.remove("rollout");
-    }
-    if let Some(code) = code {
-        result["errorCode"] = serde_json::json!(code);
     }
     if !result.get("redirect").is_some_and(|r| r.is_object()) {
         result["redirect"] = serde_json::json!({ "mode": "hosted" });
@@ -131,7 +120,7 @@ fn refuse(
 ) -> i32 {
     eprintln!("Error ({}): {}", refusal.code, refusal.message);
     if common.json {
-        emit_json_error_with_code(scan_result, Some(&refusal.code), &refusal.message);
+        emit_json_error(scan_result, &refusal.code, &refusal.message);
     }
     1
 }
@@ -165,7 +154,7 @@ fn acquire_hosted_lock(
                 crate::commands::lock_cli::format_lock_error(&socket_dir, &err, timeout)
             );
             if common.json {
-                emit_json_error_with_code(scan_result.take(), Some(code), &message);
+                emit_json_error(scan_result.take(), code, &message);
             }
             Err(1)
         }
@@ -584,7 +573,7 @@ pub(super) async fn run_redirect(
         // stdout is never empty on failure.
         Err((code, message)) => {
             if args.common.json {
-                emit_json_error(scan_result.take(), &message);
+                emit_json_error(scan_result.take(), super::PATCH_DETAILS_FAILED, &message);
             } else if code == 0 && !args.common.silent {
                 // Unreachable from scan (it never prompts, so selection
                 // cannot be cancelled); kept for a code-0 selection error.
@@ -709,7 +698,7 @@ pub(crate) async fn run_redirect_selected(
                     format_error_line(&message)
                 );
                 if common.json {
-                    emit_json_error(scan_result.take(), &message);
+                    emit_json_error(scan_result.take(), "reference_resolve_failed", &message);
                 }
                 return 1;
             }
@@ -1164,7 +1153,7 @@ pub(crate) async fn run_redirect_selected(
                 let message = format!("failed to write {rel}: {e}");
                 eprintln!("{}", format_error_line(&message));
                 if common.json {
-                    emit_json_error(scan_result.take(), &message);
+                    emit_json_error(scan_result.take(), "lockfile_write_failed", &message);
                 }
                 return 1;
             }
@@ -1432,8 +1421,10 @@ pub(crate) async fn run_redirect_selected(
                     .expect("RunWarning is a plain string struct: serialization cannot fail");
             }
         } else if let Some(e) = &vex_error {
-            result["status"] = serde_json::json!("error");
-            result["error"] = serde_json::json!({ "code": e.code, "message": e.message });
+            crate::json_envelope::set_error(
+                &mut result,
+                crate::json_envelope::EnvelopeError::new(e.code.to_string(), e.message.clone()),
+            );
             super::append_vex_error_warnings(&mut result, &vex_warnings);
         }
         println!(

@@ -24,7 +24,7 @@ use crate::hosted_memory::roots::{marker_ecosystem, UNSUPPORTED_MARKERS};
 pub(crate) enum PolicyLoadError {
     /// A malformed flag or env value: exit 2.
     Usage(String),
-    /// A policy file that cannot be honored: exit 1, `errorCode`.
+    /// A policy file that cannot be honored: exit 1, `error.code`.
     Policy(PolicyError),
 }
 
@@ -467,12 +467,11 @@ impl ScanPolicy {
 }
 
 /// The JSON error object for a policy file that cannot be honored: scan's
-/// error shape plus `errorCode`.
+/// error shape, `error: {code, message}`.
 pub(crate) fn policy_error_json(err: &PolicyError, paths: &[String]) -> serde_json::Value {
     serde_json::json!({
         "status": "error",
-        "error": err.to_string(),
-        "errorCode": err.code(),
+        "error": { "code": err.code(), "message": err.to_string() },
         "scannedPackages": 0,
         "lockfileOnlyPackages": 0,
         "packagesWithPatches": 0,

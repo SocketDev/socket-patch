@@ -43,6 +43,7 @@ use crate::ecosystem_dispatch::{
     crawl_all_ecosystems, find_all_packages_for_rollback, find_packages_for_rollback,
     partition_purls,
 };
+use crate::json_envelope::{usage_error, Command as JsonCommand};
 use crate::ui::{print_json, select_one, SelectError};
 
 /// Best-effort ecosystem extractor for a `pkg:<eco>/...` PURL. Used as
@@ -228,26 +229,28 @@ async fn report_fetch_failure(
 ) -> i32 {
     let msg = error.to_string();
     track_patch_fetch_failed(identifier, &msg, fallback_to_proxy, api_token, org_slug).await;
-    report_error(json, msg);
+    report_error(json, "patch_fetch_failed", msg);
     1
 }
 
-/// Report an error to the caller: a `{status, error}` envelope on
-/// stdout when `json` is true, otherwise a plain `Error: ...` on stderr.
-fn report_error(json: bool, message: impl std::fmt::Display) {
+/// Report an error to the caller: a `{status: "error", error: {code,
+/// message}}` object on stdout when `json` is true, otherwise a plain
+/// `Error: ...` on stderr. Every top-level `get` failure goes through here
+/// (or [`report_lock_failure`]) so the error shape cannot drift.
+fn report_error(json: bool, code: &str, message: impl std::fmt::Display) {
     let message = message.to_string();
     if json {
-        print_json(&serde_json::json!({"status": "error", "error": message}));
+        crate::json_envelope::print_legacy_error(code, &message);
     } else {
         eprintln!("Error: {message}");
     }
 }
 
 /// Report a failed apply-lock acquire in get's legacy error shape — the
-/// `{status: "error", error: "<message>"}` envelope every other hard error
-/// here uses, plus the stable `errorCode` (`lock_held` / `lock_io`) the
-/// other lock sites emit — and return the envelope for the caller's
-/// early-return guard. The message/code mapping is
+/// `{status: "error", error: {code, message}}` object every other hard
+/// error here uses, with the stable code (`lock_held` / `lock_io`) the
+/// other lock sites emit — and return it for the caller's early-return
+/// guard. The message/code mapping is
 /// [`crate::commands::lock_cli::lock_failure`]'s, so the waited clause and
 /// the I/O rendering cannot drift from `apply`'s.
 fn report_lock_failure(
@@ -257,11 +260,7 @@ fn report_lock_failure(
     timeout: Duration,
 ) -> serde_json::Value {
     let (code, message) = lock_failure(err, timeout);
-    let envelope = serde_json::json!({
-        "status": "error",
-        "errorCode": code,
-        "error": message,
-    });
+    let envelope = crate::json_envelope::legacy_error(code, &message);
     if json {
         print_json(&envelope);
     } else {
@@ -1075,7 +1074,10 @@ pub(crate) fn select_patches(
                         .collect();
                     print_json(&serde_json::json!({
                         "status": "selection_required",
-                        "error": format!("Multiple patches available for {purl}. Re-run with the chosen UUID as the identifier (`socket-patch get <uuid>`) to select one."),
+                        "error": {
+                            "code": "selection_required",
+                            "message": format!("Multiple patches available for {purl}. Re-run with the chosen UUID as the identifier (`socket-patch get <uuid>`) to select one."),
+                        },
                         "purl": purl,
                         "options": options_json,
                     }));
@@ -2399,7 +2401,8 @@ fn apply_key_covers(key: &str, record: &str) -> bool {
 /// as on every `failed` record); any other failed manifest patch (one this
 /// run did not select) gets its own `failed` record (`uuid_of` looks up
 /// its uuid); a run-level reason rides the envelope's top-level
-/// `errorCode` / `error`. `failed` grows by every record marked or
+/// `error: {code, message}` (status stays `partial_failure`: the downloads
+/// it reports still landed). `failed` grows by every record marked or
 /// appended here. Returns `applied`: how many of the run's recorded
 /// patches apply really patched (or found already patched).
 fn fold_apply_failures(
@@ -2465,8 +2468,10 @@ fn fold_apply_failures(
     let failed = envelope["failed"].as_u64().unwrap_or(0) as usize + added;
     envelope["failed"] = serde_json::json!(failed);
     if let Some((code, error)) = &report.run_error {
-        envelope["errorCode"] = serde_json::json!(code);
-        envelope["error"] = serde_json::json!(error);
+        crate::json_envelope::set_error_keep_status(
+            envelope,
+            crate::json_envelope::EnvelopeError::new(code, error),
+        );
     }
     applied
 }
@@ -2512,8 +2517,11 @@ pub async fn download_and_apply_patches_with(
         // and destroy every tracked patch record.
         Err(e) => {
             let err = format!("Failed to read manifest: {e}");
-            report_error(params.json, &err);
-            return (1, serde_json::json!({"status": "error", "error": err}));
+            report_error(params.json, "manifest_unreadable", &err);
+            return (
+                1,
+                crate::json_envelope::legacy_error("manifest_unreadable", &err),
+            );
         }
     };
 
@@ -2565,8 +2573,11 @@ pub async fn download_and_apply_patches_with(
             // unwind exactly those (a pre-existing record's blobs stay).
             unwind_new_blobs(&blobs_dir, &new_blobs).await;
             let msg = format!("Failed to write manifest: {e}");
-            report_error(params.json, &msg);
-            return (1, serde_json::json!({ "status": "error", "error": msg }));
+            report_error(params.json, "manifest_write_failed", &msg);
+            return (
+                1,
+                crate::json_envelope::legacy_error("manifest_write_failed", &msg),
+            );
         }
     }
     // Every selected patch that is now recorded is owed the nested apply:
@@ -2664,11 +2675,13 @@ pub async fn run(args: GetArgs) -> i32 {
         .filter(|&&f| f)
         .count();
     if type_flags > 1 {
-        report_error(
+        return usage_error(
+            JsonCommand::Get,
             args.common.json,
+            args.common.dry_run,
+            "invalid_args",
             "Only one of --id, --cve, --ghsa, or --package can be specified",
         );
-        return 2;
     }
     // v5: hosted by default, like scan. `--save-only` (records a manifest
     // entry) and global installs (no project lockfile) mean agent mode.
@@ -2683,20 +2696,27 @@ pub async fn run(args: GetArgs) -> i32 {
     // Global installs have no project lockfile: an explicit hosted or
     // vendored mode would rewire the cwd project, not the global copy.
     if let Some(conflict) = super::global_mode_conflict(&args.common, mode) {
-        report_error(args.common.json, conflict);
-        return 2;
+        return usage_error(
+            JsonCommand::Get,
+            args.common.json,
+            args.common.dry_run,
+            "global_scope_unsupported",
+            &conflict,
+        );
     }
     if args.save_only && mode != super::scan::ScanMode::Agent {
-        report_error(
+        return usage_error(
+            JsonCommand::Get,
             args.common.json,
-            format!(
+            args.common.dry_run,
+            "invalid_args",
+            &format!(
                 "--save-only cannot be used with --mode {}: hosted mode never writes the \
                  manifest, and vendored mode's vendor step IS the persistence (plain \
                  `get --save-only` already records without applying)",
                 mode.cli_name()
             ),
         );
-        return 2;
     }
     // Strict airgap (CLI_CONTRACT.md `--offline`: never contact the
     // network; operations that need remote data fail loudly). Every `get`
@@ -2707,6 +2727,7 @@ pub async fn run(args: GetArgs) -> i32 {
     if args.common.offline {
         report_error(
             args.common.json,
+            "offline_unsupported",
             "Fetching patches needs network access, so `get` cannot run with \
              --offline/SOCKET_OFFLINE (strict airgap)",
         );
@@ -2729,8 +2750,13 @@ pub async fn run(args: GetArgs) -> i32 {
     // a typo reads as a plain message instead of a raw API 400 body.
     if args.id || args.cve || args.ghsa {
         if let Some(err) = forced_identifier_error(&args.identifier, id_type) {
-            report_error(args.common.json, err);
-            return 2;
+            return usage_error(
+                JsonCommand::Get,
+                args.common.json,
+                args.common.dry_run,
+                "identifier_invalid",
+                &err,
+            );
         }
     }
 
@@ -3356,7 +3382,11 @@ async fn agent_dry_run(
     let manifest = match read_manifest(&args.common.resolved_manifest_path()).await {
         Ok(m) => m.unwrap_or_else(PatchManifest::new),
         Err(e) => {
-            report_error(args.common.json, format!("Failed to read manifest: {e}"));
+            report_error(
+                args.common.json,
+                "manifest_unreadable",
+                format!("Failed to read manifest: {e}"),
+            );
             return 1;
         }
     };
@@ -3446,7 +3476,11 @@ async fn save_patch_record(
         // treated as empty would be rewritten below with only this one
         // patch, destroying every tracked record.
         Err(e) => {
-            report_error(args.common.json, format!("Failed to read manifest: {e}"));
+            report_error(
+                args.common.json,
+                "manifest_unreadable",
+                format!("Failed to read manifest: {e}"),
+            );
             return Err(1);
         }
     };
@@ -3463,6 +3497,7 @@ async fn save_patch_record(
     if files.is_empty() {
         report_error(
             args.common.json,
+            "patch_no_applicable_files",
             format!(
                 "Patch {} has no applicable files; nothing to apply",
                 patch.purl
@@ -3488,7 +3523,10 @@ async fn save_patch_record(
                 "found": 1,
                 "downloaded": 0,
                 "applied": 0,
-                "error": "Blob decode or write failed",
+                "error": {
+                    "code": "blob_write_failed",
+                    "message": "Blob decode or write failed",
+                },
                 "patches": [{
                     "purl": patch.purl,
                     "uuid": patch.uuid,
@@ -3511,7 +3549,11 @@ async fn save_patch_record(
     if let Err(e) = write_manifest(manifest_path, &manifest).await {
         // No record points at the blobs just written: unwind exactly those.
         unwind_new_blobs(&blobs_dir, &new_blobs).await;
-        report_error(args.common.json, format!("Failed to write manifest: {e}"));
+        report_error(
+            args.common.json,
+            "manifest_write_failed",
+            format!("Failed to write manifest: {e}"),
+        );
         return Err(1);
     }
     Ok(action)
@@ -3958,8 +4000,10 @@ async fn run_get_vendored(
                     result["vendor"] =
                         serde_json::to_value(&*venv).unwrap_or_else(|_| serde_json::json!({}));
                 }
-                result["status"] = serde_json::json!("error");
-                result["error"] = serde_json::json!({ "code": code, "message": message });
+                crate::json_envelope::set_error(
+                    &mut result,
+                    crate::json_envelope::EnvelopeError::new(code, message),
+                );
                 print_json(&result);
             } else {
                 eprintln!(
@@ -4953,8 +4997,12 @@ mod tests {
             applied: Vec::new(),
         };
         assert_eq!(fold_apply_failures(&mut env, &report, |_| None), 0);
-        assert_eq!(env["errorCode"], "yarn_pnp_unsupported", "{env}");
-        assert_eq!(env["error"], "pnp", "{env}");
+        assert!(env.get("errorCode").is_none(), "{env}");
+        assert_eq!(
+            env["error"],
+            serde_json::json!({"code": "yarn_pnp_unsupported", "message": "pnp"}),
+            "{env}"
+        );
         assert_eq!(env["failed"], 0, "{env}");
     }
 
