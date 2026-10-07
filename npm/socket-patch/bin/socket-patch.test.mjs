@@ -165,6 +165,20 @@ describe("npm wrapper libc selection (#974)", () => {
     assert.equal(status, 3);
   });
 
+  // A binary killed by a signal has `status: null`; the wrapper must
+  // report it the way a shell does (128 + signal number), not as 1.
+  for (const [signal, code] of [["SIGINT", 130], ["SIGTERM", 143], ["SIGKILL", 137]]) {
+    it(`reports a ${signal} death as exit ${code}`, () => {
+      const logs = [];
+      const status = wrapper.runFirstUsable(["/gnu", "/musl"], [], {
+        spawn: () => ({ status: null, signal }),
+        log: (msg) => logs.push(msg),
+      });
+      assert.equal(status, code);
+      assert.deepEqual(logs, []);
+    });
+  }
+
   // End to end: a node_modules tree like yarn classic leaves on Alpine,
   // with both platform packages installed and the gnu binary unable to
   // start. The wrapper must run the musl binary instead of exiting 1
@@ -200,6 +214,33 @@ describe("npm wrapper libc selection (#974)", () => {
         assert.equal(result.stdout.trim(), "musl-binary --version");
       } finally {
         rmSync(root, { recursive: true, force: true });
+      }
+    },
+  );
+});
+
+describe("npm package contents", () => {
+  const pkgDir = join(__dirname, "..");
+  const npm = spawnSync("npm", ["--version"], { encoding: "utf8" });
+
+  it(
+    "publishes the wrapper and the compiled schema, not sources or tests",
+    { skip: npm.status !== 0 && "npm is not on PATH" },
+    () => {
+      const result = spawnSync("npm", ["pack", "--dry-run", "--json", "--ignore-scripts"], {
+        cwd: pkgDir,
+        encoding: "utf8",
+      });
+      assert.equal(result.status, 0, `stderr: ${result.stderr}`);
+      const files = JSON.parse(result.stdout)[0].files.map((f) => f.path);
+      assert.ok(files.includes("bin/socket-patch"), files.join(", "));
+      assert.ok(files.includes("package.json"), files.join(", "));
+      for (const file of files) {
+        assert.doesNotMatch(file, /\.test\.|^src\/|tsconfig|tsbuildinfo/, `unexpected file in the tarball: ${file}`);
+        assert.ok(
+          file === "package.json" || file === "README.md" || file.startsWith("bin/socket-patch") || /^dist\/schema\/manifest-schema\.(js|d\.ts)$/.test(file),
+          `unexpected file in the tarball: ${file}`,
+        );
       }
     },
   );
