@@ -375,6 +375,17 @@ fn md5(input: &[u8]) -> [u8; 16] {
 mod tests {
     use super::*;
 
+    /// B74: a FIFO sidecar reads as absent and returns at once.
+    #[cfg(unix)]
+    #[test]
+    fn read_sidecar_rejects_a_fifo_without_blocking() {
+        let tmp = tempfile::tempdir().unwrap();
+        let path = tmp.path().join("lib-1.0.jar.sha1");
+        let c = std::ffi::CString::new(path.to_str().unwrap()).unwrap();
+        assert_eq!(unsafe { libc::mkfifo(c.as_ptr(), 0o600) }, 0);
+        assert_eq!(read_sidecar(&path), None);
+    }
+
     #[test]
     fn md5_matches_rfc1321_vectors() {
         assert_eq!(hex::encode(md5(b"")), "d41d8cd98f00b204e9800998ecf8427e");

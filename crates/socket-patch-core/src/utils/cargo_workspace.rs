@@ -400,6 +400,19 @@ fn wildcard_match(pattern: &[u8], name: &[u8]) -> bool {
 mod tests {
     use super::*;
 
+    /// B74: a FIFO at `Cargo.toml` reads as "no manifest" and returns at
+    /// once (the lstat rejects it; the read behind it is the non-blocking
+    /// regular-file one, so a FIFO swapped in after the lstat fails fast too).
+    #[cfg(unix)]
+    #[test]
+    fn read_manifest_rejects_a_fifo_without_blocking() {
+        let tmp = tempfile::tempdir().unwrap();
+        let path = tmp.path().join("Cargo.toml");
+        let c = std::ffi::CString::new(path.to_str().unwrap()).unwrap();
+        assert_eq!(unsafe { libc::mkfifo(c.as_ptr(), 0o600) }, 0);
+        assert!(read_manifest(&path).is_none());
+    }
+
     fn write(root: &Path, rel: &str, content: &str) {
         let path = root.join(rel);
         std::fs::create_dir_all(path.parent().unwrap()).unwrap();

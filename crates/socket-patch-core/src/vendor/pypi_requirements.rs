@@ -2532,9 +2532,6 @@ mod tests {
 
     // ── pure-function matrices ───────────────────────────────────────────
 
-    /// Lexical normalization: interior `..` pops the stack (which decides
-    /// editable-vs-refuse for nested includes); escapes keep their `../`
-    /// prefix; absolute paths keep their leading `/`.
     /// Lines that do not start with a PEP 508 name are not requirements —
     /// in particular this module's OWN vendor-line shape must be invisible
     /// to the pin search, or an already-wired path line would misparse as a

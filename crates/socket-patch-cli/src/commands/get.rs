@@ -6302,6 +6302,81 @@ mod tests {
         assert_eq!(out.skip_records[0]["errorCode"], "package_not_installed");
     }
 
+    /// B74: a FIFO planted at `pnpm-lock.yaml` of a pnpm-PnP project must
+    /// not wedge hosted `get` in open(2). A FIFO present from the start is
+    /// already refused by the lock inventory (so this guards the whole
+    /// hosted filter path, and passes on the old code too); the raw read
+    /// behind the pnpm-PnP keep-gate is now FIFO-safe as well, which closes
+    /// the window where a FIFO is swapped in after the inventory read. A
+    /// watchdog thread
+    /// opens the FIFO's write end (non-blocking) after a grace period, which
+    /// releases a reader stuck in open(2): the test then FAILS instead of
+    /// hanging the suite.
+    #[cfg(unix)]
+    #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+    async fn filter_to_installed_purls_pnpm_pnp_hosted_fifo_lock_does_not_wedge() {
+        use std::os::unix::fs::OpenOptionsExt;
+        use std::sync::atomic::{AtomicBool, Ordering};
+        use std::sync::Arc;
+
+        let tmp = tempfile::tempdir().unwrap();
+        std::fs::write(tmp.path().join(".pnp.cjs"), b"// pnp loader\n").unwrap();
+        let lock = tmp.path().join("pnpm-lock.yaml");
+        let c = std::ffi::CString::new(lock.to_str().unwrap()).unwrap();
+        assert_eq!(unsafe { libc::mkfifo(c.as_ptr(), 0o600) }, 0);
+        std::fs::create_dir_all(tmp.path().join("node_modules")).unwrap();
+        std::fs::write(tmp.path().join("node_modules/.modules.yaml"), b"").unwrap();
+
+        let done = Arc::new(AtomicBool::new(false));
+        let rescued = Arc::new(AtomicBool::new(false));
+        let watchdog = {
+            let (done, rescued, lock) = (done.clone(), rescued.clone(), lock.clone());
+            std::thread::spawn(move || {
+                let deadline = std::time::Instant::now() + std::time::Duration::from_secs(5);
+                while !done.load(Ordering::SeqCst) && std::time::Instant::now() < deadline {
+                    std::thread::sleep(std::time::Duration::from_millis(50));
+                }
+                // Keep releasing until the body returns: each open lets one
+                // blocked reader through to EOF.
+                while !done.load(Ordering::SeqCst) {
+                    if std::fs::OpenOptions::new()
+                        .write(true)
+                        .custom_flags(libc::O_NONBLOCK)
+                        .open(&lock)
+                        .is_ok()
+                    {
+                        rescued.store(true, Ordering::SeqCst);
+                    }
+                    std::thread::sleep(std::time::Duration::from_millis(50));
+                }
+            })
+        };
+
+        let common = crate::args::GlobalArgs {
+            cwd: tmp.path().to_path_buf(),
+            ..Default::default()
+        };
+        let accessible = vec![mk_patch(
+            "88888888-8888-4888-8888-888888888888",
+            "pkg:npm/covgap-judged@1.0.0",
+            "free",
+            "2024-01-01",
+        )];
+        let out = filter_to_installed_purls(
+            &accessible,
+            &common,
+            crate::commands::scan::ScanMode::Hosted,
+        )
+        .await;
+        done.store(true, Ordering::SeqCst);
+        watchdog.join().unwrap();
+        assert!(
+            !rescued.load(Ordering::SeqCst),
+            "a FIFO pnpm-lock.yaml wedged get in open(2)"
+        );
+        assert!(out.kept.is_empty(), "{:?}", out.kept);
+    }
+
     /// pnpm-PnP + hosted: a purl the lock probe CANNOT judge (no `@version`
     /// coordinate to look for) must keep the layout-refusal code — the same
     /// no-judgment fallback as an unreadable lock — never a false
