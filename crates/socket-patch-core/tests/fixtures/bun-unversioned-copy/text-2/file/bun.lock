@@ -1,0 +1,20 @@
+{
+  "lockfileVersion": 2,
+  "configVersion": 1,
+  "workspaces": {
+    "": {
+      "name": "app",
+      "dependencies": {
+        "dep": "file:./dep",
+        "minimist": "file:./pkg.tgz",
+      },
+    },
+  },
+  "packages": {
+    "dep": ["dep@file:dep", { "dependencies": { "minimist": "1.2.2" } }],
+
+    "minimist": ["minimist@./pkg.tgz", {}, "sha512-rIqbOrKb8GJmx/5bc2M0QchhUouMXSpd1RTclXsB41JdL+VtnojfaJR+h7F9k18/4kHUsBFgk80Uk+q569vjPA=="],
+
+    "dep/minimist": ["minimist@1.2.2", "", {}, "sha512-rIqbOrKb8GJmx/5bc2M0QchhUouMXSpd1RTclXsB41JdL+VtnojfaJR+h7F9k18/4kHUsBFgk80Uk+q569vjPA=="],
+  }
+}

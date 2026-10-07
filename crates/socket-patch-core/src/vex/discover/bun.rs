@@ -86,11 +86,14 @@
 //!
 //! Non-goals: nested workspace-member locks (bun keeps one lock at the
 //! workspace root); git / github / workspace / folder entries (never
-//! Socket-written).
+//! Socket-written). Those entries still contest: a URL / `file:` tarball,
+//! git, folder or link copy whose version the lock does not record (Bun
+//! keeps none for it) withdraws every ref of the same package in that lock
+//! ([`Unwired`], #497).
 
 use super::{
-    npm_purl, DiscoverCtx, Discovery, LocateOpts, Located, PatchedRef, DIAG_LOCKFILE_UNPARSEABLE,
-    DIAG_REF_INVALID, DIAG_REF_UNATTRIBUTABLE,
+    canonical_base_purl, npm_purl, DiscoverCtx, Discovery, LocateOpts, Located, PatchedRef,
+    DIAG_LOCKFILE_UNPARSEABLE, DIAG_REF_INVALID, DIAG_REF_UNATTRIBUTABLE,
 };
 use crate::constants::npm_family::{BUN_LOCK, BUN_LOCKB};
 use crate::patch::redirect::hosted_url_version;
@@ -155,6 +158,10 @@ async fn extract_text(ctx: &DiscoverCtx<'_>, out: &mut Discovery) {
             recorded_version: None,
             integrity,
             shape_ok: tarball_tuple,
+            // Every other spec is a registry `name@<version>` or a member's
+            // `name@workspace:<path>`.
+            own_source: !target.starts_with(|c: char| c.is_ascii_digit())
+                && !target.starts_with("workspace:"),
         };
         if is_bundled_entry(entry) {
             bundled.record(ctx, BUN_LOCK, classified, out);
@@ -162,6 +169,7 @@ async fn extract_text(ctx: &DiscoverCtx<'_>, out: &mut Discovery) {
             let user_tarball = user_tarball_version(name, target).is_some();
             unwired.record(
                 classify(ctx, BUN_LOCK, classified, out),
+                name,
                 &entry.key,
                 user_tarball,
             );
@@ -288,6 +296,7 @@ async fn extract_binary(ctx: &DiscoverCtx<'_>, out: &mut Discovery) {
             // The codec only yields a resolution STRING for registry and
             // tarball-like records; git records come back empty.
             shape_ok: true,
+            own_source: p.own_source,
         };
         // A record some bundled edge reaches installs (also) as a copy
         // unpacked from that parent's tarball. Bun keeps ONE record for a
@@ -300,6 +309,7 @@ async fn extract_binary(ctx: &DiscoverCtx<'_>, out: &mut Discovery) {
                 p.version.is_none() && user_tarball_version(&p.name, &p.resolution).is_some();
             unwired.record(
                 classify(ctx, BUN_LOCKB, classified, out),
+                &p.name,
                 &label,
                 user_tarball,
             );
@@ -326,18 +336,29 @@ struct Entry<'a> {
     integrity: Option<LockIntegrity>,
     /// The entry is in a shape bun reads as a tarball tuple.
     shape_ok: bool,
+    /// Bun installs the entry from its own spec (a URL or local tarball,
+    /// git, a folder or a link), never the registry or a workspace member.
+    own_source: bool,
+}
+
+/// What [`classify`] found an entry that is not a ref to install.
+enum Install {
+    /// Nothing that contests a ref: a ref itself, an invalid wiring, or a
+    /// registry spec naming no exact version.
+    Nothing,
+    /// An unpatched copy of this exact purl.
+    Unpatched(String),
+    /// An own-source copy whose version the lock does not record (#497):
+    /// a tarball whose leaf names no version, git, a folder.
+    Unversioned,
 }
 
 /// Push `entry`'s ref when it is Socket-wired (see the module docs); stay
-/// silent for anything else. Returns the purl of a registry entry (an exact
-/// version resolved from a non-Socket source), which contests a ref for the
-/// same version in this lock ([`Unwired::contest`]) and in any other.
-fn classify(
-    ctx: &DiscoverCtx<'_>,
-    file: &str,
-    entry: Entry<'_>,
-    out: &mut Discovery,
-) -> Option<String> {
+/// silent for anything else. Returns what a non-Socket entry installs: the
+/// purl of an exact version, which contests a ref for the same version in
+/// this lock ([`Unwired::contest`]) and in any other, or a copy of unknown
+/// version, which contests every ref of the package in this lock.
+fn classify(ctx: &DiscoverCtx<'_>, file: &str, entry: Entry<'_>, out: &mut Discovery) -> Install {
     let Entry {
         label,
         name,
@@ -345,6 +366,7 @@ fn classify(
         recorded_version,
         integrity,
         shape_ok,
+        own_source,
     } = entry;
     let Located {
         vendored,
@@ -361,14 +383,16 @@ fn classify(
                  .socket/vendor/npm/<uuid>/<tarball> path; it is ignored"
             ),
         );
-        return None;
+        return Install::Nothing;
     }
     if vendored.is_none() && hosted_uuid.is_none() {
         // Registry / git / workspace / user tarball dependency: not ours. A
         // registry entry (an exact version), or a user URL / `file:`
         // tarball whose leaf names its version (#497), is an unpatched
         // install of that version: evidence against wiring of the same
-        // package in this lock and any other.
+        // package in this lock and any other. Any other own-source copy
+        // (a tarball whose leaf names no version, git, a folder) may be
+        // the wired version: Bun records no version for it.
         let version = recorded_version
             .or_else(|| {
                 target
@@ -376,9 +400,16 @@ fn classify(
                     .then_some(target)
             })
             .or_else(|| user_tarball_version(name, target));
-        let purl = version.and_then(|version| npm_purl(name, version));
+        let Some(version) = version else {
+            return if own_source {
+                Install::Unversioned
+            } else {
+                Install::Nothing
+            };
+        };
+        let purl = npm_purl(name, version);
         out.resolved_elsewhere(file, purl.clone());
-        return purl;
+        return purl.map_or(Install::Nothing, Install::Unpatched);
     }
     let invalid = |out: &mut Discovery, why: String| {
         out.diag(DIAG_REF_INVALID, file, format!("{file}: {label}: {why}"));
@@ -390,12 +421,12 @@ fn classify(
                 "{name}@{target} is not in bun's tarball tuple shape [spec, {{meta}}, integrity]"
             ),
         );
-        return None;
+        return Install::Nothing;
     }
     let version = match &vendored {
         Some(vref) if vref.eco != "npm" => {
             invalid(out, format!("{target:?} is not a vendored npm tarball"));
-            return None;
+            return Install::Nothing;
         }
         Some(vref) => tgz_leaf_version(name, &vref.leaf)
             .filter(|version| semver::Version::parse(version).is_ok()),
@@ -406,7 +437,7 @@ fn classify(
             out,
             format!("{target:?} is not an artifact of {name:?} (its leaf must be the package's own <name>-<version>.tgz)"),
         );
-        return None;
+        return Install::Nothing;
     };
     if recorded_version.is_some_and(|recorded| recorded != version) {
         invalid(
@@ -416,14 +447,14 @@ fn classify(
                 recorded_version.unwrap_or_default()
             ),
         );
-        return None;
+        return Install::Nothing;
     }
     let Some(purl) = npm_purl(name, version) else {
         invalid(
             out,
             format!("Socket-wired entry {name:?}@{version:?} has unsafe coordinates"),
         );
-        return None;
+        return Install::Nothing;
     };
     // Hosted: both bun rewriters always write the sha512 (see module docs).
     if let Some(vref) = vendored {
@@ -438,7 +469,7 @@ fn classify(
             true,
         ));
     }
-    None
+    Install::Nothing
 }
 
 /// The registry copies one lock records, keyed by purl (#588): bun installs
@@ -446,46 +477,86 @@ fn classify(
 /// registry (e.g. a workspace member added after the rewire, then `bun
 /// install`) installs unpatched beside the rewired one. A user URL /
 /// `file:` tarball of the version (#497) is such a copy too, one no re-run
-/// can rewire: bun installs it from its own spec.
+/// can rewire: bun installs it from its own spec. So is an own-source copy
+/// whose version the lock does not record (a tarball named `pkg.tgz`, a
+/// codeload URL, git, a folder): it may be the wired version, so it
+/// contests every ref of the package. Only this lock's refs: without a
+/// version it is no `name@version` evidence for the cross-lock contest.
 #[derive(Default)]
 struct Unwired {
     /// purl → the first such entry's label (a user tarball's in preference
     /// to a registry copy's), and whether it is a user tarball.
     copies: std::collections::BTreeMap<String, (String, bool)>,
+    /// Version-less purl (`pkg:npm/<name>`) → the first unversioned
+    /// own-source entry's label.
+    unversioned: std::collections::BTreeMap<String, String>,
+}
+
+/// `purl` without its `@<version>`.
+fn package_of(purl: &str) -> &str {
+    purl.rsplit_once('@').map_or(purl, |(package, _)| package)
 }
 
 impl Unwired {
-    fn record(&mut self, purl: Option<String>, label: &str, user_tarball: bool) {
-        if let Some(purl) = purl {
-            // A user-tarball copy wins over a registry one: a re-run rewires
-            // the registry copy but never the tarball, so the diagnostic must
-            // name the copy whose remedy is "depend on the registry version".
-            match self.copies.entry(purl) {
-                std::collections::btree_map::Entry::Vacant(v) => {
-                    v.insert((label.to_string(), user_tarball));
+    fn record(&mut self, install: Install, name: &str, label: &str, user_tarball: bool) {
+        let purl = match install {
+            Install::Nothing => return,
+            Install::Unpatched(purl) => purl,
+            Install::Unversioned => {
+                if let Some(purl) = npm_purl(name, "0") {
+                    let package = package_of(&canonical_base_purl(&purl)).to_string();
+                    self.unversioned
+                        .entry(package)
+                        .or_insert_with(|| label.to_string());
                 }
-                std::collections::btree_map::Entry::Occupied(mut o) => {
-                    if user_tarball && !o.get().1 {
-                        o.insert((label.to_string(), true));
-                    }
+                return;
+            }
+        };
+        // A user-tarball copy wins over a registry one: a re-run rewires the
+        // registry copy but never the tarball, so the diagnostic must name
+        // the copy whose remedy is "depend on the registry version".
+        match self.copies.entry(purl) {
+            std::collections::btree_map::Entry::Vacant(v) => {
+                v.insert((label.to_string(), user_tarball));
+            }
+            std::collections::btree_map::Entry::Occupied(mut o) => {
+                if user_tarball && !o.get().1 {
+                    o.insert((label.to_string(), true));
                 }
             }
         }
     }
 
     /// Withdraw every ref of `file` whose `name@version` another entry of
-    /// the same lock resolves from the registry.
+    /// the same lock resolves from elsewhere, or whose package an
+    /// unversioned own-source entry installs.
     fn contest(&self, file: &str, out: &mut Discovery) {
-        if self.copies.is_empty() {
+        if self.copies.is_empty() && self.unversioned.is_empty() {
             return;
         }
         let refs = std::mem::take(&mut out.refs);
         for r in refs {
-            let unwired_at = (r.source_file == std::path::Path::new(file))
-                .then(|| self.copies.get(&r.purl))
-                .flatten();
-            let Some((label, user_tarball)) = unwired_at else {
+            if r.source_file != std::path::Path::new(file) {
                 out.refs.push(r);
+                continue;
+            }
+            let Some((label, user_tarball)) = self.copies.get(&r.purl) else {
+                if let Some(label) = self.unversioned.get(package_of(&r.purl)) {
+                    out.diag(
+                        DIAG_REF_UNATTRIBUTABLE,
+                        file,
+                        format!(
+                            "{file}: {} is wired to a Socket patch but entry {label:?} of the \
+                             same lock installs that package from a URL, local tarball, git \
+                             or folder spec whose version the lock does not record; bun \
+                             installs it from that spec, so if it is this version that copy \
+                             stays UNPATCHED, and nothing is attested",
+                            r.purl,
+                        ),
+                    );
+                } else {
+                    out.refs.push(r);
+                }
                 continue;
             };
             if *user_tarball {
@@ -836,8 +907,7 @@ mod tests {
     /// a hosted / vendored rewire of the nested registry copy of the same
     /// version leaves the copy the app loads unpatched. Nothing may be
     /// attested from the lock alone (npm's #326 contest). A tarball of
-    /// another version, or one whose leaf names no version, contests
-    /// nothing.
+    /// another version contests nothing.
     #[tokio::test]
     async fn issue_497_user_tarball_copy_contests_the_ref() {
         let hosted = hosted_url("npm", "left-pad", "1.3.0", UUID_A, "left-pad-1.3.0.tgz");
@@ -871,10 +941,7 @@ mod tests {
                     out.diagnostics
                 );
             }
-            for other in [
-                "left-pad@https://registry.npmjs.org/left-pad/-/left-pad-1.2.0.tgz",
-                "left-pad@./left-pad.tgz",
-            ] {
+            for other in ["left-pad@https://registry.npmjs.org/left-pad/-/left-pad-1.2.0.tgz"] {
                 let p = Project::new();
                 p.write(
                     "bun.lock",
@@ -889,6 +956,168 @@ mod tests {
                 let out = run(&p).await;
                 assert_eq!(out.refs.len(), 1, "{label} {other}: {:#?}", out.refs);
                 assert_eq!(user_tarball_contests(&out), 0, "{label} {other}");
+            }
+        }
+    }
+
+    /// The `DIAG_REF_UNATTRIBUTABLE` diagnostics that name an own-source
+    /// copy of unknown version.
+    fn unversioned_contests(out: &Discovery) -> usize {
+        out.diagnostics
+            .iter()
+            .filter(|d| {
+                d.code == DIAG_REF_UNATTRIBUTABLE
+                    && d.detail.contains("whose version the lock does not record")
+            })
+            .count()
+    }
+
+    /// REGRESSION (#497 follow-up): Bun records no version for a URL /
+    /// `file:` tarball whose leaf names none (`pkg.tgz`, a codeload URL),
+    /// nor for a git or folder dependency, and installs it from that spec.
+    /// It may be the wired version, so it contests every ref of the package
+    /// in that lock, scoped or not. A copy of another package, a workspace
+    /// member and a registry copy of another version contest nothing.
+    #[tokio::test]
+    async fn issue_497_unversioned_own_source_copy_contests_the_ref() {
+        for (name, file) in [
+            ("left-pad", "left-pad-1.3.0.tgz"),
+            ("@s/pad", "pad-1.3.0.tgz"),
+        ] {
+            let hosted = hosted_url("npm", name, "1.3.0", UUID_A, file);
+            let vendored = format!("{name}@.socket/vendor/npm/{UUID_A}/{name}-1.3.0.tgz");
+            for (label, spec) in [
+                ("hosted", format!("{name}@{hosted}")),
+                ("vendored", vendored),
+            ] {
+                for user in [
+                    format!("{name}@./pkg.tgz"),
+                    format!("{name}@https://codeload.github.com/o/r/tar.gz/refs/tags/v1.3.0"),
+                    format!("{name}@github:o/r#c12a808"),
+                    format!("{name}@file:vend/pad"),
+                    format!("{name}@link:pad"),
+                ] {
+                    let p = Project::new();
+                    p.write(
+                        "bun.lock",
+                        text_lock(
+                            2,
+                            &[
+                                tuple(name, &user, None),
+                                tuple(&format!("dep/{name}"), &spec, Some(SRI)),
+                            ],
+                        ),
+                    );
+                    let out = run(&p).await;
+                    assert!(out.refs.is_empty(), "{label} {user}: {:#?}", out.refs);
+                    assert_eq!(
+                        unversioned_contests(&out),
+                        1,
+                        "{label} {user}: {:#?}",
+                        out.diagnostics
+                    );
+                }
+                for other in [
+                    "other@./pkg.tgz".to_string(),
+                    format!("{name}@workspace:packages/pad"),
+                    format!("{name}@1.2.0"),
+                ] {
+                    let p = Project::new();
+                    p.write(
+                        "bun.lock",
+                        text_lock(
+                            2,
+                            &[
+                                tuple("x", &other, None),
+                                tuple(&format!("dep/{name}"), &spec, Some(SRI)),
+                            ],
+                        ),
+                    );
+                    let out = run(&p).await;
+                    assert_eq!(out.refs.len(), 1, "{label} {other}: {:#?}", out.refs);
+                    assert_eq!(unversioned_contests(&out), 0, "{label} {other}");
+                }
+            }
+        }
+    }
+
+    /// REGRESSION (#497 follow-up), real Bun locks: the root depends on
+    /// minimist by `file:./pkg.tgz`, a codeload tarball URL or
+    /// `github:…#v1.2.2` (Bun 1.4.2 / 1.2.23 / 1.1.45 text, 1.1.45 binary),
+    /// and a folder dependency on minimist@1.2.2. Wiring that nested
+    /// registry copy (hosted or vendored) is never attested; dropping the
+    /// root copy from the text lock attests it.
+    #[tokio::test]
+    async fn issue_497_real_unversioned_copies_contest_the_nested_ref() {
+        let hosted = hosted_url("npm", "minimist", "1.2.2", UUID_A, "minimist-1.2.2.tgz");
+        let vendored = format!(".socket/vendor/npm/{UUID_A}/minimist-1.2.2.tgz");
+        let root = fixture_path("bun-unversioned-copy");
+        for dir in [
+            "text-0/file",
+            "text-1/file",
+            "text-2/file",
+            "text-2/url",
+            "text-2/git",
+        ] {
+            let text = std::fs::read_to_string(root.join(dir).join("bun.lock")).unwrap();
+            for wired in [&hosted, &vendored] {
+                let lock: String = text
+                    .lines()
+                    .map(
+                        |line| match line.trim_start().strip_prefix("\"dep/minimist\": ") {
+                            Some(_) => format!(
+                                "    \"dep/minimist\": [\"minimist@{wired}\", {{}}, \"{SRI}\"],\n"
+                            ),
+                            None => format!("{line}\n"),
+                        },
+                    )
+                    .collect();
+                assert!(lock.contains(wired.as_str()), "{dir}");
+                let p = Project::new();
+                p.write("bun.lock", &lock);
+                let out = run(&p).await;
+                assert_refs(&out, &[]);
+                assert_eq!(
+                    unversioned_contests(&out),
+                    1,
+                    "{dir} {wired}: {:#?}",
+                    out.diagnostics
+                );
+
+                let without_root: String = lock
+                    .lines()
+                    .filter(|line| !line.trim_start().starts_with("\"minimist\": "))
+                    .map(|line| format!("{line}\n"))
+                    .collect();
+                let p = Project::new();
+                p.write("bun.lock", &without_root);
+                let out = run(&p).await;
+                assert_eq!(out.refs.len(), 1, "{dir} {wired} control: {:#?}", out);
+                assert_eq!(unversioned_contests(&out), 0, "{dir} {wired} control");
+            }
+        }
+        for shape in ["file", "url", "git"] {
+            let bytes = std::fs::read(root.join("lockb").join(shape).join("bun.lockb")).unwrap();
+            for wired in [&hosted, &vendored] {
+                let mut lock = crate::vendor::bun_lockb::BunLockb::parse(&bytes).unwrap();
+                let id = lock
+                    .packages()
+                    .unwrap()
+                    .into_iter()
+                    .find(|p| p.name == "minimist" && p.version.as_deref() == Some("1.2.2"))
+                    .expect("nested registry record")
+                    .id;
+                lock.set_package(id, wired, SRI).unwrap();
+                let p = Project::new();
+                p.write("bun.lockb", lock.bytes());
+                let out = run(&p).await;
+                assert_refs(&out, &[]);
+                assert_eq!(
+                    unversioned_contests(&out),
+                    1,
+                    "{shape} {wired}: {:#?}",
+                    out.diagnostics
+                );
             }
         }
     }

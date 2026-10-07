@@ -55,6 +55,10 @@ pub(crate) struct BinaryPackage {
     /// EVERY edge resolving to this record is bundled (and there is at
     /// least one): rewiring its resolution installs nothing.
     pub(crate) bundled_only: bool,
+    /// Bun installs the record from its own spec — a local or remote
+    /// tarball, git, a folder or a link — not from the registry, and it is
+    /// neither the root nor a workspace member (#497).
+    pub(crate) own_source: bool,
 }
 
 #[derive(Clone, Debug)]
@@ -293,6 +297,7 @@ impl BunLockb {
             integrity,
             bundled: false,
             bundled_only: false,
+            own_source: !matches!(tag, 0 | 1 | 2 | 72),
         })
     }
 
