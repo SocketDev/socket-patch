@@ -45,6 +45,11 @@
 //!   Installing those handlers is the host's job: a host that embeds
 //!   this crate without the CLI (the Node addon) installs none, and an
 //!   interrupt there behaves like a crash.
+//!   On Unix the unlink precedes the process's death by a few
+//!   syscalls, during which its other threads still run; a competing
+//!   acquire that lands in that window could briefly overlap them.
+//!   Windows has no such window: the unlinked name stays delete-pending
+//!   until the dying process's handle closes.
 //!
 //! So no command leaves `apply.lock` behind (barring that non-cooperating
 //! replacement, which the next lock-taking command reclaims), and a
@@ -191,11 +196,6 @@ impl LockGuard {
 
 impl Drop for LockGuard {
     fn drop(&mut self) {
-        // From here on the drop itself removes the file; an interrupt
-        // landing mid-drop must not race it for the unlink.
-        if let Some(registration) = self.registration.take() {
-            interrupt::unregister(registration);
-        }
         // R0: sync every artifact still pending a durability barrier while
         // the lock is held — an artifact rebuilt in place that no later
         // commit point's barrier covered (see `utils::durability`). Best
@@ -205,6 +205,15 @@ impl Drop for LockGuard {
                 "Warning: could not sync the vendored artifacts this run wrote ({e}); \
                  run `socket-patch repair` after an unclean shutdown"
             );
+        }
+        // Leave the interrupt table only now, after the barrier (which can
+        // take seconds over a large vendored tree): an interrupt during R0
+        // still removes the file. From R1 on the drop itself removes it,
+        // and an interrupt must not race it for the unlink — once the
+        // handle closes, the inode number can be reused by the next
+        // holder's file and pass the cleanup's identity check.
+        if let Some(registration) = self.registration.take() {
+            interrupt::unregister(registration);
         }
         // R1: unlink while still holding the lock — but only the file we
         // hold. The unlink is gated on the path still naming the held
@@ -409,7 +418,7 @@ mod interrupt {
         id: u64,
         lock: PathBuf,
         /// A duplicate of the guard's handle, kept only for the identity
-        /// comparison. It leaves the table at the top of the guard's
+        /// comparison. It leaves the table in the guard's
         /// drop, before the guard closes its own handle, so it never
         /// keeps the lock or the delete-pending name alive.
         handle: Handle,
