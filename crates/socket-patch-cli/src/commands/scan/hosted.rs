@@ -1511,8 +1511,9 @@ pub(crate) async fn run_redirect_selected(
                 confirmed.is_empty(),
                 // Only the lockfile rewriters' own warnings explain a
                 // missing lock entry; unrelated guidance (pnpm trust, VEX,
-                // stale installs) is not what the hint points at.
-                rewrite.warnings.len(),
+                // stale installs, Bun default trust) is not what the hint
+                // points at.
+                lock_entry_warning_count(&rewrite.warnings),
             ) {
                 eprintln!("{line}");
             }
@@ -2436,6 +2437,20 @@ fn describe_skip_reason(reason: &str) -> String {
     }
 }
 
+/// How many of the lockfile rewriters' warnings can explain why a granted
+/// package has no lock entry: the count `format_unredirected` turns into its
+/// "(see the warning below)" hint. `redirect_bun_default_trust_lost` rides in
+/// the same vector but is about a pin that *was* written (Bun's default trust
+/// lost on the hosted URL, #371), so it never explains a missing entry.
+fn lock_entry_warning_count(
+    warnings: &[socket_patch_core::patch::redirect::RewriteWarning],
+) -> usize {
+    warnings
+        .iter()
+        .filter(|w| w.code != "redirect_bun_default_trust_lost")
+        .count()
+}
+
 /// The per-package "not redirected" lines, `skipped` (with a reason code)
 /// first, then `unconfirmed` (granted, but nothing in the project's files
 /// pins it). When nothing at all was redirected they sit under a
@@ -2674,8 +2689,8 @@ mod tests {
     use super::{
         describe_skip_reason, format_error_line, format_next_steps, format_redirect_summary,
         format_takeover_line, format_unredirected, format_warning, join_names,
-        pnpm_lock_may_need_store_flag, pnpm_trust_rerun_reminder, sentence_case, split_sentences,
-        wrap_tokens, wrap_words, TAKEOVER_INFO_CODES,
+        lock_entry_warning_count, pnpm_lock_may_need_store_flag, pnpm_trust_rerun_reminder,
+        sentence_case, split_sentences, wrap_tokens, wrap_words, TAKEOVER_INFO_CODES,
     };
     use super::{wheel_metadata_concurrency, WHEEL_METADATA_CONCURRENCY};
     use socket_patch_core::hosted::engine::REDIRECT_CANDIDATE_FILES;
@@ -4298,6 +4313,30 @@ mod tests {
             let text = describe_skip_reason(code);
             assert!(!text.contains('_'), "{code} → {text}");
         }
+    }
+
+    #[test]
+    fn lock_entry_warning_count_skips_bun_default_trust() {
+        use socket_patch_core::patch::redirect::RewriteWarning;
+        let w = |code: &str| RewriteWarning {
+            code: code.into(),
+            detail: String::new(),
+        };
+        assert_eq!(lock_entry_warning_count(&[]), 0);
+        // A trust warning alone must not make an unconfirmed package's
+        // line point at it (#371 review).
+        assert_eq!(
+            lock_entry_warning_count(&[w("redirect_bun_default_trust_lost")]),
+            0
+        );
+        assert_eq!(
+            lock_entry_warning_count(&[
+                w("redirect_bun_default_trust_lost"),
+                w("redirect_lock_unparseable"),
+                w("redirect_bun_default_trust_lost"),
+            ]),
+            1
+        );
     }
 
     #[test]
