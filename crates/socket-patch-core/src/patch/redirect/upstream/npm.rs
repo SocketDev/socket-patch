@@ -821,6 +821,9 @@ struct PnpmTarballPolicy {
     /// lock, so every resolution carries its tarball
     /// (see [`pnpm_include_tarball`]).
     always: bool,
+    /// `always` rests on the tier-3 guess that pnpm 11+ would read the
+    /// other way (see [`PnpmIncludeTarball::guessed_from_npmrc`]).
+    guessed_from_npmrc: bool,
     /// The sibling pnpm-workspace.yaml and `.npmrc`, and the pnpm major
     /// that reads them ([`pnpm_settings_major`]), which name the registry
     /// pnpm resolves a package against (see [`pnpm_lookup_registry`]).
@@ -960,6 +963,18 @@ fn pnpm_lookup_registry(
     value.filter(|value| !value.contains("${"))
 }
 
+/// What [`pnpm_include_tarball`] concluded about the lock.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+struct PnpmIncludeTarball {
+    /// pnpm wrote the lock under `lockfileIncludeTarballUrl`.
+    on: bool,
+    /// `on` came from the tier-3 fallback (no lock evidence, no known pnpm
+    /// major) reading `.npmrc`'s `lockfile-include-tarball-url=true` with
+    /// pnpm-workspace.yaml silent: pnpm 9/10 honour it, but pnpm >= 11
+    /// ignores pnpm settings in `.npmrc` and would leave `tarball:` out.
+    guessed_from_npmrc: bool,
+}
+
 /// Whether pnpm wrote the lock `text` under `lockfileIncludeTarballUrl`
 /// (#902). The setting lives in pnpm-workspace.yaml or `.npmrc`, but which
 /// of those pnpm reads depends on its major: pnpm <= 9 ignores workspace
@@ -973,20 +988,25 @@ fn pnpm_lookup_registry(
 ///    That covers a lock with no sibling install record (a fresh clone, a
 ///    Rush lock whose node_modules lives in common/temp) and only pinned
 ///    entries; a global `~/.npmrc` or `npm_config_*` setting is only
-///    visible through tier 1.
+///    visible through tier 1. When that reading turns the setting on from
+///    `.npmrc` alone, which pnpm >= 11 would not, the result says so
+///    ([`PnpmIncludeTarball::guessed_from_npmrc`]) so the restore can warn.
 fn pnpm_include_tarball(
     text: &str,
     workspace: Option<&str>,
     npmrc: Option<&str>,
     pm_major: Option<u32>,
     is_hosted: impl Fn(&str) -> bool,
-) -> bool {
+) -> PnpmIncludeTarball {
     use super::super::npmrc::npmrc_top_level_value;
 
     let major = pnpm_settings_major(text, pm_major);
     let registry = |name: &str| pnpm_lookup_registry(workspace, npmrc, major, name);
-    if let Some(evidence) = pnpm_lock_tarball_evidence(text, registry, is_hosted) {
-        return evidence;
+    if let Some(on) = pnpm_lock_tarball_evidence(text, registry, is_hosted) {
+        return PnpmIncludeTarball {
+            on,
+            guessed_from_npmrc: false,
+        };
     }
     let from_workspace =
         || workspace.and_then(|text| yaml_top_level_value(text, "lockfileIncludeTarballUrl"));
@@ -995,12 +1015,20 @@ fn pnpm_include_tarball(
             .and_then(|text| npmrc_top_level_value(text, "lockfile-include-tarball-url"))
             .map(|value| value.trim().to_string())
     };
-    let value = match major {
-        Some(major) if major <= 9 => from_npmrc(),
-        Some(major) if major >= 11 => from_workspace(),
-        _ => from_workspace().or_else(from_npmrc),
+    let (value, guessed_from_npmrc) = match major {
+        Some(major) if major <= 9 => (from_npmrc(), false),
+        Some(major) if major >= 11 => (from_workspace(), false),
+        // pnpm 10, read the same way whether known or (tier 3) assumed.
+        _ => match from_workspace() {
+            Some(value) => (Some(value), false),
+            None => (from_npmrc(), major.is_none()),
+        },
     };
-    value.is_some_and(|value| value == "true")
+    let on = value.is_some_and(|value| value == "true");
+    PnpmIncludeTarball {
+        on,
+        guessed_from_npmrc: guessed_from_npmrc && on,
+    }
 }
 
 /// What the lock's unpinned registry resolutions (integrity, a registry
@@ -1092,6 +1120,29 @@ async fn read_sibling(view: &mut View<'_>, dir_prefix: &str, name: &str) -> Opti
         .flatten()
 }
 
+/// The `upstream_pnpm_tarball_setting_guessed` detail (#902): the restore
+/// of the lock `rel` wrote `tarball:` back for `entries` on pnpm 9/10's
+/// reading of the sibling `.npmrc`, which pnpm >= 11 ignores.
+fn pnpm_tarball_guess_warning(rel: &str, entries: &[&str]) -> String {
+    let dir_prefix = match rel.rsplit_once('/') {
+        Some((dir, _)) => format!("{dir}/"),
+        None => String::new(),
+    };
+    format!(
+        "{rel}: the pnpm version could not be determined (no unpinned registry entry in \
+         the lock, no {dir_prefix}node_modules/.modules.yaml install record, no \
+         {dir_prefix}package.json `packageManager` pin), so the restore followed \
+         `lockfile-include-tarball-url=true` in {dir_prefix}.npmrc as pnpm 9/10 do and \
+         wrote `tarball:` back for {}; pnpm >= 11 ignores that `.npmrc` setting and \
+         records no `tarball:` there. If the project uses pnpm >= 11, restore {rel} from \
+         version control, set package.json `packageManager` (or reinstall so \
+         node_modules/.modules.yaml records the pnpm version) and re-run; or, to keep \
+         tarball URLs on every pnpm, move the setting into \
+         {dir_prefix}pnpm-workspace.yaml as `lockfileIncludeTarballUrl: true`",
+        entries.join(", ")
+    )
+}
+
 async fn pnpm_tarball_policy(
     view: &mut View<'_>,
     rel: &str,
@@ -1115,7 +1166,7 @@ async fn pnpm_tarball_policy(
             .as_deref()
             .and_then(package_json_pnpm_major);
     }
-    let always = pnpm_include_tarball(
+    let include = pnpm_include_tarball(
         text,
         workspace.as_deref(),
         npmrc.as_deref(),
@@ -1123,7 +1174,8 @@ async fn pnpm_tarball_policy(
         |url| ctx.hosted_uuid(url).is_some(),
     );
     PnpmTarballPolicy {
-        always,
+        always: include.on,
+        guessed_from_npmrc: include.guessed_from_npmrc,
         workspace,
         npmrc,
         major: pnpm_settings_major(text, pm_major),
@@ -1179,7 +1231,8 @@ pub(crate) async fn restore_pnpm_locks(
         let policy = pnpm_tarball_policy(view, rel, &text, ctx).await;
         let dists = fetch_dists_on(&wanted, |name| policy.registry(name), ctx, &mut result).await;
         let mut splices: Vec<(std::ops::Range<usize>, String)> = Vec::new();
-        let mut handled: Vec<String> = Vec::new();
+        // (uuid, name@version whose `tarball:` only the guessed setting kept)
+        let mut handled: Vec<(String, Option<String>)> = Vec::new();
         for entry in pnpm::entries(&text) {
             let Some(resolution) = pnpm::resolution(&entry) else {
                 continue;
@@ -1203,30 +1256,41 @@ pub(crate) async fn restore_pnpm_locks(
             };
             // pnpm records `tarball:` under lockfileIncludeTarballUrl and for
             // a URL it cannot derive from the registry (#557).
-            let restored = if policy.always
-                || !registry_derives_tarball(
-                    policy.registry(name).as_deref(),
-                    name,
-                    version,
-                    &dist.tarball,
-                ) {
+            let derived = registry_derives_tarball(
+                policy.registry(name).as_deref(),
+                name,
+                version,
+                &dist.tarball,
+            );
+            let restored = if policy.always || !derived {
                 resolution.rewrite(integrity, &dist.tarball)
             } else {
                 resolution.restore(integrity)
             };
+            let guessed =
+                (policy.guessed_from_npmrc && derived).then(|| format!("{name}@{version}"));
             splices.push((resolution.range.clone(), restored));
-            handled.push(uuid.clone());
+            handled.push((uuid.clone(), guessed));
         }
         // A refusal recorded after a splice was planned (a second instance
         // of the same pin) drops that pin's splices too.
-        let splices: Vec<_> = splices
+        let kept: Vec<_> = splices
             .into_iter()
             .zip(&handled)
-            .filter(|(_, u)| !result.refused.contains_key(*u))
-            .map(|(s, _)| s)
+            .filter(|(_, (u, _))| !result.refused.contains_key(u))
             .collect();
+        let mut guessed: Vec<&str> = kept.iter().filter_map(|(_, (_, g))| g.as_deref()).collect();
+        guessed.sort_unstable();
+        guessed.dedup();
+        let splices: Vec<_> = kept.into_iter().map(|(s, _)| s).collect();
         if splices.is_empty() {
             continue;
+        }
+        if !guessed.is_empty() {
+            result.warnings.push((
+                "upstream_pnpm_tarball_setting_guessed",
+                pnpm_tarball_guess_warning(rel, &guessed),
+            ));
         }
         let mut out = String::with_capacity(text.len());
         let mut cursor = 0;
@@ -1238,7 +1302,7 @@ pub(crate) async fn restore_pnpm_locks(
             cursor = range.end;
         }
         out.push_str(&text[cursor..]);
-        for uuid in handled {
+        for (uuid, _) in handled {
             if !result.refused.contains_key(&uuid) {
                 result.handled.insert(uuid);
             }
@@ -1430,7 +1494,7 @@ mod tests {
     use super::{
         berry_lookup_registry, berry_registry_locator, modules_yaml_pnpm_major,
         non_default_registry, package_json_pnpm_major, pnpm_include_tarball, pnpm_lookup_registry,
-        registry_derives_tarball, yaml_top_level_value,
+        pnpm_tarball_guess_warning, registry_derives_tarball, yaml_top_level_value,
     };
 
     const HOSTED: &str = "https://patch.test/npm/u/a-1.0.0.tgz";
@@ -1448,7 +1512,61 @@ mod tests {
     }
 
     fn include(text: &str, ws: Option<&str>, rc: Option<&str>, major: Option<u32>) -> bool {
-        pnpm_include_tarball(text, ws, rc, major, |url| url == HOSTED)
+        pnpm_include_tarball(text, ws, rc, major, |url| url == HOSTED).on
+    }
+
+    fn guessed(text: &str, ws: Option<&str>, rc: Option<&str>, major: Option<u32>) -> bool {
+        pnpm_include_tarball(text, ws, rc, major, |url| url == HOSTED).guessed_from_npmrc
+    }
+
+    /// #902 tier 3: with no lock evidence and no pnpm major, `.npmrc`'s
+    /// setting is followed as pnpm 9/10 read it, and flagged as a guess
+    /// exactly when pnpm >= 11 would read it the other way.
+    #[test]
+    fn pnpm_include_tarball_flags_the_npmrc_guess() {
+        let text = lock("");
+        assert!(include(&text, None, Some(RC_ON), None));
+        assert!(guessed(&text, None, Some(RC_ON), None));
+        // pnpm >= 11 agrees: the setting is off, or the workspace file
+        // (which every pnpm >= 10 reads) decides.
+        let rc_off = "lockfile-include-tarball-url=false\n";
+        assert!(!guessed(&text, None, Some(rc_off), None));
+        assert!(!guessed(&text, None, None, None));
+        assert!(!guessed(&text, Some(WS_ON), Some(RC_ON), None));
+        let ws_off = "lockfileIncludeTarballUrl: false\n";
+        assert!(!guessed(&text, Some(ws_off), Some(RC_ON), None));
+        // Evidence: a known pnpm major, a pre-9 lock, lock entries.
+        for major in [9, 10, 11] {
+            assert!(!guessed(&text, None, Some(RC_ON), Some(major)));
+        }
+        assert!(!guessed(
+            &text.replace("'9.0'", "'6.0'"),
+            None,
+            Some(RC_ON),
+            None
+        ));
+        let conventional = "  c@3.0.0:\n    resolution: {integrity: sha512-C==, \
+                            tarball: https://registry.npmjs.org/c/-/c-3.0.0.tgz}\n";
+        assert!(!guessed(&lock(conventional), None, Some(RC_ON), None));
+        // An unconventional sibling is no evidence: still a guess.
+        let cdn = "  d@1.0.0:\n    resolution: {integrity: sha512-D==, \
+                   tarball: https://cdn.example/d.tgz}\n";
+        assert!(guessed(&lock(cdn), None, Some(RC_ON), None));
+        // The warning names the file and setting followed, that pnpm >= 11
+        // ignores it, and both remedies.
+        let detail = pnpm_tarball_guess_warning("apps/web/pnpm-lock.yaml", &["a@1.0.0"]);
+        for needle in [
+            "apps/web/pnpm-lock.yaml: the pnpm version could not be determined",
+            "`lockfile-include-tarball-url=true` in apps/web/.npmrc",
+            "for a@1.0.0;",
+            "pnpm >= 11 ignores that `.npmrc` setting",
+            "`packageManager`",
+            "reinstall",
+            "re-run",
+            "apps/web/pnpm-workspace.yaml as `lockfileIncludeTarballUrl: true`",
+        ] {
+            assert!(detail.contains(needle), "{needle}: {detail}");
+        }
     }
 
     /// #902 tier 1: the lock's unpinned registry resolutions decide.

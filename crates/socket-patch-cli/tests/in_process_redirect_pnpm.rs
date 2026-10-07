@@ -1839,6 +1839,11 @@ async fn hosted_unknown_or_later_pnpm_still_gets_the_trust_scaffold() {
         );
         let warnings = warning_texts(&doc);
         assert!(warnings.contains("`pnpm add -w <pkg>`"), "{warnings}");
+        // ... and the pin that avoids the file on pnpm 9.0–10.4.
+        assert!(
+            warnings.contains("pin that pnpm in package.json `packageManager`"),
+            "{warnings}"
+        );
     }
 }
 

@@ -5107,6 +5107,12 @@ fn write_pnpm_tarball_project(root: &Path, tarball: &str) -> String {
 
 /// Scan hosted, then roll back, and return the restored pnpm-lock.yaml.
 fn pnpm_pin_and_rollback(root: &Path, server: &MockServer) -> String {
+    pnpm_pin_and_rollback_env(root, server).0
+}
+
+/// [`pnpm_pin_and_rollback`], also returning the rollback's `--json`
+/// envelope.
+fn pnpm_pin_and_rollback_env(root: &Path, server: &MockServer) -> (String, serde_json::Value) {
     let env = run_redirect_subprocess(root, &server.uri());
     assert_eq!(env["redirect"]["redirected"], 1, "{env:#}");
     let pinned = std::fs::read_to_string(root.join("pnpm-lock.yaml")).unwrap();
@@ -5118,7 +5124,10 @@ fn pnpm_pin_and_rollback(root: &Path, server: &MockServer) -> String {
         serde_json::json!([PURL]),
         "{env:#}"
     );
-    std::fs::read_to_string(root.join("pnpm-lock.yaml")).unwrap()
+    (
+        std::fs::read_to_string(root.join("pnpm-lock.yaml")).unwrap(),
+        env,
+    )
 }
 
 /// #557: under `.npmrc` `lockfile-include-tarball-url=true` (pnpm 9/10),
@@ -5563,6 +5572,125 @@ async fn pnpm_rollback_follows_lock_evidence_over_an_ignored_setting() {
     )
     .unwrap();
     assert_eq!(pnpm_pin_and_rollback(tmp.path(), &server), lock);
+}
+
+/// Whether a rollback / remove `--json` envelope carries the run-level
+/// warning `code`.
+fn has_unwind_warning(env: &serde_json::Value, code: &str) -> bool {
+    env["warnings"]
+        .as_array()
+        .unwrap()
+        .iter()
+        .any(|w| w["code"] == code)
+}
+
+/// #902: with no evidence of the pnpm version (no unpinned registry entry
+/// in the lock, no install record, no `packageManager` pin), `rollback`
+/// follows pnpm 9/10's reading of `.npmrc`'s
+/// `lockfile-include-tarball-url=true` and writes `tarball:` back, but
+/// warns `upstream_pnpm_tarball_setting_guessed`, since pnpm >= 11 ignores
+/// that setting. Every evidenced reading, and a setting pnpm >= 11 reads
+/// too, restores without the warning.
+#[tokio::test]
+#[serial]
+async fn pnpm_rollback_warns_when_it_guesses_the_npmrc_include_tarball_url() {
+    const CODE: &str = "upstream_pnpm_tarball_setting_guessed";
+    let server = MockServer::start().await;
+    mock_discovery(&server).await;
+    mock_reference(&server).await;
+    mock_view(&server).await;
+    mock_npm_registry(&server, "sha512-UPSTREAMupstream==", None).await;
+    let tarball = format!(
+        "{}/npm-registry/{NAME}/-/{NAME}-{VERSION}.tgz",
+        server.uri()
+    );
+    const RC_ON: &str = "lockfile-include-tarball-url=true\n";
+
+    // The guess: the tarball comes back, and the warning says why.
+    let tmp = tempfile::tempdir().unwrap();
+    let pristine = write_pnpm_tarball_project(tmp.path(), &tarball);
+    std::fs::write(tmp.path().join(".npmrc"), RC_ON).unwrap();
+    let (restored, env) = pnpm_pin_and_rollback_env(tmp.path(), &server);
+    assert_eq!(restored, pristine);
+    let warning = env["warnings"]
+        .as_array()
+        .unwrap()
+        .iter()
+        .find(|w| w["code"] == CODE)
+        .unwrap_or_else(|| panic!("{CODE} expected: {env:#}"));
+    let detail = warning["detail"].as_str().unwrap();
+    let entry = format!("{NAME}@{VERSION}");
+    for needle in [
+        "pnpm-lock.yaml: the pnpm version could not be determined",
+        "`lockfile-include-tarball-url=true` in .npmrc",
+        entry.as_str(),
+        "pnpm >= 11 ignores",
+        "`packageManager`",
+        "pnpm-workspace.yaml as `lockfileIncludeTarballUrl: true`",
+    ] {
+        assert!(detail.contains(needle), "{needle}: {detail}");
+    }
+
+    // Evidence of a pnpm that reads `.npmrc` (a pnpm 10 install record or
+    // corepack pin): the same restore, no guess.
+    let tmp = tempfile::tempdir().unwrap();
+    let pristine = write_pnpm_tarball_project(tmp.path(), &tarball);
+    std::fs::write(tmp.path().join(".npmrc"), RC_ON).unwrap();
+    write_pnpm_modules_json(tmp.path(), "10.12.1");
+    let (restored, env) = pnpm_pin_and_rollback_env(tmp.path(), &server);
+    assert_eq!(restored, pristine);
+    assert!(!has_unwind_warning(&env, CODE), "{env:#}");
+
+    let tmp = tempfile::tempdir().unwrap();
+    let pristine = write_pnpm_tarball_project(tmp.path(), &tarball);
+    std::fs::write(tmp.path().join(".npmrc"), RC_ON).unwrap();
+    std::fs::write(
+        tmp.path().join("package.json"),
+        format!(
+            r#"{{ "name": "consumer", "version": "0.0.0", "packageManager": "pnpm@9.15.9", "dependencies": {{ "{NAME}": "{VERSION}" }} }}"#
+        ),
+    )
+    .unwrap();
+    let (restored, env) = pnpm_pin_and_rollback_env(tmp.path(), &server);
+    assert_eq!(restored, pristine);
+    assert!(!has_unwind_warning(&env, CODE), "{env:#}");
+
+    // pnpm 11 installed it: `.npmrc` is ignored, the lock stays bare.
+    let tmp = tempfile::tempdir().unwrap();
+    write_pnpm_project(tmp.path());
+    write_pnpm_modules_json(tmp.path(), "11.28.3");
+    std::fs::write(tmp.path().join(".npmrc"), RC_ON).unwrap();
+    let pristine = std::fs::read_to_string(tmp.path().join("pnpm-lock.yaml")).unwrap();
+    let (restored, env) = pnpm_pin_and_rollback_env(tmp.path(), &server);
+    assert_eq!(restored, pristine);
+    assert!(!has_unwind_warning(&env, CODE), "{env:#}");
+
+    // The lock's own bare registry entry proves the setting off.
+    let tmp = tempfile::tempdir().unwrap();
+    write_pnpm_project(tmp.path());
+    let lock = rush_pnpm_lock(NAME).replace(
+        "\nsnapshots:\n",
+        "  other-dep@2.0.0:\n    resolution: {integrity: sha512-OTHERother==}\n\n\
+             snapshots:\n",
+    ) + "  other-dep@2.0.0: {}\n";
+    std::fs::write(tmp.path().join("pnpm-lock.yaml"), &lock).unwrap();
+    std::fs::write(tmp.path().join(".npmrc"), RC_ON).unwrap();
+    let (restored, env) = pnpm_pin_and_rollback_env(tmp.path(), &server);
+    assert_eq!(restored, lock);
+    assert!(!has_unwind_warning(&env, CODE), "{env:#}");
+
+    // The workspace file, which every pnpm >= 10 reads, sets it: no guess.
+    let tmp = tempfile::tempdir().unwrap();
+    let pristine = write_pnpm_tarball_project(tmp.path(), &tarball);
+    std::fs::write(
+        tmp.path().join("pnpm-workspace.yaml"),
+        "packages:\n  - '.'\nlockfileIncludeTarballUrl: true\n",
+    )
+    .unwrap();
+    std::fs::write(tmp.path().join(".npmrc"), RC_ON).unwrap();
+    let (restored, env) = pnpm_pin_and_rollback_env(tmp.path(), &server);
+    assert_eq!(restored, pristine);
+    assert!(!has_unwind_warning(&env, CODE), "{env:#}");
 }
 
 /// #417: hosted `scan` from a cargo workspace MEMBER treated it as a

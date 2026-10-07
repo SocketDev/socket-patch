@@ -261,12 +261,21 @@ pub fn pnpm_trust_configured_detail(server: &str, created: bool, dry_run: bool) 
     };
     // A created file makes the project a root-only workspace, where pnpm
     // 9.0–10.4 refuse `pnpm add` without `-w` (#734); a project pinned to
-    // those releases never gets one.
+    // those releases never gets one, so the note names the pin as the way
+    // out for an unpinned project with no install record.
     let root_only = if created {
-        " On pnpm 9.0–10.4 a root-only workspace needs `pnpm add -w <pkg>` \
-         to add dependencies."
+        let then = if dry_run {
+            "before the real run".to_string()
+        } else {
+            format!("then delete {PNPM_WORKSPACE_REL} and re-run")
+        };
+        format!(
+            " On pnpm 9.0–10.4 a root-only workspace needs `pnpm add -w <pkg>` \
+             to add dependencies; to avoid the file there, pin that pnpm in \
+             package.json `packageManager`, {then}."
+        )
     } else {
-        ""
+        String::new()
     };
     format!(
         "{}, so {how} {PNPM_WORKSPACE_REL} — commit it alongside the lock; \
@@ -514,6 +523,34 @@ pub fn read_npmrc_for_allow_remote(path: &std::path::Path) -> Result<Option<Stri
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    /// #734: a created root-only scaffold's detail keeps the `pnpm add -w`
+    /// caveat and names the `packageManager` pin that avoids the file on
+    /// pnpm 9.0–10.4; a merge into an existing file says neither.
+    #[test]
+    fn trust_scaffold_detail_names_the_add_caveat_and_the_pin_remedy() {
+        for dry_run in [false, true] {
+            let detail = pnpm_trust_configured_detail("patch.test", true, dry_run);
+            assert!(detail.contains("`pnpm add -w <pkg>`"), "{detail}");
+            assert!(
+                detail.contains(
+                    "to avoid the file there, pin that pnpm in package.json `packageManager`"
+                ),
+                "{detail}"
+            );
+            assert_eq!(
+                detail.contains(&format!("delete {PNPM_WORKSPACE_REL} and re-run")),
+                !dry_run,
+                "{detail}"
+            );
+            // No `@` (no `pnpm@x.y.z` example): the trust warning's
+            // no-userinfo-leak check rejects any.
+            assert!(!detail.contains('@'), "{detail}");
+        }
+        let merged = pnpm_trust_configured_detail("patch.test", false, false);
+        assert!(!merged.contains("pnpm add -w"), "{merged}");
+        assert!(!merged.contains("packageManager"), "{merged}");
+    }
 
     /// #904 (hosted): a BOM-prefixed `trustLockfile:` first line is the
     /// user's explicit setting — kept, never shadowed by an appended
