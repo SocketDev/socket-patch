@@ -397,6 +397,62 @@ async fn requirements_sole_pin_vendored_to_hosted() {
     assert_vendored_to_hosted(&root, &["requirements.txt"]).await;
 }
 
+/// #410: a requirements.txt in which every requirement is the hosted pin
+/// (a lone `six==1.16.0`, or one beside `-e .`) can be unwound again.
+/// Hosted `rollback`, `remove` and the hosted → vendored takeover restore
+/// the pin to its unhashed registry spelling. Before the fix they all
+/// refused: no other line said whether the original used `--hash`.
+async fn assert_all_hosted_requirements_unwind(pristine: &str) {
+    let server = MockServer::start().await;
+    let hosted_url = mount_hosted_api(&server, true).await;
+    let uri = server.uri();
+    for unwind in [
+        vec!["rollback", "--yes", "--offline"],
+        vec!["remove", PURL, "--yes", "--offline"],
+        // The fixture server builds the vendored wheel.
+        vec!["vendor"],
+    ] {
+        let (_tmp, root) = project();
+        std::fs::write(root.join("requirements.txt"), pristine).unwrap();
+        let (code, env) = hosted_scan(&root, &server);
+        assert_eq!(code, 0, "hosted scan: {env:#}");
+        assert_eq!(env["redirect"]["redirected"], 1, "{env:#}");
+        let wired = std::fs::read_to_string(root.join("requirements.txt")).unwrap();
+        assert!(wired.contains(&hosted_url), "hosted first:\n{wired}");
+
+        if unwind[0] == "vendor" {
+            stage_manifest(&root);
+            // `--patch-server-url` (which names the hosted origin to take
+            // over) also moves the vendored download onto this server.
+            prebuilt_common::mount_project(&server, &root).await;
+        }
+        let mut args = unwind.clone();
+        args.extend(["--patch-server-url", uri.as_str()]);
+        let (code, env) = run_cli(&root, &args, &[]);
+        assert_eq!(code, 0, "{unwind:?} over {pristine:?}: {env:#}");
+        let after = std::fs::read_to_string(root.join("requirements.txt")).unwrap();
+        if unwind[0] == "vendor" {
+            assert!(
+                after.contains(&format!(".socket/vendor/pypi/{UUID}/"))
+                    && !after.contains(&hosted_url),
+                "the takeover leaves the project vendored:\n{after}"
+            );
+        } else {
+            assert_eq!(after, pristine, "{unwind:?} restores the pristine file");
+        }
+    }
+}
+
+#[tokio::test]
+async fn requirements_sole_hosted_pin_unwinds() {
+    assert_all_hosted_requirements_unwind("six==1.16.0\n").await;
+}
+
+#[tokio::test]
+async fn requirements_editable_beside_hosted_pin_unwinds() {
+    assert_all_hosted_requirements_unwind("-e .\nsix==1.16.0\n").await;
+}
+
 /// A Poetry project; returns its wiring files.
 fn stage_poetry(root: &Path) -> &'static [&'static str] {
     std::fs::write(
