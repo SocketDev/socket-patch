@@ -152,6 +152,17 @@ impl Commands {
             Commands::HostedBundle(a) => &a.common,
         }
     }
+
+    /// Validate the run's path flags ([`args::GlobalArgs::validate_paths`])
+    /// for every command that reads the project. `self-update` and the
+    /// internal `hosted-bundle` harness (stdin in, stdout out) never touch
+    /// `--cwd`, so an ambient `SOCKET_CWD` must not fail them.
+    pub fn validate_paths(&self) -> Result<(), String> {
+        match self {
+            Commands::SelfUpdate(_) | Commands::HostedBundle(_) => Ok(()),
+            other => other.global_args().validate_paths(),
+        }
+    }
 }
 
 /// Global options every subcommand's short help (`-h`) still lists; the
