@@ -3775,7 +3775,7 @@ fn yarn_berry_tarball_url_ok(url: &str) -> bool {
 /// compares the file with its own majority-normalized re-render and fails
 /// (YN0028), while a plain install rewrites every minority line — so it is
 /// refused untouched, `yarn install` normalizes it first.
-pub(crate) fn preflight_yarn_berry_hosted(
+pub fn preflight_yarn_berry_hosted(
     lock: &str,
     manifest: Option<&str>,
     yarnrc: Option<&str>,

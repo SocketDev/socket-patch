@@ -19,7 +19,9 @@
 //!    no ledger entry).
 //! 2. [`Takeover::stage`] reverts each purl into the overlay, under a
 //!    savepoint: a revert that fails or keeps drifted wiring is rolled back
-//!    and refused. The artifact deletions wait for the commit
+//!    and refused. A yarn-berry entry is first checked against the berry
+//!    project gates on the pre-revert project (its revert re-renders
+//!    `package.json`). The artifact deletions wait for the commit
 //!    ([`GroupCommit::defer_removals`]).
 //! 3. The hosted rewrite reads the overlay, so it plans against the
 //!    reverted project. A staged purl it does not pin is RETRACTED
@@ -202,7 +204,22 @@ impl Takeover {
         candidates: &mut Vec<Candidate>,
         skipped: &mut Vec<SkippedPatch>,
     ) {
+        // Judged once, before any revert of this pass (`stage` runs on the
+        // pre-takeover overlay, a retraction having rolled back to it).
+        let berry_gate = if self.attempts.iter().any(|(_, _, e)| is_berry_entry(e)) {
+            berry_project_gate(common).await
+        } else {
+            None
+        };
         for (purl, uuid, entry) in std::mem::take(&mut self.attempts) {
+            if let Some(gate) = berry_gate.as_ref().filter(|_| is_berry_entry(&entry)) {
+                self.warnings
+                    .push(serde_json::json!({ "code": &gate.code, "detail": &gate.detail }));
+                self.warnings.push(kept_vendored(&purl, &gate.code));
+                skipped.push(SkippedPatch::new(&purl, &uuid, &gate.code));
+                candidates.retain(|c| c.purl != purl);
+                continue;
+            }
             let savepoint = group.savepoint();
             let outcome =
                 crate::commands::vendor::dispatch_revert_one(&entry, &common.cwd, false).await;
@@ -299,15 +316,7 @@ impl Takeover {
                     code
                 }
             };
-            self.warnings.push(serde_json::json!({
-                "code": KEPT_VENDORED,
-                "detail": format!(
-                    "{} is vendored, but hosted mode would not pin it ({code}); it stays \
-                     vendored — its vendored wiring, ledger entry and artifact are \
-                     untouched",
-                    staged.purl
-                ),
-            }));
+            self.warnings.push(kept_vendored(&staged.purl, &code));
             candidates.retain(|c| c.dep.patch_uuid != staged.uuid);
         }
         self.stage(common, group, candidates, skipped).await;
@@ -397,6 +406,50 @@ fn explain(
         Some(w) => (w.code.clone(), vec![w.clone()]),
         None => (NOT_PINNED.to_string(), Vec::new()),
     }
+}
+
+/// The [`KEPT_VENDORED`] warning for `purl`, naming the `code` that kept it.
+fn kept_vendored(purl: &str, code: &str) -> serde_json::Value {
+    serde_json::json!({
+        "code": KEPT_VENDORED,
+        "detail": format!(
+            "{purl} is vendored, but hosted mode would not pin it ({code}); it stays \
+             vendored — its vendored wiring, ledger entry and artifact are untouched"
+        ),
+    })
+}
+
+/// A vendored entry wired through the yarn-berry backend.
+fn is_berry_entry(entry: &VendorEntry) -> bool {
+    entry.ecosystem == "npm" && entry.flavor.as_deref() == Some("yarn-berry")
+}
+
+/// The yarn berry project gates (lock and root `package.json` line endings,
+/// `cacheKey`, `.yarnrc.yml` `compressionLevel`), judged on the project as
+/// it is BEFORE any yarn-berry entry's revert. The revert re-renders
+/// `package.json` in its majority line ending, so a mixed manifest would
+/// pass the hosted rewriter's own check afterwards, while both modes refuse
+/// to rewrite a mixed one (#628): the takeover keeps such a package
+/// vendored. The gate itself is the rewriter's
+/// (`preflight_yarn_berry_hosted`, over the shared `berry_gates`).
+async fn berry_project_gate(common: &crate::args::GlobalArgs) -> Option<RewriteWarning> {
+    use socket_patch_core::utils::fs::read_regular_to_string;
+    // An unreadable lock is left to the revert's own diagnostics.
+    let lock = read_regular_to_string(&common.cwd.join("yarn.lock"))
+        .await
+        .ok()?;
+    let manifest = read_regular_to_string(&common.cwd.join("package.json"))
+        .await
+        .ok();
+    let yarnrc = read_regular_to_string(&common.cwd.join(".yarnrc.yml"))
+        .await
+        .ok();
+    socket_patch_core::patch::redirect::preflight_yarn_berry_hosted(
+        &lock,
+        manifest.as_deref(),
+        yarnrc.as_deref(),
+    )
+    .err()
 }
 
 /// Whether `detail` names the package `name` as a whole word.
