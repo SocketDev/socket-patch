@@ -2,7 +2,7 @@
 
 ## Part 8: Tests, CI, docs and distribution
 
-_Last checked against main @ 431b818 on 2026-10-07 by the October 7 reconciliation (8.2 compile count, e2e legs, compat workflows, the coverage legs' gating role, and recommendation B). Owner: audit-core._ Earlier: `c5be5d1` by audit-core. Re-checked on `c5be5d1` (15:50Z run): the covgap counts and the contract size. Re-checked on `9c43dfc` (09:56Z run): the `#[ignore]` reasons across both crates (a RED/gap test has no CI leg). Only the repository-hygiene passages (stray `launch.json`, "DESIGN §" references), §8.3's `CLI_CONTRACT.md` measurements and guards, the contract's argument and env-var tables, the test-binary and covgap counts, the `#[serial]` count and the duplicated-helper counts have been re-checked; the rest is as of `2463257`.
+_Last checked against main @ 05ecc6e on 2026-10-07 by audit-core. Owner: audit-core._ Re-checked on `05ecc6e` (21:40Z run): the covgap counts, the sentence-assertion count, the test-binary count, the stray `launch.json` and the 39 "DESIGN §" references (unchanged), and #1018's merge. Earlier: `431b818` by the October 7 reconciliation (8.2 compile count, e2e legs, compat workflows, the coverage legs' gating role, and recommendation B); `c5be5d1` by audit-core. Re-checked on `c5be5d1` (15:50Z run): the covgap counts and the contract size. Re-checked on `9c43dfc` (09:56Z run): the `#[ignore]` reasons across both crates (a RED/gap test has no CI leg). Only the repository-hygiene passages (stray `launch.json`, "DESIGN §" references), §8.3's `CLI_CONTRACT.md` measurements and guards, the contract's argument and env-var tables, the test-binary and covgap counts, the `#[serial]` count and the duplicated-helper counts have been re-checked; the rest is as of `2463257`.
 
 > Scope: `crates/*/tests/**`, `tests/` (docker fixtures), `.github/workflows/*`, `.github/actions/*`, `scripts/`, `docs/`, `CLI_CONTRACT.md`, `CHANGELOG.md`, `npm/`, `crates/socket-patch-node/npm/`, and the Cargo profiles. CI timings come from the GitHub Actions run for `2463257` on `main`.
 
@@ -18,7 +18,7 @@ PR #277 has already started cleaning up: it deleted 237,608 lines, including 136
 
 - **Ratio:** roughly 2.7 test lines per production line overall, and **about 7:1 for the CLI crate** (235.6K integration lines against 33.7K production lines).
 - **Test counts:** ~2,753 CLI integration tests, 523 core integration tests and 5,442 inline tests. 242 are `#[ignore]`-gated.
-- **207 test executables per `cargo test --workspace`** at the review; **224** on `9c43dfc` (189 CLI, 35 core). {{C31}} There are no `[[test]]` entries, so every file links its own binary. The repo's own comments disagree on the count ("~240" in `ci.yml`, 159 in `Cargo.toml`, "~90" in `.cargo/config.toml`).
+- **207 test executables per `cargo test --workspace`** at the review; **235** on `05ecc6e` (199 CLI, 36 core; 224 on `9c43dfc`). {{C31}} There are no `[[test]]` entries, so every file links its own binary. The repo's own comments disagree on the count ("~240" in `ci.yml`, 159 in `Cargo.toml`, "~90" in `.cargo/config.toml`).
 - **Disk cost:** `Cargo.toml` notes that macOS split-debuginfo "grew target/ to 99 GB".
 - **Docker binaries are always linked.** The 14 `docker_e2e_*.rs` files are gated with `#![cfg(feature = "docker-e2e")]`, so they still compile and link as empty binaries on every default run.
 
@@ -39,12 +39,12 @@ PR #277 has already started cleaning up: it deleted 237,608 lines, including 136
 - `vex_pdm_hatch_common` and `vex_pipenv_pip_common` share **977 identical non-blank lines** (78% similar).
 
 **Coverage-chasing tests.**
-- 32 `covgap_*`/`coverage_fix_*` files hold 27,570 lines and 415 tests (on `c5be5d1`; the review counted 26,916 and 402). {{C32}} 136 of those test names are about human output (`human`, `message`, `prints`, `summary`, …).
+- 27 `covgap_*`/`coverage_fix_*` files hold 26,086 lines and 391 tests on `05ecc6e` (32 files, 27,570 lines and 415 tests on `c5be5d1`; the review counted 26,916 and 402). {{C32}} 136 of those test names are about human output (`human`, `message`, `prints`, `summary`, …).
 - 43 test files import `socket_patch_cli::commands::*` internals, which only works because `lib.rs` makes `commands` `pub`.
 - The coverage job does not gate anything ("No threshold gating").
 - In fairness, the sweep that produced them found 39 real bugs (#236). **Keep the regressions, rename them by behavior, and drop the rest.**
 
-**Exact human-text assertions.** 328 `.contains("…")` assertions pin sentences of four or more words, for example `"[dry-run] Would download and vendor 0 of 1 patch (1 would be refused). No changes made."`. The repo has no snapshot tooling. The output-polish PR (#248) had to touch **65 test files (4,346 lines)**.
+**Exact human-text assertions.** 328 `.contains("…")` assertions pin sentences of four or more words at the review (about 478 one-line ones on `05ecc6e` by a looser count, 245 of them in the covgap files; tracked phase by phase in {{C32}}), for example `"[dry-run] Would download and vendor 0 of 1 patch (1 would be refused). No changes made."`. The repo has no snapshot tooling. The output-polish PR (#248) had to touch **65 test files (4,346 lines)**.
 
 **Process-global env forces serialization.** `args.rs` mirrors flags into process env (see Part 2.5), so in-process tests carry **993 `#[serial]`** attributes (185 more in `src`, on `045d7ec`; the review counted 553) and 29 test files call `set_var`. That is the main obstacle to merging binaries. CI uses no nextest, mold/lld or sccache.
 
@@ -145,7 +145,7 @@ For `2463257` on `main`:
 
 ### New findings since the review
 
-- {{C67}} October 7: `main` went red for every PR because three stale `PENDING_INLINE_DIGESTS` entries tripped a two-sided ratchet after a merge burst (fixed by #1016). Nothing required checks on `main`, and push CI cancelled about 87% of `main` verdicts; #1018 runs CI on a merge queue with per-SHA push concurrency (the ruleset itself needs an org admin).
+- {{C67}} October 7: `main` went red for every PR because three stale `PENDING_INLINE_DIGESTS` entries tripped a two-sided ratchet after a merge burst (fixed by #1016). Nothing required checks on `main`, and push CI cancelled about 87% of `main` verdicts; #1018 (merged) runs CI on a merge queue with per-SHA push concurrency; the ruleset with required checks still needs an org admin.
 - {{C66}} October 7: test children sent telemetry to production, the e2e zero-tests guard covered Gradle only, and the Windows npm leg ran nothing (PR #1046).
 
 - {{C56}} {{C57}} Known bugs are pinned as `#[ignore = "RED: …"]` tests with no issue and no CI leg: #708 added two (`apply_with_unreadable_socket_dir_fails_closed`, `remove_by_uuid_reverts_vendoring_when_ledger_generation_is_older`); both bugs reproduce on `9c43dfc` and are now filed. A third ignored test, `crawler_monorepo_gaps`, documents a contract gap. A RED test should land with its issue number in the ignore reason.

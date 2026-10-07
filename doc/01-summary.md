@@ -96,7 +96,7 @@
 |---|---|
 | Production code (non-blank, non-comment) | **134.5K lines** in `socket-patch-core` + `socket-patch-cli` on `9c43dfc` (2026-10-06; the same script gives 117.8K at the snapshot, which the review reported as 117.6K + 34.8K comment + 9K blank). The growth is mostly the Gradle landing (#646) |
 | Inline `#[cfg(test)]` code in `src/` | ~228K lines on `9c43dfc` (~197K at the snapshot) |
-| Integration tests (`crates/*/tests`) | ~283K lines in **224 separate test executables** in core + CLI (top-level files plus directory binaries; recounted at `9c43dfc`, 2026-10-06; ~255K at the snapshot) |
+| Integration tests (`crates/*/tests`) | ~296K lines in **235 separate test executables** in core + CLI (36 core, 199 CLI: top-level files plus directory binaries; recounted at `05ecc6e`, 2026-10-07; 224 and ~283K at `9c43dfc`; ~255K at the snapshot) |
 | Test : production ratio | ~2.8 : 1 overall; ~7 : 1 for the CLI crate |
 | Largest file | `patch/redirect/mod.rs`: 21,936 lines at `db83f01` (2026-10-07; 7.6K production, 14.3K inline tests; 17,517 at the snapshot, 6.2K production then) |
 | Functions > 200 / > 500 lines | 74 / 11 at `1c6c509` (61 / 9 at the snapshot: `run_scan` 1,540 on `045d7ec`, now 1,577; `rollback::run` 984, `vendor_records_reusing` 962, `run_redirect_selected` 836, `remove::run` 797, `get::run` 635, memory `engine` 604, …) |
@@ -104,7 +104,7 @@
 | `--help` | 150–219 lines per subcommand; `list --help` lists 27 options, most of which do nothing for `list` |
 | CI per push | ~516 jobs; the CI workflow alone is 237 jobs and 348 runner-minutes; Windows `test` is the 28-minute critical path |
 | `CLI_CONTRACT.md` | 417 KB at `431b818` (2026-10-07; 415 KB at `c5be5d1`, 332 KB at the snapshot); the longest *line* is 12,077 characters at `c5be5d1` |
-| Open issues | About 304 on 2026-10-07 after the October 7 campaign (~194 `bughunt`, ~94 `arch-audit` before nine new `arch-audit` issues #1061–#1069). At the snapshot: 88, filed mostly in the last 5 days by a bug hunt; JS 26, JVM 22, Python 18, Go 6, Cargo 5, NuGet 5, Ruby 3, Composer 3 |
+| Open issues | About 322 on 2026-10-07 at 22:30Z (~198 `bughunt`, ~107 `arch-audit`). At the snapshot: 88, filed mostly in the last 5 days by a bug hunt; JS 26, JVM 22, Python 18, Go 6, Cargo 5, NuGet 5, Ruby 3, Composer 3 |
 | PR size | Recent squash merges of +53K, +85K and +94K lines |
 
 ---
