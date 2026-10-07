@@ -522,9 +522,9 @@ async fn live_pipfile_lock_conflict_vetoes_the_requirements_redirect() {
 
 /// #932: a patch granted as a platform-tagged wheel (cp311 manylinux) is
 /// never pinned into the cross-platform Pipfile.lock, nor into the sibling
-/// requirements.txt: the run leaves both files alone, exits 0 like every
+/// requirements.txt: the run leaves both files alone and exits 0 like every
 /// hosted refusal (the `redirect_pypi_platform_wheel` warning says why),
-/// and its same-run VEX never attests the unpinned patch.
+/// and a same-run VEX never attests the unpinned patch.
 #[tokio::test]
 #[serial]
 async fn platform_wheel_is_not_pinned_into_the_lock() {
@@ -539,14 +539,18 @@ async fn platform_wheel_is_not_pinned_into_the_lock() {
     write_project(tmp.path());
     const REQS: &str = "urllib3==1.26.18\n";
     std::fs::write(tmp.path().join("requirements.txt"), REQS).unwrap();
-    let vex_path = tmp.path().join("out.vex.json");
-
-    let code = run(hosted_args(tmp.path(), server.uri(), Some(&vex_path))).await;
+    let code = run(hosted_args(tmp.path(), server.uri(), None)).await;
     assert_eq!(code, 0, "a hosted refusal exits 0 with a warning");
     assert_eq!(read(&tmp.path().join("Pipfile.lock")), LOCK);
     assert_eq!(read(&tmp.path().join("requirements.txt")), REQS);
     assert_eq!(read(&tmp.path().join("Pipfile")), PIPFILE);
     assert_no_ledger(tmp.path());
+
+    // With nothing pinned, a same-run `--vex` has nothing to attest (it
+    // fails `manifest_not_found`) and never claims the patch.
+    let vex_path = tmp.path().join("out.vex.json");
+    run(hosted_args(tmp.path(), server.uri(), Some(&vex_path))).await;
+    assert_eq!(read(&tmp.path().join("Pipfile.lock")), LOCK);
     if vex_path.exists() {
         let vex = read(&vex_path);
         assert!(!vex.contains("not_affected"), "{vex}");
