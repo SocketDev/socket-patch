@@ -64,6 +64,9 @@ pub const LINKED_SOURCE_REFUSAL_MARKER: &str = "outside every node_modules tree"
 /// [`SharedStoreKind::OutsideInstallTree`]).
 pub const OUTSIDE_INSTALL_TREE_REFUSAL_MARKER: &str = "outside the install tree";
 
+/// The `action` [`SharedStore::refusal`] is given by rollback.
+pub const ROLL_BACK_ACTION: &str = "roll back";
+
 /// A cross-project store a package directory resolves into.
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub enum SharedStoreKind {
@@ -104,14 +107,23 @@ impl SharedStore {
                 "set enableGlobalVirtualStore to false and reinstall",
             ),
             SharedStoreKind::OutsideInstallTree => {
+                // A rollback has nothing to "patch directly": the bytes an
+                // older in-place patch wrote there come back from the
+                // source's own history.
+                let remedy = if action == ROLL_BACK_ACTION {
+                    "Restore that source from version control (for example `git checkout \
+                     -- <file>` in its repository) instead"
+                } else {
+                    "Patch that source directly, or install the package as a copy (for \
+                     Composer, set the path repository's `symlink` option to false)"
+                };
                 return format!(
                     "Refusing to {action} {path}: it is reached through a link and lies \
                      {OUTSIDE_INSTALL_TREE_REFUSAL_MARKER} it was installed into (a Composer \
-                     path repository, a `--symlink` install or another linked source \
-                     directory), so it is first-party source that no reinstall restores, \
-                     not an installed copy of the registry package. Patch that source \
-                     directly, or install the package as a copy (for Composer, set the path \
-                     repository's `symlink` option to false)",
+                     path repository, a `--symlink` install, a package manager linking it \
+                     in from its own prefix, or another linked source directory), so it is \
+                     not an installed copy of the registry package that socket-patch owns. \
+                     {remedy}",
                     path = self.real_path.display(),
                 );
             }
@@ -838,6 +850,15 @@ mod tests {
         assert!(got
             .refusal("patch")
             .contains(OUTSIDE_INSTALL_TREE_REFUSAL_MARKER));
+        // A rollback is told to restore the source from its history, not
+        // to "patch that source directly".
+        let rollback = got.refusal(ROLL_BACK_ACTION);
+        assert!(
+            rollback.contains(OUTSIDE_INSTALL_TREE_REFUSAL_MARKER),
+            "{rollback}"
+        );
+        assert!(rollback.contains("version control"), "{rollback}");
+        assert!(!rollback.contains("Patch that source"), "{rollback}");
 
         let installed = vendor.join("acme/real");
         std::fs::create_dir_all(installed.join("src")).unwrap();

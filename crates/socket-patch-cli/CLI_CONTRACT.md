@@ -598,6 +598,17 @@ the purl its own `package.json` names, so `apply`, `rollback` and `vex` cover `n
 beside any plain `node_modules/left-pad` copy. Only real package dirs count: a link is a dependency
 edge, never an alias copy of its own.
 
+### Links under `.socket/` and write containment (v5.0)
+
+socket-patch creates `.socket/` and everything under it itself and never writes a symlink or junction there, so a linked level below the project root is never its own. The rules below share one check (core `utils::containment`); each refusal names the linked path and carries the substring `is a symlink`. Levels at or above the project path (a symlinked home directory, `/tmp -> /private/tmp`) are never checked.
+
+- **Blob and diff cache writes** (agent-mode `get`, `scan --apply`, `apply` and `repair` downloads, and `rollback`'s before-blob fetch): a linked `.socket/blobs` or `.socket/diffs`, or a linked `.socket/blobs/<hash>` entry, is refused before anything is written. That blob is reported failed (a `get` patch fails as a whole, and its own new blobs are unwound); nothing is written at the link's target. A project that pointed `.socket/blobs` at a shared cache must replace the link with a real directory.
+- **Inline blobs in `get`**: a patch view's `blobContent` / `beforeBlobContent` must hash (git-sha256) to the `afterHash` / `beforeHash` it is stored under, or the patch fails with `content hash mismatch: content hashes to <actual>` before anything is written, the same rule a downloaded blob is held to. An existing blob that already verifies is never rewritten; every blob is staged and renamed into place, never truncated in place.
+- **Ledgers**: the vendored ledger (`.socket/vendor/state.json`) and the pre-v5 hosted redirect ledger are refused when `.socket` itself, a directory below it or the ledger file is a link (`vendor_dir_symlink_unsupported` for the vendored flows), so a hosted run that still has to update a pre-v5 redirect ledger fails under a linked `.socket`.
+- **Agent-mode apply and rollback outside the install tree**: `apply` and `rollback` (dry run included) refuse a package whose written directories resolve outside the install tree they were found in: a Composer path repository (`vendor/<ns>/<name>` linked to first-party source), a `flit install --symlink` / editable-by-link package, or a package directory a package manager links into `site-packages` from its own prefix (Homebrew's Cellar, a Nix store path). The per-package error carries `outside the install tree`. For `apply` the remedy is to patch that source directly or install the package as a copy; for `rollback` it is to restore that source from version control, since socket-patch does not write into a tree it does not own.
+
+Not covered: the agent-mode blob cache and manifest are checked from `.socket` down, so a `.socket` that is itself a link still redirects those writes (deciding that at lock time is deferred).
+
 ## Vendor command contract
 
 `vendor` is `apply`'s committable sibling: instead of patching installed packages in place

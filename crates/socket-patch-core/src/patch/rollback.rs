@@ -552,7 +552,7 @@ async fn rollback_package_patch_at(
         )
         .await
         {
-            result.error = Some(store.refusal("roll back"));
+            result.error = Some(store.refusal(crate::patch::shared_store::ROLL_BACK_ACTION));
             return result;
         }
     }

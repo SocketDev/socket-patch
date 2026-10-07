@@ -240,7 +240,12 @@ linked from `site-packages` into its source is refused), and a Composer
 package must resolve inside its vendor dir: a Composer path repository
 symlinks `vendor/<ns>/<name>` to your own source by default, and that
 source is patched directly, or installed as a copy with the repository's
-`symlink` option set to `false`.
+`symlink` option set to `false`. A package that a package manager links into
+`site-packages` from its own prefix (Homebrew links formula Python packages
+in from the Cellar, Nix from the store) resolves outside the install tree
+too and is refused the same way; install it into a virtualenv to patch it.
+`rollback` refuses the same directories: a file an older socket-patch
+patched in place there is restored from that source's version control.
 
 Every command that looks for installed npm copies walks these same trees, not
 only `scan`. A package installed only under a pruned directory is therefore
