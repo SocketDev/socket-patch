@@ -1,6 +1,6 @@
 [agent] Progress ledger for the scheduled Bundler (RubyGems) bug-hunt routine (label pm:bundler).
 
-Last updated: 2026-10-07 (run 28), main `9c43dfc` (includes #637, #621, #797, #805, #849, #731, #750, #712), latest release tag v4.0.0. Newest Bundler tested: 4.1.0.beta1 (repo gem e2e suites pass).
+Last updated: 2026-10-07 (run 29), main `d47eab3` (now includes #684 → #681, #776 → #775, #875 → #826, #916 → #915, #968 → #967, plus #637, #621, #797, #805, #849, #731, #750, #712), latest release v4.0.0 (npm; no git tags). Newest Bundler tested: 4.1.0.beta1 (no newer release as of 2026-10-07).
 
 ## Coverage matrix
 
@@ -252,6 +252,21 @@ Also on 4.0.17: BOM `Gemfile` passes; symlinked `Gemfile` / lock is refused (pas
 | Hosted transitive via `git:` gem: cycle + `rollback` | pass (lock byte-identical) | — |
 | Agent env `BUNDLE_PATH='~/x'` | pass | — |
 
+### Run 29 (main `d47eab3`; Linux Ruby 3.3.6; hosted mock + real rubygems.org upstream, agent hand-written manifest)
+
+| Cell | 4.0.22 | 2.6.9 |
+| --- | --- | --- |
+| Re-triage #951 agent shape (`BUNDLE_PATH: .gems # comment`) | still fails #951 | — |
+| Re-triage #952 agent shape (`BUNDLE_GEMFILE=gemfiles/alt.gemfile`) | still fails #952 | — |
+| Hosted: `~> 1.0` locked at 1.1.0, 0.8.1 only in the shared system gem home | **fail #1055** (×2; also v4.0.0) | **fail #1055** |
+| Hosted: same, transitive via a path gem (`~> 1.0`) | **fail #1055** (unresolvable) | — |
+| Hosted unwind: gem inside `source "https://rubygems.org" do` (4 shapes), `rollback` and `remove` | **fail #1056** (×2) | **fail #1056** |
+| Hosted cycle + rollback: prerelease `1.0.0.pre.1` | pass | — |
+| Hosted cycle + rollback: `ruby "3.3.6"` / `ruby file:` / `# frozen_string_literal` / trailing `;` / `; # c` (#875) | pass | — |
+| Hosted cycle + rollback: `install_if` / `platforms` / `group :a, :b` / `env` blocks | pass (lock byte-restored) | — |
+| Hosted: `source: "https://rubygems.org"` option | pass (refused, documented) | — |
+| Repo gem e2e suites | pass (redirect 32 / vendor 22 / stale 33) | — |
+
 ### Global mode (`-g`)
 
 | OS | Ruby / Bundler | `scan -g` report | `-g` vs project scoping | `scan -g --mode hosted` refused | `get -g` / `apply -g` | `rollback -g` byte-exact | `vex -g` | `--global-prefix <gems dir>` / `SOCKET_GLOBAL=1` | Non-writable gem dir |
@@ -274,14 +289,13 @@ Also on 4.0.17: BOM `Gemfile` passes; symlinked `Gemfile` / lock is refused (pas
 
 ## Backlog
 
-1. Re-run #681 / #729 / #749 / #751 / #775 / #826 / #896 / #915 / #951 / #952 / #967 / #985 / #1001 when fixes merge (open PRs #684, #768, #776, #875, #916, #953, #968). #875 head `5b9953d3` already passes every #826 shape. #953 head `52542db` fixes the #951 agent shape. #968 head `25e3ca6` fixes #967 in agent mode and in the hosted stale guard, but not #1001. #916 covers the `to_bool` spellings and the hosted stale guard. #776 covers every vendored-refused block shape. #684 head `0e1e6cda` misses 4.1's quoted URL-scoped mirror keys.
-2. #1001 neighbours: `path.system: false` / `disable_shared_gems true`, `deployment true` without `path`, and a global-tier `path` with the stale guard.
-3. #985 neighbours: `get <uuid> --mode hosted` and H→V takeover on the gemspec dev-dep shape (`rollback` passes, run 28).
-4. #952 neighbours: under `BUNDLE_GEMFILE=gemfiles/x.gemfile`, check `cache_path` in `gemfiles/.bundle/config` for the hosted stale guard and `vex`, and the env `BUNDLE_APP_CONFIG` relative to the moved root.
-5. More `.bundle/config` parser divergences from Bundler's `YAMLSerializer` (contrived, so low priority).
-6. RubyGems 4.1 + Bundler 4.1 content-addressed installs (`gems/<name>-<ver>-<hex8>`): revisit when a gem is published that way.
-7. Windows `x64-mingw-ucrt` platform gems in hosted and vendored modes; vendored cells and `repair` on Windows and macOS.
-8. Bundler 1.17 hosted unwind (Ruby ≤ 3.1 probe); `rollback` / `remove` on a custom-lock project.
+1. Re-run #729 / #749 / #751 / #896 / #951 / #952 / #985 / #1001 / #1055 / #1056 when fixes merge (open PRs #768, #953). #681, #775, #826, #915, #967 are fixed on main (`d47eab3`); spot-check them in hosted/agent shapes next run.
+2. #1055 neighbours: `get <purl> --mode hosted` and `vendor` on the shared-home shape; scan `--vex` output on that shape; `-g` inside a project.
+3. #1056 neighbours: CRLF Gemfile and `gems.rb` spellings; H→V takeover of a gem inside a `source … do` block.
+4. #1001 neighbours: `deployment true` without `path`, and a global-tier `path` with the stale guard.
+5. #985 neighbours: `get <uuid> --mode hosted` and H→V takeover on the gemspec dev-dep shape.
+6. Windows `x64-mingw-ucrt` platform gems in hosted and vendored modes; vendored cells and `repair` on Windows and macOS.
+7. Bundler 1.17 hosted unwind (Ruby ≤ 3.1 probe); `rollback` / `remove` on a custom-lock project.
 
 ## Known non-bugs
 
@@ -367,3 +381,6 @@ Also on 4.0.17: BOM `Gemfile` passes; symlinked `Gemfile` / lock is refused (pas
 - Agent `.bundle/config` `path "~/x"` (tilde, so out of tree) is skipped as a write root with `gem_bundle_config_path_ignored`, and `vex` refuses `not_applied`. Documented (#709 contract); env `BUNDLE_PATH='~/x'` is expanded and works (run 28).
 - In mock dirs, never run `gem install <gem>` from a cwd that holds a rebuilt `*.gem` of the same name and version: RubyGems installs the local file first, which silently patches the system copy and fakes "pass" results. Reinstall from an empty dir, and check the system cache `.gem` sha (run 28 near-miss).
 - Bundler with an explicit `path` doesn't reuse a non-default gem from the system home (verified with `rexml 3.3.9`: it fetches into `vendor/bundle`). Default gems can still come from the system homes (run 28).
+- A global (`~/.bundle/config`) `mirror.all` isn't inspected by the #681 mirror guard. That's documented in the docs/ecosystems.md RubyGems row ("user-global config … not inspected"), so it's not filed (run 29).
+- Bundler 4.0.22 `Settings#path` applies `deployment` → `vendor/bundle` only when no tier sets `path` / `path.system` / `disable_shared_gems`, so a global `path.system true` plus a local `deployment true` really does use system gems; the crawler agrees (run 29). `disable_shared_gems: false` means system gems in Bundler, and the crawler ignores it, but Bundler never writes `false` itself (1.x writes `true` or removes the key), so it's contrived and not filed.
+- An unconstrained `gem "x"` whose lock resolves a newer version than the shared-home copy hits #1055, not a separate bug (run 29).
