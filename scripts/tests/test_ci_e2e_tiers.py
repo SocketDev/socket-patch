@@ -64,7 +64,10 @@ class Tiers(unittest.TestCase):
                             ("cargo-vex-matrix-full", "cargo-vex-steps")):
             with self.subTest(job=job):
                 text = job_text(job)
-                self.assertIn("if: github.event_name != 'pull_request'", text)
+                # The merge queue runs the pull_request tier, so the full tier
+                # skips merge_group too.
+                self.assertIn("if: (github.event_name != 'pull_request' && github.event_name != 'merge_group')",
+                              text)
                 self.assertIn(f"steps: *{anchor}", text)
                 self.assertIn(f"steps: &{anchor}", TEXT)
 
