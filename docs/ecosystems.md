@@ -168,7 +168,14 @@ The backticked slug in each row is the value `-e`/`--ecosystems` accepts (e.g.
   rolled back (v5.0 keeps no hosted ledger, and a rebuilt binary record is not byte-exact
   for every lock): rollback and remove refuse it with the `git checkout -- bun.lockb`
   remedy, while the hosted → vendored takeover rebuilds its npm registry record natively
-  and vendors over it. Bun's hoisted linker keeps an installed copy whose lock entry
+  and vendors over it. Each restore reads the package's version document from the
+  registry Bun resolves it against (`.npmrc` / `bunfig.toml` scope and default
+  registries, `BUN_CONFIG_REGISTRY` / `NPM_CONFIG_REGISTRY`), sending the credentials
+  those settings give it — a bunfig `token` or `username` / `password` (`$VAR`
+  expanded), else the `.npmrc` `//host/path/:_authToken` / `_auth` / `username` +
+  `_password` covering the registry URL (`BUN_CONFIG_TOKEN` is not read); a registry
+  that still cannot be read falls back to the default registry's document with an
+  `upstream_registry_fallback` warning. Bun's hoisted linker keeps an installed copy whose lock entry
   returns to the registry record (a plain `bun install` reports no changes), so after
   `rollback`, `remove` or `vendor --revert` the patched bytes stay in `node_modules` until
   `bun install --force` (or deleting `node_modules`); `redirect_bun_reinstall_required` /

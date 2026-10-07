@@ -11,13 +11,15 @@
 //! tarball URL, so a restore that read the wrong registry, or fell back to
 //! the default one and re-based its conventional URL, cannot land on the
 //! pristine bytes by accident. The default registry (`SOCKET_NPM_REGISTRY`,
-//! the shared mirror) does not know `@corp/widget` at all.
+//! the shared mirror) does not know `@corp/widget` at all, and the scope's
+//! registry is private: it answers 401 unless the restore sends the
+//! `[install.scopes]` entry's token, as Bun does.
 
 use std::path::Path;
 
 use serde_json::{json, Value};
 use socket_patch_core::hash::git_sha256::compute_git_sha256_from_bytes;
-use wiremock::matchers::{method, path, path_regex};
+use wiremock::matchers::{header, method, path, path_regex};
 use wiremock::{Mock, MockServer, ResponseTemplate};
 
 use super::{
@@ -33,6 +35,8 @@ const SCOPED_UUID: &str = "3c4d5e6f-7a8b-4c9d-8e0f-1a2b3c4d5e6f";
 const SCOPED_HOSTED_URL: &str = "https://patch.socket.dev/patch/npm/@corp/widget/2.0.0/55555555-5555-4555-8555-555555555555/3c4d5e6f-7a8b-4c9d-8e0f-1a2b3c4d5e6f/widget-2.0.0.tgz";
 const SCOPED_INTEGRITY: &str = "sha512-corpWIDGETcorp0123456789==";
 const SCOPED_PATCHED_SHA512: &str = "sha512-corpPATCHEDcorp0123456789==";
+/// The `@corp` scope registry's token, from `bunfig.toml`.
+const SCOPE_TOKEN: &str = "corp-secret-token";
 
 /// The project's registries, all on one wiremock: the bunfig default
 /// registry (`/mirror/`) and the `@corp` scope's (`/corp/`).
@@ -57,9 +61,20 @@ impl Registries {
             .respond_with(ResponseTemplate::new(200).set_body_json(mirror_doc))
             .mount(&registries.server)
             .await;
-        // Bun and npm ask for a scoped document as `@scope%2fname`.
+        // Bun and npm ask for a scoped document as `@scope%2fname`. The
+        // private scope registry serves it only with the scope's token.
+        Mock::given(method("GET"))
+            .and(path_regex(r"^/corp/"))
+            .respond_with(ResponseTemplate::new(401))
+            .with_priority(10)
+            .mount(&registries.server)
+            .await;
         Mock::given(method("GET"))
             .and(path_regex(r"^/corp/@corp(%2[fF]|/)widget/2\.0\.0$"))
+            .and(header(
+                "authorization",
+                format!("Bearer {SCOPE_TOKEN}").as_str(),
+            ))
             .respond_with(ResponseTemplate::new(200).set_body_json(json!({
                 "name": SCOPED_NAME,
                 "version": SCOPED_VERSION,
@@ -68,6 +83,7 @@ impl Registries {
                     "integrity": SCOPED_INTEGRITY,
                 }
             })))
+            .with_priority(1)
             .mount(&registries.server)
             .await;
         registries
@@ -88,7 +104,7 @@ impl Registries {
         let uri = self.server.uri();
         format!(
             "[install]\nregistry = \"{uri}/mirror/\"\n\n\
-             [install.scopes]\ncorp = {{ url = \"{uri}/corp/\", token = \"t\" }}\n"
+             [install.scopes]\ncorp = {{ url = \"{uri}/corp/\", token = \"{SCOPE_TOKEN}\" }}\n"
         )
     }
 
@@ -173,6 +189,10 @@ fn assert_no_registry_fallback(env: &Value) {
     assert!(
         !env.to_string().contains("upstream_registry_fallback"),
         "every registry was readable: {env:#}"
+    );
+    assert!(
+        !env.to_string().contains(SCOPE_TOKEN),
+        "the scope's token is never reported: {env:#}"
     );
 }
 

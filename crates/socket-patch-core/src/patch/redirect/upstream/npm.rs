@@ -30,7 +30,7 @@ pub(super) async fn fetch_dists(
     ctx: &Ctx<'_>,
     result: &mut FormatResult,
 ) -> BTreeMap<(String, String), NpmDist> {
-    fetch_dists_on(wanted, |_| None, ctx, result)
+    fetch_dists_on(wanted, |_| None::<String>, ctx, result)
         .await
         .into_iter()
         .map(|(key, found)| (key, found.dist))
@@ -65,25 +65,63 @@ pub(super) fn non_default_registry(base: &str) -> Option<String> {
         .then(|| base.to_string())
 }
 
+/// A registry a project resolves a package against, with the
+/// `Authorization` header value its settings configure for it (a private
+/// registry's token or basic credentials). Never `Debug`: it holds a secret.
+#[derive(Clone)]
+pub(super) struct ProjectRegistry {
+    pub base: String,
+    pub authorization: Option<String>,
+}
+
+impl From<String> for ProjectRegistry {
+    fn from(base: String) -> Self {
+        ProjectRegistry {
+            base,
+            authorization: None,
+        }
+    }
+}
+
 /// [`fetch_dists`], reading each version document from the registry the
 /// project resolves `name` against (`registry(name)`; `None` means the
 /// default registry), since a mirror's `dist.tarball` need not be the
-/// default registry's (#521, #908). When the project's registry can't be
-/// read (a private mirror that wants credentials the restore does not
-/// send), the default registry's document is used, as before, and
-/// `upstream_registry_fallback` says so.
-pub(super) async fn fetch_dists_on(
+/// default registry's (#521, #908), with the credentials the project
+/// configures for it (#992). A registry with credentials is read even when
+/// it is the default one (a private package on npmjs). When the project's
+/// registry can't be read, the default registry's document is used, as
+/// before, and `upstream_registry_fallback` says so.
+pub(super) async fn fetch_dists_on<R: Into<ProjectRegistry>>(
     wanted: &BTreeSet<(String, String, String)>,
-    registry: impl Fn(&str) -> Option<String>,
+    registry: impl Fn(&str) -> Option<R>,
     ctx: &Ctx<'_>,
     result: &mut FormatResult,
 ) -> BTreeMap<(String, String), ProjectDist> {
     let lookups = wanted.iter().map(|(uuid, name, version)| {
-        let project = registry(name).as_deref().and_then(non_default_registry);
+        let project = registry(name)
+            .map(Into::into)
+            .and_then(|r: ProjectRegistry| {
+                let base = non_default_registry(&r.base).or_else(|| {
+                    r.authorization
+                        .is_some()
+                        .then(|| r.base.trim().trim_end_matches('/').to_string())
+                })?;
+                Some(ProjectRegistry {
+                    base,
+                    authorization: r.authorization,
+                })
+            });
         async move {
             let mut fell_back = None;
             let found = match project {
-                Some(base) => match ctx.client.npm_dist_on(&base, name, version).await {
+                Some(ProjectRegistry {
+                    base,
+                    authorization,
+                }) => match ctx
+                    .client
+                    .npm_dist_authorized(&base, authorization.as_deref(), name, version)
+                    .await
+                {
                     Ok(dist) => Ok(ProjectDist {
                         dist,
                         from_project: true,
@@ -1003,41 +1041,80 @@ pub(crate) async fn restore_pnpm_locks(
 /// (`BUN_CONFIG_REGISTRY` / `NPM_CONFIG_REGISTRY`), the `.npmrc`
 /// `registry`, then `bunfig.toml` `[install] registry` — Bun's own order.
 /// `None` means Bun's default registry, npmjs.
+///
+/// The registry carries the credentials Bun sends it: the bunfig entry's
+/// own `token` (Bearer) or `username` / `password` (Basic), else the
+/// `.npmrc` `//host/path/:_authToken` / `:_auth` / `:username` +
+/// `:_password` whose path covers the registry URL. `$VAR` / `${VAR}` in a
+/// bunfig value and `${VAR}` in an `.npmrc` value read `var`, as Bun
+/// expands them. A private scope registry answers 401 without them.
 fn bun_lookup_registry(
     npmrc: Option<&str>,
     bunfig: Option<&str>,
     env_registry: Option<&str>,
+    var: &dyn Fn(&str) -> Option<String>,
     name: &str,
-) -> Option<String> {
+) -> Option<ProjectRegistry> {
     use super::super::npmrc::npmrc_top_level_value;
 
     fn url(value: &str) -> Option<String> {
         let value = value.trim().trim_matches(['"', '\'']);
         (value.starts_with("https://") || value.starts_with("http://")).then(|| value.to_string())
     }
-    // A registry is a URL string or a table carrying `url`.
-    fn toml_url(item: Option<&toml_edit::Item>) -> Option<String> {
+    // A bunfig registry is a URL string or a table carrying `url` and
+    // maybe its credentials.
+    let toml_url = |item: Option<&toml_edit::Item>| -> Option<String> {
         let item = item?;
         let value = item
             .as_str()
             .or_else(|| item.get("url").and_then(toml_edit::Item::as_str))?;
-        url(value)
-    }
+        url(&expand_env(value, var, true))
+    };
+    let toml_auth = |item: &toml_edit::Item| -> Option<String> {
+        let field = |key: &str| {
+            item.get(key)
+                .and_then(toml_edit::Item::as_str)
+                .map(|v| expand_env(v, var, true))
+                .filter(|v| !v.is_empty())
+        };
+        if let Some(token) = field("token") {
+            return Some(format!("Bearer {token}"));
+        }
+        let (user, password) = (field("username")?, field("password")?);
+        use base64::Engine as _;
+        Some(format!(
+            "Basic {}",
+            base64::engine::general_purpose::STANDARD.encode(format!("{user}:{password}"))
+        ))
+    };
+    let npmrc_value = |key: &str| {
+        npmrc
+            .and_then(|text| npmrc_top_level_value(text, key))
+            .map(|v| expand_env(&v, var, false))
+    };
+    let with_npmrc_auth = |base: String, own: Option<String>| -> ProjectRegistry {
+        let authorization = own.or_else(|| npmrc_registry_auth(&base, &npmrc_value));
+        ProjectRegistry {
+            base,
+            authorization,
+        }
+    };
     let bunfig = bunfig.and_then(|text| text.parse::<toml_edit::DocumentMut>().ok());
     let install = bunfig.as_ref().and_then(|doc| doc.get("install"));
     // The configured default registry before the environment applies.
-    let configured = || {
-        npmrc
-            .and_then(|text| npmrc_top_level_value(text, "registry"))
-            .and_then(|value| url(&value))
-            .or_else(|| toml_url(install?.get("registry")))
+    let configured = || -> Option<ProjectRegistry> {
+        if let Some(base) = npmrc_value("registry").and_then(|value| url(&value)) {
+            return Some(with_npmrc_auth(base, None));
+        }
+        let item = install?.get("registry")?;
+        let base = toml_url(Some(item))?;
+        Some(with_npmrc_auth(base, toml_auth(item)))
     };
     if let Some((scope, _)) = name.strip_prefix('@').and_then(|rest| rest.split_once('/')) {
-        if let Some(scoped) = npmrc
-            .and_then(|text| npmrc_top_level_value(text, &format!("@{scope}:registry")))
-            .and_then(|value| url(&value))
+        if let Some(scoped) =
+            npmrc_value(&format!("@{scope}:registry")).and_then(|value| url(&value))
         {
-            return Some(scoped);
+            return Some(with_npmrc_auth(scoped, None));
         }
         let entry = install.and_then(|i| i.get("scopes")).and_then(|scopes| {
             scopes
@@ -1045,17 +1122,102 @@ fn bun_lookup_registry(
                 .or_else(|| scopes.get(format!("@{scope}")))
         });
         if let Some(entry) = entry {
-            // A scope entry with no URL (a token only) takes the configured
-            // default registry, never the environment's.
             if let Some(scoped) = toml_url(Some(entry)) {
-                return Some(scoped);
+                return Some(with_npmrc_auth(scoped, toml_auth(entry)));
             }
+            // A scope entry with no URL (a token only) takes the configured
+            // default registry, never the environment's, with its own
+            // credentials.
             if entry.is_table_like() && entry.get("url").is_none() {
-                return configured();
+                return configured().map(|r| match toml_auth(entry) {
+                    Some(own) => ProjectRegistry {
+                        authorization: Some(own),
+                        ..r
+                    },
+                    None => r,
+                });
             }
         }
     }
-    env_registry.and_then(url).or_else(configured)
+    match env_registry.and_then(url) {
+        Some(base) => Some(with_npmrc_auth(base, None)),
+        None => configured(),
+    }
+}
+
+/// `value` with each `${VAR}` (and, for a bunfig value, `$VAR`) replaced
+/// by `var(VAR)`, empty when unset.
+fn expand_env(value: &str, var: &dyn Fn(&str) -> Option<String>, bare: bool) -> String {
+    let is_name = |c: char| c.is_ascii_alphanumeric() || c == '_';
+    let mut out = String::with_capacity(value.len());
+    let mut rest = value;
+    while let Some(at) = rest.find('$') {
+        out.push_str(&rest[..at]);
+        let after = &rest[at + 1..];
+        if let Some(braced) = after.strip_prefix('{') {
+            if let Some(end) = braced.find('}') {
+                out.push_str(&var(&braced[..end]).unwrap_or_default());
+                rest = &braced[end + 1..];
+                continue;
+            }
+        } else if bare {
+            let end = after.find(|c| !is_name(c)).unwrap_or(after.len());
+            if end > 0 {
+                out.push_str(&var(&after[..end]).unwrap_or_default());
+                rest = &after[end..];
+                continue;
+            }
+        }
+        out.push('$');
+        rest = after;
+    }
+    out.push_str(rest);
+    out
+}
+
+/// The `Authorization` an `.npmrc` configures for the registry at `base`:
+/// the `//host[:port]/path/:`-keyed `_authToken` (Bearer), `_auth` (Basic)
+/// or `username` + base64 `_password` (Basic) of the longest path that
+/// covers `base`'s, on the same host.
+fn npmrc_registry_auth(base: &str, value: &dyn Fn(&str) -> Option<String>) -> Option<String> {
+    let rest = base
+        .strip_prefix("https://")
+        .or_else(|| base.strip_prefix("http://"))?;
+    let rest = rest.split(['?', '#']).next().unwrap_or(rest);
+    let (host, path) = rest.split_once('/').unwrap_or((rest, ""));
+    let host = host.rsplit_once('@').map_or(host, |(_, h)| h);
+    if host.is_empty() {
+        return None;
+    }
+    let segments: Vec<&str> = path.split('/').filter(|s| !s.is_empty()).collect();
+    let non_empty = |v: Option<String>| v.filter(|v| !v.is_empty());
+    for depth in (0..=segments.len()).rev() {
+        let mut dart = format!("//{host}/");
+        for segment in &segments[..depth] {
+            dart.push_str(segment);
+            dart.push('/');
+        }
+        if let Some(token) = non_empty(value(&format!("{dart}:_authToken"))) {
+            return Some(format!("Bearer {token}"));
+        }
+        if let Some(auth) = non_empty(value(&format!("{dart}:_auth"))) {
+            return Some(format!("Basic {auth}"));
+        }
+        if let (Some(user), Some(password)) = (
+            non_empty(value(&format!("{dart}:username"))),
+            non_empty(value(&format!("{dart}:_password"))),
+        ) {
+            use base64::Engine as _;
+            let engine = base64::engine::general_purpose::STANDARD;
+            let password = engine.decode(password.trim()).ok()?;
+            let password = String::from_utf8(password).ok()?;
+            return Some(format!(
+                "Basic {}",
+                engine.encode(format!("{user}:{password}"))
+            ));
+        }
+    }
+    None
 }
 
 /// The registry Bun takes from its environment: the first of
@@ -1113,10 +1275,24 @@ impl BunRegistrySettings {
 
     /// The registry Bun resolves `name` against; `None` means npmjs.
     pub(super) fn registry(&self, name: &str) -> Option<String> {
+        self.registry_with_credentials(name).map(|r| r.base)
+    }
+
+    /// [`Self::registry`] with the credentials Bun sends it.
+    pub(super) fn registry_with_credentials(&self, name: &str) -> Option<ProjectRegistry> {
+        // Unit tests read no ambient variables, as for `env_registry`.
+        let var = |key: &str| {
+            if cfg!(test) {
+                None
+            } else {
+                std::env::var(key).ok()
+            }
+        };
         bun_lookup_registry(
             self.npmrc.as_deref(),
             self.bunfig.as_deref(),
             self.env_registry.as_deref(),
+            &var,
             name,
         )
     }
@@ -1240,7 +1416,13 @@ pub(crate) async fn restore_bun_locks(
         // Bun records the tarball URL of a package from any registry but
         // npmjs, so the restore reads the project's registry settings.
         let settings = BunRegistrySettings::read(view, rel).await;
-        let dists = fetch_dists_on(&wanted, |n| settings.registry(n), ctx, &mut result).await;
+        let dists = fetch_dists_on(
+            &wanted,
+            |n| settings.registry_with_credentials(n),
+            ctx,
+            &mut result,
+        )
+        .await;
         let mut changed = false;
         for (line_idx, uuid, name, version, deps) in hits {
             if result.refused.contains_key(&uuid) {
@@ -1372,7 +1554,9 @@ mod tests {
         let bunfig = "[install]\nregistry = \"https://b.example/\"\n\n\
                       [install.scopes]\ns = \"https://s.example/\"\n\"@t\" = { url = \"https://t.example/\", token = \"x\" }\n";
         let npmrc = "registry=https://n.example/\n@u:registry=https://u.example/\n";
-        let lookup = |npmrc, bunfig, env, name| bun_lookup_registry(npmrc, bunfig, env, name);
+        let lookup = |npmrc, bunfig, env, name| {
+            bun_lookup_registry(npmrc, bunfig, env, &|_| None, name).map(|r| r.base)
+        };
         assert_eq!(
             lookup(None, Some(bunfig), None, "a").as_deref(),
             Some("https://b.example/")
@@ -1427,6 +1611,117 @@ mod tests {
         assert_eq!(
             lookup(Some("registry=${R}\n"), Some("not toml ["), Some("x"), "a"),
             None
+        );
+    }
+
+    #[test]
+    fn bun_sends_the_credentials_its_settings_give_each_registry() {
+        let vars = |key: &str| match key {
+            "CORP_TOKEN" => Some("from-env".to_string()),
+            "NPMRC_TOKEN" => Some("npmrc-env".to_string()),
+            _ => None,
+        };
+        let auth = |npmrc: Option<&str>, bunfig: Option<&str>, env: Option<&str>, name: &str| {
+            bun_lookup_registry(npmrc, bunfig, env, &vars, name).map(|r| (r.base, r.authorization))
+        };
+        let some =
+            |base: &str, auth: Option<&str>| Some((base.to_string(), auth.map(str::to_string)));
+        // The scope entry's own token, `$VAR` / `${VAR}` expanded; Basic
+        // from username + password.
+        let bunfig = "[install]\nregistry = { url = \"https://b.example/\", token = \"bt\" }\n\n\
+                      [install.scopes]\n\
+                      corp = { url = \"https://corp.example/npm/\", token = \"$CORP_TOKEN\" }\n\
+                      braced = { url = \"https://br.example/\", token = \"x${CORP_TOKEN}y\" }\n\
+                      basic = { url = \"https://ba.example/\", username = \"u\", password = \"p\" }\n\
+                      bare = \"https://bare.example/\"\n\
+                      own = { token = \"own\" }\n\
+                      unset = { url = \"https://un.example/\", token = \"$NOPE\" }\n";
+        assert_eq!(
+            auth(None, Some(bunfig), None, "@corp/w"),
+            some("https://corp.example/npm/", Some("Bearer from-env"))
+        );
+        assert_eq!(
+            auth(None, Some(bunfig), None, "@braced/w"),
+            some("https://br.example/", Some("Bearer xfrom-envy"))
+        );
+        assert_eq!(
+            auth(None, Some(bunfig), None, "@basic/w"),
+            some("https://ba.example/", Some("Basic dTpw"))
+        );
+        assert_eq!(
+            auth(None, Some(bunfig), None, "@bare/w"),
+            some("https://bare.example/", None)
+        );
+        assert_eq!(
+            auth(None, Some(bunfig), None, "@unset/w"),
+            some("https://un.example/", None)
+        );
+        // A token-only scope: the configured default registry, its own token.
+        assert_eq!(
+            auth(None, Some(bunfig), Some("https://e.example/"), "@own/w"),
+            some("https://b.example/", Some("Bearer own"))
+        );
+        // The default registry's table token; the environment's registry
+        // carries none of bunfig's.
+        assert_eq!(
+            auth(None, Some(bunfig), None, "a"),
+            some("https://b.example/", Some("Bearer bt"))
+        );
+        assert_eq!(
+            auth(None, Some(bunfig), Some("https://e.example/"), "a"),
+            some("https://e.example/", None)
+        );
+
+        // `.npmrc` nerf-darted credentials: the longest covering path on
+        // the same host; never another host's.
+        let npmrc = "@corp:registry=https://corp.example/npm/private/\n\
+                     @other:registry=https://other.example/\n\
+                     @basic:registry=https://nb.example/\n\
+                     @legacy:registry=https://lg.example/r/\n\
+                     registry=https://n.example/\n\
+                     //corp.example/:_authToken=host-wide\n\
+                     //corp.example/npm/private/:_authToken=${NPMRC_TOKEN}\n\
+                     //n.example/:_authToken=default\n\
+                     //nb.example/:_auth=dTpw\n\
+                     //lg.example/r/:username=u\n//lg.example/r/:_password=cA==\n";
+        assert_eq!(
+            auth(Some(npmrc), None, None, "@corp/w"),
+            some(
+                "https://corp.example/npm/private/",
+                Some("Bearer npmrc-env")
+            )
+        );
+        assert_eq!(
+            auth(Some(npmrc), None, None, "@other/w"),
+            some("https://other.example/", None)
+        );
+        assert_eq!(
+            auth(Some(npmrc), None, None, "@basic/w"),
+            some("https://nb.example/", Some("Basic dTpw"))
+        );
+        assert_eq!(
+            auth(Some(npmrc), None, None, "@legacy/w"),
+            some("https://lg.example/r/", Some("Basic dTpw"))
+        );
+        assert_eq!(
+            auth(Some(npmrc), None, None, "a"),
+            some("https://n.example/", Some("Bearer default"))
+        );
+        // A bunfig scope registry picks up the `.npmrc` credentials for
+        // its URL; its own token wins over them.
+        let corp_npmrc = "//corp.example/:_authToken=host-wide\n";
+        assert_eq!(
+            auth(
+                Some(corp_npmrc),
+                Some("[install.scopes]\ncorp = \"https://corp.example/x/\"\n"),
+                None,
+                "@corp/w"
+            ),
+            some("https://corp.example/x/", Some("Bearer host-wide"))
+        );
+        assert_eq!(
+            auth(Some(corp_npmrc), Some(bunfig), None, "@corp/w"),
+            some("https://corp.example/npm/", Some("Bearer from-env"))
         );
     }
 

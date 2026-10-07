@@ -105,7 +105,13 @@ pub(super) async fn restore(
         // The record keeps the tarball URL Bun fetches from, which is the
         // project registry's for a mirror (#992).
         let settings = BunRegistrySettings::read(view, rel).await;
-        let dists = fetch_dists_on(&wanted, |n| settings.registry(n), ctx, &mut result).await;
+        let dists = fetch_dists_on(
+            &wanted,
+            |n| settings.registry_with_credentials(n),
+            ctx,
+            &mut result,
+        )
+        .await;
         let mut changed = false;
         let mut restored = Vec::new();
         for (id, uuid, name, version) in hits {
@@ -373,7 +379,10 @@ mod tests {
         let package_start = u64::from_le_bytes(lock[110..118].try_into().unwrap()) as usize;
         // The root resolution's flag byte (its last).
         let flags_at = package_start + count * 16 + 63;
-        assert_eq!(lock[flags_at], crate::vendor::bun_lockb::NORMALIZED_FORMAT_1);
+        assert_eq!(
+            lock[flags_at],
+            crate::vendor::bun_lockb::NORMALIZED_FORMAT_1
+        );
         lock[flags_at] |= 0x40;
         BunLockb::parse(&lock).unwrap().validate_mutation().unwrap();
         let (outcome, after) = run(&lock, &vendor_opts()).await;
