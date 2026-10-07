@@ -293,6 +293,26 @@ fn vendored_project(root: &Path) {
     );
 }
 
+/// Every file under `root`, `.socket/` included (relative path → bytes):
+/// a dry-run takeover stages its revert in memory and must leave all of
+/// it byte-identical, the vendored artifacts included.
+fn tree_snapshot(root: &Path) -> std::collections::BTreeMap<String, Vec<u8>> {
+    fn walk(root: &Path, dir: &Path, out: &mut std::collections::BTreeMap<String, Vec<u8>>) {
+        for e in std::fs::read_dir(dir).unwrap() {
+            let p = e.unwrap().path();
+            if std::fs::symlink_metadata(&p).unwrap().is_dir() {
+                walk(root, &p, out);
+            } else {
+                let rel = p.strip_prefix(root).unwrap().to_string_lossy().into_owned();
+                out.insert(rel, std::fs::read(&p).unwrap());
+            }
+        }
+    }
+    let mut out = std::collections::BTreeMap::new();
+    walk(root, root, &mut out);
+    out
+}
+
 fn warning_detail<'a>(doc: &'a Value, code: &str) -> Option<&'a str> {
     doc["redirect"]["warnings"]
         .as_array()?
@@ -332,9 +352,15 @@ async fn dry_run_over_vendored_project_previews_the_wet_takeover() {
     vendored_project(root);
     let vendored_lock = std::fs::read(root.join("pnpm-lock.yaml")).unwrap();
     let vendored_state = std::fs::read(root.join(".socket/vendor/state.json")).unwrap();
+    let vendored_tree = tree_snapshot(root);
 
     let (code, doc) = scan_hosted_json(root, &server.uri(), /*dry_run=*/ true);
     assert_eq!(code, 0, "dry-run scan --mode hosted must succeed: {doc:#}");
+    assert_eq!(
+        tree_snapshot(root),
+        vendored_tree,
+        "dry-run must leave every file, the vendored tarball included, byte-identical"
+    );
     assert_eq!(doc["redirect"]["dryRun"], true, "envelope: {doc:#}");
 
     let codes = warning_codes(&doc);
@@ -627,9 +653,11 @@ async fn dry_run_package_lock_takeover_previews_the_npmrc_write() {
     assert_eq!(code, 0, "fixture vendor run must succeed: {env:#}");
     let vendored_lock = std::fs::read_to_string(root.join("package-lock.json")).unwrap();
     assert!(vendored_lock.contains(".socket/vendor/"), "{vendored_lock}");
+    let vendored_tree = tree_snapshot(root);
 
     let (code, doc) = scan_hosted_json(root, &server.uri(), /*dry_run=*/ true);
     assert_eq!(code, 0, "{doc:#}");
+    assert_eq!(tree_snapshot(root), vendored_tree, "dry run writes nothing");
     assert!(
         warning_codes(&doc).contains(&"redirect_would_revert_vendored"),
         "{doc:#}"
@@ -709,8 +737,10 @@ async fn vlt_dry_run_over_vendored_project_previews_the_wet_takeover() {
     let vendored_lock = std::fs::read(root.join("vlt-lock.json")).unwrap();
     let vendored_state = std::fs::read(root.join(".socket/vendor/state.json")).unwrap();
     let vendored_pkg = std::fs::read(root.join("package.json")).unwrap();
+    let vendored_tree = tree_snapshot(root);
 
     let (_, doc) = hosted::scan_hosted(root, &server, &["--dry-run"], &[]);
+    assert_eq!(tree_snapshot(root), vendored_tree, "dry run writes nothing");
     let codes = hosted::warning_codes(&doc);
     assert!(
         codes.contains(&"redirect_would_revert_vendored".to_string()),

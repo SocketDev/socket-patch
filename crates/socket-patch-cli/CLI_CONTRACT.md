@@ -2035,9 +2035,13 @@ the base, the row out of the index, the verification component out when it is st
 exactly what the planner wrote (else `gradle_verification_component_left`), and the
 owned files and apply lines once no row is left.
 
-`scan --mode hosted` over a vendored Gradle entry runs this planner's checks first
-(`takeover_refusal`, wet and `--dry-run` alike): a refused purl keeps its vendored
-patch byte-identical and is skipped with the refusal code, whose detail says so. An
+`scan --mode hosted` over a vendored Gradle entry is a staged takeover (see **Staged
+takeover** under hosted mode): the vendored revert is staged in memory, this planner
+plans against the reverted build, and a dep it refuses is retracted, wet and
+`--dry-run` alike. The purl keeps its vendored wiring, ledger entry and
+`.socket/vendor/gradle` tree byte-identical (the tree's files are deleted only after
+the takeover's commit), is skipped with the refusal code and is reported with
+`redirect_takeover_kept_vendored`. An
 eject (`vendor` over hosted pins) snapshots every Gradle wiring file before it
 restores, so a failed vendor step rolls the whole build back byte-exact.
 
