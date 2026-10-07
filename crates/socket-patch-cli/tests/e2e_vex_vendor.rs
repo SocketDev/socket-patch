@@ -1653,7 +1653,9 @@ fn vendored_npm_v2_mirror_without_resolved_keeps_the_patch_wired() {
             lock["dependencies"] = serde_json::json!({
                 "lodash": { "version": "4.17.21", "integrity": mirror_pin }
             });
-            std::fs::remove_file(&written).unwrap();
+            // The shrinkwrap shape keeps its package-lock.json twin: a
+            // shrinkwrap-only project is omitted from VEX on its own (#899).
+            std::fs::write(&written, lock.to_string()).unwrap();
             std::fs::write(cwd.join(lock_name), lock.to_string()).unwrap();
             wiring.file = lock_name.to_string();
             let mut state = VendorState::new();
