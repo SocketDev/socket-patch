@@ -61,11 +61,7 @@ impl Patch {
             "low" => 3,
             _ => 4,
         };
-        self.severities
-            .iter()
-            .copied()
-            .min_by_key(|s| rank(s))
-            .unwrap_or("unknown")
+        self.severities.iter().copied().min_by_key(|s| rank(s)).unwrap_or("unknown")
     }
 }
 
@@ -204,9 +200,7 @@ async fn mount_api(server: &MockServer, patches: Vec<Patch>) {
         .await;
     let detail_map = by_purl.clone();
     Mock::given(method("GET"))
-        .and(path_regex(format!(
-            "^/v0/orgs/{ORG}/patches/by-package/.+$"
-        )))
+        .and(path_regex(format!("^/v0/orgs/{ORG}/patches/by-package/.+$")))
         .respond_with(move |req: &Request| {
             let raw = req.url.path().rsplit('/').next().unwrap();
             let purl = percent_decode(raw);
@@ -222,15 +216,11 @@ async fn mount_api(server: &MockServer, patches: Vec<Patch>) {
                     })
                 })
                 .collect();
-            ResponseTemplate::new(200)
-                .set_body_json(json!({"patches": list, "canAccessPaidPatches": false}))
+            ResponseTemplate::new(200).set_body_json(json!({"patches": list, "canAccessPaidPatches": false}))
         })
         .mount(server)
         .await;
-    let by_uuid: BTreeMap<String, Patch> = patches
-        .iter()
-        .map(|p| (p.uuid.to_string(), p.clone()))
-        .collect();
+    let by_uuid: BTreeMap<String, Patch> = patches.iter().map(|p| (p.uuid.to_string(), p.clone())).collect();
     let refs = by_uuid.clone();
     Mock::given(method("POST"))
         .and(path(format!("/v0/orgs/{ORG}/patches/package")))
@@ -287,10 +277,8 @@ fn write_npm_root(dir: &Path, deps: &[&str]) {
     let dep_map: BTreeMap<&str, &str> = deps.iter().map(|d| (*d, "1.0.0")).collect();
     std::fs::write(
         dir.join("package.json"),
-        serde_json::to_string_pretty(
-            &json!({"name": "consumer", "version": "0.0.0", "dependencies": dep_map}),
-        )
-        .unwrap(),
+        serde_json::to_string_pretty(&json!({"name": "consumer", "version": "0.0.0", "dependencies": dep_map}))
+            .unwrap(),
     )
     .unwrap();
     let mut packages = serde_json::Map::new();
@@ -301,11 +289,7 @@ fn write_npm_root(dir: &Path, deps: &[&str]) {
     for name in deps {
         let pkg = dir.join("node_modules").join(name);
         std::fs::create_dir_all(&pkg).unwrap();
-        std::fs::write(
-            pkg.join("package.json"),
-            format!(r#"{{ "name": "{name}", "version": "1.0.0" }}"#),
-        )
-        .unwrap();
+        std::fs::write(pkg.join("package.json"), format!(r#"{{ "name": "{name}", "version": "1.0.0" }}"#)).unwrap();
         std::fs::write(pkg.join("index.js"), orig_index(name)).unwrap();
         packages.insert(
             format!("node_modules/{name}"),
@@ -320,20 +304,12 @@ fn write_npm_root(dir: &Path, deps: &[&str]) {
         "name": "consumer", "version": "0.0.0", "lockfileVersion": 3, "requires": true,
         "packages": packages
     });
-    std::fs::write(
-        dir.join("package-lock.json"),
-        serde_json::to_string_pretty(&lock).unwrap() + "\n",
-    )
-    .unwrap();
+    std::fs::write(dir.join("package-lock.json"), serde_json::to_string_pretty(&lock).unwrap() + "\n").unwrap();
 }
 
 fn write_gem(dir: &Path, name: &str, version: &str) {
-    std::fs::create_dir_all(
-        dir.join("vendor/bundle/ruby/3.0.0/gems")
-            .join(format!("{name}-{version}"))
-            .join("lib"),
-    )
-    .unwrap();
+    std::fs::create_dir_all(dir.join("vendor/bundle/ruby/3.0.0/gems").join(format!("{name}-{version}")).join("lib"))
+        .unwrap();
 }
 
 /// The monorepo: `services/web` (alpha, beta, left-pad + a gem),
@@ -373,11 +349,7 @@ impl Repo {
                 if entry.file_type().unwrap().is_dir() {
                     walk(&path, root, out);
                 } else {
-                    let rel = path
-                        .strip_prefix(root)
-                        .unwrap()
-                        .to_string_lossy()
-                        .into_owned();
+                    let rel = path.strip_prefix(root).unwrap().to_string_lossy().into_owned();
                     out.insert(rel, std::fs::read(&path).unwrap());
                 }
             }
@@ -397,8 +369,7 @@ fn run_cli(cwd: &Path, args: &[&str], env: &[(&str, &str)]) -> (i32, String, Str
             cmd.env_remove(key);
         }
     }
-    cmd.env_remove("GIT_CEILING_DIRECTORIES")
-        .env_remove("VIRTUAL_ENV");
+    cmd.env_remove("GIT_CEILING_DIRECTORIES").env_remove("VIRTUAL_ENV");
     cmd.env("SOCKET_TELEMETRY_DISABLED", "1");
     // The fixture's hosted pins name this origin; it makes them recorded.
     cmd.env("SOCKET_PATCH_SERVER_URL", "http://patch.test");
@@ -412,8 +383,7 @@ fn run_cli(cwd: &Path, args: &[&str], env: &[(&str, &str)]) -> (i32, String, Str
     ] {
         cmd.env(var, &absent);
     }
-    cmd.env("NPM_CONFIG_ALLOW_REMOTE", "")
-        .env("npm_config_allow_remote", "");
+    cmd.env("NPM_CONFIG_ALLOW_REMOTE", "").env("npm_config_allow_remote", "");
     for (k, v) in env {
         cmd.env(k, v);
     }
@@ -448,9 +418,8 @@ fn scan_json(cwd: &Path, api: &str, extra: &[&str], env: &[(&str, &str)]) -> (i3
     let mut args = vec!["--json"];
     args.extend_from_slice(extra);
     let (code, stdout, stderr) = scan(cwd, api, &args, env);
-    let doc: Value = serde_json::from_str(&stdout).unwrap_or_else(|e| {
-        panic!("stdout must be JSON ({e})\nstdout=\n{stdout}\nstderr=\n{stderr}")
-    });
+    let doc: Value = serde_json::from_str(&stdout)
+        .unwrap_or_else(|e| panic!("stdout must be JSON ({e})\nstdout=\n{stdout}\nstderr=\n{stderr}"));
     (code, doc)
 }
 
@@ -459,12 +428,7 @@ fn filtered(doc: &Value) -> Vec<(Option<String>, String)> {
         .as_array()
         .unwrap()
         .iter()
-        .map(|f| {
-            (
-                f["purl"].as_str().map(str::to_string),
-                f["reason"].as_str().unwrap().to_string(),
-            )
-        })
+        .map(|f| (f["purl"].as_str().map(str::to_string), f["reason"].as_str().unwrap().to_string()))
         .collect()
 }
 
@@ -480,11 +444,7 @@ fn filtered_reason<'a>(doc: &'a Value, purl: &str) -> &'a Value {
 fn warning_codes(doc: &Value) -> Vec<String> {
     doc["warnings"]
         .as_array()
-        .map(|w| {
-            w.iter()
-                .filter_map(|e| e["code"].as_str().map(str::to_string))
-                .collect()
-        })
+        .map(|w| w.iter().filter_map(|e| e["code"].as_str().map(str::to_string)).collect())
         .unwrap_or_default()
 }
 
@@ -504,28 +464,16 @@ async fn hosted_filters_by_ecosystem_package_and_severity() {
     assert_eq!(code, 0, "{doc:#}");
 
     let lock = repo.lock("services/web");
-    assert!(
-        lock.contains(&P_ALPHA.hosted_url()),
-        "alpha is patched:\n{lock}"
-    );
-    assert!(
-        !lock.contains(P_BETA.uuid),
-        "beta is below the floor:\n{lock}"
-    );
-    assert!(
-        !lock.contains(P_LEFTPAD.uuid),
-        "left-pad is ignored:\n{lock}"
-    );
+    assert!(lock.contains(&P_ALPHA.hosted_url()), "alpha is patched:\n{lock}");
+    assert!(!lock.contains(P_BETA.uuid), "beta is below the floor:\n{lock}");
+    assert!(!lock.contains(P_LEFTPAD.uuid), "left-pad is ignored:\n{lock}");
 
     let policy = &doc["policy"];
     assert_eq!(policy["source"], "file");
     assert_eq!(policy["path"], "socket.yml");
     assert_eq!(policy["sha256"].as_str().unwrap().len(), 64);
     assert_eq!(policy["enabled"], true);
-    assert_eq!(
-        policy["minSeverity"],
-        json!({"value": "high", "source": "file"})
-    );
+    assert_eq!(policy["minSeverity"], json!({"value": "high", "source": "file"}));
     let beta = filtered_reason(&doc, "pkg:npm/beta@1.0.0");
     assert_eq!(beta["reason"], "policy_severity");
     assert_eq!(beta["detail"], "low < high");
@@ -533,15 +481,8 @@ async fn hosted_filters_by_ecosystem_package_and_severity() {
     assert_eq!(beta["project"], "services/web");
     let left_pad = filtered_reason(&doc, "pkg:npm/left-pad@1.0.0");
     assert_eq!(left_pad["reason"], "policy_package_ignored");
-    assert_eq!(
-        left_pad["uuid"],
-        Value::Null,
-        "filtered before any patch lookup"
-    );
-    assert_eq!(
-        left_pad["detail"],
-        "pkg:npm/left-pad (patches.ignorePackages)"
-    );
+    assert_eq!(left_pad["uuid"], Value::Null, "filtered before any patch lookup");
+    assert_eq!(left_pad["detail"], "pkg:npm/left-pad (patches.ignorePackages)");
     let rack = filtered_reason(&doc, "pkg:gem/rack@1.0.0");
     assert_eq!(rack["reason"], "policy_ecosystem");
     assert_eq!(policy["counts"]["filtered"], 3);
@@ -551,10 +492,7 @@ async fn hosted_filters_by_ecosystem_package_and_severity() {
     for r in &reqs {
         if r.url.path().ends_with("/patches/batch") {
             let body = String::from_utf8_lossy(&r.body);
-            assert!(
-                !body.contains("left-pad") && !body.contains("rack"),
-                "{body}"
-            );
+            assert!(!body.contains("left-pad") && !body.contains("rack"), "{body}");
         }
     }
     assert_eq!(doc["redirect"]["redirected"], 1, "{:#}", doc["redirect"]);
@@ -565,27 +503,13 @@ async fn hosted_filters_by_ecosystem_package_and_severity() {
 async fn hosted_dry_run_makes_the_same_decisions_and_writes_nothing() {
     let server = MockServer::start().await;
     mount_api(&server, catalog()).await;
-    let repo = Repo::new(Some(
-        "version: 2\npatches:\n  minSeverity: high\n  ecosystems: [npm]\n",
-    ));
+    let repo = Repo::new(Some("version: 2\npatches:\n  minSeverity: high\n  ecosystems: [npm]\n"));
     let before = repo.snapshot();
-    let (code, doc) = scan_json(
-        &repo.dir("services/web"),
-        &server.uri(),
-        &["--dry-run"],
-        &[],
-    );
+    let (code, doc) = scan_json(&repo.dir("services/web"), &server.uri(), &["--dry-run"], &[]);
     assert_eq!(code, 0, "{doc:#}");
     assert_eq!(repo.snapshot(), before, "a dry run changes no bytes");
-    assert_eq!(
-        doc["redirect"]["redirected"], 2,
-        "alpha and left-pad: {:#}",
-        doc["redirect"]
-    );
-    assert_eq!(
-        filtered_reason(&doc, "pkg:npm/beta@1.0.0")["reason"],
-        "policy_severity"
-    );
+    assert_eq!(doc["redirect"]["redirected"], 2, "alpha and left-pad: {:#}", doc["redirect"]);
+    assert_eq!(filtered_reason(&doc, "pkg:npm/beta@1.0.0")["reason"], "policy_severity");
 }
 
 #[tokio::test]
@@ -593,24 +517,14 @@ async fn hosted_dry_run_makes_the_same_decisions_and_writes_nothing() {
 async fn path_globs_apply_default_ignores_and_ignore_paths_human() {
     let server = MockServer::start().await;
     mount_api(&server, catalog()).await;
-    let repo = Repo::new(Some(
-        "version: 2\npatches:\n  ignorePaths: [\"/services/legacy/\"]\n",
-    ));
+    let repo = Repo::new(Some("version: 2\npatches:\n  ignorePaths: [\"/services/legacy/\"]\n"));
     let legacy = repo.lock("services/legacy");
     let test_lock = repo.lock("services/test");
     let (code, stdout, stderr) = scan(&repo.root, &server.uri(), &["services/*"], &[]);
     assert_eq!(code, 0, "stdout:\n{stdout}\nstderr:\n{stderr}");
     assert!(repo.lock("services/web").contains(&P_ALPHA.hosted_url()));
-    assert_eq!(
-        repo.lock("services/legacy"),
-        legacy,
-        "ignored by patches.ignorePaths"
-    );
-    assert_eq!(
-        repo.lock("services/test"),
-        test_lock,
-        "a discovered test/ root is a built-in ignore"
-    );
+    assert_eq!(repo.lock("services/legacy"), legacy, "ignored by patches.ignorePaths");
+    assert_eq!(repo.lock("services/test"), test_lock, "a discovered test/ root is a built-in ignore");
     assert!(stdout.contains("Policy (socket.yml)"), "{stdout}");
 
     // Named literally, the test/ root is explicit: defaults do not apply.
@@ -624,9 +538,7 @@ async fn path_globs_apply_default_ignores_and_ignore_paths_human() {
 async fn include_paths_limit_roots() {
     let server = MockServer::start().await;
     mount_api(&server, catalog()).await;
-    let repo = Repo::new(Some(
-        "version: 2\npatches:\n  includePaths: [\"/services/legacy/\"]\n",
-    ));
+    let repo = Repo::new(Some("version: 2\npatches:\n  includePaths: [\"/services/legacy/\"]\n"));
     let web = repo.lock("services/web");
     let (code, doc) = scan_json(&repo.dir("services/web"), &server.uri(), &[], &[]);
     assert_eq!(code, 0, "{doc:#}");
@@ -659,10 +571,7 @@ async fn invalid_file_fails_closed_before_any_request_or_write() {
     assert!(message.contains("--no-socket-yml"), "{message}");
     assert!(doc.get("policy").is_none());
     assert_eq!(repo.snapshot(), before);
-    assert!(
-        server.received_requests().await.unwrap().is_empty(),
-        "no request before the policy loads"
-    );
+    assert!(server.received_requests().await.unwrap().is_empty(), "no request before the policy loads");
 
     // Human output names the code on stderr, same exit code.
     let (code, _, stderr) = scan(&repo.dir("services/web"), &server.uri(), &[], &[]);
@@ -670,20 +579,10 @@ async fn invalid_file_fails_closed_before_any_request_or_write() {
     assert!(stderr.contains("socket_yml_invalid"), "{stderr}");
 
     // --no-socket-yml (and its env var) skips the file.
-    let (code, doc) = scan_json(
-        &repo.dir("services/web"),
-        &server.uri(),
-        &["--no-socket-yml", "--dry-run"],
-        &[],
-    );
+    let (code, doc) = scan_json(&repo.dir("services/web"), &server.uri(), &["--no-socket-yml", "--dry-run"], &[]);
     assert_eq!(code, 0, "{doc:#}");
     assert_eq!(doc["policy"]["source"], "bypassed");
-    let (code, doc) = scan_json(
-        &repo.dir("services/web"),
-        &server.uri(),
-        &["--dry-run"],
-        &[("SOCKET_NO_SOCKET_YML", "1")],
-    );
+    let (code, doc) = scan_json(&repo.dir("services/web"), &server.uri(), &["--dry-run"], &[("SOCKET_NO_SOCKET_YML", "1")]);
     assert_eq!(code, 0, "{doc:#}");
     assert_eq!(doc["policy"]["source"], "bypassed");
 }
@@ -694,11 +593,7 @@ async fn both_files_disagreeing_is_ambiguous() {
     let server = MockServer::start().await;
     mount_api(&server, catalog()).await;
     let repo = Repo::new(Some("version: 2\npatches:\n  maxNewPatches: 1\n"));
-    std::fs::write(
-        repo.root.join("socket.yaml"),
-        "version: 2\npatches:\n  maxNewPatches: 2\n",
-    )
-    .unwrap();
+    std::fs::write(repo.root.join("socket.yaml"), "version: 2\npatches:\n  maxNewPatches: 2\n").unwrap();
     let (code, doc) = scan_json(&repo.dir("services/web"), &server.uri(), &[], &[]);
     assert_eq!(code, 1);
     assert_eq!(doc["errorCode"], "socket_yml_ambiguous");
@@ -711,66 +606,26 @@ async fn severity_flag_and_env_override_the_file() {
     mount_api(&server, catalog()).await;
     let repo = Repo::new(Some("version: 2\npatches:\n  minSeverity: high\n"));
     let web = repo.dir("services/web");
-    let (code, doc) = scan_json(
-        &web,
-        &server.uri(),
-        &["--dry-run", "--min-severity", "none"],
-        &[],
-    );
+    let (code, doc) = scan_json(&web, &server.uri(), &["--dry-run", "--min-severity", "none"], &[]);
     assert_eq!(code, 0, "{doc:#}");
-    assert_eq!(
-        doc["policy"]["minSeverity"],
-        json!({"value": null, "source": "flag"})
-    );
-    assert_eq!(
-        doc["redirect"]["redirected"], 3,
-        "beta too once the floor is lifted"
-    );
+    assert_eq!(doc["policy"]["minSeverity"], json!({"value": null, "source": "flag"}));
+    assert_eq!(doc["redirect"]["redirected"], 3, "beta too once the floor is lifted");
 
-    let (code, doc) = scan_json(
-        &web,
-        &server.uri(),
-        &["--dry-run"],
-        &[("SOCKET_MIN_SEVERITY", "critical")],
-    );
+    let (code, doc) = scan_json(&web, &server.uri(), &["--dry-run"], &[("SOCKET_MIN_SEVERITY", "critical")]);
     assert_eq!(code, 0, "{doc:#}");
-    assert_eq!(
-        doc["policy"]["minSeverity"],
-        json!({"value": "critical", "source": "env"})
-    );
+    assert_eq!(doc["policy"]["minSeverity"], json!({"value": "critical", "source": "env"}));
     assert_eq!(doc["redirect"]["redirected"], 1);
 
     // The flag beats the env; an empty env value is unset.
-    let (_, doc) = scan_json(
-        &web,
-        &server.uri(),
-        &["--dry-run", "--min-severity", "moderate"],
-        &[("SOCKET_MIN_SEVERITY", "critical")],
-    );
-    assert_eq!(
-        doc["policy"]["minSeverity"],
-        json!({"value": "medium", "source": "flag"})
-    );
-    let (_, doc) = scan_json(
-        &web,
-        &server.uri(),
-        &["--dry-run"],
-        &[("SOCKET_MIN_SEVERITY", "")],
-    );
-    assert_eq!(
-        doc["policy"]["minSeverity"],
-        json!({"value": "high", "source": "file"})
-    );
+    let (_, doc) = scan_json(&web, &server.uri(), &["--dry-run", "--min-severity", "moderate"], &[("SOCKET_MIN_SEVERITY", "critical")]);
+    assert_eq!(doc["policy"]["minSeverity"], json!({"value": "medium", "source": "flag"}));
+    let (_, doc) = scan_json(&web, &server.uri(), &["--dry-run"], &[("SOCKET_MIN_SEVERITY", "")]);
+    assert_eq!(doc["policy"]["minSeverity"], json!({"value": "high", "source": "file"}));
 
     // Malformed values are usage errors.
     let (code, _, stderr) = scan(&web, &server.uri(), &["--min-severity", "severe"], &[]);
     assert_eq!(code, 2, "{stderr}");
-    let (code, _, stderr) = scan(
-        &web,
-        &server.uri(),
-        &[],
-        &[("SOCKET_MIN_SEVERITY", "severe")],
-    );
+    let (code, _, stderr) = scan(&web, &server.uri(), &[], &[("SOCKET_MIN_SEVERITY", "severe")]);
     assert_eq!(code, 2, "{stderr}");
     assert!(stderr.contains("SOCKET_MIN_SEVERITY"), "{stderr}");
 }
@@ -788,20 +643,12 @@ async fn narrowing_after_a_hosted_patch_leaves_the_pin_byte_identical() {
     assert!(pinned.contains(&P_ALPHA.hosted_url()));
 
     // A newer merged patch appears, and the repo now ignores alpha.
-    std::fs::write(
-        repo.root.join("socket.yml"),
-        "version: 2\npatches:\n  ignorePackages: [alpha]\n",
-    )
-    .unwrap();
+    std::fs::write(repo.root.join("socket.yml"), "version: 2\npatches:\n  ignorePackages: [alpha]\n").unwrap();
     server.reset().await;
     mount_api(&server, vec![P_ALPHA, P_ALPHA_MERGED_NEW]).await;
     let (code, doc) = scan_json(&web, &server.uri(), &[], &[]);
     assert_eq!(code, 0, "{doc:#}");
-    assert_eq!(
-        repo.lock("services/web"),
-        pinned,
-        "retained: not upgraded, not removed"
-    );
+    assert_eq!(repo.lock("services/web"), pinned, "retained: not upgraded, not removed");
     let retained = &doc["policy"]["retained"][0];
     assert_eq!(retained["purl"], "pkg:npm/alpha@1.0.0");
     assert_eq!(retained["recordedUuid"], P_ALPHA.uuid);
@@ -819,11 +666,7 @@ async fn narrowing_after_a_hosted_patch_leaves_the_pin_byte_identical() {
         let (code, doc) = scan_json(&web, &server.uri(), &[], &[]);
         assert_eq!(code, 0, "{doc:#}");
         assert_eq!(repo.lock("services/web"), pinned, "{yml}");
-        assert_eq!(
-            doc["policy"]["retained"][0]["purl"], "pkg:npm/alpha@1.0.0",
-            "{yml}: {:#}",
-            doc["policy"]
-        );
+        assert_eq!(doc["policy"]["retained"][0]["purl"], "pkg:npm/alpha@1.0.0", "{yml}: {:#}", doc["policy"]);
     }
 }
 
@@ -838,15 +681,9 @@ async fn enabled_false_reports_and_writes_nothing() {
     assert_eq!(code, 0, "{doc:#}");
     assert_eq!(repo.snapshot(), before);
     assert_eq!(doc["policy"]["enabled"], false);
-    assert!(
-        warning_codes(&doc).contains(&"patches_disabled".to_string()),
-        "{doc:#}"
-    );
+    assert!(warning_codes(&doc).contains(&"patches_disabled".to_string()), "{doc:#}");
     let reasons: Vec<String> = filtered(&doc).into_iter().map(|(_, r)| r).collect();
-    assert!(
-        !reasons.is_empty() && reasons.iter().all(|r| r == "policy_disabled"),
-        "{reasons:?}"
-    );
+    assert!(!reasons.is_empty() && reasons.iter().all(|r| r == "policy_disabled"), "{reasons:?}");
     assert_eq!(doc["redirect"]["redirected"], 0);
 }
 
@@ -855,9 +692,7 @@ async fn enabled_false_reports_and_writes_nothing() {
 async fn report_only_json_fails_when_every_detail_query_fails() {
     let server = MockServer::start().await;
     Mock::given(method("GET"))
-        .and(path_regex(format!(
-            "^/v0/orgs/{ORG}/patches/by-package/.+$"
-        )))
+        .and(path_regex(format!("^/v0/orgs/{ORG}/patches/by-package/.+$")))
         .respond_with(ResponseTemplate::new(500))
         .with_priority(1)
         .mount(&server)
@@ -870,10 +705,7 @@ async fn report_only_json_fails_when_every_detail_query_fails() {
     assert_eq!(code, 1, "{doc:#}");
     assert_eq!(doc["status"], "error", "{doc:#}");
     assert!(
-        doc["error"]
-            .as_str()
-            .unwrap_or_default()
-            .contains("patch-detail queries failed"),
+        doc["error"].as_str().unwrap_or_default().contains("patch-detail queries failed"),
         "{doc:#}"
     );
     assert_eq!(repo.snapshot(), before);
@@ -894,11 +726,7 @@ async fn recorded_merge_below_the_floor_is_kept_until_a_more_severe_patch_is_ava
         "the only available patch is pinned:\n{pinned}"
     );
 
-    std::fs::write(
-        repo.root.join("socket.yml"),
-        "version: 2\npatches:\n  minSeverity: high\n",
-    )
-    .unwrap();
+    std::fs::write(repo.root.join("socket.yml"), "version: 2\npatches:\n  minSeverity: high\n").unwrap();
     let (code, doc) = scan_json(&web, &server.uri(), &[], &[]);
     assert_eq!(code, 0, "{doc:#}");
     assert_eq!(
@@ -950,17 +778,11 @@ async fn floor_with_nothing_admitted_reports_the_withheld_patch() {
     let (code, stdout, stderr) = scan(&web, &server.uri(), &[], &[]);
     assert_eq!(code, 0, "{stdout}\n{stderr}");
     assert_eq!(repo.lock("services/web"), lock);
-    assert!(
-        stdout.contains("Policy (socket.yml): 1 skipped by filters"),
-        "{stdout}"
-    );
+    assert!(stdout.contains("Policy (socket.yml): 1 skipped by filters"), "{stdout}");
     // Only critical/high are named without --verbose.
     assert!(!stdout.contains("skipped beta"), "{stdout}");
     let (_, stdout, _) = scan(&web, &server.uri(), &["--verbose"], &[]);
-    assert!(
-        stdout.contains("skipped pkg:npm/beta@1.0.0 (low): low < critical"),
-        "{stdout}"
-    );
+    assert!(stdout.contains("skipped pkg:npm/beta@1.0.0 (low): low < critical"), "{stdout}");
 }
 
 #[tokio::test]
@@ -971,17 +793,9 @@ async fn path_outside_the_repo_is_a_usage_error() {
     let repo = Repo::new(None);
     let outside = repo.root.parent().unwrap().join("elsewhere");
     write_npm_root(&outside, &["alpha"]);
-    let (code, _, stderr) = scan(
-        &repo.dir("services"),
-        &server.uri(),
-        &["web", "../../elsewhere"],
-        &[],
-    );
+    let (code, _, stderr) = scan(&repo.dir("services"), &server.uri(), &["web", "../../elsewhere"], &[]);
     assert_eq!(code, 2, "{stderr}");
-    assert!(
-        stderr.contains("is outside") && stderr.contains("run one scan per repository"),
-        "{stderr}"
-    );
+    assert!(stderr.contains("is outside") && stderr.contains("run one scan per repository"), "{stderr}");
 }
 
 #[tokio::test]
@@ -989,9 +803,7 @@ async fn path_outside_the_repo_is_a_usage_error() {
 async fn project_ignore_paths_is_honored_without_a_patches_block() {
     let server = MockServer::start().await;
     mount_api(&server, catalog()).await;
-    let repo = Repo::new(Some(
-        "version: 2\nprojectIgnorePaths:\n  - \"services/legacy/**\"\n",
-    ));
+    let repo = Repo::new(Some("version: 2\nprojectIgnorePaths:\n  - \"services/legacy/**\"\n"));
     let legacy = repo.lock("services/legacy");
     let (code, doc) = scan_json(&repo.dir("services/legacy"), &server.uri(), &[], &[]);
     assert_eq!(code, 0, "{doc:#}");
@@ -1001,22 +813,10 @@ async fn project_ignore_paths_is_honored_without_a_patches_block() {
     assert_eq!(entry["detail"], "services/legacy/** (projectIgnorePaths)");
 
     // A malformed projectIgnorePaths without a patches block only warns.
-    std::fs::write(
-        repo.root.join("socket.yml"),
-        "version: 2\nprojectIgnorePaths: {a: 1}\n",
-    )
-    .unwrap();
-    let (code, doc) = scan_json(
-        &repo.dir("services/legacy"),
-        &server.uri(),
-        &["--dry-run"],
-        &[],
-    );
+    std::fs::write(repo.root.join("socket.yml"), "version: 2\nprojectIgnorePaths: {a: 1}\n").unwrap();
+    let (code, doc) = scan_json(&repo.dir("services/legacy"), &server.uri(), &["--dry-run"], &[]);
     assert_eq!(code, 0, "{doc:#}");
-    assert!(
-        warning_codes(&doc).contains(&"socket_yml_ignored_value".to_string()),
-        "{doc:#}"
-    );
+    assert!(warning_codes(&doc).contains(&"socket_yml_ignored_value".to_string()), "{doc:#}");
 }
 
 // ---------------------------------------------------------------------------
@@ -1045,18 +845,14 @@ async fn agent_mode_applies_only_admitted_patches() {
     let (code, doc) = scan_json(&web, &server.uri(), &["--mode", "agent"], &[]);
     assert_eq!(code, 0, "{doc:#}");
     let manifest: Value =
-        serde_json::from_str(&std::fs::read_to_string(web.join(".socket/manifest.json")).unwrap())
-            .unwrap();
+        serde_json::from_str(&std::fs::read_to_string(web.join(".socket/manifest.json")).unwrap()).unwrap();
     let keys: Vec<&String> = manifest["patches"].as_object().unwrap().keys().collect();
     assert_eq!(keys, ["pkg:npm/alpha@1.0.0"]);
     assert_eq!(
         std::fs::read_to_string(web.join("node_modules/alpha/index.js")).unwrap(),
         patched_index("alpha")
     );
-    assert_eq!(
-        std::fs::read_to_string(web.join("node_modules/beta/index.js")).unwrap(),
-        orig_index("beta")
-    );
+    assert_eq!(std::fs::read_to_string(web.join("node_modules/beta/index.js")).unwrap(), orig_index("beta"));
 }
 
 #[tokio::test]
@@ -1071,23 +867,13 @@ async fn agent_mode_retains_a_recorded_patch_the_policy_now_excludes() {
     let manifest_before = std::fs::read(web.join(".socket/manifest.json")).unwrap();
     let installed_before = std::fs::read(web.join("node_modules/alpha/index.js")).unwrap();
 
-    std::fs::write(
-        repo.root.join("socket.yml"),
-        "version: 2\npatches:\n  ecosystems: [pypi]\n",
-    )
-    .unwrap();
+    std::fs::write(repo.root.join("socket.yml"), "version: 2\npatches:\n  ecosystems: [pypi]\n").unwrap();
     server.reset().await;
     mount_api(&server, vec![P_ALPHA, P_ALPHA_MERGED_NEW]).await;
     let (code, doc) = scan_json(&web, &server.uri(), &["--mode", "agent"], &[]);
     assert_eq!(code, 0, "{doc:#}");
-    assert_eq!(
-        std::fs::read(web.join(".socket/manifest.json")).unwrap(),
-        manifest_before
-    );
-    assert_eq!(
-        std::fs::read(web.join("node_modules/alpha/index.js")).unwrap(),
-        installed_before
-    );
+    assert_eq!(std::fs::read(web.join(".socket/manifest.json")).unwrap(), manifest_before);
+    assert_eq!(std::fs::read(web.join("node_modules/alpha/index.js")).unwrap(), installed_before);
     assert_eq!(doc["policy"]["retained"][0]["reason"], "policy_ecosystem");
     assert_eq!(doc["policy"]["retained"][0]["upgradeAvailable"], true);
 }
@@ -1103,12 +889,7 @@ async fn vendored_dry_run_previews_only_admitted_patches() {
     mount_api(&server, catalog()).await;
     let repo = Repo::new(Some("version: 2\npatches:\n  packages: [\"pkg:npm/beta\", \"pkg:npm/left-pad\"]\n  minSeverity: medium\n"));
     let before = repo.snapshot();
-    let (code, doc) = scan_json(
-        &repo.dir("services/web"),
-        &server.uri(),
-        &["--mode", "vendored", "--dry-run"],
-        &[],
-    );
+    let (code, doc) = scan_json(&repo.dir("services/web"), &server.uri(), &["--mode", "vendored", "--dry-run"], &[]);
     assert_eq!(code, 0, "{doc:#}");
     assert_eq!(repo.snapshot(), before);
     let previewed: Vec<&str> = doc["vendor"]["patches"]
@@ -1118,14 +899,8 @@ async fn vendored_dry_run_previews_only_admitted_patches() {
         .filter_map(|p| p["purl"].as_str())
         .collect();
     assert_eq!(previewed, ["pkg:npm/left-pad@1.0.0"], "{doc:#}");
-    assert_eq!(
-        filtered_reason(&doc, "pkg:npm/alpha@1.0.0")["reason"],
-        "policy_package_not_listed"
-    );
-    assert_eq!(
-        filtered_reason(&doc, "pkg:npm/beta@1.0.0")["reason"],
-        "policy_severity"
-    );
+    assert_eq!(filtered_reason(&doc, "pkg:npm/alpha@1.0.0")["reason"], "policy_package_not_listed");
+    assert_eq!(filtered_reason(&doc, "pkg:npm/beta@1.0.0")["reason"], "policy_severity");
 }
 
 // ---------------------------------------------------------------------------
@@ -1157,16 +932,9 @@ async fn get_bypasses_the_policy_with_a_warning() {
     let (code, stdout, stderr) = run_cli(&web, &args, &[]);
     assert_eq!(code, 0, "stdout:\n{stdout}\nstderr:\n{stderr}");
     let doc: Value = serde_json::from_str(&stdout).unwrap();
-    let warnings: Vec<&str> = doc["warnings"]
-        .as_array()
-        .unwrap()
-        .iter()
-        .filter_map(Value::as_str)
-        .collect();
+    let warnings: Vec<&str> = doc["warnings"].as_array().unwrap().iter().filter_map(Value::as_str).collect();
     assert!(
-        warnings
-            .iter()
-            .any(|w| w.starts_with("(policy_bypassed)") && w.contains("alpha")),
+        warnings.iter().any(|w| w.starts_with("(policy_bypassed)") && w.contains("alpha")),
         "{doc:#}"
     );
 
@@ -1229,65 +997,30 @@ async fn agent_mode_honors_path_filters_and_keeps_the_prune_universe() {
 
     // The root is excluded by path: nothing selected, and a --sync (agent
     // + prune) still judges the full crawl, so no entry is pruned.
-    std::fs::write(
-        repo.root.join("socket.yml"),
-        "version: 2\npatches:\n  includePaths: [\"/services/legacy/\"]\n",
-    )
-    .unwrap();
+    std::fs::write(repo.root.join("socket.yml"), "version: 2\npatches:\n  includePaths: [\"/services/legacy/\"]\n").unwrap();
     let (code, doc) = scan_json(&web, &server.uri(), &["--sync"], &[]);
     assert_eq!(code, 0, "{doc:#}");
-    assert_eq!(
-        std::fs::read(web.join(".socket/manifest.json")).unwrap(),
-        manifest_before
-    );
+    assert_eq!(std::fs::read(web.join(".socket/manifest.json")).unwrap(), manifest_before);
     assert_eq!(doc["policy"]["filtered"][0]["purl"], Value::Null);
-    assert_eq!(
-        doc["policy"]["filtered"][0]["reason"],
-        "policy_path_not_included"
-    );
-    assert_eq!(
-        doc["policy"]["counts"]["retained"], 2,
-        "{:#}",
-        doc["policy"]
-    );
-    assert_eq!(
-        doc["gc"]["removed"].as_array().map_or(0, Vec::len),
-        0,
-        "{:#}",
-        doc["gc"]
-    );
+    assert_eq!(doc["policy"]["filtered"][0]["reason"], "policy_path_not_included");
+    assert_eq!(doc["policy"]["counts"]["retained"], 2, "{:#}", doc["policy"]);
+    assert_eq!(doc["gc"]["removed"].as_array().map_or(0, Vec::len), 0, "{:#}", doc["gc"]);
 
     // A narrower ecosystem list under --sync prunes nothing either.
-    std::fs::write(
-        repo.root.join("socket.yml"),
-        "version: 2\npatches:\n  ecosystems: [pypi]\n",
-    )
-    .unwrap();
+    std::fs::write(repo.root.join("socket.yml"), "version: 2\npatches:\n  ecosystems: [pypi]\n").unwrap();
     let (code, doc) = scan_json(&web, &server.uri(), &["--sync"], &[]);
     assert_eq!(code, 0, "{doc:#}");
-    assert_eq!(
-        std::fs::read(web.join(".socket/manifest.json")).unwrap(),
-        manifest_before
-    );
+    assert_eq!(std::fs::read(web.join(".socket/manifest.json")).unwrap(), manifest_before);
 
     // patches.enabled: false skips the GC entirely.
     std::fs::remove_dir_all(web.join("node_modules/beta")).unwrap();
-    let pkg_lock = repo
-        .lock("services/web")
-        .replace("\"node_modules/beta\"", "\"node_modules/gone\"");
+    let pkg_lock = repo.lock("services/web").replace("\"node_modules/beta\"", "\"node_modules/gone\"");
     std::fs::write(web.join("package-lock.json"), pkg_lock).unwrap();
-    std::fs::write(
-        repo.root.join("socket.yml"),
-        "version: 2\npatches:\n  enabled: false\n",
-    )
-    .unwrap();
+    std::fs::write(repo.root.join("socket.yml"), "version: 2\npatches:\n  enabled: false\n").unwrap();
     let (code, doc) = scan_json(&web, &server.uri(), &["--sync"], &[]);
     assert_eq!(code, 0, "{doc:#}");
     assert!(doc.get("gc").is_none(), "{doc:#}");
-    assert_eq!(
-        std::fs::read(web.join(".socket/manifest.json")).unwrap(),
-        manifest_before
-    );
+    assert_eq!(std::fs::read(web.join(".socket/manifest.json")).unwrap(), manifest_before);
 }
 
 #[tokio::test]
@@ -1301,53 +1034,29 @@ async fn narrowing_after_vendoring_leaves_the_vendored_package_byte_identical() 
     let before = compute_git_sha256_from_bytes(orig_index("alpha").as_bytes());
     let after = compute_git_sha256_from_bytes(patched_index("alpha").as_bytes());
     std::fs::create_dir_all(web.join(".socket/blobs")).unwrap();
-    std::fs::write(
-        web.join(".socket/blobs").join(&after),
-        patched_index("alpha"),
-    )
-    .unwrap();
+    std::fs::write(web.join(".socket/blobs").join(&after), patched_index("alpha")).unwrap();
     let manifest = json!({"patches": {P_ALPHA.purl(): {
         "uuid": P_ALPHA.uuid, "exportedAt": "2026-01-01T00:00:00Z",
         "files": {"package/index.js": {"beforeHash": before, "afterHash": after}},
         "vulnerabilities": {}, "description": "d", "license": "MIT", "tier": "free"
     }}});
-    std::fs::write(
-        web.join(".socket/manifest.json"),
-        serde_json::to_vec_pretty(&manifest).unwrap(),
-    )
-    .unwrap();
+    std::fs::write(web.join(".socket/manifest.json"), serde_json::to_vec_pretty(&manifest).unwrap()).unwrap();
     let fixture = prebuilt_common::Server::project(&web);
     let (code, stdout, stderr) = run_cli(
         &web,
         &["vendor", "--json", "--cwd", web.to_str().unwrap()],
-        &[
-            ("SOCKET_VENDOR_URL", &fixture.uri),
-            ("SOCKET_PATCH_SERVER_URL", &fixture.uri),
-        ],
+        &[("SOCKET_VENDOR_URL", &fixture.uri), ("SOCKET_PATCH_SERVER_URL", &fixture.uri)],
     );
     assert_eq!(code, 0, "vendor fixture: {stdout}\n{stderr}");
-    assert!(
-        repo.lock("services/web").contains(".socket/vendor/"),
-        "vendored lock"
-    );
+    assert!(repo.lock("services/web").contains(".socket/vendor/"), "vendored lock");
     let snapshot = repo.snapshot();
 
-    std::fs::write(
-        repo.root.join("socket.yml"),
-        "version: 2\npatches:\n  ignorePackages: [\"pkg:npm/alpha\"]\n",
-    )
-    .unwrap();
+    std::fs::write(repo.root.join("socket.yml"), "version: 2\npatches:\n  ignorePackages: [\"pkg:npm/alpha\"]\n").unwrap();
     let (code, doc) = scan_json(&web, &server.uri(), &["--mode", "vendored"], &[]);
     assert_eq!(code, 0, "{doc:#}");
     let mut after_scan = repo.snapshot();
     after_scan.remove("socket.yml");
-    assert_eq!(
-        after_scan, snapshot,
-        "the vendored package, its lock wiring and ledger stay byte-identical"
-    );
-    assert_eq!(
-        doc["policy"]["retained"][0]["purl"], "pkg:npm/alpha@1.0.0",
-        "{:#}",
-        doc["policy"]
-    );
+    assert_eq!(after_scan, snapshot, "the vendored package, its lock wiring and ledger stay byte-identical");
+    assert_eq!(doc["policy"]["retained"][0]["purl"], "pkg:npm/alpha@1.0.0", "{:#}", doc["policy"]);
 }
+

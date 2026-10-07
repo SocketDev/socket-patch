@@ -316,8 +316,8 @@ async fn get_by_package_with_single_paid_patch_emits_paid_required() {
 #[tokio::test]
 async fn get_with_invalid_search_purl_falls_through() {
     // A bare string that doesn't match UUID/CVE/GHSA/PURL is treated as a
-    // package-name search (IdentifierType::Package). That path first
-    // enumerates installed packages in the cwd; with an empty working dir
+    // package-name search (`TargetKind::Name`, the shared target grammar).
+    // That path first enumerates installed packages in the cwd; with an empty working dir
     // there are no packages to match, so the binary must short-circuit to
     // a `no_packages` envelope (exit 0) BEFORE it ever queries the API.
     // We mount the by-package mock to fail the test loudly if the binary

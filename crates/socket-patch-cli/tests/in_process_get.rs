@@ -441,7 +441,7 @@ async fn get_with_explicit_ghsa_flag() {
 }
 
 /// Write a minimal installed npm package under `<cwd>/node_modules/<name>`
-/// so `crawl_all_ecosystems` discovers it as `pkg:npm/<name>@<version>`.
+/// so `crawl_ecosystems` discovers it as `pkg:npm/<name>@<version>`.
 fn install_npm_fixture(cwd: &Path, name: &str, version: &str) {
     let pkg_dir = cwd.join("node_modules").join(name);
     std::fs::create_dir_all(&pkg_dir).unwrap();
@@ -455,7 +455,7 @@ fn install_npm_fixture(cwd: &Path, name: &str, version: &str) {
 #[tokio::test]
 #[serial]
 async fn get_with_explicit_package_no_install_short_circuits() {
-    // `--package` routes through `crawl_all_ecosystems` over the cwd. With
+    // `--package` routes through `crawl_ecosystems` over the cwd. With
     // NO installed packages the run short-circuits on `no_packages` and must
     // exit 0 WITHOUT ever contacting the API. We assert the full contract:
     // exit 0, no manifest, AND that the mounted mock saw zero requests — so a
