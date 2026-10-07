@@ -111,7 +111,59 @@ pub struct VendorArgs {
 /// request is still fully satisfied when these are the only non-successes.
 fn refusal_is_benign(code: &str) -> bool {
     matches!(code, "vendor_unsupported_ecosystem" | "already_vendored")
+        // An older vendored patch kept in force (see [`keep_older_vendored_patch`]).
+        || matches!(code, vendor::VENDOR_PREBUILT_PENDING | vendor::VENDOR_PREBUILT_UNAVAILABLE)
         || socket_patch_core::vendor::jvm::sbt_gate::SKIP_CODES.contains(&code)
+}
+
+/// #954: the patch service has no artifact for `uuid` yet (still building)
+/// or at all (`build_failed`, `not_found`, …) — the backend's failed `Done`
+/// carries [`vendor::VENDOR_PREBUILT_PENDING`] /
+/// [`vendor::VENDOR_PREBUILT_UNAVAILABLE`] — while the ledger already holds
+/// `purl` vendored at another patch. The backend touched nothing, so that
+/// older vendoring is still in force: like hosted mode, which keeps its pin
+/// and skips the upgrade, the package is a benign skip under the unserved
+/// code instead of a failure that would fail every re-run until the server
+/// builds the artifact. Any other outcome passes through, a failure minus
+/// the unserved marker (its error already says it).
+fn keep_older_vendored_patch(
+    outcome: Option<VendorOutcome>,
+    state: &VendorState,
+    purl: &str,
+    uuid: &str,
+) -> Option<VendorOutcome> {
+    let Some(VendorOutcome::Done {
+        result,
+        entry,
+        mut warnings,
+    }) = outcome
+    else {
+        return outcome;
+    };
+    if !result.success {
+        if let Some(i) = warnings.iter().position(|w| {
+            matches!(
+                w.code,
+                vendor::VENDOR_PREBUILT_PENDING | vendor::VENDOR_PREBUILT_UNAVAILABLE
+            )
+        }) {
+            let unserved = warnings.remove(i);
+            if let Some(kept) = lookup_entry(&state.entries, purl).filter(|e| e.uuid != uuid) {
+                return Some(VendorOutcome::Refused {
+                    code: unserved.code,
+                    detail: format!(
+                        "kept the vendored patch {}: {} for patch {uuid}",
+                        kept.uuid, unserved.detail
+                    ),
+                });
+            }
+        }
+    }
+    Some(VendorOutcome::Done {
+        result,
+        entry,
+        warnings,
+    })
 }
 
 /// The `vendor_dir_symlink_unsupported` detail when `purl`'s vendor dir
@@ -3208,6 +3260,7 @@ pub(crate) async fn vendor_records_reusing(
                 }
             }
 
+            let outcome = keep_older_vendored_patch(outcome, &state, candidate, &record.uuid);
             match outcome {
                 None => {
                     env.record(

@@ -1136,6 +1136,72 @@ mod tests {
         );
     }
 
+    /// The warning codes riding a failed `Done` (the vendor loop's tell for
+    /// "not served (yet)", #954).
+    fn done_warning_codes(outcome: &VendorOutcome) -> Vec<&'static str> {
+        match outcome {
+            VendorOutcome::Done { warnings, .. } => warnings.iter().map(|w| w.code).collect(),
+            other => panic!("expected Done failure, got {other:?}"),
+        }
+    }
+
+    /// #954: a patch the service has no artifact for — still building, or
+    /// `build_failed` / `not_found` / `withdrawn` — fails with the code the
+    /// vendor loop reads to keep an older vendored patch of the package.
+    #[tokio::test]
+    async fn unserved_artifact_failure_carries_the_unserved_code() {
+        for (status, code, needle) in [
+            (
+                "pending_build",
+                crate::vendor::VENDOR_PREBUILT_PENDING,
+                "still building",
+            ),
+            (
+                "build_failed",
+                crate::vendor::VENDOR_PREBUILT_UNAVAILABLE,
+                "build_failed",
+            ),
+            (
+                "not_found",
+                crate::vendor::VENDOR_PREBUILT_UNAVAILABLE,
+                "not_found",
+            ),
+            (
+                "withdrawn",
+                crate::vendor::VENDOR_PREBUILT_UNAVAILABLE,
+                "withdrawn",
+            ),
+        ] {
+            let server = wiremock::MockServer::start().await;
+            mount_status_only(&server, status).await;
+            let tmp = tempfile::tempdir().unwrap();
+            let record = record_with_uuid(UUID);
+            let cfg = service_cfg(&server.uri(), VendorSource::Service);
+            let err = expect_err(run_pipeline(tmp.path(), &record, Some(&cfg)).await);
+            assert_eq!(done_warning_codes(&err), vec![code], "{status}");
+            expect_done_failure(err, needle);
+        }
+    }
+
+    /// A request failure is not "unserved": no code, so the vendor loop
+    /// still fails the package (#954 keeps only the served-status misses).
+    #[tokio::test]
+    async fn request_failure_carries_no_unserved_code() {
+        use wiremock::matchers::{method, path};
+        use wiremock::{Mock, ResponseTemplate};
+        let server = wiremock::MockServer::start().await;
+        Mock::given(method("POST"))
+            .and(path("/v0/orgs/acme/patches/package"))
+            .respond_with(ResponseTemplate::new(500))
+            .mount(&server)
+            .await;
+        let tmp = tempfile::tempdir().unwrap();
+        let record = record_with_uuid(UUID);
+        let cfg = service_cfg(&server.uri(), VendorSource::Service);
+        let err = expect_err(run_pipeline(tmp.path(), &record, Some(&cfg)).await);
+        assert!(done_warning_codes(&err).is_empty());
+    }
+
     /// `--vendor-source=service` + a request/transport failure (HTTP 500 on
     /// the package-reference POST) = hard fail naming the request failure.
     #[tokio::test]

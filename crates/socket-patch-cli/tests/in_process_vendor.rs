@@ -776,6 +776,127 @@ async fn revendor_new_uuid_cleans_stale_artifact_and_still_reverts() {
 }
 
 // ─────────────────────────────────────────────────────────────────────
+// 8c'. a superseding patch the service has not built keeps the old one
+// ─────────────────────────────────────────────────────────────────────
+
+/// #954: the package is vendored at `UUID`, then its patch moves to `UUID2`
+/// whose prebuilt artifact the service has not built (`pending_build`) or
+/// cannot serve (`build_failed`, `not_found`). The older vendoring is still
+/// in force — nothing is touched — so the run keeps it and reports a skip
+/// under the unserved code (exit 0), the way hosted mode keeps its pin,
+/// instead of failing every re-run until the server builds the artifact.
+#[tokio::test]
+async fn superseding_patch_without_a_served_artifact_keeps_the_vendored_one() {
+    use wiremock::matchers::{method, path_regex};
+    use wiremock::{Mock, MockServer, ResponseTemplate};
+    const UUID2: &str = "0a1b2c3d-4e5f-6a7b-8c9d-0e1f2a3b4c5d";
+    for (status, code) in [
+        ("pending_build", "vendor_prebuilt_pending"),
+        ("build_failed", "vendor_prebuilt_unavailable"),
+        ("not_found", "vendor_prebuilt_unavailable"),
+    ] {
+        let fx = npm_fixture();
+        assert_eq!(vendor_run(vendor_args(fx.root())).await, 0);
+        let wired_lock = fx.lock_bytes();
+        let state_before = std::fs::read(fx.state_path()).unwrap();
+
+        let mut manifest: Value =
+            serde_json::from_slice(&std::fs::read(fx.manifest_path()).unwrap()).unwrap();
+        manifest["patches"][PURL]["uuid"] = json!(UUID2);
+        std::fs::write(
+            fx.manifest_path(),
+            serde_json::to_vec_pretty(&manifest).unwrap(),
+        )
+        .unwrap();
+
+        let server = MockServer::start().await;
+        Mock::given(method("POST"))
+            .and(path_regex(r"/(patch|patches)/package$"))
+            .respond_with(
+                ResponseTemplate::new(200)
+                    .set_body_json(json!({ "results": { UUID2: { "status": status } } })),
+            )
+            .mount(&server)
+            .await;
+        let uri = server.uri();
+        let (code_out, env) = vendor_cli(
+            fx.root(),
+            &[
+                "--api-url",
+                &uri,
+                "--vendor-url",
+                &uri,
+                "--api-token",
+                "sktsec_placeholder_value_for_tests_api",
+                "--org",
+                "acme",
+                "--lock-timeout",
+                "5",
+            ],
+        );
+        assert_eq!(code_out, 0, "{status}: the older patch is kept: {env:#}");
+        let skipped = find_event(&env, "skipped", Some(code));
+        assert_eq!(skipped["purl"], PURL);
+        assert!(
+            skipped.to_string().contains(UUID) && skipped.to_string().contains(UUID2),
+            "{status}: names the kept and the unserved patch: {skipped}"
+        );
+        assert_eq!(env["summary"]["failed"], 0, "{status}: {env:#}");
+        assert_eq!(fx.lock_bytes(), wired_lock, "{status}: wiring untouched");
+        assert_eq!(
+            std::fs::read(fx.state_path()).unwrap(),
+            state_before,
+            "{status}: ledger untouched"
+        );
+        assert!(fx.tgz_path().is_file(), "{status}: old artifact kept");
+    }
+}
+
+/// The #954 skip is only for a package vendored at ANOTHER patch: a first
+/// vendor whose artifact is still building has nothing to keep and fails.
+#[tokio::test]
+async fn unserved_first_vendor_still_fails() {
+    use wiremock::matchers::{method, path_regex};
+    use wiremock::{Mock, MockServer, ResponseTemplate};
+    let fx = npm_fixture();
+    let server = MockServer::start().await;
+    Mock::given(method("POST"))
+        .and(path_regex(r"/(patch|patches)/package$"))
+        .respond_with(
+            ResponseTemplate::new(200)
+                .set_body_json(json!({ "results": { UUID: { "status": "pending_build" } } })),
+        )
+        .mount(&server)
+        .await;
+    let uri = server.uri();
+    let (code, env) = vendor_cli(
+        fx.root(),
+        &[
+            "--api-url",
+            &uri,
+            "--vendor-url",
+            &uri,
+            "--api-token",
+            "sktsec_placeholder_value_for_tests_api",
+            "--org",
+            "acme",
+            "--lock-timeout",
+            "5",
+        ],
+    );
+    assert_eq!(code, 1, "{env:#}");
+    let failed = find_event(&env, "failed", None);
+    assert!(failed.to_string().contains("still building"), "{failed}");
+    assert!(
+        events(&env)
+            .iter()
+            .all(|e| e["errorCode"] != "vendor_prebuilt_pending"),
+        "no unserved marker leaks out of a real failure: {env:#}"
+    );
+    assert_eq!(fx.lock_bytes(), fx.original_lock);
+}
+
+// ─────────────────────────────────────────────────────────────────────
 // 8d. re-vendor under a new patch uuid — yarn berry
 // ─────────────────────────────────────────────────────────────────────
 
