@@ -42,9 +42,12 @@ pub async fn preflight_pypi_takeover(
 /// whose `version` equals the patch's (`matching_package`), so a recorded
 /// unit at another version can never be taken over.
 fn preflight_uv_takeover(entry: &VendorEntry) -> Result<(), RewriteWarning> {
-    let Some((_, patch_version)) = entry.base_purl.rsplit_once('@') else {
+    let Some((_, raw_version)) = entry.base_purl.rsplit_once('@') else {
         return Ok(());
     };
+    // Ledger purls keep the API's encoding (a PEP 440 local `+` is `%2B`);
+    // the lock and `matching_package` compare the decoded version.
+    let patch_version = crate::utils::purl::percent_decode_purl_component(raw_version);
     for record in entry.wiring.iter().filter(|r| r.kind == "uv_lock_package") {
         let Some(original) = record.original.as_ref().and_then(|v| v.as_str()) else {
             continue;
@@ -52,7 +55,7 @@ fn preflight_uv_takeover(entry: &VendorEntry) -> Result<(), RewriteWarning> {
         let Some(locked) = recorded_unit_version(original) else {
             continue;
         };
-        if locked != patch_version {
+        if locked != *patch_version {
             return Err(RewriteWarning {
                 code: "redirect_uv_takeover_version_unreachable".into(),
                 detail: format!(
@@ -185,6 +188,13 @@ mod tests {
     #[test]
     fn uv_entry_at_the_patch_version_is_admitted() {
         assert!(preflight_uv_takeover(&entry("uv", vec![uv_package("1.16.0")])).is_ok());
+    }
+
+    #[test]
+    fn uv_entry_at_an_encoded_local_patch_version_is_admitted() {
+        let mut e = entry("uv", vec![uv_package("1.16.0+socket.1")]);
+        e.base_purl = "pkg:pypi/six@1.16.0%2Bsocket.1".into();
+        assert!(preflight_uv_takeover(&e).is_ok());
     }
 
     #[test]
