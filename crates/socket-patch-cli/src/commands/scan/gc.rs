@@ -54,8 +54,9 @@ pub(super) struct GcSummary {
     /// finish (`cleanup_failed`: the pass aborted, or left orphans it could
     /// not unlink — the removed counts above are what it did reclaim). The
     /// mutations already happened on disk, so the stale record is reported,
-    /// not the pass failed. Serialized as additive `warnings[]` on the
-    /// apply shape only.
+    /// not the pass failed. Also the vendored reverts' backend advisories
+    /// (e.g. `vendor_bun_reinstall_required`). Serialized as additive
+    /// `warnings[]` on the apply shape only.
     warnings: Vec<(&'static str, String)>,
 }
 
@@ -88,6 +89,7 @@ impl GcSummary {
         self.vendored_failed = v.failed;
         self.vendored_failed.sort();
         self.warnings.extend(v.write_failures);
+        self.warnings.extend(v.advisories);
         self.vendor_orphan_dirs = v.orphan_dirs;
     }
 

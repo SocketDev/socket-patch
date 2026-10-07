@@ -311,6 +311,7 @@ async fn takeover_vendors_over_a_hosted_bun_lockb_and_reverts_exactly() {
             p.lock() == p.pristine,
             "{writer}: the revert restores the pre-hosted bun.lockb byte for byte"
         );
+        assert_reinstall_advised(&env);
     }
 }
 
@@ -326,6 +327,27 @@ async fn eject_vendors_a_hosted_bun_lockb_and_reverts_exactly() {
     let (code, env) = p.run_json(&["vendor", "--revert"]);
     assert_eq!(code, 0, "revert: {env:#}");
     assert!(p.lock() == p.pristine, "exact pre-hosted bytes");
+    assert_reinstall_advised(&env);
+}
+
+/// #764: the revert put minimist's registry record back while the hoisted
+/// `node_modules/minimist` still holds the vendored bytes, which a plain
+/// `bun install` keeps: the envelope carries exactly one per-entry advisory
+/// naming `bun install --force`.
+fn assert_reinstall_advised(env: &Value) {
+    let advisories: Vec<&Value> = env["events"]
+        .as_array()
+        .into_iter()
+        .flatten()
+        .filter(|e| e["errorCode"] == "vendor_bun_reinstall_required")
+        .collect();
+    assert_eq!(advisories.len(), 1, "{env:#}");
+    assert_eq!(advisories[0]["purl"], PURL, "{env:#}");
+    let detail = advisories[0]["reason"].as_str().unwrap_or_default();
+    assert!(
+        detail.contains("minimist@1.2.2") && detail.contains("`bun install --force`"),
+        "{env:#}"
+    );
 }
 
 /// A hosted lock whose workspace dependency behaviors the rewrite had to

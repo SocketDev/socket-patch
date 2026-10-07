@@ -4183,6 +4183,17 @@ pub(crate) struct VendorGcSummary {
     /// "manifest_write_failed", <detail>)`. The reverts themselves already
     /// happened on disk; the stale record is what the caller must report.
     pub write_failures: Vec<(&'static str, String)>,
+    /// The wet reverts' backend advisories (`code`, `detail`), e.g. Bun's
+    /// `vendor_bun_reinstall_required` (#764): every other reverting
+    /// command surfaces these, and the GC must not drop them.
+    pub advisories: Vec<(&'static str, String)>,
+}
+
+impl VendorGcSummary {
+    fn take_advisories(&mut self, outcome: &RevertOutcome) {
+        self.advisories
+            .extend(outcome.warnings.iter().map(|w| (w.code, w.detail.clone())));
+    }
 }
 
 /// The vendored-state GC behind `scan --prune`:
@@ -4248,6 +4259,7 @@ pub(crate) async fn run_vendor_gc(
             }
             let entry = state.entries.get(&purl).cloned().expect("listed above");
             let outcome = dispatch_revert_one(&entry, &common.cwd, false).await;
+            out.take_advisories(&outcome);
             if !outcome.success {
                 out.failed.push(purl);
             } else if outcome.kept_artifact {
@@ -4284,6 +4296,7 @@ pub(crate) async fn run_vendor_gc(
             continue;
         }
         let outcome = dispatch_revert_one(&entry, &common.cwd, false).await;
+        out.take_advisories(&outcome);
         if !outcome.success {
             out.failed.push(purl);
             continue;
