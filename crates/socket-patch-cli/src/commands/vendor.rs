@@ -1140,18 +1140,22 @@ async fn run_check(args: &VendorArgs) -> i32 {
             return emit_eject_refusal(&args.common, "vendor_state_unreadable", &e.to_string())
         }
     };
-    if state.entries.is_empty()
-        && [
-            ".socket/vendor/maven2",
-            ".socket/vendor/gradle",
-            ".socket/vendor/gradle-index.tsv",
-            socket_patch_core::vendor::jvm::sbt::BUILD_FILE,
-        ]
-        .iter()
-        .chain(socket_patch_core::vendor::jvm::coursier_tree::ORPHAN_PATHS)
-        .any(|rel| root.join(rel).exists())
-    {
-        return emit_eject_refusal(&args.common, "vendor_ledger_missing", "JVM artifacts exist without a vendor ledger; restore .socket/vendor/state.json from version control");
+    // JVM trees are not `.socket/vendor/<eco>/<uuid>` dirs the reference
+    // scan below can name, so their layout is checked against the ledger's
+    // JVM entries directly: present with none of them is an orphan, whatever
+    // other ecosystems the ledger records.
+    let jvm_orphan = (!state.entries.values().any(vendor::jvm::apply::is_jvm_entry))
+        .then(|| {
+            vendor::jvm::apply::LEDGER_OWNED_PATHS
+                .iter()
+                .copied()
+                .find(|rel| root.join(rel).exists())
+        })
+        .flatten();
+    const JVM_ORPHAN_DETAIL: &str = "JVM artifacts exist without a vendor ledger entry; restore \
+                                     .socket/vendor/state.json from version control";
+    if state.entries.is_empty() && jvm_orphan.is_some() {
+        return emit_eject_refusal(&args.common, "vendor_ledger_missing", JVM_ORPHAN_DETAIL);
     }
     let manifest_path = args.common.resolved_manifest_path();
     let manifest = match read_manifest(&manifest_path).await {
@@ -1232,6 +1236,16 @@ async fn run_check(args: &VendorArgs) -> i32 {
             "vendor_ledger_missing",
             "patch has no vendored ledger entry",
         ));
+    }
+    if let Some(rel) = jvm_orphan {
+        if !args.common.json {
+            eprintln!("vendor_ledger_missing: {JVM_ORPHAN_DETAIL}");
+        }
+        env.record(
+            PatchEvent::artifact(PatchAction::Failed)
+                .with_error("vendor_ledger_missing", JVM_ORPHAN_DETAIL)
+                .with_details(serde_json::json!({ "ecosystem": "maven", "path": rel })),
+        );
     }
     // A project file still wired to a vendored artifact the ledger does not
     // know (the ledger was ignored or dropped from the commit along with the

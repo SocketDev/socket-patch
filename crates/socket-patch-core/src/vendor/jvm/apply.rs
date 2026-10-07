@@ -697,15 +697,28 @@ pub async fn revert(root: &Path, entry: &VendorEntry, opts: RevertOpts) -> Rever
 /// The vendored repository trees JVM entries write under `.socket/vendor`
 /// (sbt's Coursier tree included).
 pub(crate) const VENDOR_TREES: &[&str] = &[
-    ".socket/vendor/maven2",
-    ".socket/vendor/gradle",
+    maven_reactor::TREE_ROOT,
+    gradle::TREE_ROOT,
     coursier_tree::TREE_ROOT,
+];
+
+/// The committed JVM layout only a JVM ledger entry ([`is_jvm_entry`]) can
+/// own — the repository trees plus the indexes and the generated sbt build
+/// file beside them. Any of them present with no JVM entry in the ledger is
+/// an orphan: `vendor --check` reports `vendor_ledger_missing` for it.
+pub const LEDGER_OWNED_PATHS: &[&str] = &[
+    maven_reactor::TREE_ROOT,
+    gradle::TREE_ROOT,
+    gradle::INDEX_REL,
+    coursier_tree::TREE_ROOT,
+    coursier_tree::INDEX_REL,
+    sbt::BUILD_FILE,
 ];
 
 /// Owned directories pruned once empty, up to and including themselves.
 const OWNED_DIRS: &[&str] = &[
-    ".socket/vendor/maven2",
-    ".socket/vendor/gradle",
+    maven_reactor::TREE_ROOT,
+    gradle::TREE_ROOT,
     ".socket/gradle",
     coursier_tree::TREE_ROOT,
 ];
