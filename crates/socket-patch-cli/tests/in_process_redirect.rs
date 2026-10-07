@@ -1621,6 +1621,80 @@ async fn scan_redirect_heals_digestless_bun_tuple_and_rollback_restores_the_regi
     }
 }
 
+/// #992: Bun writes a package's full tarball URL into the `bun.lock`
+/// registry slot whenever it is not under registry.npmjs.org, and Bun
+/// 1.1.39–1.3.6 read an empty slot as npmjs whatever bunfig says. A hosted
+/// rollback in a project whose `bunfig.toml` names a mirror must write the
+/// mirror's URL back, not `""`: read from the mirror's own version document
+/// when it answers, and rebuilt on the mirror from the default registry's
+/// conventional URL (with `upstream_registry_fallback`) when it doesn't.
+#[tokio::test]
+#[serial]
+async fn bun_rollback_keeps_the_bunfig_registry_tarball_url() {
+    let server = MockServer::start().await;
+    mock_discovery(&server).await;
+    mock_reference(&server).await;
+    mock_view(&server).await;
+    let integrity = "sha512-UPSTREAMupstream==";
+    mock_npm_registry(&server, integrity, None).await;
+    // A mirror that serves its version document (conventional URLs).
+    let mirror_tarball = format!("{}/mirror/{NAME}/-/{NAME}-{VERSION}.tgz", server.uri());
+    Mock::given(method("GET"))
+        .and(path(format!("/mirror/{NAME}/{VERSION}")))
+        .respond_with(ResponseTemplate::new(200).set_body_json(serde_json::json!({
+            "name": NAME,
+            "version": VERSION,
+            "dist": { "tarball": mirror_tarball, "integrity": integrity },
+        })))
+        .mount(&server)
+        .await;
+
+    // `private` answers nothing: the restore falls back to the default
+    // registry's document and re-bases its conventional URL on the mirror.
+    for (mirror, readable) in [("mirror", true), ("private", false)] {
+        let tmp = tempfile::tempdir().unwrap();
+        write_bun_project(tmp.path(), 1);
+        let lock_path = tmp.path().join("bun.lock");
+        let slot = format!("{}/{mirror}/{NAME}/-/{NAME}-{VERSION}.tgz", server.uri());
+        let pristine = std::fs::read_to_string(&lock_path)
+            .unwrap()
+            .replace("\"\", {}", &format!("\"{slot}\", {{}}"));
+        std::fs::write(&lock_path, &pristine).unwrap();
+        std::fs::write(
+            tmp.path().join("bunfig.toml"),
+            format!("[install]\nregistry = \"{}/{mirror}/\"\n", server.uri()),
+        )
+        .unwrap();
+
+        let env = run_redirect_subprocess(tmp.path(), &server.uri());
+        assert_eq!(env["redirect"]["redirected"], 1, "{mirror}: {env:#}");
+        assert!(
+            std::fs::read_to_string(&lock_path)
+                .unwrap()
+                .contains(HOSTED_URL),
+            "{mirror}: the lock is hosted"
+        );
+
+        let (code, env) = rollback_json(tmp.path(), &server);
+        assert_eq!(code, Some(0), "{mirror}: rollback: {env:#}");
+        assert_eq!(
+            env["hosted"]["reverted"],
+            serde_json::json!([PURL]),
+            "{mirror}: {env:#}"
+        );
+        assert_eq!(
+            std::fs::read_to_string(&lock_path).unwrap(),
+            pristine,
+            "{mirror}: rollback writes the mirror's tarball URL back into the registry slot"
+        );
+        assert_eq!(
+            env.to_string().contains("upstream_registry_fallback"),
+            !readable,
+            "{mirror}: {env:#}"
+        );
+    }
+}
+
 // Native binary lockfiles are parsed and patched without invoking Bun.
 const INVALID_LOCKB_BYTES: &[u8] = b"\x00BUN-BINARY\xff\xfe\x00LOCK";
 
