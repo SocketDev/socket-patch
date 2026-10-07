@@ -1137,40 +1137,86 @@ fn pin_spellings_and_shadowed_blocks() {
 /// surface does with a PnP checkout that nonetheless carries Socket lock
 /// wiring (hand-made, or left behind by a linker switch):
 ///
-/// * standalone `vex`, hosted: there is no crawlable installed tree, so the
-///   ref is "not installed" and attests on the lock's integrity pin exactly
-///   like a lockfile-only checkout (design D5 — yarn enforces the berry
-///   `checksum:` on every fetch into the zip cache). Berry 2/3's bare-hex
-///   checksum is no pin (module doc), so those are omitted
-///   (`package_not_found`) — never a false attestation.
+/// * standalone `vex`, hosted: there is no crawlable installed tree, so
+///   "not found" does not mean "not installed". The lock's integrity pin
+///   attests (design D5 — yarn enforces the berry `checksum:` on every
+///   fetch into the zip cache) only when the PnP loader itself resolves the
+///   package through the patch (a fresh install of the hosted lock: berry
+///   names the hosted url, classic the resolved url's hash). A loader
+///   written before the lock was rewired runs the registry copy, so the
+///   purl is omitted (`package_not_found`, #519). Berry 2/3's bare-hex
+///   checksum is no pin (module doc), so those are omitted either way —
+///   never a false attestation.
 /// * standalone `vex`, vendored: the committed tarball is the evidence
 ///   whatever the linker; PnP consumes the same `file:` artifact.
 /// * `apply --vex`: apply refuses a PnP layout outright, manifest or not
 ///   (`yarn_pnp_unsupported`, exit 1, no document).
 #[test]
 fn pnp_layout_contract() {
-    for flavor in [Flavor::Berry2, Flavor::Berry3, Flavor::Berry4] {
-        for mode in ["hosted", "vendored"] {
+    for flavor in FLAVORS {
+        for mode in ["hosted", "hosted-stale", "vendored"] {
+            if mode == "vendored" && !flavor.is_berry() {
+                continue;
+            }
             let tmp = tempfile::tempdir().unwrap();
             let cwd = tmp.path();
-            if mode == "hosted" {
-                hosted_checkout(cwd, flavor);
-            } else {
+            if mode == "vendored" {
                 vendored_checkout(cwd, flavor, PATCHED);
+            } else {
+                hosted_checkout(cwd, flavor);
             }
-            put(
-                cwd,
-                ".yarnrc.yml",
-                b"nodeLinker: pnp\nenableGlobalCache: false\n",
-            );
-            put(cwd, ".pnp.cjs", b"/* yarn PnP loader */\n");
+            let fresh = mode != "hosted-stale";
+            if flavor.is_berry() {
+                put(
+                    cwd,
+                    ".yarnrc.yml",
+                    b"nodeLinker: pnp\nenableGlobalCache: false\n",
+                );
+                // The package registry of `.pnp.cjs`: a fresh install of the
+                // hosted lock names the hosted locator, an install from
+                // before the rewire the registry one.
+                let reference = if fresh {
+                    format!(
+                        "npm:1.3.0::__archiveUrl={}",
+                        encode_uri_component(&berry_hosted_url("https://patch.socket.dev", UUID))
+                    )
+                } else {
+                    "npm:1.3.0".to_string()
+                };
+                put(
+                    cwd,
+                    ".pnp.cjs",
+                    format!(
+                        "/* yarn PnP loader */\n[\"left-pad\", [[\"{reference}\", \
+                         {{\"packageLocation\": \"./.yarn/cache/left-pad.zip/node_modules/left-pad/\"}}]]]\n"
+                    )
+                    .as_bytes(),
+                );
+            } else {
+                // yarn 1 (`installConfig.pnp`): `.pnp.js` names the cache
+                // folder, whose hash is the resolved url's fragment.
+                let hash = if fresh {
+                    "abcdef0123456789abcdef0123456789abcdef01"
+                } else {
+                    "5b8a3a7765dfe001261dde915589e782f8c94d1e"
+                };
+                put(
+                    cwd,
+                    ".pnp.js",
+                    format!(
+                        "/* yarn PnP loader */\npackageLocation: \
+                         \"/home/u/.cache/yarn/v6/npm-left-pad-1.3.0-{hash}-integrity/node_modules/left-pad/\"\n"
+                    )
+                    .as_bytes(),
+                );
+            }
             assert!(!cwd.join("node_modules").exists());
             let (_rt, server) = serve_left_pad();
             let (code, env) = vex_json(cwd, &["--proxy-url", &server.uri()]);
             let cell = format!("{flavor:?} {mode} PnP vex");
             if mode == "vendored" {
                 assert_attested(cwd, code, &env, UUID, "vendored", &cell);
-            } else if flavor.hosted_pin_is_read() {
+            } else if fresh && flavor.hosted_pin_is_read() {
                 assert_attested(cwd, code, &env, UUID, "redirected", &cell);
             } else {
                 assert_omitted(cwd, code, &env, "package_not_found", &cell);

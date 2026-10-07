@@ -11,7 +11,10 @@ vendored (`vendor` wires the root
 linkers are covered end to end; Plug'n'Play keeps packages inside
 `.yarn/cache` zips, so `vendor` refuses it (`vendor_yarn_berry_unsupported`)
 and so does `apply` (`yarn_pnp_unsupported`), while standalone `vex` still
-attests a hosted lock's `checksum:` pin.
+attests a hosted lock's `checksum:` pin once the PnP loader (`.pnp.cjs`)
+resolves the package through the hosted url. A loader written before the lock
+was rewired still runs the registry copy, so `vex` omits the package
+(`package_not_found`) until `yarn install` rewrites it (#519).
 
 ## Hosted pin shape and registry credentials
 
