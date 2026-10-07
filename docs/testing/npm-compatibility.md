@@ -17,7 +17,7 @@ Measured against the real releases (Node 24.21 on macOS, 2026-09-22):
 | 6.14.18 | lockfileVersion 1 | renames the lock | **fails closed**: EINTEGRITY — npm 6 fetches registry dependencies from the configured registry and ignores `resolved`, so the patched sha512 pin rejects the registry bytes (`redirect_npm_legacy_client` warns) | a v1 lock is refused (`vendor_lockfile_version_unsupported`), and a hosted → vendored takeover refuses it before restoring the hosted pin, so the package stays hosted; npm 6 DOES install a vendored **v2** lock (written by npm 7+) from its legacy `dependencies` mirror |
 | 7.0.0, 7.24.2, 8.19.4 | lockfileVersion 2 (+ v1 mirror) | renames the lock | patched (npm 6 installing this v2 lock: patched, except an npm alias, which npm 6 fetches from the registry, so it **fails closed** with EINTEGRITY and `redirect_npm_legacy_alias_client` warns) | patched (npm 6 installing this v2 lock: patched, alias nodes included) |
 | 9.0.0, 9.9.4, 10.9.9, 11.20.0 | lockfileVersion 3 | renames the lock | patched | patched |
-| 12.0.0, 12.1.0 | lockfileVersion 3 | **removed** — a committed shrinkwrap gets a package-lock.json twin on first install, and installs read the twin | patched with a plain `npm ci` — the hosted run writes `allow-remote=all` to the project `.npmrc` (`redirect_npm_allow_remote` warns on every npm hosted run); the same checkout WITHOUT that `.npmrc` is refused EALLOWREMOTE | patched (both locks are rewired in the dual-lock state) |
+| 12.0.0, 12.1.0 | lockfileVersion 3 | **removed** — npm 12 never reads npm-shrinkwrap.json: a shrinkwrap-only checkout is resolved from the registry into a fresh package-lock.json (so its patches stay unpatched under npm 12, see below), and installs read package-lock.json | patched with a plain `npm ci` — the hosted run writes `allow-remote=all` to the project `.npmrc` (`redirect_npm_allow_remote` warns on every npm hosted run); the same checkout WITHOUT that `.npmrc` is refused EALLOWREMOTE | patched (both locks are rewired in the dual-lock state) |
 
 npm 12 notes:
 
@@ -56,7 +56,11 @@ npm 12 notes:
   value case-sensitively (`all` admits everything, `none` nothing, anything
   else — `root`, `All`, a typo — only direct dependencies).
 - `npm ci` refuses a project whose only lock is npm-shrinkwrap.json; `npm
-  install` copies it to package-lock.json and installs from the copy. With
+  install` ignores it, resolves the tree from the registry and writes a fresh
+  package-lock.json (npm 12.0.0 – 12.2.0, #899), so a shrinkwrap-only
+  rewrite reaches npm <= 11 only: hosted and vendored runs warn
+  `redirect_npm_shrinkwrap_only` / `vendor_npm_shrinkwrap_only` and `vex`
+  omits the patch (`vex_npm_shrinkwrap_only`). With
   both present, npm 12 installs from package-lock.json while npm <= 11 installs
   from the shrinkwrap — so hosted and vendored rewrites wire BOTH, and
   manifest-less VEX refuses to attest a package one lock wires while the other

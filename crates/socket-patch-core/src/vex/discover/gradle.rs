@@ -192,7 +192,13 @@ pub(crate) async fn extract(ctx: &DiscoverCtx<'_>, out: &mut Discovery) {
             continue;
         };
         if let Some((rel, detail)) = bypass {
-            out.unattested(&purl, &row.uuid, &rel, detail);
+            out.unattested(
+                &purl,
+                &row.uuid,
+                &rel,
+                super::UnattestedWhy::GradleLockAboveBase,
+                detail,
+            );
         }
         out.push(PatchedRef::hosted(
             purl,

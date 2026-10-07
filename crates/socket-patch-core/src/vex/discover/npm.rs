@@ -52,8 +52,8 @@ use serde_json::Value;
 
 use super::{
     npm_purl, npm_vendored_tarball_names, parse_json, vendor_ref, DiscoverCtx, Discovery,
-    LocateOpts, Located, PatchedRef, VendorRef, DIAG_LOCKFILE_UNPARSEABLE, DIAG_REF_INVALID,
-    DIAG_REF_UNATTRIBUTABLE,
+    LocateOpts, Located, PatchedRef, UnattestedWhy, VendorRef, DIAG_LOCKFILE_UNPARSEABLE,
+    DIAG_REF_INVALID, DIAG_REF_UNATTRIBUTABLE,
 };
 use crate::constants::npm_family::{NPM_LOCKS, PNPM_LOCK, PNPM_SHRINKWRAP_LEGACY};
 use crate::formats::pnpm::{
@@ -133,6 +133,10 @@ impl NpmLockRefs {
 /// `name@version` elsewhere (#588 — e.g. a workspace member added after
 /// the rewire, then `npm install`): npm installs every entry, and that one
 /// fetches the unpatched registry bytes.
+///
+/// A ref in a lone `npm-shrinkwrap.json` (no package-lock.json twin) is
+/// pushed but marked [`UnattestedWhy::NpmShrinkwrapOnly`] (#899): npm 12
+/// never reads the shrinkwrap and installs from the registry instead.
 fn push_uncontested(locks: Vec<NpmLockRefs>, out: &mut Discovery) {
     let wired: Vec<BTreeSet<String>> = locks
         .iter()
@@ -212,6 +216,28 @@ fn push_uncontested(locks: Vec<NpmLockRefs>, out: &mut Discovery) {
                     ),
                 );
             } else {
+                if locks.len() == 1 && lock.file == NPM_LOCKS[0] {
+                    // A shrinkwrap with no package-lock.json twin (#899):
+                    // npm 12 no longer reads npm-shrinkwrap.json at all — it
+                    // resolves the tree fresh from the registry and writes
+                    // its own package-lock.json — so the wiring reaches npm
+                    // <= 11 only. The ref stays (rollback, remove and list
+                    // still manage it); VEX omits it.
+                    out.unattested(
+                        &r.purl,
+                        &r.uuid,
+                        lock.file,
+                        UnattestedWhy::NpmShrinkwrapOnly,
+                        format!(
+                            "{} has no {} twin — npm >= 12 never reads {}, resolves the \
+                             package from the registry and writes a fresh {}, so only npm \
+                             <= 11 installs the patched bytes; rename the lock to {} (or \
+                             commit a copy under that name) and re-run `socket-patch vendor` \
+                             / `scan --mode hosted`",
+                            lock.file, NPM_LOCKS[1], NPM_LOCKS[0], NPM_LOCKS[1], NPM_LOCKS[1],
+                        ),
+                    );
+                }
                 out.push(r.clone());
             }
         }
@@ -1102,6 +1128,61 @@ mod tests {
                 out.recognized
             );
         }
+    }
+
+    /// REGRESSION (#899): a shrinkwrap with NO package-lock.json twin is
+    /// not attested. npm 12 never reads npm-shrinkwrap.json: it resolves the
+    /// tree from the registry and writes a fresh package-lock.json, so the
+    /// wiring reaches npm <= 11 only — hosted or vendored. The refs stay
+    /// (rollback, remove and list manage them) and are marked
+    /// [`UnattestedWhy::NpmShrinkwrapOnly`]. A package-lock.json alone, and
+    /// a shrinkwrap with a wired twin, still attest.
+    #[tokio::test]
+    async fn a_shrinkwrap_without_a_package_lock_twin_is_not_attested() {
+        let hosted = hosted_url("npm", "left-pad", "1.3.0", UUID_A, "left-pad-1.3.0.tgz");
+        let vendored = format!("file:.socket/vendor/npm/{UUID_B}/minimist-1.2.5.tgz");
+        let wired = || {
+            lock_with_packages(serde_json::json!({
+                "node_modules/left-pad": { "version": "1.3.0", "resolved": hosted, "integrity": SRI },
+                "node_modules/minimist": { "version": "1.2.5", "resolved": vendored, "integrity": SRI },
+            }))
+        };
+        let p = Project::new();
+        p.write("npm-shrinkwrap.json", wired());
+        let out = run(&p).await;
+        assert_eq!(out.refs.len(), 2, "the wiring stays managed: {:#?}", out);
+        assert!(out.diagnostics.is_empty(), "{:?}", out.diagnostics);
+        assert_eq!(out.unattested.len(), 2, "{:#?}", out.unattested);
+        for (purl, uuid) in [
+            ("pkg:npm/left-pad@1.3.0", UUID_A),
+            ("pkg:npm/minimist@1.2.5", UUID_B),
+        ] {
+            assert!(
+                out.unattested.iter().any(|u| u.purl == purl
+                    && u.uuid == uuid
+                    && u.why == UnattestedWhy::NpmShrinkwrapOnly
+                    && u.file == std::path::Path::new("npm-shrinkwrap.json")
+                    && u.detail.contains("no package-lock.json")
+                    && u.detail.contains("npm >= 12")),
+                "{purl}: {:#?}",
+                out.unattested
+            );
+        }
+
+        // The twin npm 12 reads makes both attestable again.
+        p.write("package-lock.json", wired());
+        let out = run(&p).await;
+        assert_eq!(out.refs.len(), 4, "{:#?}", out.diagnostics);
+        assert!(out.diagnostics.is_empty(), "{:?}", out.diagnostics);
+        assert!(out.unattested.is_empty(), "{:#?}", out.unattested);
+
+        // package-lock.json alone is what every npm >= 7 reads.
+        let p = Project::new();
+        p.write("package-lock.json", wired());
+        let out = run(&p).await;
+        assert_eq!(out.refs.len(), 2, "{:#?}", out.diagnostics);
+        assert!(out.diagnostics.is_empty(), "{:?}", out.diagnostics);
+        assert!(out.unattested.is_empty(), "{:#?}", out.unattested);
     }
 
     /// REGRESSION (#798 review): a sibling npm lock holding the wired

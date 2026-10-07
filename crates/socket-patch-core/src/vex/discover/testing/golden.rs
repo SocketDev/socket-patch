@@ -215,12 +215,14 @@ fn render(out: &Discovery, root: &Path) -> Value {
                     purl,
                     uuid,
                     file,
+                    why,
                     detail,
                 } = u;
                 json!({
                     "purl": purl,
                     "uuid": uuid,
                     "file": path_str(file),
+                    "why": format!("{why:?}"),
                     "detail": normalize(detail, &roots),
                 })
             })

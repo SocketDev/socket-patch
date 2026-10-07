@@ -170,6 +170,19 @@ pub async fn vendor_npm<'a>(
     // npm 12 — the unpatched registry bytes kept installing. Every other
     // present npm lock is therefore rewired identically (the hosted
     // rewriter's rule), and one that cannot be is SAID.
+    // A shrinkwrap with NO package-lock.json twin (#899): npm 12 never reads
+    // npm-shrinkwrap.json — it resolves from the registry and writes a fresh
+    // package-lock.json — so the wiring reaches npm <= 11 only. Still wired
+    // (npm <= 11 installs from it) and SAID, never a silent success.
+    if lock_name == SHRINKWRAP && sibling_locks.is_empty() {
+        warnings.push(VendorWarning::new(
+            "vendor_npm_shrinkwrap_only",
+            crate::patch::redirect::npm_shrinkwrap_only_detail(
+                &[format!("{name}@{version}")],
+                "is vendored",
+            ),
+        ));
+    }
     let mut siblings: Vec<SiblingLock> = Vec::new();
     for (sib_name, sib_bytes) in sibling_locks {
         match sibling_lock_target(
@@ -2722,6 +2735,11 @@ mod tests {
         );
     }
 
+    /// A shrinkwrap-only project is still rewired (npm <= 11 installs from
+    /// it). REGRESSION (#899): npm 12 never reads npm-shrinkwrap.json, so
+    /// every run — the in-sync re-run too — warns
+    /// `vendor_npm_shrinkwrap_only`; a project with the package-lock.json
+    /// twin does not.
     #[tokio::test]
     async fn shrinkwrap_only_project_rewires_the_shrinkwrap() {
         let fx = fixture().await;
@@ -2748,6 +2766,31 @@ mod tests {
             shrink["packages"]["node_modules/left-pad"]["resolved"],
             json!(format!("file:{}", fx.expected_rel_tgz()))
         );
+        let shrinkwrap_only = |warnings: &[VendorWarning]| {
+            warnings
+                .iter()
+                .find(|w| w.code == "vendor_npm_shrinkwrap_only")
+                .map(|w| w.detail.clone())
+        };
+        let detail = shrinkwrap_only(&warnings)
+            .unwrap_or_else(|| panic!("shrinkwrap-only warning missing: {warnings:?}"));
+        for needle in ["left-pad@1.3.0", "npm >= 12", "no package-lock.json"] {
+            assert!(detail.contains(needle), "{needle}: {detail}");
+        }
+
+        // The in-sync re-run still says it.
+        let (result, again, warnings) = expect_done(fx.vendor(false).await);
+        assert!(result.success);
+        assert!(again.is_none());
+        assert!(shrinkwrap_only(&warnings).is_some(), "{warnings:?}");
+
+        // With the twin npm 12 reads, no shrinkwrap-only warning.
+        tokio::fs::copy(fx.root().join(SHRINKWRAP), fx.lock_path())
+            .await
+            .unwrap();
+        let (result, _, warnings) = expect_done(fx.vendor(false).await);
+        assert!(result.success);
+        assert!(shrinkwrap_only(&warnings).is_none(), "{warnings:?}");
     }
 
     /// npm 12 auto-creates package-lock.json beside a committed

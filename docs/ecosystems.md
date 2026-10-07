@@ -40,8 +40,15 @@ The backticked slug in each row is the value `-e`/`--ecosystems` accepts (e.g.
 ## npm hosted-mode notes
 
 - **npm (package-lock.json / npm-shrinkwrap.json)** — every present npm lock is
-  rewritten (npm 12 installs from the package-lock.json twin it keeps beside a
-  committed shrinkwrap). npm 12 defaults `allow-remote=none` and refuses the
+  rewritten (npm <= 11 installs from a committed shrinkwrap, npm 12 only from
+  package-lock.json). npm 12 never reads npm-shrinkwrap.json: on a
+  shrinkwrap-only project it resolves the tree from the registry and writes a
+  fresh package-lock.json, so the patch reaches npm <= 11 only. Hosted and
+  vendored runs still rewire the shrinkwrap but warn
+  (`redirect_npm_shrinkwrap_only` / `vendor_npm_shrinkwrap_only`), and `vex`
+  omits those patches (`vex_npm_shrinkwrap_only`) while `list`, `rollback` and
+  `remove` still manage them; rename the lock to package-lock.json (or commit
+  a copy under that name) and re-run. npm 12 defaults `allow-remote=none` and refuses the
   redirected tarballs (EALLOWREMOTE) unless the project `.npmrc` sets
   `allow-remote=all`, so the hosted run writes it (new file, or one appended
   line; once `rollback` / `remove` / the vendored takeover has restored the last

@@ -84,7 +84,7 @@ use socket_patch_core::vendor::state::{VendorArtifact, VendorEntry, VendorState}
 use socket_patch_core::vex::discover::{
     canonical_base_purl, vendor_ref, Discovery, LedgerLiveness, PatchedRef, WiringMode,
 };
-use socket_patch_core::vex::FailedPatch;
+use socket_patch_core::vex::{FailedPatch, UnattestedWhy};
 
 use crate::args::GlobalArgs;
 use crate::ui::plural;
@@ -195,6 +195,11 @@ pub(crate) const NOTE_API_AUTH_FALLBACK: &str = "api_auth_fallback";
 /// records a release above its base, which that build resolves instead
 /// (`vex::Unattested`).
 pub(crate) const NOTE_LOCK_ABOVE_BASE: &str = "vex_gradle_lock_above_base";
+
+/// Omission tag and note: the patch is wired only in a root
+/// `npm-shrinkwrap.json` with no `package-lock.json` twin, which npm >= 12
+/// never reads (`vex::Unattested`, #899).
+pub(crate) const NOTE_NPM_SHRINKWRAP_ONLY: &str = "vex_npm_shrinkwrap_only";
 
 fn note(code: &'static str, detail: String) -> PlanNote {
     PlanNote { code, detail }
@@ -330,8 +335,10 @@ pub(crate) async fn plan(common: &GlobalArgs, sources: Sources, assume_live: &[S
     }
     let superseded = attach_discovered(&mut cands, &discovery, &vendor, &conflicts);
     // Wired, but a build bypasses the pin (`Unattested`: a Gradle lock
-    // above the hosted base resolves the newer upstream release): the ref
-    // keeps rollback, remove and list working, and the patch is omitted.
+    // above the hosted base resolves the newer upstream release; an npm
+    // shrinkwrap with no package-lock.json twin, which npm >= 12 ignores):
+    // the ref keeps rollback, remove and list working, and the patch is
+    // omitted.
     cands.retain(|c| {
         let pkg = canonical_base_purl(&c.key);
         let Some(u) = discovery
@@ -341,15 +348,25 @@ pub(crate) async fn plan(common: &GlobalArgs, sources: Sources, assume_live: &[S
         else {
             return true;
         };
-        gated.push(failed(&c.key, NOTE_LOCK_ABOVE_BASE));
-        notes.push(note(
-            NOTE_LOCK_ABOVE_BASE,
-            format!(
-                "{}: patch {} is wired, but {}; not attested until that build resolves the \
-                 patch (re-lock it, or roll the patch back once upstream ships the fix)",
-                c.key, c.uuid, u.detail
+        let (code, detail) = match u.why {
+            UnattestedWhy::GradleLockAboveBase => (
+                NOTE_LOCK_ABOVE_BASE,
+                format!(
+                    "{}: patch {} is wired, but {}; not attested until that build resolves \
+                     the patch (re-lock it, or roll the patch back once upstream ships the fix)",
+                    c.key, c.uuid, u.detail
+                ),
             ),
-        ));
+            UnattestedWhy::NpmShrinkwrapOnly => (
+                NOTE_NPM_SHRINKWRAP_ONLY,
+                format!(
+                    "{}: patch {} is wired, but {}; not attested until it is",
+                    c.key, c.uuid, u.detail
+                ),
+            ),
+        };
+        gated.push(failed(&c.key, code));
+        notes.push(note(code, detail));
         false
     });
     for (key, old_uuid, wired) in &superseded {
@@ -1558,6 +1575,7 @@ mod tests {
             purl: PURL.into(),
             uuid: U1.into(),
             file: "b/gradle.lockfile".into(),
+            why: UnattestedWhy::GradleLockAboveBase,
             detail: "b/gradle.lockfile:1 locks it above the patched 1.10.0".into(),
         });
         let sources = |discovery: Discovery| Sources {

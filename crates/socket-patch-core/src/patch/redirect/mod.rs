@@ -1047,8 +1047,11 @@ fn rewrite_npm_lock(
     // dual-lock state is the DEFAULT for a shrinkwrap repo under npm 12.
     // Rewriting only the first present lock would patch the file npm doesn't
     // install from — a silent FALSE SUCCESS. Rewrite EVERY present npm lock so
-    // a fresh `npm install`/`npm ci` from EITHER is redirected (shrinkwrap-only
-    // repos on npm <= 6 keep working: only that one file is present).
+    // a fresh `npm install`/`npm ci` from EITHER is redirected. A
+    // shrinkwrap-ONLY repo is still rewritten (npm <= 11 installs from it),
+    // but npm 12 never reads npm-shrinkwrap.json — it resolves from the
+    // registry and writes its own package-lock.json — so that is SAID
+    // (#899, `redirect_npm_shrinkwrap_only`).
     let present: Vec<&str> = crate::constants::npm_family::NPM_LOCKS
         .into_iter()
         .filter(|f| files.contains_key(*f))
@@ -1160,15 +1163,61 @@ fn rewrite_npm_lock(
             false
         })
         .collect();
-    for lockfile in present {
+    for lockfile in &present {
         rewrite_one_npm_lock(
-            &files[lockfile],
+            &files[*lockfile],
             lockfile,
             &npm,
             &manifest_overrides,
             result,
         );
     }
+    if let [SHRINKWRAP] = present.as_slice() {
+        warn_npm_shrinkwrap_only(files, &npm, result);
+    }
+}
+
+const SHRINKWRAP: &str = crate::constants::npm_family::NPM_LOCKS[0];
+const PACKAGE_LOCK: &str = crate::constants::npm_family::NPM_LOCKS[1];
+
+/// #899: the root `npm-shrinkwrap.json` is the ONLY npm lock and it carries
+/// a hosted redirect (spliced this run or by an earlier one — the warning
+/// repeats until the project gains the twin). npm 12 ignores the shrinkwrap,
+/// so its installs fetch the unpatched registry bytes.
+fn warn_npm_shrinkwrap_only(
+    files: &BTreeMap<String, String>,
+    npm: &[&DepOverride],
+    result: &mut RewriteResult,
+) {
+    let lock = result
+        .files
+        .get(SHRINKWRAP)
+        .or_else(|| files.get(SHRINKWRAP));
+    let wired: Vec<String> = npm
+        .iter()
+        .filter(|dep| lock.is_some_and(|text| text.contains(dep.artifact_url.as_str())))
+        .map(|dep| format!("{}@{}", full_name(dep), dep.version))
+        .collect();
+    if wired.is_empty() {
+        return;
+    }
+    result.warnings.push(RewriteWarning {
+        code: "redirect_npm_shrinkwrap_only".into(),
+        detail: npm_shrinkwrap_only_detail(&wired, "redirected"),
+    });
+}
+
+/// The shared detail of the hosted (`redirect_npm_shrinkwrap_only`) and
+/// vendored (`vendor_npm_shrinkwrap_only`) shrinkwrap-only warnings.
+pub fn npm_shrinkwrap_only_detail(packages: &[String], how: &str) -> String {
+    format!(
+        "{} {how} in {SHRINKWRAP} only — there is no {PACKAGE_LOCK}, and npm >= 12 never \
+         reads {SHRINKWRAP}: it resolves the tree from the registry and writes a fresh \
+         {PACKAGE_LOCK}, so npm >= 12 installs stay UNPATCHED (npm <= 11 installs from the \
+         shrinkwrap and is patched); rename the lock to {PACKAGE_LOCK} (or commit a copy \
+         under that name) and re-run",
+        packages.join(", ")
+    )
 }
 
 /// Leave `dep` on its registry entry because the project patches it with
@@ -15631,12 +15680,15 @@ mod tests {
         );
     }
 
-    /// A shrinkwrap-ONLY project (the npm <= 6 world, where `npm shrinkwrap`
-    /// wrote the sole lock and no `package-lock.json` was auto-created) must
-    /// still be rewritten with zero warnings — the dual-lock handling must
-    /// not perturb the single-lock path.
+    /// A shrinkwrap-ONLY project (what `npm shrinkwrap` leaves: no
+    /// `package-lock.json`) is still rewritten — npm <= 11 installs from it —
+    /// and NO package-lock.json is invented. REGRESSION (#899): npm 12 never
+    /// reads the shrinkwrap (it resolves from the registry and writes a
+    /// fresh package-lock.json), so the run warns
+    /// `redirect_npm_shrinkwrap_only` — again on an in-sync re-run — instead
+    /// of reporting a clean success.
     #[test]
-    fn npm_shrinkwrap_only_still_rewritten_no_warnings() {
+    fn npm_shrinkwrap_only_rewritten_and_warns_npm12_ignores_it() {
         let ovr = npm_override(
             "left-pad",
             "1.3.0",
@@ -15678,9 +15730,47 @@ mod tests {
         );
         assert_eq!(
             warning_codes(&r),
-            Vec::<&str>::new(),
-            "a clean shrinkwrap-only success must emit NO warnings: {:?}",
+            vec!["redirect_npm_shrinkwrap_only"],
+            "{:?}",
             r.warnings
+        );
+        let detail = &r.warnings[0].detail;
+        for needle in [
+            "left-pad@1.3.0",
+            "npm >= 12",
+            "no package-lock.json",
+            "UNPATCHED",
+        ] {
+            assert!(detail.contains(needle), "{needle}: {detail}");
+        }
+
+        // The in-sync re-run writes nothing and still warns.
+        files.insert("npm-shrinkwrap.json".to_string(), out.clone());
+        let again = rewrite_registry_redirect(&files, std::slice::from_ref(&ovr));
+        assert!(again.files.is_empty(), "{:?}", again.files.keys());
+        assert_eq!(warning_codes(&again), vec!["redirect_npm_shrinkwrap_only"]);
+
+        // The twin npm 12 reads: both rewritten, no shrinkwrap-only warning.
+        files.insert("package-lock.json".to_string(), out.clone());
+        let twin = rewrite_registry_redirect(&files, std::slice::from_ref(&ovr));
+        assert_eq!(
+            warning_codes(&twin),
+            Vec::<&str>::new(),
+            "{:?}",
+            twin.warnings
+        );
+
+        // A shrinkwrap without any of the deps carries no redirect: no warning.
+        let mut other = BTreeMap::new();
+        other.insert(
+            "npm-shrinkwrap.json".to_string(),
+            r#"{"lockfileVersion":3,"packages":{"":{"name":"app"}}}"#.to_string(),
+        );
+        let none = rewrite_registry_redirect(&other, std::slice::from_ref(&ovr));
+        assert!(
+            !warning_codes(&none).contains(&"redirect_npm_shrinkwrap_only"),
+            "{:?}",
+            none.warnings
         );
     }
 

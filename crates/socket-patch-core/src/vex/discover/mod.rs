@@ -426,10 +426,8 @@ pub struct ContestedRef {
 
 /// A ref discovery emits (so rollback, remove and list find the wiring)
 /// that must not be attested: the files show a build that resolves the
-/// package from somewhere the pin does not reach. Today: a Gradle lock
-/// entry above the hosted pin's base (the owned script lets that newer
-/// upstream release resolve), so that build consumes no patch. The CLI's
-/// VEX plan omits every candidate of `(purl, uuid)` with `detail`.
+/// package from somewhere the pin does not reach ([`UnattestedWhy`]). The
+/// CLI's VEX plan omits every candidate of `(purl, uuid)` with `detail`.
 #[derive(Debug, Clone, PartialEq, Eq, PartialOrd, Ord)]
 pub struct Unattested {
     /// Canonical base purl ([`canonical_base_purl`]).
@@ -437,7 +435,22 @@ pub struct Unattested {
     pub uuid: String,
     /// Root-relative file that shows the bypass.
     pub file: PathBuf,
+    pub why: UnattestedWhy,
     pub detail: String,
+}
+
+/// Which build bypasses an [`Unattested`] ref's wiring.
+#[derive(Debug, Clone, Copy, PartialEq, Eq, PartialOrd, Ord)]
+pub enum UnattestedWhy {
+    /// A Gradle lock entry above the hosted pin's base: the owned script
+    /// lets that newer upstream release resolve, so that build consumes no
+    /// patch.
+    GradleLockAboveBase,
+    /// The wiring is in a root `npm-shrinkwrap.json` with no
+    /// `package-lock.json` twin (#899): npm >= 12 never reads the
+    /// shrinkwrap, resolves the package from the registry and writes a
+    /// fresh package-lock.json, so only npm <= 11 installs the patch.
+    NpmShrinkwrapOnly,
 }
 
 /// Everything [`discover_patched_refs`] found.
@@ -738,11 +751,19 @@ impl Discovery {
 
     /// Record that the ref `(purl, uuid)` is wired but bypassed by the
     /// build `file` shows ([`Unattested`]). Pushed beside the ref itself.
-    pub(crate) fn unattested(&mut self, purl: &str, uuid: &str, file: &str, detail: String) {
+    pub(crate) fn unattested(
+        &mut self,
+        purl: &str,
+        uuid: &str,
+        file: &str,
+        why: UnattestedWhy,
+        detail: String,
+    ) {
         self.unattested.push(Unattested {
             purl: canonical_base_purl(purl),
             uuid: uuid.to_string(),
             file: PathBuf::from(file),
+            why,
             detail,
         });
     }
