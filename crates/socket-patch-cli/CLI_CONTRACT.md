@@ -1750,7 +1750,11 @@ resolves any more (`dependency removed`; `scan --mode vendored --prune` reverts
 the entry). For a package-lock entry, drift also includes a
 `package-lock.json` / `npm-shrinkwrap.json` entry for the vendored `name@version`
 that `vendor` would rewire but that does not resolve to the vendored artifact
-(#588); the reason names that entry. Missing ledger entries fail with
+(#588); the reason names that entry. It also includes any entry for that
+`name@version` beneath a `hasShrinkwrap: true` package, which npm 7–11 install
+from that package's own `npm-shrinkwrap.json` whatever the lock says (#753); the
+reason names the entry and its shrinkwrapping dependency, which must be updated
+since re-vendoring cannot reach that copy. Missing ledger entries fail with
 `vendor_ledger_missing`: a manifest patch with no ledger entry, and a lockfile
 reference to `.socket/vendor/<eco>/<uuid>/` that no ledger entry owns (the
 artifact-level event repair emits: `uuid` plus `details.{ecosystem,path}`, no

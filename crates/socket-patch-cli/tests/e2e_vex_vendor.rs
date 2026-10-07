@@ -1714,6 +1714,140 @@ fn vendored_npm_v2_mirror_without_resolved_keeps_the_patch_wired() {
     }
 }
 
+/// REGRESSION (#753): `lodash@4.17.21` sits beneath a dependency that
+/// ships its own npm-shrinkwrap.json (`"hasShrinkwrap": true`), and npm
+/// 7–11 install that copy from the dependency's shrinkwrap, ignoring the
+/// root lock. Neither a pre-fix lock whose ONLY copy (the nested one) was
+/// rewired to the vendored tarball, nor a vendored hoisted copy beside an
+/// unpatched nested one, may be attested by `vex`, and `vendor --check`
+/// must fail naming the shrinkwrapped copy (re-vendoring cannot reach it,
+/// so its generic "wiring missing; re-run vendor" advice would be wrong).
+#[test]
+fn vendored_npm_patch_with_a_copy_under_a_has_shrinkwrap_dependency() {
+    let purl = "pkg:npm/lodash@4.17.21";
+    let uuid = "0a0a0a0a-7537-4537-8537-0a0a0a0a0a0a";
+    let patched = b"patched npm bytes\n";
+    let after_hash = compute_git_sha256_from_bytes(patched);
+    let nested = "node_modules/sw/node_modules/lodash";
+    for (label, only_nested_wired) in [
+        ("pre-fix lock, only the nested copy wired", true),
+        ("hoisted wired, nested registry copy", false),
+    ] {
+        let tmp = tempfile::tempdir().expect("create tempdir");
+        let cwd = tmp.path();
+        let rel = format!(".socket/vendor/npm/{uuid}/lodash-4.17.21.tgz");
+        let sha256 = sha256_hex(&write_member_tgz(
+            &cwd.join(&rel),
+            "package/index.js",
+            patched,
+        ));
+        let record = make_record(
+            uuid,
+            "package/index.js",
+            &after_hash,
+            "GHSA-shrk-aaaa",
+            &["CVE-2026-753"],
+        );
+        let wiring = write_matrix_wiring(cwd, "npm", uuid, &rel);
+        let lock_path = cwd.join("package-lock.json");
+        let mut lock: Value =
+            serde_json::from_str(&std::fs::read_to_string(&lock_path).unwrap()).unwrap();
+        let packages = lock["packages"].as_object_mut().unwrap();
+        let hoisted = packages["node_modules/lodash"].clone();
+        packages.insert(
+            "node_modules/sw".to_string(),
+            serde_json::json!({
+                "version": "1.0.0",
+                "resolved": "https://registry.npmjs.org/sw/-/sw-1.0.0.tgz",
+                "integrity": "sha512-U1c=",
+                "hasShrinkwrap": true
+            }),
+        );
+        if only_nested_wired {
+            packages.shift_remove("node_modules/lodash");
+            packages.insert(nested.to_string(), hoisted);
+        } else {
+            packages.insert(
+                nested.to_string(),
+                serde_json::json!({
+                    "version": "4.17.21",
+                    "resolved": "https://registry.npmjs.org/lodash/-/lodash-4.17.21.tgz",
+                    "integrity": "sha512-T1JJR0lOQUw="
+                }),
+            );
+        }
+        std::fs::write(&lock_path, lock.to_string()).unwrap();
+        let mut state = VendorState::new();
+        state.entries.insert(
+            purl.to_string(),
+            detached_matrix_entry("npm", purl, uuid, &rel, sha256, record, wiring),
+        );
+        let dir = cwd.join(".socket/vendor");
+        std::fs::create_dir_all(&dir).unwrap();
+        std::fs::write(
+            dir.join("state.json"),
+            serde_json::to_string_pretty(&state).unwrap(),
+        )
+        .unwrap();
+
+        let vex_path = cwd.join("out.vex.json");
+        let out = cli()
+            .args([
+                "vex",
+                "--cwd",
+                cwd.to_str().unwrap(),
+                "--json",
+                "--output",
+                vex_path.to_str().unwrap(),
+                "--product",
+                "pkg:npm/app@1.0.0",
+            ])
+            .output()
+            .expect("invoke vex");
+        let env: Value = serde_json::from_slice(&out.stdout).unwrap_or_else(|e| {
+            panic!(
+                "{label}: vex envelope JSON on stdout ({e}): {}",
+                String::from_utf8_lossy(&out.stdout)
+            )
+        });
+        assert_eq!(out.status.code(), Some(1), "{label}: {env}");
+        assert!(
+            !vex_path.exists(),
+            "{label}: no VEX document may attest the purl: {env}"
+        );
+        assert!(
+            env.to_string().contains(nested),
+            "{label}: the envelope names the shrinkwrapped copy: {env}"
+        );
+
+        let check = cli()
+            .args([
+                "vendor",
+                "--check",
+                "--cwd",
+                cwd.to_str().unwrap(),
+                "--json",
+            ])
+            .output()
+            .expect("invoke vendor --check");
+        let check_env: Value = serde_json::from_slice(&check.stdout).unwrap_or_else(|e| {
+            panic!(
+                "{label}: vendor --check envelope JSON on stdout ({e}): {}",
+                String::from_utf8_lossy(&check.stdout)
+            )
+        });
+        assert_eq!(check.status.code(), Some(1), "{label}: {check_env}");
+        let event = &check_env["events"][0];
+        assert_eq!(event["errorCode"], "vendor_check_failed", "{check_env}");
+        assert!(
+            event["reason"].as_str().is_some_and(|r| r.contains(nested)
+                && r.contains("hasShrinkwrap")
+                && !r.contains("re-run `socket-patch vendor`")),
+            "{label}: the check names the shrinkwrapped copy: {check_env}"
+        );
+    }
+}
+
 // ──────────────────────────────────────────────────────────────────────
 // 8. an applied, byte-verified agent-mode patch attests whether or not its
 // ecosystem has an install hook (there is no setup-state filter).

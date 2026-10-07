@@ -543,8 +543,8 @@ fn rewritable_matches(
                 format!(
                     "every {lock_name} entry for {name}@{version} is bundled inside a \
                      parent's tarball, installed from a dependency's own shrinkwrap, a link, \
-                     or installed from a non-registry spec and cannot be rewritten — those copies stay UNPATCHED and `npm install` \
-                     will not help: {}",
+                     or installed from a non-registry spec and cannot be rewritten — those \
+                     copies stay UNPATCHED and `npm install` will not help: {}",
                     skipped.join("; ")
                 ),
             )));
@@ -931,6 +931,7 @@ pub(super) async fn check_wiring(entry: &VendorEntry, project_root: &Path) -> Re
     let wired = format!("file:{}", entry.artifact.path);
     let overrides = NpmOverrides::read(project_root).await;
     let mut unwired = Vec::new();
+    let mut shrinkwrapped = Vec::new();
     for lock_name in NPM_LOCKS {
         let bytes = match read_regular_to_bytes(&project_root.join(lock_name)).await {
             Ok(bytes) => bytes,
@@ -953,6 +954,32 @@ pub(super) async fn check_wiring(entry: &VendorEntry, project_root: &Path) -> Re
                 .filter(|m| m.original.get("resolved").and_then(Value::as_str) != Some(&wired))
                 .map(|m| format!("{lock_name} `{}`", m.key)),
         );
+        // A copy npm 7–11 install from a dependency's own shrinkwrap
+        // (#753) installs unpatched whatever this lock says, and vendor
+        // cannot rewire it, so its "re-run vendor" advice does not apply.
+        let packages = lock.get("packages").and_then(Value::as_object);
+        for (key, ancestor) in npm_shrinkwrapped_entries(&lock) {
+            let Some(obj) = packages
+                .and_then(|p| p.get(&key))
+                .and_then(Value::as_object)
+            else {
+                continue;
+            };
+            if entry_name(&key, obj) == name
+                && obj.get("version").and_then(Value::as_str) == Some(version.as_str())
+            {
+                shrinkwrapped.push(format!("{lock_name} `{key}` (beneath `{ancestor}`)"));
+            }
+        }
+    }
+    if !shrinkwrapped.is_empty() {
+        return Err(format!(
+            "{} install {name}@{version} from a dependency's own npm-shrinkwrap.json \
+             (hasShrinkwrap), which npm 7–11 read instead of this lock, so that copy installs \
+             unpatched whatever the lock says and vendoring cannot rewire it; update that \
+             dependency to a release that ships a fixed copy",
+            shrinkwrapped.join(", ")
+        ));
     }
     if unwired.is_empty() {
         return Ok(());

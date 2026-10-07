@@ -75,7 +75,7 @@ skip it with `redirect_npm_shrinkwrapped_instance_skipped` /
 `vendor_shrinkwrapped_instance_skipped` (vendoring refuses with
 `vendor_lock_entry_not_rewritable` when it is the only copy), and VEX does not
 attest the package while that unpatched copy installs
-(`patched_ref_unattributable`).
+(`patched_ref_unattributable`); `vendor --check` fails naming that copy.
 
 ## Suites
 
