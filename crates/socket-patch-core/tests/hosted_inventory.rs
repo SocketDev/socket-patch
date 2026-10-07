@@ -290,3 +290,63 @@ async fn yarn_classic_pin_beside_a_git_copy_is_an_attributable_pin() {
     assert_eq!(inv.pins[0].files, vec!["yarn.lock".to_string()]);
     assert!(inv.contested_refusal().is_none(), "{inv:?}");
 }
+
+/// The twin over a copy beneath a `hasShrinkwrap` package (#753): npm 7–11
+/// install it from that package's own npm-shrinkwrap.json, so the hosted
+/// rewriter skips it (`redirect_npm_shrinkwrapped_instance_skipped`), and
+/// over a nested git copy (#326). The hoisted pin is still the rewriter's
+/// own wiring.
+#[tokio::test]
+async fn npm_pin_beside_a_shrinkwrapped_or_git_copy_is_an_attributable_pin() {
+    let shrinkwrapped = (
+        serde_json::json!({
+            "version": "1.0.0",
+            "resolved": "https://registry.npmjs.org/@bh/sw/-/sw-1.0.0.tgz",
+            "integrity": "sha512-sw==",
+            "hasShrinkwrap": true,
+        }),
+        serde_json::json!({
+            "version": "1.3.0",
+            "resolved": "https://registry.npmjs.org/left-pad/-/left-pad-1.3.0.tgz",
+            "integrity": "sha512-upstream==",
+        }),
+    );
+    let git = (
+        serde_json::json!({
+            "version": "1.0.0",
+            "resolved": "https://registry.npmjs.org/@bh/sw/-/sw-1.0.0.tgz",
+            "integrity": "sha512-sw==",
+            "dependencies": { "left-pad": "stevemao/left-pad#v1.3.0" },
+        }),
+        serde_json::json!({
+            "version": "1.3.0",
+            "resolved": "git+ssh://git@github.com/stevemao/left-pad.git#ff8e7ba",
+        }),
+    );
+    for (case, (parent, child)) in [("hasShrinkwrap", shrinkwrapped), ("git", git)] {
+        let tmp = tempfile::tempdir().unwrap();
+        let root = tmp.path();
+        std::fs::write(
+            root.join("package.json"),
+            r#"{"name":"app","version":"1.0.0","dependencies":{"left-pad":"1.3.0","@bh/sw":"1.0.0"}}"#,
+        )
+        .unwrap();
+        let mut lock: serde_json::Value =
+            serde_json::from_str(&lock(&hosted_url(), "sha512-patched==")).unwrap();
+        let packages = lock["packages"].as_object_mut().unwrap();
+        packages.insert("node_modules/@bh/sw".into(), parent);
+        packages.insert("node_modules/@bh/sw/node_modules/left-pad".into(), child);
+        std::fs::write(root.join("package-lock.json"), lock.to_string()).unwrap();
+
+        let discovery = socket_patch_core::vex::discover_patched_refs(root).await;
+        assert!(
+            discovery.refs.is_empty(),
+            "{case}: never attested: {discovery:#?}"
+        );
+        let inv = HostedInventory::of(&discovery);
+        assert_eq!(inv.pins.len(), 1, "{case}: {inv:?}");
+        assert_eq!(inv.pins[0].purl, "pkg:npm/left-pad@1.3.0");
+        assert_eq!(inv.pins[0].uuid, PATCH);
+        assert!(inv.contested_refusal().is_none(), "{case}: {inv:?}");
+    }
+}

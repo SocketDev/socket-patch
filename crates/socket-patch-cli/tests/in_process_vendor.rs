@@ -4046,6 +4046,39 @@ snapshots:
         std::fs::write(&path, bytes).unwrap();
     }
 
+    /// [`write_package_lock_project`] plus a parent package `@bh/sw` that
+    /// ships its own npm-shrinkwrap.json (`hasShrinkwrap: true`) with a
+    /// nested copy of the same `name@version`: npm 7–11 install that copy
+    /// from the parent's shrinkwrap, so the hosted run rewires only the
+    /// hoisted entry (`redirect_npm_shrinkwrapped_instance_skipped`, #753).
+    fn write_package_lock_project_with_shrinkwrapped_copy(root: &Path) {
+        write_package_lock_project(root);
+        let path = root.join("package-lock.json");
+        let mut lock: Value = serde_json::from_slice(&std::fs::read(&path).unwrap()).unwrap();
+        let packages = lock["packages"].as_object_mut().unwrap();
+        packages.insert(
+            "node_modules/@bh/sw".to_string(),
+            json!({
+                "version": "1.0.0",
+                "resolved": "https://registry.npmjs.org/@bh/sw/-/sw-1.0.0.tgz",
+                "integrity": "sha512-sw==",
+                "hasShrinkwrap": true,
+                "dependencies": { CONV_NAME: CONV_VERSION }
+            }),
+        );
+        packages.insert(
+            format!("node_modules/@bh/sw/node_modules/{CONV_NAME}"),
+            json!({
+                "version": CONV_VERSION,
+                "resolved": format!("https://registry.npmjs.org/{CONV_NAME}/-/{CONV_NAME}-{CONV_VERSION}.tgz"),
+                "integrity": UPSTREAM_SHA512
+            }),
+        );
+        let mut bytes = serde_json::to_vec_pretty(&lock).unwrap();
+        bytes.push(b'\n');
+        std::fs::write(&path, bytes).unwrap();
+    }
+
     /// REGRESSION (#828): a hosted pin beside a BUNDLED copy of the same
     /// `name@version` is withheld from VEX (the bundled copy stays
     /// unpatched), but it is still the hosted run's own wiring of one
@@ -4055,12 +4088,32 @@ snapshots:
     #[tokio::test]
     #[serial]
     async fn hosted_pin_beside_a_bundled_copy_rolls_back_to_upstream() {
+        hosted_pin_beside_an_unreachable_copy_rolls_back(
+            write_package_lock_project_with_bundled_copy,
+        )
+        .await;
+    }
+
+    /// REGRESSION (#828 over #753): the same for a copy beneath a
+    /// `hasShrinkwrap` package — discovery dropped the hoisted pin outright
+    /// instead of shadowing it, so rollback refused it as
+    /// `hosted_wiring_contested`.
+    #[tokio::test]
+    #[serial]
+    async fn hosted_pin_beside_a_shrinkwrapped_copy_rolls_back_to_upstream() {
+        hosted_pin_beside_an_unreachable_copy_rolls_back(
+            write_package_lock_project_with_shrinkwrapped_copy,
+        )
+        .await;
+    }
+
+    async fn hosted_pin_beside_an_unreachable_copy_rolls_back(write: fn(&Path)) {
         let server = MockServer::start().await;
         mock_hosted_api(&server).await;
         let registry = mock_registry(&server).await;
         let tmp = tempfile::tempdir().unwrap();
         let root = tmp.path();
-        write_package_lock_project_with_bundled_copy(root);
+        write(root);
         let pristine_lock = std::fs::read_to_string(root.join("package-lock.json")).unwrap();
 
         assert_eq!(scan_run(hosted_args(root, server.uri())).await, 0);
@@ -4103,12 +4156,30 @@ snapshots:
     #[tokio::test]
     #[serial]
     async fn hosted_pin_beside_a_bundled_copy_is_restored_by_the_vendor_takeover() {
+        hosted_pin_beside_an_unreachable_copy_is_restored_by_the_takeover(
+            write_package_lock_project_with_bundled_copy,
+        )
+        .await;
+    }
+
+    /// REGRESSION (#828 over #753): the same takeover beside a copy beneath
+    /// a `hasShrinkwrap` package.
+    #[tokio::test]
+    #[serial]
+    async fn hosted_pin_beside_a_shrinkwrapped_copy_is_restored_by_the_vendor_takeover() {
+        hosted_pin_beside_an_unreachable_copy_is_restored_by_the_takeover(
+            write_package_lock_project_with_shrinkwrapped_copy,
+        )
+        .await;
+    }
+
+    async fn hosted_pin_beside_an_unreachable_copy_is_restored_by_the_takeover(write: fn(&Path)) {
         let server = MockServer::start().await;
         mock_hosted_api(&server).await;
         let registry = mock_registry(&server).await;
         let tmp = tempfile::tempdir().unwrap();
         let root = tmp.path();
-        write_package_lock_project_with_bundled_copy(root);
+        write(root);
 
         assert_eq!(scan_run(hosted_args(root, server.uri())).await, 0);
         assert!(std::fs::read_to_string(root.join("package-lock.json"))

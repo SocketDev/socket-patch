@@ -83,10 +83,12 @@ pub(crate) async fn extract(ctx: &DiscoverCtx<'_>, out: &mut Discovery) {
 /// What one parsed npm lock wires, plus the packages it resolves ELSEWHERE
 /// (an entry whose `resolved` is not a Socket reference), the packages it
 /// installs BUNDLED (each purl → the first such entry's lock location) and
-/// every `name@version` it has any entry for, at any path.
+/// every `name@version` it has any entry for, at any path. `ref_locations`
+/// names the lock entry each ref was read from (purl, location).
 struct NpmLockRefs {
     file: &'static str,
     refs: Vec<PatchedRef>,
+    ref_locations: Vec<(String, String)>,
     unwired: BTreeMap<String, String>,
     bundled: BTreeMap<String, String>,
     mentioned: BTreeSet<String>,
@@ -259,6 +261,7 @@ async fn extract_package_lock(
     let mut read = NpmLockRefs {
         file,
         refs: Vec::new(),
+        ref_locations: Vec::new(),
         unwired: BTreeMap::new(),
         bundled: BTreeMap::new(),
         mentioned: BTreeSet::new(),
@@ -389,9 +392,15 @@ fn pins_a_wired_ref(read: &NpmLockRefs, purl: &str, pin: Option<&str>) -> bool {
 /// 7–11 install everything beneath a `hasShrinkwrap` package from that
 /// package's own npm-shrinkwrap.json (#753), so such an entry stays
 /// unpatched whatever its `resolved` says. Every ref for the same
-/// `name@version` is dropped (that copy is live beside it), and the copy
-/// counts as resolved elsewhere, so other locks' wiring for it is contested
-/// too.
+/// `name@version` is dropped from attestation (that copy is live beside
+/// it), and the copy counts as resolved elsewhere, so other locks' wiring
+/// for it is contested too.
+///
+/// A dropped ref wired at a REGISTRY entry (the rewriters' own output
+/// beside a copy they skip) or beneath a `hasShrinkwrap` package (a
+/// pre-#753 run's wiring) is still shadowed, so rollback / remove / the
+/// takeover unwind it (#828). Only a wiring of the git / url / `file:`
+/// entry itself — which no Socket rewriter writes — is not.
 fn drop_non_registry_installs(
     file: &str,
     doc: &Value,
@@ -399,8 +408,11 @@ fn drop_non_registry_installs(
     read: &mut NpmLockRefs,
     out: &mut Discovery,
 ) {
+    let non_registry = npm_non_registry_entries(doc, overrides);
+    // Locations a wiring of which is not the rewriters' own output.
+    let foreign: BTreeSet<String> = non_registry.keys().cloned().collect();
     // (lock key, why that copy installs from elsewhere)
-    let elsewhere: Vec<(String, String)> = npm_non_registry_entries(doc, overrides)
+    let elsewhere: Vec<(String, String)> = non_registry
         .into_iter()
         .map(|(key, reason)| {
             let why = format!(
@@ -445,6 +457,7 @@ fn drop_non_registry_installs(
             .or_insert_with(|| key.clone());
         unpatched.push((purl, key, why));
     }
+    let ref_locations = &read.ref_locations;
     read.refs.retain(|r| {
         let Some((_, key, why)) = unpatched.iter().find(|(p, _, _)| *p == r.purl) else {
             return true;
@@ -458,6 +471,12 @@ fn drop_non_registry_installs(
                 r.purl
             ),
         );
+        let ours = ref_locations
+            .iter()
+            .any(|(purl, location)| *purl == r.purl && !foreign.contains(location));
+        if ours {
+            out.shadow(r.clone());
+        }
         false
     });
 }
@@ -545,9 +564,13 @@ fn entry_ref(
             );
             return;
         }
+        read.ref_locations
+            .push((purl.clone(), location.to_string()));
         read.refs
             .push(PatchedRef::vendored(purl, &vref, file, integrity));
     } else if let Some(uuid) = hosted_uuid {
+        read.ref_locations
+            .push((purl.clone(), location.to_string()));
         read.refs.push(PatchedRef::hosted(
             purl,
             uuid,
@@ -1744,6 +1767,15 @@ mod tests {
                 "{label}: {:#?}",
                 out.diagnostics
             );
+            // A pre-#753 run's wiring of that copy: still the rewriters'
+            // own output, so rollback / remove / the takeover unwind it.
+            assert!(
+                out.shadowed
+                    .iter()
+                    .any(|r| r.purl == "pkg:npm/left-pad@1.3.0"),
+                "{label}: {:#?}",
+                out.shadowed
+            );
 
             // A wired hoisted copy beside a registry shrinkwrapped copy.
             let p = Project::new();
@@ -1759,6 +1791,16 @@ mod tests {
             );
             let out = run(&p).await;
             assert!(out.refs.is_empty(), "{label}: {:#?}", out.refs);
+            // The rewriter's own wiring beside the copy it skips
+            // (`redirect_npm_shrinkwrapped_instance_skipped`) is withheld
+            // from VEX but not lost (#828).
+            assert!(
+                out.shadowed
+                    .iter()
+                    .any(|r| r.purl == "pkg:npm/left-pad@1.3.0"),
+                "{label}: {:#?}",
+                out.shadowed
+            );
         }
 
         // Without `hasShrinkwrap` the nested wired copy is an ordinary ref.
@@ -1998,6 +2040,13 @@ mod tests {
                     "{spec} / {wiring}: {:?}",
                     diag_codes(&out)
                 );
+                // The non-registry entry itself carries the wiring: no
+                // Socket rewriter writes that, so it is not shadowed either.
+                assert!(
+                    out.shadowed.is_empty(),
+                    "{spec} / {wiring}: {:#?}",
+                    out.shadowed
+                );
             }
         }
         // Transitive: the hoisted copy is wired, a nested git copy of the
@@ -2031,6 +2080,18 @@ mod tests {
             diag.detail.contains("node_modules/a/node_modules/left-pad"),
             "{}",
             diag.detail
+        );
+        // The hoisted wiring is the hosted rewriter's own output beside a
+        // copy it skips: withheld from VEX, still unwound by rollback /
+        // remove / the takeover (#828).
+        assert_eq!(
+            out.shadowed
+                .iter()
+                .map(|r| (r.purl.as_str(), r.uuid.as_str()))
+                .collect::<Vec<_>>(),
+            vec![("pkg:npm/left-pad@1.3.0", UUID_A)],
+            "{:#?}",
+            out.shadowed
         );
         // Control: a registry spec keeps the ref.
         let p = Project::new();
