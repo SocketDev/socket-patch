@@ -1883,8 +1883,8 @@ mod vendor_warning_redaction_tests {
             "GET https://u:p@h.example/patch/npm/a/1.0.0/TOK/7c8d9e0f-1a2b-4a1b-8c2d-3e4f5a6b7c8d/a.tgz: \
              HTTP 404 (GOPROXY=https://proxy.golang.org,https://bot:ghp_X@goproxy.corp,direct)",
         );
-        for secret in ["TOK", "u:p", "bot:ghp_X"] {
-            assert!(!w.detail.contains(secret), "{secret}: {}", w.detail);
+        for needle in ["TOK", "u:p", "bot:ghp_X"] {
+            assert!(!w.detail.contains(needle), "{needle}: {}", w.detail);
         }
         assert!(w.detail.contains("HTTP 404"), "{}", w.detail);
         let plain = VendorWarning::new("c", "no url here");

@@ -2984,8 +2984,8 @@ mod tests {
             format!("http://u:pw@{dead}/patch/npm/a/1.0.0/GRANTTOKEN/{UUID}/a.tgz"),
         ] {
             let err = download(&build_registry_client(), &url).await.unwrap_err();
-            for secret in ["GRANTTOKEN", "u:pw", "QSECRET"] {
-                assert!(!err.contains(secret), "{secret} in {err}");
+            for needle in ["GRANTTOKEN", "u:pw", "QSECRET"] {
+                assert!(!err.contains(needle), "{needle} in {err}");
             }
             assert!(
                 err.contains(UUID),
