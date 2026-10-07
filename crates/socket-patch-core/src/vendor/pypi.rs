@@ -307,8 +307,8 @@ async fn detect_pypi_flavor(
         !additional_locks.is_empty()
     };
     if !has_uv_lock && matching_additional_lock {
-        if exists("requirements.txt").await {
-            present.push("requirements.txt");
+        if exists(PYPI_REQUIREMENTS).await {
+            present.push(PYPI_REQUIREMENTS);
         }
         if !present.is_empty() {
             warnings.push(VendorWarning::new(

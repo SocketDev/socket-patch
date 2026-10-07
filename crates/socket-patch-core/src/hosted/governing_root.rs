@@ -20,7 +20,7 @@
 
 use std::path::{Path, PathBuf};
 
-use crate::constants::npm_family::{NPM_LOCKS, VLT_LOCK};
+use crate::formats::governing_locks::{npm_lock_files, NpmLockFamily};
 use crate::patch::redirect::npmrc::npmrc_top_level_value;
 use crate::utils::fs::{read_regular_to_string, read_regular_to_string_sync};
 use crate::utils::pnpm_workspace::governing_workspace_file;
@@ -51,15 +51,10 @@ pub const PNPM_SETTINGS_ELSEWHERE: &str = "redirect_pnpm_settings_elsewhere";
 const PNPM_LOCK: &str = "pnpm-lock.yaml";
 const PNPM_WORKSPACE: &str = "pnpm-workspace.yaml";
 
-/// npm-family locks that, present in the project directory, make it its
-/// own lock root: the existing rewriters handle it.
-const OWN_LOCKS: [&str; 5] = [
-    PNPM_LOCK,
-    "shrinkwrap.yaml",
-    "yarn.lock",
-    "bun.lock",
-    "bun.lockb",
-];
+/// Lock names beyond the governing table's root locks that, present in the
+/// project directory, still make it its own lock root: pnpm's pre-v3
+/// `shrinkwrap.yaml`, which the legacy pnpm rewriter reads.
+const EXTRA_OWN_LOCKS: [&str; 1] = ["shrinkwrap.yaml"];
 
 const HOSTED_CARGO_ROOT_HINT: &str =
     "hosted mode pins the crate in the workspace's Cargo.lock and in every member \
@@ -240,25 +235,19 @@ async fn pnpm_lock_elsewhere(root: &Path) -> Option<PathBuf> {
 /// a lock the rewriters read, or is a Rush repo (Rush keeps its locks under
 /// common/config, read by the rewriter).
 fn has_own_npm_family_lock(root: &Path) -> bool {
-    OWN_LOCKS
-        .iter()
-        .chain(NPM_LOCKS.iter())
-        .chain(std::iter::once(&VLT_LOCK))
+    npm_lock_files()
+        .chain(EXTRA_OWN_LOCKS)
         .any(|name| root.join(name).exists())
         || root.join("rush.json").exists()
 }
 
-/// Locks of the package managers that read `package.json` `workspaces`
-/// (npm, yarn, Bun). pnpm reads only `pnpm-workspace.yaml` and vlt only
-/// `vlt.json`, so their locks at a `workspaces` root govern no member
-/// through that field; the pnpm check owns pnpm workspaces.
-const WORKSPACE_ROOT_LOCKS: [&str; 5] = [
-    "package-lock.json",
-    "npm-shrinkwrap.json",
-    "yarn.lock",
-    "bun.lock",
-    "bun.lockb",
-];
+/// Lock families of the package managers that read `package.json`
+/// `workspaces` (npm, yarn, Bun), in the order a refusal names them. pnpm
+/// reads only `pnpm-workspace.yaml` and vlt only `vlt.json`, so their locks
+/// at a `workspaces` root govern no member through that field; the pnpm
+/// check owns pnpm workspaces.
+const WORKSPACE_ROOT_FAMILIES: [NpmLockFamily; 3] =
+    [NpmLockFamily::Npm, NpmLockFamily::Yarn, NpmLockFamily::Bun];
 
 /// #884: the project directory is a member of an npm, yarn (classic or
 /// berry) or Bun workspace, whose root `package.json` lists it under
@@ -297,9 +286,9 @@ async fn package_json_workspace_refusal(root: &Path) -> Option<(PathBuf, Refusal
         if !workspaces_include(&patterns, &rel) {
             continue;
         }
-        let locks: Vec<&str> = WORKSPACE_ROOT_LOCKS
+        let locks: Vec<&str> = WORKSPACE_ROOT_FAMILIES
             .iter()
-            .copied()
+            .flat_map(|family| family.files().iter().copied())
             .filter(|name| ancestor.join(name).is_file())
             .collect();
         if locks.is_empty() {
