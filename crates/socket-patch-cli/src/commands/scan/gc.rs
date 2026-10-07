@@ -5,7 +5,6 @@
 use socket_patch_core::manifest::cleanup_blobs::{ArtifactReferences, CleanupResult};
 use socket_patch_core::manifest::operations::{read_manifest, write_manifest};
 use socket_patch_core::manifest::schema::PatchManifest;
-use socket_patch_core::utils::purl::strip_purl_qualifiers;
 use socket_patch_core::utils::purl_key::PurlKey;
 use socket_patch_core::vendor::{purl_keys_cover, VENDOR_STATE_REL};
 use std::collections::HashSet;
@@ -315,10 +314,9 @@ async fn preview_apply_gc(
     // Mirror the wet pass, which drops an unused vendored entry's manifest
     // keys before the blob sweep, or the preview under-reports orphans.
     for purl in &vendor_gc.unused_reverted {
-        let base = strip_purl_qualifiers(purl).to_string();
-        manifest
-            .patches
-            .retain(|k, _| k != purl && strip_purl_qualifiers(k) != base);
+        for k in crate::commands::vendor::unused_vendored_manifest_keys(&manifest.patches, purl) {
+            manifest.patches.remove(&k);
+        }
     }
     let prunable = detect_prunable(&manifest, scanned_purls, vendored);
     // Likewise drop the prunable entries in memory before the sweep: the

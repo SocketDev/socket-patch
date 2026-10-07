@@ -19,7 +19,11 @@
 //! parts too, since that padding erases whether the lock said `X`, `X.0` or
 //! `X.0.0`. Any other spelling Composer rejects keys as itself minus one
 //! leading `v`, and is equivalent only to other rejected spellings with the
-//! same key.
+//! same key. [`composer_version_identity_key`] keeps that space apart with a
+//! `\u{1}` sentinel; [`composer_version_key`] (what `PurlKey` uses, so its
+//! string stays printable in reports) relies instead on every accepted key
+//! being accepted itself, bare and behind a `v`, which
+//! `sentinel_free_key_keeps_rejected_spellings_apart` pins over the vectors.
 //!
 //! Only comparisons go through this module, and purl comparisons reach it
 //! only through [`crate::utils::purl_key::PurlKey`]. Stored spellings
@@ -346,6 +350,53 @@ mod tests {
                 };
                 if keyed != spec || keyed != composer_versions_equivalent(a, b) {
                     failures.push(format!("{a:?} vs {b:?}: key {keyed}, spec {spec}"));
+                }
+            }
+        }
+        assert!(failures.is_empty(), "{}", failures.join("\n"));
+    }
+
+    /// [`PurlKey`](crate::utils::purl_key::PurlKey) keys on the sentinel-free
+    /// [`composer_version_key`], which is only sound while a rejected
+    /// spelling's key can never equal an accepted one's: every accepted key
+    /// `N` must itself be accepted, bare and behind a `v` (the only text a
+    /// rejected spelling `N` / `vN` would key as; a `v` only before a digit).
+    #[test]
+    fn sentinel_free_key_keeps_rejected_spellings_apart() {
+        let v = vectors();
+        let mut inputs: Vec<&str> = v["vectors"]
+            .as_array()
+            .unwrap()
+            .iter()
+            .map(|case| case["input"].as_str().unwrap())
+            .collect();
+        for case in v["equivalence"].as_array().unwrap() {
+            inputs.push(case["left"].as_str().unwrap());
+            inputs.push(case["right"].as_str().unwrap());
+        }
+        let mut failures = Vec::new();
+        for input in &inputs {
+            let Some(key) = identity_normalize(input) else {
+                continue;
+            };
+            // `strip_leading_v` only strips a `v` before a digit.
+            let mut spellings = vec![key.clone()];
+            if key.starts_with(|c: char| c.is_ascii_digit()) {
+                spellings.push(format!("v{key}"));
+            }
+            for spelling in spellings {
+                if identity_normalize(&spelling).is_none() {
+                    failures.push(format!(
+                        "{input:?} keys as {key:?}, but {spelling:?} is rejected"
+                    ));
+                }
+            }
+        }
+        for a in &inputs {
+            for b in &inputs {
+                let plain = composer_version_key(a) == composer_version_key(b);
+                if plain != composer_versions_equivalent(a, b) {
+                    failures.push(format!("{a:?} vs {b:?}: plain key {plain}"));
                 }
             }
         }

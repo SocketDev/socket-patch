@@ -1352,10 +1352,7 @@ pub(crate) async fn gem_takeover_refusals_for<'a>(
         bun_lockb: true,
     };
     for purl in purls.filter(|p| p.starts_with("pkg:gem/")) {
-        let Some(pin) = pins
-            .iter()
-            .find(|pin| canonical_purl(&pin.purl) == canonical_purl(purl))
-        else {
+        let Some(pin) = pins.iter().find(|pin| PurlKey::same(&pin.purl, purl)) else {
             continue;
         };
         if let Some(refusal) = gem_takeover_refusal(cwd, purl, pin, &restore_opts).await {
@@ -4153,6 +4150,23 @@ pub(crate) struct VendorGcSummary {
     /// happened on disk; the stale record is what the caller must report.
     pub write_failures: Vec<(&'static str, String)>,
 }
+/// The manifest keys an unused vendored entry `purl` owns: every key with
+/// the same [`PurlKey`] (any qualifier set, encoding, NuGet case, PEP 503
+/// spelling or composer release padding). The ONE relation behind the wet
+/// vendor GC's manifest drop and `scan --prune --dry-run`'s preview of it,
+/// so the two never report different prune sets.
+pub(crate) fn unused_vendored_manifest_keys<V>(
+    patches: &std::collections::HashMap<String, V>,
+    purl: &str,
+) -> Vec<String> {
+    let base = PurlKey::new(purl);
+    patches
+        .keys()
+        .filter(|k| k.as_str() == purl || PurlKey::new(k) == base)
+        .cloned()
+        .collect()
+}
+
 
 /// The vendored-state GC behind `scan --prune`:
 ///
@@ -4268,14 +4282,7 @@ pub(crate) async fn run_vendor_gc(
         state.entries.remove(&purl);
         ledger_dirty = true;
         if let Some(m) = manifest.as_mut() {
-            let base = PurlKey::new(&entry.base_purl);
-            let dropped: Vec<String> = m
-                .patches
-                .keys()
-                .filter(|k| *k == &purl || PurlKey::new(k) == base)
-                .cloned()
-                .collect();
-            for k in dropped {
+            for k in unused_vendored_manifest_keys(&m.patches, &purl) {
                 m.patches.remove(&k);
                 manifest_dirty = true;
             }
@@ -6872,5 +6879,45 @@ mod eject_snapshot_tests {
         .expect("a FIFO must not wedge the eject snapshot");
         let err = taken.err().expect("a FIFO must fail the snapshot");
         assert_eq!(err.kind(), std::io::ErrorKind::InvalidInput);
+    }
+}
+
+#[cfg(test)]
+mod unused_vendored_manifest_keys_tests {
+    use super::unused_vendored_manifest_keys;
+    use std::collections::HashMap;
+
+    /// The wet vendor GC and `scan --prune --dry-run`'s preview both drop
+    /// these keys, so they must cover every spelling of the release and
+    /// nothing else.
+    #[test]
+    fn covers_every_spelling_of_the_release() {
+        let patches: HashMap<String, ()> = [
+            "pkg:nuget/Newtonsoft.Json@13.0.1",
+            "pkg:nuget/newtonsoft.json@13.0.1?x=1",
+            "pkg:nuget/newtonsoft.json@13.0.2",
+            "pkg:pypi/typing-extensions@4.12.2",
+            "pkg:composer/psr/log@3.0.2",
+        ]
+        .into_iter()
+        .map(|k| (k.to_string(), ()))
+        .collect();
+        let mut nuget = unused_vendored_manifest_keys(&patches, "pkg:nuget/newtonsoft.json@13.0.1");
+        nuget.sort();
+        assert_eq!(
+            nuget,
+            vec![
+                "pkg:nuget/Newtonsoft.Json@13.0.1".to_string(),
+                "pkg:nuget/newtonsoft.json@13.0.1?x=1".to_string(),
+            ]
+        );
+        assert_eq!(
+            unused_vendored_manifest_keys(&patches, "pkg:pypi/typing_extensions@4.12.2"),
+            vec!["pkg:pypi/typing-extensions@4.12.2".to_string()]
+        );
+        assert_eq!(
+            unused_vendored_manifest_keys(&patches, "pkg:composer/psr/log@3.0.2.0"),
+            vec!["pkg:composer/psr/log@3.0.2".to_string()]
+        );
     }
 }

@@ -10,7 +10,7 @@ use socket_patch_core::api::types::{
 };
 use socket_patch_core::manifest::schema::{PatchManifest, PatchRecord};
 use socket_patch_core::utils::concurrent::{api_concurrency_for, ordered_concurrent};
-use socket_patch_core::utils::purl::{canonical_purl, normalize_purl, strip_purl_qualifiers};
+use socket_patch_core::utils::purl::{normalize_purl, strip_purl_qualifiers};
 use socket_patch_core::utils::purl_key::PurlKey;
 use socket_patch_core::vendor::lock_inventory::LockfileEntry;
 use socket_patch_core::vendor::VendorState;
@@ -33,8 +33,9 @@ pub(super) struct UpdateInfo {
 #[derive(Default)]
 pub(crate) struct LockfileSupplement {
     pub(crate) packages: Vec<socket_patch_core::crawlers::types::CrawledPackage>,
-    /// Literal crawler-form purls, for fast membership tests.
-    pub(crate) purls: HashSet<String>,
+    /// The lockfile-only packages' identities ([`PurlKey`]), keyed once so
+    /// [`lockfile_only_contains`] is a single hash lookup.
+    pub(crate) purls: HashSet<PurlKey>,
     /// The FULL lockfile inventory the supplement was derived from (installed
     /// packages included), kept so the hosted-wiring probes reuse it instead
     /// of re-parsing every project lockfile. Empty for global scans.
@@ -88,7 +89,7 @@ pub(crate) async fn lockfile_supplement(
         let Some(pkg) = crawled_from_purl(&entry.purl, &common.cwd) else {
             continue;
         };
-        out.purls.insert(entry.purl.clone());
+        out.purls.insert(PurlKey::new(&entry.purl));
         out.packages.push(pkg);
     }
     out.entries = entries.clone();
@@ -96,18 +97,14 @@ pub(crate) async fn lockfile_supplement(
 }
 
 /// Whether an API-spelled purl (percent-encoded, possibly qualified) names
-/// a lockfile-only package: `purls` holds the crawler's literal spelling, so
+/// a lockfile-only package: `purls` holds the crawler spellings' keys, so
 /// the comparison bridges the two by [`PurlKey`] (encoding, qualifiers,
 /// PyPI/NuGet name folding, composer release identity: the API may serve
 /// the padded `@3.0.2.0` for a lock's `3.0.2`). The ONE predicate behind the
 /// `notInstalled` flag, the `[NOT INSTALLED]` marker, the
 /// `package_not_installed` skip partition and the vendor baseline pre-check.
-pub(super) fn lockfile_only_contains(purls: &HashSet<String>, api_purl: &str) -> bool {
-    if purls.contains(&canonical_purl(api_purl)) {
-        return true;
-    }
-    let key = PurlKey::new(api_purl);
-    purls.iter().any(|p| PurlKey::new(p) == key)
+pub(super) fn lockfile_only_contains(purls: &HashSet<PurlKey>, api_purl: &str) -> bool {
+    purls.contains(&PurlKey::new(api_purl))
 }
 
 /// A displayable crawl entry fabricated from a purl (decoded form). The
@@ -267,7 +264,7 @@ pub(super) async fn preverify_vendor_baselines<W: std::io::Write>(
     api_client: &socket_patch_core::api::client::ApiClient,
     selected: &[PatchSearchResult],
     crawled: &[socket_patch_core::crawlers::types::CrawledPackage],
-    lockfile_only: &HashSet<String>,
+    lockfile_only: &HashSet<PurlKey>,
     vendor: Option<&HashMap<String, socket_patch_core::vendor::VendorEntry>>,
     status: &mut crate::ui::StatusLine<W>,
 ) -> (HashSet<String>, HashMap<String, PatchResponse>) {
@@ -1706,8 +1703,8 @@ mod tests {
                 std::path::PathBuf::from("/nonexistent"),
             ),
         ];
-        let lockfile_only: HashSet<String> =
-            std::iter::once("pkg:npm/@scope/lockonly@1.0.0".to_string()).collect();
+        let lockfile_only: HashSet<PurlKey> =
+            std::iter::once(PurlKey::new("pkg:npm/@scope/lockonly@1.0.0")).collect();
 
         // A live status line: every step is shown, and the line is gone
         // once the check returns (nothing left over for the preview).
@@ -2175,7 +2172,7 @@ mod tests {
             &api_client_for(&mock.uri()),
             &selected,
             &crawled,
-            &std::iter::once("pkg:npm/lockonly@1.0.0".to_string()).collect(),
+            &std::iter::once(PurlKey::new("pkg:npm/lockonly@1.0.0")).collect(),
             Some(&ledger),
             &mut crate::ui::StatusLine::new(Vec::new(), false, false, 80),
         )
