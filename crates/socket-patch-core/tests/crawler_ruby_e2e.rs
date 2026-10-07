@@ -895,7 +895,7 @@ async fn dot_bundle_base_path_crawls_the_loaded_copy() {
         "BUNDLE_DEFAULT_INSTALL_USES_PATH",
         "HOME",
     ];
-    let previous: Vec<_> = keys.iter().map(|key| std::env::var_os(key)).collect();
+    let previous: Vec<_> = keys.iter().map(std::env::var_os).collect();
     for key in keys {
         std::env::remove_var(key);
     }

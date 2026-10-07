@@ -732,3 +732,144 @@ async fn run_berry_capstone(driver: VendorDriver, yarnrc_extra: &str) {
     );
     eprintln!("REVERT OK");
 }
+
+// ── #831: .gitignore rules over the vendored tarball ───────────────────
+
+fn git(cwd: &Path, args: &[&str]) -> Output {
+    let out = Command::new("git")
+        .args(["-c", "user.name=t", "-c", "user.email=t@t", "-c", "init.defaultBranch=main"])
+        .args(args)
+        .current_dir(cwd)
+        .output()
+        .expect("failed to run git");
+    assert!(
+        out.status.success(),
+        "git {args:?} failed:\n{}",
+        String::from_utf8_lossy(&out.stderr)
+    );
+    out
+}
+
+/// A yarn berry (node-modules linker) project inside a git work tree whose
+/// `.gitignore` adds `rule`, with left-pad installed and a marker patch
+/// staged. `None` when yarn berry or the registry is unavailable.
+fn gitignored_berry_fixture(tmp: &Path, rule: &str) -> Option<(PathBuf, Vec<u8>)> {
+    if !has_corepack_pm(yarn_berry()) {
+        skip!(
+            "SKIP e2e_vendor_yarn_berry_build (gitignore): `corepack {}` unavailable",
+            yarn_berry()
+        );
+        return None;
+    }
+    let proj = tmp.join("proj");
+    std::fs::create_dir_all(&proj).unwrap();
+    std::fs::write(
+        proj.join("package.json"),
+        format!(
+            r#"{{"name":"yarn-berry-gitignore","version":"0.0.0","private":true,"dependencies":{{"{DEP}":"{DEP_VERSION}"}}}}"#
+        ),
+    )
+    .unwrap();
+    std::fs::write(
+        proj.join(".yarnrc.yml"),
+        "nodeLinker: node-modules\nenableGlobalCache: false\n",
+    )
+    .unwrap();
+    let global = tmp.join("yarn-global");
+    let install = corepack(
+        &proj,
+        yarn_berry(),
+        &["install"],
+        &[("YARN_GLOBAL_FOLDER", global.to_str().unwrap())],
+    );
+    if !install.status.success() {
+        skip!(
+            "SKIP e2e_vendor_yarn_berry_build (gitignore): fixture `yarn install` failed:\n{}",
+            yarn_berry_common::yarn_output(&install)
+        );
+        return None;
+    }
+    let orig = std::fs::read(proj.join("node_modules").join(DEP).join("index.js")).unwrap();
+    let patched: Vec<u8> = [MARKER.as_bytes(), orig.as_slice()].concat();
+    stage_patch(
+        &proj,
+        &format!("pkg:npm/{DEP}@{DEP_VERSION}"),
+        "package/index.js",
+        &orig,
+        &patched,
+    );
+    std::fs::write(
+        proj.join(".gitignore"),
+        format!("node_modules\n.yarn/\n.pnp.*\n{rule}\n"),
+    )
+    .unwrap();
+    git(&proj, &["init", "-q"]);
+    Some((proj, patched))
+}
+
+/// #831 (yarn berry): under `*.tgz` the vendored tarball still reaches the
+/// commit, so a fresh `git clone` passes `yarn install --immutable` with an
+/// empty global folder and loads the patched bytes.
+#[test]
+fn yarn_berry_vendored_tarball_survives_a_tgz_gitignore_rule() {
+    let tmp = tempfile::tempdir().unwrap();
+    let Some((proj, patched)) = gitignored_berry_fixture(tmp.path(), "*.tgz") else {
+        return;
+    };
+    let (code, stdout, stderr) = run_socket(
+        &proj,
+        &["vendor", "--json", "--offline", "--cwd", proj.to_str().unwrap()],
+    );
+    assert_eq!(code, 0, "vendor failed.\nstdout:\n{stdout}\nstderr:\n{stderr}");
+
+    git(&proj, &["add", "-A"]);
+    git(&proj, &["commit", "-qm", "vendored"]);
+    let fresh = tmp.path().join("fresh");
+    git(
+        tmp.path(),
+        &["clone", "-q", proj.to_str().unwrap(), fresh.to_str().unwrap()],
+    );
+    let fresh_global = tmp.path().join("fresh-yarn-global");
+    let ci = corepack(
+        &fresh,
+        yarn_berry(),
+        &["install", "--immutable"],
+        &[
+            ("YARN_GLOBAL_FOLDER", fresh_global.to_str().unwrap()),
+            ("YARN_ENABLE_GLOBAL_CACHE", "false"),
+        ],
+    );
+    assert!(
+        ci.status.success(),
+        "a fresh clone must install from the committed tarball:\n{}",
+        yarn_berry_common::yarn_output(&ci)
+    );
+    assert_eq!(
+        std::fs::read(fresh.join("node_modules").join(DEP).join("index.js")).unwrap(),
+        patched,
+        "the clone installs the patched bytes"
+    );
+}
+
+/// #831 (yarn berry): `.socket/` ignored refuses before any write.
+#[test]
+fn yarn_berry_vendor_refuses_a_gitignored_socket_dir() {
+    let tmp = tempfile::tempdir().unwrap();
+    let Some((proj, _)) = gitignored_berry_fixture(tmp.path(), ".socket/") else {
+        return;
+    };
+    let lock_before = std::fs::read(proj.join("yarn.lock")).unwrap();
+    let pkg_before = std::fs::read(proj.join("package.json")).unwrap();
+    let (code, stdout, stderr) = run_socket(
+        &proj,
+        &["vendor", "--json", "--offline", "--cwd", proj.to_str().unwrap()],
+    );
+    assert_eq!(code, 1, "vendor must fail.\nstdout:\n{stdout}\nstderr:\n{stderr}");
+    assert!(
+        stdout.contains("vendor_artifact_gitignored"),
+        "refusal code expected:\n{stdout}"
+    );
+    assert_eq!(std::fs::read(proj.join("yarn.lock")).unwrap(), lock_before);
+    assert_eq!(std::fs::read(proj.join("package.json")).unwrap(), pkg_before);
+    assert!(!proj.join(format!(".socket/vendor/npm/{UUID}")).exists());
+}

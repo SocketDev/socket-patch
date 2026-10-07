@@ -496,18 +496,22 @@ async fn vlt_hosted_artifact_preflight_refuses_before_the_vendored_revert() {
     assert!(root.join(rel()).join("index.js").is_file());
 }
 
-/// A vendor that fails after the takeover's upstream restore was persisted
-/// (here a patch-service artifact failing its integrity check) still heals
-/// the hosted store copy against the restored registry pin: the lock no
-/// longer pins anything hosted, so no later run could find it again.
+/// A vendor that fails after the takeover's upstream restore (here a
+/// patch-service artifact failing its integrity check) rolls the restore
+/// back (#853, #944): the purl stays hosted-patched, the lock and the
+/// hosted store copy are left as hosted mode wrote them, and nothing asks
+/// for a reinstall.
 #[tokio::test(flavor = "multi_thread")]
-async fn vlt_failed_vendor_after_the_takeover_revert_still_heals_the_store() {
+async fn vlt_failed_vendor_after_the_takeover_revert_keeps_the_hosted_pin() {
     let tmp = tempfile::tempdir().unwrap();
     let root = tmp.path();
     let server = MockServer::start().await;
     mock_api(&server).await;
     hosted_project(root, &server).await;
     seed_manifest(root);
+    let lock = hosted::read(root, "vlt-lock.json");
+    let pkg = hosted::read(root, "package.json");
+    let store = hosted::store_dir(root, TILDE_ID).exists();
 
     let service = MockServer::start().await;
     hosted::mock_reference_at(
@@ -536,27 +540,30 @@ async fn vlt_failed_vendor_after_the_takeover_revert_still_heals_the_store() {
     assert_eq!(code, 1, "{env:#}\n{stderr}");
     let codes = all_codes(&env);
     assert!(
-        codes.contains(&"vendor_takeover_reverted_redirect".to_string()),
-        "{env:#}"
+        !codes.contains(&"vendor_takeover_reverted_redirect".to_string()),
+        "the restore is rolled back, never reported: {env:#}"
     );
     assert!(
         detail_of(&env, "apply_failed").contains("integrity"),
         "{env:#}"
     );
-    assert_eq!(
-        detail_of(&env, "redirect_vlt_reinstall_required"),
-        "restored registry pins for 1 packages; removed the patched installed copies, so \
-         node_modules is incomplete until you run `vlt install` (or `vlt ci`)"
+    assert!(
+        !codes.contains(&"redirect_vlt_reinstall_required".to_string()),
+        "{env:#}"
     );
-    assert_eq!(hosted::read(root, "vlt-lock.json"), registry_lock());
-    assert_eq!(hosted::read(root, "package.json"), PACKAGE_JSON);
+    assert_eq!(
+        hosted::read(root, "vlt-lock.json"),
+        lock,
+        "the hosted pin stays"
+    );
+    assert_eq!(hosted::read(root, "package.json"), pkg);
     assert!(vendor_entry(root).is_none());
     assert_no_redirect_ledger(root);
-    assert!(
-        !hosted::store_dir(root, TILDE_ID).exists(),
-        "the hosted store copy is invalidated"
+    assert_eq!(
+        hosted::store_dir(root, TILDE_ID).exists(),
+        store,
+        "the hosted store copy is left alone"
     );
-    assert!(!root.join("node_modules/.vlt-lock.json").exists());
 }
 
 /// An optional hosted pin taken over by `scan --mode vendored`: the
