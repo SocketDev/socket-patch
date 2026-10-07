@@ -2137,3 +2137,154 @@ fn pnpm_vendor_keeps_user_workspace_overrides_authoritative() {
     );
     assert_eq!(std::fs::read_to_string(&lock_path).unwrap(), lock_before);
 }
+
+/// #957: pnpm 9+ writes a scoped `npm:` alias's target quoted
+/// (`version: '@isaacs/string-locale-compare@1.1.0'` in the root
+/// importer, `sl: '@isaacs/…@1.1.0'` in a dependent's snapshot). Vendoring
+/// can't rewrite that reference, so it must refuse the package — exactly as
+/// it refuses the unscoped `npm:left-pad@1.3.0` alias — instead of
+/// reporting success over a lock whose frozen install fails with
+/// ERR_PNPM_LOCKFILE_MISSING_DEPENDENCY. The lock, package.json and
+/// `.socket/vendor` stay untouched, and the untouched lock still
+/// frozen-installs.
+#[test]
+fn pnpm_vendor_refuses_quoted_scoped_alias_references() {
+    if !has_corepack_pm(PNPM_PRIMARY) {
+        println!("SKIP: `corepack {PNPM_PRIMARY}` unavailable");
+        return;
+    }
+    let pm = PNPM_PRIMARY;
+    const SCOPED: &str = "@isaacs/string-locale-compare";
+    const SCOPED_VERSION: &str = "1.1.0";
+    let alias = format!("npm:{SCOPED}@{SCOPED_VERSION}");
+
+    for shape in ["importer", "snapshot"] {
+        let tmp = tempfile::tempdir().unwrap();
+        let proj = tmp.path().join("proj");
+        std::fs::create_dir_all(&proj).unwrap();
+        let deps = if shape == "importer" {
+            serde_json::json!({ "sl": alias })
+        } else {
+            // A local tarball dependency that itself aliases the scoped
+            // package, so the quoted reference lands in its snapshot.
+            let pkg = tmp.path().join("host").join("package");
+            std::fs::create_dir_all(&pkg).unwrap();
+            let host = serde_json::json!({
+                "name": "host",
+                "version": "1.0.0",
+                "dependencies": { "sl": alias },
+            });
+            std::fs::write(pkg.join("package.json"), host.to_string()).unwrap();
+            std::fs::write(pkg.join("index.js"), "module.exports = require('sl');\n").unwrap();
+            let tar = Command::new("tar")
+                .args(["-czf"])
+                .arg(proj.join("host-1.0.0.tgz"))
+                .arg("package")
+                .current_dir(tmp.path().join("host"))
+                .output()
+                .expect("tar runs");
+            assert!(tar.status.success(), "{tar:?}");
+            serde_json::json!({ "host": "file:./host-1.0.0.tgz" })
+        };
+        let pkg_doc = serde_json::json!({
+            "name": "scoped-alias",
+            "version": "0.0.0",
+            "private": true,
+            "dependencies": deps,
+        });
+        let pkg_before = format!("{}\n", serde_json::to_string_pretty(&pkg_doc).unwrap());
+        std::fs::write(proj.join("package.json"), &pkg_before).unwrap();
+
+        let store = tmp.path().join("pnpm-store");
+        let install = corepack(
+            &proj,
+            pm,
+            &["install", "--store-dir", store.to_str().unwrap()],
+        );
+        if !install.status.success() {
+            assert!(!pnpm_required(), "fixture install failed: {install:?}");
+            println!("SKIP: fixture `pnpm install` failed: {install:?}");
+            return;
+        }
+        let lock_path = proj.join("pnpm-lock.yaml");
+        let lock_before = std::fs::read_to_string(&lock_path).unwrap();
+        let quoted = format!("'{SCOPED}@{SCOPED_VERSION}'");
+        let reference = if shape == "importer" {
+            format!("        version: {quoted}\n")
+        } else {
+            format!("      sl: {quoted}\n")
+        };
+        assert!(
+            lock_before.contains(&reference),
+            "{shape}: pnpm wrote the quoted alias reference:\n{lock_before}"
+        );
+
+        let installed = if shape == "importer" {
+            proj.join("node_modules/sl/index.js")
+        } else {
+            proj.join(format!(
+                "node_modules/.pnpm/{}@{SCOPED_VERSION}/node_modules/{SCOPED}/index.js",
+                SCOPED.replace('/', "+")
+            ))
+        };
+        let orig = std::fs::read(&installed)
+            .unwrap_or_else(|e| panic!("{shape}: installed {}: {e}", installed.display()));
+        let patched: Vec<u8> = [MARKER.as_bytes(), orig.as_slice()].concat();
+        let purl = format!("pkg:npm/{SCOPED}@{SCOPED_VERSION}");
+        stage_patch(&proj, &purl, "package/index.js", &orig, &patched);
+        let cwd = proj.to_str().unwrap();
+
+        let (code, stdout, stderr) =
+            run_socket(&proj, &["vendor", "--json", "--offline", "--cwd", cwd]);
+        let env = parse_envelope(&stdout);
+        assert_ne!(code, 0, "{shape}: the refusal fails the run.\n{env}");
+        assert_eq!(
+            env["summary"]["applied"], 0,
+            "{shape}: a quoted scoped alias must not vendor.\n{env}\nstderr:\n{stderr}"
+        );
+        assert!(
+            stdout.contains("vendor_lock_entry_unsupported") && stdout.contains("aliased"),
+            "{shape}: the refusal names the aliased reference: {env}"
+        );
+        assert_eq!(
+            std::fs::read_to_string(&lock_path).unwrap(),
+            lock_before,
+            "{shape}: lock untouched"
+        );
+        assert_eq!(
+            std::fs::read_to_string(proj.join("package.json")).unwrap(),
+            pkg_before,
+            "{shape}: package.json untouched"
+        );
+        assert!(
+            !proj.join(format!(".socket/vendor/npm/{UUID}")).exists(),
+            "{shape}: a refused vendor leaves no artifact"
+        );
+
+        // The untouched lock still frozen-installs from a fresh checkout.
+        let fresh = tmp.path().join("fresh");
+        std::fs::create_dir_all(&fresh).unwrap();
+        for file in ["package.json", "pnpm-lock.yaml"] {
+            std::fs::copy(proj.join(file), fresh.join(file)).unwrap();
+        }
+        if shape == "snapshot" {
+            std::fs::copy(proj.join("host-1.0.0.tgz"), fresh.join("host-1.0.0.tgz")).unwrap();
+        }
+        let ci = corepack(
+            &fresh,
+            pm,
+            &[
+                "install",
+                "--frozen-lockfile",
+                "--store-dir",
+                store.to_str().unwrap(),
+            ],
+        );
+        assert!(
+            ci.status.success(),
+            "{shape}: fresh frozen install of the untouched lock.\nstdout:\n{}\nstderr:\n{}",
+            String::from_utf8_lossy(&ci.stdout),
+            String::from_utf8_lossy(&ci.stderr),
+        );
+    }
+}
