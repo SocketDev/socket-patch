@@ -234,6 +234,15 @@ runners) from the GitHub releases and verifies it against `SHASUMS256.txt`. Ever
   writes the bare path itself, are left alone. Covered by
   `e2e_bun_lockb::workspace_text_migration_heals_on_rerun`
   on the 1.4.2 leg.
+- **Binary → text migration of a vendored lock.** The migration deletes
+  `bun.lockb` and carries the vendored tuples into `bun.lock`, while the
+  vendor state still records `bun.lockb` package snapshots. `vendor
+  --revert`, `rollback` and the hosted takeover then restore each recorded
+  registry package as the tuple Bun writes for it (an empty registry slot
+  under `https://registry.npmjs.org`, the tarball URL otherwise), and a
+  superseding re-vendor carries that tuple over as its pre-vendor original
+  (#784). Covered by `e2e_bun_lockb::vendored_text_migration_reverts_to_registry`
+  (skipped below Bun 1.2) on the 1.4.2 leg.
 - **Workspace-member local tarballs.** Bun 1.2.x–1.3.x resolve a
   local-tarball dependency declared by a workspace member relative to the
   member (`.socket/vendor/…` → ENOENT on `bun install`); 1.4.x resolve it

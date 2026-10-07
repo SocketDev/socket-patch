@@ -1078,6 +1078,127 @@ async fn native_binary_alias_and_transitive() {
     }
 }
 
+/// #784: after Bun migrates a vendored `bun.lockb` to `bun.lock`
+/// (`bun install --save-text-lockfile`), `vendor --revert` and `rollback`
+/// must restore the registry tuple Bun writes when it migrates the pristine
+/// binary lock, instead of failing on the missing `bun.lockb`, and a hosted
+/// takeover must replace the vendored wiring; a fresh frozen install of the
+/// result gets the original (or, hosted, the patched) bytes. Needs a Bun >= 1.2
+/// reader (the text lock releases the vendored text path parses). Not named
+/// `native_binary_*`, like the #803 test: it runs on the 1.4.2 CI leg.
+#[tokio::test(flavor = "multi_thread")]
+#[serial_test::serial]
+async fn vendored_text_migration_reverts_to_registry() {
+    for unwind in [
+        &["vendor", "--revert"][..],
+        &["rollback", "--yes"][..],
+        &["scan"][..],
+    ] {
+        let Some(fixture) = Fixture::new("direct") else {
+            return;
+        };
+        let raw = String::from_utf8_lossy(
+            &command(&fixture.reader, &fixture.project)
+                .arg("--version")
+                .output()
+                .unwrap()
+                .stdout,
+        )
+        .trim()
+        .to_string();
+        let major_minor: Vec<u32> = raw
+            .split('.')
+            .take(2)
+            .filter_map(|p| p.parse().ok())
+            .collect();
+        if major_minor.as_slice() < [1, 2].as_slice() {
+            eprintln!("SKIP vendored text migration: Bun {raw} < 1.2");
+            return;
+        }
+        let migrate = |dir: &Path, label: &str| {
+            std::fs::remove_file(dir.join("bunfig.toml")).unwrap();
+            let _ = std::fs::remove_dir_all(dir.join("node_modules"));
+            let output = command(&fixture.reader, dir)
+                .args(["install", "--save-text-lockfile", "--ignore-scripts"])
+                .env(
+                    "BUN_INSTALL_CACHE_DIR",
+                    fixture.temp.path().join(format!("{label}-cache")),
+                )
+                .env(
+                    "BUN_INSTALL",
+                    fixture.temp.path().join(format!("{label}-home")),
+                )
+                .output()
+                .unwrap();
+            require_success(output, &format!("{label}: bun.lockb -> bun.lock migration"));
+            assert!(!dir.join("bun.lockb").exists(), "{label}");
+            std::fs::read_to_string(dir.join("bun.lock")).unwrap()
+        };
+        // What Bun writes for the pristine binary lock.
+        let pristine_dir = fixture.temp.path().join("pristine-migration");
+        std::fs::create_dir_all(&pristine_dir).unwrap();
+        for file in ["package.json", "bun.lockb", "bunfig.toml"] {
+            std::fs::copy(fixture.project.join(file), pristine_dir.join(file)).unwrap();
+        }
+        let pristine = migrate(&pristine_dir, "pristine");
+
+        let server = MockServer::start().await;
+        mock_api(&server, &fixture, "minimist").await;
+        let project = &fixture.project;
+        let vendored = scan(project, &server, "vendored", &[]);
+        assert_eq!(vendored["vendor"]["summary"]["applied"], 1, "{vendored}");
+        let migrated = migrate(project, "vendored");
+        assert!(
+            migrated.contains(&format!("minimist@.socket/vendor/npm/{UUID}/")),
+            "the migration carries the vendored tuple:\n{migrated}"
+        );
+
+        let result = if unwind == ["scan"] {
+            // The hosted takeover reverts the vendored wiring first.
+            let hosted = scan(project, &server, "hosted", &[]);
+            assert_eq!(hosted["redirect"]["redirected"], 1, "{hosted}");
+            hosted
+        } else {
+            cli(project, unwind)
+        };
+        assert_eq!(result["status"], "success", "{unwind:?}: {result}");
+        assert!(!project.join(".socket/vendor").exists(), "{unwind:?}");
+        let expected = if unwind == ["scan"] {
+            let lock = std::fs::read_to_string(project.join("bun.lock")).unwrap();
+            assert!(lock.contains("/patch/npm/minimist/"), "{lock}");
+            &fixture.patched
+        } else {
+            assert_eq!(
+                std::fs::read_to_string(project.join("bun.lock")).unwrap(),
+                pristine,
+                "{unwind:?} restores the registry tuple"
+            );
+            &fixture.original
+        };
+
+        let checkout = fixture.temp.path().join("reverted-checkout");
+        std::fs::create_dir_all(&checkout).unwrap();
+        for file in ["package.json", "bun.lock"] {
+            std::fs::copy(project.join(file), checkout.join(file)).unwrap();
+        }
+        let output = command(&fixture.reader, &checkout)
+            .args(["install", "--frozen-lockfile", "--ignore-scripts"])
+            .env(
+                "BUN_INSTALL_CACHE_DIR",
+                fixture.temp.path().join("revert-cache"),
+            )
+            .env("BUN_INSTALL", fixture.temp.path().join("revert-home"))
+            .output()
+            .unwrap();
+        require_success(output, "frozen install of the reverted bun.lock");
+        assert_eq!(
+            std::fs::read(installed_target(&checkout).join("index.js")).unwrap(),
+            *expected,
+            "{unwind:?}: a fresh frozen install"
+        );
+    }
+}
+
 /// #803: Bun 1.4 migrates a hosted workspace `bun.lockb` to `bun.lock`
 /// with the member path the binary normalization wrote as the root's
 /// `consumer` literal, so a frozen install of the migrated lock fails and
@@ -1156,7 +1277,10 @@ async fn workspace_text_migration_heals_on_rerun() {
     }
     let output = command(&fixture.reader, &checkout)
         .args(["install", "--frozen-lockfile", "--ignore-scripts"])
-        .env("BUN_INSTALL_CACHE_DIR", fixture.temp.path().join("text-cache"))
+        .env(
+            "BUN_INSTALL_CACHE_DIR",
+            fixture.temp.path().join("text-cache"),
+        )
         .env("BUN_INSTALL", fixture.temp.path().join("text-home"))
         .output()
         .unwrap();

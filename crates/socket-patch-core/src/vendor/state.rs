@@ -519,7 +519,9 @@ pub fn carry_forward_wiring(prev: &VendorEntry, entry: &mut VendorEntry) {
                 .wiring
                 .iter()
                 .filter(|p| wiring_surface_matches(p, rec));
-            if let Some(prev_rec) = candidates.next() {
+            if rec.kind == "bun_lock_package" && !prev.wiring.iter().any(|p| p.kind == rec.kind) {
+                rec.original = migrated_bun_original(prev, rec);
+            } else if let Some(prev_rec) = candidates.next() {
                 // Multiple equal binary resolutions can have different
                 // registry originals. Renumbered IDs cannot disambiguate
                 // them, so do not attach a guessed restore payload.
@@ -561,6 +563,23 @@ pub fn carry_forward_wiring(prev: &VendorEntry, entry: &mut VendorEntry) {
             entry.wiring.push(prev_rec.clone());
         }
     }
+}
+
+/// The pre-vendor original of a `bun.lock` record that re-pinned a tuple
+/// Bun migrated from the binary lock (#784): the previous entry recorded it
+/// as a `bun.lockb` package snapshot, rebuilt here as the registry tuple Bun
+/// writes for it. `None` when the binary records disagree on it.
+fn migrated_bun_original(prev: &VendorEntry, current: &WiringRecord) -> Option<serde_json::Value> {
+    let line = current.new.as_ref()?.as_str()?;
+    let mut lines = prev
+        .wiring
+        .iter()
+        .filter(|p| p.kind == "bun_lockb_package")
+        .filter_map(|p| super::bun_binary::migrated_registry_line(line, p.original.as_ref()?));
+    let first = lines.next()?;
+    lines
+        .all(|other| other == first)
+        .then_some(serde_json::Value::String(first))
 }
 
 /// Binary IDs are offsets into Bun's package array and may change after an
