@@ -1,0 +1,50 @@
+name: bughunt yarn-classic probe
+on:
+  push:
+    branches: ['bughunt/yarn-classic/**']
+permissions:
+  contents: read
+jobs:
+  probe:
+    runs-on: ${{ matrix.runner }}
+    timeout-minutes: 30
+    strategy:
+      fail-fast: false
+      matrix:
+        runner: ['ubuntu-latest', 'ubuntu-24.04-arm']
+        image: ['node:22-alpine', 'node:18-alpine', 'node:22-bookworm-slim']
+        yarn: ['1.7.0', '1.22.22']
+    steps:
+      - name: PR 976 wrapper under yarn ${{ matrix.yarn }} on ${{ matrix.image }} (${{ matrix.runner }})
+        run: |
+          curl -fsSL -o wrapper.js https://raw.githubusercontent.com/SocketDev/socket-patch/162befeef53037a1fbb8fb7d48c7025b9bcad8ad/npm/socket-patch/bin/socket-patch
+          head -3 wrapper.js
+          cat > probe.sh <<'PROBEEOF'
+          set -u
+          V="$1"
+          echo "arch $(uname -m) libc: $(ldd --version 2>&1 | head -1)"; node --version
+          npm install --prefix /y --no-audit --no-fund "yarn@$V" > /dev/null 2>&1
+          Y="node /y/node_modules/yarn/bin/yarn.js"; $Y --version
+          mkdir -p /p && cd /p && echo '{"name":"p","version":"1.0.0","private":true}' > package.json
+          $Y add -D @socketsecurity/socket-patch@4.0.0 --no-progress > /tmp/i.log 2>&1; echo "local install exit $?"
+          echo "local platform packages: $(ls node_modules/@socketsecurity | tr '\n' ' ')"
+          W=node_modules/@socketsecurity/socket-patch/bin/socket-patch
+          node $W --version > /tmp/o.txt 2> /tmp/e.txt; rc0=$?
+          echo "OLD wrapper exit $rc0 out=[$(cat /tmp/o.txt)] err=[$(cat /tmp/e.txt)]"
+          cp /wrapper.js $W
+          node $W --version > /tmp/o.txt 2> /tmp/e.txt; rc1=$?
+          echo "NEW wrapper exit $rc1 out=[$(cat /tmp/o.txt)] err=[$(cat /tmp/e.txt)]"
+          $Y socket-patch --version > /tmp/o2.txt 2>&1; rc2=$?; echo "NEW via yarn run exit $rc2 out=[$(tr '\n' ' ' < /tmp/o2.txt | cut -c1-200)]"
+          node $W scan --json --cwd /p --offline > /tmp/o3.txt 2>&1; rc3=$?; echo "NEW scan exit $rc3 out=[$(tr '\n' ' ' < /tmp/o3.txt | cut -c1-300)]"
+          # exit-code passthrough: an unknown subcommand should give the CLI's own usage exit (2)
+          node $W definitely-not-a-command > /dev/null 2>&1; rc4=$?; echo "NEW usage exit $rc4"
+          # global install
+          $Y global add @socketsecurity/socket-patch@4.0.0 --prefix /g --no-progress > /tmp/g.log 2>&1; echo "global install exit $?"
+          GD=$($Y global dir 2>/dev/null | tail -1); echo "global dir $GD"
+          GW="$GD/node_modules/@socketsecurity/socket-patch/bin/socket-patch"
+          /g/bin/socket-patch --version > /tmp/o.txt 2>&1; rg0=$?; echo "OLD global bin exit $rg0 out=[$(cat /tmp/o.txt)]"
+          cp /wrapper.js "$GW"
+          /g/bin/socket-patch --version > /tmp/o.txt 2>&1; rg1=$?; echo "NEW global bin exit $rg1 out=[$(cat /tmp/o.txt)]"
+          echo "RESULT yarn=$V $(grep ^ID= /etc/os-release) arch=$(uname -m) old=$rc0 new=$rc1 yarnrun=$rc2 scan=$rc3 usage=$rc4 global_old=$rg0 global_new=$rg1"
+          PROBEEOF
+          docker run --rm -v "$PWD/probe.sh:/probe.sh:ro" -v "$PWD/wrapper.js:/wrapper.js:ro" ${{ matrix.image }} sh /probe.sh '${{ matrix.yarn }}'
