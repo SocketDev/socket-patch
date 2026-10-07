@@ -206,6 +206,10 @@ pub(crate) mod npm;
 pub(crate) mod nuget;
 pub(crate) mod pypi_locks;
 pub(crate) mod pypi_other;
+pub(crate) mod sbt;
+pub use sbt::{
+    DIAG_SBT_OWNED_FILE_MODIFIED, DIAG_SBT_RESOLUTION_UNVERIFIED, DIAG_VENDORED_TREE_MISSING,
+};
 pub(crate) mod vlt;
 pub(crate) mod yarn;
 
@@ -404,6 +408,22 @@ pub struct ResolvedElsewhere {
     pub file: PathBuf,
 }
 
+/// A ref another lock contests ([`Discovery::contest_across_locks`]): it
+/// was dropped from `refs` and diagnosed [`DIAG_REF_UNATTRIBUTABLE`]. Kept
+/// so a ledger reader can name the contesting lock instead of reporting the
+/// wiring as gone ([`Discovery::vendored_contest`]).
+#[derive(Debug, Clone, PartialEq, Eq, PartialOrd, Ord)]
+pub struct ContestedRef {
+    /// Canonical base purl ([`canonical_base_purl`]).
+    pub purl: String,
+    pub uuid: String,
+    pub mode: WiringMode,
+    /// Root-relative lock that wires the patch.
+    pub file: PathBuf,
+    /// Root-relative lock that resolves the same version from elsewhere.
+    pub other: PathBuf,
+}
+
 /// A ref discovery emits (so rollback, remove and list find the wiring)
 /// that must not be attested: the files show a build that resolves the
 /// package from somewhere the pin does not reach. Today: a Gradle lock
@@ -439,6 +459,8 @@ pub struct Discovery {
     pub elsewhere: Vec<ResolvedElsewhere>,
     /// Refs in `refs` whose wiring a build bypasses ([`Unattested`]).
     pub unattested: Vec<Unattested>,
+    /// Refs dropped because another lock contests them ([`ContestedRef`]).
+    pub contested: Vec<ContestedRef>,
 }
 
 impl Discovery {
@@ -614,6 +636,13 @@ impl Discovery {
             }
         }
         for (r, other) in contested {
+            self.contested.push(ContestedRef {
+                purl: r.purl.clone(),
+                uuid: r.uuid.clone(),
+                mode: r.mode,
+                file: r.source_file.clone(),
+                other: other.clone(),
+            });
             let file = r.source_file.to_string_lossy().into_owned();
             self.diag(
                 DIAG_REF_UNATTRIBUTABLE,
@@ -677,6 +706,28 @@ impl Discovery {
         })
     }
 
+    /// The cross-lock contest that killed a VENDORED ledger claim, if any:
+    /// a ref wiring `purl` to `uuid` that [`Discovery::contest_across_locks`]
+    /// dropped because another lock resolves the same version from
+    /// elsewhere. Lets a reader of a dead claim name both locks instead of
+    /// saying nothing wires the artifact.
+    pub fn vendored_contest(&self, purl: &str, uuid: &str) -> Option<&ContestedRef> {
+        let key = canonical_base_purl(purl);
+        self.contested.iter().find(|c| {
+            c.uuid == uuid && c.mode == WiringMode::Vendored && same_package(&c.purl, &key)
+        })
+    }
+
+    /// Whether any lock discovery read resolves `purl` (any spelling) at
+    /// all: wired to a Socket patch, contested, or from elsewhere
+    /// ([`Discovery::resolved_elsewhere`]).
+    pub fn resolves_package(&self, purl: &str) -> bool {
+        let key = canonical_base_purl(purl);
+        self.refs.iter().any(|r| same_package(&r.purl, &key))
+            || self.contested.iter().any(|c| same_package(&c.purl, &key))
+            || self.elsewhere.iter().any(|e| same_package(&e.purl, &key))
+    }
+
     fn recognize(&mut self, uuid: &str, mode: WiringMode, file: &str) {
         self.recognized.push(Recognized {
             uuid: uuid.to_string(),
@@ -701,6 +752,8 @@ impl Discovery {
         self.elsewhere.dedup();
         self.unattested.sort();
         self.unattested.dedup();
+        self.contested.sort();
+        self.contested.dedup();
         self.refs.sort_by(|a, b| {
             (&a.source_file, &a.purl, &a.uuid, a.mode).cmp(&(
                 &b.source_file,
@@ -768,6 +821,7 @@ async fn discover_with_ctx(ctx: DiscoverCtx<'_>) -> Discovery {
     composer::extract(&ctx, &mut out).await;
     maven::extract(&ctx, &mut out).await;
     gradle::extract(&ctx, &mut out).await;
+    sbt::extract(&ctx, &mut out).await;
     nuget::extract(&ctx, &mut out).await;
     deno::extract(&ctx, &mut out).await;
     out.contest_across_locks();
@@ -3040,6 +3094,8 @@ mod tests {
                     "gradle.lockfile",
                     "pom.xml",
                     "settings-gradle.lockfile",
+                    "socket-patch-vendor.sbt",
+                    "socket-patch.sbt",
                 ],
             ),
             ("nuget", &["NuGet.Config", "NuGet.config", "nuget.config"]),
@@ -3826,7 +3882,21 @@ mod tests {
             assert!(out.recognizes(uuid, mode), "{name}");
             if mode == WiringMode::Hosted {
                 assert_eq!(out.hosted_claim(purl, uuid), Some(false), "{name}");
+                assert!(out.vendored_contest(purl, uuid).is_none(), "{name}");
+            } else {
+                // #900: the dead vendored claim names both locks.
+                assert_eq!(
+                    out.vendored_claim(purl, uuid, &format!(".socket/vendor/x/{uuid}")),
+                    Some(false),
+                    "{name}"
+                );
+                let c = out.vendored_contest(purl, uuid).expect(name);
+                assert_eq!(c.file, std::path::Path::new(files[0].0), "{name}");
+                assert_eq!(c.other, std::path::Path::new(files[1].0), "{name}");
+                assert!(out.vendored_contest(purl, UUID_A).is_none(), "{name}");
             }
+            assert!(out.resolves_package(purl), "{name}");
+            assert!(!out.resolves_package("pkg:npm/unrelated@1.0.0"), "{name}");
 
             // Without the contesting lock the same wiring is a ref.
             let alone = Project::new();

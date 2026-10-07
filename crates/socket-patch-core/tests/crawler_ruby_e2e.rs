@@ -777,6 +777,89 @@ async fn global_bundle_store_is_shadowed_by_environment_path_flags() {
     }
 }
 
+/// #915: a project that moved from `vendor/bundle` back to system gems
+/// (`bundle config set --local path.system true`, or the env
+/// `BUNDLE_PATH__SYSTEM=true`) still has the gitignored `vendor/bundle`.
+/// Bundler loads the system copy, so the ambient discovery must crawl the
+/// `gem env` home and not the leftover store.
+#[cfg(unix)]
+#[tokio::test]
+#[serial]
+async fn path_system_crawls_gem_env_home_not_leftover_vendor_bundle() {
+    let tmp = tempfile::tempdir().unwrap();
+    let root = tmp.path().join("app");
+    let leftover = root.join("vendor/bundle/ruby/3.3.0/gems");
+    stage_gem(&leftover, "colorize", "0.8.1").await;
+    std::fs::write(root.join("Gemfile"), "gem 'colorize', '0.8.1'\n").unwrap();
+    std::fs::create_dir_all(root.join(".bundle")).unwrap();
+
+    let gemdir = tmp.path().join("system-gem-home");
+    let system_gems = gemdir.join("gems");
+    let loaded_copy = stage_gem(&system_gems, "colorize", "0.8.1").await;
+    let bin = tmp.path().join("bin");
+    std::fs::create_dir_all(&bin).unwrap();
+    install_fake_gem(&bin, &gemdir);
+
+    let keys = [
+        "BUNDLE_CONFIG",
+        "BUNDLE_USER_CONFIG",
+        "BUNDLE_USER_HOME",
+        "BUNDLE_APP_CONFIG",
+        "BUNDLE_IGNORE_CONFIG",
+        "BUNDLE_PATH",
+        "BUNDLE_PATH__SYSTEM",
+        "BUNDLE_DISABLE_SHARED_GEMS",
+        "HOME",
+    ];
+    let previous: Vec<_> = keys.iter().map(|key| std::env::var_os(key)).collect();
+    for key in keys {
+        std::env::remove_var(key);
+    }
+    std::env::set_var("HOME", tmp.path().join("home"));
+    let crawler = RubyCrawler;
+    let options = options_at(&root);
+    let mut cases = Vec::new();
+    for (label, config, env) in [
+        ("control", "---\n", None),
+        ("local", "---\nBUNDLE_PATH__SYSTEM: \"true\"\n", None),
+        ("env", "---\n", Some("true")),
+    ] {
+        std::fs::write(root.join(".bundle/config"), config).unwrap();
+        if let Some(value) = env {
+            std::env::set_var("BUNDLE_PATH__SYSTEM", value);
+        }
+        let paths = with_path(&bin, || async { crawler.get_gem_paths(&options).await })
+            .await
+            .unwrap();
+        std::env::remove_var("BUNDLE_PATH__SYSTEM");
+        let mut found = Vec::new();
+        for gems_dir in &paths {
+            let hits = crawler
+                .find_each_by_purl(gems_dir, &["pkg:gem/colorize@0.8.1".to_string()])
+                .await;
+            found.extend(hits.into_iter().flatten().map(|p| p.path));
+        }
+        cases.push((label, paths, found));
+    }
+    // Restore the ambient state before any assertion can panic.
+    for (key, value) in keys.into_iter().zip(previous) {
+        match value {
+            Some(value) => std::env::set_var(key, value),
+            None => std::env::remove_var(key),
+        }
+    }
+
+    for (label, paths, found) in cases {
+        if label == "control" {
+            // No setting: the historic leftover heuristic is unchanged.
+            assert_eq!(paths, vec![leftover.clone()], "{label}");
+        } else {
+            assert_eq!(paths, vec![system_gems.clone()], "{label}");
+            assert_eq!(found, vec![loaded_copy.clone()], "{label}");
+        }
+    }
+}
+
 // ── global gem discovery ───────────────────────────────────────
 
 #[tokio::test]
