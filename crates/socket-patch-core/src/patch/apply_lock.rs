@@ -34,14 +34,34 @@
 //!   for the next acquire to reclaim, rather than unlinked from under
 //!   whoever locked it.
 //!
+//! * An interrupted holder removes the file too. [`acquire`] registers
+//!   every held lock in a process-global table and the guard's drop
+//!   takes it out again; [`cleanup_held_lock_on_interrupt`] unlinks each
+//!   registered file (gated on the same inode identity as the drop) and
+//!   prunes an empty `.socket/`. The CLI calls it from its SIGINT,
+//!   SIGTERM and SIGHUP handlers (Ctrl-C, Ctrl-Break and console close
+//!   on Windows) before letting the signal end the process, because the
+//!   default disposition kills the process without running any drop.
+//!   Installing those handlers is the host's job: a host that embeds
+//!   this crate without the CLI (the Node addon) installs none, and an
+//!   interrupt there behaves like a crash.
+//!
 //! So no command leaves `apply.lock` behind (barring that non-cooperating
 //! replacement, which the next lock-taking command reclaims), and a
 //! project that had no
 //! `.socket/` before a run has none after it unless the run wrote real
-//! state there. A leftover file from a crashed run needs no removal to
-//! unblock anything — the kernel released the dead process's advisory
-//! lock with its file handle — so the next acquire reclaims it in place
-//! and removes it on exit. `Held` therefore always means a live process.
+//! state there. Only an uncatchable kill (SIGKILL, power loss) can leave
+//! the file. Such a leftover needs no removal to unblock anything — the
+//! kernel released the dead process's advisory lock with its file
+//! handle — so the next acquire reclaims it in place and removes it on
+//! exit. `Held` therefore always means a live process.
+//!
+//! socket-patch never keeps a persistent lock file in the project. That
+//! is why this module carries the deletion machinery (the identity
+//! checks, the vanished/delete-pending retries, the unlink under the
+//! lock). If a persistent lock is ever needed, it must live outside the
+//! project (the user cache dir or a configurable path), never under
+//! `.socket/`.
 //!
 //! # Windows
 //!
@@ -156,6 +176,9 @@ pub struct LockGuard {
     handle: Option<Handle>,
     path: PathBuf,
     socket_dir: PathBuf,
+    /// This guard's entry in the interrupt-cleanup table, if it got one
+    /// (see [`cleanup_held_lock_on_interrupt`]).
+    registration: Option<interrupt::Registration>,
 }
 
 impl LockGuard {
@@ -168,6 +191,11 @@ impl LockGuard {
 
 impl Drop for LockGuard {
     fn drop(&mut self) {
+        // From here on the drop itself removes the file; an interrupt
+        // landing mid-drop must not race it for the unlink.
+        if let Some(registration) = self.registration.take() {
+            interrupt::unregister(registration);
+        }
         // R0: sync every artifact still pending a durability barrier while
         // the lock is held — an artifact rebuilt in place that no later
         // commit point's barrier covered (see `utils::durability`). Best
@@ -218,6 +246,226 @@ fn prune_empty_socket_dir(socket_dir: &Path) {
     {
         let _ = std::fs::remove_dir(socket_dir);
     }
+}
+
+/// Remove every lock file this process holds, for a host's interrupt
+/// handler (the CLI's SIGINT/SIGTERM/SIGHUP handler on Unix, its console
+/// ctrl handler on Windows) to call just before the signal ends the
+/// process. The default disposition kills the process without running
+/// [`LockGuard`]'s drop, so without this an interrupted run would leave
+/// `apply.lock` (and a `.socket/` the run created) behind.
+///
+/// For each registered guard: if the lock path still names the inode the
+/// guard holds, unlink it, then remove the `.socket/` directory if it is
+/// now empty. The identity gate is the drop's: a replacement planted by a
+/// non-cooperating `rm` + `touch` belongs to someone else and is left
+/// alone. Nothing is unregistered, so a second call is a harmless no-op.
+///
+/// Unix: async-signal-safe. It reads only memory built at acquire time
+/// and calls only `stat`, `unlink` and `rmdir`. Windows: the console ctrl
+/// handler runs on an ordinary thread, so this takes a mutex and uses
+/// std. The unlinked name stays delete-pending until the process's lock
+/// handle closes at exit, so a competing acquire keeps retrying until
+/// then; the empty-directory prune is skipped there for the same reason.
+///
+/// Call it only when the process is about to end: the guards it cleaned
+/// up still hold their locks, but their files are gone.
+pub fn cleanup_held_lock_on_interrupt() {
+    interrupt::cleanup(None);
+}
+
+/// The interrupt-cleanup table behind [`cleanup_held_lock_on_interrupt`].
+///
+/// Every command holds one guard at a time, but the in-process unit tests
+/// hold many at once, so the table has a few slots. A guard that finds
+/// them all taken is simply not registered: its drop still cleans up
+/// normally, only an interrupt would leave its file behind.
+#[cfg(unix)]
+mod interrupt {
+    use std::ffi::{CStr, CString};
+    use std::os::unix::ffi::OsStrExt;
+    use std::path::Path;
+    use std::ptr;
+    use std::sync::atomic::{AtomicPtr, AtomicUsize, Ordering::SeqCst};
+
+    use super::{LockGuard, SOCKET_DIR_NAME};
+
+    const SLOTS: usize = 8;
+
+    /// Everything the handler needs, built before the slot is published so
+    /// the handler never allocates.
+    pub(super) struct Held {
+        lock: CString,
+        /// `None` unless the directory is literally named `.socket` (the
+        /// same gate as `prune_empty_socket_dir`).
+        socket_dir: Option<CString>,
+        dev: u64,
+        ino: u64,
+    }
+
+    static HELD: [AtomicPtr<Held>; SLOTS] = [const { AtomicPtr::new(ptr::null_mut()) }; SLOTS];
+
+    /// Number of cleanups currently reading the table. `unregister` frees
+    /// an entry only when none is: a cleanup that started before the
+    /// entry left the table may still be reading it. (With SeqCst, a
+    /// cleanup that starts after `unregister` read zero also loads the
+    /// slot after it was cleared, so it never sees the freed entry.)
+    static READERS: AtomicUsize = AtomicUsize::new(0);
+
+    #[derive(Debug)]
+    pub(super) struct Registration(usize);
+
+    fn c_path(path: &Path) -> Option<CString> {
+        CString::new(path.as_os_str().as_bytes()).ok()
+    }
+
+    pub(super) fn register(guard: &LockGuard) -> Option<Registration> {
+        let handle = guard.handle.as_ref()?;
+        let socket_dir = if guard
+            .socket_dir
+            .file_name()
+            .is_some_and(|name| name == SOCKET_DIR_NAME)
+        {
+            Some(c_path(&guard.socket_dir)?)
+        } else {
+            None
+        };
+        let held = Box::into_raw(Box::new(Held {
+            lock: c_path(&guard.path)?,
+            socket_dir,
+            dev: handle.dev(),
+            ino: handle.ino(),
+        }));
+        for (i, slot) in HELD.iter().enumerate() {
+            if slot
+                .compare_exchange(ptr::null_mut(), held, SeqCst, SeqCst)
+                .is_ok()
+            {
+                return Some(Registration(i));
+            }
+        }
+        // SAFETY: never published, so this is still the only pointer.
+        drop(unsafe { Box::from_raw(held) });
+        None
+    }
+
+    pub(super) fn unregister(Registration(i): Registration) {
+        let held = HELD[i].swap(ptr::null_mut(), SeqCst);
+        if !held.is_null() && READERS.load(SeqCst) == 0 {
+            // SAFETY: the slot no longer publishes it and no cleanup is
+            // reading the table, so this is the last reference. When a
+            // cleanup is running, the process is about to die: leak it.
+            drop(unsafe { Box::from_raw(held) });
+        }
+    }
+
+    /// `only`: restrict the cleanup to one lock path (the unit tests, which
+    /// share the table with every other test in the binary).
+    pub(super) fn cleanup(only: Option<&CStr>) {
+        READERS.fetch_add(1, SeqCst);
+        for slot in &HELD {
+            let held = slot.load(SeqCst);
+            if held.is_null() {
+                continue;
+            }
+            // SAFETY: published entries are freed only after leaving the
+            // table while READERS is zero, and we hold READERS above zero.
+            let held = unsafe { &*held };
+            if only.is_some_and(|only| only != held.lock.as_c_str()) {
+                continue;
+            }
+            // SAFETY: plain syscalls on NUL-terminated paths built at
+            // acquire time; `st` is a valid out-pointer.
+            unsafe {
+                let mut st: libc::stat = std::mem::zeroed();
+                if libc::stat(held.lock.as_ptr(), &mut st) == 0
+                    && st.st_dev as u64 == held.dev
+                    && st.st_ino as u64 == held.ino
+                {
+                    libc::unlink(held.lock.as_ptr());
+                }
+                if let Some(dir) = &held.socket_dir {
+                    // Non-recursive: fails harmlessly when not empty.
+                    libc::rmdir(dir.as_ptr());
+                }
+            }
+        }
+        READERS.fetch_sub(1, SeqCst);
+    }
+}
+
+#[cfg(windows)]
+mod interrupt {
+    use std::path::{Path, PathBuf};
+    use std::sync::Mutex;
+
+    use same_file::Handle;
+
+    use super::LockGuard;
+
+    struct Held {
+        id: u64,
+        lock: PathBuf,
+        /// A duplicate of the guard's handle, kept only for the identity
+        /// comparison. It leaves the table at the top of the guard's
+        /// drop, before the guard closes its own handle, so it never
+        /// keeps the lock or the delete-pending name alive.
+        handle: Handle,
+    }
+
+    static HELD: Mutex<Vec<Held>> = Mutex::new(Vec::new());
+    static NEXT_ID: std::sync::atomic::AtomicU64 = std::sync::atomic::AtomicU64::new(0);
+
+    #[derive(Debug)]
+    pub(super) struct Registration(u64);
+
+    fn table() -> std::sync::MutexGuard<'static, Vec<Held>> {
+        HELD.lock()
+            .unwrap_or_else(std::sync::PoisonError::into_inner)
+    }
+
+    pub(super) fn register(guard: &LockGuard) -> Option<Registration> {
+        let dup = guard.handle.as_ref()?.as_file().try_clone().ok()?;
+        let handle = Handle::from_file(dup).ok()?;
+        let id = NEXT_ID.fetch_add(1, std::sync::atomic::Ordering::Relaxed);
+        table().push(Held {
+            id,
+            lock: guard.path.clone(),
+            handle,
+        });
+        Some(Registration(id))
+    }
+
+    pub(super) fn unregister(Registration(id): Registration) {
+        table().retain(|held| held.id != id);
+    }
+
+    pub(super) fn cleanup(only: Option<&Path>) {
+        for held in table().iter() {
+            if only.is_some_and(|only| only != held.lock) {
+                continue;
+            }
+            if Handle::from_path(&held.lock).is_ok_and(|now| now == held.handle) {
+                let _ = std::fs::remove_file(&held.lock);
+            }
+        }
+    }
+}
+
+#[cfg(not(any(unix, windows)))]
+mod interrupt {
+    use super::LockGuard;
+
+    #[derive(Debug)]
+    pub(super) struct Registration;
+
+    pub(super) fn register(_: &LockGuard) -> Option<Registration> {
+        None
+    }
+
+    pub(super) fn unregister(_: Registration) {}
+
+    pub(super) fn cleanup(_: Option<&std::path::Path>) {}
 }
 
 /// Finish the group commit a crashed vendored run left half-written (see
@@ -319,9 +567,13 @@ pub fn acquire(socket_dir: &Path, timeout: Duration) -> Result<LockGuard, LockEr
         // a waiter parked with the file open would prolong a Windows
         // delete-pending window for everyone.
         match attempt(&path, socket_dir) {
-            Attempt::Acquired(guard) => {
+            Attempt::Acquired(mut guard) => {
+                guard.registration = interrupt::register(&guard);
                 // On failure the guard drops here, releasing the lock.
                 recover_group_commit(socket_dir)?;
+                // Debug-only hook: the interrupt tests park the process
+                // here, lock held, and signal it.
+                crate::utils::failpoint::hit("apply_lock.acquired");
                 return Ok(guard);
             }
             Attempt::Contended => {
@@ -476,6 +728,7 @@ fn attempt(path: &Path, socket_dir: &Path) -> Attempt {
             handle: Some(held),
             path: path.to_path_buf(),
             socket_dir: socket_dir.to_path_buf(),
+            registration: None,
         }),
         // The path names a replacement: a releaser unlinked the inode we
         // locked between our open and our lock, and a newcomer created
@@ -970,6 +1223,91 @@ mod tests {
         drop(fresh);
         assert!(!lock_path.exists());
         assert!(!socket.exists());
+    }
+
+    /// Run the interrupt cleanup for one lock path only: the table is
+    /// process-global, and the other tests in this binary hold locks of
+    /// their own while this runs.
+    #[cfg(unix)]
+    fn interrupt_cleanup_of(path: &Path) {
+        use std::os::unix::ffi::OsStrExt;
+        let path = std::ffi::CString::new(path.as_os_str().as_bytes()).unwrap();
+        interrupt::cleanup(Some(&path));
+    }
+
+    #[cfg(windows)]
+    fn interrupt_cleanup_of(path: &Path) {
+        interrupt::cleanup(Some(path));
+    }
+
+    /// An interrupt removes the held lock file and the empty `.socket/`
+    /// the acquire created, and the guard's later drop (which a real
+    /// interrupt never reaches) still copes with the file being gone.
+    #[cfg(any(unix, windows))]
+    #[test]
+    fn interrupt_cleanup_removes_the_held_file_and_empty_socket_dir() {
+        let dir = tempfile::tempdir().unwrap();
+        let socket = socket_dir(&dir);
+        let lock_path = socket.join("apply.lock");
+
+        let guard = acquire(&socket, Duration::ZERO).unwrap();
+        assert!(guard.registration.is_some(), "acquire registers the lock");
+        assert!(lock_path.is_file());
+
+        interrupt_cleanup_of(&lock_path);
+        assert!(!lock_path.exists(), "the interrupt removes apply.lock");
+        // Windows keeps the name delete-pending until the handle closes,
+        // so the prune is the drop's job there.
+        #[cfg(unix)]
+        assert!(!socket.exists(), "and the .socket/ it left empty");
+
+        drop(guard);
+        assert!(!lock_path.exists());
+        assert!(!socket.exists());
+    }
+
+    /// The interrupt cleanup is gated on identity like the drop: a
+    /// replacement planted by `rm` + `touch` is someone else's file.
+    #[cfg(any(unix, windows))]
+    #[test]
+    fn interrupt_cleanup_leaves_a_replacement_file_alone() {
+        let dir = tempfile::tempdir().unwrap();
+        let socket = socket_dir(&dir);
+        let lock_path = socket.join("apply.lock");
+
+        let guard = acquire(&socket, Duration::ZERO).unwrap();
+        std::fs::remove_file(&lock_path).unwrap();
+        std::fs::File::create(&lock_path).unwrap();
+
+        interrupt_cleanup_of(&lock_path);
+        assert!(
+            lock_path.is_file(),
+            "the cleanup must not unlink a file the guard does not hold"
+        );
+        assert!(socket.is_dir());
+
+        drop(guard);
+        assert!(lock_path.is_file(), "nor may the drop");
+    }
+
+    /// The drop takes the guard out of the table: a later interrupt in
+    /// the same process leaves the next holder's file alone.
+    #[cfg(any(unix, windows))]
+    #[test]
+    fn dropped_guard_is_unregistered() {
+        let dir = tempfile::tempdir().unwrap();
+        let socket = socket_dir(&dir);
+        let lock_path = socket.join("apply.lock");
+
+        drop(acquire(&socket, Duration::ZERO).unwrap());
+        // Hold the next file through a plain handle, not a guard, so
+        // nothing re-registers this path.
+        std::fs::create_dir_all(&socket).unwrap();
+        let other = std::fs::File::create(&lock_path).unwrap();
+        other.try_lock_exclusive().unwrap();
+
+        interrupt_cleanup_of(&lock_path);
+        assert!(lock_path.is_file());
     }
 
     /// Two threads hammering acquire/release on one `.socket/` — every
