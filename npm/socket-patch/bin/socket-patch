@@ -1,5 +1,6 @@
 #!/usr/bin/env node
 const { spawnSync } = require("child_process");
+const fs = require("fs");
 const path = require("path");
 
 const PLATFORMS = {
@@ -15,32 +16,82 @@ const PLATFORMS = {
   "android arm64": ["@socketsecurity/socket-patch-android-arm64"],
 };
 
-const key = `${process.platform} ${process.arch}`;
-const candidates = PLATFORMS[key];
-if (!candidates) {
-  console.error(`Unsupported platform: ${key}`);
-  process.exit(1);
-}
-
-const exe = process.platform === "win32" ? "socket-patch.exe" : "socket-patch";
-let binPath;
-for (const pkg of candidates) {
+// Installers that ignore the `libc` field (yarn classic) install both the
+// -gnu and the -musl package on Linux, so the order above alone would run
+// the glibc binary on musl hosts (Alpine), where it cannot start.
+function detectLibc({
+  platform = process.platform,
+  getReport = () => process.report.getReport(),
+  listDir = (dir) => fs.readdirSync(dir),
+} = {}) {
+  if (platform !== "linux") return null;
   try {
-    const pkgDir = path.dirname(require.resolve(`${pkg}/package.json`));
-    binPath = path.join(pkgDir, exe);
-    break;
+    // Node reports the runtime glibc version only when it runs on glibc.
+    if (getReport().header.glibcVersionRuntime) return "glibc";
   } catch {}
-}
-if (!binPath) {
-  // Fallback: try local bin directory (for development or bundled installs)
-  const localBin = process.platform === "win32"
-    ? `socket-patch-${key.replace(" ", "-")}.exe`
-    : `socket-patch-${key.replace(" ", "-")}`;
-  binPath = path.join(__dirname, localBin);
+  // Same probe as scripts/install.sh: musl's dynamic loader.
+  try {
+    if (listDir("/lib").some((name) => name.startsWith("ld-musl-"))) return "musl";
+  } catch {}
+  return null;
 }
 
-const result = spawnSync(binPath, process.argv.slice(2), {
-  stdio: "inherit",
-  env: process.env,
-});
-process.exit(result.status ?? 1);
+function orderCandidates(candidates, libc) {
+  if (libc !== "musl") return candidates;
+  const musl = candidates.filter((pkg) => pkg.endsWith("-musl"));
+  return [...musl, ...candidates.filter((pkg) => !pkg.endsWith("-musl"))];
+}
+
+// Spawn errors that mean "this binary cannot run here", so the next
+// installed candidate is worth trying.
+const UNRUNNABLE = new Set(["ENOENT", "EACCES", "ENOEXEC"]);
+
+function runFirstUsable(binPaths, args, {
+  spawn = (bin, argv) => spawnSync(bin, argv, { stdio: "inherit", env: process.env }),
+  log = (msg) => console.error(msg),
+} = {}) {
+  let lastError;
+  for (const bin of binPaths) {
+    const result = spawn(bin, args);
+    if (!result.error) return result.status ?? 1;
+    lastError = { bin, error: result.error };
+    if (!UNRUNNABLE.has(result.error.code)) break;
+  }
+  if (lastError) {
+    log(`socket-patch: failed to run ${lastError.bin}: ${lastError.error.message}`);
+  }
+  return 1;
+}
+
+function main() {
+  const key = `${process.platform} ${process.arch}`;
+  const candidates = PLATFORMS[key];
+  if (!candidates) {
+    console.error(`Unsupported platform: ${key}`);
+    process.exit(1);
+  }
+
+  const exe = process.platform === "win32" ? "socket-patch.exe" : "socket-patch";
+  const binPaths = [];
+  for (const pkg of orderCandidates(candidates, detectLibc())) {
+    try {
+      const pkgDir = path.dirname(require.resolve(`${pkg}/package.json`));
+      binPaths.push(path.join(pkgDir, exe));
+    } catch {}
+  }
+  if (binPaths.length === 0) {
+    // Fallback: try local bin directory (for development or bundled installs)
+    const localBin = process.platform === "win32"
+      ? `socket-patch-${key.replace(" ", "-")}.exe`
+      : `socket-patch-${key.replace(" ", "-")}`;
+    binPaths.push(path.join(__dirname, localBin));
+  }
+
+  process.exit(runFirstUsable(binPaths, process.argv.slice(2)));
+}
+
+if (require.main === module) {
+  main();
+} else {
+  module.exports = { PLATFORMS, detectLibc, orderCandidates, runFirstUsable };
+}
