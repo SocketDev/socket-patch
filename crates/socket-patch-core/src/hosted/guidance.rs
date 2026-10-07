@@ -208,9 +208,36 @@ pub fn pnpm_trust_configured_detail(server: &str, created: bool, dry_run: bool) 
         (true, true) => "`trustLockfile: true` would be written to a new",
         (false, true) => "`trustLockfile: true` would be merged into the existing",
     };
+    // A created file makes the project a root-only workspace, where pnpm
+    // 9.0–10.4 refuse `pnpm add` without `-w` (#734); a project pinned to
+    // those releases never gets one.
+    let root_only = if created {
+        " On pnpm 9.0–10.4 a root-only workspace needs `pnpm add -w <pkg>` \
+         to add dependencies."
+    } else {
+        ""
+    };
     format!(
         "{}, so {how} {PNPM_WORKSPACE_REL} — commit it alongside the lock; \
-         installs need no extra flags. {PNPM_TRUST_TRADEOFF_AND_CAUTION}",
+         installs need no extra flags.{root_only} {PNPM_TRUST_TRADEOFF_AND_CAUTION}",
+        pnpm_trust_policy_preamble(server),
+    )
+}
+
+/// The single-package variant on pnpm 9.0–10.4 (#734): the project has no
+/// pnpm-workspace.yaml and every pin it carries (`pins`, as prose) is a
+/// pnpm that never reads `trustLockfile` but would treat a created file as
+/// a root-only workspace and refuse `pnpm add` (ERR_PNPM_ADDING_TO_ROOT),
+/// so nothing was written. Names the pnpm >= 11 recovery.
+pub fn pnpm_trust_not_needed_detail(server: &str, pins: &str, dry_run: bool) -> String {
+    let was = if dry_run { "would be" } else { "was" };
+    format!(
+        "{}. The project's pnpm ({pins}) does not read `trustLockfile`, so no \
+         {PNPM_WORKSPACE_REL} {was} created: on pnpm 9.0–10.4 one would make the \
+         project a root-only workspace where `pnpm add <pkg>` fails with \
+         ERR_PNPM_ADDING_TO_ROOT. After upgrading to pnpm >=11, re-run \
+         `socket-patch scan --mode hosted` to create it, or install with \
+         `pnpm install --trust-lockfile`. {PNPM_TRUST_TRADEOFF_AND_CAUTION}",
         pnpm_trust_policy_preamble(server),
     )
 }
@@ -219,6 +246,7 @@ pub fn pnpm_trust_configured_detail(server: &str, created: bool, dry_run: bool) 
 pub use crate::formats::pnpm::{
     lock_version_major as pnpm_lock_version_major,
     may_need_store_flag as pnpm_lock_may_need_store_flag,
+    root_only_workspace_breaks_add as pnpm_root_only_workspace_breaks_add,
 };
 
 /// The planned pnpm-workspace.yaml `trustLockfile: true` edit.

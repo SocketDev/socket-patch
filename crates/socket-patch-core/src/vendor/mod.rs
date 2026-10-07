@@ -192,7 +192,7 @@ pub fn yarn_classic_berry_migration_risk(project_root: &Path) -> Option<VendorWa
                 .and_then(|p| p.as_str().map(String::from))
         })
     {
-        let major = pm.trim().strip_prefix("yarn@").map(|rest| {
+        let major = crate::utils::package_manager::pinned_version(&pm, "yarn").map(|rest| {
             rest.chars()
                 .take_while(char::is_ascii_digit)
                 .collect::<String>()

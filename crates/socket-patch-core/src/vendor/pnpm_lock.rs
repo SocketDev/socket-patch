@@ -95,7 +95,9 @@ pub(crate) const VENDOR_PNPM_SETTINGS_ELSEWHERE: &str = "vendor_pnpm_settings_el
 /// `pnpm-workspace.yaml`. pnpm 9 refuses a workspace file whose `packages`
 /// field is missing or empty; `.` (the root, already the sole importer) is a
 /// no-op that cannot accidentally glob a stray `packages/` subtree into a
-/// workspace the way `packages/*` would.
+/// workspace the way `packages/*` would. It still makes the project a
+/// workspace, so a project pinned to pnpm 9.0–10.4 (which refuse `pnpm add`
+/// there) never gets one (#734).
 const WS_SCAFFOLD_PACKAGES: [&str; 2] = ["packages:", "  - '.'"];
 
 /// Wiring kinds (the `WiringRecord.kind` discriminators this backend owns).
@@ -299,7 +301,13 @@ pub(super) async fn vendor_pnpm_dialect(
 
     // Only modern locks mirror overrides into pnpm-workspace.yaml. Legacy
     // pnpm reads package.json alone; creating a workspace changes its mode.
-    let ws_edit = if dialect == PnpmDialect::V9 {
+    // So does a project with no workspace file pinned to pnpm 9.0–10.4:
+    // those read package.json `pnpm.overrides` (wired above) and refuse
+    // `pnpm add` in the root-only workspace a created file would make
+    // (#734). A later run on pnpm >= 10.5 adds the mirror.
+    let ws_edit = if dialect == PnpmDialect::V9
+        && !(ws_text.is_none() && pinned_pre_10_5(project_root, &pkg_bytes).await)
+    {
         match apply_workspace_override(ws_text.as_deref(), &effective_key, &spec, &mut wiring) {
             Ok(edit) => edit,
             Err(e) => {
@@ -1791,6 +1799,21 @@ fn workspace_overrides_govern(pkg: &Value, ws_text: Option<&str>, lock: &[String
 // `<name>@<version>` → `file:` mapping is mirrored here. Edits are line
 // splices (never a YAML library) so untouched lines stay byte-identical and
 // revert restores the file byte-for-byte (or deletes a file we created).
+
+/// Whether every pnpm pin of a project (package.json, the installed
+/// `node_modules/.modules.yaml`) is a release that refuses `pnpm add` in a
+/// root-only workspace, so no pnpm-workspace.yaml is created for it. The
+/// install record is advisory: unreadable counts as absent.
+async fn pinned_pre_10_5(project_root: &Path, pkg_bytes: &[u8]) -> bool {
+    let modules = read_regular_to_string(&project_root.join("node_modules/.modules.yaml"))
+        .await
+        .ok();
+    crate::formats::pnpm::root_only_workspace_breaks_add(
+        std::str::from_utf8(pkg_bytes).ok(),
+        modules.as_deref(),
+    )
+    .is_some()
+}
 
 /// The bytes of a freshly created pnpm-workspace.yaml: a root-only
 /// `packages:` list (pnpm 9 refuses a workspace file with no `packages`
@@ -5744,6 +5767,123 @@ snapshots:
             !ws_exists(&fx).await,
             "revert deletes the workspace file it created"
         );
+    }
+
+    /// #734: a project with no workspace file whose pnpm is 9.0–10.4 (the
+    /// installed `.modules.yaml`, or package.json's pin) gets none: it would
+    /// make the project a root-only workspace those releases refuse `pnpm
+    /// add` in, and they read package.json `pnpm.overrides`, which is wired
+    /// with the lock. Revert restores both byte-for-byte. A later vendor on
+    /// pnpm >= 10.5 adds the mirror, and revert then undoes all three.
+    #[tokio::test]
+    async fn project_pinned_to_pnpm_9_through_10_4_gets_no_workspace_scaffold() {
+        let modules = |version: &str| {
+            format!("hoistPattern:\n  - '*'\nlayoutVersion: 5\npackageManager: pnpm@{version}\n")
+        };
+        let pinned_pkg =
+            P1_BEFORE_PKG.replacen("{\n", "{\n  \"packageManager\": \"pnpm@10.4.1\",\n", 1);
+        assert_ne!(pinned_pkg, P1_BEFORE_PKG);
+        for (pkg, modules_yaml) in [
+            (P1_BEFORE_PKG.to_string(), Some(modules("9.15.9"))),
+            (pinned_pkg.clone(), None),
+        ] {
+            let fx = fixture_with(&pkg, P1_BEFORE_LOCK).await;
+            if let Some(text) = &modules_yaml {
+                tokio::fs::write(fx.root().join("node_modules/.modules.yaml"), text)
+                    .await
+                    .unwrap();
+            }
+            let (result, entry, _) = expect_done(fx.vendor(false).await);
+            assert!(result.success, "{:?}", result.error);
+            let entry = entry.unwrap();
+            let spec = format!("file:{}", fx.rel_tgz());
+            assert!(!ws_exists(&fx).await, "no root-only workspace for {pkg}");
+            assert!(fx
+                .read(PACKAGE_JSON)
+                .await
+                .contains(&format!("\"left-pad@1.3.0\": \"{spec}\"")));
+            assert!(fx
+                .read(PNPM_LOCK)
+                .await
+                .contains(&format!("overrides:\n  left-pad@1.3.0: {spec}")));
+            assert!(entry.wiring.iter().all(|r| r.file != PNPM_WORKSPACE));
+            assert!(!entry.pnpm.as_ref().unwrap().created_workspace_file);
+
+            // A re-run is in sync: nothing is written, still no workspace.
+            let (rerun, rerun_entry, _) = expect_done(fx.vendor(false).await);
+            assert!(rerun.success && rerun_entry.is_none());
+            assert!(!ws_exists(&fx).await);
+
+            let outcome = revert_pnpm(&entry, fx.root(), false).await;
+            assert!(outcome.success, "{:?}", outcome.error);
+            assert!(outcome.warnings.is_empty(), "{:?}", outcome.warnings);
+            assert_eq!(fx.read(PACKAGE_JSON).await, pkg);
+            assert_eq!(fx.read(PNPM_LOCK).await, P1_BEFORE_LOCK);
+        }
+
+        // The upgrade: vendored on pnpm 9, then installed with pnpm 11.
+        let fx = fixture_with(P1_BEFORE_PKG, P1_BEFORE_LOCK).await;
+        let modules_path = fx.root().join("node_modules/.modules.yaml");
+        tokio::fs::write(&modules_path, modules("9.15.9"))
+            .await
+            .unwrap();
+        let (_, prev, _) = expect_done(fx.vendor(false).await);
+        let prev = prev.unwrap();
+        assert!(!ws_exists(&fx).await);
+        tokio::fs::write(&modules_path, modules("11.0.0"))
+            .await
+            .unwrap();
+        let (_, revendored, _) = expect_done(fx.vendor(false).await);
+        let mut merged = revendored.unwrap();
+        let spec = format!("file:{}", fx.rel_tgz());
+        assert_eq!(
+            fx.read(PNPM_WORKSPACE).await,
+            ws_scaffold_text("left-pad@1.3.0", &spec),
+            "pnpm 11 reads overrides from the workspace file: the mirror is added"
+        );
+        super::super::state::carry_forward_wiring(&prev, &mut merged);
+        let outcome = revert_pnpm(&merged, fx.root(), false).await;
+        assert!(outcome.success, "{:?}", outcome.error);
+        assert_eq!(fx.read(PACKAGE_JSON).await, P1_BEFORE_PKG);
+        assert_eq!(fx.read(PNPM_LOCK).await, P1_BEFORE_LOCK);
+        assert!(!ws_exists(&fx).await);
+    }
+
+    /// The #734 gate stays closed on pnpm >= 10.5, and on any pin that does
+    /// not agree: the root-only scaffold is created as before.
+    #[tokio::test]
+    async fn pnpm_10_5_or_a_disagreeing_pin_still_gets_the_workspace_scaffold() {
+        for (pkg_pin, modules_pin) in [
+            (None, Some("10.5.0")),
+            (Some("11.1.0"), Some("9.15.9")),
+            (Some("9.15.9"), Some("11.0.0")),
+        ] {
+            let pkg = match pkg_pin {
+                Some(v) => P1_BEFORE_PKG.replacen(
+                    "{\n",
+                    &format!("{{\n  \"packageManager\": \"pnpm@{v}\",\n"),
+                    1,
+                ),
+                None => P1_BEFORE_PKG.to_string(),
+            };
+            let fx = fixture_with(&pkg, P1_BEFORE_LOCK).await;
+            if let Some(v) = modules_pin {
+                tokio::fs::write(
+                    fx.root().join("node_modules/.modules.yaml"),
+                    format!("{{\"packageManager\":\"pnpm@{v}\"}}"),
+                )
+                .await
+                .unwrap();
+            }
+            let (_, entry, _) = expect_done(fx.vendor(false).await);
+            let spec = format!("file:{}", fx.rel_tgz());
+            assert_eq!(
+                fx.read(PNPM_WORKSPACE).await,
+                ws_scaffold_text("left-pad@1.3.0", &spec),
+                "{pkg_pin:?} / {modules_pin:?}"
+            );
+            assert!(entry.unwrap().pnpm.unwrap().created_workspace_file);
+        }
     }
 
     /// Existing workspace file WITHOUT an `overrides:` section: vendor

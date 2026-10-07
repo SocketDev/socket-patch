@@ -1144,3 +1144,44 @@ async fn yarn_berry_pin_takes_bin_from_the_served_tarball() {
         }
     }
 }
+
+/// #734 in memory: with no node_modules in the view, package.json's
+/// `packageManager` is the only pin. pnpm 9.15.9 gets its lock pinned and
+/// no root-only pnpm-workspace.yaml; pnpm 11 still gets the trust scaffold.
+#[tokio::test]
+async fn pnpm_9_pin_gets_no_root_only_workspace_in_memory() {
+    let dir = fixtures_root().join("redirect/npm/pnpm/basic");
+    let server = MockServer::start().await;
+    mount_api(
+        &server,
+        &patches_from_overrides(&dir.join("overrides.json"), None),
+    )
+    .await;
+    for (pin, scaffold) in [("9.15.9", false), ("11.0.0", true)] {
+        let mut files = fixture_files(&dir.join("input"));
+        files.insert(
+            "package.json".into(),
+            format!(r#"{{"name":"app","packageManager":"pnpm@{pin}"}}"#).into_bytes(),
+        );
+        let output = run_engine(&server, build_input(&files, &[], options(false))).await;
+        let project = &output.projects[0];
+        assert!(project.error.is_none(), "{:?}", project.error);
+        let paths: Vec<&str> = output
+            .changed_files
+            .iter()
+            .map(|f| f.path.as_str())
+            .collect();
+        assert!(paths.contains(&"pnpm-lock.yaml"), "{paths:?}");
+        assert_eq!(
+            paths.contains(&"pnpm-workspace.yaml"),
+            scaffold,
+            "{pin}: {paths:?}"
+        );
+        let warnings = project.redirect["warnings"].to_string();
+        assert_eq!(
+            warnings.contains("ERR_PNPM_ADDING_TO_ROOT"),
+            !scaffold,
+            "{warnings}"
+        );
+    }
+}

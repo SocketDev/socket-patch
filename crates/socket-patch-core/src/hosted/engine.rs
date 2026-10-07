@@ -46,8 +46,9 @@ use super::guidance::{
     npm_allow_remote_env_set_detail, npm_allow_remote_manual_detail,
     npm_allow_remote_outer_set_detail, npm_allow_remote_unreadable_detail,
     npm_allow_remote_user_set_detail, npm_lock_url_needles, plan_workspace_trust, pnpm_heal_root,
-    pnpm_lock_may_need_store_flag, pnpm_lock_version_major, pnpm_trust_configured_detail,
-    pnpm_trust_legacy_detail, pnpm_trust_manual_guidance, pnpm_trust_policy_preamble,
+    pnpm_lock_may_need_store_flag, pnpm_lock_version_major, pnpm_root_only_workspace_breaks_add,
+    pnpm_trust_configured_detail, pnpm_trust_legacy_detail, pnpm_trust_manual_guidance,
+    pnpm_trust_not_needed_detail, pnpm_trust_policy_preamble,
     pnpm_trust_workspace_unreadable_detail, pnpm_trust_workspace_unsupported_detail,
     read_npmrc_for_allow_remote, read_workspace_for_trust, url_host, TrustPlan, NPM_LOCKS,
     PNPM_TRUST_TRADEOFF_AND_CAUTION, PNPM_WORKSPACE_REL, REDIRECT_PNPM_WORKSPACE_TRUST_EDIT_KIND,
@@ -1446,7 +1447,19 @@ fn pnpm_trust(
             original: None,
             new: Some(serde_json::json!("true")),
         };
+        // No workspace file and a project pinned to pnpm 9.0–10.4: creating
+        // one would make it a root-only workspace those releases refuse
+        // `pnpm add` in, for a key they never read (#734).
+        let pinned_pre_10_5 = match &workspace {
+            Ok(None) if !symlinked => root_only_workspace_breaks_add(view),
+            _ => None,
+        };
         match workspace {
+            Ok(None) if pinned_pre_10_5.is_some() => pnpm_trust_not_needed_detail(
+                &server,
+                pinned_pre_10_5.as_deref().unwrap_or_default(),
+                options.dry_run,
+            ),
             // Present but UNREADABLE: never plan a Create (it would
             // overwrite the user's workspace file) — fall back to
             // warning-only guidance naming the file and the error.
@@ -1524,6 +1537,29 @@ fn pnpm_trust_user_set_detail(server: &str, file: &str, value: &str) -> String {
          `trustLockfile: true` yourself so every install accepts the patched \
          artifacts. {PNPM_TRUST_TRADEOFF_AND_CAUTION}",
         pnpm_trust_policy_preamble(server),
+    )
+}
+
+/// The pnpm pins of a project with no pnpm-workspace.yaml, when every one
+/// is a release that refuses `pnpm add` in a root-only workspace (see
+/// [`pnpm_root_only_workspace_breaks_add`]). Reads the root package.json
+/// and the installed `node_modules/.modules.yaml`, both advisory: FIFO-safe
+/// on disk, and an in-memory entry that is not text counts as absent.
+fn root_only_workspace_breaks_add(view: &ProjectView<'_>) -> Option<String> {
+    let read = |rel: &str| match view {
+        ProjectView::Disk(cwd)
+        | ProjectView::Snapshot(crate::vendor::lock_inventory::DiskSnapshot {
+            root: cwd, ..
+        }) => crate::utils::fs::read_regular_to_string_sync(&cwd.join(rel)).ok(),
+        ProjectView::Memory(project) if !project.is_symlink(rel) => match project.get(rel) {
+            Some(MemoryEntry::Text(text)) => Some(text.to_string()),
+            _ => None,
+        },
+        ProjectView::Memory(_) => None,
+    };
+    pnpm_root_only_workspace_breaks_add(
+        read(crate::hosted::memory::select::NPM_MANIFEST_REL).as_deref(),
+        read("node_modules/.modules.yaml").as_deref(),
     )
 }
 
