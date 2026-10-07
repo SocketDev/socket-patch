@@ -103,6 +103,25 @@ pub fn scrub_socket_vars(cmd: &mut Command) {
     }
 }
 
+/// The in-process half, for test binaries that only parse argv with clap:
+/// clap reads every env-bound `SOCKET_*` flag at parse time, so an ambient
+/// value (or a `.cargo/config.toml` `[env]` default such as
+/// `SOCKET_TELEMETRY_DISABLED=1`) changes what a parse yields. Removes every
+/// `SOCKET_*` var from this process, once; later calls wait for the first.
+/// Nothing is restored, so call it only from binaries where no test needs a
+/// `SOCKET_*` var, and call it before every parse so no parse reads the
+/// environment while it is being changed.
+pub fn scrub_process_socket_env() {
+    static ONCE: std::sync::Once = std::sync::Once::new();
+    ONCE.call_once(|| {
+        for (key, _) in std::env::vars_os() {
+            if key.to_string_lossy().starts_with("SOCKET_") {
+                std::env::remove_var(&key);
+            }
+        }
+    });
+}
+
 /// Opt-in scrubs for the ambient config of the tools a suite drives.
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub enum Extra {

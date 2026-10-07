@@ -12,13 +12,25 @@ use clap::Parser;
 use socket_patch_cli::commands::apply::ApplyArgs;
 use socket_patch_cli::{Cli, Commands};
 
+#[path = "common/hermetic.rs"]
+mod hermetic;
+
+/// `Cli::try_parse_from` with the ambient `SOCKET_*` environment removed
+/// first: clap reads the env-bound flags at parse time, so without it the
+/// workspace `SOCKET_TELEMETRY_DISABLED=1` default (or a developer's shell)
+/// would set `--no-telemetry` and friends in every parse.
+fn try_parse(argv: &[&str]) -> Result<Cli, clap::Error> {
+    hermetic::scrub_process_socket_env();
+    Cli::try_parse_from(argv)
+}
+
 /// Parse `socket-patch apply <extra...>` and return the inner `ApplyArgs`.
 /// Panics if parsing fails or yields a non-`Apply` subcommand — tests for
-/// the failure path call `Cli::try_parse_from` directly.
+/// the failure path call [`try_parse`] directly.
 fn parse_apply(extra: &[&str]) -> ApplyArgs {
     let mut argv: Vec<&str> = vec!["socket-patch", "apply"];
     argv.extend_from_slice(extra);
-    let cli = Cli::try_parse_from(&argv).expect("parse");
+    let cli = try_parse(&argv).expect("parse");
     match cli.command {
         Commands::Apply(a) => a,
         _ => panic!("expected Apply"),
@@ -305,7 +317,7 @@ fn no_telemetry_long() {
 /// the trailing token is rejected as an unknown argument.
 #[test]
 fn bare_bool_does_not_consume_next_token() {
-    match Cli::try_parse_from(["socket-patch", "apply", "--force", "stray"]) {
+    match try_parse(&["socket-patch", "apply", "--force", "stray"]) {
         Ok(_) => panic!("`--force stray` must reject the stray positional"),
         Err(err) => assert_eq!(err.kind(), clap::error::ErrorKind::UnknownArgument),
     }
@@ -563,7 +575,7 @@ fn download_mode_values_are_not_normalized() {
 /// expectation to assert an `InvalidValue` error.
 #[test]
 fn download_mode_invalid_value_is_only_caught_at_runtime() {
-    match Cli::try_parse_from(["socket-patch", "apply", "--download-mode", "totally-bogus"]) {
+    match try_parse(&["socket-patch", "apply", "--download-mode", "totally-bogus"]) {
         Ok(cli) => match cli.command {
             Commands::Apply(a) => assert_eq!(
                 a.common.download_mode, "totally-bogus",
@@ -588,7 +600,7 @@ fn download_mode_invalid_value_is_only_caught_at_runtime() {
 fn unknown_flag_fails_with_unknown_argument() {
     // `Cli` doesn't implement `Debug`, so we can't use `.expect_err()` —
     // match the Result by hand.
-    match Cli::try_parse_from(["socket-patch", "apply", "--unknown-flag"]) {
+    match try_parse(&["socket-patch", "apply", "--unknown-flag"]) {
         Ok(_) => panic!("--unknown-flag must be rejected"),
         Err(err) => {
             assert_eq!(err.kind(), clap::error::ErrorKind::UnknownArgument);
