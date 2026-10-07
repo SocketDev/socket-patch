@@ -28,6 +28,13 @@ existing scripts against the new CLI; the [changelog](../CHANGELOG.md) and
 - `list` succeeds on an empty project. Hosted results identify lockfiles instead
   of a hosted ledger. Scripts must use the updated
   [JSON shapes and exit codes](../crates/socket-patch-cli/CLI_CONTRACT.md#json-output-shapes).
+- A token whose organization cannot be resolved no longer queries
+  `/v0/orgs/default/…`. When no `--org`, `SOCKET_ORG_SLUG` or socket-cli
+  `defaultOrg` is set and `GET /v0/organizations` fails, the whole run uses the
+  public proxy anonymously (free patches only) and warns once; `scan --json` and
+  `get --json` report it as `api_auth_fallback` in `warnings[]`. Set `--org` or
+  `SOCKET_ORG_SLUG` to get org patches. The org is resolved once per run, so an
+  embedded `--vex` no longer resolves it again.
 
 ## Installation channels
 
