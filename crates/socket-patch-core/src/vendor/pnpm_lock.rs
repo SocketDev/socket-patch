@@ -1509,11 +1509,12 @@ pub(super) fn classify_pkg_override(
 /// Classify the pnpm-workspace.yaml `overrides:` section for `name` with
 /// the same rules as [`classify_pkg_override`] — on pnpm 10.5+ (always on
 /// 11/12) it is the authoritative override map, so a user exact pin there
-/// is taken over just like one in package.json (#854). Values compare raw:
-/// a quoted pin (`'1.3.0'`) or one with a trailing comment is a conflict
-/// (fail-closed). A missing file, a missing section and an inline/flow
-/// section classify as `Insert`; [`check_workspace_override`] refuses the
-/// shapes the surgery cannot edit.
+/// is taken over just like one in package.json (#854). Values compare as
+/// YAML reads them ([`ws_override_value`]): a quoted pin (`'1.3.0'`) or one
+/// with a trailing comment is the same pin as the plain `1.3.0`. A missing
+/// file, a missing section and an inline/flow section classify as
+/// `Insert`; [`check_workspace_override`] refuses the shapes the surgery
+/// cannot edit.
 fn classify_ws_override(
     ws_text: Option<&str>,
     name: &str,
@@ -1531,12 +1532,21 @@ fn classify_ws_override(
         lines[start + 1..end]
             .iter()
             .filter_map(|l| parse_key_line(l, indent))
-            .map(|(key, _repr, rest)| (key, rest, rest.to_string())),
+            .map(|(key, _repr, rest)| (key, ws_override_value(rest), rest.to_string())),
         name,
         version,
         our_key,
         PNPM_WORKSPACE,
     )
+}
+
+/// A pnpm-workspace.yaml override's value as YAML reads it: a trailing
+/// ` #` comment and one layer of quotes dropped, so a hand-written
+/// `left-pad: '1.3.0'  # CVE-…` pins the same `1.3.0` its lock mirror
+/// records. Comparisons only — the raw text is what a takeover records as
+/// the original, so revert restores the line byte-for-byte.
+fn ws_override_value(rest: &str) -> &str {
+    unquote_value(workspace::strip_comment(rest).trim())
 }
 
 /// The shared per-entry rules of [`classify_pkg_override`] and
@@ -2076,8 +2086,9 @@ fn check_workspace_override(
         if override_key_name(key) != name {
             continue;
         }
+        let value = ws_override_value(rest);
         // A sibling version's vendored override coexists — skip it.
-        if is_vendor_value(rest) && !vendor_value_is_for(rest, name, version) {
+        if is_vendor_value(value) && !vendor_value_is_for(value, name, version) {
             continue;
         }
         if key != effective_key {
@@ -2086,7 +2097,7 @@ fn check_workspace_override(
                  match `{effective_key}` — remove it (or vendor --revert) first"
             ));
         }
-        if !(is_vendor_value(rest) || rest == version) {
+        if !(is_vendor_value(value) || value == version) {
             return Err(format!(
                 "{PNPM_WORKSPACE} already carries an override for `{key}` ({rest}); vendoring \
                  would fight it — remove the override (or vendor --revert) first"
@@ -2139,8 +2150,9 @@ fn apply_workspace_override(
                 });
             }
             // Ours (stale uuid, no original) or the user's exact-version pin
-            // being TAKEN OVER (recorded, live quoting preserved).
-            let original = (!is_vendor_value(&rest)).then(|| rest.clone());
+            // being TAKEN OVER (recorded raw — quotes, comment and all — so
+            // revert restores the line byte-for-byte).
+            let original = (!is_vendor_value(ws_override_value(&rest))).then(|| rest.clone());
             lines[i] = format!("{pad}{}: {spec}", yaml_key_like(our_key, &repr));
             wiring.push(ws_record(our_key, spec, WiringAction::Rewritten, original));
         } else {
@@ -7119,6 +7131,71 @@ snapshots:
         assert_eq!(fx.read(PACKAGE_JSON).await, P1_BEFORE_PKG);
         assert_eq!(fx.read(PNPM_WORKSPACE).await, ws_before);
         assert_eq!(fx.read(PNPM_LOCK).await, lock_before);
+    }
+
+    /// #854: a hand-written workspace pin that is quoted or carries a
+    /// trailing comment is the same exact pin as the plain value its lock
+    /// mirror records (`left-pad: 1.3.0`), so it is taken over too. The raw
+    /// text is the recorded original, so revert restores the quotes and the
+    /// comment byte-for-byte. It used to refuse, with a detail claiming an
+    /// exact pin equal to 1.3.0 is taken over automatically.
+    #[tokio::test]
+    async fn ws_quoted_or_commented_exact_pin_is_taken_over_and_reverted_verbatim() {
+        let lock_before = p1_lock_with_override("left-pad", "1.3.0");
+        for value in [
+            "'1.3.0'",
+            "\"1.3.0\"",
+            "1.3.0  # CVE-2099-0001",
+            "'1.3.0' # pinned",
+        ] {
+            let ws_before = ws_with_override("left-pad", value);
+            let fx = fixture_with(P1_BEFORE_PKG, &lock_before).await;
+            write_ws(&fx, &ws_before).await;
+
+            let (result, entry, _) = expect_done(fx.vendor(false).await);
+            assert!(result.success, "{value}: {:?}", result.error);
+            let entry = entry.unwrap();
+            let spec = format!("file:{}", fx.rel_tgz());
+            assert_eq!(
+                fx.read(PNPM_WORKSPACE).await,
+                ws_with_override("left-pad", &spec),
+                "{value}"
+            );
+            assert_eq!(fx.read(PACKAGE_JSON).await, P1_BEFORE_PKG, "{value}");
+            let rec = entry
+                .wiring
+                .iter()
+                .find(|r| r.kind == KIND_WS_OVERRIDE)
+                .unwrap();
+            assert_eq!(rec.original, Some(Value::String(value.into())), "{value}");
+
+            let outcome = revert_pnpm(&entry, fx.root(), false).await;
+            assert!(outcome.success, "{value}: {:?}", outcome.error);
+            assert!(
+                outcome.warnings.is_empty(),
+                "{value}: {:?}",
+                outcome.warnings
+            );
+            assert_eq!(fx.read(PNPM_WORKSPACE).await, ws_before, "{value}");
+            assert_eq!(fx.read(PNPM_LOCK).await, lock_before, "{value}");
+            assert_eq!(fx.read(PACKAGE_JSON).await, P1_BEFORE_PKG, "{value}");
+        }
+    }
+
+    /// The normalization reads a value, not a version: a quoted or
+    /// commented range / other version still refuses.
+    #[tokio::test]
+    async fn ws_quoted_or_commented_non_matching_pin_still_refuses() {
+        for value in ["'^1.3.0'", "1.4.0 # 1.3.0", "'1.3.0 # x'"] {
+            let lock = p1_lock_with_override("left-pad", "1.3.0");
+            let ws = ws_with_override("left-pad", value);
+            let fx = fixture_with(P1_BEFORE_PKG, &lock).await;
+            write_ws(&fx, &ws).await;
+            let detail = expect_refused(fx.vendor(false).await, "vendor_override_conflict");
+            assert!(detail.contains(PNPM_WORKSPACE), "{value}: {detail}");
+            assert_eq!(fx.read(PNPM_WORKSPACE).await, ws, "refusal writes nothing");
+            assert_eq!(fx.read(PNPM_LOCK).await, lock);
+        }
     }
 
     /// #854, pnpm 9 shape: the lock does not record the workspace pin
