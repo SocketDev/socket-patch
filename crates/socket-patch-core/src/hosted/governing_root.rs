@@ -474,10 +474,6 @@ mod tests {
         assert_eq!(code(&member, "npm").await, None);
     }
 
-    /// #880: a member with its own v9 lock is pinned through that lock, but
-    /// pnpm reads `trustLockfile` only from the root `pnpm-workspace.yaml`.
-    /// Until that file trusts the lock (or opts out), the hosted run refuses
-    /// rather than nest a settings file pnpm ignores.
     /// #1006: a project the nearest `pnpm-workspace.yaml` does not list
     /// under `packages:` is standalone on pnpm 11.28+/12 and reads only its
     /// own settings file, so the trust auto-config's nested file is the
@@ -499,12 +495,38 @@ mod tests {
         let demo = tmp.path().join("examples/demo");
         let refused = refusal(&ProjectView::Disk(&demo), &[candidate("npm")], true).await;
         assert!(refused.is_none(), "{refused:?}");
-        // A settings-only root file lists no project but the root.
-        write(tmp.path(), "pnpm-workspace.yaml", "trustLockfile: false\n");
+        // A settings-only root file lists no project but the root. No trust
+        // key, so only the membership rule keeps it from refusing.
+        write(
+            tmp.path(),
+            "pnpm-workspace.yaml",
+            "sharedWorkspaceLockfile: false\n",
+        );
         let refused = refusal(&ProjectView::Disk(&demo), &[candidate("npm")], true).await;
         assert!(refused.is_none(), "{refused:?}");
+        // `**` does not list a dot directory (pnpm 12 installs it with its
+        // own lock), so a GitHub action project is not refused either.
+        write(tmp.path(), "pnpm-workspace.yaml", "packages:\n  - '**'\n");
+        write(tmp.path(), ".github/actions/demo/package.json", "{}");
+        write(
+            tmp.path(),
+            ".github/actions/demo/pnpm-lock.yaml",
+            "lockfileVersion: '9.0'\n",
+        );
+        let action = tmp.path().join(".github/actions/demo");
+        let refused = refusal(&ProjectView::Disk(&action), &[candidate("npm")], true).await;
+        assert!(refused.is_none(), "{refused:?}");
+        // ...while `examples/demo`, which `**` lists, is refused.
+        assert_eq!(
+            code(&demo, "npm").await.as_deref(),
+            Some(PNPM_SETTINGS_ELSEWHERE)
+        );
     }
 
+    /// #880: a member with its own v9 lock is pinned through that lock, but
+    /// pnpm reads `trustLockfile` only from the root `pnpm-workspace.yaml`.
+    /// Until that file trusts the lock (or opts out), the hosted run refuses
+    /// rather than nest a settings file pnpm ignores.
     #[tokio::test]
     async fn pnpm_member_with_own_lock_needs_the_root_to_trust_it() {
         let tmp = tempfile::tempdir().unwrap();

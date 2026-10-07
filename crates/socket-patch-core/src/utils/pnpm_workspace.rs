@@ -21,7 +21,7 @@ use std::path::{Path, PathBuf};
 use serde::Deserialize;
 
 use crate::utils::fs::read_regular_to_string_sync;
-use crate::utils::workspace_globs::{glob_matches, split_negation};
+use crate::utils::workspace_globs::{glob_matches_no_dot, split_negation};
 
 /// pnpm's workspace and settings file.
 pub const PNPM_WORKSPACE: &str = "pnpm-workspace.yaml";
@@ -70,7 +70,9 @@ pub fn governing_workspace_file(project_root: &Path) -> Option<PathBuf> {
 /// - no `packages:` key, a null one or an empty list: the workspace is the
 ///   root alone, so no;
 /// - otherwise when some pattern matches and no `!` pattern does (pnpm's
-///   globber reads every negation as an ignore, wherever it sits).
+///   globber reads every negation as an ignore, wherever it sits). A
+///   wildcard never matches a component starting with `.`, so `**` does
+///   not list `.github/actions/demo` (see [`glob_matches_no_dot`]).
 ///
 /// Errs toward "member", the refusing side, whenever it cannot decide: a
 /// file that does not parse, or a pattern using glob syntax the shared
@@ -95,8 +97,8 @@ fn lists_as_member(yaml: &str, rel: &[String]) -> bool {
         .iter()
         .map(|p| split_negation(p))
         .partition(|(negated, _)| *negated);
-    listed.iter().any(|(_, p)| glob_matches(p, rel))
-        && !negated.iter().any(|(_, p)| glob_matches(p, rel))
+    listed.iter().any(|(_, p)| glob_matches_no_dot(p, rel))
+        && !negated.iter().any(|(_, p)| glob_matches_no_dot(p, rel))
 }
 
 /// `path` without the verbatim prefix `std::fs::canonicalize` adds on
@@ -213,6 +215,23 @@ mod tests {
         // `**` lists every directory below the root.
         write(&root, PNPM_WORKSPACE, "packages:\n  - '**'\n");
         assert_eq!(governed("examples/demo"), file);
+        // ...except dot directories: pnpm 12 gives each its own lock, as it
+        // does under `packages/**` and `packages/*` (probed on 12.10.1). An
+        // explicit dot component lists them.
+        for rel in [
+            ".github/actions/demo",
+            "packages/.x/demo",
+            "packages/.hidden",
+        ] {
+            write(&root, &format!("{rel}/package.json"), "{}");
+        }
+        assert_eq!(governed(".github/actions/demo"), None);
+        write(&root, PNPM_WORKSPACE, "packages:\n  - 'packages/**'\n");
+        assert_eq!(governed("packages/.x/demo"), None);
+        write(&root, PNPM_WORKSPACE, "packages:\n  - packages/*\n");
+        assert_eq!(governed("packages/.hidden"), None);
+        write(&root, PNPM_WORKSPACE, "packages:\n  - '.github/**'\n");
+        assert_eq!(governed(".github/actions/demo"), file);
         // Glob syntax this matcher does not model (braces, classes,
         // extglobs) and a file that does not parse fail closed: governed.
         for ws in [
