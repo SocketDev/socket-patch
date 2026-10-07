@@ -2,7 +2,7 @@
 
 ## Part 2: CLI command layer and user experience
 
-_Last checked against main @ 9c43dfc on 2026-10-07 by audit-core. Owner: audit-core._ Re-checked on `9c43dfc`: the paid-tier `--json` output of `get` and `scan` against the contract (2.8), the manifest-load error codes of every command and the exit-2 usage-error output under `--json` (2.8), the legacy mode spellings and embedded `--vex` (2.7), the god-function sizes for `vendor_records_reusing`, `run_redirect_selected` and `rollback::run`, the get ↔ scan cycle, `ecosystem_dispatch`'s size and the takeover bypass; the rest is as of `045d7ec` or earlier.
+_Last checked against main @ 9c43dfc on 2026-10-07 by audit-core. Owner: audit-core._ Re-checked on `9c43dfc` (10:40Z run): manifest-presence probes per command and `remove`'s per-store identifier matching. Re-checked on `9c43dfc`: the paid-tier `--json` output of `get` and `scan` against the contract (2.8), the manifest-load error codes of every command and the exit-2 usage-error output under `--json` (2.8), the legacy mode spellings and embedded `--vex` (2.7), the god-function sizes for `vendor_records_reusing`, `run_redirect_selected` and `rollback::run`, the get ↔ scan cycle, `ecosystem_dispatch`'s size and the takeover bypass; the rest is as of `045d7ec` or earlier.
 
 > Scope: `crates/socket-patch-cli/src/` — `args.rs`, `lib.rs`/`main.rs`, `ecosystem_dispatch.rs`, `json_envelope.rs`, `ui/*`, `update_notifier.rs`, and every `commands/*` module.
 
@@ -113,7 +113,7 @@ $ socket-patch get nope --offline --json             → {"status":"error","erro
 
 - `repair`, `remove` and `vex` use the envelope, with an `error` object that carries a stable `code`.
 - `scan`, `get` and `rollback` have no fixed `error` type. `rollback` always emits a bare string, but `scan` and `get` each emit a bare string on some paths and a `{code, message}` object on others (scan's embedded-VEX failure, get's vendored failure); `get`'s lock failure adds a sibling `errorCode`. A script must type-check `.error` before reading it. {{C14}}
-- Codes are free strings, so one condition gets a different code per command: an unparseable `.socket/manifest.json` is `manifest_invalid` (list, remove), `manifest_unreadable` (`apply --check`, `vendor --check`, vex), `apply_failed`, `repair_failed`, the undocumented `invalid_manifest` (vendor) or a bare string (rollback) on `9c43dfc`. {{C52}} The typed-registry plan is {{C13}}.
+- Codes are free strings, so one condition gets a different code per command: an unparseable `.socket/manifest.json` is `manifest_invalid` (list, remove), `manifest_unreadable` (`apply --check`, `vendor --check`, vex), `apply_failed`, `repair_failed`, the undocumented `invalid_manifest` (vendor) or a bare string (rollback) on `9c43dfc`. {{C52}} The typed-registry plan is {{C13}}. A manifest that exists but can't be stat'd (ENOTDIR, ELOOP, EACCES) is worse: five commands probe with `metadata().is_err()` ahead of `read_manifest`, so `apply`, `apply --check` and `vendor` report `noManifest` and exit 0, and `repair`/`remove`/`rollback` say `manifest_not_found`. {{C56}}
 - Exit-2 usage errors under `--json` have no single channel. `scan`, `remove` and `rollback` print nothing on stdout, as clap does; `get` prints a bare-string object; `vendor`, `repair` and `vex` print a full envelope with a code. The same `--global --mode vendored` refusal gives three different stdouts on `scan`, `get` and `vendor`. {{C53}}
 - Status is `partialFailure` in the envelope but `partial_failure` in the legacy shapes.
 - The paid-plan refusal is documented but not emitted: the contract lists `status: "paidRequired"` and an `errorCode` `paid_required` for get and scan, but `get` writes the legacy `{"status":"paid_required",…}` from two hand-written blocks, `scan` reports only `paidPatches`, and `Status::PaidRequired` is never constructed. {{C54}}
@@ -173,6 +173,9 @@ That is **7 verbs instead of 9 visible + 2 hidden + 2 aliases + 3 hidden flag sp
 | R11 | Move `ecosystem_dispatch` (950 production lines of pure crawler fan-out on `9c43dfc`; its only CLI dependency is `GlobalArgs`), `vendor_records_reusing` and the disk hosted orchestration into core behind one orchestrator over `ProjectView` | −2K to −4K over time | High; incremental. {{C12}} |
 
 ### New findings since the review
+
+- {{C56}} One manifest-presence rule, five copies: `apply`, `vendor`, `repair`, `remove` and `rollback` each treat any stat error on `.socket/manifest.json` as "no manifest" while core's `read_manifest` treats only NotFound so. `apply` and `vendor` fail open (exit 0, `noManifest`) on a `.socket` that is a file or a looping symlink (run twice on `9c43dfc`).
+- {{C57}} `remove` resolves its identifier once per store instead of deriving the ledger targets from the manifest entries it deletes: `remove <uuid>` with an older vendored generation removes the manifest entry, keeps the vendoring and reports success (#708's RED test, run twice on `9c43dfc`).
 
 - {{C39}} The stale-token fallback is wider than get's search gap: `apply`, `rollback` and `repair` blob/diff downloads and `vendor` eject view fetches never fall back, although `CLI_CONTRACT.md` promises eject the same fallback as `get`. On `045d7ec`, with the auth API answering 401, `apply` reported `sources_download_failed` without trying the proxy; without a token, the same run fetched from the proxy.
 

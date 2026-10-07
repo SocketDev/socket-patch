@@ -2,7 +2,7 @@
 
 ## Part 8: Tests, CI, docs and distribution
 
-_Last checked against main @ 9c43dfc on 2026-10-06 by audit-core. Owner: audit-core._ Only the repository-hygiene passages (stray `launch.json`, "DESIGN §" references), §8.3's `CLI_CONTRACT.md` measurements and guards, the contract's argument and env-var tables, the test-binary and covgap counts, the `#[serial]` count and the duplicated-helper counts have been re-checked; the rest is as of `2463257`.
+_Last checked against main @ 9c43dfc on 2026-10-07 by audit-core. Owner: audit-core._ Re-checked on `9c43dfc` (10:40Z run): the `#[ignore]` reasons across both crates (a RED/gap test has no CI leg). Only the repository-hygiene passages (stray `launch.json`, "DESIGN §" references), §8.3's `CLI_CONTRACT.md` measurements and guards, the contract's argument and env-var tables, the test-binary and covgap counts, the `#[serial]` count and the duplicated-helper counts have been re-checked; the rest is as of `2463257`.
 
 > Scope: `crates/*/tests/**`, `tests/` (docker fixtures), `.github/workflows/*`, `.github/actions/*`, `scripts/`, `docs/`, `CLI_CONTRACT.md`, `CHANGELOG.md`, `npm/`, `crates/socket-patch-node/npm/`, and the Cargo profiles. CI timings come from the GitHub Actions run for `2463257` on `main`.
 
@@ -144,6 +144,8 @@ For `2463257` on `main`:
 | J | **Hygiene:** delete the stray `.vscode`; single targets table; `--version` smoke test on release artifacts; fix `version-sync.sh`; run or generate the zod schema test; move the agent-sweep scripts to `tools/`; path-filter the `node-addon` job | Prevents silent release drift | Low |
 
 ### New findings since the review
+
+- {{C56}} {{C57}} Known bugs are pinned as `#[ignore = "RED: …"]` tests with no issue and no CI leg: #708 added two (`apply_with_unreadable_socket_dir_fails_closed`, `remove_by_uuid_reverts_vendoring_when_ledger_generation_is_older`); both bugs reproduce on `9c43dfc` and are now filed. A third ignored test, `crawler_monorepo_gaps`, documents a contract gap. A RED test should land with its issue number in the ignore reason.
 
 - {{C47}} Test files that spawned the CLI with no `SOCKET_*` scrub: on `045d7ec` an ambient `SOCKET_DRY_RUN=true` or `SOCKET_OFFLINE=true` turned 18 of the 19 `repair_vendor_e2e` tests red. Since #850, 8 of the 10 spawn through the hermetic `common/hermetic.rs` builder, and the `spawn_env_hygiene` ratchet fails on a new bare spawn. `scan_invariants` and `in_process_npm_multicopy` remain.
 - {{C40}} Env vars that core reads directly have no documentation guard: `SOCKET_API_CONCURRENCY` (the operator throttle for the patch API) and `SOCKET_WALK_THREADS` appear in no doc. Only clap-bound vars are checked, through `GLOBAL_ARG_ENV_VARS`/`LOCAL_ARG_ENV_VARS`. It is the env-var slice of 8.5 F.

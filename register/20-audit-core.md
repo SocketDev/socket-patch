@@ -1,5 +1,5 @@
 ### CLI layer, core infrastructure, agent mode, tests and docs (`audit-core`)
-_Last updated 2026-10-07T04:30Z · main @ 9c43dfc_
+_Last updated 2026-10-07T10:40Z · main @ 9c43dfc_
 
 | ID | P | Problem | Source | Issues | Status |
 |---|:-:|---|---|---|---|
@@ -57,7 +57,9 @@ _Last updated 2026-10-07T04:30Z · main @ 9c43dfc_
 | C52 | 3 | One unparseable `.socket/manifest.json`, five `--json` codes: `manifest_invalid` (list, remove; two hand-written splits), `manifest_unreadable` (`apply --check`, `vendor --check`, vex), `apply_failed`, `repair_failed`, undocumented `invalid_manifest` (vendor), bare string (rollback). | new finding | #931 | filed #931 |
 | C53 | 3 | Exit-2 usage errors pick their `--json` channel per site: `scan`, `remove` and `rollback` write nothing on stdout, `get` a bare string, `vendor`, `repair` and `vex` a coded envelope; `--global --mode vendored` gives three stdouts on `scan`/`get`/`vendor`. | new finding | #704 | decision #704; folded in as its second question |
 | C54 | 3 | The contract documents `status: paidRequired` and errorCode `paid_required` for get and scan, but `get` emits legacy `status: "paid_required"` (two hand-written blocks) and `scan` reports only `paidPatches`; `Status::PaidRequired` is never constructed. | new finding | #982 | filed #982 |
-| C55 | 3 | Decide: the future of agent mode (~6.4K CLI + ~3.5K core): freeze it to the ecosystems that need it, or keep it and ask the package manager for layouts. | §5; §6 Q2 | | to verify |
+| C55 | 3 | Decide: the future of agent mode (CLI apply 2,963 + fetch_stage + repair; ~3.2K agent-only core; ~29 open agent-mode bugs). Only Deno and `--global` installs need it. | §5; §6 Q2 | #1000 | decision #1000 |
+| C56 | 2 | `apply`, `apply --check` and `vendor` treat any stat error on `.socket/manifest.json` as "no manifest" (`noManifest`, exit 0); `repair`/`remove`/`rollback` say `manifest_not_found`. Five `metadata().is_err()` probes bypass `read_manifest`'s NotFound rule. | new finding | #998 | filed #998 |
+| C57 | 2 | `remove <uuid>` re-matches the vendor ledger by the raw identifier, so an older ledger generation is never reverted: manifest entry removed, vendoring kept, `status: success`. | new finding | #999 | filed #999 |
 
 **Handed off** (to the CI janitor): report-only coverage and LTO `docker-base` off PRs; e2e from 148 to ~50 legs; a reusable compat workflow; no per-leg compiles; dead CI path filters (review 8.2, 8.5 B/C/E).
 

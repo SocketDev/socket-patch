@@ -2,7 +2,7 @@
 
 ## Part 7: Core infrastructure and agent (in-place) mode
 
-_Last checked against main @ 9c43dfc on 2026-10-07 by audit-core. Owner: audit-core._ Re-checked on `9c43dfc`: the self-update footprint and its overlap with `install.sh` (7.5), the credentials block of `client.rs`, agent-mode jar member verification, the apply/rollback store-copy fold and the artifact-retention (GC) policies. Re-checked on `0d302dc`: the `api/*` size row, the `client.rs` breakdown, the retry table, the registry-client timeout, process spawning and hash case. The timeout, blob/diff body, zip-read, process-spawning, API-pacing, URL-builder, retry, batching, hashing, UUID, env/home-dir, atomic-write, purl, dead-code, telemetry, apply/rollback-engine, diff-download, `apply.lock`, Maven-sidecar, group-commit-reader, socket.yml and spawn-deadline passages were re-checked on `045d7ec`; the rest is as of `2463257`.
+_Last checked against main @ 9c43dfc on 2026-10-07 by audit-core. Owner: audit-core._ Re-checked on `9c43dfc` (10:40Z run): the 7.4 agent-mode footprint, the sidecar list (Maven rewriter from #646) and which ecosystems need agent mode. Re-checked on `9c43dfc`: the self-update footprint and its overlap with `install.sh` (7.5), the credentials block of `client.rs`, agent-mode jar member verification, the apply/rollback store-copy fold and the artifact-retention (GC) policies. Re-checked on `0d302dc`: the `api/*` size row, the `client.rs` breakdown, the retry table, the registry-client timeout, process spawning and hash case. The timeout, blob/diff body, zip-read, process-spawning, API-pacing, URL-builder, retry, batching, hashing, UUID, env/home-dir, atomic-write, purl, dead-code, telemetry, apply/rollback-engine, diff-download, `apply.lock`, Maven-sidecar, group-commit-reader, socket.yml and spawn-deadline passages were re-checked on `045d7ec`; the rest is as of `2463257`.
 
 > Scope: `api/*`, `manifest/*`, `ledgers.rs`, `constants.rs`, `patch/` (excluding `redirect/`), `policy/*`, `rollout*`, `update/*`, the CLI `update_notifier.rs`/`update.rs`, `telemetry.rs`, and the generic `utils/*` and `hash/*`.
 
@@ -79,12 +79,12 @@ The vendor policy also has three separate hand-written retry loops, plus a first
 ### 7.4 Agent mode
 
 **Footprint:**
-- core: apply 1,132, rollback 617, sidecars 708, diff 100, package 333, blob_fetcher 603, manifest 507;
-- CLI: apply 2,237, fetch_stage 440, repair 784;
+- core (re-measured on `9c43dfc`): apply 1,230, rollback 751, sidecars 1,107, store_copies 332, shared_store 332, diff 99, package 332, blob_fetcher 603, manifest 578. `patch/apply.rs`, `package.rs` and `manifest/` are shared with vendored staging; the agent-only part is about 3.2K;
+- CLI (on `9c43dfc`): apply 2,963 (2,237 at the review), fetch_stage 437, repair 785;
 - the multi-mode rollback (2,660) and remove (1,571) carry agent legs;
 - over 13K dedicated test lines.
 
-Counting the agent arms in `scan`, `get` and `rollback`, agent mode is **about 6.4K CLI production lines** plus ~3.5K in core.
+Counting the agent arms in `scan`, `get` and `rollback`, agent mode is **about 6.4K CLI production lines** plus ~3.5K in core (review numbers; the CLI `apply.rs` has grown ~700 lines since). Only Deno (its only mode) and `--global` installs (hosted and vendored act on project lockfiles) need it; Go's agent mode writes a `.socket/go-patches/` replace, which vendored covers. About 29 of the open `bug` issues are agent-mode-specific, roughly twice the review's ~15. {{C55}}
 
 **The safety model is sound and worth keeping:**
 - every manifest path is escape-checked;
@@ -106,12 +106,13 @@ So diff only saves bytes when a user commits `.socket/diffs` but not `.socket/bl
 - **Recommendation:** make `file` the default (keep `diff` as an alias for one major), then delete `patch/diff.rs`, the diff branches in `blob_fetcher`/`fetch_stage`/`repair`, and `qbsdiff`.
 - **Saving:** about 600 production and 1,000 test lines, plus one dependency. Re-verified on `045d7ec` (top-up at `fetch_stage.rs:377-398`; diff-only code includes `patch/diff.rs` (99 production lines) and `patch/package.rs` (332)). The default change is a contract MAJOR, so it is filed as a decision. {{C25}}
 
-**Sidecars** (`patch/sidecars/`, 708 production / 1,312 test lines) are post-apply fixes for package-manager checksum files:
+**Sidecars** (`patch/sidecars/`, 1,107 production lines on `9c43dfc`; 708 at the review) are post-apply fixes for package-manager checksum files:
 - cargo: rewrite `.cargo-checksum.json`;
+- Maven: rewrite a `~/.m2` `.sha1`/`.md5` that described the pre-patch bytes, and put it back on rollback; Gradle `files-2.1` copies get advisories (#646);
 - NuGet: delete `.nupkg.metadata`;
 - PyPI, gem and Go: advisory text only.
 
-Agent mode writes no Maven sidecar, and needs none: Maven 3.9.11 doesn't verify the local repository's `.sha1` files, so a jar patched in place under a stale `.jar.sha1` still builds and runs (checked on `045d7ec`; the review's concern is rejected). The real Gradle gap is that the crawler patches `~/.m2`, which a Gradle-only build never reads (#551). {{C27}} This code exists only for in-place mode.
+Maven 3.9.11 doesn't verify the local repository's `.sha1` files by default, so the review's stale-checksum concern was rejected on `045d7ec`; since #646 the Maven sidecar rewrites them anyway (for `mvn -C` and mirror tooling), and agent mode patches each Gradle `files-2.1` copy the build reads, which fixed #551. {{C27}} This code exists only for in-place mode.
 
 **`apply.lock`** is 553 production lines (re-checked on `045d7ec`). Most of that complexity comes from *deleting* the lock file on exit: unlinking while it is held, identity checks, Windows delete-pending handling. Lock acquisition also replays the vendored group-commit journal, which couples vendored crash recovery into every command's lock. Leaving a gitignored lock file on disk (the convention every package manager uses), or locking a file outside the project, would cut about 200 lines; the v5.0 contract promises the transient file, so this is a decision. Moving the journal replay and the durability barrier out of the lock primitive changes no behavior. {{C26}}
 
