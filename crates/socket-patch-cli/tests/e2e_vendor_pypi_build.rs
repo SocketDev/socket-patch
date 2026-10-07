@@ -1649,3 +1649,104 @@ fn pip_vendored_requirements_evaluate_environment_markers() {
         );
     }
 }
+
+/// #928: `uv pip compile --universal` splits a package across marker
+/// branches when it resolves differently per Python. Vendoring the patched
+/// 1.16.0 must rewrite only that branch (marker and hash kept) and leave
+/// the other version's branch alone, so a fresh `--no-index` checkout
+/// installs the patched wheel on the matching Python, and revert is
+/// byte-identical. Before the fix the other branch made vendored refuse
+/// with a false `pypi_requirement_not_pinned`.
+#[test]
+#[serial_test::serial]
+fn pip_vendored_requirements_marker_split_rewrites_matching_branch() {
+    let python = find_python().expect("Python is required for the pip marker-split regression");
+    let tmp = tempfile::tempdir().unwrap();
+    let project = tmp.path().join("proj");
+    std::fs::create_dir_all(&project).unwrap();
+    assert_tool_ok(
+        &tool(Path::new(python), &project, &["-m", "venv", ".venv"], &[]),
+        "create source venv",
+    );
+    let venv = project.join(".venv");
+    assert_tool_ok(
+        &tool(
+            &venv.join("bin/pip"),
+            &project,
+            &["install", "--disable-pip-version-check", "six==1.16.0"],
+            &[],
+        ),
+        "install upstream six",
+    );
+    let patched = stage_patch(&project, &site_packages(&venv).join("six.py"));
+    // The `uv pip compile --universal --generate-hashes` shape; the 1.17.0
+    // branch can never match the running interpreter.
+    let original = "six==1.16.0 ; python_full_version >= '3' \\\n    \
+         --hash=sha256:8abb2f1d86890a2dfb989f9a77cfcfd3e47c2a354b01111771326f8aa26e0254\n\
+         six==1.17.0 ; python_full_version < '3' \\\n    \
+         --hash=sha256:4721f391ed90541fddacab5acf947aa0d3dc7d27b2e1e8eda2be8970586c3274\n";
+    std::fs::write(project.join("requirements.txt"), original).unwrap();
+
+    let (code, stdout, stderr) = run_vendored(&VendorDriver::VendorOffline, &project);
+    assert_eq!(code, 0, "vendor failed: {stdout}\n{stderr}");
+    assert_vendored_applied(&parse_envelope(&stdout));
+    let requirements = std::fs::read_to_string(project.join("requirements.txt")).unwrap();
+    assert!(
+        requirements.ends_with(
+            "six==1.17.0 ; python_full_version < '3' \\\n    \
+             --hash=sha256:4721f391ed90541fddacab5acf947aa0d3dc7d27b2e1e8eda2be8970586c3274\n"
+        ),
+        "the other branch must stay untouched:\n{requirements}"
+    );
+    let vendor_line = requirements.lines().next().unwrap();
+    assert!(
+        vendor_line.starts_with("./.socket/vendor/pypi/")
+            && vendor_line.contains("; python_full_version >= '3' --hash=sha256:"),
+        "the 1.16.0 branch becomes a hashed, marker-carrying vendor line: {vendor_line}"
+    );
+
+    let fresh = project.join("fresh");
+    std::fs::create_dir_all(&fresh).unwrap();
+    std::fs::copy(
+        project.join("requirements.txt"),
+        fresh.join("requirements.txt"),
+    )
+    .unwrap();
+    copy_dir_recursive(&project.join(".socket"), &fresh.join(".socket"));
+    assert_tool_ok(
+        &tool(Path::new(python), &fresh, &["-m", "venv", ".venv"], &[]),
+        "create fresh venv",
+    );
+    let fresh_venv = fresh.join(".venv");
+    assert_tool_ok(
+        &tool(
+            &fresh_venv.join("bin/pip"),
+            &fresh,
+            &[
+                "install",
+                "--disable-pip-version-check",
+                "--no-index",
+                "--require-hashes",
+                "-r",
+                "requirements.txt",
+            ],
+            &[],
+        ),
+        "install vendored marker-split requirements",
+    );
+    assert_eq!(python_oracle(&fresh_venv, &fresh), "1");
+    manifestless_vex(
+        &fresh,
+        "pip vendored marker split",
+        &patched,
+        original.as_bytes(),
+    );
+
+    let (code, stdout, stderr) =
+        run_socket(&project, &["vendor", "--revert", "--offline", "--json"]);
+    assert_eq!(code, 0, "revert failed: {stdout}\n{stderr}");
+    assert_eq!(
+        std::fs::read_to_string(project.join("requirements.txt")).unwrap(),
+        original
+    );
+}
