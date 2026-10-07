@@ -82,9 +82,12 @@ impl HostedPin {
             .collect()
     }
 
-    /// Every hosted pin a discovery holds.
+    /// Every hosted pin a discovery holds: its refs, plus the refs it
+    /// withholds from attestation only because an unreachable unpatched
+    /// copy installs beside them ([`Discovery::shadowed`], #828) — that
+    /// wiring is still one package version's pin, so it is restorable.
     pub fn all(discovery: &Discovery) -> Vec<HostedPin> {
-        Self::from_refs(&discovery.refs)
+        Self::from_refs(discovery.refs.iter().chain(&discovery.shadowed))
     }
 
     /// `(name, version)` of the purl, percent-decoded.
@@ -154,7 +157,7 @@ impl HostedInventory {
         // is excused in a file that also names the pin's own patch uuid.
         let pin_tokens: BTreeMap<String, BTreeSet<&str>> = {
             let mut tokens: BTreeMap<String, BTreeSet<&str>> = BTreeMap::new();
-            for r in &discovery.refs {
+            for r in discovery.refs.iter().chain(&discovery.shadowed) {
                 if r.mode != WiringMode::Hosted {
                     continue;
                 }
@@ -351,9 +354,7 @@ pub struct RestoreOutcome {
 
 impl RestoreOutcome {
     pub fn restored(&self) -> impl Iterator<Item = &PinResult> {
-        self.pins
-            .iter()
-            .filter(|p| p.status == PinStatus::Restored)
+        self.pins.iter().filter(|p| p.status == PinStatus::Restored)
     }
 
     pub fn refused(&self) -> impl Iterator<Item = (&PinResult, &str)> {
@@ -688,9 +689,7 @@ async fn restore_pass(view: &mut View<'_>, active: &[&HostedPin], ctx: &Ctx<'_>)
             Format::YarnLock => npm::restore_yarn_locks(view, &pins, &files, ctx).await,
             Format::PnpmLock => npm::restore_pnpm_locks(view, &pins, &files, ctx).await,
             Format::BunLock => npm::restore_bun_locks(view, &pins, &files, ctx).await,
-            Format::BunLockb if ctx.bun_lockb => {
-                bun_lockb::restore(view, &pins, &files, ctx).await
-            }
+            Format::BunLockb if ctx.bun_lockb => bun_lockb::restore(view, &pins, &files, ctx).await,
             Format::Cargo => cargo::restore(view, &pins, &files, ctx).await,
             Format::Golang => golang::restore(view, &pins, &files, ctx).await,
             Format::Gem => gem::restore(view, &pins, &files, ctx).await,

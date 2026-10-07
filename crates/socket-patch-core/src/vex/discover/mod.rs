@@ -474,6 +474,15 @@ pub struct Discovery {
     pub unattested: Vec<Unattested>,
     /// Refs dropped because another lock contests them ([`ContestedRef`]).
     pub contested: Vec<ContestedRef>,
+    /// Refs withheld from `refs` only because the build ALSO installs an
+    /// unpatched copy of the same `name@version` that no rewire can reach
+    /// (a bundled copy unpacked from its parent's tarball, a yarn classic
+    /// git or `file:` directory block), each diagnosed
+    /// [`DIAG_REF_UNATTRIBUTABLE`]. Never attested, but the wiring itself
+    /// is the rewriters' own output and names exactly one package version,
+    /// so the management commands (rollback, remove, list, the vendored
+    /// takeover) still see and unwind it (#828). Validated like `refs`.
+    pub shadowed: Vec<PatchedRef>,
 }
 
 impl Discovery {
@@ -486,7 +495,28 @@ impl Discovery {
     /// * the purl is `pkg:<known type>/<name>@<version>` (then canonicalized);
     /// * a vendored ref names a root-anchored artifact under its OWN uuid dir
     ///   and its purl's ecosystem dir.
-    pub fn push(&mut self, mut r: PatchedRef) {
+    pub fn push(&mut self, r: PatchedRef) {
+        if let Some(r) = self.validated(r) {
+            if !self.refs.contains(&r) {
+                self.refs.push(r);
+            }
+        }
+    }
+
+    /// Withhold the wired `r` from attestation because an unpatched copy of
+    /// its `name@version` installs beside it ([`Discovery::shadowed`]). The
+    /// caller diagnoses why. Validated exactly like [`Discovery::push`].
+    pub(crate) fn shadow(&mut self, r: PatchedRef) {
+        if let Some(r) = self.validated(r) {
+            if !self.shadowed.contains(&r) {
+                self.shadowed.push(r);
+            }
+        }
+    }
+
+    /// [`Discovery::push`]'s gate: the canonicalized ref, or `None` after
+    /// diagnosing why it is invalid.
+    fn validated(&mut self, mut r: PatchedRef) -> Option<PatchedRef> {
         let file = r.source_file.to_string_lossy().into_owned();
         if !is_canonical_uuid(&r.uuid) {
             self.diag(
@@ -497,7 +527,7 @@ impl Discovery {
                     r.purl, r.uuid
                 ),
             );
-            return;
+            return None;
         }
         // Every identity an extractor builds a ref from is recognized — the
         // valid ref and the one rejected below alike (rule 11). This is also
@@ -511,7 +541,7 @@ impl Discovery {
                 &file,
                 format!("{file}: {:?} is not a usable package purl", r.purl),
             );
-            return;
+            return None;
         };
         r.purl = purl;
         match r.mode {
@@ -535,7 +565,7 @@ impl Discovery {
                             r.purl, r.artifact_rel, r.uuid
                         ),
                     );
-                    return;
+                    return None;
                 }
                 r.integrity_required = false;
                 r.url = None;
@@ -545,9 +575,7 @@ impl Discovery {
         if matches!(r.locked_integrity, Some(LockIntegrity::None)) {
             r.locked_integrity = None;
         }
-        if !self.refs.contains(&r) {
-            self.refs.push(r);
-        }
+        Some(r)
     }
 
     /// Record a diagnostic for root-relative `file`. `detail` is shown to
@@ -777,15 +805,17 @@ impl Discovery {
         self.unattested.dedup();
         self.contested.sort();
         self.contested.dedup();
-        self.refs.sort_by(|a, b| {
-            (&a.source_file, &a.purl, &a.uuid, a.mode).cmp(&(
-                &b.source_file,
-                &b.purl,
-                &b.uuid,
-                b.mode,
-            ))
-        });
-        self.refs.dedup();
+        for refs in [&mut self.refs, &mut self.shadowed] {
+            refs.sort_by(|a, b| {
+                (&a.source_file, &a.purl, &a.uuid, a.mode).cmp(&(
+                    &b.source_file,
+                    &b.purl,
+                    &b.uuid,
+                    b.mode,
+                ))
+            });
+            refs.dedup();
+        }
         self.diagnostics
             .sort_by(|a, b| (&a.file, a.code, &a.detail).cmp(&(&b.file, b.code, &b.detail)));
         self.recognized.sort();

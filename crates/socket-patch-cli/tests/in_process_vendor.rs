@@ -4020,6 +4020,125 @@ snapshots:
         );
     }
 
+    /// [`write_package_lock_project`] plus a parent package `bund` that
+    /// BUNDLES the same `name@version` (`inBundle: true`): the hosted run
+    /// rewires only the hoisted entry (`redirect_npm_bundled_instance_skipped`).
+    fn write_package_lock_project_with_bundled_copy(root: &Path) {
+        write_package_lock_project(root);
+        let path = root.join("package-lock.json");
+        let mut lock: Value = serde_json::from_slice(&std::fs::read(&path).unwrap()).unwrap();
+        let packages = lock["packages"].as_object_mut().unwrap();
+        packages.insert(
+            "node_modules/bund".to_string(),
+            json!({ "version": "1.0.0", "resolved": "file:bund-1.0.0.tgz", "dependencies": { CONV_NAME: CONV_VERSION }, "bundleDependencies": [CONV_NAME] }),
+        );
+        packages.insert(
+            format!("node_modules/bund/node_modules/{CONV_NAME}"),
+            json!({
+                "version": CONV_VERSION,
+                "resolved": format!("https://registry.npmjs.org/{CONV_NAME}/-/{CONV_NAME}-{CONV_VERSION}.tgz"),
+                "integrity": UPSTREAM_SHA512,
+                "inBundle": true
+            }),
+        );
+        let mut bytes = serde_json::to_vec_pretty(&lock).unwrap();
+        bytes.push(b'\n');
+        std::fs::write(&path, bytes).unwrap();
+    }
+
+    /// REGRESSION (#828): a hosted pin beside a BUNDLED copy of the same
+    /// `name@version` is withheld from VEX (the bundled copy stays
+    /// unpatched), but it is still the hosted run's own wiring of one
+    /// package version. `rollback` must restore it (it refused it as
+    /// `patched_ref_unattributable`, remedy "re-run scan --mode hosted", a
+    /// loop) and delete the `.npmrc` the hosted run created.
+    #[tokio::test]
+    #[serial]
+    async fn hosted_pin_beside_a_bundled_copy_rolls_back_to_upstream() {
+        let server = MockServer::start().await;
+        mock_hosted_api(&server).await;
+        let registry = mock_registry(&server).await;
+        let tmp = tempfile::tempdir().unwrap();
+        let root = tmp.path();
+        write_package_lock_project_with_bundled_copy(root);
+        let pristine_lock = std::fs::read_to_string(root.join("package-lock.json")).unwrap();
+
+        assert_eq!(scan_run(hosted_args(root, server.uri())).await, 0);
+        assert!(std::fs::read_to_string(root.join("package-lock.json"))
+            .unwrap()
+            .contains(HOSTED_URL));
+        assert!(root.join(".npmrc").exists());
+
+        let env_pairs = online_env(&registry, PATCH_ORIGIN);
+        let env_pairs: Vec<(&str, &str)> =
+            env_pairs.iter().map(|(k, v)| (*k, v.as_str())).collect();
+        let (code, stdout, stderr) = run_cli(
+            root,
+            &[
+                "rollback",
+                "--json",
+                "--yes",
+                "--cwd",
+                root.to_str().unwrap(),
+            ],
+            &env_pairs,
+        );
+        assert_eq!(code, 0, "rollback: {stdout}\n{stderr}");
+        let lock = std::fs::read_to_string(root.join("package-lock.json")).unwrap();
+        let lock: Value = serde_json::from_str(&lock).unwrap();
+        let pristine: Value = serde_json::from_str(&pristine_lock).unwrap();
+        assert_eq!(lock, pristine, "rollback restores the upstream lock");
+        assert!(
+            !root.join(".npmrc").exists(),
+            "the hosted run's allow-remote .npmrc goes with the last hosted pin"
+        );
+    }
+
+    /// REGRESSION (#828): the hosted → vendored takeover over a hosted pin
+    /// beside a bundled copy restores the upstream entry first, exactly as
+    /// without the bundled copy: `vendor_takeover_reverted_redirect`, the
+    /// `.npmrc` deleted, the vendor ledger's original the REGISTRY entry
+    /// (it recorded the grant-tokenized hosted URL), and `vendor --revert`
+    /// lands on upstream, never back on hosted.
+    #[tokio::test]
+    #[serial]
+    async fn hosted_pin_beside_a_bundled_copy_is_restored_by_the_vendor_takeover() {
+        let server = MockServer::start().await;
+        mock_hosted_api(&server).await;
+        let registry = mock_registry(&server).await;
+        let tmp = tempfile::tempdir().unwrap();
+        let root = tmp.path();
+        write_package_lock_project_with_bundled_copy(root);
+
+        assert_eq!(scan_run(hosted_args(root, server.uri())).await, 0);
+        assert!(std::fs::read_to_string(root.join("package-lock.json"))
+            .unwrap()
+            .contains(HOSTED_URL));
+
+        seed_manifest_and_blob(root);
+        let (code, env) = vendor_online_cli(root, &registry, PATCH_ORIGIN, &[]);
+        assert_eq!(code, 0, "vendor over the hosted lock must succeed: {env:#}");
+        find_event(&env, "skipped", Some("vendor_takeover_reverted_redirect"));
+        assert!(
+            !root.join(".npmrc").exists(),
+            "the takeover must remove the .npmrc the hosted run created: {env:#}"
+        );
+        let state = std::fs::read_to_string(root.join(".socket/vendor/state.json")).unwrap();
+        assert!(
+            !state.contains("patch.socket.dev"),
+            "the ledger original is the registry entry, not the hosted pin: {state}"
+        );
+
+        let (code, env) = vendor_online_cli(root, &registry, PATCH_ORIGIN, &["--revert"]);
+        assert_eq!(code, 0, "vendor --revert: {env:#}");
+        let lock = std::fs::read_to_string(root.join("package-lock.json")).unwrap();
+        assert!(
+            !lock.contains(HOSTED_URL) && !lock.contains(".socket/vendor/"),
+            "vendor --revert lands on upstream: {lock}"
+        );
+        assert!(!root.join(".npmrc").exists());
+    }
+
     /// Hosted → vendored in a git project that ignores `.socket/` (#831):
     /// hosted mode writes nothing there, so the rule is common. The
     /// gitignore refusal comes BEFORE the takeover restores the upstream

@@ -163,6 +163,9 @@ fn push_uncontested(locks: Vec<NpmLockRefs>, out: &mut Discovery) {
                         lock.file, r.purl, r.uuid,
                     ),
                 );
+                // Still the hosted rewriter's own output for exactly this
+                // version, so rollback / remove / the takeover unwind it.
+                out.shadow(r.clone());
                 continue;
             }
             if let Some(location) = lock.unwired.get(&r.purl) {
@@ -1654,6 +1657,18 @@ mod tests {
             );
             let out = run(&p).await;
             assert!(out.refs.is_empty(), "{label}: {:#?}", out.refs);
+            // Withheld from attestation, but still the wiring of exactly
+            // this version, so rollback / remove / the takeover see it (#828).
+            let shadowed: Vec<_> = out
+                .shadowed
+                .iter()
+                .map(|r| (r.purl.as_str(), r.uuid.as_str(), r.mode))
+                .collect();
+            assert_eq!(
+                shadowed,
+                vec![("pkg:npm/left-pad@1.3.0", uuid, mode)],
+                "{label}"
+            );
             let contested = bundled_contests(&out);
             assert_eq!(contested.len(), 1, "{label}: {:#?}", out.diagnostics);
             assert!(

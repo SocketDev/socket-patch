@@ -157,15 +157,18 @@ fn extract_classic(ctx: &DiscoverCtx<'_>, entries: Vec<YarnEntry>, out: &mut Dis
             .then(|| unpatched_copies.iter().find(|(purl, ..)| *purl == r.purl))
             .flatten();
         match copy {
-            Some((_, key, how)) => out.diag(
-                DIAG_REF_UNATTRIBUTABLE,
-                YARN_LOCK,
-                format!(
-                    "{YARN_LOCK}: {} is wired to a Socket patch but lock entry `{key}` \
-                     {how}; that copy stays UNPATCHED and nothing is attested",
-                    r.purl
-                ),
-            ),
+            Some((_, key, how)) => {
+                out.diag(
+                    DIAG_REF_UNATTRIBUTABLE,
+                    YARN_LOCK,
+                    format!(
+                        "{YARN_LOCK}: {} is wired to a Socket patch but lock entry `{key}` \
+                         {how}; that copy stays UNPATCHED and nothing is attested",
+                        r.purl
+                    ),
+                );
+                out.shadow(r);
+            }
             None => out.refs.push(r),
         }
     }
@@ -1044,6 +1047,18 @@ mod tests {
             p.write("yarn.lock", classic(&blocks));
             let out = run(&p).await;
             assert!(out.refs.is_empty(), "{case}: {:#?}", out.refs);
+            // The registry wiring beside the git copy is withheld, not lost:
+            // rollback / remove / the takeover still unwind it (#828).
+            let shadowed = out
+                .shadowed
+                .iter()
+                .any(|r| r.purl == "pkg:npm/left-pad@1.3.0");
+            assert_eq!(
+                shadowed,
+                case.starts_with("registry"),
+                "{case}: {:#?}",
+                out.shadowed
+            );
             assert!(
                 out.diagnostics
                     .iter()
