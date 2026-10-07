@@ -1988,7 +1988,11 @@ pub fn undecodable_guard(undecodable: &[String], candidates: &[Candidate]) -> Op
     undecodable
         .iter()
         .find(|rel| {
-            file_ecosystem(rel).is_some_and(|eco| candidates.iter().any(|c| c.dep.ecosystem == eco))
+            // The root manifest is read strictly only as a yarn berry
+            // rewrite target (its `resolutions`); advisory reads never
+            // record it, so here it is always an npm rewrite target.
+            let eco = file_ecosystem(rel).or((rel.as_str() == "package.json").then_some("npm"));
+            eco.is_some_and(|eco| candidates.iter().any(|c| c.dep.ecosystem == eco))
         })
         .map(|rel| undecodable_refusal(rel))
 }
@@ -2278,6 +2282,56 @@ mod tests {
             .await;
             assert!(guard(&view, &done, &cargo).is_none());
         }
+    }
+
+    /// #721 review: beside a yarn berry lock the root `package.json` is a
+    /// rewrite target (its `resolutions`), so a non-UTF-8 one refuses the
+    /// run instead of being taken for absent. Beside an npm lock it is
+    /// advisory only and never refuses.
+    #[tokio::test]
+    async fn a_non_utf8_berry_manifest_refuses_the_npm_run() {
+        use crate::patch::redirect::Integrity;
+        let candidates = vec![Candidate {
+            purl: "pkg:npm/left-pad@1.3.0".into(),
+            dep: DepOverride {
+                ecosystem: "npm".into(),
+                name: "left-pad".into(),
+                namespace: None,
+                version: "1.3.0".into(),
+                token: "tok".into(),
+                patch_uuid: "uuid".into(),
+                artifact_url:
+                    "https://patch.socket.dev/patch/npm/left-pad/1.3.0/tok/uuid/left-pad-1.3.0.tgz"
+                        .into(),
+                registry_override: None,
+                integrity: Integrity::default(),
+            },
+        }];
+        let berry = "__metadata:\n  version: 8\n  cacheKey: 10c0\n\n\"left-pad@npm:^1.3.0\":\n  \
+                     version: 1.3.0\n  resolution: \"left-pad@npm:1.3.0\"\n";
+        let latin1: &[u8] = b"{\"name\": \"Andr\xe9\"}\n";
+        let tmp = tempfile::tempdir().unwrap();
+        std::fs::write(tmp.path().join("yarn.lock"), berry).unwrap();
+        std::fs::write(tmp.path().join("package.json"), latin1).unwrap();
+        let view = ProjectView::Disk(tmp.path());
+        let read = read_candidate_files(&view, &BTreeSet::new(), &candidates).await;
+        assert_eq!(read.undecodable_reads, vec!["package.json"]);
+        let refusal = undecodable_guard(&read.undecodable_reads, &candidates).expect("refused");
+        assert_eq!(refusal.code, UNREADABLE_REFUSAL);
+
+        // Beside an npm lock the manifest is advisory: never refused.
+        std::fs::remove_file(tmp.path().join("yarn.lock")).unwrap();
+        std::fs::write(
+            tmp.path().join("package-lock.json"),
+            "{\"lockfileVersion\": 3, \"packages\": {}}\n",
+        )
+        .unwrap();
+        let read = read_candidate_files(&view, &BTreeSet::new(), &candidates).await;
+        assert!(
+            read.undecodable_reads.is_empty(),
+            "{:?}",
+            read.undecodable_reads
+        );
     }
 
     /// A hosted URL left in a berry project's `package.json` `resolutions`
