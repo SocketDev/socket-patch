@@ -193,10 +193,13 @@ impl ManifestFacts {
 static FACTS_MEMO: ParseMemo<ManifestFacts, 512> = ParseMemo::new();
 
 fn read_manifest(path: &Path) -> Option<Arc<ManifestFacts>> {
+    // A symlinked manifest is not followed; the read itself is the
+    // non-blocking regular-file one, so a FIFO swapped in after the
+    // `lstat` fails fast instead of wedging in open(2).
     if !std::fs::symlink_metadata(path).is_ok_and(|m| m.is_file()) {
         return None;
     }
-    let text = std::fs::read_to_string(path).ok()?;
+    let text = crate::utils::fs::read_regular_to_string_sync(path).ok()?;
     FACTS_MEMO
         .parse(text.as_bytes(), || {
             text.parse::<DocumentMut>()

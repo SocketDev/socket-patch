@@ -1522,10 +1522,16 @@ async fn filter_to_installed_purls(
     // mark the installed version — but the pnpm-lock.yaml the hosted
     // rewriter will edit is right there. Read its raw text once and gate the
     // keep-branch below on version membership, so a large advisory fan-out
-    // doesn't request grants for every version ever patched (raw
-    // `read_to_string` matches the hosted flow's own candidate-file reads).
+    // doesn't request grants for every version ever patched. Read FIFO-safe,
+    // like the hosted flow's own candidate-file reads: a FIFO planted at
+    // `pnpm-lock.yaml` must not wedge `get` in open(2).
     let pnpm_pnp_lock_text: Option<String> = (pnp_pnpm && mode == super::scan::ScanMode::Hosted)
-        .then(|| std::fs::read_to_string(common.cwd.join("pnpm-lock.yaml")).ok())
+        .then(|| {
+            socket_patch_core::utils::fs::read_regular_to_string_sync(
+                &common.cwd.join("pnpm-lock.yaml"),
+            )
+            .ok()
+        })
         .flatten();
     let pnpm_pnp_lock = pnpm_pnp_lock_text.as_deref().map(PnpmLock::parse);
 
