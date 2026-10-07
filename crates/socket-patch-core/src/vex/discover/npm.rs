@@ -45,13 +45,14 @@ use std::collections::{BTreeMap, BTreeSet};
 use serde_json::Value;
 
 use super::{
-    npm_purl, npm_vendored_tarball_names, parse_json, vendor_ref, DiscoverCtx, Discovery,
-    LocateOpts, Located, PatchedRef, VendorRef, DIAG_LOCKFILE_UNPARSEABLE, DIAG_REF_INVALID,
-    DIAG_REF_UNATTRIBUTABLE,
+    canonical_base_purl, npm_purl, npm_vendored_tarball_names, parse_json, vendor_ref, DiscoverCtx,
+    Discovery, LocateOpts, Located, PatchedRef, VendorRef, DIAG_LOCKFILE_UNPARSEABLE,
+    DIAG_REF_INVALID, DIAG_REF_UNATTRIBUTABLE,
 };
 use crate::constants::npm_family::{NPM_LOCKS, PNPM_LOCK, PNPM_SHRINKWRAP_LEGACY};
 use crate::formats::pnpm::{
-    classify_pnpm_key, entry_field, pnpm_registry_key, PnpmKey, PnpmLock, PnpmPackage,
+    classify_pnpm_key, entry_bundled, entry_field, pnpm_registry_key, Bundled, PnpmKey, PnpmLock,
+    PnpmPackage,
 };
 use crate::utils::digest::is_sri_pin;
 use crate::vendor::lock_inventory::pnpm::rush_lock_rels;
@@ -573,10 +574,72 @@ async fn extract_pnpm_lock(ctx: &DiscoverCtx<'_>, file: &str, out: &mut Discover
         return;
     }
     let mut copies: Vec<PnpmFileCopy> = Vec::new();
+    let mut bundles: Vec<(&str, Bundled<'_>)> = Vec::new();
     for package in lock.packages() {
         pnpm_entry_ref(ctx, file, package, &mut copies, out);
+        bundles.extend(entry_bundled(&package.entry).map(|b| (package.key, b)));
     }
     record_pnpm_file_copies(ctx, file, copies, out).await;
+    record_pnpm_bundled_copies(file, &bundles, out);
+}
+
+/// Record the bundled copies a pnpm lock installs as unpatched copies of
+/// every ref of the same lock they may hold. pnpm unpacks a package's
+/// `bundledDependencies` from its own tarball into its store directory
+/// (`node_modules/.pnpm/<parent>/node_modules/<parent>/node_modules/<name>`)
+/// and never resolves them, so no Socket wiring of the lock reaches that
+/// copy — the npm, bun and vlt extractors already contest the same case
+/// from their locks' bundled entries. The lock names the bundled package
+/// but not its version (that lives in the parent's tarball), so a ref of
+/// the same NAME is contested whatever its version: a missed attestation
+/// when the bundled copy is another version, never a false one.
+/// `bundledDependencies: true` bundles every dependency of the parent,
+/// which the lock does not list, so it contests every ref of the lock.
+fn record_pnpm_bundled_copies(file: &str, bundles: &[(&str, Bundled<'_>)], out: &mut Discovery) {
+    if bundles.is_empty() {
+        return;
+    }
+    let lock_refs: Vec<String> = out
+        .refs
+        .iter()
+        .filter(|r| r.source_file == std::path::Path::new(file))
+        .map(|r| r.purl.clone())
+        .collect();
+    for purl in lock_refs {
+        let Some((_, version)) = crate::utils::purl::purl_name_version(&purl) else {
+            continue;
+        };
+        let target = canonical_base_purl(&purl);
+        for (parent, bundled) in bundles {
+            let names = match bundled {
+                Bundled::All => None,
+                Bundled::Names(names) => Some(names),
+            };
+            let holds = names.is_none_or(|names| {
+                names.iter().any(|name| {
+                    npm_purl(name, version).is_some_and(|p| canonical_base_purl(&p) == target)
+                })
+            });
+            if !holds {
+                continue;
+            }
+            let what = if names.is_some() {
+                "a bundled copy of it"
+            } else {
+                "every dependency as a bundled copy (`bundledDependencies: true`)"
+            };
+            out.unpatched_copy(
+                file,
+                Some(purl.clone()),
+                parent,
+                &format!(
+                    "ships {what}, which pnpm unpacks from that package's own tarball \
+                     (the lock does not record its version) and no Socket wiring reaches"
+                ),
+            );
+            break;
+        }
+    }
 }
 
 /// A pnpm `packages:` entry installed from a user's `file:` directory or
@@ -2157,6 +2220,103 @@ mod tests {
             &run(&p).await,
             &[("pkg:npm/left-pad@1.3.0", UUID_A, WiringMode::Hosted)],
         );
+    }
+
+    /// pnpm unpacks a package's `bundledDependencies` from its own tarball
+    /// and never locks them, so a bundled copy of the wired package stays
+    /// unpatched beside the Socket wiring (audit B04; npm, bun and vlt
+    /// already contest it). The lock does not record the bundled version,
+    /// so a ref of the same name is contested; a bundle of another name
+    /// is not. Hosted and vendored refs alike, v9 and legacy keys.
+    #[tokio::test]
+    async fn pnpm_bundled_copy_contests_the_ref() {
+        let url = hosted_url("npm", "left-pad", "1.3.0", UUID_A, "left-pad-1.3.0.tgz");
+        let wired =
+            format!("  left-pad@1.3.0:\n    resolution: {{integrity: {SRI}, tarball: {url}}}\n\n");
+        let host = |key: &str, field: &str| {
+            format!("  {key}:\n    resolution: {{integrity: sha512-HOST==}}\n{field}\n\n")
+        };
+        let lock = |extra: &str| format!("lockfileVersion: '9.0'\n\npackages:\n\n{wired}{extra}");
+        let hosted = [("pkg:npm/left-pad@1.3.0", UUID_A, WiringMode::Hosted)];
+
+        // Controls: no bundle, a bundle of another name, `false`.
+        for extra in [
+            String::new(),
+            host(
+                "host-pkg@1.0.0",
+                "    bundledDependencies:\n      - right-pad",
+            ),
+            host("host-pkg@1.0.0", "    bundledDependencies: false"),
+        ] {
+            let p = Project::new();
+            p.write("pnpm-lock.yaml", lock(&extra));
+            assert_refs(&run(&p).await, &hosted);
+        }
+
+        for (case, text) in [
+            (
+                "v9 block list",
+                lock(&host(
+                    "host-pkg@1.0.0",
+                    "    bundledDependencies:\n      - left-pad",
+                )),
+            ),
+            (
+                "v9 flow list",
+                lock(&host(
+                    "host-pkg@1.0.0",
+                    "    bundledDependencies: [left-pad]",
+                )),
+            ),
+            (
+                "v9 true",
+                lock(&host("host-pkg@1.0.0", "    bundledDependencies: true")),
+            ),
+            (
+                "v6 key",
+                format!(
+                    "lockfileVersion: '6.0'\n\npackages:\n\n  /left-pad@1.3.0:\n    \
+                     resolution: {{integrity: {SRI}, tarball: {url}}}\n    dev: false\n\n{}",
+                    host(
+                        "/host-pkg@1.0.0",
+                        "    bundledDependencies:\n      - left-pad"
+                    )
+                ),
+            ),
+        ] {
+            let p = Project::new();
+            p.write("pnpm-lock.yaml", text);
+            let out = run(&p).await;
+            assert!(out.refs.is_empty(), "{case}: {:#?}", out.refs);
+            assert!(
+                out.diagnostics
+                    .iter()
+                    .any(|d| d.code == DIAG_REF_UNATTRIBUTABLE
+                        && d.detail.contains("host-pkg@1.0.0")
+                        && d.detail.contains("bundled")
+                        && d.detail.contains("UNPATCHED")),
+                "{case}: {:#?}",
+                out.diagnostics
+            );
+        }
+
+        // A vendored ref is contested the same way.
+        let p = Project::new();
+        let rel = format!(".socket/vendor/npm/{UUID_A}/left-pad-1.3.0.tgz");
+        p.write(&rel, npm_tgz("left-pad", "1.3.0"));
+        p.write(
+            "pnpm-lock.yaml",
+            format!(
+                "lockfileVersion: '9.0'\n\npackages:\n\n  left-pad@file:{rel}:\n    \
+                 resolution: {{integrity: {SRI}, tarball: file:{rel}}}\n    version: 1.3.0\n\n{}",
+                host(
+                    "host-pkg@1.0.0",
+                    "    bundledDependencies:\n      - left-pad"
+                )
+            ),
+        );
+        let out = run(&p).await;
+        assert!(out.refs.is_empty(), "vendored: {:#?}", out.refs);
     }
 
     /// The committed golden (TS backend output — what a depscan PR leaves).
