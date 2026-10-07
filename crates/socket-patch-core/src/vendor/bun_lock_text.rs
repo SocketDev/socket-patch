@@ -224,6 +224,43 @@ pub(crate) fn split_name_spec(s: &str) -> Option<(&str, &str)> {
     Some((&s[..at], &s[at + 1..]))
 }
 
+/// The version a user tarball dependency of `name` installs (#497). Bun
+/// records a remote-URL or `file:` tarball dependency as `name@<url|path>`
+/// (text) or as a tarball resolution (binary) with no version of its own,
+/// and installs it from that spec, never from the registry, so no rewire
+/// of a registry `name@version` reaches it. The version is read from the
+/// artifact leaf, `<bare>-<version>.tgz` (or `.tar.gz`) with a semver
+/// `<version>` (`<bare>` = the name without its `@scope/`): the leaf every
+/// registry tarball and `npm pack` output carries. A leaf naming no version
+/// yields `None`, and so does our own vendored path.
+pub(crate) fn user_tarball_version<'t>(name: &str, target: &'t str) -> Option<&'t str> {
+    if crate::vendor::path::parse_vendor_path(target).is_some() {
+        return None;
+    }
+    let path = target.split(['?', '#']).next().unwrap_or(target);
+    let leaf = path.rsplit(['/', '\\']).next()?;
+    let bare = name.rsplit('/').next().unwrap_or(name);
+    let version = leaf.strip_prefix(bare)?.strip_prefix('-')?;
+    let version = version
+        .strip_suffix(".tgz")
+        .or_else(|| version.strip_suffix(".tar.gz"))?;
+    semver::Version::parse(version).is_ok().then_some(version)
+}
+
+/// [`user_tarball_version`] for a text `packages` entry: true when the
+/// entry's spec is `name@<tarball>` and the tarball's leaf names `version`.
+pub(crate) fn is_user_tarball_entry(entry: &BunEntry, name: &str, version: &str) -> bool {
+    entry
+        .elems
+        .first()
+        .and_then(|raw| decode_json_string(raw))
+        .is_some_and(|spec| {
+            split_name_spec(&spec).is_some_and(|(entry_name, target)| {
+                entry_name == name && user_tarball_version(name, target) == Some(version)
+            })
+        })
+}
+
 /// `"lockfileVersion": <n>` head check — only the fixture-pinned text
 /// lockfile versions are spliced (fail-closed on anything newer/older).
 ///
@@ -711,6 +748,41 @@ pub(crate) fn heal_workspace_literals(
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    /// #497: a user tarball's version is its `<bare>-<semver>.tgz` leaf,
+    /// for remote URLs and local paths alike; a registry version, a leaf
+    /// naming no version or another package, and our own vendored path are
+    /// not user tarballs.
+    #[test]
+    fn user_tarball_version_reads_the_leaf() {
+        for (name, target, want) in [
+            (
+                "is-number",
+                "https://registry.npmjs.org/is-number/-/is-number-6.0.0.tgz",
+                Some("6.0.0"),
+            ),
+            ("is-number", "./is-number-6.0.0.tgz", Some("6.0.0")),
+            ("is-number", "file:./is-number-6.0.0.tgz", Some("6.0.0")),
+            ("is-number", "vendor\\is-number-6.0.0.tar.gz", Some("6.0.0")),
+            (
+                "@s/p",
+                "https://h.test/@s/p/-/p-1.0.0-2.tgz?t=1",
+                Some("1.0.0-2"),
+            ),
+            ("is-number", "6.0.0", None),
+            ("is-number", "./is-number.tgz", None),
+            ("is-number", "./is-number-latest.tgz", None),
+            ("is-number", "./is-odd-6.0.0.tgz", None),
+            ("is-number", "github:jonschlinkert/is-number#6.0.0", None),
+            (
+                "is-number",
+                ".socket/vendor/npm/9f6b2c4e-1d3a-4f6b-8c2d-7e5a9b1c3d5f/is-number-6.0.0.tgz",
+                None,
+            ),
+        ] {
+            assert_eq!(user_tarball_version(name, target), want, "{name} {target}");
+        }
+    }
 
     /// #367: the keys come from the manifest and from the lock's mirror,
     /// and match the exact `name@version` (scoped too) or a bare name.

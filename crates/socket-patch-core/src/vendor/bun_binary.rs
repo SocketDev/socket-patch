@@ -1,7 +1,7 @@
 //! Native binary Bun vendoring. Package records are edited without re-resolving
 //! dependencies or requiring a Bun executable.
 use super::bun_lock_text::{
-    decode_json_string, packages_bounds, parse_entry_line, split_name_spec,
+    decode_json_string, packages_bounds, parse_entry_line, split_name_spec, user_tarball_version,
 };
 use super::bun_lockb::{BinaryPackage, BunLockb};
 use super::common::{already_patched_result, refused};
@@ -124,6 +124,7 @@ pub(crate) async fn vendor(
         matches,
         mirrors,
         bundled,
+        user_tarballs,
     } = match preflight_package(&project, root, &coords, &leaf) {
         Ok(v) => v,
         Err(o) => return *o,
@@ -151,6 +152,18 @@ pub(crate) async fn vendor(
                 coords.name,
                 coords.version,
                 if package.bundled_only { "" } else { "also " },
+            ),
+        ));
+    }
+    for package in user_tarballs {
+        // LOUD: bun installs this copy from its own URL / `file:`
+        // resolution, which vendoring does not touch (#497).
+        warnings.push(super::VendorWarning::new(
+            "vendor_non_registry_entry_skipped",
+            super::bun_lock::user_tarball_detail(
+                &format!("{LOCK} package #{}", package.id),
+                &coords.name,
+                &coords.version,
             ),
         ));
     }
@@ -409,6 +422,9 @@ pub(super) struct BinaryTargets {
     /// Matching records some bundled edge reaches (#469): each one's
     /// bundled copy stays unpatched, which vendoring reports loudly.
     bundled: Vec<BinaryPackage>,
+    /// User URL / `file:` tarball records of the same version (#497): bun
+    /// installs them from their own resolution, so they stay unpatched.
+    user_tarballs: Vec<BinaryPackage>,
 }
 
 /// The per-package pre-flight against an already-read lock: the records
@@ -435,6 +451,18 @@ pub(super) fn preflight_package(
         .chain(&bundled_only)
         .cloned()
         .collect();
+    let user_tarballs: Vec<_> = project
+        .packages
+        .iter()
+        .filter(|p| {
+            p.name == coords.name
+                && p.version.is_none()
+                && !p.bundled_only
+                && user_tarball_version(&coords.name, &p.resolution)
+                    == Some(coords.version.as_str())
+        })
+        .cloned()
+        .collect();
     if matches.is_empty() && !bundled_only.is_empty() {
         // Only a bundled edge reaches the record: Bun unpacks that copy
         // from the parent's tarball, so rewiring the record installs
@@ -446,6 +474,22 @@ pub(super) fn preflight_package(
                  cannot be rewritten — those copies stay UNPATCHED and `bun install` will not \
                  help; vendor or update the bundling parent to cover them",
                 coords.name, coords.version
+            ),
+        )));
+    }
+    if matches.is_empty() && !user_tarballs.is_empty() {
+        // The package IS locked, from a URL / `file:` resolution bun
+        // installs as written (#497): "run `bun install`" would not help.
+        let ids: Vec<String> = user_tarballs.iter().map(|p| format!("#{}", p.id)).collect();
+        return Err(Box::new(refused(
+            "vendor_lock_entry_not_rewritable",
+            format!(
+                "every {LOCK} record for {}@{} ({}) installs it from a URL or local tarball, \
+                 not the registry, and cannot be rewritten — those copies stay UNPATCHED and \
+                 `bun install` will not help; depend on the registry release to vendor it",
+                coords.name,
+                coords.version,
+                ids.join(", ")
             ),
         )));
     }
@@ -480,6 +524,7 @@ pub(super) fn preflight_package(
         matches,
         mirrors,
         bundled,
+        user_tarballs,
     })
 }
 

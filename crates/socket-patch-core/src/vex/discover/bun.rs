@@ -95,7 +95,9 @@ use super::{
 use crate::constants::npm_family::{BUN_LOCK, BUN_LOCKB};
 use crate::patch::redirect::hosted_url_version;
 use crate::utils::digest::is_sri_pin;
-use crate::vendor::bun_lock_text::{decode_json_string, is_bundled_entry, split_name_spec};
+use crate::vendor::bun_lock_text::{
+    decode_json_string, is_bundled_entry, split_name_spec, user_tarball_version,
+};
 use crate::vendor::bun_lockb::BunLockb;
 use crate::vendor::lock_inventory::bun::bun_text_entries;
 use crate::vendor::lock_inventory::bun_text_lock_drives;
@@ -157,7 +159,12 @@ async fn extract_text(ctx: &DiscoverCtx<'_>, out: &mut Discovery) {
         if is_bundled_entry(entry) {
             bundled.record(ctx, BUN_LOCK, classified, out);
         } else {
-            unwired.record(classify(ctx, BUN_LOCK, classified, out), &entry.key);
+            let user_tarball = user_tarball_version(name, target).is_some();
+            unwired.record(
+                classify(ctx, BUN_LOCK, classified, out),
+                &entry.key,
+                user_tarball,
+            );
         }
     }
     bundled.contest(BUN_LOCK, out);
@@ -289,7 +296,13 @@ async fn extract_binary(ctx: &DiscoverCtx<'_>, out: &mut Discovery) {
         if p.bundled {
             bundled.record(ctx, BUN_LOCKB, classified, out);
         } else {
-            unwired.record(classify(ctx, BUN_LOCKB, classified, out), &label);
+            let user_tarball =
+                p.version.is_none() && user_tarball_version(&p.name, &p.resolution).is_some();
+            unwired.record(
+                classify(ctx, BUN_LOCKB, classified, out),
+                &label,
+                user_tarball,
+            );
         }
     }
     bundled.contest(BUN_LOCKB, out);
@@ -352,13 +365,17 @@ fn classify(
     }
     if vendored.is_none() && hosted_uuid.is_none() {
         // Registry / git / workspace / user tarball dependency: not ours. A
-        // registry entry (an exact version) is evidence against another
-        // lock's wiring of the same package.
-        let version = recorded_version.or_else(|| {
-            target
-                .starts_with(|c: char| c.is_ascii_digit())
-                .then_some(target)
-        });
+        // registry entry (an exact version), or a user URL / `file:`
+        // tarball whose leaf names its version (#497), is an unpatched
+        // install of that version: evidence against wiring of the same
+        // package in this lock and any other.
+        let version = recorded_version
+            .or_else(|| {
+                target
+                    .starts_with(|c: char| c.is_ascii_digit())
+                    .then_some(target)
+            })
+            .or_else(|| user_tarball_version(name, target));
         let purl = version.and_then(|version| npm_purl(name, version));
         out.resolved_elsewhere(file, purl.clone());
         return purl;
@@ -427,17 +444,22 @@ fn classify(
 /// The registry copies one lock records, keyed by purl (#588): bun installs
 /// every entry, so a second entry resolving a wired `name@version` from the
 /// registry (e.g. a workspace member added after the rewire, then `bun
-/// install`) installs unpatched beside the rewired one.
+/// install`) installs unpatched beside the rewired one. A user URL /
+/// `file:` tarball of the version (#497) is such a copy too, one no re-run
+/// can rewire: bun installs it from its own spec.
 #[derive(Default)]
 struct Unwired {
-    /// purl → the first such entry's label.
-    copies: std::collections::BTreeMap<String, String>,
+    /// purl → the first such entry's label, and whether it is a user
+    /// tarball.
+    copies: std::collections::BTreeMap<String, (String, bool)>,
 }
 
 impl Unwired {
-    fn record(&mut self, purl: Option<String>, label: &str) {
+    fn record(&mut self, purl: Option<String>, label: &str, user_tarball: bool) {
         if let Some(purl) = purl {
-            self.copies.entry(purl).or_insert_with(|| label.to_string());
+            self.copies
+                .entry(purl)
+                .or_insert_with(|| (label.to_string(), user_tarball));
         }
     }
 
@@ -452,10 +474,24 @@ impl Unwired {
             let unwired_at = (r.source_file == std::path::Path::new(file))
                 .then(|| self.copies.get(&r.purl))
                 .flatten();
-            let Some(label) = unwired_at else {
+            let Some((label, user_tarball)) = unwired_at else {
                 out.refs.push(r);
                 continue;
             };
+            if *user_tarball {
+                out.diag(
+                    DIAG_REF_UNATTRIBUTABLE,
+                    file,
+                    format!(
+                        "{file}: {} is wired to a Socket patch but entry {label:?} of the same \
+                         lock installs that version from a URL or local tarball, not the \
+                         registry; bun installs it from that spec, so that copy stays \
+                         UNPATCHED and nothing is attested",
+                        r.purl,
+                    ),
+                );
+                continue;
+            }
             out.diag(
                 DIAG_REF_UNATTRIBUTABLE,
                 file,
@@ -770,6 +806,118 @@ mod tests {
             let out = run(&p).await;
             assert_eq!(out.refs.len(), 1, "{label} control: {:#?}", out.refs);
             assert_eq!(contests(&out), 0, "{label} control: {:#?}", out.diagnostics);
+        }
+    }
+
+    /// The `DIAG_REF_UNATTRIBUTABLE` diagnostics that name a user tarball.
+    fn user_tarball_contests(out: &Discovery) -> usize {
+        out.diagnostics
+            .iter()
+            .filter(|d| {
+                d.code == DIAG_REF_UNATTRIBUTABLE
+                    && d.detail.contains("from a URL or local tarball")
+                    && d.detail.contains("UNPATCHED")
+            })
+            .count()
+    }
+
+    /// REGRESSION (#497): a root dependency on `left-pad` by remote URL or
+    /// `file:` tarball is installed from that spec, never the registry, so
+    /// a hosted / vendored rewire of the nested registry copy of the same
+    /// version leaves the copy the app loads unpatched. Nothing may be
+    /// attested from the lock alone (npm's #326 contest). A tarball of
+    /// another version, or one whose leaf names no version, contests
+    /// nothing.
+    #[tokio::test]
+    async fn issue_497_user_tarball_copy_contests_the_ref() {
+        let hosted = hosted_url("npm", "left-pad", "1.3.0", UUID_A, "left-pad-1.3.0.tgz");
+        let vendored = format!("left-pad@.socket/vendor/npm/{UUID_A}/left-pad-1.3.0.tgz");
+        for (label, spec) in [
+            ("hosted", format!("left-pad@{hosted}")),
+            ("vendored", vendored),
+        ] {
+            for user in [
+                "left-pad@https://registry.npmjs.org/left-pad/-/left-pad-1.3.0.tgz",
+                "left-pad@./left-pad-1.3.0.tgz",
+                "left-pad@vendor/left-pad-1.3.0.tgz",
+            ] {
+                let p = Project::new();
+                p.write(
+                    "bun.lock",
+                    text_lock(
+                        2,
+                        &[
+                            tuple("left-pad", user, Some(SRI)),
+                            tuple("dep/left-pad", &spec, Some(SRI)),
+                        ],
+                    ),
+                );
+                let out = run(&p).await;
+                assert!(out.refs.is_empty(), "{label} {user}: {:#?}", out.refs);
+                assert_eq!(
+                    user_tarball_contests(&out),
+                    1,
+                    "{label} {user}: {:#?}",
+                    out.diagnostics
+                );
+            }
+            for other in [
+                "left-pad@https://registry.npmjs.org/left-pad/-/left-pad-1.2.0.tgz",
+                "left-pad@./left-pad.tgz",
+            ] {
+                let p = Project::new();
+                p.write(
+                    "bun.lock",
+                    text_lock(
+                        2,
+                        &[
+                            tuple("left-pad", other, Some(SRI)),
+                            tuple("dep/left-pad", &spec, Some(SRI)),
+                        ],
+                    ),
+                );
+                let out = run(&p).await;
+                assert_eq!(out.refs.len(), 1, "{label} {other}: {:#?}", out.refs);
+                assert_eq!(user_tarball_contests(&out), 0, "{label} {other}");
+            }
+        }
+    }
+
+    /// REGRESSION (#497), `bun.lockb`: Bun 1.1.45's tarball record of a
+    /// root URL / `file:` dependency contests a hosted or vendored rewire
+    /// of is-odd's nested registry copy of the same version.
+    #[tokio::test]
+    async fn issue_497_binary_user_tarball_record_contests_the_ref() {
+        let hosted = hosted_url("npm", "is-number", "6.0.0", UUID_A, "is-number-6.0.0.tgz");
+        let vendored = format!(".socket/vendor/npm/{UUID_A}/is-number-6.0.0.tgz");
+        for shape in ["url", "file"] {
+            for wired in [&hosted, &vendored] {
+                let bytes = std::fs::read(
+                    fixture_path("bun-lockb-user-tarball")
+                        .join(shape)
+                        .join("bun.lockb"),
+                )
+                .expect("user tarball fixture");
+                let mut lock = crate::vendor::bun_lockb::BunLockb::parse(&bytes).unwrap();
+                let id = lock
+                    .packages()
+                    .unwrap()
+                    .into_iter()
+                    .find(|p| p.name == "is-number" && p.version.as_deref() == Some("6.0.0"))
+                    .expect("nested registry record")
+                    .id;
+                lock.set_package(id, wired, SRI).unwrap();
+                let p = Project::new();
+                p.write("bun.lockb", lock.bytes());
+                let out = run(&p).await;
+                assert_refs(&out, &[]);
+                assert_eq!(
+                    user_tarball_contests(&out),
+                    1,
+                    "{shape} {wired}: {:#?}",
+                    out.diagnostics
+                );
+            }
         }
     }
 

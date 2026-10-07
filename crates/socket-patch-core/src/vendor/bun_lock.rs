@@ -42,7 +42,7 @@ use crate::utils::fs::{atomic_write_bytes_preserving_mode, read_regular_to_strin
 use crate::utils::socket_dir::remove_tree_and_prune;
 use crate::vendor::bun_lock_text::{
     decode_json_string, default_trust_detail, has_workspace_packages, is_bundled_entry,
-    lock_version, loses_default_trust, packages_bounds, parse_entry_line,
+    is_user_tarball_entry, lock_version, loses_default_trust, packages_bounds, parse_entry_line,
     patched_dependency_detail, patched_dependency_key, patched_dependency_keys, split_name_spec,
     BunEntry,
 };
@@ -379,6 +379,14 @@ pub(crate) async fn vendor_bun<'a>(
         name,
         version,
     ));
+    for key in user_tarball_matches(&project.entries, name, version) {
+        // LOUD: bun installs this copy from its own URL / `file:` spec,
+        // never the vendored tuple, so it stays the unpatched bytes (#497).
+        warnings.push(VendorWarning::new(
+            "vendor_non_registry_entry_skipped",
+            user_tarball_detail(&format!("{BUN_LOCK} entry `{key}`"), name, version),
+        ));
+    }
     let BunProject {
         mut lines, entries, ..
     } = project;
@@ -789,6 +797,21 @@ pub(super) fn preflight_package(
                      and `bun install` will not help; vendor or update the bundling parent \
                      to cover them",
                     bundled.join(", ")
+                ),
+            )));
+        }
+        let user_tarballs = user_tarball_matches(&project.entries, name, version);
+        if !user_tarballs.is_empty() {
+            // Likewise: the package IS locked, from a URL / `file:` spec
+            // bun installs as written (#497).
+            return Err(Box::new(refused(
+                "vendor_lock_entry_not_rewritable",
+                format!(
+                    "every {BUN_LOCK} entry for {name}@{version} ({}) installs it from a URL \
+                     or local tarball, not the registry, and cannot be rewritten — those \
+                     copies stay UNPATCHED and `bun install` will not help; depend on the \
+                     registry release to vendor it",
+                    user_tarballs.join(", ")
                 ),
             )));
         }
@@ -1222,6 +1245,27 @@ fn bundled_matches(
         .filter(|e| classify(e, target_spec, name, target_leaf).is_some() && is_bundled_entry(e))
         .map(|e| e.key.clone())
         .collect()
+}
+
+/// Keys of the non-bundled entries that install `name@version` from a user
+/// URL / `file:` tarball (#497): bun installs those from their own spec, so
+/// no vendored tuple reaches them.
+fn user_tarball_matches(entries: &[BunEntry], name: &str, version: &str) -> Vec<String> {
+    entries
+        .iter()
+        .filter(|e| !is_bundled_entry(e) && is_user_tarball_entry(e, name, version))
+        .map(|e| e.key.clone())
+        .collect()
+}
+
+/// The stays-UNPATCHED detail for a user tarball copy at `label`, shared
+/// by the text and binary backends.
+pub(super) fn user_tarball_detail(label: &str, name: &str, version: &str) -> String {
+    format!(
+        "{label} installs {name}@{version} from a URL or local tarball, not the registry, \
+         and CANNOT be rewritten — bun installs it from that spec, so that copy stays \
+         UNPATCHED; depend on the registry release to vendor it"
+    )
 }
 
 /// Classify an entry against the target: `Some(Registry)` for the exact
@@ -2214,6 +2258,58 @@ mod tests {
         );
     }
 
+    /// REGRESSION (#497): bun installs a remote-URL or `file:` tarball
+    /// dependency from its own spec, so vendoring the registry copy beside
+    /// it leaves the copy the app loads unpatched. The tarball tuple is
+    /// never rewired and is reported loudly (npm's #326); with no registry
+    /// copy the vendor refuses with the real reason and writes nothing.
+    #[tokio::test]
+    async fn user_tarball_copy_is_never_rewired_silently() {
+        let regular_line = BN3_BEFORE_LOCK
+            .lines()
+            .find(|l| l.contains("\"left-pad\": ["))
+            .unwrap();
+        let nested_line = regular_line.replace("\"left-pad\": [", "\"dep/left-pad\": [");
+        for user_line in [
+            r#"    "left-pad": ["left-pad@https://registry.npmjs.org/left-pad/-/left-pad-1.3.0.tgz", {}, "sha512-XI5MPzVNApjAyhQzphX8BkmKsKUxD4LdyK24iZeQGinBN9yTQT3bFlCBy/aVx2HrNcqQGsdot8ghrjyrvMCoEA=="],"#,
+            r#"    "left-pad": ["left-pad@./left-pad-1.3.0.tgz", {}, "sha512-XI5MPzVNApjAyhQzphX8BkmKsKUxD4LdyK24iZeQGinBN9yTQT3bFlCBy/aVx2HrNcqQGsdot8ghrjyrvMCoEA=="],"#,
+        ] {
+            // The tarball copy only.
+            let lock = BN3_BEFORE_LOCK.replace(regular_line, user_line);
+            let fx = fixture_with(&lock, "node_modules/left-pad").await;
+            let detail = expect_refused(fx.vendor(false).await, "vendor_lock_entry_not_rewritable");
+            assert!(
+                detail.contains("left-pad") && detail.contains("UNPATCHED"),
+                "{detail}"
+            );
+            assert_eq!(fx.read_lock().await, lock, "refusal writes nothing");
+            assert!(!fx.root().join(".socket/vendor").exists());
+
+            // Beside a nested registry copy of the same version.
+            let lock =
+                BN3_BEFORE_LOCK.replace(regular_line, &format!("{user_line}\n\n{nested_line}"));
+            let fx = fixture_with(&lock, "node_modules/dep/node_modules/left-pad").await;
+            let (result, entry, warnings) = expect_done(fx.vendor(false).await);
+            assert!(result.success, "{:?}", result.error);
+            let entry = entry.unwrap();
+            assert_eq!(entry.wiring.len(), 1);
+            assert_eq!(entry.wiring[0].key.as_deref(), Some("dep/left-pad"));
+            assert!(
+                fx.read_lock().await.contains(user_line),
+                "the tarball line keeps its bytes"
+            );
+            let skipped = warnings
+                .iter()
+                .find(|w| w.code == "vendor_non_registry_entry_skipped")
+                .unwrap_or_else(|| panic!("{user_line}: {warnings:?}"));
+            assert!(
+                skipped.detail.contains("`left-pad`") && skipped.detail.contains("UNPATCHED"),
+                "{}",
+                skipped.detail
+            );
+        }
+    }
+
     /// REGRESSION (#469), `bun.lockb`: a record only a bundled edge
     /// reaches refuses with the real reason; a record Bun shares between a
     /// regular and a bundled install is vendored for the regular install,
@@ -2277,6 +2373,65 @@ mod tests {
                 .any(|w| w.code == "vendor_bundled_instance_skipped"),
             "{warnings:?}"
         );
+    }
+
+    /// REGRESSION (#497), `bun.lockb`: Bun 1.1.45's record of a root URL /
+    /// `file:` tarball dependency is installed from its own resolution, so
+    /// vendoring is-odd's nested registry copy reports the tarball copy as
+    /// staying unpatched instead of succeeding silently, and that record is
+    /// left alone.
+    #[tokio::test]
+    async fn binary_user_tarball_record_is_reported_unpatched() {
+        for shape in ["url", "file"] {
+            let fx = fixture_with("", "node_modules/is-odd/node_modules/is-number").await;
+            let dir = std::path::Path::new(env!("CARGO_MANIFEST_DIR"))
+                .join("tests/fixtures/bun-lockb-user-tarball")
+                .join(shape);
+            tokio::fs::remove_file(fx.root().join(BUN_LOCK))
+                .await
+                .unwrap();
+            for file in ["bun.lockb", "package.json"] {
+                tokio::fs::copy(dir.join(file), fx.root().join(file))
+                    .await
+                    .unwrap();
+            }
+            tokio::fs::write(
+                fx.installed.join("package.json"),
+                br#"{"name":"is-number","version":"6.0.0"}"#,
+            )
+            .await
+            .unwrap();
+            let blobs = fx.root().join(".socket/blobs");
+            let outcome = crate::vendor::test_support::vendor_bun(
+                "pkg:npm/is-number@6.0.0",
+                &fx.installed,
+                fx.root(),
+                &fx.record,
+                &PatchSources::blobs_only(&blobs),
+                "2026-06-09T00:00:00Z",
+                false,
+                false,
+                None,
+            )
+            .await;
+            let (result, entry, warnings) = expect_done(outcome);
+            assert!(result.success, "{shape}: {:?}", result.error);
+            assert_eq!(entry.unwrap().wiring.len(), 1, "{shape}: the registry copy");
+            let skipped = warnings
+                .iter()
+                .find(|w| w.code == "vendor_non_registry_entry_skipped")
+                .unwrap_or_else(|| panic!("{shape}: {warnings:?}"));
+            assert!(skipped.detail.contains("UNPATCHED"), "{}", skipped.detail);
+            let lock = tokio::fs::read(fx.root().join("bun.lockb")).await.unwrap();
+            let packages = crate::vendor::bun_lockb::BunLockb::parse_packages(&lock).unwrap();
+            assert!(
+                packages.iter().any(|p| p.name == "is-number"
+                    && p.version.is_none()
+                    && parse_vendor_path(&p.resolution).is_none()
+                    && p.resolution.ends_with("is-number-6.0.0.tgz")),
+                "{shape}: the tarball record keeps its resolution: {packages:?}"
+            );
+        }
     }
 
     /// REGRESSION (#367): a package the project patches itself with

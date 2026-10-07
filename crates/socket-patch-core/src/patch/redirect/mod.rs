@@ -4847,7 +4847,9 @@ fn rewrite_bun_lock(
     overrides: &[DepOverride],
     result: &mut RewriteResult,
 ) {
-    use crate::vendor::bun_lock_text::{decode_json_string, is_bundled_entry};
+    use crate::vendor::bun_lock_text::{
+        decode_json_string, is_bundled_entry, is_user_tarball_entry,
+    };
 
     let npm: Vec<&DepOverride> = overrides.iter().filter(|o| o.ecosystem == "npm").collect();
     if npm.is_empty() {
@@ -4902,6 +4904,7 @@ fn rewrite_bun_lock(
         let mut matched_any = false;
         // A non-bundled instance now resolves to the hosted URL.
         let mut wired = false;
+        let mut user_tarball_skipped = false;
         for entry in &entries {
             let Some(spec) = entry.elems.first().and_then(|e| decode_json_string(e)) else {
                 continue;
@@ -4975,7 +4978,24 @@ fn rewrite_bun_lock(
                 deps_verbatim = entry.elems[1].clone();
             } else {
                 // Same-name-but-unowned entry (user file:/URL dep, other
-                // version) — never touched.
+                // version) — never touched. A user URL / `file:` tarball of
+                // this very version is installed from that spec beside the
+                // pinned copy and stays unpatched (#497, npm's #326): say so,
+                // and keep the in-run VEX from assuming the uuid patched.
+                if spec != url_spec && is_user_tarball_entry(entry, &fname, &dep.version) {
+                    user_tarball_skipped = true;
+                    result.bundled_skipped_uuids.insert(dep.patch_uuid.clone());
+                    result.warnings.push(RewriteWarning {
+                        code: "redirect_bun_non_registry_entry_skipped".into(),
+                        detail: format!(
+                            "bun.lock entry `{}` installs {fname}@{} from a URL or local \
+                             tarball, not the registry, and CANNOT be redirected — bun installs \
+                             it from that spec, so that copy stays UNPATCHED; depend on the \
+                             registry release to patch it",
+                            entry.key, dep.version
+                        ),
+                    });
+                }
                 continue;
             }
             matched_any = true;
@@ -5025,7 +5045,7 @@ fn rewrite_bun_lock(
                 .warnings
                 .push(bun_default_trust_warning(&fname, &dep.version));
         }
-        if !matched_any {
+        if !matched_any && !user_tarball_skipped {
             // Mirrors the pnpm/berry/uv rewriters: a granted dep that matched
             // no rewritable tuple (lock re-resolved to another version, entry
             // occupied by an unowned URL/file: spec) must be diagnosable, not
@@ -10777,7 +10797,11 @@ mod tests {
             r.files.is_empty(),
             "foreign-origin URL dep must not be touched"
         );
-        assert_eq!(r.warnings[0].code, "redirect_bun_entry_not_found");
+        // ...but bun installs it from that URL, unpatched (#497).
+        assert_eq!(
+            r.warnings[0].code,
+            "redirect_bun_non_registry_entry_skipped"
+        );
 
         // Our origin but ANOTHER version's leaf is never claimed either.
         let other_version_url = "https://patch.socket.dev/patch/npm/oldtoken-1111/aaaaaaaa-aaaa-4aaa-8aaa-aaaaaaaaaaaa/left-pad-1.2.0.tgz";
@@ -11154,6 +11178,82 @@ mod tests {
             "{:?}",
             r.warnings
         );
+    }
+
+    /// REGRESSION (#497): bun installs a remote-URL or `file:` tarball
+    /// dependency from its own spec, never the registry, so a registry copy
+    /// of the same version rewired beside it leaves the copy the app loads
+    /// unpatched. The tarball tuple is left alone LOUDLY (npm's #326), the
+    /// uuid is kept out of the in-run VEX's assumptions, and a lock holding
+    /// only the tarball copy says why instead of `redirect_bun_entry_not_found`.
+    #[test]
+    fn bun_lock_user_tarball_copy_is_skipped_with_loud_warning() {
+        let sha512 = format!("sha512-{}==", "A".repeat(86));
+        let ovr = npm_override(
+            "is-number",
+            "6.0.0",
+            "http://p.test/is-number-6.0.0.tgz",
+            &sha512,
+        );
+        let nested = "\"is-odd/is-number\": [\"is-number@6.0.0\", \"\", {}, \"sha512-UP==\"],";
+        for user in [
+            "\"is-number\": [\"is-number@https://registry.npmjs.org/is-number/-/is-number-6.0.0.tgz\", {}, \"sha512-UP==\"],",
+            "\"is-number\": [\"is-number@./is-number-6.0.0.tgz\", {}, \"sha512-UP==\"],",
+            "\"is-number\": [\"is-number@vendor/is-number-6.0.0.tgz\", {}],",
+        ] {
+            let both = format!("{user}\n    {nested}");
+            let mut files = BTreeMap::new();
+            files.insert("bun.lock".to_string(), bun_lock_file(&both, 2));
+            let mut r = RewriteResult::default();
+            rewrite_bun_lock(&files, std::slice::from_ref(&ovr), &mut r);
+            assert_eq!(r.edits.len(), 1, "{user}: {:?}", r.edits);
+            assert_eq!(r.edits[0].key.as_deref(), Some("is-odd/is-number"));
+            let out = r.files.get("bun.lock").expect("nested copy rewired");
+            assert!(out.contains(user), "{user}: tarball line untouched: {out}");
+            assert_eq!(
+                warning_codes(&r),
+                vec!["redirect_bun_non_registry_entry_skipped"],
+                "{user}: {:?}",
+                r.warnings
+            );
+            assert!(
+                r.warnings[0].detail.contains("`is-number`")
+                    && r.warnings[0].detail.contains("UNPATCHED"),
+                "{}",
+                r.warnings[0].detail
+            );
+            assert!(r.bundled_skipped_uuids.contains(&ovr.patch_uuid));
+
+            // The tarball copy alone: nothing to rewire, and the warning
+            // names the real reason.
+            let mut files = BTreeMap::new();
+            files.insert("bun.lock".to_string(), bun_lock_file(user, 2));
+            let mut r = RewriteResult::default();
+            rewrite_bun_lock(&files, std::slice::from_ref(&ovr), &mut r);
+            assert!(r.files.is_empty() && r.edits.is_empty(), "{:?}", r.edits);
+            assert_eq!(
+                warning_codes(&r),
+                vec!["redirect_bun_non_registry_entry_skipped"],
+                "{user}: {:?}",
+                r.warnings
+            );
+        }
+
+        // A tarball of ANOTHER version, or one whose leaf names no version,
+        // is not this copy: no warning.
+        for other in [
+            "\"is-number\": [\"is-number@https://registry.npmjs.org/is-number/-/is-number-7.0.0.tgz\", {}, \"sha512-UP==\"],",
+            "\"is-number\": [\"is-number@./is-number.tgz\", {}, \"sha512-UP==\"],",
+        ] {
+            let both = format!("{other}\n    {nested}");
+            let mut files = BTreeMap::new();
+            files.insert("bun.lock".to_string(), bun_lock_file(&both, 2));
+            let mut r = RewriteResult::default();
+            rewrite_bun_lock(&files, std::slice::from_ref(&ovr), &mut r);
+            assert_eq!(r.edits.len(), 1, "{other}: {:?}", r.edits);
+            assert!(r.warnings.is_empty(), "{other}: {:?}", r.warnings);
+            assert!(r.bundled_skipped_uuids.is_empty());
+        }
     }
 
     /// REGRESSION (#367): `bun patch --commit` keys the project's own patch
@@ -20356,13 +20456,23 @@ packages:
             Some(format!("    {stale}").as_str())
         );
 
-        for unowned in [
-            // Foreign origin, same leaf: a user's own URL dep.
-            "\"left-pad\": [\"left-pad@https://example.com/mirror/left-pad-1.3.0.tgz\", {}],",
+        for (unowned, code) in [
+            // Foreign origin, same leaf: a user's own URL dep, which bun
+            // installs from that URL, unpatched (#497).
+            (
+                "\"left-pad\": [\"left-pad@https://example.com/mirror/left-pad-1.3.0.tgz\", {}],",
+                "redirect_bun_non_registry_entry_skipped",
+            ),
             // Our origin, another version's leaf.
-            "\"left-pad\": [\"left-pad@https://patch.socket.dev/patch/npm/oldtoken-1111/aaaaaaaa-aaaa-4aaa-8aaa-aaaaaaaaaaaa/left-pad-1.2.0.tgz\", {}],",
+            (
+                "\"left-pad\": [\"left-pad@https://patch.socket.dev/patch/npm/oldtoken-1111/aaaaaaaa-aaaa-4aaa-8aaa-aaaaaaaaaaaa/left-pad-1.2.0.tgz\", {}],",
+                "redirect_bun_entry_not_found",
+            ),
             // Registry spec in a 2-tuple: not bun's registry grammar.
-            "\"left-pad\": [\"left-pad@1.3.0\", {}],",
+            (
+                "\"left-pad\": [\"left-pad@1.3.0\", {}],",
+                "redirect_bun_entry_not_found",
+            ),
         ] {
             let mut files = BTreeMap::new();
             files.insert("bun.lock".to_string(), bun_lock_file(unowned, 1));
@@ -20374,7 +20484,7 @@ packages:
             );
             assert_eq!(
                 r.warnings.iter().map(|w| w.code.as_str()).collect::<Vec<_>>(),
-                vec!["redirect_bun_entry_not_found"],
+                vec![code],
                 "{unowned}"
             );
         }
@@ -20398,7 +20508,8 @@ packages:
     /// Fail-closed ownership legs of the URL-tuple takeover: an OTHER-name
     /// spec, a non-http `file:` spec, and a foreign-origin URL all survive
     /// byte-identically while the target registry tuple in the same lock is
-    /// rewritten.
+    /// rewritten. The foreign-origin URL names the target's own leaf, so it
+    /// is reported as a copy that stays unpatched (#497).
     #[test]
     fn bun_lock_unowned_url_and_file_tuples_survive_untouched() {
         let sha = format!("sha512-{}==", "A".repeat(86));
@@ -20433,7 +20544,13 @@ packages:
             );
         }
         assert_eq!(r.edits.len(), 1, "only the target is edited: {:?}", r.edits);
-        assert!(r.warnings.is_empty(), "{:?}", r.warnings);
+        assert_eq!(
+            warning_codes(&r),
+            vec!["redirect_bun_non_registry_entry_skipped"],
+            "{:?}",
+            r.warnings
+        );
+        assert!(r.warnings[0].detail.contains("`mirror/left-pad`"));
     }
 
     /// The uv block iteration must find the target mid-file and leave both
