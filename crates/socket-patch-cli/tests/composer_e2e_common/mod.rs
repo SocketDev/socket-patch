@@ -35,6 +35,8 @@
 //!   fixture install that cannot reach its registry, FAILS the test
 //!   instead of soft-skipping it, so a leg can never report green on an
 //!   unexercised toolchain.
+//!   ([`composer`] first re-runs a connect-level curl failure against a
+//!   remote host, see [`remote_transport_failure`].)
 //! * `SOCKET_PATCH_COMPOSER_E2E_VERSION=<1|2|2.2|2.10.3…>` — the release
 //!   (prefix) the leg pinned, e.g. setup-php's `composer:<v>`; the capstone
 //!   asserts `composer --version` reports exactly it or a release under it
@@ -150,7 +152,75 @@ pub fn composer_major(suite: &str) -> Option<u32> {
 /// is a plain-http loopback wiremock. Git runs with `core.autocrlf=false`:
 /// Git for Windows' system default converts a source install's checkout to
 /// CRLF, so its bytes would never equal the upstream archive's.
+///
+/// A failed run whose output shows a connect-level curl failure against a
+/// remote host ([`remote_transport_failure`]) is re-run, up to
+/// [`TRANSPORT_ATTEMPTS`] times in all: the fixture `composer update` is
+/// the only step that reaches packagist / GitHub, and one 10 s connect
+/// timeout there would otherwise fail a required leg. Any other failure,
+/// including every failure against the loopback patch server, returns at
+/// once.
 pub fn composer(cwd: &Path, args: &[&str], home: &Path, cache: &Path) -> Output {
+    let mut attempt = 1;
+    loop {
+        let out = composer_once(cwd, args, home, cache);
+        if out.status.success() || attempt == TRANSPORT_ATTEMPTS {
+            return out;
+        }
+        let text = format!(
+            "{}\n{}",
+            String::from_utf8_lossy(&out.stdout),
+            String::from_utf8_lossy(&out.stderr)
+        );
+        let Some(failure) = remote_transport_failure(&text) else {
+            return out;
+        };
+        eprintln!(
+            "composer {}: transport failure ({failure}); retrying ({attempt}/{TRANSPORT_ATTEMPTS})",
+            args.join(" ")
+        );
+        std::thread::sleep(std::time::Duration::from_secs(5 * attempt as u64));
+        attempt += 1;
+    }
+}
+
+/// Runs of [`composer`] allowed when each failure is a remote transport
+/// failure.
+pub const TRANSPORT_ATTEMPTS: u32 = 3;
+
+/// Composer's curl failures that mean the request never got an HTTP
+/// answer: 6 (could not resolve host), 7 (could not connect), 28 (timed
+/// out), 35 (TLS connect error), 52 (empty reply), 56 (connection reset
+/// while receiving).
+const TRANSIENT_CURL_CODES: &[&str] = &["6", "7", "28", "35", "52", "56"];
+
+/// The first `curl error <code> while downloading <url>` line in composer's
+/// output with a transient [`TRANSIENT_CURL_CODES`] code and a non-loopback
+/// URL, or `None`. HTTP status failures, checksum failures and anything
+/// against `127.0.0.1` / `localhost` (the capstones' wiremock patch server)
+/// are never transient.
+pub fn remote_transport_failure(text: &str) -> Option<&str> {
+    text.lines().map(str::trim).find(|line| {
+        let Some((head, url)) = line.split_once(" while downloading ") else {
+            return false;
+        };
+        let Some(code) = head.rsplit_once("curl error ").map(|(_, code)| code.trim()) else {
+            return false;
+        };
+        let host = url
+            .split_once("://")
+            .map_or("", |(_, rest)| rest)
+            .split(['/', ':'])
+            .next()
+            .unwrap_or("");
+        TRANSIENT_CURL_CODES.contains(&code)
+            && !host.is_empty()
+            && host != "127.0.0.1"
+            && host != "localhost"
+    })
+}
+
+fn composer_once(cwd: &Path, args: &[&str], home: &Path, cache: &Path) -> Output {
     std::fs::create_dir_all(home).unwrap();
     std::fs::create_dir_all(cache).unwrap();
     let config = home.join("config.json");
@@ -276,4 +346,49 @@ pub fn fresh_checkout(proj: &Path, dst: &Path) {
         !dst.join("vendor").exists(),
         "a fresh checkout must not carry an installed tree (test bug)"
     );
+}
+
+// Integration-test crates do not get `cfg(test)`, so (as in
+// `common/cache_env.rs`) these stay ungated to run at all.
+mod composer_e2e_common_selftests {
+    use super::remote_transport_failure;
+
+    /// The packagist connect timeout that failed the Windows composer
+    /// 2.2.30 leg, both as composer's first stderr line and as the wrapped
+    /// `[TransportException]` box line, is transient.
+    #[test]
+    fn packagist_connect_timeout_is_transient() {
+        let line = "curl error 28 while downloading https://repo.packagist.org/packages.json: \
+                    Connection timed out after 10001 milliseconds";
+        assert_eq!(remote_transport_failure(line), Some(line));
+        let boxed = "Loading composer repositories with package information\n\n  \
+                     [Composer\\Downloader\\TransportException]\n  \
+                     curl error 28 while downloading https://repo.packagist.org/packages.json: \
+                     Connection timed out after 10001 millisec  \n  onds\n";
+        assert!(remote_transport_failure(boxed).is_some());
+        for code in ["6", "7", "35", "52", "56"] {
+            let text = format!(
+                "curl error {code} while downloading https://api.github.com/repos/php-fig/log/zipball/x: boom"
+            );
+            assert!(remote_transport_failure(&text).is_some(), "{text}");
+        }
+    }
+
+    /// Loopback (the capstones' own patch server), HTTP answers, checksum
+    /// refusals, other curl codes and unrelated output are not retried.
+    #[test]
+    fn functional_and_loopback_failures_are_not_transient() {
+        for text in [
+            "curl error 7 while downloading http://127.0.0.1:41231/archive.zip: Failed to connect",
+            "curl error 28 while downloading http://localhost:8080/p2/psr/log.json: timed out",
+            "curl error 60 while downloading https://repo.packagist.org/packages.json: SSL certificate problem",
+            "The \"https://repo.packagist.org/packages.json\" file could not be downloaded (HTTP/2 404 )",
+            "The checksum verification of the file failed (downloaded from http://127.0.0.1:1/a.zip)",
+            "Your requirements could not be resolved to an installable set of packages.",
+            "curl error 28 while downloading : nowhere",
+            "",
+        ] {
+            assert_eq!(remote_transport_failure(text), None, "{text}");
+        }
+    }
 }

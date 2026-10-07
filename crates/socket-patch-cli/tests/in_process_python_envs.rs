@@ -883,6 +883,84 @@ async fn pdm_pep582_pypackages_is_scanned_not_a_stray_dot_venv() {
     assert_scan_finds(&project, "pkg:pypi/pep582-pkg@1.0.0").await;
 }
 
+/// #964: a fresh uv checkout (`pyproject.toml` + `uv.lock`, no `.venv`
+/// yet, optionally a CI `UV_PROJECT_ENVIRONMENT` not synced yet) and a
+/// script-only directory (`tool.py` + `tool.py.lock`) take their candidates
+/// from the lock alone. A package that exists only in the OS Python (here a
+/// conda root under the stubbed HOME) is not the project's and must never
+/// reach the patch query, in any mode.
+#[tokio::test]
+#[serial]
+async fn uv_fresh_checkout_never_scans_the_system_python() {
+    use socket_patch_cli::commands::scan::ScanMode;
+    const UV_LOCK: &str = "version = 1\nrequires-python = \">=3.9\"\n\n\
+        [[package]]\nname = \"app\"\nversion = \"0.1.0\"\n\
+        source = { virtual = \".\" }\ndependencies = [{ name = \"six\" }]\n\n\
+        [[package]]\nname = \"six\"\nversion = \"1.16.0\"\n\
+        source = { registry = \"https://pypi.org/simple\" }\n";
+    for (shape, uv_env) in [
+        ("project", None),
+        ("project", Some("not-synced")),
+        ("script", None),
+    ] {
+        for mode in [ScanMode::Agent, ScanMode::Vendored, ScanMode::Hosted] {
+            let tmp = tempfile::tempdir().unwrap();
+            let project = tmp.path().join("proj");
+            std::fs::create_dir_all(&project).unwrap();
+            if shape == "project" {
+                std::fs::write(
+                    project.join("pyproject.toml"),
+                    "[project]\nname = \"app\"\nversion = \"0.1.0\"\ndependencies = [\"six==1.16.0\"]\n",
+                )
+                .unwrap();
+                std::fs::write(project.join("uv.lock"), UV_LOCK).unwrap();
+            } else {
+                std::fs::write(
+                    project.join("tool.py"),
+                    "# /// script\n# dependencies = [\"six==1.16.0\"]\n# ///\n",
+                )
+                .unwrap();
+                std::fs::write(project.join("tool.py.lock"), UV_LOCK).unwrap();
+            }
+            let home = tmp.path().join("home");
+            let system = home
+                .join("anaconda3")
+                .join("lib")
+                .join("python3.11")
+                .join("site-packages");
+            std::fs::create_dir_all(&system).unwrap();
+            write_dist_info(&system, "system_decoy", "6.6.6");
+
+            let server = MockServer::start().await;
+            mock_batch_empty(&server).await;
+            let prev_home = std::env::var_os("HOME");
+            let prev_profile = std::env::var_os("USERPROFILE");
+            std::env::set_var("HOME", &home);
+            std::env::set_var("USERPROFILE", &home);
+            std::env::remove_var("VIRTUAL_ENV");
+            match uv_env {
+                Some(v) => std::env::set_var("UV_PROJECT_ENVIRONMENT", v),
+                None => std::env::remove_var("UV_PROJECT_ENVIRONMENT"),
+            }
+            let mut args = default_args(&project, server.uri());
+            args.mode = Some(mode);
+            let code = scan_run(args).await;
+            std::env::remove_var("UV_PROJECT_ENVIRONMENT");
+            match prev_home {
+                Some(v) => std::env::set_var("HOME", v),
+                None => std::env::remove_var("HOME"),
+            }
+            match prev_profile {
+                Some(v) => std::env::set_var("USERPROFILE", v),
+                None => std::env::remove_var("USERPROFILE"),
+            }
+            let context = format!("{shape} UV_PROJECT_ENVIRONMENT={uv_env:?} {mode:?}");
+            assert_eq!(code, 0, "{context}");
+            assert_not_discovered(&batch_bodies(&server).await, "pkg:pypi/system-decoy@6.6.6");
+        }
+    }
+}
+
 /// #525: uv syncs into `UV_PROJECT_ENVIRONMENT`, absolute or relative to the
 /// project, and ignores an activated `VIRTUAL_ENV` for project commands.
 #[tokio::test]

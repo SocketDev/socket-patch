@@ -1742,7 +1742,11 @@ type LockRefusals = HashMap<String, (&'static str, String)>;
 /// refusal and the ledger's idempotency skip, which take precedence in the
 /// fetch loop. A purl the lockfiles pin hosted is left to the vendor loop:
 /// its takeover restores the upstream lock entry first, and the restore
-/// rewrites the very text the gates read.
+/// rewrites the very text the gates read. The one exception is a hosted
+/// gem the takeover would refuse ([`gem_takeover_refusals_for`]), which
+/// is refused here with the takeover's code instead of after its fetch.
+///
+/// [`gem_takeover_refusals_for`]: crate::commands::vendor::gem_takeover_refusals_for
 ///
 /// Only a package the vendor loop would hand to its backend is refused
 /// here (see [`crate::commands::vendor::lock_refusals_reaching_backend`]):
@@ -1759,44 +1763,65 @@ async fn lock_text_refusals_for(
     prior: Option<&crate::ecosystem_dispatch::NpmCrawlSnapshot>,
 ) -> LockRefusals {
     let cwd = params.cwd.as_path();
-    let claimed: Vec<String> = socket_patch_core::patch::redirect::upstream::HostedPin::all(
+    let origins: Vec<String> = params
+        .patch_server_url
+        .iter()
+        .filter(|url| !url.trim().is_empty())
+        .cloned()
+        .collect();
+    let pins = socket_patch_core::patch::redirect::upstream::HostedPin::all(
         &socket_patch_core::vex::discover_patched_refs_with(
             cwd,
             &socket_patch_core::vex::DiscoverOptions {
-                patch_server_origins: params
-                    .patch_server_url
-                    .iter()
-                    .filter(|url| !url.trim().is_empty())
-                    .cloned()
-                    .collect(),
+                patch_server_origins: origins.clone(),
             },
         )
         .await,
-    )
-    .into_iter()
-    .map(|pin| canonical_purl(&pin.purl))
-    .collect();
-    let candidates: Vec<(&str, &str)> = selected
+    );
+    let claimed: Vec<String> = pins.iter().map(|pin| canonical_purl(&pin.purl)).collect();
+    let fetchable: Vec<&PatchSearchResult> = selected
         .iter()
         .filter(|sr| bun_refusal.filter(|r| r.applies_to(&sr.purl)).is_none())
         .filter(|sr| {
             detached_ledger_record(RecordStore::Ledger(&ledger.entries), &sr.purl, &sr.uuid)
                 .is_none()
         })
+        .collect();
+    let candidates: Vec<(&str, &str)> = fetchable
+        .iter()
         .filter(|sr| !claimed.contains(&canonical_purl(&sr.purl)))
         .map(|sr| (sr.purl.as_str(), sr.uuid.as_str()))
         .collect();
     let refused = socket_patch_core::vendor::lock_text_refusals(cwd, &candidates).await;
     let options = params.crawler_options();
-    crate::commands::vendor::lock_refusals_reaching_backend(
-        cwd,
-        refused,
-        &ledger.entries,
-        |purls| async move {
-            crate::commands::vendor::installed_purls(&options, &purls, prior).await
-        },
-    )
-    .await
+    let mut refusals =
+        crate::commands::vendor::lock_refusals_reaching_backend(
+            cwd,
+            refused,
+            &ledger.entries,
+            |purls| async move {
+                crate::commands::vendor::installed_purls(&options, &purls, prior).await
+            },
+        )
+        .await;
+    // A hosted gem the takeover will refuse (#775) is refused here too, so
+    // its view is never fetched for a package the run cannot vendor. The
+    // download phase only runs online (`--offline` refuses `get` and `scan`
+    // before it), so the dry-run restore may resolve the registry entry.
+    refusals.extend(
+        crate::commands::vendor::gem_takeover_refusals_for(
+            cwd,
+            fetchable
+                .iter()
+                .filter(|sr| claimed.contains(&canonical_purl(&sr.purl)))
+                .map(|sr| sr.purl.as_str()),
+            &pins,
+            false,
+            origins,
+        )
+        .await,
+    );
+    refusals
 }
 
 /// The record a detached ledger entry already carries for `purl` at
@@ -3758,7 +3783,12 @@ async fn run_get_vendored(
     // Dry run: ledger-classification preview only (scan's posture) — no
     // download, no vendor step, no writes.
     if args.common.dry_run {
-        let preview = super::scan::preview_vendor_json(&args.common.cwd, selected).await;
+        let takeover = super::vendor::gem_takeover_preview_refusals(
+            &args.common,
+            selected.iter().map(|p| p.purl.as_str()),
+        )
+        .await;
+        let preview = super::scan::preview_vendor_json(&args.common.cwd, selected, &takeover).await;
         if args.common.json {
             let mut result = serde_json::json!({
                 "status": "success",
