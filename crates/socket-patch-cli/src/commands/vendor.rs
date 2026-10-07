@@ -278,6 +278,56 @@ pub(crate) async fn dispatch_revert_one_opts(
     }
 }
 
+/// The `vendor --check` failure for a ledger entry the liveness rule
+/// ([`Discovery::vendor_entry_live`]) calls dead, naming WHY so the remedy
+/// works:
+///
+/// * another lock contests the wiring (`package-lock.json` resolving the
+///   same version from the registry beside a wired `yarn.lock`): name both
+///   locks; re-vendoring changes nothing;
+/// * the dependency left the lock (upgraded or uninstalled): the in-use
+///   probe the prune GC reverts by says so and no lock resolves the
+///   package any more, so `scan --prune` is the fix, as `scan`'s own
+///   `vendor_ledger_entry_unwired` hint says;
+/// * otherwise a relock dropped the reference while the package stayed.
+async fn unwired_check_failure(
+    discovery: &socket_patch_core::vex::discover::Discovery,
+    root: &Path,
+    key: &str,
+    entry: &VendorEntry,
+) -> String {
+    let dir = format!(".socket/vendor/{}/{}", entry.ecosystem, entry.uuid);
+    if let Some(c) = discovery.vendored_contest(&entry.base_purl, &entry.uuid) {
+        return format!(
+            "wiring contested: {} wires {dir}, but {} resolves the same version from \
+             elsewhere (not a Socket patch), so an install driven by {} gets the unpatched \
+             package; delete whichever of the two locks the project does not install from \
+             (re-vendoring changes nothing while both resolve it)",
+            c.file.display(),
+            c.other.display(),
+            c.other.display(),
+        );
+    }
+    // Only the npm-family and Python extractors record every lock entry
+    // (`resolved_elsewhere`), so only there does "no lock resolves it"
+    // prove the dependency is gone rather than unreadable.
+    if matches!(entry.ecosystem.as_str(), "npm" | "pypi")
+        && !discovery.resolves_package(&entry.base_purl)
+        && dispatch_in_use_one(entry, root).await == Some(false)
+    {
+        return format!(
+            "dependency removed: no lockfile resolves {} any more (it was upgraded or \
+             uninstalled), so nothing installs {dir}; run `socket-patch scan --mode vendored \
+             --prune` to revert the vendored entry",
+            strip_purl_qualifiers(key)
+        );
+    }
+    format!(
+        "wiring missing: no lockfile or config references {dir} any more, so a fresh install \
+         gets the unpatched package; re-run `socket-patch vendor` to rewire it"
+    )
+}
+
 /// Is this vendored entry still consumed by its project's lockfile
 /// dependency graph? `None` = cannot determine — callers must keep the
 /// entry (fail-safe): ecosystems other than npm, cargo and pypi (whose
@@ -1039,10 +1089,7 @@ async fn run_check(args: &VendorArgs) -> i32 {
             // intact; a fresh install is then unpatched. Same rule as
             // `vex`'s `vendor_unwired`.
             if !discovery.vendor_entry_live(root, entry).await {
-                failure = Some(format!(
-                    "wiring missing: no lockfile or config references .socket/vendor/{}/{} any more, so a fresh install gets the unpatched package; re-run `socket-patch vendor` to rewire it",
-                    entry.ecosystem, entry.uuid
-                ));
+                failure = Some(unwired_check_failure(discovery, root, key, entry).await);
             }
         }
         if vendor::jvm::apply::upstream_unverified(entry) {
