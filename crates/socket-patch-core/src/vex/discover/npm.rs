@@ -470,7 +470,12 @@ fn entry_ref(
     out: &mut Discovery,
 ) {
     let name = node.name;
-    read.mention(name, node.version);
+    // Built once: every entry is mentioned, and a registry entry (nearly
+    // all of them) is also recorded as resolved elsewhere.
+    let purl = node.version.and_then(|v| npm_purl(name, v));
+    if let Some(purl) = &purl {
+        read.mentioned.insert(purl.clone());
+    }
     let resolved = node.resolved;
     let Located {
         vendored,
@@ -497,7 +502,7 @@ fn entry_ref(
         // A registry / git / tarball dependency: not ours. Remembered so a
         // sibling lock's Socket wiring for the same package is contested
         // (the npm pair here, any other lock by the orchestrator).
-        if let Some(purl) = node.version.and_then(|v| npm_purl(name, v)) {
+        if let Some(purl) = purl {
             out.resolved_elsewhere(file, Some(purl.clone()));
             read.unwired
                 .entry(purl)

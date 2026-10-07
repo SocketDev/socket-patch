@@ -1264,15 +1264,10 @@ pub(crate) async fn run_redirect_selected(
     // Classified over the lockfiles as this run left them and the vendored
     // ledger as the takeover left it.
     let mut takeover_warnings: Vec<serde_json::Value> = Vec::new();
-    let hosted_now = crate::commands::hosted_state_from_lockfiles(common, &common.cwd).await;
-    let superseded = super::classify_overlap_takeover_with(
-        common,
-        &common.cwd,
-        Some(&hosted_now),
-        vendor_state.as_ref().ok(),
-    )
-    .await
-    .redirect;
+    let superseded =
+        super::classify_overlap_takeover_with(common, &common.cwd, vendor_state.as_ref().ok())
+            .await
+            .redirect;
     if !superseded.is_empty() {
         takeover_warnings.push(serde_json::json!({
             "code": super::REDIRECT_SUPERSEDES_VENDORED,

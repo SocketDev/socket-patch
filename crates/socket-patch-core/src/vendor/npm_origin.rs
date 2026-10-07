@@ -484,10 +484,10 @@ fn resolved_is_non_registry(resolved: &str) -> bool {
         return true;
     }
     match resolved.strip_prefix("file:") {
-        Some(path) => {
-            let path = path.trim_start_matches("./");
-            !path.starts_with(&format!("{SOCKET_DIR}/vendor/"))
-        }
+        Some(path) => !path
+            .trim_start_matches("./")
+            .strip_prefix(SOCKET_DIR)
+            .is_some_and(|rest| rest.starts_with("/vendor/")),
         None => false,
     }
 }
@@ -515,8 +515,11 @@ pub(crate) fn npm_spec_is_registry(spec: &str) -> bool {
     if spec.starts_with('.') {
         return false;
     }
-    let lower = spec.to_ascii_lowercase();
-    !(lower.ends_with(".tgz") || lower.ends_with(".tar.gz") || lower.ends_with(".tar"))
+    let has_suffix = |suffix: &str| {
+        spec.len() >= suffix.len()
+            && spec.as_bytes()[spec.len() - suffix.len()..].eq_ignore_ascii_case(suffix.as_bytes())
+    };
+    !(has_suffix(".tgz") || has_suffix(".tar.gz") || has_suffix(".tar"))
 }
 
 #[cfg(test)]
@@ -604,6 +607,9 @@ mod tests {
             "/abs/left-pad",
             "~/left-pad",
             "left-pad-1.3.0.tgz",
+            "left-pad-1.3.0.TGZ",
+            "left-pad-1.3.0.Tar.Gz",
+            "left-pad-1.3.0.tar",
             "C:\\pkgs\\left-pad.tgz",
             "npm:left-pad@github:stevemao/left-pad",
         ] {
@@ -611,6 +617,29 @@ mod tests {
                 !npm_spec_is_registry(spec),
                 "{spec:?} is not a registry spec"
             );
+        }
+    }
+
+    /// socket-patch's own vendored wiring (with or without `./`) is not a
+    /// local source; any other `file:` path, git and git hosts are.
+    #[test]
+    fn non_registry_resolved_spares_only_socket_vendor_paths() {
+        for resolved in [
+            "file:.socket/vendor/npm/u/left-pad-1.3.0.tgz",
+            "file:./.socket/vendor/npm/u/left-pad-1.3.0.tgz",
+            "https://registry.npmjs.org/left-pad/-/left-pad-1.3.0.tgz",
+        ] {
+            assert!(!resolved_is_non_registry(resolved), "{resolved:?}");
+        }
+        for resolved in [
+            "file:.socketx/vendor/left-pad-1.3.0.tgz",
+            "file:.socket/vendorx/left-pad-1.3.0.tgz",
+            "file:.socket",
+            "file:../left-pad",
+            "git+ssh://git@github.com/stevemao/left-pad.git#ff8e7ba",
+            "github:stevemao/left-pad",
+        ] {
+            assert!(resolved_is_non_registry(resolved), "{resolved:?}");
         }
     }
 

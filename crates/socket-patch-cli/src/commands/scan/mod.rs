@@ -905,7 +905,7 @@ pub(super) const REDIRECT_PRUNE_IGNORED_DETAIL: &str =
      `scan --mode vendored --prune` to garbage-collect";
 
 /// The PURLs claimed by BOTH a hosted pin (`redirect`, the lockfiles'
-/// hosted state — see [`crate::commands::hosted_state_from_lockfiles`]) and
+/// hosted state — see [`crate::commands::hosted_state_from_pins`]) and
 /// the vendored state ledger (`.socket/vendor/state.json`), sorted. A
 /// non-empty result means one of the two is stale for each PURL (a
 /// lockfile entry can point only one way). `None`, an empty vendor ledger,
@@ -951,25 +951,34 @@ pub(super) async fn classify_overlap_takeover(common: &GlobalArgs, cwd: &Path) -
     // A malformed vendor ledger classifies like a missing one (this path
     // only feeds takeover warnings; corruption is a hard error on the
     // write/attest paths).
-    let redirect = crate::commands::hosted_state_from_lockfiles(common, cwd).await;
     let vendor = socket_patch_core::vendor::load_state(cwd).await.ok();
-    classify_overlap_takeover_with(common, cwd, Some(&redirect), vendor.as_ref()).await
+    classify_overlap_takeover_with(common, cwd, vendor.as_ref()).await
 }
 
-/// [`classify_overlap_takeover`] over already-loaded state (the hosted
-/// engine classifies against its post-takeover vendor ledger); still reads
-/// the LIVE lockfiles in `cwd`. `None` for either yields no overlap.
+/// [`classify_overlap_takeover`] against an already-loaded vendored ledger
+/// (the hosted engine classifies against its post-takeover ledger); the
+/// hosted side is the LIVE lockfiles' pins in `cwd`. `None` or an empty
+/// ledger yields no overlap.
+///
+/// The lockfiles are discovered at most once, and not at all without a
+/// vendored entry to overlap: discovery re-walks every lockfile of the
+/// project, which is a real share of a hosted scan's time (#993), and a
+/// project that never vendored (the hosted common case) has nothing for
+/// it to decide.
 pub(super) async fn classify_overlap_takeover_with(
     common: &GlobalArgs,
     cwd: &Path,
-    redirect: Option<&socket_patch_core::patch::redirect::RedirectState>,
     vendor: Option<&VendorState>,
 ) -> OverlapTakeover {
     let mut out = OverlapTakeover::default();
-    let Some(vendor) = vendor else {
+    let Some(vendor) = vendor.filter(|v| !v.entries.is_empty()) else {
         return out;
     };
-    let overlap = overlap_from_states(redirect, vendor);
+    let discovery = crate::commands::discover_wiring(common, cwd).await;
+    let redirect = crate::commands::hosted_state_from_pins(
+        &socket_patch_core::patch::redirect::upstream::HostedPin::all(&discovery),
+    );
+    let overlap = overlap_from_states(Some(&redirect), vendor);
     if overlap.is_empty() {
         return out;
     }
@@ -987,15 +996,14 @@ pub(super) async fn classify_overlap_takeover_with(
             .or_insert(entry);
     }
     // Each hosted pin's patch uuid (embedded in every hosted artifact URL,
-    // whatever the host). A non-empty overlap proves `redirect` is `Some`.
+    // whatever the host).
     let mut redirect_uuid_by_purl: std::collections::HashMap<String, &str> =
         std::collections::HashMap::new();
-    for (key, record) in redirect.iter().flat_map(|r| &r.records) {
+    for (key, record) in &redirect.records {
         redirect_uuid_by_purl
             .entry(canon(key))
             .or_insert(record.uuid.as_str());
     }
-    let discovery = crate::commands::discover_wiring(common, cwd).await;
     let mut liveness = LedgerLiveness::new(cwd, &discovery, None);
     for purl in overlap {
         let hosted_live = match redirect_uuid_by_purl.get(&purl) {
@@ -1317,7 +1325,7 @@ async fn gradle_scan(
 
 /// The scanned purls whose HOSTED redirect wiring is still live: a hosted
 /// pin names the purl (`redirect_state`, the lockfiles' hosted state — see
-/// [`crate::commands::hosted_state_from_lockfiles`]) AND lockfile discovery
+/// [`crate::commands::hosted_state_from_pins`]) AND lockfile discovery
 /// proves the current lockfile still routes it to that hosted patch — core
 /// `Discovery::redirect_record_live`, the same liveness rule `vex` gates
 /// hosted attestations on.
@@ -4409,6 +4417,38 @@ mod tests {
             vec!["pkg:npm/minimist@1.2.2".to_string()]
         );
         assert!(takeover.vendored.is_empty(), "{takeover:?}");
+    }
+
+    /// The takeover classifier runs after every hosted rewrite, so it must
+    /// not re-walk the lockfiles when no vendored ledger entry could
+    /// overlap (the hosted common case), and walks them once otherwise
+    /// (#993: it used to discover twice — once for the hosted pins, once
+    /// for liveness — and even with no vendored ledger at all).
+    #[tokio::test]
+    async fn takeover_classifier_discovers_at_most_once() {
+        let discoveries = || crate::commands::DISCOVERIES.with(|n| n.get());
+        let tmp = tempfile::tempdir().unwrap();
+        let root = tmp.path();
+        write_lock_pointing_at_hosted(root, "minimist", "1.2.2").await;
+
+        for vendor in [None, Some(VendorState::new())] {
+            let before = discoveries();
+            assert_eq!(
+                classify_overlap_takeover_with(&common_at(root), root, vendor.as_ref()).await,
+                OverlapTakeover::default()
+            );
+            assert_eq!(discoveries(), before, "no vendored entry, no discovery");
+        }
+
+        write_vendor_ledger_wired(root, &["pkg:npm/minimist@1.2.2"]).await;
+        let vendor = socket_patch_core::vendor::load_state(root).await.unwrap();
+        let before = discoveries();
+        let takeover = classify_overlap_takeover_with(&common_at(root), root, Some(&vendor)).await;
+        assert_eq!(discoveries(), before + 1, "one discovery serves both sides");
+        assert_eq!(
+            takeover.redirect,
+            vec!["pkg:npm/minimist@1.2.2".to_string()]
+        );
     }
 
     #[tokio::test]

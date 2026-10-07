@@ -600,15 +600,17 @@ impl Discovery {
     /// package managers that keep several lockfiles side by side (npm,
     /// pnpm, yarn, bun; uv, pylock, poetry, pdm, Pipfile, requirements)
     /// call it for every such entry with exact coordinates.
+    ///
+    /// Duplicates are kept until [`Discovery::finalize`] sorts and dedups
+    /// the list: a membership check here made recording quadratic in the
+    /// lock's size (#993), and every reader before then only asks whether
+    /// some entry matches.
     pub(crate) fn resolved_elsewhere(&mut self, file: &str, purl: Option<String>) {
         let Some(purl) = purl else { return };
-        let entry = ResolvedElsewhere {
+        self.elsewhere.push(ResolvedElsewhere {
             purl: canonical_base_purl(&purl),
             file: PathBuf::from(file),
-        };
-        if !self.elsewhere.contains(&entry) {
-            self.elsewhere.push(entry);
-        }
+        });
     }
 
     /// Drop every ref that ANOTHER lock contests: a lock that resolves the
