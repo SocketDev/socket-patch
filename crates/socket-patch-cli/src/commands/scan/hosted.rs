@@ -3381,8 +3381,8 @@ mod tests {
 
     /// Probe invocation with the default surface (project-local discovery,
     /// no artifact shas) — tests override the knobs they exercise.
-    /// `records` is the merged map production hands over (this run's
-    /// fetched records plus the ledger's persisted ones).
+    /// `records` is the map production hands over: this run's fetched
+    /// records, by uuid.
     async fn probe(
         cwd: &std::path::Path,
         confirmed: &[(String, String)],
@@ -3711,25 +3711,22 @@ mod tests {
         );
     }
 
-    /// RE-FIRE guarantee: when this run's record fetch failed (no fresh
-    /// records), the merged map the caller hands over still carries the
-    /// redirect ledger's PERSISTED record under whatever purl key the
-    /// ledger used — and the probe's uuid lookup judges from it, so a
-    /// transient /patches/view failure cannot silently retire the warning
-    /// while the stale materialization is still there.
+    /// The probe links a record to a confirmed purl by uuid alone: a
+    /// record keyed under the API's qualified purl spelling (not the
+    /// confirmed purl) must still judge the stale materialization.
     #[tokio::test]
-    async fn gem_stale_probe_judges_from_persisted_ledger_records() {
+    async fn gem_stale_probe_matches_records_by_uuid_not_purl_key() {
         let stale = tempfile::tempdir().unwrap();
         materialize_gem(stale.path(), GEM_UPSTREAM);
-        // Persisted under the API's qualified spelling, not the confirmed
+        // Keyed under the API's qualified spelling, not the confirmed
         // purl: only the uuid links them.
-        let mut ledger_only = std::collections::BTreeMap::new();
-        ledger_only.insert(format!("{GEM_PURL}?platform=ruby"), gem_record());
-        let out = probe(stale.path(), &one_confirmed(), &ledger_only).await;
+        let mut qualified = std::collections::BTreeMap::new();
+        qualified.insert(format!("{GEM_PURL}?platform=ruby"), gem_record());
+        let out = probe(stale.path(), &one_confirmed(), &qualified).await;
         assert_eq!(
             out.warnings.len(),
             1,
-            "the ledger records must keep the warning firing across flaky fetches"
+            "a record keyed under another purl spelling must still match by uuid"
         );
     }
 
