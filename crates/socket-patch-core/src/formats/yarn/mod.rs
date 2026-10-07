@@ -9,6 +9,7 @@
 //! rewriters and lockfile discovery cannot disagree on it.
 
 pub(crate) mod berry_entry;
+pub mod berry_gates;
 
 use super::text::strip_bom;
 

@@ -111,8 +111,9 @@ The backticked slug in each row is the value `-e`/`--ecosystems` accepts (e.g.
   is e2e-covered; PnP is untested for hosted — the lock rewrite fires, but PnP's
   `.yarn/cache` resolution isn't exercised. CRLF locks — what yarn writes on Windows,
   and what a `core.autocrlf` checkout produces anywhere — are rewritten in their own
-  line ending (a BOM is kept); a lock mixing CRLF and LF is refused
-  (`redirect_yarn_berry_mixed_line_endings`) until `yarn install` normalizes it. See
+  line ending (a BOM is kept); a lock or root `package.json` mixing CRLF and LF is
+  refused (`redirect_yarn_berry_mixed_line_endings`, the same decision vendored mode
+  takes) until `yarn install` normalizes it. See
   [yarn berry compatibility](testing/yarn-berry-compatibility.md).
 - **yarn `npm:` aliases (classic & berry)** — a lock entry that consumes the patched
   package only through an alias descriptor (`"safe-pad@npm:left-pad@^1.3.0"`) is left
