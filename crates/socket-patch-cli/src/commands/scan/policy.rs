@@ -87,7 +87,11 @@ pub(crate) fn dir_markers(dir: &Path) -> Vec<String> {
         })
         .unwrap_or_default();
     if markers.is_empty() {
-        // No lockfile: the manifests say what the project is.
+        // No lockfile: the manifests say what the project is. Every name
+        // here, JVM build files included, must be a regular file: the
+        // root-marker report lists files, so it deliberately keeps
+        // `is_file` rather than `layout::marker_present` (which lets a
+        // directory named like a build file mark a JVM build).
         markers = MANIFEST_MARKERS
             .iter()
             .chain(socket_patch_core::vendor::jvm::layout::JVM_PROJECT_MARKERS)

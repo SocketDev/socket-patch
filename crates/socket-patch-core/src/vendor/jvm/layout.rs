@@ -223,8 +223,15 @@ pub const GRADLE_ROOT_FILES: &[&str] = &[
     "build.gradle",
     "build.gradle.kts",
 ];
-/// Gradle's settings scripts.
+/// Gradle's settings scripts: Groovy, then Kotlin (indexed by
+/// `usize::from(kotlin)`).
 pub const GRADLE_SETTINGS_FILES: &[&str] = &[GRADLE_ROOT_FILES[0], GRADLE_ROOT_FILES[1]];
+/// Whether a `/`-separated path names a Gradle settings script (by its
+/// basename, at any depth).
+pub fn is_gradle_settings(rel: &str) -> bool {
+    let name = rel.rsplit('/').next().unwrap_or(rel);
+    GRADLE_SETTINGS_FILES.contains(&name)
+}
 /// Gradle's build scripts.
 pub const GRADLE_BUILD_FILES: &[&str] = &[GRADLE_ROOT_FILES[2], GRADLE_ROOT_FILES[3]];
 /// Mill's build files.
@@ -300,8 +307,11 @@ impl BuildTool {
     }
 }
 
-/// The one stat rule every disk-side marker check applies: the path
+/// The one stat rule every disk-side build-marker check applies: the path
 /// exists, following symlinks (a file, or for `.scala-build` a directory).
+/// So a directory named like a build file counts, and a dangling symlink
+/// does not. (`scan`'s policy root markers keep `is_file`, the rule they
+/// share with the non-JVM manifests they are listed beside.)
 pub fn marker_present(dir: &Path, rel: &str) -> bool {
     std::fs::metadata(dir.join(rel)).is_ok()
 }
@@ -497,6 +507,69 @@ mod tests {
                     "{marker}"
                 );
             }
+        }
+    }
+
+    #[test]
+    fn gradle_settings_names() {
+        assert_eq!(
+            GRADLE_SETTINGS_FILES,
+            &["settings.gradle", "settings.gradle.kts"]
+        );
+        assert!(is_gradle_settings("settings.gradle"));
+        assert!(is_gradle_settings("sub/dir/settings.gradle.kts"));
+        assert!(!is_gradle_settings("build.gradle"));
+        assert!(!is_gradle_settings("settings.gradle/x"));
+        assert!(!is_gradle_settings("my-settings.gradle"));
+    }
+
+    /// The tree-relative constants each backend spells as a literal must
+    /// sit under the tree constant they belong to, so moving a tree root
+    /// fails here rather than drifting.
+    #[test]
+    fn tree_relative_constants_sit_under_their_tree() {
+        use super::super::{coursier_tree, gradle, maven_reactor, sbt, scala_cli};
+        let under = |rel: &str, tree: &str| {
+            assert!(
+                rel.strip_prefix(tree).is_some_and(|r| r.starts_with('/')),
+                "{rel} is not under {tree}"
+            )
+        };
+        under(maven_reactor::GITATTRIBUTES_REL, MAVEN2_TREE);
+        under(sbt::TREE_GITIGNORE_REL, MAVEN2_TREE);
+        under(gradle::GITATTRIBUTES_REL, GRADLE_TREE);
+        under(coursier_tree::GITIGNORE_REL, COURSIER_TREE);
+        under(coursier_tree::GITATTRIBUTES_REL, COURSIER_TREE);
+        under(scala_cli::GUARD_REL, COURSIER_TREE);
+        assert!(scala_cli::ROOT_BYTES.contains(scala_cli::GUARD_REL));
+        assert!(maven_reactor::TAIL_DIR.ends_with(&format!("/{MAVEN2_TREE}")));
+        assert!(maven_reactor::REPO_URL.ends_with(&format!("/{MAVEN2_TREE}")));
+        for index in [gradle::INDEX_REL, coursier_tree::INDEX_REL] {
+            under(index, ".socket/vendor");
+        }
+        assert_eq!(
+            gradle::VENDOR_GITATTRIBUTES_REL,
+            ".socket/vendor/.gitattributes"
+        );
+    }
+
+    /// Pins the edges of the one marker stat rule: a directory named like
+    /// a build file counts, a dangling symlink does not.
+    #[test]
+    fn marker_present_edges() {
+        let tmp = tempfile::tempdir().unwrap();
+        let dir = tmp.path();
+        std::fs::create_dir(dir.join("build.gradle")).unwrap();
+        assert!(marker_present(dir, "build.gradle"));
+        assert!(has_build(dir, BuildTool::Gradle));
+        std::fs::create_dir(dir.join(SCALA_CLI_DIR)).unwrap();
+        assert!(has_build(dir, BuildTool::ScalaCli));
+        assert!(!marker_present(dir, POM_FILE));
+        #[cfg(unix)]
+        {
+            std::os::unix::fs::symlink(dir.join("missing"), dir.join(POM_FILE)).unwrap();
+            assert!(!marker_present(dir, POM_FILE));
+            assert!(!has_build(dir, BuildTool::Maven));
         }
     }
 }

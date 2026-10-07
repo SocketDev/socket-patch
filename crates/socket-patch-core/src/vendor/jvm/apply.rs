@@ -80,13 +80,6 @@ fn safe_rel(rel: &str) -> bool {
             .all(|s| !s.is_empty() && s != "." && s != ".." && !s.eq_ignore_ascii_case(".git"))
 }
 
-fn is_settings_file(rel: &str) -> bool {
-    matches!(
-        rel.rsplit('/').next(),
-        Some("settings.gradle" | "settings.gradle.kts")
-    )
-}
-
 /// A text file some planner edits or owns.
 fn is_wiring_file(rel: &str) -> bool {
     let under_owned = rel.starts_with(".socket/") || rel.starts_with(".mvn/");
@@ -95,7 +88,7 @@ fn is_wiring_file(rel: &str) -> bool {
         || gradle::is_derived_metadata_path(rel)
         || sbt::is_wiring_file(rel)
         || scala_cli::is_wiring_file(rel)
-        || (!under_owned && (rel.ends_with(".xml") || is_settings_file(rel)))
+        || (!under_owned && (rel.ends_with(".xml") || layout::is_gradle_settings(rel)))
 }
 
 fn is_owned_file(rel: &str) -> bool {
@@ -141,7 +134,9 @@ fn record_allowed(w: &WiringRecord, c: &Coords<'_>) -> bool {
                 rel.ends_with(".xml") && !rel.starts_with(".socket/") && !rel.starts_with(".mvn/")
             }
             CONFIG_LINE_KIND => rel == maven_reactor::MAVEN_CONFIG,
-            SETTINGS_FRAGMENT_KIND => is_settings_file(rel) && !rel.starts_with(".socket/"),
+            SETTINGS_FRAGMENT_KIND => {
+                layout::is_gradle_settings(rel) && !rel.starts_with(".socket/")
+            }
             VERIFICATION_FRAGMENT_KIND => rel == gradle::VERIFICATION_REL,
             OWNED_FILE_KIND => is_owned_file(rel),
             DERIVED_METADATA_KIND => rel == gradle::derived_metadata_rel(c.group_id, c.artifact_id),

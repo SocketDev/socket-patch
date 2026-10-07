@@ -28,7 +28,7 @@ pub const GITATTRIBUTES_REL: &str = ".socket/vendor/maven2/.gitattributes";
 const OFFLINE_LINE: &str = "-Daether.offline.protocols=file";
 const OFFLINE_KEY: &str = "-Daether.offline.protocols=";
 const TAIL_KEY: &str = "-Dmaven.repo.local.tail=";
-const TAIL_DIR: &str = "${session.rootDirectory}/.socket/vendor/maven2";
+pub(crate) const TAIL_DIR: &str = "${session.rootDirectory}/.socket/vendor/maven2";
 pub const REPO_ID: &str = "socket-patch-vendor";
 pub const REPO_URL: &str = "file://${maven.multiModuleProjectDirectory}/.socket/vendor/maven2";
 pub(crate) const BEGIN_MARKER: &str = "<!-- socket-patch:begin -->";

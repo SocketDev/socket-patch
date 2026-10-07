@@ -907,7 +907,7 @@ pub fn unplan(read: ReadFn<'_>, c: &Coords<'_>, records: &[WiringRecord]) -> Jvm
     let in_block_key = format!("in_block:{}:{}:{}", c.group_id, c.artifact_id, c.version);
     for (rel, text) in after.iter_mut() {
         let Some(t) = text.as_mut() else { continue };
-        if !is_settings_file(rel) {
+        if !layout::is_gradle_settings(rel) {
             continue;
         }
         let dir = rel.rsplit_once('/').map_or("", |(d, _)| d);
@@ -1036,7 +1036,7 @@ pub fn unplan(read: ReadFn<'_>, c: &Coords<'_>, records: &[WiringRecord]) -> Jvm
     if others.is_empty() {
         after.insert(INDEX_REL.to_string(), None);
         for (rel, text) in after.iter_mut() {
-            if !is_settings_file(rel) {
+            if !layout::is_gradle_settings(rel) {
                 continue;
             }
             for w in recs(rel)
@@ -1179,16 +1179,14 @@ pub fn references(read: ReadFn<'_>, c: &Coords<'_>) -> bool {
             })
         });
     let wiring = WiringTarget::vendored();
-    let applied = ["settings.gradle", "settings.gradle.kts"]
-        .iter()
-        .any(|rel| {
-            read(rel)
-                .and_then(|b| String::from_utf8(b).ok())
-                .is_some_and(|text| {
-                    let dsl = dsl::dsl_of(rel).unwrap_or(Dsl::Groovy);
-                    has_apply_line(&text, dsl, &wiring, "")
-                })
-        });
+    let applied = layout::GRADLE_SETTINGS_FILES.iter().any(|rel| {
+        read(rel)
+            .and_then(|b| String::from_utf8(b).ok())
+            .is_some_and(|text| {
+                let dsl = dsl::dsl_of(rel).unwrap_or(Dsl::Groovy);
+                has_apply_line(&text, dsl, &wiring, "")
+            })
+    });
     indexed && applied
 }
 
@@ -1246,11 +1244,6 @@ pub fn wired_checked(
         }
     }
     Ok(wired(read, list, c))
-}
-
-fn is_settings_file(rel: &str) -> bool {
-    let name = rel.rsplit('/').next().unwrap_or(rel);
-    name == "settings.gradle" || name == "settings.gradle.kts"
 }
 
 /// `text` without its first whole line whose trimmed body is `line`.
@@ -1399,14 +1392,7 @@ pub(crate) fn settings_target(
     };
     Ok(Target {
         dir: dir.to_string(),
-        rel: join_rel(
-            dir,
-            if kotlin {
-                "settings.gradle.kts"
-            } else {
-                "settings.gradle"
-            },
-        ),
+        rel: join_rel(dir, layout::GRADLE_SETTINGS_FILES[usize::from(kotlin)]),
         text: None,
         kotlin,
     })

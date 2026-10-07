@@ -751,8 +751,9 @@ pub(super) fn not_build_root(project_root: &Path) -> Option<String> {
         }
         let read_text = |p: &str| crate::gradle::dsl::decode(&reader.read(p)?);
         // Gradle reads the Groovy settings first.
-        let settings = ["settings.gradle", "settings.gradle.kts"]
-            .into_iter()
+        let settings = layout::GRADLE_SETTINGS_FILES
+            .iter()
+            .copied()
             .find(|f| reader.read(f).is_some());
         // Only a Gradle project can belong to an ancestor Gradle build.
         if let Some(settings) = settings.filter(|_| own_build || own_settings) {

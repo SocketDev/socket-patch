@@ -2633,7 +2633,8 @@ fn created_settings_over_existing(
         .keys()
         .filter(|rel| {
             let base = rel.rsplit('/').next().unwrap_or(rel);
-            (matches!(base, "settings.gradle" | "settings.gradle.kts") || base == SBT_HOSTED_FILE)
+            (socket_patch_core::vendor::jvm::layout::is_gradle_settings(rel)
+                || base == SBT_HOSTED_FILE)
                 && !done.files.contains_key(rel.as_str())
         })
         .find(|rel| std::fs::symlink_metadata(cwd.join(rel)).is_ok())

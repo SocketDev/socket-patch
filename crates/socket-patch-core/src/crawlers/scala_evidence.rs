@@ -159,7 +159,10 @@ pub fn resolution_of(projects: &[(String, BloopProject)]) -> JvmResolution {
 /// The evidence under `root`, `None` when there is none.
 pub fn discover(root: &Path) -> Option<ScalaEvidence> {
     let dir = root.join(BLOOP_DIR);
-    for d in [root.join(".scala-build"), dir.clone()] {
+    for d in [
+        root.join(crate::vendor::jvm::layout::SCALA_CLI_DIR),
+        dir.clone(),
+    ] {
         match std::fs::symlink_metadata(&d) {
             Ok(m) if m.is_dir() => {}
             Ok(_) => {
