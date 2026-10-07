@@ -25,6 +25,7 @@ use super::common::{
     already_patched_result, done, prune_empty_vendor_levels, refused, service_offline_conflict,
 };
 use super::path::vendor_uuid_dir_rel;
+use super::pypi_distribution::wheel_platform_from_filename;
 use super::pypi_pdm::{PdmProject, PdmTarget};
 use super::pypi_pipenv::{PipenvProject, PipenvTarget};
 use super::pypi_poetry::{PoetryProject, PoetryTarget};
@@ -1977,35 +1978,12 @@ async fn try_pypi_service_wheel(
     }))
 }
 
-fn wheel_platform_from_filename(wheel_name: &str) -> (bool, String) {
-    let stem = wheel_name.strip_suffix(".whl").unwrap_or(wheel_name);
-    let parts: Vec<&str> = stem.split('-').collect();
-    if parts.len() >= 3 {
-        let triple = parts[parts.len() - 3..].join("-");
-        (tag_is_platform_specific(&triple), triple)
-    } else {
-        // Unparseable → cannot prove portability.
-        (true, stem.to_string())
-    }
-}
-
-/// Platform-specific iff the tag triple binds an ABI or platform — `cp311-
-/// none-any` is merely version-bound, `*-cp311-*` / `*-manylinux*` lock the
-/// artifact to this machine's platform.
-fn tag_is_platform_specific(tag: &str) -> bool {
-    let parts: Vec<&str> = tag.split('-').collect();
-    match parts.as_slice() {
-        [_py, abi, plat] => *abi != "none" || *plat != "any",
-        // Malformed tags can't prove portability — claim platform-locked.
-        _ => true,
-    }
-}
-
 #[cfg(test)]
 mod tests {
     use super::*;
     use crate::hash::git_sha256::compute_git_sha256_from_bytes;
     use crate::manifest::schema::PatchFileInfo;
+    use crate::vendor::pypi_distribution::tag_is_platform_specific;
     use crate::vendor::state::VENDOR_MARKER_FILE;
     use std::collections::HashMap;
     use std::path::PathBuf;
