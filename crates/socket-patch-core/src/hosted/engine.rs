@@ -37,6 +37,7 @@ use crate::patch::redirect::{
     artifact_url_spellings, rewrite_registry_redirect_withholding_vlt, DepOverride, FileEdit,
     RewriteResult, RewriteWarning,
 };
+use crate::utils::pnpm_workspace::governing_workspace_file;
 use crate::utils::purl::purl_parts;
 use crate::vendor::lock_inventory::{MemoryEntry, ProjectView};
 
@@ -308,10 +309,12 @@ pub struct CandidateFiles {
     /// instead of taking them for absent (and creating a settings file over
     /// one).
     pub gradle_unreadable: BTreeSet<String>,
-    /// Set when bundler is configured (`BUNDLE_GEMFILE`) to load a manifest
-    /// the gem rewriter cannot edit: every gem manifest and lock was left
-    /// out of `files`, and the rewrite reports this instead of a redirect.
-    pub gem_manifest_unsupported: Option<RewriteWarning>,
+    /// Set when bundler is configured to load a manifest the gem rewriter
+    /// cannot edit (`BUNDLE_GEMFILE`), or to fetch the patch-registry
+    /// source through a mirror (`mirror.all`, #681): every gem manifest and
+    /// lock was left out of `files`, and the rewrite reports this instead
+    /// of a redirect.
+    pub gem_refusal: Option<RewriteWarning>,
 }
 
 impl CandidateFiles {
@@ -509,6 +512,33 @@ pub async fn read_candidate_files(
                 }
             }
         }
+        // The root manifest's `patchedDependencies` names the packages the
+        // project patches itself with `bun patch`, which the bun rewriters
+        // must leave on their registry tuple (#367). Read beside either bun
+        // lock, advisory too: the member walk above reaches the root only
+        // through a `workspaces` section in bun's emitted shape.
+        if !out.files.contains_key("package.json")
+            && (out.files.contains_key("bun.lock") || super::vlt::bun_lockb_present(view))
+        {
+            if let Some(text) = read_advisory(view, unreadable, "package.json").await {
+                out.files.insert("package.json".to_string(), text);
+            }
+        }
+    }
+
+    // Beside a classic yarn.lock, the yarn configs decide whether an
+    // offline mirror serves the tarballs (the classic rewriter's refusal).
+    // Read strictly: a link or an unreadable in-memory entry could hide a
+    // mirror, so it is refused like a rewrite target.
+    if candidates.iter().any(|c| c.dep.ecosystem == "npm")
+        && out
+            .files
+            .get("yarn.lock")
+            .is_some_and(|lock| !crate::patch::redirect::is_berry_lock(lock))
+    {
+        out.read(view, unreadable, crate::patch::redirect::YARNRC_REL)
+            .await;
+        out.read(view, unreadable, NPMRC_REL).await;
     }
 
     // Cargo workspace members (and in-root path dependencies) declare
@@ -550,7 +580,7 @@ pub async fn read_candidate_files(
         }
     }
     if candidates.iter().any(|c| c.dep.ecosystem == "gem") {
-        keep_bundler_loaded_gem_files(view, &mut out).await;
+        keep_bundler_loaded_gem_files(view, candidates, &mut out).await;
     }
     // A Gradle build: every script, catalog and lock file its script graph
     // reaches, for the hosted Gradle planner.
@@ -558,6 +588,18 @@ pub async fn read_candidate_files(
         && crate::patch::redirect::gradle::gradle_build_present(&out.files)
     {
         read_gradle_files(view, unreadable, &mut out).await;
+    }
+    // An sbt build's resolution evidence rides a synthetic key (see
+    // `patch::redirect::sbt::SBT_RESOLUTION_KEY`).
+    if candidates.iter().any(|c| c.dep.ecosystem == "maven")
+        && crate::formats::sbt::build::sbt_build_present(&crate::formats::sbt::build::files_reader(
+            &out.files,
+        ))
+    {
+        if let Some(json) = super::sbt_reads::extra_resolution(view).await {
+            let key = crate::patch::redirect::sbt::SBT_RESOLUTION_KEY;
+            out.files.insert(key.to_string(), json);
+        }
     }
     out.symlinked_reads.sort();
     out.symlinked_reads.dedup();
@@ -664,30 +706,69 @@ const GEM_MANIFEST_FILES: [&str; 4] = ["Gemfile", "Gemfile.lock", "gems.rb", "ge
 /// - `BUNDLE_GEMFILE` naming the root `Gemfile` / `gems.rb`: the other
 ///   spelling is dropped;
 /// - `BUNDLE_GEMFILE` naming anything else: every spelling is dropped and
-///   [`CandidateFiles::gem_manifest_unsupported`] says why.
+///   [`CandidateFiles::gem_refusal`] says why;
+/// - a bundler mirror capturing the patch-registry source (`mirror.all`,
+///   or `mirror.<source>`; see [`crate::formats::gem::mirror`]): every
+///   spelling is dropped the same way (#681).
 ///
 /// A memory view has no environment: only its own app config is read.
-async fn keep_bundler_loaded_gem_files(view: &ProjectView<'_>, out: &mut CandidateFiles) {
+async fn keep_bundler_loaded_gem_files(
+    view: &ProjectView<'_>,
+    candidates: &[Candidate],
+    out: &mut CandidateFiles,
+) {
     use crate::formats::gem::manifest::LoadedManifest;
+    let sources: Vec<&str> = candidates
+        .iter()
+        .filter_map(|c| c.dep.registry_override.as_ref())
+        .filter(|ov| ov.kind == "rubygems-compact-index")
+        .map(|ov| ov.index_url.as_str())
+        .collect();
     let loaded = crate::crawlers::ruby_crawler::bundler_loaded_manifest_in(view).await;
-    let keep: &[&str] = match &loaded {
-        LoadedManifest::Default => return,
-        LoadedManifest::Configured { .. } => {
+    let mirror = match view {
+        ProjectView::Disk(root)
+        | ProjectView::Snapshot(crate::vendor::lock_inventory::DiskSnapshot { root, .. }) => {
+            crate::crawlers::ruby_crawler::bundler_source_mirror(root, &sources).await
+        }
+        ProjectView::Memory(_) => {
+            let config = view.read_text(".bundle/config").await.ok();
+            crate::formats::gem::mirror::capturing_mirror(config.as_deref(), &[], &sources)
+        }
+    };
+    let refusal = if let Some(detail) = loaded.unsupported_detail() {
+        Some(RewriteWarning {
+            code: "redirect_gem_bundle_gemfile_unsupported".into(),
+            detail,
+        })
+    } else {
+        // #681: a mirror serves the upstream gem for the redirected source,
+        // so bundler would install unpatched bytes while the run (and its
+        // VEX) reported the gem redirected. Refuse every gem redirect.
+        mirror.map(|capture| RewriteWarning {
+            code: "redirect_gem_mirror_overrides_source".into(),
+            detail: format!(
+                "{} routes the Socket patch-registry source to that mirror, which serves \
+                 the unpatched upstream gem; no gem was redirected. To fix, {} and re-run \
+                 the scan",
+                capture.setting, capture.remedy
+            ),
+        })
+    };
+    let keep: &[&str] = match (&loaded, &refusal) {
+        (_, Some(_)) | (LoadedManifest::Unsupported { .. }, _) => &[],
+        (LoadedManifest::Default, None) => return,
+        (LoadedManifest::Configured { .. }, None) => {
             let (gemfile, lock) = loaded
                 .pair(out.files.contains_key("gems.rb"))
                 .expect("a configured default spelling has a pair");
             &[gemfile, lock]
         }
-        LoadedManifest::Unsupported { .. } => &[],
     };
     let dropped = |rel: &str| GEM_MANIFEST_FILES.contains(&rel) && !keep.contains(&rel);
     out.files.retain(|rel, _| !dropped(rel));
     out.symlinked_reads.retain(|rel| !dropped(rel));
     out.unreadable_reads.retain(|rel| !dropped(rel));
-    out.gem_manifest_unsupported = loaded.unsupported_detail().map(|detail| RewriteWarning {
-        code: "redirect_gem_bundle_gemfile_unsupported".into(),
-        detail,
-    });
+    out.gem_refusal = refusal;
 }
 
 /// The pypi wheels whose metadata a native lock rewrite needs, in
@@ -1002,7 +1083,7 @@ pub async fn rewrite(
         symlinked_reads,
         unreadable_reads,
         gradle_unreadable,
-        gem_manifest_unsupported,
+        gem_refusal,
     } = read;
     // The rewriters' override slice — materialized ONCE, after the last
     // candidate filter, so it can never disagree with `candidates`.
@@ -1067,7 +1148,7 @@ pub async fn rewrite(
         (files, rewrite)
     };
     // The gem files were withheld on purpose: say why, not "no Gemfile".
-    if let Some(warning) = gem_manifest_unsupported {
+    if let Some(warning) = gem_refusal {
         rewrite
             .warnings
             .retain(|w| w.code != "redirect_gem_no_gemfile");
@@ -1079,7 +1160,26 @@ pub async fn rewrite(
             .retain(|w| w.code != "redirect_npm_no_lockfile");
         match content {
             Ok(bytes) => {
-                crate::patch::redirect::rewrite_bun_binary(&bytes, &overrides, &mut rewrite)
+                // A package the project patches itself (`bun patch`) keeps
+                // its registry record, loudly (#367).
+                let user_patched = crate::vendor::bun_lock_text::patched_dependency_keys(
+                    files.get("package.json").map(String::as_str),
+                    None,
+                );
+                let binary_overrides: Vec<DepOverride> = overrides
+                    .iter()
+                    .filter(|o| {
+                        o.ecosystem != "npm"
+                            || !crate::patch::redirect::skip_bun_user_patched(
+                                &user_patched,
+                                &crate::patch::redirect::full_name(o),
+                                o,
+                                &mut rewrite,
+                            )
+                    })
+                    .cloned()
+                    .collect();
+                crate::patch::redirect::rewrite_bun_binary(&bytes, &binary_overrides, &mut rewrite)
             }
             Err(warning) => rewrite.warnings.push(warning),
         }
@@ -1151,6 +1251,7 @@ pub async fn rewrite(
         .files
         .keys()
         .chain(rewrite.binary_files.keys())
+        .filter(|k| !crate::patch::redirect::sbt::is_synthetic_key(k))
         .cloned()
         .collect();
     let confirmed = confirm(&files, &rewrite, candidates, binary_bun, withheld_from_vlt);
@@ -1318,6 +1419,26 @@ fn pnpm_trust(
         pnpm_trust_legacy_detail(&server)
     } else if !root_lock_v9 || !options.trust_lockfile_config {
         pnpm_trust_manual_guidance(&server)
+    } else if let Some(root_file) = governing_workspace(view) {
+        // A workspace member with its own lock: pnpm reads `trustLockfile`
+        // only from the workspace root's file, and a nested one would be
+        // ignored (#880). The governing-root pre-check refused every root
+        // file but these two, so nothing is written here.
+        let root_file = root_file.display().to_string();
+        match read_workspace_for_trust(std::path::Path::new(&root_file))
+            .ok()
+            .flatten()
+            .map(|text| plan_workspace_trust(Some(&text)))
+        {
+            Some(TrustPlan::AlreadyTrue) => {
+                pnpm_rerun_only = spliced_pnpm_locks == 0;
+                pnpm_trust_already_true_detail(&server, &root_file)
+            }
+            Some(TrustPlan::UserSet(value)) => {
+                pnpm_trust_user_set_detail(&server, &root_file, &value)
+            }
+            _ => pnpm_trust_manual_guidance(&server),
+        }
     } else {
         let (workspace, symlinked) = read_workspace(view);
         workspace_symlinked = symlinked;
@@ -1345,21 +1466,11 @@ fn pnpm_trust(
                 }
                 TrustPlan::AlreadyTrue => {
                     pnpm_rerun_only = spliced_pnpm_locks == 0;
-                    format!(
-                        "{}, and {PNPM_WORKSPACE_REL} already carries `trustLockfile: \
-                         true` — keep it committed alongside the lock; installs need \
-                         no extra flags. {PNPM_TRUST_TRADEOFF_AND_CAUTION}",
-                        pnpm_trust_policy_preamble(&server),
-                    )
+                    pnpm_trust_already_true_detail(&server, PNPM_WORKSPACE_REL)
                 }
-                TrustPlan::UserSet(value) => format!(
-                    "{}. {PNPM_WORKSPACE_REL} explicitly sets `trustLockfile: \
-                 {value}`, which was respected and left untouched — install \
-                 with `pnpm install --trust-lockfile`, or set `trustLockfile: \
-                 true` yourself so every install accepts the patched \
-                 artifacts. {PNPM_TRUST_TRADEOFF_AND_CAUTION}",
-                    pnpm_trust_policy_preamble(&server),
-                ),
+                TrustPlan::UserSet(value) => {
+                    pnpm_trust_user_set_detail(&server, PNPM_WORKSPACE_REL, &value)
+                }
                 TrustPlan::Unsupported(why) => {
                     pnpm_trust_workspace_unsupported_detail(&server, &why)
                 }
@@ -1395,6 +1506,42 @@ fn pnpm_trust(
         pnpm_rerun_only,
         workspace_symlinked,
     )
+}
+
+/// The trust detail for a settings file (`file`) that already carries
+/// `trustLockfile: true`.
+fn pnpm_trust_already_true_detail(server: &str, file: &str) -> String {
+    format!(
+        "{}, and {file} already carries `trustLockfile: true` — keep it committed \
+         alongside the lock; installs need no extra flags. \
+         {PNPM_TRUST_TRADEOFF_AND_CAUTION}",
+        pnpm_trust_policy_preamble(server),
+    )
+}
+
+/// The trust detail for a settings file (`file`) whose explicit
+/// `trustLockfile: <value>` was respected.
+fn pnpm_trust_user_set_detail(server: &str, file: &str, value: &str) -> String {
+    format!(
+        "{}. {file} explicitly sets `trustLockfile: {value}`, which was respected \
+         and left untouched — install with `pnpm install --trust-lockfile`, or set \
+         `trustLockfile: true` yourself so every install accepts the patched \
+         artifacts. {PNPM_TRUST_TRADEOFF_AND_CAUTION}",
+        pnpm_trust_policy_preamble(server),
+    )
+}
+
+/// The ancestor `pnpm-workspace.yaml` governing a disk project's pnpm
+/// settings (see [`governing_workspace_file`]); an in-memory project has
+/// no ancestors.
+fn governing_workspace(view: &ProjectView<'_>) -> Option<std::path::PathBuf> {
+    match view {
+        ProjectView::Disk(cwd)
+        | ProjectView::Snapshot(crate::vendor::lock_inventory::DiskSnapshot {
+            root: cwd, ..
+        }) => governing_workspace_file(cwd),
+        ProjectView::Memory(_) => None,
+    }
 }
 
 /// npm >= 12 ships `allow-remote=none`: it refuses (EALLOWREMOTE) every
@@ -1536,6 +1683,7 @@ fn confirm(
         .iter()
         .filter(|(name, _)| !(pdm_inactive && name.as_str() == "pdm.lock"))
         .filter(|(name, _)| !is_npm_manifest(name))
+        .filter(|(name, _)| !crate::patch::redirect::sbt::is_synthetic_key(name))
         .map(|(name, content)| (name.as_str(), rewrite.files.get(name).unwrap_or(content)))
         .chain(
             rewrite
@@ -1544,6 +1692,7 @@ fn confirm(
                 .filter(|(name, _)| !files.contains_key(*name) && !is_npm_manifest(name))
                 .map(|(name, content)| (name.as_str(), content)),
         )
+        .filter(|(name, _)| !crate::patch::redirect::sbt::is_generated_file(name))
         .collect();
     // Gradle scripts, locks and owned files never confirm by substring: a
     // pasted snippet or a stale lock line pins nothing (the Gradle planner
@@ -1566,8 +1715,32 @@ fn confirm(
             let uuid = c.dep.patch_uuid.as_str();
             // vlt decides before the binary-bun rule, so `bun.lockb` beside
             // a vlt-driven `vlt-lock.json` never confirms an npm purl.
-            if rewrite.refused_vlt_uuids.contains(uuid) {
+            if rewrite.refused_vlt_uuids.contains(uuid) || rewrite.refused_bun_uuids.contains(uuid)
+            {
                 return ProbeStep::Decided(false);
+            }
+            // An sbt build's Maven pins are confirmed by the sbt rewriter's
+            // own report: the generated file names the index URL whether or
+            // not the pin was verified against the build's evidence (so it
+            // is never a substring proof). Beside a `pom.xml` the Maven
+            // rewriter's own landing also confirms. Beside a Gradle build
+            // whose planner decided the patch, both builds must pin it
+            // (each build pins on its own, as a pom beside Gradle must):
+            // the Gradle arm below confirms an sbt-confirmed uuid, and a
+            // uuid the sbt rewriter refused is never confirmed by the
+            // Gradle planner alone — the sbt build still loads upstream.
+            if purl.starts_with("pkg:maven/") {
+                if let Some(sbt_only) = crate::patch::redirect::sbt::maven_confirmation(files) {
+                    let refused_by_sbt = rewrite.refused_sbt_uuids.contains(uuid);
+                    if refused_by_sbt && rewrite.gradle_uuids.contains(uuid) {
+                        return ProbeStep::Decided(false);
+                    }
+                    let by_sbt = rewrite.confirmed_sbt_uuids.contains(uuid) && !refused_by_sbt;
+                    let gradle_decides = by_sbt && rewrite.gradle_uuids.contains(uuid);
+                    if (by_sbt || sbt_only) && !gradle_decides {
+                        return ProbeStep::Decided(by_sbt);
+                    }
+                }
             }
             if rewrite.vlt_drives && purl.starts_with("pkg:npm/") {
                 return ProbeStep::Decided(rewrite.confirmed_vlt_uuids.contains(uuid));
@@ -1618,6 +1791,11 @@ fn confirm(
             // `resolutions` routing to it; the URL in `yarn.lock` alone (the
             // routing removed, a refused re-pin) installs nothing, so the
             // berry rewriter's own report decides every dep its lock holds.
+            // A yarn classic lock beside an offline mirror installs the
+            // upstream mirror tarball whatever `resolved` says.
+            if rewrite.refused_yarn_classic_uuids.contains(uuid) {
+                return ProbeStep::Decided(false);
+            }
             if rewrite.yarn_berry_uuids.contains(uuid) {
                 return ProbeStep::Decided(rewrite.confirmed_yarn_berry_uuids.contains(uuid));
             }
@@ -1716,6 +1894,10 @@ fn file_ecosystem(rel: &str) -> Option<&'static str> {
     if let Some(eco) = crate::formats::registry::hosted_file_ecosystem(rel) {
         return Some(eco);
     }
+    // Read only beside a classic yarn.lock, for its offline-mirror gate.
+    if rel == crate::patch::redirect::YARNRC_REL || rel == NPMRC_REL {
+        return Some("npm");
+    }
     let base = rel.rsplit('/').next().unwrap_or(rel);
     // A legacy Gradle lock (`gradle/dependency-locks/<conf>.lockfile`).
     if base.ends_with(".lockfile") {
@@ -1748,6 +1930,7 @@ pub fn guard(
             .files
             .keys()
             .chain(done.rewrite.binary_files.keys())
+            .filter(|k| !crate::patch::redirect::sbt::is_synthetic_key(k))
     };
     if let Some(linked) = written().find(|k| view.is_symlink(k)) {
         return Some(symlink_refusal(linked));
@@ -2174,6 +2357,153 @@ mod tests {
         assert!(redirected(&done), "{:?}", done.rewrite.warnings);
     }
 
+    /// REGRESSION (#367), binary lock: a `bun.lockb`-only project's root
+    /// manifest is read for its `patchedDependencies`, and a package the
+    /// project patches itself with `bun patch` keeps its registry record,
+    /// loudly, and is never assumed patched by the in-run VEX.
+    #[tokio::test]
+    async fn issue_367_bun_lockb_keeps_a_user_patched_package_on_the_registry() {
+        use crate::patch::redirect::Integrity;
+        let fixture = std::path::Path::new(env!("CARGO_MANIFEST_DIR"))
+            .join("tests/fixtures/bun-lockb-bundled/both");
+        let candidates = vec![Candidate {
+            purl: "pkg:npm/is-number@7.0.0".into(),
+            dep: DepOverride {
+                ecosystem: "npm".into(),
+                name: "is-number".into(),
+                namespace: None,
+                version: "7.0.0".into(),
+                token: "tok".into(),
+                patch_uuid: "uuid".into(),
+                artifact_url: "https://patch.test/is-number-7.0.0.tgz".into(),
+                registry_override: None,
+                integrity: Integrity {
+                    sha512: Some(format!("sha512-{}==", "A".repeat(86))),
+                    ..Default::default()
+                },
+            },
+        }];
+        let manifest = r#"{"name":"p","version":"1.0.0","dependencies":{"@bh/bund":"1.0.0","is-number":"7.0.0"}}"#;
+        let patched_manifest = manifest.replacen(
+            "}}",
+            r#"},"patchedDependencies":{"is-number@7.0.0":"patches/is-number@7.0.0.patch"}}"#,
+            1,
+        );
+        for user_patched in [false, true] {
+            let tmp = tempfile::tempdir().unwrap();
+            std::fs::copy(fixture.join("bun.lockb"), tmp.path().join("bun.lockb")).unwrap();
+            std::fs::write(
+                tmp.path().join("package.json"),
+                if user_patched {
+                    &patched_manifest
+                } else {
+                    manifest
+                },
+            )
+            .unwrap();
+            let view = ProjectView::Disk(tmp.path());
+            let outer = OuterAllowRemote::default;
+            let options = RewriteOptions {
+                dry_run: false,
+                targets_pipenv_lock: false,
+                pipenv_major: None,
+                pipenv_unknown_detail: String::new(),
+                trust_lockfile_config: true,
+                npm_allow_remote_config: true,
+                npm_outer: &outer,
+                blocking: false,
+            };
+            let read = read_candidate_files(&view, &BTreeSet::new(), &candidates).await;
+            assert!(read.files.contains_key("package.json"));
+            let done = rewrite(
+                &view,
+                read,
+                &candidates,
+                BTreeMap::new(),
+                &BTreeSet::new(),
+                &[],
+                options,
+            )
+            .await;
+            let skipped = done
+                .rewrite
+                .warnings
+                .iter()
+                .find(|w| w.code == "redirect_bun_patched_dependency_skipped");
+            if user_patched {
+                assert!(
+                    !done.rewrite.binary_files.contains_key("bun.lockb"),
+                    "the user-patched record is left alone"
+                );
+                let skipped = skipped.expect("the skip is reported");
+                assert!(
+                    skipped.detail.contains("is-number@7.0.0"),
+                    "{}",
+                    skipped.detail
+                );
+                assert!(done.rewrite.bundled_skipped_uuids.contains("uuid"));
+            } else {
+                assert!(
+                    done.rewrite.binary_files.contains_key("bun.lockb"),
+                    "{:?}",
+                    done.rewrite.warnings
+                );
+                assert!(skipped.is_none(), "{:?}", done.rewrite.warnings);
+            }
+            assert!(!done.rewrite.files.contains_key("package.json"));
+        }
+    }
+
+    /// REGRESSION (#367), text lock: the root manifest is read beside a
+    /// `bun.lock` even when the lock has no `workspaces` section to reach it
+    /// through, and a package the project patches itself is never
+    /// confirmed, not even when a sibling `package-lock.json` takes the
+    /// hosted URL: Bun keeps installing the registry bytes.
+    #[tokio::test]
+    async fn issue_367_bun_lock_user_patched_package_is_never_confirmed() {
+        let bun_lock = "{\n  \"lockfileVersion\": 1,\n  \"packages\": {\n    \"left-pad\": \
+                        [\"left-pad@1.3.0\", \"\", {}, \"sha512-UPSTREAM==\"],\n  }\n}\n";
+        let npm_lock = r#"{
+  "name": "app",
+  "lockfileVersion": 3,
+  "requires": true,
+  "packages": {
+    "": { "name": "app", "dependencies": { "left-pad": "1.3.0" } },
+    "node_modules/left-pad": {
+      "version": "1.3.0",
+      "resolved": "https://registry.npmjs.org/left-pad/-/left-pad-1.3.0.tgz",
+      "integrity": "sha512-UPSTREAM=="
+    }
+  }
+}
+"#;
+        let manifest = r#"{"name":"app","dependencies":{"left-pad":"1.3.0"},"patchedDependencies":{"left-pad@1.3.0":"patches/left-pad@1.3.0.patch"}}"#;
+        // Without the sibling npm lock nothing else reads the manifest.
+        for with_npm_lock in [false, true] {
+            let tmp = tempfile::tempdir().unwrap();
+            std::fs::write(tmp.path().join("bun.lock"), bun_lock).unwrap();
+            if with_npm_lock {
+                std::fs::write(tmp.path().join("package-lock.json"), npm_lock).unwrap();
+            }
+            std::fs::write(tmp.path().join("package.json"), manifest).unwrap();
+            let (read, done) = npm_rewrite(&ProjectView::Disk(tmp.path()), &BTreeSet::new()).await;
+            assert!(read.files.contains_key("package.json"));
+            assert!(
+                !done.rewrite.files.contains_key("bun.lock"),
+                "the user-patched entry keeps its registry tuple"
+            );
+            assert!(
+                done.rewrite
+                    .warnings
+                    .iter()
+                    .any(|w| w.code == "redirect_bun_patched_dependency_skipped"),
+                "{:?}",
+                done.rewrite.warnings
+            );
+            assert!(done.confirmed.is_empty(), "{:?}", done.confirmed);
+        }
+    }
+
     fn gem_candidate() -> Candidate {
         use crate::patch::redirect::{Integrity, RegistryOverride, RegistryOverrideIdentifiers};
         Candidate {
@@ -2436,6 +2766,37 @@ mod tests {
         assert!(done.confirmed.is_empty(), "{:?}", done.confirmed);
     }
 
+    /// An sbt build beside a Gradle build: the Gradle planner pinning a
+    /// uuid the sbt rewriter refused (here: no resolution evidence) does
+    /// not confirm it — the sbt build still loads the upstream artifact.
+    #[tokio::test]
+    async fn a_mixed_sbt_and_gradle_build_needs_both() {
+        let mut p = MemoryProject::new();
+        p.insert_text("settings.gradle", "");
+        p.insert_text(
+            "build.gradle",
+            "dependencies { implementation 'com.socketfixture:victim:1.10.0' }\n",
+        );
+        p.insert_text(
+            "gradle.lockfile",
+            "com.socketfixture:victim:1.10.0=runtimeClasspath\nempty=\n",
+        );
+        // The Gradle half alone pins the patch.
+        let (_, done) = gradle_rewrite(&p).await;
+        assert!(done.rewrite.confirmed_gradle_uuids.contains(GRADLE_UUID));
+        assert_eq!(done.confirmed.len(), 1, "{:?}", done.confirmed);
+
+        p.insert_text("project/build.properties", "sbt.version=1.9.9\n");
+        p.insert_text(
+            "build.sbt",
+            "libraryDependencies += \"com.socketfixture\" % \"victim\" % \"1.10.0\"\n",
+        );
+        let (_, done) = gradle_rewrite(&p).await;
+        assert!(done.rewrite.confirmed_gradle_uuids.contains(GRADLE_UUID));
+        assert!(done.rewrite.refused_sbt_uuids.contains(GRADLE_UUID));
+        assert!(done.confirmed.is_empty(), "{:?}", done.confirmed);
+    }
+
     const GEMFILE: &str = "source \"https://rubygems.org\"\n\ngem \"rails\", \"7.0.0\"\n";
     const GEM_LOCK: &str = "GEM\n  remote: https://rubygems.org/\n  specs:\n    rails (7.0.0)\n\n\
         PLATFORMS\n  ruby\n\nDEPENDENCIES\n  rails (= 7.0.0)\n\nBUNDLED WITH\n   2.5.22\n";
@@ -2501,6 +2862,109 @@ mod tests {
             "{codes:?}"
         );
         assert!(!codes.contains(&"redirect_gem_no_gemfile"), "{codes:?}");
+    }
+
+    fn warning_codes(done: &Rewritten) -> Vec<&str> {
+        done.rewrite
+            .warnings
+            .iter()
+            .map(|w| w.code.as_str())
+            .collect()
+    }
+
+    /// #681: `bundle config set --local mirror.all <url>` sends the
+    /// patch-registry `source` block to the mirror, which serves the
+    /// upstream gem. The redirect used to be written and attested; now no
+    /// gem file is a candidate and the run says why.
+    #[tokio::test]
+    async fn bundler_mirror_all_redirects_nothing() {
+        let mut p = MemoryProject::new();
+        p.insert_text("Gemfile", GEMFILE);
+        p.insert_text("Gemfile.lock", GEM_LOCK);
+        p.insert_text(
+            ".bundle/config",
+            "---\nBUNDLE_MIRROR__ALL: \"https://artifactory.example/api/gems/rubygems/\"\n",
+        );
+        let (read, done) = gem_rewrite(&p).await;
+        assert!(!read.files.contains_key("Gemfile"));
+        assert!(!read.files.contains_key("Gemfile.lock"));
+        assert!(
+            done.rewrite.files.is_empty(),
+            "{:?}",
+            done.rewrite.files.keys()
+        );
+        let codes = warning_codes(&done);
+        assert!(
+            codes.contains(&"redirect_gem_mirror_overrides_source"),
+            "{codes:?}"
+        );
+        assert!(!codes.contains(&"redirect_gem_no_gemfile"), "{codes:?}");
+        let w = done
+            .rewrite
+            .warnings
+            .iter()
+            .find(|w| w.code == "redirect_gem_mirror_overrides_source")
+            .unwrap();
+        assert!(!w.detail.contains("artifactory.example"), "{}", w.detail);
+        assert!(
+            w.detail.contains("mirror.https://rubygems.org"),
+            "{}",
+            w.detail
+        );
+    }
+
+    /// Exact-source and hostname mirrors both refuse intake and confirmation,
+    /// with sensitive mirror values excluded from the rendered warning.
+    #[tokio::test]
+    async fn bundler_mirror_for_the_patch_source_redirects_nothing() {
+        for key in [
+            "BUNDLE_MIRROR__HTTPS://PATCH__TEST/GEM/TOK/UUID/",
+            "BUNDLE_MIRROR__PATCH__TEST",
+            "BUNDLE_MIRROR__PATCH__TEST/",
+        ] {
+            let mut p = MemoryProject::new();
+            p.insert_text("Gemfile", GEMFILE);
+            p.insert_text("Gemfile.lock", GEM_LOCK);
+            p.insert_text(".bundle/config", format!("---\n{key}: \"https://review-user:review-secret@m.example/?token=review-token\"\n"));
+            let (read, done) = gem_rewrite(&p).await;
+            assert!(!read.files.contains_key("Gemfile"));
+            assert!(!read.files.contains_key("Gemfile.lock"));
+            assert!(
+                done.rewrite.files.is_empty(),
+                "{key}: {:?}",
+                done.rewrite.files.keys()
+            );
+            let warning = done
+                .rewrite
+                .warnings
+                .iter()
+                .find(|warning| warning.code == "redirect_gem_mirror_overrides_source")
+                .unwrap();
+            for secret in ["review-user", "review-secret", "review-token"] {
+                assert!(!warning.detail.contains(secret));
+            }
+        }
+    }
+
+    /// A mirror scoped to rubygems.org leaves the patch-registry source
+    /// alone: the redirect still lands.
+    #[tokio::test]
+    async fn bundler_mirror_scoped_to_rubygems_org_still_redirects() {
+        let mut p = MemoryProject::new();
+        p.insert_text("Gemfile", GEMFILE);
+        p.insert_text("Gemfile.lock", GEM_LOCK);
+        p.insert_text(
+            ".bundle/config",
+            "---\nBUNDLE_MIRROR__HTTPS://RUBYGEMS__ORG/: \"https://m.example/\"\n",
+        );
+        let (_read, done) = gem_rewrite(&p).await;
+        assert!(
+            done.rewrite.files.contains_key("Gemfile"),
+            "{:?} {:?}",
+            done.rewrite.files.keys(),
+            warning_codes(&done)
+        );
+        assert!(!warning_codes(&done).contains(&"redirect_gem_mirror_overrides_source"));
     }
 
     /// `BUNDLE_GEMFILE: Gemfile` beside a `gems.rb`: bundler loads the

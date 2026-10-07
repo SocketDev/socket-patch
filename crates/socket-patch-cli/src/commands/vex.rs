@@ -163,6 +163,8 @@ impl VexEmbedArgs {
             compact: self.vex_compact,
             assume_applied: Vec::new(),
             known_stale: Vec::new(),
+            hosted_gem_mirror_refused: false,
+            hosted_gem_mirror_check: false,
             // Embedded callers skip VEX entirely under `--dry-run`.
             dry_run: false,
             product_flag: "--vex-product",
@@ -194,6 +196,19 @@ pub(crate) struct VexBuildParams {
     /// Hosted probes positively identified unpatched installed bytes. These
     /// PURLs cannot be attested by another interpreter or --no-verify.
     pub known_stale: Vec<String>,
+    /// Embedded hosted scan refused gem routing because a Bundler mirror
+    /// captures a patch source. Rediscovered hosted gem pins (including older
+    /// pins outside this scan's candidates) then require verified installed
+    /// bytes: neither lockfile inference, assume_applied nor --no-verify may
+    /// attest them. Agent/vendored evidence and standalone VEX are unchanged.
+    pub hosted_gem_mirror_refused: bool,
+    /// Embedded hosted scan (`scan --mode hosted --vex`, `get --mode hosted
+    /// --vex`), on every terminal path: check each hosted gem pin in the
+    /// completed VEX plan against the project's Bundler mirror settings and
+    /// treat a captured pin like [`Self::hosted_gem_mirror_refused`]. Runs
+    /// independently of this run's grant candidates. Standalone `vex` and
+    /// agent/vendored embedded VEX leave it off.
+    pub hosted_gem_mirror_check: bool,
     /// `vex --dry-run`: build and verify, but write nothing to `output` and
     /// leave any previous document there alone. Printing to stdout is not a
     /// mutation, so it still happens.
@@ -329,6 +344,8 @@ pub async fn run(args: VexArgs) -> i32 {
         compact: args.compact,
         assume_applied: Vec::new(),
         known_stale: Vec::new(),
+        hosted_gem_mirror_refused: false,
+        hosted_gem_mirror_check: false,
         dry_run: args.common.dry_run,
         product_flag: "--product",
         npm_prior: None,
@@ -458,6 +475,41 @@ fn org_looks_like_path(org: Option<&str>) -> Option<String> {
     })
 }
 
+/// [`VexBuildParams::hosted_gem_mirror_check`]: the plan's hosted gem pins
+/// whose own Socket source (the lock's `GEM` remote) a Bundler mirror
+/// captures. Checked from the completed plan, not from this run's grant
+/// candidates, so older pins are covered when the scan found no gem to
+/// redirect (empty catalog, paid-only gem, withdrawn offer). A pin with no
+/// recovered source URL is still captured by `mirror.all`.
+async fn hosted_gem_mirror_captured(
+    common: &GlobalArgs,
+    params: &VexBuildParams,
+    plan: &Plan,
+) -> std::collections::HashSet<String> {
+    let mut captured = std::collections::HashSet::new();
+    if !params.hosted_gem_mirror_check {
+        return captured;
+    }
+    for (purl, wiring) in plan
+        .hosted
+        .iter()
+        .filter(|(purl, _)| purl.starts_with("pkg:gem/"))
+    {
+        let sources: Vec<&str> = wiring
+            .refs
+            .iter()
+            .filter_map(|r| r.url.as_deref())
+            .collect();
+        if socket_patch_core::crawlers::ruby_crawler::bundler_source_mirror(&common.cwd, &sources)
+            .await
+            .is_some()
+        {
+            captured.insert(purl.clone());
+        }
+    }
+    captured
+}
+
 /// Core VEX pipeline shared by the standalone `vex` command and the
 /// embedded `apply`/`vendor`/`scan` `--vex` paths: resolve the product, verify the
 /// plan's record view against disk (unless `no_verify`), build the OpenVEX
@@ -474,6 +526,13 @@ async fn generate_vex(
     warnings: &mut Vec<RunWarning>,
 ) -> Result<VexWriteSummary, VexGenError> {
     let manifest = &plan.view;
+    let mirror_captured = hosted_gem_mirror_captured(common, params, &plan).await;
+    let mirror_refused = |purl: &str| {
+        mirror_captured.contains(purl)
+            || (params.hosted_gem_mirror_refused
+                && purl.starts_with("pkg:gem/")
+                && plan.hosted.contains_key(purl))
+    };
     let redirected: &[String] = &plan.redirected;
     let product_id = match resolve_product_id(common, params.product.as_deref(), warnings).await {
         Ok(id) => id,
@@ -537,7 +596,21 @@ async fn generate_vex(
             .collect();
         vendored.sort();
         VerifyOutcome {
-            applied: manifest.patches.keys().cloned().collect(),
+            applied: manifest
+                .patches
+                .keys()
+                .filter(|purl| !mirror_refused(purl))
+                .cloned()
+                .collect(),
+            failed: manifest
+                .patches
+                .keys()
+                .filter(|purl| mirror_refused(purl))
+                .map(|purl| FailedPatch {
+                    purl: purl.clone(),
+                    reason: "mirror_overrides_source".into(),
+                })
+                .collect(),
             vendored,
             ..Default::default()
         }
@@ -619,6 +692,7 @@ async fn generate_vex(
         outcome.failed.retain(|f| {
             let excused = f.reason == "package_not_found"
                 && plan.lockfile_basis.contains(&f.purl)
+                && !mirror_refused(&f.purl)
                 && crawled(&f.purl)
                 && !hidden(&f.purl);
             if excused {
@@ -657,7 +731,8 @@ async fn generate_vex(
             .iter()
             .map(|s| strip_purl_qualifiers(s))
             .collect();
-        let is_exempt = |purl: &str| exempt.contains(strip_purl_qualifiers(purl));
+        let is_exempt =
+            |purl: &str| exempt.contains(strip_purl_qualifiers(purl)) && !mirror_refused(purl);
         outcome.failed.retain(|f| !is_exempt(&f.purl));
         for key in manifest.patches.keys() {
             if is_exempt(key) && !outcome.applied.iter().any(|p| p == key) {
@@ -829,15 +904,15 @@ async fn vex_copy_sets(
     manifest: &PatchManifest,
     copies: &HashMap<String, Vec<PathBuf>>,
 ) -> HashMap<String, Vec<PathBuf>> {
-    use socket_patch_core::crawlers::gradle_cache::{
-        installed_copies_detailed, is_gradle_version_dir,
-    };
+    use socket_patch_core::crawlers::gradle_cache::{expands, installed_copies_detailed};
     use socket_patch_core::patch::jvm_jar::{self, RecordShape};
     let holds = |purl: &str, path: &PathBuf| {
         let Some(record) = manifest.patches.get(purl) else {
             return true;
         };
-        if !is_gradle_version_dir(path) {
+        // A Gradle version dir or an Ivy artifact dir holding none of the
+        // record's files is no copy of it.
+        if !expands(path) {
             return true;
         }
         match jvm_jar::classify(purl, &record.files) {
@@ -889,12 +964,14 @@ async fn withhold_unpatched_jvm_copies(
     common: &GlobalArgs,
     warnings: &mut Vec<RunWarning>,
 ) {
-    use socket_patch_core::crawlers::gradle_cache::is_gradle_version_dir;
+    use socket_patch_core::crawlers::gradle_cache::{self, is_gradle_version_dir};
     use socket_patch_core::patch::jvm_jar::{self, RecordShape};
 
+    // A Gradle version dir or an Ivy artifact dir expands into several
+    // directories, so even a lone copy can be partly unpatched: name it.
     let mut unpatched = std::mem::take(&mut outcome.unpatched_copies);
     unpatched.retain(|(purl, path)| {
-        is_gradle_version_dir(path) || copies.get(purl).is_some_and(|c| c.len() > 1)
+        gradle_cache::expands(path) || copies.get(purl).is_some_and(|c| c.len() > 1)
     });
     let mut derived: Vec<(String, PathBuf)> = Vec::new();
     let mut unchecked: Vec<String> = Vec::new();
@@ -1455,6 +1532,9 @@ fn omission_phrase(reason: &str) -> &'static str {
              against"
         }
         "stale_install" => "the installed copy is not patched",
+        "mirror_overrides_source" => {
+            "a Bundler mirror overrides the hosted source and installed bytes were not verified"
+        }
         RECORD_UNAVAILABLE => {
             "a lockfile wires the patch, but no local record exists and the patch API could not \
              supply one (offline, a network error, not found, or a paid patch without an API \
@@ -1465,7 +1545,8 @@ fn omission_phrase(reason: &str) -> &'static str {
         }
         VENDOR_UNWIRED => {
             "the vendor ledger records its artifact, but no lockfile or config wires it to this \
-             package any more"
+             package in a way the build is sure to install (the wiring was dropped, another lock \
+             resolves the same version from elsewhere, or the dependency was removed)"
         }
         REDIRECT_UNWIRED => {
             "the hosted ledger records it, but no lockfile wires its hosted patch to this \
@@ -1647,6 +1728,7 @@ mod tests {
             "vendor_artifact_missing",
             "vendor_manifest_unverifiable",
             "stale_install",
+            "mirror_overrides_source",
             RECORD_UNAVAILABLE,
             RECORD_MISMATCH,
             VENDOR_UNWIRED,
@@ -1902,6 +1984,8 @@ mod npm_prior_tests {
             compact: false,
             assume_applied: Vec::new(),
             known_stale: Vec::new(),
+            hosted_gem_mirror_refused: false,
+            hosted_gem_mirror_check: false,
             dry_run: false,
             product_flag: "--vex-product",
             npm_prior: prior,
@@ -1970,6 +2054,211 @@ mod npm_prior_tests {
                 crate::ecosystem_dispatch::crawl_ecosystems_with_npm(&other, None).await;
             let ignored = run(&common, &tmp.path().join("ignored.json"), foreign).await;
             assert_eq!(walked, ignored, "{label} (foreign snapshot)");
+        }
+    }
+}
+
+#[cfg(test)]
+mod mirror_refusal_tests {
+    use super::*;
+    use crate::commands::vex_sources::HostedWiring;
+    use std::collections::{BTreeMap, HashSet};
+
+    /// The current scan can refuse routing while VEX rediscovers an older pin
+    /// outside its candidates. Only hosted gem inference is affected; actual
+    /// installed verification is covered by the native repeat-scan capstone.
+    #[tokio::test]
+    async fn mirror_refusal_denies_hosted_gem_inference_without_gating_other_evidence() {
+        let tmp = tempfile::tempdir().unwrap();
+        let common = GlobalArgs {
+            cwd: tmp.path().to_path_buf(),
+            json: true,
+            no_telemetry: true,
+            ..Default::default()
+        };
+        let purls = [
+            "pkg:gem/captured@1.0.0?platform=ruby",
+            "pkg:gem/agent@1.0.0",
+            "pkg:npm/other@1.0.0",
+            "pkg:gem/vendor@1.0.0",
+        ];
+        for refused in [false, true] {
+            for no_verify in [false, true] {
+                let mut view = PatchManifest::new();
+                for (index, purl) in purls.iter().enumerate() {
+                    let record: PatchRecord = serde_json::from_value(serde_json::json!({
+                        "uuid": format!("00000000-0000-4000-8000-00000000000{index}"),
+                        "exportedAt": "2026-01-01T00:00:00Z",
+                        "files": {"index.js": {"beforeHash": "a".repeat(64), "afterHash": "b".repeat(64)}},
+                        "vulnerabilities": {format!("GHSA-mirror-000{index}"): {"cves": [format!("CVE-2026-100{index}")], "summary": "test", "severity": "high", "description": "test"}},
+                        "description": "test", "license": "MIT", "tier": "free"
+                    })).unwrap();
+                    view.patches.insert(purl.to_string(), record);
+                }
+                let hosted = BTreeMap::from([purls[0], purls[2]].map(|purl| {
+                    (
+                        purl.to_string(),
+                        HostedWiring {
+                            uuid: view.patches[purl].uuid.clone(),
+                            refs: Vec::new(),
+                        },
+                    )
+                }));
+                let vendor_entry = serde_json::from_value(serde_json::json!({
+                    "ecosystem": "gem", "basePurl": purls[3], "uuid": view.patches[purls[3]].uuid,
+                    "artifact": {"path": ".socket/vendor/gem/test/gem"}, "wiring": []
+                }))
+                .unwrap();
+                let plan = Plan {
+                    view,
+                    vendor_entries: HashMap::from([(purls[3].to_string(), vendor_entry)]),
+                    redirected: vec![purls[0].to_string(), purls[2].to_string()],
+                    lockfile_basis: HashSet::from([purls[0].to_string(), purls[2].to_string()]),
+                    hosted,
+                    gated: Vec::new(),
+                    notes: Vec::new(),
+                };
+                let mut params = VexEmbedArgs {
+                    vex: Some(tmp.path().join(format!("{refused}-{no_verify}.json"))),
+                    vex_product: Some("pkg:generic/test@1.0.0".into()),
+                    vex_no_verify: no_verify,
+                    ..Default::default()
+                }
+                .to_build_params();
+                params.hosted_gem_mirror_refused = refused;
+                // Even a supplied assumption cannot revive the refused pin;
+                // qualifier-insensitive exemption matching remains intact.
+                params.assume_applied = purls
+                    .iter()
+                    .map(|purl| purl.split('?').next().unwrap().to_string())
+                    .collect();
+                let summary = generate_vex(&common, &params, plan, &mut Vec::new())
+                    .await
+                    .unwrap_or_else(|err| panic!("{}: {}", err.code, err.message));
+                assert_eq!(summary.statements, if refused { 3 } else { 4 });
+                let doc = serde_json::to_string(&summary.doc).unwrap();
+                assert_eq!(doc.contains("pkg:gem/captured@"), !refused);
+                for purl in &purls[1..] {
+                    assert!(doc.contains(purl), "{purl}: {doc}");
+                }
+                assert_eq!(summary.failed.len(), usize::from(refused));
+                if refused {
+                    assert_eq!(summary.failed[0].purl, purls[0]);
+                    assert_eq!(
+                        summary.failed[0].reason,
+                        if no_verify {
+                            "mirror_overrides_source"
+                        } else {
+                            "package_not_found"
+                        }
+                    );
+                }
+            }
+        }
+    }
+
+    /// Bugbot (PR #684): a hosted scan with no gem candidate (empty catalog,
+    /// paid-only gem, withdrawn offer) emits no mirror refusal warning, yet
+    /// its embedded VEX still rediscovers older hosted gem pins. The check
+    /// runs over the plan's own pin sources, independently of candidates.
+    #[tokio::test]
+    async fn mirror_check_refuses_rediscovered_pins_without_gem_candidates() {
+        use socket_patch_core::vex::discover::PatchedRef;
+        let tmp = tempfile::tempdir().unwrap();
+        let common = GlobalArgs {
+            cwd: tmp.path().to_path_buf(),
+            json: true,
+            no_telemetry: true,
+            ..Default::default()
+        };
+        let gem = "pkg:gem/captured@1.0.0";
+        let npm = "pkg:npm/other@1.0.0";
+        let uuid = "00000000-0000-4000-8000-000000000000";
+        let source = format!("https://patch.socket.dev/gem/tok/{uuid}/");
+        std::fs::create_dir(tmp.path().join(".bundle")).unwrap();
+        // (app config, check on, gem attested)
+        let cases = [
+            (None, true, true),
+            (Some("BUNDLE_MIRROR__ALL"), false, true),
+            (Some("BUNDLE_MIRROR__ALL"), true, false),
+            (Some("BUNDLE_MIRROR__PATCH__SOCKET__DEV"), true, false),
+            (Some("BUNDLE_MIRROR__HTTPS://RUBYGEMS__ORG/"), true, true),
+        ];
+        for (index, (key, check, attested)) in cases.into_iter().enumerate() {
+            let config = tmp.path().join(".bundle/config");
+            match key {
+                Some(key) => {
+                    std::fs::write(&config, format!("---\n{key}: \"https://m.example/\"\n"))
+                        .unwrap()
+                }
+                None => {
+                    let _ = std::fs::remove_file(&config);
+                }
+            }
+            let mut view = PatchManifest::new();
+            for (n, purl) in [gem, npm].into_iter().enumerate() {
+                let record: PatchRecord = serde_json::from_value(serde_json::json!({
+                    "uuid": format!("00000000-0000-4000-8000-00000000000{n}"),
+                    "exportedAt": "2026-01-01T00:00:00Z",
+                    "files": {"index.js": {"beforeHash": "a".repeat(64), "afterHash": "b".repeat(64)}},
+                    "vulnerabilities": {format!("GHSA-mirror-100{n}"): {"cves": [format!("CVE-2026-200{n}")], "summary": "test", "severity": "high", "description": "test"}},
+                    "description": "test", "license": "MIT", "tier": "free"
+                }))
+                .unwrap();
+                view.patches.insert(purl.to_string(), record);
+            }
+            let hosted = BTreeMap::from([
+                (
+                    gem.to_string(),
+                    HostedWiring {
+                        uuid: uuid.into(),
+                        refs: vec![PatchedRef::hosted(
+                            gem.into(),
+                            uuid.into(),
+                            "Gemfile.lock",
+                            Some(&source),
+                            None,
+                            false,
+                        )],
+                    },
+                ),
+                (
+                    npm.to_string(),
+                    HostedWiring {
+                        uuid: view.patches[npm].uuid.clone(),
+                        refs: Vec::new(),
+                    },
+                ),
+            ]);
+            let plan = Plan {
+                view,
+                vendor_entries: HashMap::new(),
+                redirected: vec![gem.to_string(), npm.to_string()],
+                lockfile_basis: HashSet::from([gem.to_string(), npm.to_string()]),
+                hosted,
+                gated: Vec::new(),
+                notes: Vec::new(),
+            };
+            let mut params = VexEmbedArgs {
+                vex: Some(tmp.path().join(format!("{index}.json"))),
+                vex_product: Some("pkg:generic/test@1.0.0".into()),
+                vex_no_verify: true,
+                ..Default::default()
+            }
+            .to_build_params();
+            // No candidate refused anything this run: only the plan check.
+            params.hosted_gem_mirror_check = check;
+            let summary = generate_vex(&common, &params, plan, &mut Vec::new())
+                .await
+                .unwrap_or_else(|err| panic!("{}: {}", err.code, err.message));
+            let doc = serde_json::to_string(&summary.doc).unwrap();
+            assert_eq!(doc.contains(gem), attested, "case {index}: {doc}");
+            assert!(doc.contains(npm), "case {index}: {doc}");
+            if !attested {
+                assert_eq!(summary.failed.len(), 1, "case {index}");
+                assert_eq!(summary.failed[0].purl, gem);
+                assert_eq!(summary.failed[0].reason, "mirror_overrides_source");
+            }
         }
     }
 }

@@ -534,6 +534,74 @@ async fn get_with_explicit_package_flag_resolves_installed_and_saves() {
     );
 }
 
+/// Write a minimal installed PyPI distribution under `<cwd>/.venv` whose
+/// METADATA spells the project name as pip does (e.g. `ruamel.yaml`).
+fn install_pypi_fixture(cwd: &Path, name: &str, version: &str) {
+    let sp = if cfg!(windows) {
+        cwd.join(".venv").join("Lib").join("site-packages")
+    } else {
+        cwd.join(".venv")
+            .join("lib")
+            .join("python3.11")
+            .join("site-packages")
+    };
+    let dist = sp.join(format!(
+        "{}-{version}.dist-info",
+        name.replace(['.', '-'], "_")
+    ));
+    std::fs::create_dir_all(&dist).unwrap();
+    std::fs::write(
+        dist.join("METADATA"),
+        format!("Metadata-Version: 2.1\nName: {name}\nVersion: {version}\n"),
+    )
+    .unwrap();
+}
+
+#[tokio::test]
+#[serial]
+async fn get_package_name_matches_pypi_spellings_pip_accepts() {
+    // #926: `get ruamel.yaml` (the spelling in requirements.txt, `pip list`
+    // and the dist-info) used to report `no_match` and exit 0, because the
+    // crawler stores the PEP 503 name `ruamel-yaml` and the matcher only
+    // lowercased. Every spelling pip treats as the same project must
+    // resolve to the installed package and search by its canonical PURL.
+    let saved_venv = std::env::var_os("VIRTUAL_ENV");
+    std::env::remove_var("VIRTUAL_ENV");
+    let purl = "pkg:pypi/ruamel-yaml@0.18.6";
+    let encoded = "pkg%3Apypi%2Fruamel-yaml%400.18.6";
+    for spelling in ["ruamel.yaml", "ruamel_yaml", "Ruamel.YAML", "ruamel-yaml"] {
+        let (server, url) = start_wiremock().await;
+        make_search_mock_one(&server, "by-package", encoded, UUID, purl, "free").await;
+        make_view_mock(&server, UUID, purl, "free").await;
+
+        let tmp = tempfile::tempdir().unwrap();
+        install_pypi_fixture(tmp.path(), "ruamel.yaml", "0.18.6");
+
+        let mut args = default_args(spelling, tmp.path());
+        args.common.api_url = Some(url);
+
+        let code = run(args).await;
+        assert_eq!(code, 0, "{spelling}: resolved + saved package must exit 0");
+        assert_patch_saved(tmp.path(), purl, UUID);
+        let paths: Vec<String> = server
+            .received_requests()
+            .await
+            .unwrap()
+            .iter()
+            .map(|r| r.url.path().to_string())
+            .collect();
+        assert!(
+            paths
+                .iter()
+                .any(|p| p == &format!("/v0/orgs/{ORG}/patches/by-package/{encoded}")),
+            "{spelling}: must search by the canonical PURL, saw: {paths:?}"
+        );
+    }
+    if let Some(v) = saved_venv {
+        std::env::set_var("VIRTUAL_ENV", v);
+    }
+}
+
 // ---------------------------------------------------------------------------
 // Network failure
 // ---------------------------------------------------------------------------

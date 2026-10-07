@@ -85,7 +85,11 @@ use crate::formats::pnpm::workspace;
 use crate::formats::pnpm::{check_v9_lock_version as check_lock_version, vendored_npm_uuids};
 
 const PACKAGE_JSON: &str = "package.json";
-const PNPM_WORKSPACE: &str = "pnpm-workspace.yaml";
+use crate::utils::pnpm_workspace::{governing_workspace_file, PNPM_WORKSPACE};
+
+/// Refusal code for a workspace member whose pnpm settings live in an
+/// ancestor `pnpm-workspace.yaml` (see [`read_project`]).
+pub(crate) const VENDOR_PNPM_SETTINGS_ELSEWHERE: &str = "vendor_pnpm_settings_elsewhere";
 
 /// The root-only workspace member list written into a freshly created
 /// `pnpm-workspace.yaml`. pnpm 9 refuses a workspace file whose `packages`
@@ -579,6 +583,30 @@ async fn read_project(
                 )));
             }
         };
+    // A workspace member with its own lock (`sharedWorkspaceLockfile:
+    // false`) and no workspace file of its own: pnpm reads `overrides:`
+    // only from the workspace root's file, so the create path below would
+    // nest a `packages: ['.']` scaffold pnpm ignores, and every root
+    // install then fails (frozen) or drops the override (#881). The
+    // override cannot go in the root file either: socket-patch writes only
+    // inside the project. Hosted mode pins such a member.
+    if ws_text.is_none() {
+        if let Some(file) = governing_workspace_file(project_root) {
+            return Err(Box::new(refused(
+                VENDOR_PNPM_SETTINGS_ELSEWHERE,
+                format!(
+                    "{} is a project of the pnpm workspace whose settings live in {}: \
+                     pnpm reads `overrides:` only from that file, so an override wired \
+                     into this project would be ignored (pnpm >= 11 fails frozen \
+                     installs, and a plain `pnpm install` reinstalls the unpatched \
+                     package); vendored mode cannot wire a member with its own lockfile \
+                     — use `--mode hosted`; nothing was written",
+                    project_root.display(),
+                    file.display()
+                ),
+            )));
+        }
+    }
     // Same CRLF posture as the lock above: the workspace splices match exact
     // LF lines, so a CRLF file dodges the conflict checks and the edit
     // appends a DUPLICATE `overrides:` section — a duplicated mapping key
@@ -3810,6 +3838,89 @@ snapshots:
                 )
             }
         }
+    }
+
+    /// #881: a workspace member with its own lock (`sharedWorkspaceLockfile:
+    /// false`) has no `pnpm-workspace.yaml` of its own; pnpm reads
+    /// `overrides:` only from the workspace root's. Vendoring used to
+    /// create a nested `packages: ['.']` + `overrides:` file pnpm ignores,
+    /// so root installs failed (frozen) or silently dropped the patch. It
+    /// now refuses before any write, the dry run and the pre-flight
+    /// included.
+    #[tokio::test]
+    async fn workspace_member_with_its_own_lock_is_refused_before_any_write() {
+        let fx = fixture_with(P1_BEFORE_PKG, P1_BEFORE_LOCK).await;
+        let ws_root = fx.root();
+        let member = ws_root.join("packages/a");
+        tokio::fs::create_dir_all(&member).await.unwrap();
+        for name in [PACKAGE_JSON, PNPM_LOCK, "node_modules"] {
+            tokio::fs::rename(ws_root.join(name), member.join(name))
+                .await
+                .unwrap();
+        }
+        let root_ws = "packages:\n  - 'packages/*'\nsharedWorkspaceLockfile: false\n";
+        tokio::fs::write(ws_root.join(PNPM_WORKSPACE), root_ws)
+            .await
+            .unwrap();
+        let blobs = ws_root.join(".socket/blobs");
+        let sources = PatchSources::blobs_only(&blobs);
+        // As the refusal spells it: canonical (Windows expands 8.3 names),
+        // without the verbatim prefix.
+        let governing = crate::utils::pnpm_workspace::without_verbatim_prefix(
+            std::fs::canonicalize(&ws_root)
+                .unwrap()
+                .join(PNPM_WORKSPACE),
+        );
+        for dry_run in [true, false] {
+            let outcome = crate::vendor::test_support::vendor_pnpm(
+                "pkg:npm/left-pad@1.3.0",
+                &member.join("node_modules/left-pad"),
+                &member,
+                &fx.record,
+                &sources,
+                "2026-06-09T00:00:00Z",
+                dry_run,
+                false,
+                None,
+            )
+            .await;
+            let detail = expect_refused(outcome, VENDOR_PNPM_SETTINGS_ELSEWHERE);
+            assert!(
+                detail.contains(&governing.display().to_string()),
+                "the detail names the governing workspace file: {detail}"
+            );
+        }
+        let preflight =
+            preflight_packages(&member, &[("pkg:npm/left-pad@1.3.0", &fx.record)]).await;
+        assert_eq!(preflight, vec![Err(VENDOR_PNPM_SETTINGS_ELSEWHERE)]);
+        assert!(!member.join(PNPM_WORKSPACE).exists(), "no nested file");
+        assert!(!member.join(".socket").exists(), "nothing staged");
+        assert_eq!(
+            tokio::fs::read_to_string(member.join(PACKAGE_JSON))
+                .await
+                .unwrap(),
+            P1_BEFORE_PKG
+        );
+        assert_eq!(
+            tokio::fs::read_to_string(member.join(PNPM_LOCK))
+                .await
+                .unwrap(),
+            P1_BEFORE_LOCK
+        );
+        assert_eq!(
+            tokio::fs::read_to_string(ws_root.join(PNPM_WORKSPACE))
+                .await
+                .unwrap(),
+            root_ws
+        );
+
+        // The workspace root itself (its own settings file) still vendors.
+        let fx = fixture_with(P1_BEFORE_PKG, P1_BEFORE_LOCK).await;
+        tokio::fs::write(fx.root().join(PNPM_WORKSPACE), "packages:\n  - '.'\n")
+            .await
+            .unwrap();
+        let (result, _, _) = expect_done(fx.vendor(false).await);
+        assert!(result.success, "{:?}", result.error);
     }
 
     #[tokio::test]

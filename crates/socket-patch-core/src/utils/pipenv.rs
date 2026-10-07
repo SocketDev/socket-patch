@@ -65,7 +65,7 @@ pub async fn installed_major(root: &Path) -> Option<u32> {
     // The RESOLVED path is spawned; a Windows `.bat` / `.cmd` shim is run by
     // `std` itself through cmd.exe with correct quoting (see the shared
     // launcher's docs).
-    let mut command = tokio::process::Command::from(crate::utils::process::command_for(&program));
+    let mut command = crate::utils::process::command_for(&program);
     // The version banner does not depend on a project, so the probe runs in a
     // NEUTRAL directory: with the scanned repository as cwd, Pipenv would read
     // its `.env`, `Pipfile` and `.venv` pointer — committed, attacker-shaped
@@ -76,12 +76,12 @@ pub async fn installed_major(root: &Path) -> Option<u32> {
         .current_dir(std::env::temp_dir())
         .env("PIPENV_DONT_LOAD_ENV", "1")
         .env("PIPENV_NOSPIN", "1")
-        .env("PIPENV_IGNORE_VIRTUALENVS", "1")
-        .kill_on_drop(true);
-    let output = tokio::time::timeout(std::time::Duration::from_secs(10), command.output())
-        .await
-        .ok()?
-        .ok()?;
+        .env("PIPENV_IGNORE_VIRTUALENVS", "1");
+    let output = crate::utils::fs::run_blocking(move || {
+        crate::utils::process::output_within(command, crate::utils::process::PROBE_TIMEOUT)
+    })
+    .await
+    .ok()?;
     if !output.status.success() {
         return None;
     }
