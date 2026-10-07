@@ -19,7 +19,7 @@
 //! | composer | package dir         | composer.lock `dist` → `{type: path}`          |
 //! | gem      | gem dir (+gemspec)  | Gemfile `path:` + Gemfile.lock PATH pair       |
 //! | pypi     | rebuilt wheel       | per manifest flavor: uv, poetry, pdm, pipenv, requirements ([`pypi`] routes) |
-//! | maven    | rebuilt jar         | committed `file://` maven2 repo + pom `<repository>` ([`maven_repo`]) |
+//! | maven    | patched jar         | suffixed `<version>-socket.<hex8>` tree under `.socket/vendor/maven2` + pom pin, `.mvn/maven.config` (or Gradle / sbt / scala-cli wiring) ([`maven_repo`] routes to [`jvm`]) |
 //! | nuget    | rebuilt nupkg       | folder feed + `nuget.config` + `packages.lock.json` pin ([`nuget_feed`]) |
 //!
 //! npm requests route through [`npm_flavor`], which content-sniffs the

@@ -61,7 +61,7 @@ fn text<'a>(read: ReadFn<'a>) -> impl Fn(&str) -> Option<String> + 'a {
 }
 
 /// [`Shape::Sbt`] for a directory holding an sbt marker, unless the
-/// project is already vendored through the Maven reactor, the legacy
+/// project is already vendored through the Maven reactor, the pre-v5
 /// single-pom path, the Gradle backend or the scala-cli backend (its wiring
 /// stays on that backend; a new pin there then plans as before).
 pub fn detect(read: ReadFn<'_>) -> Option<Shape> {
@@ -89,8 +89,9 @@ fn scala_cli_wired(read: ReadFn<'_>) -> bool {
     read(super::scala_cli::ROOT_FILE).is_some() || read(super::coursier_tree::INDEX_REL).is_some()
 }
 
-/// The legacy single-pom path (`vendor/maven_repo.rs`, `Shape::Other`)
-/// already wired the root pom: its `<repository>` id.
+/// The pre-v5 single-pom backend already wired the root pom: its
+/// `<repository>` id. The root stays off sbt so that `vendor --revert` can
+/// unwind it first (vendoring it is refused as `legacy_maven_root`).
 fn legacy_pom_wired(read: ReadFn<'_>) -> bool {
     read("pom.xml").is_some_and(|b| {
         let pom = String::from_utf8_lossy(&b);
@@ -102,17 +103,17 @@ fn legacy_pom_wired(read: ReadFn<'_>) -> bool {
     })
 }
 
-/// The Maven reactor backend already wired this root: its tagged block or
-/// pin in the root pom, or its repository tail in `.mvn/maven.config`.
+/// The Maven reactor backend already wired this root (a multi-module
+/// reactor or a single pom): its tagged block or pin in the root pom, or
+/// its repository tail in `.mvn/maven.config`.
 fn reactor_wired(read: ReadFn<'_>) -> bool {
     let Some(pom) = read("pom.xml").map(|b| String::from_utf8_lossy(&b).into_owned()) else {
         return false;
     };
-    maven_reactor::declares_modules(&pom)
-        && (pom.contains("<!-- socket-patch:begin -->")
-            || pom.contains("<!-- socket-patch ")
-            || read(maven_reactor::MAVEN_CONFIG)
-                .is_some_and(|c| String::from_utf8_lossy(&c).contains(".socket/vendor/maven2")))
+    pom.contains("<!-- socket-patch:begin -->")
+        || pom.contains("<!-- socket-patch ")
+        || read(maven_reactor::MAVEN_CONFIG)
+            .is_some_and(|c| String::from_utf8_lossy(&c).contains(".socket/vendor/maven2"))
 }
 
 /// The Gradle backend already wired this root (its settings apply line).
@@ -734,8 +735,9 @@ mod tests {
         let read = |p: &str| scala.get(p).cloned();
         assert_eq!(detect(&read), None);
         assert_eq!(super::super::detect(&read), Shape::ScalaCli);
-        // A single-module pom the legacy path already wired stays legacy
-        // (`Shape::Other`); an unwired one beside sbt routes to sbt.
+        // A single-module pom the pre-v5 path already wired stays off sbt
+        // (a Maven root, refused until reverted); an unwired one beside
+        // sbt routes to sbt.
         let legacy = build(
             "1.9.9",
             &[(
@@ -747,7 +749,7 @@ mod tests {
         );
         let read = |p: &str| legacy.get(p).cloned();
         assert_eq!(detect(&read), None);
-        assert_eq!(super::super::detect(&read), Shape::Other);
+        assert_eq!(super::super::detect(&read), Shape::MavenReactor);
         // A Gradle build with an unrelated `project/build.properties` is
         // not sbt-shaped.
         let stray: BTreeMap<String, Vec<u8>> = [
