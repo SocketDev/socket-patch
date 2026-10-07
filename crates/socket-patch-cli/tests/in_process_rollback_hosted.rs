@@ -1372,3 +1372,199 @@ async fn npm_hosted_round_trip_manifest_less_vex() {
             .expect("manifest-less VEX cells panicked");
     });
 }
+
+// ---------------------------------------------------------------------------
+// Agent record superseded by a hosted pin (#933)
+// ---------------------------------------------------------------------------
+//
+// An agent-mode apply recorded patch A in `.socket/manifest.json`; a later
+// hosted scan pinned the same `name@version` to a SUPERSEDING patch (the
+// fixture's UUID, B) and left record A in place. After a reinstall the tree
+// holds B's bytes, which are neither of A's sides, so restoring A in place
+// would fail "modified after patching". The hosted leg owns that package
+// now: rollback and remove restore the lock, drop the superseded record
+// with a warning, and exit 0.
+
+const SUPERSEDED_UUID: &str = "aaaaaaaa-aaaa-4aaa-8aaa-aaaaaaaaaaaa";
+const ORIGINAL_INDEX: &[u8] = b"module.exports = 'original';\n";
+const A_PATCHED_INDEX: &[u8] = b"module.exports = 'patched by A';\n";
+const B_PATCHED_INDEX: &[u8] = b"module.exports = 'patched by B';\n";
+
+/// The npm project wired by a real hosted scan to patch B, with agent
+/// record A left in the manifest (its before-blob cached, as agent apply
+/// leaves it) and `installed` as the installed `index.js`. Returns the
+/// pristine lock bytes.
+async fn write_superseded_agent_fixture(
+    root: &Path,
+    server: &MockServer,
+    installed: &[u8],
+) -> String {
+    let pristine = write_npm_project(root);
+    let pkg = root.join("node_modules").join(NAME);
+    std::fs::write(pkg.join("index.js"), A_PATCHED_INDEX).unwrap();
+
+    let before = socket_patch_core::hash::git_sha256::compute_git_sha256_from_bytes(ORIGINAL_INDEX);
+    let after = socket_patch_core::hash::git_sha256::compute_git_sha256_from_bytes(A_PATCHED_INDEX);
+    let mut record = patch_record(SUPERSEDED_UUID, GHSA);
+    record.files.clear();
+    record.files.insert(
+        "package/index.js".to_string(),
+        PatchFileInfo {
+            before_hash: before.clone(),
+            after_hash: after,
+        },
+    );
+    let mut manifest = socket_patch_core::manifest::schema::PatchManifest::new();
+    manifest.patches.insert(PURL.to_string(), record);
+    std::fs::create_dir_all(root.join(".socket/blobs")).unwrap();
+    std::fs::write(root.join(".socket/blobs").join(&before), ORIGINAL_INDEX).unwrap();
+    std::fs::write(
+        root.join(".socket/manifest.json"),
+        serde_json::to_string_pretty(&manifest).unwrap(),
+    )
+    .unwrap();
+
+    mock_discovery(server).await;
+    mock_reference(server).await;
+    mock_view(server).await;
+    let code = scan_run(hosted_scan_args(root, server.uri())).await;
+    assert_eq!(code, 0, "the superseding hosted scan should succeed");
+    let wired = std::fs::read_to_string(root.join("package-lock.json")).unwrap();
+    assert!(
+        wired.contains(HOSTED_URL),
+        "the lock must pin the superseding hosted patch; got:\n{wired}"
+    );
+    let manifest = std::fs::read_to_string(root.join(".socket/manifest.json")).unwrap();
+    assert!(
+        manifest.contains(SUPERSEDED_UUID),
+        "the hosted scan leaves the superseded agent record A in place; got:\n{manifest}"
+    );
+
+    // What the next `npm ci` (or no reinstall at all) leaves installed.
+    std::fs::write(pkg.join("index.js"), installed).unwrap();
+    mock_npm_registry(server).await;
+    pristine
+}
+
+fn manifest_patch_keys(root: &Path) -> Vec<String> {
+    let raw = std::fs::read_to_string(root.join(".socket/manifest.json")).unwrap();
+    let v: Value = serde_json::from_str(&raw).unwrap();
+    v["patches"]
+        .as_object()
+        .map(|m| m.keys().cloned().collect())
+        .unwrap_or_default()
+}
+
+/// Run `remove <identifier> --json --yes` online as a scrubbed subprocess.
+fn run_remove_subprocess_online(cwd: &Path, server: &MockServer, identifier: &str) -> (i32, Value) {
+    let out = scrubbed_cli()
+        .env(
+            "SOCKET_NPM_REGISTRY",
+            format!("{}/npm-registry", server.uri()),
+        )
+        .args([
+            "remove",
+            identifier,
+            "--json",
+            "--yes",
+            "--patch-server-url",
+            "http://patch.test",
+            "--cwd",
+            cwd.to_str().unwrap(),
+        ])
+        .output()
+        .expect("run socket-patch");
+    let envelope: Value = serde_json::from_slice(&out.stdout).unwrap_or_else(|e| {
+        panic!(
+            "remove --json stdout must be a pure JSON envelope: {e}\nstdout:\n{}\nstderr:\n{}",
+            String::from_utf8_lossy(&out.stdout),
+            String::from_utf8_lossy(&out.stderr)
+        )
+    });
+    (out.status.code().unwrap_or(-1), envelope)
+}
+
+/// #933: after the reinstall the tree holds B's bytes. Rollback restores
+/// the lock, drops record A with `rollback_record_superseded`, leaves the
+/// installed bytes for the reinstall to replace, and exits 0 — twice.
+#[tokio::test]
+#[serial]
+async fn rollback_drops_an_agent_record_superseded_by_a_hosted_pin() {
+    let server = MockServer::start().await;
+    let tmp = tempfile::tempdir().unwrap();
+    let pristine = write_superseded_agent_fixture(tmp.path(), &server, B_PATCHED_INDEX).await;
+
+    let (code, envelope) = run_rollback_subprocess_online(tmp.path(), &server, &[]);
+    assert_eq!(
+        code, 0,
+        "rollback must not fail on the superseded record:\n{envelope:#}"
+    );
+    assert!(
+        warning_codes(&envelope).contains(&"rollback_record_superseded".to_string()),
+        "the superseded record is named in warnings[]:\n{envelope:#}"
+    );
+    let restored = std::fs::read_to_string(tmp.path().join("package-lock.json")).unwrap();
+    assert_eq!(restored, pristine, "the hosted leg restores the lock");
+    assert!(
+        manifest_patch_keys(tmp.path()).is_empty(),
+        "the superseded record leaves the manifest"
+    );
+    let installed =
+        std::fs::read(tmp.path().join("node_modules").join(NAME).join("index.js")).unwrap();
+    assert_eq!(
+        installed, B_PATCHED_INDEX,
+        "B's installed bytes are the reinstall's to replace, never overwritten with A's original"
+    );
+
+    let (code, envelope) = run_rollback_subprocess_online(tmp.path(), &server, &[]);
+    assert_eq!(code, 0, "a re-run is a clean no-op:\n{envelope:#}");
+}
+
+/// #933 without a reinstall: the tree still holds A's patched bytes, so
+/// the agent leg restores them in place as before.
+#[tokio::test]
+#[serial]
+async fn rollback_restores_a_superseded_agent_record_still_installed() {
+    let server = MockServer::start().await;
+    let tmp = tempfile::tempdir().unwrap();
+    let pristine = write_superseded_agent_fixture(tmp.path(), &server, A_PATCHED_INDEX).await;
+
+    let (code, envelope) = run_rollback_subprocess_online(tmp.path(), &server, &[]);
+    assert_eq!(code, 0, "{envelope:#}");
+    assert!(
+        !warning_codes(&envelope).contains(&"rollback_record_superseded".to_string()),
+        "A's bytes were restored in place, nothing was left to the reinstall:\n{envelope:#}"
+    );
+    let restored = std::fs::read_to_string(tmp.path().join("package-lock.json")).unwrap();
+    assert_eq!(restored, pristine);
+    assert!(manifest_patch_keys(tmp.path()).is_empty());
+    let installed =
+        std::fs::read(tmp.path().join("node_modules").join(NAME).join("index.js")).unwrap();
+    assert_eq!(installed, ORIGINAL_INDEX);
+}
+
+/// #933: `remove <purl>` un-hosts the package instead of aborting on the
+/// superseded agent record before the hosted leg runs.
+#[tokio::test]
+#[serial]
+async fn remove_unhosts_a_package_whose_agent_record_is_superseded() {
+    let server = MockServer::start().await;
+    let tmp = tempfile::tempdir().unwrap();
+    let pristine = write_superseded_agent_fixture(tmp.path(), &server, B_PATCHED_INDEX).await;
+
+    let (code, envelope) = run_remove_subprocess_online(tmp.path(), &server, PURL);
+    assert_eq!(
+        code, 0,
+        "remove must not refuse the superseded record:\n{envelope:#}"
+    );
+    let restored = std::fs::read_to_string(tmp.path().join("package-lock.json")).unwrap();
+    assert_eq!(
+        restored, pristine,
+        "remove must not leave the hosted pin live"
+    );
+    assert!(manifest_patch_keys(tmp.path()).is_empty());
+    assert!(
+        envelope.to_string().contains("rollback_record_superseded"),
+        "the superseded record is reported:\n{envelope:#}"
+    );
+}

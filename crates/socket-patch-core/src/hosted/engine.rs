@@ -46,11 +46,12 @@ use super::guidance::{
     npm_allow_remote_env_set_detail, npm_allow_remote_manual_detail,
     npm_allow_remote_outer_set_detail, npm_allow_remote_unreadable_detail,
     npm_allow_remote_user_set_detail, npm_lock_url_needles, plan_workspace_trust, pnpm_heal_root,
-    pnpm_lock_may_need_store_flag, pnpm_lock_version_major, pnpm_trust_configured_detail,
-    pnpm_trust_legacy_detail, pnpm_trust_manual_guidance, pnpm_trust_policy_preamble,
-    pnpm_trust_workspace_unreadable_detail, pnpm_trust_workspace_unsupported_detail,
-    read_npmrc_for_allow_remote, read_workspace_for_trust, url_host, TrustPlan, NPM_LOCKS,
-    PNPM_TRUST_TRADEOFF_AND_CAUTION, PNPM_WORKSPACE_REL, REDIRECT_PNPM_WORKSPACE_TRUST_EDIT_KIND,
+    pnpm_is_shrinkwrap_lock, pnpm_lock_may_need_store_flag, pnpm_lock_version_major,
+    pnpm_trust_configured_detail, pnpm_trust_legacy_detail, pnpm_trust_manual_guidance,
+    pnpm_trust_policy_preamble, pnpm_trust_workspace_unreadable_detail,
+    pnpm_trust_workspace_unsupported_detail, read_npmrc_for_allow_remote, read_workspace_for_trust,
+    url_host, TrustPlan, NPM_LOCKS, PNPM_TRUST_TRADEOFF_AND_CAUTION, PNPM_WORKSPACE_REL,
+    REDIRECT_PNPM_WORKSPACE_TRUST_EDIT_KIND,
 };
 use super::vlt::bun_lockb_present;
 
@@ -1407,9 +1408,7 @@ fn pnpm_trust(
     // needed" for a lock whose era is unknown.
     let all_locks_legacy = pnpm_lock_texts.iter().all(|text| {
         pnpm_lock_version_major(text).is_some_and(|major| major < 9)
-            || text
-                .lines()
-                .any(|line| line.starts_with("shrinkwrapVersion:"))
+            || pnpm_is_shrinkwrap_lock(text)
     });
     let detail = if all_locks_legacy {
         pnpm_trust_legacy_detail(&server)
