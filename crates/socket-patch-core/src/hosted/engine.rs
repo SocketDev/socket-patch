@@ -39,7 +39,7 @@ use crate::patch::redirect::{
 };
 use crate::utils::pnpm_workspace::governing_workspace_file;
 use crate::utils::purl::purl_parts;
-use crate::vendor::lock_inventory::{MemoryEntry, ProjectView};
+use crate::vendor::lock_inventory::{bun_text_lock_drives, MemoryEntry, ProjectView};
 
 use super::guidance::{
     npm_allow_remote_already_detail, npm_allow_remote_configured_detail,
@@ -252,23 +252,11 @@ pub fn build_candidates(
     candidates
 }
 
-/// Whether the text `bun.lock` is present (disk: `exists`). Text retains
-/// Bun's precedence when both lock spellings are present.
-pub fn bun_lock_present(view: &ProjectView<'_>) -> bool {
-    match view {
-        ProjectView::Disk(cwd)
-        | ProjectView::Snapshot(crate::vendor::lock_inventory::DiskSnapshot {
-            root: cwd, ..
-        }) => cwd.join("bun.lock").exists(),
-        ProjectView::Memory(project) => project.contains("bun.lock"),
-    }
-}
-
 /// Whether an npm candidate would rewrite a `bun.lockb` that is a symbolic
 /// link (atomic replacement cannot preserve a link; previews refuse too).
 pub fn bun_lockb_symlinked(view: &ProjectView<'_>, candidates: &[Candidate]) -> bool {
     candidates.iter().any(|c| c.dep.ecosystem == "npm")
-        && !bun_lock_present(view)
+        && !bun_text_lock_drives(view)
         && view.is_symlink("bun.lockb")
 }
 
@@ -1085,7 +1073,7 @@ pub async fn rewrite(
     // candidate filter, so it can never disagree with `candidates`.
     let overrides: Vec<DepOverride> = candidates.iter().map(|c| c.dep.clone()).collect();
     let bun_lockb = bun_lockb_present(view);
-    let binary_bun = !bun_lock_present(view) && bun_lockb;
+    let binary_bun = !bun_text_lock_drives(view) && bun_lockb;
     let binary_content = if binary_bun && overrides.iter().any(|o| o.ecosystem == "npm") {
         Some(
             view.read_bytes("bun.lockb")

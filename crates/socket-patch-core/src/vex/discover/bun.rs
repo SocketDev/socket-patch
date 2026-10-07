@@ -4,8 +4,10 @@
 //! ## Which lock
 //!
 //! Exactly ONE of the two is read, because bun itself reads exactly one:
-//! `bun.lock` whenever it exists (lstat — a squatting FIFO / dangling link
-//! still counts, and is then diagnosed unreadable), else `bun.lockb`. A
+//! `bun.lock` whenever its open finds something (stat, through links — a
+//! squatting FIFO or directory still counts, and is then diagnosed
+//! unreadable; a dangling link does not, #735), else `bun.lockb`: the
+//! shared [`bun_text_lock_drives`] predicate. A
 //! stale binary lock left beside a text lock wires nothing, so it must not
 //! become a ref (rule 10 — the same gate `vendor::bun_workspace` and
 //! `lock_inventory::wired_vendor_integrity` apply).
@@ -96,11 +98,12 @@ use crate::utils::digest::is_sri_pin;
 use crate::vendor::bun_lock_text::{decode_json_string, is_bundled_entry, split_name_spec};
 use crate::vendor::bun_lockb::BunLockb;
 use crate::vendor::lock_inventory::bun::bun_text_entries;
+use crate::vendor::lock_inventory::bun_text_lock_drives;
 use crate::vendor::lock_inventory::LockIntegrity;
 use crate::vendor::npm_common::tgz_leaf_version;
 
 pub(crate) async fn extract(ctx: &DiscoverCtx<'_>, out: &mut Discovery) {
-    if ctx.exists(BUN_LOCK).await {
+    if bun_text_lock_drives(&ctx.view) {
         extract_text(ctx, out).await;
         // bun reads bun.lock whenever it exists: whatever a leftover
         // bun.lockb still names is recognized as unwired (rule 11).
@@ -1425,6 +1428,28 @@ mod tests {
             .expect("discovery must not block on a FIFO");
         assert!(out.refs.is_empty());
         assert_eq!(diag_codes(&out), vec![DIAG_LOCKFILE_UNREADABLE]);
+    }
+
+    /// REGRESSION (#735): a dangling `bun.lock` link is absent to bun,
+    /// which installs from `bun.lockb` — so discovery reads the binary
+    /// lock's refs instead of diagnosing the link unreadable.
+    #[cfg(unix)]
+    #[tokio::test]
+    async fn dangling_text_lock_link_leaves_the_binary_lock_live() {
+        let bytes = std::fs::read(fixture_path("bun-lockb/1.3.14/bun.lockb")).expect("fixture");
+        let p = Project::new();
+        p.write(
+            "bun.lockb",
+            rewire(&bytes, &[hosted_minimist("1.2.2", UUID_A)]),
+        );
+        std::os::unix::fs::symlink("missing-target", p.root().join("bun.lock")).unwrap();
+        let out = run(&p).await;
+        assert_refs(
+            &out,
+            &[("pkg:npm/minimist@1.2.2", UUID_A, WiringMode::Hosted)],
+        );
+        assert!(out.diagnostics.is_empty(), "{:?}", out.diagnostics);
+        assert_eq!(out.refs[0].source_file, Path::new("bun.lockb"));
     }
 
     /// The full orchestrator picks the bun refs up.

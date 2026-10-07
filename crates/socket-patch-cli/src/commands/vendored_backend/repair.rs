@@ -41,7 +41,9 @@ struct Candidate {
 pub(crate) async fn scan_vendor_references(project_root: &Path) -> Vec<(String, String, String)> {
     let mut seen: HashSet<(String, String)> = HashSet::new();
     let mut out = Vec::new();
-    if !project_root.join("bun.lock").exists() {
+    if !socket_patch_core::vendor::lock_inventory::bun_text_lock_drives(
+        &socket_patch_core::vendor::lock_inventory::ProjectView::Disk(project_root),
+    ) {
         if let Ok(paths) =
             socket_patch_core::vendor::bun_lock::binary_vendor_paths(project_root).await
         {

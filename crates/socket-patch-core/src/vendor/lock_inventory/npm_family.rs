@@ -5,13 +5,11 @@
 #[cfg(test)]
 use std::path::Path;
 
-use crate::constants::npm_family::{
-    BUN_LOCK, BUN_LOCKB, NPM_LOCKS, PNPM_SHRINKWRAP_LEGACY, VLT_LOCK,
-};
+use crate::constants::npm_family::{BUN_LOCKB, NPM_LOCKS, PNPM_SHRINKWRAP_LEGACY, VLT_LOCK};
 use crate::utils::purl::npm_purl;
 use crate::vendor::npm_flavor::NpmLockFlavor;
 
-use super::bun::{bun_text_lock_present_in, inventory_bun_binary_in, inventory_bun_in};
+use super::bun::{bun_text_lock_drives, inventory_bun_binary_in, inventory_bun_in};
 use super::npm::inventory_package_lock_in;
 use super::pnpm::{
     inventory_pnpm_lock_in, inventory_pnpm_lock_rel_in, inventory_rush_pnpm_locks_in,
@@ -151,7 +149,7 @@ pub(super) async fn inventory_npm_lock_raw_in(
         NpmLockFlavor::YarnClassic => inventory_yarn_classic_in(view).await,
         NpmLockFlavor::YarnBerry => inventory_yarn_berry_in(view).await,
         NpmLockFlavor::Bun => {
-            if bun_text_lock_present_in(view).await {
+            if bun_text_lock_drives(view) {
                 inventory_bun_in(view).await
             } else {
                 Some(inventory_bun_binary_in(view).await?)
@@ -184,7 +182,7 @@ pub(super) async fn inventory_live_sibling_lock_in(
     // when the version refusal fired no bun.lock can actually be present;
     // probed anyway to keep this a literal transcription of the router's
     // order. The binary lock shares the same routing precedence.
-    if view.exists(BUN_LOCK).await {
+    if bun_text_lock_drives(view) {
         return Some((
             NpmLockFlavor::Bun,
             inventory_bun_in(view).await.unwrap_or_default(),

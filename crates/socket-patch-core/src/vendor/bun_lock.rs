@@ -647,12 +647,12 @@ pub(crate) async fn vendor_bun<'a>(
     }
 }
 
-/// Whether the project's installs are driven by the native binary lock:
-/// no `bun.lock` beside a `bun.lockb`. [`vendor_bun`] routes those to
-/// [`super::bun_binary`], and the vendor loop's download plan follows the
-/// same routing.
+/// Whether the project's installs are driven by the native binary lock
+/// ([`super::lock_inventory::bun_binary_lock_drives`]). [`vendor_bun`]
+/// routes those to [`super::bun_binary`], and the vendor loop's download
+/// plan follows the same routing.
 pub(super) fn binary_lock_drives(project_root: &Path) -> bool {
-    !project_root.join(BUN_LOCK).exists() && project_root.join("bun.lockb").exists()
+    super::lock_inventory::bun_binary_lock_drives(project_root)
 }
 
 /// The text lock, read and strictly parsed before any write: version-
@@ -851,9 +851,7 @@ pub(crate) async fn revert_bun_opts(
         .wiring
         .iter()
         .any(|r| r.kind == super::bun_binary::KIND || r.kind == "bun_lockb_workspace_artifact")
-        || (entry.wiring.is_empty()
-            && !project_root.join(BUN_LOCK).exists()
-            && project_root.join("bun.lockb").exists())
+        || (entry.wiring.is_empty() && binary_lock_drives(project_root))
     {
         return super::bun_binary::revert(entry, project_root, opts).await;
     }

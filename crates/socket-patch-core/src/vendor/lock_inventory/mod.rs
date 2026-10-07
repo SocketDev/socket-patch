@@ -70,6 +70,7 @@ pub(crate) mod vlt;
 pub(crate) mod wired;
 pub(crate) mod yarn;
 
+pub use self::bun::{bun_binary_lock_drives, bun_text_lock_drives};
 pub(crate) use self::npm::{
     npm_legacy_identity, npm_lock_bundled_nodes, npm_lock_legacy_mirror_nodes,
     npm_lock_located_nodes, NpmLockNode,
