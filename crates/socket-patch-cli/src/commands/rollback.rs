@@ -24,7 +24,9 @@ use crate::args::{apply_env_toggles, parse_bool_flag, GlobalArgs};
 use crate::commands::apply::is_local_go;
 use crate::commands::lock_cli::acquire_or_emit;
 use crate::commands::vendored_backend::{RevertedEntry, VendorRevertStep, VendoredBackend};
-use crate::ecosystem_dispatch::{find_all_packages_for_rollback, partition_purls, JvmScope};
+use crate::ecosystem_dispatch::{
+    distinct_npm_copies, find_all_packages_for_rollback, partition_purls, JvmScope,
+};
 use crate::json_envelope::Command as EnvelopeCommand;
 use crate::looks_like_uuid;
 use crate::ui::{plural, StatusLine};
@@ -2144,12 +2146,14 @@ pub(crate) async fn rollback_patches_inner(
     // one would leave the other copy still patched (silently divergent from
     // the manifest's rolled-back state). The rollback loop below restores
     // every copy.
-    let all_packages_multi = find_all_packages_for_rollback(
+    let mut all_packages_multi = find_all_packages_for_rollback(
         &partitioned,
         &crawler_options,
         common.silent || common.json,
     )
     .await;
+    // One restore per physical copy, as apply patches them (#633).
+    distinct_npm_copies(&mut all_packages_multi).await;
 
     // One representative path per PURL for the "is it installed" checks and
     // the abort envelope's path display. The before-blob gate and the

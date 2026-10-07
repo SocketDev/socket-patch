@@ -1184,7 +1184,7 @@ Every `--json` invocation emits a single JSON object that follows the **unified 
 }
 ```
 
-`files[].path` is the manifest file key (`package/index.js`). A pnpm or vlt package installed as more than one peer-variant store copy is patched (and rolled back) in every copy; a file of a copy other than the one the package resolved to is listed under that copy's on-disk path (`…/.pnpm/foo@1.0.0_react@18.3.1/node_modules/foo/index.js`). So a run that wrote only such a copy reports `applied` with that file, not `already_patched`, and rollback's `filesRolledBack` / `filesVerified` carry the same paths (it counts the package in `rolledBack`, not `alreadyOriginal`).
+`files[].path` is the manifest file key (`package/index.js`). A pnpm or vlt package installed as more than one peer-variant store copy is patched (and rolled back) in every copy; a file of a copy other than the one the package resolved to is listed under that copy's on-disk path (`…/.pnpm/foo@1.0.0_react@18.3.1/node_modules/foo/index.js`). So a run that wrote only such a copy reports `applied` with that file, not `already_patched`, and rollback's `filesRolledBack` / `filesVerified` carry the same paths (it counts the package in `rolledBack`, not `alreadyOriginal`). Copies are counted by real location: a pnpm / Bun workspace member's `packages/a/node_modules/foo` link into the root store is the same copy as the store entry, so `apply` / `rollback` visit it once (one event, no phantom `already_patched` / `alreadyOriginal`), while path targets still match it through the member's link (#633).
 
 `details` is intentionally schemaless — different subcommands attach different keys. Consumers MUST treat unknown keys as best-effort metadata and must not break on absence.
 

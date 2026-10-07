@@ -685,3 +685,126 @@ fn apply_and_rollback_refuse_a_node_modules_link_to_first_party_source() {
         "rollback wrote through the link"
     );
 }
+
+/// #633: in a pnpm workspace on the isolated linker, a member's
+/// `packages/a/node_modules/dupvuln` is a link to the root store entry
+/// `node_modules/.pnpm/dupvuln@1.0.0/node_modules/dupvuln`. The root and
+/// the member are separate `node_modules` roots, so the resolver sees the
+/// one physical copy under two spellings; apply and rollback must still
+/// visit it once (they used to report a phantom `already_patched` /
+/// already-original second event on every run). Path targets keep seeing
+/// the member's spelling, so `rollback packages/a` still selects it.
+#[cfg(unix)]
+#[test]
+fn apply_and_rollback_visit_a_pnpm_workspace_member_link_once() {
+    let tmp = tempfile::tempdir().unwrap();
+    let root = tmp.path();
+    let name = "dupvuln";
+    let purl = "pkg:npm/dupvuln@1.0.0";
+    let original = b"module.exports = function(){ return 'VULNERABLE'; };\n";
+    let mut patched = original.to_vec();
+    patched.extend_from_slice(b"// SOCKET-PATCHED-MULTICOPY\n");
+    std::fs::write(
+        root.join("package.json"),
+        r#"{ "name": "root", "version": "1.0.0", "private": true }"#,
+    )
+    .unwrap();
+    std::fs::write(
+        root.join("pnpm-workspace.yaml"),
+        "packages:\n  - 'packages/*'\n",
+    )
+    .unwrap();
+    let store_copy = write_copy(
+        &root
+            .join("node_modules/.pnpm/dupvuln@1.0.0/node_modules")
+            .join(name),
+        name,
+        "1.0.0",
+        original,
+    );
+    let member = root.join("packages").join("a");
+    std::fs::create_dir_all(member.join("node_modules")).unwrap();
+    std::fs::write(
+        member.join("package.json"),
+        r#"{ "name": "a", "version": "1.0.0", "dependencies": { "dupvuln": "1.0.0" } }"#,
+    )
+    .unwrap();
+    std::os::unix::fs::symlink(
+        "../../../node_modules/.pnpm/dupvuln@1.0.0/node_modules/dupvuln",
+        member.join("node_modules").join(name),
+    )
+    .unwrap();
+    stage_manifest_and_blob(
+        root,
+        purl,
+        &git_sha256(original),
+        &git_sha256(&patched),
+        &patched,
+    );
+    std::fs::write(
+        root.join(".socket")
+            .join("blobs")
+            .join(git_sha256(original)),
+        original,
+    )
+    .unwrap();
+
+    let (code, v) = run_apply(root);
+    assert_eq!(code, 0, "first apply; envelope={v}");
+    assert_eq!(std::fs::read(&store_copy).unwrap(), patched);
+    assert_eq!(v["summary"]["applied"], 1, "first apply; envelope={v}");
+    assert_eq!(v["summary"]["skipped"], 0, "first apply; envelope={v}");
+    assert_eq!(
+        dupvuln_events(&v),
+        vec![("applied".to_string(), String::new())],
+        "first apply; envelope={v}"
+    );
+
+    let (code, v) = run_apply(root);
+    assert_eq!(code, 0, "second apply; envelope={v}");
+    assert_eq!(v["summary"]["applied"], 0, "second apply; envelope={v}");
+    assert_eq!(v["summary"]["skipped"], 1, "second apply; envelope={v}");
+    assert_eq!(
+        dupvuln_events(&v),
+        vec![("skipped".to_string(), "already_patched".to_string())],
+        "second apply; envelope={v}"
+    );
+
+    let rollback = |extra: &[&str]| {
+        let out = Command::new(binary())
+            .args([
+                "rollback",
+                "--json",
+                "--offline",
+                "--yes",
+                "--ecosystems",
+                "npm",
+            ])
+            .args(extra)
+            .arg("--cwd")
+            .arg(root)
+            .output()
+            .expect("run rollback");
+        let stdout = String::from_utf8_lossy(&out.stdout).to_string();
+        let v: serde_json::Value = serde_json::from_str(stdout.trim())
+            .unwrap_or_else(|e| panic!("rollback must emit JSON: {e}; stdout={stdout}"));
+        (out.status.code().unwrap_or(-1), v)
+    };
+
+    // `--preserve-state` keeps the manifest entry for the scoped run below.
+    let (code, v) = rollback(&["--preserve-state"]);
+    assert_eq!(code, 0, "rollback; envelope={v}");
+    assert_eq!(std::fs::read(&store_copy).unwrap(), original);
+    assert_eq!(v["rolledBack"], 1, "rollback; envelope={v}");
+    assert_eq!(v["alreadyOriginal"], 0, "rollback; envelope={v}");
+
+    // A path target still selects the copy through the member's link.
+    let (code, v) = run_apply(root);
+    assert_eq!(code, 0, "re-apply; envelope={v}");
+    assert_eq!(std::fs::read(&store_copy).unwrap(), patched);
+    let (code, v) = rollback(&["packages/a"]);
+    assert_eq!(code, 0, "scoped rollback; envelope={v}");
+    assert_eq!(std::fs::read(&store_copy).unwrap(), original);
+    assert_eq!(v["rolledBack"], 1, "scoped rollback; envelope={v}");
+    assert_eq!(v["alreadyOriginal"], 0, "scoped rollback; envelope={v}");
+}

@@ -198,6 +198,45 @@ fn merge_npm_copies(
     }
 }
 
+/// `paths` in order with every path that resolves to an already-listed
+/// directory dropped: two discovered site-packages paths can name ONE
+/// directory (a `lib64 -> lib` symlink, a symlinked venv), as can two npm
+/// copies (see [`distinct_npm_copies`]), and patching it twice would report
+/// the second pass `already_patched`. A path that can't be canonicalized is
+/// kept as-is.
+pub(crate) async fn distinct_install_dirs(paths: &[PathBuf]) -> Vec<PathBuf> {
+    let mut seen: HashSet<PathBuf> = HashSet::new();
+    let mut out = Vec::with_capacity(paths.len());
+    for path in paths {
+        let key = tokio::fs::canonicalize(path)
+            .await
+            .unwrap_or_else(|_| path.clone());
+        if seen.insert(key) {
+            out.push(path.clone());
+        }
+    }
+    out
+}
+
+/// Collapse each npm PURL's copies to distinct physical directories, in
+/// discovery order (the first spelling of each directory wins). The
+/// resolver walks every `node_modules` root, so a pnpm / Bun isolated
+/// workspace yields one copy twice: as the root's `.pnpm` store entry and
+/// as a member's `packages/a/node_modules/<dep>` link to it. Visiting both
+/// patched (or restored) it once and reported the second visit as a
+/// phantom `already_patched` / already-original event (#633). The map
+/// itself keeps every spelling, because path targets (`scan` / `rollback
+/// packages/a`) select a copy by the member's link; only the commands that
+/// act per copy collapse it. Genuinely distinct copies (nested duplicates,
+/// store peer variants) have distinct real paths and are all kept.
+pub(crate) async fn distinct_npm_copies(map: &mut HashMap<String, Vec<PathBuf>>) {
+    for (purl, paths) in map.iter_mut() {
+        if paths.len() > 1 && Ecosystem::from_purl(purl) == Some(Ecosystem::Npm) {
+            *paths = distinct_install_dirs(paths).await;
+        }
+    }
+}
+
 /// Release-variant merge: the crawler is queried with base PURLs (no
 /// `?qualifiers`); fan the resulting paths back out to every qualified
 /// caller-supplied PURL that strips to the same base. Used for the
@@ -1068,6 +1107,34 @@ mod tests {
     }
 
     // ---- merge_npm_copies -------------------------------------------------
+
+    /// #633: a pnpm workspace member's link into the root store is the
+    /// copy the root walk already found, so it collapses to the first
+    /// spelling; a genuine second copy, a missing path and a non-npm PURL
+    /// are kept as they are.
+    #[cfg(unix)]
+    #[tokio::test]
+    async fn distinct_npm_copies_drops_a_second_spelling_of_one_dir() {
+        let tmp = tempfile::tempdir().unwrap();
+        let store = tmp.path().join("node_modules/.pnpm/a@1.0.0/node_modules/a");
+        let nested = tmp.path().join("node_modules/b/node_modules/a");
+        std::fs::create_dir_all(&store).unwrap();
+        std::fs::create_dir_all(&nested).unwrap();
+        let member_nm = tmp.path().join("packages/m/node_modules");
+        std::fs::create_dir_all(&member_nm).unwrap();
+        let link = member_nm.join("a");
+        std::os::unix::fs::symlink(&store, &link).unwrap();
+        let missing = tmp.path().join("gone");
+        let mut map: HashMap<String, Vec<PathBuf>> = HashMap::new();
+        map.insert(
+            "pkg:npm/a@1.0.0".into(),
+            vec![store.clone(), link.clone(), nested.clone(), missing.clone()],
+        );
+        map.insert("pkg:gem/a@1.0.0".into(), vec![store.clone(), link.clone()]);
+        distinct_npm_copies(&mut map).await;
+        assert_eq!(map["pkg:npm/a@1.0.0"], vec![store.clone(), nested, missing]);
+        assert_eq!(map["pkg:gem/a@1.0.0"], vec![store, link]);
+    }
 
     #[test]
     fn merge_npm_copies_carries_every_copy_per_purl() {
