@@ -1293,6 +1293,61 @@ async fn scan_prune_without_a_mode_is_report_only() {
     );
 }
 
+/// #464: a report-only global scan hints at commands that keep the global
+/// scope. Run verbatim without `--global-prefix`, the hint would scan the
+/// cwd project and leave the global copy unpatched.
+#[tokio::test]
+async fn scan_global_report_only_hint_keeps_the_global_scope() {
+    let mock = MockServer::start().await;
+    let purl = "pkg:npm/minimist@1.2.2";
+    mount_one_patch_api(&mock, purl, b"x\n").await;
+
+    let tmp = tempfile::tempdir().unwrap();
+    // A prefix with a space: the hint must quote it to stay runnable.
+    let prefix = tmp.path().join("global lib").join("node_modules");
+    let pkg_dir = prefix.join("minimist");
+    std::fs::create_dir_all(&pkg_dir).unwrap();
+    std::fs::write(
+        pkg_dir.join("package.json"),
+        r#"{ "name": "minimist", "version": "1.2.2" }"#,
+    )
+    .unwrap();
+    std::fs::write(pkg_dir.join("index.js"), b"x\n").unwrap();
+    let cwd = tmp.path().join("elsewhere");
+    std::fs::create_dir_all(&cwd).unwrap();
+
+    let prefix_arg = prefix.to_str().unwrap();
+    let (code, stdout, stderr) =
+        run_scan_human(&cwd, &mock.uri(), &["--global-prefix", prefix_arg]);
+    assert_eq!(
+        code, 0,
+        "report-only is a success; stdout={stdout}; stderr={stderr}"
+    );
+    assert!(
+        stdout.contains("Patches to apply:") && stdout.contains(purl),
+        "the global scan must find the patch; got {stdout:?}"
+    );
+    let quoted = if cfg!(windows) {
+        format!("\"{prefix_arg}\"")
+    } else {
+        format!("'{prefix_arg}'")
+    };
+    for command in [
+        format!("  socket-patch scan --mode agent --global-prefix {quoted}"),
+        format!("  socket-patch get --global-prefix {quoted} <package-name-or-purl-or-CVE-ID>"),
+    ] {
+        assert!(
+            stdout.lines().any(|line| line == command),
+            "the hint must keep the global scope ({command:?}); got {stdout:?}"
+        );
+    }
+    assert_eq!(
+        std::fs::read(pkg_dir.join("index.js")).unwrap(),
+        b"x\n",
+        "a report-only scan must not patch the global copy"
+    );
+}
+
 /// Each spelling that folds to `--mode agent` applies without prompting.
 #[tokio::test]
 async fn scan_human_agent_mode_applies_without_prompting() {

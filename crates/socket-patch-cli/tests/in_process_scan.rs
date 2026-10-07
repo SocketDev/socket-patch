@@ -13,6 +13,49 @@ use socket_patch_cli::commands::scan::{run, ScanArgs};
 use wiremock::matchers::{method, path, path_regex};
 use wiremock::{Mock, MockServer, ResponseTemplate};
 
+/// Keeps the machine's Coursier / Ivy caches out of a Maven test that pins
+/// the exact batch traffic (a JVM project's crawl also reaches them):
+/// `HOME` points at an empty directory and the variables naming a cache
+/// are unset until drop, which restores them. Only inside `#[serial]`
+/// tests.
+struct NoJvmCaches {
+    _home: tempfile::TempDir,
+    saved: Vec<(&'static str, Option<std::ffi::OsString>)>,
+}
+
+impl NoJvmCaches {
+    fn new() -> Self {
+        let home = tempfile::tempdir().unwrap();
+        let keys = [
+            "HOME",
+            "USERPROFILE",
+            "XDG_CACHE_HOME",
+            "LOCALAPPDATA",
+            "COURSIER_CACHE",
+            "SBT_OPTS",
+            "JAVA_OPTS",
+        ];
+        let saved = keys.iter().map(|k| (*k, std::env::var_os(k))).collect();
+        for key in keys {
+            std::env::remove_var(key);
+        }
+        std::env::set_var("HOME", home.path());
+        std::env::set_var("USERPROFILE", home.path());
+        Self { _home: home, saved }
+    }
+}
+
+impl Drop for NoJvmCaches {
+    fn drop(&mut self) {
+        for (key, value) in &self.saved {
+            match value {
+                Some(v) => std::env::set_var(key, v),
+                None => std::env::remove_var(key),
+            }
+        }
+    }
+}
+
 const ORG: &str = "test-org";
 const PURL: &str = "pkg:npm/in-proc-scan@1.0.0";
 const UUID: &str = "11111111-1111-4111-8111-111111111111";
@@ -1380,6 +1423,7 @@ async fn scan_non_json_dry_run_does_not_mutate() {
 #[tokio::test]
 #[serial]
 async fn scan_discovers_maven_and_nuget_in_every_mode() {
+    let _no_jvm_caches = NoJvmCaches::new();
     use socket_patch_cli::commands::scan::ScanMode;
 
     const MAVEN_PURL: &str = "pkg:maven/org.example/foo@1.0.0";

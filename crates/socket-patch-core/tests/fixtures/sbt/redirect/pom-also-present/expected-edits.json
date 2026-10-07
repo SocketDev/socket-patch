@@ -1,0 +1,41 @@
+[
+  {
+    "path": "pom.xml",
+    "kind": "redirect_maven_dep_version",
+    "action": "rewritten",
+    "key": "org.apache.commons:commons-lang3",
+    "original": "3.11",
+    "new": "3.11-socket.abcdef12"
+  },
+  {
+    "path": "pom.xml",
+    "kind": "redirect_maven_repository",
+    "action": "added",
+    "key": "socket-patch-abcdef12-0000-4000-8000-000000000001",
+    "new": {
+      "id": "socket-patch-abcdef12-0000-4000-8000-000000000001",
+      "url": "https://patch.socket.dev/patch-registry/maven/11111111-1111-4111-8111-111111111111/abcdef12-0000-4000-8000-000000000001/maven2"
+    }
+  },
+  {
+    "path": ".mvn/maven.config",
+    "kind": "redirect_maven_config",
+    "action": "added",
+    "key": "trustedChecksums"
+  },
+  {
+    "path": ".mvn/checksums/checksums.sha256",
+    "kind": "redirect_maven_trusted_checksums",
+    "action": "added"
+  },
+  {
+    "path": "socket-patch.sbt",
+    "kind": "redirect_sbt_pin",
+    "action": "added",
+    "key": "org.apache.commons:commons-lang3",
+    "new": {
+      "uuid": "abcdef12-0000-4000-8000-000000000001",
+      "version": "3.11-socket.abcdef12"
+    }
+  }
+]

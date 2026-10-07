@@ -34,9 +34,9 @@ use socket_patch_core::utils::group_commit::{CommittedFile, GroupCommit};
 use socket_patch_core::utils::purl::{canonical_purl, normalize_purl, strip_purl_qualifiers};
 use socket_patch_core::utils::socket_dir::remove_tree_and_prune;
 use socket_patch_core::vendor::{
-    self, ecosystem_dir_for_purl, load_state, lock_inventory, lookup_entry, save_state,
-    save_state_shared, PackageSource, RevertOpts, RevertOutcome, VendorEntry, VendorOutcome,
-    VendorServiceConfig, VendorState, VendorWarning,
+    self, ecosystem_dir_for_purl, load_state, lock_inventory, lookup_entry, lookup_entry_kv,
+    save_state, save_state_shared, PackageSource, RevertOpts, RevertOutcome, VendorEntry,
+    VendorOutcome, VendorServiceConfig, VendorState, VendorWarning,
 };
 use socket_patch_core::vex::time::now_rfc3339;
 use std::collections::{HashMap, HashSet};
@@ -111,6 +111,7 @@ pub struct VendorArgs {
 /// request is still fully satisfied when these are the only non-successes.
 fn refusal_is_benign(code: &str) -> bool {
     matches!(code, "vendor_unsupported_ecosystem" | "already_vendored")
+        || socket_patch_core::vendor::jvm::sbt_gate::SKIP_CODES.contains(&code)
 }
 
 /// The `vendor_dir_symlink_unsupported` detail when `purl`'s vendor dir
@@ -986,8 +987,10 @@ async fn run_check(args: &VendorArgs) -> i32 {
             ".socket/vendor/maven2",
             ".socket/vendor/gradle",
             ".socket/vendor/gradle-index.tsv",
+            socket_patch_core::vendor::jvm::sbt::BUILD_FILE,
         ]
         .iter()
+        .chain(socket_patch_core::vendor::jvm::coursier_tree::ORPHAN_PATHS)
         .any(|rel| root.join(rel).exists())
     {
         return emit_eject_refusal(&args.common, "vendor_ledger_missing", "JVM artifacts exist without a vendor ledger; restore .socket/vendor/state.json from version control");
@@ -1060,11 +1063,13 @@ async fn run_check(args: &VendorArgs) -> i32 {
         }
         env.record(event);
     }
-    for key in manifest
+    let mut unledgered_uuids: HashSet<&str> = HashSet::new();
+    for (key, record) in manifest
         .patches
-        .keys()
-        .filter(|k| !state.entries.contains_key(*k))
+        .iter()
+        .filter(|(k, _)| !state.entries.contains_key(*k))
     {
+        unledgered_uuids.insert(record.uuid.as_str());
         if !args.common.json {
             eprintln!("{key}: patch has no vendored ledger entry");
         }
@@ -1072,6 +1077,38 @@ async fn run_check(args: &VendorArgs) -> i32 {
             "vendor_ledger_missing",
             "patch has no vendored ledger entry",
         ));
+    }
+    // A project file still wired to a vendored artifact the ledger does not
+    // know (the ledger was ignored or dropped from the commit along with the
+    // manifest) leaves every fresh install failing; the manifest keys above
+    // cannot see it, so the references are read from the wiring itself.
+    let references =
+        crate::commands::vendored_backend::repair::scan_vendor_references(root).await;
+    for (eco, uuid, rel) in references {
+        let ledgered = state
+            .entries
+            .values()
+            .any(|entry| entry.uuid == uuid && entry.ecosystem == eco);
+        if ledgered || unledgered_uuids.contains(uuid.as_str()) {
+            continue;
+        }
+        // No ledger entry means no purl to name: like repair, the event
+        // carries the uuid and the referenced path instead. The message
+        // names only the ecosystem, keeping patch identifiers out of logs.
+        let detail = format!(
+            "a lockfile references a vendored {eco} artifact under .socket/vendor/{eco}/ but \
+             the vendor ledger (.socket/vendor/state.json) has no entry for it; restore \
+             state.json from version control"
+        );
+        if !args.common.json {
+            eprintln!("vendor_ledger_missing: {detail}");
+        }
+        env.record(
+            PatchEvent::artifact(PatchAction::Failed)
+                .with_uuid(uuid)
+                .with_error("vendor_ledger_missing", detail)
+                .with_details(serde_json::json!({ "ecosystem": eco, "path": rel })),
+        );
     }
     if args.common.json {
         println!("{}", env.to_pretty_json());
@@ -1193,12 +1230,26 @@ impl EjectSnapshot {
                 &build.files,
             ));
         }
+        planned.extend(
+            socket_patch_core::vendor::jvm::coursier_tree::CAPTURED_FILES
+                .iter()
+                .map(|s| s.to_string()),
+        );
         let mut files = std::collections::BTreeMap::new();
         for rel in root_files.iter().chain(planned.iter()) {
             if files.contains_key(rel) {
                 continue;
             }
-            files.insert(rel.clone(), Self::read(&root.join(rel)).await?);
+            // FIFO-safe: a FIFO or device planted at a captured name
+            // (scala-cli / Coursier owned files included) fails the
+            // snapshot, and with it the eject, instead of blocking open(2).
+            let bytes =
+                match socket_patch_core::utils::fs::read_regular_to_bytes(&root.join(rel)).await {
+                    Ok(bytes) => Some(bytes),
+                    Err(e) if e.kind() == std::io::ErrorKind::NotFound => None,
+                    Err(e) => return Err(e),
+                };
+            files.insert(rel.clone(), bytes);
         }
         Ok(EjectSnapshot {
             root: root.to_path_buf(),
@@ -1414,24 +1465,38 @@ async fn run_eject(args: &VendorArgs, pins: Vec<HostedPin>) -> i32 {
         },
     )
     .await;
-    let refused: Vec<(String, String)> = plan
+    let mut refused: Vec<(String, &'static str, String)> = plan
         .refused()
-        .map(|(pin, why)| (pin.purl.clone(), why.to_string()))
+        .map(|(pin, why)| (pin.purl.clone(), "redirect_revert_failed", why.to_string()))
         .collect();
+    // An sbt / scala-cli pin is vendored only past the build-evidence gate
+    // (no `target/` evidence in a fresh clone, stale evidence, …). Run it
+    // now, while the hosted pin still serves the patch: a pin the gate
+    // would stop after the restore would end neither hosted nor vendored.
+    for pin in &pins {
+        if let Err((code, detail)) =
+            socket_patch_core::vendor::maven_repo::jvm_gate_preflight(&common.cwd, &pin.purl).await
+        {
+            refused.push((
+                pin.purl.clone(),
+                code,
+                format!("kept hosted: the vendored gate would not vendor it ({detail})"),
+            ));
+        }
+    }
     if !refused.is_empty() {
         let mut env = Envelope::new(Command::Vendor);
         env.dry_run = common.dry_run;
-        for (purl, why) in &refused {
+        for (purl, code, why) in &refused {
             report_vendor_failure(common, purl, why);
             env.record(
-                PatchEvent::new(PatchAction::Failed, purl.clone())
-                    .with_error("redirect_revert_failed", why.clone()),
+                PatchEvent::new(PatchAction::Failed, purl.clone()).with_error(*code, why.clone()),
             );
         }
         env.mark_error(EnvelopeError::new(
             "eject_refused",
-            "not every hosted pin can be restored to its upstream registry entry; nothing was \
-             changed",
+            "not every hosted pin can be restored to its upstream registry entry and vendored; \
+             nothing was changed",
         ));
         if common.json {
             println!("{}", env.to_pretty_json());
@@ -1572,6 +1637,34 @@ async fn run_eject(args: &VendorArgs, pins: Vec<HostedPin>) -> i32 {
             )
             .await;
         exit = i32::from(applied);
+        // Backstop: every ejected pin must now be vendored. A package the
+        // backend skipped (a vendored gate condition the pre-pass did not
+        // see) would otherwise leave the project neither hosted nor
+        // vendored while the run succeeds.
+        if exit == 0 {
+            let ledger = load_state(&common.cwd).await.ok();
+            let missing: Vec<&str> = pins
+                .iter()
+                .map(|p| p.purl.as_str())
+                .filter(|purl| {
+                    ledger
+                        .as_ref()
+                        .is_none_or(|l| lookup_entry(&l.entries, purl).is_none())
+                })
+                .collect();
+            if !missing.is_empty() {
+                let detail = format!(
+                    "{} {} not vendored, so the eject is undone",
+                    missing.join(", "),
+                    if missing.len() == 1 { "was" } else { "were" }
+                );
+                if !common.json {
+                    eprintln!("Error: {detail}");
+                }
+                env.mark_error(EnvelopeError::new("eject_incomplete", detail));
+                exit = 1;
+            }
+        }
     }
     if exit != 0 {
         match snapshot.restore(&restore.reverted_files, &committed).await {
@@ -2010,6 +2103,24 @@ impl StagedSource {
     }
 }
 
+/// Whether an installed copy that fails `candidate`'s variant probe is
+/// still `candidate` itself, superseded: the ledger vendored exactly this
+/// package at an OLDER patch uuid (#769), so the venv most likely holds
+/// that patch's bytes (`pipenv sync` from the vendored wheel), which are
+/// neither the pristine release nor this patch's output. The re-vendor
+/// then takes the pristine artifact from the lock / registry / service, as
+/// a lock-only checkout does, instead of reporting it not installed.
+fn superseded_install(
+    ledger: &VendorState,
+    candidate: &str,
+    record: &PatchRecord,
+    sole_candidate: bool,
+) -> bool {
+    lookup_entry_kv(&ledger.entries, candidate).is_some_and(|(key, entry)| {
+        entry.uuid != record.uuid && (sole_candidate || key == candidate)
+    })
+}
+
 #[allow(clippy::too_many_arguments)]
 async fn plan_service_downloads(
     cwd: &Path,
@@ -2026,6 +2137,8 @@ async fn plan_service_downloads(
         &vendor::pypi::InstalledSiteListings,
     ),
 ) -> Vec<socket_patch_core::api::client::PlannedDownload> {
+    // The loop's stand-in for a superseded install (see there).
+    let uninstalled = cwd.join(".socket/vendor/.uninstalled");
     // Each loop candidate that reaches its backend, in loop order.
     let mut reaching: Vec<(&str, &PatchRecord, &Path)> = Vec::new();
     let mut handled_bases: HashSet<String> = HashSet::new();
@@ -2057,6 +2170,7 @@ async fn plan_service_downloads(
                 && !matches!(Ecosystem::from_purl(candidate), Some(Ecosystem::Maven));
             let ledger_answers_probe =
                 lookup_entry(&ledger.entries, candidate).is_some_and(|e| e.uuid == record.uuid);
+            let mut source_path = source.path();
             if probe_applicable && !force && !ledger_answers_probe {
                 if matches!(staged, StagedSource::Installed(_)) {
                     if let Some((file, info)) = representative_file(&record.files) {
@@ -2064,7 +2178,11 @@ async fn plan_service_downloads(
                         if !variant_matches_installed(Some(
                             &verify_file_patch(dir, file, info).await.status,
                         )) {
-                            continue;
+                            if !superseded_install(ledger, candidate, record, candidates.len() == 1)
+                            {
+                                continue;
+                            }
+                            source_path = &uninstalled;
                         }
                     }
                 } else if candidates.len() > 1 && lookup_entry(&ledger.entries, candidate).is_none()
@@ -2102,7 +2220,7 @@ async fn plan_service_downloads(
             if lookup_entry(&ledger.entries, candidate).is_some_and(|e| e.uuid == record.uuid) {
                 continue;
             }
-            reaching.push((candidate.as_str(), record, source.path()));
+            reaching.push((candidate.as_str(), record, source_path));
         }
     }
 
@@ -2459,6 +2577,8 @@ pub(crate) async fn vendor_records_reusing(
         && !socket_patch_core::utils::failpoint::switched_off("group_commit"))
     .then(|| GroupCommit::begin(&common.cwd));
     let mut stale_artifacts: Vec<StaleArtifact> = Vec::new();
+    // The source of a superseded install (see [`superseded_install`]).
+    let uninstalled = common.cwd.join(".socket/vendor/.uninstalled");
     for (index, (purl, staged)) in all_packages.iter().enumerate() {
         let pkg_source = staged.as_source();
         let is_variant_eco =
@@ -2500,6 +2620,7 @@ pub(crate) async fn vendor_records_reusing(
             // without downloading the pristine tree just to read one file.
             let ledger_answers_probe =
                 lookup_entry(&state.entries, candidate).is_some_and(|e| e.uuid == record.uuid);
+            let mut candidate_source = pkg_source;
             if probe_applicable && !force && !ledger_answers_probe {
                 if matches!(staged, StagedSource::Installed(_)) {
                     if let Some((file, info)) = representative_file(&record.files) {
@@ -2508,7 +2629,11 @@ pub(crate) async fn vendor_records_reusing(
                                 .await
                                 .status,
                         )) {
-                            continue;
+                            if !superseded_install(&state, candidate, record, candidates.len() == 1)
+                            {
+                                continue;
+                            }
+                            candidate_source = PackageSource::Installed(&uninstalled);
                         }
                     }
                 } else if candidates.len() > 1 && lookup_entry(&state.entries, candidate).is_none()
@@ -2627,15 +2752,23 @@ pub(crate) async fn vendor_records_reusing(
                         .clone();
                     let refusal = match project {
                         Some(refusal) => Some(refusal),
-                        None => {
-                            socket_patch_core::vendor::yarn_berry_vendor_target_preflight(
-                                &common.cwd,
-                                candidate,
-                                pin,
-                                &restore_opts,
-                            )
-                            .await
-                        }
+                        None => match socket_patch_core::vendor::npm_tarball_gitignore_preflight(
+                            &common.cwd,
+                            &record.uuid,
+                        )
+                        .await
+                        {
+                            Some(refusal) => Some(refusal),
+                            None => {
+                                socket_patch_core::vendor::yarn_berry_vendor_target_preflight(
+                                    &common.cwd,
+                                    candidate,
+                                    pin,
+                                    &restore_opts,
+                                )
+                                .await
+                            }
+                        },
                     };
                     if let Some((code, detail)) = &refusal {
                         has_errors = true;
@@ -2646,6 +2779,26 @@ pub(crate) async fn vendor_records_reusing(
                         report_vendor_failure(common, candidate, detail);
                         continue;
                     }
+                }
+                // The vendored sbt / scala-cli gate, before the restore: a
+                // pin it would stop stays hosted (never neither).
+                if let Err((code, detail)) =
+                    socket_patch_core::vendor::maven_repo::jvm_gate_preflight(
+                        &common.cwd,
+                        candidate,
+                    )
+                    .await
+                {
+                    has_errors = true;
+                    let detail = format!(
+                        "kept the hosted pin: the vendored gate would not vendor it ({detail})"
+                    );
+                    env.record(
+                        PatchEvent::new(PatchAction::Failed, candidate.clone())
+                            .with_error(code, detail.clone()),
+                    );
+                    report_vendor_failure(common, candidate, &detail);
+                    continue;
                 }
                 let vlt_lock = socket_patch_core::utils::fs::read_regular_to_string(
                     &common
@@ -2718,11 +2871,16 @@ pub(crate) async fn vendor_records_reusing(
                     // backend would refuse a `vendor_lock_entry_not_found`
                     // the wet run never sees: the advisory already states the
                     // plan, so the preview stops here.
-                    if restore
-                        .reverted_files
-                        .iter()
-                        .any(|f| f == "bun.lock" || f == "bun.lockb")
-                    {
+                    //
+                    // Likewise `socket-patch.sbt`: it still pins the GA on
+                    // disk, so the sbt planner would refuse the
+                    // `vendor_sbt_hosted_conflict` the wet run (which
+                    // restores first) never sees.
+                    if restore.reverted_files.iter().any(|f| {
+                        f == "bun.lock"
+                            || f == "bun.lockb"
+                            || f == socket_patch_core::formats::sbt::owned_file::HOSTED_FILE
+                    }) {
                         continue;
                     }
                 } else {
@@ -2815,7 +2973,7 @@ pub(crate) async fn vendor_records_reusing(
             ));
             let outcome = dispatch_vendor_one(
                 candidate,
-                pkg_source,
+                candidate_source,
                 &common.cwd,
                 record,
                 sources,
@@ -2965,6 +3123,8 @@ pub(crate) async fn vendor_records_reusing(
                             wired_flavors.insert(flavor.to_string());
                         } else if entry.ecosystem == "composer" {
                             wired_flavors.insert("composer".to_string());
+                        } else if let Some(tool) = jvm_wiring_tool(&entry.wiring) {
+                            wired_flavors.insert(tool.to_string());
                         }
                         let (save_failed, stale) = record_vendor_entry(
                             common, env, &mut state, candidate, entry, detached, record,
@@ -3179,22 +3339,26 @@ pub(crate) async fn vendor_records_reusing(
             // package.json `pnpm.overrides` mirror is ignored), so pnpm-wired
             // runs must name that file among the committables: a checkout
             // that loses it silently unvendors on the next install.
-            let commit = if wired_flavors.contains("pnpm") {
-                ".socket/vendor/, package.json, pnpm-lock.yaml, and pnpm-workspace.yaml to \
-                 make the patches portable (pnpm >=11 reads the vendored override only from \
-                 pnpm-workspace.yaml)"
-            } else if wired_flavors.contains("vlt") {
-                VLT_COMMIT_HINT
-            } else {
-                ".socket/vendor/ and the updated lockfiles to make the patches portable"
-            };
+            let commit = commit_hint(&wired_flavors);
             let mut installs: Vec<&str> = wired_flavors
                 .iter()
                 .filter_map(|f| flavor_install_command(f))
                 .collect();
             installs.sort_unstable();
             installs.dedup();
-            let reinstall = if installs.is_empty() {
+            let jvm_only = !installs.is_empty()
+                && wired_flavors
+                    .iter()
+                    .filter(|f| flavor_install_command(f).is_some())
+                    .all(|f| JVM_TOOLS.contains(&f.as_str()));
+            let reinstall = if jvm_only {
+                let cmds: Vec<String> = installs.iter().map(|c| format!("`{c}`")).collect();
+                format!(
+                    "Run {} so the build resolves the vendored artifacts (the generated root \
+                     file points it at .socket/vendor/)",
+                    cmds.join(" and ")
+                )
+            } else if installs.is_empty() {
                 "Reinstall from the updated lockfile so the installed packages pick up the \
                  vendored artifacts"
                     .to_string()
@@ -3222,13 +3386,67 @@ pub(crate) async fn vendor_records_reusing(
                     extra.extend(super::composer_hints::vendored_reinstall_hints(&packages));
                 }
             }
-            for line in crate::ui::next_steps(commit, &reinstall, &extra) {
+            for line in crate::ui::next_steps(&commit, &reinstall, &extra) {
                 println!("{line}");
             }
         }
     }
 
     has_errors
+}
+
+/// The pseudo-flavors of vendored JVM builds whose wiring is a generated
+/// root file rather than a lockfile.
+const JVM_TOOLS: &[&str] = &["sbt", "scala-cli"];
+
+/// `sbt` / `scala-cli` when `wiring` is that vendored backend's (a ledger
+/// entry of either records ecosystem `maven` and no flavor).
+fn jvm_wiring_tool(wiring: &[vendor::state::WiringRecord]) -> Option<&'static str> {
+    use socket_patch_core::vendor::jvm::{COURSIER_INDEX_KIND, SBT_FRAGMENT_KIND};
+    if wiring.iter().any(|w| w.kind == SBT_FRAGMENT_KIND) {
+        Some("sbt")
+    } else if wiring.iter().any(|w| w.kind == COURSIER_INDEX_KIND) {
+        Some("scala-cli")
+    } else {
+        None
+    }
+}
+
+/// The "Commit …" next step for the flavors a run wired. sbt and scala-cli
+/// wire through a generated root file, never a lockfile: committing only
+/// `.socket/` would leave CI resolving the unpatched upstream silently.
+fn commit_hint(wired: &HashSet<String>) -> String {
+    if wired.contains("pnpm") {
+        return ".socket/vendor/, package.json, pnpm-lock.yaml, and pnpm-workspace.yaml to make \
+                the patches portable (pnpm >=11 reads the vendored override only from \
+                pnpm-workspace.yaml)"
+            .to_string();
+    }
+    if wired.contains("vlt") {
+        return VLT_COMMIT_HINT.to_string();
+    }
+    let mut roots: Vec<&str> = Vec::new();
+    if wired.contains("sbt") {
+        roots.push(socket_patch_core::vendor::jvm::sbt::BUILD_FILE);
+    }
+    if wired.contains("scala-cli") {
+        roots.push(socket_patch_core::vendor::jvm::scala_cli::ROOT_FILE);
+    }
+    let lockfiles = wired.iter().any(|f| !JVM_TOOLS.contains(&f.as_str())) || roots.is_empty();
+    match (roots.is_empty(), lockfiles) {
+        (true, _) => {
+            ".socket/vendor/ and the updated lockfiles to make the patches portable".into()
+        }
+        (false, false) => format!(
+            "{} and .socket/vendor/ to make the patches portable (without the root file the \
+             build resolves the unpatched upstream)",
+            roots.join(", ")
+        ),
+        (false, true) => format!(
+            "{}, .socket/vendor/ and the updated lockfiles to make the patches portable",
+            roots.join(", ")
+        ),
+    }
 }
 
 /// What a vlt-wired run commits (the "Commit …" next step).
@@ -3252,6 +3470,9 @@ fn flavor_install_command(flavor: &str) -> Option<&'static str> {
         "pnpm" | "pnpm-legacy" => Some("pnpm install"),
         "bun" => Some("bun install"),
         "vlt" => Some("vlt install"),
+        // Not an install: the JVM build re-resolves from the vendored tree.
+        "sbt" => Some("sbt update"),
+        "scala-cli" => Some("scala-cli compile --test ."),
         _ => None,
     }
 }
@@ -5529,6 +5750,55 @@ mod scope_and_hint_tests {
         assert_eq!(flavor_install_command("vlt"), Some("vlt install"));
         assert_eq!(flavor_install_command("cargo"), None);
         assert_eq!(flavor_install_command(""), None);
+        assert_eq!(flavor_install_command("sbt"), Some("sbt update"));
+        assert_eq!(
+            flavor_install_command("scala-cli"),
+            Some("scala-cli compile --test .")
+        );
+    }
+
+    #[test]
+    fn jvm_commit_hint_names_the_generated_root_file() {
+        let set = |fs: &[&str]| fs.iter().map(|f| f.to_string()).collect::<HashSet<_>>();
+        let sbt = commit_hint(&set(&["sbt"]));
+        assert!(
+            sbt.starts_with("socket-patch-vendor.sbt and .socket/vendor/"),
+            "{sbt}"
+        );
+        assert!(!sbt.contains("lockfiles"), "{sbt}");
+        let cli = commit_hint(&set(&["scala-cli"]));
+        assert!(
+            cli.starts_with("socket-patch.scala and .socket/vendor/"),
+            "{cli}"
+        );
+        let both = commit_hint(&set(&["sbt", "package-lock"]));
+        assert!(
+            both.contains("socket-patch-vendor.sbt") && both.contains("lockfiles"),
+            "{both}"
+        );
+        assert_eq!(
+            commit_hint(&set(&[])),
+            ".socket/vendor/ and the updated lockfiles to make the patches portable"
+        );
+        let wiring = |kind: &str| {
+            vec![vendor::state::WiringRecord {
+                file: "x".into(),
+                kind: kind.into(),
+                action: vendor::state::WiringAction::Added,
+                key: None,
+                original: None,
+                new: None,
+            }]
+        };
+        assert_eq!(
+            jvm_wiring_tool(&wiring(socket_patch_core::vendor::jvm::SBT_FRAGMENT_KIND)),
+            Some("sbt")
+        );
+        assert_eq!(
+            jvm_wiring_tool(&wiring(socket_patch_core::vendor::jvm::COURSIER_INDEX_KIND)),
+            Some("scala-cli")
+        );
+        assert_eq!(jvm_wiring_tool(&wiring("pom_fragment")), None);
     }
 
     #[test]
@@ -6287,5 +6557,26 @@ mod eject_snapshot_tests {
                 .ino(),
             ino
         );
+    }
+
+    /// A FIFO at a captured path fails the snapshot fast instead of
+    /// wedging the eject in a blocking open(2).
+    #[cfg(unix)]
+    #[tokio::test]
+    async fn snapshot_fails_closed_on_a_fifo() {
+        let tmp = tempfile::tempdir().unwrap();
+        let rel = socket_patch_core::vendor::jvm::coursier_tree::CAPTURED_FILES[0];
+        let path = tmp.path().join(rel);
+        std::fs::create_dir_all(path.parent().unwrap()).unwrap();
+        let c = std::ffi::CString::new(path.to_str().unwrap()).unwrap();
+        assert_eq!(unsafe { libc::mkfifo(c.as_ptr(), 0o644) }, 0);
+        let taken = tokio::time::timeout(
+            std::time::Duration::from_secs(10),
+            EjectSnapshot::take(tmp.path(), &[]),
+        )
+        .await
+        .expect("a FIFO must not wedge the eject snapshot");
+        let err = taken.err().expect("a FIFO must fail the snapshot");
+        assert_eq!(err.kind(), std::io::ErrorKind::InvalidInput);
     }
 }

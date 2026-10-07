@@ -175,6 +175,7 @@ fn is_captured(rel: &Path) -> bool {
             ".socket/vendor/gradle/.gitattributes",
         ]
         .contains(&spelled.as_str())
+        || crate::vendor::jvm::coursier_tree::CAPTURED_FILES.contains(&spelled.as_str())
     {
         return true;
     }

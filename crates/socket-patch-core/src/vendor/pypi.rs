@@ -430,7 +430,9 @@ enum WiringPlan {
     Hatch(super::pypi_hatch::HatchProject),
     Poetry(Box<PoetryProject>),
     Pdm(Box<PdmProject>),
-    Pipenv(Box<PipenvProject>),
+    /// The ledger entry of an OLDER patch uuid whose Pipfile.lock wiring the
+    /// guards admitted for an in-place re-wire (#769), if any.
+    Pipenv(Box<PipenvProject>, Option<Box<VendorEntry>>),
     /// The lock already routes this package through THIS patch uuid's
     /// vendored wheel: no wiring — verify (or rebuild) the artifact only.
     InSync,
@@ -869,12 +871,25 @@ async fn pypi_prelude<'p>(
                     ),
                 ));
             }
-            let target = match super::pypi_pipenv::check_target_guards(
+            // A superseding patch (#769): the ledger entry that wired this
+            // package at an older uuid holds the pre-vendor originals the
+            // re-wire carries forward. An unreadable ledger leaves none, and
+            // the guards then refuse the re-wire as before.
+            let superseded = super::state::load_state_shared(project_root)
+                .await
+                .ok()
+                .and_then(|state| {
+                    super::state::lookup_entry(&state.entries, base)
+                        .filter(|entry| entry.uuid != record.uuid)
+                        .cloned()
+                });
+            let target = match super::pypi_pipenv::check_target_guards_superseding(
                 &project,
                 &canon_name,
                 &record.uuid,
                 version,
                 hosted_origins,
+                superseded.as_ref(),
             ) {
                 Ok(target) => target,
                 // A refusal carries no warnings: probe nothing for it.
@@ -901,7 +916,9 @@ async fn pypi_prelude<'p>(
                     wired_pin = pipenv_wired_pin(&project.lock, &uuid_dir_rel);
                     WiringPlan::InSync
                 }
-                PipenvTarget::Fresh => WiringPlan::Pipenv(Box::new(project)),
+                PipenvTarget::Fresh => {
+                    WiringPlan::Pipenv(Box::new(project), superseded.map(Box::new))
+                }
             }
         }
     };
@@ -1308,7 +1325,7 @@ pub async fn vendor_pypi_with_pipenv_version<'a>(
             .await
             .map(|(wiring, meta)| (wiring, MetaSlot::Pdm(meta)))
         }
-        WiringPlan::Pipenv(project) => super::pypi_pipenv::wire_pipenv(
+        WiringPlan::Pipenv(project, superseded) => super::pypi_pipenv::wire_pipenv_superseding(
             &project,
             project_root,
             &canon_name,
@@ -1317,6 +1334,7 @@ pub async fn vendor_pypi_with_pipenv_version<'a>(
             &artifact.sha256_hex,
             &record.uuid,
             &hosted_origins,
+            superseded.as_deref(),
         )
         .await
         .map(|(wiring, meta)| (wiring, MetaSlot::Pipenv(meta))),
@@ -4486,6 +4504,161 @@ wheels = [
     "develop": {}
 }
 "#;
+
+    /// A Pipenv project (Pipfile.lock, no requirements.txt) over the
+    /// [`e2e_fixture`] install and blob store.
+    async fn pipenv_e2e_fixture() -> E2eFixture {
+        let fx = e2e_fixture().await;
+        tokio::fs::remove_file(fx.root.join("requirements.txt"))
+            .await
+            .unwrap();
+        touch(&fx.root, "Pipfile.lock", PIPENV_REGISTRY_LOCK).await;
+        fx
+    }
+
+    /// Vendor `record` into the [`pipenv_e2e_fixture`] project.
+    async fn pipenv_vendor(fx: &E2eFixture, record: &PatchRecord) -> VendorOutcome {
+        let sources = PatchSources::blobs_only(&fx.blobs);
+        crate::vendor::test_support::vendor_pypi(
+            "pkg:pypi/six@1.16.0",
+            &fx.site_packages,
+            &fx.root,
+            record,
+            &sources,
+            "2026-06-09T00:00:00Z",
+            false,
+            false,
+            None,
+        )
+        .await
+    }
+
+    async fn read_json(root: &Path, name: &str) -> serde_json::Value {
+        serde_json::from_str(&tokio::fs::read_to_string(root.join(name)).await.unwrap()).unwrap()
+    }
+
+    /// #769: a Pipfile.lock wired to an EARLIER patch uuid re-vendors in
+    /// place to the superseding uuid, as the `would_revendor` preview and
+    /// the CLI contract promise: the entry moves to the new wheel, its
+    /// record carries the pre-vendor registry original forward, and
+    /// `vendor --revert` of the NEW entry restores the registry pin.
+    #[tokio::test]
+    async fn pipenv_superseding_uuid_revendors_in_place() {
+        const UUID2: &str = "0a1b2c3d-4e5f-4a6b-8c7d-9e0f1a2b3c4d";
+        let fx = pipenv_e2e_fixture().await;
+        let registry = read_json(&fx.root, "Pipfile.lock").await;
+        let VendorOutcome::Done { result, entry, .. } = pipenv_vendor(&fx, &fx.record).await else {
+            panic!("first vendor must be Done");
+        };
+        assert!(result.success, "{:?}", result.error);
+        let first = entry.expect("entry on success");
+        save_ledger_entry(&fx.root, &first).await;
+
+        let mut record2 = fx.record.clone();
+        record2.uuid = UUID2.to_string();
+        let outcome = pipenv_vendor(&fx, &record2).await;
+        let VendorOutcome::Done { result, entry, .. } = outcome else {
+            panic!("superseding uuid must re-vendor, got {outcome:?}");
+        };
+        assert!(result.success, "{:?}", result.error);
+        let second = entry.expect("entry on success");
+        assert_eq!(second.uuid, UUID2);
+        assert_eq!(second.wiring.len(), 1);
+        assert_eq!(second.wiring[0].key.as_deref(), Some("default:six"));
+        assert_eq!(
+            second.wiring[0].original,
+            Some(registry["default"]["six"].clone()),
+            "the pre-vendor registry original is carried forward"
+        );
+        let lock = tokio::fs::read_to_string(fx.root.join("Pipfile.lock"))
+            .await
+            .unwrap();
+        assert!(!lock.contains(UUID), "Pipfile.lock kept uuid A:\n{lock}");
+        assert!(lock.contains(UUID2), "Pipfile.lock not on uuid B:\n{lock}");
+        assert!(fx
+            .root
+            .join(format!(".socket/vendor/pypi/{UUID2}/{WHEEL_NAME}"))
+            .is_file());
+
+        save_ledger_entry(&fx.root, &second).await;
+        let reverted = revert_pypi(&second, &fx.root, false).await;
+        assert!(reverted.success, "{:?}", reverted.error);
+        assert!(reverted.warnings.is_empty(), "{:?}", reverted.warnings);
+        assert_eq!(read_json(&fx.root, "Pipfile.lock").await, registry);
+    }
+
+    /// #769: without a ledger entry for the older uuid there is no recorded
+    /// pre-vendor original to carry forward, so a re-wire could never be
+    /// reverted. That case still refuses, before anything is written.
+    #[tokio::test]
+    async fn pipenv_superseding_uuid_without_ledger_refuses() {
+        const UUID2: &str = "0a1b2c3d-4e5f-4a6b-8c7d-9e0f1a2b3c4d";
+        let fx = pipenv_e2e_fixture().await;
+        let VendorOutcome::Done { result, .. } = pipenv_vendor(&fx, &fx.record).await else {
+            panic!("first vendor must be Done");
+        };
+        assert!(result.success, "{:?}", result.error);
+        let wired = tokio::fs::read_to_string(fx.root.join("Pipfile.lock"))
+            .await
+            .unwrap();
+
+        let mut record2 = fx.record.clone();
+        record2.uuid = UUID2.to_string();
+        let outcome = pipenv_vendor(&fx, &record2).await;
+        let VendorOutcome::Refused { code, detail } = outcome else {
+            panic!("expected Refused, got {outcome:?}");
+        };
+        assert_eq!(code, "pypi_pipenv_source_already_exists");
+        assert!(detail.contains(UUID), "{detail}");
+        assert!(detail.contains("records no wiring"), "{detail}");
+        assert_eq!(
+            tokio::fs::read_to_string(fx.root.join("Pipfile.lock"))
+                .await
+                .unwrap(),
+            wired
+        );
+        assert!(!fx
+            .root
+            .join(format!(".socket/vendor/pypi/{UUID2}"))
+            .exists());
+    }
+
+    /// #769: a re-wire replays only what the older entry's ledger recorded.
+    /// A wired entry edited since vendoring refuses before anything is
+    /// written.
+    #[tokio::test]
+    async fn pipenv_superseding_uuid_drifted_entry_refuses() {
+        const UUID2: &str = "0a1b2c3d-4e5f-4a6b-8c7d-9e0f1a2b3c4d";
+        let fx = pipenv_e2e_fixture().await;
+        let VendorOutcome::Done { result, entry, .. } = pipenv_vendor(&fx, &fx.record).await else {
+            panic!("first vendor must be Done");
+        };
+        assert!(result.success, "{:?}", result.error);
+        save_ledger_entry(&fx.root, &entry.expect("entry on success")).await;
+        let mut lock = read_json(&fx.root, "Pipfile.lock").await;
+        lock["default"]["six"]["markers"] = serde_json::json!("python_version >= '3.8'");
+        let drifted = serde_json::to_string_pretty(&lock).unwrap() + "\n";
+        touch(&fx.root, "Pipfile.lock", &drifted).await;
+
+        let mut record2 = fx.record.clone();
+        record2.uuid = UUID2.to_string();
+        let outcome = pipenv_vendor(&fx, &record2).await;
+        let VendorOutcome::Refused { code, detail } = outcome else {
+            panic!("expected Refused, got {outcome:?}");
+        };
+        assert_eq!(code, "pypi_pipenv_source_already_exists");
+        assert!(detail.contains("changed since vendoring"), "{detail}");
+        assert_eq!(
+            tokio::fs::read_to_string(fx.root.join("Pipfile.lock"))
+                .await
+                .unwrap(),
+            drifted
+        );
+        assert!(!fx
+            .root
+            .join(format!(".socket/vendor/pypi/{UUID2}"))
+            .exists());
+    }
 
     /// A relock regenerated the wired entry to a registry reference whose
     /// hash list differs from the recorded original (Pipenv 2022.12.19 does

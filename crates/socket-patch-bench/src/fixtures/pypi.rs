@@ -483,3 +483,32 @@ pub fn build_pdm(t: &mut Tree, size: Size) -> std::io::Result<Fixture> {
     t.mkdir("home")?;
     Ok(fixture(&ds, &["pdm.lock"], &[]))
 }
+
+// ── hatch ──────────────────────────────────────────────────────────────
+
+/// A lockless Hatch app: hatchling backend, the direct deps in
+/// `[project]`, and a `hatch.toml` default environment (in-project
+/// `.venv`) that pins every patched transitive too. Hosted Hatch only
+/// redirects deps a Hatch table declares, so the pins are what a real
+/// project patching transitive deps writes.
+pub fn build_hatch(t: &mut Tree, size: Size) -> std::io::Result<Fixture> {
+    let ds = dists("hatch", size);
+    t.write(
+        "project/pyproject.toml",
+        pyproject(
+            &ds,
+            "\n[build-system]\nrequires = [\"hatchling\"]\nbuild-backend = \"hatchling.build\"\n",
+        ),
+    )?;
+    let mut s = String::from("[envs.default]\npath = \".venv\"\ndependencies = [\n");
+    for (i, d) in ds.iter().enumerate() {
+        if d.patched || i % 10 == 0 {
+            let _ = writeln!(s, "    \"{}=={}\",", d.name, d.version);
+        }
+    }
+    s.push_str("]\n\n[envs.default.scripts]\ntest = \"python -m unittest\"\n");
+    t.write("project/hatch.toml", s)?;
+    install_venv(t, &ds)?;
+    t.mkdir("home")?;
+    Ok(fixture(&ds, &["hatch.toml", "pyproject.toml"], &[]))
+}
