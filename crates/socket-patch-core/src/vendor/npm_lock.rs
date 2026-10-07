@@ -30,7 +30,9 @@ use super::lock_inventory::npm_legacy_identity;
 use super::npm_common::{
     done_failure_unstage, guard_coordinates, guard_revert_uuid_dir, stage_patch_pack,
 };
-use super::npm_origin::{legacy_packages_key, npm_non_registry_entries, NpmOverrides};
+use super::npm_origin::{
+    legacy_packages_key, npm_non_registry_entries, npm_shrinkwrapped_entries, NpmOverrides,
+};
 use super::parse_memo::ParseMemo;
 use super::path::parse_vendor_path;
 use super::source::PackageSource;
@@ -528,6 +530,7 @@ fn rewritable_matches(
                 matches!(
                     w.code,
                     "vendor_bundled_instance_skipped"
+                        | "vendor_shrinkwrapped_instance_skipped"
                         | "vendor_link_entry_skipped"
                         | "vendor_non_registry_entry_skipped"
                 )
@@ -539,8 +542,8 @@ fn rewritable_matches(
                 "vendor_lock_entry_not_rewritable",
                 format!(
                     "every {lock_name} entry for {name}@{version} is bundled inside a \
-                     parent's tarball, a link, or installed from a non-registry spec and \
-                     cannot be rewritten — those copies stay UNPATCHED and `npm install` \
+                     parent's tarball, installed from a dependency's own shrinkwrap, a link, \
+                     or installed from a non-registry spec and cannot be rewritten — those copies stay UNPATCHED and `npm install` \
                      will not help: {}",
                     skipped.join("; ")
                 ),
@@ -978,6 +981,7 @@ fn scan_lock_matches(
     };
     let non_registry = npm_non_registry_entries(lock, overrides);
     let mut member: Option<String> = None;
+    let shrinkwrapped = npm_shrinkwrapped_entries(lock);
     for (key, entry) in packages {
         // The root "" entry is the project itself, never a dependency.
         if key.is_empty() {
@@ -1025,6 +1029,22 @@ fn scan_lock_matches(
                     "lock entry `{key}` is bundled inside its parent's tarball and CANNOT be \
                      rewritten — that copy stays UNPATCHED; vendor or update the bundling \
                      parent to cover it"
+                ),
+            ));
+            continue;
+        }
+        if let Some(ancestor) = shrinkwrapped.get(key.as_str()) {
+            // LOUD: npm 7–11 install this copy from `ancestor`'s own
+            // npm-shrinkwrap.json and ignore the root lock's entry, so a
+            // rewrite here would report the patch applied while the
+            // original bytes install (#753).
+            warnings.push(VendorWarning::new(
+                "vendor_shrinkwrapped_instance_skipped",
+                format!(
+                    "lock entry `{key}` is installed from `{ancestor}`'s own \
+                     npm-shrinkwrap.json (hasShrinkwrap), which npm 7–11 read instead of this \
+                     lock, so it CANNOT be rewritten — that copy stays UNPATCHED; vendor or \
+                     update `{ancestor}` to cover it"
                 ),
             ));
             continue;
@@ -1141,8 +1161,9 @@ fn rewrite_legacy_tree(
             // stays-UNPATCHED warning.)
         } else if is_match && non_registry.contains_key(&packages_key) {
             // The mirror of a `packages` entry npm installs from a git / url
-            // / `file:` spec (#326): its twin was skipped with
-            // `vendor_non_registry_entry_skipped`, so rewiring this copy
+            // / `file:` spec (#326) or from a dependency's shrinkwrap (#753):
+            // its twin was skipped with `vendor_non_registry_entry_skipped` /
+            // `vendor_shrinkwrapped_instance_skipped`, so rewiring this copy
             // would record wiring for bytes that never install.
         } else if is_match && !entry_in_sync(obj, resolved, integrity) {
             let was_vendored = entry_points_into_vendor(obj);
@@ -1390,8 +1411,10 @@ impl LockRewire<'_> {
         changed: &mut bool,
         recomputed_deps: &mut bool,
     ) -> Result<(), String> {
-        // Taken before any rewrite, for the legacy mirror below.
-        let non_registry = npm_non_registry_entries(lock, self.overrides);
+        // Taken before any rewrite, for the legacy mirror below: the
+        // mirror of an entry the `packages` scan skipped stays as it is.
+        let mut non_registry = npm_non_registry_entries(lock, self.overrides);
+        non_registry.extend(npm_shrinkwrapped_entries(lock));
         let Some(packages) = lock.get_mut("packages").and_then(Value::as_object_mut) else {
             return Err("lock `packages` object vanished mid-rewrite".to_string());
         };
@@ -2323,6 +2346,57 @@ mod tests {
             live["packages"]["node_modules/foo/node_modules/left-pad"],
             lock["packages"]["node_modules/foo/node_modules/left-pad"],
             "the git copy is byte-untouched"
+        );
+    }
+
+    /// REGRESSION (#753): npm 7–11 install a copy beneath a `hasShrinkwrap`
+    /// package from that package's own npm-shrinkwrap.json, so the nested
+    /// entry is skipped loudly while the hoisted copy is still vendored; a
+    /// shrinkwrapped-only target refuses instead of reporting success.
+    #[tokio::test]
+    async fn instance_under_has_shrinkwrap_parent_is_skipped_with_warning() {
+        let mut lock = default_lock();
+        lock["packages"]["node_modules/foo"]["hasShrinkwrap"] = json!(true);
+        let fx = fixture_with("left-pad", "1.3.0", lock.clone()).await;
+        let (result, entry, warnings) = expect_done(fx.vendor(false).await);
+        assert!(result.success);
+        assert_eq!(entry.unwrap().wiring.len(), 1, "only the hoisted copy");
+        let skipped = warnings
+            .iter()
+            .find(|w| w.code == "vendor_shrinkwrapped_instance_skipped")
+            .unwrap_or_else(|| panic!("{warnings:?}"));
+        assert!(
+            skipped.detail.contains("UNPATCHED")
+                && skipped
+                    .detail
+                    .contains("node_modules/foo/node_modules/left-pad")
+                && skipped.detail.contains("`node_modules/foo`"),
+            "{}",
+            skipped.detail
+        );
+        let live = fx.read_lock().await;
+        assert_eq!(
+            live["packages"]["node_modules/foo/node_modules/left-pad"],
+            lock["packages"]["node_modules/foo/node_modules/left-pad"],
+            "the shrinkwrapped copy is byte-untouched"
+        );
+
+        // Only the shrinkwrapped copy: refuse, write nothing.
+        let mut lock = lock;
+        lock["packages"]
+            .as_object_mut()
+            .unwrap()
+            .shift_remove("node_modules/left-pad");
+        let fx = fixture_with("left-pad", "1.3.0", lock).await;
+        let detail = expect_refused(fx.vendor(false).await, "vendor_lock_entry_not_rewritable");
+        assert!(
+            detail.contains("UNPATCHED") && detail.contains("hasShrinkwrap"),
+            "{detail}"
+        );
+        assert_eq!(
+            tokio::fs::read(fx.lock_path()).await.unwrap(),
+            fx.lock_bytes,
+            "lock untouched by the refusal"
         );
     }
 

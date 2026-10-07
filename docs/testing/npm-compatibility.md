@@ -66,6 +66,17 @@ npm 12 notes:
   (`patched_ref_unattributable`).
 - `allow-file` defaults to `all`: vendored `file:` tarballs install unchanged.
 
+Dependencies that ship their own `npm-shrinkwrap.json` (#753): the lock marks
+such a package `"hasShrinkwrap": true` (`firebase-tools`, `netlify-cli`), and
+npm 7–11 install everything beneath it from that package's own shrinkwrap,
+ignoring the root lock's entries (npm 12.2.0 honors the root lock). A copy of
+the patched `name@version` there is never rewired: hosted and vendored scans
+skip it with `redirect_npm_shrinkwrapped_instance_skipped` /
+`vendor_shrinkwrapped_instance_skipped` (vendoring refuses with
+`vendor_lock_entry_not_rewritable` when it is the only copy), and VEX does not
+attest the package while that unpatched copy installs
+(`patched_ref_unattributable`).
+
 ## Suites
 
 | Suite | npm | What it proves |

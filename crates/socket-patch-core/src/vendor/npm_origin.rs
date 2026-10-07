@@ -407,6 +407,42 @@ pub(crate) fn npm_non_registry_entries(
     out
 }
 
+/// Every `packages` key installed beneath a package that ships its own
+/// `npm-shrinkwrap.json` (the lock marks that ancestor `"hasShrinkwrap":
+/// true`, e.g. `firebase-tools`, `netlify-cli`), mapped to the outermost
+/// such ancestor's key (#753). npm 7–11 install that subtree from the
+/// dependency's own shrinkwrap at reify time and ignore the root lock's
+/// entries for it, so a rewrite of one of them installs nothing (npm 12
+/// honors the root lock, but the files cannot tell which npm installs).
+/// The rewriters skip these entries loudly and lockfile discovery never
+/// attests them. Empty for a lock without `packages`: a lockfileVersion 1
+/// lock does not record `hasShrinkwrap`.
+pub(crate) fn npm_shrinkwrapped_entries(lock: &Value) -> BTreeMap<String, String> {
+    let mut out = BTreeMap::new();
+    let Some(packages) = lock.get("packages").and_then(Value::as_object) else {
+        return out;
+    };
+    let ships_shrinkwrap = |key: &str| {
+        packages
+            .get(key)
+            .and_then(|entry| entry.get("hasShrinkwrap"))
+            .and_then(Value::as_bool)
+            == Some(true)
+    };
+    for key in packages.keys() {
+        // Each `/node_modules/` segment closes an enclosing package's path,
+        // outermost first.
+        let ancestor = key
+            .match_indices("/node_modules/")
+            .map(|(at, _)| &key[..at])
+            .find(|prefix| ships_shrinkwrap(prefix));
+        if let Some(ancestor) = ancestor {
+            out.insert(key.clone(), ancestor.to_string());
+        }
+    }
+    out
+}
+
 /// The `packages` key node's module lookup picks for `dep_name` required
 /// from the package at `from`: `<from>/node_modules/<dep>`, then the same
 /// under each ancestor directory, up to the project root.
@@ -488,6 +524,45 @@ mod tests {
     use serde_json::json;
 
     use super::*;
+
+    /// #753: every entry under a `hasShrinkwrap` package maps to that
+    /// (outermost) package; the package itself, its siblings and workspace
+    /// members' own entries do not.
+    #[test]
+    fn shrinkwrapped_entries_are_the_descendants_of_a_has_shrinkwrap_package() {
+        let lock = json!({
+            "lockfileVersion": 3,
+            "packages": {
+                "": {},
+                "node_modules/@bh/sw": { "version": "1.0.0", "hasShrinkwrap": true },
+                "node_modules/@bh/sw/node_modules/left-pad": { "version": "1.3.0" },
+                "node_modules/@bh/sw/node_modules/a": { "version": "1.0.0", "hasShrinkwrap": true },
+                "node_modules/@bh/sw/node_modules/a/node_modules/b": { "version": "1.0.0" },
+                "node_modules/left-pad": { "version": "1.1.3" },
+                "node_modules/other": { "version": "1.0.0", "hasShrinkwrap": false },
+                "node_modules/other/node_modules/left-pad": { "version": "1.3.0" },
+                "packages/ws": { "version": "1.0.0" },
+                "packages/ws/node_modules/left-pad": { "version": "1.3.0" }
+            }
+        });
+        let got = npm_shrinkwrapped_entries(&lock);
+        let want: BTreeMap<String, String> = [
+            (
+                "node_modules/@bh/sw/node_modules/left-pad",
+                "node_modules/@bh/sw",
+            ),
+            ("node_modules/@bh/sw/node_modules/a", "node_modules/@bh/sw"),
+            (
+                "node_modules/@bh/sw/node_modules/a/node_modules/b",
+                "node_modules/@bh/sw",
+            ),
+        ]
+        .into_iter()
+        .map(|(k, v)| (k.to_string(), v.to_string()))
+        .collect();
+        assert_eq!(got, want);
+        assert!(npm_shrinkwrapped_entries(&json!({"dependencies": {}})).is_empty());
+    }
 
     #[test]
     fn registry_specs_are_recognized() {

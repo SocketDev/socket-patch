@@ -28,6 +28,12 @@
 //!   — a stale mirror entry must not outvote the `packages` entry npm
 //!   installs.
 //!
+//! Entries npm installs from somewhere other than their `resolved` — a git /
+//! url / `file:` spec, or a dependency's own npm-shrinkwrap.json (an entry
+//! beneath a `hasShrinkwrap: true` package, #753) — are never attested and
+//! contest every ref for the same `name@version`
+//! ([`drop_non_registry_installs`]).
+//!
 //! An entry is a ref when its `resolved` is
 //!
 //! * a Socket-HOSTED url ([`DiscoverCtx::hosted_uuid`]) → [`WiringMode::Hosted`].
@@ -59,7 +65,9 @@ use crate::vendor::lock_inventory::{
     npm_lock_bundled_nodes, npm_lock_legacy_mirror_nodes, npm_lock_located_nodes, LockIntegrity,
     NpmLockNode,
 };
-use crate::vendor::npm_origin::{npm_non_registry_entries, NpmOverrides};
+use crate::vendor::npm_origin::{
+    npm_non_registry_entries, npm_shrinkwrapped_entries, NpmOverrides,
+};
 
 pub(crate) async fn extract(ctx: &DiscoverCtx<'_>, out: &mut Discovery) {
     let mut locks: Vec<NpmLockRefs> = Vec::new();
@@ -348,11 +356,13 @@ fn pins_a_wired_ref(read: &NpmLockRefs, purl: &str, pin: Option<&str>) -> bool {
 }
 
 /// npm installs a git / url / `file:` dependency from the dependent's spec
-/// and ignores the entry's `resolved` (`vendor::npm_origin`, #326), so such
-/// an entry stays unpatched whatever its `resolved` says. Every ref for the
-/// same `name@version` is dropped (that copy is live beside it), and the
-/// copy counts as resolved elsewhere, so other locks' wiring for it is
-/// contested too.
+/// and ignores the entry's `resolved` (`vendor::npm_origin`, #326), and npm
+/// 7–11 install everything beneath a `hasShrinkwrap` package from that
+/// package's own npm-shrinkwrap.json (#753), so such an entry stays
+/// unpatched whatever its `resolved` says. Every ref for the same
+/// `name@version` is dropped (that copy is live beside it), and the copy
+/// counts as resolved elsewhere, so other locks' wiring for it is contested
+/// too.
 fn drop_non_registry_installs(
     file: &str,
     doc: &Value,
@@ -360,12 +370,32 @@ fn drop_non_registry_installs(
     read: &mut NpmLockRefs,
     out: &mut Discovery,
 ) {
-    let non_registry = npm_non_registry_entries(doc, overrides);
-    if non_registry.is_empty() {
+    // (lock key, why that copy installs from elsewhere)
+    let elsewhere: Vec<(String, String)> = npm_non_registry_entries(doc, overrides)
+        .into_iter()
+        .map(|(key, reason)| {
+            let why = format!(
+                "is not installed from the registry ({reason}); npm installs it from that spec"
+            );
+            (key, why)
+        })
+        .chain(
+            npm_shrinkwrapped_entries(doc)
+                .into_iter()
+                .map(|(key, ancestor)| {
+                    let why = format!(
+                        "is installed from `{ancestor}`'s own npm-shrinkwrap.json \
+                         (hasShrinkwrap), which npm 7–11 read instead of this lock"
+                    );
+                    (key, why)
+                }),
+        )
+        .collect();
+    if elsewhere.is_empty() {
         return;
     }
     let mut unpatched: Vec<(String, &str, &str)> = Vec::new();
-    for (key, reason) in &non_registry {
+    for (key, why) in &elsewhere {
         let entry = &doc["packages"][key.as_str()];
         let key_name = key.rsplit_once("node_modules/").map_or("", |(_, n)| n);
         let name = entry
@@ -384,19 +414,18 @@ fn drop_non_registry_installs(
         read.unwired
             .entry(purl.clone())
             .or_insert_with(|| key.clone());
-        unpatched.push((purl, key, reason));
+        unpatched.push((purl, key, why));
     }
     read.refs.retain(|r| {
-        let Some((_, key, reason)) = unpatched.iter().find(|(p, _, _)| *p == r.purl) else {
+        let Some((_, key, why)) = unpatched.iter().find(|(p, _, _)| *p == r.purl) else {
             return true;
         };
         out.diag(
             DIAG_REF_UNATTRIBUTABLE,
             file,
             format!(
-                "{file}: {} is wired to a Socket patch but lock entry `{key}` is not \
-                 installed from the registry ({reason}); npm installs it from that spec, so \
-                 that copy stays UNPATCHED and nothing is attested",
+                "{file}: {} is wired to a Socket patch but lock entry `{key}` {why}, so that \
+                 copy stays UNPATCHED and nothing is attested",
                 r.purl
             ),
         );
@@ -1572,6 +1601,81 @@ mod tests {
             &[("pkg:npm/left-pad@1.3.0", UUID_A, WiringMode::Hosted)],
         );
         assert!(bundled_contests(&out).is_empty(), "{:#?}", out.diagnostics);
+    }
+
+    /// REGRESSION (#753): npm 7–11 install a copy beneath a `hasShrinkwrap`
+    /// package from that package's own npm-shrinkwrap.json and ignore the
+    /// root lock's entry, so a Socket url written there (by a pre-fix scan)
+    /// is never a ref, and a registry copy there contests the hoisted
+    /// wired entry of the same version, in either mode.
+    #[tokio::test]
+    async fn shrinkwrapped_copy_is_never_attested_and_contests_the_wired_entry() {
+        let hosted = hosted_url("npm", "left-pad", "1.3.0", UUID_A, "left-pad-1.3.0.tgz");
+        let vendored = format!("file:.socket/vendor/npm/{UUID_B}/left-pad-1.3.0.tgz");
+        let registry = "https://registry.npmjs.org/left-pad/-/left-pad-1.3.0.tgz";
+        let sw = serde_json::json!({
+            "version": "1.0.0",
+            "resolved": "https://registry.npmjs.org/@bh/sw/-/sw-1.0.0.tgz",
+            "integrity": "sha512-SW",
+            "hasShrinkwrap": true,
+        });
+        for (label, resolved) in [("hosted", &hosted), ("vendored", &vendored)] {
+            // The only copy is the shrinkwrapped one, rewired in the root lock.
+            let p = Project::new();
+            p.write(
+                "package-lock.json",
+                lock_with_packages(serde_json::json!({
+                    "node_modules/@bh/sw": sw,
+                    "node_modules/@bh/sw/node_modules/left-pad": {
+                        "version": "1.3.0", "resolved": resolved, "integrity": SRI
+                    },
+                })),
+            );
+            let out = run(&p).await;
+            assert!(out.refs.is_empty(), "{label}: {:#?}", out.refs);
+            assert!(
+                out.diagnostics
+                    .iter()
+                    .any(|d| d.code == DIAG_REF_UNATTRIBUTABLE
+                        && d.detail.contains("hasShrinkwrap")
+                        && d.detail
+                            .contains("node_modules/@bh/sw/node_modules/left-pad")),
+                "{label}: {:#?}",
+                out.diagnostics
+            );
+
+            // A wired hoisted copy beside a registry shrinkwrapped copy.
+            let p = Project::new();
+            p.write(
+                "package-lock.json",
+                lock_with_packages(serde_json::json!({
+                    "node_modules/left-pad": { "version": "1.3.0", "resolved": resolved, "integrity": SRI },
+                    "node_modules/@bh/sw": sw,
+                    "node_modules/@bh/sw/node_modules/left-pad": {
+                        "version": "1.3.0", "resolved": registry, "integrity": "sha512-ORIG"
+                    },
+                })),
+            );
+            let out = run(&p).await;
+            assert!(out.refs.is_empty(), "{label}: {:#?}", out.refs);
+        }
+
+        // Without `hasShrinkwrap` the nested wired copy is an ordinary ref.
+        let p = Project::new();
+        p.write(
+            "package-lock.json",
+            lock_with_packages(serde_json::json!({
+                "node_modules/@bh/sw": { "version": "1.0.0", "resolved": "https://registry.npmjs.org/@bh/sw/-/sw-1.0.0.tgz" },
+                "node_modules/@bh/sw/node_modules/left-pad": {
+                    "version": "1.3.0", "resolved": hosted, "integrity": SRI
+                },
+            })),
+        );
+        let out = run(&p).await;
+        assert_refs(
+            &out,
+            &[("pkg:npm/left-pad@1.3.0", UUID_A, WiringMode::Hosted)],
+        );
     }
 
     /// REGRESSION (#325), lockfileVersion 1: a `bundled: true` copy nested in

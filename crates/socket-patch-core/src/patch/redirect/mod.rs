@@ -27,7 +27,9 @@ use crate::utils::digest::is_hex64_lower;
 use crate::utils::line_endings::{to_lf, LineEndings};
 use crate::vendor::common::{parse_json_text, JsonLayout};
 use crate::vendor::lock_inventory::npm_legacy_identity;
-use crate::vendor::npm_origin::{legacy_packages_key, npm_non_registry_entries, NpmOverrides};
+use crate::vendor::npm_origin::{
+    legacy_packages_key, npm_non_registry_entries, npm_shrinkwrapped_entries, NpmOverrides,
+};
 use crate::vendor::yarn_berry_lock::yarnrc_compression_level;
 
 mod bun_binary;
@@ -1268,6 +1270,12 @@ fn rewrite_one_npm_lock(
     // Entries npm installs from a git / url / `file:` spec: see
     // `vendor::npm_origin` (#326).
     let non_registry = npm_non_registry_entries(&lock, manifest_overrides);
+    // Entries npm 7–11 install from a dependency's own shrinkwrap (#753).
+    let shrinkwrapped = npm_shrinkwrapped_entries(&lock);
+    // The legacy mirror of an entry the `packages` scan skips (and warns
+    // about) is never rewired either.
+    let mut mirror_skipped = non_registry.clone();
+    mirror_skipped.extend(shrinkwrapped.clone());
     // npm 7+ reads `packages` when it exists; the legacy `dependencies`
     // mirror must not suppress an attestation for that install tree.
     // Match the shared npm lock inventory's object-valued-map precedence.
@@ -1324,6 +1332,26 @@ fn rewrite_one_npm_lock(
                     });
                     continue;
                 }
+                // npm 7–11 install everything beneath a `hasShrinkwrap`
+                // package from that package's own npm-shrinkwrap.json and
+                // ignore the root lock's entry, so a rewrite here would
+                // confirm (and VEX-attest) a patch that never installs
+                // there (#753). Recorded like a bundled copy so the in-run
+                // `--vex` verifies instead of assuming.
+                if let Some(ancestor) = shrinkwrapped.get(key.as_str()) {
+                    matched_any = true;
+                    result.bundled_skipped_uuids.insert(dep.patch_uuid.clone());
+                    result.warnings.push(RewriteWarning {
+                        code: "redirect_npm_shrinkwrapped_instance_skipped".into(),
+                        detail: format!(
+                            "lock entry `{key}` is installed from `{ancestor}`'s own \
+                             npm-shrinkwrap.json (hasShrinkwrap), which npm 7–11 read \
+                             instead of this lock, so it CANNOT be redirected — that copy \
+                             stays UNPATCHED; vendor or update `{ancestor}` to cover it"
+                        ),
+                    });
+                    continue;
+                }
                 // npm installs a git / url / `file:` dependency from the
                 // dependent's spec and ignores `resolved`, so a rewrite here
                 // would confirm (and VEX-attest) a patch that never installs.
@@ -1359,7 +1387,7 @@ fn rewrite_one_npm_lock(
             changed = rewrite_npm_v2_deps(
                 deps,
                 "",
-                &non_registry,
+                &mirror_skipped,
                 &fname,
                 dep,
                 &sha512,
@@ -1502,9 +1530,10 @@ fn rewrite_npm_v2_deps(
                 });
             } else if non_registry.contains_key(&packages_key) {
                 // The mirror of a `packages` entry npm installs from a git /
-                // url / `file:` spec: that twin was skipped (and warned about)
-                // above, so rewriting this copy would only record an edit for
-                // bytes that never install.
+                // url / `file:` spec, or from a dependency's own shrinkwrap
+                // (#753): that twin was skipped (and warned about) above, so
+                // rewriting this copy would only record an edit for bytes
+                // that never install.
                 *matched_any = true;
             } else {
                 *matched_any = true;
@@ -15930,6 +15959,106 @@ mod tests {
             r.bundled_skipped_uuids.contains(&overrides[0].patch_uuid),
             "#325: the skipped bundled copy must keep the patch out of the in-run VEX"
         );
+    }
+
+    /// REGRESSION (#753): npm 7–11 install everything beneath a
+    /// `hasShrinkwrap` package from that package's own npm-shrinkwrap.json,
+    /// ignoring the root lock's entry. Rewriting the nested entry (or its
+    /// v2 legacy mirror) would confirm a patch npm never installs, so it is
+    /// skipped loudly, while a hoisted copy of the same version elsewhere
+    /// is still redirected.
+    #[test]
+    fn npm_entry_under_has_shrinkwrap_parent_is_skipped_with_loud_warning() {
+        let mut files = BTreeMap::new();
+        files.insert(
+            "package-lock.json".to_string(),
+            r#"{
+  "name": "app",
+  "lockfileVersion": 2,
+  "packages": {
+    "": { "name": "app", "version": "0.0.0" },
+    "node_modules/@bh/sw": {
+      "version": "1.0.0",
+      "resolved": "https://registry.npmjs.org/@bh/sw/-/sw-1.0.0.tgz",
+      "integrity": "sha512-SW==",
+      "hasShrinkwrap": true
+    },
+    "node_modules/@bh/sw/node_modules/left-pad": {
+      "version": "1.3.0",
+      "resolved": "https://registry.npmjs.org/left-pad/-/left-pad-1.3.0.tgz",
+      "integrity": "sha512-UPSTREAM=="
+    }
+  },
+  "dependencies": {
+    "@bh/sw": {
+      "version": "1.0.0",
+      "resolved": "https://registry.npmjs.org/@bh/sw/-/sw-1.0.0.tgz",
+      "integrity": "sha512-SW==",
+      "dependencies": {
+        "left-pad": {
+          "version": "1.3.0",
+          "resolved": "https://registry.npmjs.org/left-pad/-/left-pad-1.3.0.tgz",
+          "integrity": "sha512-UPSTREAM=="
+        }
+      }
+    }
+  }
+}
+"#
+            .to_string(),
+        );
+        let overrides = vec![npm_override(
+            "left-pad",
+            "1.3.0",
+            "http://patch.test/lp.tgz",
+            "sha512-PATCHED==",
+        )];
+        let r = rewrite_registry_redirect(&files, &overrides);
+        assert!(
+            r.files.is_empty() && r.edits.is_empty(),
+            "a shrinkwrapped-only dep must change nothing: files={:?} edits={:?}",
+            r.files.keys(),
+            r.edits
+        );
+        let skipped = r
+            .warnings
+            .iter()
+            .find(|w| w.code == "redirect_npm_shrinkwrapped_instance_skipped")
+            .unwrap_or_else(|| panic!("shrinkwrapped skip must warn: {:?}", r.warnings));
+        assert!(
+            skipped.detail.contains("UNPATCHED")
+                && skipped
+                    .detail
+                    .contains("node_modules/@bh/sw/node_modules/left-pad")
+                && skipped.detail.contains("`node_modules/@bh/sw`"),
+            "the warning must name the entry and its shrinkwrap owner: {}",
+            skipped.detail
+        );
+        assert!(
+            !warning_codes(&r).contains(&"redirect_npm_entry_not_found"),
+            "a shrinkwrapped skip is a MATCH: {:?}",
+            r.warnings
+        );
+        assert!(
+            r.bundled_skipped_uuids.contains(&overrides[0].patch_uuid),
+            "the skipped copy must keep the patch out of the in-run VEX"
+        );
+
+        // A hoisted copy outside the shrinkwrapped subtree still redirects.
+        let lock = files["package-lock.json"].replace(
+            r#""node_modules/@bh/sw": {"#,
+            r#""node_modules/left-pad": {
+      "version": "1.3.0",
+      "resolved": "https://registry.npmjs.org/left-pad/-/left-pad-1.3.0.tgz",
+      "integrity": "sha512-UPSTREAM=="
+    },
+    "node_modules/@bh/sw": {"#,
+        );
+        files.insert("package-lock.json".to_string(), lock);
+        let r = rewrite_registry_redirect(&files, &overrides);
+        let keys: Vec<_> = r.edits.iter().filter_map(|e| e.key.as_deref()).collect();
+        assert_eq!(keys, ["node_modules/left-pad"], "edits: {:?}", r.edits);
+        assert!(warning_codes(&r).contains(&"redirect_npm_shrinkwrapped_instance_skipped"));
     }
 
     /// #326: npm installs a git, remote-tarball or `file:` dependency from
