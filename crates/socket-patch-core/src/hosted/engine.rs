@@ -8,7 +8,7 @@
 //! 1. [`build_candidates`] — reference grants → rewriter overrides.
 //! 2. [`bun_lockb_symlinked`] — the binary-lock symlink refusal.
 //! 3. vlt artifact preflight ([`super::vlt`]) + [`withhold_everywhere`].
-//! 4. (caller) the apply lock, the ledger, the vendored→hosted takeover.
+//! 4. (caller) the apply lock and the vendored→hosted takeover.
 //! 5. [`read_candidate_files`] → [`wheel_targets`] → (caller) wheel metadata,
 //!    and [`yarn_berry_manifest_targets`] → (caller) served npm manifests.
 //! 6. [`rewrite`] — the rewriters, the pnpm `trustLockfile` and npm
@@ -17,8 +17,7 @@
 //!
 //! Nothing here writes, spawns, reads the environment or touches the
 //! network: every host effect (locking, probes, record fetches, the commit
-//! of the rewritten files, the redirect ledger in [`super::ledger`]) stays
-//! with the caller.
+//! of the rewritten files) stays with the caller.
 
 use std::collections::{BTreeMap, BTreeSet, HashMap};
 
@@ -1233,14 +1232,13 @@ pub async fn rewrite(
     );
     if let Some((text, edit)) = trust_config_write {
         rewrite.files.insert(PNPM_WORKSPACE_REL.to_string(), text);
-        // Appended last: `--revert` walks edits in reverse, so the trust key
-        // is unwound before the lock originals are restored.
+        // Appended last, after the lock edits it serves. v5 keeps no hosted
+        // ledger, so nothing replays these edits; the order is write order.
         rewrite.edits.push(edit);
     }
     if let Some((text, edit)) = npmrc_config_write {
         rewrite.files.insert(NPMRC_REL.to_string(), text);
-        // Appended after the lock edits for the same reason: a whole-ledger
-        // replay unwinds the setting before the lock originals it served.
+        // Appended after the lock edits, like the pnpm trust key above.
         rewrite.edits.push(edit);
     }
     let rewritten: Vec<String> = rewrite
@@ -1903,8 +1901,8 @@ fn file_ecosystem(rel: &str) -> Option<&'static str> {
         .then_some("pypi")
 }
 
-/// SYMLINK GUARD — fail-closed, whole rewrite, before the ledger and before
-/// any write (hosted rewrites are transactional). The writer stages next to
+/// SYMLINK GUARD — fail-closed, whole rewrite, before any write (hosted
+/// rewrites are transactional). The writer stages next to
 /// the path and renames over it, which REPLACES a symbolic link with a
 /// detached regular copy: the link target goes stale and a revert restores
 /// bytes but never the link. Applies to every ecosystem's files and to dry
