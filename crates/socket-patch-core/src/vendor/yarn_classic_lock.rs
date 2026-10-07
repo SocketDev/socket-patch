@@ -28,9 +28,10 @@ use serde_json::Value;
 
 use crate::constants::SOCKET_DIR;
 use crate::formats::yarn::blocks::{
-    block_eol, body_field_line, classic_field, replace_block, scan_blocks, LockBlock,
+    block_eol, body_field_line, classic_field, repin_classic_block, replace_block, scan_blocks,
+    LockBlock,
 };
-use crate::formats::yarn::patterns::{pattern_real_name, split_key_patterns};
+use crate::formats::yarn::patterns::{classic_key_real_name, split_key_patterns};
 use crate::formats::yarn::source::{classic_block_source, ClassicBlockSource};
 use crate::manifest::schema::PatchRecord;
 use crate::patch::apply::PatchSources;
@@ -709,13 +710,10 @@ enum BlockClass {
 /// Does this block stand for `name@version`, and can it be rewired?
 fn classify_classic_block(block: &LockBlock, name: &str, version: &str) -> BlockClass {
     let patterns = split_key_patterns(&block.key);
-    if patterns.is_empty() {
-        return BlockClass::NoMatch;
-    }
     // Every key pattern must resolve to the target package's real name (an
     // `alias@npm:left-pad@^1.3.0` pattern carries the real name inside the
     // range — spike Y5's alias block).
-    if !patterns.iter().all(|p| pattern_real_name(p) == Some(name)) {
+    if classic_key_real_name(&patterns) != Some(name) {
         return BlockClass::NoMatch;
     }
     if classic_field(&block.lines, "version") != Some(version) {
@@ -750,8 +748,8 @@ fn classify_classic_block(block: &LockBlock, name: &str, version: &str) -> Block
     }
 }
 
-/// Rebuild a block's lines with the vendored `resolved`/`integrity` (adding
-/// the integrity line when absent — yarn then enforces both hashes) and,
+/// Rebuild a block's lines with the vendored `resolved`/`integrity`
+/// ([`repin_classic_block`], the pin every classic writer shares) and,
 /// when the patch rewrote the package's own manifest, the recomputed
 /// dependency sub-maps.
 fn rewrite_classic_block(
@@ -760,58 +758,41 @@ fn rewrite_classic_block(
     integrity_value: &str,
     staged_pkg: Option<&Value>,
 ) -> Vec<String> {
-    let has_integrity = lines
-        .iter()
-        .skip(1)
-        .any(|l| body_field_line(l).is_some_and(|r| r.starts_with("integrity ")));
-    let mut out = vec![lines[0].clone()];
-    let mut i = 1;
-    while i < lines.len() {
-        let line = &lines[i];
-        if let Some(rest) = body_field_line(line) {
-            if rest.starts_with("resolved ") {
-                out.push(format!("  resolved \"{resolved_value}\""));
-                if !has_integrity {
-                    // yarn's field order: version, resolved, integrity, deps.
-                    out.push(format!("  integrity {integrity_value}"));
-                }
+    let pinned = repin_classic_block(lines, resolved_value, integrity_value);
+    let Some(pkg) = staged_pkg else {
+        return pinned;
+    };
+    let mut out = Vec::with_capacity(pinned.len());
+    let mut i = 0;
+    while i < pinned.len() {
+        if i > 0
+            && body_field_line(&pinned[i])
+                .is_some_and(|r| r == "dependencies:" || r == "optionalDependencies:")
+        {
+            // Drop the stale sub-map (header + 4-space entries); the
+            // recomputed ones are appended below in yarn's order.
+            i += 1;
+            while i < pinned.len() && body_field_line(&pinned[i]).is_none() {
                 i += 1;
-                continue;
             }
-            if rest.starts_with("integrity ") {
-                out.push(format!("  integrity {integrity_value}"));
-                i += 1;
-                continue;
-            }
-            if staged_pkg.is_some() && (rest == "dependencies:" || rest == "optionalDependencies:")
-            {
-                // Drop the stale sub-map (header + 4-space entries); the
-                // recomputed ones are appended below in yarn's order.
-                i += 1;
-                while i < lines.len() && body_field_line(&lines[i]).is_none() {
-                    i += 1;
-                }
-                continue;
-            }
+            continue;
         }
-        out.push(line.clone());
+        out.push(pinned[i].clone());
         i += 1;
     }
-    if let Some(pkg) = staged_pkg {
-        for field in ["dependencies", "optionalDependencies"] {
-            let Some(map) = pkg.get(field).and_then(Value::as_object) else {
-                continue;
-            };
-            if map.is_empty() {
-                continue;
-            }
-            out.push(format!("  {field}:"));
-            let mut keys: Vec<&String> = map.keys().collect();
-            keys.sort_unstable();
-            for k in keys {
-                if let Some(range) = map.get(k).and_then(Value::as_str) {
-                    out.push(format!("    {} \"{range}\"", quote_yarn_key(k)));
-                }
+    for field in ["dependencies", "optionalDependencies"] {
+        let Some(map) = pkg.get(field).and_then(Value::as_object) else {
+            continue;
+        };
+        if map.is_empty() {
+            continue;
+        }
+        out.push(format!("  {field}:"));
+        let mut keys: Vec<&String> = map.keys().collect();
+        keys.sort_unstable();
+        for k in keys {
+            if let Some(range) = map.get(k).and_then(Value::as_str) {
+                out.push(format!("    {} \"{range}\"", quote_yarn_key(k)));
             }
         }
     }
@@ -905,6 +886,7 @@ pub(super) fn json_to_lines(value: &Value) -> Option<Vec<String>> {
 #[cfg(test)]
 mod tests {
     use super::*;
+    use crate::formats::yarn::patterns::pattern_real_name;
     use crate::hash::git_sha256::compute_git_sha256_from_bytes;
     use crate::manifest::schema::PatchFileInfo;
     use crate::patch::apply::{ApplyResult, VerifyStatus};

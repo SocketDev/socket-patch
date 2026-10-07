@@ -124,10 +124,68 @@ pub(crate) fn body_field_line(line: &str) -> Option<&str> {
     Some(rest)
 }
 
+/// Whether `line` is the 2-space body field `field`, in either grammar
+/// (classic `field "value"` / `field value`, berry `field: value`).
+pub(crate) fn is_body_field(line: &str, field: &str) -> bool {
+    body_field_line(line)
+        .and_then(|rest| rest.strip_prefix(field))
+        .is_some_and(|rest| rest.starts_with([' ', ':']))
+}
+
+/// `lines` with the first body field `field` replaced by `new_line`
+/// (`None` when the block has no such field). Plain line surgery: no
+/// regex, so nothing in `new_line` is ever read as a replacement
+/// template.
+pub(crate) fn with_body_field(
+    lines: &[String],
+    field: &str,
+    new_line: &str,
+) -> Option<Vec<String>> {
+    let at = lines.iter().skip(1).position(|l| is_body_field(l, field))? + 1;
+    let mut out = lines.to_vec();
+    out[at] = new_line.to_string();
+    Some(out)
+}
+
+/// A classic block's lines pinned to a tarball: `resolved` set to
+/// `resolved` and `integrity` to `integrity` — the `integrity` line
+/// replaced, or added right after `resolved` when absent (yarn's field
+/// order: version, resolved, integrity, dependencies; once the line is
+/// there yarn enforces both hashes). Every other line is kept verbatim. A
+/// block with no `resolved` line is returned unchanged: there is no tarball
+/// to repoint.
+///
+/// The ONE classic pin splice: the vendored backend, the hosted rewriter
+/// and the hosted restore all write a block through it.
+pub(crate) fn repin_classic_block(
+    lines: &[String],
+    resolved: &str,
+    integrity: &str,
+) -> Vec<String> {
+    if !lines.iter().skip(1).any(|l| is_body_field(l, "resolved")) {
+        return lines.to_vec();
+    }
+    let has_integrity = lines.iter().skip(1).any(|l| is_body_field(l, "integrity"));
+    let mut out = Vec::with_capacity(lines.len() + 1);
+    for (i, line) in lines.iter().enumerate() {
+        if i > 0 && is_body_field(line, "resolved") {
+            out.push(format!("  resolved \"{resolved}\""));
+            if !has_integrity {
+                out.push(format!("  integrity {integrity}"));
+            }
+        } else if i > 0 && is_body_field(line, "integrity") {
+            out.push(format!("  integrity {integrity}"));
+        } else {
+            out.push(line.clone());
+        }
+    }
+    out
+}
+
 /// Read a classic scalar field (`<name> "<value>"`, integrity unquoted).
-pub(crate) fn classic_field<'a>(lines: &'a [String], field: &str) -> Option<&'a str> {
+pub(crate) fn classic_field<'a, S: AsRef<str>>(lines: &'a [S], field: &str) -> Option<&'a str> {
     for line in lines.iter().skip(1) {
-        let Some(rest) = body_field_line(line) else {
+        let Some(rest) = body_field_line(line.as_ref()) else {
             continue;
         };
         let Some(value) = rest.strip_prefix(field) else {
@@ -160,9 +218,9 @@ pub(crate) fn live_blocks(patterns: &[Vec<String>]) -> Vec<bool> {
 }
 
 /// Read a berry scalar field (`<name>: <value>`, value possibly quoted).
-pub(crate) fn berry_field<'a>(lines: &'a [String], field: &str) -> Option<&'a str> {
+pub(crate) fn berry_field<'a, S: AsRef<str>>(lines: &'a [S], field: &str) -> Option<&'a str> {
     for line in lines.iter().skip(1) {
-        let Some(rest) = body_field_line(line) else {
+        let Some(rest) = body_field_line(line.as_ref()) else {
             continue;
         };
         let Some(value) = rest.strip_prefix(field) else {
@@ -179,4 +237,51 @@ pub(crate) fn berry_field<'a>(lines: &'a [String], field: &str) -> Option<&'a st
 /// The lock's exact `__metadata` block (its `version` / `cacheKey` header).
 pub(crate) fn berry_metadata(blocks: &[LockBlock]) -> Option<&LockBlock> {
     blocks.iter().find(|b| b.key == "__metadata")
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    fn lines(text: &str) -> Vec<String> {
+        text.lines().map(str::to_string).collect()
+    }
+
+    #[test]
+    fn repin_replaces_or_adds_integrity_and_keeps_every_other_line() {
+        let with = lines(
+            "a@^1:\n  version \"1.0.0\"\n  resolved \"https://r/a.tgz#00\"\n  integrity sha512-old\n  dependencies:\n    b \"^1\"",
+        );
+        assert_eq!(
+            repin_classic_block(&with, "https://p/$1.tgz#ff", "sha512-new"),
+            lines(
+                "a@^1:\n  version \"1.0.0\"\n  resolved \"https://p/$1.tgz#ff\"\n  integrity sha512-new\n  dependencies:\n    b \"^1\"",
+            ),
+            "a `$` in the URL is literal text, never a replacement group"
+        );
+        let without = lines("a@^1:\n  version \"1.0.0\"\n  resolved \"https://r/a.tgz\"");
+        assert_eq!(
+            repin_classic_block(&without, "https://p/a.tgz", "sha512-new"),
+            lines(
+                "a@^1:\n  version \"1.0.0\"\n  resolved \"https://p/a.tgz\"\n  integrity sha512-new",
+            )
+        );
+        let unresolved = lines("a@^1:\n  version \"1.0.0\"\n  integrity sha512-old");
+        assert_eq!(repin_classic_block(&unresolved, "x", "y"), unresolved);
+    }
+
+    #[test]
+    fn with_body_field_matches_both_grammars_and_skips_sub_maps() {
+        let berry = lines(
+            "\"a@npm:^1\":\n  dependencies:\n    resolution: x\n  resolution: \"a@npm:1.0.0\"",
+        );
+        assert_eq!(
+            with_body_field(&berry, "resolution", "  resolution: \"$0\"").unwrap()[3],
+            "  resolution: \"$0\""
+        );
+        assert_eq!(with_body_field(&berry, "checksum", "x"), None);
+        assert!(is_body_field("  resolved \"x\"", "resolved"));
+        assert!(!is_body_field("  resolvedX \"x\"", "resolved"));
+        assert!(!is_body_field("    resolved \"x\"", "resolved"));
+    }
 }

@@ -851,8 +851,7 @@ pub fn yarn_berry_manifest_targets<'a>(
     else {
         return Vec::new();
     };
-    let lock = crate::utils::line_endings::to_lf(lock);
-    let bin_entries = crate::patch::redirect::berry_bin_entries(&lock);
+    let bin_entries = crate::patch::redirect::berry_bin_entries(lock);
     if bin_entries.is_empty() {
         return Vec::new();
     }

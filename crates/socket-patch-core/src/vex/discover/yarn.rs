@@ -91,7 +91,8 @@ use super::{
 };
 use crate::formats::yarn::blocks::{berry_field, classic_field};
 use crate::formats::yarn::patterns::{
-    pattern_real_name, resolution_selector_target, split_resolved_sha1, BerryLocator,
+    classic_key_real_name, pattern_real_name, resolution_selector_target, split_resolved_sha1,
+    BerryLocator,
 };
 use crate::formats::yarn::source::{classic_block_source, ClassicBlockSource};
 use crate::patch::redirect::is_berry_lock;
@@ -148,16 +149,11 @@ fn extract_classic(ctx: &DiscoverCtx<'_>, entries: Vec<YarnEntry>, out: &mut Dis
 
 /// The purl a block stands for when every key pattern names one package.
 fn classic_block_purl(entry: &YarnEntry) -> Option<String> {
-    let patterns = &entry.patterns;
     match (
-        patterns.first().and_then(|p| pattern_real_name(p)),
+        classic_key_real_name(&entry.patterns),
         classic_field(&entry.block.lines, "version"),
     ) {
-        (Some(name), Some(version))
-            if patterns.iter().all(|p| pattern_real_name(p) == Some(name)) =>
-        {
-            npm_purl(name, version)
-        }
+        (Some(name), Some(version)) => npm_purl(name, version),
         _ => None,
     }
 }

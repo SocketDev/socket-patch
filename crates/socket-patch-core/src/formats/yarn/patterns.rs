@@ -79,6 +79,15 @@ pub(crate) fn pattern_real_name(pattern: &str) -> Option<&str> {
     Some(name)
 }
 
+/// The one real package EVERY pattern of a classic key stands for
+/// ([`pattern_real_name`]): `None` when there is no pattern, one does not
+/// parse, or they name different packages.
+pub(crate) fn classic_key_real_name(patterns: &[String]) -> Option<&str> {
+    let mut names = patterns.iter().map(|p| pattern_real_name(p));
+    let first = names.next()??;
+    names.all(|n| n == Some(first)).then_some(first)
+}
+
 /// A classic `resolved` value split at its first `#`: the url before it,
 /// and the fragment as a lowercase sha1 when it is 40 hex digits (either
 /// case) — the legacy tarball verifier yarn v1 enforces when no

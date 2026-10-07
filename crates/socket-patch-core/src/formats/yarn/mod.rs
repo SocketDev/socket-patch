@@ -5,6 +5,8 @@
 //! * the block walk and field reads ([`blocks`]);
 //! * key, descriptor and locator patterns ([`patterns`]);
 //! * where yarn 1 installs a block's copy from ([`source`]);
+//! * the stanza view the hosted berry writers re-key and re-order
+//!   entries in ([`stanzas`]);
 //! * the berry pinned-entry renderer ([`berry_entry`]).
 //!
 //! The vendored backends (`vendor::yarn_classic_lock`,
@@ -17,6 +19,7 @@ pub mod berry_gates;
 pub(crate) mod blocks;
 pub(crate) mod patterns;
 pub(crate) mod source;
+pub(crate) mod stanzas;
 
 use super::text::strip_bom;
 
