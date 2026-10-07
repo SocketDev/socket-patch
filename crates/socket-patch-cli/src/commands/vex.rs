@@ -1545,7 +1545,8 @@ fn omission_phrase(reason: &str) -> &'static str {
         }
         VENDOR_UNWIRED => {
             "the vendor ledger records its artifact, but no lockfile or config wires it to this \
-             package any more"
+             package in a way the build is sure to install (the wiring was dropped, another lock \
+             resolves the same version from elsewhere, or the dependency was removed)"
         }
         REDIRECT_UNWIRED => {
             "the hosted ledger records it, but no lockfile wires its hosted patch to this \

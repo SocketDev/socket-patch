@@ -37,7 +37,8 @@ use std::path::{Path, PathBuf};
 use serde_json::{json, Map, Value};
 
 use crate::vex::discover::{
-    Diag, Discovery, PatchedRef, Recognized, ResolvedElsewhere, Unattested, UnlockedPin, WiringMode,
+    ContestedRef, Diag, Discovery, PatchedRef, Recognized, ResolvedElsewhere, Unattested,
+    UnlockedPin, WiringMode,
 };
 
 /// Set to `1` to (re)write the goldens instead of comparing against them.
@@ -120,6 +121,7 @@ fn render(out: &Discovery, root: &Path) -> Value {
         unlocked_pins,
         elsewhere,
         unattested,
+        contested,
     } = out;
     let refs: Vec<Value> = refs
         .iter()
@@ -220,6 +222,28 @@ fn render(out: &Discovery, root: &Path) -> Value {
                     "uuid": uuid,
                     "file": path_str(file),
                     "detail": normalize(detail, &roots),
+                })
+            })
+            .collect::<Vec<_>>()
+            .into();
+    }
+    if !contested.is_empty() {
+        rendered["contested"] = contested
+            .iter()
+            .map(|c| {
+                let ContestedRef {
+                    purl,
+                    uuid,
+                    mode: m,
+                    file,
+                    other,
+                } = c;
+                json!({
+                    "purl": purl,
+                    "uuid": uuid,
+                    "mode": mode(*m),
+                    "file": path_str(file),
+                    "other": path_str(other),
                 })
             })
             .collect::<Vec<_>>()
