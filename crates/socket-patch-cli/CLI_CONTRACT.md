@@ -535,7 +535,10 @@ the model is **not uniform** today:
   config file's `BUNDLE_PATH:` (`$BUNDLE_APP_CONFIG/config`, else `<cwd>/.bundle/config` — what
   `bundle config set --local path` records), then the **`BUNDLE_PATH` environment variable**, then the
   **standalone `<cwd>/bundle`** tree when it holds `bundle/bundler/setup.rb` (what `bundle install
-  --standalone` writes and the app loads; bundler 4 records no config for it), then the
+  --standalone` writes and the app loads; bundler 4 records no config for it), then **`<cwd>/.bundle`**
+  when no Bundler tier sets a path or a truthy `path.system` (Bundler's base path under
+  `default_install_uses_path` on 2.x and `simulate_version 5` on 4.x, and the default from Bundler 5
+  on; it keeps the `gem env` fallback on, like the explicit roots, #967), then the
   default `<cwd>/vendor/bundle` — each in both store layouts bundler produces (scoped
   `<root>/<engine>/<abi>/gems/` and flat `<root>/gems/`). The env variable is the user's own machine
   state, so it is honored verbatim (it may point outside `--cwd`; a leading `~` expands against home);
