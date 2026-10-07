@@ -934,7 +934,29 @@ async fn apply_package_patch_at(
         .iter()
         .all(|v| v.status == VerifyStatus::AlreadyPatched);
 
+    // Maven: retry a Coursier sidecar resync an earlier apply could not
+    // finish (see `sidecars::coursier::retry_record`) when this run writes
+    // nothing: every file already patched, or (`--force`) skipped.
+    let coursier_retry = |result: &mut ApplyResult| {
+        if !dry_run {
+            let keys: Vec<String> = result
+                .files_verified
+                .iter()
+                .filter(|v| v.status == VerifyStatus::AlreadyPatched)
+                .map(|v| v.file.clone())
+                .collect();
+            let failed = "sidecar fixup failed (patch still applied)";
+            result.sidecar = crate::patch::sidecars::coursier::retry_record(
+                package_key,
+                pkg_path,
+                &keys,
+                failed,
+            );
+        }
+    };
+
     if all_already_patched {
+        coursier_retry(&mut result);
         result.success = true;
         return result;
     }
@@ -947,6 +969,7 @@ async fn apply_package_patch_at(
 
     if all_done_or_skipped {
         // Some or all files were not found but skipped via --force
+        coursier_retry(&mut result);
         let not_found_count = result
             .files_verified
             .iter()
@@ -2704,6 +2727,59 @@ mod tests {
     /// sidecar fixup, or its checksum entry stays stale forever and
     /// `cargo build` refuses the crate even though the retry reported
     /// success.
+    /// `--force` with an already patched Coursier jar and a missing file:
+    /// nothing is written, yet a sidecar resync an earlier apply could not
+    /// finish is retried (the jar's `__sha1` still names the old bytes).
+    #[tokio::test]
+    async fn test_force_skip_retries_a_stale_coursier_sidecar() {
+        use sha1::Digest as _;
+        let pkg_dir = tempfile::tempdir().unwrap();
+        let pkg = pkg_dir.path();
+        let jar = "a-1.0.jar";
+        tokio::fs::write(pkg.join(jar), b"patched jar")
+            .await
+            .unwrap();
+        let stale = hex::encode(sha1::Sha1::digest(b"original jar"));
+        tokio::fs::write(pkg.join(format!(".{jar}__sha1")), &stale)
+            .await
+            .unwrap();
+        let mut files = HashMap::new();
+        files.insert(
+            jar.to_string(),
+            PatchFileInfo {
+                before_hash: compute_git_sha256_from_bytes(b"original jar"),
+                after_hash: compute_git_sha256_from_bytes(b"patched jar"),
+            },
+        );
+        files.insert(
+            "a-1.0-extra.jar".to_string(),
+            PatchFileInfo {
+                before_hash: compute_git_sha256_from_bytes(b"x"),
+                after_hash: compute_git_sha256_from_bytes(b"y"),
+            },
+        );
+        let blobs = tempfile::tempdir().unwrap();
+        let result = apply_package_patch(
+            "pkg:maven/g/a@1.0",
+            pkg,
+            &files,
+            &PatchSources::blobs_only(blobs.path()),
+            None,
+            false,
+            MismatchPolicy::Force,
+        )
+        .await;
+        assert!(result.success, "{:?}", result.error);
+        assert!(result.files_patched.is_empty());
+        assert!(result.sidecar.is_some(), "the resync was retried");
+        assert_eq!(
+            tokio::fs::read_to_string(pkg.join(format!(".{jar}__sha1")))
+                .await
+                .unwrap(),
+            hex::encode(sha1::Sha1::digest(b"patched jar"))
+        );
+    }
+
     #[tokio::test]
     async fn test_apply_retry_resyncs_already_patched_checksum_entries() {
         fn plain_sha256(b: &[u8]) -> String {

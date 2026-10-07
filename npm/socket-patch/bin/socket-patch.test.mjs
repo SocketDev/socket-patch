@@ -1,6 +1,9 @@
 import { describe, it } from "node:test";
 import assert from "node:assert/strict";
-import { readFileSync } from "node:fs";
+import { spawnSync } from "node:child_process";
+import { chmodSync, mkdirSync, mkdtempSync, readFileSync, rmSync, writeFileSync } from "node:fs";
+import { createRequire } from "node:module";
+import { tmpdir } from "node:os";
 import { fileURLToPath } from "node:url";
 import { dirname, join } from "node:path";
 
@@ -70,4 +73,134 @@ describe("npm platform dispatch", () => {
       assert.equal(candidates[1], muslPkg, `second candidate for ${key} should be musl`);
     }
   });
+});
+
+// Regression tests for #974: installers that ignore `libc` (yarn classic)
+// install both the -gnu and -musl packages, so the wrapper must pick the
+// one that can run on this host and must never exit silently.
+
+const wrapperPath = join(__dirname, "socket-patch");
+const wrapper = createRequire(import.meta.url)(wrapperPath);
+
+describe("npm wrapper libc selection (#974)", () => {
+  it("does not run the CLI when required as a module", () => {
+    assert.equal(typeof wrapper.orderCandidates, "function");
+    assert.equal(typeof wrapper.detectLibc, "function");
+    assert.equal(typeof wrapper.runFirstUsable, "function");
+  });
+
+  it("detects musl when the Node runtime reports no glibc", () => {
+    const libc = wrapper.detectLibc({
+      platform: "linux",
+      getReport: () => ({ header: {} }),
+      listDir: () => ["ld-musl-x86_64.so.1", "libc.musl-x86_64.so.1"],
+    });
+    assert.equal(libc, "musl");
+  });
+
+  it("detects glibc from the runtime report even if a musl loader exists", () => {
+    const libc = wrapper.detectLibc({
+      platform: "linux",
+      getReport: () => ({ header: { glibcVersionRuntime: "2.36" } }),
+      listDir: () => ["ld-musl-x86_64.so.1"],
+    });
+    assert.equal(libc, "glibc");
+  });
+
+  it("returns null off Linux", () => {
+    assert.equal(
+      wrapper.detectLibc({
+        platform: "darwin",
+        getReport: () => ({ header: {} }),
+        listDir: () => [],
+      }),
+      null,
+    );
+  });
+
+  for (const key of ["linux x64", "linux arm64", "linux arm", "linux ia32"]) {
+    it(`prefers the musl package on a musl host (${key})`, () => {
+      const ordered = wrapper.orderCandidates(PLATFORMS[key], "musl");
+      assert.match(ordered[0], /-musl$/);
+      assert.match(ordered[1], /-gnu$/);
+    });
+
+    it(`keeps gnu first on a glibc host (${key})`, () => {
+      assert.deepEqual(wrapper.orderCandidates(PLATFORMS[key], "glibc"), PLATFORMS[key]);
+    });
+  }
+
+  it("falls back to the next binary when the first cannot be spawned", () => {
+    const calls = [];
+    const enoent = Object.assign(new Error("spawnSync gnu ENOENT"), { code: "ENOENT" });
+    const status = wrapper.runFirstUsable(["/gnu", "/musl"], ["--version"], {
+      spawn: (bin) => {
+        calls.push(bin);
+        return bin === "/gnu" ? { status: null, error: enoent } : { status: 0 };
+      },
+      log: () => {},
+    });
+    assert.equal(status, 0);
+    assert.deepEqual(calls, ["/gnu", "/musl"]);
+  });
+
+  it("prints why it failed instead of exiting silently", () => {
+    const logs = [];
+    const enoent = Object.assign(new Error("spawnSync /gnu ENOENT"), { code: "ENOENT" });
+    const status = wrapper.runFirstUsable(["/gnu"], [], {
+      spawn: () => ({ status: null, error: enoent }),
+      log: (msg) => logs.push(msg),
+    });
+    assert.equal(status, 1);
+    assert.equal(logs.length, 1);
+    assert.match(logs[0], /\/gnu/);
+    assert.match(logs[0], /ENOENT/);
+  });
+
+  it("propagates the exit status of a binary that ran", () => {
+    const status = wrapper.runFirstUsable(["/gnu", "/musl"], [], {
+      spawn: () => ({ status: 3 }),
+      log: () => {},
+    });
+    assert.equal(status, 3);
+  });
+
+  // End to end: a node_modules tree like yarn classic leaves on Alpine,
+  // with both platform packages installed and the gnu binary unable to
+  // start. The wrapper must run the musl binary instead of exiting 1
+  // with no output.
+  it(
+    "runs the musl binary when the gnu one cannot start (yarn classic layout)",
+    { skip: process.platform !== "linux" || !PLATFORMS[`linux ${process.arch}`] },
+    () => {
+      const root = mkdtempSync(join(tmpdir(), "sp-wrapper-"));
+      try {
+        const scope = join(root, "node_modules", "@socketsecurity");
+        const binDir = join(scope, "socket-patch", "bin");
+        mkdirSync(binDir, { recursive: true });
+        writeFileSync(join(binDir, "socket-patch"), readFileSync(wrapperPath));
+        for (const pkg of PLATFORMS[`linux ${process.arch}`]) {
+          const dir = join(root, "node_modules", pkg);
+          mkdirSync(dir, { recursive: true });
+          writeFileSync(join(dir, "package.json"), JSON.stringify({ name: pkg, version: "0.0.0" }));
+          const exe = join(dir, "socket-patch");
+          if (pkg.endsWith("-gnu")) {
+            // A binary whose ELF interpreter is missing fails exactly like
+            // a glibc binary on musl: spawn reports ENOENT.
+            writeFileSync(exe, "#!/nonexistent/ld-linux.so.2\n");
+          } else {
+            writeFileSync(exe, "#!/bin/sh\necho \"musl-binary $*\"\n");
+          }
+          chmodSync(exe, 0o755);
+        }
+        const result = spawnSync(process.execPath, [join(binDir, "socket-patch"), "--version"], {
+          encoding: "utf8",
+        });
+        assert.equal(result.status, 0, `stderr: ${result.stderr}`);
+        assert.equal(result.stdout.trim(), "musl-binary --version");
+      } finally {
+        rmSync(root, { recursive: true, force: true });
+      }
+    },
+  );
 });

@@ -397,6 +397,62 @@ async fn requirements_sole_pin_vendored_to_hosted() {
     assert_vendored_to_hosted(&root, &["requirements.txt"]).await;
 }
 
+/// #410: a requirements.txt in which every requirement is the hosted pin
+/// (a lone `six==1.16.0`, or one beside `-e .`) can be unwound again.
+/// Hosted `rollback`, `remove` and the hosted → vendored takeover restore
+/// the pin to its unhashed registry spelling. Before the fix they all
+/// refused: no other line said whether the original used `--hash`.
+async fn assert_all_hosted_requirements_unwind(pristine: &str) {
+    let server = MockServer::start().await;
+    let hosted_url = mount_hosted_api(&server, true).await;
+    let uri = server.uri();
+    for unwind in [
+        vec!["rollback", "--yes", "--offline"],
+        vec!["remove", PURL, "--yes", "--offline"],
+        // The fixture server builds the vendored wheel.
+        vec!["vendor"],
+    ] {
+        let (_tmp, root) = project();
+        std::fs::write(root.join("requirements.txt"), pristine).unwrap();
+        let (code, env) = hosted_scan(&root, &server);
+        assert_eq!(code, 0, "hosted scan: {env:#}");
+        assert_eq!(env["redirect"]["redirected"], 1, "{env:#}");
+        let wired = std::fs::read_to_string(root.join("requirements.txt")).unwrap();
+        assert!(wired.contains(&hosted_url), "hosted first:\n{wired}");
+
+        if unwind[0] == "vendor" {
+            stage_manifest(&root);
+            // `--patch-server-url` (which names the hosted origin to take
+            // over) also moves the vendored download onto this server.
+            prebuilt_common::mount_project(&server, &root).await;
+        }
+        let mut args = unwind.clone();
+        args.extend(["--patch-server-url", uri.as_str()]);
+        let (code, env) = run_cli(&root, &args, &[]);
+        assert_eq!(code, 0, "{unwind:?} over {pristine:?}: {env:#}");
+        let after = std::fs::read_to_string(root.join("requirements.txt")).unwrap();
+        if unwind[0] == "vendor" {
+            assert!(
+                after.contains(&format!(".socket/vendor/pypi/{UUID}/"))
+                    && !after.contains(&hosted_url),
+                "the takeover leaves the project vendored:\n{after}"
+            );
+        } else {
+            assert_eq!(after, pristine, "{unwind:?} restores the pristine file");
+        }
+    }
+}
+
+#[tokio::test]
+async fn requirements_sole_hosted_pin_unwinds() {
+    assert_all_hosted_requirements_unwind("six==1.16.0\n").await;
+}
+
+#[tokio::test]
+async fn requirements_editable_beside_hosted_pin_unwinds() {
+    assert_all_hosted_requirements_unwind("-e .\nsix==1.16.0\n").await;
+}
+
 /// A Poetry project; returns its wiring files.
 fn stage_poetry(root: &Path) -> &'static [&'static str] {
     std::fs::write(
@@ -454,6 +510,94 @@ async fn pipenv_vendored_to_hosted() {
     let (_tmp, root) = project();
     let files = stage_pipenv(&root);
     assert_vendored_to_hosted(&root, files).await;
+}
+
+/// A superseding patch for the same release (a fixed patch, or one
+/// covering more CVEs).
+const UUID_B: &str = "6d4f2b3c-8e5a-4f7b-9c9d-2e3f4a5b6c7d";
+const PATCHED_B: &[u8] = b"# six\nVERSION = '1.16.0'\nSOCKET_PATCHED = 2\n";
+
+/// A virtualenv whose six was installed from the vendored wheel of patch
+/// A (`pipenv sync` after the first vendor): its files are A's patched
+/// bytes, not the pristine release patch B is diffed against.
+fn venv_installed_from_patch_a(venv: &Path) {
+    let site = venv.join("lib/python3.11/site-packages");
+    let dist = site.join("six-1.16.0.dist-info");
+    std::fs::create_dir_all(&dist).unwrap();
+    std::fs::write(site.join("six.py"), PATCHED).unwrap();
+    std::fs::write(
+        dist.join("METADATA"),
+        "Metadata-Version: 2.1\nName: six\nVersion: 1.16.0\n\n",
+    )
+    .unwrap();
+    std::fs::write(
+        dist.join("WHEEL"),
+        "Wheel-Version: 1.0\nRoot-Is-Purelib: true\nTag: py2-none-any\nTag: py3-none-any\n",
+    )
+    .unwrap();
+    std::fs::write(dist.join("INSTALLER"), "pip\n").unwrap();
+    std::fs::write(
+        dist.join("RECORD"),
+        "six.py,,\nsix-1.16.0.dist-info/METADATA,,\nsix-1.16.0.dist-info/WHEEL,,\nsix-1.16.0.dist-info/INSTALLER,,\nsix-1.16.0.dist-info/RECORD,,\n",
+    )
+    .unwrap();
+}
+
+/// #769: a Pipenv project vendored at patch A moves to the superseding
+/// patch B when the manifest offers it, as the `would_revendor` preview
+/// and the CLI contract promise, whether the checkout is lock-only or its
+/// venv was installed from A's vendored wheel. Pipfile.lock is rewired to
+/// B, A's artifact is swept, and reverting B restores the registry pin.
+#[tokio::test]
+async fn pipenv_revendors_to_a_superseding_patch() {
+    for venv_present in [false, true] {
+        let lane = if venv_present {
+            "venv from A"
+        } else {
+            "lock-only"
+        };
+        let (_tmp, root) = project();
+        stage_pipenv(&root);
+        let registry = std::fs::read_to_string(root.join("Pipfile.lock")).unwrap();
+        vendor_project(&root, &["Pipfile.lock"]);
+
+        let venv = root.join("../patched-venv");
+        let mut extra: Vec<(&str, &str)> = Vec::new();
+        if venv_present {
+            venv_installed_from_patch_a(&venv);
+            extra.push(("VIRTUAL_ENV", venv.to_str().unwrap()));
+        }
+        stage_manifest_with(&root, UUID_B, PATCHED_B);
+        let (code, env) = run_cli(&root, &["vendor"], &extra);
+        assert_eq!(code, 0, "{lane}: re-vendor to B: {env:#}");
+        assert!(
+            env.to_string().contains("vendor_stale_artifact_removed"),
+            "{lane}: A's artifact is swept: {env:#}"
+        );
+        let lock = std::fs::read_to_string(root.join("Pipfile.lock")).unwrap();
+        assert!(
+            lock.contains(&format!(".socket/vendor/pypi/{UUID_B}/")) && !lock.contains(UUID),
+            "{lane}: Pipfile.lock is rewired to B:\n{lock}"
+        );
+        assert!(!root.join(format!(".socket/vendor/pypi/{UUID}")).exists());
+        let wheels: Vec<_> = std::fs::read_dir(root.join(format!(".socket/vendor/pypi/{UUID_B}")))
+            .unwrap()
+            .flatten()
+            .filter(|e| e.file_name().to_string_lossy().ends_with(".whl"))
+            .collect();
+        assert_eq!(wheels.len(), 1, "{lane}: B's wheel is vendored");
+
+        let (code, env) = run_cli(&root, &["vendor", "--revert"], &extra);
+        assert_eq!(code, 0, "{lane}: revert B: {env:#}");
+        let reverted: Value =
+            serde_json::from_str(&std::fs::read_to_string(root.join("Pipfile.lock")).unwrap())
+                .unwrap();
+        let registry: Value = serde_json::from_str(&registry).unwrap();
+        assert_eq!(
+            reverted, registry,
+            "{lane}: revert restores the registry pin"
+        );
+    }
 }
 
 const UV_LOCK: &str = r#"version = 1

@@ -1,0 +1,14 @@
+<?xml version="1.0" encoding="UTF-8"?>
+<ivy-report version="1.0">
+<info organisation="d" module="d" revision="0.1.0-SNAPSHOT" conf="runtime"/>
+<dependencies>
+<module organisation="com.google.code.gson" name="gson">
+<revision name="2.8.9">
+<artifacts>
+<artifact name="gson" type="jar" ext="jar" location="/root/.ivy2/cache/com.google.code.gson/gson/jars/gson-2.8.9.jar">
+</artifact>
+</artifacts>
+</revision>
+</module>
+</dependencies>
+</ivy-report>
