@@ -243,6 +243,9 @@ const SETUP_ALTERNATIVE: &str =
 /// 8. `hatch.toml` / `[tool.hatch]` / hatchling build backend → hatch;
 /// 9. a lone pyproject → refuse;  10. nothing → refuse.
 ///
+/// The tool-lock order is the shared table
+/// [`crate::formats::governing_locks::PYPI_TOOL_LOCKS`].
+///
 /// When more than one tool lockfile coexists, the winner is wired and a LOUD
 /// `pypi_multiple_lockfiles` warning names the ignored locks — they go
 /// stale-but-valid, which is otherwise invisible. Standalone locks that don't
@@ -255,22 +258,26 @@ async fn detect_pypi_flavor(
         let p = project_root.join(name);
         async move { tokio::fs::metadata(&p).await.is_ok() }
     };
-    let has_uv_lock = exists("uv.lock").await;
-    let has_poetry_lock = exists("poetry.lock").await;
-    let has_pdm_lock = exists("pdm.lock").await;
-    let has_pipfile_lock = exists("Pipfile.lock").await;
+    use crate::formats::governing_locks::{
+        pypi_governing_tool_lock, pypi_locks_outside, PYPI_REQUIREMENTS, PYPI_TOOL_LOCKS,
+    };
+    let mut tool_locks: Vec<&str> = Vec::new();
+    for lock in PYPI_TOOL_LOCKS {
+        if exists(lock).await {
+            tool_locks.push(lock);
+        }
+    }
+    let governing = pypi_governing_tool_lock(|lock| tool_locks.contains(&lock));
+    let has_uv_lock = governing == Some("uv.lock");
     let has_pipfile = exists("Pipfile").await;
 
     // Coexisting tool locks: wire the precedence winner, warn about the rest.
-    let mut present: Vec<&str> = [
-        ("uv.lock", has_uv_lock),
-        ("poetry.lock", has_poetry_lock),
-        ("pdm.lock", has_pdm_lock),
-        ("Pipfile.lock", has_pipfile_lock),
-    ]
-    .into_iter()
-    .filter_map(|(name, present)| present.then_some(name))
-    .collect();
+    let mut present: Vec<&str> = governing.into_iter().collect();
+    if let Some(governing) = governing {
+        present.extend(pypi_locks_outside(governing, |lock| {
+            tool_locks.contains(&lock)
+        }));
+    }
     let additional_locks: Vec<String> = crate::utils::python_lock::python_lock_paths(project_root)
         .map_err(|error| ("pypi_lock_read_failed", error.to_string()))?
         .into_iter()
@@ -323,23 +330,18 @@ async fn detect_pypi_flavor(
         ));
     }
 
-    if has_uv_lock {
-        return Ok((PypiFlavor::UvProject, warnings));
-    }
-    if has_poetry_lock {
-        return Ok((PypiFlavor::Poetry, warnings));
-    }
-    if has_pdm_lock {
-        return Ok((PypiFlavor::Pdm, warnings));
-    }
-    if has_pipfile_lock {
-        return Ok((PypiFlavor::Pipenv, warnings));
+    match governing {
+        Some("uv.lock") => return Ok((PypiFlavor::UvProject, warnings)),
+        Some("poetry.lock") => return Ok((PypiFlavor::Poetry, warnings)),
+        Some("pdm.lock") => return Ok((PypiFlavor::Pdm, warnings)),
+        Some(_) => return Ok((PypiFlavor::Pipenv, warnings)),
+        None => {}
     }
 
     let pyproject_text = read_regular_to_string(&project_root.join("pyproject.toml"))
         .await
         .ok();
-    let has_requirements = exists("requirements.txt").await;
+    let has_requirements = exists(PYPI_REQUIREMENTS).await;
     let has_pyproject_table = |prefix: &str| {
         pyproject_text
             .as_deref()

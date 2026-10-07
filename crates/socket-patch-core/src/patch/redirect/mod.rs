@@ -499,14 +499,15 @@ pub fn pipenv_reserialized_around_reference(
 }
 
 /// Whether `pdm.lock` is the project's PyPI install driver: present, with no
-/// `uv.lock` or `poetry.lock` beside it (mirroring the vendored flavor
-/// precedence uv > poetry > pdm > pipenv). A leftover `pdm.lock` beside one
-/// of those neither blocks nor is attested through them. `pub` so the CLI's
-/// hosted confirmation gate can share the predicate instead of re-deriving it.
+/// higher-ranked tool lock (`uv.lock`, `poetry.lock`) beside it, by the
+/// shared precedence [`crate::formats::governing_locks::PYPI_TOOL_LOCKS`]. A
+/// leftover `pdm.lock` beside one of those neither blocks nor is attested
+/// through them. `pub` so the CLI's hosted confirmation gate can share the
+/// predicate instead of re-deriving it.
 pub fn pdm_drives(files: &BTreeMap<String, String>) -> bool {
-    files.contains_key("pdm.lock")
-        && !files.contains_key("uv.lock")
-        && !files.contains_key("poetry.lock")
+    crate::formats::governing_locks::pypi_tool_lock_governs("pdm.lock", |lock| {
+        files.contains_key(lock)
+    })
 }
 
 /// `overrides` minus the deps whose patch uuid is in `refused` — borrowed

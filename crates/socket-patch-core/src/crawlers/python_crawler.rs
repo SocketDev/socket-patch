@@ -560,11 +560,13 @@ fn pdm_env_flag(var: &impl Fn(&str) -> Option<String>, name: &str) -> bool {
 }
 
 /// Whether PDM installs the project at `cwd`: a PDM project (see
-/// [`is_pdm_project`], or a `.pdm-python`) with no `uv.lock` or
-/// `poetry.lock`, which drive installs ahead of `pdm.lock` (the hosted
-/// rewriters' precedence).
+/// [`is_pdm_project`], or a `.pdm-python`) with no tool lock that drives
+/// installs ahead of `pdm.lock` (`uv.lock`, `poetry.lock`: the shared
+/// precedence [`crate::formats::governing_locks::PYPI_TOOL_LOCKS`]).
 async fn pdm_drives_project(cwd: &Path) -> bool {
-    if cwd.join("uv.lock").is_file() || cwd.join("poetry.lock").is_file() {
+    if crate::formats::governing_locks::pypi_tool_lock_shadowed("pdm.lock", |lock| {
+        cwd.join(lock).is_file()
+    }) {
         return false;
     }
     cwd.join(".pdm-python").is_file() || is_pdm_project(cwd).await
