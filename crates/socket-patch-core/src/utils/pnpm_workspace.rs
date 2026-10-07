@@ -44,23 +44,97 @@ pub enum MemberLocks {
     Unresolved(String),
 }
 
-/// Whether the workspace turned the shared lock off: a top-level
+/// A pnpm setting as one settings source spells it.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct PnpmSetting {
+    /// The value, quotes removed.
+    pub value: String,
+    /// Where it is set, as a refusal names it (e.g.
+    /// `` `gitBranchLockfile: true` in pnpm-workspace.yaml ``).
+    pub source: String,
+}
+
+impl PnpmSetting {
+    /// The value as a boolean, spelled the way both readers pnpm uses
+    /// accept (js-yaml takes `True` / `FALSE` too); `None` for anything
+    /// else.
+    pub fn as_bool(&self) -> Option<bool> {
+        let value = self.value.trim();
+        if value.eq_ignore_ascii_case("true") {
+            Some(true)
+        } else if value.eq_ignore_ascii_case("false") {
+            Some(false)
+        } else {
+            None
+        }
+    }
+}
+
+/// Where a pnpm setting is set: a top-level `yaml_key` in `workspace`
+/// (`pnpm-workspace.yaml`) wins; when that file does not set it,
+/// `npmrc_key` in `npmrc` (pnpm 10 and older read it there). `None` when
+/// neither sets it.
+pub fn pnpm_setting(
+    workspace: Option<&str>,
+    npmrc: Option<&str>,
+    yaml_key: &str,
+    npmrc_key: &str,
+) -> Option<PnpmSetting> {
+    use crate::formats::pnpm::workspace::yaml_top_level_value;
+    if let Some(value) = workspace.and_then(|text| yaml_top_level_value(text, yaml_key)) {
+        let source = format!("`{yaml_key}: {value}` in {PNPM_WORKSPACE}");
+        return Some(PnpmSetting { value, source });
+    }
+    let value = npmrc
+        .and_then(|text| crate::patch::redirect::npmrc::npmrc_top_level_value(text, npmrc_key))?;
+    let value = value.trim().to_string();
+    let source = format!("`{npmrc_key}={value}` in .npmrc");
+    Some(PnpmSetting { value, source })
+}
+
+/// `npmrc_key` from the environment (`pnpm_config_<key>`, then
+/// `npm_config_<key>`, dashes as underscores), looked up through `env`:
+/// what a CI job sets when neither settings file does.
+fn env_setting(npmrc_key: &str, env: impl Fn(&str) -> Option<String>) -> Option<PnpmSetting> {
+    let key = npmrc_key.replace('-', "_");
+    [format!("pnpm_config_{key}"), format!("npm_config_{key}")]
+        .into_iter()
+        .find_map(|var| {
+            let value = env(&var)?.trim().to_string();
+            let source = format!("`{var}={value}` in the environment");
+            Some(PnpmSetting { value, source })
+        })
+}
+
+/// [`pnpm_setting`], falling back to the environment ([`env_setting`]) on
+/// disk, where the CLI runs pnpm's environment.
+fn view_setting(
+    view: &ProjectView<'_>,
+    workspace: Option<&str>,
+    npmrc: Option<&str>,
+    yaml_key: &str,
+    npmrc_key: &str,
+) -> Option<PnpmSetting> {
+    pnpm_setting(workspace, npmrc, yaml_key, npmrc_key).or_else(|| {
+        if matches!(view, ProjectView::Memory(_)) {
+            return None;
+        }
+        env_setting(npmrc_key, |var| std::env::var(var).ok())
+    })
+}
+
+/// Whether the workspace turned the shared lock off:
 /// `sharedWorkspaceLockfile: false` in `workspace` (`pnpm-workspace.yaml`),
 /// or, when that file does not set the key, `shared-workspace-lockfile=false`
-/// in the root `.npmrc` (pnpm 10 and older read it there).
+/// in the root `.npmrc` (see [`pnpm_setting`]).
 pub fn shared_lockfile_disabled(workspace: &str, npmrc: Option<&str>) -> bool {
-    use crate::formats::pnpm::workspace::yaml_top_level_value;
-    match yaml_top_level_value(workspace, "sharedWorkspaceLockfile") {
-        Some(value) => value == "false",
-        None => npmrc
-            .and_then(|text| {
-                crate::patch::redirect::npmrc::npmrc_top_level_value(
-                    text,
-                    "shared-workspace-lockfile",
-                )
-            })
-            .is_some_and(|value| value.trim() == "false"),
-    }
+    pnpm_setting(
+        Some(workspace),
+        npmrc,
+        "sharedWorkspaceLockfile",
+        "shared-workspace-lockfile",
+    )
+    .is_some_and(|setting| setting.as_bool() == Some(false))
 }
 
 /// Whether a root lock is a SHARED workspace lock: its `importers:` names a
@@ -122,7 +196,14 @@ pub async fn member_locks(view: &ProjectView<'_>) -> MemberLocks {
         return MemberLocks::Shared;
     };
     let npmrc = view.read_text(".npmrc").await.ok();
-    if !shared_lockfile_disabled(&workspace, npmrc.as_deref()) {
+    let shared = view_setting(
+        view,
+        Some(&workspace),
+        npmrc.as_deref(),
+        "sharedWorkspaceLockfile",
+        "shared-workspace-lockfile",
+    );
+    if shared.is_none_or(|setting| setting.as_bool() != Some(false)) {
         return MemberLocks::Shared;
     }
     let root_lock = view.read_text(PNPM_LOCK).await.ok();
@@ -130,7 +211,16 @@ pub async fn member_locks(view: &ProjectView<'_>) -> MemberLocks {
         return MemberLocks::Shared;
     }
     let globs = match crate::formats::pnpm::workspace::package_globs(&workspace) {
-        Ok(globs) => globs,
+        Ok(Some(globs)) => globs,
+        // pnpm <= 8 then finds projects in every directory (`**`), more
+        // than a bounded walk can promise to list.
+        Ok(None) => {
+            return MemberLocks::Unresolved(format!(
+                "{PNPM_WORKSPACE} turns the shared lock off, so every workspace member \
+                 installs from its own {PNPM_LOCK}, but it has no `packages:` list to \
+                 find the members by"
+            ))
+        }
         Err(why) => {
             return MemberLocks::Unresolved(format!(
                 "{PNPM_WORKSPACE} sets sharedWorkspaceLockfile: false, so every \
@@ -195,23 +285,22 @@ impl GitBranchLocks {
          into pnpm-lock.yaml with `pnpm install --merge-git-branch-lockfiles`, then re-run";
 }
 
-/// Where `gitBranchLockfile` is turned on: a top-level `gitBranchLockfile:
-/// true` in `workspace` (`pnpm-workspace.yaml`), or, when that file does
-/// not set the key, `git-branch-lockfile=true` in the root `.npmrc` (pnpm
-/// 10 and older read it there). `None` when it is off.
+/// Where `gitBranchLockfile` is turned on (see [`pnpm_setting`]): its
+/// source, `None` when it is off.
 pub fn git_branch_lockfile_setting(workspace: Option<&str>, npmrc: Option<&str>) -> Option<String> {
-    use crate::formats::pnpm::workspace::yaml_top_level_value;
-    let on = |value: &str| value.trim().eq_ignore_ascii_case("true");
-    if let Some(value) = workspace.and_then(|text| yaml_top_level_value(text, "gitBranchLockfile"))
-    {
-        return on(&value).then(|| format!("`gitBranchLockfile: true` in {PNPM_WORKSPACE}"));
-    }
-    npmrc
-        .and_then(|text| {
-            crate::patch::redirect::npmrc::npmrc_top_level_value(text, "git-branch-lockfile")
-        })
-        .filter(|value| on(value))
-        .map(|_| "`git-branch-lockfile=true` in .npmrc".to_string())
+    git_branch_on(pnpm_setting(
+        workspace,
+        npmrc,
+        "gitBranchLockfile",
+        "git-branch-lockfile",
+    ))
+}
+
+/// The source of a `gitBranchLockfile` setting that turns it on.
+fn git_branch_on(setting: Option<PnpmSetting>) -> Option<String> {
+    setting
+        .filter(|setting| setting.as_bool() == Some(true))
+        .map(|setting| setting.source)
 }
 
 /// Whether `name` is a pnpm branch lock: `pnpm-lock.<branch>.yaml` (pnpm
@@ -242,19 +331,13 @@ pub async fn git_branch_locks(view: &ProjectView<'_>) -> Option<GitBranchLocks> 
     }
     let workspace = view.read_text(PNPM_WORKSPACE).await.ok();
     let npmrc = view.read_text(".npmrc").await.ok();
-    let setting =
-        git_branch_lockfile_setting(workspace.as_deref(), npmrc.as_deref()).or_else(|| {
-            if matches!(view, ProjectView::Memory(_)) {
-                return None;
-            }
-            [
-                "pnpm_config_git_branch_lockfile",
-                "npm_config_git_branch_lockfile",
-            ]
-            .into_iter()
-            .find(|var| std::env::var(var).is_ok_and(|v| v.trim().eq_ignore_ascii_case("true")))
-            .map(|var| format!("`{var}=true` in the environment"))
-        })?;
+    let setting = git_branch_on(view_setting(
+        view,
+        workspace.as_deref(),
+        npmrc.as_deref(),
+        "gitBranchLockfile",
+        "git-branch-lockfile",
+    ))?;
     Some(GitBranchLocks { setting, locks })
 }
 
@@ -337,6 +420,40 @@ mod tests {
             "'sharedWorkspaceLockfile': false # own locks\n",
             Some("shared-workspace-lockfile=true\n")
         ));
+        // js-yaml reads every capitalisation of a boolean.
+        assert!(shared_lockfile_disabled("sharedWorkspaceLockfile: False\n", None));
+        assert!(shared_lockfile_disabled("packages: []\n", Some("shared-workspace-lockfile = FALSE\n")));
+        assert!(!shared_lockfile_disabled("sharedWorkspaceLockfile: TRUE\n", None));
+        assert!(!shared_lockfile_disabled("sharedWorkspaceLockfile: no\n", None));
+    }
+
+    #[test]
+    fn the_environment_spells_a_setting_with_underscores() {
+        let env = |vars: &'static [(&'static str, &'static str)]| {
+            move |var: &str| {
+                vars.iter()
+                    .find(|(name, _)| *name == var)
+                    .map(|(_, value)| value.to_string())
+            }
+        };
+        let found = env_setting(
+            "shared-workspace-lockfile",
+            env(&[("npm_config_shared_workspace_lockfile", " false ")]),
+        )
+        .unwrap();
+        assert_eq!(found.as_bool(), Some(false));
+        assert!(found.source.contains("npm_config_shared_workspace_lockfile"));
+        // The pnpm spelling wins over npm's.
+        let found = env_setting(
+            "git-branch-lockfile",
+            env(&[
+                ("npm_config_git_branch_lockfile", "false"),
+                ("pnpm_config_git_branch_lockfile", "TRUE"),
+            ]),
+        )
+        .unwrap();
+        assert_eq!(found.as_bool(), Some(true));
+        assert_eq!(env_setting("git-branch-lockfile", env(&[])), None);
     }
 
     #[test]
@@ -438,6 +555,18 @@ mod tests {
             member_locks(&view).await,
             MemberLocks::Unresolved(_)
         ));
+        // No `packages:` key (pnpm <= 8 finds projects everywhere): never
+        // "no members", with or without a root lock.
+        write(root, PNPM_WORKSPACE, "sharedWorkspaceLockfile: false\n");
+        assert!(matches!(
+            member_locks(&view).await,
+            MemberLocks::Unresolved(_)
+        ));
+        write(root, PNPM_LOCK, "lockfileVersion: '9.0'\nimporters:\n  .: {}\n");
+        assert!(matches!(
+            member_locks(&view).await,
+            MemberLocks::Unresolved(_)
+        ));
     }
 
     #[test]
@@ -460,6 +589,9 @@ mod tests {
             None
         );
         assert!(setting(Some("  gitBranchLockfile: true\n"), None).is_none());
+        assert!(setting(Some("gitBranchLockfile: TRUE\n"), None).is_some());
+        assert!(setting(None, Some("git-branch-lockfile=True\n")).is_some());
+        assert_eq!(setting(Some("gitBranchLockfile: False\n"), None), None);
     }
 
     #[test]

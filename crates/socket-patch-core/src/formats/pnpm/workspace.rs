@@ -139,11 +139,12 @@ pub(crate) fn block_section_bounds(lines: &[String], name: &str) -> Option<(usiz
 
 /// The `packages:` globs of a pnpm-workspace.yaml, quotes removed (a
 /// negation keeps its leading `!`), from a block sequence (items indented
-/// or at column 0) or a one-line flow sequence. `Ok` and empty when the
-/// file has no top-level `packages:` key; `Err` names a value this reader
-/// cannot follow (a scalar, a multi-line flow, an anchor or alias, a nested
-/// node), which a caller must not take for "no members".
-pub(crate) fn package_globs(text: &str) -> Result<Vec<String>, String> {
+/// or at column 0) or a one-line flow sequence. `Ok(None)` when the file
+/// has no top-level `packages:` key (pnpm <= 8 then finds projects in
+/// every directory); `Err` names a value this reader cannot follow (a
+/// scalar, a multi-line flow, an anchor or alias, a nested node), which a
+/// caller must not take for "no members".
+pub(crate) fn package_globs(text: &str) -> Result<Option<Vec<String>>, String> {
     let text = text.strip_prefix('\u{feff}').unwrap_or(text);
     let lines: Vec<&str> = text
         .lines()
@@ -153,7 +154,7 @@ pub(crate) fn package_globs(text: &str) -> Result<Vec<String>, String> {
         .iter()
         .rposition(|l| top_level_key(l).is_some_and(|(key, _)| key == "packages"))
     else {
-        return Ok(Vec::new());
+        return Ok(None);
     };
     let inline = top_level_key(lines[start]).map_or("", |(_, value)| value);
     if !inline.is_empty() {
@@ -166,7 +167,8 @@ pub(crate) fn package_globs(text: &str) -> Result<Vec<String>, String> {
             .map(str::trim)
             .filter(|item| !item.is_empty())
             .map(glob_scalar)
-            .collect();
+            .collect::<Result<_, _>>()
+            .map(Some);
     }
     let mut out = Vec::new();
     for line in &lines[start + 1..] {
@@ -186,7 +188,7 @@ pub(crate) fn package_globs(text: &str) -> Result<Vec<String>, String> {
             None => break,
         }
     }
-    Ok(out)
+    Ok(Some(out))
 }
 
 /// One `packages:` item: a plain or quoted scalar, quotes removed.
@@ -332,7 +334,7 @@ mod tests {
 
     #[test]
     fn package_globs_read_block_flow_quoted_and_negated_items() {
-        let globs = |text: &str| package_globs(text);
+        let globs = |text: &str| package_globs(text).map(Option::unwrap_or_default);
         assert_eq!(
             globs("packages:\n  - packages/*\n  - 'apps/**' # web\n  - \"!**/fixtures/**\"\nsharedWorkspaceLockfile: false\n"),
             Ok(vec![
@@ -351,7 +353,9 @@ mod tests {
             Ok(vec!["packages/*".to_string(), "!packages/x".to_string()])
         );
         assert_eq!(globs("packages: []\n"), Ok(Vec::new()));
-        assert_eq!(globs("trustLockfile: true\n"), Ok(Vec::new()));
+        // An absent key is not an empty list.
+        assert_eq!(package_globs("packages: []\n"), Ok(Some(Vec::new())));
+        assert_eq!(package_globs("trustLockfile: true\n"), Ok(None));
         // Shapes this reader cannot follow are errors, never "no members".
         for text in [
             "packages: *members\n",

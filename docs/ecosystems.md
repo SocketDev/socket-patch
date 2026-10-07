@@ -84,7 +84,8 @@ The backticked slug in each row is the value `-e`/`--ecosystems` accepts (e.g.
   pinned beside the root's (pnpm 7 writes no root lock at all), and `list`,
   `vex` and `rollback` read the member locks too. Member locks beside a root
   lock that lists member importers are stale and ignored. A member list the
-  CLI cannot read is refused with `redirect_pnpm_member_locks_unresolved`.
+  CLI cannot read (including a `pnpm-workspace.yaml` with no `packages:` key)
+  is refused with `redirect_pnpm_member_locks_unresolved`.
   With `gitBranchLockfile` on (`git-branch-lockfile=true` in `.npmrc` on
   pnpm 10 and older), pnpm installs a branch from its own
   `pnpm-lock.<branch>.yaml`, which neither mode can pin: while such a lock
