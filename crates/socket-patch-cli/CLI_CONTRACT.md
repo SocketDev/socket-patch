@@ -833,7 +833,12 @@ worse, lets a warm cache silently serve unpatched bytes):
   (purl or patch uuid; v5 keeps no hosted ledger) restores each matched pin to its default
   upstream registry entry — the same restore as `rollback` (see "Hosted unwind coverage"), for every
   ecosystem. A hosted-only match works with no manifest at all (mirroring the manifest-less
-  vendored escape). A pin the restore refuses (`--offline`, a registry that does not answer,
+  vendored escape). **One owned pin per release**: an identifier that matches a manifest entry
+  also selects the vendored ledger entry that entry claims and every hosted pin wiring the same
+  package release, whatever patch uuid (generation) each recorded — so `remove <uuid A>` of a
+  record a later scan superseded with patch B (vendored or hosted) unwinds B's wiring too. That
+  hosted restore needs the registry lookups below, so such a remove can refuse offline where the
+  manifest entry alone would not. A pin the restore refuses (`--offline`, a registry that does not answer,
   `bun.lockb`, …) or a failed write is the top-level `hosted_revert_failed` error BEFORE the
   manifest mutation (exit 1, manifest not modified; message `could not restore <purl> to its
   upstream registry entry: … (`git checkout -- <files>`)`). v4's `hosted_revert_unsupported` is no
@@ -888,7 +893,7 @@ worse, lets a warm cache silently serve unpatched bytes):
 
 ### Targets
 
-`rollback [TARGET]...` — zero or more targets, unioned. `pkg:` tokens are PURLs (base purl matches every release variant; qualified purl exact), other identifier-shaped tokens are UUIDs, and only **path-shaped** tokens (separator, glob metachar `*?[`, `./` prefix, or absolute) are path globs — see the per-subcommand args table for the safety rationale. Identifier matching runs across ALL THREE sources (a hosted pin matches by purl or by the patch uuid in its hosted URL); an identifier matching nothing anywhere is the familiar exit-1 error. Path globs use the same matcher as `scan [PATHS]` (ancestor rule, `require_literal_separator`, absolute-only outside `--cwd`, Windows case-insensitive): installed copies of every candidate purl are discovered and purls with ≥ 1 matching copy are selected. Scoping sentences (shared with scan):
+`rollback [TARGET]...` — zero or more targets, unioned. `pkg:` tokens are PURLs (base purl matches every release variant; qualified purl exact), other identifier-shaped tokens are UUIDs, and only **path-shaped** tokens (separator, glob metachar `*?[`, `./` prefix, or absolute) are path globs — see the per-subcommand args table for the safety rationale. Identifier matching runs across ALL THREE sources (a hosted pin matches by purl or by the patch uuid in its hosted URL); an identifier that matches a manifest entry also selects the vendored ledger entry that entry claims and every hosted pin of the same package release under any patch uuid (one owned pin per release — `remove` parity); an identifier matching nothing anywhere is the familiar exit-1 error. Path globs use the same matcher as `scan [PATHS]` (ancestor rule, `require_literal_separator`, absolute-only outside `--cwd`, Windows case-insensitive): installed copies of every candidate purl are discovered and purls with ≥ 1 matching copy are selected. Scoping sentences (shared with scan):
 
 * **A target that selects nothing is an error on `rollback` (exit 1) and an empty scan on `scan` (exit 0).** Each rollback path pattern must select at least one patched package; the error names the pattern and the reachability rule.
 * **Path targets select installed copies; entries with no installed copy are reachable only by identifier or unscoped runs.**
