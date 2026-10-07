@@ -506,10 +506,10 @@ fn default_remove_sweeps_archives_too() {
 
     // Every archive is gone from BOTH archive dirs, the kept entry's too.
     for dir in ["diffs", "packages"] {
-        for uuid in [ARCH_UUID_A, ARCH_UUID_B] {
+        for (label, uuid) in [("A", ARCH_UUID_A), ("B", ARCH_UUID_B)] {
             assert!(
                 !socket.join(dir).join(format!("{uuid}.tar.gz")).exists(),
-                "{dir}/{uuid}.tar.gz must be swept"
+                "entry {label}'s {dir} archive must be swept"
             );
         }
     }
