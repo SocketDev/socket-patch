@@ -79,6 +79,16 @@ pub async fn remove_tree_and_prune(dir: &Path, stop_dir: &Path) -> std::io::Resu
             link.display()
         )));
     }
+    // A staged hosted takeover deletes the unit only once its commit is on
+    // disk (see `group_commit::defer_removal`). The prune bound is the
+    // level just below `stop_dir`, so `stop_dir` itself still survives.
+    let bound = dir
+        .ancestors()
+        .find(|a| a.parent() == Some(stop_dir))
+        .unwrap_or(dir);
+    if super::group_commit::defer_removal(dir, bound) {
+        return Ok(());
+    }
     crate::patch::copy_tree::remove_tree(dir).await?;
     if let Some(parent) = dir.parent() {
         prune_empty_dirs(parent, stop_dir).await;
