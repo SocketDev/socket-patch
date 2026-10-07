@@ -34,9 +34,9 @@ use socket_patch_core::utils::group_commit::{CommittedFile, GroupCommit};
 use socket_patch_core::utils::purl::{canonical_purl, normalize_purl, strip_purl_qualifiers};
 use socket_patch_core::utils::socket_dir::remove_tree_and_prune;
 use socket_patch_core::vendor::{
-    self, ecosystem_dir_for_purl, load_state, lock_inventory, lookup_entry, save_state,
-    save_state_shared, PackageSource, RevertOpts, RevertOutcome, VendorEntry, VendorOutcome,
-    VendorServiceConfig, VendorState, VendorWarning,
+    self, ecosystem_dir_for_purl, load_state, lock_inventory, lookup_entry, lookup_entry_kv,
+    save_state, save_state_shared, PackageSource, RevertOpts, RevertOutcome, VendorEntry,
+    VendorOutcome, VendorServiceConfig, VendorState, VendorWarning,
 };
 use socket_patch_core::vex::time::now_rfc3339;
 use std::collections::{HashMap, HashSet};
@@ -2069,6 +2069,24 @@ impl StagedSource {
     }
 }
 
+/// Whether an installed copy that fails `candidate`'s variant probe is
+/// still `candidate` itself, superseded: the ledger vendored exactly this
+/// package at an OLDER patch uuid (#769), so the venv most likely holds
+/// that patch's bytes (`pipenv sync` from the vendored wheel), which are
+/// neither the pristine release nor this patch's output. The re-vendor
+/// then takes the pristine artifact from the lock / registry / service, as
+/// a lock-only checkout does, instead of reporting it not installed.
+fn superseded_install(
+    ledger: &VendorState,
+    candidate: &str,
+    record: &PatchRecord,
+    sole_candidate: bool,
+) -> bool {
+    lookup_entry_kv(&ledger.entries, candidate).is_some_and(|(key, entry)| {
+        entry.uuid != record.uuid && (sole_candidate || key == candidate)
+    })
+}
+
 #[allow(clippy::too_many_arguments)]
 async fn plan_service_downloads(
     cwd: &Path,
@@ -2085,6 +2103,8 @@ async fn plan_service_downloads(
         &vendor::pypi::InstalledSiteListings,
     ),
 ) -> Vec<socket_patch_core::api::client::PlannedDownload> {
+    // The loop's stand-in for a superseded install (see there).
+    let uninstalled = cwd.join(".socket/vendor/.uninstalled");
     // Each loop candidate that reaches its backend, in loop order.
     let mut reaching: Vec<(&str, &PatchRecord, &Path)> = Vec::new();
     let mut handled_bases: HashSet<String> = HashSet::new();
@@ -2116,6 +2136,7 @@ async fn plan_service_downloads(
                 && !matches!(Ecosystem::from_purl(candidate), Some(Ecosystem::Maven));
             let ledger_answers_probe =
                 lookup_entry(&ledger.entries, candidate).is_some_and(|e| e.uuid == record.uuid);
+            let mut source_path = source.path();
             if probe_applicable && !force && !ledger_answers_probe {
                 if matches!(staged, StagedSource::Installed(_)) {
                     if let Some((file, info)) = representative_file(&record.files) {
@@ -2123,7 +2144,11 @@ async fn plan_service_downloads(
                         if !variant_matches_installed(Some(
                             &verify_file_patch(dir, file, info).await.status,
                         )) {
-                            continue;
+                            if !superseded_install(ledger, candidate, record, candidates.len() == 1)
+                            {
+                                continue;
+                            }
+                            source_path = &uninstalled;
                         }
                     }
                 } else if candidates.len() > 1 && lookup_entry(&ledger.entries, candidate).is_none()
@@ -2161,7 +2186,7 @@ async fn plan_service_downloads(
             if lookup_entry(&ledger.entries, candidate).is_some_and(|e| e.uuid == record.uuid) {
                 continue;
             }
-            reaching.push((candidate.as_str(), record, source.path()));
+            reaching.push((candidate.as_str(), record, source_path));
         }
     }
 
@@ -2518,6 +2543,8 @@ pub(crate) async fn vendor_records_reusing(
         && !socket_patch_core::utils::failpoint::switched_off("group_commit"))
     .then(|| GroupCommit::begin(&common.cwd));
     let mut stale_artifacts: Vec<StaleArtifact> = Vec::new();
+    // The source of a superseded install (see [`superseded_install`]).
+    let uninstalled = common.cwd.join(".socket/vendor/.uninstalled");
     for (index, (purl, staged)) in all_packages.iter().enumerate() {
         let pkg_source = staged.as_source();
         let is_variant_eco =
@@ -2559,6 +2586,7 @@ pub(crate) async fn vendor_records_reusing(
             // without downloading the pristine tree just to read one file.
             let ledger_answers_probe =
                 lookup_entry(&state.entries, candidate).is_some_and(|e| e.uuid == record.uuid);
+            let mut candidate_source = pkg_source;
             if probe_applicable && !force && !ledger_answers_probe {
                 if matches!(staged, StagedSource::Installed(_)) {
                     if let Some((file, info)) = representative_file(&record.files) {
@@ -2567,7 +2595,11 @@ pub(crate) async fn vendor_records_reusing(
                                 .await
                                 .status,
                         )) {
-                            continue;
+                            if !superseded_install(&state, candidate, record, candidates.len() == 1)
+                            {
+                                continue;
+                            }
+                            candidate_source = PackageSource::Installed(&uninstalled);
                         }
                     }
                 } else if candidates.len() > 1 && lookup_entry(&state.entries, candidate).is_none()
@@ -2899,7 +2931,7 @@ pub(crate) async fn vendor_records_reusing(
             ));
             let outcome = dispatch_vendor_one(
                 candidate,
-                pkg_source,
+                candidate_source,
                 &common.cwd,
                 record,
                 sources,
