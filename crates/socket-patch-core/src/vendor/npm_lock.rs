@@ -162,9 +162,9 @@ pub async fn vendor_npm<'a>(
         };
 
     // ── 3b. Sibling lock (npm 12) ───────────────────────────────────────
-    // npm 12 removed `npm shrinkwrap`, auto-creates a package-lock.json
-    // beside a committed npm-shrinkwrap.json on first install and then
-    // reifies FROM package-lock.json (verified against real npm 12.0.0 /
+    // npm 12 removed `npm shrinkwrap`, never reads a committed
+    // npm-shrinkwrap.json, writes a package-lock.json (from the registry)
+    // beside it on first install and then reifies FROM package-lock.json (verified against real npm 12.0.0 /
     // 12.1.0; npm <= 11 installs from the shrinkwrap). Wiring only the
     // shrinkwrap in that dual-lock state was a silent false success under
     // npm 12 — the unpatched registry bytes kept installing. Every other

@@ -1041,9 +1041,9 @@ fn rewrite_npm_lock(
         return;
     }
     // BOTH npm locks can legitimately co-exist and BOTH must be rewritten.
-    // `npm shrinkwrap` was removed in npm 12, which now auto-creates a
-    // `package-lock.json` beside any committed `npm-shrinkwrap.json` on first
-    // install and reifies the install FROM `package-lock.json`. So the
+    // `npm shrinkwrap` was removed in npm 12, which never reads a committed
+    // `npm-shrinkwrap.json`: its first install resolves from the registry,
+    // writes a `package-lock.json` beside it and reifies FROM that. So the
     // dual-lock state is the DEFAULT for a shrinkwrap repo under npm 12.
     // Rewriting only the first present lock would patch the file npm doesn't
     // install from — a silent FALSE SUCCESS. Rewrite EVERY present npm lock so

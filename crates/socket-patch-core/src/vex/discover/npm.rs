@@ -108,9 +108,9 @@ impl NpmLockRefs {
 }
 
 /// Push every ref no OTHER npm lock contests. npm <= 11 installs from
-/// npm-shrinkwrap.json when both exist; npm 12 auto-creates a
-/// package-lock.json beside it and installs from THAT (verified against real
-/// npm 12.0.0 / 12.1.0). A package one lock wires to a Socket patch while the
+/// npm-shrinkwrap.json when both exist; npm 12 never reads the shrinkwrap,
+/// writes a package-lock.json (from the registry) beside it and installs from
+/// THAT (verified against real npm 12.0.0 / 12.1.0). A package one lock wires to a Socket patch while the
 /// other resolves it only elsewhere (the registry) is therefore installed
 /// patched by some npm majors and unpatched by others — not decidable from
 /// the files, so it is diagnosed and not attested (the same call as the v2
