@@ -475,7 +475,7 @@ fn download_mode_file() {
 //
 // `get --mode <hosted|vendored|agent>` reuses scan's `ScanMode` value-enum
 // (see cli_parse_scan.rs) so the two commands can never drift on mode
-// names. Unlike scan, `get` has NO legacy boolean spellings and no
+// names. Unlike scan, `get` has no `--sync` shorthand and no
 // `resolve_mode_flags` fold — the parsed enum IS the source of truth
 // (`None` = agent, today's behavior; the `--save-only` conflict is
 // enforced inside `run()`, not by clap — pinned in get_modes_e2e.rs).

@@ -238,7 +238,7 @@ fn lock_timeout_help_names_get_and_scan() {
 }
 
 /// `-h` stays short (about eight options per page); `--help` still lists
-/// every option, and the deprecated `scan --apply`/`--vendor` spellings
+/// every option, and the removed `scan --apply`/`--vendor` spellings
 /// are in neither.
 #[test]
 fn short_help_lists_about_eight_options_and_long_help_lists_all() {

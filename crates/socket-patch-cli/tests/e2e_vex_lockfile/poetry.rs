@@ -1568,7 +1568,7 @@ fn scan_redirect_wiring_attests_without_manifest_or_ledger() {
 #[test]
 fn scan_vendor_wiring_attests_without_manifest_or_ledger() {
     for release in WRITER_RELEASES {
-        let what = format!("poetry {release} scan --vendor");
+        let what = format!("poetry {release} scan --mode vendored");
         let p = Proj::new();
         p.write_files(&native_files(release));
         p.install(PRISTINE);

@@ -2313,7 +2313,7 @@ async fn scan_vendor_state_attests_manifest_less() {
 
     let checkout = tmp.path().join("checkout");
     npm_e2e_common::fresh_checkout(tmp.path(), &checkout, &["package-lock.json"]);
-    run_manifestless_tail("scan --vendor", &checkout, pristine);
+    run_manifestless_tail("scan --mode vendored", &checkout, pristine);
 }
 
 /// The committed state of the manifest-driven standalone `vendor` — the

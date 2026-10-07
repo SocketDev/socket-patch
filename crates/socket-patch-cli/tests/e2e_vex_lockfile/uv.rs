@@ -1648,7 +1648,7 @@ fn scan_vendor_wiring_attests_without_manifest_or_ledger() {
             // uv vendoring always edits the pyproject/lock pair.
             continue;
         }
-        let what = format!("{} scan --vendor", flavor.label());
+        let what = format!("{} scan --mode vendored", flavor.label());
         let p = Proj::new();
         p.write_files(&flavor.native_files());
         p.install(flavor.version(), PRISTINE);
