@@ -1309,7 +1309,7 @@ const COMMONS_TEXT_POM: &str = "<project xmlns=\"http://maven.apache.org/POM/4.0
 /// reverted to the registry version with the ledger left behind is
 /// `vendor_unwired`.
 #[test]
-fn maven_vendor_command_wiring_reattests_without_manifest_or_ledger() {
+fn maven_vendor_command_wiring_reattests_from_its_ledger_only() {
     let fx = Fx::new();
     let v = Vendored::maven();
     let cached = fx.m2().join("org/apache/commons/commons-text/1.10.0");

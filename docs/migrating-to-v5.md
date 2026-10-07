@@ -90,6 +90,11 @@ socket-patch vendor            # or: socket-patch scan --mode vendored
 
 `remove`, `rollback` and switching to hosted mode still unwind the old wiring.
 
+`socket-patch vex` attests a single-module project vendored by v5 from
+`.socket/vendor/state.json`, as it already did for reactors. Commit that file:
+without it the suffixed pin is not attested. The pre-v5 `<repository>` wiring
+was also attested from `pom.xml` alone.
+
 Without a Maven Wrapper (`.mvn/wrapper/maven-wrapper.properties`) the CLI can't
 tell which Maven builds the project, so `vendor` reports two
 `vendor_jvm_degraded` warnings, `maven_f_outside_root` and
