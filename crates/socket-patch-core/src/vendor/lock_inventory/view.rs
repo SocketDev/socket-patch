@@ -374,21 +374,18 @@ pub(crate) async fn detect_npm_lock_flavor_in(
         })
     };
 
-    // A loader the configured `nodeLinker` disowns is stale (#975). Only the
-    // project's own rc file is in a memory snapshot; the home folder's rc
-    // file is the environment's, read from disk as yarn does. A classic
-    // lock is yarn 1, which has no `nodeLinker`.
+    // A loader the configured `nodeLinker` disowns is stale (#975). A
+    // memory snapshot is the repository alone, not the host it is scanned
+    // on: only its own `.yarnrc.yml` counts, never the host's
+    // `YARN_NODE_LINKER`, `YARN_RC_FILENAME` or home rc file. A classic lock
+    // is yarn 1, which has no `nodeLinker`.
     let linker = || {
-        let env = crate::crawlers::pkg_managers::YarnEnv::current();
         let lock = project.read_text("yarn.lock").ok();
         crate::crawlers::pkg_managers::effective_yarn_linker(lock.as_deref(), || {
-            env.node_linker
-                .clone()
-                .or_else(|| {
-                    let rc = project.read_text(&env.rc_filename).ok()?;
-                    env.rc_node_linker(&rc)
-                })
-                .or_else(|| env.home_node_linker())
+            let rc = project.read_text(".yarnrc.yml").ok()?;
+            crate::vendor::yarn_berry_lock::yarnrc_scalar(&rc, "nodeLinker")
+                .filter(|v| !v.is_empty())
+                .map(str::to_string)
         })
     };
     if let Some(marker) = crate::crawlers::pkg_managers::live_pnp_marker_with(linker, exists) {

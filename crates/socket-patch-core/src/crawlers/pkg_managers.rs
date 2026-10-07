@@ -187,23 +187,23 @@ impl YarnEnv {
         }
     }
 
-    /// The `nodeLinker` the rc file text `rc` sets, if any.
-    pub(crate) fn rc_node_linker(&self, rc: &str) -> Option<String> {
-        crate::vendor::yarn_berry_lock::yarnrc_scalar(rc, "nodeLinker")
-            .filter(|v| !v.is_empty())
-            .map(str::to_string)
-    }
-
     /// The `nodeLinker` the home folder's rc file sets: yarn reads it after
     /// every project-side rc file, so it applies only when none of those
     /// sets the key.
-    pub(crate) fn home_node_linker(&self) -> Option<String> {
+    fn home_node_linker(&self) -> Option<String> {
         let rc = crate::utils::fs::read_regular_to_string_sync(
             &self.home.as_ref()?.join(&self.rc_filename),
         )
         .ok()?;
-        self.rc_node_linker(&rc)
+        rc_node_linker(&rc)
     }
+}
+
+/// The `nodeLinker` the rc file text `rc` sets, if any.
+fn rc_node_linker(rc: &str) -> Option<String> {
+    crate::vendor::yarn_berry_lock::yarnrc_scalar(rc, "nodeLinker")
+        .filter(|v| !v.is_empty())
+        .map(str::to_string)
 }
 
 /// The `nodeLinker` yarn berry resolves for `project_root`:
@@ -227,7 +227,7 @@ pub(crate) fn yarn_node_linker_in(project_root: &Path, env: &YarnEnv) -> Option<
         .find_map(|dir| {
             let rc =
                 crate::utils::fs::read_regular_to_string_sync(&dir.join(&env.rc_filename)).ok()?;
-            env.rc_node_linker(&rc)
+            rc_node_linker(&rc)
         })
         .or_else(|| env.home_node_linker())
 }
