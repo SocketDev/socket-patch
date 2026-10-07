@@ -7107,6 +7107,13 @@ fn rewrite_maven_pom(
             let hex8 = crate::formats::maven::split_socket_version(old)
                 .map(|(_, h)| h)
                 .unwrap_or_default();
+            // The suffix carries only the uuid's first eight hex digits: a
+            // `-socket.<hex8>` literal of another artifact still in the pom
+            // may be a different live pin whose uuid shares them, so its
+            // repository stays.
+            if pom_text.contains(&format!("-socket.{hex8}")) {
+                continue;
+            }
             for old_uuid in generation::named_generations(pom_text) {
                 if old_uuid == dep.patch_uuid || !old_uuid.starts_with(hex8) {
                     continue;
@@ -22643,6 +22650,63 @@ mod owned_pin_generation_matrix {
         let checksums = &repinned[MVN_CHECKSUMS];
         assert!(!checksums.contains("aaaaaaaa"), "{checksums}");
         assert_eq!(checksums.lines().count(), 2, "{checksums}");
+    }
+
+    /// Another artifact's live pin whose uuid shares the superseded
+    /// generation's eight hex digits keeps its repository: the re-pin of
+    /// `commons-lang3` must not strand `commons-text`'s `-socket.<hex8>`.
+    #[test]
+    fn maven_repin_keeps_a_live_pin_sharing_the_hex8() {
+        let tok = "22222222-3333-4444-8555-666666666666";
+        let twin = "aaaaaaaa-1111-4000-8000-00000000001a";
+        let mut text = maven(twin, tok);
+        let to_text = |s: &str| {
+            s.replace("commons-lang3", "commons-text")
+                .replace("3.12.0", "1.10.0")
+        };
+        text.name = "commons-text".into();
+        text.version = "1.10.0".into();
+        text.artifact_url = to_text(&text.artifact_url);
+        let ro = text.registry_override.as_mut().unwrap();
+        ro.identifiers.name = to_text(&ro.identifiers.name);
+        ro.identifiers.version = "1.10.0".into();
+        ro.identifiers.maven_artifact_id = Some("commons-text".into());
+        ro.identifiers.maven_suffixed_version = Some("1.10.0-socket.aaaaaaaa".into());
+
+        let mut files = pom_project();
+        let pom = files["pom.xml"].replace(
+            "  </dependencies>\n",
+            "    <dependency>\n      <groupId>org.apache.commons</groupId>\n      \
+             <artifactId>commons-text</artifactId>\n      <version>1.10.0</version>\n    \
+             </dependency>\n  </dependencies>\n",
+        );
+        files.insert("pom.xml".into(), pom);
+        let (wired, _) = plan(&files, &text);
+        let (wired, _) = plan(&wired, &maven(A, tok));
+        let wired_pom = &wired["pom.xml"];
+        assert!(
+            wired_pom.contains(&format!("<id>socket-patch-{twin}</id>")),
+            "{wired_pom}"
+        );
+        assert!(
+            wired_pom.contains(&format!("<id>socket-patch-{A}</id>")),
+            "{wired_pom}"
+        );
+
+        let (repinned, _) = plan(&wired, &maven(B, tok));
+        let pom = &repinned["pom.xml"];
+        assert!(
+            pom.contains("<version>3.12.0-socket.bbbbbbbb</version>"),
+            "{pom}"
+        );
+        assert!(
+            pom.contains("<version>1.10.0-socket.aaaaaaaa</version>"),
+            "{pom}"
+        );
+        assert!(
+            pom.contains(&format!("<id>socket-patch-{twin}</id>")),
+            "the live twin pin lost its repository:\n{pom}"
+        );
     }
 
     /// A `-socket.<hex8>` literal that no hosted `socket-patch-<uuid>`
