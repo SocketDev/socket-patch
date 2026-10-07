@@ -1063,11 +1063,13 @@ async fn run_check(args: &VendorArgs) -> i32 {
         }
         env.record(event);
     }
-    for key in manifest
+    let mut unledgered_uuids: HashSet<&str> = HashSet::new();
+    for (key, record) in manifest
         .patches
-        .keys()
-        .filter(|k| !state.entries.contains_key(*k))
+        .iter()
+        .filter(|(k, _)| !state.entries.contains_key(*k))
     {
+        unledgered_uuids.insert(record.uuid.as_str());
         if !args.common.json {
             eprintln!("{key}: patch has no vendored ledger entry");
         }
@@ -1075,6 +1077,38 @@ async fn run_check(args: &VendorArgs) -> i32 {
             "vendor_ledger_missing",
             "patch has no vendored ledger entry",
         ));
+    }
+    // A project file still wired to a vendored artifact the ledger does not
+    // know (the ledger was ignored or dropped from the commit along with the
+    // manifest) leaves every fresh install failing; the manifest keys above
+    // cannot see it, so the references are read from the wiring itself.
+    let references =
+        crate::commands::vendored_backend::repair::scan_vendor_references(root).await;
+    for (eco, uuid, rel) in references {
+        let ledgered = state
+            .entries
+            .values()
+            .any(|entry| entry.uuid == uuid && entry.ecosystem == eco);
+        if ledgered || unledgered_uuids.contains(uuid.as_str()) {
+            continue;
+        }
+        // No ledger entry means no purl to name: like repair, the event
+        // carries the uuid and the referenced path instead. The message
+        // names only the ecosystem, keeping patch identifiers out of logs.
+        let detail = format!(
+            "a lockfile references a vendored {eco} artifact under .socket/vendor/{eco}/ but \
+             the vendor ledger (.socket/vendor/state.json) has no entry for it; restore \
+             state.json from version control"
+        );
+        if !args.common.json {
+            eprintln!("vendor_ledger_missing: {detail}");
+        }
+        env.record(
+            PatchEvent::artifact(PatchAction::Failed)
+                .with_uuid(uuid)
+                .with_error("vendor_ledger_missing", detail)
+                .with_details(serde_json::json!({ "ecosystem": eco, "path": rel })),
+        );
     }
     if args.common.json {
         println!("{}", env.to_pretty_json());
@@ -2718,15 +2752,23 @@ pub(crate) async fn vendor_records_reusing(
                         .clone();
                     let refusal = match project {
                         Some(refusal) => Some(refusal),
-                        None => {
-                            socket_patch_core::vendor::yarn_berry_vendor_target_preflight(
-                                &common.cwd,
-                                candidate,
-                                pin,
-                                &restore_opts,
-                            )
-                            .await
-                        }
+                        None => match socket_patch_core::vendor::npm_tarball_gitignore_preflight(
+                            &common.cwd,
+                            &record.uuid,
+                        )
+                        .await
+                        {
+                            Some(refusal) => Some(refusal),
+                            None => {
+                                socket_patch_core::vendor::yarn_berry_vendor_target_preflight(
+                                    &common.cwd,
+                                    candidate,
+                                    pin,
+                                    &restore_opts,
+                                )
+                                .await
+                            }
+                        },
                     };
                     if let Some((code, detail)) = &refusal {
                         has_errors = true;
