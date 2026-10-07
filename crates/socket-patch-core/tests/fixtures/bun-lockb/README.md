@@ -26,7 +26,9 @@ and an empty `BUN_INSTALL_CACHE_DIR` to regenerate. Bun 1.2+ fixtures include
   wrote for the `e2e_bun_lockb` workspace (vendored once, uuid
   `80630680-…`) after a late dependent of minimist@1.2.2 — a new `late`
   member, or `bun add` in the existing `adder` member — gave it a second,
-  nested registry record (#861).
+  nested registry record (#861). `late-dependent/<version>-deps-<member>.lockb`
+  are the same flow with mkdirp@0.5.6 patched, a package with a dependency
+  (minimist) of its own.
 
 Other releases capture the stable major/minor eras. `two-versions` covers
 multiple package versions and scoped restoration. The earliest writers include

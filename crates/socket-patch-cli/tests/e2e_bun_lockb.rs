@@ -214,14 +214,23 @@ fn copy_tree(source: &Path, target: &Path) {
 }
 
 fn find_installed_target(root: &Path) -> Option<PathBuf> {
-    fn visit(dir: &Path, seen: &mut std::collections::HashSet<PathBuf>) -> Option<PathBuf> {
+    find_installed(root, ("minimist", "1.2.2"))
+}
+
+/// The first installed copy of `(name, version)` under `root`.
+fn find_installed(root: &Path, (name, version): (&str, &str)) -> Option<PathBuf> {
+    fn visit(
+        dir: &Path,
+        target: (&str, &str),
+        seen: &mut std::collections::HashSet<PathBuf>,
+    ) -> Option<PathBuf> {
         let canonical = dir.canonicalize().ok()?;
         if !seen.insert(canonical) {
             return None;
         }
         if let Ok(bytes) = std::fs::read(dir.join("package.json")) {
             if let Ok(package) = serde_json::from_slice::<Value>(&bytes) {
-                if package["name"] == "minimist" && package["version"] == "1.2.2" {
+                if package["name"] == target.0 && package["version"] == target.1 {
                     return Some(dir.to_path_buf());
                 }
             }
@@ -229,14 +238,14 @@ fn find_installed_target(root: &Path) -> Option<PathBuf> {
         for entry in std::fs::read_dir(dir).ok()?.flatten() {
             let path = entry.path();
             if path.is_dir() {
-                if let Some(found) = visit(&path, seen) {
+                if let Some(found) = visit(&path, target, seen) {
                     return Some(found);
                 }
             }
         }
         None
     }
-    visit(root, &mut std::collections::HashSet::new())
+    visit(root, (name, version), &mut std::collections::HashSet::new())
 }
 
 fn installed_target(root: &Path) -> PathBuf {
@@ -250,6 +259,9 @@ fn installed_target(root: &Path) -> PathBuf {
 
 struct Fixture {
     temp: tempfile::TempDir,
+    /// The patched package: minimist@1.2.2, or (`*-deps` shapes)
+    /// mkdirp@0.5.6, which has a dependency of its own.
+    target: (&'static str, &'static str),
     project: PathBuf,
     reader: PathBuf,
     legacy_reader: Option<PathBuf>,
@@ -321,7 +333,7 @@ impl Fixture {
         let dependencies = match shape {
             "alias" => json!({"alias":"npm:minimist@1.2.2", "is-number":"7.0.0"}),
             "transitive" => json!({"mkdirp":"0.5.3", "is-number":"7.0.0"}),
-            "workspace" | "workspace-adder" => {
+            "workspace" | "workspace-adder" | "workspace-deps" | "workspace-deps-adder" => {
                 json!({"consumer":"workspace:*", "is-number":"7.0.0"})
             }
             "workspace-nested" => {
@@ -344,16 +356,23 @@ impl Fixture {
             package["scripts"] =
                 json!({"preinstall":"echo root-pre", "postinstall":"echo root-post"});
         }
+        let target = if shape.ends_with("-deps") || shape.ends_with("-deps-adder") {
+            ("mkdirp", "0.5.6")
+        } else {
+            ("minimist", "1.2.2")
+        };
         if shape.starts_with("workspace") || shape == "extensions" {
             package["workspaces"] = json!(["packages/*"]);
             std::fs::create_dir_all(project.join("packages/consumer")).unwrap();
             std::fs::write(
                 project.join("packages/consumer/package.json"),
-                br#"{"name":"consumer","version":"1.0.0","dependencies":{"minimist":"1.2.2"}}"#,
+                serde_json::to_vec(&json!({"name":"consumer","version":"1.0.0",
+                    "dependencies":{target.0:target.1}}))
+                .unwrap(),
             )
             .unwrap();
         }
-        if shape == "workspace-adder" {
+        if shape.ends_with("-adder") {
             std::fs::create_dir_all(project.join("packages/adder")).unwrap();
             std::fs::write(
                 project.join("packages/adder/package.json"),
@@ -406,7 +425,9 @@ impl Fixture {
             "writer must not produce text"
         );
         let original_lock = std::fs::read(project.join("bun.lockb")).unwrap();
-        let original = std::fs::read(installed_target(&project).join("index.js")).unwrap();
+        let installed = find_installed(&project, target)
+            .unwrap_or_else(|| panic!("installed {target:?} not found"));
+        let original = std::fs::read(installed.join("index.js")).unwrap();
         let patched = [MARKER, original.as_slice()].concat();
         let bystander = std::fs::read(project.join("node_modules/is-number/index.js")).unwrap();
         eprintln!(
@@ -416,6 +437,7 @@ impl Fixture {
         );
         Some(Self {
             temp,
+            target,
             project,
             reader,
             legacy_reader: std::env::var_os("SOCKET_PATCH_BUN_LOCKB_LEGACY_READER")
@@ -426,6 +448,15 @@ impl Fixture {
             patched,
             bystander,
         })
+    }
+
+    fn purl(&self) -> String {
+        format!("pkg:npm/{}@{}", self.target.0, self.target.1)
+    }
+
+    /// The patch's tarball file name.
+    fn tgz(&self) -> String {
+        format!("{}-{}.tgz", self.target.0, self.target.1)
     }
 
     fn lock(&self) -> Vec<u8> {
@@ -440,7 +471,7 @@ impl Fixture {
         let socket = self.project.join(".socket");
         std::fs::create_dir_all(socket.join("blobs")).unwrap();
         let after = compute_git_sha256_from_bytes(&self.patched);
-        let manifest = json!({"patches":{PURL:{"uuid":UUID,
+        let manifest = json!({"patches":{self.purl():{"uuid":UUID,
             "exportedAt":"2026-01-01T00:00:00Z", "files":{"package/index.js":{
                 "beforeHash":compute_git_sha256_from_bytes(&self.original), "afterHash":after}},
             "vulnerabilities":{GHSA:{"cves":[CVE],"summary":"binary lock vuln","severity":"high","description":"d"}},
@@ -505,7 +536,7 @@ impl Fixture {
             .output()
             .unwrap();
         let output = require_success(output, label);
-        let target = find_installed_target(&checkout).unwrap_or_else(|| {
+        let target = find_installed(&checkout, self.target).unwrap_or_else(|| {
             panic!(
                 "{label}: installed target absent under {}\nstdout: {}\nstderr: {}",
                 checkout.display(),
@@ -693,33 +724,40 @@ async fn mock_api(server: &MockServer, fixture: &Fixture, _target: &str) {
     mock_api_patch(server, fixture, UUID, &fixture.patched).await;
 }
 
-/// [`mock_api`] serving patch `uuid`, which writes `patched` as minimist's
-/// `index.js` (a superseding patch is a second server with a new uuid).
+/// [`mock_api`] serving patch `uuid`, which writes `patched` as the fixture
+/// target's `index.js` (a superseding patch is a second server with a new
+/// uuid).
 async fn mock_api_patch(server: &MockServer, fixture: &Fixture, uuid: &str, patched: &[u8]) {
-    let tgz = make_tgz_from_installed(&installed_target(&fixture.project), patched);
-    prebuilt_common::mount_download(server, PURL, uuid, "minimist-1.2.2.tgz", &tgz).await;
+    let (name, version) = fixture.target;
+    let (purl, file) = (fixture.purl(), fixture.tgz());
+    let installed = find_installed(&fixture.project, fixture.target).unwrap();
+    let tgz = make_tgz_from_installed(&installed, patched);
+    prebuilt_common::mount_download(server, &purl, uuid, &file, &tgz).await;
     std::fs::write(fixture.temp.path().join("hosted.tgz"), &tgz).unwrap();
-    let url = format!("{}/patch/npm/minimist/1.2.2/33333333-3333-4333-8333-333333333333/{uuid}/minimist-1.2.2.tgz", server.uri());
+    let url = format!(
+        "{}/patch/npm/{name}/{version}/33333333-3333-4333-8333-333333333333/{uuid}/{file}",
+        server.uri()
+    );
     let sri = format!(
         "sha512-{}",
         base64::engine::general_purpose::STANDARD.encode(Sha512::digest(&tgz))
     );
     Mock::given(method("POST")).and(path(format!("/v0/orgs/{ORG}/patches/batch")))
         .respond_with(ResponseTemplate::new(200).set_body_json(json!({"packages":[{
-            "purl":PURL,"patches":[{"uuid":uuid,"purl":PURL,"tier":"free","cveIds":[],"ghsaIds":[],"severity":"high","title":"binary lock patch"}]}],"canAccessPaidPatches":false})))
+            "purl":purl,"patches":[{"uuid":uuid,"purl":purl,"tier":"free","cveIds":[],"ghsaIds":[],"severity":"high","title":"binary lock patch"}]}],"canAccessPaidPatches":false})))
         .mount(server).await;
-    Mock::given(method("GET")).and(path_regex(format!("^/v0/orgs/{ORG}/patches/by-package/.*minimist.*$")))
+    Mock::given(method("GET")).and(path_regex(format!("^/v0/orgs/{ORG}/patches/by-package/.*{name}.*$")))
         .respond_with(ResponseTemplate::new(200).set_body_json(json!({"patches":[{
-            "uuid":uuid,"purl":PURL,"publishedAt":"2026-01-01T00:00:00Z","description":"binary lock patch","license":"MIT","tier":"free","vulnerabilities":{}}],"canAccessPaidPatches":false})))
+            "uuid":uuid,"purl":purl,"publishedAt":"2026-01-01T00:00:00Z","description":"binary lock patch","license":"MIT","tier":"free","vulnerabilities":{}}],"canAccessPaidPatches":false})))
         .mount(server).await;
     Mock::given(method("POST")).and(path(format!("/v0/orgs/{ORG}/patches/package")))
         .respond_with(ResponseTemplate::new(200).set_body_json(json!({"results":{uuid:{
-            "status":"granted","url":url,"purl":PURL,"artifacts":[{"kind":"tarball","url":url,"integrity":{"sha512":sri}}],"registryOverride":null}}})))
+            "status":"granted","url":url,"purl":purl,"artifacts":[{"kind":"tarball","url":url,"integrity":{"sha512":sri}}],"registryOverride":null}}})))
         .mount(server).await;
     Mock::given(method("GET"))
         .and(path(format!("/v0/orgs/{ORG}/patches/view/{uuid}")))
         .respond_with(
-            ResponseTemplate::new(200).set_body_json(json!({"uuid":uuid,"purl":PURL,
+            ResponseTemplate::new(200).set_body_json(json!({"uuid":uuid,"purl":purl,
             "publishedAt":"2026-01-01T00:00:00Z","files":{"package/index.js":{
                 "beforeHash":compute_git_sha256_from_bytes(&fixture.original),
                 "afterHash":compute_git_sha256_from_bytes(patched),
@@ -730,7 +768,7 @@ async fn mock_api_patch(server: &MockServer, fixture: &Fixture, uuid: &str, patc
         .mount(server)
         .await;
     Mock::given(method("GET"))
-        .and(path_regex("^/patch/npm/minimist/.*$"))
+        .and(path_regex(format!("^/patch/npm/{name}/.*$")))
         .respond_with(ResponseTemplate::new(200).set_body_raw(tgz, "application/octet-stream"))
         .mount(server)
         .await;
@@ -1532,7 +1570,26 @@ fn dumped_records(fixture: &Fixture) -> Vec<String> {
 #[tokio::test(flavor = "multi_thread")]
 #[serial_test::serial]
 async fn workspace_late_dependent_rerun_shares_the_tarball_record() {
-    for (shape, member) in [("workspace", "late"), ("workspace-adder", "adder")] {
+    late_dependent_matrix([("workspace", "late"), ("workspace-adder", "adder")]).await;
+}
+
+/// #861, a patched package WITH dependencies of its own (mkdirp@0.5.6 ->
+/// minimist): the late registry record resolves its dependencies to the
+/// same packages as the tarball record, so it folds the same way — its
+/// edges leave the lock with it and the trees are re-hoisted as Bun
+/// hoists them — instead of being rewired to the same tarball (`EEXIST`).
+#[tokio::test(flavor = "multi_thread")]
+#[serial_test::serial]
+async fn workspace_late_dependent_with_dependencies_rerun_shares_the_tarball_record() {
+    late_dependent_matrix([
+        ("workspace-deps", "late"),
+        ("workspace-deps-adder", "adder"),
+    ])
+    .await;
+}
+
+async fn late_dependent_matrix(cases: [(&str, &str); 2]) {
+    for (shape, member) in cases {
         let Some(fixture) = Fixture::new(shape) else {
             return;
         };
@@ -1560,13 +1617,15 @@ async fn workspace_late_dependent_rerun_shares_the_tarball_record() {
 
 async fn late_dependent_rerun(fixture: &Fixture, member: &str) {
     let project = &fixture.project;
+    let (name, version) = fixture.target;
+    let file = fixture.tgz();
     std::fs::write(
         project.join("bunfig.toml"),
         "[install]\nsaveTextLockfile = false\nlinker = \"isolated\"\n",
     )
     .unwrap();
     let server = MockServer::start().await;
-    mock_api(&server, fixture, "minimist").await;
+    mock_api(&server, fixture, name).await;
     fixture.stage();
     let first = cli(project, &["vendor", "--offline"]);
     assert_eq!(
@@ -1577,14 +1636,14 @@ async fn late_dependent_rerun(fixture: &Fixture, member: &str) {
     let dir = project.join("packages").join(member);
     let mut add = if dir.exists() {
         let mut add = command(&fixture.reader, &dir);
-        add.args(["add", "minimist@1.2.2", "--ignore-scripts"]);
+        add.args(["add", &format!("{name}@{version}"), "--ignore-scripts"]);
         add
     } else {
         std::fs::create_dir_all(&dir).unwrap();
         std::fs::write(
             dir.join("package.json"),
             format!(
-                r#"{{"name":"{member}","version":"1.0.0","dependencies":{{"minimist":"1.2.2"}}}}"#
+                r#"{{"name":"{member}","version":"1.0.0","dependencies":{{"{name}":"{version}"}}}}"#
             ),
         )
         .unwrap();
@@ -1603,9 +1662,9 @@ async fn late_dependent_rerun(fixture: &Fixture, member: &str) {
     require_success(output, &format!("{member}: the late dependent"));
     let before = dumped_records(fixture);
     assert!(
-        before.iter().any(
-            |line| line.contains("minimist-1.2.2.tgz") && !line.contains(".socket/vendor/npm/")
-        ),
+        before
+            .iter()
+            .any(|line| line.contains(&file) && !line.contains(".socket/vendor/npm/")),
         "{member}: Bun writes a nested registry record: {before:?}"
     );
 
@@ -1614,15 +1673,19 @@ async fn late_dependent_rerun(fixture: &Fixture, member: &str) {
         rerun["summary"]["applied"], 1,
         "{member}: vendored re-run: {rerun}"
     );
+    assert!(
+        !rerun
+            .to_string()
+            .contains("vendor_bun_lockb_duplicate_records"),
+        "{member}: the records fold, no fallback: {rerun}"
+    );
     let after = dumped_records(fixture);
     assert_eq!(
         after
             .iter()
-            .filter(|line| line.contains("minimist-1.2.2.tgz"))
+            .filter(|line| line.contains(&file))
             .collect::<Vec<_>>(),
-        [&format!(
-            "resolved \".socket/vendor/npm/{UUID}/minimist-1.2.2.tgz\""
-        )],
+        [&format!("resolved \".socket/vendor/npm/{UUID}/{file}\"")],
         "{member}: one record, the tarball: {after:?}"
     );
     // EEXIST was intermittent (about half the cold frozen installs).
@@ -1638,7 +1701,9 @@ async fn late_dependent_rerun(fixture: &Fixture, member: &str) {
                 checkout
                     .join("packages")
                     .join(member)
-                    .join("node_modules/minimist/index.js")
+                    .join("node_modules")
+                    .join(name)
+                    .join("index.js")
             )
             .unwrap(),
             fixture.patched,

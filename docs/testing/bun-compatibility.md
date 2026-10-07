@@ -255,13 +255,19 @@ runners) from the GitHub releases and verifies it against `SHASUMS256.txt`. Ever
   frozen installs fail intermittently with `EEXIST` (measured on 1.3.9 and
   1.4.2; 1.2.23, the hoisted linker and text `bun.lock` were unaffected).
   The vendored re-run instead folds the duplicate into the tarball record:
-  its dependents resolve to that record, the record is dropped and later
-  package IDs renumbered, and the hoisting trees are rewritten the way Bun
-  re-hoists them (1.3.x refuses a frozen binary lock whose re-hoisted trees
-  differ). This is limited to records without dependencies of their own,
-  where the re-hoist is exactly predictable; otherwise every record is
-  rewired as before, with `vendor_bun_lockb_duplicate_records`. Covered by
-  `e2e_bun_lockb::workspace_late_dependent_rerun_shares_the_tarball_record`
+  its dependents resolve to that record, the record and its own dependency
+  edges are dropped and later package IDs and dependency slices renumbered,
+  and the hoisting trees are re-derived with Bun's hoister (1.3.x refuses a
+  frozen binary lock whose re-hoisted trees differ). The fold needs the
+  duplicate's dependencies to resolve to the same packages as the tarball
+  record's (so nothing is orphaned), and the codec's hoister to reproduce
+  the lock's own trees and need no rule it does not model (a peer meeting
+  another version, a cyclic folder); otherwise every record is rewired as
+  before, with `vendor_bun_lockb_duplicate_records`. A patched package with
+  dependencies of its own (mkdirp@0.5.6) folds the same way, and an
+  unfrozen install by 1.3.9 and 1.4.2 leaves the folded lock byte-identical.
+  Covered by `e2e_bun_lockb::workspace_late_dependent_rerun_shares_the_tarball_record`
+  and `workspace_late_dependent_with_dependencies_rerun_shares_the_tarball_record`
   on the 1.3.14 and 1.4.2 legs, and hermetically by the
   `bun-lockb/late-dependent/` fixtures.
 - **Workspace-member local tarballs.** Bun 1.2.x–1.3.x resolve a

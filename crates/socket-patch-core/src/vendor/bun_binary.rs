@@ -48,9 +48,11 @@ fn is_target(package: &BinaryPackage, coords: &NpmCoords, leaf: &str) -> bool {
 /// and frozen installs then fail intermittently with `EEXIST` (#861). So
 /// such records are folded into ONE kept record (the one already at
 /// `target`, else one of ours, else the first), as Bun's own re-save
-/// would. A record some bundled edge reaches is left to the rewrite: its
-/// parent's tarball ships that copy. Where the lock's hoisting is not
-/// exactly predictable ([`BunLockb::merge_packages`]) the records are all
+/// would, whether or not the package has dependencies of its own. A record
+/// some bundled edge reaches is left to the rewrite: its parent's tarball
+/// ships that copy. Where the records cannot fold exactly
+/// ([`BunLockb::merge_packages`]: their dependencies resolve differently,
+/// or the lock's hoisting is not one this codec reproduces) they are all
 /// rewritten as before, with a warning. Returns the records left to
 /// rewrite, re-read after renumbering, and whether the lock changed.
 fn merge_duplicates(
@@ -1655,12 +1657,12 @@ mod duplicate_tests {
 
     /// The uuid the fixtures were first vendored under.
     const UUID: &str = "80630680-4da6-45f9-bba8-b888e0ffd58c";
-    const PURL: &str = "pkg:npm/minimist@1.2.2";
     const BEFORE: &[u8] = b"module.exports = 'original';\n";
     const AFTER: &[u8] = b"module.exports = 'patched';\n";
 
     /// REGRESSION (#861): the vendored re-run after Bun gave a late
-    /// dependent its own registry record of minimist@1.2.2 (see
+    /// dependent its own registry record of minimist@1.2.2, or of
+    /// mkdirp@0.5.6 with its own dependency on minimist (`deps`; see
     /// `bun_lockb::tests::LATE_DEPENDENT`) leaves ONE record, the tarball,
     /// that every dependency edge resolves to — never two records with one
     /// tarball resolution, which the isolated linker installs into the same
@@ -1668,7 +1670,22 @@ mod duplicate_tests {
     /// test reverts it through the first run's ledger.)
     #[tokio::test]
     async fn rerun_folds_the_late_registry_copy_into_the_tarball_record() {
-        for name in ["1.3.9-late", "1.3.9-adder", "1.4.2-late", "1.4.2-adder"] {
+        for name in [
+            "1.3.9-late",
+            "1.3.9-adder",
+            "1.4.2-late",
+            "1.4.2-adder",
+            "1.3.9-deps-late",
+            "1.3.9-deps-adder",
+            "1.4.2-deps-late",
+            "1.4.2-deps-adder",
+        ] {
+            let (package, version) = if name.contains("-deps-") {
+                ("mkdirp", "0.5.6")
+            } else {
+                ("minimist", "1.2.2")
+            };
+            let purl = format!("pkg:npm/{package}@{version}");
             let tmp = tempfile::tempdir().unwrap();
             let root = tmp.path();
             let fixture = format!(
@@ -1676,11 +1693,11 @@ mod duplicate_tests {
                 env!("CARGO_MANIFEST_DIR")
             );
             std::fs::copy(&fixture, root.join(LOCK)).unwrap();
-            let installed = root.join("node_modules/minimist");
+            let installed = root.join("node_modules").join(package);
             std::fs::create_dir_all(&installed).unwrap();
             std::fs::write(
                 installed.join("package.json"),
-                br#"{"name":"minimist","version":"1.2.2"}"#,
+                format!(r#"{{"name":"{package}","version":"{version}"}}"#),
             )
             .unwrap();
             std::fs::write(installed.join("index.js"), BEFORE).unwrap();
@@ -1696,7 +1713,7 @@ mod duplicate_tests {
             .unwrap();
             let (result, entry, warnings) = ts::expect_done(
                 ts::vendor_bun(
-                    PURL,
+                    &purl,
                     &installed,
                     root,
                     &record,
@@ -1716,14 +1733,14 @@ mod duplicate_tests {
             let entry = entry.expect("the lock changed");
             let lock = BunLockb::parse(&std::fs::read(root.join(LOCK)).unwrap()).unwrap();
             lock.validate_mutation().unwrap();
-            let minimist: Vec<_> = lock
+            let copies: Vec<_> = lock
                 .packages()
                 .unwrap()
                 .into_iter()
-                .filter(|p| p.name == "minimist")
+                .filter(|p| p.name == package)
                 .collect();
             assert_eq!(
-                minimist
+                copies
                     .iter()
                     .map(|p| p.resolution.as_str())
                     .collect::<Vec<_>>(),
