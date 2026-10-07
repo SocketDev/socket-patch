@@ -1098,3 +1098,53 @@ fn pnp_project_still_refuses_when_an_npm_patch_is_in_scope() {
         "the refusal must still be a pre-apply bail"
     );
 }
+
+/// #975: a Yarn 2 → Yarn 4 migration that switched `nodeLinker` to
+/// `node-modules` (or `pnpm`) keeps the Yarn 2 `.pnp.js` around, which
+/// yarn ignores. The configured linker decides, so apply patches the
+/// installed `node_modules/` copy instead of refusing as Plug'n'Play.
+#[test]
+fn stale_pnp_loader_under_non_pnp_linker_applies() {
+    for linker in ["node-modules", "pnpm"] {
+        let dir = tempfile::tempdir().unwrap();
+        let cwd = dir.path();
+        std::fs::write(
+            cwd.join("package.json"),
+            r#"{"name":"migrated","version":"0.0.0","private":true}"#,
+        )
+        .unwrap();
+        std::fs::write(cwd.join(".pnp.js"), b"// stale Yarn 2 loader\n").unwrap();
+        std::fs::write(
+            cwd.join(".yarnrc.yml"),
+            format!("nodeLinker: {linker}\ncompressionLevel: 0\n"),
+        )
+        .unwrap();
+        let index = stage_applicable_package(cwd);
+
+        let (code, stdout, stderr) = run(cwd, &["apply", "--json"]);
+        assert_eq!(
+            code, 0,
+            "{linker}: a stale loader must not refuse.\nstdout:\n{stdout}\nstderr:\n{stderr}"
+        );
+        assert_eq!(
+            std::fs::read(&index).unwrap(),
+            PATCHED_BYTES,
+            "{linker}: the node_modules copy is patched"
+        );
+    }
+}
+
+/// The configured linker still refuses a live PnP project: `nodeLinker:
+/// pnp` with a loader present is refused exactly as before.
+#[test]
+fn pnp_loader_under_explicit_pnp_linker_still_refuses() {
+    let dir = tempfile::tempdir().unwrap();
+    make_yarn_berry_project(dir.path());
+    std::fs::write(dir.path().join(".yarnrc.yml"), "nodeLinker: \"pnp\"\n").unwrap();
+    let index = stage_applicable_package(dir.path());
+    let (code, stdout, _) = run(dir.path(), &["apply", "--json"]);
+    assert_eq!(code, 1, "{stdout}");
+    let env = parse_json_envelope(&stdout);
+    assert_eq!(envelope_error_code(&env), Some("yarn_pnp_unsupported"));
+    assert_eq!(std::fs::read(&index).unwrap(), ORIGINAL_BYTES);
+}
