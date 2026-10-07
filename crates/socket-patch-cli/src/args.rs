@@ -613,7 +613,6 @@ pub const GLOBAL_ARG_ENV_VARS: &[&str] = &[
 /// missing here escapes the empty-var scrub — the invariant tests below
 /// parse every entry against its owning subcommand to keep this honest.
 pub const LOCAL_ARG_ENV_VARS: &[&str] = &[
-    "SOCKET_FORCE",
     "SOCKET_PATCH_VERSION",
     "SOCKET_SAVE_ONLY",
     "SOCKET_ALL_RELEASES",
@@ -1560,9 +1559,6 @@ mod tests {
         // (env var, argv of a subcommand that binds it) — every bool entry
         // of `LOCAL_ARG_ENV_VARS`, on each subcommand that binds it.
         const BOOL_BINDINGS: &[(&str, &[&str])] = &[
-            ("SOCKET_FORCE", &["socket-patch", "apply"]),
-            ("SOCKET_FORCE", &["socket-patch", "vendor"]),
-            ("SOCKET_FORCE", &["socket-patch", "self-update"]),
             ("SOCKET_SAVE_ONLY", &["socket-patch", "get", "x"]),
             ("SOCKET_ALL_RELEASES", &["socket-patch", "get", "x"]),
             ("SOCKET_ALL_RELEASES", &["socket-patch", "scan"]),
@@ -1597,6 +1593,48 @@ mod tests {
                     std::env::remove_var(var);
                 }
             }
+        });
+    }
+
+    /// v5 retired `SOCKET_FORCE` (#615): `--force` is flag-only on `apply`,
+    /// `vendor` and `--update`. A stale export must be ignored, so it can
+    /// never quietly skip the beforeHash check or the managed-install
+    /// refusal; the flag itself still works.
+    #[test]
+    #[serial_test::serial]
+    fn socket_force_env_is_ignored_and_force_flag_still_works() {
+        fn force_of(argv: &[&str]) -> bool {
+            let argv = argv.iter().map(|s| s.to_string()).collect();
+            match crate::parse_argv_with_shortcuts(argv)
+                .unwrap_or_else(|e| panic!("parse failed: {e}"))
+                .command
+            {
+                crate::Commands::Apply(a) => a.force,
+                crate::Commands::Vendor(a) => a.force,
+                crate::Commands::SelfUpdate(a) => a.force,
+                _ => panic!("unexpected subcommand"),
+            }
+        }
+
+        const ARGVS: &[&[&str]] = &[
+            &["socket-patch", "apply"],
+            &["socket-patch", "vendor"],
+            &["socket-patch", "self-update"],
+            &["socket-patch", "--update"],
+        ];
+
+        with_clean_socket_env(|| {
+            with_env_cleared(&["SOCKET_FORCE"], || {
+                for val in ["1", "true", "yes"] {
+                    std::env::set_var("SOCKET_FORCE", val);
+                    for &argv in ARGVS {
+                        assert!(!force_of(argv), "SOCKET_FORCE={val} set force on {argv:?}");
+                        let mut with_flag = argv.to_vec();
+                        with_flag.push("--force");
+                        assert!(force_of(&with_flag), "--force ignored on {argv:?}");
+                    }
+                }
+            });
         });
     }
 
