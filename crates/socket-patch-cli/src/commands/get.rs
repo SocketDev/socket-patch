@@ -4916,6 +4916,8 @@ mod tests {
 
     // "patched\n" in base64 — a valid payload so only the hash is at fault.
     const BLOB_B64: &str = "cGF0Y2hlZAo=";
+    /// base64 of `"pristine\n"`.
+    const PRISTINE_B64: &str = "cHJpc3RpbmUK";
 
     #[tokio::test]
     async fn write_blob_entry_rejects_relative_traversal_hash() {
@@ -5013,7 +5015,7 @@ mod tests {
             b"pristine\n",
             "a verified blob is byte-identical afterwards"
         );
-        let created = write_blob_entry(&blobs_dir, "cHJpc3RpbmUK", &pristine, "f", "blob")
+        let created = write_blob_entry(&blobs_dir, PRISTINE_B64, &pristine, "f", "blob")
             .await
             .unwrap();
         assert!(!created, "an existing verified blob is not re-created");
@@ -5267,16 +5269,22 @@ mod tests {
         let tmp = tempfile::tempdir().unwrap();
         let blobs_dir = tmp.path().join(".socket/blobs");
 
-        let after = "a".repeat(64);
+        // A REAL git-sha256 name, so the after-blob verifies and lands
+        // before the before-blob's traversal hash is rejected.
+        let after = git_sha256(b"patched\n");
         let mut files = HashMap::new();
         let mut info = file_resp(Some("../escaped"), Some(&after));
         info.blob_content = Some(BLOB_B64.to_string());
-        info.before_blob_content = Some(BLOB_B64.to_string());
+        info.before_blob_content = Some(PRISTINE_B64.to_string());
         files.insert("package/index.js".to_string(), info);
         let patch = patch_with_files(files);
 
         let res = write_all_patch_blobs(&blobs_dir, &patch, /*quiet=*/ true).await;
         assert_eq!(res, Err(()));
+        assert!(
+            !tmp.path().join(".socket/escaped").exists(),
+            "nothing is written at the traversal target"
+        );
         assert!(
             !blobs_dir.join(&after).exists(),
             "the after-blob written before the failure is unwound"
@@ -5296,7 +5304,7 @@ mod tests {
         let tmp = tempfile::tempdir().unwrap();
         let blobs_dir = tmp.path().join(".socket/blobs");
         tokio::fs::create_dir_all(&blobs_dir).await.unwrap();
-        let after = "a".repeat(64);
+        let after = git_sha256(b"patched\n");
         tokio::fs::write(blobs_dir.join(&after), b"patched\n")
             .await
             .unwrap();
@@ -5304,7 +5312,7 @@ mod tests {
         let mut files = HashMap::new();
         let mut info = file_resp(Some("../escaped"), Some(&after));
         info.blob_content = Some(BLOB_B64.to_string());
-        info.before_blob_content = Some(BLOB_B64.to_string());
+        info.before_blob_content = Some(PRISTINE_B64.to_string());
         files.insert("package/index.js".to_string(), info);
         let patch = patch_with_files(files);
 
@@ -5317,11 +5325,11 @@ mod tests {
         );
 
         // And a fully successful write reports exactly the NEW hashes.
-        let before = "b".repeat(64);
+        let before = git_sha256(b"pristine\n");
         let mut files = HashMap::new();
         let mut info = file_resp(Some(&before), Some(&after));
         info.blob_content = Some(BLOB_B64.to_string());
-        info.before_blob_content = Some(BLOB_B64.to_string());
+        info.before_blob_content = Some(PRISTINE_B64.to_string());
         files.insert("package/index.js".to_string(), info);
         let created = write_all_patch_blobs(&blobs_dir, &patch_with_files(files), true)
             .await

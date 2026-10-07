@@ -1142,6 +1142,56 @@ mod tests {
         stream_cache_entry_atomic(dest, &mut body, None).await
     }
 
+    /// The download path refuses a linked `.socket/blobs` (a committed
+    /// link to a shared cache or another project) and a linked
+    /// `.socket/blobs/<hash>` entry, end to end through
+    /// [`fetch_blobs_by_hash`]: the blob is reported failed and nothing is
+    /// written at the link's target.
+    #[cfg(unix)]
+    #[tokio::test]
+    async fn download_refuses_a_linked_blobs_dir_or_entry() {
+        let bytes = b"patched\n";
+        let hash = compute_git_sha256_from_bytes(bytes);
+        let server = wiremock::MockServer::start().await;
+        wiremock::Mock::given(wiremock::matchers::any())
+            .respond_with(wiremock::ResponseTemplate::new(200).set_body_bytes(bytes.to_vec()))
+            .mount(&server)
+            .await;
+        let client = ApiClient::new(crate::api::client::ApiClientOptions {
+            api_url: server.uri(),
+            api_token: None,
+            use_public_proxy: true,
+            org_slug: None,
+        });
+        let tmp = tempfile::tempdir().unwrap();
+        let hashes: HashSet<String> = [hash.clone()].into_iter().collect();
+
+        // A linked `.socket/blobs` directory.
+        let shared = tmp.path().join("shared-cache");
+        std::fs::create_dir_all(&shared).unwrap();
+        let proj = tmp.path().join("proj");
+        std::fs::create_dir_all(proj.join(".socket")).unwrap();
+        std::os::unix::fs::symlink(&shared, proj.join(".socket/blobs")).unwrap();
+        let res = fetch_blobs_by_hash(&hashes, &proj.join(".socket/blobs"), &client, None).await;
+        assert_eq!((res.downloaded, res.failed), (0, 1), "{res:?}");
+        let err = res.results[0].error.clone().unwrap_or_default();
+        assert!(
+            err.contains(crate::utils::containment::LINKED_LEVEL_MARKER),
+            "{err}"
+        );
+        assert_eq!(std::fs::read_dir(&shared).unwrap().count(), 0);
+
+        // A dangling `.socket/blobs/<hash>` link: `get_missing`-style
+        // presence probes see it as missing, and the write must not follow it.
+        let proj2 = tmp.path().join("proj2");
+        std::fs::create_dir_all(proj2.join(".socket/blobs")).unwrap();
+        let victim = tmp.path().join("victim");
+        std::os::unix::fs::symlink(&victim, proj2.join(".socket/blobs").join(&hash)).unwrap();
+        let res = fetch_blobs_by_hash(&hashes, &proj2.join(".socket/blobs"), &client, None).await;
+        assert_eq!((res.downloaded, res.failed), (0, 1), "{res:?}");
+        assert!(!victim.exists(), "nothing is written through the link");
+    }
+
     #[tokio::test]
     async fn test_write_cache_entry_atomic_writes_exact_bytes_no_litter() {
         let dir = tempfile::tempdir().unwrap();
