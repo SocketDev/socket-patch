@@ -790,6 +790,11 @@ pub(super) struct NpmCommit {
     pub pnpm: Option<PnpmMeta>,
     /// yarn berry: the service's checksum of the tarball, when recorded.
     pub yarn_berry10c0: Option<String>,
+    /// package-lock: the wiring touched no entry whose fields mirror the
+    /// package's `package.json` (only the v2 legacy `dependencies` mirror
+    /// was rewired), so nothing was recomputed from a patched manifest and
+    /// the `package.json` advisory is withheld.
+    pub manifest_mirrors_untouched: bool,
 }
 
 /// The per-flavor half of npm tarball vendoring: the lock grammar's
@@ -929,7 +934,7 @@ pub(super) async fn vendor_npm_family<B: NpmLockBackend>(
             .await
         }
     };
-    if staged.staged_pkg_json.is_some() {
+    if staged.staged_pkg_json.is_some() && !commit.manifest_mirrors_untouched {
         warnings.push(backend.manifest_warning(&coords.name, &coords.version));
     }
 

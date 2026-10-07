@@ -374,8 +374,13 @@ impl NpmLockBackend for PackageLockBackend {
         if primary_changed {
             LOCK_MEMO.store(out, lock);
         }
+        // Only a rewritten `packages` entry has its dependency/bin fields
+        // recomputed from the patched manifest; a run that rewired just the
+        // v2 legacy mirror recomputed nothing.
+        let manifest_mirrors_untouched = !wiring.iter().any(|w| w.kind == KIND_LOCK_ENTRY);
         Ok(Some(NpmCommit {
             wiring,
+            manifest_mirrors_untouched,
             ..NpmCommit::default()
         }))
     }
@@ -3532,6 +3537,79 @@ mod tests {
 
         let (result, entry, warnings) = expect_done(fx.vendor(false).await);
         assert!(result.success && entry.is_none(), "{:?}", result.error);
+        assert_eq!(manifest_warnings(&warnings), 0, "{warnings:?}");
+    }
+
+    /// The `package.json` advisory says the lock entries' dependency/bin
+    /// fields were recomputed, so it fires only when a `packages` entry
+    /// was. A re-run that rewires just the v2 legacy `dependencies` mirror
+    /// (an npm 6 install re-saved it to the registry) recomputes nothing.
+    #[tokio::test]
+    async fn legacy_mirror_only_rewire_omits_the_manifest_warning() {
+        let lock = json!({
+            "name": "fixture",
+            "version": "1.0.0",
+            "lockfileVersion": 2,
+            "requires": true,
+            "packages": {
+                "": { "name": "fixture", "version": "1.0.0" },
+                "node_modules/left-pad": {
+                    "version": "1.3.0",
+                    "resolved": REG_RESOLVED,
+                    "integrity": "sha512-orig=="
+                }
+            },
+            "dependencies": {
+                "left-pad": {
+                    "version": "1.3.0",
+                    "resolved": REG_RESOLVED,
+                    "integrity": "sha512-orig=="
+                }
+            }
+        });
+        let mut fx = fixture_with("left-pad", "1.3.0", lock).await;
+        let before = installed_pkg_json("left-pad", "1.3.0");
+        let after: &[u8] =
+            br#"{"name":"left-pad","version":"1.3.0","dependencies":{"wow":"^1.0.0"}}"#;
+        let after_hash = compute_git_sha256_from_bytes(after);
+        tokio::fs::write(fx.root().join(".socket/blobs").join(&after_hash), after)
+            .await
+            .unwrap();
+        fx.record.files.insert(
+            "package/package.json".to_string(),
+            PatchFileInfo {
+                before_hash: compute_git_sha256_from_bytes(&before),
+                after_hash,
+            },
+        );
+        let manifest_warnings = |w: &[VendorWarning]| {
+            w.iter()
+                .filter(|w| w.code == "vendor_dep_manifest_rewritten")
+                .count()
+        };
+        let (result, entry, warnings) = expect_done(fx.vendor(false).await);
+        assert!(result.success && entry.is_some(), "{:?}", result.error);
+        assert_eq!(manifest_warnings(&warnings), 1, "{warnings:?}");
+
+        // npm 6 re-saves the mirror from the registry; `packages` stays wired.
+        let mut live = fx.read_lock().await;
+        live["dependencies"]["left-pad"]["resolved"] = json!(REG_RESOLVED);
+        live["dependencies"]["left-pad"]["integrity"] = json!("sha512-orig==");
+        tokio::fs::write(fx.lock_path(), serialize_json(&live, "  ").unwrap())
+            .await
+            .unwrap();
+
+        let (result, entry, warnings) = expect_done(fx.vendor(false).await);
+        assert!(result.success, "{:?}", result.error);
+        let entry = entry.expect("the mirror rewire is recorded");
+        assert!(
+            entry
+                .wiring
+                .iter()
+                .all(|r| r.kind == KIND_LOCK_LEGACY_ENTRY),
+            "{:?}",
+            entry.wiring
+        );
         assert_eq!(manifest_warnings(&warnings), 0, "{warnings:?}");
     }
 
