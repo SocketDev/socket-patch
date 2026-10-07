@@ -31,7 +31,7 @@ jobs:
           W=node_modules/@socketsecurity/socket-patch/bin/socket-patch
           node $W --version > /tmp/o.txt 2> /tmp/e.txt; rc0=$?
           echo "OLD wrapper exit $rc0 out=[$(cat /tmp/o.txt)] err=[$(cat /tmp/e.txt)]"
-          cp /wrapper.js $W
+          cat /wrapper.js > $W; ls -l $W
           node $W --version > /tmp/o.txt 2> /tmp/e.txt; rc1=$?
           echo "NEW wrapper exit $rc1 out=[$(cat /tmp/o.txt)] err=[$(cat /tmp/e.txt)]"
           $Y socket-patch --version > /tmp/o2.txt 2>&1; rc2=$?; echo "NEW via yarn run exit $rc2 out=[$(tr '\n' ' ' < /tmp/o2.txt | cut -c1-200)]"
@@ -43,7 +43,7 @@ jobs:
           GD=$($Y global dir 2>/dev/null | tail -1); echo "global dir $GD"
           GW="$GD/node_modules/@socketsecurity/socket-patch/bin/socket-patch"
           /g/bin/socket-patch --version > /tmp/o.txt 2>&1; rg0=$?; echo "OLD global bin exit $rg0 out=[$(cat /tmp/o.txt)]"
-          cp /wrapper.js "$GW"
+          cat /wrapper.js > "$GW"; ls -lL "$GW" /g/bin/socket-patch
           /g/bin/socket-patch --version > /tmp/o.txt 2>&1; rg1=$?; echo "NEW global bin exit $rg1 out=[$(cat /tmp/o.txt)]"
           echo "RESULT yarn=$V $(grep ^ID= /etc/os-release) arch=$(uname -m) old=$rc0 new=$rc1 yarnrun=$rc2 scan=$rc3 usage=$rc4 global_old=$rg0 global_new=$rg1"
           PROBEEOF
