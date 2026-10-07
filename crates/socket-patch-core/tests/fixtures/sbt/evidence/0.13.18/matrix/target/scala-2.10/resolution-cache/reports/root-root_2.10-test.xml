@@ -1,0 +1,14 @@
+<?xml version="1.0" encoding="UTF-8"?>
+<ivy-report version="1.0">
+<info organisation="root" module="root_2.10" revision="0.1-SNAPSHOT" conf="test"/>
+<dependencies>
+<module organisation="org.scala-lang" name="scala-library">
+<revision name="2.10.7">
+<artifacts>
+<artifact name="scala-library" type="jar" ext="jar" location="/root/.ivy2/cache/org.scala-lang/scala-library/jars/scala-library-2.10.7.jar">
+</artifact>
+</artifacts>
+</revision>
+</module>
+</dependencies>
+</ivy-report>

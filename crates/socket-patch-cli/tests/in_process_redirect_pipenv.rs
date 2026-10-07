@@ -109,6 +109,11 @@ fn hosted_args(cwd: &Path, api_url: String, vex: Option<&Path>) -> ScanArgs {
 }
 
 async fn mock_api(server: &MockServer) {
+    mock_api_serving(server, HOSTED_URL).await;
+}
+
+/// [`mock_api`] with the grant serving `hosted_url` as the patched artifact.
+async fn mock_api_serving(server: &MockServer, hosted_url: &str) {
     Mock::given(method("POST"))
         .and(path(format!("/v0/orgs/{ORG}/patches/batch")))
         .respond_with(ResponseTemplate::new(200).set_body_json(serde_json::json!({
@@ -143,11 +148,11 @@ async fn mock_api(server: &MockServer) {
             "results": {
                 UUID: {
                     "status": "granted",
-                    "url": HOSTED_URL,
+                    "url": hosted_url,
                     "purl": PURL,
                     "artifacts": [{
                         "kind": "tarball",
-                        "url": HOSTED_URL,
+                        "url": hosted_url,
                         "integrity": { "sha256": sha256() }
                     }],
                     "registryOverride": null
@@ -513,6 +518,43 @@ async fn live_pipfile_lock_conflict_vetoes_the_requirements_redirect() {
     );
     assert_eq!(read(&tmp.path().join("Pipfile.lock")), lock);
     assert_eq!(read(&tmp.path().join("Pipfile")), PIPFILE);
+}
+
+/// #932: a patch granted as a platform-tagged wheel (cp311 manylinux) is
+/// never pinned into the cross-platform Pipfile.lock, nor into the sibling
+/// requirements.txt: the run leaves both files alone and exits 0 like every
+/// hosted refusal (the `redirect_pypi_platform_wheel` warning says why),
+/// and a same-run VEX never attests the unpinned patch.
+#[tokio::test]
+#[serial]
+async fn platform_wheel_is_not_pinned_into_the_lock() {
+    let _major = MajorGuard::set("2026");
+    let server = MockServer::start().await;
+    let platform_url = HOSTED_URL.replace(
+        "py2.py3-none-any",
+        "cp311-cp311-manylinux_2_17_x86_64.manylinux2014_x86_64",
+    );
+    mock_api_serving(&server, &platform_url).await;
+    let tmp = tempfile::tempdir().unwrap();
+    write_project(tmp.path());
+    const REQS: &str = "urllib3==1.26.18\n";
+    std::fs::write(tmp.path().join("requirements.txt"), REQS).unwrap();
+    let code = run(hosted_args(tmp.path(), server.uri(), None)).await;
+    assert_eq!(code, 0, "a hosted refusal exits 0 with a warning");
+    assert_eq!(read(&tmp.path().join("Pipfile.lock")), LOCK);
+    assert_eq!(read(&tmp.path().join("requirements.txt")), REQS);
+    assert_eq!(read(&tmp.path().join("Pipfile")), PIPFILE);
+    assert_no_ledger(tmp.path());
+
+    // With nothing pinned, a same-run `--vex` has nothing to attest (it
+    // fails `manifest_not_found`) and never claims the patch.
+    let vex_path = tmp.path().join("out.vex.json");
+    run(hosted_args(tmp.path(), server.uri(), Some(&vex_path))).await;
+    assert_eq!(read(&tmp.path().join("Pipfile.lock")), LOCK);
+    if vex_path.exists() {
+        let vex = read(&vex_path);
+        assert!(!vex.contains("not_affected"), "{vex}");
+    }
 }
 
 /// The same conflict in an ABANDONED lock (no Pipfile beside it) says

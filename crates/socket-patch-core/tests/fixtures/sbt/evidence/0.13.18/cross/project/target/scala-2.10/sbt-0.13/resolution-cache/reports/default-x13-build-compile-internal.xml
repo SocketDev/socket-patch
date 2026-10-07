@@ -1,0 +1,414 @@
+<?xml version="1.0" encoding="UTF-8"?>
+<ivy-report version="1.0">
+<info organisation="default" module="x13-build" revision="0.1-SNAPSHOT" conf="compile-internal"/>
+<dependencies>
+<module organisation="org.scala-sbt" name="sbt">
+<revision name="0.13.18">
+<artifacts>
+<artifact name="sbt" type="jar" ext="jar" location="/root/.ivy2/cache/org.scala-sbt/sbt/jars/sbt-0.13.18.jar">
+</artifact>
+</artifacts>
+</revision>
+</module>
+<module organisation="org.scala-sbt" name="compiler-interface">
+<revision name="0.13.18">
+<artifacts>
+<artifact name="compiler-interface" type="jar" ext="jar" location="/root/.ivy2/cache/org.scala-sbt/compiler-interface/jars/compiler-interface-0.13.18.jar">
+</artifact>
+</artifacts>
+</revision>
+</module>
+<module organisation="org.scala-sbt" name="main">
+<revision name="0.13.18">
+<artifacts>
+<artifact name="main" type="jar" ext="jar" location="/root/.ivy2/cache/org.scala-sbt/main/jars/main-0.13.18.jar">
+</artifact>
+</artifacts>
+</revision>
+</module>
+<module organisation="org.scala-sbt" name="logic">
+<revision name="0.13.18">
+<artifacts>
+<artifact name="logic" type="jar" ext="jar" location="/root/.ivy2/cache/org.scala-sbt/logic/jars/logic-0.13.18.jar">
+</artifact>
+</artifacts>
+</revision>
+</module>
+<module organisation="org.scala-sbt" name="main-settings">
+<revision name="0.13.18">
+<artifacts>
+<artifact name="main-settings" type="jar" ext="jar" location="/root/.ivy2/cache/org.scala-sbt/main-settings/jars/main-settings-0.13.18.jar">
+</artifact>
+</artifacts>
+</revision>
+</module>
+<module organisation="org.scala-sbt" name="command">
+<revision name="0.13.18">
+<artifacts>
+<artifact name="command" type="jar" ext="jar" location="/root/.ivy2/cache/org.scala-sbt/command/jars/command-0.13.18.jar">
+</artifact>
+</artifacts>
+</revision>
+</module>
+<module organisation="org.scala-sbt" name="template-resolver">
+<revision name="0.1">
+<artifacts>
+<artifact name="template-resolver" type="jar" ext="jar" location="/root/.ivy2/cache/org.scala-sbt/template-resolver/jars/template-resolver-0.1.jar">
+</artifact>
+</artifacts>
+</revision>
+</module>
+<module organisation="org.scala-sbt" name="apply-macro">
+<revision name="0.13.18">
+<artifacts>
+<artifact name="apply-macro" type="jar" ext="jar" location="/root/.ivy2/cache/org.scala-sbt/apply-macro/jars/apply-macro-0.13.18.jar">
+</artifact>
+</artifacts>
+</revision>
+</module>
+<module organisation="org.scala-sbt" name="actions">
+<revision name="0.13.18">
+<artifacts>
+<artifact name="actions" type="jar" ext="jar" location="/root/.ivy2/cache/org.scala-sbt/actions/jars/actions-0.13.18.jar">
+</artifact>
+</artifacts>
+</revision>
+</module>
+<module organisation="org.scala-sbt" name="testing">
+<revision name="0.13.18">
+<artifacts>
+<artifact name="testing" type="jar" ext="jar" location="/root/.ivy2/cache/org.scala-sbt/testing/jars/testing-0.13.18.jar">
+</artifact>
+</artifacts>
+</revision>
+</module>
+<module organisation="org.scala-sbt" name="test-agent">
+<revision name="0.13.18">
+<artifacts>
+<artifact name="test-agent" type="jar" ext="jar" location="/root/.ivy2/cache/org.scala-sbt/test-agent/jars/test-agent-0.13.18.jar">
+</artifact>
+</artifacts>
+</revision>
+</module>
+<module organisation="org.scala-sbt" name="test-interface">
+<revision name="1.0">
+<artifacts>
+<artifact name="test-interface" type="jar" ext="jar" location="/root/.ivy2/cache/org.scala-sbt/test-interface/jars/test-interface-1.0.jar">
+</artifact>
+</artifacts>
+</revision>
+</module>
+<module organisation="org.scala-sbt" name="tracking">
+<revision name="0.13.18">
+<artifacts>
+<artifact name="tracking" type="jar" ext="jar" location="/root/.ivy2/cache/org.scala-sbt/tracking/jars/tracking-0.13.18.jar">
+</artifact>
+</artifacts>
+</revision>
+</module>
+<module organisation="org.scala-sbt" name="cache">
+<revision name="0.13.18">
+<artifacts>
+<artifact name="cache" type="jar" ext="jar" location="/root/.ivy2/cache/org.scala-sbt/cache/jars/cache-0.13.18.jar">
+</artifact>
+</artifacts>
+</revision>
+</module>
+<module organisation="org.scala-sbt" name="task-system">
+<revision name="0.13.18">
+<artifacts>
+<artifact name="task-system" type="jar" ext="jar" location="/root/.ivy2/cache/org.scala-sbt/task-system/jars/task-system-0.13.18.jar">
+</artifact>
+</artifacts>
+</revision>
+</module>
+<module organisation="org.scala-sbt" name="tasks">
+<revision name="0.13.18">
+<artifacts>
+<artifact name="tasks" type="jar" ext="jar" location="/root/.ivy2/cache/org.scala-sbt/tasks/jars/tasks-0.13.18.jar">
+</artifact>
+</artifacts>
+</revision>
+</module>
+<module organisation="org.scala-sbt" name="run">
+<revision name="0.13.18">
+<artifacts>
+<artifact name="run" type="jar" ext="jar" location="/root/.ivy2/cache/org.scala-sbt/run/jars/run-0.13.18.jar">
+</artifact>
+</artifacts>
+</revision>
+</module>
+<module organisation="org.scala-sbt" name="compiler-ivy-integration">
+<revision name="0.13.18">
+<artifacts>
+<artifact name="compiler-ivy-integration" type="jar" ext="jar" location="/root/.ivy2/cache/org.scala-sbt/compiler-ivy-integration/jars/compiler-ivy-integration-0.13.18.jar">
+</artifact>
+</artifacts>
+</revision>
+</module>
+<module organisation="org.scala-sbt" name="ivy">
+<revision name="0.13.18">
+<artifacts>
+<artifact name="ivy" type="jar" ext="jar" location="/root/.ivy2/cache/org.scala-sbt/ivy/jars/ivy-0.13.18.jar">
+</artifact>
+</artifacts>
+</revision>
+</module>
+<module organisation="org.scala-sbt" name="serialization_2.10">
+<revision name="0.1.2">
+<artifacts>
+<artifact name="serialization_2.10" type="jar" ext="jar" location="/root/.ivy2/cache/org.scala-sbt/serialization_2.10/jars/serialization_2.10-0.1.2.jar">
+</artifact>
+</artifacts>
+</revision>
+</module>
+<module organisation="org.spire-math" name="json4s-support_2.10">
+<revision name="0.6.0">
+<artifacts>
+<artifact name="json4s-support_2.10" type="jar" ext="jar" location="/root/.ivy2/cache/org.spire-math/json4s-support_2.10/jars/json4s-support_2.10-0.6.0.jar">
+</artifact>
+</artifacts>
+</revision>
+</module>
+<module organisation="org.spire-math" name="jawn-parser_2.10">
+<revision name="0.6.0">
+<artifacts>
+<artifact name="jawn-parser_2.10" type="jar" ext="jar" location="/root/.ivy2/cache/org.spire-math/jawn-parser_2.10/jars/jawn-parser_2.10-0.6.0.jar">
+</artifact>
+</artifacts>
+</revision>
+</module>
+<module organisation="org.json4s" name="json4s-core_2.10">
+<revision name="3.2.10">
+<artifacts>
+<artifact name="json4s-core_2.10" type="jar" ext="jar" location="/root/.ivy2/cache/org.json4s/json4s-core_2.10/jars/json4s-core_2.10-3.2.10.jar">
+</artifact>
+</artifacts>
+</revision>
+</module>
+<module organisation="com.thoughtworks.paranamer" name="paranamer">
+<revision name="2.6">
+<artifacts>
+<artifact name="paranamer" type="jar" ext="jar" location="/root/.ivy2/cache/com.thoughtworks.paranamer/paranamer/jars/paranamer-2.6.jar">
+</artifact>
+</artifacts>
+</revision>
+</module>
+<module organisation="org.json4s" name="json4s-ast_2.10">
+<revision name="3.2.10">
+<artifacts>
+<artifact name="json4s-ast_2.10" type="jar" ext="jar" location="/root/.ivy2/cache/org.json4s/json4s-ast_2.10/jars/json4s-ast_2.10-3.2.10.jar">
+</artifact>
+</artifacts>
+</revision>
+</module>
+<module organisation="org.scala-lang.modules" name="scala-pickling_2.10">
+<revision name="0.10.1">
+<artifacts>
+<artifact name="scala-pickling_2.10" type="jar" ext="jar" location="/root/.ivy2/cache/org.scala-lang.modules/scala-pickling_2.10/jars/scala-pickling_2.10-0.10.1.jar">
+</artifact>
+</artifacts>
+</revision>
+</module>
+<module organisation="org.scalamacros" name="quasiquotes_2.10">
+<revision name="2.0.1">
+<artifacts>
+<artifact name="quasiquotes_2.10" type="jar" ext="jar" location="/root/.ivy2/cache/org.scalamacros/quasiquotes_2.10/jars/quasiquotes_2.10-2.0.1.jar">
+</artifact>
+</artifacts>
+</revision>
+</module>
+<module organisation="com.jcraft" name="jsch">
+<revision name="0.1.50">
+<artifacts>
+<artifact name="jsch" type="jar" ext="jar" location="/root/.ivy2/cache/com.jcraft/jsch/jars/jsch-0.1.50.jar">
+</artifact>
+</artifacts>
+</revision>
+</module>
+<module organisation="org.scala-sbt.ivy" name="ivy">
+<revision name="2.3.0-sbt-b18f59ea3bc914a297bb6f1a4f7fb0ace399e310">
+<artifacts>
+<artifact name="ivy" type="jar" ext="jar" location="/root/.ivy2/cache/org.scala-sbt.ivy/ivy/jars/ivy-2.3.0-sbt-b18f59ea3bc914a297bb6f1a4f7fb0ace399e310.jar">
+</artifact>
+</artifacts>
+</revision>
+</module>
+<module organisation="org.scala-sbt" name="cross">
+<revision name="0.13.18">
+<artifacts>
+<artifact name="cross" type="jar" ext="jar" location="/root/.ivy2/cache/org.scala-sbt/cross/jars/cross-0.13.18.jar">
+</artifact>
+</artifacts>
+</revision>
+</module>
+<module organisation="org.scala-sbt" name="compiler-integration">
+<revision name="0.13.18">
+<artifacts>
+<artifact name="compiler-integration" type="jar" ext="jar" location="/root/.ivy2/cache/org.scala-sbt/compiler-integration/jars/compiler-integration-0.13.18.jar">
+</artifact>
+</artifacts>
+</revision>
+</module>
+<module organisation="org.scala-sbt" name="persist">
+<revision name="0.13.18">
+<artifacts>
+<artifact name="persist" type="jar" ext="jar" location="/root/.ivy2/cache/org.scala-sbt/persist/jars/persist-0.13.18.jar">
+</artifact>
+</artifacts>
+</revision>
+</module>
+<module organisation="org.scala-tools.sbinary" name="sbinary_2.10">
+<revision name="0.4.2">
+<artifacts>
+<artifact name="sbinary_2.10" type="jar" ext="jar" location="/root/.ivy2/cache/org.scala-tools.sbinary/sbinary_2.10/jars/sbinary_2.10-0.4.2.jar">
+</artifact>
+</artifacts>
+</revision>
+</module>
+<module organisation="org.scala-sbt" name="compile">
+<revision name="0.13.18">
+<artifacts>
+<artifact name="compile" type="jar" ext="jar" location="/root/.ivy2/cache/org.scala-sbt/compile/jars/compile-0.13.18.jar">
+</artifact>
+</artifacts>
+</revision>
+</module>
+<module organisation="org.scala-sbt" name="incremental-compiler">
+<revision name="0.13.18">
+<artifacts>
+<artifact name="incremental-compiler" type="jar" ext="jar" location="/root/.ivy2/cache/org.scala-sbt/incremental-compiler/jars/incremental-compiler-0.13.18.jar">
+</artifact>
+</artifacts>
+</revision>
+</module>
+<module organisation="org.scala-sbt" name="relation">
+<revision name="0.13.18">
+<artifacts>
+<artifact name="relation" type="jar" ext="jar" location="/root/.ivy2/cache/org.scala-sbt/relation/jars/relation-0.13.18.jar">
+</artifact>
+</artifacts>
+</revision>
+</module>
+<module organisation="org.scala-sbt" name="api">
+<revision name="0.13.18">
+<artifacts>
+<artifact name="api" type="jar" ext="jar" location="/root/.ivy2/cache/org.scala-sbt/api/jars/api-0.13.18.jar">
+</artifact>
+</artifacts>
+</revision>
+</module>
+<module organisation="org.scala-sbt" name="classfile">
+<revision name="0.13.18">
+<artifacts>
+<artifact name="classfile" type="jar" ext="jar" location="/root/.ivy2/cache/org.scala-sbt/classfile/jars/classfile-0.13.18.jar">
+</artifact>
+</artifacts>
+</revision>
+</module>
+<module organisation="org.scala-sbt" name="logging">
+<revision name="0.13.18">
+<artifacts>
+<artifact name="logging" type="jar" ext="jar" location="/root/.ivy2/cache/org.scala-sbt/logging/jars/logging-0.13.18.jar">
+</artifact>
+</artifacts>
+</revision>
+</module>
+<module organisation="org.scala-sbt" name="process">
+<revision name="0.13.18">
+<artifacts>
+<artifact name="process" type="jar" ext="jar" location="/root/.ivy2/cache/org.scala-sbt/process/jars/process-0.13.18.jar">
+</artifact>
+</artifacts>
+</revision>
+</module>
+<module organisation="org.scala-sbt" name="completion">
+<revision name="0.13.18">
+<artifacts>
+<artifact name="completion" type="jar" ext="jar" location="/root/.ivy2/cache/org.scala-sbt/completion/jars/completion-0.13.18.jar">
+</artifact>
+</artifacts>
+</revision>
+</module>
+<module organisation="jline" name="jline">
+<revision name="2.14.5">
+<artifacts>
+<artifact name="jline" type="jar" ext="jar" location="/root/.ivy2/cache/jline/jline/jars/jline-2.14.5.jar">
+</artifact>
+</artifacts>
+</revision>
+</module>
+<module organisation="org.scala-sbt" name="collections">
+<revision name="0.13.18">
+<artifacts>
+<artifact name="collections" type="jar" ext="jar" location="/root/.ivy2/cache/org.scala-sbt/collections/jars/collections-0.13.18.jar">
+</artifact>
+</artifacts>
+</revision>
+</module>
+<module organisation="org.scala-sbt" name="classpath">
+<revision name="0.13.18">
+<artifacts>
+<artifact name="classpath" type="jar" ext="jar" location="/root/.ivy2/cache/org.scala-sbt/classpath/jars/classpath-0.13.18.jar">
+</artifact>
+</artifacts>
+</revision>
+</module>
+<module organisation="org.scala-sbt" name="launcher-interface">
+<revision name="1.0.1">
+<artifacts>
+<artifact name="launcher-interface" type="jar" ext="jar" location="/root/.ivy2/cache/org.scala-sbt/launcher-interface/jars/launcher-interface-1.0.1.jar">
+</artifact>
+</artifacts>
+</revision>
+</module>
+<module organisation="org.scala-sbt" name="io">
+<revision name="0.13.18">
+<artifacts>
+<artifact name="io" type="jar" ext="jar" location="/root/.ivy2/cache/org.scala-sbt/io/jars/io-0.13.18.jar">
+</artifact>
+</artifacts>
+</revision>
+</module>
+<module organisation="org.scala-sbt" name="control">
+<revision name="0.13.18">
+<artifacts>
+<artifact name="control" type="jar" ext="jar" location="/root/.ivy2/cache/org.scala-sbt/control/jars/control-0.13.18.jar">
+</artifact>
+</artifacts>
+</revision>
+</module>
+<module organisation="org.scala-sbt" name="interface">
+<revision name="0.13.18">
+<artifacts>
+<artifact name="interface" type="jar" ext="jar" location="/root/.ivy2/cache/org.scala-sbt/interface/jars/interface-0.13.18.jar">
+</artifact>
+</artifacts>
+</revision>
+</module>
+<module organisation="org.scala-lang" name="scala-compiler">
+<revision name="2.10.7">
+<artifacts>
+<artifact name="scala-compiler" type="jar" ext="jar" location="/root/.ivy2/cache/org.scala-lang/scala-compiler/jars/scala-compiler-2.10.7.jar">
+</artifact>
+</artifacts>
+</revision>
+</module>
+<module organisation="org.scala-lang" name="scala-reflect">
+<revision name="2.10.7">
+<artifacts>
+<artifact name="scala-reflect" type="jar" ext="jar" location="/root/.ivy2/cache/org.scala-lang/scala-reflect/jars/scala-reflect-2.10.7.jar">
+</artifact>
+</artifacts>
+</revision>
+</module>
+<module organisation="org.scala-lang" name="scala-library">
+<revision name="2.10.7">
+<artifacts>
+<artifact name="scala-library" type="jar" ext="jar" location="/root/.ivy2/cache/org.scala-lang/scala-library/jars/scala-library-2.10.7.jar">
+</artifact>
+</artifacts>
+</revision>
+</module>
+</dependencies>
+</ivy-report>

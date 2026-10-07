@@ -1,11 +1,15 @@
 //! The governing-root pre-check of the hosted flow: a run whose `--cwd` is
 //! a workspace member reads the member's directory only, while the package
 //! manager installs from a lock in an ancestor directory. Hosted mode then
-//! either pins nothing and reports success (pnpm, #590) or rewrites the
-//! member as a lockless project and breaks the workspace (cargo, #417).
+//! either pins nothing and reports success (pnpm, #590; npm, yarn and Bun
+//! `package.json` workspaces, #884) or rewrites the member as a lockless
+//! project and breaks the workspace (cargo, #417).
 //!
-//! [`refusal`] spots both layouts before any takeover or write, so the run
-//! fails closed and names the directory to run from. Vendored mode refuses
+//! [`refusal`] spots these layouts before any takeover or write, so the run
+//! fails closed and names the directory to run from. It also refuses a
+//! pnpm member that does have its own lock when the `trustLockfile: true`
+//! hosted pins need lives in the workspace root's `pnpm-workspace.yaml`,
+//! the only one pnpm reads (#880). Vendored mode refuses
 //! the same layouts (`vendor_lockfile_missing`,
 //! `cargo_manifest_not_workspace_root`); the cargo check is the vendored
 //! one, shared.
@@ -18,17 +22,31 @@ use std::path::{Path, PathBuf};
 
 use crate::constants::npm_family::{NPM_LOCKS, VLT_LOCK};
 use crate::patch::redirect::npmrc::npmrc_top_level_value;
-use crate::utils::fs::read_regular_to_string;
+use crate::utils::fs::{read_regular_to_string, read_regular_to_string_sync};
+use crate::utils::pnpm_workspace::governing_workspace_file;
 use crate::vendor::cargo::NOT_WORKSPACE_ROOT;
 use crate::vendor::cargo_manifest;
 use crate::vendor::lock_inventory::ProjectView;
 
 use super::engine::{Candidate, Refusal};
+use super::guidance::{
+    plan_workspace_trust, pnpm_lock_version_major, read_workspace_for_trust, TrustPlan,
+};
 
 /// Refusal code for a pnpm project whose `pnpm-lock.yaml` lives in another
 /// directory: the nearest ancestor `pnpm-workspace.yaml` (a workspace
 /// member) or a configured `lockfile-dir`.
 pub const PNPM_LOCKFILE_ELSEWHERE: &str = "redirect_pnpm_lockfile_elsewhere";
+
+/// Refusal code for an npm, yarn or Bun workspace member: an ancestor
+/// `package.json` lists the project directory in its `workspaces`, and the
+/// workspace's lock lives at that root.
+pub const WORKSPACE_LOCKFILE_ELSEWHERE: &str = "redirect_workspace_lockfile_elsewhere";
+
+/// Refusal code for a pnpm workspace member with its own lock whose
+/// settings (`trustLockfile`) live in an ancestor `pnpm-workspace.yaml`
+/// that does not trust the lock yet.
+pub const PNPM_SETTINGS_ELSEWHERE: &str = "redirect_pnpm_settings_elsewhere";
 
 const PNPM_LOCK: &str = "pnpm-lock.yaml";
 const PNPM_WORKSPACE: &str = "pnpm-workspace.yaml";
@@ -50,8 +68,14 @@ const HOSTED_CARGO_ROOT_HINT: &str =
      nothing was written";
 
 /// `Some` when the project directory is governed by a lock in another
-/// directory that hosted mode would not read (see the module doc).
-pub async fn refusal(view: &ProjectView<'_>, candidates: &[Candidate]) -> Option<Refusal> {
+/// directory that hosted mode would not read, or (with the trust
+/// auto-config on) by pnpm settings in another directory that hosted mode
+/// would not write (see the module doc).
+pub async fn refusal(
+    view: &ProjectView<'_>,
+    candidates: &[Candidate],
+    trust_lockfile_config: bool,
+) -> Option<Refusal> {
     let root: &Path = match view {
         ProjectView::Disk(root) => root,
         ProjectView::Snapshot(snap) => snap.root,
@@ -63,8 +87,24 @@ pub async fn refusal(view: &ProjectView<'_>, candidates: &[Candidate]) -> Option
         }
     }
     if candidates.iter().any(|c| c.dep.ecosystem == "npm") {
+        let workspace = if has_own_npm_family_lock(root) {
+            None
+        } else {
+            package_json_workspace_refusal(root).await
+        };
         if let Some(lock) = pnpm_lock_elsewhere(root).await {
             let dir = lock.parent().unwrap_or(&lock);
+            // A `package.json` workspace root nested inside the pnpm lock's
+            // directory is nearer the member and owns its lock (Bugbot on
+            // #901); otherwise pnpm's workspace or `lockfile-dir` governs.
+            if let Some((ws_root, refusal)) = workspace {
+                let pnpm_dir = tokio::fs::canonicalize(dir)
+                    .await
+                    .unwrap_or_else(|_| dir.to_path_buf());
+                if ws_root != pnpm_dir && ws_root.starts_with(&pnpm_dir) {
+                    return Some(refusal);
+                }
+            }
             return Some(Refusal {
                 code: PNPM_LOCKFILE_ELSEWHERE.to_string(),
                 message: format!(
@@ -77,8 +117,53 @@ pub async fn refusal(view: &ProjectView<'_>, candidates: &[Candidate]) -> Option
                 ),
             });
         }
+        if let Some((_, refusal)) = workspace {
+            return Some(refusal);
+        }
+        if trust_lockfile_config {
+            if let Some(refusal) = pnpm_settings_elsewhere(root) {
+                return Some(refusal);
+            }
+        }
     }
     None
+}
+
+/// A pnpm v9 project lock (the one the trust auto-config serves) in a
+/// workspace member whose settings come from an ancestor
+/// `pnpm-workspace.yaml` that neither trusts the lock nor explicitly opts
+/// out. The auto-config used to create a nested file pnpm ignores (#880);
+/// socket-patch writes only inside the project, so the user adds the key
+/// to the root file. An explicit `trustLockfile: <non-true>` is respected,
+/// as in a single project.
+fn pnpm_settings_elsewhere(root: &Path) -> Option<Refusal> {
+    let lock = read_regular_to_string_sync(&root.join(PNPM_LOCK)).ok()?;
+    if pnpm_lock_version_major(&lock).is_none_or(|major| major < 9) {
+        return None;
+    }
+    let file = governing_workspace_file(root)?;
+    if let Ok(Some(text)) = read_workspace_for_trust(&file) {
+        if matches!(
+            plan_workspace_trust(Some(&text)),
+            TrustPlan::AlreadyTrue | TrustPlan::UserSet(_)
+        ) {
+            return None;
+        }
+    }
+    Some(Refusal {
+        code: PNPM_SETTINGS_ELSEWHERE.to_string(),
+        message: format!(
+            "{} is a project of the pnpm workspace whose settings live in {}: pnpm \
+             reads `trustLockfile` only from that file, so pnpm >= 11 rejects the hosted \
+             pins in this project's pnpm-lock.yaml (ERR_PNPM_TARBALL_URL_MISMATCH) until \
+             it trusts the lock, and a pnpm-workspace.yaml created here would be ignored; \
+             add `trustLockfile: true` to {} (pnpm <= 10 ignores it) and re-run, or pass \
+             --no-trust-lockfile-config to pin without it; nothing was written",
+            root.display(),
+            file.display(),
+            file.display()
+        ),
+    })
 }
 
 /// The vendored workspace-root check over `<root>/Cargo.toml`; an absent or
@@ -104,13 +189,7 @@ async fn cargo_member_refusal(root: &Path) -> Option<Refusal> {
 /// relative directory is resolved from the invocation cwd, as pnpm does;
 /// without an override, the workspace's lock lives at its root.
 async fn pnpm_lock_elsewhere(root: &Path) -> Option<PathBuf> {
-    let has_own_lock = OWN_LOCKS
-        .iter()
-        .chain(NPM_LOCKS.iter())
-        .chain(std::iter::once(&VLT_LOCK))
-        .any(|name| root.join(name).exists());
-    // Rush keeps its locks under common/config, read by the rewriter.
-    if has_own_lock || root.join("rush.json").exists() {
+    if has_own_npm_family_lock(root) {
         return None;
     }
     let canonical = tokio::fs::canonicalize(root)
@@ -155,6 +234,176 @@ async fn pnpm_lock_elsewhere(root: &Path) -> Option<PathBuf> {
         return lock_elsewhere(&canonical, &workspace_root, ".").await;
     }
     None
+}
+
+/// Whether the project directory is its own npm-family lock root: it holds
+/// a lock the rewriters read, or is a Rush repo (Rush keeps its locks under
+/// common/config, read by the rewriter).
+fn has_own_npm_family_lock(root: &Path) -> bool {
+    OWN_LOCKS
+        .iter()
+        .chain(NPM_LOCKS.iter())
+        .chain(std::iter::once(&VLT_LOCK))
+        .any(|name| root.join(name).exists())
+        || root.join("rush.json").exists()
+}
+
+/// Locks of the package managers that read `package.json` `workspaces`
+/// (npm, yarn, Bun). pnpm reads only `pnpm-workspace.yaml` and vlt only
+/// `vlt.json`, so their locks at a `workspaces` root govern no member
+/// through that field; the pnpm check owns pnpm workspaces.
+const WORKSPACE_ROOT_LOCKS: [&str; 5] = [
+    "package-lock.json",
+    "npm-shrinkwrap.json",
+    "yarn.lock",
+    "bun.lock",
+    "bun.lockb",
+];
+
+/// #884: the project directory is a member of an npm, yarn (classic or
+/// berry) or Bun workspace, whose root `package.json` lists it under
+/// `workspaces` and whose lock lives at that root. Each of those package
+/// managers installs the member from the root lock, so a hosted run here
+/// would find the member's copy, pin nothing and report success.
+///
+/// The nearest ancestor whose `workspaces` patterns match the member is
+/// its workspace root, as npm and yarn resolve it. A matching root with no
+/// lock may itself be a member of an outer workspace (yarn berry's nested
+/// worktrees), so the walk goes on with that root as the member and
+/// refuses at the first root that holds an npm, yarn or Bun lock; a chain
+/// that ends without one (never installed), or at a Rush root, refuses
+/// nothing. Returns the
+/// governing root with the refusal, so [`refusal`] can weigh it against
+/// the pnpm check (the nearer root wins; a tie goes to pnpm's message).
+async fn package_json_workspace_refusal(root: &Path) -> Option<(PathBuf, Refusal)> {
+    let canonical = tokio::fs::canonicalize(root)
+        .await
+        .unwrap_or_else(|_| root.to_path_buf());
+    let mut member: &Path = &canonical;
+    for ancestor in canonical.ancestors().skip(1) {
+        let Ok(text) = read_regular_to_string(&ancestor.join("package.json")).await else {
+            continue;
+        };
+        let Some(patterns) = workspace_patterns(&text) else {
+            continue;
+        };
+        let Ok(rel) = member.strip_prefix(ancestor) else {
+            continue;
+        };
+        let rel: Vec<String> = rel
+            .components()
+            .map(|c| c.as_os_str().to_string_lossy().into_owned())
+            .collect();
+        if !workspaces_include(&patterns, &rel) {
+            continue;
+        }
+        let locks: Vec<&str> = WORKSPACE_ROOT_LOCKS
+            .iter()
+            .copied()
+            .filter(|name| ancestor.join(name).is_file())
+            .collect();
+        if locks.is_empty() {
+            // Rush keeps its locks under common/config: the rewriters own
+            // a run from the Rush root.
+            if ancestor.join("rush.json").exists() {
+                return None;
+            }
+            member = ancestor;
+            continue;
+        }
+        let refusal = Refusal {
+            code: WORKSPACE_LOCKFILE_ELSEWHERE.to_string(),
+            message: format!(
+                "{} is a workspace member with no lockfile of its own: the workspace \
+                 root {} lists it under \"workspaces\" and installs it from {}, which a \
+                 hosted run here cannot see; run socket-patch from {} (the workspace \
+                 root); nothing was written",
+                root.display(),
+                ancestor.display(),
+                locks
+                    .iter()
+                    .map(|name| ancestor.join(name).display().to_string())
+                    .collect::<Vec<_>>()
+                    .join(", "),
+                ancestor.display()
+            ),
+        };
+        return Some((ancestor.to_path_buf(), refusal));
+    }
+    None
+}
+
+/// The `workspaces` patterns of a `package.json`: the array form (npm,
+/// yarn, Bun) or the object form's `packages` array (yarn classic's
+/// `nohoist` shape, Bun's catalogs shape). `None` when the field is absent
+/// or the manifest does not parse.
+fn workspace_patterns(package_json: &str) -> Option<Vec<String>> {
+    let text = package_json
+        .strip_prefix('\u{feff}')
+        .unwrap_or(package_json);
+    let doc: serde_json::Value = serde_json::from_str(text).ok()?;
+    let field = doc.get("workspaces")?;
+    let list = match field {
+        serde_json::Value::Array(list) => list,
+        serde_json::Value::Object(map) => map.get("packages")?.as_array()?,
+        _ => return None,
+    };
+    Some(
+        list.iter()
+            .filter_map(|v| v.as_str())
+            .map(str::to_string)
+            .collect(),
+    )
+}
+
+/// Whether the member path (`rel`, relative to the workspace root, one
+/// entry per component) matches a `workspaces` pattern and no later
+/// `!`-negated one. A pattern is a `/`-separated glob: `*` and `?` match
+/// within one component, `**` matches any number of components.
+fn workspaces_include(patterns: &[String], rel: &[String]) -> bool {
+    if rel.is_empty() {
+        return false;
+    }
+    let mut included = false;
+    for pattern in patterns {
+        let (negated, pattern) = match pattern.strip_prefix('!') {
+            Some(rest) => (true, rest),
+            None => (false, pattern.as_str()),
+        };
+        let segments: Vec<&str> = pattern
+            .trim()
+            .split(['/', '\\'])
+            .filter(|s| !s.is_empty() && *s != ".")
+            .collect();
+        if segments.is_empty() {
+            continue;
+        }
+        if path_glob_matches(&segments, rel) {
+            included = !negated;
+        }
+    }
+    included
+}
+
+fn path_glob_matches(pattern: &[&str], path: &[String]) -> bool {
+    match pattern.split_first() {
+        None => path.is_empty(),
+        Some((&"**", rest)) => (0..=path.len()).any(|skip| path_glob_matches(rest, &path[skip..])),
+        Some((first, rest)) => path.split_first().is_some_and(|(head, tail)| {
+            segment_glob_matches(first.as_bytes(), head.as_bytes()) && path_glob_matches(rest, tail)
+        }),
+    }
+}
+
+fn segment_glob_matches(pattern: &[u8], name: &[u8]) -> bool {
+    match pattern.split_first() {
+        None => name.is_empty(),
+        Some((b'*', rest)) => {
+            (0..=name.len()).any(|skip| segment_glob_matches(rest, &name[skip..]))
+        }
+        Some((b'?', rest)) => !name.is_empty() && segment_glob_matches(rest, &name[1..]),
+        Some((c, rest)) => name.first() == Some(c) && segment_glob_matches(rest, &name[1..]),
+    }
 }
 
 async fn npmrc_lockfile_dir(root: &Path) -> Option<String> {
@@ -225,7 +474,7 @@ mod tests {
     }
 
     async fn code(dir: &Path, ecosystem: &str) -> Option<String> {
-        refusal(&ProjectView::Disk(dir), &[candidate(ecosystem)])
+        refusal(&ProjectView::Disk(dir), &[candidate(ecosystem)], true)
             .await
             .map(|r| r.code)
     }
@@ -259,7 +508,7 @@ mod tests {
         write(
             tmp.path(),
             "pnpm-workspace.yaml",
-            "packages:\n  - packages/*\n",
+            "packages:\n  - packages/*\ntrustLockfile: true\n",
         );
         write(tmp.path(), "packages/a/package.json", "{}");
         let member = tmp.path().join("packages/a");
@@ -269,6 +518,72 @@ mod tests {
             tmp.path(),
             "packages/a/pnpm-lock.yaml",
             "lockfileVersion: '9.0'\n",
+        );
+        assert_eq!(code(&member, "npm").await, None);
+    }
+
+    /// #880: a member with its own v9 lock is pinned through that lock, but
+    /// pnpm reads `trustLockfile` only from the root `pnpm-workspace.yaml`.
+    /// Until that file trusts the lock (or opts out), the hosted run refuses
+    /// rather than nest a settings file pnpm ignores.
+    #[tokio::test]
+    async fn pnpm_member_with_own_lock_needs_the_root_to_trust_it() {
+        let tmp = tempfile::tempdir().unwrap();
+        let ws = "packages:\n  - packages/*\nsharedWorkspaceLockfile: false\n";
+        write(tmp.path(), "pnpm-workspace.yaml", ws);
+        write(tmp.path(), "packages/a/package.json", "{}");
+        write(
+            tmp.path(),
+            "packages/a/pnpm-lock.yaml",
+            "lockfileVersion: '9.0'\n",
+        );
+        let member = tmp.path().join("packages/a");
+        let refused = refusal(&ProjectView::Disk(&member), &[candidate("npm")], true)
+            .await
+            .unwrap();
+        assert_eq!(refused.code, PNPM_SETTINGS_ELSEWHERE);
+        assert!(
+            refused.message.contains("trustLockfile: true")
+                && refused.message.contains("pnpm-workspace.yaml")
+                && refused.message.contains("nothing was written"),
+            "{}",
+            refused.message
+        );
+        // `--no-trust-lockfile-config` plans no trust write: nothing to refuse.
+        let opted_out = refusal(&ProjectView::Disk(&member), &[candidate("npm")], false).await;
+        assert!(opted_out.is_none());
+        // A non-npm run, and a pre-v9 lock (no trust policy), are untouched.
+        assert_eq!(code(&member, "pypi").await, None);
+        write(
+            tmp.path(),
+            "packages/a/pnpm-lock.yaml",
+            "lockfileVersion: '6.0'\n",
+        );
+        assert_eq!(code(&member, "npm").await, None);
+        write(
+            tmp.path(),
+            "packages/a/pnpm-lock.yaml",
+            "lockfileVersion: '9.0'\n",
+        );
+        // The root trusting the lock, or explicitly opting out, settles it.
+        write(
+            tmp.path(),
+            "pnpm-workspace.yaml",
+            &format!("{ws}trustLockfile: true\n"),
+        );
+        assert_eq!(code(&member, "npm").await, None);
+        write(
+            tmp.path(),
+            "pnpm-workspace.yaml",
+            &format!("{ws}trustLockfile: false\n"),
+        );
+        assert_eq!(code(&member, "npm").await, None);
+        // A member with its own settings file is its own workspace there.
+        write(tmp.path(), "pnpm-workspace.yaml", ws);
+        write(
+            tmp.path(),
+            "packages/a/pnpm-workspace.yaml",
+            "packages:\n  - .\n",
         );
         assert_eq!(code(&member, "npm").await, None);
     }
@@ -393,6 +708,336 @@ mod tests {
             "packages: []\n",
         );
         assert_eq!(code(&tmp.path().join("packages/a"), "npm").await, None);
+    }
+
+    /// #884: a member of an npm / yarn classic / yarn berry / Bun workspace
+    /// has no lock of its own; the root `package.json` lists it under
+    /// `workspaces` and the root lock governs it.
+    #[tokio::test]
+    async fn package_json_workspace_member_is_refused_for_every_root_lock() {
+        for lock in [
+            "package-lock.json",
+            "npm-shrinkwrap.json",
+            "yarn.lock",
+            "bun.lock",
+            "bun.lockb",
+        ] {
+            let tmp = tempfile::tempdir().unwrap();
+            write(
+                tmp.path(),
+                "package.json",
+                r#"{"name":"root","private":true,"workspaces":["packages/*"]}"#,
+            );
+            write(tmp.path(), lock, "");
+            write(tmp.path(), "packages/a/package.json", "{}");
+            let member = tmp.path().join("packages/a");
+            let refusal = refusal(&ProjectView::Disk(&member), &[candidate("npm")], true)
+                .await
+                .unwrap_or_else(|| panic!("{lock}: member must be refused"));
+            assert_eq!(refusal.code, WORKSPACE_LOCKFILE_ELSEWHERE, "{lock}");
+            assert!(
+                refusal.message.contains(lock) && refusal.message.contains("nothing was written"),
+                "{lock}: {}",
+                refusal.message
+            );
+            // The root is fine, and so is a non-npm run from the member.
+            assert_eq!(code(tmp.path(), "npm").await, None, "{lock}");
+            assert_eq!(code(&member, "pypi").await, None, "{lock}");
+        }
+    }
+
+    /// #884, yarn classic `nohoist` and Bun's object form: `workspaces` is
+    /// an object whose `packages` lists the members.
+    #[tokio::test]
+    async fn package_json_object_workspaces_member_is_refused() {
+        let tmp = tempfile::tempdir().unwrap();
+        write(
+            tmp.path(),
+            "package.json",
+            r#"{"private":true,"workspaces":{"packages":["packages/*"],"nohoist":["**/left-pad"]}}"#,
+        );
+        write(tmp.path(), "yarn.lock", "");
+        write(tmp.path(), "packages/a/package.json", "{}");
+        assert_eq!(
+            code(&tmp.path().join("packages/a"), "npm").await.as_deref(),
+            Some(WORKSPACE_LOCKFILE_ELSEWHERE)
+        );
+    }
+
+    /// A member with its own lock is its own lock root; a directory the
+    /// root's `workspaces` does not list, a lockless workspace root and a
+    /// root without `workspaces` refuse nothing.
+    #[tokio::test]
+    async fn package_json_workspace_non_members_are_left_alone() {
+        let tmp = tempfile::tempdir().unwrap();
+        write(
+            tmp.path(),
+            "package.json",
+            r#"{"private":true,"workspaces":["packages/*","!packages/excluded"]}"#,
+        );
+        write(tmp.path(), "packages/a/package.json", "{}");
+        let member = tmp.path().join("packages/a");
+        // Lockless root.
+        assert_eq!(code(&member, "npm").await, None);
+        write(tmp.path(), "yarn.lock", "");
+        assert_eq!(
+            code(&member, "npm").await.as_deref(),
+            Some(WORKSPACE_LOCKFILE_ELSEWHERE)
+        );
+        // Unlisted and negated directories.
+        write(tmp.path(), "tools/x/package.json", "{}");
+        assert_eq!(code(&tmp.path().join("tools/x"), "npm").await, None);
+        write(tmp.path(), "packages/excluded/package.json", "{}");
+        assert_eq!(
+            code(&tmp.path().join("packages/excluded"), "npm").await,
+            None
+        );
+        // A member with its own lock.
+        write(tmp.path(), "packages/a/package-lock.json", "{}");
+        assert_eq!(code(&member, "npm").await, None);
+
+        // No `workspaces` at all: a nested standalone project.
+        let tmp = tempfile::tempdir().unwrap();
+        write(tmp.path(), "package.json", r#"{"name":"root"}"#);
+        write(tmp.path(), "package-lock.json", "{}");
+        write(tmp.path(), "sub/package.json", "{}");
+        assert_eq!(code(&tmp.path().join("sub"), "npm").await, None);
+    }
+
+    /// The nearest ancestor that lists the member is its root, past an
+    /// intermediate `package.json` that does not.
+    #[tokio::test]
+    async fn package_json_workspace_root_is_the_nearest_listing_ancestor() {
+        let tmp = tempfile::tempdir().unwrap();
+        write(
+            tmp.path(),
+            "package.json",
+            r#"{"private":true,"workspaces":["apps/**"]}"#,
+        );
+        write(tmp.path(), "package-lock.json", "{}");
+        write(tmp.path(), "apps/package.json", r#"{"name":"not-a-root"}"#);
+        write(tmp.path(), "apps/web/site/package.json", "{}");
+        let refusal = refusal(
+            &ProjectView::Disk(&tmp.path().join("apps/web/site")),
+            &[candidate("npm")],
+            true,
+        )
+        .await
+        .expect("deep member refused");
+        assert_eq!(refusal.code, WORKSPACE_LOCKFILE_ELSEWHERE);
+        let root = std::fs::canonicalize(tmp.path()).unwrap();
+        assert!(
+            refusal
+                .message
+                .contains(&format!("run socket-patch from {}", root.display())),
+            "{}",
+            refusal.message
+        );
+    }
+
+    /// Bugbot on #901: a lockless workspace root that is itself a member
+    /// of an outer workspace (yarn berry nested worktrees) hands the walk
+    /// to the outer root, whose lock governs both.
+    #[tokio::test]
+    async fn nested_lockless_workspace_defers_to_the_outer_root() {
+        let tmp = tempfile::tempdir().unwrap();
+        write(
+            tmp.path(),
+            "package.json",
+            r#"{"private":true,"workspaces":["packages/*"]}"#,
+        );
+        write(tmp.path(), "yarn.lock", "");
+        write(
+            tmp.path(),
+            "packages/inner/package.json",
+            r#"{"private":true,"workspaces":["pkgs/*"]}"#,
+        );
+        write(tmp.path(), "packages/inner/pkgs/a/package.json", "{}");
+        let member = tmp.path().join("packages/inner/pkgs/a");
+        let refusal = refusal(&ProjectView::Disk(&member), &[candidate("npm")], true)
+            .await
+            .expect("nested member refused");
+        assert_eq!(refusal.code, WORKSPACE_LOCKFILE_ELSEWHERE);
+        let root = std::fs::canonicalize(tmp.path()).unwrap();
+        assert!(
+            refusal
+                .message
+                .contains(&format!("run socket-patch from {}", root.display())),
+            "{}",
+            refusal.message
+        );
+        // The outer root must list the inner root, not just any path.
+        write(
+            tmp.path(),
+            "package.json",
+            r#"{"private":true,"workspaces":["apps/*"]}"#,
+        );
+        assert_eq!(code(&member, "npm").await, None);
+    }
+
+    /// Bugbot on #901: a pnpm workspace nested in an outer yarn workspace
+    /// is the member's lock root; the pnpm check names it, not the outer
+    /// yarn root.
+    #[tokio::test]
+    async fn nested_pnpm_root_stops_the_package_json_walk() {
+        let tmp = tempfile::tempdir().unwrap();
+        write(
+            tmp.path(),
+            "package.json",
+            r#"{"private":true,"workspaces":["packages/*"]}"#,
+        );
+        write(tmp.path(), "yarn.lock", "");
+        write(
+            tmp.path(),
+            "packages/inner/package.json",
+            r#"{"private":true,"workspaces":["pkgs/*"]}"#,
+        );
+        write(
+            tmp.path(),
+            "packages/inner/pnpm-workspace.yaml",
+            "packages:\n  - pkgs/*\n",
+        );
+        write(
+            tmp.path(),
+            "packages/inner/pnpm-lock.yaml",
+            "lockfileVersion: '9.0'\n",
+        );
+        write(tmp.path(), "packages/inner/pkgs/a/package.json", "{}");
+        let member = tmp.path().join("packages/inner/pkgs/a");
+        assert_eq!(
+            code(&member, "npm").await.as_deref(),
+            Some(PNPM_LOCKFILE_ELSEWHERE)
+        );
+
+        // Bugbot on #901: a stray pnpm lock at the inner root with no
+        // `pnpm-workspace.yaml` governs nothing (pnpm ignores
+        // `package.json` workspaces), so the outer yarn root is named.
+        std::fs::remove_file(tmp.path().join("packages/inner/pnpm-workspace.yaml")).unwrap();
+        let refusal = refusal(&ProjectView::Disk(&member), &[candidate("npm")], true)
+            .await
+            .expect("outer yarn root refused");
+        assert_eq!(refusal.code, WORKSPACE_LOCKFILE_ELSEWHERE);
+        let outer = std::fs::canonicalize(tmp.path()).unwrap();
+        assert!(
+            refusal
+                .message
+                .contains(&format!("run socket-patch from {}", outer.display()))
+                && refusal.message.contains("yarn.lock"),
+            "{}",
+            refusal.message
+        );
+    }
+
+    /// Bugbot on #901: a yarn workspace nested inside a pnpm workspace is
+    /// nearer the member and owns its lock, so it is the root named.
+    #[tokio::test]
+    async fn nearer_package_json_root_beats_an_outer_pnpm_workspace() {
+        let tmp = tempfile::tempdir().unwrap();
+        write(tmp.path(), PNPM_WORKSPACE, "packages:\n  - tools/*\n");
+        write(tmp.path(), PNPM_LOCK, "lockfileVersion: '9.0'\n");
+        write(
+            tmp.path(),
+            "apps/package.json",
+            r#"{"private":true,"workspaces":["web"]}"#,
+        );
+        write(tmp.path(), "apps/yarn.lock", "");
+        write(tmp.path(), "apps/web/package.json", "{}");
+        let member = tmp.path().join("apps/web");
+        let refusal = refusal(&ProjectView::Disk(&member), &[candidate("npm")], true)
+            .await
+            .expect("member refused");
+        assert_eq!(refusal.code, WORKSPACE_LOCKFILE_ELSEWHERE);
+        let apps = std::fs::canonicalize(tmp.path().join("apps")).unwrap();
+        assert!(
+            refusal
+                .message
+                .contains(&format!("run socket-patch from {}", apps.display())),
+            "{}",
+            refusal.message
+        );
+        // Same directory: pnpm's own message wins the tie.
+        write(
+            tmp.path(),
+            "package.json",
+            r#"{"private":true,"workspaces":["tools/*"]}"#,
+        );
+        write(tmp.path(), "tools/t/package.json", "{}");
+        assert_eq!(
+            code(&tmp.path().join("tools/t"), "npm").await.as_deref(),
+            Some(PNPM_LOCKFILE_ELSEWHERE)
+        );
+    }
+
+    /// Bugbot on #901: a stray `pnpm-lock.yaml` at a nested `workspaces`
+    /// root does not beat the outer pnpm workspace pnpm installs from.
+    #[tokio::test]
+    async fn stray_inner_pnpm_lock_does_not_beat_the_outer_pnpm_workspace() {
+        let tmp = tempfile::tempdir().unwrap();
+        write(tmp.path(), PNPM_WORKSPACE, "packages:\n  - apps/**\n");
+        write(tmp.path(), PNPM_LOCK, "lockfileVersion: '9.0'\n");
+        write(
+            tmp.path(),
+            "apps/package.json",
+            r#"{"private":true,"workspaces":["web"]}"#,
+        );
+        write(
+            tmp.path(),
+            "apps/pnpm-lock.yaml",
+            "lockfileVersion: '9.0'\n",
+        );
+        write(tmp.path(), "apps/web/package.json", "{}");
+        assert_eq!(
+            code(&tmp.path().join("apps/web"), "npm").await.as_deref(),
+            Some(PNPM_LOCKFILE_ELSEWHERE)
+        );
+    }
+
+    #[test]
+    fn workspaces_patterns_match_like_npm_and_yarn() {
+        let rel = |p: &str| p.split('/').map(str::to_string).collect::<Vec<_>>();
+        let pats = |p: &[&str]| p.iter().map(|s| s.to_string()).collect::<Vec<_>>();
+        assert!(workspaces_include(
+            &pats(&["packages/*"]),
+            &rel("packages/a")
+        ));
+        assert!(!workspaces_include(
+            &pats(&["packages/*"]),
+            &rel("packages/a/b")
+        ));
+        assert!(workspaces_include(
+            &pats(&["./packages/*/"]),
+            &rel("packages/a")
+        ));
+        assert!(workspaces_include(
+            &pats(&["packages/**"]),
+            &rel("packages/a/b")
+        ));
+        assert!(workspaces_include(
+            &pats(&["**/pkg-*"]),
+            &rel("x/y/pkg-one")
+        ));
+        assert!(workspaces_include(&pats(&["app"]), &rel("app")));
+        assert!(!workspaces_include(&pats(&["app"]), &rel("apps")));
+        assert!(workspaces_include(&pats(&["app?"]), &rel("apps")));
+        assert!(!workspaces_include(
+            &pats(&["packages/*", "!packages/b"]),
+            &rel("packages/b")
+        ));
+        assert!(!workspaces_include(&pats(&["*"]), &[]));
+    }
+
+    #[test]
+    fn workspace_patterns_reads_both_field_shapes() {
+        assert_eq!(
+            workspace_patterns(r#"{"workspaces":["a/*","b"]}"#),
+            Some(vec!["a/*".to_string(), "b".to_string()])
+        );
+        assert_eq!(
+            workspace_patterns("\u{feff}{\"workspaces\":{\"packages\":[\"a/*\"]}}"),
+            Some(vec!["a/*".to_string()])
+        );
+        assert_eq!(workspace_patterns(r#"{"name":"x"}"#), None);
+        assert_eq!(workspace_patterns("not json"), None);
     }
 
     /// #417: a cargo workspace member is refused with the vendored code; the

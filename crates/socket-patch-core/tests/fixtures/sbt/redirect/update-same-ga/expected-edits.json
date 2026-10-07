@@ -1,0 +1,16 @@
+[
+  {
+    "path": "socket-patch.sbt",
+    "kind": "redirect_sbt_pin_updated",
+    "action": "updated",
+    "key": "org.apache.commons:commons-lang3",
+    "original": {
+      "uuid": "0fedcba9-0000-4000-8000-000000000000",
+      "version": "3.11-socket.0fedcba9"
+    },
+    "new": {
+      "uuid": "abcdef12-0000-4000-8000-000000000001",
+      "version": "3.11-socket.abcdef12"
+    }
+  }
+]

@@ -148,7 +148,6 @@
     ],
     "redirect_vlt_reinstall_required: hosted to vendored takeover": [
       "vlt_hosted_then_vendored_takeover_keeps_an_optional_hosted_copy",
-      "vlt_failed_vendor_after_the_takeover_revert_still_heals_the_store",
       "vlt_pinned_matrix_hosted_then_vendored_optional_takeover"
     ],
     "vendor_vlt_reinstall_required: optional dependency rewired or still linked upstream": [
