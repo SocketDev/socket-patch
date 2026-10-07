@@ -1,5 +1,5 @@
 ### Refactor routine (`refactor`, hourly, highest leverage first)
-_Last updated 2026-10-07T03:58Z · main @ 9c43dfc_
+_Last updated 2026-10-07T04:58Z · main @ 9c43dfc_
 
 **In flight:**
 - [#876](https://github.com/SocketDev/socket-patch/pull/876): registry clients (`build_registry_client`, Maven `fetch_registry_bytes`) built through one `registry_client_builder` under `ApiTimeouts`; `registry_fetch::download` onto `read_capped`. Also ports the base-red digest-ratchet fix for #646's JVM files. Issue #872 (C49). `ready`.
@@ -23,7 +23,7 @@ _Last updated 2026-10-07T03:58Z · main @ 9c43dfc_
 | 4 | #856 (E62, child 1 of #855): VEX npm aliases through the core resolver | 1 | 1 | ≈1.8 | M | ≈5 | skipped: `vex_consumed.rs` changed by #690 |
 | 5 | #883 (E39): `canonicalize_pypi_name` + `pep508_name` into one PyPI name module | 0 | 1 | ≈3 | L | ≈5 | skipped: 13 files changed by open PRs |
 
-Re-ranked 2026-10-07T03:58Z: main, discussion steering and queue unchanged since 01:58Z. New since then: #982 (C54, `paidRequired` contract drift in `get`, B1 U0 D≈0 R M ≈1; a JSON-output change, left to the fixer) and #983 (Decide, `agent:needs-human`, in Decisions). At 01:58Z: tracking #971 (E26, retire the legacy single-pom Maven backend); its child #972 (move the v5 JVM orchestrator out of `maven_repo.rs`, B0 U1 D0 R L ≈2, ~1,170 moved lines) is skipped: `maven_repo.rs` changed by #690 and #876; #973 is a Decide (`agent:needs-human`, in Decisions). Earlier: #960 (E21, ≈4) skipped on `commands/vendor.rs`; bugs #958, #967 left to the fixer. #893 (≈4, `cleanup_blobs.rs`) is still the best eligible; then #871 after #889, then #705. 3 of 3 slots used (#876, #886, #889 `ready` and approved, no review questions). Decisions: #648, #704, #792, #808, #615, #966, #973, #983; C07.
+Re-ranked 2026-10-07T04:58Z: main, discussion steering and queue unchanged since 03:58Z; new since then only bughunt bug #985 (not `arch-audit`, left to the fixer). At 03:58Z, new: #982 (C54, `paidRequired` contract drift in `get`, B1 U0 D≈0 R M ≈1; a JSON-output change, left to the fixer) and #983 (Decide, `agent:needs-human`, in Decisions). At 01:58Z: tracking #971 (E26, retire the legacy single-pom Maven backend); its child #972 (move the v5 JVM orchestrator out of `maven_repo.rs`, B0 U1 D0 R L ≈2, ~1,170 moved lines) is skipped: `maven_repo.rs` changed by #690 and #876; #973 is a Decide (`agent:needs-human`, in Decisions). Earlier: #960 (E21, ≈4) skipped on `commands/vendor.rs`; bugs #958, #967 left to the fixer. #893 (≈4, `cleanup_blobs.rs`) is still the best eligible; then #871 after #889, then #705. 3 of 3 slots used (#876, #886, #889 `ready` and approved, no review questions). Decisions: #648, #704, #792, #808, #615, #966, #973, #983; C07.
 
 **Notes:**
 - The sandbox runs as root, so 4 core lib tests fail on main and on branches alike: `copy_tree::relax_loop_must_not_traverse_symlinked_root`, `vlt_heal::an_unremovable_hidden_lock_keeps_every_store_entry`, `pypi_poetry::wire_write_failure_maps_error_and_leaves_lock_untouched`, `pypi_requirements::wire_failure_rolls_back_already_written_files`.
