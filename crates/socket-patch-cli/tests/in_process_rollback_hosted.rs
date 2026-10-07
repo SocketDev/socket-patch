@@ -1144,9 +1144,8 @@ async fn a_git_pattern_hosted_pin_is_refused_not_restored_to_the_registry() {
     assert!(
         envelope["hosted"]["failed"][0]["error"]
             .as_str()
-            .is_some_and(
-                |e| e.contains("installs from git") && e.contains("`git checkout -- yarn.lock`")
-            ),
+            .is_some_and(|e| e.contains("installs from git")
+                && e.contains("`git checkout -- yarn.lock`")),
         "{envelope}"
     );
     assert_eq!(

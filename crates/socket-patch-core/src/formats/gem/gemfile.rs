@@ -409,14 +409,8 @@ mod tests {
 
     #[test]
     fn escaped_quotes_and_hashes_inside_strings_stay_in_the_string() {
-        assert_eq!(
-            key(", require: 'it\\'s', gitlab: \"x\""),
-            Some("gitlab:".into())
-        );
-        assert_eq!(
-            key(", require: \"a\\\"b\", git: \"x\""),
-            Some("git:".into())
-        );
+        assert_eq!(key(", require: 'it\\'s', gitlab: \"x\""), Some("gitlab:".into()));
+        assert_eq!(key(", require: \"a\\\"b\", git: \"x\""), Some("git:".into()));
         assert_eq!(key(", local: \"#{name}\""), Some("local:".into()));
     }
 

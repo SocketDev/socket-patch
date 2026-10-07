@@ -89,8 +89,13 @@ The backticked slug in each row is the value `-e`/`--ecosystems` accepts (e.g.
   the patched files. See the [compatibility matrix and workflow](testing/pnpm-compatibility.md).
 - **yarn classic** — the `yarn.lock` entry's `resolved` / `integrity` are
   rewritten to the hosted tarball. A project that sets `yarn-offline-mirror`
-  (in `.yarnrc` or `.npmrc`) is refused with
-  `redirect_yarn_classic_offline_mirror`. Yarn looks mirror tarballs up by
+  is refused with `redirect_yarn_classic_offline_mirror`. The mirror is
+  resolved the way yarn 1 resolves it: the project's `.yarnrc` / `.npmrc`,
+  the user's (`~/.yarnrc`, which `yarn config set` writes, and `~/.npmrc`),
+  `<prefix>/etc/yarnrc` / `npmrc`, every ancestor directory's, and the
+  `YARN_*` / `npm_config_*` environment variables. A file saved with a UTF-8
+  BOM counts too, and `false` in a higher-precedence layer turns the mirror
+  off. Yarn looks mirror tarballs up by
   file name, and the hosted tarball has the same name as the upstream one
   already in the mirror, so installs would get the unpatched bytes and fail
   the integrity check. Use `--mode vendored` there; it works with a mirror.

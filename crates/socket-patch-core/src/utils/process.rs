@@ -162,7 +162,9 @@ pub(crate) fn resolve_app_alias_with(
     std::env::split_paths(&path)
         .filter(|dir| dir.is_absolute())
         .map(|dir| dir.join(format!("{name}.exe")))
-        .find(|candidate| std::fs::symlink_metadata(candidate).is_ok_and(|meta| !meta.is_dir()))
+        .find(|candidate| {
+            std::fs::symlink_metadata(candidate).is_ok_and(|meta| !meta.is_dir())
+        })
 }
 
 /// A plain file that cannot be executed (a stray `bun` data file on PATH)
@@ -593,11 +595,7 @@ mod tests {
         let tmp = tempfile::tempdir().unwrap();
         let safe = tmp.path().join("bin");
         std::fs::create_dir_all(&safe).unwrap();
-        let relative = [
-            PathBuf::from("."),
-            PathBuf::from(""),
-            PathBuf::from("planted"),
-        ];
+        let relative = [PathBuf::from("."), PathBuf::from(""), PathBuf::from("planted")];
 
         let only_relative = std::env::join_paths(&relative).unwrap();
         let var = |name: &str| (name == "PATH").then(|| only_relative.clone());
@@ -607,10 +605,7 @@ mod tests {
         let with_safe =
             std::env::join_paths(relative.iter().cloned().chain([safe.clone()])).unwrap();
         let var = |name: &str| (name == "PATH").then(|| with_safe.clone());
-        assert_eq!(
-            resolve_app_alias_with("yarn", &var),
-            Some(safe.join("yarn.exe"))
-        );
+        assert_eq!(resolve_app_alias_with("yarn", &var), Some(safe.join("yarn.exe")));
     }
 
     #[test]

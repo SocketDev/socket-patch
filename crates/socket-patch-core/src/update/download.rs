@@ -741,10 +741,7 @@ mod tests {
         let tmp = tempfile::tempdir().unwrap();
         let missing = tmp.path().join("never-existed");
         sweep_stale_stages(&missing);
-        assert!(
-            !missing.exists(),
-            "sweep must not create the destination dir"
-        );
+        assert!(!missing.exists(), "sweep must not create the destination dir");
     }
 
     /// A write failure AFTER a successful open (EFBIG here, standing in
@@ -760,7 +757,8 @@ mod tests {
     #[test]
     fn stage_write_failure_cleans_up_stage_file() {
         const CHILD_ENV: &str = "SOCKET_PATCH_CORE_TEST_STAGE_FSIZE_CHILD";
-        const TEST_NAME: &str = "update::download::tests::stage_write_failure_cleans_up_stage_file";
+        const TEST_NAME: &str =
+            "update::download::tests::stage_write_failure_cleans_up_stage_file";
         if std::env::var_os(CHILD_ENV).is_none() {
             let exe = std::env::current_exe().expect("test binary path must resolve");
             let output = std::process::Command::new(exe)
@@ -826,10 +824,7 @@ mod tests {
             matches!(err, UpdateError::SwapFailed(_)),
             "expected SwapFailed, got: {err}"
         );
-        assert!(
-            err.to_string().contains("error writing staged binary"),
-            "{err}"
-        );
+        assert!(err.to_string().contains("error writing staged binary"), "{err}");
         let leftovers: Vec<String> = std::fs::read_dir(tmp.path())
             .unwrap()
             .map(|e| e.unwrap().file_name().to_string_lossy().into_owned())
