@@ -2,8 +2,9 @@
 //! a workspace member reads the member's directory only, while the package
 //! manager installs from a lock in an ancestor directory. Hosted mode then
 //! either pins nothing and reports success (pnpm, #590; npm, yarn and Bun
-//! `package.json` workspaces, #884; vlt `vlt.json` workspaces, #942) or rewrites the member as a lockless
-//! project and breaks the workspace (cargo, #417).
+//! `package.json` workspaces, #884; vlt `vlt.json` workspaces, #942) or
+//! rewrites the member as a lockless project and breaks the workspace
+//! (cargo, #417).
 //!
 //! [`refusal`] spots these layouts before any takeover or write, so the run
 //! fails closed and names the directory to run from. It also refuses a
