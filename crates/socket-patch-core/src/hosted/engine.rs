@@ -507,6 +507,18 @@ pub async fn read_candidate_files(
                 }
             }
         }
+        // The root manifest's `patchedDependencies` names the packages the
+        // project patches itself with `bun patch`, which the bun rewriters
+        // must leave on their registry tuple (#367). Read beside either bun
+        // lock, advisory too: the member walk above reaches the root only
+        // through a `workspaces` section in bun's emitted shape.
+        if !out.files.contains_key("package.json")
+            && (out.files.contains_key("bun.lock") || super::vlt::bun_lockb_present(view))
+        {
+            if let Some(text) = read_advisory(view, unreadable, "package.json").await {
+                out.files.insert("package.json".to_string(), text);
+            }
+        }
     }
 
     // Beside a classic yarn.lock, the yarn configs decide whether an
@@ -1143,7 +1155,26 @@ pub async fn rewrite(
             .retain(|w| w.code != "redirect_npm_no_lockfile");
         match content {
             Ok(bytes) => {
-                crate::patch::redirect::rewrite_bun_binary(&bytes, &overrides, &mut rewrite)
+                // A package the project patches itself (`bun patch`) keeps
+                // its registry record, loudly (#367).
+                let user_patched = crate::vendor::bun_lock_text::patched_dependency_keys(
+                    files.get("package.json").map(String::as_str),
+                    None,
+                );
+                let binary_overrides: Vec<DepOverride> = overrides
+                    .iter()
+                    .filter(|o| {
+                        o.ecosystem != "npm"
+                            || !crate::patch::redirect::skip_bun_user_patched(
+                                &user_patched,
+                                &crate::patch::redirect::full_name(o),
+                                o,
+                                &mut rewrite,
+                            )
+                    })
+                    .cloned()
+                    .collect();
+                crate::patch::redirect::rewrite_bun_binary(&bytes, &binary_overrides, &mut rewrite)
             }
             Err(warning) => rewrite.warnings.push(warning),
         }
@@ -1633,7 +1664,8 @@ fn confirm(
             let uuid = c.dep.patch_uuid.as_str();
             // vlt decides before the binary-bun rule, so `bun.lockb` beside
             // a vlt-driven `vlt-lock.json` never confirms an npm purl.
-            if rewrite.refused_vlt_uuids.contains(uuid) {
+            if rewrite.refused_vlt_uuids.contains(uuid) || rewrite.refused_bun_uuids.contains(uuid)
+            {
                 return ProbeStep::Decided(false);
             }
             // An sbt build's Maven pins are confirmed by the sbt rewriter's
@@ -2272,6 +2304,153 @@ mod tests {
         std::fs::write(tmp.path().join("package.json"), OVERRIDING_MANIFEST).unwrap();
         let (_, done) = npm_rewrite(&ProjectView::Disk(tmp.path()), &BTreeSet::new()).await;
         assert!(redirected(&done), "{:?}", done.rewrite.warnings);
+    }
+
+    /// REGRESSION (#367), binary lock: a `bun.lockb`-only project's root
+    /// manifest is read for its `patchedDependencies`, and a package the
+    /// project patches itself with `bun patch` keeps its registry record,
+    /// loudly, and is never assumed patched by the in-run VEX.
+    #[tokio::test]
+    async fn issue_367_bun_lockb_keeps_a_user_patched_package_on_the_registry() {
+        use crate::patch::redirect::Integrity;
+        let fixture = std::path::Path::new(env!("CARGO_MANIFEST_DIR"))
+            .join("tests/fixtures/bun-lockb-bundled/both");
+        let candidates = vec![Candidate {
+            purl: "pkg:npm/is-number@7.0.0".into(),
+            dep: DepOverride {
+                ecosystem: "npm".into(),
+                name: "is-number".into(),
+                namespace: None,
+                version: "7.0.0".into(),
+                token: "tok".into(),
+                patch_uuid: "uuid".into(),
+                artifact_url: "https://patch.test/is-number-7.0.0.tgz".into(),
+                registry_override: None,
+                integrity: Integrity {
+                    sha512: Some(format!("sha512-{}==", "A".repeat(86))),
+                    ..Default::default()
+                },
+            },
+        }];
+        let manifest = r#"{"name":"p","version":"1.0.0","dependencies":{"@bh/bund":"1.0.0","is-number":"7.0.0"}}"#;
+        let patched_manifest = manifest.replacen(
+            "}}",
+            r#"},"patchedDependencies":{"is-number@7.0.0":"patches/is-number@7.0.0.patch"}}"#,
+            1,
+        );
+        for user_patched in [false, true] {
+            let tmp = tempfile::tempdir().unwrap();
+            std::fs::copy(fixture.join("bun.lockb"), tmp.path().join("bun.lockb")).unwrap();
+            std::fs::write(
+                tmp.path().join("package.json"),
+                if user_patched {
+                    &patched_manifest
+                } else {
+                    manifest
+                },
+            )
+            .unwrap();
+            let view = ProjectView::Disk(tmp.path());
+            let outer = OuterAllowRemote::default;
+            let options = RewriteOptions {
+                dry_run: false,
+                targets_pipenv_lock: false,
+                pipenv_major: None,
+                pipenv_unknown_detail: String::new(),
+                trust_lockfile_config: true,
+                npm_allow_remote_config: true,
+                npm_outer: &outer,
+                blocking: false,
+            };
+            let read = read_candidate_files(&view, &BTreeSet::new(), &candidates).await;
+            assert!(read.files.contains_key("package.json"));
+            let done = rewrite(
+                &view,
+                read,
+                &candidates,
+                BTreeMap::new(),
+                &BTreeSet::new(),
+                &[],
+                options,
+            )
+            .await;
+            let skipped = done
+                .rewrite
+                .warnings
+                .iter()
+                .find(|w| w.code == "redirect_bun_patched_dependency_skipped");
+            if user_patched {
+                assert!(
+                    !done.rewrite.binary_files.contains_key("bun.lockb"),
+                    "the user-patched record is left alone"
+                );
+                let skipped = skipped.expect("the skip is reported");
+                assert!(
+                    skipped.detail.contains("is-number@7.0.0"),
+                    "{}",
+                    skipped.detail
+                );
+                assert!(done.rewrite.bundled_skipped_uuids.contains("uuid"));
+            } else {
+                assert!(
+                    done.rewrite.binary_files.contains_key("bun.lockb"),
+                    "{:?}",
+                    done.rewrite.warnings
+                );
+                assert!(skipped.is_none(), "{:?}", done.rewrite.warnings);
+            }
+            assert!(!done.rewrite.files.contains_key("package.json"));
+        }
+    }
+
+    /// REGRESSION (#367), text lock: the root manifest is read beside a
+    /// `bun.lock` even when the lock has no `workspaces` section to reach it
+    /// through, and a package the project patches itself is never
+    /// confirmed, not even when a sibling `package-lock.json` takes the
+    /// hosted URL: Bun keeps installing the registry bytes.
+    #[tokio::test]
+    async fn issue_367_bun_lock_user_patched_package_is_never_confirmed() {
+        let bun_lock = "{\n  \"lockfileVersion\": 1,\n  \"packages\": {\n    \"left-pad\": \
+                        [\"left-pad@1.3.0\", \"\", {}, \"sha512-UPSTREAM==\"],\n  }\n}\n";
+        let npm_lock = r#"{
+  "name": "app",
+  "lockfileVersion": 3,
+  "requires": true,
+  "packages": {
+    "": { "name": "app", "dependencies": { "left-pad": "1.3.0" } },
+    "node_modules/left-pad": {
+      "version": "1.3.0",
+      "resolved": "https://registry.npmjs.org/left-pad/-/left-pad-1.3.0.tgz",
+      "integrity": "sha512-UPSTREAM=="
+    }
+  }
+}
+"#;
+        let manifest = r#"{"name":"app","dependencies":{"left-pad":"1.3.0"},"patchedDependencies":{"left-pad@1.3.0":"patches/left-pad@1.3.0.patch"}}"#;
+        // Without the sibling npm lock nothing else reads the manifest.
+        for with_npm_lock in [false, true] {
+            let tmp = tempfile::tempdir().unwrap();
+            std::fs::write(tmp.path().join("bun.lock"), bun_lock).unwrap();
+            if with_npm_lock {
+                std::fs::write(tmp.path().join("package-lock.json"), npm_lock).unwrap();
+            }
+            std::fs::write(tmp.path().join("package.json"), manifest).unwrap();
+            let (read, done) = npm_rewrite(&ProjectView::Disk(tmp.path()), &BTreeSet::new()).await;
+            assert!(read.files.contains_key("package.json"));
+            assert!(
+                !done.rewrite.files.contains_key("bun.lock"),
+                "the user-patched entry keeps its registry tuple"
+            );
+            assert!(
+                done.rewrite
+                    .warnings
+                    .iter()
+                    .any(|w| w.code == "redirect_bun_patched_dependency_skipped"),
+                "{:?}",
+                done.rewrite.warnings
+            );
+            assert!(done.confirmed.is_empty(), "{:?}", done.confirmed);
+        }
     }
 
     fn gem_candidate() -> Candidate {
