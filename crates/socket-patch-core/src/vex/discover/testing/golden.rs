@@ -123,6 +123,8 @@ fn render(out: &Discovery, root: &Path) -> Value {
         unpatched_copies,
         unattested,
         contested,
+        read: _,
+        withheld: _,
     } = out;
     let refs: Vec<Value> = refs
         .iter()

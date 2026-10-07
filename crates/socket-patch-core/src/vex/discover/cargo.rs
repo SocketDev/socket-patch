@@ -88,8 +88,9 @@
 //! `[patch] crates-io = { … }` forms). The path must be root-anchored
 //! ([`vendor_ref`]: a `../` or absolute spelling consumes some OTHER
 //! checkout's copy), the leaf a single `<name>-<version>` directory for the
-//! entry's crate. Same liveness truth source as
-//! `vendor::cargo::vendored_entry_in_use`: when a `Cargo.lock` parses, it
+//! entry's crate. The lock is the liveness truth source (the prune GC's
+//! in-use verdict, `Discovery::vendor_entry_in_use`, reads it from these
+//! refs): when a `Cargo.lock` parses, it
 //! must hold a SOURCELESS `[[package]]` for that name + version — an entry
 //! with a registry source (re-resolved, or a hosted takeover) or none at
 //! all means the copy is not what builds, and so does a
@@ -97,7 +98,7 @@
 //! a `[patch]` left out of the graph — e.g. by the user's path dependency,
 //! whose lock entry is sourceless too), so no ref ([`DIAG_REF_INVALID`]).
 //! No lock (first build pending) or an unparseable one (cargo refuses to
-//! build) keeps the ref, like `vendored_entry_in_use`. A manifest entry
+//! build) keeps the ref. A manifest entry
 //! cargo ignores is no ref ([`DIAG_REF_INVALID`]) either: cargo lets a
 //! project-config `[patch]` item with the same key replace it (unless that
 //! item wires the same path — the half-migrated shape, attested through the
@@ -738,24 +739,36 @@ async fn vendored_from_patches(
         }
         let copy_tagged = matches!(tag, CopyTag::Tagged(_) | CopyTag::Unreadable);
         if let Lock::Parsed(lock) = lock {
-            let why =
-                match lock.vendored_in_use(name, version, &vref.uuid, copy_tagged) {
-                    CopyClaim::Consumed => None,
-                    CopyClaim::OtherTag(other) => Some(format!(
-                        "{CARGO_LOCK} builds the copy tagged for patch {other} ({name} {})",
-                        cargo_tag::tag_version(version, other)
-                    )),
-                    CopyClaim::UntaggedOverride => Some(format!(
-                        "{CARGO_LOCK} builds an untagged {name} {version}, not the copy (which \
+            let claim = lock.vendored_in_use(name, version, &vref.uuid, copy_tagged);
+            let relock_pending =
+                matches!(claim, CopyClaim::OtherTag(_) | CopyClaim::UntaggedOverride);
+            let why = match claim {
+                CopyClaim::Consumed => None,
+                CopyClaim::OtherTag(other) => Some(format!(
+                    "{CARGO_LOCK} builds the copy tagged for patch {other} ({name} {})",
+                    cargo_tag::tag_version(version, other)
+                )),
+                CopyClaim::UntaggedOverride => Some(format!(
+                    "{CARGO_LOCK} builds an untagged {name} {version}, not the copy (which \
                      cargo would lock as {}): another [patch] or path dependency overrides it",
-                        cargo_tag::tag_version(version, &vref.uuid)
-                    )),
-                    CopyClaim::NotConsumed => Some(format!(
-                        "{CARGO_LOCK} does not build {name}@{version} from it (an unused patch, \
+                    cargo_tag::tag_version(version, &vref.uuid)
+                )),
+                CopyClaim::NotConsumed => Some(format!(
+                    "{CARGO_LOCK} does not build {name}@{version} from it (an unused patch, \
                      or the lock resolves it from a registry)"
-                    )),
-                };
+                )),
+            };
             if let Some(why) = why {
+                // The manifest still routes the crate to this copy and the
+                // lock entry is detached: only the lock's generation lags,
+                // and the next unlocked build consumes the copy.
+                if relock_pending {
+                    out.withheld.push(super::Recognized {
+                        uuid: vref.uuid.clone(),
+                        mode: super::WiringMode::Vendored,
+                        file: std::path::PathBuf::from(file),
+                    });
+                }
                 out.diag(
                     DIAG_REF_INVALID,
                     file,

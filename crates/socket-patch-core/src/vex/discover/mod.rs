@@ -481,6 +481,35 @@ pub struct Discovery {
     pub unattested: Vec<Unattested>,
     /// Refs dropped because another lock contests them ([`ContestedRef`]).
     pub contested: Vec<ContestedRef>,
+    /// Every file an extractor read through the guarded reads
+    /// ([`DiscoverCtx::read_text`] / [`DiscoverCtx::read_bytes`]), with the
+    /// ecosystem whose extractor read it — sorted, deduped. "No ref wires
+    /// this vendored entry" means "unused" only once discovery has read
+    /// that ecosystem's files ([`Discovery::vendor_entry_in_use`]).
+    pub read: Vec<ReadFile>,
+    /// Wiring a file still routes through a Socket patch that an extractor
+    /// WITHHOLDS as a ref because the build may not consume it: a ref another
+    /// entry or npm lock contests (npm's in-pair contest, a bundled copy),
+    /// or cargo vendored wiring whose lock builds another generation's copy
+    /// (a `[patch]` at this copy, the lock tagged for another uuid or
+    /// untagged — the next relock consumes it). Not attested, but still
+    /// wiring: the prune GC must keep such an entry
+    /// ([`Discovery::vendor_entry_in_use`]). Sorted, deduped.
+    pub withheld: Vec<Recognized>,
+}
+
+/// One file discovery's guarded reads touched ([`Discovery::read`]).
+#[derive(Debug, Clone, PartialEq, Eq, PartialOrd, Ord)]
+pub struct ReadFile {
+    /// The vendor ecosystem dir name (`npm`, `pypi`, `cargo`, `golang`,
+    /// `gem`, `composer`, `maven`, `nuget`) of the extractor that read it
+    /// ([`VendorEntry::ecosystem`]'s spelling).
+    pub ecosystem: &'static str,
+    /// Root-relative path.
+    pub file: PathBuf,
+    /// `false`: the file exists but could not be read
+    /// ([`DIAG_LOCKFILE_UNREADABLE`]).
+    pub readable: bool,
 }
 
 impl Discovery {
@@ -852,6 +881,10 @@ impl Discovery {
             .sort_by(|a, b| (&a.file, a.code, &a.detail).cmp(&(&b.file, b.code, &b.detail)));
         self.recognized.sort();
         self.recognized.dedup();
+        self.read.sort();
+        self.read.dedup();
+        self.withheld.sort();
+        self.withheld.dedup();
     }
 }
 
@@ -892,26 +925,38 @@ pub async fn discover_patched_refs_in(
     discover_with_ctx(ctx).await
 }
 
-async fn discover_with_ctx(ctx: DiscoverCtx<'_>) -> Discovery {
+async fn discover_with_ctx(mut ctx: DiscoverCtx<'_>) -> Discovery {
     let mut out = Discovery::default();
+    // Each extractor's reads are tagged with the vendor ecosystem it reads
+    // for ([`Discovery::read`]).
+    ctx.ecosystem = "npm";
     npm::extract(&ctx, &mut out).await;
     yarn::extract(&ctx, &mut out).await;
     bun::extract(&ctx, &mut out).await;
     vlt::extract(&ctx, &mut out).await;
+    ctx.ecosystem = "cargo";
     cargo::extract(&ctx, &mut out).await;
+    ctx.ecosystem = "golang";
     golang::extract(&ctx, &mut out).await;
+    ctx.ecosystem = "pypi";
     pypi_locks::extract(&ctx, &mut out).await;
     pypi_other::extract(&ctx, &mut out).await;
+    ctx.ecosystem = "gem";
     gem::extract(&ctx, &mut out).await;
+    ctx.ecosystem = "composer";
     composer::extract(&ctx, &mut out).await;
+    ctx.ecosystem = "maven";
     maven::extract(&ctx, &mut out).await;
     gradle::extract(&ctx, &mut out).await;
     sbt::extract(&ctx, &mut out).await;
+    ctx.ecosystem = "nuget";
     nuget::extract(&ctx, &mut out).await;
+    ctx.ecosystem = "deno";
     deno::extract(&ctx, &mut out).await;
     out.contest_within_locks();
     out.contest_across_locks();
     out.recognized.extend(ctx.take_recognized());
+    out.read.extend(ctx.take_read());
     out.finalize();
     out
 }
@@ -934,6 +979,11 @@ pub(crate) struct DiscoverCtx<'a> {
     /// scratch `Discovery` (a file parsed only to explain it) still counts.
     /// A `Mutex` keeps the ctx `Sync` across the extractors' `.await`s.
     recognized: Mutex<BTreeSet<Recognized>>,
+    /// The ecosystem the running extractor reads for (set by
+    /// [`discover_with_ctx`] between extractors), tagging [`Self::read`].
+    ecosystem: &'static str,
+    /// Every guarded read so far ([`Discovery::read`]).
+    read: Mutex<BTreeSet<ReadFile>>,
 }
 
 impl<'a> DiscoverCtx<'a> {
@@ -943,7 +993,30 @@ impl<'a> DiscoverCtx<'a> {
             view: crate::vendor::lock_inventory::ProjectView::Disk(root),
             patch_server_origins,
             recognized: Mutex::new(BTreeSet::new()),
+            ecosystem: "",
+            read: Mutex::new(BTreeSet::new()),
         }
+    }
+
+    /// Log a guarded read of `rel` ([`Discovery::read`]).
+    fn log_read(&self, rel: &str, readable: bool) {
+        self.read
+            .lock()
+            .unwrap_or_else(std::sync::PoisonError::into_inner)
+            .insert(ReadFile {
+                ecosystem: self.ecosystem,
+                file: PathBuf::from(rel),
+                readable,
+            });
+    }
+
+    /// Every guarded read so far, draining the log.
+    pub(crate) fn take_read(&self) -> Vec<ReadFile> {
+        let mut read = self
+            .read
+            .lock()
+            .unwrap_or_else(std::sync::PoisonError::into_inner);
+        std::mem::take(&mut *read).into_iter().collect()
     }
 
     /// Record every Socket identity `text` (the content of root-relative
@@ -1031,11 +1104,13 @@ impl<'a> DiscoverCtx<'a> {
     pub(crate) async fn read_text(&self, rel: &str, out: &mut Discovery) -> Option<String> {
         match self.view.read_text(rel).await {
             Ok(text) => {
+                self.log_read(rel, true);
                 self.recognize_text(rel, &text);
                 Some(text)
             }
             Err(e) if e.kind() == std::io::ErrorKind::NotFound => None,
             Err(e) => {
+                self.log_read(rel, false);
                 out.diag(
                     DIAG_LOCKFILE_UNREADABLE,
                     rel,
@@ -1067,11 +1142,13 @@ impl<'a> DiscoverCtx<'a> {
     pub(crate) async fn read_bytes(&self, rel: &str, out: &mut Discovery) -> Option<Vec<u8>> {
         match self.view.read_bytes(rel).await {
             Ok(bytes) => {
+                self.log_read(rel, true);
                 self.recognize_text(rel, &String::from_utf8_lossy(&bytes));
                 Some(bytes)
             }
             Err(e) if e.kind() == std::io::ErrorKind::NotFound => None,
             Err(e) => {
+                self.log_read(rel, false);
                 out.diag(
                     DIAG_LOCKFILE_UNREADABLE,
                     rel,
@@ -1718,6 +1795,61 @@ impl Discovery {
         vendored_wiring_live(root, &files, &entry.ecosystem, &entry.uuid).await
     }
 
+    /// Whether the project still CONSUMES a vendor-ledger entry's artifact —
+    /// the question the `scan --prune` GC reverts by and `scan`'s vendored
+    /// ledger supplement re-discovers by, answered from the same discovery
+    /// as [`Discovery::vendor_entry_live`] for every ecosystem:
+    ///
+    /// * `Some(true)` — the entry is live, or a lock wires it while another
+    ///   lock contests that wiring ([`Discovery::vendored_contest`]: still
+    ///   wired; `vendor --check` names both locks, reverting would not
+    ///   settle which one installs), or an extractor withheld its wiring
+    ///   ([`Discovery::withheld`]). A JVM entry: its tree is still
+    ///   referenced ([`crate::vendor::jvm::apply::entry_references`], which
+    ///   also answers `true` when a file cannot be read);
+    /// * `Some(false)` — discovery read a lockfile of this ecosystem
+    ///   ([`decides_install`]) and nothing wires the entry: the dependency
+    ///   left the lock, was re-resolved elsewhere, or the wiring survives
+    ///   only in a shape the package manager does not install from (rule
+    ///   11);
+    /// * `None` — cannot determine, so callers keep the entry: discovery
+    ///   read no lockfile of this ecosystem, or one of its files could not
+    ///   be read or parsed.
+    pub async fn vendor_entry_in_use(&self, root: &Path, entry: &VendorEntry) -> Option<bool> {
+        if crate::vendor::jvm::apply::is_jvm_entry(entry) {
+            return Some(crate::vendor::jvm::apply::entry_references(root, entry));
+        }
+        if self.vendor_entry_live(root, entry).await
+            || self
+                .vendored_contest(&entry.base_purl, &entry.uuid)
+                .is_some()
+        {
+            return Some(true);
+        }
+        if self
+            .withheld
+            .iter()
+            .any(|r| r.uuid == entry.uuid && r.mode == WiringMode::Vendored)
+        {
+            return Some(true);
+        }
+        let mut read_lock = false;
+        for read in self.read.iter().filter(|r| r.ecosystem == entry.ecosystem) {
+            // A file that could not be read or parsed — or whose tree could
+            // not be finished (an unreadable requirements include) — proves
+            // nothing absent.
+            let undecided = self.diagnostics.iter().any(|d| {
+                matches!(d.code, DIAG_LOCKFILE_UNREADABLE | DIAG_LOCKFILE_UNPARSEABLE)
+                    && d.file == read.file
+            });
+            if !read.readable || undecided {
+                return None;
+            }
+            read_lock |= decides_install(read.ecosystem, &read.file);
+        }
+        read_lock.then_some(false)
+    }
+
     /// Liveness of a REDIRECT-ledger record (`purl` resolves from patch
     /// `uuid`) — the ONE rule every reader of the redirect ledger applies
     /// (`vex`'s liveness gate, `scan`'s takeover classifier and its
@@ -1812,6 +1944,35 @@ impl Discovery {
         }
         hosted_wiring_in_files(root, &recorded, uuid).await
     }
+}
+
+/// Whether root-relative `file` is one of `ecosystem`'s lockfiles — what an
+/// install of that ecosystem resolves from: a [`ROOT`]-role row of the
+/// format registry by basename (`Cargo.lock`, `composer.lock`, `go.mod`,
+/// `requirements.txt`, …) or a Python lock (`uv.lock`, `pylock*.toml`,
+/// `*.py.lock`). NuGet and Maven have no lock row (the wiring config is
+/// what restores), so their [`PROBE`] rows count. A manifest alone
+/// (`Cargo.toml`, `pyproject.toml`) does not: with no lock, the next
+/// relock may still route through it, so it proves no entry unused
+/// ([`Discovery::vendor_entry_in_use`]).
+///
+/// [`ROOT`]: crate::formats::registry::ROOT
+/// [`PROBE`]: crate::formats::registry::PROBE
+fn decides_install(ecosystem: &str, file: &Path) -> bool {
+    use crate::formats::registry::{registry, PROBE, ROOT};
+    let Some(base) = file.file_name().and_then(|b| b.to_str()) else {
+        return false;
+    };
+    if ecosystem == "pypi" && crate::utils::python_lock::is_python_lock_name(base) {
+        return true;
+    }
+    let rows = || registry().iter().filter(|f| f.ecosystem == ecosystem);
+    let role = if rows().any(|f| f.has(ROOT)) {
+        ROOT
+    } else {
+        PROBE
+    };
+    rows().any(|f| f.has(role) && f.basename() == base)
 }
 
 /// The gem name of a `pkg:gem/<name>@<version>` purl (any qualifiers).

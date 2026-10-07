@@ -227,6 +227,12 @@ impl Bundled {
                 out.refs.push(r);
                 continue;
             };
+            // Still wiring, just not attested (`Discovery::withheld`).
+            out.withheld.push(super::Recognized {
+                uuid: r.uuid.clone(),
+                mode: r.mode,
+                file: r.source_file.clone(),
+            });
             out.diag(
                 DIAG_REF_UNATTRIBUTABLE,
                 file,
@@ -453,6 +459,12 @@ impl Unwired {
                 out.refs.push(r);
                 continue;
             };
+            // Still wiring, just not attested (`Discovery::withheld`).
+            out.withheld.push(super::Recognized {
+                uuid: r.uuid.clone(),
+                mode: r.mode,
+                file: r.source_file.clone(),
+            });
             out.diag(
                 DIAG_REF_UNATTRIBUTABLE,
                 file,
