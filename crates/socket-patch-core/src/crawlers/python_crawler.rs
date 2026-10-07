@@ -498,9 +498,7 @@ async fn pdm_project_setting(
     table: &str,
     key: &str,
 ) -> Option<toml_edit::Item> {
-    let home = var("HOME")
-        .or_else(|| var("USERPROFILE"))
-        .map(PathBuf::from);
+    let home = env_home(var);
     let files = [cwd.join(".pdm.toml"), cwd.join("pdm.toml")]
         .into_iter()
         .chain(pdm_user_config_files(home.as_deref(), var));
@@ -1316,9 +1314,7 @@ fn poetry_user_config_path(var: &impl Fn(&str) -> Option<String>) -> Option<Path
     if let Some(dir) = var("POETRY_CONFIG_DIR").filter(|v| !v.trim().is_empty()) {
         return Some(PathBuf::from(dir).join("config.toml"));
     }
-    let home = var("HOME")
-        .or_else(|| var("USERPROFILE"))
-        .map(PathBuf::from);
+    let home = env_home(var);
     let dir = if cfg!(windows) {
         var("APPDATA")
             .map(PathBuf::from)
@@ -1343,9 +1339,7 @@ fn poetry_user_config_path(var: &impl Fn(&str) -> Option<String>) -> Option<Path
 /// `$XDG_CACHE_HOME`/`~/.cache` + `/pypoetry` (other unix),
 /// `%LOCALAPPDATA%\pypoetry\Cache` (Windows).
 fn poetry_default_cache_dir(var: &impl Fn(&str) -> Option<String>) -> Option<PathBuf> {
-    let home = var("HOME")
-        .or_else(|| var("USERPROFILE"))
-        .map(PathBuf::from);
+    let home = env_home(var);
     if cfg!(windows) {
         Some(
             var("LOCALAPPDATA")
@@ -1685,9 +1679,7 @@ fn poetry_installer_data_dir(var: &impl Fn(&str) -> Option<String>) -> Option<Pa
     if let Some(home) = var("POETRY_HOME").filter(|v| !v.trim().is_empty()) {
         return Some(expand_home(&home, var));
     }
-    let home = var("HOME")
-        .or_else(|| var("USERPROFILE"))
-        .map(PathBuf::from);
+    let home = env_home(var);
     let base = if cfg!(windows) {
         var("APPDATA")
             .filter(|v| !v.trim().is_empty())
@@ -1706,16 +1698,24 @@ fn poetry_installer_data_dir(var: &impl Fn(&str) -> Option<String>) -> Option<Pa
 
 fn expand_home(raw: &str, var: &impl Fn(&str) -> Option<String>) -> PathBuf {
     if let Some(rest) = raw.strip_prefix("~/").or_else(|| raw.strip_prefix("~\\")) {
-        if let Some(home) = var("HOME").or_else(|| var("USERPROFILE")) {
-            return PathBuf::from(home).join(rest);
+        if let Some(home) = env_home(var) {
+            return home.join(rest);
         }
     }
     if raw == "~" {
-        if let Some(home) = var("HOME").or_else(|| var("USERPROFILE")) {
-            return PathBuf::from(home);
+        if let Some(home) = env_home(var) {
+            return home;
         }
     }
     PathBuf::from(raw)
+}
+
+/// `HOME`, then `USERPROFILE`, from an injected environment, under the
+/// shared rule ([`crate::utils::fs::home_from_env`]): an empty or relative
+/// value is no home, so the pdm/poetry probes never resolve against the
+/// working directory.
+fn env_home(var: &impl Fn(&str) -> Option<String>) -> Option<PathBuf> {
+    crate::utils::fs::home_from_env(|k| var(k).map(Into::into))
 }
 
 /// `site-packages` of every virtualenv Poetry created for the project at
@@ -2070,8 +2070,12 @@ fn pipenv_home_dir(var: &impl Fn(&str) -> Option<String>) -> Option<PathBuf> {
             })
             .or_else(|| var("HOME").and_then(non_empty))
             .map(PathBuf::from)
+            .filter(|h| crate::utils::fs::is_usable_home(h))
     } else {
-        var("HOME").and_then(non_empty).map(PathBuf::from)
+        var("HOME")
+            .and_then(non_empty)
+            .map(PathBuf::from)
+            .filter(|h| crate::utils::fs::is_usable_home(h))
     }
 }
 
@@ -3675,7 +3679,11 @@ mod tests {
         fake_venv(&tmp.path().join("uv-env"), "venv");
         let uv_env = env_of(&[(
             "UV_PROJECT_ENVIRONMENT",
-            tmp.path().join("uv-env").join("venv").to_string_lossy().into_owned(),
+            tmp.path()
+                .join("uv-env")
+                .join("venv")
+                .to_string_lossy()
+                .into_owned(),
         )]);
         assert_eq!(
             find_local_venv_site_packages_with(&project, &uv_env).await,
@@ -5879,6 +5887,30 @@ G=
             find_local_venv_site_packages_with(&project, &poetry_env(tmp.path(), &flag)).await,
             vec![dot_venv]
         );
+    }
+
+    /// B66: an empty or relative injected `HOME` is no home. It used to be
+    /// joined as-is, so the pdm/poetry config, cache and installer probes
+    /// read `./.config/pypoetry/…` (and the like) under the working
+    /// directory.
+    #[test]
+    fn injected_home_must_be_rooted() {
+        fn only_home(home: &'static str) -> impl Fn(&str) -> Option<String> {
+            move |k: &str| (k == "HOME").then(|| home.to_string())
+        }
+        for bad in ["", "rel", "~"] {
+            let var = only_home(bad);
+            assert_eq!(env_home(&var), None, "HOME={bad:?}");
+            assert_eq!(poetry_user_config_path(&var), None, "HOME={bad:?}");
+            assert_eq!(poetry_default_cache_dir(&var), None, "HOME={bad:?}");
+            assert_eq!(poetry_installer_data_dir(&var), None, "HOME={bad:?}");
+            assert_eq!(pipenv_home_dir(&var), None, "HOME={bad:?}");
+            assert_eq!(expand_home("~/x", &var), PathBuf::from("~/x"));
+        }
+        let abs = std::env::temp_dir();
+        let var = |k: &str| (k == "HOME").then(|| abs.to_string_lossy().into_owned());
+        assert_eq!(env_home(&var), Some(abs.clone()));
+        assert_eq!(expand_home("~/x", &var), abs.join("x"));
     }
 
     #[test]

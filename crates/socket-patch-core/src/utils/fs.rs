@@ -375,21 +375,39 @@ pub(crate) async fn entry_file_type(entry: &DirEntry) -> Option<std::fs::FileTyp
 }
 
 /// The user's home directory: `HOME`, then `USERPROFILE` (Windows), each
-/// only when set, non-empty and ABSOLUTE; otherwise `None`. A relative or
+/// only when set, non-empty and rooted (absolute; on Windows a
+/// current-drive `\Users\u` also counts); otherwise `None`. A relative or
 /// empty value (stripped CI/container/sudo environments, `env -i`) would
 /// turn every `home_dir().join(…)` probe into a CWD-relative path,
 /// pointing the crawlers at directories inside the user's project as if
-/// they were the per-user package roots (`~/.cargo`, `~/.m2`, `~/.nuget`,
-/// …), so a caller with no home probes nothing there.
+/// they were the per-user package roots (`~/.cargo`, `~/.nuget`, …), so a
+/// caller with no home probes nothing there.
 ///
-/// The one home resolver for the crawlers' well-known per-user roots,
-/// telemetry's home-dir redaction and the repository walk's home stop.
+/// The home resolver for the crawlers' well-known per-user roots and
+/// telemetry's home-dir redaction; [`home_from_env`] applies the same rule
+/// to an injected environment (the Maven `~/.m2` default and the Python
+/// crawler's pdm/poetry/pipenv seams). Readers that deliberately follow
+/// another tool's own rule keep theirs: the repository walk's home stop
+/// (git: `HOME` on Unix, `USERPROFILE` on Windows), Gradle's passwd-vs-
+/// `$HOME` check, npm's `.npmrc` resolution, the socket-cli config
+/// location and `update::state`'s cache-dir chain.
 pub(crate) fn home_dir() -> Option<PathBuf> {
+    home_from_env(|k| std::env::var_os(k))
+}
+
+/// [`home_dir`]'s rule over an injected environment lookup.
+pub(crate) fn home_from_env(var: impl Fn(&str) -> Option<std::ffi::OsString>) -> Option<PathBuf> {
     ["HOME", "USERPROFILE"]
         .into_iter()
-        .filter_map(std::env::var_os)
+        .filter_map(var)
         .map(PathBuf::from)
-        .find(|home| home.is_absolute())
+        .find(|home| is_usable_home(home))
+}
+
+/// Whether `home` may anchor per-user probes: not empty and not
+/// CWD-relative.
+pub(crate) fn is_usable_home(home: &Path) -> bool {
+    home.has_root()
 }
 
 /// Atomically commit `content` to `path` via stage + fsync + rename.
