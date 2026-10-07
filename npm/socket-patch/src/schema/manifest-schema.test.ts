@@ -122,6 +122,30 @@ describe('PatchManifestSchema', () => {
     assert.ok(!result.success, 'Invalid UUID should fail')
   })
 
+  it('should keep the legacy setup block on round-trip', () => {
+    const manifest = {
+      patches: {},
+      setup: { exclude: ['packages/legacy'], manual: ['pypi'] },
+    }
+    const result = PatchManifestSchema.safeParse(manifest)
+    assert.ok(result.success, 'A manifest with a setup block should parse')
+    assert.deepEqual(result.data.setup, manifest.setup)
+  })
+
+  it('should accept a setup block with either list omitted', () => {
+    const result = PatchManifestSchema.safeParse({ patches: {}, setup: {} })
+    assert.ok(result.success, 'An empty setup block should parse')
+    assert.deepEqual(result.data.setup, {})
+  })
+
+  it('should reject a malformed setup block', () => {
+    const result = PatchManifestSchema.safeParse({
+      patches: {},
+      setup: { exclude: 'packages/legacy' },
+    })
+    assert.ok(!result.success, 'setup.exclude must be a list')
+  })
+
   it('should reject non-object input', () => {
     assert.ok(!PatchManifestSchema.safeParse(null).success)
     assert.ok(!PatchManifestSchema.safeParse('string').success)

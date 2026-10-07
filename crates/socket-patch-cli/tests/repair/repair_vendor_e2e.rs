@@ -535,6 +535,106 @@ async fn repair_rebuilds_detached_entry_without_manifest() {
     assert_socket_dir_lean(tmp.path());
 }
 
+/// 7b. #832, #958: NuGet's vendored feed (`nuget.config`), Maven's vendored
+///     repository (`pom.xml`) and a Hatch environment (`hatch.toml`) wire a
+///     unit too. With the ledger gone, repair reports each one as
+///     `vendor_ledger_missing` instead of seeing no vendored traces at all.
+///     NuGet and Maven name the uuid dir itself, not a file inside it.
+#[tokio::test]
+async fn repair_reports_missing_ledger_for_nuget_maven_and_hatch_wiring() {
+    let mock = MockServer::start().await;
+    mount_patch_api(&mock).await;
+    let tmp = tempfile::tempdir().unwrap();
+    let nuget = "22222222-2222-4222-8222-222222222222";
+    let maven = "33333333-3333-4333-8333-333333333333";
+    let pypi = "44444444-4444-4444-8444-444444444444";
+    let wheel = "six-1.16.0-py2.py3-none-any.whl";
+    let files = [
+        (
+            "nuget.config".to_string(),
+            format!(
+                "<?xml version=\"1.0\" encoding=\"utf-8\"?>\n<configuration>\n  <packageSources>\n    \
+                 <add key=\"socket-patch-vendor\" value=\".socket/vendor/nuget/{nuget}\" />\n  \
+                 </packageSources>\n</configuration>\n"
+            ),
+        ),
+        (
+            "pom.xml".to_string(),
+            format!(
+                "<project>\n  <repositories>\n    <repository>\n      \
+                 <id>socket-patch-vendor-{maven}</id>\n      \
+                 <url>file://${{project.basedir}}/.socket/vendor/maven/{maven}</url>\n    \
+                 </repository>\n  </repositories>\n</project>\n"
+            ),
+        ),
+        (
+            "hatch.toml".to_string(),
+            format!(
+                "[envs.default]\ndependencies = [\n  \"six @ {{root:uri}}/.socket/vendor/pypi/{pypi}/{wheel}#sha256={}\",\n]\n",
+                "0".repeat(64)
+            ),
+        ),
+    ];
+    for (name, text) in &files {
+        std::fs::write(tmp.path().join(name), text).unwrap();
+    }
+    for (eco, uuid, leaf) in [
+        ("nuget", nuget, "x.nupkg"),
+        ("maven", maven, "x.pom"),
+        ("pypi", pypi, wheel),
+    ] {
+        let dir = tmp.path().join(format!(".socket/vendor/{eco}/{uuid}"));
+        std::fs::create_dir_all(&dir).unwrap();
+        std::fs::write(dir.join(leaf), b"artifact").unwrap();
+    }
+
+    let (code, stdout, stderr) = run_cli(tmp.path(), &mock.uri(), &["repair"]);
+    assert_eq!(code, 1, "stdout={stdout} stderr={stderr}");
+    let v = parse_env(&stdout);
+    let mut missing: Vec<(String, String, String)> = events_of(&v)
+        .into_iter()
+        .filter(|e| e["errorCode"] == "vendor_ledger_missing")
+        .map(|e| {
+            (
+                e["details"]["ecosystem"].as_str().unwrap_or("").to_string(),
+                e["uuid"].as_str().unwrap_or("").to_string(),
+                e["details"]["path"].as_str().unwrap_or("").to_string(),
+            )
+        })
+        .collect();
+    missing.sort();
+    assert_eq!(
+        missing,
+        vec![
+            (
+                "maven".to_string(),
+                maven.to_string(),
+                format!(".socket/vendor/maven/{maven}")
+            ),
+            (
+                "nuget".to_string(),
+                nuget.to_string(),
+                format!(".socket/vendor/nuget/{nuget}")
+            ),
+            (
+                "pypi".to_string(),
+                pypi.to_string(),
+                format!(
+                    ".socket/vendor/pypi/{pypi}/{wheel}#sha256={}",
+                    "0".repeat(64)
+                )
+            ),
+        ],
+        "envelope={v}"
+    );
+    for (name, text) in &files {
+        assert_eq!(
+            &std::fs::read_to_string(tmp.path().join(name)).unwrap(),
+            text
+        );
+    }
+}
+
 /// G6 for a manifest-free vendored project: after the run, `.socket/` holds
 /// exactly `vendor/` — no `apply.lock` outlives it, no blobs/diffs/packages
 /// are conjured by a repair that rebuilds from the ledger's embedded record.

@@ -5,9 +5,7 @@
 use std::path::Path;
 
 use crate::utils::digest::is_hex;
-use crate::vendor::yarn_berry_lock::{
-    berry_field, berry_metadata, parse_berry_locator, BerryLocator,
-};
+use crate::vendor::yarn_berry_lock::{berry_field, parse_berry_locator, BerryLocator};
 use crate::vendor::yarn_classic_lock::{
     self, classic_field, live_blocks, scan_blocks, split_berry_key_patterns, split_key_patterns,
     split_resolved_sha1, LockBlock,
@@ -79,9 +77,7 @@ pub(crate) struct BerryLock {
 /// discovery share (see [`classic_entries`]).
 pub(crate) fn berry_entries(text: &str) -> BerryLock {
     let blocks = scan_blocks(text);
-    let cache_key = berry_metadata(&blocks)
-        .and_then(|meta| berry_field(&meta.lines, "cacheKey"))
-        .map(str::to_string);
+    let cache_key = crate::formats::yarn::berry_gates::cache_key(text).map(str::to_string);
     let mut entries = yarn_entries(blocks, split_berry_key_patterns);
     entries.retain(|e| e.block.key != "__metadata");
     BerryLock { cache_key, entries }
