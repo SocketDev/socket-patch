@@ -956,9 +956,8 @@ jobs:
           # setup-node step, no version change.
           #
           # `npm_required` turns the npm suites' "npm not installed" soft-skip
-          # into a hard failure. Not on Windows: `Command::new("npm")` cannot
-          # resolve `npm.cmd` there, so that leg still skips (a known gap; see
-          # docs/testing/npm-compatibility.md).
+          # into a hard failure, on every OS: the suite resolves npm through
+          # PATHEXT, so Windows finds the `npm.cmd` shim instead of skipping.
           - os: ubuntu-latest
             suite: e2e_redirect_npm_build
             npm_required: '1'
@@ -967,6 +966,7 @@ jobs:
             npm_required: '1'
           - os: windows-latest
             suite: e2e_redirect_npm_build
+            npm_required: '1'
           - os: ubuntu-latest
             suite: e2e_redirect_rush_sim
           - os: macos-latest
@@ -1617,14 +1617,15 @@ jobs:
           SOCKET_PATCH_SBT_E2E_VERSION: ${{ matrix.sbt }}
           E2E_SUITE: ${{ matrix.suite }}
           E2E_TEST_FILTER: ${{ matrix.test_filter || '--ignored' }}
-          E2E_JVM_TOOL: ${{ matrix.jvm_tool }}
           E2E_ALLOW_EMPTY: ${{ matrix.allow_empty }}
         shell: bash
         # Runs from the package root with CARGO_MANIFEST_DIR set, as
         # `cargo test` would. `suite` may name several binaries; an
         # `allow_empty` row skips the ones whose test file has not landed.
-        # Every suite a Gradle leg runs must run at least one test (per
-        # suite, so one suite's tests never hide another's empty filter).
+        # Every suite a leg runs must run at least one test (per suite, so
+        # one suite's tests never hide another's empty filter): a renamed
+        # module, a dropped `#[ignore]` under the default `--ignored`
+        # selector or a stale `test_filter` would otherwise pass as 0/0.
         run: |
           set -uo pipefail
           exe=''
@@ -1644,8 +1645,8 @@ jobs:
               continue
             fi
             passed=$(sed -n 's/^test result: .* \([0-9][0-9]*\) passed;.*/\1/p' "$log" | head -n 1)
-            if [ "$E2E_JVM_TOOL" = gradle ] && [ "${passed:-0}" = 0 ]; then
-              echo "::error::$suite ran no test in this Gradle leg ($E2E_TEST_FILTER)"
+            if [ "${passed:-0}" = 0 ]; then
+              echo "::error::$suite ran no test in this leg (filter: $E2E_TEST_FILTER). Fix the row's suite or test_filter so it selects the tests it is meant to run."
               status=1
             fi
           done
