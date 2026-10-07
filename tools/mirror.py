@@ -23,7 +23,10 @@ LIMIT = 64000
 REPO = 'SocketDev/socket-patch'
 TOKEN = re.compile(r'\{\{([A-Z][A-Z0-9]*(?:[-,][A-Z][A-Z0-9]*)*)\}\}')
 ROW = re.compile(r'^\|\s*([A-Z][0-9]+)\s*\|')
-RENDERED_AT = re.compile(r'\d{4}-\d{2}-\d{2} \d{2}:\d{2} UTC \(ledger `[^`]+`\)')
+# The render time inside the {{UPDATED}} stamp. same() ignores only the time, so
+# a target is re-rendered whenever the ledger commit named in its stamp changes.
+RENDER_TIME = re.compile(r'\d{4}-\d{2}-\d{2} \d{2}:\d{2} UTC(?= \(ledger `)')
+ENTRY_MARKER = re.compile(r'<!-- arch-audit-entry: (\S+) -->')
 ORDER = ['fixed', 'already fixed', 'in PR', 'filed', 'decision pending', 'to verify',
          'rejected', 'handed off', 'other', 'missing']
 warnings = []
@@ -61,13 +64,21 @@ class Tree:
         return sorted(p for p in out.splitlines() if p.endswith('.md'))
 
 
+# Leading status tokens, longest first. A status cell starts with one of these
+# (`filed #595; tracking …`, `in PR #1008`, `fixed (#597); …`), so classify by
+# the start of the cell only: a substring match would read `filed #1; fixed
+# upstream` as fixed.
+STATUS_PREFIXES = [('already fixed', 'already fixed'), ('to verify', 'to verify'),
+                   ('handed off', 'handed off'), ('not a defect', 'rejected'),
+                   ('decision', 'decision pending'), ('decide', 'decision pending'),
+                   ('rejected', 'rejected'), ('in pr', 'in PR'), ('fixed', 'fixed'),
+                   ('filed', 'filed')]
+
+
 def classify(status):
-    s = status.lower()
-    for key, label in [('to verify', 'to verify'), ('already fixed', 'already fixed'),
-                       ('fixed', 'fixed'), ('in pr', 'in PR'), ('filed', 'filed'),
-                       ('decision', 'decision pending'), ('rejected', 'rejected'),
-                       ('not a defect', 'rejected'), ('handed off', 'handed off')]:
-        if key in s:
+    s = status.strip().lstrip('*_`').lower()
+    for prefix, label in STATUS_PREFIXES:
+        if s.startswith(prefix):
             return label
     return 'other'
 
@@ -168,9 +179,27 @@ def update(kind, node_id, body):
 
 
 def same(a, b):
-    # Ignore the render time, so a target is only edited when its content changed.
-    norm = lambda s: RENDERED_AT.sub('', s.replace('\r\n', '\n')).strip()
+    # Ignore the render time but not the ledger commit in the stamp: a target is
+    # edited when its content or the commit it was rendered from changed.
+    norm = lambda s: RENDER_TIME.sub('', s.replace('\r\n', '\n')).strip()
     return norm(a) == norm(b)
+
+
+def posted_entries(discussion_number):
+    """The entry paths already posted as discussion comments (by their marker)."""
+    owner, name = REPO.split('/')
+    q = ('query($o:String!,$n:String!,$d:Int!,$c:String){repository(owner:$o,name:$n){'
+         'discussion(number:$d){comments(first:100,after:$c){'
+         'pageInfo{hasNextPage endCursor} nodes{body}}}}}')
+    seen, cursor = set(), None
+    while True:
+        page = graphql(q, {'o': owner, 'n': name, 'd': discussion_number, 'c': cursor})
+        comments = page['repository']['discussion']['comments']
+        for node in comments['nodes']:
+            seen.update(ENTRY_MARKER.findall(node['body'] or ''))
+        if not comments['pageInfo']['hasNextPage']:
+            return seen
+        cursor = comments['pageInfo']['endCursor']
 
 
 def post_entries(ledger, before, after, dry_run):
@@ -179,7 +208,20 @@ def post_entries(ledger, before, after, dry_run):
     except subprocess.CalledProcessError:
         before = EMPTY_TREE
     out = git('diff', '--name-only', '--diff-filter=A', '-z', before, after, '--', 'entries/*/*.md')
-    for path in sorted(p for p in out.split('\0') if p):
+    paths = sorted(p for p in out.split('\0') if p)
+    if not paths:
+        return
+    # Overlapping runs (or a re-run) can see the same added entry: skip any
+    # entry whose marker is already on the discussion, so each posts once.
+    try:
+        already = posted_entries(ledger['discussion'])
+    except RuntimeError as e:
+        warnings.append(f'could not list posted entries, posting without the duplicate check: {e}')
+        already = set()
+    for path in paths:
+        if path in already:
+            print(f'{path}: already posted')
+            continue
         body = git('show', f'{after}:{path}').rstrip() + f'\n\n<!-- arch-audit-entry: {path} -->\n'
         if dry_run:
             print(f'would post {path}')
