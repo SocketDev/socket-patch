@@ -302,11 +302,17 @@ async fn package_json_workspace_refusal(root: &Path) -> Option<(PathBuf, Refusal
         if !workspaces_include(&patterns, &rel) {
             continue;
         }
-        let locks: Vec<&str> = WORKSPACE_ROOT_LOCKS
+        let mut locks: Vec<&str> = WORKSPACE_ROOT_LOCKS
             .iter()
             .copied()
             .filter(|name| ancestor.join(name).is_file())
             .collect();
+        // vlt falls back to `package.json` `workspaces` when the root's
+        // `vlt.json` declares none (Bugbot on #1073), so its lock there
+        // governs the member too.
+        if ancestor.join(VLT_LOCK).is_file() && !vlt_json_declares_workspaces(ancestor).await {
+            locks.push(VLT_LOCK);
+        }
         if locks.is_empty() {
             // Rush keeps its locks under common/config: the rewriters own
             // a run from the Rush root.
@@ -387,6 +393,18 @@ async fn vlt_workspace_refusal(root: &Path) -> Option<(PathBuf, Refusal)> {
         return Some((ancestor.to_path_buf(), refusal));
     }
     None
+}
+
+/// Whether `<dir>/vlt.json` has a `workspaces` field. vlt keys its
+/// precedence on the field: with it, `package.json` `workspaces` is
+/// ignored; without it (or without the file), vlt reads `package.json`.
+/// An unreadable or unparseable file counts as declaring none.
+async fn vlt_json_declares_workspaces(dir: &Path) -> bool {
+    read_regular_to_string(&dir.join(VLT_JSON))
+        .await
+        .ok()
+        .and_then(|text| vlt_workspace_patterns(&text))
+        .is_some()
 }
 
 /// The refusal of the nearer (deeper) of two governing roots.
@@ -1419,25 +1437,52 @@ mod tests {
         assert_eq!(code(&member, "npm").await, None);
     }
 
-    /// A `vlt-lock.json` at a `package.json` `workspaces` root governs no
-    /// member through that field (vlt reads only `vlt.json`), and a
-    /// `package-lock.json` at a `vlt.json` root governs none through
-    /// `vlt.json` (npm reads only `package.json`).
+    /// Bugbot on #1073: vlt falls back to `package.json` `workspaces` when
+    /// the root's `vlt.json` has no `workspaces` field, so its
+    /// `vlt-lock.json` there governs the member. With the field present,
+    /// vlt ignores `package.json` `workspaces`, and a `package-lock.json`
+    /// at a `vlt.json` root governs nothing through `vlt.json` (npm reads
+    /// only `package.json`).
     #[tokio::test]
-    async fn vlt_and_package_json_workspaces_need_their_own_lock() {
+    async fn vlt_reads_package_json_workspaces_only_without_vlt_json_ones() {
+        for vlt_json in [None, Some(r#"{"registries":{}}"#)] {
+            let tmp = tempfile::tempdir().unwrap();
+            write(
+                tmp.path(),
+                "package.json",
+                r#"{"private":true,"workspaces":["packages/{a,b}"]}"#,
+            );
+            if let Some(text) = vlt_json {
+                write(tmp.path(), VLT_JSON, text);
+            }
+            write(tmp.path(), VLT_LOCK, "{}");
+            write(tmp.path(), "packages/a/package.json", "{}");
+            let refusal = refusal(
+                &ProjectView::Disk(&tmp.path().join("packages/a")),
+                &[candidate("npm")],
+                true,
+            )
+            .await
+            .unwrap_or_else(|| panic!("{vlt_json:?}: member must be refused"));
+            assert_eq!(refusal.code, WORKSPACE_LOCKFILE_ELSEWHERE);
+            assert!(refusal.message.contains(VLT_LOCK), "{}", refusal.message);
+        }
+
+        // vlt.json's own `workspaces` field wins and does not list the member.
         let tmp = tempfile::tempdir().unwrap();
         write(
             tmp.path(),
             "package.json",
             r#"{"private":true,"workspaces":["packages/*"]}"#,
         );
+        write(tmp.path(), VLT_JSON, r#"{"workspaces":"tools/*"}"#);
         write(tmp.path(), VLT_LOCK, "{}");
         write(tmp.path(), "packages/a/package.json", "{}");
         assert_eq!(code(&tmp.path().join("packages/a"), "npm").await, None);
 
         let tmp = tempfile::tempdir().unwrap();
         write(tmp.path(), "package.json", r#"{"private":true}"#);
-        write(tmp.path(), "vlt.json", r#"{"workspaces":"packages/*"}"#);
+        write(tmp.path(), VLT_JSON, r#"{"workspaces":"packages/*"}"#);
         write(tmp.path(), "package-lock.json", "{}");
         write(tmp.path(), "packages/a/package.json", "{}");
         assert_eq!(code(&tmp.path().join("packages/a"), "npm").await, None);
