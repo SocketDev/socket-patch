@@ -1,13 +1,12 @@
-//! Staged, fail-closed file I/O shared by the hosted-redirect reverts — the
-//! per-purl takeover ([`super::takeover`]) and the whole-ledger replay
-//! ([`super::replay`]).
+//! Staged, fail-closed file I/O for the hosted → upstream restore
+//! ([`super::upstream`]).
 //!
-//! Both reverts resolve every inverse against a STAGED view of the project
-//! and let nothing reach disk until all of them have resolved, so a drift
-//! refusal leaves the project byte-identical. This module is that staging
-//! layer: FIFO-safe reads of untrusted project files, the staged view, and
-//! one flush with the same guards on both sides (a symlink or FIFO squatting
-//! a path refuses; every write is atomic and keeps the file's mode).
+//! The restore resolves every pin against a STAGED view of the project and
+//! lets nothing reach disk until all of them have resolved, so a refusal
+//! leaves the project byte-identical. This module is that staging layer:
+//! FIFO-safe reads of untrusted project files, the staged view, and one
+//! flush with the same guards on both sides (a symlink or FIFO squatting a
+//! path refuses; every write is atomic and keeps the file's mode).
 
 use std::collections::BTreeMap;
 use std::path::Path;
