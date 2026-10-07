@@ -1896,8 +1896,9 @@ async fn vendored_takeover(
     }
     // The takeover refusal (if any) for one candidate: bun gates every
     // npm purl, berry and vlt only their own vendored entries, Gradle each
-    // of its own purls, and a PyPI entry on the hosted rewriter's reach
-    // (`pypi_takeover_refusals` above). Berry also runs
+    // of its own purls, a pypi purl on a platform-tagged grant (#701), and a
+    // PyPI entry on the hosted rewriter's reach (`pypi_takeover_refusals`
+    // above). Berry also runs
     // the rewriter's per-dep grant gate (a grant without the berry cache
     // checksum is skipped by the rewriter, so reverting first would leave
     // the package in neither mode). A refused purl is never dispatched (see
@@ -1909,7 +1910,12 @@ async fn vendored_takeover(
             return gradle_takeover_refusals.get(&c.purl).cloned();
         }
         if c.purl.starts_with("pkg:pypi/") {
-            return entry.and_then(|_| pypi_takeover_refusals.get(&c.purl).cloned());
+            // A platform-tagged grant is never pinned (#701 / #932): keep
+            // the vendored patch rather than revert it to nothing.
+            return entry.and_then(|_| {
+                socket_patch_core::patch::redirect::pypi_platform_wheel_refusal(&c.dep)
+                    .or_else(|| pypi_takeover_refusals.get(&c.purl).cloned())
+            });
         }
         if !c.purl.starts_with("pkg:npm/") {
             return None;

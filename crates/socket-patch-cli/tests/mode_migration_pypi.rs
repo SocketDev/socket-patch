@@ -143,10 +143,19 @@ fn run_raw(root: &Path, args: &[&str], extra: &[(&str, &str)]) -> (i32, String, 
 /// rewriters) — or, with `wheel_served: false`, a 404 for it. Returns the
 /// hosted URL.
 async fn mount_hosted_api(server: &MockServer, wheel_served: bool) -> String {
+    mount_hosted_api_serving(server, wheel_served, WHEEL).await
+}
+
+/// [`mount_hosted_api`] with the grant naming the wheel file `wheel_name`.
+async fn mount_hosted_api_serving(
+    server: &MockServer,
+    wheel_served: bool,
+    wheel_name: &str,
+) -> String {
     let wheel = hosted_wheel();
     let sha = hex::encode(Sha256::digest(&wheel));
     let route =
-        format!("/patch/pypi/six/1.16.0/33333333-3333-4333-8333-333333333333/{UUID}/{WHEEL}");
+        format!("/patch/pypi/six/1.16.0/33333333-3333-4333-8333-333333333333/{UUID}/{wheel_name}");
     let hosted_url = format!("{}{route}", server.uri());
     Mock::given(method("POST"))
         .and(path(format!("/v0/orgs/{ORG}/patches/batch")))
@@ -958,13 +967,24 @@ async fn assert_unreachable_takeover_refused(root: &Path, wired: &str, dry_run: 
 /// and every wiring file in `files`, the ledger entry and the vendored
 /// wheel are kept byte for byte.
 async fn assert_takeover_refused(root: &Path, files: &[&str], code_name: &str, dry_run: bool) {
+    assert_takeover_refused_serving(root, files, code_name, dry_run, WHEEL).await;
+}
+
+/// [`assert_takeover_refused`] with the hosted API granting `wheel_name`.
+async fn assert_takeover_refused_serving(
+    root: &Path,
+    files: &[&str],
+    code_name: &str,
+    dry_run: bool,
+    wheel_name: &str,
+) {
     let before: Vec<String> = files
         .iter()
         .map(|f| std::fs::read_to_string(root.join(f)).unwrap())
         .collect();
     let state = root.join(".socket/vendor/state.json");
     let server = MockServer::start().await;
-    mount_hosted_api(&server, true).await;
+    mount_hosted_api_serving(&server, true, wheel_name).await;
     let uri = server.uri();
     let mut args = hosted_scan_args(&uri);
     if dry_run {
@@ -1264,4 +1284,26 @@ async fn dry_run_predicts_poetry_0_lock_takeover_refusal() {
         true,
     )
     .await;
+}
+
+/// #701 / #932: a hosted grant that is a platform-tagged wheel is never
+/// pinned, so a vendored → hosted takeover onto it must be refused BEFORE
+/// the revert (keeping the vendored patch) instead of stranding the
+/// package unpatched — on the dry run too.
+#[tokio::test]
+async fn platform_wheel_takeover_is_refused_before_revert() {
+    const PLATFORM: &str = "six-1.16.0-cp311-cp311-manylinux_2_17_x86_64.whl";
+    for dry_run in [true, false] {
+        let (_tmp, root) = project();
+        let files = stage_requirements(&root);
+        vendor_project(&root, files);
+        assert_takeover_refused_serving(
+            &root,
+            &["requirements.txt"],
+            "redirect_pypi_platform_wheel",
+            dry_run,
+            PLATFORM,
+        )
+        .await;
+    }
 }
