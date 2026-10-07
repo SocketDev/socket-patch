@@ -68,39 +68,25 @@ jobs:
           retention-days: 7
 
   install-proof:
+    # One job per Node runtime; each walks its pnpm versions in turn. A leg
+    # does ~20 s of work, so 25 single-version jobs spent most of their time
+    # (and runner slots) on setup, and any one leg left waiting for a runner
+    # failed the whole run. Every version still runs; a failure names it.
+    name: install-proof (node ${{ matrix.node }})
     needs: build
     runs-on: ubuntu-latest
-    timeout-minutes: 15
+    timeout-minutes: 30
     strategy:
       fail-fast: false
       matrix:
         include:
           # 1.0.0 must explicitly refuse its non-durable shrinkwrap format.
-          - {pnpm: '1.0.0', node: '10.24.1'}
-          - {pnpm: '1.43.1', node: '10.24.1'}
-          - {pnpm: '2.0.0', node: '10.24.1'}
-          - {pnpm: '2.25.7', node: '10.24.1'}
-          - {pnpm: '3.0.0', node: '10.24.1'}
-          - {pnpm: '3.8.1', node: '10.24.1'}
-          - {pnpm: '4.0.0', node: '16.20.2'}
-          - {pnpm: '4.14.4', node: '16.20.2'}
-          - {pnpm: '5.0.0', node: '16.20.2'}
-          - {pnpm: '5.18.11', node: '16.20.2'}
-          - {pnpm: '6.0.0', node: '16.20.2'}
-          - {pnpm: '6.35.1', node: '16.20.2'}
-          - {pnpm: '7.0.0', node: '16.20.2'}
-          - {pnpm: '7.33.7', node: '16.20.2'}
-          - {pnpm: '8.0.0', node: '16.20.2'}
-          - {pnpm: '8.15.9', node: '16.20.2'}
-          - {pnpm: '9.0.0', node: '24.11.1'}
-          - {pnpm: '9.15.9', node: '24.11.1'}
-          - {pnpm: '10.0.0', node: '24.11.1'}
-          - {pnpm: '10.33.0', node: '24.11.1'}
-          - {pnpm: '10.34.5', node: '24.11.1'}
-          - {pnpm: '11.0.0', node: '24.11.1'}
-          - {pnpm: '11.27.0', node: '24.11.1'}
-          - {pnpm: '12.0.0', node: '24.11.1'}
-          - {pnpm: '12.4.2', node: '24.11.1'}
+          - node: '10.24.1'
+            pnpm: 1.0.0 1.43.1 2.0.0 2.25.7 3.0.0 3.8.1
+          - node: '16.20.2'
+            pnpm: 4.0.0 4.14.4 5.0.0 5.18.11 6.0.0 6.35.1 7.0.0 7.33.7 8.0.0 8.15.9
+          - node: '24.11.1'
+            pnpm: 9.0.0 9.15.9 10.0.0 10.33.0 10.34.5 11.0.0 11.27.0 12.0.0 12.4.2
     steps:
       - uses: actions/download-artifact@d3f86a106a0bac45b974a628896c90dbdf5c8093 # v4
         with:
@@ -110,34 +96,50 @@ jobs:
       - uses: actions/setup-node@49933ea5288caeca8642d1e84afbd3f7d6820020 # v4
         with:
           node-version: '24.11.1'
-      - name: Install the pinned package manager
+      - name: Install the pinned package managers
         env:
-          PNPM_TEST_VERSION: ${{ matrix.pnpm }}
+          PNPM_TEST_VERSIONS: ${{ matrix.pnpm }}
         run: |
-          npm install --prefix "$RUNNER_TEMP/pnpm-tool" --no-audit --no-fund "pnpm@$PNPM_TEST_VERSION"
-          echo "SOCKET_PATCH_PNPM_E2E_BIN=$RUNNER_TEMP/pnpm-tool/node_modules/.bin/pnpm" >> "$GITHUB_ENV"
+          for v in $PNPM_TEST_VERSIONS; do
+            npm install --prefix "$RUNNER_TEMP/pnpm-$v" --no-audit --no-fund "pnpm@$v"
+          done
       - uses: actions/setup-node@49933ea5288caeca8642d1e84afbd3f7d6820020 # v4
         with:
           node-version: ${{ matrix.node }}
-      - name: Require installation, verified VEX, rollback and integrity rejection
+      # Per version: installation, verified VEX, rollback and integrity
+      # rejection, then the vendored lifecycle and manifest-less VEX (pnpm
+      # >= 9: full vendored capstone; 7-8: the legacy lifecycle; 1-6:
+      # vendoring refused, nothing attested). Each version gets its own
+      # TMPDIR, so the suites' shared cache sandbox (cache_env::cache_root)
+      # and fixtures start as empty as on a fresh runner.
+      - name: Require every pinned pnpm to install, verify, roll back and vendor
         env:
-          SOCKET_PATCH_PNPM_E2E_VERSION: ${{ matrix.pnpm }}
+          PNPM_TEST_VERSIONS: ${{ matrix.pnpm }}
           SOCKET_PATCH_PNPM_E2E_REQUIRED: '1'
           SOCKET_NO_CONFIG: '1'
           SOCKET_NO_UPDATE_CHECK: '1'
         run: |
-          chmod +x bin/socket-patch bin/pnpm-e2e
+          chmod +x bin/socket-patch bin/pnpm-e2e bin/pnpm-vendor-e2e
           export SOCKET_PATCH_PNPM_E2E_SOCKET_BIN="$PWD/bin/socket-patch"
-          bin/pnpm-e2e pnpm_pinned_matrix --ignored --nocapture
-      - name: Require vendored lifecycle and manifest-less VEX
-        # pnpm >= 9: full vendored capstone (vendor + get --mode vendored);
-        # 7-8: the legacy lifecycle; 1-6: vendoring refused, nothing attested.
-        env:
-          SOCKET_PATCH_PNPM_E2E_VERSION: ${{ matrix.pnpm }}
-          SOCKET_PATCH_PNPM_E2E_REQUIRED: '1'
-          SOCKET_NO_CONFIG: '1'
-          SOCKET_NO_UPDATE_CHECK: '1'
-        run: |
-          chmod +x bin/socket-patch bin/pnpm-vendor-e2e
-          export SOCKET_PATCH_PNPM_E2E_SOCKET_BIN="$PWD/bin/socket-patch"
-          bin/pnpm-vendor-e2e pnpm_pinned_matrix --ignored --nocapture
+          failed=()
+          for v in $PNPM_TEST_VERSIONS; do
+            echo "::group::pnpm $v"
+            if (
+              export SOCKET_PATCH_PNPM_E2E_VERSION="$v"
+              export SOCKET_PATCH_PNPM_E2E_BIN="$RUNNER_TEMP/pnpm-$v/node_modules/.bin/pnpm"
+              export TMPDIR="$RUNNER_TEMP/tmp-$v"
+              mkdir -p "$TMPDIR" &&
+                bin/pnpm-e2e pnpm_pinned_matrix --ignored --nocapture &&
+                bin/pnpm-vendor-e2e pnpm_pinned_matrix --ignored --nocapture
+            ); then
+              echo "::endgroup::"
+            else
+              echo "::endgroup::"
+              echo "::error title=pnpm $v::pnpm $v install-proof failed (expand its log group)"
+              failed+=("$v")
+            fi
+          done
+          if [ "${#failed[@]}" -ne 0 ]; then
+            echo "Failed pnpm versions: ${failed[*]}"
+            exit 1
+          fi
