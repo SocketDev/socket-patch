@@ -4895,10 +4895,12 @@ fn rewrite_bun_lock(
             // reads the entry's spec (#469), so a rewrite here would count
             // as redirected (and VEX-attest the patch) while the unpatched
             // bundled bytes keep installing. Mirrors npm's `inBundle` guard.
-            if is_bundled_entry(entry)
-                && (spec == target_spec
-                    || spec == url_spec
-                    || is_prior_hosted_bun_spec(&spec, &fname, &dep.artifact_url))
+            // The spec compare runs first: the bundled check JSON-parses the
+            // meta, which per dep × entry doubled bun/hosted wall (#578).
+            if (spec == target_spec
+                || spec == url_spec
+                || is_prior_hosted_bun_spec(&spec, &fname, &dep.artifact_url))
+                && is_bundled_entry(entry)
             {
                 matched_any = true;
                 result.bundled_skipped_uuids.insert(dep.patch_uuid.clone());
@@ -10615,6 +10617,69 @@ mod tests {
             r.warnings.len(),
             1,
             "the sha512 refusal must not double-warn entry-not-found"
+        );
+    }
+
+    /// REGRESSION (#578): the bundled-copy check JSON-parses an entry's meta,
+    /// so running it before the spec compare cost one parse per dep × entry
+    /// (bun/hosted wall +110%). Only an entry whose spec matches the dep may
+    /// pay it, and the bundled copy must still be skipped and reported.
+    #[test]
+    fn bun_lock_bundled_check_runs_only_on_matching_entries() {
+        use crate::vendor::bun_lock_text::BUNDLED_CHECKS;
+
+        const ENTRIES: usize = 200;
+        const DEPS: usize = 20;
+        let sha512 = format!("sha512-{}==", "A".repeat(86));
+        let mut body: Vec<String> = (0..ENTRIES)
+            .map(|i| format!("\"pkg{i}\": [\"pkg{i}@1.0.0\", \"\", {{}}, \"sha512-OLD==\"],"))
+            .collect();
+        body.push(
+            "\"parent/pkg0\": [\"pkg0@1.0.0\", \"\", { \"bundled\": true }, \"sha512-OLD==\"],"
+                .into(),
+        );
+        let mut files = BTreeMap::new();
+        files.insert(
+            "bun.lock".to_string(),
+            bun_lock_file(&body.join("\n    "), 1),
+        );
+        let overrides: Vec<DepOverride> = (0..DEPS)
+            .map(|i| {
+                npm_override(
+                    &format!("pkg{i}"),
+                    "1.0.0",
+                    &format!("http://p.test/pkg{i}.tgz"),
+                    &sha512,
+                )
+            })
+            .collect();
+
+        BUNDLED_CHECKS.with(|checks| checks.set(0));
+        let mut r = RewriteResult::default();
+        rewrite_bun_lock(&files, &overrides, &mut r);
+        let checks = BUNDLED_CHECKS.with(std::cell::Cell::get);
+
+        let out = r.files.get("bun.lock").expect("matching deps are rewired");
+        for i in 0..DEPS {
+            assert!(out.contains(&format!("http://p.test/pkg{i}.tgz")), "{out}");
+        }
+        assert!(
+            out.contains("\"parent/pkg0\": [\"pkg0@1.0.0\", \"\", { \"bundled\": true }"),
+            "the bundled copy is never rewired: {out}"
+        );
+        assert!(
+            r.warnings
+                .iter()
+                .any(|w| w.code == "redirect_bun_bundled_instance_skipped"),
+            "{:?}",
+            r.warnings
+        );
+        // One check per spec-matching entry (DEPS registry tuples + the
+        // bundled copy), not DEPS × (ENTRIES + 1).
+        assert!(
+            checks <= DEPS + 1,
+            "{checks} bundled checks for {DEPS} deps over {} entries",
+            ENTRIES + 1
         );
     }
 

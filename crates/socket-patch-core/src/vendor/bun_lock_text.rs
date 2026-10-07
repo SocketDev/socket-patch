@@ -217,6 +217,14 @@ pub(crate) fn has_workspace_packages(entries: &[BunEntry]) -> bool {
     })
 }
 
+#[cfg(test)]
+thread_local! {
+    /// [`is_bundled_entry`] calls this thread made. Each one JSON-parses the
+    /// entry's meta, so a rewrite loop over N deps × M entries must check the
+    /// cheap spec match first and pay it only for matching entries (#578).
+    pub(crate) static BUNDLED_CHECKS: std::cell::Cell<usize> = const { std::cell::Cell::new(0) };
+}
+
 /// True when `entry` is a `bundleDependencies` copy: bun records it as its
 /// own `parent/child` entry whose `{meta}` object carries `"bundled": true`,
 /// and unpacks it from the PARENT's tarball without ever reading the
@@ -226,6 +234,8 @@ pub(crate) fn has_workspace_packages(entries: &[BunEntry]) -> bool {
 /// tarball tuple). A meta that does not parse as JSON but mentions
 /// `"bundled"` counts as bundled: fail closed, never rewire or attest it.
 pub(crate) fn is_bundled_entry(entry: &BunEntry) -> bool {
+    #[cfg(test)]
+    BUNDLED_CHECKS.with(|checks| checks.set(checks.get() + 1));
     let Some(meta) = entry.elems.iter().skip(1).find(|e| e.starts_with('{')) else {
         return false;
     };

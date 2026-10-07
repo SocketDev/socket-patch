@@ -1083,17 +1083,15 @@ enum TupleShape {
 
 /// [`classify`] for the instances vendoring may rewrite: a bundled entry
 /// ([`is_bundled_entry`]) is unpacked from its parent's tarball and never
-/// read, so it is no rewrite target whatever its spec says (#469).
+/// read, so it is no rewrite target whatever its spec says (#469). The
+/// bundled check JSON-parses the meta, so it runs only on a match (#578).
 fn classify_rewritable(
     entry: &BunEntry,
     target_spec: &str,
     name: &str,
     target_leaf: &str,
 ) -> Option<TupleShape> {
-    if is_bundled_entry(entry) {
-        return None;
-    }
-    classify(entry, target_spec, name, target_leaf)
+    classify(entry, target_spec, name, target_leaf).filter(|_| !is_bundled_entry(entry))
 }
 
 /// Keys of the bundled entries that resolve the target `name@version`.
@@ -1105,7 +1103,7 @@ fn bundled_matches(
 ) -> Vec<String> {
     entries
         .iter()
-        .filter(|e| is_bundled_entry(e) && classify(e, target_spec, name, target_leaf).is_some())
+        .filter(|e| classify(e, target_spec, name, target_leaf).is_some() && is_bundled_entry(e))
         .map(|e| e.key.clone())
         .collect()
 }
@@ -4337,5 +4335,48 @@ mod tests {
         let (planned, looped) = preflight_then_vendor(&fx).await;
         assert_eq!(looped, Err("vendor_lockfile_missing"));
         assert_eq!(planned, looped);
+    }
+
+    /// REGRESSION (#578): the vendor twin of the hosted hot loop. Every
+    /// per-target scan (`classify_rewritable`, `bundled_matches`) ran the
+    /// JSON-parsing bundled check on EVERY entry before the cheap spec
+    /// match; it may run only on the entries that resolve the target.
+    #[test]
+    fn bundled_check_runs_only_on_matching_entries() {
+        use crate::vendor::bun_lock_text::BUNDLED_CHECKS;
+
+        const ENTRIES: usize = 200;
+        let mut entries: Vec<BunEntry> = (0..ENTRIES)
+            .map(|i| {
+                parse_entry_line(&format!(
+                    "\"pkg{i}\": [\"pkg{i}@1.0.0\", \"\", {{}}, \"sha512-OLD==\"],"
+                ))
+                .unwrap()
+            })
+            .collect();
+        entries.push(
+            parse_entry_line(
+                "\"parent/pkg0\": [\"pkg0@1.0.0\", \"\", { \"bundled\": true }, \"sha512-OLD==\"],",
+            )
+            .unwrap(),
+        );
+
+        BUNDLED_CHECKS.with(|checks| checks.set(0));
+        let (spec, leaf) = ("pkg0@1.0.0", tgz_rel_leaf("pkg0", "1.0.0"));
+        let rewritable = entries
+            .iter()
+            .filter(|e| classify_rewritable(e, spec, "pkg0", &leaf).is_some())
+            .count();
+        let bundled = bundled_matches(&entries, spec, "pkg0", &leaf);
+        let checks = BUNDLED_CHECKS.with(std::cell::Cell::get);
+
+        assert_eq!(rewritable, 1, "only the registry tuple is rewritable");
+        assert_eq!(bundled, vec!["parent/pkg0".to_string()]);
+        // Two matching entries, two scans: at most four checks, not 2 × 201.
+        assert!(
+            checks <= 4,
+            "{checks} bundled checks over {} entries",
+            ENTRIES + 1
+        );
     }
 }
