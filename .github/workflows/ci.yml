@@ -800,6 +800,19 @@ jobs:
       - name: Run npm dispatch tests
         run: node --test npm/socket-patch/bin/socket-patch.test.mjs
 
+      - name: Run npm schema tests
+        # The `./schema` export's zod tests. `npm install --no-save`, not
+        # `npm ci`, for the reason publish-npm.yml gives (a version-synced
+        # lock can name platform packages not yet on the registry); the
+        # platform binaries are optional and not needed here. The pack
+        # test runs again once `npm test` has built dist/, so it also
+        # checks that the compiled schema ships.
+        working-directory: npm/socket-patch
+        run: |
+          npm install --no-save --ignore-scripts --no-audit --no-fund --omit=optional
+          npm test
+          node --test --test-name-pattern="npm package contents" bin/socket-patch.test.mjs
+
   # Compiles the CLI and every CLI test target once per OS (--all-features,
   # so this is also the feature-gated suites' compile-rot check) and uploads
   # the binaries the e2e, e2e-full and cargo-vex legs run. The legs run the

@@ -108,7 +108,9 @@ pub fn normalize_purl(purl: &str) -> Cow<'_, str> {
 /// Purl equality up to percent-encoding of the base components
 /// (`pkg:npm/%40scope/x@1` ≡ `pkg:npm/@scope/x@1`) and, for composer, up to
 /// the version spelling of one release (`@3.0.2` ≡ `@v3.0.2` ≡ `@3.0.2.0`,
-/// name case-insensitive; see [`crate::utils::composer_version`]).
+/// name case-insensitive; see [`crate::utils::composer_version`]) and, for
+/// pypi, up to the PEP 503 spelling of the name (`typing_extensions` ≡
+/// `Typing-Extensions` ≡ `typing-extensions`).
 /// Qualifiers and subpath must still match exactly.
 pub fn purl_eq(a: &str, b: &str) -> bool {
     let (a, b) = (normalize_purl(a), normalize_purl(b));
@@ -119,7 +121,23 @@ pub fn purl_eq(a: &str, b: &str) -> bool {
     let (base_a, suffix_a) = a.split_at(split(&a));
     let (base_b, suffix_b) = b.split_at(split(&b));
     suffix_a == suffix_b
-        && crate::utils::composer_version::composer_bases_equivalent(base_a, base_b)
+        && (crate::utils::composer_version::composer_bases_equivalent(base_a, base_b)
+            || pypi_bases_equivalent(base_a, base_b))
+}
+
+/// Whether two decoded `pkg:pypi/<name>@<version>` bases name the same
+/// release once both names are in PEP 503 canonical form. `false` unless
+/// both are pypi bases.
+fn pypi_bases_equivalent(a: &str, b: &str) -> bool {
+    fn canonical(base: &str) -> Option<String> {
+        let rest = base.strip_prefix("pkg:pypi/")?;
+        let (name, version) = match rest.rfind('@').filter(|&i| i > 0) {
+            Some(at) => rest.split_at(at),
+            None => (rest, ""),
+        };
+        Some(format!("{}{version}", canonicalize_pypi_name(name)))
+    }
+    matches!((canonical(a), canonical(b)), (Some(x), Some(y)) if x == y)
 }
 
 /// Extract the value of a single PURL qualifier (`?key=value&…`), if present.
@@ -1277,6 +1295,55 @@ mod tests {
         assert!(!purl_matches_identifier(
             "pkg:npm/%40scope/x@1.0.0",
             "pkg:npm/@scope/y@1.0.0"
+        ));
+    }
+
+    #[test]
+    fn test_purl_matches_identifier_pypi_pep503_spellings() {
+        // #1024: patch keys are PEP 503 canonical, but users type the
+        // name as the project declares it. Every spelling must select the
+        // patch, for base and qualified identifiers alike.
+        let key = "pkg:pypi/typing-extensions@4.7.1";
+        let qualified = "pkg:pypi/typing-extensions@4.7.1?artifact_id=abc";
+        for spelling in [
+            "pkg:pypi/typing_extensions@4.7.1",
+            "pkg:pypi/Typing-Extensions@4.7.1",
+            "pkg:pypi/typing.extensions@4.7.1",
+            "pkg:pypi/Typing__Extensions@4.7.1",
+            "pkg:pypi/typing%5Fextensions@4.7.1",
+        ] {
+            assert!(purl_eq(key, spelling), "{spelling}");
+            assert!(purl_eq(spelling, key), "{spelling}");
+            assert!(purl_matches_identifier(key, spelling), "{spelling}");
+            assert!(purl_matches_identifier(qualified, spelling), "{spelling}");
+            assert!(
+                purl_matches_identifier(qualified, &format!("{spelling}?artifact_id=abc")),
+                "{spelling}"
+            );
+            assert!(
+                crate::utils::target::Target::parse(spelling).matches_patch(key, "u"),
+                "{spelling}"
+            );
+        }
+        assert!(purl_matches_identifier(
+            "pkg:pypi/jinja2@3.1.2",
+            "pkg:pypi/Jinja2@3.1.2"
+        ));
+        assert!(purl_matches_identifier(
+            "pkg:pypi/ruamel-yaml@0.17.21",
+            "pkg:pypi/ruamel.yaml@0.17.21"
+        ));
+        // Still distinct: another version, another qualifier, another name,
+        // and the same name under another ecosystem.
+        assert!(!purl_eq(key, "pkg:pypi/typing_extensions@4.7.2"));
+        assert!(!purl_matches_identifier(
+            qualified,
+            "pkg:pypi/typing_extensions@4.7.1?artifact_id=xyz"
+        ));
+        assert!(!purl_eq(key, "pkg:pypi/typingextensions@4.7.1"));
+        assert!(!purl_eq(
+            "pkg:npm/typing-extensions@4.7.1",
+            "pkg:npm/typing_extensions@4.7.1"
         ));
     }
 

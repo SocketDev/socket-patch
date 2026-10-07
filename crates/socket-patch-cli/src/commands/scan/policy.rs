@@ -69,7 +69,10 @@ pub(crate) fn load_invocation_policy(args: &ScanArgs) -> Result<InvocationPolicy
 
 /// The marker files of a disk project root: the same lock markers the
 /// in-memory engine detects roots by, plus the maven/nuget markers disk
-/// scans support. Manifests are not markers (so both engines agree).
+/// scans support. When a directory has none of those, its manifests
+/// ([`MANIFEST_MARKERS`] and the JVM build files) are its markers instead;
+/// the in-memory engine has no such fallback (manifests alone never make
+/// a root there), so for a lockless directory the two engines disagree.
 pub(crate) fn dir_markers(dir: &Path) -> Vec<String> {
     let mut markers: Vec<String> = std::fs::read_dir(dir)
         .map(|entries| {
