@@ -1042,10 +1042,6 @@ mod tests {
                 format!("<add key=\"socket-patch-vendor\" value=\".socket/vendor/nuget/{nuget}/\" />"),
             ),
             (
-                "NuGet.Config",
-                format!("<add key=\"socket-patch-vendor\" value=\".socket\\vendor\\nuget\\{nuget_win}\" />"),
-            ),
-            (
                 "pom.xml",
                 format!("<url>file://${{project.basedir}}/.socket/vendor/maven/{maven}</url>"),
             ),
@@ -1071,16 +1067,32 @@ mod tests {
                     format!(".socket/vendor/nuget/{nuget}")
                 ),
                 (
-                    "nuget".to_string(),
-                    nuget_win.to_string(),
-                    format!(".socket/vendor/nuget/{nuget_win}")
-                ),
-                (
                     "pypi".to_string(),
                     pypi.to_string(),
                     format!(".socket/vendor/pypi/{pypi}/{wheel}")
                 ),
             ]
+        );
+
+        // The backslashed Windows spelling, under another config spelling.
+        // Its own project: on a case-insensitive file system `NuGet.Config`
+        // and `nuget.config` are one file.
+        let win = tempfile::tempdir().unwrap();
+        tokio::fs::write(
+            win.path().join("NuGet.Config"),
+            format!(
+                "<add key=\"socket-patch-vendor\" value=\".socket\\vendor\\nuget\\{nuget_win}\" />"
+            ),
+        )
+        .await
+        .unwrap();
+        assert_eq!(
+            scan_vendor_references(win.path()).await,
+            vec![(
+                "nuget".to_string(),
+                nuget_win.to_string(),
+                format!(".socket/vendor/nuget/{nuget_win}")
+            )]
         );
 
         // A bare eco dir or a non-uuid dir is still no reference.
