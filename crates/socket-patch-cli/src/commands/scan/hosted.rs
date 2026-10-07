@@ -1773,6 +1773,42 @@ async fn vendored_takeover(
     } else {
         None
     };
+    // Yarn classic twin: an offline mirror refuses the hosted rewrite
+    // (vendored mode works with one), so a vendored yarn classic entry
+    // must stay vendored rather than be reverted into neither mode.
+    let classic_entry = |entry: &socket_patch_core::vendor::VendorEntry| {
+        entry.ecosystem == "npm" && entry.flavor.as_deref() == Some("yarn-classic")
+    };
+    let classic_takeover_refusal = if takeover
+        .iter()
+        .any(|(_, entry)| entry.as_ref().is_some_and(classic_entry))
+    {
+        match socket_patch_core::utils::fs::read_regular_to_string(&common.cwd.join("yarn.lock"))
+            .await
+        {
+            Ok(lock) => {
+                let read_rc = |rel: &str| {
+                    let path = common.cwd.join(rel);
+                    async move {
+                        socket_patch_core::utils::fs::read_regular_to_string(&path)
+                            .await
+                            .ok()
+                    }
+                };
+                let yarnrc = read_rc(socket_patch_core::patch::redirect::YARNRC_REL).await;
+                let npmrc = read_rc(socket_patch_core::patch::redirect::npmrc::NPMRC_REL).await;
+                socket_patch_core::patch::redirect::preflight_yarn_classic_hosted(
+                    &lock,
+                    yarnrc.as_deref(),
+                    npmrc.as_deref(),
+                )
+                .err()
+            }
+            Err(_) => None,
+        }
+    } else {
+        None
+    };
     // vlt twin: the hosted rewriter's lock-level refusal must be known
     // before a vendored vlt entry is reverted, or the revert strips the
     // live vendored patch and the rewrite then refuses the lock.
@@ -1866,6 +1902,11 @@ async fn vendored_takeover(
                             .err()
                     })
                     .flatten()
+            })
+            .or_else(|| {
+                classic_takeover_refusal
+                    .clone()
+                    .filter(|_| entry.is_some_and(classic_entry))
             })
             .or_else(|| {
                 vlt_takeover_refusal

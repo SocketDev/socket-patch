@@ -273,6 +273,14 @@ pub struct RewriteResult {
         serde(skip_serializing_if = "std::collections::BTreeSet::is_empty")
     )]
     pub confirmed_yarn_berry_uuids: std::collections::BTreeSet<String>,
+    /// Patch uuids the yarn classic rewriter refused because the project
+    /// configures a `yarn-offline-mirror` (see
+    /// [`preflight_yarn_classic_hosted`]). Never confirmed.
+    #[cfg_attr(
+        test,
+        serde(skip_serializing_if = "std::collections::BTreeSet::is_empty")
+    )]
+    pub refused_yarn_classic_uuids: std::collections::BTreeSet<String>,
     pub python_lock_uuids: std::collections::BTreeSet<String>,
     pub confirmed_python_lock_uuids: std::collections::BTreeSet<String>,
     pub refused_python_lock_uuids: std::collections::BTreeSet<String>,
@@ -687,6 +695,7 @@ fn merge_group_delta(result: &mut RewriteResult, delta: RewriteResult) {
         refused_pnpm_uuids,
         yarn_berry_uuids,
         confirmed_yarn_berry_uuids,
+        refused_yarn_classic_uuids,
         python_lock_uuids,
         confirmed_python_lock_uuids,
         refused_python_lock_uuids,
@@ -722,6 +731,9 @@ fn merge_group_delta(result: &mut RewriteResult, delta: RewriteResult) {
     result
         .confirmed_yarn_berry_uuids
         .extend(confirmed_yarn_berry_uuids);
+    result
+        .refused_yarn_classic_uuids
+        .extend(refused_yarn_classic_uuids);
     result.python_lock_uuids.extend(python_lock_uuids);
     result
         .confirmed_python_lock_uuids
@@ -3243,6 +3255,123 @@ fn plan_cargo_config(
 }
 
 // ── yarn.lock (classic) ──────────────────────────────────────────────────────
+/// The project's `.yarnrc`, read beside a classic `yarn.lock` for its
+/// `yarn-offline-mirror` setting.
+pub const YARNRC_REL: &str = ".yarnrc";
+
+/// The `yarn-offline-mirror` directory a project-level `.yarnrc` or
+/// `.npmrc` configures, if any. Yarn 1 reads the key from its own
+/// `.yarnrc` first and falls back to the npm config, so a `.yarnrc` entry
+/// (even `false`) wins over `.npmrc`. An empty value or `false` means no
+/// mirror.
+pub fn yarn_classic_offline_mirror(yarnrc: Option<&str>, npmrc: Option<&str>) -> Option<String> {
+    let value = yarnrc
+        .and_then(yarnrc_value_of_offline_mirror)
+        .or_else(|| npmrc.and_then(npmrc_value_of_offline_mirror))?;
+    (!value.is_empty() && value != "false").then_some(value)
+}
+
+const YARN_OFFLINE_MIRROR_KEY: &str = "yarn-offline-mirror";
+
+/// Strip one pair of matching quotes, as yarn's `.yarnrc` parser and npm's
+/// ini parser both do.
+fn unquote_rc_value(raw: &str) -> &str {
+    let raw = raw.trim();
+    for q in ['"', '\''] {
+        if raw.len() >= 2 && raw.starts_with(q) && raw.ends_with(q) {
+            return &raw[1..raw.len() - 1];
+        }
+    }
+    raw
+}
+
+/// The last `yarn-offline-mirror` value in a `.yarnrc` (`key value` or
+/// `key: value` lines, key optionally quoted, `#` comments); later lines
+/// override earlier ones.
+fn yarnrc_value_of_offline_mirror(text: &str) -> Option<String> {
+    let mut found = None;
+    for line in text.lines() {
+        let line = line.trim();
+        if line.is_empty() || line.starts_with('#') {
+            continue;
+        }
+        let (key, rest) = match line.strip_prefix('"') {
+            Some(quoted) => match quoted.split_once('"') {
+                Some((key, rest)) => (key, rest),
+                None => continue,
+            },
+            // yarn's `.yarnrc` parser also ends an unquoted key at `:`, so
+            // `key: value` and `key:value` set the key like `key value`.
+            None => match line.split_once(|c: char| c.is_whitespace() || c == ':') {
+                Some((key, rest)) => (key, rest),
+                None => (line, ""),
+            },
+        };
+        if key == YARN_OFFLINE_MIRROR_KEY {
+            let rest = rest.trim_start();
+            let rest = rest.strip_prefix(':').unwrap_or(rest);
+            found = Some(unquote_rc_value(rest).to_string());
+        }
+    }
+    found
+}
+
+/// The last top-level `yarn-offline-mirror` value in an `.npmrc` (ini
+/// `key = value` lines, `#`/`;` comments, `[section]` headers end the
+/// top level).
+fn npmrc_value_of_offline_mirror(text: &str) -> Option<String> {
+    let mut found = None;
+    for line in text.lines() {
+        let line = line.trim();
+        if line.starts_with('[') {
+            break;
+        }
+        if line.is_empty() || line.starts_with('#') || line.starts_with(';') {
+            continue;
+        }
+        let Some((key, value)) = line.split_once('=') else {
+            continue;
+        };
+        if unquote_rc_value(key) == YARN_OFFLINE_MIRROR_KEY {
+            found = Some(unquote_rc_value(value).to_string());
+        }
+    }
+    found
+}
+
+/// The project-level refusal of the yarn classic hosted rewriter: a
+/// configured `yarn-offline-mirror`. Yarn 1 stores and looks up mirror
+/// tarballs by the basename of `resolved`, and the hosted URL ends in the
+/// same `<name>-<version>.tgz` as the upstream tarball already in the
+/// mirror, so yarn installs the upstream bytes and fails the patched
+/// integrity (or, `--offline`, never fetches the patched tarball at all).
+/// `Ok` for a lock that is not classic (the berry rewriter owns those).
+///
+/// Exposed so the vendored→hosted mode takeover can refuse BEFORE it
+/// reverts a vendored yarn classic entry (vendored mode works with a
+/// mirror), like [`preflight_yarn_berry_hosted`].
+pub fn preflight_yarn_classic_hosted(
+    lock: &str,
+    yarnrc: Option<&str>,
+    npmrc: Option<&str>,
+) -> Result<(), RewriteWarning> {
+    if is_berry_lock(lock) {
+        return Ok(());
+    }
+    match yarn_classic_offline_mirror(yarnrc, npmrc) {
+        Some(mirror) => Err(RewriteWarning {
+            code: "redirect_yarn_classic_offline_mirror".into(),
+            detail: format!(
+                "the project sets `yarn-offline-mirror` ({mirror}); yarn looks mirror \
+                 tarballs up by file name, and the hosted tarball has the same name as \
+                 the upstream one, so installs would get the unpatched bytes and fail \
+                 the integrity check; leaving yarn.lock untouched (use --mode vendored)"
+            ),
+        }),
+        None => Ok(()),
+    }
+}
+
 fn rewrite_yarn_classic(
     files: &BTreeMap<String, String>,
     overrides: &[DepOverride],
@@ -3258,6 +3387,16 @@ fn rewrite_yarn_classic(
     if is_berry_lock(raw) {
         return; // yarn-berry — not classic
     }
+    // An offline mirror refuses every dep this lock locks (see
+    // [`preflight_yarn_classic_hosted`]): nothing is rewritten, and the
+    // refused uuids are never confirmed, so an earlier run's URL left in
+    // the lock attests nothing either.
+    let mirror_refusal = preflight_yarn_classic_hosted(
+        raw,
+        files.get(YARNRC_REL).map(String::as_str),
+        files.get(npmrc::NPMRC_REL).map(String::as_str),
+    )
+    .err();
     // CRLF locks (core.autocrlf Windows checkouts — yarn v1 parses them fine)
     // are processed LF-normalized and re-expanded on output, so untouched
     // lines round-trip byte-identically. Without this, `split("\n\n")` never
@@ -3369,6 +3508,12 @@ fn rewrite_yarn_classic(
                 continue;
             }
             matched_any = true;
+            if mirror_refusal.is_some() {
+                result
+                    .refused_yarn_classic_uuids
+                    .insert(dep.patch_uuid.clone());
+                continue;
+            }
             let frag = dep
                 .integrity
                 .sha1
@@ -3424,6 +3569,11 @@ fn rewrite_yarn_classic(
                 code: "redirect_yarn_classic_entry_not_found".into(),
                 detail: format!("no yarn.lock entry resolving {fname}@{}", dep.version),
             });
+        }
+    }
+    if let Some(warning) = mirror_refusal {
+        if !result.refused_yarn_classic_uuids.is_empty() {
+            result.warnings.push(warning);
         }
     }
     if changed {
@@ -9758,6 +9908,122 @@ mod tests {
         assert_eq!(
             r.warnings[0].code,
             "redirect_yarn_classic_unsupported_line_endings"
+        );
+    }
+
+    /// #364: yarn 1 looks offline-mirror tarballs up by the basename of
+    /// `resolved`, which the hosted URL shares with the upstream tarball in
+    /// the mirror, so a project-level mirror (`.yarnrc` or `.npmrc`)
+    /// refuses the rewrite untouched, and the dep is never confirmed.
+    #[test]
+    fn yarn_classic_offline_mirror_refuses_rewrite() {
+        let ovr = npm_override(
+            "left-pad",
+            "1.3.0",
+            "http://p.test/patch/npm/left-pad/1.3.0/tok/u/left-pad-1.3.0.tgz",
+            "sha512-PATCHED==",
+        );
+        let cases = [
+            (YARNRC_REL, "yarn-offline-mirror \"./mirror\"\n"),
+            (YARNRC_REL, "# offline\n\"yarn-offline-mirror\" ./mirror\n"),
+            (YARNRC_REL, "yarn-offline-mirror ./mirror\r\n"),
+            (YARNRC_REL, "yarn-offline-mirror: ./mirror\n"),
+            (YARNRC_REL, "yarn-offline-mirror:./mirror\n"),
+            (YARNRC_REL, "yarn-offline-mirror : \"./mirror\"\n"),
+            (YARNRC_REL, "\"yarn-offline-mirror\": \"./mirror\"\n"),
+            (npmrc::NPMRC_REL, "yarn-offline-mirror = ./mirror\n"),
+            (npmrc::NPMRC_REL, "yarn-offline-mirror=\"./mirror\"\n"),
+        ];
+        for (rc, text) in cases {
+            for lock in [
+                classic_lock_two_entries(),
+                classic_lock_two_entries().replace('\n', "\r\n"),
+            ] {
+                let mut files = BTreeMap::new();
+                files.insert("yarn.lock".to_string(), lock);
+                files.insert(rc.to_string(), text.to_string());
+                let mut r = RewriteResult::default();
+                rewrite_yarn_classic(&files, std::slice::from_ref(&ovr), &mut r);
+                assert!(
+                    r.files.is_empty() && r.edits.is_empty(),
+                    "{rc} {text:?}: lock must stay untouched: {:?}",
+                    r.files
+                );
+                assert_eq!(
+                    r.warnings.len(),
+                    1,
+                    "{rc} {text:?}: one refusal: {:?}",
+                    r.warnings
+                );
+                assert_eq!(r.warnings[0].code, "redirect_yarn_classic_offline_mirror");
+                assert!(
+                    r.warnings[0].detail.contains("./mirror")
+                        && r.warnings[0].detail.contains("--mode vendored"),
+                    "{}",
+                    r.warnings[0].detail
+                );
+                assert!(r.refused_yarn_classic_uuids.contains(&ovr.patch_uuid));
+            }
+        }
+    }
+
+    /// No mirror, a disabled one, a look-alike key, or an `.npmrc` mirror
+    /// that `.yarnrc` turns off leaves the classic rewrite as before.
+    #[test]
+    fn yarn_classic_without_effective_offline_mirror_rewrites() {
+        let ovr = npm_override(
+            "left-pad",
+            "1.3.0",
+            "http://p.test/lp.tgz",
+            "sha512-PATCHED==",
+        );
+        let cases: [&[(&str, &str)]; 8] = [
+            &[],
+            &[(YARNRC_REL, "yarn-offline-mirror false\n")],
+            &[(YARNRC_REL, "yarn-offline-mirror: false\n")],
+            &[(YARNRC_REL, "yarn-offline-mirror:\n")],
+            &[(YARNRC_REL, "yarn-offline-mirror \"\"\n")],
+            &[(YARNRC_REL, "yarn-offline-mirror-pruning true\n# yarn-offline-mirror ./m\n")],
+            &[(npmrc::NPMRC_REL, "[scope]\nyarn-offline-mirror=./m\n")],
+            &[
+                (YARNRC_REL, "yarn-offline-mirror false\n"),
+                (npmrc::NPMRC_REL, "yarn-offline-mirror=./m\n"),
+            ],
+        ];
+        for rcs in cases {
+            let mut files = BTreeMap::new();
+            files.insert("yarn.lock".to_string(), classic_lock_two_entries());
+            for (rc, text) in rcs {
+                files.insert(rc.to_string(), text.to_string());
+            }
+            let mut r = RewriteResult::default();
+            rewrite_yarn_classic(&files, std::slice::from_ref(&ovr), &mut r);
+            assert!(r.warnings.is_empty(), "{rcs:?}: {:?}", r.warnings);
+            assert!(r.files["yarn.lock"].contains("http://p.test/lp.tgz"), "{rcs:?}");
+            assert!(r.refused_yarn_classic_uuids.is_empty(), "{rcs:?}");
+        }
+    }
+
+    /// The mirror only gates deps the classic lock locks, and never a berry
+    /// lock (berry has no offline mirror; its cache is checksummed).
+    #[test]
+    fn yarn_classic_offline_mirror_preflight_scope() {
+        let rc = Some("yarn-offline-mirror ./mirror\n");
+        assert!(preflight_yarn_classic_hosted(&classic_lock_two_entries(), rc, None).is_err());
+        assert!(preflight_yarn_classic_hosted(&classic_lock_two_entries(), None, None).is_ok());
+        let berry = "__metadata:\n  version: 8\n  cacheKey: 10c0\n";
+        assert!(preflight_yarn_classic_hosted(berry, rc, None).is_ok());
+
+        let other = npm_override("not-locked", "1.0.0", "http://p.test/x.tgz", "sha512-X==");
+        let mut files = BTreeMap::new();
+        files.insert("yarn.lock".to_string(), classic_lock_two_entries());
+        files.insert(YARNRC_REL.to_string(), rc.unwrap().to_string());
+        let mut r = RewriteResult::default();
+        rewrite_yarn_classic(&files, std::slice::from_ref(&other), &mut r);
+        assert!(r.refused_yarn_classic_uuids.is_empty());
+        assert_eq!(
+            r.warnings.iter().map(|w| w.code.as_str()).collect::<Vec<_>>(),
+            ["redirect_yarn_classic_entry_not_found"]
         );
     }
 

@@ -87,6 +87,13 @@ The backticked slug in each row is the value `-e`/`--ecosystems` accepts (e.g.
   upstream bytes. Use a clean install tree and an empty store; `--force` is not
   a reliable substitute. Run `socket-patch vex` after installation to verify
   the patched files. See the [compatibility matrix and workflow](testing/pnpm-compatibility.md).
+- **yarn classic** — the `yarn.lock` entry's `resolved` / `integrity` are
+  rewritten to the hosted tarball. A project that sets `yarn-offline-mirror`
+  (in `.yarnrc` or `.npmrc`) is refused with
+  `redirect_yarn_classic_offline_mirror`. Yarn looks mirror tarballs up by
+  file name, and the hosted tarball has the same name as the upstream one
+  already in the mirror, so installs would get the unpatched bytes and fail
+  the integrity check. Use `--mode vendored` there; it works with a mirror.
 - **yarn berry** — the redirect pins the way yarn does for a root `resolutions`
   entry (cacheKey `10c0` / yarn 4): `package.json` routes the locked descriptor
   (`"left-pad@npm:^1.3.0"`) to the hosted tarball and only that `yarn.lock` entry

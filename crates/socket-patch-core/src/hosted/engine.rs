@@ -509,6 +509,21 @@ pub async fn read_candidate_files(
         }
     }
 
+    // Beside a classic yarn.lock, the yarn configs decide whether an
+    // offline mirror serves the tarballs (the classic rewriter's refusal).
+    // Read strictly: a link or an unreadable in-memory entry could hide a
+    // mirror, so it is refused like a rewrite target.
+    if candidates.iter().any(|c| c.dep.ecosystem == "npm")
+        && out
+            .files
+            .get("yarn.lock")
+            .is_some_and(|lock| !crate::patch::redirect::is_berry_lock(lock))
+    {
+        out.read(view, unreadable, crate::patch::redirect::YARNRC_REL)
+            .await;
+        out.read(view, unreadable, NPMRC_REL).await;
+    }
+
     // Cargo workspace members (and in-root path dependencies) declare
     // dependencies of their own: a member's direct `cfg-if = "1"` must be
     // pinned alongside the root's, or the redirected lock entry is
@@ -1693,6 +1708,11 @@ fn confirm(
             // `resolutions` routing to it; the URL in `yarn.lock` alone (the
             // routing removed, a refused re-pin) installs nothing, so the
             // berry rewriter's own report decides every dep its lock holds.
+            // A yarn classic lock beside an offline mirror installs the
+            // upstream mirror tarball whatever `resolved` says.
+            if rewrite.refused_yarn_classic_uuids.contains(uuid) {
+                return ProbeStep::Decided(false);
+            }
             if rewrite.yarn_berry_uuids.contains(uuid) {
                 return ProbeStep::Decided(rewrite.confirmed_yarn_berry_uuids.contains(uuid));
             }
@@ -1790,6 +1810,10 @@ fn is_gradle_file(rel: &str) -> bool {
 fn file_ecosystem(rel: &str) -> Option<&'static str> {
     if let Some(eco) = crate::formats::registry::hosted_file_ecosystem(rel) {
         return Some(eco);
+    }
+    // Read only beside a classic yarn.lock, for its offline-mirror gate.
+    if rel == crate::patch::redirect::YARNRC_REL || rel == NPMRC_REL {
+        return Some("npm");
     }
     let base = rel.rsplit('/').next().unwrap_or(rel);
     // A legacy Gradle lock (`gradle/dependency-locks/<conf>.lockfile`).
