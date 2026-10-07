@@ -64,7 +64,7 @@ The repository had **88 open issues** when this review was written. Most were fi
 - the takeover ignoring `kept_artifact`;
 - the bare `hatch` spawn and the project's own rule against it;
 - the comment-blind `nuget_package_source_keys`;
-- `SOCKET_FORCE` on three flags;
+- `SOCKET_FORCE` on three flags (removed per #615);
 - `--download-mode diff` re-fetching all blobs when any archive is missing;
 - `mem_blobs` never `Some` in production;
 - `wired_vendor_integrity` with no production caller;

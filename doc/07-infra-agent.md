@@ -2,7 +2,7 @@
 
 ## Part 7: Core infrastructure and agent (in-place) mode
 
-_Last checked against main @ 9c43dfc on 2026-10-07 by audit-core. Owner: audit-core._ Re-checked on `9c43dfc` (09:56Z run): the 7.4 agent-mode footprint, the sidecar list (Maven rewriter from #646) and which ecosystems need agent mode. Re-checked on `9c43dfc`: the self-update footprint and its overlap with `install.sh` (7.5), the credentials block of `client.rs`, agent-mode jar member verification, the apply/rollback store-copy fold and the artifact-retention (GC) policies. Re-checked on `0d302dc`: the `api/*` size row, the `client.rs` breakdown, the retry table, the registry-client timeout, process spawning and hash case. The timeout, blob/diff body, zip-read, process-spawning, API-pacing, URL-builder, retry, batching, hashing, UUID, env/home-dir, atomic-write, purl, dead-code, telemetry, apply/rollback-engine, diff-download, `apply.lock`, Maven-sidecar, group-commit-reader, socket.yml and spawn-deadline passages were re-checked on `045d7ec`; the rest is as of `2463257`.
+_Last checked against main @ 9c43dfc on 2026-10-07 by audit-core. Owner: audit-core._ Re-checked on `9c43dfc` (09:56Z run): the 7.4 agent-mode footprint, the sidecar list (Maven rewriter from #646) and which ecosystems need agent mode. Re-checked on `9c43dfc`: the self-update footprint and its overlap with `install.sh` (7.5), the credentials block of `client.rs`, agent-mode jar member verification, the apply/rollback store-copy fold and the artifact-retention (GC) policies. Re-checked on `0d302dc`: the `api/*` size row, the `client.rs` breakdown, the retry table, the registry-client timeout, process spawning and hash case. The timeout, blob/diff body, zip-read, process-spawning, API-pacing, URL-builder, retry, batching, hashing, UUID, env/home-dir, atomic-write, purl, dead-code, telemetry, apply/rollback-engine, diff-download, `apply.lock`, Maven-sidecar, group-commit-reader, socket.yml and spawn-deadline passages were re-checked on `045d7ec`; the rest is as of `2463257`. 2026-10-07 14:00Z: 7.2, 7.4, 7.5 and 7.6 record the maintainer's decisions on #648, #792, #808, #983 and #1000 (no code re-check).
 
 > Scope: `api/*`, `manifest/*`, `ledgers.rs`, `constants.rs`, `patch/` (excluding `redirect/`), `policy/*`, `rollout*`, `update/*`, the CLI `update_notifier.rs`/`update.rs`, `telemetry.rs`, and the generic `utils/*` and `hash/*`.
 
@@ -24,7 +24,7 @@ That is about **19.6K production lines.** Comments are a large share of them: 25
 
 **Why `client.rs` is 2,918 production lines** (on `0d302dc`; moving the vendor service out is {{C29}}):
 - **~950 lines: the vendoring service**, which is not the patch API. The two-step grant + download (`fetch_vendor_package` → `download_artifact_resuming`), its types, and `download_artifact_capped`.
-- **~330 lines: credentials** (L2039–L2368 on `9c43dfc`). Env/config resolution, a token-shape lint, org auto-resolve and the proxy-fallback client builder; moving them out is the second C29 issue, #913.
+- **~330 lines: credentials** (L2039–L2368 on `9c43dfc`). Env/config resolution, a token-shape lint, org auto-resolve and the proxy-fallback client builder; moving them out is the second C29 issue, #913. Per #648 the org-resolve step will produce the run's single route, so #913 and the #648 PR rebase on each other.
 - **~200 lines: legacy proxy fallback.** The per-package GET path, `is_batch_unsupported`.
 - **~80 lines: debug-ordering machinery.** A `task_local` buffer plus `HeldBack`/`hold_back_debug`, with 45 call sites in 11 files. Its only purpose is to make `--debug` output byte-identical to what a serial loop would print.
 - **~650 lines: the patch API itself.**
@@ -39,7 +39,7 @@ That is about **19.6K production lines.** Comments are a large share of them: 25
 
 The vendor policy also has three separate hand-written retry loops, plus a first-attempt/resume split that exists only to keep the request sequence identical under prefetch. Two near-identical downloaders (`download_vendor_archive_once` and `download_artifact_capped_once`) differ only in return type and message strings.
 
-**Three URL builders with two different policies.** `patches_path` sends an authenticated client without an org slug to `/v0/orgs/default/...`, but `binary_url` and `vendor_package_url` send the same client to the public proxy. Telemetry has a fourth copy of the decision. So when org auto-resolve fails, JSON calls go to the "default" org while blob downloads silently go to the proxy. Re-verified by execution on `045d7ec`: view and batch go to `/v0/orgs/default/patches/…` with the bearer, while blob, diff, vendor references and telemetry go anonymously to `patches-api.socket.dev/patch/…`. {{C07}}
+**Three URL builders with two different policies.** `patches_path` sends an authenticated client without an org slug to `/v0/orgs/default/...`, but `binary_url` and `vendor_package_url` send the same client to the public proxy. Telemetry has a fourth copy of the decision. So when org auto-resolve fails, JSON calls go to the "default" org while blob downloads silently go to the proxy. Re-verified by execution on `045d7ec`: view and batch go to `/v0/orgs/default/patches/…` with the bearer, while blob, diff, vendor references and telemetry go anonymously to `patches-api.socket.dev/patch/…`. Decided in #648: the org is resolved once, when the client is built, into one route (`Org{slug}` or `Proxy`) that all builders and telemetry read; a failed auto-resolve sends the whole run to the public proxy anonymously with one warning, never `/v0/orgs/default`; embedded `--vex` reuses the run's client instead of resolving again. PR pending. {{C07}}
 
 **Timeouts on the main paths (#581).**
 - `ApiClient::new` and `plain_client()` build both reqwest clients through one policy, `api::retry::ApiTimeouts`: `API_CONNECT_TIMEOUT` (10 s) and `API_READ_TIMEOUT` (60 s of silence, reset per chunk), with no total deadline. Tests override it with `ApiClient::with_api_timeouts`. {{C02}}
@@ -84,7 +84,7 @@ The vendor policy also has three separate hand-written retry loops, plus a first
 - the multi-mode rollback (2,660) and remove (1,571) carry agent legs;
 - over 13K dedicated test lines.
 
-Counting the agent arms in `scan`, `get` and `rollback`, agent mode is **about 6.4K CLI production lines** plus ~3.5K in core (review numbers; the CLI `apply.rs` has grown ~700 lines since). Only Deno (its only mode) and `--global` installs (hosted and vendored act on project lockfiles) need it; Go's agent mode writes a `.socket/go-patches/` replace, which vendored covers. About 29 of the open `bug` issues are agent-mode-specific, roughly twice the review's ~15. {{C55}}
+Counting the agent arms in `scan`, `get` and `rollback`, agent mode is **about 6.4K CLI production lines** plus ~3.5K in core (review numbers; the CLI `apply.rs` has grown ~700 lines since). Deno (its only mode) and `--global` installs (hosted and vendored act on project lockfiles) have no other mode; Go's agent mode writes a `.socket/go-patches/` replace, which vendored also covers. About 29 of the open `bug` issues are agent-mode-specific, roughly twice the review's ~15. The maintainer decided to keep agent mode for every ecosystem for now (#1000, option A); its open bugs are tracked and fixed individually. {{C55}}
 
 **The safety model is sound and worth keeping:**
 - every manifest path is escape-checked;
@@ -103,8 +103,8 @@ The default `MismatchPolicy::Warn` silently overwrites locally modified dependen
 - everything is staged in a tempdir and thrown away after the run.
 
 So diff only saves bytes when a user commits `.socket/diffs` but not `.socket/blobs`. The diff fetch is also sequential with no retry, and it is the only user of the `qbsdiff` dependency. Blob downloads are sequential with no retry too, while the JSON calls run 32 at a time.
-- **Recommendation:** make `file` the default (keep `diff` as an alias for one major), then delete `patch/diff.rs`, the diff branches in `blob_fetcher`/`fetch_stage`/`repair`, and `qbsdiff`.
-- **Saving:** about 600 production and 1,000 test lines, plus one dependency. Re-verified on `045d7ec` (top-up at `fetch_stage.rs:377-398`; diff-only code includes `patch/diff.rs` (99 production lines) and `patch/package.rs` (332)). The default change is a contract MAJOR, so it is filed as a decision. {{C25}}
+- **Decided (#792):** v5 removes the diff download path and the `--download-mode` / `SOCKET_DOWNLOAD_MODE` option outright (no alias). Blobs are the only patch-content source, and `.socket/diffs/` is swept as obsolete like `.socket/packages/`.
+- **Saving:** about 600 production and 1,000 test lines, plus one dependency. Re-verified on `045d7ec` (top-up at `fetch_stage.rs:377-398`; diff-only code is `patch/diff.rs` (99 production lines), `read_archive_filtered`, `resolve_from_diff`/`AppliedVia::Diff`, `fetch_diff`, the diff fetch/coverage code in `blob_fetcher`/`fetch_stage`/`repair` and `qbsdiff`). `patch/package.rs` is not diff-only on current main: vendor/*, `hosted/npm_manifest.rs` and `redirect/vlt_heal.rs` use its readers, so it stays and the saving is nearer 400 production lines. {{C25}}
 
 **Sidecars** (`patch/sidecars/`, 1,107 production lines on `9c43dfc`; 708 at the review) are post-apply fixes for package-manager checksum files:
 - cargo: rewrite `.cargo-checksum.json`;
@@ -114,7 +114,7 @@ So diff only saves bytes when a user commits `.socket/diffs` but not `.socket/bl
 
 Maven 3.9.11 doesn't verify the local repository's `.sha1` files by default, so the review's stale-checksum concern was rejected on `045d7ec`; since #646 the Maven sidecar rewrites them anyway (for `mvn -C` and mirror tooling), and agent mode patches each Gradle `files-2.1` copy the build reads, which fixed #551. {{C27}} This code exists only for in-place mode.
 
-**`apply.lock`** is 553 production lines (re-checked on `045d7ec`). Most of that complexity comes from *deleting* the lock file on exit: unlinking while it is held, identity checks, Windows delete-pending handling. Lock acquisition also replays the vendored group-commit journal, which couples vendored crash recovery into every command's lock. Leaving a gitignored lock file on disk (the convention every package manager uses), or locking a file outside the project, would cut about 200 lines; the v5.0 contract promises the transient file, so this is a decision. Moving the journal replay and the durability barrier out of the lock primitive changes no behavior. {{C26}}
+**`apply.lock`** is 553 production lines (re-checked on `045d7ec`). Most of that complexity comes from *deleting* the lock file on exit: unlinking while it is held, identity checks, Windows delete-pending handling. Lock acquisition also replays the vendored group-commit journal, which couples vendored crash recovery into every command's lock. Decided in #808: the lock stays transient. socket-patch never leaves a lock file in the project, and a persistent lock, if ever needed, would live outside it (home/cache dir or a configurable path), so the ~200 lines of deletion machinery stay. One residue path remains on main: an interrupted run (Ctrl-C/SIGTERM/SIGHUP, Windows console ctrl) dies without dropping the guard and leaves `apply.lock` until the next lock-taking command; the #808 PR removes the file on interrupt. Moving the journal replay and the durability barrier out of the lock primitive changes no behavior (tracked by #809 and #793). {{C26}}
 
 **Dead path (verified):** `PatchSources::mem_blobs` is never `Some` in production, but its doc still says vendor flows stage content there. {{C23}}
 
@@ -122,7 +122,7 @@ Maven 3.9.11 doesn't verify the local repository's `.sha1` files by default, so 
 
 | Feature | Prod / tests | Verdict |
 |---|---|---|
-| **Self-update + passive notifier** | 2,351 / 5,689 | Only `Standalone` installs self-update; npm, cargo and brew are redirected to their own tools. Still detects the pre-v5 `Pypi` and `LauncherCache` channels, which is a live refusal for old installs, not dead code. Two metadata strategies, a separate lock, and its own stage writer. **Keep the notifier; replace `--update` with "re-run install.sh"** (or keep a much thinner swap). Up to −1K production and −3K test lines. Re-checked on `9c43dfc`: still 2,350 production lines; `install.sh` has no Windows rows and the README sends Windows zip users to `--update`, so replacing the swap drops their only updater. {{C36}} |
+| **Self-update + passive notifier** | 2,351 / 5,689 | Only `Standalone` installs self-update; npm, cargo and brew are redirected to their own tools. Still detects the pre-v5 `Pypi` and `LauncherCache` channels, which is a live refusal for old installs, not dead code. Two metadata strategies, a separate lock, and its own stage writer. **Keep both (decided #983).** The maintainer treats self-update as essential. Follow-ups: retry on transient failures, an idle timeout instead of the 300 s whole-download budget, streaming the archive to disk instead of a 256 MiB in-memory `read_capped`, and a live post-release `--update` test. Re-checked on `9c43dfc`: still 2,350 production lines; `install.sh` has no Windows rows and the README sends Windows zip users to `--update`, so replacing the swap drops their only updater. {{C36}} |
 | **Telemetry** | 891 / 864 | 19 near-identical public wrappers (17 `track_*` + 2 `spawn_*`, ~450 lines); a new HTTP client per event; endpoint logic duplicated. The CLI passes token/org at ~45 call sites in 10 command files, plus 5 helper signatures (not 125), and resolves them two ways: `telemetry_credentials()` in `list`/`vex`, the API client's getters elsewhere. **Collapse to one `Telemetry` handle with `track(Event)` and a shared client** (~−300). {{C22}} |
 | **Failpoints** | 65 | Fine (compiled out of release). But `switched_off("group_commit")` keeps the *old non-group-commit path* alive as a test oracle. |
 | **group_commit + durability** | 1,376 / 1,287 | A process-wide virtual filesystem: every `utils::fs` read and write consults it. It renders typed values lazily via `Any`, does three-way hand-edit reconciliation in `recover`, and still journals `redirect-state.json`, which nothing writes. Writes that bypass `utils::fs` are silently not captured. High-cost machinery for a vendored-run speedup; see 5.7 for the root-cause fix. |
@@ -133,8 +133,8 @@ Maven 3.9.11 doesn't verify the local repository's `.sha1` files by default, so 
 
 ### 7.6 Recommendations
 
-1. **Make `file` the default download mode** and delete the diff machinery: −600 production, −1K tests, −1 dependency. Low risk.
-2. **One retry and timeout primitive** across every HTTP path, so the JSON and blob paths get timeouts: −200 production. **Fixes possible indefinite hangs.** Medium risk, because tests pin the current semantics.
+1. **Remove `--download-mode` and the diff machinery** (decided #792, v5): about −400 production, −1K tests, −1 dependency. Low risk. {{C25}}
+2. **One retry and timeout primitive** across every HTTP path, so the JSON and blob paths get timeouts: −200 production. **Fixes possible indefinite hangs.** Medium risk, because tests pin the current semantics. The self-update clients are now in scope too (#983 keeps the swap).
 3. **Delete the verified dead and legacy code:** `mem_blobs`, the always-true `VendorSource` predicates, the `redirect-state.json` group-commit `LEDGERS` entry, and the `switched_off("group_commit")` oracle path. About −60 production, −350 tests. {{C23}} (The `Pypi`/`LauncherCache` update channels are *not* dead: they make `--update` refuse to swap a pre-v5 pip/gem-owned binary and print a migration hint.)
 4. **Fold rollback into the apply engine** (swap hashes, keep a delete branch for created files): −300 production. {{C24}}
 5. **One telemetry `track(Event)`** with a shared client: −300. {{C22}}
@@ -151,7 +151,7 @@ Maven 3.9.11 doesn't verify the local repository's `.sha1` files by default, so 
    Saves about −200.
 8. **Split `client.rs`** into client, vendor_service and credentials, and give it a single auth-vs-proxy URL policy.
 9. **Keep the socket.yml event tree:** on re-check it is the contract's validator, so serde would save little and lose the scoped refusals. {{C28}}
-10. **Re-scope self-update:** keep the notifier, consider dropping the binary swap.
+10. **Harden self-update** (kept per #983): shared retry, idle timeout, streamed download, live post-release test. {{C36}}
 
 ### New findings since the review
 
