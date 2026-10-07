@@ -11,7 +11,9 @@
 //!
 //! Run from that workspace root, the members' own locks are the ones pnpm
 //! installs from, so hosted mode pins and discovery reads them beside the
-//! root's ([`member_locks`], #492).
+//! root's ([`member_locks`], #492). With `gitBranchLockfile` on, a branch
+//! installs from its own `pnpm-lock.<branch>.yaml`, which neither mode can
+//! pin, so both refuse ([`git_branch_locks`], #556).
 
 use std::path::{Path, PathBuf};
 
@@ -160,6 +162,100 @@ pub async fn member_locks(view: &ProjectView<'_>) -> MemberLocks {
         ));
     }
     MemberLocks::PerMember(keys)
+}
+
+/// pnpm's per-branch locks (`gitBranchLockfile`, #556), found at a project
+/// root: the setting is on and at least one `pnpm-lock.<branch>.yaml`
+/// exists. pnpm then installs a branch from its own lock whenever that lock
+/// exists (falling back to `pnpm-lock.yaml` only when it does not), so a
+/// pin in `pnpm-lock.yaml` is not what the branch installs.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct GitBranchLocks {
+    /// Where the setting is turned on, as the refusal names it (e.g.
+    /// `gitBranchLockfile: true` in pnpm-workspace.yaml).
+    pub setting: String,
+    /// The root branch-lock names, sorted.
+    pub locks: Vec<String>,
+}
+
+impl GitBranchLocks {
+    /// What pnpm does with the setting, for a refusal's detail.
+    pub fn describe(&self) -> String {
+        format!(
+            "{} makes pnpm install a git branch from its own lock ({}) rather than \
+             {PNPM_LOCK} whenever that lock exists, and socket-patch cannot tell which \
+             branch lock is live or pin one",
+            self.setting,
+            self.locks.join(", ")
+        )
+    }
+
+    /// The remedy every refusal names.
+    pub const REMEDY: &'static str = "turn gitBranchLockfile off and fold the branch locks \
+         into pnpm-lock.yaml with `pnpm install --merge-git-branch-lockfiles`, then re-run";
+}
+
+/// Where `gitBranchLockfile` is turned on: a top-level `gitBranchLockfile:
+/// true` in `workspace` (`pnpm-workspace.yaml`), or, when that file does
+/// not set the key, `git-branch-lockfile=true` in the root `.npmrc` (pnpm
+/// 10 and older read it there). `None` when it is off.
+pub fn git_branch_lockfile_setting(workspace: Option<&str>, npmrc: Option<&str>) -> Option<String> {
+    use crate::formats::pnpm::workspace::yaml_top_level_value;
+    let on = |value: &str| value.trim().eq_ignore_ascii_case("true");
+    if let Some(value) = workspace.and_then(|text| yaml_top_level_value(text, "gitBranchLockfile"))
+    {
+        return on(&value).then(|| format!("`gitBranchLockfile: true` in {PNPM_WORKSPACE}"));
+    }
+    npmrc
+        .and_then(|text| {
+            crate::patch::redirect::npmrc::npmrc_top_level_value(text, "git-branch-lockfile")
+        })
+        .filter(|value| on(value))
+        .map(|_| "`git-branch-lockfile=true` in .npmrc".to_string())
+}
+
+/// Whether `name` is a pnpm branch lock: `pnpm-lock.<branch>.yaml` (pnpm
+/// spells a `/` in the branch name as `!`), never `pnpm-lock.yaml` itself.
+pub fn is_git_branch_lock_name(name: &str) -> bool {
+    name.strip_prefix("pnpm-lock.")
+        .and_then(|rest| rest.strip_suffix(".yaml"))
+        .is_some_and(|branch| !branch.is_empty())
+}
+
+/// The project's per-branch locks (see [`GitBranchLocks`]), `None` unless
+/// the setting is on AND a branch lock exists at the root: with no branch
+/// lock pnpm installs from `pnpm-lock.yaml`, which is then pinned as usual.
+/// Settings are read through the view's FIFO-safe reader; on disk the
+/// `npm_config_git_branch_lockfile` / `pnpm_config_git_branch_lockfile`
+/// environment spellings count too.
+pub async fn git_branch_locks(view: &ProjectView<'_>) -> Option<GitBranchLocks> {
+    let locks: Vec<String> = view
+        .list_dir("")
+        .await
+        .ok()?
+        .into_iter()
+        .filter(|entry| !entry.is_dir && is_git_branch_lock_name(&entry.name))
+        .map(|entry| entry.name)
+        .collect();
+    if locks.is_empty() {
+        return None;
+    }
+    let workspace = view.read_text(PNPM_WORKSPACE).await.ok();
+    let npmrc = view.read_text(".npmrc").await.ok();
+    let setting =
+        git_branch_lockfile_setting(workspace.as_deref(), npmrc.as_deref()).or_else(|| {
+            if matches!(view, ProjectView::Memory(_)) {
+                return None;
+            }
+            [
+                "pnpm_config_git_branch_lockfile",
+                "npm_config_git_branch_lockfile",
+            ]
+            .into_iter()
+            .find(|var| std::env::var(var).is_ok_and(|v| v.trim().eq_ignore_ascii_case("true")))
+            .map(|var| format!("`{var}=true` in the environment"))
+        })?;
+    Some(GitBranchLocks { setting, locks })
 }
 
 /// The `pnpm-workspace.yaml` that governs `project_root`'s pnpm settings
@@ -342,6 +438,67 @@ mod tests {
             member_locks(&view).await,
             MemberLocks::Unresolved(_)
         ));
+    }
+
+    #[test]
+    fn the_git_branch_lock_setting_prefers_the_workspace_file() {
+        let setting = git_branch_lockfile_setting;
+        assert!(setting(Some("gitBranchLockfile: true\n"), None).is_some());
+        assert!(setting(Some("'gitBranchLockfile': \"True\" # per branch\n"), None).is_some());
+        assert!(setting(None, Some("git-branch-lockfile=true\n")).is_some());
+        assert!(setting(Some("packages: []\n"), Some("git-branch-lockfile = true\n")).is_some());
+        assert_eq!(setting(None, None), None);
+        assert_eq!(setting(Some("gitBranchLockfile: false\n"), None), None);
+        assert_eq!(setting(None, Some("; git-branch-lockfile=true\n")), None);
+        assert_eq!(setting(Some("# gitBranchLockfile: true\n"), None), None);
+        // pnpm 11+ reads only the YAML: an explicit `false` there wins.
+        assert_eq!(
+            setting(
+                Some("gitBranchLockfile: false\n"),
+                Some("git-branch-lockfile=true\n")
+            ),
+            None
+        );
+        assert!(setting(Some("  gitBranchLockfile: true\n"), None).is_none());
+    }
+
+    #[test]
+    fn branch_lock_names_exclude_the_main_lock() {
+        for name in [
+            "pnpm-lock.feature.yaml",
+            "pnpm-lock.feat!x.yaml",
+            "pnpm-lock.v1.2.yaml",
+        ] {
+            assert!(is_git_branch_lock_name(name), "{name}");
+        }
+        for name in [
+            "pnpm-lock.yaml",
+            "pnpm-lock..yaml",
+            "pnpm-lock.feature.yml",
+            "pnpm-lock.yaml.bak",
+            "shrinkwrap.yaml",
+        ] {
+            assert!(!is_git_branch_lock_name(name), "{name}");
+        }
+    }
+
+    #[tokio::test]
+    async fn git_branch_locks_need_the_setting_and_a_branch_lock() {
+        let tmp = tempfile::tempdir().unwrap();
+        let root = tmp.path();
+        let view = ProjectView::Disk(root);
+        write(root, PNPM_LOCK, "lockfileVersion: '9.0'\n");
+        write(root, PNPM_WORKSPACE, "gitBranchLockfile: true\n");
+        assert_eq!(git_branch_locks(&view).await, None);
+        write(root, "pnpm-lock.b.yaml", "lockfileVersion: '9.0'\n");
+        write(root, "pnpm-lock.a.yaml", "lockfileVersion: '9.0'\n");
+        // A directory of that name is no lock.
+        std::fs::create_dir(root.join("pnpm-lock.dir.yaml")).unwrap();
+        let found = git_branch_locks(&view).await.unwrap();
+        assert_eq!(found.locks, ["pnpm-lock.a.yaml", "pnpm-lock.b.yaml"]);
+        assert!(found.setting.contains(PNPM_WORKSPACE), "{}", found.setting);
+        write(root, PNPM_WORKSPACE, "packages: []\n");
+        assert_eq!(git_branch_locks(&view).await, None);
     }
 
     #[test]

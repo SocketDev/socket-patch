@@ -318,11 +318,13 @@ pub struct CandidateFiles {
     /// lock was left out of `files`, and the rewrite reports this instead
     /// of a redirect.
     pub gem_refusal: Option<RewriteWarning>,
-    /// Set when the workspace keeps one lock per member but the members
-    /// cannot be listed: the root pnpm lock was left out of `files` (it
-    /// pins nothing a member installs), and the rewrite reports this
-    /// instead of a redirect or a "no lockfile" hint.
-    pub pnpm_member_refusal: Option<RewriteWarning>,
+    /// Set when the root pnpm lock pins nothing pnpm installs: the
+    /// workspace keeps one lock per member but the members cannot be
+    /// listed (#492), or `gitBranchLockfile` installs the branch from a
+    /// `pnpm-lock.<branch>.yaml` (#556). The root lock was left out of
+    /// `files`, and the rewrite reports this instead of a redirect or a
+    /// "no lockfile" hint.
+    pub pnpm_refusal: Option<RewriteWarning>,
 }
 
 impl CandidateFiles {
@@ -583,10 +585,12 @@ pub async fn read_candidate_files(
                 }
             }
         }
-    } else if candidates.iter().any(|c| c.dep.ecosystem == "npm")
-        && !matches!(view, ProjectView::Memory(_))
-    {
-        read_pnpm_member_locks(view, unreadable, &mut out).await;
+    } else if candidates.iter().any(|c| c.dep.ecosystem == "npm") {
+        if let Some(branch) = crate::utils::pnpm_workspace::git_branch_locks(view).await {
+            refuse_git_branch_locks(&mut out, &branch);
+        } else if !matches!(view, ProjectView::Memory(_)) {
+            read_pnpm_member_locks(view, unreadable, &mut out).await;
+        }
     }
     if candidates.iter().any(|c| c.dep.ecosystem == "gem") {
         keep_bundler_loaded_gem_files(view, candidates, &mut out).await;
@@ -623,7 +627,7 @@ pub async fn read_candidate_files(
 /// rewrite target, read strictly under its root-relative key: the pnpm
 /// rewriter is basename-generalized and the write-back path-generic, like
 /// the Rush locks above. Members whose list cannot be read leave the root
-/// lock out too and refuse (see [`CandidateFiles::pnpm_member_refusal`]).
+/// lock out too and refuse (see [`CandidateFiles::pnpm_refusal`]).
 /// Disk only: the in-memory engine detects each member lock as a root of
 /// its own.
 async fn read_pnpm_member_locks(
@@ -661,10 +665,10 @@ async fn read_pnpm_member_locks(
 }
 
 /// Leave the root pnpm lock out and record why (see
-/// [`CandidateFiles::pnpm_member_refusal`]).
+/// [`CandidateFiles::pnpm_refusal`]).
 fn refuse_pnpm_members(out: &mut CandidateFiles, why: String) {
     out.files.remove("pnpm-lock.yaml");
-    out.pnpm_member_refusal = Some(RewriteWarning {
+    out.pnpm_refusal = Some(RewriteWarning {
         code: PNPM_MEMBER_LOCKS_UNRESOLVED.into(),
         detail: format!(
             "{why}; no pnpm lock was rewritten — make every member lock a readable \
@@ -673,9 +677,49 @@ fn refuse_pnpm_members(out: &mut CandidateFiles, why: String) {
     });
 }
 
+/// `gitBranchLockfile` with a branch lock present (#556): pnpm installs
+/// the branch from that lock, which hosted mode cannot pin, so the root
+/// lock (stale on the branch) is left out and the run refuses every pnpm
+/// pin (see [`CandidateFiles::pnpm_refusal`]). In memory the root lock is
+/// dropped from the link and unreadable lists too: it is not written.
+fn refuse_git_branch_locks(
+    out: &mut CandidateFiles,
+    branch: &crate::utils::pnpm_workspace::GitBranchLocks,
+) {
+    const ROOT_LOCKS: [&str; 2] = ["pnpm-lock.yaml", "shrinkwrap.yaml"];
+    for lock in ROOT_LOCKS {
+        out.files.remove(lock);
+    }
+    out.symlinked_reads
+        .retain(|r| !ROOT_LOCKS.contains(&r.as_str()));
+    out.unreadable_reads
+        .retain(|r| !ROOT_LOCKS.contains(&r.as_str()));
+    out.pnpm_refusal = Some(git_branch_lock_refusal(branch));
+}
+
+/// The [`PNPM_GIT_BRANCH_LOCKFILE`] warning for `branch`: the hosted
+/// rewrite's, and the vendored→hosted takeover's (which keeps the vendored
+/// wiring rather than revert it into a lock pnpm does not install from).
+pub fn git_branch_lock_refusal(
+    branch: &crate::utils::pnpm_workspace::GitBranchLocks,
+) -> RewriteWarning {
+    RewriteWarning {
+        code: PNPM_GIT_BRANCH_LOCKFILE.into(),
+        detail: format!(
+            "{}; no pnpm lock was rewritten — {}",
+            branch.describe(),
+            crate::utils::pnpm_workspace::GitBranchLocks::REMEDY
+        ),
+    }
+}
+
 /// Refusal code for a `sharedWorkspaceLockfile: false` workspace whose
 /// member locks cannot be listed.
 pub const PNPM_MEMBER_LOCKS_UNRESOLVED: &str = "redirect_pnpm_member_locks_unresolved";
+
+/// Refusal code for a project whose `gitBranchLockfile` setting makes pnpm
+/// install from a `pnpm-lock.<branch>.yaml` (#556).
+pub const PNPM_GIT_BRANCH_LOCKFILE: &str = "redirect_pnpm_git_branch_lockfile";
 
 /// Read what the hosted Gradle planner needs into `out` (see
 /// [`crate::patch::redirect::gradle::GradleFiles`]): the script graph is
@@ -1154,7 +1198,7 @@ pub async fn rewrite(
         unreadable_reads,
         gradle_unreadable,
         gem_refusal,
-        pnpm_member_refusal,
+        pnpm_refusal,
     } = read;
     // The rewriters' override slice — materialized ONCE, after the last
     // candidate filter, so it can never disagree with `candidates`.
@@ -1225,9 +1269,9 @@ pub async fn rewrite(
             .retain(|w| w.code != "redirect_gem_no_gemfile");
         rewrite.warnings.push(warning);
     }
-    // The member locks were withheld on purpose: say why, not "run `pnpm
-    // install`" (which never writes a root lock in this layout).
-    if let Some(warning) = pnpm_member_refusal {
+    // The pnpm locks were withheld on purpose: say why, not "run `pnpm
+    // install`" (which never writes a root lock in either layout).
+    if let Some(warning) = pnpm_refusal {
         rewrite.warnings.retain(|w| {
             w.code != "redirect_pnpm_no_lockfile" && w.code != "redirect_npm_no_lockfile"
         });
@@ -3215,6 +3259,10 @@ mod tests {
     }
 
     async fn member_rewrite(root: &std::path::Path) -> (CandidateFiles, Rewritten) {
+        view_rewrite(&ProjectView::Disk(root)).await
+    }
+
+    async fn view_rewrite(view: &ProjectView<'_>) -> (CandidateFiles, Rewritten) {
         let outer = OuterAllowRemote::default;
         let options = RewriteOptions {
             dry_run: false,
@@ -3227,10 +3275,9 @@ mod tests {
             blocking: false,
         };
         let candidates = is_number_candidates();
-        let view = ProjectView::Disk(root);
-        let read = read_candidate_files(&view, &BTreeSet::new(), &candidates).await;
+        let read = read_candidate_files(view, &BTreeSet::new(), &candidates).await;
         let done = rewrite(
-            &view,
+            view,
             read.clone(),
             &candidates,
             BTreeMap::new(),
@@ -3394,6 +3441,114 @@ mod tests {
         let codes = warning_codes(&done);
         assert!(codes.contains(&PNPM_MEMBER_LOCKS_UNRESOLVED), "{codes:?}");
         assert!(!codes.contains(&"redirect_pnpm_no_lockfile"), "{codes:?}");
+    }
+
+    const BRANCH_LOCK: &str = "pnpm-lock.feature.yaml";
+    const BRANCH_WS: &str = "packages:\n  - '.'\ngitBranchLockfile: true\n";
+
+    /// The issue's layout: `pnpm-lock.yaml` as committed on main, and the
+    /// lock pnpm writes for the `feature` branch under `gitBranchLockfile`.
+    fn write_branch_lock_project(root: &std::path::Path, workspace: &str, root_lock: bool) {
+        write_rel(
+            root,
+            "package.json",
+            r#"{"name":"app","dependencies":{"is-number":"7.0.0"}}"#,
+        );
+        write_rel(root, "pnpm-workspace.yaml", workspace);
+        write_rel(root, "node_modules/.modules.yaml", "layoutVersion: 5\n");
+        if root_lock {
+            write_rel(root, "pnpm-lock.yaml", &v9_member_lock(true));
+        }
+        write_rel(root, BRANCH_LOCK, &v9_member_lock(true));
+    }
+
+    fn assert_branch_lock_refused(read: &CandidateFiles, done: &Rewritten) {
+        assert!(!read.files.contains_key("pnpm-lock.yaml"));
+        assert!(done.rewrite.files.is_empty(), "{:?}", done.rewrite.files);
+        assert!(done.confirmed.is_empty(), "{:?}", done.confirmed);
+        let codes = warning_codes(done);
+        assert!(codes.contains(&PNPM_GIT_BRANCH_LOCKFILE), "{codes:?}");
+        assert!(
+            !codes.contains(&"redirect_pnpm_no_lockfile")
+                && !codes.contains(&"redirect_npm_no_lockfile"),
+            "{codes:?}"
+        );
+        let detail = &done
+            .rewrite
+            .warnings
+            .iter()
+            .find(|w| w.code == PNPM_GIT_BRANCH_LOCKFILE)
+            .unwrap()
+            .detail;
+        assert!(
+            detail.contains(BRANCH_LOCK) && detail.contains("--merge-git-branch-lockfiles"),
+            "{detail}"
+        );
+    }
+
+    /// `gitBranchLockfile` with a branch lock beside `pnpm-lock.yaml`: pnpm
+    /// installs the branch from the branch lock, so pinning the stale
+    /// `pnpm-lock.yaml` would confirm a pin nothing installs (#556).
+    #[tokio::test]
+    async fn a_git_branch_lock_refuses_the_stale_root_lock() {
+        let tmp = tempfile::tempdir().unwrap();
+        write_branch_lock_project(tmp.path(), BRANCH_WS, true);
+        let (read, done) = member_rewrite(tmp.path()).await;
+        assert_branch_lock_refused(&read, &done);
+
+        // pnpm 10 and older read the setting from `.npmrc`.
+        let tmp = tempfile::tempdir().unwrap();
+        write_branch_lock_project(tmp.path(), "packages:\n  - '.'\n", true);
+        write_rel(tmp.path(), ".npmrc", "git-branch-lockfile=true\n");
+        let (read, done) = member_rewrite(tmp.path()).await;
+        assert_branch_lock_refused(&read, &done);
+
+        // The in-memory engine refuses the same project.
+        let mut project = MemoryProject::new();
+        project.insert_text("package.json", r#"{"name":"app"}"#);
+        project.insert_text("pnpm-workspace.yaml", BRANCH_WS);
+        project.insert_text("pnpm-lock.yaml", v9_member_lock(true));
+        project.insert_text(BRANCH_LOCK, v9_member_lock(true));
+        let (read, done) = view_rewrite(&ProjectView::Memory(&project)).await;
+        assert_branch_lock_refused(&read, &done);
+    }
+
+    /// Only the branch lock: not "run `pnpm install`", which just rewrites
+    /// the branch lock again (#556).
+    #[tokio::test]
+    async fn a_lone_git_branch_lock_is_not_a_missing_lock() {
+        let tmp = tempfile::tempdir().unwrap();
+        write_branch_lock_project(tmp.path(), BRANCH_WS, false);
+        let (read, done) = member_rewrite(tmp.path()).await;
+        assert_branch_lock_refused(&read, &done);
+    }
+
+    /// The setting alone (no branch lock: main, or a branch whose deps never
+    /// changed) installs from `pnpm-lock.yaml`, so it is pinned as usual; so
+    /// is a stray branch lock while the setting is off.
+    #[tokio::test]
+    async fn the_root_lock_is_pinned_without_a_live_git_branch_lock() {
+        for (workspace, branch_lock) in [
+            (BRANCH_WS, false),
+            ("packages:\n  - '.'\ngitBranchLockfile: false\n", true),
+            ("packages:\n  - '.'\n", true),
+        ] {
+            let tmp = tempfile::tempdir().unwrap();
+            write_branch_lock_project(tmp.path(), workspace, true);
+            if !branch_lock {
+                std::fs::remove_file(tmp.path().join(BRANCH_LOCK)).unwrap();
+            }
+            let (_, done) = member_rewrite(tmp.path()).await;
+            let text = done
+                .rewrite
+                .files
+                .get("pnpm-lock.yaml")
+                .unwrap_or_else(|| panic!("{workspace}: {:?}", done.rewrite.warnings));
+            assert!(text.contains(MEMBER_URL), "{text}");
+            assert_eq!(done.confirmed.len(), 1, "{workspace}");
+            assert!(!warning_codes(&done).contains(&PNPM_GIT_BRANCH_LOCKFILE));
+            assert!(!done.rewrite.files.contains_key(BRANCH_LOCK));
+        }
     }
 }
 

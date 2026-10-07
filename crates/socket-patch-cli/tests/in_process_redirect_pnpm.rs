@@ -56,7 +56,10 @@ async fn rollback_hosted(cwd: &Path, server: &MockServer) -> i32 {
         })))
         .mount(server)
         .await;
-    std::env::set_var("SOCKET_NPM_REGISTRY", format!("{}/npm-registry", server.uri()));
+    std::env::set_var(
+        "SOCKET_NPM_REGISTRY",
+        format!("{}/npm-registry", server.uri()),
+    );
     let code = rollback::run(RollbackArgs {
         targets: Vec::new(),
         common: socket_patch_cli::args::GlobalArgs {
@@ -805,7 +808,11 @@ async fn hosted_pnpm_manifestless_vex_from_lockfile_legacy_ledger_and_api() {
                         ..VexRun::offline()
                     },
                 );
-                assert_eq!(out.code, Some(0), "[{lock_name}] legacy ledger, offline: {out}");
+                assert_eq!(
+                    out.code,
+                    Some(0),
+                    "[{lock_name}] legacy ledger, offline: {out}"
+                );
                 assert_attested(out.doc(), PURL, UUID, Marker::Redirected, vulns);
                 assert_eq!(api.request_count(), seen);
 
@@ -1804,4 +1811,101 @@ async fn hosted_scan_pins_pnpm7_member_locks_without_a_root_lock() {
         "{codes:?}"
     );
     assert!(!root.join("pnpm-lock.yaml").exists());
+}
+
+/// #556: with `gitBranchLockfile` on, pnpm installs a branch from its own
+/// `pnpm-lock.<branch>.yaml` whenever one exists. Hosted mode pinned the
+/// stale `pnpm-lock.yaml` beside it and reported success while every fresh
+/// install on the branch stayed upstream; with only the branch lock it said
+/// "run `pnpm install`", which just rewrites the branch lock. Both now
+/// refuse with `redirect_pnpm_git_branch_lockfile`, confirm nothing and
+/// write nothing (a rewriter-level refusal: the run itself still exits 0,
+/// like `redirect_pnpm_member_locks_unresolved`).
+#[tokio::test]
+#[serial]
+async fn hosted_scan_refuses_a_git_branch_lockfile_project() {
+    let server = MockServer::start().await;
+    mock_discovery(&server).await;
+    mock_reference(&server).await;
+    for (case, root_lock, workspace, npmrc) in [
+        (
+            "both locks",
+            true,
+            "packages:\n  - '.'\ngitBranchLockfile: true\n",
+            None,
+        ),
+        (
+            "branch lock only",
+            false,
+            "packages:\n  - '.'\ngitBranchLockfile: true\n",
+            None,
+        ),
+        (
+            "pnpm 10 .npmrc",
+            true,
+            "packages:\n  - '.'\n",
+            Some("git-branch-lockfile=true\n"),
+        ),
+    ] {
+        let tmp = tempfile::tempdir().unwrap();
+        let root = tmp.path();
+        write_pnpm_project(root);
+        let lock = std::fs::read_to_string(root.join("pnpm-lock.yaml")).unwrap();
+        std::fs::write(root.join("pnpm-lock.feature.yaml"), &lock).unwrap();
+        if !root_lock {
+            std::fs::remove_file(root.join("pnpm-lock.yaml")).unwrap();
+        }
+        std::fs::write(root.join("pnpm-workspace.yaml"), workspace).unwrap();
+        if let Some(npmrc) = npmrc {
+            std::fs::write(root.join(".npmrc"), npmrc).unwrap();
+        }
+        let pkg = std::fs::read_to_string(root.join("package.json")).unwrap();
+
+        let (code, doc) = run_hosted_json(root, &server.uri());
+        assert_eq!(code, Some(0), "{case}: {doc}");
+        assert_eq!(doc["redirect"]["redirected"], 0, "{case}: {doc}");
+        assert_eq!(
+            doc["redirect"]["rewrittenFiles"],
+            serde_json::json!([]),
+            "{case}"
+        );
+        let codes: Vec<&str> = doc["redirect"]["warnings"]
+            .as_array()
+            .into_iter()
+            .flatten()
+            .filter_map(|w| w["code"].as_str())
+            .collect();
+        assert!(
+            codes.contains(&"redirect_pnpm_git_branch_lockfile")
+                && !codes.contains(&"redirect_pnpm_no_lockfile"),
+            "{case}: {codes:?}"
+        );
+        assert!(
+            warning_texts(&doc).contains("pnpm-lock.feature.yaml"),
+            "{case}: {doc}"
+        );
+        if root_lock {
+            assert_eq!(
+                std::fs::read_to_string(root.join("pnpm-lock.yaml")).unwrap(),
+                lock,
+                "{case}: the stale root lock is left alone"
+            );
+        }
+        assert_eq!(
+            std::fs::read_to_string(root.join("pnpm-lock.feature.yaml")).unwrap(),
+            lock,
+            "{case}"
+        );
+        assert_eq!(
+            std::fs::read_to_string(root.join("pnpm-workspace.yaml")).unwrap(),
+            workspace,
+            "{case}: no trust key"
+        );
+        assert_eq!(
+            std::fs::read_to_string(root.join("package.json")).unwrap(),
+            pkg,
+            "{case}"
+        );
+        assert_no_ledger(root);
+    }
 }

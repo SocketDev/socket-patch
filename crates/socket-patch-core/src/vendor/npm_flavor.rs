@@ -254,6 +254,12 @@ pub(crate) async fn detect_npm_lock_flavor(
             ));
         }
 
+        // Only a pnpm branch lock (`gitBranchLockfile`, #556): name the
+        // setting, not a missing lock `pnpm install` would never write.
+        if let Some(refusal) = pnpm_lock::git_branch_lock_refusal(project_root).await {
+            return Err(refusal);
+        }
+
         // Nothing recognizable.
         return Err((
             "vendor_lockfile_missing",
@@ -1054,6 +1060,27 @@ mod tests {
         touch(tmp.path(), "pnpm-lock.yaml", PNPM_9).await;
         let (code, _) = detect_npm_lock_flavor(tmp.path()).await.unwrap_err();
         assert_eq!(code, "vendor_yarn_berry_unsupported");
+    }
+
+    /// Only a `gitBranchLockfile` branch lock: pnpm's lock exists, just
+    /// not under the name vendoring wires, so the refusal names the
+    /// setting rather than "no lockfile — run your install first" (#556).
+    #[tokio::test]
+    async fn a_lone_git_branch_lock_names_the_setting() {
+        let tmp = tempfile::tempdir().unwrap();
+        touch(tmp.path(), "package.json", "{}").await;
+        touch(tmp.path(), "pnpm-lock.feature.yaml", PNPM_9).await;
+        let (code, _) = detect_npm_lock_flavor(tmp.path()).await.unwrap_err();
+        assert_eq!(code, "vendor_lockfile_missing", "setting off: no lock");
+        touch(
+            tmp.path(),
+            "pnpm-workspace.yaml",
+            "packages:\n  - '.'\ngitBranchLockfile: true\n",
+        )
+        .await;
+        let (code, detail) = detect_npm_lock_flavor(tmp.path()).await.unwrap_err();
+        assert_eq!(code, "vendor_pnpm_git_branch_lockfile");
+        assert!(detail.contains("pnpm-lock.feature.yaml"), "{detail}");
     }
 
     #[tokio::test]

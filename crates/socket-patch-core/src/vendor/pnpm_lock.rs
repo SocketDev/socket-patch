@@ -476,6 +476,26 @@ impl ProjectLock {
     }
 }
 
+/// The refusal for a project whose `gitBranchLockfile` setting installs
+/// the branch from a `pnpm-lock.<branch>.yaml` (#556): the wiring edits
+/// `pnpm-lock.yaml` only, and pnpm would then fail every
+/// `--frozen-lockfile` install on the branch over the overrides the
+/// manifest gained. Also raised by the flavor probe when the branch lock
+/// is the only one.
+pub(super) async fn git_branch_lock_refusal(project_root: &Path) -> Option<(&'static str, String)> {
+    use crate::utils::pnpm_workspace::{git_branch_locks, GitBranchLocks};
+    let view = crate::vendor::lock_inventory::ProjectView::Disk(project_root);
+    let branch = git_branch_locks(&view).await?;
+    Some((
+        "vendor_pnpm_git_branch_lockfile",
+        format!(
+            "{}; vendoring wires {PNPM_LOCK} only, so nothing was changed — {}",
+            branch.describe(),
+            GitBranchLocks::REMEDY
+        ),
+    ))
+}
+
 /// Read the pair, refusing (before any write) a file that is missing,
 /// unreadable, not the shape the surgery has fixtures for, or CRLF.
 async fn read_project(
@@ -504,6 +524,9 @@ async fn read_project(
             )));
         }
     };
+    if let Some(refusal) = git_branch_lock_refusal(project_root).await {
+        return Err(Box::new(refused(refusal.0, refusal.1)));
+    }
     let lock_text = match read_regular_to_string(&project_root.join(PNPM_LOCK)).await {
         Ok(text) => text,
         Err(e) => {
@@ -5149,6 +5172,48 @@ snapshots:
                 .exists(),
             "refusal stages no artifact"
         );
+    }
+
+    /// `gitBranchLockfile` with a branch lock: pnpm installs the branch from
+    /// `pnpm-lock.<branch>.yaml`, so wiring `pnpm-lock.yaml` (stale there)
+    /// would break every `--frozen-lockfile` install on an overrides
+    /// mismatch. Refused before any write, by the pre-flight too (#556).
+    #[tokio::test]
+    async fn a_git_branch_lock_refuses_before_any_write() {
+        let fx = fixture_with(P1_BEFORE_PKG, P1_BEFORE_LOCK).await;
+        let workspace = "packages:\n  - '.'\ngitBranchLockfile: true\n";
+        tokio::fs::write(fx.root().join(PNPM_WORKSPACE), workspace)
+            .await
+            .unwrap();
+        tokio::fs::write(fx.root().join("pnpm-lock.feature.yaml"), P1_BEFORE_LOCK)
+            .await
+            .unwrap();
+        for dry_run in [true, false] {
+            let detail =
+                expect_refused(fx.vendor(dry_run).await, "vendor_pnpm_git_branch_lockfile");
+            assert!(
+                detail.contains("pnpm-lock.feature.yaml")
+                    && detail.contains("--merge-git-branch-lockfiles"),
+                "{detail}"
+            );
+        }
+        let (planned, looped) = preflight_then_vendor(&fx).await;
+        assert_eq!(planned, Err("vendor_pnpm_git_branch_lockfile"));
+        assert_eq!(looped, Err("vendor_pnpm_git_branch_lockfile"));
+        assert_eq!(fx.read(PNPM_LOCK).await, P1_BEFORE_LOCK, "lock untouched");
+        assert_eq!(fx.read(PACKAGE_JSON).await, P1_BEFORE_PKG, "pkg untouched");
+        assert_eq!(
+            fx.read(PNPM_WORKSPACE).await,
+            workspace,
+            "workspace untouched"
+        );
+        assert!(!fx.root().join(".socket/vendor").exists());
+
+        // The setting with no branch lock installs from pnpm-lock.yaml.
+        tokio::fs::remove_file(fx.root().join("pnpm-lock.feature.yaml"))
+            .await
+            .unwrap();
+        assert!(matches!(fx.vendor(false).await, VendorOutcome::Done { .. }));
     }
 
     /// A CRLF pnpm-lock.yaml (Windows autocrlf checkout) passes the version

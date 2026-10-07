@@ -163,6 +163,11 @@ fn classify(rel: &str, root_files: &BTreeSet<&str>) -> Option<Need> {
         if rel.ends_with(".py") && root_files.contains(format!("{rel}.lock").as_str()) {
             return Some(Need::Text);
         }
+        // A pnpm branch lock refuses the pnpm pins under
+        // `gitBranchLockfile` (#556); only its presence matters.
+        if crate::utils::pnpm_workspace::is_git_branch_lock_name(rel) {
+            return Some(Need::Present);
+        }
         return None;
     }
     let rush = root_files.contains("rush.json");
@@ -436,6 +441,7 @@ pub fn candidate_files() -> Vec<String> {
         "*.py (beside *.py.lock)",
         "pylock.toml",
         "pylock.*.toml",
+        "pnpm-lock.*.yaml (presence only)",
         "**/Cargo.toml (Cargo workspaces)",
     ] {
         out.insert(pattern.to_string());
@@ -472,6 +478,7 @@ mod tests {
             blob("web/yarn.lock"),
             blob("web/.yarnrc.yml"),
             blob("web/node_modules/x/package-lock.json"),
+            blob("pnpm-lock.feature.yaml"),
         ];
         entries.push(TreeEntryInput {
             path: "pnpm-workspace.yaml".into(),
@@ -501,7 +508,7 @@ mod tests {
             ]
         );
         assert_eq!(s.fetch_binary, vec!["bun.lockb"]);
-        assert_eq!(s.present_only, vec![".pnp.cjs"]);
+        assert_eq!(s.present_only, vec![".pnp.cjs", "pnpm-lock.feature.yaml"]);
         assert_eq!(s.symlinks, vec!["pnpm-workspace.yaml"]);
         assert_eq!(s.ignored_count, 2);
     }

@@ -85,6 +85,14 @@ The backticked slug in each row is the value `-e`/`--ecosystems` accepts (e.g.
   `vex` and `rollback` read the member locks too. Member locks beside a root
   lock that lists member importers are stale and ignored. A member list the
   CLI cannot read is refused with `redirect_pnpm_member_locks_unresolved`.
+  With `gitBranchLockfile` on (`git-branch-lockfile=true` in `.npmrc` on
+  pnpm 10 and older), pnpm installs a branch from its own
+  `pnpm-lock.<branch>.yaml`, which neither mode can pin: while such a lock
+  exists, hosted mode refuses the pnpm pins with
+  `redirect_pnpm_git_branch_lockfile` and vendored mode with
+  `vendor_pnpm_git_branch_lockfile`. Turn the setting off and run
+  `pnpm install --merge-git-branch-lockfiles`, then re-run. With no branch
+  lock, `pnpm-lock.yaml` is the lock pnpm installs from and is pinned as usual.
   For 9.0 root or member locks, the CLI configures `trustLockfile: true` in
   the root `pnpm-workspace.yaml` unless opted out with `--no-trust-lockfile-config` or
   explicitly disabled by the project. pnpm >=11 needs this for hosted URLs.
