@@ -25,6 +25,8 @@ const INTEGRITY_LEN: usize = 65;
 /// parent (verified against a real Bun 1.3.14 lock, fixture
 /// `bun-lockb-bundled`).
 const BEHAVIOR_BUNDLED: u8 = 0x40;
+/// Bun's `Dependency.Behavior.peer` bit.
+const BEHAVIOR_PEER: u8 = 0x10;
 /// Written by this codec in the last eight bytes of the root package's
 /// resolution (its value union, which a root resolution never reads — early
 /// writers leave uninitialized bytes there, and every supported reader
@@ -353,6 +355,272 @@ impl BunLockb {
             }
         }
         Ok(found)
+    }
+
+    /// Fold the leaf `duplicates` of package `kept` into it, the lock Bun
+    /// itself writes for one package that several dependents resolve to:
+    /// their dependency edges resolve to `kept`, the edges hoisting would
+    /// now deduplicate leave the trees (and a tree they leave empty goes
+    /// too), and their rows leave every package column, later IDs moving
+    /// down by one. Bun's frozen install re-hoists the lock and refuses one
+    /// whose trees differ, so this is only done where hoisting is exactly
+    /// predictable: every record involved has no dependencies of its own (a
+    /// leaf spawns no subtree), and no edge to it is a peer, nor any edge in
+    /// the lock bundled (a bundled edge starts a new hoisting root).
+    /// `Ok(false)` leaves the lock unchanged.
+    pub(crate) fn merge_packages(
+        &mut self,
+        kept: usize,
+        duplicates: &[usize],
+    ) -> Result<bool, String> {
+        let mut candidate = self.clone();
+        let merged = candidate.merge_packages_inner(kept, duplicates)?;
+        if merged {
+            *self = candidate;
+        }
+        Ok(merged)
+    }
+
+    fn merge_packages_inner(&mut self, kept: usize, duplicates: &[usize]) -> Result<bool, String> {
+        self.check_editable()?;
+        self.check_id(kept)?;
+        for &id in duplicates {
+            self.check_id(id)?;
+            if id == 0 || id == kept {
+                return Err("bun.lockb: invalid duplicate package".into());
+            }
+        }
+        if duplicates.is_empty() {
+            return Ok(false);
+        }
+        let style = self.hash_style()?;
+        // The same normalizations as any record edit (`set_package`).
+        self.promote_legacy_format()?;
+        self.normalize_workspace_behaviors()?;
+        for &id in duplicates.iter().chain([&kept]) {
+            if !self.package_dependency_range(id)?.is_empty() {
+                return Ok(false);
+            }
+        }
+        let dependencies = self.dependency_array()?;
+        let resolutions = self.buffer_array(2)?;
+        let edges = resolutions.data.len() / 4;
+        let mut resolved = Vec::with_capacity(edges);
+        for index in 0..edges {
+            let behavior = self.data[dependencies.data.start + index * 26 + 16];
+            let mut id = u32_at(&self.data, resolutions.data.start + index * 4)? as usize;
+            if duplicates.contains(&id) {
+                id = kept;
+            }
+            if behavior & BEHAVIOR_BUNDLED != 0 || (id == kept && behavior & BEHAVIOR_PEER != 0) {
+                return Ok(false);
+            }
+            resolved.push(id);
+        }
+        let name_hash = |edge: usize| u64_at(&self.data, dependencies.data.start + edge * 26 + 8);
+
+        // Bun's hoister places an edge where it is declared unless the
+        // nearest ancestor tree holding the same name holds the same
+        // package, which deduplicates it. Merging only turns other packages
+        // into `kept`, so an edge to `kept` leaves its tree exactly when
+        // that nearest ancestor (parents precede children) now resolves to
+        // `kept` too.
+        let trees = self.buffer_array(0)?;
+        let hoisted = self.buffer_array(1)?;
+        if trees.data.len() % 20 != 0 {
+            return Err("bun.lockb: invalid tree buffer".into());
+        }
+        let mut nodes = Vec::new();
+        for at in trees.data.clone().step_by(20) {
+            let field = |i: usize| u32_at(&self.data, at + i * 4).map(|v| v as usize);
+            let (off, len) = (field(3)?, field(4)?);
+            if off + len > hoisted.data.len() / 4 {
+                return Err("bun.lockb: invalid tree dependency slice".into());
+            }
+            let placed = (off..off + len)
+                .map(|i| u32_at(&self.data, hoisted.data.start + i * 4).map(|v| v as usize))
+                .collect::<Result<Vec<_>, _>>()?;
+            nodes.push((field(0)?, field(1)?, field(2)?, placed));
+        }
+        for index in 0..nodes.len() {
+            let parent = nodes[index].2;
+            if parent != u32::MAX as usize && parent >= index {
+                return Ok(false);
+            }
+            let mut placed = std::mem::take(&mut nodes[index].3);
+            let mut deduplicated = Vec::new();
+            for &edge in &placed {
+                if resolved.get(edge) != Some(&kept) {
+                    continue;
+                }
+                let hash = name_hash(edge)?;
+                let mut ancestor = parent;
+                while ancestor != u32::MAX as usize {
+                    let mut same_name = nodes[ancestor]
+                        .3
+                        .iter()
+                        .filter(|&&e| e < edges && name_hash(e).is_ok_and(|h| h == hash));
+                    if let Some(&nearest) = same_name.next() {
+                        if resolved[nearest] == kept {
+                            deduplicated.push(edge);
+                        }
+                        break;
+                    }
+                    ancestor = nodes[ancestor].2;
+                }
+            }
+            placed.retain(|edge| !deduplicated.contains(edge));
+            if placed.is_empty() && !deduplicated.is_empty() {
+                if nodes.iter().any(|node| node.2 == index) {
+                    return Ok(false);
+                }
+                nodes[index].0 = usize::MAX;
+            }
+            nodes[index].3 = placed;
+        }
+        let mut renumbered = Vec::with_capacity(nodes.len());
+        let mut next = 0;
+        for node in &nodes {
+            renumbered.push(next);
+            if node.0 != usize::MAX {
+                next += 1;
+            }
+        }
+        let (mut tree_bytes, mut hoisted_bytes) = (Vec::new(), Vec::new());
+        for (index, (id, dependency, parent, placed)) in nodes.iter().enumerate() {
+            if *id == usize::MAX {
+                continue;
+            }
+            let id = if *id == index { renumbered[index] } else { *id };
+            let parent = if *parent == u32::MAX as usize {
+                *parent
+            } else {
+                renumbered[*parent]
+            };
+            for value in [
+                id,
+                *dependency,
+                parent,
+                hoisted_bytes.len() / 4,
+                placed.len(),
+            ] {
+                tree_bytes.extend_from_slice(&(value as u32).to_le_bytes());
+            }
+            for &edge in placed {
+                hoisted_bytes.extend_from_slice(&(edge as u32).to_le_bytes());
+            }
+        }
+
+        let new_id = |id: usize| id - duplicates.iter().filter(|&&d| d < id).count();
+        let mut resolution_bytes = Vec::with_capacity(edges * 4);
+        for (index, &id) in resolved.iter().enumerate() {
+            let raw = u32_at(&self.data, resolutions.data.start + index * 4)?;
+            let id = if id < self.count {
+                new_id(id) as u32
+            } else {
+                raw
+            };
+            resolution_bytes.extend_from_slice(&id.to_le_bytes());
+        }
+        let meta = self.package_start + self.count * (32 + self.resolution_size);
+        for row in 0..self.count {
+            let at = meta + row * 88 + 8;
+            if u32_at(&self.data, at)? as usize == row {
+                self.data[at..at + 4].copy_from_slice(&(new_id(row) as u32).to_le_bytes());
+            }
+        }
+        let mut widths = vec![8, 8, self.resolution_size, 8, 8, 88, 20];
+        if self.fields == 8 {
+            widths.push(49);
+        }
+        let mut columns = Vec::new();
+        let mut column = self.package_start;
+        for width in widths {
+            for row in (0..self.count).filter(|row| !duplicates.contains(row)) {
+                let at = column + row * width;
+                columns.extend_from_slice(&self.data[at..at + width]);
+            }
+            column += self.count * width;
+        }
+        let count = self.count - duplicates.len();
+        *self = self.relayout(
+            count,
+            &columns,
+            [
+                Some(tree_bytes),
+                Some(hoisted_bytes),
+                Some(resolution_bytes),
+            ],
+        )?;
+        self.normalize_production_pool()?;
+        self.update_hash(style)?;
+        Ok(true)
+    }
+
+    /// The lock re-laid with `count` packages in `columns` and the first
+    /// buffers replaced, the way Bun's serializer writes one: each buffer
+    /// keeps its descriptor and type prefix, then zero padding to an
+    /// eight-byte data start; everything after the six buffers moves by the
+    /// size difference, which must keep the extensions' alignment.
+    fn relayout(
+        &self,
+        count: usize,
+        columns: &[u8],
+        replaced: [Option<Vec<u8>>; 3],
+    ) -> Result<Self, String> {
+        let arrays = (0..6)
+            .map(|index| self.buffer_array(index))
+            .collect::<Result<Vec<_>, _>>()?;
+        let mut data = self.data[..self.package_start].to_vec();
+        data.extend_from_slice(columns);
+        put_u64(&mut data, PACKAGES_AT, count);
+        let package_end = data.len();
+        put_u64(&mut data, PACKAGES_AT + 32, package_end);
+        for (index, array) in arrays.iter().enumerate() {
+            let bytes = match replaced.get(index) {
+                Some(Some(bytes)) => bytes.as_slice(),
+                _ => &self.data[array.data.clone()],
+            };
+            let padding = self.data[array.descriptor + 16..array.data.start]
+                .iter()
+                .rev()
+                .take_while(|b| **b == 0)
+                .count();
+            let descriptor = data.len();
+            data.extend_from_slice(&self.data[array.descriptor..array.data.start - padding]);
+            if !bytes.is_empty() {
+                data.resize(data.len().next_multiple_of(8), 0);
+            }
+            let start = data.len();
+            data.extend_from_slice(bytes);
+            let end = data.len();
+            put_u64(&mut data, descriptor, start);
+            put_u64(&mut data, descriptor + 8, end);
+        }
+        let end = arrays[5].data.end;
+        if (data.len() as i128 - end as i128) % 8 != 0 {
+            return Err("bun.lockb: re-laid buffers would misalign the extensions".into());
+        }
+        let shift = |value: usize| (value as i128 + data.len() as i128 - end as i128) as usize;
+        let total = shift(self.total);
+        let extensions: Vec<_> = self
+            .extensions
+            .iter()
+            .map(|array| {
+                (
+                    shift(array.descriptor),
+                    shift(array.data.start),
+                    shift(array.data.end),
+                )
+            })
+            .collect();
+        data.extend_from_slice(&self.data[end..]);
+        put_u64(&mut data, TOTAL_AT, total);
+        for (descriptor, start, end) in extensions {
+            put_u64(&mut data, descriptor, start);
+            put_u64(&mut data, descriptor + 8, end);
+        }
+        Self::parse(&data)
     }
 
     pub(crate) fn set_package(
@@ -2387,5 +2655,128 @@ mod tests {
         lock.set_package(1, "a.tgz", &digest()).unwrap();
         assert_eq!(lock.package(1).unwrap().resolution, "a.tgz");
         assert_eq!(lock.bytes().len(), original_len);
+    }
+
+    /// The `bun.lockb` each Bun wrote for a workspace vendored once (uuid
+    /// `80630680-…`) after a late dependent of minimist@1.2.2 was added: a
+    /// new member (`late`, hoisted after the vendored record, so it nests
+    /// its registry copy) or `bun add` in an existing one (`adder`, hoisted
+    /// first, so the vendored record nests instead).
+    const LATE_DEPENDENT: [(&str, &[u8]); 4] = [
+        (
+            "1.3.9-late",
+            include_bytes!("../../tests/fixtures/bun-lockb/late-dependent/1.3.9-late.lockb"),
+        ),
+        (
+            "1.3.9-adder",
+            include_bytes!("../../tests/fixtures/bun-lockb/late-dependent/1.3.9-adder.lockb"),
+        ),
+        (
+            "1.4.2-late",
+            include_bytes!("../../tests/fixtures/bun-lockb/late-dependent/1.4.2-late.lockb"),
+        ),
+        (
+            "1.4.2-adder",
+            include_bytes!("../../tests/fixtures/bun-lockb/late-dependent/1.4.2-adder.lockb"),
+        ),
+    ];
+
+    /// Each hoisting tree as `(parent, names of the packages it places)`.
+    fn tree_placements(lock: &BunLockb) -> Vec<(u32, Vec<String>)> {
+        let trees = lock.buffer_array(0).unwrap();
+        let hoisted = lock.buffer_array(1).unwrap();
+        let resolutions = lock.buffer_array(2).unwrap();
+        let packages = lock.packages().unwrap();
+        trees
+            .data
+            .step_by(20)
+            .map(|at| {
+                let field = |i: usize| u32_at(&lock.data, at + i * 4).unwrap() as usize;
+                let mut names: Vec<_> = (field(3)..field(3) + field(4))
+                    .map(|i| {
+                        let edge = u32_at(&lock.data, hoisted.data.start + i * 4).unwrap();
+                        let id = u32_at(&lock.data, resolutions.data.start + edge as usize * 4);
+                        packages[id.unwrap() as usize].name.clone()
+                    })
+                    .collect();
+                names.sort();
+                (field(2) as u32, names)
+            })
+            .collect()
+    }
+
+    /// REGRESSION (#861): the late dependent's registry record folds into
+    /// the vendored tarball record — one record per resolution, as Bun
+    /// writes it, so the isolated linker gets one store directory — and the
+    /// trees become what Bun's frozen install re-hoists: the nested copy is
+    /// deduplicated against the hoisted one and its emptied tree dropped.
+    /// The re-laid buffers keep Bun's eight-byte data alignment.
+    #[test]
+    fn late_duplicate_folds_into_the_tarball_record_as_bun_hoists_it() {
+        for (label, bytes) in LATE_DEPENDENT {
+            let member = label.rsplit('-').next().unwrap();
+            let mut lock = BunLockb::parse(bytes).unwrap();
+            let minimist: Vec<_> = lock
+                .packages()
+                .unwrap()
+                .into_iter()
+                .filter(|p| p.name == "minimist")
+                .collect();
+            assert_eq!(minimist.len(), 2, "{label}");
+            let kept = minimist
+                .iter()
+                .find(|p| p.resolution.starts_with(".socket/"));
+            let kept = kept.unwrap().id;
+            let duplicate = minimist.iter().find(|p| p.id != kept).unwrap().id;
+            assert_eq!(tree_placements(&lock).len(), 2, "{label}: Bun nests a copy");
+
+            assert!(lock.merge_packages(kept, &[duplicate]).unwrap(), "{label}");
+            lock.validate_mutation().unwrap();
+            let merged = BunLockb::parse(&lock.bytes()).unwrap();
+            let packages = merged.packages().unwrap();
+            assert_eq!(packages.len(), 5, "{label}");
+            let minimist: Vec<_> = packages.iter().filter(|p| p.name == "minimist").collect();
+            assert_eq!(minimist.len(), 1, "{label}: {packages:?}");
+            assert!(minimist[0]
+                .resolution
+                .starts_with(".socket/vendor/npm/80630680-"));
+            let meta = merged.package_start + merged.count * (32 + merged.resolution_size);
+            for row in 0..merged.count {
+                assert_eq!(
+                    u32_at(&merged.data, meta + row * 88 + 8).unwrap() as usize,
+                    row
+                );
+            }
+            let mut expected = ["consumer", member, "is-number", "minimist"];
+            expected.sort();
+            assert_eq!(
+                tree_placements(&merged),
+                [(u32::MAX, expected.iter().map(|n| n.to_string()).collect())],
+                "{label}"
+            );
+            for array in (0..6)
+                .map(|i| merged.buffer_array(i).unwrap())
+                .chain(merged.extensions.iter().cloned())
+                .filter(|a| !a.data.is_empty())
+            {
+                assert_eq!(array.data.start % 8, 0, "{label}: aligned");
+            }
+        }
+    }
+
+    /// A record with dependencies of its own spawns a subtree whose
+    /// hoisting the merge does not reproduce: it declines, lock unchanged.
+    #[test]
+    fn merge_declines_records_with_dependencies() {
+        let bytes =
+            include_bytes!("../../tests/fixtures/bun-lockb/0.8.1-production-complex/bun.lockb");
+        let mut lock = BunLockb::parse(bytes).unwrap();
+        let parent = (1..lock.count)
+            .find(|&id| !lock.package_dependency_range(id).unwrap().is_empty())
+            .unwrap();
+        let other = (1..lock.count).find(|&id| id != parent).unwrap();
+        assert!(!lock.merge_packages(parent, &[other]).unwrap());
+        assert!(!lock.merge_packages(other, &[parent]).unwrap());
+        assert_eq!(lock.bytes(), bytes);
     }
 }

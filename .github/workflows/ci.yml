@@ -1066,8 +1066,12 @@ jobs:
           - {os: ubuntu-latest, suite: e2e_bun_lockb, bun: '1.1.45', test_filter: --include-ignored}
           # Bun >= 1.4 migrating a hosted workspace bun.lockb to bun.lock
           # (#803; its reader must be 1.4+) and a vendored one, then
-          # reverting it (#784; skipped by the < 1.2 readers above).
-          - {os: ubuntu-latest, suite: e2e_bun_lockb, bun: '1.4.2', test_filter: --include-ignored text_migration}
+          # reverting it (#784; skipped by the < 1.2 readers above). Both
+          # 1.4.2 and 1.3.14 also run the isolated-linker vendored re-run
+          # after a late dependent (#861); 1.3 re-hoists a frozen binary lock
+          # and refuses one whose trees changed.
+          - {os: ubuntu-latest, suite: e2e_bun_lockb, bun: '1.4.2', test_filter: --include-ignored text_migration workspace_late_dependent}
+          - {os: ubuntu-latest, suite: e2e_bun_lockb, bun: '1.3.14', test_filter: --include-ignored workspace_late_dependent}
           # Real-vlt capstones (DESIGN §8.4): wiremock patch service and a local
           # npm registry fed from npmjs, driven by the pinned vlt release
           # (`node vlt.js`, installed below from a sha512-checked `npm pack`).

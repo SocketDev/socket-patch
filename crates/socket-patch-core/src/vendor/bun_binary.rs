@@ -33,6 +33,72 @@ fn is_ours(package: &BinaryPackage, name: &str, leaf: &str) -> bool {
         && package.resolution.ends_with(&format!("/{leaf}"))
 }
 
+/// A record vendoring `coords` rewires: the exact `name@version`, or one of
+/// our own tarballs for it.
+fn is_target(package: &BinaryPackage, coords: &NpmCoords, leaf: &str) -> bool {
+    (package.name == coords.name && package.version.as_deref() == Some(&coords.version))
+        || is_ours(package, &coords.name, leaf)
+}
+
+/// Bun's writer keeps one package record per resolution, but after a project
+/// is vendored a new dependent of the package (a member added later, `bun
+/// add` in a member) gets a second, nested registry record of the same
+/// `name@version`, because the hoisted one is a local tarball now. Rewiring
+/// it to the same tarball gives two records one isolated store directory,
+/// and frozen installs then fail intermittently with `EEXIST` (#861). So
+/// such records are folded into ONE kept record (the one already at
+/// `target`, else one of ours, else the first), as Bun's own re-save
+/// would. A record some bundled edge reaches is left to the rewrite: its
+/// parent's tarball ships that copy. Where the lock's hoisting is not
+/// exactly predictable ([`BunLockb::merge_packages`]) the records are all
+/// rewritten as before, with a warning. Returns the records left to
+/// rewrite, re-read after renumbering, and whether the lock changed.
+fn merge_duplicates(
+    lock: &mut BunLockb,
+    matches: Vec<BinaryPackage>,
+    target: &str,
+    coords: &NpmCoords,
+    leaf: &str,
+    warnings: &mut Vec<VendorWarning>,
+) -> Result<(Vec<BinaryPackage>, bool), String> {
+    let mut candidates: Vec<_> = matches.iter().filter(|p| !p.bundled).collect();
+    candidates.sort_by_key(|p| {
+        (
+            p.resolution != target,
+            !is_ours(p, &coords.name, leaf),
+            p.id,
+        )
+    });
+    let Some((kept, duplicates)) = candidates.split_first() else {
+        return Ok((matches, false));
+    };
+    if duplicates.is_empty() {
+        return Ok((matches, false));
+    }
+    let duplicates: Vec<usize> = duplicates.iter().map(|p| p.id).collect();
+    if !lock.merge_packages(kept.id, &duplicates)? {
+        warnings.push(VendorWarning::new(
+            "vendor_bun_lockb_duplicate_records",
+            format!(
+                "{LOCK} has {} records of {}@{} that cannot be folded into one, so each is \
+                 rewired to the same tarball; Bun's isolated linker can fail to install two \
+                 records with one tarball (EEXIST); the hoisted linker \
+                 (`[install] linker = \"hoisted\"` in bunfig.toml) installs it",
+                duplicates.len() + 1,
+                coords.name,
+                coords.version
+            ),
+        ));
+        return Ok((matches, false));
+    }
+    let matches = lock
+        .packages()?
+        .into_iter()
+        .filter(|p| is_target(p, coords, leaf) && !p.bundled_only)
+        .collect();
+    Ok((matches, true))
+}
+
 #[allow(clippy::too_many_arguments)]
 pub(crate) async fn vendor(
     purl: &str,
@@ -105,6 +171,19 @@ pub(crate) async fn vendor(
         };
     };
     let mut wiring = Vec::new();
+    let (matches, merged) = match merge_duplicates(
+        &mut lock,
+        matches,
+        &staged.rel_tgz,
+        &coords,
+        &leaf,
+        &mut warnings,
+    ) {
+        Ok(v) => v,
+        Err(e) => {
+            return done_failure_unstage(purl, e, root, &coords.uuid_dir_rel, preexisted).await
+        }
+    };
     for package in matches {
         if package.resolution == staged.rel_tgz
             && package.integrity.as_deref() == Some(&staged.packed.integrity)
@@ -161,7 +240,7 @@ pub(crate) async fn vendor(
             .await
         }
     };
-    let lock_changed = !wiring.is_empty();
+    let lock_changed = merged || !wiring.is_empty();
     let mut mirror_backups: Vec<(PathBuf, Option<Vec<u8>>)> = Vec::new();
     for (workspace, rel) in &mirrors {
         let path = root.join(rel);
@@ -335,10 +414,7 @@ pub(super) fn preflight_package(
     let (bundled_only, matches): (Vec<_>, Vec<_>) = project
         .packages
         .iter()
-        .filter(|p| {
-            (p.name == coords.name && p.version.as_deref() == Some(&coords.version))
-                || is_ours(p, &coords.name, leaf)
-        })
+        .filter(|p| is_target(p, coords, leaf))
         .cloned()
         .partition(|p| p.bundled_only);
     let bundled: Vec<_> = matches
@@ -1490,5 +1566,92 @@ mod rebuild_tests {
             None,
             "another version's tarball"
         );
+    }
+}
+
+#[cfg(test)]
+mod duplicate_tests {
+    use super::*;
+    use crate::hash::git_sha256::compute_git_sha256_from_bytes;
+    use crate::vendor::test_support as ts;
+
+    /// The uuid the fixtures were first vendored under.
+    const UUID: &str = "80630680-4da6-45f9-bba8-b888e0ffd58c";
+    const PURL: &str = "pkg:npm/minimist@1.2.2";
+    const BEFORE: &[u8] = b"module.exports = 'original';\n";
+    const AFTER: &[u8] = b"module.exports = 'patched';\n";
+
+    /// REGRESSION (#861): the vendored re-run after Bun gave a late
+    /// dependent its own registry record of minimist@1.2.2 (see
+    /// `bun_lockb::tests::LATE_DEPENDENT`) leaves ONE record, the tarball,
+    /// that every dependency edge resolves to — never two records with one
+    /// tarball resolution, which the isolated linker installs into the same
+    /// store directory (`EEXIST`). (The e2e `workspace_late_dependent_*`
+    /// test reverts it through the first run's ledger.)
+    #[tokio::test]
+    async fn rerun_folds_the_late_registry_copy_into_the_tarball_record() {
+        for name in ["1.3.9-late", "1.3.9-adder", "1.4.2-late", "1.4.2-adder"] {
+            let tmp = tempfile::tempdir().unwrap();
+            let root = tmp.path();
+            let fixture = format!(
+                "{}/tests/fixtures/bun-lockb/late-dependent/{name}.lockb",
+                env!("CARGO_MANIFEST_DIR")
+            );
+            std::fs::copy(&fixture, root.join(LOCK)).unwrap();
+            let installed = root.join("node_modules/minimist");
+            std::fs::create_dir_all(&installed).unwrap();
+            std::fs::write(
+                installed.join("package.json"),
+                br#"{"name":"minimist","version":"1.2.2"}"#,
+            )
+            .unwrap();
+            std::fs::write(installed.join("index.js"), BEFORE).unwrap();
+            let blobs = root.join(".socket/blobs");
+            std::fs::create_dir_all(&blobs).unwrap();
+            let after_hash = compute_git_sha256_from_bytes(AFTER);
+            std::fs::write(blobs.join(&after_hash), AFTER).unwrap();
+            let record: PatchRecord = serde_json::from_value(serde_json::json!({
+                "uuid": UUID, "exportedAt": "", "files": {"package/index.js": {
+                    "beforeHash": compute_git_sha256_from_bytes(BEFORE), "afterHash": after_hash,
+                }}, "vulnerabilities": {}, "description": "", "license": "MIT", "tier": "free",
+            }))
+            .unwrap();
+            let (result, entry, warnings) = ts::expect_done(
+                ts::vendor_bun(
+                    PURL,
+                    &installed,
+                    root,
+                    &record,
+                    &PatchSources::blobs_only(&blobs),
+                    "",
+                    false,
+                    false,
+                    None,
+                )
+                .await,
+            );
+            assert!(result.success, "{name}: {result:?}");
+            assert!(
+                !ts::has_warning(&warnings, "vendor_bun_lockb_duplicate_records"),
+                "{name}: {warnings:?}"
+            );
+            let entry = entry.expect("the lock changed");
+            let lock = BunLockb::parse(&std::fs::read(root.join(LOCK)).unwrap()).unwrap();
+            lock.validate_mutation().unwrap();
+            let minimist: Vec<_> = lock
+                .packages()
+                .unwrap()
+                .into_iter()
+                .filter(|p| p.name == "minimist")
+                .collect();
+            assert_eq!(
+                minimist
+                    .iter()
+                    .map(|p| p.resolution.as_str())
+                    .collect::<Vec<_>>(),
+                [entry.artifact.path.as_str()],
+                "{name}: one record per tarball resolution"
+            );
+        }
     }
 }

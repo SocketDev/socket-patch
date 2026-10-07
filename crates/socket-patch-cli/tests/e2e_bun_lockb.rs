@@ -321,7 +321,9 @@ impl Fixture {
         let dependencies = match shape {
             "alias" => json!({"alias":"npm:minimist@1.2.2", "is-number":"7.0.0"}),
             "transitive" => json!({"mkdirp":"0.5.3", "is-number":"7.0.0"}),
-            "workspace" => json!({"consumer":"workspace:*", "is-number":"7.0.0"}),
+            "workspace" | "workspace-adder" => {
+                json!({"consumer":"workspace:*", "is-number":"7.0.0"})
+            }
             "workspace-nested" => {
                 json!({"consumer":"workspace:*", "minimist":"1.2.8", "is-number":"7.0.0"})
             }
@@ -348,6 +350,14 @@ impl Fixture {
             std::fs::write(
                 project.join("packages/consumer/package.json"),
                 br#"{"name":"consumer","version":"1.0.0","dependencies":{"minimist":"1.2.2"}}"#,
+            )
+            .unwrap();
+        }
+        if shape == "workspace-adder" {
+            std::fs::create_dir_all(project.join("packages/adder")).unwrap();
+            std::fs::write(
+                project.join("packages/adder/package.json"),
+                br#"{"name":"adder","version":"1.0.0","dependencies":{"is-number":"7.0.0"}}"#,
             )
             .unwrap();
         }
@@ -1301,6 +1311,164 @@ async fn workspace_text_migration_heals_on_rerun() {
         std::fs::read_to_string(checkout.join("bun.lock")).unwrap(),
         healed,
         "the frozen install keeps the lock"
+    );
+}
+
+/// The `(name, resolution)` package lines of Bun's own yarn-style dump of
+/// the project's `bun.lockb`.
+fn dumped_records(fixture: &Fixture) -> Vec<String> {
+    let output = command(&fixture.reader, &fixture.project)
+        .arg("bun.lockb")
+        .output()
+        .unwrap();
+    let dump =
+        String::from_utf8_lossy(&require_success(output, "bun bun.lockb").stdout).into_owned();
+    dump.lines()
+        .filter(|line| line.trim_start().starts_with("resolved "))
+        .map(str::trim)
+        .map(str::to_string)
+        .collect()
+}
+
+/// #861: after a vendored workspace `bun.lockb`, a new dependent of the
+/// patched package (a member added later, or `bun add` in an existing
+/// member) makes Bun write a second, nested REGISTRY record of the same
+/// `name@version`, since the hoisted one is a local tarball now. The
+/// vendored re-run must not rewire that record to the same tarball: two
+/// records with one tarball resolution share one isolated store directory,
+/// and frozen installs fail intermittently with `EEXIST`. It folds the
+/// record into the existing tarball record instead, so every fresh frozen
+/// install links the patched bytes into the new dependent too. The member
+/// names hoist the late dependent after (`late`) and before (`adder`) the
+/// vendored one. Isolated linker (Bun >= 1.3); not named `native_binary_*`
+/// (the backtest matrix runs exactly those).
+#[tokio::test(flavor = "multi_thread")]
+#[serial_test::serial]
+async fn workspace_late_dependent_rerun_shares_the_tarball_record() {
+    for (shape, member) in [("workspace", "late"), ("workspace-adder", "adder")] {
+        let Some(fixture) = Fixture::new(shape) else {
+            return;
+        };
+        let raw = String::from_utf8_lossy(
+            &command(&fixture.reader, &fixture.project)
+                .arg("--version")
+                .output()
+                .unwrap()
+                .stdout,
+        )
+        .trim()
+        .to_string();
+        let major_minor: Vec<u32> = raw
+            .split('.')
+            .take(2)
+            .filter_map(|p| p.parse().ok())
+            .collect();
+        if major_minor.as_slice() < [1, 3].as_slice() {
+            eprintln!("SKIP late workspace dependent: Bun {raw} has no isolated linker");
+            return;
+        }
+        late_dependent_rerun(&fixture, member).await;
+    }
+}
+
+async fn late_dependent_rerun(fixture: &Fixture, member: &str) {
+    let project = &fixture.project;
+    std::fs::write(
+        project.join("bunfig.toml"),
+        "[install]\nsaveTextLockfile = false\nlinker = \"isolated\"\n",
+    )
+    .unwrap();
+    let server = MockServer::start().await;
+    mock_api(&server, fixture, "minimist").await;
+    fixture.stage();
+    let first = cli(project, &["vendor", "--offline"]);
+    assert_eq!(
+        first["summary"]["applied"], 1,
+        "{member}: first vendor: {first}"
+    );
+
+    let dir = project.join("packages").join(member);
+    let mut add = if dir.exists() {
+        let mut add = command(&fixture.reader, &dir);
+        add.args(["add", "minimist@1.2.2", "--ignore-scripts"]);
+        add
+    } else {
+        std::fs::create_dir_all(&dir).unwrap();
+        std::fs::write(
+            dir.join("package.json"),
+            format!(
+                r#"{{"name":"{member}","version":"1.0.0","dependencies":{{"minimist":"1.2.2"}}}}"#
+            ),
+        )
+        .unwrap();
+        let mut install = command(&fixture.reader, project);
+        install.args(["install", "--ignore-scripts"]);
+        install
+    };
+    let output = add
+        .env(
+            "BUN_INSTALL_CACHE_DIR",
+            fixture.temp.path().join("late-cache"),
+        )
+        .env("BUN_INSTALL", fixture.temp.path().join("late-home"))
+        .output()
+        .unwrap();
+    require_success(output, &format!("{member}: the late dependent"));
+    let before = dumped_records(fixture);
+    assert!(
+        before.iter().any(
+            |line| line.contains("minimist-1.2.2.tgz") && !line.contains(".socket/vendor/npm/")
+        ),
+        "{member}: Bun writes a nested registry record: {before:?}"
+    );
+
+    let rerun = cli(project, &["vendor", "--offline"]);
+    assert_eq!(
+        rerun["summary"]["applied"], 1,
+        "{member}: vendored re-run: {rerun}"
+    );
+    let after = dumped_records(fixture);
+    assert_eq!(
+        after
+            .iter()
+            .filter(|line| line.contains("minimist-1.2.2.tgz"))
+            .collect::<Vec<_>>(),
+        [&format!(
+            "resolved \".socket/vendor/npm/{UUID}/minimist-1.2.2.tgz\""
+        )],
+        "{member}: one record, the tarball: {after:?}"
+    );
+    // EEXIST was intermittent (about half the cold frozen installs).
+    for attempt in 0..6 {
+        let checkout = fixture.frozen_install(
+            &format!("{member}-{attempt}"),
+            &fixture.patched,
+            &fixture.bystander,
+            false,
+        );
+        assert_eq!(
+            std::fs::read(
+                checkout
+                    .join("packages")
+                    .join(member)
+                    .join("node_modules/minimist/index.js")
+            )
+            .unwrap(),
+            fixture.patched,
+            "{member} attempt {attempt}: the late dependent links the patched bytes"
+        );
+    }
+    let again = cli(project, &["vendor", "--offline"]);
+    assert_eq!(
+        again["summary"]["skipped"], 1,
+        "{member}: idempotent: {again}"
+    );
+    cli(project, &["vendor", "--revert"]);
+    fixture.frozen_install(
+        &format!("{member}-reverted"),
+        &fixture.original,
+        &fixture.bystander,
+        false,
     );
 }
 

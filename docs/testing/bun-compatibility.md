@@ -92,7 +92,8 @@ Binary locks are parsed and patched directly. The codec understands the original
 version-1 representation, the version-2 URL representation, the later scripts
 package field, and version 3's wider semantic-version representation. It keeps
 package IDs, dependency edges, hoisting data, package metadata and optional
-extensions intact. Historical workspace dependency flags and literals are
+extensions intact, except where a vendored re-run folds a duplicate record of
+the patched package into its tarball record (#861, below). Historical workspace dependency flags and literals are
 normalized to the equivalent representation accepted by old and new readers;
 the original encoding is retained for rollback. Unknown versions and invalid
 offsets fail closed.
@@ -243,6 +244,25 @@ runners) from the GitHub releases and verifies it against `SHASUMS256.txt`. Ever
   superseding re-vendor carries that tuple over as its pre-vendor original
   (#784). Covered by `e2e_bun_lockb::vendored_text_migration_reverts_to_registry`
   (skipped below Bun 1.2) on the 1.4.2 leg.
+- **Late dependents of a vendored package (#861).** After a workspace
+  `bun.lockb` is vendored, a new dependent of the patched `name@version` (a
+  member added later, or `bun add` in a member) makes Bun write a second,
+  nested registry record of it, since the hoisted record is now a local
+  tarball. Rewiring that record to the same tarball leaves two records with
+  one resolution, which Bun's own writer never produces: on the isolated
+  linker both map to one `node_modules/.bun/` store directory and cold
+  frozen installs fail intermittently with `EEXIST` (measured on 1.3.9 and
+  1.4.2; 1.2.23, the hoisted linker and text `bun.lock` were unaffected).
+  The vendored re-run instead folds the duplicate into the tarball record:
+  its dependents resolve to that record, the record is dropped and later
+  package IDs renumbered, and the hoisting trees are rewritten the way Bun
+  re-hoists them (1.3.x refuses a frozen binary lock whose re-hoisted trees
+  differ). This is limited to records without dependencies of their own,
+  where the re-hoist is exactly predictable; otherwise every record is
+  rewired as before, with `vendor_bun_lockb_duplicate_records`. Covered by
+  `e2e_bun_lockb::workspace_late_dependent_rerun_shares_the_tarball_record`
+  on the 1.3.14 and 1.4.2 legs, and hermetically by the
+  `bun-lockb/late-dependent/` fixtures.
 - **Workspace-member local tarballs.** Bun 1.2.x–1.3.x resolve a
   local-tarball dependency declared by a workspace member relative to the
   member (`.socket/vendor/…` → ENOENT on `bun install`); 1.4.x resolve it
