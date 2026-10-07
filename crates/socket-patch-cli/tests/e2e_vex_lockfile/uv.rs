@@ -10,7 +10,7 @@
 //! rewriters (`rewrite_python_lock`, `rewrite_project_metadata`,
 //! `rewrite_script_metadata`) over real uv output (uv 0.11 `uv lock` /
 //! `uv lock --script` / `uv export --format pylock.toml` grammar), and the
-//! writer-driven cells run the real `scan --mode hosted --vex` / `scan --vendor
+//! writer-driven cells run the real `scan --mode hosted --vex` / `scan --mode vendored
 //! --vex` binaries against a wiremock patch API. The package is a made-up
 //! `vexfixture`, so no interpreter's global site-packages on the test host
 //! can hold a copy (a no-venv python project falls back to the global
@@ -36,7 +36,7 @@
 //!      installed + patched → attests after hashing; installed pristine →
 //!      `not_applied`; a pin-less hosted entry needs an installed tree.
 //!
-//! Plus the embedded entry points (`scan --mode hosted --vex`, `scan --vendor
+//! Plus the embedded entry points (`scan --mode hosted --vex`, `scan --mode vendored
 //! --vex`, `apply --vex`).
 
 use crate::vex_e2e_common;
@@ -1368,7 +1368,7 @@ fn pinless_hosted_entry_needs_an_installed_tree() {
 }
 
 // ════════════════════════════════════════════════════════════════════════
-// Writer-driven: the REAL `scan --mode hosted --vex` / `scan --vendor --vex`
+// Writer-driven: the REAL `scan --mode hosted --vex` / `scan --mode vendored --vex`
 // write the wiring and the ledgers; then the manifest (and the ledgers) are
 // deleted and standalone `vex` must still attest — and stop attesting once
 // the real revert unwinds the wiring with the ledger left behind.
@@ -1631,7 +1631,7 @@ fn scan_redirect_wiring_attests_without_manifest_or_ledger() {
     }
 }
 
-/// `scan --vendor --vex --vendor-source build` over the installed (pristine)
+/// `scan --mode vendored --vex --vendor-source build` over the installed (pristine)
 /// dist rebuilds the patched wheel into `.socket/vendor/pypi/<uuid>/`, wires
 /// the lock, writes the ledger (never a manifest: vendored mode is
 /// manifest-free) and attests in-run. A legacy manifest seeded beside the
@@ -1662,7 +1662,8 @@ fn scan_vendor_wiring_attests_without_manifest_or_ledger() {
         let embedded = p.root.join("embedded.vex.json");
         let args = vec![
             "scan",
-            "--vendor",
+            "--mode",
+            "vendored",
             "--vendor-source",
             "service",
             "--vex",

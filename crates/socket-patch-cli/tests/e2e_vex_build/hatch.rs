@@ -14,7 +14,7 @@
 //!    hosted rewriter reads the exact pin from the declaration);
 //! 2. the synthetic patch appends a marker to `six.py`; a wiremock Socket
 //!    API serves discovery, the grant, the view and the patched wheel;
-//! 3. hosted: `scan --mode hosted --vex`; vendored: `scan --vendor
+//! 3. hosted: `scan --mode hosted --vex`; vendored: `scan --mode vendored
 //!    --vendor-source build --vex` — the same-run VEX attests, and the
 //!    declaration becomes `six @ <url>#sha256=…` /
 //!    `six @ {root:uri}/.socket/vendor/pypi/<uuid>/<wheel>#sha256=…`;
@@ -201,7 +201,7 @@ fn hatch() -> Option<Hatch> {
 fn scan_mode_args(mode: Mode) -> Vec<&'static str> {
     match mode {
         Mode::Hosted => vec!["--mode=hosted"],
-        Mode::Vendored => vec!["--vendor", "--vendor-source", "service"],
+        Mode::Vendored => vec!["--mode", "vendored", "--vendor-source", "service"],
     }
 }
 

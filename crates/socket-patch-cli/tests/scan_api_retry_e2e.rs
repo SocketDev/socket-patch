@@ -428,7 +428,7 @@ async fn exhausted_detail_fetch_is_a_json_warning() {
     let (code, stdout, stderr) = run_scan(
         tmp.path(),
         &server.uri(),
-        &["--json", "--apply", "--dry-run"],
+        &["--json", "--mode", "agent", "--dry-run"],
         &[],
     );
     let v = json(&stdout);

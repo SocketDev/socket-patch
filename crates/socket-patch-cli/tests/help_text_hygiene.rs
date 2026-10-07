@@ -196,7 +196,7 @@ fn vendor_and_repair_summaries_read_as_one_line() {
     );
     assert!(
         text.lines().any(|l| l
-            == "  repair    Agent mode: download missing patch artifacts and clean up unused ones [aliases: gc]"),
+            == "  repair    Agent mode: download missing patch artifacts and clean up unused ones"),
         "{text}"
     );
     let repair = long_help(&["repair"]);

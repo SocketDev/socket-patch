@@ -693,7 +693,7 @@ fn bare_uuid_fallback_treats_uuid_as_get_identifier() {
 fn each_subcommand_help_prints_usage() {
     let tmp = tempfile::tempdir().unwrap();
     let subcommands = [
-        "apply", "rollback", "get", "scan", "list", "remove", "repair", "gc",
+        "apply", "rollback", "get", "scan", "list", "remove", "repair",
     ];
     for sub in subcommands {
         let (code, stdout, _stderr) = common::run_with_env(tmp.path(), &[sub, "--help"], &[]);
@@ -718,8 +718,6 @@ fn top_level_help_prints_all_subcommands() {
             "top-level help missing {sub}; got: {stdout}"
         );
     }
-    // `gc` is the visible alias.
-    assert!(stdout.contains("gc"), "top-level help missing `gc` alias");
 }
 
 #[test]

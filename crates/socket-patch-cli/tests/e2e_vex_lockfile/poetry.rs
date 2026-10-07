@@ -12,7 +12,7 @@
 //! locks of every Poetry release (`socket-patch-core/tests/fixtures/poetry/
 //! <0.12.17..2.4.3>/`: lock formats "0" / "1.0" / "1.1" / "2.0" / "2.1"), and
 //! the writer-driven cells run the real `scan --mode hosted --vex` / `scan
-//! --vendor --vex` / `apply --vex` / `vendor --vex` binaries against a
+//! --mode vendored --vex` / `apply --vex` / `vendor --vex` binaries against a
 //! wiremock patch API. The package is renamed to a made-up `vexfixture`, so
 //! no interpreter's global site-packages on the test host can hold a copy.
 //!
@@ -1240,7 +1240,7 @@ fn strip_pin(lock: &str, pin: &str) -> String {
 }
 
 // ════════════════════════════════════════════════════════════════════════
-// Writer-driven: the REAL `scan --mode hosted --vex` / `scan --vendor --vex`
+// Writer-driven: the REAL `scan --mode hosted --vex` / `scan --mode vendored --vex`
 // write the wiring and the ledgers; then the manifest (and the ledgers) are
 // deleted and standalone + embedded VEX must still attest — and stop
 // attesting once the real revert unwinds the wiring with the ledger left
@@ -1554,7 +1554,7 @@ fn scan_redirect_wiring_attests_without_manifest_or_ledger() {
     }
 }
 
-/// `scan --vendor --vex --vendor-source build` over the installed (pristine)
+/// `scan --mode vendored --vex --vendor-source build` over the installed (pristine)
 /// dist rebuilds the patched wheel into `.socket/vendor/pypi/<uuid>/`, wires
 /// the lock, writes the ledger (never a manifest: vendored mode is
 /// manifest-free) and attests in-run. A legacy manifest seeded beside the
@@ -1580,7 +1580,8 @@ fn scan_vendor_wiring_attests_without_manifest_or_ledger() {
         let embedded_doc = p.root.join("embedded.vex.json");
         let args = vec![
             "scan",
-            "--vendor",
+            "--mode",
+            "vendored",
             "--vendor-source",
             "service",
             "--vex",

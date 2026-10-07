@@ -137,15 +137,10 @@ fn defaults_match_contract() {
     assert_eq!(args.common.api_token, None);
     assert_eq!(args.common.ecosystems, None);
     assert!(
-        !args.apply,
-        "--apply default is false (scan --json stays read-only)"
-    );
-    assert!(
         !args.prune,
         "--prune default is false (GC is opt-in in v3.0)"
     );
     assert!(!args.sync, "--sync default is false");
-    assert!(!args.vendor, "--vendor default is false");
     assert_eq!(args.mode, None, "--mode default is None (no mode selector)");
     assert!(!args.common.dry_run, "--dry-run default is false");
     assert!(
@@ -385,9 +380,9 @@ fn unknown_flag_fails() {
     assert_eq!(err.kind(), clap::error::ErrorKind::UnknownArgument);
 }
 
-// --- `--apply` flag and JSON shape ----------------------------------------
+// --- `--mode agent` and JSON shape -----------------------------------------
 //
-// `--apply` (== `--mode agent`) opts callers into the discover → select →
+// `--mode agent` opts callers into the discover → select →
 // apply pipeline; a bare scan defaults to hosted mode, and only
 // `--prune`/global scans without a mode are report-only. The subprocess test
 // below also locks in the `updates` key that bots rely on to summarize what
@@ -395,23 +390,23 @@ fn unknown_flag_fails() {
 
 #[test]
 #[serial_test::serial]
-fn apply_flag_long_form() {
-    let args = parse_scan(&["--apply"]);
-    assert!(args.apply);
+fn mode_agent_long_form() {
+    let args = parse_scan(&["--mode", "agent"]);
+    assert_eq!(args.mode, Some(ScanMode::Agent));
 }
 
 #[test]
 #[serial_test::serial]
-fn apply_flag_combines_with_json_and_yes() {
-    let args = parse_scan(&["--apply", "--json", "--yes"]);
-    assert!(args.apply);
+fn mode_agent_combines_with_json_and_yes() {
+    let args = parse_scan(&["--mode", "agent", "--json", "--yes"]);
+    assert_eq!(args.mode, Some(ScanMode::Agent));
     assert!(args.common.json);
     assert!(args.common.yes);
 }
 
 // --- `--prune` / `--sync` / `--dry-run` flags (v3.0 GC opt-in) ------------
 //
-// `--prune` opts into GC. `--sync` is sugar for `--apply --prune`.
+// `--prune` opts into GC. `--sync` is sugar for `--mode agent --prune`.
 // `--dry-run` (`-d`) previews what those flags would do without mutating.
 
 #[test]
@@ -423,9 +418,9 @@ fn prune_flag_long_form() {
 
 #[test]
 #[serial_test::serial]
-fn prune_combines_with_apply_and_json() {
-    let args = parse_scan(&["--apply", "--json", "--yes", "--prune"]);
-    assert!(args.apply);
+fn prune_combines_with_mode_agent_and_json() {
+    let args = parse_scan(&["--mode", "agent", "--json", "--yes", "--prune"]);
+    assert_eq!(args.mode, Some(ScanMode::Agent));
     assert!(args.common.json);
     assert!(args.common.yes);
     assert!(args.prune);
@@ -436,9 +431,9 @@ fn prune_combines_with_apply_and_json() {
 fn sync_flag_long_form() {
     let args = parse_scan(&["--sync"]);
     assert!(args.sync);
-    // --sync alone doesn't set --apply or --prune (the derivation
+    // --sync alone doesn't set --mode or --prune (the derivation
     // happens inside scan::run, not at parser time).
-    assert!(!args.apply);
+    assert_eq!(args.mode, None);
     assert!(!args.prune);
 }
 
@@ -570,18 +565,17 @@ fn scan_json_empty_cwd_emits_updates_key() {
     );
     assert!(
         v.get("apply").is_none(),
-        "no `apply` sub-object may appear when --apply was not passed"
+        "no `apply` sub-object may appear in a report-only scan"
     );
 }
 
-// --- `--mode` selector (documented spelling of the mode booleans) ----------
+// --- `--mode` selector ---------------------------------------------------------
 //
-// `--mode <hosted|vendored|agent>` is the RELEASED spelling of the three
-// mode flags. `resolve_mode_flags` (run at the top of `scan::run`,
-// exercised directly here) makes `args.mode` the single source of truth:
-// the `--vendor`/`--apply`/`--sync` booleans fold INTO the enum (they are
-// input spellings, never read downstream), and the cross-mode rules clap
-// can't express (a value-dependent conflict) are enforced.
+// `--mode <hosted|vendored|agent>` selects the mode. `resolve_mode_flags`
+// (run at the top of `scan::run`, exercised directly here) makes
+// `args.mode` the single source of truth: `--sync` resolves to agent, and
+// the cross-mode rule clap can't express (a value-dependent conflict
+// between `--sync` and another `--mode`) is enforced.
 
 /// Parse `extra` (must parse cleanly at the clap level), then run the mode
 /// fold — mirroring exactly what `scan::run` does before it reads the
@@ -596,7 +590,7 @@ fn parse_and_resolve(extra: &[&str]) -> Result<ScanArgs, String> {
 #[serial_test::serial]
 fn mode_hosted_is_the_source_of_truth() {
     // The parser records the enum verbatim and the fold leaves it as the
-    // single source of truth (the booleans are inputs, not outputs).
+    // single source of truth.
     let folded = parse_and_resolve(&["--mode", "hosted"]).expect("fold ok");
     assert_eq!(folded.mode, Some(ScanMode::Hosted));
 }
@@ -606,12 +600,6 @@ fn mode_hosted_is_the_source_of_truth() {
 fn mode_vendored_is_the_source_of_truth() {
     let folded = parse_and_resolve(&["--mode", "vendored"]).expect("fold ok");
     assert_eq!(folded.mode, Some(ScanMode::Vendored));
-    let folded = parse_and_resolve(&["--vendor"]).expect("fold ok");
-    assert_eq!(
-        folded.mode,
-        Some(ScanMode::Vendored),
-        "--vendor == --mode vendored"
-    );
 }
 
 #[test]
@@ -619,13 +607,7 @@ fn mode_vendored_is_the_source_of_truth() {
 fn mode_agent_is_the_source_of_truth() {
     let folded = parse_and_resolve(&["--mode", "agent"]).expect("fold ok");
     assert_eq!(folded.mode, Some(ScanMode::Agent));
-    let folded = parse_and_resolve(&["--apply"]).expect("fold ok");
-    assert_eq!(
-        folded.mode,
-        Some(ScanMode::Agent),
-        "--apply == --mode agent"
-    );
-    // --sync counts as an agent-mode spelling (its prune half is orthogonal).
+    // --sync selects agent mode (its prune half is orthogonal).
     let folded = parse_and_resolve(&["--sync"]).expect("fold ok");
     assert_eq!(
         folded.mode,
@@ -666,29 +648,21 @@ fn mode_rejects_unknown_value() {
 
 #[test]
 #[serial_test::serial]
-fn mode_hosted_with_vendor_boolean_errors() {
+fn mode_hosted_with_sync_errors() {
     // Clap ACCEPTS the combination (no value-dependent conflict is
-    // expressible), so the parse succeeds; the fold is what rejects a
-    // boolean belonging to a different mode.
-    let mut args = parse_scan(&["--mode", "hosted", "--vendor"]);
-    assert!(
-        resolve_mode_flags(&mut args).is_err(),
-        "--mode hosted + --vendor is a cross-mode contradiction"
-    );
-}
-
-#[test]
-#[serial_test::serial]
-fn mode_agent_with_apply_boolean_is_allowed() {
-    // Same mode spelled both ways is redundant but legal.
-    let folded = parse_and_resolve(&["--mode", "agent", "--apply"]).expect("same-mode ok");
-    assert_eq!(folded.mode, Some(ScanMode::Agent));
+    // expressible), so the parse succeeds; the fold is what rejects
+    // `--sync` (agent mode) next to a different `--mode`.
+    for mode in ["hosted", "vendored"] {
+        let mut args = parse_scan(&["--mode", mode, "--sync"]);
+        let err = resolve_mode_flags(&mut args).expect_err("cross-mode --sync");
+        assert!(err.contains("cannot be used with --sync"), "{err}");
+    }
 }
 
 #[test]
 #[serial_test::serial]
 fn mode_agent_with_sync_boolean_is_allowed() {
-    // --sync implies agent mode, so it counts as an agent-mode spelling.
+    // --sync implies agent mode, so `--mode agent` is redundant but legal.
     let folded = parse_and_resolve(&["--mode", "agent", "--sync"]).expect("same-mode ok");
     assert_eq!(folded.mode, Some(ScanMode::Agent));
     assert!(folded.sync);
@@ -696,18 +670,20 @@ fn mode_agent_with_sync_boolean_is_allowed() {
 
 #[test]
 #[serial_test::serial]
-fn legacy_mode_spellings_still_parse() {
-    // The boolean aliases keep working with no `--mode` given; the fold
-    // derives the mode enum from them (the inverse of the historical
-    // direction — `args.mode` is now the single source of truth).
-    assert!(parse_scan(&["--vendor"]).vendor);
-    assert!(parse_scan(&["--apply"]).apply);
-    let folded = parse_and_resolve(&["--vendor"]).expect("legacy fold ok");
-    assert_eq!(
-        folded.mode,
-        Some(ScanMode::Vendored),
-        "legacy --vendor folds into the mode selector"
-    );
+fn removed_mode_booleans_are_usage_errors() {
+    // v5 removed the hidden `--apply` / `--vendor` spellings: each is now
+    // an ordinary clap unknown-argument error.
+    for flag in ["--apply", "--vendor"] {
+        let err = match try_parse_scan(&[flag]) {
+            Ok(_) => panic!("{flag} should no longer parse"),
+            Err(e) => e,
+        };
+        assert_eq!(
+            err.kind(),
+            clap::error::ErrorKind::UnknownArgument,
+            "{flag}"
+        );
+    }
 }
 
 // --- scrub-list completeness guard -----------------------------------------
@@ -719,16 +695,14 @@ fn legacy_mode_spellings_still_parse() {
 /// `Debug` derive) are formatted individually.
 fn snap(a: &ScanArgs) -> String {
     format!(
-        "{:?} paths={:?} batch_size={:?} apply={} prune={} sync={} vendor={} \
+        "{:?} paths={:?} batch_size={:?} prune={} sync={} \
          mode={:?} all_releases={} vex={:?} vex_product={:?} \
          vex_no_verify={} vex_doc_id={:?} vex_compact={}",
         a.common,
         a.paths,
         a.batch_size,
-        a.apply,
         a.prune,
         a.sync,
-        a.vendor,
         a.mode,
         a.all_releases,
         a.vex.vex,

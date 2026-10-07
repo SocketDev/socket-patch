@@ -208,7 +208,7 @@ fn assert_before_hashes(gem_dir: &Path, files: &serde_json::Value) {
 }
 
 /// The "files are not patched" oracle used by `test_gem_dry_run` /
-/// `test_gem_save_only` (after `get --no-apply` / `get --save-only`) must
+/// `test_gem_save_only` (after `get --save-only`) must
 /// FAIL when the gem is actually in the applied state — otherwise a `get`
 /// that wrongly applies sails through the whole test. Hermetic stand-in for
 /// that masked regression: a gem dir whose files carry afterHash content
@@ -243,7 +243,7 @@ fn not_patched_oracle_catches_applied_state() {
     assert!(
         oracle.is_err(),
         "the not-patched oracle passed on a fully applied gem — it cannot \
-         catch a `get --no-apply`/`--save-only` that wrongly applies"
+         catch a `get --save-only` that wrongly applies"
     );
 
     // And it must PASS on the pristine state (no false failures).
@@ -565,7 +565,7 @@ fn test_gem_full_lifecycle() {
     );
 }
 
-/// `get --no-apply` + `apply --dry-run` should not modify files.
+/// `get --save-only` + `apply --dry-run` should not modify files.
 #[test]
 #[ignore]
 fn test_gem_dry_run() {
@@ -583,7 +583,7 @@ fn test_gem_dry_run() {
     let gem_dir = find_gem_dir(cwd);
 
     // Download without applying.
-    assert_run_ok(cwd, &["get", GEM_UUID, "--mode", "agent", "--no-apply"], "get --no-apply");
+    assert_run_ok(cwd, &["get", GEM_UUID, "--mode", "agent", "--save-only"], "get --save-only");
 
     // Read manifest to get file list and expected hashes.
     let manifest_path = cwd.join(".socket/manifest.json");
@@ -591,7 +591,7 @@ fn test_gem_dry_run() {
 
     // Files should still be original (not patched) — checked against the
     // manifest's beforeHash, an oracle independent of the current disk
-    // state (a snapshot taken after `get --no-apply` would pass even if
+    // state (a snapshot taken after `get --save-only` would pass even if
     // the flag regressed and applied).
     assert_before_hashes(&gem_dir, &files);
 

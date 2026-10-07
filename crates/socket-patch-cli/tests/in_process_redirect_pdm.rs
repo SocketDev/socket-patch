@@ -156,10 +156,8 @@ fn hosted_args(cwd: &Path, api_url: String, vex: Option<&Path>) -> ScanArgs {
         packages: Vec::new(),
         common: global(cwd, api_url),
         batch_size: Some(100),
-        apply: false,
         prune: false,
         sync: false,
-        vendor: false,
         mode: Some(socket_patch_cli::commands::scan::ScanMode::Hosted),
         all_releases: false,
         vex: VexEmbedArgs {

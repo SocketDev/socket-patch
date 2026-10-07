@@ -104,7 +104,7 @@ async fn assert_lock_only_discovers_with_env(
     envs: &[(&str, &str)],
     expected: &[&str],
 ) {
-    for mode in [&[][..], &["--vendor"][..]] {
+    for mode in [&[][..], &["--mode", "vendored"][..]] {
         let mock = MockServer::start().await;
         mount_empty_batch(&mock).await;
         let tmp = tempfile::tempdir().unwrap();

@@ -210,10 +210,10 @@ fn run_cli(root: &Path, mock_uri: &str, argv: &[&str]) -> (i32, String, String) 
     )
 }
 
-/// `scan --vendor --yes` to establish a vendored project; returns the
+/// `scan --mode vendored --yes` to establish a vendored project; returns the
 /// vendored tarball path.
 fn vendor_project(root: &Path, mock_uri: &str, extra: &[&str]) -> PathBuf {
-    let mut argv = vec!["scan", "--vendor", "--yes"];
+    let mut argv = vec!["scan", "--mode", "vendored", "--yes"];
     argv.extend_from_slice(extra);
     let (code, stdout, stderr) = run_cli(root, mock_uri, &argv);
     assert_eq!(code, 0, "vendor setup failed: {stdout} {stderr}");
@@ -837,9 +837,9 @@ fn add_healthy_cargo_dir_entry(root: &Path) -> PathBuf {
     dir
 }
 
-/// `scan --vendor --yes` the gem fixture; returns the vendored copy dir.
+/// `scan --mode vendored --yes` the gem fixture; returns the vendored copy dir.
 fn vendor_gem_project(root: &Path, mock_uri: &str) -> PathBuf {
-    let (code, stdout, stderr) = run_cli(root, mock_uri, &["scan", "--vendor", "--yes"]);
+    let (code, stdout, stderr) = run_cli(root, mock_uri, &["scan", "--mode", "vendored", "--yes"]);
     assert_eq!(code, 0, "gem vendor setup failed: {stdout} {stderr}");
     let copy = root.join(gem_copy_rel());
     assert_eq!(

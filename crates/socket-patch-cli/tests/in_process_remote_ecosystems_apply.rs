@@ -133,10 +133,8 @@ fn default_scan_args(cwd: &Path, eco: &str, api_url: String) -> ScanArgs {
             ..socket_patch_cli::args::GlobalArgs::default()
         },
         batch_size: Some(100),
-        apply: false,
         prune: false,
         sync: true,
-        vendor: false,
         mode: None,
         all_releases: false,
         vex: Default::default(),
@@ -211,14 +209,18 @@ async fn setup_apply_mock(
 
 /// Read `<cwd>/.socket/manifest.json`, parse it, and assert the agent-mode
 /// scan recorded `purl` with `uuid` and at least one patched-file entry.
-/// This is the signature the AGENT-mode `--apply`/`--sync` paths must leave
+/// This is the signature the AGENT-mode `--mode agent`/`--sync` paths must leave
 /// behind (manifest + blobs, applied by CI) — a test that only checks the
 /// on-disk bytes would miss a regression that patches the file but forgets to
 /// persist the manifest the CI re-apply depends on.
 fn assert_manifest_records(cwd: &Path, purl: &str, uuid: &str) {
     let manifest_path = cwd.join(".socket/manifest.json");
-    let raw = std::fs::read_to_string(&manifest_path)
-        .unwrap_or_else(|e| panic!("scan --apply must write {}: {e}", manifest_path.display()));
+    let raw = std::fs::read_to_string(&manifest_path).unwrap_or_else(|e| {
+        panic!(
+            "scan --mode agent must write {}: {e}",
+            manifest_path.display()
+        )
+    });
     let manifest: socket_patch_core::manifest::schema::PatchManifest =
         serde_json::from_str(&raw).expect("manifest.json parses");
     let record = manifest
@@ -696,11 +698,11 @@ async fn nuget_handcrafted_discovery() {
 }
 
 // ---------------------------------------------------------------------------
-// AGENT-mode `scan --apply` (+ manifest-written) coverage
+// AGENT-mode `scan --mode agent` (+ manifest-written) coverage
 //
-// The tests above exercise `scan --sync` (== `--apply --prune`) and assert
+// The tests above exercise `scan --sync` (== `--mode agent --prune`) and assert
 // only the on-disk bytes. These add the missing agent-mode signature checks
-// for npm/composer/maven/nuget: the pure `--apply` spelling (no prune) AND an
+// for npm/composer/maven/nuget: the pure `--mode agent` spelling (no prune) AND an
 // explicit assertion that `.socket/manifest.json` was written with the patch
 // record — the artifact a CI re-apply consumes. Each mock advertises a
 // `beforeHash` that MATCHES the handcrafted on-disk bytes, so the default
@@ -749,15 +751,15 @@ async fn npm_handcrafted_scan_apply_writes_manifest_and_patches() {
     )
     .await;
 
-    // `--apply` (NOT `--sync`): the pure agent-mode apply spelling.
+    // `--mode agent` (NOT `--sync`): the pure agent-mode apply spelling.
     let mut args = default_scan_args(tmp.path(), "npm", server.uri());
     args.common.global = false; // scan cwd-relative node_modules, not $(npm root -g)
     args.sync = false;
-    args.apply = true;
+    args.mode = Some(socket_patch_cli::commands::scan::ScanMode::Agent);
     let code = scan_run(args).await;
     assert_eq!(
         code, 0,
-        "scan --apply should fully apply the npm patch (exit 0)"
+        "scan --mode agent should fully apply the npm patch (exit 0)"
     );
 
     let after = std::fs::read(&index).expect("read after");
@@ -815,11 +817,11 @@ async fn composer_handcrafted_scan_apply_writes_manifest() {
     let mut args = default_scan_args(tmp.path(), "composer", server.uri());
     args.common.global = false;
     args.sync = false;
-    args.apply = true;
+    args.mode = Some(socket_patch_cli::commands::scan::ScanMode::Agent);
     let code = scan_run(args).await;
     assert_eq!(
         code, 0,
-        "scan --apply should fully apply the composer patch (exit 0)"
+        "scan --mode agent should fully apply the composer patch (exit 0)"
     );
 
     let after = std::fs::read(&payload).expect("read after");
@@ -869,11 +871,11 @@ async fn maven_handcrafted_scan_apply_writes_manifest() {
     // Maven probes MAVEN_REPO_LOCAL under the default `global` bypass.
     let mut args = default_scan_args(tmp.path(), "maven", server.uri());
     args.sync = false;
-    args.apply = true;
+    args.mode = Some(socket_patch_cli::commands::scan::ScanMode::Agent);
     let code = scan_run(args).await;
     assert_eq!(
         code, 0,
-        "scan --apply should fully apply the maven patch (exit 0)"
+        "scan --mode agent should fully apply the maven patch (exit 0)"
     );
 
     let after = std::fs::read(&payload_file).expect("read after");
@@ -925,11 +927,11 @@ async fn nuget_handcrafted_scan_apply_writes_manifest() {
 
     let mut args = default_scan_args(tmp.path(), "nuget", server.uri());
     args.sync = false;
-    args.apply = true;
+    args.mode = Some(socket_patch_cli::commands::scan::ScanMode::Agent);
     let code = scan_run(args).await;
     assert_eq!(
         code, 0,
-        "scan --apply should fully apply the nuget patch (exit 0)"
+        "scan --mode agent should fully apply the nuget patch (exit 0)"
     );
 
     let after = std::fs::read(&payload).expect("read after");

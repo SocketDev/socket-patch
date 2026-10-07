@@ -2,13 +2,17 @@
 //!
 //! These tests cover the parser surface that doesn't fit in
 //! `src/lib.rs::tests` — clap's auto-generated help/version handling, the
-//! "no subcommand" error kind, every subcommand name, and the
-//! visible_alias values (`download` for `get`, `gc` for `repair`).
+//! "no subcommand" error kind, every subcommand name, and the v4
+//! spellings v5 removed (`download`, `gc`, `scan --apply`/`--vendor`,
+//! `get --no-apply`), which must stay usage errors.
 //!
 //! Each subcommand name and alias here is part of the CLI contract
 //! defined in `crates/socket-patch-cli/CLI_CONTRACT.md`.
 
 use socket_patch_cli::{parse_argv_with_shortcuts, Cli, Commands};
+
+#[path = "common/hermetic.rs"]
+mod hermetic;
 
 /// Parse through the **production** entry point. `main.rs` does not call
 /// `Cli::try_parse_from` directly — it calls `parse_argv_with_shortcuts`, which
@@ -199,36 +203,59 @@ fn top_level_help() -> String {
     err.to_string()
 }
 
-#[test]
-fn download_alias_parses_as_get() {
-    // `download` is the visible_alias for `get` — wrappers in the wild
-    // call this name directly, so it has to keep working.
-    let cli = parse(&["socket-patch", "download", "some-id"])
-        .expect("`download` alias must parse as Get");
-    match cli.command {
-        Commands::Get(args) => assert_eq!(args.identifier, "some-id"),
-        _ => panic!("expected Commands::Get via `download` alias"),
-    }
+/// Spellings v5 removed with no deprecation release (#966). Each must be an
+/// ordinary clap usage error, and the two former subcommand aliases must be
+/// gone from `--help`.
+const REMOVED_SPELLINGS: &[&[&str]] = &[
+    &["scan", "--apply"],
+    &["scan", "--vendor"],
+    &["get", "some-id", "--no-apply"],
+    &["download", "some-id"],
+    &["gc"],
+];
 
-    // It must be a *visible* alias: clap lists visible aliases on the `get`
-    // row as `[aliases: download]`. A hidden alias would not appear here.
+#[test]
+fn removed_spellings_are_usage_errors() {
+    for argv in REMOVED_SPELLINGS {
+        let mut full = vec!["socket-patch"];
+        full.extend_from_slice(argv);
+        let err = expect_err(parse(&full));
+        assert!(
+            matches!(
+                err.kind(),
+                clap::error::ErrorKind::UnknownArgument | clap::error::ErrorKind::InvalidSubcommand
+            ),
+            "{argv:?}: expected a usage error, got {:?}",
+            err.kind()
+        );
+        assert_eq!(err.exit_code(), 2, "{argv:?}");
+    }
     let help = top_level_help();
     assert!(
-        help.contains("[aliases: download]"),
-        "`download` must be a visible alias of `get` in --help; got:\n{help}"
+        !help.contains("aliases"),
+        "no subcommand aliases remain; got:\n{help}"
     );
+    for line in help.lines() {
+        let first = line.split_whitespace().next();
+        assert!(
+            first != Some("download") && first != Some("gc"),
+            "removed alias listed in --help: {line:?}"
+        );
+    }
 }
 
 #[test]
-fn gc_alias_parses_as_repair() {
-    // `gc` is the visible_alias for `repair`.
-    let cli = parse(&["socket-patch", "gc"]).expect("`gc` alias must parse as Repair");
-    assert!(matches!(cli.command, Commands::Repair(_)));
-
-    // As above: `gc` must remain a visible alias of `repair`.
-    let help = top_level_help();
-    assert!(
-        help.contains("[aliases: gc]"),
-        "`gc` must be a visible alias of `repair` in --help; got:\n{help}"
-    );
+fn removed_spellings_exit_two_through_the_binary() {
+    let tmp = tempfile::tempdir().unwrap();
+    for argv in REMOVED_SPELLINGS {
+        let out = hermetic::binary_command()
+            .args(*argv)
+            .current_dir(tmp.path())
+            .env("SOCKET_TELEMETRY_DISABLED", "1")
+            .output()
+            .expect("run socket-patch");
+        let stderr = String::from_utf8_lossy(&out.stderr);
+        assert_eq!(out.status.code(), Some(2), "{argv:?}: {stderr}");
+        assert!(stderr.contains("error:"), "{argv:?}: {stderr}");
+    }
 }
