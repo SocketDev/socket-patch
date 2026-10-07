@@ -802,13 +802,16 @@ fn manifest_targets_npm(manifest: &PatchManifest) -> bool {
 /// package-manager layout gate below: scan cannot discover PnP packages so
 /// it never writes a manifest, and the loud `yarn_pnp_unsupported` refusal
 /// must still be reachable without one.
+/// The yarn-berry PnP refusal's envelope error text.
+const YARN_PNP_UNSUPPORTED: &str = "yarn-berry Plug'n'Play layout is not supported by socket-patch (packages live inside .yarn/cache zips). Use `yarn patch <pkg>` instead.";
+
 fn refuse_yarn_pnp(args: &ApplyArgs) -> i32 {
     if args.common.json {
         let mut env = Envelope::new(Command::Apply);
         env.dry_run = args.common.dry_run;
         env.mark_error(EnvelopeError::new(
             "yarn_pnp_unsupported",
-            "yarn-berry Plug'n'Play layout is not supported by socket-patch (packages live inside .yarn/cache zips). Use `yarn patch <pkg>` instead.",
+            YARN_PNP_UNSUPPORTED,
         ));
         println!("{}", env.to_pretty_json());
     } else {
@@ -964,7 +967,85 @@ pub async fn run(args: ApplyArgs) -> i32 {
         Err(code) => return code,
     };
 
-    run_locked(args, manifest_path, &client, lock).await
+    run_locked(args, manifest_path, &client, lock).await.code
+}
+
+/// One patch the nested apply failed: the manifest purl, a stable code
+/// (`apply_failed`, `package_not_installed`) and the error text — the same
+/// `errorCode` / `error` pair the standalone `apply --json` reports.
+#[derive(Clone, Debug, PartialEq, Eq)]
+pub(crate) struct ApplyFailure {
+    pub purl: String,
+    pub code: String,
+    pub error: String,
+}
+
+/// What a run of [`run_locked`] reports back. `apply` itself only needs
+/// `code`; `get` / `scan --mode agent` fold the rest into their own
+/// envelope, because the nested apply never prints JSON (#424).
+#[derive(Debug, Default)]
+pub(crate) struct ApplyRunReport {
+    /// The process exit code.
+    pub code: i32,
+    /// Per-patch failures.
+    pub failures: Vec<ApplyFailure>,
+    /// A failure not tied to one patch (unreadable manifest, the yarn PnP
+    /// refusal, unavailable patch sources, a failed embedded VEX), as
+    /// `(errorCode, error)`. Set only when `code != 0` and `failures`
+    /// alone would not explain it.
+    pub run_error: Option<(String, String)>,
+    /// The package keys apply patched or found already patched, so a
+    /// failed run's caller can count exactly what applied. Filled only
+    /// when `code != 0`.
+    pub applied: Vec<String>,
+}
+
+impl ApplyRunReport {
+    fn run_failure(code: i32, error_code: &str, error: impl Into<String>) -> Self {
+        Self {
+            code,
+            failures: Vec::new(),
+            run_error: Some((error_code.to_string(), error.into())),
+            applied: Vec::new(),
+        }
+    }
+}
+
+/// The per-patch failures of a failed apply loop: every failed result (one
+/// per package, the first error wins). With none, what failed the run is
+/// the in-scope manifest purls with no installed package that the
+/// project's lockfiles do not resolve either; beside a failed result those
+/// are only the "no matching installed package" warning, never a failure.
+fn collect_apply_failures(
+    results: &[ApplyResult],
+    unmatched: &[String],
+    lockfile_only: &HashSet<String>,
+) -> Vec<ApplyFailure> {
+    let mut failures: Vec<ApplyFailure> = Vec::new();
+    for r in results.iter().filter(|r| !r.success) {
+        if failures.iter().any(|f| f.purl == r.package_key) {
+            continue;
+        }
+        failures.push(ApplyFailure {
+            purl: r.package_key.clone(),
+            code: "apply_failed".to_string(),
+            error: r
+                .error
+                .clone()
+                .unwrap_or_else(|| "unknown error".to_string()),
+        });
+    }
+    if !failures.is_empty() {
+        return failures;
+    }
+    for purl in unresolved_purls(unmatched, lockfile_only) {
+        failures.push(ApplyFailure {
+            purl,
+            code: "package_not_installed".to_string(),
+            error: "No installed package matches this PURL".to_string(),
+        });
+    }
+    failures
 }
 
 /// The locked half of `apply`: everything from the manifest read on — the
@@ -976,13 +1057,14 @@ pub async fn run(args: ApplyArgs) -> i32 {
 /// re-acquire would contend) and the nested apply never builds a second
 /// client. `lock` is released explicitly once every mutation is done
 /// (output and a possibly slow telemetry POST must not keep a sibling
-/// waiting), otherwise on return.
+/// waiting), otherwise on return. The returned [`ApplyRunReport`] carries
+/// the exit code plus what failed, for a nested caller's envelope.
 pub(crate) async fn run_locked(
     args: ApplyArgs,
     manifest_path: PathBuf,
     client: &ApiClient,
     lock: LockGuard,
-) -> i32 {
+) -> ApplyRunReport {
     let api_token = client.api_token().cloned();
     let org_slug = client.org_slug().cloned();
 
@@ -995,11 +1077,14 @@ pub(crate) async fn run_locked(
         Ok(Some(m)) => m,
         Ok(None) => {
             lock.release();
-            return report_apply_failure(&args, "Invalid manifest", &api_token, &org_slug).await;
+            let code = report_apply_failure(&args, "Invalid manifest", &api_token, &org_slug).await;
+            return ApplyRunReport::run_failure(code, "apply_failed", "Invalid manifest");
         }
         Err(e) => {
             lock.release();
-            return report_apply_failure(&args, &e.to_string(), &api_token, &org_slug).await;
+            let error = e.to_string();
+            let code = report_apply_failure(&args, &error, &api_token, &org_slug).await;
+            return ApplyRunReport::run_failure(code, "apply_failed", error);
         }
     };
 
@@ -1017,7 +1102,11 @@ pub(crate) async fn run_locked(
     match detect_npm_pkg_manager(&args.common.cwd) {
         NpmPkgManager::YarnBerryPnP => {
             if eco_in_local_scope(&args.common, Ecosystem::Npm) && manifest_targets_npm(&manifest) {
-                return refuse_yarn_pnp(&args);
+                return ApplyRunReport::run_failure(
+                    refuse_yarn_pnp(&args),
+                    "yarn_pnp_unsupported",
+                    YARN_PNP_UNSUPPORTED,
+                );
             }
         }
         NpmPkgManager::Pnpm => {
@@ -1320,14 +1409,50 @@ pub(crate) async fn run_locked(
             // A requested-but-failed VEX flips an otherwise-successful
             // apply to a non-zero exit (fail-the-command contract).
             if success && !vex_failed {
-                0
+                return ApplyRunReport::default();
+            }
+            let failures = if success {
+                Vec::new()
             } else {
-                1
+                collect_apply_failures(&results, &unmatched, &lockfile_only)
+            };
+            let run_error = if let Some(Err(e)) = &vex_result {
+                Some((e.code.to_string(), e.message.clone()))
+            } else if failures.is_empty() {
+                // Nothing per-patch explains the failure: the run-level
+                // reason (sources unavailable) or a generic one.
+                Some(
+                    run_warnings
+                        .iter()
+                        .find(|w| is_stage_failure_code(&w.code))
+                        .map(|w| (w.code.clone(), w.detail.clone()))
+                        .unwrap_or_else(|| {
+                            (
+                                "apply_failed".to_string(),
+                                "One or more patches failed to apply".to_string(),
+                            )
+                        }),
+                )
+            } else {
+                None
+            };
+            // Vendor-owned results are skips, not applies.
+            let applied = results
+                .iter()
+                .filter(|r| r.success && r.package_path != VENDOR_OWNED_MARKER)
+                .map(|r| r.package_key.clone())
+                .collect();
+            ApplyRunReport {
+                code: 1,
+                failures,
+                run_error,
+                applied,
             }
         }
         Err(e) => {
             lock.release();
-            report_apply_failure(&args, &e, &api_token, &org_slug).await
+            let code = report_apply_failure(&args, &e, &api_token, &org_slug).await;
+            ApplyRunReport::run_failure(code, "apply_failed", e)
         }
     }
 }
@@ -4166,5 +4291,70 @@ mod tests {
             panic!("unexpected_gradle_bytes must not wedge on a FIFO leaf");
         }
         assert_eq!(result.unwrap(), None);
+    }
+
+    // --- collect_apply_failures (#424) -------------------------------------
+
+    fn failed_result(purl: &str, error: Option<&str>) -> ApplyResult {
+        ApplyResult {
+            package_key: purl.to_string(),
+            package_path: "/tmp/node_modules/x".to_string(),
+            success: false,
+            files_verified: Vec::new(),
+            files_patched: Vec::new(),
+            applied_via: HashMap::new(),
+            error: error.map(str::to_string),
+            sidecar: None,
+        }
+    }
+
+    #[test]
+    fn collect_apply_failures_reports_each_failed_package_once() {
+        let results = vec![
+            failed_result("pkg:npm/a@1.0.0", Some("Permission denied (os error 13)")),
+            failed_result("pkg:npm/a@1.0.0", Some("second copy")),
+            failed_result("pkg:npm/b@1.0.0", None),
+            sample_applied(VerifyStatus::Ready),
+        ];
+        let failures = collect_apply_failures(&results, &[], &HashSet::new());
+        assert_eq!(
+            failures,
+            vec![
+                ApplyFailure {
+                    purl: "pkg:npm/a@1.0.0".to_string(),
+                    code: "apply_failed".to_string(),
+                    error: "Permission denied (os error 13)".to_string(),
+                },
+                ApplyFailure {
+                    purl: "pkg:npm/b@1.0.0".to_string(),
+                    code: "apply_failed".to_string(),
+                    error: "unknown error".to_string(),
+                },
+            ]
+        );
+    }
+
+    #[test]
+    fn collect_apply_failures_names_unresolved_purls_only_when_nothing_else_failed() {
+        let unmatched = vec![
+            "pkg:npm/gone@1.0.0".to_string(),
+            "pkg:npm/opt@1.0.0".to_string(),
+        ];
+        let lockfile_only = HashSet::from(["pkg:npm/opt@1.0.0".to_string()]);
+        let failures = collect_apply_failures(&[], &unmatched, &lockfile_only);
+        assert_eq!(
+            failures,
+            vec![ApplyFailure {
+                purl: "pkg:npm/gone@1.0.0".to_string(),
+                code: "package_not_installed".to_string(),
+                error: "No installed package matches this PURL".to_string(),
+            }],
+            "a lockfile-resolved purl never fails the run (#403)"
+        );
+        // Beside a real failure, an uninstalled patch is only a warning.
+        let results = vec![failed_result("pkg:npm/a@1.0.0", Some("boom"))];
+        let failures = collect_apply_failures(&results, &unmatched, &lockfile_only);
+        assert_eq!(failures.len(), 1, "{failures:?}");
+        assert_eq!(failures[0].purl, "pkg:npm/a@1.0.0");
     }
 }

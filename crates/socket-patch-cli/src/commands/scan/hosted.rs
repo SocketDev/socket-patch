@@ -749,9 +749,15 @@ pub(crate) async fn run_redirect_selected(
     }
     // A workspace member whose lock lives in an ancestor directory (pnpm
     // workspace / `lockfile-dir`, cargo workspace): the rewriters would
-    // read only the member, so refuse before any takeover or write.
-    if let Some(refusal) =
-        socket_patch_core::hosted::governing_root::refusal(&view, &candidates).await
+    // read only the member, so refuse before any takeover or write. The
+    // same goes for a pnpm member whose `trustLockfile` setting lives in
+    // the workspace root's pnpm-workspace.yaml.
+    if let Some(refusal) = socket_patch_core::hosted::governing_root::refusal(
+        &view,
+        &candidates,
+        !common.no_trust_lockfile_config,
+    )
+    .await
     {
         return refuse(common, scan_result.take(), &refusal);
     }
@@ -1773,6 +1779,42 @@ async fn vendored_takeover(
     } else {
         None
     };
+    // Yarn classic twin: an offline mirror refuses the hosted rewrite
+    // (vendored mode works with one), so a vendored yarn classic entry
+    // must stay vendored rather than be reverted into neither mode.
+    let classic_entry = |entry: &socket_patch_core::vendor::VendorEntry| {
+        entry.ecosystem == "npm" && entry.flavor.as_deref() == Some("yarn-classic")
+    };
+    let classic_takeover_refusal = if takeover
+        .iter()
+        .any(|(_, entry)| entry.as_ref().is_some_and(classic_entry))
+    {
+        match socket_patch_core::utils::fs::read_regular_to_string(&common.cwd.join("yarn.lock"))
+            .await
+        {
+            Ok(lock) => {
+                let read_rc = |rel: &str| {
+                    let path = common.cwd.join(rel);
+                    async move {
+                        socket_patch_core::utils::fs::read_regular_to_string(&path)
+                            .await
+                            .ok()
+                    }
+                };
+                let yarnrc = read_rc(socket_patch_core::patch::redirect::YARNRC_REL).await;
+                let npmrc = read_rc(socket_patch_core::patch::redirect::npmrc::NPMRC_REL).await;
+                socket_patch_core::patch::redirect::preflight_yarn_classic_hosted(
+                    &lock,
+                    yarnrc.as_deref(),
+                    npmrc.as_deref(),
+                )
+                .err()
+            }
+            Err(_) => None,
+        }
+    } else {
+        None
+    };
     // vlt twin: the hosted rewriter's lock-level refusal must be known
     // before a vendored vlt entry is reverted, or the revert strips the
     // live vendored patch and the rewrite then refuses the lock.
@@ -1835,8 +1877,9 @@ async fn vendored_takeover(
     };
     // The takeover refusal (if any) for one candidate: bun gates every
     // npm purl, berry and vlt only their own vendored entries, Gradle each
-    // of its own purls, and a requirements.txt entry is gated on the hosted
-    // rewriter's reach (it pins only the root file, #699). Berry also runs
+    // of its own purls, a pypi purl on a platform-tagged grant (#701), and a
+    // requirements.txt entry on the hosted rewriter's reach (it pins only
+    // the root file, #699). Berry also runs
     // the rewriter's per-dep grant gate (a grant without the berry cache
     // checksum is skipped by the rewriter, so reverting first would leave
     // the package in neither mode). A refused purl is never dispatched (see
@@ -1848,8 +1891,12 @@ async fn vendored_takeover(
             return gradle_takeover_refusals.get(&c.purl).cloned();
         }
         if c.purl.starts_with("pkg:pypi/") {
+            // A platform-tagged grant is never pinned (#701 / #932): keep
+            // the vendored patch rather than revert it to nothing.
             return entry.and_then(|e| {
-                socket_patch_core::patch::redirect::preflight_requirements_takeover(e).err()
+                socket_patch_core::patch::redirect::pypi_platform_wheel_refusal(&c.dep).or_else(
+                    || socket_patch_core::patch::redirect::preflight_requirements_takeover(e).err(),
+                )
             });
         }
         if !c.purl.starts_with("pkg:npm/") {
@@ -1866,6 +1913,11 @@ async fn vendored_takeover(
                             .err()
                     })
                     .flatten()
+            })
+            .or_else(|| {
+                classic_takeover_refusal
+                    .clone()
+                    .filter(|_| entry.is_some_and(classic_entry))
             })
             .or_else(|| {
                 vlt_takeover_refusal

@@ -311,6 +311,11 @@ jobs:
         # still fails loudly on the last attempt. A binary restored by the
         # step above skips the compile.
         #
+        # --ssl-revoke-best-effort: Windows curl (schannel) otherwise fails
+        # the TLS handshake with CRYPT_E_REVOCATION_OFFLINE whenever the
+        # CA's revocation server is unreachable. A revoked certificate still
+        # fails, and the sha256 check follows. A no-op on other OSes.
+        #
         # Either way the binary's directory goes on PATH so
         # `Command::new("vexctl")` in the tests resolves.
         shell: bash
@@ -328,7 +333,7 @@ jobs:
             *) asset='' ;;
           esac
           if [ -n "$asset" ]; then
-            curl -fsSL --retry 5 --retry-all-errors -o "$dir/$bin" \
+            curl -fsSL --retry 5 --retry-all-errors --ssl-revoke-best-effort -o "$dir/$bin" \
               "https://github.com/openvex/vexctl/releases/download/$VEXCTL_VERSION/$asset"
             echo "$sha  $dir/$bin" | sha256sum -c -
             chmod +x "$dir/$bin"
@@ -1466,14 +1471,15 @@ jobs:
         if: steps.jvm.outputs.maven == 'true'
         # Straight from the Apache archive (sha512-verified), so a leg gets
         # exactly the release it names rather than the runner's Maven.
+        # --ssl-revoke-best-effort: see the `test` job's vexctl step.
         shell: bash
         env:
           MAVEN_VERSION: ${{ matrix.maven || '3.9.16' }}
         run: |
           major="${MAVEN_VERSION%%.*}"
           url="https://archive.apache.org/dist/maven/maven-${major}/${MAVEN_VERSION}/binaries/apache-maven-${MAVEN_VERSION}-bin.tar.gz"
-          curl -fsSL --retry 5 --retry-all-errors "$url" -o "$RUNNER_TEMP/maven.tgz"
-          curl -fsSL --retry 5 --retry-all-errors "$url.sha512" -o "$RUNNER_TEMP/maven.sha512"
+          curl -fsSL --retry 5 --retry-all-errors --ssl-revoke-best-effort "$url" -o "$RUNNER_TEMP/maven.tgz"
+          curl -fsSL --retry 5 --retry-all-errors --ssl-revoke-best-effort "$url.sha512" -o "$RUNNER_TEMP/maven.sha512"
           python -c 'import hashlib, pathlib, os; p=pathlib.Path(os.environ["RUNNER_TEMP"]); assert hashlib.sha512((p/"maven.tgz").read_bytes()).hexdigest() == (p/"maven.sha512").read_text().split()[0]'
           # Python accepts native Windows paths for both archive and destination.
           python -m tarfile -e "$RUNNER_TEMP/maven.tgz" "$RUNNER_TEMP"
@@ -1488,8 +1494,8 @@ jobs:
           GRADLE_VERSION: ${{ matrix.gradle }}
         run: |
           url="https://services.gradle.org/distributions/gradle-${GRADLE_VERSION}-bin.zip"
-          curl -fsSL --retry 5 --retry-all-errors "$url" -o "$RUNNER_TEMP/gradle.zip"
-          curl -fsSL --retry 5 --retry-all-errors "$url.sha256" -o "$RUNNER_TEMP/gradle.sha256"
+          curl -fsSL --retry 5 --retry-all-errors --ssl-revoke-best-effort "$url" -o "$RUNNER_TEMP/gradle.zip"
+          curl -fsSL --retry 5 --retry-all-errors --ssl-revoke-best-effort "$url.sha256" -o "$RUNNER_TEMP/gradle.sha256"
           python -c 'import hashlib, pathlib, os; p=pathlib.Path(os.environ["RUNNER_TEMP"]); assert hashlib.sha256((p/"gradle.zip").read_bytes()).hexdigest() == (p/"gradle.sha256").read_text().strip()'
           unzip -q "$RUNNER_TEMP/gradle.zip" -d "$RUNNER_TEMP"
           launcher="$RUNNER_TEMP/gradle-${GRADLE_VERSION}/bin/gradle"
