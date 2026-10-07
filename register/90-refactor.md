@@ -14,11 +14,11 @@ _Last updated 2026-10-07T15:57Z · main @ c5be5d1_
 
 | # | Candidate | B | U | D | R | Score | Note |
 |---|---|:-:|:-:|:-:|:-:|:-:|---|
-| 1 | #990 (E24, child 1 of #989): one `vendor::revert::finish` with an explicit `KeepPolicy` for the 12 copied finish blocks | 0 | 1 | ≈12 | L | ≈14 | skipped: most backend files changed by open PRs (#657, #776, #909, #943, #978, #980, #997) |
-| 2 | #922 (E22, child 1 of #920): one `VendorEntry::npm` constructor for the 7 npm-family ledger tails | 0 | 1 | ≈7 | L | ≈9 | skipped: claimed (`agent:claimed`); drivers changed by #657, #909 |
-| 3 | #998 (C56): one NotFound-only manifest probe for `apply`, `vendor`, `repair`, `remove`, `rollback` (5 `metadata().is_err()` copies) | 1 | 1 | ≈5 | M | ≈8 | skipped: `commands/vendor.rs` changed by #776, #978; pairs with #931 |
-| 4 | #931 (C52, child 1 of #930): one manifest-read error mapper (`manifest_invalid`/`manifest_unreadable`) for every command | 1 | 1 | ≈2.5 | M | ≈5.5 | skipped: `commands/vendor.rs` changed by #776, #978 |
-| 5 | #773 (C44): one `Ecosystem::from_cli_name` for flag, env, socket.yml, vendor | 1 | 0 | ≈2 | L | ≈5 | skipped: `commands/vendor.rs` changed by #776, #978 |
+| 1 | #990 (E24, child 1 of #989): one `vendor::revert::finish` with an explicit `KeepPolicy` for the 12 copied finish blocks | 0 | 1 | ≈12 | L | ≈14 | skipped: most backend files changed by open PRs (#657, #943, #997, #1036, #1038–#1040, #1043, #1044) |
+| 2 | #922 (E22, child 1 of #920): one `VendorEntry::npm` constructor for the 7 npm-family ledger tails | 0 | 1 | ≈7 | L | ≈9 | skipped: claimed (`agent:claimed`); drivers changed by #657 |
+| 3 | #998 (C56): one NotFound-only manifest probe for `apply`, `vendor`, `repair`, `remove`, `rollback` (5 `metadata().is_err()` copies) | 1 | 1 | ≈5 | M | ≈8 | skipped: `commands/vendor.rs` changed by #978 and 6 others; pairs with #931 |
+| 4 | #931 (C52, child 1 of #930): one manifest-read error mapper (`manifest_invalid`/`manifest_unreadable`) for every command | 1 | 1 | ≈2.5 | M | ≈5.5 | skipped: `commands/vendor.rs` changed by #978 and 6 others |
+| 5 | #773 (C44): one `Ecosystem::from_cli_name` for flag, env, socket.yml, vendor | 1 | 0 | ≈2 | L | ≈5 | skipped: `commands/vendor.rs` changed by #978 and 6 others |
 
 Re-ranked 2026-10-07T15:57Z: #876 and #889 merged (main @ c5be5d1); audit-core already rewrote the C49 and 7.2 passages. 7 `arch-refactor/*` PRs open (#1015 `ready` with the burn-down; maintainer drafts #1021, #1027, #1030, #1031, #1036, #1041), so no new PR this run. #776, #909, #980 merged, but the top five stay skipped: `commands/vendor.rs` is changed by #978, #1021, #1027, #1032, #1041, #1043, #1045; backend files by #657, #943, #997, #1026, #1036, #1038–#1040, #1043, #1044; #922 is claimed. Next eligible when a slot frees: #893 (C50, ≈4), #705 (one `utils::uuid` grammar; #1042 touches uuid), #871 (now unblocked by #889). C07 still open.
 
