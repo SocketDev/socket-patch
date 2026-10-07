@@ -3131,7 +3131,15 @@ mod tests {
                 );
                 let graph = lock.hoist_graph().unwrap();
                 let hoisted = hoist(&graph);
-                let label = path.strip_prefix(&root).unwrap().display().to_string();
+                // Joined with `/` on every platform: `display()` would use `\`
+                // on Windows and miss the `bun-lockb/0.1.` era check below.
+                let label = path
+                    .strip_prefix(&root)
+                    .unwrap()
+                    .components()
+                    .map(|c| c.as_os_str().to_string_lossy())
+                    .collect::<Vec<_>>()
+                    .join("/");
                 if label.starts_with("bun-lockb/0.1.") {
                     assert_ne!(hoisted, Some(own), "{label}");
                 } else {
