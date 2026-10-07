@@ -4,24 +4,20 @@
 //! stdout: a full envelope for the envelope commands, `{status, error}` for
 //! `scan`, `get` and `rollback`. None of these cases reaches the network.
 
-use std::path::{Path, PathBuf};
-use std::process::Command;
+use std::path::Path;
 
 use socket_patch_cli::args::{GLOBAL_ARG_ENV_VARS, LOCAL_ARG_ENV_VARS};
 
-fn binary() -> PathBuf {
-    env!("CARGO_BIN_EXE_socket-patch").into()
-}
+#[path = "common/hermetic.rs"]
+mod hermetic;
 
 fn run(cwd: &Path, args: &[&str], env: &[(&str, &str)]) -> (i32, String, String) {
-    let mut cmd = Command::new(binary());
+    let mut cmd = hermetic::binary_command();
+    hermetic::scrub_extra(&mut cmd, &[hermetic::Extra::Venv]);
     cmd.args(args).current_dir(cwd);
     for var in GLOBAL_ARG_ENV_VARS.iter().chain(LOCAL_ARG_ENV_VARS.iter()) {
         cmd.env_remove(var);
     }
-    cmd.env_remove("VIRTUAL_ENV");
-    cmd.env_remove("SOCKET_MAX_NEW_PATCHES");
-    cmd.env_remove("SOCKET_MIN_SEVERITY");
     cmd.env("SOCKET_TELEMETRY_DISABLED", "1");
     // Unroutable: a case that reached the network would fail differently.
     cmd.env("SOCKET_API_URL", "http://127.0.0.1:1");

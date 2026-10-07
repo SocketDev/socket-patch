@@ -960,6 +960,11 @@ const APPLY_FAILED: &str = "Error: Some patches could not be applied.";
 /// `--ghsa`, so a typo fails fast with a readable message instead of a raw
 /// API 400 body. `None` when it is well-formed (or the type is not
 /// shape-checked).
+///
+/// The message never echoes the argument: it reaches stderr, and CodeQL
+/// treats anything that may be a patch uuid as sensitive
+/// (rust/cleartext-logging). The user typed it, so naming the expected
+/// form is enough.
 fn forced_identifier_error(identifier: &str, id_type: IdentifierType) -> Option<String> {
     let (ok, what, form) = match id_type {
         IdentifierType::Uuid => (
@@ -975,7 +980,7 @@ fn forced_identifier_error(identifier: &str, id_type: IdentifierType) -> Option<
         ),
         IdentifierType::Purl | IdentifierType::Package => return None,
     };
-    (!ok).then(|| format!("\"{identifier}\" is not a valid {what} (expected {form})"))
+    (!ok).then(|| format!("The identifier is not a valid {what} (expected {form})"))
 }
 
 /// Select one patch per PURL from available patches.
@@ -5932,15 +5937,15 @@ mod tests {
     fn forced_identifier_shapes() {
         assert_eq!(
             forced_identifier_error("lodash", IdentifierType::Uuid).as_deref(),
-            Some("\"lodash\" is not a valid patch UUID (expected xxxxxxxx-xxxx-xxxx-xxxx-xxxxxxxxxxxx)")
+            Some("The identifier is not a valid patch UUID (expected xxxxxxxx-xxxx-xxxx-xxxx-xxxxxxxxxxxx)")
         );
         assert_eq!(
             forced_identifier_error("lodash", IdentifierType::Cve).as_deref(),
-            Some("\"lodash\" is not a valid CVE ID (expected CVE-YYYY-NNNN)")
+            Some("The identifier is not a valid CVE ID (expected CVE-YYYY-NNNN)")
         );
         assert_eq!(
             forced_identifier_error("GHSA-1", IdentifierType::Ghsa).as_deref(),
-            Some("\"GHSA-1\" is not a valid GHSA ID (expected GHSA-xxxx-xxxx-xxxx)")
+            Some("The identifier is not a valid GHSA ID (expected GHSA-xxxx-xxxx-xxxx)")
         );
         assert_eq!(
             forced_identifier_error("a8b05a61-1e2f-4c5f-a65b-93e71deba1ae", IdentifierType::Uuid),

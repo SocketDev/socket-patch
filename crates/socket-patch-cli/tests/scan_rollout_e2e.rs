@@ -789,7 +789,15 @@ async fn a_malformed_env_cap_is_a_usage_error_unless_the_flag_overrides_it() {
         .env("SOCKET_MAX_NEW_PATCHES", "lots");
     let out = cmd.output().unwrap();
     assert_eq!(out.status.code(), Some(2));
-    assert!(String::from_utf8_lossy(&out.stderr).contains("SOCKET_MAX_NEW_PATCHES"));
+    // Under --json the coded usage error goes to stdout (#704).
+    let v: Value = serde_json::from_slice(&out.stdout).unwrap();
+    assert_eq!(v["error"]["code"], "invalid_env", "{v}");
+    assert!(
+        v["error"]["message"]
+            .as_str()
+            .is_some_and(|m| m.contains("SOCKET_MAX_NEW_PATCHES")),
+        "{v}"
+    );
 
     // A flag overrides the env value without reading it.
     let mut with_flag = Command::new(binary());

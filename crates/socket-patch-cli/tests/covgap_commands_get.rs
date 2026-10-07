@@ -2834,7 +2834,7 @@ async fn forced_identifier_type_is_validated_locally() {
         let (code, stdout, stderr) = run_get_bin(tmp.path(), &server.uri(), &["lodash", flag]);
         assert_eq!(code, 2, "{flag}: stdout={stdout}\nstderr={stderr}");
         assert!(
-            stderr.contains(&format!("Error: \"lodash\" {what} (expected ")),
+            stderr.contains(&format!("Error: The identifier {what} (expected ")),
             "{flag}: stderr={stderr}"
         );
         let (code, stdout, _) = run_get_bin(tmp.path(), &server.uri(), &["lodash", flag, "--json"]);
