@@ -633,7 +633,14 @@ fn live_bun_store_entries_sync(
 ) -> Option<(HashSet<OsString>, HashMap<OsString, Listing>)> {
     let real_store = std::fs::canonicalize(store_path).ok()?;
     let importer = store_path.parent()?;
-    if candidates.is_empty() {
+    // A global store entry (#635) is a link into the shared
+    // `<cache>/links`, whose entries link one another there, never back
+    // into this `.bun`, so the walk cannot see what reaches them.
+    if candidates.is_empty()
+        || candidates
+            .iter()
+            .any(|e| e.file_type.is_some_and(|ft| ft.is_symlink()))
+    {
         return None;
     }
     let root = match importer.parent() {
@@ -6200,6 +6207,58 @@ mod tests {
             vec![number_twin.clone()],
         )
         .await;
+    }
+
+    /// #599 with #635: a global store's shared `<cache>/links` entries link
+    /// their dependencies to one another, never back into a project's
+    /// `.bun`, so the orphan walk cannot tell which `.bun` links are live.
+    /// The scan keeps every global store entry rather than dropping the
+    /// transitive packages it only reaches through the cache.
+    #[tokio::test]
+    async fn test_bun_global_store_entries_are_kept_by_the_orphan_walk() {
+        let dir = tempfile::tempdir().unwrap();
+        let tmp: PathBuf = dir.path().components().collect();
+        let root = tmp.join("proj");
+        let nm = root.join("node_modules");
+        let store = nm.join(".bun");
+        std::fs::create_dir_all(&store).unwrap();
+        std::fs::write(
+            root.join("package.json"),
+            r#"{ "name": "proj", "dependencies": { "is-odd": "3.0.1" } }"#,
+        )
+        .unwrap();
+        let links = tmp.join("bun-cache").join("links");
+        let link_entry = |entry: &str, name: &str, version: &str| {
+            let shared = links.join(format!("{entry}-6a490709ba3c5c8f"));
+            write_pkg(&shared.join("node_modules").join(name), name, version);
+            link_dir(&shared, &store.join(entry));
+            shared.join("node_modules")
+        };
+        let odd = link_entry("is-odd@3.0.1", "is-odd", "3.0.1");
+        let number = link_entry("is-number@6.0.0", "is-number", "6.0.0");
+        // A second entry for the name, so links are read, not guessed.
+        link_entry("is-number@6.0.0+3c4e1d2a", "is-number", "6.0.0");
+        link_dir(&number.join("is-number"), &odd.join("is-number"));
+        // Bun writes the importer's links relative, into `.bun`.
+        #[cfg(unix)]
+        std::os::unix::fs::symlink(".bun/is-odd@3.0.1/node_modules/is-odd", nm.join("is-odd"))
+            .unwrap();
+        #[cfg(windows)]
+        link_dir(
+            &store.join("is-odd@3.0.1/node_modules/is-odd"),
+            &nm.join("is-odd"),
+        );
+
+        let candidates = pnpm_shaped_store_candidates_sync(&store, StoreLayout::Bun);
+        assert_eq!(candidates.len(), 3);
+        assert!(live_bun_store_entries_sync(&store, &candidates).is_none());
+        let scanned = scan_paths(&root).await;
+        let purls: Vec<&str> = scanned.iter().map(|(p, _)| p.as_str()).collect();
+        assert_eq!(
+            purls,
+            ["pkg:npm/is-number@6.0.0", "pkg:npm/is-odd@3.0.1"],
+            "{scanned:?}"
+        );
     }
 
     /// #599: Bun never prunes `.bun`. After an in-place `bun install` that
