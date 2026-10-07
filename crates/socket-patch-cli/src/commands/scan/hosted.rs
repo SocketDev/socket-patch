@@ -1398,18 +1398,26 @@ pub(crate) async fn run_redirect_selected(
     warnings.extend(takeover_warnings.iter().cloned());
     warnings.extend(prune_warnings.iter().cloned());
 
+    // Granted, but nothing in the project pins it (no lock entry,
+    // unreadable lock, ...): reported per purl (`redirect.patches[]`
+    // `unpinned` rows; the human "Not hosted" lines) so it never vanishes
+    // silently. (A skipped uuid — e.g. unavailable wheel metadata — is
+    // already listed with its reason.)
+    let unconfirmed = socket_patch_core::hosted::engine::unconfirmed_candidates(
+        &candidates,
+        &confirmed,
+        &skipped,
+    );
     if common.json {
         // Nest the redirect result under `redirect` inside the classic scan
         // object (built by `run`, threaded in via `scan_result`), mirroring
         // vendored mode's nested `vendor` block, so the hosted `--json`
         // envelope keeps the same top-level scan keys as every other scan.
         let redirect = redirect_json_block(
-            confirmed.len(),
+            &confirmed,
+            &unconfirmed,
             done.rewritten.clone(),
-            skipped
-                .iter()
-                .map(socket_patch_core::hosted::render::skipped_json)
-                .collect(),
+            &skipped,
             warnings,
             common.dry_run,
         );
@@ -1491,23 +1499,11 @@ pub(crate) async fn run_redirect_selected(
                 .filter(|s| s.reason != super::rollout::ROLLOUT_DEFERRED)
                 .map(|s| (s.purl.clone(), s.reason.clone()))
                 .collect();
-            // Granted, but nothing in the project pins it (no lock entry,
-            // unreadable lock, ...): listed so it never vanishes silently.
-            // (A skipped uuid — e.g. unavailable wheel metadata — is already
-            // listed with its reason.)
-            let unconfirmed: Vec<String> = candidates
-                .iter()
-                .filter(|c| {
-                    !confirmed
-                        .iter()
-                        .any(|(cp, cu)| *cp == c.purl && *cu == c.dep.patch_uuid)
-                })
-                .filter(|c| !skipped.iter().any(|s| s.uuid == c.dep.patch_uuid))
-                .map(|c| c.purl.clone())
-                .collect();
+            let unconfirmed_purls: Vec<String> =
+                unconfirmed.iter().map(|(purl, _)| purl.clone()).collect();
             for line in format_unredirected(
                 &skipped_pairs,
-                &unconfirmed,
+                &unconfirmed_purls,
                 confirmed.is_empty(),
                 // Only the lockfile rewriters' own warnings explain a
                 // missing lock entry; unrelated guidance (pnpm trust, VEX,
@@ -3262,9 +3258,10 @@ mod tests {
         // spelling of the block (`run`'s zero-discovery arm uses the same
         // helper).
         let redirect = redirect_json_block(
-            1,
+            &[("pkg:npm/minimist@1.2.2".to_string(), "abc-123".to_string())],
+            &[],
             vec!["package-lock.json".to_string()],
-            Vec::new(),
+            &[],
             vec![prune_ignored_warning()],
             false,
         );

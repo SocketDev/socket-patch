@@ -91,6 +91,29 @@ pub struct Candidate {
     pub dep: DepOverride,
 }
 
+/// `(purl, uuid)` of each candidate that was granted but that nothing in
+/// the project's final files pins: not in `confirmed` (purl and uuid) and
+/// not already reported in `skipped` (by uuid — a skip carries its own
+/// reason). Candidate order. The disk and memory paths both report these
+/// as the `unpinned` rows of the `redirect` block, and the disk path's
+/// human output lists them as "Not hosted".
+pub fn unconfirmed_candidates(
+    candidates: &[Candidate],
+    confirmed: &[(String, String)],
+    skipped: &[SkippedPatch],
+) -> Vec<(String, String)> {
+    candidates
+        .iter()
+        .filter(|c| {
+            !confirmed
+                .iter()
+                .any(|(purl, uuid)| *purl == c.purl && *uuid == c.dep.patch_uuid)
+        })
+        .filter(|c| !skipped.iter().any(|s| s.uuid == c.dep.patch_uuid))
+        .map(|c| (c.purl.clone(), c.dep.patch_uuid.clone()))
+        .collect()
+}
+
 /// A selected patch that was not redirected, and why (the `skipped[]`
 /// entries of the `redirect` block).
 #[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
