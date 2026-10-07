@@ -705,7 +705,7 @@ async fn takeover_refuses_symlinked_wiring_file_before_reverting() {
 /// `scan --mode hosted` takes the same `.socket/apply.lock` every other
 /// mutating command holds — but only when it could write. A WET run with a
 /// granted reference refuses a held lock with `lock_held` (the hosted
-/// envelope's top-level `errorCode`, the shared contention message, exit 1)
+/// envelope's top-level `error.code`, the shared contention message, exit 1)
 /// BEFORE the ledger load or any file write; the human arm prints the
 /// shared `Error: Another socket-patch process …` line plus the
 /// `--lock-timeout` hint. A `--dry-run`,
@@ -870,8 +870,8 @@ async fn zero_grant_wet_run_ignores_a_malformed_pre_v5_ledger() {
 /// The hosted `lock_io` envelope (CLI_CONTRACT.md "Lock lifecycle (v5.0)" and
 /// the hosted-mode "Lock (v5.0)" clause): a regular file
 /// squatting on `.socket/` makes the wet run's lock acquire fail with an I/O
-/// fault, not contention — top-level `errorCode: "lock_io"`, a string
-/// `error` naming the squatting path, `redirect: {mode: "hosted"}` retained,
+/// fault, not contention — top-level `error.code: "lock_io"`, an
+/// `error.message` naming the squatting path, `redirect: {mode: "hosted"}` retained,
 /// exit 1, refused BEFORE the ledger is read or written. The human arm prints
 /// the shared `Error: Failed to open lock file at …` line WITHOUT the
 /// `--lock-timeout` hint (that is a live-holder remedy). The squatting file is never removed or truncated.

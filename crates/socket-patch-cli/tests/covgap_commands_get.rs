@@ -2427,9 +2427,9 @@ async fn mount_granted_reference(server: &MockServer, uuid: &str, purl: &str, ur
 /// Hosted twin of `vendored_lock_held_vendor_step_errors_without_vendor_envelope`
 /// (and of `covgap_commands_scan_hosted::hosted_lock_held_refuses_before_any_write`):
 /// `get <uuid> --mode hosted` folds its result into the HOSTED error
-/// envelope, so a held apply lock surfaces as the top-level `errorCode`
-/// with a string `error` — NOT the vendored `error: {code, message}`
-/// object — exit 1, `redirect.mode` retained, nothing written; the human
+/// envelope, so a held apply lock surfaces as the top-level
+/// `error: {code: "lock_held", message}` object (v5.0: no top-level
+/// `errorCode`) — exit 1, `redirect.mode` retained, nothing written; the human
 /// arm prints the shared `Error: Another socket-patch process …` line plus
 /// the `--lock-timeout` hint. A
 /// `--dry-run` never contends: it previews the redirect under the held

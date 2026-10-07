@@ -1504,7 +1504,7 @@ download failures, and `applied` counts only the patches that did apply.
 A failure no single patch explains (an unreadable manifest, the yarn PnP
 refusal, unavailable patch sources) sets top-level `error: {code, message}`
 on the same object (`apply` in `scan`'s envelope); `status` stays
-`partial_failure`. v5.0: this replaced the top-level `error.code` + string
+`partial_failure`. v5.0: this replaced the top-level `errorCode` + string
 `error` pair (MAJOR).
 
 `vulnerabilities[]` is always sorted by `id` so consumer diffs and

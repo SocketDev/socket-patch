@@ -762,7 +762,7 @@ fn lock_contention_exits_with_lock_held_envelope() {
     assert_eq!(
         envelope_error_code(&v),
         Some("lock_held"),
-        "expected errorCode=lock_held; stdout=\n{stdout}"
+        "expected error.code=lock_held; stdout=\n{stdout}"
     );
     assert_eq!(
         json_string(&v, "status"),
