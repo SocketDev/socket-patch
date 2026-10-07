@@ -68,7 +68,13 @@ pub(super) async fn artifact_preflight(
     hosted_vlt::judge(&plan, deps, probes)
 }
 
-fn patch_server_origins(common: &crate::args::GlobalArgs) -> Vec<String> {
+/// The origins the vlt heal treats as Socket-owned in the final lock: the
+/// patch server plus `--api-url`. Unlike discovery's
+/// [`crate::commands::rollback::patch_server_origins`], it also counts the
+/// `--api-url` origin (as it has since vlt support landed, #269), so a
+/// setup serving the hosted tarballs from the API origin is healed too.
+/// Discovery-facing code must use the rollback helper, not this one.
+fn vlt_heal_origins(common: &crate::args::GlobalArgs) -> Vec<String> {
     common
         .patch_server_url
         .iter()
@@ -322,7 +328,7 @@ pub(super) async fn heal_after_rewrite(
     let mut out = StaleInstallOutcome::default();
     let owned: Vec<vlt_heal::OwnedInstance> = inputs
         .final_lock
-        .map(|lock| vlt_heal::socket_owned_instances(lock, &patch_server_origins(common)))
+        .map(|lock| vlt_heal::socket_owned_instances(lock, &vlt_heal_origins(common)))
         .unwrap_or_default()
         .into_iter()
         .filter(|i| inputs.preflight.passed.contains(&i.patch_uuid))

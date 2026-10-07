@@ -385,17 +385,31 @@ fn unrooted_unsupported_warnings<'a>(
 /// nothing. Pins on a patch server other than Socket's are recognized once
 /// the run's references name it ([`stage::mark_pinned`]).
 ///
+/// Unlike the mention scan this replaced, a pin counts whether or not the
+/// API still offers its patch (as on disk): a re-scan re-confirms it as
+/// ALREADY instead of spending a NEW slot. A pin wired only by files under
+/// a nested root (one discovery reaches through a requirements include or
+/// a rush subspace) is that root's own and does not count here.
+///
 /// [`HostedPin::discover`]: crate::patch::redirect::upstream::HostedPin::discover
 /// [`stage::mark_pinned`]: crate::rollout::stage::mark_pinned
-async fn memory_recorded(project: &MemoryProject) -> RecordedIndex {
+async fn memory_recorded(project: &MemoryProject, root: &str, roots: &[String]) -> RecordedIndex {
     let manifest = project
         .text(select::MANIFEST_REL)
         .and_then(|text| serde_json::from_str(text).ok());
     let vendor = stages::vendored_entries(project);
+    let nested: Vec<String> = roots
+        .iter()
+        .filter(|other| other.as_str() != root)
+        .filter_map(|other| roots::strip_root(root, other).map(|rel| format!("{rel}/")))
+        .filter(|rel| rel != "/")
+        .collect();
+    let own = |file: &String| !nested.iter().any(|n| file.starts_with(n.as_str()));
     let pins: Vec<(String, String)> =
         crate::patch::redirect::upstream::HostedPin::discover(ProjectView::Memory(project), &[])
             .await
             .into_iter()
+            .filter(|pin| pin.files.iter().any(own))
             .map(|pin| (pin.purl, pin.uuid))
             .collect();
     let merged = crate::ledgers::merge_ledger_records_for_updates(
@@ -707,6 +721,7 @@ async fn engine(
     stage.incomplete |= states
         .iter()
         .any(|s| s.error.as_ref().is_some_and(|e| e.code == "patch_lookup_failed"));
+    let roots_by_path: Vec<String> = states.iter().map(|s| s.root.clone()).collect();
     for state in states.iter_mut() {
         if state.error.is_some() {
             continue;
@@ -714,7 +729,7 @@ async fn engine(
         let Some(project) = state.project.as_ref() else {
             continue;
         };
-        let recorded = memory_recorded(project).await;
+        let recorded = memory_recorded(project, &state.root, &roots_by_path).await;
         stage.incomplete |= lookup_incomplete(
             &recorded,
             &state.failed_details,

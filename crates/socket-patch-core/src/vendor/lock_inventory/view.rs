@@ -211,7 +211,13 @@ impl<'a> DiskSnapshot<'a> {
 
     /// Read `rel` as `content` instead of the disk's: the project as a
     /// pending write would leave it. Content reads and existence probes see
-    /// the overlay; directory listings still list the disk.
+    /// the overlay; directory listings (`list_dir`, `python_lock_paths`,
+    /// rush subspace locks) still list the disk. So a file the write would
+    /// CREATE that discovery only finds by listing (a new `pylock.*.toml`, a
+    /// new rush subspace lock) is invisible to a discovery over the overlay,
+    /// and the hosted attribution gate keeps the rewriters' verdict for its
+    /// pin. No hosted rewriter creates such a file today; one that does must
+    /// merge its outputs into the listings first.
     pub fn overlay(&self, rel: &str, content: &[u8]) {
         self.remember(rel, &Ok(content.to_vec()));
         self.overlaid
