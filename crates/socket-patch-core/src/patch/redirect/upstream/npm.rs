@@ -44,18 +44,25 @@ pub(super) struct ProjectDist {
     pub from_project: bool,
 }
 
+/// Whether `base` is registry.npmjs.org or its registry.yarnpkg.com alias
+/// (either scheme).
+fn is_npmjs_registry(base: &str) -> bool {
+    let base = base.trim().trim_end_matches('/');
+    let host = base
+        .strip_prefix("https://")
+        .or_else(|| base.strip_prefix("http://"))
+        .unwrap_or(base);
+    matches!(host, "registry.npmjs.org" | "registry.yarnpkg.com")
+}
+
 /// The registry base a project names, unless it is the default registry
 /// (npmjs, its registry.yarnpkg.com alias, or `SOCKET_NPM_REGISTRY`), whose
 /// document [`fetch_dists`] already reads.
 pub(super) fn non_default_registry(base: &str) -> Option<String> {
     use crate::vendor::registry_fetch::npm_registry_base;
     let base = base.trim().trim_end_matches('/');
-    let host = base
-        .strip_prefix("https://")
-        .or_else(|| base.strip_prefix("http://"))
-        .unwrap_or(base);
-    let npmjs = matches!(host, "registry.npmjs.org" | "registry.yarnpkg.com");
-    (!base.is_empty() && !npmjs && base != npm_registry_base()).then(|| base.to_string())
+    (!base.is_empty() && !is_npmjs_registry(base) && base != npm_registry_base())
+        .then(|| base.to_string())
 }
 
 /// [`fetch_dists`], reading each version document from the registry the
@@ -1015,26 +1022,51 @@ fn bun_lookup_registry(
     }
     let bunfig = bunfig.and_then(|text| text.parse::<toml_edit::DocumentMut>().ok());
     let install = bunfig.as_ref().and_then(|doc| doc.get("install"));
+    // The configured default registry before the environment applies.
+    let configured = || {
+        npmrc
+            .and_then(|text| npmrc_top_level_value(text, "registry"))
+            .and_then(|value| url(&value))
+            .or_else(|| toml_url(install?.get("registry")))
+    };
     if let Some((scope, _)) = name.strip_prefix('@').and_then(|rest| rest.split_once('/')) {
-        let scoped = npmrc
+        if let Some(scoped) = npmrc
             .and_then(|text| npmrc_top_level_value(text, &format!("@{scope}:registry")))
             .and_then(|value| url(&value))
-            .or_else(|| {
-                let scopes = install?.get("scopes")?;
-                toml_url(scopes.get(scope)).or_else(|| toml_url(scopes.get(format!("@{scope}"))))
-            });
-        if scoped.is_some() {
-            return scoped;
+        {
+            return Some(scoped);
+        }
+        let entry = install.and_then(|i| i.get("scopes")).and_then(|scopes| {
+            scopes
+                .get(scope)
+                .or_else(|| scopes.get(format!("@{scope}")))
+        });
+        if let Some(entry) = entry {
+            // A scope entry with no URL (a token only) takes the configured
+            // default registry, never the environment's.
+            if let Some(scoped) = toml_url(Some(entry)) {
+                return Some(scoped);
+            }
+            if entry.is_table_like() && entry.get("url").is_none() {
+                return configured();
+            }
         }
     }
-    env_registry
-        .and_then(url)
-        .or_else(|| {
-            npmrc
-                .and_then(|text| npmrc_top_level_value(text, "registry"))
-                .and_then(|value| url(&value))
-        })
-        .or_else(|| toml_url(install?.get("registry")))
+    env_registry.and_then(url).or_else(configured)
+}
+
+/// The registry Bun takes from its environment: the first of
+/// `BUN_CONFIG_REGISTRY`, `NPM_CONFIG_REGISTRY`, `npm_config_registry`
+/// that is an http(s) URL — Bun skips a key that is not and reads the
+/// next (`PackageManagerOptions.load`).
+fn bun_env_registry(var: impl Fn(&str) -> Option<String>) -> Option<String> {
+    [
+        "BUN_CONFIG_REGISTRY",
+        "NPM_CONFIG_REGISTRY",
+        "npm_config_registry",
+    ]
+    .iter()
+    .find_map(|key| var(key).filter(|v| v.starts_with("https://") || v.starts_with("http://")))
 }
 
 /// The settings beside a Bun lock that decide which registry Bun resolves
@@ -1061,13 +1093,14 @@ impl BunRegistrySettings {
             .await
             .ok()
             .flatten();
-        let env_registry = [
-            "BUN_CONFIG_REGISTRY",
-            "NPM_CONFIG_REGISTRY",
-            "npm_config_registry",
-        ]
-        .iter()
-        .find_map(|key| std::env::var(key).ok().filter(|v| !v.is_empty()));
+        // Unit tests read no ambient registry: npm exports
+        // `npm_config_registry` to child processes whenever one is
+        // configured, which would otherwise steer the fixtures' restores.
+        let env_registry = if cfg!(test) {
+            None
+        } else {
+            bun_env_registry(|key| std::env::var(key).ok())
+        };
         Self {
             npmrc,
             bunfig,
@@ -1087,11 +1120,10 @@ impl BunRegistrySettings {
 }
 
 /// The tarball URL Bun recorded for `name@version` resolved against
-/// `project_registry`: the project registry's own `dist.tarball`, or —
-/// for a document read from the default registry instead (a fallback, or
-/// a project on `SOCKET_NPM_REGISTRY` itself) — its conventional URL
-/// re-based on the project's registry, the URL Bun derived. With no
-/// project registry, the default registry's `dist.tarball`, as before.
+/// `project_registry`: the `dist.tarball` of the document read, except
+/// that a fallback from an unreadable mirror to the default registry's
+/// document re-bases its conventional URL on the mirror, the URL Bun
+/// derived there.
 pub(super) fn bun_tarball_url(
     project_registry: Option<&str>,
     name: &str,
@@ -1102,12 +1134,16 @@ pub(super) fn bun_tarball_url(
         npm_registry_base, npm_tarball_is_conventional, npm_tarball_url,
     };
     let tarball = &found.dist.tarball;
-    match project_registry.map(|r| r.trim().trim_end_matches('/')) {
+    // Only a fallback from a registry the default document does not stand
+    // for is re-based: npmjs, its yarnpkg alias and `SOCKET_NPM_REGISTRY`
+    // advertise the very `dist.tarball` that was read, which is what Bun
+    // recorded.
+    match project_registry.and_then(non_default_registry) {
         Some(base)
             if !found.from_project
                 && npm_tarball_is_conventional(&npm_registry_base(), name, version, tarball) =>
         {
-            npm_tarball_url(base, name, version)
+            npm_tarball_url(&base, name, version)
         }
         _ => tarball.clone(),
     }
@@ -1124,8 +1160,10 @@ fn bun_registry_slot(
     found: &ProjectDist,
 ) -> String {
     use crate::vendor::registry_fetch::DEFAULT_NPM_REGISTRY;
-    let Some(base) = project_registry.filter(|base| !base.trim().starts_with(DEFAULT_NPM_REGISTRY))
-    else {
+    // Bun resolved npmjs (unconfigured, or npmjs / its yarnpkg alias,
+    // whose documents advertise npmjs tarballs): the empty slot, whatever
+    // `SOCKET_NPM_REGISTRY` the restore itself read.
+    let Some(base) = project_registry.filter(|base| !is_npmjs_registry(base)) else {
         return String::new();
     };
     let url = bun_tarball_url(Some(base), name, version, found);
@@ -1320,8 +1358,9 @@ pub(crate) async fn cleanup_side_config(
 #[cfg(test)]
 mod tests {
     use super::{
-        berry_lookup_registry, berry_registry_locator, bun_lookup_registry, bun_registry_slot,
-        non_default_registry, registry_derives_tarball, yaml_top_level_value, ProjectDist,
+        berry_lookup_registry, berry_registry_locator, bun_env_registry, bun_lookup_registry,
+        bun_registry_slot, bun_tarball_url, non_default_registry, registry_derives_tarball,
+        yaml_top_level_value, ProjectDist,
     };
     use crate::patch::redirect::upstream::client::NpmDist;
 
@@ -1368,6 +1407,18 @@ mod tests {
                 "{name}"
             );
         }
+        // A scope entry with no URL takes the configured default registry,
+        // not the environment's (Bun's `registry.url = base.url`).
+        let token_only = "[install]\nregistry = \"https://b.example/\"\n\n\
+                          [install.scopes]\nw = { token = \"x\" }\n";
+        assert_eq!(
+            lookup(None, Some(token_only), Some("https://e.example"), "@w/a").as_deref(),
+            Some("https://b.example/")
+        );
+        assert_eq!(
+            lookup(None, Some(token_only), Some("https://e.example"), "a").as_deref(),
+            Some("https://e.example")
+        );
         // Nothing configured, or nothing that is a URL: npmjs.
         assert_eq!(lookup(None, None, None, "a"), None);
         assert_eq!(
@@ -1377,6 +1428,7 @@ mod tests {
     }
 
     #[test]
+    #[serial_test::serial]
     fn bun_writes_the_tarball_url_unless_it_is_on_npmjs() {
         let found = |tarball: &str, from_project| ProjectDist {
             dist: NpmDist {
@@ -1397,11 +1449,57 @@ mod tests {
             bun_registry_slot(Some("https://m.example"), "a", "1.0.0", &cdn),
             "https://cdn.example/f/a.tgz"
         );
-        // npmjs, configured or not, is Bun's empty slot.
+        // npmjs, configured or not, or its aliases, is Bun's empty slot:
+        // their documents advertise npmjs tarballs, never re-based.
         let npmjs = found("https://registry.npmjs.org/a/-/a-1.0.0.tgz", false);
-        for registry in [None, Some("https://registry.npmjs.org/")] {
+        for registry in [
+            None,
+            Some("https://registry.npmjs.org/"),
+            Some("http://registry.npmjs.org/"),
+            Some("https://registry.yarnpkg.com/"),
+        ] {
             assert_eq!(bun_registry_slot(registry, "a", "1.0.0", &npmjs), "");
+            assert_eq!(
+                bun_tarball_url(registry, "a", "1.0.0", &npmjs),
+                "https://registry.npmjs.org/a/-/a-1.0.0.tgz",
+                "{registry:?}"
+            );
         }
+        // A fallback from an unreadable mirror re-bases the conventional URL.
+        assert_eq!(
+            bun_tarball_url(Some("https://m.example/npm/"), "a", "1.0.0", &npmjs),
+            "https://m.example/npm/a/-/a-1.0.0.tgz"
+        );
+    }
+
+    #[test]
+    fn bun_env_registry_skips_keys_that_are_not_urls() {
+        let env = |pairs: &'static [(&'static str, &'static str)]| {
+            move |key: &str| {
+                pairs
+                    .iter()
+                    .find(|(k, _)| *k == key)
+                    .map(|(_, v)| v.to_string())
+            }
+        };
+        assert_eq!(
+            bun_env_registry(env(&[
+                ("BUN_CONFIG_REGISTRY", "not-a-url"),
+                ("NPM_CONFIG_REGISTRY", ""),
+                ("npm_config_registry", "https://n.example/"),
+            ]))
+            .as_deref(),
+            Some("https://n.example/")
+        );
+        assert_eq!(
+            bun_env_registry(env(&[
+                ("BUN_CONFIG_REGISTRY", "http://b.example"),
+                ("npm_config_registry", "https://n.example/"),
+            ]))
+            .as_deref(),
+            Some("http://b.example")
+        );
+        assert_eq!(bun_env_registry(env(&[("BUN_CONFIG_REGISTRY", "x")])), None);
     }
 
     #[test]
