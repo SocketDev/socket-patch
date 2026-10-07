@@ -19,7 +19,7 @@
 //!
 //! The copy is produced by **delegating to the hardened
 //! [`apply_package_patch`] pipeline** pointed at the fresh copy, reusing all the
-//! verify → package/diff/blob → atomic-write machinery unchanged.
+//! verify → blob → atomic-write machinery unchanged.
 
 use std::collections::{HashMap, HashSet};
 use std::path::{Path, PathBuf};

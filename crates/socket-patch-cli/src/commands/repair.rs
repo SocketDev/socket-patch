@@ -1137,21 +1137,14 @@ mod tests {
     #[test]
     fn found_missing_line() {
         assert_eq!(format_found_missing(1, BLOB), "Found 1 missing blob");
-        assert_eq!(
-            format_found_missing(12, DIFF_ARCHIVE),
-            "Found 12 missing diff archives"
-        );
+        assert_eq!(format_found_missing(12, BLOB), "Found 12 missing blobs");
     }
 
     #[test]
     fn offline_warning_singular_and_plural() {
         assert_eq!(
-            format_offline_warning(
-                &ids(&["11111111-1111-4111-8111-111111111111"]),
-                DIFF_ARCHIVE
-            ),
-            "Warning: 1 diff archive is missing (offline mode - not downloading):\n\
-             \x20 - 11111111-1111-4111-8111-111111111111"
+            format_offline_warning(&ids(&["a"]), BLOB),
+            "Warning: 1 blob is missing (offline mode - not downloading):\n  - a"
         );
         assert_eq!(
             format_offline_warning(&ids(&["b", "a"]), BLOB),
@@ -1230,8 +1223,8 @@ mod tests {
             "Dry run: no changes made."
         );
         assert_eq!(
-            format_final_line(1, false, DIFF_ARCHIVE, false),
-            "Repair finished with errors: 1 diff archive was not downloaded."
+            format_final_line(1, false, BLOB, false),
+            "Repair finished with errors: 1 blob was not downloaded."
         );
         assert_eq!(
             format_final_line(2, true, BLOB, false),

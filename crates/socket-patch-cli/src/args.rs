@@ -445,8 +445,9 @@ impl GlobalArgs {
         }
     }
 
-    /// The directory the manifest lives in — where `apply.lock`, `blobs/`,
-    /// `diffs/` and `packages/` sit (`<cwd>/.socket` by default). The one
+    /// The directory the manifest lives in — where `apply.lock` and `blobs/`
+    /// sit, and the obsolete `diffs/` and `packages/` the cleanup sweeps
+    /// remove (`<cwd>/.socket` by default). The one
     /// derivation every lock acquire and artifact probe uses; see
     /// [`socket_dir_of`] for callers holding a raw manifest path.
     pub(crate) fn socket_dir(&self) -> PathBuf {

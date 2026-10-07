@@ -477,7 +477,7 @@ async fn repair_dry_run_does_not_download() {
         "dry-run must not download blobs"
     );
     // The decisive check: the blob endpoint must never have been requested.
-    // If dry_run were ignored, fetch_missing_sources would have hit it.
+    // If dry_run were ignored, fetch_missing_blobs would have hit it.
     let hits = server
         .received_requests()
         .await

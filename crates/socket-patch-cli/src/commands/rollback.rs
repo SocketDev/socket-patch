@@ -2413,8 +2413,7 @@ pub(crate) async fn rollback_patches_inner(
             // locally-drifted) root copy says nothing about a still-patched
             // nested duplicate, whose restore still needs the blob. Probing
             // only a representative copy skipped the download and wedged the
-            // online rollback with a mid-run `MissingBlob` failure. Mirrors
-            // apply's `mismatch_blob_gaps`.
+            // online rollback with a mid-run `MissingBlob` failure.
             let mut pkg_paths = all_packages_multi
                 .get(purl)
                 .expect("gate manifest holds only attempted targets, which the crawler discovered")
