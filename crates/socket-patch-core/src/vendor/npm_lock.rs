@@ -26,13 +26,11 @@ use crate::utils::fs::{atomic_write_bytes_preserving_mode, read_regular_to_bytes
 use crate::utils::socket_dir::remove_tree_and_prune;
 
 use super::common::{already_patched_result, done, parse_json_manifest, refused, JsonLayout};
-use super::lock_inventory::npm_legacy_identity;
+use super::lock_inventory::{npm_lock_entries, NpmLockSection};
 use super::npm_common::{
     done_failure_unstage, guard_coordinates, guard_revert_uuid_dir, stage_patch_pack,
 };
-use super::npm_origin::{
-    legacy_packages_key, npm_non_registry_entries, npm_shrinkwrapped_entries, NpmOverrides,
-};
+use super::npm_origin::{npm_non_registry_entries, npm_shrinkwrapped_entries, NpmOverrides};
 use super::parse_memo::ParseMemo;
 use super::path::parse_vendor_path;
 use super::source::PackageSource;
@@ -970,19 +968,17 @@ pub(super) async fn check_wiring(entry: &VendorEntry, project_root: &Path) -> Re
         // A copy npm 7–11 install from a dependency's own shrinkwrap
         // (#753) installs unpatched whatever this lock says, and vendor
         // cannot rewire it, so its "re-run vendor" advice does not apply.
-        let packages = lock.get("packages").and_then(Value::as_object);
-        for (key, ancestor) in npm_shrinkwrapped_entries(&lock) {
-            let Some(obj) = packages
-                .and_then(|p| p.get(&key))
-                .and_then(Value::as_object)
-            else {
-                continue;
-            };
-            if entry_name(&key, obj) == name
-                && obj.get("version").and_then(Value::as_str) == Some(version.as_str())
-            {
-                shrinkwrapped.push(format!("{lock_name} `{key}` (beneath `{ancestor}`)"));
-            }
+        let beneath = npm_shrinkwrapped_entries(&lock);
+        let mut copies: Vec<(&str, &String)> = npm_lock_entries(&lock)
+            .into_iter()
+            .filter(|e| e.section == NpmLockSection::Packages && e.value.is_object())
+            .filter(|e| e.node.name == name && e.node.version == Some(version.as_str()))
+            .filter_map(|e| Some((e.key, beneath.get(e.key)?)))
+            .collect();
+        // In key order, as the shrinkwrapped map lists them.
+        copies.sort_unstable_by_key(|&(key, _)| key);
+        for (key, ancestor) in copies {
+            shrinkwrapped.push(format!("{lock_name} `{key}` (beneath `{ancestor}`)"));
         }
     }
     if !shrinkwrapped.is_empty() {
@@ -1016,27 +1012,22 @@ fn scan_lock_matches(
     warnings: &mut Vec<VendorWarning>,
 ) -> LockScan {
     let mut matches = Vec::new();
-    let Some(packages) = lock.get("packages").and_then(Value::as_object) else {
+    if lock.get("packages").and_then(Value::as_object).is_none() {
         return LockScan::Matches(matches); // validated earlier; defensive
-    };
+    }
     let non_registry = npm_non_registry_entries(lock, overrides);
     let mut member: Option<String> = None;
     let shrinkwrapped = npm_shrinkwrapped_entries(lock);
-    for (key, entry) in packages {
+    let candidates = npm_lock_entries(lock).into_iter().filter(|e| {
         // The root "" entry is the project itself, never a dependency.
-        if key.is_empty() {
-            continue;
-        }
-        let Some(obj) = entry.as_object() else {
-            continue;
-        };
-        if entry_name(key, obj) != name {
-            continue;
-        }
-        if obj.get("version").and_then(Value::as_str) != Some(version) {
-            continue;
-        }
-        if !key.contains(NODE_MODULES_SEG) {
+        e.section == NpmLockSection::Packages
+            && !e.key.is_empty()
+            && e.node.name == name
+            && e.node.version == Some(version)
+    });
+    for e in candidates {
+        let key = e.key;
+        if !e.is_dependency() {
             // The project's own source (a workspace member or `file:`
             // directory) that happens to carry this name@version. Vendoring
             // it would shadow first-party code, but it does not make the
@@ -1050,17 +1041,17 @@ fn scan_lock_matches(
                      patch that source directly if it needs the fix"
                 ),
             ));
-            member.get_or_insert_with(|| key.clone());
+            member.get_or_insert_with(|| key.to_string());
             continue;
         }
-        if obj.get("link").and_then(Value::as_bool) == Some(true) {
+        if e.link {
             warnings.push(VendorWarning::new(
                 "vendor_link_entry_skipped",
                 format!("lock entry `{key}` is a link (npm workspaces/file: dir); skipped"),
             ));
             continue;
         }
-        if obj.get("inBundle").and_then(Value::as_bool) == Some(true) {
+        if e.bundled {
             // LOUD: this copy ships inside its PARENT's tarball, which we do
             // not repack — it will still be the unpatched bytes after vendor.
             warnings.push(VendorWarning::new(
@@ -1073,7 +1064,7 @@ fn scan_lock_matches(
             ));
             continue;
         }
-        if let Some(ancestor) = shrinkwrapped.get(key.as_str()) {
+        if let Some(ancestor) = shrinkwrapped.get(key) {
             // LOUD: npm 7–11 install this copy from `ancestor`'s own
             // npm-shrinkwrap.json and ignore the root lock's entry, so a
             // rewrite here would report the patch applied while the
@@ -1089,7 +1080,7 @@ fn scan_lock_matches(
             ));
             continue;
         }
-        if let Some(reason) = non_registry.get(key.as_str()) {
+        if let Some(reason) = non_registry.get(key) {
             // LOUD: npm installs a git / url / `file:` dependency from the
             // dependent's spec and ignores `resolved`, so a rewrite here
             // would report the patch applied while the original bytes
@@ -1105,28 +1096,14 @@ fn scan_lock_matches(
             continue;
         }
         matches.push(LockMatch {
-            key: key.clone(),
-            original: entry.clone(),
+            key: key.to_string(),
+            original: e.value.clone(),
         });
     }
     match member {
         Some(key) if matches.is_empty() => LockScan::WorkspaceMember { key },
         _ => LockScan::Matches(matches),
     }
-}
-
-/// The package name a lock entry stands for: the explicit `name` field when
-/// present (npm writes it for aliases — `npm i alias@npm:real`), else the
-/// path after the LAST `node_modules/` (handles nesting AND scopes), else
-/// the key's basename (workspace-member keys, for classification only).
-fn entry_name<'a>(key: &'a str, obj: &'a serde_json::Map<String, Value>) -> &'a str {
-    if let Some(n) = obj.get("name").and_then(Value::as_str) {
-        return n;
-    }
-    if let Some(idx) = key.rfind(NODE_MODULES_SEG) {
-        return &key[idx + NODE_MODULES_SEG.len()..];
-    }
-    key.rsplit('/').next().unwrap_or(key)
 }
 
 fn entry_in_sync(live: &serde_json::Map<String, Value>, resolved: &str, integrity: &str) -> bool {
@@ -1161,89 +1138,37 @@ fn recompute_dep_fields(live: &mut serde_json::Map<String, Value>, staged_pkg: &
     }
 }
 
-/// Walk the v2 legacy `dependencies` tree and rewrite every node matching
-/// `name`+`version`. Nodes are addressed for revert by RFC 6901 JSON
-/// Pointer (names may contain `/` — scoped packages — so a plain
-/// slash-joined key would be ambiguous; `Value::pointer_mut` handles the
-/// `~1` escaping natively).
-#[allow(clippy::too_many_arguments)]
-fn rewrite_legacy_tree(
-    deps: &mut serde_json::Map<String, Value>,
-    pointer_base: &str,
-    parent_key: &str,
+/// The v2 legacy `dependencies` nodes to rewire for `name`+`version`, by
+/// RFC 6901 JSON Pointer (names may contain `/` — scoped packages — so a
+/// plain slash-joined key would be ambiguous). npm 6 spells an alias
+/// install `"<alias>": {"version": "npm:real@ver"}`; it installs that node
+/// from a `file:` `resolved` like any other (verified against real npm
+/// 6.14.18), so it is rewired with the rest (#432).
+fn legacy_rewire_targets(
+    lock: &Value,
     non_registry: &BTreeMap<String, String>,
     name: &str,
     version: &str,
-    resolved: &str,
-    integrity: &str,
-    lock_name: &str,
-    wiring: &mut Vec<WiringRecord>,
-    changed: &mut bool,
-) {
-    for (dep_name, node) in deps.iter_mut() {
-        let Some(obj) = node.as_object_mut() else {
-            continue;
-        };
-        let pointer = format!("{pointer_base}/{}", escape_json_pointer_token(dep_name));
-        let packages_key = legacy_packages_key(parent_key, dep_name);
-        // npm 6 spells an alias install `"<alias>": {"version":
-        // "npm:real@ver"}`; it installs that node from a `file:` `resolved`
-        // like any other (verified against real npm 6.14.18), so it is
-        // rewired with the rest (#432).
-        let (node_name, node_version) =
-            npm_legacy_identity(dep_name, obj.get("version").and_then(Value::as_str));
-        let is_match = node_name == name && node_version == Some(version);
-        if is_match && obj.get("bundled").and_then(Value::as_bool) == Some(true) {
-            // Parity with the `packages` scan's inBundle skip: this copy
-            // ships inside its parent's tarball, npm never installs it from
-            // `resolved`, and rewriting it would desync the two lock halves.
-            // (The `packages` twin carries `inBundle` and already pushed the
-            // stays-UNPATCHED warning.)
-        } else if is_match && non_registry.contains_key(&packages_key) {
-            // The mirror of a `packages` entry npm installs from a git / url
-            // / `file:` spec (#326) or from a dependency's shrinkwrap (#753):
-            // its twin was skipped with `vendor_non_registry_entry_skipped` /
-            // `vendor_shrinkwrapped_instance_skipped`, so rewiring this copy
-            // would record wiring for bytes that never install.
-        } else if is_match && !entry_in_sync(obj, resolved, integrity) {
-            let was_vendored = entry_points_into_vendor(obj);
-            let original = Value::Object(obj.clone());
-            obj.insert("resolved".to_string(), Value::String(resolved.to_string()));
-            obj.insert(
-                "integrity".to_string(),
-                Value::String(integrity.to_string()),
-            );
-            wiring.push(WiringRecord {
-                file: lock_name.to_string(),
-                kind: KIND_LOCK_LEGACY_ENTRY.to_string(),
-                action: WiringAction::Rewritten,
-                key: Some(pointer.clone()),
-                original: if was_vendored { None } else { Some(original) },
-                new: Some(Value::Object(obj.clone())),
-            });
-            *changed = true;
-        }
-        if let Some(sub) = obj.get_mut("dependencies").and_then(Value::as_object_mut) {
-            rewrite_legacy_tree(
-                sub,
-                &format!("{pointer}/dependencies"),
-                &packages_key,
-                non_registry,
-                name,
-                version,
-                resolved,
-                integrity,
-                lock_name,
-                wiring,
-                changed,
-            );
-        }
-    }
-}
-
-/// RFC 6901 token escaping (`~` → `~0`, `/` → `~1`).
-fn escape_json_pointer_token(token: &str) -> String {
-    token.replace('~', "~0").replace('/', "~1")
+) -> Vec<String> {
+    npm_lock_entries(lock)
+        .into_iter()
+        .filter(|e| e.section == NpmLockSection::Legacy)
+        .filter(|e| e.node.name == name && e.node.version == Some(version))
+        // Parity with the `packages` scan's inBundle skip: a bundled copy
+        // ships inside its parent's tarball, npm never installs it from
+        // `resolved`, and rewriting it would desync the two lock halves.
+        // (The `packages` twin carries `inBundle` and already pushed the
+        // stays-UNPATCHED warning.)
+        .filter(|e| !e.bundled)
+        // The mirror of a `packages` entry npm installs from a git / url /
+        // `file:` spec (#326) or from a dependency's shrinkwrap (#753): its
+        // twin was skipped with `vendor_non_registry_entry_skipped` /
+        // `vendor_shrinkwrapped_instance_skipped`, so rewiring this copy
+        // would record wiring for bytes that never install.
+        .filter(|e| !non_registry.contains_key(e.packages_key.as_ref()))
+        .filter(|e| e.value.is_object())
+        .map(|e| e.pointer)
+        .collect()
 }
 
 /// The parenthetical of a drifted-lock-entry warning: where the entry
@@ -1501,20 +1426,33 @@ impl LockRewire<'_> {
         // npm 6); leaving the registry resolved/integrity there would let an
         // old client silently install unpatched bytes.
         if lock_version == Some(2) {
-            if let Some(deps) = lock.get_mut("dependencies").and_then(Value::as_object_mut) {
-                rewrite_legacy_tree(
-                    deps,
-                    "/dependencies",
-                    "",
-                    &non_registry,
-                    self.name,
-                    self.version,
-                    self.resolved,
-                    self.integrity,
-                    lock_name,
-                    wiring,
-                    changed,
+            let targets = legacy_rewire_targets(lock, &non_registry, self.name, self.version);
+            for pointer in targets {
+                let Some(obj) = lock.pointer_mut(&pointer).and_then(Value::as_object_mut) else {
+                    continue;
+                };
+                if entry_in_sync(obj, self.resolved, self.integrity) {
+                    continue;
+                }
+                let was_vendored = entry_points_into_vendor(obj);
+                let original = Value::Object(obj.clone());
+                obj.insert(
+                    "resolved".to_string(),
+                    Value::String(self.resolved.to_string()),
                 );
+                obj.insert(
+                    "integrity".to_string(),
+                    Value::String(self.integrity.to_string()),
+                );
+                wiring.push(WiringRecord {
+                    file: lock_name.to_string(),
+                    kind: KIND_LOCK_LEGACY_ENTRY.to_string(),
+                    action: WiringAction::Rewritten,
+                    key: Some(pointer),
+                    original: if was_vendored { None } else { Some(original) },
+                    new: Some(Value::Object(obj.clone())),
+                });
+                *changed = true;
             }
         }
         Ok(())
@@ -4630,14 +4568,11 @@ mod tests {
     }
 
     #[test]
-    fn indent_detection_and_pointer_escaping() {
+    fn indent_detection() {
         assert_eq!(detect_indent("{\n  \"a\": 1\n}\n"), "  ");
         assert_eq!(detect_indent("{\n\t\"a\": 1\n}\n"), "\t");
         assert_eq!(detect_indent("{\n    \"a\": 1\n}\n"), "    ");
         assert_eq!(detect_indent("{}"), "  ", "default for flat files");
-
-        assert_eq!(escape_json_pointer_token("@scope/name"), "@scope~1name");
-        assert_eq!(escape_json_pointer_token("a~b"), "a~0b");
     }
 
     use crate::api::client::{ApiClient, ApiClientOptions};
