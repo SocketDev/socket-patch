@@ -1705,7 +1705,8 @@ pub fn parse_pnpm_root_output(stdout: &str) -> Option<String> {
 /// Get the bun global `node_modules` path: the global dir `bun pm ls -g`
 /// reports, else (no `bun` to ask, or an answer we can't read) the one
 /// Bun's own resolution picks from the environment, see
-/// [`bun_global_dir_from_env`].
+/// [`bun_global_dir_from_env`]. `None` when neither names a dir; see
+/// [`resolve_bun_global_prefix`] for why.
 ///
 /// The packages' dir is never derived from `bun pm bin -g` (#443): Bun
 /// moves its bin dir (`BUN_INSTALL_BIN`, bunfig `globalBinDir`) and its
@@ -1713,10 +1714,43 @@ pub fn parse_pnpm_root_output(stdout: &str) -> Option<String> {
 /// named a dir that didn't exist and every Bun global vanished from a
 /// global scan.
 pub fn get_bun_global_prefix() -> Option<String> {
-    get_bun_global_prefix_with(&GlobalProbeRunner).or_else(|| {
-        bun_global_dir_from_env(&|var| std::env::var_os(var))
-            .map(|dir| dir.join("node_modules").to_string_lossy().to_string())
-    })
+    resolve_bun_global_prefix().ok().flatten()
+}
+
+/// [`get_bun_global_prefix`], telling "Bun is not in use" (`Ok(None)`)
+/// apart from "Bun is in use but its global dir can't be told" (`Err` with
+/// the reason, #443), so a global scan can say so instead of reporting a
+/// clean, empty result.
+pub fn resolve_bun_global_prefix() -> Result<Option<String>, String> {
+    resolve_bun_global_prefix_with(
+        &GlobalProbeRunner,
+        &|var| std::env::var_os(var),
+        crate::utils::process::resolve_tool("bun").is_some(),
+    )
+}
+
+/// [`resolve_bun_global_prefix`] over an injected runner and environment.
+/// Bun counts as in use when `bun_on_path`, or when `BUN_INSTALL_GLOBAL_DIR`
+/// or `BUN_INSTALL` is set; otherwise an undeterminable dir is `Ok(None)`.
+pub fn resolve_bun_global_prefix_with(
+    runner: &dyn CommandRunner,
+    var: &impl Fn(&str) -> Option<OsString>,
+    bun_on_path: bool,
+) -> Result<Option<String>, String> {
+    if let Some(prefix) = get_bun_global_prefix_with(runner) {
+        return Ok(Some(prefix));
+    }
+    match bun_global_dir_from_env(var) {
+        Ok(dir) => Ok(Some(dir.join("node_modules").to_string_lossy().to_string())),
+        Err(why)
+            if bun_on_path
+                || var("BUN_INSTALL_GLOBAL_DIR").is_some()
+                || var("BUN_INSTALL").is_some() =>
+        {
+            Err(why)
+        }
+        Err(_) => Ok(None),
+    }
 }
 
 /// Version of `get_bun_global_prefix` that accepts an injected
@@ -1756,23 +1790,51 @@ pub fn parse_bun_ls_global_output(stdout: &str) -> Option<String> {
 /// `$BUN_INSTALL/install/global`, else `.bun/install/global` under
 /// `XDG_CACHE_HOME` or the home dir (`USERPROFILE` on Windows).
 ///
-/// A set-but-empty or relative variable counts as unset, the same rule as
-/// `composer_home_candidates`: it would otherwise name a dir relative to
-/// the scanned project.
-pub fn bun_global_dir_from_env(var: &impl Fn(&str) -> Option<OsString>) -> Option<PathBuf> {
-    let absolute = |name: &str| {
-        var(name)
-            .map(PathBuf::from)
-            .filter(|path| path.is_absolute())
+/// Bunfig is not consulted: measured on Bun 1.0.36 - 1.4.2, `bun add -g`
+/// ignores `install.globalDir` in the global (`~/.bunfig.toml`,
+/// `$XDG_CONFIG_HOME/.bunfig.toml`) and the local bunfig alike (it does
+/// honor `globalBinDir`, which moves only the bins), and so does
+/// `bun pm ls -g`.
+///
+/// Bun uses a set variable as it is, so the first one set decides. One that
+/// is empty or relative names a dir relative to wherever `bun add -g` ran,
+/// which can't be known here: that is an `Err` naming the variable, as is
+/// having no home dir at all.
+pub fn bun_global_dir_from_env(var: &impl Fn(&str) -> Option<OsString>) -> Result<PathBuf, String> {
+    let lookup = |name: &str| {
+        let value = var(name)?;
+        let path = PathBuf::from(&value);
+        Some(if path.is_absolute() {
+            Ok(path)
+        } else {
+            Err(format!("{name} is {value:?}, not an absolute path"))
+        })
     };
     let home_var = if cfg!(windows) { "USERPROFILE" } else { "HOME" };
-    absolute("BUN_INSTALL_GLOBAL_DIR")
-        .or_else(|| absolute("BUN_INSTALL").map(|dir| dir.join("install").join("global")))
-        .or_else(|| {
-            absolute("XDG_CACHE_HOME")
-                .or_else(|| absolute(home_var))
-                .map(|dir| dir.join(".bun").join("install").join("global"))
-        })
+    if let Some(dir) = lookup("BUN_INSTALL_GLOBAL_DIR") {
+        return dir;
+    }
+    if let Some(dir) = lookup("BUN_INSTALL") {
+        return dir.map(|dir| dir.join("install").join("global"));
+    }
+    lookup("XDG_CACHE_HOME")
+        .or_else(|| lookup(home_var))
+        .unwrap_or_else(|| Err(format!("neither XDG_CACHE_HOME nor {home_var} is set")))
+        .map(|dir| dir.join(".bun").join("install").join("global"))
+}
+
+/// Say once (muted only by `--silent`) that a global scan left Bun's global
+/// packages out because their dir can't be told (#443), instead of
+/// reporting a clean, empty result for them.
+fn warn_bun_global_dir_undetermined(why: &str) {
+    static SHOWN: std::sync::atomic::AtomicBool = std::sync::atomic::AtomicBool::new(false);
+    crate::utils::notice::notice_once(crate::utils::notice::Notice::Warning, &SHOWN, || {
+        format!(
+            "Warning: could not determine Bun's global package directory ({why}), so Bun's \
+             global packages were not scanned. Pass --global-prefix <dir>/node_modules to scan \
+             them."
+        )
+    });
 }
 
 // ---------------------------------------------------------------------------
@@ -2495,8 +2557,10 @@ impl NpmCrawler {
         if let Some(yarn_path) = get_yarn_global_prefix() {
             add(PathBuf::from(yarn_path));
         }
-        if let Some(bun_path) = get_bun_global_prefix() {
-            add(PathBuf::from(bun_path));
+        match resolve_bun_global_prefix() {
+            Ok(Some(bun_path)) => add(PathBuf::from(bun_path)),
+            Ok(None) => {}
+            Err(why) => warn_bun_global_dir_undetermined(&why),
         }
 
         // macOS-specific fallback paths

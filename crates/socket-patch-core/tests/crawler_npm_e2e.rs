@@ -10,7 +10,7 @@ use socket_patch_core::crawlers::npm_crawler::{
     get_npm_global_prefix, get_npm_global_prefix_with, get_pnpm_global_prefix,
     get_pnpm_global_prefix_with, get_yarn_global_prefix, get_yarn_global_prefix_with,
     parse_bun_ls_global_output, parse_npm_root_output, parse_package_name, parse_pnpm_root_output,
-    parse_yarn_dir_output, read_package_json,
+    parse_yarn_dir_output, read_package_json, resolve_bun_global_prefix_with,
 };
 use socket_patch_core::crawlers::types::CrawlerOptions;
 use socket_patch_core::crawlers::NpmCrawler;
@@ -299,6 +299,7 @@ fn get_pnpm_global_prefix_returns_none_when_pnpm_not_on_path() {
 fn get_bun_global_prefix_falls_back_to_env_when_bun_not_on_path() {
     with_empty_path(|| {
         let want = bun_global_dir_from_env(&|var| std::env::var_os(var))
+            .ok()
             .map(|dir| dir.join("node_modules").to_string_lossy().to_string());
         assert_eq!(get_bun_global_prefix(), want);
     });
@@ -374,6 +375,102 @@ fn get_bun_global_prefix_with_mock_runner_success() {
     assert_eq!(
         get_bun_global_prefix_with(&runner).as_deref(),
         Some("/Users/foo/.bun/install/global/node_modules")
+    );
+}
+
+// ── bun global dir: env resolution and the undetermined case (#443) ──
+
+/// An environment holding exactly `vars`.
+fn env_of<'a>(vars: &'a [(&'a str, &'a str)]) -> impl Fn(&str) -> Option<std::ffi::OsString> + 'a {
+    move |name| {
+        vars.iter()
+            .find(|(n, _)| *n == name)
+            .map(|(_, v)| std::ffi::OsString::from(v))
+    }
+}
+
+/// Bun uses the first of `BUN_INSTALL_GLOBAL_DIR`, `BUN_INSTALL`,
+/// `XDG_CACHE_HOME`, home that is SET, as it is: one that is empty or
+/// relative names a dir relative to wherever `bun add -g` ran, so the dir
+/// can't be told, and a later variable is not a stand-in for it.
+#[cfg(unix)]
+#[test]
+#[serial_test::parallel]
+fn bun_global_dir_from_env_follows_the_first_set_variable() {
+    let ok = |vars: &[(&str, &str)], want: &str| {
+        assert_eq!(
+            bun_global_dir_from_env(&env_of(vars)),
+            Ok(std::path::PathBuf::from(want)),
+            "{vars:?}"
+        );
+    };
+    ok(
+        &[
+            ("BUN_INSTALL_GLOBAL_DIR", "/g"),
+            ("BUN_INSTALL", "/b"),
+            ("HOME", "/h"),
+        ],
+        "/g",
+    );
+    ok(
+        &[("BUN_INSTALL", "/b"), ("XDG_CACHE_HOME", "/x")],
+        "/b/install/global",
+    );
+    ok(
+        &[("XDG_CACHE_HOME", "/x"), ("HOME", "/h")],
+        "/x/.bun/install/global",
+    );
+    ok(&[("HOME", "/h")], "/h/.bun/install/global");
+
+    for (vars, named) in [
+        (
+            &[("BUN_INSTALL_GLOBAL_DIR", "rel/g"), ("HOME", "/h")][..],
+            "BUN_INSTALL_GLOBAL_DIR",
+        ),
+        (
+            &[("BUN_INSTALL_GLOBAL_DIR", ""), ("BUN_INSTALL", "/b")][..],
+            "BUN_INSTALL_GLOBAL_DIR",
+        ),
+        (&[("BUN_INSTALL", "rel"), ("HOME", "/h")][..], "BUN_INSTALL"),
+        (
+            &[("XDG_CACHE_HOME", "rel"), ("HOME", "/h")][..],
+            "XDG_CACHE_HOME",
+        ),
+        (&[][..], "HOME"),
+    ] {
+        let why = bun_global_dir_from_env(&env_of(vars)).unwrap_err();
+        assert!(why.contains(named), "{vars:?}: {why}");
+    }
+}
+
+/// #443: when `bun pm ls -g` can't answer and the environment can't name
+/// the dir either, a global scan learns why (to say so) as long as Bun is
+/// in use: `bun` on PATH, or a `BUN_INSTALL*` variable set. Without Bun
+/// there is nothing to report.
+#[test]
+#[serial_test::parallel]
+fn resolve_bun_global_prefix_reports_an_undeterminable_dir() {
+    let silent_bun = common::MockCommandRunner::new();
+    let relative = [("BUN_INSTALL_GLOBAL_DIR", "rel/g"), ("HOME", "/h")];
+    let why = resolve_bun_global_prefix_with(&silent_bun, &env_of(&relative), false).unwrap_err();
+    assert!(why.contains("BUN_INSTALL_GLOBAL_DIR"), "{why}");
+    assert!(resolve_bun_global_prefix_with(&silent_bun, &env_of(&[]), true).is_err());
+    assert_eq!(
+        resolve_bun_global_prefix_with(&silent_bun, &env_of(&[]), false),
+        Ok(None),
+        "no Bun in use: nothing to report"
+    );
+
+    // Bun's own answer wins over an environment we can't read.
+    let answering_bun = common::MockCommandRunner::new().with_response(
+        "bun",
+        &["pm", "ls", "-g"],
+        Some("/g node_modules (1 installed)\n"),
+    );
+    let want = std::path::PathBuf::from("/g").join("node_modules");
+    assert_eq!(
+        resolve_bun_global_prefix_with(&answering_bun, &env_of(&relative), true),
+        Ok(Some(want.to_string_lossy().to_string()))
     );
 }
 

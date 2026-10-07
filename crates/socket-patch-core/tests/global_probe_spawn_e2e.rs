@@ -517,3 +517,44 @@ async fn bun_global_dir_falls_back_to_bun_env_resolution() {
         drop(case_env);
     }
 }
+
+/// #443: Bun's global dir does not follow bunfig. Measured on Bun 1.0.36 -
+/// 1.4.2, `bun add -g` installs into `~/.bun/install/global` even when the
+/// global bunfig (`~/.bunfig.toml`, `$XDG_CONFIG_HOME/.bunfig.toml`) sets
+/// `install.globalDir` (its `globalBinDir` moves only the bins), so the
+/// environment fallback must not follow it either.
+#[test]
+#[serial]
+fn bun_global_dir_fallback_ignores_bunfig_global_dir() {
+    let l = layout();
+    let mut env = Env::new();
+    point_env_at(&mut env, &l);
+    for name in ["BUN_INSTALL_GLOBAL_DIR", "BUN_INSTALL", "XDG_CACHE_HOME"] {
+        env.set(name, None);
+    }
+    let config = l.home.join("xdg-config");
+    env.set("XDG_CONFIG_HOME", Some(config.as_os_str()));
+    let bunfig = |dir: &Path, global: &str| {
+        std::fs::create_dir_all(dir).unwrap();
+        let toml = format!(
+            "[install]\nglobalDir = {:?}\nglobalBinDir = {:?}\n",
+            l.home.join(global).to_string_lossy(),
+            l.home.join("bunfig-bin").to_string_lossy(),
+        );
+        std::fs::write(dir.join(".bunfig.toml"), toml).unwrap();
+        std::fs::create_dir_all(l.home.join(global).join("node_modules")).unwrap();
+    };
+    bunfig(&l.home, "home-bunfig-global");
+    bunfig(&config, "xdg-bunfig-global");
+
+    assert_eq!(
+        get_bun_global_prefix().map(PathBuf::from),
+        Some(
+            l.home
+                .join(".bun")
+                .join("install")
+                .join("global")
+                .join("node_modules")
+        )
+    );
+}
