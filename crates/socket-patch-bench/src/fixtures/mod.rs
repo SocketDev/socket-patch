@@ -189,6 +189,13 @@ pub static ALL: &[Pm] = &[
         build: pypi::build_pdm,
     },
     Pm {
+        name: "hatch",
+        description: "Hatch (hatchling pyproject + hatch.toml envs, .venv)",
+        packages: 1000,
+        patched: 25,
+        build: pypi::build_hatch,
+    },
+    Pm {
         name: "bundler",
         description: "RubyGems (Gemfile.lock with CHECKSUMS, vendor/bundle)",
         packages: 800,
