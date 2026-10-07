@@ -173,9 +173,7 @@ pub fn pnpm_lock_carries_hosted_redirect(
 pub fn npm_lock_url_needles(artifact_url: &str) -> Vec<String> {
     let mut needles: Vec<String> =
         crate::patch::redirect::artifact_url_spellings(artifact_url).into();
-    needles.push(crate::utils::uri::encode_uri_component(
-        artifact_url,
-    ));
+    needles.push(crate::utils::uri::encode_uri_component(artifact_url));
     needles
 }
 
@@ -310,11 +308,7 @@ fn npm_allow_remote_preamble(hosts: &[&str]) -> String {
 
 /// The auto-config variant: `allow-remote=all` was (or, on `--dry-run`,
 /// would be) written to the project `.npmrc`, so installs need no flags.
-pub fn npm_allow_remote_configured_detail(
-    hosts: &[&str],
-    created: bool,
-    dry_run: bool,
-) -> String {
+pub fn npm_allow_remote_configured_detail(hosts: &[&str], created: bool, dry_run: bool) -> String {
     let how = match (created, dry_run) {
         (true, false) => "`allow-remote=all` was written to a new",
         (false, false) => "`allow-remote=all` was appended to the existing",
@@ -409,6 +403,54 @@ pub fn npm_allow_remote_unreadable_detail(hosts: &[&str], why: &str) -> String {
          `allow-remote=all` to it yourself (or install with `npm ci --allow-remote=all`) \
          so npm >=12 installs the patched artifacts. {NPM_ALLOW_REMOTE_TRADEOFF}",
         npm_allow_remote_preamble(hosts),
+    )
+}
+
+/// Warning code for a hosted npm pin that npm's
+/// `replace-registry-host` setting rewrites to the configured registry
+/// (#812).
+pub const NPM_REPLACE_REGISTRY_HOST_CODE: &str = "redirect_npm_replace_registry_host";
+
+/// npm (>= 8) `replace-registry-host` rewrites the hosted pins' origin to
+/// the configured registry, so every install fetches `<registry>/patch/…`
+/// and fails E404 (closed: never unpatched bytes). Nothing is written to
+/// override it — like an explicit `allow-remote`, the setting is the
+/// user's — so the warning names where it is set and both remedies.
+pub fn npm_replace_registry_host_detail(
+    hosts: &[&str],
+    value: &str,
+    source: &crate::patch::redirect::npmrc::SettingSource,
+) -> String {
+    use crate::patch::redirect::npmrc::SettingSource;
+    let (where_, fix) = match source {
+        SettingSource::Env(var) => (
+            format!("the environment variable {var} sets"),
+            format!(
+                "unset {var} (npm's environment layer overrides every .npmrc) or set it to \
+                 `npmjs`"
+            ),
+        ),
+        SettingSource::Project => (
+            "the project .npmrc sets".to_string(),
+            "change it to `replace-registry-host=npmjs` (npm's default) or remove it".to_string(),
+        ),
+        SettingSource::File { layer, path } => (
+            format!("the {layer} npm config ({}) sets", path.display()),
+            format!(
+                "set `replace-registry-host=npmjs` (npm's default) in the project .npmrc (it \
+                 outranks the {layer} config) or change the {layer} config"
+            ),
+        ),
+    };
+    format!(
+        "the npm lockfile now resolves patched dependencies from the hosted patch server ({}), \
+         but {where_} `replace-registry-host={value}`, which makes npm >=8 rewrite those \
+         `resolved` URLs to the configured registry: every `npm ci` / `npm install` then \
+         fails E404 (a warm npm cache can hide this locally; a fresh checkout or CI runner \
+         fails). To install the hosted patches, {fix}; or switch this project to vendored \
+         patches (`socket-patch scan --mode vendored`), whose `file:` resolutions npm never \
+         rewrites",
+        hosts.join(", "),
     )
 }
 

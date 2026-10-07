@@ -64,7 +64,7 @@ npm 12 notes:
 | `e2e_redirect_npm_build` (`#[ignore]`) | real | scan / get-uuid / get-ghsa hosted redirects, shrinkwrap flavor, tampered-tarball rejection, fresh-checkout `npm ci`, manifest-less VEX tail |
 | `e2e_vendor_npm_build` | real | vendor / get-vendored, shrinkwrap flavor, npm 6 × v2 lock, idempotency, byte-exact revert, manifest-less VEX tail |
 | `e2e_vex_lockfile::npm` | none | tamper / spoof / mismatch / pin cells over lockfileVersion 1, 2, 3, shrinkwrap and dual-lock shapes |
-| `redirect_npm_allow_remote` | none | the npm 12 `allow-remote` auto-config: `.npmrc` create / append (BOM, CRLF), explicit values respected (project file, user / global config, env var), unhonored spellings, bare-CR and indented-section files, section-scoped copies, opt-out flag + env, dry run, symlinked `.npmrc`, `--silent`, rollback/removal deleting a standalone setting or warning `npm_allow_remote_left` when other settings remain |
+| `redirect_npm_allow_remote` | none | the npm 12 `allow-remote` auto-config: `.npmrc` create / append (BOM, CRLF), explicit values respected (project file, user / global config, env var), unhonored spellings, bare-CR and indented-section files, section-scoped copies, opt-out flag + env, dry run, symlinked `.npmrc`, `--silent`, rollback/removal deleting a standalone setting or warning `npm_allow_remote_left` when other settings remain; `replace-registry-host` rewriting the hosted pin (project file, user config, env var) warned `redirect_npm_replace_registry_host` |
 | `e2e_hosted_production` / `e2e_vendored_production` (`#[ignore]`) | real (ambient) | the same flows against production, ending in the manifest-less VEX tail |
 
 The manifest-less VEX tail (`tests/npm_e2e_common/manifestless.rs`) runs four

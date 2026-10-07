@@ -44,6 +44,7 @@ const PATCHED_SHA512: &str = "sha512-PATCHEDpatchedPATCHEDpatched0123456789==";
 const UPSTREAM_SHA512: &str = "sha512-UPSTREAMupstream==";
 const CODE: &str = "redirect_npm_allow_remote";
 const LEFT: &str = "npm_allow_remote_left";
+const REPLACE_HOST: &str = "redirect_npm_replace_registry_host";
 
 fn hosted_url() -> String {
     format!(
@@ -188,6 +189,8 @@ fn npm_isolation(root: &Path) -> Vec<(String, String)> {
         ("PREFIX".into(), absent(".absent-prefix")),
         ("NPM_CONFIG_ALLOW_REMOTE".into(), String::new()),
         ("npm_config_allow_remote".into(), String::new()),
+        ("NPM_CONFIG_REPLACE_REGISTRY_HOST".into(), String::new()),
+        ("npm_config_replace_registry_host".into(), String::new()),
     ]
 }
 
@@ -786,6 +789,119 @@ async fn outer_npm_config_layers_are_respected() {
     assert_eq!(
         std::fs::read_to_string(tmp.path().join(".npmrc")).unwrap(),
         "allow-remote=all\n"
+    );
+}
+
+fn replace_host_warning(doc: &Value) -> Option<&str> {
+    doc["redirect"]["warnings"]
+        .as_array()
+        .into_iter()
+        .flatten()
+        .find(|w| w["code"] == REPLACE_HOST)
+        .and_then(|w| w["detail"].as_str())
+}
+
+/// #812: npm >= 8's `replace-registry-host=always` (or the pinned host
+/// itself) makes npm rewrite every hosted pin to the configured registry,
+/// so each later `npm ci` / `npm install` fails E404. The hosted run
+/// detected nothing and reported success. It now warns
+/// `redirect_npm_replace_registry_host` (JSON + human), naming the layer
+/// that sets it — project file, user config or env var — on the first run
+/// and on the "already hosted" re-run; a value that does not match the
+/// pinned host stays quiet.
+#[tokio::test]
+async fn replace_registry_host_rewriting_the_pin_is_warned() {
+    let server = MockServer::start().await;
+    mock_api(&server).await;
+
+    // Project `.npmrc`: first run and the idempotent re-run both warn.
+    let tmp = tempfile::tempdir().unwrap();
+    write_npm_project(tmp.path(), "package-lock.json");
+    std::fs::write(tmp.path().join(".npmrc"), "replace-registry-host=always\n").unwrap();
+    for run in 0..2 {
+        let (code, doc, _) = scan_hosted(tmp.path(), &server.uri(), &["--json"]);
+        assert_eq!(code, 0, "{doc:#}");
+        let detail = replace_host_warning(&doc)
+            .unwrap_or_else(|| panic!("run {run}: no {REPLACE_HOST}: {doc:#}"));
+        assert!(
+            detail.contains("patch.test")
+                && detail.contains("the project .npmrc sets `replace-registry-host=always`")
+                && detail.contains("E404")
+                && detail.contains("replace-registry-host=npmjs")
+                && detail.contains("--mode vendored"),
+            "{detail}"
+        );
+    }
+    let (code, _, stderr) = scan_hosted(tmp.path(), &server.uri(), &[]);
+    assert_eq!(code, 0, "{stderr}");
+    assert!(
+        stderr.contains("Warning: ") && stderr.contains("`replace-registry-host=always`"),
+        "{stderr}"
+    );
+
+    // The pinned hostname itself rewrites it too; another host does not.
+    for (value, warns) in [
+        ("patch.test", true),
+        ("registry.example", false),
+        ("never", false),
+    ] {
+        let tmp = tempfile::tempdir().unwrap();
+        write_npm_project(tmp.path(), "package-lock.json");
+        std::fs::write(
+            tmp.path().join(".npmrc"),
+            format!("replace-registry-host={value}\n"),
+        )
+        .unwrap();
+        let (code, doc, _) = scan_hosted(tmp.path(), &server.uri(), &["--json"]);
+        assert_eq!(code, 0, "{doc:#}");
+        assert_eq!(
+            replace_host_warning(&doc).is_some(),
+            warns,
+            "{value}: {doc:#}"
+        );
+        assert!(allow_remote_warning(&doc).is_some(), "{doc:#}");
+    }
+
+    // User config (relocated the way npm allows).
+    let tmp = tempfile::tempdir().unwrap();
+    let cfg = tempfile::tempdir().unwrap();
+    write_npm_project(tmp.path(), "package-lock.json");
+    let user = cfg.path().join("user.npmrc");
+    std::fs::write(&user, "replace-registry-host=always\n").unwrap();
+    let user_s = user.to_str().unwrap();
+    let (code, doc, _) = scan_hosted_env(
+        tmp.path(),
+        &server.uri(),
+        &["--json"],
+        &[
+            ("NPM_CONFIG_USERCONFIG", user_s),
+            ("npm_config_userconfig", user_s),
+        ],
+    );
+    assert_eq!(code, 0, "{doc:#}");
+    let detail = replace_host_warning(&doc).unwrap_or_else(|| panic!("no {REPLACE_HOST}: {doc:#}"));
+    assert!(
+        detail.contains("the user npm config") && detail.contains(user_s),
+        "{detail}"
+    );
+
+    // The env var beats a project `npmjs`.
+    let tmp = tempfile::tempdir().unwrap();
+    write_npm_project(tmp.path(), "package-lock.json");
+    std::fs::write(tmp.path().join(".npmrc"), "replace-registry-host=npmjs\n").unwrap();
+    let (code, doc, _) = scan_hosted_env(
+        tmp.path(),
+        &server.uri(),
+        &["--json"],
+        &[("npm_config_replace_registry_host", "always")],
+    );
+    assert_eq!(code, 0, "{doc:#}");
+    let detail = replace_host_warning(&doc).unwrap_or_else(|| panic!("no {REPLACE_HOST}: {doc:#}"));
+    assert!(
+        detail
+            .to_ascii_lowercase()
+            .contains("npm_config_replace_registry_host sets `replace-registry-host=always`"),
+        "{detail}"
     );
 }
 
