@@ -887,9 +887,34 @@ pub async fn discover_patched_refs_in(
     snapshot: &crate::vendor::lock_inventory::DiskSnapshot<'_>,
     opts: &DiscoverOptions,
 ) -> Discovery {
-    let mut ctx = DiscoverCtx::with_origins(snapshot.root, &opts.patch_server_origins);
-    ctx.view = crate::vendor::lock_inventory::ProjectView::Snapshot(snapshot);
-    discover_with_ctx(ctx).await
+    discover_patched_refs_view(
+        crate::vendor::lock_inventory::ProjectView::Snapshot(snapshot),
+        opts,
+    )
+    .await
+}
+
+/// [`discover_patched_refs_with`] over any [`ProjectView`]: the disk, a
+/// per-run snapshot of it (possibly overlaid with a rewrite's output, see
+/// [`DiskSnapshot::overlay`]), or an in-memory project. Over memory the
+/// disk-only probes (installed trees, vendored artifact dirs, the sbt
+/// resolution evidence) see nothing, exactly as an in-memory hosted scan
+/// sees no installed tree.
+///
+/// [`ProjectView`]: crate::vendor::lock_inventory::ProjectView
+/// [`DiskSnapshot::overlay`]: crate::vendor::lock_inventory::DiskSnapshot::overlay
+pub async fn discover_patched_refs_view(
+    view: crate::vendor::lock_inventory::ProjectView<'_>,
+    opts: &DiscoverOptions,
+) -> Discovery {
+    // Boxed as `Send` here, where the extractors' futures are concrete: the
+    // in-memory hosted engine's future must be `Send`, and proving it
+    // through every extractor from inside the engine's loops trips rustc's
+    // higher-ranked auto-trait check.
+    let run: std::pin::Pin<Box<dyn std::future::Future<Output = Discovery> + Send + '_>> = Box::pin(
+        discover_with_ctx(DiscoverCtx::over(view, &opts.patch_server_origins)),
+    );
+    run.await
 }
 
 async fn discover_with_ctx(ctx: DiscoverCtx<'_>) -> Discovery {
@@ -921,13 +946,12 @@ fn is_script_lock(file: &Path) -> bool {
     crate::utils::python_lock::is_script_lock_name(&file.to_string_lossy())
 }
 
-/// What every extractor receives: the project root plus the hosted-origin
+/// What every extractor receives: the project view plus the hosted-origin
 /// allowlist, with the guarded-read and identity helpers bolted on.
 pub(crate) struct DiscoverCtx<'a> {
-    pub(crate) root: &'a Path,
-    /// Where the guarded reads read from: `root` on disk, or a per-run
-    /// snapshot of it.
-    view: crate::vendor::lock_inventory::ProjectView<'a>,
+    /// Where the guarded reads read from: the root on disk, a per-run
+    /// snapshot of it, or an in-memory project.
+    pub(crate) view: crate::vendor::lock_inventory::ProjectView<'a>,
     patch_server_origins: &'a [String],
     /// What the guarded reads have recognized so far (rule 11) — collected
     /// here, not in the extractor's `&mut Discovery`, so a read into a
@@ -938,12 +962,28 @@ pub(crate) struct DiscoverCtx<'a> {
 
 impl<'a> DiscoverCtx<'a> {
     pub(crate) fn with_origins(root: &'a Path, patch_server_origins: &'a [String]) -> Self {
+        Self::over(
+            crate::vendor::lock_inventory::ProjectView::Disk(root),
+            patch_server_origins,
+        )
+    }
+
+    pub(crate) fn over(
+        view: crate::vendor::lock_inventory::ProjectView<'a>,
+        patch_server_origins: &'a [String],
+    ) -> Self {
         DiscoverCtx {
-            root,
-            view: crate::vendor::lock_inventory::ProjectView::Disk(root),
+            view,
             patch_server_origins,
             recognized: Mutex::new(BTreeSet::new()),
         }
+    }
+
+    /// The project root on disk, for the probes only a real tree answers
+    /// (installed packages, vendored artifact dirs, build evidence); `None`
+    /// over an in-memory project, where those probes find nothing.
+    pub(crate) fn disk_root(&self) -> Option<&'a Path> {
+        self.view.disk_root()
     }
 
     /// Record every Socket identity `text` (the content of root-relative

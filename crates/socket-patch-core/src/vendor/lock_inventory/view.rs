@@ -248,7 +248,34 @@ pub enum ProjectView<'a> {
     Snapshot(&'a DiskSnapshot<'a>),
 }
 
-impl ProjectView<'_> {
+impl<'a> ProjectView<'a> {
+    /// The project root on disk; `None` in memory.
+    pub fn disk_root(&self) -> Option<&'a Path> {
+        match *self {
+            ProjectView::Disk(root) => Some(root),
+            ProjectView::Snapshot(snap) => Some(snap.root),
+            ProjectView::Memory(_) => None,
+        }
+    }
+
+    /// The root-level Python lock names (sorted; see
+    /// [`crate::utils::python_lock::python_lock_paths`]).
+    pub fn python_lock_paths(&self) -> Vec<String> {
+        match self {
+            ProjectView::Disk(root) | ProjectView::Snapshot(DiskSnapshot { root, .. }) => {
+                crate::utils::python_lock::python_lock_paths(root).unwrap_or_default()
+            }
+            ProjectView::Memory(project) => project
+                .children("")
+                .into_iter()
+                .filter(|(name, is_dir)| {
+                    !is_dir && crate::utils::python_lock::is_python_lock_name(name)
+                })
+                .map(|(name, _)| name)
+                .collect(),
+        }
+    }
+
     /// FIFO-safe regular-file text read.
     pub async fn read_text(&self, rel: &str) -> io::Result<String> {
         match self {

@@ -21,20 +21,15 @@ use super::LockfileEntry;
 /// directories only (a symlinked subspace dir could point the read outside
 /// the project) with traversal-safe UTF-8 names. Stat / list only; whether
 /// the project IS a Rush monorepo (`rush.json`) is the caller's check.
-pub(crate) async fn rush_lock_rels(root: &Path) -> Vec<String> {
-    let mut names = Vec::new();
-    if let Ok(mut dir) = tokio::fs::read_dir(root.join(RUSH_SUBSPACES_DIR)).await {
-        while let Ok(Some(entry)) = dir.next_entry().await {
-            if !entry.file_type().await.is_ok_and(|t| t.is_dir()) {
-                continue;
-            }
-            if let Some(name) = entry.file_name().to_str() {
-                if is_safe_single_segment(name) {
-                    names.push(name.to_string());
-                }
-            }
-        }
-    }
+pub(crate) async fn rush_lock_rels(view: ProjectView<'_>) -> Vec<String> {
+    let mut names: Vec<String> = view
+        .list_dir(RUSH_SUBSPACES_DIR)
+        .await
+        .unwrap_or_default()
+        .into_iter()
+        .filter(|entry| entry.is_dir && is_safe_single_segment(&entry.name))
+        .map(|entry| entry.name)
+        .collect();
     names.sort();
     let mut rels = vec![RUSH_COMMON_LOCK_REL.to_string()];
     rels.extend(

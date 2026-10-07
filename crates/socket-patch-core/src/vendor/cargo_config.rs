@@ -321,10 +321,17 @@ pub(crate) fn patch_entries(doc: &DocumentMut) -> Vec<CargoPatchEntry<'_>> {
 /// extension (and warns) — else [`CONFIG_TOML`] (which may not exist yet).
 /// `metadata`, not lstat: cargo's own existence probe follows symlinks.
 pub(crate) async fn effective_config_rel(project_root: &Path) -> &'static str {
-    if fs::metadata(project_root.join(".cargo").join("config"))
-        .await
-        .is_ok()
-    {
+    effective_config_rel_in(crate::vendor::lock_inventory::ProjectView::Disk(
+        project_root,
+    ))
+    .await
+}
+
+/// [`effective_config_rel`] over any project view.
+pub(crate) async fn effective_config_rel_in(
+    view: crate::vendor::lock_inventory::ProjectView<'_>,
+) -> &'static str {
+    if view.exists(CONFIG_LEGACY).await {
         CONFIG_LEGACY
     } else {
         CONFIG_TOML

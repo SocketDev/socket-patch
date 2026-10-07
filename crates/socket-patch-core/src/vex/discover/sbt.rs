@@ -51,7 +51,11 @@ pub(crate) async fn extract(ctx: &DiscoverCtx<'_>, out: &mut Discovery) {
     if hosted.is_none() && vendored.is_none() {
         return;
     }
-    let (res, blocker) = evidence(ctx.root).await;
+    // The resolution evidence is sbt's own output tree: only a disk has one.
+    let (res, blocker) = match ctx.disk_root() {
+        Some(root) => evidence(root).await,
+        None => (None, None),
+    };
     let blocker = blocker.as_deref();
     let mut hashes = Hashes::default();
     if let Some(text) = hosted {
@@ -324,7 +328,10 @@ async fn vendored_check(
 ) {
     for (ext, want) in [("pom", &pin.pom_sha256), ("jar", &pin.jar_sha256)] {
         let rel = format!("{VENDORED_REPO_REL}/{}", pin.repo_path(ext));
-        let got = hashes.of(&ctx.root.join(&rel)).await;
+        let got = match ctx.disk_root() {
+            Some(root) => hashes.of(&root.join(&rel)).await,
+            None => None,
+        };
         if got.as_deref() != Some(want.as_str()) {
             out.diag(
                 DIAG_VENDORED_TREE_MISSING,

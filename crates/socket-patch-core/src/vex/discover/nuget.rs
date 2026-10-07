@@ -98,7 +98,12 @@ pub(crate) async fn extract(ctx: &DiscoverCtx<'_>, out: &mut Discovery) {
     // case-insensitive filesystem the "others" are the file read below
     // itself — skipped, so it is not reported under three names.
     for name in CONFIG_NAMES.iter().filter(|name| **name != cfg_rel) {
-        if !same_file(&ctx.root.join(name), &ctx.root.join(cfg_rel)).await {
+        // In memory every spelling is its own entry.
+        let same = match ctx.disk_root() {
+            Some(root) => same_file(&root.join(name), &root.join(cfg_rel)).await,
+            None => false,
+        };
+        if !same {
             ctx.recognize_ignored(name).await;
         }
     }
@@ -544,7 +549,11 @@ async fn emit_vendored(
 async fn feed_leaves(ctx: &DiscoverCtx<'_>, uuid: &str, id_lower: &str) -> Vec<(String, String)> {
     // `uuid` passed the canonical grammar (socket_patch_name_uuid), so the
     // join cannot escape `.socket/vendor/nuget/`.
-    let dir = ctx.root.join(VENDOR_DIR).join("nuget").join(uuid);
+    // The vendored feed is a dir of packages: only a disk has one.
+    let Some(root) = ctx.disk_root() else {
+        return Vec::new();
+    };
+    let dir = root.join(VENDOR_DIR).join("nuget").join(uuid);
     let Ok(mut entries) = tokio::fs::read_dir(&dir).await else {
         return Vec::new();
     };

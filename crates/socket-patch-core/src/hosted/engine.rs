@@ -361,24 +361,6 @@ impl CandidateFiles {
     }
 }
 
-/// The root-level Python lock names (sorted).
-async fn python_lock_paths(view: &ProjectView<'_>) -> Vec<String> {
-    match view {
-        ProjectView::Disk(cwd)
-        | ProjectView::Snapshot(crate::vendor::lock_inventory::DiskSnapshot {
-            root: cwd, ..
-        }) => crate::utils::python_lock::python_lock_paths(cwd).unwrap_or_default(),
-        ProjectView::Memory(project) => project
-            .children("")
-            .into_iter()
-            .filter(|(name, is_dir)| {
-                !is_dir && crate::utils::python_lock::is_python_lock_name(name)
-            })
-            .map(|(name, _)| name)
-            .collect(),
-    }
-}
-
 /// Whether the project is a Rush monorepo (disk: `rush.json` is a file).
 fn rush_repo(view: &ProjectView<'_>) -> bool {
     match view {
@@ -552,7 +534,7 @@ pub async fn read_candidate_files(
         }
     }
 
-    for path in python_lock_paths(view).await {
+    for path in view.python_lock_paths() {
         if let Some(script) = crate::utils::python_lock::script_of_lock(&path) {
             out.read(view, unreadable, script).await;
         }
