@@ -765,7 +765,11 @@ async fn record_berry_copies(ctx: &DiscoverCtx<'_>, copies: Vec<BerryCopy>, out:
             let url = copy.reference.split(['#']).next().unwrap_or_default();
             (
                 registry_tarball_name(url, &copy.version),
-                format!("installs it from {url:?}"),
+                // Published in the VEX document: never a credential.
+                format!(
+                    "installs it from {:?}",
+                    crate::utils::redact::redact_url(url)
+                ),
             )
         };
         let Some(name) = name else {

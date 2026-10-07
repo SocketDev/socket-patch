@@ -28,11 +28,25 @@ export const PatchRecordSchema = z.object({
 
 export type PatchRecord = z.infer<typeof PatchRecordSchema>
 
+// Legacy state written by the `setup` command that v5 removed (and by the
+// pre-v5 `vex`). The CLI still parses it and keeps it on rewrite, so a
+// manifest validated here keeps it too. Mirrors `SetupConfig` in
+// crates/socket-patch-core/src/manifest/schema.rs.
+export const SetupConfigSchema = z.object({
+  // Workspace-member paths the removed `setup` skipped.
+  exclude: z.array(z.string()).optional(),
+  // Ecosystems the pre-v5 `vex` attested with no install hook wired.
+  manual: z.array(z.string()).optional(),
+})
+
+export type SetupConfig = z.infer<typeof SetupConfigSchema>
+
 export const PatchManifestSchema = z.object({
   patches: z.record(
     z.string(), // Package PURL like "pkg:npm/simplehttpserver@0.0.6"
     PatchRecordSchema,
   ),
+  setup: SetupConfigSchema.optional(),
 })
 
 export type PatchManifest = z.infer<typeof PatchManifestSchema>
