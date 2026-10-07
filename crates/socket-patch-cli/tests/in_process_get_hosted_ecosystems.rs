@@ -512,7 +512,9 @@ async fn maven_profile_scoped_dependency_is_not_redirected() {
 "#;
     std::fs::write(tmp.path().join("pom.xml"), pom).unwrap();
 
-    socket_patch_cli::commands::get::run(get_hosted_args(UUID, tmp.path(), server.uri())).await;
+    let code =
+        socket_patch_cli::commands::get::run(get_hosted_args(UUID, tmp.path(), server.uri())).await;
+    assert_eq!(code, 0, "an unattributable pin is a skip, not a failure");
     assert_eq!(
         reference_bodies(&server).await.len(),
         1,

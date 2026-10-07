@@ -1009,6 +1009,20 @@ pub(crate) async fn run_redirect_selected(
             socket_patch_core::utils::fs::read_regular_to_string_sync(path).ok()
         })
     };
+    // The wet takeovers' uuids: their vendored wiring is already reverted,
+    // so the rewrite's attribution gate must not drop them (dry-run previews
+    // left `candidates`, so this holds only wet takeovers).
+    let takeover_uuids: std::collections::BTreeSet<String> = {
+        use socket_patch_core::utils::purl::{canonical_purl, strip_purl_qualifiers};
+        let key = |purl: &str| canonical_purl(strip_purl_qualifiers(purl));
+        let migrated: std::collections::HashSet<String> =
+            takeover_migrated.iter().map(|p| key(p)).collect();
+        candidates
+            .iter()
+            .filter(|c| migrated.contains(&key(&c.purl)))
+            .map(|c| c.dep.patch_uuid.clone())
+            .collect()
+    };
     let rewrite_options = || RewriteOptions {
         dry_run: common.dry_run,
         targets_pipenv_lock,
@@ -1021,6 +1035,7 @@ pub(crate) async fn run_redirect_selected(
         npm_allow_remote_config: !common.no_npm_allow_remote_config,
         npm_outer: &npm_outer,
         blocking: true,
+        takeover_uuids: takeover_uuids.clone(),
     };
     // The rollout gate plans again without its deferred rows: keep what
     // the second pass needs.
@@ -2450,6 +2465,12 @@ fn describe_skip_reason(reason: &str) -> String {
         }
         "redirect_vlt_artifact_unverifiable" => {
             "vlt could not verify the hosted artifact (see the warning)".into()
+        }
+        "redirect_unattributable" => {
+            "lockfile discovery could not attribute its pin to one package version, so \
+             nothing was written for it (reconcile the project's lockfiles; --json has the \
+             detail)"
+                .into()
         }
         other => format!("server status `{other}`"),
     }
@@ -4298,6 +4319,12 @@ mod tests {
             describe_skip_reason("redirect_requirements_takeover_unreachable"),
             "hosted mode cannot pin it where vendored mode wired it, so it stays vendored \
              (see the warning)"
+        );
+        assert_eq!(
+            describe_skip_reason(socket_patch_core::hosted::engine::REDIRECT_UNATTRIBUTABLE),
+            "lockfile discovery could not attribute its pin to one package version, so \
+             nothing was written for it (reconcile the project's lockfiles; --json has the \
+             detail)"
         );
         assert_eq!(describe_skip_reason("mystery"), "server status `mystery`");
         for code in [

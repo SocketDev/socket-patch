@@ -330,6 +330,7 @@ pub(crate) async fn rewrite(
             npm_allow_remote_config: options.npm_allow_remote_config,
             npm_outer: &npm_outer,
             blocking: false,
+            takeover_uuids: Default::default(),
         },
     )
     .await;

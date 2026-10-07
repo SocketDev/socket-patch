@@ -906,6 +906,13 @@ pub struct RewriteOptions<'a> {
     /// Run the rewriters on the blocking pool (the disk flow: pure CPU over
     /// every lock text).
     pub blocking: bool,
+    /// Uuids of the wet run's vendored→hosted takeovers: the caller already
+    /// reverted their vendored wiring (and saved the ledger) before the
+    /// rewrite, so the attribution gate never drops them — that would leave
+    /// the package on the unpatched registry release — and their pin keeps
+    /// the rewriters' verdict, as a dry run's withheld takeover preview
+    /// does. Empty for the in-memory engine, which takes nothing over.
+    pub takeover_uuids: BTreeSet<String>,
 }
 
 /// One project's rewrite, ready for the guard, the record fetch and the
@@ -1070,7 +1077,13 @@ pub async fn rewrite(
     // package version (another lock resolving the same version elsewhere, a
     // pin Maven never consumes) would be refused by every later command, so
     // it is dropped and the rest rewritten without it. Each pass drops at
-    // least one candidate, so this ends.
+    // least one candidate, so this ends. A wet takeover is never dropped
+    // (see [`RewriteOptions::takeover_uuids`]): its vendored wiring is
+    // already gone, and its pin keeps the rewriters' verdict.
+    let exempt: BTreeSet<String> = withheld_from_vlt
+        .union(&options.takeover_uuids)
+        .cloned()
+        .collect();
     let mut kept: Vec<Candidate> = candidates.to_vec();
     let mut unattributed: Vec<SkippedPatch> = Vec::new();
     loop {
@@ -1084,7 +1097,7 @@ pub async fn rewrite(
             options.clone(),
         )
         .await;
-        let (vetoed, lockless) = unattributed_pins(view, &done, &kept, withheld_from_vlt).await;
+        let (vetoed, lockless) = unattributed_pins(view, &done, &kept, &exempt).await;
         if vetoed.is_empty() {
             done.unattributed = unattributed;
             done.rewrite.warnings.extend(lockless);
@@ -1107,8 +1120,10 @@ pub async fn rewrite(
 /// bundled or user-patched copy the rewriters knowingly left on the
 /// registry (`bundled_skipped_uuids`, or a bundled copy in vlt's store;
 /// both are warned and kept out of the in-run VEX), or one withheld from
-/// the vlt rewrite while a sibling lock takes it (`withheld_from_vlt`). Which unreachable copies should block a
-/// redirect is the copy-source policy (audit B16), not decided here.
+/// the vlt rewrite while a sibling lock takes it, and a wet vendored→hosted
+/// takeover whose vendored wiring the caller already reverted (both in
+/// `exempt`). Which unreachable copies should block a redirect is the
+/// copy-source policy (audit B16), not decided here.
 ///
 /// [`HostedInventory`]: crate::patch::redirect::upstream::HostedInventory
 /// [`UnlockedPin`]: crate::vex::discover::UnlockedPin
@@ -1116,7 +1131,7 @@ async fn unattributed_pins(
     view: &ProjectView<'_>,
     done: &Rewritten,
     candidates: &[Candidate],
-    withheld_from_vlt: &BTreeSet<String>,
+    exempt: &BTreeSet<String>,
 ) -> (Vec<SkippedPatch>, Vec<RewriteWarning>) {
     if done.confirmed.is_empty() {
         return (Vec::new(), Vec::new());
@@ -1217,7 +1232,7 @@ async fn unattributed_pins(
             !attributed.contains(uuid.as_str())
                 && contested.contains(uuid.as_str())
                 && !done.rewrite.bundled_skipped_uuids.contains(uuid)
-                && !withheld_from_vlt.contains(uuid)
+                && !exempt.contains(uuid)
                 && !vlt_bundled.contains(&crate::vex::discover::canonical_base_purl(purl))
         })
         .map(|(purl, uuid)| {
@@ -2260,6 +2275,7 @@ mod tests {
             npm_allow_remote_config: true,
             npm_outer: &outer,
             blocking: false,
+            takeover_uuids: Default::default(),
         };
         let mut skipped = Vec::new();
         let candidates = build_candidates(&selected, &refs, &mut skipped);
@@ -2491,6 +2507,7 @@ mod tests {
             npm_allow_remote_config: true,
             npm_outer: &outer,
             blocking: false,
+            takeover_uuids: Default::default(),
         };
         let candidates = vec![left_pad_candidate()];
         let read = read_candidate_files(view, unreadable, &candidates).await;
@@ -2612,6 +2629,7 @@ mod tests {
                 npm_allow_remote_config: true,
                 npm_outer: &outer,
                 blocking: false,
+                takeover_uuids: Default::default(),
             };
             let read = read_candidate_files(&view, &BTreeSet::new(), &candidates).await;
             assert!(read.files.contains_key("package.json"));
@@ -2788,6 +2806,7 @@ mod tests {
             npm_allow_remote_config: true,
             npm_outer: &outer,
             blocking: false,
+            takeover_uuids: Default::default(),
         };
         let candidates = vec![gradle_candidate()];
         let read = read_candidate_files(view, &BTreeSet::new(), &candidates).await;
@@ -2999,6 +3018,92 @@ mod tests {
         assert!(done.confirmed.is_empty(), "{:?}", done.confirmed);
     }
 
+    /// A lockless NuGet pin (a Socket source mapping, no
+    /// `packages.lock.json`) is still written, but the run says no later
+    /// command can manage it and names the lockfile that fixes that.
+    #[tokio::test]
+    async fn a_lockless_nuget_pin_is_written_with_the_lockless_warning() {
+        use crate::patch::redirect::{Integrity, RegistryOverride, RegistryOverrideIdentifiers};
+        let base =
+            format!("https://patch.test/patch-registry/nuget/{FIXTURE_TOKEN}/{FIXTURE_UUID}");
+        let candidate = Candidate {
+            purl: "pkg:nuget/Newtonsoft.Json@13.0.3".into(),
+            dep: DepOverride {
+                ecosystem: "nuget".into(),
+                name: "Newtonsoft.Json".into(),
+                namespace: None,
+                version: "13.0.3".into(),
+                token: FIXTURE_TOKEN.into(),
+                patch_uuid: FIXTURE_UUID.into(),
+                artifact_url: format!(
+                    "{base}/flat/newtonsoft.json/13.0.3/newtonsoft.json.13.0.3.nupkg"
+                ),
+                registry_override: Some(RegistryOverride {
+                    kind: "nuget-v3".into(),
+                    index_url: format!("{base}/index.json"),
+                    identifiers: RegistryOverrideIdentifiers {
+                        name: "Newtonsoft.Json".into(),
+                        version: "13.0.3".into(),
+                        nuget_id_lower: Some("newtonsoft.json".into()),
+                        nuget_version_norm: Some("13.0.3".into()),
+                        ..Default::default()
+                    },
+                }),
+                integrity: Integrity {
+                    sha512: Some("sha512-NUGETPATCHED==".into()),
+                    ..Default::default()
+                },
+            },
+        };
+        let mut p = MemoryProject::new();
+        p.insert_text(
+            "nuget.config",
+            "<?xml version=\"1.0\" encoding=\"utf-8\"?>\n<configuration>\n  <packageSources>\n    \
+             <add key=\"nuget.org\" value=\"https://api.nuget.org/v3/index.json\" />\n  \
+             </packageSources>\n</configuration>\n",
+        );
+        let outer = OuterAllowRemote::default;
+        let options = RewriteOptions {
+            dry_run: false,
+            targets_pipenv_lock: false,
+            pipenv_major: None,
+            pipenv_unknown_detail: String::new(),
+            trust_lockfile_config: true,
+            npm_allow_remote_config: true,
+            npm_outer: &outer,
+            blocking: false,
+            takeover_uuids: Default::default(),
+        };
+        let candidates = vec![candidate];
+        let view = ProjectView::Memory(&p);
+        let read = read_candidate_files(&view, &BTreeSet::new(), &candidates).await;
+        let done = rewrite(
+            &view,
+            read,
+            &candidates,
+            BTreeMap::new(),
+            &BTreeSet::new(),
+            &[],
+            options,
+        )
+        .await;
+        assert_eq!(done.confirmed.len(), 1, "{:?}", done.rewrite.warnings);
+        assert!(done.unattributed.is_empty(), "{:?}", done.unattributed);
+        let lockless: Vec<&RewriteWarning> = done
+            .rewrite
+            .warnings
+            .iter()
+            .filter(|w| w.code == REDIRECT_PIN_LOCKLESS)
+            .collect();
+        assert_eq!(lockless.len(), 1, "{:?}", done.rewrite.warnings);
+        let detail = &lockless[0].detail;
+        assert!(detail.contains("Newtonsoft.Json"), "{detail}");
+        assert!(
+            detail.contains("dotnet restore --use-lock-file"),
+            "{detail}"
+        );
+    }
+
     const GEMFILE: &str = "source \"https://rubygems.org\"\n\ngem \"rails\", \"7.0.0\"\n";
     const GEM_LOCK: &str = "GEM\n  remote: https://rubygems.org/\n  specs:\n    rails (7.0.0)\n\n\
         PLATFORMS\n  ruby\n\nDEPENDENCIES\n  rails (= 7.0.0)\n\nBUNDLED WITH\n   2.5.22\n";
@@ -3014,6 +3119,7 @@ mod tests {
             npm_allow_remote_config: true,
             npm_outer: &outer,
             blocking: false,
+            takeover_uuids: Default::default(),
         };
         let candidates = vec![gem_candidate()];
         let view = ProjectView::Memory(p);

@@ -425,7 +425,8 @@ async fn an_unreached_requirements_include_vetoes_the_pipfile_lock_redirect() {
     std::fs::create_dir_all(tmp.path().join("req")).unwrap();
     std::fs::write(tmp.path().join("req/base.txt"), "urllib3==1.26.18\n").unwrap();
 
-    run(hosted_args(tmp.path(), server.uri(), None)).await;
+    let code = run(hosted_args(tmp.path(), server.uri(), None)).await;
+    assert_eq!(code, 0, "an unattributable pin is a skip, not a failure");
     assert_eq!(
         read(&tmp.path().join("Pipfile.lock")),
         LOCK,
