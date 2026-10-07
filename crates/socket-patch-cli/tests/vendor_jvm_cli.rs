@@ -688,13 +688,20 @@ fn check_reports_jvm_trees_without_a_jvm_entry_beside_other_entries() {
     let (code, env) = socket(root, &["vendor", "--check"]);
     assert_eq!(code, Some(1), "{env}");
     let events = env["events"].as_array().expect("events");
+    let orphan = events
+        .iter()
+        .find(|e| {
+            e.to_string().contains("vendor_ledger_missing") && e["details"]["ecosystem"] == "maven"
+        })
+        .unwrap_or_else(|| panic!("no JVM orphan event: {env}"));
+    // The event names the orphaned JVM layout itself, not the npm entry
+    // (which fails `--check` on its own for its missing artifact).
+    let path = orphan["details"]["path"].as_str().expect("orphan path");
     assert!(
-        events
-            .iter()
-            .any(|e| e.to_string().contains("vendor_ledger_missing")
-                && e["details"]["ecosystem"] == "maven"),
-        "{env}"
+        socket_patch_core::vendor::jvm::apply::LEDGER_OWNED_PATHS.contains(&path),
+        "{path}: {env}"
     );
+    assert!(root.join("proj").join(path).exists(), "{path}");
     assert_eq!(snapshot(root), before);
 }
 
