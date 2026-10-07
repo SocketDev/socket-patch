@@ -1008,7 +1008,7 @@ State lives at `$XDG_CACHE_HOME`|`~/.cache` (Unix/macOS) or `%LOCALAPPDATA%` (Wi
 
 ## Environment variables
 
-Public configuration uses the `SOCKET_*` names below. The three deprecated v3/v4 environment aliases were removed in v5; see [Removed env vars](#removed-env-vars).
+Public configuration uses the `SOCKET_*` names below. The three deprecated v3/v4 environment aliases and `SOCKET_FORCE` were removed in v5; see [Removed env vars](#removed-env-vars).
 
 Four `SOCKET_CLI_*` names from the sibling JS Socket CLI are additionally accepted as **peer aliases** (supported, not deprecated — no warning): `SOCKET_CLI_API_TOKEN` → `SOCKET_API_TOKEN`, `SOCKET_CLI_ORG_SLUG` → `SOCKET_ORG_SLUG`, `SOCKET_CLI_API_BASE_URL` → `SOCKET_API_URL`, `SOCKET_CLI_NO_API_TOKEN` → `SOCKET_NO_API_TOKEN`. The canonical `SOCKET_*` name always wins when both are set; promotion is silent and happens in-process before clap parses. Other socket-cli names (`SOCKET_CLI_CONFIG`, `SOCKET_CLI_API_PROXY`, `SOCKET_CLI_DEBUG`) are deliberately **not** honored.
 
