@@ -889,7 +889,8 @@ struct LockMatch {
 /// What the `packages` scan found.
 enum LockScan {
     Matches(Vec<LockMatch>),
-    /// A matching key outside `node_modules/` — the caller refuses.
+    /// A matching key outside `node_modules/` and no rewritable instance
+    /// besides it — the caller refuses.
     WorkspaceMember {
         key: String,
     },
@@ -946,7 +947,8 @@ pub(super) async fn check_wiring(entry: &VendorEntry, project_root: &Path) -> Re
 }
 
 /// Scan `packages` for instances of `name@version`, pushing skip warnings
-/// for the link / inBundle instances that cannot be rewritten.
+/// for the workspace-member / link / inBundle / non-registry instances that
+/// cannot be rewritten.
 fn scan_lock_matches(
     lock: &Value,
     overrides: &NpmOverrides,
@@ -959,6 +961,7 @@ fn scan_lock_matches(
         return LockScan::Matches(matches); // validated earlier; defensive
     };
     let non_registry = npm_non_registry_entries(lock, overrides);
+    let mut member: Option<String> = None;
     for (key, entry) in packages {
         // The root "" entry is the project itself, never a dependency.
         if key.is_empty() {
@@ -974,7 +977,21 @@ fn scan_lock_matches(
             continue;
         }
         if !key.contains(NODE_MODULES_SEG) {
-            return LockScan::WorkspaceMember { key: key.clone() };
+            // The project's own source (a workspace member or `file:`
+            // directory) that happens to carry this name@version. Vendoring
+            // it would shadow first-party code, but it does not make the
+            // registry copies elsewhere in the lock unrewritable (#688):
+            // skip it, and refuse only when nothing rewritable remains.
+            warnings.push(VendorWarning::new(
+                "vendor_workspace_member_skipped",
+                format!(
+                    "lock entry `{key}` is the project's own source (a workspace member or \
+                     `file:` directory) with the same name@version; it is not vendored — \
+                     patch that source directly if it needs the fix"
+                ),
+            ));
+            member.get_or_insert_with(|| key.clone());
+            continue;
         }
         if obj.get("link").and_then(Value::as_bool) == Some(true) {
             warnings.push(VendorWarning::new(
@@ -1016,7 +1033,10 @@ fn scan_lock_matches(
             original: entry.clone(),
         });
     }
-    LockScan::Matches(matches)
+    match member {
+        Some(key) if matches.is_empty() => LockScan::WorkspaceMember { key },
+        _ => LockScan::Matches(matches),
+    }
 }
 
 /// The package name a lock entry stands for: the explicit `name` field when
@@ -2385,6 +2405,66 @@ mod tests {
             !fx.root().join(".socket/vendor").exists(),
             "refusal writes nothing"
         );
+    }
+
+    /// #688: a local directory (`file:` dependency or workspace member) whose
+    /// package.json carries the patched name@version must not refuse the
+    /// REGISTRY copies elsewhere in the lock — those are rewired, the local
+    /// source is skipped with a warning and left untouched.
+    #[tokio::test]
+    async fn namesake_local_directory_does_not_block_registry_copies() {
+        let mut lock = default_lock();
+        lock["packages"][""]["dependencies"]["lp-local"] = json!("file:./third_party/left-pad");
+        lock["packages"]["node_modules/lp-local"] = json!({
+            "resolved": "third_party/left-pad",
+            "link": true
+        });
+        lock["packages"]["third_party/left-pad"] = json!({
+            "name": "left-pad",
+            "version": "1.3.0"
+        });
+        let fx = fixture_with("left-pad", "1.3.0", lock).await;
+        let (result, entry, warnings) = expect_done(fx.vendor(false).await);
+        assert!(result.success, "{:?}", result.error);
+        let entry = entry.expect("vendored entry");
+        assert_eq!(entry.wiring.len(), 2, "both registry instances rewired");
+
+        let member = warnings
+            .iter()
+            .find(|w| w.code == "vendor_workspace_member_skipped")
+            .expect("the skipped local source is named");
+        assert!(
+            member.detail.contains("third_party/left-pad"),
+            "{}",
+            member.detail
+        );
+
+        let wired = fx.read_lock().await;
+        let tgz = json!(format!("file:{}", fx.expected_rel_tgz()));
+        assert_eq!(wired["packages"]["node_modules/left-pad"]["resolved"], tgz);
+        assert_eq!(
+            wired["packages"]["node_modules/foo/node_modules/left-pad"]["resolved"],
+            tgz
+        );
+        assert_eq!(
+            wired["packages"]["third_party/left-pad"],
+            json!({ "name": "left-pad", "version": "1.3.0" }),
+            "the first-party source entry is left untouched"
+        );
+        assert_eq!(
+            wired["packages"]["node_modules/lp-local"],
+            json!({ "resolved": "third_party/left-pad", "link": true })
+        );
+
+        // The wiring audit covers the same registry copies: restoring the
+        // pre-vendor lock is drift, not silently skipped because of the
+        // namesake member.
+        assert_eq!(check_wiring(&entry, fx.root()).await, Ok(()));
+        tokio::fs::write(fx.lock_path(), &fx.lock_bytes)
+            .await
+            .unwrap();
+        let drift = check_wiring(&entry, fx.root()).await.unwrap_err();
+        assert!(drift.contains("`node_modules/left-pad`"), "{drift}");
     }
 
     #[tokio::test]

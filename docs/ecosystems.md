@@ -225,8 +225,10 @@ to first-party source: an npm, Yarn, pnpm or Bun workspace member, a
 `file:` or `link:` directory dependency, or an `npm link` target. That
 source is not an installed copy of the registry package, and no reinstall
 restores it, so it is never overwritten. Patch it directly instead (vendored
-mode refuses it the same way, with `vendor_workspace_member`). Links into a
-store inside a `node_modules` tree, including a workspace member's link
+mode refuses it the same way, with `vendor_workspace_member`; when an npm lock
+also holds a registry copy of the same `name@version`, that copy is still
+vendored and the local source is skipped with `vendor_workspace_member_skipped`).
+Links into a store inside a `node_modules` tree, including a workspace member's link
 into the root `node_modules/.pnpm`, are patched as usual. So are links into
 Yarn's pnpm-linker store relocated outside `node_modules`, but only for an
 active Yarn pnpm install (a `yarn.lock`, and `nodeLinker: pnpm` with
