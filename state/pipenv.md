@@ -2,7 +2,7 @@
 
 The routine runs every 6 hours. Each run adds one comment here with the socket-patch commit it tested, the OS × Pipenv-version × mode cells it covered, the issues it filed, updated or closed, and what it plans to probe next. The routine treats this thread as its only memory.
 
-Last run: 2026-10-07 ~03:34Z, main `9c43dfc` (CLI 4.0.0, unchanged). Filed #981: on Pipenv 2023+, a vendored lock breaks `pipenv requirements --hash` → `pip install -r` (the vendored wheel is exported with no hash). The 2020 / 2021 takeovers, subdirectory and `PIPENV_PIPFILE` installs, and `--system --deploy` all pass. Previous run: 2026-10-06 ~21:46Z (#947 comment).
+Last run: 2026-10-07 ~09:46Z, main `9c43dfc` (CLI 4.0.0, unchanged). Bisected #981 (first bad Pipenv 2023.7.9) and added Pipenv evidence to #477 (rollback / remove / `vendor --revert` leave the patched wheel installed, because Pipenv never reinstalls it). Symlinked project dirs, the `.env` hosted stale warning, `vendor` from a manifest, `get` CVE / uuid / purl, and the agent ↔ hosted / vendored takeovers all pass. Previous run: 2026-10-07 ~03:34Z (filed #981).
 
 ## Coverage matrix
 
@@ -78,20 +78,22 @@ Stale-install remedy followed verbatim, `15:30Z` run, `045d7ec`: `default` patch
 
 `03:34Z` run (2026-10-07), `9c43dfc`: vendored + `pipenv requirements --hash` → `pip install -r`: fail #981 on 2023.12.1 / 2024.4.1 / 2026.8.0 (vendored wheel exported without a hash, so pip's require-hashes mode refuses everything); pass on 2022.12.19 (absolute `file:///` + hash) and hosted 2026. Without `--hash`: pass on 2022 / 2023 / 2026. Vendored `pipenv sync` from a subdirectory and via `PIPENV_PIPFILE` from elsewhere (2020 / 2022 / 2023 / 2026), `pipenv verify`, and `install --system --deploy` (2022 / 2026): pass.
 
+`09:46Z` run (2026-10-07), `9c43dfc`: #981 bisect: `pipenv requirements --hash` keeps the vendored hash through 2023.6.26, 2023.7.1–2023.7.4 export `six==` (Pipenv's bug, loud), and the hash is gone from **2023.7.9** on (`--dev` / `--categories` too). Vendored sync and hosted sync + tamper rejection on 2023.6.26 / 2023.7.1 / 2023.7.4 / 2023.7.9: pass. Symlinked project dir (agent `--cwd <link>`, `PIPENV_PIPFILE=<link>/Pipfile`) on 2022 / 2026: pass. Hosted stale warning + remedy + vex with `.env` custom-name / IN_PROJECT venvs (2023 / 2026): pass. `vendor` from an agent manifest (2022 / 2026), `get` uuid / purl / CVE in both modes (2026): pass. Agent → hosted / vendored and hosted → agent takeovers (2022 / 2026): pass. Rollback / remove / `vendor --revert` leave the patched wheel installed through `sync` / `--deploy` on 2022 / 2023 / 2026: fail, #477 (commented).
+
 macOS/Windows rows are from the 2026-09-30 probes on `f6b7fb9`. No probe ran on v5 because branch deletion through the git proxy still fails (re-checked 2026-10-03 03:30Z); `bughunt/pipenv/20260930-venv-discovery` and `bughunt/pipenv/20260930-virtualenv` still need a maintainer to delete them.
 
 ## Backlog
 
-0000000. #981: bisect the 2023.x release that dropped `--hash` for `file` entries; `--dev` / `--categories` exports; re-verify once fixed.
-000000. Re-verify #947 (+ the budget variant, commented 2026-10-06 21:46Z) and #504 once PR #950 merges; `get --mode vendored` / `vendor` from a manifest variants still untested. (The 2020 / 2021 hosted ↔ vendored takeovers: done 2026-10-07, pass.)
-00000. #932 variants: `develop` / named categories, Pipenv 11 `path` form, hosted rollback of the narrowed entry (refused by the session policy on 2026-10-06); re-verify once fixed.
+0000000. #981: re-verify once fixed. (Bisect: first bad 2023.7.9; `--dev` / `--categories` exports also have no hash. Done 2026-10-07 09:46Z.) Re-verify #477 for Pipenv once fixed (the rollback / remove / `vendor --revert` remedy should name `pipenv run pip uninstall -y <pkg> && pipenv sync` with the lock's category args).
+000000. Re-verify #947 (+ the budget variant, commented 2026-10-06 21:46Z) and #504 once PR #950 merges; (`get --mode vendored` / `vendor` from a manifest: done 2026-10-07 09:46Z, pass.) (The 2020 / 2021 hosted ↔ vendored takeovers: done 2026-10-07, pass.)
+00000. #932: draft fix PR #984 (with #701); re-verify on it or main. Variants: `develop` / named categories, Pipenv 11 `path` form, hosted rollback of the narrowed entry (refused by the session policy on 2026-10-06); re-verify once fixed.
 0000. #912 variants: `pylock.<name>.toml` (`pylock_name`), dev packages in pylock, rollback / remove / repair on a pylock-only Pipenv project; re-verify once fixed.
 
 000. (#790 re-verified fixed on main `0d302dc`, 2026-10-05 19:15Z.) Still untested: Windows cmd / PowerShell quoting of `--categories "…"`.
 00. Re-verify #769 once fixed (vendored re-vendor A → B: rewire in place, old uuid dir removed, revert byte-exact, no false `package_not_installed` with a venv). (Hosted supersede on 2018 / 2022 / 2023, develop / named categories and with a sibling requirements.txt: done 2026-10-04 15:30Z, pass.)
 0. (#645 re-verified fixed for agent mode and agent vex on 2026-10-05 21:44Z, and for the hosted stale warning and hosted vex on 2026-10-06 15:37Z.)
 1. #612 variants still open: `-r` includes in vendored mode. Re-verify once fixed. (Revert / rollback on the half-wired project pass.)
-2. #546 re-verified fixed for agent mode (2026-10-05 21:44Z, 12 `.env` shapes); `VIRTUAL_ENV` / `PIPENV_ACTIVE` / IGNORE inside `.env` done 2026-10-06, pass. Still to do: the hosted stale warning with `.env` custom-name / IN_PROJECT venvs.
+2. #546 re-verified fixed for agent mode (2026-10-05 21:44Z, 12 `.env` shapes); `VIRTUAL_ENV` / `PIPENV_ACTIVE` / IGNORE inside `.env` done 2026-10-06, pass. (The hosted stale warning with `.env` custom-name / IN_PROJECT venvs: done 2026-10-07 09:46Z, pass.)
 3. Re-verify #504 and the #454 human-mode gap once they're fixed.
 4. #567 variants: vendored mode with an `-r` include, `remove`, `-c` constraints; re-verify once fixed.
 5. **Maintainer request (global `-g` mode):** still to do: macOS / Windows, `-g` on 2018 / 11, and `--global-prefix` as a venv root (scans 0; undocumented). Checklist in the 20261001T040000Z entry.
@@ -165,3 +167,6 @@ macOS/Windows rows are from the 2026-09-30 probes on `f6b7fb9`. No probe ran on 
 - Agent mode with `PIPENV_IGNORE_VIRTUALENVS=1` or `PIPENV_ACTIVE=1` in `.env` and `VIRTUAL_ENV` exported: socket-patch patches the activated venv as well as the project's venv, though current Pipenv ignores the activated one. That's the documented union of settings-timing profiles (the 2020 shell caches IGNORE before dotenv). The venv Pipenv uses is always patched, so it's over-coverage, not a miss.
 - A UTF-8 BOM on Pipfile.lock: Pipenv 2026.8.0 can't parse it (it renames the lock to `.bak` and the install fails), and Pipenv 2022.12.19 rewrites it with an empty `default`. Pipenv itself breaks on a BOM lock, so there is no real-world socket-patch shape here (socket-patch keeps the BOM and rewrites correctly).
 - `repair` heals only the vendored artifact; a venv that already installed the tampered bytes needs the stale-install remedy that the next `scan` prints. Documented as artifact-only.
+- Pipenv 2023.7.1–2023.7.4 `pipenv requirements` export any `file` lock entry (hosted URL or vendored path) as `<name>==`, so `pip install -r` fails loudly (`No matching distribution found`). That's Pipenv's exporter bug; `pipenv sync` on those releases installs the patched wheel.
+- Vendored → agent: agent mode skips the vendor-owned package, so a warm upstream venv stays, and vex attests with `vendored_tree_out_of_sync` (documented vendored evidence row).
+- Mock harness: restarting `tools/mock.py` rebuilds the patched wheel with new zip timestamps (a different sha256). Don't kill it with `pkill -f` from a shell whose command line names it.
