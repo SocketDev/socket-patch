@@ -8,6 +8,7 @@ use std::collections::HashMap;
 use socket_patch_core::api::types::{PatchSearchResult, VulnerabilityResponse};
 
 use super::discovery::severity_order;
+use crate::args::GlobalArgs;
 use crate::ui::{self, plural, Align};
 
 /// Visible widths of the table's PATCHES and SEVERITY columns.
@@ -269,13 +270,56 @@ pub(super) fn dry_run_line(plan: Plan, refused: usize) -> String {
 }
 
 /// Lines printed after a report-only scan (`--prune` or global with no
-/// mode, so no lockfile to rewire): how to apply what it found.
-pub(super) fn report_only_hint() -> [String; 3] {
+/// mode, so no lockfile to rewire): how to apply what it found. A global
+/// run's commands repeat its scope (`-g` or `--global-prefix <dir>`):
+/// without it, running the hint verbatim patches the cwd project and
+/// leaves the global copy unpatched (#464).
+pub(super) fn report_only_hint(common: &GlobalArgs) -> [String; 3] {
+    let scope = match &common.global_prefix {
+        Some(prefix) => Some(format!(
+            "--global-prefix {}",
+            shell_word(&prefix.to_string_lossy())
+        )),
+        None if common.global => Some("-g".to_string()),
+        None => None,
+    };
+    let (scan, get) = match &scope {
+        Some(scope) => (
+            format!("  socket-patch scan --mode agent {scope}"),
+            format!("  socket-patch get {scope} <package-name-or-purl-or-CVE-ID>"),
+        ),
+        None => (
+            "  socket-patch scan --mode agent [PATHS]".to_string(),
+            "  socket-patch get <package-name-or-purl-or-CVE-ID>".to_string(),
+        ),
+    };
     [
         "To apply these patches in place, run:".to_string(),
-        "  socket-patch scan --mode agent [PATHS]".to_string(),
-        "  socket-patch get <package-name-or-purl-or-CVE-ID>".to_string(),
+        scan,
+        get,
     ]
+}
+
+/// `word` as one argument a user can paste into their shell: bare when it
+/// holds only characters no shell treats specially, otherwise quoted (POSIX
+/// single quotes; double quotes on Windows, which cmd and PowerShell both
+/// read as one argument). A trailing run of backslashes is doubled inside
+/// the Windows quotes: the argv parser would otherwise read the last one as
+/// escaping the closing quote.
+fn shell_word(word: &str) -> String {
+    let plain = |c: char| {
+        c.is_ascii_alphanumeric()
+            || matches!(c, '/' | '.' | '_' | '-' | ':' | '+' | '=' | ',' | '@')
+            || (cfg!(windows) && c == '\\')
+    };
+    if !word.is_empty() && word.chars().all(plain) {
+        word.to_string()
+    } else if cfg!(windows) {
+        let trailing = word.len() - word.trim_end_matches('\\').len();
+        format!("\"{word}{}\"", "\\".repeat(trailing))
+    } else {
+        format!("'{}'", word.replace('\'', r"'\''"))
+    }
 }
 
 /// Printed (vendored mode, before vendoring) for a selected package whose
@@ -755,11 +799,80 @@ mod tests {
 
     #[test]
     fn report_only_hint_names_agent_mode() {
+        let project = report_only_hint(&GlobalArgs::default());
         assert_eq!(
-            report_only_hint()[0],
-            "To apply these patches in place, run:"
+            project,
+            [
+                "To apply these patches in place, run:",
+                "  socket-patch scan --mode agent [PATHS]",
+                "  socket-patch get <package-name-or-purl-or-CVE-ID>",
+            ]
         );
-        assert!(report_only_hint()[1].contains("--mode agent"));
+    }
+
+    /// #464: the hint after a report-only global scan keeps the run's
+    /// global scope, or running it verbatim patches the cwd project.
+    #[test]
+    fn report_only_hint_keeps_global_scope() {
+        let global = GlobalArgs {
+            global: true,
+            ..GlobalArgs::default()
+        };
+        assert_eq!(
+            report_only_hint(&global)[1..],
+            [
+                "  socket-patch scan --mode agent -g",
+                "  socket-patch get -g <package-name-or-purl-or-CVE-ID>",
+            ]
+        );
+        let mut rows = vec![
+            (
+                false,
+                "/opt/node/lib/node_modules",
+                "/opt/node/lib/node_modules",
+            ),
+            // `--global-prefix` alone selects the global tree; `-g` is not
+            // repeated next to it.
+            (
+                true,
+                "/opt/node/lib/node_modules",
+                "/opt/node/lib/node_modules",
+            ),
+        ];
+        if cfg!(windows) {
+            rows.push((
+                false,
+                r"C:\Program Files\nodejs",
+                r#""C:\Program Files\nodejs""#,
+            ));
+            rows.push((false, r"C:\nodejs\node_modules", r"C:\nodejs\node_modules"));
+            rows.push((
+                false,
+                r"C:\Program Files\nodejs\",
+                r#""C:\Program Files\nodejs\\""#,
+            ));
+        } else {
+            rows.push((false, "/tmp/global lib", "'/tmp/global lib'"));
+            rows.push((false, "/tmp/it's", r"'/tmp/it'\''s'"));
+            rows.push((false, "/tmp/$HOME", "'/tmp/$HOME'"));
+        }
+        for (global, prefix, shown) in rows {
+            let args = GlobalArgs {
+                global,
+                global_prefix: Some(prefix.into()),
+                ..GlobalArgs::default()
+            };
+            assert_eq!(
+                report_only_hint(&args)[1..],
+                [
+                    format!("  socket-patch scan --mode agent --global-prefix {shown}"),
+                    format!(
+                        "  socket-patch get --global-prefix {shown} <package-name-or-purl-or-CVE-ID>"
+                    ),
+                ],
+                "prefix {prefix:?}"
+            );
+        }
     }
 
     #[test]
