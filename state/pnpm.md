@@ -1,6 +1,6 @@
 [agent] Progress ledger for the scheduled pnpm bug-hunt routine (label pm:pnpm).
 
-Last updated: 2026-10-07 (run 27), main `9c43dfc`, latest release 4.0.0.
+Last updated: 2026-10-07 (run 28), main `9c43dfc`, latest release 4.0.0.
 
 Method: real pnpm installs. Hosted, vendored and global agent mode run against a local Python mock of the patch API (batch, by-package, view with inline blobs, `patches/blob/<hash>`, package grant, hosted tarball, `/registry/<name>/<ver>` mirror; `ajv-keywords@3.5.2` serves as the peer-dependency package). On v5, set `SOCKET_PATCH_SERVER_URL=<mock>` and `SOCKET_NPM_REGISTRY=<mock>/registry` so that hosted pins are recognised and rollback can restore upstream. The oracle is a marker prepended to `index.js`, checked after a fresh `--frozen-lockfile` install against a dead registry, or by running the global tool. The repo's pinned matrix (`.github/workflows/pnpm-compatibility.yml`) already covers plain hosted and vendored installs on pnpm 1–12. This ledger tracks what it doesn't.
 
@@ -270,6 +270,15 @@ Run 27 additions (main `9c43dfc`, Linux; aliases and scoped packages in transiti
 
 The #957 snapshot-path variant isn't a regression: release 4.0.0 behaves the same.
 
+Run 28 additions (main `9c43dfc`, Linux; newest pnpm releases 10.34.6 / 11.28.5 / 12.10.1):
+
+| pnpm | Hosted: 3 pkgs (scoped + unscoped) pin → fresh frozen (dead registry) → rollback byte-exact | Hosted + `trustPolicy: no-downgrade` + `minimumReleaseAge: 1440` (fresh frozen / fresh plain install) | Hosted: scoped + unscoped `npm:` alias in a transitive snapshot (fresh frozen, `vex`) | Agent `scan --mode agent` beside a `pnpm patch` edit dir (`node_modules/.pnpm_patches`) | Hosted + socket.yml `ignorePackages` over an existing pin | Hosted `--max-new-patches 1` convergence | #935 `link:` copy beside a registry copy |
+| --- | --- | --- | --- | --- | --- | --- | --- |
+| 9.15.9 | (run 7) | n/a | pass / pass | pass (edit dir left upstream, store copy patched) | untested | blocked (permission classifier) | blocked (permission classifier) |
+| 10.34.6 | pass | pass / pass | untested | untested | untested | untested | untested |
+| 11.28.5 | pass | pass / pass | untested | untested | untested | untested | untested |
+| 12.10.1 | pass | pass / pass | pass / pass | pass | pass (`retained`, lock byte-identical) | blocked (permission classifier) | blocked (permission classifier) |
+
 Run 20 additions (main `045d7ec`, Linux):
 
 | pnpm (lock) | Vendored parent + vendored dep (`debug`→`ms`): `remove <parent>` / takeover → hosted / `rollback` | `remove <child>` (control) | Hosted parent + dep: remove parent / rollback | Mixed-case names (`Base64`, `JSONStream`): hosted / agent / vendored | User parent-selector / range-selector override (vendored) | Agent `symlink=false` / `hoist=false` | `list -g` |
@@ -307,7 +316,7 @@ Global mode (`-g`, v5 main `2463257`):
 ## Backlog
 
 0. **Maintainer request (global `-g` mode):** the Linux cells are done. Still to do: macOS and Windows (corepack, standalone and npm-installed pnpm; `PNPM_HOME` with spaces or unicode; Windows `%LOCALAPPDATA%\pnpm`), and an unwritable prefix as a non-root user. Full checklist in the 20261001T040000Z entry. Needs a probe branch.
-1. Delete the stale probe branch `bughunt/pnpm/20260930-virtual-store`. `git push --delete` failed through the git proxy in runs 1, 3, 10 and 16, and was denied by the permission policy in runs 2, 5–9, 11–14, 16, 17 and 19, so a maintainer needs to do it. macOS and Windows probes stay on hold until branch cleanup works.
+1. Delete the stale probe branch `bughunt/pnpm/20260930-virtual-store`. `git push --delete` failed through the git proxy in runs 1, 3, 10 and 16, and was denied by the permission policy in runs 2, 5–9, 11–14, 16, 17, 19 and 28, so a maintainer needs to do it. macOS and Windows probes stay on hold until branch cleanup works.
 2. #754 follow-ups: a Windows `C:/…/My Project #2` checkout, and the moved-checkout heal path now that the specifier is quoted. Needs a probe.
 2a. #778 follow-ups: pnpm 7 workspace layout, and `-g` absolute scopes vs `rollback -g` (`--sync`/`--prune` with a scope done in run 18: fails safe).
 3. #696 / #661 follow-ups (both fixed in run 21): `modulesDir` in the global `config.yaml` / `rc`, and that GVS and out-of-project `virtualStoreDir` transitive deps also stop attesting.
@@ -320,6 +329,8 @@ Global mode (`-g`, v5 main `2463257`):
 8a. #830 follow-ups: a three-level vendored chain, a `scan --mode vendored` re-run over the broken `remove` state, and the pnpm 7/8 workspace dialect.
 8c. #880 / #881 follow-ups: a member of a workspace whose root uses `catalogs`, and the pnpm 7/8 dialect.
 8b. #853 follow-ups: the takeover over a peer-suffixed snapshot key and over a pnpm ≤6 legacy lock, and `vendor --dry-run` (manifest-driven) parity.
+8d. v5 rollout and policy over pnpm locks: `--max-new-patches 1` convergence over 3 hosted pins (9.15.9 / 12.10.1, then a two-document lock on 12.x), and socket.yml `includePaths` in a workspace with `sharedWorkspaceLockfile: false`. Blocked by the permission classifier in run 28.
+8e. #935 follow-up: a `link:` copy beside a registry copy (blocked in run 28), then `git+` / `github:` copies.
 9. Re-verify the open set when fixes land: #435, #466, #492, #556, #633, #713, #714, #734, #778, #830, #831 (PR #837, pnpm gitignore matrix), #853, #854, #880, #881, #902, #903, #904 (fix PR #909), #919, #935, #956 and #957.
 9a. BOM follow-ups (#903 / #904): a fresh install of a hosted BOM-`package.json` pin, and Windows checkouts (needs a probe). (Vendored BOM workspace file on 9.15.9 / 10.34.5 done in run 25: #904 reproduces.)
 9b. #902 follow-ups: the setting in the global `rc` / `config.yaml`. (Mirror + tarball URLs became #919 in run 24.)
