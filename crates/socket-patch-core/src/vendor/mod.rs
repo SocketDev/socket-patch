@@ -150,11 +150,18 @@ pub struct VendorWarning {
 }
 
 impl VendorWarning {
+    /// Every URL quoted in `detail` is redacted
+    /// ([`crate::utils::redact::redact_urls_in`]): a vendor warning lands in
+    /// `--json` events and CI logs, and the URLs it quotes (service grant
+    /// URLs, GOPROXY / `.npmrc` / private-index registries) carry
+    /// credentials.
     pub fn new(code: &'static str, detail: impl Into<String>) -> Self {
-        Self {
-            code,
-            detail: detail.into(),
-        }
+        let detail = detail.into();
+        let detail = match crate::utils::redact::redact_urls_in(&detail) {
+            std::borrow::Cow::Borrowed(_) => detail,
+            std::borrow::Cow::Owned(redacted) => redacted,
+        };
+        Self { code, detail }
     }
 }
 

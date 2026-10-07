@@ -368,14 +368,10 @@ fn artifact_tables(package: &toml_edit::Table) -> Vec<&dyn TableLike> {
     tables
 }
 
-/// The lowercased host of `url`.
+/// The lowercased `host[:port]` of `url` (never its userinfo).
 fn url_host(url: &str) -> String {
-    let rest = url.split_once("://").map_or(url, |(_, rest)| rest);
-    let authority = rest.split(['/', '?', '#']).next().unwrap_or("");
-    authority
-        .rsplit('@')
-        .next()
-        .unwrap_or(authority)
+    crate::utils::redact::url_host(url)
+        .unwrap_or("")
         .to_ascii_lowercase()
 }
 

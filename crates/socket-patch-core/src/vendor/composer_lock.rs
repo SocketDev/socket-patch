@@ -748,13 +748,7 @@ pub(super) async fn composer_service_copy(
             format!("cannot move the extracted dist into place: {e}"),
         );
     }
-    warnings.push(VendorWarning::new(
-        "vendor_prebuilt_downloaded",
-        format!(
-            "vendored {pkg} from the patch service ({})",
-            archive.source_url
-        ),
-    ));
+    warnings.push(archive.downloaded_warning(pkg));
     ComposerServiceCopy::Used(())
 }
 

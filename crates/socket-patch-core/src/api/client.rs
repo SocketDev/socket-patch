@@ -23,6 +23,7 @@ use crate::constants::USER_AGENT as USER_AGENT_VALUE;
 use crate::utils::digest::is_hex;
 use crate::utils::env_compat::{is_debug_enabled, is_offline_env, proxy_url_from_env};
 use crate::utils::notice::{notice_once, Notice};
+use crate::utils::redact::{redact_url, redact_urls_in};
 use crate::utils::socket_cli_config;
 
 // Each client advisory prints at most once per process: commands build
@@ -37,10 +38,12 @@ static MULTI_ORG_SHOWN: AtomicBool = AtomicBool::new(false);
 /// act on ("Connection refused", a DNS or TLS failure). Causes already
 /// spelled out by an outer message are skipped.
 fn network_error_detail(e: &reqwest::Error) -> String {
-    let mut msg = e.to_string();
+    // reqwest's text names the request URL: a grant URL, or one with
+    // userinfo from `--api-url` / a proxy, is quoted redacted.
+    let mut msg = redact_urls_in(&e.to_string()).into_owned();
     let mut source = std::error::Error::source(e);
     while let Some(cause) = source {
-        let part = cause.to_string();
+        let part = redact_urls_in(&cause.to_string()).into_owned();
         if !part.is_empty() && !msg.contains(&part) {
             msg.push_str(": ");
             msg.push_str(&part);
@@ -94,9 +97,15 @@ fn status_error(head: &str, status: StatusCode, text: &str) -> String {
     }
 }
 
-/// Log debug messages when debug mode is enabled.
+/// Log debug messages when debug mode is enabled. Every URL in `message`
+/// is redacted first: debug lines quote grant URLs and `--api-url`s, and
+/// debug output is routinely pasted into CI logs and bug reports.
 fn debug_log(message: &str) {
-    if is_debug_enabled() && !defer_debug_line(message) {
+    if !is_debug_enabled() {
+        return;
+    }
+    let message = redact_urls_in(message);
+    if !defer_debug_line(&message) {
         eprintln!("[socket-patch debug] {}", message);
     }
 }
@@ -1686,7 +1695,8 @@ impl ApiClient {
         if !(url.starts_with("https://") || url.starts_with("http://")) {
             return (
                 ServeDownload::Failed(ApiError::Other(format!(
-                    "refusing non-http(s) artifact URL `{url}`"
+                    "refusing non-http(s) artifact URL `{}`",
+                    redact_url(url)
                 ))),
                 None,
             );
@@ -1836,8 +1846,14 @@ pub(crate) struct DeferredAttempt {
 fn artifact_download_result(outcome: ServeDownload, url: &str) -> Result<Vec<u8>, ApiError> {
     match outcome {
         ServeDownload::Ok(bytes) => Ok(bytes),
-        ServeDownload::NotFound => Err(ApiError::Other(format!("artifact not found: {url}"))),
-        ServeDownload::Pending => Err(ApiError::Other(format!("artifact still building: {url}"))),
+        ServeDownload::NotFound => Err(ApiError::Other(format!(
+            "artifact not found: {}",
+            redact_url(url)
+        ))),
+        ServeDownload::Pending => Err(ApiError::Other(format!(
+            "artifact still building: {}",
+            redact_url(url)
+        ))),
         ServeDownload::Failed(e) => Err(e),
     }
 }
@@ -2800,7 +2816,8 @@ impl ApiClient {
     ) -> Result<Vec<u8>, ApiError> {
         if !(url.starts_with("https://") || url.starts_with("http://")) {
             return Err(ApiError::Other(format!(
-                "refusing non-http(s) artifact URL `{url}`"
+                "refusing non-http(s) artifact URL `{}`",
+                redact_url(url)
             )));
         }
         let attempts = self.vendor_retry.attempts.max(1);
@@ -2852,13 +2869,19 @@ impl ApiClient {
             StatusCode::OK => {}
             StatusCode::NOT_FOUND | StatusCode::GONE => {
                 return (
-                    Err(ApiError::Other(format!("artifact not found: {url}"))),
+                    Err(ApiError::Other(format!(
+                        "artifact not found: {}",
+                        redact_url(url)
+                    ))),
                     None,
                 )
             }
             StatusCode::REQUEST_TIMEOUT => {
                 return (
-                    Err(ApiError::Other(format!("artifact still building: {url}"))),
+                    Err(ApiError::Other(format!(
+                        "artifact still building: {}",
+                        redact_url(url)
+                    ))),
                     None,
                 )
             }

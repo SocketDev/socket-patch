@@ -10,7 +10,7 @@ use crate::constants::npm_family::{
     BUN_LOCK, BUN_LOCKB, NPM_LOCKS, PNPM_LOCK, VLT_HIDDEN_LOCK_REL, VLT_LOCK, VLT_STORE_DIR,
 };
 use crate::patch::redirect::vlt_preflight::{self, ArtifactProbe, OFFLINE_REASON};
-use crate::patch::redirect::{redact_grant_token, vlt, DepOverride};
+use crate::patch::redirect::{vlt, DepOverride};
 use crate::vendor::lock_inventory::{MemoryEntry, ProjectView};
 
 /// The warning code (and skip reason) of a dep whose artifact vlt would
@@ -180,7 +180,7 @@ pub fn judge(
         );
         out.warnings.push(crate::hosted::engine::warning(
             ARTIFACT_UNVERIFIABLE,
-            redact_grant_token(&detail, &dep.artifact_url, &dep.patch_uuid),
+            crate::utils::redact::redact_urls_in(&detail).into_owned(),
         ));
         if everywhere {
             out.withheld_everywhere

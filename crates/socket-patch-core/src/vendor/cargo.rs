@@ -404,13 +404,7 @@ pub(super) async fn cargo_service_copy(
             format!("cannot move the extracted crate into place: {e}"),
         );
     }
-    warnings.push(VendorWarning::new(
-        "vendor_prebuilt_downloaded",
-        format!(
-            "vendored {name} from the patch service ({})",
-            archive.source_url
-        ),
-    ));
+    warnings.push(archive.downloaded_warning(name));
     CargoServiceCopy::Used(())
 }
 

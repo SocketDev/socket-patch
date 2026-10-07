@@ -1172,8 +1172,16 @@ fn walk_zip_with_prefix(
 
 /// Capped download. http(s) only; the cap is enforced on the declared
 /// Content-Length AND the actual stream (a lying server cannot blow past
-/// it).
+/// it). Every error quotes the URL redacted (userinfo from a GOPROXY or
+/// `.npmrc` registry, a grant token, a signed query), reqwest's own error
+/// text included.
 pub(crate) async fn download(client: &reqwest::Client, url: &str) -> Result<Vec<u8>, String> {
+    download_unredacted(client, url)
+        .await
+        .map_err(|e| crate::utils::redact::redact_urls_in(&e).into_owned())
+}
+
+async fn download_unredacted(client: &reqwest::Client, url: &str) -> Result<Vec<u8>, String> {
     if !(url.starts_with("https://") || url.starts_with("http://")) {
         return Err(format!("refusing non-http(s) artifact URL `{url}`"));
     }

@@ -92,6 +92,19 @@ pub(crate) struct VerifiedArchive {
 }
 
 impl VerifiedArchive {
+    /// The `vendor_prebuilt_downloaded` advisory every backend reports once
+    /// it has used these bytes for `subject`. The source URL carries the
+    /// org's grant token; [`VendorWarning::new`] quotes it redacted.
+    pub(crate) fn downloaded_warning(&self, subject: impl std::fmt::Display) -> VendorWarning {
+        VendorWarning::new(
+            "vendor_prebuilt_downloaded",
+            format!(
+                "vendored {subject} from the patch service ({})",
+                self.source_url
+            ),
+        )
+    }
+
     /// Hex sha256 of [`Self::bytes`], digested once on first ask.
     pub(crate) fn sha256_hex(&self) -> &str {
         self.sha256_hex
@@ -318,13 +331,7 @@ pub(crate) async fn service_archive_copy(
             ),
         );
     }
-    warnings.push(VendorWarning::new(
-        "vendor_prebuilt_downloaded",
-        format!(
-            "vendored {name} from the patch service ({})",
-            archive.source_url
-        ),
-    ));
+    warnings.push(archive.downloaded_warning(name));
     ServiceCopy::Used(archive.bytes)
 }
 
