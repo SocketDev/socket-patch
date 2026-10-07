@@ -73,6 +73,8 @@ run `socket-patch apply` once after migration to confirm the manifest still appl
 | `SOCKET_PATCH_PROXY_URL` | `SOCKET_PROXY_URL` |
 | `SOCKET_PATCH_DEBUG` | `SOCKET_DEBUG` |
 | `SOCKET_PATCH_TELEMETRY_DISABLED` | `SOCKET_TELEMETRY_DISABLED` |
+| `--download-mode`, `SOCKET_DOWNLOAD_MODE` | No replacement; patch content is always fetched as per-file blobs |
 
-Legacy `.socket/packages/` archives are no longer read. Patch data uses diff
-archives or blobs; cleanup commands remove obsolete package archives.
+Legacy `.socket/packages/` and `.socket/diffs/` archives are no longer read.
+Patch data uses per-file blobs (`.socket/blobs/`); cleanup commands remove the
+obsolete archives.
