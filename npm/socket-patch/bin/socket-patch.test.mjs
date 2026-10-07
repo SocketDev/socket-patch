@@ -1,7 +1,7 @@
 import { describe, it } from "node:test";
 import assert from "node:assert/strict";
 import { spawnSync } from "node:child_process";
-import { chmodSync, mkdirSync, mkdtempSync, readFileSync, rmSync, writeFileSync } from "node:fs";
+import { chmodSync, existsSync, mkdirSync, mkdtempSync, readFileSync, rmSync, writeFileSync } from "node:fs";
 import { createRequire } from "node:module";
 import { tmpdir } from "node:os";
 import { fileURLToPath } from "node:url";
@@ -235,6 +235,12 @@ describe("npm package contents", () => {
       const files = JSON.parse(result.stdout)[0].files.map((f) => f.path);
       assert.ok(files.includes("bin/socket-patch"), files.join(", "));
       assert.ok(files.includes("package.json"), files.join(", "));
+      // The `./schema` export points at dist/; once it is built, both
+      // compiled files must ship or the export resolves to nothing.
+      if (existsSync(join(pkgDir, "dist", "schema", "manifest-schema.js"))) {
+        assert.ok(files.includes("dist/schema/manifest-schema.js"), files.join(", "));
+        assert.ok(files.includes("dist/schema/manifest-schema.d.ts"), files.join(", "));
+      }
       for (const file of files) {
         assert.doesNotMatch(file, /\.test\.|^src\/|tsconfig|tsbuildinfo/, `unexpected file in the tarball: ${file}`);
         assert.ok(
