@@ -1,7 +1,7 @@
 [agent] Bench: progress log for the `socket-patch scan` benchmark suite (`crates/socket-patch-bench`, `.github/workflows/bench.yml`). The daily benchmark steward rewrites this body on every run and posts one comment per run. Machine-readable history is in `history.json` on the [`bench/ledger`](https://github.com/SocketDev/socket-patch/tree/bench/ledger) branch. The first run (2026-10-02) was logged in #580 and backfilled there.
 
 ## Last run
-- **When:** 2026-10-07 ~08:30 UTC
+- **When:** 2026-10-07 ~08:00 UTC
 - **main:** `9c43dfc9` (Cache the macOS vexctl build in the test job, #874). Unchanged since the 10-06 run, so there was no daily A/B.
 - **Suite source:** `main`, plus `hatch/*` from #925, measured with the #925 bench binary on the same main CLI. `gradle/*` (also in #925) was not re-measured today.
 - **Runner:** 4 vCPU, Intel(R) Xeon(R) Processor @ 2.80GHz, cloud sandbox. It ran about 1.3x slower than 10-06's runner on absolute medians. Verdicts come only from same-machine interleaved `compare`.
