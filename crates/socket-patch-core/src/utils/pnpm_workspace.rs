@@ -18,6 +18,7 @@
 use std::path::{Path, PathBuf};
 
 use crate::utils::cargo_workspace::{expand_glob, DirTree, DiskTree, MemoryTree};
+use crate::utils::fs::read_regular_to_string;
 use crate::vendor::lock_inventory::view::ProjectView;
 
 /// pnpm's workspace and settings file.
@@ -192,8 +193,50 @@ pub(crate) fn member_dirs(tree: &dyn DirTree, globs: &[String]) -> Vec<String> {
 /// `pnpm-lock.yaml` through the view's FIFO-safe reader; a file that
 /// cannot be read counts as absent, which keeps the shared default.
 pub async fn member_locks(view: &ProjectView<'_>) -> MemberLocks {
+    let (dirs, globs, root_lock) = match workspace_members(view).await {
+        Members::Shared => return MemberLocks::Shared,
+        Members::Unresolved(why) => return MemberLocks::Unresolved(why),
+        Members::Dirs {
+            dirs,
+            globs,
+            root_lock,
+        } => (dirs, globs, root_lock),
+    };
+    let mut keys = Vec::new();
+    for dir in dirs {
+        let key = format!("{dir}/{PNPM_LOCK}");
+        if view.exists_no_follow(&key).await {
+            keys.push(key);
+        }
+    }
+    if keys.is_empty() && !root_lock {
+        return MemberLocks::Unresolved(format!(
+            "{PNPM_WORKSPACE} sets sharedWorkspaceLockfile: false, so every workspace \
+             member installs from its own {PNPM_LOCK}, but no member lock was found \
+             under its `packages:` globs ({})",
+            globs.join(", ")
+        ));
+    }
+    MemberLocks::PerMember(keys)
+}
+
+/// The workspace members that install from their own lock (see
+/// [`member_locks`]).
+enum Members {
+    Shared,
+    /// The member directories, the globs naming them, and whether the root
+    /// has a lock of its own.
+    Dirs {
+        dirs: Vec<String>,
+        globs: Vec<String>,
+        root_lock: bool,
+    },
+    Unresolved(String),
+}
+
+async fn workspace_members(view: &ProjectView<'_>) -> Members {
     let Ok(workspace) = view.read_text(PNPM_WORKSPACE).await else {
-        return MemberLocks::Shared;
+        return Members::Shared;
     };
     let npmrc = view.read_text(".npmrc").await.ok();
     let shared = view_setting(
@@ -204,25 +247,25 @@ pub async fn member_locks(view: &ProjectView<'_>) -> MemberLocks {
         "shared-workspace-lockfile",
     );
     if shared.is_none_or(|setting| setting.as_bool() != Some(false)) {
-        return MemberLocks::Shared;
+        return Members::Shared;
     }
     let root_lock = view.read_text(PNPM_LOCK).await.ok();
     if root_lock.as_deref().is_some_and(root_lock_lists_members) {
-        return MemberLocks::Shared;
+        return Members::Shared;
     }
     let globs = match crate::formats::pnpm::workspace::package_globs(&workspace) {
         Ok(Some(globs)) => globs,
         // pnpm <= 8 then finds projects in every directory (`**`), more
         // than a bounded walk can promise to list.
         Ok(None) => {
-            return MemberLocks::Unresolved(format!(
+            return Members::Unresolved(format!(
                 "{PNPM_WORKSPACE} turns the shared lock off, so every workspace member \
                  installs from its own {PNPM_LOCK}, but it has no `packages:` list to \
                  find the members by"
             ))
         }
         Err(why) => {
-            return MemberLocks::Unresolved(format!(
+            return Members::Unresolved(format!(
                 "{PNPM_WORKSPACE} sets sharedWorkspaceLockfile: false, so every \
                  workspace member installs from its own {PNPM_LOCK}, but its \
                  member list cannot be read: {why}"
@@ -236,22 +279,11 @@ pub async fn member_locks(view: &ProjectView<'_>) -> MemberLocks {
         }
         ProjectView::Memory(project) => member_dirs(&MemoryTree(project), &globs),
     };
-    let mut keys = Vec::new();
-    for dir in dirs {
-        let key = format!("{dir}/{PNPM_LOCK}");
-        if view.exists_no_follow(&key).await {
-            keys.push(key);
-        }
+    Members::Dirs {
+        dirs,
+        globs,
+        root_lock: root_lock.is_some(),
     }
-    if keys.is_empty() && root_lock.is_none() {
-        return MemberLocks::Unresolved(format!(
-            "{PNPM_WORKSPACE} sets sharedWorkspaceLockfile: false, so every workspace \
-             member installs from its own {PNPM_LOCK}, but no member lock was found \
-             under its `packages:` globs ({})",
-            globs.join(", ")
-        ));
-    }
-    MemberLocks::PerMember(keys)
 }
 
 /// pnpm's per-branch locks (`gitBranchLockfile`, #556), found at a project
@@ -312,33 +344,81 @@ pub fn is_git_branch_lock_name(name: &str) -> bool {
 }
 
 /// The project's per-branch locks (see [`GitBranchLocks`]), `None` unless
-/// the setting is on AND a branch lock exists at the root: with no branch
-/// lock pnpm installs from `pnpm-lock.yaml`, which is then pinned as usual.
-/// Settings are read through the view's FIFO-safe reader; on disk the
+/// the setting is on AND a branch lock exists: with no branch lock pnpm
+/// installs from `pnpm-lock.yaml`, which is then pinned as usual. pnpm
+/// picks the branch lock's name once and looks for it in every directory
+/// it installs a lock from, so the branch locks of the members that install
+/// from their own lock ([`member_locks`]) count beside the root's.
+///
+/// The setting is read through the view's FIFO-safe reader from the
+/// project's own `pnpm-workspace.yaml` / `.npmrc`; on disk, a project with
+/// no `pnpm-workspace.yaml` of its own (a workspace member) also reads the
+/// governing ancestor's and the `.npmrc` beside it
+/// ([`governing_workspace_file`]), and the
 /// `npm_config_git_branch_lockfile` / `pnpm_config_git_branch_lockfile`
 /// environment spellings count too.
 pub async fn git_branch_locks(view: &ProjectView<'_>) -> Option<GitBranchLocks> {
-    let locks: Vec<String> = view
-        .list_dir("")
-        .await
-        .ok()?
-        .into_iter()
-        .filter(|entry| !entry.is_dir && is_git_branch_lock_name(&entry.name))
-        .map(|entry| entry.name)
-        .collect();
+    let mut locks = branch_lock_names(view, "").await;
+    if let Members::Dirs { dirs, .. } = workspace_members(view).await {
+        for dir in dirs {
+            locks.extend(branch_lock_names(view, &dir).await);
+        }
+    }
     if locks.is_empty() {
         return None;
     }
     let workspace = view.read_text(PNPM_WORKSPACE).await.ok();
     let npmrc = view.read_text(".npmrc").await.ok();
-    let setting = git_branch_on(view_setting(
-        view,
-        workspace.as_deref(),
-        npmrc.as_deref(),
-        "gitBranchLockfile",
-        "git-branch-lockfile",
-    ))?;
+    const KEYS: (&str, &str) = ("gitBranchLockfile", "git-branch-lockfile");
+    let mut setting = pnpm_setting(workspace.as_deref(), npmrc.as_deref(), KEYS.0, KEYS.1);
+    if setting.is_none() {
+        if let Some(file) = governing_file(view) {
+            let workspace = read_regular_to_string(&file).await.ok();
+            let npmrc = read_regular_to_string(&file.with_file_name(".npmrc"))
+                .await
+                .ok();
+            setting =
+                pnpm_setting(workspace.as_deref(), npmrc.as_deref(), KEYS.0, KEYS.1).map(|found| {
+                    PnpmSetting {
+                        source: format!("{} (at {})", found.source, file.display()),
+                        ..found
+                    }
+                });
+        }
+    }
+    let setting =
+        git_branch_on(setting.or_else(|| view_setting(view, None, None, KEYS.0, KEYS.1)))?;
     Some(GitBranchLocks { setting, locks })
+}
+
+/// The `pnpm-lock.<branch>.yaml` files in root-relative `dir` (`""` for
+/// the root), as root-relative paths, sorted.
+async fn branch_lock_names(view: &ProjectView<'_>, dir: &str) -> Vec<String> {
+    let Ok(entries) = view.list_dir(dir).await else {
+        return Vec::new();
+    };
+    let mut names: Vec<String> = entries
+        .into_iter()
+        .filter(|entry| !entry.is_dir && is_git_branch_lock_name(&entry.name))
+        .map(|entry| match dir {
+            "" => entry.name,
+            dir => format!("{dir}/{}", entry.name),
+        })
+        .collect();
+    names.sort();
+    names
+}
+
+/// The ancestor `pnpm-workspace.yaml` governing a disk view's project
+/// ([`governing_workspace_file`]); an in-memory project has none.
+fn governing_file(view: &ProjectView<'_>) -> Option<PathBuf> {
+    match view {
+        ProjectView::Disk(root)
+        | ProjectView::Snapshot(crate::vendor::lock_inventory::DiskSnapshot { root, .. }) => {
+            governing_workspace_file(root)
+        }
+        ProjectView::Memory(_) => None,
+    }
 }
 
 /// The `pnpm-workspace.yaml` that governs `project_root`'s pnpm settings
@@ -421,10 +501,22 @@ mod tests {
             Some("shared-workspace-lockfile=true\n")
         ));
         // js-yaml reads every capitalisation of a boolean.
-        assert!(shared_lockfile_disabled("sharedWorkspaceLockfile: False\n", None));
-        assert!(shared_lockfile_disabled("packages: []\n", Some("shared-workspace-lockfile = FALSE\n")));
-        assert!(!shared_lockfile_disabled("sharedWorkspaceLockfile: TRUE\n", None));
-        assert!(!shared_lockfile_disabled("sharedWorkspaceLockfile: no\n", None));
+        assert!(shared_lockfile_disabled(
+            "sharedWorkspaceLockfile: False\n",
+            None
+        ));
+        assert!(shared_lockfile_disabled(
+            "packages: []\n",
+            Some("shared-workspace-lockfile = FALSE\n")
+        ));
+        assert!(!shared_lockfile_disabled(
+            "sharedWorkspaceLockfile: TRUE\n",
+            None
+        ));
+        assert!(!shared_lockfile_disabled(
+            "sharedWorkspaceLockfile: no\n",
+            None
+        ));
     }
 
     #[test]
@@ -442,7 +534,9 @@ mod tests {
         )
         .unwrap();
         assert_eq!(found.as_bool(), Some(false));
-        assert!(found.source.contains("npm_config_shared_workspace_lockfile"));
+        assert!(found
+            .source
+            .contains("npm_config_shared_workspace_lockfile"));
         // The pnpm spelling wins over npm's.
         let found = env_setting(
             "git-branch-lockfile",
@@ -562,7 +656,11 @@ mod tests {
             member_locks(&view).await,
             MemberLocks::Unresolved(_)
         ));
-        write(root, PNPM_LOCK, "lockfileVersion: '9.0'\nimporters:\n  .: {}\n");
+        write(
+            root,
+            PNPM_LOCK,
+            "lockfileVersion: '9.0'\nimporters:\n  .: {}\n",
+        );
         assert!(matches!(
             member_locks(&view).await,
             MemberLocks::Unresolved(_)

@@ -88,7 +88,8 @@ The backticked slug in each row is the value `-e`/`--ecosystems` accepts (e.g.
   is refused with `redirect_pnpm_member_locks_unresolved`.
   With `gitBranchLockfile` on (`git-branch-lockfile=true` in `.npmrc` on
   pnpm 10 and older), pnpm installs a branch from its own
-  `pnpm-lock.<branch>.yaml`, which neither mode can pin: while such a lock
+  `pnpm-lock.<branch>.yaml` (in each member's directory too, when members
+  keep their own locks), which neither mode can pin: while such a lock
   exists, hosted mode refuses the pnpm pins with
   `redirect_pnpm_git_branch_lockfile` and vendored mode with
   `vendor_pnpm_git_branch_lockfile`. Turn the setting off and run

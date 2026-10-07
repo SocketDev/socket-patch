@@ -3523,6 +3523,98 @@ mod tests {
         assert_branch_lock_refused(&read, &done);
     }
 
+    /// Under `sharedWorkspaceLockfile: false` pnpm looks for the branch
+    /// lock in every member's directory too: a member whose deps changed on
+    /// the branch installs from `<member>/pnpm-lock.<branch>.yaml`, so its
+    /// `pnpm-lock.yaml` is stale and no member lock is pinned (#492 x #556).
+    #[tokio::test]
+    async fn a_member_git_branch_lock_refuses_the_stale_member_locks() {
+        // pnpm 8+: the settings in the YAML, a root lock covering `.` only,
+        // and no branch lock at the root.
+        let tmp = tempfile::tempdir().unwrap();
+        let ws = "packages:\n  - 'packages/*'\nsharedWorkspaceLockfile: false\n\
+                  gitBranchLockfile: true\n";
+        write_member_workspace(tmp.path(), ws);
+        write_rel(
+            tmp.path(),
+            &format!("packages/a/{BRANCH_LOCK}"),
+            &v9_member_lock(true),
+        );
+        let (read, done) = member_rewrite(tmp.path()).await;
+        assert_branch_lock_refused(&read, &done);
+        assert!(read.pnpm_member_lock_keys.is_empty());
+        for key in MEMBER_KEYS {
+            assert!(!read.files.contains_key(key), "{key}");
+        }
+
+        // pnpm 7: both settings in `.npmrc` and no root lock at all.
+        let tmp = tempfile::tempdir().unwrap();
+        write_member_workspace(tmp.path(), "packages:\n  - 'packages/*'\n");
+        std::fs::remove_file(tmp.path().join("pnpm-lock.yaml")).unwrap();
+        write_rel(
+            tmp.path(),
+            ".npmrc",
+            "shared-workspace-lockfile=false\ngit-branch-lockfile=true\n",
+        );
+        write_rel(
+            tmp.path(),
+            &format!("packages/a/{BRANCH_LOCK}"),
+            &v9_member_lock(true),
+        );
+        let (read, done) = member_rewrite(tmp.path()).await;
+        assert_branch_lock_refused(&read, &done);
+        assert!(read.pnpm_member_lock_keys.is_empty());
+
+        // The setting off: the member branch lock is a stray file.
+        let tmp = tempfile::tempdir().unwrap();
+        write_member_workspace(
+            tmp.path(),
+            "packages:\n  - 'packages/*'\nsharedWorkspaceLockfile: false\n",
+        );
+        write_rel(
+            tmp.path(),
+            &format!("packages/a/{BRANCH_LOCK}"),
+            &v9_member_lock(true),
+        );
+        let (read, done) = member_rewrite(tmp.path()).await;
+        assert_eq!(read.pnpm_member_lock_keys, MEMBER_KEYS);
+        assert!(!warning_codes(&done).contains(&PNPM_GIT_BRANCH_LOCKFILE));
+    }
+
+    /// Run from a member, the setting lives in the ancestor
+    /// `pnpm-workspace.yaml` pnpm reads it from, not in the member.
+    #[tokio::test]
+    async fn a_member_run_reads_the_setting_from_the_governing_workspace() {
+        let tmp = tempfile::tempdir().unwrap();
+        let ws = "packages:\n  - 'packages/*'\nsharedWorkspaceLockfile: false\n\
+                  gitBranchLockfile: true\n";
+        write_member_workspace(tmp.path(), ws);
+        let member = tmp.path().join("packages/a");
+        write_rel(&member, BRANCH_LOCK, &v9_member_lock(true));
+        let (read, done) = member_rewrite(&member).await;
+        assert_branch_lock_refused(&read, &done);
+        let detail = &done
+            .rewrite
+            .warnings
+            .iter()
+            .find(|w| w.code == PNPM_GIT_BRANCH_LOCKFILE)
+            .unwrap()
+            .detail;
+        assert!(detail.contains("gitBranchLockfile: true"), "{detail}");
+
+        // pnpm 10 and older: the `.npmrc` beside the ancestor file.
+        let tmp = tempfile::tempdir().unwrap();
+        write_member_workspace(
+            tmp.path(),
+            "packages:\n  - 'packages/*'\nsharedWorkspaceLockfile: false\n",
+        );
+        write_rel(tmp.path(), ".npmrc", "git-branch-lockfile=true\n");
+        let member = tmp.path().join("packages/a");
+        write_rel(&member, BRANCH_LOCK, &v9_member_lock(true));
+        let (read, done) = member_rewrite(&member).await;
+        assert_branch_lock_refused(&read, &done);
+    }
+
     /// The setting alone (no branch lock: main, or a branch whose deps never
     /// changed) installs from `pnpm-lock.yaml`, so it is pinned as usual; so
     /// is a stray branch lock while the setting is off.
