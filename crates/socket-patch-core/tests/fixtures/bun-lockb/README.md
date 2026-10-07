@@ -28,7 +28,10 @@ and an empty `BUN_INSTALL_CACHE_DIR` to regenerate. Bun 1.2+ fixtures include
   member, or `bun add` in the existing `adder` member — gave it a second,
   nested registry record (#861). `late-dependent/<version>-deps-<member>.lockb`
   are the same flow with mkdirp@0.5.6 patched, a package with a dependency
-  (minimist) of its own.
+  (minimist) of its own. The `<version>-ws-*` locks repeat both flows with
+  ws@8.18.0 also at the root, whose optional peers (bufferutil,
+  utf-8-validate) nothing installs: unresolved edges, as most real locks
+  hold.
 
 Other releases capture the stable major/minor eras. `two-versions` covers
 multiple package versions and scoped restoration. The earliest writers include

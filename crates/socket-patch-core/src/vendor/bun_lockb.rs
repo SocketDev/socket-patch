@@ -1951,10 +1951,14 @@ fn behavior_order(l: u8, r: u8) -> Ordering {
 /// from the root, each package's edges in `DepSorter` order go to the
 /// highest tree (up to a bundled edge's) with no same-name edge in the way,
 /// deduplicated where one resolves to the same package, and a tree that
-/// places nothing is dropped. `None` where the result depends on a rule the
-/// releases differ on or this does not model: an unresolved edge, edges
-/// tied in that order, a package listing one name for two packages, a peer
-/// edge meeting another package of its name (a semver check), or a peer or
+/// places nothing is dropped. An unresolved edge is skipped, except an
+/// optional peer nothing installs (such as `ws`'s `bufferutil`), which
+/// hoists like any edge but is left out of the written buffer, as Bun's
+/// `Tree.Builder.clean` does. `None` where the result depends on a rule the
+/// releases differ on or this does not model: an optional peer that would
+/// resolve to (or be resolved by) a same-name edge it meets, edges tied in
+/// that order, a package listing one name for two packages, a peer edge
+/// meeting another package of its name (a semver check), or a peer or
 /// cyclic folder edge.
 fn hoist(graph: &HoistGraph) -> Option<(Vec<u8>, Vec<u8>)> {
     // (dependency, parent, placed edges) per tree.
@@ -1988,12 +1992,18 @@ fn hoist(graph: &HoistGraph) -> Option<(Vec<u8>, Vec<u8>)> {
             let HoistEdge {
                 behavior, package, ..
             } = graph.edges[edge];
-            if package >= graph.lists.len() {
-                return None;
-            }
+            let resolved = package < graph.lists.len();
             let bundled = behavior & BEHAVIOR_BUNDLED != 0;
             let hoisted = if bundled {
                 Hoisted::Placed(next)
+            } else if !resolved {
+                if behavior & (BEHAVIOR_OPTIONAL | BEHAVIOR_PEER)
+                    != BEHAVIOR_OPTIONAL | BEHAVIOR_PEER
+                {
+                    // Bun skips an unresolvable edge that is no optional peer.
+                    continue;
+                }
+                hoist_dependency(graph, &trees, true, next, hoist_root, edge, &list)?
             } else if graph.folder[package] {
                 let mut tree = next;
                 while tree != INVALID_TREE {
@@ -2012,7 +2022,7 @@ fn hoist(graph: &HoistGraph) -> Option<(Vec<u8>, Vec<u8>)> {
             };
             if let Hoisted::Placed(tree) = hoisted {
                 trees[tree].2.push(edge);
-                if !graph.lists[package].is_empty() {
+                if resolved && !graph.lists[package].is_empty() {
                     queue.push_back((tree, edge, if bundled { tree } else { hoist_root }));
                 }
             }
@@ -2023,6 +2033,13 @@ fn hoist(graph: &HoistGraph) -> Option<(Vec<u8>, Vec<u8>)> {
     }
     let (mut tree_bytes, mut hoisted_bytes) = (Vec::new(), Vec::new());
     for (id, (dependency, parent, placed)) in trees.iter().enumerate() {
+        // An optional peer that never resolved holds its place while
+        // hoisting but is not written.
+        let placed: Vec<usize> = placed
+            .iter()
+            .copied()
+            .filter(|&edge| graph.edges[edge].package < graph.lists.len())
+            .collect();
         for value in [
             id,
             *dependency,
@@ -2032,7 +2049,7 @@ fn hoist(graph: &HoistGraph) -> Option<(Vec<u8>, Vec<u8>)> {
         ] {
             tree_bytes.extend_from_slice(&(value as u32).to_le_bytes());
         }
-        for &edge in placed {
+        for edge in placed {
             hoisted_bytes.extend_from_slice(&(edge as u32).to_le_bytes());
         }
     }
@@ -2041,7 +2058,10 @@ fn hoist(graph: &HoistGraph) -> Option<(Vec<u8>, Vec<u8>)> {
 
 /// Bun's `hoistDependency` for `edge` (of the package whose edges are
 /// `list`) from `tree` up: deduplicated against the same package, kept
-/// below a different one, else placed in the highest tree reached.
+/// below a different one, else placed in the highest tree reached. An
+/// unresolved optional peer meeting another one of its name is set aside
+/// (Bun's `resolve_later`, which only a later resolution acts on); meeting
+/// a resolved one either way round re-resolves it, which is `None`.
 fn hoist_dependency(
     graph: &HoistGraph,
     trees: &[(usize, usize, Vec<usize>)],
@@ -2057,6 +2077,12 @@ fn hoist_dependency(
         .iter()
         .find(|&&other| graph.edges[other].hash == wanted.hash)
     {
+        let unresolved = |edge: &HoistEdge| edge.package >= graph.lists.len();
+        match (unresolved(&graph.edges[other]), unresolved(wanted)) {
+            (true, true) => return Some(Hoisted::Deduplicated),
+            (true, false) | (false, true) => return None,
+            (false, false) => {}
+        }
         if graph.edges[other].package == wanted.package {
             return Some(Hoisted::Deduplicated);
         }
@@ -2861,8 +2887,10 @@ mod tests {
     /// nests its registry copy) or `bun add` in an existing one (`adder`,
     /// hoisted first, so the vendored record nests instead). The patched
     /// package is minimist@1.2.2, or (`deps`) mkdirp@0.5.6, whose own
-    /// dependency on minimist each record lists.
-    const LATE_DEPENDENT: [(&str, &[u8]); 8] = [
+    /// dependency on minimist each record lists. The `ws` locks also depend
+    /// on ws@8.18.0 at the root, whose two optional peers nothing installs:
+    /// unresolved edges, as most real locks have.
+    const LATE_DEPENDENT: [(&str, &[u8]); 16] = [
         (
             "1.3.9-late",
             include_bytes!("../../tests/fixtures/bun-lockb/late-dependent/1.3.9-late.lockb"),
@@ -2894,6 +2922,46 @@ mod tests {
         (
             "1.4.2-deps-adder",
             include_bytes!("../../tests/fixtures/bun-lockb/late-dependent/1.4.2-deps-adder.lockb"),
+        ),
+        (
+            "1.3.9-ws-late",
+            include_bytes!("../../tests/fixtures/bun-lockb/late-dependent/1.3.9-ws-late.lockb"),
+        ),
+        (
+            "1.3.9-ws-adder",
+            include_bytes!("../../tests/fixtures/bun-lockb/late-dependent/1.3.9-ws-adder.lockb"),
+        ),
+        (
+            "1.3.9-ws-deps-late",
+            include_bytes!(
+                "../../tests/fixtures/bun-lockb/late-dependent/1.3.9-ws-deps-late.lockb"
+            ),
+        ),
+        (
+            "1.3.9-ws-deps-adder",
+            include_bytes!(
+                "../../tests/fixtures/bun-lockb/late-dependent/1.3.9-ws-deps-adder.lockb"
+            ),
+        ),
+        (
+            "1.4.2-ws-late",
+            include_bytes!("../../tests/fixtures/bun-lockb/late-dependent/1.4.2-ws-late.lockb"),
+        ),
+        (
+            "1.4.2-ws-adder",
+            include_bytes!("../../tests/fixtures/bun-lockb/late-dependent/1.4.2-ws-adder.lockb"),
+        ),
+        (
+            "1.4.2-ws-deps-late",
+            include_bytes!(
+                "../../tests/fixtures/bun-lockb/late-dependent/1.4.2-ws-deps-late.lockb"
+            ),
+        ),
+        (
+            "1.4.2-ws-deps-adder",
+            include_bytes!(
+                "../../tests/fixtures/bun-lockb/late-dependent/1.4.2-ws-deps-adder.lockb"
+            ),
         ),
     ];
 
@@ -2958,9 +3026,10 @@ mod tests {
             lock.validate_mutation().unwrap();
             let merged = BunLockb::parse(&lock.bytes()).unwrap();
             let packages = merged.packages().unwrap();
+            let ws = label.contains("-ws-");
             assert_eq!(
                 packages.len(),
-                if target == "mkdirp" { 6 } else { 5 },
+                5 + usize::from(target == "mkdirp") + usize::from(ws),
                 "{label}"
             );
             let copies: Vec<_> = packages.iter().filter(|p| p.name == target).collect();
@@ -2974,7 +3043,19 @@ mod tests {
                 "{label}: the duplicate's own edges leave"
             );
             let graph = merged.hoist_graph().unwrap();
-            assert!(graph.edges.iter().all(|e| e.package < merged.count));
+            let unresolved: Vec<_> = graph
+                .edges
+                .iter()
+                .filter(|e| e.package >= merged.count)
+                .map(|e| (e.name.as_slice(), e.package))
+                .collect();
+            let none = u32::MAX as usize;
+            let peers: &[(&[u8], usize)] = &[(b"bufferutil", none), (b"utf-8-validate", none)];
+            assert_eq!(
+                unresolved,
+                if ws { peers } else { &[] },
+                "{label}: only ws's optional peers stay unresolved"
+            );
             let meta = merged.package_start + merged.count * (32 + merged.resolution_size);
             for row in 0..merged.count {
                 assert_eq!(
@@ -2985,6 +3066,9 @@ mod tests {
             let mut expected = vec!["consumer", member, "is-number", "minimist"];
             if target == "mkdirp" {
                 expected.push("mkdirp");
+            }
+            if ws {
+                expected.push("ws");
             }
             expected.sort();
             assert_eq!(
@@ -3020,14 +3104,15 @@ mod tests {
     }
 
     /// The merge's hoister is Bun's: re-hoisting the lock every captured
-    /// Bun release wrote reproduces its trees byte for byte. The 0.1.x
-    /// writers hoisted differently; the merge's check that the lock's own
-    /// trees come back makes it decline those locks.
+    /// Bun release wrote reproduces its trees byte for byte, unresolved
+    /// optional peers included. The 0.1.x writers hoisted differently; the
+    /// merge's check that the lock's own trees come back makes it decline
+    /// those locks.
     #[test]
     fn hoist_reproduces_every_captured_writers_trees() {
         let root = std::path::Path::new(env!("CARGO_MANIFEST_DIR")).join("tests/fixtures");
         let mut stack = vec![root.clone()];
-        let mut checked = 0;
+        let (mut checked, mut unresolved) = (0, 0);
         while let Some(dir) = stack.pop() {
             for entry in std::fs::read_dir(&dir).unwrap() {
                 let path = entry.unwrap().path();
@@ -3044,16 +3129,23 @@ mod tests {
                     lock.data[lock.buffer_array(0).unwrap().data].to_vec(),
                     lock.data[lock.buffer_array(1).unwrap().data].to_vec(),
                 );
-                let hoisted = hoist(&lock.hoist_graph().unwrap());
+                let graph = lock.hoist_graph().unwrap();
+                let hoisted = hoist(&graph);
                 let label = path.strip_prefix(&root).unwrap().display().to_string();
                 if label.starts_with("bun-lockb/0.1.") {
                     assert_ne!(hoisted, Some(own), "{label}");
                 } else {
                     assert_eq!(hoisted, Some(own), "{label}");
                     checked += 1;
+                    if graph.edges.iter().any(|e| e.package >= graph.lists.len()) {
+                        unresolved += 1;
+                    }
                 }
             }
         }
         assert!(checked >= 30, "{checked}");
+        // REGRESSION (#861): locks with an optional peer nothing installs
+        // (the `late-dependent/*-ws-*` ones) hoist too.
+        assert!(unresolved >= 8, "{unresolved}");
     }
 }

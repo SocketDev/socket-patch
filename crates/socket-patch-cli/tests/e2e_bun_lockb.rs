@@ -333,8 +333,13 @@ impl Fixture {
         let dependencies = match shape {
             "alias" => json!({"alias":"npm:minimist@1.2.2", "is-number":"7.0.0"}),
             "transitive" => json!({"mkdirp":"0.5.3", "is-number":"7.0.0"}),
-            "workspace" | "workspace-adder" | "workspace-deps" | "workspace-deps-adder" => {
-                json!({"consumer":"workspace:*", "is-number":"7.0.0"})
+            "workspace" => json!({"consumer":"workspace:*", "is-number":"7.0.0"}),
+            // REGRESSION (#861): ws@8 has two optional peers nothing
+            // installs (bufferutil, utf-8-validate), so the lock holds
+            // unresolved edges, as most real locks do; the fold must still
+            // re-hoist it.
+            "workspace-adder" | "workspace-deps" | "workspace-deps-adder" => {
+                json!({"consumer":"workspace:*", "is-number":"7.0.0", "ws":"8.18.0"})
             }
             "workspace-nested" => {
                 json!({"consumer":"workspace:*", "minimist":"1.2.8", "is-number":"7.0.0"})

@@ -266,6 +266,10 @@ runners) from the GitHub releases and verifies it against `SHASUMS256.txt`. Ever
   before, with `vendor_bun_lockb_duplicate_records`. A patched package with
   dependencies of its own (mkdirp@0.5.6) folds the same way, and an
   unfrozen install by 1.3.9 and 1.4.2 leaves the folded lock byte-identical.
+  An optional peer nothing installs (ws@8's `bufferutil` and
+  `utf-8-validate`, common in real locks) is an unresolved edge: the hoister
+  skips it from the written trees as Bun does, so it does not block the
+  fold; the e2e `-adder` and `-deps` shapes depend on ws@8.18.0 for this.
   Covered by `e2e_bun_lockb::workspace_late_dependent_rerun_shares_the_tarball_record`
   and `workspace_late_dependent_with_dependencies_rerun_shares_the_tarball_record`
   on the 1.3.14 and 1.4.2 legs, and hermetically by the
