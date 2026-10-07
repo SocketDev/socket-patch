@@ -1138,8 +1138,10 @@ pub fn recover(project_root: &Path) -> std::io::Result<Recovery> {
         if relative_to(Path::new(""), rel).is_none()
             || !is_captured(rel)
             // A journal must never write through a link (out of the
-            // project, or onto a file it does not name).
-            || crate::utils::containment::linked_level(project_root, &project_root.join(rel))
+            // project, or onto a file it does not name). A level that
+            // cannot be probed (EACCES, ENOTDIR) fails recovery closed:
+            // the journal stays and the locked command does not proceed.
+            || crate::utils::containment::try_linked_level(project_root, &project_root.join(rel))?
                 .is_some()
         {
             return set_aside(SetAsideOutcome::Refused);
@@ -1737,6 +1739,34 @@ mod tests {
             assert_eq!(std::fs::read(outside.join("target.json")).unwrap(), b"old");
             assert!(!root.join("b.lock").exists(), "{rel}: nothing applied");
         }
+    }
+
+    /// A journaled path whose level cannot be probed (here ENOTDIR: a
+    /// regular file sits where a directory should) fails recovery closed:
+    /// `recover` errors, the journal stays in place, and nothing is
+    /// written, rather than the probe error being read as "not a link".
+    #[cfg(unix)]
+    #[test]
+    fn recovery_fails_closed_when_a_level_cannot_be_probed() {
+        let tmp = tempfile::tempdir().unwrap();
+        let root = tmp.path();
+        std::fs::write(root.join("blocker"), b"file").unwrap();
+        let changes = vec![
+            change("b.lock", b"b", b"b2"),
+            Change {
+                rel: "blocker/x.lock".into(),
+                before: None,
+                after: Some(b"new".to_vec()),
+                preserve_mode: false,
+            },
+        ];
+        write_journal(root, &changes);
+        assert!(recover(root).is_err());
+        assert!(
+            root.join(COMMIT_JOURNAL_REL).is_file(),
+            "the journal is kept"
+        );
+        assert!(!root.join("b.lock").exists(), "nothing applied");
     }
 
     /// #627: a commit never renames over a symbolic link (a shared lock, a

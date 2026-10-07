@@ -71,15 +71,11 @@ pub(super) async fn load(
             ));
         }
         let path = root.join(wheel);
-        let mut component_path = root.to_path_buf();
-        for component in wheel.split('/') {
-            component_path.push(component);
-            if is_symlink(&component_path).await {
-                return Err((
-                    "pypi_hatch_pin_invalid",
-                    "wheel path contains a symlink".into(),
-                ));
-            }
+        if crate::utils::containment::linked_level(root, &path).is_some() {
+            return Err((
+                "pypi_hatch_pin_invalid",
+                "wheel path contains a symlink".into(),
+            ));
         }
         if tokio::fs::try_exists(&path).await.unwrap_or(true)
             && super::verify::file_sha256_hex(&path).await.as_deref() != Some(hash.as_str())

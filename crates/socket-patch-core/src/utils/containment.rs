@@ -29,22 +29,38 @@ use std::path::{Path, PathBuf};
 /// a Windows junction (lstat), or `None`. `path` itself counts as a level;
 /// `root` and its ancestors do not. A level that does not exist (yet) is
 /// not a link, so a tree the caller is about to create passes. When `path`
-/// is not below `root`, only `path` itself is checked.
+/// is not below `root`, only `path` itself is checked. A level that cannot
+/// be probed (EACCES, ENOTDIR) is reported as no link; callers that must
+/// fail closed on it use [`try_linked_level`].
 pub fn linked_level(root: &Path, path: &Path) -> Option<PathBuf> {
+    try_linked_level(root, path).ok().flatten()
+}
+
+/// [`linked_level`], but an lstat error other than `NotFound` on a level
+/// (EACCES, ENOTDIR) is returned instead of being read as "not a link".
+/// Levels are probed outermost first; a missing level ends the walk (nothing
+/// below it can exist).
+pub fn try_linked_level(root: &Path, path: &Path) -> std::io::Result<Option<PathBuf>> {
     let levels: Vec<&Path> = if path.starts_with(root) && path != root {
         path.ancestors().take_while(|a| *a != root).collect()
     } else {
         vec![path]
     };
-    levels
-        .into_iter()
-        .rev()
-        .find(|level| is_link(level))
-        .map(Path::to_path_buf)
+    for level in levels.into_iter().rev() {
+        match std::fs::symlink_metadata(level) {
+            Ok(meta) if meta.file_type().is_symlink() => return Ok(Some(level.to_path_buf())),
+            Ok(_) => {}
+            Err(e) if e.kind() == std::io::ErrorKind::NotFound => return Ok(None),
+            Err(e) => return Err(e),
+        }
+    }
+    Ok(None)
 }
 
 /// Whether `path` is itself a symlink or a Windows junction (lstat; a
-/// missing path is not).
+/// missing or unreadable path is not). The one link predicate:
+/// [`crate::utils::fs::is_symlink`] and every link probe in the vendor
+/// backends delegate here.
 pub fn is_link(path: &Path) -> bool {
     std::fs::symlink_metadata(path).is_ok_and(|meta| meta.file_type().is_symlink())
 }
@@ -147,6 +163,24 @@ mod tests {
         // Not below root: only the path itself is checked.
         assert_eq!(linked_level(&tmp.path().join("elsewhere"), &path), None);
         assert!(is_link(&real.join(".socket")));
+    }
+
+    /// `try_linked_level` surfaces a level it cannot probe (here ENOTDIR:
+    /// a regular file used as a directory) where `linked_level` reads it as
+    /// no link; a missing level is no link for both.
+    #[cfg(unix)]
+    #[test]
+    fn try_linked_level_propagates_unprobeable_levels() {
+        let tmp = tempfile::tempdir().unwrap();
+        let root = tmp.path();
+        std::fs::write(root.join("file"), b"x").unwrap();
+        let through_file = root.join("file/below");
+        assert!(try_linked_level(root, &through_file).is_err());
+        assert_eq!(linked_level(root, &through_file), None);
+        assert_eq!(
+            try_linked_level(root, &root.join("missing/deeper")).unwrap(),
+            None
+        );
     }
 
     #[test]
