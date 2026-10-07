@@ -30,11 +30,6 @@ pub fn dsl_of(rel: &str) -> Option<Dsl> {
     }
 }
 
-/// `s` without a leading UTF-8 byte-order mark.
-pub fn strip_bom(s: &str) -> &str {
-    s.strip_prefix('\u{feff}').unwrap_or(s)
-}
-
 /// Script bytes as text: a leading BOM is dropped and anything that is not
 /// UTF-8 is `None` (unparseable), never decoded lossily.
 pub fn decode(bytes: &[u8]) -> Option<String> {
@@ -745,8 +740,6 @@ mod tests {
     fn bom_is_skipped() {
         let src = "\u{feff}include ':a'\n";
         assert_eq!(render(src, Dsl::Groovy), ["I:include", "S::a"]);
-        assert_eq!(strip_bom(src), "include ':a'\n");
-        assert_eq!(strip_bom("x"), "x");
         assert_eq!(
             decode(b"\xef\xbb\xbfinclude ':a'").as_deref(),
             Some("include ':a'")

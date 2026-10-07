@@ -12,6 +12,7 @@ mod vlt_hosted_common;
 mod vlt_vendored;
 
 mod covgap_commands_remove;
+mod pypi_name_spellings;
 mod remove_duality_invariants;
 mod remove_invariants;
 mod remove_network;

@@ -334,7 +334,11 @@ async fn find_site_packages_under(
 /// 3. Poetry's out-of-tree virtualenv(s), when Poetry itself would not use
 ///    `./.venv` for the project (see [`find_poetry_virtualenv_site_packages`])
 /// 4. `.venv` directory in `cwd`
-/// 5. `venv` directory in `cwd`
+/// 5. `venv` directory in `cwd` (a PDM project with neither: PEP 582)
+/// 6. Hatch's out-of-tree envs for the project (see
+///    [`super::hatch_env::hatch_environments`]), added to whichever of the
+///    above answered: `hatch run` never uses an env another manager
+///    records or activates, so its envs stay the project's (#335)
 pub async fn find_local_venv_site_packages(cwd: &Path) -> Vec<PathBuf> {
     let var = |name: &str| std::env::var(name).ok();
     find_local_venv_site_packages_with(cwd, &var).await
@@ -343,6 +347,25 @@ pub async fn find_local_venv_site_packages(cwd: &Path) -> Vec<PathBuf> {
 /// [`find_local_venv_site_packages`] over an explicit environment (tests pass
 /// a closure instead of mutating the process environment).
 async fn find_local_venv_site_packages_with(
+    cwd: &Path,
+    var: &impl Fn(&str) -> Option<String>,
+) -> Vec<PathBuf> {
+    let mut found = managed_or_local_site_packages(cwd, var).await;
+    add_hatch_site_packages(cwd, var, &mut found).await;
+    found
+}
+
+/// Steps 0-5 of [`find_local_venv_site_packages`] (no Hatch envs): the env
+/// a package manager records or activates, else the project's local venvs.
+/// What a non-Hatch manager's own reinstall reaches, e.g. Pipenv's venv.
+pub async fn non_hatch_local_venv_site_packages(cwd: &Path) -> Vec<PathBuf> {
+    let var = |name: &str| std::env::var(name).ok();
+    managed_or_local_site_packages(cwd, &var).await
+}
+
+/// Steps 0-5 of [`find_local_venv_site_packages`]: the env a package
+/// manager records or activates, else the project's local venvs.
+async fn managed_or_local_site_packages(
     cwd: &Path,
     var: &impl Fn(&str) -> Option<String>,
 ) -> Vec<PathBuf> {
@@ -401,6 +424,28 @@ async fn find_local_venv_site_packages_with(
     }
 
     results
+}
+
+/// Appends the `site-packages` of every existing Hatch env of the project
+/// at `cwd` (see [`super::hatch_env::hatch_environments`]) not already in
+/// `results`.
+async fn add_hatch_site_packages(
+    cwd: &Path,
+    var: &impl Fn(&str) -> Option<String>,
+    results: &mut Vec<PathBuf>,
+) {
+    for env in super::hatch_env::hatch_environments_with(cwd, var).await {
+        for site in hatch_env_site_packages(&env).await {
+            if !results.contains(&site) {
+                results.push(site);
+            }
+        }
+    }
+}
+
+/// The `site-packages` directories of one Hatch env.
+pub async fn hatch_env_site_packages(env: &super::hatch_env::HatchEnvironment) -> Vec<PathBuf> {
+    find_site_packages_under(&env.prefix, "site-packages").await
 }
 
 /// The `site-packages` of the env the project's package manager records for
@@ -580,9 +625,7 @@ async fn pdm_saved_interpreter(cwd: &Path) -> Option<PathBuf> {
     let saved = match read_regular_to_string(&cwd.join(".pdm-python")).await {
         Ok(text) => text.trim().to_string(),
         Err(_) => {
-            let text = read_regular_to_string(&cwd.join(".pdm.toml"))
-                .await
-                .ok()?;
+            let text = read_regular_to_string(&cwd.join(".pdm.toml")).await.ok()?;
             let doc = text.parse::<toml_edit::DocumentMut>().ok()?;
             doc.get("python")?.get("path")?.as_str()?.trim().to_string()
         }
@@ -637,6 +680,19 @@ async fn uv_project_environment_site_packages(
     var: &impl Fn(&str) -> Option<String>,
 ) -> Option<Vec<PathBuf>> {
     let env = var("UV_PROJECT_ENVIRONMENT").filter(|v| !v.trim().is_empty())?;
+    let uv_project = cwd.join("uv.lock").is_file()
+        || (cwd.join("pyproject.toml").is_file() && !claimed_by_non_uv_manager(cwd).await);
+    if !uv_project {
+        return None;
+    }
+    let found = find_site_packages_under(&cwd.join(env), "site-packages").await;
+    (!found.is_empty()).then_some(found)
+}
+
+/// Whether a manager other than uv records or locks the project at `cwd`:
+/// Poetry, PDM or Pipenv files, or a lockless Poetry (`[tool.poetry]`) or
+/// PDM project.
+async fn claimed_by_non_uv_manager(cwd: &Path) -> bool {
     let other_lock = [
         "poetry.lock",
         "poetry.toml",
@@ -647,19 +703,34 @@ async fn uv_project_environment_site_packages(
     ]
     .iter()
     .any(|marker| cwd.join(marker).exists());
-    // A lockless Poetry (`[tool.poetry]`) or PDM project is still theirs.
-    let other_manager = other_lock
+    other_lock
         || is_pdm_project(cwd).await
         || read_regular_to_string(&cwd.join("pyproject.toml"))
             .await
-            .is_ok_and(|text| text.contains("[tool.poetry"));
-    let uv_project =
-        cwd.join("uv.lock").is_file() || (cwd.join("pyproject.toml").is_file() && !other_manager);
-    if !uv_project {
-        return None;
+            .is_ok_and(|text| text.contains("[tool.poetry"))
+}
+
+/// Whether only uv installs for `cwd`, so its env is only ever uv's own: a
+/// `uv.lock` no other manager shares (uv syncs it into `./.venv` or
+/// `UV_PROJECT_ENVIRONMENT`), or a directory whose only Python markers are
+/// PEP 723 script locks (`*.py.lock`, whose envs live in uv's cache).
+async fn uv_owns_project_env(cwd: &Path) -> bool {
+    if claimed_by_non_uv_manager(cwd).await {
+        return false;
     }
-    let found = find_site_packages_under(&cwd.join(env), "site-packages").await;
-    (!found.is_empty()).then_some(found)
+    if cwd.join("uv.lock").is_file() {
+        return true;
+    }
+    let other_marker = [
+        "pyproject.toml",
+        "setup.py",
+        "setup.cfg",
+        "requirements.txt",
+    ]
+    .iter()
+    .any(|marker| cwd.join(marker).exists());
+    let locks = crate::utils::python_lock::python_lock_paths(cwd).unwrap_or_default();
+    !other_marker && !locks.is_empty() && locks.iter().all(|name| name.ends_with(".py.lock"))
 }
 
 /// Whether `cwd` is a Pipenv project: a `Pipfile` or a `Pipfile.lock`.
@@ -3023,15 +3094,15 @@ impl PythonCrawler {
     ///      `.venv`, and `venv` directories, then Poetry's and Pipenv's
     ///      out-of-tree virtualenvs.
     ///   2. If no venv was found AND the cwd looks like a Python
-    ///      project (see `is_python_project`) that is not a Pipenv
-    ///      project (whose env is only ever Pipenv's own), fall through
+    ///      project (see `is_python_project`) whose env is not only ever
+    ///      Pipenv's own (`is_pipenv_project`) or uv's own (see
+    ///      `uv_owns_project_env`), fall through
     ///      to `get_global_python_site_packages`. This mirrors the
     ///      cargo / ruby / go pattern where a project marker
     ///      indicates "scan this ecosystem globally for this project".
     ///
-    /// Without the marker fallback, a fresh clone with
-    /// `pyproject.toml` + `uv.lock` but no `.venv` would silently
-    /// return zero packages.
+    /// A fresh uv clone (`uv.lock`, no `.venv` yet) returns nothing:
+    /// its lock-only packages come from `uv.lock` instead.
     pub async fn get_site_packages_paths(
         &self,
         options: &CrawlerOptions,
@@ -3051,6 +3122,12 @@ impl PythonCrawler {
         // installed for the project, and its lock-only packages come from
         // `Pipfile.lock`; the OS Python is never its env (#504, #947).
         if is_pipenv_project(&options.cwd) {
+            return Ok(Vec::new());
+        }
+        // A uv project or script lock installs only into uv's own env. With
+        // none synced yet nothing is installed for it, and its lock-only
+        // packages come from the lock; the OS Python is never its env (#964).
+        if uv_owns_project_env(&options.cwd).await {
             return Ok(Vec::new());
         }
         if is_python_project(&options.cwd).await {
@@ -3409,6 +3486,99 @@ mod tests {
                 .find(|(k, _)| k == name)
                 .map(|(_, v)| v.clone())
         }
+    }
+
+    /// #335: Hatch keeps a project's envs out of tree, under
+    /// `<data dir>/env/virtual/<name>/<id>/<env>`, and never uses `./.venv`
+    /// for them. Every existing env is the project's (stale-install probes,
+    /// VEX's installed basis and agent mode see them all), alongside a
+    /// `./.venv` another tool made.
+    #[tokio::test]
+    async fn hatch_out_of_tree_envs_are_project_envs() {
+        let tmp = tempfile::tempdir().unwrap();
+        let project = tmp.path().join("app");
+        std::fs::create_dir_all(&project).unwrap();
+        std::fs::write(
+            project.join("pyproject.toml"),
+            "[build-system]\nrequires = [\"hatchling\"]\nbuild-backend = \"hatchling.build\"\n\n[project]\nname = \"app\"\nversion = \"0.1.0\"\ndependencies = [\"six==1.16.0\"]\n",
+        )
+        .unwrap();
+        let data = tmp.path().join("hatch-data");
+        let var = env_of(&[
+            ("HATCH_DATA_DIR", data.to_string_lossy().into_owned()),
+            (
+                "HOME",
+                tmp.path().join("home").to_string_lossy().into_owned(),
+            ),
+        ]);
+        assert!(find_local_venv_site_packages_with(&project, &var)
+            .await
+            .is_empty());
+
+        let envs = super::super::hatch_env::hatch_environments_with(&project, &var).await;
+        assert!(envs.is_empty());
+        let storage_root = data.join("env").join("virtual").join("app");
+        // Hatch's own id for the project root, whichever casefolding applies.
+        let real = std::fs::canonicalize(&project).unwrap();
+        let mut sites = Vec::new();
+        for id in super::super::hatch_env::project_ids_for_tests(&real) {
+            let (_, site) = fake_venv_root(&storage_root.join(&id).join("app"));
+            sites.push(site);
+        }
+        let found = find_local_venv_site_packages_with(&project, &var).await;
+        assert!(!found.is_empty());
+        assert!(found.iter().all(|s| sites.contains(s)), "{found:?}");
+
+        // An activated venv that is not Hatch's does not hide them.
+        let other = tempfile::tempdir().unwrap();
+        let activated_site = fake_venv(other.path(), "tool-venv");
+        let mut activated = vec![(
+            "VIRTUAL_ENV",
+            other
+                .path()
+                .join("tool-venv")
+                .to_string_lossy()
+                .into_owned(),
+        )];
+        activated.push(("HATCH_DATA_DIR", data.to_string_lossy().into_owned()));
+        activated.push((
+            "HOME",
+            tmp.path().join("home").to_string_lossy().into_owned(),
+        ));
+        let found = find_local_venv_site_packages_with(&project, &env_of(&activated)).await;
+        assert_eq!(found.first(), Some(&activated_site), "{found:?}");
+        assert!(found.iter().any(|s| sites.contains(s)), "{found:?}");
+
+        // Nor does a `UV_PROJECT_ENVIRONMENT` venv (a Hatch project's
+        // pyproject alone makes it a uv project).
+        let uv_env = tmp.path().join("uv-env");
+        let uv_site = fake_venv(&uv_env, "venv");
+        let uv_vars = env_of(&[
+            (
+                "UV_PROJECT_ENVIRONMENT",
+                uv_env.join("venv").to_string_lossy().into_owned(),
+            ),
+            ("HATCH_DATA_DIR", data.to_string_lossy().into_owned()),
+            (
+                "HOME",
+                tmp.path().join("home").to_string_lossy().into_owned(),
+            ),
+        ]);
+        let found = find_local_venv_site_packages_with(&project, &uv_vars).await;
+        assert_eq!(found.first(), Some(&uv_site), "{found:?}");
+        assert!(found.iter().any(|s| sites.contains(s)), "{found:?}");
+
+        // Nor does Pipenv's own resolution (a `Pipfile` beside pyproject).
+        std::fs::write(project.join("Pipfile"), "[packages]\n").unwrap();
+        let found = find_local_venv_site_packages_with(&project, &var).await;
+        assert!(found.iter().any(|s| sites.contains(s)), "{found:?}");
+        std::fs::remove_file(project.join("Pipfile")).unwrap();
+
+        // A `./.venv` beside them is kept too.
+        let dot = fake_venv(&project, ".venv");
+        let found = find_local_venv_site_packages_with(&project, &var).await;
+        assert!(found.contains(&dot));
+        assert!(found.iter().any(|s| sites.contains(s)));
     }
 
     /// #502: PDM installs into the interpreter saved in `.pdm-python` (an
