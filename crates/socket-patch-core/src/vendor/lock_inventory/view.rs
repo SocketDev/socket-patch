@@ -474,6 +474,38 @@ mod tests {
                 .0,
             "vendor_yarn_berry_unsupported"
         );
+        // The pnpm-PnP carve-out is shared with disk: a `.pnp.cjs` over an
+        // installed pnpm store (either marker) is pnpm's PnP linker, not
+        // yarn berry.
+        for marker in ["node_modules/.modules.yaml", "node_modules/.pnpm/lock.yaml"] {
+            let pnpm_pnp = project(&[
+                (".pnp.cjs", MemoryEntry::Present),
+                ("pnpm-lock.yaml", text("lockfileVersion: '9.0'\n")),
+                (marker, MemoryEntry::Present),
+            ]);
+            assert_eq!(
+                detect_npm_lock_flavor_in(&ProjectView::Memory(&pnpm_pnp))
+                    .await
+                    .unwrap_err()
+                    .0,
+                "vendor_pnpm_pnp_unsupported",
+                "{marker}"
+            );
+        }
+        // A yarn.lock beside it keeps the yarn berry refusal.
+        let yarn_pnp = project(&[
+            (".pnp.cjs", MemoryEntry::Present),
+            ("pnpm-lock.yaml", text("lockfileVersion: '9.0'\n")),
+            ("yarn.lock", text("")),
+            ("node_modules/.modules.yaml", MemoryEntry::Present),
+        ]);
+        assert_eq!(
+            detect_npm_lock_flavor_in(&ProjectView::Memory(&yarn_pnp))
+                .await
+                .unwrap_err()
+                .0,
+            "vendor_yarn_berry_unsupported"
+        );
         let empty = MemoryProject::new();
         assert_eq!(
             detect_npm_lock_flavor_in(&ProjectView::Memory(&empty))
