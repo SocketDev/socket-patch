@@ -109,12 +109,7 @@ pub(crate) async fn discover_wiring_in(
 
 fn discover_options(common: &crate::args::GlobalArgs) -> socket_patch_core::vex::DiscoverOptions {
     socket_patch_core::vex::DiscoverOptions {
-        patch_server_origins: common
-            .patch_server_url
-            .iter()
-            .filter(|url| !url.trim().is_empty())
-            .cloned()
-            .collect(),
+        patch_server_origins: hosted_unwind::patch_server_origins(common),
     }
 }
 

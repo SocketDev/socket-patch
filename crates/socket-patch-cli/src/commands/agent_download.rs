@@ -800,12 +800,8 @@ pub(crate) async fn lock_text_refusals_for(
     prior: Option<&crate::ecosystem_dispatch::NpmCrawlSnapshot>,
 ) -> LockRefusals {
     let cwd = params.cwd.as_path();
-    let origins: Vec<String> = params
-        .patch_server_url
-        .iter()
-        .filter(|url| !url.trim().is_empty())
-        .cloned()
-        .collect();
+    let origins =
+        crate::commands::hosted_unwind::patch_server_origins_of(params.patch_server_url.as_deref());
     let pins = socket_patch_core::patch::redirect::upstream::HostedPin::all(
         &socket_patch_core::vex::discover_patched_refs_with(
             cwd,

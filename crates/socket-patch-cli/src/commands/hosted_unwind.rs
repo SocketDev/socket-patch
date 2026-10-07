@@ -21,11 +21,16 @@ pub(crate) struct HostedLegOutcome {
 /// The patch-server origins that count as hosted, besides Socket's own:
 /// the operator's `--patch-server-url` (discovery's allowlist).
 pub(crate) fn patch_server_origins(common: &GlobalArgs) -> Vec<String> {
-    common
-        .patch_server_url
-        .iter()
+    patch_server_origins_of(common.patch_server_url.as_deref())
+}
+
+/// [`patch_server_origins`] from the `--patch-server-url` value itself, for
+/// callers that carry it outside a [`GlobalArgs`].
+pub(crate) fn patch_server_origins_of(patch_server_url: Option<&str>) -> Vec<String> {
+    patch_server_url
+        .into_iter()
         .filter(|url| !url.trim().is_empty())
-        .cloned()
+        .map(str::to_string)
         .collect()
 }
 
