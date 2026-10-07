@@ -154,6 +154,17 @@ pub(crate) fn resolution_selector_target(selector: &str) -> Option<&str> {
     (!name.is_empty() && name != "**").then_some(name)
 }
 
+/// The package a berry `npm:<name>@<range>` alias range installs: `None`
+/// for a plain `npm:<range>` (no alias, the descriptor's own package) or
+/// any other protocol. Unlike [`pattern_real_name`], which answers for a
+/// whole classic key pattern and reads a bare `npm:<name>` with no range as
+/// an alias of `<name>`, this reads only the range, so a plain berry
+/// `npm:^1` registry range is never mistaken for an alias target.
+pub(crate) fn berry_npm_alias_target(range: &str) -> Option<&str> {
+    let body = range.strip_prefix("npm:")?;
+    split_pattern(body).map(|(real, _)| real)
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;

@@ -350,7 +350,7 @@ pub(crate) async fn restore_yarn_locks(
         let Some(raw) = read_or_refuse(view, rel, &pins, &mut result).await else {
             continue;
         };
-        if super::super::is_berry_lock(&raw) {
+        if crate::formats::yarn::is_berry_lock(&raw) {
             restore_berry(view, rel, &raw, &pins, ctx, &mut result).await;
         } else {
             restore_classic(view, rel, &raw, &pins, ctx, &mut result).await;
@@ -368,14 +368,15 @@ async fn restore_classic(
     result: &mut FormatResult,
 ) {
     use crate::formats::yarn::blocks::{
-        block_eol, classic_field, repin_classic_block, replace_block, scan_blocks,
+        block_eol, classic_field, classic_line_endings_supported, repin_classic_block,
+        replace_block, scan_blocks,
     };
     use crate::formats::yarn::patterns::{classic_key_real_name, split_key_patterns};
     use crate::formats::yarn::source::{classic_copy_source, CopySource};
 
     // The same byte splice as the hosted rewriter (see
-    // [`super::super::classic_line_endings_supported`]).
-    if !super::super::classic_line_endings_supported(raw) {
+    // [`classic_line_endings_supported`]).
+    if !classic_line_endings_supported(raw) {
         refuse_all_in(
             pins,
             rel,

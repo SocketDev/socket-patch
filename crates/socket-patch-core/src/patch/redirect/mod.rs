@@ -55,22 +55,25 @@ use crate::formats::composer::hosted::rewrite_composer_lock;
 use crate::formats::gem::gemfile;
 use crate::formats::gem::hosted::{checksum_entry_span, converge_gem_lock_source};
 use crate::formats::gem::lock_lists_direct_dependency;
-pub(crate) use crate::formats::yarn::is_berry_lock;
 use crate::formats::cargo::hosted::CargoLockPlan;
 #[cfg(test)]
 use crate::formats::cargo::hosted::CARGO_LOCK_REFERENCE_KIND;
 #[cfg(test)]
 use crate::formats::pnpm::hosted::pnpm_unrewritten_instances;
 use crate::formats::yarn::berry_entry::{manifest_bin, render_pinned_entry, Pin};
+#[cfg(test)]
+use crate::formats::yarn::blocks::berry_bin_entries;
 use crate::formats::yarn::blocks::{
-    berry_field, block_eol, classic_field, is_body_field, repin_classic_block,
-    replace_block, scan_blocks, LockBlock,
+    berry_field, berry_lock_locks, block_eol, classic_field, classic_line_endings_supported,
+    repin_classic_block, replace_block, scan_blocks, LockBlock,
 };
+use crate::formats::yarn::is_berry_lock;
 use crate::formats::yarn::patterns::{
-    classic_key_real_name, split_berry_key_patterns, split_key_patterns, split_pattern,
+    berry_npm_alias_target, classic_key_real_name, split_berry_key_patterns, split_key_patterns,
+    split_pattern,
 };
-use crate::formats::yarn::stanzas::{stanza_key, BerryStanzas};
 use crate::formats::yarn::source::{classic_copy_source, CopySource};
+use crate::formats::yarn::stanzas::{stanza_key, BerryStanzas};
 #[cfg(test)]
 mod pnpm_equivalence_tests;
 #[cfg(test)]
@@ -3691,17 +3694,6 @@ fn classic_block_head(key: &str) -> (Vec<String>, Option<String>) {
     (patterns, real_name)
 }
 
-/// Whether the hosted classic writers (rewrite and restore) can splice
-/// `lock`: every `\r` is part of a `\r\n` line break. CRLF, LF and a mix of
-/// the two all splice byte-exactly; a bare `\r` does not.
-pub(crate) fn classic_line_endings_supported(lock: &str) -> bool {
-    let bytes = lock.as_bytes();
-    bytes
-        .iter()
-        .enumerate()
-        .all(|(i, &b)| b != b'\r' || bytes.get(i + 1) == Some(&b'\n'))
-}
-
 // ── yarn.lock (berry / v2+) ──────────────────────────────────────────────────
 // Berry fetches each package from its lock entry's `resolution:` locator and
 // verifies the CONVERTED CACHE ZIP against the lock's `checksum:` (a
@@ -4283,31 +4275,6 @@ fn rewrite_yarn_berry_with_manifests(
     }
 }
 
-/// Whether a berry lock holds an entry for `name` at `version`, under any
-/// descriptor (npm, tarball, `patch:`, …).
-fn berry_lock_locks(lock: &str, name: &str, version: &str) -> bool {
-    scan_blocks(lock).iter().any(|block| {
-        block.key != "__metadata"
-            && berry_field(&block.lines, "version") == Some(version)
-            && split_berry_key_patterns(&block.key).iter().any(|p| {
-                split_pattern(p).is_some_and(|(n, range)| {
-                    n == name && berry_npm_alias_target(range).is_none_or(|real| real == name)
-                })
-            })
-    })
-}
-
-/// The entries of the berry lock `lock` that carry a `bin:` map: the only
-/// ones whose pin needs the served tarball's own package.json (#718).
-/// Scanned once per lock, so the per-dep check in
-/// [`berry_pin_needs_manifest`] only walks these (usually none).
-pub(crate) fn berry_bin_entries(lock: &str) -> Vec<LockBlock> {
-    scan_blocks(lock)
-        .into_iter()
-        .filter(|block| block.lines.iter().skip(1).any(|l| is_body_field(l, "bin")))
-        .collect()
-}
-
 /// Whether the berry hosted pin of `dep` would re-key one of `bin_entries`
 /// (see [`berry_bin_entries`]): an entry of the package version whose
 /// descriptors all name the package through a plain (non-fork) `npm:`
@@ -4337,13 +4304,6 @@ pub(crate) fn berry_pin_needs_manifest(bin_entries: &[LockBlock], dep: &DepOverr
                 })
             })
     })
-}
-
-/// The package an `npm:<name>@<range>` alias range installs (`None` for a
-/// plain `npm:<range>` or any other protocol).
-fn berry_npm_alias_target(range: &str) -> Option<&str> {
-    let body = range.strip_prefix("npm:")?;
-    split_pattern(body).map(|(real, _)| real)
 }
 
 /// The root manifest the yarn berry hosted pin edits.

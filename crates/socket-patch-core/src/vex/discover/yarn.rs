@@ -95,7 +95,7 @@ use crate::formats::yarn::patterns::{
     BerryLocator,
 };
 use crate::formats::yarn::source::{classic_copy_source, CopySource};
-use crate::patch::redirect::is_berry_lock;
+use crate::formats::yarn::is_berry_lock;
 use crate::utils::digest::is_sri_pin;
 use crate::vendor::lock_inventory::yarn::{
     berry_checksum_pin, berry_entries, classic_entries, BerryLock, YarnEntry,

@@ -6,6 +6,7 @@
 //! fields with [`classic_field`] / [`berry_field`], so they cannot drift
 //! apart on what a block, a key or a field is.
 
+use super::patterns::{berry_npm_alias_target, split_berry_key_patterns, split_pattern};
 use crate::vendor::common::detect_eol;
 
 /// One key-line block of a yarn lockfile (classic or berry).
@@ -237,6 +238,42 @@ pub(crate) fn berry_field<'a, S: AsRef<str>>(lines: &'a [S], field: &str) -> Opt
 /// The lock's exact `__metadata` block (its `version` / `cacheKey` header).
 pub(crate) fn berry_metadata(blocks: &[LockBlock]) -> Option<&LockBlock> {
     blocks.iter().find(|b| b.key == "__metadata")
+}
+
+/// Whether the hosted classic writers (rewrite and restore) can splice
+/// `lock`: every `\r` is part of a `\r\n` line break. CRLF, LF and a mix of
+/// the two all splice byte-exactly; a bare `\r` does not.
+pub(crate) fn classic_line_endings_supported(lock: &str) -> bool {
+    let bytes = lock.as_bytes();
+    bytes
+        .iter()
+        .enumerate()
+        .all(|(i, &b)| b != b'\r' || bytes.get(i + 1) == Some(&b'\n'))
+}
+
+/// Whether a berry lock holds an entry for `name` at `version`, under any
+/// descriptor (npm, tarball, `patch:`, …).
+pub(crate) fn berry_lock_locks(lock: &str, name: &str, version: &str) -> bool {
+    scan_blocks(lock).iter().any(|block| {
+        block.key != "__metadata"
+            && berry_field(&block.lines, "version") == Some(version)
+            && split_berry_key_patterns(&block.key).iter().any(|p| {
+                split_pattern(p).is_some_and(|(n, range)| {
+                    n == name && berry_npm_alias_target(range).is_none_or(|real| real == name)
+                })
+            })
+    })
+}
+
+/// The entries of the berry lock `lock` that carry a `bin:` map: the only
+/// ones whose pin needs the served tarball's own package.json (#718).
+/// Scanned once per lock, so the per-dep check in
+/// [`berry_pin_needs_manifest`] only walks these (usually none).
+pub(crate) fn berry_bin_entries(lock: &str) -> Vec<LockBlock> {
+    scan_blocks(lock)
+        .into_iter()
+        .filter(|block| block.lines.iter().skip(1).any(|l| is_body_field(l, "bin")))
+        .collect()
 }
 
 #[cfg(test)]
