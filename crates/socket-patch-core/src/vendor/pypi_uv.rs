@@ -371,7 +371,8 @@ pub(super) fn check_target_guards(
             let detail = if path.contains(".socket/vendor/pypi/") {
                 format!(
                     "[tool.uv.sources] already routes {key} to a socket-patch vendored wheel; \
-                     run `socket-patch vendor --revert` before re-vendoring"
+                     {remedy}",
+                    remedy = super::common::REVERT_ALL_AND_REVENDOR,
                 )
             } else {
                 format!(
@@ -6283,7 +6284,7 @@ six = { path = ".socket/vendor/pypi/9f6b2c4e-1d3a-4f6b-8c2d-7e5a9b1c3d5f/six-1.1
     /// renames over it: a symlinked pyproject.toml / uv.lock would be
     /// REPLACED by a regular file (target left stale, git shows a
     /// typechange). Wire refuses before ANY write with
-    /// `pypi_uv_symlink_unsupported` naming the file; revert keeps the
+    /// `redirect_symlinked_file_unsupported` naming the file; revert keeps the
     /// artifact and fails. The link stays a link, its target keeps its bytes,
     /// and nothing under `.socket/` appears.
     #[cfg(unix)]

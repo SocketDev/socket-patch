@@ -5,7 +5,7 @@ use std::sync::Arc;
 use toml_edit::{DocumentMut, Item, Table, TableLike, Value};
 
 use crate::crawlers::python_crawler::canonicalize_pypi_name;
-use crate::utils::fs::{atomic_write_bytes_preserving_mode, first_symlink, read_regular_to_string};
+use crate::utils::fs::{atomic_write_bytes_preserving_mode, read_regular_to_string};
 use crate::utils::python_lock::{
     is_python_lock_name, python_lock_paths, rewrite_python_lock, script_of_lock, ArtifactSource,
 };
@@ -13,7 +13,7 @@ use crate::utils::python_script::{
     replace_script_metadata, rewrite_script_metadata, script_metadata,
 };
 
-use super::common::record;
+use super::common::{record, refuse_symlinked};
 use super::parse_memo::ParseMemo;
 use super::state::{VendorEntry, WiringAction, WiringRecord};
 use super::{RevertOutcome, VendorWarning};
@@ -52,21 +52,6 @@ async fn read_file(path: &Path) -> Result<String, Failure> {
             },
         )
     })
-}
-
-/// Every writer here stages a replacement next to `file` and renames over
-/// it, which REPLACES a symlink with a regular file: the link target goes
-/// stale (uv itself writes through the link), and a later revert restores
-/// bytes but never the link (git shows a 120000→100644 typechange). Refuse
-/// before the first write instead — same fail-closed policy (and the same
-/// refusal) as the hosted replay flush guard.
-async fn refuse_symlinked(
-    root: &Path,
-    files: impl Iterator<Item = &String>,
-) -> Option<(&'static str, String)> {
-    first_symlink(root, files.map(String::as_str))
-        .await
-        .map(super::common::symlink_refusal)
 }
 
 /// The run's PEP 751 / script-lock parses. Both readers below would
@@ -339,9 +324,10 @@ pub(super) async fn wire_python_locks(
             edits.push((file.name.clone(), file.text.clone(), rewritten, KIND));
         }
     }
-    if let Some(refusal) = refuse_symlinked(root, edits.iter().map(|(file, ..)| file)).await {
-        return Err(refusal);
-    }
+    // Every writer here stages a replacement and renames over the path,
+    // which would REPLACE a linked lock with a regular file: refuse first.
+    let files: Vec<&str> = edits.iter().map(|(file, ..)| file.as_str()).collect();
+    refuse_symlinked(root, &files).await?;
     for (file, original, _, _) in &edits {
         if read_file(&root.join(file)).await? != *original {
             return Err((
@@ -810,8 +796,8 @@ pub(super) async fn revert_python_locks(
         // A refused write fails the revert outright: the artifact and the
         // ledger entry stay so the restore can be retried once the link is
         // a regular file again.
-        if let Some((_, detail)) = refuse_symlinked(root, edits.iter().map(|(file, ..)| file)).await
-        {
+        let files: Vec<&str> = edits.iter().map(|(file, ..)| file.as_str()).collect();
+        if let Err((_, detail)) = refuse_symlinked(root, &files).await {
             return RevertOutcome::failed(detail);
         }
         for (file, original, _) in &edits {
