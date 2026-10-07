@@ -139,10 +139,19 @@ The backticked slug in each row is the value `-e`/`--ecosystems` accepts (e.g.
   `github:owner/repo`, which yarn locks to a GitHub codeload tarball) is the project's
   own artifact, not the registry package the patch is built for. Hosted and vendored
   modes both pin to Socket's build of the registry package, so they leave such an
-  entry untouched (`redirect_yarn_classic_non_registry_skipped` /
+  entry untouched (`redirect_yarn_classic_non_registry_entry_skipped` /
   `vendor_yarn_classic_non_registry_entry_skipped`) and that copy stays unpatched;
   rollback refuses a hosted pin an older release wrote on one, since its original
-  `resolved` was never recorded.
+  `resolved` was never recorded. Such a copy an older release already pinned installs
+  Socket's build, not an unpatched one: a hosted re-run names it
+  (`redirect_yarn_classic_non_registry_legacy_pin`, restore `yarn.lock` from version
+  control to undo it), and a vendored re-run keeps the existing wiring in sync and names
+  it (`vendor_yarn_classic_non_registry_legacy_wiring`, undone by `vendor --revert`).
+- **yarn classic entries with no `resolved`** — a registry entry with no `resolved`
+  line is a stale lock with no tarball to repoint; `yarn install` re-locks it from the
+  registry. Hosted mode leaves it untouched and names it
+  (`redirect_yarn_classic_unresolved_entry_skipped`); vendored mode skips it
+  (`vendor_link_entry_skipped`).
 - **yarn classic `file:` directory dependencies** — yarn 1 copies a `file:` directory
   (an entry with no `resolved` tarball) into `node_modules`, so no lock rewrite reaches
   that copy. Hosted and vendored modes leave the entry untouched

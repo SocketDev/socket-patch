@@ -331,6 +331,13 @@ fn rewritable_candidates(
                     detail,
                 ));
             }
+            BlockClass::LegacyWired(detail) => {
+                candidate_keys.push(block.key.clone());
+                skipped.push(VendorWarning::new(
+                    "vendor_yarn_classic_non_registry_legacy_wiring",
+                    detail,
+                ));
+            }
             BlockClass::NoMatch => {}
         }
     }
@@ -715,6 +722,10 @@ enum BlockClass {
     /// Matches the target but installs a non-registry tarball (B16);
     /// carries the warning detail.
     RemoteSkip(String),
+    /// A non-registry copy an older release already wired into
+    /// `.socket/vendor/` (B16 upgrade state): kept as a candidate so an
+    /// in-sync re-run stays a no-op, but named; carries the warning detail.
+    LegacyWired(String),
     NoMatch,
 }
 
@@ -738,6 +749,18 @@ fn classify_classic_block(block: &LockBlock, name: &str, version: &str) -> Block
         // The vendored tarball is the patch service's build of the REGISTRY
         // package (B16): wiring a fork, local build or hosted-git copy to it
         // would swap the user's code for registry bytes.
+        // Checked before the copy-source refusal: a block whose `resolved`
+        // is already ours installs the vendored build, not the user's own
+        // artifact, and its original is in the ledger for `vendor --revert`.
+        CopySource::RemoteTarball if block_points_into_vendor(&block.lines) => {
+            BlockClass::LegacyWired(format!(
+                "lock block `{}` is a file: tarball, URL or hosted-git dependency that an \
+                 older release wired to the vendored registry build of {name}@{version}, so \
+                 it installs that build rather than your own; `socket-patch vendor --revert` \
+                 restores its original source",
+                block.key
+            ))
+        }
         CopySource::RemoteTarball => BlockClass::RemoteSkip(format!(
             "lock block `{}` installs from a tarball that is not the registry's (a \
              file: tarball, URL or hosted-git dependency), and the vendored artifact is \
@@ -1460,6 +1483,47 @@ left-pad@^1.3.0:
             tgz_first,
             "tarball byte-identical across re-runs"
         );
+    }
+
+    /// B16 upgrade state: an older release wired a URL-keyed fork block
+    /// into `.socket/vendor/`. That block is ours, so an in-sync re-run
+    /// stays a byte-stable no-op (not `vendor_lock_entry_not_rewritable`,
+    /// and never "stays UNPATCHED"), and the legacy wiring is named with
+    /// the way back.
+    #[tokio::test]
+    async fn legacy_wired_non_registry_copy_rerun_is_in_sync_and_named() {
+        let fx = fixture_with_lock(Y2_BEFORE).await;
+        expect_done(fx.vendor(false).await);
+        let wired = fx.lock_text().await;
+        let legacy = wired.replacen(
+            "left-pad@^1.3.0:",
+            "\"left-pad@https://host.test/fork/left-pad-1.3.0.tgz\":",
+            1,
+        );
+        assert_ne!(legacy, wired, "fixture re-keys the wired block");
+        tokio::fs::write(fx.lock_path(), &legacy).await.unwrap();
+
+        let (result, entry, warnings) = expect_done(fx.vendor(false).await);
+        assert!(result.success, "{:?}", result.error);
+        assert!(entry.is_none(), "in sync: no new ledger entry");
+        let codes: Vec<&str> = warnings
+            .iter()
+            .map(|w| w.code)
+            .filter(|&c| c != "vendor_prebuilt_downloaded")
+            .collect();
+        assert_eq!(codes, ["vendor_yarn_classic_non_registry_legacy_wiring"]);
+        let detail = &warnings
+            .iter()
+            .find(|w| w.code == codes[0])
+            .unwrap()
+            .detail;
+        assert!(
+            detail.contains("host.test/fork")
+                && detail.contains("vendor --revert")
+                && !detail.contains("UNPATCHED"),
+            "{detail}"
+        );
+        assert_eq!(fx.lock_text().await, legacy, "lock byte-stable");
     }
 
     #[tokio::test]
