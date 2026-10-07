@@ -854,7 +854,7 @@ impl Collector<'_> {
             self.unresolved(rel, 0, Site::Script, Reason::TooLarge, String::new());
             return None;
         }
-        Some(dsl::strip_bom(&text).to_string())
+        Some(crate::formats::text::strip_bom(&text).to_string())
     }
 
     /// The Groovy (preferred, as Gradle does) or Kotlin `<stem>` script of
@@ -1185,7 +1185,7 @@ impl ScriptGraph {
                 continue;
             }
             c.files += 1;
-            let text = dsl::strip_bom(text).to_string();
+            let text = crate::formats::text::strip_bom(text).to_string();
             let dsl = dsl::dsl_of(tag).unwrap_or(Dsl::Groovy);
             if !dsl::well_formed(&text, dsl) {
                 c.graph.init_unparseable.push(tag.clone());
@@ -1414,7 +1414,7 @@ pub fn subproject_owner(
             problems.push(issue(Reason::TooLarge));
             return None;
         }
-        let text = dsl::strip_bom(&text).to_string();
+        let text = crate::formats::text::strip_bom(&text).to_string();
         let dsl = dsl::dsl_of(r).unwrap_or(Dsl::Groovy);
         if !dsl::well_formed(&text, dsl) {
             problems.push(issue(Reason::Unparseable));
@@ -1451,16 +1451,18 @@ pub fn subproject_owner(
 /// `gradle/wrapper/gradle-wrapper.properties`.
 pub fn wrapper_version(read: TextReadFn<'_>, root: &str) -> Option<(u32, u32, u32)> {
     let text = read(&join_rel(root, "gradle/wrapper/gradle-wrapper.properties"))?;
-    let url = dsl::strip_bom(&text).lines().find_map(|line| {
-        let line = line.trim_start();
-        let rest = line.strip_prefix("distributionUrl")?;
-        let rest = rest.trim_start();
-        let rest = rest
-            .strip_prefix('=')
-            .or_else(|| rest.strip_prefix(':'))
-            .unwrap_or(rest);
-        Some(rest.trim().replace('\\', ""))
-    })?;
+    let url = crate::formats::text::strip_bom(&text)
+        .lines()
+        .find_map(|line| {
+            let line = line.trim_start();
+            let rest = line.strip_prefix("distributionUrl")?;
+            let rest = rest.trim_start();
+            let rest = rest
+                .strip_prefix('=')
+                .or_else(|| rest.strip_prefix(':'))
+                .unwrap_or(rest);
+            Some(rest.trim().replace('\\', ""))
+        })?;
     let re = regex::Regex::new(r"gradle-(\d+)\.(\d+)(?:\.(\d+))?").ok()?;
     let caps = re.captures(&url)?;
     Some((

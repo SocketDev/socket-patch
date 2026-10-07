@@ -469,7 +469,7 @@ impl GradleFiles {
 
     fn read(&self, rel: &str, misses: &std::cell::RefCell<BTreeSet<String>>) -> Option<String> {
         if let Some(t) = self.files.get(rel) {
-            return Some(dsl::strip_bom(t).to_string());
+            return Some(crate::formats::text::strip_bom(t).to_string());
         }
         if !self.absent.contains(rel) {
             misses.borrow_mut().insert(rel.to_string());
@@ -637,7 +637,11 @@ fn key_list(files: &BTreeMap<String, String>, dir: &str) -> Vec<String> {
 /// The script graph of the build `files` holds (BOMs stripped for the
 /// tokenizer).
 pub fn graph_of(files: &BTreeMap<String, String>) -> ScriptGraph {
-    let read = |rel: &str| files.get(rel).map(|t| dsl::strip_bom(t).to_string());
+    let read = |rel: &str| {
+        files
+            .get(rel)
+            .map(|t| crate::formats::text::strip_bom(t).to_string())
+    };
     let list = |dir: &str| key_list(files, dir);
     ScriptGraph::collect(&read, &list, "", &[])
 }
@@ -694,7 +698,11 @@ fn project_refusal(
     graph: &ScriptGraph,
     index: &Result<Vec<HostedRow>, String>,
 ) -> Option<Refusal> {
-    let read = |rel: &str| files.get(rel).map(|t| dsl::strip_bom(t).to_string());
+    let read = |rel: &str| {
+        files
+            .get(rel)
+            .map(|t| crate::formats::text::strip_bom(t).to_string())
+    };
     if let Some((maj, min, patch)) = wrapper_version(&read, "") {
         if (maj, min) < (6, 8) {
             return Some(refusal(
