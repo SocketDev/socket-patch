@@ -4183,16 +4183,39 @@ pub(crate) struct VendorGcSummary {
     /// "manifest_write_failed", <detail>)`. The reverts themselves already
     /// happened on disk; the stale record is what the caller must report.
     pub write_failures: Vec<(&'static str, String)>,
-    /// The wet reverts' backend advisories (`code`, `detail`), e.g. Bun's
-    /// `vendor_bun_reinstall_required` (#764): every other reverting
-    /// command surfaces these, and the GC must not drop them.
+    /// The wet reverts' reinstall advisories (`code`, `detail`): Bun's
+    /// `vendor_bun_reinstall_required` (#764) and vlt's
+    /// `vendor_vlt_reinstall_required`. Every other reverting command
+    /// surfaces these, and the GC must not drop them.
     pub advisories: Vec<(&'static str, String)>,
 }
 
+/// The revert warnings `scan --prune` forwards into `gc.warnings[]`: only
+/// the "the installed tree still holds the vendored copy" advisories. The
+/// revert's other warnings are routine for a prune and stay out:
+/// `vendor_lock_entry_removed` is the normal leg-(b) case (the dependency
+/// was uninstalled), and a drift keep is already reported through
+/// `keptVendoredEntries` and its own `GC: kept …` line.
+const GC_FORWARDED_ADVISORIES: &[&str] = &[
+    socket_patch_core::vendor::bun_lock::REINSTALL_REQUIRED,
+    socket_patch_core::vendor::vlt_lock::REINSTALL_REQUIRED,
+];
+
 impl VendorGcSummary {
+    /// Keep a revert's reinstall advisories. Only a revert that actually
+    /// restored the lock (succeeded, not drift-kept) can leave a stale
+    /// installed copy behind.
     fn take_advisories(&mut self, outcome: &RevertOutcome) {
-        self.advisories
-            .extend(outcome.warnings.iter().map(|w| (w.code, w.detail.clone())));
+        if !outcome.success || outcome.kept_artifact {
+            return;
+        }
+        self.advisories.extend(
+            outcome
+                .warnings
+                .iter()
+                .filter(|w| GC_FORWARDED_ADVISORIES.contains(&w.code))
+                .map(|w| (w.code, w.detail.clone())),
+        );
     }
 }
 

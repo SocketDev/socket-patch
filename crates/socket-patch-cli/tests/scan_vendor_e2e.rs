@@ -1114,6 +1114,13 @@ async fn scan_prune_reverts_unused_vendored_entry() {
         serde_json::json!([]),
         "nothing resolves through the artifact, so nothing is kept: {v}"
     );
+    // The revert warns `vendor_lock_entry_removed` (nothing to restore):
+    // routine for a prune of an uninstalled dependency, so it is not a
+    // gc warning.
+    assert!(
+        v["gc"].get("warnings").is_none(),
+        "a routine prune adds no gc warning: {v}"
+    );
 
     // Ledger empty (an emptied state file is removed outright), artifact
     // gone.
