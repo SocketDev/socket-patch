@@ -2,7 +2,7 @@
 
 ## Part 5: Vendored mode and the non-JS backends
 
-_Last checked against main @ 9c43dfc on 2026-10-06 by audit-ecosystems (5.2 ecosystem enumeration sites and dispatch re-checked at `9c43dfc`; the vendored-reference scan's file list re-checked at `9c43dfc`; 5.4 Poetry/PDM/Pipenv backend skeleton and Poetry forward splicers re-checked at `9c43dfc`; 5.2 dead `force`/`sources` parameters re-checked at `9c43dfc`; per-backend service-copy and cleanup copies re-checked at `9c43dfc`; 5.4 NuGet, Poetry/PDM and Gem re-checked at `4646693`; as of `045d7ec`: 5.4 Python, Cargo, Maven XML, Gem, Go and CRLF helpers; 5.6 scaffolding; the vendored-reference scan behind repair and the orphan sweeps). Owner: audit-ecosystems._
+_Last checked against main @ 9c43dfc on 2026-10-07 by audit-ecosystems (5.7 JVM backends and the single-module routing re-checked at `9c43dfc`; 5.2 ecosystem enumeration sites and dispatch re-checked at `9c43dfc`; the vendored-reference scan's file list re-checked at `9c43dfc`; 5.4 Poetry/PDM/Pipenv backend skeleton and Poetry forward splicers re-checked at `9c43dfc`; 5.2 dead `force`/`sources` parameters re-checked at `9c43dfc`; per-backend service-copy and cleanup copies re-checked at `9c43dfc`; 5.4 NuGet, Poetry/PDM and Gem re-checked at `4646693`; as of `045d7ec`: 5.4 Python, Cargo, Maven XML, Gem, Go and CRLF helpers; 5.6 scaffolding; the vendored-reference scan behind repair and the orphan sweeps). Owner: audit-ecosystems._
 
 > Scope: `vendor/` framework (`mod`, `common`, `state`, `verify`, `registry_fetch`, `service_fetch`, `prestage`, `reuse`, `redownload`, `ledger_snapshots`, `parse_memo`, `path`, `source`, `toml_surgery`, `lock_inventory`); backends for cargo, gem, pypi (×10 files), golang, composer, nuget, maven and `jvm/`; related `utils/` parsers; and the CLI `vendor.rs` + `vendored_backend/`.
 
@@ -193,11 +193,12 @@ v5 removed local artifact building, but the scaffolding remains:
 ### 5.7 Complexity vs value
 
 - **JVM (7,451 production lines; ~6,300 inline tests; ~1.7K CLI e2e): two backends for one ecosystem.**
-  - The legacy single-POM backend (`maven_repo.rs`) uses whole-file pom snapshots.
-  - The v5 `jvm/*` handles reactor and Gradle builds and is the best-designed code in vendored mode: pure planners over a `ReadFn` that return file writes plus fragment records, with an order-independent unplan.
+  - The legacy single-POM backend (`maven_repo.rs`) uses whole-file pom snapshots and wires the **unsuffixed** GAV through a trailing `<repository>`, so a warm `~/.m2`, an earlier repository or `mirrorOf *` can shadow it (#263, #274, #622; the always-on `vendor_maven_local_cache_shadow` warning).
+  - The v5 `jvm/*` handles reactor and Gradle builds and is the best-designed code in vendored mode: pure planners over a `ReadFn` that return file writes plus fragment records, with an order-independent unplan. Its orchestrator, though (`vendor_maven_jvm`, acquisition, metadata, materialisation; about 1,170 raw lines), lives inside `maven_repo.rs`, and `redownload.rs`, agent-mode `jvm_jar.rs` and VEX import from there.
+  - The planner already plans a single-module pom: `Shape::Mixed` runs `maven_reactor::plan` on one. Only `Detected::shape` mapping a lone single-module pom to `Shape::Other` keeps it on the legacy path. On `9c43dfc`, a lone CRLF single-module pom planned with no warnings, re-planned to nothing and unplanned byte for byte (executed twice).
   - It uses three artifact roots (`.socket/vendor/maven/<uuid>`, `.socket/vendor/maven2`, `.socket/vendor/gradle`) plus `.socket/gradle/` and `gradle-index.tsv`. None of them follows the `<eco>/<uuid>` convention that `path.rs` and the orphan sweep rely on.
   - `--maven-config auto|none` is a *global* CLI flag consumed by one function.
-  - **Merge the two backends** into one planner with a `Shape::Single` variant, drop the `"jvm"` alias, and make `--maven-config` a `vendor`/`scan --mode vendored` flag.
+  - **Merge the two backends** into one planner with a `Shape::Single` variant, drop the `"jvm"` alias, and make `--maven-config` a `vendor`/`scan --mode vendored` flag. The legacy kind stays revert-only. {{E26}}
 - **PyPI's seven flavors** (uv 1,775; requirements 830; pylock 678; pipenv 657; pdm 496; poetry 477; hatch 303; router 1,928 production lines).
   - Each flavor is needed for correctness, but they share no trait.
   - Poetry, pdm and pipenv together are ~1,600 production lines in vendor plus ~1,150 in utils, for what is one pattern: a lock-only per-package splice with guards.
