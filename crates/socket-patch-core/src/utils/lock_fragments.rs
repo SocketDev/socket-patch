@@ -13,6 +13,13 @@ use toml_edit::Table;
 
 use crate::utils::line_endings::majority_terminator;
 
+#[cfg(test)]
+thread_local! {
+    /// Whole-lock renders this thread's rewrites took, each followed by a
+    /// full re-parse: what a hosted rewrite of N deps must not pay N times.
+    pub(crate) static RENDERS: std::cell::Cell<usize> = const { std::cell::Cell::new(0) };
+}
+
 /// Takes `name`'s fragments of `text` from its (spanned) parse.
 pub(crate) type FragmentsIn =
     fn(&toml_edit::Document<String>, &str, &str) -> Result<Vec<String>, String>;
@@ -212,6 +219,8 @@ pub(crate) fn finish<'a>(
     before: Result<Vec<String>, String>,
     fragments_in: FragmentsIn,
 ) -> Result<FragmentRewrite<'a>, String> {
+    #[cfg(test)]
+    RENDERS.with(|renders| renders.set(renders.get() + 1));
     let before = before?;
     let rendered = crate::utils::python_lock::preserve_line_endings(text, rendered);
     let after_doc = toml_edit::Document::parse(rendered).map_err(|e| e.to_string())?;
@@ -259,6 +268,166 @@ pub(crate) fn finish<'a>(
         fragments_in,
         before,
         known_edits,
+    })
+}
+
+/// What one dep's rewrite did to a lock, whether it ran in a
+/// [`rewrite_batch`] or step by step.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub enum LockStep {
+    /// The dep's unit changed: its `(original, replacement)` fragment edits.
+    Rewritten(Vec<(String, String)>),
+    /// The unit already carried this rewrite (an idempotent re-run).
+    Unchanged,
+    /// The lock has no unit for the dep (or locks another version).
+    NotFound,
+    /// The rewrite refused, leaving the lock as it was.
+    Refused(String),
+}
+
+/// Every dep's [`LockStep`] over one lock, in dep order, and the lock text
+/// after all of them.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct LockBatch {
+    pub text: String,
+    pub steps: Vec<LockStep>,
+}
+
+/// Every dep's rewrite of `text` over ONE parse and ONE render, with exactly
+/// the outcome the step-by-step rewrite (one [`finish`] per dep, each parsing
+/// the previous dep's output) would have had; `None` whenever this cannot
+/// vouch for that, and the caller then goes step by step.
+///
+/// `plan(i, lock)` settles dep `i` against the document as the previous deps
+/// left it, so a refusal or not-found verdict is the one the step-by-step
+/// rewrite would reach; `mutate` then applies a planned dep. Each rewritten
+/// dep's fragments are taken from the original text and from the single
+/// rendering, and spliced into the original text. That is only the
+/// step-by-step result when the deps rewrite distinct packages (a second
+/// rewrite of a package would start from the first one's output) and the
+/// lock has one line-ending style (a mixed lock's majority, which spells
+/// each spliced fragment, can shift as deps land), and the combined splice
+/// must reproduce the rendering byte for byte.
+pub(crate) fn rewrite_batch<P>(
+    text: &str,
+    names: &[&str],
+    mut plan: impl FnMut(usize, &Table) -> Result<Option<P>, String>,
+    mut mutate: impl FnMut(&mut toml_edit::DocumentMut, P) -> Result<(), String>,
+    fragments_in: FragmentsIn,
+) -> Option<LockBatch> {
+    if text.contains("\r\n") && text.replace("\r\n", "").contains('\n') {
+        return None;
+    }
+    let original = toml_edit::Document::parse(text.to_owned()).ok()?;
+    let mut lock = original.clone().into_mut();
+    let mut steps = Vec::with_capacity(names.len());
+    let mut rewritten: Vec<(usize, Vec<String>)> = Vec::new();
+    let mut packages = std::collections::BTreeSet::new();
+    for (index, name) in names.iter().enumerate() {
+        match plan(index, lock.as_table()) {
+            Err(detail) => steps.push(LockStep::Refused(detail)),
+            Ok(None) => steps.push(LockStep::NotFound),
+            Ok(Some(planned)) => {
+                if !packages.insert(crate::crawlers::python_crawler::canonicalize_pypi_name(
+                    name,
+                )) {
+                    return None;
+                }
+                let before = fragments_in(&original, text, name).ok()?;
+                mutate(&mut lock, planned).ok()?;
+                rewritten.push((index, before));
+                steps.push(LockStep::Unchanged);
+            }
+        }
+    }
+    if rewritten.is_empty() {
+        return Some(LockBatch {
+            text: text.to_string(),
+            steps,
+        });
+    }
+    #[cfg(test)]
+    RENDERS.with(|renders| renders.set(renders.get() + 1));
+    let rendered = crate::utils::python_lock::preserve_line_endings(text, lock.to_string());
+    let after_doc = toml_edit::Document::parse(rendered).ok()?;
+    let rendered = after_doc.raw();
+    let file_terminator = majority_terminator(text);
+    // Each changed fragment as the byte range of `text` it replaces (trimmed
+    // to what differs) and the replacement.
+    let mut splices: Vec<(std::ops::Range<usize>, &str)> = Vec::new();
+    let mut edits_of: Vec<(usize, Vec<(String, String)>)> = Vec::new();
+    for (index, before) in &rewritten {
+        let after = fragments_in(&after_doc, rendered, names[*index]).ok()?;
+        if before.len() != after.len() {
+            return None;
+        }
+        let mut edits = Vec::new();
+        for (old, new) in before.iter().zip(after) {
+            let new = respell(old, &new, file_terminator);
+            if *old == new {
+                continue;
+            }
+            if text.matches(old.as_str()).count() != 1 {
+                return None;
+            }
+            edits.push((old.clone(), new));
+        }
+        edits_of.push((*index, edits));
+    }
+    for (_, edits) in &edits_of {
+        for (old, new) in edits {
+            let at = text.find(old.as_str())?;
+            // Only the bytes that differ are replaced, so the units' shared
+            // boundaries (a unit's fragment ends at the next unit's header)
+            // never overlap.
+            let common =
+                |a: &mut dyn Iterator<Item = (u8, u8)>| a.take_while(|(x, y)| x == y).count();
+            let mut prefix = common(&mut old.bytes().zip(new.bytes()));
+            while !old.is_char_boundary(prefix) || !new.is_char_boundary(prefix) {
+                prefix -= 1;
+            }
+            let mut suffix =
+                common(&mut old[prefix..].bytes().rev().zip(new[prefix..].bytes().rev()));
+            while !old.is_char_boundary(old.len() - suffix)
+                || !new.is_char_boundary(new.len() - suffix)
+            {
+                suffix -= 1;
+            }
+            splices.push((
+                at + prefix..at + old.len() - suffix,
+                &new[prefix..new.len() - suffix],
+            ));
+        }
+    }
+    splices.sort_by_key(|(range, _)| (range.start, range.end));
+    let mut result = String::with_capacity(rendered.len());
+    let mut copied = 0;
+    for (range, replacement) in &splices {
+        if range.start < copied {
+            return None;
+        }
+        result.push_str(&text[copied..range.start]);
+        result.push_str(replacement);
+        copied = range.end;
+    }
+    result.push_str(&text[copied..]);
+    if result != rendered {
+        return None;
+    }
+    for (index, edits) in edits_of {
+        if edits
+            .iter()
+            .any(|(_, new)| result.matches(new.as_str()).count() != 1)
+        {
+            return None;
+        }
+        if !edits.is_empty() {
+            steps[index] = LockStep::Rewritten(edits);
+        }
+    }
+    Some(LockBatch {
+        text: result,
+        steps,
     })
 }
 

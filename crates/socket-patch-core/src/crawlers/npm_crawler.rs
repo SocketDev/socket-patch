@@ -1689,7 +1689,10 @@ impl NpmCrawler {
                     .then_some((index, pkg_path))
             })
             .collect();
-        if !store_entry {
+        // npm's linked store keeps an alias install in an entry named after
+        // the alias, its real dir `node_modules/<alias>` (#852), so those
+        // entries are searched for alias copies like an importer tree.
+        if !store_entry || is_npm_linked_store_entry(&nm_path) {
             matched.extend(Self::alias_copies(&nm_path, &listing, pending));
         }
         let gvs_member = !store_entry && may_be_gvs_workspace_member(&listing);
@@ -3078,15 +3081,27 @@ async fn find_store_peer_variant_copies_reusing(
         } in entries
         {
             // Fast advertisement filter; undecodable pnpm names stay
-            // probeable, undecodable vlt ids are never variants.
-            match (advertised, layout) {
+            // probeable, undecodable vlt ids are never variants. npm's
+            // linked store names an alias install's entry after the ALIAS
+            // (`.store/lp@1.3.0-<hash>/node_modules/lp` holds the real
+            // `left-pad@1.3.0`, #852), so there a same-version entry under
+            // another name is probed at its own dir.
+            let dir_key = match (advertised, layout) {
+                (Some((n, v)), StoreLayout::NpmLinked)
+                    if n != full_name
+                        && v == version
+                        && n.split('/').all(is_safe_npm_component) =>
+                {
+                    n
+                }
                 (Some((n, v)), _) if n != full_name || v != version => continue,
                 (None, StoreLayout::Vlt) => continue,
-                _ => {}
-            }
-            // `full_name` may be scoped (`@s/n`) — Path::join handles the
+                _ => full_name.clone(),
+            };
+            let alias_entry = dir_key != full_name;
+            // `dir_key` may be scoped (`@s/n`) — Path::join handles the
             // two-segment relative form.
-            let mut candidate = entry_nm.join(&full_name);
+            let mut candidate = entry_nm.join(&dir_key);
             // Real dirs only: a link here is another entry's physical
             // copy, reached via that entry, unless it is the entry's own
             // `package` dir (Yarn 4), the physical copy itself.
@@ -3094,6 +3109,9 @@ async fn find_store_peer_variant_copies_reusing(
                 continue;
             };
             if !meta.is_dir() {
+                if alias_entry {
+                    continue;
+                }
                 let (nm, key) = (entry_nm.clone(), full_name.clone());
                 match run_walk(move || store_entry_own_package_sync(&nm, &key)).await {
                     Some(own) => candidate = own,
@@ -3202,6 +3220,30 @@ fn store_entry_package_dir_sync(entry_nm: &Path) -> Option<(PathBuf, PathBuf)> {
     }
     let canonical = std::fs::canonicalize(&own).ok()?;
     Some((own, canonical))
+}
+
+/// Whether `entry_nm` is the `node_modules` of an entry in npm's
+/// `install-strategy=linked` store: `node_modules/.store/<entry>/node_modules`,
+/// or `node_modules/.store/@scope/<entry>/node_modules` for a scoped package.
+fn is_npm_linked_store_entry(entry_nm: &Path) -> bool {
+    let is_named =
+        |dir: Option<&Path>, name: &str| dir.and_then(Path::file_name) == Some(OsStr::new(name));
+    let Some(mut parent) = entry_nm.parent().and_then(Path::parent) else {
+        return false;
+    };
+    if parent
+        .file_name()
+        .and_then(OsStr::to_str)
+        .is_some_and(|name| name.starts_with('@'))
+    {
+        match parent.parent() {
+            Some(store) => parent = store,
+            None => return false,
+        }
+    }
+    is_named(Some(entry_nm), "node_modules")
+        && is_named(Some(parent), NPM_LINKED_STORE_NAME)
+        && is_named(parent.parent(), "node_modules")
 }
 
 /// Whether `pkg_path` is the physical dir one of `copies` resolves to.
@@ -4953,6 +4995,91 @@ mod tests {
             find_store_peer_variant_copies(&number).await,
             vec![number_twin.clone()]
         );
+    }
+
+    /// #852: under `install-strategy=linked`, npm 9–11 store an alias
+    /// install (`"lp": "npm:left-pad@1.3.0"`) in an entry named after the
+    /// ALIAS: `.store/lp@1.3.0-<hash>/node_modules/lp` holds the real
+    /// `left-pad@1.3.0`, and the importer's `node_modules/lp` links to it.
+    /// Beside a plain copy, the plain copy is the resolver's primary and
+    /// the alias entry is the peer-variant fan-out's to find, or apply
+    /// leaves `require('lp')` unpatched while VEX attests `not_affected`.
+    #[tokio::test]
+    async fn test_npm_linked_store_alias_entry_beside_a_plain_copy_is_a_copy() {
+        let tmp = tempfile::tempdir().unwrap();
+        let root: PathBuf = tmp.path().components().collect();
+        let nm = root.join("node_modules");
+        let store = nm.join(".store");
+
+        let plain = store.join("left-pad@1.3.0-iv4j8hdajpqgDc7lVr5hdA/node_modules/left-pad");
+        write_pkg(&plain, "left-pad", "1.3.0");
+        let alias = store.join("lp@1.3.0-NCKE2NXgCY5tgWWRE6qdYA/node_modules/lp");
+        write_pkg(&alias, "left-pad", "1.3.0");
+        // A scoped alias name, and an unscoped alias of a scoped package.
+        let scoped_alias = store.join("@x/pad@1.3.0-AAAAAAAAAAAAAAAAAAAAAA/node_modules/@x/pad");
+        write_pkg(&scoped_alias, "left-pad", "1.3.0");
+        // An alias of another version, and an alias entry whose own dir is
+        // a link (a dependency edge), are not copies.
+        let other = store.join("lp2@1.2.0-BBBBBBBBBBBBBBBBBBBBBB/node_modules/lp2");
+        write_pkg(&other, "left-pad", "1.2.0");
+        let edge_entry = store.join("lp3@1.3.0-CCCCCCCCCCCCCCCCCCCCCC/node_modules");
+        std::fs::create_dir_all(&edge_entry).unwrap();
+        link_dir(&plain, &edge_entry.join("lp3"));
+        link_dir(&plain, &nm.join("left-pad"));
+        link_dir(&alias, &nm.join("lp"));
+
+        let purl = "pkg:npm/left-pad@1.3.0".to_string();
+        let found = NpmCrawler::new()
+            .find_by_purls(&nm, std::slice::from_ref(&purl))
+            .await
+            .unwrap();
+        assert_eq!(copy_paths(&found, &purl), vec![nm.join("left-pad")]);
+
+        let mut variants = find_store_peer_variant_copies(&nm.join("left-pad")).await;
+        variants.sort();
+        let mut want = vec![alias.clone(), scoped_alias.clone()];
+        want.sort();
+        assert_eq!(variants, want);
+
+        // VEX's every-installed-copy set sees the alias entries too.
+        let mut all = with_store_peer_variant_copies(vec![nm.join("left-pad")]).await;
+        all.sort();
+        let mut want = vec![nm.join("left-pad"), alias.clone(), scoped_alias.clone()];
+        want.sort();
+        assert_eq!(all, want);
+    }
+
+    /// #852: with only the alias installed, the alias-named linked store
+    /// entry is the purl's only copy. Apply reported it "not found on
+    /// disk" (exit 0) and VEX refused with `package_not_found`.
+    #[tokio::test]
+    async fn test_npm_linked_store_alias_only_install_is_resolved() {
+        let tmp = tempfile::tempdir().unwrap();
+        let root: PathBuf = tmp.path().components().collect();
+        let nm = root.join("node_modules");
+        let store = nm.join(".store");
+
+        let alias = store.join("lp@1.3.0-NCKE2NXgCY5tgWWRE6qdYA/node_modules/lp");
+        write_pkg(&alias, "left-pad", "1.3.0");
+        let scoped = store.join("sp@2.0.0-DDDDDDDDDDDDDDDDDDDDDD/node_modules/sp");
+        write_pkg(&scoped, "@s/pkg", "2.0.0");
+        link_dir(&alias, &nm.join("lp"));
+        link_dir(&scoped, &nm.join("sp"));
+
+        let pad = "pkg:npm/left-pad@1.3.0".to_string();
+        let scoped_purl = "pkg:npm/%40s/pkg@2.0.0".to_string();
+        let found = NpmCrawler::new()
+            .find_by_purls(&nm, &[pad.clone(), scoped_purl.clone()])
+            .await
+            .unwrap();
+        assert_eq!(copy_paths(&found, &pad), vec![alias.clone()]);
+        let copy = &found[&pad][0];
+        assert_eq!(
+            (copy.name.as_str(), copy.version.as_str()),
+            ("left-pad", "1.3.0")
+        );
+        assert_eq!(copy_paths(&found, &scoped_purl), vec![scoped.clone()]);
+        assert_eq!(found[&scoped_purl][0].namespace.as_deref(), Some("@s"));
     }
 
     /// #362: pnpm's `virtualStoreDir` moves the virtual store, and

@@ -31,6 +31,15 @@ pub const JVM_PROJECT_MARKERS: &[&str] = &[
     "build.gradle.kts",
     "settings.gradle",
     "settings.gradle.kts",
+    // sbt (`project/build.properties` is no marker: every marker list
+    // matches a basename, and `build.properties` alone is too generic)
+    "build.sbt",
+    // Mill
+    "build.mill",
+    "build.mill.yaml",
+    "build.sc",
+    // scala-cli
+    "project.scala",
 ];
 
 /// Whether `dir` holds any [`JVM_PROJECT_MARKERS`] file.
@@ -60,13 +69,95 @@ pub enum JvmCacheLayout {
 
 impl JvmCacheLayout {
     /// The layout of the cache rooted at `path`, from the root's own
-    /// spelling (each cache's root directory has a distinctive name).
-    /// Anything unrecognized is a Maven local repository.
+    /// spelling (each cache's root directory has a distinctive name), in
+    /// order:
+    ///
+    /// 1. `…/files-2.1` → [`Self::GradleModules2`];
+    /// 2. `…/cache` under a directory whose name contains `ivy` (any case;
+    ///    `~/.ivy2/cache`, `<sbt.ivy.home>/cache`) → [`Self::Ivy`];
+    /// 3. `…/v1` under `coursier`, `Coursier`, `Cache` or `cache` (every OS
+    ///    default and the legacy `~/.coursier/cache/v1`) → [`Self::Coursier`];
+    /// 4. a path with an `https` / `http` component followed by at least two
+    ///    more (a Coursier per-repository root,
+    ///    `<cache>/https/<host>/<repo path…>`) → [`Self::Coursier`];
+    /// 5. anything else is a Maven local repository.
+    ///
+    /// A Coursier false positive is harmless: the Coursier arms fall back
+    /// to the Maven2 logic on a path that is not a Coursier cache directory.
     pub fn classify(path: &Path) -> Self {
-        match path.file_name().and_then(|n| n.to_str()) {
-            Some("files-2.1") => Self::GradleModules2,
-            _ => Self::Maven2,
+        let name = |p: &Path| p.file_name().and_then(|n| n.to_str()).map(str::to_string);
+        let parent = path.parent().and_then(name);
+        match name(path).as_deref() {
+            Some("files-2.1") => return Self::GradleModules2,
+            Some("cache")
+                if parent
+                    .as_deref()
+                    .is_some_and(|p| p.to_ascii_lowercase().contains("ivy")) =>
+            {
+                return Self::Ivy
+            }
+            Some("v1")
+                if matches!(
+                    parent.as_deref(),
+                    Some("coursier" | "Coursier" | "Cache" | "cache")
+                ) =>
+            {
+                return Self::Coursier
+            }
+            _ => {}
         }
+        let parts: Vec<&std::ffi::OsStr> = path
+            .components()
+            .filter_map(|c| match c {
+                std::path::Component::Normal(s) => Some(s),
+                _ => None,
+            })
+            .collect();
+        let scheme = parts.iter().position(|s| *s == "https" || *s == "http");
+        if scheme.is_some_and(|at| parts.len() >= at + 3) {
+            return Self::Coursier;
+        }
+        Self::Maven2
+    }
+}
+
+/// Append `root` to `roots` when [`JvmCacheLayout::classify`] agrees with
+/// its layout and the path is not there yet; `true` when appended. A
+/// Coursier or Ivy root reached through an override whose path spells
+/// another layout (an Ivy home at `/tmp/x`, so `/tmp/x/cache`) is skipped
+/// with a debug line: [`MavenCrawler::find_by_purls`], which recovers the
+/// layout from the path alone, would otherwise resolve it with the wrong
+/// one.
+///
+/// [`MavenCrawler::find_by_purls`]: super::MavenCrawler::find_by_purls
+pub fn push_classified(roots: &mut Vec<JvmCacheRoot>, root: JvmCacheRoot) -> bool {
+    if JvmCacheLayout::classify(&root.path) != root.layout {
+        debug_log(&format!(
+            "skipping {:?} cache root {}: its path does not spell that layout",
+            root.layout,
+            root.path.display()
+        ));
+        return false;
+    }
+    // A root reached twice (the same path, or another spelling of it
+    // through a symlink) is one cache: listing it twice would make the
+    // every-copy fan-out patch the same files twice.
+    let canonical = |p: &Path| std::fs::canonicalize(p).unwrap_or_else(|_| p.to_path_buf());
+    let key = canonical(&root.path);
+    if roots
+        .iter()
+        .any(|r| r.path == root.path || canonical(&r.path) == key)
+    {
+        return false;
+    }
+    roots.push(root);
+    true
+}
+
+/// A `SOCKET_DEBUG` line from the JVM cache discovery.
+pub(crate) fn debug_log(message: &str) {
+    if crate::utils::env_compat::is_debug_enabled() {
+        eprintln!("[socket-patch debug] {message}");
     }
 }
 
@@ -143,7 +234,9 @@ pub fn all_local_roots_with(cwd: &Path, env: &super::maven_crawler::JvmEnv) -> V
 /// Every installed copy of one artifact file
 /// (`<artifact>-<version>[-<classifier>].<ext>`) under `root`: the one
 /// repository path for [`JvmCacheLayout::Maven2`], every hash directory's
-/// copy for [`JvmCacheLayout::GradleModules2`] (sorted). Only existing
+/// copy for [`JvmCacheLayout::GradleModules2`] (sorted), the path in each
+/// repository root of a [`JvmCacheLayout::Coursier`] cache, and each
+/// artifact type directory's copy for [`JvmCacheLayout::Ivy`]. Only existing
 /// regular files are returned; unsafe coordinates resolve to nothing.
 pub fn locate_artifact(
     root: &JvmCacheRoot,
@@ -195,8 +288,35 @@ pub fn locate_artifact(
             copies.sort();
             copies
         }
-        // sbt: Coursier / Ivy plug in here.
-        JvmCacheLayout::Coursier | JvmCacheLayout::Ivy => Vec::new(),
+        // A Coursier cache directory holds per-repository Maven2 roots; a
+        // per-repository root is one itself.
+        JvmCacheLayout::Coursier => {
+            let repos = if super::coursier_cache::is_coursier_cache_dir(&root.path) {
+                super::coursier_cache::repo_roots(&root.path)
+            } else {
+                vec![root.path.clone()]
+            };
+            repos
+                .into_iter()
+                .map(|repo| {
+                    repo.join(group.replace('.', "/"))
+                        .join(artifact)
+                        .join(version)
+                        .join(&leaf)
+                })
+                .filter(|p| p.is_file())
+                .collect()
+        }
+        // `<cache>/<org>/<module>/<type dir>/<leaf>`: the jar under
+        // `jars/` (or `bundles/`, `orbits/`), a sources jar under `srcs/`.
+        JvmCacheLayout::Ivy => {
+            let module = root.path.join(group).join(artifact);
+            super::ivy_cache::type_dirs(&module)
+                .iter()
+                .map(|dir| module.join(dir).join(&leaf))
+                .filter(|p| p.is_file())
+                .collect()
+        }
     }
 }
 
@@ -217,6 +337,106 @@ mod tests {
             JvmCacheLayout::classify(Path::new("")),
             JvmCacheLayout::Maven2
         );
+    }
+
+    #[test]
+    fn classify_recognizes_ivy_and_coursier_roots_on_every_os() {
+        use JvmCacheLayout::*;
+        for (path, want) in [
+            // Ivy: `<ivy home>/cache`.
+            ("/home/u/.ivy2/cache", Ivy),
+            ("/opt/sbt-IVY/cache", Ivy),
+            ("/tmp/x/cache", Maven2),
+            ("/home/u/.ivy2/local", Maven2),
+            // Coursier cache dirs: Linux, macOS, Windows (both spellings),
+            // legacy.
+            ("/home/u/.cache/coursier/v1", Coursier),
+            ("/Users/u/Library/Caches/Coursier/v1", Coursier),
+            ("/c/Users/u/AppData/Local/Coursier/Cache/v1", Coursier),
+            ("/c/Users/u/AppData/Local/Coursier/cache/v1", Coursier),
+            ("/home/u/.coursier/cache/v1", Coursier),
+            ("/srv/api/v1", Maven2),
+            // Coursier per-repository roots.
+            (
+                "/home/u/.cache/coursier/v1/https/repo1.maven.org/maven2",
+                Coursier,
+            ),
+            (
+                "/tmp/cs/http/nexus.corp/content/repositories/releases",
+                Coursier,
+            ),
+            ("/tmp/cs/https/host", Maven2),
+            ("/tmp/cs", Maven2),
+            ("/home/u/.m2/repository", Maven2),
+        ] {
+            assert_eq!(JvmCacheLayout::classify(Path::new(path)), want, "{path}");
+        }
+    }
+
+    #[cfg(windows)]
+    #[test]
+    fn classify_reads_windows_separators() {
+        let path = Path::new(r"C:\Users\u\AppData\Local\Coursier\Cache\v1");
+        assert_eq!(JvmCacheLayout::classify(path), JvmCacheLayout::Coursier);
+        let repo = Path::new(r"C:\cs\https\repo1.maven.org\maven2");
+        assert_eq!(JvmCacheLayout::classify(repo), JvmCacheLayout::Coursier);
+    }
+
+    #[test]
+    fn push_classified_keeps_only_roots_whose_path_spells_their_layout() {
+        let mut roots = Vec::new();
+        let ivy = |p: &str| JvmCacheRoot::new(PathBuf::from(p), JvmCacheLayout::Ivy);
+        assert!(push_classified(&mut roots, ivy("/h/.ivy2/cache")));
+        assert!(
+            !push_classified(&mut roots, ivy("/h/.ivy2/cache")),
+            "duplicate"
+        );
+        assert!(
+            !push_classified(&mut roots, ivy("/tmp/x/cache")),
+            "override at /tmp/x"
+        );
+        let cs = JvmCacheRoot::new(PathBuf::from("/tmp/cs"), JvmCacheLayout::Coursier);
+        assert!(
+            !push_classified(&mut roots, cs),
+            "a bare COURSIER_CACHE dir"
+        );
+        let repo = JvmCacheRoot::new(
+            PathBuf::from("/tmp/cs/https/repo1.maven.org/maven2"),
+            JvmCacheLayout::Coursier,
+        );
+        assert!(push_classified(&mut roots, repo));
+        assert_eq!(roots.len(), 2);
+    }
+
+    /// A root reached again through a symlink is the same cache: listing
+    /// it twice would patch its files twice.
+    #[cfg(unix)]
+    #[test]
+    fn push_classified_drops_a_symlinked_spelling_of_a_listed_root() {
+        let tmp = tempfile::tempdir().unwrap();
+        let real = tmp.path().join("home/.ivy2/cache");
+        std::fs::create_dir_all(&real).unwrap();
+        let alias = tmp.path().join("alias-ivy");
+        std::os::unix::fs::symlink(tmp.path().join("home/.ivy2"), &alias).unwrap();
+        let mut roots = Vec::new();
+        let ivy = |p: PathBuf| JvmCacheRoot::new(p, JvmCacheLayout::Ivy);
+        assert!(push_classified(&mut roots, ivy(real.clone())));
+        assert!(!push_classified(&mut roots, ivy(alias.join("cache"))));
+        assert_eq!(roots, vec![ivy(real)]);
+    }
+
+    #[test]
+    fn scala_build_files_are_markers_but_build_properties_is_not() {
+        for marker in [
+            "build.sbt",
+            "build.mill",
+            "build.mill.yaml",
+            "build.sc",
+            "project.scala",
+        ] {
+            assert!(JVM_PROJECT_MARKERS.contains(&marker), "{marker}");
+        }
+        assert!(JVM_PROJECT_MARKERS.iter().all(|m| !m.contains('/')));
     }
 
     #[test]

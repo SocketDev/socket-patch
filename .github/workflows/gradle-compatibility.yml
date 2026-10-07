@@ -241,9 +241,15 @@ jobs:
         env:
           MAVEN_VERSION: '3.9.16'
         run: |
+          # --retry-all-errors: plain --retry skips refused connections and TLS
+          # handshake errors (curl exit 7/35), as in ci.yml's copy of this step.
+          # --ssl-revoke-best-effort: Windows curl (schannel) otherwise fails the
+          # TLS handshake with CRYPT_E_REVOCATION_OFFLINE whenever the CA's
+          # revocation server is unreachable. A revoked certificate still fails;
+          # the body is checked against a digest right after. A no-op elsewhere.
           url="https://archive.apache.org/dist/maven/maven-3/${MAVEN_VERSION}/binaries/apache-maven-${MAVEN_VERSION}-bin.tar.gz"
-          curl -fsSL --retry 3 "$url" -o "$RUNNER_TEMP/maven.tgz"
-          curl -fsSL --retry 3 "$url.sha512" -o "$RUNNER_TEMP/maven.sha512"
+          curl -fsSL --retry 5 --retry-all-errors --ssl-revoke-best-effort "$url" -o "$RUNNER_TEMP/maven.tgz"
+          curl -fsSL --retry 5 --retry-all-errors --ssl-revoke-best-effort "$url.sha512" -o "$RUNNER_TEMP/maven.sha512"
           python -c 'import hashlib, pathlib, os; p=pathlib.Path(os.environ["RUNNER_TEMP"]); assert hashlib.sha512((p/"maven.tgz").read_bytes()).hexdigest() == (p/"maven.sha512").read_text().split()[0]'
           python -m tarfile -e "$RUNNER_TEMP/maven.tgz" "$RUNNER_TEMP"
           launcher="$RUNNER_TEMP/apache-maven-${MAVEN_VERSION}/bin/mvn"
@@ -259,9 +265,10 @@ jobs:
         env:
           GRADLE_VERSION: ${{ matrix.gradle }}
         run: |
+          # Download flags: see the Maven step above.
           url="https://services.gradle.org/distributions/gradle-${GRADLE_VERSION}-bin.zip"
-          curl -fsSL --retry 3 "$url" -o "$RUNNER_TEMP/gradle.zip"
-          curl -fsSL --retry 3 "$url.sha256" -o "$RUNNER_TEMP/gradle.sha256"
+          curl -fsSL --retry 5 --retry-all-errors --ssl-revoke-best-effort "$url" -o "$RUNNER_TEMP/gradle.zip"
+          curl -fsSL --retry 5 --retry-all-errors --ssl-revoke-best-effort "$url.sha256" -o "$RUNNER_TEMP/gradle.sha256"
           python -c 'import hashlib, pathlib, os; p=pathlib.Path(os.environ["RUNNER_TEMP"]); assert hashlib.sha256((p/"gradle.zip").read_bytes()).hexdigest() == (p/"gradle.sha256").read_text().strip()'
           unzip -q "$RUNNER_TEMP/gradle.zip" -d "$RUNNER_TEMP"
           launcher="$RUNNER_TEMP/gradle-${GRADLE_VERSION}/bin/gradle"

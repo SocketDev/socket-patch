@@ -1,0 +1,13 @@
+{
+  "v": 1,
+  "root": "/project",
+  "resolution": null,
+  "declared": [
+    "."
+  ],
+  "stale": false,
+  "wiring_newer": false,
+  "deps_digest": "0a1b2c3d",
+  "read_error": null,
+  "findings": {}
+}

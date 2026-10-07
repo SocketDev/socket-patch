@@ -1401,3 +1401,271 @@ async fn hosted_scan_resolves_inherited_lockfile_dir_from_cwd() {
 async fn hosted_scan_workspace_yaml_overrides_member_npmrc() {
     assert_workspace_configured_lock_refused("root-yaml-precedence").await;
 }
+
+/// The workspace root as refusals and warnings name it: canonical (Windows
+/// expands 8.3 names) without the verbatim `\\?\` prefix.
+fn member_root(tmp: &tempfile::TempDir) -> std::path::PathBuf {
+    socket_patch_core::utils::pnpm_workspace::without_verbatim_prefix(
+        std::fs::canonicalize(tmp.path()).unwrap(),
+    )
+}
+
+/// Every redirect warning's text, unescaped: a JSON dump doubles each
+/// Windows `\`, so a path would never match.
+fn warning_texts(doc: &serde_json::Value) -> String {
+    let mut out = String::new();
+    for warning in doc["redirect"]["warnings"].as_array().into_iter().flatten() {
+        for value in warning.as_object().into_iter().flat_map(|o| o.values()) {
+            if let Some(text) = value.as_str() {
+                out.push_str(text);
+                out.push('\n');
+            }
+        }
+        if let Some(text) = warning.as_str() {
+            out.push_str(text);
+            out.push('\n');
+        }
+    }
+    out
+}
+
+/// #880: a workspace member with its own lock (`sharedWorkspaceLockfile:
+/// false`) is pinned through its own lock, but pnpm reads `trustLockfile`
+/// only from the workspace root's `pnpm-workspace.yaml`. Hosted mode used
+/// to create a nested `packages: ['.']` + `trustLockfile: true` file in the
+/// member, which pnpm ignores, so every root install failed on pnpm 11/12
+/// while the scan reported success. It now refuses before any write and
+/// names the root file; once that file trusts the lock, the member pins
+/// with no nested file.
+#[tokio::test]
+#[serial]
+async fn hosted_scan_from_pnpm_member_with_own_lock_never_nests_trust_config() {
+    let server = MockServer::start().await;
+    mock_discovery(&server).await;
+    mock_reference(&server).await;
+    mock_view(&server).await;
+    let tmp = tempfile::tempdir().unwrap();
+    let root = member_root(&tmp);
+    std::fs::write(
+        root.join("package.json"),
+        r#"{ "name": "root", "private": true }"#,
+    )
+    .unwrap();
+    let root_ws = root.join("pnpm-workspace.yaml");
+    let ws_before = "packages:\n  - 'packages/*'\nsharedWorkspaceLockfile: false\n";
+    std::fs::write(&root_ws, ws_before).unwrap();
+    let member = root.join("packages/a");
+    std::fs::create_dir_all(&member).unwrap();
+    write_pnpm_project(&member);
+    let lock = member.join("pnpm-lock.yaml");
+    let lock_before = std::fs::read_to_string(&lock).unwrap();
+
+    let (code, doc) = run_hosted_json(&member, &server.uri());
+    assert_eq!(code, Some(1), "{doc}");
+    assert_eq!(doc["status"], "error", "{doc}");
+    assert_eq!(
+        doc["errorCode"], "redirect_pnpm_settings_elsewhere",
+        "{doc}"
+    );
+    let message = doc["error"].as_str().unwrap_or_default();
+    assert!(
+        message.contains(&root_ws.display().to_string())
+            && message.contains("trustLockfile: true")
+            && message.contains("nothing was written"),
+        "the error names the root file and the key to add: {message}"
+    );
+    assert_eq!(std::fs::read_to_string(&lock).unwrap(), lock_before);
+    assert_eq!(std::fs::read_to_string(&root_ws).unwrap(), ws_before);
+    assert!(!member.join("pnpm-workspace.yaml").exists());
+
+    // With the key in the root file (what pnpm reads), the member pins and
+    // no nested settings file is created.
+    let ws_trusted = format!("{ws_before}trustLockfile: true\n");
+    std::fs::write(&root_ws, &ws_trusted).unwrap();
+    let (code, doc) = run_hosted_json(&member, &server.uri());
+    assert_eq!(code, Some(0), "{doc}");
+    assert_eq!(doc["redirect"]["redirected"], 1, "{doc}");
+    assert!(std::fs::read_to_string(&lock).unwrap().contains(HOSTED_URL));
+    assert!(
+        !member.join("pnpm-workspace.yaml").exists(),
+        "pnpm ignores a member's settings file; none is created"
+    );
+    assert_eq!(std::fs::read_to_string(&root_ws).unwrap(), ws_trusted);
+    let warnings = warning_texts(&doc);
+    assert!(
+        warnings.contains(&root_ws.display().to_string()) && warnings.contains("already carries"),
+        "the trust warning names the root file: {warnings}"
+    );
+}
+
+/// #880: an explicit `trustLockfile: false` in the root file is the user's
+/// call, respected as in a single project: the member pins, nothing is
+/// nested, and the warning names the root file.
+#[tokio::test]
+#[serial]
+async fn hosted_scan_from_pnpm_member_respects_root_trust_opt_out() {
+    let server = MockServer::start().await;
+    mock_discovery(&server).await;
+    mock_reference(&server).await;
+    mock_view(&server).await;
+    let tmp = tempfile::tempdir().unwrap();
+    let root = member_root(&tmp);
+    let root_ws = root.join("pnpm-workspace.yaml");
+    let ws = "packages:\n  - 'packages/*'\ntrustLockfile: false\n";
+    std::fs::write(&root_ws, ws).unwrap();
+    let member = root.join("packages/a");
+    std::fs::create_dir_all(&member).unwrap();
+    write_pnpm_project(&member);
+
+    let (code, doc) = run_hosted_json(&member, &server.uri());
+    assert_eq!(code, Some(0), "{doc}");
+    assert_eq!(doc["redirect"]["redirected"], 1, "{doc}");
+    assert!(!member.join("pnpm-workspace.yaml").exists());
+    assert_eq!(std::fs::read_to_string(&root_ws).unwrap(), ws);
+    let warnings = warning_texts(&doc);
+    assert!(
+        warnings.contains(&root_ws.display().to_string())
+            && warnings.contains("trustLockfile: false"),
+        "{warnings}"
+    );
+}
+
+/// An npm / yarn / Bun workspace: the root `package.json` lists
+/// `packages/*` under `workspaces` (array form, or yarn classic's
+/// `{packages, nohoist}` object form) and holds the only lock, `lock_name`;
+/// the member `packages/a` holds its manifest and its own unhoisted copy.
+fn write_package_json_workspace(
+    root: &Path,
+    lock_name: &str,
+    object_form: bool,
+) -> std::path::PathBuf {
+    let workspaces = if object_form {
+        r#"{ "packages": ["packages/*"], "nohoist": ["**/in-proc-redirect-pnpm"] }"#
+    } else {
+        r#"["packages/*"]"#
+    };
+    std::fs::write(
+        root.join("package.json"),
+        format!(r#"{{ "name": "root", "private": true, "workspaces": {workspaces} }}"#),
+    )
+    .unwrap();
+    std::fs::write(root.join(lock_name), format!("# root lock {lock_name}\n")).unwrap();
+    let member = root.join("packages/a");
+    let pkg = member.join("node_modules").join(NAME);
+    std::fs::create_dir_all(&pkg).unwrap();
+    std::fs::write(
+        member.join("package.json"),
+        format!(
+            r#"{{ "name": "a", "version": "1.0.0", "dependencies": {{ "{NAME}": "{VERSION}" }} }}"#
+        ),
+    )
+    .unwrap();
+    std::fs::write(
+        pkg.join("package.json"),
+        format!(r#"{{ "name": "{NAME}", "version": "{VERSION}" }}"#),
+    )
+    .unwrap();
+    member
+}
+
+/// #884: `scan --mode hosted` and `get <uuid> --mode hosted` from an npm,
+/// yarn classic, yarn berry or Bun workspace member found the member's
+/// copy, read no lock in the member, pinned nothing, and exited 0 with
+/// `success` and an npm "no package-lock.json" warning, while the package
+/// manager installs the unpatched copy from the root lock. They now refuse
+/// and name the workspace root.
+#[tokio::test]
+#[serial]
+async fn hosted_scan_from_package_json_workspace_member_refuses() {
+    let server = MockServer::start().await;
+    mock_discovery(&server).await;
+    mock_reference(&server).await;
+    mock_view(&server).await;
+    for (lock_name, object_form) in [
+        ("package-lock.json", false),
+        ("npm-shrinkwrap.json", false),
+        ("yarn.lock", false),
+        ("yarn.lock", true),
+        ("bun.lock", false),
+        ("bun.lockb", false),
+    ] {
+        let tmp = tempfile::tempdir().unwrap();
+        let member = write_package_json_workspace(tmp.path(), lock_name, object_form);
+        let lock = tmp.path().join(lock_name);
+        let before = std::fs::read_to_string(&lock).unwrap();
+        let case = format!("{lock_name} (object form: {object_form})");
+
+        let (code, doc) = run_hosted_json(&member, &server.uri());
+        assert_refused_workspace_lock_elsewhere(&case, code, &doc, &lock, &before, &member);
+
+        let out = scrubbed_cli()
+            .args([
+                "get",
+                UUID,
+                "--mode",
+                "hosted",
+                "--json",
+                "--yes",
+                "--cwd",
+                member.to_str().unwrap(),
+                "--api-url",
+                &server.uri(),
+                "--org",
+                ORG,
+                "--api-token",
+                "fake",
+            ])
+            .output()
+            .expect("run socket-patch");
+        let doc: serde_json::Value = serde_json::from_slice(&out.stdout).unwrap_or_else(|e| {
+            panic!(
+                "{case}: get --json output is not JSON ({e}):\n{}\n{}",
+                String::from_utf8_lossy(&out.stdout),
+                String::from_utf8_lossy(&out.stderr)
+            )
+        });
+        assert_refused_workspace_lock_elsewhere(
+            &case,
+            out.status.code(),
+            &doc,
+            &lock,
+            &before,
+            &member,
+        );
+    }
+}
+
+fn assert_refused_workspace_lock_elsewhere(
+    case: &str,
+    code: Option<i32>,
+    doc: &serde_json::Value,
+    lock: &Path,
+    lock_before: &str,
+    cwd: &Path,
+) {
+    assert_eq!(
+        code,
+        Some(1),
+        "{case}: a found-but-unpinnable patch is not success: {doc}"
+    );
+    assert_eq!(doc["status"], "error", "{case}: {doc}");
+    assert_eq!(
+        doc["errorCode"], "redirect_workspace_lockfile_elsewhere",
+        "{case}: {doc}"
+    );
+    let message = doc["error"].as_str().unwrap_or_default();
+    let lock_name = lock.file_name().unwrap().to_str().unwrap();
+    assert!(
+        message.contains(lock_name) && message.contains("nothing was written"),
+        "{case}: the error names the governing lock: {message}"
+    );
+    assert_eq!(
+        std::fs::read_to_string(lock).unwrap(),
+        lock_before,
+        "{case}"
+    );
+    assert!(
+        !cwd.join(".socket").exists(),
+        "{case}: nothing written in the member"
+    );
+}

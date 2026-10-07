@@ -1293,6 +1293,61 @@ async fn scan_prune_without_a_mode_is_report_only() {
     );
 }
 
+/// #464: a report-only global scan hints at commands that keep the global
+/// scope. Run verbatim without `--global-prefix`, the hint would scan the
+/// cwd project and leave the global copy unpatched.
+#[tokio::test]
+async fn scan_global_report_only_hint_keeps_the_global_scope() {
+    let mock = MockServer::start().await;
+    let purl = "pkg:npm/minimist@1.2.2";
+    mount_one_patch_api(&mock, purl, b"x\n").await;
+
+    let tmp = tempfile::tempdir().unwrap();
+    // A prefix with a space: the hint must quote it to stay runnable.
+    let prefix = tmp.path().join("global lib").join("node_modules");
+    let pkg_dir = prefix.join("minimist");
+    std::fs::create_dir_all(&pkg_dir).unwrap();
+    std::fs::write(
+        pkg_dir.join("package.json"),
+        r#"{ "name": "minimist", "version": "1.2.2" }"#,
+    )
+    .unwrap();
+    std::fs::write(pkg_dir.join("index.js"), b"x\n").unwrap();
+    let cwd = tmp.path().join("elsewhere");
+    std::fs::create_dir_all(&cwd).unwrap();
+
+    let prefix_arg = prefix.to_str().unwrap();
+    let (code, stdout, stderr) =
+        run_scan_human(&cwd, &mock.uri(), &["--global-prefix", prefix_arg]);
+    assert_eq!(
+        code, 0,
+        "report-only is a success; stdout={stdout}; stderr={stderr}"
+    );
+    assert!(
+        stdout.contains("Patches to apply:") && stdout.contains(purl),
+        "the global scan must find the patch; got {stdout:?}"
+    );
+    let quoted = if cfg!(windows) {
+        format!("\"{prefix_arg}\"")
+    } else {
+        format!("'{prefix_arg}'")
+    };
+    for command in [
+        format!("  socket-patch scan --mode agent --global-prefix {quoted}"),
+        format!("  socket-patch get --global-prefix {quoted} <package-name-or-purl-or-CVE-ID>"),
+    ] {
+        assert!(
+            stdout.lines().any(|line| line == command),
+            "the hint must keep the global scope ({command:?}); got {stdout:?}"
+        );
+    }
+    assert_eq!(
+        std::fs::read(pkg_dir.join("index.js")).unwrap(),
+        b"x\n",
+        "a report-only scan must not patch the global copy"
+    );
+}
+
 /// Each spelling that folds to `--mode agent` applies without prompting.
 #[tokio::test]
 async fn scan_human_agent_mode_applies_without_prompting() {
@@ -2653,4 +2708,46 @@ async fn scan_vendored_ignores_a_degraded_pre_v5_vlt_ledger_edit() {
             "{key}: the pre-v5 ledger is left byte-identical: {env:#}"
         );
     }
+}
+
+/// `scan --mode agent --json` whose nested apply fails (the installed copy
+/// is a symlink to a first-party `packages/` directory, which apply refuses
+/// to patch): the `apply` block must carry
+/// the per-patch failure — `action: "failed"`, `errorCode`, `error` — and
+/// count it in `failed`, not report the patch as a clean `added` (#424).
+#[cfg(unix)]
+#[tokio::test]
+async fn scan_agent_json_nested_apply_failure_reaches_the_apply_block() {
+    let mock = MockServer::start().await;
+    let purl = "pkg:npm/apply-fails@1.0.0";
+    mount_one_patch_api(&mock, purl, b"before\n").await;
+
+    let tmp = tempfile::tempdir().unwrap();
+    write_root_package_json(tmp.path());
+    write_npm_package(tmp.path(), "apply-fails", "1.0.0", b"before\n");
+    let member = tmp.path().join("packages/apply-fails");
+    std::fs::create_dir_all(member.parent().unwrap()).unwrap();
+    std::fs::rename(tmp.path().join("node_modules/apply-fails"), &member).unwrap();
+    std::os::unix::fs::symlink(
+        "../packages/apply-fails",
+        tmp.path().join("node_modules/apply-fails"),
+    )
+    .unwrap();
+
+    let (code, stdout, stderr) = run_scan_agent(tmp.path(), &mock.uri(), &["--json"]);
+    assert_eq!(code, 1, "stdout={stdout}\nstderr={stderr}");
+    let v: serde_json::Value = serde_json::from_str(stdout.trim()).expect("one JSON envelope");
+    assert_eq!(v["status"], "partial_failure", "{v}");
+    let apply = &v["apply"];
+    assert_eq!(apply["failed"], 1, "the apply failure must be counted: {v}");
+    assert_eq!(apply["applied"], 0, "{v}");
+    let rec = &apply["patches"][0];
+    assert_eq!(rec["purl"], purl, "{v}");
+    assert_eq!(rec["action"], "failed", "{v}");
+    assert_eq!(rec["errorCode"], "apply_failed", "{v}");
+    assert!(
+        rec["error"].as_str().is_some_and(|e| !e.is_empty()),
+        "the apply error text must reach the envelope: {v}"
+    );
+    assert_eq!(std::fs::read(member.join("index.js")).unwrap(), b"before\n",);
 }

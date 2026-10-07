@@ -22,6 +22,128 @@
 /// construction.
 const SUPPORTED_LOCK_VERSIONS: [u64; 3] = [0, 1, 2];
 
+/// The `patchedDependencies` keys a Bun project declares: the root
+/// `package.json`'s object, which `bun patch --commit` writes and every
+/// install reads, plus the copy Bun mirrors at the top of a text `bun.lock`
+/// (`  "patchedDependencies": {` … `  },`, one `"key": "path"` line each).
+/// Either source alone is enough: a key missing from one is still a patch
+/// Bun applies. The manifest is read as Bun reads it, a leading BOM,
+/// comments and trailing commas allowed ([`strip_jsonc`]); one Bun cannot parse either, and a lock
+/// section out of Bun's emitted shape, contribute only what they spell
+/// plainly.
+pub(crate) fn patched_dependency_keys(manifest: Option<&str>, lock: Option<&str>) -> Vec<String> {
+    let mut keys: Vec<String> = manifest
+        .map(crate::formats::text::strip_bom)
+        .and_then(|text| {
+            serde_json::from_str::<serde_json::Value>(text)
+                .or_else(|_| serde_json::from_str(&strip_jsonc(text)))
+                .ok()
+        })
+        .and_then(|value| match value.get("patchedDependencies") {
+            Some(serde_json::Value::Object(map)) => Some(map.keys().cloned().collect()),
+            _ => None,
+        })
+        .unwrap_or_default();
+    if let Some(lock) = lock {
+        let mut lines = lock
+            .split('\n')
+            .map(|l| l.strip_suffix('\r').unwrap_or(l))
+            .skip_while(|l| *l != "  \"patchedDependencies\": {")
+            .skip(1);
+        while let Some((4, key, _, _)) = lines.next().and_then(parse_string_pair_line) {
+            if !keys.contains(&key) {
+                keys.push(key);
+            }
+        }
+    }
+    keys
+}
+
+/// `text` with the JSONC Bun accepts in a `package.json` removed: `//` and
+/// `/* */` comments and a comma before a closing `}` or `]`, all outside
+/// strings. Everything else, strings included, is kept byte for byte.
+fn strip_jsonc(text: &str) -> String {
+    let mut out = String::with_capacity(text.len());
+    let mut chars = text.chars().peekable();
+    let mut in_string = false;
+    while let Some(c) = chars.next() {
+        if in_string {
+            out.push(c);
+            if c == '\\' {
+                if let Some(escaped) = chars.next() {
+                    out.push(escaped);
+                }
+            } else if c == '"' {
+                in_string = false;
+            }
+            continue;
+        }
+        match c {
+            '"' => {
+                in_string = true;
+                out.push(c);
+            }
+            '/' if chars.peek() == Some(&'/') => {
+                while chars.peek().is_some_and(|&n| n != '\n') {
+                    chars.next();
+                }
+            }
+            '/' if chars.peek() == Some(&'*') => {
+                chars.next();
+                let mut prev = '\0';
+                for n in chars.by_ref() {
+                    if prev == '*' && n == '/' {
+                        break;
+                    }
+                    prev = n;
+                }
+            }
+            '}' | ']' => {
+                let kept = out.trim_end_matches(char::is_whitespace).len();
+                if out[..kept].ends_with(',') {
+                    out.remove(kept - 1);
+                }
+                out.push(c);
+            }
+            _ => out.push(c),
+        }
+    }
+    out
+}
+
+/// The `patchedDependencies` key that makes Bun apply a project-authored
+/// patch to `name@version`, if any. Bun keys the patch on the registry
+/// resolution's `name@version`; a bare `name` is matched too so that a
+/// key spelled without a version never slips past the gate.
+///
+/// Bun applies such a patch only while the lock resolves the package to
+/// that registry `name@version`. Rewiring it to a hosted URL or a vendored
+/// tarball makes Bun drop the user's patch on every install, silently
+/// (#367), so both modes leave such a package alone and say why.
+pub(crate) fn patched_dependency_key<'k>(
+    keys: &'k [String],
+    name: &str,
+    version: &str,
+) -> Option<&'k str> {
+    let spec = format!("{name}@{version}");
+    keys.iter()
+        .map(String::as_str)
+        .find(|key| *key == spec || *key == name)
+}
+
+/// The user-facing reason a package with a project-authored Bun patch is
+/// left on its registry resolution, shared by the hosted and vendored
+/// paths so the two modes never drift apart.
+pub(crate) fn patched_dependency_detail(key: &str, name: &str, version: &str) -> String {
+    format!(
+        "package.json `patchedDependencies` has `{key}`, a patch the project applies with \
+         `bun patch`; Bun applies it only to the registry {name}@{version}, so rewiring the \
+         package would silently drop that patch from every install. It is left unchanged and \
+         stays without the Socket patch: fold the Socket fix into your own patch, or remove \
+         the `patchedDependencies` entry (`bun patch --commit` again without it) and re-run"
+    )
+}
+
 /// One parsed single-line packages entry.
 pub(crate) struct BunEntry {
     pub(crate) line_idx: usize,
@@ -525,6 +647,52 @@ pub(crate) fn heal_workspace_literals(
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    /// #367: the keys come from the manifest and from the lock's mirror,
+    /// and match the exact `name@version` (scoped too) or a bare name.
+    #[test]
+    fn patched_dependency_keys_read_manifest_and_lock() {
+        let manifest = r#"{"name":"app","patchedDependencies":{"left-pad@1.3.0":"patches/left-pad@1.3.0.patch"}}"#;
+        let lock = "{\r\n  \"lockfileVersion\": 1,\r\n  \"patchedDependencies\": {\r\n    \"@s/p@2.0.0\": \"patches/@s%2Fp@2.0.0.patch\",\r\n    \"left-pad@1.3.0\": \"patches/left-pad@1.3.0.patch\",\r\n  },\r\n  \"packages\": {\r\n    \"x@1.0.0\": \"not a key\",\r\n  }\r\n}\r\n";
+        let keys = patched_dependency_keys(Some(manifest), Some(lock));
+        assert_eq!(keys, vec!["left-pad@1.3.0", "@s/p@2.0.0"]);
+        assert_eq!(
+            patched_dependency_key(&keys, "left-pad", "1.3.0"),
+            Some("left-pad@1.3.0")
+        );
+        assert_eq!(
+            patched_dependency_key(&keys, "@s/p", "2.0.0"),
+            Some("@s/p@2.0.0")
+        );
+        assert_eq!(patched_dependency_key(&keys, "left-pad", "1.3.1"), None);
+        assert_eq!(patched_dependency_key(&keys, "x", "1.0.0"), None);
+        let bare = vec!["left-pad".to_string()];
+        assert_eq!(
+            patched_dependency_key(&bare, "left-pad", "1.3.0"),
+            Some("left-pad")
+        );
+        assert!(patched_dependency_keys(Some("not json"), None).is_empty());
+        // Bun reads a JSONC manifest: comments and trailing commas, with
+        // the same characters inside strings left alone.
+        let jsonc = "{\n  // a comment, \"x\": 1\n  \"name\": \"a//b /* c */\",\n  /* block\n  */\n  \"patchedDependencies\": {\n    \"left-pad@1.3.0\": \"patches/x,}.patch\",\n  },\n}\n";
+        assert_eq!(
+            patched_dependency_keys(Some(jsonc), None),
+            vec!["left-pad@1.3.0"]
+        );
+        // A Windows-saved manifest leads with a UTF-8 BOM, which Bun skips.
+        assert_eq!(
+            patched_dependency_keys(Some(&format!("\u{feff}{jsonc}")), None),
+            vec!["left-pad@1.3.0"]
+        );
+        let stripped: serde_json::Value = serde_json::from_str(&strip_jsonc(jsonc)).unwrap();
+        assert_eq!(stripped["name"], "a//b /* c */");
+        assert_eq!(
+            stripped["patchedDependencies"]["left-pad@1.3.0"],
+            "patches/x,}.patch"
+        );
+        assert!(patched_dependency_keys(Some(r#"{"patchedDependencies":[]}"#), None).is_empty());
+        assert!(patched_dependency_keys(None, None).is_empty());
+    }
 
     /// The `bundled` meta flag, in the shapes real Bun 1.3.14 writes, the
     /// rewritten tarball tuple, and a meta that is not plain JSON.

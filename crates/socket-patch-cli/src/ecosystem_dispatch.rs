@@ -685,6 +685,8 @@ pub(crate) struct MavenCopies {
     /// by Gradle, never written.
     pub read_only: Vec<PathBuf>,
     /// `~/.m2` copies a Gradle-only build never reads (no `mavenLocal()`).
+    /// A Coursier or Ivy copy (sbt, Mill, scala-cli) is never one: the
+    /// `mavenLocal()` gate is about `~/.m2` alone.
     pub m2_ignored: Vec<PathBuf>,
 }
 
@@ -741,12 +743,11 @@ impl JvmScope {
 
     /// Split the copies the resolver found for one purl.
     pub(crate) fn split(&self, paths: &[PathBuf]) -> MavenCopies {
-        use socket_patch_core::crawlers::gradle_cache::is_gradle_version_dir;
         let mut out = MavenCopies::default();
         for path in paths {
             if self.is_read_only(path) {
                 out.read_only.push(path.clone());
-            } else if !is_gradle_version_dir(path) && !self.m2_consumed() {
+            } else if path.starts_with(&self.env.m2_repo) && !self.m2_consumed() {
                 out.m2_ignored.push(path.clone());
             } else {
                 out.consumed.push(path.clone());

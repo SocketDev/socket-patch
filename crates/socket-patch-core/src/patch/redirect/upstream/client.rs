@@ -150,12 +150,15 @@ pub(crate) const OFFLINE: &str =
 
 type Cache<T> = Mutex<HashMap<(String, String), Result<T, String>>>;
 
+/// [`Cache`] keyed by (registry base, name, version).
+type RegistryCache<T> = Mutex<HashMap<(String, String, String), Result<T, String>>>;
+
 /// One client per restore run; every lookup is cached (success and
 /// failure alike) so a pin wired in several files costs one request.
 pub(crate) struct UpstreamClient {
     http: RegistryClient,
     offline: bool,
-    npm: Cache<NpmDist>,
+    npm: RegistryCache<NpmDist>,
     npm_berry: Cache<String>,
     cargo: Cache<String>,
     go: Cache<GoSums>,
@@ -205,25 +208,42 @@ impl UpstreamClient {
         String::from_utf8(bytes).map_err(|_| format!("{url} is not UTF-8"))
     }
 
-    /// `dist` of `name@version` from the npm registry's version document.
+    /// `dist` of `name@version` from the default npm registry's version
+    /// document.
     pub(crate) async fn npm_dist(&self, name: &str, version: &str) -> Result<NpmDist, String> {
-        let key = (name.to_string(), version.to_string());
+        self.npm_dist_on(&npm_registry_base(), name, version).await
+    }
+
+    /// `dist` of `name@version` from the version document of the npm
+    /// registry at `base` (a project's configured registry or mirror).
+    pub(crate) async fn npm_dist_on(
+        &self,
+        base: &str,
+        name: &str,
+        version: &str,
+    ) -> Result<NpmDist, String> {
+        let base = base.trim_end_matches('/');
+        let key = (base.to_string(), name.to_string(), version.to_string());
         if let Some(hit) = self.npm.lock().await.get(&key) {
             return hit.clone();
         }
-        let result = self.fetch_npm_dist(name, version).await;
+        let result = self.fetch_npm_dist(base, name, version).await;
         self.npm.lock().await.insert(key, result.clone());
         result
     }
 
-    async fn fetch_npm_dist(&self, name: &str, version: &str) -> Result<NpmDist, String> {
+    async fn fetch_npm_dist(
+        &self,
+        base: &str,
+        name: &str,
+        version: &str,
+    ) -> Result<NpmDist, String> {
         if self.offline {
             return Err(OFFLINE.to_string());
         }
         let encoded_name = name.replace('/', "%2f");
         let url = format!(
-            "{}/{encoded_name}/{}",
-            npm_registry_base(),
+            "{base}/{encoded_name}/{}",
             crate::utils::uri::encode_uri_component(version)
         );
         let doc = self.get_json(&url).await?;
@@ -747,7 +767,9 @@ mod tests {
         let h1 = go_mod_h1(b"module example.com/m\n");
         assert!(h1.starts_with("h1:") && h1.ends_with('='), "{h1}");
     }
+    // The npm cache key reads `SOCKET_NPM_REGISTRY`, which serial tests set.
     #[tokio::test]
+    #[serial_test::serial]
     async fn berry_metadata_is_registry_anchored_without_repacking() {
         use base64::Engine as _;
         use sha2::Digest as _;
@@ -775,7 +797,7 @@ mod tests {
                 .await;
             let client = UpstreamClient::new(false);
             client.npm.lock().await.insert(
-                ("left-pad".into(), "1.3.0".into()),
+                (npm_registry_base(), "left-pad".into(), "1.3.0".into()),
                 Ok(NpmDist {
                     tarball: format!("{}/archive.tgz", server.uri()),
                     integrity: registry_sri,
@@ -794,7 +816,9 @@ mod tests {
         }
     }
 
+    // The npm cache key reads `SOCKET_NPM_REGISTRY`, which serial tests set.
     #[tokio::test]
+    #[serial_test::serial]
     async fn berry_metadata_refuses_wrong_identity_integrity_and_unavailable_service() {
         use base64::Engine as _;
         use sha2::Digest as _;
@@ -833,7 +857,7 @@ mod tests {
                 .await;
             let client = UpstreamClient::new(false);
             client.npm.lock().await.insert(
-                ("left-pad".into(), "1.3.0".into()),
+                (npm_registry_base(), "left-pad".into(), "1.3.0".into()),
                 Ok(NpmDist {
                     tarball: format!("{}/archive.tgz", server.uri()),
                     integrity: Some("sha512-other".into()),

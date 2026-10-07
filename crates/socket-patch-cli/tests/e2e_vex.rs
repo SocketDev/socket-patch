@@ -993,7 +993,8 @@ fn verify_mode_requires_every_installed_copy_patched() {
 
 /// Regressions #603 and #601: the every-copy rule covers store copies
 /// too. `apply` patches a package's other store copies (a Deno `_1` copy
-/// index, a pnpm peer variant) and a copy bundled inside another
+/// index, a pnpm peer variant, an npm linked-store entry named after an
+/// alias, #852) and a copy bundled inside another
 /// package's store entry, so `vex` must hash each of them: one pristine
 /// copy omits the purl, and all patched attests it. Each layout has the
 /// primary copy linked from the importer, as `deno install`, pnpm and vlt
@@ -1028,6 +1029,11 @@ fn verify_mode_requires_every_store_copy_patched() {
             "pnpm bundled copy (#601)",
             ".pnpm/store-pkg@1.0.0/node_modules/store-pkg",
             ".pnpm/bundler@1.0.0/node_modules/bundler/node_modules/store-pkg",
+        ),
+        (
+            "npm linked-store alias entry (#852)",
+            ".store/store-pkg@1.0.0-iv4j8hdajpqgDc7lVr5hdA/node_modules/store-pkg",
+            ".store/sp@1.0.0-NCKE2NXgCY5tgWWRE6qdYA/node_modules/sp",
         ),
     ];
 

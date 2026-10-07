@@ -34,6 +34,7 @@ pub(crate) mod maven;
 pub(crate) mod nuget;
 pub mod pnpm;
 pub mod registry;
+pub mod sbt;
 pub mod text;
 pub mod yarn;
 
