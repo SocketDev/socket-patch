@@ -205,12 +205,19 @@ links on to other entries. A workspace member's `node_modules` has no
 `.modules.yaml` of its own (pnpm writes it only at the workspace root), so
 the root's record is used, and the member's own links seed the walk. Agent-mode `apply` and `rollback` then fail on
 those copies, direct and transitive alike, instead of writing through
-them, and never report a transitive one as "not installed". PDM's symlink install
+them, and never report a transitive one as "not installed". Bun's global
+store (`[install] globalStore = true` in `bunfig.toml`, or
+`BUN_INSTALL_GLOBAL_STORE=1`, Bun 1.3.14 and later) is handled the same
+way: each `node_modules/.bun/<entry>` is then a link into
+`<cache>/links/<entry>-<hash>` in Bun's install cache, and those linked
+entries are walked (so `vex` checks their bytes) but refused by agent-mode
+`apply` and `rollback`. PDM's symlink install
 cache gets the same treatment: with `install.cache` and
 `cache_method = symlink` (PDM 2.0–2.12), `site-packages/<pkg>` links into
 `<cache>/packages/<wheel>/lib`, and that package is refused too. The error
 names the store and how to get a private copy (disable the global virtual
-store, or `pdm config install.cache_method hardlink`, then reinstall), or
+store or Bun's `globalStore`, or `pdm config install.cache_method
+hardlink`, then reinstall), or
 use hosted or vendored mode.
 
 Agent-mode `apply` and `rollback` also fail, dry run included, on a

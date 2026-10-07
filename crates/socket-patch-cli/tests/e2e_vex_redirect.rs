@@ -2225,6 +2225,73 @@ fn bun_hosted_ref_is_judged_by_the_bun_store_copy() {
     }
 }
 
+/// #635: with Bun's global store (`[install] globalStore = true`, Bun >=
+/// 1.3.14) the `.bun` entry is a link into `<cache>/links/<entry>-<hash>`,
+/// a dir shared across projects. That linked store copy is still what this
+/// project loads, so a pristine one is `not_applied` while `bun.lock` pins
+/// the hosted tarball. Skipping the link read as "nothing installed" and
+/// attested the pinned lock.
+#[cfg(unix)]
+#[test]
+fn bun_hosted_ref_is_judged_by_a_global_store_copy() {
+    let (pristine, patched) = (
+        &b"module.exports = 'pristine'\n"[..],
+        &b"module.exports = 'patched'\n"[..],
+    );
+    let purl = "pkg:npm/left-pad@1.3.0";
+    let url = hosted_npm_url("left-pad", "1.3.0", UUID);
+    let tmp = tempfile::tempdir().unwrap();
+    let cwd = &tmp.path().join("app");
+    put(
+        cwd,
+        "package.json",
+        br#"{ "name": "app", "version": "1.0.0", "dependencies": { "dep": "1.0.0" } }"#,
+    );
+    put(
+        cwd,
+        "bunfig.toml",
+        b"[install]\nlinker = \"isolated\"\nglobalStore = true\n",
+    );
+    put(
+        cwd,
+        "bun.lock",
+        format!(
+            "{{\n  \"lockfileVersion\": 1,\n  \"workspaces\": {{\n    \"\": {{\n      \
+             \"name\": \"app\",\n      \"dependencies\": {{\n        \"dep\": \"1.0.0\",\n      \
+             }},\n    }},\n  }},\n  \"packages\": {{\n    \
+             \"dep\": [\"dep@1.0.0\", \"\", {{ \"dependencies\": {{ \"left-pad\": \"1.3.0\" }} }}, \
+             \"sha512-{dep}==\"],\n\n    \
+             \"left-pad\": [\"left-pad@{url}\", {{}}, \"{SRI}\"],\n  }}\n}}\n",
+            dep = "D".repeat(86),
+        )
+        .as_bytes(),
+    );
+    let shared = tmp
+        .path()
+        .join("bun-cache/links/left-pad@1.3.0-6a490709ba3c5c8f");
+    put(
+        &shared,
+        "node_modules/left-pad/package.json",
+        br#"{ "name": "left-pad", "version": "1.3.0" }"#,
+    );
+    put(&shared, "node_modules/left-pad/index.js", pristine);
+    std::fs::create_dir_all(cwd.join("node_modules/.bun")).unwrap();
+    std::os::unix::fs::symlink(&shared, cwd.join("node_modules/.bun/left-pad@1.3.0")).unwrap();
+    let (_rt, server) = serve_patch_views(vec![(
+        UUID.to_string(),
+        one_file_view(UUID, purl, "package/index.js", pristine, patched),
+    )]);
+    let args = ["--proxy-url", &server.uri()];
+
+    let (code, env) = vex_json(cwd, &args);
+    assert_eq!(code, Some(1), "a pristine global store copy: {env}");
+    assert_eq!(skipped_reason(&env, purl), "not_applied", "{env}");
+
+    put(&shared, "node_modules/left-pad/index.js", patched);
+    let (code, env) = vex_json(cwd, &args);
+    assert_attested(cwd, code, &env, UUID, "the global store copy verifies");
+}
+
 /// The patch view for `name@version` (the [`left_pad_view`] shape).
 fn npm_view(name: &str, version: &str, after_hash: &str) -> Value {
     let mut view = left_pad_view(after_hash);

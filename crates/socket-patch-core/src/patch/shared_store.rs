@@ -7,7 +7,7 @@
 //! module cache), but not a package *directory* that is itself a symlink
 //! into a store every project on the machine links to: the rename then lands
 //! inside the shared directory, patching (or, on rollback, unpatching) every
-//! other project that uses it. Two package managers install that way:
+//! other project that uses it. Three package managers install that way:
 //!
 //! * **PDM's package cache** (`install.cache = true` with
 //!   `install.cache_method = symlink`, PDM 2.0–2.12): `site-packages/<pkg>`
@@ -18,6 +18,11 @@
 //!   `node_modules/<dep>` is a symlink (a junction on Windows) into
 //!   `<store>/v<N>/links/…/node_modules/<dep>`, beside the store's
 //!   `files/` content directory.
+//! * **Bun's global store** (`[install] globalStore = true` in
+//!   `bunfig.toml`, or `BUN_INSTALL_GLOBAL_STORE=1`, Bun >= 1.3.14, isolated
+//!   linker): each `node_modules/.bun/<entry>` is a symlink into
+//!   `<cache>/links/<entry>-<hash>/node_modules/<name>` in Bun's install
+//!   cache.
 //!
 //! Detection is positive and marker-based, on the package directory's real
 //! path: a per-project store reached through a symlink (pnpm's
@@ -53,6 +58,8 @@ pub enum SharedStoreKind {
     PdmPackageCache,
     /// `<store>/v<N>/links`, pnpm's global virtual store.
     PnpmGlobalVirtualStore,
+    /// `<cache>/links/<entry>-<hash>`, Bun's global store.
+    BunGlobalStore,
     /// A `node_modules` entry linked to first-party source outside every
     /// `node_modules` tree (a workspace member, a `file:` / `link:`
     /// directory dependency, an `npm link` target).
@@ -80,6 +87,11 @@ impl SharedStore {
             SharedStoreKind::PnpmGlobalVirtualStore => (
                 "pnpm's global virtual store (enableGlobalVirtualStore)",
                 "set enableGlobalVirtualStore to false and reinstall",
+            ),
+            SharedStoreKind::BunGlobalStore => (
+                "Bun's global store (install.globalStore / BUN_INSTALL_GLOBAL_STORE)",
+                "set `globalStore = false` under `[install]` in bunfig.toml (and unset \
+                 BUN_INSTALL_GLOBAL_STORE), then reinstall",
             ),
             SharedStoreKind::LinkedSource => {
                 return format!(
@@ -162,6 +174,14 @@ fn shared_store_of_blocking(pkg_path: &Path) -> Option<SharedStore> {
         if is_pnpm_global_virtual_store_dir(dir) {
             return Some(SharedStore {
                 kind: SharedStoreKind::PnpmGlobalVirtualStore,
+                real_path: real.clone(),
+            });
+        }
+
+        // Bun: <cache>/links/<entry>-<hash>/node_modules/<name>/….
+        if name == "links" && real.strip_prefix(dir).is_ok_and(is_bun_global_store_path) {
+            return Some(SharedStore {
+                kind: SharedStoreKind::BunGlobalStore,
                 real_path: real.clone(),
             });
         }
@@ -324,6 +344,59 @@ pub(crate) fn is_pnpm_global_virtual_store_dir(dir: &Path) -> bool {
         && parent.is_some_and(|p| p.join("files").is_dir())
 }
 
+/// Whether `rest`, a real path below a `links` dir, is a package inside an
+/// entry of Bun's global store: `<entry>-<hash>/node_modules/<name>/…`,
+/// where `<entry>` is the `.bun` entry name the project links it under
+/// (`<name>@<version>`, a scoped name's `/` written `+`, or `<name>@` and a
+/// mangled tarball URL), `<hash>` is hex, and `<name>` is the package the
+/// entry name starts with. A bundled dependency nested inside the package
+/// is in the same entry, so it is matched too.
+fn is_bun_global_store_path(rest: &Path) -> bool {
+    let mut parts = rest.components().map(|c| c.as_os_str().to_str());
+    let (Some(Some(entry)), Some(Some("node_modules")), Some(Some(first))) =
+        (parts.next(), parts.next(), parts.next())
+    else {
+        return false;
+    };
+    if !entry
+        .rsplit_once('-')
+        .is_some_and(|(_, hash)| is_bun_store_hash(hash))
+    {
+        return false;
+    }
+    let name = if first.starts_with('@') {
+        let Some(Some(leaf)) = parts.next() else {
+            return false;
+        };
+        format!("{first}+{leaf}")
+    } else {
+        first.to_string()
+    };
+    entry
+        .strip_prefix(&name)
+        .is_some_and(|tail| tail.starts_with('@'))
+}
+
+/// Whether `real`, a real (canonical) directory, is the Bun global store
+/// entry a `node_modules/.bun/<entry_name>` link points to:
+/// `<cache>/links/<entry_name>-<hash>`.
+pub(crate) fn is_bun_global_store_entry(real: &Path, entry_name: &str) -> bool {
+    real.parent()
+        .and_then(Path::file_name)
+        .is_some_and(|n| n == "links")
+        && real
+            .file_name()
+            .and_then(|n| n.to_str())
+            .and_then(|n| n.strip_prefix(entry_name))
+            .and_then(|tail| tail.strip_prefix('-'))
+            .is_some_and(is_bun_store_hash)
+}
+
+/// The hex hash Bun appends to a global store entry's name.
+fn is_bun_store_hash(hash: &str) -> bool {
+    (1..=16).contains(&hash.len()) && hash.bytes().all(|b| b.is_ascii_hexdigit())
+}
+
 /// `v3`, `v10`, `v11`, …: the layout-version directory of a pnpm store.
 fn is_pnpm_store_version_dir(name: &str) -> bool {
     name.strip_prefix('v')
@@ -347,6 +420,22 @@ pub(crate) mod test_support {
             .join("abc123")
             .join("node_modules")
             .join("left-pad");
+        std::fs::create_dir_all(&pkg).unwrap();
+        pkg
+    }
+
+    /// `<root>/bun-cache/links/<entry>-<hash>/node_modules/<name>`, beside
+    /// the cache's own `<name>@<version>@@@1` extraction, for `name`
+    /// (`left-pad`, or scoped `@scope/leaf`) at `version`.
+    pub(crate) fn make_bun_global_store_entry(root: &Path, name: &str, version: &str) -> PathBuf {
+        let cache = root.join("bun-cache");
+        let entry = format!("{}@{version}", name.replace('/', "+"));
+        std::fs::create_dir_all(cache.join(format!("{entry}@@@1"))).unwrap();
+        let pkg = cache
+            .join("links")
+            .join(format!("{entry}-6a490709ba3c5c8f"))
+            .join("node_modules")
+            .join(name);
         std::fs::create_dir_all(&pkg).unwrap();
         pkg
     }
@@ -458,6 +547,84 @@ mod tests {
         std::fs::create_dir_all(&private).unwrap();
         std::os::unix::fs::symlink(&private, nm.join("is-odd")).unwrap();
         assert_eq!(shared_store_of(&nm.join("is-odd")).await, None);
+    }
+
+    /// #635: with Bun's global store each `node_modules/.bun/<entry>` is a
+    /// link into `<cache>/links/<entry>-<hash>`, shared by every project on
+    /// the machine. A package reached through that link (the importer's
+    /// `node_modules/<name>` or the `.bun` entry itself), scoped or not, a
+    /// file below it, and a bundled dependency inside it are all refused.
+    #[cfg(unix)]
+    #[tokio::test]
+    async fn bun_global_store_is_shared() {
+        use std::os::unix::fs::symlink;
+        let dir = tempfile::tempdir().unwrap();
+        let nm = dir.path().join("proj").join("node_modules");
+        let bun = nm.join(".bun");
+        std::fs::create_dir_all(&bun).unwrap();
+        std::fs::create_dir_all(nm.join("@isaacs")).unwrap();
+        for (name, link) in [
+            ("left-pad", nm.join("left-pad")),
+            (
+                "@isaacs/string-locale-compare",
+                nm.join("@isaacs/string-locale-compare"),
+            ),
+        ] {
+            let pkg = make_bun_global_store_entry(dir.path(), name, "1.3.0");
+            let entry = pkg
+                .ancestors()
+                .find(|a| a.parent().and_then(Path::file_name) == Some("links".as_ref()))
+                .unwrap();
+            let bun_entry = bun.join(format!("{}@1.3.0", name.replace('/', "+")));
+            symlink(entry, &bun_entry).unwrap();
+            let via_bun = bun_entry.join("node_modules").join(name);
+            symlink(&via_bun, &link).unwrap();
+            std::fs::create_dir_all(pkg.join("node_modules").join("bundled")).unwrap();
+            for path in [
+                link.clone(),
+                via_bun.clone(),
+                pkg.join("node_modules/bundled"),
+            ] {
+                let got = shared_store_of(&path).await.expect("shared");
+                assert_eq!(
+                    got.kind,
+                    SharedStoreKind::BunGlobalStore,
+                    "{}",
+                    path.display()
+                );
+            }
+            let got = shared_store_of_patch_dirs(&link, ["lib/new/a.js"]).await;
+            assert_eq!(got.map(|s| s.kind), Some(SharedStoreKind::BunGlobalStore));
+        }
+    }
+
+    /// Bun's per-project isolated store (`node_modules/.bun/<entry>` a real
+    /// dir), and `links` dirs that do not hold a store entry's package, are
+    /// not shared.
+    #[tokio::test]
+    async fn bun_per_project_store_is_not_shared() {
+        let dir = tempfile::tempdir().unwrap();
+        let private = dir
+            .path()
+            .join("node_modules/.bun/left-pad@1.3.0/node_modules/left-pad");
+        std::fs::create_dir_all(&private).unwrap();
+        assert_eq!(shared_store_of(&private).await, None);
+        for not_entry in [
+            // No hex hash after the entry name.
+            "links/left-pad@1.3.0/node_modules/left-pad",
+            "links/left-pad@1.3.0-xyz/node_modules/left-pad",
+            // The package is not the one the entry names.
+            "links/is-odd@3.0.1-6a490709ba3c5c8f/node_modules/left-pad",
+            "links/left-pad-6a490709ba3c5c8f/node_modules/left-pad",
+            // Not under the entry's `node_modules`.
+            "links/left-pad@1.3.0-6a490709ba3c5c8f/left-pad",
+            // A package that is itself named `links`.
+            "node_modules/links/lib",
+        ] {
+            let path = dir.path().join("x").join(not_entry);
+            std::fs::create_dir_all(&path).unwrap();
+            assert_eq!(shared_store_of(&path).await, None, "{not_entry}");
+        }
     }
 
     /// A PyPI patch is rooted at `site-packages` (keys `<pkg>/<file>`), so
@@ -763,6 +930,13 @@ mod tests {
             real_path: PathBuf::from("/s/v10/links/x"),
         };
         assert!(s.refusal("roll back").contains("enableGlobalVirtualStore"));
+        let s = SharedStore {
+            kind: SharedStoreKind::BunGlobalStore,
+            real_path: PathBuf::from("/c/links/x@1.0.0-abc/node_modules/x"),
+        };
+        let msg = s.refusal("patch");
+        assert!(msg.contains(SHARED_STORE_REFUSAL_MARKER), "{msg}");
+        assert!(msg.contains("globalStore = false"), "{msg}");
         let s = SharedStore {
             kind: SharedStoreKind::LinkedSource,
             real_path: PathBuf::from("/ws/packages/left-pad"),

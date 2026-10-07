@@ -544,6 +544,20 @@ fn decode_bun_store_entry_name(entry_name: &str) -> Option<(String, String)> {
     decode_pnpm_store_entry_name(entry_name).filter(|(_, version)| !version.contains('+'))
 }
 
+/// Whether the `.bun` entry `entry_name` of `store` is a link into Bun's
+/// global store (`[install] globalStore`, Bun >= 1.3.14, #635): every
+/// entry is then a link to `<cache>/links/<entry_name>-<hash>`, a dir
+/// shared by every project on the machine. The entry is still this
+/// project's installed copy (its transitive dependencies live nowhere
+/// else), so it is walked: VEX must see its bytes, and agent apply and
+/// rollback refuse it as shared (see [`crate::patch::shared_store`])
+/// instead of reporting it as not installed. Other links are skipped.
+fn is_bun_global_store_link_sync(store: &Path, entry_name: &str) -> bool {
+    std::fs::canonicalize(store.join(entry_name)).is_ok_and(|real| {
+        real.is_dir() && crate::patch::shared_store::is_bun_global_store_entry(&real, entry_name)
+    })
+}
+
 /// The `node_modules` child that is npm's `install-strategy=linked` store,
 /// also written by Yarn 4's pnpm linker (see
 /// [`store_entry_own_package_sync`]).
@@ -2580,7 +2594,12 @@ impl NpmCrawler {
             .into_iter()
             .filter(|entry| {
                 !(entry.name_str.starts_with('.') || entry.name_str == "node_modules")
-                    && entry.file_type.is_some_and(|ft| ft.is_dir())
+                    && entry.file_type.is_some_and(|ft| {
+                        ft.is_dir()
+                            || (ft.is_symlink()
+                                && layout == StoreLayout::Bun
+                                && is_bun_global_store_link_sync(store_path, &entry.name_str))
+                    })
             })
             .collect();
 
@@ -5630,6 +5649,65 @@ mod tests {
                 ("pkg:npm/@babel/code-frame@7.0.0", vec![frame.clone()]),
                 ("pkg:npm/to-regex-range@5.0.1", vec![hosted.clone()]),
                 ("pkg:npm/is-odd@3.0.1", vec![nm.join("is-odd")]),
+            ],
+            &number,
+            vec![number_twin.clone()],
+        )
+        .await;
+    }
+
+    /// #635: with Bun's global store (`[install] globalStore`, Bun >=
+    /// 1.3.14) every `.bun/<entry>` is a link to
+    /// `<cache>/links/<entry>-<hash>`, shared across projects. The project's
+    /// transitive packages live only there, so the walks follow those links
+    /// (reporting each copy under `.bun`, where apply then refuses it as
+    /// shared), and still skip a `.bun` link to anything else.
+    #[tokio::test]
+    async fn test_bun_global_store_transitive_packages_are_found() {
+        let dir = tempfile::tempdir().unwrap();
+        let tmp: PathBuf = dir.path().components().collect();
+        let root = tmp.join("proj");
+        let nm = root.join("node_modules");
+        let store = nm.join(".bun");
+        std::fs::create_dir_all(&store).unwrap();
+        let links = tmp.join("bun-cache").join("links");
+        let link_entry = |entry: &str, name: &str, version: &str| {
+            let shared = links.join(format!("{entry}-6a490709ba3c5c8f"));
+            write_pkg(&shared.join("node_modules").join(name), name, version);
+            link_dir(&shared, &store.join(entry));
+            store.join(entry).join("node_modules").join(name)
+        };
+
+        let odd = link_entry("is-odd@3.0.1", "is-odd", "3.0.1");
+        let number = link_entry("is-number@6.0.0", "is-number", "6.0.0");
+        let number_twin = link_entry("is-number@6.0.0+3c4e1d2a", "is-number", "6.0.0");
+        let frame = link_entry("@babel+code-frame@7.0.0", "@babel/code-frame", "7.0.0");
+        link_dir(&number, &odd.parent().unwrap().join("is-number"));
+        link_dir(&odd, &nm.join("is-odd"));
+        // A `.bun` link that is not into a global store entry.
+        let elsewhere = tmp.join("elsewhere");
+        write_pkg(
+            &elsewhere.join("node_modules/left-pad"),
+            "left-pad",
+            "1.3.0",
+        );
+        link_dir(&elsewhere, &store.join("left-pad@1.3.0"));
+
+        assert_store_copies_found(
+            &root,
+            &[
+                "pkg:npm/@babel/code-frame@7.0.0",
+                "pkg:npm/is-number@6.0.0",
+                "pkg:npm/is-odd@3.0.1",
+            ],
+            &[
+                (
+                    "pkg:npm/is-number@6.0.0",
+                    vec![number.clone(), number_twin.clone()],
+                ),
+                ("pkg:npm/@babel/code-frame@7.0.0", vec![frame.clone()]),
+                ("pkg:npm/is-odd@3.0.1", vec![nm.join("is-odd")]),
+                ("pkg:npm/left-pad@1.3.0", vec![]),
             ],
             &number,
             vec![number_twin.clone()],
