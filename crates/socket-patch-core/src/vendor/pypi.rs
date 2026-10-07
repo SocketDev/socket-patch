@@ -1414,7 +1414,7 @@ async fn guard_unwired_pypi_revert(
     uuid: &str,
     uuid_dir_rel: &str,
 ) -> Option<RevertOutcome> {
-    let clause = unwired_pypi_reference_clause(project_root, uuid).await?;
+    let clause = pypi_reference_clause(project_root, uuid, &[]).await?;
     let detail = format!(
         "refusing to remove {uuid_dir_rel}: the ledger entry records no pre-vendor wiring to \
          replay (it was likely reconstructed by `socket-patch repair`; the pre-vendor Python \
@@ -1434,18 +1434,22 @@ async fn guard_unwired_pypi_revert(
     })
 }
 
-/// The in-use probe behind [`guard_unwired_pypi_revert`]: `None` when every
-/// Python project file was read and none mentions the uuid dir; otherwise
-/// the human clause naming what blocks the revert. The probe list is the
-/// statically named project files, the root `requirements.txt` plus every
-/// `-r` include the planner may have written a pin into, and every Python
-/// lock the root directory LISTS (`uv.lock`, `pylock*.toml`, `*.py.lock`
-/// with its paired script). Every step fails closed: a root that cannot be
-/// listed, an include tree that cannot be read, or a listed lock (a symlink
-/// included — lstat only, so an unreadable target is still probed) that
-/// exists but cannot be read all block the revert, because none of them
-/// can prove the absence of a reference.
-async fn unwired_pypi_reference_clause(project_root: &Path, uuid: &str) -> Option<String> {
+/// The in-use probe behind [`guard_unwired_pypi_revert`] and the
+/// post-restore keep in [`revert_pypi_opts`]: `None` when every Python
+/// project file was read and none mentions the uuid dir; otherwise the human
+/// clause naming what blocks the deletion. The probe list is the statically
+/// named project files, the root `requirements.txt` plus every `-r` include
+/// the planner may have written a pin into, every Python lock the root
+/// directory LISTS (`uv.lock`, `pylock*.toml`, `*.py.lock` with its paired
+/// script), and every other root-level `*.txt` (a `uv export -o` target, or
+/// a `requirements-dev.txt` the user moved a vendor line into). `skip`
+/// names files left out of the probe (a dry run's not-yet-restored wiring).
+/// Every step fails closed: a root that cannot be listed, an include tree
+/// that cannot be read, or a listed file (a symlink included — lstat only,
+/// so an unreadable target is still probed) that exists but cannot be read
+/// all block the deletion, because none of them can prove the absence of a
+/// reference.
+async fn pypi_reference_clause(project_root: &Path, uuid: &str, skip: &[&str]) -> Option<String> {
     let needle = format!(".socket/vendor/pypi/{uuid}/");
     let mut names: Vec<String> = [
         "pyproject.toml",
@@ -1495,7 +1499,8 @@ async fn unwired_pypi_reference_clause(project_root: &Path, uuid: &str) -> Optio
         let Some(name) = entry.file_name().to_str().map(str::to_string) else {
             continue;
         };
-        if !crate::utils::python_lock::is_python_lock_name(&name) {
+        let is_lock = crate::utils::python_lock::is_python_lock_name(&name);
+        if !is_lock && !name.ends_with(".txt") {
             continue;
         }
         // lstat only: a regular file or ANY symlink is probed (the read
@@ -1508,14 +1513,19 @@ async fn unwired_pypi_reference_clause(project_root: &Path, uuid: &str) -> Optio
         {
             continue;
         }
-        if let Some(script) = crate::utils::python_lock::script_of_lock(&name) {
-            names.push(script.to_string());
+        if is_lock {
+            if let Some(script) = crate::utils::python_lock::script_of_lock(&name) {
+                names.push(script.to_string());
+            }
         }
         if !names.contains(&name) {
             names.push(name);
         }
     }
     for name in &names {
+        if skip.contains(&name.as_str()) {
+            continue;
+        }
         let path = project_root.join(name);
         match read_regular_to_string(&path).await {
             Ok(text) if text.contains(&needle) => {
@@ -1533,6 +1543,19 @@ async fn unwired_pypi_reference_clause(project_root: &Path, uuid: &str) -> Optio
         }
     }
     None
+}
+
+/// The `vendor_revert_residual_reference` keep for a file the flavor revert
+/// did not restore: names it and the way out.
+fn residual_reference_warning(uuid: &str, clause: &str) -> VendorWarning {
+    VendorWarning::new(
+        "vendor_revert_residual_reference",
+        format!(
+            "kept .socket/vendor/pypi/{uuid}/: {clause}, and deleting the vendored wheel would \
+             make every install from it fail; point that file back at the registry release \
+             (or re-export it from the restored lock) and re-run `vendor --revert`"
+        ),
+    )
 }
 
 /// `VendorEntry::flavor` values the dispatch below knows how to revert —
@@ -1616,7 +1639,22 @@ pub async fn revert_pypi_opts(
             }
         }
     };
-    if !outcome.success || dry_run {
+    if !outcome.success {
+        return outcome;
+    }
+    if dry_run {
+        // Preview the residual-reference keep below. The files the flavor
+        // would restore still carry its wiring, so they are left out; the
+        // keep itself is wet-only (`kept_artifact` contract), the warning
+        // alone tells the preview the artifact would stay.
+        if !entry.wiring.is_empty() && !keep_artifact {
+            let wired: Vec<&str> = entry.wiring.iter().map(|r| r.file.as_str()).collect();
+            if let Some(clause) = pypi_reference_clause(project_root, &entry.uuid, &wired).await {
+                outcome
+                    .warnings
+                    .push(residual_reference_warning(&entry.uuid, &clause));
+            }
+        }
         return outcome;
     }
     // LOSSINESS GUARD (the RevertOutcome contract every npm-family backend
@@ -1651,6 +1689,24 @@ pub async fn revert_pypi_opts(
     // entry), so only the deletion is skipped.
     if keep_artifact {
         return outcome;
+    }
+    // RESIDUAL-REFERENCE GUARD: the flavor restored only the files it
+    // recorded. Any other project file that still names the uuid dir — a
+    // `uv export`-ed requirements.txt or pylock.toml, a vendor line the user
+    // moved into a `-r` include or a sibling requirements file — would
+    // install from a deleted wheel. Keep the artifact and the ledger entry
+    // until nothing references it (an unwired entry already passed the same
+    // probe in `guard_unwired_pypi_revert`).
+    if !entry.wiring.is_empty() {
+        if let Some(clause) = pypi_reference_clause(project_root, &entry.uuid, &[]).await {
+            outcome
+                .warnings
+                .push(residual_reference_warning(&entry.uuid, &clause));
+            let uuid_dir_rel = vendor_uuid_dir_rel("pypi", &entry.uuid)
+                .unwrap_or_else(|| format!(".socket/vendor/pypi/{:?}", entry.uuid));
+            outcome.keep_artifact(&uuid_dir_rel);
+            return outcome;
+        }
     }
     // SECURITY: entry.uuid comes from the committed, tamper-able state.json
     // and names a directory for DELETION. Re-validate through the canonical
