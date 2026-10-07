@@ -1,6 +1,6 @@
 [agent] Progress ledger for the scheduled Bun bug-hunt routine (label pm:bun).
 
-Last updated: 2026-10-07 (run 27), main `9c43dfc`, latest release 4.0.0, latest Bun 1.4.2 (canary 1.4.3-canary.1).
+Last updated: 2026-10-07 (run 28), main `db83f01`, latest release 4.0.0, latest Bun 1.4.2 (canary 1.4.3-canary.1).
 
 Method (run 16 note: the sandbox shell exports `BUN_OPTIONS=--smol`, so unset it; run 17 note: on Bun ≥ 1.2, `bunfig [install] saveTextLockfile = false` writes a binary `bun.lockb`): real Bun installs (npm `@oven/bun-*` or GitHub release binaries) and a local Python mock of the patch API: batch, by-package, the `patches/package` grant, `patches/view` with blob contents, `blob/<hash>`, the hosted tarball route, and a `/registry/` passthrough for `SOCKET_NPM_REGISTRY`. Set `SOCKET_PATCH_SERVER_URL` to the mock. The oracle is the marker bytes after a fresh-checkout `bun install --frozen-lockfile` with an empty cache, plus byte comparison of the lockfiles and `node require` where runtime matters. The repo's own matrix (`scripts/backtest-bun.py`, `bun-compatibility.yml`) already covers plain hosted and vendored shapes across Bun 0.8.1–1.4.2. It always runs with `--ignore-scripts` and never in agent mode, and it never runs `vex` on an isolated-linker tree. This ledger tracks what it doesn't.
 
@@ -42,18 +42,20 @@ Run 26 (main unchanged at `9c43dfc`, so no re-triage): no new bugs. Explicit `tr
 
 Run 27 (main unchanged at `9c43dfc`, so no re-triage): new **#992**. Hosted `bun.lock` `rollback` / `remove` / hosted→vendored→`vendor --revert` write `""` into the registry slot, and Bun 1.1.39–1.3.6 resolve `""` against npmjs, ignoring the bunfig registry. Custom-registry projects then fail cold frozen installs (404), or silently bypass their mirror. Bun's own boundary is 1.3.7. Also passing: `preinstall` / `install` / `postinstall` on a scoped package with a `bin` and an unscoped preinstall-only package (hosted / vendored × text / `bun.lockb` × single / workspace × 1.2.23 / 1.3.9 / 1.4.2). In untrusted projects, rewiring doesn't start running scripts. `bun pm trust` and `--filter` work on 1.2.23. Plain re-installs leave a rewritten `bun.lockb` byte-identical. Bun 1.4.3-canary.1 passes hosted / vendored / agent, the takeover chain and rollback. Packages with only a sha1 `shasum` rewire fine. See the run 27 section below.
 
+Run 28 (new main `db83f01`): #992 and #861 still reproduce (the fix is pending in draft #1009). Verified on Linux: #367 (#873, registry-keyed `bun patch` kept, text + `bun.lockb`), #884 (#901, loud member refusal), #831 (#837, Bun `*.tgz` / `.socket/` ignores) and #963 (a refused vendored takeover keeps the Bun hosted pins). New: **#1019**. On Bun 1.4, a `bun patch` made after rewiring is keyed `name@<hosted URL | vendor path>`, which the #873 guard doesn't match, so superseding re-runs, takeovers, rollback and revert silently drop it. See the run 28 section below.
+
 ## Coverage matrix
 
 | OS | Bun | Agent: hoisted | Agent: isolated linker | Hosted/vendored: `bun patch` | Hosted/vendored: default-trusted scripts | Hosted → `vex`: isolated linker | Hosted rollback/remove byte-exact (text lock) | `bun.lockb` takeover ⇄ revert |
 | --- | --- | --- | --- | --- | --- | --- | --- | --- |
 | Linux | 1.1.39 / 1.1.40 | pass (1.1.39; run 12) | n/a | untested | untested | n/a | pass (v0 hosted + vendored; lockb refuses / semantic, as documented; run 12) | pass (1.1.39 single; workspace takeover refuses, documented; run 23) |
 | Linux | 1.1.45 | untested | n/a | untested | pass | n/a | pass (v0) | pass (semantic; run 10) |
-| Linux | 1.2.23 | pass | pass (opt-in; run 9; peer variants run 21) | fail #367 | pass | pass, but fail #599 after an in-place reinstall | pass (v1 single + workspace; run 21) | pass (semantic; workspace takeover refuses, documented; run 21) |
+| Linux | 1.2.23 | pass | pass (opt-in; run 9; peer variants run 21) | pass (#367 fixed, run 28) | pass | pass, but fail #599 after an in-place reinstall | pass (v1 single + workspace; run 21) | pass (semantic; workspace takeover refuses, documented; run 21) |
 | Linux | 1.3.0–1.3.4 | pass (1.3.0, 1.3.4) | pass (1.3.0, 1.3.4; run 9) | untested | pass | pass (1.3.0, 1.3.4; run 9) | pass (single: hosted + vendored; workspace: hosted, vendored refuses as documented) | pass (1.3.4 single + isolated workspace, semantic; run 23) |
 | Linux | 1.3.10 | pass (workspace; run 24) | pass (workspace; run 24) | untested | untested | untested | pass (v1 workspace hoisted + isolated; single vendored + superseding uuid + revert byte-exact; run 24) | pass (single + isolated workspace, semantic; run 23) |
 | Linux | 1.3.5–1.3.9 | pass (1.3.9; run 14) | pass (1.3.9; run 14; peer variants run 21) | fail #367 (1.3.9) | fail #371 | untested | pass (1.3.9 v1 single + workspace; run 21) | pass (1.3.9 semantic; workspace takeover refuses, documented; run 21) |
 | Linux | 1.3.14 | pass | pass (run 9) | fail #367 | fail #371 | pass fresh; fail #599 in place | pass (v1, workspace, catalog) | pass (semantic; vendored lockb isolated workspace too; run 10) |
-| Linux | 1.4.2 | pass; fail #635 with `globalStore`; fail #626 (first-party workspace member) | pass (run 9; peer-hash entries, symlink backend) | fail #367 (text + lockb) | fail #371 | pass fresh (text + lockb workspace); fail #599 in place | pass (v2, alias, overrides) | pass (semantic; not byte-exact, see Known non-bugs); workspace lockb → text migration healed by a re-run (#803 fixed, run 20); vendored re-run after a new dependent: fail #861 (isolated) |
+| Linux | 1.4.2 | pass; fail #635 with `globalStore`; fail #626 (first-party workspace member) | pass (run 9; peer-hash entries, symlink backend) | pass for registry keys (#367 fixed, text + lockb, run 28); fail #1019 for a `bun patch` made after rewiring | fail #371 | pass fresh (text + lockb workspace); fail #599 in place | pass (v2, alias, overrides) | pass (semantic; not byte-exact, see Known non-bugs); workspace lockb → text migration healed by a re-run (#803 fixed, run 20); vendored re-run after a new dependent: fail #861 (isolated) |
 | macOS | 1.2.23 | pass | fail #366 | fail #367 | untested | fail #405 | untested | untested |
 | macOS | 1.3.4 / 1.3.5 | untested | untested | untested | pass / fail #371 | untested | untested | untested |
 | macOS | 1.3.14 / 1.4.2 | pass | fail #366 | fail #367 | fail #371 (1.4.2) | fail #405 | untested | untested |
@@ -385,12 +387,24 @@ Other passes (Linux, 1.4.2 unless noted):
 | Hosted text-lock rollback / remove / takeover-revert with a bunfig custom registry, then a cold frozen install | 1.1.45 / 1.2.23 / 1.3.6 | **fail #992** |
 | Same | 1.3.7 / 1.4.2 | pass (only the `""` diff) |
 
+### Run 28 (Linux, main `db83f01`)
+| Cell | Bun | Result |
+| --- | --- | --- |
+| #992 re-triage: hosted rollback with bunfig registry → cold frozen install | 1.2.23 | fail #992 (still) |
+| #861 re-triage: isolated `bun.lockb` workspace, vendored re-run after a new member | 1.4.2 | fail #861 (6/8 EEXIST) |
+| #367: registry-keyed `bun patch` (plain + scoped) then hosted / vendored | 1.2.23 / 1.4.2 text, 1.4.2 lockb | pass (warn / refuse, user patch kept, siblings rewired) |
+| `bun patch` made after a hosted or vendored rewire (key `name@<url or vendor path>`), then a superseding re-run / takeover / rollback / revert | 1.4.2 text + lockb | **fail #1019** |
+| Same state | 1.2.23 / 1.3.9 | n/a (Bun's `bun patch --commit` crashes on URL-resolved packages) |
+| #884: hosted `scan` from a workspace member | 1.3.9 / 1.4.2 isolated | pass (`redirect_workspace_lockfile_elsewhere`, exit 1, nothing written) |
+| #831: vendored with `*.tgz` / `.socket/` in `.gitignore` | 1.4.2 text + lockb | pass (`*.tgz` kept via nested negation; `.socket/` fails closed) |
+| #963: hosted text-v1 workspace → refused `scan --mode vendored` | 1.2.23 / 1.3.9 | pass (hosted pins kept, frozen install patched) |
+
 ## Backlog
 
 0. **Maintainer request (partly covered in runs 3 and 6):** global (`-g`) mode for hosted patches. Still to do: a non-writable global dir must fail loudly (needs a probe; the sandbox runs as root); Windows 1.1.45/1.2.23 with an ASCII temp path; Bun 1.0.x. #443 is still open; re-test #434 (`bun.cmd`) on Windows now that #442 has landed. Checklist: the 20261001T040000Z entry.
 1. A maintainer needs to delete the probe branches `bughunt/bun/20260930-default-trust`, `bughunt/bun/20260930-isolated-bunpatch`, `bughunt/bun/20261001-vex-isolated` and `bughunt/bun/20261001-global-dirs`. Deletion is still refused from the sandbox (runs 7–26; run 26: blocked by the session permission classifier), so no new probes until then.
-2. #861: macOS/Windows; re-test when fixed (the existing-member `bun add` variant reproduces, run 23). #884 (Bun member shape) and #367 (PR #873): re-test when merged.
-3. #831: re-test on Bun (text, `bun.lockb`, workspace) once #837 lands. #764 follow-up: macOS/Windows. Real Windows autocrlf checkouts.
+2. #861: macOS/Windows; re-test when fixed (the existing-member `bun add` variant reproduces, run 23). #884 and #367 verified fixed on Linux (run 28). #1019: workspace members, Bun 1.4.0-written keys, macOS/Windows; re-test when fixed. Most open issues are claimed by draft #1009: re-test all of them when it merges.
+3. #831: verified on Bun 1.4.2 text + `bun.lockb` (run 28); the isolated-workspace cell is still to do. `vendor --check` after `bun remove` (#970). #764 follow-up: macOS/Windows. Real Windows autocrlf checkouts.
 4. #861, #831, #784, #764, #635, #599 and #497: re-test when fixed. #626 on Bun once PR #634 merges. Also `globalStore` + workspaces and `globalStore` on macOS/Windows. (#605/#774 store copies on Bun peer-variant entries: pass, run 21.)
 5. macOS/Windows re-runs of the #366 / #405 / #469 / #803 fixes (Windows isolated uses junctions).
 6. #497 `github:` tuples (needs a probe).
@@ -399,6 +413,10 @@ Other passes (Linux, 1.4.2 unless noted):
 9. Digest boundary with a valid substitute tarball, 1.3.9 text lock vs 1.3.10 (low priority, documented limitation).
 
 ## Known non-bugs
+
+- Vendored `scan --dry-run` previews a `bun patch`ed package (`patchedDependencies` `name@version`) as `would_vendor`, while the wet run refuses it `vendor_lock_entry_unsupported` (exit 1). That's documented scope: `would_refuse` predicts only the Bun preflight lock codes (CLI_CONTRACT `would_refuse` row; `scan/vendor_flow.rs:80` "outside the preflights are not predicted"). Run 28.
+- Bun 1.2.23 / 1.3.9 `bun patch --commit` crashes (SIGILL) on a package resolved to a URL tarball. That's a Bun bug. Bun 1.4.2 works and keys the patch by the URL (#1019).
+- Mock fixture: decode by-package purls twice (`%2540` for scoped names), or scoped patches look unpatched.
 
 - A registry document with only a sha1 `shasum` and no `integrity` makes the hosted text-lock restore refuse with `the registry records no integrity` and the checkout remedy (fail closed, generic npm-family code). npmjs has backfilled `integrity` on old versions (minimist 0.0.8, left-pad 0.0.3, qs 0.6.6, lodash 1.0.0 all checked), so it's only reachable on bare private registries. Not filed (run 27).
 - Lifecycle `prepare` doesn't run for registry or tarball dependencies, on any Bun version, with or without socket-patch.
