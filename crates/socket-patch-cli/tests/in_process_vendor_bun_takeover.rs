@@ -35,6 +35,10 @@
 //!      `vendor_bun_workspace_unsupported` BEFORE the takeover restores
 //!      anything, so the hosted wiring survives byte-for-byte; the v2 twin
 //!      still takes over.
+//!   6. A project with its own registries (bunfig `[install] registry` and
+//!      `[install.scopes]`, #992): `remove <purl>` and the takeover +
+//!      `vendor --revert` chain keep each registry's tarball URL in the
+//!      slot (`in_process_vendor_bun_takeover/registry.rs`).
 //!
 //! Every child process gets the ambient `SOCKET_*` vars scrubbed and
 //! telemetry hard-disabled; each test runs in its own tempdir.
@@ -53,6 +57,8 @@ use wiremock::{Mock, MockServer, ResponseTemplate};
 
 #[path = "vex_e2e_common/bun.rs"]
 mod bun_vex;
+#[path = "in_process_vendor_bun_takeover/registry.rs"]
+mod registry;
 #[path = "in_process_vendor_bun_takeover/vlt.rs"]
 mod vlt;
 #[path = "vlt_hosted_common/mod.rs"]
@@ -353,6 +359,15 @@ fn run_cli(cwd: &Path, args: &[&str]) -> (i32, String, String) {
         if key.starts_with("SOCKET_") && key != "SOCKET_NO_CONFIG" {
             cmd.env_remove(key);
         }
+    }
+    // A registry exported by npm (`npm_config_registry`) or Bun would
+    // steer the Bun restores off the fixtures' registries (#992).
+    for key in [
+        "BUN_CONFIG_REGISTRY",
+        "NPM_CONFIG_REGISTRY",
+        "npm_config_registry",
+    ] {
+        cmd.env_remove(key);
     }
     cmd.env("SOCKET_TELEMETRY_DISABLED", "1")
         .env("SOCKET_NPM_REGISTRY", registry_uri());

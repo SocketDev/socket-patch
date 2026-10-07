@@ -93,6 +93,15 @@ impl Project {
                 cmd.env_remove(key);
             }
         }
+        // A registry exported by npm (`npm_config_registry`) or Bun would
+        // steer the takeover's restore off the fixtures' registry (#992).
+        for key in [
+            "BUN_CONFIG_REGISTRY",
+            "NPM_CONFIG_REGISTRY",
+            "npm_config_registry",
+        ] {
+            cmd.env_remove(key);
+        }
         let uri = self.server.uri();
         cmd.env("SOCKET_TELEMETRY_DISABLED", "1")
             .env("SOCKET_API_URL", &uri)
@@ -397,6 +406,132 @@ async fn rollback_and_offline_vendor_refuse_with_the_checkout_remedy() {
         "{env:#}"
     );
     assert_eq!(p.lock(), hosted, "a refused rollback writes nothing");
+}
+
+/// #992: in a project whose `bunfig.toml` names a mirror, the takeover
+/// rebuilds the binary record with the tarball URL the mirror's version
+/// document advertises (Bun fetches from the URL the record holds), the
+/// vendor ledger keeps it as the original, and `vendor --revert` writes it
+/// back. A second hosted → vendored → revert round trip from that lock
+/// lands on it byte for byte.
+#[tokio::test]
+async fn takeover_and_revert_keep_the_bunfig_registry_tarball_url() {
+    let p = hosted_project("1.1.38").await;
+    // An off-path (CDN-style) URL: a restore that fell back to the default
+    // registry and re-based its conventional URL cannot produce it.
+    let mirror_tarball = format!("{}/mirror-cdn/minimist-1.2.2.tgz", p.server.uri());
+    Mock::given(method("GET"))
+        .and(path("/mirror/minimist/1.2.2"))
+        .respond_with(ResponseTemplate::new(200).set_body_json(json!({
+            "name": "minimist",
+            "version": "1.2.2",
+            "dist": { "tarball": mirror_tarball, "integrity": UPSTREAM_INTEGRITY }
+        })))
+        .mount(&p.server)
+        .await;
+    std::fs::write(
+        p.root().join("bunfig.toml"),
+        format!("[install]\nregistry = \"{}/mirror/\"\n", p.server.uri()),
+    )
+    .unwrap();
+    stage_record(p.root());
+
+    let mut reverted: Option<Vec<u8>> = None;
+    for round in 0..2 {
+        if let Some(lock) = &reverted {
+            // Pin the mirror lock hosted again, as `scan --mode hosted` does.
+            let dep: DepOverride = serde_json::from_value(json!({
+                "ecosystem": "npm",
+                "name": "minimist",
+                "version": "1.2.2",
+                "token": GRANT,
+                "patchUuid": UUID,
+                "artifactUrl": p.hosted_url(),
+                "integrity": { "sha512": format!(
+                    "sha512-{}", base64::engine::general_purpose::STANDARD.encode([42u8; 64])) }
+            }))
+            .unwrap();
+            let mut rewrite = RewriteResult::default();
+            rewrite_bun_binary(lock, &[dep], &mut rewrite);
+            assert!(rewrite.warnings.is_empty(), "{:?}", rewrite.warnings);
+            std::fs::write(
+                p.root().join("bun.lockb"),
+                &rewrite.binary_files["bun.lockb"],
+            )
+            .unwrap();
+        }
+
+        let (code, env) = p.run_json(&["vendor"]);
+        assert_eq!(
+            code, 0,
+            "round {round}: vendor over the hosted pin: {env:#}"
+        );
+        assert_eq!(env["summary"]["applied"], 1, "round {round}: {env:#}");
+        let codes = codes(&env);
+        assert!(
+            codes
+                .iter()
+                .any(|c| c == "vendor_takeover_reverted_redirect"),
+            "round {round}: {env:#}"
+        );
+        assert!(
+            !codes.iter().any(|c| c == "upstream_registry_fallback"),
+            "round {round}: the mirror was readable: {env:#}"
+        );
+        let original = vendored_original(p.root());
+        assert_eq!(
+            original["resolution"], mirror_tarball,
+            "round {round}: {original}"
+        );
+        assert_eq!(
+            original["integrity"], UPSTREAM_INTEGRITY,
+            "round {round}: {original}"
+        );
+
+        let (code, env) = p.run_json(&["vendor", "--revert"]);
+        assert_eq!(code, 0, "round {round}: revert: {env:#}");
+        let lock = p.lock();
+        let text = String::from_utf8_lossy(&lock);
+        // The string pool keeps the replaced npmjs URL as dead bytes (the
+        // codec appends); the record references the mirror's.
+        assert!(
+            text.contains(&mirror_tarball),
+            "round {round}: the reverted record fetches from the mirror"
+        );
+        assert!(
+            !text.contains(GRANT) && !text.contains(".socket/vendor"),
+            "round {round}: no hosted or vendored residue"
+        );
+        if let Some(first) = &reverted {
+            assert!(
+                &lock == first,
+                "a mirror lock round-trips through hosted, vendored and revert byte for byte"
+            );
+        }
+        reverted = Some(lock);
+    }
+
+    // The reverted lock's own record (what a plain vendor snapshots from
+    // it) is the mirror's, not just a string left in its pool.
+    let reverted = reverted.unwrap();
+    let (code, env) = p.run_json(&["vendor"]);
+    assert_eq!(code, 0, "vendor over the reverted lock: {env:#}");
+    assert_eq!(vendored_original(p.root())["resolution"], mirror_tarball);
+    let (code, env) = p.run_json(&["vendor", "--revert"]);
+    assert_eq!(code, 0, "{env:#}");
+    assert!(p.lock() == reverted, "the plain revert is exact");
+}
+
+/// The vendor ledger's recorded pre-vendor `bun_lockb_package` record.
+fn vendored_original(root: &Path) -> Value {
+    let state: Value =
+        serde_json::from_slice(&std::fs::read(root.join(".socket/vendor/state.json")).unwrap())
+            .unwrap();
+    state["entries"][PURL]["wiring"]
+        .as_array()
+        .and_then(|w| w.iter().find(|r| r["kind"] == "bun_lockb_package"))
+        .map(|r| r["original"].clone())
+        .unwrap_or_else(|| panic!("bun_lockb_package wiring: {state:#}"))
 }
 
 /// A Bun workspace's member-relative mirror of the vendored tarball goes
