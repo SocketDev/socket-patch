@@ -1060,7 +1060,7 @@ mod tests {
             "text-2/git",
         ] {
             let text = std::fs::read_to_string(root.join(dir).join("bun.lock")).unwrap();
-            for wired in [&hosted, &vendored] {
+            for (mode, wired) in [("hosted", &hosted), ("vendored", &vendored)] {
                 let lock: String = text
                     .lines()
                     .map(
@@ -1080,7 +1080,7 @@ mod tests {
                 assert_eq!(
                     unversioned_contests(&out),
                     1,
-                    "{dir} {wired}: {:#?}",
+                    "{dir} {mode}: {:#?}",
                     out.diagnostics
                 );
 
@@ -1092,13 +1092,13 @@ mod tests {
                 let p = Project::new();
                 p.write("bun.lock", &without_root);
                 let out = run(&p).await;
-                assert_eq!(out.refs.len(), 1, "{dir} {wired} control: {:#?}", out);
-                assert_eq!(unversioned_contests(&out), 0, "{dir} {wired} control");
+                assert_eq!(out.refs.len(), 1, "{dir} {mode} control: {:#?}", out);
+                assert_eq!(unversioned_contests(&out), 0, "{dir} {mode} control");
             }
         }
         for shape in ["file", "url", "git"] {
             let bytes = std::fs::read(root.join("lockb").join(shape).join("bun.lockb")).unwrap();
-            for wired in [&hosted, &vendored] {
+            for (mode, wired) in [("hosted", &hosted), ("vendored", &vendored)] {
                 let mut lock = crate::vendor::bun_lockb::BunLockb::parse(&bytes).unwrap();
                 let id = lock
                     .packages()
@@ -1115,7 +1115,7 @@ mod tests {
                 assert_eq!(
                     unversioned_contests(&out),
                     1,
-                    "{shape} {wired}: {:#?}",
+                    "{shape} {mode}: {:#?}",
                     out.diagnostics
                 );
             }
@@ -1162,7 +1162,7 @@ mod tests {
         let hosted = hosted_url("npm", "is-number", "6.0.0", UUID_A, "is-number-6.0.0.tgz");
         let vendored = format!(".socket/vendor/npm/{UUID_A}/is-number-6.0.0.tgz");
         for shape in ["url", "file"] {
-            for wired in [&hosted, &vendored] {
+            for (mode, wired) in [("hosted", &hosted), ("vendored", &vendored)] {
                 let bytes = std::fs::read(
                     fixture_path("bun-lockb-user-tarball")
                         .join(shape)
@@ -1185,7 +1185,7 @@ mod tests {
                 assert_eq!(
                     user_tarball_contests(&out),
                     1,
-                    "{shape} {wired}: {:#?}",
+                    "{shape} {mode}: {:#?}",
                     out.diagnostics
                 );
             }
