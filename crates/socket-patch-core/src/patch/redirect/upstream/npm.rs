@@ -825,9 +825,9 @@ async fn restore_berry(
 /// What decides whether pnpm records a resolution's `tarball:` in the lock
 /// at `rel`, read from its sibling settings files.
 struct PnpmTarballPolicy {
-    /// `lockfileIncludeTarballUrl` in pnpm-workspace.yaml (pnpm 10+, which
-    /// wins over `.npmrc`), else `lockfile-include-tarball-url` in `.npmrc`:
-    /// every resolution carries its tarball.
+    /// pnpm's `lockfileIncludeTarballUrl` was in effect when it wrote the
+    /// lock, so every resolution carries its tarball
+    /// (see [`pnpm_include_tarball`]).
     always: bool,
     /// The sibling `.npmrc`, whose `registry` / `@scope:registry` name the
     /// registry pnpm resolves a package against (see [`pnpm_lookup_registry`]).
@@ -864,34 +864,174 @@ fn pnpm_lookup_registry(npmrc: Option<&str>, name: &str) -> Option<String> {
         .filter(|value| !value.contains("${"))
 }
 
-async fn pnpm_tarball_policy(view: &mut View<'_>, rel: &str) -> PnpmTarballPolicy {
+/// Whether pnpm wrote the lock `text` under `lockfileIncludeTarballUrl`
+/// (#902). The setting lives in pnpm-workspace.yaml or `.npmrc`, but which
+/// of those pnpm reads depends on its major: pnpm <= 9 ignores workspace
+/// settings, pnpm 11+ ignores pnpm settings in `.npmrc`, and pnpm 10 reads
+/// both (the workspace file wins). Strongest signal first:
+///
+/// 1. the lock's own unpinned registry resolutions ([`pnpm_lock_tarball_evidence`]);
+/// 2. the settings file the installed pnpm major (`pm_major`, or a pre-9
+///    lock / shrinkwrap, which only pnpm <= 8 writes) reads;
+/// 3. with neither, pnpm 10's reading (workspace file, else `.npmrc`).
+///    That covers a lock with no sibling install record (a fresh clone, a
+///    Rush lock whose node_modules lives in common/temp) and only pinned
+///    entries; a global `~/.npmrc` or `npm_config_*` setting is only
+///    visible through tier 1.
+fn pnpm_include_tarball(
+    text: &str,
+    workspace: Option<&str>,
+    npmrc: Option<&str>,
+    pm_major: Option<u32>,
+    is_hosted: impl Fn(&str) -> bool,
+) -> bool {
     use super::super::npmrc::npmrc_top_level_value;
+    use crate::formats::pnpm::lock_version_major;
 
+    if let Some(evidence) = pnpm_lock_tarball_evidence(text, npmrc, is_hosted) {
+        return evidence;
+    }
+    let from_workspace =
+        || workspace.and_then(|text| yaml_top_level_value(text, "lockfileIncludeTarballUrl"));
+    let from_npmrc = || {
+        npmrc
+            .and_then(|text| npmrc_top_level_value(text, "lockfile-include-tarball-url"))
+            .map(|value| value.trim().to_string())
+    };
+    let legacy_lock = lock_version_major(text).is_some_and(|major| major < 9)
+        || text
+            .lines()
+            .any(|line| line.starts_with("shrinkwrapVersion:"));
+    let major = pm_major.or(legacy_lock.then_some(8));
+    let value = match major {
+        Some(major) if major <= 9 => from_npmrc(),
+        Some(major) if major >= 11 => from_workspace(),
+        _ => from_workspace().or_else(from_npmrc),
+    };
+    value.is_some_and(|value| value == "true")
+}
+
+/// What the lock's unpinned registry resolutions (integrity, a registry
+/// key, no `type` / `directory` / `commit` / `repo`, a non-hosted and
+/// non-`file:` tarball if any) say about `lockfileIncludeTarballUrl`.
+/// With it on, pnpm records `tarball:` on every one of them, so a single
+/// bare one proves it off, whatever else the lock holds (a conventional
+/// URL can still appear with it off, under a second registry). With no
+/// bare one, a tarball pnpm could have derived proves it on. `None`: no
+/// such resolution (an unconventional URL is recorded either way).
+fn pnpm_lock_tarball_evidence(
+    text: &str,
+    npmrc: Option<&str>,
+    is_hosted: impl Fn(&str) -> bool,
+) -> Option<bool> {
+    use crate::formats::pnpm::{classify_pnpm_key, pnpm_packages, PnpmKey};
+
+    let mut derived = false;
+    for package in pnpm_packages(text) {
+        let PnpmKey::Registry { name, version } = classify_pnpm_key(package.key) else {
+            continue;
+        };
+        let Some(resolution) = package.resolution.as_ref() else {
+            continue;
+        };
+        if resolution.integrity().is_none()
+            || resolution
+                .fields
+                .iter()
+                .any(|(k, _)| matches!(*k, "type" | "directory" | "commit" | "repo"))
+        {
+            continue;
+        }
+        match resolution.tarball() {
+            None => return Some(false),
+            Some(tarball) if tarball.starts_with("file:") || is_hosted(tarball) => {}
+            Some(tarball) => {
+                derived |= registry_derives_tarball(
+                    pnpm_lookup_registry(npmrc, name).as_deref(),
+                    name,
+                    version,
+                    tarball,
+                );
+            }
+        }
+    }
+    derived.then_some(true)
+}
+
+/// The major of a `pnpm@<version>` package-manager spec (`.modules.yaml`'s
+/// `packageManager`, package.json's corepack pin, `+sha…` suffix allowed).
+fn pnpm_spec_major(spec: &str) -> Option<u32> {
+    let version = spec
+        .trim()
+        .trim_matches(['"', '\''])
+        .strip_prefix("pnpm@")?;
+    let major = version.split(['.', '+', '-']).next()?;
+    major.parse().ok()
+}
+
+/// The pnpm major an install record names: `node_modules/.modules.yaml`'s
+/// `packageManager` (JSON on pnpm 10+, a top-level YAML scalar before).
+fn modules_yaml_pnpm_major(text: &str) -> Option<u32> {
+    let text = crate::utils::serde::strip_bom(text);
+    if let Ok(value) = serde_json::from_str::<serde_json::Value>(text) {
+        return value
+            .get("packageManager")
+            .and_then(|v| v.as_str())
+            .and_then(pnpm_spec_major);
+    }
+    yaml_top_level_value(text, "packageManager")
+        .as_deref()
+        .and_then(pnpm_spec_major)
+}
+
+/// The pnpm major package.json's corepack `packageManager` pins.
+fn package_json_pnpm_major(text: &str) -> Option<u32> {
+    serde_json::from_str::<serde_json::Value>(crate::utils::serde::strip_bom(text))
+        .ok()?
+        .get("packageManager")?
+        .as_str()
+        .and_then(pnpm_spec_major)
+}
+
+/// The text of `name` next to the lock (`dir_prefix`); `None` when absent
+/// or unreadable.
+async fn read_sibling(view: &mut View<'_>, dir_prefix: &str, name: &str) -> Option<String> {
+    view.read(&format!("{dir_prefix}{name}"))
+        .await
+        .ok()
+        .flatten()
+}
+
+async fn pnpm_tarball_policy(
+    view: &mut View<'_>,
+    rel: &str,
+    text: &str,
+    ctx: &Ctx<'_>,
+) -> PnpmTarballPolicy {
     let dir_prefix = match rel.rsplit_once('/') {
         Some((dir, _)) => format!("{dir}/"),
         None => String::new(),
     };
-    let workspace = view
-        .read(&format!("{dir_prefix}pnpm-workspace.yaml"))
+    let workspace = read_sibling(view, &dir_prefix, "pnpm-workspace.yaml").await;
+    let npmrc = read_sibling(view, &dir_prefix, ".npmrc").await;
+    // What installed the project, else what it pins.
+    let mut pm_major = read_sibling(view, &dir_prefix, "node_modules/.modules.yaml")
         .await
-        .ok()
-        .flatten();
-    let npmrc = view
-        .read(&format!("{dir_prefix}.npmrc"))
-        .await
-        .ok()
-        .flatten();
-    let npmrc_value = |key: &str| {
-        npmrc
-            .as_deref()
-            .and_then(|text| npmrc_top_level_value(text, key))
-            .map(|value| value.trim().to_string())
-    };
-    let always = workspace
         .as_deref()
-        .and_then(|text| yaml_top_level_value(text, "lockfileIncludeTarballUrl"))
-        .or_else(|| npmrc_value("lockfile-include-tarball-url"))
-        .is_some_and(|value| value == "true");
+        .and_then(modules_yaml_pnpm_major);
+    if pm_major.is_none() {
+        pm_major = read_sibling(view, &dir_prefix, "package.json")
+            .await
+            .as_deref()
+            .and_then(package_json_pnpm_major);
+    }
+    let always = pnpm_include_tarball(
+        text,
+        workspace.as_deref(),
+        npmrc.as_deref(),
+        pm_major,
+        |url| ctx.hosted_uuid(url).is_some(),
+    );
     PnpmTarballPolicy { always, npmrc }
 }
 
@@ -941,7 +1081,7 @@ pub(crate) async fn restore_pnpm_locks(
             .iter()
             .map(|(_, u, n, v)| (u.clone(), n.clone(), v.clone()))
             .collect();
-        let policy = pnpm_tarball_policy(view, rel).await;
+        let policy = pnpm_tarball_policy(view, rel, &text, ctx).await;
         let dists = fetch_dists_on(&wanted, |name| policy.registry(name), ctx, &mut result).await;
         let mut splices: Vec<(std::ops::Range<usize>, String)> = Vec::new();
         let mut handled: Vec<String> = Vec::new();
@@ -1193,9 +1333,115 @@ pub(crate) async fn cleanup_side_config(
 #[cfg(test)]
 mod tests {
     use super::{
-        berry_lookup_registry, berry_registry_locator, non_default_registry, pnpm_lookup_registry,
+        berry_lookup_registry, berry_registry_locator, modules_yaml_pnpm_major,
+        non_default_registry, package_json_pnpm_major, pnpm_include_tarball, pnpm_lookup_registry,
         registry_derives_tarball, yaml_top_level_value,
     };
+
+    const HOSTED: &str = "https://patch.test/npm/u/a-1.0.0.tgz";
+    const WS_ON: &str = "packages:\n  - '.'\nlockfileIncludeTarballUrl: true\n";
+    const RC_ON: &str = "lockfile-include-tarball-url=true\n";
+
+    /// A v9 lock: `a@1.0.0` pinned to the hosted tarball, plus `extra`
+    /// `packages:` entries.
+    fn lock(extra: &str) -> String {
+        format!(
+            "lockfileVersion: '9.0'\n\npackages:\n  a@1.0.0:\n    \
+             resolution: {{integrity: sha512-A==, tarball: {HOSTED}}}\n{extra}\n\
+             snapshots:\n  a@1.0.0: {{}}\n"
+        )
+    }
+
+    fn include(text: &str, ws: Option<&str>, rc: Option<&str>, major: Option<u32>) -> bool {
+        pnpm_include_tarball(text, ws, rc, major, |url| url == HOSTED)
+    }
+
+    /// #902 tier 1: the lock's unpinned registry resolutions decide.
+    #[test]
+    fn pnpm_include_tarball_follows_lock_evidence() {
+        let bare = "  b@2.0.0:\n    resolution: {integrity: sha512-B==}\n";
+        let conventional = "  c@3.0.0:\n    resolution: {integrity: sha512-C==, \
+                            tarball: https://registry.npmjs.org/c/-/c-3.0.0.tgz}\n";
+        // A bare sibling: the setting was off, whatever .npmrc says.
+        assert!(!include(&lock(bare), None, Some(RC_ON), None));
+        assert!(!include(&lock(bare), Some(WS_ON), Some(RC_ON), Some(10)));
+        // A derivable tarball on the sibling: it was on, with no setting seen.
+        assert!(include(&lock(conventional), None, None, Some(9)));
+        // Mixed: bare wins (the conventional one is under a second registry).
+        let mixed = format!("{bare}{conventional}");
+        assert!(!include(&lock(&mixed), None, Some(RC_ON), None));
+        // Unconventional, `file:`, git and integrity-less entries are no
+        // evidence either way: the settings decide.
+        for silent in [
+            "  d@1.0.0:\n    resolution: {integrity: sha512-D==, tarball: https://cdn.example/d.tgz}\n",
+            "  e@file:.socket/vendor/npm/x/e-1.0.0.tgz:\n    resolution: {integrity: sha512-E==, tarball: file:.socket/vendor/npm/x/e-1.0.0.tgz}\n",
+            "  f@1.0.0:\n    resolution: {integrity: sha512-F==, tarball: file:x.tgz}\n",
+            "  g@1.0.0:\n    resolution: {type: git, repo: https://g.example/g, commit: abc}\n",
+            "  h@1.0.0:\n    resolution: {tarball: https://registry.npmjs.org/h/-/h-1.0.0.tgz}\n",
+        ] {
+            assert!(include(&lock(silent), None, Some(RC_ON), None), "{silent}");
+            assert!(!include(&lock(silent), None, None, None), "{silent}");
+        }
+    }
+
+    /// #902 tier 2: the settings file the installed pnpm major reads.
+    #[test]
+    fn pnpm_include_tarball_reads_the_settings_file_of_the_pnpm_major() {
+        let text = lock("");
+        // pnpm <= 9 ignores pnpm-workspace.yaml settings.
+        assert!(!include(&text, Some(WS_ON), None, Some(9)));
+        assert!(include(&text, None, Some(RC_ON), Some(9)));
+        // pnpm 10 reads both, the workspace file winning.
+        assert!(include(&text, Some(WS_ON), None, Some(10)));
+        assert!(include(&text, None, Some(RC_ON), Some(10)));
+        let ws_off = "lockfileIncludeTarballUrl: false\n";
+        assert!(!include(&text, Some(ws_off), Some(RC_ON), Some(10)));
+        // pnpm 11+ ignores pnpm settings in .npmrc.
+        for major in [11, 12] {
+            assert!(!include(&text, None, Some(RC_ON), Some(major)));
+            assert!(include(&text, Some(WS_ON), None, Some(major)));
+        }
+        // Unknown major: pnpm 10's reading.
+        assert!(include(&text, Some(WS_ON), None, None));
+        assert!(include(&text, None, Some(RC_ON), None));
+        // Only pnpm <= 8 writes a pre-9 lock or a shrinkwrap.yaml.
+        let v6 = text.replace("'9.0'", "'6.0'");
+        assert!(!include(&v6, Some(WS_ON), None, None));
+        assert!(include(&v6, None, Some(RC_ON), None));
+        let shrinkwrap = format!(
+            "shrinkwrapVersion: 3\n{}",
+            text.replace("lockfileVersion: '9.0'\n", "")
+        );
+        assert!(!include(&shrinkwrap, Some(WS_ON), None, None));
+    }
+
+    #[test]
+    fn pnpm_major_from_install_record_and_package_json() {
+        let json = "{\n  \"layoutVersion\": 5,\n  \"packageManager\": \"pnpm@11.28.3\"\n}\n";
+        assert_eq!(modules_yaml_pnpm_major(json), Some(11));
+        assert_eq!(
+            modules_yaml_pnpm_major("\u{feff}layoutVersion: 5\npackageManager: pnpm@9.15.9\n"),
+            Some(9)
+        );
+        assert_eq!(
+            modules_yaml_pnpm_major("packageManager: 'pnpm@8.6.0'\n"),
+            Some(8)
+        );
+        assert_eq!(
+            modules_yaml_pnpm_major("packageManager: yarn@4.0.0\n"),
+            None
+        );
+        assert_eq!(modules_yaml_pnpm_major("{}"), None);
+        assert_eq!(
+            package_json_pnpm_major(r#"{"packageManager":"pnpm@10.4.1+sha512.abc"}"#),
+            Some(10)
+        );
+        assert_eq!(
+            package_json_pnpm_major(r#"{"packageManager":"npm@10.0.0"}"#),
+            None
+        );
+        assert_eq!(package_json_pnpm_major("not json"), None);
+    }
 
     #[test]
     fn pnpm_reads_the_npmrc_registry_and_scope_registries() {

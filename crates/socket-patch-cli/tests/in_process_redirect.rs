@@ -4987,6 +4987,188 @@ async fn pnpm_rollback_keeps_the_mirror_tarball_under_include_tarball_url() {
     assert_eq!(pnpm_pin_and_rollback(tmp.path(), &server), pristine);
 }
 
+/// `remove <PURL>` as a subprocess, like [`rollback_json`].
+fn remove_json(cwd: &Path, registry: &MockServer) -> (Option<i32>, serde_json::Value) {
+    let out = scrubbed_cli()
+        .args([
+            "remove",
+            PURL,
+            "--json",
+            "--yes",
+            "--patch-server-url",
+            "http://patch.test",
+            "--cwd",
+            cwd.to_str().unwrap(),
+        ])
+        .env(
+            "SOCKET_NPM_REGISTRY",
+            format!("{}/npm-registry", registry.uri()),
+        )
+        .output()
+        .expect("run socket-patch remove");
+    let env_json: serde_json::Value = serde_json::from_slice(&out.stdout).unwrap_or_else(|e| {
+        panic!(
+            "remove --json stdout must be JSON: {e}\nstdout:\n{}\nstderr:\n{}",
+            String::from_utf8_lossy(&out.stdout),
+            String::from_utf8_lossy(&out.stderr)
+        )
+    });
+    (out.status.code(), env_json)
+}
+
+/// The `node_modules/.modules.yaml` install record pnpm 10+ writes (JSON),
+/// naming `pnpm@{version}` as the pnpm that installed the project.
+fn write_pnpm_modules_json(root: &Path, version: &str) {
+    std::fs::write(
+        root.join("node_modules/.modules.yaml"),
+        format!(
+            "{{\n  \"layoutVersion\": 5,\n  \"nodeLinker\": \"isolated\",\n  \
+             \"packageManager\": \"pnpm@{version}\",\n  \"pendingBuilds\": []\n}}\n"
+        ),
+    )
+    .unwrap();
+}
+
+/// #902: pnpm 11/12 ignore `lockfile-include-tarball-url` in `.npmrc`, so
+/// the lock they wrote has no `tarball:` and `rollback` must keep it that
+/// way, byte-exact.
+#[tokio::test]
+#[serial]
+async fn pnpm_rollback_stays_bare_when_pnpm11_ignores_npmrc_include_tarball_url() {
+    let server = MockServer::start().await;
+    mock_discovery(&server).await;
+    mock_reference(&server).await;
+    mock_view(&server).await;
+    mock_npm_registry(&server, "sha512-UPSTREAMupstream==", None).await;
+
+    let tmp = tempfile::tempdir().unwrap();
+    write_pnpm_project(tmp.path());
+    write_pnpm_modules_json(tmp.path(), "11.28.3");
+    std::fs::write(
+        tmp.path().join(".npmrc"),
+        "lockfile-include-tarball-url=true\n",
+    )
+    .unwrap();
+    let pristine = std::fs::read_to_string(tmp.path().join("pnpm-lock.yaml")).unwrap();
+    assert_eq!(pnpm_pin_and_rollback(tmp.path(), &server), pristine);
+}
+
+/// #902, `remove` shares the restore: same project as above.
+#[tokio::test]
+#[serial]
+async fn pnpm_remove_stays_bare_when_pnpm12_ignores_npmrc_include_tarball_url() {
+    let server = MockServer::start().await;
+    mock_discovery(&server).await;
+    mock_reference(&server).await;
+    mock_view(&server).await;
+    mock_npm_registry(&server, "sha512-UPSTREAMupstream==", None).await;
+
+    let tmp = tempfile::tempdir().unwrap();
+    write_pnpm_project(tmp.path());
+    write_pnpm_modules_json(tmp.path(), "12.8.1");
+    std::fs::write(
+        tmp.path().join(".npmrc"),
+        "lockfile-include-tarball-url=true\n",
+    )
+    .unwrap();
+    let lock_path = tmp.path().join("pnpm-lock.yaml");
+    let pristine = std::fs::read_to_string(&lock_path).unwrap();
+    let env = run_redirect_subprocess(tmp.path(), &server.uri());
+    assert_eq!(env["redirect"]["redirected"], 1, "{env:#}");
+    assert!(std::fs::read_to_string(&lock_path)
+        .unwrap()
+        .contains("patch.test"));
+    let (code, env) = remove_json(tmp.path(), &server);
+    assert_eq!(code, Some(0), "remove: {env:#}");
+    assert_eq!(std::fs::read_to_string(&lock_path).unwrap(), pristine);
+}
+
+/// #902: pnpm <= 9 ignores pnpm-workspace.yaml settings, so a
+/// `lockfileIncludeTarballUrl: true` there left the lock bare. The pnpm 9
+/// install record is YAML.
+#[tokio::test]
+#[serial]
+async fn pnpm_rollback_stays_bare_when_pnpm9_ignores_workspace_include_tarball_url() {
+    let server = MockServer::start().await;
+    mock_discovery(&server).await;
+    mock_reference(&server).await;
+    mock_view(&server).await;
+    mock_npm_registry(&server, "sha512-UPSTREAMupstream==", None).await;
+
+    let tmp = tempfile::tempdir().unwrap();
+    write_pnpm_project(tmp.path());
+    std::fs::write(
+        tmp.path().join("node_modules/.modules.yaml"),
+        "hoistPattern:\n  - '*'\nlayoutVersion: 5\nnodeLinker: isolated\n\
+         packageManager: pnpm@9.15.9\npendingBuilds: []\n",
+    )
+    .unwrap();
+    std::fs::write(
+        tmp.path().join("pnpm-workspace.yaml"),
+        "packages:\n  - '.'\nlockfileIncludeTarballUrl: true\n",
+    )
+    .unwrap();
+    let pristine = std::fs::read_to_string(tmp.path().join("pnpm-lock.yaml")).unwrap();
+    assert_eq!(pnpm_pin_and_rollback(tmp.path(), &server), pristine);
+}
+
+/// #902: with no install record, package.json's corepack `packageManager`
+/// pin names the pnpm major.
+#[tokio::test]
+#[serial]
+async fn pnpm_rollback_reads_the_pnpm_major_from_package_json_package_manager() {
+    let server = MockServer::start().await;
+    mock_discovery(&server).await;
+    mock_reference(&server).await;
+    mock_view(&server).await;
+    mock_npm_registry(&server, "sha512-UPSTREAMupstream==", None).await;
+
+    let tmp = tempfile::tempdir().unwrap();
+    write_pnpm_project(tmp.path());
+    std::fs::write(
+        tmp.path().join("package.json"),
+        format!(
+            r#"{{ "name": "consumer", "version": "0.0.0", "packageManager": "pnpm@9.15.9+sha512.abc", "dependencies": {{ "{NAME}": "{VERSION}" }} }}"#
+        ),
+    )
+    .unwrap();
+    std::fs::write(
+        tmp.path().join("pnpm-workspace.yaml"),
+        "packages:\n  - '.'\nlockfileIncludeTarballUrl: true\n",
+    )
+    .unwrap();
+    let pristine = std::fs::read_to_string(tmp.path().join("pnpm-lock.yaml")).unwrap();
+    assert_eq!(pnpm_pin_and_rollback(tmp.path(), &server), pristine);
+}
+
+/// #902: the lock itself is the best witness. An unpinned registry entry
+/// pnpm wrote without `tarball:` proves the setting was not in effect,
+/// whatever the settings files say.
+#[tokio::test]
+#[serial]
+async fn pnpm_rollback_follows_lock_evidence_over_an_ignored_setting() {
+    let server = MockServer::start().await;
+    mock_discovery(&server).await;
+    mock_reference(&server).await;
+    mock_view(&server).await;
+    mock_npm_registry(&server, "sha512-UPSTREAMupstream==", None).await;
+
+    let tmp = tempfile::tempdir().unwrap();
+    write_pnpm_project(tmp.path());
+    let lock = rush_pnpm_lock(NAME).replace(
+        "\nsnapshots:\n",
+        "  other-dep@2.0.0:\n    resolution: {integrity: sha512-OTHERother==}\n\n\
+             snapshots:\n",
+    ) + "  other-dep@2.0.0: {}\n";
+    std::fs::write(tmp.path().join("pnpm-lock.yaml"), &lock).unwrap();
+    std::fs::write(
+        tmp.path().join(".npmrc"),
+        "lockfile-include-tarball-url=true\n",
+    )
+    .unwrap();
+    assert_eq!(pnpm_pin_and_rollback(tmp.path(), &server), lock);
+}
+
 /// #417: hosted `scan` from a cargo workspace MEMBER treated it as a
 /// lockless project, wrote `registry = …` into the member's Cargo.toml and
 /// a `[registries]` block into the member's `.cargo/config.toml`, left the
