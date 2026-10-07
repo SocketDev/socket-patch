@@ -97,7 +97,7 @@ use crate::vendor::lock_inventory::yarn::{
 use crate::vendor::lock_inventory::LockIntegrity;
 use crate::vendor::yarn_berry_lock::{berry_field, resolution_selector_target, BerryLocator};
 use crate::vendor::yarn_classic_lock::{
-    classic_block_is_git, classic_field, pattern_real_name, split_pattern, split_resolved_sha1,
+    classic_block_source, classic_field, pattern_real_name, split_resolved_sha1, ClassicBlockSource,
 };
 
 const YARN_LOCK: &str = "yarn.lock";
@@ -145,63 +145,78 @@ fn extract_classic(ctx: &DiscoverCtx<'_>, entries: Vec<YarnEntry>, out: &mut Dis
     }
 }
 
+/// The purl a block stands for when every key pattern names one package.
+fn classic_block_purl(entry: &YarnEntry) -> Option<String> {
+    let patterns = &entry.patterns;
+    match (
+        patterns.first().and_then(|p| pattern_real_name(p)),
+        classic_field(&entry.block.lines, "version"),
+    ) {
+        (Some(name), Some(version))
+            if patterns.iter().all(|p| pattern_real_name(p) == Some(name)) =>
+        {
+            npm_purl(name, version)
+        }
+        _ => None,
+    }
+}
+
 /// Classify one live classic block. A block of a package that yarn
-/// installs from anything but a Socket wiring — git (#363) or a registry /
-/// url tarball (#938) — is an unpatched copy of that `name@version`
-/// ([`Discovery::unpatched_copy`]): yarn 1 installs ONE copy per
-/// `name@version`, and which block it takes depends on which pattern it
-/// resolves first, so no wiring of the same version in this lock is
-/// attested beside it.
+/// installs from anything but a Socket wiring — git (#363), a `file:`
+/// directory (#921) or a registry / url tarball (#938) — is an unpatched
+/// copy of that `name@version` ([`Discovery::unpatched_copy`]): yarn 1
+/// installs ONE copy per `name@version`, and which block it takes depends
+/// on which pattern it resolves first, so no wiring of the same version in
+/// this lock is attested beside it.
 fn classic_block(ctx: &DiscoverCtx<'_>, entry: &YarnEntry, out: &mut Discovery) {
     let YarnEntry {
         block, patterns, ..
     } = entry;
     let resolved = classic_field(&block.lines, "resolved");
-    // yarn 1 fetches a git pattern with git, from `resolved` (#363): the
-    // copy is the git bytes, whatever `resolved` names.
-    if classic_block_is_git(patterns, resolved) {
-        let purl = match (
-            patterns.first().and_then(|p| pattern_real_name(p)),
-            classic_field(&block.lines, "version"),
-        ) {
-            (Some(name), Some(version))
-                if patterns.iter().all(|p| pattern_real_name(p) == Some(name)) =>
-            {
-                npm_purl(name, version)
+    match classic_block_source(patterns, resolved) {
+        // yarn 1 fetches a git pattern with git, from `resolved` (#363): the
+        // copy is the git bytes, whatever `resolved` names.
+        ClassicBlockSource::Git => {
+            // A Socket wiring here (an older release rewired it) is inert.
+            if resolved.is_some_and(|r| classify(ctx, r, YARN_LOCK, &block.key, out).is_some()) {
+                out.diag(
+                    DIAG_REF_UNATTRIBUTABLE,
+                    YARN_LOCK,
+                    format!(
+                        "{YARN_LOCK}: Socket-wired entry `{}` installs from git, which yarn \
+                         fetches from the git source rather than the wired tarball; it is not \
+                         attested",
+                        block.key
+                    ),
+                );
             }
-            _ => None,
-        };
-        // A Socket wiring here (an older release rewired it) is inert.
-        if resolved.is_some_and(|r| classify(ctx, r, YARN_LOCK, &block.key, out).is_some()) {
-            out.diag(
-                DIAG_REF_UNATTRIBUTABLE,
+            out.unpatched_copy(
                 YARN_LOCK,
-                format!(
-                    "{YARN_LOCK}: Socket-wired entry `{}` installs from git, which yarn \
-                     fetches from the git source rather than the wired tarball; it is not \
-                     attested",
-                    block.key
-                ),
+                classic_block_purl(entry),
+                &block.key,
+                "installs from git, which yarn fetches from the git source rather than a tarball",
             );
+            return;
         }
-        out.unpatched_copy(
-            YARN_LOCK,
-            purl,
-            &block.key,
-            "installs from git, which yarn fetches from the git source rather than a tarball",
-        );
-        return;
+        // yarn 1 copies a `file:` directory into node_modules (#921): that
+        // copy is the directory's bytes, and no `resolved` there is fetched.
+        ClassicBlockSource::Directory => {
+            out.unpatched_copy(
+                YARN_LOCK,
+                classic_block_purl(entry),
+                &block.key,
+                "installs from a file: directory, which yarn copies into node_modules \
+                 rather than fetching a tarball",
+            );
+            return;
+        }
+        // `link:` ranges install from the working tree; `resolved` is inert.
+        ClassicBlockSource::Link | ClassicBlockSource::Unresolved => return,
+        ClassicBlockSource::Tarball => {}
     }
     let Some(resolved) = resolved else {
         return;
     };
-    // `link:` ranges install from the working tree; `resolved` is inert.
-    if patterns
-        .iter()
-        .any(|p| split_pattern(p).is_some_and(|(_, range)| range.starts_with("link:")))
-    {
-        return;
-    }
     let names: std::collections::BTreeSet<Option<&str>> =
         patterns.iter().map(|p| pattern_real_name(p)).collect();
     let names: Vec<Option<&str>> = names.into_iter().collect();
@@ -1169,6 +1184,53 @@ mod tests {
                 out.diagnostics
                     .iter()
                     .any(|d| d.code == DIAG_REF_UNATTRIBUTABLE && d.detail.contains("git")),
+                "{case}: {:?}",
+                out.diagnostics
+            );
+        }
+    }
+
+    /// #921: yarn 1 COPIES a `file:` directory dependency into
+    /// node_modules, so a `file:` block of the wired name@version (no
+    /// `resolved`, alone or merged into the registry block's key) is an
+    /// unpatched copy: the registry wiring beside it is not attested, the
+    /// diagnostic names the block, and the copy counts as resolved
+    /// elsewhere. Control: the same wiring without that copy is a ref.
+    #[tokio::test]
+    async fn classic_file_directory_copies_are_never_attested() {
+        let lp = hosted_url("npm", "left-pad", "1.3.0", UUID_A, "left-pad-1.3.0.tgz");
+        let wired = classic_block("left-pad@^1.3.0", "1.3.0", &lp, Some(SRI));
+        let p = Project::new();
+        p.write("yarn.lock", classic(std::slice::from_ref(&wired)));
+        assert_eq!(run(&p).await.refs.len(), 1, "control: the wiring is a ref");
+
+        let file_copy = "\"left-pad@file:forks/left-pad\":\n  version \"1.3.0\"\n\n".to_string();
+        let merged_key =
+            "left-pad@^1.3.0, \"left-pad@file:forks/left-pad\":\n  version \"1.3.0\"\n\n"
+                .to_string();
+        for (case, blocks) in [
+            (
+                "registry wired beside a file: copy",
+                vec![wired.clone(), file_copy],
+            ),
+            (
+                "file: copy merged with another range, no resolved",
+                vec![
+                    classic_block("left-pad@~1.3.0", "1.3.0", &lp, Some(SRI)),
+                    merged_key,
+                ],
+            ),
+        ] {
+            let p = Project::new();
+            p.write("yarn.lock", classic(&blocks));
+            let out = run(&p).await;
+            assert!(out.refs.is_empty(), "{case}: {:#?}", out.refs);
+            assert!(
+                out.diagnostics
+                    .iter()
+                    .any(|d| d.code == DIAG_REF_UNATTRIBUTABLE
+                        && d.detail.contains("file: directory")
+                        && d.detail.contains("left-pad@file:forks/left-pad")),
                 "{case}: {:?}",
                 out.diagnostics
             );

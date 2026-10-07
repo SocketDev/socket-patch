@@ -37,8 +37,8 @@ use std::path::{Path, PathBuf};
 use serde_json::{json, Map, Value};
 
 use crate::vex::discover::{
-    Diag, Discovery, PatchedRef, Recognized, ResolvedElsewhere, Unattested, UnlockedPin,
-    UnpatchedCopy, WiringMode,
+    ContestedRef, Diag, Discovery, PatchedRef, Recognized, ResolvedElsewhere, Unattested,
+    UnlockedPin, UnpatchedCopy, WiringMode,
 };
 
 /// Set to `1` to (re)write the goldens instead of comparing against them.
@@ -122,6 +122,7 @@ fn render(out: &Discovery, root: &Path) -> Value {
         elsewhere,
         unpatched_copies,
         unattested,
+        contested,
     } = out;
     let refs: Vec<Value> = refs
         .iter()
@@ -247,6 +248,28 @@ fn render(out: &Discovery, root: &Path) -> Value {
             .collect::<Vec<_>>()
             .into();
     }
+    if !contested.is_empty() {
+        rendered["contested"] = contested
+            .iter()
+            .map(|c| {
+                let ContestedRef {
+                    purl,
+                    uuid,
+                    mode: m,
+                    file,
+                    other,
+                } = c;
+                json!({
+                    "purl": purl,
+                    "uuid": uuid,
+                    "mode": mode(*m),
+                    "file": path_str(file),
+                    "other": path_str(other),
+                })
+            })
+            .collect::<Vec<_>>()
+            .into();
+    }
     rendered
 }
 
@@ -323,8 +346,9 @@ fn corpus() -> Vec<CorpusEntry> {
         let name = top.file_name().unwrap().to_string_lossy().into_owned();
         match name.as_str() {
             GOLDEN_DIR => {}
-            // Tables and store listings, not projects.
-            "vlt" | "vlt-trees" | "vendor" => {}
+            // Tables and store listings, not projects (`sbt`: build-tool
+            // resolution records, read by the sbt evidence parser only).
+            "vlt" | "vlt-trees" | "vendor" | "sbt" => {}
             // Redirect cases: `<eco>/<flavor>/<case>/{input,expected}` —
             // each side is a project root (nested files included).
             "redirect" => {
@@ -543,7 +567,7 @@ mod tests {
     #[test]
     fn table_fixture_dirs_are_not_corpus_projects() {
         let corpus = corpus();
-        for skipped in ["vlt", "vlt-trees", "vendor"] {
+        for skipped in ["vlt", "vlt-trees", "vendor", "sbt"] {
             let nested = format!("{skipped}/");
             assert!(
                 corpus

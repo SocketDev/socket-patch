@@ -16,8 +16,10 @@ use toml_edit::{value, Array, DocumentMut, InlineTable, Item, Table, TableLike, 
 
 use crate::crawlers::python_crawler::canonicalize_pypi_name;
 use crate::utils::lock_fragments::{
-    extend_span, finish, fragments_of, next_header_end, pair_fragments, FragmentRewrite, LockParse,
+    extend_span, finish, fragments_of, next_header_end, pair_fragments, rewrite_batch,
+    FragmentRewrite, LockParse,
 };
+pub use crate::utils::lock_fragments::{LockBatch, LockStep};
 use crate::utils::python_lock::{is_prior_hosted_url, table_likes};
 
 /// The `{file, hash}` tables Poetry records in `package`'s own
@@ -250,18 +252,7 @@ pub fn rewrite_poetry_lock_in<'a>(
     filename: &str,
     sha256: &str,
 ) -> Result<Option<PoetryLockRewrite<'a>>, String> {
-    if !matches!(source_type, "file" | "url")
-        || sha256.len() != 64
-        || !sha256.bytes().all(|byte| byte.is_ascii_hexdigit())
-    {
-        return Err("invalid Poetry artifact source or SHA-256".into());
-    }
-    // Poetry compares the lock's `sha256:<hex>` against `hashlib`'s lowercase
-    // hexdigest as strings, so an uppercase digest would fail every install.
-    let sha256 = sha256.to_ascii_lowercase();
-    if !crate::vendor::pypi_distribution::matches(filename, name, version) {
-        return Err("Poetry patch wheel does not match the locked package".into());
-    }
+    let sha256 = checked_sha256(name, version, source_type, filename, sha256)?;
     let doc = parse.take(text, "Poetry")?;
     let plan = match plan_poetry_rewrite(&doc, name, version, source_type, source_url, &sha256) {
         Ok(Some(plan)) => plan,
@@ -271,16 +262,60 @@ pub fn rewrite_poetry_lock_in<'a>(
             return verdict.map(|_| None);
         }
     };
+    // The original's fragments come from the same parse; an error surfaces
+    // where a fresh parse would raise it, after the rewrite.
+    let before = poetry_lock_fragments_in(&doc, text, name);
+    let mut lock = doc.into_mut();
+    mutate_poetry_lock(&mut lock, plan, source_type, filename, &sha256)?;
+    finish(
+        "Poetry",
+        parse,
+        text,
+        name,
+        lock.to_string(),
+        before,
+        poetry_lock_fragments_in::<String>,
+    )
+    .map(Some)
+}
+
+/// The rewrite's own refusals, settled before the lock is read: the
+/// lowercase `sha256` to pin.
+fn checked_sha256(
+    name: &str,
+    version: &str,
+    source_type: &str,
+    filename: &str,
+    sha256: &str,
+) -> Result<String, String> {
+    if !matches!(source_type, "file" | "url")
+        || sha256.len() != 64
+        || !sha256.bytes().all(|byte| byte.is_ascii_hexdigit())
+    {
+        return Err("invalid Poetry artifact source or SHA-256".into());
+    }
+    if !crate::vendor::pypi_distribution::matches(filename, name, version) {
+        return Err("Poetry patch wheel does not match the locked package".into());
+    }
+    // Poetry compares the lock's `sha256:<hex>` against `hashlib`'s lowercase
+    // hexdigest as strings, so an uppercase digest would fail every install.
+    Ok(sha256.to_ascii_lowercase())
+}
+
+/// Apply a planned rewrite to the parsed lock.
+fn mutate_poetry_lock(
+    lock: &mut DocumentMut,
+    plan: PoetryLockPlan,
+    source_type: &str,
+    filename: &str,
+    sha256: &str,
+) -> Result<(), String> {
     let PoetryLockPlan {
         format,
         effective_url,
         index,
         package_name,
     } = plan;
-    // The original's fragments come from the same parse; an error surfaces
-    // where a fresh parse would raise it, after the rewrite.
-    let before = poetry_lock_fragments_in(&doc, text, name);
-    let mut lock = doc.into_mut();
     let package = lock
         .get_mut("package")
         .and_then(Item::as_array_of_tables_mut)
@@ -325,23 +360,103 @@ pub fn rewrite_poetry_lock_in<'a>(
             .ok_or_else(|| format!("[metadata.{field}] is not a table"))?;
         if format == "0" {
             let mut hashes = Array::new();
-            hashes.push(sha256.as_str());
+            hashes.push(sha256);
             table.insert(&package_name, value(hashes));
         } else {
             let entry = legacy_files_entry(table, &package_name, files, rewritten);
             table.insert(&package_name, entry);
         }
     }
-    finish(
-        "Poetry",
-        parse,
+    Ok(())
+}
+
+/// One dep of a [`rewrite_poetry_lock_all`]: the arguments of
+/// [`rewrite_poetry_lock_in`] past the lock text.
+pub struct PoetryLockDep<'a> {
+    pub name: &'a str,
+    pub version: &'a str,
+    pub source_type: &'a str,
+    pub source_url: &'a str,
+    pub filename: &'a str,
+    pub sha256: &'a str,
+}
+
+/// Every dep's [`rewrite_poetry_lock_in`] over `text`, each against the
+/// previous one's output: one parse and one render of the lock for all of
+/// them when the batch can vouch for the step-by-step result, else step by
+/// step.
+pub fn rewrite_poetry_lock_all(text: &str, deps: &[PoetryLockDep]) -> LockBatch {
+    rewrite_poetry_lock_batch(text, deps).unwrap_or_else(|| rewrite_poetry_lock_steps(text, deps))
+}
+
+/// [`rewrite_poetry_lock_all`] over one parse and one render, or `None` (see
+/// [`rewrite_batch`]).
+fn rewrite_poetry_lock_batch(text: &str, deps: &[PoetryLockDep]) -> Option<LockBatch> {
+    let names: Vec<&str> = deps.iter().map(|dep| dep.name).collect();
+    rewrite_batch(
         text,
-        name,
-        lock.to_string(),
-        before,
+        &names,
+        |index, lock| {
+            let dep = &deps[index];
+            let sha256 = checked_sha256(
+                dep.name,
+                dep.version,
+                dep.source_type,
+                dep.filename,
+                dep.sha256,
+            )?;
+            let plan = plan_poetry_rewrite(
+                lock,
+                dep.name,
+                dep.version,
+                dep.source_type,
+                dep.source_url,
+                &sha256,
+            )?;
+            Ok(plan.map(|plan| (plan, index, sha256)))
+        },
+        |lock, (plan, index, sha256)| {
+            let dep = &deps[index];
+            mutate_poetry_lock(lock, plan, dep.source_type, dep.filename, &sha256)
+        },
         poetry_lock_fragments_in::<String>,
     )
-    .map(Some)
+}
+
+/// [`rewrite_poetry_lock_all`] one dep at a time.
+fn rewrite_poetry_lock_steps(text: &str, deps: &[PoetryLockDep]) -> LockBatch {
+    let mut content = text.to_string();
+    let mut parse = PoetryLockParse::default();
+    let mut steps = Vec::with_capacity(deps.len());
+    for dep in deps {
+        let step = match rewrite_poetry_lock_in(
+            &mut parse,
+            &content,
+            dep.name,
+            dep.version,
+            dep.source_type,
+            dep.source_url,
+            dep.filename,
+            dep.sha256,
+        ) {
+            Ok(Some(rewrite)) if rewrite.text != content => match rewrite.edits() {
+                Ok(edits) => {
+                    let text = rewrite.text;
+                    content = text;
+                    LockStep::Rewritten(edits)
+                }
+                Err(detail) => LockStep::Refused(detail),
+            },
+            Ok(Some(_)) => LockStep::Unchanged,
+            Ok(None) => LockStep::NotFound,
+            Err(detail) => LockStep::Refused(detail),
+        };
+        steps.push(step);
+    }
+    LockBatch {
+        text: content,
+        steps,
+    }
 }
 
 /// Every refusal and not-applicable verdict of [`rewrite_poetry_lock_in`]
@@ -1080,5 +1195,184 @@ mod parse_reuse_equivalence_tests {
             SHA,
         );
         assert!(matches!(got, Ok(None)), "the stale parse was reused");
+    }
+}
+
+#[cfg(test)]
+mod batch_equivalence_tests {
+    //! [`rewrite_poetry_lock_all`]'s one-render batch against the
+    //! step-by-step rewrite it replaces (#760): whenever the batch answers,
+    //! its text and every dep's step are the step-by-step ones.
+    use super::*;
+
+    const VERSIONS: &[&str] = &[
+        "0.12.17", "1.0.10", "1.1.15", "1.2.2", "1.3.2", "1.4.2", "1.5.1", "1.6.1", "1.7.1",
+        "1.8.5", "2.0.1", "2.1.4", "2.2.1", "2.3.4", "2.4.3",
+    ];
+    const SHA: &str = "34b97092d7e0a3a8cf7cd10e386f401b3737364026c45e622aa02903dffe0f07";
+
+    /// The native fixture with `extra` clones of its urllib3 unit, adjacent
+    /// to it, each with its own legacy integrity entry.
+    fn grown(version: &str, extra: usize) -> String {
+        let lock = std::fs::read_to_string(format!(
+            "{}/tests/fixtures/poetry/{version}/poetry.lock",
+            env!("CARGO_MANIFEST_DIR")
+        ))
+        .unwrap()
+        .replace("\r\n", "\n");
+        let meta = lock.find("\n[metadata]").unwrap();
+        let first = lock.find("[[package]]").unwrap();
+        let unit = &lock[first..meta];
+        let mut out = lock[..meta].to_string();
+        for i in 0..extra {
+            out.push('\n');
+            out.push_str(&unit.replace("name = \"urllib3\"", &format!("name = \"pkg{i}\"")));
+        }
+        let mut tail = lock[meta..].to_string();
+        for key in ["\nurllib3 = [\n", "\nurllib3 = []"] {
+            if let Some(start) = tail.find(key) {
+                let end = start + tail[start + 1..].find('\n').unwrap() + 1;
+                let end = if key.ends_with("[\n") {
+                    start + tail[start..].find("\n]").unwrap() + 2
+                } else {
+                    end
+                };
+                let entry = tail[start..end].to_string();
+                let clones: String = (0..extra)
+                    .map(|i| entry.replacen("urllib3 =", &format!("pkg{i} ="), 1))
+                    .collect();
+                tail.insert_str(end, &clones);
+                break;
+            }
+        }
+        out + &tail
+    }
+
+    struct Dep {
+        name: String,
+        version: &'static str,
+        source_type: &'static str,
+        url: String,
+        sha256: String,
+    }
+
+    fn dep(name: &str, version: &'static str, tag: &str) -> Dep {
+        Dep {
+            name: name.into(),
+            version,
+            source_type: "url",
+            url: format!(
+                "https://patch.socket.dev/patch/pypi/{name}/{tag}/{name}-{version}-py2.py3-none-any.whl"
+            ),
+            sha256: SHA.into(),
+        }
+    }
+
+    fn lock_deps(deps: &[Dep]) -> Vec<PoetryLockDep<'_>> {
+        deps.iter()
+            .map(|dep| PoetryLockDep {
+                name: &dep.name,
+                version: dep.version,
+                source_type: dep.source_type,
+                source_url: &dep.url,
+                filename: dep.url.rsplit('/').next().unwrap(),
+                sha256: &dep.sha256,
+            })
+            .collect()
+    }
+
+    /// The dep mixes run over each lock: every package (adjacent units),
+    /// every other one, reversed, interleaved with refusals and not-found
+    /// verdicts, and a package rewritten twice (which the batch hands back).
+    fn mixes(extra: usize) -> Vec<(Vec<Dep>, bool)> {
+        let all = || {
+            std::iter::once(dep("urllib3", "1.26.18", "a"))
+                .chain((0..extra).map(|i| dep(&format!("pkg{i}"), "1.26.18", "a")))
+        };
+        let mut every_other: Vec<Dep> = all().step_by(2).collect();
+        every_other.push(dep("absent", "1.0.0", "a"));
+        let mut reversed: Vec<Dep> = all().collect();
+        reversed.reverse();
+        let mut mixed: Vec<Dep> = vec![dep("urllib3", "9.9.9", "a")];
+        for (n, dep) in all().enumerate() {
+            mixed.push(dep);
+            if n == 1 {
+                mixed.push(Dep {
+                    sha256: "not-a-sha".into(),
+                    ..super::batch_equivalence_tests::dep("pkg0", "1.26.18", "b")
+                });
+                mixed.push(Dep {
+                    source_type: "file",
+                    url: ".socket/vendor/x/pkg0-1.26.18-py2.py3-none-any.whl".into(),
+                    ..super::batch_equivalence_tests::dep("pkg0", "1.26.18", "a")
+                });
+            }
+        }
+        mixed.push(dep("urllib3", "9.9.9", "a"));
+        let mut twice: Vec<Dep> = all().collect();
+        twice.push(dep("urllib3", "1.26.18", "rotated"));
+        vec![
+            (all().collect(), true),
+            (every_other, true),
+            (reversed, true),
+            (mixed, true),
+            (twice, false),
+        ]
+    }
+
+    #[test]
+    fn batch_matches_the_step_by_step_rewrite() {
+        let mut batched = 0;
+        let mut cases = 0;
+        for version in VERSIONS {
+            for extra in [0, 1, 4] {
+                for style in ["lf", "crlf", "mixed"] {
+                    let mut lock = grown(version, extra);
+                    match style {
+                        "crlf" => lock = lock.replace('\n', "\r\n"),
+                        "mixed" => lock = lock.replacen('\n', "\r\n", 1),
+                        _ => {}
+                    }
+                    for (mix, (deps, batchable)) in mixes(extra).into_iter().enumerate() {
+                        let deps = lock_deps(&deps);
+                        let what = format!("{version} extra={extra} {style} mix={mix}");
+                        let steps = rewrite_poetry_lock_steps(&lock, &deps);
+                        // And again over the output: the idempotent re-scan.
+                        for (rerun, text) in
+                            [lock.clone(), steps.text.clone()].into_iter().enumerate()
+                        {
+                            cases += 1;
+                            let steps = rewrite_poetry_lock_steps(&text, &deps);
+                            let batch = rewrite_poetry_lock_batch(&text, &deps);
+                            if let Some(batch) = &batch {
+                                batched += 1;
+                                assert_eq!(batch, &steps, "{what}");
+                            }
+                            assert_eq!(rewrite_poetry_lock_all(&text, &deps), steps, "{what}");
+                            // Poetry 0.12 refuses every URL source: nothing to
+                            // render, so the batch answers.
+                            if style == "mixed" {
+                                // (The first rewrite may respell the lone CRLF
+                                // line, leaving the re-run's lock all LF.)
+                                assert!(
+                                    rerun == 1 || batch.is_none(),
+                                    "{what}: the batch must hand back"
+                                );
+                            } else if version.starts_with("0.") {
+                                assert!(batch.is_some(), "{what}: nothing rewritten");
+                            } else if !batchable {
+                                assert!(batch.is_none(), "{what}: the batch must hand back");
+                            } else {
+                                assert!(batch.is_some(), "{what}: the batch must answer");
+                            }
+                        }
+                    }
+                }
+            }
+        }
+        assert!(
+            batched * 2 > cases,
+            "only {batched} of {cases} cases batched"
+        );
     }
 }

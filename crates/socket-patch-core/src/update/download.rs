@@ -265,19 +265,21 @@ async fn sanity_exec(
     const ETXTBSY_ATTEMPTS: u64 = 10;
     let mut attempt = 0u64;
     let output = loop {
-        let mut cmd = tokio::process::Command::new(staged);
-        cmd.arg("--version")
-            .stdin(std::process::Stdio::null())
-            .stdout(std::process::Stdio::piped())
-            .stderr(std::process::Stdio::null())
-            .kill_on_drop(true);
-        let result = tokio::time::timeout(std::time::Duration::from_secs(10), cmd.output())
-            .await
-            .map_err(|_| {
-                UpdateError::VerifyFailed(
+        let mut cmd = std::process::Command::new(staged);
+        cmd.arg("--version");
+        let result = match crate::utils::fs::run_blocking(move || {
+            crate::utils::process::output_within(cmd, crate::utils::process::PROBE_TIMEOUT)
+        })
+        .await
+        {
+            Ok(output) => Ok(output),
+            Err(crate::utils::process::BoundedError::Spawn(e)) => Err(e),
+            Err(crate::utils::process::BoundedError::TimedOut) => {
+                return Err(UpdateError::VerifyFailed(
                     "downloaded binary hung during its --version self-check".to_string(),
-                )
-            })?;
+                ))
+            }
+        };
         match result {
             Ok(output) => break output,
             Err(e)

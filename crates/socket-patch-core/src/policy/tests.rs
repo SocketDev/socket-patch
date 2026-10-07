@@ -408,6 +408,90 @@ fn package_spec_matching_grammar() {
 }
 
 #[test]
+fn pypi_package_specs_compare_pep503_canonical_names() {
+    // #910: PyPI purls are PEP 503-canonical, so every spelling pip
+    // treats as the same project must match, in bare and purl specs.
+    let purl = "pkg:pypi/typing-extensions@4.12.2";
+    for spec in [
+        "typing-extensions",
+        "typing_extensions",
+        "Typing_Extensions",
+        "typing.extensions",
+        "typing__extensions",
+        "pkg:pypi/typing_extensions",
+        "pkg:pypi/Typing.Extensions",
+        "pkg:pypi/typing_extensions@4.12.2",
+    ] {
+        assert!(
+            package_spec_matches(spec, purl),
+            "{spec} should match {purl}"
+        );
+    }
+    assert!(package_spec_matches(
+        "zope_interface",
+        "pkg:pypi/zope-interface@6.0"
+    ));
+    assert!(package_spec_matches(
+        "ruamel.yaml",
+        "pkg:pypi/ruamel-yaml@0.18.6"
+    ));
+    // A non-canonical purl (as a caller might pass) still matches.
+    assert!(package_spec_matches(
+        "typing-extensions",
+        "pkg:pypi/typing_extensions@4.12.2"
+    ));
+    // Different projects and versions stay distinct.
+    assert!(!package_spec_matches("typing_extension", purl));
+    assert!(!package_spec_matches("typingextensions", purl));
+    assert!(!package_spec_matches(
+        "pkg:pypi/typing_extensions@4.12.3",
+        purl
+    ));
+    assert!(!package_spec_matches("pkg:npm/typing_extensions", purl));
+    // Other ecosystems keep their exact (case-folded) names.
+    assert!(!package_spec_matches("left_pad", "pkg:npm/left-pad@1.3.0"));
+    assert!(!package_spec_matches(
+        "pkg:npm/left_pad",
+        "pkg:npm/left-pad@1.3.0"
+    ));
+    assert!(!package_spec_matches(
+        "pkg:cargo/cfg_if",
+        "pkg:cargo/cfg-if@1.0.0"
+    ));
+}
+
+#[test]
+fn pypi_ignore_and_allow_lists_use_pep503_names() {
+    let purl = "pkg:pypi/typing-extensions@4.12.2";
+    for spec in [
+        "typing_extensions",
+        "Typing_Extensions",
+        "typing.extensions",
+        "pkg:pypi/typing_extensions",
+    ] {
+        let policy = load(&[(
+            "socket.yml",
+            &format!("version: 2\npatches:\n  ignorePackages: [\"{spec}\"]\n"),
+        )]);
+        assert!(
+            matches!(
+                policy.admits_purl(purl),
+                Err(FilterReason::PackageIgnored { .. })
+            ),
+            "ignorePackages {spec} must exclude {purl}"
+        );
+        let policy = load(&[(
+            "socket.yml",
+            &format!("version: 2\npatches:\n  packages: [\"{spec}\"]\n"),
+        )]);
+        assert!(
+            policy.admits_purl(purl).is_ok(),
+            "packages {spec} must admit {purl}"
+        );
+    }
+}
+
+#[test]
 fn composer_package_filters_match_release_identity_and_preserve_branch_case() {
     let policy = load(&[(
         "socket.yml",

@@ -23,9 +23,11 @@
 //! segment policy as forward rewrite, heal and vendor. Only the shared
 //! `registry_base` normalizes a modern empty segment when resolving a URL.
 
+use std::collections::BTreeMap;
+
 use serde_json::{Map, Value};
 
-use super::npm::{by_uuid, fetch_dists, read_or_refuse, refuse_all_in};
+use super::npm::{by_uuid, fetch_dists_on, read_or_refuse, refuse_all_in};
 use super::{Ctx, FormatResult, HostedPin, View};
 use crate::vendor::vlt_lock_text::{
     brotli_for_slot3, default_registry_alias, entry_text, is_default_registry, nodes_block,
@@ -233,17 +235,24 @@ pub(crate) async fn restore(
             .iter()
             .map(|h| (h.uuid.clone(), h.name.clone(), h.version.clone()))
             .collect();
-        let dists = fetch_dists(&wanted, ctx, &mut result).await;
+        // Each version document comes from the registry its node resolves
+        // against, whose `dist.tarball` vlt wrote into slot [3] (#521).
+        let bases: BTreeMap<&str, String> = hits
+            .iter()
+            .filter_map(|h| {
+                registry_base(h.era, &h.segment, &h.name, options).map(|b| (h.name.as_str(), b))
+            })
+            .collect();
+        let dists =
+            fetch_dists_on(&wanted, |name| bases.get(name).cloned(), ctx, &mut result).await;
         let mut out: Vec<String> = lines.iter().map(|l| (*l).to_string()).collect();
         let mut planned: Vec<&str> = Vec::new();
         for hit in &hits {
             if result.refused.contains_key(&hit.uuid) {
                 continue;
             }
-            let Some(integrity) = dists
-                .get(&(hit.name.clone(), hit.version.clone()))
-                .and_then(|d| d.integrity.clone())
-            else {
+            let found = dists.get(&(hit.name.clone(), hit.version.clone()));
+            let Some(integrity) = found.and_then(|d| d.dist.integrity.clone()) else {
                 result.refuse(
                     &hit.uuid,
                     format!(
@@ -263,7 +272,12 @@ pub(crate) async fn restore(
                     );
                     continue;
                 };
-                Some(json(&tarball_url(&base, &hit.name, &hit.version)))
+                // The node's registry advertised its tarball URL; without
+                // that document, the conventional URL on the node's base.
+                match found.filter(|d| d.from_project) {
+                    Some(d) => Some(json(&d.dist.tarball)),
+                    None => Some(json(&tarball_url(&base, &hit.name, &hit.version))),
+                }
             } else {
                 None
             };
@@ -696,6 +710,90 @@ mod tests {
             assert_eq!(after["nodes"]["~npm~@s+a@1.0.0"], expected);
         }
         std::env::remove_var("SOCKET_NPM_REGISTRY");
+    }
+
+    /// #521: slot [3] is the `dist.tarball` the node's own registry
+    /// advertises (what vlt writes verbatim), not a conventional
+    /// `<registry>/<name>/-/<leaf>-<ver>.tgz` it may never serve. The
+    /// version document comes from that registry, not the default one.
+    #[tokio::test]
+    #[serial_test::serial]
+    async fn restore_takes_slot3_from_the_node_registrys_dist_tarball() {
+        let server = MockServer::start().await;
+        // The default registry (npmjs's stand-in) knows nothing of a CDN.
+        Mock::given(method("GET"))
+            .and(path("/left-pad/1.3.0"))
+            .respond_with(ResponseTemplate::new(200).set_body_json(serde_json::json!({
+                "dist": {
+                    "tarball": "https://registry.npmjs.org/left-pad/-/left-pad-1.3.0.tgz",
+                    "integrity": "sha512-WRONG==",
+                }
+            })))
+            .mount(&server)
+            .await;
+        let cdn = format!("{}/_cdn/files/left-pad-1.3.0.tgz", server.uri());
+        Mock::given(method("GET"))
+            .and(path("/mirror/left-pad/1.3.0"))
+            .respond_with(ResponseTemplate::new(200).set_body_json(serde_json::json!({
+                "dist": { "tarball": cdn, "integrity": LP_UPSTREAM }
+            })))
+            .mount(&server)
+            .await;
+        std::env::set_var("SOCKET_NPM_REGISTRY", server.uri());
+        let mirror = format!("{}/mirror/", server.uri());
+        let original = format!(
+            "{{\n  \"lockfileVersion\": 1,\n  \"options\": {{\"registries\":{{\"npm\":\"{mirror}\"}}}},\n  \"nodes\": {{\n    \"~npm~left-pad@1.3.0\": [0,\"left-pad\",\"{LP_UPSTREAM}\",\"{cdn}\"]\n  }},\n  \"edges\": {{}}\n}}\n"
+        );
+        let hosted_lock = original
+            .replace(LP_UPSTREAM, "sha512-AA==")
+            .replace(&cdn, &hosted(LP_UUID, "left-pad-1.3.0.tgz"));
+        let (outcome, after) = run(
+            &hosted_lock,
+            &[pin("pkg:npm/left-pad@1.3.0", LP_UUID)],
+            false,
+        )
+        .await;
+        std::env::remove_var("SOCKET_NPM_REGISTRY");
+        assert!(refused(&outcome).is_empty(), "{:?}", refused(&outcome));
+        assert_eq!(after, original);
+    }
+
+    /// A node registry that can't be read (a private mirror wanting
+    /// credentials) falls back to the default registry's document and the
+    /// conventional URL on the node's base, and says so.
+    #[tokio::test]
+    #[serial_test::serial]
+    async fn unreadable_node_registry_falls_back_with_a_warning() {
+        let server = registry(&[("left-pad", "1.3.0", Some(LP_UPSTREAM))]).await;
+        std::env::set_var("SOCKET_NPM_REGISTRY", server.uri());
+        // Nothing is mounted under /private/: every lookup there is a 404.
+        let mirror = format!("{}/private/", server.uri());
+        let text = format!(
+            "{{\n  \"lockfileVersion\": 1,\n  \"options\": {{\"registries\":{{\"npm\":\"{mirror}\"}}}},\n  \"nodes\": {{\n    \"~npm~left-pad@1.3.0\": [0,\"left-pad\",\"sha512-AA==\",\"{}\"]\n  }},\n  \"edges\": {{}}\n}}\n",
+            hosted(LP_UUID, "left-pad-1.3.0.tgz")
+        );
+        let (outcome, after) = run(&text, &[pin("pkg:npm/left-pad@1.3.0", LP_UUID)], false).await;
+        std::env::remove_var("SOCKET_NPM_REGISTRY");
+        assert!(refused(&outcome).is_empty(), "{:?}", refused(&outcome));
+        let after: Value = serde_json::from_str(&after).unwrap();
+        assert_eq!(
+            after["nodes"]["~npm~left-pad@1.3.0"],
+            serde_json::json!([
+                0,
+                "left-pad",
+                LP_UPSTREAM,
+                format!("{mirror}left-pad/-/left-pad-1.3.0.tgz")
+            ])
+        );
+        assert!(
+            outcome
+                .warnings
+                .iter()
+                .any(|(code, detail)| *code == "upstream_registry_fallback"
+                    && detail.contains(mirror.trim_end_matches('/'))),
+            "{:?}",
+            outcome.warnings
+        );
     }
 
     #[tokio::test]
