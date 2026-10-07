@@ -1823,8 +1823,7 @@ async fn run_scan(
     // supplement falls back to the committed artifacts (fail-closed for the
     // prune), the key set degrades to empty (fail-open).
     let vendor_state = &ctx.loaded().await.vendor;
-    let ledger_supplement =
-        vendored_ledger_supplement(&args.common, &all_crawled, vendor_state).await;
+    let ledger_supplement = vendored_ledger_supplement(&ctx, &all_crawled, vendor_state).await;
     for pkg in &ledger_supplement.packages {
         if let Some(eco) = Ecosystem::from_purl(&pkg.purl) {
             *eco_counts.entry(eco).or_insert(0) += 1;
