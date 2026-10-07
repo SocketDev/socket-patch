@@ -20,7 +20,7 @@
 //! A block `name@range[, name@range2]:` with `version "X"` and
 //! `resolved "<spec>"`. The package is the REAL name of the key patterns
 //! (`alias@npm:real@range` names `real` —
-//! [`crate::vendor::yarn_classic_lock::pattern_real_name`]); every pattern
+//! [`crate::formats::yarn::patterns::pattern_real_name`]); every pattern
 //! must agree, otherwise a Socket-wired block is diagnosed (the rewriters
 //! refuse mixed keys). `link:` keys are skipped: yarn installs them from the
 //! working tree, never from `resolved`.
@@ -89,16 +89,17 @@ use super::{
     DiscoverCtx, Discovery, LocateOpts, PatchedRef, VendorRef, Wired, DIAG_LOCKFILE_UNPARSEABLE,
     DIAG_REF_INVALID, DIAG_REF_UNATTRIBUTABLE,
 };
+use crate::formats::yarn::blocks::{berry_field, classic_field};
+use crate::formats::yarn::patterns::{
+    pattern_real_name, resolution_selector_target, split_resolved_sha1, BerryLocator,
+};
+use crate::formats::yarn::source::{classic_block_source, ClassicBlockSource};
 use crate::patch::redirect::is_berry_lock;
 use crate::utils::digest::is_sri_pin;
 use crate::vendor::lock_inventory::yarn::{
     berry_checksum_pin, berry_entries, classic_entries, BerryLock, YarnEntry,
 };
 use crate::vendor::lock_inventory::LockIntegrity;
-use crate::vendor::yarn_berry_lock::{berry_field, resolution_selector_target, BerryLocator};
-use crate::vendor::yarn_classic_lock::{
-    classic_block_source, classic_field, pattern_real_name, split_resolved_sha1, ClassicBlockSource,
-};
 
 const YARN_LOCK: &str = "yarn.lock";
 const PACKAGE_JSON: &str = "package.json";

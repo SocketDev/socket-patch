@@ -1,15 +1,22 @@
-//! `yarn.lock`, classic (v1) and berry (v2+): the grammar split every
-//! reader of the file routes on.
+//! `yarn.lock`, classic (v1) and berry (v2+): the one grammar every
+//! reader and writer of the file shares.
 //!
-//! The entry grammars themselves (`vendor::yarn_classic_lock`'s block walk,
-//! `lock_inventory::yarn`'s entry models) and the hosted splices are still
-//! read through their current homes; this module owns the one decision
-//! they all start from — which grammar a lock is — so the vendor flavor
-//! probe, the lock-inventory view, repair's reference flavor, both hosted
-//! rewriters and lockfile discovery cannot disagree on it.
+//! * which grammar a lock is ([`sniff_grammar`], [`is_berry_lock`]);
+//! * the block walk and field reads ([`blocks`]);
+//! * key, descriptor and locator patterns ([`patterns`]);
+//! * where yarn 1 installs a block's copy from ([`source`]);
+//! * the berry pinned-entry renderer ([`berry_entry`]).
+//!
+//! The vendored backends (`vendor::yarn_classic_lock`,
+//! `vendor::yarn_berry_lock`), the hosted rewriters and restorers
+//! (`patch::redirect`), the lock inventory and lockfile discovery all read
+//! the lock through these, so they cannot disagree on it.
 
 pub(crate) mod berry_entry;
 pub mod berry_gates;
+pub(crate) mod blocks;
+pub(crate) mod patterns;
+pub(crate) mod source;
 
 use super::text::strip_bom;
 

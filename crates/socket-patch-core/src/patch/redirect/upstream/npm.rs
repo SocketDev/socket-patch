@@ -369,7 +369,7 @@ async fn restore_classic(
     ctx: &Ctx<'_>,
     result: &mut FormatResult,
 ) {
-    use crate::vendor::yarn_classic_lock::{classic_block_is_git, split_key_patterns};
+    use crate::formats::yarn::{patterns::split_key_patterns, source::classic_block_is_git};
 
     let eol = LineEndings::of(raw);
     if eol == LineEndings::Mixed {
@@ -551,8 +551,8 @@ async fn restore_berry(
     ctx: &Ctx<'_>,
     result: &mut FormatResult,
 ) {
-    use crate::vendor::yarn_berry_lock::resolution_selector_target;
-    use crate::vendor::yarn_classic_lock::{split_berry_key_patterns, split_pattern};
+    use crate::formats::yarn::patterns::resolution_selector_target;
+    use crate::formats::yarn::patterns::{split_berry_key_patterns, split_pattern};
 
     let (bom, body) = match raw.strip_prefix('\u{feff}') {
         Some(rest) => ("\u{feff}", rest),

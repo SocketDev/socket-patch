@@ -3450,7 +3450,7 @@ fn rewrite_yarn_classic(
     overrides: &[DepOverride],
     result: &mut RewriteResult,
 ) {
-    use crate::vendor::yarn_classic_lock::{split_key_patterns, split_pattern};
+    use crate::formats::yarn::patterns::{split_key_patterns, split_pattern};
 
     let npm: Vec<&DepOverride> = overrides.iter().filter(|o| o.ecosystem == "npm").collect();
     if npm.is_empty() || !files.contains_key("yarn.lock") {
@@ -3547,7 +3547,7 @@ fn rewrite_yarn_classic(
                 .lines()
                 .find_map(|l| l.strip_prefix("  resolved "))
                 .map(|v| v.trim().trim_matches('"'));
-            use crate::vendor::yarn_classic_lock::{classic_block_source, ClassicBlockSource};
+            use crate::formats::yarn::source::{classic_block_source, ClassicBlockSource};
             let source = classic_block_source(&patterns, resolved);
             // yarn 1 COPIES a `file:` directory (or a block with no
             // `resolved`) into node_modules (#921): there is no tarball to
@@ -3705,7 +3705,7 @@ fn rewrite_yarn_classic(
 /// one does not parse, or they name different packages. `None` overall
 /// when the block has no key line.
 fn yarn_classic_block_head(block: &str) -> Option<(String, Option<String>)> {
-    use crate::vendor::yarn_classic_lock::{pattern_real_name, split_key_patterns};
+    use crate::formats::yarn::patterns::{pattern_real_name, split_key_patterns};
     let key_line = block
         .lines()
         .find(|l| !l.is_empty() && !l.starts_with([' ', '\t', '#']))?;
@@ -3847,7 +3847,7 @@ fn rewrite_yarn_berry_with_manifests(
     result: &mut RewriteResult,
 ) {
     // Descriptors split with the classic grammar's `name@range` rule.
-    use crate::vendor::yarn_classic_lock::{split_berry_key_patterns, split_pattern};
+    use crate::formats::yarn::patterns::{split_berry_key_patterns, split_pattern};
     let npm: Vec<&DepOverride> = overrides.iter().filter(|o| o.ecosystem == "npm").collect();
     if npm.is_empty() || !files.contains_key("yarn.lock") {
         return;
@@ -4346,7 +4346,7 @@ pub(crate) fn berry_entries_sorted(blocks: &[String]) -> bool {
 /// Whether an LF-normalized berry lock holds an entry for `name` at
 /// `version`, under any descriptor (npm, tarball, `patch:`, …).
 fn berry_lock_locks(content: &str, name: &str, version: &str) -> bool {
-    use crate::vendor::yarn_classic_lock::{split_berry_key_patterns, split_pattern};
+    use crate::formats::yarn::patterns::{split_berry_key_patterns, split_pattern};
     let version_line = format!("\n  version: {version}\n");
     content.split("\n\n").any(|block| {
         let Some(key) = block.lines().next().and_then(|l| l.strip_suffix(':')) else {
@@ -4381,7 +4381,7 @@ pub(crate) fn berry_bin_entries(content: &str) -> Vec<&str> {
 /// range, or one an earlier hosted run keyed by its tarball URL. A fork
 /// alias or another protocol is never re-keyed, so never needs a fetch.
 pub(crate) fn berry_pin_needs_manifest(bin_entries: &[&str], dep: &DepOverride) -> bool {
-    use crate::vendor::yarn_classic_lock::{split_berry_key_patterns, split_pattern};
+    use crate::formats::yarn::patterns::{split_berry_key_patterns, split_pattern};
     if bin_entries.is_empty() {
         return false;
     }
@@ -4425,7 +4425,7 @@ pub(crate) fn berry_pin_needs_manifest(bin_entries: &[&str], dep: &DepOverride) 
 /// plain `npm:<range>` or any other protocol).
 fn berry_npm_alias_target(range: &str) -> Option<&str> {
     let body = range.strip_prefix("npm:")?;
-    crate::vendor::yarn_classic_lock::split_pattern(body).map(|(real, _)| real)
+    crate::formats::yarn::patterns::split_pattern(body).map(|(real, _)| real)
 }
 
 /// The root manifest the yarn berry hosted pin edits.
@@ -4546,7 +4546,7 @@ fn berry_resolutions_pin(
     current_url: Option<&str>,
     artifact_url: &str,
 ) -> Result<BerryResolutionsPin, RewriteWarning> {
-    use crate::vendor::yarn_berry_lock::resolution_selector_target;
+    use crate::formats::yarn::patterns::resolution_selector_target;
     let empty = serde_json::Map::new();
     let table = match manifest.get("resolutions") {
         None => &empty,
@@ -4601,7 +4601,7 @@ fn berry_resolutions_pin(
     }
     let ranges: Vec<&str> = selectors
         .iter()
-        .filter_map(|selector| crate::vendor::yarn_classic_lock::split_pattern(selector))
+        .filter_map(|selector| crate::formats::yarn::patterns::split_pattern(selector))
         .filter(|(n, range)| *n == name && range.starts_with("npm:"))
         .map(|(_, range)| range)
         .collect();

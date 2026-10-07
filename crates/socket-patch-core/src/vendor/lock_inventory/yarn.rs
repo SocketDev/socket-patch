@@ -4,12 +4,15 @@
 #[cfg(test)]
 use std::path::Path;
 
-use crate::utils::digest::is_hex;
-use crate::vendor::yarn_berry_lock::{berry_field, parse_berry_locator, BerryLocator};
-use crate::vendor::yarn_classic_lock::{
-    self, classic_field, live_blocks, scan_blocks, split_berry_key_patterns, split_key_patterns,
-    split_resolved_sha1, LockBlock,
+use crate::formats::yarn::blocks::{
+    berry_field, berry_metadata, classic_field, live_blocks, scan_blocks, LockBlock,
 };
+use crate::formats::yarn::patterns::{
+    parse_berry_locator, pattern_real_name, split_berry_key_patterns, split_key_patterns,
+    split_pattern, split_resolved_sha1, BerryLocator,
+};
+use crate::utils::digest::is_hex;
+use crate::vendor::yarn_classic_lock;
 
 use super::view::ProjectView;
 use super::{http_url, LockIntegrity, LockfileEntry};
@@ -125,10 +128,7 @@ fn classic_registry_view(text: &str) -> Vec<LockfileEntry> {
         if yarn_classic_lock::block_points_into_vendor(&block.lines) {
             continue;
         }
-        let Some(name) = patterns
-            .first()
-            .and_then(|p| yarn_classic_lock::pattern_real_name(p))
-        else {
+        let Some(name) = patterns.first().and_then(|p| pattern_real_name(p)) else {
             continue;
         };
         let Some(version) = classic_field(&block.lines, "version") else {
@@ -197,7 +197,6 @@ fn berry_hosted_tarball_entry(
     version: &str,
     reference: &str,
 ) -> bool {
-    use crate::vendor::yarn_classic_lock::split_pattern;
     crate::patch::redirect::hosted_url::hosted_url_names(reference, name, version)
         && !entry.patterns.is_empty()
         && entry.patterns.iter().all(|p| {
