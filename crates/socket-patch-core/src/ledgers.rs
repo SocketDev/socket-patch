@@ -28,7 +28,8 @@ use std::path::Path;
 
 use crate::manifest::schema::{PatchManifest, PatchRecord};
 use crate::patch::redirect::{CorruptRedirectState, RedirectState};
-use crate::utils::purl::{normalize_purl, patch_matches, strip_purl_qualifiers};
+use crate::utils::purl::{normalize_purl, strip_purl_qualifiers};
+use crate::utils::target::Target;
 use crate::vendor::{VendorEntry, VendorState};
 
 /// A patch store, in owner-precedence order (a lower store wins a key).
@@ -293,16 +294,15 @@ impl<'a> Ledgers<'a> {
         out
     }
 
-    /// Every entry a remove/rollback `identifier` (purl or uuid) matches:
-    /// manifest and hosted records by [`patch_matches`] on their key,
-    /// vendored entries by [`VendorEntry::matches_identifier`] (key or base
-    /// purl).
-    pub fn matching(&self, identifier: &str) -> Matches {
+    /// Every entry a remove/rollback `target` matches: manifest and hosted
+    /// records by [`Target::matches_patch`] on their key, vendored entries
+    /// by [`VendorEntry::matches_target`] (key or base purl).
+    pub fn matching(&self, target: &Target) -> Matches {
         let mut manifest: Vec<String> = self
             .manifest
             .into_iter()
             .flat_map(|m| m.patches.iter())
-            .filter(|(key, rec)| patch_matches(key, &rec.uuid, identifier))
+            .filter(|(key, rec)| target.matches_patch(key, &rec.uuid))
             .map(|(key, _)| key.clone())
             .collect();
         manifest.sort();
@@ -310,7 +310,7 @@ impl<'a> Ledgers<'a> {
             .vendor
             .into_iter()
             .flat_map(|s| s.entries.iter())
-            .filter(|(key, entry)| entry.matches_identifier(key, identifier))
+            .filter(|(key, entry)| entry.matches_target(key, target))
             .map(|(k, e)| (k.clone(), e.clone()))
             .collect();
         vendor.sort_by(|a, b| a.0.cmp(&b.0));
@@ -318,7 +318,7 @@ impl<'a> Ledgers<'a> {
             .redirect
             .into_iter()
             .flat_map(|r| r.records.iter())
-            .filter(|(key, rec)| patch_matches(key, &rec.uuid, identifier))
+            .filter(|(key, rec)| target.matches_patch(key, &rec.uuid))
             .map(|(key, _)| key.clone())
             .collect();
         Matches {
@@ -370,7 +370,6 @@ pub fn uuid_only_record(uuid: &str) -> PatchRecord {
         tier: String::new(),
     }
 }
-
 
 /// Fold the hosted pins and the vendor ledger's patch records into the
 /// manifest view update detection consults. Hosted mode records purl→uuid
@@ -569,11 +568,11 @@ mod tests {
             vendor: Some(&v),
             redirect: Some(&r),
         };
-        let found = l.matching("pkg:npm/a@1");
+        let found = l.matching(&Target::parse("pkg:npm/a@1"));
         assert_eq!(found.manifest, vec!["pkg:npm/a@1"]);
         assert_eq!(found.vendor.len(), 1);
         assert_eq!(found.hosted, vec!["pkg:npm/a@1"]);
-        assert!(l.matching("nope").is_empty());
-        assert_eq!(l.matching("hb").hosted, vec!["pkg:npm/b@1"]);
+        assert!(l.matching(&Target::parse("nope")).is_empty());
+        assert_eq!(l.matching(&Target::parse("hb")).hosted, vec!["pkg:npm/b@1"]);
     }
 }

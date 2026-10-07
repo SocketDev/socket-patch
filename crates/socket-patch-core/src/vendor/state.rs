@@ -33,9 +33,10 @@ use crate::constants::SOCKET_DIR;
 use crate::manifest::schema::PatchRecord;
 use crate::utils::composer_version::{composer_purl_identity, composer_purls_equivalent};
 use crate::utils::fs::{atomic_write_artifact, read_regular_to_bytes};
-use crate::utils::purl::{patch_matches, strip_purl_qualifiers};
+use crate::utils::purl::strip_purl_qualifiers;
 use crate::utils::serde::serialize_sorted;
 use crate::utils::socket_dir::{prune_empty_dirs, remove_file_and_prune, write_json_ledger};
+use crate::utils::target::Target;
 
 use super::parse_memo::ParseMemo;
 use super::path::VENDOR_DIR;
@@ -303,12 +304,11 @@ impl VendorEntry {
     }
 
     /// Does this entry, stored under ledger `key`, match a remove/rollback
-    /// identifier? By its ledger key or by its base purl (mirroring the
-    /// manifest matching of [`patch_matches`]; a golang key is case-encoded
-    /// while `base_purl` holds the decoded spelling users type), or by uuid.
-    pub fn matches_identifier(&self, key: &str, identifier: &str) -> bool {
-        patch_matches(key, &self.uuid, identifier)
-            || patch_matches(&self.base_purl, &self.uuid, identifier)
+    /// target? By its ledger key or by its base purl (the manifest rule,
+    /// [`Target::matches_patch`]; a golang key is case-encoded while
+    /// `base_purl` holds the decoded spelling users type), or by uuid.
+    pub fn matches_target(&self, key: &str, target: &Target) -> bool {
+        target.matches_patch(key, &self.uuid) || target.matches_patch(&self.base_purl, &self.uuid)
     }
 
     /// Does this entry, stored under ledger `key`, own the manifest purl
@@ -1098,20 +1098,29 @@ mod tests {
         entry.ecosystem = "golang".into();
         entry.base_purl = "pkg:golang/github.com/BurntSushi/toml@1.0.0".into();
         let key = "pkg:golang/github.com/!burnt!sushi/toml@1.0.0";
-        assert!(entry.matches_identifier(key, key));
-        assert!(entry.matches_identifier(key, "pkg:golang/github.com/BurntSushi/toml@1.0.0"));
-        assert!(entry.matches_identifier(key, UUID));
-        assert!(!entry.matches_identifier(key, "pkg:golang/github.com/BurntSushi/toml@2.0.0"));
-        assert!(!entry.matches_identifier(key, "00000000-0000-4000-8000-000000000000"));
+        assert!(entry.matches_target(key, &Target::parse(key)));
+        assert!(entry.matches_target(
+            key,
+            &Target::parse("pkg:golang/github.com/BurntSushi/toml@1.0.0")
+        ));
+        assert!(entry.matches_target(key, &Target::parse(UUID)));
+        assert!(!entry.matches_target(
+            key,
+            &Target::parse("pkg:golang/github.com/BurntSushi/toml@2.0.0")
+        ));
+        assert!(!entry.matches_target(key, &Target::parse("00000000-0000-4000-8000-000000000000")));
 
         // A qualified pypi key: the base identifier covers it, another
         // variant's qualifier does not.
         let mut entry = sample_entry();
         entry.base_purl = "pkg:pypi/requests@2.28.0".into();
         let key = "pkg:pypi/requests@2.28.0?artifact_id=abc";
-        assert!(entry.matches_identifier(key, "pkg:pypi/requests@2.28.0"));
-        assert!(entry.matches_identifier(key, key));
-        assert!(!entry.matches_identifier(key, "pkg:pypi/requests@2.28.0?artifact_id=zzz"));
+        assert!(entry.matches_target(key, &Target::parse("pkg:pypi/requests@2.28.0")));
+        assert!(entry.matches_target(key, &Target::parse(key)));
+        assert!(!entry.matches_target(
+            key,
+            &Target::parse("pkg:pypi/requests@2.28.0?artifact_id=zzz")
+        ));
     }
 
     /// `covers_purl`: the exact key, a qualifier-stripped twin of the key

@@ -5,7 +5,7 @@ use socket_patch_core::manifest::operations::{read_manifest, write_manifest};
 use socket_patch_core::manifest::schema::PatchManifest;
 use socket_patch_core::patch::redirect::upstream::HostedPin;
 use socket_patch_core::telemetry::{track_patch_remove_failed, track_patch_removed};
-use socket_patch_core::utils::purl::patch_matches;
+use socket_patch_core::utils::target::Target;
 use socket_patch_core::vendor::{
     load_state, RevertOpts, VendorEntry, VendorState, VENDOR_STATE_REL,
 };
@@ -22,43 +22,43 @@ use crate::commands::vendored_backend::{RevertedEntry, VendorRevertStep, Vendore
 use crate::json_envelope::{Command, Envelope, EnvelopeError, PatchAction, PatchEvent, Status};
 use crate::ui::plural;
 
-/// Vendor-ledger entries matching a remove identifier
+/// Vendor-ledger entries matching a remove target
 /// ([`socket_patch_core::ledgers::Ledgers::matching`]), sorted by key for
 /// deterministic event order.
-fn vendor_entries_matching(state: &VendorState, identifier: &str) -> Vec<(String, VendorEntry)> {
+fn vendor_entries_matching(state: &VendorState, target: &Target) -> Vec<(String, VendorEntry)> {
     socket_patch_core::ledgers::Ledgers {
         vendor: Some(state),
         ..Default::default()
     }
-    .matching(identifier)
+    .matching(target)
     .vendor
 }
 
-/// The lockfiles' hosted pins matching a remove identifier (by purl or
+/// The lockfiles' hosted pins matching a remove target (by purl, name or
 /// patch uuid), sorted by purl.
-fn hosted_pins_matching(pins: &[HostedPin], identifier: &str) -> Vec<HostedPin> {
+fn hosted_pins_matching(pins: &[HostedPin], target: &Target) -> Vec<HostedPin> {
     let mut matches: Vec<HostedPin> = pins
         .iter()
-        .filter(|pin| patch_matches(&pin.purl, &pin.uuid, identifier))
+        .filter(|pin| target.matches_patch(&pin.purl, &pin.uuid))
         .cloned()
         .collect();
     matches.sort_by(|a, b| a.purl.cmp(&b.purl));
     matches
 }
 
-/// Drop every manifest entry matching `identifier` except `exclusions`
+/// Drop every manifest entry matching `target` except `exclusions`
 /// (drift-kept vendored purls, whose record must survive with their
 /// vendored state). Returns the removed purls, sorted.
 fn remove_matching(
     manifest: &mut PatchManifest,
-    identifier: &str,
+    target: &Target,
     exclusions: &HashSet<String>,
 ) -> Vec<String> {
     let mut removed: Vec<String> = manifest
         .patches
         .iter()
         .filter(|(purl, patch)| {
-            patch_matches(purl, &patch.uuid, identifier) && !exclusions.contains(*purl)
+            target.matches_patch(purl, &patch.uuid) && !exclusions.contains(*purl)
         })
         .map(|(purl, _)| purl.clone())
         .collect();
@@ -271,7 +271,8 @@ fn format_blob_sweep(
 
 #[derive(Args)]
 pub struct RemoveArgs {
-    /// Package PURL or patch UUID.
+    /// Patch UUID, package PURL (`pkg:npm/lodash@4.17.21`, or versionless
+    /// for every version), or exact package name (`lodash`)
     pub identifier: String,
 
     #[command(flatten)]
@@ -313,6 +314,9 @@ const DRY_RUN_FOOTER: &str = "Dry run: no changes made.";
 
 pub async fn run(args: RemoveArgs) -> i32 {
     apply_env_toggles(&args.common);
+    // The shared target grammar: a UUID, a purl (versioned or not) or an
+    // exact package name. Every store below matches through it.
+    let target = Target::parse(&args.identifier);
 
     // Self-enforced usage error (exit 2, like scan's mode conflicts):
     // `--skip-rollback` keeps the tree and drops the state,
@@ -441,7 +445,7 @@ pub async fn run(args: RemoveArgs) -> i32 {
     let mut matching: Vec<_> = manifest
         .patches
         .iter()
-        .filter(|(purl, patch)| patch_matches(purl, &patch.uuid, &args.identifier))
+        .filter(|(purl, patch)| target.matches_patch(purl, &patch.uuid))
         .collect();
     matching.sort_by(|a, b| a.0.cmp(b.0));
 
@@ -462,7 +466,7 @@ pub async fn run(args: RemoveArgs) -> i32 {
         // --revert`'s all-at-once). An unreadable ledger falls through to
         // `not_found`: nothing is mutated on that path.
         if let Ok(state) = vendor_state_result {
-            let ledger_matches = vendor_entries_matching(&state, &args.identifier);
+            let ledger_matches = vendor_entries_matching(&state, &target);
             if !ledger_matches.is_empty() {
                 return remove_ledger_only(
                     &args,
@@ -478,7 +482,7 @@ pub async fn run(args: RemoveArgs) -> i32 {
         // Hosted-only patches likewise have no manifest entry — their
         // lockfile pins are their only persistence, and `remove` is their
         // per-purl exit path (restoring the upstream entry IS the removal).
-        let hosted_matches = hosted_pins_matching(&hosted_pins, &args.identifier);
+        let hosted_matches = hosted_pins_matching(&hosted_pins, &target);
         if !hosted_matches.is_empty() {
             return remove_hosted_only(
                 &args,
@@ -505,9 +509,10 @@ pub async fn run(args: RemoveArgs) -> i32 {
     // blast radius explicit so the user understands why a single
     // `remove pkg:pypi/foo@1.0` is removing several variants.
     if loud {
-        let variants = args.identifier.starts_with("pkg:")
-            && !args.identifier.contains('?')
-            && matching.len() > 1;
+        // Only an exact base purl expands to release variants; a name or
+        // versionless purl matching several entries is "several patches".
+        let variants =
+            target.is_versioned_purl() && !args.identifier.contains('?') && matching.len() > 1;
         eprintln!(
             "{}",
             format_remove_header(
@@ -541,9 +546,9 @@ pub async fn run(args: RemoveArgs) -> i32 {
         } else {
             let vendored = vendor_state_result
                 .as_ref()
-                .map(|st| vendor_entries_matching(st, &args.identifier).len())
+                .map(|st| vendor_entries_matching(st, &target).len())
                 .unwrap_or(0);
-            let hosted = hosted_pins_matching(&hosted_pins, &args.identifier).len();
+            let hosted = hosted_pins_matching(&hosted_pins, &target).len();
             (vendored, hosted)
         };
         let prompt = remove_prompt(
@@ -602,7 +607,7 @@ pub async fn run(args: RemoveArgs) -> i32 {
             &socket_dir,
             &manifest,
             &vendored_keys,
-            InnerSelection::Identifier(Some(&args.identifier)),
+            InnerSelection::Identifier(Some(&target)),
             Some(&telemetry_client),
         )
         .await
@@ -722,7 +727,7 @@ pub async fn run(args: RemoveArgs) -> i32 {
             return 1;
         }
     };
-    let vendored_matches = vendor_entries_matching(&vendor_state, &args.identifier);
+    let vendored_matches = vendor_entries_matching(&vendor_state, &target);
     let mut vendor_leg = RemoveVendorLeg::default();
     if !vendored_matches.is_empty() {
         if args.skip_rollback {
@@ -771,7 +776,7 @@ pub async fn run(args: RemoveArgs) -> i32 {
     // carried into the success envelope's `warnings[]`.
     let mut hosted_leg_warnings: Vec<(String, String)> = Vec::new();
     if !args.skip_rollback {
-        let hosted_matches = hosted_pins_matching(&hosted_pins, &args.identifier);
+        let hosted_matches = hosted_pins_matching(&hosted_pins, &target);
         if !hosted_matches.is_empty() {
             let leg = match unwind_hosted(&args.common, &hosted_matches).await {
                 Ok(leg) => {
@@ -837,7 +842,7 @@ pub async fn run(args: RemoveArgs) -> i32 {
     let removed = if args.preserve_state {
         Vec::new()
     } else {
-        remove_matching(&mut updated_manifest, &args.identifier, &excluded_kept)
+        remove_matching(&mut updated_manifest, &target, &excluded_kept)
     };
     if removed.is_empty() && !args.preserve_state {
         // Every matching entry was drift-kept (the identifier matched, so
@@ -1629,7 +1634,11 @@ mod tests {
     fn remove_base_purl_removes_all_variants() {
         let mut manifest = multi_variant_manifest();
 
-        let removed = remove_matching(&mut manifest, "pkg:pypi/six@1.16.0", &Default::default());
+        let removed = remove_matching(
+            &mut manifest,
+            &Target::parse("pkg:pypi/six@1.16.0"),
+            &Default::default(),
+        );
 
         // All three release variants removed (sorted); the npm package untouched.
         assert_eq!(removed.len(), 3);
@@ -1648,7 +1657,7 @@ mod tests {
 
         let removed = remove_matching(
             &mut manifest,
-            "pkg:pypi/six@1.16.0?artifact_id=sdist",
+            &Target::parse("pkg:pypi/six@1.16.0?artifact_id=sdist"),
             &Default::default(),
         );
 
@@ -1664,7 +1673,11 @@ mod tests {
     fn remove_by_uuid_removes_single_variant() {
         let mut manifest = multi_variant_manifest();
 
-        let removed = remove_matching(&mut manifest, "uuid-cp312", &Default::default());
+        let removed = remove_matching(
+            &mut manifest,
+            &Target::parse("uuid-cp312"),
+            &Default::default(),
+        );
 
         assert_eq!(removed, vec!["pkg:pypi/six@1.16.0?artifact_id=wheel-cp312"]);
         assert_eq!(manifest.patches.len(), 3);
@@ -1684,7 +1697,11 @@ mod tests {
             setup: None,
         };
 
-        let removed = remove_matching(&mut manifest, "pkg:npm/foo@1.0", &Default::default());
+        let removed = remove_matching(
+            &mut manifest,
+            &Target::parse("pkg:npm/foo@1.0"),
+            &Default::default(),
+        );
 
         assert_eq!(removed, vec!["pkg:npm/foo@1.0"]);
         assert_eq!(manifest.patches.len(), 1);
@@ -1701,10 +1718,52 @@ mod tests {
         let mut manifest = multi_variant_manifest();
         let before = manifest.clone();
 
-        let removed = remove_matching(&mut manifest, "pkg:npm/not-here@9.9.9", &Default::default());
+        let removed = remove_matching(
+            &mut manifest,
+            &Target::parse("pkg:npm/not-here@9.9.9"),
+            &Default::default(),
+        );
 
         assert!(removed.is_empty(), "nothing should match");
         assert_eq!(manifest, before, "manifest left intact");
+    }
+
+    /// The shared target grammar: a bare name and a versionless purl
+    /// select every recorded version (`remove six` used to be "No patch
+    /// found"), and a name stays exact (`six` is not `sixer`).
+    #[test]
+    fn remove_by_name_or_versionless_purl_removes_every_version() {
+        for token in ["six", "pkg:pypi/six"] {
+            let mut manifest = multi_variant_manifest();
+            manifest
+                .patches
+                .insert("pkg:pypi/six@1.17.0".to_string(), make_record("uuid-17"));
+            manifest.patches.insert(
+                "pkg:pypi/sixer@1.0.0".to_string(),
+                make_record("uuid-sixer"),
+            );
+            let removed =
+                remove_matching(&mut manifest, &Target::parse(token), &Default::default());
+            assert!(
+                removed.contains(&"pkg:pypi/six@1.17.0".to_string()),
+                "{token}: {removed:?}"
+            );
+            assert!(
+                removed.iter().all(|p| p.starts_with("pkg:pypi/six@")),
+                "{token}: {removed:?}"
+            );
+            assert!(
+                manifest.patches.contains_key("pkg:pypi/sixer@1.0.0"),
+                "{token}"
+            );
+            assert!(
+                !manifest
+                    .patches
+                    .keys()
+                    .any(|k| k.starts_with("pkg:pypi/six@")),
+                "{token}"
+            );
+        }
     }
 
     /// A base PURL must not bleed across versions: removing `six@1.16.0`
@@ -1725,7 +1784,11 @@ mod tests {
             setup: None,
         };
 
-        let removed = remove_matching(&mut manifest, "pkg:pypi/six@1.16.0", &Default::default());
+        let removed = remove_matching(
+            &mut manifest,
+            &Target::parse("pkg:pypi/six@1.16.0"),
+            &Default::default(),
+        );
 
         assert_eq!(removed, vec!["pkg:pypi/six@1.16.0?artifact_id=sdist"]);
         assert_eq!(manifest.patches.len(), 1);
@@ -1742,7 +1805,11 @@ mod tests {
         let exclusions: HashSet<String> =
             ["pkg:pypi/six@1.16.0?artifact_id=sdist".to_string()].into();
 
-        let removed = remove_matching(&mut manifest, "pkg:pypi/six@1.16.0", &exclusions);
+        let removed = remove_matching(
+            &mut manifest,
+            &Target::parse("pkg:pypi/six@1.16.0"),
+            &exclusions,
+        );
 
         assert_eq!(
             removed.len(),

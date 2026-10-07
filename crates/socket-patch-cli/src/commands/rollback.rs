@@ -14,7 +14,8 @@ use socket_patch_core::patch::rollback::{
     VerifyRollbackResult, VerifyRollbackStatus,
 };
 use socket_patch_core::telemetry::{track_patch_rollback_failed, track_patch_rolled_back};
-use socket_patch_core::utils::purl::{patch_matches, strip_purl_qualifiers};
+use socket_patch_core::utils::purl::strip_purl_qualifiers;
+use socket_patch_core::utils::target::{is_path_shaped, Target, TargetKind};
 use socket_patch_core::vendor::{purl_keys_cover, RevertOpts, VendorState};
 use std::collections::{HashMap, HashSet};
 use std::path::{Path, PathBuf};
@@ -26,7 +27,6 @@ use crate::commands::lock_cli::acquire_or_emit;
 use crate::commands::vendored_backend::{RevertedEntry, VendorRevertStep, VendoredBackend};
 use crate::ecosystem_dispatch::{find_all_packages_for_rollback, partition_purls, JvmScope};
 use crate::json_envelope::Command as EnvelopeCommand;
-use crate::looks_like_uuid;
 use crate::ui::{plural, StatusLine};
 
 #[derive(Args)]
@@ -374,31 +374,25 @@ fn format_reinstall_note(still_patched: usize, dry_run: bool) -> String {
 /// One classified rollback target token.
 #[derive(Debug, Clone, PartialEq)]
 pub(crate) enum RollbackTarget {
-    /// PURL or UUID — today's `patch_matches` semantics.
-    Identifier(String),
+    /// A UUID, purl or package name in the shared target grammar
+    /// ([`Target::matches_patch`]).
+    Identifier(Target),
     /// A path glob scoping the run to patches with an installed copy
     /// under a matching path.
     PathGlob(String),
 }
 
 /// Shape-classify a target token. Only path-SHAPED tokens become globs
-/// (separator, glob metachar, `./` prefix, or absolute); `pkg:` and every
-/// other bare word keep identifier semantics, so a truncated UUID or a
-/// package name typed without its `pkg:` prefix stays a safe
-/// "No patch found matching identifier" error instead of silently
+/// ([`is_path_shaped`]: separator, glob metachar, `./` prefix, or absolute;
+/// an npm `@scope/name` is a name); `pkg:` and every other token keep the
+/// shared target grammar, so a truncated UUID or a mistyped name stays a
+/// safe "No patch found matching identifier" error instead of silently
 /// selecting a directory subtree.
 pub(crate) fn classify_target(token: &str) -> RollbackTarget {
-    if token.starts_with("pkg:") {
-        return RollbackTarget::Identifier(token.to_string());
-    }
-    let path_shaped = token.contains('/')
-        || token.contains('\\')
-        || token.contains(['*', '?', '['])
-        || Path::new(token).is_absolute();
-    if path_shaped {
+    if is_path_shaped(token) {
         RollbackTarget::PathGlob(token.to_string())
     } else {
-        RollbackTarget::Identifier(token.to_string())
+        RollbackTarget::Identifier(Target::parse(token))
     }
 }
 
@@ -450,7 +444,7 @@ pub(crate) enum InnerSelection<'a> {
     /// The legacy single-identifier filter (`remove`'s delegation): a
     /// no-match identifier is an error, a missing manifest is an error,
     /// and `None` selects the whole manifest.
-    Identifier(Option<&'a str>),
+    Identifier(Option<&'a Target>),
     /// A pre-resolved purl set from the CLI boundary's target resolver
     /// (identifiers ∪ path globs ∪ everything). No-match and
     /// missing-manifest handling already happened upstream, so an empty
@@ -545,12 +539,12 @@ async fn try_rollback_local_go(
 
 fn find_patches_to_rollback(
     manifest: &PatchManifest,
-    identifier: Option<&str>,
+    target: Option<&Target>,
 ) -> Vec<PatchToRollback> {
     manifest
         .patches
         .iter()
-        .filter(|(purl, patch)| identifier.is_none_or(|id| patch_matches(purl, &patch.uuid, id)))
+        .filter(|(purl, patch)| target.is_none_or(|t| t.matches_patch(purl, &patch.uuid)))
         .map(|(purl, patch)| PatchToRollback {
             purl: purl.clone(),
             patch: patch.clone(),
@@ -996,7 +990,7 @@ pub async fn run(args: RollbackArgs) -> i32 {
 
     // Classify targets up front: the glob validation is a pre-network
     // usage check.
-    let mut identifiers: Vec<String> = Vec::new();
+    let mut identifiers: Vec<Target> = Vec::new();
     let mut path_patterns: Vec<String> = Vec::new();
     for token in &args.targets {
         match classify_target(token) {
@@ -1246,13 +1240,13 @@ pub async fn run(args: RollbackArgs) -> i32 {
         vendor_scope.extend(found.vendor.into_iter().map(|(k, _)| k));
         // Hosted pins live in the lockfiles, not in a store.
         for (purl, uuid) in &redirect_records {
-            if patch_matches(purl, uuid, id) {
+            if id.matches_patch(purl, uuid) {
                 hosted_scope.insert(purl.clone());
                 matched = true;
             }
         }
         if !matched {
-            let hint = if id.starts_with("pkg:") || looks_like_uuid(id) {
+            let hint = if matches!(id.kind(), TargetKind::Purl | TargetKind::Uuid) {
                 String::new()
             } else {
                 format!(" (to target a directory instead, use ./{id} or {id}/**)")
@@ -2024,9 +2018,7 @@ pub(crate) async fn rollback_patches_inner(
     let mut blobs_path = socket_dir.join("blobs");
 
     let patches_to_rollback = match &selection {
-        InnerSelection::Identifier(identifier) => {
-            find_patches_to_rollback(manifest, identifier.as_deref())
-        }
+        InnerSelection::Identifier(identifier) => find_patches_to_rollback(manifest, *identifier),
         InnerSelection::Scope { purls, .. } => manifest
             .patches
             .iter()
@@ -3077,12 +3069,13 @@ mod tests {
             dry_run,
             ..common.clone()
         };
+        let target = identifier.map(Target::parse);
         let outcome = rollback_patches_inner(
             &delegated_common,
             &socket_dir,
             &manifest,
             &vendored_keys,
-            InnerSelection::Identifier(identifier),
+            InnerSelection::Identifier(target.as_ref()),
             None,
         )
         .await?;
@@ -3127,7 +3120,7 @@ mod tests {
     #[test]
     fn test_find_patches_to_rollback_purl_match() {
         let manifest = make_manifest();
-        let result = find_patches_to_rollback(&manifest, Some("pkg:npm/foo@1.0"));
+        let result = find_patches_to_rollback(&manifest, Some(&Target::parse("pkg:npm/foo@1.0")));
         assert_eq!(result.len(), 1);
         assert_eq!(result[0].purl, "pkg:npm/foo@1.0");
     }
@@ -3135,14 +3128,15 @@ mod tests {
     #[test]
     fn test_find_patches_to_rollback_purl_no_match() {
         let manifest = make_manifest();
-        let result = find_patches_to_rollback(&manifest, Some("pkg:npm/nonexistent@1"));
+        let result =
+            find_patches_to_rollback(&manifest, Some(&Target::parse("pkg:npm/nonexistent@1")));
         assert!(result.is_empty());
     }
 
     #[test]
     fn test_find_patches_to_rollback_uuid_match() {
         let manifest = make_manifest();
-        let result = find_patches_to_rollback(&manifest, Some("uuid-bar"));
+        let result = find_patches_to_rollback(&manifest, Some(&Target::parse("uuid-bar")));
         assert_eq!(result.len(), 1);
         assert_eq!(result[0].patch.uuid, "uuid-bar");
         assert_eq!(result[0].purl, "pkg:npm/bar@2.0");
@@ -3151,7 +3145,8 @@ mod tests {
     #[test]
     fn test_find_patches_to_rollback_uuid_no_match() {
         let manifest = make_manifest();
-        let result = find_patches_to_rollback(&manifest, Some("uuid-does-not-exist"));
+        let result =
+            find_patches_to_rollback(&manifest, Some(&Target::parse("uuid-does-not-exist")));
         assert!(result.is_empty());
     }
 
@@ -3181,7 +3176,8 @@ mod tests {
     #[test]
     fn test_find_patches_to_rollback_base_purl_matches_all_variants() {
         let manifest = make_multi_variant_manifest();
-        let result = find_patches_to_rollback(&manifest, Some("pkg:pypi/six@1.16.0"));
+        let result =
+            find_patches_to_rollback(&manifest, Some(&Target::parse("pkg:pypi/six@1.16.0")));
         // Base PURL (no qualifier) expands to every release variant.
         assert_eq!(result.len(), 3);
         for p in &result {
@@ -3192,17 +3188,57 @@ mod tests {
     #[test]
     fn test_find_patches_to_rollback_qualified_purl_matches_one_variant() {
         let manifest = make_multi_variant_manifest();
-        let result =
-            find_patches_to_rollback(&manifest, Some("pkg:pypi/six@1.16.0?artifact_id=sdist"));
+        let result = find_patches_to_rollback(
+            &manifest,
+            Some(&Target::parse("pkg:pypi/six@1.16.0?artifact_id=sdist")),
+        );
         // A fully-qualified PURL targets exactly one variant.
         assert_eq!(result.len(), 1);
         assert_eq!(result[0].purl, "pkg:pypi/six@1.16.0?artifact_id=sdist");
     }
 
+    /// Rollback shares the target grammar: a bare name (and an npm
+    /// `@scope/name`) is a package target, not a uuid-only identifier or a
+    /// path glob; only path-shaped tokens are globs.
+    #[test]
+    fn classify_target_uses_the_shared_grammar() {
+        assert!(matches!(
+            classify_target("lodash"),
+            RollbackTarget::Identifier(_)
+        ));
+        assert!(matches!(
+            classify_target("@babel/core"),
+            RollbackTarget::Identifier(_)
+        ));
+        assert!(matches!(
+            classify_target("pkg:npm/@s/x"),
+            RollbackTarget::Identifier(_)
+        ));
+        assert!(matches!(
+            classify_target("./node_modules"),
+            RollbackTarget::PathGlob(_)
+        ));
+        assert!(matches!(
+            classify_target("node_modules/**"),
+            RollbackTarget::PathGlob(_)
+        ));
+        let manifest = make_manifest();
+        let result = find_patches_to_rollback(&manifest, Some(&Target::parse("foo")));
+        assert_eq!(result.len(), 1, "a bare name selects its recorded patch");
+        assert_eq!(result[0].purl, "pkg:npm/foo@1.0");
+        let result = find_patches_to_rollback(&manifest, Some(&Target::parse("pkg:npm/foo")));
+        assert_eq!(
+            result.len(),
+            1,
+            "a versionless purl selects its recorded patch"
+        );
+    }
+
     #[test]
     fn test_find_patches_to_rollback_base_purl_does_not_leak_other_packages() {
         let manifest = make_multi_variant_manifest();
-        let result = find_patches_to_rollback(&manifest, Some("pkg:pypi/six@1.16.0"));
+        let result =
+            find_patches_to_rollback(&manifest, Some(&Target::parse("pkg:pypi/six@1.16.0")));
         assert!(result.iter().all(|p| p.purl.contains("six@1.16.0")));
     }
 
