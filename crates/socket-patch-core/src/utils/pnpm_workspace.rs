@@ -41,7 +41,7 @@ const PNPM_LOCK: &str = "pnpm-lock.yaml";
 
 /// The directories pnpm never finds workspace projects in (the default
 /// ignores of its project finder), at any depth.
-const MEMBER_SKIP: &[&str] = &["node_modules", "bower_components", "test", "tests"];
+pub(crate) const MEMBER_SKIP: &[&str] = &["node_modules", "bower_components", "test", "tests"];
 
 /// Which lock(s) pnpm installs a workspace from, read at its root.
 #[derive(Debug, Clone, PartialEq, Eq)]
@@ -377,7 +377,7 @@ async fn workspace_members(view: &ProjectView<'_>) -> Members {
 }
 
 /// The manifest names that make a directory a pnpm project.
-const PROJECT_MANIFESTS: [&str; 3] = ["package.json", "package.yaml", "package.json5"];
+pub(crate) const PROJECT_MANIFESTS: [&str; 3] = ["package.json", "package.yaml", "package.json5"];
 
 /// pnpm's per-branch locks (`gitBranchLockfile`, #556), found at a project
 /// root: the setting is on and at least one `pnpm-lock.<branch>.yaml`

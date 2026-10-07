@@ -73,6 +73,30 @@ pub(super) async fn inventory_pnpm_lock_at(lock_path: &Path) -> Option<Vec<Lockf
     pnpm_lock_text_inventory(&text)
 }
 
+/// Inventory the workspace members' own locks pnpm installs from under
+/// `sharedWorkspaceLockfile: false` (#492), the same ones hosted mode pins
+/// and discovery reads ([`member_locks`]): empty for a shared lock, an
+/// unresolved member list, or a Rush monorepo (whose locks are read
+/// instead). A member lock that cannot be read adds nothing.
+pub(super) async fn inventory_pnpm_member_locks_in(view: &ProjectView<'_>) -> Vec<LockfileEntry> {
+    use crate::utils::pnpm_workspace::{member_locks, MemberLocks};
+    if view.is_file("rush.json") {
+        return Vec::new();
+    }
+    let MemberLocks::PerMember(keys) = member_locks(view).await else {
+        return Vec::new();
+    };
+    let mut out = Vec::new();
+    for key in keys {
+        out.extend(
+            inventory_pnpm_lock_rel_in(view, &key)
+                .await
+                .unwrap_or_default(),
+        );
+    }
+    out
+}
+
 fn pnpm_lock_text_inventory(text: &str) -> Option<Vec<LockfileEntry>> {
     PnpmLock::parse(text).entries()
 }

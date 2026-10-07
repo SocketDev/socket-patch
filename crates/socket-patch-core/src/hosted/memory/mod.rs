@@ -33,6 +33,12 @@
 //! `maxTotalBytes`, so such a repo can fail with a `limit` error where the
 //! disk run would succeed. Fetching fewer would instead silently drop
 //! manifests the disk run pins.
+//!
+//! A pnpm workspace member's own `pnpm-lock.yaml` (a root the nearest
+//! ancestor `pnpm-workspace.yaml` lists) is demoted into that workspace
+//! root, which reads it as a disk run from the root does: pinned beside the
+//! root lock under `sharedWorkspaceLockfile: false`, ignored beside a
+//! shared root lock (#492).
 
 use std::collections::{BTreeMap, BTreeSet, HashMap};
 use std::sync::Arc;
@@ -289,75 +295,55 @@ fn demote_cargo_members(states: &mut [RootState], warnings: &mut Vec<EngineWarni
     }
 }
 
-/// A pnpm root with a v9 lock but no `pnpm-workspace.yaml` of its own that
-/// the nearest ancestor `pnpm-workspace.yaml` lists as a workspace project
-/// (#492, #880): pnpm reads `trustLockfile` only from that ancestor file,
-/// so the trust auto-config's `pnpm-workspace.yaml` in the member would be
-/// ignored and pnpm >= 11 would reject the hosted pins. The disk run
-/// refuses a member run the same way (`redirect_pnpm_settings_elsewhere`)
-/// and, from the workspace root, pins the member locks and trusts them in
-/// the root file; the in-memory engine treats each member lock as a root
-/// of its own, so it refuses the member instead of writing a file pnpm
-/// never reads. A governing file it cannot read (a symlink, oversize)
-/// counts as listing the member, the refusing side.
-fn refuse_governed_pnpm_members(files: &BTreeMap<String, SharedFile>, states: &mut [RootState]) {
-    use crate::hosted::governing_root::PNPM_SETTINGS_ELSEWHERE;
-    use crate::hosted::guidance::PNPM_WORKSPACE_REL;
-    for state in states.iter_mut() {
-        let Some(project) = state.project.as_ref() else {
+/// The text of the input file `path` when its content was provided (see
+/// [`roots::pnpm_workspace_members`]).
+fn input_text<'a>(files: &'a BTreeMap<String, SharedFile>, path: &str) -> Option<&'a str> {
+    match files.get(path) {
+        Some(SharedFile {
+            entry: MemoryEntry::Text(text),
+            unreadable: false,
+        }) => Some(text),
+        _ => None,
+    }
+}
+
+/// A pnpm workspace member's own `pnpm-lock.yaml` is the workspace root's
+/// to read (#492, [`roots::pnpm_workspace_members`]): pinned beside the
+/// root's under `sharedWorkspaceLockfile: false`, a stale leftover beside a
+/// shared root lock. A member that stays a root (it holds another lock, or
+/// the caller named it) drops that lock, as a Cargo member drops its
+/// Cargo.lock ([`demote_cargo_members`]); when the workspace root is not
+/// among the roots, the lock is not scanned at all and a warning says so.
+fn demote_pnpm_members(
+    states: &mut [RootState],
+    members: &[(String, String)],
+    warnings: &mut Vec<EngineWarning>,
+) {
+    let roots: BTreeSet<String> = states.iter().map(|s| s.root.clone()).collect();
+    for (member, workspace) in members {
+        let Some(state) = states.iter_mut().find(|s| &s.root == member) else {
             continue;
         };
-        if state.root.is_empty() || project.contains(PNPM_WORKSPACE_REL) {
+        let Some(project) = state.project.as_mut() else {
+            continue;
+        };
+        if project.remove("pnpm-lock.yaml").is_none() {
             continue;
         }
-        let v9 = matches!(
-            project.get("pnpm-lock.yaml"),
-            Some(MemoryEntry::Text(lock))
-                if crate::formats::pnpm::lock_version_major(lock).is_some_and(|major| major >= 9)
-        );
-        if !v9 {
+        state.unreadable.remove("pnpm-lock.yaml");
+        if roots.contains(workspace) {
             continue;
         }
-        let mut dir = state.root.as_str();
-        let governing = loop {
-            dir = roots::split_path(dir).0;
-            let path = roots::join_root(dir, PNPM_WORKSPACE_REL);
-            if let Some(file) = files.get(&path) {
-                break Some((dir, path, file));
-            }
-            if dir.is_empty() {
-                break None;
-            }
-        };
-        let Some((dir, path, file)) = governing else {
-            continue;
-        };
-        let rel: Vec<String> = roots::strip_root(dir, &state.root)
-            .unwrap_or(&state.root)
-            .split('/')
-            .map(str::to_string)
-            .collect();
-        let member = match &file.entry {
-            MemoryEntry::Text(text) if !file.unreadable => {
-                crate::utils::pnpm_workspace::lists_as_member(text, &rel)
-            }
-            _ => true,
-        };
-        if member {
-            state.fail(
-                PNPM_SETTINGS_ELSEWHERE,
-                format!(
-                    "{} is a project of the pnpm workspace whose settings live in {path}: \
-                     pnpm reads `trustLockfile` only from that file, so a \
-                     pnpm-workspace.yaml created in {} would be ignored and pnpm >= 11 \
-                     would reject the hosted pins (ERR_PNPM_TARBALL_URL_MISMATCH); the \
-                     in-memory engine does not pin a workspace member's own lock — run \
-                     hosted mode from the workspace root on a checkout, or turn the trust \
-                     auto-config off to pin without it; nothing was written",
-                    state.root, state.root
-                ),
-            );
-        }
+        let workspace = if workspace.is_empty() { "." } else { workspace };
+        warnings.push(EngineWarning::new(
+            "pnpm_member_lock_ignored",
+            format!(
+                "{member} is a project of the pnpm workspace at `{workspace}`, whose root \
+                 decides which lock pnpm installs it from; its pnpm-lock.yaml was not \
+                 scanned — scan `{workspace}` as a project root to pin it"
+            ),
+            Some(member),
+        ));
     }
 }
 
@@ -560,13 +546,30 @@ async fn engine(
     }
     let mut policy_filtered: Vec<FilteredEntry> = Vec::new();
 
-    let root_list: Vec<String> = match &options.project_roots {
+    let mut root_list: Vec<String> = match &options.project_roots {
         Some(roots) => roots.clone(),
         None => roots::detect_roots(files.keys().map(String::as_str), ecosystems).0,
     };
     // The full policy (paths from the file too) judges every root before
     // the project limit; roots named in `projectRoots` are explicit.
     let explicit_roots = options.project_roots.is_some();
+    // pnpm workspace members' locks belong to the workspace root (#492):
+    // a detected member with no other lock is no root of its own, and the
+    // workspace root is one even with no lock there (pnpm 7 writes none).
+    let pnpm_members = roots::pnpm_workspace_members(
+        &root_list,
+        |path| files.contains_key(path),
+        |path| input_text(&files, path),
+    );
+    if !explicit_roots && !pnpm_members.is_empty() {
+        root_list.retain(|root| {
+            !pnpm_members.iter().any(|(member, _)| member == root)
+                || roots::has_other_root_marker(root, files.keys().map(String::as_str), ecosystems)
+        });
+        root_list.extend(pnpm_members.iter().map(|(_, workspace)| workspace.clone()));
+        root_list.sort();
+        root_list.dedup();
+    }
     let detected_roots = root_list.clone();
     let root_list: Vec<String> = root_list
         .into_iter()
@@ -631,10 +634,8 @@ async fn engine(
             error: None,
         })
         .collect();
-    if options.trust_lockfile_config {
-        refuse_governed_pnpm_members(&files, &mut states);
-    }
     drop(files);
+    demote_pnpm_members(&mut states, &pnpm_members, &mut warnings);
     demote_cargo_members(&mut states, &mut warnings);
     phases.mark("roots");
 

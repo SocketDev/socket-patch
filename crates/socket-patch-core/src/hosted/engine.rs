@@ -593,7 +593,7 @@ pub async fn read_candidate_files(
     } else if candidates.iter().any(|c| c.dep.ecosystem == "npm") {
         if let Some(branch) = crate::utils::pnpm_workspace::git_branch_locks(view).await {
             refuse_git_branch_locks(&mut out, &branch);
-        } else if !matches!(view, ProjectView::Memory(_)) {
+        } else {
             read_pnpm_member_locks(view, unreadable, &mut out).await;
         }
     }
@@ -633,10 +633,11 @@ pub async fn read_candidate_files(
 /// rewriter is basename-generalized and the write-back path-generic, like
 /// the Rush locks above. Members whose list cannot be read leave the root
 /// lock out too and refuse (see [`CandidateFiles::pnpm_refusal`]).
-/// Disk only: the in-memory engine detects each member lock as a root of
-/// its own, and refuses one the trust auto-config would scaffold a nested
-/// pnpm-workspace.yaml for (`refuse_governed_pnpm_members` in
-/// [`super::memory`]).
+/// In memory too: the in-memory engine demotes each member lock into its
+/// workspace root (`roots::pnpm_workspace_members` in [`super::memory`]),
+/// so the root reads them here as a disk run from it does; a member lock
+/// whose content was not provided refuses the project like an unreadable
+/// root lock.
 async fn read_pnpm_member_locks(
     view: &ProjectView<'_>,
     unreadable: &BTreeSet<String>,

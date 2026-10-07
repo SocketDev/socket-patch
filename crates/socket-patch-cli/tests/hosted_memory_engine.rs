@@ -1186,13 +1186,14 @@ async fn pnpm_9_pin_gets_no_root_only_workspace_in_memory() {
     }
 }
 
-/// #492 in memory: a member of a `sharedWorkspaceLockfile: false` pnpm
-/// workspace is detected as a root of its own. pnpm reads `trustLockfile`
-/// only from the workspace root's pnpm-workspace.yaml, so the member is
-/// refused rather than given a nested scaffold pnpm ignores. A project the
-/// root file does not list stays a standalone project.
+/// #492 in memory: the lock of a `sharedWorkspaceLockfile: false` pnpm
+/// workspace member is demoted into the workspace root, which pins it and
+/// trusts it in its own pnpm-workspace.yaml (the only one pnpm reads),
+/// never in a nested scaffold. A project the root file does not list
+/// stays a standalone root. A member named alone as a project root is not
+/// pinned on its own; a warning names the workspace root to scan.
 #[tokio::test]
-async fn a_pnpm_workspace_member_lock_is_refused_not_scaffolded_in_memory() {
+async fn a_pnpm_workspace_member_lock_is_demoted_into_the_workspace_root_in_memory() {
     let dir = fixtures_root().join("redirect/npm/pnpm/basic");
     let server = MockServer::start().await;
     mount_api(
@@ -1200,8 +1201,9 @@ async fn a_pnpm_workspace_member_lock_is_refused_not_scaffolded_in_memory() {
         &patches_from_overrides(&dir.join("overrides.json"), None),
     )
     .await;
-    let member = prefixed("packages/a", &fixture_files(&dir.join("input")));
-    for (globs, refused) in [("packages/*", true), ("tools/*", false)] {
+    let mut member = prefixed("packages/a", &fixture_files(&dir.join("input")));
+    member.insert("packages/a/package.json".into(), b"{}".to_vec());
+    for (globs, listed) in [("packages/*", true), ("tools/*", false)] {
         let mut files = member.clone();
         files.insert(
             "pnpm-workspace.yaml".into(),
@@ -1212,28 +1214,33 @@ async fn a_pnpm_workspace_member_lock_is_refused_not_scaffolded_in_memory() {
             b"lockfileVersion: '9.0'\n\nimporters:\n\n  .: {}\n".to_vec(),
         );
         let output = run_engine(&server, build_input(&files, &[], options(false))).await;
-        let project = output
-            .projects
-            .iter()
-            .find(|p| p.root == "packages/a")
-            .expect("the member lock is a root");
+        let roots: Vec<&str> = output.projects.iter().map(|p| p.root.as_str()).collect();
         let paths: Vec<&str> = output
             .changed_files
             .iter()
             .map(|f| f.path.as_str())
             .collect();
-        if refused {
-            let error = project.error.as_ref().expect("refused");
-            assert_eq!(error.code, "redirect_pnpm_settings_elsewhere", "{error:?}");
+        assert!(
+            output.projects.iter().all(|p| p.error.is_none()),
+            "{:?}",
+            output.projects
+        );
+        assert!(paths.contains(&"packages/a/pnpm-lock.yaml"), "{paths:?}");
+        if listed {
+            assert_eq!(roots, [""]);
+            assert!(paths.contains(&"pnpm-workspace.yaml"), "{paths:?}");
             assert!(
-                !paths.iter().any(|p| p.starts_with("packages/a/")),
+                !paths.contains(&"packages/a/pnpm-workspace.yaml"),
                 "{paths:?}"
             );
         } else {
-            assert!(project.error.is_none(), "{:?}", project.error);
-            assert!(paths.contains(&"packages/a/pnpm-lock.yaml"), "{paths:?}");
+            assert_eq!(roots, ["", "packages/a"]);
+            assert!(
+                paths.contains(&"packages/a/pnpm-workspace.yaml"),
+                "a standalone project gets its own file: {paths:?}"
+            );
         }
-        // The trust auto-config off pins the member without a scaffold.
+        // The trust auto-config off pins the lock without any scaffold.
         let mut opts = options(false);
         opts.trust_lockfile_config = Some(false);
         let output = run_engine(&server, build_input(&files, &[], opts)).await;
@@ -1242,11 +1249,18 @@ async fn a_pnpm_workspace_member_lock_is_refused_not_scaffolded_in_memory() {
             .iter()
             .map(|f| f.path.as_str())
             .collect();
-        assert!(paths.contains(&"packages/a/pnpm-lock.yaml"), "{paths:?}");
-        assert!(
-            !paths.contains(&"packages/a/pnpm-workspace.yaml"),
-            "{paths:?}"
-        );
+        assert_eq!(paths, ["packages/a/pnpm-lock.yaml"]);
+
+        // The member named alone: its lock is the workspace root's.
+        let mut opts = options(false);
+        opts.project_roots = Some(vec!["packages/a".into()]);
+        let output = run_engine(&server, build_input(&files, &[], opts)).await;
+        let ignored = output
+            .warnings
+            .iter()
+            .any(|w| w.code == "pnpm_member_lock_ignored");
+        assert_eq!(ignored, listed, "{:?}", output.warnings);
+        assert_eq!(output.changed_files.is_empty(), listed);
     }
 }
 

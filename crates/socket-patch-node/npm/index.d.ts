@@ -2,7 +2,7 @@ export type Ecosystem = 'npm' | 'pypi' | 'cargo' | 'golang' | 'gem' | 'composer'
 
 export interface TreeEntryInput { path: string; mode: string; type: 'blob' | 'tree' | 'commit'; size?: number }
 export interface PathSelection {
-  roots: string[]              // detected project roots, repo-relative ('' = repo root), sorted
+  roots: string[]              // detected project roots, repo-relative ('' = repo root), sorted; includes a pnpm workspace root above member locks (the session decides which candidates are members)
   fetchText: string[]          // stream these as UTF-8 text files
   fetchBinary: string[]        // stream these as raw bytes (e.g. bun.lockb)
   presentOnly: string[]        // engine only needs to know they exist (e.g. .pnp.cjs, rush repo-state.json)
