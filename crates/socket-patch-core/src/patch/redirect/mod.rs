@@ -15854,7 +15854,7 @@ mod tests {
                 "http://p.test/lp.tgz",
             ),
         );
-        let r = rewrite_registry_redirect(&files, &[ovr.clone()]);
+        let r = rewrite_registry_redirect(&files, std::slice::from_ref(&ovr));
         assert!(r.edits.is_empty(), "{:?}", r.edits);
         assert_eq!(
             warning_codes(&r),

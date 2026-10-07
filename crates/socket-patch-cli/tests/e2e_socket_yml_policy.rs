@@ -892,29 +892,55 @@ async fn agent_mode_judges_nested_project_copies_by_their_own_root() {
     let (code, doc) = scan_json(&repo.root, &server.uri(), &["--mode", "agent"], &[]);
     assert_eq!(code, 0, "{doc:#}");
     let index = |rel: &str, name: &str| index_at(&repo, rel, name);
-    assert_eq!(index("services/web", "alpha"), patched_index("alpha"), "{doc:#}");
-    assert_eq!(index("services/legacy", "gamma"), orig_index("gamma"), "ignored by patches.ignorePaths");
-    assert_eq!(index("services/test", "delta"), orig_index("delta"), "a discovered test/ root is a built-in ignore");
+    assert_eq!(
+        index("services/web", "alpha"),
+        patched_index("alpha"),
+        "{doc:#}"
+    );
+    assert_eq!(
+        index("services/legacy", "gamma"),
+        orig_index("gamma"),
+        "ignored by patches.ignorePaths"
+    );
+    assert_eq!(
+        index("services/test", "delta"),
+        orig_index("delta"),
+        "a discovered test/ root is a built-in ignore"
+    );
     let mut roots: Vec<(String, String)> = doc["policy"]["filtered"]
         .as_array()
         .unwrap()
         .iter()
         .filter(|f| f["purl"].is_null())
-        .map(|f| (f["project"].as_str().unwrap().to_string(), f["reason"].as_str().unwrap().to_string()))
+        .map(|f| {
+            (
+                f["project"].as_str().unwrap().to_string(),
+                f["reason"].as_str().unwrap().to_string(),
+            )
+        })
         .collect();
     roots.sort();
     assert_eq!(
         roots,
         [
-            ("services/legacy".to_string(), "policy_path_excluded".to_string()),
-            ("services/test".to_string(), "policy_path_excluded".to_string()),
+            (
+                "services/legacy".to_string(),
+                "policy_path_excluded".to_string()
+            ),
+            (
+                "services/test".to_string(),
+                "policy_path_excluded".to_string()
+            ),
         ],
         "{:#}",
         doc["policy"]
     );
     // A package an admitted project also installs is patched per package
     // version, so its copy in the ignored project is patched too: say so.
-    assert!(warning_codes(&doc).contains(&"policy_shared_copy".to_string()), "{doc:#}");
+    assert!(
+        warning_codes(&doc).contains(&"policy_shared_copy".to_string()),
+        "{doc:#}"
+    );
     let shared = doc["warnings"]
         .as_array()
         .unwrap()
@@ -922,15 +948,26 @@ async fn agent_mode_judges_nested_project_copies_by_their_own_root() {
         .find(|w| w["code"] == "policy_shared_copy")
         .unwrap();
     let detail = shared["detail"].as_str().unwrap();
-    assert!(detail.contains("pkg:npm/left-pad@1.0.0") && detail.contains("services/legacy"), "{detail}");
+    assert!(
+        detail.contains("pkg:npm/left-pad@1.0.0") && detail.contains("services/legacy"),
+        "{detail}"
+    );
 
     // includePaths: the docs' headline example selects nested projects from
     // the repo root (which itself is not included).
     let repo = Repo::new(Some("version: 2\npatches:\n  includePaths: [\"/services/legacy/\"]\n"));
     let (code, doc) = scan_json(&repo.root, &server.uri(), &["--mode", "agent"], &[]);
     assert_eq!(code, 0, "{doc:#}");
-    assert_eq!(index_at(&repo, "services/legacy", "gamma"), patched_index("gamma"), "{doc:#}");
-    assert_eq!(index_at(&repo, "services/web", "alpha"), orig_index("alpha"), "{doc:#}");
+    assert_eq!(
+        index_at(&repo, "services/legacy", "gamma"),
+        patched_index("gamma"),
+        "{doc:#}"
+    );
+    assert_eq!(
+        index_at(&repo, "services/web", "alpha"),
+        orig_index("alpha"),
+        "{doc:#}"
+    );
     let web_root = doc["policy"]["filtered"]
         .as_array()
         .unwrap()
@@ -945,7 +982,13 @@ async fn agent_mode_judges_nested_project_copies_by_their_own_root() {
 }
 
 fn index_at(repo: &Repo, rel: &str, name: &str) -> String {
-    std::fs::read_to_string(repo.dir(rel).join("node_modules").join(name).join("index.js")).unwrap()
+    std::fs::read_to_string(
+        repo.dir(rel)
+            .join("node_modules")
+            .join(name)
+            .join("index.js"),
+    )
+    .unwrap()
 }
 
 // ---------------------------------------------------------------------------

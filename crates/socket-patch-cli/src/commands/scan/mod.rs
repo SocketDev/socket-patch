@@ -1988,7 +1988,9 @@ async fn run_scan(
             .get_node_modules_paths(&crawler_options)
             .await
             .unwrap_or_default();
-        policy.locate_nested_copies(&nm_roots, &filtered_crawled).await;
+        policy
+            .locate_nested_copies(&nm_roots, &filtered_crawled)
+            .await;
     }
     let filtered_crawled = policy.admit_crawled_copies(filtered_crawled, &supplement_purls);
 

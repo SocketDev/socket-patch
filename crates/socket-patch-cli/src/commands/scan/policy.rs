@@ -316,7 +316,11 @@ impl ScanPolicy {
     /// are not, find the other copies of each npm package whose crawled
     /// copy sits on the other side, so [`Self::admit_crawled_copies`] sees
     /// every root that installs it.
-    pub(crate) async fn locate_nested_copies(&mut self, nm_roots: &[PathBuf], pkgs: &[CrawledPackage]) {
+    pub(crate) async fn locate_nested_copies(
+        &mut self,
+        nm_roots: &[PathBuf],
+        pkgs: &[CrawledPackage],
+    ) {
         if self.nested.is_none() {
             return;
         }
@@ -349,7 +353,9 @@ impl ScanPolicy {
                 continue;
             };
             for (purl, copies) in found {
-                more.entry(purl).or_default().extend(copies.into_iter().map(|c| c.path));
+                more.entry(purl)
+                    .or_default()
+                    .extend(copies.into_iter().map(|c| c.path));
             }
         }
         if let Some(nested) = self.nested.as_mut() {
@@ -369,7 +375,10 @@ impl ScanPolicy {
         supplements: &HashSet<String>,
     ) -> Vec<CrawledPackage> {
         if self.nested.is_none() {
-            return pkgs.into_iter().filter(|p| self.admit_crawled(&p.purl)).collect();
+            return pkgs
+                .into_iter()
+                .filter(|p| self.admit_crawled(&p.purl))
+                .collect();
         }
         // Each purl's first admitting root, else its first root.
         let mut owners: BTreeMap<String, Owner> = BTreeMap::new();
@@ -386,16 +395,23 @@ impl ScanPolicy {
             } else if let Some(more) = more_copies.get(&pkg.purl) {
                 paths.extend(more.iter().map(PathBuf::as_path));
             }
-            let mut copy_owners: Vec<Owner> =
-                paths.into_iter().map(|path| self.copy_owner(path)).collect();
+            let mut copy_owners: Vec<Owner> = paths
+                .into_iter()
+                .map(|path| self.copy_owner(path))
+                .collect();
             if copy_owners.is_empty() {
                 copy_owners.push((self.project.clone(), self.root_verdict.clone()));
             }
             for (project, verdict) in copy_owners {
                 if verdict.is_err() {
-                    skipped.entry(pkg.purl.clone()).or_default().insert(project.clone());
+                    skipped
+                        .entry(pkg.purl.clone())
+                        .or_default()
+                        .insert(project.clone());
                 }
-                let slot = owners.entry(pkg.purl.clone()).or_insert_with(|| (project.clone(), verdict.clone()));
+                let slot = owners
+                    .entry(pkg.purl.clone())
+                    .or_insert_with(|| (project.clone(), verdict.clone()));
                 if slot.1.is_err() && verdict.is_ok() {
                     *slot = (project, verdict);
                 }
@@ -414,7 +430,9 @@ impl ScanPolicy {
             }
             admitted.insert(purl);
         }
-        pkgs.into_iter().filter(|p| admitted.contains(&p.purl)).collect()
+        pkgs.into_iter()
+            .filter(|p| admitted.contains(&p.purl))
+            .collect()
     }
 
     /// Whether selection can filter anything (a floor, or patching
@@ -736,7 +754,13 @@ pub(crate) const POLICY_SHARED_COPY: &str = "policy_shared_copy";
 fn shared_copy_detail(purl: &str, projects: &BTreeSet<String>) -> String {
     let projects: Vec<String> = projects
         .iter()
-        .map(|p| if p.is_empty() { "the repo root".to_string() } else { sanitize(p) })
+        .map(|p| {
+            if p.is_empty() {
+                "the repo root".to_string()
+            } else {
+                sanitize(p)
+            }
+        })
         .collect();
     format!(
         "{} is patched for an included project, so its installed copy under skipped project{} {} \
@@ -888,14 +912,20 @@ mod tests {
         project(&repo.join("tests/e2e"), true);
         // A lockless workspace member belongs to the repo root.
         project(&repo.join("packages/member"), false);
-        let invocation = invocation(&repo, "version: 2\npatches:\n  ignorePaths: [\"/services/\"]\n");
+        let invocation = invocation(
+            &repo,
+            "version: 2\npatches:\n  ignorePaths: [\"/services/\"]\n",
+        );
         let mut policy = ScanPolicy::for_root(&invocation, &repo, true, false);
         policy.judge_nested_roots(&invocation, &repo);
         let crawl = vec![
             copy(&repo, "shared"),
             copy(&repo.join("services/legacy"), "shared"),
             copy(&repo.join("services/legacy"), "legacy-only"),
-            copy(&repo.join("services/legacy/node_modules/legacy-only"), "deep"),
+            copy(
+                &repo.join("services/legacy/node_modules/legacy-only"),
+                "deep",
+            ),
             copy(&repo.join("tests/e2e"), "fixture-only"),
             copy(&repo.join("packages/member"), "member-dep"),
         ];
@@ -906,18 +936,30 @@ mod tests {
             .collect();
         assert_eq!(
             kept,
-            ["pkg:npm/shared@1.0.0", "pkg:npm/shared@1.0.0", "pkg:npm/member-dep@1.0.0"]
+            [
+                "pkg:npm/shared@1.0.0",
+                "pkg:npm/shared@1.0.0",
+                "pkg:npm/member-dep@1.0.0"
+            ]
         );
         let doc = policy.json();
         let roots: Vec<(&str, &str)> = doc["filtered"]
             .as_array()
             .unwrap()
             .iter()
-            .map(|f| (f["project"].as_str().unwrap(), f["reason"].as_str().unwrap()))
+            .map(|f| {
+                (
+                    f["project"].as_str().unwrap(),
+                    f["reason"].as_str().unwrap(),
+                )
+            })
             .collect();
         assert_eq!(
             roots,
-            [("services/legacy", "policy_path_excluded"), ("tests/e2e", "policy_path_excluded")]
+            [
+                ("services/legacy", "policy_path_excluded"),
+                ("tests/e2e", "policy_path_excluded")
+            ]
         );
         // The shared package is noted only once a patch is selected for it.
         assert!(policy.shared_copy_warnings().is_empty());
@@ -935,7 +977,11 @@ mod tests {
         let warnings = policy.shared_copy_warnings();
         assert_eq!(warnings.len(), 1);
         assert_eq!(warnings[0].code, POLICY_SHARED_COPY);
-        assert!(warnings[0].detail.contains("services/legacy"), "{}", warnings[0].detail);
+        assert!(
+            warnings[0].detail.contains("services/legacy"),
+            "{}",
+            warnings[0].detail
+        );
     }
 
     /// The crawl keeps one copy per purl: when that copy sits under a
@@ -946,7 +992,10 @@ mod tests {
         let repo = std::fs::canonicalize(tmp.path()).unwrap();
         project(&repo, true);
         project(&repo.join("services/legacy"), true);
-        let invocation = invocation(&repo, "version: 2\npatches:\n  ignorePaths: [\"/services/\"]\n");
+        let invocation = invocation(
+            &repo,
+            "version: 2\npatches:\n  ignorePaths: [\"/services/\"]\n",
+        );
         let mut policy = ScanPolicy::for_root(&invocation, &repo, true, false);
         policy.judge_nested_roots(&invocation, &repo);
         copy(&repo, "shared");
@@ -954,7 +1003,10 @@ mod tests {
             copy(&repo.join("services/legacy"), "shared"),
             copy(&repo.join("services/legacy"), "legacy-only"),
         ];
-        let nm_roots = [repo.join("node_modules"), repo.join("services/legacy/node_modules")];
+        let nm_roots = [
+            repo.join("node_modules"),
+            repo.join("services/legacy/node_modules"),
+        ];
         policy.locate_nested_copies(&nm_roots, &crawl).await;
         let kept: Vec<String> = policy
             .admit_crawled_copies(crawl, &HashSet::new())
@@ -976,9 +1028,15 @@ mod tests {
         let repo = std::fs::canonicalize(tmp.path()).unwrap();
         project(&repo, true);
         project(&repo.join("services/legacy"), true);
-        let invocation = invocation(&repo, "version: 2\npatches:\n  ignorePaths: [\"/services/\"]\n");
+        let invocation = invocation(
+            &repo,
+            "version: 2\npatches:\n  ignorePaths: [\"/services/\"]\n",
+        );
         let mut policy = ScanPolicy::for_root(&invocation, &repo, true, false);
-        let kept = policy.admit_crawled_copies(vec![copy(&repo.join("services/legacy"), "a")], &HashSet::new());
+        let kept = policy.admit_crawled_copies(
+            vec![copy(&repo.join("services/legacy"), "a")],
+            &HashSet::new(),
+        );
         assert_eq!(kept.len(), 1);
         assert_eq!(policy.json()["counts"]["filtered"], 0);
     }
