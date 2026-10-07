@@ -1,10 +1,10 @@
 ### Refactor routine (`refactor`, hourly, highest leverage first)
-_Last updated 2026-10-07T17:49Z · main @ 431b818 (October 7 reconciliation)_
+_Last updated 2026-10-07T18:56Z · main @ 05ecc6e_
 
 **In flight:**
 - No routine-opened PR is open. 24 `arch-refactor` PRs are open, so `MAX_OPEN` is full; the routine re-ranks only.
 - Maintainer drafts (decided issues): [#1021](https://github.com/SocketDev/socket-patch/pull/1021) (#615), [#1027](https://github.com/SocketDev/socket-patch/pull/1027) (#704), [#1030](https://github.com/SocketDev/socket-patch/pull/1030) (#808), [#1031](https://github.com/SocketDev/socket-patch/pull/1031) (#966), [#1036](https://github.com/SocketDev/socket-patch/pull/1036) (#973), [#1041](https://github.com/SocketDev/socket-patch/pull/1041) (#648), [#1049](https://github.com/SocketDev/socket-patch/pull/1049) (#792), [#1051](https://github.com/SocketDev/socket-patch/pull/1051) (#580).
-- October 7 campaign (duplicate business logic, one PR per seam; register rows in brackets): #1026 credentials [C59], #1029 trust signals [C61], #1032 JVM layout [E77, E69], #1033 VEX attestation [E72], #1034 target grammar [C62], #1035 supersede lifecycle [E71], #1038 paths and roots [C64], #1039 atomic takeover [E70], #1042 `.socket` containment [C60, C42], #1043 command cycles and UI text [C65, C12], #1044 governing locks [E75], #1045 `PurlKey` [C63], #1046 test hygiene [C66], #1050 vendored liveness [E74], #1057 yarn grammar [E08, E76], #1058 pinned check [E73]. CI merge queue: #1018 [C67].
+- October 7 campaign (duplicate business logic, one PR per seam; register rows in brackets): #1026 credentials [C59], #1029 trust signals [C61], #1032 JVM layout [E77, E69], #1033 VEX attestation [E72], #1034 target grammar [C62], #1035 supersede lifecycle [E71], #1038 paths and roots [C64], #1039 atomic takeover [E70], #1042 `.socket` containment [C60, C42], #1043 command cycles and UI text [C65, C12], #1044 governing locks [E75], #1045 `PurlKey` [C63], #1046 test hygiene [C66], #1050 vendored liveness [E74], #1057 yarn grammar [E08, E76], #1058 pinned check [E73].
 
 **Merged:**
 - [#1015](https://github.com/SocketDev/socket-patch/pull/1015): the vendored-reference scan reads every `VENDORED` row and accepts the bare uuid dir. Issues #832, #958 (E61). `8e521f9` (+308 / −41). Left: dead `eco == "maven2"` arm in `commands/vendor.rs`.
@@ -22,7 +22,7 @@ _Last updated 2026-10-07T17:49Z · main @ 431b818 (October 7 reconciliation)_
 | 4 | #931 (C13 child 1): one manifest-read error mapper for every command | 1 | 1 | ≈2.5 | M | ≈5.5 | skipped: as #998 |
 | 5 | #893 (C50): one artifact GC retention policy | 1 | 0 | ≈2 | L | ≈4 | next eligible when a slot frees |
 
-Re-ranked 2026-10-07T17:49Z by the October 7 reconciliation: stale skip lists replaced (#657, #909, #940, #1015, #876, #889 merged). The campaign PRs above cover E08, E69–E77, C42 and C59–C67; don't start work on those rows.
+Re-ranked 2026-10-07T18:56Z (unchanged; #1018 merged, C67 is audit-core's to record). Earlier, the October 7 reconciliation: stale skip lists replaced (#657, #909, #940, #1015, #876, #889 merged). The campaign PRs above cover E08, E69–E77, C42 and C59–C67; don't start work on those rows.
 
 **Notes:**
 - The sandbox runs as root, so 4 core lib tests fail on main and on branches alike: `copy_tree::relax_loop_must_not_traverse_symlinked_root`, `vlt_heal::an_unremovable_hidden_lock_keeps_every_store_entry`, `pypi_poetry::wire_write_failure_maps_error_and_leaves_lock_untouched`, `pypi_requirements::wire_failure_rolls_back_already_written_files`.
