@@ -4848,7 +4848,7 @@ fn rewrite_bun_lock(
     result: &mut RewriteResult,
 ) {
     use crate::vendor::bun_lock_text::{
-        decode_json_string, is_bundled_entry, is_user_tarball_entry,
+        decode_json_string, is_bundled_entry, is_user_tarball_spec,
     };
 
     let npm: Vec<&DepOverride> = overrides.iter().filter(|o| o.ecosystem == "npm").collect();
@@ -4982,7 +4982,7 @@ fn rewrite_bun_lock(
                 // this very version is installed from that spec beside the
                 // pinned copy and stays unpatched (#497, npm's #326): say so,
                 // and keep the in-run VEX from assuming the uuid patched.
-                if spec != url_spec && is_user_tarball_entry(entry, &fname, &dep.version) {
+                if spec != url_spec && is_user_tarball_spec(&spec, &fname, &dep.version) {
                     user_tarball_skipped = true;
                     result.bundled_skipped_uuids.insert(dep.patch_uuid.clone());
                     result.warnings.push(RewriteWarning {

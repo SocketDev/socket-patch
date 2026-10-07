@@ -449,17 +449,27 @@ fn classify(
 /// can rewire: bun installs it from its own spec.
 #[derive(Default)]
 struct Unwired {
-    /// purl → the first such entry's label, and whether it is a user
-    /// tarball.
+    /// purl → the first such entry's label (a user tarball's in preference
+    /// to a registry copy's), and whether it is a user tarball.
     copies: std::collections::BTreeMap<String, (String, bool)>,
 }
 
 impl Unwired {
     fn record(&mut self, purl: Option<String>, label: &str, user_tarball: bool) {
         if let Some(purl) = purl {
-            self.copies
-                .entry(purl)
-                .or_insert_with(|| (label.to_string(), user_tarball));
+            // A user-tarball copy wins over a registry one: a re-run rewires
+            // the registry copy but never the tarball, so the diagnostic must
+            // name the copy whose remedy is "depend on the registry version".
+            match self.copies.entry(purl) {
+                std::collections::btree_map::Entry::Vacant(v) => {
+                    v.insert((label.to_string(), user_tarball));
+                }
+                std::collections::btree_map::Entry::Occupied(mut o) => {
+                    if user_tarball && !o.get().1 {
+                        o.insert((label.to_string(), true));
+                    }
+                }
+            }
         }
     }
 
@@ -881,6 +891,38 @@ mod tests {
                 assert_eq!(user_tarball_contests(&out), 0, "{label} {other}");
             }
         }
+    }
+
+    /// REGRESSION (#497 review): when the same version has both an unwired
+    /// registry copy and a user-tarball copy, and the registry copy comes
+    /// first, the diagnostic still names the tarball copy, since a re-run
+    /// cannot rewire it. The "re-run to rewire every copy" remedy would be
+    /// wrong here.
+    #[tokio::test]
+    async fn issue_497_user_tarball_copy_outranks_an_earlier_registry_copy() {
+        let hosted = hosted_url("npm", "left-pad", "1.3.0", UUID_A, "left-pad-1.3.0.tgz");
+        let p = Project::new();
+        p.write(
+            "bun.lock",
+            text_lock(
+                2,
+                &[
+                    format!("\"a/left-pad\": [\"left-pad@1.3.0\", \"\", {{}}, \"{SRI}\"]"),
+                    tuple("left-pad", "left-pad@./left-pad-1.3.0.tgz", Some(SRI)),
+                    tuple("z/left-pad", &format!("left-pad@{hosted}"), Some(SRI)),
+                ],
+            ),
+        );
+        let out = run(&p).await;
+        assert!(out.refs.is_empty(), "{:#?}", out.refs);
+        assert_eq!(user_tarball_contests(&out), 1, "{:#?}", out.diagnostics);
+        assert!(
+            !out.diagnostics
+                .iter()
+                .any(|d| d.detail.contains("rewire every copy")),
+            "{:#?}",
+            out.diagnostics
+        );
     }
 
     /// REGRESSION (#497), `bun.lockb`: Bun 1.1.45's tarball record of a

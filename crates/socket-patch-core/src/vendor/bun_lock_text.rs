@@ -254,11 +254,16 @@ pub(crate) fn is_user_tarball_entry(entry: &BunEntry, name: &str, version: &str)
         .elems
         .first()
         .and_then(|raw| decode_json_string(raw))
-        .is_some_and(|spec| {
-            split_name_spec(&spec).is_some_and(|(entry_name, target)| {
-                entry_name == name && user_tarball_version(name, target) == Some(version)
-            })
-        })
+        .is_some_and(|spec| is_user_tarball_spec(&spec, name, version))
+}
+
+/// [`is_user_tarball_entry`] on an already-decoded `name@<target>` spec,
+/// for hot loops that decoded it once already. The name is matched by a
+/// prefix strip, so an entry of another package costs one compare.
+pub(crate) fn is_user_tarball_spec(spec: &str, name: &str, version: &str) -> bool {
+    spec.strip_prefix(name)
+        .and_then(|rest| rest.strip_prefix('@'))
+        .is_some_and(|target| user_tarball_version(name, target) == Some(version))
 }
 
 /// `"lockfileVersion": <n>` head check — only the fixture-pinned text
@@ -782,6 +787,36 @@ mod tests {
         ] {
             assert_eq!(user_tarball_version(name, target), want, "{name} {target}");
         }
+    }
+
+    #[test]
+    fn is_user_tarball_spec_checks_the_name_first() {
+        assert!(is_user_tarball_spec(
+            "left-pad@./left-pad-1.3.0.tgz",
+            "left-pad",
+            "1.3.0"
+        ));
+        assert!(is_user_tarball_spec(
+            "@s/p@file:./p-1.0.0.tgz",
+            "@s/p",
+            "1.0.0"
+        ));
+        assert!(!is_user_tarball_spec(
+            "left-pad@./left-pad-1.2.0.tgz",
+            "left-pad",
+            "1.3.0"
+        ));
+        assert!(!is_user_tarball_spec("left-pad@1.3.0", "left-pad", "1.3.0"));
+        assert!(!is_user_tarball_spec(
+            "left-pad-x@./left-pad-1.3.0.tgz",
+            "left-pad",
+            "1.3.0"
+        ));
+        assert!(!is_user_tarball_spec(
+            "is-odd@./left-pad-1.3.0.tgz",
+            "left-pad",
+            "1.3.0"
+        ));
     }
 
     /// #367: the keys come from the manifest and from the lock's mirror,
