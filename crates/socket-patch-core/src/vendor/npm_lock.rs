@@ -458,13 +458,29 @@ fn lock_version_gate(lock: &Value, lock_name: &str) -> Result<Option<u64>, Box<V
     if !matches!(lock_version, Some(2) | Some(3))
         || !lock.get("packages").is_some_and(Value::is_object)
     {
-        return Err(Box::new(refused(
-            "vendor_lockfile_version_unsupported",
+        // npm >= 12.1 writes lockfileVersion 4 for its native `npm patch`
+        // (root `patchedDependencies` + a `patched` record on the entry),
+        // and re-running `npm install` keeps it at 4: the npm >= 7 upgrade
+        // advice would be wrong (#711).
+        let detail = if lock_version == Some(4) {
+            format!(
+                "{lock_name} has lockfileVersion 4, which npm >= 12.1 writes for its native \
+                 `npm patch` (`patchedDependencies` in package.json); vendored mode supports \
+                 only v2/v3 locks and would drop or break that patch. Fold the Socket fix into \
+                 your own patch, or remove the `patchedDependencies` entries and \
+                 regenerate the lock with `npm install`, or use hosted mode, which leaves the \
+                 patched package alone"
+            )
+        } else {
             format!(
                 "{lock_name} has lockfileVersion {:?}; only v2/v3 locks (with a `packages` \
                  object) are supported — run `npm install` with npm >= 7 to upgrade it",
                 lock_version
-            ),
+            )
+        };
+        return Err(Box::new(refused(
+            "vendor_lockfile_version_unsupported",
+            detail,
         )));
     }
     Ok(lock_version)
@@ -2481,6 +2497,40 @@ mod tests {
         expect_refused(
             fx.vendor(false).await,
             "vendor_lockfile_version_unsupported",
+        );
+    }
+
+    /// REGRESSION (#711): npm >= 12.1 writes lockfileVersion 4 for its
+    /// native `npm patch`, and `npm install` keeps it there. The refusal
+    /// names that cause instead of the "upgrade with npm >= 7" advice that
+    /// fits only a v1 lock.
+    #[tokio::test]
+    async fn lockfile_v4_refusal_names_npm_patch() {
+        let lock = json!({
+            "name": "fixture",
+            "version": "1.0.0",
+            "lockfileVersion": 4,
+            "packages": {
+                "": { "name": "fixture", "version": "1.0.0" },
+                "node_modules/left-pad": {
+                    "version": "1.3.0",
+                    "resolved": REG_RESOLVED,
+                    "integrity": "sha512-orig==",
+                    "patched": { "integrity": "sha512-user==", "path": "patches/left-pad@1.3.0.patch" }
+                }
+            }
+        });
+        let fx = fixture_with("left-pad", "1.3.0", lock).await;
+        let detail = expect_refused(
+            fx.vendor(false).await,
+            "vendor_lockfile_version_unsupported",
+        );
+        assert!(
+            detail.contains("lockfileVersion 4")
+                && detail.contains("npm patch")
+                && detail.contains("patchedDependencies")
+                && !detail.contains("npm >= 7"),
+            "{detail}"
         );
     }
 

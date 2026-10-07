@@ -266,6 +266,16 @@ pub struct RewriteResult {
         serde(skip_serializing_if = "std::collections::BTreeSet::is_empty")
     )]
     pub refused_bun_uuids: std::collections::BTreeSet<String>,
+    /// Patch uuids the npm lock rewriter left on their registry entry
+    /// because the project patches that package itself with npm 12's
+    /// native `npm patch` (#711). Never confirmed: npm applies the user's
+    /// diff on top of whatever tarball the lock names, so a hosted pin
+    /// either fails `EPATCHFAILED` or installs bytes VEX can't attest.
+    #[cfg_attr(
+        test,
+        serde(skip_serializing_if = "std::collections::BTreeSet::is_empty")
+    )]
+    pub refused_npm_uuids: std::collections::BTreeSet<String>,
     /// Patch uuids whose package version a yarn berry `yarn.lock` locks, so
     /// the berry rewriter alone decides them: the hosted pin is the
     /// URL-keyed lock entry AND the root `package.json` `resolutions`
@@ -765,6 +775,7 @@ fn merge_group_delta(result: &mut RewriteResult, delta: RewriteResult) {
         refused_pdm_uuids,
         refused_pnpm_uuids,
         refused_bun_uuids,
+        refused_npm_uuids,
         yarn_berry_uuids,
         confirmed_yarn_berry_uuids,
         refused_yarn_classic_uuids,
@@ -800,6 +811,7 @@ fn merge_group_delta(result: &mut RewriteResult, delta: RewriteResult) {
     result.refused_pdm_uuids.extend(refused_pdm_uuids);
     result.refused_pnpm_uuids.extend(refused_pnpm_uuids);
     result.refused_bun_uuids.extend(refused_bun_uuids);
+    result.refused_npm_uuids.extend(refused_npm_uuids);
     result.yarn_berry_uuids.extend(yarn_berry_uuids);
     result
         .confirmed_yarn_berry_uuids
@@ -1087,6 +1099,57 @@ fn rewrite_npm_lock(
         .get("package.json")
         .map(|text| NpmOverrides::from_manifest_text(text))
         .unwrap_or_default();
+    // A package the project patches itself with npm 12's native `npm patch`
+    // is left on its registry entries in EVERY present lock (#711): the root
+    // `patchedDependencies` key, or the `"patched": {integrity, path}`
+    // record npm writes on the lock entry (lockfileVersion 4). npm applies
+    // that diff to every install of the entry, so rewriting a sibling lock
+    // would still stack the user's diff on the hosted bytes. Only a lock
+    // that spells `"patched"` at all is parsed here, so the common case
+    // costs one substring scan.
+    let user_patched = crate::vendor::bun_lock_text::patched_dependency_keys(
+        files.get("package.json").map(String::as_str),
+        None,
+    );
+    let lock_patched: Vec<(String, String, &str, String)> = present
+        .iter()
+        .filter(|lockfile| files[**lockfile].contains("\"patched\""))
+        .filter_map(|lockfile| Some((*lockfile, parse_json_text(&files[*lockfile]).ok()?)))
+        .flat_map(|(lockfile, lock)| {
+            lock.get("packages")
+                .and_then(Value::as_object)
+                .into_iter()
+                .flatten()
+                .filter(|(_, entry)| entry.get("patched").is_some_and(|p| !p.is_null()))
+                .filter_map(|(key, entry)| {
+                    let (name, version) = npm_lock_entry_identity(key, entry)?;
+                    Some((name, version?, lockfile, key.clone()))
+                })
+                .collect::<Vec<_>>()
+        })
+        .collect();
+    let npm: Vec<&DepOverride> = npm
+        .into_iter()
+        .filter(|dep| {
+            let fname = full_name(dep);
+            let source = if let Some(key) = crate::vendor::bun_lock_text::patched_dependency_key(
+                &user_patched,
+                &fname,
+                &dep.version,
+            ) {
+                format!("package.json `patchedDependencies` has `{key}`")
+            } else if let Some((_, _, lockfile, key)) = lock_patched
+                .iter()
+                .find(|(name, version, _, _)| *name == fname && *version == dep.version)
+            {
+                format!("{lockfile} entry `{key}` carries npm's `patched` record")
+            } else {
+                return true;
+            };
+            skip_npm_user_patched(&source, &fname, dep, result);
+            false
+        })
+        .collect();
     for lockfile in present {
         rewrite_one_npm_lock(
             &files[lockfile],
@@ -1096,6 +1159,52 @@ fn rewrite_npm_lock(
             result,
         );
     }
+}
+
+/// Leave `dep` on its registry entry because the project patches it with
+/// npm 12's native `npm patch` (#711). npm extracts whatever tarball the
+/// lock names and then applies the user's diff, failing the whole install
+/// `EPATCHFAILED` when the diff no longer applies: a hosted pin of the
+/// same lines breaks every later `npm ci` / `npm install`, and one that
+/// does apply installs bytes that are neither the original nor the Socket
+/// patch, which VEX can never attest. Warns, keeps the in-run VEX from
+/// assuming the uuid patched, and keeps any other lock from confirming it.
+fn skip_npm_user_patched(source: &str, name: &str, dep: &DepOverride, result: &mut RewriteResult) {
+    result.bundled_skipped_uuids.insert(dep.patch_uuid.clone());
+    result.refused_npm_uuids.insert(dep.patch_uuid.clone());
+    result.warnings.push(RewriteWarning {
+        code: "redirect_npm_patched_dependency_skipped".into(),
+        detail: format!(
+            "{source}, a patch the project applies with npm's native `npm patch`; npm applies \
+             it on top of whatever tarball the lock names, so pinning {name}@{} to the hosted \
+             patch would fail every install `EPATCHFAILED` (or install bytes that match \
+             neither the original nor the Socket patch). It is left unchanged and stays \
+             without the Socket patch: fold the Socket fix into your own patch, or remove the \
+             `patchedDependencies` entry and re-run",
+            dep.version
+        ),
+    });
+}
+
+/// The (package, version) an npm lock `packages` entry stands for, `None`
+/// for a key that is not an installable dependency.
+fn npm_lock_entry_identity(key: &str, entry: &Value) -> Option<(String, Option<String>)> {
+    // Only `node_modules/` keys are installable dependencies: "" is the
+    // project root and other bare keys are workspace members — SOURCE dirs
+    // a resolved/integrity insert would corrupt.
+    let (_, key_name) = key.rsplit_once("node_modules/")?;
+    // The package a lock entry stands for: the explicit `name` field when
+    // present (npm writes it for aliases — `npm i alias@npm:real` keys the
+    // entry by the ALIAS), else the key's trailing path. Mirrors
+    // `vendor::npm_lock`'s `entry_name`, so an alias install of the patched
+    // package redirects and an entry that merely SHARES the key name
+    // (`npm i <fname>@npm:other`) is never hijacked.
+    let entry_nm = entry
+        .get("name")
+        .and_then(Value::as_str)
+        .unwrap_or(key_name);
+    let version = entry.get("version").and_then(Value::as_str);
+    Some((entry_nm.to_string(), version.map(str::to_string)))
 }
 
 /// Rewrite a single npm lockfile (`package-lock.json` or `npm-shrinkwrap.json`)
@@ -1129,26 +1238,7 @@ fn rewrite_one_npm_lock(
         .map(|packages| {
             packages
                 .iter()
-                .map(|(key, entry)| {
-                    // Only `node_modules/` keys are installable dependencies:
-                    // "" is the project root and other bare keys are workspace
-                    // members — SOURCE dirs a resolved/integrity insert would
-                    // corrupt.
-                    let (_, key_name) = key.rsplit_once("node_modules/")?;
-                    // The package a lock entry stands for: the explicit `name`
-                    // field when present (npm writes it for aliases — `npm i
-                    // alias@npm:real` keys the entry by the ALIAS), else the
-                    // key's trailing path. Mirrors `vendor::npm_lock`'s
-                    // `entry_name`, so an alias install of the patched package
-                    // redirects and an entry that merely SHARES the key name
-                    // (`npm i <fname>@npm:other`) is never hijacked.
-                    let entry_nm = entry
-                        .get("name")
-                        .and_then(Value::as_str)
-                        .unwrap_or(key_name);
-                    let version = entry.get("version").and_then(Value::as_str);
-                    Some((entry_nm.to_string(), version.map(str::to_string)))
-                })
+                .map(|(key, entry)| npm_lock_entry_identity(key, entry))
                 .collect()
         })
         .unwrap_or_default();
@@ -15540,6 +15630,128 @@ mod tests {
             "a clean shrinkwrap-only success must emit NO warnings: {:?}",
             r.warnings
         );
+    }
+
+    /// REGRESSION (#711): npm 12.1+ `npm patch` records the project's own
+    /// diff in the root `patchedDependencies` and on the lock entry
+    /// (`"patched"`, lockfileVersion 4), then applies it on top of whatever
+    /// tarball the lock names. Pinning that entry to the hosted patch made
+    /// every later `npm ci` fail `EPATCHFAILED` while the scan reported a
+    /// clean switch. The entry keeps its registry tuple in EVERY present
+    /// lock, the run says why, and the in-run VEX never assumes it patched;
+    /// another granted package in the same lock is still rewired.
+    #[test]
+    fn npm_lock_user_patched_dependency_is_left_alone_loudly() {
+        let ovr = npm_override(
+            "left-pad",
+            "1.3.0",
+            "http://p.test/lp.tgz",
+            "sha512-PATCHED==",
+        );
+        let mut other = npm_override(
+            "is-number",
+            "7.0.0",
+            "http://p.test/isn.tgz",
+            "sha512-PATCHED==",
+        );
+        other.patch_uuid = "22222222-2222-4222-8222-222222222222".into();
+        let lock = |patched: bool| {
+            let record = if patched {
+                ",\n      \"patched\": {\n        \"integrity\": \"sha512-USER==\",\n        \
+                 \"path\": \"patches/left-pad@1.3.0.patch\"\n      }"
+            } else {
+                ""
+            };
+            format!(
+                "{{\n  \"name\": \"app\",\n  \"lockfileVersion\": {},\n  \"packages\": {{\n    \
+                 \"\": {{\n      \"name\": \"app\"\n    }},\n    \"node_modules/is-number\": {{\n      \
+                 \"version\": \"7.0.0\",\n      \
+                 \"resolved\": \"https://registry.npmjs.org/is-number/-/is-number-7.0.0.tgz\",\n      \
+                 \"integrity\": \"sha512-UPSTREAM==\"\n    }},\n    \"node_modules/left-pad\": {{\n      \
+                 \"version\": \"1.3.0\",\n      \
+                 \"resolved\": \"https://registry.npmjs.org/left-pad/-/left-pad-1.3.0.tgz\",\n      \
+                 \"integrity\": \"sha512-UPSTREAM==\"{record}\n    }}\n  }}\n}}\n",
+                if patched { 4 } else { 3 }
+            )
+        };
+        let manifest = r#"{"name":"app","dependencies":{"left-pad":"1.3.0","is-number":"7.0.0"},"patchedDependencies":{"left-pad@1.3.0":"patches/left-pad@1.3.0.patch"}}"#;
+
+        // Each signal alone gates the dep: the manifest key (over a lock
+        // that does not record it), or the lock's `patched` record (with no
+        // manifest read), and both together. A shrinkwrap beside a
+        // `patched` package-lock is left alone for that dep too.
+        for (with_manifest, with_record, shrinkwrap) in [
+            (true, false, false),
+            (false, true, false),
+            (true, true, false),
+            (false, true, true),
+        ] {
+            let case = format!("manifest={with_manifest} record={with_record} sw={shrinkwrap}");
+            let mut files = BTreeMap::new();
+            files.insert("package-lock.json".to_string(), lock(with_record));
+            if shrinkwrap {
+                files.insert("npm-shrinkwrap.json".to_string(), lock(false));
+            }
+            if with_manifest {
+                files.insert("package.json".to_string(), manifest.to_string());
+            }
+            let r = rewrite_registry_redirect(&files, &[ovr.clone(), other.clone()]);
+            assert_eq!(r.edits.len(), if shrinkwrap { 2 } else { 1 }, "{case}");
+            assert!(
+                r.edits
+                    .iter()
+                    .all(|e| e.key.as_deref() == Some("node_modules/is-number")),
+                "{case}: {:?}",
+                r.edits
+            );
+            for out in r.files.values() {
+                assert!(
+                    out.contains("https://registry.npmjs.org/left-pad/-/left-pad-1.3.0.tgz")
+                        && !out.contains("http://p.test/lp.tgz"),
+                    "{case}: the user-patched entry keeps its registry tuple: {out}"
+                );
+            }
+            assert_eq!(
+                warning_codes(&r),
+                vec!["redirect_npm_patched_dependency_skipped"],
+                "{case}: {:?}",
+                r.warnings
+            );
+            let detail = &r.warnings[0].detail;
+            assert!(
+                detail.contains("left-pad@1.3.0")
+                    && detail.contains("npm patch")
+                    && detail.contains("EPATCHFAILED"),
+                "{case}: {detail}"
+            );
+            if !with_manifest {
+                assert!(
+                    detail.contains("package-lock.json entry `node_modules/left-pad`"),
+                    "{case}: {detail}"
+                );
+            }
+            assert!(r.bundled_skipped_uuids.contains(&ovr.patch_uuid), "{case}");
+            assert!(r.refused_npm_uuids.contains(&ovr.patch_uuid), "{case}");
+            assert!(!r.refused_npm_uuids.contains(&other.patch_uuid), "{case}");
+        }
+
+        // A patch for ANOTHER version, or a null `patched`, gates nothing.
+        let mut files = BTreeMap::new();
+        files.insert(
+            "package-lock.json".to_string(),
+            lock(false).replace(
+                "\"integrity\": \"sha512-UPSTREAM==\"\n    }\n  }",
+                "\"integrity\": \"sha512-UPSTREAM==\",\n      \"patched\": null\n    }\n  }",
+            ),
+        );
+        files.insert(
+            "package.json".to_string(),
+            manifest.replace("left-pad@1.3.0\":", "left-pad@1.2.0\":"),
+        );
+        let r = rewrite_registry_redirect(&files, &[ovr.clone(), other.clone()]);
+        assert_eq!(r.edits.len(), 2, "{:?} {:?}", r.edits, r.warnings);
+        assert!(r.warnings.is_empty(), "{:?}", r.warnings);
+        assert!(r.refused_npm_uuids.is_empty());
     }
 
     /// #324: the hosted npm rewrite changes only the rewired values and keeps

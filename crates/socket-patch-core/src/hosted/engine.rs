@@ -1730,7 +1730,9 @@ fn confirm(
             let uuid = c.dep.patch_uuid.as_str();
             // vlt decides before the binary-bun rule, so `bun.lockb` beside
             // a vlt-driven `vlt-lock.json` never confirms an npm purl.
-            if rewrite.refused_vlt_uuids.contains(uuid) || rewrite.refused_bun_uuids.contains(uuid)
+            if rewrite.refused_vlt_uuids.contains(uuid)
+                || rewrite.refused_bun_uuids.contains(uuid)
+                || rewrite.refused_npm_uuids.contains(uuid)
             {
                 return ProbeStep::Decided(false);
             }

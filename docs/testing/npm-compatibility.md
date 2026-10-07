@@ -21,6 +21,15 @@ Measured against the real releases (Node 24.21 on macOS, 2026-09-22):
 
 npm 12 notes:
 
+- `npm patch add` / `npm patch commit` (npm >= 12.1) record the project's own
+  diff in the root `package.json` `patchedDependencies`, store it under
+  `patches/`, add a `patched: {integrity, path}` record to the lock entry and
+  write lockfileVersion 4. Every install extracts the locked tarball and then
+  applies that diff, failing `EPATCHFAILED` when it no longer applies. Hosted
+  mode therefore leaves such a package on its registry entry, in every npm
+  lock, and warns `redirect_npm_patched_dependency_skipped`; other packages in
+  the lock are still pinned. Vendored mode refuses the v4 lock
+  (`vendor_lockfile_version_unsupported`, naming `npm patch`) (#711).
 - `allow-remote` defaults to `none`: any tarball whose `resolved` origin is not
   the configured registry is refused. `allow-remote=root` admits only direct
   dependencies. `allow-remote=all` is the setting a hosted redirect needs; it
