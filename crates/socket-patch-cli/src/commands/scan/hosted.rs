@@ -1745,8 +1745,8 @@ async fn vendored_takeover(
         None
     };
     // Yarn berry twin of the bun gate: the berry rewriter's project-level
-    // refusals (mixed line endings, cacheKey, `.yarnrc.yml`
-    // compressionLevel) must be known before the takeover reverts a
+    // refusals (mixed yarn.lock / package.json line endings, cacheKey,
+    // `.yarnrc.yml` compressionLevel) must be known before the takeover reverts a
     // vendored berry purl, or the revert strips the live vendored patch
     // and the rewriter then refuses the lock. Only entries the
     // vendor ledger wired through the yarn-berry backend are gated (the
@@ -1768,8 +1768,14 @@ async fn vendored_takeover(
                 )
                 .await
                 .ok();
+                let manifest = socket_patch_core::utils::fs::read_regular_to_string(
+                    &common.cwd.join("package.json"),
+                )
+                .await
+                .ok();
                 socket_patch_core::patch::redirect::preflight_yarn_berry_hosted(
                     &lock,
+                    manifest.as_deref(),
                     yarnrc.as_deref(),
                 )
                 .err()
