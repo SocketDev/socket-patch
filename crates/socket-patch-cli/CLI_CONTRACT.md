@@ -647,8 +647,11 @@ included). A hosted wiring that discovery cannot attribute (a lock mentioning a 
 uuid it rejected, or a pin with no lockfile) is refused with `hosted_wiring_contested` (exit 1,
 nothing touched) rather than ejecting a partial set; `rollback`, `remove` and `list` refuse the same
 way (`list` degrades to a warning when it can still list). A pin withheld from attestation only
-because an unpatched bundled, git, or `hasShrinkwrap`-nested copy of the same version installs beside it is not contested:
-it is restored like any other pin (#828). The grant token of an attributed pin's
+because an unpatched copy of the same version installs beside it is not contested: a bundled,
+git, or `hasShrinkwrap`-nested copy, or a same-lock copy the wiring cannot reach (a pnpm `file:`
+directory or tarball, a yarn classic registry or `file:` directory block of the same
+`name@version`, a yarn berry `file:` or URL copy under another dependency name). It is restored
+like any other pin (#828, #935, #938, #939). The grant token of an attributed pin's
 own URL is never contested wiring where the same file also names that pin's patch uuid (a uv
 pin's paired `pyproject.toml` `[tool.uv.sources]` entry, a vlt pin in a `vlt-lock.json` whose pins
 are withheld from the lock basis); any other unattributed uuid still is. `--vex` works as on the manifest-driven
