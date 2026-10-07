@@ -1426,6 +1426,43 @@ async fn hosted_scan_from_pnpm_member_with_own_lock_never_nests_trust_config() {
     );
 }
 
+/// #1006: a project below a `pnpm-workspace.yaml` whose `packages:` globs
+/// do not list it (an `examples/` app) is no workspace member. pnpm
+/// 11.28+/12 install it standalone, with its own lock, and read
+/// `trustLockfile` only from its own settings file, so hosted mode pins the
+/// lock and creates that file as for any single project; the unrelated
+/// root file is left byte-identical.
+#[tokio::test]
+#[serial]
+async fn hosted_scan_from_pnpm_project_outside_workspace_globs_pins_and_nests_trust() {
+    let server = MockServer::start().await;
+    mock_discovery(&server).await;
+    mock_reference(&server).await;
+    mock_view(&server).await;
+    let tmp = tempfile::tempdir().unwrap();
+    let root = member_root(&tmp);
+    std::fs::write(
+        root.join("package.json"),
+        r#"{ "name": "root", "private": true }"#,
+    )
+    .unwrap();
+    let root_ws = root.join("pnpm-workspace.yaml");
+    let ws_before = "packages:\n  - 'packages/*'\n";
+    std::fs::write(&root_ws, ws_before).unwrap();
+    let demo = root.join("examples/demo");
+    std::fs::create_dir_all(&demo).unwrap();
+    write_pnpm_project(&demo);
+
+    let (code, doc) = run_hosted_json(&demo, &server.uri());
+    assert_eq!(code, Some(0), "{doc}");
+    assert_eq!(doc["redirect"]["redirected"], 1, "{doc}");
+    let lock = std::fs::read_to_string(demo.join("pnpm-lock.yaml")).unwrap();
+    assert!(lock.contains(HOSTED_URL), "{lock}");
+    let nested = std::fs::read_to_string(demo.join("pnpm-workspace.yaml")).unwrap();
+    assert!(nested.contains("trustLockfile: true"), "{nested}");
+    assert_eq!(std::fs::read_to_string(&root_ws).unwrap(), ws_before);
+}
+
 /// #880: an explicit `trustLockfile: false` in the root file is the user's
 /// call, respected as in a single project: the member pins, nothing is
 /// nested, and the warning names the root file.
@@ -1596,4 +1633,132 @@ fn assert_refused_workspace_lock_elsewhere(
         !cwd.join(".socket").exists(),
         "{case}: nothing written in the member"
     );
+}
+
+/// Pin the project's pnpm: package.json `packageManager` and/or the
+/// installed `node_modules/.modules.yaml` record (pnpm 9's YAML spelling).
+fn pin_pnpm(root: &Path, package_json: Option<&str>, modules_yaml: Option<&str>) {
+    if let Some(version) = package_json {
+        std::fs::write(
+            root.join("package.json"),
+            format!(
+                r#"{{ "name": "consumer", "version": "0.0.0", "packageManager": "pnpm@{version}", "dependencies": {{ "{NAME}": "{VERSION}" }} }}"#
+            ),
+        )
+        .unwrap();
+    }
+    if let Some(version) = modules_yaml {
+        std::fs::write(
+            root.join("node_modules/.modules.yaml"),
+            format!("hoistPattern:\n  - '*'\nlayoutVersion: 5\npackageManager: pnpm@{version}\n"),
+        )
+        .unwrap();
+    }
+}
+
+/// #734: on pnpm 9.0–10.4 a created `packages: ['.']` file makes a
+/// single-package project a root-only workspace where `pnpm add <pkg>`
+/// fails with ERR_PNPM_ADDING_TO_ROOT, and those releases never read
+/// `trustLockfile`. A project pinned there (installed record or
+/// package.json) gets its lock pinned and no pnpm-workspace.yaml; the
+/// warning says why and how to add trust on pnpm >= 11. After the upgrade a
+/// re-run creates the file, and rollback removes it with the pin.
+#[tokio::test]
+#[serial]
+async fn hosted_pnpm_9_through_10_4_project_gets_no_root_only_workspace() {
+    let server = MockServer::start().await;
+    mock_discovery(&server).await;
+    mock_reference(&server).await;
+    mock_view(&server).await;
+
+    for (package_json, modules_yaml, named) in [
+        (
+            None,
+            Some("9.15.9"),
+            "pnpm@9.15.9 (node_modules/.modules.yaml)",
+        ),
+        (
+            Some("10.4.1"),
+            None,
+            "pnpm@10.4.1 (package.json packageManager)",
+        ),
+        (
+            Some("9.15.9"),
+            Some("9.15.9"),
+            "pnpm@9.15.9 (package.json packageManager)",
+        ),
+    ] {
+        let tmp = tempfile::tempdir().unwrap();
+        write_pnpm_project(tmp.path());
+        pin_pnpm(tmp.path(), package_json, modules_yaml);
+
+        let (code, doc) = run_hosted_json(tmp.path(), &server.uri());
+        assert_eq!(code, Some(0), "{doc}");
+        let lock = std::fs::read_to_string(tmp.path().join("pnpm-lock.yaml")).unwrap();
+        assert!(lock.contains(HOSTED_URL), "{lock}");
+        assert!(
+            !tmp.path().join("pnpm-workspace.yaml").exists(),
+            "no root-only workspace for {package_json:?} / {modules_yaml:?}"
+        );
+        let warnings = warning_texts(&doc);
+        assert!(
+            warnings.contains("ERR_PNPM_ADDING_TO_ROOT")
+                && warnings.contains(named)
+                && warnings.contains("re-run `socket-patch scan --mode hosted`"),
+            "{warnings}"
+        );
+    }
+
+    // The upgrade: package.json now pins pnpm 11, which needs the setting;
+    // the heal-on-rerun path creates the scaffold.
+    let tmp = tempfile::tempdir().unwrap();
+    write_pnpm_project(tmp.path());
+    pin_pnpm(tmp.path(), Some("9.15.9"), None);
+    let (code, doc) = run_hosted_json(tmp.path(), &server.uri());
+    assert_eq!(code, Some(0), "{doc}");
+    let ws_path = tmp.path().join("pnpm-workspace.yaml");
+    assert!(!ws_path.exists());
+    pin_pnpm(tmp.path(), Some("11.0.0"), None);
+    let (code, doc) = run_hosted_json(tmp.path(), &server.uri());
+    assert_eq!(code, Some(0), "{doc}");
+    assert_eq!(
+        std::fs::read_to_string(&ws_path).unwrap(),
+        "packages:\n  - '.'\ntrustLockfile: true\n"
+    );
+    let code = rollback_hosted(tmp.path(), &server).await;
+    assert_eq!(code, 0, "rollback must restore the pnpm pin");
+    assert!(!ws_path.exists(), "rollback removes the created scaffold");
+}
+
+/// The #734 gate keeps the scaffold whenever the project's pnpm may read
+/// it: no pin, pnpm >= 10.5, or pins that disagree (a stale install record
+/// beside a pnpm 11 pin). The detail names the `-w` caveat.
+#[tokio::test]
+#[serial]
+async fn hosted_unknown_or_later_pnpm_still_gets_the_trust_scaffold() {
+    let server = MockServer::start().await;
+    mock_discovery(&server).await;
+    mock_reference(&server).await;
+    mock_view(&server).await;
+
+    for (package_json, modules_yaml) in [
+        (None, None),
+        (None, Some("10.5.0")),
+        (Some("11.0.0"), None),
+        (Some("11.1.0"), Some("9.15.9")),
+    ] {
+        let tmp = tempfile::tempdir().unwrap();
+        write_pnpm_project(tmp.path());
+        pin_pnpm(tmp.path(), package_json, modules_yaml);
+
+        let (code, doc) = run_hosted_json(tmp.path(), &server.uri());
+        assert_eq!(code, Some(0), "{doc}");
+        assert_eq!(
+            std::fs::read_to_string(tmp.path().join("pnpm-workspace.yaml")).unwrap(),
+            "packages:\n  - '.'\ntrustLockfile: true\n",
+            "{package_json:?} / {modules_yaml:?}"
+        );
+        let warnings = warning_texts(&doc);
+        assert!(warnings.contains("`pnpm add -w <pkg>`"), "{warnings}");
+    }
 }

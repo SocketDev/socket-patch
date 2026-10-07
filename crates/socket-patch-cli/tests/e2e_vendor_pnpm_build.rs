@@ -79,8 +79,8 @@ mod hermetic;
 #[path = "vex_e2e_common/mod.rs"]
 mod vex_e2e_common;
 use vex_e2e_common::{
-    assert_absent, assert_attested, assert_not_attested, patch_view, run_vex, strip_ledgers,
-    strip_manifest, Marker, PatchApi, VexRun, VexVia,
+    assert_absent, assert_attested, assert_not_attested, installed_pnpm_pre_10_5, patch_view,
+    run_vex, strip_ledgers, strip_manifest, Marker, PatchApi, VexRun, VexVia,
 };
 
 const ORG: &str = "test-org";
@@ -660,17 +660,28 @@ async fn run_pnpm_capstone(pm: &str, driver: VendorDriver) {
     // refuses a workspace file whose `packages` field is missing/empty, and
     // `.` cannot glob a stray subtree into the workspace the way `packages/*`
     // could. That makes the committable set install on pnpm 9/10/11 alike.
+    // pnpm 9.0–10.4 (as the install recorded it) are the exception: they
+    // read package.json, and a root-only workspace breaks their `pnpm add`,
+    // so no file is created (#734).
     let ws_path = proj.join("pnpm-workspace.yaml");
-    let ws_after =
-        std::fs::read_to_string(&ws_path).expect("vendoring must create pnpm-workspace.yaml");
-    assert!(
-        ws_after.contains(&format!("{DEP}@{DEP_VERSION}: file:{tgz_rel}")),
-        "pnpm-workspace.yaml `overrides:` must point at the vendored tarball; got:\n{ws_after}"
-    );
-    assert!(
-        ws_after.contains("packages:") && ws_after.contains("- '.'"),
-        "created pnpm-workspace.yaml must carry a root-only packages list; got:\n{ws_after}"
-    );
+    let ws_created = !installed_pnpm_pre_10_5(&proj);
+    if ws_created {
+        let ws_after =
+            std::fs::read_to_string(&ws_path).expect("vendoring must create pnpm-workspace.yaml");
+        assert!(
+            ws_after.contains(&format!("{DEP}@{DEP_VERSION}: file:{tgz_rel}")),
+            "pnpm-workspace.yaml `overrides:` must point at the vendored tarball; got:\n{ws_after}"
+        );
+        assert!(
+            ws_after.contains("packages:") && ws_after.contains("- '.'"),
+            "created pnpm-workspace.yaml must carry a root-only packages list; got:\n{ws_after}"
+        );
+    } else {
+        assert!(
+            !ws_path.exists(),
+            "{pm}: no root-only pnpm-workspace.yaml on pnpm 9.0–10.4"
+        );
+    }
     eprintln!("VENDOR OK ({pm}, {driver:?})");
 
     // 4. FRESH-CHECKOUT PROOF: committable files only, EMPTY store,
@@ -679,7 +690,9 @@ async fn run_pnpm_capstone(pm: &str, driver: VendorDriver) {
     std::fs::create_dir_all(&fresh).unwrap();
     std::fs::copy(&pkg_path, fresh.join("package.json")).unwrap();
     std::fs::copy(&lock_path, fresh.join("pnpm-lock.yaml")).unwrap();
-    std::fs::copy(&ws_path, fresh.join("pnpm-workspace.yaml")).unwrap();
+    if ws_created {
+        std::fs::copy(&ws_path, fresh.join("pnpm-workspace.yaml")).unwrap();
+    }
     copy_dir_recursive(&proj.join(".socket"), &fresh.join(".socket"));
 
     let fresh_store = tmp.path().join("fresh-pnpm-store");
@@ -738,7 +751,8 @@ async fn run_pnpm_capstone(pm: &str, driver: VendorDriver) {
 
     // Manifest-less VEX over the real fresh install (kept ledger, deleted
     // ledgers, offline, embedded vendor/apply --vex, reverted lock).
-    // The fixture had no pnpm-workspace.yaml: vendoring created it.
+    // The fixture had no pnpm-workspace.yaml: vendoring created it (or, on
+    // pnpm 9.0–10.4, did not).
     assert_manifestless_vendored_vex(
         &fresh,
         pm,
@@ -762,7 +776,7 @@ async fn run_pnpm_capstone(pm: &str, driver: VendorDriver) {
     // 5. Idempotency: a re-run exits 0 and leaves ALL THREE files byte-stable.
     let lock_wired = std::fs::read(&lock_path).unwrap();
     let pkg_wired = std::fs::read(&pkg_path).unwrap();
-    let ws_wired = std::fs::read(&ws_path).unwrap();
+    let ws_wired = std::fs::read(&ws_path).ok();
     let (code, stdout, stderr) = run_socket(
         &proj,
         &[
@@ -790,7 +804,7 @@ async fn run_pnpm_capstone(pm: &str, driver: VendorDriver) {
         "re-vendor must leave package.json byte-identical"
     );
     assert_eq!(
-        std::fs::read(&ws_path).unwrap(),
+        std::fs::read(&ws_path).ok(),
         ws_wired,
         "re-vendor must leave pnpm-workspace.yaml byte-identical"
     );

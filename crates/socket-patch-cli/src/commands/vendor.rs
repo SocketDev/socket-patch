@@ -3558,7 +3558,12 @@ pub(crate) async fn vendor_records_reusing(
             // package.json `pnpm.overrides` mirror is ignored), so pnpm-wired
             // runs must name that file among the committables: a checkout
             // that loses it silently unvendors on the next install.
-            let commit = commit_hint(&wired_flavors);
+            // A project pinned to pnpm 9.0–10.4 gets no pnpm-workspace.yaml
+            // (#734), so the file is named only when it is there.
+            let commit = commit_hint(
+                &wired_flavors,
+                common.cwd.join("pnpm-workspace.yaml").exists(),
+            );
             let mut installs: Vec<&str> = wired_flavors
                 .iter()
                 .filter_map(|f| flavor_install_command(f))
@@ -3634,10 +3639,17 @@ fn jvm_wiring_tool(wiring: &[vendor::state::WiringRecord]) -> Option<&'static st
 /// The "Commit …" next step for the flavors a run wired. sbt and scala-cli
 /// wire through a generated root file, never a lockfile: committing only
 /// `.socket/` would leave CI resolving the unpatched upstream silently.
-fn commit_hint(wired: &HashSet<String>) -> String {
-    if wired.contains("pnpm") {
+fn commit_hint(wired: &HashSet<String>, pnpm_workspace: bool) -> String {
+    if wired.contains("pnpm") && pnpm_workspace {
         return ".socket/vendor/, package.json, pnpm-lock.yaml, and pnpm-workspace.yaml to make \
                 the patches portable (pnpm >=11 reads the vendored override only from \
+                pnpm-workspace.yaml)"
+            .to_string();
+    }
+    if wired.contains("pnpm") {
+        return ".socket/vendor/, package.json, and pnpm-lock.yaml to make the patches \
+                portable (the project's pnpm 9.0–10.4 reads the override from package.json; \
+                after upgrading to pnpm >=11, re-run vendor so it also writes \
                 pnpm-workspace.yaml)"
             .to_string();
     }
@@ -5979,25 +5991,34 @@ mod scope_and_hint_tests {
     #[test]
     fn jvm_commit_hint_names_the_generated_root_file() {
         let set = |fs: &[&str]| fs.iter().map(|f| f.to_string()).collect::<HashSet<_>>();
-        let sbt = commit_hint(&set(&["sbt"]));
+        let sbt = commit_hint(&set(&["sbt"]), false);
         assert!(
             sbt.starts_with("socket-patch-vendor.sbt and .socket/vendor/"),
             "{sbt}"
         );
         assert!(!sbt.contains("lockfiles"), "{sbt}");
-        let cli = commit_hint(&set(&["scala-cli"]));
+        let cli = commit_hint(&set(&["scala-cli"]), false);
         assert!(
             cli.starts_with("socket-patch.scala and .socket/vendor/"),
             "{cli}"
         );
-        let both = commit_hint(&set(&["sbt", "package-lock"]));
+        let both = commit_hint(&set(&["sbt", "package-lock"]), false);
         assert!(
             both.contains("socket-patch-vendor.sbt") && both.contains("lockfiles"),
             "{both}"
         );
         assert_eq!(
-            commit_hint(&set(&[])),
+            commit_hint(&set(&[]), false),
             ".socket/vendor/ and the updated lockfiles to make the patches portable"
+        );
+        // pnpm names pnpm-workspace.yaml only when the run left one (#734).
+        let pnpm = commit_hint(&set(&["pnpm"]), true);
+        assert!(pnpm.contains("and pnpm-workspace.yaml"), "{pnpm}");
+        let pnpm = commit_hint(&set(&["pnpm"]), false);
+        assert!(
+            pnpm.starts_with(".socket/vendor/, package.json, and pnpm-lock.yaml")
+                && pnpm.contains("re-run vendor"),
+            "{pnpm}"
         );
         let wiring = |kind: &str| {
             vec![vendor::state::WiringRecord {

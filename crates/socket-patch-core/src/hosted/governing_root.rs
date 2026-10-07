@@ -24,6 +24,7 @@ use crate::constants::npm_family::{NPM_LOCKS, VLT_LOCK};
 use crate::patch::redirect::npmrc::npmrc_top_level_value;
 use crate::utils::fs::{read_regular_to_string, read_regular_to_string_sync};
 use crate::utils::pnpm_workspace::governing_workspace_file;
+use crate::utils::workspace_globs::workspaces_include;
 use crate::vendor::cargo::NOT_WORKSPACE_ROOT;
 use crate::vendor::cargo_manifest;
 use crate::vendor::lock_inventory::ProjectView;
@@ -130,9 +131,10 @@ pub async fn refusal(
 }
 
 /// A pnpm v9 project lock (the one the trust auto-config serves) in a
-/// workspace member whose settings come from an ancestor
-/// `pnpm-workspace.yaml` that neither trusts the lock nor explicitly opts
-/// out. The auto-config used to create a nested file pnpm ignores (#880);
+/// workspace member (listed by the `packages:` globs of the nearest
+/// ancestor `pnpm-workspace.yaml`, #1006) whose settings come from that
+/// file, which neither trusts the lock nor explicitly opts out. The
+/// auto-config used to create a nested file pnpm ignores (#880);
 /// socket-patch writes only inside the project, so the user adds the key
 /// to the root file. An explicit `trustLockfile: <non-true>` is respected,
 /// as in a single project.
@@ -356,56 +358,6 @@ fn workspace_patterns(package_json: &str) -> Option<Vec<String>> {
     )
 }
 
-/// Whether the member path (`rel`, relative to the workspace root, one
-/// entry per component) matches a `workspaces` pattern and no later
-/// `!`-negated one. A pattern is a `/`-separated glob: `*` and `?` match
-/// within one component, `**` matches any number of components.
-fn workspaces_include(patterns: &[String], rel: &[String]) -> bool {
-    if rel.is_empty() {
-        return false;
-    }
-    let mut included = false;
-    for pattern in patterns {
-        let (negated, pattern) = match pattern.strip_prefix('!') {
-            Some(rest) => (true, rest),
-            None => (false, pattern.as_str()),
-        };
-        let segments: Vec<&str> = pattern
-            .trim()
-            .split(['/', '\\'])
-            .filter(|s| !s.is_empty() && *s != ".")
-            .collect();
-        if segments.is_empty() {
-            continue;
-        }
-        if path_glob_matches(&segments, rel) {
-            included = !negated;
-        }
-    }
-    included
-}
-
-fn path_glob_matches(pattern: &[&str], path: &[String]) -> bool {
-    match pattern.split_first() {
-        None => path.is_empty(),
-        Some((&"**", rest)) => (0..=path.len()).any(|skip| path_glob_matches(rest, &path[skip..])),
-        Some((first, rest)) => path.split_first().is_some_and(|(head, tail)| {
-            segment_glob_matches(first.as_bytes(), head.as_bytes()) && path_glob_matches(rest, tail)
-        }),
-    }
-}
-
-fn segment_glob_matches(pattern: &[u8], name: &[u8]) -> bool {
-    match pattern.split_first() {
-        None => name.is_empty(),
-        Some((b'*', rest)) => {
-            (0..=name.len()).any(|skip| segment_glob_matches(rest, &name[skip..]))
-        }
-        Some((b'?', rest)) => !name.is_empty() && segment_glob_matches(rest, &name[1..]),
-        Some((c, rest)) => name.first() == Some(c) && segment_glob_matches(rest, &name[1..]),
-    }
-}
-
 async fn npmrc_lockfile_dir(root: &Path) -> Option<String> {
     let npmrc = read_regular_to_string(&root.join(".npmrc")).await.ok()?;
     npmrc_top_level_value(&npmrc, "lockfile-dir")
@@ -520,6 +472,55 @@ mod tests {
             "lockfileVersion: '9.0'\n",
         );
         assert_eq!(code(&member, "npm").await, None);
+    }
+
+    /// #1006: a project the nearest `pnpm-workspace.yaml` does not list
+    /// under `packages:` is standalone on pnpm 11.28+/12 and reads only its
+    /// own settings file, so the trust auto-config's nested file is the
+    /// one pnpm reads: nothing to refuse.
+    #[tokio::test]
+    async fn pnpm_project_outside_the_workspace_globs_is_not_refused() {
+        let tmp = tempfile::tempdir().unwrap();
+        write(
+            tmp.path(),
+            "pnpm-workspace.yaml",
+            "packages:\n  - packages/*\n",
+        );
+        write(tmp.path(), "examples/demo/package.json", "{}");
+        write(
+            tmp.path(),
+            "examples/demo/pnpm-lock.yaml",
+            "lockfileVersion: '9.0'\n",
+        );
+        let demo = tmp.path().join("examples/demo");
+        let refused = refusal(&ProjectView::Disk(&demo), &[candidate("npm")], true).await;
+        assert!(refused.is_none(), "{refused:?}");
+        // A settings-only root file lists no project but the root. No trust
+        // key, so only the membership rule keeps it from refusing.
+        write(
+            tmp.path(),
+            "pnpm-workspace.yaml",
+            "sharedWorkspaceLockfile: false\n",
+        );
+        let refused = refusal(&ProjectView::Disk(&demo), &[candidate("npm")], true).await;
+        assert!(refused.is_none(), "{refused:?}");
+        // `**` does not list a dot directory (pnpm 12 installs it with its
+        // own lock), so a GitHub action project is not refused either.
+        write(tmp.path(), "pnpm-workspace.yaml", "packages:\n  - '**'\n");
+        write(tmp.path(), ".github/actions/demo/package.json", "{}");
+        write(
+            tmp.path(),
+            ".github/actions/demo/pnpm-lock.yaml",
+            "lockfileVersion: '9.0'\n",
+        );
+        let action = tmp.path().join(".github/actions/demo");
+        let refused = refusal(&ProjectView::Disk(&action), &[candidate("npm")], true).await;
+        assert!(refused.is_none(), "{refused:?}");
+        // ...while `examples/demo`, which `**` lists, is refused.
+        assert_eq!(
+            code(&demo, "npm").await.as_deref(),
+            Some(PNPM_SETTINGS_ELSEWHERE)
+        );
     }
 
     /// #880: a member with its own v9 lock is pinned through that lock, but
@@ -990,40 +991,6 @@ mod tests {
             code(&tmp.path().join("apps/web"), "npm").await.as_deref(),
             Some(PNPM_LOCKFILE_ELSEWHERE)
         );
-    }
-
-    #[test]
-    fn workspaces_patterns_match_like_npm_and_yarn() {
-        let rel = |p: &str| p.split('/').map(str::to_string).collect::<Vec<_>>();
-        let pats = |p: &[&str]| p.iter().map(|s| s.to_string()).collect::<Vec<_>>();
-        assert!(workspaces_include(
-            &pats(&["packages/*"]),
-            &rel("packages/a")
-        ));
-        assert!(!workspaces_include(
-            &pats(&["packages/*"]),
-            &rel("packages/a/b")
-        ));
-        assert!(workspaces_include(
-            &pats(&["./packages/*/"]),
-            &rel("packages/a")
-        ));
-        assert!(workspaces_include(
-            &pats(&["packages/**"]),
-            &rel("packages/a/b")
-        ));
-        assert!(workspaces_include(
-            &pats(&["**/pkg-*"]),
-            &rel("x/y/pkg-one")
-        ));
-        assert!(workspaces_include(&pats(&["app"]), &rel("app")));
-        assert!(!workspaces_include(&pats(&["app"]), &rel("apps")));
-        assert!(workspaces_include(&pats(&["app?"]), &rel("apps")));
-        assert!(!workspaces_include(
-            &pats(&["packages/*", "!packages/b"]),
-            &rel("packages/b")
-        ));
-        assert!(!workspaces_include(&pats(&["*"]), &[]));
     }
 
     #[test]
