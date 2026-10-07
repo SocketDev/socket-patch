@@ -38,6 +38,11 @@ pub enum MemoryEntry {
 #[derive(Debug, Clone, Default, PartialEq, Eq)]
 pub struct MemoryProject {
     entries: BTreeMap<String, MemoryEntry>,
+    /// The `.yarnrc.yml` texts of the repository directories above this
+    /// project, nearest first. yarn berry merges every rc file at or above
+    /// the project, so a `nodeLinker` set only there still decides whether
+    /// a `.pnp.*` loader is live (#975).
+    ancestor_yarnrcs: Vec<Arc<str>>,
 }
 
 impl MemoryProject {
@@ -57,6 +62,11 @@ impl MemoryProject {
     #[cfg(test)]
     pub(crate) fn insert_present(&mut self, rel: impl Into<String>) {
         self.insert(rel, MemoryEntry::Present);
+    }
+
+    /// Set the `.yarnrc.yml` texts above the project, nearest first.
+    pub fn set_ancestor_yarnrcs(&mut self, rcs: Vec<Arc<str>>) {
+        self.ancestor_yarnrcs = rcs;
     }
 
     pub fn remove(&mut self, rel: &str) -> Option<MemoryEntry> {
@@ -376,16 +386,28 @@ pub(crate) async fn detect_npm_lock_flavor_in(
 
     // A loader the configured `nodeLinker` disowns is stale (#975). A
     // memory snapshot is the repository alone, not the host it is scanned
-    // on: only its own `.yarnrc.yml` counts, never the host's
-    // `YARN_NODE_LINKER`, `YARN_RC_FILENAME` or home rc file. A classic lock
-    // is yarn 1, which has no `nodeLinker`.
+    // on: only the repository's own `.yarnrc.yml` files count (the
+    // project's, then those above it, the closest setting winning, as on
+    // disk), never the host's `YARN_NODE_LINKER`, `YARN_RC_FILENAME` or
+    // home rc file. A classic lock is yarn 1, which has no `nodeLinker`.
     let linker = || {
         let lock = project.read_text("yarn.lock").ok();
         crate::crawlers::pkg_managers::effective_yarn_linker(lock.as_deref(), || {
-            let rc = project.read_text(".yarnrc.yml").ok()?;
-            crate::vendor::yarn_berry_lock::yarnrc_scalar(&rc, "nodeLinker")
-                .filter(|v| !v.is_empty())
-                .map(str::to_string)
+            let node_linker = |rc: &str| {
+                crate::vendor::yarn_berry_lock::yarnrc_scalar(rc, "nodeLinker")
+                    .filter(|v| !v.is_empty())
+                    .map(str::to_string)
+            };
+            project
+                .read_text(".yarnrc.yml")
+                .ok()
+                .and_then(|rc| node_linker(&rc))
+                .or_else(|| {
+                    project
+                        .ancestor_yarnrcs
+                        .iter()
+                        .find_map(|rc| node_linker(rc))
+                })
         })
     };
     if let Some(marker) = crate::crawlers::pkg_managers::live_pnp_marker_with(linker, exists) {
@@ -587,6 +609,41 @@ mod tests {
         ]);
         assert_eq!(
             detect_npm_lock_flavor_in(&ProjectView::Memory(&yarn1_pnp))
+                .await
+                .unwrap_err()
+                .0,
+            "vendor_yarn_berry_unsupported"
+        );
+        // The linker set only in a `.yarnrc.yml` above the project (the
+        // repository root over a nested yarn project) still counts, the
+        // nearest one winning; the project's own rc wins over both.
+        let mut parent_rc = stale.clone();
+        parent_rc.remove(".yarnrc.yml");
+        parent_rc.set_ancestor_yarnrcs(vec![
+            Arc::from("enableGlobalCache: false\n"),
+            Arc::from("nodeLinker: node-modules\n"),
+            Arc::from("nodeLinker: pnp\n"),
+        ]);
+        assert_eq!(
+            detect_npm_lock_flavor_in(&ProjectView::Memory(&parent_rc))
+                .await
+                .unwrap()
+                .0,
+            NpmLockFlavor::YarnBerry
+        );
+        let mut own_rc_wins = parent_rc.clone();
+        own_rc_wins.insert_text(".yarnrc.yml", "nodeLinker: pnp\n");
+        assert_eq!(
+            detect_npm_lock_flavor_in(&ProjectView::Memory(&own_rc_wins))
+                .await
+                .unwrap_err()
+                .0,
+            "vendor_yarn_berry_unsupported"
+        );
+        let mut parent_pnp = parent_rc.clone();
+        parent_pnp.set_ancestor_yarnrcs(vec![Arc::from("nodeLinker: pnp\n")]);
+        assert_eq!(
+            detect_npm_lock_flavor_in(&ProjectView::Memory(&parent_pnp))
                 .await
                 .unwrap_err()
                 .0,

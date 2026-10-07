@@ -239,6 +239,18 @@ fn project_for(
         }
         project.insert(rel, file.entry.clone());
     }
+    // yarn berry merges the rc files above the project as well, so a
+    // nested yarn root sees the repository's `.yarnrc.yml` files above it
+    // (`select_paths` fetches them for a root holding a PnP loader).
+    let ancestor_yarnrcs = roots::strict_ancestors(root)
+        .filter_map(
+            |dir| match &files.get(&roots::join_root(dir, roots::YARNRC_NAME))?.entry {
+                MemoryEntry::Text(text) => Some(Arc::clone(text)),
+                _ => None,
+            },
+        )
+        .collect();
+    project.set_ancestor_yarnrcs(ancestor_yarnrcs);
     (project, unreadable)
 }
 
@@ -1514,6 +1526,50 @@ mod tests {
             outer_unreadable,
             BTreeSet::from(["a/big.lock".to_string()]),
             "a non-UTF-8 file is absent to disk too"
+        );
+    }
+
+    /// #975: a nested yarn root's loader follows a `nodeLinker` set only in
+    /// a repository `.yarnrc.yml` above it, as the disk walk does.
+    #[tokio::test]
+    async fn nested_yarn_root_follows_an_ancestor_yarnrc_linker() {
+        use crate::vendor::lock_inventory::view::detect_npm_lock_flavor_in;
+        let mut files: BTreeMap<String, SharedFile> = BTreeMap::new();
+        files.insert(
+            ".yarnrc.yml".into(),
+            share(InputFile::Text("nodeLinker: node-modules\n".into())),
+        );
+        files.insert(
+            "apps/.yarnrc.yml".into(),
+            share(InputFile::Text("enableGlobalCache: false\n".into())),
+        );
+        files.insert(
+            "apps/web/yarn.lock".into(),
+            share(InputFile::Text("__metadata:\n  version: 8\n".into())),
+        );
+        files.insert(
+            "apps/web/.pnp.cjs".into(),
+            share(InputFile::Present(PresentKind::Present)),
+        );
+        let (web, _) = project_for("apps/web", &files);
+        assert!(
+            detect_npm_lock_flavor_in(&ProjectView::Memory(&web))
+                .await
+                .is_ok(),
+            "the repository rc disowns the stale loader"
+        );
+        files.insert(
+            "apps/.yarnrc.yml".into(),
+            share(InputFile::Text("nodeLinker: pnp\n".into())),
+        );
+        let (web, _) = project_for("apps/web", &files);
+        assert_eq!(
+            detect_npm_lock_flavor_in(&ProjectView::Memory(&web))
+                .await
+                .unwrap_err()
+                .0,
+            "vendor_yarn_berry_unsupported",
+            "the nearest rc above the project wins"
         );
     }
 

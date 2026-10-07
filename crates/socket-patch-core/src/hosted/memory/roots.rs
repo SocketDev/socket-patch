@@ -90,6 +90,23 @@ pub(crate) fn join_root(root: &str, rel: &str) -> String {
     }
 }
 
+/// yarn berry's rc file, which yarn merges from every directory at or
+/// above the project (the closest setting winning).
+pub(crate) const YARNRC_NAME: &str = ".yarnrc.yml";
+
+/// The directories strictly above `root` inside the repository, nearest
+/// first, ending with the repository root (`""`). None for the repository
+/// root itself.
+pub(crate) fn strict_ancestors(root: &str) -> impl Iterator<Item = &str> {
+    let mut next = (!root.is_empty()).then_some(root);
+    std::iter::from_fn(move || {
+        let dir = next?;
+        let parent = split_path(dir).0;
+        next = (!parent.is_empty()).then_some(parent);
+        Some(parent)
+    })
+}
+
 fn allowed(ecosystems: Option<&[String]>, eco: &str) -> bool {
     ecosystems.is_none_or(|list| list.iter().any(|e| e == eco))
 }
@@ -244,5 +261,15 @@ mod tests {
             detect_roots(["a/package-lock.json", "b/Cargo.lock"], Some(&only_npm));
         assert_eq!(found, vec!["a"]);
         assert_eq!(ignored[0].reason, "ecosystem_filtered");
+    }
+
+    #[test]
+    fn strict_ancestors_walk_up_to_the_repo_root() {
+        assert_eq!(strict_ancestors("").count(), 0);
+        assert_eq!(strict_ancestors("web").collect::<Vec<_>>(), vec![""]);
+        assert_eq!(
+            strict_ancestors("apps/web/ui").collect::<Vec<_>>(),
+            vec!["apps/web", "apps", ""]
+        );
     }
 }
