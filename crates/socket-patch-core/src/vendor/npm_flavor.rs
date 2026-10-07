@@ -90,7 +90,9 @@ impl NpmLockFlavor {
 
 /// Yarn berry Plug'n'Play loaders: packages live inside `.yarn/cache/` zips,
 /// so there is nothing on disk to stage and no lockfile entry to rewire.
-use crate::constants::npm_family::{BUN_LOCK, BUN_LOCKB, NPM_LOCKS, PNPM_LOCK, VLT_LOCK};
+use crate::constants::npm_family::{
+    BUN_LOCK, BUN_LOCKB, NPM_LOCKS, PNPM_LOCK, PNP_MARKERS, VLT_LOCK,
+};
 
 /// Every lockfile name the probe knows, grouped into wiring families: the
 /// flavor that owns a family wires (or supersedes) every file in it, so only
@@ -163,12 +165,12 @@ pub(crate) async fn detect_npm_lock_flavor(
     //    wrong twice over. Vendor still refuses (the file: rewiring has no
     //    fixtures under pnpm's PnP linker — fail closed), but with a pnpm
     //    diagnosis and remedy.
-    //    A loader the configured `nodeLinker` disowns is stale (#975) and
-    //    skipped, so the yarn berry sniff below decides.
-    let marker = crate::crawlers::pkg_managers::live_pnp_marker(project_root, |m| {
-        std::fs::metadata(project_root.join(m)).is_ok()
-    });
-    if let Some(marker) = marker {
+    //    The pnpm carve-out is decided on any loader: yarn's `nodeLinker`
+    //    says nothing about pnpm's own. A yarn loader the configured
+    //    `nodeLinker` disowns is stale (#975) and skipped, so the yarn berry
+    //    sniff below decides.
+    let present = |m: &str| std::fs::metadata(project_root.join(m)).is_ok();
+    if let Some(marker) = PNP_MARKERS.into_iter().find(|m| present(m)) {
         if crate::crawlers::pkg_managers::pnpm_pnp_layout(project_root) {
             return Err((
                 "vendor_pnpm_pnp_unsupported",
@@ -183,6 +185,8 @@ pub(crate) async fn detect_npm_lock_flavor(
                 ),
             ));
         }
+    }
+    if let Some(marker) = crate::crawlers::pkg_managers::live_pnp_marker(project_root, present) {
         return Err((
             "vendor_yarn_berry_unsupported",
             format!(
@@ -961,7 +965,6 @@ mod tests {
     }
 
     use super::*;
-    use crate::constants::npm_family::PNP_MARKERS;
     use crate::hash::git_sha256::compute_git_sha256_from_bytes;
 
     #[test]
@@ -1122,6 +1125,18 @@ mod tests {
         assert!(detail.contains("node-linker=pnp"), "{detail}");
         assert!(detail.contains("scan --mode hosted"), "{detail}");
         assert!(!detail.contains("yarn patch"), "{detail}");
+    }
+
+    /// pnpm's PnP loader is pnpm's, not yarn's: a yarn `nodeLinker` that
+    /// disowns yarn loaders (an ancestor `.yarnrc.yml`, `YARN_NODE_LINKER`)
+    /// must not let a pnpm `node-linker=pnp` tree past its own refusal.
+    #[tokio::test]
+    async fn pnpm_pnp_layout_refuses_under_a_non_pnp_yarn_linker() {
+        let tmp = tempfile::tempdir().unwrap();
+        stage_pnpm_pnp_layout(tmp.path()).await;
+        touch(tmp.path(), ".yarnrc.yml", "nodeLinker: node-modules\n").await;
+        let (code, _) = detect_npm_lock_flavor(tmp.path()).await.unwrap_err();
+        assert_eq!(code, "vendor_pnpm_pnp_unsupported");
     }
 
     /// The pnpm-PnP carve-out stays fail-closed: a yarn.lock alongside
