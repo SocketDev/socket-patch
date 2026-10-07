@@ -1,6 +1,5 @@
 use clap::Args;
 use futures_util::StreamExt;
-use regex::Regex;
 use socket_patch_core::api::client::{
     build_proxy_fallback_client, get_api_client_with_overrides, hold_back_debug,
     is_fallback_candidate, ApiClient, ApiError,
@@ -20,14 +19,11 @@ use socket_patch_core::patch::apply::{is_valid_blob_hash, select_installed_varia
 use socket_patch_core::patch::apply_lock::{LockError, LockGuard};
 use socket_patch_core::telemetry::{track_patch_fetch_failed, track_patch_fetched};
 use socket_patch_core::utils::concurrent::{api_concurrency_for, ordered_concurrent};
-use socket_patch_core::utils::purl::{
-    canonical_purl, is_purl, normalize_purl, strip_purl_qualifiers,
-};
+use socket_patch_core::utils::purl::{canonical_purl, normalize_purl, strip_purl_qualifiers};
+use socket_patch_core::utils::target::{Target, TargetKind};
 use socket_patch_core::vendor::{load_state, lookup_entry, VendorEntry, VendorState};
 use std::collections::HashMap;
-use std::fmt;
 use std::path::{Path, PathBuf};
-use std::sync::LazyLock;
 use std::time::Duration;
 
 use crate::args::{apply_env_toggles, GlobalArgs};
@@ -40,8 +36,7 @@ use crate::commands::vlt_preflight::{
     vlt_refusal_for, vlt_vendor_preflight_selected, VltVendorRefusal,
 };
 use crate::ecosystem_dispatch::{
-    crawl_all_ecosystems, find_all_packages_for_rollback, find_packages_for_rollback,
-    partition_purls,
+    crawl_ecosystems, find_all_packages_for_rollback, find_packages_for_rollback, partition_purls,
 };
 use crate::ui::{print_json, select_one, SelectError};
 
@@ -462,51 +457,6 @@ pub struct GetArgs {
     pub mode: Option<super::scan::ScanMode>,
 }
 
-#[derive(Debug, Clone, Copy, PartialEq)]
-enum IdentifierType {
-    Uuid,
-    Cve,
-    Ghsa,
-    Purl,
-    Package,
-}
-
-impl fmt::Display for IdentifierType {
-    fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
-        match self {
-            IdentifierType::Uuid => write!(f, "UUID"),
-            IdentifierType::Cve => write!(f, "CVE"),
-            IdentifierType::Ghsa => write!(f, "GHSA"),
-            IdentifierType::Purl => write!(f, "PURL"),
-            IdentifierType::Package => write!(f, "package name"),
-        }
-    }
-}
-
-/// Case-insensitive advisory-id shapes, compiled once. The UUID shape is
-/// [`crate::looks_like_uuid`] (the same 8-4-4-4-12 hex check the argv
-/// rewrite uses), so the two detectors cannot drift.
-static CVE_RE: LazyLock<Regex> =
-    LazyLock::new(|| Regex::new(r"(?i)^CVE-\d{4}-\d+$").expect("hardcoded CVE regex must compile"));
-static GHSA_RE: LazyLock<Regex> = LazyLock::new(|| {
-    Regex::new(r"(?i)^GHSA-[a-z0-9]{4}-[a-z0-9]{4}-[a-z0-9]{4}$")
-        .expect("hardcoded GHSA regex must compile")
-});
-
-fn detect_identifier_type(identifier: &str) -> Option<IdentifierType> {
-    if crate::looks_like_uuid(identifier) {
-        Some(IdentifierType::Uuid)
-    } else if CVE_RE.is_match(identifier) {
-        Some(IdentifierType::Cve)
-    } else if GHSA_RE.is_match(identifier) {
-        Some(IdentifierType::Ghsa)
-    } else if is_purl(identifier) {
-        Some(IdentifierType::Purl)
-    } else {
-        None
-    }
-}
-
 /// Advisory labels for a patch: every advisory's CVE ids, or the advisory
 /// id itself when it has no CVE assigned yet (a fresh GHSA). Sorted and
 /// deduplicated, so the text never depends on `HashMap` iteration order.
@@ -693,18 +643,60 @@ fn format_search_results(
     out
 }
 
-/// The stderr line naming the package a package-name search went with
-/// (only the best fuzzy match is searched).
-fn format_best_match(purl: &str, matches: usize) -> String {
-    if matches > 1 {
-        format!(
-            "Best match: {} (of {} matching packages)",
-            normalize_purl(purl),
-            matches
-        )
-    } else {
-        format!("Best match: {}", normalize_purl(purl))
+/// The stderr line naming the installed packages a package-name search
+/// matched (every one of them is searched).
+fn format_matched_packages(purls: &[String]) -> String {
+    let names: Vec<String> = purls
+        .iter()
+        .map(|p| normalize_purl(p).into_owned())
+        .collect();
+    match names.as_slice() {
+        [one] => format!("Matched: {one}"),
+        many => format!(
+            "Matched {} installed packages: {}",
+            many.len(),
+            many.join(", ")
+        ),
     }
+}
+
+/// Every installed purl a package-name `target` selects, deduplicated and
+/// sorted (a monorepo can hold the same release in several places).
+fn installed_target_matches(
+    target: &Target,
+    packages: &[socket_patch_core::crawlers::CrawledPackage],
+) -> Vec<String> {
+    let mut purls: Vec<String> = packages
+        .iter()
+        .filter(|pkg| target.matches_package(&pkg.purl))
+        .map(|pkg| pkg.purl.clone())
+        .collect();
+    purls.sort();
+    purls.dedup();
+    purls
+}
+
+/// "Did you mean" for a name that matched nothing exactly: up to five
+/// installed names the fuzzy ranker puts closest. A suggestion only — a
+/// near name is never searched or patched.
+fn format_did_you_mean(
+    query: &str,
+    packages: &[socket_patch_core::crawlers::CrawledPackage],
+) -> Option<String> {
+    let mut names: Vec<String> = Vec::new();
+    for pkg in fuzzy_match_packages(query, packages, usize::MAX) {
+        let name = match &pkg.namespace {
+            Some(ns) => format!("{ns}/{}", pkg.name),
+            None => pkg.name.clone(),
+        };
+        if !names.contains(&name) {
+            names.push(name);
+        }
+        if names.len() == 5 {
+            break;
+        }
+    }
+    (!names.is_empty()).then(|| format!("Did you mean: {}?", names.join(", ")))
 }
 
 /// The `--verbose` per-version detail behind [`format_skip_summary`]: one
@@ -961,22 +953,19 @@ const APPLY_FAILED: &str = "Error: Some patches could not be applied.";
 /// `--ghsa`, so a typo fails fast with a readable message instead of a raw
 /// API 400 body. `None` when it is well-formed (or the type is not
 /// shape-checked).
-fn forced_identifier_error(identifier: &str, id_type: IdentifierType) -> Option<String> {
-    let (ok, what, form) = match id_type {
-        IdentifierType::Uuid => (
-            crate::looks_like_uuid(identifier),
-            "patch UUID",
-            "xxxxxxxx-xxxx-xxxx-xxxx-xxxxxxxxxxxx",
-        ),
-        IdentifierType::Cve => (CVE_RE.is_match(identifier), "CVE ID", "CVE-YYYY-NNNN"),
-        IdentifierType::Ghsa => (
-            GHSA_RE.is_match(identifier),
-            "GHSA ID",
-            "GHSA-xxxx-xxxx-xxxx",
-        ),
-        IdentifierType::Purl | IdentifierType::Package => return None,
+fn forced_identifier_error(target: &Target) -> Option<String> {
+    if target.shape_ok() {
+        return None;
+    }
+    let (what, form) = match target.kind() {
+        TargetKind::Uuid => ("patch UUID", "xxxxxxxx-xxxx-xxxx-xxxx-xxxxxxxxxxxx"),
+        TargetKind::Cve => ("CVE ID", "CVE-YYYY-NNNN"),
+        TargetKind::Ghsa => ("GHSA ID", "GHSA-xxxx-xxxx-xxxx"),
+        TargetKind::Purl | TargetKind::Name => return None,
     };
-    (!ok).then(|| format!("\"{identifier}\" is not a valid {what} (expected {form})"))
+    Some(format!(
+        "\"{target}\" is not a valid {what} (expected {form})"
+    ))
 }
 
 /// Select one patch per PURL from available patches.
@@ -1399,22 +1388,6 @@ async fn filter_to_installed_releases(
 /// several patches for one purl).
 fn sort_by_purl(patches: &mut [PatchSearchResult]) {
     patches.sort_by(|a, b| a.purl.cmp(&b.purl).then_with(|| a.uuid.cmp(&b.uuid)));
-}
-
-/// Does this purl carry an exact version (`pkg:type/name@version`)? An
-/// exact-versioned PURL identifier is exempt from the coarse installed-
-/// version narrowing, like a UUID: the user named the version explicitly.
-/// npm scope `@`s don't count (`pkg:npm/@scope/name` is versionless — the
-/// candidate "version" after the last `@` still contains a `/`).
-fn purl_has_version(purl: &str) -> bool {
-    let stripped = strip_purl_qualifiers(purl);
-    stripped
-        .strip_prefix("pkg:")
-        .and_then(|rest| rest.split_once('/'))
-        .and_then(|(_, coord)| coord.rsplit_once('@'))
-        .is_some_and(|(head, version)| {
-            !head.is_empty() && !version.is_empty() && !version.contains('/')
-        })
 }
 
 /// Outcome of the coarse installed-VERSION narrowing over a CVE/GHSA/PURL
@@ -2688,22 +2661,25 @@ pub async fn run(args: GetArgs) -> i32 {
         return 1;
     }
 
-    // Determine identifier type
-    let id_type = if args.id {
-        IdentifierType::Uuid
-    } else if args.cve {
-        IdentifierType::Cve
-    } else if args.ghsa {
-        IdentifierType::Ghsa
-    } else if args.package {
-        IdentifierType::Package
-    } else {
-        detect_identifier_type(&args.identifier).unwrap_or(IdentifierType::Package)
+    // Classify the identifier with the shared target grammar (the same
+    // one `remove` and `rollback` use), or take the forced kind.
+    let forced = [
+        (args.id, TargetKind::Uuid),
+        (args.cve, TargetKind::Cve),
+        (args.ghsa, TargetKind::Ghsa),
+        (args.package, TargetKind::Name),
+    ]
+    .into_iter()
+    .find_map(|(set, kind)| set.then_some(kind));
+    let target = match forced {
+        Some(kind) => Target::with_kind(&args.identifier, kind),
+        None => Target::parse(&args.identifier),
     };
+    let id_type = target.kind();
     // A forced type is shape-checked locally, before any network call, so
     // a typo reads as a plain message instead of a raw API 400 body.
     if args.id || args.cve || args.ghsa {
-        if let Some(err) = forced_identifier_error(&args.identifier, id_type) {
+        if let Some(err) = forced_identifier_error(&target) {
             report_error(args.common.json, err);
             return 2;
         }
@@ -2713,7 +2689,7 @@ pub async fn run(args: GetArgs) -> i32 {
     // `--silent` is "errors only" (CLI_CONTRACT.md): every informational
     // print below is gated on this; errors and JSON envelopes are not.
     let quiet = args.common.json || args.common.silent;
-    if !quiet && id_type == IdentifierType::Package && !args.package {
+    if !quiet && id_type == TargetKind::Name && !args.package {
         eprintln!("Treating \"{}\" as a package name search", args.identifier);
     }
     let overrides = args.common.api_client_overrides();
@@ -2734,7 +2710,7 @@ pub async fn run(args: GetArgs) -> i32 {
     let mut status = crate::ui::StatusLine::stderr(args.common.json, args.common.silent);
 
     // Handle UUID: fetch and download directly
-    if id_type == IdentifierType::Uuid {
+    if id_type == TargetKind::Uuid {
         status.set(format!("Fetching patch {}...", args.identifier));
         let mut fetch_result = api_client.fetch_patch(&args.identifier).await;
         // 401/403 from the auth endpoint → swap to the public proxy
@@ -2804,6 +2780,30 @@ pub async fn run(args: GetArgs) -> i32 {
                     telemetry_org.as_deref(),
                 )
                 .await;
+                let selected = vec![search_result_from_response(&patch)];
+                // The search path's selection rules hold here too: a patch
+                // outside `--ecosystems` is never acted on, and acting
+                // against the repo's socket.yml says so (`policy_bypassed`).
+                if !args.common.purl_ecosystem_selected(&patch.purl) {
+                    if args.common.json {
+                        print_json(&empty_result_json("not_found"));
+                    } else if !args.common.silent {
+                        println!(
+                            "No patch found with UUID: {} in the selected ecosystems \
+                             (it patches {})",
+                            args.identifier,
+                            normalize_purl(&patch.purl)
+                        );
+                    }
+                    return 0;
+                }
+                let policy_warnings =
+                    super::scan::policy::policy_bypass_warnings(&args.common, &selected);
+                if !args.common.silent {
+                    for (_, detail) in &policy_warnings {
+                        eprintln!("Warning: {detail}");
+                    }
+                }
                 // Mode dispatch. All three reuse THIS fetched patch and
                 // this possibly-proxy-fallback client rather than
                 // re-fetching with a fresh one, which would re-hit the
@@ -2812,14 +2812,12 @@ pub async fn run(args: GetArgs) -> i32 {
                 return match mode {
                     // Save to manifest and apply in place.
                     super::scan::ScanMode::Agent => {
-                        save_and_apply_patch(&args, &api_client, &patch).await
+                        save_and_apply_patch(&args, &api_client, &patch, &policy_warnings).await
                     }
                     super::scan::ScanMode::Hosted => {
-                        let selected = vec![search_result_from_response(&patch)];
-                        run_get_hosted(&args, &api_client, &selected, &[], &[]).await
+                        run_get_hosted(&args, &api_client, &selected, &[], &policy_warnings).await
                     }
                     super::scan::ScanMode::Vendored => {
-                        let selected = vec![search_result_from_response(&patch)];
                         run_get_vendored(
                             &args,
                             &api_client,
@@ -2827,7 +2825,7 @@ pub async fn run(args: GetArgs) -> i32 {
                             &selected,
                             Some(&patch),
                             &[],
-                            &[],
+                            &policy_warnings,
                             telemetry_token.as_deref(),
                             telemetry_org.as_deref(),
                         )
@@ -2883,17 +2881,15 @@ pub async fn run(args: GetArgs) -> i32 {
     // CVE / GHSA / PURL share the same path: log the search, dispatch to
     // the matching endpoint, and surface errors via `report_fetch_failure`.
     let search_response: SearchResponse = match id_type {
-        IdentifierType::Cve | IdentifierType::Ghsa | IdentifierType::Purl => {
+        TargetKind::Cve | TargetKind::Ghsa | TargetKind::Purl => {
             status.set(format!(
                 "Searching patches for {id_type} {}...",
                 args.identifier
             ));
             let result = match id_type {
-                IdentifierType::Cve => api_client.search_patches_by_cve(&args.identifier).await,
-                IdentifierType::Ghsa => api_client.search_patches_by_ghsa(&args.identifier).await,
-                IdentifierType::Purl => {
-                    api_client.search_patches_by_package(&args.identifier).await
-                }
+                TargetKind::Cve => api_client.search_patches_by_cve(&args.identifier).await,
+                TargetKind::Ghsa => api_client.search_patches_by_ghsa(&args.identifier).await,
+                TargetKind::Purl => api_client.search_patches_by_package(&args.identifier).await,
                 _ => unreachable!(),
             };
             status.finish();
@@ -2912,9 +2908,12 @@ pub async fn run(args: GetArgs) -> i32 {
                 }
             }
         }
-        IdentifierType::Package => {
+        TargetKind::Name => {
             status.set("Enumerating packages...");
-            let (all_packages, _, _) = crawl_all_ecosystems(&args.common.crawler_options()).await;
+            // `--ecosystems` scopes the crawl, so a name can only resolve
+            // inside the selected ecosystems.
+            let only = args.common.ecosystems.as_deref().filter(|l| !l.is_empty());
+            let (all_packages, _, _) = crawl_ecosystems(&args.common.crawler_options(), only).await;
 
             if all_packages.is_empty() {
                 status.finish();
@@ -2931,47 +2930,69 @@ pub async fn run(args: GetArgs) -> i32 {
                 crate::ui::plural(all_packages.len(), "package", "packages")
             ));
 
-            let matches = fuzzy_match_packages(&args.identifier, &all_packages, 20);
-
-            if matches.is_empty() {
+            // The shared target grammar: an EXACT name (full or last
+            // segment, case-insensitive, PEP 503 for PyPI), never a prefix
+            // or substring, and every installed version of it.
+            let matched = installed_target_matches(&target, &all_packages);
+            if matched.is_empty() {
                 if args.common.json {
                     print_json(&empty_result_json("no_match"));
                 } else if !args.common.silent {
                     println!("No packages matching \"{}\" found.", args.identifier);
+                    // Near names are only ever suggested, never acted on.
+                    if let Some(hint) = format_did_you_mean(&args.identifier, &all_packages) {
+                        println!("{hint}");
+                    }
                 }
                 return 0;
             }
 
-            // Only the best match is searched: name it, so a fuzzy pick
-            // of the wrong package is visible.
-            let best_match = &matches[0];
             if !quiet {
-                eprintln!("{}", format_best_match(&best_match.purl, matches.len()));
+                eprintln!("{}", format_matched_packages(&matched));
             }
-            status.set(format!(
-                "Searching patches for {}...",
-                normalize_purl(&best_match.purl)
-            ));
-            let result = api_client.search_patches_by_package(&best_match.purl).await;
-            status.finish();
-            match result {
-                Ok(r) => r,
-                Err(e) => {
-                    return report_fetch_failure(
-                        &args.identifier,
-                        e,
-                        fallback_to_proxy,
-                        telemetry_token.as_deref(),
-                        telemetry_org.as_deref(),
-                        args.common.json,
-                    )
-                    .await;
+            let mut merged = SearchResponse {
+                patches: Vec::new(),
+                can_access_paid_patches: false,
+            };
+            for purl in &matched {
+                status.set(format!("Searching patches for {}...", normalize_purl(purl)));
+                let result = api_client.search_patches_by_package(purl).await;
+                status.finish();
+                match result {
+                    Ok(r) => {
+                        merged.can_access_paid_patches |= r.can_access_paid_patches;
+                        for patch in r.patches {
+                            if !merged.patches.iter().any(|p| p.uuid == patch.uuid) {
+                                merged.patches.push(patch);
+                            }
+                        }
+                    }
+                    Err(e) => {
+                        return report_fetch_failure(
+                            &args.identifier,
+                            e,
+                            fallback_to_proxy,
+                            telemetry_token.as_deref(),
+                            telemetry_org.as_deref(),
+                            args.common.json,
+                        )
+                        .await;
+                    }
                 }
             }
+            merged
         }
         _ => unreachable!(),
     };
     drop(status);
+
+    // `--ecosystems` restricts what `get` acts on, whatever the identifier
+    // kind: an advisory or purl search can return patches for other
+    // ecosystems, and those are never selected.
+    let mut search_response = search_response;
+    search_response
+        .patches
+        .retain(|p| args.common.purl_ecosystem_selected(&p.purl));
 
     if search_response.patches.is_empty() {
         if args.common.json {
@@ -3007,8 +3028,8 @@ pub async fn run(args: GetArgs) -> i32 {
             }));
         } else if !args.common.silent {
             let all: Vec<&PatchSearchResult> = search_response.patches.iter().collect();
-            if id_type == IdentifierType::Package && !quiet {
-                // Separate the stderr `Best match` line above on a terminal;
+            if id_type == TargetKind::Name && !quiet {
+                // Separate the stderr `Matched` line above on a terminal;
                 // stdout itself starts with the result.
                 eprintln!();
             }
@@ -3033,8 +3054,8 @@ pub async fn run(args: GetArgs) -> i32 {
     // never "not installed".
     let narrowing_exempt = args.all_releases
         || args.save_only
-        || id_type == IdentifierType::Package
-        || (id_type == IdentifierType::Purl && purl_has_version(&args.identifier));
+        || id_type == TargetKind::Name
+        || target.is_versioned_purl();
     // The narrowing runs over EVERY result (one crawl), paid no-access ones
     // included, so the listing can still show an installed package's paid
     // fix as `[PAID] (no access)`; selection, the skip records and the
@@ -3075,7 +3096,7 @@ pub async fn run(args: GetArgs) -> i32 {
     }
     if accessible.is_empty() {
         // Every accessible patch was narrowed out. Additive status (never
-        // `no_match`, which is pinned to the fuzzy package-name path):
+        // `no_match`, which is pinned to the package-name path):
         // exit 0, the skips carry the detail via their errorCode.
         if args.common.json {
             let mut result = serde_json::json!({
@@ -3104,8 +3125,8 @@ pub async fn run(args: GetArgs) -> i32 {
     // per-version detail after the summary under --verbose.
     let listed: Vec<&PatchSearchResult> = listed.iter().collect();
     if !quiet {
-        if id_type == IdentifierType::Package || !narrow_warnings.is_empty() {
-            // Separate the stderr lines above (`Best match`, warnings) on a
+        if id_type == TargetKind::Name || !narrow_warnings.is_empty() {
+            // Separate the stderr lines above (`Matched`, warnings) on a
             // terminal; stdout itself starts with the result.
             eprintln!();
         }
@@ -3496,7 +3517,15 @@ async fn save_patch_record(
 /// `--save-only`, apply it — under ONE apply lock, on the `client` the
 /// fetch used (a fresh client could re-hit the 401/403 its proxy fallback
 /// just recovered from).
-async fn save_and_apply_patch(args: &GetArgs, client: &ApiClient, patch: &PatchResponse) -> i32 {
+/// `policy_warnings` are the run's `(code, detail)` warnings already
+/// printed to stderr (today: `policy_bypassed`); the JSON envelope carries
+/// them like the search path's.
+async fn save_and_apply_patch(
+    args: &GetArgs,
+    client: &ApiClient,
+    patch: &PatchResponse,
+    policy_warnings: &[(String, String)],
+) -> i32 {
     // Same "errors only" gate as `run` — informational prints respect
     // `--silent`; errors and the JSON envelope do not.
     let quiet = args.common.json || args.common.silent;
@@ -3506,7 +3535,13 @@ async fn save_and_apply_patch(args: &GetArgs, client: &ApiClient, patch: &PatchR
     // A dry run previews against the manifest and writes nothing — not
     // even the lock (which would create `.socket/`).
     if args.common.dry_run {
-        return agent_dry_run(args, &[search_result_from_response(patch)], &[], &[]).await;
+        return agent_dry_run(
+            args,
+            &[search_result_from_response(patch)],
+            &[],
+            policy_warnings,
+        )
+        .await;
     }
     // See `download_and_apply_patches_with`: the RMW runs under the lock,
     // which also creates `.socket/` and prunes it again when nothing lands;
@@ -3639,6 +3674,7 @@ async fn save_and_apply_patch(args: &GetArgs, client: &ApiClient, patch: &PatchR
         if !warnings.is_empty() {
             result_json["warnings"] = serde_json::json!(warnings);
         }
+        fold_narrowing_into_result(&mut result_json, &[], policy_warnings);
         print_json(&result_json);
     }
 
@@ -3987,13 +4023,19 @@ mod tests {
     use socket_patch_core::api::types::{PatchFileResponse, VulnerabilityResponse};
     use std::collections::HashMap;
 
-    // --- detect_identifier_type -------------------------------------------
+    // --- identifier classification (the shared core target grammar) -------
+
+    /// `get`'s view of [`Target::parse`]: `None` for the bare-name fallback.
+    fn detect_identifier_type(identifier: &str) -> Option<TargetKind> {
+        let kind = Target::parse(identifier).kind();
+        (kind != TargetKind::Name).then_some(kind)
+    }
 
     #[test]
     fn detect_uuid_lowercase() {
         assert_eq!(
             detect_identifier_type("80630680-4da6-45f9-bba8-b888e0ffd58c"),
-            Some(IdentifierType::Uuid)
+            Some(TargetKind::Uuid)
         );
     }
 
@@ -4002,7 +4044,7 @@ mod tests {
         // Case-insensitive UUID regex per contract.
         assert_eq!(
             detect_identifier_type("80630680-4DA6-45F9-BBA8-B888E0FFD58C"),
-            Some(IdentifierType::Uuid)
+            Some(TargetKind::Uuid)
         );
     }
 
@@ -4010,7 +4052,7 @@ mod tests {
     fn detect_cve_uppercase() {
         assert_eq!(
             detect_identifier_type("CVE-2021-44906"),
-            Some(IdentifierType::Cve)
+            Some(TargetKind::Cve)
         );
     }
 
@@ -4019,7 +4061,7 @@ mod tests {
         // Load-bearing: CVE detection must be case-insensitive.
         assert_eq!(
             detect_identifier_type("cve-2021-44906"),
-            Some(IdentifierType::Cve)
+            Some(TargetKind::Cve)
         );
     }
 
@@ -4027,7 +4069,7 @@ mod tests {
     fn detect_ghsa_uppercase() {
         assert_eq!(
             detect_identifier_type("GHSA-abcd-1234-wxyz"),
-            Some(IdentifierType::Ghsa)
+            Some(TargetKind::Ghsa)
         );
     }
 
@@ -4036,7 +4078,7 @@ mod tests {
         // Load-bearing: GHSA detection must be case-insensitive.
         assert_eq!(
             detect_identifier_type("ghsa-abcd-1234-wxyz"),
-            Some(IdentifierType::Ghsa)
+            Some(TargetKind::Ghsa)
         );
     }
 
@@ -4044,7 +4086,7 @@ mod tests {
     fn detect_purl() {
         assert_eq!(
             detect_identifier_type("pkg:npm/foo@1.0"),
-            Some(IdentifierType::Purl)
+            Some(TargetKind::Purl)
         );
     }
 
@@ -5714,14 +5756,57 @@ mod tests {
     }
 
     #[test]
-    fn best_match_line_names_the_count_only_when_there_was_a_choice() {
+    fn matched_line_names_every_searched_package() {
         assert_eq!(
-            format_best_match("pkg:npm/%40s/a@1", 1),
-            "Best match: pkg:npm/@s/a@1"
+            format_matched_packages(&["pkg:npm/%40s/a@1".to_string()]),
+            "Matched: pkg:npm/@s/a@1"
         );
         assert_eq!(
-            format_best_match("pkg:npm/a@1", 3),
-            "Best match: pkg:npm/a@1 (of 3 matching packages)"
+            format_matched_packages(&["pkg:npm/a@1".to_string(), "pkg:npm/a@2".to_string()]),
+            "Matched 2 installed packages: pkg:npm/a@1, pkg:npm/a@2"
+        );
+    }
+
+    fn crawled(
+        purl: &str,
+        name: &str,
+        namespace: Option<&str>,
+    ) -> socket_patch_core::crawlers::CrawledPackage {
+        socket_patch_core::crawlers::CrawledPackage {
+            name: name.to_string(),
+            version: "1".to_string(),
+            namespace: namespace.map(str::to_string),
+            purl: purl.to_string(),
+            path: std::path::PathBuf::from("/fake"),
+        }
+    }
+
+    /// B11: a package name selects EXACT matches only — every installed
+    /// version — and never a prefix/substring sibling (`yaml` is not
+    /// `yaml-ast-parser`); near names are only suggested.
+    #[test]
+    fn package_name_selects_every_exact_version_and_no_near_names() {
+        let pkgs = vec![
+            crawled("pkg:npm/lodash@4.17.21", "lodash", None),
+            crawled("pkg:npm/lodash@4.17.4", "lodash", None),
+            crawled("pkg:npm/lodash@4.17.4", "lodash", None),
+            crawled("pkg:npm/lodash-es@4.17.21", "lodash-es", None),
+            crawled("pkg:npm/yaml-ast-parser@0.0.43", "yaml-ast-parser", None),
+        ];
+        assert_eq!(
+            installed_target_matches(&Target::parse("lodash"), &pkgs),
+            vec!["pkg:npm/lodash@4.17.21", "pkg:npm/lodash@4.17.4"]
+        );
+        assert!(installed_target_matches(&Target::parse("yaml"), &pkgs).is_empty());
+        assert_eq!(
+            format_did_you_mean("yaml", &pkgs).as_deref(),
+            Some("Did you mean: yaml-ast-parser?")
+        );
+        assert_eq!(format_did_you_mean("zzqxjvwq", &pkgs), None);
+        assert_eq!(
+            installed_target_matches(&Target::parse("pkg:npm/lodash"), &pkgs).len(),
+            2,
+            "a versionless purl selects every installed version"
         );
     }
 
@@ -5853,35 +5938,38 @@ mod tests {
     #[test]
     fn forced_identifier_shapes() {
         assert_eq!(
-            forced_identifier_error("lodash", IdentifierType::Uuid).as_deref(),
+            forced_identifier_error(&Target::with_kind("lodash", TargetKind::Uuid)).as_deref(),
             Some("\"lodash\" is not a valid patch UUID (expected xxxxxxxx-xxxx-xxxx-xxxx-xxxxxxxxxxxx)")
         );
         assert_eq!(
-            forced_identifier_error("lodash", IdentifierType::Cve).as_deref(),
+            forced_identifier_error(&Target::with_kind("lodash", TargetKind::Cve)).as_deref(),
             Some("\"lodash\" is not a valid CVE ID (expected CVE-YYYY-NNNN)")
         );
         assert_eq!(
-            forced_identifier_error("GHSA-1", IdentifierType::Ghsa).as_deref(),
+            forced_identifier_error(&Target::with_kind("GHSA-1", TargetKind::Ghsa)).as_deref(),
             Some("\"GHSA-1\" is not a valid GHSA ID (expected GHSA-xxxx-xxxx-xxxx)")
         );
         assert_eq!(
-            forced_identifier_error("a8b05a61-1e2f-4c5f-a65b-93e71deba1ae", IdentifierType::Uuid),
+            forced_identifier_error(&Target::with_kind(
+                "a8b05a61-1e2f-4c5f-a65b-93e71deba1ae",
+                TargetKind::Uuid
+            )),
             None
         );
         assert_eq!(
-            forced_identifier_error("cve-2021-44906", IdentifierType::Cve),
+            forced_identifier_error(&Target::with_kind("cve-2021-44906", TargetKind::Cve)),
             None
         );
         assert_eq!(
-            forced_identifier_error("GHSA-xvch-5gv4-984h", IdentifierType::Ghsa),
+            forced_identifier_error(&Target::with_kind("GHSA-xvch-5gv4-984h", TargetKind::Ghsa)),
             None
         );
         assert_eq!(
-            forced_identifier_error("anything", IdentifierType::Package),
+            forced_identifier_error(&Target::with_kind("anything", TargetKind::Name)),
             None
         );
         assert_eq!(
-            forced_identifier_error("anything", IdentifierType::Purl),
+            forced_identifier_error(&Target::with_kind("anything", TargetKind::Purl)),
             None
         );
     }
@@ -6151,15 +6239,15 @@ mod tests {
         assert_eq!(record, serde_json::json!({"purl": "pkg:npm/x@1.0.0"}));
     }
 
-    /// The `IdentifierType` Display labels are user-facing vocabulary (the
+    /// The `TargetKind` Display labels are user-facing vocabulary (the
     /// "No patches found for {type}: {id}" terminal) — pin all five.
     #[test]
     fn identifier_type_display_labels_are_stable() {
-        assert_eq!(IdentifierType::Uuid.to_string(), "UUID");
-        assert_eq!(IdentifierType::Cve.to_string(), "CVE");
-        assert_eq!(IdentifierType::Ghsa.to_string(), "GHSA");
-        assert_eq!(IdentifierType::Purl.to_string(), "PURL");
-        assert_eq!(IdentifierType::Package.to_string(), "package name");
+        assert_eq!(TargetKind::Uuid.to_string(), "UUID");
+        assert_eq!(TargetKind::Cve.to_string(), "CVE");
+        assert_eq!(TargetKind::Ghsa.to_string(), "GHSA");
+        assert_eq!(TargetKind::Purl.to_string(), "PURL");
+        assert_eq!(TargetKind::Name.to_string(), "package name");
     }
 
     /// JSON mode with multiple free patches for one purl: the

@@ -28,7 +28,7 @@ use socket_patch_core::vendor::{VendorServiceConfig, VendorSource};
 /// loudly instead of silently matching nothing.
 ///
 /// Without this, an unsupported name parsed fine and was then silently
-/// dropped by `partition_purls`/`crawl_all_ecosystems`, so the user got a
+/// dropped by `partition_purls`/`crawl_ecosystems`, so the user got a
 /// "0 patches" result with no hint that the ecosystem name was the cause.
 fn parse_supported_ecosystem(s: &str) -> Result<String, String> {
     if Ecosystem::all().iter().any(|e| e.cli_name() == s) {

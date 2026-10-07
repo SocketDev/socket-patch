@@ -16,7 +16,7 @@ use socket_patch_core::crawlers::GoCrawler;
 use socket_patch_core::crawlers::MavenCrawler;
 use socket_patch_core::crawlers::NuGetCrawler;
 
-/// Whether [`crawl_all_ecosystems`] actually visits this PURL's ecosystem
+/// Whether [`crawl_ecosystems`] actually visits this PURL's ecosystem
 /// in THIS process. An unrecognized `pkg:<type>/` (a newer CLI's ecosystem
 /// in a committed manifest) has no crawler at all — for those, absence
 /// from the crawl carries no information about whether the package is
@@ -767,22 +767,13 @@ where
     Box::pin(make())
 }
 
-/// Crawl all ecosystems and return all packages, per-ecosystem counts and
+/// Crawl the ecosystems and return all packages, per-ecosystem counts and
 /// the gem crawl's refused config-sourced `BUNDLE_PATH`
 /// (`BundleStoreDiscovery::skipped_config_path`, local mode only) —
 /// recovered from the crawl that hit it, so callers surfacing the advisory
 /// never probe the Bundler roots a second time.
-pub async fn crawl_all_ecosystems(
-    options: &CrawlerOptions,
-) -> (
-    Vec<CrawledPackage>,
-    HashMap<Ecosystem, usize>,
-    Option<String>,
-) {
-    crawl_ecosystems(options, None).await
-}
-
-/// [`crawl_all_ecosystems`] over only the ecosystems `only` names
+///
+/// Restricted to the ecosystems `only` names
 /// (`--ecosystems` spellings; `None` crawls every one). A crawler that is
 /// not selected never runs: it contributes no packages and no `counts`
 /// entry. Each crawler reports only its own ecosystem's purls, so the
@@ -800,7 +791,7 @@ pub async fn crawl_ecosystems(
     (packages, counts, skipped_config_path)
 }
 
-/// [`crawl_all_ecosystems`], also handing back the npm half of the crawl as
+/// [`crawl_ecosystems`], also handing back the npm half of the crawl as
 /// an [`NpmCrawlSnapshot`] (its packages are the leading `counts[Npm]`
 /// entries of the package list).
 #[cfg(test)]
@@ -1737,7 +1728,7 @@ mod tests {
     #[tokio::test]
     async fn crawl_all_includes_every_ecosystem_unconditionally() {
         let tmp = tempfile::tempdir().unwrap();
-        let (_, counts, _) = crawl_all_ecosystems(&local_options(tmp.path().to_path_buf())).await;
+        let (_, counts, _) = crawl_ecosystems(&local_options(tmp.path().to_path_buf()), None).await;
         for eco in [
             Ecosystem::Npm,
             Ecosystem::Pypi,
@@ -2020,7 +2011,7 @@ mod tests {
             global_prefix: Some(root.to_path_buf()),
         };
 
-        let (packages, counts, _) = crawl_all_ecosystems(&options).await;
+        let (packages, counts, _) = crawl_ecosystems(&options, None).await;
 
         let mut serial: Vec<CrawledPackage> = Vec::new();
         let mut serial_counts: HashMap<Ecosystem, usize> = HashMap::new();

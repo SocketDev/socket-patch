@@ -762,10 +762,10 @@ async fn human_global_package_search_empty_prefix_prints_no_global_packages() {
     );
 }
 
-/// Installed packages that fuzzy-match NOTHING: the `no_match` terminal —
+/// Installed packages that match NOTHING (exactly or nearly): the `no_match` terminal —
 /// json envelope + human message — exits 0 with zero API calls.
 #[tokio::test]
-async fn package_search_without_fuzzy_match_is_no_match_in_both_modes() {
+async fn package_search_without_a_match_is_no_match_in_both_modes() {
     // json flavor.
     {
         let server = MockServer::start().await;
@@ -811,7 +811,7 @@ async fn package_search_without_fuzzy_match_is_no_match_in_both_modes() {
     }
 }
 
-/// The package path's search-API error arm: a fuzzy-matched package whose
+/// The package path's search-API error arm: a matched package whose
 /// by-package search 500s must exit 1 via `report_fetch_failure`, after
 /// printing the "checking for available patches" progress line.
 #[tokio::test]
@@ -837,8 +837,8 @@ async fn human_package_search_api_error_reports_fetch_failure() {
         "a 500 from the package search must exit 1; stdout={stdout}\nstderr={stderr}"
     );
     assert!(
-        stderr.contains(&format!("Best match: pkg:npm/{NAME}@1.0.0\n")),
-        "the best-match line must print first; stderr={stderr}"
+        stderr.contains(&format!("Matched: pkg:npm/{NAME}@1.0.0\n")),
+        "the matched-packages line must print first; stderr={stderr}"
     );
     assert!(
         stderr.contains("Error:"),
