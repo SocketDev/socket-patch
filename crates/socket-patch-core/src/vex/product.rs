@@ -61,7 +61,7 @@ pub async fn detect_product(cwd: &Path) -> DetectResult {
     let mut result = DetectResult::default();
 
     // 1. git remote origin (highest priority — canonical when present).
-    if let Some(purl) = detect_git_remote(cwd).await {
+    if let Some(purl) = detect_git_remote(cwd, &mut result.warnings).await {
         result.purl = Some(purl);
         return result;
     }
@@ -417,7 +417,9 @@ fn scan_toml_section(content: &str, section: &str) -> Option<(String, String)> {
 /// through `commondir`), never past `GIT_CEILING_DIRECTORIES`, and never a
 /// repository at the home directory unless `start` is it — a dotfiles
 /// repo at `~` is not every project's product. A checkout owned by an
-/// untrusted user is not read (git refuses it too).
+/// untrusted user is not read (git refuses it too). Both of those skips
+/// push a note onto `warnings`, so the fallback to the manifest is never
+/// silent.
 ///
 /// Returns `None` when:
 /// * `start` is not inside such a checkout, or its config is unreadable,
@@ -426,14 +428,36 @@ fn scan_toml_section(content: &str, section: &str) -> Option<(String, String)> {
 ///   even unrecognized hosts fall through to the raw-URL case.)
 ///
 /// The package-manifest fallback then names the product.
-async fn detect_git_remote(start: &Path) -> Option<String> {
+async fn detect_git_remote(start: &Path, warnings: &mut Vec<String>) -> Option<String> {
     let start = start.to_path_buf();
-    let git_config_path = crate::utils::fs::run_blocking(move || {
-        crate::utils::repo_root::find_git_repo(&start)
-            .filter(|repo| repo.trusted)?
-            .config_path()
+    let (git_config_path, warning) = crate::utils::fs::run_blocking(move || {
+        use crate::utils::repo_root;
+        match repo_root::find_git_repo(&start) {
+            Some(repo) if repo.trusted => (repo.config_path(), None),
+            Some(repo) => (
+                None,
+                Some(format!(
+                    "git checkout {} is owned by another user; not reading its remote \
+                     origin for the top-level product (git refuses it too, see \
+                     safe.directory)",
+                    repo.root.display()
+                )),
+            ),
+            None => (
+                None,
+                repo_root::home_repo_not_entered(&start).map(|home| {
+                    format!(
+                        "not using the git repository at the home directory {} for the \
+                         top-level product; pass --product to name it",
+                        home.display()
+                    )
+                }),
+            ),
+        }
     })
-    .await?;
+    .await;
+    warnings.extend(warning);
+    let git_config_path = git_config_path?;
     let content = crate::utils::fs::read_regular_to_string(&git_config_path)
         .await
         .ok()?;
@@ -1254,7 +1278,7 @@ mod tests {
     #[tokio::test]
     async fn detect_git_remote_returns_none_when_no_repo_ancestor() {
         let dir = tempfile::tempdir().unwrap();
-        let r = detect_git_remote(dir.path()).await;
+        let r = detect_git_remote(dir.path(), &mut Vec::new()).await;
         assert!(r.is_none(), "unexpected checkout above {dir:?}: {r:?}");
     }
 
@@ -1264,7 +1288,7 @@ mod tests {
     async fn detect_git_remote_handles_non_existent_start_path() {
         let dir = tempfile::tempdir().unwrap();
         let nonexistent = dir.path().join("does/not/exist");
-        assert!(detect_git_remote(&nonexistent).await.is_none());
+        assert!(detect_git_remote(&nonexistent, &mut Vec::new()).await.is_none());
     }
 
     /// B22: inside a submodule (`.git` is a `gitdir:` FILE), the product is
@@ -1340,6 +1364,50 @@ mod tests {
         .unwrap();
         let r = detect_product(dir.path()).await;
         assert!(r.purl.is_none());
+    }
+
+    /// B22: a dotfiles repository at `$HOME` is not the product of a project
+    /// below it, and the fallback to the manifest says why.
+    #[tokio::test]
+    #[serial_test::serial]
+    async fn detect_below_a_home_repository_warns_and_uses_the_manifest() {
+        let tmp = tempfile::tempdir().unwrap();
+        let home = std::fs::canonicalize(tmp.path()).unwrap();
+        std::fs::create_dir_all(home.join(".git")).unwrap();
+        std::fs::write(
+            home.join(".git/config"),
+            "[remote \"origin\"]\n\turl = git@github.com:me/dotfiles.git\n",
+        )
+        .unwrap();
+        let project = home.join("app");
+        std::fs::create_dir_all(&project).unwrap();
+        std::fs::write(
+            project.join("package.json"),
+            r#"{"name":"app","version":"1.0.0"}"#,
+        )
+        .unwrap();
+
+        let var = if cfg!(windows) { "USERPROFILE" } else { "HOME" };
+        let prev = std::env::var_os(var);
+        std::env::set_var(var, &home);
+        let below = detect_product(&project).await;
+        let at_home = detect_product(&home).await;
+        match prev {
+            Some(v) => std::env::set_var(var, v),
+            None => std::env::remove_var(var),
+        }
+
+        assert_eq!(below.purl.as_deref(), Some("pkg:npm/app@1.0.0"));
+        assert_eq!(below.warnings.len(), 1, "{:?}", below.warnings);
+        assert!(
+            below.warnings[0].contains("home directory")
+                && below.warnings[0].contains(&home.display().to_string()),
+            "{:?}",
+            below.warnings
+        );
+        // Run from the home directory itself, the repository is the product.
+        assert_eq!(at_home.purl.as_deref(), Some("pkg:github/me/dotfiles"));
+        assert!(at_home.warnings.is_empty());
     }
 
     /// `package.json` where `version` is a number → None.

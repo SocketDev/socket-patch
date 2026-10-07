@@ -87,9 +87,16 @@ pub fn ancestor_search_dirs(start: &Path) -> Vec<PathBuf> {
     dirs
 }
 
-/// The home directory, canonicalized so it compares with canonical walks.
-fn home() -> Option<PathBuf> {
-    crate::utils::fs::home_dir().map(|p| std::fs::canonicalize(&p).unwrap_or(p))
+/// The home directory as git's own home rule reads it (`HOME` on Unix,
+/// `USERPROFILE` on Windows: an MSYS/Cygwin `HOME` does not move the
+/// stop), when set and rooted, canonicalized so it compares with canonical
+/// walks.
+pub(crate) fn home() -> Option<PathBuf> {
+    let var = if cfg!(windows) { "USERPROFILE" } else { "HOME" };
+    std::env::var_os(var)
+        .map(PathBuf::from)
+        .filter(|p| crate::utils::fs::is_usable_home(p))
+        .map(|p| std::fs::canonicalize(&p).unwrap_or(p))
 }
 
 /// [`search_dirs`] with the home directory and the ceilings injected;
@@ -123,6 +130,24 @@ fn search_dirs_with(
 /// The git checkout enclosing `start` (see the module rules), or `None`.
 pub fn find_git_repo(start: &Path) -> Option<GitRepo> {
     repo_at_end_of(search_dirs(start))
+}
+
+/// The checkout AT the home directory that a lookup from `start` stopped
+/// short of (the home rule), if there is one: for callers that should say
+/// why a repository the user may expect was not used.
+pub fn home_repo_not_entered(start: &Path) -> Option<PathBuf> {
+    home_repo_beyond(&search_dirs(start), home().as_deref())
+}
+
+/// The home directory when it holds `.git` and is the directory just above
+/// a `dirs` walk that ended without a checkout.
+fn home_repo_beyond(dirs: &[PathBuf], home: Option<&Path>) -> Option<PathBuf> {
+    let last = dirs.last()?;
+    if dot_git_metadata(last).is_some() {
+        return None;
+    }
+    let parent = last.parent()?;
+    (home == Some(parent) && dot_git_metadata(parent).is_some()).then(|| parent.to_path_buf())
 }
 
 /// The checkout at the last directory of a [`search_dirs`] walk, if the
@@ -227,6 +252,13 @@ mod tests {
             vec![project.clone(), home.join("code")]
         );
         assert_eq!(find(&home, Some(&home), &[]), Some(home.clone()));
+        // The skipped home checkout is reported, so callers can say why.
+        let walk = search_dirs_with(&project, Some(&home), &[], true);
+        assert_eq!(home_repo_beyond(&walk, Some(&home)), Some(home.clone()));
+        assert_eq!(home_repo_beyond(&walk, None), None);
+        fs::create_dir_all(project.join(".git")).unwrap();
+        let walk = search_dirs_with(&project, Some(&home), &[], true);
+        assert_eq!(home_repo_beyond(&walk, Some(&home)), None);
     }
 
     #[test]
