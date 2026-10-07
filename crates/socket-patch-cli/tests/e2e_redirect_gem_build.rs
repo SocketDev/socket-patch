@@ -457,6 +457,12 @@ enum Driver {
     /// environment, so bundler still loads `Gemfile.next` and the run must
     /// still redirect and attest nothing.
     ScanVexDualBootEnvGemfile,
+    /// [`Driver::ScanVex`] on a Gemfile that declares the gem inside a
+    /// `group :development do … end` block (#775): hosted mode wraps it in
+    /// a source block inside the group, but vendored mode cannot edit an
+    /// indented declaration, so a later takeover must refuse before it
+    /// un-hosts the gem.
+    ScanVexGroupBlock,
     /// [`Driver::ScanVex`] on a project whose committed `.bundle/config`
     /// sets `mirror.all` (#681): bundler fetches the patch-registry source
     /// from the mirror, which serves the upstream gem. The run must refuse,
@@ -502,6 +508,7 @@ impl Driver {
             Driver::ScanVexDualBootEnvGemfile => {
                 "scan --mode hosted (config Gemfile.next, env BUNDLE_GEMFILE=Gemfile)"
             }
+            Driver::ScanVexGroupBlock => "scan --mode hosted (gem in a group block)",
             Driver::ScanVexSemicolonJoinedDeclaration => {
                 "scan --mode hosted (two `;`-joined gem declarations)"
             }
@@ -777,6 +784,10 @@ async fn redirect_scanned_project(
              group :test do\n  gem \"{DEP}\"\nend\n",
             server.uri()
         ),
+        Driver::ScanVexGroupBlock => format!(
+            "source \"{}/upstream\"\n\ngroup :development do\n  gem \"{DEP}\"\nend\n",
+            server.uri()
+        ),
         Driver::ScanVexEvalGemfile => {
             std::fs::write(proj.join("Gemfile.common"), format!("gem \"{DEP}\"\n")).unwrap();
             format!(
@@ -1000,6 +1011,7 @@ async fn redirect_scanned_project(
         | Driver::ScanVexDualBootEnvGemfile
         | Driver::ScanVexDuplicateDeclaration
         | Driver::ScanVexEvalGemfile
+        | Driver::ScanVexGroupBlock
         | Driver::ScanVexCustomGitSource
         | Driver::ScanVexMultiLineDeclaration
         | Driver::ScanVexConditionalDeclaration
@@ -1171,7 +1183,9 @@ async fn redirect_scanned_project(
         );
     }
     match driver {
-        Driver::ScanVex | Driver::ScanVexTrailingSemicolonDeclaration => {
+        Driver::ScanVex
+        | Driver::ScanVexGroupBlock
+        | Driver::ScanVexTrailingSemicolonDeclaration => {
             assert_eq!(env["vex"]["statements"], 1, "vex block: {env}");
             assert_eq!(
                 env["vex"]["verified"], false,
@@ -1829,6 +1843,152 @@ async fn gem_hosted_gems_rb_pin_survives_a_refused_vendored_takeover() {
         return;
     };
     vendor_takeover_keeps_the_hosted_gems_rb_pin(&fx);
+}
+
+/// #775: hosted mode accepts a gem declared inside a `group … do` block,
+/// but vendored mode refuses an indented declaration. A takeover (`scan`
+/// or `get <uuid>` with `--mode vendored`, dry or wet) must raise that
+/// refusal BEFORE it restores the hosted pin, or the gem ends up unpatched
+/// in both modes.
+#[tokio::test(flavor = "multi_thread")]
+#[ignore = "host capstone: shells out to a real ruby/gem/bundler (>= 1.17; CHECKSUMS arm >= 2.6); \
+            the unpinned `test` job skips it, an e2e job with a pinned toolchain runs it via --ignored"]
+async fn gem_hosted_group_block_pin_survives_a_refused_vendored_takeover() {
+    let Some(fx) = redirect_scanned_project(
+        "group-block takeover",
+        Spelling::Gemfile,
+        true,
+        true,
+        None,
+        Driver::ScanVexGroupBlock,
+    )
+    .await
+    else {
+        return;
+    };
+    // The takeover's restore re-derives a CHECKSUMS pin's upstream sha256
+    // only for a rubygems.org remote (the shape of the #775 report). Spell
+    // the mock upstream as rubygems.org in the pair, and serve that
+    // registry from the mock (`SOCKET_RUBYGEMS_URL`, below). No bundler
+    // runs after this point.
+    let upstream = format!("{}/upstream", fx._server.uri());
+    for (file, from, to) in [
+        (
+            "Gemfile",
+            format!("\"{upstream}\""),
+            "\"https://rubygems.org\"",
+        ),
+        (
+            "Gemfile.lock",
+            format!("{upstream}/"),
+            "https://rubygems.org/",
+        ),
+    ] {
+        let path = fx.proj.join(file);
+        let text = std::fs::read_to_string(&path).unwrap();
+        assert!(
+            text.contains(&from),
+            "{file} names the mock upstream:\n{text}"
+        );
+        std::fs::write(&path, text.replace(&from, to)).unwrap();
+    }
+    for (command, selector) in [("get", Some(UUID)), ("scan", None)] {
+        for dry_run in [true, false] {
+            let views = view_requests(&fx).await;
+            vendor_takeover_keeps_the_hosted_group_pin(&fx, command, selector, dry_run);
+            // The refusal is known before the download phase: a wet scan
+            // never fetches the patch view (nor its files) of a gem it
+            // cannot vendor. `get <uuid>` fetches the view once to resolve
+            // its identifier, and that is all it fetches.
+            let fetched = view_requests(&fx).await - views;
+            let allowed = usize::from(command == "get");
+            assert!(
+                fetched <= allowed,
+                "{command} --mode vendored (dry_run={dry_run}) fetched the refused gem's \
+                 view {fetched} time(s)"
+            );
+        }
+    }
+}
+
+/// One refused takeover of the group-block fixture: the
+/// `gemfile_declaration_not_editable` refusal (exit 1 wet; a `would_refuse`
+/// preview row dry), no revert (nor a preview of one), and the hosted
+/// `Gemfile` / `Gemfile.lock` byte-untouched.
+fn vendor_takeover_keeps_the_hosted_group_pin(
+    fx: &RedirectFixture,
+    command: &str,
+    selector: Option<&str>,
+    dry_run: bool,
+) {
+    let before: Vec<Vec<u8>> = ["Gemfile", "Gemfile.lock"]
+        .iter()
+        .map(|f| std::fs::read(fx.proj.join(f)).unwrap())
+        .collect();
+    let proj = fx.proj.to_str().expect("utf8 tmp path");
+    let api = fx._server.uri();
+    let mut argv: Vec<&str> = vec![command];
+    argv.extend(selector);
+    argv.extend([
+        "--mode",
+        "vendored",
+        "--json",
+        "--yes",
+        "--cwd",
+        proj,
+        "--api-url",
+        &api,
+        "--org",
+        ORG,
+        "--api-token",
+        "fake",
+        "--patch-server-url",
+        &api,
+    ]);
+    if dry_run {
+        argv.push("--dry-run");
+    }
+    let label = format!("{command} --mode vendored (dry_run={dry_run})");
+    let upstream = format!("{api}/upstream");
+    let (code, stdout, stderr) =
+        run_socket_env(&fx.proj, &argv, &[("SOCKET_RUBYGEMS_URL", &upstream)]);
+    let env: serde_json::Value = serde_json::from_str(&stdout)
+        .unwrap_or_else(|e| panic!("{label}: not JSON: {e}\nstdout:\n{stdout}\nstderr:\n{stderr}"));
+    if dry_run {
+        // The ledger-classification preview: the refusal is a
+        // `would_refuse` row (which never flips the exit code), never
+        // `would_vendor`.
+        assert_eq!(code, 0, "{label}: {env}");
+        let row = &env["vendor"]["patches"][0];
+        assert_eq!(row["action"], "would_refuse", "{label}: {env}");
+        assert_eq!(
+            row["errorCode"], "gemfile_declaration_not_editable",
+            "{label}: {env}"
+        );
+    } else {
+        assert_eq!(code, 1, "{label} must refuse: {env}\nstderr:\n{stderr}");
+        assert!(
+            stdout.contains("gemfile_declaration_not_editable"),
+            "{label}: the declaration refusal names its cause: {env}"
+        );
+    }
+    for code in [
+        "vendor_takeover_reverted_redirect",
+        "vendor_would_revert_redirect",
+        "would_vendor",
+    ] {
+        assert!(
+            !stdout.contains(code),
+            "{label}: the hosted pin must not be (previewed as) reverted ({code}):\n{stdout}"
+        );
+    }
+    for (file, before) in ["Gemfile", "Gemfile.lock"].iter().zip(before) {
+        assert_eq!(
+            std::fs::read(fx.proj.join(file)).unwrap(),
+            before,
+            "{label}: {file} keeps its hosted wiring"
+        );
+    }
 }
 
 /// A hosted→vendored takeover of a `gems.rb` project: vendored mode cannot

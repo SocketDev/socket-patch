@@ -13,8 +13,9 @@
 //!    for a fallback that only fires when the redirect shape drifts.
 //!
 //! All fetch sizes are capped and every request carries an explicit
-//! timeout: a hung self-update is strictly worse than a hung scan, so this
-//! module does not inherit the API client's no-timeout posture.
+//! whole-request deadline ([`UpdateTimeouts`]), unlike the API client's
+//! connect + per-read bounds (`api::retry::ApiTimeouts`): a hung
+//! self-update is strictly worse than a hung scan.
 
 use std::time::Duration;
 

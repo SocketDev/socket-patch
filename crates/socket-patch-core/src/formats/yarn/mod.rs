@@ -9,6 +9,9 @@
 //! rewriters and lockfile discovery cannot disagree on it.
 
 pub(crate) mod berry_entry;
+pub mod berry_gates;
+
+use super::text::strip_bom;
 
 /// Which grammar a `yarn.lock` head declares.
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
@@ -52,10 +55,6 @@ pub fn is_berry_lock(content: &str) -> bool {
     strip_bom(content)
         .lines()
         .any(|line| line.starts_with("__metadata:"))
-}
-
-fn strip_bom(text: &str) -> &str {
-    text.strip_prefix('\u{feff}').unwrap_or(text)
 }
 
 #[cfg(test)]

@@ -394,7 +394,7 @@ pub(crate) async fn detect_npm_lock_flavor_in(
         let lock = project.read_text("yarn.lock").ok();
         crate::crawlers::pkg_managers::effective_yarn_linker(lock.as_deref(), || {
             let node_linker = |rc: &str| {
-                crate::vendor::yarn_berry_lock::yarnrc_scalar(rc, "nodeLinker")
+                crate::formats::yarn::berry_gates::yarnrc_scalar(rc, "nodeLinker")
                     .filter(|v| !v.is_empty())
                     .map(str::to_string)
             };

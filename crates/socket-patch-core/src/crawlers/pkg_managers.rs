@@ -201,7 +201,7 @@ impl YarnEnv {
 
 /// The `nodeLinker` the rc file text `rc` sets, if any.
 fn rc_node_linker(rc: &str) -> Option<String> {
-    crate::vendor::yarn_berry_lock::yarnrc_scalar(rc, "nodeLinker")
+    crate::formats::yarn::berry_gates::yarnrc_scalar(rc, "nodeLinker")
         .filter(|v| !v.is_empty())
         .map(str::to_string)
 }
