@@ -2088,6 +2088,74 @@ fn bun_lock_pin_restores_to_the_registry_tuple() {
     assert!(!tmp.path().join(".socket").exists(), "no .socket/ residue");
 }
 
+/// #764: Bun's hoisted linker keeps an installed copy whose lock entry
+/// returns to the registry record (a plain `bun install` reports "no
+/// changes"), so a rollback over a hoisted `node_modules/left-pad` warns
+/// `redirect_bun_reinstall_required` and names `bun install --force`, in
+/// the JSON `warnings[]` and on stderr. An isolated install (the copy a
+/// link into `node_modules/.bun/`) relinks, so it stays silent.
+#[test]
+fn bun_lock_rollback_warns_that_a_hoisted_copy_is_kept() {
+    let registry = NpmRegistry::start(&[("left-pad", "1.2.3")]);
+    let project = |installed: bool| {
+        let tmp = tempfile::tempdir().expect("tempdir");
+        std::fs::write(
+            tmp.path().join("bun.lock"),
+            bun_lock(&bun_redirected_line()),
+        )
+        .unwrap();
+        if installed {
+            let pkg = tmp.path().join("node_modules/left-pad");
+            std::fs::create_dir_all(&pkg).unwrap();
+            std::fs::write(pkg.join("index.js"), "// PATCHED\n").unwrap();
+        }
+        tmp
+    };
+    let has_code = |v: &serde_json::Value| {
+        v["warnings"].as_array().is_some_and(|ws| {
+            ws.iter().any(|w| {
+                w["code"] == "redirect_bun_reinstall_required"
+                    && w["detail"].as_str().is_some_and(|d| {
+                        d.contains("left-pad@1.2.3") && d.contains("`bun install --force`")
+                    })
+            })
+        })
+    };
+
+    let hoisted = project(true);
+    let (code, stdout, stderr) = run_hosted(
+        hoisted.path(),
+        &["rollback", "--json", "--yes"],
+        Some(&registry),
+    );
+    assert_eq!(code, 0, "stdout=\n{stdout}\nstderr=\n{stderr}");
+    assert!(
+        has_code(&parse_envelope(&stdout, &stderr)),
+        "stdout=\n{stdout}"
+    );
+
+    let hoisted = project(true);
+    let (code, stdout, stderr) =
+        run_hosted(hoisted.path(), &["rollback", "--yes"], Some(&registry));
+    assert_eq!(code, 0, "stdout=\n{stdout}\nstderr=\n{stderr}");
+    assert!(
+        stderr.contains("`bun install --force`"),
+        "the human run names the forcing install; stderr=\n{stderr}"
+    );
+
+    let fresh = project(false);
+    let (code, stdout, stderr) = run_hosted(
+        fresh.path(),
+        &["rollback", "--json", "--yes"],
+        Some(&registry),
+    );
+    assert_eq!(code, 0, "stdout=\n{stdout}\nstderr=\n{stderr}");
+    assert!(
+        !has_code(&parse_envelope(&stdout, &stderr)),
+        "nothing installed, nothing kept; stdout=\n{stdout}"
+    );
+}
+
 /// Dry-run twin of `bun_lock_pin_restores_to_the_registry_tuple`: "Would
 /// restore …", bun.lock byte-identical afterwards.
 #[test]

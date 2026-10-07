@@ -162,7 +162,11 @@ The backticked slug in each row is the value `-e`/`--ecosystems` accepts (e.g.
   rolled back (v5.0 keeps no hosted ledger, and a rebuilt binary record is not byte-exact
   for every lock): rollback and remove refuse it with the `git checkout -- bun.lockb`
   remedy, while the hosted → vendored takeover rebuilds its npm registry record natively
-  and vendors over it.
+  and vendors over it. Bun's hoisted linker keeps an installed copy whose lock entry
+  returns to the registry record (a plain `bun install` reports no changes), so after
+  `rollback`, `remove` or `vendor --revert` the patched bytes stay in `node_modules` until
+  `bun install --force` (or deleting `node_modules`); `redirect_bun_reinstall_required` /
+  `vendor_bun_reinstall_required` say so whenever such a copy may be installed.
   Bun verifies the sha512 of URL and local-tarball tuples only from 1.3.10 (registry
   tuples from 1.2.0), so on 1.1.39–1.3.9 a hosted or vendored rewrite removes digest
   enforcement for the patched package. Every boundary here is measured against real

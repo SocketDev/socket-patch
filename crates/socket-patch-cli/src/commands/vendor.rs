@@ -442,10 +442,7 @@ async fn unwired_check_failure(
 /// entry (fail-safe): ecosystems other than npm, cargo and pypi (whose
 /// probe covers the requirements flavor only) have no in-use probe yet,
 /// and a missing/unreadable lockfile proves nothing.
-pub(crate) async fn dispatch_in_use_one(
-    entry: &VendorEntry,
-    project_root: &Path,
-) -> Option<bool> {
+pub(crate) async fn dispatch_in_use_one(entry: &VendorEntry, project_root: &Path) -> Option<bool> {
     match entry.ecosystem.as_str() {
         "npm" => vendor::npm_flavor::vendored_entry_in_use(entry, project_root).await,
         // Cargo probes the lock entry's shape: detached + `[patch]` pointing
@@ -1237,8 +1234,7 @@ async fn run_check(args: &VendorArgs) -> i32 {
     // know (the ledger was ignored or dropped from the commit along with the
     // manifest) leaves every fresh install failing; the manifest keys above
     // cannot see it, so the references are read from the wiring itself.
-    let references =
-        crate::commands::vendored_backend::repair::scan_vendor_references(root).await;
+    let references = crate::commands::vendored_backend::repair::scan_vendor_references(root).await;
     for (eco, uuid, rel) in references {
         let ledgered = state
             .entries
@@ -3696,6 +3692,16 @@ fn flavor_install_command(flavor: &str) -> Option<&'static str> {
     }
 }
 
+/// The install that resyncs an installed tree after a revert: Bun's
+/// hoisted linker keeps the vendored copy through a plain `bun install`
+/// (#764), so Bun's needs `--force`.
+fn flavor_revert_install_command(flavor: &str) -> Option<&'static str> {
+    match flavor {
+        "bun" => Some("bun install --force"),
+        other => flavor_install_command(other),
+    }
+}
+
 /// Drop installed npm copies that resolve into `.socket/vendor/` (or no
 /// longer resolve at all): vlt links a vendored `file:` dependency straight
 /// to its committed dir, which is this tool's own artifact and never a
@@ -4028,7 +4034,7 @@ async fn run_revert(args: &VendorArgs, env: &mut Envelope) -> i32 {
         if summary.reverted > 0 && !common.dry_run {
             let mut installs: Vec<&str> = reverted_flavors
                 .iter()
-                .filter_map(|f| flavor_install_command(f))
+                .filter_map(|f| flavor_revert_install_command(f))
                 .collect();
             installs.sort_unstable();
             installs.dedup();
@@ -6627,6 +6633,16 @@ mod ui_format_tests {
             "Error: Could not read the vendor ledger (.socket/vendor/state.json): \
              Permission denied (os error 13)"
         );
+    }
+
+    #[test]
+    fn revert_install_hint_forces_bun() {
+        assert_eq!(
+            flavor_revert_install_command("bun"),
+            Some("bun install --force")
+        );
+        assert_eq!(flavor_revert_install_command("pnpm"), Some("pnpm install"));
+        assert_eq!(flavor_revert_install_command("cargo"), None);
     }
 
     #[test]

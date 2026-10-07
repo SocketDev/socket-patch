@@ -841,8 +841,90 @@ pub(crate) async fn revert_bun(
 
 /// [`revert_bun`] with full [`RevertOpts`]: `keep_artifact` skips the
 /// artifact deletion — and the refusals that exist only to protect it —
-/// while the wiring restore runs unchanged.
+/// while the wiring restore runs unchanged. A wet revert that restored the
+/// wiring adds [`REINSTALL_REQUIRED`] when the installed tree may keep the
+/// vendored copy.
 pub(crate) async fn revert_bun_opts(
+    entry: &VendorEntry,
+    project_root: &Path,
+    opts: RevertOpts,
+) -> RevertOutcome {
+    let mut outcome = revert_bun_wiring(entry, project_root, opts).await;
+    if outcome.success && !outcome.kept_artifact && !opts.dry_run {
+        let stale = stale_hoisted_copies(project_root, [entry.base_purl.as_str()]).await;
+        if !stale.is_empty() {
+            outcome.warnings.push(VendorWarning::new(
+                REINSTALL_REQUIRED,
+                reinstall_advisory(&stale),
+            ));
+        }
+    }
+    outcome
+}
+
+/// A revert (or hosted unwind) left an installed copy Bun may keep: its
+/// hoisted linker does not re-extract a package whose lock entry moves
+/// from a local or URL tarball back to the registry record of the same
+/// `name@version`, so a plain `bun install` (`--frozen-lockfile` too)
+/// reports "no changes" and the patched bytes stay installed (#764,
+/// measured on 1.1.45, 1.2.23, 1.3.9, 1.3.14 and 1.4.2). The isolated
+/// linker relinks to the registry entry, and `bun install --force`
+/// reinstalls on both without touching the lock.
+pub const REINSTALL_REQUIRED: &str = "vendor_bun_reinstall_required";
+
+/// The `name@version` of each npm purl in `purls` whose installed copy Bun
+/// may keep after its lock entry returns to the registry (see
+/// [`REINSTALL_REQUIRED`]): `node_modules/<name>` is a real directory (an
+/// isolated install links it into `node_modules/.bun/`), or the tree has
+/// no `node_modules/.bun/` at all (a hoisted install, where a copy may sit
+/// nested under another package). A project with no `node_modules/` has
+/// nothing installed to keep.
+pub async fn stale_hoisted_copies<'a>(
+    project_root: &Path,
+    purls: impl IntoIterator<Item = &'a str>,
+) -> Vec<String> {
+    let modules = project_root.join("node_modules");
+    if !tokio::fs::metadata(&modules)
+        .await
+        .is_ok_and(|m| m.is_dir())
+    {
+        return Vec::new();
+    }
+    let hoisted_tree = tokio::fs::symlink_metadata(modules.join(".bun"))
+        .await
+        .is_err();
+    let mut stale = Vec::new();
+    for purl in purls {
+        let Some((name, version)) = super::npm_common::parse_npm_purl(purl) else {
+            continue;
+        };
+        let copy = tokio::fs::symlink_metadata(modules.join(&name)).await;
+        let kept = match copy {
+            Ok(m) => m.is_dir(),
+            Err(_) => hoisted_tree,
+        };
+        let label = format!("{name}@{version}");
+        if kept && !stale.contains(&label) {
+            stale.push(label);
+        }
+    }
+    stale
+}
+
+/// The [`REINSTALL_REQUIRED`] detail for the `name@version` labels in
+/// `stale` (shared with the hosted unwind's run-level advisory).
+pub fn reinstall_advisory(stale: &[String]) -> String {
+    format!(
+        "Bun's hoisted linker keeps the installed copy of {} when its lock entry returns to \
+         the registry: a plain `bun install` reports no changes and node_modules may still \
+         hold the patched bytes; run `bun install --force` (or delete node_modules and run \
+         `bun install`) to reinstall the upstream copy",
+        stale.join(", ")
+    )
+}
+
+/// The wiring restore behind [`revert_bun_opts`].
+async fn revert_bun_wiring(
     entry: &VendorEntry,
     project_root: &Path,
     opts: RevertOpts,
@@ -1946,7 +2028,7 @@ mod tests {
         for entry in [&entry_b, &entry_a] {
             let outcome = revert_bun(entry, fx.root(), false).await;
             assert!(outcome.success, "{:?}", outcome.error);
-            assert!(outcome.warnings.is_empty(), "{:?}", outcome.warnings);
+            assert!(lock_warnings(&outcome).is_empty(), "{:?}", outcome.warnings);
         }
         assert_eq!(fx.read_lock().await, BN4C_BEFORE_LOCK, "lock byte-restored");
         assert!(!fx
@@ -2028,7 +2110,7 @@ mod tests {
 
         let outcome = revert_bun(&entry, fx.root(), false).await;
         assert!(outcome.success, "{:?}", outcome.error);
-        assert!(outcome.warnings.is_empty(), "{:?}", outcome.warnings);
+        assert!(lock_warnings(&outcome).is_empty(), "{:?}", outcome.warnings);
         assert_eq!(
             fx.read_lock().await,
             crlf_before,
@@ -2502,7 +2584,7 @@ mod tests {
                 );
                 let outcome = revert_bun(&entry, fx.root(), false).await;
                 assert!(outcome.success, "{:?}", outcome.error);
-                assert!(outcome.warnings.is_empty(), "{:?}", outcome.warnings);
+                assert!(lock_warnings(&outcome).is_empty(), "{:?}", outcome.warnings);
                 assert_eq!(
                     fx.read_lock().await,
                     lock,
@@ -2813,7 +2895,7 @@ mod tests {
         let entry = entry.expect("success carries a ledger entry");
         let outcome = revert_bun(&entry, fx.root(), false).await;
         assert!(outcome.success, "{:?}", outcome.error);
-        assert!(outcome.warnings.is_empty(), "{:?}", outcome.warnings);
+        assert!(lock_warnings(&outcome).is_empty(), "{:?}", outcome.warnings);
         assert_eq!(fx.read_lock().await, lock, "lock byte-restored");
     }
 
@@ -2982,7 +3064,7 @@ mod tests {
         let outcome = revert_bun(&entry, fx.root(), false).await;
         assert!(outcome.success, "{:?}", outcome.error);
         assert!(
-            outcome.warnings.is_empty(),
+            lock_warnings(&outcome).is_empty(),
             "an unmoved entry is ours, not drift: {:?}",
             outcome.warnings
         );
@@ -2995,6 +3077,17 @@ mod tests {
             .root()
             .join(format!(".socket/vendor/npm/{UUID}"))
             .exists());
+    }
+
+    /// A revert's lock-wiring advisories: every fixture installs a hoisted
+    /// `node_modules/left-pad`, whose [`REINSTALL_REQUIRED`] the tests below
+    /// that are about the lock leave out.
+    fn lock_warnings(outcome: &RevertOutcome) -> Vec<&VendorWarning> {
+        outcome
+            .warnings
+            .iter()
+            .filter(|w| w.code != REINSTALL_REQUIRED)
+            .collect()
     }
 
     #[tokio::test]
@@ -3032,13 +3125,104 @@ mod tests {
 
         let outcome = revert_bun(&entry, fx.root(), false).await;
         assert!(outcome.success, "{:?}", outcome.error);
-        assert!(outcome.warnings.is_empty(), "{:?}", outcome.warnings);
+        // The hoisted install's copy is the only advisory (#764).
+        let codes: Vec<&str> = outcome.warnings.iter().map(|w| w.code).collect();
+        assert_eq!(codes, [REINSTALL_REQUIRED], "{:?}", outcome.warnings);
         assert_eq!(fx.read_lock().await, BN3_BEFORE_LOCK, "lock byte-restored");
         assert!(!tgz_path.exists());
         assert!(!fx
             .root()
             .join(format!(".socket/vendor/npm/{UUID}"))
             .exists());
+    }
+
+    /// #764: Bun's hoisted linker keeps `node_modules/<name>` when the lock
+    /// entry returns from the vendored tarball to the registry record, so a
+    /// plain `bun install` leaves the vendored bytes installed. The revert
+    /// says so and names the install that does reinstall (measured on Bun
+    /// 1.2.23, 1.3.14 and 1.4.2: `bun install --force` reinstalls and keeps
+    /// the lock).
+    #[tokio::test]
+    async fn revert_warns_that_bun_keeps_a_hoisted_copy() {
+        let fx = fixture_with(BN3_BEFORE_LOCK, "node_modules/left-pad").await;
+        let (_, entry, _) = expect_done(fx.vendor(false).await);
+        let entry = entry.unwrap();
+
+        let dry = revert_bun(&entry, fx.root(), true).await;
+        assert!(
+            dry.warnings.is_empty(),
+            "a preview changes nothing installed"
+        );
+
+        let outcome = revert_bun(&entry, fx.root(), false).await;
+        assert!(outcome.success, "{:?}", outcome.error);
+        let w = outcome
+            .warnings
+            .iter()
+            .find(|w| w.code == REINSTALL_REQUIRED)
+            .expect("the hoisted copy is reported");
+        assert!(w.detail.contains("left-pad@1.3.0"), "{}", w.detail);
+        assert!(w.detail.contains("`bun install --force`"), "{}", w.detail);
+    }
+
+    /// The isolated linker relinks `node_modules/<name>` to the restored
+    /// registry entry, and a project with nothing installed has nothing to
+    /// keep: neither warns.
+    #[cfg(unix)]
+    #[tokio::test]
+    async fn revert_skips_the_advisory_without_a_hoisted_copy() {
+        for isolated in [true, false] {
+            let fx = fixture_with(BN3_BEFORE_LOCK, "node_modules/left-pad").await;
+            let (_, entry, _) = expect_done(fx.vendor(false).await);
+            let entry = entry.unwrap();
+            let modules = fx.root().join("node_modules");
+            if isolated {
+                let store = modules.join(".bun/left-pad@1.3.0/node_modules/left-pad");
+                tokio::fs::create_dir_all(store.parent().unwrap())
+                    .await
+                    .unwrap();
+                tokio::fs::rename(modules.join("left-pad"), &store)
+                    .await
+                    .unwrap();
+                std::os::unix::fs::symlink(&store, modules.join("left-pad")).unwrap();
+            } else {
+                tokio::fs::remove_dir_all(&modules).await.unwrap();
+            }
+
+            let outcome = revert_bun(&entry, fx.root(), false).await;
+            assert!(outcome.success, "{:?}", outcome.error);
+            assert!(
+                outcome
+                    .warnings
+                    .iter()
+                    .all(|w| w.code != REINSTALL_REQUIRED),
+                "isolated={isolated}: {:?}",
+                outcome.warnings
+            );
+        }
+    }
+
+    /// A hoisted tree (no `node_modules/.bun/`) may hold the copy nested
+    /// under another package; only an isolated tree proves it absent.
+    #[tokio::test]
+    async fn stale_hoisted_copies_reads_the_linker_layout() {
+        let tmp = tempfile::tempdir().unwrap();
+        let root = tmp.path();
+        let purls = ["pkg:npm/@scope/a@1.0.0", "pkg:npm/b@2.0.0"];
+        assert!(stale_hoisted_copies(root, purls).await.is_empty());
+
+        tokio::fs::create_dir_all(root.join("node_modules/@scope/a"))
+            .await
+            .unwrap();
+        assert_eq!(
+            stale_hoisted_copies(root, purls).await,
+            ["@scope/a@1.0.0", "b@2.0.0"]
+        );
+
+        tokio::fs::create_dir_all(root.join("node_modules/.bun"))
+            .await
+            .unwrap();
+        assert_eq!(stale_hoisted_copies(root, purls).await, ["@scope/a@1.0.0"]);
     }
 
     /// bun.lock is a user-owned file we merely edit: the vendor rewrite and
@@ -3188,7 +3372,7 @@ mod tests {
         let outcome = revert_bun(&entry, fx.root(), false).await;
         assert!(outcome.success, "{:?}", outcome.error);
         assert!(
-            outcome.warnings.is_empty(),
+            lock_warnings(&outcome).is_empty(),
             "no drift left after the undo: {:?}",
             outcome.warnings
         );
@@ -3305,7 +3489,7 @@ mod tests {
                  deletion guard must not fire: {:?}",
                 outcome.error
             );
-            assert!(outcome.warnings.is_empty(), "{:?}", outcome.warnings);
+            assert!(lock_warnings(&outcome).is_empty(), "{:?}", outcome.warnings);
             assert!(!outcome.kept_artifact, "preserve-state is not a drift-keep");
             assert!(tgz_path.exists(), "artifact kept");
             assert_eq!(
@@ -3468,7 +3652,7 @@ mod tests {
         )
         .await;
         assert!(outcome.success, "{:?}", outcome.error);
-        assert!(outcome.warnings.is_empty(), "{:?}", outcome.warnings);
+        assert!(lock_warnings(&outcome).is_empty(), "{:?}", outcome.warnings);
         assert!(!outcome.kept_artifact, "preserve-state is not a drift-keep");
         assert_eq!(fx.read_lock().await, BN3_BEFORE_LOCK, "wiring restored");
         assert!(tgz_path.exists(), "artifact deliberately kept");
@@ -3476,7 +3660,7 @@ mod tests {
         let outcome = revert_bun(&entry, fx.root(), false).await;
         assert!(outcome.success, "{:?}", outcome.error);
         assert!(
-            outcome.warnings.is_empty(),
+            lock_warnings(&outcome).is_empty(),
             "converged records are silent: {:?}",
             outcome.warnings
         );
@@ -3671,7 +3855,7 @@ mod tests {
         let outcome = revert_bun(&entry, fx.root(), false).await;
         assert!(outcome.success, "{:?}", outcome.error);
         assert!(
-            outcome.warnings.is_empty(),
+            lock_warnings(&outcome).is_empty(),
             "already-converged is silent: {:?}",
             outcome.warnings
         );
@@ -3762,7 +3946,7 @@ mod tests {
         // The healed lock reverts through the ORIGINAL entry byte-exactly.
         let outcome = revert_bun(&entry, fx.root(), false).await;
         assert!(outcome.success, "{:?}", outcome.error);
-        assert!(outcome.warnings.is_empty(), "{:?}", outcome.warnings);
+        assert!(lock_warnings(&outcome).is_empty(), "{:?}", outcome.warnings);
         assert_eq!(fx.read_lock().await, BN3_BEFORE_LOCK);
         assert!(!fx
             .root()
@@ -3786,7 +3970,7 @@ mod tests {
         let outcome = revert_bun(&entry, fx.root(), false).await;
         assert!(outcome.success, "{:?}", outcome.error);
         assert!(
-            outcome.warnings.is_empty(),
+            lock_warnings(&outcome).is_empty(),
             "a digest-less spelling of our own tuple is not drift: {:?}",
             outcome.warnings
         );
@@ -3828,7 +4012,7 @@ mod tests {
 
         let outcome = revert_bun(&entry, fx.root(), false).await;
         assert!(
-            outcome.success && outcome.warnings.is_empty(),
+            outcome.success && lock_warnings(&outcome).is_empty(),
             "{outcome:?}"
         );
         assert_eq!(fx.read_lock().await, crlf_before);
@@ -3866,7 +4050,7 @@ mod tests {
 
             let outcome = revert_bun(&entry, fx.root(), false).await;
             assert!(
-                outcome.success && outcome.warnings.is_empty(),
+                outcome.success && lock_warnings(&outcome).is_empty(),
                 "v{version}: {outcome:?}"
             );
             let original_line = entry.wiring[0]
@@ -4200,7 +4384,7 @@ mod tests {
         let outcome = revert_bun(&entry, fx.root(), false).await;
         assert!(outcome.success, "{:?}", outcome.error);
         assert!(
-            outcome.warnings.is_empty(),
+            lock_warnings(&outcome).is_empty(),
             "the converged re-run is silent: {:?}",
             outcome.warnings
         );
