@@ -1,6 +1,6 @@
 [agent] Progress ledger for the scheduled pnpm bug-hunt routine (label pm:pnpm).
 
-Last updated: 2026-10-07 (run 28), main `9c43dfc`, latest release 4.0.0.
+Last updated: 2026-10-07 (run 29), main `1c6c509`, latest release 4.0.0.
 
 Method: real pnpm installs. Hosted, vendored and global agent mode run against a local Python mock of the patch API (batch, by-package, view with inline blobs, `patches/blob/<hash>`, package grant, hosted tarball, `/registry/<name>/<ver>` mirror; `ajv-keywords@3.5.2` serves as the peer-dependency package). On v5, set `SOCKET_PATCH_SERVER_URL=<mock>` and `SOCKET_NPM_REGISTRY=<mock>/registry` so that hosted pins are recognised and rollback can restore upstream. The oracle is a marker prepended to `index.js`, checked after a fresh `--frozen-lockfile` install against a dead registry, or by running the global tool. The repo's pinned matrix (`.github/workflows/pnpm-compatibility.yml`) already covers plain hosted and vendored installs on pnpm 1–12. This ledger tracks what it doesn't.
 
@@ -279,6 +279,17 @@ Run 28 additions (main `9c43dfc`, Linux; newest pnpm releases 10.34.6 / 11.28.5 
 | 11.28.5 | pass | pass / pass | untested | untested | untested | untested | untested |
 | 12.10.1 | pass | pass / pass | pass / pass | pass | pass (`retained`, lock byte-identical) | blocked (permission classifier) | blocked (permission classifier) |
 
+Run 29 additions (main `1c6c509`, Linux):
+
+| pnpm | Standalone project nested under an unrelated `pnpm-workspace.yaml` (not in its globs): hosted / vendored | Member with its own lock (`sharedWorkspaceLockfile: false`), hosted: no root trust / root trust + fresh frozen | #853 takeover refusal keeps hosted pin (CRLF / catalog / ws override) | `link:` copy beside a registry copy (hosted, `vex`) |
+| --- | --- | --- | --- | --- |
+| 9.15.9 | n/a (installs the root workspace) | untested | — / pass / — | untested |
+| 10.34.6 | n/a (installs the root workspace) | untested | untested | untested |
+| 11.28.5 | fail #1006 / untested | pass (refuses) / pass | — / — / pass | untested |
+| 12.10.1 | fail #1006 / fail #1006 | pass (refuses) / pass | pass / — / — | pass (`vex` omits, not_applied) |
+
+#1006 is a regression: first bad commit `8e8daf0` (#888); release 4.0.0 passes. #853's `--dry-run` preview remainder still reproduces (9.15.9 / 11.28.5).
+
 Run 20 additions (main `045d7ec`, Linux):
 
 | pnpm (lock) | Vendored parent + vendored dep (`debug`→`ms`): `remove <parent>` / takeover → hosted / `rollback` | `remove <child>` (control) | Hosted parent + dep: remove parent / rollback | Mixed-case names (`Base64`, `JSONStream`): hosted / agent / vendored | User parent-selector / range-selector override (vendored) | Agent `symlink=false` / `hoist=false` | `list -g` |
@@ -330,8 +341,9 @@ Global mode (`-g`, v5 main `2463257`):
 8c. #880 / #881 follow-ups: a member of a workspace whose root uses `catalogs`, and the pnpm 7/8 dialect.
 8b. #853 follow-ups: the takeover over a peer-suffixed snapshot key and over a pnpm ≤6 legacy lock, and `vendor --dry-run` (manifest-driven) parity.
 8d. v5 rollout and policy over pnpm locks: `--max-new-patches 1` convergence over 3 hosted pins (9.15.9 / 12.10.1, then a two-document lock on 12.x), and socket.yml `includePaths` in a workspace with `sharedWorkspaceLockfile: false`. Blocked by the permission classifier in run 28.
-8e. #935 follow-up: a `link:` copy beside a registry copy (blocked in run 28), then `git+` / `github:` copies.
-9. Re-verify the open set when fixes land: #435, #466, #492, #556, #633, #713, #714, #734, #778, #830, #831 (PR #837, pnpm gitignore matrix), #853, #854, #880, #881, #902, #903, #904 (fix PR #909), #919, #935, #956 and #957.
+8e. #935 follow-up: `git+` / `github:` copies (`link:` copy done in run 29: pass).
+8f. #1006 follow-ups: a settings-only parent `pnpm-workspace.yaml` (no `packages:`), negated globs (`!examples/**`), pnpm 10 `ignore-workspace`, and vendored from a real member on 11/12 (expect `vendor_pnpm_settings_elsewhere`).
+9. Re-verify the open set when fixes land (#853 core and #880/#881 verified in run 29; #956 closed by #961, re-check on pnpm 7/8): #435, #466, #492, #556, #633, #713, #714, #734, #778, #830, #831 (PR #837, pnpm gitignore matrix), #853, #854, #880, #881, #902, #903, #904 (fix PR #909), #919, #935, #957 and #1006.
 9a. BOM follow-ups (#903 / #904): a fresh install of a hosted BOM-`package.json` pin, and Windows checkouts (needs a probe). (Vendored BOM workspace file on 9.15.9 / 10.34.5 done in run 25: #904 reproduces.)
 9b. #902 follow-ups: the setting in the global `rc` / `config.yaml`. (Mirror + tarball URLs became #919 in run 24.)
 9c. #919 follow-ups: scoped `@scope:registry=` mirrors, the hosted → vendored takeover + `vendor --revert` on a mirror, pnpm 7/8 lock dialects, and re-verification once PR #918 (or a successor) covers `restore_pnpm_locks`.
@@ -404,4 +416,5 @@ Global mode (`-g`, v5 main `2463257`):
 - Vendored on a pnpm 1/2 `shrinkwrap.yaml` project fails closed with `vendor_lockfile_missing`, whose message lists `pnpm-lock.yaml` but not `shrinkwrap.yaml` (cosmetic; vendoring pnpm ≤ 6 is refused as documented).
 - Fixture note (run 24): pnpm caches registry metadata per host in `~/.cache/pnpm/metadata/<host>+<port>`. Give each mirror cell its own `XDG_CACHE_HOME`, or a mirror that changes its `dist.tarball` style serves stale URLs. For fresh-install checks, copy the working tree; a git clone takes the committed lock.
 - Fixture note (run 23): the Python mock rebuilds the patched tarball on every restart (the gzip mtime changes), so a pin's sha512 changes between mock restarts. Re-scan after restarting the mock.
+- Fixture note (run 29): `vex --json` needs `--output`, and a workspace root without a `version` needs `--product`.
 - Fixture note (run 27): agent `rollback --offline` needs the before blob staged in `.socket/blobs`; without it, rollback fails with `Before blob not found` (`missing_blob`). That's documented (`repair` fetches it).
