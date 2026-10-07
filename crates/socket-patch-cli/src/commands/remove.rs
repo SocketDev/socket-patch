@@ -779,8 +779,7 @@ pub async fn run(args: RemoveArgs) -> i32 {
                     leg
                 }
                 Err(err) => {
-                    let (code, msg) = hosted_unwind_error(err, true);
-                    emit_error_envelope(args.common.json, args.common.dry_run, code, msg);
+                    emit_hosted_unwind_error(&args.common, err, true);
                     return 1;
                 }
             };
@@ -1337,6 +1336,20 @@ fn hosted_unwind_error(err: HostedUnwindError, manifest_backed: bool) -> (&'stat
     )
 }
 
+/// Report a stopped hosted unwind. JSON carries the whole message in the
+/// error envelope. A human run already saw `Error: <why>` — the hosted leg
+/// prints each refusal as it happens — so only the manifest-backed path's
+/// extra fact is added; printing the refusal again would show the same
+/// error twice (B77).
+fn emit_hosted_unwind_error(common: &GlobalArgs, err: HostedUnwindError, manifest_backed: bool) {
+    let (code, msg) = hosted_unwind_error(err, manifest_backed);
+    if common.json {
+        emit_error_envelope(true, common.dry_run, code, msg);
+    } else if manifest_backed {
+        eprintln!("The manifest was not modified.");
+    }
+}
+
 /// Remove path for identifiers that match ONLY hosted lockfile pins (no
 /// manifest entry, no vendor-ledger entry): confirm, restore each pin's
 /// upstream registry entry, and report `Removed`/`hosted_reverted` events. Like the ledger-only vendored path,
@@ -1406,8 +1419,7 @@ async fn remove_hosted_only(
         Ok(leg) => leg,
         Err(err) => {
             track_patch_remove_failed("hosted redirect revert failed", api_token, org_slug).await;
-            let (code, msg) = hosted_unwind_error(err, false);
-            emit_error_envelope(args.common.json, args.common.dry_run, code, msg);
+            emit_hosted_unwind_error(&args.common, err, false);
             return 1;
         }
     };
