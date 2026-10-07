@@ -91,6 +91,34 @@ pub(crate) fn verify_members(
     Ok(())
 }
 
+/// Whether a wheel filename binds an ABI or platform, and its tag triple
+/// for messages. Shared by vendored mode (`vendor_platform_locked`) and the
+/// hosted redirect (`redirect_pypi_platform_wheel`), so both modes call the
+/// same wheels portable.
+pub(crate) fn wheel_platform_from_filename(wheel_name: &str) -> (bool, String) {
+    let stem = wheel_name.strip_suffix(".whl").unwrap_or(wheel_name);
+    let parts: Vec<&str> = stem.split('-').collect();
+    if parts.len() >= 3 {
+        let triple = parts[parts.len() - 3..].join("-");
+        (tag_is_platform_specific(&triple), triple)
+    } else {
+        // Unparseable → cannot prove portability.
+        (true, stem.to_string())
+    }
+}
+
+/// Platform-specific iff the tag triple binds an ABI or platform — `cp311-
+/// none-any` is merely version-bound, `*-cp311-*` / `*-manylinux*` lock the
+/// artifact to this machine's platform.
+pub(crate) fn tag_is_platform_specific(tag: &str) -> bool {
+    let parts: Vec<&str> = tag.split('-').collect();
+    match parts.as_slice() {
+        [_py, abi, plat] => *abi != "none" || *plat != "any",
+        // Malformed tags can't prove portability — claim platform-locked.
+        _ => true,
+    }
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;

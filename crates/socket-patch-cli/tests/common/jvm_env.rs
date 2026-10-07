@@ -30,16 +30,16 @@ pub const AMBIENT: &[&str] = &[
     "GRADLE_USER_HOME",
     "GRADLE_RO_DEP_CACHE",
     "GRADLE_HOME",
+    // The Coursier / Ivy lookups (sbt, Mill, scala-cli) read these: an
+    // ambient value would aim a test's crawl at a real cache.
+    "COURSIER_CACHE",
+    "SBT_OPTS",
 ];
 
 /// The cache roots a test may hand the CLI explicitly (they survive
 /// `prebuilt_common::prepare_command`'s scrub and are served by its fixture
 /// server).
-pub const EXPLICIT: &[&str] = &[
-    "GRADLE_USER_HOME",
-    "GRADLE_RO_DEP_CACHE",
-    // sbt (Coursier / Ivy) registers COURSIER_CACHE here.
-];
+pub const EXPLICIT: &[&str] = &["GRADLE_USER_HOME", "GRADLE_RO_DEP_CACHE", "COURSIER_CACHE"];
 
 /// Toolchain locations that default to a path under the real home (the
 /// list `cache_env::TOOLCHAIN_ROOTS` carries for package-manager children).

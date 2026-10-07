@@ -1,10 +1,12 @@
 pub mod cargo_crawler;
 pub mod composer_crawler;
+pub mod coursier_cache;
 pub mod deno_crawler;
 pub mod fuzzy_match;
 pub mod go_crawler;
 pub mod gradle_cache;
 pub mod hatch_env;
+pub mod ivy_cache;
 pub mod jvm_cache;
 mod listing;
 pub mod maven_crawler;
@@ -17,6 +19,8 @@ pub(crate) mod oracle_support;
 pub mod pkg_managers;
 pub mod python_crawler;
 pub mod ruby_crawler;
+pub mod sbt_evidence;
+pub mod scala_evidence;
 pub mod types;
 pub mod walk_pool;
 

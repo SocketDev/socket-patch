@@ -1,0 +1,50 @@
+[
+  {
+    "ecosystem": "maven",
+    "name": "commons-lang3",
+    "namespace": "org.apache.commons",
+    "version": "3.11",
+    "token": "11111111-1111-4111-8111-111111111111",
+    "patchUuid": "abcdef12-0000-4000-8000-000000000001",
+    "artifactUrl": "https://patch.socket.dev/patch/maven/org.apache.commons/commons-lang3/3.11/11111111-1111-4111-8111-111111111111/abcdef12-0000-4000-8000-000000000001/commons-lang3-3.11-socket.abcdef12.jar",
+    "registryOverride": {
+      "kind": "maven2",
+      "indexUrl": "https://patch.socket.dev/patch-registry/maven/11111111-1111-4111-8111-111111111111/abcdef12-0000-4000-8000-000000000001/maven2",
+      "identifiers": {
+        "name": "org.apache.commons/commons-lang3",
+        "version": "3.11",
+        "mavenGroupId": "org.apache.commons",
+        "mavenArtifactId": "commons-lang3",
+        "mavenSuffixedVersion": "3.11-socket.abcdef12",
+        "mavenPomSha256": "b1b1b1b1b1b1b1b1b1b1b1b1b1b1b1b1b1b1b1b1b1b1b1b1b1b1b1b1b1b1b1b1"
+      }
+    },
+    "integrity": {
+      "sha256": "c1c1c1c1c1c1c1c1c1c1c1c1c1c1c1c1c1c1c1c1c1c1c1c1c1c1c1c1c1c1c1c1"
+    }
+  },
+  {
+    "ecosystem": "maven",
+    "name": "commons-lang3",
+    "namespace": "org.apache.commons",
+    "version": "3.11",
+    "token": "11111111-1111-4111-8111-111111111111",
+    "patchUuid": "0fedcba9-0000-4000-8000-000000000000",
+    "artifactUrl": "https://patch.socket.dev/patch/maven/org.apache.commons/commons-lang3/3.11/11111111-1111-4111-8111-111111111111/0fedcba9-0000-4000-8000-000000000000/commons-lang3-3.11-socket.0fedcba9.jar",
+    "registryOverride": {
+      "kind": "maven2",
+      "indexUrl": "https://patch.socket.dev/patch-registry/maven/11111111-1111-4111-8111-111111111111/0fedcba9-0000-4000-8000-000000000000/maven2",
+      "identifiers": {
+        "name": "org.apache.commons/commons-lang3",
+        "version": "3.11",
+        "mavenGroupId": "org.apache.commons",
+        "mavenArtifactId": "commons-lang3",
+        "mavenSuffixedVersion": "3.11-socket.0fedcba9",
+        "mavenPomSha256": "b0b0b0b0b0b0b0b0b0b0b0b0b0b0b0b0b0b0b0b0b0b0b0b0b0b0b0b0b0b0b0b0"
+      }
+    },
+    "integrity": {
+      "sha256": "c0c0c0c0c0c0c0c0c0c0c0c0c0c0c0c0c0c0c0c0c0c0c0c0c0c0c0c0c0c0c0c0"
+    }
+  }
+]

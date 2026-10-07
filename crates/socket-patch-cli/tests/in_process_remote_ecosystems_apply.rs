@@ -24,6 +24,49 @@ use wiremock::{Mock, MockServer, ResponseTemplate};
 
 const ORG: &str = "test-org";
 
+/// Keeps the machine's Coursier / Ivy caches out of a Maven test that pins
+/// the exact batch traffic (a JVM project's crawl also reaches them):
+/// `HOME` points at an empty directory and the variables naming a cache
+/// are unset until drop, which restores them. Only inside `#[serial]`
+/// tests.
+struct NoJvmCaches {
+    _home: tempfile::TempDir,
+    saved: Vec<(&'static str, Option<std::ffi::OsString>)>,
+}
+
+impl NoJvmCaches {
+    fn new() -> Self {
+        let home = tempfile::tempdir().unwrap();
+        let keys = [
+            "HOME",
+            "USERPROFILE",
+            "XDG_CACHE_HOME",
+            "LOCALAPPDATA",
+            "COURSIER_CACHE",
+            "SBT_OPTS",
+            "JAVA_OPTS",
+        ];
+        let saved = keys.iter().map(|k| (*k, std::env::var_os(k))).collect();
+        for key in keys {
+            std::env::remove_var(key);
+        }
+        std::env::set_var("HOME", home.path());
+        std::env::set_var("USERPROFILE", home.path());
+        Self { _home: home, saved }
+    }
+}
+
+impl Drop for NoJvmCaches {
+    fn drop(&mut self) {
+        for (key, value) in &self.saved {
+            match value {
+                Some(v) => std::env::set_var(key, v),
+                None => std::env::remove_var(key),
+            }
+        }
+    }
+}
+
 fn git_sha256(content: &[u8]) -> String {
     let header = format!("blob {}\0", content.len());
     let mut hasher = Sha256::new();
@@ -598,6 +641,7 @@ async fn golang_handcrafted_discovery() {
 #[tokio::test]
 #[serial]
 async fn maven_handcrafted_discovery() {
+    let _no_jvm_caches = NoJvmCaches::new();
     let tmp = tempfile::tempdir().expect("tempdir");
     let repo = tmp.path().join("m2");
     let version_dir = repo.join("org/example/foo/1.0.0");

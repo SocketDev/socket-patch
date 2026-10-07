@@ -14,6 +14,8 @@ use crate::utils::fs::is_dir;
 
 #[cfg(test)]
 mod oracle;
+#[cfg(test)]
+mod scala_cache_tests;
 
 /// How many `.pom` paths the parallel parse takes at a time. Every phase
 /// stays in walk order whatever the chunk, so this only bounds peak
@@ -541,6 +543,20 @@ pub(crate) fn is_safe_maven_coordinate(group_id: &str, artifact_id: &str, versio
         && path_safety::is_safe_single_segment(version)
 }
 
+/// A Coursier per-repository root as a cache root: tagged with the layout
+/// its path spells, so `find_by_purls` (which recovers the layout from the
+/// path alone) resolves it the same way. A repository at the host itself
+/// (`<cache>/https/<host>`) spells Maven2, which crawls it identically; one
+/// whose path happens to spell Ivy or Gradle is left for
+/// [`jvm_cache::push_classified`] to skip.
+fn coursier_repo_root(path: PathBuf) -> JvmCacheRoot {
+    let layout = match JvmCacheLayout::classify(&path) {
+        JvmCacheLayout::Maven2 => JvmCacheLayout::Maven2,
+        _ => JvmCacheLayout::Coursier,
+    };
+    JvmCacheRoot::new(path, layout)
+}
+
 // ---------------------------------------------------------------------------
 // Cache roots
 // ---------------------------------------------------------------------------
@@ -654,8 +670,9 @@ pub fn normalize_prefix(prefix: &Path) -> PathBuf {
 /// Whether a local scan of `cwd` counts the Maven local repository.
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub enum M2Gate {
-    /// Not a Gradle-only project (a `pom.xml`, or no Gradle marker): m2
-    /// counts as always.
+    /// Not a Gradle-only project (a `pom.xml`, an sbt / Mill / scala-cli
+    /// build beside the Gradle one, or no Gradle marker): m2 counts as
+    /// always.
     NotGradleOnly,
     /// A Gradle build that declares `mavenLocal()` (in this script).
     Declared(String),
@@ -668,8 +685,16 @@ pub enum M2Gate {
 
 /// See [`M2Gate`]. Reads the build's scripts and the init scripts of
 /// `env`'s Gradle user home.
+///
+/// A Scala-tool build beside the Gradle one ([`SCALA_TOOL_MARKERS`]) keeps
+/// m2 as a lone sbt / Mill / scala-cli root does: its own resolvers (an
+/// sbt `Resolver.mavenLocal`, say) are not the Gradle scripts', so the
+/// Gradle build's silence on `mavenLocal()` cannot rule `~/.m2` out.
 pub fn m2_gate(cwd: &Path, env: &JvmEnv) -> M2Gate {
-    if cwd.join("pom.xml").exists() || !gradle_cache::has_gradle_marker(cwd) {
+    if cwd.join("pom.xml").exists()
+        || !gradle_cache::has_gradle_marker(cwd)
+        || has_scala_tool_marker(cwd)
+    {
         return M2Gate::NotGradleOnly;
     }
     match gradle_cache::maven_local(cwd, env.gradle.as_ref()) {
@@ -698,10 +723,75 @@ pub fn maven_local_undetermined(cwd: &Path) -> Option<String> {
 // MavenCrawler
 // ---------------------------------------------------------------------------
 
+/// Files (root-relative) that make a directory an sbt, Mill or scala-cli
+/// project: the builds whose artifacts live in the Coursier / Ivy caches.
+const SCALA_TOOL_MARKERS: &[&str] = &[
+    "build.sbt",
+    "project/build.properties",
+    "build.mill",
+    "build.mill.yaml",
+    "build.sc",
+    "project.scala",
+    ".scala-build",
+];
+
+/// [`scala_tool_project`] for a blocking caller (the walk pool).
+fn has_scala_tool_marker(dir: &Path) -> bool {
+    SCALA_TOOL_MARKERS
+        .iter()
+        .any(|marker| std::fs::symlink_metadata(dir.join(marker)).is_ok())
+}
+
+/// `path` with its symlinks resolved, or as given when it cannot be.
+async fn canonical_or_self(path: &Path) -> PathBuf {
+    tokio::fs::canonicalize(path)
+        .await
+        .unwrap_or_else(|_| path.to_path_buf())
+}
+
+/// Whether `dir` holds any [`SCALA_TOOL_MARKERS`] entry.
+async fn scala_tool_project(dir: &Path) -> bool {
+    for marker in SCALA_TOOL_MARKERS {
+        if tokio::fs::symlink_metadata(dir.join(marker)).await.is_ok() {
+            return true;
+        }
+    }
+    false
+}
+
+/// Whether `path` is spelled like a Coursier per-repository root (an
+/// `https` / `http` component, host-level repositories included), never
+/// Maven's local repository.
+fn coursier_spelled(path: &Path) -> bool {
+    path.components()
+        .any(|c| matches!(c.as_os_str().to_str(), Some("https" | "http")))
+}
+
+/// Whether the version directory `dir` of a Coursier repository root holds
+/// an artifact, not only its `.pom`: Coursier caches the pom of every
+/// version it considers during conflict resolution but downloads jars only
+/// for the versions it picks, and an evicted version's pom-only directory
+/// is no installed copy (Ivy's crawler likewise requires the jar).
+fn holds_artifact(dir: &Path) -> bool {
+    const NOT_ARTIFACTS: &[&str] = &[
+        ".pom", ".module", ".sha1", ".md5", ".sha256", ".sha512", ".asc", ".json",
+    ];
+    std::fs::read_dir(dir).is_ok_and(|entries| {
+        entries.flatten().any(|e| {
+            let name = e.file_name();
+            let name = name.to_string_lossy();
+            !name.starts_with('.')
+                && !NOT_ARTIFACTS.iter().any(|ext| name.ends_with(ext))
+                && e.file_type().is_ok_and(|t| t.is_file())
+        })
+    })
+}
+
 /// Maven/Java ecosystem crawler for discovering packages in the JVM
-/// artifact caches: the local Maven repository (`~/.m2/repository/`) and
+/// artifact caches: the local Maven repository (`~/.m2/repository/`),
 /// Gradle's module cache (`~/.gradle/caches/modules-2/files-2.1`, plus the
-/// read-only `$GRADLE_RO_DEP_CACHE`).
+/// read-only `$GRADLE_RO_DEP_CACHE`), and the Coursier / Ivy caches sbt,
+/// Mill and scala-cli resolve into.
 pub struct MavenCrawler;
 
 impl MavenCrawler {
@@ -724,7 +814,9 @@ impl MavenCrawler {
 
     /// Every JVM artifact cache whose packages a scan reports, under the
     /// caches `env` names. Order: Gradle's `files-2.1`, the read-only
-    /// Gradle cache, the Maven local repository.
+    /// Gradle cache, the Maven local repository, then the Coursier
+    /// per-repository roots, the Ivy caches and the caches local sbt
+    /// evidence points into.
     ///
     /// - `--global-prefix` names one root, its layout
     ///   [`JvmCacheLayout::classify`]'d after [`normalize_prefix`] (a Gradle
@@ -735,8 +827,12 @@ impl MavenCrawler {
     ///   scanned against a shared cache.
     /// - The Gradle caches count for a Gradle build (a Gradle marker in the
     ///   cwd) or in global mode.
-    /// - The Maven local repository counts in global mode, for a `pom.xml`
-    ///   or a cwd with no Gradle marker, and for a Gradle build that reads
+    /// - The Coursier / Ivy caches count for an sbt, Mill or scala-cli
+    ///   project (`SCALA_TOOL_MARKERS`) or in global mode; their
+    ///   directories are read from the process environment.
+    /// - The Maven local repository counts in global mode, for a `pom.xml`,
+    ///   a Scala-tool build or a cwd with no Gradle marker, and for a
+    ///   Gradle build that reads
     ///   it: `mavenLocal()` declared in the build's scripts or an init
     ///   script, or not ruled out ([`m2_gate`]). A Gradle-only build that
     ///   never declares it does not resolve from `~/.m2`, so its contents
@@ -773,6 +869,30 @@ impl MavenCrawler {
                 env.m2_repo.clone(),
                 JvmCacheLayout::Maven2,
             ));
+        }
+        // sbt / Mill / scala-cli: Coursier's per-repository roots, the Ivy
+        // caches, then the caches local sbt evidence points into (the
+        // directory walks are blocking). The first root holding a PURL wins
+        // the crawl dedup. Locally only for a Scala-tool project: a Maven or
+        // Gradle build never reads those caches.
+        if !options.global && !scala_tool_project(&options.cwd).await {
+            return roots;
+        }
+        let cwd = options.cwd.clone();
+        let scala_roots = run_walk(move || {
+            let coursier = super::coursier_cache::process_cache_dirs(&cwd)
+                .into_iter()
+                .flat_map(|dir| super::coursier_cache::repo_roots(&dir))
+                .map(coursier_repo_root);
+            let ivy = super::ivy_cache::process_cache_dirs(&cwd)
+                .into_iter()
+                .map(|path| JvmCacheRoot::new(path, JvmCacheLayout::Ivy));
+            let evidence = super::sbt_evidence::cache_roots(&cwd);
+            coursier.chain(ivy).chain(evidence).collect::<Vec<_>>()
+        })
+        .await;
+        for root in scala_roots {
+            jvm_cache::push_classified(&mut roots, root);
         }
         roots
     }
@@ -833,8 +953,18 @@ impl MavenCrawler {
         if jvm && is_dir(&env.m2_repo).await {
             paths.push(env.m2_repo.clone());
         }
+        // One physical cache once, however it is spelled (a root reached
+        // through a symlinked home names the `~/.m2` pushed above): the
+        // every-copy fan-out would otherwise patch it twice, and the alias
+        // would escape the `~/.m2` prefix checks.
+        let mut seen = Vec::with_capacity(paths.len());
+        for path in &paths {
+            seen.push(canonical_or_self(path).await);
+        }
         for root in self.get_jvm_cache_roots_with(options, env).await {
-            if !paths.contains(&root.path) {
+            let key = canonical_or_self(&root.path).await;
+            if !paths.contains(&root.path) && !seen.contains(&key) {
+                seen.push(key);
                 paths.push(root.path);
             }
         }
@@ -875,14 +1005,49 @@ impl MavenCrawler {
     ) -> Result<HashMap<String, CrawledPackage>, std::io::Error> {
         match JvmCacheLayout::classify(src_path) {
             JvmCacheLayout::Maven2 => {}
+            // A Coursier cache directory resolves through each repository
+            // root inside it (first root wins); a repository root is Maven2.
+            JvmCacheLayout::Coursier => {
+                let dir = src_path.to_path_buf();
+                let repos = run_walk(move || {
+                    super::coursier_cache::is_coursier_cache_dir(&dir)
+                        .then(|| super::coursier_cache::repo_roots(&dir))
+                })
+                .await;
+                let Some(repos) = repos else {
+                    return self.find_in_maven2(src_path, purls, true).await;
+                };
+                let mut result = HashMap::new();
+                for repo in repos {
+                    for (purl, pkg) in self.find_in_maven2(&repo, purls, true).await? {
+                        result.entry(purl).or_insert(pkg);
+                    }
+                }
+                return Ok(result);
+            }
+            JvmCacheLayout::Ivy => {
+                let (root, purls) = (src_path.to_path_buf(), purls.to_vec());
+                return Ok(run_walk(move || super::ivy_cache::find_by_purls(&root, &purls)).await);
+            }
             JvmCacheLayout::GradleModules2 => {
                 let src = src_path.to_path_buf();
                 let purls = purls.to_vec();
                 return Ok(run_walk(move || Self::find_in_files21(&src, &purls)).await);
             }
-            // Other layouts plug in here; until then they resolve nothing.
-            JvmCacheLayout::Coursier | JvmCacheLayout::Ivy => return Ok(HashMap::new()),
         }
+        self.find_in_maven2(src_path, purls, coursier_spelled(src_path))
+            .await
+    }
+
+    /// [`Self::find_by_purls`] over one Maven2 repository root; a Coursier
+    /// root (`require_artifact`) reports only directories that hold an
+    /// artifact ([`holds_artifact`]).
+    async fn find_in_maven2(
+        &self,
+        src_path: &Path,
+        purls: &[String],
+        require_artifact: bool,
+    ) -> Result<HashMap<String, CrawledPackage>, std::io::Error> {
         let mut result: HashMap<String, CrawledPackage> = HashMap::new();
 
         for purl in purls {
@@ -907,7 +1072,12 @@ impl MavenCrawler {
                 // The path already encodes the coordinates
                 // (groupId/artifactId/version), so verifying the package is
                 // just checking a `.pom` file exists there.
-                if self.has_pom_file(&expected_path).await {
+                let installed = self.has_pom_file(&expected_path).await
+                    && (!require_artifact || {
+                        let dir = expected_path.clone();
+                        run_walk(move || holds_artifact(&dir)).await
+                    });
+                if installed {
                     result.insert(
                         purl.clone(),
                         CrawledPackage {
@@ -975,6 +1145,22 @@ impl MavenCrawler {
         self.scan_maven_repo_chunked(repo_path, seen, POM_PARSE_CHUNK)
     }
 
+    /// [`Self::scan_maven_repo`] over a Coursier repository root: a version
+    /// directory holding only its pom ([`holds_artifact`]) is no copy.
+    fn scan_coursier_repo(
+        &self,
+        repo_path: &Path,
+        seen: &mut HashSet<String>,
+    ) -> Vec<CrawledPackage> {
+        self.scan_maven_repo_filtered(
+            repo_path,
+            seen,
+            POM_PARSE_CHUNK,
+            LayoutTrust::default(),
+            true,
+        )
+    }
+
     /// Crawl one cache root according to its layout.
     fn scan_cache_root(
         &self,
@@ -982,10 +1168,23 @@ impl MavenCrawler {
         seen: &mut HashSet<String>,
     ) -> Vec<CrawledPackage> {
         match root.layout {
+            JvmCacheLayout::Maven2 if coursier_spelled(&root.path) => {
+                self.scan_coursier_repo(&root.path, seen)
+            }
             JvmCacheLayout::Maven2 => self.scan_maven_repo(&root.path, seen),
+            // A Coursier cache directory is crawled per repository root
+            // inside it; a repository root is a Maven2 tree.
+            JvmCacheLayout::Coursier
+                if super::coursier_cache::is_coursier_cache_dir(&root.path) =>
+            {
+                super::coursier_cache::repo_roots(&root.path)
+                    .iter()
+                    .flat_map(|repo| self.scan_coursier_repo(repo, seen))
+                    .collect()
+            }
+            JvmCacheLayout::Coursier => self.scan_coursier_repo(&root.path, seen),
+            JvmCacheLayout::Ivy => super::ivy_cache::scan(&root.path, seen),
             JvmCacheLayout::GradleModules2 => Self::scan_files21(&root.path, seen),
-            // Other layouts plug in here; until then they crawl nothing.
-            JvmCacheLayout::Coursier | JvmCacheLayout::Ivy => Vec::new(),
         }
     }
 
@@ -1069,7 +1268,20 @@ impl MavenCrawler {
         repo_path: &Path,
         seen: &mut HashSet<String>,
         chunk: usize,
+        trust: LayoutTrust,
+    ) -> Vec<CrawledPackage> {
+        self.scan_maven_repo_filtered(repo_path, seen, chunk, trust, false)
+    }
+
+    /// The scan, optionally keeping only version directories that hold an
+    /// artifact (`require_artifact`, a Coursier root).
+    fn scan_maven_repo_filtered(
+        &self,
+        repo_path: &Path,
+        seen: &mut HashSet<String>,
+        chunk: usize,
         mut trust: LayoutTrust,
+        require_artifact: bool,
     ) -> Vec<CrawledPackage> {
         let chunk = chunk.max(1);
         let mut results = Vec::new();
@@ -1129,6 +1341,9 @@ impl MavenCrawler {
                 let Some(version_dir) = path.parent() else {
                     continue;
                 };
+                if require_artifact && !holds_artifact(version_dir) {
+                    continue;
+                }
                 if let Some((group_id, artifact_id, version)) = coords {
                     let purl =
                         crate::utils::purl::build_maven_purl(&group_id, &artifact_id, &version);
@@ -2453,8 +2668,10 @@ mod tests {
             global_prefix: None,
         };
         let paths = crawler.get_maven_repo_paths(&options).await.unwrap();
+        // Only the Maven local repository is pinned here; a Coursier or Ivy
+        // cache of the machine running the suite may legitimately appear.
         assert!(
-            paths.is_empty(),
+            !paths.contains(&missing) && paths.iter().all(|p| !p.starts_with(project.path())),
             "a java project with a missing m2 repo must yield no repo paths, got {paths:?}"
         );
     }
