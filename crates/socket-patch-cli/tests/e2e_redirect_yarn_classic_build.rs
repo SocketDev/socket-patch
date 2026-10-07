@@ -970,64 +970,7 @@ async fn classic_git_sourced_dependency_is_left_unrewired() {
     let tgz_path = tmp.path().join("patched.tgz");
     build_patched_tgz(&installed_dir, &patched, &tgz_path);
     let tgz = std::fs::read(&tgz_path).unwrap();
-    let server = MockServer::start().await;
-    let hosted_url = format!(
-        "{}/patch/npm/{DEP}/{DEP_VERSION}/{TOKEN}/{UUID}/{DEP}-{DEP_VERSION}.tgz",
-        server.uri()
-    );
-    let summary = serde_json::json!({
-        "uuid": UUID, "purl": PURL, "tier": "free",
-        "cveIds": [], "ghsaIds": [], "severity": "high", "title": "git classic fixture"
-    });
-    Mock::given(method("POST"))
-        .and(path(format!("/v0/orgs/{ORG}/patches/batch")))
-        .respond_with(ResponseTemplate::new(200).set_body_json(serde_json::json!({
-            "packages": [{ "purl": PURL, "patches": [summary] }],
-            "canAccessPaidPatches": false,
-        })))
-        .mount(&server)
-        .await;
-    Mock::given(method("GET"))
-        .and(path_regex(format!(
-            "^/v0/orgs/{ORG}/patches/by-package/.+$"
-        )))
-        .respond_with(ResponseTemplate::new(200).set_body_json(serde_json::json!({
-            "patches": [{
-                "uuid": UUID, "purl": PURL, "publishedAt": "2026-01-01T00:00:00Z",
-                "description": "x", "license": "MIT", "tier": "free", "vulnerabilities": {}
-            }],
-            "canAccessPaidPatches": false,
-        })))
-        .mount(&server)
-        .await;
-    Mock::given(method("POST"))
-        .and(path(format!("/v0/orgs/{ORG}/patches/package")))
-        .respond_with(ResponseTemplate::new(200).set_body_json(serde_json::json!({
-            "results": { UUID: {
-                "status": "granted", "url": hosted_url, "purl": PURL,
-                "artifacts": [{ "kind": "tarball", "url": hosted_url,
-                    "integrity": { "sha512": sha512_sri(&tgz), "sha1": sha1_hex(&tgz) } }],
-                "registryOverride": null
-            } }
-        })))
-        .mount(&server)
-        .await;
-    Mock::given(method("GET"))
-        .and(path(format!("/v0/orgs/{ORG}/patches/view/{UUID}")))
-        .respond_with(ResponseTemplate::new(200).set_body_json(serde_json::json!({
-            "uuid": UUID, "purl": PURL, "publishedAt": "2026-01-01T00:00:00Z",
-            "files": { "package/index.js": {
-                "beforeHash": compute_git_sha256_from_bytes(orig),
-                "afterHash": compute_git_sha256_from_bytes(&patched),
-            } },
-            "vulnerabilities": { GHSA: {
-                "cves": [CVE], "summary": "s", "severity": "high", "description": "d"
-            } },
-            "description": "x", "license": "MIT", "tier": "free"
-        })))
-        .mount(&server)
-        .await;
-
+    let server = mock_hosted_grant(&tgz, orig, &patched, "git classic fixture").await;
     let api_url = server.uri();
     let (code, stdout, stderr) = run_socket(
         &proj,
@@ -1088,4 +1031,171 @@ async fn classic_git_sourced_dependency_is_left_unrewired() {
         String::from_utf8_lossy(&ci.stdout),
         String::from_utf8_lossy(&ci.stderr),
     );
+}
+
+/// #921: a `file:` directory dependency locks as a block with no
+/// `resolved`; yarn 1 COPIES the directory into node_modules, so no lock
+/// rewrite reaches it. `scan --mode hosted --json` must say so with
+/// `redirect_yarn_classic_directory_skipped` (it used to report success
+/// with no warning at all), leave the lock byte-identical and attest
+/// nothing in its in-run VEX. The fork is local, so no registry is needed.
+#[tokio::test(flavor = "multi_thread")]
+#[serial_test::serial]
+async fn classic_file_directory_dependency_is_named_and_not_attested() {
+    if !require_yarn_classic("e2e_redirect_yarn_classic_build (file:)", |c| {
+        cache_env::isolate(c);
+    }) {
+        return;
+    }
+    let tmp = tempfile::tempdir().unwrap();
+    let proj = tmp.path().join("proj");
+    let fork = proj.join("forks").join(DEP);
+    std::fs::create_dir_all(&fork).unwrap();
+    std::fs::write(
+        fork.join("package.json"),
+        format!(r#"{{"name":"{DEP}","version":"{DEP_VERSION}","main":"index.js"}}"#),
+    )
+    .unwrap();
+    let orig: &[u8] = b"module.exports = function leftPad(s) { return s; };\n";
+    std::fs::write(fork.join("index.js"), orig).unwrap();
+    std::fs::write(
+        proj.join("package.json"),
+        format!(
+            r#"{{"name":"file-classic","version":"0.0.0","private":true,"dependencies":{{"{DEP}":"file:./forks/{DEP}"}}}}"#
+        ),
+    )
+    .unwrap();
+    let cache = tmp.path().join("yarn-cache");
+    let install = corepack(
+        &proj,
+        &yarn_classic(),
+        &["install", "--no-progress"],
+        &[("YARN_CACHE_FOLDER", cache.to_str().unwrap())],
+    );
+    if !install.status.success() {
+        skip!(
+            "(file:): fixture `yarn install` of the file: directory failed:\n{}",
+            String::from_utf8_lossy(&install.stderr)
+        );
+        return;
+    }
+    let lock_pristine = std::fs::read_to_string(proj.join("yarn.lock")).unwrap();
+    assert!(
+        lock_pristine.contains(&format!("{DEP}@file:./forks/{DEP}"))
+            && !lock_pristine.contains("resolved"),
+        "fixture must lock a file: directory block:\n{lock_pristine}"
+    );
+
+    let installed_dir = proj.join("node_modules").join(DEP);
+    let patched: Vec<u8> = [MARKER.as_bytes(), orig].concat();
+    let tgz_path = tmp.path().join("patched.tgz");
+    build_patched_tgz(&installed_dir, &patched, &tgz_path);
+    let tgz = std::fs::read(&tgz_path).unwrap();
+    let server = mock_hosted_grant(&tgz, orig, &patched, "file: classic fixture").await;
+
+    let api_url = server.uri();
+    let (code, stdout, stderr) = run_socket(
+        &proj,
+        &[
+            "scan",
+            "--mode",
+            "hosted",
+            "--json",
+            "--yes",
+            "--cwd",
+            proj.to_str().unwrap(),
+            "--api-url",
+            &api_url,
+            "--org",
+            ORG,
+            "--api-token",
+            "fake",
+            "--vex",
+            "out.vex.json",
+            "--vex-product",
+            PRODUCT,
+        ],
+    );
+    println!("scan exit {code}\nstdout:\n{stdout}\nstderr:\n{stderr}");
+    let env: serde_json::Value = serde_json::from_str(&stdout)
+        .unwrap_or_else(|e| panic!("scan --json output is not JSON: {e}\n{stdout}\n{stderr}"));
+    assert_eq!(
+        std::fs::read_to_string(proj.join("yarn.lock")).unwrap(),
+        lock_pristine,
+        "the file: block must stay byte-identical: {env}"
+    );
+    assert!(
+        env.to_string()
+            .contains("redirect_yarn_classic_directory_skipped"),
+        "the skip must be named: {env}"
+    );
+    let vex = std::fs::read_to_string(proj.join("out.vex.json")).unwrap_or_default();
+    assert!(
+        !vex.contains("not_affected"),
+        "nothing may be attested for the file: copy:\n{vex}\n{env}"
+    );
+}
+
+/// A mock patch API granting one hosted patch of `DEP@DEP_VERSION` whose
+/// tarball is `tgz` (`index.js` from `orig` to `patched`).
+async fn mock_hosted_grant(tgz: &[u8], orig: &[u8], patched: &[u8], title: &str) -> MockServer {
+    let server = MockServer::start().await;
+    let hosted_url = format!(
+        "{}/patch/npm/{DEP}/{DEP_VERSION}/{TOKEN}/{UUID}/{DEP}-{DEP_VERSION}.tgz",
+        server.uri()
+    );
+    let summary = serde_json::json!({
+        "uuid": UUID, "purl": PURL, "tier": "free",
+        "cveIds": [], "ghsaIds": [], "severity": "high", "title": title
+    });
+    Mock::given(method("POST"))
+        .and(path(format!("/v0/orgs/{ORG}/patches/batch")))
+        .respond_with(ResponseTemplate::new(200).set_body_json(serde_json::json!({
+            "packages": [{ "purl": PURL, "patches": [summary] }],
+            "canAccessPaidPatches": false,
+        })))
+        .mount(&server)
+        .await;
+    Mock::given(method("GET"))
+        .and(path_regex(format!(
+            "^/v0/orgs/{ORG}/patches/by-package/.+$"
+        )))
+        .respond_with(ResponseTemplate::new(200).set_body_json(serde_json::json!({
+            "patches": [{
+                "uuid": UUID, "purl": PURL, "publishedAt": "2026-01-01T00:00:00Z",
+                "description": "x", "license": "MIT", "tier": "free", "vulnerabilities": {}
+            }],
+            "canAccessPaidPatches": false,
+        })))
+        .mount(&server)
+        .await;
+    Mock::given(method("POST"))
+        .and(path(format!("/v0/orgs/{ORG}/patches/package")))
+        .respond_with(ResponseTemplate::new(200).set_body_json(serde_json::json!({
+            "results": { UUID: {
+                "status": "granted", "url": hosted_url, "purl": PURL,
+                "artifacts": [{ "kind": "tarball", "url": hosted_url,
+                    "integrity": { "sha512": sha512_sri(tgz), "sha1": sha1_hex(tgz) } }],
+                "registryOverride": null
+            } }
+        })))
+        .mount(&server)
+        .await;
+    Mock::given(method("GET"))
+        .and(path(format!("/v0/orgs/{ORG}/patches/view/{UUID}")))
+        .respond_with(ResponseTemplate::new(200).set_body_json(serde_json::json!({
+            "uuid": UUID, "purl": PURL, "publishedAt": "2026-01-01T00:00:00Z",
+            "files": { "package/index.js": {
+                "beforeHash": compute_git_sha256_from_bytes(orig),
+                "afterHash": compute_git_sha256_from_bytes(patched),
+            } },
+            "vulnerabilities": { GHSA: {
+                "cves": [CVE], "summary": "s", "severity": "high", "description": "d"
+            } },
+            "description": "x", "license": "MIT", "tier": "free"
+        })))
+        .mount(&server)
+        .await;
+
+    server
 }

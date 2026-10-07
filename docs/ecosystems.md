@@ -130,6 +130,14 @@ The backticked slug in each row is the value `-e`/`--ecosystems` accepts (e.g.
   git copy is there, and rollback refuses a hosted pin an older release wrote on one.
   The hosted-git shorthands (`owner/repo`, `github:owner/repo`) lock to a codeload
   tarball and are rewired normally.
+- **yarn classic `file:` directory dependencies** — yarn 1 copies a `file:` directory
+  (an entry with no `resolved` tarball) into `node_modules`, so no lock rewrite reaches
+  that copy. Hosted and vendored modes leave the entry untouched
+  (`redirect_yarn_classic_directory_skipped` / `vendor_link_entry_skipped`, naming it) and
+  that copy stays unpatched; `vex` never attests the package from that lock while the
+  copy is there. When every entry of the package is such a copy (git, `file:` directory
+  or `link:`), vendoring refuses with `vendor_lock_entry_not_rewritable` naming them,
+  since `yarn install` can't help.
 - **bun** — text `bun.lock` lockfileVersion 0, 1 or 2: 0 is the `--save-text-lockfile`
   opt-in lock of Bun 1.1.39–1.1.45, 1 the 1.2–1.3 default, 2 the 1.4+ default; all three
   emit one `packages` grammar, so registry entries rewrite identically. Any other or
