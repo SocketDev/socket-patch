@@ -83,6 +83,26 @@ pub(crate) fn is_pnpm_lock_text(text: &str) -> bool {
         .any(|line| line.starts_with("lockfileVersion:") || line.starts_with("shrinkwrapVersion:"))
 }
 
+/// The main document of a pnpm lock: the text after its last column-0
+/// `---` marker, else all of it. pnpm 11+ writes the env lockfile
+/// (`configDependencies` / `packageManagerDependencies`, whose resolutions
+/// never carry `tarball:`) as a first document ahead of the project lock.
+pub(crate) fn main_document(content: &str) -> &str {
+    let mut start = 0;
+    let mut offset = 0;
+    for line in content.split_inclusive('\n') {
+        offset += line.len();
+        let text = line.trim_end_matches(['\r', '\n']);
+        if text
+            .strip_prefix("---")
+            .is_some_and(|rest| rest.is_empty() || rest.starts_with([' ', '\t']))
+        {
+            start = offset;
+        }
+    }
+    &content[start..]
+}
+
 /// The value of the entry-level (four-space) `field:` line of a packages
 /// entry body, unquoted; `None` when absent, empty, or given more than once
 /// (ambiguous — fail closed). Nested (deeper-indented) lines are never
