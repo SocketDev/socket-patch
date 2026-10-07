@@ -134,6 +134,32 @@ class BunInstalledTargetsTests(unittest.TestCase):
                              [store / 'minimist@1.2.2/node_modules/minimist'])
             self.assertIsNone(bun.store_entry(store / 'node_modules/minimist'))
 
+    def test_stale_hidden_hoist_link_is_skipped_only_on_request(self):
+        # Bun 1.3.0 leaves `.bun/node_modules/minimist` on the superseded
+        # patched entry while the member links the registry one.
+        with tempfile.TemporaryDirectory() as tmp:
+            project = Path(tmp).resolve()
+            store = project / 'node_modules/.bun'
+            for key in ('minimist@1.2.2', 'minimist@https+++patch.socket.dev+x'):
+                pkg = store / key / 'node_modules/minimist'
+                pkg.mkdir(parents=True)
+                (pkg / 'package.json').write_text('{"name": "minimist", "version": "1.2.2"}')
+            (store / 'node_modules').mkdir()
+            member = project / 'packages/consumer/node_modules'
+            member.mkdir(parents=True)
+            try:
+                (store / 'node_modules/minimist').symlink_to(
+                    '../minimist@https+++patch.socket.dev+x/node_modules/minimist')
+                (member / 'minimist').symlink_to(
+                    '../../../node_modules/.bun/minimist@1.2.2/node_modules/minimist')
+            except OSError:
+                self.skipTest('symlinks unavailable')
+            registry = store / 'minimist@1.2.2/node_modules/minimist'
+            patched = store / 'minimist@https+++patch.socket.dev+x/node_modules/minimist'
+            self.assertEqual(sorted(bun.installed_targets(project)), sorted([registry, patched]))
+            self.assertEqual(bun.installed_targets(project, skip_hidden_hoist=True), [registry])
+            self.assertEqual(bun.STALE_HIDDEN_HOIST, ('1.3.0',))
+
     def test_hoisted_copies_are_always_installed(self):
         with tempfile.TemporaryDirectory() as tmp:
             project = Path(tmp).resolve()

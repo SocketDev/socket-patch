@@ -134,6 +134,10 @@ LOCK_V2_FROM = (1, 4, 0)                      # fresh locks are lockfileVersion 
 LINKER_FROM = (1, 3, 0)                       # bunfig [install] linker
 TARBALL_INTEGRITY_ENFORCED_FROM = (1, 3, 10)  # URL/local tarball sha512 verified
 NO_PEER_OR_OVERRIDE = ('0.8.1', '1.0.0')      # peers not installed, overrides ignored
+# Bun 1.3.0's isolated linker leaves `node_modules/.bun/node_modules/<name>`
+# (the hidden hoist link) on a superseded store entry, even under
+# `bun install --force`; 1.3.1 repoints it. Measured on 1.3.0-1.3.14.
+STALE_HIDDEN_HOIST = ('1.3.0',)
 
 # Bun's hoisted linker keeps the installed copy when a lock entry moves back to
 # the registry copy of the same name@version, so `rollback` / `vendor --revert`
@@ -525,15 +529,25 @@ def store_entry(path):
     return None
 
 
-def linked_store_entries(project):
+def hidden_hoist(directory):
+    """Whether `directory` is Bun's hidden hoist dir (`node_modules/.bun/node_modules`)."""
+    parts = directory.parts
+    return parts[-3:] == ('node_modules', '.bun', 'node_modules')
+
+
+def linked_store_entries(project, skip_hidden_hoist=False):
     """Every isolated store entry some symlink outside it resolves into. Bun's
     isolated linker leaves the entry of a superseded resolution (the patched
     `minimist@https+++patch.socket.dev+…`) on disk, unlinked, after the lock
-    moves back to the registry; nothing can `require` it (the #599 orphans)."""
+    moves back to the registry; nothing can `require` it (the #599 orphans).
+    `skip_hidden_hoist` ignores the links in Bun's hidden hoist dir (see
+    STALE_HIDDEN_HOIST)."""
     live = set()
     for directory, subdirs, files in os.walk(project):
         if '.socket' in Path(directory).relative_to(project).parts:
             subdirs[:] = []
+            continue
+        if skip_hidden_hoist and hidden_hoist(Path(directory)):
             continue
         for name in [*subdirs, *files]:
             link = Path(directory) / name
@@ -546,7 +560,7 @@ def linked_store_entries(project):
     return live
 
 
-def installed_targets(project):
+def installed_targets(project, skip_hidden_hoist=False):
     """The installed minimist@1.2.2 copies node can load: every copy outside
     an isolated store, and the store copies something links to."""
     targets = []
@@ -556,7 +570,7 @@ def installed_targets(project):
             continue
         entry = store_entry(manifest)
         if entry is not None:
-            live = linked_store_entries(project) if live is None else live
+            live = linked_store_entries(project, skip_hidden_hoist) if live is None else live
             if entry.resolve() not in live:
                 continue
         data = json.loads(manifest.read_text(encoding='utf-8'))
@@ -565,8 +579,8 @@ def installed_targets(project):
     return targets
 
 
-def oracle(project, record, side):
-    targets = installed_targets(project)
+def oracle(project, record, side, skip_hidden_hoist=False):
+    targets = installed_targets(project, skip_hidden_hoist)
     checks = {}
     for target in targets:
         for filename, hashes in record['files'].items():
@@ -1357,6 +1371,19 @@ def main():
                     code, _ = run([bun, 'install', '--ignore-scripts', '--force'], project,
                                   env_for(bun, 'cache-rollback'), case / 'reinstall-force.log', False)
                     plain_ok, row['rollbackFiles'] = oracle(project, record, 'before')
+                if code == 0 and not plain_ok and version in STALE_HIDDEN_HOIST:
+                    # Every copy a declared dependency reaches is original;
+                    # only Bun's own stale hidden hoist link (which no install
+                    # flag repoints on this release) still reaches the
+                    # superseded patched entry. Recorded, not asserted.
+                    plain_ok, row['rollbackFiles'] = oracle(project, record, 'before',
+                                                            skip_hidden_hoist=True)
+                    if plain_ok:
+                        checks.pop('rollbackReinstallAdvised', None)
+                        row.setdefault('upstreamLimitations', []).append(
+                            'Bun %s keeps node_modules/.bun/node_modules/minimist on the '
+                            'superseded patched store entry after rollback, even under '
+                            '`bun install --force` (fixed in 1.3.1)' % version)
                 checks['rollbackOriginalBytes'] = code == 0 and plain_ok
             row['passed'] = all(checks.values())
         except Exception as error:  # noqa: BLE001 — every cell must produce a row

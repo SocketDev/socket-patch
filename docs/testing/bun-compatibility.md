@@ -447,6 +447,11 @@ asserted: supported → 0; hosted refusals → 0 with `redirect.redirected == 0`
   `bun install --force`. The isolated linker links the registry entry and
   leaves the superseded patched store entry under `node_modules/.bun`
   unlinked; the byte oracle counts only store entries something links to.
+  Bun 1.3.0 (only; 1.3.1 fixed it, measured 1.3.0–1.3.14) also leaves its
+  hidden hoist link `node_modules/.bun/node_modules/minimist` on that
+  superseded entry, even under `--force`; when that link is the only patched
+  copy left, the cell records it under `upstreamLimitations` instead of
+  failing.
 
 The runner captures the exact project manifests, lockfiles, the ledgers (and a
 `.socket/manifest.json` only where the `preexisting-manifest` shape seeded one),
