@@ -1,6 +1,6 @@
 [agent] Progress ledger for the scheduled pnpm bug-hunt routine (label pm:pnpm).
 
-Last updated: 2026-10-06 (run 26), main `9c43dfc`, latest release 4.0.0.
+Last updated: 2026-10-07 (run 27), main `9c43dfc`, latest release 4.0.0.
 
 Method: real pnpm installs. Hosted, vendored and global agent mode run against a local Python mock of the patch API (batch, by-package, view with inline blobs, `patches/blob/<hash>`, package grant, hosted tarball, `/registry/<name>/<ver>` mirror; `ajv-keywords@3.5.2` serves as the peer-dependency package). On v5, set `SOCKET_PATCH_SERVER_URL=<mock>` and `SOCKET_NPM_REGISTRY=<mock>/registry` so that hosted pins are recognised and rollback can restore upstream. The oracle is a marker prepended to `index.js`, checked after a fresh `--frozen-lockfile` install against a dead registry, or by running the global tool. The repo's pinned matrix (`.github/workflows/pnpm-compatibility.yml`) already covers plain hosted and vendored installs on pnpm 1–12. This ledger tracks what it doesn't.
 
@@ -259,6 +259,17 @@ Run 26 additions (main `9c43dfc`, Linux; scoped packages and `npm:` aliases):
 
 #956 and #957 aren't regressions: release 4.0.0 behaves the same (3.3.0 has no pnpm vendored mode).
 
+Run 27 additions (main `9c43dfc`, Linux; aliases and scoped packages in transitive positions, `file:` tarball parents):
+
+| pnpm (lock) | Vendored: scoped `npm:` alias in a transitive snapshot | Vendored: unscoped alias in a transitive snapshot (control) | Vendored: scoped parent → scoped transitive | Vendored: `vendor --revert` → frozen install over the patched tree | Agent: scoped `npm:` alias, direct / transitive (apply, vex, rollback) |
+| --- | --- | --- | --- | --- | --- |
+| 8.15.9 (6.0) | pass (refused) | untested | untested | untested | untested |
+| 9.15.9 | fail #957 (snapshot path, comment) | pass (refused) | pass | pass (byte-exact, upstream relinked, `vex` declines) | pass / pass |
+| 10.34.5 | untested | untested | pass | untested | untested |
+| 12.8.1 | fail #957 (snapshot path, comment) | pass (refused) | pass | pass | pass / pass |
+
+The #957 snapshot-path variant isn't a regression: release 4.0.0 behaves the same.
+
 Run 20 additions (main `045d7ec`, Linux):
 
 | pnpm (lock) | Vendored parent + vendored dep (`debug`→`ms`): `remove <parent>` / takeover → hosted / `rollback` | `remove <child>` (control) | Hosted parent + dep: remove parent / rollback | Mixed-case names (`Base64`, `JSONStream`): hosted / agent / vendored | User parent-selector / range-selector override (vendored) | Agent `symlink=false` / `hoist=false` | `list -g` |
@@ -314,8 +325,7 @@ Global mode (`-g`, v5 main `2463257`):
 9b. #902 follow-ups: the setting in the global `rc` / `config.yaml`. (Mirror + tarball URLs became #919 in run 24.)
 9c. #919 follow-ups: scoped `@scope:registry=` mirrors, the hosted → vendored takeover + `vendor --revert` on a mirror, pnpm 7/8 lock dialects, and re-verification once PR #918 (or a successor) covers `restore_pnpm_locks`.
 9d. #935 follow-ups: a `git+` / `github:` dependency sharing the patched name@version beside a registry copy, the pnpm 7 (5.4) dialect, a `link:` copy (should not contest), and `vex --product` on a member path.
-9e. #956 / #957 follow-ups: a scoped alias inside a transitive dependency's snapshot (`rest == reg_key` has the same quoting gap), scoped vendored in a pnpm 7/8 workspace layout, and re-verification once fixed.
-9f. Vendored scoped package with its own scoped transitive deps on 9.x / 12.x, and agent `apply` on a scoped `npm:` alias.
+9e. #956 / #957 follow-ups: scoped vendored in a pnpm 7/8 workspace layout, hosted mode over a scoped alias in a transitive snapshot, and re-verification once fixed (PR #961 covers #956; the fix for #957 must cover the snapshot path too, see the run 27 comment).
 10. Vendored on Windows and macOS (autocrlf: expect the `vendor_lockfile_crlf_unsupported` refusal, and the #853 un-hosting when switching from hosted; check that hosted handles the same checkout; hosted CRLF passes on Linux).
 
 ## Known non-bugs
@@ -383,3 +393,4 @@ Global mode (`-g`, v5 main `2463257`):
 - Vendored on a pnpm 1/2 `shrinkwrap.yaml` project fails closed with `vendor_lockfile_missing`, whose message lists `pnpm-lock.yaml` but not `shrinkwrap.yaml` (cosmetic; vendoring pnpm ≤ 6 is refused as documented).
 - Fixture note (run 24): pnpm caches registry metadata per host in `~/.cache/pnpm/metadata/<host>+<port>`. Give each mirror cell its own `XDG_CACHE_HOME`, or a mirror that changes its `dist.tarball` style serves stale URLs. For fresh-install checks, copy the working tree; a git clone takes the committed lock.
 - Fixture note (run 23): the Python mock rebuilds the patched tarball on every restart (the gzip mtime changes), so a pin's sha512 changes between mock restarts. Re-scan after restarting the mock.
+- Fixture note (run 27): agent `rollback --offline` needs the before blob staged in `.socket/blobs`; without it, rollback fails with `Before blob not found` (`missing_blob`). That's documented (`repair` fetches it).
