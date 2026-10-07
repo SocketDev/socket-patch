@@ -1693,7 +1693,8 @@ impl NpmCrawler {
         // the alias, its real dir `node_modules/<alias>` (#852), so those
         // entries are searched for alias copies like an importer tree.
         if !store_entry || is_npm_linked_store_entry(&nm_path) {
-            matched.extend(Self::alias_copies(&nm_path, &listing, pending));
+            let aliases = Self::alias_copies(&nm_path, &listing, pending, &matched);
+            matched.extend(aliases);
         }
         let gvs_member = !store_entry && may_be_gvs_workspace_member(&listing);
         let mut nested = Self::collect_nested_node_modules(&nm_path, listing);
@@ -1724,12 +1725,17 @@ impl NpmCrawler {
     /// Only real package dirs count (links are dependency edges into a
     /// store or into first-party source, never copies of their own), and
     /// a dir whose name is its package's own name is the direct probe's
-    /// job, so it is skipped here: that keeps one physical dir from being
-    /// recorded twice through a case-insensitive lookup.
+    /// job, so it is skipped here. A dir whose name differs only by case
+    /// (`node_modules/Left-Pad` holding `left-pad`) is an alias on a
+    /// case-sensitive file system, where the probe misses it; it is skipped
+    /// only when it IS the dir the probe already returned (`probed`, a
+    /// case-insensitive file system folding the probe's path onto it), so
+    /// one physical dir is never recorded twice (#856).
     fn alias_copies(
         nm_path: &Path,
         listing: &Listing,
         pending: &[Target],
+        probed: &[(usize, PathBuf)],
     ) -> Vec<(usize, PathBuf)> {
         let mut by_identity: HashMap<(&str, &str), Vec<usize>> = HashMap::new();
         for (index, target) in pending.iter().enumerate() {
@@ -1768,11 +1774,21 @@ impl NpmCrawler {
             else {
                 continue;
             };
-            if name.eq_ignore_ascii_case(&dir_key) {
+            if name == dir_key {
                 continue;
             }
+            let case_only = name.eq_ignore_ascii_case(&dir_key);
             if let Some(indices) = by_identity.get(&(name.as_str(), version.as_str())) {
-                found.extend(indices.iter().map(|&index| (index, pkg_path.clone())));
+                for &index in indices {
+                    let already_probed = case_only
+                        && probed.iter().any(|(probed_index, probed_path)| {
+                            *probed_index == index
+                                && same_file::is_same_file(probed_path, &pkg_path).unwrap_or(false)
+                        });
+                    if !already_probed {
+                        found.push((index, pkg_path.clone()));
+                    }
+                }
             }
         }
         found
@@ -3740,6 +3756,48 @@ mod tests {
         let copy = &found[&scoped][0];
         assert_eq!(copy.namespace.as_deref(), Some("@s"));
         assert_eq!(copy.name, "pkg");
+    }
+
+    /// #856: a key differing from the package's name only by case
+    /// (`node_modules/Left-Pad` holding `left-pad@1.3.0`, a legacy-valid
+    /// npm name) is an alias copy. On a case-sensitive file system the
+    /// direct probe of `node_modules/left-pad` misses it, so the alias pass
+    /// must return it; where the file system folds case the probe already
+    /// returned that physical dir, and it is reported exactly once.
+    #[tokio::test]
+    async fn find_by_purls_resolves_a_case_only_alias_once() {
+        let tmp = tempfile::tempdir().unwrap();
+        let nm = tmp.path().join("node_modules");
+        write_pkg(&nm.join("Left-Pad"), "left-pad", "1.3.0");
+        write_pkg(&nm.join("mm"), "minimist", "1.2.2");
+        let case_folding = nm.join("left-pad").exists();
+
+        let pad = "pkg:npm/left-pad@1.3.0".to_string();
+        let mm = "pkg:npm/minimist@1.2.2".to_string();
+        let found = NpmCrawler::new()
+            .find_by_purls(&nm, &[pad.clone(), mm.clone()])
+            .await
+            .unwrap();
+        let pad_copies = copy_paths(&found, &pad);
+        assert_eq!(pad_copies.len(), 1, "{pad_copies:?}");
+        if !case_folding {
+            assert_eq!(pad_copies, vec![nm.join("Left-Pad")]);
+        }
+        assert_eq!(copy_paths(&found, &mm), vec![nm.join("mm")]);
+
+        // Beside a plain copy (case-sensitive file systems only: a folding
+        // one cannot hold both names), both dirs are copies.
+        if !case_folding {
+            write_pkg(&nm.join("left-pad"), "left-pad", "1.3.0");
+            let found = NpmCrawler::new()
+                .find_by_purls(&nm, std::slice::from_ref(&pad))
+                .await
+                .unwrap();
+            assert_eq!(
+                copy_paths(&found, &pad),
+                vec![nm.join("left-pad"), nm.join("Left-Pad")]
+            );
+        }
     }
 
     /// A link is a dependency edge (into a store, a workspace member or an
