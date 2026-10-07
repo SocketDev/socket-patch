@@ -519,43 +519,53 @@ pub fn rewrite_registry_redirect_with_pipenv_version(
 /// any platform its markers allow, and a hosted pin narrows the entry to
 /// that one wheel: installs on any other interpreter, OS or architecture
 /// then fail, and hosted rollback cannot derive which upstream wheels to
-/// put back. Fail closed like hosted gem (`redirect_gem_platform_unsupported`):
-/// warn once per patch and withhold it from every PyPI rewriter. The tags
-/// are read the way vendored mode reads them for `vendor_platform_locked`.
+/// put back. Fail closed like hosted gem (`redirect_gem_platform_unsupported`).
+/// The tags are read the way vendored mode reads them for
+/// `vendor_platform_locked`. `None` for a portable wheel, an sdist, or a
+/// non-pypi override. The vendored→hosted takeover asks this BEFORE it
+/// reverts a vendored purl, so the refusal never strips a live patch.
+pub fn pypi_platform_wheel_refusal(dep: &DepOverride) -> Option<RewriteWarning> {
+    if dep.ecosystem != "pypi" {
+        return None;
+    }
+    let path = dep
+        .artifact_url
+        .split(['?', '#'])
+        .next()
+        .unwrap_or_default();
+    let file_name = path.rsplit('/').next().unwrap_or_default();
+    // An sdist carries no platform tags.
+    if !file_name.ends_with(".whl") {
+        return None;
+    }
+    let (platform_locked, tags) =
+        crate::vendor::pypi_distribution::wheel_platform_from_filename(file_name);
+    platform_locked.then(|| RewriteWarning {
+        code: "redirect_pypi_platform_wheel".into(),
+        detail: format!(
+            "the patched wheel for {}=={} is platform-specific ({tags}); pinning it \
+             would make the project's Python lockfiles install it on this platform \
+             only, so the redirect is skipped and nothing was written for it",
+            dep.name, dep.version
+        ),
+    })
+}
+
+/// Withhold every [`pypi_platform_wheel_refusal`] patch from all the PyPI
+/// rewriters, warning once per patch.
 fn withhold_pypi_platform_wheels<'a>(
     overrides: &'a [DepOverride],
     result: &mut RewriteResult,
 ) -> Cow<'a, [DepOverride]> {
     let mut refused = std::collections::BTreeSet::new();
     for dep in overrides {
-        if dep.ecosystem != "pypi" || refused.contains(&dep.patch_uuid) {
+        if refused.contains(&dep.patch_uuid) {
             continue;
         }
-        let path = dep
-            .artifact_url
-            .split(['?', '#'])
-            .next()
-            .unwrap_or_default();
-        let file_name = path.rsplit('/').next().unwrap_or_default();
-        // An sdist carries no platform tags.
-        if !file_name.ends_with(".whl") {
-            continue;
+        if let Some(warning) = pypi_platform_wheel_refusal(dep) {
+            refused.insert(dep.patch_uuid.clone());
+            result.warnings.push(warning);
         }
-        let (platform_locked, tags) =
-            crate::vendor::pypi_distribution::wheel_platform_from_filename(file_name);
-        if !platform_locked {
-            continue;
-        }
-        refused.insert(dep.patch_uuid.clone());
-        result.warnings.push(RewriteWarning {
-            code: "redirect_pypi_platform_wheel".into(),
-            detail: format!(
-                "the patched wheel for {}=={} is platform-specific ({tags}); pinning it \
-                 would make the project's Python lockfiles install it on this platform \
-                 only, so the redirect is skipped and nothing was written for it",
-                dep.name, dep.version
-            ),
-        });
     }
     withhold(overrides, &refused)
 }
