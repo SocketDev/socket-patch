@@ -72,6 +72,56 @@ pub fn pnpm_trust_manual_guidance(server: &str) -> String {
     )
 }
 
+/// The Rush variant (#713): every touched pnpm lock is a Rush common or
+/// subspace lock. rush runs pnpm in common/temp with a pnpm-workspace.yaml
+/// it generates itself, and pnpm-config.json has no `trustLockfile` key, so
+/// neither the repo-root workspace key nor `pnpm install --trust-lockfile`
+/// reaches the install — the only knob rush forwards is pnpm's
+/// `pnpm_config_trust_lockfile` env var. pnpm 11 additionally re-resolves a
+/// trusted hosted entry back to the registry under the
+/// `--no-prefer-frozen-lockfile` flag `rush install` passes by default
+/// (exit 0, upstream bytes), which the `usePnpmFrozenLockfileForRushInstall`
+/// experiment turns off. Verified with rush 5.180.0 on pnpm 11.0.0, 11.28.3
+/// and 12.8.1. The tail replaces the generic `--store-dir` reinstall: rush
+/// keeps its own store and node_modules under common/temp.
+pub fn pnpm_trust_rush_detail(server: &str) -> String {
+    format!(
+        "The Rush pnpm lockfile was repointed at {server}. pnpm >=11 does not \
+         install it under rush's default flow: it either fails \
+         (ERR_PNPM_TARBALL_URL_MISMATCH / \
+         ERR_PNPM_LOCKFILE_RESOLUTION_VERIFICATION) or — pnpm 11 — SILENTLY \
+         re-resolves the patched entries back to the vulnerable upstream \
+         artifact while still exiting 0. rush runs pnpm in common/temp with a \
+         pnpm-workspace.yaml it generates itself, so a repo-root \
+         `trustLockfile` setting or `--trust-lockfile` flag never reaches it; \
+         nothing was written. On pnpm 12, install with \
+         `pnpm_config_trust_lockfile=true rush install` (set the variable in \
+         CI too). On pnpm 11, also set \
+         `\"usePnpmFrozenLockfileForRushInstall\": true` in \
+         common/config/rush/experiments.json so `rush install` stops passing \
+         `--no-prefer-frozen-lockfile`. pnpm <=10 installs work unchanged. \
+         Note: trusting the lockfile makes pnpm skip its lockfile \
+         re-verification (minimumReleaseAge / trustPolicy re-checks) for ALL \
+         lockfile entries, not just the patched ones — the per-entry sha512 \
+         integrity pins are still enforced. Do NOT rebuild the lockfile \
+         (`rush update --full`, or deleting it): that silently discards the \
+         hosted patches. After a lock-only change, rush's store and \
+         node_modules under common/temp can still hold upstream files; run \
+         `rush purge` before `rush install` for a reliable reinstall, then \
+         run `socket-patch vex` to verify the patched files"
+    )
+}
+
+/// Appended to the generic trust warning when a run spliced a Rush lock
+/// ALONGSIDE a non-Rush pnpm lock, so the Rush half is not left with
+/// remedies that never reach rush's install.
+pub const PNPM_TRUST_RUSH_MIXED_NOTE: &str =
+    "For the Rush lockfiles this run also repointed, none of the above \
+     reaches rush's install: use `pnpm_config_trust_lockfile=true rush \
+     install` (pnpm 11 also needs `\"usePnpmFrozenLockfileForRushInstall\": \
+     true` in common/config/rush/experiments.json) and run `rush purge` \
+     first for a clean reinstall";
+
 /// The LEGACY-lock variant (lockfileVersion 5.x/6.0 — pnpm 7/8): those
 /// majors have neither the pnpm >=11 lockfile trust policy nor any trust
 /// flag or setting, so installs consume the redirected lock unchanged and

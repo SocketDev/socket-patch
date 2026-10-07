@@ -2722,6 +2722,61 @@ async fn rush_repo_state_stale_warning_is_gated_on_repo_state_presence() {
     );
 }
 
+/// pnpm >=11 rejects (or, under Rush's `--no-prefer-frozen-lockfile`
+/// install, silently re-resolves) a hosted-redirected lock unless the
+/// lockfile is trusted — but the generic `redirect_pnpm_trust_lockfile`
+/// remedies (`pnpm install --trust-lockfile`, a repo-root
+/// pnpm-workspace.yaml `trustLockfile` key, a `--store-dir` reinstall) do
+/// nothing in a Rush repo: rush runs pnpm in common/temp with a workspace
+/// file it generates itself (#713). A run that spliced only Rush locks must
+/// carry the Rush remedy instead: the `pnpm_config_trust_lockfile=true rush
+/// install` env var, the pnpm 11 `usePnpmFrozenLockfileForRushInstall`
+/// experiment, and a `rush purge` clean reinstall.
+#[tokio::test]
+#[serial]
+async fn rush_pnpm_trust_warning_gives_rush_remedy() {
+    let server = MockServer::start().await;
+    mock_discovery(&server).await;
+    mock_reference(&server).await;
+    mock_view(&server).await;
+
+    let tmp = tempfile::tempdir().unwrap();
+    write_rush_project(tmp.path(), false);
+    let env = run_redirect_subprocess(tmp.path(), &server.uri());
+    assert_eq!(env["status"], "success", "envelope: {env}");
+    let detail = env["redirect"]["warnings"]
+        .as_array()
+        .and_then(|arr| {
+            arr.iter()
+                .find(|w| w["code"] == "redirect_pnpm_trust_lockfile")
+                .and_then(|w| w["detail"].as_str())
+                .map(str::to_string)
+        })
+        .unwrap_or_else(|| panic!("redirect_pnpm_trust_lockfile must fire; envelope: {env}"));
+    for needle in [
+        "pnpm_config_trust_lockfile=true rush install",
+        "usePnpmFrozenLockfileForRushInstall",
+        "common/config/rush/experiments.json",
+        "rush purge",
+        "socket-patch vex",
+    ] {
+        assert!(
+            detail.contains(needle),
+            "the Rush trust detail must name `{needle}`; got:\n{detail}"
+        );
+    }
+    for needle in ["pnpm install --trust-lockfile", "--store-dir", "pnpm clean --lockfile"] {
+        assert!(
+            !detail.contains(needle),
+            "the Rush trust detail must not offer the pnpm-only `{needle}`; got:\n{detail}"
+        );
+    }
+    assert!(
+        !tmp.path().join("pnpm-workspace.yaml").exists(),
+        "rush nested-lock redirects must not create a root pnpm-workspace.yaml"
+    );
+}
+
 /// The `redirect_rush_repo_state_stale` warning claims a Rush lock "was edited
 /// outside `rush update`" — so it must fire only when the rewrite actually
 /// landed in a Rush lock. A Rush repo whose locks resolve only an UNRELATED
