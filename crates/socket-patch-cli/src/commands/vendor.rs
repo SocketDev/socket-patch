@@ -372,7 +372,7 @@ pub(crate) async fn dispatch_revert_one_opts(
     {
         return RevertOutcome::failed(vendor::path::vendor_dir_symlink_detail(&link));
     }
-    match entry.ecosystem.as_str() {
+    match vendor::jvm::layout::ledger_ecosystem(&entry.ecosystem) {
         "npm" => vendor::npm_flavor::revert_npm_any_opts(entry, project_root, opts).await,
         "pypi" => vendor::pypi::revert_pypi_opts(entry, project_root, opts).await,
         "gem" => vendor::gem::revert_gem_opts(entry, project_root, opts).await,
@@ -380,7 +380,7 @@ pub(crate) async fn dispatch_revert_one_opts(
         "golang" => vendor::golang::revert_go_vendor_opts(entry, project_root, opts).await,
         "composer" => vendor::composer_lock::revert_composer_opts(entry, project_root, opts).await,
         "nuget" => vendor::nuget_feed::revert_nuget_opts(entry, project_root, opts).await,
-        "maven" | "jvm" => vendor::maven_repo::revert_maven_opts(entry, project_root, opts).await,
+        "maven" => vendor::maven_repo::revert_maven_opts(entry, project_root, opts).await,
         other => RevertOutcome::failed(format!(
             "this build has no vendor backend for ecosystem `{other}`"
         )),
@@ -1141,15 +1141,9 @@ async fn run_check(args: &VendorArgs) -> i32 {
         }
     };
     if state.entries.is_empty()
-        && [
-            ".socket/vendor/maven2",
-            ".socket/vendor/gradle",
-            ".socket/vendor/gradle-index.tsv",
-            socket_patch_core::vendor::jvm::sbt::BUILD_FILE,
-        ]
-        .iter()
-        .chain(socket_patch_core::vendor::jvm::coursier_tree::ORPHAN_PATHS)
-        .any(|rel| root.join(rel).exists())
+        && socket_patch_core::vendor::jvm::layout::ORPHAN_PATHS
+            .iter()
+            .any(|rel| root.join(rel).exists())
     {
         return emit_eject_refusal(&args.common, "vendor_ledger_missing", "JVM artifacts exist without a vendor ledger; restore .socket/vendor/state.json from version control");
     }
@@ -1386,7 +1380,7 @@ impl EjectSnapshot {
             ));
         }
         planned.extend(
-            socket_patch_core::vendor::jvm::coursier_tree::CAPTURED_FILES
+            socket_patch_core::vendor::jvm::layout::CAPTURED_FILES
                 .iter()
                 .map(|s| s.to_string()),
         );
@@ -6784,7 +6778,7 @@ mod eject_snapshot_tests {
     #[tokio::test]
     async fn snapshot_fails_closed_on_a_fifo() {
         let tmp = tempfile::tempdir().unwrap();
-        let rel = socket_patch_core::vendor::jvm::coursier_tree::CAPTURED_FILES[0];
+        let rel = socket_patch_core::vendor::jvm::layout::CAPTURED_FILES[0];
         let path = tmp.path().join(rel);
         std::fs::create_dir_all(path.parent().unwrap()).unwrap();
         let c = std::ffi::CString::new(path.to_str().unwrap()).unwrap();

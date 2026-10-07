@@ -29,10 +29,10 @@ use crate::utils::purl::parse_maven_purl;
 use super::super::state::{VendorEntry, WiringAction, WiringRecord};
 use super::super::{RevertOpts, RevertOutcome, VendorWarning};
 use super::{
-    coursier_tree, gradle, maven_reactor, op_of, op_str, safe_coordinates, sbt, scala_cli,
-    sha256_hex, Coords, JvmPlan, JvmUnplan, Shape, CONFIG_LINE_KIND, COURSIER_INDEX_KIND,
-    CREATED_DIR_KIND, DERIVED_METADATA_KIND, KINDS, OWNED_FILE_KIND, POM_FRAGMENT_KIND,
-    SBT_FRAGMENT_KIND, SETTINGS_FRAGMENT_KIND, TREE_KIND, VERIFICATION_FRAGMENT_KIND,
+    coursier_tree, gradle, layout, maven_reactor, op_of, op_str, sbt, scala_cli, sha256_hex,
+    Coords, JvmPlan, JvmUnplan, Shape, CONFIG_LINE_KIND, COURSIER_INDEX_KIND, CREATED_DIR_KIND,
+    DERIVED_METADATA_KIND, KINDS, OWNED_FILE_KIND, POM_FRAGMENT_KIND, SBT_FRAGMENT_KIND,
+    SETTINGS_FRAGMENT_KIND, TREE_KIND, VERIFICATION_FRAGMENT_KIND,
 };
 
 /// Whether `entry` was written by this backend: it has wiring and every
@@ -62,7 +62,7 @@ pub fn entry_gav(entry: &VendorEntry) -> Result<(String, String, String), String
     }
     let (g, a, v) = parse_maven_purl(&entry.base_purl)
         .ok_or_else(|| format!("not a maven purl: {:?}", entry.base_purl))?;
-    if !safe_coordinates(&g, &a, &v) {
+    if !layout::safe_coordinates(&g, &a, &v) {
         return Err(format!("unsafe maven coordinates in {:?}", entry.base_purl));
     }
     Ok((g.into_owned(), a.into_owned(), v.into_owned()))
@@ -294,12 +294,12 @@ fn is_vendored_tree_file(reader: &ProjectReader, rel: &str, existing: &[u8]) -> 
         return false;
     };
     let parse = |bytes: &[u8]| serde_json::from_slice::<Value>(bytes).ok();
-    if name == maven_reactor::MARKER_FILE {
+    if name == layout::MARKER_FILE {
         return parse(existing)
             .is_some_and(|m| m.get("uuid").is_some() && m.get("schema").is_some());
     }
     reader
-        .read(&format!("{dir}/{}", maven_reactor::MARKER_FILE))
+        .read(&format!("{dir}/{}", layout::MARKER_FILE))
         .and_then(|m| parse(&m))
         .and_then(|m| {
             m.get("files")?
@@ -322,7 +322,7 @@ pub async fn write_plan(root: &Path, plan: &JvmPlan) -> Result<Vec<WiringRecord>
     let mut targets = Vec::new();
     for w in &plan.writes {
         let allowed = if w.tree {
-            VENDOR_TREES
+            layout::VENDOR_TREES
                 .iter()
                 .any(|tree| w.rel.strip_prefix(tree).is_some_and(|r| r.starts_with('/')))
         } else {
@@ -505,8 +505,7 @@ fn sides(wiring: &[WiringRecord]) -> (bool, bool) {
     let gradle = is_gradle(wiring);
     let maven = wiring.iter().any(|w| {
         matches!(w.kind.as_str(), POM_FRAGMENT_KIND | CONFIG_LINE_KIND)
-            || w.file
-                .starts_with(&format!("{}/", maven_reactor::TREE_ROOT))
+            || w.file.starts_with(&format!("{}/", layout::MAVEN2_TREE))
     });
     (maven || !gradle, gradle)
 }
@@ -548,7 +547,7 @@ fn is_gradle(wiring: &[WiringRecord]) -> bool {
             SETTINGS_FRAGMENT_KIND | VERIFICATION_FRAGMENT_KIND
         ) || w.file == gradle::INDEX_REL
             || w.file == gradle::SCRIPT_REL
-            || w.file.starts_with(&format!("{}/", gradle::TREE_ROOT))
+            || w.file.starts_with(&format!("{}/", layout::GRADLE_TREE))
     })
 }
 
@@ -694,20 +693,12 @@ pub async fn revert(root: &Path, entry: &VendorEntry, opts: RevertOpts) -> Rever
     }
 }
 
-/// The vendored repository trees JVM entries write under `.socket/vendor`
-/// (sbt's Coursier tree included).
-pub(crate) const VENDOR_TREES: &[&str] = &[
-    ".socket/vendor/maven2",
-    ".socket/vendor/gradle",
-    coursier_tree::TREE_ROOT,
-];
-
 /// Owned directories pruned once empty, up to and including themselves.
 const OWNED_DIRS: &[&str] = &[
-    ".socket/vendor/maven2",
-    ".socket/vendor/gradle",
+    layout::MAVEN2_TREE,
+    layout::GRADLE_TREE,
     ".socket/gradle",
-    coursier_tree::TREE_ROOT,
+    layout::COURSIER_TREE,
 ];
 
 /// Remove, deepest first and only when empty, the parents of `removed` up to
@@ -1061,13 +1052,13 @@ pub fn checked_tree_jar(root: &Path, entry: &VendorEntry, uuid: &str) -> Result<
             return Err("vendor_artifact_missing".into());
         }
     }
-    if rel.starts_with(".socket/vendor/maven2/") {
+    if rel.starts_with(&format!("{}/", layout::MAVEN2_TREE)) {
         return Ok(rel);
     }
     let marker_path = format!(
         "{}/{}",
         rel.rsplit_once('/').ok_or("vendor_path_unsafe")?.0,
-        gradle::MARKER_NAME
+        layout::MARKER_FILE
     );
     let reader = ProjectReader::new(root);
     let bytes = reader.read(&marker_path).ok_or("vendor_artifact_missing")?;
@@ -1396,7 +1387,7 @@ mod tests {
             "uuid": UUID,
         });
         std::fs::write(
-            root.join(tree_file("socket-patch.vendor.json")),
+            root.join(tree_file(layout::MARKER_FILE)),
             serde_json::to_vec(&marker).unwrap(),
         )
         .unwrap();

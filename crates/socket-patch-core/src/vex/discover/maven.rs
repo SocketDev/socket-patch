@@ -88,10 +88,9 @@ use super::{
     Discovery, PatchedRef, WiringMode, DIAG_LOCKFILE_UNPARSEABLE, DIAG_REF_INVALID,
     DIAG_REF_UNATTRIBUTABLE,
 };
-use crate::patch::redirect::{
-    local_repo_artifact_path, MVN_CHECKSUMS, MVN_CONFIG, TRUSTED_CHECKSUMS_ON,
-};
+use crate::patch::redirect::{MVN_CHECKSUMS, MVN_CONFIG, TRUSTED_CHECKSUMS_ON};
 use crate::utils::digest::sha256_hex;
+use crate::vendor::jvm::layout;
 use crate::vendor::lock_inventory::LockIntegrity;
 use crate::formats::maven::{
     is_maven_coordinate, is_maven_version_text, parse_pom, split_socket_version, Pom, PomDep,
@@ -249,9 +248,9 @@ async fn extract_hosted(
         let jvm_tree = candidates.is_empty()
             && ctx
                 .exists(&format!(
-                    "{}/{}/{artifact}/{pinned}/{artifact}-{pinned}.jar",
-                    crate::vendor::jvm::maven_reactor::TREE_ROOT,
-                    group.replace('.', "/")
+                    "{}/{}",
+                    layout::MAVEN2_TREE,
+                    layout::artifact_path(group, artifact, &pinned, None, "jar")
                 ))
                 .await;
         match candidates.as_slice() {
@@ -315,7 +314,7 @@ async fn extract_hosted(
         if checksums.is_none() {
             checksums = Some(trusted_checksums(ctx, out).await);
         }
-        let jar = local_repo_artifact_path(group, artifact, pinned, "jar");
+        let jar = layout::artifact_path(group, artifact, pinned, None, "jar");
         let integrity = checksums
             .as_ref()
             .and_then(|c| c.get(&jar))
@@ -397,7 +396,7 @@ async fn extract_vendored(
         let (group, artifact, version) = (group.as_ref(), artifact.as_ref(), version.as_ref());
         let rel = format!(
             "{dir}/{}",
-            local_repo_artifact_path(group, artifact, version, "jar")
+            layout::artifact_path(group, artifact, version, None, "jar")
         );
         let jar_ok = tokio::fs::symlink_metadata(ctx.root.join(&rel))
             .await

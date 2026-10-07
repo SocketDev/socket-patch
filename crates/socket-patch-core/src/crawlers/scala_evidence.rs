@@ -310,7 +310,7 @@ fn is_stale(root: &Path, sources: &[PathBuf], evidence_time: SystemTime) -> bool
         return true;
     }
     let listed: BTreeSet<String> = sources.iter().filter_map(|p| rel_of(p)).collect();
-    let project = crate::vendor::jvm::scala_cli::PROJECT_FILE;
+    let project = crate::vendor::jvm::layout::SCALA_CLI_FILE;
     if !listed.contains(project) && std::fs::symlink_metadata(root.join(project)).is_ok() {
         debug_log("scala-cli evidence: the newest project does not list project.scala");
         return true;

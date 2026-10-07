@@ -1671,7 +1671,7 @@ async fn vendored_takeover(
             || p.starts_with("pkg:maven/")
     };
     let gradle_jvm_entry = |entry: &socket_patch_core::vendor::VendorEntry| {
-        entry.ecosystem == "jvm"
+        entry.ecosystem == socket_patch_core::vendor::jvm::layout::LEDGER_ECOSYSTEM
             && entry.wiring.iter().any(|w| {
                 w.file.ends_with(".gradle")
                     || w.file.ends_with(".gradle.kts")

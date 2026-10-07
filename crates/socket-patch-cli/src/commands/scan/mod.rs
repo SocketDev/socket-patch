@@ -1226,7 +1226,10 @@ async fn gradle_scan(
         .unwrap_or_default();
     let want_locks = !out.gradle_purls.is_empty();
     let Ok((gate, locked, mismatch, env)) = tokio::task::spawn_blocking(move || {
-        let gradle_build = gradle_cache::has_gradle_marker(&cwd);
+        let gradle_build = socket_patch_core::vendor::jvm::layout::has_build(
+            &cwd,
+            socket_patch_core::vendor::jvm::layout::BuildTool::Gradle,
+        );
         let env = JvmEnv::from_process();
         let gate = (!global && gradle_build).then(|| m2_gate(&cwd, &env));
         // The cwd's build locks annotate Gradle-cached packages in a global

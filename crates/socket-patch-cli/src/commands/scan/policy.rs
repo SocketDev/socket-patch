@@ -90,7 +90,7 @@ pub(crate) fn dir_markers(dir: &Path) -> Vec<String> {
         // No lockfile: the manifests say what the project is.
         markers = MANIFEST_MARKERS
             .iter()
-            .chain(socket_patch_core::crawlers::jvm_cache::JVM_PROJECT_MARKERS)
+            .chain(socket_patch_core::vendor::jvm::layout::JVM_PROJECT_MARKERS)
             .filter(|name| dir.join(name).is_file())
             .map(|name| name.to_string())
             .collect();
@@ -100,7 +100,7 @@ pub(crate) fn dir_markers(dir: &Path) -> Vec<String> {
 }
 
 /// Manifests that stand in as markers for a root with no lockfile (plus
-/// every JVM build file, `jvm_cache::JVM_PROJECT_MARKERS`).
+/// every JVM build file, `layout::JVM_PROJECT_MARKERS`).
 const MANIFEST_MARKERS: [&str; 6] = [
     "package.json",
     "pyproject.toml",
