@@ -1,6 +1,6 @@
 [agent] Progress ledger for the scheduled Bundler (RubyGems) bug-hunt routine (label pm:bundler).
 
-Last updated: 2026-10-06 (run 26), main `9c43dfc` (includes #637, #621, #797, #805, #849, #731, #750, #712), latest release tag v4.0.0. Newest Bundler tested: 4.1.0.beta1 (repo gem e2e suites pass).
+Last updated: 2026-10-07 (run 27), main `9c43dfc` (includes #637, #621, #797, #805, #849, #731, #750, #712), latest release tag v4.0.0. Newest Bundler tested: 4.1.0.beta1 (repo gem e2e suites pass).
 
 ## Coverage matrix
 
@@ -232,6 +232,15 @@ Also on 4.0.17: BOM `Gemfile` passes; symlinked `Gemfile` / lock is refused (pas
 | Control: no setting (system install) | pass | — | — |
 | PR #953 head `52542db` on the #951 agent shape | pass (fixes #951) | — | — |
 
+### Run 27 (main `9c43dfc`; Linux Ruby 3.3.6; `gemspec` library projects)
+
+| Cell | 4.0.22 | 4.0.0 / 4.0.10 / 4.0.17 | 2.7.2 | 2.6.9 |
+| --- | --- | --- | --- | --- |
+| Hosted: gemspec dev dep only (no Gemfile line) | pass (refused: `redirect_gem_declaration_not_visible`) | — | — | — |
+| Hosted, CHECKSUMS lock: gemspec dev dep + Gemfile `gem` line → fresh frozen install | fail #985 (×3) | fail #985 | fail #985 | pass |
+| Hosted: gemspec runtime dep + Gemfile `gem` line → fresh frozen install | pass | — | — | — |
+| Vendored: gemspec dev dep + Gemfile `gem` line → fresh frozen install | fail #985 (×2) | — | fail #985 | pass |
+
 ### Global mode (`-g`)
 
 | OS | Ruby / Bundler | `scan -g` report | `-g` vs project scoping | `scan -g --mode hosted` refused | `get -g` / `apply -g` | `rollback -g` byte-exact | `vex -g` | `--global-prefix <gems dir>` / `SOCKET_GLOBAL=1` | Non-writable gem dir |
@@ -254,13 +263,14 @@ Also on 4.0.17: BOM `Gemfile` passes; symlinked `Gemfile` / lock is refused (pas
 
 ## Backlog
 
-1. Re-run #681 / #729 / #749 / #751 / #775 / #826 / #896 / #915 / #951 / #952 / #967 when fixes merge (open PRs #684, #768, #776, #875, #916, #953). #875 head `5b9953d3` already passes every #826 shape. #953 head `52542db` fixes the #951 agent shape. #916 covers the `to_bool` spellings and the hosted stale guard. #776 covers every vendored-refused block shape. #684 head `0e1e6cda` misses 4.1's quoted URL-scoped mirror keys.
-2. #967 neighbours: the hosted stale guard with a stale `.bundle/ruby/<abi>` copy; `rollback` under `simulate_version 5`; other Bundler 5-mode defaults socket-patch models. When Bundler 5 ships, `.bundle` becomes the plain default, so re-run everything there.
-3. #952 neighbours: under `BUNDLE_GEMFILE=gemfiles/x.gemfile`, check `cache_path` in `gemfiles/.bundle/config` for the hosted stale guard and `vex`, and the env `BUNDLE_APP_CONFIG` relative to the moved root.
-4. More `.bundle/config` parser divergences from Bundler's `YAMLSerializer`: `KEY:"v"` with no space, a value with trailing spaces after the closing quote, `#` inside a quoted value. All contrived, so low priority.
-5. RubyGems 4.1 + Bundler 4.1 content-addressed installs (`gems/<name>-<ver>-<hex8>`): revisit when a gem is published that way.
-6. Windows `x64-mingw-ucrt` platform gems in hosted and vendored modes; vendored cells and `repair` on Windows and macOS.
-7. Bundler 1.17 hosted unwind (Ruby ≤ 3.1 probe); `rollback` / `remove` on a custom-lock project.
+1. Re-run #681 / #729 / #749 / #751 / #775 / #826 / #896 / #915 / #951 / #952 / #967 / #985 when fixes merge (open PRs #684, #768, #776, #875, #916, #953). #875 head `5b9953d3` already passes every #826 shape. #953 head `52542db` fixes the #951 agent shape. #916 covers the `to_bool` spellings and the hosted stale guard. #776 covers every vendored-refused block shape. #684 head `0e1e6cda` misses 4.1's quoted URL-scoped mirror keys.
+2. #985 neighbours: hosted `rollback` on the gemspec dev-dep shape (the exact-pin restore may then fail frozen installs), `get <uuid> --mode hosted`, and H→V takeover on that shape.
+3. #967 neighbours: the hosted stale guard with a stale `.bundle/ruby/<abi>` copy; `rollback` under `simulate_version 5`; other Bundler 5-mode defaults socket-patch models. When Bundler 5 ships, `.bundle` becomes the plain default, so re-run everything there.
+4. #952 neighbours: under `BUNDLE_GEMFILE=gemfiles/x.gemfile`, check `cache_path` in `gemfiles/.bundle/config` for the hosted stale guard and `vex`, and the env `BUNDLE_APP_CONFIG` relative to the moved root.
+5. More `.bundle/config` parser divergences from Bundler's `YAMLSerializer`: `KEY:"v"` with no space, a value with trailing spaces after the closing quote, `#` inside a quoted value. All contrived, so low priority.
+6. RubyGems 4.1 + Bundler 4.1 content-addressed installs (`gems/<name>-<ver>-<hex8>`): revisit when a gem is published that way.
+7. Windows `x64-mingw-ucrt` platform gems in hosted and vendored modes; vendored cells and `repair` on Windows and macOS.
+8. Bundler 1.17 hosted unwind (Ruby ≤ 3.1 probe); `rollback` / `remove` on a custom-lock project.
 
 ## Known non-bugs
 
@@ -342,4 +352,4 @@ Also on 4.0.17: BOM `Gemfile` passes; symlinked `Gemfile` / lock is refused (pas
 - Bundler's config loader keeps the double quotes when a quoted value is followed by a comment (`BUNDLE_PATH: ".gems" # c` → `"\".gems\""`) or by trailing spaces. Bundler itself breaks there, so only the unquoted `value # comment` shape (#951) is a socket-patch bug (run 25).
 - Bundler's config loader doesn't unescape `inspect`-written values (`"D:\\a\\proj"`, `"\u00FC"`), and neither does socket-patch, so they agree (run 25).
 - Under `BUNDLE_GEMFILE=gemfiles/x.gemfile`, Bundler reads `gemfiles/.bundle/config` and ignores the root `.bundle/config` (verified with 4.0.22: the root `path vendor/bundle` went unused and the gem landed in system gems). setup-ruby's `bundler-cache` writes an absolute `$PWD/vendor/bundle`, so the crawler's default `vendor/bundle` probe happens to find it; only relative paths hit #952 (run 25).
-
+- Gemspec-library cells (run 27): the hosted/vendored harness copies must also copy `mylib.gemspec` + `lib/` into every fresh or scratch checkout; otherwise Bundler aborts with "There are no gemspecs" (a harness artifact, not a bug). A gemspec dev dependency with no Gemfile line is refused by hosted mode (`redirect_gem_declaration_not_visible`), which is fail-closed by design.
