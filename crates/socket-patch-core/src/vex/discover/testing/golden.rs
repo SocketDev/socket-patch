@@ -123,6 +123,7 @@ fn render(out: &Discovery, root: &Path) -> Value {
         unpatched_copies,
         unattested,
         contested,
+        install_trees,
     } = out;
     let refs: Vec<Value> = refs
         .iter()
@@ -268,6 +269,13 @@ fn render(out: &Discovery, root: &Path) -> Value {
                 })
             })
             .collect::<Vec<_>>()
+            .into();
+    }
+    if !install_trees.is_empty() {
+        rendered["install_trees"] = install_trees
+            .iter()
+            .map(|(file, root)| (path_str(file), Value::from(path_str(root))))
+            .collect::<Map<_, _>>()
             .into();
     }
     rendered
