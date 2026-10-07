@@ -94,7 +94,7 @@ use crate::formats::yarn::patterns::{
     classic_key_real_name, pattern_real_name, resolution_selector_target, split_resolved_sha1,
     BerryLocator,
 };
-use crate::formats::yarn::source::{classic_block_source, ClassicBlockSource};
+use crate::formats::yarn::source::{classic_copy_source, CopySource};
 use crate::patch::redirect::is_berry_lock;
 use crate::utils::digest::is_sri_pin;
 use crate::vendor::lock_inventory::yarn::{
@@ -170,10 +170,10 @@ fn classic_block(ctx: &DiscoverCtx<'_>, entry: &YarnEntry, out: &mut Discovery) 
         block, patterns, ..
     } = entry;
     let resolved = classic_field(&block.lines, "resolved");
-    match classic_block_source(patterns, resolved) {
+    match classic_copy_source(patterns, resolved) {
         // yarn 1 fetches a git pattern with git, from `resolved` (#363): the
         // copy is the git bytes, whatever `resolved` names.
-        ClassicBlockSource::Git => {
+        CopySource::Git => {
             // A Socket wiring here (an older release rewired it) is inert.
             if resolved.is_some_and(|r| classify(ctx, r, YARN_LOCK, &block.key, out).is_some()) {
                 out.diag(
@@ -197,7 +197,7 @@ fn classic_block(ctx: &DiscoverCtx<'_>, entry: &YarnEntry, out: &mut Discovery) 
         }
         // yarn 1 copies a `file:` directory into node_modules (#921): that
         // copy is the directory's bytes, and no `resolved` there is fetched.
-        ClassicBlockSource::Directory => {
+        CopySource::Directory => {
             out.unpatched_copy(
                 YARN_LOCK,
                 classic_block_purl(entry),
@@ -208,8 +208,10 @@ fn classic_block(ctx: &DiscoverCtx<'_>, entry: &YarnEntry, out: &mut Discovery) 
             return;
         }
         // `link:` ranges install from the working tree; `resolved` is inert.
-        ClassicBlockSource::Link | ClassicBlockSource::Unresolved => return,
-        ClassicBlockSource::Tarball => {}
+        CopySource::Link | CopySource::Unresolved => return,
+        // A hosted pin an older release wrote on a remote tarball copy
+        // replaced it with the registry artifact, so that copy IS Socket's.
+        CopySource::Registry | CopySource::RemoteTarball => {}
     }
     let Some(resolved) = resolved else {
         return;

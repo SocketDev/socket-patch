@@ -69,7 +69,7 @@ use crate::formats::yarn::patterns::{
     classic_key_real_name, split_berry_key_patterns, split_key_patterns, split_pattern,
 };
 use crate::formats::yarn::stanzas::{stanza_key, BerryStanzas};
-use crate::formats::yarn::source::{classic_block_source, ClassicBlockSource};
+use crate::formats::yarn::source::{classic_copy_source, CopySource};
 #[cfg(test)]
 mod pnpm_equivalence_tests;
 #[cfg(test)]
@@ -3530,12 +3530,12 @@ fn rewrite_yarn_classic(
             }
             let key = &block.key;
             let resolved = classic_field(&block.lines, "resolved");
-            let source = classic_block_source(patterns, resolved);
+            let source = classic_copy_source(patterns, resolved);
             // yarn 1 COPIES a `file:` directory (or a block with no
             // `resolved`) into node_modules (#921): there is no tarball to
             // repoint, so that copy keeps the directory's unpatched bytes —
             // named, and never assumed applied by the in-run VEX.
-            if source == ClassicBlockSource::Directory {
+            if source == CopySource::Directory {
                 copy_skipped = true;
                 result.bundled_skipped_uuids.insert(dep.patch_uuid.clone());
                 result.warnings.push(RewriteWarning {
@@ -3554,7 +3554,7 @@ fn rewrite_yarn_classic(
             // the block stays byte-identical and that copy keeps the git
             // bytes — never assumed patched by the in-run VEX. Checked
             // before the alias gate: an alias of a git range is git too.
-            if source == ClassicBlockSource::Git {
+            if source == CopySource::Git {
                 copy_skipped = true;
                 result.bundled_skipped_uuids.insert(dep.patch_uuid.clone());
                 result.warnings.push(RewriteWarning {
@@ -3563,6 +3563,27 @@ fn rewrite_yarn_classic(
                         "lock entry `{key}` installs {fname}@{} from git, which yarn fetches \
                          from the git source rather than a tarball; the hosted redirect leaves \
                          it untouched, so this copy stays unpatched",
+                        dep.version
+                    ),
+                });
+                continue;
+            }
+            // A `file:` tarball, URL or hosted-git shorthand copy (B16) is
+            // the user's own artifact — a fork, a local build — not the
+            // registry package: pinning it to Socket's patched REGISTRY
+            // artifact would silently swap the user's code for registry
+            // bytes, and nothing records the original `resolved` for a
+            // rollback. Left untouched and named, like the git copy.
+            if source == CopySource::RemoteTarball {
+                copy_skipped = true;
+                result.bundled_skipped_uuids.insert(dep.patch_uuid.clone());
+                result.warnings.push(RewriteWarning {
+                    code: "redirect_yarn_classic_non_registry_skipped".into(),
+                    detail: format!(
+                        "lock entry `{key}` installs {fname}@{} from a tarball that is not the \
+                         registry's (a file: tarball, URL or hosted-git dependency); the hosted \
+                         redirect only repoints registry copies, so it leaves this one \
+                         untouched and this copy stays unpatched",
                         dep.version
                     ),
                 });
@@ -10300,6 +10321,60 @@ mod tests {
         assert_eq!(r.warnings[0].code, "redirect_yarn_classic_entry_not_found");
     }
 
+    /// B16: a `file:` tarball, URL or hosted-git (codeload) copy is the
+    /// user's own artifact, not the registry package: the hosted pin would
+    /// swap it for Socket's patched registry bytes. It stays byte-identical,
+    /// named, and out of the in-run VEX, while the registry block beside it
+    /// is pinned. The old rewriter repointed all three.
+    #[test]
+    fn yarn_classic_non_registry_tarball_copies_are_skipped() {
+        let ovr = npm_override(
+            "left-pad",
+            "1.3.0",
+            "http://p.test/lp.tgz",
+            "sha512-PATCHED==",
+        );
+        let registry_block = "left-pad@^1.3.0:\n  version \"1.3.0\"\n  \
+             resolved \"https://registry.yarnpkg.com/left-pad/-/left-pad-1.3.0.tgz#bbbb\"\n  \
+             integrity sha512-UPSTREAMupstream==\n";
+        let copies = [
+            "\"left-pad@file:./old/left-pad-1.3.0.tgz\":\n  version \"1.3.0\"\n  \
+             resolved \"file:./old/left-pad-1.3.0.tgz#cccc\"\n",
+            "\"left-pad@https://host.test/fork/left-pad-1.3.0.tgz\":\n  version \"1.3.0\"\n  \
+             resolved \"https://host.test/fork/left-pad-1.3.0.tgz\"\n  integrity sha512-FORK==\n",
+            "left-pad@stevemao/left-pad#v1.3.0:\n  version \"1.3.0\"\n  \
+             resolved \"https://codeload.github.com/stevemao/left-pad/tar.gz/ff8e7ba5\"\n",
+        ];
+        for copy in copies {
+            let mut files = BTreeMap::new();
+            files.insert(
+                "yarn.lock".to_string(),
+                format!("# yarn lockfile v1\n\n\n{registry_block}\n{copy}"),
+            );
+            let mut r = RewriteResult::default();
+            rewrite_yarn_classic(&files, std::slice::from_ref(&ovr), &mut r);
+            assert_eq!(r.edits.len(), 1, "{copy}: {:?}", r.edits);
+            let out = &r.files["yarn.lock"];
+            assert!(out.contains("resolved \"http://p.test/lp.tgz\""), "{out}");
+            assert!(out.ends_with(copy), "{copy}: copy byte-identical:\n{out}");
+            let codes: Vec<&str> = r.warnings.iter().map(|w| w.code.as_str()).collect();
+            assert_eq!(codes, ["redirect_yarn_classic_non_registry_skipped"], "{copy}");
+            assert!(r.bundled_skipped_uuids.contains(&ovr.patch_uuid), "{copy}");
+
+            // As the only copy: nothing is written, and the scan says why.
+            let mut files = BTreeMap::new();
+            files.insert(
+                "yarn.lock".to_string(),
+                format!("# yarn lockfile v1\n\n\n{copy}"),
+            );
+            let mut r = RewriteResult::default();
+            rewrite_yarn_classic(&files, std::slice::from_ref(&ovr), &mut r);
+            assert!(r.files.is_empty() && r.edits.is_empty(), "{copy}: {:?}", r.files);
+            let codes: Vec<&str> = r.warnings.iter().map(|w| w.code.as_str()).collect();
+            assert_eq!(codes, ["redirect_yarn_classic_non_registry_skipped"], "{copy}");
+        }
+    }
+
     /// #921: yarn 1 COPIES a `file:` directory dependency into
     /// node_modules, so its block (no `resolved`) has nothing to repoint.
     /// Beside a registry block, the registry block is wired and the copy is
@@ -10436,7 +10511,8 @@ mod tests {
             .any(|w| w.code == "redirect_yarn_classic_git_skipped"));
         assert!(r.bundled_skipped_uuids.contains(&ovr.patch_uuid));
 
-        // The codeload shorthand is a tarball to yarn: still rewired.
+        // The codeload shorthand is a tarball to yarn, but not the registry
+        // package (B16): named as a non-registry copy, not as git.
         files.insert(
             "yarn.lock".to_string(),
             "# yarn lockfile v1\n\n\nleft-pad@stevemao/left-pad#v1.3.0:\n  version \"1.3.0\"\n  \
@@ -10445,8 +10521,9 @@ mod tests {
         );
         let mut r = RewriteResult::default();
         rewrite_yarn_classic(&files, std::slice::from_ref(&ovr), &mut r);
-        assert_eq!(r.edits.len(), 1, "{:?}", r.warnings);
-        assert!(r.warnings.is_empty(), "{:?}", r.warnings);
+        assert!(r.edits.is_empty(), "{:?}", r.edits);
+        let codes: Vec<&str> = r.warnings.iter().map(|w| w.code.as_str()).collect();
+        assert_eq!(codes, ["redirect_yarn_classic_non_registry_skipped"]);
     }
 
     /// The opposite alias direction — `"alias@npm:<fname>@…"` consuming the

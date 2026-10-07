@@ -32,7 +32,7 @@ use crate::formats::yarn::blocks::{
     LockBlock,
 };
 use crate::formats::yarn::patterns::{classic_key_real_name, split_key_patterns};
-use crate::formats::yarn::source::{classic_block_source, ClassicBlockSource};
+use crate::formats::yarn::source::{classic_copy_source, CopySource};
 use crate::manifest::schema::PatchRecord;
 use crate::patch::apply::PatchSources;
 use crate::utils::fs::{atomic_write_bytes_preserving_mode, read_regular_to_string};
@@ -290,7 +290,8 @@ fn refuse_berry_lock(text: &str) -> Result<(), Box<VendorOutcome>> {
 
 /// [`vendor_yarn_classic`]'s step 3: classify every block of
 /// `name@version` and return the rewritable keys plus a named warning for
-/// each copy that can't be rewired (link, `file:` directory, git). Refused
+/// each copy that can't be rewired (link, `file:` directory, git, a
+/// non-registry tarball). Refused
 /// when nothing is rewritable — as `vendor_lock_entry_not_rewritable`,
 /// naming the skipped copies, when the package IS locked but only through
 /// such copies (#857: `yarn install` can't help there) — or when a key sits
@@ -323,6 +324,13 @@ fn rewritable_candidates(
             BlockClass::UnresolvedSkip(detail) => {
                 skipped.push(VendorWarning::new("vendor_link_entry_skipped", detail));
             }
+            BlockClass::RemoteSkip(detail) => {
+                unrewritable.push(detail.clone());
+                skipped.push(VendorWarning::new(
+                    "vendor_yarn_classic_non_registry_entry_skipped",
+                    detail,
+                ));
+            }
             BlockClass::NoMatch => {}
         }
     }
@@ -331,9 +339,9 @@ fn rewritable_candidates(
         return Err(Box::new(refused(
             "vendor_lock_entry_not_rewritable",
             format!(
-                "every {YARN_LOCK} block for {name}@{version} installs from git, a link or a \
-                 file: directory, which vendoring can't rewire — those copies stay UNPATCHED \
-                 and `yarn install` will not help: {}",
+                "every {YARN_LOCK} block for {name}@{version} installs from git, a link, a \
+                 file: directory or a non-registry tarball, which vendoring can't rewire — \
+                 those copies stay UNPATCHED and `yarn install` will not help: {}",
                 details.join("; ")
             ),
         )));
@@ -704,6 +712,9 @@ enum BlockClass {
     /// Matches the target but has no `resolved` (a stale lock `yarn install`
     /// re-locks); carries the warning detail.
     UnresolvedSkip(String),
+    /// Matches the target but installs a non-registry tarball (B16);
+    /// carries the warning detail.
+    RemoteSkip(String),
     NoMatch,
 }
 
@@ -722,25 +733,34 @@ fn classify_classic_block(block: &LockBlock, name: &str, version: &str) -> Block
     // link: and file:-DIRECTORY ranges resolve from the working tree, not a
     // tarball — rewriting their resolved would not change what installs.
     let resolved = classic_field(&block.lines, "resolved");
-    match classic_block_source(&patterns, resolved) {
-        ClassicBlockSource::Tarball => BlockClass::Candidate,
-        ClassicBlockSource::Link => BlockClass::LinkSkip(format!(
+    match classic_copy_source(&patterns, resolved) {
+        CopySource::Registry => BlockClass::Candidate,
+        // The vendored tarball is the patch service's build of the REGISTRY
+        // package (B16): wiring a fork, local build or hosted-git copy to it
+        // would swap the user's code for registry bytes.
+        CopySource::RemoteTarball => BlockClass::RemoteSkip(format!(
+            "lock block `{}` installs from a tarball that is not the registry's (a \
+             file: tarball, URL or hosted-git dependency), and the vendored artifact is \
+             built from the registry package; skipped, so that copy stays unpatched",
+            block.key
+        )),
+        CopySource::Link => BlockClass::LinkSkip(format!(
             "lock block `{}` is a link: dependency; skipped",
             block.key
         )),
-        ClassicBlockSource::Directory => BlockClass::LinkSkip(format!(
+        CopySource::Directory => BlockClass::LinkSkip(format!(
             "lock block `{}` is a file: directory dependency; skipped, so that copy \
              stays unpatched",
             block.key
         )),
-        ClassicBlockSource::Unresolved => BlockClass::UnresolvedSkip(format!(
+        CopySource::Unresolved => BlockClass::UnresolvedSkip(format!(
             "lock block `{}` has no resolved tarball; skipped",
             block.key
         )),
         // yarn fetches a git pattern with git, from `resolved` (#363): a
         // vendored tarball there makes every install fail, and the copy is
         // the git bytes.
-        ClassicBlockSource::Git => BlockClass::GitSkip(format!(
+        CopySource::Git => BlockClass::GitSkip(format!(
             "lock block `{}` installs from git, which yarn fetches from the git \
              source rather than a tarball; skipped, so that copy stays unpatched",
             block.key
@@ -2243,12 +2263,12 @@ left-pad@^1.3.0:
         );
     }
 
-    /// A `file:`-TARBALL range (unlike a `file:` directory) resolves from a
-    /// packable tarball, so it must fall through the LinkSkip gate and be
-    /// rewritten — a flipped `is_tarball_path` polarity would silently skip
-    /// real tarball deps.
+    /// B16: a `file:`-TARBALL range is the user's own artifact, not the
+    /// registry package the vendored tarball is built from, so it is never
+    /// wired to it: as the only copy it is refused as not rewritable, the
+    /// lock untouched. (It used to be rewired to the registry build.)
     #[tokio::test]
-    async fn file_tarball_range_block_is_rewritten_not_skipped() {
+    async fn file_tarball_range_only_copy_is_refused_untouched() {
         let lock = r#"# yarn lockfile v1
 
 "left-pad@file:./old/left-pad-1.3.0.tgz":
@@ -2256,35 +2276,13 @@ left-pad@^1.3.0:
   resolved "file:./old/left-pad-1.3.0.tgz#0123456789abcdef0123456789abcdef01234567"
 "#;
         let fx = fixture_with_lock(lock).await;
-        let (result, entry, warnings) = expect_done(fx.vendor(false).await);
-        assert!(result.success, "{:?}", result.error);
+        let detail = expect_refused(fx.vendor(false).await, "vendor_lock_entry_not_rewritable");
         assert!(
-            !warnings
-                .iter()
-                .any(|w| w.code == "vendor_link_entry_skipped"),
-            "a file: TARBALL range is rewritable, not a link-skip: {warnings:?}"
+            detail.contains("left-pad@file:./old/left-pad-1.3.0.tgz")
+                && detail.contains("not the registry's"),
+            "{detail}"
         );
-        let entry = entry.expect("success carries a ledger entry");
-        assert_eq!(entry.wiring.len(), 1);
-        assert_eq!(
-            entry.wiring[0].key.as_deref(),
-            Some("\"left-pad@file:./old/left-pad-1.3.0.tgz\""),
-            "verbatim quoted key line (no colon)"
-        );
-
-        let (sha1, sri) = fx.packed_hashes().await;
-        let text = fx.lock_text().await;
-        let lines: Vec<&str> = text.lines().collect();
-        assert_eq!(
-            lines[4],
-            format!("  resolved \"file:./.socket/vendor/npm/{UUID}/left-pad-1.3.0.tgz#{sha1}\""),
-            "resolved repointed at the vendored tarball"
-        );
-        assert_eq!(
-            lines[5],
-            format!("  integrity {sri}"),
-            "integrity line added so both hash checks are enforced"
-        );
+        assert_eq!(fx.lock_text().await, lock);
     }
 
     /// `--preserve-state` (`keep_artifact`): the wiring restore runs
@@ -2979,20 +2977,31 @@ left-pad@^1.3.0:
         assert!(fx.lock_text().await.contains(extra.trim_start()));
     }
 
-    /// #363 scope note: the hosted-git SHORTHAND locks to a codeload tarball
-    /// that yarn fetches as a tarball, so it stays rewritable.
+    /// B16: a hosted-git shorthand (locked to a codeload tarball) or URL
+    /// copy beside the registry block: the registry block is wired, and
+    /// each non-registry copy is named as staying unpatched, its block
+    /// byte-identical.
     #[tokio::test]
-    async fn codeload_shorthand_block_is_still_rewritten() {
-        let lock = r#"# yarn lockfile v1
-
-
-left-pad@stevemao/left-pad#v1.3.0:
-  version "1.3.0"
-  resolved "https://codeload.github.com/stevemao/left-pad/tar.gz/ff8e7ba5b0b3a5ad2f1bb06a4e6aef1c6b2c3d4e"
-"#;
-        let fx = fixture_with_lock(lock).await;
+    async fn non_registry_tarball_copies_beside_registry_are_skipped_with_warning() {
+        let extra = "\nleft-pad@stevemao/left-pad#v1.3.0:\n  version \"1.3.0\"\n  \
+                     resolved \"https://codeload.github.com/stevemao/left-pad/tar.gz/ff8e7ba5\"\n\
+                     \n\"left-pad@https://host.test/fork/left-pad-1.3.0.tgz\":\n  version \"1.3.0\"\n  \
+                     resolved \"https://host.test/fork/left-pad-1.3.0.tgz\"\n";
+        let lock = format!("{Y2_BEFORE}{extra}");
+        let fx = fixture_with_lock(&lock).await;
         let (result, entry, warnings) = expect_done(fx.vendor(false).await);
         assert!(result.success, "{:?}", result.error);
-        assert_eq!(entry.unwrap().wiring.len(), 1, "{warnings:?}");
+        assert_eq!(entry.unwrap().wiring.len(), 1, "only the registry block");
+        let skipped: Vec<&VendorWarning> = warnings
+            .iter()
+            .filter(|w| w.code == "vendor_yarn_classic_non_registry_entry_skipped")
+            .collect();
+        assert_eq!(skipped.len(), 2, "{warnings:?}");
+        assert!(
+            skipped[0].detail.contains("stevemao/left-pad#v1.3.0"),
+            "{skipped:?}"
+        );
+        assert!(skipped[1].detail.contains("host.test/fork"), "{skipped:?}");
+        assert!(fx.lock_text().await.ends_with(extra));
     }
 }

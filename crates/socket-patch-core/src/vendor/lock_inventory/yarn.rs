@@ -11,6 +11,7 @@ use crate::formats::yarn::patterns::{
     parse_berry_locator, pattern_real_name, split_berry_key_patterns, split_key_patterns,
     split_pattern, split_resolved_sha1, BerryLocator,
 };
+use crate::formats::yarn::source::{classic_copy_source, CopySource};
 use crate::utils::digest::is_hex;
 use crate::vendor::yarn_classic_lock;
 
@@ -135,14 +136,19 @@ fn classic_registry_view(text: &str) -> Vec<LockfileEntry> {
             continue;
         };
         // `resolved "url#sha1hex"` — the fragment is the legacy verifier of
-        // a registry tarball. A non-registry resolution (a git repository,
-        // over any protocol, or a local file) records hashes of an artifact
-        // no registry serves — a git fragment is a commit id — so neither it
-        // nor an `integrity` field verifies a registry fetch.
+        // a registry tarball. A non-registry copy (git over any protocol, a
+        // `file:` tarball, a URL or hosted-git tarball — the shared
+        // [`classic_copy_source`] rule the rewriters use) records hashes of
+        // an artifact no registry serves — a git fragment is a commit id —
+        // so neither it nor an `integrity` field verifies a registry fetch.
         let (resolved, sha1_hex, registry) = match classic_field(&block.lines, "resolved") {
             Some(raw) => {
                 let (url, sha1) = split_resolved_sha1(raw);
-                match http_url(url).filter(|u| !is_git_resolution(raw, u)) {
+                let registry_copy = !matches!(
+                    classic_copy_source(&patterns, Some(raw)),
+                    CopySource::Git | CopySource::RemoteTarball
+                );
+                match http_url(url).filter(|_| registry_copy) {
                     Some(url) => (Some(url), sha1, true),
                     None => (None, None, false),
                 }
@@ -157,18 +163,6 @@ fn classic_registry_view(text: &str) -> Vec<LockfileEntry> {
         out.push(LockfileEntry::npm(name, version, resolved, integrity));
     }
     out
-}
-
-/// Whether a classic `resolved` value names a git repository rather than a
-/// registry tarball: a `git+`/`git:`/`github:`/`ssh:` spec, an http(s) URL
-/// of a `.git` repository, or a GitHub codeload tarball of a commit.
-fn is_git_resolution(raw: &str, url: &str) -> bool {
-    let path = url.split(['?', '#']).next().unwrap_or(url);
-    ["git+", "git:", "github:", "ssh:"]
-        .iter()
-        .any(|p| raw.starts_with(p))
-        || path.ends_with(".git")
-        || path.contains("://codeload.github.com/")
 }
 
 #[cfg(test)]

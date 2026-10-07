@@ -371,7 +371,7 @@ async fn restore_classic(
         block_eol, classic_field, repin_classic_block, replace_block, scan_blocks,
     };
     use crate::formats::yarn::patterns::{classic_key_real_name, split_key_patterns};
-    use crate::formats::yarn::source::classic_block_is_git;
+    use crate::formats::yarn::source::{classic_copy_source, CopySource};
 
     // The same byte splice as the hosted rewriter (see
     // [`super::super::classic_line_endings_supported`]).
@@ -389,7 +389,8 @@ async fn restore_classic(
     // (block index, uuid, name, version) per hosted block.
     let mut hits: Vec<(usize, String, String, String)> = Vec::new();
     for (i, block) in blocks.iter().enumerate() {
-        let Some(uuid) = classic_field(&block.lines, "resolved").and_then(|r| ctx.hosted_uuid(r))
+        let Some((resolved, uuid)) =
+            classic_field(&block.lines, "resolved").and_then(|r| Some((r, ctx.hosted_uuid(r)?)))
         else {
             continue;
         };
@@ -400,15 +401,32 @@ async fn restore_classic(
         // yarn 1 fetches a git pattern with git, from `resolved` (#363): a
         // registry tarball there fails every install just as the hosted one
         // does, and the block's own git source was never recorded.
-        if classic_block_is_git(&patterns, None) {
-            result.refuse(
-                &uuid,
-                format!(
-                    "the {rel} entry wiring it installs from git; a registry tarball there \
-                     would still be fetched with git"
-                ),
-            );
-            continue;
+        match classic_copy_source(&patterns, Some(resolved)) {
+            CopySource::Git => {
+                result.refuse(
+                    &uuid,
+                    format!(
+                        "the {rel} entry wiring it installs from git; a registry tarball there \
+                         would still be fetched with git"
+                    ),
+                );
+                continue;
+            }
+            // A pin an older release wrote on a `file:` tarball, URL or
+            // hosted-git copy (B16): its own `resolved` was never recorded,
+            // and the registry tarball is not what that copy installed.
+            CopySource::RemoteTarball => {
+                result.refuse(
+                    &uuid,
+                    format!(
+                        "the {rel} entry wiring it is keyed by a non-registry source (a file: \
+                         tarball, URL or hosted-git dependency) whose original `resolved` was \
+                         not recorded — restore {rel} from version control"
+                    ),
+                );
+                continue;
+            }
+            _ => {}
         }
         let name = classic_key_real_name(&patterns);
         let version = classic_field(&block.lines, "version");
