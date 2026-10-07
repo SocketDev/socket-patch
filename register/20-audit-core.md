@@ -1,5 +1,5 @@
 ### CLI layer, core infrastructure, agent mode, tests and docs (`audit-core`)
-_Last updated 2026-10-06T21:50Z · main @ 9c43dfc_
+_Last updated 2026-10-07T04:30Z · main @ 9c43dfc_
 
 | ID | P | Problem | Source | Issues | Status |
 |---|:-:|---|---|---|---|
@@ -38,7 +38,7 @@ _Last updated 2026-10-06T21:50Z · main @ 9c43dfc_
 | C33 | 3 | Tracking: `CLI_CONTRACT.md` (379 KB on `9c43dfc`; 332 KB at review) should be a checked reference (flags, env vars, codes, exit codes) plus ≤300 lines of prose, with freshness tests. Also decouple `docs/testing` from the validation scripts. | 8.3; 8.5 F/I | #948, #949 | filed #948, #949; tracking #948 (folds in #678, #930), child 1 #949 (flag/env tables pinned to `Cli::command()`) |
 | C34 | 3 | Decide: the command model. A read-only `scan`, plus `fix`, `undo`, `sync` and `check`, with mode inferred from project state. This folds `remove`, `rollback` and `vendor --revert`, and per-command flags replace the 27 globals. | §4; 2.9; R6/R8 | | to verify |
 | C35 | 3 | Decide: drop the deprecated spellings and embedded `--vex`, and give `SOCKET_FORCE` per-command names. | R9; R10 | #966 | decision #966; `--apply`/`--vendor` run with no warning; hosted `--vex` needs `assume_applied`; `SOCKET_FORCE` part is #615 |
-| C36 | 3 | Decide: the futures of agent mode and of the self-update binary swap. | §6 Q2; 7.5 | | to verify |
+| C36 | 3 | Decide: the future of the self-update binary swap (2,350 prod lines; the only updater for the Windows zip). The agent-mode half moved to C55. | §6 Q2; 7.5 | #983 | decision #983 |
 | C37 | 2 | Patch blob/diff downloads (`fetch_binary`) buffer the whole body with no size cap; vendor and self-update use the shared `read_capped`. | new finding | #571 | fixed (#607) |
 | C38 | 2 | The public-proxy per-package fallback keeps a private cap of 10, ignoring `SOCKET_API_CONCURRENCY`, the proxy cap of 4 and the fd-limit rule; `registry_concurrency()` has no caller. | new finding | #614 | filed #614 |
 | C39 | 2 | The 401/403 proxy fallback is missing beyond `get` search: `apply`, `rollback` and `repair` blob/diff downloads and `vendor` eject view fetches fail on a stale token, although the contract promises eject `get`'s fallback. Fix: the fallback moves into `ApiClient`. | new finding | #647 | filed #647 |
@@ -56,6 +56,8 @@ _Last updated 2026-10-06T21:50Z · main @ 9c43dfc_
 | C51 | 3 | Agent-mode jar verification (`jvm_jar::verify_member_bytes`; apply, rollback, vex) buffers each patched member before hashing, while vendored `zip_bytes_match_after_hashes` streams since #587: 1,067 MiB vs 26 MiB peak RSS on a 1 GiB member. | new finding | #914 | filed #914 |
 | C52 | 3 | One unparseable `.socket/manifest.json`, five `--json` codes: `manifest_invalid` (list, remove; two hand-written splits), `manifest_unreadable` (`apply --check`, `vendor --check`, vex), `apply_failed`, `repair_failed`, undocumented `invalid_manifest` (vendor), bare string (rollback). | new finding | #931 | filed #931 |
 | C53 | 3 | Exit-2 usage errors pick their `--json` channel per site: `scan`, `remove` and `rollback` write nothing on stdout, `get` a bare string, `vendor`, `repair` and `vex` a coded envelope; `--global --mode vendored` gives three stdouts on `scan`/`get`/`vendor`. | new finding | #704 | decision #704; folded in as its second question |
+| C54 | 3 | The contract documents `status: paidRequired` and errorCode `paid_required` for get and scan, but `get` emits legacy `status: "paid_required"` (two hand-written blocks) and `scan` reports only `paidPatches`; `Status::PaidRequired` is never constructed. | new finding | #982 | filed #982 |
+| C55 | 3 | Decide: the future of agent mode (~6.4K CLI + ~3.5K core): freeze it to the ecosystems that need it, or keep it and ask the package manager for layouts. | §5; §6 Q2 | | to verify |
 
 **Handed off** (to the CI janitor): report-only coverage and LTO `docker-base` off PRs; e2e from 148 to ~50 legs; a reusable compat workflow; no per-leg compiles; dead CI path filters (review 8.2, 8.5 B/C/E).
 
