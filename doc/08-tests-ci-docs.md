@@ -2,7 +2,7 @@
 
 ## Part 8: Tests, CI, docs and distribution
 
-_Last checked against main @ 9c43dfc on 2026-10-07 by audit-core. Owner: audit-core._ Re-checked on `9c43dfc` (09:56Z run): the `#[ignore]` reasons across both crates (a RED/gap test has no CI leg). Only the repository-hygiene passages (stray `launch.json`, "DESIGN §" references), §8.3's `CLI_CONTRACT.md` measurements and guards, the contract's argument and env-var tables, the test-binary and covgap counts, the `#[serial]` count and the duplicated-helper counts have been re-checked; the rest is as of `2463257`.
+_Last checked against main @ c5be5d1 on 2026-10-07 by audit-core. Owner: audit-core._ Re-checked on `c5be5d1` (15:50Z run): the covgap counts and the contract size. Re-checked on `9c43dfc` (09:56Z run): the `#[ignore]` reasons across both crates (a RED/gap test has no CI leg). Only the repository-hygiene passages (stray `launch.json`, "DESIGN §" references), §8.3's `CLI_CONTRACT.md` measurements and guards, the contract's argument and env-var tables, the test-binary and covgap counts, the `#[serial]` count and the duplicated-helper counts have been re-checked; the rest is as of `2463257`.
 
 > Scope: `crates/*/tests/**`, `tests/` (docker fixtures), `.github/workflows/*`, `.github/actions/*`, `scripts/`, `docs/`, `CLI_CONTRACT.md`, `CHANGELOG.md`, `npm/`, `crates/socket-patch-node/npm/`, and the Cargo profiles. CI timings come from the GitHub Actions run for `2463257` on `main`.
 
@@ -39,7 +39,7 @@ PR #277 has already started cleaning up: it deleted 237,608 lines, including 136
 - `vex_pdm_hatch_common` and `vex_pipenv_pip_common` share **977 identical non-blank lines** (78% similar).
 
 **Coverage-chasing tests.**
-- 32 `covgap_*`/`coverage_fix_*` files hold 27,226 lines and 407 tests (on `9c43dfc`; the review counted 26,916 and 402). {{C32}} 136 of those test names are about human output (`human`, `message`, `prints`, `summary`, …).
+- 32 `covgap_*`/`coverage_fix_*` files hold 27,570 lines and 415 tests (on `c5be5d1`; the review counted 26,916 and 402). {{C32}} 136 of those test names are about human output (`human`, `message`, `prints`, `summary`, …).
 - 43 test files import `socket_patch_cli::commands::*` internals, which only works because `lib.rs` makes `commands` `pub`.
 - The coverage job does not gate anything ("No threshold gating").
 - In fairness, the sweep that produced them found 39 real bugs (#236). **Keep the regressions, rename them by behavior, and drop the rest.**
@@ -97,7 +97,7 @@ For `2463257` on `main`:
 ### 8.3 Docs
 
 **`CLI_CONTRACT.md` is not maintainable as written.**
-- **Size:** 1,940 lines and 379 KB on `9c43dfc` (1,638 and 332 KB at the review). 54 lines exceed 1,000 characters, 13 exceed 3,000, and the longest is **11,338 characters** (line 166). {{C33}}
+- **Size:** 2,145 lines and 415 KB on `c5be5d1` (1,638 and 332 KB at the review). 58 lines exceed 1,000 characters, 14 exceed 3,000, and the longest is **12,077 characters** (line 166). {{C33}}
 - **History mixed into reference:** 155 lines carry a `v5.0` annotation and 29 a `MAJOR`/`BREAKING` marker (counted per line on `9c43dfc`).
 - **Stale:** "Migration status (v3.0)" still promises a follow-up PR.
 - **Misordered:** "Vendored JVM support (v5)" sits after "How the contract is enforced".

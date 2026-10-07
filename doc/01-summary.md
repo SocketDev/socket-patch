@@ -99,7 +99,7 @@
 | CLI surface | 9 visible + 2 hidden subcommands; 57 visible long flags; 27 globals on every command; 43 env bindings (84 `SOCKET_*` names in source); 156 documented `errorCode`s; ~570 code-like strings in source |
 | `--help` | 150–219 lines per subcommand; `list --help` lists 27 options, most of which do nothing for `list` |
 | CI per push | ~516 jobs; the CI workflow alone is 237 jobs and 348 runner-minutes; Windows `test` is the 28-minute critical path |
-| `CLI_CONTRACT.md` | 379 KB; the longest *line* is 11,338 characters (at `9c43dfc`, 2026-10-06; 332 KB / 9,320 at the snapshot) |
+| `CLI_CONTRACT.md` | 415 KB; the longest *line* is 12,077 characters (at `c5be5d1`, 2026-10-07; 332 KB / 9,320 at the snapshot) |
 | Open issues | 319 on 2026-10-07 (246 labelled `bug`, 89 `arch-audit`). At the snapshot: 88, filed mostly in the last 5 days by a bug hunt; JS 26, JVM 22, Python 18, Go 6, Cargo 5, NuGet 5, Ruby 3, Composer 3 |
 | PR size | Recent squash merges of +53K, +85K and +94K lines |
 
