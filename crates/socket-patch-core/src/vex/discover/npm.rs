@@ -572,9 +572,119 @@ async fn extract_pnpm_lock(ctx: &DiscoverCtx<'_>, file: &str, out: &mut Discover
         );
         return;
     }
+    let mut copies: Vec<PnpmFileCopy> = Vec::new();
     for package in lock.packages() {
-        pnpm_entry_ref(ctx, file, package, out);
+        pnpm_entry_ref(ctx, file, package, &mut copies, out);
     }
+    record_pnpm_file_copies(ctx, file, copies, out).await;
+}
+
+/// A pnpm `packages:` entry installed from a user's `file:` directory or
+/// tarball, awaiting [`record_pnpm_file_copies`].
+struct PnpmFileCopy {
+    key: String,
+    /// The package name (the v9 key's, or a legacy entry's `name:` field).
+    name: Option<String>,
+    /// The entry's `version:` field (always there for a tarball).
+    version: Option<String>,
+    /// The `file:` path, relative to the lock's directory.
+    path: String,
+    directory: bool,
+}
+
+/// Record each [`PnpmFileCopy`] as an unpatched copy of its package (#935):
+/// pnpm installs a `file:` directory or tarball from the user's own bytes,
+/// and no override or tarball rewire of the registry entry reaches it. A
+/// directory entry carries no version, so it is read from the directory's
+/// `package.json` (a legacy entry's name too); one whose package cannot be
+/// read is left alone.
+async fn record_pnpm_file_copies(
+    ctx: &DiscoverCtx<'_>,
+    file: &str,
+    copies: Vec<PnpmFileCopy>,
+    out: &mut Discovery,
+) {
+    let lock_dir = std::path::Path::new(file)
+        .parent()
+        .map(|d| d.to_string_lossy().replace('\\', "/"))
+        .unwrap_or_default();
+    for copy in copies {
+        let (mut name, mut version) = (copy.name, copy.version);
+        if name.is_none() || version.is_none() {
+            let manifest: Option<Value> =
+                match crate::utils::cargo_workspace::normalize_rel(&lock_dir, &copy.path) {
+                    Some(rel) if copy.directory => {
+                        let manifest = if rel.is_empty() {
+                            "package.json".to_string()
+                        } else {
+                            format!("{rel}/package.json")
+                        };
+                        ctx.read_advisory_text(&manifest).await.and_then(|t| {
+                            serde_json::from_str(t.trim_start_matches('\u{feff}')).ok()
+                        })
+                    }
+                    Some(rel) => match ctx.read_advisory_bytes(&rel).await {
+                        Some(bytes) => tokio::task::spawn_blocking(move || {
+                            let map =
+                                crate::patch::package::read_archive_bytes_to_map(&bytes).ok()?;
+                            serde_json::from_slice::<Value>(map.get("package.json")?).ok()
+                        })
+                        .await
+                        .ok()
+                        .flatten(),
+                        None => None,
+                    },
+                    None => None,
+                };
+            let field = |k: &str| {
+                manifest
+                    .as_ref()
+                    .and_then(|m| m.get(k))
+                    .and_then(Value::as_str)
+                    .map(str::to_string)
+            };
+            name = name.or_else(|| field("name"));
+            version = version.or_else(|| field("version"));
+        }
+        let (Some(name), Some(version)) = (name, version) else {
+            continue;
+        };
+        let what = if copy.directory {
+            "directory"
+        } else {
+            "tarball"
+        };
+        out.unpatched_copy(
+            file,
+            npm_purl(&name, &version),
+            &copy.key,
+            &format!(
+                "installs it from the user's file: {what} {:?}, which no Socket wiring \
+                 reaches",
+                copy.path
+            ),
+        );
+    }
+}
+
+/// The [`PnpmFileCopy`] of a `file:`-keyed entry, `None` for any other key.
+fn pnpm_file_copy(package: &PnpmPackage<'_>, directory: bool) -> Option<PnpmFileCopy> {
+    let (name, path) = match classify_pnpm_key(package.key) {
+        PnpmKey::V9File { name, path } => (Some(name.to_string()), path),
+        PnpmKey::LegacyFile { path } => (
+            entry_field(&package.entry, "name").map(str::to_string),
+            path,
+        ),
+        PnpmKey::Registry { .. } | PnpmKey::Other => return None,
+    };
+    let path = path.strip_prefix("file:").unwrap_or(path).to_string();
+    Some(PnpmFileCopy {
+        key: package.key.to_string(),
+        name,
+        version: entry_field(&package.entry, "version").map(str::to_string),
+        path,
+        directory,
+    })
 }
 
 /// Classify one `packages:` entry and push its ref, if any.
@@ -582,6 +692,7 @@ fn pnpm_entry_ref(
     ctx: &DiscoverCtx<'_>,
     file: &str,
     package: &PnpmPackage<'_>,
+    copies: &mut Vec<PnpmFileCopy>,
     out: &mut Discovery,
 ) {
     let key = package.key;
@@ -601,6 +712,7 @@ fn pnpm_entry_ref(
     let Some(tarball) = resolution.tarball() else {
         // A plain registry entry (integrity only) or a directory/git dep.
         out.resolved_elsewhere(file, pnpm_registry_key_purl(key));
+        copies.extend(pnpm_file_copy(package, true));
         return;
     };
     let integrity = resolution
@@ -641,8 +753,10 @@ fn pnpm_entry_ref(
             true,
         ));
     } else {
-        // A registry-keyed entry fetching some other tarball.
+        // A registry-keyed entry fetching some other tarball, or a user's
+        // `file:` tarball.
         out.resolved_elsewhere(file, pnpm_registry_key_purl(key));
+        copies.extend(pnpm_file_copy(package, false));
     }
 }
 
@@ -1977,6 +2091,72 @@ mod tests {
             assert!(r.lockfile_basis_ok(), "{r:?}");
         }
         assert!(out.diagnostics.is_empty(), "{:#?}", out.diagnostics);
+    }
+
+    /// #935: pnpm installs a `file:` directory or `file:` tarball copy of
+    /// the wired name@version from the user's own bytes, so a hosted pin of
+    /// the registry entry in the SAME lock is not attested: the ref is
+    /// dropped with a diagnostic naming the copy (v9 keys and pnpm 8's
+    /// legacy `file:` keys alike). Controls: the wiring alone is a ref, and
+    /// a `file:` copy of ANOTHER version does not contest it.
+    #[tokio::test]
+    async fn issue_935_same_lock_file_copy_contests_the_pnpm_ref() {
+        let url = hosted_url("npm", "left-pad", "1.3.0", UUID_A, "left-pad-1.3.0.tgz");
+        let wired =
+            format!("  left-pad@1.3.0:\n    resolution: {{integrity: {SRI}, tarball: {url}}}\n\n");
+        let lock = |extra: &str| format!("lockfileVersion: '9.0'\n\npackages:\n\n{wired}{extra}");
+        let dir_v9 = "  left-pad@file:forks/left-pad:\n    \
+                      resolution: {directory: forks/left-pad, type: directory}\n\n";
+        let tgz_v9 = "  left-pad@file:forks/left-pad-1.3.0.tgz:\n    \
+                      resolution: {integrity: sha512-UPSTREAM==, tarball: file:forks/left-pad-1.3.0.tgz}\n    \
+                      version: 1.3.0\n\n";
+        let dir_legacy = "  file:forks/left-pad:\n    \
+                          resolution: {directory: forks/left-pad, type: directory}\n    \
+                          name: left-pad\n    version: 1.3.0\n\n";
+
+        let control = Project::new();
+        control.write("pnpm-lock.yaml", lock(""));
+        assert_refs(
+            &run(&control).await,
+            &[("pkg:npm/left-pad@1.3.0", UUID_A, WiringMode::Hosted)],
+        );
+
+        for (case, extra, fork_version) in [
+            ("v9 file: directory", dir_v9, "1.3.0"),
+            ("v9 file: tarball", tgz_v9, "1.3.0"),
+            ("legacy file: directory", dir_legacy, "1.3.0"),
+        ] {
+            let p = Project::new();
+            p.write("pnpm-lock.yaml", lock(extra));
+            p.write(
+                "forks/left-pad/package.json",
+                format!(r#"{{"name":"left-pad","version":"{fork_version}"}}"#),
+            );
+            p.write("forks/left-pad-1.3.0.tgz", npm_tgz("left-pad", "1.3.0"));
+            let out = run(&p).await;
+            assert!(out.refs.is_empty(), "{case}: {:#?}", out.refs);
+            assert!(
+                out.diagnostics
+                    .iter()
+                    .any(|d| d.code == DIAG_REF_UNATTRIBUTABLE
+                        && d.detail.contains("forks/left-pad")
+                        && d.detail.contains("UNPATCHED")),
+                "{case}: {:#?}",
+                out.diagnostics
+            );
+        }
+
+        // A `file:` directory holding ANOTHER version is not a copy of it.
+        let p = Project::new();
+        p.write("pnpm-lock.yaml", lock(dir_v9));
+        p.write(
+            "forks/left-pad/package.json",
+            r#"{"name":"left-pad","version":"2.0.0"}"#,
+        );
+        assert_refs(
+            &run(&p).await,
+            &[("pkg:npm/left-pad@1.3.0", UUID_A, WiringMode::Hosted)],
+        );
     }
 
     /// The committed golden (TS backend output — what a depscan PR leaves).

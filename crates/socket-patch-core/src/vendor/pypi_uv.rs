@@ -404,6 +404,16 @@ pub(super) fn check_target_guards(
             }
         }
     }
+
+    // `wire_uv` adds keys to the `[tool.uv]` (transitive) and
+    // `[tool.uv.sources]` tables through `ensure_table`, which refuses an
+    // inline-table or non-table link. Refuse the same shape here, in the
+    // same order and with the same detail, so a dry run previews it and the
+    // real run refuses before the prebuilt download (#979).
+    if classify_dependency(p, canon_name) == UvDepClass::Transitive {
+        check_standard_tables(&p.pyproject, &["tool", "uv"])?;
+    }
+    check_standard_tables(&p.pyproject, &["tool", "uv", "sources"])?;
     Ok(UvTarget::Fresh)
 }
 
@@ -1432,17 +1442,37 @@ fn ensure_table<'a>(
 ) -> Result<&'a mut Table, (&'static str, String)> {
     let mut table: &mut Table = doc.as_table_mut();
     for key in path {
-        table = crate::utils::toml_edit_ext::ensure_table(table, key, true).map_err(|_| {
-            (
-                "pypi_uv_lock_parse_failed",
-                format!(
-                    "pyproject.toml [{}] is not a standard table",
-                    path.join(".")
-                ),
-            )
-        })?;
+        table = crate::utils::toml_edit_ext::ensure_table(table, key, true)
+            .map_err(|_| not_a_standard_table(path))?;
     }
     Ok(table)
+}
+
+/// Read-only twin of [`ensure_table`] for the preflight: every link of
+/// `path` that exists must be a standard (header or dotted-key) table, the
+/// only shape `ensure_table` can add keys to. A missing link is fine:
+/// `ensure_table` creates it.
+fn check_standard_tables(doc: &DocumentMut, path: &[&str]) -> Result<(), (&'static str, String)> {
+    let mut table: &Table = doc.as_table();
+    for key in path {
+        match table.get(key) {
+            None => return Ok(()),
+            Some(item) => {
+                table = item.as_table().ok_or_else(|| not_a_standard_table(path))?;
+            }
+        }
+    }
+    Ok(())
+}
+
+fn not_a_standard_table(path: &[&str]) -> (&'static str, String) {
+    (
+        "pypi_uv_lock_parse_failed",
+        format!(
+            "pyproject.toml [{}] is not a standard table",
+            path.join(".")
+        ),
+    )
 }
 
 /// Whether the lock has a root `[[package]]` (source virtual/editable `.`).
@@ -4033,6 +4063,111 @@ wheels = [
             DIRECT_PATH_LOCK.replace("revision = 3\n", ""),
             "the wired revisionless lock must still byte-match uv's shape"
         );
+    }
+
+    /// #979: every non-standard-table spelling of the chain `wire_uv`
+    /// edits (inline `sources = {…}`, `[tool] uv = {…}`, dotted
+    /// `uv.sources = {…}`) is refused by the PREFLIGHT with the exact code
+    /// and detail the wet run's `ensure_table` raises, so a dry run (which
+    /// returns before wire) previews the same refusal and the real run
+    /// refuses before the prebuilt download.
+    #[tokio::test]
+    async fn guards_refuse_non_standard_uv_tables_like_wire() {
+        let direct_cases = [
+            "\n[tool.uv]\nsources = { idna = { index = \"pypi\" } }\n",
+            "\n[tool]\nuv = { sources = { idna = { index = \"pypi\" } }, index = [{ name = \"pypi\", url = \"https://pypi.org/simple\" }] }\n",
+            "\n[tool]\nuv.sources = { idna = { index = \"pypi\" } }\n",
+            "\n[tool]\nuv = 3\n",
+        ];
+        for extra in direct_cases {
+            let pyproject = format!("{DIRECT_REGISTRY_PYPROJECT}{extra}");
+            let tmp = write_pair(&pyproject, DIRECT_REGISTRY_LOCK).await;
+            let p = load_uv_project(tmp.path()).await.unwrap();
+            let guard = check_target_guards(&p, "six", UUID).unwrap_err();
+            let wire = wire_uv(
+                &p,
+                tmp.path(),
+                "six",
+                "1.16.0",
+                REL_WHEEL,
+                WHEEL_NAME,
+                WHEEL_SHA,
+                UUID,
+            )
+            .await
+            .unwrap_err();
+            assert_eq!(guard, wire, "{extra}: preflight must match wire");
+            assert_eq!(guard.0, "pypi_uv_lock_parse_failed", "{extra}");
+            assert_eq!(
+                guard.1, "pyproject.toml [tool.uv.sources] is not a standard table",
+                "{extra}"
+            );
+            let (py, lock) = read_pair(tmp.path()).await;
+            assert_eq!(py, pyproject, "{extra}: pyproject untouched");
+            assert_eq!(lock, DIRECT_REGISTRY_LOCK, "{extra}: lock untouched");
+        }
+
+        // A transitive package is wired through `[tool.uv]
+        // override-dependencies` first, so wire names `[tool.uv]`.
+        let transitive_cases = ["\n[tool]\nuv = { constraint-dependencies = [\"six==1.16.0\"] }\n"];
+        for extra in transitive_cases {
+            let pyproject = format!("{TRANSITIVE_REGISTRY_PYPROJECT}{extra}");
+            let tmp = write_pair(&pyproject, TRANSITIVE_REGISTRY_LOCK).await;
+            let p = load_uv_project(tmp.path()).await.unwrap();
+            let guard = check_target_guards(&p, "six", UUID).unwrap_err();
+            let wire = wire_uv(
+                &p,
+                tmp.path(),
+                "six",
+                "1.16.0",
+                REL_WHEEL,
+                WHEEL_NAME,
+                WHEEL_SHA,
+                UUID,
+            )
+            .await
+            .unwrap_err();
+            assert_eq!(guard, wire, "{extra}: preflight must match wire");
+            assert_eq!(guard.0, "pypi_uv_lock_parse_failed", "{extra}");
+            assert_eq!(
+                guard.1, "pyproject.toml [tool.uv] is not a standard table",
+                "{extra}"
+            );
+        }
+
+        // Standard and header-less (implied by a sub-table) tables, and a
+        // transitive package under a dotted `uv.override-dependencies`,
+        // stay wireable.
+        let ok_cases = [
+            (DIRECT_REGISTRY_PYPROJECT, "\n[tool.uv]\npackage = true\n"),
+            (
+                DIRECT_REGISTRY_PYPROJECT,
+                "\n[tool.uv.sources.idna]\nindex = \"pypi\"\n",
+            ),
+            (DIRECT_REGISTRY_PYPROJECT, "\n[tool]\nuv.package = true\n"),
+            (TRANSITIVE_REGISTRY_PYPROJECT, "\n[tool.uv]\nsources = {}\n"),
+        ];
+        for (base, extra) in ok_cases {
+            let lock = if base == DIRECT_REGISTRY_PYPROJECT {
+                DIRECT_REGISTRY_LOCK
+            } else {
+                TRANSITIVE_REGISTRY_LOCK
+            };
+            let tmp = write_pair(&format!("{base}{extra}"), lock).await;
+            let p = load_uv_project(tmp.path()).await.unwrap();
+            let got = check_target_guards(&p, "six", UUID);
+            if base == DIRECT_REGISTRY_PYPROJECT {
+                assert_eq!(got, Ok(UvTarget::Fresh), "{extra}");
+            } else {
+                // Transitive + inline sources: [tool.uv] is fine, the
+                // sources link is not.
+                assert_eq!(
+                    got.unwrap_err().1,
+                    "pyproject.toml [tool.uv.sources] is not a standard table",
+                    "{extra}"
+                );
+            }
+        }
     }
 
     /// A `[tool.uv.sources]` entry or an override pin for a DIFFERENT
