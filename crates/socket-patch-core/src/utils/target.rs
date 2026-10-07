@@ -13,15 +13,23 @@
 //! * anything else is a package name, matched EXACTLY (full name or last
 //!   segment, case-insensitive, PEP 503 for PyPI) by
 //!   [`crate::policy::package_spec_matches`] — the matcher `scan --package`
-//!   and `socket.yml` already use. There is no fuzzy matching here.
+//!   and `socket.yml` already use. There is no fuzzy matching here. A Go
+//!   major-version suffix (`v2` in `github.com/x/y/v2`) is never a name.
+//!
+//! A name's last-segment rule can select several packages (`core` →
+//! `@angular/core` and `@babel/core`). `get`, `remove` and `rollback` act
+//! on one package per name, so they refuse such a name
+//! ([`Target::ambiguity`]) and ask for the full name or a purl;
+//! `scan --package` and `socket.yml` keep selecting all of them.
 //!
 //! Verbs reject the kinds they cannot act on (a CVE matches no manifest
 //! entry, for example) rather than reinterpreting them.
 
 use std::fmt;
 
+use crate::crawlers::python_crawler::canonicalize_pypi_name;
 use crate::policy::package_spec_matches;
-use crate::utils::purl::{is_purl, purl_matches_identifier, strip_purl_qualifiers};
+use crate::utils::purl::{canonical_purl, is_purl, purl_matches_identifier, strip_purl_qualifiers};
 
 /// What a target token names.
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
@@ -120,9 +128,48 @@ impl Target {
     /// ignored), a versionless purl or a name selects every version.
     pub fn matches_package(&self, purl: &str) -> bool {
         match self.kind {
-            TargetKind::Purl | TargetKind::Name => package_spec_matches(&self.text, purl),
+            TargetKind::Purl => package_spec_matches(&self.text, purl),
+            TargetKind::Name => self.name_matches(purl),
             TargetKind::Uuid | TargetKind::Cve | TargetKind::Ghsa => false,
         }
+    }
+
+    /// The name rule: [`package_spec_matches`], except that a Go
+    /// major-version suffix (`v2`) never selects a module by its last
+    /// segment (`github.com/x/y/v2` is `y`, major version 2).
+    fn name_matches(&self, purl: &str) -> bool {
+        if is_go_major_suffix(self.text.trim()) && is_golang_purl(purl) {
+            return false;
+        }
+        package_spec_matches(&self.text, purl)
+    }
+
+    /// For a package name, the distinct packages it selects among `purls`
+    /// when there is more than one: `Some(message)` naming each (as a
+    /// versionless purl) and how to pick one. `None` for every other kind,
+    /// and for a name that selects one package (any number of its
+    /// versions) or none.
+    ///
+    /// `get`, `remove` and `rollback` refuse an ambiguous name instead of
+    /// acting on every package it reaches by last segment.
+    pub fn ambiguity<'a>(&self, purls: impl IntoIterator<Item = &'a str>) -> Option<String> {
+        if self.kind != TargetKind::Name {
+            return None;
+        }
+        let mut packages: Vec<String> = purls
+            .into_iter()
+            .filter(|purl| self.name_matches(purl))
+            .filter_map(package_identity)
+            .collect();
+        packages.sort();
+        packages.dedup();
+        (packages.len() > 1).then(|| {
+            format!(
+                "\"{}\" is ambiguous: it names {}; use the full name or a purl",
+                self.text,
+                packages.join(", ")
+            )
+        })
     }
 
     /// Does this target select the recorded patch `(purl, uuid)` — a
@@ -143,10 +190,45 @@ impl Target {
                 purl_matches_identifier(purl, &self.text)
             }
             TargetKind::Purl => package_spec_matches(&self.text, purl),
-            TargetKind::Name => uuid == self.text || package_spec_matches(&self.text, purl),
+            TargetKind::Name => uuid == self.text || self.name_matches(purl),
             TargetKind::Cve | TargetKind::Ghsa => false,
         }
     }
+}
+
+/// A package's identity: its purl without version, qualifiers or subpath,
+/// decoded and lowercased (`pkg:npm/@babel/core`), the PyPI name in its
+/// PEP 503 form. Two purls with the same identity are versions (or
+/// release variants) of one package.
+pub fn package_identity(purl: &str) -> Option<String> {
+    let canonical = canonical_purl(purl).to_lowercase();
+    let rest = canonical.strip_prefix("pkg:")?;
+    let (ty, coord) = rest.split_once('/')?;
+    let name = match coord.rfind('@').filter(|&i| i > 0) {
+        Some(at) => &coord[..at],
+        None => coord,
+    };
+    if name.is_empty() {
+        return None;
+    }
+    let name = if ty == "pypi" {
+        canonicalize_pypi_name(name)
+    } else {
+        name.to_string()
+    };
+    Some(format!("pkg:{ty}/{name}"))
+}
+
+/// `v2`, `v3`, …: a Go module path's major-version suffix.
+fn is_go_major_suffix(token: &str) -> bool {
+    token
+        .strip_prefix(['v', 'V'])
+        .is_some_and(|n| !n.is_empty() && n.bytes().all(|b| b.is_ascii_digit()))
+}
+
+fn is_golang_purl(purl: &str) -> bool {
+    purl.get(..11)
+        .is_some_and(|p| p.eq_ignore_ascii_case("pkg:golang/"))
 }
 
 /// The standard `8-4-4-4-12` hex UUID grouping, any case. The one
@@ -358,6 +440,70 @@ mod tests {
         ));
         assert!(!m(UUID, "other-uuid", UUID));
         assert!(!m("pkg:npm/a@1", UUID, "pkg:npm/b@1"));
+    }
+
+    /// A name that reaches several packages by last segment is ambiguous;
+    /// several versions of one package are not.
+    #[test]
+    fn ambiguity_counts_distinct_packages() {
+        let core = Target::parse("core");
+        let purls = [
+            "pkg:npm/%40angular/core@17.0.0",
+            "pkg:npm/@babel/core@7.0.0",
+            "pkg:npm/@babel/core@7.1.0",
+            "pkg:npm/lodash@4.17.21",
+        ];
+        let msg = core.ambiguity(purls).expect("ambiguous");
+        assert!(
+            msg.contains("pkg:npm/@angular/core, pkg:npm/@babel/core"),
+            "{msg}"
+        );
+        assert!(!msg.contains("lodash"), "{msg}");
+        // One package, many versions (and variants): not ambiguous.
+        assert_eq!(core.ambiguity(purls[1..].iter().copied()), None);
+        assert_eq!(
+            Target::parse("six")
+                .ambiguity(["pkg:pypi/six@1.16.0?artifact_id=a", "pkg:pypi/Six@1.17.0",]),
+            None
+        );
+        // The full name, a purl and a uuid are never ambiguous.
+        assert_eq!(Target::parse("@babel/core").ambiguity(purls), None);
+        assert_eq!(Target::parse("pkg:npm/core").ambiguity(purls), None);
+        assert_eq!(Target::parse(UUID).ambiguity(purls), None);
+        // Same name in two ecosystems: ambiguous.
+        assert!(Target::parse("six")
+            .ambiguity(["pkg:pypi/six@1", "pkg:npm/six@1"])
+            .is_some());
+    }
+
+    #[test]
+    fn go_major_suffix_is_never_a_name() {
+        let v2 = "pkg:golang/github.com/x/y/v2@v2.0.0";
+        for token in ["v2", "V2"] {
+            let t = Target::parse(token);
+            assert!(!t.matches_package(v2), "{token}");
+            assert!(!t.matches_patch(v2, "u"), "{token}");
+        }
+        assert!(Target::parse("github.com/x/y/v2").matches_package(v2));
+        // Outside Go, `v2` is an ordinary name.
+        assert!(Target::parse("v2").matches_package("pkg:npm/v2@1.0.0"));
+    }
+
+    #[test]
+    fn package_identity_drops_version_and_qualifiers() {
+        assert_eq!(
+            package_identity("pkg:npm/%40Babel/core@7.0.0").as_deref(),
+            Some("pkg:npm/@babel/core")
+        );
+        assert_eq!(
+            package_identity("pkg:pypi/Typing_Extensions@4?artifact_id=x").as_deref(),
+            Some("pkg:pypi/typing-extensions")
+        );
+        assert_eq!(
+            package_identity("pkg:golang/github.com/x/y/v2@v2.0.0").as_deref(),
+            Some("pkg:golang/github.com/x/y/v2")
+        );
+        assert_eq!(package_identity("lodash"), None);
     }
 
     #[test]

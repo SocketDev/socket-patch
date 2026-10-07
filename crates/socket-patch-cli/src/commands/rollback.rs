@@ -388,12 +388,28 @@ pub(crate) enum RollbackTarget {
 /// shared target grammar, so a truncated UUID or a mistyped name stays a
 /// safe "No patch found matching identifier" error instead of silently
 /// selecting a directory subtree.
+///
+/// A path-shaped token without glob metacharacters (composer
+/// `vendor/pkg`, a go module path) is promoted back to a name once the
+/// stores are loaded, when it selects a recorded or hosted patch.
 pub(crate) fn classify_target(token: &str) -> RollbackTarget {
     if is_path_shaped(token) {
         RollbackTarget::PathGlob(token.to_string())
     } else {
         RollbackTarget::Identifier(Target::parse(token))
     }
+}
+
+/// A path-shaped token that could also be a slash-containing package
+/// name: relative, no glob metacharacter or backslash, no `.` / `..`
+/// segment (`./x` and `x/..` are always paths).
+fn is_name_shaped_path(token: &str) -> bool {
+    !token.contains(['*', '?', '[', '\\'])
+        && !std::path::Path::new(token).is_absolute()
+        && !token.starts_with('/')
+        && token
+            .split('/')
+            .all(|seg| !seg.is_empty() && seg != "." && seg != "..")
 }
 
 struct PatchToRollback {
@@ -1216,6 +1232,36 @@ pub async fn run(args: RollbackArgs) -> i32 {
         .map(|pin| (pin.purl.clone(), pin.uuid.clone()))
         .collect();
 
+    let ledgers = socket_patch_core::ledgers::Ledgers {
+        manifest: Some(&manifest),
+        vendor: vendor_state_result.as_ref().ok(),
+        redirect: None,
+    };
+    // A slash-containing package name (composer `vendor/pkg`, a go module
+    // path) is shaped like a path, but is a target first: one that selects
+    // a recorded or hosted patch is an identifier, as in `get` and
+    // `remove`; only otherwise is it a path glob.
+    let (identifiers, path_scope) = {
+        let mut identifiers = identifiers;
+        let mut globs: Vec<String> = Vec::new();
+        for raw in path_scope.raw() {
+            let named = is_name_shaped_path(raw).then(|| Target::parse(raw)).filter(|t| {
+                t.kind() == TargetKind::Name
+                    && (!ledgers.matching(t).is_empty()
+                        || redirect_records
+                            .iter()
+                            .any(|(purl, uuid)| t.matches_patch(purl, uuid)))
+            });
+            match named {
+                Some(t) => identifiers.push(t),
+                None => globs.push(raw.clone()),
+            }
+        }
+        let path_scope =
+            crate::path_scope::PathScope::parse(&globs).expect("a subset of the parsed patterns");
+        (identifiers, path_scope)
+    };
+
     let scoped = !identifiers.is_empty() || !path_scope.is_empty();
 
     // Identifier matching runs across ALL THREE stores; an identifier
@@ -1228,22 +1274,35 @@ pub async fn run(args: RollbackArgs) -> i32 {
         vendor_scope.extend(vendor_entries.iter().map(|(k, _)| k.clone()));
         hosted_scope.extend(redirect_records.iter().map(|(p, _)| p.clone()));
     }
-    let ledgers = socket_patch_core::ledgers::Ledgers {
-        manifest: Some(&manifest),
-        vendor: vendor_state_result.as_ref().ok(),
-        redirect: None,
-    };
     for id in &identifiers {
         let found = ledgers.matching(id);
         let mut matched = !found.is_empty();
-        manifest_scope.extend(found.manifest);
-        vendor_scope.extend(found.vendor.into_iter().map(|(k, _)| k));
         // Hosted pins live in the lockfiles, not in a store.
+        let mut hosted_found: Vec<&str> = Vec::new();
         for (purl, uuid) in &redirect_records {
             if id.matches_patch(purl, uuid) {
                 hosted_scope.insert(purl.clone());
+                hosted_found.push(purl);
                 matched = true;
             }
+        }
+        // A name reaching several packages by last segment (`core` →
+        // `@angular/core` and `@babel/core`) is refused across every
+        // store: `rollback` acts on one package per name.
+        let ambiguity = id.ambiguity(
+            found
+                .manifest
+                .iter()
+                .map(String::as_str)
+                .chain(found.vendor.iter().map(|(k, _)| k.as_str()))
+                .chain(hosted_found),
+        );
+        manifest_scope.extend(found.manifest);
+        vendor_scope.extend(found.vendor.into_iter().map(|(k, _)| k));
+        if let Some(msg) = ambiguity {
+            track_patch_rollback_failed(&msg, api_token.as_deref(), org_slug.as_deref()).await;
+            emit_rollback_error(args.common.json, &msg);
+            return 1;
         }
         if !matched {
             let hint = if matches!(id.kind(), TargetKind::Purl | TargetKind::Uuid) {

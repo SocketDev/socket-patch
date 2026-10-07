@@ -2741,6 +2741,23 @@ pub async fn run(args: GetArgs) -> i32 {
         status.finish();
         match fetch_result {
             Ok(Some(patch)) => {
+                // The search path's selection rules hold here too: a patch
+                // outside `--ecosystems` is never acted on — checked before
+                // the paid gate, the "Found patch" line and the fetched
+                // event, since it is not this run's patch.
+                if !args.common.purl_ecosystem_selected(&patch.purl) {
+                    if args.common.json {
+                        print_json(&empty_result_json("not_found"));
+                    } else if !args.common.silent {
+                        println!(
+                            "No patch found with UUID: {} in the selected ecosystems \
+                             (it patches {})",
+                            args.identifier,
+                            normalize_purl(&patch.purl)
+                        );
+                    }
+                    return 0;
+                }
                 if patch.tier == "paid" && use_public_proxy {
                     return report_paid_required_uuid(
                         &args,
@@ -2781,22 +2798,8 @@ pub async fn run(args: GetArgs) -> i32 {
                 )
                 .await;
                 let selected = vec![search_result_from_response(&patch)];
-                // The search path's selection rules hold here too: a patch
-                // outside `--ecosystems` is never acted on, and acting
-                // against the repo's socket.yml says so (`policy_bypassed`).
-                if !args.common.purl_ecosystem_selected(&patch.purl) {
-                    if args.common.json {
-                        print_json(&empty_result_json("not_found"));
-                    } else if !args.common.silent {
-                        println!(
-                            "No patch found with UUID: {} in the selected ecosystems \
-                             (it patches {})",
-                            args.identifier,
-                            normalize_purl(&patch.purl)
-                        );
-                    }
-                    return 0;
-                }
+                // Acting against the repo's socket.yml says so
+                // (`policy_bypassed`).
                 let policy_warnings =
                     super::scan::policy::policy_bypass_warnings(&args.common, &selected);
                 if !args.common.silent {
@@ -2947,6 +2950,13 @@ pub async fn run(args: GetArgs) -> i32 {
                 return 0;
             }
 
+            // A name reaching several packages by last segment (`core` →
+            // `@angular/core` and `@babel/core`) is refused: `get` acts on
+            // one package per name.
+            if let Some(msg) = target.ambiguity(matched.iter().map(String::as_str)) {
+                report_error(args.common.json, msg);
+                return 1;
+            }
             if !quiet {
                 eprintln!("{}", format_matched_packages(&matched));
             }
@@ -2954,11 +2964,23 @@ pub async fn run(args: GetArgs) -> i32 {
                 patches: Vec::new(),
                 can_access_paid_patches: false,
             };
-            for purl in &matched {
-                status.set(format!("Searching patches for {}...", normalize_purl(purl)));
-                let result = api_client.search_patches_by_package(purl).await;
-                status.finish();
-                match result {
+            // One search per installed version, concurrently, merged in
+            // `matched` order. Any failed search still fails the run (as
+            // the single search did): a partial result could silently
+            // miss the patch for the version that failed.
+            status.set(format!(
+                "Searching patches for {}...",
+                crate::ui::plural(matched.len(), "installed version", "installed versions")
+            ));
+            let window_len = matched.len();
+            let api = &api_client;
+            let mut searches = std::pin::pin!(ordered_concurrent(
+                matched.iter(),
+                api_concurrency_for(api.uses_public_proxy(), window_len),
+                |purl| async move { hold_back_debug(api.search_patches_by_package(purl)).await },
+            ));
+            while let Some(held) = searches.next().await {
+                match held.release() {
                     Ok(r) => {
                         merged.can_access_paid_patches |= r.can_access_paid_patches;
                         for patch in r.patches {
@@ -2968,6 +2990,7 @@ pub async fn run(args: GetArgs) -> i32 {
                         }
                     }
                     Err(e) => {
+                        status.finish();
                         return report_fetch_failure(
                             &args.identifier,
                             e,
@@ -2980,6 +3003,7 @@ pub async fn run(args: GetArgs) -> i32 {
                     }
                 }
             }
+            status.finish();
             merged
         }
         _ => unreachable!(),

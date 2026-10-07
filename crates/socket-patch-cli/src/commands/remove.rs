@@ -460,6 +460,31 @@ pub async fn run(args: RemoveArgs) -> i32 {
         Ok(VendorState::default())
     };
 
+    // A name reaching several packages by last segment (`core` →
+    // `@angular/core` and `@babel/core`) is refused across every store:
+    // `remove` acts on one package per name.
+    {
+        let ledger_purls: Vec<&str> = vendor_state_result
+            .as_ref()
+            .map(|state| state.entries.keys().map(String::as_str).collect())
+            .unwrap_or_default();
+        let candidates = manifest
+            .patches
+            .keys()
+            .map(String::as_str)
+            .chain(ledger_purls)
+            .chain(hosted_pins.iter().map(|pin| pin.purl.as_str()));
+        if let Some(msg) = target.ambiguity(candidates) {
+            emit_error_envelope(
+                args.common.json,
+                args.common.dry_run,
+                "ambiguous_target",
+                msg,
+            );
+            return 1;
+        }
+    }
+
     if matching.is_empty() {
         // Ledger-only entries (vendored mode keeps no manifest record) —
         // `remove` is their per-purl exit path (alongside `vendor
