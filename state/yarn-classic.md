@@ -1,6 +1,6 @@
 [agent] Progress ledger for the scheduled Yarn classic (1.x) bug-hunt routine (label pm:yarn-classic).
 
-Last updated: 2026-10-06 (run 25), main `9c43dfc`, latest release v4.0.0. Runs 5–25 added the cells in "Run 5 cells" through "Run 25 cells" below. The project-mode matrix below was measured on `f6b7fb9` (v4); cells marked "(v5)", the global matrix and the "v5 project-mode cells" list were re-run on v5.
+Last updated: 2026-10-07 (run 26), main `9c43dfc`, latest release v4.0.0. Runs 5–26 added the cells in "Run 5 cells" through "Run 26 cells" below. The project-mode matrix below was measured on `f6b7fb9` (v4); cells marked "(v5)", the global matrix and the "v5 project-mode cells" list were re-run on v5.
 
 ## Coverage matrix
 
@@ -9,10 +9,11 @@ Cells are "pass", "fail #N", "n/a", "CI" or "untested". H = hosted, V = vendored
 | OS | yarn | H baseline | H offline mirror | H/V git dep (`git+…`) | H/V multi-version workspaces + scoped | H⇄V takeover + rollback | H/V CRLF lock + rollback | V baseline | V offline mirror (+pruning, rollback) | A apply + setup |
 | --- | --- | --- | --- | --- | --- | --- | --- | --- | --- | --- |
 | Linux | 1.0.2 | pass | n/a (yarn limitation) | H pass (run 20, #363 fixed) | H pass | untested | H pass (run 16) | n/a (yarn ≤1.6 can't install `file:` tarballs) | n/a | pass |
-| Linux | 1.3.2 / 1.5.1 (run 23) | pass | untested | untested | untested | untested | untested | n/a (yarn ≤1.6) | n/a | pass |
+| Linux | 1.1.0 / 1.2.1 / 1.4.0 (run 26) | pass | untested | untested | H pass (run 26) | H→V→H pass (V n/a ≤1.6) | H pass (run 26) | n/a (yarn ≤1.6) | n/a | untested |
+| Linux | 1.3.2 / 1.5.1 (run 23, 26) | pass | untested | untested | H pass (run 26) | H→V→H pass (V n/a ≤1.6) | H pass (run 26) | n/a (yarn ≤1.6) | n/a | pass |
 | Linux | 1.6.0 | pass | n/a (yarn limitation) | untested | H pass | untested | H pass (run 16) | n/a (yarn ≤1.6) | n/a | pass (run 17) |
 | Linux | 1.7.0 | CI | fail #364 (`--offline`) | pass (run 20, #363 fixed; V git-only: #857) | pass | pass (run 16) | pass (run 16) | pass | untested | pass (run 17) |
-| Linux | 1.9.4 | CI | fail #364 (`--offline`) | untested | untested | untested | untested | CI | pass (run 16) | pass (run 17) |
+| Linux | 1.9.4 | CI | fail #364 (`--offline`) | untested | H pass (run 26) | pass (run 26) | H pass (run 26) | CI | pass (run 16) | pass (run 17) |
 | Linux | 1.10.1 | pass | fail #364 | V git-only: #857 (run 20) | pass | pass | pass (run 16, + BOM) | pass | pass | pass (+ `--install.modules-folder`, run 9) |
 | Linux | 1.10.0 / 1.19.0 / 1.19.1 / 1.22.0 (run 24) | pass (+ warm in-place, vex) | untested | untested | untested | untested | untested | pass (+ byte-exact rollback) | untested | pass |
 | Linux | 1.17.3 | pass (in-place) | fail #364 | untested | untested | untested | untested | pass (in-place) | pass (run 16) | pass (run 17) |
@@ -177,9 +178,17 @@ Other cells that pass on Linux 1.22.22 (some also on older releases; see the ent
 - Same-basename tarballs (`left-pad@1.2.0` + `@types/left-pad@1.2.0`): V + offline mirror + pruning (fresh offline frozen, in-place, vex, byte-exact rollback) and H cold / warm-cache frozen installs on 1.7.0 / 1.10.1 / 1.22.22: pass. The vendored path is `<uuid>/@types/left-pad-1.2.0.tgz`.
 - `link:` copy beside a registry range: yarn 1.22.22 links *every* range of that name (lock `version "0.0.0"`), so there's no registry block to pin. That's yarn's behaviour; nothing to test.
 
+### Run 26 cells (`9c43dfc`)
+- **npm wrapper `@socketsecurity/socket-patch@4.0.0` installed with yarn 1 on Alpine (musl): fail #974.** yarn 1 ignores `libc`, so it installs both `-linux-x64-gnu` and `-musl`; the wrapper picks `-gnu` first, the spawn fails `ENOENT`, and it exits 1 with no output. yarn 1.0.2 / 1.7.0 / 1.10.1 / 1.22.22 in node:22-alpine all fail; npm 10.9 on Alpine (musl only) and yarn on bookworm (glibc) pass (probe run 37554067537).
+- Old releases 1.1.0 / 1.2.1 / 1.3.2 / 1.4.0 / 1.5.1 / 1.9.4: hosted CRLF lock (fresh frozen install patched, rollback keeps CRLF, post-rollback frozen install unpatched), hosted multi-version workspace + scoped member, H→V→H takeover + rollback: pass (V leg n/a on ≤1.6).
+- Lock churn: a plain non-frozen `yarn install` after H / V scan leaves yarn.lock byte-identical and the tree patched (1.7.0 / 1.10.1 / 1.22.22): pass.
+- BOM-prefixed `package.json` (root, workspace root, member), A / H / V + vex: pass (1.22.22).
+- `npm:` self-alias copy (`"lp": "npm:left-pad@1.3.0"`) beside a direct `left-pad@1.3.0`: H pins the direct block, warns `redirect_yarn_classic_alias_skipped` and vex refuses (no attestation); V wires both blocks and both install patched; vex attests: pass (1.22.22).
+- Agent `rollback packages/a` with nested copies in `a` and `b` rolls back both: documented (CLI_CONTRACT "Path-scoped scans": a selected purl is handled with all its copies).
+
 ## Backlog
 
-1. Re-check once merged: #938 (PR #940, verified run 25), #921 / #857 (PR #924, #921 verified run 25), #884 (PR #901, verified run 22; also covers the positional PATH form), #364 (PR #839), #831 (PR #837), #907 (PR #917), #778 (yarn classic nested copies, run 25), plus #828's yarn git-sibling shape. Then #467 / #519 / #558 / #591 / #691 / #692 / #758.
+1. Re-check #974 once the wrapper changes (also arm64 Alpine, and `yarn global add` on Alpine). Re-check once merged: #938 (PR #940, verified run 25), #921 / #857 (PR #924, #921 verified run 25), #884 (PR #901, verified run 22; also covers the positional PATH form), #364 (PR #839), #831 (PR #837), #907 (PR #917), #778 (yarn classic nested copies, run 25), plus #828's yarn git-sibling shape. Then #467 / #519 / #558 / #591 / #691 / #692 / #758.
 2. #857 on PR #924 (vendored git-only dep; needs a git dep, which worked in run 20 via github.com).
 3. npm-workspace analogue of the #778 nested-copy scope miss (hand over to npm if it reproduces). Also `rollback <PATH>` / `--sync <PATH>` / `--prune <PATH>` on the same yarn layout.
 4. #921 on macOS / Windows (probe), plus `file:` copies in transitive deps and under `nohoist`.
@@ -273,3 +282,7 @@ Other cells that pass on Linux 1.22.22 (some also on older releases; see the ent
 - `link:` deps: yarn 1 links every range of the same name to the `link:` target (`version "0.0.0"` blocks), so a `link:` copy can't sit beside a registry block.
 - Run-25 multi-package mock (`mockm.py <port> name@ver,…`): downloads each upstream tarball, re-roots it to `package/`, patches `index.js` / `index.d.ts` / `package.json`, one uuid per package. Vendored service artifacts must use a `package/` root, or vendored refuses `vendor_prebuilt_layout_mismatch`.
 - `scan <PATH>` in hosted / vendored mode is a per-directory `--cwd` run (CLI_CONTRACT "Path-scoped scans"); with `--json` it takes one directory, so `'packages/*'` with two members is a usage error (exit 2) by design.
+- Leftover probe branch (deletion blocked): `bughunt/yarn-classic/20261007-musl-wrapper`.
+- `rollback <PATH>` / agent `scan <PATH>` select at purl level: every copy of a selected package is handled, even copies outside the PATH (CLI_CONTRACT "Path-scoped scans"). Only the *zero-selection* miss is #778.
+- Hosted rollback in the sandbox needs `SOCKET_NPM_REGISTRY=http://127.0.0.1:<port>` with a plain-HTTP passthrough to registry.npmjs.org (python `urllib` with `/root/.ccr/ca-bundle.crt`) and `HTTPS_PROXY` unset. The restored `resolved` then reads registry.npmjs.org + an `integrity` line, so compare by a post-rollback frozen install, not `cmp`.
+- The sandbox has a docker CLI but no daemon, and dl-cdn.alpinelinux.org / unofficial-builds.nodejs.org are blocked. Use a probe branch with `docker run node:22-alpine` for musl cells.
