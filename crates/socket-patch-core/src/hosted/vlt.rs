@@ -180,7 +180,11 @@ pub fn judge(
         );
         out.warnings.push(crate::hosted::engine::warning(
             ARTIFACT_UNVERIFIABLE,
-            crate::utils::redact::redact_urls_in(&detail).into_owned(),
+            crate::hosted::engine::redact_artifact_text(
+                &detail,
+                &dep.artifact_url,
+                &dep.patch_uuid,
+            ),
         ));
         if everywhere {
             out.withheld_everywhere
