@@ -2878,6 +2878,55 @@ async fn rush_pnpm_trust_warning_gives_rush_remedy() {
     );
 }
 
+/// HEAL-ON-RERUN for #713: a Rush repo whose locks an earlier run (any
+/// release) already redirected splices nothing on a re-scan, yet its `rush
+/// install` still needs the Rush trust remedy — so the re-run re-issues it
+/// instead of going silent, and still writes no root pnpm-workspace.yaml.
+#[tokio::test]
+#[serial]
+async fn rush_rerun_on_redirected_locks_reissues_the_rush_remedy() {
+    let server = MockServer::start().await;
+    mock_discovery(&server).await;
+    mock_reference(&server).await;
+    mock_view(&server).await;
+
+    let tmp = tempfile::tempdir().unwrap();
+    write_rush_project(tmp.path(), false);
+    run_redirect_subprocess(tmp.path(), &server.uri());
+    let common_rel = "common/config/rush/pnpm-lock.yaml";
+    let redirected = std::fs::read_to_string(tmp.path().join(common_rel)).unwrap();
+    assert!(
+        redirected.contains(HOSTED_URL),
+        "first run must redirect:\n{redirected}"
+    );
+
+    let env = run_redirect_subprocess(tmp.path(), &server.uri());
+    assert_eq!(env["status"], "success", "envelope: {env}");
+    assert_eq!(
+        std::fs::read_to_string(tmp.path().join(common_rel)).unwrap(),
+        redirected,
+        "the re-run must leave the redirected Rush lock byte-identical"
+    );
+    let detail = env["redirect"]["warnings"]
+        .as_array()
+        .and_then(|arr| {
+            arr.iter()
+                .find(|w| w["code"] == "redirect_pnpm_trust_lockfile")
+                .and_then(|w| w["detail"].as_str())
+                .map(str::to_string)
+        })
+        .unwrap_or_else(|| panic!("the re-run must re-issue the Rush remedy; envelope: {env}"));
+    assert!(
+        detail.contains("pnpm_config_trust_lockfile=true rush install"),
+        "{detail}"
+    );
+    assert!(!detail.contains("pnpm install --trust-lockfile"), "{detail}");
+    assert!(
+        !tmp.path().join("pnpm-workspace.yaml").exists(),
+        "a Rush re-run must not create a root pnpm-workspace.yaml"
+    );
+}
+
 /// The `redirect_rush_repo_state_stale` warning claims a Rush lock "was edited
 /// outside `rush update`" — so it must fire only when the rewrite actually
 /// landed in a Rush lock. A Rush repo whose locks resolve only an UNRELATED

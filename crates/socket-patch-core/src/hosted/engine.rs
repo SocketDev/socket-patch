@@ -48,10 +48,10 @@ use super::guidance::{
     npm_allow_remote_user_set_detail, npm_lock_url_needles, plan_workspace_trust, pnpm_heal_root,
     pnpm_lock_may_need_store_flag, pnpm_lock_version_major, pnpm_trust_configured_detail,
     pnpm_trust_legacy_detail, pnpm_trust_manual_guidance, pnpm_trust_policy_preamble,
-    pnpm_trust_rush_detail,
-    pnpm_trust_workspace_unreadable_detail, pnpm_trust_workspace_unsupported_detail,
-    read_npmrc_for_allow_remote, read_workspace_for_trust, url_host, TrustPlan, NPM_LOCKS,
-    PNPM_TRUST_RUSH_MIXED_NOTE, PNPM_TRUST_TRADEOFF_AND_CAUTION, PNPM_WORKSPACE_REL, REDIRECT_PNPM_WORKSPACE_TRUST_EDIT_KIND,
+    pnpm_trust_rush_detail, pnpm_trust_workspace_unreadable_detail,
+    pnpm_trust_workspace_unsupported_detail, read_npmrc_for_allow_remote, read_workspace_for_trust,
+    url_host, TrustPlan, NPM_LOCKS, PNPM_TRUST_RUSH_MIXED_NOTE, PNPM_TRUST_TRADEOFF_AND_CAUTION,
+    PNPM_WORKSPACE_REL, REDIRECT_PNPM_WORKSPACE_TRUST_EDIT_KIND,
 };
 use super::vlt::bun_lockb_present;
 
@@ -1340,7 +1340,7 @@ fn pnpm_trust(
         .unzip();
     // Rush locks spliced this run. The heal and takeover roots below are
     // only ever the repo-root lock, never a Rush one.
-    let spliced_rush = spliced_keys
+    let mut spliced_rush = spliced_keys
         .iter()
         .filter(|key| rush_lock_keys.contains(key))
         .count();
@@ -1358,6 +1358,18 @@ fn pnpm_trust(
     let spliced_pnpm_locks = pnpm_lock_texts.len();
     if let Some(text) = heal_root {
         pnpm_lock_texts.push(text);
+    }
+    // HEAL-ON-RERUN for Rush: a common/subspace v9 lock an earlier run
+    // already redirected splices nothing now, but its `rush install` still
+    // needs the Rush trust remedy (#713) — nothing persists it, so it is
+    // re-issued on every run. Same gate as the root heal; never configured.
+    for key in rush_lock_keys {
+        if let Some(text) =
+            pnpm_heal_root(rewrite.files.contains_key(key), files.get(key), overrides)
+        {
+            pnpm_lock_texts.push(text);
+            spliced_rush += 1;
+        }
     }
     // A dry-run vendored→hosted takeover of a purl vendored into the root
     // pnpm lock: the wet run reverts that wiring and splices the hosted URL
@@ -2443,10 +2455,19 @@ snapshots:
         assert!(done.rewrite.files.contains_key(RUSH_COMMON_LOCK_REL));
         assert!(!done.rewrite.files.contains_key(PNPM_WORKSPACE_REL));
         let detail = pnpm_trust_detail(&done);
-        assert!(detail.contains("pnpm_config_trust_lockfile=true rush install"), "{detail}");
-        assert!(detail.contains("usePnpmFrozenLockfileForRushInstall"), "{detail}");
+        assert!(
+            detail.contains("pnpm_config_trust_lockfile=true rush install"),
+            "{detail}"
+        );
+        assert!(
+            detail.contains("usePnpmFrozenLockfileForRushInstall"),
+            "{detail}"
+        );
         assert!(detail.contains("rush purge"), "{detail}");
-        assert!(!detail.contains("pnpm install --trust-lockfile"), "{detail}");
+        assert!(
+            !detail.contains("pnpm install --trust-lockfile"),
+            "{detail}"
+        );
         assert!(!detail.contains("--store-dir"), "{detail}");
 
         let mut root = MemoryProject::new();
@@ -2462,6 +2483,34 @@ snapshots:
         let detail = pnpm_trust_detail(&done);
         assert!(detail.contains("--store-dir"), "{detail}");
         assert!(detail.contains(PNPM_TRUST_RUSH_MIXED_NOTE), "{detail}");
+    }
+
+    /// #713 HEAL-ON-RERUN: a Rush lock an earlier run already redirected
+    /// splices nothing on a re-run, yet its `rush install` still needs the
+    /// Rush remedy — the re-run re-issues it (and still writes nothing).
+    #[tokio::test]
+    async fn issue_713_rerun_on_a_redirected_rush_lock_keeps_the_rush_remedy() {
+        let mut first = MemoryProject::new();
+        first.insert_text("rush.json", r#"{ "rushVersion": "5.100.0" }"#);
+        first.insert_text(RUSH_COMMON_LOCK_REL, LEFT_PAD_V9_LOCK);
+        let (_, done) = npm_rewrite(&ProjectView::Memory(&first), &BTreeSet::new()).await;
+        let redirected = done.rewrite.files[RUSH_COMMON_LOCK_REL].clone();
+
+        let mut rerun = MemoryProject::new();
+        rerun.insert_text("rush.json", r#"{ "rushVersion": "5.100.0" }"#);
+        rerun.insert_text(RUSH_COMMON_LOCK_REL, redirected.as_str());
+        let (_, done) = npm_rewrite(&ProjectView::Memory(&rerun), &BTreeSet::new()).await;
+        assert!(done.rewrite.files.is_empty(), "{:?}", done.rewrite.files);
+        assert!(!done.pnpm_rerun_only);
+        let detail = pnpm_trust_detail(&done);
+        assert!(
+            detail.contains("pnpm_config_trust_lockfile=true rush install"),
+            "{detail}"
+        );
+        assert!(
+            !detail.contains("pnpm install --trust-lockfile"),
+            "{detail}"
+        );
     }
 
     /// REGRESSION (#367), binary lock: a `bun.lockb`-only project's root
