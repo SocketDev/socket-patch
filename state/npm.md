@@ -1,6 +1,6 @@
 [agent] Progress ledger for the scheduled npm bug-hunt routine (label pm:npm).
 
-Last updated: 2026-10-06T18Z (run 25 with a ledger), main `9c43dfc` (unchanged since 00Z), latest release v4.0.0 (previous v3.3.0, both from npm `@socketsecurity/socket-patch`). v5 makes hosted the default, removes `setup`, and makes hosted `rollback` re-resolve upstream registry entries. Cells marked (v4) were last verified on `f6b7fb9`. #432 (closed by #813) and #798 (closed by #799, re-verified 18Z: `vex` refuses the stale twin) are fixed; their old `fail` marks below are historical.
+Last updated: 2026-10-07T00Z (run 26 with a ledger), main `9c43dfc` (unchanged since 2026-10-06T00Z), latest release v4.0.0 (previous v3.3.0, both from npm `@socketsecurity/socket-patch`). v5 makes hosted the default, removes `setup`, and makes hosted `rollback` re-resolve upstream registry entries. Cells marked (v4) were last verified on `f6b7fb9`. #432 (closed by #813) and #798 (closed by #799, re-verified 18Z: `vex` refuses the stale twin) are fixed; their old `fail` marks below are historical.
 
 ## Coverage matrix
 
@@ -58,6 +58,14 @@ A hosted `scan` / `get <uuid>` run from an npm workspace member exits 0 with `re
 - `package-lock.json` + `yarn.lock` (vendored wires `yarn.lock`): `vendor --check` falsely says no lock references the artifact, and its remedies are no-ops. **fail #900** on Linux npm 10 + yarn 1.22.22.
 - #879 also covers npm 12 `npm install` on an existing v2 lock (keeps v2, drops mirror `resolved`) and an npm 8 v2 shrinkwrap (commented 2026-10-06).
 
+## npm `allow-file` vs vendored `file:` tarballs (#969, 2026-10-07T00Z)
+
+npm ≥ 11.14.0 has `allow-file` (`all` / `root` / `none`). Under `root` (vendored **transitive** dep) or `none`, vendored `scan` / `vendor --check` / lockfile-only `vex` succeed silently and every `npm ci` fails EALLOWFILE. **fail #969** on Linux npm 12.2.0 (project `.npmrc` x2, env var) and 11.21.0. Pass: `root` with a direct dep, default `all`. npm ≤ 11.13 has no such setting.
+
+## Orphaned vendored entry after `npm uninstall` (Bun handover, 2026-10-07T00Z)
+
+`scan --mode vendored --prune` reverts it (#665 fixed by #689): **pass**. `vendor --check` exits 1 with a false "fresh install gets the unpatched package" message and a no-op `socket-patch vendor` remedy: commented on **#900** (npm 8.19.4 / 10.9.4 / 12.2.0).
+
 ## Superseding patch unavailable / withdrawn (2026-10-06T18Z, main `9c43dfc`)
 
 Mock: left-pad@1.3.0 at patch A, then the API changes. Linux npm 8.19.4 (v2) / 10.9.4 / 12.2.0 (Node 24.21).
@@ -85,6 +93,7 @@ The same `name@version` gets a new patch UUID with different bytes. Mock: left-p
 
 ## Backlog
 
+- **New 2026-10-07T00Z:** #969 follow-ups (hosted→vendored takeover under `allow-file=root`; user / global `.npmrc` layers; a workspace member's vendored deps under `root`; `allow-directory` with `file:` directory deps).
 - **New 2026-10-06T18Z:** #954 follow-ups (other vendored PMs → handover if confirmed: pnpm / yarn / bun share `ServiceFetch::settle`; `--max-new-patches` with an unavailable UPGRADE; `get <B> --mode vendored` wording). (Withdrawn / forbidden superseding: done 18Z, pass.)
 - **New 2026-10-06T12Z:** #933 follow-ups (path-scoped `rollback <purl>`, agent re-scan after the takeover, other PMs → handover); Interrupted runs inside the write window.
 - (Patch superseding done 2026-10-06T12Z: pass except agent→hosted, #933.)
@@ -120,6 +129,8 @@ The same `name@version` gets a new patch UUID with different bytes. Mock: left-p
 
 ## Known non-bugs
 
+- `allow-file=root` admits a vendored **direct** dependency's `file:` tarball (npm 12.2.0); only transitive vendored entries are refused (#969).
+- An orphaned vendored ledger entry after `npm uninstall` is cleaned up by `scan --mode vendored --prune` (since #689). Only the `vendor --check` wording is wrong (#900).
 - A withdrawn patch (nothing offered, reference `withdrawn`) keeps its hosted / vendored pin and exits 0; hosted `vex` keeps attesting while the API still serves the record. No documented contract says a withdrawal should un-pin.
 - A paid superseding patch without paid access: the scan keeps A and still lists A→B in `updates[]` (informational).
 
