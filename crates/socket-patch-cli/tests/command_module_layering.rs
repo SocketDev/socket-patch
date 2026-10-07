@@ -123,6 +123,70 @@ fn child_modules(dir: &Path) -> BTreeSet<String> {
         .collect()
 }
 
+/// The first path segment of each top-level item in the `{…}` group that
+/// opens just before `rest` (`rest` starts after the `{`):
+/// `get, scan::x, rollback::{a, b} }` → `["get", "scan", "rollback"]`.
+fn group_heads(rest: &str) -> Vec<String> {
+    let mut heads = Vec::new();
+    let mut depth = 1usize;
+    let mut at_item_start = true;
+    let mut chars = rest.chars().peekable();
+    while let Some(c) = chars.next() {
+        match c {
+            '{' => depth += 1,
+            '}' => {
+                depth -= 1;
+                if depth == 0 {
+                    break;
+                }
+            }
+            ',' if depth == 1 => at_item_start = true,
+            c if depth == 1 && at_item_start && (c.is_ascii_alphabetic() || c == '_') => {
+                let mut ident = c.to_string();
+                while let Some(&n) = chars.peek() {
+                    if n.is_ascii_alphanumeric() || n == '_' {
+                        ident.push(n);
+                        chars.next();
+                    } else {
+                        break;
+                    }
+                }
+                heads.push(ident);
+                at_item_start = false;
+            }
+            _ => {}
+        }
+    }
+    heads
+}
+
+/// The `commands` children that `code` (production source of a module at
+/// `depth` below `commands`, comments stripped) references: absolute
+/// `crate::commands::x` paths, `super::`-relative paths that climb exactly
+/// to `commands`, and the heads of a `{…}` group after either prefix.
+fn referenced_children(code: &str, depth: usize) -> BTreeSet<String> {
+    let absolute = Regex::new(r"crate::commands::(?:([a-z_]+)|\{)").expect("regex");
+    let relative = Regex::new(r"(?m)(?:^|[^\w:])((?:super::)+)(?:([a-z_]+)|\{)").expect("regex");
+    let mut out = BTreeSet::new();
+    let mut take = |name: Option<regex::Match>, end: usize| match name {
+        Some(m) => {
+            out.insert(m.as_str().to_string());
+        }
+        None => out.extend(group_heads(&code[end..])),
+    };
+    for cap in absolute.captures_iter(code) {
+        take(cap.get(1), cap.get(0).expect("match").end());
+    }
+    for cap in relative.captures_iter(code) {
+        // `super::` × n from `commands::<module…>` lands on `commands`
+        // exactly when n equals the module depth.
+        if cap[1].matches("super::").count() == depth {
+            take(cap.get(2), cap.get(0).expect("match").end());
+        }
+    }
+    out
+}
+
 /// Every `commands::<x>` → `commands::<y>` reference in production code
 /// (test modules and comments excluded), as `(x, y)`.
 fn module_edges() -> BTreeSet<(String, String)> {
@@ -130,8 +194,6 @@ fn module_edges() -> BTreeSet<(String, String)> {
     let children = child_modules(&dir);
     let mut files = Vec::new();
     rust_files(&dir, &mut files);
-    let absolute = Regex::new(r"crate::commands::([a-z_]+)").expect("regex");
-    let relative = Regex::new(r"(?m)(^|[^\w:])((?:super::)+)([a-z_]+)").expect("regex");
     let test_mod = Regex::new(r"\n#\[cfg\(test\)\]\s*\n(pub(\(crate\))? )?mod ").expect("regex");
     let mut edges = BTreeSet::new();
     for file in files {
@@ -160,23 +222,47 @@ fn module_edges() -> BTreeSet<(String, String)> {
             .filter(|l| !l.trim_start().starts_with("//"))
             .collect::<Vec<_>>()
             .join("\n");
-        let mut add = |target: &str| {
-            if children.contains(target) && target != node {
-                edges.insert((node.clone(), target.to_string()));
-            }
-        };
-        for cap in absolute.captures_iter(&code) {
-            add(&cap[1]);
-        }
-        for cap in relative.captures_iter(&code) {
-            // `super::` × n from `commands::<module…>` lands on `commands`
-            // exactly when n equals the module depth.
-            if cap[2].matches("super::").count() == module.len() {
-                add(&cap[3]);
+        for target in referenced_children(&code, module.len()) {
+            if children.contains(&target) && target != node {
+                edges.insert((node.clone(), target));
             }
         }
     }
     edges
+}
+
+#[test]
+fn edge_scanner_sees_every_import_form() {
+    let names = |code: &str, depth: usize| -> Vec<String> {
+        referenced_children(code, depth).into_iter().collect()
+    };
+    // Absolute paths, plain and grouped (nested groups count only their head).
+    assert_eq!(names("use crate::commands::get::run;", 1), ["get"]);
+    assert_eq!(
+        names(
+            "use crate::commands::{get, scan::{a, b}, rollback as r};",
+            2
+        ),
+        ["get", "rollback", "scan"]
+    );
+    assert_eq!(
+        names(
+            "use crate::commands::{\n    vendor::x,\n    apply::{y, z},\n};",
+            1
+        ),
+        ["apply", "vendor"]
+    );
+    // `super::` counts only when it climbs exactly to `commands`.
+    assert_eq!(names("use super::rollback::x;", 1), ["rollback"]);
+    assert_eq!(
+        names("use super::{rollback::x, get::y};", 1),
+        ["get", "rollback"]
+    );
+    assert_eq!(names("use super::{a, b};", 2), Vec::<String>::new());
+    assert_eq!(names("use super::super::{get, scan};", 2), ["get", "scan"]);
+    assert_eq!(names("let x = super::vendor::f();", 1), ["vendor"]);
+    // Not a path: `foo::super::x` is not matched as a relative import.
+    assert_eq!(names("foo::super::get", 1), Vec::<String>::new());
 }
 
 #[test]
@@ -209,23 +295,23 @@ fn command_modules_import_each_other_only_along_allowlisted_edges() {
     );
 }
 
+/// Edges that close a cycle this PR does not break, left out of the cycle
+/// check. Each is also in [`ALLOWED_COMMAND_IMPORTS`], whose stale check
+/// fails once the edge is gone, so the entry is deleted with it.
+///
+/// `vendor` → `vendored_backend` → `vendor`: `vendored_backend` is the
+/// vendor command's engine facade and still calls back into
+/// `vendor_records_reusing` / `dispatch_revert_one_opts` (#894 child 4).
+const KNOWN_CYCLE_EDGES: &[(&str, &str)] = &[("vendored_backend", "vendor")];
+
 #[test]
 fn command_module_graph_has_no_cycles() {
-    // `vendored_backend` is the vendor command's own engine facade
-    // (#894 child 4); fold it into `vendor` so the pair is one node.
-    let fold = |m: &str| -> String {
-        if m == "vendored_backend" {
-            "vendor".to_string()
-        } else {
-            m.to_string()
-        }
-    };
     let mut graph: BTreeMap<String, BTreeSet<String>> = BTreeMap::new();
     for (from, to) in module_edges() {
-        let (from, to) = (fold(&from), fold(&to));
-        if from != to {
-            graph.entry(from).or_default().insert(to);
+        if KNOWN_CYCLE_EDGES.contains(&(from.as_str(), to.as_str())) {
+            continue;
         }
+        graph.entry(from).or_default().insert(to);
     }
     // Depth-first search for a back edge; report the cycle it closes.
     fn visit(
