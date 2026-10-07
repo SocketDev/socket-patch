@@ -749,9 +749,15 @@ pub(crate) async fn run_redirect_selected(
     }
     // A workspace member whose lock lives in an ancestor directory (pnpm
     // workspace / `lockfile-dir`, cargo workspace): the rewriters would
-    // read only the member, so refuse before any takeover or write.
-    if let Some(refusal) =
-        socket_patch_core::hosted::governing_root::refusal(&view, &candidates).await
+    // read only the member, so refuse before any takeover or write. The
+    // same goes for a pnpm member whose `trustLockfile` setting lives in
+    // the workspace root's pnpm-workspace.yaml.
+    if let Some(refusal) = socket_patch_core::hosted::governing_root::refusal(
+        &view,
+        &candidates,
+        !common.no_trust_lockfile_config,
+    )
+    .await
     {
         return refuse(common, scan_result.take(), &refusal);
     }

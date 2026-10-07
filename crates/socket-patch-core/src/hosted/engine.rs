@@ -37,6 +37,7 @@ use crate::patch::redirect::{
     artifact_url_spellings, rewrite_registry_redirect_withholding_vlt, DepOverride, FileEdit,
     RewriteResult, RewriteWarning,
 };
+use crate::utils::pnpm_workspace::governing_workspace_file;
 use crate::utils::purl::purl_parts;
 use crate::vendor::lock_inventory::{MemoryEntry, ProjectView};
 
@@ -1414,6 +1415,26 @@ fn pnpm_trust(
         pnpm_trust_legacy_detail(&server)
     } else if !root_lock_v9 || !options.trust_lockfile_config {
         pnpm_trust_manual_guidance(&server)
+    } else if let Some(root_file) = governing_workspace(view) {
+        // A workspace member with its own lock: pnpm reads `trustLockfile`
+        // only from the workspace root's file, and a nested one would be
+        // ignored (#880). The governing-root pre-check refused every root
+        // file but these two, so nothing is written here.
+        let root_file = root_file.display().to_string();
+        match read_workspace_for_trust(std::path::Path::new(&root_file))
+            .ok()
+            .flatten()
+            .map(|text| plan_workspace_trust(Some(&text)))
+        {
+            Some(TrustPlan::AlreadyTrue) => {
+                pnpm_rerun_only = spliced_pnpm_locks == 0;
+                pnpm_trust_already_true_detail(&server, &root_file)
+            }
+            Some(TrustPlan::UserSet(value)) => {
+                pnpm_trust_user_set_detail(&server, &root_file, &value)
+            }
+            _ => pnpm_trust_manual_guidance(&server),
+        }
     } else {
         let (workspace, symlinked) = read_workspace(view);
         workspace_symlinked = symlinked;
@@ -1441,21 +1462,11 @@ fn pnpm_trust(
                 }
                 TrustPlan::AlreadyTrue => {
                     pnpm_rerun_only = spliced_pnpm_locks == 0;
-                    format!(
-                        "{}, and {PNPM_WORKSPACE_REL} already carries `trustLockfile: \
-                         true` — keep it committed alongside the lock; installs need \
-                         no extra flags. {PNPM_TRUST_TRADEOFF_AND_CAUTION}",
-                        pnpm_trust_policy_preamble(&server),
-                    )
+                    pnpm_trust_already_true_detail(&server, PNPM_WORKSPACE_REL)
                 }
-                TrustPlan::UserSet(value) => format!(
-                    "{}. {PNPM_WORKSPACE_REL} explicitly sets `trustLockfile: \
-                 {value}`, which was respected and left untouched — install \
-                 with `pnpm install --trust-lockfile`, or set `trustLockfile: \
-                 true` yourself so every install accepts the patched \
-                 artifacts. {PNPM_TRUST_TRADEOFF_AND_CAUTION}",
-                    pnpm_trust_policy_preamble(&server),
-                ),
+                TrustPlan::UserSet(value) => {
+                    pnpm_trust_user_set_detail(&server, PNPM_WORKSPACE_REL, &value)
+                }
                 TrustPlan::Unsupported(why) => {
                     pnpm_trust_workspace_unsupported_detail(&server, &why)
                 }
@@ -1491,6 +1502,42 @@ fn pnpm_trust(
         pnpm_rerun_only,
         workspace_symlinked,
     )
+}
+
+/// The trust detail for a settings file (`file`) that already carries
+/// `trustLockfile: true`.
+fn pnpm_trust_already_true_detail(server: &str, file: &str) -> String {
+    format!(
+        "{}, and {file} already carries `trustLockfile: true` — keep it committed \
+         alongside the lock; installs need no extra flags. \
+         {PNPM_TRUST_TRADEOFF_AND_CAUTION}",
+        pnpm_trust_policy_preamble(server),
+    )
+}
+
+/// The trust detail for a settings file (`file`) whose explicit
+/// `trustLockfile: <value>` was respected.
+fn pnpm_trust_user_set_detail(server: &str, file: &str, value: &str) -> String {
+    format!(
+        "{}. {file} explicitly sets `trustLockfile: {value}`, which was respected \
+         and left untouched — install with `pnpm install --trust-lockfile`, or set \
+         `trustLockfile: true` yourself so every install accepts the patched \
+         artifacts. {PNPM_TRUST_TRADEOFF_AND_CAUTION}",
+        pnpm_trust_policy_preamble(server),
+    )
+}
+
+/// The ancestor `pnpm-workspace.yaml` governing a disk project's pnpm
+/// settings (see [`governing_workspace_file`]); an in-memory project has
+/// no ancestors.
+fn governing_workspace(view: &ProjectView<'_>) -> Option<std::path::PathBuf> {
+    match view {
+        ProjectView::Disk(cwd)
+        | ProjectView::Snapshot(crate::vendor::lock_inventory::DiskSnapshot {
+            root: cwd, ..
+        }) => governing_workspace_file(cwd),
+        ProjectView::Memory(_) => None,
+    }
 }
 
 /// npm >= 12 ships `allow-remote=none`: it refuses (EALLOWREMOTE) every
