@@ -82,7 +82,7 @@ pub async fn cleanup_binary_workspace_artifacts(
 
 /// The `WiringRecord.kind` this backend owns: key = the `packages` map key,
 /// original/new = the verbatim entry LINE.
-const KIND_LOCK_PACKAGE: &str = "bun_lock_package";
+pub(super) const KIND_LOCK_PACKAGE: &str = "bun_lock_package";
 
 /// Workspace gate: a `workspace:` packages entry in a lock whose
 /// `lockfileVersion` is below 2 refuses with `vendor_bun_workspace_unsupported`.
@@ -980,7 +980,7 @@ pub(crate) async fn revert_bun_opts(
     outcome
 }
 
-fn revert_one_record(
+pub(super) fn revert_one_record(
     lines: &mut [String],
     rec: &WiringRecord,
     entry_uuid: &str,

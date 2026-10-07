@@ -538,6 +538,22 @@ pub(crate) async fn revert(entry: &VendorEntry, root: &Path, opts: RevertOpts) -
             continue;
         }
         let restore = (|| {
+            // A same-uuid re-vendor on the migrated bun.lock re-pins our own
+            // tuple as a text record next to the binary records it carried
+            // forward (#784): restore it like the text revert does.
+            if let RevertLock::Migrated(lines) = &mut lock {
+                if rec.file == TEXT_LOCK && rec.kind == super::bun_lock::KIND_LOCK_PACKAGE {
+                    let mut dirty = false;
+                    super::bun_lock::revert_one_record(
+                        lines,
+                        rec,
+                        &entry.uuid,
+                        &mut dirty,
+                        &mut outcome.warnings,
+                    );
+                    return Ok(());
+                }
+            }
             if rec.file != LOCK || rec.kind != KIND {
                 return Err("unexpected binary wiring file or kind".to_string());
             }
@@ -1371,6 +1387,67 @@ mod rebuild_tests {
                 pristine,
                 "{bun}"
             );
+        }
+    }
+
+    /// A same-uuid re-run on the migrated bun.lock (artifact missing, or the
+    /// tuple's digest changed) re-pins our own tuple as a text record, and
+    /// the ledger carries the binary records forward beside it. Revert must
+    /// restore the pristine tuple from that mixed entry, not report the text
+    /// record as drift and leave the project vendored.
+    #[tokio::test]
+    async fn same_uuid_repin_after_migration_reverts_the_mixed_entry() {
+        for (bun, pristine, vendored) in MIGRATIONS {
+            let (fx, first) = vendored_then_migrated(vendored).await;
+            std::fs::remove_dir_all(fx.root().join(".socket/vendor/npm")).unwrap();
+            let integrity = first.wiring[0].new.as_ref().unwrap()["integrity"]
+                .as_str()
+                .unwrap()
+                .to_string();
+            if vendored.contains(&integrity) {
+                // Force a re-pin of the digest-carrying tuple too.
+                let lock = vendored.replace(&integrity, "sha512-AAAA");
+                std::fs::write(fx.root().join(TEXT_LOCK), lock).unwrap();
+            }
+            let blobs = fx.root().join(".socket/blobs");
+            let (result, entry, _) = ts::expect_done(
+                crate::vendor::test_support::vendor_bun(
+                    PURL,
+                    &fx.installed(),
+                    fx.root(),
+                    &fx.record,
+                    &PatchSources::blobs_only(&blobs),
+                    "",
+                    false,
+                    false,
+                    None,
+                )
+                .await,
+            );
+            assert!(result.success, "{bun}: {result:?}");
+            ts::persist(fx.root(), PURL, entry.expect("re-pinned")).await;
+            let state = crate::vendor::state::load_state(fx.root()).await.unwrap();
+            let entry = state.entries[PURL].clone();
+            let kinds: Vec<_> = entry.wiring.iter().map(|r| r.kind.as_str()).collect();
+            assert!(
+                kinds.contains(&"bun_lock_package") && kinds.contains(&KIND),
+                "{bun}: {kinds:?}"
+            );
+            let dry =
+                super::super::bun_lock::revert_bun_opts(&entry, fx.root(), RevertOpts::new(true))
+                    .await;
+            assert!(dry.success && dry.warnings.is_empty(), "{bun}: {dry:?}");
+            let outcome =
+                super::super::bun_lock::revert_bun_opts(&entry, fx.root(), RevertOpts::new(false))
+                    .await;
+            assert!(outcome.success, "{bun}: {outcome:?}");
+            assert!(outcome.warnings.is_empty(), "{bun}: {outcome:?}");
+            assert_eq!(
+                std::fs::read_to_string(fx.root().join(TEXT_LOCK)).unwrap(),
+                pristine,
+                "{bun}"
+            );
+            assert!(!fx.root().join(".socket/vendor/npm").exists(), "{bun}");
         }
     }
 
