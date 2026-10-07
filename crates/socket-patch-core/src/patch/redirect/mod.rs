@@ -3501,6 +3501,7 @@ fn rewrite_yarn_classic(
     let mut heads: Vec<Option<(String, Option<String>)>> =
         blocks.iter().map(|b| yarn_classic_block_head(b)).collect();
     let mut changed = false;
+    let mut any_pinned = false;
     for dep in &npm {
         let fname = full_name(dep);
         let Some(sha512) = dep.integrity.sha512.clone() else {
@@ -3659,6 +3660,26 @@ fn rewrite_yarn_classic(
                 detail: format!("no yarn.lock entry resolving {fname}@{}", dep.version),
             });
         }
+        any_pinned |= matched_any;
+    }
+    // Yarn 2+ (berry) migrates a classic lock on install and re-resolves
+    // every entry from the registry, dropping the hosted pins this lock now
+    // carries (rewritten this run or already pinned) — the packages then
+    // install unpatched with nothing printed. The vendored probe
+    // (`vendor::yarn_classic_berry_migration_risk`) warns about the same
+    // trap; warn here too, once per run, unless corepack pins yarn 1. The
+    // engine reads the root manifest beside a classic lock; with none there
+    // is no project for yarn to install, so nothing to warn about.
+    let manifest = files.get("package.json").map(String::as_str);
+    if any_pinned && manifest.is_some() && !crate::vendor::manifest_pins_yarn_classic(manifest) {
+        result.warnings.push(RewriteWarning {
+            code: "redirect_yarn_classic_berry_migration_risk".into(),
+            detail: "yarn.lock is yarn-classic (v1) with hosted pins: installing with yarn 2+ \
+                     (berry) migrates the lockfile and silently drops them — packages install \
+                     unpatched from the registry. Pin yarn classic (e.g. \"packageManager\": \
+                     \"yarn@1.22.22\" in package.json) so every install uses yarn 1."
+                .into(),
+        });
     }
     if let Some(warning) = mirror_refusal {
         if !result.refused_yarn_classic_uuids.is_empty() {
@@ -9913,6 +9934,158 @@ mod tests {
          resolved \"https://registry.yarnpkg.com/left-pad/-/left-pad-1.3.0.tgz#bbbb\"\n  \
          integrity sha512-UPSTREAMupstream==\n"
             .to_string()
+    }
+
+    const BERRY_RISK: &str = "redirect_yarn_classic_berry_migration_risk";
+
+    fn classic_files(package_json: Option<&str>) -> BTreeMap<String, String> {
+        let mut files = BTreeMap::new();
+        files.insert("yarn.lock".to_string(), classic_lock_two_entries());
+        if let Some(manifest) = package_json {
+            files.insert("package.json".to_string(), manifest.to_string());
+        }
+        files
+    }
+
+    fn berry_risk_count(r: &RewriteResult) -> usize {
+        r.warnings.iter().filter(|w| w.code == BERRY_RISK).count()
+    }
+
+    /// #907: a hosted pin in a classic lock is dropped by a yarn 2+ install
+    /// exactly like vendored wiring, so the hosted rewrite must warn the
+    /// way the vendored probe does — with no `packageManager` pin, with a
+    /// non-1 yarn declared (`yarn@10` must not prefix-match `yarn@1`), and
+    /// when the manifest is unparseable (fail toward warning).
+    #[test]
+    fn yarn_classic_hosted_pin_warns_berry_migration_risk() {
+        let ovr = npm_override(
+            "left-pad",
+            "1.3.0",
+            "http://p.test/lp.tgz",
+            "sha512-PATCHED==",
+        );
+        for manifest in [
+            Some(r#"{"name":"p","dependencies":{"left-pad":"^1.3.0"}}"#),
+            Some(r#"{"name":"p","packageManager":"yarn@4.18.1"}"#),
+            Some(r#"{"name":"p","packageManager":"yarn@10.0.0"}"#),
+            Some(r#"{"name":"p","packageManager":"pnpm@9.0.0"}"#),
+            Some("{not json"),
+        ] {
+            let mut r = RewriteResult::default();
+            rewrite_yarn_classic(&classic_files(manifest), std::slice::from_ref(&ovr), &mut r);
+            assert!(
+                r.files.contains_key("yarn.lock"),
+                "{manifest:?}: pin must land"
+            );
+            assert_eq!(berry_risk_count(&r), 1, "{manifest:?}: {:?}", r.warnings);
+            let w = r.warnings.iter().find(|w| w.code == BERRY_RISK).unwrap();
+            assert!(
+                w.detail.contains("yarn 2+"),
+                "detail names the trap: {}",
+                w.detail
+            );
+            assert!(
+                w.detail.contains("yarn@1"),
+                "detail names the remedy: {}",
+                w.detail
+            );
+        }
+    }
+
+    /// #907: a corepack `packageManager: yarn@1…` pin makes a stray berry
+    /// install refuse instead of migrate, so it suppresses the warning (as
+    /// it does the vendored one), including a pin with a corepack hash.
+    #[test]
+    fn yarn_classic_hosted_pin_yarn1_package_manager_suppresses_berry_risk() {
+        let ovr = npm_override(
+            "left-pad",
+            "1.3.0",
+            "http://p.test/lp.tgz",
+            "sha512-PATCHED==",
+        );
+        for pm in ["yarn@1.22.22", "yarn@1.7.0", "yarn@1.22.22+sha512.abc"] {
+            let manifest = format!(r#"{{"name":"p","packageManager":"{pm}"}}"#);
+            let mut r = RewriteResult::default();
+            rewrite_yarn_classic(
+                &classic_files(Some(&manifest)),
+                std::slice::from_ref(&ovr),
+                &mut r,
+            );
+            assert!(r.files.contains_key("yarn.lock"));
+            assert!(r.warnings.is_empty(), "{pm}: {:?}", r.warnings);
+        }
+    }
+
+    /// #907: the warning is per run, not per package, and it fires on an
+    /// idempotent re-run too: the lock already carries the pin, so the next
+    /// berry install drops it just the same.
+    #[test]
+    fn yarn_classic_berry_risk_is_once_per_run_and_survives_rerun() {
+        let lp = npm_override(
+            "left-pad",
+            "1.3.0",
+            "http://p.test/lp.tgz",
+            "sha512-PATCHED==",
+        );
+        let ab = npm_override("abbrev", "1.1.1", "http://p.test/ab.tgz", "sha512-AB==");
+        let files = classic_files(Some(r#"{"name":"p"}"#));
+        let mut r = RewriteResult::default();
+        rewrite_yarn_classic(&files, &[lp.clone(), ab], &mut r);
+        assert_eq!(r.edits.len(), 2, "both entries pinned: {:?}", r.edits);
+        assert_eq!(berry_risk_count(&r), 1, "{:?}", r.warnings);
+
+        let mut pinned = files.clone();
+        pinned.insert("yarn.lock".into(), r.files["yarn.lock"].clone());
+        let mut again = RewriteResult::default();
+        rewrite_yarn_classic(&pinned, std::slice::from_ref(&lp), &mut again);
+        assert!(
+            again.edits.is_empty(),
+            "re-run is a no-op: {:?}",
+            again.edits
+        );
+        assert_eq!(berry_risk_count(&again), 1, "{:?}", again.warnings);
+    }
+
+    /// No pin in the lock means nothing for berry to drop: a dep with no
+    /// classic entry warns only `entry_not_found`, and a berry lock is not
+    /// the classic rewriter's at all.
+    #[test]
+    fn yarn_classic_berry_risk_silent_without_a_pin() {
+        let missing = npm_override("nope", "9.9.9", "http://p.test/n.tgz", "sha512-N==");
+        let mut r = RewriteResult::default();
+        rewrite_yarn_classic(&classic_files(Some(r#"{"name":"p"}"#)), &[missing], &mut r);
+        let codes: Vec<&str> = r.warnings.iter().map(|w| w.code.as_str()).collect();
+        assert_eq!(codes, ["redirect_yarn_classic_entry_not_found"]);
+
+        // No root manifest: no project for yarn to install, nothing to warn.
+        let lp = npm_override(
+            "left-pad",
+            "1.3.0",
+            "http://p.test/lp.tgz",
+            "sha512-PATCHED==",
+        );
+        let mut r = RewriteResult::default();
+        rewrite_yarn_classic(&classic_files(None), std::slice::from_ref(&lp), &mut r);
+        assert!(r.files.contains_key("yarn.lock"));
+        assert_eq!(berry_risk_count(&r), 0, "{:?}", r.warnings);
+
+        let lp = npm_override(
+            "left-pad",
+            "1.3.0",
+            "http://p.test/lp.tgz",
+            "sha512-PATCHED==",
+        );
+        let mut files = BTreeMap::new();
+        files.insert(
+            "yarn.lock".to_string(),
+            "__metadata:\n  version: 8\n\n\"left-pad@npm:^1.3.0\":\n  version: 1.3.0\n  \
+             resolution: \"left-pad@npm:1.3.0\"\n"
+                .to_string(),
+        );
+        files.insert("package.json".to_string(), r#"{"name":"p"}"#.to_string());
+        let mut r = RewriteResult::default();
+        rewrite_yarn_classic(&files, &[lp], &mut r);
+        assert_eq!(berry_risk_count(&r), 0, "{:?}", r.warnings);
     }
 
     /// A CRLF classic lock (Windows `core.autocrlf` checkout) must rewrite
