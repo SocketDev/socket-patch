@@ -552,7 +552,8 @@ fn parse_git_config_value(raw: &str) -> String {
 /// * `https://github.com/owner/repo`     → `pkg:github/owner/repo`
 /// * Same shapes for `gitlab.com` (→ `pkg:gitlab`) and `bitbucket.org`
 ///   (→ `pkg:bitbucket`).
-/// * Anything else (self-hosted gitea, generic SSH, etc.) → URL as-is.
+/// * Anything else (self-hosted gitea, generic SSH, etc.) → the URL as an
+///   IRI ([`remote_iri`]: without credentials).
 fn remote_url_to_purl(url: &str) -> String {
     if let Some((host, path)) = split_remote_host_path(url) {
         // Trim slashes BEFORE stripping `.git`: a URL like
@@ -578,7 +579,27 @@ fn remote_url_to_purl(url: &str) -> String {
             }
         }
     }
-    url.to_string()
+    remote_iri(url)
+}
+
+/// The git remote `url` as a product `@id`. The VEX document is published
+/// to customers and auditors, so the credentials a CI clone embeds in its
+/// origin (`https://gitlab-ci-token:<job token>@…`, `https://<PAT>@…`, a
+/// `?private_token=` query) must not ride along. An ssh login name
+/// (`ssh://git@host/…`) is not a secret and stays; an ssh password does
+/// not.
+fn remote_iri(url: &str) -> String {
+    use crate::utils::redact::{strip_url_credentials, url_userinfo};
+    let stripped = strip_url_credentials(url).into_owned();
+    let is_ssh = url.starts_with("ssh://") || url.starts_with("git+ssh://");
+    let login = url_userinfo(url)
+        .filter(|_| is_ssh)
+        .and_then(|userinfo| userinfo.split(':').next())
+        .filter(|login| !login.is_empty());
+    match (login, stripped.split_once("://")) {
+        (Some(login), Some((scheme, rest))) => format!("{scheme}://{login}@{rest}"),
+        _ => stripped,
+    }
 }
 
 /// Pull `(host, path)` out of a git remote URL. Returns `None` for
@@ -810,6 +831,46 @@ mod tests {
         // Self-hosted gitea / unknown forge — VEX `@id` accepts any URI.
         let raw = "https://git.example.com/team/repo.git";
         assert_eq!(remote_url_to_purl(raw), raw);
+    }
+
+    /// B21: credentials in a CI origin never reach the published product
+    /// `@id`, whether the remote maps to a purl or falls back to the URL
+    /// (an unknown host, a GitLab subgroup).
+    #[test]
+    fn remote_url_credentials_never_reach_the_product_id() {
+        for (remote, want) in [
+            (
+                "https://gitlab-ci-token:glcbt-SECRET123@gitlab.corp.example/group/sub/app.git",
+                "https://gitlab.corp.example/group/sub/app.git",
+            ),
+            (
+                "https://bot:ghp_SECRET@gitlab.com/group/subgroup/app.git",
+                "https://gitlab.com/group/subgroup/app.git",
+            ),
+            (
+                "https://ghp_SECRET@git.example.com/team/repo.git?private_token=SECRET#main",
+                "https://git.example.com/team/repo.git#main",
+            ),
+            (
+                "ssh://deploy:SECRET@git.example.com/team/repo.git",
+                "ssh://deploy@git.example.com/team/repo.git",
+            ),
+            ("https://ghp_SECRET@github.com/o/r.git", "pkg:github/o/r"),
+        ] {
+            let id = remote_url_to_purl(remote);
+            assert_eq!(id, want, "{remote}");
+            assert!(!id.contains("SECRET"), "{id}");
+        }
+        for unchanged in [
+            "ssh://git@git.example.com/team/repo.git",
+            "git@git.example.com:team/repo.git",
+        ] {
+            assert_eq!(
+                remote_url_to_purl(unchanged),
+                unchanged,
+                "a login name is kept"
+            );
+        }
     }
 
     #[test]
