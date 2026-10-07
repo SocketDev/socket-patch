@@ -3,7 +3,7 @@
 //! Ivy). Every Maven-PURL discovery path goes through here:
 //!
 //! - [`is_jvm_project`]: whether a directory is a JVM project root, by
-//!   [`layout::JVM_PROJECT_MARKERS`].
+//!   the build markers of [`layout::BuildTool`].
 //! - [`JvmCacheLayout`] / [`JvmCacheRoot`]: an installed-artifact cache
 //!   and how its directories spell coordinates. [`MavenCrawler`] crawls
 //!   and resolves PURLs per root, dispatching on the layout.
@@ -24,16 +24,14 @@ use std::path::{Path, PathBuf};
 
 use crate::vendor::jvm::layout;
 
-/// Whether `dir` holds any [`layout::JVM_PROJECT_MARKERS`] file.
+/// Whether `dir` is a JVM build root: any [`layout::BuildTool`] marker,
+/// root-relative ones (`project/build.properties`, `.scala-build`)
+/// included ([`layout::is_jvm_build`]).
 pub async fn is_jvm_project(dir: &Path) -> bool {
     let dir = dir.to_path_buf();
-    tokio::task::spawn_blocking(move || {
-        layout::JVM_PROJECT_MARKERS
-            .iter()
-            .any(|m| layout::marker_present(&dir, m))
-    })
-    .await
-    .unwrap_or(false)
+    tokio::task::spawn_blocking(move || layout::is_jvm_build(&dir))
+        .await
+        .unwrap_or(false)
 }
 
 /// How a cache root's directories spell an artifact's coordinates.
@@ -398,13 +396,19 @@ mod tests {
         assert_eq!(project_dependency_set(Path::new("/nonexistent")), None);
     }
 
+    /// Every build-tool marker, root-relative ones included, makes a JVM
+    /// project: an sbt build may have only `project/build.properties`.
     #[tokio::test]
     async fn every_marker_makes_a_jvm_project() {
-        for marker in layout::JVM_PROJECT_MARKERS {
-            let dir = tempfile::tempdir().unwrap();
-            assert!(!is_jvm_project(dir.path()).await);
-            std::fs::write(dir.path().join(marker), "").unwrap();
-            assert!(is_jvm_project(dir.path()).await, "{marker}");
+        for tool in layout::BuildTool::ALL {
+            for marker in tool.markers() {
+                let dir = tempfile::tempdir().unwrap();
+                assert!(!is_jvm_project(dir.path()).await);
+                let path = dir.path().join(marker);
+                std::fs::create_dir_all(path.parent().unwrap()).unwrap();
+                std::fs::write(&path, "").unwrap();
+                assert!(is_jvm_project(dir.path()).await, "{marker}");
+            }
         }
     }
 }
