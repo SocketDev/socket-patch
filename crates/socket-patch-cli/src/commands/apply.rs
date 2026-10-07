@@ -598,6 +598,16 @@ async fn run_check(args: &ApplyArgs, manifest_path: &Path) -> i32 {
     let mut tree = manifest.clone();
     tree.patches
         .retain(|purl, _| owned_by_apply(purl) && !is_local_go(purl, &args.common));
+    // The same PnP gate `apply` runs: a PnP tree hides every npm copy, so
+    // without it each npm patch would read as not installed and pass calm.
+    if matches!(
+        detect_npm_pkg_manager(&args.common.cwd),
+        NpmPkgManager::YarnBerryPnP
+    ) && eco_in_local_scope(&args.common, Ecosystem::Npm)
+        && manifest_targets_npm(&tree)
+    {
+        return refuse_yarn_pnp(args);
+    }
     let mut in_sync: Vec<String> = Vec::new();
     let mut not_installed: Vec<String> = Vec::new();
     if !tree.patches.is_empty() {
