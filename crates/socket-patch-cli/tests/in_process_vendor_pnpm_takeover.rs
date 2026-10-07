@@ -2,15 +2,16 @@
 //! pnpm projects whose shape the pnpm vendored backend refuses although
 //! hosted mode accepts it (#853): a `catalog:` dependency
 //! (`vendor_lock_entry_unsupported`), a CRLF `pnpm-lock.yaml`
-//! (`vendor_lockfile_crlf_unsupported`) and a user exact-pin override in
-//! `pnpm-workspace.yaml` (`vendor_override_conflict`).
+//! (`vendor_lockfile_crlf_unsupported`) and a conflicting user override
+//! (a range) in `pnpm-workspace.yaml` (`vendor_override_conflict`).
 //!
 //! `scan`/`get --mode vendored` over such a hosted pin used to commit the
 //! upstream restore FIRST and only then reach the backend's refusal, so
 //! the run failed with the hosted pin already gone and the project went
 //! back to installing the unpatched registry release. A refused takeover
 //! must leave the hosted wiring byte-for-byte in place; a plain dependency
-//! still takes over.
+//! and a workspace exact pin equal to the vendored version (#854) still
+//! take over.
 //!
 //! The API and the npm registry are wiremock; no pnpm binary is needed.
 //! Every child process gets the ambient `SOCKET_*` vars scrubbed and
@@ -50,8 +51,13 @@ enum Shape {
     Catalog,
     /// A plain dependency whose lock is converted to CRLF after hosting.
     Crlf,
-    /// A plain dependency plus a user `overrides: { left-pad: 1.3.0 }`.
+    /// A plain dependency plus a conflicting user
+    /// `overrides: { left-pad: ^1.3.0 }` in pnpm-workspace.yaml.
     Override,
+    /// A plain dependency plus a user exact pin
+    /// `overrides: { left-pad: 1.3.0 }` in pnpm-workspace.yaml, which
+    /// vendoring takes over (#854).
+    ExactPin,
     /// A plain dependency: the control both modes accept.
     Plain,
 }
@@ -72,7 +78,8 @@ fn write_pnpm_project(root: &Path, shape: Shape) {
     .unwrap();
     let workspace = match shape {
         Shape::Catalog => format!("packages:\n  - .\ncatalog:\n  {NAME}: {VERSION}\n"),
-        Shape::Override => format!("overrides:\n  {NAME}: {VERSION}\n"),
+        Shape::Override => format!("overrides:\n  {NAME}: ^{VERSION}\n"),
+        Shape::ExactPin => format!("overrides:\n  {NAME}: {VERSION}\n"),
         Shape::Crlf | Shape::Plain => String::new(),
     };
     if !workspace.is_empty() {
@@ -94,7 +101,8 @@ fn write_pnpm_project(root: &Path, shape: Shape) {
         Shape::Catalog => lock.push_str(&format!(
             "catalogs:\n  default:\n    {NAME}:\n      specifier: {VERSION}\n      version: {VERSION}\n\n"
         )),
-        Shape::Override => lock.push_str(&format!("overrides:\n  {NAME}: {VERSION}\n\n")),
+        Shape::Override => lock.push_str(&format!("overrides:\n  {NAME}: ^{VERSION}\n\n")),
+        Shape::ExactPin => lock.push_str(&format!("overrides:\n  {NAME}: {VERSION}\n\n")),
         Shape::Crlf | Shape::Plain => {}
     }
     let specifier = match shape {
@@ -373,7 +381,7 @@ async fn scan_vendored_over_hosted_pnpm_crlf_lock_keeps_the_hosted_pin() {
         .await;
 }
 
-/// #853: a user exact-pin override in `pnpm-workspace.yaml`.
+/// #853: a conflicting user override (a range) in `pnpm-workspace.yaml`.
 #[tokio::test(flavor = "multi_thread")]
 async fn scan_vendored_over_hosted_pnpm_workspace_override_keeps_the_hosted_pin() {
     refused_takeover_keeps_hosted_pin(Shape::Override, "scan", "vendor_override_conflict").await;
@@ -404,6 +412,43 @@ async fn scan_vendored_over_hosted_pnpm_plain_dep_still_takes_over() {
         lock.contains(&format!(".socket/vendor/npm/{UUID}/")),
         "the lock must point at the vendored artifact:\n{lock}"
     );
+}
+
+/// #854: a user exact pin equal to the vendored version in
+/// `pnpm-workspace.yaml` (the pnpm 10.5+/11/12 override map) is taken over
+/// like the same pin in package.json: the workspace value becomes the
+/// vendored `file:` spec under the user's own key, and package.json is
+/// left alone. It used to be refused as `vendor_override_conflict`.
+#[tokio::test(flavor = "multi_thread")]
+async fn scan_vendored_over_hosted_pnpm_workspace_exact_pin_takes_over() {
+    let server = MockServer::start().await;
+    mock_api(&server).await;
+    let tmp = tempfile::tempdir().unwrap();
+    let root = tmp.path();
+    let hosted = host_project(root, &server.uri(), Shape::ExactPin);
+
+    let (exit, env) = run_mode(root, &server.uri(), "scan", "vendored", &["--dry-run"]);
+    assert_eq!(exit, 0, "{env:#}");
+    assert_still_hosted(root, &hosted, &env);
+
+    let (exit, env) = run_mode(root, &server.uri(), "scan", "vendored", &[]);
+    assert_eq!(exit, 0, "the exact-pin takeover must succeed: {env:#}");
+    let spec = format!("file:.socket/vendor/npm/{UUID}/{NAME}-{VERSION}.tgz");
+    let ws = std::fs::read_to_string(root.join("pnpm-workspace.yaml")).unwrap();
+    // Hosted mode's `trustLockfile: true` line may follow; the override
+    // entry itself is rewritten in place under the user's key.
+    assert!(
+        ws.starts_with(&format!("overrides:\n  {NAME}: {spec}\n")),
+        "{ws}\n{env:#}"
+    );
+    let lock = std::fs::read_to_string(root.join("pnpm-lock.yaml")).unwrap();
+    assert!(!lock.contains(HOSTED_URL), "{lock}");
+    assert!(
+        lock.contains(&format!("overrides:\n  {NAME}: {spec}\n")),
+        "the lock override map must equal the workspace file's:\n{lock}"
+    );
+    let pkg = std::fs::read_to_string(root.join("package.json")).unwrap();
+    assert!(!pkg.contains("overrides"), "{pkg}");
 }
 
 /// `vendor --dry-run` over the hosted pin previews the backend's refusal of

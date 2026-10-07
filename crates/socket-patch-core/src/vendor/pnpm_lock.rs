@@ -640,18 +640,43 @@ fn preflight_package(
     override_key: &str,
 ) -> Result<String, Box<VendorOutcome>> {
     // A user-authored exact-version pin equal to `version` is TAKEN OVER
-    // (the pin's key is rewritten to our spec on both surfaces and the
+    // (the pin's key is rewritten to our spec on every surface and the
     // original value recorded for revert); anything else same-name refuses.
-    let disposition = match classify_pkg_override(&project.pkg, name, version, override_key) {
-        Ok(d) => d,
-        Err(detail) => return Err(Box::new(refused("vendor_override_conflict", detail))),
+    // The pin may live in package.json or, for modern locks, in
+    // pnpm-workspace.yaml (the map pnpm 10.5+ reads; #854).
+    let conflict = |detail| Box::new(refused("vendor_override_conflict", detail));
+    let pkg_d =
+        classify_pkg_override(&project.pkg, name, version, override_key).map_err(conflict)?;
+    let ws_d = match &project.lock {
+        ProjectLock::V9(_) => {
+            classify_ws_override(project.ws_text.as_deref(), name, version, override_key)
+                .map_err(conflict)?
+        }
+        ProjectLock::Legacy(_) => OverrideDisposition::Insert,
     };
-    let effective_key = disposition.effective_key(override_key).to_string();
+    let (effective_key, source) = match (&pkg_d, &ws_d) {
+        (OverrideDisposition::Insert, OverrideDisposition::Insert) => (override_key, None),
+        (OverrideDisposition::Insert, ws) => (ws.effective_key(override_key), Some(PNPM_WORKSPACE)),
+        (pkg, ws) => {
+            let pkg_key = pkg.effective_key(override_key);
+            let ws_key = ws.effective_key(override_key);
+            if !matches!(ws, OverrideDisposition::Insert) && ws_key != pkg_key {
+                return Err(conflict(format!(
+                    "{PNPM_WORKSPACE} carries the override key `{ws_key}` for `{name}` while \
+                     {PACKAGE_JSON} carries `{pkg_key}` — make the two agree before vendoring"
+                )));
+            }
+            (pkg_key, Some(PACKAGE_JSON))
+        }
+    };
+    let effective_key = effective_key.to_string();
     if let ProjectLock::V9(lines) = &project.lock {
         lines.note_probe();
     }
-    if let Err(detail) = check_lock_override(project.lock.lines(), name, version, &effective_key) {
-        return Err(Box::new(refused("vendor_override_conflict", detail)));
+    if let Err(detail) =
+        check_lock_override(project.lock.lines(), name, version, &effective_key, source)
+    {
+        return Err(conflict(detail));
     }
     match &project.lock {
         ProjectLock::V9(lines) => {
@@ -1311,8 +1336,9 @@ pub(super) fn vendor_value_is_for(value: &str, name: &str, version: &str) -> boo
         .is_some_and(|p| p.eco == "npm" && p.leaf == tgz_rel_leaf(name, version))
 }
 
-/// How the package.json `pnpm.overrides` table relates to the package
-/// being vendored. The lock's `overrides:` section must mirror this map
+/// How the package.json `pnpm.overrides` table (or the pnpm-workspace.yaml
+/// `overrides:` section) relates to the package being vendored. The
+/// lock's `overrides:` section must mirror this map
 /// key-for-key (pnpm hard-checks the two and fails
 /// `ERR_PNPM_LOCKFILE_CONFIG_MISMATCH` on any drift), so whichever key
 /// this classification yields is the one BOTH surfaces edit.
@@ -1362,12 +1388,69 @@ pub(super) fn classify_pkg_override(
     let Some(map) = overrides.as_object() else {
         return Err("package.json pnpm.overrides is not an object".to_string());
     };
+    classify_override_entries(
+        map.iter().map(|(key, value)| {
+            (
+                key.as_str(),
+                value.as_str().unwrap_or(""),
+                value.to_string(),
+            )
+        }),
+        name,
+        version,
+        our_key,
+        PACKAGE_JSON,
+    )
+}
+
+/// Classify the pnpm-workspace.yaml `overrides:` section for `name` with
+/// the same rules as [`classify_pkg_override`] — on pnpm 10.5+ (always on
+/// 11/12) it is the authoritative override map, so a user exact pin there
+/// is taken over just like one in package.json (#854). Values compare raw:
+/// a quoted pin (`'1.3.0'`) or one with a trailing comment is a conflict
+/// (fail-closed). A missing file, a missing section and an inline/flow
+/// section classify as `Insert`; [`check_workspace_override`] refuses the
+/// shapes the surgery cannot edit.
+fn classify_ws_override(
+    ws_text: Option<&str>,
+    name: &str,
+    version: &str,
+    our_key: &str,
+) -> Result<OverrideDisposition, String> {
+    let Some(text) = ws_text else {
+        return Ok(OverrideDisposition::Insert);
+    };
+    let lines = split_lines(text);
+    let Some((start, end, indent)) = ws_overrides_section(&lines) else {
+        return Ok(OverrideDisposition::Insert);
+    };
+    classify_override_entries(
+        lines[start + 1..end]
+            .iter()
+            .filter_map(|l| parse_key_line(l, indent))
+            .map(|(key, _repr, rest)| (key, rest, rest.to_string())),
+        name,
+        version,
+        our_key,
+        PNPM_WORKSPACE,
+    )
+}
+
+/// The shared per-entry rules of [`classify_pkg_override`] and
+/// [`classify_ws_override`] over `(key, value, value as shown)` entries of
+/// the override map `source` carries.
+fn classify_override_entries<'a>(
+    entries: impl Iterator<Item = (&'a str, &'a str, String)>,
+    name: &str,
+    version: &str,
+    our_key: &str,
+    source: &str,
+) -> Result<OverrideDisposition, String> {
     let mut found: Option<OverrideDisposition> = None;
-    for (key, value) in map {
+    for (key, value_str, shown) in entries {
         if override_key_name(key) != name {
             continue;
         }
-        let value_str = value.as_str().unwrap_or("");
         // A SIBLING version's vendored override coexists — not ours to
         // touch (and not a conflict): skip it entirely.
         if is_vendor_value(value_str) && !vendor_value_is_for(value_str, name, version) {
@@ -1375,16 +1458,20 @@ pub(super) fn classify_pkg_override(
         }
         if found.is_some() {
             return Err(format!(
-                "package.json carries more than one pnpm override for `{name}`; vendoring \
+                "{source} carries more than one pnpm override for `{name}`; vendoring \
                  cannot pick one — remove the extras first"
             ));
         }
         let classified = if key.contains('>') {
             None
         } else if is_vendor_value(value_str) {
-            Some(OverrideDisposition::Ours { key: key.clone() })
+            Some(OverrideDisposition::Ours {
+                key: key.to_string(),
+            })
         } else if value_str == version && (key == name || key == our_key) {
-            Some(OverrideDisposition::Takeover { key: key.clone() })
+            Some(OverrideDisposition::Takeover {
+                key: key.to_string(),
+            })
         } else {
             None
         };
@@ -1392,7 +1479,7 @@ pub(super) fn classify_pkg_override(
             Some(d) => found = Some(d),
             None => {
                 return Err(format!(
-                    "package.json already carries a pnpm override for `{key}` ({value}); \
+                    "{source} already carries a pnpm override for `{key}` ({shown}); \
                      vendoring would fight it — remove the override (or vendor --revert) \
                      first (an exact-version pin equal to {version} is taken over \
                      automatically)"
@@ -1409,11 +1496,14 @@ pub(super) fn classify_pkg_override(
 /// drift means the pair is already desynced) with a value the edit can
 /// own: ours, the exact pinned `version` (takeover), or already our spec.
 /// A missing section/key is fine — the edit inserts it, restoring parity.
+/// `source` names the file `effective_key` came from (`None`: no override
+/// for `name` anywhere, so it is the key vendoring would add).
 pub(super) fn check_lock_override(
     lines: &[String],
     name: &str,
     version: &str,
     effective_key: &str,
+    source: Option<&str>,
 ) -> Result<(), String> {
     let Some((start, end)) = section_bounds(lines, "overrides") else {
         return Ok(());
@@ -1428,10 +1518,17 @@ pub(super) fn check_lock_override(
                 continue;
             }
             if key != effective_key {
+                let theirs = match source {
+                    Some(source) => format!("{source}'s `{effective_key}`"),
+                    None => format!(
+                        "the `{effective_key}` vendoring would add (no override for `{name}` \
+                         exists to take over)"
+                    ),
+                };
                 return Err(format!(
                     "{PNPM_LOCK} carries an override key `{key}` for `{name}` that does not \
-                     match package.json's `{effective_key}` — the two override maps must \
-                     agree (run `pnpm install` to re-sync them) before vendoring"
+                     match {theirs} — the two override maps must agree (run `pnpm install` \
+                     to re-sync them) before vendoring"
                 ));
             }
             if !(is_vendor_value(rest) || rest == version) {
@@ -1755,11 +1852,13 @@ pub(super) fn apply_pkg_override(
 /// Does the pnpm that wrote this lock read `overrides:` from
 /// pnpm-workspace.yaml (pnpm 10.5+) rather than package.json? True when
 /// package.json has no `pnpm.overrides` of its own and the lock's
-/// `overrides:` records a user-authored (non-vendored) key of the
-/// workspace file's `overrides:` section. pnpm 9 and 10.0–10.4 ignore the
-/// workspace block, so their locks never record it; and with no user
-/// workspace override both surfaces agree anyway, so the package.json
-/// copy stays harmless there.
+/// `overrides:` records a key of the workspace file's `overrides:`
+/// section. pnpm 9 and 10.0–10.4 ignore the workspace block, so their
+/// locks never record it; and with no workspace override both surfaces
+/// agree anyway, so the package.json copy stays harmless there. A
+/// vendored value counts too: after a workspace-only takeover (#854) or
+/// an earlier skipped copy, the lock recording it still shows the
+/// workspace file governs, and a copy now would shadow it.
 fn workspace_overrides_govern(pkg: &Value, ws_text: Option<&str>, lock: &[String]) -> bool {
     if pkg.get("pnpm").and_then(|p| p.get("overrides")).is_some() {
         return false;
@@ -1781,7 +1880,7 @@ fn workspace_overrides_govern(pkg: &Value, ws_text: Option<&str>, lock: &[String
     ws_lines[ws_start + 1..ws_end]
         .iter()
         .filter_map(|l| parse_key_line(l, indent))
-        .any(|(key, _, rest)| !is_vendor_value(rest) && lock_keys.contains(&key))
+        .any(|(key, _, _)| lock_keys.contains(&key))
 }
 
 // ─────────────────────── pnpm-workspace.yaml override ─────────────────────
@@ -6447,6 +6546,226 @@ snapshots:
             drifted_ws,
             "foreign value left alone"
         );
+    }
+
+    // ── #854: an exact pin carried ONLY by pnpm-workspace.yaml ────────────
+
+    /// [`P1_BEFORE_LOCK`] with an `overrides:` section holding `key: value`
+    /// (what pnpm 10.5+ writes when the override lives in the workspace file).
+    fn p1_lock_with_override(key: &str, value: &str) -> String {
+        P1_BEFORE_LOCK.replacen(
+            "\nimporters:\n",
+            &format!("\noverrides:\n  {key}: {value}\n\nimporters:\n"),
+            1,
+        )
+    }
+    fn ws_with_override(key: &str, value: &str) -> String {
+        format!("packages:\n  - '.'\noverrides:\n  {key}: {value}\n")
+    }
+
+    /// #854: on pnpm 10.5+/11/12 the workspace file is the authoritative
+    /// override map, so a bare-key exact pin there is taken over exactly
+    /// like the same pin in package.json: the user's key keeps its
+    /// spelling in the workspace file and the lock, package.json is left
+    /// alone (#360), a re-run is in sync, and revert restores every byte.
+    /// It used to refuse with a detail blaming package.json.
+    #[tokio::test]
+    async fn ws_bare_key_exact_pin_is_taken_over_and_revert_restores_it() {
+        let lock_before = p1_lock_with_override("left-pad", "1.3.0");
+        let ws_before = ws_with_override("left-pad", "1.3.0");
+        let fx = fixture_with(P1_BEFORE_PKG, &lock_before).await;
+        write_ws(&fx, &ws_before).await;
+
+        let (result, entry, _) = expect_done(fx.vendor(false).await);
+        assert!(result.success, "{:?}", result.error);
+        let entry = entry.unwrap();
+        let spec = format!("file:{}", fx.rel_tgz());
+
+        let ws_after = fx.read(PNPM_WORKSPACE).await;
+        assert_eq!(ws_after, ws_with_override("left-pad", &spec));
+        let lock_after = fx.read(PNPM_LOCK).await;
+        assert!(
+            lock_after.contains(&format!("overrides:\n  left-pad: {spec}\n\n")),
+            "{lock_after}"
+        );
+        assert_eq!(fx.read(PACKAGE_JSON).await, P1_BEFORE_PKG);
+        assert!(entry.wiring.iter().all(|r| r.kind != KIND_PKG_OVERRIDE));
+        for kind in [KIND_WS_OVERRIDE, KIND_LOCK_OVERRIDES] {
+            let rec = entry
+                .wiring
+                .iter()
+                .find(|r| r.kind == kind)
+                .unwrap_or_else(|| panic!("no {kind} record: {:?}", entry.wiring));
+            assert_eq!(rec.key.as_deref(), Some("left-pad"), "{kind}");
+            assert_eq!(rec.action, WiringAction::Rewritten, "{kind}");
+            assert_eq!(rec.original, Some(Value::String("1.3.0".into())), "{kind}");
+        }
+
+        // Re-run: in sync, nothing recorded, all three files byte-stable
+        // (no package.json copy appears once the ws value is ours).
+        let (result, again, _) = expect_done(fx.vendor(false).await);
+        assert!(result.success, "{:?}", result.error);
+        assert!(again.is_none(), "in-sync re-run records nothing");
+        assert!(result
+            .files_verified
+            .iter()
+            .all(|v| v.status == crate::patch::apply::VerifyStatus::AlreadyPatched));
+        assert_eq!(fx.read(PACKAGE_JSON).await, P1_BEFORE_PKG);
+        assert_eq!(fx.read(PNPM_WORKSPACE).await, ws_after);
+        assert_eq!(fx.read(PNPM_LOCK).await, lock_after);
+
+        let outcome = revert_pnpm(&entry, fx.root(), false).await;
+        assert!(outcome.success, "{:?}", outcome.error);
+        assert!(outcome.warnings.is_empty(), "{:?}", outcome.warnings);
+        assert_eq!(fx.read(PACKAGE_JSON).await, P1_BEFORE_PKG);
+        assert_eq!(fx.read(PNPM_WORKSPACE).await, ws_before);
+        assert_eq!(fx.read(PNPM_LOCK).await, lock_before);
+    }
+
+    /// #854, pnpm 9 shape: the lock does not record the workspace pin
+    /// (pnpm 9 reads overrides from package.json only). The pin is still
+    /// taken over in the workspace file, and the package.json copy plus the
+    /// lock entry use the same `left-pad` key so all three maps agree.
+    #[tokio::test]
+    async fn ws_bare_key_exact_pin_without_lock_mirror_is_taken_over() {
+        let ws_before = ws_with_override("left-pad", "1.3.0");
+        let fx = fixture_with(P1_BEFORE_PKG, P1_BEFORE_LOCK).await;
+        write_ws(&fx, &ws_before).await;
+
+        let (result, entry, _) = expect_done(fx.vendor(false).await);
+        assert!(result.success, "{:?}", result.error);
+        let entry = entry.unwrap();
+        let spec = format!("file:{}", fx.rel_tgz());
+        assert_eq!(
+            fx.read(PNPM_WORKSPACE).await,
+            ws_with_override("left-pad", &spec)
+        );
+        let pkg: Value = serde_json::from_str(&fx.read(PACKAGE_JSON).await).unwrap();
+        assert_eq!(
+            pkg["pnpm"]["overrides"]["left-pad"],
+            Value::String(spec.clone())
+        );
+        assert!(pkg["pnpm"]["overrides"].get("left-pad@1.3.0").is_none());
+        assert!(fx
+            .read(PNPM_LOCK)
+            .await
+            .contains(&format!("overrides:\n  left-pad: {spec}\n")));
+
+        let outcome = revert_pnpm(&entry, fx.root(), false).await;
+        assert!(outcome.success, "{:?}", outcome.error);
+        assert_eq!(fx.read(PACKAGE_JSON).await, P1_BEFORE_PKG);
+        assert_eq!(fx.read(PNPM_WORKSPACE).await, ws_before);
+        assert_eq!(fx.read(PNPM_LOCK).await, P1_BEFORE_LOCK);
+    }
+
+    /// #854: a genuine workspace-file conflict (a range, another version, a
+    /// selector chain) still refuses, and the detail names the file that
+    /// actually carries the override.
+    #[tokio::test]
+    async fn ws_conflicting_pins_refuse_naming_the_workspace_file() {
+        for (key, value) in [
+            ("left-pad", "^1.3.0"),
+            ("left-pad", "1.4.0"),
+            ("consumer>left-pad", "1.3.0"),
+        ] {
+            let lock = p1_lock_with_override(key, value);
+            let ws = ws_with_override(key, value);
+            let fx = fixture_with(P1_BEFORE_PKG, &lock).await;
+            write_ws(&fx, &ws).await;
+            let detail = expect_refused(fx.vendor(false).await, "vendor_override_conflict");
+            assert!(detail.contains(PNPM_WORKSPACE), "{key}: {detail}");
+            assert!(!detail.contains("package.json"), "{key}: {detail}");
+            assert_eq!(fx.read(PNPM_WORKSPACE).await, ws, "refusal writes nothing");
+            assert_eq!(fx.read(PNPM_LOCK).await, lock);
+            assert_eq!(fx.read(PACKAGE_JSON).await, P1_BEFORE_PKG);
+        }
+    }
+
+    /// #854: ws↔lock key-shape drift refuses (pnpm itself would fail the
+    /// config check), and the detail compares against the workspace file,
+    /// not package.json.
+    #[tokio::test]
+    async fn ws_and_lock_key_shape_drift_refuses_naming_the_workspace_file() {
+        let lock = p1_lock_with_override("left-pad@1.3.0", "1.3.0");
+        let fx = fixture_with(P1_BEFORE_PKG, &lock).await;
+        write_ws(&fx, &ws_with_override("left-pad", "1.3.0")).await;
+        let detail = expect_refused(fx.vendor(false).await, "vendor_override_conflict");
+        assert!(detail.contains("does not match"), "{detail}");
+        assert!(detail.contains(PNPM_WORKSPACE), "{detail}");
+        assert!(!detail.contains("package.json's"), "{detail}");
+        assert_eq!(fx.read(PNPM_LOCK).await, lock, "refusal writes nothing");
+    }
+
+    /// #854: package.json and the workspace file both pin the version but
+    /// under different keys; there is no single key all three maps can
+    /// share, so vendoring refuses naming both files.
+    #[tokio::test]
+    async fn pkg_and_ws_pins_with_different_key_shapes_refuse() {
+        let (pkg, lock) = pin_fixture_inputs("left-pad", "1.3.0");
+        let ws = ws_with_override("left-pad@1.3.0", "1.3.0");
+        let fx = fixture_with(&pkg, &lock).await;
+        write_ws(&fx, &ws).await;
+        let detail = expect_refused(fx.vendor(false).await, "vendor_override_conflict");
+        assert!(detail.contains(PNPM_WORKSPACE), "{detail}");
+        assert!(detail.contains("package.json"), "{detail}");
+        assert_eq!(fx.read(PNPM_WORKSPACE).await, ws, "refusal writes nothing");
+        assert_eq!(fx.read(PACKAGE_JSON).await, pkg);
+        assert_eq!(fx.read(PNPM_LOCK).await, lock);
+    }
+
+    /// #854: the versioned-key pin on the workspace file and the lock only
+    /// (package.json has no overrides) was already taken over, but its
+    /// re-run added a package.json copy once the ws value became ours.
+    /// The re-run is now in sync and byte-stable.
+    #[tokio::test]
+    async fn ws_versioned_key_pin_only_on_ws_and_lock_rerun_is_byte_stable() {
+        let lock_before = p1_lock_with_override("left-pad@1.3.0", "1.3.0");
+        let ws_before = ws_with_override("left-pad@1.3.0", "1.3.0");
+        let fx = fixture_with(P1_BEFORE_PKG, &lock_before).await;
+        write_ws(&fx, &ws_before).await;
+
+        let (_, entry, _) = expect_done(fx.vendor(false).await);
+        let entry = entry.unwrap();
+        assert_eq!(fx.read(PACKAGE_JSON).await, P1_BEFORE_PKG);
+        let ws_after = fx.read(PNPM_WORKSPACE).await;
+        let lock_after = fx.read(PNPM_LOCK).await;
+
+        let (result, again, _) = expect_done(fx.vendor(false).await);
+        assert!(result.success, "{:?}", result.error);
+        assert!(again.is_none(), "in-sync re-run records nothing");
+        assert_eq!(fx.read(PACKAGE_JSON).await, P1_BEFORE_PKG);
+        assert_eq!(fx.read(PNPM_WORKSPACE).await, ws_after);
+        assert_eq!(fx.read(PNPM_LOCK).await, lock_after);
+
+        let outcome = revert_pnpm(&entry, fx.root(), false).await;
+        assert!(outcome.success, "{:?}", outcome.error);
+        assert_eq!(fx.read(PACKAGE_JSON).await, P1_BEFORE_PKG);
+        assert_eq!(fx.read(PNPM_WORKSPACE).await, ws_before);
+        assert_eq!(fx.read(PNPM_LOCK).await, lock_before);
+    }
+
+    /// #854 / #360 twin: after a workspace-only takeover every workspace
+    /// override can be a vendored value. The lock still records them, so
+    /// the workspace file still governs, and vendoring ANOTHER package
+    /// must not write a package.json copy that would shadow it on pnpm 10.
+    #[test]
+    fn vendored_workspace_overrides_recorded_in_the_lock_still_govern() {
+        let pkg: Value = serde_json::from_str(P1_BEFORE_PKG).unwrap();
+        let spec =
+            "file:.socket/vendor/npm/9f6b2c4e-1d3a-4f6b-8c2d-7e5a9b1c3d5f/left-pad-1.3.0.tgz";
+        let ws = ws_with_override("left-pad", spec);
+        let lock = p1_lock_with_override("left-pad", spec);
+        assert!(workspace_overrides_govern(
+            &pkg,
+            Some(&ws),
+            &split_lines(&lock)
+        ));
+        // Unrecorded in the lock (pnpm 9): package.json still governs.
+        assert!(!workspace_overrides_govern(
+            &pkg,
+            Some(&ws),
+            &split_lines(P1_BEFORE_LOCK)
+        ));
     }
 
     /// pnpm-workspace.yaml deleted since vendoring while the record carries a
