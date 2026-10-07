@@ -450,6 +450,35 @@ mod tests {
     }
 
     #[test]
+    fn a_discovered_pin_of_another_uuid_marks_the_row_an_upgrade() {
+        // A pin on a patch server only this run's references name is found
+        // by the second discovery pass: an older patch pinned there is an
+        // UPGRADE, not a NEW row spending a cap slot.
+        let results = vec![offer(
+            "pkg:npm/a@1",
+            "aaaaaaaa-1111-4111-8111-00000000000a",
+            "",
+            &["high"],
+        )];
+        let offers = offers_from_results(&results, true);
+        let mut rows = classify(&offers, &RecordedIndex::default(), "");
+        mark_pinned(
+            &mut rows,
+            &[socket_patch_core::patch::redirect::upstream::HostedPin {
+                purl: "pkg:npm/a@1".into(),
+                uuid: "AAAAAAAA-2222-4222-8222-00000000000A".into(),
+                files: vec!["package-lock.json".into()],
+            }],
+        );
+        assert_eq!(
+            rows[0].candidate.recorded,
+            Recorded::Superseded {
+                old_uuid: "aaaaaaaa-2222-4222-8222-00000000000a".into()
+            }
+        );
+    }
+
+    #[test]
     fn case_folded_pins_match_the_selection_spelling() {
         // Discovery keys a nuget pin by the lowercased name; the API and
         // the lockfile keep the original case.

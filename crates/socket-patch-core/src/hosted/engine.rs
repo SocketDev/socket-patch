@@ -913,6 +913,12 @@ pub struct RewriteOptions<'a> {
     /// the rewriters' verdict, as a dry run's withheld takeover preview
     /// does. Empty for the in-memory engine, which takes nothing over.
     pub takeover_uuids: BTreeSet<String>,
+    /// The operator's extra patch-server origins (`--patch-server-url`):
+    /// the allowlist `vex`, `list`, `rollback`, `remove` and `vendor`
+    /// discover with, so the attribution gate sees an existing pin on a
+    /// configured server even when this run's grants live on another host.
+    /// Empty for the in-memory engine, which has no such knob.
+    pub patch_server_origins: Vec<String>,
 }
 
 /// One project's rewrite, ready for the guard, the record fetch and the
@@ -1097,7 +1103,8 @@ pub async fn rewrite(
             options.clone(),
         )
         .await;
-        let (vetoed, lockless) = unattributed_pins(view, &done, &kept, &exempt).await;
+        let (vetoed, lockless) =
+            unattributed_pins(view, &done, &kept, &exempt, &options.patch_server_origins).await;
         if vetoed.is_empty() {
             done.unattributed = unattributed;
             done.rewrite.warnings.extend(lockless);
@@ -1132,14 +1139,21 @@ async fn unattributed_pins(
     done: &Rewritten,
     candidates: &[Candidate],
     exempt: &BTreeSet<String>,
+    configured: &[String],
 ) -> (Vec<SkippedPatch>, Vec<RewriteWarning>) {
     if done.confirmed.is_empty() {
         return (Vec::new(), Vec::new());
     }
+    // The management commands' allowlist plus the hosts this run's grants
+    // name: a pin on either counts, as it will for them.
+    let mut origins = configured.to_vec();
+    for origin in crate::patch::redirect::upstream::dep_origins(candidates.iter().map(|c| &c.dep)) {
+        if !origins.contains(&origin) {
+            origins.push(origin);
+        }
+    }
     let opts = crate::vex::DiscoverOptions {
-        patch_server_origins: crate::patch::redirect::upstream::dep_origins(
-            candidates.iter().map(|c| &c.dep),
-        ),
+        patch_server_origins: origins,
     };
     let mut written: Vec<(&str, &[u8])> = Vec::new();
     for (rel, text) in &done.rewrite.files {
@@ -2276,6 +2290,7 @@ mod tests {
             npm_outer: &outer,
             blocking: false,
             takeover_uuids: Default::default(),
+            patch_server_origins: Vec::new(),
         };
         let mut skipped = Vec::new();
         let candidates = build_candidates(&selected, &refs, &mut skipped);
@@ -2508,6 +2523,7 @@ mod tests {
             npm_outer: &outer,
             blocking: false,
             takeover_uuids: Default::default(),
+            patch_server_origins: Vec::new(),
         };
         let candidates = vec![left_pad_candidate()];
         let read = read_candidate_files(view, unreadable, &candidates).await;
@@ -2630,6 +2646,7 @@ mod tests {
                 npm_outer: &outer,
                 blocking: false,
                 takeover_uuids: Default::default(),
+                patch_server_origins: Vec::new(),
             };
             let read = read_candidate_files(&view, &BTreeSet::new(), &candidates).await;
             assert!(read.files.contains_key("package.json"));
@@ -2807,6 +2824,7 @@ mod tests {
             npm_outer: &outer,
             blocking: false,
             takeover_uuids: Default::default(),
+            patch_server_origins: Vec::new(),
         };
         let candidates = vec![gradle_candidate()];
         let read = read_candidate_files(view, &BTreeSet::new(), &candidates).await;
@@ -3073,6 +3091,7 @@ mod tests {
             npm_outer: &outer,
             blocking: false,
             takeover_uuids: Default::default(),
+            patch_server_origins: Vec::new(),
         };
         let candidates = vec![candidate];
         let view = ProjectView::Memory(&p);
@@ -3120,6 +3139,7 @@ mod tests {
             npm_outer: &outer,
             blocking: false,
             takeover_uuids: Default::default(),
+            patch_server_origins: Vec::new(),
         };
         let candidates = vec![gem_candidate()];
         let view = ProjectView::Memory(p);

@@ -238,24 +238,42 @@ pub fn lookup_incomplete(
             .any(|purl| !recorded.records_package(purl))
 }
 
-/// Mark NEW rows whose selected uuid discovery already finds pinned
-/// ([`HostedPin::discover`]) as ALREADY. The recorded view is discovery
-/// over the configured patch servers; a pin on the server THIS run's
-/// references name (an origin missing from `--patch-server-url`) is only
-/// recognized once those references are known, so the caller re-runs
-/// discovery with their origins ([`dep_origins`]) and hands the pins here.
-/// Without it such a pin would read as NEW on every run and hold its slot
-/// forever. Only discovery's attributable pins count: a uuid a stale or
-/// inactive file merely mentions (an unused `pdm.lock`, a `package.json`
-/// `resolutions` leftover, a comment) pins nothing and stays NEW.
+/// Re-classify NEW rows against the pins discovery finds
+/// ([`HostedPin::discover`]): the selected uuid pinned is ALREADY, another
+/// uuid pinned for the same package is an UPGRADE
+/// ([`Recorded::Superseded`]). The recorded view is discovery over the
+/// configured patch servers; a pin on the server THIS run's references name
+/// (an origin missing from `--patch-server-url`) is only recognized once
+/// those references are known, so the caller re-runs discovery with their
+/// origins ([`dep_origins`]) and hands the pins here. Without it such a pin
+/// would read as NEW on every run and hold its slot forever, and an upgrade
+/// on that server would spend a NEW slot. Only discovery's attributable pins
+/// count: a uuid a stale or inactive file merely mentions (an unused
+/// `pdm.lock`, a `package.json` `resolutions` leftover, a comment) pins
+/// nothing and stays NEW.
+///
+/// The writers were already chosen from the selection, so a pinned uuid
+/// that the selection does not supersede is reported as an UPGRADE rather
+/// than kept ([`Recorded::Kept`]): what is written does not change, only
+/// that it spends no NEW slot.
 ///
 /// [`HostedPin::discover`]: crate::patch::redirect::upstream::HostedPin::discover
 /// [`dep_origins`]: crate::patch::redirect::upstream::dep_origins
 pub fn mark_pinned(rows: &mut [Row], pins: &[crate::patch::redirect::upstream::HostedPin]) {
-    let pinned: HashSet<String> = pins.iter().map(|p| p.uuid.to_ascii_lowercase()).collect();
+    let pairs: Vec<(String, String)> = pins
+        .iter()
+        .map(|p| (p.purl.clone(), p.uuid.to_ascii_lowercase()))
+        .collect();
+    let index = RecordedIndex::new(None, &pairs);
     for row in rows.iter_mut().filter(|r| r.candidate.recorded.is_new()) {
-        if pinned.contains(&row.candidate.uuid.to_ascii_lowercase()) {
+        let uuids = index.uuids(&row.candidate.purl);
+        let selected = row.candidate.uuid.to_ascii_lowercase();
+        if uuids.contains(&selected) {
             row.candidate.recorded = Recorded::Same;
+        } else if let Some(old) = uuids.first() {
+            row.candidate.recorded = Recorded::Superseded {
+                old_uuid: old.clone(),
+            };
         }
     }
 }

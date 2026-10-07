@@ -1023,6 +1023,7 @@ pub(crate) async fn run_redirect_selected(
             .map(|c| c.dep.patch_uuid.clone())
             .collect()
     };
+    let patch_server_origins = crate::commands::rollback::patch_server_origins(common);
     let rewrite_options = || RewriteOptions {
         dry_run: common.dry_run,
         targets_pipenv_lock,
@@ -1036,6 +1037,7 @@ pub(crate) async fn run_redirect_selected(
         npm_outer: &npm_outer,
         blocking: true,
         takeover_uuids: takeover_uuids.clone(),
+        patch_server_origins: patch_server_origins.clone(),
     };
     // The rollout gate plans again without its deferred rows: keep what
     // the second pass needs.

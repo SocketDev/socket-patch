@@ -331,6 +331,7 @@ pub(crate) async fn rewrite(
             npm_outer: &npm_outer,
             blocking: false,
             takeover_uuids: Default::default(),
+            patch_server_origins: Vec::new(),
         },
     )
     .await;
