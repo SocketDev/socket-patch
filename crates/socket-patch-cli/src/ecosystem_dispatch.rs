@@ -438,7 +438,23 @@ pub async fn find_all_packages_for_rollback(
     options: &CrawlerOptions,
     silent: bool,
 ) -> HashMap<String, Vec<PathBuf>> {
-    dispatch_find(partitioned, options, silent, merge_qualified, None).await
+    find_all_packages_for_rollback_reusing(partitioned, options, silent, None).await
+}
+
+/// [`find_all_packages_for_rollback`], taking the npm `node_modules` roots
+/// from `prior` as [`find_packages_for_rollback_reusing`] does. Used by
+/// `scan`'s path scoping, which must see the same copies `rollback`'s path
+/// targets do.
+pub async fn find_all_packages_for_rollback_reusing(
+    partitioned: &HashMap<Ecosystem, Vec<String>>,
+    options: &CrawlerOptions,
+    silent: bool,
+    prior: Option<&NpmCrawlSnapshot>,
+) -> HashMap<String, Vec<PathBuf>> {
+    let npm_roots = prior
+        .filter(|p| p.taken_with(options))
+        .map(|p| p.roots.as_slice());
+    dispatch_find(partitioned, options, silent, merge_qualified, npm_roots).await
 }
 
 /// Qualified-aware PURL resolution for rollback, vendor, repair and
@@ -1830,6 +1846,18 @@ mod tests {
             find_packages_for_rollback_reusing(&partitioned, &options, true, Some(&snapshot)).await;
         assert_eq!(reused, crawled);
         assert!(crawled.contains_key("pkg:npm/baz@3.0.0"), "{crawled:?}");
+        // The multi-copy twin keeps every copy, the member's nested one too.
+        let all_crawled = find_all_packages_for_rollback(&partitioned, &options, true).await;
+        let all_reused =
+            find_all_packages_for_rollback_reusing(&partitioned, &options, true, Some(&snapshot))
+                .await;
+        assert_eq!(all_reused, all_crawled);
+        assert!(
+            all_crawled
+                .get("pkg:npm/foo@0.9.0")
+                .is_some_and(|paths| paths.len() == 2),
+            "{all_crawled:?}"
+        );
         // The resolver finds the alias install itself (#356).
         let left_pad = "pkg:npm/left-pad@1.3.0".to_string();
         assert_eq!(crawled.get(&left_pad), Some(&root.join("node_modules/lp")));
@@ -1854,6 +1882,17 @@ mod tests {
             find_packages_for_rollback_reusing(&app_partitioned, &elsewhere, true, Some(&snapshot))
                 .await,
             find_packages_for_rollback(&app_partitioned, &elsewhere, true).await,
+            "a snapshot of another root must not answer for this one"
+        );
+        assert_eq!(
+            find_all_packages_for_rollback_reusing(
+                &app_partitioned,
+                &elsewhere,
+                true,
+                Some(&snapshot)
+            )
+            .await,
+            find_all_packages_for_rollback(&app_partitioned, &elsewhere, true).await,
             "a snapshot of another root must not answer for this one"
         );
     }
