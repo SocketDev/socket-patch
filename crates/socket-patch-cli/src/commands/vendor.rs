@@ -526,8 +526,11 @@ fn orphan_label(unit: &vendor::path::SweptVendorDir) -> String {
         .unwrap_or_else(|| format!("{}/{}", unit.eco, unit.uuid))
 }
 
-/// Does `eco` fall inside this run's `--ecosystems` scope?
+/// Does `eco` fall inside this run's `--ecosystems` scope? A vendor-ledger
+/// name counts as the package ecosystem it stands for (a `jvm` entry is
+/// `maven`, [`vendor::jvm::layout::ledger_ecosystem`]).
 pub(crate) fn ecosystem_in_scope(common: &GlobalArgs, eco: &str) -> bool {
+    let eco = vendor::jvm::layout::ledger_ecosystem(eco);
     match socket_patch_core::crawlers::Ecosystem::all()
         .iter()
         .find(|e| e.cli_name() == eco)
@@ -6075,6 +6078,20 @@ mod scope_and_hint_tests {
 
         let golang = with_scope(Some(&["golang"]));
         assert!(ecosystem_in_scope(&golang, "golang"));
+    }
+
+    /// A v5 JVM-backend ledger entry is recorded as `jvm`, which is no
+    /// `--ecosystems` name: `--ecosystems maven` must still scope it in
+    /// (the GC passes, rollback's vendored leg and repair all filter ledger
+    /// entries by this), and another ecosystem's scope must leave it out.
+    #[test]
+    fn jvm_ledger_entries_are_in_the_maven_scope() {
+        let maven = with_scope(Some(&["maven"]));
+        assert!(ecosystem_in_scope(&maven, "jvm"));
+        assert!(ecosystem_in_scope(&maven, "maven"));
+        let npm_only = with_scope(Some(&["npm"]));
+        assert!(!ecosystem_in_scope(&npm_only, "jvm"));
+        assert!(ecosystem_in_scope(&with_scope(None), "jvm"));
     }
 }
 
