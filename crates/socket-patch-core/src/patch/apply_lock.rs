@@ -375,7 +375,9 @@ mod interrupt {
                 continue;
             }
             // SAFETY: plain syscalls on NUL-terminated paths built at
-            // acquire time; `st` is a valid out-pointer.
+            // acquire time; `st` is a valid out-pointer. (The casts are
+            // no-ops on some targets only: `st_dev` is `i32` on macOS.)
+            #[allow(clippy::unnecessary_cast)]
             unsafe {
                 let mut st: libc::stat = std::mem::zeroed();
                 if libc::stat(held.lock.as_ptr(), &mut st) == 0
