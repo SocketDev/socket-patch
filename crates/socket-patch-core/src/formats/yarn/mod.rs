@@ -29,39 +29,42 @@ pub enum YarnLockGrammar {
     Classic,
 }
 
-/// How many head lines [`sniff_grammar`] reads.
-const SNIFF_HEAD_LINES: usize = 30;
-
 /// Why [`sniff_grammar`] found neither grammar, for the refusal detail.
 pub const UNIDENTIFIED_DETAIL: &str = "yarn.lock carries neither the `# yarn lockfile v1` \
      header nor a berry `__metadata:` key; cannot identify the lockfile version";
 
-/// The head sniff: berry when one of the first lines is a column-0
-/// `__metadata:` key, else classic when one is the `# yarn lockfile v1`
-/// header, else `None`. Berry wins the check — a berry lock must never be
-/// mistaken for classic. CRLF lines split like LF ones; a leading BOM is
-/// not key text.
+/// The ONE grammar decision: berry when any line is a column-0
+/// `__metadata:` key, else classic when any line is the `# yarn lockfile v1`
+/// header, else `None` (a header-less lock). Berry wins — a berry lock must
+/// never be read as classic. CRLF lines split like LF ones; a leading BOM
+/// is not key text (yarn's parsers drop it).
+///
+/// What a header-less lock is depends on what the caller does with it:
+/// the vendored router, which must know the grammar it writes, refuses
+/// `None` (`vendor_lockfile_version_unsupported`); every reader takes
+/// [`grammar`]'s answer, classic — what yarn 1 parses it as, and what yarn
+/// berry migrates it from.
 pub fn sniff_grammar(text: &str) -> Option<YarnLockGrammar> {
-    let head: Vec<&str> = strip_bom(text).lines().take(SNIFF_HEAD_LINES).collect();
-    if head.iter().any(|l| l.starts_with("__metadata:")) {
-        Some(YarnLockGrammar::Berry)
-    } else if head.iter().any(|l| l.trim() == "# yarn lockfile v1") {
-        Some(YarnLockGrammar::Classic)
-    } else {
-        None
+    let mut classic = false;
+    for line in strip_bom(text).lines() {
+        if line.starts_with("__metadata:") {
+            return Some(YarnLockGrammar::Berry);
+        }
+        classic |= line.trim() == "# yarn lockfile v1";
     }
+    classic.then_some(YarnLockGrammar::Classic)
 }
 
-/// A yarn.lock is berry (v2+) when ANY line carries the `__metadata:`
-/// header key; anything else is a classic v1 lock. The whole-file check
-/// both hosted rewriters, lockfile discovery and the classic vendored
-/// backend's refusal gate share. A leading BOM is encoding, not key text
-/// (yarn's YAML parser drops it), so a header-less lock opening with
-/// `\u{feff}__metadata:` is berry too.
+/// [`sniff_grammar`] with a header-less lock read as classic.
+pub fn grammar(text: &str) -> YarnLockGrammar {
+    sniff_grammar(text).unwrap_or(YarnLockGrammar::Classic)
+}
+
+/// Whether [`grammar`] says berry: the check both hosted rewriters, the
+/// hosted restore, lockfile discovery and the classic vendored backend's
+/// refusal gate share.
 pub fn is_berry_lock(content: &str) -> bool {
-    strip_bom(content)
-        .lines()
-        .any(|line| line.starts_with("__metadata:"))
+    grammar(content) == YarnLockGrammar::Berry
 }
 
 #[cfg(test)]
@@ -83,8 +86,23 @@ mod tests {
             Some(YarnLockGrammar::Berry)
         );
         assert_eq!(sniff_grammar("a@1:\n  version \"1\"\n"), None);
-        let deep = format!("{}# yarn lockfile v1\n", "\n".repeat(SNIFF_HEAD_LINES));
-        assert_eq!(sniff_grammar(&deep), None);
+        assert_eq!(grammar("a@1:\n  version \"1\"\n"), YarnLockGrammar::Classic);
+    }
+
+    /// B60: the vendored router (`sniff_grammar`) and every reader
+    /// (`is_berry_lock`) take one decision, wherever in the file the marker
+    /// sits. They used to disagree: the router read only the first 30 lines,
+    /// so a classic header above a hand-merged `__metadata:` key was classic
+    /// to vendor and berry to hosted, restore and VEX.
+    #[test]
+    fn the_router_and_the_readers_agree_on_a_deep_marker() {
+        let padding = "\n".repeat(40);
+        let merged = format!("# yarn lockfile v1\n{padding}__metadata:\n  version: 8\n");
+        assert_eq!(sniff_grammar(&merged), Some(YarnLockGrammar::Berry));
+        assert!(is_berry_lock(&merged));
+        let deep_header = format!("{padding}# yarn lockfile v1\n");
+        assert_eq!(sniff_grammar(&deep_header), Some(YarnLockGrammar::Classic));
+        assert!(!is_berry_lock(&deep_header));
     }
 
     #[test]
