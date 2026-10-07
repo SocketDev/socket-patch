@@ -78,13 +78,20 @@ fn check_fails_on_an_unpatched_npm_package() {
     let index = tmp.path().join("node_modules/check-target/index.js");
 
     let (code, stdout, stderr) = run_check(tmp.path(), &[]);
-    assert_eq!(code, 1, "an unpatched tree is drift\nstdout={stdout}\nstderr={stderr}");
+    assert_eq!(
+        code, 1,
+        "an unpatched tree is drift\nstdout={stdout}\nstderr={stderr}"
+    );
     assert!(stderr.contains("OUT OF SYNC"), "{stderr}");
     assert!(
         stderr.contains(&format!("{PURL}: patch not applied")),
         "the drift names the package: {stderr}"
     );
-    assert_eq!(std::fs::read(&index).unwrap(), ORIGINAL, "--check never writes");
+    assert_eq!(
+        std::fs::read(&index).unwrap(),
+        ORIGINAL,
+        "--check never writes"
+    );
 
     let (code, stdout, stderr) = run_check(tmp.path(), &["--json"]);
     assert_eq!(code, 1, "stderr={stderr}");
@@ -144,7 +151,10 @@ fn check_skips_an_uninstalled_package_and_says_so() {
     let tmp = project(None);
     let (code, stdout, stderr) = run_check(tmp.path(), &[]);
     assert_eq!(code, 0, "stdout={stdout}\nstderr={stderr}");
-    assert!(stdout.contains("1 patch not installed, skipped"), "{stdout}");
+    assert!(
+        stdout.contains("1 patch not installed, skipped"),
+        "{stdout}"
+    );
 
     let (code, stdout, _) = run_check(tmp.path(), &["--json"]);
     assert_eq!(code, 0);
@@ -164,4 +174,96 @@ fn check_honors_the_ecosystems_filter() {
     let (code, stdout, stderr) = run_check(tmp.path(), &["--ecosystems", "pypi"]);
     assert_eq!(code, 0, "stdout={stdout}\nstderr={stderr}");
     assert!(stdout.contains("No patches to check."), "{stdout}");
+}
+
+const GEM_BASE: &str = "pkg:gem/nokogiri@1.16.5";
+const GEM_LINUX: &str = "pkg:gem/nokogiri@1.16.5?platform=x86_64-linux";
+const GEM_ORIGINAL: &[u8] = b"module Nokogiri\n  VERSION = '1.16.5'\nend\n";
+const GEM_PATCHED: &[u8] = b"module Nokogiri\n  VERSION = '1.16.5'\nend\n# SOCKET-PATCH\n";
+
+/// A gem project whose manifest keys the patch by a QUALIFIED purl (a
+/// release variant, the normal form for gem and PyPI patches); the
+/// installed `lib/nokogiri.rb` holds `installed`.
+fn gem_project(installed: &[u8]) -> tempfile::TempDir {
+    let tmp = tempfile::tempdir().unwrap();
+    let root = tmp.path();
+    std::fs::write(root.join("Gemfile"), b"source 'https://rubygems.org'\n").unwrap();
+    let file = root.join("vendor/bundle/ruby/3.4.0/gems/nokogiri-1.16.5/lib/nokogiri.rb");
+    std::fs::create_dir_all(file.parent().unwrap()).unwrap();
+    std::fs::write(&file, installed).unwrap();
+    std::fs::create_dir_all(root.join("vendor/bundle/ruby/3.4.0/specifications")).unwrap();
+    std::fs::create_dir_all(root.join(".socket/blobs")).unwrap();
+    let manifest = json!({ "patches": { GEM_LINUX: {
+        "uuid": "41414141-4141-4141-8141-414141414141",
+        "exportedAt": "2024-01-01T00:00:00Z",
+        "files": { "lib/nokogiri.rb": {
+            "beforeHash": git_sha256(GEM_ORIGINAL),
+            "afterHash": git_sha256(GEM_PATCHED),
+        }},
+        "vulnerabilities": {},
+        "description": "apply --check gem variant fixture",
+        "license": "MIT",
+        "tier": "free",
+    }}});
+    std::fs::write(
+        root.join(".socket/manifest.json"),
+        serde_json::to_vec_pretty(&manifest).unwrap(),
+    )
+    .unwrap();
+    std::fs::write(
+        root.join(".socket/blobs").join(git_sha256(GEM_PATCHED)),
+        GEM_PATCHED,
+    )
+    .unwrap();
+    tmp
+}
+
+/// The release-variant false green: an installed copy of a qualified
+/// purl whose bytes match neither of the variant's hashes is drift
+/// (`no_matching_variant`, exit 1) — `apply` fails the same copy with
+/// "no matching variant found" — never "not installed, skipped".
+#[test]
+fn check_fails_on_a_qualified_gem_matching_no_variant() {
+    let tmp = gem_project(b"# foreign bytes\n");
+    let (code, stdout, stderr) = run_check(tmp.path(), &["--json", "--ecosystems", "gem"]);
+    assert_eq!(code, 1, "stdout={stdout}\nstderr={stderr}");
+    let env = parse_json_envelope(stdout.trim());
+    assert!(
+        events(&env).iter().any(|e| e["action"] == "failed"
+            && e["purl"] == GEM_BASE
+            && e["errorCode"] == "no_matching_variant"),
+        "{env}"
+    );
+
+    // Parity: `apply` exits 1 on the same tree.
+    let (code, stdout, stderr) = run_with_env(
+        tmp.path(),
+        &["apply", "--offline", "--ecosystems", "gem"],
+        &[("SOCKET_TELEMETRY_DISABLED", "1")],
+    );
+    assert_eq!(code, 1, "stdout={stdout}\nstderr={stderr}");
+}
+
+/// The same qualified variant judged on its own copy: unpatched is
+/// `not_applied` drift, patched is in sync.
+#[test]
+fn check_judges_a_qualified_gem_on_its_own_copy() {
+    let tmp = gem_project(GEM_ORIGINAL);
+    let (code, stdout, stderr) = run_check(tmp.path(), &["--json", "--ecosystems", "gem"]);
+    assert_eq!(code, 1, "stdout={stdout}\nstderr={stderr}");
+    let env = parse_json_envelope(stdout.trim());
+    assert!(
+        events(&env).iter().any(|e| e["action"] == "failed"
+            && e["purl"] == GEM_LINUX
+            && e["errorCode"] == "not_applied"),
+        "{env}"
+    );
+
+    let tmp = gem_project(GEM_PATCHED);
+    let (code, stdout, stderr) = run_check(tmp.path(), &["--ecosystems", "gem"]);
+    assert_eq!(code, 0, "stdout={stdout}\nstderr={stderr}");
+    assert!(
+        stdout.contains("Patches are in sync (1 patch checked)."),
+        "{stdout}"
+    );
 }

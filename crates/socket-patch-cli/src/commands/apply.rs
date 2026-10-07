@@ -656,36 +656,114 @@ async fn run_check(args: &ApplyArgs, manifest_path: &Path) -> i32 {
 
 /// The installed-tree half of `apply --check`: every copy of each purl in
 /// `tree`, judged by the `vex` verifier over the `vex` copy lookup (Maven:
-/// the copies a build consumes). A qualified purl (a release variant) keeps
-/// only the copies holding its own distribution — `apply` skips a copy that
-/// holds another variant, so that copy is no drift of this one.
+/// the copies a build consumes), narrowed by `apply`'s own copy rules:
+///
+/// * Release variants (a base whose manifest keys are qualified, e.g.
+///   `?artifact_id=` / `?platform=`): each copy is matched against EVERY
+///   variant of its base, as `apply` matches it, and judged only for the
+///   variants it holds. A copy that holds none of them is a
+///   `no_matching_variant` drift of the base — `apply` fails that copy
+///   ("no matching variant found"), so `--check` must not read it as
+///   "not installed". Gradle / Ivy cache dirs are exempt: `apply` treats a
+///   cache dir no variant matches as not an install of the record.
+/// * Gem: once a bundle-store copy exists, `gem env` fallback-home copies
+///   (rvm `@global`, system gem dirs) are dropped — `apply` treats them as
+///   best-effort once the store copy is patched, and an unpatched store
+///   copy is drift on its own.
 async fn verify_installed_tree(
     common: &GlobalArgs,
     tree: &PatchManifest,
 ) -> socket_patch_core::vex::VerifyOutcome {
+    use socket_patch_core::crawlers::gradle_cache::expands;
     use socket_patch_core::patch::apply::select_installed_variants;
+    use socket_patch_core::vex::FailedPatch;
     let purls: Vec<String> = tree.patches.keys().cloned().collect();
-    let copies =
+    let found =
         crate::ecosystem_dispatch::find_manifest_package_copies_reusing(&purls, common, true, None)
             .await;
-    let mut copies = crate::commands::vex::vex_copy_sets(common, tree, &copies).await;
-    for (purl, paths) in copies.iter_mut() {
-        if purl.as_str() == strip_purl_qualifiers(purl) {
-            continue;
-        }
-        let Some(record) = tree.patches.get(purl) else {
-            continue;
-        };
-        let variant = [(purl.as_str(), &record.files)];
-        let mut kept = Vec::with_capacity(paths.len());
-        for path in paths.drain(..) {
-            if !select_installed_variants(&path, &variant).await.is_empty() {
-                kept.push(path);
+    let mut copies = crate::commands::vex::vex_copy_sets(common, tree, &found).await;
+
+    // Gem copy classes, decided exactly as `apply` decides them.
+    let gem_stores: Vec<PathBuf> = if !common.global
+        && common.global_prefix.is_none()
+        && purls
+            .iter()
+            .any(|p| Ecosystem::from_purl(p) == Some(Ecosystem::Gem))
+    {
+        RubyCrawler::discover_bundle_stores(&common.cwd)
+            .await
+            .stores
+    } else {
+        Vec::new()
+    };
+    if !gem_stores.is_empty() {
+        for (purl, paths) in copies.iter_mut() {
+            if Ecosystem::from_purl(purl) != Some(Ecosystem::Gem) {
+                continue;
+            }
+            let in_store = |p: &PathBuf| gem_stores.iter().any(|s| p.starts_with(s));
+            if paths.iter().any(in_store) {
+                paths.retain(in_store);
             }
         }
-        *paths = kept;
     }
-    socket_patch_core::vex::applied_patches_with_copies(tree, &copies, None).await
+
+    // Release variants, grouped per base purl over all of its keys.
+    let mut groups: BTreeMap<String, Vec<String>> = BTreeMap::new();
+    for purl in &purls {
+        groups
+            .entry(strip_purl_qualifiers(purl).to_string())
+            .or_default()
+            .push(purl.clone());
+    }
+    let mut unmatched: Vec<FailedPatch> = Vec::new();
+    for (base, mut keys) in groups {
+        if keys.len() == 1 && keys[0] == base {
+            // An unqualified singleton names no distribution: `apply`
+            // runs it through the mismatch policy, the verifier judges it.
+            continue;
+        }
+        keys.sort();
+        let variants: Vec<(&str, &HashMap<String, PatchFileInfo>)> = keys
+            .iter()
+            .filter_map(|k| tree.patches.get(k).map(|r| (k.as_str(), &r.files)))
+            .collect();
+        let mut group_copies: Vec<PathBuf> = keys
+            .iter()
+            .flat_map(|k| copies.get(k).cloned().unwrap_or_default())
+            .collect();
+        group_copies.sort();
+        group_copies.dedup();
+        let mut kept: HashMap<&str, Vec<PathBuf>> = HashMap::new();
+        let mut stray: Vec<PathBuf> = Vec::new();
+        for path in group_copies {
+            let matched = select_installed_variants(&path, &variants).await;
+            if matched.is_empty() {
+                if !expands(&path) {
+                    stray.push(path);
+                }
+                continue;
+            }
+            for idx in matched {
+                kept.entry(variants[idx].0).or_default().push(path.clone());
+            }
+        }
+        for key in &keys {
+            let paths = kept.remove(key.as_str()).unwrap_or_default();
+            copies.insert(key.clone(), paths);
+        }
+        if !stray.is_empty() {
+            unmatched.push(FailedPatch {
+                purl: base,
+                reason: "no_matching_variant".to_string(),
+            });
+        }
+    }
+
+    let mut outcome =
+        socket_patch_core::vex::applied_patches_with_copies(tree, &copies, None).await;
+    outcome.failed.extend(unmatched);
+    outcome
 }
 
 /// The `apply --check` drift text for a verifier routing tag.
@@ -694,6 +772,10 @@ fn describe_check_failure(reason: &str) -> &'static str {
         "not_applied" => "patch not applied (an installed copy is still unpatched)",
         "hash_mismatch" => "an installed copy matches neither the original nor the patched bytes",
         "file_not_found" => "a patched file is missing from an installed copy",
+        "no_matching_variant" => {
+            "an installed copy matches none of the manifest's release variants \
+             (no matching variant found)"
+        }
         _ => "an installed copy does not verify",
     }
 }
