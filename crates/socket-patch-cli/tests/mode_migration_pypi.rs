@@ -154,9 +154,8 @@ async fn mount_hosted_api_serving(
 ) -> String {
     let wheel = hosted_wheel();
     let sha = hex::encode(Sha256::digest(&wheel));
-    let route = format!(
-        "/patch/pypi/six/1.16.0/33333333-3333-4333-8333-333333333333/{UUID}/{wheel_name}"
-    );
+    let route =
+        format!("/patch/pypi/six/1.16.0/33333333-3333-4333-8333-333333333333/{UUID}/{wheel_name}");
     let hosted_url = format!("{}{route}", server.uri());
     Mock::given(method("POST"))
         .and(path(format!("/v0/orgs/{ORG}/patches/batch")))
