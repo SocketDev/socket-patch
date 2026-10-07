@@ -1325,7 +1325,7 @@ pub(crate) async fn gem_takeover_preview_refusals<'a>(
         gems.into_iter(),
         &pins,
         common.offline,
-        crate::commands::rollback::patch_server_origins(common),
+        crate::commands::hosted_unwind::patch_server_origins(common),
     )
     .await
 }

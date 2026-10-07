@@ -51,6 +51,11 @@ const ALLOWED_COMMAND_IMPORTS: &[(&str, &str, &str)] = &[
         "vex",
         "get's vendored leg reads VexEmbedArgs defaults",
     ),
+    (
+        "get",
+        "vendor",
+        "get's vendored dry run previews vendor's gem takeover refusals",
+    ),
     // The agent download engine's nested apply still builds ApplyArgs.
     (
         "agent_download",
