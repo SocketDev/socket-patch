@@ -365,9 +365,11 @@ pub struct ApplyArgs {
     )]
     pub force: bool,
 
-    /// Read-only: verify that the committed Go `replace`-redirects match the
-    /// manifest (for CI / GitHub-App auditing), exiting non-zero on drift.
-    /// Lock-free and offline-safe — it does not crawl, fetch, or mutate.
+    /// Read-only: verify that every manifest patch is in place (each
+    /// installed copy hashes to the patched bytes; Go: the committed
+    /// `replace`-redirects match the manifest), exiting non-zero on drift.
+    /// For CI / GitHub-App auditing. Lock-free and offline-safe: it never
+    /// fetches or writes. Vendored patches are `vendor --check`'s job.
     #[arg(
         long = "check",
         default_value_t = false,
@@ -504,10 +506,21 @@ async fn reconcile_local_go(common: &GlobalArgs, target_manifest_purls: &HashSet
     }
 }
 
-/// Read-only verification of the committed Go `replace`-redirects for CI /
-/// GitHub-App auditing. Lock-free, crawl-free, offline-safe. Exits 0 when in
-/// sync, 1 on drift. Cargo patches in place (no redirect to audit), so `--check`
-/// covers Go only.
+/// Read-only verification that the manifest's patches are in place, for CI
+/// / GitHub-App auditing. Lock-free, fetch-free, offline-safe, and it never
+/// writes. Exits 0 when in sync, 1 on drift.
+///
+/// Two audits, over the in-scope (`--ecosystems`) manifest entries that are
+/// not vendor-owned (`vendor --check` audits those):
+///
+/// * local Go patches: the committed `.socket/go-patches/` copies and
+///   `go.mod` `replace` directives ([`verify_go_redirect_state`]);
+/// * every other patch: each installed copy must hash to the record's
+///   `afterHash` — the same verifier `vex` attests with
+///   ([`applied_patches_with_copies`](socket_patch_core::vex::applied_patches_with_copies)),
+///   over the same copy lookup. A release variant (a qualified purl) is
+///   judged only on the copies holding its distribution, as `apply` patches
+///   it. A package with no installed copy is skipped, as `apply` skips it.
 async fn run_check(args: &ApplyArgs, manifest_path: &Path) -> i32 {
     let manifest = match read_manifest(manifest_path).await {
         Ok(Some(m)) => m,
@@ -518,7 +531,7 @@ async fn run_check(args: &ApplyArgs, manifest_path: &Path) -> i32 {
         Ok(None) => return 0,
         Err(e) => {
             let msg = format!(
-                "Patch redirect check could not read the manifest ({e}); \
+                "Patch check could not read the manifest ({e}); \
                  treating it as drift (fail-closed)."
             );
             if args.common.json {
@@ -535,29 +548,33 @@ async fn run_check(args: &ApplyArgs, manifest_path: &Path) -> i32 {
     };
 
     // (purl_or_name, reason_code, detail) for each drift.
-    let mut drifts: Vec<(String, &'static str, String)> = Vec::new();
+    let mut drifts: Vec<(String, String, String)> = Vec::new();
     let mut checked: usize = 0;
+
+    // The `apply` scope: `--ecosystems`, minus vendor-owned purls (matched
+    // exactly as `apply` matches them; the ledger owns the PROJECT's
+    // copies only, so a global check verifies every in-scope copy).
+    let manifest_purls: Vec<String> = manifest.patches.keys().cloned().collect();
+    let in_scope: HashSet<String> =
+        partition_purls(&manifest_purls, args.common.ecosystems.as_deref())
+            .into_values()
+            .flatten()
+            .collect();
+    let vendored = if crate::commands::project_state_in_scope(&args.common) {
+        socket_patch_core::vendor::vendored_purl_keys(&args.common.cwd).await
+    } else {
+        Default::default()
+    };
+    let owned_by_apply = |purl: &str| in_scope.contains(purl) && !purl_keys_cover(&vendored, purl);
 
     {
         use socket_patch_core::patch::redirect::golang_local::Drift as GoDrift;
         if eco_in_local_scope(&args.common, Ecosystem::Golang) {
-            // Vendored modules are excluded: their replace directives point at
-            // `.socket/vendor/golang/` (the verify engine skips Vendor-owned
-            // entries) and their state is audited by `vendor`, not `--check`.
-            let vendored = socket_patch_core::vendor::load_state(&args.common.cwd)
-                .await
-                .map(|s| {
-                    s.entries
-                        .iter()
-                        .flat_map(|(k, e)| [k.clone(), e.base_purl.clone()])
-                        .collect::<HashSet<String>>()
-                })
-                .unwrap_or_default();
             let desired: HashSet<String> = manifest
                 .patches
                 .keys()
                 .filter(|p| Ecosystem::from_purl(p) == Some(Ecosystem::Golang))
-                .filter(|p| !vendored.contains(*p))
+                .filter(|p| !purl_keys_cover(&vendored, p))
                 .cloned()
                 .collect();
             checked += desired.len();
@@ -571,17 +588,45 @@ async fn run_check(args: &ApplyArgs, manifest_path: &Path) -> i32 {
                         | GoDrift::ResolvedVersionMismatch { purl, .. } => purl.clone(),
                         GoDrift::OrphanReplace { module } => module.clone(),
                     };
-                    drifts.push((id, "go_redirect_drift", d.to_string()));
+                    drifts.push((id, "go_redirect_drift".to_string(), d.to_string()));
                 }
             }
         }
     }
 
+    // Installed-tree patches: everything `apply` patches in place.
+    let mut tree = manifest.clone();
+    tree.patches
+        .retain(|purl, _| owned_by_apply(purl) && !is_local_go(purl, &args.common));
+    let mut in_sync: Vec<String> = Vec::new();
+    let mut not_installed: Vec<String> = Vec::new();
+    if !tree.patches.is_empty() {
+        let outcome = verify_installed_tree(&args.common, &tree).await;
+        in_sync = outcome.applied;
+        for failed in outcome.failed {
+            match failed.reason.as_str() {
+                "package_not_found" => not_installed.push(failed.purl),
+                // A zero-file record has nothing on disk to drift from.
+                "no_files" => in_sync.push(failed.purl),
+                reason => {
+                    let detail = format!("{}: {}", failed.purl, describe_check_failure(reason));
+                    drifts.push((failed.purl, reason.to_string(), detail));
+                }
+            }
+        }
+        in_sync.sort();
+        not_installed.sort();
+        checked += in_sync.len();
+    }
+    drifts.sort();
+
     if drifts.is_empty() {
         if args.common.json {
-            println!("{}", Envelope::new(Command::Apply).to_pretty_json());
+            let mut env = Envelope::new(Command::Apply);
+            record_check_skips(&mut env, &in_sync, &not_installed);
+            println!("{}", env.to_pretty_json());
         } else if !args.common.silent {
-            println!("{}", format_check_in_sync(checked));
+            println!("{}", format_check_in_sync(checked, not_installed.len()));
         }
         0
     } else {
@@ -590,15 +635,16 @@ async fn run_check(args: &ApplyArgs, manifest_path: &Path) -> i32 {
             for (id, code, detail) in &drifts {
                 env.record(
                     PatchEvent::new(PatchAction::Failed, id.clone())
-                        .with_reason(*code, detail.clone()),
+                        .with_reason(code.clone(), detail.clone()),
                 );
             }
+            record_check_skips(&mut env, &in_sync, &not_installed);
             env.mark_partial_failure();
             println!("{}", env.to_pretty_json());
         } else {
             // Drift IS the error the exit code signals — it prints even
             // under --silent ("errors only", never "nothing").
-            eprintln!("Error: Patch redirects are OUT OF SYNC:");
+            eprintln!("Error: Patches are OUT OF SYNC:");
             for (_, _, detail) in &drifts {
                 eprintln!("  {detail}");
             }
@@ -608,15 +654,88 @@ async fn run_check(args: &ApplyArgs, manifest_path: &Path) -> i32 {
     }
 }
 
-/// The `apply --check` success line. `--check` audits Go redirects only,
-/// so a project with none says so instead of a vacuous "in sync".
-fn format_check_in_sync(checked: usize) -> String {
-    if checked == 0 {
-        "No Go patch redirects to check.".to_string()
+/// The installed-tree half of `apply --check`: every copy of each purl in
+/// `tree`, judged by the `vex` verifier over the `vex` copy lookup (Maven:
+/// the copies a build consumes). A qualified purl (a release variant) keeps
+/// only the copies holding its own distribution — `apply` skips a copy that
+/// holds another variant, so that copy is no drift of this one.
+async fn verify_installed_tree(
+    common: &GlobalArgs,
+    tree: &PatchManifest,
+) -> socket_patch_core::vex::VerifyOutcome {
+    use socket_patch_core::patch::apply::select_installed_variants;
+    let purls: Vec<String> = tree.patches.keys().cloned().collect();
+    let copies =
+        crate::ecosystem_dispatch::find_manifest_package_copies_reusing(&purls, common, true, None)
+            .await;
+    let mut copies = crate::commands::vex::vex_copy_sets(common, tree, &copies).await;
+    for (purl, paths) in copies.iter_mut() {
+        if purl.as_str() == strip_purl_qualifiers(purl) {
+            continue;
+        }
+        let Some(record) = tree.patches.get(purl) else {
+            continue;
+        };
+        let variant = [(purl.as_str(), &record.files)];
+        let mut kept = Vec::with_capacity(paths.len());
+        for path in paths.drain(..) {
+            if !select_installed_variants(&path, &variant).await.is_empty() {
+                kept.push(path);
+            }
+        }
+        *paths = kept;
+    }
+    socket_patch_core::vex::applied_patches_with_copies(tree, &copies, None).await
+}
+
+/// The `apply --check` drift text for a verifier routing tag.
+fn describe_check_failure(reason: &str) -> &'static str {
+    match reason {
+        "not_applied" => "patch not applied (an installed copy is still unpatched)",
+        "hash_mismatch" => "an installed copy matches neither the original nor the patched bytes",
+        "file_not_found" => "a patched file is missing from an installed copy",
+        _ => "an installed copy does not verify",
+    }
+}
+
+/// The `skipped` events of an `apply --check --json` envelope: in-sync
+/// patches as `already_patched` (apply's own tag for them) and patches with
+/// no installed copy as `package_not_installed`.
+fn record_check_skips(env: &mut Envelope, in_sync: &[String], not_installed: &[String]) {
+    for purl in in_sync {
+        env.record(
+            PatchEvent::new(PatchAction::Skipped, purl.clone())
+                .with_reason("already_patched", "every installed copy is patched"),
+        );
+    }
+    for purl in not_installed {
+        env.record(
+            PatchEvent::new(PatchAction::Skipped, purl.clone()).with_reason(
+                "package_not_installed",
+                "No installed package matches this PURL",
+            ),
+        );
+    }
+}
+
+/// The `apply --check` success line: how many patches were checked, and how
+/// many were skipped for having no installed copy, so a check over an
+/// uninstalled tree never reads as a vacuous "in sync".
+fn format_check_in_sync(checked: usize, not_installed: usize) -> String {
+    let skipped = if not_installed == 0 {
+        String::new()
     } else {
         format!(
-            "Patch redirects are in sync ({} checked).",
-            plural(checked, "redirect", "redirects")
+            "; {} not installed, skipped",
+            plural(not_installed, "patch", "patches")
+        )
+    };
+    if checked == 0 && not_installed == 0 {
+        "No patches to check.".to_string()
+    } else {
+        format!(
+            "Patches are in sync ({} checked{skipped}).",
+            plural(checked, "patch", "patches")
         )
     }
 }
@@ -4200,14 +4319,20 @@ mod tests {
 
     #[test]
     fn check_in_sync_line() {
-        assert_eq!(format_check_in_sync(0), "No Go patch redirects to check.");
+        assert_eq!(format_check_in_sync(0, 0), "No patches to check.");
         assert_eq!(
-            format_check_in_sync(1),
-            "Patch redirects are in sync (1 redirect checked)."
+            format_check_in_sync(1, 0),
+            "Patches are in sync (1 patch checked)."
         );
         assert_eq!(
-            format_check_in_sync(3),
-            "Patch redirects are in sync (3 redirects checked)."
+            format_check_in_sync(3, 0),
+            "Patches are in sync (3 patches checked)."
+        );
+        // A check that skipped uninstalled packages says so, never a bare
+        // vacuous "in sync".
+        assert_eq!(
+            format_check_in_sync(0, 2),
+            "Patches are in sync (0 patches checked; 2 patches not installed, skipped)."
         );
     }
 

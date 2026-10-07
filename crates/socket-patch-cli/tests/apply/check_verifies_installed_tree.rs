@@ -1,0 +1,167 @@
+//! `apply --check` verifies every manifest patch, not only Go redirects.
+//!
+//! Before, `--check` audited the committed Go `replace`-redirects and
+//! nothing else, so on an npm (or any non-Go) agent project whose installed
+//! files were unpatched it printed "No Go patch redirects to check." and
+//! exited 0 — a permanent false green for the obvious "are we patched?" CI
+//! gate (audit B27). It now runs the `vex` verifier over every installed
+//! copy of each in-scope, non-vendored manifest patch.
+
+use std::path::Path;
+
+use serde_json::{json, Value};
+
+use crate::common;
+use common::{git_sha256, parse_json_envelope, run_with_env};
+
+const PURL: &str = "pkg:npm/check-target@1.0.0";
+const ORIGINAL: &[u8] = b"module.exports = 'vulnerable';\n";
+const PATCHED: &[u8] = b"module.exports = 'patched';\n";
+
+fn run_check(cwd: &Path, extra: &[&str]) -> (i32, String, String) {
+    let mut argv = vec!["apply", "--check", "--offline"];
+    argv.extend_from_slice(extra);
+    run_with_env(cwd, &argv, &[("SOCKET_TELEMETRY_DISABLED", "1")])
+}
+
+/// An npm agent project: `.socket/manifest.json` patching
+/// `node_modules/check-target/index.js` from [`ORIGINAL`] to [`PATCHED`];
+/// the installed copy holds `installed` (`None`: not installed).
+fn project(installed: Option<&[u8]>) -> tempfile::TempDir {
+    let tmp = tempfile::tempdir().unwrap();
+    let root = tmp.path();
+    std::fs::write(
+        root.join("package.json"),
+        r#"{ "name": "check-root", "version": "0.0.0" }"#,
+    )
+    .unwrap();
+    std::fs::create_dir_all(root.join(".socket")).unwrap();
+    let manifest = json!({ "patches": { PURL: {
+        "uuid": "27272727-2727-4272-8272-272727272727",
+        "exportedAt": "2024-01-01T00:00:00Z",
+        "files": { "index.js": {
+            "beforeHash": git_sha256(ORIGINAL),
+            "afterHash": git_sha256(PATCHED),
+        }},
+        "vulnerabilities": {},
+        "description": "apply --check fixture",
+        "license": "MIT",
+        "tier": "free",
+    }}});
+    std::fs::write(
+        root.join(".socket/manifest.json"),
+        serde_json::to_vec_pretty(&manifest).unwrap(),
+    )
+    .unwrap();
+    if let Some(bytes) = installed {
+        let pkg = root.join("node_modules/check-target");
+        std::fs::create_dir_all(&pkg).unwrap();
+        std::fs::write(
+            pkg.join("package.json"),
+            r#"{ "name": "check-target", "version": "1.0.0" }"#,
+        )
+        .unwrap();
+        std::fs::write(pkg.join("index.js"), bytes).unwrap();
+    }
+    tmp
+}
+
+fn events(env: &Value) -> Vec<Value> {
+    env["events"].as_array().cloned().unwrap_or_default()
+}
+
+/// The regression: an unpatched installed copy is drift (exit 1), in both
+/// output modes, and `--check` writes nothing.
+#[test]
+fn check_fails_on_an_unpatched_npm_package() {
+    let tmp = project(Some(ORIGINAL));
+    let index = tmp.path().join("node_modules/check-target/index.js");
+
+    let (code, stdout, stderr) = run_check(tmp.path(), &[]);
+    assert_eq!(code, 1, "an unpatched tree is drift\nstdout={stdout}\nstderr={stderr}");
+    assert!(stderr.contains("OUT OF SYNC"), "{stderr}");
+    assert!(
+        stderr.contains(&format!("{PURL}: patch not applied")),
+        "the drift names the package: {stderr}"
+    );
+    assert_eq!(std::fs::read(&index).unwrap(), ORIGINAL, "--check never writes");
+
+    let (code, stdout, stderr) = run_check(tmp.path(), &["--json"]);
+    assert_eq!(code, 1, "stderr={stderr}");
+    let env = parse_json_envelope(stdout.trim());
+    assert_eq!(env["status"], "partialFailure", "{env}");
+    let failed: Vec<Value> = events(&env)
+        .into_iter()
+        .filter(|e| e["action"] == "failed")
+        .collect();
+    assert_eq!(failed.len(), 1, "{env}");
+    assert_eq!(failed[0]["purl"], PURL, "{env}");
+    assert_eq!(failed[0]["errorCode"], "not_applied", "{env}");
+}
+
+/// Bytes that match neither hash are drift too (`apply` would overwrite
+/// them), with their own code.
+#[test]
+fn check_fails_on_a_tampered_npm_package() {
+    let tmp = project(Some(b"something else entirely\n"));
+    let (code, stdout, stderr) = run_check(tmp.path(), &["--json"]);
+    assert_eq!(code, 1, "stderr={stderr}");
+    let env = parse_json_envelope(stdout.trim());
+    assert!(
+        events(&env)
+            .iter()
+            .any(|e| e["action"] == "failed" && e["errorCode"] == "hash_mismatch"),
+        "{env}"
+    );
+}
+
+/// Anti-vacuous half: the same project with the patch in place is in sync,
+/// and says how many patches it checked.
+#[test]
+fn check_passes_on_a_patched_npm_package() {
+    let tmp = project(Some(PATCHED));
+    let (code, stdout, stderr) = run_check(tmp.path(), &[]);
+    assert_eq!(code, 0, "stdout={stdout}\nstderr={stderr}");
+    assert!(
+        stdout.contains("Patches are in sync (1 patch checked)."),
+        "{stdout}"
+    );
+
+    let (code, stdout, stderr) = run_check(tmp.path(), &["--json"]);
+    assert_eq!(code, 0, "stderr={stderr}");
+    let env = parse_json_envelope(stdout.trim());
+    assert_eq!(env["status"], "success", "{env}");
+    let events = events(&env);
+    assert_eq!(events.len(), 1, "{env}");
+    assert_eq!(events[0]["action"], "skipped", "{env}");
+    assert_eq!(events[0]["errorCode"], "already_patched", "{env}");
+}
+
+/// A package with no installed copy is skipped — `apply` skips it too —
+/// and the success line says so instead of a bare "in sync".
+#[test]
+fn check_skips_an_uninstalled_package_and_says_so() {
+    let tmp = project(None);
+    let (code, stdout, stderr) = run_check(tmp.path(), &[]);
+    assert_eq!(code, 0, "stdout={stdout}\nstderr={stderr}");
+    assert!(stdout.contains("1 patch not installed, skipped"), "{stdout}");
+
+    let (code, stdout, _) = run_check(tmp.path(), &["--json"]);
+    assert_eq!(code, 0);
+    let env = parse_json_envelope(stdout.trim());
+    assert!(
+        events(&env)
+            .iter()
+            .any(|e| e["action"] == "skipped" && e["errorCode"] == "package_not_installed"),
+        "{env}"
+    );
+}
+
+/// `--ecosystems` scopes the check exactly as it scopes `apply`.
+#[test]
+fn check_honors_the_ecosystems_filter() {
+    let tmp = project(Some(ORIGINAL));
+    let (code, stdout, stderr) = run_check(tmp.path(), &["--ecosystems", "pypi"]);
+    assert_eq!(code, 0, "stdout={stdout}\nstderr={stderr}");
+    assert!(stdout.contains("No patches to check."), "{stdout}");
+}
