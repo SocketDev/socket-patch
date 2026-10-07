@@ -12,7 +12,7 @@
 //! Cargo.lock dependents check refuses a crate one of them depends on.
 
 use std::collections::BTreeSet;
-use std::path::{Component, Path};
+use std::path::Path;
 use std::sync::Arc;
 
 use toml_edit::{DocumentMut, Item, Table};
@@ -323,26 +323,10 @@ fn path_dependencies(doc: &DocumentMut) -> Vec<String> {
 /// `base/rel` lexically normalized to a repo-relative slash path; `None`
 /// when it is absolute or climbs out of the root.
 pub(crate) fn normalize_rel(base: &str, rel: &str) -> Option<String> {
-    let rel = rel.replace('\\', "/");
-    if rel.starts_with('/') || Path::new(&rel).is_absolute() {
+    if crate::utils::relpath::is_anchored(rel) {
         return None;
     }
-    let mut parts: Vec<String> = base
-        .split('/')
-        .filter(|s| !s.is_empty())
-        .map(str::to_string)
-        .collect();
-    for component in Path::new(&rel).components() {
-        match component {
-            Component::Normal(seg) => parts.push(seg.to_str()?.to_string()),
-            Component::CurDir => {}
-            Component::ParentDir => {
-                parts.pop()?;
-            }
-            Component::RootDir | Component::Prefix(_) => return None,
-        }
-    }
-    Some(parts.join("/"))
+    crate::utils::relpath::resolve_rel(base, rel, 0)
 }
 
 /// Expand a cargo `members` / `exclude` glob (`*`, `?`, `**`) to the

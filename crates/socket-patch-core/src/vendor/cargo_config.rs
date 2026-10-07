@@ -424,20 +424,19 @@ async fn edit_config(
 /// `/abs/.socket/vendor/cargo/…`, `sub/.socket/vendor/cargo/…`) is
 /// user-authored and must never be rewritten or removed.
 pub(crate) fn path_is_socket_owned(path: &str) -> bool {
-    let norm = path.replace('\\', "/");
-    if norm.starts_with('/') {
+    if path.starts_with(['/', '\\']) {
         return false; // absolute (also covers //unc-style prefixes)
     }
-    if norm.as_bytes().get(1) == Some(&b':') {
+    if path.as_bytes().get(1) == Some(&b':') {
         return false; // Windows drive-letter absolute (C:/…)
     }
-    let segments: Vec<&str> = norm
-        .split('/')
-        .filter(|s| !s.is_empty() && *s != ".")
-        .collect();
-    if segments.contains(&"..") {
+    if path.split(['/', '\\']).any(|s| s == "..") {
         return false;
     }
+    let Some(norm) = crate::utils::relpath::resolve_rel("", path, 0) else {
+        return false;
+    };
+    let segments: Vec<&str> = norm.split('/').collect();
     let prefix: Vec<&str> = CARGO_VENDOR_DIR.split('/').collect();
     segments.len() > prefix.len() && segments[..prefix.len()] == prefix[..]
 }

@@ -154,12 +154,9 @@ pub fn normalize_socket_path(path: &str) -> Option<String> {
     if !path_is_socket_owned(path) {
         return None;
     }
-    let norm = path.replace('\\', "/");
-    let segments: Vec<&str> = norm
-        .split('/')
-        .filter(|s| !s.is_empty() && *s != ".")
-        .collect();
-    Some(segments.join("/"))
+    // `path_is_socket_owned` admits no `..`, so this only drops `.` and
+    // empty segments and unifies the separators.
+    crate::utils::relpath::resolve_rel("", path, 0)
 }
 
 /// Is `path` a Socket-owned copy of exactly `name@version`: under

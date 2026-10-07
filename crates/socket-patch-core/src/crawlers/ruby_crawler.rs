@@ -4,10 +4,9 @@ use std::path::{Path, PathBuf};
 
 use super::types::{CrawledPackage, CrawlerOptions};
 use crate::patch::path_safety;
-use crate::utils::fs::{
-    entry_is_dir, home_dir, is_dir, is_file, list_dir_entries, normalize_lexically, run_blocking,
-};
+use crate::utils::fs::{entry_is_dir, home_dir, is_dir, is_file, list_dir_entries, run_blocking};
 use crate::utils::process::{CommandRunner, SystemCommandRunner};
+use crate::utils::relpath::normalize_lexically;
 use crate::vendor::lock_inventory::{DiskSnapshot, ProjectView};
 
 /// Ruby/RubyGems ecosystem crawler for discovering gems in Bundler vendor
