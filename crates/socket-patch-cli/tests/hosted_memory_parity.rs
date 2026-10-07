@@ -35,7 +35,8 @@ fn case(fixture: &'static str) -> Case {
     }
 }
 
-async fn assert_parity(case: Case) {
+/// Returns the (shared) `redirect` block so a case can assert on it too.
+async fn assert_parity(case: Case) -> Value {
     let dir = fixtures_root().join("redirect").join(case.fixture);
     let server = MockServer::start().await;
     let patches = patches_from_overrides(&dir.join("overrides.json"), Some(&server.uri()));
@@ -112,6 +113,7 @@ async fn assert_parity(case: Case) {
         "{}",
         case.fixture
     );
+    disk_redirect
 }
 
 #[tokio::test]
@@ -167,6 +169,39 @@ async fn parity_rush() {
         ..case("npm/pnpm/nested-rush-lock")
     })
     .await;
+}
+
+/// Rush subspaces keep a repo-state.json (the pnpmShrinkwrapHash carrier)
+/// next to each subspace lock, and there is no common one (#714). Both the
+/// disk run and the in-memory selector must see it, so both emit the
+/// stale-hash warning; parity alone would pass with neither emitting it.
+#[tokio::test]
+async fn parity_rush_subspace() {
+    let lock = std::fs::read(
+        fixtures_root()
+            .join("redirect/npm/pnpm/nested-rush-lock/input/common/config/rush/pnpm-lock.yaml"),
+    )
+    .unwrap();
+    let redirect = assert_parity(Case {
+        extra: vec![
+            ("rush.json", b"{}\n".to_vec()),
+            ("common/config/subspaces/x/pnpm-lock.yaml", lock),
+            (
+                "common/config/subspaces/x/repo-state.json",
+                b"{}\n".to_vec(),
+            ),
+        ],
+        ..case("npm/pnpm/nested-rush-lock")
+    })
+    .await;
+    let codes: Vec<&str> = redirect["warnings"]
+        .as_array()
+        .map(|arr| arr.iter().filter_map(|w| w["code"].as_str()).collect())
+        .unwrap_or_default();
+    assert!(
+        codes.contains(&"redirect_rush_repo_state_stale"),
+        "a subspace repo-state.json must trigger the stale-hash warning; got {codes:?}"
+    );
 }
 
 #[tokio::test]

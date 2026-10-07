@@ -134,14 +134,15 @@ enum Need {
     Present,
 }
 
-fn is_rush_subspace_lock(rel: &str) -> bool {
+/// Whether `rel` is `common/config/subspaces/<name>/<basename>`.
+fn is_rush_subspace_file(rel: &str, basename: &str) -> bool {
     let Some(rest) = rel
         .strip_prefix(RUSH_SUBSPACES_DIR)
         .and_then(|r| r.strip_prefix('/'))
     else {
         return false;
     };
-    matches!(rest.split_once('/'), Some((name, "pnpm-lock.yaml")) if !name.is_empty())
+    matches!(rest.split_once('/'), Some((name, file)) if !name.is_empty() && file == basename)
 }
 
 /// What `rel` (relative to a root whose files are `root_files`) is needed
@@ -166,10 +167,12 @@ fn classify(rel: &str, root_files: &BTreeSet<&str>) -> Option<Need> {
         return None;
     }
     let rush = root_files.contains("rush.json");
-    if rush && (rel == RUSH_COMMON_LOCK_REL || is_rush_subspace_lock(rel)) {
+    if rush && (rel == RUSH_COMMON_LOCK_REL || is_rush_subspace_file(rel, "pnpm-lock.yaml")) {
         return Some(Need::Text);
     }
-    if rush && rel == RUSH_REPO_STATE_REL {
+    // Presence-only: the stale-hash warning keys on the repo-state.json
+    // beside each rewritten lock (per subspace when subspaces are enabled).
+    if rush && (rel == RUSH_REPO_STATE_REL || is_rush_subspace_file(rel, "repo-state.json")) {
         return Some(Need::Present);
     }
     if let Some(manifest_dir) = rel.strip_suffix("/Cargo.toml") {
@@ -432,6 +435,7 @@ pub fn candidate_files() -> Vec<String> {
         RUSH_COMMON_LOCK_REL,
         RUSH_REPO_STATE_REL,
         "common/config/subspaces/*/pnpm-lock.yaml",
+        "common/config/subspaces/*/repo-state.json",
         "*.py.lock",
         "*.py (beside *.py.lock)",
         "pylock.toml",
@@ -513,6 +517,8 @@ mod tests {
             blob("common/config/rush/pnpm-lock.yaml"),
             blob("common/config/rush/repo-state.json"),
             blob("common/config/subspaces/a/pnpm-lock.yaml"),
+            blob("common/config/subspaces/a/repo-state.json"),
+            blob("common/config/subspaces/a/b/repo-state.json"),
             blob("rs/Cargo.toml"),
             blob("rs/Cargo.lock"),
             blob("rs/crates/x/Cargo.toml"),
@@ -539,7 +545,11 @@ mod tests {
         );
         assert_eq!(
             s.present_only,
-            vec!["common/config/rush/repo-state.json", "rush.json"]
+            vec![
+                "common/config/rush/repo-state.json",
+                "common/config/subspaces/a/repo-state.json",
+                "rush.json"
+            ]
         );
     }
 

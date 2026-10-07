@@ -1010,14 +1010,25 @@ fn read_npmrc(view: &ProjectView<'_>) -> Result<Option<String>, String> {
     }
 }
 
-/// Whether Rush's repo-state file is present (disk: a regular file).
-fn rush_repo_state_present(view: &ProjectView<'_>) -> bool {
+/// The repo-state.json that carries the pnpmShrinkwrapHash of the Rush lock
+/// at `lock_key`: the file beside it. The common lock maps to
+/// [`RUSH_REPO_STATE_REL`]; with subspaces enabled each subspace keeps its
+/// own, at `common/config/subspaces/<name>/repo-state.json`.
+fn rush_repo_state_for_lock(lock_key: &str) -> String {
+    match lock_key.rsplit_once('/') {
+        Some((dir, _)) => format!("{dir}/repo-state.json"),
+        None => "repo-state.json".to_string(),
+    }
+}
+
+/// Whether the Rush repo-state file `rel` is present (disk: a regular file).
+fn rush_repo_state_present(view: &ProjectView<'_>, rel: &str) -> bool {
     match view {
         ProjectView::Disk(cwd)
         | ProjectView::Snapshot(crate::vendor::lock_inventory::DiskSnapshot {
             root: cwd, ..
-        }) => cwd.join(RUSH_REPO_STATE_REL).is_file(),
-        ProjectView::Memory(project) => project.contains(RUSH_REPO_STATE_REL),
+        }) => cwd.join(rel).is_file(),
+        ProjectView::Memory(project) => project.contains(rel),
     }
 }
 
@@ -1200,12 +1211,14 @@ pub async fn rewrite(
     // refuses until `rush update` refreshes that hash — but the redirect
     // survives `rush update` (pnpm preserves locked resolutions for
     // unchanged specifiers). Warn only when the rewrite actually landed in
-    // a Rush lock and the repo-state file that carries the hash is present.
+    // a Rush lock and the repo-state file that carries THAT lock's hash is
+    // present: it sits beside the lock, so with subspaces enabled each
+    // subspace lock pairs with its own subspace's repo-state.json (#714).
     let mut rush_warnings: Vec<RewriteWarning> = Vec::new();
     if rush_lock_keys
         .iter()
-        .any(|key| rewrite.files.contains_key(key))
-        && rush_repo_state_present(view)
+        .filter(|key| rewrite.files.contains_key(*key))
+        .any(|key| rush_repo_state_present(view, &rush_repo_state_for_lock(key)))
     {
         rush_warnings.push(warning(
             "redirect_rush_repo_state_stale",
@@ -2394,6 +2407,18 @@ packages:
 snapshots:
   left-pad@1.3.0: {}
 ";
+
+    #[test]
+    fn rush_repo_state_pairs_with_the_lock_beside_it() {
+        assert_eq!(
+            rush_repo_state_for_lock(RUSH_COMMON_LOCK_REL),
+            RUSH_REPO_STATE_REL
+        );
+        assert_eq!(
+            rush_repo_state_for_lock("common/config/subspaces/tools/pnpm-lock.yaml"),
+            "common/config/subspaces/tools/repo-state.json"
+        );
+    }
 
     fn pnpm_trust_detail(done: &Rewritten) -> &str {
         done.pnpm_warnings

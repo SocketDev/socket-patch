@@ -253,7 +253,8 @@ live at `common/config/rush/pnpm-lock.yaml` (plus one per subspace under
   survive the copy — the refusal routes you to hosted mode.
 
 Editing a Rush lock outside `rush update` desyncs the `pnpmShrinkwrapHash` in
-`common/config/rush/repo-state.json`, so when `preventManualShrinkwrapChanges` is enabled
+`common/config/rush/repo-state.json` (with subspaces enabled, in the
+`common/config/subspaces/<name>/repo-state.json` beside each subspace lock), so when `preventManualShrinkwrapChanges` is enabled
 `rush install` fails until `rush update` refreshes it (a `redirect_rush_repo_state_stale`
 warning flags this; the redirect survives the refresh — pnpm keeps locked resolutions for
 unchanged specifiers).
