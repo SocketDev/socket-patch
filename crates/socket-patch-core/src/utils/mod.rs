@@ -26,5 +26,6 @@ pub mod socket_cli_config;
 pub mod socket_dir;
 pub(crate) mod toml_edit_ext;
 pub mod uri;
+pub(crate) mod workspace_globs;
 
 pub mod hatch;

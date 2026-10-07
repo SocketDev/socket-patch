@@ -1426,6 +1426,43 @@ async fn hosted_scan_from_pnpm_member_with_own_lock_never_nests_trust_config() {
     );
 }
 
+/// #1006: a project below a `pnpm-workspace.yaml` whose `packages:` globs
+/// do not list it (an `examples/` app) is no workspace member. pnpm
+/// 11.28+/12 install it standalone, with its own lock, and read
+/// `trustLockfile` only from its own settings file, so hosted mode pins the
+/// lock and creates that file as for any single project; the unrelated
+/// root file is left byte-identical.
+#[tokio::test]
+#[serial]
+async fn hosted_scan_from_pnpm_project_outside_workspace_globs_pins_and_nests_trust() {
+    let server = MockServer::start().await;
+    mock_discovery(&server).await;
+    mock_reference(&server).await;
+    mock_view(&server).await;
+    let tmp = tempfile::tempdir().unwrap();
+    let root = member_root(&tmp);
+    std::fs::write(
+        root.join("package.json"),
+        r#"{ "name": "root", "private": true }"#,
+    )
+    .unwrap();
+    let root_ws = root.join("pnpm-workspace.yaml");
+    let ws_before = "packages:\n  - 'packages/*'\n";
+    std::fs::write(&root_ws, ws_before).unwrap();
+    let demo = root.join("examples/demo");
+    std::fs::create_dir_all(&demo).unwrap();
+    write_pnpm_project(&demo);
+
+    let (code, doc) = run_hosted_json(&demo, &server.uri());
+    assert_eq!(code, Some(0), "{doc}");
+    assert_eq!(doc["redirect"]["redirected"], 1, "{doc}");
+    let lock = std::fs::read_to_string(demo.join("pnpm-lock.yaml")).unwrap();
+    assert!(lock.contains(HOSTED_URL), "{lock}");
+    let nested = std::fs::read_to_string(demo.join("pnpm-workspace.yaml")).unwrap();
+    assert!(nested.contains("trustLockfile: true"), "{nested}");
+    assert_eq!(std::fs::read_to_string(&root_ws).unwrap(), ws_before);
+}
+
 /// #880: an explicit `trustLockfile: false` in the root file is the user's
 /// call, respected as in a single project: the member pins, nothing is
 /// nested, and the warning names the root file.

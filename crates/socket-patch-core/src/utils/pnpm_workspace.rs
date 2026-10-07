@@ -8,19 +8,34 @@
 //! every install from the root ("The settings in packages/a/
 //! pnpm-workspace.yaml do not apply"), so hosted and vendored modes must not
 //! treat a missing member file as "create one here" (#880, #881).
+//!
+//! Membership is the file's `packages:` globs. A directory they do not
+//! list (an `examples/` app, a checkout under an unrelated workspace) is
+//! no member: pnpm 11.28+ and 12 install it standalone, with its own lock,
+//! and read only its own `pnpm-workspace.yaml`, so creating that file is
+//! right there (#1006). Older pnpm installs the root workspace from such a
+//! directory, leaving it no lock of its own.
 
 use std::path::{Path, PathBuf};
+
+use serde::Deserialize;
+
+use crate::utils::fs::read_regular_to_string_sync;
+use crate::utils::workspace_globs::{glob_matches, split_negation};
 
 /// pnpm's workspace and settings file.
 pub const PNPM_WORKSPACE: &str = "pnpm-workspace.yaml";
 
 /// The `pnpm-workspace.yaml` that governs `project_root`'s pnpm settings
 /// when it is not the project's own: the nearest regular file of that name
-/// in a strict ancestor, for a project directory with none of its own.
+/// in a strict ancestor, for a project directory with none of its own that
+/// the file's `packages:` globs list (see [`lists_as_member`]).
 ///
 /// `None` when the project has its own entry of that name (of any kind: an
-/// unreadable file or a link is the caller's to report) or no ancestor
-/// has one. Reads only metadata, so a FIFO never blocks it. The path is
+/// unreadable file or a link is the caller's to report), no ancestor has
+/// one, or the nearest one does not list the project (pnpm does not look
+/// further up). Only a regular file is read, through
+/// [`read_regular_to_string_sync`], so a FIFO never blocks it. The path is
 /// canonical, minus Windows' verbatim prefix (see
 /// [`without_verbatim_prefix`]), because refusals and warnings show it to
 /// the user.
@@ -30,12 +45,58 @@ pub fn governing_workspace_file(project_root: &Path) -> Option<PathBuf> {
     }
     let canonical =
         std::fs::canonicalize(project_root).unwrap_or_else(|_| project_root.to_path_buf());
-    canonical
+    let dir = canonical
         .ancestors()
         .skip(1)
-        .map(|dir| dir.join(PNPM_WORKSPACE))
-        .find(|file| file.is_file())
-        .map(without_verbatim_prefix)
+        .find(|dir| dir.join(PNPM_WORKSPACE).is_file())?;
+    let file = dir.join(PNPM_WORKSPACE);
+    let rel: Vec<String> = canonical
+        .strip_prefix(dir)
+        .ok()?
+        .components()
+        .map(|c| c.as_os_str().to_string_lossy().into_owned())
+        .collect();
+    match read_regular_to_string_sync(&file) {
+        Ok(yaml) if !lists_as_member(&yaml, &rel) => None,
+        // Unreadable: fail closed, as a member.
+        _ => Some(without_verbatim_prefix(file)),
+    }
+}
+
+/// Whether a `pnpm-workspace.yaml` (its text) lists the directory at `rel`
+/// (relative to the file's directory, one entry per component, never
+/// empty) as a workspace project, as pnpm 11.28+/12 decide it:
+///
+/// - no `packages:` key, a null one or an empty list: the workspace is the
+///   root alone, so no;
+/// - otherwise when some pattern matches and no `!` pattern does (pnpm's
+///   globber reads every negation as an ignore, wherever it sits).
+///
+/// Errs toward "member", the refusing side, whenever it cannot decide: a
+/// file that does not parse, or a pattern using glob syntax the shared
+/// matcher does not model (braces, classes, extglobs).
+fn lists_as_member(yaml: &str, rel: &[String]) -> bool {
+    #[derive(Deserialize)]
+    struct Workspace {
+        packages: Option<Vec<String>>,
+    }
+    let yaml = crate::utils::serde::strip_bom(yaml);
+    let Ok(workspace) = serde_saphyr::from_str::<Option<Workspace>>(yaml) else {
+        return true;
+    };
+    let patterns = workspace.and_then(|w| w.packages).unwrap_or_default();
+    if patterns
+        .iter()
+        .any(|p| p.contains(['{', '}', '[', ']', '(', ')']))
+    {
+        return true;
+    }
+    let (negated, listed): (Vec<_>, Vec<_>) = patterns
+        .iter()
+        .map(|p| split_negation(p))
+        .partition(|(negated, _)| *negated);
+    listed.iter().any(|(_, p)| glob_matches(p, rel))
+        && !negated.iter().any(|(_, p)| glob_matches(p, rel))
 }
 
 /// `path` without the verbatim prefix `std::fs::canonicalize` adds on
@@ -108,6 +169,62 @@ mod tests {
             governing_workspace_file(&root.join("packages/a")),
             Some(root.join("packages").join(PNPM_WORKSPACE))
         );
+    }
+
+    #[test]
+    fn a_project_outside_the_packages_globs_is_not_governed() {
+        // pnpm 11.28+/12 install a directory the nearest workspace file does
+        // not list as a standalone project: its own lock, its own settings
+        // file (#1006).
+        let tmp = tempfile::tempdir().unwrap();
+        let root = without_verbatim_prefix(std::fs::canonicalize(tmp.path()).unwrap());
+        let governed = |rel: &str| governing_workspace_file(&root.join(rel));
+        let file = Some(root.join(PNPM_WORKSPACE));
+        for rel in ["packages/a", "packages/b", "packages/x/y", "examples/demo"] {
+            write(&root, &format!("{rel}/package.json"), "{}");
+        }
+        write(&root, PNPM_WORKSPACE, "packages:\n  - packages/*\n");
+        assert_eq!(governed("examples/demo"), None);
+        assert_eq!(governed("packages/x/y"), None);
+        assert_eq!(governed("packages/a"), file);
+        // BOM, quoting and `./` spellings still match.
+        write(
+            &root,
+            PNPM_WORKSPACE,
+            "\u{feff}packages:\n  - './packages/**'\n",
+        );
+        assert_eq!(governed("packages/x/y"), file);
+        assert_eq!(governed("examples/demo"), None);
+        // A `!` pattern excludes wherever it sits, as pnpm's globber reads it.
+        for ws in [
+            "packages:\n  - packages/*\n  - '!packages/b'\n",
+            "packages:\n  - '!packages/b'\n  - packages/*\n",
+        ] {
+            write(&root, PNPM_WORKSPACE, ws);
+            assert_eq!(governed("packages/b"), None, "{ws}");
+            assert_eq!(governed("packages/a"), file, "{ws}");
+        }
+        // No `packages:` (a settings-only file), a null or an empty list:
+        // pnpm's workspace is the root alone.
+        for ws in ["trustLockfile: true\n", "packages:\n", "packages: []\n", ""] {
+            write(&root, PNPM_WORKSPACE, ws);
+            assert_eq!(governed("examples/demo"), None, "{ws:?}");
+        }
+        // `**` lists every directory below the root.
+        write(&root, PNPM_WORKSPACE, "packages:\n  - '**'\n");
+        assert_eq!(governed("examples/demo"), file);
+        // Glob syntax this matcher does not model (braces, classes,
+        // extglobs) and a file that does not parse fail closed: governed.
+        for ws in [
+            "packages:\n  - 'packages/{a,b}'\n",
+            "packages:\n  - 'packages/[ab]'\n",
+            "packages:\n  - '+(examples|packages)/*'\n",
+            "packages: [unclosed\n",
+            "packages:\n  - 1\n  - [nested]\n",
+        ] {
+            write(&root, PNPM_WORKSPACE, ws);
+            assert_eq!(governed("examples/demo"), file, "{ws}");
+        }
     }
 
     #[test]

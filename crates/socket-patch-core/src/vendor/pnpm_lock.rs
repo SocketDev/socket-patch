@@ -589,7 +589,9 @@ async fn read_project(
     // nest a `packages: ['.']` scaffold pnpm ignores, and every root
     // install then fails (frozen) or drops the override (#881). The
     // override cannot go in the root file either: socket-patch writes only
-    // inside the project. Hosted mode pins such a member.
+    // inside the project. Hosted mode pins such a member. A directory the
+    // root's `packages:` globs do not list is standalone and takes the
+    // create path (#1006).
     if ws_text.is_none() {
         if let Some(file) = governing_workspace_file(project_root) {
             return Err(Box::new(refused(
@@ -3928,6 +3930,59 @@ snapshots:
             .unwrap();
         let (result, _, _) = expect_done(fx.vendor(false).await);
         assert!(result.success, "{:?}", result.error);
+    }
+
+    /// #1006: a project below a `pnpm-workspace.yaml` whose `packages:`
+    /// globs do not list it is no workspace member. pnpm 11.28+/12 install
+    /// it standalone (its own lock) and read only its own settings file, so
+    /// vendoring wires the override into a new nested file, as for any
+    /// single project, and leaves the unrelated root file alone.
+    #[tokio::test]
+    async fn project_outside_the_workspace_globs_vendors_into_its_own_file() {
+        let fx = fixture_with(P1_BEFORE_PKG, P1_BEFORE_LOCK).await;
+        let ws_root = fx.root();
+        let project = ws_root.join("examples/demo");
+        tokio::fs::create_dir_all(&project).await.unwrap();
+        for name in [PACKAGE_JSON, PNPM_LOCK, "node_modules"] {
+            tokio::fs::rename(ws_root.join(name), project.join(name))
+                .await
+                .unwrap();
+        }
+        let root_ws = "packages:\n  - 'packages/*'\n";
+        tokio::fs::write(ws_root.join(PNPM_WORKSPACE), root_ws)
+            .await
+            .unwrap();
+        let blobs = ws_root.join(".socket/blobs");
+        let sources = PatchSources::blobs_only(&blobs);
+        let preflight =
+            preflight_packages(&project, &[("pkg:npm/left-pad@1.3.0", &fx.record)]).await;
+        assert_eq!(preflight, vec![Ok(())]);
+        let outcome = crate::vendor::test_support::vendor_pnpm(
+            "pkg:npm/left-pad@1.3.0",
+            &project.join("node_modules/left-pad"),
+            &project,
+            &fx.record,
+            &sources,
+            "2026-06-09T00:00:00Z",
+            false,
+            false,
+            None,
+        )
+        .await;
+        let (result, entry, _) = expect_done(outcome);
+        assert!(result.success, "{:?}", result.error);
+        let entry = entry.expect("success carries a ledger entry");
+        assert!(entry.pnpm.as_ref().unwrap().created_workspace_file);
+        let nested = tokio::fs::read_to_string(project.join(PNPM_WORKSPACE))
+            .await
+            .unwrap();
+        assert!(nested.contains("overrides:"), "{nested}");
+        assert_eq!(
+            tokio::fs::read_to_string(ws_root.join(PNPM_WORKSPACE))
+                .await
+                .unwrap(),
+            root_ws
+        );
     }
 
     #[tokio::test]
