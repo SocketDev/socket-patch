@@ -3,8 +3,9 @@
 //!
 //! Before this table the npm-family order lived in the vendored router, its
 //! in-memory copy, the inventory's migration-leftover fallback, the hosted
-//! vlt `SIBLING_LOCKS` list, the hosted vlt preflight inputs and the hosted
-//! npm rewriter's "another lock owns it" check; the PyPI order lived in the
+//! vlt `SIBLING_LOCKS` list, the hosted vlt preflight inputs, the hosted
+//! npm rewriter's "another lock owns it" check and the hosted governing-root
+//! lock-root and workspace-root lists; the PyPI order lived in the
 //! vendored router, the hosted `pdm_drives` gate and the agent-mode PDM
 //! crawler. Each was a hand copy, and a precedence change had to land in all
 //! of them.
