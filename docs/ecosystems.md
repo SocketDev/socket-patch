@@ -253,17 +253,36 @@ live at `common/config/rush/pnpm-lock.yaml` (plus one per subspace under
 `common/config/subspaces/<name>/`).
 
 - **Hosted** ✅ — `scan --mode hosted` discovers and repoints those locks in place
-  (subspaces included).
+  (subspaces included). On pnpm >=11 the install needs extra Rush settings (below).
 - **Agent** ✅ — works through the generated project symlink farm.
 - **Vendored** ❌ — refused (`vendor_rush_unsupported`): `rush install` copies the lock
   into `common/temp` and runs pnpm there, so vendor's relative `file:` specs can't
   survive the copy — the refusal routes you to hosted mode.
 
 Editing a Rush lock outside `rush update` desyncs the `pnpmShrinkwrapHash` in
-`common/config/rush/repo-state.json`, so when `preventManualShrinkwrapChanges` is enabled
+`common/config/rush/repo-state.json` (with subspaces enabled, in the
+`common/config/subspaces/<name>/repo-state.json` beside each subspace lock), so when `preventManualShrinkwrapChanges` is enabled
 `rush install` fails until `rush update` refreshes it (a `redirect_rush_repo_state_stale`
 warning flags this; the redirect survives the refresh — pnpm keeps locked resolutions for
 unchanged specifiers).
+
+On pnpm >=11 a repointed lock does not install under Rush's default flow: `rush install`
+either fails (`ERR_PNPM_TARBALL_URL_MISMATCH` /
+`ERR_PNPM_LOCKFILE_RESOLUTION_VERIFICATION`) or, on pnpm 11, exits 0 after silently
+re-resolving the patched entries to the upstream registry. Rush runs pnpm in `common/temp`
+with a `pnpm-workspace.yaml` it generates, so the `trustLockfile` auto-config is not written
+in a Rush repo; the `redirect_pnpm_trust_lockfile` warning gives the Rush remedy instead
+(verified with Rush 5.180.0):
+
+- pnpm 12: install with `pnpm_config_trust_lockfile=true rush install` (set it in CI too).
+- pnpm 11: also set `"usePnpmFrozenLockfileForRushInstall": true` in
+  `common/config/rush/experiments.json`, so `rush install` stops passing
+  `--no-prefer-frozen-lockfile`.
+- pnpm <=10: nothing extra.
+
+Run `rush purge` before `rush install` so a warm store or old `node_modules` can't serve the
+upstream files, then verify with `socket-patch vex`. Don't rebuild the lock
+(`rush update --full`): that discards the hosted patches.
 
 ## npm: vlt notes
 

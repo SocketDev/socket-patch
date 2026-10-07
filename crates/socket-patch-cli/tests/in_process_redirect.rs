@@ -2735,6 +2735,211 @@ async fn rush_repo_state_stale_warning_is_gated_on_repo_state_presence() {
     );
 }
 
+/// With Rush subspaces enabled, the pnpmShrinkwrapHash carrier lives next to
+/// each subspace lock, at common/config/subspaces/<name>/repo-state.json, and
+/// there is no common/config/rush/repo-state.json (#714). A rewrite that
+/// landed in a subspace lock must still warn, keyed on that sibling file, and
+/// must leave it byte-identical.
+#[tokio::test]
+#[serial]
+async fn rush_subspace_repo_state_stale_warning_fires_for_subspace_repo_state() {
+    let server = MockServer::start().await;
+    mock_discovery(&server).await;
+    mock_reference(&server).await;
+    mock_view(&server).await;
+
+    let tmp = tempfile::tempdir().unwrap();
+    std::fs::write(
+        tmp.path().join("rush.json"),
+        r#"{ "rushVersion": "5.100.0" }"#,
+    )
+    .unwrap();
+    for name in ["default", "tools"] {
+        let dir = tmp.path().join("common/config/subspaces").join(name);
+        std::fs::create_dir_all(&dir).unwrap();
+        std::fs::write(dir.join("pnpm-lock.yaml"), rush_pnpm_lock(NAME)).unwrap();
+    }
+    let state_rel = "common/config/subspaces/default/repo-state.json";
+    let state = "{\n  \"pnpmShrinkwrapHash\": \"deadbeef\"\n}\n";
+    std::fs::write(tmp.path().join(state_rel), state).unwrap();
+
+    let env = run_redirect_subprocess(tmp.path(), &server.uri());
+    assert_eq!(env["status"], "success", "envelope: {env}");
+    for name in ["default", "tools"] {
+        let lock = std::fs::read_to_string(
+            tmp.path()
+                .join(format!("common/config/subspaces/{name}/pnpm-lock.yaml")),
+        )
+        .unwrap();
+        assert!(
+            lock.contains(HOSTED_URL),
+            "the {name} subspace lock must be redirected; got:\n{lock}"
+        );
+    }
+    assert!(
+        warning_codes(&env).contains(&"redirect_rush_repo_state_stale".to_string()),
+        "a subspace repo-state.json beside a rewritten subspace lock must trigger \
+         the stale-hash warning; got warnings {:?}",
+        warning_codes(&env)
+    );
+    assert_eq!(
+        std::fs::read_to_string(tmp.path().join(state_rel)).unwrap(),
+        state,
+        "the redirect must not rewrite the subspace repo-state.json"
+    );
+}
+
+/// The stale-hash warning pairs each rewritten lock with the repo-state.json
+/// in its own directory: a subspace repo-state.json says nothing about a
+/// rewrite that landed only in the common lock (that subspace's lock, and so
+/// its hash, is untouched).
+#[tokio::test]
+#[serial]
+async fn rush_subspace_repo_state_does_not_flag_a_common_only_rewrite() {
+    let server = MockServer::start().await;
+    mock_discovery(&server).await;
+    mock_reference(&server).await;
+    mock_view(&server).await;
+
+    let tmp = tempfile::tempdir().unwrap();
+    std::fs::write(
+        tmp.path().join("rush.json"),
+        r#"{ "rushVersion": "5.100.0" }"#,
+    )
+    .unwrap();
+    let common = tmp.path().join("common/config/rush");
+    std::fs::create_dir_all(&common).unwrap();
+    std::fs::write(common.join("pnpm-lock.yaml"), rush_pnpm_lock(NAME)).unwrap();
+    let subspace = tmp.path().join("common/config/subspaces/tools");
+    std::fs::create_dir_all(&subspace).unwrap();
+    let sub_lock = rush_pnpm_lock("unrelated-pkg");
+    std::fs::write(subspace.join("pnpm-lock.yaml"), &sub_lock).unwrap();
+    std::fs::write(subspace.join("repo-state.json"), "{}\n").unwrap();
+
+    let env = run_redirect_subprocess(tmp.path(), &server.uri());
+    assert_eq!(env["status"], "success", "envelope: {env}");
+    let lock = std::fs::read_to_string(common.join("pnpm-lock.yaml")).unwrap();
+    assert!(
+        lock.contains(HOSTED_URL),
+        "common lock must be redirected; got:\n{lock}"
+    );
+    assert_eq!(
+        std::fs::read_to_string(subspace.join("pnpm-lock.yaml")).unwrap(),
+        sub_lock,
+        "the subspace lock resolves nothing patched and must be untouched"
+    );
+    assert!(
+        !warning_codes(&env).contains(&"redirect_rush_repo_state_stale".to_string()),
+        "only the common lock changed and it has no repo-state.json beside it; got \
+         warnings {:?}",
+        warning_codes(&env)
+    );
+}
+
+/// pnpm >=11 rejects (or, under Rush's `--no-prefer-frozen-lockfile`
+/// install, silently re-resolves) a hosted-redirected lock unless the
+/// lockfile is trusted — but the generic `redirect_pnpm_trust_lockfile`
+/// remedies (`pnpm install --trust-lockfile`, a repo-root
+/// pnpm-workspace.yaml `trustLockfile` key, a `--store-dir` reinstall) do
+/// nothing in a Rush repo: rush runs pnpm in common/temp with a workspace
+/// file it generates itself (#713). A run that spliced only Rush locks must
+/// carry the Rush remedy instead: the `pnpm_config_trust_lockfile=true rush
+/// install` env var, the pnpm 11 `usePnpmFrozenLockfileForRushInstall`
+/// experiment, and a `rush purge` clean reinstall.
+#[tokio::test]
+#[serial]
+async fn rush_pnpm_trust_warning_gives_rush_remedy() {
+    let server = MockServer::start().await;
+    mock_discovery(&server).await;
+    mock_reference(&server).await;
+    mock_view(&server).await;
+
+    let tmp = tempfile::tempdir().unwrap();
+    write_rush_project(tmp.path(), false);
+    let env = run_redirect_subprocess(tmp.path(), &server.uri());
+    assert_eq!(env["status"], "success", "envelope: {env}");
+    let detail = env["redirect"]["warnings"]
+        .as_array()
+        .and_then(|arr| {
+            arr.iter()
+                .find(|w| w["code"] == "redirect_pnpm_trust_lockfile")
+                .and_then(|w| w["detail"].as_str())
+                .map(str::to_string)
+        })
+        .unwrap_or_else(|| panic!("redirect_pnpm_trust_lockfile must fire; envelope: {env}"));
+    for needle in [
+        "pnpm_config_trust_lockfile=true rush install",
+        "usePnpmFrozenLockfileForRushInstall",
+        "common/config/rush/experiments.json",
+        "rush purge",
+        "socket-patch vex",
+    ] {
+        assert!(
+            detail.contains(needle),
+            "the Rush trust detail must name `{needle}`; got:\n{detail}"
+        );
+    }
+    for needle in ["pnpm install --trust-lockfile", "--store-dir", "pnpm clean --lockfile"] {
+        assert!(
+            !detail.contains(needle),
+            "the Rush trust detail must not offer the pnpm-only `{needle}`; got:\n{detail}"
+        );
+    }
+    assert!(
+        !tmp.path().join("pnpm-workspace.yaml").exists(),
+        "rush nested-lock redirects must not create a root pnpm-workspace.yaml"
+    );
+}
+
+/// HEAL-ON-RERUN for #713: a Rush repo whose locks an earlier run (any
+/// release) already redirected splices nothing on a re-scan, yet its `rush
+/// install` still needs the Rush trust remedy — so the re-run re-issues it
+/// instead of going silent, and still writes no root pnpm-workspace.yaml.
+#[tokio::test]
+#[serial]
+async fn rush_rerun_on_redirected_locks_reissues_the_rush_remedy() {
+    let server = MockServer::start().await;
+    mock_discovery(&server).await;
+    mock_reference(&server).await;
+    mock_view(&server).await;
+
+    let tmp = tempfile::tempdir().unwrap();
+    write_rush_project(tmp.path(), false);
+    run_redirect_subprocess(tmp.path(), &server.uri());
+    let common_rel = "common/config/rush/pnpm-lock.yaml";
+    let redirected = std::fs::read_to_string(tmp.path().join(common_rel)).unwrap();
+    assert!(
+        redirected.contains(HOSTED_URL),
+        "first run must redirect:\n{redirected}"
+    );
+
+    let env = run_redirect_subprocess(tmp.path(), &server.uri());
+    assert_eq!(env["status"], "success", "envelope: {env}");
+    assert_eq!(
+        std::fs::read_to_string(tmp.path().join(common_rel)).unwrap(),
+        redirected,
+        "the re-run must leave the redirected Rush lock byte-identical"
+    );
+    let detail = env["redirect"]["warnings"]
+        .as_array()
+        .and_then(|arr| {
+            arr.iter()
+                .find(|w| w["code"] == "redirect_pnpm_trust_lockfile")
+                .and_then(|w| w["detail"].as_str())
+                .map(str::to_string)
+        })
+        .unwrap_or_else(|| panic!("the re-run must re-issue the Rush remedy; envelope: {env}"));
+    assert!(
+        detail.contains("pnpm_config_trust_lockfile=true rush install"),
+        "{detail}"
+    );
+    assert!(!detail.contains("pnpm install --trust-lockfile"), "{detail}");
+    assert!(
+        !tmp.path().join("pnpm-workspace.yaml").exists(),
+        "a Rush re-run must not create a root pnpm-workspace.yaml"
+    );
+}
+
 /// The `redirect_rush_repo_state_stale` warning claims a Rush lock "was edited
 /// outside `rush update`" — so it must fire only when the rewrite actually
 /// landed in a Rush lock. A Rush repo whose locks resolve only an UNRELATED
