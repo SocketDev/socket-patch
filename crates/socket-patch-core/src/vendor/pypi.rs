@@ -5440,6 +5440,210 @@ wheels = [
         }
     }
 
+    // ───────────── residual references outside the flavor's wiring ─────────────
+
+    /// Asserts a wet revert restored its wiring but kept the artifact (and,
+    /// via `kept_artifact`, the ledger entry) because `file` still names the
+    /// uuid dir.
+    fn assert_residual_keep(outcome: &RevertOutcome, fx: &E2eFixture, wheel: &str, file: &str) {
+        assert!(outcome.success, "{:?}", outcome.error);
+        let residual = outcome
+            .warnings
+            .iter()
+            .find(|w| w.code == "vendor_revert_residual_reference")
+            .unwrap_or_else(|| panic!("no residual warning: {:?}", outcome.warnings));
+        assert!(residual.detail.contains(file), "{}", residual.detail);
+        assert!(
+            outcome.kept_artifact,
+            "a residual reference must keep the ledger entry"
+        );
+        assert!(
+            fx.root.join(wheel).is_file(),
+            "{file} still installs the vendored wheel; deleting it breaks every install"
+        );
+    }
+
+    /// The `uv export --frozen -o requirements.txt` line for a vendored wheel.
+    fn exported_line(wheel: &str) -> String {
+        format!("./{wheel} \\\n    --hash=sha256:{}\n", "0".repeat(64))
+    }
+
+    /// Vendors six into a uv project and returns the entry plus the
+    /// pre-vendor pair.
+    async fn vendor_uv_project(fx: &E2eFixture) -> VendorEntry {
+        swap_to_lock_flavor(
+            fx,
+            &[
+                ("pyproject.toml", UV_PYPROJECT),
+                ("uv.lock", UV_LOCK_REGISTRY),
+            ],
+        )
+        .await;
+        let sources = PatchSources::blobs_only(&fx.blobs);
+        let VendorOutcome::Done { result, entry, .. } = vendor_six(fx, &sources, None).await else {
+            panic!("uv vendor must be Done");
+        };
+        assert!(result.success, "{:?}", result.error);
+        let entry = entry.expect("entry on success");
+        assert_eq!(entry.flavor.as_deref(), Some("uv"));
+        entry
+    }
+
+    /// #996: a `uv export`-ed requirements.txt or pylock.toml still names
+    /// the vendored wheel after the uv pair is restored, so the wheel (and
+    /// the ledger entry) must stay; once the export is regenerated, the
+    /// next revert finishes the cleanup.
+    #[tokio::test]
+    async fn uv_revert_keeps_artifact_while_export_references_it() {
+        for export in ["requirements.txt", "pylock.toml"] {
+            let fx = e2e_fixture().await;
+            let entry = vendor_uv_project(&fx).await;
+            let wheel = entry.artifact.path.clone();
+            let exported = if export == "pylock.toml" {
+                format!(
+                    "lock-version = \"1.0\"\ncreated-by = \"uv\"\n\n[[packages]]\nname = \"six\"\nversion = \"1.16.0\"\narchive = {{ path = \"./{wheel}\" }}\n"
+                )
+            } else {
+                exported_line(&wheel)
+            };
+            touch(&fx.root, export, &exported).await;
+
+            // The dry run previews the keep without touching anything.
+            let preview = revert_pypi(&entry, &fx.root, true).await;
+            assert!(preview.success, "{export}: {:?}", preview.error);
+            assert!(
+                preview.warnings.iter().any(|w| {
+                    w.code == "vendor_revert_residual_reference" && w.detail.contains(export)
+                }),
+                "{export}: the dry run must preview the keep: {:?}",
+                preview.warnings
+            );
+
+            let outcome = revert_pypi(&entry, &fx.root, false).await;
+            assert_residual_keep(&outcome, &fx, &wheel, export);
+            assert_eq!(
+                tokio::fs::read_to_string(fx.root.join("pyproject.toml"))
+                    .await
+                    .unwrap(),
+                UV_PYPROJECT,
+                "{export}: the uv pair is still restored"
+            );
+            assert_eq!(
+                tokio::fs::read_to_string(fx.root.join("uv.lock"))
+                    .await
+                    .unwrap(),
+                UV_LOCK_REGISTRY
+            );
+
+            // The user re-exports from the restored lock: the kept entry now
+            // reverts cleanly and the artifact goes.
+            touch(&fx.root, export, "six==1.16.0\n").await;
+            let finished = revert_pypi(&entry, &fx.root, false).await;
+            assert!(finished.success, "{export}: {:?}", finished.error);
+            assert!(!finished.kept_artifact, "{:?}", finished.warnings);
+            assert!(!uuid_dir_of(&fx).exists(), "{export}");
+        }
+    }
+
+    /// #996 (script lane): `uv export --script s.py -o requirements.txt`
+    /// keeps the artifact after the script and its lock are restored.
+    #[tokio::test]
+    async fn script_lock_revert_keeps_artifact_while_export_references_it() {
+        let fx = e2e_fixture().await;
+        let script = "# /// script\n# dependencies = [\"six==1.16.0\"]\n# ///\nprint('hi')\n";
+        let lock = r#"version = 1
+revision = 3
+requires-python = ">=3.9"
+
+[manifest]
+requirements = [{name = "six", specifier = "==1.16.0"}]
+
+[[package]]
+name = "six"
+version = "1.16.0"
+source = {registry = "https://pypi.org/simple"}
+wheels = [{url = "https://files.pythonhosted.org/six.whl", hash = "sha256:upstream"}]
+"#;
+        swap_to_lock_flavor(&fx, &[("s.py", script), ("s.py.lock", lock)]).await;
+        let sources = PatchSources::blobs_only(&fx.blobs);
+        let VendorOutcome::Done { result, entry, .. } = vendor_six(&fx, &sources, None).await
+        else {
+            panic!("script vendor must be Done");
+        };
+        assert!(result.success, "{:?}", result.error);
+        let entry = entry.unwrap();
+        touch(
+            &fx.root,
+            "requirements.txt",
+            &exported_line(&entry.artifact.path),
+        )
+        .await;
+
+        let outcome = revert_pypi(&entry, &fx.root, false).await;
+        assert_residual_keep(&outcome, &fx, &entry.artifact.path, "requirements.txt");
+        assert_eq!(
+            tokio::fs::read_to_string(fx.root.join("s.py"))
+                .await
+                .unwrap(),
+            script
+        );
+        assert_eq!(
+            tokio::fs::read_to_string(fx.root.join("s.py.lock"))
+                .await
+                .unwrap(),
+            lock
+        );
+    }
+
+    /// #867: the vendored requirements line moved into a `-r` include, or
+    /// into a sibling file requirements.txt does not include. The recorded
+    /// line drift-skips; the line's new home must still keep the artifact.
+    #[tokio::test]
+    async fn requirements_revert_keeps_artifact_for_moved_vendor_line() {
+        for (root_text, home) in [
+            ("-r requirements/base.txt\n", "requirements/base.txt"),
+            ("", "requirements-dev.txt"),
+        ] {
+            let fx = e2e_fixture().await;
+            let sources = PatchSources::blobs_only(&fx.blobs);
+            let VendorOutcome::Done { result, entry, .. } = vendor_six(&fx, &sources, None).await
+            else {
+                panic!("vendor must be Done");
+            };
+            assert!(result.success, "{:?}", result.error);
+            let entry = entry.unwrap();
+            let line = read_requirements(&fx).await;
+            assert!(line.contains(&entry.artifact.path), "{line}");
+            tokio::fs::create_dir_all(fx.root.join("requirements"))
+                .await
+                .unwrap();
+            touch(&fx.root, home, &line).await;
+            touch(
+                &fx.root,
+                "requirements.txt",
+                &format!("{root_text}idna==3.7\n"),
+            )
+            .await;
+
+            let preview = revert_pypi(&entry, &fx.root, true).await;
+            assert!(
+                preview.warnings.iter().any(|w| {
+                    w.code == "vendor_revert_residual_reference" && w.detail.contains(home)
+                }),
+                "{home}: the dry run must preview the keep: {:?}",
+                preview.warnings
+            );
+
+            let outcome = revert_pypi(&entry, &fx.root, false).await;
+            assert_residual_keep(&outcome, &fx, &entry.artifact.path, home);
+            assert_eq!(
+                tokio::fs::read_to_string(fx.root.join(home)).await.unwrap(),
+                line,
+                "{home}: the moved line is left alone"
+            );
+        }
+    }
+
     // ───────────── uv guard failures surfaced through the orchestrator ─────────────
 
     #[tokio::test]
