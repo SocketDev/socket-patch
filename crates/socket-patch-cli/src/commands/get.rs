@@ -2358,6 +2358,22 @@ async fn run_nested_apply(
     report
 }
 
+/// The nested apply's non-fatal warnings (today the default policy's
+/// `content_mismatch_overwritten` overwrites, #1004) as `get`'s string
+/// `warnings[]` entries, code-prefixed like [`fold_narrowing_into_result`].
+/// A JSON caller's nested apply is silent, so the envelope is the only
+/// place these surface; a human caller's apply already printed them.
+fn apply_warning_lines(report: Option<&ApplyRunReport>) -> Vec<String> {
+    report
+        .map(|r| {
+            r.warnings
+                .iter()
+                .map(|w| format!("({}) {}", w.code, w.detail))
+                .collect()
+        })
+        .unwrap_or_default()
+}
+
 /// Whether apply's package key `key` covers the patch record purl
 /// `record`: the same purl, or `key` is the unqualified base of a
 /// qualified record (apply keys a release-variant base by its base purl).
@@ -2624,7 +2640,9 @@ pub async fn download_and_apply_patches_with(
     }
     // Surface release-narrowing fallbacks (uninstalled package / no
     // matching variant) so JSON consumers can see why all variants were
-    // kept. Omitted entirely when narrowing was clean.
+    // kept, and the apply's mismatch overwrites. Omitted entirely when
+    // both were clean.
+    warnings.extend(apply_warning_lines(apply_report.as_ref()));
     if !warnings.is_empty() {
         result_json["warnings"] = serde_json::json!(warnings);
     }
@@ -3636,6 +3654,7 @@ async fn save_and_apply_patch(args: &GetArgs, client: &ApiClient, patch: &PatchR
             result_json["applied"] = serde_json::json!(applied);
         }
         // Same contract as `download_and_apply_patches_with`: omitted when clean.
+        warnings.extend(apply_warning_lines(apply_report.as_ref()));
         if !warnings.is_empty() {
             result_json["warnings"] = serde_json::json!(warnings);
         }
@@ -4765,6 +4784,7 @@ mod tests {
             failures,
             run_error: None,
             applied: applied.iter().map(|p| p.to_string()).collect(),
+            warnings: Vec::new(),
         }
     }
 
@@ -4921,6 +4941,7 @@ mod tests {
             failures: Vec::new(),
             run_error: Some(("yarn_pnp_unsupported".to_string(), "pnp".to_string())),
             applied: Vec::new(),
+            warnings: Vec::new(),
         };
         assert_eq!(fold_apply_failures(&mut env, &report, |_| None), 0);
         assert_eq!(env["errorCode"], "yarn_pnp_unsupported", "{env}");

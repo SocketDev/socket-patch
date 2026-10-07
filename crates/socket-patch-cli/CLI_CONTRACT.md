@@ -76,7 +76,7 @@ Every subcommand accepts the same set of "global" flags via a single shared `Glo
 
 `--offline` means the same thing on every command (v3.0): never contact the network, fail loudly when a required local source is missing. On `repair`, `--offline` and `--download-only` are mutually exclusive (exit 2). `scan` and `get` need remote data for their core function (patch discovery / patch fetch), so `--offline` refuses them up front — exit 1 with an error naming the offline gate (JSON: `status: "error"`), before any crawl, client build, or network contact. This covers `scan --vendor` too: offline vendored staging is `vendor --offline`'s job.
 
-The `--strict` mismatch policy applies to the in-place apply paths (apply/get/scan --apply/hook/go redirect). DEFAULT (v3.4): a file whose on-disk content matches neither the patch's beforeHash nor its afterHash is overwritten with the FULL verified patched content (the diff strategy self-disables on a wrong base; archive/blob writes are hash-gated to exactly afterHash; the missing blob is downloaded on demand) and surfaced as a `content_mismatch_overwritten` stderr warning + Skipped event. `--strict` turns that case into a hard error. `--force` overrides `--strict` and additionally skips missing files. Vendor staging is unaffected (it always auto-overwrites into its private stage).
+The `--strict` mismatch policy applies to the in-place apply paths (apply/get/scan --apply/hook/go redirect). DEFAULT (v3.4): a file whose on-disk content matches neither the patch's beforeHash nor its afterHash is overwritten with the FULL verified patched content (the diff strategy self-disables on a wrong base; archive/blob writes are hash-gated to exactly afterHash; the missing blob is downloaded on demand) and surfaced as a `content_mismatch_overwritten` stderr warning + Skipped event (agent-mode `get` / `scan --json`: a `warnings[]` entry, see "Agent-mode mismatch overwrites"). `--strict` turns that case into a hard error. `--force` overrides `--strict` and additionally skips missing files. Vendor staging is unaffected (it always auto-overwrites into its private stage).
 
 ## Per-subcommand arguments
 
@@ -1305,7 +1305,7 @@ Every `--json` invocation emits a single JSON object that follows the **unified 
 | `vendor_artifact_redownload_failed` | `failed` | repair: download unavailable, integrity mismatch, or downloaded bytes/inventory differ from the ledger. Existing files are preserved. |
 | `vendor_artifact_unrepairable` | `failed` | repair: the ledger identity or patch record cannot be trusted or recovered. |
 | `vendor_uuid_mismatch` | `skipped` | repair: the manifest's patch uuid moved past the vendored artifact — a re-vendor (`vendor` / `scan --vendor`) is pending; repair does not cross patch generations. |
-| `content_mismatch_overwritten` | `skipped` (warning) | apply (default policy): a file matched NEITHER beforeHash nor afterHash and was overwritten with the full verified patched content. `--strict` turns this case into a `failed` event instead. |
+| `content_mismatch_overwritten` | `skipped` (warning) | apply (default policy): a file matched NEITHER beforeHash nor afterHash and was overwritten with the full verified patched content. `--strict` turns this case into a `failed` event instead. Agent-mode `get` / `scan --json` carry it as a `(content_mismatch_overwritten) …` `warnings[]` entry (#1004). |
 | `vendor_lock_checksums_unsupported` / `vendor_stale_lock_checksum` | `failed` | vendor (gem): an ambiguous/platform CHECKSUMS entry, or a v1-wired lock whose stale token blocks the hot path (run `vendor --revert` + re-vendor). |
 | `redirect_pypi_stale_install` | `redirect.warnings[]` (warning) | Hosted Python redirect: readable installed files differ from patched hashes. Read-only, repeated on re-scan, and excludes the package from same-run VEX. See the "Python stale-install guard" section. |
 | `redirect_gem_stale_install` | `redirect.warnings[]` (warning) | scan `--mode hosted` (gem): a stale UNPATCHED materialization (installed gem, or committed archive in bundler's cache dir — `vendor/cache` unless `cache_path` moves it) that `bundle install` will reuse instead of fetching the redirected patch; the detail carries the verified remedy. Full rules and flavors: the "Gem stale-install guard" section. |
@@ -1477,6 +1477,19 @@ download failures, and `applied` counts only the patches that did apply.
 A failure no single patch explains (an unreadable manifest, the yarn PnP
 refusal, unavailable patch sources) sets top-level `errorCode` / `error`
 on the same object (`apply` in `scan`'s envelope).
+
+Agent-mode mismatch overwrites (#1004): when the nested apply's default
+mismatch policy overwrites a file that matched neither the patch's
+beforeHash nor its afterHash (a local edit, a `patch-package` / `npm
+patch` change), the same object's string `warnings[]` (`apply` in
+`scan`'s envelope) carries one
+`(content_mismatch_overwritten) <purl>: <file> did not match the patch's
+expected original content; the full verified patched content was applied`
+entry per file — the warning `apply --json` reports as a
+`content_mismatch_overwritten` `skipped` event and the human run prints on
+stderr. The patch record keeps its `added` / `updated` / `skipped` action
+and counts as applied; the status and exit code are unchanged (`--strict`
+turns the case into an apply failure instead).
 
 `vulnerabilities[]` is always sorted by `id` so consumer diffs and
 test snapshots are stable. `severity` at the top level is the max
