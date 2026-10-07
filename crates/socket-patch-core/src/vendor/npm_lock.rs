@@ -25,24 +25,25 @@ use crate::patch::apply::PatchSources;
 use crate::utils::fs::{atomic_write_bytes_preserving_mode, read_regular_to_bytes};
 use crate::utils::socket_dir::remove_tree_and_prune;
 
-use super::common::{already_patched_result, done, parse_json_manifest, refused, JsonLayout};
+use super::common::{parse_json_manifest, refused, JsonLayout};
 use super::lock_inventory::{npm_lock_entries, NpmLockSection};
 use super::npm_common::{
-    done_failure_unstage, guard_coordinates, guard_revert_uuid_dir, stage_patch_pack,
+    guard_revert_uuid_dir, vendor_npm_family, NpmCommit, NpmCoords, NpmLockBackend, NpmStagedPack,
+    NpmVendorRequest, WireCx,
 };
 use super::npm_origin::{npm_non_registry_entries, npm_shrinkwrapped_entries, NpmOverrides};
 use super::parse_memo::ParseMemo;
 use super::path::parse_vendor_path;
 use super::source::PackageSource;
-use super::state::{
-    write_marker_or_warn, VendorArtifact, VendorEntry, VendorMarker, WiringAction, WiringRecord,
-};
+use super::state::{VendorEntry, WiringAction, WiringRecord};
 use super::{RevertOpts, RevertOutcome, VendorOutcome, VendorWarning};
 
 // Test-only re-imports: the helpers moved to `npm_common` but the existing
 // suite exercises them through `use super::*` and stays unmodified.
 #[cfg(test)]
 use super::npm_common::{is_safe_npm_name, parse_npm_purl, tgz_rel_leaf};
+#[cfg(test)]
+use super::state::VendorArtifact;
 use crate::constants::npm_family::NPM_LOCKS;
 
 /// `npm-shrinkwrap.json` is the primary lock when both exist (npm <= 11
@@ -89,6 +90,8 @@ const DEP_MANIFEST_FIELDS: [&str; 4] = [
 /// produced. On success `entry` carries the ledger record to persist —
 /// `None` for dry runs and for the in-sync re-run (the existing ledger entry
 /// stays authoritative; we never re-record our own edit as an "original").
+/// The flow is [`vendor_npm_family`]'s; [`PackageLockBackend`] is the
+/// package-lock grammar.
 #[allow(clippy::too_many_arguments)]
 pub async fn vendor_npm<'a>(
     purl: &str,
@@ -101,332 +104,291 @@ pub async fn vendor_npm<'a>(
     force: bool,
     service: Option<&super::VendorServiceConfig>,
 ) -> VendorOutcome {
-    let installed_dir = installed_dir.into();
-    let mut warnings: Vec<VendorWarning> = Vec::new();
-
-    // ── 1. Coordinates (shared guard: fail-closed before any disk access,
-    //       see `npm_common::guard_coordinates` for the security note) ────
-    let coords = match guard_coordinates(purl, record) {
-        Ok(coords) => coords,
-        Err(outcome) => return *outcome,
-    };
-    let (name, version) = (coords.name.as_str(), coords.version.as_str());
-    let uuid_dir_rel = coords.uuid_dir_rel;
-    let base_purl = coords.base_purl;
-
-    // ── 2. Lockfile selection ───────────────────────────────────────────
-    let (lock_name, lock_bytes, sibling_locks) = match select_lockfile(project_root).await {
-        Ok(Some(found)) => found,
-        Ok(None) => {
-            return refused(
-                "vendor_lockfile_missing",
-                format!(
-                    "no {PACKAGE_LOCK} or {SHRINKWRAP} {} — vendoring rewires the lockfile, \
-                     so one must exist (run `npm install` first)",
-                    super::npm_flavor::project_root_location(project_root)
-                ),
-            );
-        }
-        Err(e) => {
-            return refused(
-                "vendor_lockfile_missing",
-                format!("cannot read the lockfile: {e}"),
-            );
-        }
-    };
-    let lock = match LOCK_MEMO.parse(&lock_bytes, || parse_json_manifest(&lock_bytes)) {
-        Ok(v) => v,
-        Err(e) => {
-            return refused(
-                "vendor_lockfile_version_unsupported",
-                format!("{lock_name} is not parseable JSON: {e}"),
-            );
-        }
-    };
-    let lock_version = match lock_version_gate(&lock, &lock_name) {
-        Ok(lock_version) => lock_version,
-        Err(outcome) => return *outcome,
-    };
-
-    // The root manifest's `overrides` (#490): which git / url / `file:`
-    // dependent specs npm really installs from.
-    let overrides = NpmOverrides::read(project_root).await;
-
-    // ── 3. Find the rewritable lock instances ───────────────────────────
-    let matches =
-        match rewritable_matches(&lock, &overrides, name, version, &lock_name, &mut warnings) {
-            Ok(matches) => matches,
-            Err(outcome) => return *outcome,
-        };
-
-    // ── 3b. Sibling lock (npm 12) ───────────────────────────────────────
-    // npm 12 removed `npm shrinkwrap`, never reads a committed
-    // npm-shrinkwrap.json, writes a package-lock.json (from the registry)
-    // beside it on first install and then reifies FROM package-lock.json (verified against real npm 12.0.0 /
-    // 12.1.0; npm <= 11 installs from the shrinkwrap). Wiring only the
-    // shrinkwrap in that dual-lock state was a silent false success under
-    // npm 12 — the unpatched registry bytes kept installing. Every other
-    // present npm lock is therefore rewired identically (the hosted
-    // rewriter's rule), and one that cannot be is SAID.
-    // A shrinkwrap with NO package-lock.json twin (#899): npm 12 never reads
-    // npm-shrinkwrap.json — it resolves from the registry and writes a fresh
-    // package-lock.json — so the wiring reaches npm <= 11 only. Still wired
-    // (npm <= 11 installs from it) and SAID, never a silent success.
-    if lock_name == SHRINKWRAP && sibling_locks.is_empty() {
-        warnings.push(VendorWarning::new(
-            "vendor_npm_shrinkwrap_only",
-            crate::patch::redirect::npm_shrinkwrap_only_detail(
-                &[format!("{name}@{version}")],
-                "is vendored",
-            ),
-        ));
-    }
-    let mut siblings: Vec<SiblingLock> = Vec::new();
-    for (sib_name, sib_bytes) in sibling_locks {
-        match sibling_lock_target(
-            sib_name,
-            sib_bytes,
-            &overrides,
-            name,
-            version,
-            &mut warnings,
-        ) {
-            Ok(sib) => siblings.push(sib),
-            Err(why) => warnings.push(VendorWarning::new(
-                "vendor_npm_sibling_lock_unwired",
-                format!(
-                    "{sib_name} beside {lock_name} was NOT rewired for {name}@{version} \
-                     ({why}) — npm >= 12 installs from {sib_name} when both exist, so those \
-                     installs stay UNPATCHED; regenerate it from {lock_name} (or delete it) \
-                     and re-run vendor"
-                ),
-            )),
-        }
-    }
-
-    // ── 4–7. Stage → patch → pack (shared flavor-agnostic pipeline:
-    //         tempdir stage outside the project, nested node_modules prune,
-    //         bundled-deps refusal, hardened apply, deterministic pack) ────
-    let (staged, result) = match stage_patch_pack(
-        purl,
-        installed_dir,
-        project_root,
-        record,
-        sources,
-        dry_run,
-        force,
-        &mut warnings,
-        service,
+    vendor_npm_family(
+        &PackageLockBackend,
+        NpmVendorRequest {
+            purl,
+            installed_dir: installed_dir.into(),
+            project_root,
+            record,
+            sources,
+            vendored_at,
+            dry_run,
+            force,
+            service,
+        },
     )
     .await
-    {
-        Ok(pair) => pair,
-        Err(outcome) => return *outcome,
-    };
-    let Some(staged) = staged else {
-        // Failed patch (no lock writes — wiring is last, so the project is
-        // byte-untouched) or a dry run (stops after the verify).
-        return done(result, None, warnings);
-    };
-    let uuid_dir_preexisted = staged.uuid_dir_preexisted;
-    // `staged.name`/`staged.version` echo the validated coords (the wiring
-    // below keeps using the borrowed `name`/`version`).
-    debug_assert_eq!(
-        (staged.name.as_str(), staged.version.as_str()),
-        (name, version)
-    );
-    let rel_tgz = staged.rel_tgz;
-    let packed = staged.packed;
-    let staged_pkg_json = staged.staged_pkg_json;
-    // Forward slashes by construction (uuid_dir_rel + leaf are built with
-    // `/`), relative to the project dir — the spelling npm resolves
-    // `file:` specs against.
-    let resolved = format!("file:{rel_tgz}");
+}
 
-    // ── 8. Lock rewrite (in-place Value mutation: untouched keys stay
-    //       byte-stable thanks to serde_json's preserve_order) ────────────
-    let mut wiring: Vec<WiringRecord> = Vec::new();
-    let mut changed = false;
-    let mut recomputed_deps = false;
-    // The memo hands the parse out shared; the rewrite takes its own copy —
-    // the allocation the per-package parse it replaced would have made.
-    let mut lock = (*lock).clone();
-    let rewire = LockRewire {
-        name,
-        version,
-        resolved: &resolved,
-        integrity: &packed.integrity,
-        staged_pkg_json: staged_pkg_json.as_ref(),
-        overrides: &overrides,
-    };
-    if let Err(e) = rewire.apply(
-        &mut lock,
-        lock_version,
-        &matches,
-        &lock_name,
-        &mut wiring,
-        &mut changed,
-        &mut recomputed_deps,
-    ) {
-        return done_failure_unstage(purl, e, project_root, &uuid_dir_rel, uuid_dir_preexisted)
-            .await;
+/// The package-lock (`package-lock.json` / `npm-shrinkwrap.json`) half of
+/// [`vendor_npm`].
+struct PackageLockBackend;
+
+/// [`PackageLockBackend`]'s pre-flight product: the primary lock, its
+/// rewritable instances, and every present sibling lock (npm 12).
+struct PackageLockPlan {
+    lock_name: String,
+    lock_bytes: Vec<u8>,
+    lock: std::sync::Arc<Value>,
+    lock_version: Option<u64>,
+    overrides: NpmOverrides,
+    matches: Vec<LockMatch>,
+    siblings: Vec<SiblingLock>,
+}
+
+impl NpmLockBackend for PackageLockBackend {
+    type Plan = PackageLockPlan;
+
+    fn flavor(&self) -> Option<&'static str> {
+        // Package-lock entries predate the flavor field and keep its
+        // absence as their spelling.
+        None
     }
-    let primary_changed = changed;
-    // Sibling locks get the identical rewrite; their wiring records name
-    // their own file, so revert (which walks records per file) restores
-    // each.
-    let mut sibling_writes: Vec<(String, Vec<u8>, Vec<u8>)> = Vec::new();
-    for sib in &mut siblings {
-        let mut sib_changed = false;
-        if let Err(e) = rewire.apply(
-            &mut sib.lock,
-            sib.lock_version,
-            &sib.matches,
-            &sib.name,
-            &mut wiring,
-            &mut sib_changed,
-            &mut recomputed_deps,
-        ) {
-            return done_failure_unstage(purl, e, project_root, &uuid_dir_rel, uuid_dir_preexisted)
-                .await;
+
+    async fn preflight(
+        &self,
+        project_root: &Path,
+        coords: &NpmCoords,
+        warnings: &mut Vec<VendorWarning>,
+    ) -> Result<PackageLockPlan, Box<VendorOutcome>> {
+        let (name, version) = (coords.name.as_str(), coords.version.as_str());
+
+        // ── 2. Lockfile selection ───────────────────────────────────────
+        let (lock_name, lock_bytes, sibling_locks) = match select_lockfile(project_root).await {
+            Ok(Some(found)) => found,
+            Ok(None) => {
+                return Err(Box::new(refused(
+                    "vendor_lockfile_missing",
+                    format!(
+                        "no {PACKAGE_LOCK} or {SHRINKWRAP} {} — vendoring rewires the lockfile, \
+                         so one must exist (run `npm install` first)",
+                        super::npm_flavor::project_root_location(project_root)
+                    ),
+                )));
+            }
+            Err(e) => {
+                return Err(Box::new(refused(
+                    "vendor_lockfile_missing",
+                    format!("cannot read the lockfile: {e}"),
+                )));
+            }
+        };
+        let lock = match LOCK_MEMO.parse(&lock_bytes, || parse_json_manifest(&lock_bytes)) {
+            Ok(v) => v,
+            Err(e) => {
+                return Err(Box::new(refused(
+                    "vendor_lockfile_version_unsupported",
+                    format!("{lock_name} is not parseable JSON: {e}"),
+                )));
+            }
+        };
+        let lock_version = lock_version_gate(&lock, &lock_name)?;
+
+        // The root manifest's `overrides` (#490): which git / url / `file:`
+        // dependent specs npm really installs from.
+        let overrides = NpmOverrides::read(project_root).await;
+
+        // ── 3. Find the rewritable lock instances ───────────────────────
+        let matches = rewritable_matches(&lock, &overrides, name, version, &lock_name, warnings)?;
+
+        // ── 3b. Sibling lock (npm 12) ───────────────────────────────────
+        // npm 12 removed `npm shrinkwrap`, never reads a committed
+        // npm-shrinkwrap.json, writes a package-lock.json (from the registry)
+        // beside it on first install and then reifies FROM package-lock.json (verified against real npm 12.0.0 /
+        // 12.1.0; npm <= 11 installs from the shrinkwrap). Wiring only the
+        // shrinkwrap in that dual-lock state was a silent false success under
+        // npm 12 — the unpatched registry bytes kept installing. Every other
+        // present npm lock is therefore rewired identically (the hosted
+        // rewriter's rule), and one that cannot be is SAID.
+        // A shrinkwrap with NO package-lock.json twin (#899): npm 12 never reads
+        // npm-shrinkwrap.json — it resolves from the registry and writes a fresh
+        // package-lock.json — so the wiring reaches npm <= 11 only. Still wired
+        // (npm <= 11 installs from it) and SAID, never a silent success.
+        if lock_name == SHRINKWRAP && sibling_locks.is_empty() {
+            warnings.push(VendorWarning::new(
+                "vendor_npm_shrinkwrap_only",
+                crate::patch::redirect::npm_shrinkwrap_only_detail(
+                    &[format!("{name}@{version}")],
+                    "is vendored",
+                ),
+            ));
         }
-        if sib_changed {
-            changed = true;
-            let layout = JsonLayout::of(&String::from_utf8_lossy(&sib.bytes));
-            match layout.render(&sib.lock) {
-                Ok(out) => sibling_writes.push((sib.name.clone(), sib.bytes.clone(), out)),
-                Err(e) => {
-                    return done_failure_unstage(
-                        purl,
-                        format!("cannot serialize {}: {e}", sib.name),
-                        project_root,
-                        &uuid_dir_rel,
-                        uuid_dir_preexisted,
-                    )
-                    .await
-                }
+        let mut siblings: Vec<SiblingLock> = Vec::new();
+        for (sib_name, sib_bytes) in sibling_locks {
+            match sibling_lock_target(sib_name, sib_bytes, &overrides, name, version, warnings) {
+                Ok(sib) => siblings.push(sib),
+                Err(why) => warnings.push(VendorWarning::new(
+                    "vendor_npm_sibling_lock_unwired",
+                    format!(
+                        "{sib_name} beside {lock_name} was NOT rewired for {name}@{version} \
+                         ({why}) — npm >= 12 installs from {sib_name} when both exist, so those \
+                         installs stay UNPATCHED; regenerate it from {lock_name} (or delete it) \
+                         and re-run vendor"
+                    ),
+                )),
             }
         }
+        Ok(PackageLockPlan {
+            lock_name,
+            lock_bytes,
+            lock,
+            lock_version,
+            overrides,
+            matches,
+            siblings,
+        })
     }
-    if recomputed_deps {
-        warnings.push(VendorWarning::new(
+
+    async fn wire(
+        &self,
+        plan: PackageLockPlan,
+        cx: &WireCx<'_>,
+        staged: &mut NpmStagedPack,
+        _warnings: &mut Vec<VendorWarning>,
+    ) -> Result<Option<NpmCommit>, String> {
+        let PackageLockPlan {
+            lock_name,
+            lock_bytes,
+            lock,
+            lock_version,
+            overrides,
+            matches,
+            mut siblings,
+        } = plan;
+        let project_root = cx.project_root;
+        // Forward slashes by construction (uuid_dir_rel + leaf are built with
+        // `/`), relative to the project dir — the spelling npm resolves
+        // `file:` specs against.
+        let resolved = format!("file:{}", staged.rel_tgz);
+
+        // ── 8. Lock rewrite (in-place Value mutation: untouched keys stay
+        //       byte-stable thanks to serde_json's preserve_order) ────────
+        let mut wiring: Vec<WiringRecord> = Vec::new();
+        let mut changed = false;
+        // The memo hands the parse out shared; the rewrite takes its own
+        // copy — the allocation the per-package parse it replaced would have
+        // made.
+        let mut lock = (*lock).clone();
+        let rewire = LockRewire {
+            name: &cx.coords.name,
+            version: &cx.coords.version,
+            resolved: &resolved,
+            integrity: &staged.packed.integrity,
+            staged_pkg_json: staged.staged_pkg_json.as_ref(),
+            overrides: &overrides,
+        };
+        rewire.apply(
+            &mut lock,
+            lock_version,
+            &matches,
+            &lock_name,
+            &mut wiring,
+            &mut changed,
+        )?;
+        let primary_changed = changed;
+        // Sibling locks get the identical rewrite; their wiring records name
+        // their own file, so revert (which walks records per file) restores
+        // each.
+        let mut sibling_writes: Vec<(String, Vec<u8>, Vec<u8>)> = Vec::new();
+        for sib in &mut siblings {
+            let mut sib_changed = false;
+            rewire.apply(
+                &mut sib.lock,
+                sib.lock_version,
+                &sib.matches,
+                &sib.name,
+                &mut wiring,
+                &mut sib_changed,
+            )?;
+            if sib_changed {
+                changed = true;
+                let layout = JsonLayout::of(&String::from_utf8_lossy(&sib.bytes));
+                let out = layout
+                    .render(&sib.lock)
+                    .map_err(|e| format!("cannot serialize {}: {e}", sib.name))?;
+                sibling_writes.push((sib.name.clone(), sib.bytes.clone(), out));
+            }
+        }
+
+        if !changed {
+            // Every instance already points at this uuid with the packed
+            // integrity: the project is in sync.
+            return Ok(None);
+        }
+
+        let layout = JsonLayout::of(&String::from_utf8_lossy(&lock_bytes));
+        let out = layout
+            .render(&lock)
+            .map_err(|e| format!("cannot serialize {lock_name}: {e}"))?;
+        // Siblings first, the primary lock last (still the final mutation);
+        // a failed write restores every sibling already written, so no lock
+        // is left resolving through an artifact the unstage removes.
+        let mut written: Vec<(&str, &[u8])> = Vec::new();
+        let mut write_err: Option<String> = None;
+        // Dropped before the first write, so a torn one leaves nothing
+        // behind — but only for the locks about to be written. In npm 12's
+        // dual-lock state only one of the two may hold a match, and the one
+        // nobody writes is still on disk exactly as parsed: dropping it too
+        // would make every later package re-parse a lock this run never
+        // touched.
+        for (_, original, _) in &sibling_writes {
+            LOCK_MEMO.forget(original);
+        }
+        if primary_changed {
+            LOCK_MEMO.forget(&lock_bytes);
+        }
+        for (sib_name, original, out) in &sibling_writes {
+            if let Err(e) =
+                atomic_write_bytes_preserving_mode(&project_root.join(sib_name), out).await
+            {
+                write_err = Some(format!("cannot write {sib_name}: {e}"));
+                break;
+            }
+            written.push((sib_name, original));
+        }
+        if write_err.is_none() && primary_changed {
+            if let Err(e) =
+                atomic_write_bytes_preserving_mode(&project_root.join(&lock_name), &out).await
+            {
+                write_err = Some(format!("cannot write {lock_name}: {e}"));
+            }
+        }
+        if let Some(e) = write_err {
+            for (sib_name, original) in written {
+                // Best effort: the original bytes were read moments ago.
+                let _ = atomic_write_bytes_preserving_mode(&project_root.join(sib_name), original)
+                    .await;
+            }
+            return Err(e);
+        }
+        // The bytes now on disk and the documents they were serialized from:
+        // the next package in this run reads them back and skips the parse.
+        for sib in siblings {
+            if let Some((_, _, written)) =
+                sibling_writes.iter().find(|(name, ..)| *name == sib.name)
+            {
+                LOCK_MEMO.store(written.clone(), sib.lock);
+            }
+        }
+        if primary_changed {
+            LOCK_MEMO.store(out, lock);
+        }
+        Ok(Some(NpmCommit {
+            wiring,
+            ..NpmCommit::default()
+        }))
+    }
+
+    fn manifest_warning(&self, name: &str, version: &str) -> VendorWarning {
+        VendorWarning::new(
             "vendor_dep_manifest_rewritten",
             format!(
                 "the patch rewrites {name}@{version}'s package.json; its lock entries' \
                  dependency/bin fields were recomputed from the patched manifest"
             ),
-        ));
+        )
     }
-
-    if !changed {
-        // Every instance already points at this uuid with the packed
-        // integrity: the project is in sync. The facts are those of the
-        // REUSED committed artifact (the shared pipeline wrote nothing) or,
-        // when reuse missed (no ledger anchor, a tampered/missing tarball),
-        // of a freshly acquired one that reproduced the pinned bytes. Touch
-        // nothing and synthesize an AlreadyPatched-style success, mirroring
-        // the go_redirect hot path.
-        return done(
-            already_patched_result(purl, &project_root.join(&rel_tgz), &record.files),
-            None,
-            warnings,
-        );
-    }
-
-    let layout = JsonLayout::of(&String::from_utf8_lossy(&lock_bytes));
-    let out = match layout.render(&lock) {
-        Ok(out) => out,
-        Err(e) => {
-            return done_failure_unstage(
-                purl,
-                format!("cannot serialize {lock_name}: {e}"),
-                project_root,
-                &uuid_dir_rel,
-                uuid_dir_preexisted,
-            )
-            .await
-        }
-    };
-    // Siblings first, the primary lock last (still the final mutation); a
-    // failed write restores every sibling already written, so no lock is
-    // left resolving through an artifact the unstage removes.
-    let mut written: Vec<(&str, &[u8])> = Vec::new();
-    let mut write_err: Option<String> = None;
-    // Dropped before the first write, so a torn one leaves nothing behind —
-    // but only for the locks about to be written. In npm 12's dual-lock
-    // state only one of the two may hold a match, and the one nobody writes
-    // is still on disk exactly as parsed: dropping it too would make every
-    // later package re-parse a lock this run never touched.
-    for (_, original, _) in &sibling_writes {
-        LOCK_MEMO.forget(original);
-    }
-    if primary_changed {
-        LOCK_MEMO.forget(&lock_bytes);
-    }
-    for (sib_name, original, out) in &sibling_writes {
-        if let Err(e) = atomic_write_bytes_preserving_mode(&project_root.join(sib_name), out).await
-        {
-            write_err = Some(format!("cannot write {sib_name}: {e}"));
-            break;
-        }
-        written.push((sib_name, original));
-    }
-    if write_err.is_none() && primary_changed {
-        if let Err(e) =
-            atomic_write_bytes_preserving_mode(&project_root.join(&lock_name), &out).await
-        {
-            write_err = Some(format!("cannot write {lock_name}: {e}"));
-        }
-    }
-    if let Some(e) = write_err {
-        for (sib_name, original) in written {
-            // Best effort: the original bytes were read moments ago.
-            let _ =
-                atomic_write_bytes_preserving_mode(&project_root.join(sib_name), original).await;
-        }
-        return done_failure_unstage(purl, e, project_root, &uuid_dir_rel, uuid_dir_preexisted)
-            .await;
-    }
-    // The bytes now on disk and the documents they were serialized from: the
-    // next package in this run reads them back and skips the parse.
-    for sib in siblings {
-        if let Some((_, _, written)) = sibling_writes.iter().find(|(name, ..)| *name == sib.name) {
-            LOCK_MEMO.store(written.clone(), sib.lock);
-        }
-    }
-    if primary_changed {
-        LOCK_MEMO.store(out, lock);
-    }
-
-    // ── 9. Marker + ledger entry ─────────────────────────────────────────
-    let marker = VendorMarker::new("npm", &base_purl, record, vendored_at);
-    write_marker_or_warn(&project_root.join(&uuid_dir_rel), &marker, &mut warnings).await;
-
-    let entry = VendorEntry {
-        ecosystem: "npm".to_string(),
-        base_purl,
-        uuid: record.uuid.clone(),
-        artifact: VendorArtifact {
-            yarn_berry10c0: None,
-            path: rel_tgz,
-            sha256: packed.sha256_hex,
-            size: Some(packed.size),
-            platform_locked: None,
-            file_inventory: None,
-        },
-        wiring,
-        lock: None,
-        took_over_go_patches: false,
-        detached: false,
-        record: None,
-        flavor: None,
-        uv: None,
-        pnpm: None,
-        poetry: None,
-        pdm: None,
-        pipenv: None,
-    };
-    done(result, Some(entry), warnings)
 }
 
 /// The project-level refusal [`vendor_npm`]'s step 2 raises whatever the
@@ -1365,7 +1327,6 @@ struct LockRewire<'a> {
 }
 
 impl LockRewire<'_> {
-    #[allow(clippy::too_many_arguments)]
     fn apply(
         &self,
         lock: &mut Value,
@@ -1374,7 +1335,6 @@ impl LockRewire<'_> {
         lock_name: &str,
         wiring: &mut Vec<WiringRecord>,
         changed: &mut bool,
-        recomputed_deps: &mut bool,
     ) -> Result<(), String> {
         // Taken before any rewrite, for the legacy mirror below: the
         // mirror of an entry the `packages` scan skipped stays as it is.
@@ -1406,7 +1366,6 @@ impl LockRewire<'_> {
             );
             if let Some(pkg) = self.staged_pkg_json {
                 recompute_dep_fields(live, pkg);
-                *recomputed_deps = true;
             }
             wiring.push(WiringRecord {
                 file: lock_name.to_string(),
@@ -3540,6 +3499,40 @@ mod tests {
             "field absent from the patched manifest must be removed"
         );
         assert_eq!(e["license"], json!("WTFPL"), "non-dep fields untouched");
+    }
+
+    /// #920: the `package.json` advisory is emitted once, by the run that
+    /// wires — an in-sync re-run of a manifest-rewriting patch is a quiet
+    /// AlreadyPatched.
+    #[tokio::test]
+    async fn manifest_rewriting_rerun_is_in_sync_without_the_manifest_warning() {
+        let mut fx = fixture().await;
+        let before = installed_pkg_json("left-pad", "1.3.0");
+        let after: &[u8] =
+            br#"{"name":"left-pad","version":"1.3.0","dependencies":{"wow":"^1.0.0"}}"#;
+        let after_hash = compute_git_sha256_from_bytes(after);
+        tokio::fs::write(fx.root().join(".socket/blobs").join(&after_hash), after)
+            .await
+            .unwrap();
+        fx.record.files.insert(
+            "package/package.json".to_string(),
+            PatchFileInfo {
+                before_hash: compute_git_sha256_from_bytes(&before),
+                after_hash,
+            },
+        );
+        let (result, entry, warnings) = expect_done(fx.vendor(false).await);
+        assert!(result.success && entry.is_some(), "{:?}", result.error);
+        let manifest_warnings = |w: &[VendorWarning]| {
+            w.iter()
+                .filter(|w| w.code.starts_with("vendor_dep_manifest"))
+                .count()
+        };
+        assert_eq!(manifest_warnings(&warnings), 1, "{warnings:?}");
+
+        let (result, entry, warnings) = expect_done(fx.vendor(false).await);
+        assert!(result.success && entry.is_none(), "{:?}", result.error);
+        assert_eq!(manifest_warnings(&warnings), 0, "{warnings:?}");
     }
 
     /// #324: vendoring keeps a CRLF, tab-indented or BOM-prefixed lock's

@@ -36,6 +36,9 @@ use super::service_fetch::{
     fetch_verified_archive, ServiceArtifact, ServiceAttempt, ServicePolicy, ServiceTerminal,
 };
 use super::source::PackageSource;
+use super::state::{
+    write_marker_or_warn, PnpmMeta, VendorArtifact, VendorEntry, VendorMarker, WiringRecord,
+};
 use super::{RevertOutcome, VendorOutcome, VendorServiceConfig, VendorWarning};
 
 /// Validated npm vendoring coordinates (the output of
@@ -729,6 +732,226 @@ pub(super) async fn done_failure_unstage(
         super::common::prune_empty_vendor_levels(&uuid_dir).await;
     }
     done_failure(purl, error)
+}
+
+/// The vendor ledger tail every npm flavor shares once its wiring is on
+/// disk: the informational marker in the uuid dir (a failed write is only
+/// a warning), then `Done` carrying `entry` for the ledger.
+pub(super) async fn finish_vendored(
+    project_root: &Path,
+    coords: &NpmCoords,
+    record: &PatchRecord,
+    vendored_at: &str,
+    result: ApplyResult,
+    entry: VendorEntry,
+    mut warnings: Vec<VendorWarning>,
+) -> VendorOutcome {
+    let marker = VendorMarker::new("npm", &coords.base_purl, record, vendored_at);
+    write_marker_or_warn(
+        &project_root.join(&coords.uuid_dir_rel),
+        &marker,
+        &mut warnings,
+    )
+    .await;
+    done(result, Some(entry), warnings)
+}
+
+/// One npm vendoring request, as every tarball flavor's public entry point
+/// receives it.
+pub(super) struct NpmVendorRequest<'a> {
+    pub purl: &'a str,
+    /// The crawler's `node_modules/<pkg>` dir (or a service-only source);
+    /// read-only — patching happens on a staged copy.
+    pub installed_dir: PackageSource<'a>,
+    pub project_root: &'a Path,
+    pub record: &'a PatchRecord,
+    pub sources: &'a PatchSources<'a>,
+    /// RFC3339 timestamp for the informational marker.
+    pub vendored_at: &'a str,
+    pub dry_run: bool,
+    pub force: bool,
+    pub service: Option<&'a VendorServiceConfig>,
+}
+
+/// What a flavor's wiring step may consult besides its own plan.
+pub(super) struct WireCx<'a> {
+    pub project_root: &'a Path,
+    pub coords: &'a NpmCoords,
+    pub record: &'a PatchRecord,
+    pub service: Option<&'a VendorServiceConfig>,
+}
+
+/// A committed wiring: the records revert replays, plus the one flavor
+/// extra the ledger entry carries.
+#[derive(Default)]
+pub(super) struct NpmCommit {
+    pub wiring: Vec<WiringRecord>,
+    /// pnpm: which override scaffolds this run created.
+    pub pnpm: Option<PnpmMeta>,
+    /// yarn berry: the service's checksum of the tarball, when recorded.
+    pub yarn_berry10c0: Option<String>,
+}
+
+/// The per-flavor half of npm tarball vendoring: the lock grammar's
+/// refusals and its splice. Everything around them — the coordinate guard,
+/// staging, the in-sync return, unstaging on a failed wiring, the
+/// `package.json` warning, the marker and the ledger entry — is
+/// [`vendor_npm_family`]'s, so each cross-flavor rule lives once.
+pub(super) trait NpmLockBackend {
+    /// The flavor's parsed, gated project state, carried from the
+    /// pre-flight to the wiring.
+    type Plan;
+
+    /// The ledger `flavor` (`None` is package-lock's pre-flavor spelling).
+    fn flavor(&self) -> Option<&'static str>;
+
+    /// Read and gate the project BEFORE staging: a refusal leaves the
+    /// project byte-untouched and nothing is fetched or packed.
+    async fn preflight(
+        &self,
+        project_root: &Path,
+        coords: &NpmCoords,
+        warnings: &mut Vec<VendorWarning>,
+    ) -> Result<Self::Plan, Box<VendorOutcome>>;
+
+    /// Splice the staged tarball into the project's wiring and write it,
+    /// restoring whatever it already wrote on failure. `Ok(None)`: every
+    /// surface already points at this artifact (in sync, nothing recorded).
+    /// `Err` is the failure detail; the driver unstages the uuid dir.
+    async fn wire(
+        &self,
+        plan: Self::Plan,
+        cx: &WireCx<'_>,
+        staged: &mut NpmStagedPack,
+        warnings: &mut Vec<VendorWarning>,
+    ) -> Result<Option<NpmCommit>, String>;
+
+    /// The advisory for a patch that rewrites the package's own
+    /// `package.json`, whose mirrors the flavor's lock either recomputes or
+    /// keeps.
+    fn manifest_warning(&self, name: &str, version: &str) -> VendorWarning;
+}
+
+/// Vendor one installed npm package through `backend` (see
+/// [`NpmLockBackend`]). Refuse-early, wire-last: every refusal fires
+/// before any write inside the project and the wiring is the final
+/// mutation. `entry` is `None` for dry runs, failures and the in-sync
+/// re-run (the existing ledger entry stays authoritative; a run never
+/// re-records its own edit as an "original"). The `package.json` advisory
+/// is emitted once, and only by a run that wired something.
+pub(super) async fn vendor_npm_family<B: NpmLockBackend>(
+    backend: &B,
+    req: NpmVendorRequest<'_>,
+) -> VendorOutcome {
+    let NpmVendorRequest {
+        purl,
+        installed_dir,
+        project_root,
+        record,
+        sources,
+        vendored_at,
+        dry_run,
+        force,
+        service,
+    } = req;
+    let mut warnings: Vec<VendorWarning> = Vec::new();
+
+    // Coordinates: fail-closed before any disk access (see
+    // `guard_coordinates` for the security note).
+    let coords = match guard_coordinates(purl, record) {
+        Ok(coords) => coords,
+        Err(outcome) => return *outcome,
+    };
+    let plan = match backend
+        .preflight(project_root, &coords, &mut warnings)
+        .await
+    {
+        Ok(plan) => plan,
+        Err(outcome) => return *outcome,
+    };
+
+    // Stage → patch → pack: tempdir stage outside the project, nested
+    // node_modules prune, bundled-deps refusal, hardened apply,
+    // deterministic pack.
+    let (staged, result) = match stage_patch_pack(
+        purl,
+        installed_dir,
+        project_root,
+        record,
+        sources,
+        dry_run,
+        force,
+        &mut warnings,
+        service,
+    )
+    .await
+    {
+        Ok(pair) => pair,
+        Err(outcome) => return *outcome,
+    };
+    let Some(mut staged) = staged else {
+        // Failed patch (wiring is last, so the project is byte-untouched)
+        // or a dry run (stops after the verify).
+        return done(result, None, warnings);
+    };
+    debug_assert_eq!(
+        (staged.name.as_str(), staged.version.as_str()),
+        (coords.name.as_str(), coords.version.as_str())
+    );
+
+    let cx = WireCx {
+        project_root,
+        coords: &coords,
+        record,
+        service,
+    };
+    let commit = match backend.wire(plan, &cx, &mut staged, &mut warnings).await {
+        Ok(Some(commit)) => commit,
+        Ok(None) => {
+            // In sync: the facts are those of the REUSED committed artifact
+            // (the pipeline wrote nothing) or, when reuse missed, of a fresh
+            // acquisition that reproduced the pinned bytes. Synthesize an
+            // AlreadyPatched-style success and record nothing.
+            return done(
+                already_patched_result(purl, &project_root.join(&staged.rel_tgz), &record.files),
+                None,
+                warnings,
+            );
+        }
+        Err(e) => {
+            return done_failure_unstage(
+                purl,
+                e,
+                project_root,
+                &coords.uuid_dir_rel,
+                staged.uuid_dir_preexisted,
+            )
+            .await
+        }
+    };
+    if staged.staged_pkg_json.is_some() {
+        warnings.push(backend.manifest_warning(&coords.name, &coords.version));
+    }
+
+    let mut entry = VendorEntry::npm(
+        coords.base_purl.clone(),
+        record.uuid.clone(),
+        VendorArtifact::tarball(staged.rel_tgz, &staged.packed),
+        commit.wiring,
+        backend.flavor(),
+    );
+    entry.pnpm = commit.pnpm;
+    entry.artifact.yarn_berry10c0 = commit.yarn_berry10c0;
+    finish_vendored(
+        project_root,
+        &coords,
+        record,
+        vendored_at,
+        result,
+        entry,
+        warnings,
+    )
+    .await
 }
 
 #[cfg(test)]

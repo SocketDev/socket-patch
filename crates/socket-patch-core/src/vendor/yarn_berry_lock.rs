@@ -46,7 +46,7 @@ use sha2::{Digest, Sha256, Sha512};
 use crate::constants::SOCKET_DIR;
 use crate::formats::yarn::berry_entry::{manifest_bin, render_pinned_entry, Pin};
 use crate::manifest::schema::PatchRecord;
-use crate::patch::apply::{normalize_file_path, PatchSources};
+use crate::patch::apply::PatchSources;
 use crate::utils::fs::{
     atomic_write_bytes_preserving_mode, read_regular_to_bytes, read_regular_to_string,
 };
@@ -56,16 +56,15 @@ use crate::utils::uri::encode_uri_component;
 
 #[cfg(test)]
 use super::berry_zip::berry_cache_checksum_10c0;
-use super::common::{already_patched_result, parse_json_manifest, refused, JsonLayout};
+use super::common::{parse_json_manifest, refused, JsonLayout};
 use super::npm_common::{
-    done_failure_unstage, guard_coordinates, guard_revert_uuid_dir, stage_patch_pack, tgz_rel_leaf,
+    guard_revert_uuid_dir, vendor_npm_family, NpmCommit, NpmCoords, NpmLockBackend, NpmStagedPack,
+    NpmVendorRequest, WireCx,
 };
 use super::parse_memo::ParseMemo;
 use super::path::parse_vendor_path;
 use super::source::PackageSource;
-use super::state::{
-    write_marker_or_warn, VendorArtifact, VendorEntry, VendorMarker, WiringAction, WiringRecord,
-};
+use super::state::{VendorEntry, WiringAction, WiringRecord};
 use super::yarn_classic_lock::{
     block_eol, body_field_line, forget_block_scans, lines_to_json, pattern_real_name,
     read_yarn_lock, replace_block, revert_recorded_block, scan_blocks, scan_blocks_shared,
@@ -91,7 +90,9 @@ const SUPPORTED_CACHE_KEY: &str = "10c0";
 
 /// Vendor one installed npm package into a yarn-berry (4.x, cacheKey 10c0)
 /// project. Same contract as [`super::npm_lock::vendor_npm`]: refuse-early,
-/// wire-last; `entry` is `None` for dry runs and the in-sync re-run.
+/// wire-last; `entry` is `None` for dry runs and the in-sync re-run. The
+/// flow is [`vendor_npm_family`]'s; [`YarnBerryBackend`] is the berry lock
+/// grammar.
 #[allow(clippy::too_many_arguments)]
 pub async fn vendor_yarn_berry<'a>(
     purl: &str,
@@ -104,395 +105,353 @@ pub async fn vendor_yarn_berry<'a>(
     force: bool,
     service: Option<&super::VendorServiceConfig>,
 ) -> VendorOutcome {
-    let installed_dir = installed_dir.into();
-    let mut warnings: Vec<VendorWarning> = Vec::new();
-
-    // ── 1. Coordinates (shared fail-closed guard, before any disk access) ─
-    let coords = match guard_coordinates(purl, record) {
-        Ok(coords) => coords,
-        Err(outcome) => return *outcome,
-    };
-    let (name, version) = (coords.name.as_str(), coords.version.as_str());
-    let uuid_dir_rel = coords.uuid_dir_rel.clone();
-    let base_purl = coords.base_purl.clone();
-    let rel_tgz = format!("{}/{}", coords.uuid_dir_rel, tgz_rel_leaf(name, version));
-    // The resolutions spec — `file:./` spelling per the B3 fixture.
-    let spec = format!("file:./{rel_tgz}");
-
-    // ── 2. Lockfile + cacheKey gate ───────────────────────────────────────
-    let lock_text = match read_yarn_lock(project_root).await {
-        Ok(t) => t,
-        Err(outcome) => return *outcome,
-    };
-    // A uniformly CRLF lock (what yarn writes on Windows) is spliced in its
-    // own line ending below; only a mixed one is refused.
-    if let Some(outcome) = refuse_mixed_line_endings(YARN_LOCK, &lock_text) {
-        return outcome;
-    }
-    let blocks = scan_blocks_shared(&lock_text);
-    if let Some(outcome) = refuse_unsupported_cache(&blocks) {
-        return outcome;
-    }
-
-    // ── 3. .yarnrc.yml knobs that change the checksum ───────────────────
-    if let Some(outcome) = refuse_unsupported_compression(project_root).await {
-        return outcome;
-    }
-
-    // ── 4. Root workspace name (the lock key/resolution embed it) ────────
-    let workspace = match root_workspace_gate(&blocks) {
-        Ok(workspace) => workspace,
-        Err(outcome) => return *outcome,
-    };
-
-    // ── 5. package.json + user-override conflict gate ─────────────────────
-    let pkg_path = project_root.join(PACKAGE_JSON);
-    let pkg_bytes = match read_regular_to_bytes(&pkg_path).await {
-        Ok(b) => b,
-        Err(e) => {
-            return refused(
-                "vendor_yarn_berry_manifest_unreadable",
-                format!("cannot read the project {PACKAGE_JSON}: {e}"),
-            );
-        }
-    };
-    // Its layout (BOM, indent, line ending, trailing newline) carries into
-    // the rewritten bytes; a mixed-ending file has none to carry.
-    let pkg_text = String::from_utf8_lossy(&pkg_bytes);
-    if let Some(outcome) = refuse_mixed_line_endings(PACKAGE_JSON, &pkg_text) {
-        return outcome;
-    }
-    let pkg = match PKG_JSON_MEMO.parse(&pkg_bytes, || parse_json_manifest(&pkg_bytes)) {
-        Ok(v) => v,
-        Err(e) => {
-            return refused(
-                "vendor_yarn_berry_manifest_unreadable",
-                format!("{PACKAGE_JSON} is not parseable JSON: {e}"),
-            );
-        }
-    };
-    let Some(pkg_obj) = pkg.as_object() else {
-        return refused(
-            "vendor_yarn_berry_manifest_unreadable",
-            format!("{PACKAGE_JSON} root is not an object"),
-        );
-    };
-    let takeover_original = match resolutions_gate(pkg_obj, name, version) {
-        Ok(takeover_original) => takeover_original,
-        Err(outcome) => return *outcome,
-    };
-
-    // ── 6. The single replaceable lock entry ──────────────────────────────
-    let scan = match scan_berry_target(&blocks, name, version) {
-        Ok(scan) => scan,
-        Err((code, detail)) => return refused(code, detail),
-    };
-    // An `alias@npm:<name>@…` descriptor consumes the patched package under
-    // a different ident; the bare-name resolutions entry vendoring writes
-    // can never move it, so that copy keeps installing the UNPATCHED bytes.
-    // Surface every such entry loudly instead of silently part-patching.
-    for key in &scan.alias_keys {
-        warnings.push(VendorWarning::new(
-            "vendor_alias_entry_skipped",
-            format!(
-                "{YARN_LOCK} entry `{key}` consumes {name}@{version} through an npm: alias; \
-                 the bare-name resolutions entry vendoring writes cannot move aliased \
-                 descriptors, so that copy keeps installing the UNPATCHED registry bytes"
-            ),
-        ));
-    }
-    let (target, target_is_ours) = match target_gate(&scan, name, version) {
-        Ok((idx, is_ours)) => (&blocks[idx], is_ours),
-        Err(outcome) => return *outcome,
-    };
-    let patches_manifest = record
-        .files
-        .keys()
-        .any(|k| normalize_file_path(k) == "package.json");
-
-    // ── 7. Stage → patch → pack (shared flavor-agnostic pipeline) ─────────
-    let (staged, result) = match stage_patch_pack(
-        purl,
-        installed_dir,
-        project_root,
-        record,
-        sources,
-        dry_run,
-        force,
-        &mut warnings,
-        service,
+    vendor_npm_family(
+        &YarnBerryBackend,
+        NpmVendorRequest {
+            purl,
+            installed_dir: installed_dir.into(),
+            project_root,
+            record,
+            sources,
+            vendored_at,
+            dry_run,
+            force,
+            service,
+        },
     )
     .await
-    {
-        Ok(pair) => pair,
-        Err(outcome) => return *outcome,
-    };
-    let Some(staged) = staged else {
-        // Failed patch (wiring is last — project byte-untouched) or dry run.
-        return VendorOutcome::Done {
-            result,
-            entry: None,
-            warnings,
-        };
-    };
-    let uuid_dir_preexisted = staged.uuid_dir_preexisted;
-    debug_assert_eq!(staged.rel_tgz, rel_tgz);
-    let mut packed = staged.packed;
-    let dest = project_root.join(&rel_tgz);
+}
 
-    // ── 8. Berry identity facts of the packed tarball ─────────────────────
-    // A reuse hands over the exact bytes it verified; a fresh pack is
-    // re-read and must still be the bytes the pack hashed (the lock's
-    // checksum and `hash=` are derived from these, so a file swapped after
-    // verification must fail, never be pinned).
-    let reused = staged.verified_bytes.is_some();
-    let tgz_bytes = match staged.verified_bytes {
-        Some(bytes) => bytes,
-        None => match tokio::fs::read(&dest).await {
+/// The yarn-berry half of [`vendor_yarn_berry`].
+struct YarnBerryBackend;
+
+/// [`YarnBerryBackend`]'s pre-flight product: the gated lock and project
+/// `package.json`, and the one lock entry the wiring replaces.
+struct YarnBerryPlan {
+    lock_text: String,
+    blocks: std::sync::Arc<Vec<LockBlock>>,
+    /// The root workspace's name (the lock key/resolution embed it).
+    workspace: String,
+    pkg_bytes: Vec<u8>,
+    pkg: std::sync::Arc<Value>,
+    /// A taken-over user `resolutions` pin's value (see
+    /// [`resolutions_gate`]).
+    takeover_original: Option<String>,
+    /// Index of the replaceable entry in `blocks`.
+    target_idx: usize,
+    /// The entry is already one of our `file:` entries.
+    target_is_ours: bool,
+}
+
+impl NpmLockBackend for YarnBerryBackend {
+    type Plan = YarnBerryPlan;
+
+    fn flavor(&self) -> Option<&'static str> {
+        Some("yarn-berry")
+    }
+
+    async fn preflight(
+        &self,
+        project_root: &Path,
+        coords: &NpmCoords,
+        warnings: &mut Vec<VendorWarning>,
+    ) -> Result<YarnBerryPlan, Box<VendorOutcome>> {
+        let (name, version) = (coords.name.as_str(), coords.version.as_str());
+
+        // ── 2. Lockfile + cacheKey gate ───────────────────────────────────
+        let lock_text = read_yarn_lock(project_root).await?;
+        // A uniformly CRLF lock (what yarn writes on Windows) is spliced in
+        // its own line ending below; only a mixed one is refused.
+        if let Some(outcome) = refuse_mixed_line_endings(YARN_LOCK, &lock_text) {
+            return Err(Box::new(outcome));
+        }
+        let blocks = scan_blocks_shared(&lock_text);
+        if let Some(outcome) = refuse_unsupported_cache(&blocks) {
+            return Err(Box::new(outcome));
+        }
+
+        // ── 3. .yarnrc.yml knobs that change the checksum ───────────────
+        if let Some(outcome) = refuse_unsupported_compression(project_root).await {
+            return Err(Box::new(outcome));
+        }
+
+        // ── 4. Root workspace name (the lock key/resolution embed it) ────
+        let workspace = root_workspace_gate(&blocks)?;
+
+        // ── 5. package.json + user-override conflict gate ─────────────────
+        let pkg_bytes = match read_regular_to_bytes(&project_root.join(PACKAGE_JSON)).await {
             Ok(b) => b,
             Err(e) => {
-                return done_failure_unstage(
-                    purl,
-                    format!("cannot re-read the packed tarball: {e}"),
-                    project_root,
-                    &uuid_dir_rel,
-                    uuid_dir_preexisted,
-                )
-                .await
+                return Err(Box::new(refused(
+                    "vendor_yarn_berry_manifest_unreadable",
+                    format!("cannot read the project {PACKAGE_JSON}: {e}"),
+                )));
             }
-        },
-    };
-    if hex::encode(Sha256::digest(&tgz_bytes)) != packed.sha256_hex {
-        return done_failure_unstage(
-            purl,
-            format!("the packed tarball {rel_tgz} changed on disk after it was verified"),
-            project_root,
-            &uuid_dir_rel,
-            uuid_dir_preexisted,
-        )
-        .await;
+        };
+        // Its layout (BOM, indent, line ending, trailing newline) carries
+        // into the rewritten bytes; a mixed-ending file has none to carry.
+        if let Some(outcome) =
+            refuse_mixed_line_endings(PACKAGE_JSON, &String::from_utf8_lossy(&pkg_bytes))
+        {
+            return Err(Box::new(outcome));
+        }
+        let pkg = match PKG_JSON_MEMO.parse(&pkg_bytes, || parse_json_manifest(&pkg_bytes)) {
+            Ok(v) => v,
+            Err(e) => {
+                return Err(Box::new(refused(
+                    "vendor_yarn_berry_manifest_unreadable",
+                    format!("{PACKAGE_JSON} is not parseable JSON: {e}"),
+                )));
+            }
+        };
+        let Some(pkg_obj) = pkg.as_object() else {
+            return Err(Box::new(refused(
+                "vendor_yarn_berry_manifest_unreadable",
+                format!("{PACKAGE_JSON} root is not an object"),
+            )));
+        };
+        let takeover_original = resolutions_gate(pkg_obj, name, version)?;
+
+        // ── 6. The single replaceable lock entry ──────────────────────────
+        let scan = scan_berry_target(&blocks, name, version)
+            .map_err(|(code, detail)| Box::new(refused(code, detail)))?;
+        // An `alias@npm:<name>@…` descriptor consumes the patched package
+        // under a different ident; the bare-name resolutions entry vendoring
+        // writes can never move it, so that copy keeps installing the
+        // UNPATCHED bytes. Surface every such entry loudly instead of
+        // silently part-patching.
+        for key in &scan.alias_keys {
+            warnings.push(VendorWarning::new(
+                "vendor_alias_entry_skipped",
+                format!(
+                    "{YARN_LOCK} entry `{key}` consumes {name}@{version} through an npm: alias; \
+                     the bare-name resolutions entry vendoring writes cannot move aliased \
+                     descriptors, so that copy keeps installing the UNPATCHED registry bytes"
+                ),
+            ));
+        }
+        let (target_idx, target_is_ours) = target_gate(&scan, name, version)?;
+        Ok(YarnBerryPlan {
+            lock_text,
+            blocks,
+            workspace,
+            pkg_bytes,
+            pkg,
+            takeover_original,
+            target_idx,
+            target_is_ours,
+        })
     }
-    let tgz_sha512 = hex::encode(Sha512::digest(&tgz_bytes));
-    // `hash=` — the first 6 hex chars of sha512(tgz): the lock-committed
-    // tamper guard on the tarball itself (flips on any byte edit).
-    let hash6 = &tgz_sha512[..6];
-    let locator = encode_uri_component(&format!("{workspace}@workspace:."));
-    let resolution = format!("{name}@file:./{rel_tgz}#./{rel_tgz}::hash={hash6}&locator={locator}");
-    // The service is the authority for the checksum of these bytes.
-    let mut service_serves_other_bytes = false;
-    if packed.yarn_berry10c0.is_none() {
-        if let Some(cfg) = service.filter(|cfg| cfg.service_enabled()) {
-            if let super::service_fetch::ServiceArtifact::Ready(archive) =
-                super::service_fetch::fetch_verified_archive(cfg, &record.uuid).await
-            {
-                if hex::encode(Sha256::digest(&archive.bytes)) == packed.sha256_hex {
-                    packed.yarn_berry10c0 = archive.yarn_berry10c0;
-                } else {
-                    service_serves_other_bytes = true;
+
+    async fn wire(
+        &self,
+        plan: YarnBerryPlan,
+        cx: &WireCx<'_>,
+        staged: &mut NpmStagedPack,
+        _warnings: &mut Vec<VendorWarning>,
+    ) -> Result<Option<NpmCommit>, String> {
+        let YarnBerryPlan {
+            lock_text,
+            blocks,
+            workspace,
+            pkg_bytes,
+            pkg,
+            takeover_original,
+            target_idx,
+            target_is_ours,
+        } = plan;
+        let name = cx.coords.name.as_str();
+        let project_root = cx.project_root;
+        let target = &blocks[target_idx];
+        let rel_tgz = staged.rel_tgz.clone();
+        // The resolutions spec — `file:./` spelling per the B3 fixture.
+        let spec = format!("file:./{rel_tgz}");
+        let packed = &mut staged.packed;
+
+        // ── 8. Berry identity facts of the packed tarball ─────────────────
+        // A reuse hands over the exact bytes it verified; a fresh pack is
+        // re-read and must still be the bytes the pack hashed (the lock's
+        // checksum and `hash=` are derived from these, so a file swapped
+        // after verification must fail, never be pinned).
+        let reused = staged.verified_bytes.is_some();
+        let tgz_bytes = match staged.verified_bytes.take() {
+            Some(bytes) => bytes,
+            None => tokio::fs::read(project_root.join(&rel_tgz))
+                .await
+                .map_err(|e| format!("cannot re-read the packed tarball: {e}"))?,
+        };
+        if hex::encode(Sha256::digest(&tgz_bytes)) != packed.sha256_hex {
+            return Err(format!(
+                "the packed tarball {rel_tgz} changed on disk after it was verified"
+            ));
+        }
+        let tgz_sha512 = hex::encode(Sha512::digest(&tgz_bytes));
+        // `hash=` — the first 6 hex chars of sha512(tgz): the lock-committed
+        // tamper guard on the tarball itself (flips on any byte edit).
+        let hash6 = &tgz_sha512[..6];
+        let locator = encode_uri_component(&format!("{workspace}@workspace:."));
+        let resolution =
+            format!("{name}@file:./{rel_tgz}#./{rel_tgz}::hash={hash6}&locator={locator}");
+        // The service is the authority for the checksum of these bytes.
+        let mut service_serves_other_bytes = false;
+        if packed.yarn_berry10c0.is_none() {
+            if let Some(cfg) = cx.service.filter(|cfg| cfg.service_enabled()) {
+                if let super::service_fetch::ServiceArtifact::Ready(archive) =
+                    super::service_fetch::fetch_verified_archive(cfg, &cx.record.uuid).await
+                {
+                    if hex::encode(Sha256::digest(&archive.bytes)) == packed.sha256_hex {
+                        packed.yarn_berry10c0 = archive.yarn_berry10c0;
+                    } else {
+                        service_serves_other_bytes = true;
+                    }
                 }
             }
         }
-    }
-    // A reused ledger entry written before the checksum was recorded (or by
-    // another npm flavor) carries none. When the service cannot vouch
-    // (offline, unavailable, or serving other bytes) but our own lock entry
-    // already pins `hash=` of these verified bytes, it was written from
-    // them, so an in-sync re-run can keep its checksum. Such a checksum only
-    // re-wires; it is never recorded in the ledger.
-    let mut recovered_from_lock = false;
-    if packed.yarn_berry10c0.is_none()
-        && reused
-        && target_is_ours
-        && berry_field(&target.lines, "resolution") == Some(resolution.as_str())
-    {
-        if let Some(c) = berry_field(&target.lines, "checksum") {
-            let full = if c.contains('/') {
-                c.to_string()
-            } else {
-                format!("{SUPPORTED_CACHE_KEY}/{c}")
-            };
-            if valid_berry_checksum(&full) {
-                packed.yarn_berry10c0 = Some(full);
-                recovered_from_lock = true;
+        // A reused ledger entry written before the checksum was recorded (or
+        // by another npm flavor) carries none. When the service cannot vouch
+        // (offline, unavailable, or serving other bytes) but our own lock
+        // entry already pins `hash=` of these verified bytes, it was written
+        // from them, so an in-sync re-run can keep its checksum. Such a
+        // checksum only re-wires; it is never recorded in the ledger.
+        let mut recovered_from_lock = false;
+        if packed.yarn_berry10c0.is_none()
+            && reused
+            && target_is_ours
+            && berry_field(&target.lines, "resolution") == Some(resolution.as_str())
+        {
+            if let Some(c) = berry_field(&target.lines, "checksum") {
+                let full = if c.contains('/') {
+                    c.to_string()
+                } else {
+                    format!("{SUPPORTED_CACHE_KEY}/{c}")
+                };
+                if valid_berry_checksum(&full) {
+                    packed.yarn_berry10c0 = Some(full);
+                    recovered_from_lock = true;
+                }
             }
         }
-    }
-    let checksum = match packed.yarn_berry10c0.as_deref().filter(|c| valid_berry_checksum(c)) {
-        Some(c) => checksum_in_lock_spelling(&lock_text, c),
-        // A reused tarball is kept as is, so retrying cannot help when the
-        // service serves other bytes: only a fresh vendor can wire it.
-        None if reused && service_serves_other_bytes => return done_failure_unstage(purl,
-            format!("the patch service now serves other bytes than the committed {rel_tgz}, and no Yarn Berry checksum is recorded for it; restore yarn.lock from version control, or run `socket-patch vendor --revert` (it reverts every vendored package) and vendor again"),
-            project_root, &uuid_dir_rel, uuid_dir_preexisted).await,
-        None if reused => return done_failure_unstage(purl,
-            format!("no Yarn Berry checksum is recorded for the committed {rel_tgz}; re-run online so the patch service can supply it"),
-            project_root, &uuid_dir_rel, uuid_dir_preexisted).await,
-        None => return done_failure_unstage(purl,
-            format!("the patch service supplied no Yarn Berry checksum for {name}; retry after the server artifact is ready"),
-            project_root, &uuid_dir_rel, uuid_dir_preexisted).await,
-    };
+        let checksum = match packed.yarn_berry10c0.as_deref().filter(|c| valid_berry_checksum(c)) {
+            Some(c) => checksum_in_lock_spelling(&lock_text, c),
+            // A reused tarball is kept as is, so retrying cannot help when
+            // the service serves other bytes: only a fresh vendor can wire it.
+            None if reused && service_serves_other_bytes => return Err(format!("the patch service now serves other bytes than the committed {rel_tgz}, and no Yarn Berry checksum is recorded for it; restore yarn.lock from version control, or run `socket-patch vendor --revert` (it reverts every vendored package) and vendor again")),
+            None if reused => return Err(format!("no Yarn Berry checksum is recorded for the committed {rel_tgz}; re-run online so the patch service can supply it")),
+            None => return Err(format!("the patch service supplied no Yarn Berry checksum for {name}; retry after the server artifact is ready")),
+        };
 
-    // ── 9. The replacement lock entry (verbatim B3 shape) ─────────────────
-    let lock_key = format!("\"{name}@file:./{rel_tgz}::locator={locator}\"");
-    if patches_manifest {
-        warnings.push(VendorWarning::new(
+        // ── 9. The replacement lock entry (verbatim B3 shape) ─────────────
+        let lock_key = format!("\"{name}@file:./{rel_tgz}::locator={locator}\"");
+        // Yarn builds a `file:` entry from the tarball's own package.json,
+        // whose `bin` keeps its published spelling where the registry
+        // entry's is normalized (#718). A tarball without a readable
+        // manifest keeps the registry's map (yarn cannot install it either
+        // way).
+        let tarball_bin = crate::patch::package::read_archive_bytes_to_map(&tgz_bytes)
+            .ok()
+            .and_then(|members| serde_json::from_slice::<Value>(members.get(PACKAGE_JSON)?).ok())
+            .filter(Value::is_object)
+            .map(|manifest| manifest_bin(&manifest));
+        // The exact entry yarn 4 emits for a resolutions-driven `file:`
+        // tarball (the B3 fixture shape), fields in yarn's order (#697).
+        let lock_key_line = format!("{lock_key}:");
+        let new_lines = render_pinned_entry(
+            &target.lines[1..],
+            &Pin {
+                key_line: &lock_key_line,
+                resolution: &resolution,
+                checksum: Some(&checksum),
+                bin: tarball_bin.as_ref(),
+            },
+        );
+
+        // ── 10. In-sync hot path: nothing to write, nothing to record ─────
+        let pkg_obj = pkg.as_object().expect("validated in the pre-flight");
+        let existing_res = pkg_obj.get("resolutions").and_then(|r| r.get(name));
+        let pkg_in_sync = existing_res.and_then(Value::as_str) == Some(spec.as_str());
+        if pkg_in_sync && target_is_ours && target.lines == new_lines {
+            return Ok(None);
+        }
+
+        // ── 11. Build both new byte images, then commit pkg-first/lock-second
+        let existing_entry = existing_res.is_some();
+        let mut new_pkg = (*pkg).clone();
+        {
+            let obj = new_pkg.as_object_mut().expect("validated above");
+            let res = obj
+                .entry("resolutions".to_string())
+                .or_insert_with(|| Value::Object(serde_json::Map::new()));
+            let Some(res_obj) = res.as_object_mut() else {
+                return Err("resolutions table vanished mid-edit".to_string());
+            };
+            res_obj.insert(name.to_string(), Value::String(spec.clone()));
+        }
+        let new_pkg_bytes = JsonLayout::of(&String::from_utf8_lossy(&pkg_bytes))
+            .render(&new_pkg)
+            .map_err(|e| format!("cannot serialize {PACKAGE_JSON}: {e}"))?;
+        let new_lock_text = replace_block(
+            &lock_text,
+            target,
+            &new_lines,
+            block_eol(&lock_text, target),
+        );
+        commit_pair(
+            project_root,
+            &new_pkg_bytes,
+            &pkg_bytes,
+            new_lock_text.as_bytes(),
+        )
+        .await?;
+
+        let wiring = vec![
+            WiringRecord {
+                file: PACKAGE_JSON.to_string(),
+                kind: KIND_RESOLUTION.to_string(),
+                // Rewritten when replacing our own stale entry (no
+                // `original` — never record our own edit as a pre-vendor
+                // fragment) or a taken-over user pin (whose value IS the
+                // `original`, restored verbatim on revert).
+                action: if existing_entry {
+                    WiringAction::Rewritten
+                } else {
+                    WiringAction::Added
+                },
+                key: Some(name.to_string()),
+                original: takeover_original.map(Value::String),
+                new: Some(Value::String(spec)),
+            },
+            WiringRecord {
+                file: YARN_LOCK.to_string(),
+                kind: KIND_LOCK_ENTRY.to_string(),
+                action: WiringAction::Rewritten,
+                key: Some(lock_key),
+                original: if target_is_ours {
+                    None
+                } else {
+                    Some(lines_to_json(&target.lines))
+                },
+                new: Some(lines_to_json(&new_lines)),
+            },
+        ];
+        Ok(Some(NpmCommit {
+            wiring,
+            yarn_berry10c0: packed
+                .yarn_berry10c0
+                .clone()
+                .filter(|_| !recovered_from_lock),
+            ..NpmCommit::default()
+        }))
+    }
+
+    fn manifest_warning(&self, name: &str, version: &str) -> VendorWarning {
+        VendorWarning::new(
             "vendor_dep_manifest_stale",
             format!(
                 "the patch rewrites {name}@{version}'s package.json; the yarn.lock entry \
                  keeps the registry entry's dependency fields — if the patch changed \
                  dependencies, run `yarn install` once to refresh them"
             ),
-        ));
-    }
-    // Yarn builds a `file:` entry from the tarball's own package.json, whose
-    // `bin` keeps its published spelling where the registry entry's is
-    // normalized (#718). A tarball without a readable manifest keeps the
-    // registry's map (yarn cannot install it either way).
-    let tarball_bin = crate::patch::package::read_archive_bytes_to_map(&tgz_bytes)
-        .ok()
-        .and_then(|members| serde_json::from_slice::<Value>(members.get(PACKAGE_JSON)?).ok())
-        .filter(Value::is_object)
-        .map(|manifest| manifest_bin(&manifest));
-    // The exact entry yarn 4 emits for a resolutions-driven `file:` tarball
-    // (the B3 fixture shape), fields in yarn's order (#697).
-    let lock_key_line = format!("{lock_key}:");
-    let new_lines = render_pinned_entry(
-        &target.lines[1..],
-        &Pin {
-            key_line: &lock_key_line,
-            resolution: &resolution,
-            checksum: Some(&checksum),
-            bin: tarball_bin.as_ref(),
-        },
-    );
-
-    // ── 10. In-sync hot path: nothing to write, nothing to record ─────────
-    let existing_res = pkg_obj.get("resolutions").and_then(|r| r.get(name));
-    let pkg_in_sync = existing_res.and_then(Value::as_str) == Some(spec.as_str());
-    if pkg_in_sync && target_is_ours && target.lines == new_lines {
-        return VendorOutcome::Done {
-            result: already_patched_result(purl, &dest, &record.files),
-            entry: None,
-            warnings,
-        };
-    }
-
-    // ── 11. Build both new byte images, then commit pkg-first/lock-second ─
-    let existing_entry = existing_res.is_some();
-    let mut new_pkg = (*pkg).clone();
-    {
-        let obj = new_pkg.as_object_mut().expect("validated above");
-        let res = obj
-            .entry("resolutions".to_string())
-            .or_insert_with(|| Value::Object(serde_json::Map::new()));
-        let Some(res_obj) = res.as_object_mut() else {
-            return done_failure_unstage(
-                purl,
-                "resolutions table vanished mid-edit".to_string(),
-                project_root,
-                &uuid_dir_rel,
-                uuid_dir_preexisted,
-            )
-            .await;
-        };
-        res_obj.insert(name.to_string(), Value::String(spec.clone()));
-    }
-    let new_pkg_bytes = match JsonLayout::of(&pkg_text).render(&new_pkg) {
-        Ok(b) => b,
-        Err(e) => {
-            return done_failure_unstage(
-                purl,
-                format!("cannot serialize {PACKAGE_JSON}: {e}"),
-                project_root,
-                &uuid_dir_rel,
-                uuid_dir_preexisted,
-            )
-            .await
-        }
-    };
-    let new_lock_text = replace_block(
-        &lock_text,
-        target,
-        &new_lines,
-        block_eol(&lock_text, target),
-    );
-    if let Err(e) = commit_pair(
-        project_root,
-        &new_pkg_bytes,
-        &pkg_bytes,
-        new_lock_text.as_bytes(),
-    )
-    .await
-    {
-        return done_failure_unstage(purl, e, project_root, &uuid_dir_rel, uuid_dir_preexisted)
-            .await;
-    }
-
-    // ── 12. Marker + ledger entry ─────────────────────────────────────────
-    let marker = VendorMarker::new("npm", &base_purl, record, vendored_at);
-    write_marker_or_warn(&project_root.join(&uuid_dir_rel), &marker, &mut warnings).await;
-
-    let wiring = vec![
-        WiringRecord {
-            file: PACKAGE_JSON.to_string(),
-            kind: KIND_RESOLUTION.to_string(),
-            // Rewritten when replacing our own stale entry (no `original` —
-            // never record our own edit as a pre-vendor fragment) or a
-            // taken-over user pin (whose value IS the `original`, restored
-            // verbatim on revert).
-            action: if existing_entry {
-                WiringAction::Rewritten
-            } else {
-                WiringAction::Added
-            },
-            key: Some(name.to_string()),
-            original: takeover_original.map(Value::String),
-            new: Some(Value::String(spec)),
-        },
-        WiringRecord {
-            file: YARN_LOCK.to_string(),
-            kind: KIND_LOCK_ENTRY.to_string(),
-            action: WiringAction::Rewritten,
-            key: Some(lock_key),
-            original: if target_is_ours {
-                None
-            } else {
-                Some(lines_to_json(&target.lines))
-            },
-            new: Some(lines_to_json(&new_lines)),
-        },
-    ];
-    let entry = VendorEntry {
-        ecosystem: "npm".to_string(),
-        base_purl,
-        uuid: record.uuid.clone(),
-        artifact: VendorArtifact {
-            yarn_berry10c0: packed
-                .yarn_berry10c0
-                .clone()
-                .filter(|_| !recovered_from_lock),
-            path: rel_tgz,
-            sha256: packed.sha256_hex,
-            size: Some(packed.size),
-            platform_locked: None,
-            file_inventory: None,
-        },
-        wiring,
-        lock: None,
-        took_over_go_patches: false,
-        detached: false,
-        record: None,
-        flavor: Some("yarn-berry".to_string()),
-        uv: None,
-        pnpm: None,
-        poetry: None,
-        pdm: None,
-        pipenv: None,
-    };
-    VendorOutcome::Done {
-        result,
-        entry: Some(entry),
-        warnings,
+        )
     }
 }
 
@@ -2319,6 +2278,39 @@ __metadata:
             )),
             "sub-map carried between resolution and checksum: {text}"
         );
+    }
+
+    /// #920: the `package.json` advisory is emitted once, by the run that
+    /// wires — an in-sync re-run of a manifest-rewriting patch is a quiet
+    /// AlreadyPatched.
+    #[tokio::test]
+    async fn manifest_rewriting_rerun_is_in_sync_without_the_manifest_warning() {
+        let mut fx = fixture().await;
+        let before: &[u8] = br#"{"name":"left-pad","version":"1.3.0"}"#;
+        let after: &[u8] = br#"{"name":"left-pad","version":"1.3.0","sideEffects":false}"#;
+        let after_hash = compute_git_sha256_from_bytes(after);
+        tokio::fs::write(fx.root().join(".socket/blobs").join(&after_hash), after)
+            .await
+            .unwrap();
+        fx.record.files.insert(
+            "package/package.json".to_string(),
+            PatchFileInfo {
+                before_hash: compute_git_sha256_from_bytes(before),
+                after_hash,
+            },
+        );
+        let (result, entry, warnings) = expect_done(fx.vendor(false).await);
+        assert!(result.success && entry.is_some(), "{:?}", result.error);
+        let manifest_warnings = |w: &[VendorWarning]| {
+            w.iter()
+                .filter(|w| w.code.starts_with("vendor_dep_manifest"))
+                .count()
+        };
+        assert_eq!(manifest_warnings(&warnings), 1, "{warnings:?}");
+
+        let (result, entry, warnings) = expect_done(fx.vendor(false).await);
+        assert!(result.success && entry.is_none(), "{:?}", result.error);
+        assert_eq!(manifest_warnings(&warnings), 0, "{warnings:?}");
     }
 
     /// #697: yarn writes `checksum:` after `bin:` and before `conditions:`

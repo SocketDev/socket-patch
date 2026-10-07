@@ -63,18 +63,15 @@ use crate::utils::fs::{
 };
 use crate::utils::socket_dir::remove_tree_and_prune;
 
-use super::common::{already_patched_result, done, parse_json_manifest, refused, JsonLayout};
+use super::common::{parse_json_manifest, refused, JsonLayout};
 use super::npm_common::{
-    done_failure_unstage, gate_packages, guard_coordinates, guard_revert_uuid_dir, refusal_code,
-    stage_patch_pack, tgz_rel_leaf,
+    gate_packages, guard_revert_uuid_dir, refusal_code, tgz_rel_leaf, vendor_npm_family, NpmCommit,
+    NpmCoords, NpmLockBackend, NpmStagedPack, NpmVendorRequest, WireCx,
 };
 use super::parse_memo::ParseMemo;
 use super::path::parse_vendor_path;
 use super::source::PackageSource;
-use super::state::{
-    write_marker_or_warn, PnpmMeta, VendorArtifact, VendorEntry, VendorMarker, WiringAction,
-    WiringRecord,
-};
+use super::state::{PnpmMeta, VendorEntry, WiringAction, WiringRecord};
 use super::{RevertOpts, RevertOutcome, VendorOutcome, VendorWarning};
 use crate::constants::npm_family::PNPM_LOCK;
 use crate::formats::pnpm::lines::{
@@ -178,252 +175,189 @@ pub(super) async fn vendor_pnpm_dialect(
     service: Option<&super::VendorServiceConfig>,
     dialect: PnpmDialect,
 ) -> VendorOutcome {
-    let mut warnings: Vec<VendorWarning> = Vec::new();
-
-    // ── 1. Coordinates (shared fail-closed guard) ─────────────────────────
-    let coords = match guard_coordinates(purl, record) {
-        Ok(coords) => coords,
-        Err(outcome) => return *outcome,
-    };
-    let (name, version) = (coords.name.as_str(), coords.version.as_str());
-    let rel_tgz = format!("{}/{}", coords.uuid_dir_rel, tgz_rel_leaf(name, version));
-    // pnpm spells the override target `file:<root-relative path>` with NO
-    // `./` (spike P1 fixtures, verbatim).
-    let spec = format!("file:{rel_tgz}");
-    let override_key = format!("{name}@{version}");
-
-    // ── 2. Read the pair (refuse before any write) ───────────────────────
-    let project = match read_project(project_root, dialect).await {
-        Ok(project) => project,
-        Err(outcome) => return *outcome,
-    };
-
-    // ── 3. Pre-flight refusals (override conflicts, entry present) ───────
-    let effective_key = match preflight_package(&project, name, version, &override_key) {
-        Ok(key) => key,
-        Err(outcome) => return *outcome,
-    };
-    let PnpmProject {
-        pkg_bytes,
-        mut pkg,
-        mut lock,
-        ws_text,
-    } = project;
-
-    // ── 4. Stage → patch → pack (shared flavor-agnostic pipeline) ────────
-    let (staged, result) = match stage_patch_pack(
-        purl,
-        installed_dir,
-        project_root,
-        record,
-        sources,
-        dry_run,
-        force,
-        &mut warnings,
-        service,
+    vendor_npm_family(
+        &PnpmBackend { dialect },
+        NpmVendorRequest {
+            purl,
+            installed_dir,
+            project_root,
+            record,
+            sources,
+            vendored_at,
+            dry_run,
+            force,
+            service,
+        },
     )
     .await
-    {
-        Ok(pair) => pair,
-        Err(outcome) => return *outcome,
-    };
-    let Some(staged) = staged else {
-        // Failed patch or dry run: wiring never ran, project byte-untouched.
-        return done(result, None, warnings);
-    };
-    let uuid_dir_preexisted = staged.uuid_dir_preexisted;
-    debug_assert_eq!(staged.rel_tgz, rel_tgz);
-    let packed = staged.packed;
-    if staged.staged_pkg_json.is_some() {
+}
+
+/// The pnpm half of [`vendor_pnpm`] (both lock dialects).
+struct PnpmBackend {
+    dialect: PnpmDialect,
+}
+
+/// [`PnpmBackend`]'s pre-flight product: the gated project and the
+/// override key the wiring writes under.
+struct PnpmPlan {
+    project: PnpmProject,
+    effective_key: String,
+}
+
+impl NpmLockBackend for PnpmBackend {
+    type Plan = PnpmPlan;
+
+    fn flavor(&self) -> Option<&'static str> {
+        Some(self.dialect.flavor())
+    }
+
+    async fn preflight(
+        &self,
+        project_root: &Path,
+        coords: &NpmCoords,
+        _warnings: &mut Vec<VendorWarning>,
+    ) -> Result<PnpmPlan, Box<VendorOutcome>> {
+        let override_key = format!("{}@{}", coords.name, coords.version);
+
+        // ── 2. Read the pair (refuse before any write) ───────────────────
+        let project = read_project(project_root, self.dialect).await?;
+
+        // ── 3. Pre-flight refusals (override conflicts, entry present) ───
+        let effective_key =
+            preflight_package(&project, &coords.name, &coords.version, &override_key)?;
+        Ok(PnpmPlan {
+            project,
+            effective_key,
+        })
+    }
+
+    async fn wire(
+        &self,
+        plan: PnpmPlan,
+        cx: &WireCx<'_>,
+        staged: &mut NpmStagedPack,
+        warnings: &mut Vec<VendorWarning>,
+    ) -> Result<Option<NpmCommit>, String> {
+        let dialect = self.dialect;
+        let project_root = cx.project_root;
+        let PnpmPlan {
+            project:
+                PnpmProject {
+                    pkg_bytes,
+                    mut pkg,
+                    mut lock,
+                    ws_text,
+                },
+            effective_key,
+        } = plan;
+        let rel_tgz = staged.rel_tgz.as_str();
+        // pnpm spells the override target `file:<root-relative path>` with
+        // NO `./` (spike P1 fixtures, verbatim).
+        let spec = format!("file:{rel_tgz}");
+
+        // ── 5. Compute both edits in memory (nothing written yet) ────────
+        let ctx = EditCtx {
+            name: &cx.coords.name,
+            version: &cx.coords.version,
+            rel_tgz,
+            spec: &spec,
+            integrity: &staged.packed.integrity,
+            override_key: &effective_key,
+        };
+        let mut wiring: Vec<WiringRecord> = Vec::new();
+
+        // The package.json copy is a back-compat surface for pnpm that reads
+        // overrides only from package.json. When the lock shows the
+        // project's pnpm reads them from pnpm-workspace.yaml, a new
+        // package.json `pnpm.overrides` would REPLACE the user's workspace
+        // overrides on pnpm 10 (#360), so only the workspace file and the
+        // lock are wired.
+        let skip_pkg_copy = dialect == PnpmDialect::V9
+            && workspace_overrides_govern(&pkg, ws_text.as_deref(), lock.lines());
+        let (pkg_changed, created_pnpm_table, created_overrides_table) = if skip_pkg_copy {
+            (false, false, false)
+        } else {
+            apply_pkg_override(&mut pkg, &effective_key, &spec, &mut wiring)?
+        };
+        let (lock_changed, lock_warning) = lock
+            .edit(&ctx, &mut wiring)
+            .map_err(|e| format!("{PNPM_LOCK} surgery failed: {e}"))?;
+
+        // Only modern locks mirror overrides into pnpm-workspace.yaml.
+        // Legacy pnpm reads package.json alone; creating a workspace changes
+        // its mode.
+        let ws_edit = if dialect == PnpmDialect::V9 {
+            apply_workspace_override(ws_text.as_deref(), &effective_key, &spec, &mut wiring)
+                .map_err(|e| format!("{PNPM_WORKSPACE} surgery failed: {e}"))?
+        } else {
+            WorkspaceEdit::default()
+        };
+
+        if !pkg_changed && !lock_changed && ws_edit.new_text.is_none() {
+            // Everything already carries this uuid + the packed integrity:
+            // the project is in sync.
+            return Ok(None);
+        }
+
+        if let Some(warning) = lock_warning {
+            warnings.push(warning);
+        }
+
+        // ── 6. Commit: package.json + pnpm-workspace.yaml FIRST, lock
+        //    second, unwind the override surfaces on a lock failure (P3
+        //    desync safety). Re-render package.json in its own layout (BOM,
+        //    indent, line ending, trailer) so a Windows / autocrlf manifest
+        //    diffs only in the override.
+        let new_pkg_bytes = JsonLayout::of(&String::from_utf8_lossy(&pkg_bytes))
+            .render(&pkg)
+            .map_err(|e| format!("cannot serialize {PACKAGE_JSON}: {e}"))?;
+        let lock_out = lock.lines().join("\n");
+        commit_surfaces(
+            project_root,
+            pkg_changed.then_some(new_pkg_bytes.as_slice()),
+            &pkg_bytes,
+            ws_edit.new_text.as_deref().map(str::as_bytes),
+            ws_text.as_deref().map(str::as_bytes),
+            ws_edit.created_file,
+            lock_changed.then_some(lock_out.as_bytes()),
+        )
+        .await?;
+        if lock_changed {
+            // Re-seed the memo with the lock just written, so the next
+            // package reads it back without re-splitting it. Only when the
+            // split of those bytes is provably these lines (no line carries
+            // a `\n`); otherwise the next read simply misses.
+            if let ProjectLock::V9(LockLines::Owned(written)) = lock {
+                if !written.iter().any(|l| l.contains('\n')) {
+                    LOCK_MEMO.store(lock_out.into_bytes(), LockDoc::new(written));
+                }
+            }
+        }
+        Ok(Some(NpmCommit {
+            wiring,
+            pnpm: Some(PnpmMeta {
+                created_overrides_table,
+                created_pnpm_table,
+                created_workspace_file: ws_edit.created_file,
+                created_workspace_overrides: ws_edit.created_overrides,
+            }),
+            ..NpmCommit::default()
+        }))
+    }
+
+    fn manifest_warning(&self, name: &str, version: &str) -> VendorWarning {
         // pnpm snapshots mirror the package's own dependency maps; the spike
         // has no fixture for a manifest-rewriting patch, so the mirrors are
         // preserved verbatim and the user is told to re-resolve.
-        warnings.push(VendorWarning::new(
+        VendorWarning::new(
             "vendor_dep_manifest_stale",
             format!(
                 "the patch rewrites {name}@{version}'s package.json; pnpm-lock.yaml's \
                  dependency mirrors were preserved verbatim — if the patch changed \
                  dependency ranges, run `pnpm install` to re-resolve them"
             ),
-        ));
-    }
-
-    // ── 5. Compute both edits in memory (nothing written yet) ────────────
-    let ctx = EditCtx {
-        name,
-        version,
-        rel_tgz: &rel_tgz,
-        spec: &spec,
-        integrity: &packed.integrity,
-        override_key: &effective_key,
-    };
-    let mut wiring: Vec<WiringRecord> = Vec::new();
-
-    // The package.json copy is a back-compat surface for pnpm that reads
-    // overrides only from package.json. When the lock shows the project's
-    // pnpm reads them from pnpm-workspace.yaml, a new package.json
-    // `pnpm.overrides` would REPLACE the user's workspace overrides on
-    // pnpm 10 (#360), so only the workspace file and the lock are wired.
-    let skip_pkg_copy = dialect == PnpmDialect::V9
-        && workspace_overrides_govern(&pkg, ws_text.as_deref(), lock.lines());
-    let (pkg_changed, created_pnpm_table, created_overrides_table) = if skip_pkg_copy {
-        (false, false, false)
-    } else {
-        match apply_pkg_override(&mut pkg, &effective_key, &spec, &mut wiring) {
-            Ok(out) => out,
-            Err(e) => {
-                return done_failure_unstage(
-                    purl,
-                    e,
-                    project_root,
-                    &coords.uuid_dir_rel,
-                    uuid_dir_preexisted,
-                )
-                .await
-            }
-        }
-    };
-    let (lock_changed, lock_warning) = match lock.edit(&ctx, &mut wiring) {
-        Ok(edit) => edit,
-        Err(e) => {
-            return done_failure_unstage(
-                purl,
-                format!("{PNPM_LOCK} surgery failed: {e}"),
-                project_root,
-                &coords.uuid_dir_rel,
-                uuid_dir_preexisted,
-            )
-            .await
-        }
-    };
-
-    // Only modern locks mirror overrides into pnpm-workspace.yaml. Legacy
-    // pnpm reads package.json alone; creating a workspace changes its mode.
-    let ws_edit = if dialect == PnpmDialect::V9 {
-        match apply_workspace_override(ws_text.as_deref(), &effective_key, &spec, &mut wiring) {
-            Ok(edit) => edit,
-            Err(e) => {
-                return done_failure_unstage(
-                    purl,
-                    format!("{PNPM_WORKSPACE} surgery failed: {e}"),
-                    project_root,
-                    &coords.uuid_dir_rel,
-                    uuid_dir_preexisted,
-                )
-                .await
-            }
-        }
-    } else {
-        WorkspaceEdit::default()
-    };
-
-    if !pkg_changed && !lock_changed && ws_edit.new_text.is_none() {
-        // Everything already carries this uuid + the packed integrity: the
-        // project is in sync. The integrity is that of the reused committed
-        // tarball (the shared pipeline wrote nothing) or, when reuse missed,
-        // of a fresh acquisition that reproduced the pinned bytes;
-        // synthesize AlreadyPatched and record nothing (the existing ledger
-        // entry stays authoritative).
-        return done(
-            already_patched_result(purl, &project_root.join(&rel_tgz), &record.files),
-            None,
-            warnings,
-        );
-    }
-
-    if let Some(warning) = lock_warning {
-        warnings.push(warning);
-    }
-
-    // ── 6. Commit: package.json + pnpm-workspace.yaml FIRST, lock second,
-    //    unwind the override surfaces on a lock failure (P3 desync safety).
-    // Re-render package.json in its own layout (BOM, indent, line ending,
-    // trailer) so a Windows / autocrlf manifest diffs only in the override.
-    let new_pkg_bytes = match JsonLayout::of(&String::from_utf8_lossy(&pkg_bytes)).render(&pkg) {
-        Ok(bytes) => bytes,
-        Err(e) => {
-            return done_failure_unstage(
-                purl,
-                format!("cannot serialize {PACKAGE_JSON}: {e}"),
-                project_root,
-                &coords.uuid_dir_rel,
-                uuid_dir_preexisted,
-            )
-            .await
-        }
-    };
-    let lock_out = lock.lines().join("\n");
-    if let Err(e) = commit_surfaces(
-        project_root,
-        pkg_changed.then_some(new_pkg_bytes.as_slice()),
-        &pkg_bytes,
-        ws_edit.new_text.as_deref().map(str::as_bytes),
-        ws_text.as_deref().map(str::as_bytes),
-        ws_edit.created_file,
-        lock_changed.then_some(lock_out.as_bytes()),
-    )
-    .await
-    {
-        return done_failure_unstage(
-            purl,
-            e,
-            project_root,
-            &coords.uuid_dir_rel,
-            uuid_dir_preexisted,
         )
-        .await;
     }
-    if lock_changed {
-        // Re-seed the memo with the lock just written, so the next package
-        // reads it back without re-splitting it. Only when the split of
-        // those bytes is provably these lines (no line carries a `\n`);
-        // otherwise the next read simply misses.
-        if let ProjectLock::V9(LockLines::Owned(written)) = lock {
-            if !written.iter().any(|l| l.contains('\n')) {
-                LOCK_MEMO.store(lock_out.into_bytes(), LockDoc::new(written));
-            }
-        }
-    }
-
-    // ── 7. Marker + ledger entry ─────────────────────────────────────────
-    let marker = VendorMarker::new("npm", &coords.base_purl, record, vendored_at);
-    write_marker_or_warn(
-        &project_root.join(&coords.uuid_dir_rel),
-        &marker,
-        &mut warnings,
-    )
-    .await;
-
-    let entry = VendorEntry {
-        ecosystem: "npm".to_string(),
-        base_purl: coords.base_purl,
-        uuid: record.uuid.clone(),
-        artifact: VendorArtifact {
-            yarn_berry10c0: None,
-            path: rel_tgz,
-            sha256: packed.sha256_hex,
-            size: Some(packed.size),
-            platform_locked: None,
-            file_inventory: None,
-        },
-        wiring,
-        lock: None,
-        took_over_go_patches: false,
-        detached: false,
-        record: None,
-        flavor: Some(dialect.flavor().to_string()),
-        uv: None,
-        pnpm: Some(PnpmMeta {
-            created_overrides_table,
-            created_pnpm_table,
-            created_workspace_file: ws_edit.created_file,
-            created_workspace_overrides: ws_edit.created_overrides,
-        }),
-        poetry: None,
-        pdm: None,
-        pipenv: None,
-    };
-    done(result, Some(entry), warnings)
 }
 
 /// The pair the pnpm wiring edits, read and structurally gated before any
@@ -7913,6 +7847,39 @@ snapshots:
             .read(PNPM_LOCK)
             .await
             .contains(&format!("  left-pad@file:{}:", fx.rel_tgz())));
+    }
+
+    /// #920: the `package.json` advisory is emitted once, by the run that
+    /// wires — an in-sync re-run of a manifest-rewriting patch is a quiet
+    /// AlreadyPatched.
+    #[tokio::test]
+    async fn manifest_rewriting_rerun_is_in_sync_without_the_manifest_warning() {
+        let mut fx = fixture_with(P1_BEFORE_PKG, P1_BEFORE_LOCK).await;
+        let before: &[u8] = br#"{"name":"left-pad","version":"1.3.0"}"#;
+        let after: &[u8] = br#"{"name":"left-pad","version":"1.3.0","sideEffects":false}"#;
+        let after_hash = compute_git_sha256_from_bytes(after);
+        tokio::fs::write(fx.root().join(".socket/blobs").join(&after_hash), after)
+            .await
+            .unwrap();
+        fx.record.files.insert(
+            "package/package.json".to_string(),
+            PatchFileInfo {
+                before_hash: compute_git_sha256_from_bytes(before),
+                after_hash,
+            },
+        );
+        let (result, entry, warnings) = expect_done(fx.vendor(false).await);
+        assert!(result.success && entry.is_some(), "{:?}", result.error);
+        let manifest_warnings = |w: &[VendorWarning]| {
+            w.iter()
+                .filter(|w| w.code.starts_with("vendor_dep_manifest"))
+                .count()
+        };
+        assert_eq!(manifest_warnings(&warnings), 1, "{warnings:?}");
+
+        let (result, entry, warnings) = expect_done(fx.vendor(false).await);
+        assert!(result.success && entry.is_none(), "{:?}", result.error);
+        assert_eq!(manifest_warnings(&warnings), 0, "{warnings:?}");
     }
 
     // ── parser + revert-uuid guard micro edges ──────────────────────────────
