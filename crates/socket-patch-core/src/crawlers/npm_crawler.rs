@@ -992,6 +992,47 @@ fn list_dir_sync(path: &Path) -> Listing {
     }
 }
 
+/// The `node_modules` roots a global prefix stands for. pnpm 11+ gives
+/// every `pnpm add -g` its own install, `$PNPM_HOME/global/v11/<hash>/`,
+/// each with its own `node_modules` (and its own `.pnpm` on pnpm 12, or
+/// with `enableGlobalVirtualStore: false`), and `pnpm root -g` prints
+/// their parent. Walked as one root, the installs share one
+/// `resolve_pending_targets` pass, whose store-entry filter drops a
+/// target from every later `.pnpm` once any install matched it, so the
+/// other installs' copies were silently missed (#435). Each install is
+/// therefore its own root.
+///
+/// `prefix` splits only when it is a layout-version dir (`v<N>`) that is
+/// not itself a `node_modules` (no `.modules.yaml` or `.pnpm`) and at
+/// least one child's `node_modules` carries pnpm's `.modules.yaml`. Every
+/// child `node_modules` is then a root, marked or not, so an interrupted
+/// install is still walked, in sorted order and deduplicated by real
+/// path. Anything else (pnpm <= 10's `global/5/node_modules`, an npm or
+/// custom prefix) is returned as the single root it always was.
+fn pnpm_isolated_global_install_roots(prefix: &Path) -> Vec<PathBuf> {
+    let single = || vec![prefix.to_path_buf()];
+    let is_version_dir = prefix
+        .file_name()
+        .and_then(|n| n.to_str())
+        .is_some_and(crate::patch::shared_store::is_pnpm_store_version_dir);
+    if !is_version_dir || prefix.join(".modules.yaml").exists() || prefix.join(".pnpm").exists() {
+        return single();
+    }
+    let mut installs: Vec<PathBuf> = list_dir_sync(prefix)
+        .entries
+        .into_iter()
+        .map(|entry| prefix.join(entry.name).join("node_modules"))
+        .filter(|nm| is_dir_sync(nm))
+        .collect();
+    if !installs.iter().any(|nm| nm.join(".modules.yaml").is_file()) {
+        return single();
+    }
+    installs.sort();
+    let mut seen = HashSet::new();
+    installs.retain(|nm| seen.insert(std::fs::canonicalize(nm).unwrap_or_else(|_| nm.clone())));
+    installs
+}
+
 /// Whether `dir/node_modules` is a directory, following symlinks — the
 /// workspace roots walk's `is_dir` probe — skipping the stat when `dir`'s
 /// own listing (which the walk reads anyway) already proves the answer is
@@ -1601,6 +1642,9 @@ impl NpmCrawler {
                 // engine's fan-out job, and re-probing the store for it would
                 // add a readdir storm. A target with no importer-tree copy
                 // (transitive-only) still gets its store entries probed.
+                // The filter is walk-wide, so it is only sound within ONE
+                // install: separate pnpm installs must be separate roots
+                // (see `pnpm_isolated_global_install_roots`, #435).
                 let unmatched_names: HashSet<&str> = pending
                     .iter()
                     .filter(|t| !result.contains_key(&t.purl))
@@ -1983,7 +2027,9 @@ impl NpmCrawler {
             add(PathBuf::from(npm_path));
         }
         if let Some(pnpm_path) = get_pnpm_global_prefix() {
-            add(PathBuf::from(pnpm_path));
+            for root in pnpm_isolated_global_install_roots(Path::new(&pnpm_path)) {
+                add(root);
+            }
         }
         if let Some(yarn_path) = get_yarn_global_prefix() {
             add(PathBuf::from(yarn_path));
@@ -2038,7 +2084,7 @@ impl NpmCrawler {
     fn node_modules_paths_sync(options: &CrawlerOptions) -> Vec<PathBuf> {
         if options.global || options.global_prefix.is_some() {
             if let Some(ref custom) = options.global_prefix {
-                return vec![custom.clone()];
+                return pnpm_isolated_global_install_roots(custom);
             }
             return NpmCrawler.get_global_node_modules_paths();
         }
@@ -6351,5 +6397,122 @@ mod tests {
             .recv_timeout(std::time::Duration::from_secs(10))
             .expect("a FIFO .yarnrc must not block root discovery");
         assert_eq!(roots, vec![root.join("node_modules")]);
+    }
+
+    /// One pnpm 11+ isolated global install, `<v11>/<hash>/node_modules`,
+    /// with its `.modules.yaml` marker (when `marked`) and its own
+    /// `.pnpm` virtual store holding a real `left-pad@1.3.0`. `direct`
+    /// links `left-pad` at the install's top level; otherwise it is
+    /// reached only through `lp-wrapper` (a transitive-only copy).
+    fn write_pnpm_global_install(v11: &Path, hash: &str, direct: bool, marked: bool) -> PathBuf {
+        let nm = v11.join(hash).join("node_modules");
+        let store = nm.join(".pnpm");
+        let pad = store.join("left-pad@1.3.0/node_modules/left-pad");
+        write_pkg(&pad, "left-pad", "1.3.0");
+        std::fs::write(v11.join(hash).join("package.json"), "{}").unwrap();
+        if marked {
+            std::fs::write(nm.join(".modules.yaml"), "layoutVersion: 5\n").unwrap();
+        }
+        if direct {
+            link_dir(&pad, &nm.join("left-pad"));
+        } else {
+            let wrapper = store.join("lp-wrapper@1.0.0/node_modules/lp-wrapper");
+            write_pkg(&wrapper, "lp-wrapper", "1.0.0");
+            link_dir(&pad, &store.join("lp-wrapper@1.0.0/node_modules/left-pad"));
+            link_dir(&wrapper, &nm.join("lp-wrapper"));
+        }
+        nm
+    }
+
+    fn global_prefix_options(prefix: &Path) -> CrawlerOptions {
+        CrawlerOptions {
+            cwd: prefix.to_path_buf(),
+            global: true,
+            global_prefix: Some(prefix.to_path_buf()),
+        }
+    }
+
+    /// #435: pnpm 11+ gives every `pnpm add -g` its own install dir under
+    /// `pnpm root -g` (`$PNPM_HOME/global/v11`). Each install is its own
+    /// root, so one walk's matches can never hide another install's copy;
+    /// an unmarked sibling (an interrupted install) is still walked.
+    #[test]
+    fn global_prefix_splits_pnpm_isolated_global_installs() {
+        let tmp = tempfile::tempdir().unwrap();
+        let v11 = tmp.path().join("global").join("v11");
+        let b = write_pnpm_global_install(&v11, "bbb", true, true);
+        let a = write_pnpm_global_install(&v11, "aaa", false, true);
+        let c = write_pnpm_global_install(&v11, "ccc", false, false);
+        // Neither a stray file nor a dir without `node_modules` is a root.
+        std::fs::write(v11.join("stray"), "").unwrap();
+        std::fs::create_dir_all(v11.join("empty")).unwrap();
+        let roots = NpmCrawler::node_modules_paths_sync(&global_prefix_options(&v11));
+        assert_eq!(roots, vec![a, b, c]);
+    }
+
+    /// The split only applies to pnpm's layout-version dir: pnpm <= 10's
+    /// `global/5/node_modules`, an npm prefix and a `v1` dir with no
+    /// marked install are each still the single root they always were.
+    #[test]
+    fn global_prefix_keeps_non_isolated_roots() {
+        let tmp = tempfile::tempdir().unwrap();
+        let legacy = tmp.path().join("global/5/node_modules");
+        write_pkg(&legacy.join("left-pad"), "left-pad", "1.3.0");
+        std::fs::write(legacy.join(".modules.yaml"), "layoutVersion: 5\n").unwrap();
+        let npm = tmp.path().join("npm/lib/node_modules");
+        write_pkg(&npm.join("left-pad"), "left-pad", "1.3.0");
+        let v1 = tmp.path().join("other/v1");
+        write_pkg(&v1.join("pkg/node_modules/left-pad"), "left-pad", "1.3.0");
+        // A `v<N>` dir that IS a pnpm node_modules is never split.
+        let nm_v2 = tmp.path().join("nm/v2");
+        write_pnpm_global_install(&nm_v2, "aaa", true, true);
+        std::fs::write(nm_v2.join(".modules.yaml"), "layoutVersion: 5\n").unwrap();
+        for root in [legacy, npm, v1, nm_v2] {
+            let roots = NpmCrawler::node_modules_paths_sync(&global_prefix_options(&root));
+            assert_eq!(roots, vec![root]);
+        }
+    }
+
+    /// #435 end to end through the crawler: one install links `left-pad`
+    /// directly and the other holds it only transitively in its own
+    /// `.pnpm`. Walking `global/v11` as one root let whichever install
+    /// listed first remove `left-pad` from the store filter, so the other
+    /// install's copy was silently skipped. Both orientations are built
+    /// so the guard fails whatever the directory listing order.
+    #[tokio::test]
+    async fn global_prefix_finds_every_pnpm_isolated_install_copy() {
+        for direct_first in [true, false] {
+            let tmp = tempfile::tempdir().unwrap();
+            let v11 = tmp.path().join("global").join("v11");
+            let a = write_pnpm_global_install(&v11, "aaa", direct_first, true);
+            let b = write_pnpm_global_install(&v11, "bbb", !direct_first, true);
+            let crawler = NpmCrawler::new();
+            let purl = "pkg:npm/left-pad@1.3.0".to_string();
+            let mut real: Vec<PathBuf> = Vec::new();
+            for root in crawler
+                .get_node_modules_paths(&global_prefix_options(&v11))
+                .await
+                .unwrap()
+            {
+                let found = crawler
+                    .find_by_purls(&root, std::slice::from_ref(&purl))
+                    .await
+                    .unwrap();
+                for pkg in found.get(&purl).into_iter().flatten() {
+                    let canon = std::fs::canonicalize(&pkg.path).unwrap();
+                    if !real.contains(&canon) {
+                        real.push(canon);
+                    }
+                }
+            }
+            real.sort();
+            let want = |nm: &Path| {
+                std::fs::canonicalize(nm.join(".pnpm/left-pad@1.3.0/node_modules/left-pad"))
+                    .unwrap()
+            };
+            let mut expected = vec![want(&a), want(&b)];
+            expected.sort();
+            assert_eq!(real, expected, "direct_first={direct_first}");
+        }
     }
 }

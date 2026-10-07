@@ -808,3 +808,139 @@ fn apply_and_rollback_visit_a_pnpm_workspace_member_link_once() {
     assert_eq!(v["rolledBack"], 1, "scoped rollback; envelope={v}");
     assert_eq!(v["alreadyOriginal"], 0, "scoped rollback; envelope={v}");
 }
+
+/// One pnpm 11+ isolated global install, `<v11>/<hash>/node_modules`, with
+/// its own `.pnpm` holding a real `dupvuln@1.0.0`, linked at the top level
+/// (`direct`) or reached only through `wrapper` (transitive-only).
+/// Returns the store copy's `index.js`.
+#[cfg(unix)]
+fn write_pnpm_global_install(v11: &Path, hash: &str, direct: bool, original: &[u8]) -> PathBuf {
+    let nm = v11.join(hash).join("node_modules");
+    std::fs::create_dir_all(&nm).unwrap();
+    std::fs::write(v11.join(hash).join("package.json"), "{}").unwrap();
+    std::fs::write(nm.join(".modules.yaml"), "layoutVersion: 5\n").unwrap();
+    let store = nm.join(".pnpm");
+    let pkg = store.join("dupvuln@1.0.0/node_modules/dupvuln");
+    let index = write_copy(&pkg, "dupvuln", "1.0.0", original);
+    if direct {
+        std::os::unix::fs::symlink(&pkg, nm.join("dupvuln")).unwrap();
+    } else {
+        let wrapper = store.join("wrapper@1.0.0/node_modules/wrapper");
+        write_copy(&wrapper, "wrapper", "1.0.0", b"require('dupvuln');\n");
+        std::os::unix::fs::symlink(&pkg, store.join("wrapper@1.0.0/node_modules/dupvuln")).unwrap();
+        std::os::unix::fs::symlink(&wrapper, nm.join("wrapper")).unwrap();
+    }
+    index
+}
+
+fn run_apply_global_prefix(root: &Path, prefix: &Path) -> (i32, serde_json::Value) {
+    let out = Command::new(binary())
+        .args([
+            "apply",
+            "--json",
+            "--offline",
+            "--ecosystems",
+            "npm",
+            "--cwd",
+        ])
+        .arg(root)
+        .arg("--global-prefix")
+        .arg(prefix)
+        .output()
+        .expect("run apply");
+    let stdout = String::from_utf8_lossy(&out.stdout).to_string();
+    let v: serde_json::Value = serde_json::from_str(stdout.trim())
+        .unwrap_or_else(|e| panic!("apply must emit JSON: {e}; stdout={stdout}"));
+    (out.status.code().unwrap_or(-1), v)
+}
+
+/// #435: pnpm 11+ gives every `pnpm add -g` its own install dir
+/// (`$PNPM_HOME/global/v11/<hash>/node_modules`, each with its own
+/// `.pnpm`), and `pnpm root -g` prints their parent. With one install
+/// linking the package directly and another holding it only
+/// transitively, apply patched one copy and reported success while the
+/// other stayed vulnerable. Both orientations are built so the guard
+/// fails whatever the directory listing order.
+#[cfg(unix)]
+#[test]
+fn apply_global_prefix_patches_every_pnpm_isolated_global_install() {
+    let original = b"module.exports = function(){ return 'VULNERABLE'; };\n";
+    let mut patched = original.to_vec();
+    patched.extend_from_slice(b"// SOCKET-PATCHED-MULTICOPY\n");
+    for direct_first in [true, false] {
+        let tmp = tempfile::tempdir().unwrap();
+        let root = tmp.path().join("proj");
+        std::fs::create_dir_all(&root).unwrap();
+        stage_manifest_and_blob(
+            &root,
+            "pkg:npm/dupvuln@1.0.0",
+            &git_sha256(original),
+            &git_sha256(&patched),
+            &patched,
+        );
+        let v11 = tmp.path().join("pnpm-home/global/v11");
+        let a = write_pnpm_global_install(&v11, "aaa", direct_first, original);
+        let b = write_pnpm_global_install(&v11, "bbb", !direct_first, original);
+
+        let (code, v) = run_apply_global_prefix(&root, &v11);
+        assert_eq!(code, 0, "direct_first={direct_first}; envelope={v}");
+        for index in [&a, &b] {
+            assert_eq!(
+                std::fs::read(index).unwrap(),
+                patched,
+                "{index:?} left unpatched; direct_first={direct_first}; envelope={v}"
+            );
+        }
+        assert_eq!(
+            dupvuln_events(&v),
+            vec![
+                ("applied".to_string(), String::new()),
+                ("applied".to_string(), String::new())
+            ],
+            "direct_first={direct_first}; envelope={v}"
+        );
+    }
+}
+
+/// Splitting `global/v11` into one root per install must not turn one
+/// physical copy that two installs both link (pnpm 11's global virtual
+/// store is the real-world case, refused there as a shared store) into
+/// two events.
+#[cfg(unix)]
+#[test]
+fn apply_global_prefix_visits_a_copy_shared_by_two_pnpm_global_installs_once() {
+    let original = b"module.exports = function(){ return 'VULNERABLE'; };\n";
+    let mut patched = original.to_vec();
+    patched.extend_from_slice(b"// SOCKET-PATCHED-MULTICOPY\n");
+    let tmp = tempfile::tempdir().unwrap();
+    let root = tmp.path().join("proj");
+    std::fs::create_dir_all(&root).unwrap();
+    stage_manifest_and_blob(
+        &root,
+        "pkg:npm/dupvuln@1.0.0",
+        &git_sha256(original),
+        &git_sha256(&patched),
+        &patched,
+    );
+    // An installed copy (under a `node_modules`), not linked first-party
+    // source, which apply refuses.
+    let shared = tmp.path().join("shared/node_modules/dupvuln");
+    let index = write_copy(&shared, "dupvuln", "1.0.0", original);
+    let v11 = tmp.path().join("pnpm-home/global/v11");
+    for hash in ["aaa", "bbb"] {
+        let nm = v11.join(hash).join("node_modules");
+        std::fs::create_dir_all(nm.join(".pnpm")).unwrap();
+        std::fs::write(v11.join(hash).join("package.json"), "{}").unwrap();
+        std::fs::write(nm.join(".modules.yaml"), "layoutVersion: 5\n").unwrap();
+        std::os::unix::fs::symlink(&shared, nm.join("dupvuln")).unwrap();
+    }
+
+    let (code, v) = run_apply_global_prefix(&root, &v11);
+    assert_eq!(code, 0, "envelope={v}");
+    assert_eq!(std::fs::read(&index).unwrap(), patched, "envelope={v}");
+    assert_eq!(
+        dupvuln_events(&v),
+        vec![("applied".to_string(), String::new())],
+        "envelope={v}"
+    );
+}
