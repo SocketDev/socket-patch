@@ -33,7 +33,8 @@ socket-patch get pkg:npm/lodash@4.17.20 --mode agent
 ```
 
 Replace the example identifiers with the advisory or package you need. `get` also
-accepts a patch UUID or package name. It defaults to hosted mode; `--save-only` and
+accepts a patch UUID or an exact package name, which covers every installed version
+of that package. `remove` and `rollback` take the same names. `get` defaults to hosted mode; `--save-only` and
 global targeting default to agent mode instead. Hosted and vendored `get` do not
 prompt. Agent-mode searches can offer an interactive choice.
 
