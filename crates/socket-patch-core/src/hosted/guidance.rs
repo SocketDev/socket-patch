@@ -272,7 +272,9 @@ pub fn pnpm_trust_configured_detail(server: &str, created: bool, dry_run: bool) 
         format!(
             " On pnpm 9.0–10.4 a root-only workspace needs `pnpm add -w <pkg>` \
              to add dependencies; to avoid the file there, pin that pnpm in \
-             package.json `packageManager`, {then}."
+             package.json `packageManager` (any other pnpm pin — `engines.pnpm`, \
+             `devEngines.packageManager`, node_modules/.modules.yaml — must name \
+             9.0–10.4 too), {then}."
         )
     } else {
         String::new()
@@ -536,6 +538,10 @@ mod tests {
                 detail.contains(
                     "to avoid the file there, pin that pnpm in package.json `packageManager`"
                 ),
+                "{detail}"
+            );
+            assert!(
+                detail.contains("any other pnpm pin — `engines.pnpm`"),
                 "{detail}"
             );
             assert_eq!(
