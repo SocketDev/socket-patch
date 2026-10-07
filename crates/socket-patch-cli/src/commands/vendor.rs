@@ -1805,8 +1805,11 @@ async fn run_eject(args: &VendorArgs, pins: Vec<HostedPin>) -> i32 {
         .next()
         .or_else(|| restore.flush_error.clone());
     // Every file the vendored apply's group commit wrote, with its bytes
-    // from before: the rollback's scope beyond the restore's own files.
-    let mut committed: Vec<CommittedFile> = Vec::new();
+    // from before (the rollback's scope beyond the restore's own files),
+    // and the flavors it wired for the close printed below.
+    let mut capture = EjectCapture::default();
+    // The vendored apply's events start here: a rollback retracts them.
+    let events_start = env.events.len();
     let mut exit: i32;
     if let Some(why) = restore_failure {
         env.mark_error(EnvelopeError::new("redirect_revert_failed", why.clone()));
@@ -1838,7 +1841,7 @@ async fn run_eject(args: &VendorArgs, pins: Vec<HostedPin>) -> i32 {
                     detached: true,
                     force: false,
                     prior: None,
-                    committed: Some(&mut committed),
+                    eject: Some(&mut capture),
                 },
                 &mut env,
             )
@@ -1873,19 +1876,33 @@ async fn run_eject(args: &VendorArgs, pins: Vec<HostedPin>) -> i32 {
             }
         }
     }
+    let committed = &capture.committed;
     if exit != 0 {
-        match snapshot.restore(&restore.reverted_files, &committed).await {
-            Ok(()) => env.warnings.push(RunWarning {
-                code: "eject_rolled_back".to_string(),
-                detail: "the eject did not complete, so every file it touched was restored: the \
-                         project is still hosted, exactly as before"
-                    .to_string(),
-            }),
+        match snapshot.restore(&restore.reverted_files, committed).await {
+            Ok(()) => {
+                let detail = "the eject did not complete, so every file it touched was \
+                              restored: the project is still hosted, exactly as before";
+                // Nothing the vendored apply did survives the rollback: a
+                // package it vendored is still hosted, not applied (#1005).
+                env.retract_applied(
+                    events_start,
+                    PatchAction::Skipped,
+                    "eject_rolled_back",
+                    "vendored, then rolled back with the rest of the eject: still hosted",
+                );
+                if !common.json && !common.silent {
+                    eprintln!("Warning: {detail}");
+                }
+                env.warnings.push(RunWarning {
+                    code: "eject_rolled_back".to_string(),
+                    detail: detail.to_string(),
+                });
+            }
             Err(e) => {
                 let detail = format!(
                     "the eject did not complete and restoring the pre-eject files failed ({e}); \
                      restore them from version control (`git checkout -- {}`)",
-                    snapshot.files_hint(&restore.reverted_files, &committed)
+                    snapshot.files_hint(&restore.reverted_files, committed)
                 );
                 if !common.json {
                     eprintln!("Error: {detail}");
@@ -1896,6 +1913,11 @@ async fn run_eject(args: &VendorArgs, pins: Vec<HostedPin>) -> i32 {
         if env.error.is_none() {
             env.mark_partial_failure();
         }
+    } else {
+        // The vendored summary and its "Next steps:", deferred until the
+        // eject is known to stand: a failed one is rolled back (or needs
+        // the manual restore its error names), so neither applies.
+        print_vendor_closing(common, &env, 0, &capture.wired_flavors, true);
     }
     note_classic_migration_risk(&mut env, &common.cwd, common);
     drop(guard);
@@ -2038,7 +2060,7 @@ async fn run_vendor(
                 detached: false,
                 force: args.force,
                 prior: None,
-                committed: None,
+                eject: None,
             },
             env,
         )
@@ -2521,9 +2543,13 @@ pub(crate) async fn vendor_records_reusing(
     service: Option<&VendorServiceConfig>,
     ledger: std::io::Result<VendorState>,
     prior: Option<&NpmCrawlSnapshot>,
-    committed: Option<&mut Vec<CommittedFile>>,
+    mut eject: Option<&mut EjectCapture>,
 ) -> bool {
     let mut has_errors = false;
+    // This run's events start here (`scan --mode vendored` hands over an
+    // envelope that already holds its own): the ones a refused commit
+    // retracts.
+    let events_start = env.events.len();
     // Lockfile flavors the backends wired THIS run (from the returned ledger
     // entries, not the whole ledger — an old pnpm entry must not re-flavor
     // the hints of a run that vendored only cargo). Drives the human
@@ -2743,6 +2769,11 @@ pub(crate) async fn vendor_records_reusing(
     // line prints on a clean line.
     let mut status = StatusLine::stderr(common.json, common.silent);
     let total = all_packages.len();
+    // The vendored artifact dirs before this run wrote any: a commit the
+    // symlink check refuses removes the ones the loop added, so the refusal
+    // leaves no orphan artifact behind (#898).
+    let vendor_dirs_before = (!common.dry_run).then(|| EjectSnapshot::vendor_dir_set(&common.cwd));
+
     // Service downloads, fetched ahead of this serial loop (the wiring and
     // every write stay here, in order). The plan is EXACT — only the
     // records the loop will ask the service for (see
@@ -3452,31 +3483,48 @@ pub(crate) async fn vendor_records_reusing(
     // others failed — a failed package's backend already put back what it
     // had touched, in the captured state — so a completed run ends exactly
     // where committing after every package would have left it.
+    let mut commit_failed = false;
     if let Some(group) = group {
         socket_patch_core::utils::failpoint::hit("vendor_group_commit");
         match group.commit_changes().await {
             Ok(changes) => {
-                if let Some(committed) = committed {
-                    committed.extend(changes);
+                if let Some(capture) = eject.as_deref_mut() {
+                    capture.committed.extend(changes);
                 }
                 for stale in stale_artifacts {
                     sweep_stale_artifact(common, env, &state, stale).await;
                 }
             }
             Err(e) if socket_patch_core::utils::group_commit::symlinked_target(&e).is_some() => {
-                // Refused before anything was written: the hosted refusal,
-                // same code and wording.
+                // Refused before any lockfile, manifest or ledger was
+                // written: the hosted refusal, same code and wording. The
+                // artifacts the loop already downloaded are removed, and
+                // the packages it vendored are reported as refused, not
+                // applied — nothing of them was committed (#898).
                 has_errors = true;
+                commit_failed = true;
                 let linked = socket_patch_core::utils::group_commit::symlinked_target(&e)
                     .unwrap_or_default();
                 let refusal = socket_patch_core::hosted::engine::symlink_refusal(linked);
-                if !common.json {
-                    eprintln!("Error: {}", refusal.message);
+                let mut message = refusal.message;
+                let leftovers = remove_new_vendor_dirs(common, vendor_dirs_before.as_ref()).await;
+                if !leftovers.is_empty() {
+                    message = format!(
+                        "{} (except the downloaded artifacts that could not be removed: {}; \
+                         `socket-patch vendor --revert` removes them)",
+                        message,
+                        leftovers.join("; ")
+                    );
                 }
-                env.mark_error(EnvelopeError::new(refusal.code, refusal.message));
+                env.retract_applied(events_start, PatchAction::Failed, &refusal.code, &message);
+                if !common.json {
+                    eprintln!("Error: {message}");
+                }
+                env.mark_error(EnvelopeError::new(refusal.code, message));
             }
             Err(e) => {
                 has_errors = true;
+                commit_failed = true;
                 let detail = if socket_patch_core::utils::group_commit::is_pending(&e) {
                     // Some files were replaced and could not be put back:
                     // the journal left behind makes the next locked command
@@ -3603,68 +3651,116 @@ pub(crate) async fn vendor_records_reusing(
         }
     }
 
-    if !common.json && !common.silent {
-        let tally = VendorTally::from_envelope(env, common.dry_run, dry_in_sync);
-        println!("{}", format_vendor_summary(common.dry_run, &tally));
-        if env.summary.applied > 0 && !common.dry_run {
-            // pnpm >=11 reads `overrides` ONLY from pnpm-workspace.yaml (the
-            // package.json `pnpm.overrides` mirror is ignored), so pnpm-wired
-            // runs must name that file among the committables: a checkout
-            // that loses it silently unvendors on the next install.
-            let commit = commit_hint(&wired_flavors);
-            let mut installs: Vec<&str> = wired_flavors
-                .iter()
-                .filter_map(|f| flavor_install_command(f))
-                .collect();
-            installs.sort_unstable();
-            installs.dedup();
-            let jvm_only = !installs.is_empty()
-                && wired_flavors
-                    .iter()
-                    .filter(|f| flavor_install_command(f).is_some())
-                    .all(|f| JVM_TOOLS.contains(&f.as_str()));
-            let reinstall = if jvm_only {
-                let cmds: Vec<String> = installs.iter().map(|c| format!("`{c}`")).collect();
-                format!(
-                    "Run {} so the build resolves the vendored artifacts (the generated root \
-                     file points it at .socket/vendor/)",
-                    cmds.join(" and ")
-                )
-            } else if installs.is_empty() {
-                "Reinstall from the updated lockfile so the installed packages pick up the \
-                 vendored artifacts"
-                    .to_string()
-            } else {
-                let cmds: Vec<String> = installs.iter().map(|c| format!("`{c}`")).collect();
-                format!(
-                    "Run {} to update the installed tree (vendoring rewires the lockfile \
-                     only; the current install keeps the unpatched bytes until reinstalled)",
-                    cmds.join(" and ")
-                )
-            };
-            let mut extra = Vec::new();
-            if wired_flavors.contains("bun") && common.cwd.join("bun.lockb").exists() {
-                extra.push(
-                    "For binary Bun workspaces, also commit the workspace members' \
-                     .socket/vendor/ tarballs recorded in the vendor ledger."
-                        .to_string(),
-                );
-            }
-            if wired_flavors.contains("composer") {
-                if let Ok(lock) = socket_patch_core::utils::fs::read_regular_to_string_sync(
-                    &common.cwd.join("composer.lock"),
-                ) {
-                    let packages = super::composer_hints::vendored_composer_packages(&lock);
-                    extra.extend(super::composer_hints::vendored_reinstall_hints(&packages));
-                }
-            }
-            for line in crate::ui::next_steps(&commit, &reinstall, &extra) {
-                println!("{line}");
-            }
-        }
+    // A rolled-back eject's summary would describe a vendoring that was
+    // undone: the eject prints it itself once it knows the outcome (#1005).
+    match eject {
+        Some(capture) => capture.wired_flavors = wired_flavors,
+        None => print_vendor_closing(common, env, dry_in_sync, &wired_flavors, !commit_failed),
     }
 
     has_errors
+}
+
+/// The human close of a vendor run: the summary line, then — when
+/// something was vendored and `next_steps` (the run's commit landed) — the
+/// commit and reinstall "Next steps:" for the lockfile flavors the run
+/// wired.
+fn print_vendor_closing(
+    common: &GlobalArgs,
+    env: &Envelope,
+    dry_in_sync: u32,
+    wired_flavors: &HashSet<String>,
+    next_steps: bool,
+) {
+    if common.json || common.silent {
+        return;
+    }
+    let tally = VendorTally::from_envelope(env, common.dry_run, dry_in_sync);
+    println!("{}", format_vendor_summary(common.dry_run, &tally));
+    if env.summary.applied > 0 && !common.dry_run && next_steps {
+        // pnpm >=11 reads `overrides` ONLY from pnpm-workspace.yaml (the
+        // package.json `pnpm.overrides` mirror is ignored), so pnpm-wired
+        // runs must name that file among the committables: a checkout
+        // that loses it silently unvendors on the next install.
+        let commit = commit_hint(wired_flavors);
+        let mut installs: Vec<&str> = wired_flavors
+            .iter()
+            .filter_map(|f| flavor_install_command(f))
+            .collect();
+        installs.sort_unstable();
+        installs.dedup();
+        let jvm_only = !installs.is_empty()
+            && wired_flavors
+                .iter()
+                .filter(|f| flavor_install_command(f).is_some())
+                .all(|f| JVM_TOOLS.contains(&f.as_str()));
+        let reinstall = if jvm_only {
+            let cmds: Vec<String> = installs.iter().map(|c| format!("`{c}`")).collect();
+            format!(
+                "Run {} so the build resolves the vendored artifacts (the generated root \
+                 file points it at .socket/vendor/)",
+                cmds.join(" and ")
+            )
+        } else if installs.is_empty() {
+            "Reinstall from the updated lockfile so the installed packages pick up the \
+             vendored artifacts"
+                .to_string()
+        } else {
+            let cmds: Vec<String> = installs.iter().map(|c| format!("`{c}`")).collect();
+            format!(
+                "Run {} to update the installed tree (vendoring rewires the lockfile \
+                 only; the current install keeps the unpatched bytes until reinstalled)",
+                cmds.join(" and ")
+            )
+        };
+        let mut extra = Vec::new();
+        if wired_flavors.contains("bun") && common.cwd.join("bun.lockb").exists() {
+            extra.push(
+                "For binary Bun workspaces, also commit the workspace members' \
+                 .socket/vendor/ tarballs recorded in the vendor ledger."
+                    .to_string(),
+            );
+        }
+        if wired_flavors.contains("composer") {
+            if let Ok(lock) = socket_patch_core::utils::fs::read_regular_to_string_sync(
+                &common.cwd.join("composer.lock"),
+            ) {
+                let packages = super::composer_hints::vendored_composer_packages(&lock);
+                extra.extend(super::composer_hints::vendored_reinstall_hints(&packages));
+            }
+        }
+        for line in crate::ui::next_steps(&commit, &reinstall, &extra) {
+            println!("{line}");
+        }
+    }
+}
+
+/// Remove the vendored artifact dirs that appeared since `before` (see
+/// [`EjectSnapshot::vendor_dir_set`]), returning what could not be removed.
+async fn remove_new_vendor_dirs(
+    common: &GlobalArgs,
+    before: Option<&std::collections::BTreeSet<std::path::PathBuf>>,
+) -> Vec<String> {
+    let Some(before) = before else {
+        return Vec::new();
+    };
+    let mut leftovers = Vec::new();
+    for dir in EjectSnapshot::vendor_dir_set(&common.cwd).difference(before) {
+        if let Err(e) = remove_tree_and_prune(dir, &common.cwd.join(SOCKET_DIR)).await {
+            leftovers.push(format!("{}: {e}", dir.display()));
+        }
+    }
+    leftovers
+}
+
+/// What a hosted→vendored eject's vendored apply hands back instead of
+/// printing its own close: every project file its group commit wrote (with
+/// the bytes from before, for the rollback) and the lockfile flavors it
+/// wired (for the "Next steps:" the eject prints only when it completes).
+#[derive(Default)]
+pub(crate) struct EjectCapture {
+    pub(crate) committed: Vec<CommittedFile>,
+    pub(crate) wired_flavors: HashSet<String>,
 }
 
 /// The pseudo-flavors of vendored JVM builds whose wiring is a generated

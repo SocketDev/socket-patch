@@ -1264,6 +1264,34 @@ async fn vendor_refuses_a_symlinked_lock_instead_of_replacing_it() {
             !fx.state_path().exists(),
             "{linked}: no ledger entry was committed"
         );
+        // #898: "nothing was written" holds — the artifact the loop
+        // downloaded before the commit was refused is removed — and the
+        // package is reported refused, not applied.
+        assert!(
+            !fx.tgz_path().exists(),
+            "{linked}: the refused run leaves no orphan artifact"
+        );
+        assert_eq!(env["summary"]["applied"], 0, "{linked}: {env:#}");
+        let refused = find_event(&env, "failed", Some("redirect_symlinked_file_unsupported"));
+        assert_eq!(refused["purl"], PURL, "{linked}: {env:#}");
+
+        // The human run neither claims a vendored package nor advises
+        // committing `.socket/vendor/`.
+        let (code, stdout, stderr) = run_cli(
+            fx.root(),
+            &["vendor", "--cwd", fx.root().to_str().unwrap()],
+            &[],
+        );
+        assert_eq!(code, 1, "{linked}: {stdout}\n{stderr}");
+        assert!(
+            stderr.contains(&format!("{linked} is a symbolic link")),
+            "{linked}: {stdout}\n{stderr}"
+        );
+        assert!(
+            !stdout.contains("Vendored 1 package") && !stdout.contains("Next steps"),
+            "{linked}: {stdout}\n{stderr}"
+        );
+        assert!(!fx.tgz_path().exists(), "{linked}");
     }
 }
 
