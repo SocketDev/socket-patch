@@ -1302,36 +1302,52 @@ async fn gem_hosted_explicit_bundle_path_ignores_system_home_copy() {
 
 /// #1001 control: with no Bundler `path` setting, `bundle install` installs
 /// into and reuses the `gem env` home, so a stale copy there still warns
-/// (shared-home flavor) and stays out of the same run's VEX.
+/// (shared-home flavor) and stays out of the same run's VEX. The same holds
+/// when a local `path.system: true` outranks an env `BUNDLE_PATH`: Bundler's
+/// first deciding tier turns system gems back on.
 #[cfg(unix)]
 #[tokio::test(flavor = "multi_thread")]
 async fn gem_hosted_system_install_still_flags_system_home_copy() {
     let server = MockServer::start().await;
     mount_api(&server, None).await;
-    let tmp = tempfile::tempdir().unwrap();
-    let proj = tmp.path().join("proj");
-    std::fs::create_dir_all(&proj).unwrap();
-    write_manifest_pair(&proj);
-    let bin_dir = tmp.path().join("fake-bin");
-    let system_copy = stage_system_home_copy(&tmp.path().join("system-home"), &bin_dir);
+    for local_system_over_env_path in [false, true] {
+        let tmp = tempfile::tempdir().unwrap();
+        let proj = tmp.path().join("proj");
+        std::fs::create_dir_all(&proj).unwrap();
+        write_manifest_pair(&proj);
+        let extra: &[(&str, &str)] = if local_system_over_env_path {
+            std::fs::create_dir_all(proj.join(".bundle")).unwrap();
+            std::fs::write(
+                proj.join(".bundle").join("config"),
+                "---\nBUNDLE_PATH__SYSTEM: \"true\"\n",
+            )
+            .unwrap();
+            &[("BUNDLE_PATH", "vendor/bundle")]
+        } else {
+            &[]
+        };
+        let bin_dir = tmp.path().join("fake-bin");
+        let system_copy = stage_system_home_copy(&tmp.path().join("system-home"), &bin_dir);
 
-    let (code, env, stderr, vex_path) =
-        hosted_vex_scan_with_gem_on_path(&proj, &server.uri(), &bin_dir, &[]);
-    let warnings = stale_warnings(&env);
-    assert_eq!(warnings.len(), 1, "{env}");
-    assert!(
-        warnings[0].contains(&system_copy.display().to_string())
-            && warnings[0].contains("shared gem home"),
-        "{}",
-        warnings[0]
-    );
-    if let Ok(doc) = std::fs::read_to_string(&vex_path) {
-        assert!(!doc.contains(PURL), "stale purl attested:\n{doc}");
+        let (code, env, stderr, vex_path) =
+            hosted_vex_scan_with_gem_on_path(&proj, &server.uri(), &bin_dir, extra);
+        let case = format!("local_system_over_env_path={local_system_over_env_path}");
+        let warnings = stale_warnings(&env);
+        assert_eq!(warnings.len(), 1, "{case}: {env}");
+        assert!(
+            warnings[0].contains(&system_copy.display().to_string())
+                && warnings[0].contains("shared gem home"),
+            "{case}: {}",
+            warnings[0]
+        );
+        if let Ok(doc) = std::fs::read_to_string(&vex_path) {
+            assert!(!doc.contains(PURL), "{case}: stale purl attested:\n{doc}");
+        }
+        assert_ne!(
+            code, 0,
+            "{case}: an all-stale --vex run must fail.\nstderr:\n{stderr}"
+        );
     }
-    assert_ne!(
-        code, 0,
-        "an all-stale --vex run must fail.\nstderr:\n{stderr}"
-    );
 }
 
 /// #729: run from the project root with `--cwd` left at its default (`.`).
