@@ -420,9 +420,12 @@ Honest limits of the Maven and NuGet flows — documented behavior, not bugs:
   a depMgmt pin could strand sibling artifacts sharing the property. A literal version
   that matches neither the base nor the suffixed value is skipped
   (`redirect_maven_dep_version_mismatch`). A `<base>-socket.<hex8>` literal left by an
-  earlier patch for the same release is re-pinned to the new suffix: the superseded
+  earlier hosted patch for the same release (the pom declares that patch's
+  `socket-patch-<uuid>` repository) is re-pinned to the new suffix: the superseded
   `socket-patch-<uuid>` repository and its Trusted Checksums entries are removed, and a
-  repository whose grant URL changed (a rotated token) is refreshed in place.
+  repository whose grant URL changed (a rotated token) is refreshed in place. A suffixed
+  literal no hosted repository in the pom minted (a vendored `socket-patch-vendor-<uuid>`
+  pin, say) is still a mismatch and is skipped.
 * **Trusted Checksums reinforcement (hosted Maven, 3.9.4+).** When the patch server
   supplies both the jar and pom sha256, the rewriter also emits Maven
   [Trusted Checksums](https://maven.apache.org/resolver/expected-checksums.html) files —

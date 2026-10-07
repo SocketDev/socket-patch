@@ -6854,6 +6854,23 @@ fn rewrite_maven_pom(
     }
     let mut pom = files.get("pom.xml").cloned();
     let mut pom_changed = false;
+    // The hosted generations whose `socket-patch-<uuid>` repository the pom
+    // declared before this run: only a suffixed literal one of these minted
+    // is an earlier generation of OUR pin. A vendored reactor / sbt pin
+    // writes the same `-socket.<hex8>` suffix under a
+    // `socket-patch-vendor-<uuid>` repository, which stays a mismatch.
+    let hosted_repo_generations: std::collections::BTreeSet<String> = pom
+        .as_deref()
+        .map(|text| {
+            generation::named_generations(text)
+                .into_iter()
+                .filter(|uuid| {
+                    !maven_repositories_with_id(text, &generation::hosted_pin_name(uuid))
+                        .is_empty()
+                })
+                .collect()
+        })
+        .unwrap_or_default();
     let mut mvn_config = files.get(MVN_CONFIG).cloned().unwrap_or_default();
     let mut mvn_config_changed = false;
     // (local-repo-relative path, bare sha256 hex) entries to merge in.
@@ -7030,12 +7047,17 @@ fn rewrite_maven_pom(
             })
             .collect();
         // A `<base>-socket.<hex8>` literal for this release that is not the
-        // applied suffix is an earlier generation of OUR pin (a superseding
-        // patch uuid): re-pin it like the base (#266).
+        // applied suffix, minted by a hosted `socket-patch-<uuid>` repository
+        // the pom declares, is an earlier generation of OUR pin (a
+        // superseding patch uuid): re-pin it like the base (#266).
         let prior_generation = |v: &str| {
             v != suffixed_version
-                && crate::formats::maven::split_socket_version(v)
-                    .is_some_and(|(base, _)| base == dep.version)
+                && crate::formats::maven::split_socket_version(v).is_some_and(|(base, hex8)| {
+                    base == dep.version
+                        && hosted_repo_generations
+                            .iter()
+                            .any(|uuid| uuid.starts_with(hex8))
+                })
         };
         // Rewrite base (or a prior generation) → suffixed. Descending offset
         // order so earlier edits don't shift later matches' offsets.
@@ -7238,12 +7260,17 @@ fn rewrite_maven_pom(
     if mvn_config_changed {
         result.files.insert(MVN_CONFIG.into(), mvn_config);
     }
-    let existing_checksums = files.get(MVN_CHECKSUMS).cloned().unwrap_or_default();
-    let drops_checksums = checksum_drops.iter().any(|path| {
-        existing_checksums
-            .lines()
-            .any(|l| l.split_once("  ").is_some_and(|(_, p)| p == path))
-    });
+    // LF-normalized, so the drop check and the filter below split lines the
+    // same way (a CRLF file's paths would otherwise keep a trailing `\r`).
+    let existing_checksums = files
+        .get(MVN_CHECKSUMS)
+        .map(|text| text.replace("\r\n", "\n"))
+        .unwrap_or_default();
+    let names_dropped_path = |line: &str| {
+        line.split_once("  ")
+            .is_some_and(|(_, p)| checksum_drops.iter().any(|d| d == p))
+    };
+    let drops_checksums = existing_checksums.split('\n').any(names_dropped_path);
     if !checksum_entries.is_empty() || drops_checksums {
         let action = if files.contains_key(MVN_CHECKSUMS) {
             "rewritten"
@@ -7252,10 +7279,7 @@ fn rewrite_maven_pom(
         };
         let kept: String = existing_checksums
             .split('\n')
-            .filter(|l| {
-                !l.split_once("  ")
-                    .is_some_and(|(_, p)| checksum_drops.iter().any(|d| d == p))
-            })
+            .filter(|l| !names_dropped_path(l))
             .collect::<Vec<_>>()
             .join("\n");
         result.files.insert(
@@ -22595,6 +22619,58 @@ mod owned_pin_generation_matrix {
         let checksums = &repinned[MVN_CHECKSUMS];
         assert!(!checksums.contains("aaaaaaaa"), "{checksums}");
         assert_eq!(checksums.lines().count(), 2, "{checksums}");
+    }
+
+    /// A `-socket.<hex8>` literal that no hosted `socket-patch-<uuid>`
+    /// repository minted (a vendored reactor / sbt pin, served from a
+    /// `socket-patch-vendor-<uuid>` repository) is not an earlier hosted
+    /// generation: the mismatch is reported and the pom left untouched.
+    #[test]
+    fn maven_vendored_suffix_literal_is_not_a_prior_generation() {
+        let pom = pom_project()["pom.xml"].replace(
+            "<version>3.12.0</version>",
+            "<version>3.12.0-socket.aaaaaaaa</version>",
+        );
+        let pom = pom.replace(
+            "</dependencies>\n",
+            &format!(
+                "</dependencies>\n  <repositories>\n    <repository>\n      \
+                 <id>socket-patch-vendor-{A}</id>\n      \
+                 <url>file://${{project.basedir}}/.socket/vendor/maven/repo</url>\n    \
+                 </repository>\n  </repositories>\n"
+            ),
+        );
+        let files = BTreeMap::from([("pom.xml".to_string(), pom)]);
+        let tok = "22222222-3333-4444-8555-666666666666";
+        let (_, result) = plan(&files, &maven(B, tok));
+        assert!(
+            result
+                .warnings
+                .iter()
+                .any(|w| w.code == "redirect_maven_dep_version_mismatch"),
+            "{:?}",
+            result.warnings
+        );
+        assert!(
+            !result.files.contains_key("pom.xml"),
+            "{:?}",
+            result.files.get("pom.xml")
+        );
+    }
+
+    /// A CRLF trusted-checksums file drops the superseded generation's
+    /// entries like an LF one, and the re-pinned project is settled.
+    #[test]
+    fn maven_repin_drops_superseded_checksums_from_a_crlf_file() {
+        let tok = "22222222-3333-4444-8555-666666666666";
+        let (mut wired, _) = plan(&pom_project(), &maven(A, tok));
+        let crlf = wired[MVN_CHECKSUMS].replace('\n', "\r\n");
+        wired.insert(MVN_CHECKSUMS.to_string(), crlf);
+        let (repinned, _) = plan(&wired, &maven(B, tok));
+        let checksums = &repinned[MVN_CHECKSUMS];
+        assert!(!checksums.contains("aaaaaaaa"), "{checksums}");
+        let (_, again) = plan(&repinned, &maven(B, tok));
+        assert!(again.files.is_empty(), "{:?}", again.files.keys());
     }
 
     /// #266: a rotated grant token (same uuid, new token path segment)
