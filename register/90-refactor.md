@@ -1,10 +1,11 @@
 ### Refactor routine (`refactor`, hourly, highest leverage first)
-_Last updated 2026-10-07T13:40Z · main @ db83f01_
+_Last updated 2026-10-07T15:00Z · main @ 6fe81ad_
 
 **In flight:**
 - [#876](https://github.com/SocketDev/socket-patch/pull/876): registry clients (`build_registry_client`, Maven `fetch_registry_bytes`) built through one `registry_client_builder` under `ApiTimeouts`; `registry_fetch::download` onto `read_capped`. Also ports the base-red digest-ratchet fix for #646's JVM files. Issue #872 (C49). `ready`.
 - [#889](https://github.com/SocketDev/socket-patch/pull/889): vendor-service retries read `Retry-After` through `api::retry::parse_retry_after` (HTTP-date now honored, still capped at `max_delay`) and draw jitter from the seeded `api::retry::jitter_sample` on the client's `RetryHooks`; `client.rs`'s `retry_after_secs` and `jitter_sample()` deleted. Issue #677 (C15 child 1). `ready`.
 - [#1015](https://github.com/SocketDev/socket-patch/pull/1015): the vendored-reference scan (repair, orphan sweeps, `vendor` stranded gate, rollback) reads every `VENDORED` row; the eight `VENDORED_WRITES_UNMARKED` files get the role and the list is deleted; `vendor::path::parse_vendor_reference` accepts the bare uuid dir (NuGet feed, Maven repo). Issues #832, #958 (E61, E67). `ready`. Left: dead `eco == "maven2"` arm in `commands/vendor.rs` (busy file).
+- Maintainer drafts on `arch-refactor/*` branches (no status block; count toward `MAX_OPEN`): [#1021](https://github.com/SocketDev/socket-patch/pull/1021) (#615, remove `SOCKET_FORCE`), [#1027](https://github.com/SocketDev/socket-patch/pull/1027) (#704, `{code, message}` `--json` errors; C53).
 
 **Merged:**
 - [#886](https://github.com/SocketDev/socket-patch/pull/886): one `utils::process::output_within` bounded spawn; `run_resolved` (every crawler probe) under `PROBE_TIMEOUT` (10 s); pipenv, hatch and self-update `sanity_exec` timeout blocks deleted. Issue #845 (C48), closed. Merged 2026-10-07 as `6bba625` (+236 / −47 total). Left: the `vendor/npm_dir.rs` `git check-ignore` exchange keeps its own timeout.
@@ -20,7 +21,7 @@ _Last updated 2026-10-07T13:40Z · main @ db83f01_
 | 4 | #931 (C52, child 1 of #930): one manifest-read error mapper (`manifest_invalid`/`manifest_unreadable`) for every command | 1 | 1 | ≈2.5 | M | ≈5.5 | skipped: `commands/vendor.rs` changed by #776, #978 |
 | 5 | #773 (C44): one `Ecosystem::from_cli_name` for flag, env, socket.yml, vendor | 1 | 0 | ≈2 | L | ≈5 | skipped: `commands/vendor.rs` changed by #776, #978 |
 
-Re-ranked 2026-10-07T13:40Z: #886 merged (C48 `fixed`); 2 of 3 slots were open, so this run took the best eligible candidate: #832 + #958 (E61, E67; B 2, U 0, D ≈1, R M, ≈5), now #1015. The top five above are still skipped on busy files (`commands/vendor.rs`: #776, #978) or claims. Next eligible: #893 (C50, ≈4), #705, #871 after #889. Decisions: #648, #704, #792, #808, #615, #966, #973, #983, #1000; C07. (All nine decided by the maintainer on 2026-10-07; #648, #704, #792, #808, #615, #966 and #973 are now actionable and get ranked next run, #983 and #1000 closed. #966 Q2, embedded `--vex`, stays open. #792 makes #791 moot.)
+Re-ranked 2026-10-07T15:00Z: 5 `arch-refactor/*` PRs open (#876, #889, #1015 `ready` with the burn-down; maintainer drafts #1021, #1027), so no new PR this run. Nothing of ours merged since 13:40 (main gained only #1016). The top five are still skipped: `commands/vendor.rs` is changed by #776 and #978, backend files by #657, #909, #943, #978, #980, #997, and #922 is claimed. Next eligible when a slot frees: #893 (C50, ≈4), #705 (one `utils::uuid` grammar), #871 after #889. Decisions: #648, #792, #808, #966, #973 are decided but now carry `agent:claimed` (taken by other sessions); #615 and #704 are in maintainer PRs #1021, #1027. C07 still open.
 
 **Notes:**
 - The sandbox runs as root, so 4 core lib tests fail on main and on branches alike: `copy_tree::relax_loop_must_not_traverse_symlinked_root`, `vlt_heal::an_unremovable_hidden_lock_keeps_every_store_entry`, `pypi_poetry::wire_write_failure_maps_error_and_leaves_lock_untouched`, `pypi_requirements::wire_failure_rolls_back_already_written_files`.
