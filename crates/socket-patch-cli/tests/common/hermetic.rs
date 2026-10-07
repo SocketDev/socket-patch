@@ -48,8 +48,8 @@ const HOSTILE_SEEDS: &[(&str, &str)] = &[
 
 /// A `Command` for `bin` with the hermetic `SOCKET_*` environment: the
 /// hostile seeds scrubbed, every other ambient `SOCKET_*` removed (removing
-/// `SOCKET_API_TOKEN` also forces the public proxy), and the two opt-outs
-/// forced on. Callers add args, cwd and their own env afterwards; caller env
+/// `SOCKET_API_TOKEN` also forces the public proxy), and the three opt-outs
+/// (config layer, update notifier, telemetry) forced on. Callers add args, cwd and their own env afterwards; caller env
 /// lands last, so explicit injections survive the scrub.
 pub fn command(bin: &Path) -> Command {
     let mut cmd = Command::new(bin);
@@ -72,6 +72,12 @@ pub fn command(bin: &Path) -> Command {
     // this force-set is the layer that holds there. Notifier tests opt back
     // in via caller env (which lands last).
     cmd.env("SOCKET_NO_UPDATE_CHECK", "1");
+    // And for telemetry: an unauthenticated child POSTs its events to the
+    // real public proxy unless a suite points it at a mock. The workspace
+    // `[env]` default can be overridden by the developer's shell, so force
+    // it here too. Telemetry suites opt back in via caller env with
+    // `SOCKET_TELEMETRY_DISABLED=0` and a wiremock endpoint.
+    cmd.env("SOCKET_TELEMETRY_DISABLED", "1");
     cmd
 }
 

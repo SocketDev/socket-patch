@@ -272,6 +272,61 @@ fn command_scrubs_ambient_socket_vars_and_forces_the_opt_outs() {
     );
 }
 
+/// B69: a test child must never POST telemetry to the real public proxy.
+/// An ambient opt-in (`SOCKET_TELEMETRY_DISABLED=0`, or a developer shell
+/// that removed the `.cargo/config.toml` default) must not reach the child;
+/// a suite that asserts telemetry sets its own value after `command`.
+#[test]
+#[serial]
+fn command_forces_telemetry_off() {
+    for ambient in ["0", ""] {
+        with_ambient(&[("SOCKET_TELEMETRY_DISABLED", ambient)], || {
+            let env = effective_env(&hermetic::command(Path::new("socket-patch")));
+            assert_eq!(
+                get(&env, "SOCKET_TELEMETRY_DISABLED"),
+                Some("1"),
+                "ambient SOCKET_TELEMETRY_DISABLED={ambient:?} must not re-enable telemetry"
+            );
+        });
+    }
+    let mut cmd = hermetic::command(Path::new("socket-patch"));
+    cmd.env("SOCKET_TELEMETRY_DISABLED", "0");
+    assert_eq!(
+        get(&effective_env(&cmd), "SOCKET_TELEMETRY_DISABLED"),
+        Some("0"),
+        "a telemetry suite's own opt-in lands last"
+    );
+}
+
+/// B69: every process `cargo test` / `cargo run` starts (and every child it
+/// spawns without a scrub) inherits the three opt-outs from the workspace
+/// `.cargo/config.toml` `[env]` table.
+#[test]
+fn cargo_config_env_carries_the_opt_outs() {
+    let config = Path::new(env!("CARGO_MANIFEST_DIR")).join("../../.cargo/config.toml");
+    let text = std::fs::read_to_string(&config)
+        .unwrap_or_else(|e| panic!("read {}: {e}", config.display()))
+        .replace("\r\n", "\n");
+    let env_table = text
+        .split("\n[env]\n")
+        .nth(1)
+        .unwrap_or_else(|| panic!("{} has no [env] table", config.display()));
+    let env_table = env_table.split("\n[").next().unwrap_or(env_table);
+    for var in [
+        "SOCKET_NO_CONFIG",
+        "SOCKET_NO_UPDATE_CHECK",
+        "SOCKET_TELEMETRY_DISABLED",
+    ] {
+        assert!(
+            env_table
+                .lines()
+                .any(|line| line.trim() == format!("{var} = \"1\"")),
+            "{} [env] must set {var} = \"1\"",
+            config.display()
+        );
+    }
+}
+
 #[test]
 #[serial]
 fn command_never_leaks_its_hostile_seeds() {
