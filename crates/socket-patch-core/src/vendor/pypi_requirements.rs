@@ -186,9 +186,9 @@ pub(super) async fn preflight_requirements(
                     "pypi_requirements_already_vendored",
                     format!(
                         "{}: already routes {canon_name} to the socket-patch vendored wheel for \
-                         patch {found}{why}; run `socket-patch vendor --revert` before \
-                         re-vendoring",
-                        file.rel
+                         patch {found}{why}; {remedy}",
+                        file.rel,
+                        remedy = super::common::REVERT_ALL_AND_REVENDOR,
                     ),
                 )
             };
@@ -300,9 +300,9 @@ pub(super) async fn rewire_requirements(
         (
             "pypi_requirements_already_vendored",
             format!(
-                "cannot re-wire {canon_name} from patch {}: {why}; run `socket-patch vendor \
-                     --revert` before re-vendoring",
-                prev.uuid
+                "cannot re-wire {canon_name} from patch {}: {why}; {remedy}",
+                prev.uuid,
+                remedy = super::common::REVERT_ALL_AND_REVENDOR,
             ),
         )
     })?;

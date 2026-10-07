@@ -52,9 +52,12 @@ async fn download_archive(
 // verified download by re-running the vendoring command; a file artifact
 // with no SHA-256 needs a revert first (it reverts every vendored package),
 // so the next vendoring run downloads afresh and records a new fingerprint.
-const NO_ARCHIVE_SHA256: &str = "the ledger has no archive SHA-256; restore it from version \
-     control, or run `socket-patch vendor --revert` (it reverts every vendored package) and \
-     vendor again";
+fn no_archive_sha256() -> String {
+    format!(
+        "the ledger has no archive SHA-256; restore it from version control, or {}",
+        super::common::REVERT_ALL_AND_REVENDOR
+    )
+}
 const NO_FILE_INVENTORY: &str = "the ledger has no complete file inventory; restore it from \
      version control, or re-run the vendoring command (`socket-patch vendor`, or `scan --mode \
      vendored`) to rebuild it from a verified download";
@@ -120,7 +123,7 @@ pub async fn restore(
     let file_shaped = !super::verify::is_vlt_dir_entry(entry)
         && super::verify::artifact_is_file_shaped(&entry.artifact.path);
     if file_shaped && entry.artifact.sha256.is_empty() {
-        return Err(NO_ARCHIVE_SHA256.into());
+        return Err(no_archive_sha256());
     }
     if !file_shaped && entry.artifact.file_inventory.is_none() {
         return Err(NO_FILE_INVENTORY.into());
@@ -766,7 +769,7 @@ mod tests {
             .unwrap_err();
         assert!(error.contains("no archive SHA-256"), "{error}");
         assert!(
-            error.contains("`socket-patch vendor --revert` (it reverts every vendored package) and vendor again"),
+            error.contains(super::super::common::REVERT_ALL_AND_REVENDOR),
             "the refusal names the remedy that records a new fingerprint: {error}"
         );
         assert!(server.received_requests().await.unwrap().is_empty());

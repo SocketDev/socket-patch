@@ -454,6 +454,17 @@ pub(crate) async fn any_live_file_references(
 /// stale or foreign shape. `vendor --revert` takes no package argument, so
 /// the remedy names its whole-project reach instead of implying a
 /// per-package form that does not exist (B80).
+///
+/// `socket-patch rollback <purl>` reverts one entry through the same
+/// per-entry revert, but it is not a drop-in "then vendor again": without
+/// `--preserve-state` it also deletes the artifact, the ledger record and
+/// the purl's manifest entry, so the following `vendor` has nothing left to
+/// vendor (the user would have to `get` the patch again); with
+/// `--preserve-state` it keeps a ledger entry whose wiring records are spent,
+/// and re-vendoring over that from a stale-shape lock (gem CHECKSUMS,
+/// Poetry/PDM/Pipenv sources) is not covered by any test. Until that path is
+/// proven, the remedy stays the whole-project revert, which keeps the
+/// manifest and re-vendors every package from it.
 pub(crate) const REVERT_ALL_AND_REVENDOR: &str = "run `socket-patch vendor --revert` (it reverts \
      EVERY vendored package in the project, not just this one), then vendor again";
 
