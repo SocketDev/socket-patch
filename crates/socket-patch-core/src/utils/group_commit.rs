@@ -18,8 +18,11 @@
 //! and [`GroupCommit::commit`] writes the final state once.
 //!
 //! **What is captured.** Files under the root whose relative path has no
-//! `.socket` component, plus the two ledgers (`.socket/vendor/state.json`,
-//! `.socket/vendor/redirect-state.json`). Everything else under `.socket/`
+//! `.socket` component, the two ledgers (`.socket/vendor/state.json`,
+//! `.socket/vendor/redirect-state.json`), and the small text files the JVM
+//! wiring owns under `.socket/` (the Gradle index and settings script, the
+//! owned `.gitattributes` files, the derived `maven-metadata.xml` files, the
+//! Coursier index). Everything else under `.socket/`
 //! — the artifacts under `.socket/vendor/<eco>/`, workspace members'
 //! `.socket/vendor/` mirrors, blobs, the manifest — is written straight to
 //! disk as before: artifacts are read back by path (zip readers, hashing,
@@ -191,9 +194,12 @@ fn is_captured(rel: &Path) -> bool {
             ".socket/gradle/socket-patch.settings.gradle",
             ".socket/vendor/maven2/.gitattributes",
             ".socket/vendor/gradle/.gitattributes",
+            crate::vendor::jvm::gradle::SCRIPT_GITATTRIBUTES_REL,
+            crate::vendor::jvm::gradle::VENDOR_GITATTRIBUTES_REL,
         ]
         .contains(&spelled.as_str())
         || crate::vendor::jvm::coursier_tree::CAPTURED_FILES.contains(&spelled.as_str())
+        || crate::vendor::jvm::gradle::is_derived_metadata_path(&spelled)
     {
         return true;
     }
@@ -1350,7 +1356,11 @@ mod tests {
             (".socket/gradle/socket-patch.settings.gradle", true),
             (".socket/vendor/maven2/.gitattributes", true),
             (".socket/vendor/gradle/.gitattributes", true),
+            (".socket/gradle/.gitattributes", true),
+            (".socket/vendor/.gitattributes", true),
+            (".socket/vendor/gradle/g/a/maven-metadata.xml", true),
             (".socket/vendor/gradle/g/a/1/a-1.jar", false),
+            (".socket/vendor/gradle/g/a/1/socket-patch.vendor.json", false),
             (".socket/vendor/npm/u/left-pad-1.3.0.tgz", false),
             (".socket/manifest.json", false),
             ("packages/a/.socket/vendor/npm/u/a.tgz", false),
