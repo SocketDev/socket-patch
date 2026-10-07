@@ -187,8 +187,9 @@ pub(crate) const NOTE_RECORD_OFFLINE: &str = "vex_record_offline";
 pub(crate) const NOTE_RECORD_NOT_FOUND: &str = "vex_record_not_found";
 /// A record fetch failed (transport, server, paid-only, ...).
 pub(crate) const NOTE_RECORD_FETCH_FAILED: &str = "vex_record_fetch_failed";
-/// The authenticated API refused the credentials; the public proxy served
-/// the retry (free patches only) — `get` / `scan`'s fallback.
+/// The public proxy served free patches only: the authenticated API refused
+/// the credentials (`get` / `scan`'s fallback), or a token was set but its
+/// org could not be resolved, so the run's client is on the proxy.
 pub(crate) const NOTE_API_AUTH_FALLBACK: &str = "api_auth_fallback";
 
 /// Omission tag and note: a hosted Gradle pin is wired, but a lock file
@@ -937,10 +938,20 @@ async fn fetch_records(
     }
     let overrides = common.api_client_overrides();
     // The run's client: the host's, or built here once (standalone `vex`).
+    let built_here = !api_client.initialized();
     let mut client = api_client
         .get_or_init(|| async { get_api_client_with_overrides(overrides.clone()).await.0 })
         .await
         .clone();
+    // A client built here whose org could not be resolved put the run on
+    // the proxy. Its construction already warned on stderr, so only the
+    // `--json` envelope needs the note (a host that seeded its client
+    // reports this itself).
+    if built_here && common.json {
+        if let Some(reason) = client.org_unresolved() {
+            notes.push(note(NOTE_API_AUTH_FALLBACK, reason.to_string()));
+        }
+    }
     let mut use_public_proxy = client.uses_public_proxy();
     let mut pending: Vec<String> = uuids.to_vec();
     // Each view is a heavy response: say what the run is waiting on (a live
@@ -1176,6 +1187,91 @@ mod tests {
             fallback.detail
         );
         assert!(out.contains_key(U1) && out.contains_key(U2), "{out:?}");
+    }
+
+    /// Standalone `vex --json` (no host client): a token whose org cannot
+    /// be resolved builds a proxy client here, the records come from the
+    /// proxy, and the envelope gets one `api_auth_fallback` note. A client
+    /// seeded by a host adds no note (the host reports it).
+    #[tokio::test]
+    #[serial_test::serial]
+    async fn unresolved_org_client_built_here_notes_the_fallback_once() {
+        use wiremock::matchers::{method, path as wm_path, path_regex};
+        use wiremock::{Mock, MockServer, ResponseTemplate};
+
+        let keys = ["SOCKET_ORG_SLUG", "SOCKET_OFFLINE", "SOCKET_NO_CONFIG"];
+        let saved: Vec<(&str, Option<String>)> = keys
+            .into_iter()
+            .map(|k| (k, std::env::var(k).ok()))
+            .collect();
+        std::env::remove_var("SOCKET_ORG_SLUG");
+        std::env::remove_var("SOCKET_OFFLINE");
+        std::env::set_var("SOCKET_NO_CONFIG", "1");
+
+        let mock = MockServer::start().await;
+        Mock::given(method("GET"))
+            .and(wm_path("/v0/organizations"))
+            .respond_with(ResponseTemplate::new(500))
+            .expect(1)
+            .mount(&mock)
+            .await;
+        Mock::given(path_regex("^/v0/orgs/"))
+            .respond_with(ResponseTemplate::new(500))
+            .expect(0)
+            .mount(&mock)
+            .await;
+        Mock::given(method("GET"))
+            .and(wm_path(format!("/patch/view/{U1}")))
+            .respond_with(ResponseTemplate::new(200).set_body_json(serde_json::json!({
+                "uuid": U1,
+                "purl": "pkg:npm/vexorg@1.0.0",
+                "publishedAt": "2026-01-01T00:00:00Z",
+                "files": {},
+                "vulnerabilities": {},
+                "description": "",
+                "license": "MIT",
+                "tier": "free",
+            })))
+            .mount(&mock)
+            .await;
+
+        let tmp = tempfile::tempdir().unwrap();
+        let common = GlobalArgs {
+            cwd: tmp.path().to_path_buf(),
+            json: true,
+            silent: true,
+            api_url: Some(mock.uri()),
+            api_token: Some("sktsec_placeholder_value_for_tests_api".into()),
+            proxy_url: Some(mock.uri()),
+            ..GlobalArgs::default()
+        };
+        let run_client = RunApiClient::new();
+        let mut notes: Vec<PlanNote> = Vec::new();
+        let out = fetch_records(&common, &run_client, &[U1.to_string()], &mut notes).await;
+        // A second fetch on the same run reuses the client: no second
+        // resolution (the mock's `.expect(1)`) and no second note.
+        let _ = fetch_records(&common, &run_client, &[U1.to_string()], &mut notes).await;
+
+        for (k, v) in saved {
+            match v {
+                Some(v) => std::env::set_var(k, v),
+                None => std::env::remove_var(k),
+            }
+        }
+
+        assert!(out.contains_key(U1), "{out:?}");
+        let fallbacks: Vec<_> = notes
+            .iter()
+            .filter(|n| n.code == NOTE_API_AUTH_FALLBACK)
+            .collect();
+        assert_eq!(fallbacks.len(), 1, "{notes:?}");
+        assert!(
+            fallbacks[0]
+                .detail
+                .contains("Pass --org or set SOCKET_ORG_SLUG"),
+            "{}",
+            fallbacks[0].detail
+        );
     }
 
     fn discovery(refs: Vec<PatchedRef>) -> Discovery {

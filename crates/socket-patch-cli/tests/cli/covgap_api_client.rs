@@ -104,6 +104,13 @@ fn assert_hash_token_warnings(stderr: &str, mode: &str) {
         ),
         "[{mode}] the warning must say what the run does and how to fix it; stderr={stderr}"
     );
+    assert_eq!(
+        stderr
+            .matches("Could not determine your organization")
+            .count(),
+        1,
+        "[{mode}] the run warns once; stderr={stderr}"
+    );
     assert!(
         stderr.contains("Hint: --api-token starts with `sha512-`"),
         "[{mode}] the 401 + hash-shaped token must trigger the stored-hash \
@@ -157,6 +164,17 @@ async fn get_with_hash_shaped_token_under_json_keeps_warnings_and_envelope() {
         "404 after failed org resolution maps to not_found, got: {v}"
     );
     assert_eq!(v["found"], 0, "not_found envelope reports zero found: {v}");
+    // The UUID path reports the startup downgrade in `warnings[]` too.
+    let warnings = v["warnings"]
+        .as_array()
+        .unwrap_or_else(|| panic!("no warnings[]: {v}"));
+    let prefix = "(api_auth_fallback) Could not determine your organization";
+    assert!(
+        warnings
+            .iter()
+            .any(|w| w.as_str().is_some_and(|w| w.starts_with(prefix))),
+        "api_auth_fallback missing from warnings[]: {v}"
+    );
 }
 
 /// `--silent` is "errors only": the same misconfiguration prints neither

@@ -2805,6 +2805,7 @@ pub async fn run(args: GetArgs) -> i32 {
                         &patch.uuid,
                         fallback_to_proxy,
                         &telemetry,
+                        &org_warnings,
                     )
                     .await;
                 }
@@ -2843,7 +2844,7 @@ pub async fn run(args: GetArgs) -> i32 {
                 return match mode {
                     // Save to manifest and apply in place.
                     super::scan::ScanMode::Agent => {
-                        save_and_apply_patch(&args, &api_client, &patch).await
+                        save_and_apply_patch(&args, &api_client, &patch, &org_warnings).await
                     }
                     super::scan::ScanMode::Hosted => {
                         let selected = vec![search_result_from_response(&patch)];
@@ -2875,6 +2876,7 @@ pub async fn run(args: GetArgs) -> i32 {
                     &args.identifier,
                     fallback_to_proxy,
                     &telemetry,
+                    &org_warnings,
                 )
                 .await;
             }
@@ -2887,7 +2889,9 @@ pub async fn run(args: GetArgs) -> i32 {
                 )
                 .await;
                 if args.common.json {
-                    print_json(&empty_result_json("not_found"));
+                    let mut result = empty_result_json("not_found");
+                    fold_narrowing_into_result(&mut result, &[], &org_warnings);
+                    print_json(&result);
                 } else if !args.common.silent {
                     println!("No patch found with UUID: {}", args.identifier);
                 }
@@ -3000,7 +3004,9 @@ pub async fn run(args: GetArgs) -> i32 {
 
     if search_response.patches.is_empty() {
         if args.common.json {
-            print_json(&empty_result_json("not_found"));
+            let mut result = empty_result_json("not_found");
+            fold_narrowing_into_result(&mut result, &[], &org_warnings);
+            print_json(&result);
         } else if !args.common.silent {
             println!("No patches found for {}: {}", id_type, args.identifier);
         }
@@ -3019,7 +3025,7 @@ pub async fn run(args: GetArgs) -> i32 {
 
     if accessible.is_empty() {
         if args.common.json {
-            print_json(&serde_json::json!({
+            let mut result = serde_json::json!({
                 "status": "paid_required",
                 "found": search_response.patches.len(),
                 "downloaded": 0,
@@ -3029,7 +3035,9 @@ pub async fn run(args: GetArgs) -> i32 {
                     "uuid": p.uuid,
                     "tier": p.tier,
                 })).collect::<Vec<_>>(),
-            }));
+            });
+            fold_narrowing_into_result(&mut result, &[], &org_warnings);
+            print_json(&result);
         } else if !args.common.silent {
             let all: Vec<&PatchSearchResult> = search_response.patches.iter().collect();
             if id_type == IdentifierType::Package && !quiet {
@@ -3309,6 +3317,7 @@ async fn report_paid_required_uuid(
     patch_id: &str,
     fallback_to_proxy: bool,
     telemetry: &TelemetryAuth,
+    org_warnings: &[(String, String)],
 ) -> i32 {
     track_patch_fetch_failed(patch_id, "paid_required", fallback_to_proxy, telemetry).await;
     if args.common.json {
@@ -3316,13 +3325,15 @@ async fn report_paid_required_uuid(
         if let Some(purl) = purl {
             record["purl"] = serde_json::json!(purl);
         }
-        print_json(&serde_json::json!({
+        let mut result = serde_json::json!({
             "status": "paid_required",
             "found": 1,
             "downloaded": 0,
             "applied": 0,
             "patches": [record],
-        }));
+        });
+        fold_narrowing_into_result(&mut result, &[], org_warnings);
+        print_json(&result);
     } else if !args.common.silent {
         let name = purl.map(|p| normalize_purl(p).into_owned());
         println!(
@@ -3514,7 +3525,12 @@ async fn save_patch_record(
 /// `--save-only`, apply it — under ONE apply lock, on the `client` the
 /// fetch used (a fresh client could re-hit the 401/403 its proxy fallback
 /// just recovered from).
-async fn save_and_apply_patch(args: &GetArgs, client: &ApiClient, patch: &PatchResponse) -> i32 {
+async fn save_and_apply_patch(
+    args: &GetArgs,
+    client: &ApiClient,
+    patch: &PatchResponse,
+    org_warnings: &[(String, String)],
+) -> i32 {
     // Same "errors only" gate as `run` — informational prints respect
     // `--silent`; errors and the JSON envelope do not.
     let quiet = args.common.json || args.common.silent;
@@ -3657,6 +3673,7 @@ async fn save_and_apply_patch(args: &GetArgs, client: &ApiClient, patch: &PatchR
         if !warnings.is_empty() {
             result_json["warnings"] = serde_json::json!(warnings);
         }
+        fold_narrowing_into_result(&mut result_json, &[], org_warnings);
         print_json(&result_json);
     }
 
