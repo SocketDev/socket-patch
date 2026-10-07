@@ -617,6 +617,83 @@ async fn gem_hosted_stale_bundler4_standalone_install_warns_and_is_not_attested(
     );
 }
 
+/// #967: with `simulate_version 5` (Bundler 4.x) or
+/// `default_install_uses_path` (2.x) and no path in any tier, Bundler
+/// installs into `<root>/.bundle/<engine>/<abi>/gems`. A stale copy there is
+/// what `bundle exec` loads, so the guard must name it and the same run's
+/// `--vex` must not attest the purl.
+#[tokio::test(flavor = "multi_thread")]
+async fn gem_hosted_stale_dot_bundle_install_warns_and_is_not_attested() {
+    for config in [
+        "---\nBUNDLE_SIMULATE_VERSION: \"5\"\n",
+        "---\nBUNDLE_DEFAULT_INSTALL_USES_PATH: \"true\"\n",
+    ] {
+        let server = MockServer::start().await;
+        mount_api(&server, None).await;
+        let tmp = tempfile::tempdir().unwrap();
+        let proj = tmp.path().join("proj");
+        std::fs::create_dir_all(&proj).unwrap();
+        write_manifest_pair(&proj);
+        let home = proj.join(".bundle").join("ruby").join("3.3.0");
+        let gem_dir = home.join("gems").join(format!("{DEP}-{DEP_VERSION}"));
+        std::fs::create_dir_all(gem_dir.join("lib")).unwrap();
+        std::fs::write(gem_dir.join("lib").join("stale_probe_gem.rb"), UPSTREAM_LIB).unwrap();
+        std::fs::write(proj.join(".bundle").join("config"), config).unwrap();
+
+        let vex_path = proj.join("out.vex.json");
+        let (code, stdout, stderr) = common::run_with_env(
+            &proj,
+            &[
+                "scan",
+                "--mode",
+                "hosted",
+                "--json",
+                "--yes",
+                "--cwd",
+                proj.to_str().unwrap(),
+                "--api-url",
+                &server.uri(),
+                "--org",
+                ORG,
+                "--api-token",
+                "fake",
+                "--vex",
+                vex_path.to_str().unwrap(),
+                "--vex-product",
+                "pkg:gem/app@1.0.0",
+            ],
+            &[],
+        );
+        let env = common::parse_json_envelope(&stdout);
+        assert_eq!(
+            env["redirect"]["redirected"], 1,
+            "{config}: envelope: {env}"
+        );
+        let details = stale_warnings(&env);
+        assert_eq!(
+            details.len(),
+            1,
+            "{config}: the stale .bundle copy must trip the guard: {env}\nstderr:\n{stderr}"
+        );
+        assert!(
+            details[0].contains(&gem_dir.display().to_string())
+                && !details[0].contains("shared gem home"),
+            "{config}: the warning must name the .bundle copy as project-local: {}",
+            details[0]
+        );
+        if let Ok(doc) = std::fs::read_to_string(&vex_path) {
+            assert!(
+                !doc.contains(PURL),
+                "{config}: a stale .bundle copy must never be attested:\n{doc}"
+            );
+        }
+        assert_ne!(
+            code, 0,
+            "{config}: an all-stale --vex run must fail, not attest.\nstdout:\n{stdout}\nstderr:\n{stderr}"
+        );
+    }
+}
+
 /// #483: bundler's cache dir is the `cache_path` setting — `bundle config
 /// set --local cache_path vendor/gems` (a committed `.bundle/config`) or a
 /// `BUNDLE_CACHE_PATH` export. A fresh checkout whose committed archive at
@@ -630,8 +707,11 @@ async fn gem_hosted_stale_archive_at_configured_cache_path_warns_and_is_not_atte
     let server = MockServer::start().await;
     mount_api(&server, None).await;
     let moved = "---\nBUNDLE_CACHE_PATH: \"vendor/gems\"\n";
+    // #951: Bundler drops a trailing `# comment` from the value.
+    let commented = "---\nBUNDLE_CACHE_PATH: vendor/gems # committed gem cache\n";
     for (label, config, env, cache_dir) in [
         ("app-config", Some(moved), &[][..], "gems"),
+        ("app-config-commented", Some(commented), &[][..], "gems"),
         (
             "env",
             None,

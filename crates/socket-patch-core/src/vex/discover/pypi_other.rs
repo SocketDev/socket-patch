@@ -16,10 +16,11 @@
 //!   a url naming another package, is diagnosed, never trusted. When the
 //!   url does not carry the `patch/pypi/…` levels (a self-hosted
 //!   `--patch-server-url` layout), the artifact filename alone supplies
-//!   the version. This is the host-allowlisted twin of
-//!   `vendor::pypi_pipenv::is_socket_hosted_reference`, which accepts the
-//!   same path shape on ANY https host because it only decides ownership
-//!   of a lock entry, not attestation;
+//!   the version. The path is parsed by the same
+//!   `vendor::lock_inventory::pypi::hosted_artifact_url` that
+//!   `hosted_pypi_reference` (hosted Pipenv rotation and the vendored
+//!   Pipenv guard's "is this lock entry ours" check) uses, and both apply
+//!   the same patch-server origin allowlist;
 //! * a root-anchored `.socket/vendor/pypi/<uuid>/<wheel>` path
 //!   ([`vendor_ref`]) → [`WiringMode::Vendored`]. The wheel must be a single
 //!   PEP 427 filename (or a server sdist's `dist-version.tar.gz`) naming the

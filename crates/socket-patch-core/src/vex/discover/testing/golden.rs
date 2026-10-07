@@ -252,6 +252,26 @@ fn render(out: &Discovery, root: &Path) -> Value {
             .collect::<Vec<_>>()
             .into();
     }
+    if !unpatched_copies.is_empty() {
+        rendered["unpatched_copies"] = unpatched_copies
+            .iter()
+            .map(|c| {
+                let UnpatchedCopy {
+                    purl,
+                    file,
+                    key,
+                    how,
+                } = c;
+                json!({
+                    "purl": purl,
+                    "file": path_str(file),
+                    "key": key,
+                    "how": normalize(how, &roots),
+                })
+            })
+            .collect::<Vec<_>>()
+            .into();
+    }
     if !contested.is_empty() {
         rendered["contested"] = contested
             .iter()
