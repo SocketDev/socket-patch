@@ -9,6 +9,9 @@
 //! rewriters and lockfile discovery cannot disagree on it.
 
 pub(crate) mod berry_entry;
+pub mod berry_gates;
+
+use super::text::strip_bom;
 
 /// Which grammar a `yarn.lock` head declares.
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
@@ -54,17 +57,16 @@ pub fn is_berry_lock(content: &str) -> bool {
         .any(|line| line.starts_with("__metadata:"))
 }
 
-fn strip_bom(text: &str) -> &str {
-    text.strip_prefix('\u{feff}').unwrap_or(text)
-}
-
 #[cfg(test)]
 mod tests {
     use super::*;
 
     #[test]
     fn sniff_prefers_berry_and_skips_a_bom() {
-        assert_eq!(sniff_grammar("__metadata:\n  version: 8\n"), Some(YarnLockGrammar::Berry));
+        assert_eq!(
+            sniff_grammar("__metadata:\n  version: 8\n"),
+            Some(YarnLockGrammar::Berry)
+        );
         assert_eq!(
             sniff_grammar("\u{feff}# yarn lockfile v1\r\n"),
             Some(YarnLockGrammar::Classic)
