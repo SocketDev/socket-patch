@@ -252,10 +252,12 @@ async fn nuget_prelude(
         }
     };
 
-    // The idempotent hot path's test (see `vendor_nuget`).
+    // The idempotent hot path's test (see `vendor_nuget`): a live
+    // `<packageSources>` source under our key. A commented-out one — or the
+    // key merely mentioned elsewhere — is not wiring NuGet reads.
     let config_wired = config_text
         .as_deref()
-        .is_some_and(|t| t.contains(&source_key));
+        .is_some_and(|t| parse_config_source_keys(&blank_comments(t)).contains(&source_key));
     let in_sync = config_wired && {
         // One guarded read of the committed nupkg serves both the member-hash
         // check and the lock's content-hash pin.
@@ -2092,6 +2094,48 @@ mod tests {
             tokio::fs::read(root.join(copy_rel())).await.unwrap(),
             nupkg1,
             "re-zip is deterministic"
+        );
+    }
+
+    /// B61: a commented-out Socket source is not wiring NuGet reads, so a
+    /// re-run must rewire instead of taking the in-sync hot path on a raw
+    /// substring match of the source key.
+    #[tokio::test]
+    async fn commented_out_source_is_not_wired() {
+        let (dir, blobs, installed, record) = fixture(true, None).await;
+        let root = dir.path();
+        let (r1, e1, _) = unwrap_done(run_vendor(root, &blobs, &installed, &record, false).await);
+        assert!(r1.success && e1.is_some());
+
+        let cfg = tokio::fs::read_to_string(root.join("nuget.config"))
+            .await
+            .unwrap();
+        let add_at = cfg
+            .find(&format!("<add key=\"{}\"", source_key()))
+            .expect("first run wires our source");
+        let line_end = add_at + cfg[add_at..].find('\n').unwrap();
+        let commented = format!(
+            "{}<!-- {} -->{}",
+            &cfg[..add_at],
+            &cfg[add_at..line_end],
+            &cfg[line_end..]
+        );
+        tokio::fs::write(root.join("nuget.config"), &commented)
+            .await
+            .unwrap();
+
+        let (r2, e2, _) = unwrap_done(run_vendor(root, &blobs, &installed, &record, false).await);
+        assert!(r2.success, "{:?}", r2.error);
+        assert!(
+            e2.is_some(),
+            "a commented-out source must not take the in-sync hot path"
+        );
+        let rewired = tokio::fs::read_to_string(root.join("nuget.config"))
+            .await
+            .unwrap();
+        assert!(
+            parse_config_source_keys(&blank_comments(&rewired)).contains(&source_key()),
+            "the re-run wires a live source: {rewired}"
         );
     }
 
