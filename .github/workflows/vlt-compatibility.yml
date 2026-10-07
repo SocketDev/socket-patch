@@ -270,9 +270,9 @@ jobs:
           - {os: ubuntu-latest, vlt: '1.2.0', linker: hardlink, cache_root: /dev/shm/vlt-e2e-cache, suites: e2e_safety_vlt}
     runs-on: ${{ matrix.os }}
     timeout-minutes: 45
+    # The capstones resolve fixtures through the build job's checkout path,
+    # which is the same on every runner of one OS.
     steps: &install-proof-steps
-      # The capstones resolve fixtures through the build job's checkout path,
-      # which is the same on every runner of one OS.
       - uses: actions/checkout@de0fac2e4500dabe0009e67214ff5f5447ce83dd # v6.0.2
         with:
           persist-credentials: false
