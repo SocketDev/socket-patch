@@ -430,6 +430,14 @@
     "elsewhere": [],
     "live_claims": []
   },
+  "bun-lockb/late-dependent": {
+    "refs": [],
+    "diagnostics": [],
+    "recognized": [],
+    "unlocked_pins": [],
+    "elsewhere": [],
+    "live_claims": []
+  },
   "bun-lockb/prerelease-pair-0.8.1": {
     "refs": [],
     "diagnostics": [],
