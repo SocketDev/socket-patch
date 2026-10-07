@@ -987,7 +987,16 @@ pub(crate) async fn run_redirect_selected(
             socket_patch_core::utils::fs::read_regular_to_string_sync(path).ok()
         })
     };
-    let rewrite_options = || RewriteOptions {
+    // The yarn 1 config layers outside the project (env, user, global and
+    // ancestor rc files), located the way yarn 1 does: a mirror set in any
+    // of them refuses the classic rewrite like a project one.
+    let yarn_classic_outer = || {
+        socket_patch_core::patch::redirect::yarnrc::resolve_outer_yarn_mirror_for_process(
+            &common.cwd,
+        )
+    };
+    let rewrite_options = || {
+        RewriteOptions {
         dry_run: common.dry_run,
         targets_pipenv_lock,
         pipenv_major,
@@ -998,7 +1007,9 @@ pub(crate) async fn run_redirect_selected(
         trust_lockfile_config: !common.no_trust_lockfile_config,
         npm_allow_remote_config: !common.no_npm_allow_remote_config,
         npm_outer: &npm_outer,
+        yarn_classic_outer: &yarn_classic_outer,
         blocking: true,
+    }
     };
     // The rollout gate plans again without its deferred rows: keep what
     // the second pass needs.
@@ -1812,6 +1823,9 @@ async fn vendored_takeover(
                     &lock,
                     yarnrc.as_deref(),
                     npmrc.as_deref(),
+                    &socket_patch_core::patch::redirect::yarnrc::resolve_outer_yarn_mirror_for_process(
+                        &common.cwd,
+                    ),
                 )
                 .err()
             }
@@ -4746,19 +4760,43 @@ mod tests {
         use super::npm_allow_remote_one_line;
         let hosts = ["patch.socket.dev"];
         let cases = [
-            (npm_allow_remote_configured_detail(&hosts, true, false), "Note: set"),
-            (npm_allow_remote_configured_detail(&hosts, false, false), "Note: set"),
-            (npm_allow_remote_configured_detail(&hosts, true, true), "Note: would set"),
-            (npm_allow_remote_already_detail(&hosts), "Note: .npmrc already"),
-            (npm_allow_remote_user_set_detail(&hosts, "none"), "Warning: npm >=12"),
-            (npm_allow_remote_env_set_detail(&hosts, "npm_config_allow_remote", "none"), "Warning: npm >=12"),
+            (
+                npm_allow_remote_configured_detail(&hosts, true, false),
+                "Note: set",
+            ),
+            (
+                npm_allow_remote_configured_detail(&hosts, false, false),
+                "Note: set",
+            ),
+            (
+                npm_allow_remote_configured_detail(&hosts, true, true),
+                "Note: would set",
+            ),
+            (
+                npm_allow_remote_already_detail(&hosts),
+                "Note: .npmrc already",
+            ),
+            (
+                npm_allow_remote_user_set_detail(&hosts, "none"),
+                "Warning: npm >=12",
+            ),
+            (
+                npm_allow_remote_env_set_detail(&hosts, "npm_config_allow_remote", "none"),
+                "Warning: npm >=12",
+            ),
             (npm_allow_remote_manual_detail(&hosts), "Warning: npm >=12"),
-            (npm_allow_remote_unreadable_detail(&hosts, "is a symlink"), "Warning: npm >=12"),
+            (
+                npm_allow_remote_unreadable_detail(&hosts, "is a symlink"),
+                "Warning: npm >=12",
+            ),
         ];
         for (detail, start) in cases {
             let line = npm_allow_remote_one_line(&detail);
             assert!(line.starts_with(start), "{line}");
-            assert!(!line.contains('\n') && line.ends_with("(details: --verbose)."), "{line}");
+            assert!(
+                !line.contains('\n') && line.ends_with("(details: --verbose)."),
+                "{line}"
+            );
         }
     }
 }

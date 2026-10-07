@@ -3957,7 +3957,10 @@ snapshots:
             hosted_npmrc,
             "the hosted .npmrc must be untouched"
         );
-        assert!(!root.join(".socket/vendor/npm").exists(), "nothing is staged");
+        assert!(
+            !root.join(".socket/vendor/npm").exists(),
+            "nothing is staged"
+        );
     }
 
     /// Hosted → vendored over a linked `.socket/vendor/npm` (#664): the

@@ -121,9 +121,16 @@ fn corepack(cwd: &Path, pm: &str, args: &[&str], extra_env: &[(&str, &str)]) -> 
 }
 
 fn run_socket(cwd: &Path, args: &[&str]) -> (i32, String, String) {
+    run_socket_env(cwd, args, &[])
+}
+
+fn run_socket_env(cwd: &Path, args: &[&str], extra_env: &[(&str, &str)]) -> (i32, String, String) {
     let mut cmd = Command::new(binary());
     cmd.args(args).current_dir(cwd);
     scrub_socket_env(&mut cmd);
+    for (k, v) in extra_env {
+        cmd.env(k, v);
+    }
     let out = cmd.output().expect("failed to run socket-patch binary");
     (
         out.status.code().unwrap_or(-1),
@@ -231,20 +238,35 @@ enum HostedDriver {
     GetUuid,
 }
 
+/// Where the fixture configures `yarn-offline-mirror`.
+#[derive(Clone, Copy, PartialEq, Debug)]
+enum Mirror {
+    None,
+    /// The project's `.yarnrc` (#364).
+    ProjectRc,
+    /// The project's `.yarnrc`, saved with a UTF-8 BOM and CRLF (#1078).
+    ProjectRcBom,
+    /// The `.yarnrc` of the project's parent directory (#1013).
+    ParentRc,
+    /// `YARN_YARN_OFFLINE_MIRROR` (#1013).
+    Env,
+}
+
 /// Steps 1–3: real install, patched tarball + API mocks, the hosted rewrite
 /// (per `driver`: `scan --mode hosted --vex` or `get <uuid> --mode hosted`),
 /// and the envelope/lockfile/ledger assertions.
 /// `tamper_served_tarball` serves DIFFERENT bytes at the hosted URL than the
-/// sha1/integrity pins. `offline_mirror` configures `yarn-offline-mirror`
-/// in `.yarnrc` before the fixture install, so the mirror holds the upstream
-/// tarball, and asserts the hosted rewrite REFUSES (#364) instead of
-/// pinning. `None` = skip (message printed).
+/// sha1/integrity pins. `mirror` configures `yarn-offline-mirror` (at
+/// `<proj>/mirror`) where [`Mirror`] says before the fixture install, so the
+/// mirror holds the upstream tarball, and asserts the hosted rewrite
+/// REFUSES (#364) instead of pinning. `None` = skip (message printed).
 async fn classic_hosted_project(
     tag: &str,
     tamper_served_tarball: bool,
-    offline_mirror: bool,
+    mirror: Mirror,
     driver: HostedDriver,
 ) -> Option<ClassicRedirectFixture> {
+    let offline_mirror = mirror != Mirror::None;
     if !require_yarn_classic(&format!("e2e_redirect_yarn_classic_build ({tag})"), |c| {
         cache_env::isolate(c);
     }) {
@@ -260,17 +282,42 @@ async fn classic_hosted_project(
         ),
     )
     .unwrap();
-    if offline_mirror {
-        std::fs::write(proj.join(".yarnrc"), "yarn-offline-mirror \"./mirror\"\n").unwrap();
+    let mirror_dir = proj.join("mirror");
+    let mirror_dir = mirror_dir.to_str().unwrap();
+    // Where yarn reads the mirror from; the env leg sets it for yarn AND
+    // the scan (the same shell would).
+    let mut mirror_env: Vec<(&str, &str)> = Vec::new();
+    match mirror {
+        Mirror::None => {}
+        Mirror::ProjectRc => {
+            std::fs::write(proj.join(".yarnrc"), "yarn-offline-mirror \"./mirror\"\n").unwrap();
+        }
+        Mirror::ProjectRcBom => {
+            std::fs::write(
+                proj.join(".yarnrc"),
+                "\u{feff}yarn-offline-mirror \"./mirror\"\r\n",
+            )
+            .unwrap();
+        }
+        Mirror::ParentRc => {
+            std::fs::write(
+                tmp.path().join(".yarnrc"),
+                format!("yarn-offline-mirror {mirror_dir:?}\n"),
+            )
+            .unwrap();
+        }
+        Mirror::Env => mirror_env.push(("YARN_YARN_OFFLINE_MIRROR", mirror_dir)),
     }
 
     // 1. REAL fixture: yarn classic install (network here, private cache).
     let cache = tmp.path().join("yarn-cache");
+    let mut install_env = vec![("YARN_CACHE_FOLDER", cache.to_str().unwrap())];
+    install_env.extend_from_slice(&mirror_env);
     let install = corepack(
         &proj,
         &yarn_classic(),
         &["install", "--no-progress"],
-        &[("YARN_CACHE_FOLDER", cache.to_str().unwrap())],
+        &install_env,
     );
     if !install.status.success() {
         skip!(
@@ -435,7 +482,7 @@ async fn classic_hosted_project(
             "fake",
         ],
     };
-    let (code, stdout, stderr) = run_socket(&proj, &argv);
+    let (code, stdout, stderr) = run_socket_env(&proj, &argv, &mirror_env);
     let env: serde_json::Value = serde_json::from_str(&stdout).unwrap_or_else(|e| {
         panic!("{driver:?} --mode hosted --json output is not JSON: {e}\nstdout:\n{stdout}")
     });
@@ -453,7 +500,8 @@ async fn classic_hosted_project(
             "a mirrored project must not count a redirect: {env}"
         );
         assert!(
-            env.to_string().contains("redirect_yarn_classic_offline_mirror"),
+            env.to_string()
+                .contains("redirect_yarn_classic_offline_mirror"),
             "the refusal must be reported: {env}"
         );
         assert_eq!(
@@ -707,7 +755,8 @@ fn hosted_dev_resave_vex(fx: &ClassicRedirectFixture) {
 #[tokio::test(flavor = "multi_thread")]
 #[serial_test::serial]
 async fn classic_redirect_fresh_checkout_installs_patched_bytes() {
-    let Some(fx) = classic_hosted_project("main", false, false, HostedDriver::Scan).await else {
+    let Some(fx) = classic_hosted_project("main", false, Mirror::None, HostedDriver::Scan).await
+    else {
         return;
     };
 
@@ -746,7 +795,9 @@ async fn classic_redirect_fresh_checkout_installs_patched_bytes() {
 #[tokio::test(flavor = "multi_thread")]
 #[serial_test::serial]
 async fn classic_get_uuid_hosted_fresh_checkout_installs() {
-    let Some(fx) = classic_hosted_project("get-uuid", false, false, HostedDriver::GetUuid).await else {
+    let Some(fx) =
+        classic_hosted_project("get-uuid", false, Mirror::None, HostedDriver::GetUuid).await
+    else {
         return;
     };
 
@@ -778,7 +829,8 @@ async fn classic_get_uuid_hosted_fresh_checkout_installs() {
 #[tokio::test(flavor = "multi_thread")]
 #[serial_test::serial]
 async fn classic_redirect_tampered_hosted_tarball_fails_integrity() {
-    let Some(fx) = classic_hosted_project("tampered", true, false, HostedDriver::Scan).await else {
+    let Some(fx) = classic_hosted_project("tampered", true, Mirror::None, HostedDriver::Scan).await
+    else {
         return;
     };
 
@@ -819,12 +871,21 @@ async fn classic_redirect_tampered_hosted_tarball_fails_integrity() {
 #[tokio::test(flavor = "multi_thread")]
 #[serial_test::serial]
 async fn classic_offline_mirror_refuses_hosted_and_keeps_installs_working() {
-    let Some(fx) = classic_hosted_project("offline-mirror", false, true, HostedDriver::Scan).await
+    let Some(fx) = classic_hosted_project(
+        "offline-mirror",
+        false,
+        Mirror::ProjectRc,
+        HostedDriver::Scan,
+    )
+    .await
     else {
         return;
     };
     assert!(
-        fx.proj.join("mirror").join(format!("{DEP}-{DEP_VERSION}.tgz")).is_file(),
+        fx.proj
+            .join("mirror")
+            .join(format!("{DEP}-{DEP_VERSION}.tgz"))
+            .is_file(),
         "the fixture install must populate the offline mirror"
     );
     let fresh = fx.tmp.path().join("fresh");
@@ -850,7 +911,11 @@ async fn classic_offline_mirror_refuses_hosted_and_keeps_installs_working() {
             String::from_utf8_lossy(&ci.stderr)
         );
         assert!(
-            !fresh.join("node_modules").join(DEP).join("index.js").exists(),
+            !fresh
+                .join("node_modules")
+                .join(DEP)
+                .join("index.js")
+                .exists(),
             "yarn < 1.7 is expected to install nothing from the mirror"
         );
         return;
@@ -872,8 +937,36 @@ async fn classic_offline_mirror_refuses_hosted_and_keeps_installs_working() {
         );
         let installed =
             std::fs::read(fresh.join("node_modules").join(DEP).join("index.js")).unwrap();
-        assert_eq!(installed, fx.orig, "the untouched lock installs the upstream bytes");
+        assert_eq!(
+            installed, fx.orig,
+            "the untouched lock installs the upstream bytes"
+        );
         std::fs::remove_dir_all(fresh.join("node_modules")).unwrap();
+    }
+}
+
+/// #1078 / #1013: yarn 1 also takes the mirror from a BOM-prefixed project
+/// `.yarnrc`, an ancestor directory's `.yarnrc` and a `YARN_*` env var, so
+/// each refuses the hosted rewrite like the plain project rc above (the
+/// fixture asserts no redirect, no attestation, an untouched lock).
+#[tokio::test(flavor = "multi_thread")]
+#[serial_test::serial]
+async fn classic_offline_mirror_outside_project_rc_refuses_hosted() {
+    for (tag, mirror) in [
+        ("offline-mirror-bom", Mirror::ProjectRcBom),
+        ("offline-mirror-parent", Mirror::ParentRc),
+        ("offline-mirror-env", Mirror::Env),
+    ] {
+        let Some(fx) = classic_hosted_project(tag, false, mirror, HostedDriver::Scan).await else {
+            return;
+        };
+        assert!(
+            fx.proj
+                .join("mirror")
+                .join(format!("{DEP}-{DEP_VERSION}.tgz"))
+                .is_file(),
+            "{tag}: yarn must read this mirror config (the fixture install populates it)"
+        );
     }
 }
 

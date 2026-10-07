@@ -469,8 +469,16 @@ fn get_help_lists_all_identifier_flags() {
         );
     }
     // Help text is for users: no implementation notes from the source.
-    for leak in ["value_parser", "parse_bool_flag", "No env binding", "locally- installed"] {
-        assert!(!stdout.contains(leak), "get --help leaks {leak:?}: {stdout}");
+    for leak in [
+        "value_parser",
+        "parse_bool_flag",
+        "No env binding",
+        "locally- installed",
+    ] {
+        assert!(
+            !stdout.contains(leak),
+            "get --help leaks {leak:?}: {stdout}"
+        );
     }
 }
 
