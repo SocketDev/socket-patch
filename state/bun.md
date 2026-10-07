@@ -1,6 +1,6 @@
 [agent] Progress ledger for the scheduled Bun bug-hunt routine (label pm:bun).
 
-Last updated: 2026-10-07 (run 26), main `9c43dfc`, latest release 4.0.0, latest Bun 1.4.2.
+Last updated: 2026-10-07 (run 27), main `9c43dfc`, latest release 4.0.0, latest Bun 1.4.2 (canary 1.4.3-canary.1).
 
 Method (run 16 note: the sandbox shell exports `BUN_OPTIONS=--smol`, so unset it; run 17 note: on Bun ≥ 1.2, `bunfig [install] saveTextLockfile = false` writes a binary `bun.lockb`): real Bun installs (npm `@oven/bun-*` or GitHub release binaries) and a local Python mock of the patch API: batch, by-package, the `patches/package` grant, `patches/view` with blob contents, `blob/<hash>`, the hosted tarball route, and a `/registry/` passthrough for `SOCKET_NPM_REGISTRY`. Set `SOCKET_PATCH_SERVER_URL` to the mock. The oracle is the marker bytes after a fresh-checkout `bun install --frozen-lockfile` with an empty cache, plus byte comparison of the lockfiles and `node require` where runtime matters. The repo's own matrix (`scripts/backtest-bun.py`, `bun-compatibility.yml`) already covers plain hosted and vendored shapes across Bun 0.8.1–1.4.2. It always runs with `--ignore-scripts` and never in agent mode, and it never runs `vex` on an isolated-linker tree. This ledger tracks what it doesn't.
 
@@ -39,6 +39,8 @@ Run 24 (main unchanged at `9c43dfc`, so no re-triage): no new bugs. The Bun 1.3.
 Run 25 (main unchanged at `9c43dfc`, so no re-triage): no new bugs. Mixed per-package modes (vendored ⇄ one package hosted, on text and `bun.lockb`, single and workspace, 1.2.23 / 1.3.9 / 1.4.2) pass, as do `globalStore` + vendored workspace lockb, `overrides`/`resolutions` and Bun lock re-serializations. #861 also reproduces under `globalStore`. `bun remove` of a vendored package leaves `vendor --check` red with a no-op remedy; it's generic, so it was handed to npm (related #900). See the run 25 section below.
 
 Run 26 (main unchanged at `9c43dfc`, so no re-triage): no new bugs. Explicit `trustedDependencies` and `bun pm trust` on hosted / vendored packages with a postinstall keep the script running (text + `bun.lockb`, single + workspace, 1.2.23 / 1.3.9 / 1.4.2). Mixed per-package modes plus a superseding uuid, re-run in each mode, pass. `bun install --filter` frozen installs on rewired workspaces pass. Probe-branch deletion is still refused (now by the sandbox's permission classifier). See the run 26 section below.
+
+Run 27 (main unchanged at `9c43dfc`, so no re-triage): new **#992**. Hosted `bun.lock` `rollback` / `remove` / hosted→vendored→`vendor --revert` write `""` into the registry slot, and Bun 1.1.39–1.3.6 resolve `""` against npmjs, ignoring the bunfig registry. Custom-registry projects then fail cold frozen installs (404), or silently bypass their mirror. Bun's own boundary is 1.3.7. Also passing: `preinstall` / `install` / `postinstall` on a scoped package with a `bin` and an unscoped preinstall-only package (hosted / vendored × text / `bun.lockb` × single / workspace × 1.2.23 / 1.3.9 / 1.4.2). In untrusted projects, rewiring doesn't start running scripts. `bun pm trust` and `--filter` work on 1.2.23. Plain re-installs leave a rewritten `bun.lockb` byte-identical. Bun 1.4.3-canary.1 passes hosted / vendored / agent, the takeover chain and rollback. Packages with only a sha1 `shasum` rewire fine. See the run 27 section below.
 
 ## Coverage matrix
 
@@ -371,6 +373,18 @@ Other passes (Linux, 1.4.2 unless noted):
   - Lockfile-only vendored scan on 1.1.45 v0 with a CRLF + BOM `package.json`.
   - A corrupt served tarball rejected on 1.3.9, 1.3.10 and 1.4.2, text + lockb.
 
+### Run 27 (Linux, main `9c43dfc`)
+| Cell | Bun | Result |
+| --- | --- | --- |
+| Hosted/vendored rewire of a scoped package with `preinstall`/`install`/`postinstall` + `bin`, and an unscoped preinstall-only package; `trustedDependencies`; cold frozen install runs the same scripts, links `.bin`, is patched, `vex` attests | 1.2.23 / 1.3.9 / 1.4.2 × text / lockb × single / workspace (pre-v2 text workspace vendored refuses, documented) | pass |
+| Same, untrusted project (no `trustedDependencies`): no scripts run before or after the rewire | 1.2.23 / 1.3.9 / 1.4.2 × text / lockb | pass |
+| `bun pm trust` after rewiring; `--frozen-lockfile --filter` (`m1`, `proj`, `!m1`, `./packages/*`) | 1.2.23 | pass |
+| Plain (non-frozen) `bun install` on a rewritten `bun.lockb` leaves it byte-identical (same `bun pm hash`) | 1.2.23 / 1.3.9 / 1.4.2, hosted + vendored, single + workspace | pass |
+| Hosted / vendored / agent cells, the hosted→vendored→revert→hosted→rollback chain | 1.4.3-canary.1 (text v2 + lockb) | pass (lockb rollback refuses, documented) |
+| sha1-only package (registry has `shasum`, no `integrity`): hosted / vendored rewire + frozen install | 1.2.23 / 1.3.9 / 1.4.2 × text / lockb | pass |
+| Hosted text-lock rollback / remove / takeover-revert with a bunfig custom registry, then a cold frozen install | 1.1.45 / 1.2.23 / 1.3.6 | **fail #992** |
+| Same | 1.3.7 / 1.4.2 | pass (only the `""` diff) |
+
 ## Backlog
 
 0. **Maintainer request (partly covered in runs 3 and 6):** global (`-g`) mode for hosted patches. Still to do: a non-writable global dir must fail loudly (needs a probe; the sandbox runs as root); Windows 1.1.45/1.2.23 with an ASCII temp path; Bun 1.0.x. #443 is still open; re-test #434 (`bun.cmd`) on Windows now that #442 has landed. Checklist: the 20261001T040000Z entry.
@@ -381,10 +395,13 @@ Other passes (Linux, 1.4.2 unless noted):
 5. macOS/Windows re-runs of the #366 / #405 / #469 / #803 fixes (Windows isolated uses junctions).
 6. #497 `github:` tuples (needs a probe).
 7. Hosted rollback on real macOS and Windows checkouts.
-8. Bun 1.4.3 when stable. Lifecycle scripts beyond postinstall (`preinstall`, `prepare`) and a scoped package with a script on `bun.lockb`. (Mixed modes, `globalStore` + vendored workspace lockb: pass, run 25. Superseding uuids in mixed modes, explicit `trustedDependencies`, `bun pm trust`, `--filter`: pass, run 26.)
+8. Bun 1.4.3 when stable (1.4.3-canary.1 passes, run 27). #992: re-test when fixed, including `[install.scopes]` and `NPM_CONFIG_REGISTRY` variants and the 1.1.45 `remove` / takeover cells. (Lifecycle scripts and scoped packages with scripts on `bun.lockb`: pass, run 27.) (Mixed modes, `globalStore` + vendored workspace lockb: pass, run 25. Superseding uuids in mixed modes, explicit `trustedDependencies`, `bun pm trust`, `--filter`: pass, run 26.)
 9. Digest boundary with a valid substitute tarball, 1.3.9 text lock vs 1.3.10 (low priority, documented limitation).
 
 ## Known non-bugs
+
+- A registry document with only a sha1 `shasum` and no `integrity` makes the hosted text-lock restore refuse with `the registry records no integrity` and the checkout remedy (fail closed, generic npm-family code). npmjs has backfilled `integrity` on old versions (minimist 0.0.8, left-pad 0.0.3, qs 0.6.6, lodash 1.0.0 all checked), so it's only reachable on bare private registries. Not filed (run 27).
+- Lifecycle `prepare` doesn't run for registry or tarball dependencies, on any Bun version, with or without socket-patch.
 
 - `patches-api.socket.dev` is blocked by the sandbox proxy. Mock the API. Also, the CLI's reqwest can't reach `registry.npmjs.org` from the sandbox (curl can), so hosted rollback/remove need `SOCKET_NPM_REGISTRY` pointed at a local passthrough. Without it you get `cannot restore … error sending request`, which is a sandbox artifact.
 - Agent `rollback` → `missing_blob` when the mock serves no before-blob (fixture limit).
@@ -430,7 +447,7 @@ Other passes (Linux, 1.4.2 unless noted):
 - `scan --json` `apply.patches[].action` (`added` / `skipped`) is the manifest record's state, not whether files were written.
 - `repair` doesn't recreate a deleted `socket-patch.vendor.json` sidecar. It's informational only (CLI_CONTRACT). A deleted `.socket/vendor/state.json` → `repair` `vendor_ledger_missing` (documented v5: restore it from VCS).
 - An interrupted vendored → hosted takeover can leave registry tuples (unpatched install) until the re-run. `vex` doesn't attest them, and the re-run heals.
-- Hosted rollback on a lock whose registry slot holds a full custom-registry tarball URL (Bun writes one for a non-default `[install] registry`) restores `""`. It's pinned by the `custom-registry` shape in `backtest-bun.py`, and the restored lock frozen-installs from the configured registry (run 14). The same holds after a vendored → hosted → vendored chain: `vendor --revert` restores `""` for any entry that passed through hosted mode, and full URLs for entries that were only ever vendored (run 26).
+- Hosted rollback on a lock whose registry slot holds a full custom-registry tarball URL (Bun writes one for a non-default `[install] registry`) restores `""`. It's pinned by the `custom-registry` shape in `backtest-bun.py`, and the restored lock frozen-installs from the configured registry (run 14). The same holds after a vendored → hosted → vendored chain: `vendor --revert` restores `""` for any entry that passed through hosted mode, and full URLs for entries that were only ever vendored (run 26). **Correction (run 27):** that's only true on Bun ≥ 1.3.7. Bun 1.1.39–1.3.6 resolve `""` against npmjs, which is #992.
 - Bun resolves a dependency on `X@2.0.0+build.6` to an installed `X@2.0.0+build.5`, because semver ignores build metadata. That's Bun behaviour.
 - Bun copies `file:` directory deps into `node_modules`, so agent mode patches the copy, not the source. That's safe and not part of #626.
 - Mock fixture: serve the npm registry from a different origin than `SOCKET_PATCH_SERVER_URL`. Otherwise the registry URLs Bun writes into `bun.lockb` look like hosted pins, and vendored `rollback` fails `hosted_wiring_contested` (run 15; with split origins it's `success`).
