@@ -903,6 +903,22 @@ async fn pom_and_gradle_get_both_roots() {
     assert_eq!(m.roots(false).await, vec![m.gradle_files21(), m.m2()]);
 }
 
+/// An sbt build beside a Gradle build that never declares `mavenLocal()`
+/// keeps m2: the sbt build's own resolvers (`Resolver.mavenLocal`) are not
+/// in the Gradle scripts, so the Gradle gate cannot rule `~/.m2` out.
+#[tokio::test]
+async fn sbt_beside_gradle_keeps_m2() {
+    let m = Machine::new();
+    m.write("settings.gradle", "rootProject.name = 'p'\n");
+    m.write("build.gradle", GRADLE_ONLY);
+    assert_eq!(m.gate(), M2Gate::Ignored);
+    m.write("build.sbt", "resolvers += Resolver.mavenLocal\n");
+    assert_eq!(m.gate(), M2Gate::NotGradleOnly);
+    let roots = m.roots(false).await;
+    assert!(roots.contains(&m.m2()), "{roots:?}");
+    assert!(roots.contains(&m.gradle_files21()), "{roots:?}");
+}
+
 /// A pom-only project never reads the Gradle cache; a non-JVM cwd gets no
 /// root at all unless the scan is global.
 #[tokio::test]

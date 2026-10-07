@@ -8,6 +8,9 @@
 //! * #412: pins reached through in-root `-r` includes;
 //! * #721: a UTF-16 file with a BOM (Windows PowerShell 5.1's
 //!   `pip freeze >` output), which pip decodes.
+//! * #994: include targets pip unquotes (`-r "dev reqs.txt"`,
+//!   `--requirement="dev.txt"`, `-r dev\ reqs.txt`) or expands
+//!   (`-r ${REQDIR}/dev.txt`).
 //!
 //! Driven through the built binary against a mock patch API; the
 //! assertion is what discovery sends to the batch endpoint and the
@@ -34,7 +37,12 @@ async fn mount_empty_batch(mock: &MockServer) {
         .await;
 }
 
-fn run_scan(root: &Path, mock_uri: &str, extra: &[&str]) -> (i32, serde_json::Value) {
+fn run_scan(
+    root: &Path,
+    mock_uri: &str,
+    extra: &[&str],
+    envs: &[(&str, &str)],
+) -> (i32, serde_json::Value) {
     let mut argv = vec![
         "scan",
         "--json",
@@ -53,6 +61,7 @@ fn run_scan(root: &Path, mock_uri: &str, extra: &[&str]) -> (i32, serde_json::Va
         .env("SOCKET_TELEMETRY_DISABLED", "1")
         .env_remove("VIRTUAL_ENV")
         .env_remove("CONDA_PREFIX")
+        .envs(envs.iter().copied())
         .output()
         .expect("run socket-patch");
     let stdout = String::from_utf8_lossy(&out.stdout);
@@ -89,11 +98,27 @@ async fn batch_purls(mock: &MockServer) -> Vec<String> {
 }
 
 async fn assert_lock_only_discovers(files: &[(&str, &str)], expected: &[&str]) {
+    assert_lock_only_discovers_with_env(files, &[], expected).await;
+}
+
+async fn assert_lock_only_discovers_with_env(
+    files: &[(&str, &str)],
+    envs: &[(&str, &str)],
+    expected: &[&str],
+) {
     let files: Vec<(&str, &[u8])> = files.iter().map(|(r, c)| (*r, c.as_bytes())).collect();
-    assert_lock_only_discovers_bytes(&files, expected).await;
+    assert_lock_only_discovers_bytes_with_env(&files, envs, expected).await;
 }
 
 async fn assert_lock_only_discovers_bytes(files: &[(&str, &[u8])], expected: &[&str]) {
+    assert_lock_only_discovers_bytes_with_env(files, &[], expected).await;
+}
+
+async fn assert_lock_only_discovers_bytes_with_env(
+    files: &[(&str, &[u8])],
+    envs: &[(&str, &str)],
+    expected: &[&str],
+) {
     for mode in [&[][..], &["--vendor"][..]] {
         let mock = MockServer::start().await;
         mount_empty_batch(&mock).await;
@@ -103,7 +128,7 @@ async fn assert_lock_only_discovers_bytes(files: &[(&str, &[u8])], expected: &[&
             std::fs::create_dir_all(p.parent().unwrap()).unwrap();
             std::fs::write(p, content).unwrap();
         }
-        let (code, v) = run_scan(tmp.path(), &mock.uri(), mode);
+        let (code, v) = run_scan(tmp.path(), &mock.uri(), mode, envs);
         assert_eq!(code, 0, "mode={mode:?}: {v}");
         assert_eq!(
             v["lockfileOnlyPackages"].as_u64(),
@@ -180,4 +205,46 @@ async fn lock_only_scan_discovers_utf16_pins() {
         )
         .await;
     }
+}
+
+/// #994: pip `shlex`-splits an include line's options, so a quoted or
+/// backslash-escaped target names the file without its quotes, and a
+/// target with a space is one path, not two words.
+#[tokio::test]
+async fn lock_only_scan_discovers_quoted_include_targets() {
+    let cases: &[(&str, &str, &str)] = &[
+        ("dq", "-r \"dev reqs.txt\"\n", "dev reqs.txt"),
+        ("sq", "-r 'dev reqs.txt'\n", "dev reqs.txt"),
+        ("dq_nospace", "-r \"dev.txt\"\n", "dev.txt"),
+        ("bs", "-r dev\\ reqs.txt\n", "dev reqs.txt"),
+        ("longq", "--requirement \"dev.txt\"\n", "dev.txt"),
+        ("eqq", "--requirement=\"dev.txt\"\n", "dev.txt"),
+        ("attached", "-r\"dev reqs.txt\"\n", "dev reqs.txt"),
+    ];
+    for (case, root, include) in cases {
+        eprintln!("case {case}");
+        assert_lock_only_discovers(
+            &[
+                ("requirements.txt", root),
+                (include, "sp-fixture-quoted==1.0.0\n"),
+            ],
+            &["pkg:pypi/sp-fixture-quoted@1.0.0"],
+        )
+        .await;
+    }
+}
+
+/// #994: pip expands `${NAME}` from the environment before it parses the
+/// line, so `-r ${REQDIR}/dev.txt` follows `$REQDIR`.
+#[tokio::test]
+async fn lock_only_scan_discovers_env_var_include_target() {
+    assert_lock_only_discovers_with_env(
+        &[
+            ("requirements.txt", "-r ${SP_TEST_REQDIR}/dev.txt\n"),
+            ("sub/dev.txt", "sp-fixture-env==1.0.0\n"),
+        ],
+        &[("SP_TEST_REQDIR", "sub")],
+        &["pkg:pypi/sp-fixture-env@1.0.0"],
+    )
+    .await;
 }

@@ -18,6 +18,48 @@ fn options_at(root: &Path) -> CrawlerOptions {
     }
 }
 
+/// Keeps the machine's Coursier / Ivy caches out of a test that pins the
+/// exact repo list (a JVM marker or `--global` also crawls them): `HOME`
+/// points at an empty directory and the variables naming a cache are unset
+/// until drop, which restores them. Only inside `#[serial]` tests.
+struct NoJvmCaches {
+    _home: tempfile::TempDir,
+    saved: Vec<(&'static str, Option<std::ffi::OsString>)>,
+}
+
+impl NoJvmCaches {
+    fn new() -> Self {
+        let home = tempfile::tempdir().unwrap();
+        let keys = [
+            "HOME",
+            "USERPROFILE",
+            "XDG_CACHE_HOME",
+            "LOCALAPPDATA",
+            "COURSIER_CACHE",
+            "SBT_OPTS",
+            "JAVA_OPTS",
+        ];
+        let saved = keys.iter().map(|k| (*k, std::env::var_os(k))).collect();
+        for key in keys {
+            std::env::remove_var(key);
+        }
+        std::env::set_var("HOME", home.path());
+        std::env::set_var("USERPROFILE", home.path());
+        Self { _home: home, saved }
+    }
+}
+
+impl Drop for NoJvmCaches {
+    fn drop(&mut self) {
+        for (key, value) in &self.saved {
+            match value {
+                Some(v) => std::env::set_var(key, v),
+                None => std::env::remove_var(key),
+            }
+        }
+    }
+}
+
 /// Stage a maven m2-layout package: <repo>/<group/path>/<artifact>/<version>/
 /// with a minimal pom.xml.
 async fn stage_maven_pkg(
@@ -260,6 +302,7 @@ async fn get_maven_repo_paths_home_dot_m2_fallback() {
 #[tokio::test]
 #[serial]
 async fn get_maven_repo_paths_global_mode_with_maven_repo_local() {
+    let _no_jvm_caches = NoJvmCaches::new();
     let tmp = tempfile::tempdir().unwrap();
     let repo = tmp.path().join("custom-m2");
     tokio::fs::create_dir_all(&repo).await.unwrap();
@@ -517,6 +560,7 @@ async fn get_maven_repo_paths_no_marker_returns_empty() {
 #[tokio::test]
 #[serial]
 async fn get_maven_repo_paths_with_pom_xml_returns_repo() {
+    let _no_jvm_caches = NoJvmCaches::new();
     let tmp = tempfile::tempdir().unwrap();
     tokio::fs::write(tmp.path().join("pom.xml"), b"<project/>")
         .await
@@ -617,6 +661,7 @@ async fn get_maven_repo_paths_with_build_gradle_kts_returns_repo() {
 #[tokio::test]
 #[serial]
 async fn get_maven_repo_paths_m2_home_fallback() {
+    let _no_jvm_caches = NoJvmCaches::new();
     let tmp = tempfile::tempdir().unwrap();
     tokio::fs::write(tmp.path().join("pom.xml"), b"<project/>")
         .await

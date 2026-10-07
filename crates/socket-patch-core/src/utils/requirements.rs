@@ -129,6 +129,99 @@ pub(crate) fn strip_comment(text: &str) -> &str {
     split_comment(text).0
 }
 
+/// pip's `expand_env_variables`: each `${NAME}` whose `NAME` is
+/// `[A-Z0-9_]+` is replaced by `lookup(NAME)`; an unset or empty variable
+/// leaves the reference as written. pip expands after stripping comments
+/// and before it splits the options, so a variable can carry quotes or
+/// spaces that the split then reads.
+pub(crate) fn expand_env_vars(code: &str, lookup: impl Fn(&str) -> Option<String>) -> String {
+    let mut out = String::with_capacity(code.len());
+    let mut rest = code;
+    while let Some(start) = rest.find("${") {
+        out.push_str(&rest[..start]);
+        let after = &rest[start + 2..];
+        let name_len = after
+            .find(|c: char| !(c.is_ascii_uppercase() || c.is_ascii_digit() || c == '_'))
+            .unwrap_or(after.len());
+        let value = (name_len > 0 && after[name_len..].starts_with('}'))
+            .then(|| lookup(&after[..name_len]))
+            .flatten()
+            .filter(|v| !v.is_empty());
+        match value {
+            Some(v) => {
+                out.push_str(&v);
+                rest = &after[name_len + 1..];
+            }
+            None => {
+                out.push_str("${");
+                rest = after;
+            }
+        }
+    }
+    out.push_str(rest);
+    out
+}
+
+/// Python's `shlex.split` (POSIX mode), which pip runs over a line's
+/// options: whitespace separates words; `'…'` is literal; inside `"…"` a
+/// backslash escapes only `"` and `\`; elsewhere a backslash escapes any
+/// character; adjacent quoted and bare parts join into one word, and `""`
+/// is an empty word. `None` for an unclosed quote or a trailing lone
+/// backslash, which pip refuses ("Could not split options").
+pub(crate) fn shlex_split(text: &str) -> Option<Vec<String>> {
+    let mut words = Vec::new();
+    let mut word = String::new();
+    let mut in_word = false;
+    let mut chars = text.chars();
+    while let Some(c) = chars.next() {
+        match c {
+            ' ' | '\t' | '\r' | '\n' => {
+                if in_word {
+                    words.push(std::mem::take(&mut word));
+                    in_word = false;
+                }
+            }
+            '\\' => {
+                word.push(chars.next()?);
+                in_word = true;
+            }
+            '\'' => {
+                in_word = true;
+                loop {
+                    match chars.next()? {
+                        '\'' => break,
+                        ch => word.push(ch),
+                    }
+                }
+            }
+            '"' => {
+                in_word = true;
+                loop {
+                    match chars.next()? {
+                        '"' => break,
+                        '\\' => {
+                            let next = chars.next()?;
+                            if next != '"' && next != '\\' {
+                                word.push('\\');
+                            }
+                            word.push(next);
+                        }
+                        ch => word.push(ch),
+                    }
+                }
+            }
+            _ => {
+                word.push(c);
+                in_word = true;
+            }
+        }
+    }
+    if in_word {
+        words.push(word);
+    }
+    Some(words)
+}
+
 /// The `(name as spelled, version)` of an exact `name[extras]==X` registry
 /// requirement (a logical line's code part; an optional `; marker` and
 /// options may follow), `None` for anything else — ranges, `===`, wildcards
@@ -427,5 +520,79 @@ mod tests {
         assert_eq!(archive_filename_coords("six-1.16.0.whl"), None, "no tags");
         assert_eq!(archive_filename_coords("six.tar.gz"), None, "no version");
         assert_eq!(archive_filename_coords("six-1.0.egg"), None);
+    }
+
+    #[test]
+    fn expand_env_vars_follows_pips_name_grammar() {
+        let lookup = |name: &str| match name {
+            "REQDIR" => Some("sub".to_string()),
+            "SPACED" => Some("\"dev reqs.txt\"".to_string()),
+            "EMPTY" => Some(String::new()),
+            _ => None,
+        };
+        assert_eq!(
+            expand_env_vars("-r ${REQDIR}/dev.txt", lookup),
+            "-r sub/dev.txt"
+        );
+        assert_eq!(
+            expand_env_vars("-r ${SPACED}", lookup),
+            "-r \"dev reqs.txt\""
+        );
+        assert_eq!(
+            expand_env_vars("${REQDIR}/${REQDIR}", lookup),
+            "sub/sub",
+            "every reference is expanded"
+        );
+        for kept in [
+            "-r ${UNSET}/dev.txt",
+            "-r ${EMPTY}/dev.txt",
+            "-r ${reqdir}/dev.txt",
+            "-r $REQDIR/dev.txt",
+            "-r ${}/dev.txt",
+            "-r ${REQDIR",
+            "-r ${REQ-DIR}/dev.txt",
+        ] {
+            assert_eq!(expand_env_vars(kept, lookup), kept, "{kept:?}");
+        }
+    }
+
+    #[test]
+    fn shlex_split_matches_python_posix_mode() {
+        let split = |s: &str| shlex_split(s).map(|w| w.join("|"));
+        assert_eq!(split("-r dev.txt").as_deref(), Some("-r|dev.txt"));
+        assert_eq!(split("-r\t dev.txt ").as_deref(), Some("-r|dev.txt"));
+        assert_eq!(
+            split("-r \"dev reqs.txt\"").as_deref(),
+            Some("-r|dev reqs.txt")
+        );
+        assert_eq!(
+            split("-r 'dev reqs.txt'").as_deref(),
+            Some("-r|dev reqs.txt")
+        );
+        assert_eq!(
+            split("-r dev\\ reqs.txt").as_deref(),
+            Some("-r|dev reqs.txt")
+        );
+        assert_eq!(
+            split("--requirement=\"dev.txt\"").as_deref(),
+            Some("--requirement=dev.txt")
+        );
+        assert_eq!(split("a\"b c\"'d e'f").as_deref(), Some("ab cd ef"));
+        assert_eq!(
+            split("'a\\b'").as_deref(),
+            Some("a\\b"),
+            "no escapes in '…'"
+        );
+        assert_eq!(
+            split("\"a\\\"b\\\\c\\d\"").as_deref(),
+            Some("a\"b\\c\\d"),
+            "in \"…\" only \\\" and \\\\ are escapes"
+        );
+        assert_eq!(split("sub\\dev.txt").as_deref(), Some("subdev.txt"));
+        assert_eq!(shlex_split("-r \"\"").unwrap(), vec!["-r", ""]);
+        assert_eq!(shlex_split("").unwrap(), Vec::<String>::new());
+        for unbalanced in ["-r \"dev.txt", "-r 'dev.txt", "-r dev.txt\\"] {
+            assert_eq!(shlex_split(unbalanced), None, "{unbalanced:?}");
+        }
     }
 }
