@@ -377,8 +377,8 @@ impl RubyCrawler {
         // copy lives (#915). Gated like the explicit roots: config only
         // counts for a Ruby project. (A recorded local path never coexists
         // with it: [`parse_bundle_config_path`] already drops it.)
-        let uses_system_gems = Self::has_bundler_manifest(cwd).await
-            && Self::bundler_path_system(
+        let path_tier = if Self::has_bundler_manifest(cwd).await {
+            Self::bundler_path_tier(
                 cwd,
                 bundle_path_env,
                 path_system_env,
@@ -386,14 +386,18 @@ impl RubyCrawler {
                 global_config,
                 ignore_config,
             )
-            .await;
+            .await
+        } else {
+            None
+        };
+        let uses_system_gems = path_tier.is_some_and(|tier| tier.system);
 
         let mut roots: Vec<PathBuf> = Vec::new();
         let mut skipped_config_path = None;
         let mut skipped_config_root = None;
         if Self::has_bundler_manifest(cwd).await {
             if let Some(value) =
-                Self::app_config_bundle_path(cwd, app_config_env, ignore_config).await
+                Self::app_config_bundle_path(cwd, app_config_env, ignore_config, home).await
             {
                 match resolve_config_bundle_path(cwd, &value, home) {
                     Some(root) => roots.push(root),
@@ -431,12 +435,34 @@ impl RubyCrawler {
             let shadowed = bundle_path_env.is_some()
                 || (!ignore_config && Self::app_config_sets_path(cwd, app_config_env).await);
             if !shadowed {
-                if let Some(value) = read_global_config(global_config, false)
-                    .await
-                    .and_then(|text| parse_bundle_config_path(&text))
-                {
+                let text = read_global_config(global_config, false).await;
+                let value = match text {
+                    Some(text) => {
+                        bundle_config_dir_reading(
+                            parse_bundle_config_path(&text),
+                            parse_legacy_bundle_config_path(&text),
+                            |value| resolve_bundle_path(cwd, Path::new(value), home),
+                        )
+                        .await
+                    }
+                    None => None,
+                };
+                if let Some(value) = value {
                     roots.push(resolve_bundle_path(cwd, Path::new(&value), home));
                 }
+            }
+            // With no explicit path and no truthy `path.system` in the
+            // deciding tier, Bundler's `Path#base_path` is `<root>/.bundle`
+            // whenever `use_system_gems?` is false: `default_install_uses_path`
+            // on 2.x, `bundler_5_mode?` (`simulate_version 5`) on 4.x, and
+            // the default from Bundler 5 on (#967). Probed without reading
+            // those version-dependent flags: the scoped store only exists
+            // once Bundler installed there. Like the explicit roots it keeps
+            // the `gem env` fallback on, since default gems stay in the
+            // system homes.
+            if !path_tier.is_some_and(|tier| tier.system || tier.explicit_path) {
+                let dot_bundle = cwd.join(".bundle");
+                roots.push(normalize_lexically(&dot_bundle).unwrap_or(dot_bundle));
             }
         }
         if !uses_system_gems {
@@ -663,42 +689,43 @@ impl RubyCrawler {
         let config = bundler_app_config_dir(cwd, app_config_env).join("config");
         crate::utils::fs::read_regular_to_string(&config)
             .await
-            .is_ok_and(|text| config_path_system(&text).is_some())
+            .is_ok_and(|text| config_path_tier(&text).is_some())
     }
 
-    /// Whether the Bundler tier that decides the install path sets a
-    /// truthy `path.system`. `Settings#path` takes the FIRST of the local
-    /// app config, the environment and the global config that sets
-    /// `path`, `path.system` or `disable_shared_gems` (even to an empty or
-    /// false value); with no such tier there is no `path.system` at all.
-    /// Callers already pass no `global_config` when the env tier sets
-    /// `path.system` or `disable_shared_gems` (see
+    /// The Bundler tier that decides the install path. `Settings#path`
+    /// takes the FIRST of the local app config, the environment and the
+    /// global config that sets `path`, `path.system` or
+    /// `disable_shared_gems` (even to an empty or false value); `None` when
+    /// no tier does. Callers already pass no `global_config` when the env
+    /// tier sets `path.system` or `disable_shared_gems` (see
     /// [`global_path_config_unless_env_path_settings`]).
-    async fn bundler_path_system(
+    async fn bundler_path_tier(
         cwd: &Path,
         bundle_path_env: Option<&OsStr>,
         path_system_env: Option<&OsStr>,
         app_config_env: Option<&OsStr>,
         global_config: Option<&Path>,
         ignore_config: bool,
-    ) -> bool {
+    ) -> Option<BundlerPathTier> {
         if !ignore_config {
             let config = bundler_app_config_dir(cwd, app_config_env).join("config");
             if let Ok(text) = crate::utils::fs::read_regular_to_string(&config).await {
-                if let Some(system) = config_path_system(&text) {
-                    return system;
+                if let Some(tier) = config_path_tier(&text) {
+                    return Some(tier);
                 }
             }
         }
         if bundle_path_env.is_some() || path_system_env.is_some() {
-            return path_system_env.is_some_and(|v| bundler_truthy(&v.to_string_lossy()));
+            return Some(BundlerPathTier {
+                explicit_path: bundle_path_env.is_some(),
+                system: path_system_env.is_some_and(|v| bundler_truthy(&v.to_string_lossy())),
+            });
         }
-        if let Some(global) = global_config {
-            if let Ok(text) = crate::utils::fs::read_regular_to_string(global).await {
-                return config_path_system(&text).unwrap_or(false);
-            }
-        }
-        false
+        let global = global_config?;
+        let text = crate::utils::fs::read_regular_to_string(global)
+            .await
+            .ok()?;
+        config_path_tier(&text)
     }
 
     /// The `BUNDLE_PATH` recorded in bundler's app config file — the value
@@ -709,6 +736,7 @@ impl RubyCrawler {
         cwd: &Path,
         app_config_env: Option<&OsStr>,
         ignore_config: bool,
+        home: Option<&Path>,
     ) -> Option<String> {
         if ignore_config {
             return None;
@@ -723,7 +751,12 @@ impl RubyCrawler {
         let contents = crate::utils::fs::read_regular_to_string(&config)
             .await
             .ok()?;
-        parse_bundle_config_path(&contents)
+        bundle_config_dir_reading(
+            parse_bundle_config_path(&contents),
+            parse_legacy_bundle_config_path(&contents),
+            |value| resolve_bundle_path(cwd, Path::new(value), home),
+        )
+        .await
     }
 
     /// Get global gem paths by querying `gem env` and checking well-known locations.
@@ -1513,20 +1546,26 @@ pub async fn bundler_app_cache_dir_with_env(
     ignore_config: bool,
     global_config: Option<&Path>,
 ) -> PathBuf {
-    let mut configured = read_app_config(root, app_config_env, ignore_config)
+    // Component-wise, so `vendor/gems` uses the native separator.
+    let resolve = |value: PathBuf| root.join(normalize_lexically(&value).unwrap_or(value));
+    let cache_path = |text: Option<String>| async {
+        let text = text?;
+        bundle_config_dir_reading(
+            bundle_config_setting(&text, "BUNDLE_CACHE_PATH"),
+            legacy_bundle_config_setting(&text, "BUNDLE_CACHE_PATH"),
+            |value| resolve(PathBuf::from(value)),
+        )
         .await
-        .and_then(|text| bundle_config_setting(&text, "BUNDLE_CACHE_PATH"))
         .map(PathBuf::from)
+    };
+    let mut configured = cache_path(read_app_config(root, app_config_env, ignore_config).await)
+        .await
         .or_else(|| cache_env.filter(|v| !v.is_empty()).map(PathBuf::from));
     if configured.is_none() {
-        configured = read_global_config(global_config, ignore_config)
-            .await
-            .and_then(|text| bundle_config_setting(&text, "BUNDLE_CACHE_PATH"))
-            .map(PathBuf::from);
+        configured = cache_path(read_global_config(global_config, ignore_config).await).await;
     }
     match configured {
-        // Component-wise, so `vendor/gems` uses the native separator.
-        Some(value) => root.join(normalize_lexically(&value).unwrap_or(value)),
+        Some(value) => resolve(value),
         None => root.join("vendor").join("cache"),
     }
 }
@@ -1618,16 +1657,26 @@ fn resolve_config_bundle_path(
 /// goes through Bundler's own coercion ([`bundler_truthy`]), so `"1"` or
 /// `"yes"` count too, while `"false"` leaves the recorded path in effect.
 fn parse_bundle_config_path(contents: &str) -> Option<String> {
+    parse_bundle_config_path_with(contents, unquote_bundle_config_value)
+}
+
+/// [`parse_bundle_config_path`] as a Bundler before 2.5.6 reads it (see
+/// [`unquote_legacy_bundle_config_value`]).
+fn parse_legacy_bundle_config_path(contents: &str) -> Option<String> {
+    parse_bundle_config_path_with(contents, unquote_legacy_bundle_config_value)
+}
+
+fn parse_bundle_config_path_with(contents: &str, unquote: fn(&str) -> &str) -> Option<String> {
     let mut path: Option<String> = None;
     let mut path_system = false;
     for line in contents.lines() {
         if let Some(rest) = line.strip_prefix("BUNDLE_PATH:") {
-            let v = unquote_bundle_config_value(rest);
+            let v = unquote(rest);
             if !v.is_empty() {
                 path = Some(v.to_string());
             }
         } else if let Some(rest) = line.strip_prefix("BUNDLE_PATH__SYSTEM:") {
-            path_system = bundler_truthy(unquote_bundle_config_value(rest));
+            path_system = bundler_truthy(unquote(rest));
         }
     }
     if path_system {
@@ -1637,10 +1686,20 @@ fn parse_bundle_config_path(contents: &str) -> Option<String> {
     }
 }
 
+/// The part of Bundler's `Settings::Path` the crawler needs from the tier
+/// that decides the install path.
+#[derive(Debug, Clone, Copy)]
+struct BundlerPathTier {
+    /// The tier sets `path`, even to an empty string (`explicit_path`).
+    explicit_path: bool,
+    /// The tier's `path.system` is truthy (`system_path`).
+    system: bool,
+}
+
 /// For one Bundler config file: `None` when it sets none of `path`,
 /// `path.system` and `disable_shared_gems` (Bundler reads on to the next
-/// tier), else whether its `path.system` is truthy.
-fn config_path_system(contents: &str) -> Option<bool> {
+/// tier), else what it says about the path.
+fn config_path_tier(contents: &str) -> Option<BundlerPathTier> {
     let sets_path = [
         "BUNDLE_PATH",
         "BUNDLE_PATH__SYSTEM",
@@ -1648,9 +1707,10 @@ fn config_path_system(contents: &str) -> Option<bool> {
     ]
     .iter()
     .any(|key| bundle_config_setting_including_empty(contents, key).is_some());
-    sets_path.then(|| {
-        bundle_config_setting_including_empty(contents, "BUNDLE_PATH__SYSTEM")
-            .is_some_and(|v| bundler_truthy(&v))
+    sets_path.then(|| BundlerPathTier {
+        explicit_path: bundle_config_setting_including_empty(contents, "BUNDLE_PATH").is_some(),
+        system: bundle_config_setting_including_empty(contents, "BUNDLE_PATH__SYSTEM")
+            .is_some_and(|v| bundler_truthy(&v)),
     })
 }
 
@@ -1668,24 +1728,97 @@ pub(crate) fn bundle_config_setting(contents: &str, key: &str) -> Option<String>
 /// path. Callers that decide whether a lower tier applies need presence,
 /// not just a non-empty value.
 pub(crate) fn bundle_config_setting_including_empty(contents: &str, key: &str) -> Option<String> {
+    bundle_config_setting_with(contents, key, unquote_bundle_config_value)
+}
+
+/// [`bundle_config_setting`] as a Bundler before 2.5.6 reads it (see
+/// [`unquote_legacy_bundle_config_value`]).
+fn legacy_bundle_config_setting(contents: &str, key: &str) -> Option<String> {
+    bundle_config_setting_with(contents, key, unquote_legacy_bundle_config_value)
+        .filter(|value| !value.is_empty())
+}
+
+fn bundle_config_setting_with(
+    contents: &str,
+    key: &str,
+    unquote: fn(&str) -> &str,
+) -> Option<String> {
     let mut found = None;
     for line in contents.lines() {
         if let Some(rest) = line.strip_prefix(key).and_then(|r| r.strip_prefix(':')) {
-            let v = unquote_bundle_config_value(rest);
-            found = Some(v.to_string());
+            found = Some(unquote(rest).to_string());
         }
     }
     found
 }
 
-/// Unwrap one bundler app-config scalar: trim, then strip one matching
-/// pair of double or single quotes (bundler double-quotes what it writes).
+/// Unwrap one bundler app-config scalar the way Bundler's config loader
+/// does (`Gem::YAMLSerializer`, RubyGems 3.5.6+, which Bundler 2.4+ uses
+/// when present; Bundler's own copy from 2.5.6): trim, strip one matching
+/// pair of double or single quotes (bundler double-quotes what it writes),
+/// then `strip_comment` — cut the value at its first `#` and trim, unless
+/// it starts with `#` (#951). The quote pair must close the line, so
+/// `"vendor/bundle" # note` keeps its quotes, as it does for Bundler.
 pub(crate) fn unquote_bundle_config_value(rest: &str) -> &str {
     let v = rest.trim();
+    strip_bundle_config_comment(unquote_matching_pair(v).unwrap_or(v))
+}
+
+/// [`unquote_bundle_config_value`] for the loader Bundler used before
+/// `strip_comment` (Bundler < 2.4, or 2.4–2.5.5 on RubyGems < 3.5.6): the
+/// `# comment` stays part of the value.
+fn unquote_legacy_bundle_config_value(rest: &str) -> &str {
+    let v = rest.trim();
+    unquote_matching_pair(v).unwrap_or(v)
+}
+
+fn unquote_matching_pair(v: &str) -> Option<&str> {
     v.strip_prefix('"')
         .and_then(|s| s.strip_suffix('"'))
         .or_else(|| v.strip_prefix('\'').and_then(|s| s.strip_suffix('\'')))
-        .unwrap_or(v)
+}
+
+/// Bundler's `YAMLSerializer#strip_comment`.
+fn strip_bundle_config_comment(v: &str) -> &str {
+    match v.split_once('#') {
+        Some((value, _)) if !v.starts_with('#') => value.trim(),
+        _ => v,
+    }
+}
+
+/// A directory setting whose value carries a `# comment` reads differently
+/// in the two Bundler config-loader eras (see
+/// [`unquote_legacy_bundle_config_value`]), and the installed Bundler's era
+/// is not known here. Bundler creates the directory it uses, so take the
+/// current reading unless only the legacy reading's directory exists.
+/// Values without a comment read the same in both eras.
+///
+/// Only two directory readings are weighed against each other. When the
+/// current reading is unset — e.g. a commented `path.system: true` that
+/// only the current loader honours — the legacy path's directory is no
+/// evidence of the era (it may be a leftover install, the #915 shape), so
+/// the current reading stands.
+async fn bundle_config_dir_reading(
+    current: Option<String>,
+    legacy: Option<String>,
+    resolve: impl Fn(&str) -> PathBuf,
+) -> Option<String> {
+    let (Some(value), Some(legacy)) = (current.as_deref(), legacy) else {
+        return current;
+    };
+    if value == legacy {
+        return current;
+    }
+    let is_dir = |path: PathBuf| async move {
+        tokio::fs::metadata(path)
+            .await
+            .is_ok_and(|meta| meta.is_dir())
+    };
+    if !is_dir(resolve(value)).await && is_dir(resolve(&legacy)).await {
+        Some(legacy)
+    } else {
+        current
+    }
 }
 
 /// Whether a PURL-derived gem coordinate is safe to join onto the gem root.
@@ -3682,6 +3815,158 @@ mod tests {
         assert_eq!(discovery.stores, vec![store]);
     }
 
+    /// Stage a gem under `<root>/.bundle/ruby/3.3.0/gems`, where Bundler
+    /// installs when it uses neither an explicit path nor the system gems
+    /// (`default_install_uses_path` on 2.x, `simulate_version 5` on 4.x).
+    async fn stage_dot_bundle_store(root: &Path) -> PathBuf {
+        tokio::fs::write(root.join("Gemfile"), b"gem \"colorize\"\n")
+            .await
+            .unwrap();
+        let store = root.join(".bundle").join("ruby").join("3.3.0").join("gems");
+        tokio::fs::create_dir_all(store.join("colorize-0.8.1").join("lib"))
+            .await
+            .unwrap();
+        store
+    }
+
+    /// #967: with no tier setting `path`, `path.system` or
+    /// `disable_shared_gems`, Bundler's base path is `<root>/.bundle` once
+    /// `default_install_uses_path` (2.x) or `simulate_version 5` (4.x) is
+    /// on. That store must be crawled. It is not the default root, so the
+    /// `gem env` fallback (default gems) stays on.
+    #[tokio::test]
+    async fn dot_bundle_base_path_is_crawled() {
+        for config in [
+            None,
+            Some("---\nBUNDLE_SIMULATE_VERSION: \"5\"\n"),
+            Some("---\nBUNDLE_DEFAULT_INSTALL_USES_PATH: \"true\"\n"),
+            // A falsy flag decides the tier without naming a path.
+            Some("---\nBUNDLE_PATH__SYSTEM: \"false\"\nBUNDLE_SIMULATE_VERSION: \"5\"\n"),
+        ] {
+            let dir = tempfile::tempdir().unwrap();
+            let store = stage_dot_bundle_store(dir.path()).await;
+            if let Some(config) = config {
+                tokio::fs::write(dir.path().join(".bundle").join("config"), config)
+                    .await
+                    .unwrap();
+            }
+
+            let discovery =
+                RubyCrawler::discover_bundle_stores_with_env(dir.path(), None, None, None, None)
+                    .await;
+            assert_eq!(discovery.stores, vec![store], "{config:?}");
+            assert!(!discovery.default_root_has_stores, "{config:?}");
+        }
+    }
+
+    /// #967, global variant: `bundle config set --global simulate_version
+    /// 5` with no path in any tier still installs into `<root>/.bundle`.
+    #[tokio::test]
+    async fn dot_bundle_base_path_with_global_flag_is_crawled() {
+        let dir = tempfile::tempdir().unwrap();
+        let root = dir.path().join("proj");
+        tokio::fs::create_dir_all(&root).await.unwrap();
+        let store = stage_dot_bundle_store(&root).await;
+        let global = dir.path().join("global-config");
+        tokio::fs::write(&global, "---\nBUNDLE_SIMULATE_VERSION: \"5\"\n")
+            .await
+            .unwrap();
+
+        let discovery =
+            RubyCrawler::discover_bundle_stores_with_env(&root, None, None, None, Some(&global))
+                .await;
+        assert_eq!(discovery.stores, vec![store]);
+        assert!(!discovery.default_root_has_stores);
+    }
+
+    /// #967 controls: Bundler never uses `<root>/.bundle` when the tier
+    /// that decides the path names one (local, env or global) or sets a
+    /// truthy `path.system`, and the root only counts for a Ruby project.
+    #[tokio::test]
+    async fn dot_bundle_base_path_is_skipped_when_bundler_does_not_use_it() {
+        // A local path.
+        let dir = tempfile::tempdir().unwrap();
+        stage_dot_bundle_store(dir.path()).await;
+        for config in [
+            "---\nBUNDLE_PATH: \"vendor/bundle\"\n",
+            "---\nBUNDLE_PATH: \"\"\n",
+            "---\nBUNDLE_PATH__SYSTEM: \"true\"\n",
+        ] {
+            tokio::fs::write(dir.path().join(".bundle").join("config"), config)
+                .await
+                .unwrap();
+            let discovery =
+                RubyCrawler::discover_bundle_stores_with_env(dir.path(), None, None, None, None)
+                    .await;
+            assert!(
+                discovery.stores.is_empty(),
+                "{config}: {:?}",
+                discovery.stores
+            );
+        }
+        tokio::fs::remove_file(dir.path().join(".bundle").join("config"))
+            .await
+            .unwrap();
+
+        // An env `BUNDLE_PATH`, even an empty one.
+        let elsewhere = dir.path().join("elsewhere");
+        for env in [elsewhere.as_os_str(), OsStr::new("")] {
+            let discovery = RubyCrawler::discover_bundle_stores_with_env(
+                dir.path(),
+                Some(env),
+                None,
+                None,
+                None,
+            )
+            .await;
+            assert!(
+                discovery.stores.is_empty(),
+                "{env:?}: {:?}",
+                discovery.stores
+            );
+        }
+
+        // An env `path.system`.
+        let discovery = RubyCrawler::discover_bundle_stores_with_path_system_env(
+            dir.path(),
+            None,
+            Some(OsStr::new("true")),
+            None,
+        )
+        .await;
+        assert!(discovery.stores.is_empty(), "{:?}", discovery.stores);
+
+        // A global path or `path.system`.
+        let global = dir.path().join("global-config");
+        for config in [
+            "---\nBUNDLE_PATH: \"/opt/bundle\"\n",
+            "---\nBUNDLE_PATH__SYSTEM: \"true\"\n",
+        ] {
+            tokio::fs::write(&global, config).await.unwrap();
+            let discovery = RubyCrawler::discover_bundle_stores_with_env(
+                dir.path(),
+                None,
+                None,
+                None,
+                Some(&global),
+            )
+            .await;
+            assert!(
+                discovery.stores.is_empty(),
+                "{config}: {:?}",
+                discovery.stores
+            );
+        }
+
+        // Not a Ruby project.
+        tokio::fs::remove_file(dir.path().join("Gemfile"))
+            .await
+            .unwrap();
+        let discovery =
+            RubyCrawler::discover_bundle_stores_with_env(dir.path(), None, None, None, None).await;
+        assert!(discovery.stores.is_empty(), "{:?}", discovery.stores);
+    }
+
     /// Bundler's boolean coercion (`Settings#to_bool`).
     #[test]
     fn bundler_truthy_matches_bundler_to_bool() {
@@ -4557,5 +4842,150 @@ mod tests {
             }
         }
         assert!(found > 50, "vacuous fixtures: {found}");
+    }
+
+    /// #951: Bundler's config loader (`Gem::YAMLSerializer#strip_comment`,
+    /// RubyGems / Bundler 2.5.6+) cuts a `.bundle/config` value at its
+    /// first `#` unless the value starts with one, and applies that to the
+    /// unquoted value. Pinned against the real loader's output.
+    #[test]
+    fn bundle_config_values_drop_a_trailing_comment_like_bundler() {
+        let text = "---\nBUNDLE_PATH: .gems # project-local gems\n\
+                    BUNDLE_A: \"a#b\"\nBUNDLE_B: x#y\nBUNDLE_C: #z\n\
+                    BUNDLE_D: \"vendor/bundle\" # quoted then commented\n\
+                    BUNDLE_E: \"a # b\"\nBUNDLE_F: ' q ' \n";
+        let get = |key| bundle_config_setting_including_empty(text, key);
+        assert_eq!(get("BUNDLE_PATH").as_deref(), Some(".gems"));
+        assert_eq!(get("BUNDLE_A").as_deref(), Some("a"));
+        assert_eq!(get("BUNDLE_B").as_deref(), Some("x"));
+        // A value that STARTS with `#` is kept whole.
+        assert_eq!(get("BUNDLE_C").as_deref(), Some("#z"));
+        // The closing quote is not at the end of the line, so the loader
+        // matches no quote pair: the quotes stay part of the value.
+        assert_eq!(get("BUNDLE_D").as_deref(), Some("\"vendor/bundle\""));
+        assert_eq!(get("BUNDLE_E").as_deref(), Some("a"));
+        // No `#`: the unquoted value is kept as is.
+        assert_eq!(get("BUNDLE_F").as_deref(), Some(" q "));
+    }
+
+    /// #951: a commented `path`, `path.system`, `cache_path` and `gemfile`
+    /// read the way Bundler reads them.
+    #[tokio::test]
+    async fn commented_bundle_config_settings_follow_bundler() {
+        assert_eq!(
+            parse_bundle_config_path("---\nBUNDLE_PATH: .gems # project-local gems\n"),
+            Some(".gems".to_string())
+        );
+        assert_eq!(
+            parse_bundle_config_path(
+                "---\nBUNDLE_PATH: vendor/bundle\nBUNDLE_PATH__SYSTEM: true # use system gems\n"
+            ),
+            None
+        );
+        assert_eq!(
+            crate::formats::gem::manifest::config_gemfile("---\nBUNDLE_GEMFILE: gems.rb # twin\n")
+                .as_deref(),
+            Some("gems.rb")
+        );
+
+        let dir = tempfile::tempdir().unwrap();
+        let root = dir.path();
+        std::fs::create_dir_all(root.join(".bundle")).unwrap();
+        std::fs::write(
+            root.join(".bundle").join("config"),
+            "---\nBUNDLE_CACHE_PATH: vendor/gems # committed gem cache\n",
+        )
+        .unwrap();
+        assert_eq!(
+            bundler_app_cache_dir_with_env(root, None, None, false, None).await,
+            root.join("vendor").join("gems")
+        );
+    }
+
+    /// #951 repro: `BUNDLE_PATH: .gems # comment` must discover the
+    /// `.gems` store Bundler installs into, not a directory named after
+    /// the whole line.
+    #[tokio::test]
+    async fn commented_app_config_bundle_path_discovers_the_bundler_store() {
+        let dir = tempfile::tempdir().unwrap();
+        std::fs::write(dir.path().join("Gemfile"), b"gem \"colorize\"\n").unwrap();
+        std::fs::create_dir_all(dir.path().join(".bundle")).unwrap();
+        std::fs::write(
+            dir.path().join(".bundle").join("config"),
+            "---\nBUNDLE_PATH: .gems # project-local gems\n",
+        )
+        .unwrap();
+        let gems = dir
+            .path()
+            .join(".gems")
+            .join("ruby")
+            .join("3.3.0")
+            .join("gems");
+        std::fs::create_dir_all(gems.join("colorize-0.8.1").join("lib")).unwrap();
+        std::fs::create_dir_all(dir.path().join(".gems/ruby/3.3.0/specifications")).unwrap();
+
+        let paths = RubyCrawler::get_vendor_bundle_paths_with_env(dir.path(), None, None).await;
+        assert_eq!(paths, vec![gems]);
+    }
+
+    /// Bundler before 2.5.6 (or 2.4/2.5 on RubyGems before 3.5.6) keeps the
+    /// comment in the value and installs into a directory named after it.
+    /// When only that legacy-era directory exists, discovery must still
+    /// find the store (the pre-#951 behaviour), not fall back to the
+    /// system gem homes.
+    #[tokio::test]
+    async fn commented_bundle_path_keeps_the_legacy_bundler_store() {
+        let dir = tempfile::tempdir().unwrap();
+        std::fs::write(dir.path().join("Gemfile"), b"gem \"colorize\"\n").unwrap();
+        std::fs::create_dir_all(dir.path().join(".bundle")).unwrap();
+        std::fs::write(
+            dir.path().join(".bundle").join("config"),
+            "---\nBUNDLE_PATH: .gems # note\n",
+        )
+        .unwrap();
+        let root = dir.path().join(".gems # note");
+        let gems = root.join("ruby").join("2.7.0").join("gems");
+        std::fs::create_dir_all(gems.join("colorize-0.8.1").join("lib")).unwrap();
+        std::fs::create_dir_all(root.join("ruby/2.7.0/specifications")).unwrap();
+
+        let paths = RubyCrawler::get_vendor_bundle_paths_with_env(dir.path(), None, None).await;
+        assert_eq!(paths, vec![gems]);
+
+        // Same for the cache path: only the legacy-era dir exists.
+        std::fs::write(
+            dir.path().join(".bundle").join("config"),
+            "---\nBUNDLE_CACHE_PATH: vendor/gems # c\n",
+        )
+        .unwrap();
+        let legacy_cache = dir.path().join("vendor").join("gems # c");
+        std::fs::create_dir_all(&legacy_cache).unwrap();
+        assert_eq!(
+            bundler_app_cache_dir_with_env(dir.path(), None, None, false, None).await,
+            legacy_cache
+        );
+    }
+
+    /// Bugbot on #953: a commented `path.system: true` drops the recorded
+    /// path under the current loader. A leftover directory at that
+    /// recorded path must not bring it back through the legacy reading.
+    #[tokio::test]
+    async fn commented_path_system_true_ignores_a_leftover_recorded_path() {
+        let dir = tempfile::tempdir().unwrap();
+        std::fs::write(dir.path().join("Gemfile"), b"gem \"foo\"\n").unwrap();
+        std::fs::create_dir_all(dir.path().join(".bundle")).unwrap();
+        std::fs::write(
+            dir.path().join(".bundle").join("config"),
+            "---\nBUNDLE_PATH: vendor/mygems\nBUNDLE_PATH__SYSTEM: true # use system gems\n",
+        )
+        .unwrap();
+        let root = dir.path().join("vendor").join("mygems");
+        std::fs::create_dir_all(root.join("gems").join("foo-1.0.0").join("lib")).unwrap();
+        std::fs::create_dir_all(root.join("specifications")).unwrap();
+
+        let paths = RubyCrawler::get_vendor_bundle_paths_with_env(dir.path(), None, None).await;
+        assert!(
+            paths.is_empty(),
+            "a commented path.system=true must still drop the config root: {paths:?}"
+        );
     }
 }

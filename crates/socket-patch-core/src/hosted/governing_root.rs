@@ -416,24 +416,24 @@ async fn lock_elsewhere(project: &Path, base: &Path, dir: &str) -> Option<PathBu
 }
 
 /// The top-level `lockfileDir:` scalar of a `pnpm-workspace.yaml`, read
-/// line-wise (a block key at column 0, bare or quoted, an optional quoted
-/// value, an optional trailing comment). A leading UTF-8 BOM is skipped,
-/// and the last assignment wins, as in the `.npmrc` reader.
+/// through the workspace splices' own key grammar
+/// ([`top_level_key`](crate::formats::pnpm::workspace::top_level_key):
+/// every key spelling, a trailing comment, a leading UTF-8 BOM). The last
+/// assignment wins, as in the `.npmrc` reader.
 fn workspace_lockfile_dir(yaml: &str) -> Option<String> {
-    let yaml = yaml.strip_prefix('\u{feff}').unwrap_or(yaml);
-    // The last assignment wins: scan from the end.
-    yaml.lines().rev().find_map(|line| {
-        let rest = ["lockfileDir", "\"lockfileDir\"", "'lockfileDir'"]
-            .iter()
-            .find_map(|key| line.strip_prefix(key))?
-            .trim_start();
-        let value = rest.strip_prefix(':')?.trim();
-        let value = match value.chars().next() {
-            Some(q @ ('"' | '\'')) => value[1..].split(q).next().unwrap_or(""),
-            _ => value.split(" #").next().unwrap_or("").trim(),
-        };
-        (!value.is_empty()).then(|| value.to_string())
-    })
+    yaml.lines()
+        .filter_map(crate::formats::pnpm::workspace::top_level_key)
+        .rfind(|(key, _)| key == "lockfileDir")
+        .map(|(_, value)| unquote_scalar(value).to_string())
+        .filter(|value| !value.is_empty())
+}
+
+/// A YAML scalar value without its surrounding quotes.
+fn unquote_scalar(value: &str) -> &str {
+    match value.as_bytes() {
+        [q @ (b'"' | b'\''), .., last] if last == q => &value[1..value.len() - 1],
+        _ => value,
+    }
 }
 
 #[cfg(test)]
@@ -1090,5 +1090,13 @@ mod tests {
             workspace_lockfile_dir("lockfileDir: ../a\nlockfileDir: ../b\n").as_deref(),
             Some("../b")
         );
+        // #905: read through the shared `top_level_key` grammar, so every
+        // spelling the workspace splices accept is read here too.
+        assert_eq!(
+            workspace_lockfile_dir("lockfileDir : ../x # shared lock\n").as_deref(),
+            Some("../x")
+        );
+        assert_eq!(workspace_lockfile_dir("lockfileDir: \"\"\n"), None);
+        assert_eq!(workspace_lockfile_dir("# lockfileDir: ..\n"), None);
     }
 }

@@ -57,6 +57,7 @@ use std::path::Path;
 
 use toml_edit::{DocumentMut, InlineTable, Item, Value};
 
+use crate::formats::text::split_bom;
 use crate::utils::fs::{atomic_write_bytes_preserving_mode, read_regular_to_string};
 
 use super::cargo_config::{ensure_table_like, patch_entries, path_is_socket_owned};
@@ -361,15 +362,6 @@ pub fn parse_manifest(content: &str) -> Result<DocumentMut, ManifestError> {
         .replace("\r\n", "\n")
         .parse::<DocumentMut>()
         .map_err(|e| ManifestError::Unparseable(format!("Cargo.toml is not valid TOML: {e}")))
-}
-
-/// `(bom, rest)`: a leading UTF-8 BOM (`toml_edit` accepts it but never
-/// renders it back), split off so an edit can restore it.
-fn split_bom(content: &str) -> (&str, &str) {
-    match content.strip_prefix('\u{feff}') {
-        Some(rest) => ("\u{feff}", rest),
-        None => ("", content),
-    }
 }
 
 /// `edited` (the `toml_edit` rendering of `original` after an edit) mapped
