@@ -515,8 +515,10 @@ fn no_new_private_scrub_socket_env_copies() {
         .collect();
     assert!(
         unexpected.is_empty(),
-        "spawn through `common/hermetic.rs` (hermetic::command + scrub_extra) \
-         instead of a private scrub_socket_env: {unexpected:?}"
+        "these test files define a private scrub_socket_env: {unexpected:?}. \
+         Spawn through `tests/common/hermetic.rs` instead (hermetic::command \
+         for the binary, scrub_socket_vars + scrub_extra for package-manager \
+         children). Do not add them to PENDING_SCRUB_COPIES."
     );
     let stale: Vec<&&str> = PENDING_SCRUB_COPIES
         .iter()
@@ -524,8 +526,10 @@ fn no_new_private_scrub_socket_env_copies() {
         .collect();
     assert!(
         stale.is_empty(),
-        "these files no longer carry a scrub_socket_env copy; drop them from \
-         PENDING_SCRUB_COPIES: {stale:?}"
+        "these files no longer carry a scrub_socket_env copy: {stale:?}. Delete \
+         them from PENDING_SCRUB_COPIES in \
+         crates/socket-patch-cli/tests/spawn_env_hygiene.rs (another PR may \
+         have migrated them; rebase and drop the entries)."
     );
 }
 
@@ -542,8 +546,11 @@ fn no_new_bare_binary_spawns() {
         .collect();
     assert!(
         unexpected.is_empty(),
-        "spawn the binary through `hermetic::command` / `common::run*`, not a \
-         bare Command::new: {unexpected:?}"
+        "these test files spawn the binary with a bare Command::new: \
+         {unexpected:?}. Use `hermetic::command(&bin)` / \
+         `hermetic::binary_command()` or `common::run*` (tests/common/) so the \
+         child gets the hermetic SOCKET_* environment. Do not add them to \
+         PENDING_RAW_SPAWNS."
     );
     let stale: Vec<&&str> = PENDING_RAW_SPAWNS
         .iter()
@@ -551,7 +558,9 @@ fn no_new_bare_binary_spawns() {
         .collect();
     assert!(
         stale.is_empty(),
-        "these files no longer spawn the binary bare; drop them from \
-         PENDING_RAW_SPAWNS: {stale:?}"
+        "these files no longer spawn the binary bare: {stale:?}. Delete them \
+         from PENDING_RAW_SPAWNS in \
+         crates/socket-patch-cli/tests/spawn_env_hygiene.rs (another PR may \
+         have migrated them; rebase and drop the entries)."
     );
 }
