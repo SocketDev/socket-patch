@@ -1322,6 +1322,52 @@ mod tests {
     }
 
     #[test]
+    fn test_purl_matches_identifier_pypi_pep503_spellings() {
+        // #1024: patch keys are PEP 503 canonical, but users type the
+        // name as the project declares it. Every spelling must select the
+        // patch, for base and qualified identifiers alike.
+        let key = "pkg:pypi/typing-extensions@4.7.1";
+        let qualified = "pkg:pypi/typing-extensions@4.7.1?artifact_id=abc";
+        for spelling in [
+            "pkg:pypi/typing_extensions@4.7.1",
+            "pkg:pypi/Typing-Extensions@4.7.1",
+            "pkg:pypi/typing.extensions@4.7.1",
+            "pkg:pypi/Typing__Extensions@4.7.1",
+            "pkg:pypi/typing%5Fextensions@4.7.1",
+        ] {
+            assert!(purl_eq(key, spelling), "{spelling}");
+            assert!(purl_eq(spelling, key), "{spelling}");
+            assert!(purl_matches_identifier(key, spelling), "{spelling}");
+            assert!(purl_matches_identifier(qualified, spelling), "{spelling}");
+            assert!(
+                purl_matches_identifier(qualified, &format!("{spelling}?artifact_id=abc")),
+                "{spelling}"
+            );
+            assert!(patch_matches(key, "u", spelling), "{spelling}");
+        }
+        assert!(purl_matches_identifier(
+            "pkg:pypi/jinja2@3.1.2",
+            "pkg:pypi/Jinja2@3.1.2"
+        ));
+        assert!(purl_matches_identifier(
+            "pkg:pypi/ruamel-yaml@0.17.21",
+            "pkg:pypi/ruamel.yaml@0.17.21"
+        ));
+        // Still distinct: another version, another qualifier, another name,
+        // and the same name under another ecosystem.
+        assert!(!purl_eq(key, "pkg:pypi/typing_extensions@4.7.2"));
+        assert!(!purl_matches_identifier(
+            qualified,
+            "pkg:pypi/typing_extensions@4.7.1?artifact_id=xyz"
+        ));
+        assert!(!purl_eq(key, "pkg:pypi/typingextensions@4.7.1"));
+        assert!(!purl_eq(
+            "pkg:npm/typing-extensions@4.7.1",
+            "pkg:npm/typing_extensions@4.7.1"
+        ));
+    }
+
+    #[test]
     fn test_parse_jsr_purl_percent_encoded_scope() {
         let ((scope, name), version) = parse_jsr_purl("pkg:jsr/%40std/path@0.220.0").unwrap();
         assert_eq!(scope, "@std");
