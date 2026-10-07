@@ -38,7 +38,13 @@
 //! ancestor `pnpm-workspace.yaml` lists) is demoted into that workspace
 //! root, which reads it as a disk run from the root does: pinned beside the
 //! root lock under `sharedWorkspaceLockfile: false`, ignored beside a
-//! shared root lock (#492).
+//! shared root lock (#492). Only once the root's files confirm it (the
+//! globs read and list the member, which has a package manifest, and the
+//! root pins or knowingly ignores its lock) and socket.yml admits the root:
+//! otherwise the member keeps its lock as a root of its own. Path selection
+//! cannot read the globs, so under a workspace root it fetches every
+//! `pnpm-lock.yaml` beside a package manifest outside pnpm's skipped trees,
+//! the same over-fetch tradeoff as Cargo member manifests above.
 
 use std::collections::{BTreeMap, BTreeSet, HashMap};
 use std::sync::Arc;
@@ -295,20 +301,119 @@ fn demote_cargo_members(states: &mut [RootState], warnings: &mut Vec<EngineWarni
     }
 }
 
-/// The text of the input file `path` when its content was provided (see
-/// [`roots::pnpm_workspace_members`]).
-fn input_text<'a>(files: &'a BTreeMap<String, SharedFile>, path: &str) -> Option<&'a str> {
-    match files.get(path) {
-        Some(SharedFile {
-            entry: MemoryEntry::Text(text),
-            unreadable: false,
-        }) => Some(text),
-        _ => None,
+/// The confirmed pnpm workspace members among `candidates`
+/// ([`roots::pnpm_member_candidates`]), each with its workspace root: the
+/// root's own files (as a disk run from it reads them) account for the
+/// member's lock
+/// ([`root_accounts_for_member_lock`](crate::utils::pnpm_workspace::root_accounts_for_member_lock)),
+/// and `admitted` (the socket.yml path policy) lets that root be scanned.
+/// Any other candidate keeps its lock as a root of its own, as before #492
+/// ([`refuse_governed_pnpm_members`] guards its trust auto-config): a lock
+/// demoted into a root that leaves it unread, or that is never scanned,
+/// would be pinned by no one.
+async fn confirm_pnpm_members(
+    files: &BTreeMap<String, SharedFile>,
+    candidates: Vec<(String, String)>,
+    admitted: impl Fn(&str) -> bool,
+) -> Vec<(String, String)> {
+    let mut views: BTreeMap<String, MemoryProject> = BTreeMap::new();
+    let mut out = Vec::new();
+    for (member, workspace) in candidates {
+        if !admitted(&workspace) {
+            continue;
+        }
+        let Some(rel) = roots::strip_root(&workspace, &member).map(str::to_string) else {
+            continue;
+        };
+        let project = views
+            .entry(workspace.clone())
+            .or_insert_with(|| project_for(&workspace, files).0);
+        let view = ProjectView::Memory(project);
+        if crate::utils::pnpm_workspace::root_accounts_for_member_lock(&view, &rel).await {
+            out.push((member, workspace));
+        }
+    }
+    out
+}
+
+/// A pnpm root with a v9 lock but no `pnpm-workspace.yaml` of its own that
+/// the nearest ancestor `pnpm-workspace.yaml` may list as a workspace
+/// project, and whose lock was not demoted into that workspace root
+/// ([`confirm_pnpm_members`]): pnpm reads `trustLockfile` only from that
+/// ancestor file, so the trust auto-config's `pnpm-workspace.yaml` in the
+/// member would be ignored and pnpm >= 11 would reject the hosted pins.
+/// The disk run refuses a member run the same way
+/// (`redirect_pnpm_settings_elsewhere`), so the member is refused rather
+/// than given a file pnpm never reads. A governing file the engine cannot
+/// read (a symlink, oversize, content not provided) or whose globs it
+/// cannot model counts as listing the member, the refusing side.
+fn refuse_governed_pnpm_members(files: &BTreeMap<String, SharedFile>, states: &mut [RootState]) {
+    use crate::hosted::governing_root::PNPM_SETTINGS_ELSEWHERE;
+    use crate::hosted::guidance::PNPM_WORKSPACE_REL;
+    for state in states.iter_mut() {
+        let Some(project) = state.project.as_ref() else {
+            continue;
+        };
+        if state.root.is_empty() || project.contains(PNPM_WORKSPACE_REL) {
+            continue;
+        }
+        let v9 = matches!(
+            project.get("pnpm-lock.yaml"),
+            Some(MemoryEntry::Text(lock))
+                if crate::formats::pnpm::lock_version_major(lock).is_some_and(|major| major >= 9)
+        );
+        if !v9 {
+            continue;
+        }
+        let mut dir = state.root.as_str();
+        let governing = loop {
+            dir = roots::split_path(dir).0;
+            let path = roots::join_root(dir, PNPM_WORKSPACE_REL);
+            if let Some(file) = files.get(&path) {
+                break Some((path, file));
+            }
+            if dir.is_empty() {
+                break None;
+            }
+        };
+        let Some((path, file)) = governing else {
+            continue;
+        };
+        let rel: Vec<String> = roots::strip_root(dir, &state.root)
+            .unwrap_or(&state.root)
+            .split('/')
+            .map(str::to_string)
+            .collect();
+        let member = match &file.entry {
+            MemoryEntry::Text(text) if !file.unreadable => {
+                crate::utils::pnpm_workspace::lists_as_member(text, &rel)
+            }
+            _ => true,
+        };
+        if member {
+            let workspace = if dir.is_empty() { "." } else { dir };
+            state.fail(
+                PNPM_SETTINGS_ELSEWHERE,
+                format!(
+                    "{} may be a project of the pnpm workspace whose settings live in {path}: \
+                     pnpm reads `trustLockfile` only from that file, so a \
+                     pnpm-workspace.yaml created in {} would be ignored and pnpm >= 11 \
+                     would reject the hosted pins (ERR_PNPM_TARBALL_URL_MISMATCH); the \
+                     in-memory engine pins a member's lock from the workspace root `{workspace}` \
+                     only when that root's pnpm-workspace.yaml, lock and the member's \
+                     package.json say the root installs or ignores it — scan `{workspace}` \
+                     with those files, run hosted mode from the workspace root on a \
+                     checkout, or turn the trust auto-config off to pin without it; \
+                     nothing was written",
+                    state.root, state.root
+                ),
+            );
+        }
     }
 }
 
 /// A pnpm workspace member's own `pnpm-lock.yaml` is the workspace root's
-/// to read (#492, [`roots::pnpm_workspace_members`]): pinned beside the
+/// to read (#492, [`confirm_pnpm_members`]): pinned beside the
 /// root's under `sharedWorkspaceLockfile: false`, a stale leftover beside a
 /// shared root lock. A member that stays a root (it holds another lock, or
 /// the caller named it) drops that lock, as a Cargo member drops its
@@ -554,21 +659,55 @@ async fn engine(
     // the project limit; roots named in `projectRoots` are explicit.
     let explicit_roots = options.project_roots.is_some();
     // pnpm workspace members' locks belong to the workspace root (#492):
-    // a detected member with no other lock is no root of its own, and the
+    // a confirmed member with no other lock is no root of its own, and the
     // workspace root is one even with no lock there (pnpm 7 writes none).
-    let pnpm_members = roots::pnpm_workspace_members(
-        &root_list,
-        |path| files.contains_key(path),
-        |path| input_text(&files, path),
-    );
-    if !explicit_roots && !pnpm_members.is_empty() {
+    let admitted = |root: &str| {
+        let markers = roots::root_markers(root, files.keys().map(String::as_str));
+        policy
+            .admits_root(&Root {
+                rel_dir: root,
+                markers: &markers,
+                explicit: explicit_roots,
+            })
+            .is_ok()
+    };
+    let candidates =
+        roots::pnpm_member_candidates(&root_list, |path| files.contains_key(path), ecosystems);
+    let pnpm_members = confirm_pnpm_members(&files, candidates.clone(), admitted).await;
+    let other_marker =
+        |root: &str| roots::has_other_root_marker(root, files.keys().map(String::as_str), ecosystems);
+    if !explicit_roots {
         root_list.retain(|root| {
-            !pnpm_members.iter().any(|(member, _)| member == root)
-                || roots::has_other_root_marker(root, files.keys().map(String::as_str), ecosystems)
+            !pnpm_members.iter().any(|(member, _)| member == root) || other_marker(root)
         });
         root_list.extend(pnpm_members.iter().map(|(_, workspace)| workspace.clone()));
         root_list.sort();
         root_list.dedup();
+    } else {
+        // Named roots are kept, with two exceptions that make a run over
+        // path selection's `roots` match the detected one: a confirmed
+        // member named beside its workspace root (and holding no other
+        // lock), and a lockless directory selection named only because a
+        // pnpm-workspace.yaml sits above candidate members, none of which
+        // it turned out to pin.
+        let named: BTreeSet<String> = root_list.iter().cloned().collect();
+        let speculative: BTreeSet<&str> = candidates
+            .iter()
+            .map(|(_, workspace)| workspace.as_str())
+            .filter(|workspace| {
+                !pnpm_members.iter().any(|(_, w)| w == workspace)
+                    && roots::root_markers(workspace, files.keys().map(String::as_str)).is_empty()
+            })
+            .collect();
+        root_list.retain(|root| {
+            if speculative.contains(root.as_str()) {
+                return false;
+            }
+            !pnpm_members
+                .iter()
+                .any(|(member, workspace)| member == root && named.contains(workspace))
+                || other_marker(root)
+        });
     }
     let detected_roots = root_list.clone();
     let root_list: Vec<String> = root_list
@@ -634,8 +773,11 @@ async fn engine(
             error: None,
         })
         .collect();
-    drop(files);
     demote_pnpm_members(&mut states, &pnpm_members, &mut warnings);
+    if options.trust_lockfile_config {
+        refuse_governed_pnpm_members(&files, &mut states);
+    }
+    drop(files);
     demote_cargo_members(&mut states, &mut warnings);
     phases.mark("roots");
 

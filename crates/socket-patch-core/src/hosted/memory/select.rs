@@ -21,7 +21,7 @@ use crate::policy::{
 };
 
 use super::roots::{
-    detect_roots, join_root, pnpm_workspace_members, root_markers, split_path, strip_root,
+    detect_roots, join_root, pnpm_member_candidates, root_markers, split_path, strip_root,
     EXCLUDED_ROOT_SEGMENTS, UNSUPPORTED_MARKERS,
 };
 use super::types::{
@@ -199,25 +199,34 @@ fn classify(rel: &str, root_files: &BTreeSet<&str>) -> Option<Need> {
 
 /// What a pnpm workspace root (one with a `pnpm-workspace.yaml`) needs of
 /// its nested file `rel` to read its members' own locks (#492, see
-/// `utils::pnpm_workspace::member_locks`): every `pnpm-lock.yaml` outside
-/// the trees pnpm's project finder skips, the branch locks beside one
-/// (#556), and whether a directory holding either has a package manifest,
-/// pnpm's test for a project. The `packages:` globs decide the members once
-/// the text is in.
+/// `utils::pnpm_workspace::member_locks`): in a directory holding a package
+/// manifest (pnpm's test for a project; a lock in any other directory is
+/// one pnpm never installs from), the `pnpm-lock.yaml`, the branch locks
+/// (#556) and the manifest itself, outside the trees pnpm's project finder
+/// skips. The `packages:` globs decide the members once the text is in;
+/// like Cargo member manifests, a lock the globs do not list is fetched and
+/// ignored (see the module docs of [`super`]).
 fn pnpm_member_need(rel: &str, root_files: &BTreeSet<&str>) -> Option<Need> {
     use crate::utils::pnpm_workspace::{is_git_branch_lock_name, MEMBER_SKIP, PROJECT_MANIFESTS};
     let (dir, base) = split_path(rel);
     if dir.split('/').any(|seg| MEMBER_SKIP.contains(&seg)) {
         return None;
     }
-    if base == "pnpm-lock.yaml" {
+    let lock = base == "pnpm-lock.yaml";
+    let branch = is_git_branch_lock_name(base);
+    let manifest = PROJECT_MANIFESTS.contains(&base);
+    if !(lock || branch || manifest) {
+        return None;
+    }
+    let beside = |name: &str| root_files.contains(format!("{dir}/{name}").as_str());
+    if !PROJECT_MANIFESTS.iter().any(|m| beside(m)) {
+        return None;
+    }
+    if lock {
         return Some(Need::Text);
     }
-    if is_git_branch_lock_name(base) {
+    if branch {
         return Some(Need::Present);
-    }
-    if !PROJECT_MANIFESTS.contains(&base) {
-        return None;
     }
     let prefix = format!("{dir}/");
     root_files
@@ -347,12 +356,19 @@ pub fn select_paths(entries: &[TreeEntryInput], options: &SelectOptions) -> Path
             // A pnpm workspace member's lock is read from its workspace
             // root (#492), which becomes a root of its own even with no
             // lock there (pnpm 7 writes none). Without content every root
-            // a workspace file sits above counts as a member; the session
-            // decides by the `packages:` globs and keeps the rest as
-            // roots, so each stays a root here too.
+            // a workspace file sits above is a candidate member: its
+            // workspace root is added (and fetched) and the candidate kept.
+            // The session confirms members from the files, and given these
+            // roots as `projectRoots` it drops a confirmed member beside its
+            // workspace root and a lockless workspace root that pins none,
+            // so it detects the same roots either way.
             let mut found = found;
-            let members = pnpm_workspace_members(&found, |p| blobs.contains_key(p), |_| None);
-            found.extend(members.into_iter().map(|(_, workspace)| workspace));
+            let candidates = pnpm_member_candidates(
+                &found,
+                |p| blobs.contains_key(p),
+                options.ecosystems.as_deref(),
+            );
+            found.extend(candidates.into_iter().map(|(_, workspace)| workspace));
             found.sort();
             found.dedup();
             found
@@ -424,7 +440,7 @@ pub fn select_paths(entries: &[TreeEntryInput], options: &SelectOptions) -> Path
     // from the nearest ancestor one when that file lists it (#492): the
     // session needs that file to tell a workspace member, whose lock it
     // demotes into the workspace root, from a standalone project (see
-    // `roots::pnpm_workspace_members`), also when the caller named the
+    // `roots::pnpm_member_candidates`), also when the caller named the
     // roots.
     for (root, files) in &per_root {
         if !files.contains("pnpm-lock.yaml") || files.contains(PNPM_WORKSPACE_REL) {

@@ -634,7 +634,8 @@ pub async fn read_candidate_files(
 /// the Rush locks above. Members whose list cannot be read leave the root
 /// lock out too and refuse (see [`CandidateFiles::pnpm_refusal`]).
 /// In memory too: the in-memory engine demotes each member lock into its
-/// workspace root (`roots::pnpm_workspace_members` in [`super::memory`]),
+/// workspace root once that root's files confirm it reads them
+/// (`confirm_pnpm_members` in [`super::memory`]),
 /// so the root reads them here as a disk run from it does; a member lock
 /// whose content was not provided refuses the project like an unreadable
 /// root lock.

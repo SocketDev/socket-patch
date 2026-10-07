@@ -288,6 +288,48 @@ pub async fn member_locks(view: &ProjectView<'_>) -> MemberLocks {
     MemberLocks::PerMember(keys)
 }
 
+/// Whether the workspace rooted at `view` accounts for the
+/// `pnpm-lock.yaml` of its directory `dir` (root-relative, never empty)
+/// the way a run from that root reads it (#492): pinned as a member lock
+/// ([`member_locks`] lists it), or a stale leftover beside a root lock pnpm
+/// installs every member from. Only then may the in-memory engine take the
+/// lock away from `dir` as a root of its own.
+///
+/// `false`, so `dir` keeps its lock, whenever the root's answer is not
+/// that: the root `pnpm-workspace.yaml` is unreadable, its `packages:`
+/// cannot be read or uses glob syntax the matcher does not model, it does
+/// not list `dir`, `dir` has no package manifest (pnpm's test for a
+/// project), the member list is unresolved, or the shared default holds
+/// with no root lock to install from.
+pub(crate) async fn root_accounts_for_member_lock(view: &ProjectView<'_>, dir: &str) -> bool {
+    let Ok(workspace) = view.read_text(PNPM_WORKSPACE).await else {
+        return false;
+    };
+    let rel: Vec<String> = dir.split('/').map(str::to_string).collect();
+    let listed = matches!(
+        read_package_globs(&workspace),
+        Ok(Some(globs)) if matches!(lists_member(&globs, &rel), Ok(true))
+    );
+    if !listed {
+        return false;
+    }
+    let mut project = false;
+    for manifest in PROJECT_MANIFESTS {
+        if view.exists_no_follow(&format!("{dir}/{manifest}")).await {
+            project = true;
+            break;
+        }
+    }
+    if !project {
+        return false;
+    }
+    match member_locks(view).await {
+        MemberLocks::PerMember(keys) => keys.contains(&format!("{dir}/{PNPM_LOCK}")),
+        MemberLocks::Shared => view.read_text(PNPM_LOCK).await.is_ok(),
+        MemberLocks::Unresolved(_) => false,
+    }
+}
+
 /// The workspace members that install from their own lock (see
 /// [`member_locks`]).
 enum Members {

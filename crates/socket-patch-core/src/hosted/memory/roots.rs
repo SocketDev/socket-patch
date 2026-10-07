@@ -5,7 +5,7 @@
 //! the enclosing workspace's `members`/`exclude` can say whether it is a
 //! member, so the engine demotes members once manifests are readable. A
 //! pnpm workspace member's lock is demoted into the workspace root the
-//! same way, by the `packages:` globs ([`pnpm_workspace_members`]).
+//! same way, by the `packages:` globs ([`pnpm_member_candidates`]).
 
 use std::collections::{BTreeMap, BTreeSet};
 
@@ -160,29 +160,29 @@ pub(crate) fn detect_roots<'a>(
     (roots, ignored)
 }
 
-/// The workspace members among the pnpm `roots` (#492): a root holding a
-/// `pnpm-lock.yaml` and no `pnpm-workspace.yaml` of its own that the
-/// nearest ancestor `pnpm-workspace.yaml` lists as a project
-/// ([`lists_as_member`](crate::utils::pnpm_workspace::lists_as_member)),
-/// paired with that file's directory. pnpm installs such a member as part
-/// of that workspace: from its own lock under `sharedWorkspaceLockfile:
-/// false`, which a run from the workspace root pins beside the root's
-/// ([`member_locks`](crate::utils::pnpm_workspace::member_locks)), or from
-/// the root's shared lock, which leaves the member's a stale leftover pnpm
-/// never reads. Either way the workspace root decides it, so the member's
-/// lock is demoted into that root, the way a Cargo member's lock is.
+/// The candidate workspace members among the pnpm `roots` (#492): a root
+/// holding a `pnpm-lock.yaml` and no `pnpm-workspace.yaml` of its own, with
+/// a `pnpm-workspace.yaml` in a strict ancestor, paired with the nearest
+/// such file's directory (pnpm never looks past it). Empty when the
+/// `ecosystems` filter leaves npm out.
 ///
-/// `has` says whether a repo path exists; `workspace_text` returns a
-/// `pnpm-workspace.yaml`'s text, `None` when it is unknown (path selection
-/// has no content yet) or unreadable, which counts as listing the member,
-/// as the disk governing check reads it.
-pub(crate) fn pnpm_workspace_members<'a>(
+/// Decided from paths alone, so a candidate is only that: the engine reads
+/// the workspace root's files to confirm that root pins (or knowingly
+/// ignores) the member's lock
+/// ([`root_accounts_for_member_lock`](crate::utils::pnpm_workspace::root_accounts_for_member_lock))
+/// before it demotes the lock into it, the way a Cargo member's lock is.
+/// Path selection, which has no content yet, fetches the workspace root of
+/// every candidate.
+pub(crate) fn pnpm_member_candidates(
     roots: &[String],
     has: impl Fn(&str) -> bool,
-    workspace_text: impl Fn(&str) -> Option<&'a str>,
+    ecosystems: Option<&[String]>,
 ) -> Vec<(String, String)> {
-    use crate::utils::pnpm_workspace::{lists_as_member, PNPM_WORKSPACE};
+    use crate::utils::pnpm_workspace::PNPM_WORKSPACE;
     let mut out = Vec::new();
+    if !allowed(ecosystems, "npm") {
+        return out;
+    }
     for root in roots {
         if root.is_empty()
             || !has(&join_root(root, "pnpm-lock.yaml"))
@@ -193,20 +193,10 @@ pub(crate) fn pnpm_workspace_members<'a>(
         let mut dir = root.as_str();
         while !dir.is_empty() {
             dir = split_path(dir).0;
-            let file = join_root(dir, PNPM_WORKSPACE);
-            if !has(&file) {
-                continue;
-            }
-            let rel: Vec<String> = strip_root(dir, root)
-                .unwrap_or(root)
-                .split('/')
-                .map(str::to_string)
-                .collect();
-            if workspace_text(&file).is_none_or(|yaml| lists_as_member(yaml, &rel)) {
+            if has(&join_root(dir, PNPM_WORKSPACE)) {
                 out.push((root.clone(), dir.to_string()));
+                break;
             }
-            // pnpm does not look past the nearest workspace file.
-            break;
         }
     }
     out
@@ -214,7 +204,7 @@ pub(crate) fn pnpm_workspace_members<'a>(
 
 /// Whether `root` holds a root marker of an `ecosystems` ecosystem besides
 /// its `pnpm-lock.yaml`: a pnpm member demoted into its workspace root
-/// ([`pnpm_workspace_members`]) stays a root of its own only then.
+/// ([`pnpm_member_candidates`]) stays a root of its own only then.
 pub(crate) fn has_other_root_marker<'a>(
     root: &str,
     paths: impl IntoIterator<Item = &'a str>,
@@ -233,7 +223,7 @@ mod tests {
     use super::*;
 
     #[test]
-    fn pnpm_members_are_the_roots_the_nearest_workspace_file_lists() {
+    fn pnpm_member_candidates_sit_below_the_nearest_workspace_file() {
         let paths: BTreeSet<&str> = [
             "pnpm-workspace.yaml",
             "pnpm-lock.yaml",
@@ -250,33 +240,43 @@ mod tests {
             .iter()
             .map(|r| r.to_string())
             .collect();
-        let texts = |path: &str| match path {
-            "pnpm-workspace.yaml" => Some("packages:\n  - packages/*\n  - nested/*\n"),
-            "nested/pnpm-workspace.yaml" => Some("packages: []\n"),
-            _ => None,
-        };
         let has = |p: &str| paths.contains(p);
         assert_eq!(
-            pnpm_workspace_members(&roots, has, texts),
-            vec![("packages/a".to_string(), String::new())],
-            "b has its own file, c is not listed, and the nearest file of x lists nothing"
+            pnpm_member_candidates(&roots, has, None),
+            [
+                ("nested/x".to_string(), "nested".to_string()),
+                ("packages/a".to_string(), String::new()),
+                ("tools/c".to_string(), String::new()),
+            ],
+            "b has its own file and the repo root is no member; x's nearest file is nested's"
         );
-        // No content yet: every root under a workspace file is a member.
-        let found: Vec<String> = pnpm_workspace_members(&roots, has, |_| None)
-            .into_iter()
-            .map(|(member, _)| member)
-            .collect();
-        assert_eq!(found, ["nested/x", "packages/a", "tools/c"]);
-        assert!(!has_other_root_marker(
-            "packages/a",
-            paths.iter().copied(),
-            None
-        ));
-        assert!(has_other_root_marker(
-            "packages/a",
-            ["packages/a/pnpm-lock.yaml", "packages/a/package-lock.json"],
-            None
-        ));
+        let cargo_only = ["cargo".to_string()];
+        assert!(pnpm_member_candidates(&roots, has, Some(&cargo_only)).is_empty());
+        let npm = ["npm".to_string()];
+        assert_eq!(pnpm_member_candidates(&roots, has, Some(&npm)).len(), 3);
+    }
+
+    #[test]
+    fn other_root_markers_are_scoped_to_the_member_directory() {
+        let paths = [
+            "packages/a/pnpm-lock.yaml",
+            "packages/a/package.json",
+            "packages/a/sub/package-lock.json",
+            "packages/ab/Cargo.lock",
+            "packages/package-lock.json",
+            "Cargo.lock",
+        ];
+        assert!(
+            !has_other_root_marker("packages/a", paths, None),
+            "markers in a parent, a sibling or a subdirectory are not the member's"
+        );
+        let mut own = paths.to_vec();
+        own.push("packages/a/yarn.lock");
+        assert!(has_other_root_marker("packages/a", own.iter().copied(), None));
+        let cargo = ["cargo".to_string()];
+        assert!(!has_other_root_marker("packages/a", own.iter().copied(), Some(&cargo)));
+        own.push("packages/a/Cargo.lock");
+        assert!(has_other_root_marker("packages/a", own.iter().copied(), Some(&cargo)));
     }
 
     fn roots(paths: &[&str]) -> Vec<String> {
