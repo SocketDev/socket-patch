@@ -670,7 +670,7 @@ impl GroupCommit {
         // the file other checkouts read, unpatched. Refuse the whole commit
         // before anything is written, as the hosted guard does.
         for change in &changes {
-            if is_symlink(&root.join(&change.rel)) {
+            if crate::utils::containment::is_link(&root.join(&change.rel)) {
                 return Err(std::io::Error::new(
                     std::io::ErrorKind::InvalidInput,
                     SymlinkedTarget(rel_string(&change.rel)),
@@ -1070,30 +1070,9 @@ fn carries_commit(item: &Replay) -> Option<bool> {
 /// run, which captures nothing, to predict that refusal.
 pub fn symlinked_paths<'a>(root: &Path, rels: impl IntoIterator<Item = &'a str>) -> Vec<String> {
     rels.into_iter()
-        .filter(|rel| is_symlink(&root.join(rel)))
+        .filter(|rel| crate::utils::containment::is_link(&root.join(rel)))
         .map(str::to_string)
         .collect()
-}
-
-fn is_symlink(path: &Path) -> bool {
-    std::fs::symlink_metadata(path).is_ok_and(|m| m.file_type().is_symlink())
-}
-
-/// Whether any existing level of `rel` below `root` — the file itself
-/// included — is a symbolic link: a journal must never write through one
-/// (out of the project, or onto a file it does not name).
-fn crosses_symlink(root: &Path, rel: &Path) -> std::io::Result<bool> {
-    let mut at = root.to_path_buf();
-    for component in rel.components() {
-        at.push(component);
-        match std::fs::symlink_metadata(&at) {
-            Ok(meta) if meta.file_type().is_symlink() => return Ok(true),
-            Ok(_) => {}
-            Err(e) if e.kind() == std::io::ErrorKind::NotFound => return Ok(false),
-            Err(e) => return Err(e),
-        }
-    }
-    Ok(false)
 }
 
 fn write_sync(path: &Path, bytes: Option<&[u8]>, preserve_mode: bool) -> std::io::Result<()> {
@@ -1158,7 +1137,10 @@ pub fn recover(project_root: &Path) -> std::io::Result<Recovery> {
         let rel = Path::new(&file.path);
         if relative_to(Path::new(""), rel).is_none()
             || !is_captured(rel)
-            || crosses_symlink(project_root, rel)?
+            // A journal must never write through a link (out of the
+            // project, or onto a file it does not name).
+            || crate::utils::containment::linked_level(project_root, &project_root.join(rel))
+                .is_some()
         {
             return set_aside(SetAsideOutcome::Refused);
         }
