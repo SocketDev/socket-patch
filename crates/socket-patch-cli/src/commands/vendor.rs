@@ -2771,8 +2771,17 @@ pub(crate) async fn vendor_records_reusing(
     let total = all_packages.len();
     // The vendored artifact dirs before this run wrote any: a commit the
     // symlink check refuses removes the ones the loop added, so the refusal
-    // leaves no orphan artifact behind (#898).
-    let vendor_dirs_before = (!common.dry_run).then(|| EjectSnapshot::vendor_dir_set(&common.cwd));
+    // leaves no orphan artifact behind (#898). A dir the pre-run ledger
+    // already names (an artifact redownloaded in place) is kept: it needs
+    // no commit to be referenced.
+    let vendor_dirs_before = (!common.dry_run).then(|| VendorDirsBefore {
+        dirs: EjectSnapshot::vendor_dir_set(&common.cwd),
+        referenced: state
+            .entries
+            .values()
+            .map(|e| common.cwd.join(&e.artifact.path))
+            .collect(),
+    });
 
     // Service downloads, fetched ahead of this serial loop (the wiring and
     // every write stay here, in order). The plan is EXACT — only the
@@ -3735,17 +3744,29 @@ fn print_vendor_closing(
     }
 }
 
-/// Remove the vendored artifact dirs that appeared since `before` (see
-/// [`EjectSnapshot::vendor_dir_set`]), returning what could not be removed.
+/// The vendored artifact dirs a run started with (see
+/// [`EjectSnapshot::vendor_dir_set`]), and the artifact paths its ledger
+/// named then.
+struct VendorDirsBefore {
+    dirs: std::collections::BTreeSet<std::path::PathBuf>,
+    referenced: Vec<std::path::PathBuf>,
+}
+
+/// Remove the vendored artifact dirs that appeared since `before`, except
+/// one holding an artifact the pre-run ledger names (redownloaded in place,
+/// referenced without any commit), returning what could not be removed.
 async fn remove_new_vendor_dirs(
     common: &GlobalArgs,
-    before: Option<&std::collections::BTreeSet<std::path::PathBuf>>,
+    before: Option<&VendorDirsBefore>,
 ) -> Vec<String> {
     let Some(before) = before else {
         return Vec::new();
     };
     let mut leftovers = Vec::new();
-    for dir in EjectSnapshot::vendor_dir_set(&common.cwd).difference(before) {
+    for dir in EjectSnapshot::vendor_dir_set(&common.cwd).difference(&before.dirs) {
+        if before.referenced.iter().any(|p| p.starts_with(dir)) {
+            continue;
+        }
         if let Err(e) = remove_tree_and_prune(dir, &common.cwd.join(SOCKET_DIR)).await {
             leftovers.push(format!("{}: {e}", dir.display()));
         }
