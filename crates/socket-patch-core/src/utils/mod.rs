@@ -21,6 +21,7 @@ pub mod purl;
 pub mod python_lock;
 pub mod python_script;
 pub(crate) mod relpath;
+pub mod repo_root;
 pub(crate) mod requirements;
 pub(crate) mod serde;
 pub mod socket_cli_config;

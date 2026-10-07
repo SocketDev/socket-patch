@@ -729,7 +729,11 @@ async fn legacy_mixed_root(project_root: &Path) -> bool {
 /// Maven reactor, a project of a Gradle build or an sbt subproject of a
 /// build rooted above it: vendoring
 /// there would wire a build nobody runs and leave the real one unpatched
-/// (#428). Ancestors are searched up to the enclosing git checkout.
+/// (#428). Ancestors are searched up to the enclosing git checkout (a
+/// checkout at `project_root` itself does not stop the search: a submodule
+/// can still be a module of the build above it), with the repository
+/// lookup's own bounds: never into the home directory or a
+/// `GIT_CEILING_DIRECTORIES` entry ([`crate::utils::repo_root`]).
 pub(super) fn not_build_root(project_root: &Path) -> Option<String> {
     let project = super::jvm::apply::ProjectReader::new(project_root);
     let own_settings = ["settings.gradle", "settings.gradle.kts"]
@@ -738,9 +742,13 @@ pub(super) fn not_build_root(project_root: &Path) -> Option<String> {
     let own_build = ["build.gradle", "build.gradle.kts"]
         .iter()
         .any(|f| project_root.join(f).is_file());
-    for ancestor in project_root.ancestors().skip(1) {
+    let canonical_root =
+        std::fs::canonicalize(project_root).unwrap_or_else(|_| project_root.to_path_buf());
+    let ancestors = crate::utils::repo_root::ancestor_search_dirs(&canonical_root);
+    for ancestor in &ancestors {
+        let ancestor = ancestor.as_path();
         let reader = super::jvm::apply::ProjectReader::new(ancestor);
-        let rel = project_root
+        let rel = canonical_root
             .strip_prefix(ancestor)
             .ok()
             .map(|p| p.to_string_lossy().replace('\\', "/"));
@@ -779,9 +787,6 @@ pub(super) fn not_build_root(project_root: &Path) -> Option<String> {
                     ancestor.display()
                 ));
             }
-        }
-        if ancestor.join(".git").exists() {
-            break;
         }
     }
     None

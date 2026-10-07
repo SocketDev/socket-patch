@@ -407,44 +407,38 @@ fn scan_toml_section(content: &str, section: &str) -> Option<(String, String)> {
     Some((name, version))
 }
 
-/// Walk up from `start` looking for a `.git/config` (the working tree
-/// or any of its ancestors). When found, parse the
-/// `[remote "origin"] url = ...` line and convert that URL to a PURL.
+/// The `[remote "origin"] url = ...` of the git checkout enclosing
+/// `start`, converted to a PURL.
+///
+/// The checkout is the one every repository lookup uses
+/// ([`crate::utils::repo_root::find_git_repo`]): the NEAREST `.git`
+/// directory or file, so a submodule or linked worktree names itself (its
+/// config is followed through the `gitdir:` pointer, and a worktree's
+/// through `commondir`), never past `GIT_CEILING_DIRECTORIES`, and never a
+/// repository at the home directory unless `start` is it — a dotfiles
+/// repo at `~` is not every project's product. A checkout owned by an
+/// untrusted user is not read (git refuses it too).
 ///
 /// Returns `None` when:
-/// * `cwd` is not inside a git working tree,
-/// * `.git/config` has no `[remote "origin"]` section, or
+/// * `start` is not inside such a checkout, or its config is unreadable,
+/// * the config has no `[remote "origin"]` section, or
 /// * the URL is empty / parsing failed catastrophically. (Otherwise
 ///   even unrecognized hosts fall through to the raw-URL case.)
 ///
-/// Worktrees (`.git` as a file pointing at a real git dir elsewhere)
-/// are deliberately NOT followed — they're rare and the package-
-/// manifest fallback handles them correctly. Submodules likewise:
-/// only the outermost `.git/config` wins.
+/// The package-manifest fallback then names the product.
 async fn detect_git_remote(start: &Path) -> Option<String> {
-    let git_config_path = find_git_config(start).await?;
-    let content = tokio::fs::read_to_string(&git_config_path).await.ok()?;
+    let start = start.to_path_buf();
+    let git_config_path = crate::utils::fs::run_blocking(move || {
+        crate::utils::repo_root::find_git_repo(&start)
+            .filter(|repo| repo.trusted)?
+            .config_path()
+    })
+    .await?;
+    let content = crate::utils::fs::read_regular_to_string(&git_config_path)
+        .await
+        .ok()?;
     let url = scan_remote_origin_url(&content)?;
     Some(remote_url_to_purl(&url))
-}
-
-/// Walk ancestors looking for `<dir>/.git/config` as a regular file.
-/// Returns the path to it, or `None` if we exhaust the chain.
-async fn find_git_config(start: &Path) -> Option<std::path::PathBuf> {
-    let mut cursor = match tokio::fs::canonicalize(start).await {
-        Ok(p) => p,
-        Err(_) => start.to_path_buf(),
-    };
-    loop {
-        let candidate = cursor.join(".git").join("config");
-        if crate::utils::fs::is_file(&candidate).await {
-            return Some(candidate);
-        }
-        match cursor.parent() {
-            Some(p) => cursor = p.to_path_buf(),
-            None => return None,
-        }
-    }
 }
 
 /// Read the `url = ...` line out of the `[remote "origin"]` section of
@@ -1255,31 +1249,82 @@ mod tests {
         assert!(r.warnings.is_empty());
     }
 
-    /// `find_git_config` returns None for a path that genuinely has
-    /// no `.git/config` on any ancestor. Tempdir on `/var/folders` (macOS)
-    /// or `/tmp` (linux) gives us a tree that escapes the user's home.
+    /// No checkout above a tempdir: `/var/folders` (macOS) and `/tmp`
+    /// (Linux) live outside any git repository.
     #[tokio::test]
-    async fn find_git_config_returns_none_when_no_repo_ancestor() {
-        // Walk up from the tempdir — none of its ancestors should
-        // contain `.git/config`. This depends on the test runner's
-        // tempdir living outside any git repo; both macOS
-        // /var/folders and Linux /tmp satisfy that.
+    async fn detect_git_remote_returns_none_when_no_repo_ancestor() {
         let dir = tempfile::tempdir().unwrap();
-        let r = find_git_config(dir.path()).await;
-        assert!(r.is_none(), "unexpected .git/config above {dir:?}: {r:?}");
+        let r = detect_git_remote(dir.path()).await;
+        assert!(r.is_none(), "unexpected checkout above {dir:?}: {r:?}");
     }
 
-    /// `find_git_config` handles a non-existent start path via the
-    /// `canonicalize → Err` arm and still walks ancestors of the
-    /// raw input. Returns None when no config is found.
+    /// A start path that does not exist walks its raw ancestors and finds
+    /// nothing.
     #[tokio::test]
-    async fn find_git_config_handles_non_existent_start_path() {
+    async fn detect_git_remote_handles_non_existent_start_path() {
         let dir = tempfile::tempdir().unwrap();
         let nonexistent = dir.path().join("does/not/exist");
-        // No I/O panic; the fallback `start.to_path_buf()` arm of
-        // the `canonicalize` match runs.
-        let r = find_git_config(&nonexistent).await;
-        assert!(r.is_none());
+        assert!(detect_git_remote(&nonexistent).await.is_none());
+    }
+
+    /// B22: inside a submodule (`.git` is a `gitdir:` FILE), the product is
+    /// the submodule's own origin, not the superproject's.
+    #[tokio::test]
+    async fn detect_in_submodule_names_the_submodule() {
+        let root = tempfile::tempdir().unwrap();
+        let root = root.path();
+        let modules = root.join(".git/modules/sub");
+        std::fs::create_dir_all(&modules).unwrap();
+        std::fs::write(
+            root.join(".git/config"),
+            "[remote \"origin\"]\n\turl = git@github.com:acme/superproject.git\n",
+        )
+        .unwrap();
+        std::fs::write(
+            modules.join("config"),
+            "[remote \"origin\"]\n\turl = git@github.com:acme/child.git\n",
+        )
+        .unwrap();
+        let sub = root.join("sub");
+        std::fs::create_dir_all(&sub).unwrap();
+        std::fs::write(sub.join(".git"), "gitdir: ../.git/modules/sub\n").unwrap();
+        std::fs::write(
+            sub.join("package.json"),
+            r#"{"name":"child-app","version":"2.0.0"}"#,
+        )
+        .unwrap();
+
+        let r = detect_product(&sub).await;
+        assert_eq!(r.purl.as_deref(), Some("pkg:github/acme/child"));
+
+        // A submodule whose git dir is gone is not silently attributed to
+        // the superproject: the manifest names it.
+        std::fs::remove_dir_all(&modules).unwrap();
+        let r = detect_product(&sub).await;
+        assert_eq!(r.purl.as_deref(), Some("pkg:npm/child-app@2.0.0"));
+    }
+
+    /// B22: a linked worktree (`git worktree add`) reads the shared
+    /// repository's remotes through `commondir`.
+    #[tokio::test]
+    async fn detect_in_linked_worktree_uses_the_common_config() {
+        let base = tempfile::tempdir().unwrap();
+        let base = base.path();
+        let main_git = base.join("main/.git");
+        let wt_git = main_git.join("worktrees/wt");
+        std::fs::create_dir_all(&wt_git).unwrap();
+        std::fs::write(
+            main_git.join("config"),
+            "[remote \"origin\"]\n\turl = https://github.com/acme/app.git\n",
+        )
+        .unwrap();
+        std::fs::write(wt_git.join("commondir"), "../..\n").unwrap();
+        let wt = base.join("wt");
+        std::fs::create_dir_all(wt.join("src")).unwrap();
+        std::fs::write(wt.join(".git"), format!("gitdir: {}\n", wt_git.display())).unwrap();
+
+        let r = detect_product(&wt.join("src")).await;
+        assert_eq!(r.purl.as_deref(), Some("pkg:github/acme/app"));
     }
 
     /// `package.json` where `name` is a number, not a string → None.

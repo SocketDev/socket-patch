@@ -801,87 +801,27 @@ fn canonical_pypi_purl(purl: String) -> String {
     format!("pkg:pypi/{}{version}", canonicalize_pypi_name(name))
 }
 
-fn home_dir() -> Option<PathBuf> {
-    let var = if cfg!(windows) { "USERPROFILE" } else { "HOME" };
-    std::env::var_os(var)
-        .filter(|v| !v.is_empty())
-        .map(PathBuf::from)
-        .map(|p| std::fs::canonicalize(&p).unwrap_or(p))
-}
-
-fn ceiling_dirs() -> Vec<PathBuf> {
-    std::env::var_os("GIT_CEILING_DIRECTORIES")
-        .map(|v| {
-            std::env::split_paths(&v)
-                .filter(|p| !p.as_os_str().is_empty())
-                .map(|p| std::fs::canonicalize(&p).unwrap_or(p))
-                .collect()
-        })
-        .unwrap_or_default()
-}
-
-#[cfg(unix)]
-fn trusted_owner(meta: &std::fs::Metadata) -> bool {
-    use std::os::unix::fs::MetadataExt;
-    let sudo_uid = std::env::var("SUDO_UID").ok().and_then(|v| v.trim().parse::<u32>().ok());
-    // SAFETY: geteuid has no preconditions and cannot fail.
-    owner_trusted(meta.uid(), unsafe { libc::geteuid() }, sudo_uid)
-}
-
-/// `.git` is trusted when it belongs to the invoking user, to root, or
-/// (under sudo) to the user sudo ran for. Root trusts every owner: a root
-/// process is exposed to the whole filesystem anyway, and CI containers
-/// commonly run as root over a checkout owned by another uid, where
-/// distrust would silently drop the repo's policy (which only narrows).
-#[cfg(unix)]
-fn owner_trusted(owner: u32, euid: u32, sudo_uid: Option<u32>) -> bool {
-    euid == 0 || owner == euid || owner == 0 || sudo_uid == Some(owner)
-}
-
-#[cfg(not(unix))]
-fn trusted_owner(_meta: &std::fs::Metadata) -> bool {
-    true
-}
-
-/// The repo root for `cwd` (4.5) with the lookup's warnings: the nearest
-/// ancestor (inclusive) holding a `.git` directory or file, not walking
-/// past `GIT_CEILING_DIRECTORIES` or into the home directory, and (Unix)
-/// only when `.git` belongs to a trusted owner ([`owner_trusted`]).
-/// Otherwise `cwd`.
+/// The repo root for `cwd` (4.5) with the lookup's warnings: the checkout
+/// [`crate::utils::repo_root::find_git_repo`] finds (nearest `.git`
+/// directory or file, not past `GIT_CEILING_DIRECTORIES` or into the home
+/// directory), when its `.git` belongs to a trusted owner. Otherwise
+/// `cwd`.
 pub fn find_repo_root_with_warnings(cwd: &Path) -> (PathBuf, Vec<PolicyWarning>) {
     let cwd = std::fs::canonicalize(cwd).unwrap_or_else(|_| cwd.to_path_buf());
-    let ceilings = ceiling_dirs();
-    let home = home_dir();
     let mut warnings = Vec::new();
-    let mut dir: &Path = &cwd;
-    loop {
-        if dir != cwd && home.as_deref() == Some(dir) {
-            break;
-        }
-        // `metadata` follows a `.git` symlink, as git does.
-        if let Ok(meta) = std::fs::metadata(dir.join(".git")) {
-            if meta.is_dir() || meta.is_file() {
-                if trusted_owner(&meta) {
-                    return (dir.to_path_buf(), warnings);
-                }
-                warnings.push(PolicyWarning {
-                    code: SOCKET_YML_REPO_UNTRUSTED,
-                    detail: format!(
-                        "{} is owned by another user; using {} as the repository root",
-                        dir.join(".git").display(),
-                        cwd.display()
-                    ),
-                });
-                break;
-            }
-        }
-        let Some(parent) = dir.parent() else { break };
-        if ceilings.iter().any(|c| c == parent) {
-            break;
-        }
-        dir = parent;
+    match crate::utils::repo_root::find_git_repo(&cwd) {
+        Some(repo) if repo.trusted => return (repo.root, warnings),
+        Some(repo) => warnings.push(PolicyWarning {
+            code: SOCKET_YML_REPO_UNTRUSTED,
+            detail: format!(
+                "{} is owned by another user; using {} as the repository root",
+                repo.dot_git().display(),
+                cwd.display()
+            ),
+        }),
+        None => {}
     }
-    (cwd.clone(), warnings)
+    (cwd, warnings)
 }
 
 /// [`find_repo_root_with_warnings`] without the warnings.
