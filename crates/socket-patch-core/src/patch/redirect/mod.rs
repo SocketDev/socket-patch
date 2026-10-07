@@ -1048,14 +1048,10 @@ fn rewrite_npm_lock(
         // lockfile exists at all. A vlt project without its lock gets
         // `redirect_vlt_no_lockfile` from the vlt rewriter instead.
         let sibling_lock_present = files.keys().any(|k| {
-            k == "yarn.lock"
-                || k == "bun.lock"
-                || k == "bun.lockb"
-                || k == "pnpm-lock.yaml"
+            crate::formats::governing_locks::npm_lock_files().any(|lock| k == lock)
                 || k.ends_with("/pnpm-lock.yaml")
                 || k == "shrinkwrap.yaml"
                 || k.ends_with("/shrinkwrap.yaml")
-                || k == crate::constants::npm_family::VLT_LOCK
                 || k == crate::constants::npm_family::VLT_CONFIG
                 || k == crate::constants::npm_family::VLT_HIDDEN_LOCK_REL
         });

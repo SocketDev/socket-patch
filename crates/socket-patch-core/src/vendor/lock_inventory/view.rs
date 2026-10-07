@@ -12,14 +12,7 @@ use std::io;
 use std::path::Path;
 use std::sync::Arc;
 
-use crate::constants::npm_family::{
-    BUN_LOCK, BUN_LOCKB, NPM_LOCKS, PNPM_LOCK, PNP_MARKERS, VLT_LOCK,
-};
 use crate::utils::fs::{read_regular_to_bytes, read_regular_to_string};
-use crate::vendor::npm_flavor::NpmLockFlavor;
-use crate::formats::pnpm::{sniff_lock_grammar, PnpmLockGrammar};
-use crate::formats::yarn::{sniff_grammar, YarnLockGrammar, UNIDENTIFIED_DETAIL};
-use crate::vendor::VendorWarning;
 
 /// One in-memory file.
 #[derive(Debug, Clone, PartialEq, Eq)]
@@ -313,6 +306,17 @@ impl ProjectView<'_> {
         }
     }
 
+    /// A directory (following links on disk; an implied directory in
+    /// memory).
+    pub fn is_dir(&self, rel: &str) -> bool {
+        match self {
+            ProjectView::Disk(root) | ProjectView::Snapshot(DiskSnapshot { root, .. }) => {
+                root.join(rel).is_dir()
+            }
+            ProjectView::Memory(project) => project.is_dir(rel),
+        }
+    }
+
     /// The path itself is a symbolic link.
     pub fn is_symlink(&self, rel: &str) -> bool {
         match self {
@@ -353,101 +357,10 @@ impl ProjectView<'_> {
     }
 }
 
-/// [`crate::vendor::npm_flavor::detect_npm_lock_flavor`] over a
-/// [`ProjectView`]. The disk variant IS the disk probe; the memory variant
-/// follows the same decision table, with pnpm's own Plug'n'Play layout
-/// never detected (there is no installed store in memory).
-pub(crate) async fn detect_npm_lock_flavor_in(
-    view: &ProjectView<'_>,
-) -> Result<(NpmLockFlavor, Vec<VendorWarning>), (&'static str, String)> {
-    let project = match view {
-        ProjectView::Disk(root) | ProjectView::Snapshot(DiskSnapshot { root, .. }) => {
-            return crate::vendor::npm_flavor::detect_npm_lock_flavor(root).await
-        }
-        ProjectView::Memory(project) => *project,
-    };
-    let exists = |name: &str| project.contains(name);
-    let read_lock = |name: &str| -> Result<String, (&'static str, String)> {
-        project.read_text(name).map_err(|e| {
-            (
-                "vendor_lockfile_missing",
-                format!("cannot read {name}: {e}"),
-            )
-        })
-    };
-
-    if let Some(marker) = PNP_MARKERS.iter().find(|m| exists(m)) {
-        return Err((
-            "vendor_yarn_berry_unsupported",
-            format!(
-                "found `{marker}`: this is a yarn berry Plug'n'Play project — packages \
-                 live inside .yarn/cache/ zips, not node_modules/, so there is nothing \
-                 vendor could stage or rewire; use `yarn patch <pkg>` instead"
-            ),
-        ));
-    }
-
-    let detected = 'flavor: {
-        if exists(VLT_LOCK) {
-            let text = read_lock(VLT_LOCK)?;
-            match crate::vendor::vlt_lock::sniff_vendor_lock(&text) {
-                Ok(_) => break 'flavor NpmLockFlavor::Vlt,
-                Err(detail) => return Err(("vendor_lockfile_version_unsupported", detail)),
-            }
-        }
-        if exists(BUN_LOCK) || exists(BUN_LOCKB) {
-            break 'flavor NpmLockFlavor::Bun;
-        }
-        if exists(PNPM_LOCK) {
-            let text = read_lock(PNPM_LOCK)?;
-            match sniff_lock_grammar(&text) {
-                Ok(PnpmLockGrammar::V9) => break 'flavor NpmLockFlavor::Pnpm,
-                Ok(PnpmLockGrammar::V54 | PnpmLockGrammar::V60) => {
-                    break 'flavor NpmLockFlavor::PnpmLegacy
-                }
-                Err(detail) => return Err(("vendor_lockfile_version_unsupported", detail)),
-            }
-        }
-        if exists("yarn.lock") {
-            let text = read_lock("yarn.lock")?;
-            match sniff_grammar(&text) {
-                Some(YarnLockGrammar::Berry) => break 'flavor NpmLockFlavor::YarnBerry,
-                Some(YarnLockGrammar::Classic) => break 'flavor NpmLockFlavor::YarnClassic,
-                None => {
-                    return Err((
-                        "vendor_lockfile_version_unsupported",
-                        UNIDENTIFIED_DETAIL.to_string(),
-                    ))
-                }
-            }
-        }
-        if exists(NPM_LOCKS[0]) || exists(NPM_LOCKS[1]) {
-            break 'flavor NpmLockFlavor::PackageLock;
-        }
-        if exists("rush.json") {
-            return Err((
-                "vendor_rush_unsupported",
-                format!(
-                    "found rush.json: this is a Rush monorepo — its single pnpm lockfile \
-                     lives at {}; use `socket-patch scan --mode hosted`, which edits it in \
-                     place",
-                    crate::constants::npm_family::RUSH_COMMON_LOCK_REL
-                ),
-            ));
-        }
-        return Err((
-            "vendor_lockfile_missing",
-            "no package-lock.json, npm-shrinkwrap.json, yarn.lock, pnpm-lock.yaml, bun.lock, \
-             bun.lockb, or vlt-lock.json in the project root"
-                .to_string(),
-        ));
-    };
-    Ok((detected, Vec::new()))
-}
-
 #[cfg(test)]
 mod tests {
     use super::*;
+    use crate::vendor::npm_flavor::{detect_npm_lock_flavor_in, NpmLockFlavor};
 
     fn project(files: &[(&str, MemoryEntry)]) -> MemoryProject {
         let mut p = MemoryProject::new();

@@ -185,10 +185,16 @@ pub fn detect_npm_pkg_manager(project_root: &Path) -> NpmPkgManager {
 /// (`crate::vendor::npm_flavor::detect_npm_lock_flavor`) so both
 /// detection sites agree on what counts as a pnpm-PnP tree.
 pub(crate) fn pnpm_pnp_layout(project_root: &Path) -> bool {
-    let node_modules = project_root.join("node_modules");
-    (node_modules.join(".modules.yaml").is_file() || node_modules.join(".pnpm").is_dir())
-        && project_root.join("pnpm-lock.yaml").is_file()
-        && !project_root.join("yarn.lock").is_file()
+    pnpm_pnp_layout_in(&crate::vendor::lock_inventory::ProjectView::Disk(
+        project_root,
+    ))
+}
+
+/// [`pnpm_pnp_layout`] over a [`crate::vendor::lock_inventory::ProjectView`].
+pub(crate) fn pnpm_pnp_layout_in(view: &crate::vendor::lock_inventory::ProjectView<'_>) -> bool {
+    (view.is_file("node_modules/.modules.yaml") || view.is_dir("node_modules/.pnpm"))
+        && view.is_file("pnpm-lock.yaml")
+        && !view.is_file("yarn.lock")
 }
 
 #[cfg(test)]
