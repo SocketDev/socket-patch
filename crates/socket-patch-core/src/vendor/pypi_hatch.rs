@@ -20,7 +20,7 @@ async fn read_files(root: &Path) -> Result<BTreeMap<String, String>, Failure> {
     let mut files = BTreeMap::new();
     for file in ["pyproject.toml", "hatch.toml"] {
         if is_symlink(&root.join(file)).await {
-            return Err(("pypi_hatch_symlink", format!("{file} is a symbolic link")));
+            return Err(super::common::symlink_refusal(file));
         }
         match read_regular_to_string(&root.join(file)).await {
             Ok(text) => {

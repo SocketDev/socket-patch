@@ -483,7 +483,7 @@ pub(super) async fn wire_uv(
     record_uuid: &str,
 ) -> Result<(Vec<WiringRecord>, UvMeta, Vec<VendorWarning>), (&'static str, String)> {
     // Before ANY write: a symlinked half would be replaced by the rename.
-    refuse_symlinked(root, &UV_PAIR, "pypi_uv_symlink_unsupported").await?;
+    refuse_symlinked(root, &UV_PAIR).await?;
     match check_target_guards(p, canon_name, record_uuid)? {
         // Defensive: the orchestrator short-circuits in-sync pre-flight and
         // never calls wire on it (we must never re-record our own edit as an
@@ -795,9 +795,7 @@ pub(super) async fn revert_uv(entry: &VendorEntry, root: &Path, dry_run: bool) -
     let lock_path = root.join("uv.lock");
     // A symlinked half would be replaced by the rename-over write: keep the
     // artifact (the wiring still routes through it) and fail the revert.
-    if let Err((code, detail)) =
-        refuse_symlinked(root, &UV_PAIR, "pypi_uv_symlink_unsupported").await
-    {
+    if let Err((code, detail)) = refuse_symlinked(root, &UV_PAIR).await {
         return RevertOutcome {
             kept_artifact: true,
             success: false,
@@ -6321,7 +6319,11 @@ six = { path = ".socket/vendor/pypi/9f6b2c4e-1d3a-4f6b-8c2d-7e5a9b1c3d5f/six-1.1
             )
             .await
             .unwrap_err();
-            assert_eq!(code, "pypi_uv_symlink_unsupported", "{linked}: {detail}");
+            assert_eq!(
+                code,
+                crate::hosted::engine::SYMLINK_REFUSAL,
+                "{linked}: {detail}"
+            );
             assert!(detail.contains(linked), "{linked}: {detail}");
             let meta = tokio::fs::symlink_metadata(tmp.path().join(linked))
                 .await
@@ -6357,7 +6359,7 @@ six = { path = ".socket/vendor/pypi/9f6b2c4e-1d3a-4f6b-8c2d-7e5a9b1c3d5f/six-1.1
             assert!(outcome.kept_artifact, "{linked}: artifact must be kept");
             let error = outcome.error.unwrap_or_default();
             assert!(
-                error.contains("pypi_uv_symlink_unsupported") && error.contains(linked),
+                error.contains(crate::hosted::engine::SYMLINK_REFUSAL) && error.contains(linked),
                 "{linked}: {error}"
             );
             let meta = tokio::fs::symlink_metadata(tmp.path().join(linked))

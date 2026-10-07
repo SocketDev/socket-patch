@@ -58,20 +58,15 @@ async fn read_file(path: &Path) -> Result<String, Failure> {
 /// it, which REPLACES a symlink with a regular file: the link target goes
 /// stale (uv itself writes through the link), and a later revert restores
 /// bytes but never the link (git shows a 120000→100644 typechange). Refuse
-/// before the first write instead — same fail-closed policy as the hosted
-/// replay flush guard.
-fn symlink_refusal(file: &str) -> String {
-    format!(
-        "{file} is a symbolic link; socket-patch rewrites files in place with an atomic \
-         rename, which would replace the link — replace the link with a regular file (or \
-         run socket-patch in the directory it points to) and re-run"
-    )
-}
-
-async fn refuse_symlinked(root: &Path, files: impl Iterator<Item = &String>) -> Option<String> {
+/// before the first write instead — same fail-closed policy (and the same
+/// refusal) as the hosted replay flush guard.
+async fn refuse_symlinked(
+    root: &Path,
+    files: impl Iterator<Item = &String>,
+) -> Option<(&'static str, String)> {
     first_symlink(root, files.map(String::as_str))
         .await
-        .map(symlink_refusal)
+        .map(super::common::symlink_refusal)
 }
 
 /// The run's PEP 751 / script-lock parses. Both readers below would
@@ -344,8 +339,8 @@ pub(super) async fn wire_python_locks(
             edits.push((file.name.clone(), file.text.clone(), rewritten, KIND));
         }
     }
-    if let Some(detail) = refuse_symlinked(root, edits.iter().map(|(file, ..)| file)).await {
-        return Err(("pypi_lock_symlink_unsupported", detail));
+    if let Some(refusal) = refuse_symlinked(root, edits.iter().map(|(file, ..)| file)).await {
+        return Err(refusal);
     }
     for (file, original, _, _) in &edits {
         if read_file(&root.join(file)).await? != *original {
@@ -815,7 +810,8 @@ pub(super) async fn revert_python_locks(
         // A refused write fails the revert outright: the artifact and the
         // ledger entry stay so the restore can be retried once the link is
         // a regular file again.
-        if let Some(detail) = refuse_symlinked(root, edits.iter().map(|(file, ..)| file)).await {
+        if let Some((_, detail)) = refuse_symlinked(root, edits.iter().map(|(file, ..)| file)).await
+        {
             return RevertOutcome::failed(detail);
         }
         for (file, original, _) in &edits {
@@ -1347,7 +1343,7 @@ mod tests {
     fn symlink_refusal_names(result: &Result<Vec<WiringRecord>, Failure>, file: &str) {
         match result {
             Err((code, detail)) => {
-                assert_eq!(*code, "pypi_lock_symlink_unsupported", "{detail}");
+                assert_eq!(*code, crate::hosted::engine::SYMLINK_REFUSAL, "{detail}");
                 assert!(
                     detail.starts_with(&format!("{file} is a symbolic link")),
                     "the refusal must name the linked file: {detail}"

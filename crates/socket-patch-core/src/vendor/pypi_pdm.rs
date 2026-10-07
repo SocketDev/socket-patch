@@ -390,7 +390,7 @@ pub async fn wire_pdm(
     known_patched_sha256: &[&str],
 ) -> Result<(Vec<WiringRecord>, PdmMeta), (&'static str, String)> {
     // Before ANY write: a symlinked lock would be replaced by the rename-over.
-    refuse_symlinked(root, &[LOCK_FILE], "pypi_pdm_symlink_unsupported").await?;
+    refuse_symlinked(root, &[LOCK_FILE]).await?;
     match check_target_guards(p, canon_name, version, record_uuid)? {
         // Defensive: the orchestrator short-circuits in-sync pre-flight and
         // never calls wire on it (we must never re-record our own edit as an
@@ -481,9 +481,7 @@ pub async fn revert_pdm(entry: &VendorEntry, root: &Path, dry_run: bool) -> Reve
     // its target stale and never restoring the link. Keep the artifact (the
     // wiring still routes through the linked file) and fail — the guard lives
     // here, not in the poetry-shared splice helper, so poetry is untouched.
-    if let Err((code, detail)) =
-        refuse_symlinked(root, &[LOCK_FILE], "pypi_pdm_symlink_unsupported").await
-    {
+    if let Err((code, detail)) = refuse_symlinked(root, &[LOCK_FILE]).await {
         return RevertOutcome {
             kept_artifact: true,
             success: false,
@@ -1521,7 +1519,7 @@ distribution = false
         )
         .await
         .unwrap_err();
-        assert_eq!(err.0, "pypi_pdm_symlink_unsupported");
+        assert_eq!(err.0, crate::hosted::engine::SYMLINK_REFUSAL);
         // The link is intact and its target is byte-unchanged.
         assert!(std::fs::symlink_metadata(root.join("pdm.lock"))
             .unwrap()
@@ -1550,7 +1548,7 @@ distribution = false
             outcome
                 .error
                 .as_deref()
-                .is_some_and(|e| e.contains("pypi_pdm_symlink_unsupported")),
+                .is_some_and(|e| e.contains(crate::hosted::engine::SYMLINK_REFUSAL)),
             "{:?}",
             outcome.error
         );
