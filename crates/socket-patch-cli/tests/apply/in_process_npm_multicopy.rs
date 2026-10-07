@@ -12,6 +12,7 @@
 //! assert EVERY physical copy is patched (and later restored) AND that the
 //! JSON summary counts every copy.
 
+use std::ffi::OsStr;
 use std::path::{Path, PathBuf};
 use std::process::Command;
 
@@ -130,6 +131,11 @@ fn build_two_copy_tree(tmp: &Path) -> (PathBuf, PathBuf, PathBuf, String, String
 }
 
 fn run_apply(root: &Path) -> (i32, serde_json::Value) {
+    run_apply_with(root, &[])
+}
+
+/// `run_apply` plus `extra` arguments (flags or path targets).
+fn run_apply_with(root: &Path, extra: &[&OsStr]) -> (i32, serde_json::Value) {
     let out = Command::new(binary())
         .args([
             "apply",
@@ -138,8 +144,9 @@ fn run_apply(root: &Path) -> (i32, serde_json::Value) {
             "--ecosystems",
             "npm",
             "--cwd",
-            root.to_str().unwrap(),
         ])
+        .arg(root)
+        .args(extra)
         .output()
         .expect("run apply");
     let code = out.status.code().unwrap_or(-1);
@@ -324,6 +331,11 @@ fn build_vlt_peer_variant_tree(tmp: &Path, link_importer: bool) -> (PathBuf, Pat
 }
 
 fn run_rollback(root: &Path) -> (i32, serde_json::Value) {
+    run_rollback_with(root, &[])
+}
+
+/// `run_rollback` plus `extra` arguments (flags or path targets).
+fn run_rollback_with(root: &Path, extra: &[&OsStr]) -> (i32, serde_json::Value) {
     let out = Command::new(binary())
         .args([
             "rollback",
@@ -333,8 +345,9 @@ fn run_rollback(root: &Path) -> (i32, serde_json::Value) {
             "--ecosystems",
             "npm",
             "--cwd",
-            root.to_str().unwrap(),
         ])
+        .arg(root)
+        .args(extra)
         .output()
         .expect("run rollback");
     let stdout = String::from_utf8_lossy(&out.stdout).to_string();
@@ -770,29 +783,8 @@ fn apply_and_rollback_visit_a_pnpm_workspace_member_link_once() {
         "second apply; envelope={v}"
     );
 
-    let rollback = |extra: &[&str]| {
-        let out = Command::new(binary())
-            .args([
-                "rollback",
-                "--json",
-                "--offline",
-                "--yes",
-                "--ecosystems",
-                "npm",
-            ])
-            .args(extra)
-            .arg("--cwd")
-            .arg(root)
-            .output()
-            .expect("run rollback");
-        let stdout = String::from_utf8_lossy(&out.stdout).to_string();
-        let v: serde_json::Value = serde_json::from_str(stdout.trim())
-            .unwrap_or_else(|e| panic!("rollback must emit JSON: {e}; stdout={stdout}"));
-        (out.status.code().unwrap_or(-1), v)
-    };
-
     // `--preserve-state` keeps the manifest entry for the scoped run below.
-    let (code, v) = rollback(&["--preserve-state"]);
+    let (code, v) = run_rollback_with(root, &["--preserve-state".as_ref()]);
     assert_eq!(code, 0, "rollback; envelope={v}");
     assert_eq!(std::fs::read(&store_copy).unwrap(), original);
     assert_eq!(v["rolledBack"], 1, "rollback; envelope={v}");
@@ -802,7 +794,7 @@ fn apply_and_rollback_visit_a_pnpm_workspace_member_link_once() {
     let (code, v) = run_apply(root);
     assert_eq!(code, 0, "re-apply; envelope={v}");
     assert_eq!(std::fs::read(&store_copy).unwrap(), patched);
-    let (code, v) = rollback(&["packages/a"]);
+    let (code, v) = run_rollback_with(root, &["packages/a".as_ref()]);
     assert_eq!(code, 0, "scoped rollback; envelope={v}");
     assert_eq!(std::fs::read(&store_copy).unwrap(), original);
     assert_eq!(v["rolledBack"], 1, "scoped rollback; envelope={v}");
@@ -833,27 +825,6 @@ fn write_pnpm_global_install(v11: &Path, hash: &str, direct: bool, original: &[u
     index
 }
 
-fn run_apply_global_prefix(root: &Path, prefix: &Path) -> (i32, serde_json::Value) {
-    let out = Command::new(binary())
-        .args([
-            "apply",
-            "--json",
-            "--offline",
-            "--ecosystems",
-            "npm",
-            "--cwd",
-        ])
-        .arg(root)
-        .arg("--global-prefix")
-        .arg(prefix)
-        .output()
-        .expect("run apply");
-    let stdout = String::from_utf8_lossy(&out.stdout).to_string();
-    let v: serde_json::Value = serde_json::from_str(stdout.trim())
-        .unwrap_or_else(|e| panic!("apply must emit JSON: {e}; stdout={stdout}"));
-    (out.status.code().unwrap_or(-1), v)
-}
-
 /// #435: pnpm 11+ gives every `pnpm add -g` its own install dir
 /// (`$PNPM_HOME/global/v11/<hash>/node_modules`, each with its own
 /// `.pnpm`), and `pnpm root -g` prints their parent. With one install
@@ -882,7 +853,7 @@ fn apply_global_prefix_patches_every_pnpm_isolated_global_install() {
         let a = write_pnpm_global_install(&v11, "aaa", direct_first, original);
         let b = write_pnpm_global_install(&v11, "bbb", !direct_first, original);
 
-        let (code, v) = run_apply_global_prefix(&root, &v11);
+        let (code, v) = run_apply_with(&root, &["--global-prefix".as_ref(), v11.as_os_str()]);
         assert_eq!(code, 0, "direct_first={direct_first}; envelope={v}");
         for index in [&a, &b] {
             assert_eq!(
@@ -935,7 +906,7 @@ fn apply_global_prefix_visits_a_copy_shared_by_two_pnpm_global_installs_once() {
         std::os::unix::fs::symlink(&shared, nm.join("dupvuln")).unwrap();
     }
 
-    let (code, v) = run_apply_global_prefix(&root, &v11);
+    let (code, v) = run_apply_with(&root, &["--global-prefix".as_ref(), v11.as_os_str()]);
     assert_eq!(code, 0, "envelope={v}");
     assert_eq!(std::fs::read(&index).unwrap(), patched, "envelope={v}");
     assert_eq!(
