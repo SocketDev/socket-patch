@@ -63,7 +63,7 @@
    - A 17.5K-line `redirect/mod.rs`.
    - Two hosted orchestrators kept equal by parity tests.
    - Four discovery systems.
-   - Nine different revert mechanisms.
+   - Nine different revert mechanisms. {{E24}}
    - Two JSON envelope shapes, 27 global flags silently accepted by every command, and 156 documented error codes.
 
    **We estimate 25–35K production lines (20–30%) and 50K+ test lines could go.** Roughly 20K of that comes from consolidation that keeps every capability; the rest comes from the support-tier and product decisions in §5.

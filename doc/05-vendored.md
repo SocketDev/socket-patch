@@ -2,7 +2,7 @@
 
 ## Part 5: Vendored mode and the non-JS backends
 
-_Last checked against main @ 9c43dfc on 2026-10-07 by audit-ecosystems (5.7 JVM backends and the single-module routing re-checked at `9c43dfc`; 5.2 ecosystem enumeration sites and dispatch re-checked at `9c43dfc`; the vendored-reference scan's file list re-checked at `9c43dfc`; 5.4 Poetry/PDM/Pipenv backend skeleton and Poetry forward splicers re-checked at `9c43dfc`; 5.2 dead `force`/`sources` parameters re-checked at `9c43dfc`; per-backend service-copy and cleanup copies re-checked at `9c43dfc`; 5.4 NuGet, Poetry/PDM and Gem re-checked at `4646693`; as of `045d7ec`: 5.4 Python, Cargo, Maven XML, Gem, Go and CRLF helpers; 5.6 scaffolding; the vendored-reference scan behind repair and the orphan sweeps). Owner: audit-ecosystems._
+_Last checked against main @ 9c43dfc on 2026-10-07 by audit-ecosystems (5.3 revert envelope, finish steps and keep policies re-checked at `9c43dfc`; 5.7 JVM backends and the single-module routing re-checked at `9c43dfc`; 5.2 ecosystem enumeration sites and dispatch re-checked at `9c43dfc`; the vendored-reference scan's file list re-checked at `9c43dfc`; 5.4 Poetry/PDM/Pipenv backend skeleton and Poetry forward splicers re-checked at `9c43dfc`; 5.2 dead `force`/`sources` parameters re-checked at `9c43dfc`; per-backend service-copy and cleanup copies re-checked at `9c43dfc`; 5.4 NuGet, Poetry/PDM and Gem re-checked at `4646693`; as of `045d7ec`: 5.4 Python, Cargo, Maven XML, Gem, Go and CRLF helpers; 5.6 scaffolding; the vendored-reference scan behind repair and the orphan sweeps). Owner: audit-ecosystems._
 
 > Scope: `vendor/` framework (`mod`, `common`, `state`, `verify`, `registry_fetch`, `service_fetch`, `prestage`, `reuse`, `redownload`, `ledger_snapshots`, `parse_memo`, `path`, `source`, `toml_surgery`, `lock_inventory`); backends for cargo, gem, pypi (×10 files), golang, composer, nuget, maven and `jvm/`; related `utils/` parsers; and the CLI `vendor.rs` + `vendored_backend/`.
 
@@ -87,7 +87,7 @@ Each `VendorEntry` (`state.rs:215-282`) stores:
 
 `original`/`new` are untyped JSON whose shape depends on `kind`, and there are **more than 45 distinct kind strings**.
 
-"Record the original and restore it" is the right idea, but it is **implemented about nine different ways**:
+"Record the original and restore it" is the right idea, but it is **implemented about nine different ways**: {{E24}}
 
 | Mechanism | Used by |
 |---|---|
@@ -99,6 +99,11 @@ Each `VendorEntry` (`state.rs:215-282`) stores:
 | Whole-file snapshot, restored if live == new | maven legacy pom, nuget config, pylock / PEP 723 / hatch |
 | Three-way structural TOML merge | `pypi_lock.rs:414-569` |
 | Pure plan/unplan with shared-fragment refcounting | JVM (`jvm/mod.rs`, `jvm/apply.rs`), the best design in the slice |
+
+The envelope around those mechanisms is copied too (re-checked at `9c43dfc`):
+- The finish step (dry-run return → drift-keep → `--preserve-state` return → `remove_tree_and_prune`) is written 12 times, with four keep policies: unconditional drift-keep (gem, npm, pnpm, bun ×2), keep while a live file still names the uuid dir (composer, maven legacy, nuget), a "lock still mentions the uuid" refusal (yarn classic and berry), and pypi's drift-or-residual keep with a warning-only removal failure. Sharing it is #990, child 1 of {{E24}}.
+- The record loop (reverse wiring walk, unknown-kind warning, `Ok(false)` → `vendor_lock_entry_drifted`) is copied in composer, gem, maven legacy and nuget. Only poetry/pdm can revert coupled records all-or-nothing (`revert_lock_fragment_splice_atomic`); gem cannot, so a drifted Gemfile line still lets the lock be restored ({{E68}}).
+- Forward and revert recognize "our" wiring by different predicates in gem ({{E68}}) and requirements.txt (#977).
 
 Revert/restore/unwind code in the non-npm backends totals **about 3,540 lines**: gem 422, nuget 305, pypi 291, pypi_lock 254, uv 231, cargo 220, composer 205, and more.
 
@@ -251,6 +256,7 @@ Old `kind`s are translated into `SpliceRecord`s when the ledger loads, so legacy
 
 ### New findings since the review
 
+- {{E68}}: vendored gem treats a Gemfile that merely contains the copy path as wired, but its revert needs the exact recorded line and reverts the lock records anyway: a trailing comment on the wired line leaves `Gemfile.lock` restored to the registry while the Gemfile keeps `path:`, and every later revert drift-keeps (executed three times). Same forward/revert split as #977; see 5.3.
 - {{E67}}: the vendored-reference scan (repair, the orphan sweeps, the `vendor` stranded-reference gate) reads only `VENDORED`-role files, but `hatch.toml` is one of the vendored writes listed in `registry::VENDORED_WRITES_UNMARKED`. With a missing ledger entry, the sweep deletes a wheel that a `hatch.toml` environment still names, while VEX (`PROBE`) sees it live (executed twice). The same split hides NuGet and Maven ({{E61}}); the register's two notions of "vendored writes this file" are the root cause.
 - {{E66}}: vendored Poetry wires a 2.x lock through the `toml_edit` engine when it is CRLF and through a `toml_surgery` line scanner when it is LF. For the same lock the two give different `files` shapes, and only the engine checks the wheel name and lowercases the digest (executed twice); see 5.4.
 - {{E65}}: `vendor --force` documents a missing-file tolerance and a `vendor_content_mismatch_overwritten` warning that no backend implements; every acquisition sink takes `_force`/`_sources`, and `vendor` with and without `--force` behave the same (executed twice). Bears on #615; see 5.2.
