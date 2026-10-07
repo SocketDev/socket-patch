@@ -3419,7 +3419,7 @@ fn npmrc_value_of_offline_mirror(text: &str) -> Option<String> {
 /// mirror, so yarn installs the upstream bytes and fails the patched
 /// integrity (or, `--offline`, never fetches the patched tarball at all).
 /// `Ok` for a lock that is not classic (the berry rewriter owns those).
-pub fn preflight_yarn_classic_hosted(
+fn preflight_yarn_classic_hosted(
     lock: &str,
     yarnrc: Option<&str>,
     npmrc: Option<&str>,
@@ -3769,7 +3769,10 @@ fn berry_cache_key(content: &str) -> Option<String> {
 /// compares the file with its own majority-normalized re-render and fails
 /// (YN0028), while a plain install rewrites every minority line — so it is
 /// refused untouched, `yarn install` normalizes it first.
-pub fn preflight_yarn_berry_hosted(lock: &str, yarnrc: Option<&str>) -> Result<(), RewriteWarning> {
+pub(crate) fn preflight_yarn_berry_hosted(
+    lock: &str,
+    yarnrc: Option<&str>,
+) -> Result<(), RewriteWarning> {
     if !is_berry_lock(lock) {
         return Ok(());
     }
