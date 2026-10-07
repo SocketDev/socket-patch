@@ -57,7 +57,7 @@ pub(crate) fn patched_dependency_keys(manifest: Option<&str>, lock: Option<&str>
 /// A root `package.json` parsed as Bun reads it: a leading BOM, comments
 /// and trailing commas allowed. `None` when Bun could not parse it either.
 fn parse_manifest(text: &str) -> Option<serde_json::Value> {
-    let text = crate::utils::serde::strip_bom(text);
+    let text = crate::formats::text::strip_bom(text);
     serde_json::from_str(text)
         .or_else(|_| serde_json::from_str(&strip_jsonc(text)))
         .ok()

@@ -5,6 +5,7 @@ pub mod deno_crawler;
 pub mod fuzzy_match;
 pub mod go_crawler;
 pub mod gradle_cache;
+pub mod hatch_env;
 pub mod ivy_cache;
 pub mod jvm_cache;
 mod listing;

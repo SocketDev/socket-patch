@@ -23,12 +23,12 @@ use regex::Regex;
 use serde::{Deserialize, Serialize};
 use serde_json::{json, Value};
 
+use crate::formats::yarn::berry_gates::{self, Yarnrc};
 use crate::utils::digest::is_hex64_lower;
 use crate::utils::line_endings::{to_lf, LineEndings};
 use crate::vendor::common::{parse_json_text, JsonLayout};
 use crate::vendor::lock_inventory::npm_legacy_identity;
 use crate::vendor::npm_origin::{legacy_packages_key, npm_non_registry_entries, NpmOverrides};
-use crate::vendor::yarn_berry_lock::yarnrc_compression_level;
 
 mod bun_binary;
 pub use bun_binary::{preflight_bun_binary, rewrite_bun_binary};
@@ -3505,6 +3505,7 @@ fn rewrite_yarn_classic(
     let mut heads: Vec<Option<(String, Option<String>)>> =
         blocks.iter().map(|b| yarn_classic_block_head(b)).collect();
     let mut changed = false;
+    let mut any_pinned = false;
     for dep in &npm {
         let fname = full_name(dep);
         let Some(sha512) = dep.integrity.sha512.clone() else {
@@ -3663,6 +3664,26 @@ fn rewrite_yarn_classic(
                 detail: format!("no yarn.lock entry resolving {fname}@{}", dep.version),
             });
         }
+        any_pinned |= matched_any;
+    }
+    // Yarn 2+ (berry) migrates a classic lock on install and re-resolves
+    // every entry from the registry, dropping the hosted pins this lock now
+    // carries (rewritten this run or already pinned) — the packages then
+    // install unpatched with nothing printed. The vendored probe
+    // (`vendor::yarn_classic_berry_migration_risk`) warns about the same
+    // trap; warn here too, once per run, unless corepack pins yarn 1. The
+    // engine reads the root manifest beside a classic lock; with none there
+    // is no project for yarn to install, so nothing to warn about.
+    let manifest = files.get("package.json").map(String::as_str);
+    if any_pinned && manifest.is_some() && !crate::vendor::manifest_pins_yarn_classic(manifest) {
+        result.warnings.push(RewriteWarning {
+            code: "redirect_yarn_classic_berry_migration_risk".into(),
+            detail: "yarn.lock is yarn-classic (v1) with hosted pins: installing with yarn 2+ \
+                     (berry) migrates the lockfile and silently drops them — packages install \
+                     unpatched from the registry. Pin yarn classic (e.g. \"packageManager\": \
+                     \"yarn@1.22.22\" in package.json) so every install uses yarn 1."
+                .into(),
+        });
     }
     if let Some(warning) = mirror_refusal {
         if !result.refused_yarn_classic_uuids.is_empty() {
@@ -3737,31 +3758,15 @@ fn yarn_berry_tarball_url_ok(url: &str) -> bool {
         && (url.ends_with(".tgz") || url.ends_with(".tar.gz"))
 }
 
-/// Only cacheKey `10c0` (yarn 4, compressionLevel 0 default) has a checksum we
-/// can reproduce offline; matches the vendored backend's `SUPPORTED_CACHE_KEY`.
-const YARN_BERRY_SUPPORTED_CACHE_KEY: &str = "10c0";
-
-/// The `cacheKey:` value from the `__metadata` block (berry writes it unquoted:
-/// `  cacheKey: 10c0`), mirroring the vendored backend's `berry_field`.
-fn berry_cache_key(content: &str) -> Option<String> {
-    let meta = content.split("\n\n").find(|b| {
-        b.lines()
-            .next()
-            .is_some_and(|l| l.trim_end() == "__metadata:")
-    })?;
-    for line in meta.lines().skip(1) {
-        if let Some(rest) = line.strip_prefix("  cacheKey:") {
-            return Some(rest.trim().trim_matches('"').to_string());
-        }
-    }
-    None
-}
-
 /// The project-level refusals of the yarn berry hosted rewriter — the gates
 /// that hold for every dep of the lock, whatever the overrides: a MIXED
-/// line-ending lock, an unsupported `cacheKey`, and a `.yarnrc.yml`
-/// `compressionLevel` other than 0. `Ok` for a lock that is not berry (the
-/// classic rewriter owns those).
+/// line-ending lock or root `package.json` (`manifest`, the file the
+/// rewriter's `resolutions` land in), an unsupported `cacheKey`, and a
+/// `.yarnrc.yml` `compressionLevel` other than 0. The same
+/// [`berry_gates::check`] the vendored backend raises, under this mode's
+/// `redirect_yarn_berry_*` codes, so the two modes take one decision on the
+/// files both edit (#628). `Ok` for a lock that is not berry (the classic
+/// rewriter owns those).
 ///
 /// Exposed so the vendored→hosted mode takeover (`scan`/`get --mode hosted`
 /// over a vendored berry purl) can refuse BEFORE it reverts the vendored
@@ -3807,46 +3812,18 @@ pub fn preflight_yarn_berry_hosted_dep(dep: &DepOverride) -> Result<(), RewriteW
     })
 }
 
-pub fn preflight_yarn_berry_hosted(lock: &str, yarnrc: Option<&str>) -> Result<(), RewriteWarning> {
+pub fn preflight_yarn_berry_hosted(
+    lock: &str,
+    manifest: Option<&str>,
+    yarnrc: Option<&str>,
+) -> Result<(), RewriteWarning> {
     if !is_berry_lock(lock) {
         return Ok(());
     }
-    let body = lock.strip_prefix('\u{feff}').unwrap_or(lock);
-    if LineEndings::of(body) == LineEndings::Mixed {
-        return Err(RewriteWarning {
-            code: "redirect_yarn_berry_mixed_line_endings".into(),
-            detail: "yarn.lock mixes CRLF and LF line endings (or holds a bare carriage \
-                     return), so no single line ending can be kept, and yarn itself \
-                     rejects it under `--immutable` (YN0028) — run `yarn install` once to \
-                     normalize the lock, then re-run; leaving it untouched"
-                .into(),
-        });
-    }
-    // Refuse any lock whose cache checksum we can't reproduce
-    // offline. A guessed `checksum:` bricks installs (YN0018).
-    let key = berry_cache_key(&to_lf(body));
-    if key.as_deref() != Some(YARN_BERRY_SUPPORTED_CACHE_KEY) {
-        return Err(RewriteWarning {
-            code: "redirect_yarn_berry_cache_unsupported".into(),
-            detail: format!(
-                "yarn.lock cacheKey is `{}`; only `{YARN_BERRY_SUPPORTED_CACHE_KEY}` \
-                 (yarn 4, compressionLevel 0 default) has an offline-reproducible cache checksum",
-                key.as_deref().unwrap_or("(missing)")
-            ),
-        });
-    }
-    if let Some(level) = yarnrc.and_then(yarnrc_compression_level) {
-        if level != "0" {
-            return Err(RewriteWarning {
-                code: "redirect_yarn_berry_cache_unsupported".into(),
-                detail: format!(
-                    ".yarnrc.yml sets `compressionLevel: {level}`, which changes berry's \
-                     cache checksums; only compressionLevel 0 (the yarn 4 default) is supported"
-                ),
-            });
-        }
-    }
-    Ok(())
+    berry_gates::check(lock, manifest, Yarnrc::from_option(yarnrc)).map_err(|gate| RewriteWarning {
+        code: format!("redirect_yarn_berry_{}", gate.code_suffix()),
+        detail: gate.detail(),
+    })
 }
 
 /// The berry hosted pin without served manifests (every pin keeps the
@@ -3891,12 +3868,14 @@ fn rewrite_yarn_berry_with_manifests(
         Some(rest) => ("\u{feff}", rest),
         None => ("", raw.as_str()),
     };
-    // Project-level gates (line endings, cacheKey, compressionLevel), shared
-    // with the vendored→hosted takeover preflight so a takeover never
+    // Project-level gates (lock and manifest line endings, cacheKey,
+    // compressionLevel), shared with the vendored→hosted takeover preflight so a takeover never
     // reverts vendored wiring this rewriter then refuses.
-    if let Err(warning) =
-        preflight_yarn_berry_hosted(raw, files.get(".yarnrc.yml").map(String::as_str))
-    {
+    if let Err(warning) = preflight_yarn_berry_hosted(
+        raw,
+        files.get(BERRY_MANIFEST).map(String::as_str),
+        files.get(".yarnrc.yml").map(String::as_str),
+    ) {
         result.warnings.push(warning);
         // Nothing is verified, so nothing is confirmed — but a dep this lock
         // locks is still this rewriter's to decide: an earlier run's URL in
@@ -9755,6 +9734,46 @@ mod tests {
         }
     }
 
+    /// #628: a root `package.json` mixing CRLF and LF is refused untouched,
+    /// like a mixed lock and like vendored mode (`JsonLayout` would re-render
+    /// every minority line in the majority ending). A uniform CRLF manifest
+    /// is still rewritten in its own ending.
+    #[test]
+    fn berry_mixed_root_manifest_is_refused_untouched() {
+        let checksum = format!("10c0/{}", "7".repeat(128));
+        let ovr = berry_override("left-pad", "1.3.0", "http://p.test/lp.tgz", &checksum);
+        let mut files = BTreeMap::new();
+        files.insert("yarn.lock".to_string(), berry_lock("10c0"));
+        files.insert(
+            "package.json".to_string(),
+            "{\r\n  \"name\": \"app\",\n  \"version\": \"1.0.0\"\r\n}\r\n".to_string(),
+        );
+        let mut r = RewriteResult::default();
+        rewrite_yarn_berry(&files, std::slice::from_ref(&ovr), &mut r);
+        assert!(r.files.is_empty(), "nothing written: {:?}", r.files.keys());
+        assert_eq!(
+            r.warnings.first().map(|w| w.code.as_str()),
+            Some("redirect_yarn_berry_mixed_line_endings"),
+            "{:?}",
+            r.warnings
+        );
+        assert!(r.warnings[0].detail.contains("package.json"));
+        assert!(r.confirmed_yarn_berry_uuids.is_empty());
+
+        files.insert(
+            "package.json".to_string(),
+            "{\r\n  \"name\": \"app\",\r\n  \"version\": \"1.0.0\"\r\n}\r\n".to_string(),
+        );
+        let mut r = RewriteResult::default();
+        rewrite_yarn_berry(&files, std::slice::from_ref(&ovr), &mut r);
+        let manifest = r.files.get("package.json").expect("uniform CRLF rewritten");
+        assert_eq!(
+            LineEndings::of(manifest),
+            LineEndings::Crlf,
+            "kept CRLF: {manifest:?}"
+        );
+    }
+
     #[test]
     fn yarn_berry_warning_branches() {
         let checksum = format!("10c0/{}", "7".repeat(128));
@@ -10004,6 +10023,158 @@ mod tests {
          resolved \"https://registry.yarnpkg.com/left-pad/-/left-pad-1.3.0.tgz#bbbb\"\n  \
          integrity sha512-UPSTREAMupstream==\n"
             .to_string()
+    }
+
+    const BERRY_RISK: &str = "redirect_yarn_classic_berry_migration_risk";
+
+    fn classic_files(package_json: Option<&str>) -> BTreeMap<String, String> {
+        let mut files = BTreeMap::new();
+        files.insert("yarn.lock".to_string(), classic_lock_two_entries());
+        if let Some(manifest) = package_json {
+            files.insert("package.json".to_string(), manifest.to_string());
+        }
+        files
+    }
+
+    fn berry_risk_count(r: &RewriteResult) -> usize {
+        r.warnings.iter().filter(|w| w.code == BERRY_RISK).count()
+    }
+
+    /// #907: a hosted pin in a classic lock is dropped by a yarn 2+ install
+    /// exactly like vendored wiring, so the hosted rewrite must warn the
+    /// way the vendored probe does — with no `packageManager` pin, with a
+    /// non-1 yarn declared (`yarn@10` must not prefix-match `yarn@1`), and
+    /// when the manifest is unparseable (fail toward warning).
+    #[test]
+    fn yarn_classic_hosted_pin_warns_berry_migration_risk() {
+        let ovr = npm_override(
+            "left-pad",
+            "1.3.0",
+            "http://p.test/lp.tgz",
+            "sha512-PATCHED==",
+        );
+        for manifest in [
+            Some(r#"{"name":"p","dependencies":{"left-pad":"^1.3.0"}}"#),
+            Some(r#"{"name":"p","packageManager":"yarn@4.18.1"}"#),
+            Some(r#"{"name":"p","packageManager":"yarn@10.0.0"}"#),
+            Some(r#"{"name":"p","packageManager":"pnpm@9.0.0"}"#),
+            Some("{not json"),
+        ] {
+            let mut r = RewriteResult::default();
+            rewrite_yarn_classic(&classic_files(manifest), std::slice::from_ref(&ovr), &mut r);
+            assert!(
+                r.files.contains_key("yarn.lock"),
+                "{manifest:?}: pin must land"
+            );
+            assert_eq!(berry_risk_count(&r), 1, "{manifest:?}: {:?}", r.warnings);
+            let w = r.warnings.iter().find(|w| w.code == BERRY_RISK).unwrap();
+            assert!(
+                w.detail.contains("yarn 2+"),
+                "detail names the trap: {}",
+                w.detail
+            );
+            assert!(
+                w.detail.contains("yarn@1"),
+                "detail names the remedy: {}",
+                w.detail
+            );
+        }
+    }
+
+    /// #907: a corepack `packageManager: yarn@1…` pin makes a stray berry
+    /// install refuse instead of migrate, so it suppresses the warning (as
+    /// it does the vendored one), including a pin with a corepack hash.
+    #[test]
+    fn yarn_classic_hosted_pin_yarn1_package_manager_suppresses_berry_risk() {
+        let ovr = npm_override(
+            "left-pad",
+            "1.3.0",
+            "http://p.test/lp.tgz",
+            "sha512-PATCHED==",
+        );
+        for pm in ["yarn@1.22.22", "yarn@1.7.0", "yarn@1.22.22+sha512.abc"] {
+            let manifest = format!(r#"{{"name":"p","packageManager":"{pm}"}}"#);
+            let mut r = RewriteResult::default();
+            rewrite_yarn_classic(
+                &classic_files(Some(&manifest)),
+                std::slice::from_ref(&ovr),
+                &mut r,
+            );
+            assert!(r.files.contains_key("yarn.lock"));
+            assert!(r.warnings.is_empty(), "{pm}: {:?}", r.warnings);
+        }
+    }
+
+    /// #907: the warning is per run, not per package, and it fires on an
+    /// idempotent re-run too: the lock already carries the pin, so the next
+    /// berry install drops it just the same.
+    #[test]
+    fn yarn_classic_berry_risk_is_once_per_run_and_survives_rerun() {
+        let lp = npm_override(
+            "left-pad",
+            "1.3.0",
+            "http://p.test/lp.tgz",
+            "sha512-PATCHED==",
+        );
+        let ab = npm_override("abbrev", "1.1.1", "http://p.test/ab.tgz", "sha512-AB==");
+        let files = classic_files(Some(r#"{"name":"p"}"#));
+        let mut r = RewriteResult::default();
+        rewrite_yarn_classic(&files, &[lp.clone(), ab], &mut r);
+        assert_eq!(r.edits.len(), 2, "both entries pinned: {:?}", r.edits);
+        assert_eq!(berry_risk_count(&r), 1, "{:?}", r.warnings);
+
+        let mut pinned = files.clone();
+        pinned.insert("yarn.lock".into(), r.files["yarn.lock"].clone());
+        let mut again = RewriteResult::default();
+        rewrite_yarn_classic(&pinned, std::slice::from_ref(&lp), &mut again);
+        assert!(
+            again.edits.is_empty(),
+            "re-run is a no-op: {:?}",
+            again.edits
+        );
+        assert_eq!(berry_risk_count(&again), 1, "{:?}", again.warnings);
+    }
+
+    /// No pin in the lock means nothing for berry to drop: a dep with no
+    /// classic entry warns only `entry_not_found`, and a berry lock is not
+    /// the classic rewriter's at all.
+    #[test]
+    fn yarn_classic_berry_risk_silent_without_a_pin() {
+        let missing = npm_override("nope", "9.9.9", "http://p.test/n.tgz", "sha512-N==");
+        let mut r = RewriteResult::default();
+        rewrite_yarn_classic(&classic_files(Some(r#"{"name":"p"}"#)), &[missing], &mut r);
+        let codes: Vec<&str> = r.warnings.iter().map(|w| w.code.as_str()).collect();
+        assert_eq!(codes, ["redirect_yarn_classic_entry_not_found"]);
+
+        // No root manifest: no project for yarn to install, nothing to warn.
+        let lp = npm_override(
+            "left-pad",
+            "1.3.0",
+            "http://p.test/lp.tgz",
+            "sha512-PATCHED==",
+        );
+        let mut r = RewriteResult::default();
+        rewrite_yarn_classic(&classic_files(None), std::slice::from_ref(&lp), &mut r);
+        assert!(r.files.contains_key("yarn.lock"));
+        assert_eq!(berry_risk_count(&r), 0, "{:?}", r.warnings);
+
+        let lp = npm_override(
+            "left-pad",
+            "1.3.0",
+            "http://p.test/lp.tgz",
+            "sha512-PATCHED==",
+        );
+        let mut files = BTreeMap::new();
+        files.insert(
+            "yarn.lock".to_string(),
+            "__metadata:\n  version: 8\n\n\"left-pad@npm:^1.3.0\":\n  version: 1.3.0\n  \
+             resolution: \"left-pad@npm:1.3.0\"\n"
+                .to_string(),
+        );
+        files.insert("package.json".to_string(), r#"{"name":"p"}"#.to_string());
+        let mut r = RewriteResult::default();
+        rewrite_yarn_classic(&files, &[lp], &mut r);
+        assert_eq!(berry_risk_count(&r), 0, "{:?}", r.warnings);
     }
 
     /// A CRLF classic lock (Windows `core.autocrlf` checkout) must rewrite
@@ -18307,13 +18478,13 @@ packages:
             classic_lock_two_entries().replacen("\n", "\r\n", 1),
         ] {
             assert_eq!(
-                preflight_yarn_berry_hosted(&ok, None).map_err(|w| w.code),
+                preflight_yarn_berry_hosted(&ok, None, None).map_err(|w| w.code),
                 Ok(()),
                 "{ok:?}"
             );
         }
         let code = |lock: &str, rc: Option<&str>| {
-            preflight_yarn_berry_hosted(lock, rc).map_err(|w| w.code)
+            preflight_yarn_berry_hosted(lock, None, rc).map_err(|w| w.code)
         };
         assert_eq!(
             code(&crlf.replacen("\r\n", "\n", 1), None),

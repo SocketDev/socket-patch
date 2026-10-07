@@ -12,8 +12,8 @@ use socket_patch_core::manifest::schema::{PatchManifest, PatchRecord};
 use socket_patch_core::utils::fs::read_regular_to_string;
 use socket_patch_core::utils::purl::normalize_purl;
 use socket_patch_core::vendor::{
-    self, artifact_is_file_shaped, check_vendored_artifact, parse_vendor_path, ArtifactHealth,
-    VendorEntry, VendorState, VendorWarning,
+    self, artifact_is_file_shaped, check_vendored_artifact, parse_vendor_path,
+    path::parse_vendor_reference, ArtifactHealth, VendorEntry, VendorState, VendorWarning,
 };
 
 use super::VendoredBackend;
@@ -33,7 +33,8 @@ struct Candidate {
 }
 
 /// Scan the wiring-bearing files for vendored-artifact references,
-/// returning deduped `(ecosystem, uuid, artifact relpath)` triples. Pure
+/// returning deduped `(ecosystem, uuid, artifact relpath)` triples (the
+/// relpath is the uuid dir itself for a directory-wired unit). Pure
 /// text scan plus native binary Bun resolution records and the canonical
 /// path parser. Used by repair (references the ledger does not cover), by
 /// the orphan sweeps (`vendor --revert`, `scan --prune`: a dir a lockfile
@@ -71,19 +72,24 @@ pub(crate) async fn scan_vendor_references(project_root: &Path) -> Vec<(String, 
             let slice = &rest[idx..];
             // `:` ends a reference too: pnpm snapshot keys are
             // `name@file:<path>:` and yaml mappings suffix the path with a
-            // colon — npm names/versions never contain one.
+            // colon — npm names/versions never contain one. `<` ends an XML
+            // element's text (Maven's `<url>…/<uuid></url>`).
             let end = slice
                 .find([
-                    '"', '\'', '`', ' ', '\t', '\n', '\r', ',', ')', ']', '}', ';', ':',
+                    '"', '\'', '`', ' ', '\t', '\n', '\r', ',', ')', ']', '}', ';', ':', '<',
                 ])
                 .unwrap_or(slice.len());
             let candidate = slice[..end].replace('\\', "/");
-            if let Some(parts) = parse_vendor_path(&candidate) {
+            // NuGet's feed and Maven's repository name the uuid dir itself.
+            if let Some(parts) = parse_vendor_reference(&candidate) {
                 if seen.insert((parts.eco.to_string(), parts.uuid.clone())) {
                     out.push((
                         parts.eco.to_string(),
                         parts.uuid.clone(),
-                        candidate.trim_start_matches("./").to_string(),
+                        candidate
+                            .trim_start_matches("./")
+                            .trim_end_matches('/')
+                            .to_string(),
                     ));
                 }
             }
@@ -95,8 +101,9 @@ pub(crate) async fn scan_vendor_references(project_root: &Path) -> Vec<(String, 
 }
 
 /// Every wiring-bearing file name the vendor backends may rewrite, relative
-/// to `project_root`: the registry's vendored wiring files
-/// ([`registry::VENDORED`]), vlt importer manifests, the Python
+/// to `project_root`: every file the registry says a vendored run writes
+/// ([`registry::VENDORED`]: `nuget.config`, `pom.xml` and `hatch.toml`
+/// included), vlt importer manifests, the Python
 /// locks the root lists (and their scripts) and the requirements `-r`
 /// include tree. Sorted and deduplicated; entries need not exist.
 async fn wiring_files(project_root: &Path) -> Vec<String> {
@@ -1015,6 +1022,92 @@ mod tests {
             references,
             vec![("pypi".to_string(), uuid.to_string(), path.clone())]
         );
+    }
+
+    /// #832, #958: every file a vendored run writes is scanned, and a
+    /// reference to the uuid dir itself counts. NuGet's feed and Maven's
+    /// repository name the dir (Windows backslashes and a trailing slash
+    /// included); a Hatch environment in `hatch.toml` names a wheel. Every
+    /// caller (repair, the orphan sweeps, the `vendor` stranded-reference
+    /// gate, rollback's ledger-less gate) reads this one scan.
+    #[tokio::test]
+    async fn scan_recovers_unit_dir_and_hatch_toml_references() {
+        let tmp = tempfile::tempdir().unwrap();
+        let nuget = "22222222-2222-4222-8222-222222222222";
+        let nuget_win = "55555555-5555-4555-8555-555555555555";
+        let maven = "33333333-3333-4333-8333-333333333333";
+        let pypi = "44444444-4444-4444-8444-444444444444";
+        let wheel = "six-1.16.0-py2.py3-none-any.whl";
+        for (file, text) in [
+            (
+                "nuget.config",
+                format!("<add key=\"socket-patch-vendor\" value=\".socket/vendor/nuget/{nuget}/\" />"),
+            ),
+            (
+                "pom.xml",
+                format!("<url>file://${{project.basedir}}/.socket/vendor/maven/{maven}</url>"),
+            ),
+            (
+                "hatch.toml",
+                format!("[envs.default]\ndependencies = [\"six @ {{root:uri}}/.socket/vendor/pypi/{pypi}/{wheel}\"]\n"),
+            ),
+        ] {
+            tokio::fs::write(tmp.path().join(file), text).await.unwrap();
+        }
+        let refs = scan_vendor_references(tmp.path()).await;
+        assert_eq!(
+            refs,
+            vec![
+                (
+                    "maven".to_string(),
+                    maven.to_string(),
+                    format!(".socket/vendor/maven/{maven}")
+                ),
+                (
+                    "nuget".to_string(),
+                    nuget.to_string(),
+                    format!(".socket/vendor/nuget/{nuget}")
+                ),
+                (
+                    "pypi".to_string(),
+                    pypi.to_string(),
+                    format!(".socket/vendor/pypi/{pypi}/{wheel}")
+                ),
+            ]
+        );
+
+        // The backslashed Windows spelling, under another config spelling.
+        // Its own project: on a case-insensitive file system `NuGet.Config`
+        // and `nuget.config` are one file.
+        let win = tempfile::tempdir().unwrap();
+        tokio::fs::write(
+            win.path().join("NuGet.Config"),
+            format!(
+                "<add key=\"socket-patch-vendor\" value=\".socket\\vendor\\nuget\\{nuget_win}\" />"
+            ),
+        )
+        .await
+        .unwrap();
+        assert_eq!(
+            scan_vendor_references(win.path()).await,
+            vec![(
+                "nuget".to_string(),
+                nuget_win.to_string(),
+                format!(".socket/vendor/nuget/{nuget_win}")
+            )]
+        );
+
+        // A bare eco dir or a non-uuid dir is still no reference.
+        tokio::fs::write(
+            tmp.path().join("pom.xml"),
+            "<url>file://${project.basedir}/.socket/vendor/maven</url>\n\
+             <url>file://${maven.multiModuleProjectDirectory}/.socket/vendor/maven2</url>\n\
+             <url>file://${project.basedir}/.socket/vendor/maven/not-a-uuid</url>",
+        )
+        .await
+        .unwrap();
+        let refs = scan_vendor_references(tmp.path()).await;
+        assert!(refs.iter().all(|(eco, _, _)| eco != "maven"), "{refs:?}");
     }
 
     /// pnpm writes vendored paths in THREE spellings — override values,
