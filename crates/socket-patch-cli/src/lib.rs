@@ -18,6 +18,7 @@ pub mod ui;
 pub mod update_notifier;
 
 use clap::{Parser, Subcommand};
+use socket_patch_core::utils::target::is_uuid_shaped;
 
 // CLI contract surface — subcommand names, visible_alias values, flag names,
 // defaults, JSON shapes, and exit codes are PUBLIC and SEMVER-SIGNIFICANT.
@@ -238,24 +239,6 @@ pub fn try_parse_cli(argv: &[String]) -> Result<Cli, clap::Error> {
     Cli::from_arg_matches_mut(&mut matches).map_err(|e| e.format(&mut cli_command()))
 }
 
-/// Check whether `s` looks like a UUID (8-4-4-4-12 hex pattern).
-///
-/// Used by [`parse_argv_with_shortcuts`] to detect the convenience form
-/// `socket-patch <UUID>` and rewrite it to `socket-patch get <UUID>`, and
-/// by rollback's target resolver to decide whether a no-match identifier
-/// error should hint at the path-glob spelling.
-pub(crate) fn looks_like_uuid(s: &str) -> bool {
-    let parts: Vec<&str> = s.split('-').collect();
-    if parts.len() != 5 {
-        return false;
-    }
-    let expected = [8, 4, 4, 4, 12];
-    parts
-        .iter()
-        .zip(expected.iter())
-        .all(|(p, &len)| p.len() == len && p.chars().all(|c| c.is_ascii_hexdigit()))
-}
-
 /// Parse a full argv vector with two convenience rewrites on failure:
 /// `--update [...]` becomes the hidden `self-update` subcommand, and a
 /// bare `<UUID>` becomes `get <UUID>`. Returns the original clap error if
@@ -316,7 +299,22 @@ pub fn parse_argv_with_shortcuts(argv: Vec<String>) -> Result<Cli, clap::Error> 
                     Err(_) => Err(err),
                 };
             }
-            if argv.len() >= 2 && looks_like_uuid(&argv[1]) {
+            // The UUID shortcut keys on the first UUID-shaped token before
+            // any subcommand name, not just argv[1], so root-position flags
+            // are fine: `socket-patch --json <UUID>` is `get --json <UUID>`.
+            // The shape is the shared target grammar's
+            // ([`is_uuid_shaped`]), the same one `get` classifies with.
+            let subcommands: Vec<String> = cli_command()
+                .get_subcommands()
+                .flat_map(|c| std::iter::once(c.get_name()).chain(c.get_all_aliases()))
+                .map(str::to_string)
+                .collect();
+            let uuid_operand = argv
+                .iter()
+                .skip(1)
+                .take_while(|a| !subcommands.contains(a))
+                .any(|a| is_uuid_shaped(a));
+            if uuid_operand {
                 let mut new_args = vec![argv[0].clone(), "get".into()];
                 new_args.extend_from_slice(&argv[1..]);
                 match try_parse_cli(&new_args) {
@@ -344,8 +342,9 @@ mod tests {
     //! uses — both of which are part of the CLI contract (see
     //! `CLI_CONTRACT.md`).
     use super::*;
+    use socket_patch_core::utils::target::is_uuid_shaped as looks_like_uuid;
 
-    // ---------- looks_like_uuid ----------
+    // ---------- looks_like_uuid (the shared core UUID shape) ----------
 
     #[test]
     fn looks_like_uuid_accepts_canonical_lowercase() {
@@ -464,6 +463,23 @@ mod tests {
             }
             _ => panic!("expected Commands::Get"),
         }
+    }
+
+    /// The shortcut keys on the first UUID-shaped operand, not just
+    /// argv[1]: `socket-patch --json <UUID>` used to fail with
+    /// "unexpected argument '--json'".
+    #[test]
+    fn fallback_rewrites_a_uuid_after_leading_flags() {
+        let cli = parse_argv_with_shortcuts(argv(&["socket-patch", "--json", UUID])).unwrap();
+        match cli.command {
+            Commands::Get(args) => {
+                assert_eq!(args.identifier, UUID);
+                assert!(args.common.json);
+            }
+            _ => panic!("expected the get subcommand"),
+        }
+        // A UUID after a real subcommand is that subcommand's operand.
+        assert!(parse_argv_with_shortcuts(argv(&["socket-patch", "list", UUID])).is_err());
     }
 
     #[test]
