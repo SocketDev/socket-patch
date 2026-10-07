@@ -364,10 +364,11 @@ async fn dry_run_over_vendored_project_previews_the_wet_takeover() {
     // writes (the takeover splices the root v9 lock) must be previewed too.
     let trust = warning_detail(&doc, "redirect_pnpm_trust_lockfile")
         .unwrap_or_else(|| panic!("the trust config must be previewed: {doc:#}"));
-    // (The vendor run already created pnpm-workspace.yaml for its own
-    // wiring, so the wet run MERGES the key into it.)
+    // The vendor run created pnpm-workspace.yaml for its own wiring, and
+    // the takeover's revert removes it again, so the wet run writes a new
+    // one: the preview plans against the same reverted project.
     assert!(
-        trust.contains("would be merged into the existing pnpm-workspace.yaml"),
+        trust.contains("would be written to a new pnpm-workspace.yaml"),
         "{trust}"
     );
     assert!(
@@ -417,6 +418,12 @@ async fn dry_run_over_vendored_project_previews_the_wet_takeover() {
     assert!(
         workspace(root).is_some_and(|w| w.contains("trustLockfile: true")),
         "the wet run writes what the preview promised: {wet:#}"
+    );
+    let wet_trust = warning_detail(&wet, "redirect_pnpm_trust_lockfile")
+        .unwrap_or_else(|| panic!("the wet run reports the trust config: {wet:#}"));
+    assert!(
+        wet_trust.contains("to a new pnpm-workspace.yaml"),
+        "the preview named the wet run's file: {wet_trust}"
     );
 }
 

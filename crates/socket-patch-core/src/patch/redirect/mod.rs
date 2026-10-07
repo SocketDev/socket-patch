@@ -3419,10 +3419,6 @@ fn npmrc_value_of_offline_mirror(text: &str) -> Option<String> {
 /// mirror, so yarn installs the upstream bytes and fails the patched
 /// integrity (or, `--offline`, never fetches the patched tarball at all).
 /// `Ok` for a lock that is not classic (the berry rewriter owns those).
-///
-/// Exposed so the vendored→hosted mode takeover can refuse BEFORE it
-/// reverts a vendored yarn classic entry (vendored mode works with a
-/// mirror), like [`preflight_yarn_berry_hosted`].
 pub fn preflight_yarn_classic_hosted(
     lock: &str,
     yarnrc: Option<&str>,
@@ -3763,14 +3759,6 @@ fn berry_cache_key(content: &str) -> Option<String> {
 /// `compressionLevel` other than 0. `Ok` for a lock that is not berry (the
 /// classic rewriter owns those).
 ///
-/// Exposed so the vendored→hosted mode takeover (`scan`/`get --mode hosted`
-/// over a vendored berry purl) can refuse BEFORE it reverts the vendored
-/// wiring: the vendored revert never refuses on line endings (it keeps a
-/// mixed lock mixed), so without this preflight the takeover would strip the
-/// live vendored patch and then this rewriter would refuse the lock, leaving the
-/// package unpatched in both modes — the bun twin is
-/// [`preflight_bun_hosted`].
-///
 /// Line endings: yarn berry writes a NEW lockfile with the OS line ending
 /// (`os.EOL`: CRLF on Windows) and keeps an existing file's majority ending
 /// on every later write (`normalizeLineEndings` in yarnpkg-fslib
@@ -3781,32 +3769,6 @@ fn berry_cache_key(content: &str) -> Option<String> {
 /// compares the file with its own majority-normalized re-render and fails
 /// (YN0028), while a plain install rewrites every minority line — so it is
 /// refused untouched, `yarn install` normalizes it first.
-/// The grant prerequisite for creating a new yarn berry hosted pin: a dep
-/// whose grant carries no `yarnBerry10c0` cache checksum cannot be redirected
-/// (berry verifies the converted cache zip, and only the service can compute
-/// that checksum).
-///
-/// Exposed for the vendored→hosted mode takeover, like
-/// [`preflight_yarn_berry_hosted`]: vendored mode only uses the `tarball`
-/// artifact, so a vendorable patch can lack the berry checksum, and the
-/// takeover must keep such a package vendored instead of reverting it and
-/// then skipping the redirect.
-/// Keep this unconditional gate at the takeover boundary: a lock-aware
-/// rewriter may retain an already complete pin's stored checksum.
-pub fn preflight_yarn_berry_hosted_dep(dep: &DepOverride) -> Result<(), RewriteWarning> {
-    if dep.integrity.yarn_berry10c0.is_some() {
-        return Ok(());
-    }
-    Err(RewriteWarning {
-        code: "redirect_yarn_berry_missing_checksum".into(),
-        detail: format!(
-            "{}@{} has no yarnBerry10c0 cache checksum",
-            full_name(dep),
-            dep.version
-        ),
-    })
-}
-
 pub fn preflight_yarn_berry_hosted(lock: &str, yarnrc: Option<&str>) -> Result<(), RewriteWarning> {
     if !is_berry_lock(lock) {
         return Ok(());
@@ -4738,12 +4700,6 @@ pub(crate) fn berry_reposition_blocks(blocks: &mut Vec<String>, moved: &[String]
 // Binary locks use `rewrite_bun_binary`, which accepts bytes directly.
 // The text path uses the shared `bun_lock_text` grammar (fail-closed on
 // deviations). Byte-for-byte twin of the TS `rewriteBun`.
-/// Check a text Bun lock before reverting any existing vendored wiring.
-/// Uses the rewriter's own version, grammar and workspace compatibility rules.
-pub fn preflight_bun_hosted(content: &str) -> Result<(), RewriteWarning> {
-    parse_bun_hosted_lock(content).map(|_| ())
-}
-
 fn parse_bun_hosted_lock(
     content: &str,
 ) -> Result<(Vec<String>, Vec<crate::vendor::bun_lock_text::BunEntry>), RewriteWarning> {

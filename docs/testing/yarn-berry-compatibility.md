@@ -108,7 +108,7 @@ What socket-patch does with those files:
 | leading BOM | kept | kept, both files |
 | mixed CRLF / LF, or a bare CR | refused untouched: `redirect_yarn_berry_mixed_line_endings` | refused before any write: `vendor_yarn_berry_mixed_line_endings` |
 | revert (`rollback`, `remove`, takeovers) | upstream entries reconstructed from registry metadata; mixed endings refuse as drift | byte-exact; a lock mixed after vendoring gets the restored entry in the terminator of the entry it replaces |
-| mode takeover into this mode | the berry gates (line endings, `cacheKey`, `compressionLevel`) run BEFORE the vendored wiring is reverted; a refused purl stays vendored, byte-identical | the backend's project gates (both files' line endings, `cacheKey`, `compressionLevel`) run BEFORE the hosted redirect is reverted; a refused purl stays hosted, byte-identical |
+| mode takeover into this mode | the vendored revert is staged and the hosted rewrite planned against it; a purl the berry rewriter refuses (line endings, `cacheKey`, `compressionLevel`, no berry checksum) is retracted and stays vendored, byte-identical | the backend's project gates (both files' line endings, `cacheKey`, `compressionLevel`) run BEFORE the hosted redirect is reverted; a refused purl stays hosted, byte-identical |
 
 Every reader — manifest-less `vex`, the lockfile inventory, the npm flavor
 sniff, `repair` — splits CRLF lines like LF ones and skips a leading BOM.
