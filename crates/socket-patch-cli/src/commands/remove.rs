@@ -633,6 +633,7 @@ pub async fn run(args: RemoveArgs) -> i32 {
             &manifest,
             &vendored_keys,
             InnerSelection::Identifier(Some(&target)),
+            &super::rollback::superseded_by_hosted(&manifest, &hosted_pins),
             Some(&telemetry_client),
         )
         .await
