@@ -72,8 +72,11 @@ fn patched_fixture() -> Fixture {
         serde_json::to_vec_pretty(&manifest).expect("serialize manifest"),
     )
     .expect("write manifest");
-    std::fs::write(socket.join("blobs").join(common::git_sha256(BEFORE)), BEFORE)
-        .expect("stage before-blob");
+    std::fs::write(
+        socket.join("blobs").join(common::git_sha256(BEFORE)),
+        BEFORE,
+    )
+    .expect("stage before-blob");
     Fixture {
         _tmp: tmp,
         root,
@@ -107,10 +110,8 @@ const SPELLINGS: &[&str] = &[
 fn remove_selects_pypi_patch_by_any_pep503_spelling() {
     for spelling in SPELLINGS {
         let fx = patched_fixture();
-        let (code, stdout, stderr) = run(
-            &fx,
-            &["remove", spelling, "--json", "--yes", "--offline"],
-        );
+        let (code, stdout, stderr) =
+            run(&fx, &["remove", spelling, "--json", "--yes", "--offline"]);
         assert_eq!(
             code, 0,
             "remove {spelling} must select {KEY}; stdout=\n{stdout}\nstderr=\n{stderr}"
@@ -131,10 +132,8 @@ fn remove_selects_pypi_patch_by_any_pep503_spelling() {
 fn rollback_selects_pypi_patch_by_any_pep503_spelling() {
     for spelling in SPELLINGS {
         let fx = patched_fixture();
-        let (code, stdout, stderr) = run(
-            &fx,
-            &["rollback", spelling, "--json", "--yes", "--offline"],
-        );
+        let (code, stdout, stderr) =
+            run(&fx, &["rollback", spelling, "--json", "--yes", "--offline"]);
         assert_eq!(
             code, 0,
             "rollback {spelling} must select {KEY}; stdout=\n{stdout}\nstderr=\n{stderr}"

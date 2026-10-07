@@ -108,7 +108,9 @@ pub fn normalize_purl(purl: &str) -> Cow<'_, str> {
 /// Purl equality up to percent-encoding of the base components
 /// (`pkg:npm/%40scope/x@1` ≡ `pkg:npm/@scope/x@1`) and, for composer, up to
 /// the version spelling of one release (`@3.0.2` ≡ `@v3.0.2` ≡ `@3.0.2.0`,
-/// name case-insensitive; see [`crate::utils::composer_version`]).
+/// name case-insensitive; see [`crate::utils::composer_version`]) and, for
+/// pypi, up to the PEP 503 spelling of the name (`typing_extensions` ≡
+/// `Typing-Extensions` ≡ `typing-extensions`).
 /// Qualifiers and subpath must still match exactly.
 pub fn purl_eq(a: &str, b: &str) -> bool {
     let (a, b) = (normalize_purl(a), normalize_purl(b));
@@ -119,7 +121,23 @@ pub fn purl_eq(a: &str, b: &str) -> bool {
     let (base_a, suffix_a) = a.split_at(split(&a));
     let (base_b, suffix_b) = b.split_at(split(&b));
     suffix_a == suffix_b
-        && crate::utils::composer_version::composer_bases_equivalent(base_a, base_b)
+        && (crate::utils::composer_version::composer_bases_equivalent(base_a, base_b)
+            || pypi_bases_equivalent(base_a, base_b))
+}
+
+/// Whether two decoded `pkg:pypi/<name>@<version>` bases name the same
+/// release once both names are in PEP 503 canonical form. `false` unless
+/// both are pypi bases.
+fn pypi_bases_equivalent(a: &str, b: &str) -> bool {
+    fn canonical(base: &str) -> Option<String> {
+        let rest = base.strip_prefix("pkg:pypi/")?;
+        let (name, version) = match rest.rfind('@').filter(|&i| i > 0) {
+            Some(at) => rest.split_at(at),
+            None => (rest, ""),
+        };
+        Some(format!("{}{version}", canonicalize_pypi_name(name)))
+    }
+    matches!((canonical(a), canonical(b)), (Some(x), Some(y)) if x == y)
 }
 
 /// Extract the value of a single PURL qualifier (`?key=value&…`), if present.
