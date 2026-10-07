@@ -563,7 +563,7 @@ pub(super) async fn run_redirect(
     batch_failed: bool,
     stage: &mut super::rollout::Stage,
 ) -> i32 {
-    // Same discovery/selection as `--apply`/`--vendor`.
+    // Same discovery/selection as agent and vendored mode.
     let discovered = match discover_selected(
         api_client,
         all_packages_with_patches,

@@ -71,7 +71,6 @@ pub enum Commands {
     Scan(commands::scan::ScanArgs),
 
     /// Patch one package, CVE, GHSA or patch UUID (hosted mode by default)
-    #[command(visible_alias = "download")]
     Get(commands::get::GetArgs),
 
     /// List the patches in this project: hosted and vendored lockfile
@@ -106,7 +105,6 @@ pub enum Commands {
     /// Restores missing blobs and diff/package archives, rebuilds missing
     /// or corrupt vendored artifacts, then deletes the artifacts nothing
     /// references.
-    #[command(visible_alias = "gc")]
     Repair(commands::repair::RepairArgs),
 
     // Internal parse target of the root `--update` flag (see the rewrite
