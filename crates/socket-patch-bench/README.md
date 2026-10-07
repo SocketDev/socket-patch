@@ -38,9 +38,12 @@ layout: `npm`, `pnpm` (isolated `.pnpm` store with symlinks), `yarn-classic`,
 `yarn-berry` (node-modules linker), `bun` (text `bun.lock`, hoisted),
 `bun-isolated` (the same lockfile, Bun 1.3's isolated `.bun` store),
 `vlt` (`.vlt` store), `pip` (hash-pinned `requirements.txt`), `uv`, `pylock`
-(PEP 751), `poetry`, `pipenv`, `pdm`, `bundler`, `composer`, `cargo`,
-`golang`, `nuget` and `maven`. Deno has no hosted rewrite and is not
-benchmarked separately.
+(PEP 751), `poetry`, `pipenv`, `pdm`, `hatch` (lockless: `hatch.toml`
+environment pins, rewritten in place), `bundler`, `composer`, `cargo`,
+`golang`, `nuget`, `maven` and `gradle` (`gradle.lockfile`, Gradle's
+`modules-2/files-2.1` cache; hosted mode wires the build through
+`.socket/gradle/`). Deno has no hosted rewrite and is not benchmarked
+separately.
 
 Sizes are a large-but-ordinary project for the ecosystem (3000 npm-family
 packages, 1500 for vlt, 400-1200 for the others, so every scan takes about
@@ -75,8 +78,9 @@ unexpected). A rescan's first, preparing scan is untimed.
 
 The environment is rebuilt from nothing for every run (`env -i`): `HOME`,
 `XDG_*` and `TMPDIR` point into the fixture, so per-user caches
-(`~/.cargo`, `~/go/pkg/mod`, `~/.nuget/packages`, `~/.m2`) are the
-fixture's own and the runner's are never read; telemetry, the update check
+(`~/.cargo`, `~/go/pkg/mod`, `~/.nuget/packages`, `~/.m2`, and
+`GRADLE_USER_HOME`, which the Gradle fixture sets) are the fixture's own
+and the runner's are never read; telemetry, the update check
 and the persisted Socket login are off; and every proxy variable points at a
 closed port, so a request to anything but the mock fails the run instead of
 timing the internet. Python fixtures carry a project `.venv` and Ruby ones

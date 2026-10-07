@@ -120,6 +120,16 @@ pub(crate) fn is_exact_pin_of(specifier: &str, version: &str) -> bool {
         .is_some_and(|pinned| versions_equal(pinned, version))
 }
 
+/// Whether `specifier` (whitespace already stripped) is an exact `==` pin
+/// of SOME valid release — the shape [`is_exact_pin_of`] accepts, for any
+/// version. Arbitrary equality (`===`) and wildcards are not exact pins.
+pub(crate) fn is_exact_pin(specifier: &str) -> bool {
+    specifier
+        .strip_prefix("==")
+        .filter(|pinned| !pinned.starts_with('=') && !pinned.contains('*'))
+        .is_some_and(|pinned| parse(pinned).is_some())
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
@@ -183,5 +193,11 @@ mod tests {
         assert!(!is_exact_pin_of("~=1.16.0", "1.16.0"));
         assert!(!is_exact_pin_of("==1.15", "1.16.0"));
         assert!(!is_exact_pin_of("1.16.0", "1.16.0"));
+        assert!(is_exact_pin("==1.17.0"));
+        assert!(is_exact_pin("==1.16"));
+        assert!(!is_exact_pin("===1.17.0"));
+        assert!(!is_exact_pin("==1.17.*"));
+        assert!(!is_exact_pin(">=1.17"));
+        assert!(!is_exact_pin("==not a version"));
     }
 }

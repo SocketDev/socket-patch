@@ -88,6 +88,7 @@ const LEDGERS: [&str; 2] = [
     ".socket/vendor/redirect-state.json",
 ];
 
+#[derive(Clone)]
 struct Captured {
     /// The file's bytes, `None` once removed.
     bytes: Option<Content>,
@@ -107,6 +108,19 @@ enum Content {
 }
 
 type Render = fn(&(dyn Any + Send + Sync)) -> std::io::Result<Vec<u8>>;
+
+impl Clone for Content {
+    fn clone(&self) -> Self {
+        match self {
+            Content::Bytes(bytes) => Content::Bytes(bytes.clone()),
+            Content::Value { value, render, .. } => Content::Value {
+                value: Arc::clone(value),
+                render: *render,
+                rendered: OnceLock::new(),
+            },
+        }
+    }
+}
 
 impl Content {
     fn bytes(&self) -> std::io::Result<Vec<u8>> {
@@ -175,6 +189,7 @@ fn is_captured(rel: &Path) -> bool {
             ".socket/vendor/gradle/.gitattributes",
         ]
         .contains(&spelled.as_str())
+        || crate::vendor::jvm::coursier_tree::CAPTURED_FILES.contains(&spelled.as_str())
     {
         return true;
     }
@@ -715,6 +730,88 @@ impl Drop for GroupCommit {
     }
 }
 
+/// The captured project files of an open [`GroupCommit`] at one point of
+/// the run (see [`GroupCommit::savepoint`]). The two ledgers are not part
+/// of it: the vendor loop owns their in-memory value and re-saves it
+/// itself.
+pub struct Savepoint {
+    files: BTreeMap<PathBuf, Captured>,
+    after_commit: usize,
+    dirs_after_commit: usize,
+}
+
+impl GroupCommit {
+    /// The captured state of every project file (the ledgers aside) right
+    /// now, for [`Self::rollback_to`]. A step that writes several commit
+    /// points and must be all-or-nothing (the hosted → vendored takeover:
+    /// restore the upstream entry, then vendor) takes one first, and rolls
+    /// back to it when a later part of the step refuses: nothing has
+    /// reached the disk yet, so the commit then never sees the abandoned
+    /// writes.
+    pub fn savepoint(&self) -> Savepoint {
+        let files = self
+            .overlay
+            .files
+            .lock()
+            .unwrap_or_else(std::sync::PoisonError::into_inner)
+            .iter()
+            .filter(|(rel, _)| !is_ledger(rel))
+            .map(|(rel, captured)| (rel.clone(), captured.clone()))
+            .collect();
+        Savepoint {
+            files,
+            after_commit: self
+                .overlay
+                .after_commit
+                .lock()
+                .unwrap_or_else(std::sync::PoisonError::into_inner)
+                .len(),
+            dirs_after_commit: self
+                .overlay
+                .dirs_after_commit
+                .lock()
+                .unwrap_or_else(std::sync::PoisonError::into_inner)
+                .len(),
+        }
+    }
+
+    /// Put every captured project file (the ledgers aside) back to its
+    /// state at `savepoint`: a file first captured since then is dropped
+    /// from the overlay (it reads from disk again), and the removals queued
+    /// since then are forgotten.
+    pub fn rollback_to(&self, savepoint: Savepoint) {
+        let mut files = self
+            .overlay
+            .files
+            .lock()
+            .unwrap_or_else(std::sync::PoisonError::into_inner);
+        files.retain(|rel, _| is_ledger(rel) || savepoint.files.contains_key(rel));
+        files.extend(savepoint.files);
+        drop(files);
+        self.overlay
+            .after_commit
+            .lock()
+            .unwrap_or_else(std::sync::PoisonError::into_inner)
+            .truncate(savepoint.after_commit);
+        self.overlay
+            .dirs_after_commit
+            .lock()
+            .unwrap_or_else(std::sync::PoisonError::into_inner)
+            .truncate(savepoint.dirs_after_commit);
+    }
+}
+
+/// Whether a write of the project-relative `rel` under an open
+/// [`GroupCommit`] is captured (held in memory until the commit) rather
+/// than written straight to disk. A caller that relies on
+/// [`GroupCommit::rollback_to`] (or on dropping a throwaway group) to undo
+/// a write checks every path first: an uncaptured one would already be on
+/// disk.
+pub fn captures(rel: &str) -> bool {
+    let path = Path::new(rel);
+    path.components().all(|c| matches!(c, Component::Normal(_))) && is_captured(path)
+}
+
 fn is_ledger(rel: &Path) -> bool {
     LEDGERS.contains(&rel_string(rel).as_str())
 }
@@ -1160,6 +1257,66 @@ mod tests {
         ] {
             assert_eq!(is_captured(Path::new(rel)), captured, "{rel}");
         }
+    }
+
+    #[test]
+    fn captures_only_root_relative_commit_points() {
+        assert!(captures("pnpm-lock.yaml"));
+        assert!(captures("packages/a/package.json"));
+        assert!(!captures(".socket/gradle/hosted-index.tsv"));
+        assert!(!captures("../pnpm-lock.yaml"));
+        assert!(!captures("/abs/pnpm-lock.yaml"));
+        assert!(!captures(""));
+    }
+
+    /// The hosted → vendored takeover's undo (#853, #944): writes made
+    /// after a savepoint are forgotten, earlier ones kept, the ledger left
+    /// alone, and the commit then writes only what survived.
+    #[tokio::test]
+    async fn rollback_to_savepoint_forgets_later_project_writes_only() {
+        let tmp = tempfile::tempdir().unwrap();
+        let root = tmp.path();
+        let lock = root.join("pnpm-lock.yaml");
+        let ws = root.join("pnpm-workspace.yaml");
+        let npmrc = root.join(".npmrc");
+        let ledger = root.join(".socket/vendor/state.json");
+        std::fs::create_dir_all(ledger.parent().unwrap()).unwrap();
+        std::fs::write(&lock, b"hosted").unwrap();
+        std::fs::write(&ws, b"trustLockfile: true\n").unwrap();
+        std::fs::write(&ledger, b"{}").unwrap();
+        let group = GroupCommit::begin(root);
+        super::super::fs::atomic_write_bytes(&npmrc, b"earlier")
+            .await
+            .unwrap();
+        let savepoint = group.savepoint();
+        super::super::fs::atomic_write_bytes_preserving_mode(&lock, b"upstream")
+            .await
+            .unwrap();
+        super::super::fs::atomic_write_bytes(&npmrc, b"later")
+            .await
+            .unwrap();
+        super::super::fs::remove_file(&ws).await.unwrap();
+        super::super::fs::atomic_write_bytes(&ledger, b"{\"entries\":{}}")
+            .await
+            .unwrap();
+        let tree = root.join("packages/gone");
+        remove_dir_after_commit(&tree).await;
+        group.rollback_to(savepoint);
+        let read = |p: &Path| {
+            let p = p.to_path_buf();
+            async move { super::super::fs::read_regular_to_bytes(&p).await.unwrap() }
+        };
+        assert_eq!(read(&lock).await, b"hosted");
+        assert_eq!(read(&ws).await, b"trustLockfile: true\n");
+        assert_eq!(read(&npmrc).await, b"earlier");
+        assert_eq!(read(&ledger).await, b"{\"entries\":{}}", "ledger kept");
+        assert!(group.overlay.dirs_after_commit.lock().unwrap().is_empty());
+        let mut changed = group.commit().await.unwrap();
+        changed.sort();
+        assert_eq!(changed, [".npmrc", ".socket/vendor/state.json"]);
+        assert_eq!(std::fs::read(&lock).unwrap(), b"hosted");
+        assert_eq!(std::fs::read(&ws).unwrap(), b"trustLockfile: true\n");
+        assert_eq!(std::fs::read(&npmrc).unwrap(), b"earlier");
     }
 
     #[tokio::test]

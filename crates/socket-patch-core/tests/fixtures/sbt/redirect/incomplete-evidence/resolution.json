@@ -1,0 +1,51 @@
+{
+  "v": 1,
+  "root": "/project",
+  "resolution": {
+    "modules": [
+      [
+        [
+          "org.apache.commons",
+          "commons-lang3"
+        ],
+        {
+          "3.11": [
+            "target/scala-2.12/update/update_cache_2.12/output:compile"
+          ]
+        }
+      ]
+    ],
+    "artifacts": [
+      [
+        [
+          "org.apache.commons",
+          "commons-lang3",
+          "3.11"
+        ],
+        [
+          "/home/u/.cache/coursier/v1/https/repo1.maven.org/maven2/org/apache/commons/commons-lang3/3.11/commons-lang3-3.11.jar"
+        ]
+      ]
+    ],
+    "classifiers": [],
+    "in_scope": [
+      [
+        "org.apache.commons",
+        "commons-lang3"
+      ]
+    ],
+    "projects_seen": [
+      "."
+    ],
+    "meta_build": []
+  },
+  "declared": [
+    ".",
+    "core"
+  ],
+  "stale": false,
+  "wiring_newer": false,
+  "deps_digest": "0a1b2c3d",
+  "read_error": null,
+  "findings": {}
+}

@@ -352,6 +352,7 @@ async fn embed_vex_into_json(
     manifest_path: &Path,
     base_code: i32,
     result: &mut serde_json::Value,
+    hosted: bool,
 ) -> i32 {
     if vex_args.vex.is_none() || base_code != 0 {
         return base_code;
@@ -365,7 +366,10 @@ async fn embed_vex_into_json(
         result["vex"] = serde_json::json!({ "skipped": true, "reason": "dry_run" });
         return base_code;
     }
-    let params = vex_args.to_build_params();
+    let mut params = vex_args.to_build_params();
+    // A hosted scan that redirected nothing (empty catalog / no grants)
+    // still attests older hosted gem pins: check them against the mirror.
+    params.hosted_gem_mirror_check = hosted;
     match generate_vex_from_manifest_path(common, &params, manifest_path).await {
         Ok(summary) => {
             result["vex"] = serde_json::json!({
@@ -424,6 +428,7 @@ async fn embed_vex_human(
     vex_args: &VexEmbedArgs,
     manifest_path: &Path,
     base_code: i32,
+    hosted: bool,
 ) -> i32 {
     if vex_args.vex.is_none() || base_code != 0 {
         return base_code;
@@ -438,7 +443,10 @@ async fn embed_vex_human(
         }
         return base_code;
     }
-    let params = vex_args.to_build_params();
+    let mut params = vex_args.to_build_params();
+    // A hosted scan that redirected nothing (empty catalog / no grants)
+    // still attests older hosted gem pins: check them against the mirror.
+    params.hosted_gem_mirror_check = hosted;
     match generate_vex_from_manifest_path(common, &params, manifest_path).await {
         Ok(summary) => {
             if !common.silent {
@@ -2075,8 +2083,15 @@ async fn run_scan(
                     result["redirectState"] = state;
                 }
             }
-            let code =
-                embed_vex_into_json(&args.common, &args.vex, &manifest_path, 0, &mut result).await;
+            let code = embed_vex_into_json(
+                &args.common,
+                &args.vex,
+                &manifest_path,
+                0,
+                &mut result,
+                hosted,
+            )
+            .await;
             print_json(&result);
             return code;
         } else if !args.common.silent {
@@ -2093,7 +2108,7 @@ async fn run_scan(
             }
             policy.print_human(args.common.silent, args.common.verbose);
         }
-        return embed_vex_human(&args.common, &args.vex, &manifest_path, 0).await;
+        return embed_vex_human(&args.common, &args.vex, &manifest_path, 0, hosted).await;
     }
 
     // Build ecosystem summary
@@ -2635,6 +2650,7 @@ async fn run_scan(
             &manifest_path,
             apply_code,
             &mut result,
+            hosted,
         )
         .await;
         print_json(&result);
@@ -2666,7 +2682,7 @@ async fn run_scan(
             )
             .await;
         }
-        embed_vex_human(&args_ref.common, &args_ref.vex, manifest_ref, code).await
+        embed_vex_human(&args_ref.common, &args_ref.vex, manifest_ref, code, hosted).await
     };
 
     // Every mode stops on an empty discovery, vendored included (restoring
@@ -3075,7 +3091,7 @@ async fn run_scan(
     if report_only {
         // The "Patches to apply:" listing already ends with a blank line.
         if !silent {
-            for line in render::report_only_hint() {
+            for line in render::report_only_hint(&args.common) {
                 println!("{line}");
             }
         }
@@ -3089,7 +3105,7 @@ async fn run_scan(
             )
             .await;
         }
-        return embed_vex_human(&args.common, &args.vex, &manifest_path, 0).await;
+        return embed_vex_human(&args.common, &args.vex, &manifest_path, 0, hosted).await;
     }
 
     // Vendor mode: pre-verify baselines so a content mismatch is reported
@@ -3192,7 +3208,7 @@ async fn run_scan(
         .await;
     }
 
-    embed_vex_human(&args.common, &args.vex, &manifest_path, code).await
+    embed_vex_human(&args.common, &args.vex, &manifest_path, code, hosted).await
 }
 
 #[cfg(test)]
