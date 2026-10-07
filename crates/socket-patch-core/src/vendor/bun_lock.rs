@@ -850,7 +850,15 @@ pub(crate) async fn revert_bun_opts(
     opts: RevertOpts,
 ) -> RevertOutcome {
     let mut outcome = revert_bun_wiring(entry, project_root, opts).await;
-    if outcome.success && !outcome.kept_artifact && !opts.dry_run {
+    // Only a revert that put a lock entry back can leave Bun keeping a
+    // copy: with the lock missing nothing was restored, and with the entry
+    // removed (`bun remove`) a plain `bun install` prunes the copy.
+    let restored_nothing = outcome.lock_entry_removed()
+        || outcome
+            .warnings
+            .iter()
+            .any(|w| w.code == "vendor_lockfile_missing");
+    if outcome.success && !outcome.kept_artifact && !opts.dry_run && !restored_nothing {
         let stale = stale_hoisted_copies(project_root, [entry.base_purl.as_str()]).await;
         if !stale.is_empty() {
             outcome.warnings.push(VendorWarning::new(
@@ -3595,6 +3603,14 @@ mod tests {
             "{:?}",
             outcome.warnings
         );
+        assert!(
+            outcome
+                .warnings
+                .iter()
+                .all(|w| w.code != REINSTALL_REQUIRED),
+            "nothing restored, so nothing for Bun to keep (#764): {:?}",
+            outcome.warnings
+        );
         assert!(!outcome.kept_artifact, "a missing lock is not a drift-keep");
         assert!(
             !fx.root()
@@ -3784,6 +3800,14 @@ mod tests {
                 .any(|w| w.code == "vendor_lock_entry_removed"
                     && w.detail.contains("no longer exists; nothing to restore")),
             "{:?}",
+            outcome.warnings
+        );
+        assert!(
+            outcome
+                .warnings
+                .iter()
+                .all(|w| w.code != REINSTALL_REQUIRED),
+            "a removed dependency is pruned by a plain `bun install` (#764): {:?}",
             outcome.warnings
         );
         assert!(!outcome.kept_artifact, "{:?}", outcome.warnings);
