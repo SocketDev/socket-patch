@@ -564,7 +564,14 @@ async fn restore_berry(
     };
     let yarnrc_rel = format!("{dir_prefix}.yarnrc.yml");
     let yarnrc = view.read(&yarnrc_rel).await.ok().flatten();
-    if let Err(w) = super::super::preflight_yarn_berry_hosted(raw, yarnrc.as_deref()) {
+    // The root manifest: a hosted pin keyed by its tarball URL keeps the
+    // descriptors it replaced only as `resolutions` selectors routed there.
+    // Read before the gates: a mixed one is refused like a mixed lock.
+    let pkg_rel = format!("{dir_prefix}package.json");
+    let pkg_text = view.read(&pkg_rel).await.ok().flatten();
+    if let Err(w) =
+        super::super::preflight_yarn_berry_hosted(raw, pkg_text.as_deref(), yarnrc.as_deref())
+    {
         refuse_all_in(pins, rel, result, w.detail);
         return;
     }
@@ -581,10 +588,6 @@ async fn restore_berry(
     let version_re =
         Regex::new(r"\n {2}version: ([^\n]*)").expect("static version-line regex is valid");
 
-    // The root manifest: a hosted pin keyed by its tarball URL keeps the
-    // descriptors it replaced only as `resolutions` selectors routed there.
-    let pkg_rel = format!("{dir_prefix}package.json");
-    let pkg_text = view.read(&pkg_rel).await.ok().flatten();
     let mut pkg: Option<serde_json::Value> = pkg_text
         .as_deref()
         .and_then(|t| serde_json::from_str(t.strip_prefix('\u{feff}').unwrap_or(t)).ok())
@@ -867,7 +870,7 @@ fn pnpm_settings_major(text: &str, pm_major: Option<u32>) -> Option<u32> {
 fn yaml_block_value(text: &str, section: &str, key: &str) -> Option<String> {
     use crate::formats::pnpm::workspace::{block_section_bounds, top_level_key};
 
-    let lines: Vec<String> = crate::utils::serde::strip_bom(text)
+    let lines: Vec<String> = crate::formats::text::strip_bom(text)
         .lines()
         .map(str::to_string)
         .collect();
@@ -937,7 +940,7 @@ fn pnpm_lookup_registry(
     };
     let value = if major == Some(10) {
         let has_registries = workspace.is_some_and(|text| {
-            crate::utils::serde::strip_bom(text)
+            crate::formats::text::strip_bom(text)
                 .lines()
                 .filter_map(top_level_key)
                 .any(|(key, _)| key == "registries")
@@ -1063,7 +1066,7 @@ fn pnpm_spec_major(spec: &str) -> Option<u32> {
 /// The pnpm major an install record names: `node_modules/.modules.yaml`'s
 /// `packageManager` (JSON on pnpm 10+, a top-level YAML scalar before).
 fn modules_yaml_pnpm_major(text: &str) -> Option<u32> {
-    let text = crate::utils::serde::strip_bom(text);
+    let text = crate::formats::text::strip_bom(text);
     if let Ok(value) = serde_json::from_str::<serde_json::Value>(text) {
         return value
             .get("packageManager")
@@ -1077,7 +1080,7 @@ fn modules_yaml_pnpm_major(text: &str) -> Option<u32> {
 
 /// The pnpm major package.json's corepack `packageManager` pins.
 fn package_json_pnpm_major(text: &str) -> Option<u32> {
-    serde_json::from_str::<serde_json::Value>(crate::utils::serde::strip_bom(text))
+    serde_json::from_str::<serde_json::Value>(crate::formats::text::strip_bom(text))
         .ok()?
         .get("packageManager")?
         .as_str()

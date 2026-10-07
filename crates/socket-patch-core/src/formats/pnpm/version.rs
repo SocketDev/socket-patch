@@ -20,8 +20,8 @@
 //! `devEngines.packageManager` and `engines.pnpm`; a pin for another tool
 //! is no evidence either way.
 
+use crate::formats::text::strip_bom;
 use crate::utils::package_manager::pinned_version;
-use crate::utils::serde::strip_bom;
 
 /// `(major, minor)`; patch levels never matter here.
 type MajorMinor = (u64, u64);

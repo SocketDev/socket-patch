@@ -13,11 +13,16 @@
 //!
 //! Pure text in, answers out; the editors own the reads and writes.
 
+use crate::formats::text::strip_bom;
+
 /// The parsed key (quotes removed) and its inline value (comment and
 /// surrounding blanks stripped; `""` for a block-valued key) when `line` is
 /// a top-level mapping key. Indented lines, comments, sequence items and
-/// document markers are not keys.
+/// document markers are not keys. A leading BOM (the file's first line) is
+/// encoding, not key text, as for pnpm's YAML parser (#904); a splice that
+/// keeps the line itself keeps the BOM byte-exact.
 pub(crate) fn top_level_key(line: &str) -> Option<(String, &str)> {
+    let line = strip_bom(line);
     let line = line.strip_suffix('\r').unwrap_or(line);
     let first = *line.as_bytes().first()?;
     if matches!(first, b' ' | b'\t' | b'#' | b'-' | b'{' | b'[' | b'%') || is_marker(line, "...") {
@@ -61,7 +66,8 @@ pub(crate) fn block_insert_point(lines: &[String]) -> Result<usize, String> {
     let mut end_marker = None;
     let mut last = None; // the last non-blank line of the document
     for (i, raw) in lines.iter().enumerate() {
-        let line = raw.strip_suffix('\r').unwrap_or(raw);
+        let line = if i == 0 { strip_bom(raw) } else { raw };
+        let line = line.strip_suffix('\r').unwrap_or(line);
         let comment = line.trim_start().starts_with('#');
         if end_marker.is_some() {
             if !(line.trim().is_empty() || comment) {
@@ -279,5 +285,33 @@ mod tests {
         assert_eq!(block_section_bounds(&l, "overrides"), Some((0, 5)));
         let inline = lines("overrides : {a: 1}\n");
         assert_eq!(block_section_bounds(&inline, "overrides"), None);
+    }
+
+    /// #904: a BOM-prefixed first line is the same key pnpm reads — it must
+    /// not hide `trustLockfile:` / `overrides:` from the splices (which
+    /// then appended a duplicate key pnpm refuses to parse).
+    #[test]
+    fn top_level_key_skips_a_leading_bom() {
+        assert_eq!(
+            top_level_key("\u{feff}trustLockfile: false"),
+            Some(("trustLockfile".to_string(), "false"))
+        );
+        assert_eq!(
+            top_level_key("\u{feff}overrides:"),
+            Some(("overrides".to_string(), ""))
+        );
+        assert_eq!(
+            top_level_key("\u{feff}'trustLockfile': true"),
+            Some(("trustLockfile".to_string(), "true"))
+        );
+        assert_eq!(top_level_key("\u{feff}  trustLockfile: true"), None);
+        assert_eq!(top_level_key("\u{feff}# trustLockfile: true"), None);
+        let bom = lines("\u{feff}overrides:\n  is-number: 7.0.0\npackages:\n  - .\n");
+        assert_eq!(block_insert_point(&bom), Ok(4));
+        assert_eq!(block_section_bounds(&bom, "overrides"), Some((0, 2)));
+        assert_eq!(
+            block_insert_point(&lines("\u{feff}{packages: [.]}\n")),
+            Err("is a flow-style YAML document".to_string())
+        );
     }
 }

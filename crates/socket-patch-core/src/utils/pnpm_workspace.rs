@@ -82,7 +82,7 @@ fn lists_as_member(yaml: &str, rel: &[String]) -> bool {
     struct Workspace {
         packages: Option<Vec<String>>,
     }
-    let yaml = crate::utils::serde::strip_bom(yaml);
+    let yaml = crate::formats::text::strip_bom(yaml);
     let Ok(workspace) = serde_saphyr::from_str::<Option<Workspace>>(yaml) else {
         return true;
     };

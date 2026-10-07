@@ -537,7 +537,17 @@ pub fn yarn_classic_lock(g: &Graph) -> String {
 
 pub fn build_yarn_classic(t: &mut Tree, size: Size) -> std::io::Result<Fixture> {
     let g = graph("yarn-classic", size);
-    t.write("project/package.json", g.package_json())?;
+    // Pin yarn 1 as a real classic project does: without the pin a hosted
+    // scan rightly warns `redirect_yarn_classic_berry_migration_risk`
+    // (#907), which the scenario would count as an unexpected warning.
+    t.write(
+        "project/package.json",
+        g.package_json().replacen(
+            "\"private\": true",
+            "\"private\": true,\n  \"packageManager\": \"yarn@1.22.22\"",
+            1,
+        ),
+    )?;
     t.write("project/yarn.lock", yarn_classic_lock(&g))?;
     t.write(
         "project/node_modules/.yarn-integrity",

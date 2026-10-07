@@ -50,7 +50,7 @@ pub(crate) fn split_project_document(text: &str) -> Result<(&str, &str), String>
     let mut offset = 0;
     for line in text.split('\n') {
         let end = (offset + line.len() + 1).min(text.len());
-        let marker = line.strip_prefix('\u{feff}').unwrap_or(line);
+        let marker = crate::formats::text::strip_bom(line);
         if marker.starts_with("---") || marker.starts_with("...") {
             if marker.len() != line.len() {
                 return Err("has a byte-order mark before its `---` separator".to_string());

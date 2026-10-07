@@ -14,8 +14,10 @@ use socket_patch_core::patch::rollback::{
     VerifyRollbackResult, VerifyRollbackStatus,
 };
 use socket_patch_core::telemetry::{track_patch_rollback_failed, track_patch_rolled_back};
+use socket_patch_core::utils::composer_version::composer_purls_equivalent;
 use socket_patch_core::utils::purl::{patch_matches, strip_purl_qualifiers};
 use socket_patch_core::vendor::{purl_keys_cover, RevertOpts, VendorState};
+use socket_patch_core::vex::discover::canonical_base_purl;
 use std::collections::{HashMap, HashSet};
 use std::path::{Path, PathBuf};
 use std::time::Duration;
@@ -443,8 +445,13 @@ pub(crate) struct RollbackOutcome {
     /// the revert data the retry needs.
     pub(crate) aborted: bool,
     /// Run warnings `(code, detail)` for copies left alone without failing
-    /// the run (today: `gradle_m2_copy_not_restored`).
+    /// the run (`gradle_m2_copy_not_restored`, `rollback_record_superseded`).
     pub(crate) warnings: Vec<(String, String)>,
+    /// In-scope manifest entries superseded by a live hosted pin whose
+    /// installed copies hold neither side of the recorded patch (#933):
+    /// left to the hosted leg's lock restore instead of failing, and
+    /// removable from the manifest like a rolled-back entry. Sorted.
+    pub(crate) superseded: Vec<String>,
 }
 
 /// How `rollback_patches_inner` selects manifest entries.
@@ -1451,6 +1458,7 @@ pub async fn run(args: RollbackArgs) -> i32 {
         &manifest,
         &vendored_keys,
         selection,
+        &superseded_by_hosted(&manifest, &hosted_pins),
         Some(&telemetry_client),
     )
     .await
@@ -1463,6 +1471,7 @@ pub async fn run(args: RollbackArgs) -> i32 {
             narrowed_out,
             aborted,
             warnings: agent_warnings,
+            superseded,
         }) => {
             // Copies left alone without failing the run (an unconsumed
             // `~/.m2` copy: `gradle_m2_copy_not_restored`).
@@ -1564,6 +1573,7 @@ pub async fn run(args: RollbackArgs) -> i32 {
                     }
                     succeeded_purls.contains(*purl)
                         || not_installed.contains(purl)
+                        || superseded.contains(purl)
                         || (narrowed_out.contains(purl)
                             && !failed_bases.contains(strip_purl_qualifiers(purl)))
                 })
@@ -2017,6 +2027,10 @@ pub(crate) async fn rollback_patches_inner(
     manifest: &PatchManifest,
     vendored_keys: &HashSet<String>,
     selection: InnerSelection<'_>,
+    // Manifest purl -> the hosted uuid a live lockfile pin superseded its
+    // record with ([`superseded_by_hosted`]); empty when no hosted pin
+    // replaces a recorded patch.
+    superseded: &HashMap<String, String>,
     // The client the caller already built. Constructing one per phase
     // printed the core client's "No SOCKET_API_TOKEN set" notice once per
     // construction — twice in a single rollback. `None` builds one on
@@ -2066,6 +2080,7 @@ pub(crate) async fn rollback_patches_inner(
             narrowed_out: Vec::new(),
             aborted: false,
             warnings: Vec::new(),
+            superseded: Vec::new(),
         });
     }
 
@@ -2093,6 +2108,7 @@ pub(crate) async fn rollback_patches_inner(
             narrowed_out: Vec::new(),
             aborted: false,
             warnings: Vec::new(),
+            superseded: Vec::new(),
         });
     }
 
@@ -2494,6 +2510,7 @@ pub(crate) async fn rollback_patches_inner(
                 narrowed_out: Vec::new(),
                 aborted: true,
                 warnings: Vec::new(),
+                superseded: Vec::new(),
             });
         }
 
@@ -2574,6 +2591,7 @@ pub(crate) async fn rollback_patches_inner(
                 narrowed_out: Vec::new(),
                 aborted: true,
                 warnings: Vec::new(),
+                superseded: Vec::new(),
             });
         }
     }
@@ -2594,6 +2612,7 @@ pub(crate) async fn rollback_patches_inner(
             narrowed_out: narrowed_out.clone(),
             aborted: false,
             warnings: Vec::new(),
+            superseded: Vec::new(),
         });
     }
 
@@ -2601,6 +2620,7 @@ pub(crate) async fn rollback_patches_inner(
     let mut results: Vec<RollbackResult> = Vec::new();
     let mut has_errors = false;
     let mut warnings: Vec<(String, String)> = Vec::new();
+    let mut superseded_left: Vec<String> = Vec::new();
 
     for target in &rollback_targets {
         let (purl, pkg_path) = (&target.purl, &target.dir);
@@ -2640,6 +2660,12 @@ pub(crate) async fn rollback_patches_inner(
 
         if let Some(warning) = unconsumed_m2_skip(target, &result) {
             warnings.push(warning);
+            continue;
+        }
+        let files = target.files.as_ref().unwrap_or(&patch.files);
+        if let Some(warning) = superseded_record_skip(target, &result, files, superseded).await {
+            warnings.push(warning);
+            superseded_left.push(purl.clone());
             continue;
         }
         if !result.success {
@@ -2689,6 +2715,8 @@ pub(crate) async fn rollback_patches_inner(
         results.push(result);
     }
 
+    superseded_left.sort();
+    superseded_left.dedup();
     Ok(RollbackOutcome {
         success: !has_errors,
         results,
@@ -2697,6 +2725,7 @@ pub(crate) async fn rollback_patches_inner(
         narrowed_out,
         aborted: false,
         warnings,
+        superseded: superseded_left,
     })
 }
 
@@ -2773,6 +2802,123 @@ fn unconsumed_m2_skip(target: &CopyTarget, result: &RollbackResult) -> Option<(S
             ),
         )
     })
+}
+
+/// Manifest records a live hosted pin has superseded (#933): purl -> the
+/// hosted uuid the lockfiles wire for the same package release, when no
+/// hosted pin for that release carries the record's own uuid. An agent →
+/// hosted migration whose patch was replaced meanwhile leaves exactly this:
+/// record A in the manifest, the lock pinning B. `vex` reports the same
+/// state as `vex_record_superseded`.
+pub(crate) fn superseded_by_hosted(
+    manifest: &PatchManifest,
+    pins: &[HostedPin],
+) -> HashMap<String, String> {
+    manifest
+        .patches
+        .iter()
+        .filter_map(|(purl, record)| {
+            let pkg = canonical_base_purl(purl);
+            let same: Vec<&HostedPin> = pins
+                .iter()
+                .filter(|pin| pin.purl == pkg || composer_purls_equivalent(&pin.purl, &pkg))
+                .collect();
+            if same.iter().any(|pin| pin.uuid == record.uuid) {
+                return None;
+            }
+            same.first().map(|pin| (purl.clone(), pin.uuid.clone()))
+        })
+        .collect()
+}
+
+/// The run warning that replaces a failed in-place restore of a manifest
+/// record a live hosted pin superseded ([`superseded_by_hosted`]), when it
+/// failed before writing anything because the installed copy holds bytes
+/// that are neither side of the record (the superseding patch's, after a
+/// reinstall), lacks a file, or is a Gradle hash directory this record
+/// never patched (`gradle_rollback_hash_mismatch` with no file at the
+/// record's patched bytes). The hosted leg's lock restore and the reinstall
+/// it asks for unwind that copy; restoring the record's original bytes over
+/// the superseding patch's would only mix the two. `None` for any other
+/// result: a copy still holding the record's patched bytes (including a
+/// swapped jar with no backup, `jvm_jar_backup_missing`) is restored or
+/// fails as usual, and so does a file that cannot be read.
+async fn superseded_record_skip(
+    target: &CopyTarget,
+    result: &RollbackResult,
+    files: &HashMap<String, PatchFileInfo>,
+    superseded: &HashMap<String, String>,
+) -> Option<(String, String)> {
+    let wired = superseded.get(&target.purl)?;
+    if result.success || !result.files_rolled_back.is_empty() {
+        return None;
+    }
+    if result
+        .files_verified
+        .iter()
+        .any(|v| v.status == VerifyRollbackStatus::NotFound && !v.is_absent())
+    {
+        return None;
+    }
+    let mismatched = result
+        .files_verified
+        .iter()
+        .any(|v| v.status == VerifyRollbackStatus::HashMismatch || v.is_absent());
+    // A Gradle hash directory is refused before verification when the
+    // record's before-blob does not hash to its name: normally the
+    // superseding patch's own download, which this record never patched.
+    // It is left only if no file there still holds the record's patched
+    // bytes (a corrupt blob for the directory the record DID patch fails
+    // as usual).
+    let foreign_gradle_dir = result
+        .error
+        .as_deref()
+        .is_some_and(|e| e.starts_with("gradle_rollback_hash_mismatch"))
+        && !holds_patched_bytes(target, files).await;
+    (mismatched || foreign_gradle_dir).then(|| {
+        (
+            "rollback_record_superseded".to_string(),
+            format!(
+                "{}: the recorded patch is superseded by the lockfile-wired hosted patch {wired}; \
+                 left the installed copy at {} to the lockfile restore (the next \
+                 package-manager install puts the original files back)",
+                target.purl,
+                target.dir.display()
+            ),
+        )
+    })
+}
+
+/// Whether any of `files` in `target`'s copy is at the record's patched
+/// bytes, or cannot be checked (an unsafe key, a read error other than
+/// "not found"), which may hide them.
+async fn holds_patched_bytes(target: &CopyTarget, files: &HashMap<String, PatchFileInfo>) -> bool {
+    for (file, info) in files {
+        let key = maven_target_key(&target.purl, &target.dir, file);
+        let rel = Path::new(key.strip_prefix("package/").unwrap_or(&key));
+        if rel.as_os_str().is_empty()
+            || !rel
+                .components()
+                .all(|c| matches!(c, std::path::Component::Normal(_)))
+        {
+            return true;
+        }
+        // FIFO-safe: a FIFO or device planted at the leaf is refused, not
+        // opened (a bare read would block forever), and counts as possibly
+        // patched below.
+        match socket_patch_core::utils::fs::read_regular_to_bytes(&target.dir.join(rel)).await {
+            Ok(bytes) => {
+                if socket_patch_core::hash::git_sha256::compute_git_sha256_from_bytes(&bytes)
+                    == info.after_hash
+                {
+                    return true;
+                }
+            }
+            Err(e) if e.kind() == std::io::ErrorKind::NotFound => {}
+            Err(_) => return true,
+        }
+    }
+    false
 }
 
 /// The key `file` of a Maven record as it is joined onto `dir`: a Gradle
@@ -3087,6 +3233,7 @@ mod tests {
             &manifest,
             &vendored_keys,
             InnerSelection::Identifier(identifier),
+            &HashMap::new(),
             None,
         )
         .await?;
@@ -3251,6 +3398,166 @@ mod tests {
             error: None,
             sidecar: None,
         }
+    }
+
+    fn superseded_map() -> HashMap<String, String> {
+        HashMap::from([(
+            "pkg:npm/foo@1.0.0".to_string(),
+            "bbbbbbbb-bbbb-4bbb-8bbb-bbbbbbbbbbbb".to_string(),
+        )])
+    }
+
+    /// A record of one file, `package/index.js`, patched from `before` to
+    /// `after`, and a copy dir holding `installed` as that file.
+    fn superseded_copy(
+        installed: &[u8],
+    ) -> (
+        tempfile::TempDir,
+        CopyTarget,
+        HashMap<String, PatchFileInfo>,
+    ) {
+        let tmp = tempfile::tempdir().unwrap();
+        std::fs::write(tmp.path().join("index.js"), installed).unwrap();
+        let files = HashMap::from([(
+            "package/index.js".to_string(),
+            PatchFileInfo {
+                before_hash: socket_patch_core::hash::git_sha256::compute_git_sha256_from_bytes(
+                    b"original",
+                ),
+                after_hash: socket_patch_core::hash::git_sha256::compute_git_sha256_from_bytes(
+                    b"patched by A",
+                ),
+            },
+        )]);
+        let target = CopyTarget::plain("pkg:npm/foo@1.0.0", tmp.path());
+        (tmp, target, files)
+    }
+
+    fn refused(error: &str) -> RollbackResult {
+        let mut result = make_result(&[], &[]);
+        result.success = false;
+        result.error = Some(error.to_string());
+        result
+    }
+
+    #[tokio::test]
+    async fn superseded_skip_covers_a_copy_holding_neither_side() {
+        let (_tmp, target, files) = superseded_copy(b"patched by B");
+        let result = make_result(&[VerifyRollbackStatus::HashMismatch], &[]);
+        let (code, detail) = superseded_record_skip(&target, &result, &files, &superseded_map())
+            .await
+            .expect("a superseded record's mismatched copy is left to the hosted leg");
+        assert_eq!(code, "rollback_record_superseded");
+        assert!(
+            detail.contains("bbbbbbbb-bbbb-4bbb-8bbb-bbbbbbbbbbbb"),
+            "{detail}"
+        );
+    }
+
+    #[tokio::test]
+    async fn superseded_skip_covers_a_gradle_dir_the_record_never_patched() {
+        let (_tmp, target, files) = superseded_copy(b"patched by B");
+        let result = refused("gradle_rollback_hash_mismatch: the before-blob for x does not hash");
+        assert!(
+            superseded_record_skip(&target, &result, &files, &superseded_map())
+                .await
+                .is_some()
+        );
+    }
+
+    #[tokio::test]
+    async fn superseded_skip_keeps_jvm_copies_holding_the_patched_bytes() {
+        // The record's own patched bytes are still there: a corrupt blob for
+        // the directory it patched, or a swapped jar with no backup, fails.
+        let (_tmp, target, files) = superseded_copy(b"patched by A");
+        for error in [
+            "gradle_rollback_hash_mismatch: the before-blob for x does not hash",
+            "jvm_jar_backup_missing: no original of lib-1.0.jar",
+        ] {
+            let result = refused(error);
+            assert!(
+                superseded_record_skip(&target, &result, &files, &superseded_map())
+                    .await
+                    .is_none(),
+                "{error}"
+            );
+        }
+    }
+
+    #[cfg(unix)]
+    #[tokio::test]
+    async fn superseded_skip_never_blocks_on_a_fifo() {
+        // A FIFO where the record's file should be is unverifiable: the
+        // check must refuse it, not block in open(2), and must not skip.
+        let (tmp, target, files) = superseded_copy(b"patched by B");
+        std::fs::remove_file(tmp.path().join("index.js")).unwrap();
+        let made = std::process::Command::new("mkfifo")
+            .arg(tmp.path().join("index.js"))
+            .status()
+            .expect("run mkfifo");
+        assert!(made.success());
+        let result = refused("gradle_rollback_hash_mismatch: the before-blob for x does not hash");
+        let skip = tokio::time::timeout(
+            std::time::Duration::from_secs(10),
+            superseded_record_skip(&target, &result, &files, &superseded_map()),
+        )
+        .await
+        .expect("the patched-bytes probe must not block on a FIFO");
+        assert!(skip.is_none());
+    }
+
+    #[tokio::test]
+    async fn superseded_skip_leaves_other_failures_and_records_alone() {
+        let (_tmp, target, files) = superseded_copy(b"patched by B");
+        let mismatch = make_result(&[VerifyRollbackStatus::HashMismatch], &[]);
+        // Not superseded: the mismatch fails as before.
+        assert!(
+            superseded_record_skip(&target, &mismatch, &files, &HashMap::new())
+                .await
+                .is_none()
+        );
+        // A missing before-blob is a real failure even when superseded.
+        let missing = make_result(&[VerifyRollbackStatus::MissingBlob], &[]);
+        assert!(
+            superseded_record_skip(&target, &missing, &files, &superseded_map())
+                .await
+                .is_none()
+        );
+        // A file that exists but cannot be read may still hold A's bytes.
+        let mut unreadable = make_result(&[VerifyRollbackStatus::NotFound], &[]);
+        unreadable.files_verified[0].message = Some("Failed to hash file: EACCES".to_string());
+        assert!(
+            superseded_record_skip(&target, &unreadable, &files, &superseded_map())
+                .await
+                .is_none()
+        );
+    }
+
+    #[test]
+    fn superseded_by_hosted_needs_a_pin_with_another_uuid() {
+        let mut manifest = PatchManifest::new();
+        manifest
+            .patches
+            .insert("pkg:npm/foo@1.0.0".to_string(), make_record("aaaa"));
+        manifest
+            .patches
+            .insert("pkg:npm/bar@2.0.0".to_string(), make_record("cccc"));
+        let pin = |purl: &str, uuid: &str| HostedPin {
+            purl: purl.to_string(),
+            uuid: uuid.to_string(),
+            files: vec!["package-lock.json".to_string()],
+        };
+        let pins = vec![
+            pin("pkg:npm/foo@1.0.0", "bbbb"),
+            // bar's hosted pin carries the record's own uuid: not superseded.
+            pin("pkg:npm/bar@2.0.0", "cccc"),
+        ];
+        let map = superseded_by_hosted(&manifest, &pins);
+        assert_eq!(
+            map,
+            HashMap::from([("pkg:npm/foo@1.0.0".to_string(), "bbbb".to_string())])
+        );
+        assert!(superseded_by_hosted(&manifest, &[]).is_empty());
     }
 
     #[test]
