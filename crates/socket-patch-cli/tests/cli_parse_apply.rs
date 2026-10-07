@@ -8,21 +8,13 @@
 
 use std::path::PathBuf;
 
-use clap::Parser;
 use socket_patch_cli::commands::apply::ApplyArgs;
-use socket_patch_cli::{Cli, Commands};
+use socket_patch_cli::Commands;
 
 #[path = "common/hermetic.rs"]
 mod hermetic;
 
-/// `Cli::try_parse_from` with the ambient `SOCKET_*` environment removed
-/// first: clap reads the env-bound flags at parse time, so without it the
-/// workspace `SOCKET_TELEMETRY_DISABLED=1` default (or a developer's shell)
-/// would set `--no-telemetry` and friends in every parse.
-fn try_parse(argv: &[&str]) -> Result<Cli, clap::Error> {
-    hermetic::scrub_process_socket_env();
-    Cli::try_parse_from(argv)
-}
+use hermetic::try_parse;
 
 /// Parse `socket-patch apply <extra...>` and return the inner `ApplyArgs`.
 /// Panics if parsing fails or yields a non-`Apply` subcommand — tests for

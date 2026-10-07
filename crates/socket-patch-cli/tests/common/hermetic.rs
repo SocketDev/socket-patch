@@ -49,8 +49,9 @@ const HOSTILE_SEEDS: &[(&str, &str)] = &[
 /// A `Command` for `bin` with the hermetic `SOCKET_*` environment: the
 /// hostile seeds scrubbed, every other ambient `SOCKET_*` removed (removing
 /// `SOCKET_API_TOKEN` also forces the public proxy), and the three opt-outs
-/// (config layer, update notifier, telemetry) forced on. Callers add args, cwd and their own env afterwards; caller env
-/// lands last, so explicit injections survive the scrub.
+/// (config layer, update notifier, telemetry) forced on. Callers add args,
+/// cwd and their own env afterwards; caller env lands last, so explicit
+/// injections survive the scrub.
 pub fn command(bin: &Path) -> Command {
     let mut cmd = Command::new(bin);
     for (k, v) in HOSTILE_SEEDS {
@@ -120,6 +121,16 @@ pub fn scrub_process_socket_env() {
             }
         }
     });
+}
+
+/// `Cli::try_parse_from` with the ambient `SOCKET_*` environment removed
+/// first (see [`scrub_process_socket_env`]): clap reads the env-bound flags
+/// at parse time, so without it the workspace `SOCKET_TELEMETRY_DISABLED=1`
+/// default (or a developer's shell) would set `--no-telemetry` and friends
+/// in every parse.
+pub fn try_parse(argv: &[&str]) -> Result<socket_patch_cli::Cli, clap::Error> {
+    scrub_process_socket_env();
+    <socket_patch_cli::Cli as clap::Parser>::try_parse_from(argv)
 }
 
 /// Opt-in scrubs for the ambient config of the tools a suite drives.

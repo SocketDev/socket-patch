@@ -7,22 +7,14 @@
 //! these tests is a breaking change and requires a MAJOR bump per
 //! `crates/socket-patch-cli/CLI_CONTRACT.md`.
 
-use clap::Parser;
 use socket_patch_cli::commands::rollback::RollbackArgs;
-use socket_patch_cli::{Cli, Commands};
+use socket_patch_cli::Commands;
 use std::path::PathBuf;
 
 #[path = "common/hermetic.rs"]
 mod hermetic;
 
-/// `Cli::try_parse_from` with the ambient `SOCKET_*` environment removed
-/// first: clap reads the env-bound flags at parse time, so without it the
-/// workspace `SOCKET_TELEMETRY_DISABLED=1` default (or a developer's shell)
-/// would set `--no-telemetry` and friends in every parse.
-fn try_parse(argv: &[&str]) -> Result<Cli, clap::Error> {
-    hermetic::scrub_process_socket_env();
-    Cli::try_parse_from(argv)
-}
+use hermetic::try_parse;
 
 fn parse_rollback(extra: &[&str]) -> RollbackArgs {
     let mut argv = vec!["socket-patch", "rollback"];
