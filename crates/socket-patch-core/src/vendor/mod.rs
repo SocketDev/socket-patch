@@ -850,6 +850,39 @@ pub async fn lock_text_refusals(
     refusals
 }
 
+/// [`lock_text_refusals`] for npm `candidates` a HOSTED pin wires, in a
+/// pnpm (lockfileVersion 9) project only — the refusals a hosted → vendored
+/// takeover of them meets after it restores the registry entry (#853), so
+/// a dry-run preview can name them without staging the restore (which
+/// needs the registry). Empty for every other flavor.
+///
+/// Evaluating the gates on the still-hosted lock is exact for pnpm: the
+/// hosted restore only splices each entry's `resolution:` value, which no
+/// pnpm gate reads (coordinates, CRLF, catalogs, overrides, entry presence
+/// and ref rewritability all key on other text). The one difference is a
+/// `pnpm-workspace.yaml` scaffold hosted mode created, which the restore
+/// deletes; a gate that depended on it would make this under-predict, and
+/// the wet run still refuses. Yarn's restores rewrite key and checksum
+/// text, and legacy pnpm locks are not lock-text gated at all, so neither
+/// is predicted here.
+pub async fn pnpm_takeover_lock_text_refusals(
+    project_root: &Path,
+    candidates: &[(&str, &str)],
+) -> HashMap<String, (&'static str, String)> {
+    if !matches!(
+        npm_flavor::detect_npm_lock_flavor(project_root).await,
+        Ok((npm_flavor::NpmLockFlavor::Pnpm, _))
+    ) {
+        return HashMap::new();
+    }
+    let npm: Vec<(&str, &str)> = candidates
+        .iter()
+        .filter(|(purl, _)| ecosystem_dir_for_purl(purl) == Some("npm"))
+        .copied()
+        .collect();
+    lock_text_refusals(project_root, &npm).await
+}
+
 /// [`VendorState::purl_keys`] over the ledger in `project_root`, loaded
 /// once for callers that match whole purl sets against vendor ownership
 /// (apply / rollback / scan prune). An unreadable ledger degrades to the
@@ -1977,5 +2010,58 @@ mod berry_migration_risk_tests {
         assert!(yarn_classic_berry_migration_risk(tmp.path()).is_some());
         let tmp = project(Some(WIRED_V1), None);
         assert!(yarn_classic_berry_migration_risk(tmp.path()).is_some());
+    }
+}
+
+#[cfg(test)]
+mod pnpm_takeover_lock_text_refusal_tests {
+    use super::pnpm_takeover_lock_text_refusals;
+
+    const PURL: &str = "pkg:npm/left-pad@1.3.0";
+    const UUID: &str = "11111111-2222-4333-8444-555555555555";
+    /// A hosted pin: the entry's tarball is the patch server's.
+    const HOSTED_V9: &str = "lockfileVersion: '9.0'\n\n\
+        importers:\n\n  .:\n    dependencies:\n      left-pad:\n        specifier: 1.3.0\n        version: 1.3.0\n\n\
+        packages:\n\n  left-pad@1.3.0:\n    resolution: {integrity: sha512-x==, tarball: https://patch.socket.dev/patch/npm/left-pad/1.3.0/a/11111111-2222-4333-8444-555555555555/left-pad-1.3.0.tgz}\n\n\
+        snapshots:\n\n  left-pad@1.3.0: {}\n";
+
+    fn project(lock_name: &str, lock: &str) -> tempfile::TempDir {
+        let tmp = tempfile::tempdir().unwrap();
+        std::fs::write(
+            tmp.path().join("package.json"),
+            r#"{"name":"c","version":"1.0.0","dependencies":{"left-pad":"1.3.0"}}"#,
+        )
+        .unwrap();
+        std::fs::write(tmp.path().join(lock_name), lock).unwrap();
+        tmp
+    }
+
+    #[tokio::test]
+    async fn crlf_hosted_pnpm_lock_is_refused() {
+        let tmp = project("pnpm-lock.yaml", &HOSTED_V9.replace('\n', "\r\n"));
+        let refused = pnpm_takeover_lock_text_refusals(tmp.path(), &[(PURL, UUID)]).await;
+        assert_eq!(
+            refused.get(PURL).map(|(code, _)| *code),
+            Some("vendor_lockfile_crlf_unsupported"),
+            "{refused:?}"
+        );
+    }
+
+    #[tokio::test]
+    async fn plain_hosted_pnpm_pin_is_not_refused() {
+        let tmp = project("pnpm-lock.yaml", HOSTED_V9);
+        let refused = pnpm_takeover_lock_text_refusals(tmp.path(), &[(PURL, UUID)]).await;
+        assert!(refused.is_empty(), "{refused:?}");
+    }
+
+    /// Only pnpm is predicted: a CRLF yarn classic lock over the same purl
+    /// yields nothing here (its restore rewrites the text the gates read).
+    #[tokio::test]
+    async fn yarn_classic_project_is_out_of_scope() {
+        let lock = "# yarn lockfile v1\r\n\r\n\r\nleft-pad@1.3.0:\r\n  version \"1.3.0\"\r\n  \
+            resolved \"https://registry.yarnpkg.com/left-pad/-/left-pad-1.3.0.tgz#abc\"\r\n";
+        let tmp = project("yarn.lock", lock);
+        let refused = pnpm_takeover_lock_text_refusals(tmp.path(), &[(PURL, UUID)]).await;
+        assert!(refused.is_empty(), "{refused:?}");
     }
 }
