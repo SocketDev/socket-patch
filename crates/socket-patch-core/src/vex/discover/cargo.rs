@@ -119,10 +119,11 @@ use super::{
     DIAG_REF_UNATTRIBUTABLE,
 };
 use crate::formats::cargo::{CargoLock, CopyClaim, LockedPackage};
+use crate::patch::redirect::generation::{hosted_pin_name, PIN_NAME_PREFIX};
 use crate::utils::digest::is_hex64_lower;
 use crate::vendor::cargo_config::{
     effective_config_rel, patch_entries, registry_definitions, CargoPatchEntry, CONFIG_LEGACY,
-    CONFIG_TOML, SOCKET_REGISTRY_PREFIX,
+    CONFIG_TOML,
 };
 use crate::vendor::cargo_manifest::{crates_io_url_alias_tables, is_crates_io_source};
 use crate::vendor::cargo_tag;
@@ -457,7 +458,7 @@ fn hosted_from_lock(
             );
             continue;
         };
-        let reg = format!("{SOCKET_REGISTRY_PREFIX}{uuid}");
+        let reg = hosted_pin_name(&uuid);
         if let Some(index) = definitions.get(&reg) {
             if source_uuid(ctx, index).as_deref() != Some(uuid.as_str()) {
                 out.diag(
@@ -555,7 +556,7 @@ fn unresolved_manifest_pins(
     let deps = dependency_entries(manifest);
     for (name, regs) in decls {
         for reg in regs.iter().flatten() {
-            if !reg.trim().starts_with(SOCKET_REGISTRY_PREFIX) {
+            if !reg.trim().starts_with(PIN_NAME_PREFIX) {
                 continue;
             }
             let Some(uuid) = socket_patch_name_uuid(reg, false) else {

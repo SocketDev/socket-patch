@@ -192,8 +192,9 @@ fn restore_pin(
              plugin configuration socket-patch did not write)"
         ));
     }
-    if text.contains(&generation::hosted_pin_name(uuid)) {
-        return Err(format!("pom.xml still names socket-patch-{uuid}"));
+    let name = generation::hosted_pin_name(uuid);
+    if text.contains(&name) {
+        return Err(format!("pom.xml still names {name}"));
     }
     Ok(text)
 }
@@ -261,7 +262,7 @@ pub(crate) async fn restore(
             for module in &module_poms {
                 if let Ok(Some(child)) = view.read(module).await {
                     if child.contains(&suffixed)
-                        || child.contains(&format!("socket-patch-{}", pin.uuid))
+                        || child.contains(&generation::hosted_pin_name(&pin.uuid))
                     {
                         in_module = Some(module.clone());
                         break;

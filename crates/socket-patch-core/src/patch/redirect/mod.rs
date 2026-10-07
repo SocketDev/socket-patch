@@ -2226,27 +2226,11 @@ fn is_valid_gem_index_url(url: &str) -> bool {
         && !url.chars().any(|c| c.is_control() || c == ' ')
 }
 
-/// The uuid of a Socket-owned registry / repository / source NAME in its
-/// EXACT grammar: `socket-patch-<canonical-uuid>`, or with `vendored`
-/// `socket-patch-vendor-<canonical-uuid>` (maven's vendored repository id).
-/// No trimming: the rewriter must never treat a user's padded pin as its
-/// own, while lockfile discovery trims at its call site
-/// (`vex::discover::socket_patch_name_uuid`).
-pub(crate) fn socket_patch_name_uuid_exact(name: &str, vendored: bool) -> Option<&str> {
-    let prefix = if vendored {
-        "socket-patch-vendor-"
-    } else {
-        "socket-patch-"
-    };
-    name.strip_prefix(prefix)
-        .filter(|uuid| crate::patch::path_safety::is_canonical_uuid(uuid))
-}
-
 /// A registry name THIS rewriter owns: `socket-patch-<canonical-uuid>`. An
 /// existing pin matching this grammar was written by a previous run and may be
 /// superseded in place; any other registry pin is the user's and is refused.
 fn is_socket_patch_registry_name(value: &str) -> bool {
-    socket_patch_name_uuid_exact(value, false).is_some()
+    generation::pin_name_uuid(value, false).is_some()
 }
 
 /// The `socket-patch-<uuid>` registry name pinning `crate_name` in this

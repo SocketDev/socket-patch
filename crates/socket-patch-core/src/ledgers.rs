@@ -29,10 +29,9 @@ use std::path::Path;
 use crate::manifest::schema::{PatchManifest, PatchRecord};
 use crate::patch::redirect::upstream::HostedPin;
 use crate::patch::redirect::{CorruptRedirectState, RedirectState};
-use crate::utils::composer_version::composer_purls_equivalent;
 use crate::utils::purl::{normalize_purl, patch_matches, strip_purl_qualifiers};
 use crate::vendor::{VendorEntry, VendorState};
-use crate::vex::discover::canonical_base_purl;
+use crate::vex::discover::{canonical_base_purl, same_release};
 
 /// A patch store, in owner-precedence order (a lower store wins a key).
 #[derive(Debug, Clone, Copy, PartialEq, Eq, PartialOrd, Ord, Hash)]
@@ -132,14 +131,6 @@ impl Matches {
     }
 }
 
-/// Whether a hosted pin's purl (canonical base, as lockfile discovery spells
-/// it) wires the same package release as the store key `key`: the same
-/// owned pin, whichever patch generation (uuid) each side recorded.
-pub fn same_release(key: &str, pin_purl: &str) -> bool {
-    let base = canonical_base_purl(key);
-    base == pin_purl || composer_purls_equivalent(&base, pin_purl)
-}
-
 /// The lockfiles' hosted pins a remove/rollback `identifier` selects,
 /// sorted by purl: every pin the identifier names by purl or uuid, plus
 /// every pin wiring the same release as one of `manifest_keys` (the
@@ -157,7 +148,9 @@ pub fn hosted_pins_matching(
         .iter()
         .filter(|pin| {
             patch_matches(&pin.purl, &pin.uuid, identifier)
-                || manifest_keys.iter().any(|key| same_release(key, &pin.purl))
+                || manifest_keys
+                    .iter()
+                    .any(|key| same_release(&canonical_base_purl(key), &pin.purl))
         })
         .cloned()
         .collect();
@@ -421,7 +414,6 @@ pub fn uuid_only_record(uuid: &str) -> PatchRecord {
         tier: String::new(),
     }
 }
-
 
 /// Fold the hosted pins and the vendor ledger's patch records into the
 /// manifest view update detection consults. Hosted mode records purl→uuid

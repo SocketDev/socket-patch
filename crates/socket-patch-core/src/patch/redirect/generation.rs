@@ -1,36 +1,65 @@
-//! Owned-pin generations: the one supersede policy every hosted writer and
-//! restore shares (audit B07).
+//! Owned-pin generations: the supersede policy the hosted writers and
+//! restores share (audit B07), and the one home of the `socket-patch-<uuid>`
+//! name grammar.
 //!
 //! A package release (ecosystem, name, version) has at most ONE live
 //! socket-owned pin. The patch uuid it carries is that pin's generation: a
 //! superseding patch, or the same patch republished, is a new generation of
 //! the same pin, never a second pin beside it. So:
 //!
-//! - a re-pin replaces the previous generation in place, and drops every
-//!   piece of wiring only that generation used (a cargo `[registries.…]`
-//!   block, a Go module's go.sum pair, a Maven `<repository>`), the way a
-//!   fresh pin would never have written it;
-//! - a restore (`remove` / `rollback`) unwinds every generation still wired,
-//!   including residue an older CLI left behind, not only the generation the
-//!   lockfile names today;
+//! - a hosted re-pin (cargo, Go, Maven) replaces the previous generation in
+//!   place, and drops every piece of wiring only that generation used (a
+//!   cargo `[registries.…]` block, a Go module's go.sum pair, a Maven
+//!   `<repository>` and its trusted checksums), the way a fresh pin would
+//!   never have written it;
+//! - the cargo restore (`remove` / `rollback`) also unwinds every
+//!   `[registries.socket-patch-<uuid>]` block nothing references any more,
+//!   including residue an older CLI left behind on re-pin. The Go and Maven
+//!   restores remove only the selected pins' wiring: residue an older CLI
+//!   left there (an old socket module's go.sum pair, a superseded
+//!   repository) is not swept yet;
 //! - matching a remove/rollback identifier across the stores treats a
 //!   manifest record, the vendored entry it claims and the hosted pin of the
 //!   same release as one owned pin ([`crate::ledgers::Ledgers::matching`],
 //!   [`crate::ledgers::hosted_pins_matching`]).
 //!
 //! Hosted writers name a generation's wiring `socket-patch-<uuid>` (a cargo
-//! registry, a Maven repository id, a NuGet source key); vendored mode's
-//! `socket-patch-vendor-<uuid>` names are a different owner and never match.
+//! registry, a Maven repository id, a NuGet source key). Vendored NuGet uses
+//! the same `socket-patch-<uuid>` source key for its local feed; vendored
+//! Maven's `socket-patch-vendor-<uuid>` repository id is a different grammar
+//! ([`pin_name_uuid`] with `vendored`), which [`named_generations`] never
+//! matches.
 
 use std::collections::BTreeSet;
 
 use crate::patch::path_safety::is_canonical_uuid;
 
-const PIN_NAME_PREFIX: &str = "socket-patch-";
+/// The prefix every Socket-owned registry / repository / source name
+/// carries: `socket-patch-<uuid>`.
+pub(crate) const PIN_NAME_PREFIX: &str = "socket-patch-";
+
+/// The prefix of vendored Maven's repository id: `socket-patch-vendor-<uuid>`.
+const VENDOR_PIN_NAME_PREFIX: &str = "socket-patch-vendor-";
 
 /// The name hosted mode gives a generation's wiring: `socket-patch-<uuid>`.
 pub(crate) fn hosted_pin_name(uuid: &str) -> String {
     format!("{PIN_NAME_PREFIX}{uuid}")
+}
+
+/// The uuid of a Socket-owned registry / repository / source NAME in its
+/// EXACT grammar: `socket-patch-<canonical-uuid>`, or with `vendored`
+/// `socket-patch-vendor-<canonical-uuid>` (maven's vendored repository id).
+/// No trimming: the rewriter must never treat a user's padded pin as its
+/// own, while lockfile discovery trims at its call site
+/// (`vex::discover::socket_patch_name_uuid`).
+pub(crate) fn pin_name_uuid(name: &str, vendored: bool) -> Option<&str> {
+    let prefix = if vendored {
+        VENDOR_PIN_NAME_PREFIX
+    } else {
+        PIN_NAME_PREFIX
+    };
+    name.strip_prefix(prefix)
+        .filter(|uuid| is_canonical_uuid(uuid))
 }
 
 /// Every generation (patch uuid) `text` names as `socket-patch-<uuid>`, in
@@ -88,6 +117,21 @@ mod tests {
         );
         assert_eq!(named_generations(&text), BTreeSet::from([A.to_string()]));
         assert_eq!(hosted_pin_name(A), format!("socket-patch-{A}"));
+    }
+
+    #[test]
+    fn pin_name_uuid_is_exact() {
+        assert_eq!(pin_name_uuid(&hosted_pin_name(A), false), Some(A));
+        assert_eq!(
+            pin_name_uuid(&format!("socket-patch-vendor-{A}"), true),
+            Some(A)
+        );
+        assert_eq!(
+            pin_name_uuid(&format!("socket-patch-vendor-{A}"), false),
+            None
+        );
+        assert_eq!(pin_name_uuid(&format!(" socket-patch-{A}"), false), None);
+        assert_eq!(pin_name_uuid(&format!("socket-patch-{A}x"), false), None);
     }
 
     #[test]
