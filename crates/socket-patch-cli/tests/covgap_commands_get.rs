@@ -97,7 +97,6 @@ fn default_args(identifier: &str, cwd: &Path) -> GetArgs {
             global: false,
             global_prefix: None,
             json: true,
-            download_mode: "diff".to_string(),
             ..socket_patch_cli::args::GlobalArgs::default()
         },
         identifier: identifier.to_string(),
@@ -292,7 +291,6 @@ fn engine_params(root: &Path) -> DownloadParams {
         global_prefix: None,
         json: true,
         silent: true,
-        download_mode: "diff".to_string(),
         strict: false,
         ecosystems: None,
         persist_blobs: true,

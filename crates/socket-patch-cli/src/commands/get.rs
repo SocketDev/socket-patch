@@ -1108,8 +1108,6 @@ pub struct DownloadParams {
     pub global_prefix: Option<PathBuf>,
     pub json: bool,
     pub silent: bool,
-    /// `--download-mode` value forwarded to the apply step.
-    pub download_mode: String,
     /// When `false` (the default — narrow), a release-variant package (PyPI
     /// `?artifact_id=`, RubyGems `?platform=`, Maven `?classifier=`) is
     /// filtered down to the variant(s) matching the locally-installed
@@ -2301,7 +2299,7 @@ async fn warn_on_vendored_uuid_drift(
 }
 
 /// The `GlobalArgs` a nested apply runs with: the caller's flags verbatim
-/// (`--verbose`, `--strict`, `--ecosystems`, `--download-mode` … all flow
+/// (`--verbose`, `--strict`, `--ecosystems` … all flow
 /// through; the API flags ride along but are inert — the nested apply runs
 /// on the caller's client), with the fields `get` owns overridden: the
 /// already-resolved manifest path (apply re-resolves a
@@ -2335,7 +2333,6 @@ fn nested_apply_args_from_params(
         cwd: params.cwd.clone(),
         global: params.global,
         global_prefix: params.global_prefix.clone(),
-        download_mode: params.download_mode.clone(),
         strict: params.strict,
         // Scope the nested apply like the caller was scoped: `None` would
         // apply the WHOLE manifest, mutating other ecosystems' packages the
@@ -2746,7 +2743,6 @@ pub async fn run(args: GetArgs) -> i32 {
         get_api_client_with_overrides(overrides.clone()).await;
     let telemetry_token = api_client.api_token().cloned();
     let telemetry_org = api_client.org_slug().cloned();
-    let download_mode = args.common.download_mode.clone();
     // Set to `true` after the first 401/403 from the authenticated
     // endpoint triggered a rebuild against the public proxy. Plumbed
     // through to every subsequent telemetry event so we can track the
@@ -2823,7 +2819,6 @@ pub async fn run(args: GetArgs) -> i32 {
                     &patch.uuid,
                     &patch.tier,
                     &ecosystem_from_purl(&patch.purl),
-                    &download_mode,
                     fallback_to_proxy,
                     telemetry_token.as_deref(),
                     telemetry_org.as_deref(),
@@ -3697,7 +3692,6 @@ fn get_download_params(args: &GetArgs, save_only: bool, persist_blobs: bool) -> 
         global_prefix: args.common.global_prefix.clone(),
         json: args.common.json,
         silent: args.common.silent,
-        download_mode: args.common.download_mode.clone(),
         all_releases: args.all_releases,
         strict: args.common.strict,
         ecosystems: args.common.ecosystems.clone(),
@@ -5355,7 +5349,6 @@ mod tests {
             global_prefix: None,
             json: true,
             silent: true,
-            download_mode: "diff".to_string(),
             all_releases: false,
             strict: false,
             ecosystems: None,
@@ -6005,7 +5998,6 @@ mod tests {
             global_prefix: None,
             json: true,
             silent: true,
-            download_mode: "diff".to_string(),
             all_releases: false,
             strict: false,
             ecosystems: None,
@@ -7036,7 +7028,6 @@ mod tests {
             nested.org.is_none() && nested.api_token.is_none(),
             "API fields are never threaded through params: the nested apply runs on the run's client"
         );
-        assert_eq!(nested.download_mode, "diff");
         assert!(nested.silent, "json || silent params run a quiet apply");
         assert!(!nested.json && !nested.dry_run);
     }

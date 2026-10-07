@@ -71,7 +71,6 @@ impl<'a> VendoredBackend<'a> {
         let blobs = req.socket_dir.join("blobs");
         let sources = socket_patch_core::patch::apply::PatchSources {
             blobs_path: &blobs,
-            diffs_path: None,
             mem_blobs: None,
         };
         let records = &req.manifest.patches;

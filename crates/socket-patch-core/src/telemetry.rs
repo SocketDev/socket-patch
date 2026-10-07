@@ -4,9 +4,7 @@ use once_cell::sync::Lazy;
 use uuid::Uuid;
 
 use crate::constants::USER_AGENT;
-use crate::utils::env_compat::{
-    is_debug_enabled, is_offline_env, proxy_url_from_env,
-};
+use crate::utils::env_compat::{is_debug_enabled, is_offline_env, proxy_url_from_env};
 use crate::utils::fs::home_dir;
 use crate::vex::time::unix_to_ymdhms;
 
@@ -733,14 +731,14 @@ pub fn spawn_patch_scan_failed(
     ));
 }
 
-/// Track a successful `get`. Reports patch identity + delivery mode and
-/// whether the call was downgraded to the public proxy after an
-/// auth-endpoint 401/403.
+/// Track a successful `get`. Reports patch identity and whether the call
+/// was downgraded to the public proxy after an auth-endpoint 401/403.
+/// `download_mode` is always `"file"`: v5 fetches patch content only as
+/// per-file blobs, and the field stays so the event schema is unchanged.
 pub async fn track_patch_fetched(
     uuid: &str,
     tier: &str,
     ecosystem: &str,
-    download_mode: &str,
     fallback_to_proxy: bool,
     api_token: Option<&str>,
     org_slug: Option<&str>,
@@ -752,7 +750,7 @@ pub async fn track_patch_fetched(
             "uuid": uuid,
             "tier": tier,
             "ecosystem": ecosystem,
-            "download_mode": download_mode,
+            "download_mode": "file",
             "fallback_to_proxy": fallback_to_proxy,
         }),
         None::<&str>,

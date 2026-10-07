@@ -2867,7 +2867,6 @@ async fn mount_gem_patch_api(mock: &wiremock::MockServer, patch_purl: &str) {
     )]);
     let sources = socket_patch_core::patch::apply::PatchSources {
         blobs_path: fx.root(),
-        diffs_path: None,
         mem_blobs: Some(&blobs),
     };
     prebuilt_common::mount_record(
@@ -3948,7 +3947,10 @@ snapshots:
             hosted_npmrc,
             "the hosted .npmrc must be untouched"
         );
-        assert!(!root.join(".socket/vendor/npm").exists(), "nothing is staged");
+        assert!(
+            !root.join(".socket/vendor/npm").exists(),
+            "nothing is staged"
+        );
     }
 
     /// Hosted → vendored over a linked `.socket/vendor/npm` (#664): the

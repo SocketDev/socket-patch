@@ -304,7 +304,6 @@ fn scan_args(tmp: &Path, api_url: String, all_releases: bool) -> ScanArgs {
             api_url: Some(api_url),
             api_token: Some("fake".to_string()),
             ecosystems: Some(vec!["pypi".to_string()]),
-            download_mode: "diff".to_string(),
             dry_run: false,
             ..socket_patch_cli::args::GlobalArgs::default()
         },

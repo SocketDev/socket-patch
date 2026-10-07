@@ -2172,7 +2172,6 @@ async fn apply_and_rollback_reach_every_pnpm_peer_variant_copy() {
 
     let sources = PatchSources {
         blobs_path: &blobs,
-        diffs_path: None,
         mem_blobs: None,
     };
     let result = apply_package_patch(
@@ -2180,7 +2179,6 @@ async fn apply_and_rollback_reach_every_pnpm_peer_variant_copy() {
         &primary,
         &files,
         &sources,
-        None,
         false,
         MismatchPolicy::Warn,
     )
@@ -2281,7 +2279,6 @@ async fn apply_heals_unpatched_pnpm_twin_when_primary_already_patched() {
     );
     let sources = PatchSources {
         blobs_path: &blobs,
-        diffs_path: None,
         mem_blobs: None,
     };
     let result = apply_package_patch(
@@ -2289,7 +2286,6 @@ async fn apply_heals_unpatched_pnpm_twin_when_primary_already_patched() {
         &nm.join("foo"),
         &files,
         &sources,
-        None,
         false,
         MismatchPolicy::Warn,
     )
@@ -3239,7 +3235,6 @@ async fn vlt_apply(
     use socket_patch_core::patch::apply::{apply_package_patch, MismatchPolicy, PatchSources};
     let sources = PatchSources {
         blobs_path: &patch.blobs,
-        diffs_path: None,
         mem_blobs: None,
     };
     apply_package_patch(
@@ -3247,7 +3242,6 @@ async fn vlt_apply(
         primary,
         &patch.files,
         &sources,
-        None,
         false,
         MismatchPolicy::Warn,
     )

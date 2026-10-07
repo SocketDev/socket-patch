@@ -40,7 +40,6 @@ fn common(cwd: &Path, server: &MockServer) -> socket_patch_cli::args::GlobalArgs
         yes: true,
         api_token: Some("fake".to_string()),
         api_url: Some(server.uri()),
-        download_mode: "diff".to_string(),
         ..socket_patch_cli::args::GlobalArgs::default()
     }
 }

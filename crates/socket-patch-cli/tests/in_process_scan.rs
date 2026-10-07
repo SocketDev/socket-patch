@@ -74,7 +74,6 @@ fn default_args(cwd: &Path) -> ScanArgs {
             global_prefix: None,
             api_token: Some("fake".to_string()),
             ecosystems: None,
-            download_mode: "diff".to_string(),
             dry_run: false,
             ..socket_patch_cli::args::GlobalArgs::default()
         },

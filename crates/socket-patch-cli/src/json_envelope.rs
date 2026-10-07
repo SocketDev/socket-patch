@@ -346,11 +346,11 @@ pub enum PatchAction {
 
 /// Patch-source strategy used to apply a file. Mirrors the existing
 /// `socket_patch_core::patch::apply::AppliedVia` enum, but lives here so
-/// the JSON layer doesn't depend on core internals.
+/// the JSON layer doesn't depend on core internals. `blob` is the only
+/// value since v5 removed the diff download path.
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize)]
 #[serde(rename_all = "camelCase")]
 pub enum AppliedVia {
-    Diff,
     Blob,
 }
 
@@ -358,7 +358,6 @@ impl AppliedVia {
     pub fn from_core(via: socket_patch_core::patch::apply::AppliedVia) -> Self {
         use socket_patch_core::patch::apply::AppliedVia as Core;
         match via {
-            Core::Diff => AppliedVia::Diff,
             Core::Blob => AppliedVia::Blob,
         }
     }
@@ -620,7 +619,7 @@ mod tests {
                 PatchEventFile {
                     path: "package/index.js".into(),
                     verified: true,
-                    applied_via: Some(AppliedVia::Diff),
+                    applied_via: Some(AppliedVia::Blob),
                 },
                 PatchEventFile {
                     path: "package/lib/util.js".into(),
@@ -634,7 +633,7 @@ mod tests {
         assert_eq!(files.len(), 2);
         assert_eq!(files[0]["path"], "package/index.js");
         assert_eq!(files[0]["verified"], true);
-        assert_eq!(files[0]["appliedVia"], "diff");
+        assert_eq!(files[0]["appliedVia"], "blob");
         assert_eq!(files[1]["appliedVia"], "blob");
     }
 

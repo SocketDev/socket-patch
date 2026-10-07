@@ -176,9 +176,9 @@ pub async fn hold_back_debug<T>(fut: impl std::future::Future<Output = T>) -> He
     HeldBack { value, debug }
 }
 
-/// The body of a 200 blob or diff response, read chunk by chunk.
+/// The body of a 200 blob response, read chunk by chunk.
 ///
-/// [`ApiClient::fetch_blob`] / [`ApiClient::fetch_diff`] return this instead
+/// [`ApiClient::fetch_blob`] returns this instead
 /// of the whole body so a large patch artifact streams to disk without being
 /// held in memory (#571). The per-read idle bound of [`ApiTimeouts`] applies
 /// to every chunk.
@@ -228,7 +228,7 @@ pub struct ApiClient {
     /// Header-free twin of `client` (User-Agent only, never Authorization)
     /// for the public-proxy and grant-tokenized serve requests, where
     /// sending the Socket bearer would leak it to a third party. Built once
-    /// here so every blob/diff/tarball download shares one connection pool
+    /// here so every blob/tarball download shares one connection pool
     /// instead of paying a fresh TLS-config build + handshake per request.
     plain: reqwest::Client,
     api_url: String,
@@ -1048,24 +1048,8 @@ impl ApiClient {
         self.fetch_binary("blob", hash).await
     }
 
-    /// Fetch a per-file diff archive (tar.gz of bsdiff deltas) by patch UUID.
-    ///
-    /// Returns the archive body as a [`BinaryBody`] stream, or `Ok(None)` if
-    /// not found (404). The public proxy serves these under
-    /// `/patch/diff/<uuid>`; the authenticated API serves them under
-    /// `/v0/orgs/<slug>/patches/diff/<uuid>`.
-    pub async fn fetch_diff(&self, uuid: &str) -> Result<Option<BinaryBody>, ApiError> {
-        if !is_valid_uuid(uuid) {
-            return Err(ApiError::InvalidHash(format!(
-                "Invalid patch UUID: {}",
-                uuid
-            )));
-        }
-        self.fetch_binary("diff", uuid).await
-    }
-
     /// Build the URL (and an `is_authenticated` flag) for a binary fetch of
-    /// `kind` (`blob` / `diff`) identified by `identifier`.
+    /// `kind` (the URL segment, e.g. `blob`) identified by `identifier`.
     ///
     /// Uses the authenticated `/v0/orgs/<slug>/patches/...` endpoint when a
     /// token and org slug are configured (and we're not pinned to the public
@@ -1104,10 +1088,10 @@ impl ApiClient {
         }
     }
 
-    /// Shared implementation for `fetch_blob` / `fetch_diff`.
+    /// Transport behind `fetch_blob`.
     ///
-    /// `kind` is the URL segment (`blob` / `diff`), doubling as the
-    /// noun in log + error messages. `identifier` is the hash or UUID
+    /// `kind` is the URL segment (`blob`), doubling as the
+    /// noun in log + error messages. `identifier` is the hash
     /// interpolated into the URL. A 200 returns the unread body: callers
     /// stream it to disk instead of buffering it whole.
     async fn fetch_binary(
@@ -1150,8 +1134,8 @@ impl ApiClient {
             return Ok(None);
         }
         // Classify 401/403/429 identically to the JSON transport path
-        // (`handle_json_response`). Without this an authenticated blob/diff/
-        // package fetch that 401s/403s would surface as `ApiError::Other`,
+        // (`handle_json_response`). Without this an authenticated blob
+        // fetch that 401s/403s would surface as `ApiError::Other`,
         // which `is_fallback_candidate` ignores — silently disabling the
         // auth→proxy fallback for binary downloads. `use_auth` is the
         // authenticated-endpoint flag, so `!use_auth` is the proxy case that
@@ -3230,8 +3214,7 @@ mod tests {
     /// `fetch_blob` must reject a malformed hash *before* any network I/O:
     /// the client points at a closed port, so a regression that bypasses the
     /// `is_hex(hash, 64)` guard surfaces as `ApiError::Network` instead
-    /// of `InvalidHash` (mirrors `invalid_uuid_is_failed_without_network`;
-    /// `fetch_diff`'s twin guard is already covered).
+    /// of `InvalidHash` (mirrors `invalid_uuid_is_failed_without_network`).
     #[tokio::test]
     async fn fetch_blob_invalid_hash_rejected_without_network() {
         let client = ApiClient::new(ApiClientOptions {
@@ -3683,21 +3666,6 @@ mod tests {
         assert!(!is_valid_uuid("80630680xxxxx"));
     }
 
-    // ── fetch_diff validation tests ──────────────────────────────────
-    //
-    // These tests cover input validation only — they intentionally do
-    // NOT hit the network. The shared `fetch_binary` helper handles the
-    // transport, and `fetch_blob` already has integration coverage via
-    // the e2e_npm test.
-
-    #[tokio::test]
-    async fn test_fetch_diff_rejects_invalid_uuid() {
-        std::env::remove_var("SOCKET_API_TOKEN");
-        let (client, _) = get_api_client_from_env(None).await;
-        let result = client.fetch_diff("not-a-uuid").await;
-        assert!(matches!(result, Err(ApiError::InvalidHash(_))));
-    }
-
     // ── Token shape validation ─────────────────────────────────────────
 
     #[test]
@@ -3865,7 +3833,7 @@ mod tests {
     // ── classify_auth_error: shared 401/403/429 classification ──────────
     //
     // Both transport paths (including `fetch_binary`) route through this
-    // shared classifier, so an authenticated blob/diff/package fetch that
+    // shared classifier, so an authenticated blob fetch that
     // 401s/403s is recognized by `is_fallback_candidate` and the auth→proxy
     // fallback fires. These pin its contract directly.
 
@@ -4010,7 +3978,7 @@ mod tests {
         assert!(!looks_like_token_hash(""));
     }
 
-    // ── binary_url: proxy override must reach blob/diff/package fetches ──
+    // ── binary_url: proxy override must reach blob fetches ──
     //
     // `fetch_binary` must use the client's configured `api_url`, not
     // re-derive the proxy base from `SOCKET_PROXY_URL`/default, so a
@@ -4035,15 +4003,6 @@ mod tests {
     }
 
     #[test]
-    fn binary_url_proxy_covers_diff() {
-        let client = proxy_client("https://custom.proxy.example");
-        assert_eq!(
-            client.binary_url("diff", "uuid-1").0,
-            "https://custom.proxy.example/patch/diff/uuid-1"
-        );
-    }
-
-    #[test]
     fn binary_url_proxy_trims_trailing_slash() {
         // `new()` trims the trailing slash on api_url; binary_url also trims
         // defensively so the path never ends up with a doubled separator.
@@ -4062,11 +4021,11 @@ mod tests {
             use_public_proxy: false,
             org_slug: Some("my-org".into()),
         });
-        let (url, use_auth) = client.binary_url("diff", "uuid-123");
+        let (url, use_auth) = client.binary_url("blob", "deadbeef");
         assert!(use_auth);
         assert_eq!(
             url,
-            "https://api.socket.dev/v0/orgs/my-org/patches/diff/uuid-123"
+            "https://api.socket.dev/v0/orgs/my-org/patches/blob/deadbeef"
         );
     }
 

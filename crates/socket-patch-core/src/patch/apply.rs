@@ -6,9 +6,7 @@ use std::path::PathBuf;
 
 use crate::hash::git_sha256::compute_git_sha256_from_bytes;
 use crate::manifest::schema::PatchFileInfo;
-use crate::patch::diff::apply_diff;
 use crate::patch::file_hash::compute_file_git_sha256;
-use crate::patch::package::read_archive_filtered;
 use crate::utils::fs::read_regular_to_bytes;
 
 /// Status of a file patch verification.
@@ -39,9 +37,8 @@ pub struct VerifyResult {
 /// NEITHER `beforeHash` nor `afterHash` (and a pre-existing file that is
 /// missing).
 ///
-/// Mismatch tolerance is safe content-wise in every mode: the diff
-/// strategy self-disables on a wrong base, and the archive/blob
-/// strategies verify their bytes hash to exactly `afterHash` BEFORE any
+/// Mismatch tolerance is safe content-wise in every mode: the blob
+/// source verifies its bytes hash to exactly `afterHash` BEFORE any
 /// write — a tolerated mismatch is overwritten with the verified patched
 /// content or fails, never silently corrupted. What tolerance can do is
 /// discard local modifications to the dependency file, which is why
@@ -62,12 +59,13 @@ pub enum MismatchPolicy {
 }
 
 /// Which patch source actually wrote the patched bytes for a file.
+///
+/// Per-file blobs are the only source since v5 removed the diff download
+/// path; the type stays so the `appliedVia` JSON key keeps its shape.
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub enum AppliedVia {
-    /// Bytes were produced by applying a bsdiff delta from
-    /// `.socket/diffs/<uuid>.tar.gz`.
-    Diff,
-    /// Bytes came from a per-file blob in `.socket/blobs/`.
+    /// Bytes came from a per-file blob (`.socket/blobs/` or the in-memory
+    /// overlay).
     Blob,
 }
 
@@ -75,7 +73,6 @@ impl AppliedVia {
     /// Short lowercase tag, suitable for JSON and human output.
     pub fn as_tag(&self) -> &'static str {
         match self {
-            AppliedVia::Diff => "diff",
             AppliedVia::Blob => "blob",
         }
     }
@@ -83,12 +80,10 @@ impl AppliedVia {
 
 /// Patch sources the apply pipeline may use to obtain patched bytes.
 ///
-/// `blobs_path` is always required and serves as the universal fallback.
-/// `diffs_path` is an optional opt-in.
+/// `blobs_path` is always required; `mem_blobs` is consulted first.
 #[derive(Debug, Clone, Copy)]
 pub struct PatchSources<'a> {
     pub blobs_path: &'a Path,
-    pub diffs_path: Option<&'a Path>,
     /// In-memory blob overlay (`afterHash` → patched bytes), consulted
     /// BEFORE the on-disk blob dir. The vendor flows stage their patch
     /// content here so vendoring writes no `.socket/blobs` entries and no
@@ -97,14 +92,13 @@ pub struct PatchSources<'a> {
 }
 
 impl<'a> PatchSources<'a> {
-    /// Construct a `PatchSources` that only knows about the legacy
+    /// Construct a `PatchSources` that only knows about the on-disk
     /// per-file blob directory. All remaining callers are same-crate
     /// tests, hence the `cfg(test)` gate.
     #[cfg(test)]
     pub(crate) fn blobs_only(blobs_path: &'a Path) -> Self {
         Self {
             blobs_path,
-            diffs_path: None,
             mem_blobs: None,
         }
     }
@@ -761,13 +755,9 @@ async fn chown_blocking(
 ///
 /// For each file in `files`, this function:
 /// 1. Verifies the file is ready to be patched (or already patched).
-/// 2. If not dry_run, tries patch sources in order: diff archive →
-///    per-file blob. The diff strategy is opt-in via `sources`.
+/// 2. If not dry_run, writes each file's patched bytes from its per-file
+///    blob (`sources`), verified against `afterHash`.
 /// 3. Returns a summary of what happened.
-///
-/// `uuid` is the patch UUID. Pass `Some` to enable diff-archive lookup
-/// (`sources.diffs_path` must also be set). Pass `None` to restrict the
-/// pipeline to per-file blobs only.
 ///
 /// For npm packages, one on-disk `pkg_path` is not necessarily the only
 /// physical home of `package@version`: pnpm and vlt materialize a separate
@@ -790,12 +780,11 @@ pub async fn apply_package_patch(
     pkg_path: &Path,
     files: &HashMap<String, PatchFileInfo>,
     sources: &PatchSources<'_>,
-    uuid: Option<&str>,
     dry_run: bool,
     policy: MismatchPolicy,
 ) -> ApplyResult {
     crate::patch::store_copies::fan_out(package_key, pkg_path, |path| async move {
-        apply_package_patch_at(package_key, &path, files, sources, uuid, dry_run, policy).await
+        apply_package_patch_at(package_key, &path, files, sources, dry_run, policy).await
     })
     .await
 }
@@ -848,7 +837,6 @@ async fn apply_package_patch_at(
     pkg_path: &Path,
     files: &HashMap<String, PatchFileInfo>,
     sources: &PatchSources<'_>,
-    uuid: Option<&str>,
     dry_run: bool,
     policy: MismatchPolicy,
 ) -> ApplyResult {
@@ -900,8 +888,7 @@ async fn apply_package_patch_at(
                 // Mismatch tolerated (default + force): promote to Ready.
                 // The promoted result KEEPS `expected_hash`/`current_hash`
                 // — the signature callers use to surface the warning. The
-                // diff strategy self-disables on the wrong base; the
-                // archive/blob strategies are hash-gated to afterHash.
+                // blob source is hash-gated to afterHash.
                 (VerifyStatus::HashMismatch, MismatchPolicy::Warn | MismatchPolicy::Force) => {
                     verify_result.status = VerifyStatus::Ready;
                 }
@@ -1006,13 +993,6 @@ async fn apply_package_patch_at(
         None
     };
 
-    // Eagerly load the diff archive (if any) into memory so we don't
-    // reparse the tar.gz once per file.
-    let diff_entries = match (uuid, sources.diffs_path) {
-        (Some(uuid), Some(dir)) => load_archive_if_present(dir, uuid, files).await,
-        _ => None,
-    };
-
     // Advisory notes from writes that committed but could not fully restore
     // metadata (see `apply_file_patch_at`); reported on `error` alongside
     // `success` — the success-with-note shape the `--force` skip uses.
@@ -1029,44 +1009,26 @@ async fn apply_package_patch_at(
 
         let normalized = normalize_file_path(file_name);
 
-        // Resolve the patched bytes from the first applicable source, in
-        // order: per-file diff → in-memory blob overlay
-        // (the vendor flows stage there, so vendoring writes no
-        // `.socket/blobs` entries) → on-disk blob. A diff candidate is
-        // applicable only when its product hashes to `afterHash`; a
-        // stale or corrupt entry falls through, it is not an error. The
-        // blob is the universal fallback: failing to read it fails the
-        // file. The diff needs the pre-apply on-disk hash that
-        // `verify_file_patch` captured — under `--force` a HashMismatch is
-        // promoted to Ready but `current_hash` keeps the real value, so
-        // the diff still bails instead of producing garbage.
-        let current_hash = verify_result.and_then(|v| v.current_hash.as_deref());
-        let (patched_content, via): (Cow<'_, [u8]>, AppliedVia) = if let Some(bytes) =
-            resolve_from_diff(
-                diff_entries.as_ref(),
-                normalized,
-                pkg_path,
-                file_info,
-                current_hash,
-            )
-            .await
-        {
-            (Cow::Owned(bytes), AppliedVia::Diff)
-        } else if let Some(bytes) = sources.mem_blobs.and_then(|m| m.get(&file_info.after_hash)) {
-            (Cow::Borrowed(bytes.as_slice()), AppliedVia::Blob)
-        } else {
-            match read_blob(sources.blobs_path, &file_info.after_hash).await {
-                Ok(bytes) => (Cow::Owned(bytes), AppliedVia::Blob),
-                Err(msg) => {
-                    result.error = Some(msg);
-                    return result;
+        // Resolve the patched bytes: the in-memory blob overlay first (the
+        // vendor flows stage there, so vendoring writes no `.socket/blobs`
+        // entries), then the on-disk blob. Failing to read the blob fails
+        // the file.
+        let (patched_content, via): (Cow<'_, [u8]>, AppliedVia) =
+            if let Some(bytes) = sources.mem_blobs.and_then(|m| m.get(&file_info.after_hash)) {
+                (Cow::Borrowed(bytes.as_slice()), AppliedVia::Blob)
+            } else {
+                match read_blob(sources.blobs_path, &file_info.after_hash).await {
+                    Ok(bytes) => (Cow::Owned(bytes), AppliedVia::Blob),
+                    Err(msg) => {
+                        result.error = Some(msg);
+                        return result;
+                    }
                 }
-            }
-        };
+            };
 
         // ONE write site for every source, so a write failure (EACCES on
-        // the stage, ENOSPC, a failed rename) is reported as what it is
-        // instead of masquerading as the next source's miss. Single copy:
+        // the stage, ENOSPC, a failed rename) is reported as what it is.
+        // Single copy:
         // the public `apply_package_patch` wrapper fans out to pnpm
         // peer-variant copies itself, with per-copy verification.
         match apply_file_patch_at(pkg_path, file_name, &patched_content, &file_info.after_hash)
@@ -1145,32 +1107,7 @@ async fn apply_package_patch_at(
     result
 }
 
-/// Strategy 1 — per-file diff: apply the bsdiff delta for
-/// `normalized_path` to the on-disk file and return the product. Not
-/// applicable (`None`) when there is no delta, the entry is a new file
-/// (nothing to diff against), `current_hash` is missing or is not the
-/// `beforeHash` the delta was authored against — the strong gate: `--force`
-/// promotes a HashMismatch to Ready but the captured on-disk hash is still
-/// the real one — or the read, the delta or the product hash fails.
-async fn resolve_from_diff(
-    diff_entries: Option<&HashMap<String, Vec<u8>>>,
-    normalized_path: &str,
-    pkg_path: &Path,
-    file_info: &PatchFileInfo,
-    current_hash: Option<&str>,
-) -> Option<Vec<u8>> {
-    let delta = diff_entries?.get(normalized_path)?;
-    if file_info.before_hash.is_empty() || current_hash != Some(file_info.before_hash.as_str()) {
-        return None;
-    }
-    let before_bytes = read_regular_to_bytes(&pkg_path.join(normalized_path))
-        .await
-        .ok()?;
-    let patched = apply_diff(&before_bytes, delta).ok()?;
-    (compute_git_sha256_from_bytes(&patched) == file_info.after_hash).then_some(patched)
-}
-
-/// Strategy 2 (on-disk half) — read `blobs_path/<hash>` fail-closed.
+/// The on-disk blob source — read `blobs_path/<hash>` fail-closed.
 ///
 /// SECURITY: `hash` comes from a committed `.socket/manifest.json` that the
 /// CI `apply` step applies without user action, so it is validated as a blob
@@ -1209,46 +1146,6 @@ pub(crate) async fn read_blob_entry(blob_path: &Path) -> std::io::Result<Vec<u8>
         ));
     }
     read_regular_to_bytes(blob_path).await
-}
-
-/// True when a manifest `uuid` is safe to use as the archive file stem: a
-/// non-empty run of ASCII alphanumerics, `-` and `_`. Every real
-/// `xxxxxxxx-xxxx-…` patch id passes; a separator, `.`, NUL or anything
-/// else that could change the joined path is refused.
-fn is_safe_archive_uuid(uuid: &str) -> bool {
-    !uuid.is_empty()
-        && uuid
-            .bytes()
-            .all(|b| b.is_ascii_alphanumeric() || b == b'-' || b == b'_')
-}
-
-/// Open `<dir>/<uuid>.tar.gz` (if it exists) and return its entries
-/// filtered to the patched files in `files`. Errors and missing files
-/// both yield `None` so the caller silently falls through to the next
-/// strategy. SECURITY: `uuid` comes from the committed manifest and is
-/// used as a path component — anything but a plain single path segment
-/// (`../../x`, an absolute path) is treated as "no archive", never joined.
-async fn load_archive_if_present(
-    dir: &Path,
-    uuid: &str,
-    files: &HashMap<String, PatchFileInfo>,
-) -> Option<HashMap<String, Vec<u8>>> {
-    if !is_safe_archive_uuid(uuid) {
-        return None;
-    }
-    let archive_path = dir.join(format!("{uuid}.tar.gz"));
-    if tokio::fs::metadata(&archive_path).await.is_err() {
-        return None;
-    }
-    // `read_archive_filtered` is synchronous (tar + flate2 are sync). Run
-    // it on the blocking pool so we don't stall the executor for large
-    // archives.
-    let archive_path_owned = archive_path.clone();
-    let files_owned = files.clone();
-    tokio::task::spawn_blocking(move || read_archive_filtered(&archive_path_owned, &files_owned))
-        .await
-        .ok()
-        .and_then(|r| r.ok())
 }
 
 #[cfg(test)]
@@ -1864,7 +1761,6 @@ mod tests {
             pkg_dir.path(),
             &files,
             &PatchSources::blobs_only(blobs_dir.path()),
-            None,
             false,
             MismatchPolicy::Warn,
         )
@@ -1916,7 +1812,6 @@ mod tests {
             pkg_dir.path(),
             &files,
             &PatchSources::blobs_only(blobs_dir.path()),
-            None,
             false,
             MismatchPolicy::Warn,
         )
@@ -1953,7 +1848,6 @@ mod tests {
             pkg_dir.path(),
             &files,
             &PatchSources::blobs_only(blobs_dir.path()),
-            None,
             true,
             MismatchPolicy::Warn,
         )
@@ -1995,7 +1889,6 @@ mod tests {
             pkg_dir.path(),
             &files,
             &PatchSources::blobs_only(blobs_dir.path()),
-            None,
             false,
             MismatchPolicy::Warn,
         )
@@ -2028,7 +1921,6 @@ mod tests {
             pkg_dir.path(),
             &files,
             &PatchSources::blobs_only(blobs_dir.path()),
-            None,
             false,
             MismatchPolicy::Warn,
         )
@@ -2073,7 +1965,6 @@ mod tests {
                 pkg_dir.path(),
                 &files,
                 &PatchSources::blobs_only(blobs_dir.path()),
-                None,
                 false,
                 policy,
             )
@@ -2104,7 +1995,6 @@ mod tests {
             pkg_dir.path(),
             &files,
             &PatchSources::blobs_only(blobs_dir.path()),
-            None,
             false,
             MismatchPolicy::Strict,
         )
@@ -2131,7 +2021,6 @@ mod tests {
                 pkg_dir.path(),
                 &files,
                 &PatchSources::blobs_only(blobs_dir.path()),
-                None,
                 false,
                 policy,
             )
@@ -2160,7 +2049,6 @@ mod tests {
             pkg_dir.path(),
             &files,
             &PatchSources::blobs_only(blobs_dir.path()),
-            None,
             false,
             MismatchPolicy::Warn,
         )
@@ -2173,7 +2061,6 @@ mod tests {
             pkg_dir.path(),
             &files,
             &PatchSources::blobs_only(blobs_dir.path()),
-            None,
             false,
             MismatchPolicy::Force,
         )
@@ -2203,7 +2090,6 @@ mod tests {
             pkg_dir.path(),
             &files,
             &PatchSources::blobs_only(blobs_dir.path()),
-            None,
             true,
             MismatchPolicy::Warn,
         )
@@ -2222,80 +2108,31 @@ mod tests {
         );
     }
 
-    // ── Fallback-chain tests ─────────────────────────────────────────
-    //
-    // Tests below exercise the per-file diff archive
-    // (.socket/diffs/<uuid>.tar.gz) and the priority order diff → blob.
-
-    use flate2::write::GzEncoder;
-    use flate2::Compression as GzCompression;
-    use qbsdiff::Bsdiff;
-
-    const TEST_UUID: &str = "11111111-1111-4111-8111-111111111111";
-
-    /// Write a tar.gz archive at `<dir>/<uuid>.tar.gz` containing the
-    /// given (entry name → bytes) pairs.
-    fn write_uuid_archive(dir: &Path, uuid: &str, entries: &[(&str, &[u8])]) {
-        let archive_path = dir.join(format!("{uuid}.tar.gz"));
-        let file = std::fs::File::create(&archive_path).unwrap();
-        let gz = GzEncoder::new(file, GzCompression::default());
-        let mut builder = tar::Builder::new(gz);
-        for (name, data) in entries {
-            let mut header = tar::Header::new_gnu();
-            header.set_size(data.len() as u64);
-            header.set_mode(0o644);
-            header.set_cksum();
-            builder.append_data(&mut header, name, *data).unwrap();
-        }
-        builder.into_inner().unwrap().finish().unwrap();
-    }
-
-    fn make_delta(before: &[u8], after: &[u8]) -> Vec<u8> {
-        let mut delta = Vec::new();
-        Bsdiff::new(before, after)
-            .compare(std::io::Cursor::new(&mut delta))
-            .unwrap();
-        delta
-    }
-
-    /// Returns a fully-populated two-source fixture: original file on
-    /// disk, both (diff, blob) available with valid patched content.
-    /// Caller can then delete sources to test fallback.
+    /// A blob-only fixture: the original file on disk and its patched
+    /// content staged as a per-file blob.
     async fn make_fixture() -> (
-        tempfile::TempDir,  // root holding pkg/, blobs/, diffs/
+        tempfile::TempDir,  // root holding pkg/ and blobs/
         std::path::PathBuf, // pkg dir
         std::path::PathBuf, // blobs dir
-        std::path::PathBuf, // diffs dir
         HashMap<String, PatchFileInfo>,
         Vec<u8>, // original bytes
-        Vec<u8>, // patched bytes
     ) {
         let root = tempfile::tempdir().unwrap();
         let pkg_dir = root.path().join("pkg");
         let blobs_dir = root.path().join("blobs");
-        let diffs_dir = root.path().join("diffs");
         tokio::fs::create_dir_all(&pkg_dir).await.unwrap();
         tokio::fs::create_dir_all(&blobs_dir).await.unwrap();
-        tokio::fs::create_dir_all(&diffs_dir).await.unwrap();
 
         let original: Vec<u8> = b"the original content of the file".to_vec();
         let patched: Vec<u8> = b"the PATCHED content of the file!".to_vec();
         let before_hash = compute_git_sha256_from_bytes(&original);
         let after_hash = compute_git_sha256_from_bytes(&patched);
-
-        // On-disk file at pkg/index.js
         tokio::fs::write(pkg_dir.join("index.js"), &original)
             .await
             .unwrap();
-
-        // Per-file blob at blobs/<after_hash>
         tokio::fs::write(blobs_dir.join(&after_hash), &patched)
             .await
             .unwrap();
-
-        // Diff archive containing bsdiff(original -> patched)
-        let delta = make_delta(&original, &patched);
-        write_uuid_archive(&diffs_dir, TEST_UUID, &[("index.js", &delta)]);
 
         let mut files = HashMap::new();
         files.insert(
@@ -2305,157 +2142,7 @@ mod tests {
                 after_hash,
             },
         );
-
-        (
-            root, pkg_dir, blobs_dir, diffs_dir, files, original, patched,
-        )
-    }
-
-    #[tokio::test]
-    async fn test_apply_via_diff_when_archive_present() {
-        let (_root, pkg_dir, blobs_dir, diffs_dir, files, _orig, patched) = make_fixture().await;
-
-        let sources = PatchSources {
-            blobs_path: &blobs_dir,
-            diffs_path: Some(&diffs_dir),
-            mem_blobs: None,
-        };
-        let result = apply_package_patch(
-            "pkg:npm/x@1.0.0",
-            &pkg_dir,
-            &files,
-            &sources,
-            Some(TEST_UUID),
-            false,
-            MismatchPolicy::Warn,
-        )
-        .await;
-
-        assert!(result.success, "expected success: {:?}", result.error);
-        assert_eq!(result.applied_via.get("index.js"), Some(&AppliedVia::Diff));
-        let written = tokio::fs::read(pkg_dir.join("index.js")).await.unwrap();
-        assert_eq!(written, patched);
-    }
-
-    #[tokio::test]
-    async fn test_apply_falls_back_to_blob_when_no_archives() {
-        let (_root, pkg_dir, blobs_dir, diffs_dir, files, _orig, patched) = make_fixture().await;
-        // Delete the diff archive.
-        tokio::fs::remove_file(diffs_dir.join(format!("{TEST_UUID}.tar.gz")))
-            .await
-            .unwrap();
-
-        let sources = PatchSources {
-            blobs_path: &blobs_dir,
-            diffs_path: Some(&diffs_dir),
-            mem_blobs: None,
-        };
-        let result = apply_package_patch(
-            "pkg:npm/x@1.0.0",
-            &pkg_dir,
-            &files,
-            &sources,
-            Some(TEST_UUID),
-            false,
-            MismatchPolicy::Warn,
-        )
-        .await;
-
-        assert!(result.success);
-        assert_eq!(result.applied_via.get("index.js"), Some(&AppliedVia::Blob));
-        let written = tokio::fs::read(pkg_dir.join("index.js")).await.unwrap();
-        assert_eq!(written, patched);
-    }
-
-    #[tokio::test]
-    async fn test_apply_uuid_none_disables_alt_sources() {
-        // Even if archives exist, passing `uuid = None` must restrict the
-        // pipeline to the blob path.
-        let (_root, pkg_dir, blobs_dir, diffs_dir, files, _orig, _patched) = make_fixture().await;
-
-        let sources = PatchSources {
-            blobs_path: &blobs_dir,
-            diffs_path: Some(&diffs_dir),
-            mem_blobs: None,
-        };
-        let result = apply_package_patch(
-            "pkg:npm/x@1.0.0",
-            &pkg_dir,
-            &files,
-            &sources,
-            None,
-            false,
-            MismatchPolicy::Warn,
-        )
-        .await;
-
-        assert!(result.success);
-        assert_eq!(result.applied_via.get("index.js"), Some(&AppliedVia::Blob));
-    }
-
-    #[tokio::test]
-    async fn test_apply_via_diff_falls_through_when_before_hash_mismatch() {
-        // Corrupt the on-disk file so its hash no longer matches
-        // before_hash. Diff strategy must NOT run (its output would never
-        // match after_hash), so we fall through to the blob.
-        let (_root, pkg_dir, blobs_dir, diffs_dir, files, _orig, patched) = make_fixture().await;
-        // Overwrite on-disk content with garbage; use --force so verify
-        // promotes the HashMismatch to Ready and the pipeline still tries
-        // to apply.
-        tokio::fs::write(pkg_dir.join("index.js"), b"garbage")
-            .await
-            .unwrap();
-
-        let sources = PatchSources {
-            blobs_path: &blobs_dir,
-            diffs_path: Some(&diffs_dir),
-            mem_blobs: None,
-        };
-        let result = apply_package_patch(
-            "pkg:npm/x@1.0.0",
-            &pkg_dir,
-            &files,
-            &sources,
-            Some(TEST_UUID),
-            false,
-            MismatchPolicy::Force,
-        )
-        .await;
-
-        assert!(result.success);
-        // Diff would produce wrong output → strategy skipped → blob writes.
-        assert_eq!(result.applied_via.get("index.js"), Some(&AppliedVia::Blob));
-        let written = tokio::fs::read(pkg_dir.join("index.js")).await.unwrap();
-        assert_eq!(written, patched);
-    }
-
-    #[tokio::test]
-    async fn test_apply_dry_run_does_not_touch_alternative_sources() {
-        // Even with a diff archive present, dry-run must not modify
-        // files on disk.
-        let (_root, pkg_dir, blobs_dir, diffs_dir, files, original, _patched) =
-            make_fixture().await;
-
-        let sources = PatchSources {
-            blobs_path: &blobs_dir,
-            diffs_path: Some(&diffs_dir),
-            mem_blobs: None,
-        };
-        let result = apply_package_patch(
-            "pkg:npm/x@1.0.0",
-            &pkg_dir,
-            &files,
-            &sources,
-            Some(TEST_UUID),
-            true, // dry-run
-            MismatchPolicy::Warn,
-        )
-        .await;
-
-        assert!(result.success);
-        assert!(result.files_patched.is_empty());
-        let on_disk = tokio::fs::read(pkg_dir.join("index.js")).await.unwrap();
-        assert_eq!(on_disk, original);
+        (root, pkg_dir, blobs_dir, files, original)
     }
 
     /// New file in a NEW subdirectory inside a read-only package
@@ -2707,15 +2394,7 @@ mod tests {
 
     #[test]
     fn test_applied_via_as_tag() {
-        assert_eq!(AppliedVia::Diff.as_tag(), "diff");
         assert_eq!(AppliedVia::Blob.as_tag(), "blob");
-    }
-
-    #[test]
-    fn test_patch_sources_blobs_only_disables_other_strategies() {
-        let dir = tempfile::tempdir().unwrap();
-        let sources = PatchSources::blobs_only(dir.path());
-        assert!(sources.diffs_path.is_none());
     }
 
     /// Retried partial apply must not wedge cargo: a previous apply
@@ -2764,7 +2443,6 @@ mod tests {
             pkg,
             &files,
             &PatchSources::blobs_only(blobs.path()),
-            None,
             false,
             MismatchPolicy::Force,
         )
@@ -2842,7 +2520,6 @@ mod tests {
             pkg,
             &files,
             &PatchSources::blobs_only(blobs_dir.path()),
-            None,
             false,
             MismatchPolicy::Warn,
         )
@@ -2930,7 +2607,6 @@ mod tests {
             pkg_dir.path(),
             &files,
             &PatchSources::blobs_only(blobs_dir.path()),
-            None,
             false,
             MismatchPolicy::Warn,
         )
@@ -2981,7 +2657,6 @@ mod tests {
             pkg_dir.path(),
             &files,
             &PatchSources::blobs_only(blobs_dir.path()),
-            None,
             false,
             MismatchPolicy::Strict,
         )
@@ -3102,7 +2777,6 @@ mod tests {
                     &pkg,
                     &files,
                     &PatchSources::blobs_only(blobs_dir.path()),
-                    None,
                     false,
                     policy,
                 )
@@ -3172,7 +2846,6 @@ mod tests {
             &pkg,
             &files,
             &PatchSources::blobs_only(blobs_dir.path()),
-            None,
             false,
             MismatchPolicy::Warn,
         )
@@ -3192,174 +2865,6 @@ mod tests {
             original
         );
         assert!(!root.path().join("escape.js").exists());
-    }
-
-    // ── resolve_from_diff bail-outs ──────────────────────────────────
-    //
-    // Direct-call tests for the private diff resolver's fail-soft
-    // contract: each bail yields `None` (the pipeline falls through to
-    // the blob) and touches NOTHING on disk.
-
-    #[tokio::test]
-    async fn test_resolve_from_diff_bails_on_new_file_entry() {
-        // A diff entry for a file with empty beforeHash (malformed or
-        // adversarial patch data): there is no before content to diff
-        // against, so the strategy must refuse.
-        let dir = tempfile::tempdir().unwrap();
-        let mut entries = HashMap::new();
-        entries.insert("new.js".to_string(), make_delta(b"", b"x"));
-        let info = PatchFileInfo {
-            before_hash: String::new(),
-            after_hash: compute_git_sha256_from_bytes(b"x"),
-        };
-
-        let applied = resolve_from_diff(
-            Some(&entries),
-            "new.js",
-            dir.path(),
-            &info,
-            Some("anything"),
-        )
-        .await;
-        assert!(
-            applied.is_none(),
-            "new-file entries must never apply via diff"
-        );
-        assert!(!dir.path().join("new.js").exists(), "nothing written");
-    }
-
-    #[tokio::test]
-    async fn test_resolve_from_diff_bails_when_target_unreadable() {
-        // The current_hash gate passes (verify/apply race or permission
-        // loss) but the on-disk read fails: fail soft, fall through.
-        let dir = tempfile::tempdir().unwrap();
-        let original = b"the original content";
-        let patched = b"the patched content!";
-        let before_hash = compute_git_sha256_from_bytes(original);
-        let mut entries = HashMap::new();
-        entries.insert("index.js".to_string(), make_delta(original, patched));
-        let info = PatchFileInfo {
-            before_hash: before_hash.clone(),
-            after_hash: compute_git_sha256_from_bytes(patched),
-        };
-
-        // NO file on disk, but current_hash claims the before state.
-        let applied = resolve_from_diff(
-            Some(&entries),
-            "index.js",
-            dir.path(),
-            &info,
-            Some(&before_hash),
-        )
-        .await;
-        assert!(applied.is_none(), "unreadable target must bail");
-        assert!(!dir.path().join("index.js").exists(), "nothing written");
-    }
-
-    #[tokio::test]
-    async fn test_resolve_from_diff_bails_on_corrupt_delta() {
-        // `.socket/diffs` is on-disk and user-tamperable: garbage delta
-        // bytes must fail apply_diff and leave the target untouched.
-        let dir = tempfile::tempdir().unwrap();
-        let original = b"the original content";
-        let before_hash = compute_git_sha256_from_bytes(original);
-        tokio::fs::write(dir.path().join("index.js"), original)
-            .await
-            .unwrap();
-
-        let mut entries = HashMap::new();
-        entries.insert(
-            "index.js".to_string(),
-            b"not a real bsdiff delta header".to_vec(),
-        );
-        let info = PatchFileInfo {
-            before_hash: before_hash.clone(),
-            after_hash: compute_git_sha256_from_bytes(b"whatever"),
-        };
-
-        let applied = resolve_from_diff(
-            Some(&entries),
-            "index.js",
-            dir.path(),
-            &info,
-            Some(&before_hash),
-        )
-        .await;
-        assert!(applied.is_none(), "corrupt delta must bail");
-        assert_eq!(
-            tokio::fs::read(dir.path().join("index.js")).await.unwrap(),
-            original,
-            "target untouched after corrupt delta"
-        );
-    }
-
-    #[tokio::test]
-    async fn test_resolve_from_diff_bails_on_wrong_target_delta() {
-        // A delta authored against the RIGHT base but toward the WRONG
-        // target: apply_diff succeeds, but the product's hash differs
-        // from afterHash — nothing may be written.
-        let dir = tempfile::tempdir().unwrap();
-        let original = b"the original content";
-        let before_hash = compute_git_sha256_from_bytes(original);
-        tokio::fs::write(dir.path().join("index.js"), original)
-            .await
-            .unwrap();
-
-        let mut entries = HashMap::new();
-        entries.insert(
-            "index.js".to_string(),
-            make_delta(original, b"unexpected target"),
-        );
-        let info = PatchFileInfo {
-            before_hash: before_hash.clone(),
-            // The declared target is DIFFERENT from what the delta produces.
-            after_hash: compute_git_sha256_from_bytes(b"the real patched content"),
-        };
-
-        let applied = resolve_from_diff(
-            Some(&entries),
-            "index.js",
-            dir.path(),
-            &info,
-            Some(&before_hash),
-        )
-        .await;
-        assert!(applied.is_none(), "wrong-target delta must bail");
-        assert_eq!(
-            tokio::fs::read(dir.path().join("index.js")).await.unwrap(),
-            original,
-            "nothing written when the product hash mismatches"
-        );
-    }
-
-    /// Pipeline variant: a corrupt diff archive entry must fall through
-    /// to the blob strategy and still patch successfully.
-    #[tokio::test]
-    async fn test_apply_corrupt_diff_falls_through_to_blob() {
-        let (_root, pkg_dir, blobs_dir, diffs_dir, files, _orig, patched) = make_fixture().await;
-        // Diff archive holds garbage delta bytes.
-        write_uuid_archive(&diffs_dir, TEST_UUID, &[("index.js", b"garbage delta")]);
-
-        let sources = PatchSources {
-            blobs_path: &blobs_dir,
-            diffs_path: Some(&diffs_dir),
-            mem_blobs: None,
-        };
-        let result = apply_package_patch(
-            "pkg:npm/x@1.0.0",
-            &pkg_dir,
-            &files,
-            &sources,
-            Some(TEST_UUID),
-            false,
-            MismatchPolicy::Warn,
-        )
-        .await;
-
-        assert!(result.success, "expected success: {:?}", result.error);
-        assert_eq!(result.applied_via.get("index.js"), Some(&AppliedVia::Blob));
-        let written = tokio::fs::read(pkg_dir.join("index.js")).await.unwrap();
-        assert_eq!(written, patched);
     }
 
     // ── hygiene / hardening pins ─────────────────────────────────────
@@ -3428,7 +2933,6 @@ mod tests {
             &pkg_dir,
             &files,
             &PatchSources::blobs_only(&blobs_dir),
-            None,
             false,
             MismatchPolicy::Warn,
         )
@@ -3487,7 +2991,6 @@ mod tests {
             &pkg_dir,
             &files,
             &PatchSources::blobs_only(&blobs_dir),
-            None,
             false,
             MismatchPolicy::Warn,
         )
@@ -3510,60 +3013,14 @@ mod tests {
         );
     }
 
-    /// SECURITY: the patch `uuid` is joined as `<dir>/<uuid>.tar.gz`. A
-    /// traversal uuid that would resolve to a real archive elsewhere is
-    /// treated as "no archive" (diff strategy skipped, blob applies) —
-    /// never joined.
-    #[tokio::test]
-    async fn test_apply_unsafe_uuid_skips_archives() {
-        let (root, pkg_dir, blobs_dir, diffs_dir, files, original, patched) = make_fixture().await;
-        // `diffs/../escape/<TEST_UUID>.tar.gz` IS a valid diff archive.
-        let escape_dir = root.path().join("escape");
-        tokio::fs::create_dir_all(&escape_dir).await.unwrap();
-        let delta = make_delta(&original, &patched);
-        write_uuid_archive(&escape_dir, TEST_UUID, &[("index.js", &delta)]);
-        let escaping_uuid = format!("../escape/{TEST_UUID}");
-        let sources = PatchSources {
-            blobs_path: &blobs_dir,
-            diffs_path: Some(&diffs_dir),
-            mem_blobs: None,
-        };
-        let result = apply_package_patch(
-            "pkg:npm/x@1.0.0",
-            &pkg_dir,
-            &files,
-            &sources,
-            Some(&escaping_uuid),
-            false,
-            MismatchPolicy::Warn,
-        )
-        .await;
-
-        assert!(result.success, "expected success: {:?}", result.error);
-        assert_eq!(
-            result.applied_via.get("index.js"),
-            Some(&AppliedVia::Blob),
-            "an escaping uuid must not reach the escaped diff archive"
-        );
-        let written = tokio::fs::read(pkg_dir.join("index.js")).await.unwrap();
-        assert_eq!(written, patched);
-    }
-
-    /// A write failure under the archive strategy must surface as itself,
-    /// not be swallowed as "not applicable" and reported as the blob
-    /// fallback's `Failed to read blob …: No such file`.
+    /// A write failure must surface as itself, not be reported as a
+    /// `Failed to read blob …` miss.
     /// `chflags uchg` on the package dir is the unprivileged deterministic
     /// route to a stage-creation failure (the guard defeats 0o555).
     #[cfg(target_os = "macos")]
     #[tokio::test]
     async fn test_apply_write_failure_is_reported_not_masked_as_missing_blob() {
-        let (_root, pkg_dir, blobs_dir, diffs_dir, files, original, _patched) =
-            make_fixture().await;
-        // Only the archives are staged — no blob to fall back on.
-        let after_hash = &files["index.js"].after_hash;
-        tokio::fs::remove_file(blobs_dir.join(after_hash))
-            .await
-            .unwrap();
+        let (_root, pkg_dir, blobs_dir, files, original) = make_fixture().await;
 
         let status = std::process::Command::new("chflags")
             .arg("uchg")
@@ -3572,17 +3029,12 @@ mod tests {
             .expect("chflags must be runnable");
         assert!(status.success(), "chflags uchg failed");
 
-        let sources = PatchSources {
-            blobs_path: &blobs_dir,
-            diffs_path: Some(&diffs_dir),
-            mem_blobs: None,
-        };
+        let sources = PatchSources::blobs_only(&blobs_dir);
         let result = apply_package_patch(
             "pkg:npm/x@1.0.0",
             &pkg_dir,
             &files,
             &sources,
-            Some(TEST_UUID),
             false,
             MismatchPolicy::Warn,
         )
@@ -3800,16 +3252,9 @@ mod tests {
             let (_root, [a, b], key, blobs, files, original, _patched) = shared_store_fixture(pdm);
             let sources = PatchSources::blobs_only(&blobs);
             for dry_run in [true, false] {
-                let result = apply_package_patch(
-                    purl,
-                    &a,
-                    &files,
-                    &sources,
-                    None,
-                    dry_run,
-                    MismatchPolicy::Warn,
-                )
-                .await;
+                let result =
+                    apply_package_patch(purl, &a, &files, &sources, dry_run, MismatchPolicy::Warn)
+                        .await;
                 assert!(!result.success, "{purl} dry_run={dry_run}: must refuse");
                 let err = result.error.unwrap_or_default();
                 assert!(
@@ -3835,7 +3280,6 @@ mod tests {
             &a,
             &files,
             &PatchSources::blobs_only(&blobs),
-            None,
             false,
             MismatchPolicy::Warn,
         )
@@ -3898,8 +3342,7 @@ mod tests {
             for policy in [MismatchPolicy::Warn, MismatchPolicy::Force] {
                 for dry_run in [true, false] {
                     let result =
-                        apply_package_patch(purl, &pkg, &files, &sources, None, dry_run, policy)
-                            .await;
+                        apply_package_patch(purl, &pkg, &files, &sources, dry_run, policy).await;
                     assert!(!result.success, "{}: must refuse", pkg.display());
                     let err = result.error.unwrap_or_default();
                     assert!(
@@ -3943,7 +3386,6 @@ mod tests {
             &nm.join("left-pad"),
             &files,
             &PatchSources::blobs_only(&blobs),
-            None,
             false,
             MismatchPolicy::Warn,
         )

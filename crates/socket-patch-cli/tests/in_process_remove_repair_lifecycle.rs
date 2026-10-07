@@ -317,10 +317,10 @@ async fn remove_no_manifest_emits_not_found() {
 }
 
 // ---------------------------------------------------------------------------
-// repair: download in both modes (file/diff); `package` fails hard
+// repair: downloads per-file blobs (the only download since v5)
 // ---------------------------------------------------------------------------
 
-fn make_repair_args(cwd: &Path, mode: &str) -> RepairArgs {
+fn make_repair_args(cwd: &Path) -> RepairArgs {
     RepairArgs {
         common: socket_patch_cli::args::GlobalArgs {
             cwd: cwd.to_path_buf(),
@@ -328,7 +328,6 @@ fn make_repair_args(cwd: &Path, mode: &str) -> RepairArgs {
             dry_run: false,
             offline: false,
             json: true,
-            download_mode: mode.to_string(),
             ..socket_patch_cli::args::GlobalArgs::default()
         },
         download_only: false,
@@ -337,140 +336,7 @@ fn make_repair_args(cwd: &Path, mode: &str) -> RepairArgs {
 
 #[tokio::test]
 #[serial]
-async fn repair_diff_mode_downloads_diff_archives() {
-    let tmp = tempfile::tempdir().unwrap();
-    let uuid = "12121212-1212-4121-8121-121212121212";
-    let _after_hash = "abc123abc123abc123abc123abc123abc123abc123abc123abc123abc123abc1";
-
-    let server = MockServer::start().await;
-    // Diff mode fetches /v0/orgs/<org>/patches/diff/<uuid> → tar.gz body.
-    let fake_archive = b"fake diff archive";
-    Mock::given(method("GET"))
-        .and(path(format!("/v0/orgs/{ORG}/patches/diff/{uuid}")))
-        .respond_with(ResponseTemplate::new(200).set_body_bytes(fake_archive.to_vec()))
-        .mount(&server)
-        .await;
-    // Fallback blob endpoint should also be available.
-    let real_blob = b"real blob content";
-    let real_hash = git_sha256(real_blob);
-    Mock::given(method("GET"))
-        .and(path(format!("/v0/orgs/{ORG}/patches/blob/{real_hash}")))
-        .respond_with(ResponseTemplate::new(200).set_body_bytes(real_blob.to_vec()))
-        .mount(&server)
-        .await;
-
-    let socket = tmp.path().join(".socket");
-    std::fs::create_dir_all(&socket).unwrap();
-    std::fs::write(
-        socket.join("manifest.json"),
-        format!(
-            r#"{{ "patches": {{
-                "pkg:npm/diff-test@1.0.0": {{
-                    "uuid": "{uuid}",
-                    "exportedAt": "2024-01-01T00:00:00Z",
-                    "files": {{ "package/x.js": {{
-                        "beforeHash": "0000000000000000000000000000000000000000000000000000000000000000",
-                        "afterHash": "{real_hash}"
-                    }}}},
-                    "vulnerabilities": {{}}, "description": "x",
-                    "license": "MIT", "tier": "free"
-                }}
-            }}}}"#
-        ),
-    )
-    .unwrap();
-
-    std::env::set_var("SOCKET_API_URL", server.uri());
-    std::env::set_var("SOCKET_API_TOKEN", "fake");
-    std::env::set_var("SOCKET_ORG_SLUG", ORG);
-    let code = repair_run(make_repair_args(tmp.path(), "diff")).await;
-    std::env::remove_var("SOCKET_API_URL");
-    std::env::remove_var("SOCKET_API_TOKEN");
-    std::env::remove_var("SOCKET_ORG_SLUG");
-    assert_eq!(code, 0, "repair --download-mode diff must succeed");
-
-    // The diff archive should be on disk at .socket/diffs/<uuid>.tar.gz, and
-    // its bytes must be exactly what the server served — a corrupt/empty
-    // write would otherwise still satisfy a bare `exists()` check.
-    let archive_path = socket.join(format!("diffs/{uuid}.tar.gz"));
-    assert!(
-        archive_path.exists(),
-        "diff archive must be persisted to {}",
-        archive_path.display()
-    );
-    assert_eq!(
-        std::fs::read(&archive_path).unwrap(),
-        fake_archive,
-        "persisted diff archive bytes must match the served body"
-    );
-    // Prove the real download path ran (not a short-circuit): the diff
-    // endpoint must have actually been requested.
-    let hits = server
-        .received_requests()
-        .await
-        .unwrap()
-        .into_iter()
-        .filter(|r| r.url.path() == format!("/v0/orgs/{ORG}/patches/diff/{uuid}"))
-        .count();
-    assert_eq!(hits, 1, "diff endpoint must be fetched exactly once");
-}
-
-#[tokio::test]
-#[serial]
-async fn repair_package_mode_is_a_hard_failure() {
-    // `--download-mode package` was removed (no deployed server ever served
-    // its GET archive route). Repair must fail up front on mode parsing —
-    // before any network traffic — rather than silently degrade.
-    let tmp = tempfile::tempdir().unwrap();
-    let uuid = "13131313-1313-4131-8131-131313131313";
-
-    let server = MockServer::start().await;
-
-    let socket = tmp.path().join(".socket");
-    std::fs::create_dir_all(&socket).unwrap();
-    std::fs::write(
-        socket.join("manifest.json"),
-        format!(
-            r#"{{ "patches": {{
-                "pkg:npm/pkg-test@1.0.0": {{
-                    "uuid": "{uuid}",
-                    "exportedAt": "2024-01-01T00:00:00Z",
-                    "files": {{ "package/x.js": {{
-                        "beforeHash": "0000000000000000000000000000000000000000000000000000000000000000",
-                        "afterHash": "def456def456def456def456def456def456def456def456def456def456def4"
-                    }}}},
-                    "vulnerabilities": {{}}, "description": "x",
-                    "license": "MIT", "tier": "free"
-                }}
-            }}}}"#
-        ),
-    )
-    .unwrap();
-
-    std::env::set_var("SOCKET_API_URL", server.uri());
-    std::env::set_var("SOCKET_API_TOKEN", "fake");
-    std::env::set_var("SOCKET_ORG_SLUG", ORG);
-    let code = repair_run(make_repair_args(tmp.path(), "package")).await;
-    std::env::remove_var("SOCKET_API_URL");
-    std::env::remove_var("SOCKET_API_TOKEN");
-    std::env::remove_var("SOCKET_ORG_SLUG");
-    assert_ne!(code, 0, "removed download mode must be a hard failure");
-    let package_hits = server
-        .received_requests()
-        .await
-        .unwrap()
-        .into_iter()
-        .filter(|r| r.url.path().contains("/patches/package/"))
-        .count();
-    assert_eq!(
-        package_hits, 0,
-        "the removed mode must never reach the package archive route"
-    );
-}
-
-#[tokio::test]
-#[serial]
-async fn repair_file_mode_downloads_individual_blobs() {
+async fn repair_downloads_individual_blobs() {
     let tmp = tempfile::tempdir().unwrap();
     let blob_content = b"some patched content\n";
     let after_hash = git_sha256(blob_content);
@@ -506,7 +372,7 @@ async fn repair_file_mode_downloads_individual_blobs() {
     std::env::set_var("SOCKET_API_URL", server.uri());
     std::env::set_var("SOCKET_API_TOKEN", "fake");
     std::env::set_var("SOCKET_ORG_SLUG", ORG);
-    let code = repair_run(make_repair_args(tmp.path(), "file")).await;
+    let code = repair_run(make_repair_args(tmp.path())).await;
     std::env::remove_var("SOCKET_API_URL");
     std::env::remove_var("SOCKET_API_TOKEN");
     std::env::remove_var("SOCKET_ORG_SLUG");
@@ -533,6 +399,17 @@ async fn repair_file_mode_downloads_individual_blobs() {
         .filter(|r| r.url.path() == format!("/v0/orgs/{ORG}/patches/blob/{after_hash}"))
         .count();
     assert_eq!(hits, 1, "blob endpoint must be fetched exactly once");
+    // v5 removed the diff download path: no request may go to it, and
+    // nothing lands in the obsolete `.socket/diffs/`.
+    let diff_hits = server
+        .received_requests()
+        .await
+        .unwrap()
+        .into_iter()
+        .filter(|r| r.url.path().contains("/diff"))
+        .count();
+    assert_eq!(diff_hits, 0, "repair must never request a diff archive");
+    assert!(!socket.join("diffs").exists());
 }
 
 #[tokio::test]
@@ -577,7 +454,7 @@ async fn repair_dry_run_does_not_download() {
     )
     .unwrap();
 
-    let mut args = make_repair_args(tmp.path(), "file");
+    let mut args = make_repair_args(tmp.path());
     args.common.dry_run = true;
     args.common.offline = false;
 
@@ -622,7 +499,7 @@ async fn repair_dry_run_does_not_download() {
 #[serial]
 async fn repair_with_no_manifest_emits_error() {
     let tmp = tempfile::tempdir().unwrap();
-    assert_eq!(repair_run(make_repair_args(tmp.path(), "file")).await, 1);
+    assert_eq!(repair_run(make_repair_args(tmp.path())).await, 1);
 }
 
 /// Regression: a repair where a missing artifact fails to download must
@@ -665,7 +542,7 @@ async fn repair_download_failure_exits_nonzero() {
     std::env::set_var("SOCKET_API_URL", server.uri());
     std::env::set_var("SOCKET_API_TOKEN", "fake");
     std::env::set_var("SOCKET_ORG_SLUG", ORG);
-    let code = repair_run(make_repair_args(tmp.path(), "file")).await;
+    let code = repair_run(make_repair_args(tmp.path())).await;
     std::env::remove_var("SOCKET_API_URL");
     std::env::remove_var("SOCKET_API_TOKEN");
     std::env::remove_var("SOCKET_ORG_SLUG");
@@ -709,7 +586,7 @@ async fn repair_offline_with_present_blobs_succeeds() {
     std::fs::create_dir_all(&blobs).unwrap();
     std::fs::write(blobs.join(&hash), blob).unwrap();
 
-    let mut args = make_repair_args(tmp.path(), "file");
+    let mut args = make_repair_args(tmp.path());
     args.common.offline = true;
     assert_eq!(repair_run(args).await, 0);
     // The referenced blob is in use, so offline cleanup must leave it intact.
@@ -853,7 +730,7 @@ async fn repair_telemetry_attributed_to_env_credentials() {
     std::env::remove_var("SOCKET_TELEMETRY_DISABLED");
     std::env::remove_var("SOCKET_OFFLINE");
     std::env::remove_var("VITEST");
-    let code = repair_run(make_repair_args(tmp.path(), "file")).await;
+    let code = repair_run(make_repair_args(tmp.path())).await;
     std::env::remove_var("SOCKET_API_URL");
     std::env::remove_var("SOCKET_API_TOKEN");
     std::env::remove_var("SOCKET_ORG_SLUG");
@@ -892,7 +769,7 @@ async fn vlt_repair_redownloads_the_dir_then_remove_reverts_it() {
     let uuid_dir = root.join(format!(".socket/vendor/npm/{}", hosted::UUID));
     std::fs::remove_dir_all(&uuid_dir).unwrap();
 
-    let mut args = make_repair_args(root, "diff");
+    let mut args = make_repair_args(root);
     let fixture = prebuilt_common::Server::project(root);
     args.common.offline = false;
     fixture.configure(&mut args.common);

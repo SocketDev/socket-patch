@@ -1,4 +1,4 @@
-//! The binary transport path (`fetch_blob` / `fetch_diff`, both sharing
+//! The binary transport path (`fetch_blob`, via
 //! `fetch_binary`) must classify authenticated 401 / 403 / 429 responses the
 //! same way the JSON path does.
 //!

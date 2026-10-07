@@ -848,7 +848,6 @@ fn download_params(args: &ScanArgs, save_only: bool, json: bool, silent: bool) -
         global_prefix: args.common.global_prefix.clone(),
         json,
         silent,
-        download_mode: args.common.download_mode.clone(),
         all_releases: args.all_releases,
         strict: args.common.strict,
         ecosystems: args.common.ecosystems.clone(),

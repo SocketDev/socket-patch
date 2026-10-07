@@ -4,13 +4,10 @@
 //! short form, and default. Changes that flip a default or rename a flag
 //! must break these tests so the regression is caught before release.
 //!
-//! Two defaults are especially load-bearing and explicitly asserted:
-//!
-//! * `--batch-size` has no parse-time default: unset, `scan` picks it per
-//!   endpoint at run time (500 on the authenticated API, 100 on the public
-//!   proxy), so an explicit value must stay distinguishable from none.
-//! * `--download-mode` defaults to `"diff"`. This diverges from `repair`'s
-//!   default and is a silent-regression risk if flipped.
+//! One default is especially load-bearing and explicitly asserted:
+//! `--batch-size` has no parse-time default: unset, `scan` picks it per
+//! endpoint at run time (500 on the authenticated API, 100 on the public
+//! proxy), so an explicit value must stay distinguishable from none.
 
 use clap::Parser;
 use socket_patch_cli::commands::scan::{resolve_mode_flags, ScanArgs, ScanMode};
@@ -20,8 +17,7 @@ use socket_patch_cli::{Cli, Commands};
 /// "SOCKET_*"` binding. clap reads these at parse time whenever the matching
 /// flag is absent, so an ambient value silently overrides the code-level
 /// `default_value`. That defeats the entire purpose of these snapshot tests:
-/// a regression that flips a `default_value` (e.g. `--download-mode` →
-/// `"package"`, or `--batch-size` → `50`) would stay GREEN on any machine
+/// a regression that flips a `default_value` (e.g. `--batch-size` → `50`) would stay GREEN on any machine
 /// whose shell/CI happens to export the old value, and the "default" tests
 /// would be asserting the environment, not the parser. We therefore clear
 /// the whole set before every parse and restore it after, under `#[serial]`
@@ -37,7 +33,6 @@ const SCAN_ENV_VARS: &[&str] = &[
     "SOCKET_CWD",
     "SOCKET_SCAN_PACKAGES",
     "SOCKET_DEBUG",
-    "SOCKET_DOWNLOAD_MODE",
     "SOCKET_DRY_RUN",
     "SOCKET_ECOSYSTEMS",
     "SOCKET_GLOBAL",
@@ -120,10 +115,6 @@ fn defaults_match_contract() {
     assert_eq!(
         args.batch_size, None,
         "--batch-size has no parse-time default (resolved per endpoint at run time)"
-    );
-    assert_eq!(
-        args.common.download_mode, "diff",
-        "--download-mode default is \"diff\""
     );
 
     // All other defaults from the scan table.
@@ -352,27 +343,6 @@ fn ecosystems_unsupported_name_rejected() {
 fn ecosystems_csv_single() {
     let args = parse_scan(&["--ecosystems", "npm"]);
     assert_eq!(args.common.ecosystems, Some(vec!["npm".to_string()]));
-}
-
-#[test]
-#[serial_test::serial]
-fn download_mode_diff() {
-    let args = parse_scan(&["--download-mode", "diff"]);
-    assert_eq!(args.common.download_mode, "diff");
-}
-
-#[test]
-#[serial_test::serial]
-fn download_mode_package() {
-    let args = parse_scan(&["--download-mode", "package"]);
-    assert_eq!(args.common.download_mode, "package");
-}
-
-#[test]
-#[serial_test::serial]
-fn download_mode_file() {
-    let args = parse_scan(&["--download-mode", "file"]);
-    assert_eq!(args.common.download_mode, "file");
 }
 
 #[test]
@@ -898,7 +868,11 @@ fn max_new_patches_takes_a_count_or_none() {
         ("NONE", None),
     ] {
         let args = parse_scan(&["--max-new-patches", raw]);
-        assert_eq!(args.rollout.max_new_patches, Some(MaxNewPatches(want)), "{raw}");
+        assert_eq!(
+            args.rollout.max_new_patches,
+            Some(MaxNewPatches(want)),
+            "{raw}"
+        );
     }
 }
 
@@ -989,20 +963,33 @@ fn min_severity_flag_and_env() {
     assert_eq!(parse_scan(&[]).socket_yml.min_severity, None);
     assert_eq!(overrides(&[], &[]).unwrap().min_severity, None);
     assert_eq!(
-        overrides(&["--min-severity", "High"], &[]).unwrap().min_severity,
+        overrides(&["--min-severity", "High"], &[])
+            .unwrap()
+            .min_severity,
         Some((Some(1), OverrideSource::Flag))
     );
     assert_eq!(
-        overrides(&["--min-severity", "none"], &[("SOCKET_MIN_SEVERITY", "critical")]).unwrap().min_severity,
+        overrides(
+            &["--min-severity", "none"],
+            &[("SOCKET_MIN_SEVERITY", "critical")]
+        )
+        .unwrap()
+        .min_severity,
         Some((None, OverrideSource::Flag))
     );
     assert_eq!(
-        overrides(&[], &[("SOCKET_MIN_SEVERITY", "moderate")]).unwrap().min_severity,
+        overrides(&[], &[("SOCKET_MIN_SEVERITY", "moderate")])
+            .unwrap()
+            .min_severity,
         Some((Some(2), OverrideSource::Env))
     );
-    assert_eq!(overrides(&[], &[("SOCKET_MIN_SEVERITY", "")]).unwrap().min_severity, None);
+    assert_eq!(
+        overrides(&[], &[("SOCKET_MIN_SEVERITY", "")])
+            .unwrap()
+            .min_severity,
+        None
+    );
     assert!(overrides(&[], &[("SOCKET_MIN_SEVERITY", "severe")]).is_err());
     assert!(try_parse_scan(&["--min-severity", "severe"]).is_err());
     assert!(overrides(&["--no-socket-yml"], &[]).unwrap().bypass);
 }
-

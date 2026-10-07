@@ -969,9 +969,8 @@ pub async fn run(args: RemoveArgs) -> i32 {
                 );
             }
         }
-        // Diff archives use the same manifest-uuid keep rule; legacy
-        // package archives are swept whole (parity with repair and scan
-        // --prune).
+        // Obsolete diff and package archives are swept whole (parity with
+        // repair and scan --prune).
         for (dir, result) in [("diffs", sweep.diffs), ("packages", sweep.packages)] {
             if let Some(detail) = sweep_failure(dir, &result) {
                 if loud {

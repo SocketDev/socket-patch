@@ -542,7 +542,6 @@ pub async fn lock_text_refusals(
     let nowhere = nowhere_buf.as_path();
     let no_sources = PatchSources {
         blobs_path: nowhere,
-        diffs_path: None,
         mem_blobs: None,
     };
     let mut refusals = Vec::with_capacity(packages.len());
@@ -853,7 +852,6 @@ mod lock_text_refusal_tests {
         let nowhere = root.join("not-installed");
         let sources = PatchSources {
             blobs_path: &nowhere,
-            diffs_path: None,
             mem_blobs: None,
         };
         for (i, code) in [

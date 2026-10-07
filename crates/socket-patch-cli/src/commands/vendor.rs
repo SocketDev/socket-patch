@@ -442,10 +442,7 @@ async fn unwired_check_failure(
 /// entry (fail-safe): ecosystems other than npm, cargo and pypi (whose
 /// probe covers the requirements flavor only) have no in-use probe yet,
 /// and a missing/unreadable lockfile proves nothing.
-pub(crate) async fn dispatch_in_use_one(
-    entry: &VendorEntry,
-    project_root: &Path,
-) -> Option<bool> {
+pub(crate) async fn dispatch_in_use_one(entry: &VendorEntry, project_root: &Path) -> Option<bool> {
     match entry.ecosystem.as_str() {
         "npm" => vendor::npm_flavor::vendored_entry_in_use(entry, project_root).await,
         // Cargo probes the lock entry's shape: detached + `[patch]` pointing
@@ -1237,8 +1234,7 @@ async fn run_check(args: &VendorArgs) -> i32 {
     // know (the ledger was ignored or dropped from the commit along with the
     // manifest) leaves every fresh install failing; the manifest keys above
     // cannot see it, so the references are read from the wiring itself.
-    let references =
-        crate::commands::vendored_backend::repair::scan_vendor_references(root).await;
+    let references = crate::commands::vendored_backend::repair::scan_vendor_references(root).await;
     for (eco, uuid, rel) in references {
         let ledgered = state
             .entries
@@ -4360,7 +4356,6 @@ mod dispatch_tests {
         };
         let sources = PatchSources {
             blobs_path: tmp.path(),
-            diffs_path: None,
             mem_blobs: None,
         };
         let service = GlobalArgs {
@@ -4744,7 +4739,6 @@ mod variant_probe_tests {
         };
         let sources = PatchSources {
             blobs_path: tmp.path(),
-            diffs_path: None,
             mem_blobs: None,
         };
 
@@ -4827,7 +4821,6 @@ mod variant_probe_tests {
         };
         let sources = PatchSources {
             blobs_path: tmp.path(),
-            diffs_path: None,
             mem_blobs: None,
         };
 
@@ -4940,7 +4933,6 @@ mod variant_probe_tests {
             let common = dry_run_over(tmp.path(), &site);
             let sources = PatchSources {
                 blobs_path: tmp.path(),
-                diffs_path: None,
                 mem_blobs: None,
             };
             let mut state = VendorState::default();
@@ -4992,7 +4984,6 @@ mod variant_probe_tests {
         let common = dry_run_over(tmp.path(), &site);
         let sources = PatchSources {
             blobs_path: tmp.path(),
-            diffs_path: None,
             mem_blobs: None,
         };
 
@@ -5051,7 +5042,6 @@ mod variant_probe_tests {
         let common = dry_run_over(tmp.path(), &site);
         let sources = PatchSources {
             blobs_path: tmp.path(),
-            diffs_path: None,
             mem_blobs: None,
         };
 

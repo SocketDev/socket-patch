@@ -56,7 +56,7 @@ const DUMMY_IDENTIFIER: &str = "80630680-4da6-45f9-bba8-b888e0ffd58c";
 /// `GlobalArgs` field. Parsing-succeeds-only (`is_ok`) is not enough: it
 /// would stay green if a flag were silently dropped, bound to the wrong
 /// field, or mapped to a no-op. Each value is deliberately chosen to differ
-/// from the field's default (e.g. `--download-mode file`, not `diff`) so
+/// from the field's default (e.g. `--ecosystems npm,pypi`, not unset) so
 /// the assertion can distinguish "bound" from "left at default".
 fn global_flag_cases() -> Vec<(&'static str, Option<&'static str>, fn(&GlobalArgs))> {
     vec![
@@ -83,9 +83,6 @@ fn global_flag_cases() -> Vec<(&'static str, Option<&'static str>, fn(&GlobalArg
                 c.ecosystems.as_deref(),
                 Some(&["npm".to_string(), "pypi".to_string()][..])
             )
-        }),
-        ("--download-mode", Some("file"), |c| {
-            assert_eq!(c.download_mode, "file")
         }),
         ("--maven-config", Some("none"), |c| {
             assert_eq!(c.maven_config.as_deref(), Some("none"))
@@ -221,7 +218,6 @@ fn global_flag_cases_cover_every_global_field() {
         org: _,
         proxy_url: _,
         ecosystems: _,
-        download_mode: _,
         offline: _,
         global: _,
         global_prefix: _,
@@ -448,7 +444,6 @@ fn env_vars_populate_global_args() {
         ("SOCKET_ORG_SLUG", "env-org"),
         ("SOCKET_PROXY_URL", "https://env-proxy.example.com"),
         ("SOCKET_ECOSYSTEMS", "npm,gem"),
-        ("SOCKET_DOWNLOAD_MODE", "file"),
         ("SOCKET_VENDOR_SOURCE", "service"),
         ("SOCKET_VENDOR_URL", "https://env-vendor.example.com"),
         ("SOCKET_PATCH_SERVER_URL", "http://localhost:4026"),
@@ -495,7 +490,6 @@ fn env_vars_populate_global_args() {
             args.common.ecosystems.as_deref(),
             Some(&["npm".to_string(), "gem".to_string()][..])
         );
-        assert_eq!(args.common.download_mode, "file");
         assert_eq!(args.common.vendor_source, "service");
         assert_eq!(
             args.common.vendor_url.as_deref(),
@@ -714,8 +708,8 @@ use socket_patch_cli::args::GLOBAL_ARG_ENV_VARS as GLOBAL_ENV_VARS;
 /// but `SOCKET_CWD=`, `SOCKET_GLOBAL_PREFIX=`, `SOCKET_LOCK_TIMEOUT=` and
 /// `SOCKET_ECOSYSTEMS=` (the same blank-without-unsetting shell/CI idiom)
 /// still aborted every subcommand at clap-parse time ("a value is required" /
-/// "cannot parse integer from empty string"), and empty
-/// `SOCKET_DOWNLOAD_MODE=` / `SOCKET_MANIFEST_PATH=` leaked `""` past the
+/// "cannot parse integer from empty string"), and an empty
+/// `SOCKET_MANIFEST_PATH=` leaked `""` past the
 /// documented defaults. The binary now scrubs empty `GlobalArgs` env vars
 /// before clap parses (`args::scrub_empty_env_vars` in `main`),
 /// restoring the documented CLI > env > default precedence for blank vars.
@@ -737,7 +731,6 @@ fn empty_nonbool_env_vars_do_not_crash_the_binary() {
         "SOCKET_GLOBAL_PREFIX",
         "SOCKET_LOCK_TIMEOUT",
         "SOCKET_ECOSYSTEMS",
-        "SOCKET_DOWNLOAD_MODE",
         // Crash-class without the scrub: the vendor-source validator rejects
         // `""` outright; the two URL knobs would leak `Some("")` downstream.
         "SOCKET_VENDOR_SOURCE",
@@ -913,7 +906,6 @@ fn production_defaults_populate_when_unset() {
     assert_eq!(c.manifest_path, ".socket/manifest.json");
     assert_eq!(c.api_url, None, "no clap default — resolved in core");
     assert_eq!(c.proxy_url, None, "no clap default — resolved in core");
-    assert_eq!(c.download_mode, "diff");
     assert_eq!(c.vendor_source, "service");
     assert!(c.vendor_url.is_none());
     assert!(c.patch_server_url.is_none());

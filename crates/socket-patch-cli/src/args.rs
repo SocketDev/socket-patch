@@ -150,17 +150,6 @@ pub struct GlobalArgs {
     )]
     pub ecosystems: Option<Vec<String>>,
 
-    /// Which kind of patch artifact to download when local files are missing.
-    /// `diff` (default) fetches the smallest delta archive; `file` falls back
-    /// to legacy per-file blobs.
-    #[arg(
-        help_heading = GLOBAL_OPTIONS,
-        long = "download-mode",
-        env = "SOCKET_DOWNLOAD_MODE",
-        default_value = "diff"
-    )]
-    pub download_mode: String,
-
     /// Download installable patched artifacts from the patch service.
     /// `service` is the default; `auto` is a compatibility alias. Local
     /// artifact building is no longer supported. Healthy committed artifacts
@@ -585,7 +574,6 @@ pub const GLOBAL_ARG_ENV_VARS: &[&str] = &[
     "SOCKET_ORG_SLUG",
     "SOCKET_PROXY_URL",
     "SOCKET_ECOSYSTEMS",
-    "SOCKET_DOWNLOAD_MODE",
     "SOCKET_VENDOR_SOURCE",
     "SOCKET_VENDOR_URL",
     "SOCKET_PATCH_SERVER_URL",
@@ -640,7 +628,7 @@ pub const LOCAL_ARG_ENV_VARS: &[&str] = &[
 /// ("a value is required"), `SOCKET_LOCK_TIMEOUT` / `SOCKET_BATCH_SIZE`
 /// ("cannot parse integer from empty string") and `SOCKET_ECOSYSTEMS` (the
 /// per-token validator) outright — a single stray blank var crashed every
-/// subcommand — and an empty `SOCKET_DOWNLOAD_MODE` / `SOCKET_MANIFEST_PATH`
+/// subcommand — and an empty `SOCKET_MANIFEST_PATH`
 /// (or `SOCKET_VEX_OUTPUT`, which would silently target `""`) leaked `""`
 /// past the documented defaults. Called from `main` after peer-alias
 /// promotion and before clap runs. Only exactly-empty values are scrubbed;
@@ -677,7 +665,6 @@ impl Default for GlobalArgs {
             org: None,
             proxy_url: None,
             ecosystems: None,
-            download_mode: "diff".to_string(),
             vendor_source: "service".to_string(),
             maven_config: None,
             vendor_url: None,
@@ -897,7 +884,6 @@ mod tests {
             std::env::set_var("SOCKET_LOCK_TIMEOUT", "");
             std::env::set_var("SOCKET_GLOBAL_PREFIX", "");
             std::env::set_var("SOCKET_ECOSYSTEMS", "");
-            std::env::set_var("SOCKET_DOWNLOAD_MODE", "");
             std::env::set_var("SOCKET_VENDOR_SOURCE", "");
             std::env::set_var("SOCKET_BATCH_SIZE", "");
             std::env::set_var("SOCKET_VEX_OUTPUT", "");
@@ -933,7 +919,6 @@ mod tests {
             assert_eq!(cli.common.lock_timeout, None);
             assert!(cli.common.global_prefix.is_none());
             assert!(cli.common.ecosystems.is_none());
-            assert_eq!(cli.common.download_mode, "diff");
             assert_eq!(
                 cli.common.vendor_source, "service",
                 "empty SOCKET_VENDOR_SOURCE must fall back to the `auto` default"
@@ -1470,7 +1455,6 @@ mod tests {
 
             let cli = TestCli::try_parse_from(["socket-patch"]).unwrap();
             assert_eq!(cli.common.manifest_path, DEFAULT_PATCH_MANIFEST_PATH);
-            assert_eq!(cli.common.download_mode, "diff");
             assert_eq!(cli.common.cwd, PathBuf::from("."));
         });
     }

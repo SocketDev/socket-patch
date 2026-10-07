@@ -78,7 +78,6 @@ fn defaults_no_positional() {
     assert!(!args.common.verbose);
     // Remaining global defaults the contract pins but the original test omitted.
     assert_eq!(args.common.proxy_url, None); // default applied in core resolver
-    assert_eq!(args.common.download_mode, "diff");
     assert!(!args.common.yes);
     assert_eq!(args.common.lock_timeout, None);
     assert!(!args.common.debug);
@@ -266,12 +265,6 @@ fn proxy_url_long() {
 }
 
 #[test]
-fn download_mode_long() {
-    let args = parse_rollback(&["--download-mode", "package"]);
-    assert_eq!(args.common.download_mode, "package");
-}
-
-#[test]
 fn lock_timeout_long() {
     let args = parse_rollback(&["--lock-timeout", "30"]);
     assert_eq!(args.common.lock_timeout, Some(30));
@@ -366,7 +359,11 @@ fn bare_bool_does_not_consume_next_token() {
 /// relied on the rejection get a test-visible flip instead of a silent one.
 #[test]
 fn multiple_targets_parse_in_order() {
-    let args = parse_rollback(&["pkg:npm/foo@1", "packages/api/**", "b0630680-4da6-45f9-bba8-b888e0ffd58c"]);
+    let args = parse_rollback(&[
+        "pkg:npm/foo@1",
+        "packages/api/**",
+        "b0630680-4da6-45f9-bba8-b888e0ffd58c",
+    ]);
     assert_eq!(
         args.targets,
         vec![
