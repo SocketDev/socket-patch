@@ -1676,6 +1676,15 @@ async fn run_scan(
         explicit,
         args.common.is_global(),
     ));
+    // Agent and report-only scans patch the crawled copies in place, so a
+    // copy under a nested project's `node_modules` is judged by that
+    // project's root (#554). Hosted and vendored scans only rewire this
+    // root's lockfiles.
+    if !args.common.is_global()
+        && !matches!(args.mode, Some(ScanMode::Hosted) | Some(ScanMode::Vendored))
+    {
+        policy.judge_nested_roots(invocation, &args.common.cwd);
+    }
 
     // Positional PATH globs (see `ScanArgs::paths`). An unparseable glob
     // is a usage error, same exit-2 shape as the mode conflicts.
@@ -1966,10 +1975,14 @@ async fn run_scan(
 
     // The socket.yml root/ecosystem/package filters, after the flags
     // (which only narrow further) and after the prune-universe capture.
-    let filtered_crawled: Vec<_> = filtered_crawled
-        .into_iter()
-        .filter(|pkg| policy.admit_crawled(&pkg.purl))
-        .collect();
+    if policy.judges_nested_roots() && args.common.ecosystem_selected(Ecosystem::Npm) {
+        let nm_roots = socket_patch_core::crawlers::NpmCrawler::new()
+            .get_node_modules_paths(&crawler_options)
+            .await
+            .unwrap_or_default();
+        policy.locate_nested_copies(&nm_roots, &filtered_crawled).await;
+    }
+    let filtered_crawled = policy.admit_crawled_copies(filtered_crawled, &supplement_purls);
 
     // Gradle discovery notes (m2 gating, the user home) ride the run-level
     // warnings; the lock set only annotates `packages[]` below.
