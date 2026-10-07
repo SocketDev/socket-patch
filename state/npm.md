@@ -1,6 +1,6 @@
 [agent] Progress ledger for the scheduled npm bug-hunt routine (label pm:npm).
 
-Last updated: 2026-10-07T00Z (run 26 with a ledger), main `9c43dfc` (unchanged since 2026-10-06T00Z), latest release v4.0.0 (previous v3.3.0, both from npm `@socketsecurity/socket-patch`). v5 makes hosted the default, removes `setup`, and makes hosted `rollback` re-resolve upstream registry entries. Cells marked (v4) were last verified on `f6b7fb9`. #432 (closed by #813) and #798 (closed by #799, re-verified 18Z: `vex` refuses the stale twin) are fixed; their old `fail` marks below are historical.
+Last updated: 2026-10-07T06Z (run 27 with a ledger), main `9c43dfc` (unchanged since 2026-10-06T00Z), latest release v4.0.0 (previous v3.3.0, both from npm `@socketsecurity/socket-patch`). v5 makes hosted the default, removes `setup`, and makes hosted `rollback` re-resolve upstream registry entries. Cells marked (v4) were last verified on `f6b7fb9`. #432 (closed by #813) and #798 (closed by #799, re-verified 18Z: `vex` refuses the stale twin) are fixed; their old `fail` marks below are historical.
 
 ## Coverage matrix
 
@@ -93,6 +93,7 @@ The same `name@version` gets a new patch UUID with different bytes. Mock: left-p
 
 ## Backlog
 
+- **New 2026-10-07T06Z:** confirm the #852 scoped-alias variant (`install-strategy=linked`, `.store/@x/lp@<v>-<h>/node_modules/@x/lp` left unpatched, seen once on npm 10.9.4) and comment on #852 for the fixer. (#969 workspace-member direct dep under `allow-file=root`: done, pass.)
 - **New 2026-10-07T00Z:** #969 follow-ups (hosted→vendored takeover under `allow-file=root`; user / global `.npmrc` layers; a workspace member's vendored deps under `root`; `allow-directory` with `file:` directory deps).
 - **New 2026-10-06T18Z:** #954 follow-ups (other vendored PMs → handover if confirmed: pnpm / yarn / bun share `ServiceFetch::settle`; `--max-new-patches` with an unavailable UPGRADE; `get <B> --mode vendored` wording). (Withdrawn / forbidden superseding: done 18Z, pass.)
 - **New 2026-10-06T12Z:** #933 follow-ups (path-scoped `rollback <purl>`, agent re-scan after the takeover, other PMs → handover); Interrupted runs inside the write window.
@@ -129,6 +130,9 @@ The same `name@version` gets a new patch UUID with different bytes. Mock: left-p
 
 ## Known non-bugs
 
+- `allow-file=root` (npm 12.2.0) admits a vendored dep that is a workspace member's direct dependency (2026-10-07T06Z).
+- An alias key that shadows the patched package's name (`"left-pad": "npm:once@1.3.0"`) is correctly ignored by agent, vendored and `vex` (2026-10-07T06Z).
+- An npm 10 consumer ignores a published library's vendored `npm-shrinkwrap.json` and installs registry bytes. socket-patch makes no claim about published libraries.
 - `allow-file=root` admits a vendored **direct** dependency's `file:` tarball (npm 12.2.0); only transitive vendored entries are refused (#969).
 - An orphaned vendored ledger entry after `npm uninstall` is cleaned up by `scan --mode vendored --prune` (since #689). Only the `vendor --check` wording is wrong (#900).
 - A withdrawn patch (nothing offered, reference `withdrawn`) keeps its hosted / vendored pin and exits 0; hosted `vex` keeps attesting while the API still serves the record. No documented contract says a withdrawal should un-pin.
