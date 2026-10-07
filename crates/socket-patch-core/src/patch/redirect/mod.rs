@@ -53,7 +53,7 @@ use crate::formats::cargo::CargoLock;
 use crate::formats::composer::hosted::rewrite_composer_lock;
 use crate::formats::gem::gemfile;
 use crate::formats::gem::hosted::{checksum_entry_span, converge_gem_lock_source};
-use crate::formats::gem::{lock_lists_direct_dependency, lock_resolves as gem_lock_resolves};
+use crate::formats::gem::{lock_lists_direct_dependency, locked_specs as gem_locked_specs};
 pub(crate) use crate::formats::yarn::is_berry_lock;
 use crate::formats::cargo::hosted::CargoLockPlan;
 #[cfg(test)]
@@ -6106,6 +6106,10 @@ fn rewrite_gem(
         })
         .unwrap_or_default();
 
+    // The specs the lock resolves, read once from the lock as it was handed
+    // in: the rewrites below only re-point specs, never change a version.
+    let locked = files.get(lock_name).map(|lk| gem_locked_specs(lk));
+
     for dep in &gem {
         let Some(ov) = registry_override_of_kind(dep, "rubygems-compact-index") else {
             result.warnings.push(RewriteWarning {
@@ -6211,8 +6215,8 @@ fn rewrite_gem(
         // and pinning one of those overwrites the user's constraint or adds
         // an unresolvable top-level pin, so the next `bundle install`
         // downgrades or fails (#1055). Skip a version no `GEM` section lists.
-        if let Some(lk) = lock.as_deref() {
-            if !gem_lock_resolves(lk, &dep.name, &dep.version) {
+        if let Some(specs) = &locked {
+            if !specs.contains(&(dep.name.as_str(), dep.version.as_str())) {
                 result.warnings.push(RewriteWarning {
                     code: "redirect_gem_version_not_locked".into(),
                     detail: format!(

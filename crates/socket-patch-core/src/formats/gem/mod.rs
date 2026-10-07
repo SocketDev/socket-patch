@@ -23,7 +23,7 @@ pub(crate) mod hosted;
 pub(crate) mod manifest;
 pub(crate) mod mirror;
 
-use std::collections::{BTreeSet, HashMap};
+use std::collections::{BTreeSet, HashMap, HashSet};
 
 use crate::utils::digest::sha256_hex;
 use crate::utils::purl::simple_purl;
@@ -346,17 +346,16 @@ pub(crate) fn lock_lists_direct_dependency(lock: &str, name: &str) -> bool {
     parse(lock).direct.contains(name)
 }
 
-/// Whether a `GEM` section of the Bundler lock `lock` lists the spec
-/// `name (version)` (any platform). Hosted mode only re-points what the lock
-/// resolves: a version that is merely installed on the machine (another
-/// project's copy in the shared gem home) must never be pinned (#1055).
-pub(crate) fn lock_resolves(lock: &str, name: &str, version: &str) -> bool {
-    parse(lock).gem_sections().any(|s| {
-        s.specs
-            .iter()
-            .filter_map(|l| l.parsed)
-            .any(|spec| spec.name == name && spec.version == version)
-    })
+/// Every `name (version)` spec the `GEM` sections of the Bundler lock `lock`
+/// list (any platform). Hosted mode only re-points what the lock resolves:
+/// a version that is merely installed on the machine (another project's
+/// copy in the shared gem home) must never be pinned (#1055).
+pub(crate) fn locked_specs(lock: &str) -> HashSet<(&str, &str)> {
+    parse(lock)
+        .gem_sections()
+        .flat_map(|s| s.specs.iter().filter_map(|l| l.parsed))
+        .map(|spec| (spec.name, spec.version))
+        .collect()
 }
 
 /// The plain gem-token charset (letters, digits, `.`, `_`, `-`). The vendor
