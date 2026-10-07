@@ -1146,7 +1146,15 @@ fn rewrite_npm_lock(
             } else {
                 return true;
             };
-            skip_npm_user_patched(&source, &fname, dep, result);
+            // A lock an earlier (pre-#711) hosted run already pinned keeps
+            // that pin: say so, or the warning's "left unchanged" would
+            // read as healthy while every install still fails.
+            let pinned_in: Vec<&str> = present
+                .iter()
+                .copied()
+                .filter(|lockfile| files[*lockfile].contains(dep.artifact_url.as_str()))
+                .collect();
+            skip_npm_user_patched(&source, &fname, dep, &pinned_in, result);
             false
         })
         .collect();
@@ -1169,18 +1177,33 @@ fn rewrite_npm_lock(
 /// does apply installs bytes that are neither the original nor the Socket
 /// patch, which VEX can never attest. Warns, keeps the in-run VEX from
 /// assuming the uuid patched, and keeps any other lock from confirming it.
-fn skip_npm_user_patched(source: &str, name: &str, dep: &DepOverride, result: &mut RewriteResult) {
+fn skip_npm_user_patched(
+    source: &str,
+    name: &str,
+    dep: &DepOverride,
+    pinned_in: &[&str],
+    result: &mut RewriteResult,
+) {
     result.bundled_skipped_uuids.insert(dep.patch_uuid.clone());
     result.refused_npm_uuids.insert(dep.patch_uuid.clone());
+    let state = if pinned_in.is_empty() {
+        "It is left unchanged and stays without the Socket patch".to_string()
+    } else {
+        format!(
+            "An earlier hosted run already pinned it in {}, which keeps breaking installs \
+             until `socket-patch rollback {}` restores the registry entry",
+            pinned_in.join(" and "),
+            dep.patch_uuid
+        )
+    };
     result.warnings.push(RewriteWarning {
         code: "redirect_npm_patched_dependency_skipped".into(),
         detail: format!(
             "{source}, a patch the project applies with npm's native `npm patch`; npm applies \
              it on top of whatever tarball the lock names, so pinning {name}@{} to the hosted \
              patch would fail every install `EPATCHFAILED` (or install bytes that match \
-             neither the original nor the Socket patch). It is left unchanged and stays \
-             without the Socket patch: fold the Socket fix into your own patch, or remove the \
-             `patchedDependencies` entry and re-run",
+             neither the original nor the Socket patch). {state}. To get the Socket fix, fold \
+             it into your own patch, or remove the `patchedDependencies` entry and re-run",
             dep.version
         ),
     });
@@ -15752,6 +15775,32 @@ mod tests {
         assert_eq!(r.edits.len(), 2, "{:?} {:?}", r.edits, r.warnings);
         assert!(r.warnings.is_empty(), "{:?}", r.warnings);
         assert!(r.refused_npm_uuids.is_empty());
+
+        // A lock an earlier (pre-fix) hosted run already pinned keeps that
+        // pin: the warning must say so and name the rollback, never claim
+        // the entry is unchanged while every install still fails.
+        let mut files = BTreeMap::new();
+        files.insert(
+            "package-lock.json".to_string(),
+            lock(true).replace(
+                "https://registry.npmjs.org/left-pad/-/left-pad-1.3.0.tgz",
+                "http://p.test/lp.tgz",
+            ),
+        );
+        let r = rewrite_registry_redirect(&files, &[ovr.clone()]);
+        assert!(r.edits.is_empty(), "{:?}", r.edits);
+        assert_eq!(
+            warning_codes(&r),
+            vec!["redirect_npm_patched_dependency_skipped"]
+        );
+        let detail = &r.warnings[0].detail;
+        assert!(
+            detail.contains("already pinned it in package-lock.json")
+                && detail.contains(&format!("socket-patch rollback {}", ovr.patch_uuid))
+                && !detail.contains("left unchanged"),
+            "{detail}"
+        );
+        assert!(r.refused_npm_uuids.contains(&ovr.patch_uuid));
     }
 
     /// #324: the hosted npm rewrite changes only the rewired values and keeps
