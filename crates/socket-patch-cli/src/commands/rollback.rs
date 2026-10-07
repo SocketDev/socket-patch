@@ -3438,7 +3438,7 @@ mod tests {
 
     #[tokio::test]
     async fn superseded_skip_covers_a_copy_holding_neither_side() {
-        let (tmp, target, files) = superseded_copy(b"patched by B");
+        let (_tmp, target, files) = superseded_copy(b"patched by B");
         let result = make_result(&[VerifyRollbackStatus::HashMismatch], &[]);
         let (code, detail) = superseded_record_skip(&target, &result, &files, &superseded_map())
             .await
@@ -3452,7 +3452,7 @@ mod tests {
 
     #[tokio::test]
     async fn superseded_skip_covers_a_gradle_dir_the_record_never_patched() {
-        let (tmp, target, files) = superseded_copy(b"patched by B");
+        let (_tmp, target, files) = superseded_copy(b"patched by B");
         let result = refused("gradle_rollback_hash_mismatch: the before-blob for x does not hash");
         assert!(
             superseded_record_skip(&target, &result, &files, &superseded_map())
@@ -3465,7 +3465,7 @@ mod tests {
     async fn superseded_skip_keeps_jvm_copies_holding_the_patched_bytes() {
         // The record's own patched bytes are still there: a corrupt blob for
         // the directory it patched, or a swapped jar with no backup, fails.
-        let (tmp, target, files) = superseded_copy(b"patched by A");
+        let (_tmp, target, files) = superseded_copy(b"patched by A");
         for error in [
             "gradle_rollback_hash_mismatch: the before-blob for x does not hash",
             "jvm_jar_backup_missing: no original of lib-1.0.jar",
