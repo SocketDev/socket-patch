@@ -215,7 +215,7 @@ pub fn pnpm_trust_configured_detail(server: &str, created: bool, dry_run: bool) 
 
 // The pnpm lock-version sniffs live with the format's model.
 pub use crate::formats::pnpm::{
-    lock_version_major as pnpm_lock_version_major,
+    is_shrinkwrap_lock as pnpm_is_shrinkwrap_lock, lock_version_major as pnpm_lock_version_major,
     may_need_store_flag as pnpm_lock_may_need_store_flag,
 };
 
@@ -472,4 +472,30 @@ pub fn read_npmrc_for_allow_remote(path: &std::path::Path) -> Result<Option<Stri
     crate::utils::fs::read_regular_to_string_sync(path)
         .map(Some)
         .map_err(|e| format!("could not be read ({e})"))
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    /// #904 (hosted): a BOM-prefixed `trustLockfile:` first line is the
+    /// user's explicit setting — kept, never shadowed by an appended
+    /// duplicate key — and a BOM file that needs the key keeps its BOM.
+    #[test]
+    fn workspace_trust_plan_reads_a_bom_first_key() {
+        match plan_workspace_trust(Some("\u{feff}trustLockfile: false\npackages:\n  - .\n")) {
+            TrustPlan::UserSet(value) => assert_eq!(value, "false"),
+            _ => panic!("expected UserSet(false)"),
+        }
+        assert!(matches!(
+            plan_workspace_trust(Some("\u{feff}trustLockfile: true\npackages:\n  - .\n")),
+            TrustPlan::AlreadyTrue
+        ));
+        match plan_workspace_trust(Some("\u{feff}packages:\n  - .\n")) {
+            TrustPlan::Append(text) => {
+                assert_eq!(text, "\u{feff}packages:\n  - .\ntrustLockfile: true\n")
+            }
+            _ => panic!("expected Append"),
+        }
+    }
 }

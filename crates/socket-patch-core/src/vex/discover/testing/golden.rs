@@ -38,7 +38,7 @@ use serde_json::{json, Map, Value};
 
 use crate::vex::discover::{
     ContestedRef, Diag, Discovery, PatchedRef, Recognized, ResolvedElsewhere, Unattested,
-    UnlockedPin, WiringMode,
+    UnlockedPin, UnpatchedCopy, WiringMode,
 };
 
 /// Set to `1` to (re)write the goldens instead of comparing against them.
@@ -120,6 +120,7 @@ fn render(out: &Discovery, root: &Path) -> Value {
         recognized,
         unlocked_pins,
         elsewhere,
+        unpatched_copies,
         unattested,
         contested,
         shadowed,
@@ -230,6 +231,26 @@ fn render(out: &Discovery, root: &Path) -> Value {
     }
     if !shadowed.is_empty() {
         rendered["shadowed"] = shadowed.iter().map(render_ref).collect::<Vec<_>>().into();
+    }
+    if !unpatched_copies.is_empty() {
+        rendered["unpatched_copies"] = unpatched_copies
+            .iter()
+            .map(|c| {
+                let UnpatchedCopy {
+                    purl,
+                    file,
+                    key,
+                    how,
+                } = c;
+                json!({
+                    "purl": purl,
+                    "file": path_str(file),
+                    "key": key,
+                    "how": normalize(how, &roots),
+                })
+            })
+            .collect::<Vec<_>>()
+            .into();
     }
     if !contested.is_empty() {
         rendered["contested"] = contested

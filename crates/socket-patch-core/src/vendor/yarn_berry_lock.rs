@@ -45,12 +45,12 @@ use sha2::{Digest, Sha256, Sha512};
 
 use crate::constants::SOCKET_DIR;
 use crate::formats::yarn::berry_entry::{manifest_bin, render_pinned_entry, Pin};
+use crate::formats::yarn::berry_gates::{self, BerryGate, Yarnrc, SUPPORTED_CACHE_KEY};
 use crate::manifest::schema::PatchRecord;
 use crate::patch::apply::PatchSources;
 use crate::utils::fs::{
     atomic_write_bytes_preserving_mode, read_regular_to_bytes, read_regular_to_string,
 };
-use crate::utils::line_endings::LineEndings;
 use crate::utils::socket_dir::remove_tree_and_prune;
 use crate::utils::uri::encode_uri_component;
 
@@ -83,10 +83,6 @@ static PKG_JSON_MEMO: ParseMemo<Value> = ParseMemo::new();
 /// Wiring kinds this backend owns.
 const KIND_RESOLUTION: &str = "yarn_berry_resolution";
 const KIND_LOCK_ENTRY: &str = "yarn_berry_lock_entry";
-
-/// The only cache key the offline checksum recipe reproduces (yarn 4's
-/// internal CACHE_VERSION `10` + compressionLevel 0 → `c0`).
-const SUPPORTED_CACHE_KEY: &str = "10c0";
 
 /// Vendor one installed npm package into a yarn-berry (4.x, cacheKey 10c0)
 /// project. Same contract as [`super::npm_lock::vendor_npm`]: refuse-early,
@@ -166,7 +162,7 @@ impl NpmLockBackend for YarnBerryBackend {
             return Err(Box::new(outcome));
         }
         let blocks = scan_blocks_shared(&lock_text);
-        if let Some(outcome) = refuse_unsupported_cache(&blocks) {
+        if let Some(outcome) = refuse_unsupported_cache(&lock_text) {
             return Err(Box::new(outcome));
         }
 
@@ -578,7 +574,7 @@ pub(super) async fn read_project(project_root: &Path) -> Result<BerryProject, &'
         return Err(code(outcome));
     }
     let blocks = scan_blocks_shared(&lock_text);
-    if let Some(outcome) = refuse_unsupported_cache(&blocks) {
+    if let Some(outcome) = refuse_unsupported_cache(&lock_text) {
         return Err(code(outcome));
     }
     if let Some(outcome) = refuse_unsupported_compression(project_root).await {
@@ -964,78 +960,50 @@ fn revert_resolution_record(
 
 // ───────────────────────────── vendor internals ─────────────────────────────
 
-/// The pre-write refusal for a berry file (`yarn.lock` / `package.json`)
-/// whose line endings mix CRLF and LF, or that holds a bare CR.
-///
-/// yarn berry keeps ONE line ending per file: a new file gets `os.EOL`
-/// (CRLF on Windows) and every later write re-renders the whole file in its
-/// majority ending (`normalizeLineEndings` in yarnpkg-fslib `FakeFS.ts`,
-/// used by `Project.persistLockfile` and `Workspace.persistManifest`). A
-/// uniformly CRLF or LF file is therefore spliced (yarn.lock) or
-/// re-serialized (package.json) in its own ending; a mixed one has no
-/// ending to keep — and `yarn install --immutable` already rejects a mixed
-/// lock (YN0028), because the re-render differs from the file. `yarn
-/// install` normalizes both files, after which vendoring proceeds.
-fn refuse_mixed_line_endings(file: &str, text: &str) -> Option<VendorOutcome> {
-    (LineEndings::of(text) == LineEndings::Mixed).then(|| {
-        refused(
-            "vendor_yarn_berry_mixed_line_endings",
-            format!(
-                "{file} mixes CRLF and LF line endings (or holds a bare carriage return), so \
-                 no single line ending can be kept — yarn rewrites the file with one ending \
-                 on its next install and rejects a lockfile like this under `--immutable` \
-                 (YN0028); run `yarn install` once to normalize it, then re-run"
-            ),
-        )
-    })
+/// [`berry_gates::check_line_endings`] as this backend's refusal. A
+/// uniformly CRLF or LF file is spliced (yarn.lock) or re-serialized
+/// (package.json) in its own ending; `yarn install` normalizes a mixed one,
+/// after which vendoring proceeds.
+fn refuse_mixed_line_endings(file: &'static str, text: &str) -> Option<VendorOutcome> {
+    berry_gates::check_line_endings(file, text)
+        .err()
+        .map(gate_refusal)
 }
 
-/// The `__metadata` / `cacheKey` gate: the checksum is sha512 of the cache
-/// archive, whose bytes depend on the cache format version + compression;
-/// only 10c0 (stored entries) is reproducible offline. Emitting a guess would
-/// brick installs with YN0018, so refuse.
-fn refuse_unsupported_cache(blocks: &[LockBlock]) -> Option<VendorOutcome> {
-    let Some(meta) = berry_metadata(blocks) else {
-        return Some(refused(
-            "vendor_lockfile_version_unsupported",
-            "yarn.lock has no `__metadata:` entry — not a yarn berry lockfile".to_string(),
-        ));
-    };
-    let cache_key = berry_field(&meta.lines, "cacheKey").unwrap_or("");
-    (cache_key != SUPPORTED_CACHE_KEY).then(|| {
-        refused(
-            "vendor_yarn_berry_cache_unsupported",
-            format!(
-                "yarn.lock cacheKey is `{cache_key}`; only `{SUPPORTED_CACHE_KEY}` (yarn 4 \
-                 with compressionLevel 0, the default) has an offline-reproducible cache \
-                 checksum — remove custom compression settings and re-run `yarn install`"
-            ),
-        )
-    })
+/// [`berry_gates::check_cache_key`] as this backend's refusal.
+fn refuse_unsupported_cache(lock_text: &str) -> Option<VendorOutcome> {
+    berry_gates::check_cache_key(lock_text)
+        .err()
+        .map(gate_refusal)
 }
 
-/// The `.yarnrc.yml` `compressionLevel` gate: any level but 0
-/// changes berry's cache checksums.
+/// [`berry_gates::check_yarnrc`] over the project's `.yarnrc.yml`: any
+/// compressionLevel but 0 changes berry's cache checksums, and an
+/// unreadable file cannot be verified.
 async fn refuse_unsupported_compression(project_root: &Path) -> Option<VendorOutcome> {
-    match read_regular_to_string(&project_root.join(YARNRC)).await {
-        Ok(rc) => yarnrc_compression_level(&rc)
-            .filter(|level| *level != "0")
-            .map(|level| {
-                refused(
-                    "vendor_yarn_berry_cache_unsupported",
-                    format!(
-                        "{YARNRC} sets `compressionLevel: {level}`, which changes berry's \
-                         cache checksums; only compressionLevel 0 (the yarn 4 default) is \
-                         supported"
-                    ),
-                )
-            }),
-        Err(e) if e.kind() == std::io::ErrorKind::NotFound => None,
-        Err(e) => Some(refused(
-            "vendor_yarn_berry_cache_unsupported",
-            format!("cannot read {YARNRC} to verify the cache configuration: {e}"),
-        )),
-    }
+    let read = read_regular_to_string(&project_root.join(YARNRC)).await;
+    let error;
+    let yarnrc = match &read {
+        Ok(rc) => Yarnrc::Text(rc),
+        Err(e) if e.kind() == std::io::ErrorKind::NotFound => Yarnrc::Absent,
+        Err(e) => {
+            error = e.to_string();
+            Yarnrc::Unreadable(&error)
+        }
+    };
+    berry_gates::check_yarnrc(yarnrc).err().map(gate_refusal)
+}
+
+/// A shared project gate as this backend's refusal: the
+/// `vendor_yarn_berry_*` code, and `vendor_lockfile_version_unsupported`
+/// for a lock that is not berry at all.
+fn gate_refusal(gate: BerryGate) -> VendorOutcome {
+    let code = match (&gate, gate.code_suffix()) {
+        (BerryGate::NoMetadata, _) => "vendor_lockfile_version_unsupported",
+        (_, "mixed_line_endings") => "vendor_yarn_berry_mixed_line_endings",
+        _ => "vendor_yarn_berry_cache_unsupported",
+    };
+    refused(code, gate.detail())
 }
 
 /// The project-level refusals [`vendor_yarn_berry`] raises before any
@@ -1068,7 +1036,7 @@ pub async fn yarn_berry_vendor_preflight(project_root: &Path) -> Option<(&'stati
     if let Some(outcome) = refuse_mixed_line_endings(YARN_LOCK, &lock_text) {
         return into_pair(outcome);
     }
-    if let Some(outcome) = refuse_unsupported_cache(&scan_blocks(&lock_text)) {
+    if let Some(outcome) = refuse_unsupported_cache(&lock_text) {
         return into_pair(outcome);
     }
     if let Some(outcome) = refuse_unsupported_compression(project_root).await {
@@ -1340,47 +1308,6 @@ fn root_workspace_name(blocks: &[LockBlock]) -> Option<String> {
         }
     }
     None
-}
-
-/// The `.yarnrc.yml` `compressionLevel` value, when set. A flat line scan is
-/// enough: yarn writes the knob as a top-level scalar, and any
-/// value we cannot positively read as `0` makes the caller refuse. Shared
-/// with the hosted-redirect rewriter, whose cache-checksum gate is identical.
-/// CRLF lines split like LF ones (`str::lines`), and a leading BOM is
-/// skipped the way yarn's YAML parser skips it — otherwise a knob on the
-/// first line of a BOM'd file would read as unset (the offline-reproducible
-/// default) while yarn applies it and every install fails YN0018.
-///
-/// The value is read as a YAML scalar: a quoted value ends at its closing
-/// quote, and a plain value ends before a whitespace-separated `#` comment
-/// (`compressionLevel: 0 # keep yarn default` is `0`, #370). A `#` with no
-/// whitespace before it stays part of a plain value, as in YAML.
-pub(crate) fn yarnrc_compression_level(rc: &str) -> Option<&str> {
-    yarnrc_scalar(rc, "compressionLevel")
-}
-
-/// The top-level `.yarnrc.yml` scalar `key`, when set, read as
-/// [`yarnrc_compression_level`] describes.
-pub(crate) fn yarnrc_scalar<'a>(rc: &'a str, key: &str) -> Option<&'a str> {
-    let rc = rc.strip_prefix('\u{feff}').unwrap_or(rc);
-    rc.lines().find_map(|line| {
-        let rest = line.strip_prefix(key)?.strip_prefix(':')?.trim();
-        if let Some(quote) = rest.chars().next().filter(|c| matches!(c, '\'' | '"')) {
-            if let Some(end) = rest[1..].find(quote) {
-                return Some(&rest[1..1 + end]);
-            }
-        }
-        let value = rest
-            .char_indices()
-            .find(|&(i, c)| c == '#' && rest[..i].ends_with([' ', '\t']))
-            .map_or(rest, |(i, _)| &rest[..i]);
-        Some(value.trim_end().trim_matches(['\'', '"']))
-    })
-}
-
-/// The lock's exact `__metadata` block (its `version` / `cacheKey` header).
-pub(crate) fn berry_metadata(blocks: &[LockBlock]) -> Option<&LockBlock> {
-    blocks.iter().find(|b| b.key == "__metadata")
 }
 
 /// A berry `resolution:` locator `name@<reference>`, split at the first `@`
@@ -4006,6 +3933,95 @@ __metadata:
         }
     }
 
+    /// #629: both modes run ONE set of berry project gates, so the same
+    /// project gets the same decision — the same gate, under each mode's
+    /// code prefix, with the same detail — from the vendored preflight and
+    /// the hosted rewriter's preflight (the vendored→hosted takeover's).
+    #[tokio::test]
+    async fn both_modes_take_the_same_project_gate_decision() {
+        let half = |t: &str| {
+            let c = crlf(t);
+            let at = c.rfind("\r\n").unwrap();
+            format!("{}\n{}", &c[..at], &c[at + 2..])
+        };
+        let lf_lock = B3_BEFORE_LOCK.to_string();
+        let lf_pkg = B3_BEFORE_PKG.to_string();
+        let no_key = lf_lock.replace("  cacheKey: 10c0\n", "");
+        assert_ne!(no_key, lf_lock, "fixture carries a cacheKey line");
+        for (label, pkg, lock, yarnrc, suffix) in [
+            ("supported", lf_pkg.clone(), lf_lock.clone(), None, None),
+            (
+                "bom crlf",
+                crlf(B3_BEFORE_PKG),
+                format!("\u{feff}{}", crlf(B3_BEFORE_LOCK)),
+                None,
+                None,
+            ),
+            (
+                "cacheKey 10",
+                lf_pkg.clone(),
+                lf_lock.replace("cacheKey: 10c0", "cacheKey: 10"),
+                None,
+                Some("cache_unsupported"),
+            ),
+            (
+                "no cacheKey",
+                lf_pkg.clone(),
+                no_key,
+                None,
+                Some("cache_unsupported"),
+            ),
+            (
+                "compressionLevel mixed",
+                lf_pkg.clone(),
+                lf_lock.clone(),
+                Some("compressionLevel: mixed\n"),
+                Some("cache_unsupported"),
+            ),
+            (
+                "mixed lock",
+                crlf(B3_BEFORE_PKG),
+                half(B3_BEFORE_LOCK),
+                None,
+                Some("mixed_line_endings"),
+            ),
+            (
+                "mixed package.json",
+                half(B3_BEFORE_PKG),
+                crlf(B3_BEFORE_LOCK),
+                None,
+                Some("mixed_line_endings"),
+            ),
+        ] {
+            let fx = fixture_with(&pkg, &lock).await;
+            if let Some(rc) = yarnrc {
+                tokio::fs::write(fx.root().join(YARNRC), rc).await.unwrap();
+            }
+            let vendored = yarn_berry_vendor_preflight(fx.root()).await;
+            let hosted =
+                crate::patch::redirect::preflight_yarn_berry_hosted(&lock, Some(&pkg), yarnrc)
+                    .err();
+            match suffix {
+                None => {
+                    assert_eq!(vendored, None, "{label}: vendored passes");
+                    assert!(hosted.is_none(), "{label}: hosted passes: {hosted:?}");
+                }
+                Some(suffix) => {
+                    let (code, detail) =
+                        vendored.unwrap_or_else(|| panic!("{label}: vendored refuses"));
+                    let hosted = hosted.unwrap_or_else(|| panic!("{label}: hosted refuses"));
+                    assert_eq!(code, format!("vendor_yarn_berry_{suffix}"), "{label}");
+                    assert_eq!(
+                        hosted.code,
+                        format!("redirect_yarn_berry_{suffix}"),
+                        "{label}"
+                    );
+                    assert_eq!(hosted.detail, detail, "{label}: one detail text");
+                }
+            }
+        }
+    }
+
     /// Revert never refuses on line endings. A lock mixed AFTER vendoring
     /// (an editor saving one line LF into a CRLF lock) restores the entry in
     /// the terminator of the block it replaces, every other byte kept; a
@@ -4039,55 +4055,6 @@ __metadata:
             tokio::fs::read_to_string(fx.pkg_path()).await.unwrap(),
             format!("\u{feff}{}", crlf(B3_BEFORE_PKG)),
             "the resolutions entry is gone; the BOM added since stays"
-        );
-    }
-
-    /// A `.yarnrc.yml` saved with a BOM (and CRLF) still has its first-line
-    /// `compressionLevel` knob read — yarn applies it, so it must refuse.
-    #[test]
-    fn yarnrc_compression_level_reads_past_a_bom_and_crlf() {
-        assert_eq!(
-            yarnrc_compression_level("\u{feff}compressionLevel: mixed\r\nnodeLinker: pnp\r\n"),
-            Some("mixed")
-        );
-        assert_eq!(
-            yarnrc_compression_level("nodeLinker: pnp\r\ncompressionLevel: 0\r\n"),
-            Some("0")
-        );
-        assert_eq!(
-            yarnrc_compression_level("\u{feff}nodeLinker: pnp\r\n"),
-            None
-        );
-    }
-
-    /// A trailing YAML comment is not part of the scalar (#370): yarn reads
-    /// `compressionLevel: 0 # keep yarn default` as `0`, quoted or not.
-    #[test]
-    fn yarnrc_compression_level_drops_a_trailing_comment() {
-        for (rc, level) in [
-            ("compressionLevel: 0 # keep yarn default\n", "0"),
-            ("compressionLevel: 0\t# tab-separated\r\n", "0"),
-            ("compressionLevel: 0   #\n", "0"),
-            ("compressionLevel: \"0\" # quoted\n", "0"),
-            ("compressionLevel: '0'# quoted, no gap\n", "0"),
-            ("compressionLevel: mixed # not the default\n", "mixed"),
-            ("compressionLevel: 9 #\r\n", "9"),
-        ] {
-            assert_eq!(yarnrc_compression_level(rc), Some(level), "{rc:?}");
-        }
-    }
-
-    /// A `#` with no whitespace before it is part of a plain scalar in YAML,
-    /// so `0#x` is not the default and must still refuse (fail closed).
-    #[test]
-    fn yarnrc_compression_level_keeps_an_unseparated_hash() {
-        assert_eq!(
-            yarnrc_compression_level("compressionLevel: 0#x\n"),
-            Some("0#x")
-        );
-        assert_eq!(
-            yarnrc_compression_level("compressionLevel: \"0 # in quotes\"\n"),
-            Some("0 # in quotes")
         );
     }
 

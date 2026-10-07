@@ -8,7 +8,7 @@
 //! 1. [`build_candidates`] — reference grants → rewriter overrides.
 //! 2. [`bun_lockb_symlinked`] — the binary-lock symlink refusal.
 //! 3. vlt artifact preflight ([`super::vlt`]) + [`withhold_everywhere`].
-//! 4. (caller) the apply lock, the ledger, the vendored→hosted takeover.
+//! 4. (caller) the apply lock and the vendored→hosted takeover.
 //! 5. [`read_candidate_files`] → [`wheel_targets`] → (caller) wheel metadata,
 //!    and [`yarn_berry_manifest_targets`] → (caller) served npm manifests.
 //! 6. [`rewrite`] — the rewriters, the pnpm `trustLockfile` and npm
@@ -17,8 +17,7 @@
 //!
 //! Nothing here writes, spawns, reads the environment or touches the
 //! network: every host effect (locking, probes, record fetches, the commit
-//! of the rewritten files, the redirect ledger in [`super::ledger`]) stays
-//! with the caller.
+//! of the rewritten files) stays with the caller.
 
 use std::collections::{BTreeMap, BTreeSet, HashMap};
 
@@ -46,9 +45,9 @@ use super::guidance::{
     npm_allow_remote_env_set_detail, npm_allow_remote_manual_detail,
     npm_allow_remote_outer_set_detail, npm_allow_remote_unreadable_detail,
     npm_allow_remote_user_set_detail, npm_lock_url_needles, npm_replace_registry_host_detail,
-    plan_workspace_trust, pnpm_heal_root, pnpm_lock_may_need_store_flag, pnpm_lock_version_major,
-    pnpm_trust_configured_detail, pnpm_trust_legacy_detail, pnpm_trust_manual_guidance,
-    pnpm_trust_policy_preamble, pnpm_trust_workspace_unreadable_detail,
+    plan_workspace_trust, pnpm_heal_root, pnpm_is_shrinkwrap_lock, pnpm_lock_may_need_store_flag,
+    pnpm_lock_version_major, pnpm_trust_configured_detail, pnpm_trust_legacy_detail,
+    pnpm_trust_manual_guidance, pnpm_trust_policy_preamble, pnpm_trust_workspace_unreadable_detail,
     pnpm_trust_workspace_unsupported_detail, read_npmrc_for_allow_remote, read_workspace_for_trust,
     url_host, TrustPlan, NPM_LOCKS, NPM_REPLACE_REGISTRY_HOST_CODE,
     PNPM_TRUST_TRADEOFF_AND_CAUTION, PNPM_WORKSPACE_REL, REDIRECT_PNPM_WORKSPACE_TRUST_EDIT_KIND,
@@ -469,12 +468,16 @@ pub async fn read_candidate_files(
     {
         out.read(view, unreadable, "package.json").await;
     // Otherwise the root manifest's `overrides` decide which git / url /
-    // `file:` dependent specs npm really installs from (#490). Only the npm
-    // lock rewriter reads it, as advisory input: no rewriter edits it, so a
-    // link or an unreadable in-memory entry is left out (the rewriter then
-    // keeps its conservative reading) rather than refused.
+    // `file:` dependent specs npm really installs from (#490), and beside a
+    // classic `yarn.lock` its `packageManager` says whether a yarn 2+ install
+    // could migrate the lock and drop the hosted pins (#907). The npm lock
+    // and yarn classic rewriters read it as advisory input only: no
+    // rewriter edits it, so a link or an unreadable in-memory entry is left
+    // out (the rewriters then keep their conservative reading) rather than
+    // refused.
     } else if candidates.iter().any(|c| c.dep.ecosystem == "npm")
-        && NPM_LOCKS.iter().any(|lock| out.files.contains_key(*lock))
+        && (NPM_LOCKS.iter().any(|lock| out.files.contains_key(*lock))
+            || out.files.contains_key("yarn.lock"))
     {
         let rel = crate::hosted::memory::select::NPM_MANIFEST_REL;
         if let Some(text) = read_advisory(view, unreadable, rel).await {
@@ -1234,14 +1237,13 @@ pub async fn rewrite(
     );
     if let Some((text, edit)) = trust_config_write {
         rewrite.files.insert(PNPM_WORKSPACE_REL.to_string(), text);
-        // Appended last: `--revert` walks edits in reverse, so the trust key
-        // is unwound before the lock originals are restored.
+        // Appended last, after the lock edits it serves. v5 keeps no hosted
+        // ledger, so nothing replays these edits; the order is write order.
         rewrite.edits.push(edit);
     }
     if let Some((text, edit)) = npmrc_config_write {
         rewrite.files.insert(NPMRC_REL.to_string(), text);
-        // Appended after the lock edits for the same reason: a whole-ledger
-        // replay unwinds the setting before the lock originals it served.
+        // Appended after the lock edits, like the pnpm trust key above.
         rewrite.edits.push(edit);
     }
     let rewritten: Vec<String> = rewrite
@@ -1408,9 +1410,7 @@ fn pnpm_trust(
     // needed" for a lock whose era is unknown.
     let all_locks_legacy = pnpm_lock_texts.iter().all(|text| {
         pnpm_lock_version_major(text).is_some_and(|major| major < 9)
-            || text
-                .lines()
-                .any(|line| line.starts_with("shrinkwrapVersion:"))
+            || pnpm_is_shrinkwrap_lock(text)
     });
     let detail = if all_locks_legacy {
         pnpm_trust_legacy_detail(&server)
@@ -1926,8 +1926,8 @@ fn file_ecosystem(rel: &str) -> Option<&'static str> {
         .then_some("pypi")
 }
 
-/// SYMLINK GUARD — fail-closed, whole rewrite, before the ledger and before
-/// any write (hosted rewrites are transactional). The writer stages next to
+/// SYMLINK GUARD — fail-closed, whole rewrite, before any write (hosted
+/// rewrites are transactional). The writer stages next to
 /// the path and renames over it, which REPLACES a symbolic link with a
 /// detached regular copy: the link target goes stale and a revert restores
 /// bytes but never the link. Applies to every ecosystem's files and to dry

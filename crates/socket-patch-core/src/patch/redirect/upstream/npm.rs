@@ -503,7 +503,14 @@ async fn restore_berry(
     };
     let yarnrc_rel = format!("{dir_prefix}.yarnrc.yml");
     let yarnrc = view.read(&yarnrc_rel).await.ok().flatten();
-    if let Err(w) = super::super::preflight_yarn_berry_hosted(raw, yarnrc.as_deref()) {
+    // The root manifest: a hosted pin keyed by its tarball URL keeps the
+    // descriptors it replaced only as `resolutions` selectors routed there.
+    // Read before the gates: a mixed one is refused like a mixed lock.
+    let pkg_rel = format!("{dir_prefix}package.json");
+    let pkg_text = view.read(&pkg_rel).await.ok().flatten();
+    if let Err(w) =
+        super::super::preflight_yarn_berry_hosted(raw, pkg_text.as_deref(), yarnrc.as_deref())
+    {
         refuse_all_in(pins, rel, result, w.detail);
         return;
     }
@@ -520,10 +527,6 @@ async fn restore_berry(
     let version_re =
         Regex::new(r"\n {2}version: ([^\n]*)").expect("static version-line regex is valid");
 
-    // The root manifest: a hosted pin keyed by its tarball URL keeps the
-    // descriptors it replaced only as `resolutions` selectors routed there.
-    let pkg_rel = format!("{dir_prefix}package.json");
-    let pkg_text = view.read(&pkg_rel).await.ok().flatten();
     let mut pkg: Option<serde_json::Value> = pkg_text
         .as_deref()
         .and_then(|t| serde_json::from_str(t.strip_prefix('\u{feff}').unwrap_or(t)).ok())

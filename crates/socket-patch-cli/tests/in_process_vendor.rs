@@ -1675,6 +1675,15 @@ async fn berry_takeovers_refuse_before_reverting_the_old_mode() {
             "yarn.lock",
             "redirect_yarn_berry_mixed_line_endings",
         ),
+        // #628: hosted mode re-renders the root manifest (its
+        // `resolutions`), so a mixed one is refused before the revert, the
+        // same decision the hosted→vendored leg below takes.
+        (
+            "mixed package.json",
+            mix,
+            "package.json",
+            "redirect_yarn_berry_mixed_line_endings",
+        ),
         (
             "compressionLevel",
             compression,

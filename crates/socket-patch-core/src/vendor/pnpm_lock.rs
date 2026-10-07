@@ -5682,6 +5682,56 @@ snapshots:
         );
     }
 
+    /// #903 / #905 (vendored): a BOM-prefixed lock is the lock pnpm reads.
+    /// The flavor sniff used to refuse it as having "no lockfileVersion";
+    /// it now vendors like its plain twin, keeps the BOM, and reverts
+    /// byte-exact.
+    #[tokio::test]
+    async fn bom_lock_vendors_and_reverts_byte_exact() {
+        let bom_lock = format!("\u{feff}{P1_BEFORE_LOCK}");
+        let fx = fixture_with(P1_BEFORE_PKG, &bom_lock).await;
+
+        let (_, entry, _) = expect_done(fx.vendor(false).await);
+        let entry = entry.unwrap();
+        let lock = fx.read(PNPM_LOCK).await;
+        assert!(lock.starts_with("\u{feff}lockfileVersion:"), "{lock}");
+        assert!(lock.contains(&fx.rel_tgz()), "{lock}");
+        assert_eq!(lock.matches('\u{feff}').count(), 1, "{lock}");
+
+        let outcome = revert_pnpm(&entry, fx.root(), false).await;
+        assert!(outcome.success, "{:?}", outcome.error);
+        assert_eq!(fx.read(PNPM_LOCK).await, bom_lock, "revert is byte-exact");
+        assert_eq!(fx.read(PACKAGE_JSON).await, P1_BEFORE_PKG);
+    }
+
+    /// #904 (vendored): a BOM-prefixed `overrides:` first line is the
+    /// user's existing section. The override goes in beside theirs and the
+    /// BOM stays byte-exact; before the fix the section was missed and a
+    /// duplicate top-level `overrides:` appended, which pnpm refuses to parse.
+    #[tokio::test]
+    async fn bom_workspace_override_inserted_beside_existing_not_duplicated() {
+        let fx = fixture_with(P1_BEFORE_PKG, P1_BEFORE_LOCK).await;
+        let original = "\u{feff}overrides:\n  other-pkg: 2.0.0\npackages:\n  - 'packages/*'\n";
+        write_ws(&fx, original).await;
+
+        let (_, entry, _) = expect_done(fx.vendor(false).await);
+        let entry = entry.unwrap();
+        let spec = format!("file:{}", fx.rel_tgz());
+        assert_eq!(
+            fx.read(PNPM_WORKSPACE).await,
+            format!("\u{feff}overrides:\n  other-pkg: 2.0.0\n  left-pad@1.3.0: {spec}\npackages:\n  - 'packages/*'\n"),
+        );
+        assert!(!entry.pnpm.as_ref().unwrap().created_workspace_overrides);
+
+        let outcome = revert_pnpm(&entry, fx.root(), false).await;
+        assert!(outcome.success, "{:?}", outcome.error);
+        assert_eq!(
+            fx.read(PNPM_WORKSPACE).await,
+            original,
+            "revert is byte-exact"
+        );
+    }
+
     /// [`P1_BEFORE_LOCK`] as pnpm 10.5+ writes it when the user's
     /// `is-number: 6.0.0` override lives in pnpm-workspace.yaml: the lock's
     /// `overrides:` records the workspace-file override.

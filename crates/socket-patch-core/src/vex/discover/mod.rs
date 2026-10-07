@@ -408,6 +408,23 @@ pub struct ResolvedElsewhere {
     pub file: PathBuf,
 }
 
+/// A lock entry that installs its OWN copy of a package — a `file:`
+/// directory or tarball, a user url, git, a registry block no Socket rewrite
+/// reached — beside a Socket wiring of the same `name@version` in the SAME
+/// lock (see [`Discovery::unpatched_copy`]). The package manager installs
+/// that copy too (or instead), so the lock's wiring is never attested.
+#[derive(Debug, Clone, PartialEq, Eq, PartialOrd, Ord)]
+pub struct UnpatchedCopy {
+    /// Canonical base purl ([`canonical_base_purl`]).
+    pub purl: String,
+    /// Root-relative lock file.
+    pub file: PathBuf,
+    /// The lock entry's key, as the lock spells it.
+    pub key: String,
+    /// How that entry installs, completing "lock entry `<key>` …".
+    pub how: String,
+}
+
 /// A ref another lock contests ([`Discovery::contest_across_locks`]): it
 /// was dropped from `refs` and diagnosed [`DIAG_REF_UNATTRIBUTABLE`]. Kept
 /// so a ledger reader can name the contesting lock instead of reporting the
@@ -470,14 +487,17 @@ pub struct Discovery {
     /// non-Socket source — the evidence the cross-lock contest
     /// ([`discover_patched_refs_with`]) weighs against another lock's ref.
     pub elsewhere: Vec<ResolvedElsewhere>,
+    /// Same-lock copies that contest that lock's own refs
+    /// ([`Discovery::unpatched_copy`]).
+    pub unpatched_copies: Vec<UnpatchedCopy>,
     /// Refs in `refs` whose wiring a build bypasses ([`Unattested`]).
     pub unattested: Vec<Unattested>,
     /// Refs dropped because another lock contests them ([`ContestedRef`]).
     pub contested: Vec<ContestedRef>,
     /// Refs withheld from `refs` only because the build ALSO installs an
     /// unpatched copy of the same `name@version` that no rewire can reach
-    /// (a bundled copy unpacked from its parent's tarball, a yarn classic
-    /// git or `file:` directory block), each diagnosed
+    /// (a bundled copy unpacked from its parent's tarball, or a same-lock
+    /// [`Discovery::unpatched_copy`]), each diagnosed
     /// [`DIAG_REF_UNATTRIBUTABLE`]. Never attested, but the wiring itself
     /// is the rewriters' own output and names exactly one package version,
     /// so the management commands (rollback, remove, list, the vendored
@@ -641,6 +661,72 @@ impl Discovery {
         });
     }
 
+    /// Record that lock `file`'s entry `key` installs its own copy of `purl`
+    /// (`None` is ignored), `how` saying from where. The cross-lock contest
+    /// only weighs OTHER locks (a lock that wires a package is never its
+    /// own contester there), so this is the one same-lock rule every
+    /// extractor shares (#935, #938, #939): the copy is also
+    /// [`Discovery::resolved_elsewhere`] evidence, and
+    /// [`Discovery::contest_within_locks`] drops every ref of the same
+    /// `name@version` in the same file.
+    pub(crate) fn unpatched_copy(
+        &mut self,
+        file: &str,
+        purl: Option<String>,
+        key: &str,
+        how: &str,
+    ) {
+        let Some(purl) = purl else {
+            return;
+        };
+        self.resolved_elsewhere(file, Some(purl.clone()));
+        // Deduplicated once, in `finalize`: a per-push scan is quadratic
+        // over a lock with thousands of registry blocks.
+        self.unpatched_copies.push(UnpatchedCopy {
+            purl: canonical_base_purl(&purl),
+            file: PathBuf::from(file),
+            key: key.to_string(),
+            how: how.to_string(),
+        });
+    }
+
+    /// Drop every ref whose OWN lock also installs an unpatched copy of the
+    /// same `name@version` ([`Discovery::unpatched_copy`]): the build ships
+    /// that copy whatever the wiring does, so the ref is diagnosed
+    /// ([`DIAG_REF_UNATTRIBUTABLE`], naming the entry) and not emitted, but
+    /// [`Discovery::shadowed`]. Its uuid stays recognized (rule 11).
+    fn contest_within_locks(&mut self) {
+        if self.unpatched_copies.is_empty() {
+            return;
+        }
+        let refs = std::mem::take(&mut self.refs);
+        for r in refs {
+            let copy = self
+                .unpatched_copies
+                .iter()
+                .find(|c| c.purl == r.purl && c.file == r.source_file)
+                .cloned();
+            match copy {
+                Some(c) => {
+                    let file = r.source_file.to_string_lossy().into_owned();
+                    self.diag(
+                        DIAG_REF_UNATTRIBUTABLE,
+                        &file,
+                        format!(
+                            "{file}: {} is wired to Socket patch {} but lock entry `{}` {}; \
+                             that copy stays UNPATCHED and nothing is attested",
+                            r.purl, r.uuid, c.key, c.how
+                        ),
+                    );
+                    // Withheld, not lost: rollback / remove / the takeover
+                    // still unwind the wiring (#828).
+                    self.shadow(r);
+                }
+                None => self.refs.push(r),
+            }
+        }
+    }
+
     /// Drop every ref that ANOTHER lock contests: a lock that resolves the
     /// same package at the same version from a non-Socket source
     /// ([`Discovery::resolved_elsewhere`]) while wiring it to no patch
@@ -801,6 +887,8 @@ impl Discovery {
     fn finalize(&mut self) {
         self.elsewhere.sort();
         self.elsewhere.dedup();
+        self.unpatched_copies.sort();
+        self.unpatched_copies.dedup();
         self.unattested.sort();
         self.unattested.dedup();
         self.contested.sort();
@@ -877,6 +965,7 @@ async fn discover_with_ctx(ctx: DiscoverCtx<'_>) -> Discovery {
     sbt::extract(&ctx, &mut out).await;
     nuget::extract(&ctx, &mut out).await;
     deno::extract(&ctx, &mut out).await;
+    out.contest_within_locks();
     out.contest_across_locks();
     out.recognized.extend(ctx.take_recognized());
     out.finalize();
@@ -1018,6 +1107,12 @@ impl<'a> DiscoverCtx<'a> {
     /// `package.json`'s npm `overrides`).
     pub(crate) async fn read_advisory_text(&self, rel: &str) -> Option<String> {
         self.view.read_text(rel).await.ok()
+    }
+
+    /// Bytes twin of [`DiscoverCtx::read_advisory_text`] (a user's `file:`
+    /// tarball, read only to name the package it holds).
+    pub(crate) async fn read_advisory_bytes(&self, rel: &str) -> Option<Vec<u8>> {
+        self.view.read_bytes(rel).await.ok()
     }
 
     /// Bytes twin of [`DiscoverCtx::read_text`] (JSON and binary locks). A
@@ -2173,6 +2268,23 @@ pub(crate) mod testing {
     /// the patch uuid after it.
     pub(crate) const TOKEN: &str = "11111111-2222-4333-8444-555555555555";
 
+    /// A minimal npm tarball (`package/package.json` naming
+    /// `name@version`) — a user's `file:` tarball copy.
+    pub(crate) fn npm_tgz(name: &str, version: &str) -> Vec<u8> {
+        let manifest = format!(r#"{{"name":"{name}","version":"{version}"}}"#);
+        let mut tar = tar::Builder::new(flate2::write::GzEncoder::new(
+            Vec::new(),
+            flate2::Compression::default(),
+        ));
+        let mut header = tar::Header::new_gnu();
+        header.set_size(manifest.len() as u64);
+        header.set_mode(0o644);
+        header.set_cksum();
+        tar.append_data(&mut header, "package/package.json", manifest.as_bytes())
+            .unwrap();
+        tar.into_inner().unwrap().finish().unwrap()
+    }
+
     /// Production artifact-URL shape on Socket's patch server
     /// (`…/patch/<eco>/<name>/<version>/<token>/<uuid>/<leaf>`).
     pub(crate) fn hosted_url(
@@ -2270,6 +2382,8 @@ pub(crate) mod testing {
             let ctx = self.ctx();
             let mut out = Discovery::default();
             extract(&ctx, &mut out).await;
+            // Same-lock copies contest within one extractor's own locks.
+            out.contest_within_locks();
             let swept = ctx.take_recognized();
             assert_recognition_covers_refs(&out, &swept, "the ctx sweep", Some(self.root()));
             out.recognized.extend(swept);
