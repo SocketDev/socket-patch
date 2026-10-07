@@ -40,9 +40,7 @@ pub(super) async fn load(
     uuid: &str,
 ) -> Result<HatchProject, Failure> {
     let files = read_files(root).await?;
-    if std::env::var("HATCH_ENV_TYPE_VIRTUAL_UV_PATH").is_ok_and(|path| !path.is_empty()) {
-        return Err(("pypi_hatch_unsupported", "vendored Hatch wheels require the pip installer: uv does not enforce local wheel fragment hashes".into()));
-    }
+    require_pip_installer()?;
     let prefix = format!("{{root:uri}}/.socket/vendor/pypi/{uuid}/");
     let state = super::state::load_state_shared(root)
         .await
@@ -110,6 +108,28 @@ pub(super) async fn load(
         in_sync,
         pin,
     })
+}
+
+/// The guards vendoring applies whatever the project's wiring: the pip
+/// installer (environment variable and environment settings), and
+/// Hatch >=1.2 when `name` is an environment dependency. Checked before a
+/// superseded patch's wiring is unwound, so a refusal unrelated to that
+/// wiring never touches the project's files.
+pub(super) async fn preflight(root: &Path, name: &str) -> Result<(), Failure> {
+    let files = read_files(root).await?;
+    require_pip_installer()?;
+    hatch::require_pip_installer(&files).map_err(|error| ("pypi_hatch_unsupported", error))?;
+    if hatch::has_environment_dependency(&files, name) {
+        require_environment_context_support(root).await?;
+    }
+    Ok(())
+}
+
+fn require_pip_installer() -> Result<(), Failure> {
+    if std::env::var("HATCH_ENV_TYPE_VIRTUAL_UV_PATH").is_ok_and(|path| !path.is_empty()) {
+        return Err(("pypi_hatch_unsupported", "vendored Hatch wheels require the pip installer: uv does not enforce local wheel fragment hashes".into()));
+    }
+    Ok(())
 }
 
 async fn require_environment_context_support(root: &Path) -> Result<(), Failure> {
