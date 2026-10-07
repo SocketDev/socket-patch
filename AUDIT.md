@@ -54,12 +54,13 @@ Cloud sessions can't write to GitHub Discussions: GraphQL is blocked, the GitHub
 - `filed #n` (several issues: `filed #n, #m`)
 - `in PR #n`
 - `fixed (#n)`
+- `partly fixed (#n)` (the note names what remains)
 - `already fixed (#n)`
-- `decision #n`
+- `decision #n` (`decision pending` while no decision issue is filed)
 - `rejected`
 - `handed off`
 
-The renderer counts rows by these words.
+The renderer counts rows by the leading word only, so put the status first and notes after the `;`.
 
 ## The living document
 `doc/` describes the code as it is on `main` now; history belongs in the run entries and the original snapshot.

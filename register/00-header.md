@@ -5,7 +5,7 @@
 
 {{PROGRESS}}
 
-- **Status:** a row starts as `to verify` (taken from the review, not yet re-checked on main), then moves to `filed #n`, then `in PR #n`, then `fixed (#n)`. Other statuses: `already fixed (#n)`, `decision #n` (blocked on an owner decision) and `rejected`.
+- **Status:** a row starts as `to verify` (taken from the review, not yet re-checked on main), then moves to `filed #n`, then `in PR #n`, then `fixed (#n)`. Other statuses: `partly fixed (#n)` (a PR fixed part of it; the note names what remains), `already fixed (#n)`, `decision #n` (blocked on an owner decision; `decision pending` when no decision issue is filed yet), `handed off` (moved to another routine, such as the CI janitor) and `rejected`. The progress line counts rows by the leading status word only.
 - **P:** 1 = defect to fix now; 2 = foundation or high-leverage consolidation; 3 = later.
 - **Work items:** [open `arch-audit` issues](https://github.com/SocketDev/socket-patch/issues?q=is%3Aissue+is%3Aopen+label%3Aarch-audit) · [decisions needed](https://github.com/SocketDev/socket-patch/issues?q=is%3Aissue+is%3Aopen+label%3Aarch-audit+label%3Aagent%3Aneeds-human) · [refactor PRs](https://github.com/SocketDev/socket-patch/pulls?q=label%3Aarch-refactor)
 - **Routines:**

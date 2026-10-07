@@ -27,7 +27,7 @@ ROW = re.compile(r'^\|\s*([A-Z][0-9]+)\s*\|')
 # a target is re-rendered whenever the ledger commit named in its stamp changes.
 RENDER_TIME = re.compile(r'\d{4}-\d{2}-\d{2} \d{2}:\d{2} UTC(?= \(ledger `)')
 ENTRY_MARKER = re.compile(r'<!-- arch-audit-entry: (\S+) -->')
-ORDER = ['fixed', 'already fixed', 'in PR', 'filed', 'decision pending', 'to verify',
+ORDER = ['fixed', 'partly fixed', 'already fixed', 'in PR', 'filed', 'decision pending', 'to verify',
          'rejected', 'handed off', 'other', 'missing']
 warnings = []
 
@@ -71,7 +71,8 @@ class Tree:
 STATUS_PREFIXES = [('already fixed', 'already fixed'), ('to verify', 'to verify'),
                    ('handed off', 'handed off'), ('not a defect', 'rejected'),
                    ('decision', 'decision pending'), ('decide', 'decision pending'),
-                   ('rejected', 'rejected'), ('in pr', 'in PR'), ('fixed', 'fixed'),
+                   ('rejected', 'rejected'), ('in pr', 'in PR'), ('partly fixed', 'partly fixed'),
+                   ('fixed', 'fixed'),
                    ('filed', 'filed')]
 
 
