@@ -1760,23 +1760,13 @@ async fn lock_text_refusals_for(
     prior: Option<&crate::ecosystem_dispatch::NpmCrawlSnapshot>,
 ) -> LockRefusals {
     let cwd = params.cwd.as_path();
-    let claimed: Vec<String> = socket_patch_core::patch::redirect::upstream::HostedPin::all(
-        &socket_patch_core::vex::discover_patched_refs_with(
-            cwd,
-            &socket_patch_core::vex::DiscoverOptions {
-                patch_server_origins: params
-                    .patch_server_url
-                    .iter()
-                    .filter(|url| !url.trim().is_empty())
-                    .cloned()
-                    .collect(),
-            },
-        )
-        .await,
-    )
-    .into_iter()
-    .map(|pin| canonical_purl(&pin.purl))
-    .collect();
+    let origins: Vec<String> = params
+        .patch_server_url
+        .iter()
+        .filter(|url| !url.trim().is_empty())
+        .cloned()
+        .collect();
+    let claimed = hosted_claimed_purls(cwd, origins).await;
     let candidates: Vec<(&str, &str)> = selected
         .iter()
         .filter(|sr| bun_refusal.filter(|r| r.applies_to(&sr.purl)).is_none())
@@ -1798,6 +1788,24 @@ async fn lock_text_refusals_for(
         },
     )
     .await
+}
+
+/// The canonical purls the project's lockfiles pin hosted (a patch-server
+/// tarball, Socket's own or one of `origins`): the purls whose vendored
+/// run is a hosted → vendored takeover.
+pub(crate) async fn hosted_claimed_purls(cwd: &Path, origins: Vec<String>) -> Vec<String> {
+    socket_patch_core::patch::redirect::upstream::HostedPin::all(
+        &socket_patch_core::vex::discover_patched_refs_with(
+            cwd,
+            &socket_patch_core::vex::DiscoverOptions {
+                patch_server_origins: origins,
+            },
+        )
+        .await,
+    )
+    .into_iter()
+    .map(|pin| canonical_purl(&pin.purl))
+    .collect()
 }
 
 /// The record a detached ledger entry already carries for `purl` at
@@ -3759,7 +3767,12 @@ async fn run_get_vendored(
     // Dry run: ledger-classification preview only (scan's posture) — no
     // download, no vendor step, no writes.
     if args.common.dry_run {
-        let preview = super::scan::preview_vendor_json(&args.common.cwd, selected).await;
+        let preview = super::scan::preview_vendor_json(
+            &args.common.cwd,
+            selected,
+            &super::rollback::patch_server_origins(&args.common),
+        )
+        .await;
         if args.common.json {
             let mut result = serde_json::json!({
                 "status": "success",

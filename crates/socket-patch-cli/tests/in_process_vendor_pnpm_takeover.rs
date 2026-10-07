@@ -11,7 +11,8 @@
 //! back to installing the unpatched registry release. A refused takeover
 //! must leave the hosted wiring byte-for-byte in place; a plain dependency
 //! and a workspace exact pin equal to the vendored version (#854) still
-//! take over.
+//! take over. The `--dry-run` preview of the same runs lists a refused
+//! pin `would_refuse` with the wet run's code, never `would_vendor`.
 //!
 //! The API and the npm registry are wiremock; no pnpm binary is needed.
 //! Every child process gets the ambient `SOCKET_*` vars scrubbed and
@@ -343,6 +344,15 @@ fn assert_refused(env: &Value, exit: i32, code: &str) {
     );
 }
 
+/// The `scan` / `get --mode vendored --dry-run` preview row for `PURL`.
+fn preview_row(envelope: &Value) -> Value {
+    envelope["vendor"]["patches"]
+        .as_array()
+        .and_then(|rows| rows.iter().find(|r| r["purl"] == PURL))
+        .cloned()
+        .unwrap_or_else(|| panic!("the dry run must preview {PURL}: {envelope:#}"))
+}
+
 async fn refused_takeover_keeps_hosted_pin(shape: Shape, command: &str, code: &str) {
     let server = MockServer::start().await;
     mock_api(&server).await;
@@ -350,9 +360,21 @@ async fn refused_takeover_keeps_hosted_pin(shape: Shape, command: &str, code: &s
     let root = tmp.path();
     let hosted = host_project(root, &server.uri(), shape);
 
-    // The dry run writes nothing.
-    let (_, env) = run_mode(root, &server.uri(), command, "vendored", &["--dry-run"]);
+    // The dry run writes nothing, and previews the wet run's refusal
+    // (status and exit code unchanged) instead of promising the takeover.
+    let (exit, env) = run_mode(root, &server.uri(), command, "vendored", &["--dry-run"]);
     assert_still_hosted(root, &hosted, &env);
+    assert_eq!(
+        exit, 0,
+        "a would_refuse preview does not fail the run: {env:#}"
+    );
+    let row = preview_row(&env);
+    assert_eq!(row["action"], "would_refuse", "{env:#}");
+    assert_eq!(row["errorCode"], code, "{env:#}");
+    assert!(
+        row["error"].as_str().is_some_and(|e| !e.is_empty()),
+        "the preview carries the backend's detail: {env:#}"
+    );
 
     let (exit, env) = run_mode(root, &server.uri(), command, "vendored", &[]);
     assert_refused(&env, exit, code);
@@ -381,6 +403,12 @@ async fn scan_vendored_over_hosted_pnpm_crlf_lock_keeps_the_hosted_pin() {
         .await;
 }
 
+/// #853: `get --mode vendored` over a CRLF lock (a project-level refusal).
+#[tokio::test(flavor = "multi_thread")]
+async fn get_vendored_over_hosted_pnpm_crlf_lock_keeps_the_hosted_pin() {
+    refused_takeover_keeps_hosted_pin(Shape::Crlf, "get", "vendor_lockfile_crlf_unsupported").await;
+}
+
 /// #853: a conflicting user override (a range) in `pnpm-workspace.yaml`.
 #[tokio::test(flavor = "multi_thread")]
 async fn scan_vendored_over_hosted_pnpm_workspace_override_keeps_the_hosted_pin() {
@@ -397,8 +425,11 @@ async fn scan_vendored_over_hosted_pnpm_plain_dep_still_takes_over() {
     let root = tmp.path();
     host_project(root, &server.uri(), Shape::Plain);
 
+    // The hosted project (pin + hosted-created workspace scaffold) is not
+    // over-refused by the preview's takeover gates.
     let (exit, env) = run_mode(root, &server.uri(), "scan", "vendored", &["--dry-run"]);
     assert_eq!(exit, 0, "{env:#}");
+    assert_eq!(preview_row(&env)["action"], "would_vendor", "{env:#}");
 
     let (exit, env) = run_mode(root, &server.uri(), "scan", "vendored", &[]);
     assert_eq!(exit, 0, "the plain takeover must succeed: {env:#}");
@@ -430,6 +461,7 @@ async fn scan_vendored_over_hosted_pnpm_workspace_exact_pin_takes_over() {
     let (exit, env) = run_mode(root, &server.uri(), "scan", "vendored", &["--dry-run"]);
     assert_eq!(exit, 0, "{env:#}");
     assert_still_hosted(root, &hosted, &env);
+    assert_eq!(preview_row(&env)["action"], "would_vendor", "{env:#}");
 
     let (exit, env) = run_mode(root, &server.uri(), "scan", "vendored", &[]);
     assert_eq!(exit, 0, "the exact-pin takeover must succeed: {env:#}");

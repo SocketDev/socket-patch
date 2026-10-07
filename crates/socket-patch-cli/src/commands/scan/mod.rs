@@ -2944,7 +2944,12 @@ async fn run_scan(
     let selected = if report_only {
         selected
     } else if vendor {
-        let refused = vendor_flow::preflight_refused_purls(&args.common.cwd, &selected).await;
+        let refused = vendor_flow::preflight_refused_purls(
+            &args.common.cwd,
+            &selected,
+            &crate::commands::rollback::patch_server_origins(&args.common),
+        )
+        .await;
         stage.plan(&rows, |r| !refused.contains(&r.writer.purl));
         let deferred = stage.deferred_keys();
         selected
@@ -3063,7 +3068,14 @@ async fn run_scan(
             // rendered as `[would-refuse]` lines so a preview never
             // advertises vendoring the wet run would refuse.
             let preview = if vendor {
-                Some(preview_vendor_json(&args.common.cwd, &selected).await)
+                Some(
+                    preview_vendor_json(
+                        &args.common.cwd,
+                        &selected,
+                        &crate::commands::rollback::patch_server_origins(&args.common),
+                    )
+                    .await,
+                )
             } else {
                 None
             };

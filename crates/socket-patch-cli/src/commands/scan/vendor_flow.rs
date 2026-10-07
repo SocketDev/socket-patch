@@ -22,7 +22,7 @@ use socket_patch_core::manifest::operations::{read_manifest, write_manifest};
 use socket_patch_core::manifest::schema::PatchRecord;
 use socket_patch_core::telemetry::{track_patch_vendor_failed, PendingTelemetry};
 use socket_patch_core::utils::composer_version::composer_purls_equivalent;
-use socket_patch_core::utils::purl::strip_purl_qualifiers;
+use socket_patch_core::utils::purl::{canonical_purl, strip_purl_qualifiers};
 use socket_patch_core::vendor::{load_state, lookup_entry, save_state, VendorState};
 use std::collections::{HashMap, HashSet};
 use std::path::Path;
@@ -75,7 +75,9 @@ type VendorStepResult = Result<(bool, Envelope), VendorStepError>;
 /// package-lock preflight
 /// ([`crate::commands::bun_preflight::BunVendorRefusal`],
 /// [`crate::commands::vlt_preflight`], [`npm_lock_refusal`]) would refuse
-/// before any download.
+/// before any download, or whose hosted pnpm pin the takeover would fail
+/// to replace ([`hosted_pnpm_refusals`]: the pnpm backend's lock-text
+/// refusal, #853). `origins` are the run's `--patch-server-url` origins.
 /// The preview stays a ledger classification otherwise (engine refusals
 /// outside the preflights are not predicted), and `would_refuse` never
 /// flips the run's status or exit code. The preflights (the only disk
@@ -83,6 +85,7 @@ type VendorStepResult = Result<(bool, Envelope), VendorStepError>;
 pub(crate) async fn preview_vendor_json(
     cwd: &Path,
     selected: &[PatchSearchResult],
+    origins: &[String],
 ) -> serde_json::Value {
     // The ledger load outcome reaches the preflight AS a result, so an
     // unreadable ledger previews as `vendor_state_unreadable` rather than
@@ -94,6 +97,7 @@ pub(crate) async fn preview_vendor_json(
         vlt_vendor_preflight_selected(cwd, selected, state.as_ref().map(|s| &s.entries)).await;
     let npm_lock_refusal = npm_lock_refusal(cwd, selected).await;
     let state = state.unwrap_or_default();
+    let takeover_refusals = hosted_pnpm_refusals(cwd, selected, origins, &state).await;
     let mut patches: Vec<serde_json::Value> = selected
         .iter()
         .map(|p| match lookup_entry(&state.entries, &p.purl) {
@@ -115,6 +119,13 @@ pub(crate) async fn preview_vendor_json(
             }
             _ if p.purl.starts_with("pkg:npm/") && npm_lock_refusal.is_some() => {
                 let (code, detail) = npm_lock_refusal.as_ref().expect("checked by the guard");
+                serde_json::json!({
+                    "purl": p.purl, "uuid": p.uuid, "action": "would_refuse",
+                    "errorCode": code, "error": detail,
+                })
+            }
+            _ if takeover_refusals.contains_key(&p.purl) => {
+                let (code, detail) = &takeover_refusals[&p.purl];
                 serde_json::json!({
                     "purl": p.purl, "uuid": p.uuid, "action": "would_refuse",
                     "errorCode": code, "error": detail,
@@ -158,13 +169,15 @@ fn with_symlink_warnings(cwd: &Path, purl: &str, mut row: serde_json::Value) -> 
     row
 }
 
-/// The purls of `selected` the wet run's Bun, vlt or npm package-lock preflight would refuse
+/// The purls of `selected` the wet run's Bun, vlt or npm package-lock
+/// preflight, or the hosted pnpm takeover's lock-text gates, would refuse
 /// before any download (the `would_refuse` rows of
 /// [`preview_vendor_json`]): the vendored planning pass, so a refused NEW
 /// patch holds no rollout slot.
 pub(super) async fn preflight_refused_purls(
     cwd: &Path,
     selected: &[PatchSearchResult],
+    origins: &[String],
 ) -> HashSet<String> {
     let state = load_state(cwd).await;
     let refusal =
@@ -172,12 +185,15 @@ pub(super) async fn preflight_refused_purls(
     let vlt_refusals =
         vlt_vendor_preflight_selected(cwd, selected, state.as_ref().map(|s| &s.entries)).await;
     let npm_lock_refusal = npm_lock_refusal(cwd, selected).await;
+    let takeover_refusals =
+        hosted_pnpm_refusals(cwd, selected, origins, &state.unwrap_or_default()).await;
     selected
         .iter()
         .filter(|p| {
             refusal.as_ref().is_some_and(|r| r.applies_to(&p.purl))
                 || vlt_refusal_for(&vlt_refusals, &p.purl).is_some()
                 || (p.purl.starts_with("pkg:npm/") && npm_lock_refusal.is_some())
+                || takeover_refusals.contains_key(&p.purl)
         })
         .map(|p| p.purl.clone())
         .collect()
@@ -195,6 +211,43 @@ async fn npm_lock_refusal(
         return None;
     }
     socket_patch_core::vendor::npm_lock_vendor_preflight(cwd).await
+}
+
+/// The lock-text refusals a hosted → vendored takeover of `selected` meets
+/// in a pnpm project (#853), keyed by the selected purl: each npm purl the
+/// lockfiles pin hosted (see [`crate::commands::get::hosted_claimed_purls`])
+/// and the ledger does not already hold at this uuid, refused by the pnpm
+/// backend on the project's lock and manifest text
+/// ([`socket_patch_core::vendor::pnpm_takeover_lock_text_refusals`]). The
+/// wet takeover reaches the same refusal after its restore and rolls the
+/// restore back, so the hosted pin stays. Discovery runs only when the
+/// selection holds an npm purl and the project has a pnpm lock.
+async fn hosted_pnpm_refusals(
+    cwd: &Path,
+    selected: &[PatchSearchResult],
+    origins: &[String],
+    state: &VendorState,
+) -> HashMap<String, (&'static str, String)> {
+    let npm = |p: &&PatchSearchResult| p.purl.starts_with("pkg:npm/");
+    if !selected.iter().any(|p| npm(&p))
+        || tokio::fs::metadata(cwd.join("pnpm-lock.yaml"))
+            .await
+            .is_err()
+    {
+        return HashMap::new();
+    }
+    let claimed = crate::commands::get::hosted_claimed_purls(cwd, origins.to_vec()).await;
+    let candidates: Vec<(&str, &str)> = selected
+        .iter()
+        .filter(npm)
+        .filter(|p| claimed.contains(&canonical_purl(&p.purl)))
+        .filter(|p| lookup_entry(&state.entries, &p.purl).is_none_or(|e| e.uuid != p.uuid))
+        .map(|p| (p.purl.as_str(), p.uuid.as_str()))
+        .collect();
+    if candidates.is_empty() {
+        return HashMap::new();
+    }
+    socket_patch_core::vendor::pnpm_takeover_lock_text_refusals(cwd, &candidates).await
 }
 
 /// Human rendering of the vendored dry-run preview's `would_refuse` records
@@ -574,7 +627,8 @@ async fn run_vendor_json_path(
     // The planning pass: a patch the preflight refuses holds no slot (it
     // still reaches the engine, which reports the refusal).
     let writers = writers_of(&rows);
-    let refused = preflight_refused_purls(&args.common.cwd, &writers).await;
+    let origins = crate::commands::rollback::patch_server_origins(&args.common);
+    let refused = preflight_refused_purls(&args.common.cwd, &writers, &origins).await;
     stage.plan(&rows, |r| !refused.contains(&r.writer.purl));
     let deferred = stage.deferred_keys();
     let selected: Vec<PatchSearchResult> = writers
@@ -586,7 +640,7 @@ async fn run_vendor_json_path(
     if args.common.dry_run {
         // No downloads, no backends: classify against the ledger
         // and preview the GC, exactly like `--apply`'s dry run.
-        result["vendor"] = preview_vendor_json(&args.common.cwd, &selected).await;
+        result["vendor"] = preview_vendor_json(&args.common.cwd, &selected, &origins).await;
         if prune {
             result["gc"] = gc_json(
                 &args.common,
@@ -1315,7 +1369,7 @@ mod preview_tests {
     #[tokio::test]
     async fn preview_without_bun_lock_is_plain_would_vendor() {
         let tmp = tempfile::tempdir().unwrap();
-        let preview = preview_vendor_json(tmp.path(), &[sel(UUID, NPM)]).await;
+        let preview = preview_vendor_json(tmp.path(), &[sel(UUID, NPM)], &[]).await;
         assert_eq!(
             preview,
             serde_json::json!({
@@ -1340,7 +1394,8 @@ mod preview_tests {
             tmp.path().join("yarn.lock"),
         )
         .unwrap();
-        let preview = preview_vendor_json(tmp.path(), &[sel(UUID, NPM), sel(UUID, PYPI)]).await;
+        let preview =
+            preview_vendor_json(tmp.path(), &[sel(UUID, NPM), sel(UUID, PYPI)], &[]).await;
         let npm = action_of(&preview, NPM);
         assert_eq!(npm["action"], "would_vendor", "{preview}");
         assert_eq!(
@@ -1365,7 +1420,8 @@ mod preview_tests {
     async fn preview_marks_would_refuse_for_refused_bun_tree() {
         let tmp = tempfile::tempdir().unwrap();
         std::fs::write(tmp.path().join("bun.lock"), V1_WORKSPACE_LOCK).unwrap();
-        let preview = preview_vendor_json(tmp.path(), &[sel(UUID, NPM), sel(UUID, PYPI)]).await;
+        let preview =
+            preview_vendor_json(tmp.path(), &[sel(UUID, NPM), sel(UUID, PYPI)], &[]).await;
         let npm = action_of(&preview, NPM);
         assert_eq!(npm["action"], "would_refuse", "{preview}");
         assert_eq!(
@@ -1397,7 +1453,7 @@ mod preview_tests {
         std::fs::write(tmp.path().join("bun.lock"), V1_WORKSPACE_LOCK).unwrap();
 
         seed_entry(tmp.path(), NPM, UUID);
-        let preview = preview_vendor_json(tmp.path(), &[sel(UUID, NPM)]).await;
+        let preview = preview_vendor_json(tmp.path(), &[sel(UUID, NPM)], &[]).await;
         assert_eq!(
             action_of(&preview, NPM)["action"],
             "would_refuse",
@@ -1405,7 +1461,7 @@ mod preview_tests {
         );
 
         seed_entry(tmp.path(), NPM, OLD_UUID);
-        let preview = preview_vendor_json(tmp.path(), &[sel(UUID, NPM)]).await;
+        let preview = preview_vendor_json(tmp.path(), &[sel(UUID, NPM)], &[]).await;
         let rec = action_of(&preview, NPM);
         assert_eq!(rec["action"], "would_refuse", "{preview}");
         assert!(
@@ -1419,7 +1475,7 @@ mod preview_tests {
         );
         std::fs::write(tmp.path().join("bun.lock"), wired).unwrap();
         seed_entry(tmp.path(), NPM, UUID);
-        let preview = preview_vendor_json(tmp.path(), &[sel(UUID, NPM)]).await;
+        let preview = preview_vendor_json(tmp.path(), &[sel(UUID, NPM)], &[]).await;
         assert_eq!(
             action_of(&preview, NPM)["action"],
             "already_vendored",
@@ -1432,10 +1488,97 @@ mod preview_tests {
     async fn preview_marks_malformed_lockb_would_refuse() {
         let tmp = tempfile::tempdir().unwrap();
         std::fs::write(tmp.path().join("bun.lockb"), b"\x00binary").unwrap();
-        let preview = preview_vendor_json(tmp.path(), &[sel(UUID, NPM)]).await;
+        let preview = preview_vendor_json(tmp.path(), &[sel(UUID, NPM)], &[]).await;
         assert_eq!(
             action_of(&preview, NPM)["errorCode"],
             "vendor_bun_lockb_invalid",
+            "{preview}"
+        );
+    }
+
+    const PNPM: &str = "pkg:npm/left-pad@1.3.0";
+
+    /// A pnpm v9 project with `left-pad@1.3.0` resolved from `tarball`,
+    /// declared through the default catalog when `catalog` is set.
+    fn pnpm_project(root: &Path, tarball: &str, catalog: bool) {
+        let spec = if catalog { "catalog:" } else { "1.3.0" };
+        std::fs::write(
+            root.join("package.json"),
+            format!(r#"{{"name":"c","version":"1.0.0","dependencies":{{"left-pad":"{spec}"}}}}"#),
+        )
+        .unwrap();
+        let mut lock = String::from("lockfileVersion: '9.0'\n\n");
+        if catalog {
+            std::fs::write(
+                root.join("pnpm-workspace.yaml"),
+                "packages:\n  - .\ncatalog:\n  left-pad: 1.3.0\n",
+            )
+            .unwrap();
+            lock.push_str(
+                "catalogs:\n  default:\n    left-pad:\n      specifier: 1.3.0\n      version: 1.3.0\n\n",
+            );
+        }
+        let specifier = if catalog { "'catalog:'" } else { "1.3.0" };
+        lock.push_str(&format!(
+            "importers:\n\n  .:\n    dependencies:\n      left-pad:\n        specifier: {specifier}\n        version: 1.3.0\n\n\
+             packages:\n\n  left-pad@1.3.0:\n    resolution: {{integrity: sha512-x==, tarball: {tarball}}}\n\n\
+             snapshots:\n\n  left-pad@1.3.0: {{}}\n"
+        ));
+        std::fs::write(root.join("pnpm-lock.yaml"), lock).unwrap();
+    }
+
+    fn hosted_tarball(origin: &str) -> String {
+        format!("{origin}/patch/npm/left-pad/1.3.0/55555555-5555-4555-8555-555555555555/{UUID}/left-pad-1.3.0.tgz")
+    }
+
+    /// #853: a hosted pnpm pin the vendored backend refuses on lock text
+    /// (here a `catalog:` dependency) previews `would_refuse` with the wet
+    /// takeover's code, not `would_vendor`.
+    #[tokio::test]
+    async fn preview_refuses_hosted_pnpm_catalog_pin() {
+        let tmp = tempfile::tempdir().unwrap();
+        pnpm_project(
+            tmp.path(),
+            &hosted_tarball("https://patch.socket.dev"),
+            true,
+        );
+        let preview = preview_vendor_json(tmp.path(), &[sel(UUID, PNPM)], &[]).await;
+        let row = action_of(&preview, PNPM);
+        assert_eq!(row["action"], "would_refuse", "{preview}");
+        assert_eq!(
+            row["errorCode"], "vendor_lock_entry_unsupported",
+            "{preview}"
+        );
+    }
+
+    /// A pin served from the operator's `--patch-server-url` is hosted too.
+    #[tokio::test]
+    async fn preview_refuses_hosted_pnpm_pin_from_custom_patch_server() {
+        let tmp = tempfile::tempdir().unwrap();
+        let origin = "https://patches.example.com";
+        pnpm_project(tmp.path(), &hosted_tarball(origin), true);
+        let preview =
+            preview_vendor_json(tmp.path(), &[sel(UUID, PNPM)], &[origin.to_string()]).await;
+        assert_eq!(
+            action_of(&preview, PNPM)["action"],
+            "would_refuse",
+            "{preview}"
+        );
+    }
+
+    /// A plain hosted pnpm pin the takeover replaces is not over-refused.
+    #[tokio::test]
+    async fn preview_plain_hosted_pnpm_pin_is_would_vendor() {
+        let tmp = tempfile::tempdir().unwrap();
+        pnpm_project(
+            tmp.path(),
+            &hosted_tarball("https://patch.socket.dev"),
+            false,
+        );
+        let preview = preview_vendor_json(tmp.path(), &[sel(UUID, PNPM)], &[]).await;
+        assert_eq!(
+            action_of(&preview, PNPM)["action"],
+            "would_vendor",
             "{preview}"
         );
     }
