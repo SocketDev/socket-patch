@@ -133,7 +133,7 @@ fn is_marker(line: &str, marker: &str) -> bool {
 }
 
 /// `text` up to a ` #` comment that sits outside quotes.
-fn strip_comment(text: &str) -> &str {
+pub(crate) fn strip_comment(text: &str) -> &str {
     let bytes = text.as_bytes();
     let mut quote = None;
     for (i, &b) in bytes.iter().enumerate() {

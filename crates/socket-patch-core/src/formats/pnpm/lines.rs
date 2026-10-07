@@ -24,6 +24,79 @@ pub(crate) fn section_bounds(lines: &[String], name: &str) -> Option<(usize, usi
     Some((start, end))
 }
 
+/// The importer dependency fields pnpm writes into the env document of a
+/// two-document lock.
+const ENV_DOC_IMPORTER_FIELDS: [&str; 2] = ["configDependencies", "packageManagerDependencies"];
+
+/// Split a lock into `(prefix, project document)`, `prefix + project ==
+/// text`. pnpm >= 11 writes `pnpm-lock.yaml` as two YAML documents when the
+/// project has config dependencies (pnpm 11 and 12) or pins pnpm through
+/// `packageManager` (pnpm 12): `---`, an env document whose `importers:`
+/// hold only `configDependencies` / `packageManagerDependencies` (plus its
+/// own `packages:` / `snapshots:`), `---`, then the project lock. The line
+/// planners address sections by their first column-0 header, so they must
+/// see the project document alone; a config dependency may share the
+/// vendored package's key, so skipping documents without the key is not
+/// enough.
+///
+/// A lock without a column-0 `---` line is one document (`("", text)`); a
+/// lone leading `---` is kept in the prefix. Anything else — more
+/// documents, a first document that is not the env document, a document
+/// end marker, a byte-order mark before a separator — is `Err` (the
+/// reason): the caller refuses rather than guess which document to edit.
+pub(crate) fn split_project_document(text: &str) -> Result<(&str, &str), String> {
+    // `(start, end)` byte offsets of every separator line, `end` past its `\n`.
+    let mut separators: Vec<(usize, usize)> = Vec::new();
+    let mut offset = 0;
+    for line in text.split('\n') {
+        let end = (offset + line.len() + 1).min(text.len());
+        let marker = line.strip_prefix('\u{feff}').unwrap_or(line);
+        if marker.starts_with("---") || marker.starts_with("...") {
+            if marker.len() != line.len() {
+                return Err("has a byte-order mark before its `---` separator".to_string());
+            }
+            if line != "---" {
+                return Err(format!("has a YAML document marker line `{line}`"));
+            }
+            separators.push((offset, end));
+        }
+        offset = end;
+    }
+    match separators[..] {
+        [] => Ok(("", text)),
+        [(start, _), ..] if start != 0 => {
+            Err("has a `---` document separator after its first document".to_string())
+        }
+        [(_, end)] => Ok(text.split_at(end)),
+        [(_, env_start), (env_end, end)] => {
+            check_env_document(&text[env_start..env_end])?;
+            Ok(text.split_at(end))
+        }
+        _ => Err(format!("has {} YAML documents", separators.len())),
+    }
+}
+
+/// The first of two documents must be pnpm's env document: an `importers:`
+/// section whose importers carry only [`ENV_DOC_IMPORTER_FIELDS`].
+fn check_env_document(doc: &str) -> Result<(), String> {
+    let lines = split_lines(doc);
+    let Some((start, end)) = section_bounds(&lines, "importers") else {
+        return Err("has a first document without `importers:`".to_string());
+    };
+    for line in &lines[start + 1..end] {
+        if let Some((field, _, _)) = parse_key_line(line, 4) {
+            if !ENV_DOC_IMPORTER_FIELDS.contains(&field) {
+                return Err(format!(
+                    "has a first document whose importers carry `{field}` (pnpm's \
+                     config-dependency document carries only {})",
+                    ENV_DOC_IMPORTER_FIELDS.join(" / ")
+                ));
+            }
+        }
+    }
+    Ok(())
+}
+
 /// One 2-space-keyed block inside a section (`[header, end)`; `end` stops at
 /// the blank separator / next block header, so the captured fragment is the
 /// verbatim entry without surrounding blanks).
@@ -234,6 +307,48 @@ pub(crate) fn yaml_key_like(key: &str, original_repr: &str) -> String {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    const PROJECT: &str = "lockfileVersion: '9.0'\n\nimporters:\n\n  .:\n    dependencies:\n      a:\n        specifier: 1.0.0\n        version: 1.0.0\n";
+    const ENV_CONFIG: &str = "lockfileVersion: '9.0'\n\nimporters:\n\n  .:\n    configDependencies:\n      a:\n        specifier: 1.0.0\n        version: 1.0.0\n\npackages:\n\n  a@1.0.0:\n    resolution: {integrity: sha512-x}\n\nsnapshots:\n\n  a@1.0.0: {}\n";
+    const ENV_PM: &str = "lockfileVersion: '9.0'\n\nimporters:\n\n  .:\n    configDependencies: {}\n    packageManagerDependencies:\n      pnpm:\n        specifier: 12.8.1\n        version: 12.8.1\n";
+
+    /// #466: one document is the whole lock; pnpm's env document (config
+    /// dependencies, `packageManager`, or both) splits off at the second
+    /// separator, and the prefix plus the project document is the text.
+    #[test]
+    fn split_project_document_keeps_the_env_document_in_the_prefix() {
+        assert_eq!(split_project_document(PROJECT), Ok(("", PROJECT)));
+        let lone = format!("---\n{PROJECT}");
+        assert_eq!(split_project_document(&lone), Ok(("---\n", PROJECT)));
+        let both = ENV_PM.replace(
+            "configDependencies: {}",
+            "configDependencies:\n      a:\n        specifier: 1.0.0\n        version: 1.0.0",
+        );
+        for env in [ENV_CONFIG, ENV_PM, both.as_str()] {
+            let text = format!("---\n{env}\n---\n{PROJECT}");
+            let (prefix, project) = split_project_document(&text).unwrap();
+            assert_eq!(project, PROJECT);
+            assert_eq!(prefix, format!("---\n{env}\n---\n"));
+        }
+    }
+
+    /// Anything but pnpm's env document followed by the project lock is
+    /// refused rather than guessed at.
+    #[test]
+    fn split_project_document_refuses_unrecognized_documents() {
+        let not_env = ENV_CONFIG.replace("configDependencies", "dependencies");
+        for text in [
+            format!("---\n{ENV_CONFIG}\n---\n{ENV_PM}\n---\n{PROJECT}"),
+            format!("---\n{not_env}\n---\n{PROJECT}"),
+            format!("---\npackages:\n\n  a@1.0.0: {{}}\n---\n{PROJECT}"),
+            format!("{PROJECT}---\n{ENV_CONFIG}"),
+            format!("\u{feff}---\n{ENV_CONFIG}\n---\n{PROJECT}"),
+            format!("---\n{ENV_CONFIG}\n---\n{PROJECT}...\n"),
+            format!("--- !tag\n{PROJECT}"),
+        ] {
+            assert!(split_project_document(&text).is_err(), "{text}");
+        }
+    }
 
     /// Values pnpm's writer leaves plain stay byte-identical — the spellings
     /// the vendored legacy splice already round-trips (#754's passing cells).
