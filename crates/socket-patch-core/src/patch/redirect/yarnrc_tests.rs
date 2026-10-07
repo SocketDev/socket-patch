@@ -172,8 +172,11 @@ impl Host {
         })
     }
     /// The effective mirror for `/work/root/proj` with no project rc files.
+    /// The origin is spelled with `/` so the expectations hold on Windows,
+    /// where the resolver joins the rc name with `\`.
     fn mirror(&self) -> Option<(String, String)> {
         mirror_of(effective_mirror(None, None, &self.outer("/work/root/proj")))
+            .map(|(p, origin)| (p, origin.replace('\\', "/")))
     }
 }
 
