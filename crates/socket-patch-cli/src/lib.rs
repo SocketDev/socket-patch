@@ -156,11 +156,14 @@ impl Commands {
     /// Validate the run's path flags ([`args::GlobalArgs::validate_paths`])
     /// for every command that reads the project. `self-update` and the
     /// internal `hosted-bundle` harness (stdin in, stdout out) never touch
-    /// `--cwd`, so an ambient `SOCKET_CWD` must not fail them.
+    /// `--cwd`, so an ambient `SOCKET_CWD` must not fail them. `get` and
+    /// `scan` create the manifest, so a `--manifest-path` into a directory
+    /// that does not exist yet stays legal for them.
     pub fn validate_paths(&self) -> Result<(), String> {
         match self {
             Commands::SelfUpdate(_) | Commands::HostedBundle(_) => Ok(()),
-            other => other.global_args().validate_paths(),
+            Commands::Get(_) | Commands::Scan(_) => self.global_args().validate_paths(true),
+            other => other.global_args().validate_paths(false),
         }
     }
 }

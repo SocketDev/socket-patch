@@ -95,7 +95,11 @@ pub(crate) const GLOBAL_OPTIONS: &str = "Global options";
 //
 // **Every** global flag is parseable on **every** subcommand. Commands that
 // don't use a given flag ignore it silently — e.g. `list --global` parses
-// fine and the `global` field is unused at runtime.
+// fine and the `global` field is unused at runtime. The one exception is
+// the path flags (`--cwd`, `--global-prefix`, `--manifest-path`): `main`
+// validates them on every project command, used or not
+// ([`GlobalArgs::validate_paths`]), because a path that names nothing must
+// never read as an empty project.
 //
 // (Plain `//` comments: clap turns a doc comment here into the `--help`
 // description of any subcommand that has none of its own.)
@@ -396,8 +400,11 @@ impl GlobalArgs {
     ///
     /// A missing manifest FILE stays legal: hosted and vendored projects
     /// have none, and `get` / `scan --mode agent` create it. Only its
-    /// project directory has to exist.
-    pub fn validate_paths(&self) -> Result<(), String> {
+    /// project directory has to exist — except for the commands that
+    /// create the manifest (`creates_manifest`: `get`, `scan`), which make
+    /// a missing directory as they always have; writing it is no vacuous
+    /// pass.
+    pub fn validate_paths(&self, creates_manifest: bool) -> Result<(), String> {
         let not_dir = |flag: &str, env: &str, path: &Path, what: &str| {
             format!("{flag} (or {env}) `{}` {what}", path.display())
         };
@@ -435,7 +442,7 @@ impl GlobalArgs {
                 ));
             }
             let root = self.project_root();
-            if !root.is_dir() {
+            if !creates_manifest && !root.is_dir() {
                 return Err(not_dir(
                     "--manifest-path",
                     "SOCKET_MANIFEST_PATH",

@@ -31,6 +31,13 @@ const COMMANDS: &[&[&str]] = &[
     &["repair"],
 ];
 
+/// `get` and `scan` create the manifest (and its directory), so a
+/// `--manifest-path` into a directory that does not exist yet is legal for
+/// them.
+fn creates_manifest(command: &[&str]) -> bool {
+    matches!(command.first(), Some(&"get") | Some(&"scan"))
+}
+
 fn run(cwd: &Path, command: &[&str], extra: &[&str]) -> (i32, String, String) {
     let mut args: Vec<&str> = command.to_vec();
     args.extend_from_slice(extra);
@@ -121,6 +128,9 @@ fn manifest_path_in_a_missing_directory_is_a_usage_error_on_every_command() {
     let tmp = tempfile::tempdir().unwrap();
     let missing = tmp.path().join("no-such-dir/m.json");
     for command in COMMANDS {
+        if creates_manifest(command) {
+            continue;
+        }
         let (code, stdout, stderr) = run(
             tmp.path(),
             command,
@@ -175,6 +185,36 @@ fn existing_paths_and_a_missing_manifest_file_still_run() {
         assert_eq!(
             code, 0,
             "a missing manifest file in an existing project stays legal: {stderr}"
+        );
+    }
+}
+
+/// The commands that create the manifest keep creating its directory: a
+/// fresh checkout's `get --manifest-path state/patches.json` is no usage
+/// error, and neither is `scan`. A directory in that position still is.
+#[test]
+fn manifest_creating_commands_accept_a_manifest_path_in_a_new_directory() {
+    let tmp = tempfile::tempdir().unwrap();
+    let missing = tmp.path().join("state/patches.json");
+    for command in COMMANDS.iter().filter(|c| creates_manifest(c)) {
+        let (code, stdout, stderr) = run(
+            tmp.path(),
+            command,
+            &["--manifest-path", missing.to_str().unwrap()],
+        );
+        assert_ne!(
+            code, 2,
+            "{command:?} creates the manifest\nstdout={stdout}\nstderr={stderr}"
+        );
+        assert!(!stderr.contains("--manifest-path"), "{command:?}: {stderr}");
+        let (code, _stdout, stderr) = run(
+            tmp.path(),
+            command,
+            &["--manifest-path", tmp.path().to_str().unwrap()],
+        );
+        assert_eq!(
+            code, 2,
+            "{command:?}: a directory is no manifest file: {stderr}"
         );
     }
 }
