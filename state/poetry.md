@@ -1,6 +1,6 @@
 [agent] Progress ledger for the scheduled Poetry bug-hunt routine (label pm:poetry).
 
-Last updated: 2026-10-06 (run 14), main `9c43dfc` (includes #330, #446, #452, #456, #503, #527, #538, #540, #644, #703, #708), latest release 4.0.0 (previous 3.3.0). Run 9 re-measured the cells marked "r9". Runs 10–14 have their own tables below. #327 and #329 are closed: macOS / Windows cells that still show them haven't been re-run, because probe branches are blocked.
+Last updated: 2026-10-07 (run 15), main `db83f01` (includes #330, #446, #452, #456, #503, #527, #538, #540, #644, #703, #708, #950, #963), latest release 4.0.0 (previous 3.3.0). Run 9 re-measured the cells marked "r9". Runs 10–15 have their own tables below. #327 and #329 are closed: macOS / Windows cells that still show them haven't been re-run, because probe branches are blocked.
 
 ## Coverage matrix
 
@@ -153,15 +153,26 @@ Global installs aren't Poetry-specific (Poetry never installs globally unless `v
 | 2.5.1 | #866, #671 | still fail |
 | 2.5.1, `create = false` (uv CPython) | hosted `vex` / agent with an apt `python3-six` in `/usr/lib/python3/dist-packages` | vex refuses (`not_applied`); agent also patches the dpkg-owned copy. Lead (backlog 1) |
 
+### Run 15 cells (Linux, main `db83f01`)
+
+| Poetry | Cell | Result |
+| --- | --- | --- |
+| 2.5.1, 2.2.1, 1.8.5 | Fresh lock-only checkout (default `create = true`, no env yet), apt `six` in system Python: vendored | fail #1023 (exit 1, `pypi_poetry_lock_package_missing`) |
+| 2.5.1 | same, agent | fail #1023 (patches dpkg-owned `six.py`) |
+| 2.2.1 | `in-project = true`, no `.venv`, no out-of-tree env | fail #1023 |
+| 2.2.1 | `create = false` | fallback intended |
+| 2.5.1, 1.8.5 | Two patched packages, `remove` one: hosted + vendored, LF + CRLF; vendored `remove <uuid>` | pass |
+| 2.5.1 | `remove` / `rollback` with a non-canonical PyPI purl (`typing_extensions`, `Typing-Extensions`), agent / hosted / vendored | fail #1024 |
+| 0.12.17 | #945 re-check | still fails (commented) |
+
 ## Backlog
 
-1. **Lead (run 14):** with `virtualenvs.create = false`, the project global fallback (`get_global_python_site_packages`) crawls every well-known dir, including other interpreters' `/usr/lib/python3/dist-packages` and `/usr/local/lib/python3.X`. Hosted `vex` then refuses a correct install because of an unrelated apt copy, and agent mode patches dpkg-owned files. That follows from #538's "patch every copy" design, so it needs a maintainer call before anyone files it. A realistic trigger: a `python:3.x` image plus apt `python3-six`.
-2. **macOS / Windows re-checks for closed #327 / #329**, the #640 default paths (`~/Library/Application Support/pypoetry/venv`, `%APPDATA%\pypoetry\venv`), and #866 on macOS (where `poetry_default_data_dirs` can return two data dirs). All need probe branches.
-3. **macOS XDG** (run 8 lead): with `XDG_CACHE_HOME` / `XDG_CONFIG_HOME` set and platformdirs ≥ 4.6.0, Poetry uses the XDG dirs, but `poetry_default_cache_dir` / `poetry_user_config_path` only look in `~/Library/...`. Needs a macOS probe.
-4. **Windows Poetry 1.0/1.1 env hash** (run 8 lead): Poetry < 1.2 hashes the raw cwd, while socket-patch lowercases it. Needs a Windows probe.
-5. Probe branches are still blocked: `bughunt/poetry/20260930-venv-discovery` and `bughunt/poetry/20260930-windows-modes` still exist (run 14), and deletion was denied in runs 9–14. A maintainer needs to delete them and allow deleting `bughunt/poetry/*`.
-6. Two patched packages in one lock: `remove` one, keep the other (hosted + vendored, LF + CRLF). Needs a two-patch mock.
-7. Docs: `installer.modern-installation = false` (Poetry 1.4–1.8) keeps a warm same-version install, but the poetry-compatibility "Installer boundaries" table says 1.4–1.8 replace it.
+1. Re-check #1023 when a Poetry guard lands (PR #965 covers uv only). Confirm that `create = false` still falls back.
+2. **Lead (run 14):** with `virtualenvs.create = false`, the project global fallback (`get_global_python_site_packages`) crawls every well-known dir, including other interpreters' `/usr/lib/python3/dist-packages` and `/usr/local/lib/python3.X`. Hosted `vex` then refuses a correct install because of an unrelated apt copy, and agent mode patches dpkg-owned files. That follows from #538's "patch every copy" design, so it needs a maintainer call before anyone files it.
+3. **macOS / Windows re-checks for closed #327 / #329**, the #640 default paths, #866 on macOS, macOS XDG (`XDG_CACHE_HOME` / `XDG_CONFIG_HOME` with platformdirs ≥ 4.6), and the Windows Poetry 1.0/1.1 env hash (raw vs lowercased cwd). All need probe branches.
+4. Probe branches are still blocked: `bughunt/poetry/20260930-venv-discovery` and `bughunt/poetry/20260930-windows-modes` still exist (run 15), and deletion was denied in runs 9–15. A maintainer needs to delete them and allow deleting `bughunt/poetry/*`.
+5. Two-patch cells on a lock 1.1 (Poetry 1.1.15) and on a mixed-EOL lock. Vendored `repair` with one of two wheels deleted.
+6. Docs: `installer.modern-installation = false` (Poetry 1.4–1.8) keeps a warm same-version install, but the poetry-compatibility "Installer boundaries" table says 1.4–1.8 replace it.
 
 ## Known non-bugs
 
@@ -216,3 +227,5 @@ Global installs aren't Poetry-specific (Poetry never installs globally unless `v
 - Copying a project together with its `.venv` (virtualenv-created) keeps pip entry scripts pointing at the source venv, so Poetry 1.1 installs land in the wrong tree. Always create fresh venvs.
 - `redirect_takeover_unpatched` after a refused lock is documented in CLI_CONTRACT.md. #945 covers only the Poetry 0.x dry-run mismatch and the missing pre-revert gate.
 - Symlinked `poetry.lock`: hosted (`redirect_symlinked_file_unsupported`) and vendored (`pypi_poetry_symlink_unsupported`) both refuse before writing. Documented.
+- With Poetry ≤ 2.2, `poetry lock` creates the project env. A "fresh checkout" cell has to delete the env after locking, or the scan correctly finds it.
+- Two patched packages: `remove` of one keeps the other's hosted / vendored wiring (r15, LF + CRLF, Poetry 1.8.5 / 2.5.1). Not a bug.
