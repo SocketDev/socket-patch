@@ -788,48 +788,73 @@ async fn pyproject_flavors_vendored_revendor_superseding_patch() {
 }
 
 /// A Hatch guard unrelated to the old wiring (here the uv installer, which
-/// Hatch reports under the same `pypi_hatch_unsupported` code) refuses the
-/// superseding patch BEFORE patch A's wiring is unwound: the project files,
-/// the ledger and patch A's artifact are left exactly as they were, and no
-/// patch B wheel is built.
+/// Hatch reports under the same `pypi_hatch_unsupported` code, selected by
+/// environment variable or by an environment's `installer` / `uv-path`
+/// setting) refuses the superseding patch BEFORE patch A's wiring is
+/// unwound: the project files, the ledger and patch A's artifact are left
+/// exactly as they were, and no patch B wheel is built.
 #[tokio::test]
 async fn hatch_unrelated_guard_refuses_superseding_patch_before_unwinding() {
     const UUID_B: &str = "5c3e1a2b-7d4f-4e6a-9b8c-1d2e3f4a5b6d";
     const PATCHED_B: &[u8] = b"# six\nVERSION = '1.16.0'\nSOCKET_PATCHED = 2\n";
-    let (_tmp, root) = project();
-    let files = stage_hatch(&root);
-    vendor_project(&root, files);
-    let wired_a: Vec<String> = files
-        .iter()
-        .map(|f| std::fs::read_to_string(root.join(f)).unwrap())
-        .collect();
-    let ledger_a = std::fs::read_to_string(root.join(".socket/vendor/state.json")).unwrap();
+    const UV_PATH: &[(&str, &str)] = &[("HATCH_ENV_TYPE_VIRTUAL_UV_PATH", "/usr/bin/uv")];
+    let cases = [
+        ("env var", "", UV_PATH),
+        (
+            "installer",
+            "\n[tool.hatch.envs.default]\ninstaller = \"uv\"\n",
+            &[],
+        ),
+        (
+            "uv-path",
+            "\n[tool.hatch.envs.default]\nuv-path = \"/usr/bin/uv\"\n",
+            &[],
+        ),
+    ];
+    for (case, setting, extra) in cases {
+        let (_tmp, root) = project();
+        let files = stage_hatch(&root);
+        vendor_project(&root, files);
+        if !setting.is_empty() {
+            let path = root.join("pyproject.toml");
+            let wired = std::fs::read_to_string(&path).unwrap();
+            std::fs::write(&path, wired + setting).unwrap();
+        }
+        let wired_a: Vec<String> = files
+            .iter()
+            .map(|f| std::fs::read_to_string(root.join(f)).unwrap())
+            .collect();
+        let ledger_a = std::fs::read_to_string(root.join(".socket/vendor/state.json")).unwrap();
 
-    stage_manifest_with(&root, UUID_B, PATCHED_B);
-    let (code, env) = run_cli(
-        &root,
-        &["vendor"],
-        &[("HATCH_ENV_TYPE_VIRTUAL_UV_PATH", "/usr/bin/uv")],
-    );
-    assert_eq!(code, 1, "{env:#}");
-    let rendered = env.to_string();
-    assert!(
-        rendered.contains("pypi_hatch_unsupported") && rendered.contains("pip installer"),
-        "the installer guard is the reported refusal: {env:#}"
-    );
-    for (f, text) in files.iter().zip(&wired_a) {
+        stage_manifest_with(&root, UUID_B, PATCHED_B);
+        let (code, env) = run_cli(&root, &["vendor"], extra);
+        assert_eq!(code, 1, "{case}: {env:#}");
+        let rendered = env.to_string();
+        assert!(
+            rendered.contains("pypi_hatch_unsupported") && rendered.contains("pip installer"),
+            "{case}: the installer guard is the reported refusal: {env:#}"
+        );
+        for (f, text) in files.iter().zip(&wired_a) {
+            assert_eq!(
+                &std::fs::read_to_string(root.join(f)).unwrap(),
+                text,
+                "{case}: {f} untouched"
+            );
+        }
         assert_eq!(
-            &std::fs::read_to_string(root.join(f)).unwrap(),
-            text,
-            "{f} untouched"
+            std::fs::read_to_string(root.join(".socket/vendor/state.json")).unwrap(),
+            ledger_a,
+            "{case}"
+        );
+        assert!(
+            root.join(format!(".socket/vendor/pypi/{UUID}")).is_dir(),
+            "{case}"
+        );
+        assert!(
+            !root.join(format!(".socket/vendor/pypi/{UUID_B}")).exists(),
+            "{case}"
         );
     }
-    assert_eq!(
-        std::fs::read_to_string(root.join(".socket/vendor/state.json")).unwrap(),
-        ledger_a
-    );
-    assert!(root.join(format!(".socket/vendor/pypi/{UUID}")).is_dir());
-    assert!(!root.join(format!(".socket/vendor/pypi/{UUID_B}")).exists());
 }
 
 /// The uv lock rewrite needs the hosted wheel's METADATA, fetched only

@@ -110,13 +110,15 @@ pub(super) async fn load(
     })
 }
 
-/// The guards [`load`] applies whatever the project's wiring: the pip
-/// installer, and Hatch >=1.2 when `name` is an environment dependency.
-/// Checked before a superseded patch's wiring is unwound, so a refusal
-/// unrelated to that wiring never touches the project's files.
+/// The guards vendoring applies whatever the project's wiring: the pip
+/// installer (environment variable and environment settings), and
+/// Hatch >=1.2 when `name` is an environment dependency. Checked before a
+/// superseded patch's wiring is unwound, so a refusal unrelated to that
+/// wiring never touches the project's files.
 pub(super) async fn preflight(root: &Path, name: &str) -> Result<(), Failure> {
     let files = read_files(root).await?;
     require_pip_installer()?;
+    hatch::require_pip_installer(&files).map_err(|error| ("pypi_hatch_unsupported", error))?;
     if hatch::has_environment_dependency(&files, name) {
         require_environment_context_support(root).await?;
     }
