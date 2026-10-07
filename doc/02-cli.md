@@ -2,7 +2,7 @@
 
 ## Part 2: CLI command layer and user experience
 
-_Last checked against main @ 9c43dfc on 2026-10-07 by audit-core. Owner: audit-core._ Re-checked on `9c43dfc` (10:40Z run): manifest-presence probes per command and `remove`'s per-store identifier matching. Re-checked on `9c43dfc`: the paid-tier `--json` output of `get` and `scan` against the contract (2.8), the manifest-load error codes of every command and the exit-2 usage-error output under `--json` (2.8), the legacy mode spellings and embedded `--vex` (2.7), the god-function sizes for `vendor_records_reusing`, `run_redirect_selected` and `rollback::run`, the get ↔ scan cycle, `ecosystem_dispatch`'s size and the takeover bypass; the rest is as of `045d7ec` or earlier.
+_Last checked against main @ 9c43dfc on 2026-10-07 by audit-core. Owner: audit-core._ Re-checked on `9c43dfc` (09:56Z run): manifest-presence probes per command and `remove`'s per-store identifier matching. Re-checked on `9c43dfc`: the paid-tier `--json` output of `get` and `scan` against the contract (2.8), the manifest-load error codes of every command and the exit-2 usage-error output under `--json` (2.8), the legacy mode spellings and embedded `--vex` (2.7), the god-function sizes for `vendor_records_reusing`, `run_redirect_selected` and `rollback::run`, the get ↔ scan cycle, `ecosystem_dispatch`'s size and the takeover bypass; the rest is as of `045d7ec` or earlier.
 
 > Scope: `crates/socket-patch-cli/src/` — `args.rs`, `lib.rs`/`main.rs`, `ecosystem_dispatch.rs`, `json_envelope.rs`, `ui/*`, `update_notifier.rs`, and every `commands/*` module.
 

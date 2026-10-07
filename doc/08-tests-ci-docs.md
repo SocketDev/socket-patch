@@ -2,7 +2,7 @@
 
 ## Part 8: Tests, CI, docs and distribution
 
-_Last checked against main @ 9c43dfc on 2026-10-07 by audit-core. Owner: audit-core._ Re-checked on `9c43dfc` (10:40Z run): the `#[ignore]` reasons across both crates (a RED/gap test has no CI leg). Only the repository-hygiene passages (stray `launch.json`, "DESIGN §" references), §8.3's `CLI_CONTRACT.md` measurements and guards, the contract's argument and env-var tables, the test-binary and covgap counts, the `#[serial]` count and the duplicated-helper counts have been re-checked; the rest is as of `2463257`.
+_Last checked against main @ 9c43dfc on 2026-10-07 by audit-core. Owner: audit-core._ Re-checked on `9c43dfc` (09:56Z run): the `#[ignore]` reasons across both crates (a RED/gap test has no CI leg). Only the repository-hygiene passages (stray `launch.json`, "DESIGN §" references), §8.3's `CLI_CONTRACT.md` measurements and guards, the contract's argument and env-var tables, the test-binary and covgap counts, the `#[serial]` count and the duplicated-helper counts have been re-checked; the rest is as of `2463257`.
 
 > Scope: `crates/*/tests/**`, `tests/` (docker fixtures), `.github/workflows/*`, `.github/actions/*`, `scripts/`, `docs/`, `CLI_CONTRACT.md`, `CHANGELOG.md`, `npm/`, `crates/socket-patch-node/npm/`, and the Cargo profiles. CI timings come from the GitHub Actions run for `2463257` on `main`.
 
