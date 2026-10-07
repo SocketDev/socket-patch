@@ -1,5 +1,5 @@
 ### Refactor routine (`refactor`, hourly, highest leverage first)
-_Last updated 2026-10-07T07:58Z · main @ 9c43dfc_
+_Last updated 2026-10-07T10:05Z · main @ 9c43dfc_
 
 **In flight:**
 - [#876](https://github.com/SocketDev/socket-patch/pull/876): registry clients (`build_registry_client`, Maven `fetch_registry_bytes`) built through one `registry_client_builder` under `ApiTimeouts`; `registry_fetch::download` onto `read_capped`. Also ports the base-red digest-ratchet fix for #646's JVM files. Issue #872 (C49). `ready`.
@@ -19,11 +19,11 @@ _Last updated 2026-10-07T07:58Z · main @ 9c43dfc_
 |---|---|:-:|:-:|:-:|:-:|:-:|---|
 | 1 | #990 (E24, child 1 of #989): one `vendor::revert::finish` with an explicit `KeepPolicy` for the 12 copied finish blocks | 0 | 1 | ≈12 | L | ≈14 | skipped: 11 of 12 backend files changed by open PRs (#690, #768, #776, #825, #873, #875, #876, #888, #909, #924, #943, #961, #978, #980, #984, #986) |
 | 2 | #922 (E22, child 1 of #920): one `VendorEntry::npm` constructor for the 7 npm-family ledger tails | 0 | 1 | ≈7 | L | ≈9 | skipped: drivers changed by #657, #873, #888, #909 |
-| 3 | #931 (C52, child 1 of #930): one manifest-read error mapper (`manifest_invalid`/`manifest_unreadable`) for every command | 1 | 1 | ≈2.5 | M | ≈5.5 | skipped: `commands/vendor.rs` changed by #690, #776, #825, #837, #877 |
-| 4 | #773 (C44): one `Ecosystem::from_cli_name` for flag, env, socket.yml, vendor | 1 | 0 | ≈2 | L | ≈5 | skipped: `commands/vendor.rs` changed by #690, #776, #825, #837, #877 |
-| 5 | #856 (E62, child 1 of #855): VEX npm aliases through the core resolver | 1 | 1 | ≈1.8 | M | ≈5 | skipped: `vex_consumed.rs` changed by #690 |
+| 3 | #998 (C56): one NotFound-only manifest probe for `apply`, `vendor`, `repair`, `remove`, `rollback` (5 `metadata().is_err()` copies) | 1 | 1 | ≈5 | M | ≈8 | skipped: `commands/vendor.rs` changed by #690, #776, #825, #837, #877; pairs with #931 |
+| 4 | #931 (C52, child 1 of #930): one manifest-read error mapper (`manifest_invalid`/`manifest_unreadable`) for every command | 1 | 1 | ≈2.5 | M | ≈5.5 | skipped: `commands/vendor.rs` changed by #690, #776, #825, #837, #877 |
+| 5 | #773 (C44): one `Ecosystem::from_cli_name` for flag, env, socket.yml, vendor | 1 | 0 | ≈2 | L | ≈5 | skipped: `commands/vendor.rs` changed by #690, #776, #825, #837, #877 |
 
-Re-ranked 2026-10-07T07:58Z: main, steering and review threads unchanged. New: tracking #989 (E24, one record-revert engine) and its child #990 (ranked #1 above, skipped on file overlap); #988 (E68, gem Gemfile half-revert, `bug` p1, B1 U0 D≈0 R M ≈1, left to the fixer). #883 (E39, ≈5) drops off the top five. Earlier: #982 (C54, JSON-output change, left to the fixer); #972 (E26 child, skipped: `maven_repo.rs` changed by #690, #876). #893 (≈4, `cleanup_blobs.rs`) is still the best eligible; then #871 after #889, then #705. 3 of 3 slots used (#876, #886, #889 `ready` and approved, no review questions). Decisions: #648, #704, #792, #808, #615, #966, #973, #983; C07.
+Re-ranked 2026-10-07T10:05Z: main, steering and review threads unchanged; 3 of 3 slots used. New: #998 (C56, ranked #3, skipped on `vendor.rs`); #999 (C57, `remove <uuid>` vendored leg, B1 D≈1 R M ≈2, left to the fixer); #1000 (decision). #856 (≈5) drops off the top five. 07:58Z: added tracking #989 and child #990 (#1); #988 (E68) left to the fixer; #982 (C54) left to the fixer; #972 skipped (`maven_repo.rs`). #893 (≈4, `cleanup_blobs.rs`) is still the best eligible; then #871 after #889, then #705. Decisions: #648, #704, #792, #808, #615, #966, #973, #983, #1000; C07.
 
 **Notes:**
 - The sandbox runs as root, so 4 core lib tests fail on main and on branches alike: `copy_tree::relax_loop_must_not_traverse_symlinked_root`, `vlt_heal::an_unremovable_hidden_lock_keeps_every_store_entry`, `pypi_poetry::wire_write_failure_maps_error_and_leaves_lock_untouched`, `pypi_requirements::wire_failure_rolls_back_already_written_files`.
