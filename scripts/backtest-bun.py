@@ -67,10 +67,14 @@ artifacts and the patched install kept) it must NOT be attested, also under
 Every cell records the CLI exit codes (main, repeat, rollback, conversion),
 the exact refusal-code set, the repeat-run envelope semantics, digest
 enforcement, and after rollback the lockfile presence rules and byte identity.
-A hosted rollback restores the DEFAULT upstream registry entry re-resolved
-from the npm registry (a custom-registry slot comes back as bun's default
+A hosted rollback restores the upstream entry of the project's registry
+(#992: the full tarball URL for a non-default registry, bun's `""` for npmjs —
+the custom-registry fixture configures none, so its injected slot comes back as
 `""`); a hosted bun.lockb is binary, so its rollback refuses with the
-`git checkout -- bun.lockb` remedy and the cell applies that remedy.
+`git checkout -- bun.lockb` remedy and the cell applies that remedy. Rollback
+runs over a patched install; the reinstall is a plain `bun install` over the
+kept node_modules, and where Bun keeps the patched copy (#764) the rollback must
+have advised `bun install --force`, which the cell then runs.
 
 Provenance: `--cli-revision` is the branch-resolvable commit the row is about
 (PR head, or the pushed commit); `--cli-build-sha` (or the CLI_BUILD_SHA
@@ -131,11 +135,23 @@ LINKER_FROM = (1, 3, 0)                       # bunfig [install] linker
 TARBALL_INTEGRITY_ENFORCED_FROM = (1, 3, 10)  # URL/local tarball sha512 verified
 NO_PEER_OR_OVERRIDE = ('0.8.1', '1.0.0')      # peers not installed, overrides ignored
 
+# Bun's hoisted linker keeps the installed copy when a lock entry moves back to
+# the registry copy of the same name@version, so `rollback` / `vendor --revert`
+# name `bun install --force` whenever node_modules may still hold it (#764).
+# The rollback step follows that advice (see `rollbackReinstallAdvised`).
+BUN_REINSTALL_ADVISORIES = {'vendor_bun_reinstall_required', 'redirect_bun_reinstall_required'}
 # Advisory codes a SUPPORTED run may carry; everything else is a refusal.
+# Deliberately NOT here: `*_bun_default_trust_lost` (#371 — minimist is not on
+# Bun's default-trusted list), `*_non_registry_entry_skipped` (#497 — every
+# fixture resolves minimist from the registry) and
+# `vendor_bun_lockb_duplicate_records` (#861 — no fixture carries a nested
+# duplicate record). On these fixtures each would be a misclassification, so it
+# must fail the cell rather than be waved through.
 INFORMATIONAL = {
     'vendor_prebuilt_downloaded', 'vendor_prebuilt_unavailable', 'vendor_prebuilt_pending',
     'vendor_fetched_missing', 'reinstall_required',
     'vendor_takeover_reverted_redirect', 'redirect_takeover_reverted_vendored',
+    *BUN_REINSTALL_ADVISORIES,
 }
 # Codes that mean the rewriter or the takeover broke on a supported configuration.
 REGRESSION_CODES = {
@@ -499,11 +515,50 @@ def expected_outcome(version, shape, mode):
     return outcome(True)
 
 
+def store_entry(path):
+    """The isolated-linker store entry (`node_modules/.bun/<key>`) holding
+    `path`, or None outside one (`.bun/node_modules` is Bun's hoist dir)."""
+    parts = path.parts
+    for i in range(len(parts) - 2):
+        if parts[i] == 'node_modules' and parts[i + 1] == '.bun' and parts[i + 2] != 'node_modules':
+            return Path(*parts[:i + 3])
+    return None
+
+
+def linked_store_entries(project):
+    """Every isolated store entry some symlink outside it resolves into. Bun's
+    isolated linker leaves the entry of a superseded resolution (the patched
+    `minimist@https+++patch.socket.dev+…`) on disk, unlinked, after the lock
+    moves back to the registry; nothing can `require` it (the #599 orphans)."""
+    live = set()
+    for directory, subdirs, files in os.walk(project):
+        if '.socket' in Path(directory).relative_to(project).parts:
+            subdirs[:] = []
+            continue
+        for name in [*subdirs, *files]:
+            link = Path(directory) / name
+            # Bun links with junctions on Windows (Path.is_junction: 3.12+).
+            if not (link.is_symlink() or getattr(link, 'is_junction', lambda: False)()):
+                continue
+            entry = store_entry(link.resolve())
+            if entry is not None and store_entry(Path(directory).resolve() / name) != entry:
+                live.add(entry)
+    return live
+
+
 def installed_targets(project):
+    """The installed minimist@1.2.2 copies node can load: every copy outside
+    an isolated store, and the store copies something links to."""
     targets = []
+    live = None
     for manifest in project.rglob('package.json'):
         if 'node_modules' not in manifest.parts or '.socket' in manifest.parts:
             continue
+        entry = store_entry(manifest)
+        if entry is not None:
+            live = linked_store_entries(project) if live is None else live
+            if entry.resolve() not in live:
+                continue
         data = json.loads(manifest.read_text(encoding='utf-8'))
         if data.get('name') == 'minimist' and data.get('version') == '1.2.2':
             targets.append(manifest.parent)
@@ -1234,6 +1289,11 @@ def main():
                             version, 'rejected' if row['rejectsCorruptDigest'] else 'accepted',
                             '.'.join(map(str, TARBALL_INTEGRITY_ENFORCED_FROM))))
                 lock.write_bytes(patched_lock)
+                # Roll back from what a user actually has: a patched install
+                # (the corrupt-digest install above removed or broke it), so the
+                # reinstall below judges whether Bun keeps the patched copy (#764).
+                code, _ = install(bun, 'pre-rollback', ['--frozen-lockfile'], cache='cache-pre-rollback')
+                row['preRollbackPatched'] = code == 0 and oracle(project, record, 'after')[0]
                 code, output = run([cli, 'rollback', '--cwd', project, '--json', '--yes', '--no-telemetry'],
                                    project, env, case / 'rollback.log', False)
                 exit_codes['rollback'] = code
@@ -1241,6 +1301,10 @@ def main():
                 rollback_codes = [w.get('code') for w in rolled.get('warnings', [])]
                 row['rollbackWarnings'] = rollback_codes
                 expected_files = dict(original)
+                # Whether the rollback told the user a plain `bun install` is not
+                # enough (#764): the reinstall advisory, or — when it refused —
+                # the refusal's own remedy.
+                reinstall_advised = bool(set(rollback_codes) & BUN_REINSTALL_ADVISORIES)
                 if main_mode == 'hosted' and lockb_origin:
                     # bun.lockb is binary: the v5 upstream restore refuses it
                     # with the version-control remedy and writes nothing; the
@@ -1251,12 +1315,20 @@ def main():
                                           'git checkout -- bun.lockb' in (f.get('error') or '')
                                           for f in failed)
                         and lock.read_bytes() == patched_lock)
+                    reinstall_advised = any(f.get('purl') == PURL and
+                                            'bun install --force' in (f.get('error') or '')
+                                            for f in failed)
                     lock.write_bytes(original['bun.lockb'])
                 else:
                     checks['rollbackSucceeded'] = code == 0 and rolled.get('status') == 'success'
                     if main_mode == 'hosted' and shape == 'custom-registry':
-                        # The upstream restore writes the DEFAULT registry entry:
-                        # bun's "" slot, i.e. the lock before the slot injection.
+                        # The upstream restore writes the slot Bun itself would
+                        # write for the PROJECT's registry (#992): the full
+                        # tarball URL for a non-default registry, `""` for
+                        # npmjs and its aliases — on every Bun release. This
+                        # fixture configures no registry (the injected URL is
+                        # npmjs's own tarball), so the restore is bun's `""`
+                        # slot, i.e. the lock before the slot injection.
                         expected_files['bun.lock'] = pre_injection
                 checks['rollbackOriginalFiles'] = all(
                     (project / n).exists() and (project / n).read_bytes() == b
@@ -1270,9 +1342,22 @@ def main():
                 checks['rollbackWarningsClean'] = not set(rollback_codes) - INFORMATIONAL
                 if shape == 'crlf-lock':
                     checks['rollbackEolPreserved'] = crlf_only(lock.read_bytes())
-                code, _ = install(bun, 'reinstall', cache='cache-rollback')
-                checks['rollbackOriginalBytes'], row['rollbackFiles'] = oracle(project, record, 'before')
-                checks['rollbackOriginalBytes'] = code == 0 and checks['rollbackOriginalBytes']
+                # The user's next step: a plain `bun install` over the KEPT
+                # node_modules. Bun's hoisted linker does not re-extract a
+                # package whose entry returned to the registry copy of the same
+                # name@version (#764), so when the plain install leaves patched
+                # bytes the rollback must have said so (`*_bun_reinstall_required`)
+                # and the cell then follows that advice: `bun install --force`.
+                code, _ = run([bun, 'install', '--ignore-scripts'], project,
+                              env_for(bun, 'cache-rollback'), case / 'reinstall.log', False)
+                plain_ok, row['rollbackFiles'] = oracle(project, record, 'before')
+                row['rollbackPlainReinstallOriginal'] = code == 0 and plain_ok
+                if not row['rollbackPlainReinstallOriginal']:
+                    checks['rollbackReinstallAdvised'] = reinstall_advised
+                    code, _ = run([bun, 'install', '--ignore-scripts', '--force'], project,
+                                  env_for(bun, 'cache-rollback'), case / 'reinstall-force.log', False)
+                    plain_ok, row['rollbackFiles'] = oracle(project, record, 'before')
+                checks['rollbackOriginalBytes'] = code == 0 and plain_ok
             row['passed'] = all(checks.values())
         except Exception as error:  # noqa: BLE001 — every cell must produce a row
             row['error'] = str(error)

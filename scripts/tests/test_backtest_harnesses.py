@@ -93,6 +93,56 @@ class BunTransportRetryTests(unittest.TestCase):
             self.assertEqual(len(row['networkRetryAttempts']), 2)
 
 
+class BunInformationalCodeTests(unittest.TestCase):
+    def test_reinstall_advisories_are_informational(self):
+        # #764: rollback / vendor --revert name `bun install --force`; the
+        # advisory is not a refusal, and rerun_clean must accept it too.
+        for code in ('vendor_bun_reinstall_required', 'redirect_bun_reinstall_required'):
+            self.assertIn(code, bun.INFORMATIONAL)
+            self.assertIn(code, bun.BUN_REINSTALL_ADVISORIES)
+        envelope = {'status': 'success', 'redirect': {'redirected': 1, 'warnings': [
+            {'code': 'redirect_bun_reinstall_required'}]}}
+        self.assertTrue(bun.rerun_clean(0, envelope, 'hosted'))
+
+    def test_misclassification_codes_stay_refusals(self):
+        # No fixture rewires a default-trusted package (#371), holds a
+        # non-registry copy (#497) or a duplicate bun.lockb record (#861).
+        for code in ('redirect_bun_default_trust_lost', 'vendor_bun_default_trust_lost',
+                     'redirect_bun_non_registry_entry_skipped', 'vendor_non_registry_entry_skipped',
+                     'vendor_bun_lockb_duplicate_records'):
+            self.assertNotIn(code, bun.INFORMATIONAL)
+
+
+class BunInstalledTargetsTests(unittest.TestCase):
+    def test_unlinked_isolated_store_entry_is_not_installed(self):
+        # After a rollback Bun's isolated linker links the registry entry and
+        # leaves the patched one on disk, unlinked: only the linked copy counts.
+        with tempfile.TemporaryDirectory() as tmp:
+            project = Path(tmp).resolve()
+            store = project / 'node_modules/.bun'
+            for key in ('minimist@1.2.2', 'minimist@https+++patch.socket.dev+x'):
+                pkg = store / key / 'node_modules/minimist'
+                pkg.mkdir(parents=True)
+                (pkg / 'package.json').write_text('{"name": "minimist", "version": "1.2.2"}')
+            (store / 'node_modules').mkdir()
+            try:
+                (store / 'node_modules/minimist').symlink_to('../minimist@1.2.2/node_modules/minimist')
+                (project / 'node_modules/minimist').symlink_to('.bun/minimist@1.2.2/node_modules/minimist')
+            except OSError:
+                self.skipTest('symlinks unavailable')
+            self.assertEqual(bun.installed_targets(project),
+                             [store / 'minimist@1.2.2/node_modules/minimist'])
+            self.assertIsNone(bun.store_entry(store / 'node_modules/minimist'))
+
+    def test_hoisted_copies_are_always_installed(self):
+        with tempfile.TemporaryDirectory() as tmp:
+            project = Path(tmp).resolve()
+            pkg = project / 'node_modules/minimist'
+            pkg.mkdir(parents=True)
+            (pkg / 'package.json').write_text('{"name": "minimist", "version": "1.2.2"}')
+            self.assertEqual(bun.installed_targets(project), [pkg])
+
+
 class BunManifestlessVexHelperTests(unittest.TestCase):
     UUID = '80630680-4da6-45f9-bba8-b888e0ffd58c'
     VULNS = {'GHSA-xvch-5gv4-984h': ['CVE-2021-44906']}

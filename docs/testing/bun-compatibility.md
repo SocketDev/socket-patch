@@ -386,7 +386,8 @@ workspace` (vendor a plain project, add a workspace member, `bun install`,
 re-run — must be `already_vendored`; then `repair` rebuilds a deleted
 tarball), `crlf` (CRLF manifest), `crlf-lock` (CRLF `bun.lock`),
 `space-unicode` (a path with spaces and Unicode), `custom-registry` (a
-non-empty registry slot the rewrite must drop), `text` (`--save-text-lockfile`
+non-empty registry slot the rewrite must drop; the project configures no
+registry, so a hosted rollback restores Bun's `""` npmjs slot, #992), `text` (`--save-text-lockfile`
 opt-in, Bun ≥ 1.1.39 only — asserts `bun.lock` exists after the baseline),
 `isolated` / `hoisted` linkers, `lockfile-only` (no `node_modules`),
 `production`, `get-uuid`, `get-search`, `legacy-lockb` (the baseline is
@@ -400,7 +401,12 @@ boundaries above — not the CLI's own output — and every cell asserts
 `supported` against it and the refusal codes EXACTLY, after removing an
 explicit informational allowlist (`vendor_prebuilt_downloaded`,
 `vendor_fetched_missing`, `reinstall_required`,
-…); substring matching is never used. A configuration expected to be
+`vendor_bun_reinstall_required` / `redirect_bun_reinstall_required`,
+…); substring matching is never used. `*_bun_default_trust_lost`,
+`*_non_registry_entry_skipped` and `vendor_bun_lockb_duplicate_records` are
+deliberately not on it: no fixture rewires a default-trusted package, holds a
+non-registry copy or a duplicate `bun.lockb` record, so each would be a
+misclassification. A configuration expected to be
 supported FAILS on unexpected warnings, `redirect_bun_entry_not_found`
 or `redirect_revert_failed`. Exit codes are recorded for every invocation and
 asserted: supported → 0; hosted refusals → 0 with `redirect.redirected == 0`
@@ -428,11 +434,19 @@ asserted: supported → 0; hosted refusals → 0 with `redirect.redirected == 0`
 - `rejectCorruptDigest`: a tampered sha512 on the PATCHED tuple is rejected on
   Bun ≥ 1.3.10; below that the observation is RECORDED
   (`legacyDigestBehavior`) rather than asserted;
-- rollback restores the original manifest / lock bytes, removes the
-  `.socket/vendor` state, and a clean install reproduces the record's
-  `beforeHash` bytes; text projects retain `bun.lock`, and binary projects
-  retain `bun.lockb` without creating a text lock. The original lock presence
-  and SHA-256 are both checked.
+- rollback (run over a patched install) restores the original manifest /
+  lock bytes, removes the `.socket/vendor` state, and the reinstall reproduces
+  the record's `beforeHash` bytes; text projects retain `bun.lock`, and binary
+  projects retain `bun.lockb` without creating a text lock. The original lock
+  presence and SHA-256 are both checked. The reinstall is a plain
+  `bun install` over the kept `node_modules`; Bun's hoisted linker keeps the
+  patched copy there (#764), so when it does the rollback must have emitted
+  `vendor_bun_reinstall_required` / `redirect_bun_reinstall_required`
+  (`rollbackReinstallAdvised`; for the refused hosted `bun.lockb`, the
+  refusal's checkout remedy names it) and the cell follows that advice with
+  `bun install --force`. The isolated linker links the registry entry and
+  leaves the superseded patched store entry under `node_modules/.bun`
+  unlinked; the byte oracle counts only store entries something links to.
 
 The runner captures the exact project manifests, lockfiles, the ledgers (and a
 `.socket/manifest.json` only where the `preexisting-manifest` shape seeded one),
