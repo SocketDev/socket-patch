@@ -2675,7 +2675,7 @@ fn created_settings_over_existing(
 }
 
 /// [`created_settings_over_existing`]'s code for `socket-patch.sbt`.
-const SBT_OWNED_FILE_UNREADABLE: &str = "redirect_sbt_owned_file_unreadable";
+use socket_patch_core::hosted::engine::SBT_OWNED_FILE_UNREADABLE;
 
 #[cfg(test)]
 mod tests {

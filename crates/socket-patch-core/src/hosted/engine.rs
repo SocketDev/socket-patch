@@ -158,7 +158,22 @@ fn unreadable_refusal(rel: &str) -> Refusal {
     }
 }
 
+/// The refusal for an unreadable `socket-patch.sbt`, the file the sbt
+/// planner owns and would otherwise create over the user's bytes.
+pub const SBT_OWNED_FILE_UNREADABLE: &str = "redirect_sbt_owned_file_unreadable";
+
 fn undecodable_refusal(rel: &str) -> Refusal {
+    // Keeps the sbt planner's own refusal code, and still refuses here,
+    // before any vendored->hosted takeover revert.
+    if rel == crate::formats::sbt::owned_file::HOSTED_FILE {
+        return Refusal {
+            code: SBT_OWNED_FILE_UNREADABLE.to_string(),
+            message: format!(
+                "{rel} is not UTF-8 text, so the hosted sbt wiring would replace it; \
+                 re-save it as UTF-8 and re-run; nothing was written"
+            ),
+        };
+    }
     Refusal {
         code: UNREADABLE_REFUSAL.to_string(),
         message: format!(
@@ -626,13 +641,6 @@ pub async fn read_candidate_files(
         // is never rewritten and must not refuse the rest of the run.
         out.undecodable_reads
             .retain(|rel| !is_gradle_owned_file(rel));
-    }
-    // `socket-patch.sbt` the sbt planner takes for absent and would create:
-    // on disk the scan refuses that write with its own
-    // `redirect_sbt_owned_file_unreadable`, so leave it to that refusal.
-    if !matches!(view, ProjectView::Memory(_)) {
-        out.undecodable_reads
-            .retain(|rel| rel != crate::formats::sbt::owned_file::HOSTED_FILE);
     }
     // An sbt build's resolution evidence rides a synthetic key (see
     // `patch::redirect::sbt::SBT_RESOLUTION_KEY`).
@@ -2920,6 +2928,31 @@ mod tests {
             );
             assert!(guard(&view, &done, &candidates).is_none());
         }
+    }
+
+    /// #721 review: an unreadable `socket-patch.sbt` is refused by the
+    /// run-wide check itself, which also runs before any vendored->hosted
+    /// takeover revert, and keeps the sbt planner's own refusal code.
+    #[tokio::test]
+    async fn an_unreadable_sbt_owned_file_refuses_early_with_the_sbt_code() {
+        let latin1: &[u8] = b"// Auteur: Andr\xe9\n";
+        let tmp = tempfile::tempdir().unwrap();
+        std::fs::write(tmp.path().join("socket-patch.sbt"), latin1).unwrap();
+        let candidates = vec![gradle_candidate()];
+        let read = read_candidate_files(
+            &ProjectView::Disk(tmp.path()),
+            &BTreeSet::new(),
+            &candidates,
+        )
+        .await;
+        assert_eq!(read.undecodable_reads, vec!["socket-patch.sbt"]);
+        let refusal = undecodable_guard(&read.undecodable_reads, &candidates).expect("refused");
+        assert_eq!(refusal.code, SBT_OWNED_FILE_UNREADABLE);
+        assert!(
+            refusal.message.contains("socket-patch.sbt"),
+            "{}",
+            refusal.message
+        );
     }
 
     /// A refused Gradle build is never confirmed by a snippet pasted into a
