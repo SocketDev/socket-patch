@@ -749,9 +749,15 @@ pub(crate) async fn run_redirect_selected(
     }
     // A workspace member whose lock lives in an ancestor directory (pnpm
     // workspace / `lockfile-dir`, cargo workspace): the rewriters would
-    // read only the member, so refuse before any takeover or write.
-    if let Some(refusal) =
-        socket_patch_core::hosted::governing_root::refusal(&view, &candidates).await
+    // read only the member, so refuse before any takeover or write. The
+    // same goes for a pnpm member whose `trustLockfile` setting lives in
+    // the workspace root's pnpm-workspace.yaml.
+    if let Some(refusal) = socket_patch_core::hosted::governing_root::refusal(
+        &view,
+        &candidates,
+        !common.no_trust_lockfile_config,
+    )
+    .await
     {
         return refuse(common, scan_result.take(), &refusal);
     }
@@ -1312,6 +1318,17 @@ pub(crate) async fn run_redirect_selected(
         // v5 keeps no hosted ledger: this run's fetched records are the
         // hosted record source of the in-run attestation.
         params.hosted_records = records.clone();
+        // The gem intake gate withholds every gem file. VEX independently
+        // rediscovers older pins too, so a candidate-only set would miss some
+        // refused hosted gems. Keep their actual installed-byte verification,
+        // but do not infer applied status from the intercepted source.
+        params.hosted_gem_mirror_refused = rewrite
+            .warnings
+            .iter()
+            .any(|warning| warning.code == "redirect_gem_mirror_overrides_source");
+        // The warning above exists only when this run had gem candidates;
+        // also check every hosted gem pin the VEX plan rediscovers.
+        params.hosted_gem_mirror_check = true;
         // Stale-flagged purls are EXCLUDED from assume_applied: the same-run
         // envelope carries a redirect_gem_stale_install warning proving the
         // installed materialization unpatched, so attesting that purl from
@@ -1764,6 +1781,42 @@ async fn vendored_takeover(
     } else {
         None
     };
+    // Yarn classic twin: an offline mirror refuses the hosted rewrite
+    // (vendored mode works with one), so a vendored yarn classic entry
+    // must stay vendored rather than be reverted into neither mode.
+    let classic_entry = |entry: &socket_patch_core::vendor::VendorEntry| {
+        entry.ecosystem == "npm" && entry.flavor.as_deref() == Some("yarn-classic")
+    };
+    let classic_takeover_refusal = if takeover
+        .iter()
+        .any(|(_, entry)| entry.as_ref().is_some_and(classic_entry))
+    {
+        match socket_patch_core::utils::fs::read_regular_to_string(&common.cwd.join("yarn.lock"))
+            .await
+        {
+            Ok(lock) => {
+                let read_rc = |rel: &str| {
+                    let path = common.cwd.join(rel);
+                    async move {
+                        socket_patch_core::utils::fs::read_regular_to_string(&path)
+                            .await
+                            .ok()
+                    }
+                };
+                let yarnrc = read_rc(socket_patch_core::patch::redirect::YARNRC_REL).await;
+                let npmrc = read_rc(socket_patch_core::patch::redirect::npmrc::NPMRC_REL).await;
+                socket_patch_core::patch::redirect::preflight_yarn_classic_hosted(
+                    &lock,
+                    yarnrc.as_deref(),
+                    npmrc.as_deref(),
+                )
+                .err()
+            }
+            Err(_) => None,
+        }
+    } else {
+        None
+    };
     // vlt twin: the hosted rewriter's lock-level refusal must be known
     // before a vendored vlt entry is reverted, or the revert strips the
     // live vendored patch and the rewrite then refuses the lock.
@@ -1857,6 +1910,11 @@ async fn vendored_takeover(
                             .err()
                     })
                     .flatten()
+            })
+            .or_else(|| {
+                classic_takeover_refusal
+                    .clone()
+                    .filter(|_| entry.is_some_and(classic_entry))
             })
             .or_else(|| {
                 vlt_takeover_refusal
@@ -2153,9 +2211,33 @@ const TAKEOVER_INFO_CODES: &[&str] = &[
 /// Lowercase tool names that must keep their spelling at the start of a
 /// sentence (`pnpm >=11 rejects…` must not become `Pnpm`).
 const LOWERCASE_TOOLS: &[&str] = &[
-    "npm", "pnpm", "yarn", "bun", "cargo", "pip", "pipenv", "uv", "poetry", "pdm", "hatch", "go",
-    "gem", "bundler", "bundle", "composer", "mvn", "gradle", "dotnet", "deno", "rush", "vlt",
-    "vlx", "vlr",
+    "npm",
+    "pnpm",
+    "yarn",
+    "bun",
+    "cargo",
+    "pip",
+    "pipenv",
+    "uv",
+    "poetry",
+    "pdm",
+    "hatch",
+    "go",
+    "gem",
+    "bundler",
+    "bundle",
+    "composer",
+    "mvn",
+    "gradle",
+    "dotnet",
+    "deno",
+    "rush",
+    "vlt",
+    "vlx",
+    "vlr",
+    "sbt",
+    "mill",
+    "scala-cli",
 ];
 
 /// Capitalize the first letter of a message for an `Error:`/`Warning:`
@@ -2453,6 +2535,8 @@ fn format_next_steps(
         .any(|f| f == "package-lock.json" || f == "npm-shrinkwrap.json");
     let hint = if npm {
         " (e.g. `npm ci`)".to_string()
+    } else if let Some(sbt) = socket_patch_core::patch::redirect::sbt::next_step_hint(files) {
+        sbt.to_string()
     } else {
         crate::commands::composer_hints::hosted_reinstall_hint(files, edits).unwrap_or_default()
     };
@@ -2532,30 +2616,43 @@ pub(crate) fn npm_allow_remote_one_line(detail: &str) -> String {
     }
 }
 
-/// The refusal for a Gradle settings file the hosted rewrite writes
-/// without having read it (the planner took it for absent and creates it)
-/// while one is on disk: writing it would replace the user's settings.
+/// The refusal for a generated file the hosted rewrite writes without
+/// having read it (the planner took it for absent and creates it) while one
+/// is on disk: a Gradle settings file or `socket-patch.sbt`. Writing it would
+/// replace the user's file (and a later restore would delete it).
 fn created_settings_over_existing(
     cwd: &std::path::Path,
     done: &socket_patch_core::hosted::engine::Rewritten,
 ) -> Option<socket_patch_core::hosted::engine::Refusal> {
+    use socket_patch_core::formats::sbt::owned_file::HOSTED_FILE as SBT_HOSTED_FILE;
     done.rewrite
         .files
         .keys()
         .filter(|rel| {
             let base = rel.rsplit('/').next().unwrap_or(rel);
-            matches!(base, "settings.gradle" | "settings.gradle.kts")
+            (matches!(base, "settings.gradle" | "settings.gradle.kts") || base == SBT_HOSTED_FILE)
                 && !done.files.contains_key(rel.as_str())
         })
         .find(|rel| std::fs::symlink_metadata(cwd.join(rel)).is_ok())
-        .map(|rel| socket_patch_core::hosted::engine::Refusal {
-            code: socket_patch_core::patch::redirect::gradle::UNREADABLE_REFUSAL_CODE.to_string(),
-            message: format!(
-                "{rel} exists but could not be read, so the hosted Gradle wiring would replace \
-                 it; make it a readable UTF-8 file and re-run; nothing was written"
-            ),
+        .map(|rel| {
+            let sbt = rel.rsplit('/').next() == Some(SBT_HOSTED_FILE);
+            socket_patch_core::hosted::engine::Refusal {
+                code: if sbt {
+                    SBT_OWNED_FILE_UNREADABLE.to_string()
+                } else {
+                    socket_patch_core::patch::redirect::gradle::UNREADABLE_REFUSAL_CODE.to_string()
+                },
+                message: format!(
+                    "{rel} exists but could not be read, so the hosted {} wiring would replace \
+                     it; make it a readable UTF-8 file and re-run; nothing was written",
+                    if sbt { "sbt" } else { "Gradle" }
+                ),
+            }
         })
 }
+
+/// [`created_settings_over_existing`]'s code for `socket-patch.sbt`.
+const SBT_OWNED_FILE_UNREADABLE: &str = "redirect_sbt_owned_file_unreadable";
 
 #[cfg(test)]
 mod tests {
@@ -4087,6 +4184,18 @@ mod tests {
                 "gradle/wrapper/gradle-wrapper.properties",
                 ".socket/gradle/hosted-index.tsv",
                 ".socket/gradle/socket-patch.hosted.settings.gradle",
+                "socket-patch.sbt",
+                "socket-patch-vendor.sbt",
+                "build.sbt",
+                "project/build.properties",
+                ".sbtopts",
+                ".jvmopts",
+                "build.sbt.lock",
+                "build.mill",
+                "build.mill.yaml",
+                "build.sc",
+                ".mill-version",
+                "project.scala",
             ]
         );
     }

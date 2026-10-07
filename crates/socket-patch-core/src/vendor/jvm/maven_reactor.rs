@@ -1581,6 +1581,28 @@ fn extend_list(arg: &str, key: &str, item: &str) -> Option<String> {
 
 // ── vendored tree ───────────────────────────────────────────────────────
 
+/// The suffixed tree of `patch` exactly as [`plan_with_config`] writes it
+/// (`(tree_dir, jar_rel, writes)`), for the sbt planner, which resolves
+/// the same `.socket/vendor/maven2` layout; refused when the upstream pom
+/// cannot carry the suffixed version.
+pub(crate) fn suffixed_tree(
+    patch: &JvmPatch<'_>,
+) -> Result<(String, String, Vec<FileWrite>), JvmRefusal> {
+    let (g, a, v) = (patch.group_id, patch.artifact_id, patch.version);
+    let sv = patch.suffixed_version();
+    let suffixed_pom = std::str::from_utf8(patch.upstream_pom)
+        .ok()
+        .and_then(|pom| suffix_maven_pom(pom, v, &sv))
+        .ok_or_else(|| JvmRefusal {
+            code: UPSTREAM_UNAVAILABLE,
+            detail: format!(
+                "reason: suffix_unavailable: the upstream pom of {g}:{a}:{v} computes its own \
+                 version, so it cannot be served as {sv}"
+            ),
+        })?;
+    Ok(tree_writes(patch, &sv, suffixed_pom))
+}
+
 /// `(tree_dir, jar_rel, writes)` of the version directory.
 fn tree_writes(
     patch: &JvmPatch<'_>,

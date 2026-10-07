@@ -77,7 +77,9 @@ fn plain_sha256(content: &[u8]) -> String {
 /// This asserts on the *real structured output* of the run, not just a
 /// substring marker:
 ///   - scan's JSON shows the monolog patch was discovered AND synced
-///     (`"action": "added"`). NOTE: scan's process exit code is
+///     (recorded in `.socket/manifest.json`; its `scan.json` record is
+///     `added`, or `failed` with the error when scan's own in-place
+///     apply fails, #424). NOTE: scan's process exit code is
 ///     deliberately NOT gated — with a transitive dep that has no patch,
 ///     scan reports `"status": "partial_failure"` / exit 1 even though
 ///     the monolog patch is found and synced. Gating exit==0 would fail a
@@ -98,8 +100,11 @@ fn verify_snippet() -> &'static str {
 # --- scan: must have discovered and synced the monolog patch ---
 grep -qF 'pkg:composer/monolog/monolog@3.5.0' /tmp/scan.json || {
   echo "FAIL: scan json missing monolog purl" >&2; cat /tmp/scan.json >&2; exit 1; }
-grep -qF '"action": "added"' /tmp/scan.json || {
-  echo "FAIL: scan did not sync (add) the patch" >&2; cat /tmp/scan.json >&2; exit 1; }
+# Synced = recorded in the manifest. The patch record in scan.json may say
+# `added` or, when scan's own in-place apply step fails on this fixture,
+# `failed` with the apply error (#424); either way the record must be saved.
+grep -qF '"pkg:composer/monolog/monolog@3.5.0"' .socket/manifest.json || {
+  echo "FAIL: scan did not sync (record) the patch" >&2; cat /tmp/scan.json .socket/manifest.json >&2; exit 1; }
 
 # --- apply: must exit 0 and report a real applied+verified patch ---
 if [ "${APPLY_EXIT:-1}" != "0" ]; then

@@ -38,6 +38,7 @@ mod npm;
 mod nuget;
 mod pypi;
 mod pypi_locks;
+mod sbt;
 mod uv;
 mod vlt;
 
@@ -536,6 +537,8 @@ enum Format {
     /// The hosted Gradle index (the restorer edits the settings, lock and
     /// verification files it implies).
     Gradle,
+    /// The generated `socket-patch.sbt`.
+    Sbt,
     NuGet,
     Unsupported,
 }
@@ -562,6 +565,7 @@ fn format_of(rel: &str) -> Format {
         "vlt-lock.json" => Format::VltLock,
         "pom.xml" => Format::Maven,
         "hosted-index.tsv" => Format::Gradle,
+        crate::formats::sbt::owned_file::HOSTED_FILE if !rel.contains('/') => Format::Sbt,
         "nuget.config" | "NuGet.config" | "NuGet.Config" | "packages.lock.json" => Format::NuGet,
         _ => Format::Unsupported,
     }
@@ -696,6 +700,7 @@ async fn restore_pass(view: &mut View<'_>, active: &[&HostedPin], ctx: &Ctx<'_>)
             Format::VltLock => vlt::restore(view, &pins, &files, ctx).await,
             Format::Maven => maven::restore(view, &pins, &files, ctx).await,
             Format::Gradle => gradle::restore(view, &pins, &files, ctx).await,
+            Format::Sbt => sbt::restore(view, &pins, &files, ctx).await,
             Format::NuGet => nuget::restore(view, &pins, &files, ctx).await,
             Format::Unsupported | Format::BunLockb => {
                 let mut r = FormatResult::default();

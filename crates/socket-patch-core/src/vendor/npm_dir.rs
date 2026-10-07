@@ -514,7 +514,7 @@ pub(crate) const GITIGNORED: &str = "vendor_artifact_gitignored";
 /// commit it.
 pub(crate) const GITIGNORE_UNCHECKED: &str = "vendor_artifact_gitignore_unchecked";
 
-fn gitignore_unchecked_detail(rel: &str, why: &str) -> String {
+pub(crate) fn gitignore_unchecked_detail(rel: &str, why: &str) -> String {
     format!(
         "could not check whether git would commit the vendored artifact at {rel} ({why}); \
          make sure no ignore rule covers .socket/ before committing it"

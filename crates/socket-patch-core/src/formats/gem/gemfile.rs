@@ -243,6 +243,7 @@ pub(crate) struct SourceOption {
 /// it may carry one. Positional arguments (`*V`, constants, method calls)
 /// are version constraints and never do.
 pub(crate) fn source_option(tail: &str) -> Option<SourceOption> {
+    let tail = &without_statement_end(tail);
     let Some(args) = args(tail) else {
         return Some(SourceOption {
             key: tail.trim().to_string(),
@@ -273,6 +274,7 @@ pub(crate) fn source_option(tail: &str) -> Option<SourceOption> {
 /// `path:`. Empty when the line carries none; bails to empty on an
 /// unparseable tail (unbalanced quote or bracket).
 pub(crate) fn trailing_options(tail: &str) -> String {
+    let tail = &without_statement_end(tail);
     let Some(args) = args(tail) else {
         return String::new();
     };
@@ -282,6 +284,43 @@ pub(crate) fn trailing_options(tail: &str) -> String {
         .find(|(_, arg)| *arg != Arg::Version)
         .map(|(off, _)| tail[off..].trim_end().to_string())
         .unwrap_or_default()
+}
+
+/// `opts` minus a top-level `;` statement terminator (and any extra `;`s),
+/// keeping a trailing `#` comment. Both rewriters first refuse a tail where
+/// another statement follows the `;` (`gem_line_tail_blocks_edit`), so only
+/// `;`s, whitespace and a comment can follow it here (#826).
+fn without_statement_end(opts: &str) -> String {
+    let mut quote: Option<char> = None;
+    let mut depth: i64 = 0;
+    let mut chars = opts.char_indices();
+    while let Some((i, c)) = chars.next() {
+        if let Some(q) = quote {
+            if c == '\\' {
+                chars.next();
+            } else if c == q {
+                quote = None;
+            }
+            continue;
+        }
+        match c {
+            '#' => break,
+            '"' | '\'' => quote = Some(c),
+            '(' | '[' | '{' => depth += 1,
+            ')' | ']' | '}' => depth -= 1,
+            ';' if depth == 0 => {
+                let code = opts[..i].trim_end();
+                let rest = opts[i..].trim_start_matches(|c: char| c == ';' || c.is_whitespace());
+                return if rest.is_empty() {
+                    code.to_string()
+                } else {
+                    format!("{code} {rest}")
+                };
+            }
+            _ => {}
+        }
+    }
+    opts.to_string()
 }
 
 #[cfg(test)]
@@ -402,5 +441,31 @@ mod tests {
             trailing_options(", require: \"a,b\", group: [:x, :y]"),
             "require: \"a,b\", group: [:x, :y]"
         );
+    }
+
+    /// #826: a bare `;` ending the statement is not part of the options
+    /// (it would otherwise read as a positional `"7.0";` and be kept).
+    #[test]
+    fn trailing_options_drop_the_statement_terminator() {
+        // Nor is it an unreadable tail, which would fail closed as a
+        // source-selecting option.
+        for tail in [";", "; # c", ", \"0.8.1\";", ", require: false; # c"] {
+            assert_eq!(key(tail), None, "{tail:?}");
+        }
+        assert_eq!(key(", git: \"x\";"), Some("git:".into()));
+        for (tail, opts) in [
+            (", \"0.8.1\";", ""),
+            (", \"0.8.1\"; # c", ""),
+            (", require: false;", "require: false"),
+            (
+                ", require: false ;; # lazy; ok",
+                "require: false # lazy; ok",
+            ),
+            (", require: \"a;b\";", "require: \"a;b\""),
+            (", require: \"a;b\"", "require: \"a;b\""),
+            (", require: false # x;", "require: false # x;"),
+        ] {
+            assert_eq!(trailing_options(tail), opts, "{tail:?}");
+        }
     }
 }

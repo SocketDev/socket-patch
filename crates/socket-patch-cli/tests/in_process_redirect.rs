@@ -4745,6 +4745,89 @@ async fn yarn_berry_rollback_keeps_a_bare_locator_for_conventional_urls() {
     assert!(!restored.contains("__archiveUrl"), "{restored}");
 }
 
+/// #908: the restore reads `dist.tarball` from the registry the project
+/// resolves against (`.yarnrc.yml` `npmRegistryServer`), not from the
+/// default registry. A mirror whose tarball URLs are off the conventional
+/// path keeps its `::__archiveUrl=` binding, even though the default
+/// registry (`SOCKET_NPM_REGISTRY` here, npmjs normally) serves the
+/// conventional URL yarn would derive — and the mirror would 404.
+#[tokio::test]
+#[serial]
+async fn yarn_berry_rollback_reads_the_tarball_from_the_project_registry() {
+    let server = MockServer::start().await;
+    mock_discovery(&server).await;
+    let hosted_url = HOSTED_URL.replace("http://patch.test", &server.uri());
+    mock_reference_with_berry_url(&server, &hosted_url).await;
+    mock_view(&server).await;
+    let integrity = vlt_hosted_common::sha512_sri(&upstream_tarball());
+    // The default registry: conventional URLs, as npmjs serves them.
+    mock_npm_registry_advertising(
+        &server,
+        &integrity,
+        &format!(
+            "{}/npm-registry/{NAME}/-/{NAME}-{VERSION}.tgz",
+            server.uri()
+        ),
+    )
+    .await;
+    // The project's mirror: Artifactory/CDN-style tarball URLs.
+    let mirror = format!("{}/mirror", server.uri());
+    let advertised = format!("{}/cdn/files/{NAME}-{VERSION}.tgz", server.uri());
+    Mock::given(method("GET"))
+        .and(path(format!("/mirror/{NAME}/{VERSION}")))
+        .respond_with(ResponseTemplate::new(200).set_body_json(serde_json::json!({
+            "name": NAME,
+            "version": VERSION,
+            "dist": { "tarball": advertised, "integrity": integrity },
+        })))
+        .mount(&server)
+        .await;
+    let binding = |t: &str| {
+        t.replace(
+            &format!("resolution: \"{NAME}@npm:{VERSION}\""),
+            &format!(
+                "resolution: \"{NAME}@npm:{VERSION}::__archiveUrl={}\"",
+                socket_patch_core::utils::uri::encode_uri_component(&advertised)
+            ),
+        )
+    };
+
+    let tmp = tempfile::tempdir().unwrap();
+    write_berry_project_spelled(tmp.path(), binding);
+    std::fs::write(
+        tmp.path().join(".yarnrc.yml"),
+        format!("nodeLinker: node-modules\nnpmRegistryServer: \"{mirror}\"\n"),
+    )
+    .unwrap();
+    let lock_path = tmp.path().join("yarn.lock");
+    let pristine = std::fs::read_to_string(&lock_path).unwrap();
+
+    let env = run_redirect_subprocess_with(
+        tmp.path(),
+        &server.uri(),
+        &["--patch-server-url", &server.uri()],
+    );
+    assert_eq!(env["redirect"]["redirected"], 1, "{env:#}");
+
+    let (code, env) = rollback_json_with_origin(tmp.path(), &server, &server.uri());
+    assert_eq!(code, Some(0), "rollback: {env:#}");
+    assert_eq!(
+        env["hosted"]["reverted"],
+        serde_json::json!([PURL]),
+        "{env:#}"
+    );
+    let restored = std::fs::read_to_string(&lock_path).unwrap();
+    let checksum = berry_checksum_of(&restored);
+    assert_eq!(
+        restored,
+        pristine.replace(
+            &format!("10c0/{}", "3".repeat(128)),
+            &format!("10c0/{checksum}")
+        ),
+        "rollback keeps the mirror's __archiveUrl binding"
+    );
+}
+
 /// A pnpm project whose lock records the patched entry as
 /// `{integrity, tarball: <tarball>}` — what pnpm writes under
 /// `lockfile-include-tarball-url`, or for a tarball URL the registry

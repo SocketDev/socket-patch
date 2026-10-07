@@ -3020,7 +3020,8 @@ impl PythonCrawler {
     ///      `.venv`, and `venv` directories, then Poetry's and Pipenv's
     ///      out-of-tree virtualenvs.
     ///   2. If no venv was found AND the cwd looks like a Python
-    ///      project (see `is_python_project`), fall through
+    ///      project (see `is_python_project`) that is not a Pipenv
+    ///      project (whose env is only ever Pipenv's own), fall through
     ///      to `get_global_python_site_packages`. This mirrors the
     ///      cargo / ruby / go pattern where a project marker
     ///      indicates "scan this ecosystem globally for this project".
@@ -3041,6 +3042,13 @@ impl PythonCrawler {
         let venv_paths = find_local_venv_site_packages(&options.cwd).await;
         if !venv_paths.is_empty() {
             return Ok(venv_paths);
+        }
+        // A Pipenv project's env is only ever the one Pipenv resolves for it
+        // (see `pipenv_project_site_packages`). With none yet, nothing is
+        // installed for the project, and its lock-only packages come from
+        // `Pipfile.lock`; the OS Python is never its env (#504, #947).
+        if is_pipenv_project(&options.cwd) {
+            return Ok(Vec::new());
         }
         if is_python_project(&options.cwd).await {
             return Ok(get_global_python_site_packages().await);

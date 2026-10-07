@@ -5,7 +5,10 @@
 //! member as a lockless project and breaks the workspace (cargo, #417).
 //!
 //! [`refusal`] spots both layouts before any takeover or write, so the run
-//! fails closed and names the directory to run from. Vendored mode refuses
+//! fails closed and names the directory to run from. It also refuses a
+//! pnpm member that does have its own lock when the `trustLockfile: true`
+//! hosted pins need lives in the workspace root's `pnpm-workspace.yaml`,
+//! the only one pnpm reads (#880). Vendored mode refuses
 //! the same layouts (`vendor_lockfile_missing`,
 //! `cargo_manifest_not_workspace_root`); the cargo check is the vendored
 //! one, shared.
@@ -18,17 +21,26 @@ use std::path::{Path, PathBuf};
 
 use crate::constants::npm_family::{NPM_LOCKS, VLT_LOCK};
 use crate::patch::redirect::npmrc::npmrc_top_level_value;
-use crate::utils::fs::read_regular_to_string;
+use crate::utils::fs::{read_regular_to_string, read_regular_to_string_sync};
+use crate::utils::pnpm_workspace::governing_workspace_file;
 use crate::vendor::cargo::NOT_WORKSPACE_ROOT;
 use crate::vendor::cargo_manifest;
 use crate::vendor::lock_inventory::ProjectView;
 
 use super::engine::{Candidate, Refusal};
+use super::guidance::{
+    plan_workspace_trust, pnpm_lock_version_major, read_workspace_for_trust, TrustPlan,
+};
 
 /// Refusal code for a pnpm project whose `pnpm-lock.yaml` lives in another
 /// directory: the nearest ancestor `pnpm-workspace.yaml` (a workspace
 /// member) or a configured `lockfile-dir`.
 pub const PNPM_LOCKFILE_ELSEWHERE: &str = "redirect_pnpm_lockfile_elsewhere";
+
+/// Refusal code for a pnpm workspace member with its own lock whose
+/// settings (`trustLockfile`) live in an ancestor `pnpm-workspace.yaml`
+/// that does not trust the lock yet.
+pub const PNPM_SETTINGS_ELSEWHERE: &str = "redirect_pnpm_settings_elsewhere";
 
 const PNPM_LOCK: &str = "pnpm-lock.yaml";
 const PNPM_WORKSPACE: &str = "pnpm-workspace.yaml";
@@ -50,8 +62,14 @@ const HOSTED_CARGO_ROOT_HINT: &str =
      nothing was written";
 
 /// `Some` when the project directory is governed by a lock in another
-/// directory that hosted mode would not read (see the module doc).
-pub async fn refusal(view: &ProjectView<'_>, candidates: &[Candidate]) -> Option<Refusal> {
+/// directory that hosted mode would not read, or (with the trust
+/// auto-config on) by pnpm settings in another directory that hosted mode
+/// would not write (see the module doc).
+pub async fn refusal(
+    view: &ProjectView<'_>,
+    candidates: &[Candidate],
+    trust_lockfile_config: bool,
+) -> Option<Refusal> {
     let root: &Path = match view {
         ProjectView::Disk(root) => root,
         ProjectView::Snapshot(snap) => snap.root,
@@ -77,8 +95,50 @@ pub async fn refusal(view: &ProjectView<'_>, candidates: &[Candidate]) -> Option
                 ),
             });
         }
+        if trust_lockfile_config {
+            if let Some(refusal) = pnpm_settings_elsewhere(root) {
+                return Some(refusal);
+            }
+        }
     }
     None
+}
+
+/// A pnpm v9 project lock (the one the trust auto-config serves) in a
+/// workspace member whose settings come from an ancestor
+/// `pnpm-workspace.yaml` that neither trusts the lock nor explicitly opts
+/// out. The auto-config used to create a nested file pnpm ignores (#880);
+/// socket-patch writes only inside the project, so the user adds the key
+/// to the root file. An explicit `trustLockfile: <non-true>` is respected,
+/// as in a single project.
+fn pnpm_settings_elsewhere(root: &Path) -> Option<Refusal> {
+    let lock = read_regular_to_string_sync(&root.join(PNPM_LOCK)).ok()?;
+    if pnpm_lock_version_major(&lock).is_none_or(|major| major < 9) {
+        return None;
+    }
+    let file = governing_workspace_file(root)?;
+    if let Ok(Some(text)) = read_workspace_for_trust(&file) {
+        if matches!(
+            plan_workspace_trust(Some(&text)),
+            TrustPlan::AlreadyTrue | TrustPlan::UserSet(_)
+        ) {
+            return None;
+        }
+    }
+    Some(Refusal {
+        code: PNPM_SETTINGS_ELSEWHERE.to_string(),
+        message: format!(
+            "{} is a project of the pnpm workspace whose settings live in {}: pnpm \
+             reads `trustLockfile` only from that file, so pnpm >= 11 rejects the hosted \
+             pins in this project's pnpm-lock.yaml (ERR_PNPM_TARBALL_URL_MISMATCH) until \
+             it trusts the lock, and a pnpm-workspace.yaml created here would be ignored; \
+             add `trustLockfile: true` to {} (pnpm <= 10 ignores it) and re-run, or pass \
+             --no-trust-lockfile-config to pin without it; nothing was written",
+            root.display(),
+            file.display(),
+            file.display()
+        ),
+    })
 }
 
 /// The vendored workspace-root check over `<root>/Cargo.toml`; an absent or
@@ -225,7 +285,7 @@ mod tests {
     }
 
     async fn code(dir: &Path, ecosystem: &str) -> Option<String> {
-        refusal(&ProjectView::Disk(dir), &[candidate(ecosystem)])
+        refusal(&ProjectView::Disk(dir), &[candidate(ecosystem)], true)
             .await
             .map(|r| r.code)
     }
@@ -259,7 +319,7 @@ mod tests {
         write(
             tmp.path(),
             "pnpm-workspace.yaml",
-            "packages:\n  - packages/*\n",
+            "packages:\n  - packages/*\ntrustLockfile: true\n",
         );
         write(tmp.path(), "packages/a/package.json", "{}");
         let member = tmp.path().join("packages/a");
@@ -269,6 +329,72 @@ mod tests {
             tmp.path(),
             "packages/a/pnpm-lock.yaml",
             "lockfileVersion: '9.0'\n",
+        );
+        assert_eq!(code(&member, "npm").await, None);
+    }
+
+    /// #880: a member with its own v9 lock is pinned through that lock, but
+    /// pnpm reads `trustLockfile` only from the root `pnpm-workspace.yaml`.
+    /// Until that file trusts the lock (or opts out), the hosted run refuses
+    /// rather than nest a settings file pnpm ignores.
+    #[tokio::test]
+    async fn pnpm_member_with_own_lock_needs_the_root_to_trust_it() {
+        let tmp = tempfile::tempdir().unwrap();
+        let ws = "packages:\n  - packages/*\nsharedWorkspaceLockfile: false\n";
+        write(tmp.path(), "pnpm-workspace.yaml", ws);
+        write(tmp.path(), "packages/a/package.json", "{}");
+        write(
+            tmp.path(),
+            "packages/a/pnpm-lock.yaml",
+            "lockfileVersion: '9.0'\n",
+        );
+        let member = tmp.path().join("packages/a");
+        let refused = refusal(&ProjectView::Disk(&member), &[candidate("npm")], true)
+            .await
+            .unwrap();
+        assert_eq!(refused.code, PNPM_SETTINGS_ELSEWHERE);
+        assert!(
+            refused.message.contains("trustLockfile: true")
+                && refused.message.contains("pnpm-workspace.yaml")
+                && refused.message.contains("nothing was written"),
+            "{}",
+            refused.message
+        );
+        // `--no-trust-lockfile-config` plans no trust write: nothing to refuse.
+        let opted_out = refusal(&ProjectView::Disk(&member), &[candidate("npm")], false).await;
+        assert!(opted_out.is_none());
+        // A non-npm run, and a pre-v9 lock (no trust policy), are untouched.
+        assert_eq!(code(&member, "pypi").await, None);
+        write(
+            tmp.path(),
+            "packages/a/pnpm-lock.yaml",
+            "lockfileVersion: '6.0'\n",
+        );
+        assert_eq!(code(&member, "npm").await, None);
+        write(
+            tmp.path(),
+            "packages/a/pnpm-lock.yaml",
+            "lockfileVersion: '9.0'\n",
+        );
+        // The root trusting the lock, or explicitly opting out, settles it.
+        write(
+            tmp.path(),
+            "pnpm-workspace.yaml",
+            &format!("{ws}trustLockfile: true\n"),
+        );
+        assert_eq!(code(&member, "npm").await, None);
+        write(
+            tmp.path(),
+            "pnpm-workspace.yaml",
+            &format!("{ws}trustLockfile: false\n"),
+        );
+        assert_eq!(code(&member, "npm").await, None);
+        // A member with its own settings file is its own workspace there.
+        write(tmp.path(), "pnpm-workspace.yaml", ws);
+        write(
+            tmp.path(),
+            "packages/a/pnpm-workspace.yaml",
+            "packages:\n  - .\n",
         );
         assert_eq!(code(&member, "npm").await, None);
     }

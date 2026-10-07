@@ -1707,12 +1707,15 @@ async fn requirements_round_trips_in_both_hash_modes() {
 #[serial]
 async fn requirements_hash_mode_ambiguity_is_refused() {
     let (_server, _env) = pypi_mock(&[urllib3_release()]).await;
+    // A file whose only requirement is the pin is not ambiguous (#410): the
+    // hosted line records the mode, and nothing else can conflict with it.
     let input = tree(&[("requirements.txt", "urllib3==1.26.18\n".into())]);
-    let (why, _, _) = pypi_refusal(&input, &[urllib3_dep()], &RestoreOptions::default()).await;
-    assert!(
-        why.contains("hash-checking mode") && why.contains("not derivable"),
-        "{why}"
-    );
+    assert_pypi_round_trip("sole unhashed pin", &input, &[urllib3_dep()], None).await;
+    let input = tree(&[(
+        "requirements.txt",
+        format!("urllib3==1.26.18 --hash=sha256:{URLLIB3_WHEEL_SHA} --hash=sha256:{URLLIB3_SDIST_SHA}\n"),
+    )]);
+    assert_pypi_round_trip("sole hashed pin", &input, &[urllib3_dep()], None).await;
     let input = tree(&[(
         "requirements.txt",
         "idna==3.4 --hash=sha256:aaaa\nsix==1.16.0\nurllib3==1.26.18\n".into(),

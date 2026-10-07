@@ -443,6 +443,17 @@ fn has_hash_option(tokens: &[&str]) -> bool {
         .any(|t| *t == "--hash" || t.starts_with("--hash="))
 }
 
+/// Whether a requirements line is an editable (`-e <path>`, `-e<path>`,
+/// `--editable <path>`, `--editable=<path>`), which pip refuses in
+/// hash-checking mode.
+fn is_editable(tokens: &[&str]) -> bool {
+    tokens.first().is_some_and(|t| {
+        (t.starts_with("-e") && !t.starts_with("--"))
+            || *t == "--editable"
+            || t.starts_with("--editable=")
+    })
+}
+
 /// A hosted requirement line, cut into what its registry spelling keeps.
 struct HostedLine {
     uuid: String,
@@ -454,6 +465,10 @@ struct HostedLine {
     marker: String,
     options: String,
     comment: String,
+    /// The hosted line carries `--hash`: the requirements rewriter writes
+    /// it only into a file already in pip's hash-checking mode (#376),
+    /// else it pins by the url's `#sha256=` fragment.
+    hashed: bool,
 }
 
 /// The in-scope hosted line `requirement` is, if any: `Err((uuid, why))`
@@ -489,6 +504,7 @@ fn hosted_line(
     let tokens = requirement_tokens(body);
     let marker_len = tokens.iter().take_while(|t| !t.starts_with("--")).count();
     let marker = tokens[..marker_len].join(" ");
+    let hashed = has_hash_option(&tokens[marker_len..]);
     let mut options = Vec::new();
     let mut rest_tokens = tokens[marker_len..].iter();
     while let Some(token) = rest_tokens.next() {
@@ -517,6 +533,7 @@ fn hosted_line(
         marker,
         options: options.join(" "),
         comment: comment.trim().to_string(),
+        hashed,
     }))
 }
 
@@ -562,6 +579,12 @@ pub(crate) async fn restore_requirements(
             if tokens.contains(&"--require-hashes") {
                 require_hashes = true;
             }
+            // pip refuses an editable in hash-checking mode, so one settles
+            // the file as unhashed (#410).
+            if is_editable(&tokens) {
+                unhashed += 1;
+                continue;
+            }
             if code.starts_with('-') {
                 continue;
             }
@@ -597,10 +620,10 @@ pub(crate) async fn restore_requirements(
                 "{rel} mixes hashed and unhashed requirements, so whether the original line \
                  carried `--hash` options is not derivable"
             )),
-            (false, false) => Err(format!(
-                "every requirement in {rel} is a hosted pin, so whether the original used pip's \
-                 hash-checking mode (`--hash`) is not derivable"
-            )),
+            // Every requirement is a hosted pin (#410): nothing else in the
+            // file can conflict with either form, so follow the hosted lines'
+            // own shape, which records the mode the rewrite found.
+            (false, false) => Ok(hits.iter().any(|(_, line)| line.hashed)),
         };
         let hash_mode = match hash_mode {
             Ok(mode) => mode,
@@ -992,5 +1015,176 @@ mod tests {
         );
         assert_eq!(multiline_toml_array(&[]), "[]");
         assert_eq!(toml_quote("a\"b\\"), "\"a\\\"b\\\\\"");
+    }
+
+    // ── requirements.txt: pip's hash-checking mode (#410) ──────────────────
+
+    use super::super::{restore_upstream, HostedPin, PinStatus, RestoreOptions, RestoreOutcome};
+    use wiremock::matchers::{method, path};
+    use wiremock::{Mock, MockServer, ResponseTemplate};
+
+    const SIX_UUID: &str = "41041041-0410-4410-8410-410410410410";
+    const SIX_PATCHED: &str = "1111111111111111111111111111111111111111111111111111111111111111";
+    const SIX_WHEEL: &str = "2222222222222222222222222222222222222222222222222222222222222222";
+    const SIX_SDIST: &str = "3333333333333333333333333333333333333333333333333333333333333333";
+
+    fn six_url() -> String {
+        format!(
+            "https://patch.socket.dev/patch-registry/pypi/11111111-1111-1111-1111-111111111111/{SIX_UUID}/six-1.16.0-py2.py3-none-any.whl"
+        )
+    }
+
+    /// The hosted line the requirements rewriter writes for six into an
+    /// unhashed file (url `#sha256=` fragment, no `--hash` option).
+    fn fragment_line() -> String {
+        format!("six @ {}#sha256={SIX_PATCHED}", six_url())
+    }
+
+    /// The hosted line it writes into a hashed file (and that every pre-#383
+    /// v5 rewrite wrote, whatever the file's mode).
+    fn hashed_line() -> String {
+        format!("six @ {} --hash=sha256:{SIX_PATCHED}", six_url())
+    }
+
+    async fn pypi_json() -> MockServer {
+        let server = MockServer::start().await;
+        Mock::given(method("GET"))
+            .and(path("/pypi/six/1.16.0/json"))
+            .respond_with(ResponseTemplate::new(200).set_body_json(serde_json::json!({
+                "urls": [
+                    { "filename": "six-1.16.0-py2.py3-none-any.whl",
+                      "url": "https://files.example/six-1.16.0-py2.py3-none-any.whl",
+                      "digests": { "sha256": SIX_WHEEL } },
+                    { "filename": "six-1.16.0.tar.gz",
+                      "url": "https://files.example/six-1.16.0.tar.gz",
+                      "digests": { "sha256": SIX_SDIST } },
+                ]
+            })))
+            .mount(&server)
+            .await;
+        server
+    }
+
+    /// Restore six's hosted pin in `requirements` (online against a mocked
+    /// PyPI JSON API); the outcome and the file afterwards.
+    async fn restore_six(requirements: &str) -> (RestoreOutcome, String) {
+        let server = pypi_json().await;
+        std::env::set_var("SOCKET_PYPI_JSON_API", format!("{}/pypi", server.uri()));
+        let tmp = tempfile::tempdir().unwrap();
+        std::fs::write(tmp.path().join("requirements.txt"), requirements).unwrap();
+        let pins = [HostedPin {
+            purl: "pkg:pypi/six@1.16.0".into(),
+            uuid: SIX_UUID.into(),
+            files: vec!["requirements.txt".into()],
+        }];
+        let outcome = restore_upstream(tmp.path(), &pins, &RestoreOptions::default()).await;
+        std::env::remove_var("SOCKET_PYPI_JSON_API");
+        let after = std::fs::read_to_string(tmp.path().join("requirements.txt")).unwrap();
+        (outcome, after)
+    }
+
+    fn assert_restored(outcome: &RestoreOutcome) {
+        assert_eq!(
+            outcome.pins[0].status,
+            PinStatus::Restored,
+            "{:?}",
+            outcome.pins
+        );
+    }
+
+    /// #410: a file whose only requirement is the hosted pin restores. The
+    /// hosted line's own shape records the original mode: a `#sha256=`
+    /// fragment means the file was unhashed.
+    #[tokio::test]
+    #[serial_test::serial]
+    async fn requirements_with_only_a_hosted_pin_restores_unhashed() {
+        for eol in ["\n", "\r\n"] {
+            let (outcome, after) = restore_six(&format!("{}{eol}", fragment_line())).await;
+            assert_restored(&outcome);
+            assert_eq!(after, format!("six==1.16.0{eol}"));
+        }
+        // Comments, options and blank lines don't settle the mode either.
+        let (outcome, after) = restore_six(&format!(
+            "# pinned\n--index-url https://pypi.org/simple\n\n{} # via app\n",
+            fragment_line()
+        ))
+        .await;
+        assert_restored(&outcome);
+        assert_eq!(
+            after,
+            "# pinned\n--index-url https://pypi.org/simple\n\nsix==1.16.0 # via app\n"
+        );
+    }
+
+    /// #410: an all-hosted file whose hosted line carries `--hash` restores
+    /// in hash-checking mode, with every upstream release file's hash. With
+    /// no other requirement in the file there is nothing for it to conflict
+    /// with.
+    #[tokio::test]
+    #[serial_test::serial]
+    async fn requirements_with_only_a_hashed_hosted_pin_restores_hashed() {
+        let (outcome, after) = restore_six(&format!("{}\n", hashed_line())).await;
+        assert_restored(&outcome);
+        assert_eq!(
+            after,
+            format!("six==1.16.0 --hash=sha256:{SIX_WHEEL} --hash=sha256:{SIX_SDIST}\n")
+        );
+    }
+
+    /// #410: pip refuses an editable requirement in hash-checking mode, so an
+    /// `-e` line settles the file as unhashed, even beside a hosted line
+    /// that carries `--hash` (the pre-#383 shape).
+    #[tokio::test]
+    #[serial_test::serial]
+    async fn an_editable_line_settles_requirements_as_unhashed() {
+        for editable in ["-e .", "-e ./lib", "--editable .", "--editable=.", "-e."] {
+            for hosted in [fragment_line(), hashed_line()] {
+                let (outcome, after) = restore_six(&format!("{editable}\n{hosted}\n")).await;
+                assert_restored(&outcome);
+                assert_eq!(after, format!("{editable}\nsix==1.16.0\n"), "{hosted}");
+            }
+        }
+    }
+
+    /// Other requirement lines still decide, and genuinely mixed files are
+    /// still refused rather than guessed.
+    #[tokio::test]
+    #[serial_test::serial]
+    async fn other_requirement_lines_still_settle_the_mode() {
+        let (outcome, after) = restore_six(&format!("idna==3.7\n{}\n", hashed_line())).await;
+        assert_restored(&outcome);
+        assert_eq!(after, "idna==3.7\nsix==1.16.0\n");
+
+        let hashed_idna = "idna==3.7 --hash=sha256:aaaa\n";
+        let (outcome, after) = restore_six(&format!("{hashed_idna}{}\n", fragment_line())).await;
+        assert_restored(&outcome);
+        assert_eq!(
+            after,
+            format!(
+                "{hashed_idna}six==1.16.0 --hash=sha256:{SIX_WHEEL} --hash=sha256:{SIX_SDIST}\n"
+            )
+        );
+
+        let mixed = format!(
+            "idna==3.7 --hash=sha256:aaaa\ncertifi==2024.2.2\n{}\n",
+            fragment_line()
+        );
+        let (outcome, after) = restore_six(&mixed).await;
+        assert!(
+            matches!(&outcome.pins[0].status, PinStatus::Refused(why) if why.contains("mixes hashed and unhashed")),
+            "{:?}",
+            outcome.pins
+        );
+        assert_eq!(after, mixed);
+
+        // `-e` beside `--require-hashes` is a file pip can't install at all.
+        let broken = format!("--require-hashes\n-e .\n{}\n", hashed_line());
+        let (outcome, after) = restore_six(&broken).await;
+        assert!(
+            matches!(&outcome.pins[0].status, PinStatus::Refused(_)),
+            "{:?}",
+            outcome.pins
+        );
+        assert_eq!(after, broken);
     }
 }

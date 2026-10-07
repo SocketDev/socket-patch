@@ -1,0 +1,14 @@
+[
+  {
+    "path": "socket-patch.sbt",
+    "kind": "redirect_sbt_pin_rechecked",
+    "action": "updated",
+    "key": "org.apache.commons:commons-lang3",
+    "original": {
+      "deps": "0a1b2c3d"
+    },
+    "new": {
+      "deps": "ffff0000"
+    }
+  }
+]

@@ -50,9 +50,10 @@ pub(crate) const MANIFEST_REL: &str = ".socket/manifest.json";
 pub(crate) const NPM_MANIFEST_REL: &str = "package.json";
 
 /// Root-relative text files read beyond `REDIRECT_CANDIDATE_FILES`.
-const EXTRA_TEXT_FILES: [&str; 5] = [
+const EXTRA_TEXT_FILES: [&str; 6] = [
     PNPM_WORKSPACE_REL,
     NPMRC_REL,
+    crate::patch::redirect::YARNRC_REL,
     VENDOR_STATE_REL,
     MANIFEST_REL,
     NPM_MANIFEST_REL,

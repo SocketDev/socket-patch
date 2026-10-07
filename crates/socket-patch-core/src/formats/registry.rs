@@ -193,6 +193,24 @@ const REGISTRY: &[FormatFile] = &[
     ),
     // The vendored Gradle index: ledger-less repair finds its rows.
     row(".socket/vendor/gradle-index.tsv", "maven", VENDORED | PROBE),
+    // sbt: the generated files (the hosted one is the only file hosted mode
+    // writes; the vendored one is read for its pins) and the build sources
+    // the sbt planner reads for the version, the declared projects and the
+    // build edits that would defeat a pin (never edited).
+    row("socket-patch.sbt", "maven", HOSTED | PROBE),
+    row("socket-patch-vendor.sbt", "maven", HOSTED | PROBE),
+    row("build.sbt", "maven", HOSTED),
+    row("project/build.properties", "maven", HOSTED),
+    row(".sbtopts", "maven", HOSTED),
+    row(".jvmopts", "maven", HOSTED),
+    // An sbt-dependency-lock lock, and the Mill / scala-cli build files the
+    // snippet guidance keys on: presence only.
+    row("build.sbt.lock", "maven", HOSTED | PRESENCE_ONLY),
+    row("build.mill", "maven", HOSTED | PRESENCE_ONLY),
+    row("build.mill.yaml", "maven", HOSTED | PRESENCE_ONLY),
+    row("build.sc", "maven", HOSTED | PRESENCE_ONLY),
+    row(".mill-version", "maven", HOSTED | PRESENCE_ONLY),
+    row("project.scala", "maven", HOSTED | PRESENCE_ONLY),
     // deno.lock is deliberately absent: deno is its own ecosystem
     // (JSR-crawled) and no planner edits its integrity entries.
 ];
@@ -343,5 +361,38 @@ mod tests {
         assert_eq!(hosted_file_ecosystem("Pipfile"), None);
         assert_eq!(hosted_file_ecosystem("package.json"), None);
         assert_eq!(hosted_file_ecosystem("NuGet.Config"), Some("nuget"));
+    }
+
+    #[test]
+    fn sbt_rows_read_the_build_and_probe_only_the_generated_files() {
+        for edited in [
+            "socket-patch.sbt",
+            "socket-patch-vendor.sbt",
+            "build.sbt",
+            ".jvmopts",
+        ] {
+            assert_eq!(hosted_file_ecosystem(edited), Some("maven"), "{edited}");
+        }
+        for presence in [
+            "build.sbt.lock",
+            "build.mill",
+            "build.sc",
+            ".mill-version",
+            "project.scala",
+        ] {
+            assert_eq!(hosted_file_ecosystem(presence), None, "{presence}");
+            assert!(paths_with(HOSTED).contains(&presence), "{presence}");
+        }
+        // The sbt probes are the two generated files (beside the pom and
+        // the Gradle lock / owned files).
+        let sbt_probes: Vec<&str> = probe_paths("maven")
+            .into_iter()
+            .filter(|p| p.ends_with(".sbt") || p.contains("mill") || p.ends_with(".scala"))
+            .collect();
+        assert_eq!(sbt_probes, ["socket-patch.sbt", "socket-patch-vendor.sbt"]);
+        assert!(REGISTRY
+            .iter()
+            .filter(|f| f.path.ends_with(".sbt") || f.path.contains("mill"))
+            .all(|f| !f.has(ROOT) && !f.has(VENDORED)));
     }
 }

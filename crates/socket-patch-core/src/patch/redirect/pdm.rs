@@ -4,7 +4,7 @@ use serde_json::json;
 
 use super::{DepOverride, FileEdit, RewriteResult, RewriteWarning};
 use crate::crawlers::python_crawler::canonicalize_pypi_name;
-use crate::utils::pdm_lock::{rewrite_pdm_lock_in, PdmLockParse};
+use crate::utils::pdm_lock::{rewrite_pdm_lock_all, LockBatch, LockStep, PdmLockDep, PdmLockParse};
 
 pub(super) fn rewrite(
     files: &BTreeMap<String, String>,
@@ -14,28 +14,44 @@ pub(super) fn rewrite(
     let Some(original) = files.get("pdm.lock") else {
         return;
     };
-    let mut text = original.clone();
-    let mut stale_warned = false;
-    // Each lock state is parsed once: the presence probe, the rewrite, the
-    // format probe and the next dep all share it.
+    // Each dep's intake, in dep order: skipped (the lock lacks it), refused
+    // before the lock is read, or one dep of the batch rewrite. A package
+    // `pdm.lock` simply does not contain is not installed by pdm — a sibling
+    // `requirements.txt`/pylock may legitimately carry it — so we neither
+    // redirect it here nor veto the other pypi rewriters. Only a package the
+    // lock DOES contain but the plan refuses (source conflict, unsupported
+    // format, forked variants, bad hashes) withholds siblings. No rewrite
+    // adds or drops a package, so the probe reads the original lock.
     let mut parse = PdmLockParse::default();
-    for dep in overrides.iter().filter(|dep| dep.ecosystem == "pypi") {
-        // A package `pdm.lock` simply does not contain is not installed by pdm —
-        // a sibling `requirements.txt`/pylock may legitimately carry it — so we
-        // neither redirect it here nor veto the other pypi rewriters. Only a
-        // package the lock DOES contain but the plan refuses (source conflict,
-        // unsupported format, forked variants, bad hashes) withholds siblings.
-        if !lock_contains(&mut parse, &text, &dep.name) {
-            continue;
-        }
-        match plan_in(&mut parse, &text, dep) {
-            Ok((rewritten, edits)) => {
+    let intake: Vec<(&DepOverride, Result<Artifact, String>)> = overrides
+        .iter()
+        .filter(|dep| dep.ecosystem == "pypi")
+        .filter(|dep| lock_contains(&mut parse, original, &dep.name))
+        .map(|dep| (dep, artifact_of(dep)))
+        .collect();
+    let lock_deps: Vec<PdmLockDep> = intake
+        .iter()
+        .filter_map(|(dep, artifact)| Some(lock_dep(dep, artifact.as_ref().ok()?)))
+        .collect();
+    // Every dep is rewritten over one parse and one render of the lock.
+    let LockBatch { text, steps } = rewrite_pdm_lock_all(original, &lock_deps);
+    let mut steps = steps.into_iter();
+    // No rewrite touches `[metadata] lock_version`: read once, from the
+    // parse the presence probe already took.
+    let lock_ver: Option<String> = parse.parsed(original).ok().and_then(|lock| {
+        crate::utils::pdm_lock::lock_version(lock)
+            .ok()
+            .map(str::to_string)
+    });
+    let mut stale_warned = false;
+    for (dep, intake) in intake {
+        let step = match intake {
+            Ok(_) => steps.next().expect("one step per batched dep"),
+            Err(detail) => LockStep::Refused(detail),
+        };
+        match step {
+            LockStep::Rewritten(_) | LockStep::Unchanged => {
                 result.confirmed_pdm_uuids.insert(dep.patch_uuid.clone());
-                let lock_ver: Option<String> = parse.parsed(&rewritten).ok().and_then(|lock| {
-                    crate::utils::pdm_lock::lock_version(lock)
-                        .ok()
-                        .map(str::to_string)
-                });
                 if lock_ver.as_deref() == Some("2") {
                     result.warnings.push(RewriteWarning { code: "redirect_pdm_legacy_sync_required".into(), detail: "PDM 0.x may regenerate freshly generated locks during install; use `pdm sync` to preserve this patch, or upgrade PDM".into() });
                 }
@@ -65,10 +81,14 @@ pub(super) fn rewrite(
                         ),
                     });
                 }
-                text = rewritten;
-                result.edits.extend(edits);
+                if let LockStep::Rewritten(edits) = step {
+                    result
+                        .edits
+                        .extend(edits.into_iter().map(|(old, new)| file_edit(dep, old, new)));
+                }
             }
-            Err(detail) => {
+            LockStep::NotFound => unreachable!("PDM refuses a package its lock lacks"),
+            LockStep::Refused(detail) => {
                 result.refused_pdm_uuids.insert(dep.patch_uuid.clone());
                 result.warnings.push(RewriteWarning {
                     code: "redirect_pdm_refused".into(),
@@ -106,17 +126,11 @@ fn lock_contains(parse: &mut PdmLockParse, text: &str, name: &str) -> bool {
     }
 }
 
-#[cfg(test)]
-fn plan(text: &str, dep: &DepOverride) -> Result<(String, Vec<FileEdit>), String> {
-    plan_in(&mut PdmLockParse::default(), text, dep)
-}
+/// A dep's wheel filename and SHA-256.
+type Artifact<'a> = (String, &'a str);
 
-/// Plan `dep`'s rewrite of `text`, reusing (and refreshing) `parse`.
-fn plan_in(
-    parse: &mut PdmLockParse,
-    text: &str,
-    dep: &DepOverride,
-) -> Result<(String, Vec<FileEdit>), String> {
+/// `dep`'s [`Artifact`], or its refusal before the lock is read.
+fn artifact_of(dep: &DepOverride) -> Result<Artifact<'_>, String> {
     let sha256 = dep
         .integrity
         .sha256
@@ -133,28 +147,48 @@ fn plan_in(
         .path_segments()
         .and_then(|mut segments| segments.next_back())
         .ok_or("missing PDM wheel filename")?;
-    let rewrite = rewrite_pdm_lock_in(
-        parse,
-        text,
-        &dep.name,
-        &dep.version,
-        ("url", &dep.artifact_url),
+    Ok((filename.to_string(), sha256))
+}
+
+/// `dep`'s arguments to the lock rewrite, given its [`artifact_of`].
+fn lock_dep<'a>(dep: &'a DepOverride, (filename, sha256): &'a Artifact<'a>) -> PdmLockDep<'a> {
+    PdmLockDep {
+        name: &dep.name,
+        version: &dep.version,
+        source: ("url", &dep.artifact_url),
         filename,
         sha256,
-    )?;
-    let edits = rewrite
-        .edits()?
-        .into_iter()
-        .map(|(old, new)| FileEdit {
-            path: "pdm.lock".into(),
-            kind: "redirect_pdm_lock_package".into(),
-            action: "rewritten".into(),
-            key: Some(dep.name.clone()),
-            original: Some(json!(old)),
-            new: Some(json!(new)),
-        })
-        .collect();
-    Ok((rewrite.text, edits))
+    }
+}
+
+fn file_edit(dep: &DepOverride, old: String, new: String) -> FileEdit {
+    FileEdit {
+        path: "pdm.lock".into(),
+        kind: "redirect_pdm_lock_package".into(),
+        action: "rewritten".into(),
+        key: Some(dep.name.clone()),
+        original: Some(json!(old)),
+        new: Some(json!(new)),
+    }
+}
+
+/// `dep`'s rewrite of `text` alone: the rewritten text and its edits.
+#[cfg(test)]
+fn plan(text: &str, dep: &DepOverride) -> Result<(String, Vec<FileEdit>), String> {
+    let artifact = artifact_of(dep)?;
+    let LockBatch { text, mut steps } = rewrite_pdm_lock_all(text, &[lock_dep(dep, &artifact)]);
+    match steps.remove(0) {
+        LockStep::Rewritten(edits) => Ok((
+            text,
+            edits
+                .into_iter()
+                .map(|(old, new)| file_edit(dep, old, new))
+                .collect(),
+        )),
+        LockStep::Unchanged => Ok((text, Vec::new())),
+        LockStep::NotFound => unreachable!("PDM refuses a package its lock lacks"),
+        LockStep::Refused(detail) => Err(detail),
+    }
 }
 
 #[cfg(test)]
@@ -440,5 +474,57 @@ mod parse_reuse_equivalence_tests {
         }
         assert!(confirmed > 100, "only {confirmed} confirmed");
         g.finish();
+    }
+
+    /// A dozen patched packages in one lock cost one whole-lock render and
+    /// re-parse, not one per package (#762).
+    #[test]
+    fn many_patches_render_the_lock_once() {
+        use crate::utils::lock_fragments::RENDERS;
+        let url = |name: &str| {
+            format!("https://patch.socket.dev/patch/pypi/{name}/a/{name}-1.26.18-py3-none-any.whl")
+        };
+        let mut checked = 0;
+        for (fixture, lock) in fixtures() {
+            for crlf in [false, true] {
+                let mut lock = grown(&lock.replace("\r\n", "\n"), 11);
+                if crlf {
+                    lock = lock.replace('\n', "\r\n");
+                }
+                let names = std::iter::once("urllib3".to_string())
+                    .chain((0..11).map(|n| format!("pkg{n}")));
+                let deps: Vec<DepOverride> = names
+                    .enumerate()
+                    .map(|(n, name)| DepOverride {
+                        ecosystem: "pypi".into(),
+                        artifact_url: url(&name),
+                        name,
+                        namespace: None,
+                        version: "1.26.18".into(),
+                        token: String::new(),
+                        patch_uuid: format!("00000000-0000-4000-8000-{n:012}"),
+                        registry_override: None,
+                        integrity: Integrity {
+                            sha256: Some("a".repeat(64)),
+                            ..Default::default()
+                        },
+                    })
+                    .collect();
+                let files = BTreeMap::from([("pdm.lock".to_string(), lock)]);
+                RENDERS.with(|renders| renders.set(0));
+                let mut got = RewriteResult::default();
+                rewrite(&files, &deps, &mut got);
+                if got.confirmed_pdm_uuids.len() != 12 {
+                    continue; // a generation this dep shape doesn't land on
+                }
+                checked += 1;
+                assert_eq!(
+                    RENDERS.with(|renders| renders.get()),
+                    1,
+                    "{fixture} crlf={crlf}"
+                );
+            }
+        }
+        assert!(checked >= 16, "only {checked} locks landed every dep");
     }
 }
