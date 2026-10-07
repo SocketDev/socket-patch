@@ -3578,16 +3578,58 @@ fn rewrite_yarn_classic(
             // artifact would silently swap the user's code for registry
             // bytes, and nothing records the original `resolved` for a
             // rollback. Left untouched and named, like the git copy.
+            // A copy an older release already pinned to this run's artifact
+            // installs Socket's patched registry build, not the user's own
+            // artifact: it is neither unpatched nor re-pinned, but the pin
+            // is the B16 mistake, so it is named with the way back (rollback
+            // refuses it, since the copy's own `resolved` was never
+            // recorded).
+            if source == CopySource::RemoteTarball
+                && resolved.is_some_and(|r| {
+                    r.split_once('#').map_or(r, |(base, _)| base) == dep.artifact_url
+                })
+            {
+                matched_any = true;
+                result.warnings.push(RewriteWarning {
+                    code: "redirect_yarn_classic_non_registry_legacy_pin".into(),
+                    detail: format!(
+                        "lock entry `{key}` is a file: tarball, URL or hosted-git dependency \
+                         that an older release pinned to Socket's patched registry artifact \
+                         for {fname}@{}, so it installs the registry build rather than your \
+                         own; its original `resolved` was not recorded — restore yarn.lock \
+                         from version control to return it to its own source",
+                        dep.version
+                    ),
+                });
+                continue;
+            }
             if source == CopySource::RemoteTarball {
                 copy_skipped = true;
                 result.bundled_skipped_uuids.insert(dep.patch_uuid.clone());
                 result.warnings.push(RewriteWarning {
-                    code: "redirect_yarn_classic_non_registry_skipped".into(),
+                    code: "redirect_yarn_classic_non_registry_entry_skipped".into(),
                     detail: format!(
                         "lock entry `{key}` installs {fname}@{} from a tarball that is not the \
                          registry's (a file: tarball, URL or hosted-git dependency); the hosted \
                          redirect only repoints registry copies, so it leaves this one \
                          untouched and this copy stays unpatched",
+                        dep.version
+                    ),
+                });
+                continue;
+            }
+            // A block with no `resolved` is a stale lock (yarn writes one for
+            // every locked package): there is no tarball to repoint, and
+            // `yarn install` re-locks it from the registry, unpatched.
+            if source == CopySource::Unresolved {
+                copy_skipped = true;
+                result.bundled_skipped_uuids.insert(dep.patch_uuid.clone());
+                result.warnings.push(RewriteWarning {
+                    code: "redirect_yarn_classic_unresolved_entry_skipped".into(),
+                    detail: format!(
+                        "lock entry `{key}` locks {fname}@{} with no `resolved` tarball (a \
+                         stale lock); the hosted redirect has nothing to repoint, so this copy \
+                         stays unpatched — run `yarn install` to re-lock it, then re-run",
                         dep.version
                     ),
                 });
@@ -10104,6 +10146,46 @@ mod tests {
         rewrite_yarn_classic(&files, std::slice::from_ref(&ovr), &mut r);
         assert!(r.files.is_empty(), "{:?}", r.files);
         assert!(r.edits.is_empty(), "{:?}", r.edits);
+        let codes: Vec<&str> = r.warnings.iter().map(|w| w.code.as_str()).collect();
+        assert_eq!(codes, ["redirect_yarn_classic_unresolved_entry_skipped"]);
+        assert!(
+            r.warnings[0].detail.contains("yarn install"),
+            "{:?}",
+            r.warnings
+        );
+        assert!(r.bundled_skipped_uuids.contains(&ovr.patch_uuid));
+    }
+
+    /// B16 upgrade state: an older release pinned a URL-keyed fork block to
+    /// this artifact. That copy installs Socket's build, so it is not
+    /// called unpatched nor kept out of the in-run VEX; it is named as a
+    /// legacy pin with the way back, and left byte-identical.
+    #[test]
+    fn yarn_classic_legacy_pin_on_a_non_registry_copy_is_named_not_unpatched() {
+        let ovr = npm_override(
+            "left-pad",
+            "1.3.0",
+            "http://p.test/lp.tgz",
+            "sha512-PATCHED==",
+        );
+        let lock =
+            "# yarn lockfile v1\n\n\n\"left-pad@https://host.test/fork/left-pad-1.3.0.tgz\":\n  \
+                    version \"1.3.0\"\n  resolved \"http://p.test/lp.tgz#ab\"\n  \
+                    integrity sha512-PATCHED==\n";
+        let mut files = BTreeMap::new();
+        files.insert("yarn.lock".to_string(), lock.to_string());
+        let mut r = RewriteResult::default();
+        rewrite_yarn_classic(&files, std::slice::from_ref(&ovr), &mut r);
+        assert!(r.files.is_empty() && r.edits.is_empty(), "{:?}", r.files);
+        let codes: Vec<&str> = r.warnings.iter().map(|w| w.code.as_str()).collect();
+        assert_eq!(codes, ["redirect_yarn_classic_non_registry_legacy_pin"]);
+        assert!(
+            !r.warnings[0].detail.contains("unpatched")
+                && r.warnings[0].detail.contains("version control"),
+            "{:?}",
+            r.warnings
+        );
+        assert!(!r.bundled_skipped_uuids.contains(&ovr.patch_uuid));
     }
 
     /// Bare carriage returns outside a CRLF pair make the normalize/expand
@@ -10319,7 +10401,11 @@ mod tests {
             assert!(out.contains("resolved \"http://p.test/lp.tgz\""), "{out}");
             assert!(out.ends_with(copy), "{copy}: copy byte-identical:\n{out}");
             let codes: Vec<&str> = r.warnings.iter().map(|w| w.code.as_str()).collect();
-            assert_eq!(codes, ["redirect_yarn_classic_non_registry_skipped"], "{copy}");
+            assert_eq!(
+                codes,
+                ["redirect_yarn_classic_non_registry_entry_skipped"],
+                "{copy}"
+            );
             assert!(r.bundled_skipped_uuids.contains(&ovr.patch_uuid), "{copy}");
 
             // As the only copy: nothing is written, and the scan says why.
@@ -10330,9 +10416,17 @@ mod tests {
             );
             let mut r = RewriteResult::default();
             rewrite_yarn_classic(&files, std::slice::from_ref(&ovr), &mut r);
-            assert!(r.files.is_empty() && r.edits.is_empty(), "{copy}: {:?}", r.files);
+            assert!(
+                r.files.is_empty() && r.edits.is_empty(),
+                "{copy}: {:?}",
+                r.files
+            );
             let codes: Vec<&str> = r.warnings.iter().map(|w| w.code.as_str()).collect();
-            assert_eq!(codes, ["redirect_yarn_classic_non_registry_skipped"], "{copy}");
+            assert_eq!(
+                codes,
+                ["redirect_yarn_classic_non_registry_entry_skipped"],
+                "{copy}"
+            );
         }
     }
 
@@ -10484,7 +10578,7 @@ mod tests {
         rewrite_yarn_classic(&files, std::slice::from_ref(&ovr), &mut r);
         assert!(r.edits.is_empty(), "{:?}", r.edits);
         let codes: Vec<&str> = r.warnings.iter().map(|w| w.code.as_str()).collect();
-        assert_eq!(codes, ["redirect_yarn_classic_non_registry_skipped"]);
+        assert_eq!(codes, ["redirect_yarn_classic_non_registry_entry_skipped"]);
     }
 
     /// The opposite alias direction — `"alias@npm:<fname>@…"` consuming the
