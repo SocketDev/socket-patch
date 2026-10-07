@@ -725,10 +725,12 @@ async fn legacy_mixed_root(project_root: &Path) -> bool {
 }
 
 /// The `not_build_root` refusal detail when `project_root` is a module of a
-/// Maven reactor or a project of a Gradle build rooted above it: vendoring
+/// Maven reactor, a project of a Gradle build or an sbt subproject of a
+/// build rooted above it: vendoring
 /// there would wire a build nobody runs and leave the real one unpatched
 /// (#428). Ancestors are searched up to the enclosing git checkout.
 pub(super) fn not_build_root(project_root: &Path) -> Option<String> {
+    let project = super::jvm::apply::ProjectReader::new(project_root);
     let own_settings = ["settings.gradle", "settings.gradle.kts"]
         .iter()
         .any(|f| project_root.join(f).is_file());
@@ -748,6 +750,12 @@ pub(super) fn not_build_root(project_root: &Path) -> Option<String> {
         ) {
             return Some(format!(
                 "reason: not_build_root: run vendor from reactor root {}",
+                ancestor.display()
+            ));
+        }
+        if super::jvm::sbt::nested_in_build(&|p: &str| project.read(p), &|p: &str| reader.read(p)) {
+            return Some(format!(
+                "reason: not_build_root: run vendor from sbt build root {}",
                 ancestor.display()
             ));
         }
@@ -888,8 +896,40 @@ impl LocalSources {
                 return Ok(Some(bytes));
             }
         }
+        // An Ivy cache keeps no `<a>-<v>.pom` beside the jar, but may hold
+        // the pristine pom as `ivy-<v>.xml.original` (no checksum sidecar,
+        // so it is never an authenticated copy).
+        if ext == "pom" && classifier.is_none() && !authenticated {
+            if let Some(dir) = &self.installed_dir {
+                let (g, a, v) = gav;
+                if let Some(bytes) = crate::crawlers::ivy_cache::installed_pom(dir, g, a, v) {
+                    return Ok(Some(bytes));
+                }
+            }
+        }
         Ok(None)
     }
+}
+
+/// The vendored sbt / scala-cli gate for `purl` over the project at
+/// `project_root`, for a caller about to restore a hosted pin upstream (a
+/// takeover or an eject) before vendoring: `Err((code, detail))` when the
+/// gate would stop the patch (a skip or a refusal), so the caller keeps the
+/// hosted wiring instead of ending neither hosted nor vendored. `Ok` for
+/// any other project shape or a non-Maven purl.
+pub async fn jvm_gate_preflight(
+    project_root: &Path,
+    purl: &str,
+) -> Result<(), (&'static str, String)> {
+    let Some((g, a, v)) = parse_maven_purl(purl) else {
+        return Ok(());
+    };
+    let Some(shape) = jvm_shape(project_root).await else {
+        return Ok(());
+    };
+    super::jvm::sbt_gate::for_shape(shape, project_root, &g, &a, &v)
+        .map(|_| ())
+        .map_err(|stop| stop.code_and_detail(purl))
 }
 
 /// The committed tree bytes for `record` (jar, upstream pom, module, and
@@ -925,6 +965,11 @@ async fn jvm_committed_patch(
             ),
             (super::jvm::gradle::tree_dir(&coords), v.to_string()),
         ],
+        Shape::Sbt => vec![(
+            super::jvm::sbt::tree_dir(&coords),
+            coords.suffixed_version(),
+        )],
+        Shape::ScalaCli => vec![(super::jvm::coursier_tree::tree_dir(&coords), v.to_string())],
         Shape::Other => return None,
     };
     for (dir, tree_version) in &trees {
@@ -951,6 +996,11 @@ async fn jvm_committed_patch(
         Shape::MavenReactor => (
             super::jvm::maven_reactor::committed(&read, &coords)
                 .map(|(jar, pom)| (jar, pom, None))?,
+            Vec::new(),
+        ),
+        Shape::Sbt => (super::jvm::sbt::committed(&read, &coords)?, Vec::new()),
+        Shape::ScalaCli => (
+            super::jvm::scala_cli::committed(&read, &coords)?,
             Vec::new(),
         ),
         _ => (
@@ -1006,6 +1056,13 @@ async fn vendor_maven_jvm(
     };
     let gradle = matches!(shape, Shape::Gradle | Shape::Mixed);
     let display_path = project_root.join(".socket/vendor");
+    // sbt / scala-cli pins are gated on the build's own resolution first.
+    let gate =
+        super::jvm::sbt_gate::for_shape(shape, project_root, &group_id, &artifact_id, &version);
+    let gate_pass = match gate.map_err(|stop| stop.into_outcome(purl)) {
+        Ok(pass) => pass,
+        Err(outcome) => return outcome,
+    };
     if record.files.is_empty() {
         let reader = super::jvm::apply::ProjectReader::new(project_root);
         let probe_pom = format!("<project><groupId>{group_id}</groupId><artifactId>{artifact_id}</artifactId><version>{version}</version></project>");
@@ -1047,7 +1104,7 @@ async fn vendor_maven_jvm(
 
     let local = LocalSources::new(project_root, installed_dir, &group_id);
     let gav = (group_id.clone(), artifact_id.clone(), version.clone());
-    let mut warnings: Vec<VendorWarning> = Vec::new();
+    let mut warnings: Vec<VendorWarning> = gate_pass.warnings;
     let committed = jvm_committed_patch(shape, purl, project_root, record).await;
     let was_committed = committed.is_some();
     let (jar_bytes, mut pom_bytes, mut module_bytes, mut extras, mut result) = match committed {
@@ -1202,7 +1259,13 @@ async fn vendor_maven_jvm(
     {
         return refused("vendor_jvm_shape_unsupported", "reason: maven_config_changed: revert the existing Maven wiring before selecting --maven-config=none");
     }
-    let planned = super::jvm::plan_with_config(shape, &read, &list, &patch, config_enabled);
+    let planned = match shape {
+        // The pin records the gate's digest (every build source).
+        Shape::Sbt => {
+            super::jvm::sbt::plan_with_digest(&read, &patch, gate_pass.deps_digest.as_deref())
+        }
+        _ => super::jvm::plan_with_config(shape, &read, &list, &patch, config_enabled),
+    };
     if let Some(rel) = reader.escaped() {
         return refused(
             "vendor_jvm_shape_unsupported",

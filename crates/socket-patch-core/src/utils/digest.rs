@@ -136,6 +136,8 @@ mod tests {
     /// entry as well as on a new inline copy.
     const PENDING_INLINE_DIGESTS: &[&str] = &[
         "crawlers/gradle_cache.rs",
+        "patch/jvm_jar.rs",
+        "patch/sidecars/maven.rs",
         "utils/group_commit.rs",
         "vendor/jvm/mod.rs",
         "vendor/maven_repo.rs",

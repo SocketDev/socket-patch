@@ -9,11 +9,12 @@
 //! into the binary.
 
 use std::collections::{HashMap, HashSet};
-use std::path::Path;
+use std::path::{Path, PathBuf};
 
 use super::{
     parse_path_coordinates, parse_pom_group_artifact_version, MavenCrawler, LAYOUT_TRUST_ATTEMPTS,
 };
+use crate::crawlers::jvm_cache::JvmCacheLayout;
 use crate::crawlers::types::{CrawledPackage, CrawlerOptions};
 use crate::utils::fs::run_blocking;
 
@@ -24,10 +25,7 @@ impl LegacyMavenCrawler {
         let mut packages = Vec::new();
         let mut seen = HashSet::new();
 
-        let repo_paths = MavenCrawler::new()
-            .get_maven_repo_paths(options)
-            .await
-            .unwrap_or_default();
+        let repo_paths = maven2_roots(options).await;
 
         for repo_path in repo_paths {
             let (found, returned_seen) = run_blocking(move || {
@@ -50,10 +48,7 @@ impl LegacyMavenCrawler {
 pub(super) async fn crawl_all_content_first(options: &CrawlerOptions) -> Vec<CrawledPackage> {
     let mut packages = Vec::new();
     let mut seen = HashSet::new();
-    let repo_paths = MavenCrawler::new()
-        .get_maven_repo_paths(options)
-        .await
-        .unwrap_or_default();
+    let repo_paths = maven2_roots(options).await;
     for repo_path in repo_paths {
         let (found, returned_seen) = run_blocking(move || {
             let found = scan(&repo_path, &mut seen, false);
@@ -64,6 +59,20 @@ pub(super) async fn crawl_all_content_first(options: &CrawlerOptions) -> Vec<Cra
         packages.extend(found);
     }
     packages
+}
+
+/// The roots the oracle covers: the Maven2-layout ones only. It predates
+/// the Coursier and Ivy caches, whose crawls (the Ivy walk, the Coursier
+/// repository-root expansion) have their own tests; a Coursier
+/// per-repository root is a Maven2 tree but the oracle never saw one.
+async fn maven2_roots(options: &CrawlerOptions) -> Vec<PathBuf> {
+    MavenCrawler::new()
+        .get_jvm_cache_roots(options)
+        .await
+        .into_iter()
+        .filter(|root| root.layout == JvmCacheLayout::Maven2)
+        .map(|root| root.path)
+        .collect()
 }
 
 fn scan_maven_repo(repo_path: &Path, seen: &mut HashSet<String>) -> Vec<CrawledPackage> {

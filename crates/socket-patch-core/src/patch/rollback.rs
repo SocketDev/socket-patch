@@ -557,6 +557,22 @@ async fn rollback_package_patch_at(
         }
     }
     if all_original || dry_run {
+        // Maven: retry a Coursier sidecar resync an earlier rollback could
+        // not finish (see `sidecars::coursier::retry_record`).
+        if !dry_run {
+            let keys: Vec<String> = result
+                .files_verified
+                .iter()
+                .map(|v| v.file.clone())
+                .collect();
+            let failed = "sidecar resync failed (files still rolled back)";
+            result.sidecar = crate::patch::sidecars::coursier::retry_record(
+                package_key,
+                pkg_path,
+                &keys,
+                failed,
+            );
+        }
         result.success = true;
         return result;
     }

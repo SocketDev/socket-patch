@@ -65,7 +65,8 @@ mod vex_e2e_common;
 mod yarn_classic_vex;
 
 use yarn_classic_vex::{
-    require_yarn_classic, via_apply, yarn_classic, Embedded, ManifestlessVex, Wiring,
+    installs_file_tarballs, require_yarn_classic, via_apply, yarn_classic, yarn_classic_version,
+    Embedded, ManifestlessVex, Wiring,
 };
 
 const ORG: &str = "test-org";
@@ -234,10 +235,14 @@ enum HostedDriver {
 /// (per `driver`: `scan --mode hosted --vex` or `get <uuid> --mode hosted`),
 /// and the envelope/lockfile/ledger assertions.
 /// `tamper_served_tarball` serves DIFFERENT bytes at the hosted URL than the
-/// sha1/integrity pins. `None` = skip (message printed).
+/// sha1/integrity pins. `offline_mirror` configures `yarn-offline-mirror`
+/// in `.yarnrc` before the fixture install, so the mirror holds the upstream
+/// tarball, and asserts the hosted rewrite REFUSES (#364) instead of
+/// pinning. `None` = skip (message printed).
 async fn classic_hosted_project(
     tag: &str,
     tamper_served_tarball: bool,
+    offline_mirror: bool,
     driver: HostedDriver,
 ) -> Option<ClassicRedirectFixture> {
     if !require_yarn_classic(&format!("e2e_redirect_yarn_classic_build ({tag})"), |c| {
@@ -255,6 +260,9 @@ async fn classic_hosted_project(
         ),
     )
     .unwrap();
+    if offline_mirror {
+        std::fs::write(proj.join(".yarnrc"), "yarn-offline-mirror \"./mirror\"\n").unwrap();
+    }
 
     // 1. REAL fixture: yarn classic install (network here, private cache).
     let cache = tmp.path().join("yarn-cache");
@@ -428,13 +436,51 @@ async fn classic_hosted_project(
         ],
     };
     let (code, stdout, stderr) = run_socket(&proj, &argv);
+    let env: serde_json::Value = serde_json::from_str(&stdout).unwrap_or_else(|e| {
+        panic!("{driver:?} --mode hosted --json output is not JSON: {e}\nstdout:\n{stdout}")
+    });
+    if offline_mirror {
+        // With nothing redirected, `--vex` has nothing to attest: the scan
+        // fails closed on that rather than reporting a success.
+        if driver == HostedDriver::Scan {
+            assert_ne!(code, 0, "nothing attested must not exit 0: {env}");
+            assert_eq!(env["error"]["code"], "manifest_not_found", "{env}");
+        }
+        // #364: the mirror would serve the upstream tarball under the hosted
+        // URL's basename, so nothing is pinned, counted or attested.
+        assert_eq!(
+            env["redirect"]["redirected"], 0,
+            "a mirrored project must not count a redirect: {env}"
+        );
+        assert!(
+            env.to_string().contains("redirect_yarn_classic_offline_mirror"),
+            "the refusal must be reported: {env}"
+        );
+        assert_eq!(
+            std::fs::read_to_string(proj.join("yarn.lock")).unwrap(),
+            lock_pristine,
+            "the refused lock must stay byte-identical"
+        );
+        if driver == HostedDriver::Scan {
+            let vex = std::fs::read_to_string(proj.join("out.vex.json")).unwrap_or_default();
+            assert!(
+                !vex.contains("not_affected"),
+                "a refused redirect must not be attested: {vex}"
+            );
+        }
+        return Some(ClassicRedirectFixture {
+            tmp,
+            proj,
+            orig,
+            patched,
+            lock_pristine: lock_pristine.into_bytes(),
+            server,
+        });
+    }
     assert_eq!(
         code, 0,
         "{driver:?} --mode hosted failed.\nstdout:\n{stdout}\nstderr:\n{stderr}"
     );
-    let env: serde_json::Value = serde_json::from_str(&stdout).unwrap_or_else(|e| {
-        panic!("{driver:?} --mode hosted --json output is not JSON: {e}\nstdout:\n{stdout}")
-    });
     assert_eq!(env["status"], "success", "envelope: {env}");
     assert_eq!(
         env["redirect"]["redirected"], 1,
@@ -661,7 +707,7 @@ fn hosted_dev_resave_vex(fx: &ClassicRedirectFixture) {
 #[tokio::test(flavor = "multi_thread")]
 #[serial_test::serial]
 async fn classic_redirect_fresh_checkout_installs_patched_bytes() {
-    let Some(fx) = classic_hosted_project("main", false, HostedDriver::Scan).await else {
+    let Some(fx) = classic_hosted_project("main", false, false, HostedDriver::Scan).await else {
         return;
     };
 
@@ -700,7 +746,7 @@ async fn classic_redirect_fresh_checkout_installs_patched_bytes() {
 #[tokio::test(flavor = "multi_thread")]
 #[serial_test::serial]
 async fn classic_get_uuid_hosted_fresh_checkout_installs() {
-    let Some(fx) = classic_hosted_project("get-uuid", false, HostedDriver::GetUuid).await else {
+    let Some(fx) = classic_hosted_project("get-uuid", false, false, HostedDriver::GetUuid).await else {
         return;
     };
 
@@ -732,7 +778,7 @@ async fn classic_get_uuid_hosted_fresh_checkout_installs() {
 #[tokio::test(flavor = "multi_thread")]
 #[serial_test::serial]
 async fn classic_redirect_tampered_hosted_tarball_fails_integrity() {
-    let Some(fx) = classic_hosted_project("tampered", true, HostedDriver::Scan).await else {
+    let Some(fx) = classic_hosted_project("tampered", true, false, HostedDriver::Scan).await else {
         return;
     };
 
@@ -761,6 +807,73 @@ async fn classic_redirect_tampered_hosted_tarball_fails_integrity() {
             !installed.starts_with(b"/* SOCKET-TAMPERED */"),
             "tampered bytes must not be installed"
         );
+    }
+}
+
+/// #364: with `yarn-offline-mirror` set, yarn 1 looks the tarball up in the
+/// mirror by the basename of `resolved`, which the hosted URL shares with
+/// the upstream tarball already there, so a hosted pin would make every
+/// install fail its integrity check. The hosted rewrite refuses instead
+/// (the fixture asserts no redirect, no attestation, an untouched lock),
+/// and the fresh checkout still installs offline from the mirror.
+#[tokio::test(flavor = "multi_thread")]
+#[serial_test::serial]
+async fn classic_offline_mirror_refuses_hosted_and_keeps_installs_working() {
+    let Some(fx) = classic_hosted_project("offline-mirror", false, true, HostedDriver::Scan).await
+    else {
+        return;
+    };
+    assert!(
+        fx.proj.join("mirror").join(format!("{DEP}-{DEP_VERSION}.tgz")).is_file(),
+        "the fixture install must populate the offline mirror"
+    );
+    let fresh = fx.tmp.path().join("fresh");
+    std::fs::create_dir_all(&fresh).unwrap();
+    for f in ["package.json", "yarn.lock", ".yarnrc"] {
+        std::fs::copy(fx.proj.join(f), fresh.join(f)).unwrap();
+    }
+    copy_dir_recursive(&fx.proj.join("mirror"), &fresh.join("mirror"));
+    let fresh_cache = fx.tmp.path().join("fresh-yarn-cache");
+    // yarn 1.0–1.6 install nothing from a mirror (a local tarball), with or
+    // without socket-patch: the control the issue measured. Pin that
+    // limitation there instead of the upstream bytes.
+    if !installs_file_tarballs(&yarn_classic_version()) {
+        let ci = corepack(
+            &fresh,
+            &yarn_classic(),
+            &["install", "--frozen-lockfile", "--no-progress"],
+            &[("YARN_CACHE_FOLDER", fresh_cache.to_str().unwrap())],
+        );
+        assert!(
+            ci.status.success(),
+            "stderr:\n{}",
+            String::from_utf8_lossy(&ci.stderr)
+        );
+        assert!(
+            !fresh.join("node_modules").join(DEP).join("index.js").exists(),
+            "yarn < 1.7 is expected to install nothing from the mirror"
+        );
+        return;
+    }
+    for extra in [&[][..], &["--offline"][..]] {
+        let mut args = vec!["install", "--frozen-lockfile", "--no-progress"];
+        args.extend_from_slice(extra);
+        let ci = corepack(
+            &fresh,
+            &yarn_classic(),
+            &args,
+            &[("YARN_CACHE_FOLDER", fresh_cache.to_str().unwrap())],
+        );
+        assert!(
+            ci.status.success(),
+            "`yarn {args:?}` must still install from the mirror.\nstdout:\n{}\nstderr:\n{}",
+            String::from_utf8_lossy(&ci.stdout),
+            String::from_utf8_lossy(&ci.stderr),
+        );
+        let installed =
+            std::fs::read(fresh.join("node_modules").join(DEP).join("index.js")).unwrap();
+        assert_eq!(installed, fx.orig, "the untouched lock installs the upstream bytes");
+        std::fs::remove_dir_all(fresh.join("node_modules")).unwrap();
     }
 }
 
@@ -857,64 +970,7 @@ async fn classic_git_sourced_dependency_is_left_unrewired() {
     let tgz_path = tmp.path().join("patched.tgz");
     build_patched_tgz(&installed_dir, &patched, &tgz_path);
     let tgz = std::fs::read(&tgz_path).unwrap();
-    let server = MockServer::start().await;
-    let hosted_url = format!(
-        "{}/patch/npm/{DEP}/{DEP_VERSION}/{TOKEN}/{UUID}/{DEP}-{DEP_VERSION}.tgz",
-        server.uri()
-    );
-    let summary = serde_json::json!({
-        "uuid": UUID, "purl": PURL, "tier": "free",
-        "cveIds": [], "ghsaIds": [], "severity": "high", "title": "git classic fixture"
-    });
-    Mock::given(method("POST"))
-        .and(path(format!("/v0/orgs/{ORG}/patches/batch")))
-        .respond_with(ResponseTemplate::new(200).set_body_json(serde_json::json!({
-            "packages": [{ "purl": PURL, "patches": [summary] }],
-            "canAccessPaidPatches": false,
-        })))
-        .mount(&server)
-        .await;
-    Mock::given(method("GET"))
-        .and(path_regex(format!(
-            "^/v0/orgs/{ORG}/patches/by-package/.+$"
-        )))
-        .respond_with(ResponseTemplate::new(200).set_body_json(serde_json::json!({
-            "patches": [{
-                "uuid": UUID, "purl": PURL, "publishedAt": "2026-01-01T00:00:00Z",
-                "description": "x", "license": "MIT", "tier": "free", "vulnerabilities": {}
-            }],
-            "canAccessPaidPatches": false,
-        })))
-        .mount(&server)
-        .await;
-    Mock::given(method("POST"))
-        .and(path(format!("/v0/orgs/{ORG}/patches/package")))
-        .respond_with(ResponseTemplate::new(200).set_body_json(serde_json::json!({
-            "results": { UUID: {
-                "status": "granted", "url": hosted_url, "purl": PURL,
-                "artifacts": [{ "kind": "tarball", "url": hosted_url,
-                    "integrity": { "sha512": sha512_sri(&tgz), "sha1": sha1_hex(&tgz) } }],
-                "registryOverride": null
-            } }
-        })))
-        .mount(&server)
-        .await;
-    Mock::given(method("GET"))
-        .and(path(format!("/v0/orgs/{ORG}/patches/view/{UUID}")))
-        .respond_with(ResponseTemplate::new(200).set_body_json(serde_json::json!({
-            "uuid": UUID, "purl": PURL, "publishedAt": "2026-01-01T00:00:00Z",
-            "files": { "package/index.js": {
-                "beforeHash": compute_git_sha256_from_bytes(orig),
-                "afterHash": compute_git_sha256_from_bytes(&patched),
-            } },
-            "vulnerabilities": { GHSA: {
-                "cves": [CVE], "summary": "s", "severity": "high", "description": "d"
-            } },
-            "description": "x", "license": "MIT", "tier": "free"
-        })))
-        .mount(&server)
-        .await;
-
+    let server = mock_hosted_grant(&tgz, orig, &patched, "git classic fixture").await;
     let api_url = server.uri();
     let (code, stdout, stderr) = run_socket(
         &proj,
@@ -975,4 +1031,171 @@ async fn classic_git_sourced_dependency_is_left_unrewired() {
         String::from_utf8_lossy(&ci.stdout),
         String::from_utf8_lossy(&ci.stderr),
     );
+}
+
+/// #921: a `file:` directory dependency locks as a block with no
+/// `resolved`; yarn 1 COPIES the directory into node_modules, so no lock
+/// rewrite reaches it. `scan --mode hosted --json` must say so with
+/// `redirect_yarn_classic_directory_skipped` (it used to report success
+/// with no warning at all), leave the lock byte-identical and attest
+/// nothing in its in-run VEX. The fork is local, so no registry is needed.
+#[tokio::test(flavor = "multi_thread")]
+#[serial_test::serial]
+async fn classic_file_directory_dependency_is_named_and_not_attested() {
+    if !require_yarn_classic("e2e_redirect_yarn_classic_build (file:)", |c| {
+        cache_env::isolate(c);
+    }) {
+        return;
+    }
+    let tmp = tempfile::tempdir().unwrap();
+    let proj = tmp.path().join("proj");
+    let fork = proj.join("forks").join(DEP);
+    std::fs::create_dir_all(&fork).unwrap();
+    std::fs::write(
+        fork.join("package.json"),
+        format!(r#"{{"name":"{DEP}","version":"{DEP_VERSION}","main":"index.js"}}"#),
+    )
+    .unwrap();
+    let orig: &[u8] = b"module.exports = function leftPad(s) { return s; };\n";
+    std::fs::write(fork.join("index.js"), orig).unwrap();
+    std::fs::write(
+        proj.join("package.json"),
+        format!(
+            r#"{{"name":"file-classic","version":"0.0.0","private":true,"dependencies":{{"{DEP}":"file:./forks/{DEP}"}}}}"#
+        ),
+    )
+    .unwrap();
+    let cache = tmp.path().join("yarn-cache");
+    let install = corepack(
+        &proj,
+        &yarn_classic(),
+        &["install", "--no-progress"],
+        &[("YARN_CACHE_FOLDER", cache.to_str().unwrap())],
+    );
+    if !install.status.success() {
+        skip!(
+            "(file:): fixture `yarn install` of the file: directory failed:\n{}",
+            String::from_utf8_lossy(&install.stderr)
+        );
+        return;
+    }
+    let lock_pristine = std::fs::read_to_string(proj.join("yarn.lock")).unwrap();
+    assert!(
+        lock_pristine.contains(&format!("{DEP}@file:./forks/{DEP}"))
+            && !lock_pristine.contains("resolved"),
+        "fixture must lock a file: directory block:\n{lock_pristine}"
+    );
+
+    let installed_dir = proj.join("node_modules").join(DEP);
+    let patched: Vec<u8> = [MARKER.as_bytes(), orig].concat();
+    let tgz_path = tmp.path().join("patched.tgz");
+    build_patched_tgz(&installed_dir, &patched, &tgz_path);
+    let tgz = std::fs::read(&tgz_path).unwrap();
+    let server = mock_hosted_grant(&tgz, orig, &patched, "file: classic fixture").await;
+
+    let api_url = server.uri();
+    let (code, stdout, stderr) = run_socket(
+        &proj,
+        &[
+            "scan",
+            "--mode",
+            "hosted",
+            "--json",
+            "--yes",
+            "--cwd",
+            proj.to_str().unwrap(),
+            "--api-url",
+            &api_url,
+            "--org",
+            ORG,
+            "--api-token",
+            "fake",
+            "--vex",
+            "out.vex.json",
+            "--vex-product",
+            PRODUCT,
+        ],
+    );
+    println!("scan exit {code}\nstdout:\n{stdout}\nstderr:\n{stderr}");
+    let env: serde_json::Value = serde_json::from_str(&stdout)
+        .unwrap_or_else(|e| panic!("scan --json output is not JSON: {e}\n{stdout}\n{stderr}"));
+    assert_eq!(
+        std::fs::read_to_string(proj.join("yarn.lock")).unwrap(),
+        lock_pristine,
+        "the file: block must stay byte-identical: {env}"
+    );
+    assert!(
+        env.to_string()
+            .contains("redirect_yarn_classic_directory_skipped"),
+        "the skip must be named: {env}"
+    );
+    let vex = std::fs::read_to_string(proj.join("out.vex.json")).unwrap_or_default();
+    assert!(
+        !vex.contains("not_affected"),
+        "nothing may be attested for the file: copy:\n{vex}\n{env}"
+    );
+}
+
+/// A mock patch API granting one hosted patch of `DEP@DEP_VERSION` whose
+/// tarball is `tgz` (`index.js` from `orig` to `patched`).
+async fn mock_hosted_grant(tgz: &[u8], orig: &[u8], patched: &[u8], title: &str) -> MockServer {
+    let server = MockServer::start().await;
+    let hosted_url = format!(
+        "{}/patch/npm/{DEP}/{DEP_VERSION}/{TOKEN}/{UUID}/{DEP}-{DEP_VERSION}.tgz",
+        server.uri()
+    );
+    let summary = serde_json::json!({
+        "uuid": UUID, "purl": PURL, "tier": "free",
+        "cveIds": [], "ghsaIds": [], "severity": "high", "title": title
+    });
+    Mock::given(method("POST"))
+        .and(path(format!("/v0/orgs/{ORG}/patches/batch")))
+        .respond_with(ResponseTemplate::new(200).set_body_json(serde_json::json!({
+            "packages": [{ "purl": PURL, "patches": [summary] }],
+            "canAccessPaidPatches": false,
+        })))
+        .mount(&server)
+        .await;
+    Mock::given(method("GET"))
+        .and(path_regex(format!(
+            "^/v0/orgs/{ORG}/patches/by-package/.+$"
+        )))
+        .respond_with(ResponseTemplate::new(200).set_body_json(serde_json::json!({
+            "patches": [{
+                "uuid": UUID, "purl": PURL, "publishedAt": "2026-01-01T00:00:00Z",
+                "description": "x", "license": "MIT", "tier": "free", "vulnerabilities": {}
+            }],
+            "canAccessPaidPatches": false,
+        })))
+        .mount(&server)
+        .await;
+    Mock::given(method("POST"))
+        .and(path(format!("/v0/orgs/{ORG}/patches/package")))
+        .respond_with(ResponseTemplate::new(200).set_body_json(serde_json::json!({
+            "results": { UUID: {
+                "status": "granted", "url": hosted_url, "purl": PURL,
+                "artifacts": [{ "kind": "tarball", "url": hosted_url,
+                    "integrity": { "sha512": sha512_sri(tgz), "sha1": sha1_hex(tgz) } }],
+                "registryOverride": null
+            } }
+        })))
+        .mount(&server)
+        .await;
+    Mock::given(method("GET"))
+        .and(path(format!("/v0/orgs/{ORG}/patches/view/{UUID}")))
+        .respond_with(ResponseTemplate::new(200).set_body_json(serde_json::json!({
+            "uuid": UUID, "purl": PURL, "publishedAt": "2026-01-01T00:00:00Z",
+            "files": { "package/index.js": {
+                "beforeHash": compute_git_sha256_from_bytes(orig),
+                "afterHash": compute_git_sha256_from_bytes(patched),
+            } },
+            "vulnerabilities": { GHSA: {
+                "cves": [CVE], "summary": "s", "severity": "high", "description": "d"
+            } },
+            "description": "x", "license": "MIT", "tier": "free"
+        })))
+        .mount(&server)
+        .await;
+
+    server
 }

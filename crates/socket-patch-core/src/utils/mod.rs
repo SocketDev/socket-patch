@@ -14,6 +14,7 @@ pub mod notice;
 pub mod pdm_lock;
 pub(crate) mod pep440;
 pub mod pipenv;
+pub mod pnpm_workspace;
 pub mod poetry_lock;
 pub mod process;
 pub mod purl;

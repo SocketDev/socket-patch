@@ -91,25 +91,12 @@ pub async fn vendor_yarn_classic<'a>(
     }
 
     // ── 3. Find the rewritable blocks (pre-flight, BEFORE staging) ────────
-    let mut candidate_keys: Vec<String> = Vec::new();
     let blocks = scan_blocks_shared(&text);
-    for block in blocks.iter() {
-        match classify_classic_block(block, name, version) {
-            BlockClass::Candidate => candidate_keys.push(block.key.clone()),
-            BlockClass::LinkSkip(detail) => {
-                warnings.push(VendorWarning::new("vendor_link_entry_skipped", detail));
-            }
-            BlockClass::GitSkip(detail) => {
-                warnings.push(VendorWarning::new(
-                    "vendor_yarn_classic_git_entry_skipped",
-                    detail,
-                ));
-            }
-            BlockClass::NoMatch => {}
+    let candidate_keys = match rewritable_candidates(&blocks, name, version) {
+        Ok((keys, skipped)) => {
+            warnings.extend(skipped);
+            keys
         }
-    }
-    let candidate_keys = match rewritable_candidates(&blocks, candidate_keys, name, version) {
-        Ok(keys) => keys,
         Err(outcome) => return *outcome,
     };
     drop(blocks);
@@ -295,17 +282,56 @@ fn refuse_berry_lock(text: &str) -> Result<(), Box<VendorOutcome>> {
     Ok(())
 }
 
-/// [`vendor_yarn_classic`]'s step-3 gate over the candidate keys its block
-/// classification collected: at least one rewritable block, and no key on
-/// more than one block. Nothing here reads the package's source or asks
+/// [`vendor_yarn_classic`]'s step 3: classify every block of
+/// `name@version` and return the rewritable keys plus a named warning for
+/// each copy that can't be rewired (link, `file:` directory, git). Refused
+/// when nothing is rewritable — as `vendor_lock_entry_not_rewritable`,
+/// naming the skipped copies, when the package IS locked but only through
+/// such copies (#857: `yarn install` can't help there) — or when a key sits
+/// on more than one block. Nothing here reads the package's source or asks
 /// the service, so the vendor loop's download plan evaluates it ahead of
 /// the loop ([`preflight_packages`]).
 fn rewritable_candidates(
     blocks: &[LockBlock],
-    candidate_keys: Vec<String>,
     name: &str,
     version: &str,
-) -> Result<Vec<String>, Box<VendorOutcome>> {
+) -> Result<(Vec<String>, Vec<VendorWarning>), Box<VendorOutcome>> {
+    let mut candidate_keys: Vec<String> = Vec::new();
+    let mut skipped: Vec<VendorWarning> = Vec::new();
+    // The skipped blocks that are real installed copies no re-lock changes.
+    let mut unrewritable: Vec<String> = Vec::new();
+    for block in blocks {
+        match classify_classic_block(block, name, version) {
+            BlockClass::Candidate => candidate_keys.push(block.key.clone()),
+            BlockClass::LinkSkip(detail) => {
+                unrewritable.push(detail.clone());
+                skipped.push(VendorWarning::new("vendor_link_entry_skipped", detail));
+            }
+            BlockClass::GitSkip(detail) => {
+                unrewritable.push(detail.clone());
+                skipped.push(VendorWarning::new(
+                    "vendor_yarn_classic_git_entry_skipped",
+                    detail,
+                ));
+            }
+            BlockClass::UnresolvedSkip(detail) => {
+                skipped.push(VendorWarning::new("vendor_link_entry_skipped", detail));
+            }
+            BlockClass::NoMatch => {}
+        }
+    }
+    if candidate_keys.is_empty() && !unrewritable.is_empty() {
+        let details: Vec<&str> = unrewritable.iter().map(String::as_str).collect();
+        return Err(Box::new(refused(
+            "vendor_lock_entry_not_rewritable",
+            format!(
+                "every {YARN_LOCK} block for {name}@{version} installs from git, a link or a \
+                 file: directory, which vendoring can't rewire — those copies stay UNPATCHED \
+                 and `yarn install` will not help: {}",
+                details.join("; ")
+            ),
+        )));
+    }
     if candidate_keys.is_empty() {
         return Err(Box::new(refused(
             "vendor_lock_entry_not_found",
@@ -332,7 +358,7 @@ fn rewritable_candidates(
             )));
         }
     }
-    Ok(candidate_keys)
+    Ok((candidate_keys, skipped))
 }
 
 /// The lock as [`vendor_yarn_classic`]'s step 2 leaves it: read, re-sniffed
@@ -359,8 +385,8 @@ pub(super) async fn read_project(project_root: &Path) -> Result<ClassicProject, 
 /// Which of `packages` [`vendor_yarn_classic`] would refuse before its
 /// first service call, from one read of the lock; see
 /// [`super::npm_flavor::preflight_packages`]. The classification fold is
-/// the loop's step 3 over the same blocks; its link-skip advisories are
-/// the loop's to report and are dropped here.
+/// the loop's step 3 over the same blocks; its skip advisories are the
+/// loop's to report and are dropped here.
 pub(crate) async fn preflight_packages(
     project_root: &Path,
     packages: &[(&str, &PatchRecord)],
@@ -370,18 +396,7 @@ pub(crate) async fn preflight_packages(
         packages,
         |project, coords| {
             let (name, version) = (coords.name.as_str(), coords.version.as_str());
-            let candidate_keys: Vec<String> = project
-                .blocks
-                .iter()
-                .filter(|block| {
-                    matches!(
-                        classify_classic_block(block, name, version),
-                        BlockClass::Candidate
-                    )
-                })
-                .map(|block| block.key.clone())
-                .collect();
-            rewritable_candidates(&project.blocks, candidate_keys, name, version)
+            rewritable_candidates(&project.blocks, name, version)
                 .map(drop)
                 .map_err(|o| super::npm_common::refusal_code(&o))
         },
@@ -680,6 +695,9 @@ enum BlockClass {
     /// Matches the target but yarn fetches it with git (#363); carries the
     /// warning detail.
     GitSkip(String),
+    /// Matches the target but has no `resolved` (a stale lock `yarn install`
+    /// re-locks); carries the warning detail.
+    UnresolvedSkip(String),
     NoMatch,
 }
 
@@ -700,40 +718,31 @@ fn classify_classic_block(block: &LockBlock, name: &str, version: &str) -> Block
     }
     // link: and file:-DIRECTORY ranges resolve from the working tree, not a
     // tarball — rewriting their resolved would not change what installs.
-    for pattern in &patterns {
-        let range = split_pattern(pattern).map(|(_, r)| r).unwrap_or("");
-        if range.starts_with("link:") {
-            return BlockClass::LinkSkip(format!(
-                "lock block `{}` is a link: dependency; skipped",
-                block.key
-            ));
-        }
-        if let Some(path) = range.strip_prefix("file:") {
-            if !is_tarball_path(path) {
-                return BlockClass::LinkSkip(format!(
-                    "lock block `{}` is a file: directory dependency; skipped",
-                    block.key
-                ));
-            }
-        }
-    }
     let resolved = classic_field(&block.lines, "resolved");
-    // yarn fetches a git pattern with git, from `resolved` (#363): a vendored
-    // tarball there makes every install fail, and the copy is the git bytes.
-    if classic_block_is_git(&patterns, resolved) {
-        return BlockClass::GitSkip(format!(
+    match classic_block_source(&patterns, resolved) {
+        ClassicBlockSource::Tarball => BlockClass::Candidate,
+        ClassicBlockSource::Link => BlockClass::LinkSkip(format!(
+            "lock block `{}` is a link: dependency; skipped",
+            block.key
+        )),
+        ClassicBlockSource::Directory => BlockClass::LinkSkip(format!(
+            "lock block `{}` is a file: directory dependency; skipped, so that copy \
+             stays unpatched",
+            block.key
+        )),
+        ClassicBlockSource::Unresolved => BlockClass::UnresolvedSkip(format!(
+            "lock block `{}` has no resolved tarball; skipped",
+            block.key
+        )),
+        // yarn fetches a git pattern with git, from `resolved` (#363): a
+        // vendored tarball there makes every install fail, and the copy is
+        // the git bytes.
+        ClassicBlockSource::Git => BlockClass::GitSkip(format!(
             "lock block `{}` installs from git, which yarn fetches from the git \
              source rather than a tarball; skipped, so that copy stays unpatched",
             block.key
-        ));
+        )),
     }
-    if resolved.is_none() {
-        return BlockClass::LinkSkip(format!(
-            "lock block `{}` has no resolved tarball; skipped",
-            block.key
-        ));
-    }
-    BlockClass::Candidate
 }
 
 /// Rebuild a block's lines with the vendored `resolved`/`integrity` (adding
@@ -1071,6 +1080,51 @@ pub(crate) fn pattern_real_name(pattern: &str) -> Option<&str> {
         };
     }
     Some(name)
+}
+
+/// Where yarn 1 installs a lock block's copy from, as far as a lock
+/// rewrite is concerned. Hosted, vendored and `vex` all classify a block of
+/// the patched `name@version` through this one rule (#857, #921), so a copy
+/// one of them cannot rewire is never silently counted as wired by another.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub(crate) enum ClassicBlockSource {
+    /// A tarball `resolved` (registry, URL or `file:` tarball): rewritable.
+    Tarball,
+    /// A `link:` range: a symlink into the working tree.
+    Link,
+    /// A `file:` directory range: yarn COPIES the directory into
+    /// `node_modules`, so that copy keeps its own bytes.
+    Directory,
+    /// Fetched by yarn's git fetcher ([`classic_block_is_git`]).
+    Git,
+    /// Any other range with no `resolved`: not something yarn writes for a
+    /// locked package, so the lock is stale and `yarn install` re-locks it.
+    Unresolved,
+}
+
+/// [`ClassicBlockSource`] of a block from its key patterns and `resolved`.
+pub(crate) fn classic_block_source(
+    patterns: &[String],
+    resolved: Option<&str>,
+) -> ClassicBlockSource {
+    for pattern in patterns {
+        let range = split_pattern(pattern).map(|(_, r)| r).unwrap_or("");
+        if range.starts_with("link:") {
+            return ClassicBlockSource::Link;
+        }
+        if let Some(path) = range.strip_prefix("file:") {
+            if !is_tarball_path(path) {
+                return ClassicBlockSource::Directory;
+            }
+        }
+    }
+    if classic_block_is_git(patterns, resolved) {
+        return ClassicBlockSource::Git;
+    }
+    match resolved {
+        Some(_) => ClassicBlockSource::Tarball,
+        None => ClassicBlockSource::Unresolved,
+    }
 }
 
 /// Whether yarn 1 fetches a lock block with its GIT fetcher (#363): when any
@@ -3284,8 +3338,10 @@ left-pad@^1.3.0:
         );
     }
 
-    /// #363: a lock whose ONLY copy is git-sourced has nothing vendoring can
-    /// wire — refused before any write, the lock untouched.
+    /// #363, #857: a lock whose ONLY copy is git-sourced has nothing
+    /// vendoring can wire — refused before any write, the lock untouched,
+    /// with the real reason (the git block, named) rather than the generic
+    /// "run `yarn install`" advice, which can't help.
     #[tokio::test]
     async fn git_only_lock_is_refused_untouched() {
         let lock = r#"# yarn lockfile v1
@@ -3296,8 +3352,55 @@ left-pad@^1.3.0:
   resolved "git+file:///tmp/lpgit#a380ff32159b9beb078ec6ce294cf6fbdad19c55"
 "#;
         let fx = fixture_with_lock(lock).await;
-        expect_refused(fx.vendor(false).await, "vendor_lock_entry_not_found");
+        let detail = expect_refused(fx.vendor(false).await, "vendor_lock_entry_not_rewritable");
+        assert!(
+            detail.contains("left-pad@git+file:///tmp/lpgit#v1.3.0") && detail.contains("git"),
+            "{detail}"
+        );
+        assert!(!detail.contains("yarn install`)"), "{detail}");
         assert_eq!(fx.lock_text().await, lock);
+        let pre = preflight_packages(fx.root(), &[("pkg:npm/left-pad@1.3.0", &fx.record)]).await;
+        assert_eq!(pre, vec![Err("vendor_lock_entry_not_rewritable")]);
+    }
+
+    /// #921: a `file:` directory copy (no `resolved`) that is the only copy
+    /// of the package, alone or merged into one key with a registry range,
+    /// is refused as not rewritable, naming the block, the lock untouched.
+    #[tokio::test]
+    async fn file_directory_only_lock_is_refused_untouched() {
+        for block in [
+            "\"left-pad@file:forks/left-pad\":\n  version \"1.3.0\"\n",
+            "left-pad@^1.3.0, \"left-pad@file:forks/left-pad\":\n  version \"1.3.0\"\n",
+        ] {
+            let lock = format!("# yarn lockfile v1\n\n\n{block}");
+            let fx = fixture_with_lock(&lock).await;
+            let detail = expect_refused(fx.vendor(false).await, "vendor_lock_entry_not_rewritable");
+            assert!(detail.contains("left-pad@file:forks/left-pad"), "{detail}");
+            assert_eq!(fx.lock_text().await, lock);
+        }
+    }
+
+    /// #921: a `file:` directory copy beside the registry block: the
+    /// registry block is wired and the copy is named as staying unpatched.
+    #[tokio::test]
+    async fn file_directory_copy_beside_registry_is_skipped_with_warning() {
+        let extra = "\n\"left-pad@file:forks/left-pad\":\n  version \"1.3.0\"\n";
+        let lock = format!("{Y2_BEFORE}{extra}");
+        let fx = fixture_with_lock(&lock).await;
+        let (result, entry, warnings) = expect_done(fx.vendor(false).await);
+        assert!(result.success, "{:?}", result.error);
+        assert_eq!(entry.unwrap().wiring.len(), 1, "only the registry block");
+        let skip: Vec<&VendorWarning> = warnings
+            .iter()
+            .filter(|w| w.code == "vendor_link_entry_skipped")
+            .collect();
+        assert_eq!(skip.len(), 1, "{warnings:?}");
+        assert!(
+            skip[0].detail.contains("left-pad@file:forks/left-pad")
+                && skip[0].detail.contains("unpatched"),
+            "{skip:?}"
+        );
+        assert!(fx.lock_text().await.contains(extra.trim_start()));
     }
 
     /// #363 scope note: the hosted-git SHORTHAND locks to a codeload tarball
