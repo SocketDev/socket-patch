@@ -99,16 +99,6 @@ impl NpmLockRefs {
     }
 }
 
-/// Record a contested npm ref as withheld wiring ([`Discovery::withheld`]):
-/// the lock still resolves through the patch, it is just not attested.
-fn withhold(r: &PatchedRef, file: &str, out: &mut Discovery) {
-    out.withheld.push(super::Recognized {
-        uuid: r.uuid.clone(),
-        mode: r.mode,
-        file: std::path::PathBuf::from(file),
-    });
-}
-
 /// Push every ref no OTHER npm lock contests. npm <= 11 installs from
 /// npm-shrinkwrap.json when both exist; npm 12 auto-creates a
 /// package-lock.json beside it and installs from THAT (verified against real
@@ -161,7 +151,6 @@ fn push_uncontested(locks: Vec<NpmLockRefs>, out: &mut Discovery) {
                         lock.file, r.purl, r.uuid,
                     ),
                 );
-                withhold(r, lock.file, out);
                 continue;
             }
             if let Some(location) = lock.unwired.get(&r.purl) {
@@ -177,7 +166,6 @@ fn push_uncontested(locks: Vec<NpmLockRefs>, out: &mut Discovery) {
                         lock.file, r.purl, r.uuid,
                     ),
                 );
-                withhold(r, lock.file, out);
                 continue;
             }
             let contested_by = locks.iter().enumerate().find(|(j, other)| {
@@ -196,7 +184,6 @@ fn push_uncontested(locks: Vec<NpmLockRefs>, out: &mut Discovery) {
                         lock.file, r.purl, r.uuid, other.file, NPM_LOCKS[0], NPM_LOCKS[1],
                     ),
                 );
-                withhold(r, lock.file, out);
             } else if let Some(other) = locks
                 .iter()
                 .enumerate()
@@ -216,7 +203,6 @@ fn push_uncontested(locks: Vec<NpmLockRefs>, out: &mut Discovery) {
                         lock.file, r.purl, r.uuid, other.file, NPM_LOCKS[0], NPM_LOCKS[1],
                     ),
                 );
-                withhold(r, lock.file, out);
             } else {
                 out.push(r.clone());
             }

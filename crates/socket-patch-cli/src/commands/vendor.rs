@@ -1231,8 +1231,7 @@ async fn run_check(args: &VendorArgs) -> i32 {
     // know (the ledger was ignored or dropped from the commit along with the
     // manifest) leaves every fresh install failing; the manifest keys above
     // cannot see it, so the references are read from the wiring itself.
-    let references =
-        crate::commands::vendored_backend::repair::scan_vendor_references(root).await;
+    let references = crate::commands::vendored_backend::repair::scan_vendor_references(root).await;
     for (eco, uuid, rel) in references {
         let ledgered = state
             .entries
@@ -5241,8 +5240,53 @@ mod gc_tests {
         let out = run_vendor_gc(&common, &manifest_path, false).await;
         assert!(out.dropped_reverted.is_empty(), "{out:?}");
         assert!(out.unused_reverted.is_empty(), "{out:?}");
-        assert!(out.failed.is_empty(), "an in-use entry is never reverted: {out:?}");
+        assert!(
+            out.failed.is_empty(),
+            "an in-use entry is never reverted: {out:?}"
+        );
         assert_eq!(out.orphan_dirs, 0);
+        assert!(load_state(tmp.path())
+            .await
+            .unwrap()
+            .entries
+            .contains_key(PURL));
+    }
+
+    /// An attestation drop is not a liveness verdict: a lockfileVersion 2
+    /// lock still installs `node_modules/left-pad` from the vendored tarball
+    /// (npm 7+) while its legacy `dependencies` mirror (npm <= 6) resolves
+    /// the registry. Discovery refuses to attest that wiring, but the GC
+    /// must not unwire a patch npm 7+ still installs.
+    #[tokio::test]
+    async fn vendor_gc_keeps_an_entry_whose_wiring_is_only_unattributable() {
+        let (tmp, common, manifest_path) = gc_fixture(false).await;
+        tokio::fs::write(
+            tmp.path().join("package-lock.json"),
+            serde_json::json!({
+                "lockfileVersion": 2,
+                "packages": {
+                    "": {"dependencies": {"left-pad": "1.3.0"}},
+                    "node_modules/left-pad": {
+                        "version": "1.3.0",
+                        "resolved": format!("file:.socket/vendor/npm/{UUID}/left-pad-1.3.0.tgz"),
+                    },
+                },
+                "dependencies": {
+                    "left-pad": {
+                        "version": "1.3.0",
+                        "resolved": "https://registry.npmjs.org/left-pad/-/left-pad-1.3.0.tgz",
+                    },
+                },
+            })
+            .to_string(),
+        )
+        .await
+        .unwrap();
+        for dry_run in [true, false] {
+            let out = run_vendor_gc(&common, &manifest_path, dry_run).await;
+            assert!(out.unused_reverted.is_empty(), "dry_run={dry_run}: {out:?}");
+            assert!(out.failed.is_empty(), "dry_run={dry_run}: {out:?}");
+        }
         assert!(load_state(tmp.path())
             .await
             .unwrap()

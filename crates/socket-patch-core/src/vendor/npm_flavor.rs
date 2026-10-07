@@ -1750,6 +1750,90 @@ mod tests {
         assert_eq!(in_use(&entry, tmp.path()).await, None);
     }
 
+    /// Attestation drops a vendored ref it cannot attribute to the one copy
+    /// the install uses (`DIAG_REF_UNATTRIBUTABLE`), but the package manager
+    /// may still install the artifact: the GC verdict must keep the entry.
+    /// Each lock here still routes `node_modules/left-pad` through the
+    /// vendored tarball while another entry of the SAME lock installs an
+    /// unpatched copy.
+    #[tokio::test]
+    async fn unattributable_wiring_stays_in_use() {
+        let vendored = format!("file:.socket/vendor/npm/{UUID}/left-pad-1.3.0.tgz");
+        let registry = "https://registry.npmjs.org/left-pad/-/left-pad-1.3.0.tgz";
+        let cases = [
+            (
+                "lockfileVersion 2 whose legacy `dependencies` mirror resolves to the registry",
+                serde_json::json!({
+                    "lockfileVersion": 2,
+                    "packages": {
+                        "": {"dependencies": {"left-pad": "1.3.0"}},
+                        "node_modules/left-pad": {"version": "1.3.0", "resolved": vendored},
+                    },
+                    "dependencies": {
+                        "left-pad": {"version": "1.3.0", "resolved": registry},
+                    },
+                }),
+            ),
+            (
+                "lockfileVersion 3 with a nested git copy of the same version",
+                serde_json::json!({
+                    "lockfileVersion": 3,
+                    "packages": {
+                        "": {"dependencies": {"left-pad": "1.3.0", "foo": "1.0.0"}},
+                        "node_modules/left-pad": {"version": "1.3.0", "resolved": vendored},
+                        "node_modules/foo": {
+                            "version": "1.0.0",
+                            "resolved": "https://registry.npmjs.org/foo/-/foo-1.0.0.tgz",
+                            "dependencies": {"left-pad": "github:x/left-pad#abc"},
+                        },
+                        "node_modules/foo/node_modules/left-pad": {
+                            "version": "1.3.0",
+                            "resolved": "git+ssh://git@github.com/x/left-pad.git#abc",
+                        },
+                    },
+                }),
+            ),
+        ];
+        let entry = probe_entry(Some("package-lock"));
+        for (label, lock) in cases {
+            let tmp = tempfile::tempdir().unwrap();
+            touch(tmp.path(), "package-lock.json", &lock.to_string()).await;
+            let discovery = crate::vex::discover::discover_patched_refs(tmp.path()).await;
+            assert!(
+                discovery.refs.is_empty()
+                    && discovery
+                        .diagnostics
+                        .iter()
+                        .any(|d| d.code == crate::vex::discover::DIAG_REF_UNATTRIBUTABLE),
+                "{label}: the wiring must be dropped as unattributable: {:?}",
+                discovery.diagnostics
+            );
+            assert_eq!(in_use(&entry, tmp.path()).await, Some(true), "{label}");
+        }
+
+        // vlt: the vendored node beside another registry instance of the
+        // same version.
+        let mut entry = probe_entry(Some("vlt"));
+        let rel = format!(".socket/vendor/npm/{UUID}/left-pad-1.3.0/node_modules/left-pad");
+        entry.artifact.path = rel.clone();
+        let file_id =
+            format!("file~.socket+vendor+npm+{UUID}+left-pad-1.3.0+node__modules+left-pad");
+        let tmp = tempfile::tempdir().unwrap();
+        touch(
+            tmp.path(),
+            "vlt-lock.json",
+            &format!(
+                "{{\n  \"lockfileVersion\": 1,\n  \"nodes\": {{\n    \"{file_id}\": [0,\"left-pad\",null,\"{rel}\"],\n    \"~npm~left-pad@1.3.0\": [0,\"left-pad\",\"sha512-UPSTREAM==\",null]\n  }},\n  \"edges\": {{}}\n}}\n"
+            ),
+        )
+        .await;
+        assert_eq!(
+            in_use(&entry, tmp.path()).await,
+            Some(true),
+            "vlt other instance"
+        );
+    }
+
     #[tokio::test]
     async fn binary_bun_in_use_ignores_old_pool_strings_and_obeys_text_precedence() {
         let tmp = tempfile::tempdir().unwrap();

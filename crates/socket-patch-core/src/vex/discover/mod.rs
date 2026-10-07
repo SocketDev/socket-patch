@@ -487,14 +487,13 @@ pub struct Discovery {
     /// this vendored entry" means "unused" only once discovery has read
     /// that ecosystem's files ([`Discovery::vendor_entry_in_use`]).
     pub read: Vec<ReadFile>,
-    /// Wiring a file still routes through a Socket patch that an extractor
-    /// WITHHOLDS as a ref because the build may not consume it: a ref another
-    /// entry or npm lock contests (npm's in-pair contest, a bundled copy),
-    /// or cargo vendored wiring whose lock builds another generation's copy
-    /// (a `[patch]` at this copy, the lock tagged for another uuid or
-    /// untagged — the next relock consumes it). Not attested, but still
-    /// wiring: the prune GC must keep such an entry
-    /// ([`Discovery::vendor_entry_in_use`]). Sorted, deduped.
+    /// Vendored wiring an extractor rejects as [`DIAG_REF_INVALID`] although
+    /// the next relock consumes it: cargo's `[patch]` at this copy while
+    /// `Cargo.lock` builds another generation's copy (tagged for another
+    /// uuid, or untagged). Not attested, but still wiring: the prune GC must
+    /// keep such an entry ([`Discovery::vendor_entry_in_use`]). Wiring
+    /// dropped as [`DIAG_REF_UNATTRIBUTABLE`] needs no record here: the GC
+    /// keeps it through the diagnostic itself. Sorted, deduped.
     pub withheld: Vec<Recognized>,
 }
 
@@ -1804,7 +1803,8 @@ impl Discovery {
     ///   lock contests that wiring ([`Discovery::vendored_contest`]: still
     ///   wired; `vendor --check` names both locks, reverting would not
     ///   settle which one installs), or an extractor withheld its wiring
-    ///   ([`Discovery::withheld`]). A JVM entry: its tree is still
+    ///   ([`Discovery::withheld`]), or a file mentioning it had wiring
+    ///   dropped as unattributable (`unattributable_mention`). A JVM entry: its tree is still
     ///   referenced ([`crate::vendor::jvm::apply::entry_references`], which
     ///   also answers `true` when a file cannot be read);
     /// * `Some(false)` — discovery read a lockfile of this ecosystem
@@ -1830,6 +1830,7 @@ impl Discovery {
             .withheld
             .iter()
             .any(|r| r.uuid == entry.uuid && r.mode == WiringMode::Vendored)
+            || self.unattributable_mention(&entry.uuid)
         {
             return Some(true);
         }
@@ -1848,6 +1849,30 @@ impl Discovery {
             read_lock |= decides_install(read.ecosystem, &read.file);
         }
         read_lock.then_some(false)
+    }
+
+    /// Whether a file that mentions vendored patch `uuid` also carries a
+    /// [`DIAG_REF_UNATTRIBUTABLE`] diagnostic: an extractor (or the
+    /// orchestrator's contests) dropped wiring there because it cannot tell
+    /// which copy installs — an unpatched copy in the same lock, npm's
+    /// shrinkwrap/package-lock pair or legacy `dependencies` mirror, a
+    /// non-registry nested copy, vlt's other instances, a bundled copy, a
+    /// yarn git block, a version-less Go replace, another lock. Dropping
+    /// fails attestation closed, but it is no proof the install stopped
+    /// using the artifact, so the prune GC must keep the entry
+    /// ([`Discovery::vendor_entry_in_use`]). A mention rejected as
+    /// [`DIAG_REF_INVALID`] (a shape the package manager never installs
+    /// from) is not covered: that one is dead. File-grained on purpose: an
+    /// unattributable drop of another package in the same file errs toward
+    /// keeping.
+    fn unattributable_mention(&self, uuid: &str) -> bool {
+        self.recognized_files(uuid, WiringMode::Vendored)
+            .into_iter()
+            .any(|file| {
+                self.diagnostics
+                    .iter()
+                    .any(|d| d.code == DIAG_REF_UNATTRIBUTABLE && d.file == file)
+            })
     }
 
     /// Liveness of a REDIRECT-ledger record (`purl` resolves from patch
@@ -2586,6 +2611,37 @@ pub(crate) mod testing {
 mod tests {
     use super::testing::*;
     use super::*;
+
+    /// A pyproject-only pypi project (hatch, or any flavor before its first
+    /// lock) has no install-deciding file: `pyproject.toml` / `hatch.toml`
+    /// are manifests, so even a pyproject that no longer names the vendored
+    /// wheel cannot prove the entry unused, and the prune GC keeps it.
+    #[tokio::test]
+    async fn lockless_pyproject_entries_stay_undecidable() {
+        let tmp = tempfile::tempdir().unwrap();
+        let root = tmp.path();
+        let entry: VendorEntry = serde_json::from_value(serde_json::json!({
+            "ecosystem": "pypi",
+            "basePurl": "pkg:pypi/six@1.16.0",
+            "uuid": UUID_A,
+            "artifact": {
+                "path": format!(".socket/vendor/pypi/{UUID_A}/six-1.16.0-py2.py3-none-any.whl"),
+                "sha256": "",
+            },
+            "wiring": [],
+            "flavor": "hatch",
+        }))
+        .unwrap();
+        for file in ["pyproject.toml", "hatch.toml"] {
+            std::fs::write(
+                root.join(file),
+                "[project]\nname = \"app\"\nversion = \"0.1.0\"\ndependencies = []\n",
+            )
+            .unwrap();
+        }
+        let discovery = discover_patched_refs(root).await;
+        assert_eq!(discovery.vendor_entry_in_use(root, &entry).await, None);
+    }
 
     #[test]
     fn vendor_ref_strips_lock_suffixes_and_requires_a_root_anchor() {
