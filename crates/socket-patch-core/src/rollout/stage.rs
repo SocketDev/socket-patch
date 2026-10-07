@@ -101,9 +101,9 @@ pub struct Row {
 #[derive(Debug, Default)]
 pub struct RecordedIndex {
     exact: HashMap<String, Vec<String>>,
-    /// Discovery's folded base purl plus the raw qualifier suffix.
-    qualified: HashMap<String, Vec<String>>,
-    by_base: HashMap<String, Vec<String>>,
+    /// [`PurlKey::qualified`]: one release variant in any spelling.
+    qualified: HashMap<PurlKey, Vec<String>>,
+    by_base: HashMap<PurlKey, Vec<String>>,
 }
 
 /// The recorded view one project root classifies against: the merged
@@ -111,13 +111,6 @@ pub struct RecordedIndex {
 pub struct RecordedState<'a> {
     pub manifest: Option<&'a PatchManifest>,
     pub index: RecordedIndex,
-}
-
-/// `purl`'s folded base plus its qualifiers: equal for two spellings of the
-/// same qualified purl (percent-encoding, case where it does not matter).
-pub fn qualified_key(purl: &str) -> String {
-    let suffix = purl.find(['?', '#']).map_or("", |i| &purl[i..]);
-    format!("{}{suffix}", PurlKey::new(purl).into_string())
 }
 
 impl RecordedIndex {
@@ -135,12 +128,12 @@ impl RecordedIndex {
                 .push(uuid.to_string());
             index
                 .qualified
-                .entry(qualified_key(key))
+                .entry(PurlKey::qualified(key))
                 .or_default()
                 .push(uuid.to_string());
             index
                 .by_base
-                .entry(PurlKey::new(key).into_string())
+                .entry(PurlKey::new(key))
                 .or_default()
                 .push(uuid.to_string());
         }
@@ -161,14 +154,14 @@ impl RecordedIndex {
     pub fn uuids(&self, purl: &str) -> &[String] {
         self.exact
             .get(purl)
-            .or_else(|| self.qualified.get(&qualified_key(purl)))
-            .or_else(|| self.by_base.get(&PurlKey::new(purl).into_string()))
+            .or_else(|| self.qualified.get(&PurlKey::qualified(purl)))
+            .or_else(|| self.by_base.get(&PurlKey::new(purl)))
             .map_or(&[], Vec::as_slice)
     }
 
     /// Whether any patch is recorded for `purl`'s base purl.
     pub fn records_package(&self, purl: &str) -> bool {
-        self.by_base.contains_key(&PurlKey::new(purl).into_string())
+        self.by_base.contains_key(&PurlKey::new(purl))
     }
 }
 

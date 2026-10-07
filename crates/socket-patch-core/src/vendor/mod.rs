@@ -139,7 +139,6 @@ use std::path::Path;
 use crate::manifest::schema::PatchRecord;
 use crate::patch::apply::{is_safe_relative_subpath, normalize_file_path, ApplyResult};
 use crate::utils::fs::read_regular_to_string_sync;
-use crate::utils::purl::strip_purl_qualifiers;
 
 /// A non-fatal advisory surfaced as a warning event (`code` is a stable
 /// reason tag from the CLI contract; `detail` is human text).
@@ -382,9 +381,10 @@ pub async fn harvest_artifact_blobs_from(
             continue;
         }
         let Some(entry) = entries.get(purl).or_else(|| {
+            let key = crate::utils::purl_key::PurlKey::new(purl);
             entries
                 .values()
-                .find(|e| e.base_purl == strip_purl_qualifiers(purl))
+                .find(|e| crate::utils::purl_key::PurlKey::new(&e.base_purl) == key)
         }) else {
             continue;
         };

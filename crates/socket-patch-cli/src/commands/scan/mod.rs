@@ -20,8 +20,8 @@ use socket_patch_core::telemetry::{
     spawn_patch_scan_failed, spawn_patch_scanned, PendingTelemetry,
 };
 use socket_patch_core::utils::concurrent::{api_concurrency_for, ordered_concurrent};
-use socket_patch_core::utils::purl::{canonical_purl, normalize_purl, strip_purl_qualifiers};
-use socket_patch_core::utils::purl_key::PurlKey;
+use socket_patch_core::utils::purl::{canonical_purl, normalize_purl};
+use socket_patch_core::utils::purl_key::{canonical_base_purl, PurlKey};
 use socket_patch_core::vendor::{purl_keys_cover, VendorState};
 use socket_patch_core::vex::discover::{LedgerLiveness, WiringMode};
 use std::collections::{HashMap, HashSet};
@@ -1153,7 +1153,10 @@ pub(super) const GRADLE_USER_HOME_DIFFERS: &str = "gradle_user_home_differs";
 struct GradleScan {
     /// `(code, detail)` run-level warnings.
     notes: Vec<(String, String)>,
-    /// Base purls (normalized) of the packages crawled from a Gradle cache.
+    /// Base purls ([`canonical_base_purl`]) of the packages crawled from a
+    /// Gradle cache. Maven coordinates are case-sensitive, so the canonical
+    /// spelling is already the identity; these stay strings because the
+    /// lock-file GAVs they are checked against are built as strings.
     gradle_purls: HashSet<String>,
     /// Base purls the build's lock files name; `None` when they were not
     /// read (no Gradle build at the cwd, or no Gradle-cached package to
@@ -1203,7 +1206,7 @@ async fn gradle_scan(
         gradle_purls: crawled
             .iter()
             .filter(|p| gradle_cache::is_gradle_version_dir(&p.path))
-            .map(|p| normalize_purl(strip_purl_qualifiers(&p.purl)).into_owned())
+            .map(|p| canonical_base_purl(&p.purl))
             .collect(),
         ..GradleScan::default()
     };
@@ -1219,7 +1222,7 @@ async fn gradle_scan(
             m.patches
                 .keys()
                 .filter(|k| k.starts_with("pkg:maven/"))
-                .map(|k| normalize_purl(strip_purl_qualifiers(k)).into_owned())
+                .map(|k| canonical_base_purl(k))
                 .collect()
         })
         .unwrap_or_default();
@@ -2393,7 +2396,7 @@ async fn run_scan(
                 // name them (additive; an annotation, never a filter).
                 if let Some(base) = pkg["purl"]
                     .as_str()
-                    .map(|p| normalize_purl(strip_purl_qualifiers(p)).into_owned())
+                    .map(canonical_base_purl)
                     .filter(|base| gradle.gradle_purls.contains(base))
                 {
                     if let Some(locked) = &gradle.locked {

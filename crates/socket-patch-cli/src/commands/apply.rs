@@ -248,10 +248,11 @@ async fn mismatch_blob_gaps(
         };
         let variant_eco = Ecosystem::from_purl(purl).is_some_and(|e| e.supports_release_variants());
         let stripped = strip_purl_qualifiers(purl);
+        let identity = PurlKey::new(purl);
         let records: Vec<(&String, &PatchRecord)> = manifest
             .patches
             .iter()
-            .filter(|(key, _)| *key == purl || strip_purl_qualifiers(key) == stripped)
+            .filter(|(key, _)| *key == purl || PurlKey::new(key) == identity)
             .collect();
         if purl_keys_cover(vendored_purls, purl)
             || records

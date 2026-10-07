@@ -14,11 +14,9 @@ use socket_patch_core::patch::rollback::{
     VerifyRollbackResult, VerifyRollbackStatus,
 };
 use socket_patch_core::telemetry::{track_patch_rollback_failed, track_patch_rolled_back};
-use socket_patch_core::utils::composer_version::composer_purls_equivalent;
 use socket_patch_core::utils::purl::{patch_matches, strip_purl_qualifiers};
 use socket_patch_core::utils::purl_key::PurlKey;
 use socket_patch_core::vendor::{purl_keys_cover, RevertOpts, VendorState};
-use socket_patch_core::vex::discover::canonical_base_purl;
 use std::collections::{HashMap, HashSet};
 use std::path::{Path, PathBuf};
 use std::time::Duration;
@@ -2815,10 +2813,10 @@ pub(crate) fn superseded_by_hosted(
         .patches
         .iter()
         .filter_map(|(purl, record)| {
-            let pkg = canonical_base_purl(purl);
+            let pkg = PurlKey::new(purl);
             let same: Vec<&HostedPin> = pins
                 .iter()
-                .filter(|pin| pin.purl == pkg || composer_purls_equivalent(&pin.purl, &pkg))
+                .filter(|pin| PurlKey::new(&pin.purl) == pkg)
                 .collect();
             if same.iter().any(|pin| pin.uuid == record.uuid) {
                 return None;

@@ -3450,3 +3450,25 @@ async fn requirements_index_option_in_an_include_spans_the_tree() {
         LockIntegrity::Sha256AnyOf(vec![sha.clone()])
     );
 }
+
+#[tokio::test]
+async fn lookup_matches_by_purl_identity() {
+    let entry = |ecosystem: &'static str, name: &str, version: &str| LockfileEntry {
+        ecosystem,
+        source_kind: SourceKind::Unspecified,
+        name: name.into(),
+        version: version.into(),
+        purl: format!("pkg:{ecosystem}/{name}@{version}"),
+        resolved: None,
+        integrity: LockIntegrity::None,
+    };
+    let entries = vec![
+        entry("composer", "psr/log", "3.0.2"),
+        entry("pypi", "typing-extensions", "4.12.2"),
+    ];
+    // The API pads composer releases and may spell a PyPI name either way.
+    assert!(lookup(&entries, "pkg:composer/psr/log@3.0.2.0").is_some());
+    assert!(lookup(&entries, "pkg:composer/Psr/Log@v3.0.2").is_some());
+    assert!(lookup(&entries, "pkg:composer/psr/log@3.0.3").is_none());
+    assert!(lookup(&entries, "pkg:pypi/typing_extensions@4.12.2").is_some());
+}
