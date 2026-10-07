@@ -388,7 +388,7 @@ pub(crate) async fn detect_npm_lock_flavor_in(
                     .map(str::to_string)
             })
     };
-    if let Some(marker) = crate::crawlers::pkg_managers::live_pnp_marker_with(linker, &exists) {
+    if let Some(marker) = crate::crawlers::pkg_managers::live_pnp_marker_with(linker, exists) {
         return Err((
             "vendor_yarn_berry_unsupported",
             format!(
