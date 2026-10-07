@@ -11,7 +11,12 @@ vendored (`vendor` wires the root
 linkers are covered end to end; Plug'n'Play keeps packages inside
 `.yarn/cache` zips, so `vendor` refuses it (`vendor_yarn_berry_unsupported`)
 and so does `apply` (`yarn_pnp_unsupported`), while standalone `vex` still
-attests a hosted lock's `checksum:` pin.
+attests a hosted lock's `checksum:` pin. Plug'n'Play is decided by the
+configured linker (`YARN_NODE_LINKER`, else the nearest `.yarnrc.yml` that
+sets `nodeLinker`; unset means berry's default, `pnp`), not by whether a
+`.pnp.*` loader happens to exist: `vendor` refuses a lock-only PnP checkout up
+front, and a stale `.pnp.js` left by a Yarn 2 migration to `node-modules` or
+`pnpm` is ignored.
 
 ## Hosted pin shape and registry credentials
 
