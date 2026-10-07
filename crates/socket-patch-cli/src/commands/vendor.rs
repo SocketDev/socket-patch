@@ -494,10 +494,7 @@ async fn unwired_check_failure(
 /// entry (fail-safe): ecosystems other than npm, cargo and pypi (whose
 /// probe covers the requirements flavor only) have no in-use probe yet,
 /// and a missing/unreadable lockfile proves nothing.
-pub(crate) async fn dispatch_in_use_one(
-    entry: &VendorEntry,
-    project_root: &Path,
-) -> Option<bool> {
+pub(crate) async fn dispatch_in_use_one(entry: &VendorEntry, project_root: &Path) -> Option<bool> {
     match entry.ecosystem.as_str() {
         "npm" => vendor::npm_flavor::vendored_entry_in_use(entry, project_root).await,
         // Cargo probes the lock entry's shape: detached + `[patch]` pointing
@@ -1289,8 +1286,7 @@ async fn run_check(args: &VendorArgs) -> i32 {
     // know (the ledger was ignored or dropped from the commit along with the
     // manifest) leaves every fresh install failing; the manifest keys above
     // cannot see it, so the references are read from the wiring itself.
-    let references =
-        crate::commands::vendored_backend::repair::scan_vendor_references(root).await;
+    let references = crate::commands::vendored_backend::repair::scan_vendor_references(root).await;
     for (eco, uuid, rel) in references {
         let ledgered = state
             .entries
@@ -2770,8 +2766,9 @@ pub(crate) async fn vendor_records_reusing(
     let mut status = StatusLine::stderr(common.json, common.silent);
     let total = all_packages.len();
     // The vendored artifact dirs before this run wrote any: a commit the
-    // symlink check refuses removes the ones the loop added, so the refusal
-    // leaves no orphan artifact behind (#898). A dir the pre-run ledger
+    // symlink check refuses (or that fails with nothing written) removes
+    // the ones the loop added, so it leaves no orphan artifact behind
+    // (#898). A dir the pre-run ledger
     // already names (an artifact redownloaded in place) is kept: it needs
     // no commit to be referenced.
     let vendor_dirs_before = (!common.dry_run).then(|| VendorDirsBefore {
@@ -3544,11 +3541,30 @@ pub(crate) async fn vendor_records_reusing(
                          this project finishes it"
                     )
                 } else {
-                    format!(
+                    // Nothing was committed: like the symlink refusal
+                    // (#898), the artifacts the loop downloaded are removed
+                    // and its packages are reported failed, not applied.
+                    let mut detail = format!(
                         "could not commit the vendored lockfile, manifest and ledger edits: \
                          {e}; the project's lockfiles and .socket/vendor/state.json are \
                          unchanged"
-                    )
+                    );
+                    let leftovers =
+                        remove_new_vendor_dirs(common, vendor_dirs_before.as_ref()).await;
+                    if !leftovers.is_empty() {
+                        detail = format!(
+                            "{detail} (except the downloaded artifacts that could not be \
+                             removed: {}; `socket-patch vendor --revert` removes them)",
+                            leftovers.join("; ")
+                        );
+                    }
+                    env.retract_applied(
+                        events_start,
+                        PatchAction::Failed,
+                        "vendor_commit_failed",
+                        &detail,
+                    );
+                    detail
                 };
                 if !common.json {
                     eprintln!("Error: {detail}");
