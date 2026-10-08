@@ -1034,12 +1034,17 @@ fn pnpm_include_tarball(
     if let Some(on) = pnpm_lock_tarball_evidence(text, registry, is_hosted) {
         return PnpmIncludeTarball { on, guess: None };
     }
-    let from_workspace =
-        || workspace.and_then(|text| yaml_top_level_value(text, "lockfileIncludeTarballUrl"));
+    // js-yaml reads `True` / `TRUE` as true too; `.npmrc` (ini + nopt)
+    // only a lowercase `true`.
+    let from_workspace = || {
+        workspace
+            .and_then(|text| yaml_top_level_value(text, "lockfileIncludeTarballUrl"))
+            .map(|value| value.trim().eq_ignore_ascii_case("true"))
+    };
     let from_npmrc = || {
         npmrc
             .and_then(|text| npmrc_top_level_value(text, "lockfile-include-tarball-url"))
-            .map(|value| value.trim().to_string())
+            .map(|value| value.trim() == "true")
     };
     let value = match major {
         Some(major) if major <= 9 => from_npmrc(),
@@ -1048,8 +1053,8 @@ fn pnpm_include_tarball(
         // Tier 3: pnpm 10's reading, flagged when another major differs.
         None => {
             let guess = PnpmTarballGuess {
-                workspace: from_workspace().map(|value| value == "true"),
-                npmrc: from_npmrc().map(|value| value == "true"),
+                workspace: from_workspace(),
+                npmrc: from_npmrc(),
             };
             let on = guess.on();
             let differs = guess.pnpm9() != on || guess.pnpm11() != on;
@@ -1060,7 +1065,7 @@ fn pnpm_include_tarball(
         }
     };
     PnpmIncludeTarball {
-        on: value.is_some_and(|value| value == "true"),
+        on: value.unwrap_or(false),
         guess: None,
     }
 }
@@ -1889,6 +1894,12 @@ mod tests {
         // Unknown major: pnpm 10's reading.
         assert!(include(&text, Some(WS_ON), None, None));
         assert!(include(&text, None, Some(RC_ON), None));
+        // js-yaml reads `True` / `TRUE` as true in the workspace file.
+        for on in ["True", "TRUE", "'true'"] {
+            let ws = format!("lockfileIncludeTarballUrl: {on}\n");
+            assert!(include(&text, Some(&ws), None, Some(11)), "{on}");
+            assert!(include(&text, Some(&ws), None, None), "{on}");
+        }
         // Only pnpm <= 8 writes a pre-9 lock or a shrinkwrap.yaml.
         let v6 = text.replace("'9.0'", "'6.0'");
         assert!(!include(&v6, Some(WS_ON), None, None));
