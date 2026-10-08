@@ -1014,6 +1014,9 @@ fn every_hosted_pin_spelling_attests_and_a_pinless_entry_needs_an_install() {
         let lock = p.read("poetry.lock");
         let api = api_for(Mode::Hosted);
         let files_line = format!("files = [{{ file = \"{WHEEL}\", hash = \"sha256:{sha}\" }}]");
+        // Lock 2.x keeps Poetry's own one-file-per-line `files` array.
+        let files_block =
+            format!("files = [\n    {{file = \"{WHEEL}\", hash = \"sha256:{sha}\"}},\n]");
         let metadata_entry = format!("{PKG} = [{{ file = \"{WHEEL}\", hash = \"sha256:{sha}\" }}]");
         // A `[metadata.files]` entry that listed files before the rewrite
         // keeps Poetry's one-file-per-line layout (rollback restores the full
@@ -1023,6 +1026,7 @@ fn every_hosted_pin_spelling_attests_and_a_pinless_entry_needs_an_install() {
         let fragment = format!("#sha256={sha}&");
         let spellings: Vec<(&str, &str)> = [
             ("package files", files_line.as_str()),
+            ("package files block", files_block.as_str()),
             ("metadata.files", metadata_entry.as_str()),
             ("metadata.files block", metadata_block.as_str()),
             ("url fragment", fragment.as_str()),

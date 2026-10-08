@@ -950,12 +950,19 @@ mod tests {
                 "{version}: pristine must not be a prefix of new"
             );
             // A relock that keeps `[package.source]` but drops the inserted
-            // `files` line must NOT contain the pristine fragment either.
-            let drifted: String = rewritten
-                .lines()
-                .filter(|l| !l.starts_with("files = [{ file"))
-                .collect::<Vec<_>>()
-                .join("\n");
+            // `files` array must NOT contain the pristine fragment either.
+            // (1.0/1.1 insert it inline, 2.x one file per line.)
+            let drifted = match rewritten.find("files = [\n    {file") {
+                Some(start) => {
+                    let end = start + rewritten[start..].find("\n]\n").unwrap() + 3;
+                    format!("{}{}", &rewritten[..start], &rewritten[end..])
+                }
+                None => rewritten
+                    .lines()
+                    .filter(|l| !l.starts_with("files = [{ file"))
+                    .collect::<Vec<_>>()
+                    .join("\n"),
+            };
             assert!(!drifted.contains(original.as_str()), "{version}");
         }
         // Two adjacent packages: the first fragment ends with the second's
