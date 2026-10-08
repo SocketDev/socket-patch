@@ -499,12 +499,15 @@ jobs:
           VERSIONS_OVERRIDE: ${{ github.event.inputs.versions }}
           SHAPES_OVERRIDE: ${{ github.event.inputs.shapes }}
           MODES_OVERRIDE: ${{ github.event.inputs.modes }}
+          EVENT_NAME: ${{ github.event_name }}
         run: |
           required=()
           modes=(hosted vendored agent)
           if [ -n "$MODES_OVERRIDE" ]; then read -r -a modes <<<"$MODES_OVERRIDE"; fi
-          # The required set only covers cells the native jobs were asked to run.
-          if [ -z "$VERSIONS_OVERRIDE" ] && { [ -z "$SHAPES_OVERRIDE" ] || [[ " $SHAPES_OVERRIDE " == *" direct "* ]]; }; then
+          # The required set only covers cells the native jobs were asked to
+          # run. Pull requests run no macOS cells, so nothing is required there;
+          # the Linux and Windows locks are still compared.
+          if [ "$EVENT_NAME" != pull_request ] && [ -z "$VERSIONS_OVERRIDE" ] && { [ -z "$SHAPES_OVERRIDE" ] || [[ " $SHAPES_OVERRIDE " == *" direct "* ]]; }; then
             for v in 1.2.0 1.0.0-rc.14; do
               for m in "${modes[@]}"; do required+=("$v:$m:direct"); done
             done
