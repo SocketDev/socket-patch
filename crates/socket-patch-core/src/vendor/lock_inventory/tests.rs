@@ -1719,6 +1719,17 @@ async fn gem_inventory_diagnoses_a_lock_it_cannot_read() {
     assert!(purls.is_empty(), "{purls:?}");
     assert_eq!(codes, vec!["gem_lock_unsupported"]);
 
+    // A symlinked spelling (a git mode-120000 entry, whose target the
+    // memory view doesn't carry) may still be a file to bundler, so the
+    // twin stays unread (security review on #768).
+    for linked in ["gems.rb", "Gemfile"] {
+        let mut symlinked = twin.clone();
+        symlinked.insert(linked, MemoryEntry::Symlink);
+        let (purls, codes, _) = diagnosed(&symlinked).await;
+        assert!(purls.is_empty(), "{linked}: {purls:?}");
+        assert_eq!(codes, vec!["gem_lock_unsupported"], "{linked}");
+    }
+
     // Supported layouts: entries, no diagnosis.
     let mut plain = MemoryProject::new();
     plain.insert_text("Gemfile", "gem \"rack\"\n");

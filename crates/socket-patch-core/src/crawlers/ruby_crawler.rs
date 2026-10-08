@@ -1536,13 +1536,24 @@ pub(crate) async fn bundler_loaded_lock_diagnosed_in(
     use crate::formats::gem::manifest::{self, LoadedManifest};
     let loaded = bundler_loaded_manifest_in(view).await;
     let gems_rb = view.is_file("gems.rb");
-    if loaded == LoadedManifest::Default && gems_rb && view.is_file("Gemfile") {
+    if loaded == LoadedManifest::Default
+        && bundler_may_see_file(view, "gems.rb")
+        && bundler_may_see_file(view, "Gemfile")
+    {
         return Err(manifest::twin_manifest_refusal());
     }
     match loaded.pair(gems_rb) {
         Some((_, lock)) => Ok(lock),
         None => Err(loaded.unsupported_detail().unwrap_or_default()),
     }
+}
+
+/// Whether bundler's `File.file?` may find `rel` in `view`: a regular file
+/// (through symlinks on disk), or, on a memory view, a symlink, whose
+/// target the view doesn't carry. The twin check fails closed on it
+/// rather than guess that the link dangles.
+fn bundler_may_see_file(view: &ProjectView<'_>, rel: &str) -> bool {
+    view.is_file(rel) || matches!(view, ProjectView::Memory(project) if project.is_symlink(rel))
 }
 
 /// [`bundler_loaded_manifest`] with the environment passed explicitly (hermetic
