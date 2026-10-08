@@ -1758,7 +1758,15 @@ mod tests {
             assert!(
                 refused
                     .message
-                    .contains(&tmp.path().join(root_lock).display().to_string())
+                    // The root is named canonical (`\\?\` on Windows,
+                    // `/private` on macOS), as the walk resolves it.
+                    .contains(
+                        &std::fs::canonicalize(tmp.path())
+                            .unwrap()
+                            .join(root_lock)
+                            .display()
+                            .to_string()
+                    )
                     && refused
                         .message
                         .contains(&member.join(member_lock).display().to_string())
