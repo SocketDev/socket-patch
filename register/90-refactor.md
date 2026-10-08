@@ -1,7 +1,8 @@
 ### Refactor routine (`refactor`, hourly, highest leverage first)
-_Last updated 2026-10-08T06:45Z · main @ ea09714_
+_Last updated 2026-10-08T08:15Z · main @ 829d0af_
 
 **In flight:**
+- [#1117](https://github.com/SocketDev/socket-patch/pull/1117): 8 inline BOM strips (requirements lexers, manifest, hosted npm manifest, Gradle DSL, socket.yml, CLI Pipenv remedy) onto `formats::text`, plus `strip_bom_bytes` and a one-sided guard with a 26-file pending list. Issue #905 (E64, step 3 slice 1). Only change: a double-BOM Pipfile.lock is unparseable in the stale-install remedy. `state: ready`.
 - [#1110](https://github.com/SocketDev/socket-patch/pull/1110): one `formats::cargo::manifest` reader (`toml_edit`, `[package]` else `[project]`) for the crawler, VEX product and `cargo_tag`; deletes the crawler's line scanner. Issue #693 (E15, slice 1; `vendor/cargo.rs` `path_crate_version`/`declared_cargo_minor` and #651 remain, blocked by #1026/#1039/#1041/#1043/#1050). Parse cost 0.5 µs → 81 µs per manifest, disclosed. `state: ready`.
 - [#1108](https://github.com/SocketDev/socket-patch/pull/1108): one `utils::line_endings::terminator` (CRLF → CRLF, mixed → majority, else LF) for 7 inserted-line sites: gem lock converge, composer/requirements restore, Pipfile.lock entry formatter, PEP 723 writer, go.mod append/re-join. Issue #815 (E16, slice 1; `detect_eol`, `pypi_uv::newline_of`, Maven ×2, `redirect/mod.rs`, the `crlf` flags and upstream gem's Gemfile restore remain, all in open-PR files). Re-blesses the go/uv equivalence goldens (mixed inputs only). `state: ready`.
 - [#1106](https://github.com/SocketDev/socket-patch/pull/1106): the macOS PDM site probe runs through `utils::process::output_within`; a guard test rejects new production `kill_on_drop` spawns (pending: `vendor/npm_dir.rs`). Issue #1067 (C48, slice: `pdm_site`; the `npm_dir` git exchange remains, blocked on #1026). `state: ready`, handed to the burn-down.
@@ -19,15 +20,17 @@ _Last updated 2026-10-08T06:45Z · main @ ea09714_
 
 | # | Candidate | B | U | D | R | Score | Note |
 |---|---|:-:|:-:|:-:|:-:|:-:|---|
-| 1 | #693 (E15) slice 1: one `formats::cargo::manifest` reader for crawler, VEX, `cargo_tag` | 0 | 1 | ≈3.5 | L | ≈9 | **taken: #1110** |
+| 1 | #905 (E64) step 3 slice 1: 8 free-file BOM strips onto `formats::text` + guard | 0 | 0 | ≈8 | L | ≈16 | **taken: #1117** |
 | 2 | #990 (E24, child 1 of #989): one `vendor::revert::finish` for the 12 copied finish blocks | 0 | 1 | ≈12 | L | ≈26 | skipped: backend files changed by open PRs |
 | 3 | #922 (E22): one `VendorEntry::npm` constructor for 7 npm-family ledger tails | 0 | 1 | ≈7 | L | ≈16 | skipped: claimed; drivers changed by #1008 |
-| 4 | #936 (E66): Poetry 2.x LF locks through the shared engine | 0 | 1 | 2 | M | ≈4 | skipped: `vendor/pypi_poetry.rs` changed by #1043 |
-| 5 | #906 (E25): one `stage_prebuilt` for the 4 `<eco>_service_copy` pipelines | 0 | 1 | 4–5 | L | ≈11 | skipped: `vendor/{cargo,gem,golang,service_fetch}.rs` changed by #1026, #1041 and others |
+| 4 | E35 slice: retire the composer/go/nuget/python crawler oracles (≈590 test lines) | 0 | 0 | 4 | L | ≈8 | free files, but test-only; needs a register issue first |
+| 5 | #706 (C17) slice 2: the 6 `PENDING_INLINE_DIGESTS` files | 0 | 1 | ≈6 | L | ≈14 | skipped: all 6 files changed by open PRs |
 
-Re-ranked 2026-10-08T06:00Z at `ea09714` against the files of the 32 open PRs (510 files). Free now: `crawlers/` except `npm`/`ruby`, `formats/cargo`, `vex/product.rs`, `vendor/cargo_tag.rs`; #693 was the only scoring candidate entirely inside them. #747, #883, #895, #1012 each still touch one busy file (`hosted/engine.rs`, `vendor/pypi_*`, `ecosystem_dispatch.rs`, `vendor/registry_fetch.rs`).
+Re-ranked 2026-10-08T08:00Z at `829d0af` against the files of the 34 open PRs (516 files, 174 free production `.rs` files). Free files hold #905's 8 sites, E35's crawler oracles (except maven/npm/cargo) and #649.
 
 **Notes:**
+- Lead for `audit-ecosystems` (not filed): hosted `redirect/requirements.rs` keeps its own pip lexer (`logical_requirements`, `unquoted_index`, `requirement_tokens`) beside `utils::requirements::{logical_lines, split_comment, shlex_split}`. Its comment finder is quote-aware, pip's `COMMENT_RE` is not. `upstream/pypi.rs` shares it (changed by #1108).
+- Source-scan guards: make new ones one-sided (fail on new files only), so a PR migrating a pending file can't turn `main` red.
 - `toml_edit::Document::parse` costs about 81 µs per real crates.io `Cargo.toml` (release), against 0.5 µs for an early-exit line scanner. Disclose it whenever a hot crawl path moves to `toml_edit`.
 - Equivalence goldens (`tests/equivalence/*.golden`, re-bless with `SOCKET_PATCH_BLESS_GOLDEN=1`) feed one input in five through a mixed-ending generator, so any line-ending rule change moves them. Show that only mixed cases can move (a rule argument plus a chunk count) before you re-bless.
 - Upstream gem's `restore_manifest` pins CRLF output for a CRLF Gemfile holding an LF block (an older rewriter wrote one). Migrate it together with the forward Gemfile writer in `redirect/mod.rs`, never alone.
