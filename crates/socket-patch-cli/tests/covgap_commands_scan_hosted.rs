@@ -566,8 +566,7 @@ async fn wet_takeover_refuses_unrevertable_vendored_flavor_fail_closed() {
         "the human skipped line must name purl + reason; stderr=\n{stderr}"
     );
     assert!(
-        stderr.contains("Warning: ")
-            && stderr.contains("could not be reverted"),
+        stderr.contains("Warning: ") && stderr.contains("could not be reverted"),
         "the takeover pre-warning must reach human stderr; stderr=\n{stderr}"
     );
 }
@@ -814,7 +813,10 @@ async fn zero_grant_wet_run_ignores_a_malformed_pre_v5_ledger() {
     let lock_before = std::fs::read(root.join("package-lock.json")).unwrap();
 
     let assert_ignored = |code: i32, doc: &Value, label: &str| {
-        assert_eq!(code, 0, "{label}: a pre-v5 ledger is never an error: {doc:#}");
+        assert_eq!(
+            code, 0,
+            "{label}: a pre-v5 ledger is never an error: {doc:#}"
+        );
         assert_eq!(doc["status"], "success", "{label}: {doc:#}");
         assert!(
             !doc.to_string().contains("redirect-state.json"),
@@ -1017,7 +1019,10 @@ async fn hosted_human_empty_discovery_ignores_a_malformed_pre_v5_ledger() {
 
     for extra in [&[][..], &["--silent"][..]] {
         let (code, stdout, stderr) = scan_hosted(root, &server.uri(), extra, &[]);
-        assert_eq!(code, 0, "{extra:?}: an empty discovery exits 0; stderr=\n{stderr}");
+        assert_eq!(
+            code, 0,
+            "{extra:?}: an empty discovery exits 0; stderr=\n{stderr}"
+        );
         if extra.is_empty() {
             assert!(
                 stdout.contains("No patches available for installed packages."),
@@ -1404,16 +1409,22 @@ async fn native_bun_lockb_hosting_dry_run_rerun_and_rollback_without_bun() {
         ],
         &env,
     );
-    assert_eq!(code, 1, "a binary bun.lockb pin is refused: {stdout}\n{stderr}");
+    assert_eq!(
+        code, 1,
+        "a binary bun.lockb pin is refused: {stdout}\n{stderr}"
+    );
     let doc: Value = serde_json::from_str(&stdout).unwrap_or_else(|e| panic!("{e}: {stdout}"));
     assert_eq!(doc["status"], "partial_failure", "{doc:#}");
-    let failed = doc["hosted"]["failed"].as_array().unwrap_or_else(|| panic!("{doc:#}"));
+    let failed = doc["hosted"]["failed"]
+        .as_array()
+        .unwrap_or_else(|| panic!("{doc:#}"));
     assert_eq!(failed.len(), 1, "{doc:#}");
     assert_eq!(failed[0]["purl"], purl, "{doc:#}");
     let error = failed[0]["error"].as_str().unwrap_or_default();
     assert!(
-        error.starts_with(&format!("cannot restore {purl} to its upstream registry entry: "))
-            && error.contains("bun.lockb")
+        error.starts_with(&format!(
+            "cannot restore {purl} to its upstream registry entry: "
+        )) && error.contains("bun.lockb")
             && error.contains("git checkout"),
         "{error}"
     );
@@ -1819,7 +1830,9 @@ async fn unreadable_pnpm_workspace_gets_warning_only_guidance_in_a_live_run() {
         "the unreadable workspace file must be left byte-identical"
     );
     assert!(
-        !tmp.path().join(".socket/vendor/redirect-state.json").exists(),
+        !tmp.path()
+            .join(".socket/vendor/redirect-state.json")
+            .exists(),
         "v5 hosted mode writes no redirect ledger"
     );
 }
@@ -1931,9 +1944,8 @@ async fn live_hosted_overlap_fires_redirect_supersedes_vendored() {
     let (code, _stdout, stderr) = scan_hosted(root, &server.uri(), &psu, &[]);
     assert_eq!(code, 0, "human overlap run exits 0; stderr=\n{stderr}");
     assert!(
-        stderr.contains(
-            "Warning: Hosted wiring superseded the vendored ledger for:"
-        ) && stderr.contains(XPURL),
+        stderr.contains("Warning: Hosted wiring superseded the vendored ledger for:")
+            && stderr.contains(XPURL),
         "the supersedes warning must reach human stderr; stderr=\n{stderr}"
     );
 }
@@ -1981,8 +1993,7 @@ async fn human_dry_run_prints_would_rewrite_pnpm_guidance_and_vex_skip() {
         "the requested-but-skipped VEX must be announced; stderr=\n{stderr}"
     );
     assert!(
-        stderr.contains("Warning: ")
-            && stderr.contains("trustLockfile"),
+        stderr.contains("Warning: ") && stderr.contains("trustLockfile"),
         "the pnpm trust guidance must reach human stderr; stderr=\n{stderr}"
     );
     assert!(
@@ -2429,7 +2440,8 @@ async fn human_pnpm_rerun_prints_only_the_reminder_and_heal_restores_guidance() 
     let (code, stdout, stderr) = scan_hosted(root, &server.uri(), &[], &[]);
     assert_eq!(code, 0, "stdout=\n{stdout}\nstderr=\n{stderr}");
     assert!(
-        engine_stdout(&stdout).starts_with("Switched 1 package to hosted patches; rewrote 2 files.\n"),
+        engine_stdout(&stdout)
+            .starts_with("Switched 1 package to hosted patches; rewrote 2 files.\n"),
         "{stdout}"
     );
     // Everything from the pnpm warning on (the lines above it are the
@@ -2606,4 +2618,106 @@ async fn vlt_decides_before_binary_bun_and_a_refused_uuid_is_never_confirmed() {
 
     let (confirmed, _tmp) = run(false);
     assert_eq!(confirmed["redirect"]["redirected"], 1, "{confirmed:#}");
+}
+
+// ───────────────── yarn classic berry-migration advisory ─────────────────
+
+/// Yarn classic project: package.json (with `package_manager` when given) +
+/// installed node_modules copy + a v1 yarn.lock resolving NAME upstream.
+fn write_yarn_classic_project(root: &Path, package_manager: Option<&str>) {
+    let pm = package_manager
+        .map(|pm| format!(r#", "packageManager": "{pm}""#))
+        .unwrap_or_default();
+    std::fs::write(
+        root.join("package.json"),
+        format!(
+            r#"{{ "name": "consumer", "version": "0.0.0"{pm}, "dependencies": {{ "{NAME}": "{VERSION}" }} }}"#
+        ),
+    )
+    .unwrap();
+    let pkg = root.join("node_modules").join(NAME);
+    std::fs::create_dir_all(&pkg).unwrap();
+    std::fs::write(
+        pkg.join("package.json"),
+        format!(r#"{{ "name": "{NAME}", "version": "{VERSION}" }}"#),
+    )
+    .unwrap();
+    std::fs::write(
+        root.join("yarn.lock"),
+        format!(
+            "# THIS IS AN AUTOGENERATED FILE. DO NOT EDIT THIS FILE DIRECTLY.\n\
+             # yarn lockfile v1\n\n\n\
+             {NAME}@{VERSION}:\n  version \"{VERSION}\"\n  \
+             resolved \"https://registry.yarnpkg.com/{NAME}/-/{NAME}-{VERSION}.tgz#bbbb\"\n  \
+             integrity {UPSTREAM_SHA512}\n"
+        ),
+    )
+    .unwrap();
+}
+
+/// #907: a hosted pin in a classic yarn.lock is dropped by the next yarn 2+
+/// (berry) install exactly like vendored wiring, so `scan --mode hosted`
+/// must warn `redirect_yarn_classic_berry_migration_risk` — on a dry run, on
+/// the wet run and on an idempotent re-run — when package.json declares no
+/// package manager or a berry one.
+#[tokio::test]
+async fn hosted_yarn_classic_pin_warns_berry_migration_risk() {
+    for package_manager in [None, Some("yarn@4.18.1")] {
+        let server = MockServer::start().await;
+        mock_discovery(&server, PURL, UUID).await;
+        mock_granted_reference(&server, UUID, PURL, HOSTED_URL).await;
+        mock_view(&server, UUID, PURL).await;
+        let tmp = tempfile::tempdir().unwrap();
+        write_yarn_classic_project(tmp.path(), package_manager);
+
+        for (label, extra) in [
+            ("dry run", &["--dry-run"][..]),
+            ("wet run", &[][..]),
+            ("re-run", &[][..]),
+        ] {
+            let (code, doc) = scan_hosted_json(tmp.path(), &server.uri(), extra, &[]);
+            assert_eq!(code, 0, "{package_manager:?} {label}: {doc:#}");
+            let codes = warning_codes(&doc);
+            assert_eq!(
+                codes
+                    .iter()
+                    .filter(|c| *c == "redirect_yarn_classic_berry_migration_risk")
+                    .count(),
+                1,
+                "{package_manager:?} {label}: exactly one advisory: {codes:?}"
+            );
+            let detail = warning_detail(&doc, "redirect_yarn_classic_berry_migration_risk");
+            assert!(detail.contains("yarn 2+"), "{detail}");
+        }
+        let lock = std::fs::read_to_string(tmp.path().join("yarn.lock")).unwrap();
+        assert!(
+            lock.contains(HOSTED_URL),
+            "the warning never blocks the pin: {lock}"
+        );
+    }
+}
+
+/// #907: a corepack `packageManager: yarn@1…` pin makes a stray berry
+/// install refuse instead of migrate, so hosted stays silent, as vendored
+/// does.
+#[tokio::test]
+async fn hosted_yarn_classic_pin_with_yarn1_package_manager_stays_silent() {
+    let server = MockServer::start().await;
+    mock_discovery(&server, PURL, UUID).await;
+    mock_granted_reference(&server, UUID, PURL, HOSTED_URL).await;
+    mock_view(&server, UUID, PURL).await;
+    let tmp = tempfile::tempdir().unwrap();
+    write_yarn_classic_project(tmp.path(), Some("yarn@1.22.22"));
+
+    let (code, doc) = scan_hosted_json(tmp.path(), &server.uri(), &[], &[]);
+    assert_eq!(code, 0, "{doc:#}");
+    let codes = warning_codes(&doc);
+    assert!(
+        !codes
+            .iter()
+            .any(|c| c == "redirect_yarn_classic_berry_migration_risk"),
+        "a yarn 1 pin suppresses the advisory: {codes:?}"
+    );
+    let lock = std::fs::read_to_string(tmp.path().join("yarn.lock")).unwrap();
+    assert!(lock.contains(HOSTED_URL), "{lock}");
 }

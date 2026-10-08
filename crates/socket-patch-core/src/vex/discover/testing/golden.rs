@@ -38,7 +38,7 @@ use serde_json::{json, Map, Value};
 
 use crate::vex::discover::{
     ContestedRef, Diag, Discovery, PatchedRef, Recognized, ResolvedElsewhere, Unattested,
-    UnlockedPin, WiringMode,
+    UnlockedPin, UnpatchedCopy, WiringMode,
 };
 
 /// Set to `1` to (re)write the goldens instead of comparing against them.
@@ -120,8 +120,11 @@ fn render(out: &Discovery, root: &Path) -> Value {
         recognized,
         unlocked_pins,
         elsewhere,
+        unpatched_copies,
         unattested,
         contested,
+        // Already folded into `unattested` by the time a run returns.
+        unwired_copies: _,
     } = out;
     let refs: Vec<Value> = refs
         .iter()
@@ -216,12 +219,54 @@ fn render(out: &Discovery, root: &Path) -> Value {
                     uuid,
                     file,
                     detail,
+                    kind,
                 } = u;
                 json!({
                     "purl": purl,
                     "uuid": uuid,
                     "file": path_str(file),
                     "detail": normalize(detail, &roots),
+                    "kind": format!("{kind:?}"),
+                })
+            })
+            .collect::<Vec<_>>()
+            .into();
+    }
+    if !unpatched_copies.is_empty() {
+        rendered["unpatched_copies"] = unpatched_copies
+            .iter()
+            .map(|c| {
+                let UnpatchedCopy {
+                    purl,
+                    file,
+                    key,
+                    how,
+                } = c;
+                json!({
+                    "purl": purl,
+                    "file": path_str(file),
+                    "key": key,
+                    "how": normalize(how, &roots),
+                })
+            })
+            .collect::<Vec<_>>()
+            .into();
+    }
+    if !unpatched_copies.is_empty() {
+        rendered["unpatched_copies"] = unpatched_copies
+            .iter()
+            .map(|c| {
+                let UnpatchedCopy {
+                    purl,
+                    file,
+                    key,
+                    how,
+                } = c;
+                json!({
+                    "purl": purl,
+                    "file": path_str(file),
+                    "key": key,
+                    "how": normalize(how, &roots),
                 })
             })
             .collect::<Vec<_>>()

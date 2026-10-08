@@ -18,9 +18,7 @@ use std::collections::{HashMap, HashSet};
 use std::io::Read as _;
 use std::path::{Path, PathBuf};
 
-use super::coursier_cache::{
-    existing_dedup, jvm_option_values, log_source, process_home, TargetOs,
-};
+use super::coursier_cache::{existing_dedup, jvm_option_values, log_source, TargetOs};
 use super::maven_crawler::{is_safe_maven_coordinate, parse_pom_group_artifact_version};
 use super::types::CrawledPackage;
 use crate::utils::fs::{open_regular_file_sync, read_regular_to_bytes_sync};
@@ -76,7 +74,7 @@ fn ivy_cache_dirs_with_source(
 /// home).
 pub fn process_cache_dirs(cwd: &Path) -> Vec<PathBuf> {
     let env = |name: &str| std::env::var(name).ok().filter(|v| !v.is_empty());
-    let home = process_home();
+    let home = crate::utils::fs::home_dir();
     ivy_cache_dirs_with_source(TargetOs::host(), &env, home.as_deref(), cwd)
         .into_iter()
         .map(|(dir, source)| {

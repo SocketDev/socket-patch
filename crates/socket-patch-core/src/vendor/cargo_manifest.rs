@@ -57,6 +57,7 @@ use std::path::Path;
 
 use toml_edit::{DocumentMut, InlineTable, Item, Value};
 
+use crate::formats::text::split_bom;
 use crate::utils::fs::{atomic_write_bytes_preserving_mode, read_regular_to_string};
 
 use super::cargo_config::{ensure_table_like, patch_entries, path_is_socket_owned};
@@ -154,12 +155,9 @@ pub fn normalize_socket_path(path: &str) -> Option<String> {
     if !path_is_socket_owned(path) {
         return None;
     }
-    let norm = path.replace('\\', "/");
-    let segments: Vec<&str> = norm
-        .split('/')
-        .filter(|s| !s.is_empty() && *s != ".")
-        .collect();
-    Some(segments.join("/"))
+    // `path_is_socket_owned` admits no `..`, so this only drops `.` and
+    // empty segments and unifies the separators.
+    crate::utils::relpath::resolve_rel("", path, 0)
 }
 
 /// Is `path` a Socket-owned copy of exactly `name@version`: under
@@ -361,15 +359,6 @@ pub fn parse_manifest(content: &str) -> Result<DocumentMut, ManifestError> {
         .replace("\r\n", "\n")
         .parse::<DocumentMut>()
         .map_err(|e| ManifestError::Unparseable(format!("Cargo.toml is not valid TOML: {e}")))
-}
-
-/// `(bom, rest)`: a leading UTF-8 BOM (`toml_edit` accepts it but never
-/// renders it back), split off so an edit can restore it.
-fn split_bom(content: &str) -> (&str, &str) {
-    match content.strip_prefix('\u{feff}') {
-        Some(rest) => ("\u{feff}", rest),
-        None => ("", content),
-    }
 }
 
 /// `edited` (the `toml_edit` rendering of `original` after an edit) mapped

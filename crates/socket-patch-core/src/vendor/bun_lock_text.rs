@@ -33,7 +33,7 @@ const SUPPORTED_LOCK_VERSIONS: [u64; 3] = [0, 1, 2];
 /// plainly.
 pub(crate) fn patched_dependency_keys(manifest: Option<&str>, lock: Option<&str>) -> Vec<String> {
     let mut keys: Vec<String> = manifest
-        .map(crate::utils::serde::strip_bom)
+        .map(crate::formats::text::strip_bom)
         .and_then(|text| {
             serde_json::from_str::<serde_json::Value>(text)
                 .or_else(|_| serde_json::from_str(&strip_jsonc(text)))

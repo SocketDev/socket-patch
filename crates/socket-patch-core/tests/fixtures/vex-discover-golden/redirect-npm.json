@@ -6516,7 +6516,15 @@
         "file": "yarn.lock"
       }
     ],
-    "live_claims": []
+    "live_claims": [],
+    "unpatched_copies": [
+      {
+        "purl": "pkg:npm/left-pad@1.3.0",
+        "file": "yarn.lock",
+        "key": "\"left-pad@npm:^1.3.0\"",
+        "how": "installs it from the registry, not a Socket patch (yarn berry installs every locator the lock resolves)"
+      }
+    ]
   },
   "redirect/npm/yarn-berry/cachekey-mismatch-refusal/input": {
     "refs": [],
@@ -6529,7 +6537,15 @@
         "file": "yarn.lock"
       }
     ],
-    "live_claims": []
+    "live_claims": [],
+    "unpatched_copies": [
+      {
+        "purl": "pkg:npm/left-pad@1.3.0",
+        "file": "yarn.lock",
+        "key": "\"left-pad@npm:^1.3.0\"",
+        "how": "installs it from the registry, not a Socket patch (yarn berry installs every locator the lock resolves)"
+      }
+    ]
   },
   "redirect/npm/yarn-berry/existing-archive-url/expected": {
     "refs": [
@@ -6589,7 +6605,15 @@
         "file": "yarn.lock"
       }
     ],
-    "live_claims": []
+    "live_claims": [],
+    "unpatched_copies": [
+      {
+        "purl": "pkg:npm/left-pad@1.3.0",
+        "file": "yarn.lock",
+        "key": "\"left-pad@npm:^1.3.0\"",
+        "how": "installs it from \"https%3A%2F%2Fregistry.corp.example%2Fleft-pad-1.3.0.tgz\", not a Socket patch"
+      }
+    ]
   },
   "redirect/npm/yarn-berry/missing-berry-checksum/input": {
     "refs": [],
@@ -6602,7 +6626,15 @@
         "file": "yarn.lock"
       }
     ],
-    "live_claims": []
+    "live_claims": [],
+    "unpatched_copies": [
+      {
+        "purl": "pkg:npm/left-pad@1.3.0",
+        "file": "yarn.lock",
+        "key": "\"left-pad@npm:^1.3.0\"",
+        "how": "installs it from the registry, not a Socket patch (yarn berry installs every locator the lock resolves)"
+      }
+    ]
   },
   "redirect/npm/yarn-berry/multi-descriptor-key/expected": {
     "refs": [
@@ -6662,7 +6694,15 @@
         "file": "yarn.lock"
       }
     ],
-    "live_claims": []
+    "live_claims": [],
+    "unpatched_copies": [
+      {
+        "purl": "pkg:npm/left-pad@1.3.0",
+        "file": "yarn.lock",
+        "key": "\"left-pad@npm:^1.0.0, left-pad@npm:^1.3.0\"",
+        "how": "installs it from the registry, not a Socket patch (yarn berry installs every locator the lock resolves)"
+      }
+    ]
   },
   "redirect/npm/yarn-berry/multiple-versions/expected": {
     "refs": [
@@ -6714,6 +6754,14 @@
         "uuid": "77777777-7777-7777-7777-777777777777",
         "purl": "pkg:npm/left-pad@1.3.0"
       }
+    ],
+    "unpatched_copies": [
+      {
+        "purl": "pkg:npm/left-pad@1.0.0",
+        "file": "yarn.lock",
+        "key": "\"left-pad@npm:^1.0.0\"",
+        "how": "installs it from the registry, not a Socket patch (yarn berry installs every locator the lock resolves)"
+      }
     ]
   },
   "redirect/npm/yarn-berry/multiple-versions/input": {
@@ -6731,7 +6779,21 @@
         "file": "yarn.lock"
       }
     ],
-    "live_claims": []
+    "live_claims": [],
+    "unpatched_copies": [
+      {
+        "purl": "pkg:npm/left-pad@1.0.0",
+        "file": "yarn.lock",
+        "key": "\"left-pad@npm:^1.0.0\"",
+        "how": "installs it from the registry, not a Socket patch (yarn berry installs every locator the lock resolves)"
+      },
+      {
+        "purl": "pkg:npm/left-pad@1.3.0",
+        "file": "yarn.lock",
+        "key": "\"left-pad@npm:^1.3.0\"",
+        "how": "installs it from the registry, not a Socket patch (yarn berry installs every locator the lock resolves)"
+      }
+    ]
   },
   "redirect/npm/yarn-berry/rerun-noop/input": {
     "refs": [
@@ -6838,7 +6900,15 @@
         "file": "yarn.lock"
       }
     ],
-    "live_claims": []
+    "live_claims": [],
+    "unpatched_copies": [
+      {
+        "purl": "pkg:npm/@babel/core@7.0.0",
+        "file": "yarn.lock",
+        "key": "\"@babel/core@npm:^7.0.0\"",
+        "how": "installs it from the registry, not a Socket patch (yarn berry installs every locator the lock resolves)"
+      }
+    ]
   },
   "redirect/npm/yarn-berry/yarnrc-compression-refusal/input": {
     "refs": [],
@@ -6851,7 +6921,15 @@
         "file": "yarn.lock"
       }
     ],
-    "live_claims": []
+    "live_claims": [],
+    "unpatched_copies": [
+      {
+        "purl": "pkg:npm/left-pad@1.3.0",
+        "file": "yarn.lock",
+        "key": "\"left-pad@npm:^1.3.0\"",
+        "how": "installs it from the registry, not a Socket patch (yarn berry installs every locator the lock resolves)"
+      }
+    ]
   },
   "redirect/npm/yarn-classic/alias-guard/input": {
     "refs": [],
@@ -6868,7 +6946,21 @@
         "file": "yarn.lock"
       }
     ],
-    "live_claims": []
+    "live_claims": [],
+    "unpatched_copies": [
+      {
+        "purl": "pkg:npm/left-pad@1.3.0",
+        "file": "yarn.lock",
+        "key": "\"safe-pad@npm:left-pad@^1.3.0\"",
+        "how": "installs it from \"https://registry.yarnpkg.com/left-pad/-/left-pad-1.3.0.tgz#5b8a3a7765dfe001261dde915ec1972a5f1bb07e\", not a Socket patch (yarn 1 installs one copy per name@version, from whichever block it resolves first)"
+      },
+      {
+        "purl": "pkg:npm/totally-other@1.3.0",
+        "file": "yarn.lock",
+        "key": "\"left-pad@npm:totally-other@^1.3.0\"",
+        "how": "installs it from \"https://registry.yarnpkg.com/totally-other/-/totally-other-1.3.0.tgz#aaaabbbbccccddddeeeeffff0000111122223333\", not a Socket patch (yarn 1 installs one copy per name@version, from whichever block it resolves first)"
+      }
+    ]
   },
   "redirect/npm/yarn-classic/basic/expected": {
     "refs": [
@@ -6918,7 +7010,15 @@
         "file": "yarn.lock"
       }
     ],
-    "live_claims": []
+    "live_claims": [],
+    "unpatched_copies": [
+      {
+        "purl": "pkg:npm/left-pad@1.3.0",
+        "file": "yarn.lock",
+        "key": "left-pad@1.3.0",
+        "how": "installs it from \"https://registry.yarnpkg.com/left-pad/-/left-pad-1.3.0.tgz#5b8a3a7765dfe001261dde915ec1972a5f1bb07e\", not a Socket patch (yarn 1 installs one copy per name@version, from whichever block it resolves first)"
+      }
+    ]
   },
   "redirect/npm/yarn-classic/crlf/expected": {
     "refs": [
@@ -6960,6 +7060,14 @@
         "uuid": "22222222-2222-2222-2222-222222222222",
         "purl": "pkg:npm/left-pad@1.3.0"
       }
+    ],
+    "unpatched_copies": [
+      {
+        "purl": "pkg:npm/abbrev@1.1.1",
+        "file": "yarn.lock",
+        "key": "abbrev@^1.0.0",
+        "how": "installs it from \"https://registry.yarnpkg.com/abbrev/-/abbrev-1.1.1.tgz#f8f2c887ad10bf67f634f005b6987fed3179aac8\", not a Socket patch (yarn 1 installs one copy per name@version, from whichever block it resolves first)"
+      }
     ]
   },
   "redirect/npm/yarn-classic/crlf/input": {
@@ -6977,6 +7085,20 @@
         "file": "yarn.lock"
       }
     ],
-    "live_claims": []
+    "live_claims": [],
+    "unpatched_copies": [
+      {
+        "purl": "pkg:npm/abbrev@1.1.1",
+        "file": "yarn.lock",
+        "key": "abbrev@^1.0.0",
+        "how": "installs it from \"https://registry.yarnpkg.com/abbrev/-/abbrev-1.1.1.tgz#f8f2c887ad10bf67f634f005b6987fed3179aac8\", not a Socket patch (yarn 1 installs one copy per name@version, from whichever block it resolves first)"
+      },
+      {
+        "purl": "pkg:npm/left-pad@1.3.0",
+        "file": "yarn.lock",
+        "key": "left-pad@1.3.0",
+        "how": "installs it from \"https://registry.yarnpkg.com/left-pad/-/left-pad-1.3.0.tgz#5b8a3a7765dfe001261dde915ec1972a5f1bb07e\", not a Socket patch (yarn 1 installs one copy per name@version, from whichever block it resolves first)"
+      }
+    ]
   }
 }

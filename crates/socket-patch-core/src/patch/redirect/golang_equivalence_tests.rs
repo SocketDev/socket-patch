@@ -10,7 +10,11 @@ use super::*;
 use crate::golden::Golden;
 use crate::test_rng::Rng;
 
-fn run(g: &mut Golden, files: &BTreeMap<String, String>, overrides: &[DepOverride]) -> RewriteResult {
+fn run(
+    g: &mut Golden,
+    files: &BTreeMap<String, String>,
+    overrides: &[DepOverride],
+) -> RewriteResult {
     let mut got = RewriteResult::default();
     rewrite_golang(files, overrides, &mut got);
     g.next(&(files, overrides), &got);
@@ -282,6 +286,7 @@ fn single_walk_golang_rewrite_matches_golden() {
         "redirect_golang_gosum_prune",
         "redirect_golang_stale_replace_removed",
         "redirect_golang_stale_gosum_removed",
+        "redirect_golang_superseded_gosum_removed",
     ] {
         assert!(kinds.contains(kind), "no case reached {kind}: {kinds:?}");
     }

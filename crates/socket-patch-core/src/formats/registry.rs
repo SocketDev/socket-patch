@@ -16,9 +16,10 @@
 /// Read by the hosted planners (`scan --mode hosted`, the in-memory
 /// engine's candidate reads).
 pub const HOSTED: u8 = 1 << 0;
-/// Rewired by a vendored planner: the search space for
-/// `.socket/vendor/<eco>/<uuid>/<leaf>` references when the vendor ledger
-/// is gone (`repair`).
+/// Written by a vendored run: the search space for
+/// `.socket/vendor/<eco>/<uuid>[/<leaf>]` references (`repair`, the orphan
+/// sweeps, rollback's ledger-less gate) and the files a vendored dry run
+/// checks for symbolic links ([`wiring_paths`]).
 pub const VENDORED: u8 = 1 << 1;
 /// A lock (or wiring config) a vendored artifact is consumed through — the
 /// liveness probe of a ledger entry whose recorded wiring files are gone
@@ -68,7 +69,11 @@ const fn row(path: &'static str, ecosystem: &'static str, roles: u8) -> FormatFi
 const REGISTRY: &[FormatFile] = &[
     // ── npm family ──
     row("package-lock.json", "npm", HOSTED | VENDORED | PROBE | ROOT),
-    row("npm-shrinkwrap.json", "npm", HOSTED | VENDORED | PROBE | ROOT),
+    row(
+        "npm-shrinkwrap.json",
+        "npm",
+        HOSTED | VENDORED | PROBE | ROOT,
+    ),
     row(
         "pnpm-lock.yaml",
         "npm",
@@ -77,7 +82,7 @@ const REGISTRY: &[FormatFile] = &[
     // Package-manager detection only: the vendor probe and the hosted
     // planners have never accepted these spellings.
     row("pnpm-lock.yml", "npm", PNPM_MARKER),
-    row("pnpm-workspace.yaml", "npm", PNPM_MARKER),
+    row("pnpm-workspace.yaml", "npm", VENDORED | PNPM_MARKER),
     // pnpm <= 2 uses the same package identities under the old filename.
     row("shrinkwrap.yaml", "npm", HOSTED),
     row("node_modules/.modules.yaml", "npm", HOSTED),
@@ -107,7 +112,7 @@ const REGISTRY: &[FormatFile] = &[
     // than abandoned.
     row("Pipfile", "pypi", HOSTED | PRESENCE_ONLY),
     row("pyproject.toml", "pypi", HOSTED | VENDORED | PROBE),
-    row("hatch.toml", "pypi", HOSTED | PROBE),
+    row("hatch.toml", "pypi", HOSTED | VENDORED | PROBE),
     // ── cargo ──
     row("Cargo.toml", "cargo", HOSTED | VENDORED | PROBE),
     row("Cargo.lock", "cargo", HOSTED | VENDORED | ROOT),
@@ -119,12 +124,16 @@ const REGISTRY: &[FormatFile] = &[
     row(".cargo/config", "cargo", HOSTED | VENDORED | PROBE),
     // ── composer ──
     row("composer.json", "composer", VENDORED),
-    row("composer.lock", "composer", HOSTED | VENDORED | PROBE | ROOT),
+    row(
+        "composer.lock",
+        "composer",
+        HOSTED | VENDORED | PROBE | ROOT,
+    ),
     // ── nuget ──
-    row("nuget.config", "nuget", HOSTED | PROBE),
-    row("NuGet.config", "nuget", HOSTED | PROBE),
-    row("NuGet.Config", "nuget", HOSTED | PROBE),
-    row("packages.lock.json", "nuget", HOSTED),
+    row("nuget.config", "nuget", HOSTED | VENDORED | PROBE),
+    row("NuGet.config", "nuget", HOSTED | VENDORED | PROBE),
+    row("NuGet.Config", "nuget", HOSTED | VENDORED | PROBE),
+    row("packages.lock.json", "nuget", HOSTED | VENDORED),
     // ── gem ──
     row("Gemfile", "gem", HOSTED | VENDORED),
     row("Gemfile.lock", "gem", HOSTED | VENDORED | PROBE | ROOT),
@@ -140,10 +149,10 @@ const REGISTRY: &[FormatFile] = &[
     row("go.mod", "golang", HOSTED | VENDORED | PROBE | ROOT),
     row("go.sum", "golang", HOSTED | ROOT),
     // ── maven ──
-    row("pom.xml", "maven", HOSTED | PROBE),
+    row("pom.xml", "maven", HOSTED | VENDORED | PROBE),
     // Maven Trusted Checksums files the fail-closed maven planner merges
     // into (read so an existing user config / checksum set is preserved).
-    row(".mvn/maven.config", "maven", HOSTED),
+    row(".mvn/maven.config", "maven", HOSTED | VENDORED),
     row(".mvn/checksums/checksums.sha256", "maven", HOSTED),
     // Never edited: its `distributionUrl` names the project's Maven, which
     // the maven planner checks against the Trusted Checksums floor (3.9.4)
@@ -241,21 +250,6 @@ pub fn hosted_file_ecosystem(rel: &str) -> Option<&'static str> {
         .map(|f| f.ecosystem)
 }
 
-/// Files a vendored run writes that carry no [`VENDORED`] role (that role
-/// also scopes `repair`'s fingerprint): pnpm's workspace file, NuGet's
-/// config and lock (the vendored feed), the root `pom.xml` and
-/// `.mvn/maven.config` (vendored Maven), and `hatch.toml` (vendored Hatch).
-const VENDORED_WRITES_UNMARKED: &[&str] = &[
-    "pnpm-workspace.yaml",
-    "nuget.config",
-    "NuGet.config",
-    "NuGet.Config",
-    "packages.lock.json",
-    "pom.xml",
-    ".mvn/maven.config",
-    "hatch.toml",
-];
-
 /// The project-relative paths of `ecosystem` that a vendored run may
 /// rewrite: the files a vendored dry run checks for symbolic links, since
 /// the wet run's commit refuses to rename over one. Files a vendored run
@@ -264,10 +258,7 @@ const VENDORED_WRITES_UNMARKED: &[&str] = &[
 pub fn wiring_paths(ecosystem: &str) -> Vec<&'static str> {
     REGISTRY
         .iter()
-        .filter(|f| {
-            f.ecosystem == ecosystem
-                && (f.has(VENDORED) || VENDORED_WRITES_UNMARKED.contains(&f.path))
-        })
+        .filter(|f| f.ecosystem == ecosystem && f.has(VENDORED))
         .map(|f| f.path)
         .collect()
 }
@@ -289,7 +280,11 @@ mod tests {
         paths.dedup();
         assert_eq!(before, paths.len(), "duplicate registry path");
         for f in REGISTRY.iter().filter(|f| f.has(ROOT)) {
-            assert!(!f.path.contains('/'), "{}: a root marker is a basename", f.path);
+            assert!(
+                !f.path.contains('/'),
+                "{}: a root marker is a basename",
+                f.path
+            );
         }
     }
 
@@ -323,6 +318,61 @@ mod tests {
         ] {
             assert!(!npm.contains(&p), "{p}");
         }
+    }
+
+    /// One notion of "a file a vendored run writes" (#832, #958): the
+    /// [`VENDORED`] role. The vendored dry run's symlink check
+    /// ([`wiring_paths`]) and the vendored-reference scan
+    /// (`paths_with(VENDORED)`) read the same rows, so every file a vendored
+    /// backend rewires (NuGet's config and lock, Maven's pom and
+    /// `.mvn/maven.config`, Hatch's `hatch.toml`, pnpm's workspace file) is
+    /// searched for references.
+    #[test]
+    fn the_reference_scan_and_the_symlink_check_read_the_same_files() {
+        let vendored = paths_with(VENDORED);
+        let mut union: Vec<&str> = [
+            "npm", "pypi", "cargo", "composer", "nuget", "gem", "golang", "maven",
+        ]
+        .iter()
+        .flat_map(|eco| wiring_paths(eco))
+        .collect();
+        union.sort_unstable();
+        let mut sorted = vendored.clone();
+        sorted.sort_unstable();
+        assert_eq!(sorted, union);
+        for p in [
+            "pnpm-workspace.yaml",
+            "nuget.config",
+            "NuGet.config",
+            "NuGet.Config",
+            "packages.lock.json",
+            "pom.xml",
+            ".mvn/maven.config",
+            "hatch.toml",
+        ] {
+            assert!(vendored.contains(&p), "{p}");
+        }
+        assert_eq!(
+            wiring_paths("nuget"),
+            [
+                "nuget.config",
+                "NuGet.config",
+                "NuGet.Config",
+                "packages.lock.json"
+            ]
+        );
+        assert_eq!(
+            wiring_paths("pypi"),
+            [
+                "requirements.txt",
+                "uv.lock",
+                "poetry.lock",
+                "pdm.lock",
+                "Pipfile.lock",
+                "pyproject.toml",
+                "hatch.toml"
+            ]
+        );
     }
 
     #[test]

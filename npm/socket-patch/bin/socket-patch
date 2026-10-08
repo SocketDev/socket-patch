@@ -1,6 +1,7 @@
 #!/usr/bin/env node
 const { spawnSync } = require("child_process");
 const fs = require("fs");
+const os = require("os");
 const path = require("path");
 
 const PLATFORMS = {
@@ -46,6 +47,14 @@ function orderCandidates(candidates, libc) {
 // installed candidate is worth trying.
 const UNRUNNABLE = new Set(["ENOENT", "EACCES", "ENOEXEC"]);
 
+// A binary killed by a signal has no exit status; report it the way a
+// shell does (128 + the signal number), so Ctrl-C reads as 130, not 1.
+function exitCode({ status, signal }) {
+  if (status !== null && status !== undefined) return status;
+  const number = signal && os.constants.signals[signal];
+  return number ? 128 + number : 1;
+}
+
 function runFirstUsable(binPaths, args, {
   spawn = (bin, argv) => spawnSync(bin, argv, { stdio: "inherit", env: process.env }),
   log = (msg) => console.error(msg),
@@ -53,7 +62,7 @@ function runFirstUsable(binPaths, args, {
   let lastError;
   for (const bin of binPaths) {
     const result = spawn(bin, args);
-    if (!result.error) return result.status ?? 1;
+    if (!result.error) return exitCode(result);
     lastError = { bin, error: result.error };
     if (!UNRUNNABLE.has(result.error.code)) break;
   }

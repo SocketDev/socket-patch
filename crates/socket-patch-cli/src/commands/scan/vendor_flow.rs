@@ -21,8 +21,7 @@ use socket_patch_core::api::types::{BatchPackagePatches, PatchResponse, PatchSea
 use socket_patch_core::manifest::operations::{read_manifest, write_manifest};
 use socket_patch_core::manifest::schema::PatchRecord;
 use socket_patch_core::telemetry::{track_patch_vendor_failed, PendingTelemetry};
-use socket_patch_core::utils::composer_version::composer_purls_equivalent;
-use socket_patch_core::utils::purl::strip_purl_qualifiers;
+use socket_patch_core::utils::purl_key::PurlKey;
 use socket_patch_core::vendor::{load_state, lookup_entry, save_state, VendorState};
 use std::collections::{HashMap, HashSet};
 use std::path::Path;
@@ -80,9 +79,14 @@ type VendorStepResult = Result<(bool, Envelope), VendorStepError>;
 /// outside the preflights are not predicted), and `would_refuse` never
 /// flips the run's status or exit code. The preflights (the only disk
 /// access besides the ledger) run only when the selection holds an npm purl.
+/// `takeover_refusals` adds the hosted→vendored takeover refusals the
+/// caller resolved (the gem gates of
+/// [`crate::commands::vendor::gem_takeover_preview_refusals`]), keyed by
+/// the selected purl, as `would_refuse` rows too.
 pub(crate) async fn preview_vendor_json(
     cwd: &Path,
     selected: &[PatchSearchResult],
+    takeover_refusals: &HashMap<String, (&'static str, String)>,
 ) -> serde_json::Value {
     // The ledger load outcome reaches the preflight AS a result, so an
     // unreadable ledger previews as `vendor_state_unreadable` rather than
@@ -111,6 +115,13 @@ pub(crate) async fn preview_vendor_json(
                 serde_json::json!({
                     "purl": p.purl, "uuid": p.uuid, "action": "would_refuse",
                     "errorCode": r.code, "error": r.detail,
+                })
+            }
+            _ if takeover_refusals.contains_key(&p.purl) => {
+                let (code, detail) = &takeover_refusals[&p.purl];
+                serde_json::json!({
+                    "purl": p.purl, "uuid": p.uuid, "action": "would_refuse",
+                    "errorCode": code, "error": detail,
                 })
             }
             _ if p.purl.starts_with("pkg:npm/") && npm_lock_refusal.is_some() => {
@@ -158,26 +169,33 @@ fn with_symlink_warnings(cwd: &Path, purl: &str, mut row: serde_json::Value) -> 
     row
 }
 
-/// The purls of `selected` the wet run's Bun, vlt or npm package-lock preflight would refuse
-/// before any download (the `would_refuse` rows of
-/// [`preview_vendor_json`]): the vendored planning pass, so a refused NEW
-/// patch holds no rollout slot.
+/// The purls of `selected` the wet run's Bun, vlt or npm package-lock
+/// preflight, or the gem hosted→vendored takeover gate, would refuse before
+/// any download (the `would_refuse` rows of [`preview_vendor_json`]): the
+/// vendored planning pass, so a refused NEW patch holds no rollout slot.
 pub(super) async fn preflight_refused_purls(
-    cwd: &Path,
+    common: &GlobalArgs,
     selected: &[PatchSearchResult],
 ) -> HashSet<String> {
+    let cwd = common.cwd.as_path();
     let state = load_state(cwd).await;
     let refusal =
         bun_vendor_preflight_with_ledger(cwd, selected, state.as_ref().map(|s| &s.entries)).await;
     let vlt_refusals =
         vlt_vendor_preflight_selected(cwd, selected, state.as_ref().map(|s| &s.entries)).await;
     let npm_lock_refusal = npm_lock_refusal(cwd, selected).await;
+    let gem_refusals = crate::commands::vendor::gem_takeover_preview_refusals(
+        common,
+        selected.iter().map(|p| p.purl.as_str()),
+    )
+    .await;
     selected
         .iter()
         .filter(|p| {
             refusal.as_ref().is_some_and(|r| r.applies_to(&p.purl))
                 || vlt_refusal_for(&vlt_refusals, &p.purl).is_some()
                 || (p.purl.starts_with("pkg:npm/") && npm_lock_refusal.is_some())
+                || gem_refusals.contains_key(&p.purl)
         })
         .map(|p| p.purl.clone())
         .collect()
@@ -462,16 +480,11 @@ async fn migrate_legacy_manifest_records(
         if !(entry.detached && entry.record.is_some() && entry.uuid == record.uuid) {
             continue;
         }
-        let base = strip_purl_qualifiers(&entry.base_purl);
+        let base = PurlKey::new(&entry.base_purl);
         let keys: Vec<String> = manifest
             .patches
             .keys()
-            .filter(|k| {
-                *k == &key
-                    || *k == purl
-                    || strip_purl_qualifiers(k) == base
-                    || composer_purls_equivalent(k, base)
-            })
+            .filter(|k| *k == &key || *k == purl || PurlKey::new(k) == base)
             .cloned()
             .collect();
         for k in keys {
@@ -531,7 +544,7 @@ async fn run_vendor_json_path(
     manifest_path: &Path,
     socket_dir: &Path,
     scanned_purls: &HashSet<String>,
-    vendored_purls: &HashSet<String>,
+    vendored_purls: &HashSet<PurlKey>,
     prune: bool,
     telemetry_token: Option<&str>,
     telemetry_org: Option<&str>,
@@ -574,7 +587,7 @@ async fn run_vendor_json_path(
     // The planning pass: a patch the preflight refuses holds no slot (it
     // still reaches the engine, which reports the refusal).
     let writers = writers_of(&rows);
-    let refused = preflight_refused_purls(&args.common.cwd, &writers).await;
+    let refused = preflight_refused_purls(&args.common, &writers).await;
     stage.plan(&rows, |r| !refused.contains(&r.writer.purl));
     let deferred = stage.deferred_keys();
     let selected: Vec<PatchSearchResult> = writers
@@ -586,7 +599,12 @@ async fn run_vendor_json_path(
     if args.common.dry_run {
         // No downloads, no backends: classify against the ledger
         // and preview the GC, exactly like `--apply`'s dry run.
-        result["vendor"] = preview_vendor_json(&args.common.cwd, &selected).await;
+        let takeover = crate::commands::vendor::gem_takeover_preview_refusals(
+            &args.common,
+            selected.iter().map(|p| p.purl.as_str()),
+        )
+        .await;
+        result["vendor"] = preview_vendor_json(&args.common.cwd, &selected, &takeover).await;
         if prune {
             result["gc"] = gc_json(
                 &args.common,
@@ -706,7 +724,7 @@ async fn run_vendor_interactive_path(
     manifest_path: &Path,
     socket_dir: &Path,
     scanned_purls: &HashSet<String>,
-    vendored_purls: &HashSet<String>,
+    vendored_purls: &HashSet<PurlKey>,
     prune: bool,
     telemetry_token: Option<&str>,
     telemetry_org: Option<&str>,
@@ -891,7 +909,7 @@ pub(super) fn boxed_vendor_json_path<'a>(
     manifest_path: &'a Path,
     socket_dir: &'a Path,
     scanned_purls: &'a HashSet<String>,
-    vendored_purls: &'a HashSet<String>,
+    vendored_purls: &'a HashSet<PurlKey>,
     prune: bool,
     telemetry_token: Option<&'a str>,
     telemetry_org: Option<&'a str>,
@@ -934,7 +952,7 @@ pub(super) fn boxed_vendor_interactive_path<'a>(
     manifest_path: &'a Path,
     socket_dir: &'a Path,
     scanned_purls: &'a HashSet<String>,
-    vendored_purls: &'a HashSet<String>,
+    vendored_purls: &'a HashSet<PurlKey>,
     prune: bool,
     telemetry_token: Option<&'a str>,
     telemetry_org: Option<&'a str>,
@@ -1315,7 +1333,7 @@ mod preview_tests {
     #[tokio::test]
     async fn preview_without_bun_lock_is_plain_would_vendor() {
         let tmp = tempfile::tempdir().unwrap();
-        let preview = preview_vendor_json(tmp.path(), &[sel(UUID, NPM)]).await;
+        let preview = preview_vendor_json(tmp.path(), &[sel(UUID, NPM)], &HashMap::new()).await;
         assert_eq!(
             preview,
             serde_json::json!({
@@ -1340,7 +1358,12 @@ mod preview_tests {
             tmp.path().join("yarn.lock"),
         )
         .unwrap();
-        let preview = preview_vendor_json(tmp.path(), &[sel(UUID, NPM), sel(UUID, PYPI)]).await;
+        let preview = preview_vendor_json(
+            tmp.path(),
+            &[sel(UUID, NPM), sel(UUID, PYPI)],
+            &HashMap::new(),
+        )
+        .await;
         let npm = action_of(&preview, NPM);
         assert_eq!(npm["action"], "would_vendor", "{preview}");
         assert_eq!(
@@ -1365,7 +1388,12 @@ mod preview_tests {
     async fn preview_marks_would_refuse_for_refused_bun_tree() {
         let tmp = tempfile::tempdir().unwrap();
         std::fs::write(tmp.path().join("bun.lock"), V1_WORKSPACE_LOCK).unwrap();
-        let preview = preview_vendor_json(tmp.path(), &[sel(UUID, NPM), sel(UUID, PYPI)]).await;
+        let preview = preview_vendor_json(
+            tmp.path(),
+            &[sel(UUID, NPM), sel(UUID, PYPI)],
+            &HashMap::new(),
+        )
+        .await;
         let npm = action_of(&preview, NPM);
         assert_eq!(npm["action"], "would_refuse", "{preview}");
         assert_eq!(
@@ -1397,7 +1425,7 @@ mod preview_tests {
         std::fs::write(tmp.path().join("bun.lock"), V1_WORKSPACE_LOCK).unwrap();
 
         seed_entry(tmp.path(), NPM, UUID);
-        let preview = preview_vendor_json(tmp.path(), &[sel(UUID, NPM)]).await;
+        let preview = preview_vendor_json(tmp.path(), &[sel(UUID, NPM)], &HashMap::new()).await;
         assert_eq!(
             action_of(&preview, NPM)["action"],
             "would_refuse",
@@ -1405,7 +1433,7 @@ mod preview_tests {
         );
 
         seed_entry(tmp.path(), NPM, OLD_UUID);
-        let preview = preview_vendor_json(tmp.path(), &[sel(UUID, NPM)]).await;
+        let preview = preview_vendor_json(tmp.path(), &[sel(UUID, NPM)], &HashMap::new()).await;
         let rec = action_of(&preview, NPM);
         assert_eq!(rec["action"], "would_refuse", "{preview}");
         assert!(
@@ -1419,7 +1447,7 @@ mod preview_tests {
         );
         std::fs::write(tmp.path().join("bun.lock"), wired).unwrap();
         seed_entry(tmp.path(), NPM, UUID);
-        let preview = preview_vendor_json(tmp.path(), &[sel(UUID, NPM)]).await;
+        let preview = preview_vendor_json(tmp.path(), &[sel(UUID, NPM)], &HashMap::new()).await;
         assert_eq!(
             action_of(&preview, NPM)["action"],
             "already_vendored",
@@ -1429,10 +1457,27 @@ mod preview_tests {
 
     /// Malformed bun.lockb: `would_refuse` with the binary format code.
     #[tokio::test]
+    async fn preview_marks_a_refused_takeover_would_refuse() {
+        const GEM: &str = "pkg:gem/rails@7.0.0";
+        let tmp = tempfile::tempdir().unwrap();
+        let refusals = HashMap::from([(
+            GEM.to_string(),
+            ("gemfile_declaration_not_editable", "indented".to_string()),
+        )]);
+        let preview =
+            preview_vendor_json(tmp.path(), &[sel(UUID, GEM), sel(UUID, NPM)], &refusals).await;
+        let gem = action_of(&preview, GEM);
+        assert_eq!(gem["action"], "would_refuse", "{preview}");
+        assert_eq!(gem["errorCode"], "gemfile_declaration_not_editable");
+        assert_eq!(gem["error"], "indented");
+        assert_eq!(action_of(&preview, NPM)["action"], "would_vendor");
+    }
+
+    #[tokio::test]
     async fn preview_marks_malformed_lockb_would_refuse() {
         let tmp = tempfile::tempdir().unwrap();
         std::fs::write(tmp.path().join("bun.lockb"), b"\x00binary").unwrap();
-        let preview = preview_vendor_json(tmp.path(), &[sel(UUID, NPM)]).await;
+        let preview = preview_vendor_json(tmp.path(), &[sel(UUID, NPM)], &HashMap::new()).await;
         assert_eq!(
             action_of(&preview, NPM)["errorCode"],
             "vendor_bun_lockb_invalid",

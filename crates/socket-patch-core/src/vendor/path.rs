@@ -70,43 +70,46 @@ pub fn vendor_uuid_dir_rel(eco: &str, uuid: &str) -> Option<String> {
     Some(format!("{VENDOR_DIR}/{eco}/{uuid}"))
 }
 
-/// The first of `.socket/vendor`, `.socket/vendor/<eco>` and
+/// The outermost of `.socket`, `.socket/vendor`, `.socket/vendor/<eco>` and
 /// `.socket/vendor/<eco>/<uuid>` under `project_root` that is a symlink (or
 /// a Windows junction), project-relative and forward-slashed; `None` when
 /// none is. The `<eco>` level is only checked for a known ecosystem dir
 /// (`jvm` counts as `maven`, which also checks the JVM repository trees
-/// `.socket/vendor/maven2` and `.socket/vendor/gradle`) and the `<uuid>` level only for a canonical
-/// uuid.
+/// `.socket/vendor/maven2` and `.socket/vendor/gradle`) and the `<uuid>`
+/// level only for a canonical uuid.
 ///
 /// Vendor staging creates these dirs itself and never writes symlinks, so a
 /// linked level is never ours: its target may be another project's vendor
-/// store (two projects sharing one `.socket/vendor/npm`). Writing a unit
-/// through it, or deleting one, reaches that other project. Every vendor
-/// and revert dispatch refuses on this before touching anything, as
-/// [`sweep_vendor_dirs`] already skips a linked eco or uuid dir.
+/// store (two projects sharing one `.socket/vendor/npm`, #664) or another
+/// project's whole `.socket` (#887). Writing a unit through it, or deleting
+/// one, reaches that other project. Every vendor and revert dispatch
+/// refuses on this before touching anything, as [`sweep_vendor_dirs`]
+/// already skips a linked eco or uuid dir. The check itself is
+/// [`containment::linked_level`](crate::utils::containment::linked_level).
 pub fn vendor_dir_symlink(project_root: &Path, eco: &str, uuid: Option<&str>) -> Option<String> {
     // A `jvm` ledger entry is reverted by the maven backend, and every
     // maven-family entry may own files in the JVM repository trees
     // (`.socket/vendor/maven2`, `.socket/vendor/gradle`) as well as a
     // `maven/<uuid>` unit.
     let eco = if eco == "jvm" { "maven" } else { eco };
-    let mut levels = vec![VENDOR_DIR.to_string()];
+    let mut deepest = VENDOR_DIR.to_string();
+    let mut trees: Vec<String> = Vec::new();
     if ECOSYSTEM_DIRS.contains(&eco) {
-        levels.push(format!("{VENDOR_DIR}/{eco}"));
-        if let Some(rel) = uuid.and_then(|u| vendor_uuid_dir_rel(eco, u)) {
-            levels.push(rel);
-        }
+        deepest = uuid
+            .and_then(|u| vendor_uuid_dir_rel(eco, u))
+            .unwrap_or_else(|| format!("{VENDOR_DIR}/{eco}"));
         if eco == "maven" {
-            levels.extend(
+            trees.extend(
                 super::jvm::apply::VENDOR_TREES
                     .iter()
                     .map(|t| t.to_string()),
             );
         }
     }
-    levels.into_iter().find(|rel| {
-        std::fs::symlink_metadata(project_root.join(rel))
-            .is_ok_and(|meta| meta.file_type().is_symlink())
+    std::iter::once(deepest).chain(trees).find_map(|rel| {
+        let link = crate::utils::containment::linked_level(project_root, &project_root.join(rel))?;
+        let rel = link.strip_prefix(project_root).ok()?;
+        Some(rel.to_string_lossy().replace('\\', "/"))
     })
 }
 
@@ -137,6 +140,16 @@ pub struct VendorPathParts {
 /// This is the documented external-tool recovery rule; `None` means the
 /// string is not a Socket-vendored path.
 pub fn parse_vendor_path(s: &str) -> Option<VendorPathParts> {
+    parse_vendor_reference(s).filter(|parts| !parts.leaf.is_empty())
+}
+
+/// [`parse_vendor_path`]'s grammar, also accepting a reference to the uuid
+/// directory itself (`leaf` empty): NuGet's vendored feed
+/// (`value=".socket/vendor/nuget/<uuid>"`) and Maven's vendored repository
+/// (`<url>file://${project.basedir}/.socket/vendor/maven/<uuid></url>`)
+/// name the unit, not a file inside it. The vendored-reference scan reads
+/// wiring through this, so a directory-wired unit counts as still wired.
+pub fn parse_vendor_reference(s: &str) -> Option<VendorPathParts> {
     let norm = s.replace('\\', "/");
     let norm = norm.strip_prefix("file:").unwrap_or(&norm);
     let norm = norm.strip_prefix("./").unwrap_or(norm);
@@ -152,8 +165,8 @@ pub fn parse_vendor_path(s: &str) -> Option<VendorPathParts> {
     let mut it = rest.splitn(3, '/');
     let eco = it.next()?;
     let uuid = it.next()?;
-    let leaf = it.next()?.trim_end_matches('/');
-    if !ECOSYSTEM_DIRS.contains(&eco) || !is_canonical_uuid(uuid) || leaf.is_empty() {
+    let leaf = it.next().unwrap_or("").trim_end_matches('/');
+    if !ECOSYSTEM_DIRS.contains(&eco) || !is_canonical_uuid(uuid) {
         return None;
     }
     Some(VendorPathParts {
@@ -636,6 +649,32 @@ mod tests {
         assert!(parse_vendor_path(&format!("x.socket/vendor/npm/{UUID}/y.tgz")).is_none());
     }
 
+    /// `parse_vendor_reference` is `parse_vendor_path`'s grammar plus the
+    /// bare uuid dir (NuGet's feed, Maven's repository); `parse_vendor_path`
+    /// itself still needs a leaf.
+    #[test]
+    fn parse_vendor_reference_accepts_the_uuid_dir_itself() {
+        for s in [
+            format!(".socket/vendor/nuget/{UUID}"),
+            format!(".socket/vendor/nuget/{UUID}/"),
+            format!(".socket\\vendor\\nuget\\{UUID}"),
+            format!("file://${{project.basedir}}/.socket/vendor/nuget/{UUID}"),
+        ] {
+            let p = parse_vendor_reference(&s).unwrap_or_else(|| panic!("{s}"));
+            assert_eq!(
+                (p.eco.as_str(), p.uuid.as_str(), p.leaf.as_str()),
+                ("nuget", UUID, "")
+            );
+            assert!(parse_vendor_path(&s).is_none(), "{s}");
+        }
+        let p = parse_vendor_reference(&format!(".socket/vendor/npm/{UUID}/a/b.tgz")).unwrap();
+        assert_eq!(p.leaf, "a/b.tgz");
+        assert!(parse_vendor_reference(".socket/vendor/nuget").is_none());
+        assert!(parse_vendor_reference(".socket/vendor/nuget/not-a-uuid").is_none());
+        assert!(parse_vendor_reference(&format!(".socket/vendor/maven2/{UUID}")).is_none());
+        assert!(parse_vendor_reference(&format!("x.socket/vendor/nuget/{UUID}")).is_none());
+    }
+
     /// The re-vendor carry-forward matches wiring keys ACROSS a patch-uuid
     /// change when the key embeds the vendored path (berry's `file:` locator
     /// key), and only byte-equal otherwise.
@@ -1055,6 +1094,21 @@ mod tests {
             vendor_dir_symlink(&vendor, "jvm", None).as_deref(),
             Some(".socket/vendor")
         );
+
+        // #887: `.socket` itself shared with another project. Every
+        // ecosystem (known or not, with or without a uuid) reports it.
+        let shared = tmp.path().join("shared-socket");
+        std::fs::create_dir_all(shared.join("vendor/npm").join(UUID)).unwrap();
+        let linked = tmp.path().join("linked");
+        std::fs::create_dir_all(&linked).unwrap();
+        symlink(&shared, linked.join(".socket")).unwrap();
+        for (eco, uuid) in [("npm", Some(UUID)), ("jvm", None), ("nope", None)] {
+            assert_eq!(
+                vendor_dir_symlink(&linked, eco, uuid).as_deref(),
+                Some(".socket"),
+                "{eco}"
+            );
+        }
     }
 
     /// #664: a linked `.socket/vendor` makes every eco dir below it lstat

@@ -56,7 +56,10 @@ async fn rollback_hosted(cwd: &Path, server: &MockServer) -> i32 {
         })))
         .mount(server)
         .await;
-    std::env::set_var("SOCKET_NPM_REGISTRY", format!("{}/npm-registry", server.uri()));
+    std::env::set_var(
+        "SOCKET_NPM_REGISTRY",
+        format!("{}/npm-registry", server.uri()),
+    );
     let code = rollback::run(RollbackArgs {
         targets: Vec::new(),
         common: socket_patch_cli::args::GlobalArgs {
@@ -402,6 +405,78 @@ async fn hosted_trust_edit_reads_the_workspace_yaml_shape() {
             want.unwrap_or(user_ws),
             "workspace file for {user_ws:?}"
         );
+    }
+}
+
+/// #903 / #904: a `pnpm-lock.yaml` and `pnpm-workspace.yaml` saved with a
+/// UTF-8 BOM read like their plain twins. The BOM lock gets the
+/// `trustLockfile: true` auto-config (it used to read as unversioned and
+/// skip it), `rollback` unwinds the pin it just wrote (it used to refuse the
+/// lock as "not a pnpm lockfile") byte-exact, BOM included, and a BOM first
+/// `trustLockfile: false` key is the user's explicit opt-out, not a missing
+/// key a duplicate is appended after.
+#[tokio::test]
+#[serial]
+async fn hosted_bom_lock_and_workspace_read_like_their_plain_twins() {
+    let server = MockServer::start().await;
+    mock_discovery(&server).await;
+    mock_reference(&server).await;
+
+    // A BOM lock, no workspace file: the trust scaffold is created and the
+    // rollback restores the lock byte for byte.
+    let tmp = tempfile::tempdir().unwrap();
+    write_pnpm_project(tmp.path());
+    let lock_path = tmp.path().join("pnpm-lock.yaml");
+    let pristine = format!("\u{feff}{}", std::fs::read_to_string(&lock_path).unwrap());
+    std::fs::write(&lock_path, &pristine).unwrap();
+
+    let code = run(hosted_args(tmp.path(), server.uri())).await;
+    assert_eq!(code, 0, "scan --mode hosted should succeed on a BOM lock");
+    let lock = std::fs::read_to_string(&lock_path).unwrap();
+    assert!(lock.starts_with("\u{feff}lockfileVersion:"), "{lock}");
+    assert!(lock.contains(HOSTED_URL), "the BOM lock is redirected: {lock}");
+    let ws_path = tmp.path().join("pnpm-workspace.yaml");
+    assert_eq!(
+        std::fs::read_to_string(&ws_path).ok().as_deref(),
+        Some("packages:\n  - '.'\ntrustLockfile: true\n"),
+        "a BOM v9 lock gets the trustLockfile auto-config"
+    );
+
+    let code = rollback_hosted(tmp.path(), &server).await;
+    assert_eq!(code, 0, "rollback must unwind the pin on a BOM lock");
+    assert_eq!(
+        std::fs::read_to_string(&lock_path).unwrap(),
+        pristine,
+        "rollback restores the BOM lock byte for byte"
+    );
+    assert!(!ws_path.exists(), "the auto-created workspace file goes too");
+
+    // A BOM workspace file whose first key is the user's opt-out: left
+    // byte-identical (no duplicate `trustLockfile`), lock still redirected.
+    // One whose first key is something else gains the key once, BOM kept.
+    for (user_ws, want) in [
+        ("\u{feff}trustLockfile: false\npackages:\n  - '.'\n", None),
+        ("\u{feff}trustLockfile: true\npackages:\n  - '.'\n", None),
+        (
+            "\u{feff}packages:\n  - '.'\n",
+            Some("\u{feff}packages:\n  - '.'\ntrustLockfile: true\n"),
+        ),
+    ] {
+        let tmp = tempfile::tempdir().unwrap();
+        write_pnpm_project(tmp.path());
+        std::fs::write(tmp.path().join("pnpm-workspace.yaml"), user_ws).unwrap();
+
+        let code = run(hosted_args(tmp.path(), server.uri())).await;
+        assert_eq!(code, 0, "scan --mode hosted should succeed for {user_ws:?}");
+        assert!(
+            std::fs::read_to_string(tmp.path().join("pnpm-lock.yaml"))
+                .unwrap()
+                .contains(HOSTED_URL),
+            "the lock is still redirected for {user_ws:?}"
+        );
+        let ws = std::fs::read_to_string(tmp.path().join("pnpm-workspace.yaml")).unwrap();
+        assert_eq!(ws, want.unwrap_or(user_ws), "workspace file for {user_ws:?}");
+        assert_eq!(ws.matches("trustLockfile").count(), 1, "{ws:?}");
     }
 }
 
@@ -805,7 +880,11 @@ async fn hosted_pnpm_manifestless_vex_from_lockfile_legacy_ledger_and_api() {
                         ..VexRun::offline()
                     },
                 );
-                assert_eq!(out.code, Some(0), "[{lock_name}] legacy ledger, offline: {out}");
+                assert_eq!(
+                    out.code,
+                    Some(0),
+                    "[{lock_name}] legacy ledger, offline: {out}"
+                );
                 assert_attested(out.doc(), PURL, UUID, Marker::Redirected, vulns);
                 assert_eq!(api.request_count(), seen);
 
@@ -1559,6 +1638,111 @@ async fn hosted_scan_from_package_json_workspace_member_refuses() {
             &lock,
             &before,
             &member,
+        );
+    }
+}
+
+/// A workspace member `packages/a` holding the patched package, under a
+/// root whose `manifest` (`package.json` or `vlt.json`) declares
+/// `workspaces` and whose lock is `lock_name`.
+fn write_workspace_member(
+    root: &Path,
+    manifest: &str,
+    manifest_text: &str,
+    lock_name: &str,
+) -> std::path::PathBuf {
+    std::fs::write(root.join(manifest), manifest_text).unwrap();
+    if manifest != "package.json" {
+        std::fs::write(
+            root.join("package.json"),
+            r#"{ "name": "root", "private": true }"#,
+        )
+        .unwrap();
+    }
+    std::fs::write(root.join(lock_name), format!("# root lock {lock_name}\n")).unwrap();
+    let member = root.join("packages/a");
+    let pkg = member.join("node_modules").join(NAME);
+    std::fs::create_dir_all(&pkg).unwrap();
+    std::fs::write(
+        member.join("package.json"),
+        format!(
+            r#"{{ "name": "a", "version": "1.0.0", "dependencies": {{ "{NAME}": "{VERSION}" }} }}"#
+        ),
+    )
+    .unwrap();
+    std::fs::write(
+        pkg.join("package.json"),
+        format!(r#"{{ "name": "{NAME}", "version": "{VERSION}" }}"#),
+    )
+    .unwrap();
+    member
+}
+
+/// #1071: npm, yarn and Bun resolve `workspaces` with full glob syntax, so
+/// a root listing `packages/{a,b}` or `packages/[a-c]` governs
+/// `packages/a`. The member matcher compared `{` and `[` literally, so a
+/// hosted run from the member pinned nothing and exited 0.
+#[tokio::test]
+#[serial]
+async fn hosted_scan_from_brace_or_class_glob_workspace_member_refuses() {
+    let server = MockServer::start().await;
+    mock_discovery(&server).await;
+    mock_reference(&server).await;
+    mock_view(&server).await;
+    for pattern in [
+        "packages/{a,b}",
+        "packages/[a-c]",
+        "{apps,packages}/*",
+        "packages/[!b]",
+    ] {
+        let tmp = tempfile::tempdir().unwrap();
+        let member = write_workspace_member(
+            tmp.path(),
+            "package.json",
+            &format!(r#"{{ "name": "root", "private": true, "workspaces": ["{pattern}"] }}"#),
+            "package-lock.json",
+        );
+        let lock = tmp.path().join("package-lock.json");
+        let before = std::fs::read_to_string(&lock).unwrap();
+        let (code, doc) = run_hosted_json(&member, &server.uri());
+        assert_refused_workspace_lock_elsewhere(pattern, code, &doc, &lock, &before, &member);
+    }
+}
+
+/// #942: vlt reads its workspaces from `vlt.json` and keeps one
+/// `vlt-lock.json` at that root, so a hosted run from a member found the
+/// member's copy, read no lock, pinned nothing and exited 0. It now
+/// refuses and names the vlt workspace root, for every `workspaces` shape
+/// vlt accepts (a string, an array, an object of groups).
+#[tokio::test]
+#[serial]
+async fn hosted_scan_from_vlt_workspace_member_refuses() {
+    let server = MockServer::start().await;
+    mock_discovery(&server).await;
+    mock_reference(&server).await;
+    mock_view(&server).await;
+    for workspaces in [
+        r#""packages/*""#,
+        r#"["packages/*"]"#,
+        r#"{ "apps": "apps/*", "libs": ["packages/{a,b}"] }"#,
+    ] {
+        let tmp = tempfile::tempdir().unwrap();
+        let member = write_workspace_member(
+            tmp.path(),
+            "vlt.json",
+            &format!(r#"{{ "workspaces": {workspaces} }}"#),
+            "vlt-lock.json",
+        );
+        let lock = tmp.path().join("vlt-lock.json");
+        let before = std::fs::read_to_string(&lock).unwrap();
+        let (code, doc) = run_hosted_json(&member, &server.uri());
+        assert_refused_workspace_lock_elsewhere(workspaces, code, &doc, &lock, &before, &member);
+        assert!(
+            doc["error"]
+                .as_str()
+                .unwrap_or_default()
+                .contains("vlt.json"),
+            "{workspaces}: the error names vlt.json: {doc}"
         );
     }
 }

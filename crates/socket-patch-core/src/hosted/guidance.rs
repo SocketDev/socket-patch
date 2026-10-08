@@ -173,9 +173,7 @@ pub fn pnpm_lock_carries_hosted_redirect(
 pub fn npm_lock_url_needles(artifact_url: &str) -> Vec<String> {
     let mut needles: Vec<String> =
         crate::patch::redirect::artifact_url_spellings(artifact_url).into();
-    needles.push(crate::utils::uri::encode_uri_component(
-        artifact_url,
-    ));
+    needles.push(crate::utils::uri::encode_uri_component(artifact_url));
     needles
 }
 
@@ -217,7 +215,7 @@ pub fn pnpm_trust_configured_detail(server: &str, created: bool, dry_run: bool) 
 
 // The pnpm lock-version sniffs live with the format's model.
 pub use crate::formats::pnpm::{
-    lock_version_major as pnpm_lock_version_major,
+    is_shrinkwrap_lock as pnpm_is_shrinkwrap_lock, lock_version_major as pnpm_lock_version_major,
     may_need_store_flag as pnpm_lock_may_need_store_flag,
 };
 
@@ -310,11 +308,7 @@ fn npm_allow_remote_preamble(hosts: &[&str]) -> String {
 
 /// The auto-config variant: `allow-remote=all` was (or, on `--dry-run`,
 /// would be) written to the project `.npmrc`, so installs need no flags.
-pub fn npm_allow_remote_configured_detail(
-    hosts: &[&str],
-    created: bool,
-    dry_run: bool,
-) -> String {
+pub fn npm_allow_remote_configured_detail(hosts: &[&str], created: bool, dry_run: bool) -> String {
     let how = match (created, dry_run) {
         (true, false) => "`allow-remote=all` was written to a new",
         (false, false) => "`allow-remote=all` was appended to the existing",
@@ -430,4 +424,30 @@ pub fn read_npmrc_for_allow_remote(path: &std::path::Path) -> Result<Option<Stri
     crate::utils::fs::read_regular_to_string_sync(path)
         .map(Some)
         .map_err(|e| format!("could not be read ({e})"))
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    /// #904 (hosted): a BOM-prefixed `trustLockfile:` first line is the
+    /// user's explicit setting — kept, never shadowed by an appended
+    /// duplicate key — and a BOM file that needs the key keeps its BOM.
+    #[test]
+    fn workspace_trust_plan_reads_a_bom_first_key() {
+        match plan_workspace_trust(Some("\u{feff}trustLockfile: false\npackages:\n  - .\n")) {
+            TrustPlan::UserSet(value) => assert_eq!(value, "false"),
+            _ => panic!("expected UserSet(false)"),
+        }
+        assert!(matches!(
+            plan_workspace_trust(Some("\u{feff}trustLockfile: true\npackages:\n  - .\n")),
+            TrustPlan::AlreadyTrue
+        ));
+        match plan_workspace_trust(Some("\u{feff}packages:\n  - .\n")) {
+            TrustPlan::Append(text) => {
+                assert_eq!(text, "\u{feff}packages:\n  - .\ntrustLockfile: true\n")
+            }
+            _ => panic!("expected Append"),
+        }
+    }
 }

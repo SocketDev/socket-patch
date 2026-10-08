@@ -20,7 +20,7 @@
 //! A block `name@range[, name@range2]:` with `version "X"` and
 //! `resolved "<spec>"`. The package is the REAL name of the key patterns
 //! (`alias@npm:real@range` names `real` —
-//! [`crate::vendor::yarn_classic_lock::pattern_real_name`]); every pattern
+//! [`crate::formats::yarn::patterns::pattern_real_name`]); every pattern
 //! must agree, otherwise a Socket-wired block is diagnosed (the rewriters
 //! refuse mixed keys). `link:` keys are skipped: yarn installs them from the
 //! working tree, never from `resolved`.
@@ -89,16 +89,18 @@ use super::{
     DiscoverCtx, Discovery, LocateOpts, PatchedRef, VendorRef, Wired, DIAG_LOCKFILE_UNPARSEABLE,
     DIAG_REF_INVALID, DIAG_REF_UNATTRIBUTABLE,
 };
-use crate::patch::redirect::is_berry_lock;
+use crate::formats::yarn::blocks::{berry_field, classic_field};
+use crate::formats::yarn::patterns::{
+    classic_key_real_name, pattern_real_name, resolution_selector_target, split_resolved_sha1,
+    BerryLocator,
+};
+use crate::formats::yarn::source::{classic_copy_source, CopySource};
+use crate::formats::yarn::is_berry_lock;
 use crate::utils::digest::is_sri_pin;
 use crate::vendor::lock_inventory::yarn::{
     berry_checksum_pin, berry_entries, classic_entries, BerryLock, YarnEntry,
 };
 use crate::vendor::lock_inventory::LockIntegrity;
-use crate::vendor::yarn_berry_lock::{berry_field, resolution_selector_target, BerryLocator};
-use crate::vendor::yarn_classic_lock::{
-    classic_block_source, classic_field, pattern_real_name, split_resolved_sha1, ClassicBlockSource,
-};
 
 const YARN_LOCK: &str = "yarn.lock";
 const PACKAGE_JSON: &str = "package.json";
@@ -138,69 +140,40 @@ fn stray_top_level_line(text: &str) -> Option<&str> {
 // ── classic ──────────────────────────────────────────────────────────────
 
 fn extract_classic(ctx: &DiscoverCtx<'_>, entries: Vec<YarnEntry>, out: &mut Discovery) {
-    // (purl, key, how it installs) of every live block the lock rewrite
-    // can't repoint — fetched with git, or a `file:` directory yarn copies
-    // (#921): that copy keeps its own bytes, so no wiring of the same
-    // package in this lock is attested.
-    let mut unpatched_copies: Vec<(String, String, &'static str)> = Vec::new();
     for entry in entries {
         if entry.live && !entry.patterns.is_empty() {
-            classic_block(ctx, &entry, &mut unpatched_copies, out);
-        }
-    }
-    if unpatched_copies.is_empty() {
-        return;
-    }
-    let refs = std::mem::take(&mut out.refs);
-    for r in refs {
-        let copy = (r.source_file == std::path::Path::new(YARN_LOCK))
-            .then(|| unpatched_copies.iter().find(|(purl, ..)| *purl == r.purl))
-            .flatten();
-        match copy {
-            Some((_, key, how)) => out.diag(
-                DIAG_REF_UNATTRIBUTABLE,
-                YARN_LOCK,
-                format!(
-                    "{YARN_LOCK}: {} is wired to a Socket patch but lock entry `{key}` \
-                     {how}; that copy stays UNPATCHED and nothing is attested",
-                    r.purl
-                ),
-            ),
-            None => out.refs.push(r),
+            classic_block(ctx, &entry, out);
         }
     }
 }
 
 /// The purl a block stands for when every key pattern names one package.
 fn classic_block_purl(entry: &YarnEntry) -> Option<String> {
-    let patterns = &entry.patterns;
     match (
-        patterns.first().and_then(|p| pattern_real_name(p)),
+        classic_key_real_name(&entry.patterns),
         classic_field(&entry.block.lines, "version"),
     ) {
-        (Some(name), Some(version))
-            if patterns.iter().all(|p| pattern_real_name(p) == Some(name)) =>
-        {
-            npm_purl(name, version)
-        }
+        (Some(name), Some(version)) => npm_purl(name, version),
         _ => None,
     }
 }
 
-fn classic_block(
-    ctx: &DiscoverCtx<'_>,
-    entry: &YarnEntry,
-    unpatched_copies: &mut Vec<(String, String, &'static str)>,
-    out: &mut Discovery,
-) {
+/// Classify one live classic block. A block of a package that yarn
+/// installs from anything but a Socket wiring — git (#363), a `file:`
+/// directory (#921) or a registry / url tarball (#938) — is an unpatched
+/// copy of that `name@version` ([`Discovery::unpatched_copy`]): yarn 1
+/// installs ONE copy per `name@version`, and which block it takes depends
+/// on which pattern it resolves first, so no wiring of the same version in
+/// this lock is attested beside it.
+fn classic_block(ctx: &DiscoverCtx<'_>, entry: &YarnEntry, out: &mut Discovery) {
     let YarnEntry {
         block, patterns, ..
     } = entry;
     let resolved = classic_field(&block.lines, "resolved");
-    match classic_block_source(patterns, resolved) {
+    match classic_copy_source(patterns, resolved) {
         // yarn 1 fetches a git pattern with git, from `resolved` (#363): the
         // copy is the git bytes, whatever `resolved` names.
-        ClassicBlockSource::Git => {
+        CopySource::Git => {
             // A Socket wiring here (an older release rewired it) is inert.
             if resolved.is_some_and(|r| classify(ctx, r, YARN_LOCK, &block.key, out).is_some()) {
                 out.diag(
@@ -214,34 +187,31 @@ fn classic_block(
                     ),
                 );
             }
-            if let Some(purl) = classic_block_purl(entry) {
-                out.resolved_elsewhere(YARN_LOCK, Some(purl.clone()));
-                unpatched_copies.push((
-                    purl,
-                    block.key.clone(),
-                    "installs from git, which yarn fetches from the git source rather than \
-                     a tarball",
-                ));
-            }
+            out.unpatched_copy(
+                YARN_LOCK,
+                classic_block_purl(entry),
+                &block.key,
+                "installs from git, which yarn fetches from the git source rather than a tarball",
+            );
             return;
         }
         // yarn 1 copies a `file:` directory into node_modules (#921): that
         // copy is the directory's bytes, and no `resolved` there is fetched.
-        ClassicBlockSource::Directory => {
-            if let Some(purl) = classic_block_purl(entry) {
-                out.resolved_elsewhere(YARN_LOCK, Some(purl.clone()));
-                unpatched_copies.push((
-                    purl,
-                    block.key.clone(),
-                    "installs from a file: directory, which yarn copies into node_modules \
-                     rather than fetching a tarball",
-                ));
-            }
+        CopySource::Directory => {
+            out.unpatched_copy(
+                YARN_LOCK,
+                classic_block_purl(entry),
+                &block.key,
+                "installs from a file: directory, which yarn copies into node_modules \
+                 rather than fetching a tarball",
+            );
             return;
         }
         // `link:` ranges install from the working tree; `resolved` is inert.
-        ClassicBlockSource::Link | ClassicBlockSource::Unresolved => return,
-        ClassicBlockSource::Tarball => {}
+        CopySource::Link | CopySource::Unresolved => return,
+        // A hosted pin an older release wrote on a remote tarball copy
+        // replaced it with the registry artifact, so that copy IS Socket's.
+        CopySource::Registry | CopySource::RemoteTarball => {}
     }
     let Some(resolved) = resolved else {
         return;
@@ -251,13 +221,23 @@ fn classic_block(
     let names: Vec<Option<&str>> = names.into_iter().collect();
     let Some(wiring) = classify(ctx, resolved, YARN_LOCK, &block.key, out) else {
         // Not Socket's (a rejected Socket spelling was diagnosed instead):
-        // evidence against another lock's wiring of the same package.
+        // an unpatched copy of the package, which contests a wiring of the
+        // same version in this lock and in any other.
         if let ([Some(name)], Some(version), false) = (
             names.as_slice(),
             classic_field(&block.lines, "version"),
             root_anchored_spelling(resolved),
         ) {
-            out.resolved_elsewhere(YARN_LOCK, npm_purl(name, version));
+            out.unpatched_copy(
+                YARN_LOCK,
+                npm_purl(name, version),
+                &block.key,
+                &format!(
+                    "installs it from {resolved:?}, not a Socket patch (yarn 1 \
+                     installs one copy per name@version, from whichever block it resolves \
+                     first)"
+                ),
+            );
         }
         return;
     };
@@ -319,6 +299,7 @@ struct BerryHostedKeyed {
 async fn extract_berry(ctx: &DiscoverCtx<'_>, lock: BerryLock, out: &mut Discovery) {
     let mut vendored: Vec<BerryVendored> = Vec::new();
     let mut hosted_keyed: Vec<BerryHostedKeyed> = Vec::new();
+    let mut copies: Vec<BerryCopy> = Vec::new();
     for entry in lock.entries.iter().filter(|e| e.live) {
         berry_block(
             ctx,
@@ -326,9 +307,11 @@ async fn extract_berry(ctx: &DiscoverCtx<'_>, lock: BerryLock, out: &mut Discove
             lock.cache_key.as_deref(),
             &mut vendored,
             &mut hosted_keyed,
+            &mut copies,
             out,
         );
     }
+    record_berry_copies(ctx, copies, out).await;
     confirm_berry_hosted_keyed(ctx, hosted_keyed, out).await;
     confirm_berry_vendored(ctx, vendored, out).await;
 }
@@ -406,6 +389,7 @@ fn berry_block(
     cache_key: Option<&str>,
     vendored: &mut Vec<BerryVendored>,
     hosted_keyed: &mut Vec<BerryHostedKeyed>,
+    copies: &mut Vec<BerryCopy>,
     out: &mut Discovery,
 ) {
     let block = &entry.block;
@@ -417,9 +401,20 @@ fn berry_block(
     // locator itself encodes (npm: locators only).
     let (spec, locator_version) = if let Some((version, _)) = locator.npm() {
         let Some(archive) = locator.archive_url() else {
-            // A plain registry entry.
+            // A plain registry entry: an unpatched copy, which contests a
+            // wiring of the same version in this lock (berry installs every
+            // locator the lock resolves, so a registry locator beside a
+            // hosted or vendored one of the same `name@version` — scoped
+            // `resolutions`, a workspace member added after the rewire —
+            // ships the registry bytes too) and in any other.
             let version = berry_field(&block.lines, "version").unwrap_or(version);
-            out.resolved_elsewhere(YARN_LOCK, npm_purl(name, version));
+            out.unpatched_copy(
+                YARN_LOCK,
+                npm_purl(name, version),
+                &block.key,
+                "installs it from the registry, not a Socket patch (yarn berry installs \
+                 every locator the lock resolves)",
+            );
             return;
         };
         (archive, Some(version))
@@ -432,7 +427,23 @@ fn berry_block(
         // A custom-registry `__archiveUrl`: the registry package.
         if let (Some(v), false) = (locator_version, root_anchored_spelling(spec)) {
             let version = berry_field(&block.lines, "version").unwrap_or(v);
-            out.resolved_elsewhere(YARN_LOCK, npm_purl(name, version));
+            out.unpatched_copy(
+                YARN_LOCK,
+                npm_purl(name, version),
+                &block.key,
+                &format!("installs it from {spec:?}, not a Socket patch"),
+            );
+        } else if locator_version.is_none() && !root_anchored_spelling(spec) {
+            // A user's `file:` / url copy: yarn keys it by the DEPENDENCY
+            // name (`lp2@file:…`), so which package it installs is read
+            // from the copy itself ([`record_berry_copies`], #939).
+            if let Some(version) = berry_field(&block.lines, "version") {
+                copies.push(BerryCopy {
+                    key: block.key.clone(),
+                    reference: reference.to_string(),
+                    version: version.to_string(),
+                });
+            }
         }
         return;
     };
@@ -713,6 +724,146 @@ fn emit(
             out.push(PatchedRef::vendored(purl, &vref, YARN_LOCK, integrity));
         }
     }
+}
+
+/// A berry lock entry that installs a user's `file:` tarball / directory or
+/// url tarball (not a Socket wiring), awaiting [`record_berry_copies`].
+struct BerryCopy {
+    key: String,
+    /// The locator's reference (`file:<path>[#…][::…]` or a url).
+    reference: String,
+    version: String,
+}
+
+/// Record each [`BerryCopy`] as an unpatched copy of the package it really
+/// installs (#939). yarn keys a `file:` / url dependency by the name the
+/// depender gave it, so `"lp2": "file:left-pad-1.3.0.tgz"` locks as `lp2@…`
+/// while `node_modules/lp2` IS left-pad@1.3.0, and no `resolutions` pin of
+/// `left-pad` reaches it. The real name comes from the copy itself: the
+/// registry tarball path of a url (`…/<name>/-/<name>-<version>.tgz`), the
+/// `package.json` inside a `file:` tarball, or a `file:` directory's
+/// `package.json`. A copy whose name cannot be read is left alone.
+async fn record_berry_copies(ctx: &DiscoverCtx<'_>, copies: Vec<BerryCopy>, out: &mut Discovery) {
+    for copy in copies {
+        let (name, how) = if let Some(path) = copy.reference.strip_prefix("file:") {
+            let path = path
+                .split(['#', ':'])
+                .next()
+                .unwrap_or_default()
+                .to_string();
+            let Some(rel) = berry_file_copy_path(&copy.reference, &path) else {
+                continue;
+            };
+            let name = if is_tarball_leaf(&rel) {
+                match ctx.read_advisory_bytes(&rel).await {
+                    Some(bytes) => {
+                        tokio::task::spawn_blocking(move || tarball_package_name(&bytes))
+                            .await
+                            .ok()
+                            .flatten()
+                    }
+                    None => None,
+                }
+            } else {
+                let manifest = if rel.is_empty() {
+                    PACKAGE_JSON.to_string()
+                } else {
+                    format!("{rel}/{PACKAGE_JSON}")
+                };
+                match ctx.read_advisory_text(&manifest).await {
+                    Some(text) => manifest_name(text.as_bytes()),
+                    None => None,
+                }
+            };
+            (name, format!("installs it from the user's file:{path}"))
+        } else {
+            let url = copy.reference.split(['#']).next().unwrap_or_default();
+            (
+                registry_tarball_name(url, &copy.version),
+                format!("installs it from {url:?}"),
+            )
+        };
+        let Some(name) = name else {
+            continue;
+        };
+        out.unpatched_copy(
+            YARN_LOCK,
+            npm_purl(&name, &copy.version),
+            &copy.key,
+            &format!(
+                "{how}, which no Socket wiring of {name} reaches (yarn keys it by the \
+                 dependency name)"
+            ),
+        );
+    }
+}
+
+/// The root-relative path a berry `file:` reference names: relative to the
+/// workspace in its `locator=` binding (`b@workspace:packages/b`), or to
+/// the root when it has none. `None` when it leaves the root.
+fn berry_file_copy_path(reference: &str, path: &str) -> Option<String> {
+    let workspace = reference
+        .split_once("::")
+        .and_then(|(_, bindings)| bindings.split('&').find_map(|b| b.strip_prefix("locator=")))
+        .map(crate::utils::purl::percent_decode_purl_component)
+        .and_then(|locator| {
+            locator
+                .split_once("@workspace:")
+                .map(|(_, ws)| ws.to_string())
+        })
+        .unwrap_or_default();
+    let workspace = if workspace == "." {
+        String::new()
+    } else {
+        workspace
+    };
+    crate::utils::cargo_workspace::normalize_rel(&workspace, path)
+}
+
+fn is_tarball_leaf(path: &str) -> bool {
+    path.ends_with(".tgz") || path.ends_with(".tar.gz")
+}
+
+/// `name` of a `package.json`.
+fn manifest_name(bytes: &[u8]) -> Option<String> {
+    let bytes = bytes.strip_prefix(b"\xef\xbb\xbf").unwrap_or(bytes);
+    serde_json::from_slice::<Value>(bytes)
+        .ok()?
+        .get("name")?
+        .as_str()
+        .map(str::to_string)
+}
+
+/// `name` of the `package.json` inside an npm tarball.
+fn tarball_package_name(bytes: &[u8]) -> Option<String> {
+    let map = crate::patch::package::read_archive_bytes_to_map(bytes).ok()?;
+    manifest_name(map.get(PACKAGE_JSON)?)
+}
+
+/// The package an npm registry tarball url serves, from its
+/// `/<name>/-/<leaf>-<version>.tgz` path (`<name>` may be `@scope/leaf`,
+/// its `@` / `/` possibly percent-encoded); `None` for any other shape.
+fn registry_tarball_name(url: &str, version: &str) -> Option<String> {
+    let path = url.split_once("://").map_or(url, |(_, rest)| rest);
+    let path = path.split(['?']).next()?;
+    let (before, file) = path.rsplit_once("/-/")?;
+    let mut segs: Vec<String> = before
+        .split('/')
+        .skip(1) // the host
+        .map(|seg| crate::utils::purl::percent_decode_purl_component(seg).into_owned())
+        .collect();
+    let leaf_name = segs.pop()?;
+    let (scope, leaf_name) = match leaf_name.split_once('/') {
+        Some((scope, leaf)) => (Some(scope.to_string()), leaf.to_string()),
+        None => (segs.pop().filter(|s| s.starts_with('@')), leaf_name),
+    };
+    if file != format!("{leaf_name}-{version}.tgz") {
+        return None;
+    }
+    Some(match scope {
+        Some(scope) => format!("{scope}/{leaf_name}"),
+        None => leaf_name,
+    })
 }
 
 #[cfg(test)]
@@ -1198,6 +1349,174 @@ mod tests {
             let out = run(&p).await;
             assert!(out.refs.is_empty(), "{case}: {:#?}", out.refs);
             assert!(out.diagnostics.is_empty(), "{case}: {:?}", out.diagnostics);
+        }
+    }
+
+    /// #938: a registry block of the wired name@version beside the Socket
+    /// block in the SAME yarn.lock (e.g. after `yarn add -W left-pad
+    /// --exact`): yarn 1 installs one copy per name@version, from whichever
+    /// block it resolves first, so the wiring is not attested and the
+    /// diagnostic names the registry block. Control: another version's
+    /// registry block does not contest it.
+    #[tokio::test]
+    async fn issue_938_classic_registry_block_of_the_same_version_contests_the_ref() {
+        let lp = hosted_url("npm", "left-pad", "1.3.0", UUID_A, "left-pad-1.3.0.tgz");
+        let wired = classic_block("left-pad@^1.3.0", "1.3.0", &lp, Some(SRI));
+        let registry = |version: &str| {
+            classic_block(
+                &format!("left-pad@{version}"),
+                version,
+                &format!("https://registry.yarnpkg.com/left-pad/-/left-pad-{version}.tgz#5b8a"),
+                Some("sha512-UPSTREAM=="),
+            )
+        };
+        let p = Project::new();
+        p.write("yarn.lock", classic(&[registry("1.3.0"), wired.clone()]));
+        let out = run(&p).await;
+        assert!(out.refs.is_empty(), "{:#?}", out.refs);
+        assert!(
+            out.diagnostics
+                .iter()
+                .any(|d| d.code == DIAG_REF_UNATTRIBUTABLE
+                    && d.detail.contains("left-pad@1.3.0")
+                    && d.detail.contains("registry.yarnpkg.com")),
+            "{:#?}",
+            out.diagnostics
+        );
+
+        let p = Project::new();
+        p.write("yarn.lock", classic(&[registry("1.2.0"), wired]));
+        assert_refs(
+            &run(&p).await,
+            &[("pkg:npm/left-pad@1.3.0", UUID_A, WiringMode::Hosted)],
+        );
+    }
+
+    /// #939: yarn berry keys a `file:` tarball / directory or url dependency
+    /// by the DEPENDENCY name (`lp2@file:…`), so a copy of the wired
+    /// left-pad@1.3.0 under another name escapes the `resolutions` pin and
+    /// installs unpatched. Its package is read from the copy itself (the
+    /// tarball's or directory's `package.json`, the registry url's path) and
+    /// it contests the wiring in the same lock. Control: a copy holding
+    /// another package is not one.
+    #[tokio::test]
+    async fn issue_939_berry_other_name_copy_contests_the_ref() {
+        let ws = "b%40workspace%3Apackages%2Fb";
+        let wired = berry_vendored_block("left-pad", "1.3.0", UUID_A);
+        let copies = [
+            (
+                "file: tarball",
+                berry_block(
+                    &format!("lp2@file:../../forks/left-pad-1.3.0.tgz::locator={ws}"),
+                    "1.3.0",
+                    &format!(
+                        "lp2@file:../../forks/left-pad-1.3.0.tgz#../../forks/left-pad-1.3.0.tgz\
+                         ::hash=5c8e4c&locator={ws}"
+                    ),
+                    None,
+                ),
+            ),
+            (
+                "file: directory",
+                berry_block(
+                    &format!("lp2@file:../../forks/left-pad::locator={ws}"),
+                    "1.3.0",
+                    &format!("lp2@file:../../forks/left-pad#../../forks/left-pad::hash=1a2b3c&locator={ws}"),
+                    None,
+                ),
+            ),
+            (
+                "registry tarball url",
+                berry_block(
+                    "lp2@https://registry.npmjs.org/left-pad/-/left-pad-1.3.0.tgz",
+                    "1.3.0",
+                    "lp2@https://registry.npmjs.org/left-pad/-/left-pad-1.3.0.tgz",
+                    None,
+                ),
+            ),
+        ];
+        let project = |blocks: &[String], fork: &str| {
+            let p = Project::new();
+            p.write("yarn.lock", berry(blocks));
+            p.write(
+                "package.json",
+                package_json_with_resolutions(serde_json::json!({
+                    "left-pad": format!("file:./.socket/vendor/npm/{UUID_A}/left-pad-1.3.0.tgz"),
+                })),
+            );
+            p.write("forks/left-pad-1.3.0.tgz", npm_tgz(fork, "1.3.0"));
+            p.write(
+                "forks/left-pad/package.json",
+                format!(r#"{{"name":"{fork}","version":"1.3.0"}}"#),
+            );
+            p
+        };
+        assert_refs(
+            &run(&project(std::slice::from_ref(&wired), "left-pad")).await,
+            &[("pkg:npm/left-pad@1.3.0", UUID_A, WiringMode::Vendored)],
+        );
+        for (case, copy) in &copies {
+            let out = run(&project(&[wired.clone(), copy.clone()], "left-pad")).await;
+            assert!(out.refs.is_empty(), "{case}: {:#?}", out.refs);
+            assert!(
+                out.diagnostics
+                    .iter()
+                    .any(|d| d.code == DIAG_REF_UNATTRIBUTABLE
+                        && d.detail.contains("lp2@")
+                        && d.detail.contains("UNPATCHED")),
+                "{case}: {:#?}",
+                out.diagnostics
+            );
+        }
+        // The `file:` copies hold another package: not a copy of left-pad.
+        for (case, copy) in &copies[..2] {
+            let out = run(&project(&[wired.clone(), copy.clone()], "other-pkg")).await;
+            assert_refs(
+                &out,
+                &[("pkg:npm/left-pad@1.3.0", UUID_A, WiringMode::Vendored)],
+            );
+            assert!(out.refs.len() == 1, "{case}");
+        }
+    }
+
+    /// A berry registry locator beside a hosted one of the same
+    /// `name@version` (scoped `resolutions`, or a workspace member added
+    /// after the rewire, then `yarn install`) installs the registry bytes
+    /// too, so the hosted ref is contested in the same lock — the rule
+    /// `vex`'s yarn PnP loader check relies on, since a loader that names
+    /// both locators still names the patch (#1033 review). A registry
+    /// locator of another version contests nothing.
+    #[tokio::test]
+    async fn berry_registry_locator_beside_a_hosted_one_contests_it() {
+        let url = hosted_url("npm", "left-pad", "1.3.0", UUID_A, "left-pad-1.3.0.tgz");
+        let hosted = berry_block(
+            "left-pad@npm:1.3.0",
+            "1.3.0",
+            &format!("left-pad@npm:1.3.0::__archiveUrl={}", archive(&url)),
+            Some("10c0/aaaa"),
+        );
+        for (version, contested) in [("1.3.0", true), ("1.2.0", false)] {
+            let registry = berry_block(
+                &format!("left-pad@npm:^{version}"),
+                version,
+                &format!("left-pad@npm:{version}"),
+                Some("10c0/bbbb"),
+            );
+            let p = Project::new();
+            p.write("yarn.lock", berry(&[hosted.clone(), registry]));
+            let out = run(&p).await;
+            assert_eq!(out.refs.is_empty(), contested, "{version}: {:#?}", out.refs);
+            if contested {
+                assert!(
+                    out.diagnostics
+                        .iter()
+                        .any(|d| d.code == DIAG_REF_UNATTRIBUTABLE
+                            && d.detail.contains("left-pad@npm:^1.3.0")
+                            && d.detail.contains("UNPATCHED")),
+                    "{:#?}",
+                    out.diagnostics
+                );
+            }
         }
     }
 

@@ -118,9 +118,9 @@ class VltCoverageMap(unittest.TestCase):
         compat = self.rows.jobs(
             (ROOT / ".github/workflows/vlt-compatibility.yml").read_text(encoding="utf-8"))
         ids = {f"ci:{r['suite']}:{r['os']}:{r['vlt']}"
-               for r in self.rows.matrix_include(ci["e2e"]) if "vlt" in r}
+               for r in self.rows.job_rows(ci, "e2e") if "vlt" in r}
         ids |= {f"compat:{r['os']}:{r['vlt']}"
-                for r in self.rows.matrix_include(compat["install-proof"])}
+                for r in self.rows.job_rows(compat, "install-proof")}
         return ids
 
     def test_every_code_is_mapped_and_documented(self):
