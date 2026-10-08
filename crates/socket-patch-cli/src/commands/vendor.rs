@@ -1663,6 +1663,12 @@ async fn run_eject(args: &VendorArgs, pins: Vec<HostedPin>) -> i32 {
     if !fetch_failures.is_empty() {
         let mut env = Envelope::new(Command::Vendor);
         env.dry_run = common.dry_run;
+        if common.json {
+            env.warnings
+                .extend(crate::commands::vex_sources::api_auth_fallback_warning(
+                    &client,
+                ));
+        }
         for (purl, detail) in &fetch_failures {
             report_vendor_failure(common, purl, detail);
             env.record(
@@ -1718,6 +1724,12 @@ async fn run_eject(args: &VendorArgs, pins: Vec<HostedPin>) -> i32 {
     if !refused.is_empty() {
         let mut env = Envelope::new(Command::Vendor);
         env.dry_run = common.dry_run;
+        if common.json {
+            env.warnings
+                .extend(crate::commands::vex_sources::api_auth_fallback_warning(
+                    &client,
+                ));
+        }
         for (purl, code, why) in &refused {
             report_vendor_failure(common, purl, why);
             env.record(
@@ -1741,6 +1753,12 @@ async fn run_eject(args: &VendorArgs, pins: Vec<HostedPin>) -> i32 {
     if common.dry_run {
         let mut env = Envelope::new(Command::Vendor);
         env.dry_run = true;
+        if common.json {
+            env.warnings
+                .extend(crate::commands::vex_sources::api_auth_fallback_warning(
+                    &client,
+                ));
+        }
         for pin in &pins {
             env.record(
                 PatchEvent::new(PatchAction::Applied, pin.purl.clone()).with_reason(
