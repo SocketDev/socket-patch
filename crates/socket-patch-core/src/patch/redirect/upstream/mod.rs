@@ -105,6 +105,21 @@ impl HostedPin {
         Self::all(&crate::vex::discover::discover_patched_refs_view(view, &opts).await)
     }
 
+    /// [`HostedPin::discover`] plus the discovery's LOCKLESS cargo/nuget
+    /// pins, which are never refs (so never a [`HostedPin`]) yet still pin
+    /// a uuid: the rollout's foreign-origin pass needs both, the same way
+    /// its recorded view counts both.
+    pub async fn discover_with_unlocked(
+        view: crate::vendor::lock_inventory::ProjectView<'_>,
+        origins: &[String],
+    ) -> (Vec<HostedPin>, Vec<crate::vex::UnlockedPin>) {
+        let opts = crate::vex::DiscoverOptions {
+            patch_server_origins: origins.to_vec(),
+        };
+        let discovery = crate::vex::discover::discover_patched_refs_view(view, &opts).await;
+        (Self::all(&discovery), discovery.unlocked_pins)
+    }
+
     /// `(name, version)` of the purl, percent-decoded.
     pub(crate) fn name_version(&self) -> Option<(String, String)> {
         let (_, name, version) = crate::utils::purl::purl_parts(&self.purl)?;

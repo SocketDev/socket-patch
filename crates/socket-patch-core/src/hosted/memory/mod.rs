@@ -849,12 +849,12 @@ async fn engine(
         if origins.is_empty() {
             continue;
         }
-        let pins = crate::patch::redirect::upstream::HostedPin::discover(
+        let (pins, unlocked) = crate::patch::redirect::upstream::HostedPin::discover_with_unlocked(
             ProjectView::Memory(&plan.project),
             &origins,
         )
         .await;
-        mark_pinned(&mut states[*index].rows, &pins);
+        mark_pinned(&mut states[*index].rows, &pins, &unlocked);
     }
     let wheels: BTreeSet<(String, String)> = planned
         .iter()

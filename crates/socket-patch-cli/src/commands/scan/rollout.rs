@@ -534,9 +534,56 @@ mod tests {
                 uuid: "aaaaaaaa-1111-4111-8111-00000000000a".into(),
                 files: vec!["package-lock.json".into()],
             }],
+            &[],
         );
         assert_eq!(rows[0].candidate.recorded, Recorded::Same);
         assert_eq!(rows[1].candidate.recorded, Recorded::None);
+    }
+
+    #[test]
+    fn a_discovered_lockless_pin_marks_the_row_pinned() {
+        // The foreign-origin pass also hands over discovery's lockless
+        // cargo/nuget pins (never refs): such a pin is ALREADY, not a NEW
+        // row spending a cap slot on every re-scan.
+        let results = vec![
+            offer(
+                "pkg:cargo/serde@1.0.200",
+                "bbbbbbbb-2222-4222-8222-bbbbbbbbbbbb",
+                "",
+                &["high"],
+            ),
+            offer(
+                "pkg:cargo/serde@2.0.0",
+                "bbbbbbbb-2222-4222-8222-bbbbbbbbbbbb",
+                "",
+                &["high"],
+            ),
+        ];
+        let offers = offers_from_results(&results, true);
+        let mut rows = classify(&offers, &RecordedIndex::default(), "");
+        mark_pinned(
+            &mut rows,
+            &[],
+            &[socket_patch_core::vex::UnlockedPin {
+                ecosystem: "cargo".into(),
+                name: "serde".into(),
+                uuid: "bbbbbbbb-2222-4222-8222-bbbbbbbbbbbb".into(),
+                file: "Cargo.toml".into(),
+                version_reqs: vec!["1".into()],
+                index_url: None,
+            }],
+        );
+        let by_purl = |purl: &str| {
+            &rows
+                .iter()
+                .find(|r| r.candidate.purl == purl)
+                .expect("row")
+                .candidate
+                .recorded
+        };
+        assert_eq!(*by_purl("pkg:cargo/serde@1.0.200"), Recorded::Same);
+        // A version outside the pin's requirement is not routed by it.
+        assert_eq!(*by_purl("pkg:cargo/serde@2.0.0"), Recorded::None);
     }
 
     #[test]
@@ -559,6 +606,7 @@ mod tests {
                 uuid: "AAAAAAAA-2222-4222-8222-00000000000A".into(),
                 files: vec!["package-lock.json".into()],
             }],
+            &[],
         );
         assert_eq!(
             rows[0].candidate.recorded,

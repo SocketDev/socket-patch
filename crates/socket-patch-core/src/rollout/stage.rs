@@ -275,14 +275,22 @@ pub fn lookup_incomplete(
 /// than kept ([`Recorded::Kept`]): what is written does not change, only
 /// that it spends no NEW slot.
 ///
+/// Lockless cargo/nuget pins (`unlocked`) count too, as they do in the
+/// recorded view: they are never refs, so `pins` alone would leave such a
+/// pin NEW on every re-scan.
+///
 /// [`HostedPin::discover`]: crate::patch::redirect::upstream::HostedPin::discover
 /// [`dep_origins`]: crate::patch::redirect::upstream::dep_origins
-pub fn mark_pinned(rows: &mut [Row], pins: &[crate::patch::redirect::upstream::HostedPin]) {
+pub fn mark_pinned(
+    rows: &mut [Row],
+    pins: &[crate::patch::redirect::upstream::HostedPin],
+    unlocked: &[UnlockedPin],
+) {
     let pairs: Vec<(String, String)> = pins
         .iter()
         .map(|p| (p.purl.clone(), p.uuid.to_ascii_lowercase()))
         .collect();
-    let index = RecordedIndex::new(None, &pairs);
+    let index = RecordedIndex::new(None, &pairs).with_unlocked_pins(unlocked.iter().cloned());
     for row in rows.iter_mut().filter(|r| r.candidate.recorded.is_new()) {
         let uuids = index.uuids(&row.candidate.purl);
         let selected = row.candidate.uuid.to_ascii_lowercase();

@@ -856,11 +856,12 @@ pub(crate) async fn run_redirect_selected(
             );
             if !foreign.is_empty() {
                 let origins: Vec<String> = configured.into_iter().chain(foreign).collect();
-                let pins = socket_patch_core::patch::redirect::upstream::HostedPin::discover(
-                    view, &origins,
-                )
-                .await;
-                super::rollout::mark_pinned(&mut gate.rows, &pins);
+                let (pins, unlocked) =
+                    socket_patch_core::patch::redirect::upstream::HostedPin::discover_with_unlocked(
+                        view, &origins,
+                    )
+                    .await;
+                super::rollout::mark_pinned(&mut gate.rows, &pins, &unlocked);
             }
         }
     }
