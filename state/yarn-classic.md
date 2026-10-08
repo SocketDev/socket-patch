@@ -1,6 +1,6 @@
 [agent] Progress ledger for the scheduled Yarn classic (1.x) bug-hunt routine (label pm:yarn-classic).
 
-Last updated: 2026-10-08 (run 30), main `e61a845`, latest release v4.0.0. Runs 5–30 added the cells in "Run 5 cells" through "Run 30 cells" below. Since run 28, #364, #921, #857, #884, #831, #974, #938 (#940) and #907 (#917) are closed by merged fixes, and #1071 (#1073) and #975 (#978) have landed too; the old `fail #364` cells now mean a project-level mirror is refused (pass), and #1013 / #1078 are the remaining mirror gaps. The project-mode matrix below was measured on `f6b7fb9` (v4); cells marked "(v5)", the global matrix and the "v5 project-mode cells" list were re-run on v5.
+Last updated: 2026-10-08 (run 31), main `ea09714`, latest release v4.0.0. Runs 5–31 added the cells in "Run 5 cells" through "Run 31 cells" below. #1013 / #1078 / #519 are closed by #1083 / #1033; run 31 verified the mirror fix cross-OS. Since run 28, #364, #921, #857, #884, #831, #974, #938 (#940) and #907 (#917) are closed by merged fixes, and #1071 (#1073) and #975 (#978) have landed too; the old `fail #364` cells now mean a project-level mirror is refused (pass), and #1115 (a mirror in a workspace member's `.yarnrc`) is the remaining mirror gap. The project-mode matrix below was measured on `f6b7fb9` (v4); cells marked "(v5)", the global matrix and the "v5 project-mode cells" list were re-run on v5.
 
 ## Coverage matrix
 
@@ -14,13 +14,13 @@ Cells are "pass", "fail #N", "n/a", "CI" or "untested". H = hosted, V = vendored
 | Linux | 1.6.0 | pass | n/a (yarn limitation) | untested | H pass | untested | H pass (run 16) | n/a (yarn ≤1.6) | n/a | pass (run 17) |
 | Linux | 1.7.0 | CI | refused (#364 fixed, untested on run 28) | pass (run 20, #363 fixed; V git-only: #857) | pass | pass (run 16) | pass (run 16) | pass | untested | pass (run 17) |
 | Linux | 1.9.4 | CI | refused (#364 fixed, untested on run 28) | untested | H pass (run 26) | pass (run 26) | H pass (run 26) | CI | pass (run 16) | pass (run 17) |
-| Linux | 1.10.1 | pass | refused (#364 fixed); outside-project / env-var mirror: fail #1013; BOM `.yarnrc`/`.npmrc`: fail #1078 | V git-only: #857 (run 20) | pass | pass | pass (run 16, + BOM) | pass | pass | pass (+ `--install.modules-folder`, run 9) |
+| Linux | 1.10.1 | pass | refused (#364 fixed); outside-project / env / BOM mirror refused (#1013 / #1078 fixed, run 31); member `.yarnrc` mirror: fail #1115 | V git-only: #857 (run 20) | pass | pass | pass (run 16, + BOM) | pass | pass | pass (+ `--install.modules-folder`, run 9) |
 | Linux | 1.10.0 / 1.19.0 / 1.19.1 / 1.22.0 (run 24) | pass (+ warm in-place, vex) | untested | untested | untested | untested | untested | pass (+ byte-exact rollback) | untested | pass |
 | Linux | 1.17.3 | pass (in-place) | refused (#364 fixed, untested on run 28) | untested | untested | untested | untested | pass (in-place) | pass (run 16) | pass (run 17) |
-| Linux | 1.22.22 | pass (v5, + hosted rollback pass) | refused (#364 fixed); outside-project mirror: fail #1013 | pass (run 20, #363 fixed by #710; V git-only: #857; H pin + git sibling: #828) | pass | pass | pass | pass | pass | pass |
+| Linux | 1.22.22 | pass (v5, + hosted rollback pass) | refused (#364 fixed); outside-project / env / BOM mirror refused (run 31); member `.yarnrc` mirror: fail #1115 | pass (run 20, #363 fixed by #710; V git-only: #857; H pin + git sibling: #828) | pass | pass | pass | pass | pass | pass |
 | macOS | 1.7.0 | untested | untested | fail #363 | pass | pass | pass | pass | pass (run 18) | pass (run 18) |
-| macOS | 1.10.1 / 1.22.22 | pass (probe) | refused (#364 fixed, untested on run 28) | fail #363 | pass | pass | pass | pass | pass (run 18) | pass (run 18) |
-| Windows | 1.7.0 / 1.10.1 / 1.22.22 | pass (probe) | refused (#364 fixed, untested on run 28) | fail #363 (vendored: `Couldn't find the binary git`) | pass | pass | pass | pass | pass (run 18) | pass (run 18) |
+| macOS | 1.10.1 / 1.22.22 | pass (probe) | refused: user / prefix / parent / env / BOM layers (probe, run 31) | fail #363 | pass | pass | pass | pass | pass (run 18) | pass (run 18) |
+| Windows | 1.7.0 / 1.10.1 / 1.22.22 | pass (probe) | refused: user / prefix (node dir) / parent / env / PS 5.1 BOM / backslash path (probe on 1.10.1 / 1.22.22, run 31) | fail #363 (vendored: `Couldn't find the binary git`) | pass | pass | pass | pass | pass (run 18) | pass (run 18) |
 
 ### Global mode (`-g`) on v5 `2463257` (rows marked run 10 re-measured on `045d7ec`)
 Report = `scan -g` report-only + no leakage; refusal = `scan -g/--global-prefix/SOCKET_GLOBAL --mode hosted` exits 2; A = agent apply + import + `vex -g` + `rollback -g` byte-exact; get-mode = `get -g --mode hosted|vendored` / `scan -g --mode vendored`; RO = read-only global folder fails loudly.
@@ -214,9 +214,18 @@ Other cells that pass on Linux 1.22.22 (some also on older releases; see the ent
 - #978 (PnP follows `nodeLinker`): a yarn-1 PnP project with a classic lock keeps its loader live (code path `effective_yarn_linker`). Turning off `installConfig.pnp` and reinstalling deletes `.pnp.js` (1.22.22), so classic has no stale-loader shape: pass.
 - Re-triage: #519 still reproduces on `e61a845` (lock-only hosted pin + installed PnP → `vex` attests `not_affected`, ×2). Commented.
 
+### Run 31 cells (`ea09714`)
+- **Mirror set only in a workspace member's `.yarnrc`, install run from that member (`cd` or `--cwd`): fail #1115** (1.10.1 / 1.22.22, ×2). The hosted scan from the root pins, says success, VEX attests, and the member install fails integrity. 1.7.0 installs patched.
+- #1083 resolution on Linux (root user): project / user (`/usr/local/share`, `~`) / symlinked user rc / ancestor / prefix `etc` / env (both spellings) / `NPM_CONFIG_USERCONFIG` / symlinked project rc: refused, pass. `false` layers match real yarn on 1.7.0 / 1.10.1 / 1.22.22. V→H takeover with a user mirror: refused, vendored kept, pass.
+- Cross-OS probe 37740151120 (ubuntu / macos / windows × 1.10.1 / 1.22.22, non-root): every mirror layer, PowerShell 5.1 BOM (project + user), backslash Windows path: all pass.
+- #1035 supersede gen1 → gen2: H / V on LF / CRLF / BOM+CRLF, H↔V and A→H/V takeovers, workspace merged key + `remove` / `rollback`: pass (1.22.22; H→V also 1.7.0).
+- #1044: yarn.lock + package-lock / shrinkwrap, H and V: unchanged, pass. yarn.lock + stale pnpm-lock.yaml: vendored routes to pnpm and warns that yarn.lock stays unpatched (documented).
+- Re-triage: #1081 and #758 still reproduce; #1097 also reproduces via `get` (all commented).
+
 ## Backlog
 
-00. #1097 follow-ups: the same `!` / extglob member shapes from `get` and on yarn berry / npm / bun roots (hand over npm extglob if it reproduces; npm supports negation, so only extglob applies there). Dot-dir members (`packages/.x`, which minimatch `*` skips).
+000. #1115 follow-ups: member `.npmrc`, `yarn workspace <m> add`, V→H takeover in that shape; macOS / Windows.
+00. #1097 follow-ups (`get` done in run 31): the same `!` / extglob member shapes from `get` and on yarn berry / npm / bun roots (hand over npm extglob if it reproduces; npm supports negation, so only extglob applies there). Dot-dir members (`packages/.x`, which minimatch `*` skips).
 0. #1013 / #1078 follow-ups: the vendored→hosted takeover preflight with a user-level mirror; macOS / Windows home config paths; a BOM `.yarnrc` on a Windows probe (PowerShell 5 `Set-Content -Encoding utf8`). Re-check #1081 on berry aliases (hand over to yarn-berry if `redirect_yarn_berry_alias_skipped` also attests in-run), and on npm / pnpm alias skips.
 1. Re-check #991 on npm / pnpm vendored, and hand it over if it's family-wide. #974 / #921 / #857 / #884 / #364 / #831 are closed (run 28 verified #364 / #884 / #921 on main). Re-check #975's yarn-1 PnP cell once PR #978 merges. Re-check once merged: #828 (PR #1008, incl. the run-29 alias trigger), #1057 (re-run the run-29 battery on its final head), #921 / #857 (PR #924, #921 verified run 25), #884 (PR #901, verified run 22; also covers the positional PATH form), #364 (PR #839), #831 (PR #837), #907 (PR #917), #778 (yarn classic nested copies, run 25), plus #828's yarn git-sibling shape. Then #467 / #519 / #558 / #591 / #691 / #692 / #758.
 2. #857 on PR #924 (vendored git-only dep; needs a git dep, which worked in run 20 via github.com).
@@ -328,3 +337,7 @@ Other cells that pass on Linux 1.22.22 (some also on older releases; see the ent
 - Run-29 harness: `scratchpad/battery.sh <bin> <out>` (9 shapes × H/V, yarn 1.22.22, with 1.7.0 for the no-`integrity` shape) plus `regpass.py` (a plain-HTTP registry passthrough on :8790 for hosted rollback). The run-18 mock is still extracted from the `20261005-agent-xos` probe branch; a no-sha1 variant is the same file with `"sha1": SHA1` dropped from the grant.
 - yarn 1 deletes `.pnp.js` when `installConfig.pnp` is turned off and the project is reinstalled (1.22.22, run 30), so a stale yarn-1 loader needs a hand-committed file. Not a #975 shape.
 - yarn 1 `workspaces` ignore `!` patterns (1.0.2–1.22.22): `["packages/*", "!packages/b"]` still installs `b` as a member. Any harness that tries to exclude a member with `!` gets the wrong layout.
+- Leftover probe branch (deletion blocked): `bughunt/yarn-classic/20261008-mirror-xos`.
+- Running `yarn config set` as root writes `/usr/local/share/.yarnrc`; a probe harness must clean that too between cells, or mirror settings leak.
+- yarn.lock + a stale pnpm-lock.yaml: vendored follows the governing-lock precedence (pnpm > yarn) and warns `vendor_multiple_lockfiles` that yarn.lock stays unpatched. Documented, not filed.
+- A member-`.yarnrc` mirror (#1115) only breaks installs once the mirror holds the upstream tarball (a cold member install populates it); a no-op member install after a root install leaves it empty.
