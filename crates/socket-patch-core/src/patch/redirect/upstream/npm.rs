@@ -1087,8 +1087,13 @@ fn bun_lookup_registry(
             .and_then(|text| npmrc_top_level_value(text, key))
             .map(|v| expand_env(&v, var, false))
     };
+    // Credentials in the URL itself (`https://user:${TOKEN}@host/`) go on
+    // the request only: the base is written into bun.lock and warnings.
     let with_npmrc_auth = |base: String, own: Option<String>| -> ProjectRegistry {
-        let authorization = own.or_else(|| npmrc_registry_auth(&base, &npmrc_value));
+        let (base, userinfo) = split_userinfo(&base);
+        let authorization = own
+            .or(userinfo)
+            .or_else(|| npmrc_registry_auth(&base, &npmrc_value));
         ProjectRegistry {
             base,
             authorization,
@@ -1168,6 +1173,30 @@ fn expand_env(value: &str, var: &dyn Fn(&str) -> Option<String>, bare: bool) -> 
     }
     out.push_str(rest);
     out
+}
+
+/// `base` without its URL userinfo, and the Basic `Authorization` that
+/// userinfo stood for (percent-decoded, as a URL parser reads it).
+fn split_userinfo(base: &str) -> (String, Option<String>) {
+    use crate::utils::purl::percent_decode_purl_component as decode;
+    let Some((scheme, rest)) = base.split_once("://") else {
+        return (base.to_string(), None);
+    };
+    let authority_end = rest.find(['/', '?', '#']).unwrap_or(rest.len());
+    let Some((userinfo, host)) = rest[..authority_end].rsplit_once('@') else {
+        return (base.to_string(), None);
+    };
+    let stripped = format!("{scheme}://{host}{}", &rest[authority_end..]);
+    let (user, password) = userinfo.split_once(':').unwrap_or((userinfo, ""));
+    let (user, password) = (decode(user), decode(password));
+    let authorization = (!user.is_empty() || !password.is_empty()).then(|| {
+        use base64::Engine as _;
+        format!(
+            "Basic {}",
+            base64::engine::general_purpose::STANDARD.encode(format!("{user}:{password}"))
+        )
+    });
+    (stripped, authorization)
 }
 
 /// The `Authorization` an `.npmrc` configures for the registry at `base`:
@@ -1540,7 +1569,7 @@ mod tests {
     use super::{
         berry_lookup_registry, berry_registry_locator, bun_env_registry, bun_lookup_registry,
         bun_registry_slot, bun_tarball_url, non_default_registry, registry_derives_tarball,
-        yaml_top_level_value, ProjectDist,
+        split_userinfo, yaml_top_level_value, ProjectDist,
     };
     use crate::patch::redirect::upstream::client::NpmDist;
 
@@ -1606,6 +1635,57 @@ mod tests {
         assert_eq!(
             lookup(Some("registry=${R}\n"), Some("not toml ["), Some("x"), "a"),
             None
+        );
+    }
+
+    #[test]
+    fn bun_registry_userinfo_goes_on_the_request_not_the_base() {
+        let vars = |key: &str| (key == "TOKEN").then(|| "s3cret".to_string());
+        let lookup = |npmrc: Option<&str>, bunfig: Option<&str>, env: Option<&str>, name: &str| {
+            bun_lookup_registry(npmrc, bunfig, env, &vars, name).map(|r| (r.base, r.authorization))
+        };
+        let basic = |pair: &str| {
+            use base64::Engine as _;
+            Some(format!(
+                "Basic {}",
+                base64::engine::general_purpose::STANDARD.encode(pair)
+            ))
+        };
+        // bunfig `$VAR` / `${VAR}`, an .npmrc `${VAR}` and the environment's
+        // registry: the expanded secret never reaches the base that
+        // bun.lock, bun.lockb and upstream_registry_fallback print.
+        let bunfig = "[install]\nregistry = \"https://ci:$TOKEN@b.example/npm/\"\n\n\
+                      [install.scopes]\n\
+                      corp = { url = \"https://u:${TOKEN}@corp.example/\", token = \"own\" }\n";
+        assert_eq!(
+            lookup(None, Some(bunfig), None, "a"),
+            Some(("https://b.example/npm/".to_string(), basic("ci:s3cret")))
+        );
+        // An explicit token still wins; the userinfo is dropped all the same.
+        assert_eq!(
+            lookup(None, Some(bunfig), None, "@corp/w"),
+            Some((
+                "https://corp.example/".to_string(),
+                Some("Bearer own".to_string())
+            ))
+        );
+        assert_eq!(
+            lookup(
+                Some("@s:registry=https://x:${TOKEN}@s.example/\n"),
+                None,
+                None,
+                "@s/w"
+            ),
+            Some(("https://s.example/".to_string(), basic("x:s3cret")))
+        );
+        assert_eq!(
+            lookup(None, None, Some("https://e%40m:p%3Aw@e.example/"), "a"),
+            Some(("https://e.example/".to_string(), basic("e@m:p:w")))
+        );
+        // No userinfo: unchanged.
+        assert_eq!(
+            split_userinfo("https://h.example/a@b"),
+            ("https://h.example/a@b".to_string(), None)
         );
     }
 
