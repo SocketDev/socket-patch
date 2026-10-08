@@ -841,6 +841,29 @@ impl crate::patch::store_copies::CopyFold for ApplyResult {
 /// keys on the same text.
 pub const OWNERSHIP_NOT_RESTORED_MARKER: &str = "ownership could not be restored";
 
+/// The message of a new-file collision (see [`mark_new_file_collision`]).
+pub const NEW_FILE_COLLISION_MESSAGE: &str =
+    "File already exists, but the patch adds it as a new file (its content matches neither hash)";
+
+/// A new-file entry (empty beforeHash) whose path already holds content
+/// that is not the patched bytes is a mismatch like any other: the file
+/// matches neither the patch's beforeHash (none) nor its afterHash
+/// (CLI_CONTRACT "mismatch policy"). [`verify_file_patch`] reports it as
+/// `Ready` (its callers only ask "can this be written?"); the apply engine
+/// turns it into a `HashMismatch` with an empty `expected_hash`, so
+/// `--strict` refuses it and the default policy overwrites it with the
+/// `content_mismatch_overwritten` warning instead of silently.
+fn mark_new_file_collision(verify: &mut VerifyResult, file_info: &PatchFileInfo) {
+    if file_info.before_hash.is_empty()
+        && verify.status == VerifyStatus::Ready
+        && verify.current_hash.is_some()
+    {
+        verify.status = VerifyStatus::HashMismatch;
+        verify.message = Some(NEW_FILE_COLLISION_MESSAGE.to_string());
+        verify.expected_hash = Some(String::new());
+    }
+}
+
 /// The single-copy apply engine behind [`apply_package_patch`]: verifies
 /// and patches the package at exactly the one `pkg_path` it is given.
 async fn apply_package_patch_at(
@@ -892,6 +915,7 @@ async fn apply_package_patch_at(
         }
 
         let mut verify_result = verify_file_patch(pkg_path, file_name, file_info).await;
+        mark_new_file_collision(&mut verify_result, file_info);
 
         if verify_result.status != VerifyStatus::Ready
             && verify_result.status != VerifyStatus::AlreadyPatched
@@ -2943,17 +2967,18 @@ mod tests {
             .await
             .unwrap();
         assert_eq!(written, fresh, "divergent existing content is overwritten");
+        // B23: ... but surfaced as a mismatch overwrite (the promoted
+        // signature the CLI's `content_mismatch_overwritten` keys on).
+        let v = &result.files_verified[0];
+        assert_eq!(v.status, VerifyStatus::Ready);
+        assert!(v.expected_hash.is_some() && v.current_hash != v.expected_hash);
     }
 
-    /// CHARACTERIZATION: `--strict` does NOT protect divergent content at
-    /// a new-file path. `verify_file_patch` returns `Ready` (never
-    /// `HashMismatch`) for a new-file entry, so the Strict policy arm is
-    /// never consulted and the verified patched bytes overwrite the local
-    /// file — the deliberate "force overwrite" contract documented above
-    /// the `is_new_file` branch. If that contract ever changes to
-    /// fail-closed under Strict, flip these assertions.
+    /// B23: `--strict` refuses divergent content at a new-file path, like
+    /// any other mismatch (CLI_CONTRACT "mismatch policy"), and leaves the
+    /// local file untouched.
     #[tokio::test]
-    async fn test_apply_package_patch_new_file_overwrite_strict_characterization() {
+    async fn test_apply_package_patch_new_file_collision_refused_under_strict() {
         let pkg_dir = tempfile::tempdir().unwrap();
         let blobs_dir = tempfile::tempdir().unwrap();
 
@@ -2987,12 +3012,14 @@ mod tests {
         )
         .await;
 
-        assert!(result.success, "strict still overwrites at a new-file path");
-        assert_eq!(result.files_patched, vec!["new.js".to_string()]);
-        let written = tokio::fs::read(pkg_dir.path().join("new.js"))
+        assert!(!result.success, "strict refuses a new-file collision");
+        let err = result.error.as_deref().unwrap_or_default();
+        assert!(err.contains(NEW_FILE_COLLISION_MESSAGE), "{err}");
+        assert!(result.files_patched.is_empty());
+        let on_disk = tokio::fs::read(pkg_dir.path().join("new.js"))
             .await
             .unwrap();
-        assert_eq!(written, fresh);
+        assert_eq!(on_disk, b"stale local content", "local file untouched");
     }
 
     // ── create_dir_all failure inside apply_file_patch_at ────────────

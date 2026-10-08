@@ -2799,7 +2799,8 @@ fn uv_dir_candidates(home_dir: &Path, override_var: &str, bucket: &str) -> Vec<P
 /// macOS), `~/<unix_default>/pdm` on Linux,
 /// `~/Library/Application Support/pdm` on macOS, and
 /// `%LOCALAPPDATA%\pdm\pdm` on Windows.
-#[cfg_attr(windows, allow(unused_variables))]
+// `unix_default` is Linux-only, `var` / `xdg_var` unused on Windows.
+#[cfg_attr(any(windows, target_os = "macos"), allow(unused_variables))]
 fn pdm_dir_candidates(
     home_dir: Option<&Path>,
     var: &impl Fn(&str) -> Option<String>,
