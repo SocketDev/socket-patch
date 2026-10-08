@@ -2287,10 +2287,17 @@ fn scan_hosted_rejects_global() {
         "{stderr:?}"
     );
     assert!(stdout.is_empty());
-    // Like every usage error (and clap's own), no JSON envelope under --json.
+    // Under --json a self-enforced usage error prints the coded error on
+    // stdout (v5.0; clap's own parse errors still print nothing there).
     let (code, stdout, _) = run_scan(tmp.path(), &["--mode", "hosted", "--global", "--json"]);
     assert_eq!(code, 2);
-    assert!(stdout.trim().is_empty(), "{stdout:?}");
+    let v: serde_json::Value = serde_json::from_str(&stdout).expect("JSON on stdout");
+    assert_eq!(v["status"], "error", "{v}");
+    assert_eq!(v["error"]["code"], "global_scope_unsupported", "{v}");
+    assert!(v["error"]["message"]
+        .as_str()
+        .unwrap()
+        .starts_with("--global cannot be used with --mode hosted"));
     let prefix = tempfile::tempdir().unwrap();
     let (code, _, stderr) = run_scan(
         tmp.path(),

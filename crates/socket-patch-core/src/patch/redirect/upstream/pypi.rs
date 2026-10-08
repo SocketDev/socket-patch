@@ -649,7 +649,7 @@ pub(crate) async fn restore_requirements(
         } else {
             BTreeMap::new()
         };
-        let eol = if text.contains("\r\n") { "\r\n" } else { "\n" };
+        let eol = crate::utils::line_endings::terminator(&text);
         let mut rewritten: Vec<(usize, String, String)> = Vec::new();
         for (i, line) in &hits {
             if result.refused.contains_key(&line.uuid) {
@@ -1020,6 +1020,29 @@ mod tests {
     // ── requirements.txt: pip's hash-checking mode (#410) ──────────────────
 
     use super::super::{restore_upstream, HostedPin, PinStatus, RestoreOptions, RestoreOutcome};
+
+    /// #815: a restored hashed line's continuation takes the file's majority
+    /// line ending; one stray CRLF comment no longer turns it CRLF.
+    #[tokio::test]
+    #[serial_test::serial]
+    async fn restored_hash_continuation_takes_the_majority_line_ending() {
+        let other = format!("idna==3.4 \\\n    --hash=sha256:{}\n", "c".repeat(64));
+        for (head, eol) in [
+            ("# pinned\r\n", "\n"),
+            ("# pinned\r\n# by pip-compile\r\n# x\r\n# y\r\n", "\r\n"),
+        ] {
+            let (outcome, after) = restore_six(&format!("{head}{other}{}\n", hashed_line())).await;
+            assert_restored(&outcome);
+            assert!(
+                after.contains(&format!("six==1.16.0 \\{eol}    --hash=sha256:")),
+                "{after:?}"
+            );
+            assert_eq!(
+                after.matches("\\\r\n").count(),
+                if eol == "\r\n" { 2 } else { 0 }
+            );
+        }
+    }
     use wiremock::matchers::{method, path};
     use wiremock::{Mock, MockServer, ResponseTemplate};
 

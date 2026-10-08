@@ -503,7 +503,7 @@ async fn save_only_with_mode_conflicts_exit_two() {
         );
         let v = parse_single_json_doc(&stdout);
         assert_eq!(v["status"], "error", "envelope={v}");
-        let msg = v["error"]
+        let msg = v["error"]["message"]
             .as_str()
             .unwrap_or_else(|| panic!("get's conflict envelope carries a string error; got {v}"));
         assert!(

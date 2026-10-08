@@ -1278,7 +1278,7 @@ async fn hosted_only_project_without_manifest() {
     );
     assert_eq!(envelope["status"], "error", "{envelope}");
     assert!(
-        envelope["error"]
+        envelope["error"]["message"]
             .as_str()
             .unwrap_or_default()
             .contains("Manifest not found"),

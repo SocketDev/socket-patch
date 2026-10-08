@@ -525,7 +525,7 @@ async fn get_uuid_view_without_after_hashes_fails_no_applicable_files() {
     let v = parse_single_json_doc(&stdout);
     assert_eq!(v["status"], "error", "stdout={stdout}");
     assert!(
-        v["error"]
+        v["error"]["message"]
             .as_str()
             .unwrap_or_default()
             .contains("no applicable files"),
@@ -557,7 +557,10 @@ async fn get_uuid_traversal_after_hash_fails_blob_write_both_modes() {
         assert_eq!(code, 1, "blob failure must exit 1; stdout={stdout}");
         let v = parse_single_json_doc(&stdout);
         assert_eq!(v["status"], "error", "stdout={stdout}");
-        assert_eq!(v["error"], "Blob decode or write failed", "stdout={stdout}");
+        assert_eq!(
+            v["error"]["message"], "Blob decode or write failed",
+            "stdout={stdout}"
+        );
         assert_eq!(v["patches"][0]["action"], "failed", "stdout={stdout}");
         assert_no_manifest(tmp.path());
         assert!(
@@ -976,9 +979,9 @@ async fn engine_socket_path_occupied_fails_before_any_fetch() {
 
     assert_eq!(code, 1, "json={json}");
     assert_eq!(json["status"], "error", "json={json}");
-    assert_eq!(json["errorCode"], "lock_io", "json={json}");
+    assert_eq!(json["error"]["code"], "lock_io", "json={json}");
     assert!(
-        json["error"]
+        json["error"]["message"]
             .as_str()
             .unwrap_or_default()
             .contains(".socket"),
@@ -1029,9 +1032,9 @@ async fn engine_readonly_socket_fails_closed_before_any_fetch() {
 
     assert_eq!(code, 1, "json={json}");
     assert_eq!(json["status"], "error", "json={json}");
-    assert_eq!(json["errorCode"], "lock_io", "json={json}");
+    assert_eq!(json["error"]["code"], "lock_io", "json={json}");
     assert!(
-        json["error"]
+        json["error"]["message"]
             .as_str()
             .unwrap_or_default()
             .contains(".socket"),
@@ -1076,7 +1079,7 @@ async fn engine_readonly_socket_fails_manifest_write() {
     assert_eq!(code, 1, "json={json}");
     assert_eq!(json["status"], "error", "json={json}");
     assert!(
-        json["error"]
+        json["error"]["message"]
             .as_str()
             .unwrap_or_default()
             .contains("Failed to write manifest"),
@@ -1124,7 +1127,7 @@ async fn engine_manifest_write_failure_unwinds_the_blobs_it_wrote() {
 
     assert_eq!(code, 1, "json={json}");
     assert!(
-        json["error"]
+        json["error"]["message"]
             .as_str()
             .unwrap_or_default()
             .contains("Failed to write manifest"),
@@ -2089,7 +2092,7 @@ async fn engine_human_readonly_socket_manifest_write_failure_still_errors() {
     assert_eq!(code, 1, "json={json}");
     assert_eq!(json["status"], "error", "json={json}");
     assert!(
-        json["error"]
+        json["error"]["message"]
             .as_str()
             .unwrap_or_default()
             .contains("Failed to write manifest"),
@@ -2426,9 +2429,9 @@ async fn mount_granted_reference(server: &MockServer, uuid: &str, purl: &str, ur
 /// Hosted twin of `vendored_lock_held_vendor_step_errors_without_vendor_envelope`
 /// (and of `covgap_commands_scan_hosted::hosted_lock_held_refuses_before_any_write`):
 /// `get <uuid> --mode hosted` folds its result into the HOSTED error
-/// envelope, so a held apply lock surfaces as the top-level `errorCode`
-/// with a string `error` — NOT the vendored `error: {code, message}`
-/// object — exit 1, `redirect.mode` retained, nothing written; the human
+/// envelope, so a held apply lock surfaces as the top-level
+/// `error: {code: "lock_held", message}` object (v5.0: no top-level
+/// `errorCode`) — exit 1, `redirect.mode` retained, nothing written; the human
 /// arm prints the shared `Error: Another socket-patch process …` line plus
 /// the `--lock-timeout` hint. A
 /// `--dry-run` never contends: it previews the redirect under the held
@@ -2459,14 +2462,14 @@ async fn hosted_lock_held_get_errors_with_top_level_error_code() {
     assert_eq!(code, 1, "stdout={stdout}\nstderr={stderr}");
     let v = parse_single_json_doc(&stdout);
     assert_eq!(v["status"], "error", "stdout={stdout}");
-    assert_eq!(v["errorCode"], "lock_held", "stdout={stdout}");
+    assert_eq!(v["error"]["code"], "lock_held", "stdout={stdout}");
     assert_eq!(
-        v["error"], HELD,
-        "the hosted envelope carries a string `error`, not the vendored object; stdout={stdout}"
+        v["error"]["message"], HELD,
+        "the hosted envelope carries the `{{code, message}}` error object; stdout={stdout}"
     );
     assert!(
-        v["error"].get("code").is_none(),
-        "no nested `error.code` on the hosted shape; stdout={stdout}"
+        v.get("errorCode").is_none(),
+        "no top-level `errorCode` (v5.0); stdout={stdout}"
     );
     assert_eq!(
         v["redirect"]["mode"], "hosted",
@@ -2833,14 +2836,17 @@ async fn forced_identifier_type_is_validated_locally() {
         let (code, stdout, stderr) = run_get_bin(tmp.path(), &server.uri(), &["lodash", flag]);
         assert_eq!(code, 2, "{flag}: stdout={stdout}\nstderr={stderr}");
         assert!(
-            stderr.contains(&format!("Error: \"lodash\" {what} (expected ")),
+            stderr.contains(&format!("Error: The identifier {what} (expected ")),
             "{flag}: stderr={stderr}"
         );
         let (code, stdout, _) = run_get_bin(tmp.path(), &server.uri(), &["lodash", flag, "--json"]);
         assert_eq!(code, 2);
         let v = parse_single_json_doc(&stdout);
         assert_eq!(v["status"], "error", "{v}");
-        assert!(v["error"].as_str().unwrap().contains(what), "{v}");
+        assert!(
+            v["error"]["message"].as_str().unwrap().contains(what),
+            "{v}"
+        );
     }
     assert!(
         received_paths(&server).await.is_empty(),

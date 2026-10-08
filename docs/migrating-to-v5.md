@@ -29,6 +29,32 @@ existing scripts against the new CLI; the [changelog](../CHANGELOG.md) and
   of a hosted ledger. Scripts must use the updated
   [JSON shapes and exit codes](../crates/socket-patch-cli/CLI_CONTRACT.md#json-output-shapes).
 
+## JSON output
+
+Every `--json` failure now reports its top-level `error` as an object,
+`{"code": "...", "message": "..."}`, on every command. `apply`, `list`, `remove`,
+`repair`, `vendor` and `vex` already did; `scan`, `get` and `rollback` change:
+
+- Read `.error.message` where you read `.error`, and route on `.error.code`.
+- The top-level `errorCode` key is gone. Read `.error.code` instead. This affects
+  `get`'s and hosted `scan`'s `lock_held` / `lock_io`, hosted `scan` refusals,
+  `scan`'s socket.yml refusals (`socket_yml_invalid`, `socket_yml_ambiguous`) and
+  the nested-apply error `get` and `scan --mode agent` report.
+- Per-record keys do not change: `patches[*].error`, `patches[*].errorCode` and
+  rollback's `results[*].error` stay strings.
+- Usage errors (exit 2) that `scan`, `remove` and `rollback` enforce themselves
+  now print the coded error on stdout under `--json`, as `get`, `repair`,
+  `vendor` and `vex` do. Clap's own parse errors, and the check that a
+  `--cwd`, `--global-prefix` or `--manifest-path` names something, still print
+  nothing on stdout.
+
+```bash
+socket-patch scan --json | jq -r 'select(.status == "error") | .error.code'
+```
+
+The codes are listed in the
+[CLI contract](../crates/socket-patch-cli/CLI_CONTRACT.md#top-level-envelopeerror-codes).
+
 ## Installation channels
 
 v5 distributes standalone binaries, Cargo crates, and npm packages. The PyPI and

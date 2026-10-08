@@ -175,22 +175,24 @@ pub(crate) fn merge_metadata(record: &mut serde_json::Value, meta: serde_json::V
     }
 }
 
-/// Report an error to the caller: a `{status, error}` envelope on
-/// stdout when `json` is true, otherwise a plain `Error: ...` on stderr.
-pub(crate) fn report_error(json: bool, message: impl std::fmt::Display) {
+/// Report an error to the caller: a `{status: "error", error: {code,
+/// message}}` object on stdout when `json` is true, otherwise a plain
+/// `Error: ...` on stderr. Every top-level `get` failure goes through here
+/// (or [`report_lock_failure`]) so the error shape cannot drift.
+pub(crate) fn report_error(json: bool, code: &str, message: impl std::fmt::Display) {
     let message = message.to_string();
     if json {
-        print_json(&serde_json::json!({"status": "error", "error": message}));
+        crate::json_envelope::print_legacy_error(code, &message);
     } else {
         eprintln!("Error: {message}");
     }
 }
 
 /// Report a failed apply-lock acquire in get's legacy error shape — the
-/// `{status: "error", error: "<message>"}` envelope every other hard error
-/// here uses, plus the stable `errorCode` (`lock_held` / `lock_io`) the
-/// other lock sites emit — and return the envelope for the caller's
-/// early-return guard. The message/code mapping is
+/// `{status: "error", error: {code, message}}` object every other hard
+/// error here uses, with the stable code (`lock_held` / `lock_io`) the
+/// other lock sites emit — and return it for the caller's early-return
+/// guard. The message/code mapping is
 /// [`crate::commands::lock_cli::lock_failure`]'s, so the waited clause and
 /// the I/O rendering cannot drift from `apply`'s.
 pub(crate) fn report_lock_failure(
@@ -200,11 +202,7 @@ pub(crate) fn report_lock_failure(
     timeout: Duration,
 ) -> serde_json::Value {
     let (code, message) = lock_failure(err, timeout);
-    let envelope = serde_json::json!({
-        "status": "error",
-        "errorCode": code,
-        "error": message,
-    });
+    let envelope = crate::json_envelope::legacy_error(code, &message);
     if json {
         print_json(&envelope);
     } else {
@@ -1423,7 +1421,8 @@ pub(crate) fn apply_key_covers(key: &str, record: &str) -> bool {
 /// as on every `failed` record); any other failed manifest patch (one this
 /// run did not select) gets its own `failed` record (`uuid_of` looks up
 /// its uuid); a run-level reason rides the envelope's top-level
-/// `errorCode` / `error`. `failed` grows by every record marked or
+/// `error: {code, message}` (status stays `partial_failure`: the downloads
+/// it reports still landed). `failed` grows by every record marked or
 /// appended here. Returns `applied`: how many of the run's recorded
 /// patches apply really patched (or found already patched).
 pub(crate) fn fold_apply_failures(
@@ -1490,8 +1489,10 @@ pub(crate) fn fold_apply_failures(
     let failed = envelope["failed"].as_u64().unwrap_or(0) as usize + added;
     envelope["failed"] = serde_json::json!(failed);
     if let Some((code, error)) = &report.run_error {
-        envelope["errorCode"] = serde_json::json!(code);
-        envelope["error"] = serde_json::json!(error);
+        crate::json_envelope::set_error_keep_status(
+            envelope,
+            crate::json_envelope::EnvelopeError::new(code, error),
+        );
     }
     applied
 }
@@ -1537,8 +1538,11 @@ pub async fn download_and_apply_patches_with(
         // and destroy every tracked patch record.
         Err(e) => {
             let err = format!("Failed to read manifest: {e}");
-            report_error(params.json, &err);
-            return (1, serde_json::json!({"status": "error", "error": err}));
+            report_error(params.json, "manifest_unreadable", &err);
+            return (
+                1,
+                crate::json_envelope::legacy_error("manifest_unreadable", &err),
+            );
         }
     };
 
@@ -1590,8 +1594,11 @@ pub async fn download_and_apply_patches_with(
             // unwind exactly those (a pre-existing record's blobs stay).
             unwind_new_blobs(&blobs_dir, &new_blobs).await;
             let msg = format!("Failed to write manifest: {e}");
-            report_error(params.json, &msg);
-            return (1, serde_json::json!({ "status": "error", "error": msg }));
+            report_error(params.json, "manifest_write_failed", &msg);
+            return (
+                1,
+                crate::json_envelope::legacy_error("manifest_write_failed", &msg),
+            );
         }
     }
     // Every selected patch that is now recorded is owed the nested apply:

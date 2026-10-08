@@ -182,7 +182,7 @@ fn find_by_purls_sync(pkg_path: &Path, purls: &[String]) -> HashMap<String, Craw
         // could traverse out of the root before touching the
         // filesystem — `verify_nuget_package` only checks for
         // `lib/` or a `.nuspec`, so it is no defense.
-        if !is_safe_nuget_coordinate(name, version) {
+        if !path_safety::is_safe_name_version(name, version) {
             continue;
         }
 
@@ -369,23 +369,6 @@ fn find_legacy_dir_case_insensitive(
     }
 
     None
-}
-
-/// Whether the PURL-derived NuGet coordinates are safe to join onto the
-/// package root in [`NuGetCrawler::find_by_purls`].
-///
-/// The name and version come straight from the (untrusted) manifest PURL.
-/// Each is used as a single path segment in the global-cache layout and as
-/// part of the `<Name>.<Version>` directory name in the legacy layout, after
-/// which the resolved directory is patched IN PLACE (NuGet has no redirect
-/// backend) — so a tampered PURL must not be able to traverse out of the
-/// root. A real NuGet id/version never contains a separator, a `.`/`..`
-/// segment, a backslash, a colon, or a NUL. Delegates to
-/// [`path_safety::is_safe_single_segment`], which also rejects `:` — a
-/// Windows drive-relative coordinate (`C:evil`) joins as an absolute path.
-/// Fails closed. Mirrors the maven/go/deno/npm crawler coordinate guards.
-fn is_safe_nuget_coordinate(name: &str, version: &str) -> bool {
-    path_safety::is_safe_single_segment(name) && path_safety::is_safe_single_segment(version)
 }
 
 /// Get the NuGet global packages folder.
@@ -1053,31 +1036,6 @@ mod tests {
             home.ends_with(Path::new(".nuget").join("packages")),
             "empty NUGET_PACKAGES must fall back to ~/.nuget/packages, got {home:?}"
         );
-    }
-
-    #[test]
-    fn test_is_safe_nuget_coordinate() {
-        // Real coordinates pass, including dotted ids and prerelease tags.
-        assert!(is_safe_nuget_coordinate("Newtonsoft.Json", "13.0.3"));
-        assert!(is_safe_nuget_coordinate("Contoso.Widgets", "2.0.0-RC1"));
-        assert!(is_safe_nuget_coordinate("xunit", "2.6.2+build.5"));
-
-        // Traversal / separator smuggling fails closed.
-        assert!(!is_safe_nuget_coordinate("..", "1.0.0"));
-        assert!(!is_safe_nuget_coordinate("../escaped", "1.0.0"));
-        assert!(!is_safe_nuget_coordinate("a/b", "1.0.0"));
-        assert!(!is_safe_nuget_coordinate("a\\b", "1.0.0"));
-        assert!(!is_safe_nuget_coordinate("a\0b", "1.0.0"));
-        assert!(!is_safe_nuget_coordinate("a", ".."));
-        assert!(!is_safe_nuget_coordinate("a", "../../escaped/1.0.0"));
-        assert!(!is_safe_nuget_coordinate("a", "1/0"));
-        assert!(!is_safe_nuget_coordinate("a", "."));
-        assert!(!is_safe_nuget_coordinate("", "1.0.0"));
-        assert!(!is_safe_nuget_coordinate("a", ""));
-        // Windows drive-relative escape: a `:` (e.g. `C:evil`) makes the
-        // joined path absolute under `Path::join`.
-        assert!(!is_safe_nuget_coordinate("C:evil", "1.0.0"));
-        assert!(!is_safe_nuget_coordinate("a", "C:1.0.0"));
     }
 
     /// SECURITY regression: a tampered manifest PURL whose name or version

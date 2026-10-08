@@ -993,6 +993,50 @@ async fn composer_edge_shapes_round_trip() {
     }
 }
 
+/// #815: a mixed-ending lock (LF majority, CRLF `_readme` lines) gets
+/// its restored dist block in the majority style, so the unwind is byte
+/// exact. The old "any `\r\n` → CRLF" rule spelled the block in CRLF.
+#[tokio::test]
+#[serial]
+async fn composer_mixed_line_endings_restore_in_the_majority_style() {
+    let mixed = COMPOSER_LOCK.replacen("\n", "\r\n", 3);
+    assert!(mixed.matches("\r\n").count() < mixed.matches('\n').count() / 2);
+    let case = synthetic(
+        "mixed-lf-majority",
+        &[("composer.lock", &mixed)],
+        composer_override("psr/log", "1.1.4"),
+    );
+    let (after, statuses) = composer_run(&case, |_| {}).await;
+    assert_round_trip(&case, &after, &statuses);
+}
+
+/// #815: the hosted gem lock converge inserts its DEPENDENCIES pin in the
+/// lock's majority style; one stray CRLF line no longer turns it CRLF.
+#[test]
+fn gem_lock_pin_on_a_mixed_lock_takes_the_majority_terminator() {
+    let lf_majority = transitive_lock()
+        .replace("  rails (= 7.0.0)\n", "")
+        .replace("BUNDLED WITH\n", "BUNDLED WITH\r\n");
+    let crlf_majority = lf_majority.replace('\n', "\r\n").replace("\r\r\n", "\n");
+    for (lock, eol) in [(lf_majority, "\n"), (crlf_majority, "\r\n")] {
+        let input = BTreeMap::from([
+            (
+                "Gemfile".to_string(),
+                "source \"https://rubygems.org\"\n\ngem \"puma\"\n\n".to_string(),
+            ),
+            ("Gemfile.lock".to_string(), lock.clone()),
+        ]);
+        let deps: Vec<socket_patch_core::patch::redirect::DepOverride> =
+            serde_json::from_value(gem_override("zeitwerk", "2.6.0")).unwrap();
+        let rewrite = socket_patch_core::patch::redirect::rewrite_registry_redirect(&input, &deps);
+        let out = &rewrite.files["Gemfile.lock"];
+        assert!(
+            out.contains(&format!("\n  zeitwerk (= 2.6.0)!{eol}")),
+            "{lock:?} -> {out:?}"
+        );
+    }
+}
+
 #[tokio::test]
 #[serial]
 async fn composer_refusals_leave_everything_hosted() {

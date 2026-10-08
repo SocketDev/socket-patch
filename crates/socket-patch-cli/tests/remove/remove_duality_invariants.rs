@@ -397,13 +397,16 @@ fn preserve_conflicts_with_skip_rollback() {
         code, 2,
         "the conflict is a usage error; stdout=\n{stdout}\nstderr=\n{stderr}"
     );
+    // Under --json the coded usage error is the envelope on stdout (#704).
+    let v: serde_json::Value = serde_json::from_str(stdout.trim())
+        .unwrap_or_else(|e| panic!("stdout must be one JSON envelope ({e}): {stdout:?}"));
+    assert_eq!(v["status"], "error", "{v}");
+    assert_eq!(v["error"]["code"], "invalid_args", "{v}");
     assert!(
-        stderr.contains("no-op"),
-        "the error must explain the no-op quadrant; got {stderr:?}"
-    );
-    assert!(
-        stdout.trim().is_empty(),
-        "usage errors print to stderr, not a JSON envelope; got {stdout:?}"
+        v["error"]["message"]
+            .as_str()
+            .is_some_and(|m| m.contains("no-op")),
+        "the error must explain the no-op quadrant; got {v}"
     );
     // The conflict fires before any store is read or created.
     assert!(
@@ -414,7 +417,7 @@ fn preserve_conflicts_with_skip_rollback() {
     // Env-sourced: SOCKET_PRESERVE_STATE=true + --skip-rollback conflicts
     // exactly the same way (the contract row says flag- or env-sourced alike).
     let tmp2 = tempfile::tempdir().expect("tempdir");
-    let (code2, _stdout2, stderr2) = run_remove(
+    let (code2, stdout2, stderr2) = run_remove(
         tmp2.path(),
         &["pkg:npm/x@1.0.0", "--json", "--yes", "--skip-rollback"],
         &[("SOCKET_PRESERVE_STATE", "true")],
@@ -424,8 +427,8 @@ fn preserve_conflicts_with_skip_rollback() {
         "env-sourced preserve-state must conflict too; stderr=\n{stderr2}"
     );
     assert!(
-        stderr2.contains("no-op"),
-        "same self-enforced usage error text; got {stderr2:?}"
+        stdout2.contains("no-op"),
+        "same self-enforced usage error text; got {stdout2:?}"
     );
     assert!(!tmp2.path().join(".socket").exists());
 }

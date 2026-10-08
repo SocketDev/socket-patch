@@ -279,7 +279,8 @@ fn check_target_unit(
             }
             // Ours, but a STALE patch generation: wiring over it would lose
             // the only recorded registry original — refuse with the repair
-            // path (mirrors gem's stale-checksum refusal).
+            // path. The orchestrator turns this refusal into a re-vendor
+            // when the ledger still records that older uuid (#1136).
             Some(parts) if parts.eco == "pypi" => Err((
                 "pypi_pdm_source_already_exists",
                 format!(
