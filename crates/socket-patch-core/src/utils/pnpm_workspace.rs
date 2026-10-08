@@ -65,14 +65,23 @@ pub struct PnpmSetting {
     /// Where it is set, as a refusal names it (e.g.
     /// `` `gitBranchLockfile: true` in pnpm-workspace.yaml ``).
     pub source: String,
+    /// Whether `pnpm-workspace.yaml` (read by js-yaml) sets it, rather
+    /// than `.npmrc` or the environment (read by ini and nopt).
+    pub yaml: bool,
 }
 
 impl PnpmSetting {
-    /// The value as a boolean, spelled the way both readers pnpm uses
-    /// accept (js-yaml takes `True` / `FALSE` too); `None` for anything
-    /// else.
+    /// The value as a boolean, as the reader pnpm uses for its source
+    /// coerces it. js-yaml takes `true` / `false` in any case (`None` for
+    /// anything else). The npm config reader behind `.npmrc` and the
+    /// environment maps only lowercase `true` / `false` / `null` /
+    /// `undefined` and keeps any other string, which pnpm then reads as
+    /// truthy, so `git-branch-lockfile=False` is on.
     pub fn as_bool(&self) -> Option<bool> {
         let value = self.value.trim();
+        if !self.yaml {
+            return Some(!matches!(value, "" | "false" | "null" | "undefined"));
+        }
         if value.eq_ignore_ascii_case("true") {
             Some(true)
         } else if value.eq_ignore_ascii_case("false") {
@@ -96,13 +105,21 @@ pub fn pnpm_setting(
     use crate::formats::pnpm::workspace::yaml_top_level_value;
     if let Some(value) = workspace.and_then(|text| yaml_top_level_value(text, yaml_key)) {
         let source = format!("`{yaml_key}: {value}` in {PNPM_WORKSPACE}");
-        return Some(PnpmSetting { value, source });
+        return Some(PnpmSetting {
+            value,
+            source,
+            yaml: true,
+        });
     }
     let value = npmrc
         .and_then(|text| crate::patch::redirect::npmrc::npmrc_top_level_value(text, npmrc_key))?;
     let value = value.trim().to_string();
     let source = format!("`{npmrc_key}={value}` in .npmrc");
-    Some(PnpmSetting { value, source })
+    Some(PnpmSetting {
+        value,
+        source,
+        yaml: false,
+    })
 }
 
 /// `npmrc_key` from the environment (`pnpm_config_<key>`, then
@@ -115,7 +132,11 @@ fn env_setting(npmrc_key: &str, env: impl Fn(&str) -> Option<String>) -> Option<
         .find_map(|var| {
             let value = env(&var)?.trim().to_string();
             let source = format!("`{var}={value}` in the environment");
-            Some(PnpmSetting { value, source })
+            Some(PnpmSetting {
+                value,
+                source,
+                yaml: false,
+            })
         })
 }
 
@@ -694,10 +715,24 @@ mod tests {
             "sharedWorkspaceLockfile: False\n",
             None
         ));
-        assert!(shared_lockfile_disabled(
+        // `.npmrc` maps only a lowercase `false`; pnpm reads any other
+        // string as on.
+        assert!(!shared_lockfile_disabled(
             "packages: []\n",
             Some("shared-workspace-lockfile = FALSE\n")
         ));
+        assert!(shared_lockfile_disabled(
+            "packages: []\n",
+            Some("shared-workspace-lockfile = false\n")
+        ));
+        assert_eq!(
+            git_branch_lockfile_setting(None, Some("git-branch-lockfile=False\n")).as_deref(),
+            Some("`git-branch-lockfile=False` in .npmrc")
+        );
+        assert_eq!(
+            git_branch_lockfile_setting(None, Some("git-branch-lockfile=false\n")),
+            None
+        );
         assert!(!shared_lockfile_disabled(
             "sharedWorkspaceLockfile: TRUE\n",
             None
