@@ -78,14 +78,13 @@ fn git_sha256(content: &[u8]) -> String {
 /// The pristine jar from Maven Central (checked against Central's `.sha1`)
 /// and the patched one: every member copied raw, plus [`MARKER`].
 async fn jars() -> (Vec<u8>, Vec<u8>) {
-    let client = reqwest::Client::new();
+    let client = reqwest::Client::builder()
+        .timeout(std::time::Duration::from_secs(60))
+        .build()
+        .expect("reqwest client");
     let get = |url: String| {
         let client = client.clone();
-        async move {
-            let resp = client.get(&url).send().await.expect("fetch from Central");
-            assert!(resp.status().is_success(), "{url}: {}", resp.status());
-            resp.bytes().await.expect("body").to_vec()
-        }
+        async move { fetch_from_central(&client, &url).await }
     };
     let pristine = get(CENTRAL_JAR.to_string()).await;
     let sha1 = String::from_utf8(get(format!("{CENTRAL_JAR}.sha1")).await).unwrap();
@@ -111,6 +110,39 @@ async fn jars() -> (Vec<u8>, Vec<u8>) {
         .unwrap();
     assert!(text.contains("socket-patch"));
     (pristine, patched)
+}
+
+/// GET `url` from Maven Central, retrying what a CI runner sees as a
+/// transient blip: a transport error (DNS, connect, reset, timeout) or a
+/// 429 / 5xx. Any other status fails at once. Without this, one blip
+/// failed every cell of a leg within milliseconds, before `docker run`.
+async fn fetch_from_central(client: &reqwest::Client, url: &str) -> Vec<u8> {
+    const ATTEMPTS: u32 = 5;
+    let mut last = String::new();
+    for attempt in 1..=ATTEMPTS {
+        if attempt > 1 {
+            eprintln!("{url}: attempt {} failed ({last}); retrying", attempt - 1);
+            tokio::time::sleep(std::time::Duration::from_secs(1 << (attempt - 2))).await;
+        }
+        let resp = match client.get(url).send().await {
+            Ok(resp) => resp,
+            Err(e) => {
+                last = format!("{e:?}");
+                continue;
+            }
+        };
+        let status = resp.status();
+        if status.is_server_error() || status == reqwest::StatusCode::TOO_MANY_REQUESTS {
+            last = status.to_string();
+            continue;
+        }
+        assert!(status.is_success(), "{url}: {status}");
+        match resp.bytes().await {
+            Ok(body) => return body.to_vec(),
+            Err(e) => last = format!("{e:?}"),
+        }
+    }
+    panic!("{url}: {ATTEMPTS} attempts failed, last: {last}");
 }
 
 /// The authenticated patch API serving one whole-jar patch for
