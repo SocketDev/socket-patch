@@ -1,6 +1,6 @@
 [agent] Progress ledger for the scheduled Bundler (RubyGems) bug-hunt routine (label pm:bundler).
 
-Last updated: 2026-10-08 (run 33), main `823810a` (now also includes #768 → #749 / #751, and #1039, the atomic V→H takeover), latest release v4.0.0 (npm; no git tags). Newest Bundler tested: 4.1.0.beta1 (no newer release as of 2026-10-07).
+Last updated: 2026-10-08 (run 34), main `cb16bdd`, latest release v4.0.0 (npm; no git tags). Newest Bundler tested: 4.1.0.beta1; newest stable 4.0.22.
 
 ## Coverage matrix
 
@@ -307,6 +307,14 @@ Also on 4.0.17: BOM `Gemfile` passes; symlinked `Gemfile` / lock is refused (pas
 | Hosted `Gemfile` + `gems.rb` twin (#751 fixture) | pass (refused) |
 | Hosted Gemfile DSL `lockfile "custom.lock"` + leftover `Gemfile.lock` | **fail, #749 gap** (commented; ×2) |
 
+### Run 34 (main `cb16bdd`; Linux Ruby 3.3.6; scratch copies of `e2e_redirect_gem_build.rs`, real `bundle install`, CHECKSUMS lock)
+
+| Cell | 4.0.22 | 4.0.18 |
+| --- | --- | --- |
+| Hosted 1-gem superseding patch (new uuid, same version): re-scan, stale warning, cold frozen install of gen B, `vex` | — | pass |
+| Hosted 2-gem re-scan, sorted section insert | pass | pass |
+| Hosted 2-gem re-scan superseding one gem to a later-sorting uuid | **fail #1186** (×2) | lock re-sorted by Bundler (warning only) |
+
 ### Global mode (`-g`)
 
 | OS | Ruby / Bundler | `scan -g` report | `-g` vs project scoping | `scan -g --mode hosted` refused | `get -g` / `apply -g` | `rollback -g` byte-exact | `vex -g` | `--global-prefix <gems dir>` / `SOCKET_GLOBAL=1` | Non-writable gem dir |
@@ -329,13 +337,12 @@ Also on 4.0.17: BOM `Gemfile` passes; symlinked `Gemfile` / lock is refused (pas
 
 ## Backlog
 
-1. #749 DSL gap: re-run when it's fixed or the issue is reopened; also the vendored DSL shape and `lockfile false`.
-2. #1039: re-check the V→H gem takeover (the run-16 "refused" known non-bug may be stale).
-3. Re-run #896 / #952 / #985 / #1056 / #1092 / #1109 / #1125 when fixes merge.
+1. #1186 neighbours: rotated grant token only (same uuids) on a 2-gem project; `rollback` / `remove` of one of 3 hosted gems; Bundler 2.6.9.
+2. #749 DSL gap: re-run when it's fixed or the issue is reopened; also the vendored DSL shape and `lockfile false`.
+3. Re-run #896 / #952 / #985 / #1056 / #1092 / #1109 / #1125 / #1186 when fixes merge.
 4. #1125 neighbours: `gems.rb` without `gems.locked`; `get <uuid> --mode hosted` and `vendor` on a lockless project.
-5. Hosted re-pin to a superseding patch generation (same version, new sha): the stale guard and `rollback`.
-6. #1092 neighbours: Windows `x64-mingw-ucrt` + `x64-mingw32` pairs (probe branch); a lock listing several platform variants.
-7. #1056 neighbours: CRLF Gemfile and `gems.rb`; the Bundler 1.17 hosted unwind. #1109 neighbours: global-tier `deployment` / `path`.
+5. #1092 neighbours: Windows `x64-mingw-ucrt` + `x64-mingw32` pairs (probe branch); a lock listing several platform variants.
+6. #1056 neighbours: CRLF Gemfile and `gems.rb`; the Bundler 1.17 hosted unwind. #1109 neighbours: global-tier `deployment` / `path`.
 
 ## Known non-bugs
 
@@ -433,3 +440,6 @@ Also on 4.0.17: BOM `Gemfile` passes; symlinked `Gemfile` / lock is refused (pas
 - A scratch hosted test in `e2e_redirect_gem_build.rs` needs `GEM_PATH=<shared home>:<system gem dir>` to pick a non-default Bundler via `BUNDLER_VERSION`; otherwise it silently falls back to the default 2.5.22 (run 32).
 - Bundler 4.0.18 refuses every frozen install of a project whose Gemfile uses the `lockfile "x.lock"` DSL when no `Gemfile.lock` exists ("The frozen setting requires a lockfile"). With a leftover `Gemfile.lock` it passes that check and reads the DSL lock. That's Bundler's own behaviour (run 33).
 - `#749` / `#751` are fixed for the config / env / global spellings and the twin (#768). The DSL spelling is tracked as a comment on #749.
+- #1039 made the V→H takeover atomic, but gem is not in `hosted::takeover::takeover_ecosystem` (cargo / npm / golang / pypi / maven), so the run-16 gem V→H refusal is unchanged (run 34).
+- A hosted single-gem superseding patch (same version, new uuid) works: the re-scan rewrites the block, lock remote and CHECKSUMS, and the stale guard flags the gen-A install (its wording says "UNPATCHED" for older-patch bytes; fail-safe, not filed) (run 34).
+- Layer extra patch generations over the e2e fixture's mocks with wiremock `Mock::with_priority(1|2)` (default priority is 5); `cargo test` on a cold target takes >10 min, so run it with a long background timeout (run 34).
