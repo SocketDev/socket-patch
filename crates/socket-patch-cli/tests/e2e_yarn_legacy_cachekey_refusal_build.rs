@@ -40,7 +40,11 @@
 //! return when the corepack-pinned yarn is unavailable or the fixture
 //! install cannot reach the registry; every assertion after that is HARD.
 
-use std::path::{Path, PathBuf};
+#[path = "common/mod.rs"]
+mod common;
+use common::binary;
+
+use std::path::Path;
 use std::process::{Output, Stdio};
 
 use base64::Engine as _;
@@ -85,10 +89,6 @@ const MARKER: &str = "/* SOCKET-PATCHED */\n";
 const GHSA: &str = "GHSA-yarn-legacy-refusal";
 
 // ── self-contained helpers (convention: e2e test files stay standalone) ─
-
-fn binary() -> PathBuf {
-    PathBuf::from(env!("CARGO_BIN_EXE_socket-patch"))
-}
 
 /// Probe corepack from a NEUTRAL temp dir: a `packageManager` field in an
 /// ancestor `package.json` makes corepack refuse to run a different package

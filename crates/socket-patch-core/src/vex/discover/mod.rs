@@ -179,7 +179,7 @@
 //!     `vlt-lock.json`), so discovery and the inventory see one entry walk
 //!     per format (an architecture test in this module enforces it).
 
-use std::collections::BTreeSet;
+use std::collections::{BTreeMap, BTreeSet};
 use std::path::{Path, PathBuf};
 use std::sync::Mutex;
 
@@ -560,6 +560,12 @@ pub struct Discovery {
     /// so the management commands (rollback, remove, list, the vendored
     /// takeover) still see and unwind it (#828). Validated like `refs`.
     pub shadowed: Vec<PatchedRef>,
+    /// Root-relative files that are not locks of their own but part of
+    /// another file's install tree, mapped to that tree's root file: the
+    /// in-root `-r` includes of `requirements.txt`, which pip reads with the
+    /// root as one requirement set ([`Discovery::same_install_tree`]). A
+    /// file absent here is its own tree.
+    pub install_trees: BTreeMap<PathBuf, PathBuf>,
     /// Every file an extractor read through the guarded reads
     /// ([`DiscoverCtx::read_text`] / [`DiscoverCtx::read_bytes`]), with the
     /// ecosystem whose extractor read it — sorted, deduped. "No ref wires
@@ -825,22 +831,27 @@ impl Discovery {
     /// 11). This generalizes the npm extractor's shrinkwrap/package-lock
     /// rule to every pair of locks. PEP 723 script locks (`*.py.lock`)
     /// neither contest nor are contested: each is scoped to its own script's
-    /// install.
+    /// install. Files of one install tree ([`Discovery::install_trees`]) are
+    /// one lock here: pip resolves a direct reference and a compatible `==`
+    /// pin of the same version in `requirements.txt` and its `-r` includes
+    /// to the reference (#1086).
     fn contest_across_locks(&mut self) {
         let wiring: BTreeSet<(String, PathBuf)> = self
             .refs
             .iter()
-            .map(|r| (r.purl.clone(), r.source_file.clone()))
+            .map(|r| (r.purl.clone(), self.tree_of(&r.source_file).to_path_buf()))
             .collect();
         let mut contested = Vec::new();
         let refs = std::mem::take(&mut self.refs);
         for r in refs {
             let other = (!is_script_lock(&r.source_file))
                 .then(|| {
+                    let tree = self.tree_of(&r.source_file);
                     self.elsewhere.iter().find(|e| {
+                        let other = self.tree_of(&e.file);
                         e.purl == r.purl
-                            && e.file != r.source_file
-                            && !wiring.contains(&(e.purl.clone(), e.file.clone()))
+                            && other != tree
+                            && !wiring.contains(&(e.purl.clone(), other.to_path_buf()))
                     })
                 })
                 .flatten();
@@ -873,6 +884,23 @@ impl Discovery {
                 ),
             );
         }
+    }
+
+    /// Record that root-relative `file` is installed as part of the tree
+    /// rooted at `root` (see [`Discovery::install_trees`]).
+    pub(crate) fn install_tree(&mut self, file: &str, root: &str) {
+        if file != root {
+            self.install_trees
+                .insert(PathBuf::from(file), PathBuf::from(root));
+        }
+    }
+
+    /// The install tree `file` belongs to: its tree's root file, or itself.
+    fn tree_of<'a>(&'a self, file: &'a Path) -> &'a Path {
+        self.install_trees
+            .get(file)
+            .map(PathBuf::as_path)
+            .unwrap_or(file)
     }
 
     /// Record a lockless Socket pin (see [`UnlockedPin`]).
@@ -4349,6 +4377,121 @@ mod tests {
             let alone = Project::new();
             alone.write(files[0].0, &files[0].1);
             assert_eq!(alone.discover().await.refs.len(), 1, "{name} alone");
+        }
+    }
+
+    /// REGRESSION (#1086): the root `requirements.txt` and its in-root `-r`
+    /// includes are ONE install tree (`pip install -r requirements.txt`
+    /// reads them as one requirement set, where a direct reference beats a
+    /// compatible `==` pin of the same version). A duplicate exact pin in an
+    /// include therefore never contests a wiring elsewhere in the same tree,
+    /// whichever file carries the wiring and wherever the `-r` line sits. A
+    /// lock outside the tree (`uv.lock`) still contests it.
+    #[tokio::test]
+    async fn a_requirements_include_tree_is_one_lock_in_the_contest() {
+        const SHA: &str = "aaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaa";
+        let wheel = "vexdemo-1.2.3-py3-none-any.whl";
+        let pypi_url = hosted_url("pypi", "vexdemo", "1.2.3", UUID_A, wheel);
+        let hosted = format!("vexdemo @ {pypi_url} --hash=sha256:{SHA}\n");
+        let vendored = format!("./.socket/vendor/pypi/{UUID_B}/{wheel} --hash=sha256:{SHA}\n");
+        let pin = "vexdemo==1.2.3\n".to_string();
+        type Files = Vec<(&'static str, String)>;
+        let cases: Vec<(&str, Files, &str, WiringMode, &str)> = vec![
+            (
+                "hosted root, include first",
+                vec![
+                    ("requirements.txt", format!("-r dev.txt\n{hosted}")),
+                    ("dev.txt", pin.clone()),
+                ],
+                UUID_A,
+                WiringMode::Hosted,
+                "requirements.txt",
+            ),
+            (
+                "hosted root, include last",
+                vec![
+                    ("requirements.txt", format!("{hosted}-r dev.txt\n")),
+                    ("dev.txt", pin.clone()),
+                ],
+                UUID_A,
+                WiringMode::Hosted,
+                "requirements.txt",
+            ),
+            (
+                "hosted root, pin in a nested include",
+                vec![
+                    (
+                        "requirements.txt",
+                        format!("{hosted}--requirement reqs/dev.txt\n"),
+                    ),
+                    ("reqs/dev.txt", "-r more.txt\n".to_string()),
+                    ("reqs/more.txt", pin.clone()),
+                ],
+                UUID_A,
+                WiringMode::Hosted,
+                "requirements.txt",
+            ),
+            (
+                "vendored include, pin in the root",
+                vec![
+                    ("requirements.txt", format!("{pin}-r dev.txt\n")),
+                    ("dev.txt", vendored.clone()),
+                ],
+                UUID_B,
+                WiringMode::Vendored,
+                "dev.txt",
+            ),
+        ];
+        for (name, files, uuid, mode, wired_in) in cases {
+            let p = Project::new();
+            for (file, text) in &files {
+                p.write(file, text);
+            }
+            let out = p.discover().await;
+            assert_eq!(
+                out.refs.len(),
+                1,
+                "{name}: {:#?} {:#?}",
+                out.refs,
+                out.diagnostics
+            );
+            let r = &out.refs[0];
+            assert_eq!(
+                (r.purl.as_str(), r.uuid.as_str(), r.mode),
+                ("pkg:pypi/vexdemo@1.2.3", uuid, mode),
+                "{name}"
+            );
+            assert_eq!(r.source_file, Path::new(wired_in), "{name}");
+            assert!(out.contested.is_empty(), "{name}: {:#?}", out.contested);
+            assert!(
+                !out.diagnostics
+                    .iter()
+                    .any(|d| d.code == DIAG_REF_UNATTRIBUTABLE),
+                "{name}: {:#?}",
+                out.diagnostics
+            );
+            if mode == WiringMode::Hosted {
+                assert_eq!(
+                    out.hosted_claim("pkg:pypi/vexdemo@1.2.3", uuid),
+                    Some(true),
+                    "{name}"
+                );
+            }
+
+            // A lock OUTSIDE the tree still contests the same wiring, and
+            // names itself, not the include.
+            p.write(
+                "uv.lock",
+                format!(
+                    "version = 1\nrequires-python = \">=3.8\"\n\n[[package]]\nname = \"vexdemo\"\n\
+                     version = \"1.2.3\"\nsource = {{ registry = \"https://pypi.org/simple\" }}\n\
+                     wheels = [{{ url = \"https://files.pythonhosted.org/packages/{wheel}\", hash = \"sha256:{SHA}\" }}]\n"
+                ),
+            );
+            let out = p.discover().await;
+            assert!(out.refs.is_empty(), "{name} + uv.lock: {:#?}", out.refs);
+            assert_eq!(out.contested.len(), 1, "{name} + uv.lock");
+            assert_eq!(out.contested[0].other, Path::new("uv.lock"), "{name}");
         }
     }
 

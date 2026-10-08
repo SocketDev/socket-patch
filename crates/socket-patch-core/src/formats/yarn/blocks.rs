@@ -7,6 +7,7 @@
 //! apart on what a block, a key or a field is.
 
 use super::patterns::{berry_npm_alias_target, split_berry_key_patterns, split_pattern};
+use crate::formats::text::split_bom;
 use crate::vendor::common::detect_eol;
 
 /// One key-line block of a yarn lockfile (classic or berry).
@@ -42,10 +43,9 @@ pub(crate) fn scan_blocks(text: &str) -> Vec<LockBlock> {
         }
         let mut content = content.strip_suffix('\r').unwrap_or(content);
         if start == 0 {
-            if let Some(rest) = content.strip_prefix('\u{feff}') {
-                start = '\u{feff}'.len_utf8();
-                content = rest;
-            }
+            let (bom, rest) = split_bom(content);
+            start = bom.len();
+            content = rest;
         }
         lines.push((start, pos, content, terminated));
     }

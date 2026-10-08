@@ -1111,6 +1111,40 @@ fn remove_hosted_only_revert_failure_fails_closed() {
     assert_eq!(read_bytes(&lock_path), lock_before, "lock untouched");
 }
 
+/// B77: a human (non-JSON) hosted remove whose restore is refused prints
+/// the refusal ONCE. The hosted leg prints each refusal as it happens;
+/// remove used to print the same `Error:` line again on its way out.
+/// Covers the manifest-backed path (which adds that the manifest was not
+/// modified) and the hosted-only path.
+#[test]
+fn remove_hosted_revert_failure_prints_the_error_once() {
+    let needle = "annot restore pkg:npm/left-pad@1.3.0 to its upstream registry entry";
+    for manifest_backed in [true, false] {
+        let tmp = tempfile::tempdir().expect("tempdir");
+        let lock_path = tmp.path().join("package-lock.json");
+        std::fs::write(&lock_path, redirected_lock_text()).unwrap();
+        if manifest_backed {
+            write_manifest_files_empty(tmp.path(), NPM_PURL, NPM_UUID);
+        }
+        let (code, stdout, stderr) = run_remove(tmp.path(), &[NPM_PURL, "--yes", "--offline"], &[]);
+        assert_eq!(
+            code, 1,
+            "manifest_backed={manifest_backed}: stdout=\n{stdout}\nstderr=\n{stderr}"
+        );
+        assert_eq!(
+            stderr.matches(needle).count(),
+            1,
+            "manifest_backed={manifest_backed}: the refusal must print exactly once; \
+             stderr=\n{stderr}"
+        );
+        assert_eq!(
+            stderr.contains("The manifest was not modified."),
+            manifest_backed,
+            "manifest_backed={manifest_backed}: stderr=\n{stderr}"
+        );
+    }
+}
+
 // ---------------------------------------------------------------------------
 // 10. Restored-lockfile write failure (main flow + hosted-only). Unix-only;
 //     skipped where directory modes are not enforced (root).

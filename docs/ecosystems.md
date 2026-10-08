@@ -972,7 +972,8 @@ version = "1.0.4+socket.<uuid>"
   has a `[patch."https://github.com/rust-lang/crates.io-index"]` table,
   which cargo lets replace `[patch.crates-io]` wholesale — move its entries
   under `[patch.crates-io]`. Also `cargo_manifest_unreadable`,
-  `cargo_manifest_unparseable`, `cargo_manifest_symlink_unsupported`.
+  `cargo_manifest_unparseable`, and `redirect_symlinked_file_unsupported` for a
+  symlinked `Cargo.toml` (the one symlink code every mode uses).
 - **Formatting.** Comments, ordering, CRLF / mixed line endings, a UTF-8
   BOM and the trailing-newline state are preserved; a revert with nothing
   else changed restores `Cargo.toml` byte for byte, and keeps your own

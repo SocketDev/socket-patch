@@ -46,9 +46,7 @@ use sha2::{Digest, Sha256, Sha512};
 use crate::constants::SOCKET_DIR;
 use crate::formats::yarn::berry_entry::{manifest_bin, render_pinned_entry, Pin};
 use crate::formats::yarn::berry_gates::{self, BerryGate, Yarnrc, SUPPORTED_CACHE_KEY};
-use crate::formats::yarn::blocks::{
-    berry_field, block_eol, replace_block, scan_blocks, LockBlock,
-};
+use crate::formats::yarn::blocks::{berry_field, block_eol, replace_block, scan_blocks, LockBlock};
 use crate::formats::yarn::patterns::{pattern_real_name, split_berry_key_patterns, split_pattern};
 use crate::manifest::schema::PatchRecord;
 use crate::patch::apply::PatchSources;
@@ -333,7 +331,7 @@ impl NpmLockBackend for YarnBerryBackend {
             Some(c) => checksum_in_lock_spelling(&lock_text, c),
             // A reused tarball is kept as is, so retrying cannot help when
             // the service serves other bytes: only a fresh vendor can wire it.
-            None if reused && service_serves_other_bytes => return Err(format!("the patch service now serves other bytes than the committed {rel_tgz}, and no Yarn Berry checksum is recorded for it; restore yarn.lock from version control, or run `socket-patch vendor --revert` (it reverts every vendored package) and vendor again")),
+            None if reused && service_serves_other_bytes => return Err(format!("the patch service now serves other bytes than the committed {rel_tgz}, and no Yarn Berry checksum is recorded for it; restore yarn.lock from version control, or {}", super::common::REVERT_ALL_AND_REVENDOR)),
             None if reused => return Err(format!("no Yarn Berry checksum is recorded for the committed {rel_tgz}; re-run online so the patch service can supply it")),
             None => return Err(format!("the patch service supplied no Yarn Berry checksum for {name}; retry after the server artifact is ready")),
         };

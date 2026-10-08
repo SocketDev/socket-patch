@@ -124,6 +124,7 @@ fn render(out: &Discovery, root: &Path) -> Value {
         unattested,
         contested,
         shadowed,
+        install_trees,
         read: _,
         withheld: _,
         // Already folded into `unattested` by the time a run returns.
@@ -296,6 +297,13 @@ fn render(out: &Discovery, root: &Path) -> Value {
                 })
             })
             .collect::<Vec<_>>()
+            .into();
+    }
+    if !install_trees.is_empty() {
+        rendered["install_trees"] = install_trees
+            .iter()
+            .map(|(file, root)| (path_str(file), Value::from(path_str(root))))
+            .collect::<Map<_, _>>()
             .into();
     }
     rendered

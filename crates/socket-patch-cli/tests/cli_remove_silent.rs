@@ -12,14 +12,14 @@
 //! `get_api_client_with_overrides` in core for every command and is
 //! out of scope for `remove`'s `--silent` gating.
 
+#[path = "common/mod.rs"]
+mod common;
+use common::binary;
+
 use std::path::{Path, PathBuf};
 use std::process::Command;
 
 use socket_patch_cli::args::GLOBAL_ARG_ENV_VARS;
-
-fn binary() -> PathBuf {
-    env!("CARGO_BIN_EXE_socket-patch").into()
-}
 
 const ONE_PATCH_MANIFEST: &str = r#"{
   "patches": {
