@@ -470,14 +470,13 @@ impl<'a> DiskSnapshot<'a> {
     }
 
     /// Read `rel` as `content` instead of the disk's: the project as a
-    /// pending write would leave it. Content reads and existence probes see
-    /// the overlay; directory listings (`list_dir`, `python_lock_paths`,
-    /// rush subspace locks) still list the disk. So a file the write would
-    /// CREATE that discovery only finds by listing (a new `pylock.*.toml`, a
-    /// new rush subspace lock) is invisible to a discovery over the overlay,
-    /// and the hosted attribution gate keeps the rewriters' verdict for its
-    /// pin. No hosted rewriter creates such a file today; one that does must
-    /// merge its outputs into the listings first.
+    /// pending write would leave it. Content reads, existence probes (of
+    /// the file and of the directories it implies) and the view's
+    /// directory listings (`list_dir`, `python_lock_paths`) see the
+    /// overlay, so a file the write would CREATE is there for every read
+    /// the view mediates. A read around the view ([`Self::root`]) still
+    /// sees the disk alone; a [`Self::tracked`] recording tells whether
+    /// one happened.
     pub fn overlay(&self, rel: &str, content: &[u8]) {
         self.remember(rel, &Ok(content.to_vec()));
         self.overlaid
@@ -491,6 +490,45 @@ impl<'a> DiskSnapshot<'a> {
             .lock()
             .unwrap_or_else(std::sync::PoisonError::into_inner)
             .contains(rel)
+    }
+
+    /// The direct children of directory `dir` (`""` for the root) that the
+    /// overlaid files imply, as `name -> is_dir`.
+    fn overlaid_children(&self, dir: &str) -> BTreeMap<String, bool> {
+        let overlaid = self
+            .overlaid
+            .lock()
+            .unwrap_or_else(std::sync::PoisonError::into_inner);
+        let mut out = BTreeMap::new();
+        for path in overlaid.iter() {
+            let rest = if dir.is_empty() {
+                Some(path.as_str())
+            } else {
+                path.strip_prefix(dir).and_then(|r| r.strip_prefix('/'))
+            };
+            let Some(rest) = rest.filter(|r| !r.is_empty()) else {
+                continue;
+            };
+            match rest.split_once('/') {
+                Some((name, _)) => {
+                    out.insert(name.to_string(), true);
+                }
+                None => {
+                    out.entry(rest.to_string()).or_insert(false);
+                }
+            }
+        }
+        out
+    }
+
+    /// `rel` is a directory an overlaid file lives under.
+    fn is_overlaid_dir(&self, rel: &str) -> bool {
+        let prefix = format!("{rel}/");
+        self.overlaid
+            .lock()
+            .unwrap_or_else(std::sync::PoisonError::into_inner)
+            .iter()
+            .any(|path| path.starts_with(&prefix))
     }
 
     fn lock(&self) -> std::sync::MutexGuard<'_, ReadCache> {
@@ -523,6 +561,21 @@ impl<'a> DiskSnapshot<'a> {
         self.remember(rel, &read);
         read
     }
+}
+
+/// The UTF-8-named entries of directory `dir` on disk, sorted by name.
+async fn list_disk_dir(dir: &Path) -> io::Result<Vec<DirEntryInfo>> {
+    let mut read = tokio::fs::read_dir(dir).await?;
+    let mut out = Vec::new();
+    while let Ok(Some(entry)) = read.next_entry().await {
+        let Some(name) = entry.file_name().to_str().map(str::to_string) else {
+            continue;
+        };
+        let is_dir = entry.file_type().await.is_ok_and(|t| t.is_dir());
+        out.push(DirEntryInfo { name, is_dir });
+    }
+    out.sort_by(|a, b| a.name.cmp(&b.name));
+    Ok(out)
 }
 
 fn lock_tracking(tracking: &std::sync::Mutex<Tracking>) -> std::sync::MutexGuard<'_, Tracking> {
@@ -575,8 +628,23 @@ impl<'a> ProjectView<'a> {
             snap.touch_listing("");
         }
         match self {
-            ProjectView::Disk(root) | ProjectView::Snapshot(DiskSnapshot { root, .. }) => {
+            ProjectView::Disk(root) => {
                 crate::utils::python_lock::python_lock_paths(root).unwrap_or_default()
+            }
+            ProjectView::Snapshot(snap) => {
+                let mut names =
+                    crate::utils::python_lock::python_lock_paths(snap.root).unwrap_or_default();
+                names.extend(
+                    snap.overlaid_children("")
+                        .into_iter()
+                        .filter(|(name, is_dir)| {
+                            !is_dir && crate::utils::python_lock::is_python_lock_name(name)
+                        })
+                        .map(|(name, _)| name),
+                );
+                names.sort();
+                names.dedup();
+                names
             }
             ProjectView::Memory(project) => project
                 .children("")
@@ -629,7 +697,9 @@ impl<'a> ProjectView<'a> {
             snap.touch(rel);
         }
         match self {
-            ProjectView::Snapshot(snap) if snap.is_overlaid(rel) => true,
+            ProjectView::Snapshot(snap) if snap.is_overlaid(rel) || snap.is_overlaid_dir(rel) => {
+                true
+            }
             ProjectView::Disk(root) | ProjectView::Snapshot(DiskSnapshot { root, .. }) => {
                 tokio::fs::metadata(root.join(rel)).await.is_ok()
             }
@@ -643,7 +713,9 @@ impl<'a> ProjectView<'a> {
             snap.touch(rel);
         }
         match self {
-            ProjectView::Snapshot(snap) if snap.is_overlaid(rel) => true,
+            ProjectView::Snapshot(snap) if snap.is_overlaid(rel) || snap.is_overlaid_dir(rel) => {
+                true
+            }
             ProjectView::Disk(root) | ProjectView::Snapshot(DiskSnapshot { root, .. }) => {
                 tokio::fs::symlink_metadata(root.join(rel)).await.is_ok()
             }
@@ -687,15 +759,20 @@ impl<'a> ProjectView<'a> {
             snap.touch_listing(rel);
         }
         match self {
-            ProjectView::Disk(root) | ProjectView::Snapshot(DiskSnapshot { root, .. }) => {
-                let mut dir = tokio::fs::read_dir(root.join(rel)).await?;
-                let mut out = Vec::new();
-                while let Ok(Some(entry)) = dir.next_entry().await {
-                    let Some(name) = entry.file_name().to_str().map(str::to_string) else {
-                        continue;
-                    };
-                    let is_dir = entry.file_type().await.is_ok_and(|t| t.is_dir());
-                    out.push(DirEntryInfo { name, is_dir });
+            ProjectView::Disk(root) => list_disk_dir(&root.join(rel)).await,
+            ProjectView::Snapshot(snap) => {
+                let created = snap.overlaid_children(rel);
+                let mut out = match list_disk_dir(&snap.root.join(rel)).await {
+                    Ok(out) => out,
+                    Err(e) if e.kind() == io::ErrorKind::NotFound && !created.is_empty() => {
+                        Vec::new()
+                    }
+                    Err(e) => return Err(e),
+                };
+                for (name, is_dir) in created {
+                    if !out.iter().any(|e| e.name == name) {
+                        out.push(DirEntryInfo { name, is_dir });
+                    }
                 }
                 out.sort_by(|a, b| a.name.cmp(&b.name));
                 Ok(out)
@@ -1059,6 +1136,42 @@ mod tests {
         let plain = DiskSnapshot::new(root);
         plain.begin_recording();
         assert!(plain.end_recording().is_none());
+    }
+
+    /// A file an overlay CREATES is there for every read the view
+    /// mediates: listings (also of a directory the disk lacks), directory
+    /// probes and the root Python lock names.
+    #[tokio::test]
+    async fn an_overlaid_creation_is_listed() {
+        let tmp = tempfile::tempdir().unwrap();
+        let root = tmp.path();
+        std::fs::create_dir(root.join("sub")).unwrap();
+        std::fs::write(root.join("sub/old"), "").unwrap();
+        let snap = DiskSnapshot::new(root);
+        snap.overlay("sub/new", b"x");
+        snap.overlay("sub/old", b"y");
+        snap.overlay("gone/deep/file", b"z");
+        snap.overlay("pylock.toml", b"");
+        let view = ProjectView::Snapshot(&snap);
+        let names = |entries: Vec<DirEntryInfo>| -> Vec<(String, bool)> {
+            entries.into_iter().map(|e| (e.name, e.is_dir)).collect()
+        };
+        assert_eq!(
+            names(view.list_dir("sub").await.unwrap()),
+            [("new".to_string(), false), ("old".to_string(), false)]
+        );
+        assert_eq!(
+            names(view.list_dir("gone").await.unwrap()),
+            [("deep".to_string(), true)]
+        );
+        assert!(view.list_dir("absent").await.is_err());
+        assert!(view.exists("gone/deep").await);
+        assert!(view.exists_no_follow("gone").await);
+        assert!(!view.exists("gon").await);
+        assert_eq!(view.python_lock_paths(), ["pylock.toml"]);
+        let root_names = names(view.list_dir("").await.unwrap());
+        assert!(root_names.contains(&("gone".to_string(), true)));
+        assert!(root_names.contains(&("pylock.toml".to_string(), false)));
     }
 
     #[tokio::test]

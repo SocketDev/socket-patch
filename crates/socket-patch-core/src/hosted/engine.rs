@@ -980,13 +980,19 @@ pub enum FinalDiscovery {
     /// [`RewriteOptions::prior_discovery`]: still the caller's to read.
     Prior,
     /// A discovery of the project with the pass's writes overlaid (the
-    /// project read when the gate ran). A directory listing does not see an
-    /// overlaid file the disk lacks (see
+    /// project read when the gate ran). Every read the view mediates sees
+    /// the overlay, created files included (see
     /// [`DiskSnapshot::overlay`](crate::vendor::lock_inventory::DiskSnapshot::overlay)),
-    /// so it equals a discovery of the written disk only when every written
-    /// file already existed or is one no discovery lists for
-    /// ([`overlay_creation_is_invisible`]).
-    Overlaid(Box<crate::vex::discover::Discovery>),
+    /// so it equals a discovery of the written disk when every written file
+    /// already existed, or when discovery read nothing around the view
+    /// (`view_only`), or when each created file is one no such read can
+    /// see ([`overlay_creation_is_invisible`]).
+    Overlaid {
+        discovery: Box<crate::vex::discover::Discovery>,
+        /// Discovery read the project only through the overlaid view (no
+        /// raw disk read: the vlt store, sbt evidence, a vendored feed).
+        view_only: bool,
+    },
 }
 
 /// Whether CREATING `rel` (a write over no existing regular file) leaves a
@@ -1245,25 +1251,33 @@ async fn unattributed_pins(
                     };
                     after.insert(rel, entry);
                 }
-                crate::vex::discover::discover_patched_refs_view(ProjectView::Memory(&after), &opts)
-                    .await
+                let discovery = crate::vex::discover::discover_patched_refs_view(
+                    ProjectView::Memory(&after),
+                    &opts,
+                )
+                .await;
+                (discovery, true)
             }
             Some(root) => {
-                let after = crate::vendor::lock_inventory::DiskSnapshot::new(root);
+                // Tracked only to learn whether discovery read around the
+                // overlay (see `FinalDiscovery::Overlaid::view_only`).
+                let after = crate::vendor::lock_inventory::DiskSnapshot::tracked(root);
                 for (rel, bytes) in written {
                     after.overlay(rel, bytes);
                 }
-                crate::vex::discover::discover_patched_refs_view(
+                after.begin_recording();
+                let discovery = crate::vex::discover::discover_patched_refs_view(
                     ProjectView::Snapshot(&after),
                     &opts,
                 )
-                .await
+                .await;
+                (discovery, after.end_recording().is_some())
             }
         })
     };
     let discovery = match (reused, &fresh) {
         (Some(prior), _) => prior,
-        (None, Some(fresh)) => fresh,
+        (None, Some((fresh, _))) => fresh,
         (None, None) => unreachable!("a pass reuses the prior discovery or discovers afresh"),
     };
     // The management commands' own view of the result: an attributable
@@ -1356,7 +1370,10 @@ async fn unattributed_pins(
     let discovery = match (same_origins, fresh) {
         (false, _) => None,
         (true, None) => Some(FinalDiscovery::Prior),
-        (true, Some(fresh)) => Some(FinalDiscovery::Overlaid(Box::new(fresh))),
+        (true, Some((fresh, view_only))) => Some(FinalDiscovery::Overlaid {
+            discovery: Box::new(fresh),
+            view_only,
+        }),
     };
     Gated {
         vetoed,
@@ -3254,12 +3271,17 @@ mod tests {
         let done = gated_left_pad_rewrite(tmp.path(), &configured, Some(&before)).await;
         assert!(done.rewrite.files.contains_key("package-lock.json"));
         assert_eq!(done.confirmed.len(), 1, "{:?}", done.rewrite.warnings);
-        let Some(FinalDiscovery::Overlaid(overlaid)) = &done.final_discovery else {
+        let Some(FinalDiscovery::Overlaid {
+            discovery: overlaid,
+            view_only,
+        }) = &done.final_discovery
+        else {
             panic!(
                 "expected the overlaid discovery: {:?}",
                 done.final_discovery
             );
         };
+        assert!(*view_only, "npm discovery reads only through the view");
         write_rewrite(tmp.path(), &done);
         let after = discover_configured(tmp.path(), &configured).await;
         assert_eq!(format!("{overlaid:?}"), format!("{after:?}"));
@@ -3291,7 +3313,10 @@ mod tests {
         // Without a prior discovery, the gate discovers the (unwritten)
         // project itself and hands that back.
         let done = gated_left_pad_rewrite(tmp.path(), &configured, None).await;
-        let Some(FinalDiscovery::Overlaid(fresh)) = &done.final_discovery else {
+        let Some(FinalDiscovery::Overlaid {
+            discovery: fresh, ..
+        }) = &done.final_discovery
+        else {
             panic!("expected a fresh discovery: {:?}", done.final_discovery);
         };
         assert_eq!(format!("{fresh:?}"), format!("{prior:?}"));

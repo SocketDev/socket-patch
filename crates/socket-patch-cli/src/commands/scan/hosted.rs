@@ -657,9 +657,10 @@ enum Written<'a> {
 ///   it first. Failing that, when the rewrite planned nothing, the gate's
 ///   own discovery of the unwritten project.
 /// - Files written: the gate's discovery over exactly those writes
-///   ([`FinalDiscovery::Overlaid`]), when every written path existed before
-///   or is one no discovery finds by listing a directory
-///   ([`engine::overlay_creation_is_invisible`]).
+///   ([`FinalDiscovery::Overlaid`]), when every written path existed
+///   before, or discovery read only through the overlaid view (which shows
+///   created files too), or each created path is one no read around the
+///   view sees ([`engine::overlay_creation_is_invisible`]).
 ///
 /// [`FinalDiscovery::Overlaid`]: socket_patch_core::hosted::engine::FinalDiscovery::Overlaid
 /// [`engine::overlay_creation_is_invisible`]: socket_patch_core::hosted::engine::overlay_creation_is_invisible
@@ -670,17 +671,19 @@ fn discovery_after_writes<'d>(
     healed_store: Option<&std::collections::BTreeMap<String, String>>,
 ) -> Option<&'d socket_patch_core::vex::discover::Discovery> {
     use socket_patch_core::hosted::engine::{overlay_creation_is_invisible, FinalDiscovery};
-    let overlaid = match gate {
-        Some(FinalDiscovery::Overlaid(discovery)) => Some(&**discovery),
+    let (overlaid, view_only) = match gate {
+        Some(FinalDiscovery::Overlaid {
+            discovery,
+            view_only,
+        }) => (Some(&**discovery), *view_only),
         // The gate read `prior` itself (see `engine::rewrite`).
-        Some(FinalDiscovery::Prior) | None => None,
+        Some(FinalDiscovery::Prior) | None => (None, false),
     };
     let candidate = match written {
         Written::Nothing => prior.or(overlaid),
         Written::Previewed => prior,
-        Written::Landed { created } => {
-            overlaid.filter(|_| created.iter().all(|rel| overlay_creation_is_invisible(rel)))
-        }
+        Written::Landed { created } => overlaid
+            .filter(|_| view_only || created.iter().all(|rel| overlay_creation_is_invisible(rel))),
     };
     candidate.filter(|discovery| {
         healed_store.is_none_or(|after| discovery.vlt_bundled_copies.as_ref() == Some(after))
@@ -2848,8 +2851,14 @@ mod tests {
         use socket_patch_core::hosted::engine::FinalDiscovery;
         use socket_patch_core::vex::discover::Discovery;
         let prior = Discovery::default();
-        let overlaid = FinalDiscovery::Overlaid(Box::default());
-        let Some(FinalDiscovery::Overlaid(gate)) = Some(&overlaid) else {
+        let overlaid = FinalDiscovery::Overlaid {
+            discovery: Box::default(),
+            view_only: false,
+        };
+        let Some(FinalDiscovery::Overlaid {
+            discovery: gate, ..
+        }) = Some(&overlaid)
+        else {
             unreachable!()
         };
         let same = |got: Option<&Discovery>, want: &Discovery| {
@@ -2870,12 +2879,27 @@ mod tests {
                 gate
             ));
         }
-        // A created file a directory listing finds (a new pylock, a rush
-        // subspace lock): the overlay never listed it, so discover again.
+        // Any other created file, when discovery also read around the
+        // overlaid view (which alone shows created files): discover again.
         let written = Written::Landed {
             created: &[".npmrc", "pylock.toml"],
         };
         assert!(discovery_after_writes(Some(&prior), Some(&overlaid), written, None).is_none());
+        // ...but a discovery that read only through the view saw it.
+        let view_only = FinalDiscovery::Overlaid {
+            discovery: Box::default(),
+            view_only: true,
+        };
+        let Some(FinalDiscovery::Overlaid {
+            discovery: seen, ..
+        }) = Some(&view_only)
+        else {
+            unreachable!()
+        };
+        assert!(same(
+            discovery_after_writes(Some(&prior), Some(&view_only), written, None),
+            seen
+        ));
         // Files landed, but the gate counted another origin or discovered
         // nothing: scan's pre-write discovery is stale, so discover again.
         assert!(discovery_after_writes(Some(&prior), None, landed, None).is_none());
@@ -2889,14 +2913,19 @@ mod tests {
         assert!(
             discovery_after_writes(Some(&prior), Some(&overlaid), landed, Some(&after)).is_none()
         );
-        let saw = |copies: &std::collections::BTreeMap<String, String>| {
-            FinalDiscovery::Overlaid(Box::new(Discovery {
+        let saw = |copies: &std::collections::BTreeMap<String, String>| FinalDiscovery::Overlaid {
+            discovery: Box::new(Discovery {
                 vlt_bundled_copies: Some(copies.clone()),
                 ..Discovery::default()
-            }))
+            }),
+            view_only: false,
         };
         let current = saw(&after);
-        let Some(FinalDiscovery::Overlaid(current_gate)) = Some(&current) else {
+        let Some(FinalDiscovery::Overlaid {
+            discovery: current_gate,
+            ..
+        }) = Some(&current)
+        else {
             unreachable!()
         };
         assert!(same(
