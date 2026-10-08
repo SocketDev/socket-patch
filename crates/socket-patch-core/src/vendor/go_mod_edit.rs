@@ -628,7 +628,13 @@ fn apply_socket_replace(
     if !body.is_empty() && !body.ends_with('\n') {
         body.push_str(eol);
     }
-    if !body.is_empty() && !body.ends_with(&format!("{eol}{eol}")) {
+    // A trailing blank line counts whichever break spells it: on a mixed
+    // file the blank may be `\r\n` while `eol` is the majority `\n`.
+    let ends_blank = body
+        .strip_suffix('\n')
+        .map(|rest| rest.strip_suffix('\r').unwrap_or(rest))
+        .is_some_and(|rest| rest.ends_with('\n'));
+    if !body.is_empty() && !ends_blank {
         body.push_str(eol);
     }
     body.push_str(&want_line);
@@ -1901,6 +1907,15 @@ replace (
             assert!(appended.ends_with(&format!("@v1.4.2{eol}")), "{appended:?}");
             assert_eq!(appended.matches('\n').count(), 2, "{appended:?}");
         }
+        // An existing trailing blank line is reused even when its break is
+        // the minority style: no second blank before the directive.
+        let crlf_blank = "module m\n\ngo 1.21\n\nrequire github.com/foo/bar v1.4.2\r\n\r\n";
+        let upserted =
+            upsert_replace_entry(crlf_blank, "github.com/foo/bar", "v1.4.2", GO_PATCHES_DIR)
+                .unwrap()
+                .unwrap();
+        let appended = upserted.strip_prefix(crlf_blank).expect("an append");
+        assert!(appended.starts_with("replace "), "{appended:?}");
     }
 
     #[test]
