@@ -3487,6 +3487,56 @@ async fn requirements_in_root_includes_are_inventoried() {
     assert_eq!(sorted_pairs(&in_memory), sorted_pairs(&entries));
 }
 
+/// #721: pip decodes a requirements file by its BOM, so a UTF-16 root
+/// file and a UTF-16 include (what Windows PowerShell 5.1's `pip freeze >`
+/// writes) are inventoried like their UTF-8 text, on disk and in memory.
+#[tokio::test]
+async fn requirements_utf16_files_are_inventoried() {
+    fn utf16(text: &str, le: bool) -> Vec<u8> {
+        let mut out = if le {
+            vec![0xFF, 0xFE]
+        } else {
+            vec![0xFE, 0xFF]
+        };
+        for unit in text.encode_utf16() {
+            out.extend(if le {
+                unit.to_le_bytes()
+            } else {
+                unit.to_be_bytes()
+            });
+        }
+        out
+    }
+    for le in [true, false] {
+        let root_bytes = utf16("-r requirements/base.txt\r\nidna==3.7\r\n", le);
+        let base_bytes = utf16("six==1.16.0\r\n", !le);
+        let tmp = tempfile::tempdir().unwrap();
+        std::fs::create_dir_all(tmp.path().join("requirements")).unwrap();
+        std::fs::write(tmp.path().join("requirements.txt"), &root_bytes).unwrap();
+        std::fs::write(tmp.path().join("requirements/base.txt"), &base_bytes).unwrap();
+        let entries = inventory_pypi_locks(tmp.path()).await.unwrap();
+        assert_eq!(
+            sorted_pairs(&entries),
+            vec![
+                ("idna".to_string(), "3.7".to_string()),
+                ("six".to_string(), "1.16.0".to_string()),
+            ],
+            "le={le}: {entries:?}"
+        );
+
+        let mut project = MemoryProject::new();
+        project.insert("requirements.txt", MemoryEntry::Binary(root_bytes.into()));
+        project.insert(
+            "requirements/base.txt",
+            MemoryEntry::Binary(base_bytes.into()),
+        );
+        let in_memory = super::pypi::inventory_pypi_locks_in(&ProjectView::Memory(&project))
+            .await
+            .unwrap();
+        assert_eq!(sorted_pairs(&in_memory), sorted_pairs(&entries));
+    }
+}
+
 /// pip applies an index option from ANY file of the tree globally, so an
 /// `--index-url` inside an include keeps the root file's hashed pins
 /// unverifiable too (the `public_index` rule spans the whole tree).
