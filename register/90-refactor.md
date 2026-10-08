@@ -1,11 +1,12 @@
 ### Refactor routine (`refactor`, hourly, highest leverage first)
-_Last updated 2026-10-08T02:20Z · main @ d7f8679_
+_Last updated 2026-10-08T03:10Z · main @ b762f41_
 
 **In flight:**
+- [#1106](https://github.com/SocketDev/socket-patch/pull/1106): the macOS PDM site probe runs through `utils::process::output_within`; a guard test rejects new production `kill_on_drop` spawns (pending: `vendor/npm_dir.rs`). Issue #1067 (C48, slice: `pdm_site`; the `npm_dir` git exchange remains, blocked on #1026). `state: ready`, handed to the burn-down.
 - [#1103](https://github.com/SocketDev/socket-patch/pull/1103): `go.sum` edits through `GoSumEditor` only; deletes the oracle-only free functions and names the key rule once. Issue #631 (E52, slice: steps 2–3; the move to `formats/golang/sum.rs` remains). `state: ready`, handed to the burn-down.
-- REFACTOR.md no longer caps open PRs; the file-overlap skip rule still applies. With 39 open PRs touching ~1000 files, only rows whose files no open PR changes are eligible.
+- REFACTOR.md no longer caps open PRs; the file-overlap skip rule still applies. With 38 open PRs touching ~1020 files, only rows whose files no open PR changes are eligible.
 - Maintainer drafts (decided issues): [#1021](https://github.com/SocketDev/socket-patch/pull/1021) (#615), [#1027](https://github.com/SocketDev/socket-patch/pull/1027) (#704), [#1030](https://github.com/SocketDev/socket-patch/pull/1030) (#808), [#1031](https://github.com/SocketDev/socket-patch/pull/1031) (#966), [#1036](https://github.com/SocketDev/socket-patch/pull/1036) (#973), [#1041](https://github.com/SocketDev/socket-patch/pull/1041) (#648), [#1049](https://github.com/SocketDev/socket-patch/pull/1049) (#792), [#1051](https://github.com/SocketDev/socket-patch/pull/1051) (#580).
-- October 7 campaign (duplicate business logic, one PR per seam; register rows in brackets): #1026 credentials [C59], #1029 trust signals [C61], #1032 JVM layout [E77, E69], #1033 VEX attestation [E72], #1034 target grammar [C62], #1035 supersede lifecycle [E71], #1038 paths and roots [C64], #1039 atomic takeover [E70], #1042 `.socket` containment [C60, C42], #1043 command cycles and UI text [C65, C12], #1044 governing locks [E75], #1045 `PurlKey` [C63], #1046 test hygiene [C66], #1050 vendored liveness [E74], #1057 yarn grammar [E08, E76], #1058 pinned check [E73].
+- October 7 campaign (duplicate business logic, one PR per seam; register rows in brackets): #1026 credentials [C59], #1029 trust signals [C61], #1032 JVM layout [E77, E69], #1033 VEX attestation [E72], #1034 target grammar [C62], #1035 supersede lifecycle [E71], #1038 paths and roots [C64], #1039 atomic takeover [E70], #1043 command cycles and UI text [C65, C12], #1044 governing locks [E75], #1045 `PurlKey` [C63], #1046 test hygiene [C66], #1050 vendored liveness [E74], #1057 yarn grammar [E08, E76], #1058 pinned check [E73]. #1042 `.socket` containment [C60, C42] merged as `ddc3bfb`.
 
 **Merged:**
 - [#1015](https://github.com/SocketDev/socket-patch/pull/1015): the vendored-reference scan reads every `VENDORED` row and accepts the bare uuid dir. Issues #832, #958 (E61). `8e521f9` (+308 / −41). Left: dead `eco == "maven2"` arm in `commands/vendor.rs`.
@@ -20,12 +21,13 @@ _Last updated 2026-10-08T02:20Z · main @ d7f8679_
 | 1 | #990 (E24, child 1 of #989): one `vendor::revert::finish` with an explicit `KeepPolicy` for the 12 copied finish blocks | 0 | 1 | ≈12 | L | ≈26 | skipped: all 12 backend files changed by open PRs (#1008, #1009, #1026, #1039, #1041, #1043, #1050, #1051, #1057, …) |
 | 2 | #922 (E22, child 1 of #920): one `VendorEntry::npm` constructor for the 7 npm-family ledger tails | 0 | 1 | ≈7 | L | ≈16 | skipped: claimed; drivers changed by #1008 |
 | 3 | #998 (C56): one NotFound-only manifest probe (5 `metadata().is_err()` copies) | 1 | 1 | ≈5 | M | ≈13 | skipped: `commands/vendor.rs` changed by 11 open PRs |
-| 4 | #631 (E52) step 1: move `go_sum_edit.rs` to `formats/golang/sum.rs` | 0 | 1 | 0 | L | ≈2 | skipped: `redirect/mod.rs`, `vendor/mod.rs`, `formats/mod.rs` changed by open PRs; steps 2–3 in #1103 |
-| 5 | #1067 (C48 rest): route `pdm_site` / `npm_dir` child deadlines through `utils::process` | 0 | 0 | ≈2 | L | ≈4 | skipped: `npm_dir.rs` and `utils/process.rs` changed by #1026 |
+| 4 | #914 (C51): agent-mode jar members hashed through the streaming zip comparator (1,067 → 26 MiB peak on a 1 GiB member) | 0 | 0 | 1 | L | ≈5 | skipped: `patch/jvm_jar.rs` changed by #1032, #1041 |
+| 5 | #1067 (C48) slice 1: `pdm_site` through `output_within` + guard | 0 | 1 | 1 | L | ≈4 | **taken: #1106** (only eligible slice); slice 2 (`npm_dir`) waits on #1026 |
 
-Re-ranked 2026-10-08T02:00Z under the uncapped REFACTOR.md. Every open `refactor`/`arch-audit` issue was checked against the files of the 39 open PRs; #631 steps 2–3 (one file, `vendor/go_sum_edit.rs`) was the only eligible slice, and it went to #1103. Score now uses 2·D per REFACTOR.md.
+Re-ranked 2026-10-08T03:00Z at `b762f41`. Every open `refactor`/`arch-audit` issue was matched (by the `.rs` paths its body names, then by grep of the symbols) against the files of the 38 open PRs; only #1067's `pdm_site` slice and #649's stray `launch.json` were free. #1067 won and went to #1106. The eight `arch-refactor/*` drafts with a stale heartbeat (#1021, #1027, #1030, #1031, #1036, #1041, #1049, #1051) are maintainer-authored drafts, not routine PRs: don't take them over.
 
 **Notes:**
+- `crawlers/python_crawler/pdm_site.rs` is compiled only on macOS, and the sandbox can't cross-check `aarch64-apple-darwin` (`ring` needs an Apple cc). To test it, temporarily change its `mod` line in `python_crawler.rs` to `#[cfg(unix)] #[allow(dead_code)]` and revert before committing.
 - Overlap check recipe: list `/pulls?state=open`, fetch `/pulls/<n>/files` for each (≈40 calls), and match exact paths; suffix matches on `mod.rs` / `client.rs` give false positives.
 - To delete a refactor oracle safely: first refactor the kept code while the oracle test still runs, then capture the oracle's outputs on odd inputs as fixed expectations, then delete it (done in #1103).
 - The sandbox runs as root, so 4 core lib tests fail on main and on branches alike: `copy_tree::relax_loop_must_not_traverse_symlinked_root`, `vlt_heal::an_unremovable_hidden_lock_keeps_every_store_entry`, `pypi_poetry::wire_write_failure_maps_error_and_leaves_lock_untouched`, `pypi_requirements::wire_failure_rolls_back_already_written_files`.
