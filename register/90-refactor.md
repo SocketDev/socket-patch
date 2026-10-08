@@ -1,12 +1,13 @@
 ### Refactor routine (`refactor`, hourly, highest leverage first)
-_Last updated 2026-10-08T05:10Z · main @ 05fd82b_
+_Last updated 2026-10-08T06:45Z · main @ ea09714_
 
 **In flight:**
+- [#1110](https://github.com/SocketDev/socket-patch/pull/1110): one `formats::cargo::manifest` reader (`toml_edit`, `[package]` else `[project]`) for the crawler, VEX product and `cargo_tag`; deletes the crawler's line scanner. Issue #693 (E15, slice 1; `vendor/cargo.rs` `path_crate_version`/`declared_cargo_minor` and #651 remain, blocked by #1026/#1039/#1041/#1043/#1050). Parse cost 0.5 µs → 81 µs per manifest, disclosed. `state: ready`.
 - [#1108](https://github.com/SocketDev/socket-patch/pull/1108): one `utils::line_endings::terminator` (CRLF → CRLF, mixed → majority, else LF) for 7 inserted-line sites: gem lock converge, composer/requirements restore, Pipfile.lock entry formatter, PEP 723 writer, go.mod append/re-join. Issue #815 (E16, slice 1; `detect_eol`, `pypi_uv::newline_of`, Maven ×2, `redirect/mod.rs`, the `crlf` flags and upstream gem's Gemfile restore remain, all in open-PR files). Re-blesses the go/uv equivalence goldens (mixed inputs only). `state: ready`.
 - [#1106](https://github.com/SocketDev/socket-patch/pull/1106): the macOS PDM site probe runs through `utils::process::output_within`; a guard test rejects new production `kill_on_drop` spawns (pending: `vendor/npm_dir.rs`). Issue #1067 (C48, slice: `pdm_site`; the `npm_dir` git exchange remains, blocked on #1026). `state: ready`, handed to the burn-down.
 - [#1103](https://github.com/SocketDev/socket-patch/pull/1103): `go.sum` edits through `GoSumEditor` only; deletes the oracle-only free functions and names the key rule once. Issue #631 (E52, slice: steps 2–3; the move to `formats/golang/sum.rs` remains). `state: ready`, handed to the burn-down.
 - Maintainer drafts (decided issues): [#1021](https://github.com/SocketDev/socket-patch/pull/1021) (#615), [#1027](https://github.com/SocketDev/socket-patch/pull/1027) (#704), [#1030](https://github.com/SocketDev/socket-patch/pull/1030) (#808), [#1031](https://github.com/SocketDev/socket-patch/pull/1031) (#966), [#1036](https://github.com/SocketDev/socket-patch/pull/1036) (#973), [#1041](https://github.com/SocketDev/socket-patch/pull/1041) (#648), [#1049](https://github.com/SocketDev/socket-patch/pull/1049) (#792), [#1051](https://github.com/SocketDev/socket-patch/pull/1051) (#580).
-- October 7 campaign (duplicate business logic, one PR per seam; register rows in brackets): #1026 credentials [C59], #1029 trust signals [C61], #1032 JVM layout [E77, E69], #1033 VEX attestation [E72], #1034 target grammar [C62], #1035 supersede lifecycle [E71], #1038 paths and roots [C64], #1039 atomic takeover [E70], #1043 command cycles and UI text [C65, C12], #1044 governing locks [E75], #1045 `PurlKey` [C63], #1046 test hygiene [C66], #1050 vendored liveness [E74], #1057 yarn grammar [E08, E76], #1058 pinned check [E73]. #1042 `.socket` containment [C60, C42] merged as `ddc3bfb`.
+- October 7 campaign (duplicate business logic, one PR per seam; register rows in brackets): #1026 credentials [C59], #1029 trust signals [C61], #1032 JVM layout [E77, E69], #1033 VEX attestation [E72], #1034 target grammar [C62], #1035 supersede lifecycle [E71], #1038 paths and roots [C64], #1039 atomic takeover [E70], #1043 command cycles and UI text [C65, C12], #1044 governing locks [E75], #1045 `PurlKey` [C63], #1046 test hygiene [C66], #1050 vendored liveness [E74], #1057 yarn grammar [E08, E76], #1058 pinned check [E73]. Merged: #1042 [C60, C42] `ddc3bfb`, #1033 [E72], #1038 [C64], #1046 [C66], #1035 [E71], #1044 [E75].
 
 **Merged:**
 - [#1015](https://github.com/SocketDev/socket-patch/pull/1015): the vendored-reference scan reads every `VENDORED` row and accepts the bare uuid dir. Issues #832, #958 (E61). `8e521f9` (+308 / −41). Left: dead `eco == "maven2"` arm in `commands/vendor.rs`.
@@ -18,15 +19,16 @@ _Last updated 2026-10-08T05:10Z · main @ 05fd82b_
 
 | # | Candidate | B | U | D | R | Score | Note |
 |---|---|:-:|:-:|:-:|:-:|:-:|---|
-| 1 | #990 (E24, child 1 of #989): one `vendor::revert::finish` for the 12 copied finish blocks | 0 | 1 | ≈12 | L | ≈26 | skipped: all 12 backend files changed by open PRs |
-| 2 | #922 (E22): one `VendorEntry::npm` constructor for 7 npm-family ledger tails | 0 | 1 | ≈7 | L | ≈16 | skipped: claimed; drivers changed by #1008 |
-| 3 | #815 (E16) slice 1: `line_endings::terminator` for the 7 copies in free files | 0 | 1 | 7 | L | ≈16 | **taken: #1108** |
-| 4 | #906 (E25): one `stage_prebuilt` for the 4 `<eco>_service_copy` pipelines | 0 | 1 | 4–5 | L | ≈11 | skipped: `vendor/{cargo,composer_lock,gem,golang,service_fetch}.rs` changed by #1026, #1041 and others |
-| 5 | #998 (C56): one NotFound-only manifest probe | 1 | 1 | ≈5 | M | ≈13 | skipped: `commands/vendor.rs` changed by 11 open PRs |
+| 1 | #693 (E15) slice 1: one `formats::cargo::manifest` reader for crawler, VEX, `cargo_tag` | 0 | 1 | ≈3.5 | L | ≈9 | **taken: #1110** |
+| 2 | #990 (E24, child 1 of #989): one `vendor::revert::finish` for the 12 copied finish blocks | 0 | 1 | ≈12 | L | ≈26 | skipped: backend files changed by open PRs |
+| 3 | #922 (E22): one `VendorEntry::npm` constructor for 7 npm-family ledger tails | 0 | 1 | ≈7 | L | ≈16 | skipped: claimed; drivers changed by #1008 |
+| 4 | #936 (E66): Poetry 2.x LF locks through the shared engine | 0 | 1 | 2 | M | ≈4 | skipped: `vendor/pypi_poetry.rs` changed by #1043 |
+| 5 | #906 (E25): one `stage_prebuilt` for the 4 `<eco>_service_copy` pipelines | 0 | 1 | 4–5 | L | ≈11 | skipped: `vendor/{cargo,gem,golang,service_fetch}.rs` changed by #1026, #1041 and others |
 
-Re-ranked 2026-10-08T05:10Z at `05fd82b` against the files of the 39 open PRs: only #649 (score 0) is free. #1107 (C75) overlaps #1026/#1041/#1049 and waits on a trust-default decision; #1090 and every #1089 covgap child overlap open PRs. Issues with backticked links hide their paths from a body-path match: check symbol definitions.
+Re-ranked 2026-10-08T06:00Z at `ea09714` against the files of the 32 open PRs (510 files). Free now: `crawlers/` except `npm`/`ruby`, `formats/cargo`, `vex/product.rs`, `vendor/cargo_tag.rs`; #693 was the only scoring candidate entirely inside them. #747, #883, #895, #1012 each still touch one busy file (`hosted/engine.rs`, `vendor/pypi_*`, `ecosystem_dispatch.rs`, `vendor/registry_fetch.rs`).
 
 **Notes:**
+- `toml_edit::Document::parse` costs about 81 µs per real crates.io `Cargo.toml` (release), against 0.5 µs for an early-exit line scanner. Disclose it whenever a hot crawl path moves to `toml_edit`.
 - Equivalence goldens (`tests/equivalence/*.golden`, re-bless with `SOCKET_PATCH_BLESS_GOLDEN=1`) feed one input in five through a mixed-ending generator, so any line-ending rule change moves them. Show that only mixed cases can move (a rule argument plus a chunk count) before you re-bless.
 - Upstream gem's `restore_manifest` pins CRLF output for a CRLF Gemfile holding an LF block (an older rewriter wrote one). Migrate it together with the forward Gemfile writer in `redirect/mod.rs`, never alone.
 - `crawlers/python_crawler/pdm_site.rs` is compiled only on macOS, and the sandbox can't cross-check `aarch64-apple-darwin` (`ring` needs an Apple cc). To test it, temporarily change its `mod` line in `python_crawler.rs` to `#[cfg(unix)] #[allow(dead_code)]` and revert before committing.
