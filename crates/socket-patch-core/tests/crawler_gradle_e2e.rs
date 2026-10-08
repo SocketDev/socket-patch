@@ -607,7 +607,7 @@ fn home_precedence() {
     let m = Machine::new();
     let base = m.jvm_env();
     assert_eq!(base.gradle.as_ref().unwrap().files21, m.gradle_files21());
-    assert_eq!(base.m2_repo, m.m2());
+    assert_eq!(base.m2_repo, Some(m.m2()));
 
     let mut env = m.env.clone();
     env.insert("GRADLE_USER_HOME".into(), "/guh".into());
@@ -635,12 +635,12 @@ fn home_precedence() {
     env.insert("M2_HOME".into(), "/m2home".into());
     assert_eq!(
         JvmEnv::resolve(&env, Os::Unix, None).m2_repo,
-        PathBuf::from("/mrl")
+        Some(PathBuf::from("/mrl"))
     );
     env.remove("MAVEN_REPO_LOCAL");
     assert_eq!(
         JvmEnv::resolve(&env, Os::Unix, None).m2_repo,
-        PathBuf::from("/m2home/repository")
+        Some(PathBuf::from("/m2home/repository"))
     );
 }
 

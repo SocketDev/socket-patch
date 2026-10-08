@@ -1247,16 +1247,14 @@ pub async fn run(args: RollbackArgs) -> i32 {
     };
     for id in &identifiers {
         let found = ledgers.matching(id);
-        let mut matched = !found.is_empty();
+        // Hosted pins live in the lockfiles, not in a store: matched by the
+        // identifier, or as another generation of a matched manifest key.
+        let pins =
+            socket_patch_core::ledgers::hosted_pins_matching(&hosted_pins, id, &found.manifest);
+        let matched = !found.is_empty() || !pins.is_empty();
         manifest_scope.extend(found.manifest);
         vendor_scope.extend(found.vendor.into_iter().map(|(k, _)| k));
-        // Hosted pins live in the lockfiles, not in a store.
-        for (purl, uuid) in &redirect_records {
-            if patch_matches(purl, uuid, id) {
-                hosted_scope.insert(purl.clone());
-                matched = true;
-            }
-        }
+        hosted_scope.extend(pins.into_iter().map(|pin| pin.purl));
         if !matched {
             let hint = if id.starts_with("pkg:") || looks_like_uuid(id) {
                 String::new()

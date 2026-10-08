@@ -27,7 +27,8 @@ pub mod verify;
 pub use build::{build_document, BuildOptions};
 pub use discover::{
     discover_patched_refs, discover_patched_refs_in, discover_patched_refs_with, Diag,
-    DiscoverOptions, Discovery, PatchedRef, Recognized, Unattested, UnlockedPin, WiringMode,
+    DiscoverOptions, Discovery, PatchedRef, Recognized, Unattested, UnattestedKind, UnlockedPin,
+    WiringMode,
 };
 pub use product::{detect_product, DetectResult};
 pub use schema::{

@@ -441,12 +441,31 @@ pub struct ContestedRef {
     pub other: PathBuf,
 }
 
-/// A ref discovery emits (so rollback, remove and list find the wiring)
-/// that must not be attested: the files show a build that resolves the
-/// package from somewhere the pin does not reach. Today: a Gradle lock
-/// entry above the hosted pin's base (the owned script lets that newer
-/// upstream release resolve), so that build consumes no patch. The CLI's
-/// VEX plan omits every candidate of `(purl, uuid)` with `detail`.
+/// Why an [`Unattested`] ref's wiring does not reach the copy a build runs.
+#[derive(Debug, Clone, Copy, PartialEq, Eq, PartialOrd, Ord)]
+pub enum UnattestedKind {
+    /// A Gradle lock entry above the hosted pin's base: the owned script
+    /// lets that newer upstream release resolve.
+    LockAboveBase,
+    /// The ref's own pnpm lock names a package that bundles a copy of it
+    /// (`bundledDependencies`): pnpm unpacks that copy from the parent's
+    /// tarball, where no wiring reaches, and does not lock its version.
+    BundledCopy,
+    /// `deno.lock` locks the same `name@version`: `deno install` installs
+    /// a `package.json` project's npm deps from it, never from the
+    /// npm-family lock that carries the wiring.
+    DenoLock,
+}
+
+/// A ref discovery emits (so rollback, remove and list find the wiring,
+/// and the ledgers' liveness gates still see it wired) that must not be
+/// attested: the files show a build that may run a copy the pin does not
+/// reach ([`UnattestedKind`]). The CLI's VEX plan omits every candidate of
+/// `(purl, uuid)` with `detail`. Unlike a contest
+/// ([`Discovery::unpatched_copy`], [`Discovery::contest_across_locks`]),
+/// this never drops the ref, so `vendor --check` and `scan` keep treating
+/// the wiring as live — the right answer when re-running `scan` / `vendor`
+/// could never clear the evidence.
 #[derive(Debug, Clone, PartialEq, Eq, PartialOrd, Ord)]
 pub struct Unattested {
     /// Canonical base purl ([`canonical_base_purl`]).
@@ -455,6 +474,49 @@ pub struct Unattested {
     /// Root-relative file that shows the bypass.
     pub file: PathBuf,
     pub detail: String,
+    pub kind: UnattestedKind,
+}
+
+/// Which refs an [`UnwiredCopy`] may stand beside.
+#[derive(Debug, Clone, PartialEq, Eq, PartialOrd, Ord)]
+pub enum CopyTarget {
+    /// Exactly this canonical base purl.
+    Purl(String),
+    /// An npm package of this name, whatever its version.
+    NpmName(String),
+    /// Every ref.
+    Any,
+}
+
+/// A copy some build installs where no Socket wiring reaches, recorded by
+/// an extractor ([`Discovery::unwired_copy`]) and turned into
+/// [`Unattested`] marks for the refs it may stand beside once every
+/// extractor has run ([`Discovery::unattest_unwired_copies`]).
+#[derive(Debug, Clone, PartialEq, Eq, PartialOrd, Ord)]
+pub struct UnwiredCopy {
+    /// Only refs of this root-relative file; `None` = refs of any file.
+    pub(crate) scope: Option<PathBuf>,
+    pub(crate) target: CopyTarget,
+    /// Root-relative file that shows the copy.
+    pub(crate) file: PathBuf,
+    /// Completes "patch <uuid> is wired, but …"; names the file.
+    pub(crate) detail: String,
+    pub(crate) kind: UnattestedKind,
+}
+
+impl UnwiredCopy {
+    fn covers(&self, r: &PatchedRef) -> bool {
+        if self.scope.as_ref().is_some_and(|f| *f != r.source_file) {
+            return false;
+        }
+        match &self.target {
+            CopyTarget::Purl(purl) => PurlKey::same(purl, &r.purl),
+            CopyTarget::NpmName(name) => crate::utils::purl::purl_name_version(&r.purl)
+                .and_then(|(_, version)| npm_purl(name, version))
+                .is_some_and(|p| PurlKey::same(&p, &r.purl)),
+            CopyTarget::Any => true,
+        }
+    }
 }
 
 /// Everything [`discover_patched_refs`] found.
@@ -479,6 +541,9 @@ pub struct Discovery {
     pub unpatched_copies: Vec<UnpatchedCopy>,
     /// Refs in `refs` whose wiring a build bypasses ([`Unattested`]).
     pub unattested: Vec<Unattested>,
+    /// Copies no wiring reaches, pending [`Discovery::unattest_unwired_copies`];
+    /// always empty once discovery returns (folded into `unattested`).
+    pub unwired_copies: Vec<UnwiredCopy>,
     /// Refs dropped because another lock contests them ([`ContestedRef`]).
     pub contested: Vec<ContestedRef>,
 }
@@ -821,13 +886,53 @@ impl Discovery {
 
     /// Record that the ref `(purl, uuid)` is wired but bypassed by the
     /// build `file` shows ([`Unattested`]). Pushed beside the ref itself.
-    pub(crate) fn unattested(&mut self, purl: &str, uuid: &str, file: &str, detail: String) {
+    pub(crate) fn unattested(
+        &mut self,
+        purl: &str,
+        uuid: &str,
+        file: &str,
+        detail: String,
+        kind: UnattestedKind,
+    ) {
         self.unattested.push(Unattested {
             purl: canonical_base_purl(purl),
             uuid: uuid.to_string(),
             file: PathBuf::from(file),
             detail,
+            kind,
         });
+    }
+
+    /// Record a copy some build installs where no Socket wiring reaches,
+    /// when the files cannot tie it to a ref's exact `name@version` or
+    /// cannot say the build runs it ([`UnwiredCopy`]). Every ref it may
+    /// stand beside is marked [`Unattested`] — a missed attestation at
+    /// worst, never a false one — and stays a ref, so no ledger claim dies
+    /// over evidence a rewire could never clear.
+    pub(crate) fn unwired_copy(&mut self, copy: UnwiredCopy) {
+        self.unwired_copies.push(copy);
+    }
+
+    /// Mark every surviving ref an [`UnwiredCopy`] covers [`Unattested`]
+    /// (the first covering copy names the cause), once every extractor has
+    /// run.
+    fn unattest_unwired_copies(&mut self) {
+        let copies = std::mem::take(&mut self.unwired_copies);
+        let marks: Vec<Unattested> = self
+            .refs
+            .iter()
+            .filter_map(|r| {
+                let c = copies.iter().find(|c| c.covers(r))?;
+                Some(Unattested {
+                    purl: r.purl.clone(),
+                    uuid: r.uuid.clone(),
+                    file: c.file.clone(),
+                    detail: c.detail.clone(),
+                    kind: c.kind,
+                })
+            })
+            .collect();
+        self.unattested.extend(marks);
     }
 
     fn finalize(&mut self) {
@@ -911,6 +1016,7 @@ async fn discover_with_ctx(ctx: DiscoverCtx<'_>) -> Discovery {
     deno::extract(&ctx, &mut out).await;
     out.contest_within_locks();
     out.contest_across_locks();
+    out.unattest_unwired_copies();
     out.recognized.extend(ctx.take_recognized());
     out.finalize();
     out
@@ -1091,7 +1197,7 @@ impl<'a> DiscoverCtx<'a> {
 /// `vendored = true`, `socket-patch-vendor-<uuid>` (maven's vendored repo
 /// id). Exact grammar only — a suffix or a non-canonical uuid is not ours.
 pub(crate) fn socket_patch_name_uuid(name: &str, vendored: bool) -> Option<String> {
-    crate::patch::redirect::socket_patch_name_uuid_exact(name.trim(), vendored).map(str::to_string)
+    crate::patch::redirect::generation::pin_name_uuid(name.trim(), vendored).map(str::to_string)
 }
 
 /// Every Socket patch identity `text` MENTIONS, by wiring mode — the sweep
@@ -2290,8 +2396,10 @@ pub(crate) mod testing {
             let ctx = self.ctx();
             let mut out = Discovery::default();
             extract(&ctx, &mut out).await;
-            // Same-lock copies contest within one extractor's own locks.
+            // Same-lock copies contest within one extractor's own locks,
+            // and its unwired copies mark its own refs.
             out.contest_within_locks();
+            out.unattest_unwired_copies();
             let swept = ctx.take_recognized();
             assert_recognition_covers_refs(&out, &swept, "the ctx sweep", Some(self.root()));
             out.recognized.extend(swept);

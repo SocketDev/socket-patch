@@ -84,7 +84,7 @@ use socket_patch_core::vendor::state::{VendorArtifact, VendorEntry, VendorState}
 use socket_patch_core::vex::discover::{
     vendor_ref, Discovery, LedgerLiveness, PatchedRef, WiringMode,
 };
-use socket_patch_core::vex::FailedPatch;
+use socket_patch_core::vex::{FailedPatch, UnattestedKind};
 
 use crate::args::GlobalArgs;
 use crate::ui::plural;
@@ -195,6 +195,38 @@ pub(crate) const NOTE_API_AUTH_FALLBACK: &str = "api_auth_fallback";
 /// records a release above its base, which that build resolves instead
 /// (`vex::Unattested`).
 pub(crate) const NOTE_LOCK_ABOVE_BASE: &str = "vex_gradle_lock_above_base";
+/// Omission tag and note: an npm pin is wired, but its pnpm lock names a
+/// package that bundles a copy of it, which no wiring reaches
+/// (`vex::Unattested`, `UnattestedKind::BundledCopy`).
+pub(crate) const NOTE_PNPM_BUNDLED_COPY: &str = "vex_pnpm_bundled_copy";
+/// Omission tag and note: an npm pin is wired, but `deno.lock` locks the
+/// same version, which `deno install` installs without the wiring
+/// (`vex::Unattested`, `UnattestedKind::DenoLock`).
+pub(crate) const NOTE_DENO_LOCK_COPY: &str = "vex_deno_lock_copy";
+
+/// The omission tag of an [`Unattested`](socket_patch_core::vex::Unattested)
+/// ref, and the remedy its note ends with.
+fn unattested_note(kind: UnattestedKind) -> (&'static str, &'static str) {
+    match kind {
+        UnattestedKind::LockAboveBase => (
+            NOTE_LOCK_ABOVE_BASE,
+            "not attested until that build resolves the patch (re-lock it, or roll the patch \
+             back once upstream ships the fix)",
+        ),
+        UnattestedKind::BundledCopy => (
+            NOTE_PNPM_BUNDLED_COPY,
+            "not attested while that package bundles it; the wiring itself is intact, so \
+             re-running `scan` / `vendor` does not change this (drop or upgrade the bundling \
+             package)",
+        ),
+        UnattestedKind::DenoLock => (
+            NOTE_DENO_LOCK_COPY,
+            "not attested while deno.lock locks the same version; the wiring itself is \
+             intact, so re-running `scan` / `vendor` does not change this (drop the entry from \
+             deno.lock if Deno does not install this project's npm dependencies)",
+        ),
+    }
+}
 
 fn note(code: &'static str, detail: String) -> PlanNote {
     PlanNote { code, detail }
@@ -330,8 +362,9 @@ pub(crate) async fn plan(common: &GlobalArgs, sources: Sources, assume_live: &[S
     }
     let superseded = attach_discovered(&mut cands, &discovery, &vendor, &conflicts);
     // Wired, but a build bypasses the pin (`Unattested`: a Gradle lock
-    // above the hosted base resolves the newer upstream release): the ref
-    // keeps rollback, remove and list working, and the patch is omitted.
+    // above the hosted base resolves the newer upstream release, a pnpm
+    // bundled copy, a deno.lock copy): the ref keeps rollback, remove,
+    // list and the ledgers' liveness working, and the patch is omitted.
     cands.retain(|c| {
         let pkg = canonical_base_purl(&c.key);
         let Some(u) = discovery
@@ -341,12 +374,12 @@ pub(crate) async fn plan(common: &GlobalArgs, sources: Sources, assume_live: &[S
         else {
             return true;
         };
-        gated.push(failed(&c.key, NOTE_LOCK_ABOVE_BASE));
+        let (code, remedy) = unattested_note(u.kind);
+        gated.push(failed(&c.key, code));
         notes.push(note(
-            NOTE_LOCK_ABOVE_BASE,
+            code,
             format!(
-                "{}: patch {} is wired, but {}; not attested until that build resolves the \
-                 patch (re-lock it, or roll the patch back once upstream ships the fix)",
+                "{}: patch {} is wired, but {}; {remedy}",
                 c.key, c.uuid, u.detail
             ),
         ));
@@ -1549,6 +1582,7 @@ mod tests {
             uuid: U1.into(),
             file: "b/gradle.lockfile".into(),
             detail: "b/gradle.lockfile:1 locks it above the patched 1.10.0".into(),
+            kind: UnattestedKind::LockAboveBase,
         });
         let sources = |discovery: Discovery| Sources {
             manifest: PatchManifest::new(),
