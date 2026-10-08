@@ -1470,17 +1470,23 @@ jobs:
 
       - name: Install Maven ${{ matrix.maven || '3.9.16' }}
         if: steps.jvm.outputs.maven == 'true'
-        # Straight from the Apache archive (sha512-verified), so a leg gets
-        # exactly the release it names rather than the runner's Maven.
-        # --ssl-revoke-best-effort: see the `test` job's vexctl step.
+        # The exact release a leg names rather than the runner's Maven. The
+        # tarball comes from Maven Central's CDN (well under a second);
+        # archive.apache.org throttles bulk downloads to 1.5-5.5 minutes per
+        # leg. Its sha512 still comes from the Apache archive (Central has
+        # none for 3.6.3/3.8.9), so the bytes are checked against a digest
+        # from a second origin. --ssl-revoke-best-effort: see the `test`
+        # job's vexctl step.
         shell: bash
         env:
           MAVEN_VERSION: ${{ matrix.maven || '3.9.16' }}
         run: |
           major="${MAVEN_VERSION%%.*}"
-          url="https://archive.apache.org/dist/maven/maven-${major}/${MAVEN_VERSION}/binaries/apache-maven-${MAVEN_VERSION}-bin.tar.gz"
+          file="apache-maven-${MAVEN_VERSION}-bin.tar.gz"
+          url="https://repo.maven.apache.org/maven2/org/apache/maven/apache-maven/${MAVEN_VERSION}/${file}"
+          sha_url="https://archive.apache.org/dist/maven/maven-${major}/${MAVEN_VERSION}/binaries/${file}.sha512"
           curl -fsSL --retry 5 --retry-all-errors --ssl-revoke-best-effort "$url" -o "$RUNNER_TEMP/maven.tgz"
-          curl -fsSL --retry 5 --retry-all-errors --ssl-revoke-best-effort "$url.sha512" -o "$RUNNER_TEMP/maven.sha512"
+          curl -fsSL --retry 5 --retry-all-errors --ssl-revoke-best-effort "$sha_url" -o "$RUNNER_TEMP/maven.sha512"
           python -c 'import hashlib, pathlib, os; p=pathlib.Path(os.environ["RUNNER_TEMP"]); assert hashlib.sha512((p/"maven.tgz").read_bytes()).hexdigest() == (p/"maven.sha512").read_text().split()[0]'
           # Python accepts native Windows paths for both archive and destination.
           python -m tarfile -e "$RUNNER_TEMP/maven.tgz" "$RUNNER_TEMP"
