@@ -149,7 +149,9 @@ fn apply_silent_online_download_failure_keeps_error_output() {
     );
     let chatter = stderr_chatter(&stderr);
     assert!(
-        chatter.iter().any(|l| l.contains("could not be downloaded")),
+        chatter
+            .iter()
+            .any(|l| l.contains("could not be downloaded")),
         "--silent must keep the download-failure error (errors only, \
          never nothing); stderr was: {stderr:?}"
     );

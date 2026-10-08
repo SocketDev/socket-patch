@@ -14,7 +14,15 @@ and so does `apply` (`yarn_pnp_unsupported`), while standalone `vex` still
 attests a hosted lock's `checksum:` pin once the PnP loader (`.pnp.cjs`)
 resolves the package through the hosted url. A loader written before the lock
 was rewired still runs the registry copy, so `vex` omits the package
-(`package_not_found`) until `yarn install` rewrites it (#519).
+(`package_not_found`) until `yarn install` rewrites it (#519). Plug'n'Play is
+decided by the configured linker (`YARN_NODE_LINKER`, else the nearest rc file
+at or above the project that sets `nodeLinker`, else the home folder's rc file;
+the rc file is `.yarnrc.yml` unless `YARN_RC_FILENAME` renames it; unset means
+berry's default, `pnp`), not by whether a `.pnp.*` loader happens to exist:
+`vendor` refuses a lock-only PnP checkout up front, and a stale `.pnp.js` left
+by a Yarn 2 migration to `node-modules` or `pnpm` is ignored. Yarn 1 PnP
+(`installConfig.pnp`, a classic `yarn.lock`) has no `nodeLinker`, so its
+loader is always refused, whatever a berry setting says.
 
 ## Hosted pin shape and registry credentials
 
