@@ -1,6 +1,6 @@
 [agent] Progress ledger for the scheduled pnpm bug-hunt routine (label pm:pnpm).
 
-Last updated: 2026-10-08 (run 31), main `05ecc6e`, latest release 4.0.0.
+Last updated: 2026-10-08 (run 32), main `ea09714`, latest release 4.0.0.
 
 Method: real pnpm installs. Hosted, vendored and global agent mode run against a local Python mock of the patch API (batch, by-package, view with inline blobs, `patches/blob/<hash>`, package grant, hosted tarball, `/registry/<name>/<ver>` mirror; `ajv-keywords@3.5.2` serves as the peer-dependency package). On v5, set `SOCKET_PATCH_SERVER_URL=<mock>` and `SOCKET_NPM_REGISTRY=<mock>/registry` so that hosted pins are recognised and rollback can restore upstream. The oracle is a marker prepended to `index.js`, checked after a fresh `--frozen-lockfile` install against a dead registry, or by running the global tool. The repo's pinned matrix (`.github/workflows/pnpm-compatibility.yml`) already covers plain hosted and vendored installs on pnpm 1–12. This ledger tracks what it doesn't.
 
@@ -316,6 +316,18 @@ Run 31 additions (main `05ecc6e`, Linux):
 
 #1096 isn't a regression: release 4.0.0 behaves the same. pnpm 8.x, 9.x and 10.0.0–10.4.1 reject a workspace file that has keys but no `packages:`; 10.5.0+ accept it.
 
+Run 32 additions (main `ea09714`, Linux):
+
+| pnpm (lock) | Supersede A → B: hosted re-pin / vendored re-vendor (fresh frozen, `vex`, rollback byte-exact) | Takeover + supersede (hosted A → vendored B / vendored A → hosted B) | `--max-new-patches 1`, 3 pkgs: hosted / vendored | Agent `virtualStoreDir: ../../vs` (#1038) | Hosted + `enableGlobalVirtualStore` (pin, fresh frozen, `vex`, rollback) | Vendored + user `pnpm.overrides` in package.json | Workspace file only `---` / `%YAML` / `---`+`...` (hosted) | `--update` on a pnpm global / project install |
+| --- | --- | --- | --- | --- | --- | --- | --- | --- |
+| 8.15.9 (6.0) | untested / pass (absolute specifiers) | untested | untested | untested | n/a | (run 11) | n/a | untested |
+| 9.15.9 | untested | untested | untested | untested | n/a | pass (rollback keeps the user override) | fail #1096 | fail #1111 / fail #1111 |
+| 10.4.1 | — | — | — | — | — | — | fail #1096 | — |
+| 10.34.6 | untested | untested | untested | untested | n/a on CI | pass | (10.5+ accept) | fail #1111 / fail #1111 |
+| 12.10.1 | pass / pass | pass / pass | pass / pass | pass | pass | n/a (pnpm 12 ignores the field) | pass | fail #1111 / fail #1111 |
+
+Re-triage (run 32): #1006 still reproduces on `ea09714` (12.10.1). #1111 isn't a regression: 4.0.0 gives `npm update -g` even for project installs.
+
 Run 20 additions (main `045d7ec`, Linux):
 
 | pnpm (lock) | Vendored parent + vendored dep (`debug`→`ms`): `remove <parent>` / takeover → hosted / `rollback` | `remove <child>` (control) | Hosted parent + dep: remove parent / rollback | Mixed-case names (`Base64`, `JSONStream`): hosted / agent / vendored | User parent-selector / range-selector override (vendored) | Agent `symlink=false` / `hoist=false` | `list -g` |
@@ -352,7 +364,8 @@ Global mode (`-g`, v5 main `2463257`):
 
 ## Backlog
 
-000. #1096 follow-ups: a workspace file holding only `---` / `...` / `%YAML`, and vendored on 10.4.1 with a comment-only file.
+000. #1111 follow-ups: the passive update-notifier text on a real newer release, and a pnpm global install on Windows (`%LOCALAPPDATA%\pnpm`) and macOS. Needs a probe. #1096: marker-only files are done (run 32, commented); vendored on 10.4.1 with a comment-only file is still to do.
+0a. Supersede A → B over a two-document lock (pnpm 11/12 `packageManager` / `configDependencies`) and on 9/10 vendored. Also `remove <B>` after an agent A + hosted B mix (blocked by the permission classifier in run 32).
 00. #1074 follow-ups: the setting in the global `rc` / `config.yaml`, the pnpm 7/8 dialect, Rush, and vendored on 9/10 (12 passes). Handed an unverified npm lead (`package-lock=false`) to discussion #302.
 0. **Maintainer request (global `-g` mode):** the Linux cells are done. Still to do: macOS and Windows (corepack, standalone and npm-installed pnpm; `PNPM_HOME` with spaces or unicode; Windows `%LOCALAPPDATA%\pnpm`), and an unwritable prefix as a non-root user. Full checklist in the 20261001T040000Z entry. Needs a probe branch.
 1. Delete the stale probe branch `bughunt/pnpm/20260930-virtual-store`. `git push --delete` failed through the git proxy in runs 1, 3, 10 and 16, and was denied by the permission policy in runs 2, 5–9, 11–14, 16, 17, 19 and 28, so a maintainer needs to do it. macOS and Windows probes stay on hold until branch cleanup works.
@@ -368,10 +381,10 @@ Global mode (`-g`, v5 main `2463257`):
 8a. #830 follow-ups: a three-level vendored chain, a `scan --mode vendored` re-run over the broken `remove` state, and the pnpm 7/8 workspace dialect.
 8c. #880 / #881 follow-ups: a member of a workspace whose root uses `catalogs`, and the pnpm 7/8 dialect.
 8b. #853 follow-ups: the takeover over a peer-suffixed snapshot key and over a pnpm ≤6 legacy lock, and `vendor --dry-run` (manifest-driven) parity.
-8d. v5 rollout and policy over pnpm locks: `--max-new-patches 1` convergence over 3 hosted pins (9.15.9 / 12.10.1, then a two-document lock on 12.x), and socket.yml `includePaths` in a workspace with `sharedWorkspaceLockfile: false`. Blocked by the permission classifier in run 28.
+8d. v5 rollout and policy over pnpm locks: `--max-new-patches 1` passes on 12.10.1, hosted and vendored (run 32). Still to do: 9.15.9, a two-document lock on 12.x, and socket.yml `includePaths` in a workspace with `sharedWorkspaceLockfile: false`.
 8e. #935 follow-up: `git+` / `github:` copies (`link:` copy done in run 29: pass).
 8f. #1006 follow-ups: a settings-only parent `pnpm-workspace.yaml` (no `packages:`), negated globs (`!examples/**`), pnpm 10 `ignore-workspace`, and vendored from a real member on 11/12 (expect `vendor_pnpm_settings_elsewhere`).
-9. Re-verify the open set when fixes land (#853 core and #880/#881 verified in run 29; #956, #903, #904 and the #935 VEX half verified in run 30): #435, #466, #492, #556, #633, #713, #714, #734, #778, #830, #831 (PR #837, pnpm gitignore matrix), #853, #854, #880, #881, #902, #903, #904 (fix PR #909), #919, #935 (scan half), #1006, #1074 and #1096.
+9. Re-verify the open set when fixes land (#853 core and #880/#881 verified in run 29; #956, #903, #904 and the #935 VEX half verified in run 30): #435, #466, #492, #556, #633, #713, #714, #734, #778, #830, #831 (PR #837, pnpm gitignore matrix), #853, #854, #880, #881, #902, #903, #904 (fix PR #909), #919, #935 (scan half), #1006, #1074, #1096 and #1111.
 9a. BOM follow-ups (#903 / #904): a fresh install of a hosted BOM-`package.json` pin, and Windows checkouts (needs a probe). (Vendored BOM workspace file on 9.15.9 / 10.34.5 done in run 25: #904 reproduces.)
 9b. #902 follow-ups: the setting in the global `rc` / `config.yaml`. (Mirror + tarball URLs became #919 in run 24.)
 9c. #919 follow-ups: scoped `@scope:registry=` mirrors, the hosted → vendored takeover + `vendor --revert` on a mirror, pnpm 7/8 lock dialects, and re-verification once PR #918 (or a successor) covers `restore_pnpm_locks`.
@@ -452,3 +465,5 @@ Global mode (`-g`, v5 main `2463257`):
 - `vendor --revert` with a missing ledger skips with `vendor_orphan_still_wired` and says to "run `socket-patch repair` to re-adopt them", but `repair` answers `vendor_ledger_missing` ("does not rebuild the ledger from lockfiles"). The remedies contradict each other, but it's cosmetic and not pnpm-specific (run 30).
 - Hosted reads only a literal `true` (optionally quoted) as `trustLockfile` already set. For `True` / `yes` it warns that the user's explicit value "was respected", but pnpm 12 treats both as trusted and installs patched. That's cosmetic (run 31).
 - pnpm 11 / 12 ignore `.npmrc` `lockfile=false`, so #1074 applies there only through the `pnpm-workspace.yaml` `lockfile: false` key (run 31).
+- With a stale sibling lock, vendored wires only the governing lock in the #1044 precedence table (vlt > bun > pnpm > yarn > npm) and warns `vendor_multiple_lockfiles`. That's documented. Hosted rewrites every present lock (run 32).
+- `remove <uuid A>` on a release where the agent manifest holds A and a hosted pin holds a superseding B also unwinds B's pin. #1035 designed it that way: every generation of the release goes (run 32).
