@@ -494,7 +494,7 @@ enum RepoKind {
 fn classify_repo(ctx: &DiscoverCtx<'_>, repo: &PomRepo, out: &mut Discovery) -> RepoKind {
     let id = repo.id.as_str();
     let url = repo.url.as_str();
-    let id_socket = id.starts_with("socket-patch-");
+    let id_socket = id.starts_with(crate::patch::redirect::generation::PIN_NAME_PREFIX);
     let id_hosted = socket_patch_name_uuid(id, false);
     let id_vendored = socket_patch_name_uuid(id, true);
     let url_hosted = ctx.hosted_uuid(url);

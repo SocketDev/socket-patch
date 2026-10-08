@@ -367,61 +367,40 @@ pub(crate) async fn entry_file_type(entry: &DirEntry) -> Option<std::fs::FileTyp
     entry.file_type().await.ok()
 }
 
-/// Resolve the user's home directory: `HOME`, then `USERPROFILE`
-/// (Windows), then a literal `"~"` — a harmless non-existent path so
-/// downstream joins probe nothing rather than panic. A set-but-empty
-/// variable counts as unset: honoring `""` would turn every
-/// `home_dir().join(…)` probe into a CWD-relative path, pointing the
-/// crawlers at directories inside the user's project. The shared
-/// fallback chain for every crawler that scans well-known per-user
-/// package roots (`~/.cargo`, `~/.m2`, `~/.nuget`, …) and for
-/// telemetry's home-dir redaction.
-/// The go/composer crawlers deliberately use a stricter
-/// no-home-means-no-path chain instead.
-pub(crate) fn home_dir() -> PathBuf {
-    let home = std::env::var("HOME")
-        .ok()
-        .filter(|h| !h.is_empty())
-        .or_else(|| std::env::var("USERPROFILE").ok().filter(|h| !h.is_empty()))
-        .unwrap_or_else(|| "~".to_string());
-    PathBuf::from(home)
+/// The user's home directory: `HOME`, then `USERPROFILE` (Windows), each
+/// only when set, non-empty and rooted (absolute; on Windows a
+/// current-drive `\Users\u` also counts); otherwise `None`. A relative or
+/// empty value (stripped CI/container/sudo environments, `env -i`) would
+/// turn every `home_dir().join(…)` probe into a CWD-relative path,
+/// pointing the crawlers at directories inside the user's project as if
+/// they were the per-user package roots (`~/.cargo`, `~/.nuget`, …), so a
+/// caller with no home probes nothing there.
+///
+/// The home resolver for the crawlers' well-known per-user roots and
+/// telemetry's home-dir redaction; [`home_from_env`] applies the same rule
+/// to an injected environment (the Maven `~/.m2` default and the Python
+/// crawler's pdm/poetry/pipenv seams). Readers that deliberately follow
+/// another tool's own rule keep theirs: the repository walk's home stop
+/// (git: `HOME` on Unix, `USERPROFILE` on Windows), Gradle's passwd-vs-
+/// `$HOME` check, npm's `.npmrc` resolution, the socket-cli config
+/// location and `update::state`'s cache-dir chain.
+pub(crate) fn home_dir() -> Option<PathBuf> {
+    home_from_env(|k| std::env::var_os(k))
 }
 
-/// Resolve `.`/`..` without touching the filesystem, so a path can be
-/// containment-checked BEFORE it is opened (a canonicalizing check would
-/// have to stat the very path being validated, and would fail on
-/// not-yet-existing directories). Returns `None` when `..` pops above the
-/// path's own root — nothing legitimate does that, so it fails closed.
-///
-/// Symlinks are not resolved: a symlink INSIDE the project pointing out
-/// of it is a pre-existing trust decision of the project's own tree, the
-/// same assumption the rest of the crawler layer makes.
-///
-/// Shared by the composer crawler's `install-path` containment guard and
-/// the ruby crawler's config-sourced `BUNDLE_PATH` containment guard.
-pub(crate) fn normalize_lexically(path: &Path) -> Option<PathBuf> {
-    use std::path::Component;
+/// [`home_dir`]'s rule over an injected environment lookup.
+pub(crate) fn home_from_env(var: impl Fn(&str) -> Option<std::ffi::OsString>) -> Option<PathBuf> {
+    ["HOME", "USERPROFILE"]
+        .into_iter()
+        .filter_map(var)
+        .map(PathBuf::from)
+        .find(|home| is_usable_home(home))
+}
 
-    let mut out = PathBuf::new();
-    let mut depth = 0usize;
-    for component in path.components() {
-        match component {
-            Component::Prefix(_) | Component::RootDir => out.push(component.as_os_str()),
-            Component::CurDir => {}
-            Component::ParentDir => {
-                if depth == 0 {
-                    return None;
-                }
-                out.pop();
-                depth -= 1;
-            }
-            Component::Normal(segment) => {
-                out.push(segment);
-                depth += 1;
-            }
-        }
-    }
-    Some(out)
+/// Whether `home` may anchor per-user probes: not empty and not
+/// CWD-relative.
+pub(crate) fn is_usable_home(home: &Path) -> bool {
+    home.has_root()
 }
 
 /// Atomically commit `content` to `path` via stage + fsync + rename.
@@ -1094,20 +1073,18 @@ mod tests {
         );
     }
 
-    /// Regression: a set-but-empty `HOME` (stripped CI/container/sudo
-    /// environments) must be treated as unset, exactly like the documented
-    /// no-home fallback. Honoring `""` made `home_dir()` return an empty
-    /// `PathBuf`, so every `home_dir().join(".cargo")`-style probe became a
-    /// CWD-relative path and the crawlers scanned directories inside the
-    /// user's project as if they were the per-user package roots.
-    #[test]
-    #[serial_test::serial]
-    fn home_dir_treats_empty_home_as_unset() {
-        let prev_home = std::env::var("HOME").ok();
-        let prev_profile = std::env::var("USERPROFILE").ok();
-        std::env::set_var("HOME", "");
-        std::env::set_var("USERPROFILE", "");
-        let home = home_dir();
+    /// Run `f` with `HOME`/`USERPROFILE` set to `home`/`profile`
+    /// (`None` = unset), restoring both.
+    fn with_home_env<T>(home: Option<&str>, profile: Option<&str>, f: impl FnOnce() -> T) -> T {
+        let prev_home = std::env::var_os("HOME");
+        let prev_profile = std::env::var_os("USERPROFILE");
+        let set = |name: &str, v: Option<&str>| match v {
+            Some(v) => std::env::set_var(name, v),
+            None => std::env::remove_var(name),
+        };
+        set("HOME", home);
+        set("USERPROFILE", profile);
+        let out = f();
         match prev_home {
             Some(v) => std::env::set_var("HOME", v),
             None => std::env::remove_var("HOME"),
@@ -1116,10 +1093,39 @@ mod tests {
             Some(v) => std::env::set_var("USERPROFILE", v),
             None => std::env::remove_var("USERPROFILE"),
         }
+        out
+    }
+
+    /// Regression: a set-but-empty `HOME` (stripped CI/container/sudo
+    /// environments) must be treated as unset. Honoring `""` made
+    /// `home_dir()` return an empty `PathBuf`, so every
+    /// `home_dir().join(".cargo")`-style probe became a CWD-relative path
+    /// and the crawlers scanned directories inside the user's project as
+    /// if they were the per-user package roots.
+    #[test]
+    #[serial_test::serial]
+    fn home_dir_treats_empty_home_as_unset() {
+        assert_eq!(with_home_env(Some(""), Some(""), home_dir), None);
+    }
+
+    /// B66: with no usable home the resolver used to fall back to the
+    /// literal RELATIVE path `~`, which every caller joined onto and so
+    /// probed `./~/.cargo`, `./~/.nuget/packages`, … under the process
+    /// working directory. A relative value is no home either.
+    #[test]
+    #[serial_test::serial]
+    fn home_dir_never_returns_a_relative_path() {
+        assert_eq!(with_home_env(None, None, home_dir), None);
+        assert_eq!(with_home_env(Some("rel/home"), None, home_dir), None);
+        let abs = std::env::temp_dir();
+        let abs = abs.to_str().unwrap();
         assert_eq!(
-            home,
-            PathBuf::from("~"),
-            "empty HOME/USERPROFILE must fall back to the harmless `~` sentinel"
+            with_home_env(Some("~"), Some(abs), home_dir),
+            Some(PathBuf::from(abs))
+        );
+        assert_eq!(
+            with_home_env(Some(abs), Some("elsewhere"), home_dir),
+            Some(PathBuf::from(abs))
         );
     }
 

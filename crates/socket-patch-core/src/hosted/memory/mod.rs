@@ -1551,7 +1551,7 @@ mod tests {
     /// a repository `.yarnrc.yml` above it, as the disk walk does.
     #[tokio::test]
     async fn nested_yarn_root_follows_an_ancestor_yarnrc_linker() {
-        use crate::vendor::lock_inventory::view::detect_npm_lock_flavor_in;
+        use crate::vendor::npm_flavor::detect_npm_lock_flavor_in;
         let mut files: BTreeMap<String, SharedFile> = BTreeMap::new();
         files.insert(
             ".yarnrc.yml".into(),

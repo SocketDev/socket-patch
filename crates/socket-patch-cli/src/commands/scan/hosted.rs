@@ -10,6 +10,7 @@ use futures_util::StreamExt;
 use socket_patch_core::api::client::hold_back_debug;
 use socket_patch_core::api::types::BatchPackagePatches;
 use socket_patch_core::patch::apply_lock::LockGuard;
+use socket_patch_core::patch::redirect::yarnrc::resolve_outer_yarn_mirror_for_process;
 use socket_patch_core::patch::redirect::DepOverride;
 use socket_patch_core::utils::concurrent::{
     api_concurrency, api_concurrency_for, ordered_concurrent,
@@ -1104,6 +1105,10 @@ pub(crate) async fn run_redirect_selected(
         .and_then(|gate| gate.prior)
         .filter(|_| takeover_files.is_empty() && takeover_migrated.is_empty())
         .and_then(|prior| prior.still_current());
+    // The yarn 1 config layers outside the project (env, user, global and
+    // ancestor rc files), located the way yarn 1 does: a mirror set in any
+    // of them refuses the classic rewrite like a project one.
+    let yarn_classic_outer = || resolve_outer_yarn_mirror_for_process(&common.cwd);
     let rewrite_options = || RewriteOptions {
         dry_run: common.dry_run,
         targets_pipenv_lock,
@@ -1115,6 +1120,7 @@ pub(crate) async fn run_redirect_selected(
         trust_lockfile_config: !common.no_trust_lockfile_config,
         npm_allow_remote_config: !common.no_npm_allow_remote_config,
         npm_outer: &npm_outer,
+        yarn_classic_outer: &yarn_classic_outer,
         blocking: true,
         takeover_uuids: takeover_uuids.clone(),
         patch_server_origins: patch_server_origins.clone(),
@@ -1962,6 +1968,7 @@ async fn vendored_takeover(
                     &lock,
                     yarnrc.as_deref(),
                     npmrc.as_deref(),
+                    &resolve_outer_yarn_mirror_for_process(&common.cwd),
                 )
                 .err()
             }

@@ -12,12 +12,7 @@ use std::io;
 use std::path::Path;
 use std::sync::Arc;
 
-use crate::constants::npm_family::{BUN_LOCK, BUN_LOCKB, NPM_LOCKS, PNPM_LOCK, VLT_LOCK};
-use crate::formats::pnpm::{sniff_lock_grammar, PnpmLockGrammar};
-use crate::formats::yarn::{sniff_grammar, YarnLockGrammar, UNIDENTIFIED_DETAIL};
 use crate::utils::fs::{read_regular_to_bytes, read_regular_to_string};
-use crate::vendor::npm_flavor::NpmLockFlavor;
-use crate::vendor::VendorWarning;
 
 /// One in-memory file.
 #[derive(Debug, Clone, PartialEq, Eq)]
@@ -748,6 +743,72 @@ impl<'a> ProjectView<'a> {
         }
     }
 
+    /// A directory (following links on disk; an implied directory in
+    /// memory).
+    pub fn is_dir(&self, rel: &str) -> bool {
+        if let ProjectView::Snapshot(snap) = self {
+            snap.touch(rel);
+        }
+        match self {
+            ProjectView::Snapshot(snap) if snap.is_overlaid_dir(rel) => true,
+            ProjectView::Disk(root) | ProjectView::Snapshot(DiskSnapshot { root, .. }) => {
+                root.join(rel).is_dir()
+            }
+            ProjectView::Memory(project) => project.is_dir(rel),
+        }
+    }
+
+    /// The `nodeLinker` yarn would use here, `None` when unset: what
+    /// [`crate::crawlers::pkg_managers::live_pnp_marker_with`] asks to tell a
+    /// live PnP loader from a stale one (#975). On disk it is the disk
+    /// probe (environment, rc files, home rc). A memory snapshot is the
+    /// repository alone, not the host it is scanned on: only the
+    /// repository's own `.yarnrc.yml` files count (the project's, then those
+    /// above it, the closest setting winning, as on disk), never the host's
+    /// `YARN_NODE_LINKER`, `YARN_RC_FILENAME` or home rc file. A classic
+    /// lock is yarn 1, which has no `nodeLinker`.
+    pub(crate) fn yarn_node_linker(&self) -> Option<String> {
+        use crate::crawlers::pkg_managers::effective_yarn_linker;
+        // The disk probe also reads the environment and the rc files above
+        // the project and in the home directory, which no fingerprint
+        // covers: a snapshot's read goes through `root()`, opting its
+        // recording out of reuse (only a tree holding a PnP loader asks).
+        let disk_root = match self {
+            ProjectView::Disk(root) => Some(*root),
+            ProjectView::Snapshot(snap) => Some(snap.root()),
+            ProjectView::Memory(_) => None,
+        };
+        match self {
+            ProjectView::Disk(_) | ProjectView::Snapshot(_) => {
+                let root = disk_root.expect("a disk view has a root");
+                let lock = crate::utils::fs::read_regular_to_string_sync(&root.join("yarn.lock"));
+                effective_yarn_linker(lock.ok().as_deref(), || {
+                    crate::crawlers::pkg_managers::yarn_node_linker(root)
+                })
+            }
+            ProjectView::Memory(project) => {
+                let lock = project.read_text("yarn.lock").ok();
+                effective_yarn_linker(lock.as_deref(), || {
+                    let node_linker = |rc: &str| {
+                        crate::formats::yarn::berry_gates::yarnrc_scalar(rc, "nodeLinker")
+                            .filter(|v| !v.is_empty())
+                            .map(str::to_string)
+                    };
+                    project
+                        .read_text(".yarnrc.yml")
+                        .ok()
+                        .and_then(|rc| node_linker(&rc))
+                        .or_else(|| {
+                            project
+                                .ancestor_yarnrcs
+                                .iter()
+                                .find_map(|rc| node_linker(rc))
+                        })
+                })
+            }
+        }
+    }
+
     /// The path itself is a symbolic link.
     pub fn is_symlink(&self, rel: &str) -> bool {
         if let ProjectView::Snapshot(snap) = self {
@@ -799,130 +860,10 @@ impl<'a> ProjectView<'a> {
     }
 }
 
-/// [`crate::vendor::npm_flavor::detect_npm_lock_flavor`] over a
-/// [`ProjectView`]. The disk variant IS the disk probe; the memory variant
-/// follows the same decision table, with pnpm's own Plug'n'Play layout
-/// never detected (there is no installed store in memory).
-pub(crate) async fn detect_npm_lock_flavor_in(
-    view: &ProjectView<'_>,
-) -> Result<(NpmLockFlavor, Vec<VendorWarning>), (&'static str, String)> {
-    let project = match view {
-        ProjectView::Disk(root) => {
-            return crate::vendor::npm_flavor::detect_npm_lock_flavor(root).await
-        }
-        ProjectView::Snapshot(snap) => {
-            return crate::vendor::npm_flavor::detect_npm_lock_flavor(snap.root()).await
-        }
-        ProjectView::Memory(project) => *project,
-    };
-    let exists = |name: &str| project.contains(name);
-    let read_lock = |name: &str| -> Result<String, (&'static str, String)> {
-        project.read_text(name).map_err(|e| {
-            (
-                "vendor_lockfile_missing",
-                format!("cannot read {name}: {e}"),
-            )
-        })
-    };
-
-    // A loader the configured `nodeLinker` disowns is stale (#975). A
-    // memory snapshot is the repository alone, not the host it is scanned
-    // on: only the repository's own `.yarnrc.yml` files count (the
-    // project's, then those above it, the closest setting winning, as on
-    // disk), never the host's `YARN_NODE_LINKER`, `YARN_RC_FILENAME` or
-    // home rc file. A classic lock is yarn 1, which has no `nodeLinker`.
-    let linker = || {
-        let lock = project.read_text("yarn.lock").ok();
-        crate::crawlers::pkg_managers::effective_yarn_linker(lock.as_deref(), || {
-            let node_linker = |rc: &str| {
-                crate::formats::yarn::berry_gates::yarnrc_scalar(rc, "nodeLinker")
-                    .filter(|v| !v.is_empty())
-                    .map(str::to_string)
-            };
-            project
-                .read_text(".yarnrc.yml")
-                .ok()
-                .and_then(|rc| node_linker(&rc))
-                .or_else(|| {
-                    project
-                        .ancestor_yarnrcs
-                        .iter()
-                        .find_map(|rc| node_linker(rc))
-                })
-        })
-    };
-    if let Some(marker) = crate::crawlers::pkg_managers::live_pnp_marker_with(linker, exists) {
-        return Err((
-            "vendor_yarn_berry_unsupported",
-            format!(
-                "found `{marker}`: this is a yarn berry Plug'n'Play project — packages \
-                 live inside .yarn/cache/ zips, not node_modules/, so there is nothing \
-                 vendor could stage or rewire; use `yarn patch <pkg>` instead"
-            ),
-        ));
-    }
-
-    let detected = 'flavor: {
-        if exists(VLT_LOCK) {
-            let text = read_lock(VLT_LOCK)?;
-            match crate::vendor::vlt_lock::sniff_vendor_lock(&text) {
-                Ok(_) => break 'flavor NpmLockFlavor::Vlt,
-                Err(detail) => return Err(("vendor_lockfile_version_unsupported", detail)),
-            }
-        }
-        if exists(BUN_LOCK) || exists(BUN_LOCKB) {
-            break 'flavor NpmLockFlavor::Bun;
-        }
-        if exists(PNPM_LOCK) {
-            let text = read_lock(PNPM_LOCK)?;
-            match sniff_lock_grammar(&text) {
-                Ok(PnpmLockGrammar::V9) => break 'flavor NpmLockFlavor::Pnpm,
-                Ok(PnpmLockGrammar::V54 | PnpmLockGrammar::V60) => {
-                    break 'flavor NpmLockFlavor::PnpmLegacy
-                }
-                Err(detail) => return Err(("vendor_lockfile_version_unsupported", detail)),
-            }
-        }
-        if exists("yarn.lock") {
-            let text = read_lock("yarn.lock")?;
-            match sniff_grammar(&text) {
-                Some(YarnLockGrammar::Berry) => break 'flavor NpmLockFlavor::YarnBerry,
-                Some(YarnLockGrammar::Classic) => break 'flavor NpmLockFlavor::YarnClassic,
-                None => {
-                    return Err((
-                        "vendor_lockfile_version_unsupported",
-                        UNIDENTIFIED_DETAIL.to_string(),
-                    ))
-                }
-            }
-        }
-        if exists(NPM_LOCKS[0]) || exists(NPM_LOCKS[1]) {
-            break 'flavor NpmLockFlavor::PackageLock;
-        }
-        if exists("rush.json") {
-            return Err((
-                "vendor_rush_unsupported",
-                format!(
-                    "found rush.json: this is a Rush monorepo — its single pnpm lockfile \
-                     lives at {}; use `socket-patch scan --mode hosted`, which edits it in \
-                     place",
-                    crate::constants::npm_family::RUSH_COMMON_LOCK_REL
-                ),
-            ));
-        }
-        return Err((
-            "vendor_lockfile_missing",
-            "no package-lock.json, npm-shrinkwrap.json, yarn.lock, pnpm-lock.yaml, bun.lock, \
-             bun.lockb, or vlt-lock.json in the project root"
-                .to_string(),
-        ));
-    };
-    Ok((detected, Vec::new()))
-}
-
 #[cfg(test)]
 mod tests {
     use super::*;
+    use crate::vendor::npm_flavor::{detect_npm_lock_flavor_in, NpmLockFlavor};
 
     fn project(files: &[(&str, MemoryEntry)]) -> MemoryProject {
         let mut p = MemoryProject::new();
@@ -1098,6 +1039,38 @@ mod tests {
                 .0,
             "vendor_yarn_berry_unsupported"
         );
+        // The pnpm-PnP carve-out is shared with disk: a `.pnp.cjs` over an
+        // installed pnpm store (either marker) is pnpm's PnP linker, not
+        // yarn berry.
+        for marker in ["node_modules/.modules.yaml", "node_modules/.pnpm/lock.yaml"] {
+            let pnpm_pnp = project(&[
+                (".pnp.cjs", MemoryEntry::Present),
+                ("pnpm-lock.yaml", text("lockfileVersion: '9.0'\n")),
+                (marker, MemoryEntry::Present),
+            ]);
+            assert_eq!(
+                detect_npm_lock_flavor_in(&ProjectView::Memory(&pnpm_pnp))
+                    .await
+                    .unwrap_err()
+                    .0,
+                "vendor_pnpm_pnp_unsupported",
+                "{marker}"
+            );
+        }
+        // A yarn.lock beside it keeps the yarn berry refusal.
+        let yarn_pnp = project(&[
+            (".pnp.cjs", MemoryEntry::Present),
+            ("pnpm-lock.yaml", text("lockfileVersion: '9.0'\n")),
+            ("yarn.lock", text("")),
+            ("node_modules/.modules.yaml", MemoryEntry::Present),
+        ]);
+        assert_eq!(
+            detect_npm_lock_flavor_in(&ProjectView::Memory(&yarn_pnp))
+                .await
+                .unwrap_err()
+                .0,
+            "vendor_yarn_berry_unsupported"
+        );
         let empty = MemoryProject::new();
         assert_eq!(
             detect_npm_lock_flavor_in(&ProjectView::Memory(&empty))
@@ -1232,6 +1205,30 @@ mod tests {
         let plain = DiskSnapshot::new(root);
         plain.begin_recording();
         assert!(plain.end_recording().is_none());
+    }
+
+    /// A directory probe is fingerprinted like any other, and the yarn
+    /// `nodeLinker` probe, which also reads the environment and rc files
+    /// above the project, opts the recording out of reuse.
+    #[tokio::test]
+    async fn the_dir_and_yarn_linker_probes_keep_the_read_set_honest() {
+        let tmp = tempfile::tempdir().unwrap();
+        let root = tmp.path();
+        let set = recorded(root, |view| {
+            Box::pin(async move {
+                assert!(!view.is_dir("node_modules/.vlt"));
+            })
+        })
+        .await
+        .expect("recorded");
+        assert_eq!(set.len(), 1);
+        std::fs::create_dir_all(root.join("node_modules/.vlt")).unwrap();
+        assert!(!set.unchanged(), "the probed directory appeared");
+
+        let snap = DiskSnapshot::tracked(root);
+        snap.begin_recording();
+        let _ = ProjectView::Snapshot(&snap).yarn_node_linker();
+        assert!(snap.end_recording().is_none(), "an unfingerprinted read");
     }
 
     /// A file an overlay CREATES is there for every read the view

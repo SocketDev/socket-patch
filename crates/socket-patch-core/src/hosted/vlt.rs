@@ -6,9 +6,8 @@
 
 use std::collections::{BTreeMap, BTreeSet};
 
-use crate::constants::npm_family::{
-    BUN_LOCK, BUN_LOCKB, NPM_LOCKS, PNPM_LOCK, VLT_HIDDEN_LOCK_REL, VLT_LOCK, VLT_STORE_DIR,
-};
+use crate::constants::npm_family::{BUN_LOCKB, VLT_HIDDEN_LOCK_REL, VLT_LOCK, VLT_STORE_DIR};
+use crate::formats::governing_locks::{npm_locks_outside, NpmLockFamily};
 use crate::patch::redirect::vlt_preflight::{self, ArtifactProbe, OFFLINE_REASON};
 use crate::patch::redirect::{redact_grant_token, vlt, DepOverride};
 use crate::vendor::lock_inventory::{MemoryEntry, ProjectView};
@@ -82,10 +81,11 @@ pub async fn inputs(view: &ProjectView<'_>) -> BTreeMap<String, String> {
         return files;
     };
     files.insert(VLT_LOCK.to_string(), lock);
-    for sibling in [NPM_LOCKS[0], NPM_LOCKS[1], "yarn.lock", PNPM_LOCK, BUN_LOCK] {
-        if view.is_file(sibling) {
-            files.insert(sibling.to_string(), String::new());
-        }
+    // `bun.lockb` stays out: `vlt_drives` takes it as `bun_lockb_present`.
+    for sibling in npm_locks_outside(NpmLockFamily::Vlt, |lock| {
+        lock != BUN_LOCKB && view.is_file(lock)
+    }) {
+        files.insert(sibling.to_string(), String::new());
     }
     if install_state_present(view) {
         files.insert(VLT_HIDDEN_LOCK_REL.to_string(), String::new());
