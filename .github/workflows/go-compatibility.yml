@@ -7,6 +7,7 @@ name: Go patch compatibility
 
 on:
   pull_request:
+    types: [opened, synchronize, reopened, ready_for_review]
     paths:
       - '.github/workflows/go-compatibility.yml'
       - 'crates/socket-patch-core/src/vendor/go*.rs'
@@ -38,19 +39,15 @@ env:
 
 jobs:
   go:
+    if: github.event.pull_request.draft != true
     strategy:
       fail-fast: false
       matrix:
         os: [ubuntu-latest]
         go: ['1.18.10', '1.21.13', '1.24.13', '1.26.3']
-        include:
-          # macOS-latest dyld refuses binaries without LC_UUID (Go < 1.24
-          # linkers; see ci.yml's vexctl step).
-          - {os: macos-latest, go: '1.24.13'}
-          - {os: macos-latest, go: '1.26.3'}
     runs-on: ${{ matrix.os }}
     timeout-minutes: 45
-    steps:
+    steps: &go-steps
       - uses: actions/checkout@de0fac2e4500dabe0009e67214ff5f5447ce83dd # v6.0.2
         with:
           persist-credentials: false
@@ -75,3 +72,19 @@ jobs:
             --test e2e_golang_hosted_build --test e2e_vendor_golang_build \
             --test e2e_golang_build --test e2e_golang_workspace_build -- --nocapture
           cargo test -p socket-patch-cli --test e2e_vex_lockfile -- golang:: --nocapture
+
+  # The macOS rows of `go`: they run on push to main (and nightly
+  # where scheduled), not on every PR push, so PRs stop queueing on the
+  # small macOS runner pool.
+  go-macos:
+    if: github.event_name != 'pull_request'
+    strategy:
+      fail-fast: false
+      matrix:
+        os: [macos-latest]
+        # macOS-latest dyld refuses binaries without LC_UUID (Go < 1.24
+        # linkers; see ci.yml's vexctl step).
+        go: ['1.24.13', '1.26.3']
+    runs-on: ${{ matrix.os }}
+    timeout-minutes: 45
+    steps: *go-steps
