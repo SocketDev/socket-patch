@@ -1887,22 +1887,6 @@ pub async fn revert_pypi(entry: &VendorEntry, project_root: &Path, dry_run: bool
     revert_pypi_opts(entry, project_root, RevertOpts::new(dry_run)).await
 }
 
-/// Is this pypi-vendored entry still consumed by its project? The prune GC
-/// and the vendored discovery supplement ask this; `None` keeps the entry.
-///
-/// Only the `requirements` flavor has a probe: its requirements tree is
-/// the lock pip installs from, so a pin the user removed or bumped there
-/// proves the entry unused. The other flavors report `None` (cannot
-/// determine), as before.
-pub async fn vendored_entry_in_use(entry: &VendorEntry, project_root: &Path) -> Option<bool> {
-    match entry.flavor.as_deref() {
-        Some("requirements") => {
-            super::pypi_requirements::requirements_entry_in_use(project_root, &entry.uuid).await
-        }
-        _ => None,
-    }
-}
-
 /// Fail-closed twin of [`super::npm_lock::guard_unwired_textual_revert`]
 /// for the Python backends. A ledger entry with NO wiring records cannot
 /// restore any project file — that is the shape `socket-patch repair`

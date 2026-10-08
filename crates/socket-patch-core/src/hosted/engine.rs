@@ -689,7 +689,7 @@ pub async fn read_candidate_files(
         // unreadable, which the planner would otherwise skip silently.
         out.undecodable_reads.retain(|rel| {
             !is_gradle_owned_file(rel)
-                || crate::patch::redirect::gradle::GRADLE_ROOT_FILES.contains(&rel.as_str())
+                || crate::vendor::jvm::layout::GRADLE_ROOT_FILES.contains(&rel.as_str())
         });
     }
     // An sbt build's resolution evidence rides a synthetic key (see
@@ -910,12 +910,15 @@ const GEM_MANIFEST_FILES: [&str; 4] = ["Gemfile", "Gemfile.lock", "gems.rb", "ge
 /// to bundler's own choice, so it can never wire a manifest bundler
 /// ignores:
 ///
-/// - no `BUNDLE_GEMFILE`: unchanged (the rewriter's `gems.rb`-first choice
-///   and its divergence guard are bundler's default discovery);
+/// - no `BUNDLE_GEMFILE`: unchanged for a lone `Gemfile` or `gems.rb`; a
+///   `Gemfile` + `gems.rb` twin is withheld, since bundler 1.x loads the
+///   `Gemfile`, >= 2 loads `gems.rb`, and nothing says which runs
+///   ([`manifest::twin_manifest_refusal`](crate::formats::gem::manifest::twin_manifest_refusal));
 /// - `BUNDLE_GEMFILE` naming the root `Gemfile` / `gems.rb`: the other
 ///   spelling is dropped;
-/// - `BUNDLE_GEMFILE` naming anything else: every spelling is dropped and
-///   [`CandidateFiles::gem_refusal`] says why;
+/// - `BUNDLE_GEMFILE` naming anything else, or bundler 4's
+///   `BUNDLE_LOCKFILE` naming a lock other than the pair's own: every
+///   spelling is dropped and [`CandidateFiles::gem_refusal`] says why;
 /// - a bundler mirror capturing the patch-registry source (`mirror.all`,
 ///   or `mirror.<source>`; see [`crate::formats::gem::mirror`]): every
 ///   spelling is dropped the same way (#681).
@@ -926,7 +929,7 @@ async fn keep_bundler_loaded_gem_files(
     candidates: &[Candidate],
     out: &mut CandidateFiles,
 ) {
-    use crate::formats::gem::manifest::LoadedManifest;
+    use crate::formats::gem::manifest::{self, LoadedManifest};
     let sources: Vec<&str> = candidates
         .iter()
         .filter_map(|c| c.dep.registry_override.as_ref())
@@ -945,8 +948,14 @@ async fn keep_bundler_loaded_gem_files(
         }
     };
     let refusal = if let Some(detail) = loaded.unsupported_detail() {
+        let code = match &loaded {
+            LoadedManifest::UnsupportedLockfile { .. } => {
+                "redirect_gem_bundle_lockfile_unsupported"
+            }
+            _ => "redirect_gem_bundle_gemfile_unsupported",
+        };
         Some(RewriteWarning {
-            code: "redirect_gem_bundle_gemfile_unsupported".into(),
+            code: code.into(),
             detail,
         })
     } else {
@@ -963,8 +972,30 @@ async fn keep_bundler_loaded_gem_files(
             ),
         })
     };
+    // A spelling bundler sees (`File.file?`) even when this run couldn't
+    // read it: a symlink, an unreadable or a non-UTF-8 file still makes the
+    // project a twin, as lock inventory (`view.is_file`) already counts it.
+    let present = |rel: &str| {
+        out.files.contains_key(rel)
+            || view.is_file(rel)
+            || out.symlinked_reads.iter().any(|r| r == rel)
+            || out.unreadable_reads.iter().any(|r| r == rel)
+            || out.undecodable_reads.iter().any(|r| r == rel)
+    };
+    let is_twin = present("gems.rb") && present("Gemfile");
+    let mut twin_ambiguous = None;
     let keep: &[&str] = match (&loaded, &refusal) {
-        (_, Some(_)) | (LoadedManifest::Unsupported { .. }, _) => &[],
+        (_, Some(_))
+        | (LoadedManifest::Unsupported { .. } | LoadedManifest::UnsupportedLockfile { .. }, _) => {
+            &[]
+        }
+        // Default discovery of a twin: bundler 1.x loads the `Gemfile`
+        // and >= 2 loads `gems.rb`, and nothing here says which runs, so
+        // neither pair is wired (#751).
+        (LoadedManifest::Default, None) if is_twin => {
+            twin_ambiguous = Some(manifest::twin_manifest_refusal());
+            &[]
+        }
         (LoadedManifest::Default, None) => return,
         (LoadedManifest::Configured { .. }, None) => {
             let (gemfile, lock) = loaded
@@ -978,7 +1009,10 @@ async fn keep_bundler_loaded_gem_files(
     out.symlinked_reads.retain(|rel| !dropped(rel));
     out.unreadable_reads.retain(|rel| !dropped(rel));
     out.undecodable_reads.retain(|rel| !dropped(rel));
-    out.gem_refusal = refusal;
+    out.gem_refusal = refusal.or(twin_ambiguous.map(|detail| RewriteWarning {
+        code: "redirect_gem_twin_manifest_ambiguous".into(),
+        detail,
+    }));
 }
 
 /// The pypi wheels whose metadata a native lock rewrite needs, in
@@ -1099,16 +1133,6 @@ pub fn pipenv_lock_targets(files: &BTreeMap<String, String>, candidates: &[Candi
     }
     let overrides: Vec<DepOverride> = candidates.iter().map(|c| c.dep.clone()).collect();
     crate::patch::redirect::pipenv_lock_targets(files, &overrides)
-}
-
-/// A dry-run vendored→hosted takeover the disk caller withheld from the
-/// rewriters: its artifact URL and the root locks its vendored wiring
-/// lives in (the wet run splices the hosted URL there, so the
-/// install-policy auto-configs are previewed for those locks).
-#[derive(Debug, Clone)]
-pub struct TakeoverPreview {
-    pub artifact_url: String,
-    pub locks: Vec<String>,
 }
 
 /// The host-dependent inputs of [`rewrite`].
@@ -1292,14 +1316,13 @@ pub fn candidate_presence_needles(dep: &DepOverride) -> Vec<String> {
 ///
 /// `python_metadata` maps a wheel's artifact URL to its fetched METADATA;
 /// `withheld_from_vlt` are the uuids the vlt preflight kept out of the vlt
-/// rewrite; `takeover_previews` are the disk dry run's withheld takeovers.
+/// rewrite.
 pub async fn rewrite(
     view: &ProjectView<'_>,
     read: CandidateFiles,
     candidates: &[Candidate],
     python_metadata: BTreeMap<String, String>,
     withheld_from_vlt: &BTreeSet<String>,
-    takeover_previews: &[TakeoverPreview],
     options: RewriteOptions<'_>,
 ) -> Rewritten {
     let CandidateFiles {
@@ -1477,17 +1500,10 @@ pub async fn rewrite(
         &rewrite,
         &rush_lock_keys,
         &overrides,
-        takeover_previews,
         &options,
     );
-    let (npm_warnings, npmrc_config_write) = npm_allow_remote(
-        view,
-        &files,
-        &rewrite,
-        &overrides,
-        takeover_previews,
-        &options,
-    );
+    let (npm_warnings, npmrc_config_write) =
+        npm_allow_remote(view, &files, &rewrite, &overrides, &options);
     if let Some((text, edit)) = trust_config_write {
         rewrite.files.insert(PNPM_WORKSPACE_REL.to_string(), text);
         // Appended last, after the lock edits it serves. v5 keeps no hosted
@@ -1567,7 +1583,6 @@ fn pnpm_trust(
     rewrite: &RewriteResult,
     rush_lock_keys: &[String],
     overrides: &[DepOverride],
-    takeover_previews: &[TakeoverPreview],
     options: &RewriteOptions<'_>,
 ) -> (Vec<RewriteWarning>, ConfigWrite, bool, bool) {
     let mut pnpm_warnings: Vec<RewriteWarning> = Vec::new();
@@ -1627,26 +1642,6 @@ fn pnpm_trust(
             spliced_rush += 1;
         }
     }
-    // A dry-run vendored→hosted takeover of a purl vendored into the root
-    // pnpm lock: the wet run reverts that wiring and splices the hosted URL
-    // into it, so the trust config is previewed against the root lock (the
-    // vendored text carries the same lockfileVersion).
-    let takeover_pnpm_urls: Vec<&str> = takeover_previews
-        .iter()
-        .filter(|t| t.locks.iter().any(|l| l == "pnpm-lock.yaml"))
-        .map(|t| t.artifact_url.as_str())
-        .collect();
-    let takeover_root: Option<&String> = if takeover_pnpm_urls.is_empty()
-        || !heal_locks.is_empty()
-        || rewrite.files.contains_key("pnpm-lock.yaml")
-    {
-        None
-    } else {
-        files.get("pnpm-lock.yaml")
-    };
-    if let Some(text) = takeover_root {
-        pnpm_lock_texts.push(text);
-    }
     if pnpm_lock_texts.is_empty() {
         return (
             pnpm_warnings,
@@ -1672,8 +1667,6 @@ fn pnpm_trust(
         .zip(present)
         .filter(|(_, present)| *present)
         .filter_map(|(o, _)| url_host(&o.artifact_url))
-        // Dry-run takeover purls land in the root lock on the wet run.
-        .chain(takeover_pnpm_urls.iter().filter_map(|url| url_host(url)))
         .collect();
     hosts.sort_unstable();
     hosts.dedup();
@@ -1686,7 +1679,7 @@ fn pnpm_trust(
     // lockfileVersion >= 9 gets the auto-config — spliced this run, or
     // detected already-redirected (heal path).
     let is_v9 = |text: &String| pnpm_lock_version_major(text).is_some_and(|major| major >= 9);
-    let governing_lock_v9 = heal_locks.iter().copied().chain(takeover_root).any(is_v9)
+    let governing_lock_v9 = heal_locks.iter().copied().any(is_v9)
         || governing
             .iter()
             .filter_map(|key| rewrite.files.get(*key))
@@ -1936,7 +1929,6 @@ fn npm_allow_remote(
     files: &BTreeMap<String, String>,
     rewrite: &RewriteResult,
     overrides: &[DepOverride],
-    takeover_previews: &[TakeoverPreview],
     options: &RewriteOptions<'_>,
 ) -> (Vec<RewriteWarning>, ConfigWrite) {
     let mut npm_warnings: Vec<RewriteWarning> = Vec::new();
@@ -1957,15 +1949,6 @@ fn npm_allow_remote(
             .zip(present)
             .filter(|(_, present)| *present)
             .filter_map(|(o, _)| url_host(&o.artifact_url))
-            // A dry-run vendored→hosted takeover: the wet run reverts the
-            // vendored wiring in a root npm lock and splices the hosted URL
-            // there, so preview the `.npmrc` write too.
-            .chain(
-                takeover_previews
-                    .iter()
-                    .filter(|t| t.locks.iter().any(|l| NPM_LOCKS.contains(&l.as_str())))
-                    .filter_map(|t| url_host(&t.artifact_url)),
-            )
             .collect();
         hosts.sort_unstable();
         hosts.dedup();
@@ -2301,7 +2284,7 @@ pub fn undecodable_guard(undecodable: &[String], candidates: &[Candidate]) -> Op
             // the build itself, which only maven candidates could patch.
             let eco = file_ecosystem(rel)
                 .or((rel.as_str() == "package.json").then_some("npm"))
-                .or(crate::patch::redirect::gradle::GRADLE_ROOT_FILES
+                .or(crate::vendor::jvm::layout::GRADLE_ROOT_FILES
                     .contains(&rel.as_str())
                     .then_some("maven"));
             eco.is_some_and(|eco| candidates.iter().any(|c| c.dep.ecosystem == eco))
@@ -2494,7 +2477,6 @@ mod tests {
             &candidates,
             BTreeMap::new(),
             &BTreeSet::new(),
-            &[],
             options,
         )
         .await;
@@ -2568,7 +2550,6 @@ mod tests {
                 &candidates,
                 BTreeMap::new(),
                 &BTreeSet::new(),
-                &[],
                 options(),
             )
             .await;
@@ -2590,7 +2571,6 @@ mod tests {
                 &cargo,
                 BTreeMap::new(),
                 &BTreeSet::new(),
-                &[],
                 options(),
             )
             .await;
@@ -2852,7 +2832,6 @@ mod tests {
             &candidates,
             BTreeMap::new(),
             &BTreeSet::new(),
-            &[],
             options,
         )
         .await;
@@ -3082,7 +3061,6 @@ snapshots:
                 &candidates,
                 BTreeMap::new(),
                 &BTreeSet::new(),
-                &[],
                 options,
             )
             .await;
@@ -3257,7 +3235,6 @@ snapshots:
             &candidates,
             BTreeMap::new(),
             &BTreeSet::new(),
-            &[],
             options,
         )
         .await;
@@ -3544,6 +3521,10 @@ snapshots:
         PLATFORMS\n  ruby\n\nDEPENDENCIES\n  rails (= 7.0.0)\n\nBUNDLED WITH\n   2.5.22\n";
 
     async fn gem_rewrite(p: &MemoryProject) -> (CandidateFiles, Rewritten) {
+        gem_rewrite_in(&ProjectView::Memory(p)).await
+    }
+
+    async fn gem_rewrite_in(view: &ProjectView<'_>) -> (CandidateFiles, Rewritten) {
         let outer = OuterAllowRemote::default;
         let options = RewriteOptions {
             dry_run: false,
@@ -3557,15 +3538,13 @@ snapshots:
             blocking: false,
         };
         let candidates = vec![gem_candidate()];
-        let view = ProjectView::Memory(p);
-        let read = read_candidate_files(&view, &BTreeSet::new(), &candidates).await;
+        let read = read_candidate_files(view, &BTreeSet::new(), &candidates).await;
         let done = rewrite(
-            &view,
+            view,
             read.clone(),
             &candidates,
             BTreeMap::new(),
             &BTreeSet::new(),
-            &[],
             options,
         )
         .await;
@@ -3613,6 +3592,169 @@ snapshots:
             .iter()
             .map(|w| w.code.as_str())
             .collect()
+    }
+
+    /// #749: bundler 4's `BUNDLE_LOCKFILE` naming another lock leaves every
+    /// gem manifest out of the candidates, and the run says why.
+    #[tokio::test]
+    async fn bundle_lockfile_naming_another_lock_redirects_nothing() {
+        let mut p = MemoryProject::new();
+        p.insert_text("Gemfile", GEMFILE);
+        p.insert_text("Gemfile.lock", GEM_LOCK);
+        p.insert_text("custom.lock", GEM_LOCK);
+        p.insert_text(".bundle/config", "---\nBUNDLE_LOCKFILE: \"custom.lock\"\n");
+        let (read, done) = gem_rewrite(&p).await;
+        assert!(!read.files.contains_key("Gemfile"));
+        assert!(!read.files.contains_key("Gemfile.lock"));
+        assert!(
+            done.rewrite.files.is_empty(),
+            "{:?}",
+            done.rewrite.files.keys()
+        );
+        let codes = warning_codes(&done);
+        assert!(
+            codes.contains(&"redirect_gem_bundle_lockfile_unsupported"),
+            "{codes:?}"
+        );
+    }
+
+    /// #749: a memory view has no real root, so an absolute
+    /// `BUNDLE_LOCKFILE` that would land on the pair's lock if the project
+    /// sat at `/` still names a file outside the project. Bundler opens
+    /// that path, never the in-repo lock, so the pair stays out.
+    #[tokio::test]
+    async fn absolute_bundle_lockfile_redirects_nothing() {
+        for (gems_rb, lock) in [(false, "/Gemfile.lock"), (true, "/gems.locked")] {
+            let mut p = MemoryProject::new();
+            if gems_rb {
+                p.insert_text("gems.rb", GEMFILE);
+                p.insert_text("gems.locked", GEM_LOCK);
+            } else {
+                p.insert_text("Gemfile", GEMFILE);
+                p.insert_text("Gemfile.lock", GEM_LOCK);
+            }
+            p.insert_text(
+                ".bundle/config",
+                format!("---\nBUNDLE_LOCKFILE: \"{lock}\"\n").as_str(),
+            );
+            let (_read, done) = gem_rewrite(&p).await;
+            assert!(
+                done.rewrite.files.is_empty(),
+                "{lock}: {:?}",
+                done.rewrite.files.keys()
+            );
+            let codes = warning_codes(&done);
+            assert!(
+                codes.contains(&"redirect_gem_bundle_lockfile_unsupported"),
+                "{lock}: {codes:?}"
+            );
+        }
+    }
+
+    /// #751: a `Gemfile` + `gems.rb` twin is withheld whatever its locks'
+    /// `BUNDLED WITH` say (which bundler wrote a lock is not which one
+    /// installs it), and the run says why.
+    #[tokio::test]
+    async fn twin_redirects_nothing_whatever_the_locks_say() {
+        let legacy = GEM_LOCK.replace("2.5.22", "1.17.3");
+        for (gemfile_lock, gems_locked) in [
+            (legacy.as_str(), legacy.as_str()),
+            (legacy.as_str(), GEM_LOCK),
+            (GEM_LOCK, GEM_LOCK),
+        ] {
+            let mut p = MemoryProject::new();
+            p.insert_text("Gemfile", GEMFILE);
+            p.insert_text("Gemfile.lock", gemfile_lock);
+            p.insert_text("gems.rb", GEMFILE);
+            p.insert_text("gems.locked", gems_locked);
+            let (_read, done) = gem_rewrite(&p).await;
+            assert!(
+                done.rewrite.files.is_empty(),
+                "{:?}",
+                done.rewrite.files.keys()
+            );
+            let codes = warning_codes(&done);
+            assert!(
+                codes.contains(&"redirect_gem_twin_manifest_ambiguous"),
+                "{codes:?}"
+            );
+        }
+    }
+
+    /// A twin whose other spelling this run can't read (a symlink, an
+    /// unreadable or a non-UTF-8 file) is still a twin: bundler's
+    /// `File.file?` sees it, so neither pair is wired (Bugbot on #768).
+    #[tokio::test]
+    async fn twin_with_an_unreadable_spelling_redirects_nothing() {
+        for (other, entry) in [
+            ("gems.rb", MemoryEntry::Symlink),
+            ("Gemfile", MemoryEntry::Symlink),
+            (
+                "gems.rb",
+                MemoryEntry::Binary(vec![0xff, 0xfe, 0x00].into()),
+            ),
+        ] {
+            let mut p = MemoryProject::new();
+            for (rel, text) in [
+                ("Gemfile", GEMFILE),
+                ("Gemfile.lock", GEM_LOCK),
+                ("gems.rb", GEMFILE),
+                ("gems.locked", GEM_LOCK),
+            ] {
+                if rel != other {
+                    p.insert_text(rel, text);
+                }
+            }
+            p.insert(other, entry);
+            let (_read, done) = gem_rewrite(&p).await;
+            assert!(
+                done.rewrite.files.is_empty(),
+                "{other}: {:?}",
+                done.rewrite.files.keys()
+            );
+            let codes = warning_codes(&done);
+            assert!(
+                codes.contains(&"redirect_gem_twin_manifest_ambiguous"),
+                "{other}: {codes:?}"
+            );
+        }
+    }
+
+    /// On disk, a twin spelling that `stat`s as a regular file but can't
+    /// be read (permission denied) is still a twin: bundler's `File.file?`
+    /// sees it, so neither pair is wired (Bugbot on #768).
+    #[cfg(unix)]
+    #[tokio::test]
+    async fn twin_with_an_unreadable_disk_spelling_redirects_nothing() {
+        use std::os::unix::fs::PermissionsExt;
+        let tmp = tempfile::tempdir().unwrap();
+        let root = tmp.path();
+        for (rel, text) in [
+            ("Gemfile", GEMFILE),
+            ("Gemfile.lock", GEM_LOCK),
+            ("gems.rb", GEMFILE),
+            ("gems.locked", GEM_LOCK),
+        ] {
+            std::fs::write(root.join(rel), text).unwrap();
+        }
+        let gems_rb = root.join("gems.rb");
+        std::fs::set_permissions(&gems_rb, std::fs::Permissions::from_mode(0o000)).unwrap();
+        if std::fs::read(&gems_rb).is_ok() {
+            // Running as root: permissions can't make the read fail.
+            return;
+        }
+        let (_read, done) = gem_rewrite_in(&ProjectView::Disk(root)).await;
+        std::fs::set_permissions(&gems_rb, std::fs::Permissions::from_mode(0o644)).unwrap();
+        assert!(
+            done.rewrite.files.is_empty(),
+            "{:?}",
+            done.rewrite.files.keys()
+        );
+        let codes = warning_codes(&done);
+        assert!(
+            codes.contains(&"redirect_gem_twin_manifest_ambiguous"),
+            "{codes:?}"
+        );
     }
 
     /// #681: `bundle config set --local mirror.all <url>` sends the
@@ -3731,23 +3873,23 @@ snapshots:
         assert!(!done.rewrite.files.contains_key("gems.locked"));
     }
 
-    /// Without `BUNDLE_GEMFILE` nothing changes: `gems.rb` is still the
-    /// spelling bundler (and the rewriter) picks.
+    /// Without `BUNDLE_GEMFILE` a lone `gems.rb` pair is still the one
+    /// bundler (and the rewriter) picks; a twin is withheld
+    /// ([`twin_redirects_nothing_whatever_the_locks_say`]).
     #[tokio::test]
-    async fn default_discovery_still_prefers_gems_rb() {
+    async fn default_discovery_wires_a_lone_gems_rb() {
         let mut p = MemoryProject::new();
-        p.insert_text("Gemfile", GEMFILE);
-        p.insert_text("Gemfile.lock", GEM_LOCK);
         p.insert_text("gems.rb", GEMFILE);
         p.insert_text("gems.locked", GEM_LOCK);
-        let (read, done) = gem_rewrite(&p).await;
-        assert!(read.files.contains_key("Gemfile"));
+        let (_read, done) = gem_rewrite(&p).await;
         assert!(
             done.rewrite.files.contains_key("gems.rb"),
             "{:?}",
             done.rewrite.files.keys()
         );
-        assert!(!done.rewrite.files.contains_key("Gemfile"));
+        assert!(warning_codes(&done)
+            .iter()
+            .all(|c| !c.starts_with("redirect_gem_twin")));
     }
 
     /// #333: the Pipenv planner keys a live lock on the `Pipfile` beside
@@ -3895,7 +4037,6 @@ snapshots:
             &candidates,
             BTreeMap::new(),
             &BTreeSet::new(),
-            &[],
             options,
         )
         .await;

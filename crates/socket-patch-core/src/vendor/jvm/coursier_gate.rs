@@ -24,7 +24,7 @@ use std::collections::BTreeSet;
 use std::path::{Path, PathBuf};
 
 use super::sbt_gate::GateStop;
-use super::{coursier_tree, scala_cli, JvmRefusal, JvmWarning};
+use super::{coursier_tree, layout, scala_cli, JvmRefusal, JvmWarning};
 use crate::crawlers::scala_evidence::{self, ScalaEvidence};
 use crate::formats::sbt::gate::{check_new, GateRefusal};
 use crate::utils::fs::read_regular_to_bytes_sync;
@@ -150,7 +150,7 @@ pub(crate) fn gate(
                 "the last build after vendoring resolved {g}:{a}:{base} from {} instead of {}; \
                  a repository passed on the command line (`-r`) or declared elsewhere wins",
                 path.display(),
-                coursier_tree::TREE_ROOT
+                layout::COURSIER_TREE
             ),
         ));
     }
@@ -308,7 +308,7 @@ fn resolved_elsewhere(
     if !wired_build || !in_tree {
         return None;
     }
-    let tree = [root, canonical_root.as_path()].map(|r| r.join(coursier_tree::TREE_ROOT));
+    let tree = [root, canonical_root.as_path()].map(|r| r.join(layout::COURSIER_TREE));
     e.resolution
         .artifacts
         .get(&(g.to_string(), a.to_string(), base.to_string()))
@@ -689,7 +689,7 @@ mod tests {
         std::fs::create_dir_all(root.join(".socket/vendor")).unwrap();
         std::fs::write(root.join(coursier_tree::INDEX_REL), index).unwrap();
         let tree_jar = root
-            .join(coursier_tree::TREE_ROOT)
+            .join(layout::COURSIER_TREE)
             .join("com/typesafe/config/1.4.3/config-1.4.3.jar");
         let tree_jar = tree_jar.to_string_lossy().into_owned();
         let in_tree: (&str, &str, &str, &[(&str, &str)]) = (

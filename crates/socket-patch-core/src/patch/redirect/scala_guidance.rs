@@ -14,10 +14,7 @@ use super::{
     RewriteWarning,
 };
 
-/// Mill build files.
-pub const MILL_MARKERS: &[&str] = &["build.mill", "build.mill.yaml", "build.sc", ".mill-version"];
-/// scala-cli directory-build markers.
-pub const SCALA_CLI_MARKERS: &[&str] = &["project.scala"];
+use crate::vendor::jvm::layout::{MILL_MARKERS, SCALA_CLI_FILE};
 
 /// The pin a snippet names: the Socket repository and the version to force.
 struct Pin {
@@ -108,7 +105,7 @@ pub fn warn(
     result: &mut RewriteResult,
 ) {
     let mill = MILL_MARKERS.iter().any(|m| files.contains_key(*m));
-    let scala_cli = SCALA_CLI_MARKERS.iter().any(|m| files.contains_key(*m));
+    let scala_cli = files.contains_key(SCALA_CLI_FILE);
     if !mill && !scala_cli {
         return;
     }
@@ -146,7 +143,7 @@ pub fn warn(
 pub fn owns_maven_root(files: &BTreeMap<String, String>) -> bool {
     MILL_MARKERS
         .iter()
-        .chain(SCALA_CLI_MARKERS)
+        .chain([&SCALA_CLI_FILE])
         .any(|m| files.contains_key(*m))
         && no_maven_or_gradle(files)
 }
