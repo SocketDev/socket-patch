@@ -434,10 +434,7 @@ async fn hosted_bom_lock_and_workspace_read_like_their_plain_twins() {
     assert_eq!(code, 0, "scan --mode hosted should succeed on a BOM lock");
     let lock = std::fs::read_to_string(&lock_path).unwrap();
     assert!(lock.starts_with("\u{feff}lockfileVersion:"), "{lock}");
-    assert!(
-        lock.contains(HOSTED_URL),
-        "the BOM lock is redirected: {lock}"
-    );
+    assert!(lock.contains(HOSTED_URL), "the BOM lock is redirected: {lock}");
     let ws_path = tmp.path().join("pnpm-workspace.yaml");
     assert_eq!(
         std::fs::read_to_string(&ws_path).ok().as_deref(),
@@ -452,10 +449,7 @@ async fn hosted_bom_lock_and_workspace_read_like_their_plain_twins() {
         pristine,
         "rollback restores the BOM lock byte for byte"
     );
-    assert!(
-        !ws_path.exists(),
-        "the auto-created workspace file goes too"
-    );
+    assert!(!ws_path.exists(), "the auto-created workspace file goes too");
 
     // A BOM workspace file whose first key is the user's opt-out: left
     // byte-identical (no duplicate `trustLockfile`), lock still redirected.
@@ -481,11 +475,7 @@ async fn hosted_bom_lock_and_workspace_read_like_their_plain_twins() {
             "the lock is still redirected for {user_ws:?}"
         );
         let ws = std::fs::read_to_string(tmp.path().join("pnpm-workspace.yaml")).unwrap();
-        assert_eq!(
-            ws,
-            want.unwrap_or(user_ws),
-            "workspace file for {user_ws:?}"
-        );
+        assert_eq!(ws, want.unwrap_or(user_ws), "workspace file for {user_ws:?}");
         assert_eq!(ws.matches("trustLockfile").count(), 1, "{ws:?}");
     }
 }

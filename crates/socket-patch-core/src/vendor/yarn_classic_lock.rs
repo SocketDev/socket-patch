@@ -1512,7 +1512,11 @@ left-pad@^1.3.0:
             .filter(|&c| c != "vendor_prebuilt_downloaded")
             .collect();
         assert_eq!(codes, ["vendor_yarn_classic_non_registry_legacy_wiring"]);
-        let detail = &warnings.iter().find(|w| w.code == codes[0]).unwrap().detail;
+        let detail = &warnings
+            .iter()
+            .find(|w| w.code == codes[0])
+            .unwrap()
+            .detail;
         assert!(
             detail.contains("host.test/fork")
                 && detail.contains("vendor --revert")

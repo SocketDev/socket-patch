@@ -556,7 +556,8 @@ async fn live_pipfile_lock_conflict_vetoes_the_requirements_redirect() {
 #[tokio::test]
 #[serial]
 async fn platform_wheel_is_not_pinned_into_the_lock() {
-    assert_wheel_tag_is_not_pinned("cp311-cp311-manylinux_2_17_x86_64.manylinux2014_x86_64").await;
+    assert_wheel_tag_is_not_pinned("cp311-cp311-manylinux_2_17_x86_64.manylinux2014_x86_64")
+        .await;
 }
 
 /// #1048: a pure wheel bound to one interpreter (`cp311-none-any`) fails

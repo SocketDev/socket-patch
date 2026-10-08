@@ -46,7 +46,9 @@ use sha2::{Digest, Sha256, Sha512};
 use crate::constants::SOCKET_DIR;
 use crate::formats::yarn::berry_entry::{manifest_bin, render_pinned_entry, Pin};
 use crate::formats::yarn::berry_gates::{self, BerryGate, Yarnrc, SUPPORTED_CACHE_KEY};
-use crate::formats::yarn::blocks::{berry_field, block_eol, replace_block, scan_blocks, LockBlock};
+use crate::formats::yarn::blocks::{
+    berry_field, block_eol, replace_block, scan_blocks, LockBlock,
+};
 use crate::formats::yarn::patterns::{pattern_real_name, split_berry_key_patterns, split_pattern};
 use crate::manifest::schema::PatchRecord;
 use crate::patch::apply::{normalize_file_path, PatchSources};
