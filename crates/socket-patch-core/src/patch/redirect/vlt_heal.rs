@@ -936,6 +936,49 @@ mod tests {
         assert!(socket_owned_instances("\u{feff}{}", &[]).is_empty());
     }
 
+    /// The rollback heal's only target source (the ledger-driven
+    /// `ledger_targets` is gone): every Socket-owned instance of a wanted
+    /// purl, peer contexts included, with its slot [0] flags and no record.
+    #[test]
+    fn lock_targets_name_every_owned_instance_of_the_purls() {
+        let lock = r#"{
+  "lockfileVersion": 1,
+  "options": {},
+  "nodes": {
+    "~npm~left-pad@1.3.0": [0,"left-pad","sha512-P","https://patch.socket.dev/patch/npm/t/aaaaaaaa-aaaa-4aaa-8aaa-aaaaaaaaaaaa/left-pad-1.3.0.tgz"],
+    "~npm~left-pad@1.3.0~peer.1": [3,"left-pad","sha512-P","https://patch.socket.dev/patch/npm/t/aaaaaaaa-aaaa-4aaa-8aaa-aaaaaaaaaaaa/left-pad-1.3.0.tgz"],
+    "~npm~left-pad@1.3.1": [0,"left-pad","sha512-Q","https://patch.socket.dev/patch/npm/t/bbbbbbbb-bbbb-4bbb-8bbb-bbbbbbbbbbbb/left-pad-1.3.1.tgz"],
+    "~npm~ms@2.1.3": [2,"ms","sha512-R","https://registry.npmjs.org/ms/-/ms-2.1.3.tgz"]
+  },
+  "edges": {}
+}
+"#;
+        let purls = [
+            "pkg:npm/left-pad@1.3.0".to_string(),
+            "pkg:npm/ms@2.1.3".to_string(),
+        ];
+        let targets = lock_targets(lock, &[], &purls);
+        let got: Vec<(&str, &str, Option<u64>)> = targets
+            .iter()
+            .map(|t| (t.purl.as_str(), t.dep_id.as_str(), t.flags))
+            .collect();
+        assert_eq!(
+            got,
+            [
+                ("pkg:npm/left-pad@1.3.0", "~npm~left-pad@1.3.0", Some(0)),
+                (
+                    "pkg:npm/left-pad@1.3.0",
+                    "~npm~left-pad@1.3.0~peer.1",
+                    Some(3)
+                ),
+            ]
+        );
+        assert!(targets
+            .iter()
+            .all(|t| t.name == "left-pad" && t.record.is_none()));
+        assert!(lock_targets("\u{feff}{}", &[], &purls).is_empty());
+    }
+
     #[test]
     fn only_prod_and_dev_nodes_are_reinstalled_after_removal() {
         assert!(reinstalls_after_removal(Some(0)));
