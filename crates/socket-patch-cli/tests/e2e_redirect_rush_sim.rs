@@ -24,7 +24,11 @@
 //! `rush install`, asserting patched bytes; plus the
 //! `preventManualShrinkwrapChanges` failure + `rush update` recovery.
 
-use std::path::{Path, PathBuf};
+#[path = "common/mod.rs"]
+mod common;
+use common::binary;
+
+use std::path::Path;
 use std::process::{Command, Output, Stdio};
 
 use sha2::{Digest, Sha512};
@@ -54,10 +58,6 @@ const GHSA: &str = "GHSA-rush-hosted";
 const VULNS: &[(&str, &[&str])] = &[(GHSA, &["CVE-2026-5151"])];
 
 // ── self-contained helpers ────────────────────────────────────────────
-
-fn binary() -> PathBuf {
-    PathBuf::from(env!("CARGO_BIN_EXE_socket-patch"))
-}
 
 /// Probe corepack from a NEUTRAL temp dir (a `packageManager` field in an
 /// ancestor package.json — e.g. this monorepo root — otherwise makes corepack

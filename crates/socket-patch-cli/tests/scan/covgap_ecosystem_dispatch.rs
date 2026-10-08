@@ -22,7 +22,9 @@
 //!   through `find_packages_for_rollback`'s deno branch, restore the file's
 //!   ORIGINAL bytes on disk, and report `rolledBack == 1` for the exact PURL.
 
-use std::path::{Path, PathBuf};
+use crate::common::binary;
+
+use std::path::Path;
 use std::process::Command;
 
 use serde_json::Value;
@@ -30,10 +32,6 @@ use sha2::{Digest, Sha256};
 
 const ORIGINAL: &[u8] = b"original\n";
 const PATCHED: &[u8] = b"patched\n";
-
-fn binary() -> PathBuf {
-    env!("CARGO_BIN_EXE_socket-patch").into()
-}
 
 /// Compute the git-style blob SHA-256 (`sha256("blob <len>\0" + bytes)`)
 /// the same way the production hashing code does.

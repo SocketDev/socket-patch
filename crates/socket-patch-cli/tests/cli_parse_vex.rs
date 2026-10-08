@@ -66,7 +66,7 @@ const SOCKET_ENV_VARS: &[&str] = &[
     "SOCKET_VEX_NO_VERIFY",
     "SOCKET_VEX_DOC_ID",
     "SOCKET_VEX_COMPACT",
-    // ApplyArgs-specific
+    // Retired in v5 (#615); still scrubbed for hermeticity
     "SOCKET_FORCE",
     // ScanArgs-specific
     "SOCKET_BATCH_SIZE",

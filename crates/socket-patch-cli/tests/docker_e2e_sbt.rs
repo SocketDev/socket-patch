@@ -41,6 +41,10 @@
 
 #![cfg(feature = "docker-e2e")]
 
+#[path = "common/mod.rs"]
+mod common;
+use common::git_sha256;
+
 use std::io::{Read as _, Write as _};
 use std::process::Command;
 
@@ -66,13 +70,6 @@ const MARKER: &str = "SOCKET_PATCHED.txt";
 
 fn hex_of<D: Digest>(bytes: &[u8]) -> String {
     hex::encode(D::digest(bytes))
-}
-
-fn git_sha256(content: &[u8]) -> String {
-    let mut hasher = Sha256::new();
-    hasher.update(format!("blob {}\0", content.len()).as_bytes());
-    hasher.update(content);
-    hex::encode(hasher.finalize())
 }
 
 /// The pristine jar from Maven Central (checked against Central's `.sha1`)

@@ -10,10 +10,10 @@
 //! The `|| fail "hashing ..."` guards are the only thing standing in the
 //! way, and they only work if `git_blob_sha` actually reports failure.
 
+use crate::common::git_sha256;
+
 use std::path::Path;
 use std::process::{Command, Output, Stdio};
-
-use sha2::{Digest, Sha256};
 
 use crate::docker_vendor_common;
 
@@ -54,15 +54,6 @@ fn run_stage_script(dir: &Path, body: &str) -> Output {
         .current_dir(dir)
         .output()
         .expect("failed to run bash")
-}
-
-/// Git-blob SHA-256 (`sha256("blob <len>\0" ++ bytes)`) — the hash format
-/// socket-patch records in manifests.
-fn git_sha256(content: &[u8]) -> String {
-    let mut hasher = Sha256::new();
-    hasher.update(format!("blob {}\0", content.len()).as_bytes());
-    hasher.update(content);
-    hex::encode(hasher.finalize())
 }
 
 /// A missing before-file must abort staging at the hashing guard — not

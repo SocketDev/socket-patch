@@ -106,7 +106,6 @@ pub struct ApplyArgs {
     #[arg(
         short = 'f',
         long,
-        env = "SOCKET_FORCE",
         default_value_t = false,
         value_parser = crate::args::parse_bool_flag,
     )]

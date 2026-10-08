@@ -74,6 +74,7 @@ run `socket-patch apply` once after migration to confirm the manifest still appl
 | `SOCKET_PATCH_DEBUG` | `SOCKET_DEBUG` |
 | `SOCKET_PATCH_TELEMETRY_DISABLED` | `SOCKET_TELEMETRY_DISABLED` |
 | `--download-mode`, `SOCKET_DOWNLOAD_MODE` | No replacement; patch content is always fetched as per-file blobs |
+| `SOCKET_FORCE` | Pass `--force` to the one command that needs it (`apply`, `vendor`, `--update`); the variable is now ignored |
 
 Legacy `.socket/packages/` and `.socket/diffs/` archives are no longer read.
 Patch data uses per-file blobs (`.socket/blobs/`); cleanup commands remove the

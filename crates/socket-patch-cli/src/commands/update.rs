@@ -58,7 +58,6 @@ pub struct UpdateArgs {
     /// on the requested version.
     #[arg(
         long,
-        env = "SOCKET_FORCE",
         default_value_t = false,
         value_parser = parse_bool_flag,
     )]

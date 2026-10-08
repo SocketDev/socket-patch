@@ -1220,10 +1220,12 @@ async fn berry_vendored_then_hosted_takeover_leaves_pure_hosted() {
         !proj.join(format!(".socket/vendor/npm/{UUID_V}")).exists(),
         "the orphaned committed artifact must be removed"
     );
-    assert_eq!(
-        read(&proj, "package.json"),
-        pkg_json_pristine,
-        "the berry resolutions entry must be reverted"
+    // The vendored `file:` resolutions entry is reverted; the hosted berry
+    // pin routes the same selector to the hosted tarball instead (#465).
+    let pkg_json = read(&proj, "package.json");
+    assert!(
+        !pkg_json.contains(".socket/vendor/") && pkg_json.contains(&hosted_url),
+        "the berry resolutions entry is repointed hosted:\n{pkg_json}\npristine:\n{pkg_json_pristine}"
     );
     let lock = read(&proj, "yarn.lock");
     assert!(
@@ -1264,7 +1266,12 @@ async fn berry_vendored_then_hosted_takeover_leaves_pure_hosted() {
     );
 
     // MANIFEST-LESS VEX over the pure hosted state (see yarn_berry_common).
-    let registry_state = [("yarn.lock", lock_pristine)];
+    // The hosted berry pin routes `resolutions` too (#465), so the registry
+    // state restores the manifest as well as the lock.
+    let registry_state = [
+        ("yarn.lock", lock_pristine),
+        ("package.json", pkg_json_pristine.clone().into_bytes()),
+    ];
     let yarn =
         |cwd: &Path, args: &[&str], env: &[(&str, &str)]| corepack(cwd, YARN_BERRY, args, env);
     let api_url = server.uri();

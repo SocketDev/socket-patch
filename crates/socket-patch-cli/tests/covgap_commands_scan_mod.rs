@@ -2582,7 +2582,7 @@ async fn scan_human_table_shows_full_purl_with_version() {
 // ---------------------------------------------------------------------------
 
 /// `scan --mode vendored --prune`: the lock-driven GC keeps the vlt entry
-/// `vlt-lock.json` still resolves to its dir (`vendored_entry_in_use` is
+/// `vlt-lock.json` still resolves to its dir (the in-use verdict is
 /// structural: a `file` node under the uuid) and reclaims one it does not.
 #[tokio::test]
 async fn scan_prune_keeps_a_wired_vlt_uuid_and_sweeps_an_unwired_one() {

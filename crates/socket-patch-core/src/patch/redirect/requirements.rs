@@ -5,6 +5,7 @@ use serde_json::Value;
 
 use super::{DepOverride, FileEdit, RewriteResult, RewriteWarning};
 use crate::crawlers::python_crawler::canonicalize_pypi_name;
+use crate::formats::text::{split_bom, strip_bom};
 use crate::utils::purl::percent_decode_purl_component;
 use crate::vendor::state::{VendorEntry, WiringAction};
 
@@ -32,11 +33,7 @@ pub(super) fn logical_requirements(content: &str) -> Vec<LogicalRequirement> {
             } else {
                 (physical_line, "")
             };
-            let parsed_body = if index == 0 {
-                body.strip_prefix('\u{feff}').unwrap_or(body)
-            } else {
-                body
-            };
+            let parsed_body = if index == 0 { strip_bom(body) } else { body };
             let continued =
                 !parsed_body.trim_start().starts_with('#') && body.trim_end().ends_with('\\');
             if continued && index + 1 < physical.len() {
@@ -48,7 +45,7 @@ pub(super) fn logical_requirements(content: &str) -> Vec<LogicalRequirement> {
             original.push_str(body);
             text.push_str(body);
             if start == 0 {
-                text = text.strip_prefix('\u{feff}').unwrap_or(&text).to_owned();
+                text = strip_bom(&text).to_owned();
             }
             requirements.push(LogicalRequirement {
                 original,
@@ -297,17 +294,9 @@ pub(super) fn rewrite(
             let extras = captures
                 .get(2)
                 .map_or("", |capture| capture.as_str().trim());
-            let prefix_body = requirement
-                .original
-                .strip_prefix('\u{feff}')
-                .unwrap_or(&requirement.original);
+            let (bom, prefix_body) = split_bom(&requirement.original);
             let indent = &prefix_body
                 [..prefix_body.len() - prefix_body.trim_start_matches([' ', '\t']).len()];
-            let bom = if requirement.original.starts_with('\u{feff}') {
-                "\u{feff}"
-            } else {
-                ""
-            };
             // Unhashed file: the url's `#sha256=` fragment, which pip
             // verifies without turning hash-checking mode on.
             let location = if hashed {
@@ -343,10 +332,7 @@ pub(super) fn rewrite(
                     original: Some(Value::String(requirement.original.clone())),
                     new: Some(Value::String(rewritten.clone())),
                 });
-                requirement.text = rewritten
-                    .strip_prefix('\u{feff}')
-                    .unwrap_or(&rewritten)
-                    .to_owned();
+                requirement.text = strip_bom(&rewritten).to_owned();
                 requirement.original = rewritten;
                 changed = true;
             }
