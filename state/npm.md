@@ -1,7 +1,6 @@
 [agent] Progress ledger for the scheduled npm bug-hunt routine (label pm:npm).
 
-Last updated: 2026-10-08T06Z (run 31 with a ledger), main `ea09714` (21 commits past `05ecc6e`, including #1073 (#1071 brace/class globs), #1044 (lock-precedence table), #1035 (generation matching in remove/rollback), #1042 (`.socket` link containment) and #1038), latest release v4.0.0 (previous v3.3.0, both from npm `@socketsecurity/socket-patch`). v5 makes hosted the default, removes `setup`, and makes hosted `rollback` re-resolve upstream registry entries. Cells marked (v4) were last verified on `f6b7fb9`. #432 (closed by #813), #798 (closed by #799), #852 (closed by #987, verified 18Z), #884 (closed by #901), #1071 (closed by #1073, verified 06Z on npm 10.9.4), #900 (closed by #970) and #933 (closed by #934, verified 18Z) are fixed; their old `fail` marks below are historical. Extglob workspace patterns still fail (#1097). The #688 takeover half is fixed by #963; its refusal half is still open.
-
+Last updated: 2026-10-08T12Z (run 32 with a ledger), main `e2d9633` (6 commits past `ea09714`, including #1029 (`apply --check` verifies every agent patch, path-flag validation, hosted `redirect.patches[]`), #1050 (one vendored in-use verdict) and #1045 (`PurlKey`)). main was force-updated, and its history is now grafted at `23fd62e`, so commit bisects aren't possible. Latest release v4.0.0 (previous v3.3.0, both from npm `@socketsecurity/socket-patch`). v5 makes hosted the default, removes `setup`, and makes hosted `rollback` re-resolve upstream registry entries. Cells marked (v4) were last verified on `f6b7fb9`. #432 (closed by #813), #798 (closed by #799), #852 (closed by #987, verified 18Z), #884 (closed by #901), #1071 (closed by #1073, verified 06Z on npm 10.9.4), #900 (closed by #970) and #933 (closed by #934, verified 18Z) are fixed; their old `fail` marks below are historical. Extglob workspace patterns still fail (#1097). The #688 takeover half is fixed by #963; its refusal half is still open. New this run: **#1127** (human vendored `--prune` skips the GC when no remaining package has a patch).
 ## Coverage matrix
 
 Cells are "pass", "fail #N" or "untested". Every cell uses a real npm install. Hosted cells use a local mock of the patch API with `--patch-server-url` pointed at it. Agent and vendored cells use the same mock or a hand-staged `.socket/`. "Cycle" means scan → fresh `npm ci` → `vex` → `rollback` byte-exact. "Suites" means `e2e_redirect_npm_build` + `e2e_vendor_npm_build` with `SOCKET_PATCH_NPM_E2E_REQUIRED=1`.
@@ -21,6 +20,13 @@ Cells are "pass", "fail #N" or "untested". Every cell uses a real npm install. H
 | Windows | 10.9.7 | pass: linked `.store` apply/vex/rollback (main). fail #403 (v4) | pass: cycle + `--omit=dev`, revert (main) | pass: cycle, linked cycle (probe) | **fail #434** (default and custom prefix; `--global-prefix` works) |
 | Windows | 12.1.0 / 12.2.0 | pass: linked `.store` apply/vex/rollback (main). fail #356, #403 (v4) | pass: cycle + `--omit=dev`, revert (main) | pass: cycle, linked cycle (probe) | **fail #434** |
 | Windows 2022 | 10.9.7 / 12.2.0 | pass: linked `.store` apply/vex/rollback (main) | pass: cycle + `--omit=dev`, revert (main) | pass: linked cycle (probe) | **fail #434** |
+
+## Run 32 (2026-10-08T12Z, main `e2d9633`)
+
+- `npm uninstall` of the only patched vendored dep, then human `scan --mode vendored --prune`: "No patches available", exit 0, nothing reverted; `--json` reverts it. **fail #1127** (npm 10.9.4 ×3 incl. workspace member, 12.2.0). Control with a patched package left: pass.
+- #1029 agent `apply --check`: plain, alias, linked `.store` (plain + alias), `-g` / `--global-prefix`, `tests/` / hidden / `build/` copies: pass (npm 10.9.4). Nonexistent `--global-prefix` → exit 2: pass.
+- #1045: `%40`-scoped manifest key through apply / `--check` / vex / rollback by `@` purl: pass. #1029 hosted `redirect.patches[]` (`would_pin`, `pinned`, extglob member `unpinned`): pass. #1050 prune keeps live alias / nested-member entries and fails safe on a conflict-marker lock: pass.
+- Re-triage: #879 and #1072 still reproduce on `e2d9633`.
 
 ## Run 31 (2026-10-08T06Z, main `ea09714`)
 
@@ -123,6 +129,7 @@ The same `name@version` gets a new patch UUID with different bytes. Mock: left-p
 
 ## Backlog
 
+- **New 2026-10-08T12Z:** #1127 on other vendored PMs (hand over if unseen); `apply --check` (#1029) on npm 6 v1 locks, `inBundle` copies, and a hosted-pinned package that still has a manifest record; re-check #325 / #433 / #490 / #828 on `e2d9633`.
 - **New 2026-10-08T06Z:** re-check #1094 / #1097 when fixes land (member `package-lock.json` and `npm-shrinkwrap.json`, extglob); re-check #325 / #433 / #490 / #665 / #828 / #879 on `ea09714`; #1035 with a vendored A + hosted B mix across a dual lock.
 - **New 2026-10-08T00Z:** #1094 on yarn / Bun workspaces (same `has_own_npm_family_lock` early exit; hand over if confirmed), a stray member `npm-shrinkwrap.json`, `rollback` / `remove` from the member; case-insensitive workspace globs on macOS / Windows (probe branch).
 - **New 2026-10-07T18Z:** #1071 on yarn / Bun roots (shared matcher; hand over if not covered), `!` negation order and `./` patterns vs real npm; re-check #325 / #433 / #490 / #665 on `05ecc6e`. (#1005 on a `scan --mode vendored` partial takeover: done 18Z, pass.)
@@ -163,6 +170,8 @@ The same `name@version` gets a new patch UUID with different bytes. Mock: left-p
 
 ## Known non-bugs
 
+- `apply --check -g` drift text says "Run `socket-patch apply`" without `-g`; following it fails loudly (exit 1, "matched no installed package"). Noted, not filed (#464 class, low value). (2026-10-08T12Z)
+- Mock tip (2026-10-08T12Z): the public-proxy routes (`SOCKET_PROXY_URL` + `SOCKET_API_URL`, no token) need only `POST /patch/batch` (`components[].purl`), `GET /patch/by-package/<purl>`, `/patch/view/<uuid>`, `/patch/blob/<hash>`, `POST /patch/package` and the tarball URL it returns.
 - Mock tip (2026-10-08T06Z): when two mock origins serve patch generations A and B, `remove` / `rollback` must get the A pin's origin as `--patch-server-url`, or the pin is invisible (documented) and looks like a #1035 miss.
 - A `workspaces` negation listed before the positive pattern (`["!packages/b", "packages/*"]`): npm excludes `b`, and a hosted scan from `b` pins nothing because `b` is its own project (npm 10.9.4, 2026-10-08T00Z).
 - pnpm handover #1074's npm analogue (`package-lock=false`): `npm ci` still honors the lock, so a lock-only attestation matches `npm ci`, and `vex` refuses after a plain `npm install` (see the entry below; re-reviewed 2026-10-08T00Z).
