@@ -956,19 +956,24 @@ pub(super) async fn classify_overlap_takeover(common: &GlobalArgs, cwd: &Path) -
     // A malformed vendor ledger classifies like a missing one (this path
     // only feeds takeover warnings; corruption is a hard error on the
     // write/attest paths).
-    let redirect = crate::commands::hosted_state_from_lockfiles(common, cwd).await;
+    let discovery = crate::commands::discover_wiring(common, cwd).await;
+    let redirect = crate::commands::hosted_state_from_pins(
+        &socket_patch_core::patch::redirect::upstream::HostedPin::all(&discovery),
+    );
     let vendor = socket_patch_core::vendor::load_state(cwd).await.ok();
-    classify_overlap_takeover_with(common, cwd, Some(&redirect), vendor.as_ref()).await
+    classify_overlap_takeover_with(cwd, Some(&redirect), vendor.as_ref(), &discovery).await
 }
 
 /// [`classify_overlap_takeover`] over already-loaded state (the hosted
-/// engine classifies against its post-takeover vendor ledger); still reads
-/// the LIVE lockfiles in `cwd`. `None` for either yields no overlap.
+/// engine classifies against its post-takeover vendor ledger) and
+/// `discovery`, the lockfile discovery of `cwd` as it is now
+/// ([`crate::commands::discover_wiring`]). `None` for either state yields
+/// no overlap.
 pub(super) async fn classify_overlap_takeover_with(
-    common: &GlobalArgs,
     cwd: &Path,
     redirect: Option<&socket_patch_core::patch::redirect::RedirectState>,
     vendor: Option<&VendorState>,
+    discovery: &socket_patch_core::vex::discover::Discovery,
 ) -> OverlapTakeover {
     let mut out = OverlapTakeover::default();
     let Some(vendor) = vendor else {
@@ -999,8 +1004,7 @@ pub(super) async fn classify_overlap_takeover_with(
             .entry(PurlKey::new(key))
             .or_insert(record.uuid.as_str());
     }
-    let discovery = crate::commands::discover_wiring(common, cwd).await;
-    let mut liveness = LedgerLiveness::new(cwd, &discovery, None);
+    let mut liveness = LedgerLiveness::new(cwd, discovery, None);
     for purl in overlap {
         let hosted_live = match redirect_uuid_by_purl.get(&PurlKey::new(&purl)) {
             Some(uuid) => liveness.redirect_record(&purl, uuid).await,
@@ -1927,6 +1931,25 @@ async fn run_scan(
         } else {
             socket_patch_core::patch::redirect::upstream::HostedPin::all(ctx.discovery().await)
         };
+    // Lockless cargo/nuget pins are never refs, so `HostedPin::all` drops
+    // them; the rollout's recorded view still counts them (otherwise a
+    // re-scan reads the pin it wrote as NEW and spends a cap slot).
+    let hosted_unlocked_pins = if args.common.is_global() {
+        Vec::new()
+    } else {
+        ctx.discovery().await.unlocked_pins.clone()
+    };
+    // The same discovery, handed to the hosted redirect's attribution gate
+    // (nothing below writes before it; see `rollout::Gate::prior`).
+    let prior_discovery = if args.common.is_global() {
+        None
+    } else {
+        let (discovery, read_set) = ctx.recorded_discovery().await;
+        Some(rollout::Prior {
+            discovery,
+            read_set: read_set.as_ref(),
+        })
+    };
     let hosted_state = (!args.common.is_global())
         .then(|| crate::commands::hosted_state_from_pins(&hosted_pin_list));
     let redirect_state = hosted_state.as_ref();
@@ -2391,7 +2414,8 @@ async fn run_scan(
     policy.set_update_purls(updates.iter().map(|u| u.purl.as_str()));
     let recorded = rollout::RecordedState {
         manifest: update_manifest.as_deref(),
-        index: rollout::RecordedIndex::new(update_manifest.as_deref(), &hosted_pins),
+        index: rollout::RecordedIndex::new(update_manifest.as_deref(), &hosted_pins)
+            .with_unlocked_pins(hosted_unlocked_pins),
     };
 
     // The hosted-wiring probes below take `all_purls` (POST-filter: only
@@ -2464,6 +2488,7 @@ async fn run_scan(
                 &recorded,
                 batch_error_count > 0,
                 &mut stage,
+                prior_discovery,
             )
             .await;
         }
@@ -2951,7 +2976,7 @@ async fn run_scan(
             &pairs,
             None,
             npm_crawl.as_ref(),
-            Some(rollout::Gate::new(&mut stage, rows)),
+            Some(rollout::Gate::new(&mut stage, rows).with_prior(prior_discovery)),
         )
         .await;
     }

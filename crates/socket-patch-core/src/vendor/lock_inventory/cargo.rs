@@ -41,11 +41,8 @@ pub(super) async fn inventory_cargo_lock_raw_in(
     view: &ProjectView<'_>,
 ) -> Option<Vec<LockfileEntry>> {
     let doc: std::sync::Arc<toml_edit::DocumentMut> = match view {
-        ProjectView::Disk(project_root)
-        | ProjectView::Snapshot(crate::vendor::lock_inventory::DiskSnapshot {
-            root: project_root,
-            ..
-        }) => {
+        ProjectView::Disk(_) | ProjectView::Snapshot(_) => {
+            let project_root = view.disk_root().expect("a disk view has a root");
             crate::vendor::cargo_lock::read_lock(project_root)
                 .await
                 .ok()?

@@ -243,13 +243,9 @@ pub(crate) async fn detect_npm_lock_flavor_in(
                 ));
             }
             // 4. Nothing recognizable.
-            let location = match view {
-                ProjectView::Disk(root)
-                | ProjectView::Snapshot(super::lock_inventory::DiskSnapshot { root, .. }) => {
-                    project_root_location(root)
-                }
-                ProjectView::Memory(_) => project_root_location(Path::new(".")),
-            };
+            // Only the root's name, for the message: nothing is read.
+            let shown = view.disk_root_reading(std::iter::empty::<&str>());
+            let location = project_root_location(shown.unwrap_or(Path::new(".")));
             return Err((
                 "vendor_lockfile_missing",
                 format!(

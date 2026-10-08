@@ -8,7 +8,7 @@ use crate::patch::redirect::hosted_url_version;
 use crate::vendor::bun_lock_text::{self, BunEntry};
 use crate::vendor::bun_lockb::BunLockb;
 
-use super::view::{DiskSnapshot, ProjectView};
+use super::view::ProjectView;
 use super::{http_url, LockIntegrity, LockfileEntry, UnsupportedNpmLayout};
 
 /// Every `packages` entry of a text `bun.lock`, read with the ONE
@@ -47,7 +47,10 @@ pub(crate) fn bun_text_entries(text: &str) -> Result<Vec<BunEntry>, String> {
 /// follow, so it keeps shadowing.
 pub fn bun_text_lock_drives(view: &ProjectView<'_>) -> bool {
     match view {
-        ProjectView::Disk(root) | ProjectView::Snapshot(DiskSnapshot { root, .. }) => {
+        ProjectView::Disk(_) | ProjectView::Snapshot(_) => {
+            let root = view
+                .disk_root_reading([BUN_LOCK])
+                .expect("a disk view has a root");
             match std::fs::metadata(root.join(BUN_LOCK)) {
                 Ok(_) => true,
                 Err(error) => error.kind() != std::io::ErrorKind::NotFound,

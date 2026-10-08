@@ -335,6 +335,9 @@ pub(crate) async fn rewrite(
             npm_outer: &npm_outer,
             yarn_classic_outer: &yarn_classic_outer,
             blocking: false,
+            takeover_uuids: Default::default(),
+            patch_server_origins: Vec::new(),
+            prior_discovery: None,
         },
     )
     .await;
@@ -344,6 +347,7 @@ pub(crate) async fn rewrite(
             skipped: skipped_before,
         });
     }
+    skipped.extend(done.unattributed.iter().cloned());
     let unconfirmed = engine::unconfirmed_candidates(&candidates, &done.confirmed, &skipped);
     Ok(Rewritten {
         project,

@@ -26,6 +26,10 @@ use socket_patch_core::vendor::lock_inventory::ProjectView;
 pub(crate) struct RewriteHeal {
     pub(crate) warnings: Vec<serde_json::Value>,
     pub(crate) stale_purls: BTreeSet<String>,
+    /// Set when the heal ran (it may invalidate store entries): the store's
+    /// bundled copies after it, discovery's only read of the installed tree
+    /// (`Discovery::vlt_bundled_copies`). `None` when nothing was healed.
+    pub(crate) healed_store: Option<std::collections::BTreeMap<String, String>>,
 }
 
 pub(crate) const REINSTALL_REQUIRED: &str = "redirect_vlt_reinstall_required";
@@ -78,7 +82,13 @@ pub(crate) async fn artifact_preflight(
     hosted_vlt::judge(&plan, deps, probes)
 }
 
-fn patch_server_origins(common: &crate::args::GlobalArgs) -> Vec<String> {
+/// The origins the vlt heal treats as Socket-owned in the final lock: the
+/// patch server plus `--api-url`. Unlike discovery's
+/// [`crate::commands::hosted_unwind::patch_server_origins`], it also counts the
+/// `--api-url` origin (as it has since vlt support landed, #269), so a
+/// setup serving the hosted tarballs from the API origin is healed too.
+/// Discovery-facing code must use the `hosted_unwind` helper, not this one.
+fn vlt_heal_origins(common: &crate::args::GlobalArgs) -> Vec<String> {
     common
         .patch_server_url
         .iter()
@@ -332,13 +342,14 @@ pub(crate) async fn heal_after_rewrite(
     let mut out = RewriteHeal::default();
     let owned: Vec<vlt_heal::OwnedInstance> = inputs
         .final_lock
-        .map(|lock| vlt_heal::socket_owned_instances(lock, &patch_server_origins(common)))
+        .map(|lock| vlt_heal::socket_owned_instances(lock, &vlt_heal_origins(common)))
         .unwrap_or_default()
         .into_iter()
         .filter(|i| inputs.preflight.passed.contains(&i.patch_uuid))
         .collect();
     let targeted: BTreeSet<&str> = owned.iter().map(|i| i.patch_uuid.as_str()).collect();
     let mut tally = HealTally::default();
+    let mut healed = false;
     if !owned.is_empty() {
         let targets: Vec<(Target<'_>, &str)> = owned
             .iter()
@@ -358,6 +369,7 @@ pub(crate) async fn heal_after_rewrite(
             })
             .collect();
         tally = heal_targets(common, &targets, Expected::Patched).await;
+        healed = true;
         out.warnings.push(serde_json::json!({
             "code": REINSTALL_REQUIRED,
             "detail": reinstall_detail(&tally),
@@ -385,9 +397,14 @@ pub(crate) async fn heal_after_rewrite(
     // in-run attestation (lockfile discovery contests it the same way).
     if inputs.final_lock.is_some() {
         let copies = socket_patch_core::vendor::vlt_bundled::bundled_copies(&common.cwd).await;
+        if healed {
+            out.healed_store = Some(copies.clone());
+        }
         for purl in inputs.records.keys() {
-            let base = socket_patch_core::utils::purl::strip_purl_qualifiers(purl);
-            let Some(location) = copies.get(base) else {
+            // The store's keys are decoded purls: look a `%40scope` record
+            // up the way the attribution gate does.
+            let base = socket_patch_core::utils::purl_key::canonical_base_purl(purl);
+            let Some(location) = copies.get(&base) else {
                 continue;
             };
             let Some((name, version)) = base
@@ -405,6 +422,12 @@ pub(crate) async fn heal_after_rewrite(
             }));
             out.stale_purls.insert(purl.clone());
         }
+    }
+    // A heal implies a final lock, so the block above recorded the store;
+    // never report a heal without it.
+    if healed && out.healed_store.is_none() {
+        out.healed_store =
+            Some(socket_patch_core::vendor::vlt_bundled::bundled_copies(&common.cwd).await);
     }
     out
 }
