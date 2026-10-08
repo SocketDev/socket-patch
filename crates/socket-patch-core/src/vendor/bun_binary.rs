@@ -1451,7 +1451,13 @@ mod rebuild_tests {
             let dry =
                 super::super::bun_lock::revert_bun_opts(&entry, fx.root(), RevertOpts::new(true))
                     .await;
-            assert!(dry.success && dry.warnings.is_empty(), "{bun}: {dry:?}");
+            // The preview's only advisory is the reinstall one the real
+            // revert also gives for the fixture's hoisted copy (#764).
+            let dry_codes: Vec<&str> = dry.warnings.iter().map(|w| w.code).collect();
+            assert!(
+                dry.success && dry_codes == [super::super::bun_lock::REINSTALL_REQUIRED],
+                "{bun}: {dry:?}"
+            );
             assert_eq!(
                 std::fs::read_to_string(fx.root().join(TEXT_LOCK)).unwrap(),
                 vendored
@@ -1585,7 +1591,13 @@ mod rebuild_tests {
             let dry =
                 super::super::bun_lock::revert_bun_opts(&entry, fx.root(), RevertOpts::new(true))
                     .await;
-            assert!(dry.success && dry.warnings.is_empty(), "{bun}: {dry:?}");
+            // The preview's only advisory is the reinstall one the real
+            // revert also gives for the fixture's hoisted copy (#764).
+            let dry_codes: Vec<&str> = dry.warnings.iter().map(|w| w.code).collect();
+            assert!(
+                dry.success && dry_codes == [super::super::bun_lock::REINSTALL_REQUIRED],
+                "{bun}: {dry:?}"
+            );
             let outcome =
                 super::super::bun_lock::revert_bun_opts(&entry, fx.root(), RevertOpts::new(false))
                     .await;

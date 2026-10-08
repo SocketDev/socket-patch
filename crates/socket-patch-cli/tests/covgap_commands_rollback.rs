@@ -2143,6 +2143,35 @@ fn bun_lock_rollback_warns_that_a_hoisted_copy_is_kept() {
         "the human run names the forcing install; stderr=\n{stderr}"
     );
 
+    // The preview warns the same way: its run-level `reinstall_required`
+    // note would otherwise promise that the next plain install refreshes
+    // the tree, which is the #764 failure.
+    let hoisted = project(true);
+    let (code, stdout, stderr) = run_hosted(
+        hoisted.path(),
+        &["rollback", "--dry-run", "--json", "--yes"],
+        Some(&registry),
+    );
+    assert_eq!(code, 0, "stdout=\n{stdout}\nstderr=\n{stderr}");
+    let env = parse_envelope(&stdout, &stderr);
+    assert!(has_code(&env), "stdout=\n{stdout}");
+    assert!(
+        env["warnings"]
+            .as_array()
+            .is_some_and(|ws| ws.iter().any(|w| {
+                w["code"] == "reinstall_required"
+                    && w["detail"]
+                        .as_str()
+                        .is_some_and(|d| d.contains("`bun install --force`"))
+            })),
+        "the preview's reinstall note names the forcing install; stdout=\n{stdout}"
+    );
+    assert_eq!(
+        std::fs::read_to_string(hoisted.path().join("bun.lock")).unwrap(),
+        bun_lock(&bun_redirected_line()),
+        "a dry run writes nothing"
+    );
+
     let fresh = project(false);
     let (code, stdout, stderr) = run_hosted(
         fresh.path(),

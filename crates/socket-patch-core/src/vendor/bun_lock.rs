@@ -890,9 +890,10 @@ pub(crate) async fn revert_bun(
 
 /// [`revert_bun`] with full [`RevertOpts`]: `keep_artifact` skips the
 /// artifact deletion — and the refusals that exist only to protect it —
-/// while the wiring restore runs unchanged. A wet revert that restored the
-/// wiring adds [`REINSTALL_REQUIRED`] when the installed tree may keep the
-/// vendored copy.
+/// while the wiring restore runs unchanged. A revert that restores (or, on
+/// a dry run, would restore) the wiring adds [`REINSTALL_REQUIRED`] when
+/// the installed tree may keep the vendored copy, so a preview names the
+/// same `bun install --force` the real run will.
 pub(crate) async fn revert_bun_opts(
     entry: &VendorEntry,
     project_root: &Path,
@@ -907,7 +908,7 @@ pub(crate) async fn revert_bun_opts(
             .warnings
             .iter()
             .any(|w| w.code == "vendor_lockfile_missing");
-    if outcome.success && !outcome.kept_artifact && !opts.dry_run && !restored_nothing {
+    if outcome.success && !outcome.kept_artifact && !restored_nothing {
         let stale = stale_hoisted_copies(project_root, [entry.base_purl.as_str()]).await;
         if !stale.is_empty() {
             outcome.warnings.push(VendorWarning::new(
@@ -3441,10 +3442,18 @@ mod tests {
         let (_, entry, _) = expect_done(fx.vendor(false).await);
         let entry = entry.unwrap();
 
+        // The preview names the same install the real run will: the
+        // rollback's generic reinstall note otherwise promises that the
+        // next plain install refreshes the tree, which Bun's hoisted
+        // linker doesn't do.
         let dry = revert_bun(&entry, fx.root(), true).await;
+        assert!(dry.success, "{:?}", dry.error);
+        let codes: Vec<&str> = dry.warnings.iter().map(|w| w.code).collect();
+        assert_eq!(codes, [REINSTALL_REQUIRED], "{:?}", dry.warnings);
         assert!(
-            dry.warnings.is_empty(),
-            "a preview changes nothing installed"
+            dry.warnings[0].detail.contains("`bun install --force`"),
+            "{}",
+            dry.warnings[0].detail
         );
 
         let outcome = revert_bun(&entry, fx.root(), false).await;

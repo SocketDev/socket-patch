@@ -973,7 +973,9 @@ pub(crate) async fn run_hosted_leg(common: &GlobalArgs, pins: &[HostedPin]) -> H
         .extend(outcome.reverted_files.iter().cloned());
     // Bun's hoisted linker keeps the patched copies of the pins it no
     // longer pins (#764): say so, with the install that does reinstall.
-    if !common.dry_run && outcome.flush_error.is_none() {
+    // A dry run says it too, so the preview's reinstall note names
+    // `bun install --force` like the real run's.
+    if outcome.flush_error.is_none() {
         use socket_patch_core::constants::npm_family::{BUN_LOCK, BUN_LOCKB};
         use socket_patch_core::vendor::bun_lock;
         let bun_purls = outcome
