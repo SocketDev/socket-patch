@@ -575,10 +575,9 @@ mod oracle_selftests {
         // back and confirm it equals hashing the same bytes in memory,
         // and that distinct contents produce distinct hashes (i.e. it
         // isn't returning a constant or hashing the path).
-        let dir = std::env::temp_dir();
-        let unique = format!("socket-patch-oracle-{}", std::process::id());
-        let p1 = dir.join(format!("{unique}-a.bin"));
-        let p2 = dir.join(format!("{unique}-b.bin"));
+        let dir = tempfile::tempdir().expect("temp dir");
+        let p1 = dir.path().join("a.bin");
+        let p2 = dir.path().join("b.bin");
         let content_a = b"alpha-content\n";
         let content_b = b"beta-content\n";
         std::fs::write(&p1, content_a).expect("write temp a");
@@ -591,21 +590,6 @@ mod oracle_selftests {
             git_sha256_file(&p2),
             "git_sha256_file must reflect file contents"
         );
-
-        let _ = std::fs::remove_file(&p1);
-        let _ = std::fs::remove_file(&p2);
-    }
-
-    // Unique temp dir per (pid, callsite) so the fixture-builder self-tests
-    // never collide with each other or across parallel test binaries.
-    fn scratch_dir(tag: &str) -> PathBuf {
-        let d = std::env::temp_dir().join(format!(
-            "socket-patch-oracle-{}-{}",
-            std::process::id(),
-            tag
-        ));
-        let _ = std::fs::remove_dir_all(&d);
-        d
     }
 
     #[test]
@@ -616,8 +600,8 @@ mod oracle_selftests {
         // the suites would pass while exercising nothing. Pin the exact shape
         // apply consumes: `patches.<purl>.{uuid,files.<file>.{beforeHash,
         // afterHash}}`, all camelCase.
-        let root = scratch_dir("manifest");
-        let socket_dir = root.join(".socket");
+        let root = tempfile::tempdir().expect("temp dir");
+        let socket_dir = root.path().join(".socket");
         let purl = "pkg:npm/dummy@1.0.0";
         let uuid = "11111111-1111-4111-8111-111111111111";
         let path = write_minimal_manifest(
@@ -669,8 +653,6 @@ mod oracle_selftests {
             !socket_dir.join("blobs").join("afterhash111").exists(),
             "write_minimal_manifest must not stage after_hash blobs"
         );
-
-        let _ = std::fs::remove_dir_all(&root);
     }
 
     #[test]
@@ -679,8 +661,8 @@ mod oracle_selftests {
         // `<socket_dir>/blobs/<hash>` and verifies their bytes. If write_blob
         // wrote the wrong path or mangled the bytes, "offline apply succeeds"
         // tests would silently fall back to a network path or fail to match.
-        let root = scratch_dir("blob");
-        let socket_dir = root.join(".socket");
+        let root = tempfile::tempdir().expect("temp dir");
+        let socket_dir = root.path().join(".socket");
         let hash = "deadbeefcafef00d";
         let payload = &[0u8, 1, 2, 255, b'p', b'a', b't', b'c', b'h', 0, 42];
         write_blob(&socket_dir, hash, payload);
@@ -696,8 +678,6 @@ mod oracle_selftests {
             payload,
             "write_blob must stage the exact bytes, byte-for-byte"
         );
-
-        let _ = std::fs::remove_dir_all(&root);
     }
 
     #[test]
