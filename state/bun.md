@@ -1,6 +1,6 @@
 [agent] Progress ledger for the scheduled Bun bug-hunt routine (label pm:bun).
 
-Last updated: 2026-10-07 (run 29), main `05ecc6e`, latest release 4.0.0, latest Bun 1.4.2 (no 1.4.3 stable yet).
+Last updated: 2026-10-08 (run 30), main `fe8455d`, latest release 4.0.0, latest Bun 1.4.2 (no 1.4.3 stable yet).
 
 Method (run 16 note: the sandbox shell exports `BUN_OPTIONS=--smol`, so unset it; run 17 note: on Bun ≥ 1.2, `bunfig [install] saveTextLockfile = false` writes a binary `bun.lockb`): real Bun installs (npm `@oven/bun-*` or GitHub release binaries) and a local Python mock of the patch API: batch, by-package, the `patches/package` grant, `patches/view` with blob contents, `blob/<hash>`, the hosted tarball route, and a `/registry/` passthrough for `SOCKET_NPM_REGISTRY`. Set `SOCKET_PATCH_SERVER_URL` to the mock. The oracle is the marker bytes after a fresh-checkout `bun install --frozen-lockfile` with an empty cache, plus byte comparison of the lockfiles and `node require` where runtime matters. The repo's own matrix (`scripts/backtest-bun.py`, `bun-compatibility.yml`) already covers plain hosted and vendored shapes across Bun 0.8.1–1.4.2. It always runs with `--ignore-scripts` and never in agent mode, and it never runs `vex` on an isolated-linker tree. This ledger tracks what it doesn't.
 
@@ -45,6 +45,8 @@ Run 27 (main unchanged at `9c43dfc`, so no re-triage): new **#992**. Hosted `bun
 Run 28 (new main `db83f01`): #992 and #861 still reproduce (the fix is pending in draft #1009). Verified on Linux: #367 (#873, registry-keyed `bun patch` kept, text + `bun.lockb`), #884 (#901, loud member refusal), #831 (#837, Bun `*.tgz` / `.socket/` ignores) and #963 (a refused vendored takeover keeps the Bun hosted pins). New: **#1019**. On Bun 1.4, a `bun patch` made after rewiring is keyed `name@<hosted URL | vendor path>`, which the #873 guard doesn't match, so superseding re-runs, takeovers, rollback and revert silently drop it. See the run 28 section below.
 
 Run 29 (new main `05ecc6e`): #992 still reproduces (fix pending in draft #1009). New: **#1084**. On the isolated linker, after an agent A → hosted B (superseding) migration and a `bun install`, `rollback` / `remove` exit 0 and drop record A and its blobs. #934's `rollback_record_superseded` skip ignores the orphaned `.bun/<pkg>@<ver>` store entry, which still holds A's bytes, and the advised `bun install` relinks it (first bad `04885c3`). The agent → vendored takeover leaves the same A-patched orphan behind after a revert, which was commented on #764. #934 on hoisted text locks passes. See the run 29 section below.
+
+Run 30 (new main `fe8455d`; no Bun code changes since `05ecc6e`, so #992 / #1084 weren't re-run, and their fixes are still pending in draft #1009): new **#1101**. A hosted or vendored scan / `get` run from a Bun workspace member that holds a stray `bun.lock` / `bun.lockb` pins that lock, which Bun never reads. It exits 0, and `vex` attests `not_affected` while Bun installs unpatched (the Bun variant of #1094; PR #1095 explicitly keeps Bun's own-lock shortcut, verified on its head `cddf38d`). Bun 1.1.39–1.2.23 ignore `!` workspace patterns (1.3.0+ honour them), so #1097's negation half reproduces on old Bun (commented). #1073's brace / class / `**` / object-form member refusals pass on 1.4.2. A symlinked `bun.lock` / `bun.lockb` dry run vs wet run passes (backlog 10). See the run 30 section below.
 
 ## Coverage matrix
 
@@ -412,6 +414,18 @@ Other passes (Linux, 1.4.2 unless noted):
 | agent A → vendored A or B → rollback, isolated | 1.4.2 | fail (A-patched orphan relinked); commented on #764 |
 | socket-patch 4.0.0, agent A → hosted B → rollback, isolated | 1.4.2 | exit 1, record kept (the #933 behaviour) |
 
+### Run 30 (Linux, main `fe8455d`)
+| Cell | Bun | Result |
+| --- | --- | --- |
+| Hosted `scan` / `get <uuid>` and vendored `scan` from a workspace member holding a stray `bun.lock` / `bun.lockb` (the root `bun.lock` governs) | 1.2.23 (hoisted, text + lockb), 1.3.9 (isolated), 1.4.2 (isolated + hoisted, text + lockb) | **fail #1101** (exit 0, the member lock is pinned or vendored, frozen installs unpatched, `vex` not_affected from a hoisted or lockfile-only member) |
+| Same, PR #1095 head `cddf38d` | 1.4.2 hoisted, hosted + vendored | fail (#1095 keeps the Bun shortcut) |
+| Same, release 4.0.0 | 1.4.2 hoisted | fail (not a regression) |
+| #1073: hosted `scan` from a member, object-form `workspaces.packages` = `packages/{a,b}` / `packages/[a-c]` / `packages/**` / `./packages/a/` | 1.4.2 isolated | pass (`redirect_workspace_lockfile_elsewhere`) |
+| `!packages/a` negation: Bun's member set | 1.1.39 / 1.2.0 / 1.2.23 include `a`; 1.3.0 / 1.3.4 / 1.3.9 / 1.4.2 exclude it | informational |
+| Hosted `scan` / `get` from that negated member | 1.2.23 isolated: exit 0, `redirected: 0`, `redirect_npm_no_lockfile` (×2); 1.1.39 / 1.2.23 hoisted `get`: same | **fail**, commented on #1097 |
+| Extglob `packages/@(a\|b)` | 1.2.23 / 1.4.2 | n/a (`bun install` rejects the package.json) |
+| Symlinked `bun.lockb` / `bun.lock`, vendored `--dry-run` vs wet, plus hosted wet | 1.4.2 | pass (lockb dry run: `would_refuse vendor_bun_lockb_invalid`; text dry run: `vendor_would_refuse_symlinked_file`; wet runs exit 1 with the link and its target untouched; hosted `redirect_symlinked_file_unsupported`) |
+
 ## Backlog
 
 0. **Maintainer request (partly covered in runs 3 and 6):** global (`-g`) mode for hosted patches. Still to do: a non-writable global dir must fail loudly (needs a probe; the sandbox runs as root); Windows 1.1.45/1.2.23 with an ASCII temp path; Bun 1.0.x. #443 is still open; re-test #434 (`bun.cmd`) on Windows now that #442 has landed. Checklist: the 20261001T040000Z entry.
@@ -424,9 +438,12 @@ Other passes (Linux, 1.4.2 unless noted):
 7. Hosted rollback on real macOS and Windows checkouts.
 8. Bun 1.4.3 when stable (1.4.3-canary.1 passes, run 27). #992: re-test when fixed, including `[install.scopes]` and `NPM_CONFIG_REGISTRY` variants and the 1.1.45 `remove` / takeover cells. (Lifecycle scripts and scoped packages with scripts on `bun.lockb`: pass, run 27.) (Mixed modes, `globalStore` + vendored workspace lockb: pass, run 25. Superseding uuids in mixed modes, explicit `trustedDependencies`, `bun pm trust`, `--filter`: pass, run 26.)
 9. Digest boundary with a valid substitute tarball, 1.3.9 text lock vs 1.3.10 (low priority, documented limitation).
-10. #1084: a workspace (isolated by default on Bun ≥ 1.3), macOS/Windows; re-test when fixed. The vendored dry run's symlink check doesn't list `bun.lockb` (registry row without `VENDORED`; `wiring_paths`), so check a symlinked `bun.lockb` in a vendored dry run vs a wet run.
+10. #1101: re-test when fixed (and macOS/Windows); also a stray member lock under a root `bun.lockb`. #1097 Bun < 1.3 negation: re-test when fixed. #1084: a workspace (isolated by default on Bun ≥ 1.3), macOS/Windows; re-test when fixed. The vendored dry run's symlink check doesn't list `bun.lockb` (registry row without `VENDORED`; `wiring_paths`), so check a symlinked `bun.lockb` in a vendored dry run vs a wet run.
 
 ## Known non-bugs
+
+- A hosted `scan` from a **hoisted** workspace member (no member `node_modules`) reports `success` with `scannedPackages: 0` and no refusal, because there are no candidates to gate. It claims nothing, and npm behaves the same; `get <uuid>` from the same member is refused. Not filed (run 30).
+- A refused wet vendored run on a symlinked `bun.lock` leaves unreferenced `.socket/vendor/npm/<uuid>/` artifacts. That's documented (CLI_CONTRACT `redirect_symlinked_file_unsupported`: "the artifacts written are unreferenced orphans") (run 30).
 
 - Mock fixture: a mode-less `scan` is hosted by default and re-pins, so don't use it as a read-only check after a rollback. Use `--dry-run` or `list`. Also, `pkill -f <pattern>` kills the calling shell when the pattern is in its own command line, so toggle the mock through an HTTP endpoint instead (run 29).
 - `scan_vendor_references` reads `bun.lockb` natively only when there's no `bun.lock` beside it, which matches Bun ≥ 1.2 (it reads `bun.lock` first). Not a bug (run 29).
