@@ -997,8 +997,9 @@ pub async fn discover_patched_refs_in(
     discover_with_ctx(ctx).await
 }
 
-async fn discover_with_ctx(ctx: DiscoverCtx<'_>) -> Discovery {
+async fn discover_with_ctx(mut ctx: DiscoverCtx<'_>) -> Discovery {
     let mut out = Discovery::default();
+    ignore_member_stray_locks(&mut ctx, &mut out).await;
     npm::extract(&ctx, &mut out).await;
     yarn::extract(&ctx, &mut out).await;
     bun::extract(&ctx, &mut out).await;
@@ -1022,6 +1023,49 @@ async fn discover_with_ctx(ctx: DiscoverCtx<'_>) -> Discovery {
     out
 }
 
+/// A workspace member's own npm, Bun or vlt lock that its package manager
+/// never reads (npm #1094, Bun #1101, vlt #1134: the member installs from
+/// the workspace root's lock, see
+/// [`crate::hosted::governing_root::member_stray_lock`]) is read as absent,
+/// as it is by the install: nothing in it is wiring, so its pins attest
+/// nothing. Its Socket identities are still recognized (rule 11), so a
+/// ledger claim it alone mentions is dead, and one diagnostic says why.
+/// Disk runs only: an in-memory project has no ancestors.
+async fn ignore_member_stray_locks(ctx: &mut DiscoverCtx<'_>, out: &mut Discovery) {
+    if matches!(
+        ctx.view,
+        crate::vendor::lock_inventory::ProjectView::Memory(_)
+    ) {
+        return;
+    }
+    let Some(stray) = crate::hosted::governing_root::member_stray_lock(ctx.root).await else {
+        return;
+    };
+    for rel in &stray.ignored {
+        let mentions = match ctx.view.read_bytes(rel).await {
+            Ok(bytes) => {
+                !socket_identities(&String::from_utf8_lossy(&bytes), ctx.patch_server_origins)
+                    .is_empty()
+            }
+            Err(_) => false,
+        };
+        ctx.recognize_ignored(rel).await;
+        if mentions {
+            out.diag(
+                DIAG_REF_UNATTRIBUTABLE,
+                rel,
+                format!(
+                    "{}, so the Socket references in {rel} are not attested; run socket-patch \
+                     from {} (the workspace root)",
+                    stray.detail,
+                    stray.root.display()
+                ),
+            );
+        }
+    }
+    ctx.ignored = stray.ignored;
+}
+
 /// A PEP 723 script lock (`<script>.py.lock`).
 fn is_script_lock(file: &Path) -> bool {
     crate::utils::python_lock::is_script_lock_name(&file.to_string_lossy())
@@ -1035,6 +1079,10 @@ pub(crate) struct DiscoverCtx<'a> {
     /// snapshot of it.
     view: crate::vendor::lock_inventory::ProjectView<'a>,
     patch_server_origins: &'a [String],
+    /// Root-relative lock files the package manager never reads here (a
+    /// workspace member's stray lock, see [`ignore_member_stray_locks`]):
+    /// the guarded reads see them as absent.
+    ignored: Vec<&'static str>,
     /// What the guarded reads have recognized so far (rule 11) — collected
     /// here, not in the extractor's `&mut Discovery`, so a read into a
     /// scratch `Discovery` (a file parsed only to explain it) still counts.
@@ -1048,6 +1096,7 @@ impl<'a> DiscoverCtx<'a> {
             root,
             view: crate::vendor::lock_inventory::ProjectView::Disk(root),
             patch_server_origins,
+            ignored: Vec::new(),
             recognized: Mutex::new(BTreeSet::new()),
         }
     }
@@ -1126,7 +1175,12 @@ impl<'a> DiscoverCtx<'a> {
     /// Whether `rel` exists (lstat — a dangling symlink still "exists", the
     /// read then fails and diagnoses).
     pub(crate) async fn exists(&self, rel: &str) -> bool {
-        self.view.exists_no_follow(rel).await
+        !self.is_ignored(rel) && self.view.exists_no_follow(rel).await
+    }
+
+    /// Whether `rel` is a lock the package manager never reads here.
+    fn is_ignored(&self, rel: &str) -> bool {
+        self.ignored.contains(&rel)
     }
 
     /// Guarded UTF-8 read of root-relative `rel`: `None` when missing
@@ -1135,6 +1189,9 @@ impl<'a> DiscoverCtx<'a> {
     /// parsing (rule 11) — so a file that then fails to parse, or an entry
     /// the extractor rejects or skips, is still recognized.
     pub(crate) async fn read_text(&self, rel: &str, out: &mut Discovery) -> Option<String> {
+        if self.is_ignored(rel) {
+            return None;
+        }
         match self.view.read_text(rel).await {
             Ok(text) => {
                 self.recognize_text(rel, &text);
@@ -1171,6 +1228,9 @@ impl<'a> DiscoverCtx<'a> {
     /// left in `bun.lockb`'s append-only pool names a DEAD patch, which is
     /// exactly what recognition should say about it.
     pub(crate) async fn read_bytes(&self, rel: &str, out: &mut Discovery) -> Option<Vec<u8>> {
+        if self.is_ignored(rel) {
+            return None;
+        }
         match self.view.read_bytes(rel).await {
             Ok(bytes) => {
                 self.recognize_text(rel, &String::from_utf8_lossy(&bytes));

@@ -999,7 +999,10 @@ async fn headerless_yarn_classic_lock_is_inventoried_as_classic_by_the_fallback(
         .filter(|l| !l.starts_with('#'))
         .collect::<Vec<_>>()
         .join("\n");
-    assert!(!headerless.contains("lockfile v1"), "fixture drops the header");
+    assert!(
+        !headerless.contains("lockfile v1"),
+        "fixture drops the header"
+    );
     write(tmp.path(), "yarn.lock", &headerless).await;
     let (flavor, entries) = inventory_npm_lock(tmp.path()).await.unwrap().unwrap();
     assert_eq!(flavor, NpmLockFlavor::YarnClassic);

@@ -418,7 +418,7 @@ pub async fn vendor_npm<'a>(
 
 /// The project-level refusal [`vendor_npm`]'s step 2 raises whatever the
 /// purl: the project is an npm workspace member whose own lock npm never
-/// reads (#1094, [`super::npm_flavor::npm_member_stray_lock_refusal`]), or
+/// reads (#1094, [`super::npm_flavor::member_stray_lock_refusal`]), or
 /// the primary lock (`npm-shrinkwrap.json`, else `package-lock.json`) is
 /// not parseable JSON or not a v2/v3 lock. `None` unless the project's
 /// npm flavor is package-lock (the probe `vendor_npm_any` routes on) and
@@ -439,7 +439,7 @@ pub async fn npm_lock_vendor_preflight(project_root: &Path) -> Option<(&'static 
     ) {
         return None;
     }
-    if let Some(refusal) = super::npm_flavor::npm_member_stray_lock_refusal(project_root).await {
+    if let Some(refusal) = super::npm_flavor::member_stray_lock_refusal(project_root).await {
         return Some(refusal);
     }
     let (lock_name, lock_bytes, _) = select_lockfile(project_root).await.ok()??;

@@ -397,22 +397,25 @@ async fn detect_vendorable_npm_flavor_with(
     ))
 }
 
-/// #1094: a package-lock project that is a member of an npm workspace
-/// holds a lock npm never reads (members install from the workspace
+/// A workspace member whose own lock its package manager never reads
+/// (npm #1094, Bun #1101, vlt #1134: members install from the workspace
 /// root's lock), so vendoring into it would wire nothing. Refused as a
 /// member without that lock is (`vendor_lockfile_missing`). Shared by
-/// [`vendor_npm_any`] and the hosted→vendored takeover preflight
-/// ([`super::npm_lock::npm_lock_vendor_preflight`]), which must refuse
-/// before the takeover restores the hosted pin.
-pub(crate) async fn npm_member_stray_lock_refusal(
+/// [`vendor_npm_any`] and the hosted→vendored takeover preflights
+/// ([`super::npm_lock::npm_lock_vendor_preflight`],
+/// [`super::bun_lock::preflight_vendor`],
+/// [`super::vlt_lock::vlt_vendor_preflight`]), which must refuse before
+/// the takeover restores the hosted pin.
+pub(crate) async fn member_stray_lock_refusal(
     project_root: &Path,
 ) -> Option<(&'static str, String)> {
-    let (root, detail) = crate::hosted::governing_root::npm_member_stray_lock(project_root).await?;
+    let stray = crate::hosted::governing_root::member_stray_lock(project_root).await?;
     Some((
         "vendor_lockfile_missing",
         format!(
-            "{detail}; vendor from {} (the workspace root)",
-            root.display()
+            "{}; vendor from {} (the workspace root)",
+            stray.detail,
+            stray.root.display()
         ),
     ))
 }
@@ -439,10 +442,8 @@ pub async fn vendor_npm_any<'a>(
         Ok(found) => found,
         Err((code, detail)) => return VendorOutcome::Refused { code, detail },
     };
-    if flavor == NpmLockFlavor::PackageLock {
-        if let Some((code, detail)) = npm_member_stray_lock_refusal(project_root).await {
-            return VendorOutcome::Refused { code, detail };
-        }
+    if let Some((code, detail)) = member_stray_lock_refusal(project_root).await {
+        return VendorOutcome::Refused { code, detail };
     }
     if let Some(detail) = flavor_change_refusal(project_root, purl, flavor).await {
         return VendorOutcome::Refused {

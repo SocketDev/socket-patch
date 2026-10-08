@@ -1234,8 +1234,7 @@ async fn run_check(args: &VendorArgs) -> i32 {
     // know (the ledger was ignored or dropped from the commit along with the
     // manifest) leaves every fresh install failing; the manifest keys above
     // cannot see it, so the references are read from the wiring itself.
-    let references =
-        crate::commands::vendored_backend::repair::scan_vendor_references(root).await;
+    let references = crate::commands::vendored_backend::repair::scan_vendor_references(root).await;
     for (eco, uuid, rel) in references {
         let ledgered = state
             .entries
