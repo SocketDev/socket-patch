@@ -751,8 +751,8 @@ fn bun_workspace_pattern_members_sync(root: &Path) -> Option<Vec<PathBuf>> {
     Some(members)
 }
 
-/// The dirs below `root` a `workspaces` glob matches (`/`-separated; `*`
-/// and `?` within one component, `**` any number of them), never inside a
+/// The dirs below `root` a `workspaces` glob matches (`/`-separated; `*`,
+/// `?` and `[...]` classes within one component, `**` any number of them), never inside a
 /// `node_modules` and never through a link for `**`. `None` when a `**`
 /// walk passes [`WORKSPACE_GLOB_DIR_BUDGET`] dirs.
 fn expand_workspace_pattern_sync(root: &Path, pattern: &str) -> Option<Vec<PathBuf>> {
@@ -781,13 +781,12 @@ fn expand_workspace_pattern_sync(root: &Path, pattern: &str) -> Option<Vec<PathB
                     }
                     next.push(dir);
                 }
-            } else if segment.contains(['*', '?']) {
+            } else if segment.contains(['*', '?', '[']) {
+                let pattern: Vec<char> = segment.chars().collect();
                 for entry in list_dir_sync(&dir).entries {
+                    let name: Vec<char> = entry.name_str.chars().collect();
                     if entry.name_str != "node_modules"
-                        && crate::hosted::governing_root::segment_glob_matches(
-                            segment.as_bytes(),
-                            entry.name_str.as_bytes(),
-                        )
+                        && crate::hosted::governing_root::segment_glob_matches(&pattern, &name)
                         && is_dir_sync(&dir.join(&entry.name))
                     {
                         next.push(dir.join(&entry.name));

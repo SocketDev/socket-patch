@@ -68,9 +68,11 @@ on:
 permissions:
   contents: read
 
+# Supersede stale PR runs only: main runs are the only rust-cache writers
+# (save-if), so push and dispatch runs are never cancelled mid-save.
 concurrency:
   group: composer-compat-${{ github.event.pull_request.number || github.ref }}
-  cancel-in-progress: true
+  cancel-in-progress: ${{ github.event_name == 'pull_request' }}
 
 env:
   SOCKET_NO_CONFIG: '1'

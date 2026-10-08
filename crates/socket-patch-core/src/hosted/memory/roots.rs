@@ -31,17 +31,23 @@ pub const UNSUPPORTED_MARKERS: [(&str, &[&str]); 2] = [
 /// trees, VCS and tool state, and vendored dependencies. Structural, so no
 /// policy can negate them. (Test and fixture trees are the socket.yml
 /// policy's overridable built-in ignores.)
-pub(crate) const EXCLUDED_ROOT_SEGMENTS: [&str; 5] = ["node_modules", ".git", ".socket", ".yarn", "vendor"];
+pub(crate) const EXCLUDED_ROOT_SEGMENTS: [&str; 5] =
+    ["node_modules", ".git", ".socket", ".yarn", "vendor"];
 
 /// The marker basenames of `root` among `paths` (the files the policy's
 /// path filters test for that root).
-pub(crate) fn root_markers<'a>(root: &str, paths: impl IntoIterator<Item = &'a str>) -> Vec<String> {
+pub(crate) fn root_markers<'a>(
+    root: &str,
+    paths: impl IntoIterator<Item = &'a str>,
+) -> Vec<String> {
     let mut out: Vec<String> = paths
         .into_iter()
         .filter_map(|path| {
             let (dir, base) = split_path(path);
             let marker = marker_ecosystem(base).is_some()
-                || UNSUPPORTED_MARKERS.iter().any(|(_, names)| names.contains(&base));
+                || UNSUPPORTED_MARKERS
+                    .iter()
+                    .any(|(_, names)| names.contains(&base));
             (dir == root && marker).then(|| base.to_string())
         })
         .collect();
@@ -82,6 +88,23 @@ pub(crate) fn join_root(root: &str, rel: &str) -> String {
     } else {
         format!("{root}/{rel}")
     }
+}
+
+/// yarn berry's rc file, which yarn merges from every directory at or
+/// above the project (the closest setting winning).
+pub(crate) const YARNRC_NAME: &str = ".yarnrc.yml";
+
+/// The directories strictly above `root` inside the repository, nearest
+/// first, ending with the repository root (`""`). None for the repository
+/// root itself.
+pub(crate) fn strict_ancestors(root: &str) -> impl Iterator<Item = &str> {
+    let mut next = (!root.is_empty()).then_some(root);
+    std::iter::from_fn(move || {
+        let dir = next?;
+        let parent = split_path(dir).0;
+        next = (!parent.is_empty()).then_some(parent);
+        Some(parent)
+    })
 }
 
 fn allowed(ecosystems: Option<&[String]>, eco: &str) -> bool {
@@ -202,7 +225,15 @@ mod tests {
     #[test]
     fn root_markers_name_every_marker_of_the_root_only() {
         assert_eq!(
-            root_markers("a", ["a/yarn.lock", "a/package.json", "a/b/yarn.lock", "a/pom.xml"]),
+            root_markers(
+                "a",
+                [
+                    "a/yarn.lock",
+                    "a/package.json",
+                    "a/b/yarn.lock",
+                    "a/pom.xml"
+                ]
+            ),
             vec!["pom.xml".to_string(), "yarn.lock".to_string()]
         );
     }
@@ -230,5 +261,15 @@ mod tests {
             detect_roots(["a/package-lock.json", "b/Cargo.lock"], Some(&only_npm));
         assert_eq!(found, vec!["a"]);
         assert_eq!(ignored[0].reason, "ecosystem_filtered");
+    }
+
+    #[test]
+    fn strict_ancestors_walk_up_to_the_repo_root() {
+        assert_eq!(strict_ancestors("").count(), 0);
+        assert_eq!(strict_ancestors("web").collect::<Vec<_>>(), vec![""]);
+        assert_eq!(
+            strict_ancestors("apps/web/ui").collect::<Vec<_>>(),
+            vec!["apps/web", "apps", ""]
+        );
     }
 }

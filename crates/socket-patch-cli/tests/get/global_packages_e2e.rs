@@ -211,7 +211,10 @@ fn assert_rollback_noop(stdout: &str) {
             r["skipped"], "package_not_installed",
             "a no-op rollback may carry only not-installed markers; envelope={v}"
         );
-        assert!(r["path"].is_null(), "marker path must be null; envelope={v}");
+        assert!(
+            r["path"].is_null(),
+            "marker path must be null; envelope={v}"
+        );
         assert!(
             r.get("success").is_none() && r.get("error").is_none(),
             "markers carry no success/error keys; envelope={v}"
