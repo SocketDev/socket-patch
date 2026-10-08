@@ -283,8 +283,8 @@ pub(crate) async fn restore(
                 Ok(next) => {
                     text = next;
                     checksum_dirs.push(format!(
-                        "{}/{artifact}/{suffixed}/",
-                        group.replace('.', "/")
+                        "{}/",
+                        crate::vendor::jvm::layout::version_dir(group, artifact, &suffixed)
                     ));
                     restored.push(&pin.uuid);
                 }

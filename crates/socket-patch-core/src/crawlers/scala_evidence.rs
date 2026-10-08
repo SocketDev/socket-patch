@@ -159,7 +159,10 @@ pub fn resolution_of(projects: &[(String, BloopProject)]) -> JvmResolution {
 /// The evidence under `root`, `None` when there is none.
 pub fn discover(root: &Path) -> Option<ScalaEvidence> {
     let dir = root.join(BLOOP_DIR);
-    for d in [root.join(".scala-build"), dir.clone()] {
+    for d in [
+        root.join(crate::vendor::jvm::layout::SCALA_CLI_DIR),
+        dir.clone(),
+    ] {
         match std::fs::symlink_metadata(&d) {
             Ok(m) if m.is_dir() => {}
             Ok(_) => {
@@ -310,7 +313,7 @@ fn is_stale(root: &Path, sources: &[PathBuf], evidence_time: SystemTime) -> bool
         return true;
     }
     let listed: BTreeSet<String> = sources.iter().filter_map(|p| rel_of(p)).collect();
-    let project = crate::vendor::jvm::scala_cli::PROJECT_FILE;
+    let project = crate::vendor::jvm::layout::SCALA_CLI_FILE;
     if !listed.contains(project) && std::fs::symlink_metadata(root.join(project)).is_ok() {
         debug_log("scala-cli evidence: the newest project does not list project.scala");
         return true;

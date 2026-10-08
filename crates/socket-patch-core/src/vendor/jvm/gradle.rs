@@ -33,14 +33,14 @@ use super::{
     OWNED_FILE_KIND, SETTINGS_FRAGMENT_KIND, VERIFICATION_FRAGMENT_KIND,
 };
 
-pub use super::safe_coordinates;
+use super::layout::{self, safe_coordinates};
 
 /// The owned settings script. Its bytes change only with a CLI release.
 pub const SCRIPT: &str = include_str!("socket-patch.settings.gradle");
 /// Where [`SCRIPT`] lives, project-relative.
 pub const SCRIPT_REL: &str = ".socket/gradle/socket-patch.settings.gradle";
 /// The Gradle-only artifact tree root.
-pub const TREE_ROOT: &str = ".socket/vendor/gradle";
+use super::layout::GRADLE_TREE as TREE_ROOT;
 /// The tree root's `.gitattributes`, shared by every Gradle patch.
 pub const GITATTRIBUTES_REL: &str = ".socket/vendor/gradle/.gitattributes";
 /// `.socket/gradle/`'s `.gitattributes` (`* -text`): the settings scripts
@@ -59,7 +59,7 @@ const HOSTED_SCRIPT_REL: &str = ".socket/gradle/socket-patch.hosted.settings.gra
 pub const INDEX_REL: &str = ".socket/vendor/gradle-index.tsv";
 pub const INDEX_HEADER: &str = "#socket-patch-gradle-index 1";
 pub const VERIFICATION_REL: &str = "gradle/verification-metadata.xml";
-pub const MARKER_NAME: &str = "socket-patch.vendor.json";
+use super::layout::MARKER_FILE as MARKER_NAME;
 /// Repository name shared by the script and the in-block entry: the script
 /// skips a handler that already holds it.
 const REPO_NAME: &str = "socketPatchVendor";
@@ -109,19 +109,14 @@ impl WiringTarget {
 
 /// The tree directory of `c` (same GAV).
 pub fn tree_dir(c: &Coords<'_>) -> String {
-    format!(
-        "{TREE_ROOT}/{}/{}/{}",
-        c.group_path(),
-        c.artifact_id,
-        c.version
-    )
+    c.tree_dir(TREE_ROOT, c.version)
 }
 
 /// The derived artifact-level `maven-metadata.xml` of `group:artifact`.
 pub fn derived_metadata_rel(group_id: &str, artifact_id: &str) -> String {
     format!(
         "{TREE_ROOT}/{}/{artifact_id}/{METADATA_NAME}",
-        group_id.replace('.', "/")
+        layout::group_path(group_id)
     )
 }
 
@@ -912,7 +907,7 @@ pub fn unplan(read: ReadFn<'_>, c: &Coords<'_>, records: &[WiringRecord]) -> Jvm
     let in_block_key = format!("in_block:{}:{}:{}", c.group_id, c.artifact_id, c.version);
     for (rel, text) in after.iter_mut() {
         let Some(t) = text.as_mut() else { continue };
-        if !is_settings_file(rel) {
+        if !layout::is_gradle_settings(rel) {
             continue;
         }
         let dir = rel.rsplit_once('/').map_or("", |(d, _)| d);
@@ -1041,7 +1036,7 @@ pub fn unplan(read: ReadFn<'_>, c: &Coords<'_>, records: &[WiringRecord]) -> Jvm
     if others.is_empty() {
         after.insert(INDEX_REL.to_string(), None);
         for (rel, text) in after.iter_mut() {
-            if !is_settings_file(rel) {
+            if !layout::is_gradle_settings(rel) {
                 continue;
             }
             for w in recs(rel)
@@ -1197,7 +1192,7 @@ pub fn references_checked(read: ReadFn<'_>, c: &Coords<'_>) -> Option<bool> {
     };
     let wiring = WiringTarget::vendored();
     let mut applied = Some(false);
-    for rel in ["settings.gradle", "settings.gradle.kts"] {
+    for rel in layout::GRADLE_SETTINGS_FILES {
         let Some(bytes) = read(rel) else {
             continue;
         };
@@ -1273,11 +1268,6 @@ pub fn wired_checked(
         }
     }
     Ok(wired(read, list, c))
-}
-
-fn is_settings_file(rel: &str) -> bool {
-    let name = rel.rsplit('/').next().unwrap_or(rel);
-    name == "settings.gradle" || name == "settings.gradle.kts"
 }
 
 /// `text` without its first whole line whose trimmed body is `line`.
@@ -1426,14 +1416,7 @@ pub(crate) fn settings_target(
     };
     Ok(Target {
         dir: dir.to_string(),
-        rel: join_rel(
-            dir,
-            if kotlin {
-                "settings.gradle.kts"
-            } else {
-                "settings.gradle"
-            },
-        ),
+        rel: join_rel(dir, layout::GRADLE_SETTINGS_FILES[usize::from(kotlin)]),
         text: None,
         kotlin,
     })
@@ -1445,14 +1428,9 @@ fn read_settings(read: ReadFn<'_>, dir: &str) -> Result<Target, JvmRefusal> {
 
 /// The settings target of `buildSrc`, when the checkout has one.
 pub(crate) fn read_buildsrc(read: ReadFn<'_>) -> Result<Option<Target>, JvmRefusal> {
-    let present = [
-        "build.gradle",
-        "build.gradle.kts",
-        "settings.gradle",
-        "settings.gradle.kts",
-    ]
-    .iter()
-    .any(|f| read(&format!("buildSrc/{f}")).is_some());
+    let present = layout::GRADLE_ROOT_FILES
+        .iter()
+        .any(|f| read(&format!("buildSrc/{f}")).is_some());
     if !present {
         return Ok(None);
     }
@@ -1929,25 +1907,8 @@ fn marker_json(patch: &JvmPatch<'_>, files: &[(String, &[u8])]) -> String {
 
 /// Whether an existing index row is one the script would accept.
 fn valid_index_row(row: &str) -> bool {
-    let cols: Vec<&str> = row.split('\t').collect();
-    let [gav, path, sha, uuid] = cols.as_slice() else {
-        return false;
-    };
-    let parts: Vec<&str> = gav.split(':').collect();
-    let [g, a, v] = parts.as_slice() else {
-        return false;
-    };
-    let dir = format!("{}/{a}/{v}/", g.replace('.', "/"));
-    safe_coordinates(g, a, v)
-        && path
-            .strip_prefix(&dir)
-            .is_some_and(|n| n.starts_with(&format!("{a}-{v}")) && !n.contains('/'))
-        && sha.len() == 64
-        && sha
-            .bytes()
-            .all(|c| c.is_ascii_digit() || (b'a'..=b'f').contains(&c))
-        && !uuid.is_empty()
-        && !uuid.chars().any(char::is_whitespace)
+    layout::index_row(row)
+        .is_some_and(|[.., uuid]| !uuid.is_empty() && !uuid.chars().any(char::is_whitespace))
 }
 
 /// Merge `rows` for `gav` into the existing index, replacing that GAV's
@@ -3719,6 +3680,88 @@ mod tests {
             assert!(out.success && out.warnings.is_empty(), "{files:?}: {out:?}");
             assert_eq!(testing::snapshot(root), pristine, "{files:?}");
             assert!(!root.join(".socket").exists());
+        }
+    }
+
+    /// The hosted takeover stages a vendored revert in a group that defers
+    /// artifact removals, then either drops the group (`--dry-run`), rolls
+    /// the revert back (a planner-refused, retracted takeover) or commits.
+    /// Only the commit may change the disk: the tree files, the derived
+    /// `maven-metadata.xml` (rewritten while a sibling version stays,
+    /// deleted with the last one) and the owned `.gitattributes` files all
+    /// stay byte-identical until then, and the commit lands exactly the
+    /// plain revert's result.
+    #[tokio::test]
+    async fn a_staged_revert_changes_nothing_until_its_group_commits() {
+        use crate::utils::group_commit::GroupCommit;
+        #[derive(Clone, Copy, Debug)]
+        enum End {
+            Drop,
+            Rollback,
+            Commit,
+        }
+        let sibling = JvmPatch {
+            version: "2.11.0",
+            uuid: UUID_B,
+            ..patch()
+        };
+        let shapes: [&[(&str, &str)]; 2] = [
+            &[("settings.gradle", "rootProject.name = 'x'\n")],
+            &[("settings.gradle", "plugins {\n  id 'x' version '1'\n}\n")],
+        ];
+        for files in shapes {
+            for with_sibling in [false, true] {
+                for end in [End::Drop, End::Rollback, End::Commit] {
+                    let dir = tempfile::tempdir().unwrap();
+                    let root = dir.path();
+                    testing::populate(root, files);
+                    let mut ledger = BTreeMap::new();
+                    testing::vendor(root, Shape::Gradle, &patch(), &mut ledger)
+                        .await
+                        .unwrap();
+                    if with_sibling {
+                        testing::vendor(root, Shape::Gradle, &sibling, &mut ledger)
+                            .await
+                            .unwrap();
+                    }
+                    let (before, before_dirs) = (testing::snapshot(root), testing::dirs(root));
+
+                    // What the plain (unstaged) revert leaves, on a copy.
+                    let expected_dir = tempfile::tempdir().unwrap();
+                    for (rel, bytes) in &before {
+                        let path = expected_dir.path().join(rel);
+                        std::fs::create_dir_all(path.parent().unwrap()).unwrap();
+                        std::fs::write(path, bytes).unwrap();
+                    }
+                    let mut expected_ledger = ledger.clone();
+                    let out =
+                        testing::revert(expected_dir.path(), &patch(), &mut expected_ledger).await;
+                    assert!(out.success, "{out:?}");
+                    let expected = testing::snapshot(expected_dir.path());
+
+                    let group = GroupCommit::begin(root);
+                    group.defer_removals();
+                    let savepoint = group.savepoint();
+                    let out = testing::revert(root, &patch(), &mut ledger).await;
+                    assert!(out.success && !out.kept_artifact, "{out:?}");
+                    let ctx = format!("{files:?} sibling={with_sibling} {end:?}");
+                    assert_eq!(testing::snapshot(root), before, "staged: {ctx}");
+                    match end {
+                        End::Drop => drop(group),
+                        End::Rollback => {
+                            group.rollback_to(savepoint);
+                            group.commit().await.unwrap();
+                        }
+                        End::Commit => {
+                            group.commit().await.unwrap();
+                            assert_eq!(testing::snapshot(root), expected, "{ctx}");
+                            continue;
+                        }
+                    }
+                    assert_eq!(testing::snapshot(root), before, "{ctx}");
+                    assert_eq!(testing::dirs(root), before_dirs, "{ctx}");
+                }
+            }
         }
     }
 

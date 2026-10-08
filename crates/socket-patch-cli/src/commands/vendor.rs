@@ -372,7 +372,7 @@ pub(crate) async fn dispatch_revert_one_opts(
     {
         return RevertOutcome::failed(vendor::path::vendor_dir_symlink_detail(&link));
     }
-    match entry.ecosystem.as_str() {
+    match vendor::jvm::layout::ledger_ecosystem(&entry.ecosystem) {
         "npm" => vendor::npm_flavor::revert_npm_any_opts(entry, project_root, opts).await,
         "pypi" => vendor::pypi::revert_pypi_opts(entry, project_root, opts).await,
         "gem" => vendor::gem::revert_gem_opts(entry, project_root, opts).await,
@@ -380,7 +380,7 @@ pub(crate) async fn dispatch_revert_one_opts(
         "golang" => vendor::golang::revert_go_vendor_opts(entry, project_root, opts).await,
         "composer" => vendor::composer_lock::revert_composer_opts(entry, project_root, opts).await,
         "nuget" => vendor::nuget_feed::revert_nuget_opts(entry, project_root, opts).await,
-        "maven" | "jvm" => vendor::maven_repo::revert_maven_opts(entry, project_root, opts).await,
+        "maven" => vendor::maven_repo::revert_maven_opts(entry, project_root, opts).await,
         other => RevertOutcome::failed(format!(
             "this build has no vendor backend for ecosystem `{other}`"
         )),
@@ -506,8 +506,11 @@ fn orphan_label(unit: &vendor::path::SweptVendorDir) -> String {
         .unwrap_or_else(|| format!("{}/{}", unit.eco, unit.uuid))
 }
 
-/// Does `eco` fall inside this run's `--ecosystems` scope?
+/// Does `eco` fall inside this run's `--ecosystems` scope? A vendor-ledger
+/// name counts as the package ecosystem it stands for (a `jvm` entry is
+/// `maven`, [`vendor::jvm::layout::ledger_ecosystem`]).
 pub(crate) fn ecosystem_in_scope(common: &GlobalArgs, eco: &str) -> bool {
+    let eco = vendor::jvm::layout::ledger_ecosystem(eco);
     match socket_patch_core::crawlers::Ecosystem::all()
         .iter()
         .find(|e| e.cli_name() == eco)
@@ -1124,7 +1127,7 @@ async fn run_check(args: &VendorArgs) -> i32 {
     // other ecosystems the ledger records.
     let jvm_orphan = (!state.entries.values().any(vendor::jvm::apply::is_jvm_entry))
         .then(|| {
-            vendor::jvm::apply::LEDGER_OWNED_PATHS
+            vendor::jvm::layout::LEDGER_OWNED_PATHS
                 .iter()
                 .copied()
                 .find(|rel| root.join(rel).exists())
@@ -1454,7 +1457,7 @@ impl EjectSnapshot {
             ));
         }
         planned.extend(
-            socket_patch_core::vendor::jvm::coursier_tree::CAPTURED_FILES
+            socket_patch_core::vendor::jvm::layout::CAPTURED_FILES
                 .iter()
                 .map(|s| s.to_string()),
         );
@@ -6307,6 +6310,20 @@ mod scope_and_hint_tests {
         let golang = with_scope(Some(&["golang"]));
         assert!(ecosystem_in_scope(&golang, "golang"));
     }
+
+    /// A v5 JVM-backend ledger entry is recorded as `jvm`, which is no
+    /// `--ecosystems` name: `--ecosystems maven` must still scope it in
+    /// (the GC passes, rollback's vendored leg and repair all filter ledger
+    /// entries by this), and another ecosystem's scope must leave it out.
+    #[test]
+    fn jvm_ledger_entries_are_in_the_maven_scope() {
+        let maven = with_scope(Some(&["maven"]));
+        assert!(ecosystem_in_scope(&maven, "jvm"));
+        assert!(ecosystem_in_scope(&maven, "maven"));
+        let npm_only = with_scope(Some(&["npm"]));
+        assert!(!ecosystem_in_scope(&npm_only, "jvm"));
+        assert!(ecosystem_in_scope(&with_scope(None), "jvm"));
+    }
 }
 
 #[cfg(test)]
@@ -7017,7 +7034,7 @@ mod eject_snapshot_tests {
     #[tokio::test]
     async fn snapshot_fails_closed_on_a_fifo() {
         let tmp = tempfile::tempdir().unwrap();
-        let rel = socket_patch_core::vendor::jvm::coursier_tree::CAPTURED_FILES[0];
+        let rel = socket_patch_core::vendor::jvm::layout::CAPTURED_FILES[0];
         let path = tmp.path().join(rel);
         std::fs::create_dir_all(path.parent().unwrap()).unwrap();
         let c = std::ffi::CString::new(path.to_str().unwrap()).unwrap();
