@@ -1,5 +1,5 @@
 ### Refactor routine (`refactor`, hourly, highest leverage first)
-_Last updated 2026-10-08T04:22Z · main @ b762f41_
+_Last updated 2026-10-08T05:10Z · main @ 05fd82b_
 
 **In flight:**
 - [#1108](https://github.com/SocketDev/socket-patch/pull/1108): one `utils::line_endings::terminator` (CRLF → CRLF, mixed → majority, else LF) for 7 inserted-line sites: gem lock converge, composer/requirements restore, Pipfile.lock entry formatter, PEP 723 writer, go.mod append/re-join. Issue #815 (E16, slice 1; `detect_eol`, `pypi_uv::newline_of`, Maven ×2, `redirect/mod.rs`, the `crlf` flags and upstream gem's Gemfile restore remain, all in open-PR files). Re-blesses the go/uv equivalence goldens (mixed inputs only). `state: ready`.
@@ -24,7 +24,7 @@ _Last updated 2026-10-08T04:22Z · main @ b762f41_
 | 4 | #906 (E25): one `stage_prebuilt` for the 4 `<eco>_service_copy` pipelines | 0 | 1 | 4–5 | L | ≈11 | skipped: `vendor/{cargo,composer_lock,gem,golang,service_fetch}.rs` changed by #1026, #1041 and others |
 | 5 | #998 (C56): one NotFound-only manifest probe | 1 | 1 | ≈5 | M | ≈13 | skipped: `commands/vendor.rs` changed by 11 open PRs |
 
-Re-ranked 2026-10-08T03:58Z at `b762f41` against the files of the 39 open PRs (547 paths). 156 of 383 production `.rs` files are free. Only #815's slice and #649 (comments only, score 0) fit inside them. #906 looked free on body paths alone, but its link targets are backticked, so a path-only match misses them. Check symbol definitions, not body paths.
+Re-ranked 2026-10-08T03:58Z at `b762f41` against the files of the 39 open PRs (547 paths). 156 of 383 production `.rs` files are free. Only #815's slice and #649 (comments only, score 0) fit inside them. #906 looked free on body paths alone, but its link targets are backticked, so a path-only match misses them. Check symbol definitions, not body paths. 05:10Z at `05fd82b`: nothing merged or closed, so the overlap set is unchanged. New since: #1107 (C75, one `utils::http` client builder) overlaps `client.rs`/`telemetry.rs`/`registry_fetch.rs` (#1026, #1041, #1049) and waits on a trust-default decision; #1090 (C32 child 1) and every #1089 child's covgap file are changed by open PRs; E88's severity ladder already delegates to `api::ranking`. No PR opened.
 
 **Notes:**
 - Equivalence goldens (`tests/equivalence/*.golden`, re-bless with `SOCKET_PATCH_BLESS_GOLDEN=1`) feed one input in five through a mixed-ending generator, so any line-ending rule change moves them. Show that only mixed cases can move (a rule argument plus a chunk count) before you re-bless.
