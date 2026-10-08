@@ -25,10 +25,8 @@ pub const WITHHELD_REASON: &str = ARTIFACT_UNVERIFIABLE;
 /// megabytes and is never read into the rewriter's input.
 pub fn install_state_present(view: &ProjectView<'_>) -> bool {
     match view {
-        ProjectView::Disk(cwd)
-        | ProjectView::Snapshot(crate::vendor::lock_inventory::DiskSnapshot {
-            root: cwd, ..
-        }) => {
+        ProjectView::Disk(_) | ProjectView::Snapshot(_) => {
+            let cwd = view.disk_root().expect("a disk view has a root");
             let is = |rel: &str, dir: bool| {
                 std::fs::symlink_metadata(cwd.join(rel)).is_ok_and(|m| {
                     if dir {
@@ -52,10 +50,10 @@ pub fn install_state_present(view: &ProjectView<'_>) -> bool {
 /// Whether `bun.lockb` is present (disk: `exists`, which follows links).
 pub(crate) fn bun_lockb_present(view: &ProjectView<'_>) -> bool {
     match view {
-        ProjectView::Disk(cwd)
-        | ProjectView::Snapshot(crate::vendor::lock_inventory::DiskSnapshot {
-            root: cwd, ..
-        }) => cwd.join(BUN_LOCKB).exists(),
+        ProjectView::Disk(_) | ProjectView::Snapshot(_) => {
+            let cwd = view.disk_root().expect("a disk view has a root");
+            cwd.join(BUN_LOCKB).exists()
+        }
         ProjectView::Memory(project) => project.contains(BUN_LOCKB),
     }
 }

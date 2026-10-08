@@ -256,10 +256,10 @@ pub fn build_candidates(
 /// Bun's precedence when both lock spellings are present.
 pub fn bun_lock_present(view: &ProjectView<'_>) -> bool {
     match view {
-        ProjectView::Disk(cwd)
-        | ProjectView::Snapshot(crate::vendor::lock_inventory::DiskSnapshot {
-            root: cwd, ..
-        }) => cwd.join("bun.lock").exists(),
+        ProjectView::Disk(_) | ProjectView::Snapshot(_) => {
+            let cwd = view.disk_root().expect("a disk view has a root");
+            cwd.join("bun.lock").exists()
+        }
         ProjectView::Memory(project) => project.contains("bun.lock"),
     }
 }
@@ -364,10 +364,10 @@ impl CandidateFiles {
 /// Whether the project is a Rush monorepo (disk: `rush.json` is a file).
 fn rush_repo(view: &ProjectView<'_>) -> bool {
     match view {
-        ProjectView::Disk(cwd)
-        | ProjectView::Snapshot(crate::vendor::lock_inventory::DiskSnapshot {
-            root: cwd, ..
-        }) => cwd.join("rush.json").is_file(),
+        ProjectView::Disk(_) | ProjectView::Snapshot(_) => {
+            let cwd = view.disk_root().expect("a disk view has a root");
+            cwd.join("rush.json").is_file()
+        }
         ProjectView::Memory(project) => project.contains("rush.json"),
     }
 }
@@ -708,8 +708,8 @@ async fn keep_bundler_loaded_gem_files(
         .collect();
     let loaded = crate::crawlers::ruby_crawler::bundler_loaded_manifest_in(view).await;
     let mirror = match view {
-        ProjectView::Disk(root)
-        | ProjectView::Snapshot(crate::vendor::lock_inventory::DiskSnapshot { root, .. }) => {
+        ProjectView::Disk(_) | ProjectView::Snapshot(_) => {
+            let root = view.disk_root().expect("a disk view has a root");
             crate::crawlers::ruby_crawler::bundler_source_mirror(root, &sources).await
         }
         ProjectView::Memory(_) => {
@@ -1003,13 +1003,13 @@ pub fn overlay_creation_is_invisible(rel: &str) -> bool {
 /// symbolic link (absent to the planner, refused by [`guard`]).
 fn read_workspace(view: &ProjectView<'_>) -> (std::io::Result<Option<String>>, bool) {
     match view {
-        ProjectView::Disk(cwd)
-        | ProjectView::Snapshot(crate::vendor::lock_inventory::DiskSnapshot {
-            root: cwd, ..
-        }) => (
-            read_workspace_for_trust(&cwd.join(PNPM_WORKSPACE_REL)),
-            false,
-        ),
+        ProjectView::Disk(_) | ProjectView::Snapshot(_) => {
+            let cwd = view.disk_root().expect("a disk view has a root");
+            (
+                read_workspace_for_trust(&cwd.join(PNPM_WORKSPACE_REL)),
+                false,
+            )
+        }
         ProjectView::Memory(project) => match project.get(PNPM_WORKSPACE_REL) {
             None => (Ok(None), false),
             Some(MemoryEntry::Text(text)) => (Ok(Some(text.to_string())), false),
@@ -1036,10 +1036,10 @@ fn read_workspace(view: &ProjectView<'_>) -> (std::io::Result<Option<String>>, b
 /// [`read_npmrc_for_allow_remote`]).
 fn read_npmrc(view: &ProjectView<'_>) -> Result<Option<String>, String> {
     match view {
-        ProjectView::Disk(cwd)
-        | ProjectView::Snapshot(crate::vendor::lock_inventory::DiskSnapshot {
-            root: cwd, ..
-        }) => read_npmrc_for_allow_remote(&cwd.join(NPMRC_REL)),
+        ProjectView::Disk(_) | ProjectView::Snapshot(_) => {
+            let cwd = view.disk_root().expect("a disk view has a root");
+            read_npmrc_for_allow_remote(&cwd.join(NPMRC_REL))
+        }
         ProjectView::Memory(project) => match project.get(NPMRC_REL) {
             None => Ok(None),
             Some(MemoryEntry::Symlink) => {
@@ -1059,10 +1059,10 @@ fn read_npmrc(view: &ProjectView<'_>) -> Result<Option<String>, String> {
 /// Whether Rush's repo-state file is present (disk: a regular file).
 fn rush_repo_state_present(view: &ProjectView<'_>) -> bool {
     match view {
-        ProjectView::Disk(cwd)
-        | ProjectView::Snapshot(crate::vendor::lock_inventory::DiskSnapshot {
-            root: cwd, ..
-        }) => cwd.join(RUSH_REPO_STATE_REL).is_file(),
+        ProjectView::Disk(_) | ProjectView::Snapshot(_) => {
+            let cwd = view.disk_root().expect("a disk view has a root");
+            cwd.join(RUSH_REPO_STATE_REL).is_file()
+        }
         ProjectView::Memory(project) => project.contains(RUSH_REPO_STATE_REL),
     }
 }
@@ -1867,10 +1867,10 @@ fn pnpm_trust_user_set_detail(server: &str, file: &str, value: &str) -> String {
 /// no ancestors.
 fn governing_workspace(view: &ProjectView<'_>) -> Option<std::path::PathBuf> {
     match view {
-        ProjectView::Disk(cwd)
-        | ProjectView::Snapshot(crate::vendor::lock_inventory::DiskSnapshot {
-            root: cwd, ..
-        }) => governing_workspace_file(cwd),
+        ProjectView::Disk(_) | ProjectView::Snapshot(_) => {
+            let cwd = view.disk_root().expect("a disk view has a root");
+            governing_workspace_file(cwd)
+        }
         ProjectView::Memory(_) => None,
     }
 }

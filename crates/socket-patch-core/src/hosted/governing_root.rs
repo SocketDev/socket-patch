@@ -78,7 +78,7 @@ pub async fn refusal(
 ) -> Option<Refusal> {
     let root: &Path = match view {
         ProjectView::Disk(root) => root,
-        ProjectView::Snapshot(snap) => snap.root,
+        ProjectView::Snapshot(snap) => snap.root(),
         ProjectView::Memory(_) => return None,
     };
     if candidates.iter().any(|c| c.dep.ecosystem == "cargo") {

@@ -8,7 +8,7 @@ use crate::utils::fs::{
     entry_is_dir, home_dir, is_dir, is_file, list_dir_entries, normalize_lexically, run_blocking,
 };
 use crate::utils::process::{CommandRunner, SystemCommandRunner};
-use crate::vendor::lock_inventory::{DiskSnapshot, ProjectView};
+use crate::vendor::lock_inventory::ProjectView;
 
 /// Ruby/RubyGems ecosystem crawler for discovering gems in Bundler vendor
 /// directories or global gem installation paths.
@@ -1254,6 +1254,16 @@ fn expand_tilde(value: &Path, home: Option<&Path>) -> PathBuf {
 /// [`crate::formats::gem::manifest::classify`] for `root` on disk: the
 /// manifest bundler loads, reading the ambient `BUNDLE_GEMFILE` /
 /// `BUNDLE_APP_CONFIG` and the app config file.
+/// The config files [`bundler_loaded_manifest`] reads for `root`: the app
+/// config and, when there is one, the global config.
+fn bundler_config_files(root: &Path) -> Vec<PathBuf> {
+    let app = bundler_app_config_dir(root, std::env::var_os("BUNDLE_APP_CONFIG").as_deref())
+        .join("config");
+    std::iter::once(app)
+        .chain(ambient_bundler_global_config_file(root))
+        .collect()
+}
+
 pub async fn bundler_loaded_manifest(root: &Path) -> crate::formats::gem::manifest::LoadedManifest {
     bundler_loaded_manifest_with_env(
         root,
@@ -1274,7 +1284,11 @@ pub(crate) async fn bundler_loaded_manifest_in(
 ) -> crate::formats::gem::manifest::LoadedManifest {
     use crate::formats::gem::manifest;
     match view {
-        ProjectView::Disk(root) | ProjectView::Snapshot(DiskSnapshot { root, .. }) => {
+        ProjectView::Disk(root) => bundler_loaded_manifest(root).await,
+        ProjectView::Snapshot(snap) => {
+            // The only files the probe reads: the app config and the global
+            // config (the environment it also reads is fixed for the run).
+            let root = snap.root_reading(bundler_config_files(snap.root_reading::<&Path>([])));
             bundler_loaded_manifest(root).await
         }
         ProjectView::Memory(_) => {

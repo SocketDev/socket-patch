@@ -1894,7 +1894,11 @@ async fn run_scan(
     let prior_discovery = if args.common.is_global() {
         None
     } else {
-        Some(ctx.discovery().await)
+        let (discovery, read_set) = ctx.recorded_discovery().await;
+        Some(rollout::Prior {
+            discovery,
+            read_set: read_set.as_ref(),
+        })
     };
     let hosted_state = (!args.common.is_global())
         .then(|| crate::commands::hosted_state_from_pins(&hosted_pin_list));

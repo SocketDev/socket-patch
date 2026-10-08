@@ -45,7 +45,28 @@ pub(crate) struct Gate<'a> {
     /// Scan's lockfile discovery of `--cwd`, made before the redirect
     /// (with the configured patch-server origins): the rewrite's
     /// attribution gate reuses it when nothing changed the project since.
-    pub(crate) prior: Option<&'a socket_patch_core::vex::discover::Discovery>,
+    pub(crate) prior: Option<Prior<'a>>,
+}
+
+/// Scan's discovery, made BEFORE the apply lock, with the paths it read.
+#[derive(Clone, Copy)]
+pub(crate) struct Prior<'a> {
+    pub(crate) discovery: &'a socket_patch_core::vex::discover::Discovery,
+    /// `None` when the read set cannot cover what discovery read (it read
+    /// the disk around the snapshot): never reusable.
+    pub(crate) read_set: Option<&'a socket_patch_core::vendor::lock_inventory::ReadSet>,
+}
+
+impl<'a> Prior<'a> {
+    /// The discovery, when every path it read still has the fingerprint it
+    /// had then (stats only). Called under the apply lock, so nothing that
+    /// takes it can change the project between this check and the gate; a
+    /// change since the unlocked read sends the gate to a fresh discovery.
+    pub(crate) fn still_current(&self) -> Option<&'a socket_patch_core::vex::discover::Discovery> {
+        self.read_set
+            .filter(|read| read.unchanged())
+            .map(|_| self.discovery)
+    }
 }
 
 impl<'a> Gate<'a> {
@@ -58,10 +79,7 @@ impl<'a> Gate<'a> {
     }
 
     /// This gate carrying scan's pre-redirect discovery (see [`Self::prior`]).
-    pub(crate) fn with_prior(
-        mut self,
-        prior: Option<&'a socket_patch_core::vex::discover::Discovery>,
-    ) -> Self {
+    pub(crate) fn with_prior(mut self, prior: Option<Prior<'a>>) -> Self {
         self.prior = prior;
         self
     }
@@ -223,6 +241,52 @@ pub(crate) fn human_lines(
 
 #[cfg(test)]
 mod tests {
+    /// Scan's discovery is taken before the apply lock: the gate reuses it
+    /// only while every path it read is unchanged, so a lockfile written
+    /// between scan's discovery and the gate (a concurrent run that held the
+    /// lock first) sends the gate to a fresh discovery.
+    #[tokio::test]
+    async fn the_prior_discovery_is_reused_only_while_the_project_is_unchanged() {
+        let tmp = tempfile::tempdir().unwrap();
+        let root = tmp.path();
+        let lock = r#"{"name":"app","lockfileVersion":3,"requires":true,"packages":{"":{"name":"app","dependencies":{"left-pad":"1.3.0"}},"node_modules/left-pad":{"version":"1.3.0","resolved":"https://registry.npmjs.org/left-pad/-/left-pad-1.3.0.tgz","integrity":"sha512-UPSTREAM=="}}}"#;
+        std::fs::write(root.join("package-lock.json"), lock).unwrap();
+        std::fs::write(root.join("package.json"), r#"{"name":"app"}"#).unwrap();
+        let common = crate::args::GlobalArgs {
+            cwd: root.to_path_buf(),
+            json: true,
+            ..crate::args::GlobalArgs::default()
+        };
+        let ctx = crate::commands::context::ProjectContext::new(&common);
+        let (discovery, read_set) = ctx.recorded_discovery().await;
+        let prior = super::Prior {
+            discovery,
+            read_set: read_set.as_ref(),
+        };
+        let read = read_set
+            .as_ref()
+            .expect("an npm project's discovery is recorded");
+        assert!(!read.is_empty());
+        // Unchanged (taking the apply lock creates `.socket/`): reused.
+        std::fs::create_dir_all(root.join(".socket")).unwrap();
+        std::fs::write(root.join(".socket/apply.lock"), "").unwrap();
+        assert!(std::ptr::eq(prior.still_current().unwrap(), discovery));
+        // A concurrent writer rewrote the lockfile: never reused.
+        std::fs::write(
+            root.join("package-lock.json"),
+            lock.replace("1.3.0.tgz", "1.3.0.tgz?x"),
+        )
+        .unwrap();
+        assert!(prior.still_current().is_none());
+        // Without a read set (discovery read the disk around the snapshot):
+        // never reused either.
+        let unrecorded = super::Prior {
+            discovery,
+            read_set: None,
+        };
+        assert!(unrecorded.still_current().is_none());
+    }
+
     use super::*;
     use socket_patch_core::api::types::PatchSearchResult;
     use socket_patch_core::manifest::schema::PatchManifest;

@@ -998,6 +998,15 @@ impl<'a> DiscoverCtx<'a> {
         self.view.disk_root()
     }
 
+    /// [`Self::disk_root`] for a probe that reads exactly `paths` (see
+    /// [`crate::vendor::lock_inventory::DiskSnapshot::root_reading`]).
+    pub(crate) fn disk_root_reading<P: AsRef<Path>>(
+        &self,
+        paths: impl IntoIterator<Item = P>,
+    ) -> Option<&'a Path> {
+        self.view.disk_root_reading(paths)
+    }
+
     /// Record every Socket identity `text` (the content of root-relative
     /// `rel`) mentions — see [`socket_identities`].
     fn recognize_text(&self, rel: &str, text: &str) {

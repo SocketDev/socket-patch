@@ -73,8 +73,8 @@ use super::{
     Discovery, PatchedRef, UnlockedPin, WiringMode, DIAG_LOCKFILE_UNPARSEABLE, DIAG_REF_INVALID,
     DIAG_REF_UNATTRIBUTABLE,
 };
-use crate::vendor::lock_inventory::LockIntegrity;
 use crate::formats::nuget::{parse_config, NugetConfig};
+use crate::vendor::lock_inventory::LockIntegrity;
 use crate::vendor::nuget_config::{same_file, CONFIG_NAMES};
 use crate::vendor::nuget_feed::{is_plain_nuget_token, nuget_lock_entries, nupkg_leaf};
 use crate::vendor::path::VENDOR_DIR;
@@ -99,7 +99,7 @@ pub(crate) async fn extract(ctx: &DiscoverCtx<'_>, out: &mut Discovery) {
     // itself — skipped, so it is not reported under three names.
     for name in CONFIG_NAMES.iter().filter(|name| **name != cfg_rel) {
         // In memory every spelling is its own entry.
-        let same = match ctx.disk_root() {
+        let same = match ctx.disk_root_reading([*name, cfg_rel]) {
             Some(root) => same_file(&root.join(name), &root.join(cfg_rel)).await,
             None => false,
         };

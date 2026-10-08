@@ -193,11 +193,183 @@ type ReadCache = std::collections::HashMap<String, Result<Arc<[u8]>, (io::ErrorK
 /// directory listings, the disk-only probes) goes to the disk directly.
 #[derive(Debug)]
 pub struct DiskSnapshot<'a> {
-    pub root: &'a Path,
+    /// Private so that every raw use of the root goes through
+    /// [`Self::root`], which a [`ReadSet`] recording counts as an
+    /// unrecordable disk access.
+    root: &'a Path,
     reads: std::sync::Mutex<ReadCache>,
     /// Paths [`Self::overlay`] put in place of the disk content (they exist
     /// in this view even when the disk has no such file yet).
     overlaid: std::sync::Mutex<std::collections::BTreeSet<String>>,
+    /// `Some` for a [`Self::tracked`] snapshot.
+    tracking: Option<std::sync::Mutex<Tracking>>,
+}
+
+/// What a [`DiskSnapshot::tracked`] snapshot has seen.
+#[derive(Debug, Default)]
+struct Tracking {
+    /// Each root-relative path any access touched, with its fingerprint
+    /// taken before that first access.
+    seen: std::collections::HashMap<String, Fingerprint>,
+    /// The open recording window ([`DiskSnapshot::begin_recording`]): the
+    /// paths touched in it, and whether something read the disk around the
+    /// view (its fingerprints then cannot cover what was read).
+    window: Option<(BTreeSet<String>, bool)>,
+}
+
+/// One filesystem entry's identity and version as stats report it: the
+/// entry itself (`lstat`) and, for a symbolic link, its target (`stat`).
+/// `None` for an entry that does not exist. A directory's own stat is only
+/// its kind and identity (its times move whenever any entry in it changes,
+/// including socket-patch's own `.socket/` lock); a directory something
+/// LISTED also carries its entry names ([`Self::listing`]).
+#[derive(Debug, Clone, PartialEq, Eq)]
+struct Fingerprint {
+    entry: Option<Stat>,
+    target: Option<Stat>,
+    /// The sorted `(name, is_dir)` entries of a listed directory.
+    listing: Option<Vec<(String, bool)>>,
+}
+
+#[derive(Debug, Clone, PartialEq, Eq)]
+struct Stat {
+    kind: u8,
+    len: u64,
+    modified: Option<std::time::SystemTime>,
+    /// Unix: `(dev, ino, ctime)`, which any write, rename over or
+    /// metadata change moves; elsewhere the creation time. A directory
+    /// keeps only `(dev, ino)`.
+    identity: (u64, u64, i64, i64),
+}
+
+impl Stat {
+    fn of(m: &std::fs::Metadata) -> Self {
+        let kind = if m.file_type().is_symlink() {
+            2
+        } else if m.is_dir() {
+            1
+        } else {
+            0
+        };
+        #[cfg(unix)]
+        let identity = {
+            use std::os::unix::fs::MetadataExt;
+            (m.dev(), m.ino(), m.ctime(), m.ctime_nsec())
+        };
+        #[cfg(not(unix))]
+        let identity = {
+            let created = m
+                .created()
+                .ok()
+                .and_then(|t| t.duration_since(std::time::UNIX_EPOCH).ok())
+                .unwrap_or_default();
+            (
+                0,
+                0,
+                created.as_secs() as i64,
+                i64::from(created.subsec_nanos()),
+            )
+        };
+        if kind == 1 {
+            return Stat {
+                kind,
+                len: 0,
+                modified: None,
+                identity: (identity.0, identity.1, 0, 0),
+            };
+        }
+        Stat {
+            kind,
+            len: m.len(),
+            modified: m.modified().ok(),
+            identity,
+        }
+    }
+}
+
+/// How an access uses a path.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+enum Access {
+    /// Content read or existence / type probe.
+    Probe,
+    /// Directory listing.
+    List,
+}
+
+impl Fingerprint {
+    fn of(root: &Path, rel: &str, access: Access) -> Self {
+        let path = root.join(rel);
+        let entry = std::fs::symlink_metadata(&path).ok();
+        let target = entry
+            .as_ref()
+            .filter(|m| m.file_type().is_symlink())
+            .and_then(|_| std::fs::metadata(&path).ok());
+        Fingerprint {
+            entry: entry.as_ref().map(Stat::of),
+            target: target.as_ref().map(Stat::of),
+            listing: (access == Access::List).then(|| listing(&path, rel.is_empty())),
+        }
+    }
+
+    /// Whether `rel` still has this fingerprint.
+    fn holds(&self, root: &Path, rel: &str) -> bool {
+        let access = if self.listing.is_some() {
+            Access::List
+        } else {
+            Access::Probe
+        };
+        Fingerprint::of(root, rel, access) == *self
+    }
+}
+
+/// The sorted `(name, is_dir)` entries of `dir` (empty when unreadable),
+/// leaving out socket-patch's own state directory at the project root:
+/// taking the apply lock creates it, no listing consumer selects it, and
+/// any read inside it is fingerprinted on its own.
+fn listing(dir: &Path, at_root: bool) -> Vec<(String, bool)> {
+    let Ok(entries) = std::fs::read_dir(dir) else {
+        return Vec::new();
+    };
+    let mut out: Vec<(String, bool)> = entries
+        .filter_map(Result::ok)
+        .map(|e| {
+            let is_dir = e.file_type().is_ok_and(|t| t.is_dir());
+            (e.file_name().to_string_lossy().into_owned(), is_dir)
+        })
+        .filter(|(name, _)| !(at_root && name == crate::constants::SOCKET_DIR))
+        .collect();
+    out.sort();
+    out
+}
+
+/// Every path a [`DiskSnapshot::tracked`] snapshot touched while recording
+/// (see [`DiskSnapshot::begin_recording`]), with the fingerprint each had
+/// before it was first read. Stats only: checking it never reads a file.
+#[derive(Debug, Clone)]
+pub struct ReadSet {
+    root: std::path::PathBuf,
+    paths: BTreeMap<String, Fingerprint>,
+}
+
+impl ReadSet {
+    /// Whether every recorded path still has the fingerprint it had when it
+    /// was first read: no file was written, replaced, created or removed and
+    /// no listed directory gained or lost an entry since.
+    pub fn unchanged(&self) -> bool {
+        self.paths
+            .iter()
+            .all(|(rel, before)| before.holds(&self.root, rel))
+    }
+
+    /// How many paths [`Self::unchanged`] re-stats.
+    pub fn len(&self) -> usize {
+        self.paths.len()
+    }
+
+    /// No path recorded.
+    pub fn is_empty(&self) -> bool {
+        self.paths.is_empty()
+    }
 }
 
 impl<'a> DiskSnapshot<'a> {
@@ -206,6 +378,94 @@ impl<'a> DiskSnapshot<'a> {
             root,
             reads: std::sync::Mutex::new(std::collections::HashMap::new()),
             overlaid: std::sync::Mutex::new(std::collections::BTreeSet::new()),
+            tracking: None,
+        }
+    }
+
+    /// A snapshot that fingerprints every path before it first touches it,
+    /// so a [`ReadSet`] can later tell whether what it read still holds.
+    pub fn tracked(root: &'a Path) -> Self {
+        Self {
+            tracking: Some(std::sync::Mutex::new(Tracking::default())),
+            ..Self::new(root)
+        }
+    }
+
+    /// The project root, for a read the view does not mediate. While a
+    /// recording is open this makes it unusable ([`Self::end_recording`]
+    /// returns `None`): the fingerprints cannot cover what such a read sees.
+    pub fn root(&self) -> &'a Path {
+        if let Some(tracking) = &self.tracking {
+            if let Some((_, raw)) = &mut lock_tracking(tracking).window {
+                *raw = true;
+            }
+        }
+        self.root
+    }
+
+    /// The project root, for a read the view does not mediate that reads
+    /// exactly `paths` (root-relative, or absolute for a file outside the
+    /// project) and nothing else: a recording fingerprints them like the
+    /// view's own reads, instead of giving up as [`Self::root`] does.
+    pub fn root_reading<P: AsRef<Path>>(&self, paths: impl IntoIterator<Item = P>) -> &'a Path {
+        for path in paths {
+            self.touch(&path.as_ref().to_string_lossy());
+        }
+        self.root
+    }
+
+    /// Start recording the paths this (tracked) snapshot's reads touch.
+    pub fn begin_recording(&self) {
+        if let Some(tracking) = &self.tracking {
+            lock_tracking(tracking).window = Some((BTreeSet::new(), false));
+        }
+    }
+
+    /// Stop recording: the paths touched since [`Self::begin_recording`],
+    /// or `None` when the snapshot is untracked, nothing was recording, or
+    /// something read the disk around the view meanwhile.
+    pub fn end_recording(&self) -> Option<ReadSet> {
+        let tracking = self.tracking.as_ref()?;
+        let mut tracking = lock_tracking(tracking);
+        let (touched, raw) = tracking.window.take()?;
+        if raw {
+            return None;
+        }
+        let paths = touched
+            .into_iter()
+            .filter_map(|rel| Some((rel.clone(), tracking.seen.get(&rel)?.clone())))
+            .collect();
+        Some(ReadSet {
+            root: self.root.to_path_buf(),
+            paths,
+        })
+    }
+
+    /// Note that `rel` is about to be read or probed (see [`Self::tracked`]).
+    fn touch(&self, rel: &str) {
+        self.touch_as(rel, Access::Probe);
+    }
+
+    /// Note that directory `rel` is about to be listed.
+    fn touch_listing(&self, rel: &str) {
+        self.touch_as(rel, Access::List);
+    }
+
+    fn touch_as(&self, rel: &str, access: Access) {
+        let Some(tracking) = &self.tracking else {
+            return;
+        };
+        let mut tracking = lock_tracking(tracking);
+        let known = tracking
+            .seen
+            .get(rel)
+            .is_some_and(|print| access == Access::Probe || print.listing.is_some());
+        if !known {
+            let print = Fingerprint::of(self.root, rel, access);
+            tracking.seen.insert(rel.to_string(), print);
+        }
+        if let Some((touched, _)) = &mut tracking.window {
+            touched.insert(rel.to_string());
         }
     }
 
@@ -255,6 +515,7 @@ impl<'a> DiskSnapshot<'a> {
     }
 
     async fn read_bytes(&self, rel: &str) -> io::Result<Vec<u8>> {
+        self.touch(rel);
         if let Some(hit) = self.cached(rel) {
             return hit.map(|b| b.to_vec());
         }
@@ -262,6 +523,12 @@ impl<'a> DiskSnapshot<'a> {
         self.remember(rel, &read);
         read
     }
+}
+
+fn lock_tracking(tracking: &std::sync::Mutex<Tracking>) -> std::sync::MutexGuard<'_, Tracking> {
+    tracking
+        .lock()
+        .unwrap_or_else(std::sync::PoisonError::into_inner)
 }
 
 fn utf8(bytes: Vec<u8>) -> io::Result<String> {
@@ -282,7 +549,20 @@ impl<'a> ProjectView<'a> {
     pub fn disk_root(&self) -> Option<&'a Path> {
         match *self {
             ProjectView::Disk(root) => Some(root),
-            ProjectView::Snapshot(snap) => Some(snap.root),
+            ProjectView::Snapshot(snap) => Some(snap.root()),
+            ProjectView::Memory(_) => None,
+        }
+    }
+
+    /// [`Self::disk_root`] for a read the view does not mediate that reads
+    /// exactly `paths` (see [`DiskSnapshot::root_reading`]).
+    pub fn disk_root_reading<P: AsRef<Path>>(
+        &self,
+        paths: impl IntoIterator<Item = P>,
+    ) -> Option<&'a Path> {
+        match *self {
+            ProjectView::Disk(root) => Some(root),
+            ProjectView::Snapshot(snap) => Some(snap.root_reading(paths)),
             ProjectView::Memory(_) => None,
         }
     }
@@ -290,6 +570,10 @@ impl<'a> ProjectView<'a> {
     /// The root-level Python lock names (sorted; see
     /// [`crate::utils::python_lock::python_lock_paths`]).
     pub fn python_lock_paths(&self) -> Vec<String> {
+        if let ProjectView::Snapshot(snap) = self {
+            // A listing of the root (names only).
+            snap.touch_listing("");
+        }
         match self {
             ProjectView::Disk(root) | ProjectView::Snapshot(DiskSnapshot { root, .. }) => {
                 crate::utils::python_lock::python_lock_paths(root).unwrap_or_default()
@@ -307,6 +591,9 @@ impl<'a> ProjectView<'a> {
 
     /// FIFO-safe regular-file text read.
     pub async fn read_text(&self, rel: &str) -> io::Result<String> {
+        if let ProjectView::Snapshot(snap) = self {
+            snap.touch(rel);
+        }
         match self {
             ProjectView::Disk(root) => read_regular_to_string(&root.join(rel)).await,
             ProjectView::Memory(project) => project.read_text(rel),
@@ -338,6 +625,9 @@ impl<'a> ProjectView<'a> {
 
     /// `metadata` (follows links) succeeds.
     pub async fn exists(&self, rel: &str) -> bool {
+        if let ProjectView::Snapshot(snap) = self {
+            snap.touch(rel);
+        }
         match self {
             ProjectView::Snapshot(snap) if snap.is_overlaid(rel) => true,
             ProjectView::Disk(root) | ProjectView::Snapshot(DiskSnapshot { root, .. }) => {
@@ -349,6 +639,9 @@ impl<'a> ProjectView<'a> {
 
     /// `symlink_metadata` (does not follow links) succeeds.
     pub async fn exists_no_follow(&self, rel: &str) -> bool {
+        if let ProjectView::Snapshot(snap) = self {
+            snap.touch(rel);
+        }
         match self {
             ProjectView::Snapshot(snap) if snap.is_overlaid(rel) => true,
             ProjectView::Disk(root) | ProjectView::Snapshot(DiskSnapshot { root, .. }) => {
@@ -360,6 +653,9 @@ impl<'a> ProjectView<'a> {
 
     /// A regular file (following links on disk).
     pub fn is_file(&self, rel: &str) -> bool {
+        if let ProjectView::Snapshot(snap) = self {
+            snap.touch(rel);
+        }
         match self {
             ProjectView::Snapshot(snap) if snap.is_overlaid(rel) => true,
             ProjectView::Disk(root) | ProjectView::Snapshot(DiskSnapshot { root, .. }) => {
@@ -374,6 +670,9 @@ impl<'a> ProjectView<'a> {
 
     /// The path itself is a symbolic link.
     pub fn is_symlink(&self, rel: &str) -> bool {
+        if let ProjectView::Snapshot(snap) = self {
+            snap.touch(rel);
+        }
         match self {
             ProjectView::Disk(root) | ProjectView::Snapshot(DiskSnapshot { root, .. }) => {
                 std::fs::symlink_metadata(root.join(rel)).is_ok_and(|m| m.file_type().is_symlink())
@@ -384,6 +683,9 @@ impl<'a> ProjectView<'a> {
 
     /// The UTF-8-named entries of directory `rel`, sorted by name.
     pub async fn list_dir(&self, rel: &str) -> io::Result<Vec<DirEntryInfo>> {
+        if let ProjectView::Snapshot(snap) = self {
+            snap.touch_listing(rel);
+        }
         match self {
             ProjectView::Disk(root) | ProjectView::Snapshot(DiskSnapshot { root, .. }) => {
                 let mut dir = tokio::fs::read_dir(root.join(rel)).await?;
@@ -420,8 +722,11 @@ pub(crate) async fn detect_npm_lock_flavor_in(
     view: &ProjectView<'_>,
 ) -> Result<(NpmLockFlavor, Vec<VendorWarning>), (&'static str, String)> {
     let project = match view {
-        ProjectView::Disk(root) | ProjectView::Snapshot(DiskSnapshot { root, .. }) => {
+        ProjectView::Disk(root) => {
             return crate::vendor::npm_flavor::detect_npm_lock_flavor(root).await
+        }
+        ProjectView::Snapshot(snap) => {
+            return crate::vendor::npm_flavor::detect_npm_lock_flavor(snap.root()).await
         }
         ProjectView::Memory(project) => *project,
     };
@@ -628,6 +933,132 @@ mod tests {
                 .0,
             "vendor_lockfile_missing"
         );
+    }
+
+    /// Record what `read` touches through a tracked snapshot of `root`.
+    async fn recorded<F>(root: &Path, read: F) -> Option<ReadSet>
+    where
+        F: for<'v> FnOnce(
+            ProjectView<'v>,
+        ) -> std::pin::Pin<Box<dyn std::future::Future<Output = ()> + 'v>>,
+    {
+        let snap = DiskSnapshot::tracked(root);
+        snap.begin_recording();
+        read(ProjectView::Snapshot(&snap)).await;
+        snap.end_recording()
+    }
+
+    /// The read set holds while nothing changes, and breaks when a file it
+    /// read is rewritten (same length, in place or replaced), created after
+    /// a miss, or removed.
+    #[tokio::test]
+    async fn a_read_set_notices_a_changed_file() {
+        let tmp = tempfile::tempdir().unwrap();
+        let root = tmp.path();
+        std::fs::write(root.join("a.lock"), "one").unwrap();
+        fn read(
+            view: ProjectView<'_>,
+        ) -> std::pin::Pin<Box<dyn std::future::Future<Output = ()> + '_>> {
+            Box::pin(async move {
+                view.read_text("a.lock").await.unwrap();
+                assert!(view.read_text("b.lock").await.is_err());
+            })
+        }
+        let set = recorded(root, read).await.expect("recorded");
+        assert_eq!(set.len(), 2);
+        assert!(set.unchanged());
+
+        // Rewritten in place with the same length.
+        std::fs::write(root.join("a.lock"), "two").unwrap();
+        assert!(!set.unchanged(), "an in-place rewrite");
+        // Replaced (rename over) with the same bytes.
+        let set = recorded(root, read).await.unwrap();
+        std::fs::write(root.join("a.tmp"), "two").unwrap();
+        std::fs::rename(root.join("a.tmp"), root.join("a.lock")).unwrap();
+        assert!(!set.unchanged(), "a replacement");
+        // A file that was missing appears.
+        let set = recorded(root, read).await.unwrap();
+        std::fs::write(root.join("b.lock"), "late").unwrap();
+        assert!(!set.unchanged(), "a created file");
+        // A file it read is removed.
+        let set = recorded(root, |view| {
+            Box::pin(async move {
+                view.read_text("a.lock").await.unwrap();
+            })
+        })
+        .await
+        .unwrap();
+        std::fs::remove_file(root.join("a.lock")).unwrap();
+        assert!(!set.unchanged(), "a removed file");
+    }
+
+    /// A listed directory breaks the read set when it gains or loses an
+    /// entry, but not when socket-patch creates its own `.socket/` (the
+    /// apply lock) at the root; an unlisted directory is only probed.
+    #[tokio::test]
+    async fn a_read_set_notices_a_changed_listing() {
+        let tmp = tempfile::tempdir().unwrap();
+        let root = tmp.path();
+        std::fs::create_dir(root.join("sub")).unwrap();
+        fn list(
+            view: ProjectView<'_>,
+        ) -> std::pin::Pin<Box<dyn std::future::Future<Output = ()> + '_>> {
+            Box::pin(async move {
+                view.python_lock_paths();
+                view.list_dir("sub").await.unwrap();
+            })
+        }
+        let set = recorded(root, list).await.unwrap();
+        std::fs::create_dir_all(root.join(".socket")).unwrap();
+        std::fs::write(root.join(".socket/apply.lock"), "").unwrap();
+        assert!(set.unchanged(), "socket-patch's own state dir");
+        std::fs::write(root.join("pylock.toml"), "").unwrap();
+        assert!(!set.unchanged(), "a new root entry");
+        let set = recorded(root, list).await.unwrap();
+        std::fs::write(root.join("sub/x"), "").unwrap();
+        assert!(!set.unchanged(), "a new entry in a listed dir");
+        // Probed, not listed: a new entry inside does not matter.
+        let set = recorded(root, |view| {
+            Box::pin(async move {
+                assert!(view.exists("sub").await);
+            })
+        })
+        .await
+        .unwrap();
+        std::fs::write(root.join("sub/y"), "").unwrap();
+        assert!(set.unchanged());
+    }
+
+    /// A raw use of the root while recording makes the read set unusable;
+    /// a declared raw read is fingerprinted instead, and nothing outside
+    /// the window counts.
+    #[tokio::test]
+    async fn a_raw_disk_read_makes_the_read_set_unusable() {
+        let tmp = tempfile::tempdir().unwrap();
+        let root = tmp.path();
+        std::fs::write(root.join("a.lock"), "one").unwrap();
+        let snap = DiskSnapshot::tracked(root);
+        let _ = snap.root();
+        snap.begin_recording();
+        ProjectView::Snapshot(&snap)
+            .read_text("a.lock")
+            .await
+            .unwrap();
+        assert!(ProjectView::Snapshot(&snap).disk_root().is_some());
+        assert!(snap.end_recording().is_none(), "a raw read in the window");
+
+        snap.begin_recording();
+        let config = root.join("outside.cfg");
+        let _ = snap.root_reading([&config]);
+        let set = snap.end_recording().expect("a declared read");
+        assert_eq!(set.len(), 1);
+        std::fs::write(&config, "x").unwrap();
+        assert!(!set.unchanged(), "the declared file appeared");
+
+        // An untracked snapshot records nothing.
+        let plain = DiskSnapshot::new(root);
+        plain.begin_recording();
+        assert!(plain.end_recording().is_none());
     }
 
     #[tokio::test]
