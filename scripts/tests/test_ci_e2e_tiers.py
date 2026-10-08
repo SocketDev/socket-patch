@@ -31,7 +31,7 @@ JOBS = rows_mod.jobs(TEXT)
 
 
 def rows(job):
-    return rows_mod.matrix_include(JOBS[job])
+    return rows_mod.job_rows(JOBS, job)
 
 
 def job_text(job):
@@ -266,7 +266,8 @@ class PdmCapstone(unittest.TestCase):
     job = rows_mod.jobs(PDM.read_text(encoding="utf-8"))["capstone"]
 
     def test_excludes_exactly_the_cells_ci_runs_on_every_pr(self):
-        excluded = rows_mod.matrix_include([l.replace("exclude:", "include:") for l in self.job])
+        excluded = [r for r in rows_mod.matrix_include([l.replace("exclude:", "include:") for l in self.job])
+                    if not r["os"].startswith("${{")]  # the PR-only macOS exclude
         ci = {(r["os"], r["pdm"]) for r in rows("e2e") if "pdm" in r}
         self.assertEqual({(r["os"], r["pdm"]) for r in excluded}, ci)
         self.assertEqual(len(excluded), len(ci))
@@ -287,7 +288,7 @@ class VltProofDedupe(unittest.TestCase):
     def test_only_identical_ci_cells_are_left_out(self):
         cells = proof.ci_cells(TEXT)
         compat = rows_mod.jobs(COMPAT.read_text(encoding="utf-8"))
-        for row in rows_mod.matrix_include(compat["install-proof"]):
+        for row in rows_mod.job_rows(compat, "install-proof"):
             suites = row.get("suites", " ".join(self.suites)).split()
             keep = proof.remaining(suites, row["os"], row["vlt"], row.get("node", ""), row.get("linker", ""),
                                    row.get("cache_root", ""), TEXT)
