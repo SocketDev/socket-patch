@@ -181,10 +181,11 @@ fn acquire_hosted_lock(
 struct StaleInstallOutcome {
     warnings: Vec<serde_json::Value>,
     stale_purls: std::collections::BTreeSet<String>,
-    /// The probe may have changed the installed tree (the vlt heal
-    /// invalidates store copies, which lockfile discovery reads for
-    /// bundled copies); the read-only probes never set it.
-    touched_install: bool,
+    /// Set when the vlt heal ran (it may invalidate store entries): the
+    /// store's bundled copies after it, discovery's only read of the
+    /// installed tree (`Discovery::vlt_bundled_copies`). The read-only
+    /// probes never set it.
+    healed_store: Option<std::collections::BTreeMap<String, String>>,
 }
 
 /// The `redirect_gem_stale_install` warning for one stale installed
@@ -647,9 +648,10 @@ enum Written<'a> {
 /// fresh discovery of the project as the hosted run left it, or `None` when
 /// none provably does and the caller must discover again.
 ///
-/// - Anything that touched the installed tree after the rewrite
-///   (`touched_install`: the vlt heal) may change what discovery reads, so
-///   nothing is reused.
+/// - After a vlt heal (`healed_store`: the store's bundled copies after
+///   it), only a discovery that saw exactly those copies
+///   (`Discovery::vlt_bundled_copies`) is reused: the heal may have removed
+///   store entries, and the bundled copies are all discovery reads there.
 /// - Nothing written, or a dry run: the project is as scan's pre-redirect
 ///   discovery (`prior`) saw it; `prior` is `None` when a takeover changed
 ///   it first. Failing that, when the rewrite planned nothing, the gate's
@@ -665,24 +667,24 @@ fn discovery_after_writes<'d>(
     prior: Option<&'d socket_patch_core::vex::discover::Discovery>,
     gate: Option<&'d socket_patch_core::hosted::engine::FinalDiscovery>,
     written: Written<'_>,
-    touched_install: bool,
+    healed_store: Option<&std::collections::BTreeMap<String, String>>,
 ) -> Option<&'d socket_patch_core::vex::discover::Discovery> {
     use socket_patch_core::hosted::engine::{overlay_creation_is_invisible, FinalDiscovery};
-    if touched_install {
-        return None;
-    }
     let overlaid = match gate {
         Some(FinalDiscovery::Overlaid(discovery)) => Some(&**discovery),
         // The gate read `prior` itself (see `engine::rewrite`).
         Some(FinalDiscovery::Prior) | None => None,
     };
-    match written {
+    let candidate = match written {
         Written::Nothing => prior.or(overlaid),
         Written::Previewed => prior,
         Written::Landed { created } => {
             overlaid.filter(|_| created.iter().all(|rel| overlay_creation_is_invisible(rel)))
         }
-    }
+    };
+    candidate.filter(|discovery| {
+        healed_store.is_none_or(|after| discovery.vlt_bundled_copies.as_ref() == Some(after))
+    })
 }
 
 /// The hosted-redirect flow over an ALREADY-SELECTED `(purl, uuid)` set,
@@ -1394,7 +1396,7 @@ pub(crate) async fn run_redirect_selected(
         prior_discovery,
         done.final_discovery.as_ref(),
         written,
-        vlt_stale.touched_install,
+        vlt_stale.healed_store.as_ref(),
     ) {
         Some(discovery) => discovery,
         None => {
@@ -2855,14 +2857,14 @@ mod tests {
 
         // Files landed: the gate's discovery over exactly those writes.
         assert!(same(
-            discovery_after_writes(Some(&prior), Some(&overlaid), landed, false),
+            discovery_after_writes(Some(&prior), Some(&overlaid), landed, None),
             gate
         ));
         // ...also when it created only a root config file no listing finds.
         for created in [&[".npmrc"][..], &["pnpm-workspace.yaml", ".npmrc"]] {
             let written = Written::Landed { created };
             assert!(same(
-                discovery_after_writes(None, Some(&overlaid), written, false),
+                discovery_after_writes(None, Some(&overlaid), written, None),
                 gate
             ));
         }
@@ -2871,12 +2873,31 @@ mod tests {
         let written = Written::Landed {
             created: &[".npmrc", "pylock.toml"],
         };
-        assert!(discovery_after_writes(Some(&prior), Some(&overlaid), written, false).is_none());
+        assert!(discovery_after_writes(Some(&prior), Some(&overlaid), written, None).is_none());
         // Files landed, but the gate counted another origin or discovered
         // nothing: scan's pre-write discovery is stale, so discover again.
-        assert!(discovery_after_writes(Some(&prior), None, landed, false).is_none());
-        // The vlt heal touched the installed tree discovery reads.
-        assert!(discovery_after_writes(Some(&prior), Some(&overlaid), landed, true).is_none());
+        assert!(discovery_after_writes(Some(&prior), None, landed, None).is_none());
+        // After a vlt heal, only a discovery that saw the store's bundled
+        // copies as the heal left them.
+        let after: std::collections::BTreeMap<String, String> =
+            [("pkg:npm/b@1.0.0".to_string(), "node_modules/.vlt/x".to_string())].into();
+        assert!(discovery_after_writes(Some(&prior), Some(&overlaid), landed, Some(&after)).is_none());
+        let saw = |copies: &std::collections::BTreeMap<String, String>| {
+            FinalDiscovery::Overlaid(Box::new(Discovery {
+                vlt_bundled_copies: Some(copies.clone()),
+                ..Discovery::default()
+            }))
+        };
+        let current = saw(&after);
+        let Some(FinalDiscovery::Overlaid(current_gate)) = Some(&current) else {
+            unreachable!()
+        };
+        assert!(same(
+            discovery_after_writes(None, Some(&current), landed, Some(&after)),
+            current_gate
+        ));
+        let stale = saw(&Default::default());
+        assert!(discovery_after_writes(None, Some(&stale), landed, Some(&after)).is_none());
 
         // Nothing written: scan's discovery, else the gate's of the same
         // unwritten project.
@@ -2884,27 +2905,29 @@ mod tests {
             Some(&prior),
             Some(&FinalDiscovery::Prior),
             Written::Nothing,
-            false,
+            None,
         );
         assert!(same(reused, &prior));
         assert!(same(
-            discovery_after_writes(Some(&prior), Some(&overlaid), Written::Nothing, false),
+            discovery_after_writes(Some(&prior), Some(&overlaid), Written::Nothing, None),
             &prior
         ));
         assert!(same(
-            discovery_after_writes(None, Some(&overlaid), Written::Nothing, false),
+            discovery_after_writes(None, Some(&overlaid), Written::Nothing, None),
             gate
         ));
-        assert!(discovery_after_writes(None, None, Written::Nothing, false).is_none());
-        assert!(discovery_after_writes(Some(&prior), None, Written::Nothing, true).is_none());
+        assert!(discovery_after_writes(None, None, Written::Nothing, None).is_none());
+        assert!(
+            discovery_after_writes(Some(&prior), None, Written::Nothing, Some(&after)).is_none()
+        );
 
         // A dry run left the disk as scan saw it; the gate's discovery
         // describes the preview, not the disk.
         assert!(same(
-            discovery_after_writes(Some(&prior), Some(&overlaid), Written::Previewed, false),
+            discovery_after_writes(Some(&prior), Some(&overlaid), Written::Previewed, None),
             &prior
         ));
-        assert!(discovery_after_writes(None, Some(&overlaid), Written::Previewed, false).is_none());
+        assert!(discovery_after_writes(None, Some(&overlaid), Written::Previewed, None).is_none());
     }
 
     /// The wheel window is a patch-API window, so the documented escape

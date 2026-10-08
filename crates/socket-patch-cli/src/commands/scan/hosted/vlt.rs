@@ -335,6 +335,7 @@ pub(super) async fn heal_after_rewrite(
         .collect();
     let targeted: BTreeSet<&str> = owned.iter().map(|i| i.patch_uuid.as_str()).collect();
     let mut tally = HealTally::default();
+    let mut healed = false;
     if !owned.is_empty() {
         let targets: Vec<(Target<'_>, &str)> = owned
             .iter()
@@ -354,7 +355,7 @@ pub(super) async fn heal_after_rewrite(
             })
             .collect();
         tally = heal_targets(common, &targets, Expected::Patched).await;
-        out.touched_install = true;
+        healed = true;
         out.warnings.push(serde_json::json!({
             "code": REINSTALL_REQUIRED,
             "detail": reinstall_detail(&tally),
@@ -382,6 +383,9 @@ pub(super) async fn heal_after_rewrite(
     // in-run attestation (lockfile discovery contests it the same way).
     if inputs.final_lock.is_some() {
         let copies = socket_patch_core::vendor::vlt_bundled::bundled_copies(&common.cwd).await;
+        if healed {
+            out.healed_store = Some(copies.clone());
+        }
         for purl in inputs.records.keys() {
             let base = socket_patch_core::utils::purl::strip_purl_qualifiers(purl);
             let Some(location) = copies.get(base) else {
@@ -402,6 +406,12 @@ pub(super) async fn heal_after_rewrite(
             }));
             out.stale_purls.insert(purl.clone());
         }
+    }
+    // A heal implies a final lock, so the block above recorded the store;
+    // never report a heal without it.
+    if healed && out.healed_store.is_none() {
+        out.healed_store =
+            Some(socket_patch_core::vendor::vlt_bundled::bundled_copies(&common.cwd).await);
     }
     out
 }

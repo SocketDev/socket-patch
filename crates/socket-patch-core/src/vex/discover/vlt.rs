@@ -258,6 +258,7 @@ async fn contest_bundled_copies(ctx: &DiscoverCtx<'_>, nodes: &[VltLockNode], ou
         .map(|n| (n.key.as_str(), n.name.as_str()))
         .collect();
     let copies = store_bundled_copies(root, pairs).await;
+    out.vlt_bundled_copies = Some(copies.clone());
     if copies.is_empty() {
         return;
     }
@@ -1030,6 +1031,13 @@ mod tests {
                     format!(r#"{{"name":"left-pad","version":"{bundled_version}"}}"#),
                 );
                 let out = p.run(|c, o| Box::pin(super::extract(c, o))).await;
+                // The store copies discovery read are recorded exactly as
+                // the vlt heal's store probe reports them.
+                assert_eq!(
+                    out.vlt_bundled_copies.as_ref(),
+                    Some(&crate::vendor::vlt_bundled::bundled_copies(p.root()).await)
+                );
+                assert_eq!(out.vlt_bundled_copies.as_ref().map(|c| c.len()), Some(1));
                 if contested {
                     assert_refs(&out, &[]);
                     assert_eq!(

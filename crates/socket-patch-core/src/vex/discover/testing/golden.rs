@@ -123,6 +123,10 @@ fn render(out: &Discovery, root: &Path) -> Value {
         unpatched_copies,
         unattested,
         contested,
+        // Bookkeeping of what the vlt extractor read from the store, not a
+        // finding: every copy it found already shows as a contest and a
+        // diagnostic above.
+        vlt_bundled_copies: _,
     } = out;
     let refs: Vec<Value> = refs
         .iter()

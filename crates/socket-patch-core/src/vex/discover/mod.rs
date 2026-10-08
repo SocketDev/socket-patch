@@ -485,6 +485,14 @@ pub struct Discovery {
     pub unattested: Vec<Unattested>,
     /// Refs dropped because another lock contests them ([`ContestedRef`]).
     pub contested: Vec<ContestedRef>,
+    /// The bundled copies (purl → root-relative directory) the vlt
+    /// extractor found in the installed store for the lock's nodes, exactly
+    /// as [`crate::vendor::vlt_bundled::bundled_copies`] reports them: the
+    /// only installed-tree input that discovery reads for vlt. `None` when it
+    /// did not look (no readable `vlt-lock.json`, or no disk). A caller
+    /// that changed the store since (the vlt heal) can compare this with
+    /// the store's copies now to tell whether this discovery still holds.
+    pub vlt_bundled_copies: Option<std::collections::BTreeMap<String, String>>,
 }
 
 impl Discovery {
