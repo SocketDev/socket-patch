@@ -14,7 +14,7 @@
 //! `--hash=sha256:ab#cd` are data. Exactly one leading BOM is encoding, not
 //! data (pip decodes with utf-8-sig; uv strips it too).
 
-use crate::formats::text::strip_bom;
+use crate::formats::text::{strip_bom, strip_bom_bytes};
 
 /// Decode a requirements file the way pip's `auto_decode` does: a UTF-16
 /// or UTF-32 byte-order mark selects that encoding and is dropped; a
@@ -52,7 +52,7 @@ pub(crate) fn decode(bytes: &[u8]) -> Option<String> {
             .map(|c| char::from_u32(u32::from_be_bytes([c[0], c[1], c[2], c[3]])))
             .collect();
     }
-    if !bytes.starts_with(&[0xEF, 0xBB, 0xBF]) {
+    if strip_bom_bytes(bytes).len() == bytes.len() {
         if let Some(name) = coding_line(bytes) {
             return match coding_line_codec(&name)? {
                 Codec::Utf8 => String::from_utf8(bytes.to_vec()).ok(),
