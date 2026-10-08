@@ -766,6 +766,24 @@ async fn npm_hosted_round_trip_envelope() {
 #[tokio::test]
 #[serial]
 async fn pypi_requirements_hosted_round_trip() {
+    pypi_requirements_round_trip("flask==2.0.1\nrequests==2.31.0\n", &[]).await;
+}
+
+/// REGRESSION (#1086): the same round trip when an in-root `-r` include
+/// pins the same `requests==2.31.0` (split base/dev files), with the `-r`
+/// line before and after the root pin. pip reads the root and its includes
+/// as one requirement set, where the hosted direct reference wins, so the
+/// include's compatible pin is not a competing lock: `vex` attests the
+/// patch and `rollback` restores the root line (it used to exit 2 and 1).
+#[tokio::test]
+#[serial]
+async fn pypi_requirements_hosted_round_trip_with_a_duplicate_include_pin() {
+    let dev = [("dev.txt", "requests==2.31.0\n")];
+    pypi_requirements_round_trip("-r dev.txt\nflask==2.0.1\nrequests==2.31.0\n", &dev).await;
+    pypi_requirements_round_trip("flask==2.0.1\nrequests==2.31.0\n-r dev.txt\n", &dev).await;
+}
+
+async fn pypi_requirements_round_trip(pristine: &'static str, includes: &[(&str, &str)]) {
     const PY_UUID: &str = "a1a1a1a1-a1a1-4a1a-8a1a-a1a1a1a1a1a1";
     const PY_PURL: &str = "pkg:pypi/requests@2.31.0";
     const SHA256: &str = "0123456789abcdef0123456789abcdef0123456789abcdef0123456789abcdef";
@@ -820,8 +838,10 @@ async fn pypi_requirements_hosted_round_trip() {
         .await;
 
     let tmp = tempfile::tempdir().unwrap();
-    let pristine = "flask==2.0.1\nrequests==2.31.0\n";
     std::fs::write(tmp.path().join("requirements.txt"), pristine).unwrap();
+    for (file, text) in includes {
+        std::fs::write(tmp.path().join(file), text).unwrap();
+    }
 
     let get_args = socket_patch_cli::commands::get::GetArgs {
         common: socket_patch_cli::args::GlobalArgs {
@@ -898,6 +918,10 @@ async fn pypi_requirements_hosted_round_trip() {
         !tmp.path().join(".socket").exists(),
         "a fully unwound hosted project keeps no .socket/ residue"
     );
+    for (file, text) in includes {
+        let after = std::fs::read_to_string(tmp.path().join(file)).unwrap();
+        assert_eq!(&after, text, "hosted mode never edits the include {file}");
+    }
 
     // After the rollback nothing references the patch any more: VEX finds
     // nothing to attest (online, the API would still vouch for the uuid).

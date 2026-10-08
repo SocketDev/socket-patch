@@ -30,6 +30,10 @@
 //! (the version it must report) and `SOCKET_PATCH_GRADLE_E2E_REQUIRED` (no
 //! SKIP) (`gradle_build_common`). Scratch trees go under `TMPDIR`.
 
+#[path = "common/mod.rs"]
+mod common;
+use common::{binary, git_sha256};
+
 #[path = "maven_build_common/mod.rs"]
 mod maven_build_common;
 
@@ -60,14 +64,6 @@ const SV: &str = "1.10.0-socket.1d3c1fd2";
 /// `commons-text:1.10.0` (3.5.0 on 1.3), so purging the fixture version from
 /// the local repository would break the plugin realm, not the project.
 const CLASSPATH_PLUGIN: &str = "org.apache.maven.plugins:maven-dependency-plugin:3.5.0";
-
-fn binary() -> PathBuf {
-    env!("CARGO_BIN_EXE_socket-patch").into()
-}
-
-fn git_sha256(bytes: &[u8]) -> String {
-    socket_patch_core::hash::git_sha256::compute_git_sha256_from_bytes(bytes)
-}
 
 /// `socket-patch <args>` with ambient `SOCKET_*` scrubbed, `m2` as the Maven
 /// repo and, when given, `gradle_home` as the `GRADLE_USER_HOME` the CLI

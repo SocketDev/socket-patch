@@ -13,8 +13,8 @@ use std::time::Duration;
 
 use crate::args::GlobalArgs;
 use crate::commands::lock_cli::lock_failure;
-use crate::commands::rollback::sweep_failure;
 use crate::commands::vendor::{run_vendor_gc, VendorGcSummary};
+use crate::ui::sweep_failure;
 
 /// Aggregated outcome of a GC pass (or preview). Serialized into the
 /// `scan --json` output's `gc` sub-object. See CLI_CONTRACT.md for the

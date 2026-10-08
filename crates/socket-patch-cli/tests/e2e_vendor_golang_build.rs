@@ -25,13 +25,16 @@
 //! record, never with a tampered artifact member or a reverted go.mod. The
 //! Go release is whatever `go` is on `PATH` (see `golang_e2e_matrix`).
 
+#[path = "common/mod.rs"]
+mod common;
+use common::{binary, git_sha256};
+
 #[path = "prebuilt_common/mod.rs"]
 mod prebuilt_common;
 
 use std::path::{Path, PathBuf};
 use std::process::{Command, Output};
 
-use sha2::{Digest, Sha256};
 use wiremock::matchers::{method, path};
 use wiremock::{Mock, MockServer, ResponseTemplate};
 
@@ -54,10 +57,6 @@ const PRISTINE_LIB: &str = "package upstream\n\nfunc Greeting() string { return 
 const PATCHED_LIB: &str = "package upstream\n\nfunc Greeting() string { return \"PATCHED\" }\n";
 
 // ── self-contained helpers ────────────────────────────────────────────
-
-fn binary() -> PathBuf {
-    PathBuf::from(env!("CARGO_BIN_EXE_socket-patch"))
-}
 
 /// Run socket-patch with `SOCKET_*` scrubbed + the fixture GOMODCACHE (the
 /// go crawler resolves installed modules through it).
@@ -112,13 +111,6 @@ fn go(dir: &Path, args: &[&str], env: &[(&str, &str)]) -> Output {
         cmd.env(k, v);
     }
     cmd.output().expect("run go")
-}
-
-fn git_sha256(content: &[u8]) -> String {
-    let mut hasher = Sha256::new();
-    hasher.update(format!("blob {}\0", content.len()).as_bytes());
-    hasher.update(content);
-    hex::encode(hasher.finalize())
 }
 
 fn b64(bytes: &[u8]) -> String {

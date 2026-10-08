@@ -10,25 +10,13 @@
 //!   * non-JSON runs print ONE stderr warning, gated on `!--silent`
 //!     (`--silent` = errors only — a bare crawler eprintln violated that).
 
-use std::path::{Path, PathBuf};
-use std::process::Command;
+use crate::common::{binary, git_sha256};
 
-use sha2::{Digest, Sha256};
+use std::path::Path;
+use std::process::Command;
 
 const PURL: &str = "pkg:gem/rack@3.1.0";
 const CODE: &str = "gem_bundle_config_path_ignored";
-
-fn binary() -> PathBuf {
-    env!("CARGO_BIN_EXE_socket-patch").into()
-}
-
-fn git_sha256(content: &[u8]) -> String {
-    let header = format!("blob {}\0", content.len());
-    let mut hasher = Sha256::new();
-    hasher.update(header.as_bytes());
-    hasher.update(content);
-    hex::encode(hasher.finalize())
-}
 
 /// Project fixture: Gemfile + `.bundle/config` pointing `BUNDLE_PATH` at
 /// an ABSOLUTE directory outside the project (holding a real store, so

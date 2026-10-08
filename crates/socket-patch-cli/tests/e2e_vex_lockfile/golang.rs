@@ -43,6 +43,8 @@
 //! go-patches redirect (no uuid — a documented limitation, asserted below).
 //! Embedded: `scan --vex` and `apply --vex` on a manifest-less project.
 
+use crate::common::binary;
+
 use crate::vex_e2e_common;
 
 use std::collections::HashMap;
@@ -77,10 +79,6 @@ const PRISTINE_GO: &[u8] = b"package bar // pristine\n";
 const PATCHED_GO: &[u8] = b"package bar // patched\n";
 
 // ── harness ───────────────────────────────────────────────────────────
-
-fn binary() -> &'static str {
-    env!("CARGO_BIN_EXE_socket-patch")
-}
 
 /// A project under `<tmp>/app` plus private (empty unless a test fills them)
 /// module cache and GOPATH.

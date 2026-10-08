@@ -26,10 +26,10 @@
 //!     modified"). When NO variant matches, the base still fails with
 //!     "no matching variant found" and the file stays untouched.
 
+use crate::common::{binary, git_sha256};
+
 use std::path::{Path, PathBuf};
 use std::process::Command;
-
-use sha2::{Digest, Sha256};
 
 const SINGLETON_PURL: &str = "pkg:gem/rack@3.1.0";
 const UUID_SINGLETON: &str = "31313131-3131-4131-8131-313131313131";
@@ -47,19 +47,6 @@ const LINUX_PRISTINE: &[u8] = b"module Nokogiri\n  VERSION = '1.16.5'\nend\n";
 const LINUX_MARKER: &[u8] = b"\n# SOCKET-LINUX-PATCH\n";
 const DARWIN_BEFORE: &[u8] = b"# nokogiri.rb from the arm64-darwin gem\n";
 const DARWIN_MARKER: &[u8] = b"\n# DARWIN-MARKER\n";
-
-fn binary() -> PathBuf {
-    env!("CARGO_BIN_EXE_socket-patch").into()
-}
-
-/// Git-SHA256: SHA256("blob <len>\0" ++ content).
-fn git_sha256(content: &[u8]) -> String {
-    let header = format!("blob {}\0", content.len());
-    let mut hasher = Sha256::new();
-    hasher.update(header.as_bytes());
-    hasher.update(content);
-    hex::encode(hasher.finalize())
-}
 
 fn with_marker(base: &[u8], marker: &[u8]) -> Vec<u8> {
     let mut v = base.to_vec();

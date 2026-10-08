@@ -86,6 +86,10 @@
 //! equal `bun --version`, so a CI leg cannot pass by running the wrong bun
 //! or no bun at all.
 
+#[path = "common/mod.rs"]
+mod common;
+use common::binary;
+
 use std::collections::BTreeMap;
 use std::path::{Path, PathBuf};
 use std::process::{Command, Output, Stdio};
@@ -192,10 +196,6 @@ const LOCK_V1_FROM: BunVersion = (1, 2, 0);
 const LOCK_V2_FROM: BunVersion = (1, 4, 0);
 
 // ── toolchain gate (shared semantics with the two bun capstones) ──────────
-
-fn binary() -> PathBuf {
-    PathBuf::from(env!("CARGO_BIN_EXE_socket-patch"))
-}
 
 /// The REQUIRED gate: set AND non-empty. CI's e2e matrix passes
 /// `SOCKET_PATCH_BUN_E2E_REQUIRED: ${{ matrix.bun != '' && '1' || '' }}`,

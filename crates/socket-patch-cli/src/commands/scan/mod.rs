@@ -33,7 +33,9 @@ use crate::commands::vex::{generate_vex_from_manifest_path, VexEmbedArgs};
 use crate::ecosystem_dispatch::{crawl_ecosystems, crawl_ecosystems_with_npm};
 use crate::ui::{self, plural, print_json, StatusLine};
 
-use super::get::{download_and_apply_patches_with, DownloadParams, DownloadRun};
+use crate::commands::agent_download::{
+    download_and_apply_patches_with, DownloadParams, DownloadRun,
+};
 
 use self::policy::{load_invocation_policy, InvocationPolicy, PolicyLoadError, ScanPolicy};
 pub use self::socket_yml_args::{SocketYmlArgs, MIN_SEVERITY_ENV};
@@ -64,7 +66,6 @@ pub(crate) use self::discovery::{
 use self::gc::gc_json;
 pub(crate) use self::hosted::boxed_run_redirect_selected;
 use self::hosted::run_redirect;
-pub(crate) use self::hosted::{vlt_rollback_heal, vlt_takeover_heal};
 use self::vendor_flow::{
     boxed_vendor_interactive_path, boxed_vendor_json_path, fold_vendored_skips_into_apply,
     partition_skipped_selected,
@@ -2519,21 +2520,27 @@ async fn run_scan(
                 let mut patches: Vec<serde_json::Value> = selected
                     .iter()
                     .map(|p| {
-                        match super::get::decide_patch_action(
+                        match crate::commands::agent_download::decide_patch_action(
                             manifest_for_preview,
                             &p.purl,
                             &p.uuid,
                         ) {
-                            super::get::PatchAction::Added => serde_json::json!({
-                                "purl": p.purl, "uuid": p.uuid, "action": "added",
-                            }),
-                            super::get::PatchAction::Updated { old_uuid } => serde_json::json!({
-                                "purl": p.purl, "uuid": p.uuid,
-                                "action": "updated", "oldUuid": old_uuid,
-                            }),
-                            super::get::PatchAction::Skipped => serde_json::json!({
-                                "purl": p.purl, "uuid": p.uuid, "action": "skipped",
-                            }),
+                            crate::commands::agent_download::PatchAction::Added => {
+                                serde_json::json!({
+                                    "purl": p.purl, "uuid": p.uuid, "action": "added",
+                                })
+                            }
+                            crate::commands::agent_download::PatchAction::Updated { old_uuid } => {
+                                serde_json::json!({
+                                    "purl": p.purl, "uuid": p.uuid,
+                                    "action": "updated", "oldUuid": old_uuid,
+                                })
+                            }
+                            crate::commands::agent_download::PatchAction::Skipped => {
+                                serde_json::json!({
+                                    "purl": p.purl, "uuid": p.uuid, "action": "skipped",
+                                })
+                            }
                         }
                     })
                     .collect();

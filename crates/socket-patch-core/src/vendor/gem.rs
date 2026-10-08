@@ -446,7 +446,8 @@ async fn gem_prelude(
             return Err(refused(
                 "vendor_stale_lock_checksum",
                 format!(
-                    "Gemfile.lock already wires `{name}` to {copy_rel} but its CHECKSUMS entry is not bundler's bare path-gem form (an earlier socket-patch left the registry line in place); run `vendor --revert` for {purl} and re-vendor to repair it"
+                    "Gemfile.lock already wires `{name}` to {copy_rel} but its CHECKSUMS entry is not bundler's bare path-gem form (an earlier socket-patch left the registry line in place); {remedy} to repair {purl}",
+                    remedy = super::common::REVERT_ALL_AND_REVENDOR,
                 ),
             ));
         }

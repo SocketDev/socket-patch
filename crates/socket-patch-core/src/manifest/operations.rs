@@ -64,7 +64,7 @@ pub async fn read_manifest(
     // Tolerate a UTF-8 byte-order mark (Windows editors add one on save):
     // the file looks fine in an editor, yet serde_json rejects it with an
     // opaque "expected value at line 1 column 1".
-    let json = content.strip_prefix('\u{feff}').unwrap_or(&content);
+    let json = crate::formats::text::strip_bom(&content);
     parse_manifest(json).map(Some)
 }
 
