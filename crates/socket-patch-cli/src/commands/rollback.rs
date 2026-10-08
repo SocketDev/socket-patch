@@ -1009,12 +1009,19 @@ pub async fn run(args: RollbackArgs) -> i32 {
     let path_scope = match crate::path_scope::PathScope::parse(&path_patterns) {
         Ok(s) => s,
         Err(e) => {
+            // Like emit_rollback_error: JSON keeps the verbatim message,
+            // only the human stderr line is capitalized.
+            let message = if args.common.json {
+                e
+            } else {
+                capitalize_first(&e)
+            };
             return crate::json_envelope::usage_error(
                 crate::json_envelope::Command::Rollback,
                 args.common.json,
                 args.common.dry_run,
                 "path_glob_invalid",
-                &capitalize_first(&e),
+                &message,
             );
         }
     };

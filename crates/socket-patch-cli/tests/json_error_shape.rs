@@ -132,6 +132,17 @@ fn get_usage_errors_print_the_coded_error() {
 #[test]
 fn rollback_usage_error_prints_the_coded_error() {
     assert_legacy_usage(&["rollback", "x[", "--json"], &[], "path_glob_invalid");
+    // JSON carries the verbatim message; only stderr is capitalized.
+    let tmp = tempfile::tempdir().unwrap();
+    let (_, stdout, _) = run(tmp.path(), &["rollback", "x[", "--json"], &[]);
+    let v = assert_error_object(&stdout, "path_glob_invalid");
+    let message = v["error"]["message"].as_str().unwrap();
+    assert!(message.starts_with("invalid path pattern"), "{v}");
+    let (_, _, stderr) = run(tmp.path(), &["rollback", "x["], &[]);
+    assert!(
+        stderr.starts_with("Error: Invalid path pattern"),
+        "{stderr:?}"
+    );
 }
 
 #[test]
