@@ -591,6 +591,52 @@ async fn vendored_takeover_is_refused() {
     assert!(output.changed_files.is_empty());
 }
 
+/// The in-memory engine refuses exactly the takeovers the disk flow
+/// performs (one shared predicate): a vendored PyPI package is one, so it
+/// is refused as a takeover rather than handed to the Python rewriters,
+/// which would refuse socket-patch's own vendored source as user-authored.
+#[tokio::test]
+async fn vendored_pypi_takeover_is_refused_like_the_disk_flow() {
+    const PYPI_FIXTURE: &str = "redirect/pypi/requirements/basic";
+    let server = MockServer::start().await;
+    let patches = patches_from_overrides(
+        &fixtures_root().join(PYPI_FIXTURE).join("overrides.json"),
+        None,
+    );
+    mount_api(&server, &patches).await;
+    let mut files = fixture_files(&fixtures_root().join(PYPI_FIXTURE).join("input"));
+    let uuid = "33333333-3333-3333-3333-333333333333";
+    files.insert(
+        ".socket/vendor/state.json".into(),
+        serde_json::to_vec(&serde_json::json!({
+            "version": 1,
+            "entries": {
+                "pkg:pypi/requests@2.28.1": {
+                    "ecosystem": "pypi",
+                    "basePurl": "pkg:pypi/requests@2.28.1",
+                    "uuid": uuid,
+                    "flavor": "requirements",
+                    "artifact": {"path": format!(".socket/vendor/pypi/{uuid}/requests-2.28.1-py3-none-any.whl")},
+                    "wiring": []
+                }
+            }
+        }))
+        .unwrap(),
+    );
+    let output = run_engine(&server, build_input(&files, &[], options(false))).await;
+    let project = &output.projects[0];
+    assert!(
+        project
+            .skipped
+            .iter()
+            .any(|s| s.reason == "vendored_takeover_unsupported_in_memory"),
+        "{:?}",
+        project.skipped
+    );
+    assert!(project.redirected.is_empty());
+    assert!(output.changed_files.is_empty());
+}
+
 /// A pre-v5 redirect ledger (`.socket/vendor/redirect-state.json`) is
 /// never read by the v5 engine: a torn one neither fails its project nor
 /// changes its plan, and the engine never emits (or rewrites) the file.

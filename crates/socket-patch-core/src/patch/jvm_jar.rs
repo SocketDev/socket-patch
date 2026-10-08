@@ -650,9 +650,9 @@ async fn upstream_for_gradle_copy(purl: &str, jar_leaf: &str, dir: &Path) -> Opt
     let hash = dir.file_name()?.to_str()?;
     let (group, artifact, version) = parse_maven_purl(purl)?;
     let url = format!(
-        "{}/{}/{artifact}/{version}/{jar_leaf}",
-        crate::vendor::maven_repo::maven_registry_base(),
-        group.replace('.', "/")
+        "{}/{}/{jar_leaf}",
+        crate::vendor::jvm::layout::registry_base(),
+        crate::vendor::jvm::layout::version_dir(&group, &artifact, &version)
     );
     let bytes = crate::vendor::maven_repo::fetch_registry_bytes(
         &url,

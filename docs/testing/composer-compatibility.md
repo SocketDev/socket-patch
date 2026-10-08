@@ -43,7 +43,7 @@ vendored (`e2e_vendor_composer_build`) and hosted
 | --- | --- |
 | Ubuntu | 1.10.28 (8.1), 2.0.14 (8.0), 2.1.14 (8.1), 2.2.30 (8.1, 8.3), 2.5.8 (8.2), 2.8.12 (8.4), 2.9.8 (8.4), 2.10.3 (8.5) |
 | Windows | 1.10.28 (8.1), 2.2.30 (8.3), 2.9.8 (8.4), 2.10.3 (8.5) |
-| macOS | 1.10.28 (8.1), 2.2.30 (8.3), 2.10.3 (8.5) |
+| macOS | 1.10.28 (8.1), 2.2.30 (8.3), 2.10.3 (8.4) |
 | Docker (Debian 12, PHP 8.2) | 2.2.30, 2.10.3 (`docker_e2e_vendor_composer`) |
 
 The capstones pin psr/log 3.0.2 (PHP ≥ 8.0) and, for the `v`-tagged cells,
