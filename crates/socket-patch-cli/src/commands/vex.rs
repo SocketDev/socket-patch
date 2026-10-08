@@ -51,7 +51,9 @@ pub struct VexArgs {
     ///
     /// Auto-detection tries, in order:
     ///   1. the git `origin` remote: pkg:github/<owner>/<repo> for github.com
-    ///      (likewise gitlab.com and bitbucket.org), the raw URL otherwise
+    ///      (likewise gitlab.com and bitbucket.org), the raw URL otherwise.
+    ///      The nearest checkout counts (a submodule or worktree names
+    ///      itself); a repository at the home directory only when run there
     ///   2. package.json:   pkg:npm/<name>@<version>
     ///   3. pyproject.toml: pkg:pypi/<name>@<version>
     ///   4. Cargo.toml:     pkg:cargo/<name>@<version>

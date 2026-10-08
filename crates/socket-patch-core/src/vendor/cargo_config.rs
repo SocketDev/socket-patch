@@ -153,17 +153,21 @@ pub struct ChainConfig {
 /// every ancestor directory's, and `$CARGO_HOME`'s (default `~/.cargo`), in
 /// that order (cargo lets a config item replace the manifest item with the
 /// same key, whatever its version). Read-only and fail-soft: missing /
-/// unreadable / malformed files contribute nothing.
+/// unreadable / malformed files contribute nothing, and with no
+/// `$CARGO_HOME` and no home directory there is no home config.
 pub async fn read_config_chain(project_root: &Path) -> Vec<ChainConfig> {
     let cargo_home = match std::env::var("CARGO_HOME") {
-        Ok(v) if !v.trim().is_empty() => PathBuf::from(v),
-        _ => crate::utils::fs::home_dir().join(".cargo"),
+        Ok(v) if !v.trim().is_empty() => Some(PathBuf::from(v)),
+        _ => crate::utils::fs::home_dir().map(|home| home.join(".cargo")),
     };
-    read_config_chain_with(project_root, &cargo_home).await
+    read_config_chain_with(project_root, cargo_home.as_deref()).await
 }
 
 /// [`read_config_chain`] with an explicit `$CARGO_HOME`.
-pub async fn read_config_chain_with(project_root: &Path, cargo_home: &Path) -> Vec<ChainConfig> {
+pub async fn read_config_chain_with(
+    project_root: &Path,
+    cargo_home: Option<&Path>,
+) -> Vec<ChainConfig> {
     let root = fs::canonicalize(project_root)
         .await
         .unwrap_or_else(|_| project_root.to_path_buf());
@@ -171,11 +175,13 @@ pub async fn read_config_chain_with(project_root: &Path, cargo_home: &Path) -> V
         .ancestors()
         .map(|dir| (dir.join(".cargo"), dir.to_path_buf(), dir == root))
         .collect();
-    let home_base = cargo_home
-        .parent()
-        .map(Path::to_path_buf)
-        .unwrap_or_else(|| cargo_home.to_path_buf());
-    dirs.push((cargo_home.to_path_buf(), home_base, false));
+    if let Some(cargo_home) = cargo_home {
+        let home_base = cargo_home
+            .parent()
+            .map(Path::to_path_buf)
+            .unwrap_or_else(|| cargo_home.to_path_buf());
+        dirs.push((cargo_home.to_path_buf(), home_base, false));
+    }
     let mut seen: Vec<PathBuf> = Vec::new();
     let mut out = Vec::new();
     for (cargo_dir, base, project) in dirs {
@@ -424,20 +430,19 @@ async fn edit_config(
 /// `/abs/.socket/vendor/cargo/…`, `sub/.socket/vendor/cargo/…`) is
 /// user-authored and must never be rewritten or removed.
 pub(crate) fn path_is_socket_owned(path: &str) -> bool {
-    let norm = path.replace('\\', "/");
-    if norm.starts_with('/') {
+    if path.starts_with(['/', '\\']) {
         return false; // absolute (also covers //unc-style prefixes)
     }
-    if norm.as_bytes().get(1) == Some(&b':') {
+    if path.as_bytes().get(1) == Some(&b':') {
         return false; // Windows drive-letter absolute (C:/…)
     }
-    let segments: Vec<&str> = norm
-        .split('/')
-        .filter(|s| !s.is_empty() && *s != ".")
-        .collect();
-    if segments.contains(&"..") {
+    if path.split(['/', '\\']).any(|s| s == "..") {
         return false;
     }
+    let Some(norm) = crate::utils::relpath::resolve_rel("", path, 0) else {
+        return false;
+    };
+    let segments: Vec<&str> = norm.split('/').collect();
     let prefix: Vec<&str> = CARGO_VENDOR_DIR.split('/').collect();
     segments.len() > prefix.len() && segments[..prefix.len()] == prefix[..]
 }

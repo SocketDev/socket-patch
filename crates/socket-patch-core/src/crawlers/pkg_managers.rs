@@ -183,7 +183,7 @@ impl YarnEnv {
         Self {
             node_linker: set("YARN_NODE_LINKER"),
             rc_filename: set("YARN_RC_FILENAME").unwrap_or_else(|| ".yarnrc.yml".to_string()),
-            home: Some(crate::utils::fs::home_dir()),
+            home: crate::utils::fs::home_dir(),
         }
     }
 
