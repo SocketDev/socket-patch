@@ -31,6 +31,7 @@ use std::path::{Path, PathBuf};
 use crate::args::{apply_env_toggles, GlobalArgs};
 use crate::commands::vex::{generate_vex_from_manifest_path, VexEmbedArgs};
 use crate::ecosystem_dispatch::{crawl_ecosystems, crawl_ecosystems_with_npm};
+use crate::json_envelope::{usage_error, Command as JsonCommand};
 use crate::ui::{self, plural, print_json, StatusLine};
 
 use crate::commands::agent_download::{
@@ -388,11 +389,10 @@ async fn embed_vex_into_json(
             0
         }
         Err(e) => {
-            result["status"] = serde_json::json!("error");
-            result["error"] = serde_json::json!({
-                "code": e.code,
-                "message": e.message,
-            });
+            crate::json_envelope::set_error(
+                result,
+                crate::json_envelope::EnvelopeError::new(e.code.to_string(), e.message.clone()),
+            );
             append_vex_error_warnings(result, &e.embedded_warnings());
             1
         }
@@ -758,10 +758,14 @@ async fn fetch_patch_details(
 /// print it. The discovery counts already in `result` stay — they were
 /// computed from the (successful) batch phase — while `status`/`error`
 /// mirror the all-batches-failed envelope so JSON consumers see one
-/// consistent scan-error schema instead of empty stdout.
+/// consistent scan-error schema instead of empty stdout. The code is
+/// [`PATCH_DETAILS_FAILED`]: every patch-detail query failing is the only
+/// way discovery fails.
 fn emit_discovery_error_json(result: &mut serde_json::Value, message: &str) {
-    result["status"] = serde_json::json!("error");
-    result["error"] = serde_json::json!(message);
+    crate::json_envelope::set_error(
+        result,
+        crate::json_envelope::EnvelopeError::new(PATCH_DETAILS_FAILED, message),
+    );
     if let Some(obj) = result.as_object_mut() {
         obj.remove("rollout");
     }
@@ -1478,10 +1482,10 @@ fn push_scan_json_warning(result: &mut serde_json::Value, code: &str, detail: &s
 /// Print the scan error envelope for a refusal before any scanning
 /// (`--offline`): the all-batches-failed shape with every count at
 /// zero, so JSON consumers see one consistent scan-error schema.
-fn print_zero_error_envelope(err: &str, paths: &[String]) {
+fn print_zero_error_envelope(code: &str, err: &str, paths: &[String]) {
     let result = serde_json::json!({
         "status": "error",
-        "error": err,
+        "error": { "code": code, "message": err },
         "scannedPackages": 0,
         "lockfileOnlyPackages": 0,
         "packagesWithPatches": 0,
@@ -1512,15 +1516,23 @@ pub async fn run(args: ScanArgs) -> i32 {
 /// PATH is a directory, or a glob matching directories, relative to
 /// `--cwd`. Sorted and deduplicated; the flag says whether the user named
 /// the directory literally (explicit roots skip the built-in default path
-/// ignores; glob matches are discovered roots).
-fn project_dirs(cwd: &Path, paths: &[String]) -> Result<Vec<(PathBuf, bool)>, String> {
+/// ignores; glob matches are discovered roots). `Err` is a usage error:
+/// `(code, message)`.
+fn project_dirs(
+    cwd: &Path,
+    paths: &[String],
+) -> Result<Vec<(PathBuf, bool)>, (&'static str, String)> {
     let mut dirs: Vec<(PathBuf, bool)> = Vec::new();
     for raw in paths {
         let joined = cwd.join(raw);
         if raw.contains(['*', '?', '[']) {
             let pattern = joined.to_string_lossy().into_owned();
-            let matches =
-                glob::glob(&pattern).map_err(|e| format!("invalid path pattern `{raw}`: {e}"))?;
+            let matches = glob::glob(&pattern).map_err(|e| {
+                (
+                    "path_glob_invalid",
+                    format!("invalid path pattern `{raw}`: {e}"),
+                )
+            })?;
             let before = dirs.len();
             dirs.extend(
                 matches
@@ -1529,12 +1541,15 @@ fn project_dirs(cwd: &Path, paths: &[String]) -> Result<Vec<(PathBuf, bool)>, St
                     .map(|p| (p, false)),
             );
             if dirs.len() == before {
-                return Err(format!("`{raw}` matches no directory"));
+                return Err((
+                    "path_glob_no_match",
+                    format!("`{raw}` matches no directory"),
+                ));
             }
         } else if joined.is_dir() {
             dirs.push((joined, true));
         } else {
-            return Err(format!("`{raw}` is not a directory"));
+            return Err(("path_not_directory", format!("`{raw}` is not a directory")));
         }
     }
     // A directory both named and matched counts as named.
@@ -1552,44 +1567,56 @@ async fn run_project_dirs(
     telemetry: &mut PendingTelemetry,
     invocation: &InvocationPolicy,
 ) -> i32 {
+    let usage = |code: &str, message: &str| {
+        usage_error(
+            JsonCommand::Scan,
+            args.common.json,
+            args.common.dry_run,
+            code,
+            message,
+        )
+    };
     let dirs = match project_dirs(&args.common.cwd, &args.paths) {
         Ok(dirs) => dirs,
-        Err(message) => {
-            eprintln!("Error: {message}");
-            return 2;
-        }
+        Err((code, message)) => return usage(code, &message),
     };
     if !args.common.is_global() {
         for (dir, _) in &dirs {
             let resolved = std::fs::canonicalize(dir).unwrap_or_else(|_| dir.clone());
             if !resolved.starts_with(&invocation.repo_root) {
-                eprintln!(
-                    "Error: `{}` is outside {} (the repository root socket.yml is read \
-                     from; without a trusted .git it is --cwd): run one scan per repository, \
-                     or pass --cwd at a common parent",
-                    dir.display(),
-                    invocation.repo_root.display()
+                return usage(
+                    "path_outside_repo",
+                    &format!(
+                        "`{}` is outside {} (the repository root socket.yml is read \
+                         from; without a trusted .git it is --cwd): run one scan per \
+                         repository, or pass --cwd at a common parent",
+                        dir.display(),
+                        invocation.repo_root.display()
+                    ),
                 );
-                return 2;
             }
         }
     }
     if args.common.json && dirs.len() > 1 {
-        eprintln!(
-            "Error: --json takes one project directory ({} given); run one scan per directory",
-            dirs.len()
+        return usage(
+            "invalid_args",
+            &format!(
+                "--json takes one project directory ({} given); run one scan per directory",
+                dirs.len()
+            ),
         );
-        return 2;
     }
     // `--vex <path>` names one document: each directory's run would write
     // (or, on a failed generation, remove) the same file, so the last run
     // would silently clobber the others' attestations.
     if args.vex.vex.is_some() && dirs.len() > 1 {
-        eprintln!(
-            "Error: --vex takes one project directory ({} given); run one scan per directory",
-            dirs.len()
+        return usage(
+            "invalid_args",
+            &format!(
+                "--vex takes one project directory ({} given); run one scan per directory",
+                dirs.len()
+            ),
         );
-        return 2;
     }
     // One budget per invocation (§5.2): the directories spend it in sorted
     // order, and a package admitted in one is admitted free in the next.
@@ -1598,10 +1625,7 @@ async fn run_project_dirs(
         .resolve_from_env(invocation.policy.max_new_patches())
     {
         Ok(max) => max,
-        Err(message) => {
-            eprintln!("Error: {message}");
-            return 2;
-        }
+        Err(message) => return usage("invalid_env", &message),
     };
     let root = std::fs::canonicalize(&args.common.cwd).unwrap_or_else(|_| args.common.cwd.clone());
     let carry = rollout_args::RolloutCarry::new(configured, root);
@@ -1618,6 +1642,18 @@ async fn run_project_dirs(
         code = code.max(Box::pin(run_scan(child, telemetry, Some(invocation), *explicit)).await);
     }
     code
+}
+
+/// Report a usage error `scan` enforces itself (exit 2): the coded error
+/// on stdout under `--json`, `Error: ...` on stderr otherwise.
+fn scan_usage_error(args: &ScanArgs, code: &str, message: &str) -> i32 {
+    usage_error(
+        JsonCommand::Scan,
+        args.common.json,
+        args.common.dry_run,
+        code,
+        message,
+    )
 }
 
 /// Print a policy file that cannot be honored (fail closed, exit 1).
@@ -1642,11 +1678,20 @@ async fn run_scan(
 
     // Fold the legacy mode booleans into `args.mode` (see
     // `resolve_mode_flags`). Cross-mode combinations are usage errors
-    // (exit 2), which print no JSON envelope even under --json, like
-    // clap's own.
+    // (exit 2); under --json they print the coded error on stdout.
     if let Err(message) = resolve_mode_flags(&mut args) {
-        eprintln!("Error: {message}");
-        return 2;
+        // The global-install refusal is the one with its own code: it is
+        // exactly `global_mode_conflict`'s message for the folded mode.
+        let global = args
+            .mode
+            .and_then(|mode| crate::commands::global_mode_conflict(&args.common, mode))
+            .is_some_and(|conflict| conflict == message);
+        let code = if global {
+            "global_scope_unsupported"
+        } else {
+            "invalid_args"
+        };
+        return scan_usage_error(&args, code, &message);
     }
 
     // The repo's socket.yml policy, read once per invocation before any
@@ -1660,8 +1705,7 @@ async fn run_scan(
                 &loaded
             }
             Err(PolicyLoadError::Usage(message)) => {
-                eprintln!("Error: {message}");
-                return 2;
+                return scan_usage_error(&args, "invalid_env", &message);
             }
             Err(PolicyLoadError::Policy(err)) => return report_policy_error(&err, &args),
         },
@@ -1686,10 +1730,7 @@ async fn run_scan(
     // is a usage error, same exit-2 shape as the mode conflicts.
     let path_scope = match crate::path_scope::PathScope::parse(&args.paths) {
         Ok(s) => s,
-        Err(message) => {
-            eprintln!("Error: {message}");
-            return 2;
-        }
+        Err(message) => return scan_usage_error(&args, "path_glob_invalid", &message),
     };
 
     // The per-run cap on NEW patches (`--max-new-patches` > env > the
@@ -1702,10 +1743,7 @@ async fn run_scan(
             .resolve_from_env(invocation.policy.max_new_patches())
         {
             Ok(max) => max,
-            Err(message) => {
-                eprintln!("Error: {message}");
-                return 2;
-            }
+            Err(message) => return scan_usage_error(&args, "invalid_env", &message),
         },
     };
     let mut stage =
@@ -1720,7 +1758,7 @@ async fn run_scan(
         if args.common.json {
             // Mirror the all-batches-failed error envelope shape so JSON
             // consumers see one consistent scan-error schema.
-            print_zero_error_envelope(err, path_scope.raw());
+            print_zero_error_envelope("offline_unsupported", err, path_scope.raw());
         } else {
             eprintln!("Error: {err}");
         }
@@ -2282,7 +2320,7 @@ async fn run_scan(
         if args.common.json {
             let result = serde_json::json!({
                 "status": "error",
-                "error": err,
+                "error": { "code": API_BATCH_FAILED, "message": err },
                 "scannedPackages": package_count,
                 "lockfileOnlyPackages": lockfile_only.purls.len(),
                 "packagesWithPatches": 0,
@@ -3257,15 +3295,15 @@ mod tests {
                 ("libs/core".to_string(), true)
             ]
         );
-        assert!(project_dirs(tmp.path(), &["apps/README".into()])
-            .unwrap_err()
-            .contains("is not a directory"));
-        assert!(project_dirs(tmp.path(), &["nope/*".into()])
-            .unwrap_err()
-            .contains("matches no directory"));
-        assert!(project_dirs(tmp.path(), &["x[".into()])
-            .unwrap_err()
-            .contains("invalid path pattern"));
+        let err = project_dirs(tmp.path(), &["apps/README".into()]).unwrap_err();
+        assert_eq!(err.0, "path_not_directory");
+        assert!(err.1.contains("is not a directory"));
+        let err = project_dirs(tmp.path(), &["nope/*".into()]).unwrap_err();
+        assert_eq!(err.0, "path_glob_no_match");
+        assert!(err.1.contains("matches no directory"));
+        let err = project_dirs(tmp.path(), &["x[".into()]).unwrap_err();
+        assert_eq!(err.0, "path_glob_invalid");
+        assert!(err.1.contains("invalid path pattern"));
     }
 
     #[test]
