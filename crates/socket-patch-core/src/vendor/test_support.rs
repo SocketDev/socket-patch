@@ -476,6 +476,39 @@ pub(crate) fn tree_snapshot(root: &Path) -> std::collections::BTreeMap<String, V
 
 pub mod service_fixture;
 
+/// Keep-side oracle for the prune GC
+/// ([`crate::vex::discover::Discovery::vendor_entry_in_use`]): whatever a
+/// backend just vendored and wired must never read as unused, or
+/// `scan --prune` would revert a fresh patch. Runs after every successful,
+/// non-dry-run vendor in the backend suites, so each backend's real output
+/// (every ecosystem and lock flavor they cover) pins the verdict. `None`
+/// (no lock yet, so the next install decides) is allowed.
+async fn assert_fresh_vendor_in_use(root: &Path, outcome: &VendorOutcome, dry_run: bool) {
+    let VendorOutcome::Done {
+        result,
+        entry: Some(entry),
+        ..
+    } = outcome
+    else {
+        return;
+    };
+    if dry_run || !result.success {
+        return;
+    }
+    let verdict = crate::vex::discover::discover_patched_refs(root)
+        .await
+        .vendor_entry_in_use(root, entry)
+        .await;
+    assert_ne!(
+        verdict,
+        Some(false),
+        "the prune GC would revert a freshly vendored {} entry ({:?}, flavor {:?})",
+        entry.ecosystem,
+        entry.base_purl,
+        entry.flavor
+    );
+}
+
 #[allow(clippy::too_many_arguments)]
 pub(crate) async fn vendor_pnpm<'a>(
     purl: &str,
@@ -494,7 +527,7 @@ pub(crate) async fn vendor_pnpm<'a>(
     } else {
         None
     };
-    super::pnpm_lock::vendor_pnpm(
+    let outcome = super::pnpm_lock::vendor_pnpm(
         purl,
         source,
         project_root,
@@ -505,7 +538,9 @@ pub(crate) async fn vendor_pnpm<'a>(
         force,
         service.or_else(|| fixture.as_ref().map(|f| &f.cfg)),
     )
-    .await
+    .await;
+    assert_fresh_vendor_in_use(project_root, &outcome, dry_run).await;
+    outcome
 }
 
 #[allow(clippy::too_many_arguments)]
@@ -526,7 +561,7 @@ pub(crate) async fn vendor_yarn_classic<'a>(
     } else {
         None
     };
-    super::yarn_classic_lock::vendor_yarn_classic(
+    let outcome = super::yarn_classic_lock::vendor_yarn_classic(
         purl,
         source,
         project_root,
@@ -537,7 +572,9 @@ pub(crate) async fn vendor_yarn_classic<'a>(
         force,
         service.or_else(|| fixture.as_ref().map(|f| &f.cfg)),
     )
-    .await
+    .await;
+    assert_fresh_vendor_in_use(project_root, &outcome, dry_run).await;
+    outcome
 }
 
 #[allow(clippy::too_many_arguments)]
@@ -558,7 +595,7 @@ pub(crate) async fn vendor_npm<'a>(
     } else {
         None
     };
-    super::npm_lock::vendor_npm(
+    let outcome = super::npm_lock::vendor_npm(
         purl,
         source,
         project_root,
@@ -569,7 +606,9 @@ pub(crate) async fn vendor_npm<'a>(
         force,
         service.or_else(|| fixture.as_ref().map(|f| &f.cfg)),
     )
-    .await
+    .await;
+    assert_fresh_vendor_in_use(project_root, &outcome, dry_run).await;
+    outcome
 }
 
 #[allow(clippy::too_many_arguments)]
@@ -590,7 +629,7 @@ pub(crate) async fn vendor_composer<'a>(
     } else {
         None
     };
-    super::composer_lock::vendor_composer(
+    let outcome = super::composer_lock::vendor_composer(
         purl,
         source,
         project_root,
@@ -601,7 +640,9 @@ pub(crate) async fn vendor_composer<'a>(
         force,
         service.or_else(|| fixture.as_ref().map(|f| &f.cfg)),
     )
-    .await
+    .await;
+    assert_fresh_vendor_in_use(project_root, &outcome, dry_run).await;
+    outcome
 }
 
 #[allow(clippy::too_many_arguments)]
@@ -622,7 +663,7 @@ pub(crate) async fn vendor_cargo_crate<'a>(
     } else {
         None
     };
-    super::cargo::vendor_cargo_crate(
+    let outcome = super::cargo::vendor_cargo_crate(
         purl,
         source,
         project_root,
@@ -633,7 +674,9 @@ pub(crate) async fn vendor_cargo_crate<'a>(
         force,
         service.or_else(|| fixture.as_ref().map(|f| &f.cfg)),
     )
-    .await
+    .await;
+    assert_fresh_vendor_in_use(project_root, &outcome, dry_run).await;
+    outcome
 }
 
 #[allow(clippy::too_many_arguments)]
@@ -654,7 +697,7 @@ pub(crate) async fn vendor_vlt<'a>(
     } else {
         None
     };
-    super::vlt_lock::vendor_vlt(
+    let outcome = super::vlt_lock::vendor_vlt(
         purl,
         source,
         project_root,
@@ -665,7 +708,9 @@ pub(crate) async fn vendor_vlt<'a>(
         force,
         service.or_else(|| fixture.as_ref().map(|f| &f.cfg)),
     )
-    .await
+    .await;
+    assert_fresh_vendor_in_use(project_root, &outcome, dry_run).await;
+    outcome
 }
 
 #[allow(clippy::too_many_arguments)]
@@ -686,7 +731,7 @@ pub(crate) async fn vendor_maven<'a>(
     } else {
         None
     };
-    super::maven_repo::vendor_maven(
+    let outcome = super::maven_repo::vendor_maven(
         purl,
         source.path(),
         project_root,
@@ -697,7 +742,9 @@ pub(crate) async fn vendor_maven<'a>(
         force,
         service.or_else(|| fixture.as_ref().map(|f| &f.cfg)),
     )
-    .await
+    .await;
+    assert_fresh_vendor_in_use(project_root, &outcome, dry_run).await;
+    outcome
 }
 
 #[allow(clippy::too_many_arguments)]
@@ -718,7 +765,7 @@ pub(crate) async fn vendor_pnpm_legacy<'a>(
     } else {
         None
     };
-    super::pnpm_lock_legacy::vendor_pnpm_legacy(
+    let outcome = super::pnpm_lock_legacy::vendor_pnpm_legacy(
         purl,
         source,
         project_root,
@@ -729,7 +776,9 @@ pub(crate) async fn vendor_pnpm_legacy<'a>(
         force,
         service.or_else(|| fixture.as_ref().map(|f| &f.cfg)),
     )
-    .await
+    .await;
+    assert_fresh_vendor_in_use(project_root, &outcome, dry_run).await;
+    outcome
 }
 
 #[allow(clippy::too_many_arguments)]
@@ -750,7 +799,7 @@ pub(crate) async fn vendor_nuget<'a>(
     } else {
         None
     };
-    super::nuget_feed::vendor_nuget(
+    let outcome = super::nuget_feed::vendor_nuget(
         purl,
         source.path(),
         project_root,
@@ -761,7 +810,9 @@ pub(crate) async fn vendor_nuget<'a>(
         force,
         service.or_else(|| fixture.as_ref().map(|f| &f.cfg)),
     )
-    .await
+    .await;
+    assert_fresh_vendor_in_use(project_root, &outcome, dry_run).await;
+    outcome
 }
 
 #[allow(clippy::too_many_arguments)]
@@ -782,7 +833,7 @@ pub(crate) async fn vendor_yarn_berry<'a>(
     } else {
         None
     };
-    super::yarn_berry_lock::vendor_yarn_berry(
+    let outcome = super::yarn_berry_lock::vendor_yarn_berry(
         purl,
         source,
         project_root,
@@ -793,7 +844,9 @@ pub(crate) async fn vendor_yarn_berry<'a>(
         force,
         service.or_else(|| fixture.as_ref().map(|f| &f.cfg)),
     )
-    .await
+    .await;
+    assert_fresh_vendor_in_use(project_root, &outcome, dry_run).await;
+    outcome
 }
 
 #[allow(clippy::too_many_arguments)]
@@ -814,7 +867,7 @@ pub(crate) async fn vendor_pypi<'a>(
     } else {
         None
     };
-    super::pypi::vendor_pypi(
+    let outcome = super::pypi::vendor_pypi(
         purl,
         source,
         project_root,
@@ -825,7 +878,9 @@ pub(crate) async fn vendor_pypi<'a>(
         force,
         service.or_else(|| fixture.as_ref().map(|f| &f.cfg)),
     )
-    .await
+    .await;
+    assert_fresh_vendor_in_use(project_root, &outcome, dry_run).await;
+    outcome
 }
 
 #[allow(clippy::too_many_arguments)]
@@ -846,7 +901,7 @@ pub(crate) async fn vendor_gem<'a>(
     } else {
         None
     };
-    super::gem::vendor_gem(
+    let outcome = super::gem::vendor_gem(
         purl,
         source,
         project_root,
@@ -857,7 +912,9 @@ pub(crate) async fn vendor_gem<'a>(
         force,
         service.or_else(|| fixture.as_ref().map(|f| &f.cfg)),
     )
-    .await
+    .await;
+    assert_fresh_vendor_in_use(project_root, &outcome, dry_run).await;
+    outcome
 }
 
 #[allow(clippy::too_many_arguments)]
@@ -878,7 +935,7 @@ pub(crate) async fn vendor_go_module<'a>(
     } else {
         None
     };
-    super::golang::vendor_go_module(
+    let outcome = super::golang::vendor_go_module(
         purl,
         source,
         project_root,
@@ -889,7 +946,9 @@ pub(crate) async fn vendor_go_module<'a>(
         force,
         service.or_else(|| fixture.as_ref().map(|f| &f.cfg)),
     )
-    .await
+    .await;
+    assert_fresh_vendor_in_use(project_root, &outcome, dry_run).await;
+    outcome
 }
 
 #[allow(clippy::too_many_arguments)]
@@ -910,7 +969,7 @@ pub(crate) async fn vendor_npm_any<'a>(
     } else {
         None
     };
-    super::npm_flavor::vendor_npm_any(
+    let outcome = super::npm_flavor::vendor_npm_any(
         purl,
         source,
         project_root,
@@ -921,7 +980,9 @@ pub(crate) async fn vendor_npm_any<'a>(
         force,
         service.or_else(|| fixture.as_ref().map(|f| &f.cfg)),
     )
-    .await
+    .await;
+    assert_fresh_vendor_in_use(project_root, &outcome, dry_run).await;
+    outcome
 }
 
 #[allow(clippy::too_many_arguments)]
@@ -942,7 +1003,7 @@ pub(crate) async fn vendor_bun<'a>(
     } else {
         None
     };
-    super::bun_lock::vendor_bun(
+    let outcome = super::bun_lock::vendor_bun(
         purl,
         source,
         project_root,
@@ -953,7 +1014,9 @@ pub(crate) async fn vendor_bun<'a>(
         force,
         service.or_else(|| fixture.as_ref().map(|f| &f.cfg)),
     )
-    .await
+    .await;
+    assert_fresh_vendor_in_use(project_root, &outcome, dry_run).await;
+    outcome
 }
 
 pub(crate) fn expect_failure(outcome: VendorOutcome) -> String {
