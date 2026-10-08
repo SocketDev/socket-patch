@@ -1,5 +1,5 @@
 ### Refactor routine (`refactor`, hourly, highest leverage first)
-_Last updated 2026-10-08T12:05Z · main @ e2d9633_
+_Last updated 2026-10-08T13:05Z · main @ e2d9633_
 
 **In flight:**
 - [#1126](https://github.com/SocketDev/socket-patch/pull/1126): 7 inline `starts_with("pkg:<type>/")` checks (Bun/vlt preflights, PyPI fuzzy match, Coursier sidecar, VEX verify) through `Ecosystem::from_purl`, plus an equivalence table test and a one-sided guard listing 16 pending files. Issue #747 (C20, slice 1). +18 / −9 production, +155 tests. `state: ready`.
@@ -10,7 +10,7 @@ _Last updated 2026-10-08T12:05Z · main @ e2d9633_
 - [#1108](https://github.com/SocketDev/socket-patch/pull/1108): one `utils::line_endings::terminator` (CRLF → CRLF, mixed → majority, else LF) for 7 inserted-line sites: gem lock converge, composer/requirements restore, Pipfile.lock entry formatter, PEP 723 writer, go.mod append/re-join. Issue #815 (E16, slice 1; `detect_eol`, `pypi_uv::newline_of`, Maven ×2, `redirect/mod.rs`, the `crlf` flags and upstream gem's Gemfile restore remain, all in open-PR files). Re-blesses the go/uv equivalence goldens (mixed inputs only). `state: ready`.
 - [#1106](https://github.com/SocketDev/socket-patch/pull/1106): the macOS PDM site probe runs through `utils::process::output_within`; a guard test rejects new production `kill_on_drop` spawns (pending: `vendor/npm_dir.rs`). Issue #1067 (C48, slice: `pdm_site`; the `npm_dir` git exchange remains, blocked on #1026). `state: ready`, handed to the burn-down.
 - [#1103](https://github.com/SocketDev/socket-patch/pull/1103): `go.sum` edits through `GoSumEditor` only; deletes the oracle-only free functions and names the key rule once. Issue #631 (E52, slice: steps 2–3; the move to `formats/golang/sum.rs` remains). `state: ready`, handed to the burn-down.
-- Maintainer drafts (decided issues): #1021 (#615), #1027 (#704), #1030 (#808), #1031 (#966), #1036 (#973), #1041 (#648), #1049 (#792), #1051 (#580).
+- Maintainer drafts (decided issues; #1027's status heartbeat is stale but a burn-down merge landed 12:19Z, so it isn't abandoned): #1021 (#615), #1027 (#704), #1030 (#808), #1031 (#966), #1036 (#973), #1041 (#648), #1049 (#792), #1051 (#580).
 - October 7 campaign: open #1026, #1032, #1034, #1039, #1043, #1050, #1058; merged #1042, #1033, #1038, #1046, #1035, #1044, #1029, #1057, #1045 (rows in the auditors' registers).
 
 **Merged:**
@@ -27,7 +27,7 @@ _Last updated 2026-10-08T12:05Z · main @ e2d9633_
 | 4 | #706 (C17) slice 2: the 6 `PENDING_INLINE_DIGESTS` files | 0 | 1 | ≈6 | L | ≈14 | skipped: all 6 changed by open PRs |
 | 5 | #630 (E37): one name/version coordinate guard + composer `strip_leading_v` | 0 | 0 | 4 | L | ≈8 | skipped: only the NuGet guard is free; moving it alone collapses no copy |
 
-Re-ranked 2026-10-08T12:00Z at `e2d9633` against 32 open PRs' 581 files: nothing eligible. Also blocked by open-PR files: #678, #949, #782, #801, #883, #705, #914, #1012.
+Re-ranked 2026-10-08T13:00Z at `e2d9633` against the same 32 open PRs' 581 files: nothing eligible. Also blocked by open-PR files: #678, #949, #782, #801, #883, #705, #914, #1012, #1128 (E14 Pipenv writer: `vendor/pypi_pipenv.rs` in #1043, `redirect/pipenv.rs` in #1108, `redirect/mod.rs` in 6 PRs).
 
 **Notes:**
 - E35's crawler oracles (composer/go/nuget/python/maven) can't become `golden.rs` digests: their randomized trees use symlinks (no-ops on Windows), permission modes (ignored as root and on Windows) and case-colliding names (folded on macOS). The outputs therefore differ by OS and by uid, and a golden blessed in the root sandbox would fail on non-root Linux CI. Keep the oracles until a crawler can be checked without one.
