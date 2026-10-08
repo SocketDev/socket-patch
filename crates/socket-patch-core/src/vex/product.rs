@@ -5,7 +5,8 @@
 //!      identifier when the repo IS the product. GitHub/GitLab/
 //!      Bitbucket URLs are normalized to
 //!      `pkg:<github|gitlab|bitbucket>/<owner>/<name>`; anything else
-//!      is returned as the raw URL.
+//!      is returned as the URL with any credentials (userinfo), query
+//!      and fragment removed.
 //!   2. `package.json` (npm)        → `pkg:npm/<name>@<version>`
 //!   3. `pyproject.toml` (PyPI)     → `pkg:pypi/<name>@<version>`
 //!   4. `Cargo.toml` (Cargo)        → `pkg:cargo/<name>@<version>`
@@ -552,9 +553,18 @@ fn parse_git_config_value(raw: &str) -> String {
 /// * `https://github.com/owner/repo`     → `pkg:github/owner/repo`
 /// * Same shapes for `gitlab.com` (→ `pkg:gitlab`) and `bitbucket.org`
 ///   (→ `pkg:bitbucket`).
-/// * Anything else (self-hosted gitea, generic SSH, etc.) → the URL as an
-///   IRI ([`remote_iri`]: without credentials).
+/// * Anything else (self-hosted gitea, generic SSH, etc.) → the URL with
+///   its userinfo, query and fragment removed.
+///
+/// The identifier lands in a VEX document that is meant to be committed,
+/// so it must never carry credentials: a CI-style origin such as
+/// `https://gitlab-ci-token:<TOKEN>@gitlab.example.com/g/r.git` would
+/// otherwise publish the token. The query and fragment are dropped up
+/// front (they are not part of a repository's identity, and a token can
+/// ride there too), the userinfo on the fallback path
+/// ([`split_remote_host_path`] already skips it for the normalized hosts).
 fn remote_url_to_purl(url: &str) -> String {
+    let url = strip_url_query_fragment(url);
     if let Some((host, path)) = split_remote_host_path(url) {
         // Trim slashes BEFORE stripping `.git`: a URL like
         // `https://github.com/owner/repo.git/` carries a trailing
@@ -579,26 +589,40 @@ fn remote_url_to_purl(url: &str) -> String {
             }
         }
     }
-    remote_iri(url)
+    strip_url_userinfo(url)
 }
 
-/// The git remote `url` as a product `@id`. The VEX document is published
-/// to customers and auditors, so the credentials a CI clone embeds in its
-/// origin (`https://gitlab-ci-token:<job token>@…`, `https://<PAT>@…`, a
-/// `?private_token=` query) must not ride along. An ssh login name
-/// (`ssh://git@host/…`) is not a secret and stays; an ssh password does
-/// not.
-fn remote_iri(url: &str) -> String {
-    use crate::utils::redact::{strip_url_credentials, url_userinfo};
-    let stripped = strip_url_credentials(url).into_owned();
-    let is_ssh = url.starts_with("ssh://") || url.starts_with("git+ssh://");
-    let login = url_userinfo(url)
-        .filter(|_| is_ssh)
-        .and_then(|userinfo| userinfo.split(':').next())
-        .filter(|login| !login.is_empty());
-    match (login, stripped.split_once("://")) {
-        (Some(login), Some((scheme, rest))) => format!("{scheme}://{login}@{rest}"),
-        _ => stripped,
+/// Cut a URL at its first `?` or `#`. A trailing bare `?`/`#` goes too.
+fn strip_url_query_fragment(url: &str) -> &str {
+    match url.find(['?', '#']) {
+        Some(idx) => &url[..idx],
+        None => url,
+    }
+}
+
+/// Remove a `user[:password]@` prefix from a remote URL.
+///
+/// * `scheme://[userinfo@]host[:port]/path` — the userinfo is everything
+///   up to the LAST `@` of the authority (the part before the first `/`
+///   after `://`), since an unencoded `@` in a password still precedes
+///   the host's.
+/// * scp-style `[user@]host:path` (git treats a `:` before any `/` as
+///   this form) — everything up to the last `@` before the first `/`,
+///   but only when a `:` follows it; otherwise the `@` belongs to the
+///   path (`host:repo@v1`) or the string is not a remote URL at all.
+fn strip_url_userinfo(url: &str) -> String {
+    if let Some(scheme_end) = url.find("://") {
+        let (scheme, rest) = url.split_at(scheme_end + 3);
+        let authority_end = rest.find('/').unwrap_or(rest.len());
+        return match rest[..authority_end].rfind('@') {
+            Some(at) => format!("{scheme}{}", &rest[at + 1..]),
+            None => url.to_string(),
+        };
+    }
+    let prefix_end = url.find('/').unwrap_or(url.len());
+    match url[..prefix_end].rfind('@') {
+        Some(at) if url[at + 1..prefix_end].contains(':') => url[at + 1..].to_string(),
+        _ => url.to_string(),
     }
 }
 
@@ -833,51 +857,96 @@ mod tests {
         assert_eq!(remote_url_to_purl(raw), raw);
     }
 
-    /// B21: credentials in a CI origin never reach the published product
-    /// `@id`, whether the remote maps to a purl or falls back to the URL
-    /// (an unknown host, a GitLab subgroup).
+    /// A CI-style origin on a self-hosted forge carries a token in its
+    /// userinfo. The raw-URL fallback must drop it: the product `@id`
+    /// lands in a committed VEX document.
     #[test]
-    fn remote_url_credentials_never_reach_the_product_id() {
-        for (remote, want) in [
-            (
-                "https://gitlab-ci-token:glcbt-SECRET123@gitlab.corp.example/group/sub/app.git",
-                "https://gitlab.corp.example/group/sub/app.git",
-            ),
-            (
-                "https://bot:ghp_SECRET@gitlab.com/group/subgroup/app.git",
-                "https://gitlab.com/group/subgroup/app.git",
-            ),
-            (
-                "https://ghp_SECRET@git.example.com/team/repo.git?private_token=SECRET#main",
-                "https://git.example.com/team/repo.git#main",
-            ),
-            (
-                "ssh://deploy:SECRET@git.example.com/team/repo.git",
-                "ssh://deploy@git.example.com/team/repo.git",
-            ),
-            ("https://ghp_SECRET@github.com/o/r.git", "pkg:github/o/r"),
-            // A username-only https userinfo (Bitbucket Server, Azure
-            // DevOps clones) can be a token, so it is dropped too: such a
-            // remote's product @id changed when credentials were stripped.
-            (
-                "https://user@git.selfhosted.example/team/repo.git",
-                "https://git.selfhosted.example/team/repo.git",
-            ),
-        ] {
-            let id = remote_url_to_purl(remote);
-            assert_eq!(id, want, "{remote}");
-            assert!(!id.contains("SECRET"), "{id}");
-        }
-        for unchanged in [
-            "ssh://git@git.example.com/team/repo.git",
-            "git@git.example.com:team/repo.git",
-        ] {
-            assert_eq!(
-                remote_url_to_purl(unchanged),
-                unchanged,
-                "a login name is kept"
-            );
-        }
+    fn remote_url_unknown_host_strips_credentials() {
+        assert_eq!(
+            remote_url_to_purl("https://gitlab-ci-token:glcbt-SECRET@gitlab.example.com/g/r.git"),
+            "https://gitlab.example.com/g/r.git"
+        );
+        // Username only.
+        assert_eq!(
+            remote_url_to_purl("https://deploy@git.example.com/team/repo.git"),
+            "https://git.example.com/team/repo.git"
+        );
+        // An unencoded `@` inside the password: the LAST `@` of the
+        // authority ends the userinfo.
+        assert_eq!(
+            remote_url_to_purl("https://user:p@ss@git.example.com:8443/team/repo.git"),
+            "https://git.example.com:8443/team/repo.git"
+        );
+        // ssh:// with a port, and git+https.
+        assert_eq!(
+            remote_url_to_purl("ssh://git@git.example.com:2222/team/repo.git"),
+            "ssh://git.example.com:2222/team/repo.git"
+        );
+        assert_eq!(
+            remote_url_to_purl("git+https://oauth2:tok@git.example.com/team/repo"),
+            "git+https://git.example.com/team/repo"
+        );
+    }
+
+    /// The same token on a NORMALIZED host never reaches the output
+    /// either (the purl drops the authority entirely), even when an `@`
+    /// inside the password defeats `split_remote_host_path`'s
+    /// first-`@` split.
+    #[test]
+    fn remote_url_normalized_host_never_leaks_credentials() {
+        assert_eq!(
+            remote_url_to_purl("https://x-access-token:ghs_SECRET@github.com/o/r.git"),
+            "pkg:github/o/r"
+        );
+        let out = remote_url_to_purl("https://user:p@ss@github.com/o/r.git");
+        assert!(!out.contains("p@ss") && !out.contains("user"), "{out}");
+    }
+
+    /// scp-style remotes on unknown hosts lose their `user@` too; an `@`
+    /// that belongs to the path (no `:` after it) is left alone.
+    #[test]
+    fn remote_url_unknown_host_scp_style_userinfo() {
+        assert_eq!(
+            remote_url_to_purl("git@git.example.com:team/repo.git"),
+            "git.example.com:team/repo.git"
+        );
+        assert_eq!(
+            remote_url_to_purl("deploy@git.example.com:team/repo.git"),
+            "git.example.com:team/repo.git"
+        );
+        assert_eq!(remote_url_to_purl("host:repo@v1"), "host:repo@v1");
+        // An `@` after the first `/` is path, not userinfo.
+        assert_eq!(
+            remote_url_to_purl("https://git.example.com/team/repo@v2"),
+            "https://git.example.com/team/repo@v2"
+        );
+        assert_eq!(
+            remote_url_to_purl("/srv/git/repo@v2.git"),
+            "/srv/git/repo@v2.git"
+        );
+    }
+
+    /// Query strings and fragments are not part of a repository's
+    /// identity and can carry tokens: dropped on every path, including
+    /// the normalized hosts (where they used to leak into the purl name).
+    #[test]
+    fn remote_url_query_and_fragment_are_dropped() {
+        assert_eq!(
+            remote_url_to_purl("https://git.example.com/team/repo.git?private_token=SECRET#frag"),
+            "https://git.example.com/team/repo.git"
+        );
+        assert_eq!(
+            remote_url_to_purl("https://git.example.com/team/repo#readme"),
+            "https://git.example.com/team/repo"
+        );
+        assert_eq!(
+            remote_url_to_purl("https://github.com/o/r.git?token=SECRET"),
+            "pkg:github/o/r"
+        );
+        assert_eq!(
+            remote_url_to_purl("git@gitlab.com:foo/bar.git#main"),
+            "pkg:gitlab/foo/bar"
+        );
     }
 
     #[test]

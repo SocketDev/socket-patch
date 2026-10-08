@@ -168,9 +168,8 @@ fn run_in_pty_inner(
         .expect("spawn socket-patch in PTY");
     drop(pair.slave);
 
-    let reader_handle = crate::pty_io::PtyOutput::spawn(
-        pair.master.try_clone_reader().expect("clone reader"),
-    );
+    let reader_handle =
+        crate::pty_io::PtyOutput::spawn(pair.master.try_clone_reader().expect("clone reader"));
 
     // Watchdog: detached kill after `timeout`; a no-op if the child exits
     // naturally first.
@@ -261,7 +260,10 @@ fn remove_interactive_bare_enter_proceeds_with_default_yes() {
         "\n",
         Duration::from_secs(15),
     );
-    assert_eq!(code, 0, "remove with bare Enter must succeed; got: {output}");
+    assert_eq!(
+        code, 0,
+        "remove with bare Enter must succeed; got: {output}"
+    );
     // The interactive confirm MUST have run — otherwise this test passes
     // vacuously against a regression that drops the TTY gate and
     // auto-proceeds. Match the distinctive prompt verbatim (the loose

@@ -183,16 +183,7 @@ pub(crate) async fn verify_committed_artifact(
     // artifact) would let bytes from outside the vendored tree be "reused"
     // and then pinned into the lock. `checked_artifact_path` already
     // rejected `..`/empty segments, so each prefix is a real path level.
-    let mut prefix = project_root.to_path_buf();
-    for seg in rel_path.split('/') {
-        prefix.push(seg);
-        match tokio::fs::symlink_metadata(&prefix).await {
-            Ok(meta) if meta.file_type().is_symlink() => return Err(ReuseMiss::NotRegular),
-            Ok(_) => {}
-            Err(e) if e.kind() == std::io::ErrorKind::NotFound => return Err(ReuseMiss::Missing),
-            Err(_) => return Err(ReuseMiss::Unreadable),
-        }
-    }
+    ensure_unlinked_level(project_root, &rel_path)?;
 
     // One FIFO-safe open (O_NONBLOCK + fstat on the handle): the size gate
     // and every byte below come from the same inode.
@@ -329,20 +320,30 @@ pub(crate) async fn reusable_committed_dir(
     {
         return Err(ReuseMiss::Ambiguous);
     }
-    let mut prefix = project_root.to_path_buf();
-    for seg in rel_dir.split('/') {
-        prefix.push(seg);
-        match tokio::fs::symlink_metadata(&prefix).await {
-            Ok(meta) if meta.file_type().is_symlink() => return Err(ReuseMiss::NotRegular),
-            Ok(_) => {}
-            Err(e) if e.kind() == std::io::ErrorKind::NotFound => return Err(ReuseMiss::Missing),
-            Err(_) => return Err(ReuseMiss::Unreadable),
-        }
-    }
+    ensure_unlinked_level(project_root, rel_dir)?;
     super::verify::verify_vendored_patch_record(project_root, &entry, record)
         .await
         .map_err(ReuseMiss::MemberMismatch)?;
     Ok(entry.artifact.file_inventory.unwrap_or_default())
+}
+
+/// Refuse `project_root/rel` when any level of it below the project root
+/// is a link ([`crate::utils::containment::try_linked_level`]): a symlinked
+/// uuid dir (or artifact) would let bytes from outside the vendored tree be
+/// "reused" and then pinned into the lock. A level that is missing is
+/// [`ReuseMiss::Missing`], one that cannot be probed [`ReuseMiss::Unreadable`].
+fn ensure_unlinked_level(project_root: &Path, rel: &str) -> Result<(), ReuseMiss> {
+    let path = project_root.join(rel);
+    match crate::utils::containment::try_linked_level(project_root, &path) {
+        Ok(Some(_)) => return Err(ReuseMiss::NotRegular),
+        Ok(None) => {}
+        Err(_) => return Err(ReuseMiss::Unreadable),
+    }
+    match std::fs::symlink_metadata(&path) {
+        Ok(_) => Ok(()),
+        Err(e) if e.kind() == std::io::ErrorKind::NotFound => Err(ReuseMiss::Missing),
+        Err(_) => Err(ReuseMiss::Unreadable),
+    }
 }
 
 #[cfg(test)]
