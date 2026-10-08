@@ -5,7 +5,9 @@
 //! a `pnpm-lock.yaml` only routes to the pnpm backend when its
 //! `lockfileVersion` is one we have fixtures for, and a `yarn.lock` routes
 //! to classic or berry by its header (the v1 comment vs a top-level
-//! `__metadata:` key). Only PnP projects (`.pnp.*` loaders) are refused
+//! `__metadata:` key). Only PnP projects (a `.pnp.*` loader the configured
+//! yarn `nodeLinker` still uses; forward vendoring also refuses a berry
+//! project configured for PnP before its loader exists) are refused
 //! outright: yarn-berry PnP because its packages never land on disk to
 //! stage, and pnpm's own `node-linker=pnp` mode (same loader file, real
 //! package dirs) because the file: rewiring is unvalidated under that
@@ -163,31 +165,36 @@ pub(crate) async fn detect_npm_lock_flavor(
     //    wrong twice over. Vendor still refuses (the file: rewiring has no
     //    fixtures under pnpm's PnP linker — fail closed), but with a pnpm
     //    diagnosis and remedy.
-    for marker in PNP_MARKERS {
-        if exists(marker).await {
-            if crate::crawlers::pkg_managers::pnpm_pnp_layout(project_root) {
-                return Err((
-                    "vendor_pnpm_pnp_unsupported",
-                    format!(
-                        "found `{marker}` alongside pnpm-lock.yaml and an installed pnpm \
-                         store: this is a pnpm project using `node-linker=pnp` (.npmrc), \
-                         not yarn berry — vendor's relative file: rewiring is not \
-                         validated under pnpm's Plug'n'Play linker; use `socket-patch \
-                         scan --mode hosted` (which edits pnpm-lock.yaml in place), or \
-                         switch .npmrc to `node-linker=isolated`, run `pnpm install`, \
-                         and re-run vendor"
-                    ),
-                ));
-            }
+    //    The pnpm carve-out is decided on any loader: yarn's `nodeLinker`
+    //    says nothing about pnpm's own. A yarn loader the configured
+    //    `nodeLinker` disowns is stale (#975) and skipped, so the yarn berry
+    //    sniff below decides.
+    let present = |m: &str| std::fs::metadata(project_root.join(m)).is_ok();
+    if let Some(marker) = PNP_MARKERS.into_iter().find(|m| present(m)) {
+        if crate::crawlers::pkg_managers::pnpm_pnp_layout(project_root) {
             return Err((
-                "vendor_yarn_berry_unsupported",
+                "vendor_pnpm_pnp_unsupported",
                 format!(
-                    "found `{marker}`: this is a yarn berry Plug'n'Play project — packages \
-                     live inside .yarn/cache/ zips, not node_modules/, so there is nothing \
-                     vendor could stage or rewire; use `yarn patch <pkg>` instead"
+                    "found `{marker}` alongside pnpm-lock.yaml and an installed pnpm \
+                     store: this is a pnpm project using `node-linker=pnp` (.npmrc), \
+                     not yarn berry — vendor's relative file: rewiring is not \
+                     validated under pnpm's Plug'n'Play linker; use `socket-patch \
+                     scan --mode hosted` (which edits pnpm-lock.yaml in place), or \
+                     switch .npmrc to `node-linker=isolated`, run `pnpm install`, \
+                     and re-run vendor"
                 ),
             ));
         }
+    }
+    if let Some(marker) = crate::crawlers::pkg_managers::live_pnp_marker(project_root, present) {
+        return Err((
+            "vendor_yarn_berry_unsupported",
+            format!(
+                "found `{marker}`: this is a yarn berry Plug'n'Play project — packages \
+                 live inside .yarn/cache/ zips, not node_modules/, so there is nothing \
+                 vendor could stage or rewire; use `yarn patch <pkg>` instead"
+            ),
+        ));
     }
 
     let detected = 'flavor: {
@@ -334,6 +341,54 @@ async fn sniff_yarn_lock(project_root: &Path) -> Result<NpmLockFlavor, (&'static
     ))
 }
 
+/// [`detect_npm_lock_flavor`] for a forward vendoring run: also refuses a
+/// yarn berry project whose configured `nodeLinker` is Plug'n'Play (`pnp`,
+/// or unset: berry's default) before its loader file exists (#539). A
+/// lock-only checkout of a PnP project is then refused up front, exactly
+/// as it is once `yarn install` writes `.pnp.cjs`, instead of being wired
+/// once and refused on every re-run. Read-only consumers (`vendor
+/// --check`, `--revert`, VEX, the lock inventory) keep the plain probe.
+pub(crate) async fn detect_vendorable_npm_flavor(
+    project_root: &Path,
+) -> Result<(NpmLockFlavor, Vec<VendorWarning>), (&'static str, String)> {
+    detect_vendorable_npm_flavor_with(project_root, || {
+        crate::crawlers::pkg_managers::yarn_node_linker(project_root)
+    })
+    .await
+}
+
+/// [`detect_vendorable_npm_flavor`] with the configured `nodeLinker`
+/// supplied by `linker`.
+async fn detect_vendorable_npm_flavor_with(
+    project_root: &Path,
+    linker: impl FnOnce() -> Option<String>,
+) -> Result<(NpmLockFlavor, Vec<VendorWarning>), (&'static str, String)> {
+    let found = detect_npm_lock_flavor(project_root).await?;
+    if found.0 != NpmLockFlavor::YarnBerry {
+        return Ok(found);
+    }
+    let linker = linker();
+    if !crate::crawlers::pkg_managers::yarn_linker_is_pnp(linker.as_deref()) {
+        return Ok(found);
+    }
+    let why = match linker {
+        Some(_) => "the configured yarn linker is `nodeLinker: pnp`",
+        None => {
+            "no yarn rc file (the project's, its parents' or the home folder's) \
+             sets `nodeLinker`, so yarn berry uses its default `pnp` linker"
+        }
+    };
+    Err((
+        "vendor_yarn_berry_unsupported",
+        format!(
+            "{why}: this is a yarn berry Plug'n'Play project — packages live inside \
+             .yarn/cache/ zips, not node_modules/, so vendor does not wire it; set \
+             `nodeLinker: node-modules` in .yarnrc.yml and run `yarn install`, or use \
+             `yarn patch <pkg>` instead"
+        ),
+    ))
+}
+
 /// Vendor one npm package through whichever lockfile-flavor backend serves
 /// this project (package-lock / yarn classic / yarn berry node-modules /
 /// pnpm / pnpm legacy / bun / vlt). Probe refusals (PnP, unsupported lock
@@ -352,7 +407,7 @@ pub async fn vendor_npm_any<'a>(
     service: Option<&super::VendorServiceConfig>,
 ) -> VendorOutcome {
     let installed_dir = installed_dir.into();
-    let (flavor, probe_warnings) = match detect_npm_lock_flavor(project_root).await {
+    let (flavor, probe_warnings) = match detect_vendorable_npm_flavor(project_root).await {
         Ok(found) => found,
         Err((code, detail)) => return VendorOutcome::Refused { code, detail },
     };
@@ -478,9 +533,10 @@ pub async fn vlt_routes(project_root: &Path) -> Option<Result<(), (&'static str,
         Ok((NpmLockFlavor::Vlt, _)) => Some(Ok(())),
         Ok(_) => None,
         Err(refusal) => {
-            let pnp = PNP_MARKERS
-                .iter()
-                .any(|m| std::fs::symlink_metadata(project_root.join(m)).is_ok());
+            let pnp = crate::crawlers::pkg_managers::live_pnp_marker(project_root, |m| {
+                std::fs::symlink_metadata(project_root.join(m)).is_ok()
+            })
+            .is_some();
             let vlt = tokio::fs::metadata(project_root.join(VLT_LOCK))
                 .await
                 .is_ok();
@@ -493,7 +549,7 @@ pub async fn preflight_packages(
     project_root: &Path,
     packages: &[(&str, &PatchRecord)],
 ) -> Vec<Result<(), &'static str>> {
-    let flavor = match detect_npm_lock_flavor(project_root).await {
+    let flavor = match detect_vendorable_npm_flavor(project_root).await {
         Ok((flavor, _probe_warnings)) => flavor,
         Err((code, _detail)) => return vec![Err(code); packages.len()],
     };
@@ -532,7 +588,7 @@ pub async fn lock_text_refusals(
     project_root: &Path,
     packages: &[(&str, &PatchRecord)],
 ) -> Vec<Option<(&'static str, String)>> {
-    let flavor = match detect_npm_lock_flavor(project_root).await {
+    let flavor = match detect_vendorable_npm_flavor(project_root).await {
         Ok((flavor, _)) => flavor,
         Err(_) => return vec![None; packages.len()],
     };
@@ -1021,6 +1077,94 @@ mod tests {
         }
     }
 
+    /// #975: a Yarn 2 loader left behind by a switch to the node-modules
+    /// or pnpm linker is ignored; the berry lock decides.
+    #[tokio::test]
+    async fn stale_pnp_loader_under_non_pnp_linker_is_not_refused() {
+        for linker in ["node-modules", "pnpm"] {
+            let tmp = tempfile::tempdir().unwrap();
+            touch(tmp.path(), ".pnp.js", "/* stale */").await;
+            touch(
+                tmp.path(),
+                ".yarnrc.yml",
+                &format!("nodeLinker: {linker}\n"),
+            )
+            .await;
+            touch(tmp.path(), "yarn.lock", YARN_BERRY).await;
+            let (flavor, _) = detect_npm_lock_flavor(tmp.path()).await.unwrap();
+            assert_eq!(flavor, NpmLockFlavor::YarnBerry, "{linker}");
+            let (flavor, _) = detect_vendorable_npm_flavor(tmp.path()).await.unwrap();
+            assert_eq!(flavor, NpmLockFlavor::YarnBerry, "{linker}");
+        }
+    }
+
+    /// #539: forward vendoring refuses a berry project configured for PnP
+    /// (explicitly, or by berry's default) before its loader exists, while
+    /// the read-only probe still reports the berry flavor.
+    #[tokio::test]
+    async fn vendorable_probe_refuses_berry_configured_for_pnp() {
+        for (rc, why) in [
+            (Some("nodeLinker: pnp\n"), "`nodeLinker: pnp`"),
+            (Some("enableGlobalCache: false\n"), "default `pnp` linker"),
+            (None, "default `pnp` linker"),
+        ] {
+            let tmp = tempfile::tempdir().unwrap();
+            touch(tmp.path(), "yarn.lock", YARN_BERRY).await;
+            if let Some(rc) = rc {
+                touch(tmp.path(), ".yarnrc.yml", rc).await;
+            }
+            let (flavor, _) = detect_npm_lock_flavor(tmp.path()).await.unwrap();
+            assert_eq!(flavor, NpmLockFlavor::YarnBerry);
+            let (code, detail) = detect_vendorable_npm_flavor(tmp.path()).await.unwrap_err();
+            assert_eq!(code, "vendor_yarn_berry_unsupported", "{rc:?}");
+            assert!(detail.contains(why), "{rc:?}: {detail}");
+            assert!(detail.contains("nodeLinker: node-modules"), "{detail}");
+        }
+        // Classic locks have no linker setting and are never PnP.
+        let tmp = tempfile::tempdir().unwrap();
+        touch(tmp.path(), "yarn.lock", YARN_V1).await;
+        let (flavor, _) = detect_vendorable_npm_flavor(tmp.path()).await.unwrap();
+        assert_eq!(flavor, NpmLockFlavor::YarnClassic);
+    }
+
+    /// The up-front PnP refusal follows every rc file yarn reads: a
+    /// `nodeLinker: node-modules` in the home folder's rc file, or in the
+    /// file `YARN_RC_FILENAME` names, is a node-modules project, which
+    /// vendor wires (#539 follow-up: these were refused as PnP).
+    #[tokio::test]
+    async fn vendorable_probe_follows_home_rc_and_rc_filename() {
+        use crate::crawlers::pkg_managers::{yarn_node_linker_in, YarnEnv};
+        let home = tempfile::tempdir().unwrap();
+        touch(home.path(), ".yarnrc.yml", "nodeLinker: node-modules\n").await;
+        let tmp = tempfile::tempdir().unwrap();
+        touch(tmp.path(), "yarn.lock", YARN_BERRY).await;
+        touch(tmp.path(), ".yarnrc.yml", "enableGlobalCache: false\n").await;
+        let env = YarnEnv {
+            node_linker: None,
+            rc_filename: ".yarnrc.yml".into(),
+            home: Some(home.path().to_path_buf()),
+        };
+        let (flavor, _) =
+            detect_vendorable_npm_flavor_with(tmp.path(), || yarn_node_linker_in(tmp.path(), &env))
+                .await
+                .unwrap();
+        assert_eq!(flavor, NpmLockFlavor::YarnBerry, "home rc");
+
+        let tmp = tempfile::tempdir().unwrap();
+        touch(tmp.path(), "yarn.lock", YARN_BERRY).await;
+        touch(tmp.path(), ".yarnrc.ci.yml", "nodeLinker: node-modules\n").await;
+        let env = YarnEnv {
+            node_linker: None,
+            rc_filename: ".yarnrc.ci.yml".into(),
+            home: None,
+        };
+        let (flavor, _) =
+            detect_vendorable_npm_flavor_with(tmp.path(), || yarn_node_linker_in(tmp.path(), &env))
+                .await
+                .unwrap();
+        assert_eq!(flavor, NpmLockFlavor::YarnBerry, "YARN_RC_FILENAME");
+    }
+
     /// Stage the root markers a real `pnpm install` with
     /// `node-linker=pnp` emits (layout verified against pnpm 10.28.2):
     /// the `.pnp.cjs` loader, pnpm-lock.yaml, and an installed virtual
@@ -1049,6 +1193,18 @@ mod tests {
         assert!(detail.contains("node-linker=pnp"), "{detail}");
         assert!(detail.contains("scan --mode hosted"), "{detail}");
         assert!(!detail.contains("yarn patch"), "{detail}");
+    }
+
+    /// pnpm's PnP loader is pnpm's, not yarn's: a yarn `nodeLinker` that
+    /// disowns yarn loaders (an ancestor `.yarnrc.yml`, `YARN_NODE_LINKER`)
+    /// must not let a pnpm `node-linker=pnp` tree past its own refusal.
+    #[tokio::test]
+    async fn pnpm_pnp_layout_refuses_under_a_non_pnp_yarn_linker() {
+        let tmp = tempfile::tempdir().unwrap();
+        stage_pnpm_pnp_layout(tmp.path()).await;
+        touch(tmp.path(), ".yarnrc.yml", "nodeLinker: node-modules\n").await;
+        let (code, _) = detect_npm_lock_flavor(tmp.path()).await.unwrap_err();
+        assert_eq!(code, "vendor_pnpm_pnp_unsupported");
     }
 
     /// The pnpm-PnP carve-out stays fail-closed: a yarn.lock alongside

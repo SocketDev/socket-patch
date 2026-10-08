@@ -256,7 +256,11 @@ mod equivalence_tests {
                     let mut again = files.clone();
                     again.extend(got.files.clone());
                     let got = run(rewrite_poetry, &again, &deps);
-                    g.case(format!("{what}/re-run"), &(&again, &deps), &format!("{got:?}"));
+                    g.case(
+                        format!("{what}/re-run"),
+                        &(&again, &deps),
+                        &format!("{got:?}"),
+                    );
                 }
             }
         }
