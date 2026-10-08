@@ -44,7 +44,10 @@ pub struct Candidate {
     /// Repo-relative project root; `""` is the repo root.
     pub project: String,
     pub purl: String,
-    /// [`canonical_base_purl`] of `purl`: the budget unit.
+    /// [`crate::utils::purl_key::PurlKey`] of `purl`: the budget unit, so qualifier twins (a wheel
+    /// and its sdist, gem platforms), the API's encoded spelling and a
+    /// lockfile's `Newtonsoft.Json` vs a pin's `newtonsoft.json` are one
+    /// package.
     pub base_purl: String,
     /// The selected uuid.
     pub uuid: String,
@@ -132,20 +135,6 @@ pub fn resolve_max_new(
         },
         _ => chosen,
     }
-}
-
-/// The budget unit: ecosystem + name + version, qualifiers stripped,
-/// percent-decoded and case-folded where the ecosystem is case-insensitive
-/// (discovery's [`crate::vex::discover::canonical_base_purl`], the key
-/// hosted pins carry), so qualifier twins (a wheel and its sdist, gem
-/// platforms), the API's encoded spelling and a lockfile's `Newtonsoft.Json`
-/// vs a pin's `newtonsoft.json` are one package.
-pub fn canonical_base_purl(purl: &str) -> String {
-    crate::utils::composer_version::composer_purl_identity(purl)
-        // Invalid-version identity keys contain an internal sentinel, which
-        // must not appear in the deferred purls reported to callers.
-        .filter(|key| !key.contains('\u{1}'))
-        .unwrap_or_else(|| crate::vex::discover::canonical_base_purl(purl))
 }
 
 /// Rollout order, most urgent first: in-flight, severity, advisory count
@@ -296,12 +285,13 @@ pub fn severity_label(order: u8) -> &'static str {
 #[cfg(test)]
 mod tests {
     use super::*;
+    use crate::utils::purl_key::PurlKey;
 
     fn row(project: &str, purl: &str, uuid: &str, severity: u8, advisories: usize) -> Candidate {
         Candidate {
             project: project.to_string(),
             purl: purl.to_string(),
-            base_purl: canonical_base_purl(purl),
+            base_purl: PurlKey::new(purl).into_string(),
             uuid: uuid.to_string(),
             ecosystem: purl
                 .strip_prefix("pkg:")
@@ -583,38 +573,35 @@ mod tests {
         assert_eq!(next.admitted.len(), 1);
         assert!(next.deferred.is_empty());
         assert_eq!(
-            crate::policy::canon("pkg:composer/psr/log@3.0.2.0"),
-            crate::policy::canon("pkg:composer/psr/log@v3.0.2")
+            PurlKey::new("pkg:composer/psr/log@3.0.2.0").into_string(),
+            PurlKey::new("pkg:composer/psr/log@v3.0.2").into_string()
         );
-        for key in [
-            canonical_base_purl("pkg:composer/psr/log@not-a-version"),
-            crate::policy::canon("pkg:composer/psr/log@not-a-version"),
-        ] {
-            assert!(!key.contains('\u{1}'));
-        }
+        assert!(!PurlKey::new("pkg:composer/psr/log@not-a-version")
+            .as_str()
+            .contains('\u{1}'));
         assert_ne!(
-            canonical_base_purl("pkg:composer/psr/log@dev-Feature"),
-            canonical_base_purl("pkg:composer/psr/log@dev-feature")
+            PurlKey::new("pkg:composer/psr/log@dev-Feature").into_string(),
+            PurlKey::new("pkg:composer/psr/log@dev-feature").into_string()
         );
     }
 
     #[test]
     fn qualifier_twins_share_a_base_purl_and_a_rank() {
         assert_eq!(
-            canonical_base_purl("pkg:pypi/foo@1.0?artifact_id=abc"),
-            canonical_base_purl("pkg:pypi/foo@1.0?artifact_id=def")
+            PurlKey::new("pkg:pypi/foo@1.0?artifact_id=abc").into_string(),
+            PurlKey::new("pkg:pypi/foo@1.0?artifact_id=def").into_string()
         );
         assert_eq!(
-            canonical_base_purl("pkg:npm/%40scope/x@1.0.0"),
+            PurlKey::new("pkg:npm/%40scope/x@1.0.0").into_string(),
             "pkg:npm/@scope/x@1.0.0"
         );
         assert_eq!(
-            canonical_base_purl("pkg:nuget/Newtonsoft.Json@13.0.3"),
-            canonical_base_purl("pkg:nuget/newtonsoft.json@13.0.3")
+            PurlKey::new("pkg:nuget/Newtonsoft.Json@13.0.3").into_string(),
+            PurlKey::new("pkg:nuget/newtonsoft.json@13.0.3").into_string()
         );
         assert_eq!(
-            canonical_base_purl("pkg:pypi/Foo_Bar@1.0"),
-            canonical_base_purl("pkg:pypi/foo-bar@1.0")
+            PurlKey::new("pkg:pypi/Foo_Bar@1.0").into_string(),
+            PurlKey::new("pkg:pypi/foo-bar@1.0").into_string()
         );
         let rows = vec![
             row("", "pkg:pypi/foo@1.0?artifact_id=whl", "u2", 1, 1),

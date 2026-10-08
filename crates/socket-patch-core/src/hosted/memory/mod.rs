@@ -71,9 +71,8 @@ pub use select::{candidate_files, safe_repo_path, select_paths};
 pub use types::*;
 
 use crate::policy::{
-    canon, patch_severity_order, policy_block, FilterReason, FilteredEntry, MemoryPolicyFs,
-    PolicyError, PolicySource, Root, RootFile, SelectionPolicy, PATCHES_DISABLED,
-    POLICY_FILE_NAMES,
+    patch_severity_order, policy_block, FilterReason, FilteredEntry, MemoryPolicyFs, PolicyError,
+    PolicySource, Root, RootFile, SelectionPolicy, PATCHES_DISABLED, POLICY_FILE_NAMES,
 };
 use crate::rollout::stage::{
     classify, lookup_incomplete, mentioned_uuids, offers_from_results, Offers, RecordedIndex, Row,
@@ -81,6 +80,7 @@ use crate::rollout::stage::{
 };
 use discover::Provider;
 use stages::{Planned, RewriteRefused, Rewritten, StageOptions};
+use crate::utils::purl_key::PurlKey;
 
 /// `"<crate version>+<git sha or 'unknown'>"`; the sha comes from the
 /// `SOCKET_PATCH_GIT_SHA` build-time variable.
@@ -831,7 +831,7 @@ async fn engine(
             match policy.admits_purl(&purl) {
                 Ok(()) => admitted.push(purl),
                 Err(reason) => policy_filtered.push(FilteredEntry {
-                    purl: Some(canon(&purl)),
+                    purl: Some(PurlKey::new(&purl).into_string()),
                     uuid: None,
                     project: state.root.clone(),
                     reason,
@@ -1393,7 +1393,7 @@ fn select_with_policy(
             detail: Some(reason.detail()),
         });
         filtered.push(FilteredEntry {
-            purl: Some(canon(&purl)),
+            purl: Some(PurlKey::new(&purl).into_string()),
             uuid: Some(winner.uuid.clone()),
             project: root.to_string(),
             severity: Some(patch_severity_order(&winner)),

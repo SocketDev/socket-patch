@@ -20,6 +20,7 @@ pub mod pnpm_workspace;
 pub mod poetry_lock;
 pub mod process;
 pub mod purl;
+pub mod purl_key;
 pub mod python_lock;
 pub mod python_script;
 pub(crate) mod relpath;

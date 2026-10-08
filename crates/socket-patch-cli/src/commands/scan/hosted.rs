@@ -1612,16 +1612,17 @@ fn stranded_takeovers(
     confirmed: &[(String, String)],
     dry_run: bool,
 ) -> Vec<String> {
-    use socket_patch_core::utils::purl::{canonical_purl, strip_purl_qualifiers};
+    use socket_patch_core::utils::purl_key::PurlKey;
     if dry_run {
         return Vec::new();
     }
-    let key = |purl: &str| canonical_purl(strip_purl_qualifiers(purl));
-    let pinned: std::collections::HashSet<String> =
-        confirmed.iter().map(|(purl, _)| key(purl)).collect();
+    let pinned: std::collections::HashSet<PurlKey> = confirmed
+        .iter()
+        .map(|(purl, _)| PurlKey::new(purl))
+        .collect();
     migrated
         .iter()
-        .filter(|purl| !pinned.contains(&key(purl)))
+        .filter(|purl| !pinned.contains(&PurlKey::new(purl)))
         .cloned()
         .collect()
 }
@@ -1687,7 +1688,8 @@ async fn vendored_takeover(
         // No takeover-capable candidates — nothing to reconcile.
         return Ok(out);
     }
-    use socket_patch_core::utils::purl::{canonical_purl as canon, strip_purl_qualifiers};
+    use socket_patch_core::utils::purl::strip_purl_qualifiers;
+    use socket_patch_core::utils::purl_key::PurlKey;
     // Each takeover-capable candidate with its vendored ledger entry, if
     // any (cloned out so the loop can mutate the state).
     let takeover: Vec<(&Candidate, Option<socket_patch_core::vendor::VendorEntry>)> = candidates
@@ -2109,7 +2111,7 @@ async fn vendored_takeover(
                 .expect("a vendored ledger entry was looked up in this state, so it loaded");
             state
                 .entries
-                .retain(|k, e| canon(k) != canon(purl) && canon(&e.base_purl) != canon(purl));
+                .retain(|k, e| !PurlKey::same(k, purl) && !PurlKey::same(&e.base_purl, purl));
             if let Err(e) = socket_patch_core::vendor::save_state(&common.cwd, state).await {
                 // The wiring is reverted but the ledger still claims it;
                 // redirecting now would leave a ledger asserting wiring

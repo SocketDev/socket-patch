@@ -85,7 +85,7 @@ pub(crate) async fn restore(
             );
             continue;
         };
-        if crate::vex::discover::canonical_base_purl(&pin.purl) != row.purl() {
+        if !crate::utils::purl_key::PurlKey::same(&pin.purl, &row.purl()) {
             result.refuse(
                 &pin.uuid,
                 format!(
