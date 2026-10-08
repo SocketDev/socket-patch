@@ -91,7 +91,7 @@ pub fn vendor_dir_symlink(project_root: &Path, eco: &str, uuid: Option<&str>) ->
     // maven-family entry may own files in the JVM repository trees
     // (`.socket/vendor/maven2`, `.socket/vendor/gradle`) as well as a
     // `maven/<uuid>` unit.
-    let eco = if eco == "jvm" { "maven" } else { eco };
+    let eco = super::jvm::layout::ledger_ecosystem(eco);
     let mut deepest = VENDOR_DIR.to_string();
     let mut trees: Vec<String> = Vec::new();
     if ECOSYSTEM_DIRS.contains(&eco) {
@@ -100,7 +100,7 @@ pub fn vendor_dir_symlink(project_root: &Path, eco: &str, uuid: Option<&str>) ->
             .unwrap_or_else(|| format!("{VENDOR_DIR}/{eco}"));
         if eco == "maven" {
             trees.extend(
-                super::jvm::apply::VENDOR_TREES
+                super::jvm::layout::VENDOR_TREES
                     .iter()
                     .map(|t| t.to_string()),
             );
@@ -383,7 +383,7 @@ pub(crate) fn leaf_to_purl(eco: &str, leaf: &str) -> Option<String> {
             if file_stem != format!("{artifact}-{version}") {
                 return None;
             }
-            if !is_safe_multi_segment(&group.replace('.', "/"))
+            if !is_safe_multi_segment(&super::jvm::layout::group_path(&group))
                 || !is_safe_single_segment(artifact)
                 || !is_safe_single_segment(version)
             {

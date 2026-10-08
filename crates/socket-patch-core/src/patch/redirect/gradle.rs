@@ -67,6 +67,7 @@ use crate::gradle::locks;
 use crate::gradle::selector::{admits, gradle_version_cmp, parse_selector, Selector};
 use crate::patch::path_safety::is_canonical_uuid;
 use crate::vendor::jvm::gradle as vendored;
+use crate::vendor::jvm::layout::GRADLE_ROOT_FILES;
 
 /// The owned hosted settings script. Its bytes change only with a CLI
 /// release.
@@ -91,14 +92,6 @@ const REPO_NAME_PREFIX: &str = "socketPatchHosted";
 const VENDORED_INDEX_REL: &str = vendored::INDEX_REL;
 const VERIFICATION_REL: &str = vendored::VERIFICATION_REL;
 const WRAPPER_PROPERTIES_REL: &str = "gradle/wrapper/gradle-wrapper.properties";
-
-/// Root-level files whose presence makes the checkout a Gradle build.
-pub const GRADLE_ROOT_FILES: &[&str] = &[
-    "settings.gradle",
-    "settings.gradle.kts",
-    "build.gradle",
-    "build.gradle.kts",
-];
 
 /// Whether `rel` is a settings-classpath lock (`settings-gradle.lockfile`
 /// of any build). Gradle resolves that classpath before any settings
@@ -181,7 +174,7 @@ impl HostedRow {
     /// whitespace and two lowercase sha256s.
     pub fn valid(&self) -> bool {
         let hex64 = |s: &str| crate::utils::digest::is_hex64_lower(s);
-        vendored::safe_coordinates(&self.group, &self.artifact, &self.base)
+        crate::vendor::jvm::layout::safe_coordinates(&self.group, &self.artifact, &self.base)
             && self.base.chars().any(|c| c != '.')
             && is_canonical_uuid(&self.uuid)
             && self.uuid == self.uuid.to_ascii_lowercase()

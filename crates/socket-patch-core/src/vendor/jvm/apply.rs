@@ -29,10 +29,10 @@ use crate::utils::purl::parse_maven_purl;
 use super::super::state::{VendorEntry, WiringAction, WiringRecord};
 use super::super::{RevertOpts, RevertOutcome, VendorWarning};
 use super::{
-    coursier_tree, gradle, maven_reactor, op_of, op_str, safe_coordinates, sbt, scala_cli,
-    sha256_hex, Coords, JvmPlan, JvmUnplan, Shape, CONFIG_LINE_KIND, COURSIER_INDEX_KIND,
-    CREATED_DIR_KIND, DERIVED_METADATA_KIND, KINDS, OWNED_FILE_KIND, POM_FRAGMENT_KIND,
-    SBT_FRAGMENT_KIND, SETTINGS_FRAGMENT_KIND, TREE_KIND, VERIFICATION_FRAGMENT_KIND,
+    coursier_tree, gradle, layout, maven_reactor, op_of, op_str, sbt, scala_cli, sha256_hex,
+    Coords, JvmPlan, JvmUnplan, Shape, CONFIG_LINE_KIND, COURSIER_INDEX_KIND, CREATED_DIR_KIND,
+    DERIVED_METADATA_KIND, KINDS, OWNED_FILE_KIND, POM_FRAGMENT_KIND, SBT_FRAGMENT_KIND,
+    SETTINGS_FRAGMENT_KIND, TREE_KIND, VERIFICATION_FRAGMENT_KIND,
 };
 
 /// Whether `entry` was written by this backend: it has wiring and every
@@ -62,7 +62,7 @@ pub fn entry_gav(entry: &VendorEntry) -> Result<(String, String, String), String
     }
     let (g, a, v) = parse_maven_purl(&entry.base_purl)
         .ok_or_else(|| format!("not a maven purl: {:?}", entry.base_purl))?;
-    if !safe_coordinates(&g, &a, &v) {
+    if !layout::safe_coordinates(&g, &a, &v) {
         return Err(format!("unsafe maven coordinates in {:?}", entry.base_purl));
     }
     Ok((g.into_owned(), a.into_owned(), v.into_owned()))
@@ -80,13 +80,6 @@ fn safe_rel(rel: &str) -> bool {
             .all(|s| !s.is_empty() && s != "." && s != ".." && !s.eq_ignore_ascii_case(".git"))
 }
 
-fn is_settings_file(rel: &str) -> bool {
-    matches!(
-        rel.rsplit('/').next(),
-        Some("settings.gradle" | "settings.gradle.kts")
-    )
-}
-
 /// A text file some planner edits or owns.
 fn is_wiring_file(rel: &str) -> bool {
     let under_owned = rel.starts_with(".socket/") || rel.starts_with(".mvn/");
@@ -95,7 +88,7 @@ fn is_wiring_file(rel: &str) -> bool {
         || gradle::is_derived_metadata_path(rel)
         || sbt::is_wiring_file(rel)
         || scala_cli::is_wiring_file(rel)
-        || (!under_owned && (rel.ends_with(".xml") || is_settings_file(rel)))
+        || (!under_owned && (rel.ends_with(".xml") || layout::is_gradle_settings(rel)))
 }
 
 fn is_owned_file(rel: &str) -> bool {
@@ -141,7 +134,9 @@ fn record_allowed(w: &WiringRecord, c: &Coords<'_>) -> bool {
                 rel.ends_with(".xml") && !rel.starts_with(".socket/") && !rel.starts_with(".mvn/")
             }
             CONFIG_LINE_KIND => rel == maven_reactor::MAVEN_CONFIG,
-            SETTINGS_FRAGMENT_KIND => is_settings_file(rel) && !rel.starts_with(".socket/"),
+            SETTINGS_FRAGMENT_KIND => {
+                layout::is_gradle_settings(rel) && !rel.starts_with(".socket/")
+            }
             VERIFICATION_FRAGMENT_KIND => rel == gradle::VERIFICATION_REL,
             OWNED_FILE_KIND => is_owned_file(rel),
             DERIVED_METADATA_KIND => rel == gradle::derived_metadata_rel(c.group_id, c.artifact_id),
@@ -294,12 +289,12 @@ fn is_vendored_tree_file(reader: &ProjectReader, rel: &str, existing: &[u8]) -> 
         return false;
     };
     let parse = |bytes: &[u8]| serde_json::from_slice::<Value>(bytes).ok();
-    if name == maven_reactor::MARKER_FILE {
+    if name == layout::MARKER_FILE {
         return parse(existing)
             .is_some_and(|m| m.get("uuid").is_some() && m.get("schema").is_some());
     }
     reader
-        .read(&format!("{dir}/{}", maven_reactor::MARKER_FILE))
+        .read(&format!("{dir}/{}", layout::MARKER_FILE))
         .and_then(|m| parse(&m))
         .and_then(|m| {
             m.get("files")?
@@ -322,7 +317,7 @@ pub async fn write_plan(root: &Path, plan: &JvmPlan) -> Result<Vec<WiringRecord>
     let mut targets = Vec::new();
     for w in &plan.writes {
         let allowed = if w.tree {
-            VENDOR_TREES
+            layout::VENDOR_TREES
                 .iter()
                 .any(|tree| w.rel.strip_prefix(tree).is_some_and(|r| r.starts_with('/')))
         } else {
@@ -505,8 +500,7 @@ fn sides(wiring: &[WiringRecord]) -> (bool, bool) {
     let gradle = is_gradle(wiring);
     let maven = wiring.iter().any(|w| {
         matches!(w.kind.as_str(), POM_FRAGMENT_KIND | CONFIG_LINE_KIND)
-            || w.file
-                .starts_with(&format!("{}/", maven_reactor::TREE_ROOT))
+            || w.file.starts_with(&format!("{}/", layout::MAVEN2_TREE))
     });
     (maven || !gradle, gradle)
 }
@@ -548,7 +542,7 @@ fn is_gradle(wiring: &[WiringRecord]) -> bool {
             SETTINGS_FRAGMENT_KIND | VERIFICATION_FRAGMENT_KIND
         ) || w.file == gradle::INDEX_REL
             || w.file == gradle::SCRIPT_REL
-            || w.file.starts_with(&format!("{}/", gradle::TREE_ROOT))
+            || w.file.starts_with(&format!("{}/", layout::GRADLE_TREE))
     })
 }
 
@@ -694,20 +688,16 @@ pub async fn revert(root: &Path, entry: &VendorEntry, opts: RevertOpts) -> Rever
     }
 }
 
-/// The vendored repository trees JVM entries write under `.socket/vendor`
-/// (sbt's Coursier tree included).
-pub(crate) const VENDOR_TREES: &[&str] = &[
-    ".socket/vendor/maven2",
-    ".socket/vendor/gradle",
-    coursier_tree::TREE_ROOT,
-];
+/// The committed JVM layout only a JVM ledger entry ([`is_jvm_entry`]) can
+/// own (see [`layout::LEDGER_OWNED_PATHS`]).
+pub use super::layout::LEDGER_OWNED_PATHS;
 
 /// Owned directories pruned once empty, up to and including themselves.
 const OWNED_DIRS: &[&str] = &[
-    ".socket/vendor/maven2",
-    ".socket/vendor/gradle",
+    layout::MAVEN2_TREE,
+    layout::GRADLE_TREE,
     ".socket/gradle",
-    coursier_tree::TREE_ROOT,
+    layout::COURSIER_TREE,
 ];
 
 /// Remove, deepest first and only when empty, the parents of `removed` up to
@@ -794,6 +784,9 @@ pub fn entry_wired(root: &Path, entry: &VendorEntry) -> bool {
 /// Whether the project still references the JVM `entry`'s tree (its
 /// suffixed version in a reactor pom; its index rows plus the root apply
 /// line for Gradle): what a revert must not pull from under a peer.
+/// Fails closed: a file that exists but cannot be read or parsed (or
+/// resolves outside the checkout) proves nothing absent, so the answer is
+/// `true` — the `scan --prune` GC reverts on `false`.
 pub fn entry_references(root: &Path, entry: &VendorEntry) -> bool {
     let Ok((g, a, v)) = entry_gav(entry) else {
         return true;
@@ -806,15 +799,18 @@ pub fn entry_references(root: &Path, entry: &VendorEntry) -> bool {
     };
     let reader = ProjectReader::new(root);
     let read = |rel: &str| reader.read(rel);
-    if sbt::owns(&entry.wiring) {
-        return sbt::wired_checked(&read, &c).unwrap_or(true);
-    }
-    if scala_cli::owns(&entry.wiring) {
-        return scala_cli::wired_checked(&read, &c).unwrap_or(true);
-    }
-    let (maven, gradle) = sides(&entry.wiring);
-    (maven && maven_reactor::wired_checked(&read, &c).unwrap_or(true))
-        || (gradle && gradle::references(&read, &c))
+    let referenced = if sbt::owns(&entry.wiring) {
+        sbt::wired_checked(&read, &c).unwrap_or(true)
+    } else if scala_cli::owns(&entry.wiring) {
+        scala_cli::wired_checked(&read, &c).unwrap_or(true)
+    } else {
+        let (maven, gradle) = sides(&entry.wiring);
+        (maven && maven_reactor::wired_checked(&read, &c).unwrap_or(true))
+            || (gradle && gradle::references_checked(&read, &c).unwrap_or(true))
+    };
+    // `read` answers `None` for an unreadable file as for a missing one;
+    // the error it recorded is what tells the two apart.
+    referenced || reader.read_error.borrow().is_some()
 }
 
 /// The liveness proof `vex` needs: every half of the entry is wired, and
@@ -1061,13 +1057,13 @@ pub fn checked_tree_jar(root: &Path, entry: &VendorEntry, uuid: &str) -> Result<
             return Err("vendor_artifact_missing".into());
         }
     }
-    if rel.starts_with(".socket/vendor/maven2/") {
+    if rel.starts_with(&format!("{}/", layout::MAVEN2_TREE)) {
         return Ok(rel);
     }
     let marker_path = format!(
         "{}/{}",
         rel.rsplit_once('/').ok_or("vendor_path_unsafe")?.0,
-        gradle::MARKER_NAME
+        layout::MARKER_FILE
     );
     let reader = ProjectReader::new(root);
     let bytes = reader.read(&marker_path).ok_or("vendor_artifact_missing")?;
@@ -1128,6 +1124,53 @@ mod tests {
         JvmPlan {
             writes,
             ..JvmPlan::default()
+        }
+    }
+
+    /// The `scan --prune` GC reverts when [`entry_references`] says
+    /// `false`, so a Gradle file that exists but cannot be read or parsed
+    /// must answer `true` (keep), as the maven/sbt/scala-cli arms do.
+    #[test]
+    fn gradle_references_fail_closed_on_unreadable_files() {
+        let gradle_entry = || {
+            entry(vec![
+                record(SETTINGS_FRAGMENT_KIND, "settings.gradle"),
+                record(TREE_KIND, ".socket/vendor/gradle/g/a/1/a-1.jar"),
+            ])
+        };
+        assert!(is_jvm_entry(&gradle_entry()));
+        // The root settings file still applies the script.
+        let settings = |dir: &Path| {
+            std::fs::write(
+                dir.join("settings.gradle"),
+                "apply from: '.socket/gradle/socket-patch.settings.gradle' // socket-patch\n",
+            )
+            .unwrap()
+        };
+        // Decidable: applied, but no index lists the entry — unreferenced.
+        let dir = tempfile::tempdir().unwrap();
+        settings(dir.path());
+        assert!(!entry_references(dir.path(), &gradle_entry()));
+        // A malformed index proves nothing absent.
+        let dir = tempfile::tempdir().unwrap();
+        settings(dir.path());
+        std::fs::create_dir_all(dir.path().join(".socket/vendor")).unwrap();
+        std::fs::write(dir.path().join(gradle::INDEX_REL), "garbage\n").unwrap();
+        assert!(entry_references(dir.path(), &gradle_entry()));
+        // An index the reader cannot read (here: a link out of the checkout).
+        #[cfg(unix)]
+        {
+            let dir = tempfile::tempdir().unwrap();
+            let outside = tempfile::tempdir().unwrap();
+            settings(dir.path());
+            std::fs::create_dir_all(dir.path().join(".socket/vendor")).unwrap();
+            std::fs::write(outside.path().join("index.tsv"), "x").unwrap();
+            std::os::unix::fs::symlink(
+                outside.path().join("index.tsv"),
+                dir.path().join(gradle::INDEX_REL),
+            )
+            .unwrap();
+            assert!(entry_references(dir.path(), &gradle_entry()));
         }
     }
 
@@ -1396,7 +1439,7 @@ mod tests {
             "uuid": UUID,
         });
         std::fs::write(
-            root.join(tree_file("socket-patch.vendor.json")),
+            root.join(tree_file(layout::MARKER_FILE)),
             serde_json::to_vec(&marker).unwrap(),
         )
         .unwrap();

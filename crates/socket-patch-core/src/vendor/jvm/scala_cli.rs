@@ -18,7 +18,7 @@ use std::collections::BTreeMap;
 
 use super::coursier_tree::{self, GITATTRIBUTES_REL, GITIGNORE, GITIGNORE_REL, INDEX_REL};
 use super::{
-    finish_writes, op_of, CommittedTree, Coords, JvmPatch, JvmPlan, JvmRefusal, JvmUnplan,
+    finish_writes, layout, op_of, CommittedTree, Coords, JvmPatch, JvmPlan, JvmRefusal, JvmUnplan,
     JvmWarning, ReadFn, Shape, WiringRecord,
 };
 
@@ -28,7 +28,7 @@ pub const ROOT_FILE: &str = "socket-patch.scala";
 pub const GUARD_REL: &str = ".socket/vendor/coursier/socket-patch.scala";
 /// The scala-cli project file (its presence warns
 /// `vendor_scala_cli_directives_split`).
-pub const PROJECT_FILE: &str = "project.scala";
+use super::layout::SCALA_CLI_FILE as PROJECT_FILE;
 /// [`ROOT_FILE`]'s bytes.
 pub const ROOT_BYTES: &str =
     "// managed by socket-patch\n//> using file .socket/vendor/coursier/socket-patch.scala\n";
@@ -39,12 +39,9 @@ pub const GUARD_BYTES: &str = "// managed by socket-patch\n//> using repository 
 /// stray `project.scala` never turns a reactor or a Mill build into a
 /// scala-cli one). `.mill-version` alone is not a Mill build file.
 fn other_build_file(read: ReadFn<'_>) -> bool {
-    use crate::patch::redirect::{
-        gradle::GRADLE_ROOT_FILES as GRADLE_FILES, scala_guidance::MILL_MARKERS,
-    };
-    std::iter::once(&"pom.xml")
-        .chain(GRADLE_FILES)
-        .chain(MILL_MARKERS.iter().filter(|m| **m != ".mill-version"))
+    std::iter::once(&layout::POM_FILE)
+        .chain(layout::GRADLE_ROOT_FILES)
+        .chain(layout::MILL_BUILD_FILES)
         .any(|f| read(f).is_some())
 }
 
@@ -70,8 +67,7 @@ pub fn owns(wiring: &[WiringRecord]) -> bool {
     wiring.iter().any(|w| {
         w.kind == super::COURSIER_INDEX_KIND
             || w.file == ROOT_FILE
-            || w.file
-                .starts_with(&format!("{}/", coursier_tree::TREE_ROOT))
+            || w.file.starts_with(&format!("{}/", layout::COURSIER_TREE))
     })
 }
 

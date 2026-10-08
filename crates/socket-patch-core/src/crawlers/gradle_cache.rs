@@ -17,11 +17,11 @@ use std::collections::{BTreeMap, BTreeSet, HashMap};
 use std::path::{Path, PathBuf};
 
 use crate::crawlers::jvm_cache::Gav;
-use crate::crawlers::maven_crawler::is_safe_maven_coordinate;
 use crate::gradle::graph::{self, MavenLocal, ScriptGraph};
 use crate::gradle::home::{is_init_script_name, GradleHome};
 use crate::gradle::{Env, Os};
 use crate::manifest::schema::PatchFileInfo;
+use crate::vendor::jvm::layout::{self, is_path_safe, BuildTool};
 
 /// The leaf directory name of a Gradle module cache.
 pub const FILES21: &str = "files-2.1";
@@ -112,7 +112,7 @@ fn is_bookkeeping(name: &str) -> bool {
 /// literal directory levels (group, artifact, version), then a hash
 /// directory ([`is_hash_dir_name`]) and its regular files. Bookkeeping
 /// directories and lock files are skipped, as is any coordinate that
-/// [`is_safe_maven_coordinate`] rejects. Sorted (walk order).
+/// [`is_path_safe`] rejects. Sorted (walk order).
 pub fn walk_files21(root: &Path) -> Vec<Entry> {
     let mut out = Vec::new();
     for (group, is_dir) in children(root) {
@@ -126,7 +126,7 @@ pub fn walk_files21(root: &Path) -> Vec<Entry> {
             }
             let artifact_dir = group_dir.join(&artifact);
             for (version, is_dir) in children(&artifact_dir) {
-                if !is_dir || !is_safe_maven_coordinate(&group, &artifact, &version) {
+                if !is_dir || !is_path_safe(&group, &artifact, &version) {
                     continue;
                 }
                 let gav: Gav = (group.clone(), artifact.clone(), version.clone());
@@ -171,7 +171,7 @@ pub fn has_module_file<'a>(entries: impl IntoIterator<Item = &'a Entry>) -> bool
 /// [`has_module_file`] for the version directory `root/<g>/<a>/<v>`.
 pub fn is_installed(root: &Path, gav: &Gav) -> bool {
     let (g, a, v) = gav;
-    if !is_safe_maven_coordinate(g, a, v) {
+    if !is_path_safe(g, a, v) {
         return false;
     }
     has_module_file(&version_dir_entries(&root.join(g).join(a).join(v), gav))
@@ -926,19 +926,11 @@ pub fn init_scripts_for_build(home: &GradleHome, build_root: &Path) -> InitScrip
 
 // ── the build and mavenLocal() ──────────────────────────────────────────
 
-/// Gradle build files (the Gradle half of `jvm_cache::JVM_PROJECT_MARKERS`).
-pub const GRADLE_MARKERS: &[&str] = &[
-    "build.gradle",
-    "build.gradle.kts",
-    "settings.gradle",
-    "settings.gradle.kts",
-];
-
-const SETTINGS: &[&str] = &["settings.gradle", "settings.gradle.kts"];
-
-/// Whether `dir` holds a Gradle build or settings script.
-pub fn has_gradle_marker(dir: &Path) -> bool {
-    GRADLE_MARKERS.iter().any(|m| dir.join(m).is_file())
+/// Whether `dir` holds a Gradle settings script.
+fn has_settings(dir: &Path) -> bool {
+    layout::GRADLE_SETTINGS_FILES
+        .iter()
+        .any(|s| layout::marker_present(dir, s))
 }
 
 /// The Gradle build roots to analyse for a cwd that is a Gradle project:
@@ -946,16 +938,12 @@ pub fn has_gradle_marker(dir: &Path) -> bool {
 /// that has one (Gradle searches upwards for the settings of a
 /// subproject). Empty when the cwd has no Gradle marker.
 pub fn build_roots(cwd: &Path) -> Vec<PathBuf> {
-    if !has_gradle_marker(cwd) {
+    if !layout::has_build(cwd, BuildTool::Gradle) {
         return Vec::new();
     }
     let mut roots = vec![cwd.to_path_buf()];
-    if !SETTINGS.iter().any(|s| cwd.join(s).is_file()) {
-        if let Some(up) = cwd
-            .ancestors()
-            .skip(1)
-            .find(|d| SETTINGS.iter().any(|s| d.join(s).is_file()))
-        {
+    if !has_settings(cwd) {
+        if let Some(up) = cwd.ancestors().skip(1).find(|d| has_settings(d)) {
             roots.push(up.to_path_buf());
         }
     }

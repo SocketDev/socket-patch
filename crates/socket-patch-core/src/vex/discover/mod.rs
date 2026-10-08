@@ -546,6 +546,34 @@ pub struct Discovery {
     pub unwired_copies: Vec<UnwiredCopy>,
     /// Refs dropped because another lock contests them ([`ContestedRef`]).
     pub contested: Vec<ContestedRef>,
+    /// Every file an extractor read through the guarded reads
+    /// ([`DiscoverCtx::read_text`] / [`DiscoverCtx::read_bytes`]), with the
+    /// ecosystem whose extractor read it — sorted, deduped. "No ref wires
+    /// this vendored entry" means "unused" only once discovery has read
+    /// that ecosystem's files ([`Discovery::vendor_entry_in_use`]).
+    pub read: Vec<ReadFile>,
+    /// Vendored wiring an extractor rejects as [`DIAG_REF_INVALID`] although
+    /// the next relock consumes it: cargo's `[patch]` at this copy while
+    /// `Cargo.lock` builds another generation's copy (tagged for another
+    /// uuid, or untagged). Not attested, but still wiring: the prune GC must
+    /// keep such an entry ([`Discovery::vendor_entry_in_use`]). Wiring
+    /// dropped as [`DIAG_REF_UNATTRIBUTABLE`] needs no record here: the GC
+    /// keeps it through the diagnostic itself. Sorted, deduped.
+    pub withheld: Vec<Recognized>,
+}
+
+/// One file discovery's guarded reads touched ([`Discovery::read`]).
+#[derive(Debug, Clone, PartialEq, Eq, PartialOrd, Ord)]
+pub struct ReadFile {
+    /// The vendor ecosystem dir name (`npm`, `pypi`, `cargo`, `golang`,
+    /// `gem`, `composer`, `maven`, `nuget`) of the extractor that read it
+    /// ([`VendorEntry::ecosystem`]'s spelling).
+    pub ecosystem: &'static str,
+    /// Root-relative path.
+    pub file: PathBuf,
+    /// `false`: the file exists but could not be read
+    /// ([`DIAG_LOCKFILE_UNREADABLE`]).
+    pub readable: bool,
 }
 
 impl Discovery {
@@ -957,6 +985,10 @@ impl Discovery {
             .sort_by(|a, b| (&a.file, a.code, &a.detail).cmp(&(&b.file, b.code, &b.detail)));
         self.recognized.sort();
         self.recognized.dedup();
+        self.read.sort();
+        self.read.dedup();
+        self.withheld.sort();
+        self.withheld.dedup();
     }
 }
 
@@ -997,27 +1029,39 @@ pub async fn discover_patched_refs_in(
     discover_with_ctx(ctx).await
 }
 
-async fn discover_with_ctx(ctx: DiscoverCtx<'_>) -> Discovery {
+async fn discover_with_ctx(mut ctx: DiscoverCtx<'_>) -> Discovery {
     let mut out = Discovery::default();
+    // Each extractor's reads are tagged with the vendor ecosystem it reads
+    // for ([`Discovery::read`]).
+    ctx.ecosystem = "npm";
     npm::extract(&ctx, &mut out).await;
     yarn::extract(&ctx, &mut out).await;
     bun::extract(&ctx, &mut out).await;
     vlt::extract(&ctx, &mut out).await;
+    ctx.ecosystem = "cargo";
     cargo::extract(&ctx, &mut out).await;
+    ctx.ecosystem = "golang";
     golang::extract(&ctx, &mut out).await;
+    ctx.ecosystem = "pypi";
     pypi_locks::extract(&ctx, &mut out).await;
     pypi_other::extract(&ctx, &mut out).await;
+    ctx.ecosystem = "gem";
     gem::extract(&ctx, &mut out).await;
+    ctx.ecosystem = "composer";
     composer::extract(&ctx, &mut out).await;
+    ctx.ecosystem = "maven";
     maven::extract(&ctx, &mut out).await;
     gradle::extract(&ctx, &mut out).await;
     sbt::extract(&ctx, &mut out).await;
+    ctx.ecosystem = "nuget";
     nuget::extract(&ctx, &mut out).await;
+    ctx.ecosystem = "deno";
     deno::extract(&ctx, &mut out).await;
     out.contest_within_locks();
     out.contest_across_locks();
     out.unattest_unwired_copies();
     out.recognized.extend(ctx.take_recognized());
+    out.read.extend(ctx.take_read());
     out.finalize();
     out
 }
@@ -1040,6 +1084,11 @@ pub(crate) struct DiscoverCtx<'a> {
     /// scratch `Discovery` (a file parsed only to explain it) still counts.
     /// A `Mutex` keeps the ctx `Sync` across the extractors' `.await`s.
     recognized: Mutex<BTreeSet<Recognized>>,
+    /// The ecosystem the running extractor reads for (set by
+    /// [`discover_with_ctx`] between extractors), tagging [`Self::read`].
+    ecosystem: &'static str,
+    /// Every guarded read so far ([`Discovery::read`]).
+    read: Mutex<BTreeSet<ReadFile>>,
 }
 
 impl<'a> DiscoverCtx<'a> {
@@ -1049,7 +1098,30 @@ impl<'a> DiscoverCtx<'a> {
             view: crate::vendor::lock_inventory::ProjectView::Disk(root),
             patch_server_origins,
             recognized: Mutex::new(BTreeSet::new()),
+            ecosystem: "",
+            read: Mutex::new(BTreeSet::new()),
         }
+    }
+
+    /// Log a guarded read of `rel` ([`Discovery::read`]).
+    fn log_read(&self, rel: &str, readable: bool) {
+        self.read
+            .lock()
+            .unwrap_or_else(std::sync::PoisonError::into_inner)
+            .insert(ReadFile {
+                ecosystem: self.ecosystem,
+                file: PathBuf::from(rel),
+                readable,
+            });
+    }
+
+    /// Every guarded read so far, draining the log.
+    pub(crate) fn take_read(&self) -> Vec<ReadFile> {
+        let mut read = self
+            .read
+            .lock()
+            .unwrap_or_else(std::sync::PoisonError::into_inner);
+        std::mem::take(&mut *read).into_iter().collect()
     }
 
     /// Record every Socket identity `text` (the content of root-relative
@@ -1137,11 +1209,13 @@ impl<'a> DiscoverCtx<'a> {
     pub(crate) async fn read_text(&self, rel: &str, out: &mut Discovery) -> Option<String> {
         match self.view.read_text(rel).await {
             Ok(text) => {
+                self.log_read(rel, true);
                 self.recognize_text(rel, &text);
                 Some(text)
             }
             Err(e) if e.kind() == std::io::ErrorKind::NotFound => None,
             Err(e) => {
+                self.log_read(rel, false);
                 out.diag(
                     DIAG_LOCKFILE_UNREADABLE,
                     rel,
@@ -1173,11 +1247,13 @@ impl<'a> DiscoverCtx<'a> {
     pub(crate) async fn read_bytes(&self, rel: &str, out: &mut Discovery) -> Option<Vec<u8>> {
         match self.view.read_bytes(rel).await {
             Ok(bytes) => {
+                self.log_read(rel, true);
                 self.recognize_text(rel, &String::from_utf8_lossy(&bytes));
                 Some(bytes)
             }
             Err(e) if e.kind() == std::io::ErrorKind::NotFound => None,
             Err(e) => {
+                self.log_read(rel, false);
                 out.diag(
                     DIAG_LOCKFILE_UNREADABLE,
                     rel,
@@ -1788,6 +1864,87 @@ impl Discovery {
         vendored_wiring_live(root, &files, &entry.ecosystem, &entry.uuid).await
     }
 
+    /// Whether the project still CONSUMES a vendor-ledger entry's artifact —
+    /// the question the `scan --prune` GC reverts by and `scan`'s vendored
+    /// ledger supplement re-discovers by, answered from the same discovery
+    /// as [`Discovery::vendor_entry_live`] for every ecosystem:
+    ///
+    /// * `Some(true)` — the entry is live, or a lock wires it while another
+    ///   lock contests that wiring ([`Discovery::vendored_contest`]: still
+    ///   wired; `vendor --check` names both locks, reverting would not
+    ///   settle which one installs), or an extractor withheld its wiring
+    ///   ([`Discovery::withheld`]), or a file mentioning it had wiring
+    ///   dropped as unattributable (`unattributable_mention`). A JVM entry: its tree is still
+    ///   referenced ([`crate::vendor::jvm::apply::entry_references`], which
+    ///   also answers `true` when a file cannot be read);
+    /// * `Some(false)` — discovery read a lockfile of this ecosystem
+    ///   ([`decides_install`]) and nothing wires the entry: the dependency
+    ///   left the lock, was re-resolved elsewhere, or the wiring survives
+    ///   only in a shape the package manager does not install from (rule
+    ///   11);
+    /// * `None` — cannot determine, so callers keep the entry: discovery
+    ///   read no lockfile of this ecosystem, or one of its files could not
+    ///   be read or parsed.
+    pub async fn vendor_entry_in_use(&self, root: &Path, entry: &VendorEntry) -> Option<bool> {
+        if crate::vendor::jvm::apply::is_jvm_entry(entry) {
+            return Some(crate::vendor::jvm::apply::entry_references(root, entry));
+        }
+        if self.vendor_entry_live(root, entry).await
+            || self
+                .vendored_contest(&entry.base_purl, &entry.uuid)
+                .is_some()
+        {
+            return Some(true);
+        }
+        if self
+            .withheld
+            .iter()
+            .any(|r| r.uuid == entry.uuid && r.mode == WiringMode::Vendored)
+            || self.unattributable_mention(&entry.uuid)
+        {
+            return Some(true);
+        }
+        let mut read_lock = false;
+        for read in self.read.iter().filter(|r| r.ecosystem == entry.ecosystem) {
+            // A file that could not be read or parsed — or whose tree could
+            // not be finished (an unreadable requirements include) — proves
+            // nothing absent.
+            let undecided = self.diagnostics.iter().any(|d| {
+                matches!(d.code, DIAG_LOCKFILE_UNREADABLE | DIAG_LOCKFILE_UNPARSEABLE)
+                    && d.file == read.file
+            });
+            if !read.readable || undecided {
+                return None;
+            }
+            read_lock |= decides_install(read.ecosystem, &read.file);
+        }
+        read_lock.then_some(false)
+    }
+
+    /// Whether a file that mentions vendored patch `uuid` also carries a
+    /// [`DIAG_REF_UNATTRIBUTABLE`] diagnostic: an extractor (or the
+    /// orchestrator's contests) dropped wiring there because it cannot tell
+    /// which copy installs — an unpatched copy in the same lock, npm's
+    /// shrinkwrap/package-lock pair or legacy `dependencies` mirror, a
+    /// non-registry nested copy, vlt's other instances, a bundled copy, a
+    /// yarn git block, a version-less Go replace, another lock. Dropping
+    /// fails attestation closed, but it is no proof the install stopped
+    /// using the artifact, so the prune GC must keep the entry
+    /// ([`Discovery::vendor_entry_in_use`]). A mention rejected as
+    /// [`DIAG_REF_INVALID`] (a shape the package manager never installs
+    /// from) is not covered: that one is dead. File-grained on purpose: an
+    /// unattributable drop of another package in the same file errs toward
+    /// keeping.
+    fn unattributable_mention(&self, uuid: &str) -> bool {
+        self.recognized_files(uuid, WiringMode::Vendored)
+            .into_iter()
+            .any(|file| {
+                self.diagnostics
+                    .iter()
+                    .any(|d| d.code == DIAG_REF_UNATTRIBUTABLE && d.file == file)
+            })
+    }
+
     /// Liveness of a REDIRECT-ledger record (`purl` resolves from patch
     /// `uuid`) — the ONE rule every reader of the redirect ledger applies
     /// (`vex`'s liveness gate, `scan`'s takeover classifier and its
@@ -1882,6 +2039,35 @@ impl Discovery {
         }
         hosted_wiring_in_files(root, &recorded, uuid).await
     }
+}
+
+/// Whether root-relative `file` is one of `ecosystem`'s lockfiles — what an
+/// install of that ecosystem resolves from: a [`ROOT`]-role row of the
+/// format registry by basename (`Cargo.lock`, `composer.lock`, `go.mod`,
+/// `requirements.txt`, …) or a Python lock (`uv.lock`, `pylock*.toml`,
+/// `*.py.lock`). NuGet and Maven have no lock row (the wiring config is
+/// what restores), so their [`PROBE`] rows count. A manifest alone
+/// (`Cargo.toml`, `pyproject.toml`) does not: with no lock, the next
+/// relock may still route through it, so it proves no entry unused
+/// ([`Discovery::vendor_entry_in_use`]).
+///
+/// [`ROOT`]: crate::formats::registry::ROOT
+/// [`PROBE`]: crate::formats::registry::PROBE
+fn decides_install(ecosystem: &str, file: &Path) -> bool {
+    use crate::formats::registry::{registry, PROBE, ROOT};
+    let Some(base) = file.file_name().and_then(|b| b.to_str()) else {
+        return false;
+    };
+    if ecosystem == "pypi" && crate::utils::python_lock::is_python_lock_name(base) {
+        return true;
+    }
+    let rows = || registry().iter().filter(|f| f.ecosystem == ecosystem);
+    let role = if rows().any(|f| f.has(ROOT)) {
+        ROOT
+    } else {
+        PROBE
+    };
+    rows().any(|f| f.has(role) && f.basename() == base)
 }
 
 /// The gem name of a `pkg:gem/<name>@<version>` purl (any qualifiers).
@@ -2497,6 +2683,73 @@ pub(crate) mod testing {
 mod tests {
     use super::testing::*;
     use super::*;
+
+    /// A pyproject-only pypi project (hatch, or any flavor before its first
+    /// lock) has no install-deciding file: `pyproject.toml` / `hatch.toml`
+    /// are manifests, so even a pyproject that no longer names the vendored
+    /// wheel cannot prove the entry unused, and the prune GC keeps it.
+    #[tokio::test]
+    async fn lockless_pyproject_entries_stay_undecidable() {
+        let tmp = tempfile::tempdir().unwrap();
+        let root = tmp.path();
+        let entry: VendorEntry = serde_json::from_value(serde_json::json!({
+            "ecosystem": "pypi",
+            "basePurl": "pkg:pypi/six@1.16.0",
+            "uuid": UUID_A,
+            "artifact": {
+                "path": format!(".socket/vendor/pypi/{UUID_A}/six-1.16.0-py2.py3-none-any.whl"),
+                "sha256": "",
+            },
+            "wiring": [],
+            "flavor": "hatch",
+        }))
+        .unwrap();
+        for file in ["pyproject.toml", "hatch.toml"] {
+            std::fs::write(
+                root.join(file),
+                "[project]\nname = \"app\"\nversion = \"0.1.0\"\ndependencies = []\n",
+            )
+            .unwrap();
+        }
+        let discovery = discover_patched_refs(root).await;
+        assert_eq!(discovery.vendor_entry_in_use(root, &entry).await, None);
+    }
+
+    /// A `jvm` ledger row with no wiring records (stripped by hand) is not
+    /// [`crate::vendor::jvm::apply::is_jvm_entry`], so no tree layout is
+    /// checked; its trees are not `.socket/vendor/<eco>/<uuid>` dirs a lock
+    /// could reference, and readable Maven/Gradle files must not decide it
+    /// unused: discovery reads no `jvm`-ecosystem file, so the prune GC
+    /// keeps it.
+    #[tokio::test]
+    async fn empty_wiring_jvm_entries_stay_undecidable() {
+        let tmp = tempfile::tempdir().unwrap();
+        let root = tmp.path();
+        std::fs::write(
+            root.join("pom.xml"),
+            "<project><modelVersion>4.0.0</modelVersion><groupId>g</groupId>\
+             <artifactId>app</artifactId><version>1</version></project>\n",
+        )
+        .unwrap();
+        std::fs::write(root.join("settings.gradle"), "").unwrap();
+        std::fs::write(root.join("gradle.lockfile"), "# Gradle lockfile\nempty=\n").unwrap();
+        let discovery = discover_patched_refs(root).await;
+        let entry: VendorEntry = serde_json::from_value(serde_json::json!({
+            "ecosystem": "jvm",
+            "basePurl": "pkg:maven/com.google.code.gson/gson@2.10.1",
+            "uuid": UUID_A,
+            "artifact": {
+                "path": format!(
+                    ".socket/vendor/maven2/com/google/code/gson/gson/2.10.1-socket.{}/gson-2.10.1-socket.{}.jar",
+                    &UUID_A[..8], &UUID_A[..8]
+                ),
+                "sha256": "",
+            },
+            "wiring": [],
+        }))
+        .unwrap();
+        assert_eq!(discovery.vendor_entry_in_use(root, &entry).await, None);
+    }
 
     #[test]
     fn vendor_ref_strips_lock_suffixes_and_requires_a_root_anchor() {
