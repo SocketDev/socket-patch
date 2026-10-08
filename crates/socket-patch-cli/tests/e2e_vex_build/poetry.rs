@@ -1095,7 +1095,10 @@ fn poetry_vendored_revendors_to_a_superseding_patch() {
     assert!(out.status.success(), "pristine install: {}", text(&out));
     let (code, env) = vendor(&service_a, false);
     assert_eq!(code, Some(0), "vendor patch A: {env}");
-    // The project venv now holds patch A, as after any `poetry install`.
+    // The project venv now holds patch A. Recreate it: Poetry before 1.2
+    // keeps an installed six whose version is unchanged, even when its
+    // source moved to the vendored wheel.
+    std::fs::remove_dir_all(project.join(".venv")).unwrap();
     let out = poetry.install(&project);
     assert!(out.status.success(), "install patch A: {}", text(&out));
     assert_eq!(python_oracle(&project), "1");
