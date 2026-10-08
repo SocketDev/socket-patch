@@ -1892,6 +1892,14 @@ async fn run_scan(
         } else {
             socket_patch_core::patch::redirect::upstream::HostedPin::all(ctx.discovery().await)
         };
+    // Lockless cargo/nuget pins are never refs, so `HostedPin::all` drops
+    // them; the rollout's recorded view still counts them (otherwise a
+    // re-scan reads the pin it wrote as NEW and spends a cap slot).
+    let hosted_unlocked_pins = if args.common.is_global() {
+        Vec::new()
+    } else {
+        ctx.discovery().await.unlocked_pins.clone()
+    };
     // The same discovery, handed to the hosted redirect's attribution gate
     // (nothing below writes before it; see `rollout::Gate::prior`).
     let prior_discovery = if args.common.is_global() {
@@ -2367,7 +2375,8 @@ async fn run_scan(
     policy.set_update_purls(updates.iter().map(|u| u.purl.as_str()));
     let recorded = rollout::RecordedState {
         manifest: update_manifest.as_deref(),
-        index: rollout::RecordedIndex::new(update_manifest.as_deref(), &hosted_pins),
+        index: rollout::RecordedIndex::new(update_manifest.as_deref(), &hosted_pins)
+            .with_unlocked_pins(hosted_unlocked_pins),
     };
 
     // The hosted-wiring probes below take `all_purls` (POST-filter: only

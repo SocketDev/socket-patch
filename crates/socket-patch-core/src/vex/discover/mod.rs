@@ -378,9 +378,14 @@ pub struct UnlockedPin {
 impl UnlockedPin {
     /// Whether this pin routes `purl` (any spelling) to patch `uuid`.
     fn covers(&self, purl: &str, uuid: &str) -> bool {
-        if self.uuid != uuid {
-            return false;
-        }
+        self.uuid == uuid && self.routes(purl)
+    }
+
+    /// Whether this pin routes `purl` (any spelling, exact version) to its
+    /// patch: the package matches and the version satisfies every
+    /// requirement the pin declares. The rollout's recorded view reads a
+    /// lockless pin through this (it has no version of its own to index).
+    pub fn routes(&self, purl: &str) -> bool {
         let key = canonical_base_purl(purl);
         let Some(version) = key.rsplit_once('@').map(|(_, v)| v) else {
             return false;

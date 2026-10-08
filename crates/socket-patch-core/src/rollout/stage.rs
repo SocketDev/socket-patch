@@ -14,6 +14,7 @@ use crate::crawlers::Ecosystem;
 use crate::manifest::schema::PatchManifest;
 pub use crate::policy::Offers;
 use crate::utils::purl_key::PurlKey;
+use crate::vex::UnlockedPin;
 
 use super::{plan_rollout, severity_label, Candidate, MaxNew, MaxNewSource, Recorded, RolloutPlan};
 
@@ -104,6 +105,10 @@ pub struct RecordedIndex {
     /// [`PurlKey::qualified`]: one release variant in any spelling.
     qualified: HashMap<PurlKey, Vec<String>>,
     by_base: HashMap<PurlKey, Vec<String>>,
+    /// Lockless hosted pins ([`UnlockedPin`]), each with its uuid as a
+    /// one-element list: they route every satisfying version of a package,
+    /// so they are matched per purl rather than indexed by key.
+    unlocked: Vec<(UnlockedPin, Vec<String>)>,
 }
 
 /// The recorded view one project root classifies against: the merged
@@ -149,19 +154,41 @@ impl RecordedIndex {
         index
     }
 
+    /// Also count discovery's lockless pins (a cargo `registry =` or nuget
+    /// source-mapping pin with no lockfile) as recorded. They are the
+    /// hosted rewriter's own output for a lockless project but never refs,
+    /// so without them a re-scan would read the pin it wrote as NEW and
+    /// spend a `--max-new-patches` slot on it every run.
+    pub fn with_unlocked_pins(mut self, pins: impl IntoIterator<Item = UnlockedPin>) -> Self {
+        self.unlocked.extend(pins.into_iter().map(|pin| {
+            let uuid = vec![pin.uuid.clone()];
+            (pin, uuid)
+        }));
+        self
+    }
+
     /// The uuids recorded for `purl`, sorted: the exact key, else the same
-    /// purl in another spelling, else any qualifier twin.
+    /// purl in another spelling, else any qualifier twin, else the uuid of a
+    /// lockless pin that routes it.
     pub fn uuids(&self, purl: &str) -> &[String] {
         self.exact
             .get(purl)
             .or_else(|| self.qualified.get(&PurlKey::qualified(purl)))
             .or_else(|| self.by_base.get(&PurlKey::new(purl)))
+            .or_else(|| self.unlocked_uuid(purl))
             .map_or(&[], Vec::as_slice)
+    }
+
+    fn unlocked_uuid(&self, purl: &str) -> Option<&Vec<String>> {
+        self.unlocked
+            .iter()
+            .find(|(pin, _)| pin.routes(purl))
+            .map(|(_, uuid)| uuid)
     }
 
     /// Whether any patch is recorded for `purl`'s base purl.
     pub fn records_package(&self, purl: &str) -> bool {
-        self.by_base.contains_key(&PurlKey::new(purl))
+        self.by_base.contains_key(&PurlKey::new(purl)) || self.unlocked_uuid(purl).is_some()
     }
 }
 

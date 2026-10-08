@@ -770,4 +770,77 @@ mod tests {
         unlimited.plan(&classify(&offers, &RecordedIndex::default(), ""), |_| true);
         assert!(unlimited.warnings().is_empty());
     }
+
+    /// REGRESSION: a lockless NuGet / Cargo pin (the hosted rewriter's own
+    /// output when the project has no lockfile) is never a discovery ref,
+    /// so `HostedPin::all` drops it. Re-scanned under `--max-new-patches 1`
+    /// it must read as ALREADY through the recorded view (as `scan` builds
+    /// it), not as NEW: otherwise every re-scan spends the one slot on the
+    /// pin it already wrote and the genuinely new patch is deferred forever.
+    #[tokio::test]
+    async fn a_rescanned_lockless_pin_is_already_not_new_under_a_cap() {
+        use socket_patch_core::patch::redirect::upstream::HostedPin;
+        const NUGET: &str = "aaaaaaaa-1111-4111-8111-aaaaaaaaaaaa";
+        const CARGO: &str = "bbbbbbbb-2222-4222-8222-bbbbbbbbbbbb";
+        const GRANT: &str = "cccccccc-3333-4333-8333-cccccccccccc";
+        let tmp = tempfile::tempdir().unwrap();
+        let nuget_key = format!("socket-patch-{NUGET}");
+        std::fs::write(
+            tmp.path().join("nuget.config"),
+            format!(
+                "<?xml version=\"1.0\" encoding=\"utf-8\"?>\n<configuration>\n  <packageSources>\n    \
+                 <add key=\"{nuget_key}\" value=\"https://patch.socket.dev/patch-registry/nuget/{GRANT}/{NUGET}/index.json\" />\n  \
+                 </packageSources>\n  <packageSourceMapping>\n    <packageSource key=\"{nuget_key}\">\n      \
+                 <package pattern=\"Newtonsoft.Json\" />\n    </packageSource>\n  \
+                 </packageSourceMapping>\n</configuration>\n"
+            ),
+        )
+        .unwrap();
+        std::fs::write(
+            tmp.path().join("Cargo.toml"),
+            format!(
+                "[package]\nname = \"app\"\nversion = \"0.1.0\"\n\n[dependencies]\n\
+                 serde = {{ version = \"1\", registry = \"socket-patch-{CARGO}\" }}\n"
+            ),
+        )
+        .unwrap();
+        std::fs::create_dir(tmp.path().join(".cargo")).unwrap();
+        std::fs::write(
+            tmp.path().join(".cargo/config.toml"),
+            format!(
+                "[registries.socket-patch-{CARGO}]\nindex = \
+                 \"sparse+https://patch.socket.dev/patch-registry/cargo/{GRANT}/{CARGO}/index/\"\n"
+            ),
+        )
+        .unwrap();
+        let discovery = socket_patch_core::vex::discover::discover_patched_refs(tmp.path()).await;
+        assert_eq!(discovery.unlocked_pins.len(), 2, "{discovery:#?}");
+        let pins: Vec<(String, String)> = HostedPin::all(&discovery)
+            .into_iter()
+            .map(|p| (p.purl, p.uuid))
+            .collect();
+        assert!(pins.is_empty(), "lockless pins are never refs: {pins:?}");
+
+        let results = vec![
+            offer("pkg:nuget/Newtonsoft.Json@13.0.3", NUGET, "", &["critical"]),
+            offer("pkg:cargo/serde@1.0.200", CARGO, "", &["critical"]),
+            offer("pkg:npm/fresh@1.0.0", "fresh", "", &["low"]),
+        ];
+        let offers = offers_from_results(&results, true);
+        let index = RecordedIndex::new(None, &pins).with_unlocked_pins(discovery.unlocked_pins);
+        let one = MaxNew {
+            value: Some(1),
+            source: MaxNewSource::Flag,
+        };
+        let mut stage = Stage::new(one, None, Path::new("/repo"));
+        stage.plan(&classify(&offers, &index, ""), |_| true);
+        let counts = &stage.json()["counts"];
+        assert_eq!(counts["already"], 2, "{counts}");
+        assert_eq!(counts["new"], 1, "{counts}");
+        assert_eq!(counts["deferred"], 0, "{counts}");
+
+        // A version outside the cargo pin's requirement is not routed by it.
+        assert!(index.uuids("pkg:cargo/serde@2.0.0").is_empty());
+        assert!(!index.records_package("pkg:cargo/serde@2.0.0"));
+    }
 }

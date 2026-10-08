@@ -417,16 +417,25 @@ async fn memory_recorded(project: &MemoryProject, root: &str, roots: &[String]) 
         .filter(|rel| rel != "/")
         .collect();
     let own = |file: &String| !nested.iter().any(|n| file.starts_with(n.as_str()));
-    let pins: Vec<(String, String)> =
-        crate::patch::redirect::upstream::HostedPin::discover(ProjectView::Memory(project), &[])
-            .await
-            .into_iter()
-            .filter(|pin| pin.files.iter().any(own))
-            .map(|pin| (pin.purl, pin.uuid))
-            .collect();
+    // The same discovery `HostedPin::discover` runs, kept whole so its
+    // lockless pins (never refs) count as recorded too.
+    let discovery = crate::vex::discover::discover_patched_refs_view(
+        ProjectView::Memory(project),
+        &crate::vex::DiscoverOptions::default(),
+    )
+    .await;
+    let pins: Vec<(String, String)> = crate::patch::redirect::upstream::HostedPin::all(&discovery)
+        .into_iter()
+        .filter(|pin| pin.files.iter().any(own))
+        .map(|pin| (pin.purl, pin.uuid))
+        .collect();
+    let unlocked = discovery
+        .unlocked_pins
+        .into_iter()
+        .filter(|pin| own(&pin.file.to_string_lossy().replace('\\', "/")));
     let merged =
         crate::ledgers::merge_ledger_records_for_updates(manifest.as_ref(), vendor.as_ref(), &pins);
-    RecordedIndex::new(merged.as_deref(), &pins)
+    RecordedIndex::new(merged.as_deref(), &pins).with_unlocked_pins(unlocked)
 }
 
 async fn engine(
@@ -1681,5 +1690,47 @@ mod tests {
             &mut filtered,
         );
         assert!(filtered.is_empty());
+    }
+
+    /// REGRESSION: the in-memory recorded view counts a lockless NuGet /
+    /// Cargo pin (never a discovery ref) as recorded, so a re-scan under a
+    /// cap reads the pin it wrote as ALREADY instead of spending a NEW slot.
+    #[tokio::test]
+    async fn memory_recorded_counts_lockless_nuget_and_cargo_pins() {
+        const NUGET: &str = "aaaaaaaa-1111-4111-8111-aaaaaaaaaaaa";
+        const CARGO: &str = "bbbbbbbb-2222-4222-8222-bbbbbbbbbbbb";
+        const GRANT: &str = "cccccccc-3333-4333-8333-cccccccccccc";
+        let key = format!("socket-patch-{NUGET}");
+        let mut p = MemoryProject::new();
+        p.insert_text(
+            "nuget.config",
+            format!(
+                "<?xml version=\"1.0\" encoding=\"utf-8\"?>\n<configuration>\n  <packageSources>\n    \
+                 <add key=\"{key}\" value=\"https://patch.socket.dev/patch-registry/nuget/{GRANT}/{NUGET}/index.json\" />\n  \
+                 </packageSources>\n  <packageSourceMapping>\n    <packageSource key=\"{key}\">\n      \
+                 <package pattern=\"Newtonsoft.Json\" />\n    </packageSource>\n  \
+                 </packageSourceMapping>\n</configuration>\n"
+            ),
+        );
+        p.insert_text(
+            "Cargo.toml",
+            format!(
+                "[package]\nname = \"app\"\nversion = \"0.1.0\"\n\n[dependencies]\n\
+                 serde = {{ version = \"1\", registry = \"socket-patch-{CARGO}\" }}\n"
+            ),
+        );
+        p.insert_text(
+            ".cargo/config.toml",
+            format!(
+                "[registries.socket-patch-{CARGO}]\nindex = \
+                 \"sparse+https://patch.socket.dev/patch-registry/cargo/{GRANT}/{CARGO}/index/\"\n"
+            ),
+        );
+        let index = memory_recorded(&p, "", &[String::new()]).await;
+        assert_eq!(index.uuids("pkg:nuget/Newtonsoft.Json@13.0.3"), [NUGET]);
+        assert_eq!(index.uuids("pkg:cargo/serde@1.0.200"), [CARGO]);
+        assert!(index.records_package("pkg:cargo/serde@1.0.200"));
+        assert!(index.uuids("pkg:cargo/serde@2.0.0").is_empty());
+        assert!(index.uuids("pkg:nuget/Other@1.0.0").is_empty());
     }
 }
