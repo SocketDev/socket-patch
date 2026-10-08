@@ -12,8 +12,10 @@ use crate::common;
 
 const ORG_SLUG: &str = "test-org";
 const UUID: &str = "11111111-1111-4111-8111-111111111111";
-/// The `afterHash` embedded in `patch_response_json`; also the blob filename.
-const AFTER_HASH: &str = "1111111111111111111111111111111111111111111111111111111111111111";
+/// The `afterHash` embedded in `patch_response_json` (the git-sha256 of
+/// `BLOB_BYTES`, which `get` verifies inline blobs against); also the blob
+/// filename.
+const AFTER_HASH: &str = "d2802877eb1c2f442d30d18abcb281cb2830875571624544f2f1acb36480997e";
 /// base64 "cGF0Y2hlZAo=" decodes to exactly these bytes.
 const BLOB_BYTES: &[u8] = b"patched\n";
 
@@ -44,9 +46,9 @@ fn run_get(cwd: &Path, api_url: &str, identifier: &str, extra: &[&str]) -> (i32,
 /// PatchResponse JSON suitable as a `view/{uuid}` response. All fields
 /// are camelCase as the binary expects.
 fn patch_response_json(purl: &str, uuid: &str) -> serde_json::Value {
-    // base64 of "patched\n" — content is arbitrary, the save path
-    // doesn't verify content hash. The afterHash value is what gets
-    // used as the blob filename.
+    // base64 of "patched\n". `get` verifies an inline blob against the
+    // hash it is stored under, so afterHash is its real git-sha256; it is
+    // also the blob filename.
     serde_json::json!({
         "uuid": uuid,
         "purl": purl,
@@ -54,7 +56,7 @@ fn patch_response_json(purl: &str, uuid: &str) -> serde_json::Value {
         "files": {
             "package/index.js": {
                 "beforeHash": "0000000000000000000000000000000000000000000000000000000000000000",
-                "afterHash":  "1111111111111111111111111111111111111111111111111111111111111111",
+                "afterHash":  AFTER_HASH,
                 "blobContent": "cGF0Y2hlZAo=",
             }
         },

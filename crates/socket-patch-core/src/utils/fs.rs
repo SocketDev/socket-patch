@@ -244,10 +244,7 @@ where
 /// a regular file (leaving the target stale) — they use this to refuse
 /// fail-closed before any write, mirroring the hosted replay guard.
 pub async fn is_symlink(path: &Path) -> bool {
-    tokio::fs::symlink_metadata(path)
-        .await
-        .map(|metadata| metadata.file_type().is_symlink())
-        .unwrap_or(false)
+    crate::utils::containment::is_link(path)
 }
 
 /// Blocking twin of [`read_regular_to_string`] for the few synchronous
@@ -327,12 +324,8 @@ pub async fn first_symlink<'a>(
     root: &Path,
     rels: impl IntoIterator<Item = &'a str>,
 ) -> Option<&'a str> {
-    for rel in rels {
-        if is_symlink(&root.join(rel)).await {
-            return Some(rel);
-        }
-    }
-    None
+    rels.into_iter()
+        .find(|rel| crate::utils::containment::is_link(&root.join(rel)))
 }
 
 /// Remove the link at `path` itself — never its target. A symlink (file or
