@@ -561,12 +561,14 @@ impl LocalSources {
     }
 }
 
-/// The vendored sbt / scala-cli gate for `purl` over the project at
-/// `project_root`, for a caller about to restore a hosted pin upstream (a
-/// takeover or an eject) before vendoring: `Err((code, detail))` when the
-/// gate would stop the patch (a skip or a refusal), so the caller keeps the
-/// hosted wiring instead of ending neither hosted nor vendored. `Ok` for
-/// any other project shape or a non-Maven purl.
+/// The vendored refusals and sbt / scala-cli gate for `purl` over the
+/// project at `project_root`, for a caller about to restore a hosted pin
+/// upstream (a takeover or an eject) before vendoring: `Err((code,
+/// detail))` when [`vendor_maven`] would stop the patch before writing
+/// anything (`not_build_root`, `legacy_maven_root`, or a gate skip or
+/// refusal), so the caller keeps the hosted wiring instead of ending
+/// neither hosted nor vendored. `Ok` for any other project or a non-Maven
+/// purl.
 pub async fn jvm_gate_preflight(
     project_root: &Path,
     purl: &str,
@@ -574,6 +576,9 @@ pub async fn jvm_gate_preflight(
     let Some((g, a, v)) = parse_maven_purl(purl) else {
         return Ok(());
     };
+    if let Some(detail) = not_build_root(project_root) {
+        return Err(("vendor_jvm_shape_unsupported", detail));
+    }
     if legacy_root(project_root).await {
         return Err((
             "vendor_jvm_shape_unsupported",
@@ -3425,6 +3430,48 @@ mod tests {
             assert!(!out.success, "{out:?}");
         }
         assert!(root.join("src/Main.java").is_file());
+    }
+
+    /// A module of an ancestor Maven reactor is refused `not_build_root`
+    /// by both [`vendor_maven`] and [`jvm_gate_preflight`], so a hosted
+    /// pin is kept rather than restored before a refusal that writes
+    /// nothing; the reactor root itself passes the preflight.
+    #[tokio::test]
+    #[serial_test::serial]
+    async fn maven_reactor_module_refuses_not_build_root_in_preflight() {
+        let (dir, blobs, installed, record) = fixture(None, true, true).await;
+        let root = dir.path();
+        std::fs::create_dir_all(root.join(".git")).unwrap();
+        std::fs::write(
+            root.join("pom.xml"),
+            "<project><modelVersion>4.0.0</modelVersion><groupId>com.example</groupId>\
+             <artifactId>parent</artifactId><version>1.0</version><packaging>pom</packaging>\
+             <modules><module>app</module></modules></project>\n",
+        )
+        .unwrap();
+        let module = root.join("app");
+        std::fs::create_dir_all(&module).unwrap();
+        std::fs::write(
+            module.join("pom.xml"),
+            "<project><modelVersion>4.0.0</modelVersion><parent><groupId>com.example</groupId>\
+             <artifactId>parent</artifactId><version>1.0</version></parent>\
+             <artifactId>app</artifactId></project>\n",
+        )
+        .unwrap();
+        let before = crate::vendor::test_support::tree_snapshot(root);
+        let (code, detail) = jvm_gate_preflight(&module, PURL).await.unwrap_err();
+        assert_eq!(code, "vendor_jvm_shape_unsupported");
+        assert!(
+            detail.starts_with("reason: not_build_root: run vendor from reactor root "),
+            "{detail}"
+        );
+        let (code, vendor_detail) =
+            unwrap_refused(run_vendor(&module, &blobs, &installed, &record, false).await);
+        assert_eq!(code, "vendor_jvm_shape_unsupported");
+        assert_eq!(vendor_detail, detail);
+        assert_eq!(crate::vendor::test_support::tree_snapshot(root), before);
+        assert!(service_preflight(PURL, &module, &record).await.is_none());
+        assert!(jvm_gate_preflight(root, PURL).await.is_ok());
     }
 
     /// #428: vendoring from a project of a Gradle build rooted above it
