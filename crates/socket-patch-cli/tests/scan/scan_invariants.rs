@@ -1085,7 +1085,7 @@ async fn scan_apply_all_detail_queries_failed_emits_json_error_envelope() {
         "a total detail-phase failure must be reported as status=error; envelope={v}"
     );
     assert!(
-        v["error"].is_string() && !v["error"].as_str().unwrap().is_empty(),
+        v["error"]["message"].is_string() && !v["error"]["message"].as_str().unwrap().is_empty(),
         "the error envelope must carry a diagnosable message; envelope={v}"
     );
     assert_ne!(code, 0, "exit code must stay non-zero; envelope={v}");
@@ -1121,7 +1121,7 @@ async fn scan_vendored_all_detail_queries_failed_emits_json_error_envelope() {
         "a total detail-phase failure must be reported as status=error; envelope={v}"
     );
     assert!(
-        v["error"].is_string() && !v["error"].as_str().unwrap().is_empty(),
+        v["error"]["message"].is_string() && !v["error"]["message"].as_str().unwrap().is_empty(),
         "the error envelope must carry a diagnosable message; envelope={v}"
     );
     assert_ne!(code, 0, "exit code must stay non-zero; envelope={v}");

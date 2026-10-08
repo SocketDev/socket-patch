@@ -1052,3 +1052,109 @@ fn poetry_vendored_fresh_install_then_manifestless_vex() {
         .join(VENDORED_UUID)
         .exists());
 }
+
+/// #1136: a vendored Poetry project moves to a superseding patch. Patch A
+/// is vendored and installed into the project venv; the patch service then
+/// offers only patch B for the same release. The dry run previews the
+/// re-vendor and the wet run performs it (it used to exit 1 with
+/// `pypi_poetry_source_already_exists`, leaving the lock on A), so a fresh
+/// `poetry install` gets B's bytes. Reverting B restores the pristine lock.
+#[test]
+#[ignore = "real Poetry + PyPI; run by the CI e2e matrix per Poetry release"]
+fn poetry_vendored_revendors_to_a_superseding_patch() {
+    const UUID_B: &str = "5e7a9c1d-3f5b-4d7f-8b9c-1d3f5b7d9f1a";
+    const MARKER_B: &[u8] = b"\n# SOCKET-PATCHED\nSOCKET_PATCHED = 2\n";
+    let tmp = tempfile::tempdir().unwrap();
+    let home = tmp.path().join("home");
+    std::fs::create_dir_all(&home).unwrap();
+    let Some(poetry) = Poetry::find(&home) else {
+        return;
+    };
+    let project = tmp.path().join("proj");
+    let Some((pristine, pristine_lock)) =
+        locked_project(&poetry, &project, &tmp.path().join("probe"))
+    else {
+        return;
+    };
+    let vendor = |service: &PatchService, dry_run: bool| {
+        let mut args = vec!["scan", "--mode", "vendored", "--vendor-source", "service"];
+        if dry_run {
+            args.push("--dry-run");
+        }
+        socket_patch(&project, &poetry, service, &args)
+    };
+
+    let mut patched_a = pristine.clone();
+    patched_a.extend_from_slice(MARKER);
+    let service_a = PatchService::start(
+        VENDORED_UUID,
+        &pristine,
+        &patched_a,
+        &build_wheel(&patched_a),
+    );
+    let out = poetry.install(&project);
+    assert!(out.status.success(), "pristine install: {}", text(&out));
+    let (code, env) = vendor(&service_a, false);
+    assert_eq!(code, Some(0), "vendor patch A: {env}");
+    // The project venv now holds patch A. Recreate it: Poetry before 1.2
+    // keeps an installed six whose version is unchanged, even when its
+    // source moved to the vendored wheel.
+    std::fs::remove_dir_all(project.join(".venv")).unwrap();
+    let out = poetry.install(&project);
+    assert!(out.status.success(), "install patch A: {}", text(&out));
+    assert_eq!(python_oracle(&project), "1");
+
+    let mut patched_b = pristine.clone();
+    patched_b.extend_from_slice(MARKER_B);
+    let service_b = PatchService::start(UUID_B, &pristine, &patched_b, &build_wheel(&patched_b));
+    let wired_a = std::fs::read_to_string(project.join("poetry.lock")).unwrap();
+    let (code, env) = vendor(&service_b, true);
+    assert_eq!(code, Some(0), "dry-run re-vendor: {env}");
+    assert!(env.to_string().contains("would_revendor"), "{env}");
+    assert_eq!(
+        std::fs::read_to_string(project.join("poetry.lock")).unwrap(),
+        wired_a,
+        "the dry run writes nothing"
+    );
+
+    let (code, env) = vendor(&service_b, false);
+    assert_eq!(code, Some(0), "re-vendor to patch B: {env}");
+    let lock = std::fs::read_to_string(project.join("poetry.lock")).unwrap();
+    let rel_b = format!(".socket/vendor/pypi/{UUID_B}/{WHEEL}");
+    assert!(
+        lock.contains(&rel_b) && !lock.contains(VENDORED_UUID),
+        "poetry.lock is rewired to B:\n{lock}"
+    );
+    assert!(project.join(&rel_b).is_file(), "{env}");
+    assert!(
+        !project
+            .join(".socket/vendor/pypi")
+            .join(VENDORED_UUID)
+            .exists(),
+        "patch A's artifact is swept: {env}"
+    );
+    if poetry.major_minor() >= (1, 6) {
+        let out = poetry.run(&project, &["check", "--lock"]);
+        assert!(out.status.success(), "poetry check --lock: {}", text(&out));
+    }
+
+    // A fresh checkout installs patch B.
+    let fresh = tmp.path().join("fresh");
+    fresh_checkout(&project, &fresh);
+    let out = poetry.install(&fresh);
+    assert!(out.status.success(), "poetry install (B): {}", text(&out));
+    assert_eq!(
+        std::fs::read(installed_six(&fresh).expect("six installed")).unwrap(),
+        patched_b,
+        "patch B's bytes installed"
+    );
+    assert_eq!(python_oracle(&fresh), "2");
+
+    let (code, env) = socket_patch(&project, &poetry, &service_b, &["vendor", "--revert"]);
+    assert_eq!(code, Some(0), "vendor --revert: {env}");
+    assert_eq!(
+        std::fs::read_to_string(project.join("poetry.lock")).unwrap(),
+        pristine_lock,
+        "revert restores the pristine lock"
+    );
+}

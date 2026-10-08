@@ -283,7 +283,7 @@ jobs:
       - run: rustup show
       - uses: Swatinem/rust-cache@c19371144df3bb44fab255c43d04cbc2ab54d1c4 # v2.9.1
         with:
-          key: sbt-compat
+          shared-key: dev-${{ matrix.os }}
           save-if: ${{ github.ref == 'refs/heads/main' }}
       - uses: actions/setup-java@de7274f081f381c8f8158605e0321c36c376e2e6 # v6.0.1
         with:

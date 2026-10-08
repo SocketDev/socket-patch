@@ -120,7 +120,9 @@ fn rollback_with_no_manifest_emits_error() {
     assert_eq!(v["status"], "error");
     // Pin the *specific* error so a regression that exits 1 for some other
     // reason (e.g. ambient env steering it elsewhere) can't pass.
-    let err = v["error"].as_str().expect("error message string");
+    let err = v["error"]["message"]
+        .as_str()
+        .expect("error message string");
     assert!(
         err.contains("Manifest not found"),
         "unexpected error message: {err}"
@@ -138,7 +140,9 @@ fn rollback_unknown_identifier_emits_error() {
     assert_eq!(code, 1, "unknown identifier must exit 1; stdout=\n{stdout}");
     let v: serde_json::Value = serde_json::from_str(&stdout).expect("valid JSON");
     assert_eq!(v["status"], "error");
-    let err = v["error"].as_str().expect("error message string");
+    let err = v["error"]["message"]
+        .as_str()
+        .expect("error message string");
     assert!(
         err.contains("No patch found matching identifier"),
         "unexpected error: {err}"
