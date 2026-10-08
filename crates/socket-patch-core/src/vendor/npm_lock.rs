@@ -1199,18 +1199,30 @@ fn version_moved_off<'a>(rec: &WiringRecord, live: &'a Value) -> Option<&'a str>
     let original_leaf = split_http_scheme(original_resolved)?
         .1
         .strip_prefix(prefix)?;
-    let original_version = rec
-        .original
-        .as_ref()?
-        .get("version")
-        .and_then(Value::as_str)?;
+    let original_version = tarball_version(
+        rec.original
+            .as_ref()?
+            .get("version")
+            .and_then(Value::as_str)?,
+    );
     let basename = original_leaf.strip_suffix(&format!("-{original_version}.tgz"))?;
-    let plain_version = !live_version.is_empty()
-        && live_version
+    let tarball = tarball_version(live_version);
+    let plain_version = !tarball.is_empty()
+        && tarball
             .chars()
             .all(|c| c.is_ascii_alphanumeric() || matches!(c, '.' | '-' | '+'));
     let leaf = live_rest.strip_prefix(prefix)?;
-    (plain_version && leaf == format!("{basename}-{live_version}.tgz")).then_some(live_version)
+    (plain_version && leaf == format!("{basename}-{tarball}.tgz")).then_some(live_version)
+}
+
+/// The version a lock `version` field names in its tarball file: itself,
+/// or for a legacy (lockfile v1) alias row's `npm:left-pad@1.3.0` /
+/// `npm:@scope/pkg@1.0.0` spelling, the part after the last `@`.
+fn tarball_version(version: &str) -> &str {
+    match version.strip_prefix("npm:") {
+        Some(spec) => spec.rsplit_once('@').map_or(spec, |(_, v)| v),
+        None => version,
+    }
 }
 
 /// `https://registry.npmjs.org/left-pad/-/left-pad-1.3.0.tgz` →
@@ -3600,6 +3612,45 @@ mod tests {
                 "{moved}"
             );
         }
+    }
+
+    /// #1155, legacy alias: a lockfile v1 alias row spells its version
+    /// `npm:left-pad@1.3.0`. Upgrading the alias (`npm install
+    /// pad@npm:left-pad@1.3.1`) writes `npm:left-pad@1.3.1` with the 1.3.1
+    /// registry tarball, which is the same plain upgrade. An alias pointed
+    /// at another package's tarball stays drift.
+    #[test]
+    fn version_moved_off_reads_legacy_alias_versions() {
+        let rec = WiringRecord {
+            file: PACKAGE_LOCK.to_string(),
+            kind: KIND_LOCK_LEGACY_ENTRY.to_string(),
+            action: WiringAction::Rewritten,
+            key: Some("/dependencies/pad".to_string()),
+            original: Some(json!({
+                "version": "npm:left-pad@1.3.0",
+                "resolved": REG_RESOLVED,
+                "integrity": "sha512-orig=="
+            })),
+            new: Some(json!({
+                "version": "npm:left-pad@1.3.0",
+                "resolved": format!("file:.socket/vendor/npm/{UUID}/left-pad-1.3.0.tgz"),
+            })),
+        };
+        let upgraded = json!({
+            "version": "npm:left-pad@1.3.1",
+            "resolved": "https://registry.npmjs.org/left-pad/-/left-pad-1.3.1.tgz",
+        });
+        assert_eq!(
+            version_moved_off(&rec, &upgraded),
+            Some("npm:left-pad@1.3.1")
+        );
+        let elsewhere = json!({
+            "version": "npm:left-pad@1.3.1",
+            "resolved": "https://registry.npmjs.org/left-pad/-/other-1.3.1.tgz",
+        });
+        assert_eq!(version_moved_off(&rec, &elsewhere), None);
+        assert_eq!(tarball_version("npm:@scope/pkg@1.0.0"), "1.0.0");
+        assert_eq!(tarball_version("1.0.0"), "1.0.0");
     }
 
     /// #1155 provenance guard: a version change is only an upgrade when the
