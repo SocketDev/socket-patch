@@ -51,7 +51,7 @@ _Last updated 2026-10-08T01:30Z · main @ e61a845_
 | E47 | 3 | Decide: support tiers for `bun.lockb` writes, vendored pnpm 7/8, vlt pre-1.0 encodings and hosted pnpm ≤ 6, and whether hosted JVM ships as beta. | §5; §6 Q3; 4.6 | | decision pending; no decision issue filed yet |
 | E48 | 3 | Discovery re-implements package-manager layouts (venv-name hashing, global prefixes, the pnpm store). Target: ask the package manager (`poetry env info -p`, `pipenv --venv`, `npm query`, …). | 2.2 #2; 6.6 | | to verify |
 | E50 | 2 | Hosted `rewrite_nuget` and upstream restore rewrite `packages.lock.json` entries of the patched id at other versions (every framework); vendored `locked_at` filters by version. Four lock walkers. | new finding | #593 | filed #593 |
-| E52 | 3 | `vendor/go_sum_edit.rs`: free go.sum helpers have no production caller and are re-implemented by `GoSumEditor`; the pure hosted codec lives in `vendor/`. | new finding | #631 | filed #631 |
+| E52 | 3 | `vendor/go_sum_edit.rs`: free go.sum helpers have no production caller and are re-implemented by `GoSumEditor`; the pure hosted codec lives in `vendor/`. | new finding | #631 | in PR #1103; slice: oracle copies deleted, the move to `formats/golang/sum.rs` remains |
 | E53 | 2 | Vendored pnpm wrote the root `package.json` with `serialize_json` (lost CRLF, refused BOM). | new finding | #662 | fixed (#810) |
 | E54 | 3 | Poetry and PDM lock rewriters restored line endings with two rules. | new finding | #695 | fixed (#703) |
 | E56 | 2 | Lock inventory read only `Gemfile.lock`, so a `gems.rb` project's `gems.locked` was invisible. | new finding | #736 | fixed (#750) |

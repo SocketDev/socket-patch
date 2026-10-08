@@ -1,8 +1,9 @@
 ### Refactor routine (`refactor`, hourly, highest leverage first)
-_Last updated 2026-10-08T00:58Z · main @ e61a845_
+_Last updated 2026-10-08T02:20Z · main @ d7f8679_
 
 **In flight:**
-- No routine-opened PR is open. 8 `arch-refactor/*` branches (the maintainer drafts) plus 15 `arch-fix/*` campaign PRs are open, so `MAX_OPEN` is full; the routine re-ranks only.
+- [#1103](https://github.com/SocketDev/socket-patch/pull/1103): `go.sum` edits through `GoSumEditor` only; deletes the oracle-only free functions and names the key rule once. Issue #631 (E52, slice: steps 2–3; the move to `formats/golang/sum.rs` remains). `state: ready`, handed to the burn-down.
+- REFACTOR.md no longer caps open PRs; the file-overlap skip rule still applies. With 39 open PRs touching ~1000 files, only rows whose files no open PR changes are eligible.
 - Maintainer drafts (decided issues): [#1021](https://github.com/SocketDev/socket-patch/pull/1021) (#615), [#1027](https://github.com/SocketDev/socket-patch/pull/1027) (#704), [#1030](https://github.com/SocketDev/socket-patch/pull/1030) (#808), [#1031](https://github.com/SocketDev/socket-patch/pull/1031) (#966), [#1036](https://github.com/SocketDev/socket-patch/pull/1036) (#973), [#1041](https://github.com/SocketDev/socket-patch/pull/1041) (#648), [#1049](https://github.com/SocketDev/socket-patch/pull/1049) (#792), [#1051](https://github.com/SocketDev/socket-patch/pull/1051) (#580).
 - October 7 campaign (duplicate business logic, one PR per seam; register rows in brackets): #1026 credentials [C59], #1029 trust signals [C61], #1032 JVM layout [E77, E69], #1033 VEX attestation [E72], #1034 target grammar [C62], #1035 supersede lifecycle [E71], #1038 paths and roots [C64], #1039 atomic takeover [E70], #1042 `.socket` containment [C60, C42], #1043 command cycles and UI text [C65, C12], #1044 governing locks [E75], #1045 `PurlKey` [C63], #1046 test hygiene [C66], #1050 vendored liveness [E74], #1057 yarn grammar [E08, E76], #1058 pinned check [E73].
 
@@ -12,19 +13,21 @@ _Last updated 2026-10-08T00:58Z · main @ e61a845_
 - [#889](https://github.com/SocketDev/socket-patch/pull/889): vendor-service retries share `api::retry` (`Retry-After` HTTP-date, jitter). Issue #677 (C15 child 1). `835601b` (+209 / −38). Left: blob/diff fetches have no retry (#676).
 - Earlier: [#886](https://github.com/SocketDev/socket-patch/pull/886) (#845, C48 slice 1), [#870](https://github.com/SocketDev/socket-patch/pull/870) (#781), [#865](https://github.com/SocketDev/socket-patch/pull/865) (#706 slice 1), [#858](https://github.com/SocketDev/socket-patch/pull/858) (#728), [#850](https://github.com/SocketDev/socket-patch/pull/850) (#823 slice 1), [#607](https://github.com/SocketDev/socket-patch/pull/607) (#571), [#602](https://github.com/SocketDev/socket-patch/pull/602) (#592), [#597](https://github.com/SocketDev/socket-patch/pull/597) (#561, E01), [#587](https://github.com/SocketDev/socket-patch/pull/587) (#569, C01), [#583](https://github.com/SocketDev/socket-patch/pull/583) (E12), [#581](https://github.com/SocketDev/socket-patch/pull/581) (#570), [#574](https://github.com/SocketDev/socket-patch/pull/574) (#562), [#572](https://github.com/SocketDev/socket-patch/pull/572) (#563).
 
-**Queue** (B bugs closed, U unblocks, D duplication removed, R risk; score = 3B + 2U + D − risk):
+**Queue** (B bugs closed, U unblocks, D duplication removed, R risk; score = 3B + 2U + 2D + S − risk):
 
 | # | Candidate | B | U | D | R | Score | Note |
 |---|---|:-:|:-:|:-:|:-:|:-:|---|
-| 1 | #990 (E24, child 1 of #989): one `vendor::revert::finish` with an explicit `KeepPolicy` for the 12 copied finish blocks | 0 | 1 | ≈12 | L | ≈14 | skipped: backend files changed by #1032, #1039, #1043, #1044, #1050, #1057 |
-| 2 | #922 (E22, child 1 of #920): one `VendorEntry::npm` constructor for the 7 npm-family ledger tails | 0 | 1 | ≈7 | L | ≈9 | skipped: claimed; drivers changed by #1008 |
-| 3 | #998 (C56): one NotFound-only manifest probe (5 `metadata().is_err()` copies) | 1 | 1 | ≈5 | M | ≈8 | skipped: `commands/vendor.rs` changed by open PRs; pairs with #931 and #1063 |
-| 4 | #931 (C13 child 1): one manifest-read error mapper for every command | 1 | 1 | ≈2.5 | M | ≈5.5 | skipped: as #998 |
-| 5 | #893 (C50): one artifact GC retention policy | 1 | 0 | ≈2 | L | ≈4 | next eligible when a slot frees |
+| 1 | #990 (E24, child 1 of #989): one `vendor::revert::finish` with an explicit `KeepPolicy` for the 12 copied finish blocks | 0 | 1 | ≈12 | L | ≈26 | skipped: all 12 backend files changed by open PRs (#1008, #1009, #1026, #1039, #1041, #1043, #1050, #1051, #1057, …) |
+| 2 | #922 (E22, child 1 of #920): one `VendorEntry::npm` constructor for the 7 npm-family ledger tails | 0 | 1 | ≈7 | L | ≈16 | skipped: claimed; drivers changed by #1008 |
+| 3 | #998 (C56): one NotFound-only manifest probe (5 `metadata().is_err()` copies) | 1 | 1 | ≈5 | M | ≈13 | skipped: `commands/vendor.rs` changed by 11 open PRs |
+| 4 | #631 (E52) step 1: move `go_sum_edit.rs` to `formats/golang/sum.rs` | 0 | 1 | 0 | L | ≈2 | skipped: `redirect/mod.rs`, `vendor/mod.rs`, `formats/mod.rs` changed by open PRs; steps 2–3 in #1103 |
+| 5 | #1067 (C48 rest): route `pdm_site` / `npm_dir` child deadlines through `utils::process` | 0 | 0 | ≈2 | L | ≈4 | skipped: `npm_dir.rs` and `utils/process.rs` changed by #1026 |
 
-Re-ranked 2026-10-08T00:58Z (order unchanged). main moved 05ecc6e → e61a845 with five fixer/CI merges (#946, #978, #1002, #1073, #1080), none touching a queued row. New since 23:58Z: #1099 is a `Decide:` issue (skipped, `agent:needs-human`); #1098 (gem VEX judges an unused system gem-home copy, B 1, U 0, D 0, score ≈3) is a single bug for the fixer and overlaps #1033 (VEX). The 8 maintainer drafts refreshed their heartbeats at 00:42Z. New since 20:58Z: #1088 is a `Decide:` issue (skipped, `agent:needs-human`); #1089/#1090 (CLI tests assert error codes, test-only, B 0, U 1, D ≈1, score ≈3) rank below #893 and overlap #1046 (test hygiene). Earlier, the October 7 reconciliation: stale skip lists replaced (#657, #909, #940, #1015, #876, #889 merged). The campaign PRs above cover E08, E69–E77, C42 and C59–C67; don't start work on those rows.
+Re-ranked 2026-10-08T02:00Z under the uncapped REFACTOR.md. Every open `refactor`/`arch-audit` issue was checked against the files of the 39 open PRs; #631 steps 2–3 (one file, `vendor/go_sum_edit.rs`) was the only eligible slice, and it went to #1103. Score now uses 2·D per REFACTOR.md.
 
 **Notes:**
+- Overlap check recipe: list `/pulls?state=open`, fetch `/pulls/<n>/files` for each (≈40 calls), and match exact paths; suffix matches on `mod.rs` / `client.rs` give false positives.
+- To delete a refactor oracle safely: first refactor the kept code while the oracle test still runs, then capture the oracle's outputs on odd inputs as fixed expectations, then delete it (done in #1103).
 - The sandbox runs as root, so 4 core lib tests fail on main and on branches alike: `copy_tree::relax_loop_must_not_traverse_symlinked_root`, `vlt_heal::an_unremovable_hidden_lock_keeps_every_store_entry`, `pypi_poetry::wire_write_failure_maps_error_and_leaves_lock_untouched`, `pypi_requirements::wire_failure_rolls_back_already_written_files`.
 - `redirect/pipenv.rs`, `vendor/pypi.rs` and `vendor/lock_inventory/vlt.rs` aren't rustfmt-clean on main: format only your own hunks there. Check `rustfmt --check` on the `main` copy before formatting a whole file.
 - `lock_inventory/mod.rs` `architecture_tests` forbid `hosted_patch_uuid*` in a format file's model section. Origin-policy helpers go after the `// ── registry view ──` marker.
