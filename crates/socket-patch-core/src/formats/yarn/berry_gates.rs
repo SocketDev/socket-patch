@@ -197,7 +197,7 @@ pub fn yarnrc_compression_level(rc: &str) -> Option<&str> {
 /// The top-level `.yarnrc.yml` scalar `key`, when set, read as
 /// [`yarnrc_compression_level`] describes.
 pub fn yarnrc_scalar<'a>(rc: &'a str, key: &str) -> Option<&'a str> {
-    let rc = rc.strip_prefix('\u{feff}').unwrap_or(rc);
+    let rc = crate::formats::text::strip_bom(rc);
     rc.lines().find_map(|line| {
         let rest = line.strip_prefix(key)?.strip_prefix(':')?.trim();
         if let Some(quote) = rest.chars().next().filter(|c| matches!(c, '\'' | '"')) {
@@ -326,6 +326,11 @@ mod tests {
         );
         assert_eq!(
             yarnrc_compression_level("\u{feff}nodeLinker: pnp\r\n"),
+            None
+        );
+        // A second BOM is content (#905): the key is not at column 0.
+        assert_eq!(
+            yarnrc_compression_level("\u{feff}\u{feff}compressionLevel: 0\n"),
             None
         );
     }
