@@ -7136,12 +7136,11 @@ fn rewrite_maven_pom(
             // The suffix carries only the uuid's first eight hex digits: a
             // `-socket.<hex8>` literal of another artifact still in the pom
             // may be a different live pin whose uuid shares them, so its
-            // repository stays.
-            if pom_text.contains(&format!("-socket.{hex8}")) {
-                continue;
-            }
+            // repository stays. The trusted checksums below are keyed by this
+            // artifact's own GAV, so they go either way.
+            let hex8_still_pinned = pom_text.contains(&format!("-socket.{hex8}"));
             for old_uuid in generation::named_generations(pom_text) {
-                if old_uuid == dep.patch_uuid || !old_uuid.starts_with(hex8) {
+                if hex8_still_pinned || old_uuid == dep.patch_uuid || !old_uuid.starts_with(hex8) {
                     continue;
                 }
                 let old_id = generation::hosted_pin_name(&old_uuid);
@@ -22870,6 +22869,12 @@ mod owned_pin_generation_matrix {
             pom.contains(&format!("<id>socket-patch-{twin}</id>")),
             "the live twin pin lost its repository:\n{pom}"
         );
+        // The superseded generation's own trusted checksums are keyed by its
+        // GAV, so they go even though the hex8-sharing repository stays.
+        let checksums = &repinned[MVN_CHECKSUMS];
+        assert!(!checksums.contains("3.12.0-socket.aaaaaaaa"), "{checksums}");
+        assert!(checksums.contains("3.12.0-socket.bbbbbbbb"), "{checksums}");
+        assert!(checksums.contains("1.10.0-socket.aaaaaaaa"), "{checksums}");
     }
 
     /// A `-socket.<hex8>` literal that no hosted `socket-patch-<uuid>`
