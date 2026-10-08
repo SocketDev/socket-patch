@@ -124,6 +124,8 @@ fn render(out: &Discovery, root: &Path) -> Value {
         unattested,
         contested,
         shadowed,
+        read: _,
+        withheld: _,
         // Already folded into `unattested` by the time a run returns.
         unwired_copies: _,
     } = out;

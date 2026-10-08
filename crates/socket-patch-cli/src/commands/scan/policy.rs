@@ -84,10 +84,14 @@ pub(crate) fn load_invocation_policy(args: &ScanArgs) -> Result<InvocationPolicy
 pub(crate) fn dir_markers(dir: &Path) -> Vec<String> {
     let mut markers = lock_markers(dir);
     if markers.is_empty() {
-        // No lockfile: the manifests say what the project is.
+        // No lockfile: the manifests say what the project is. Every name
+        // here, JVM build files included, must be a regular file: the
+        // root-marker report lists files, so it deliberately keeps
+        // `is_file` rather than `layout::marker_present` (which lets a
+        // directory named like a build file mark a JVM build).
         markers = MANIFEST_MARKERS
             .iter()
-            .chain(socket_patch_core::crawlers::jvm_cache::JVM_PROJECT_MARKERS)
+            .chain(socket_patch_core::vendor::jvm::layout::JVM_PROJECT_MARKERS)
             .filter(|name| dir.join(name).is_file())
             .map(|name| name.to_string())
             .collect();
@@ -117,7 +121,7 @@ fn lock_markers(dir: &Path) -> Vec<String> {
 }
 
 /// Manifests that stand in as markers for a root with no lockfile (plus
-/// every JVM build file, `jvm_cache::JVM_PROJECT_MARKERS`).
+/// every JVM build file, `layout::JVM_PROJECT_MARKERS`).
 const MANIFEST_MARKERS: [&str; 6] = [
     "package.json",
     "pyproject.toml",
@@ -442,7 +446,9 @@ impl ScanPolicy {
             }
             if root_ok && self.policy.admits_purl(&purl).is_ok() {
                 if let Some(projects) = skipped.remove(&purl) {
-                    self.report().shared_copies.insert(PurlKey::new(&purl).into_string(), projects);
+                    self.report()
+                        .shared_copies
+                        .insert(PurlKey::new(&purl).into_string(), projects);
                 }
             }
             admitted.insert(purl);
@@ -485,7 +491,9 @@ impl ScanPolicy {
     }
 
     fn recorded_uuid(&self, purl: &str) -> Option<&str> {
-        self.recorded.get(&PurlKey::new(purl).into_string()).map(String::as_str)
+        self.recorded
+            .get(&PurlKey::new(purl).into_string())
+            .map(String::as_str)
     }
 
     /// Step 3: the root, ecosystem and package filters. Returns whether the
@@ -521,7 +529,10 @@ impl ScanPolicy {
         }
         if root_excluded {
             // Already reported as the root's one entry.
-        } else if report.filtered_purls.insert(PurlKey::new(purl).into_string()) {
+        } else if report
+            .filtered_purls
+            .insert(PurlKey::new(purl).into_string())
+        {
             report.filtered.push(FilteredEntry {
                 purl: Some(PurlKey::new(purl).into_string()),
                 uuid: None,
@@ -536,7 +547,10 @@ impl ScanPolicy {
     /// Record the purls with a newer patch (`updates[]`), for
     /// `retained[].upgradeAvailable`.
     pub(crate) fn set_update_purls<'a>(&self, purls: impl IntoIterator<Item = &'a str>) {
-        self.report().update_purls = purls.into_iter().map(|p| PurlKey::new(p).into_string()).collect();
+        self.report().update_purls = purls
+            .into_iter()
+            .map(|p| PurlKey::new(p).into_string())
+            .collect();
     }
 
     /// Steps 5-6: group the tier-accessible offers, keep retained packages
@@ -550,7 +564,10 @@ impl ScanPolicy {
         {
             let report = self.report();
             for offer in accessible {
-                if report.retained_purls.contains(&PurlKey::new(&offer.purl).into_string()) {
+                if report
+                    .retained_purls
+                    .contains(&PurlKey::new(&offer.purl).into_string())
+                {
                     continue;
                 }
                 grouped.entry(offer.purl.clone()).or_default().push(offer);
@@ -623,8 +640,13 @@ impl ScanPolicy {
                 }
             }
             if let Some(i) = chosen {
-                if report.shared_copies.contains_key(&PurlKey::new(&purl).into_string()) {
-                    report.shared_selected.insert(PurlKey::new(&purl).into_string());
+                if report
+                    .shared_copies
+                    .contains_key(&PurlKey::new(&purl).into_string())
+                {
+                    report
+                        .shared_selected
+                        .insert(PurlKey::new(&purl).into_string());
                 }
                 offers.selected.insert(purl.clone(), group[i].clone());
             }

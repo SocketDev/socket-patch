@@ -6,7 +6,6 @@ use sha1::Sha1;
 use sha2::{Digest as _, Sha256};
 
 use crate::constants::SOCKET_DIR;
-use crate::crawlers::maven_crawler::is_safe_maven_coordinate;
 use crate::manifest::schema::{PatchFileInfo, PatchRecord};
 use crate::patch::apply::{ApplyResult, PatchSources};
 use crate::patch::copy_tree::remove_tree;
@@ -16,6 +15,7 @@ use crate::utils::fs::{
 };
 use crate::utils::purl::{build_maven_purl, parse_maven_purl};
 use crate::utils::socket_dir::remove_tree_and_prune;
+use crate::vendor::jvm::layout::{self, is_path_safe};
 
 use super::common::{
     already_patched_result, any_live_file_references, done, failed_result,
@@ -62,25 +62,6 @@ const MAVEN_USER_AGENT: &str = "Apache-Maven/3.9.11 (Java 17.0.16; Mac OS X 15.5
 const MAVEN_USER_AGENT: &str = "Apache-Maven/3.9.11 (Java 17.0.16; Windows 11 10.0)";
 #[cfg(not(any(target_os = "macos", target_os = "windows")))]
 const MAVEN_USER_AGENT: &str = "Apache-Maven/3.9.11 (Java 17.0.16; Linux 6.8.0)";
-
-/// The maven2 registry base for the (fallback) pom download, overridable with
-/// `SOCKET_MAVEN_REGISTRY` (the private-mirror / test escape hatch). Default is
-/// Maven Central's maven2 endpoint.
-pub(crate) fn maven_registry_base() -> String {
-    std::env::var("SOCKET_MAVEN_REGISTRY")
-        .ok()
-        .map(|v| v.trim_end_matches('/').to_string())
-        .filter(|v| !v.is_empty())
-        .unwrap_or_else(|| "https://repo1.maven.org/maven2".to_string())
-}
-
-/// Convert a dotted Maven groupId to its maven2 path segment
-/// (`org.apache.commons` → `org/apache/commons`). Local twin of the private
-/// `maven_crawler::group_id_to_path`; the coordinate has already passed
-/// [`is_safe_maven_coordinate`] before this runs.
-fn group_id_to_path(group_id: &str) -> String {
-    group_id.replace('.', "/")
-}
 
 /// Everything [`vendor_maven`] decides before it can first ask the patch
 /// service: the coordinate guards, the no-op of an empty patch, the project
@@ -144,17 +125,20 @@ async fn maven_prelude(
     // Each dot-delimited groupId segment must be a safe path segment on its
     // own (which also rejects an empty groupId and leading/trailing/double
     // dots), as must the artifactId and version.
-    if !is_safe_maven_coordinate(group_id, artifact_id, version) {
+    if !is_path_safe(group_id, artifact_id, version) {
         return Err(refused(
             "unsafe_coordinates",
             format!("unsafe maven coordinates `{group_id}:{artifact_id}` @ `{version}`"),
         ));
     }
 
-    let group_path = group_id_to_path(group_id);
-    let leaf_rel = format!("{uuid_dir_rel}/{group_path}/{artifact_id}/{version}");
-    let jar_leaf = format!("{artifact_id}-{version}.jar");
-    let pom_leaf = format!("{artifact_id}-{version}.pom");
+    let group_path = layout::group_path(group_id);
+    let leaf_rel = format!(
+        "{uuid_dir_rel}/{}",
+        layout::version_dir(group_id, artifact_id, version)
+    );
+    let jar_leaf = layout::file_name(artifact_id, version, None, "jar");
+    let pom_leaf = layout::file_name(artifact_id, version, None, "pom");
     let jar_copy_rel = format!("{leaf_rel}/{jar_leaf}");
     let uuid_dir = project_root.join(&uuid_dir_rel);
     let leaf_dir = project_root.join(&leaf_rel);
@@ -189,7 +173,7 @@ async fn maven_prelude(
     let Some(pom_xml_text) = pom_xml_text else {
         // No project pom.xml: a gradle-only project has no <repositories> to
         // wire (and Gradle ignores it); anything else is not a Maven project.
-        if project_has_gradle(project_root).await {
+        if layout::has_build(project_root, layout::BuildTool::Gradle) {
             return Err(refused(
                 "vendor_gradle_unsupported",
                 "this is a Gradle project (no pom.xml); vendoring wires a Maven \
@@ -210,7 +194,10 @@ async fn maven_prelude(
         ));
     }
 
-    let wired = pom_xml_text.contains(&repo_id);
+    // Wired = our `<repository>` id where Maven reads it: a commented-out
+    // or profile-scoped block serves nothing (the same masking the
+    // forward writer's anchors use), so it must not take the hot path.
+    let wired = find_wireable_anchor(&pom_xml_text, &repo_id).is_some();
     let in_sync = wired && artifact_in_sync(&leaf_dir, &jar_leaf, &pom_leaf, &record.files).await;
     Ok(MavenPrelude {
         group_id: group_id.to_string(),
@@ -234,7 +221,9 @@ async fn maven_prelude(
 }
 
 /// Whether [`vendor_maven`] — a wet run with the service enabled — asks the
-/// patch service for `record`: past every refusal it raises first and not
+/// patch service for `record`: past every refusal and skip it raises first
+/// (`not_build_root`, and for a JVM shape [`jvm_prelude`]'s coordinate,
+/// ledger and sbt / scala-cli gate stops), not the empty patch, and not
 /// answered by the in-sync hot path. The vendor loop's download plan
 /// consults this.
 pub(crate) async fn service_preflight(
@@ -242,7 +231,12 @@ pub(crate) async fn service_preflight(
     project_root: &Path,
     record: &PatchRecord,
 ) -> Option<crate::api::client::PlannedDownload> {
+    if not_build_root(project_root).is_some() {
+        return None;
+    }
     if let Some(shape) = jvm_shape(project_root).await {
+        jvm_prelude(shape, purl, project_root, record).await.ok()?;
+        (!record.files.is_empty()).then_some(())?;
         jvm_committed_patch(shape, purl, project_root, record)
             .await
             .is_none()
@@ -395,7 +389,6 @@ async fn vendor_maven_single(
                 group_id,
                 artifact_id,
                 version,
-                &group_path,
                 record,
                 sources,
                 force,
@@ -464,7 +457,6 @@ async fn vendor_maven_single(
         group_id,
         artifact_id,
         version,
-        &group_path,
         record,
         sources,
         force,
@@ -739,12 +731,12 @@ async fn legacy_mixed_root(project_root: &Path) -> bool {
 /// spelling reaches it ([`shown_ancestor`]).
 pub(super) fn not_build_root(project_root: &Path) -> Option<String> {
     let project = super::jvm::apply::ProjectReader::new(project_root);
-    let own_settings = ["settings.gradle", "settings.gradle.kts"]
+    let own_settings = layout::GRADLE_SETTINGS_FILES
         .iter()
-        .any(|f| project_root.join(f).is_file());
-    let own_build = ["build.gradle", "build.gradle.kts"]
+        .any(|f| layout::marker_present(project_root, f));
+    let own_build = layout::GRADLE_BUILD_FILES
         .iter()
-        .any(|f| project_root.join(f).is_file());
+        .any(|f| layout::marker_present(project_root, f));
     let canonical_root =
         std::fs::canonicalize(project_root).unwrap_or_else(|_| project_root.to_path_buf());
     let ancestors = crate::utils::repo_root::ancestor_search_dirs(&canonical_root);
@@ -774,8 +766,9 @@ pub(super) fn not_build_root(project_root: &Path) -> Option<String> {
         }
         let read_text = |p: &str| crate::gradle::dsl::decode(&reader.read(p)?);
         // Gradle reads the Groovy settings first.
-        let settings = ["settings.gradle", "settings.gradle.kts"]
-            .into_iter()
+        let settings = layout::GRADLE_SETTINGS_FILES
+            .iter()
+            .copied()
             .find(|f| reader.read(f).is_some());
         // Only a Gradle project can belong to an ancestor Gradle build.
         if let Some(settings) = settings.filter(|_| own_build || own_settings) {
@@ -1004,7 +997,7 @@ async fn jvm_committed_patch(
     };
     for (dir, tree_version) in &trees {
         let marker: serde_json::Value =
-            serde_json::from_slice(&read(&format!("{dir}/socket-patch.vendor.json"))?).ok()?;
+            serde_json::from_slice(&read(&format!("{dir}/{}", layout::MARKER_FILE))?).ok()?;
         if marker.get("uuid")?.as_str()? != record.uuid {
             return None;
         }
@@ -1042,6 +1035,65 @@ async fn jvm_committed_patch(
         .then_some((committed, extras))
 }
 
+/// What [`vendor_maven_jvm`] establishes before anything else: the
+/// coordinates, the ledger, and the sbt / scala-cli resolution gate's pass.
+struct JvmPrelude {
+    group_id: String,
+    artifact_id: String,
+    version: String,
+    state: super::state::VendorState,
+    gate_pass: super::jvm::sbt_gate::ShapePass,
+}
+
+/// Every refusal and skip [`vendor_maven_jvm`] raises before it can first
+/// ask the patch service (bar the empty patch's no-op and the committed
+/// tree's hot path), so its download plan ([`service_preflight`]) grants
+/// nothing the vendor loop then stops short of.
+async fn jvm_prelude(
+    shape: super::jvm::Shape,
+    purl: &str,
+    project_root: &Path,
+    record: &PatchRecord,
+) -> Result<JvmPrelude, VendorOutcome> {
+    let Some((group_id, artifact_id, version)) = parse_maven_purl(purl) else {
+        return Err(refused(
+            "unsafe_coordinates",
+            format!("not a maven purl: {purl}"),
+        ));
+    };
+    let (group_id, artifact_id, version) = (
+        group_id.to_string(),
+        artifact_id.to_string(),
+        version.to_string(),
+    );
+    if vendor_uuid_dir_rel("maven", &record.uuid).is_none() {
+        return Err(refused(
+            "unsafe_coordinates",
+            format!("non-canonical patch uuid {:?}", record.uuid),
+        ));
+    }
+    if !layout::safe_coordinates(&group_id, &artifact_id, &version) {
+        return Err(refused(
+            "unsafe_coordinates",
+            format!("unsafe maven coordinates `{group_id}:{artifact_id}` @ `{version}`"),
+        ));
+    }
+    let state = super::state::load_state(project_root)
+        .await
+        .map_err(|e| refused("vendor_state_unreadable", e.to_string()))?;
+    // sbt / scala-cli pins are gated on the build's own resolution first.
+    let gate_pass =
+        super::jvm::sbt_gate::for_shape(shape, project_root, &group_id, &artifact_id, &version)
+            .map_err(|stop| stop.into_outcome(purl))?;
+    Ok(JvmPrelude {
+        group_id,
+        artifact_id,
+        version,
+        state,
+        gate_pass,
+    })
+}
+
 /// Vendor into a multi-module reactor, a Gradle build or a mixed root
 /// through the [`super::jvm`] backend. The jar and pom come from the
 /// committed tree when it already holds this patch, otherwise from the
@@ -1060,39 +1112,19 @@ async fn vendor_maven_jvm(
     service: Option<&VendorServiceConfig>,
 ) -> VendorOutcome {
     use super::jvm::Shape;
-    let Some((group_id, artifact_id, version)) = parse_maven_purl(purl) else {
-        return refused("unsafe_coordinates", format!("not a maven purl: {purl}"));
-    };
-    let (group_id, artifact_id, version) = (
-        group_id.to_string(),
-        artifact_id.to_string(),
-        version.to_string(),
-    );
-    if vendor_uuid_dir_rel("maven", &record.uuid).is_none() {
-        return refused(
-            "unsafe_coordinates",
-            format!("non-canonical patch uuid {:?}", record.uuid),
-        );
-    }
-    if !super::jvm::safe_coordinates(&group_id, &artifact_id, &version) {
-        return refused(
-            "unsafe_coordinates",
-            format!("unsafe maven coordinates `{group_id}:{artifact_id}` @ `{version}`"),
-        );
-    }
-    let state = match super::state::load_state(project_root).await {
-        Ok(state) => Some(state),
-        Err(e) => return refused("vendor_state_unreadable", e.to_string()),
-    };
-    let gradle = matches!(shape, Shape::Gradle | Shape::Mixed);
-    let display_path = project_root.join(".socket/vendor");
-    // sbt / scala-cli pins are gated on the build's own resolution first.
-    let gate =
-        super::jvm::sbt_gate::for_shape(shape, project_root, &group_id, &artifact_id, &version);
-    let gate_pass = match gate.map_err(|stop| stop.into_outcome(purl)) {
-        Ok(pass) => pass,
+    let JvmPrelude {
+        group_id,
+        artifact_id,
+        version,
+        state,
+        gate_pass,
+    } = match jvm_prelude(shape, purl, project_root, record).await {
+        Ok(prelude) => prelude,
         Err(outcome) => return outcome,
     };
+    let state = Some(state);
+    let gradle = matches!(shape, Shape::Gradle | Shape::Mixed);
+    let display_path = project_root.join(".socket/vendor");
     if record.files.is_empty() {
         let reader = super::jvm::apply::ProjectReader::new(project_root);
         let probe_pom = format!("<project><groupId>{group_id}</groupId><artifactId>{artifact_id}</artifactId><version>{version}</version></project>");
@@ -1433,7 +1465,7 @@ async fn vendor_maven_jvm(
         &jar_bytes,
         wiring,
     );
-    entry.ecosystem = "jvm".to_string();
+    entry.ecosystem = layout::LEDGER_ECOSYSTEM.to_string();
     done(result, Some(entry), warnings)
 }
 
@@ -1448,17 +1480,13 @@ async fn acquire_classifier(
     service: Option<&VendorServiceConfig>,
 ) -> Result<Option<Vec<u8>>, String> {
     let (g, a, v) = gav;
-    let leaf = format!("{a}-{v}-{classifier}.jar");
+    let leaf = layout::file_name(a, v, Some(classifier), "jar");
     let local_copy = local.find(gav, Some(classifier), "jar", true).await?;
     let online = service.is_some_and(|s| !s.offline);
     let bytes = match local_copy {
         Some(bytes) => bytes,
         None if online => {
-            let url = format!(
-                "{}/{}/{a}/{v}/{leaf}",
-                maven_registry_base(),
-                group_id_to_path(g)
-            );
+            let url = layout::registry_url(g, a, v, Some(classifier), "jar");
             match fetch_registry_bytes(&url, super::registry_fetch::MAX_DOWNLOAD_BYTES).await {
                 Ok(bytes) => bytes,
                 Err(e) if e.contains("HTTP 404") => return Ok(None),
@@ -1517,9 +1545,9 @@ async fn verify_jvm_upstream(
         None => format!(".{ext}"),
     };
     let url = format!(
-        "{}/{gpath}/{a}/{v}/{a}-{v}{tail}",
-        maven_registry_base(),
-        gpath = group_id_to_path(g)
+        "{}/{}/{a}-{v}{tail}",
+        layout::registry_base(),
+        layout::version_dir(g, a, v)
     );
     let (checksum, actual) = match fetch_pom_bytes(&format!("{url}.sha512")).await {
         Ok(sum) => (sum, hex::encode(sha2::Sha512::digest(bytes))),
@@ -1551,19 +1579,12 @@ pub(super) async fn acquire_jvm_artifact(
     service: Option<&VendorServiceConfig>,
 ) -> Result<Vec<u8>, String> {
     let (g, a, v) = gav;
-    let leaf = match classifier {
-        Some(c) => format!("{a}-{v}-{c}.{ext}"),
-        None => format!("{a}-{v}.{ext}"),
-    };
+    let leaf = layout::file_name(a, v, classifier, ext);
     let bytes = match local.find(gav, classifier, ext, false).await? {
         Some(bytes) => bytes,
         None if service.is_some_and(|s| !s.offline) => {
             fetch_registry_bytes(
-                &format!(
-                    "{}/{}/{a}/{v}/{leaf}",
-                    maven_registry_base(),
-                    group_id_to_path(g)
-                ),
+                &layout::registry_url(g, a, v, classifier, ext),
                 if ext == "jar" {
                     super::registry_fetch::MAX_DOWNLOAD_BYTES
                 } else {
@@ -1753,7 +1774,6 @@ async fn materialise_and_write(
     group_id: &str,
     artifact_id: &str,
     version: &str,
-    group_path: &str,
     record: &PatchRecord,
     _sources: &PatchSources<'_>,
     _force: bool,
@@ -1774,7 +1794,6 @@ async fn materialise_and_write(
         group_id,
         artifact_id,
         version,
-        group_path,
         service,
         warnings,
     )
@@ -1804,7 +1823,6 @@ async fn acquire_upstream_pom(
     group_id: &str,
     artifact_id: &str,
     version: &str,
-    group_path: &str,
     service: Option<&VendorServiceConfig>,
     warnings: &mut Vec<VendorWarning>,
 ) -> Result<Vec<u8>, String> {
@@ -1828,8 +1846,7 @@ async fn acquire_upstream_pom(
              (it would drop transitive dependencies)"
         ));
     }
-    let base = maven_registry_base();
-    let url = format!("{base}/{group_path}/{artifact_id}/{version}/{artifact_id}-{version}.pom");
+    let url = layout::registry_url(group_id, artifact_id, version, None, "pom");
     match fetch_pom_bytes(&url).await {
         Ok(bytes) => {
             warnings.push(VendorWarning::new(
@@ -2152,22 +2169,6 @@ fn real_open_tag(text: &str, element: &str) -> bool {
     false
 }
 
-/// Whether the project root carries a Gradle build marker (used only to give a
-/// gradle-only project the specific `vendor_gradle_unsupported` refusal).
-async fn project_has_gradle(project_root: &Path) -> bool {
-    for marker in [
-        "build.gradle",
-        "build.gradle.kts",
-        "settings.gradle",
-        "settings.gradle.kts",
-    ] {
-        if tokio::fs::metadata(project_root.join(marker)).await.is_ok() {
-            return true;
-        }
-    }
-    false
-}
-
 /// The always-on `vendor_maven_local_cache_shadow` advisory carrying the purge
 /// one-liner.
 fn local_cache_shadow_warning(
@@ -2446,6 +2447,72 @@ mod tests {
         }
     }
 
+    /// The JVM shapes' plan entry asks for a grant exactly when the JVM
+    /// backend would: never for a Gradle subproject (`not_build_root`) nor
+    /// for an sbt build the resolution gate skips, both of which stop
+    /// before the service is asked; a Gradle root does ask. A granted
+    /// download the loop then skips is a leaked server-side build.
+    #[tokio::test]
+    #[serial_test::serial]
+    async fn jvm_service_preflight_matches_what_the_backend_asks_for() {
+        use crate::vendor::test_support::{granted_uuids, mount_no_results, service_cfg};
+        let server = wiremock::MockServer::start().await;
+        mount_no_results(&server).await;
+        let cfg = service_cfg(&server.uri(), crate::vendor::VendorSource::Service, false);
+
+        let (sub_dir, blobs, installed, record) = fixture(None, true, true).await;
+        std::fs::create_dir_all(sub_dir.path().join(".git")).unwrap();
+        std::fs::write(sub_dir.path().join("settings.gradle"), "include 'app'\n").unwrap();
+        let subproject = sub_dir.path().join("app");
+        std::fs::create_dir_all(&subproject).unwrap();
+        std::fs::write(subproject.join("build.gradle"), "plugins { id 'java' }\n").unwrap();
+
+        let (sbt_dir, ..) = fixture(None, true, true).await;
+        std::fs::create_dir_all(sbt_dir.path().join("project")).unwrap();
+        std::fs::write(
+            sbt_dir.path().join("build.sbt"),
+            "scalaVersion := \"2.13.12\"\n",
+        )
+        .unwrap();
+        std::fs::write(
+            sbt_dir.path().join("project/build.properties"),
+            "sbt.version=1.9.7\n",
+        )
+        .unwrap();
+
+        let (gradle_dir, ..) = fixture(None, true, true).await;
+        std::fs::write(
+            gradle_dir.path().join("build.gradle"),
+            "plugins { id 'java' }\n",
+        )
+        .unwrap();
+
+        let sources = PatchSources::blobs_only(&blobs);
+        for (project, asks) in [
+            (subproject.as_path(), false),
+            (sbt_dir.path(), false),
+            (gradle_dir.path(), true),
+        ] {
+            let planned = service_preflight(PURL, project, &record).await.is_some();
+            let before = granted_uuids(&server).await.len();
+            let _ = crate::vendor::test_support::vendor_maven(
+                PURL,
+                installed.as_path(),
+                project,
+                &record,
+                &sources,
+                "2026-06-09T00:00:00Z",
+                false,
+                false,
+                Some(&cfg),
+            )
+            .await;
+            let asked = granted_uuids(&server).await.len() > before;
+            assert_eq!(asked, asks, "{}: the backend's own ask", project.display());
+            assert_eq!(planned, asked, "{}: plan vs backend", project.display());
+        }
+    }
+
     /// The download plan's gate names exactly the artifacts whose vendor call
     /// asks the patch service for a grant: not a non-canonical uuid, not the
     /// empty patch's no-op, and — once vendored — not the in-sync re-run; a
@@ -2649,6 +2716,48 @@ mod tests {
         );
     }
 
+    /// B61: a commented-out vendored `<repository>` is not wiring Maven
+    /// reads, so a re-run must rewire instead of taking the in-sync hot path
+    /// on a raw substring match of the repository id.
+    #[tokio::test]
+    #[serial_test::serial]
+    async fn commented_out_repository_is_not_wired() {
+        let (dir, blobs, installed, record) = fixture(Some(project_pom()), true, true).await;
+        let root = dir.path();
+        let (r1, e1, _) = unwrap_done(run_vendor(root, &blobs, &installed, &record, false).await);
+        assert!(r1.success && e1.is_some());
+
+        let block = repository_block(
+            &format!("{VENDOR_REPO_ID_PREFIX}{UUID}"),
+            &format!(".socket/vendor/maven/{UUID}"),
+        );
+        let pom = tokio::fs::read_to_string(root.join(PROJECT_POM))
+            .await
+            .unwrap();
+        assert!(pom.contains(&block), "first run wires our block: {pom}");
+        tokio::fs::write(
+            root.join(PROJECT_POM),
+            pom.replacen(&block, &format!("<!--\n{block}-->\n"), 1),
+        )
+        .await
+        .unwrap();
+
+        let (r2, e2, _) = unwrap_done(run_vendor(root, &blobs, &installed, &record, false).await);
+        assert!(r2.success, "{:?}", r2.error);
+        assert!(
+            e2.is_some(),
+            "a commented-out repository must not take the in-sync hot path"
+        );
+        let rewired = tokio::fs::read_to_string(root.join(PROJECT_POM))
+            .await
+            .unwrap();
+        assert!(
+            strip_xml_comments(&rewired)
+                .contains(&format!("<id>{VENDOR_REPO_ID_PREFIX}{UUID}</id>")),
+            "the re-run wires a live repository: {rewired}"
+        );
+    }
+
     #[tokio::test]
     #[serial_test::serial]
     async fn wired_missing_artifact_rebuilds_only() {
@@ -2746,7 +2855,7 @@ mod tests {
         let (result, entry, _) =
             unwrap_done(run_vendor(root, &blobs, &installed, &record, false).await);
         assert!(result.success, "{:?}", result.error);
-        assert_eq!(entry.unwrap().ecosystem, "jvm");
+        assert_eq!(entry.unwrap().ecosystem, layout::LEDGER_ECOSYSTEM);
         assert!(root.join(".socket/vendor/gradle-index.tsv").is_file());
     }
 
@@ -3125,8 +3234,11 @@ mod tests {
     #[test]
     #[serial_test::serial]
     fn group_id_path_and_safety() {
-        assert_eq!(group_id_to_path("org.apache.commons"), "org/apache/commons");
-        let is_safe_group_id = |g| is_safe_maven_coordinate(g, "a", "1");
+        assert_eq!(
+            layout::group_path("org.apache.commons"),
+            "org/apache/commons"
+        );
+        let is_safe_group_id = |g| is_path_safe(g, "a", "1");
         assert!(is_safe_group_id("org.apache.commons"));
         assert!(!is_safe_group_id(""));
         assert!(!is_safe_group_id(".org"));
@@ -3639,7 +3751,7 @@ mod tests {
 
     /// No pom.xml AND no gradle marker → the plain missing-pom refusal (the
     /// gradle sibling is tested above; this pins the non-gradle arm and
-    /// `project_has_gradle` returning false through all four probes).
+    /// `layout::has_build(.., Gradle)` returning false through all four probes).
     #[tokio::test]
     #[serial_test::serial]
     async fn refuses_pom_project_missing_without_gradle_marker() {

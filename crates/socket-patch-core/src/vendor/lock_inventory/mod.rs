@@ -199,7 +199,9 @@ impl LockfileEntry {
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub struct UnsupportedNpmLayout {
     /// Stable diagnosis code, including `bun_lockb_invalid` for malformed
-    /// binary Bun locks and the flavor probe's Plug'n'Play refusal codes.
+    /// binary Bun locks, the flavor probe's Plug'n'Play refusal codes, and
+    /// `gem_lock_unsupported` for a Bundler lock bundler loads but
+    /// socket-patch cannot read (despite the name, not only npm).
     pub code: &'static str,
     /// Human-readable diagnosis with format or filesystem error details.
     pub detail: String,
@@ -318,6 +320,7 @@ async fn union_views_in(
         Ok(None) => {}
         Err(diag) => unsupported.push(diag),
     }
+    unsupported.extend(gem::unsupported_gem_layout_in(view).await);
     let views = [
         if every {
             cargo::inventory_cargo_lock_raw_in(view).await
