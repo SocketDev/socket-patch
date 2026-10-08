@@ -180,7 +180,10 @@ jobs:
         include:
           - {os: macos-latest, composer: '1.10.28', php: '8.1', sha256: 0915af36eb01e3f0e16cd309adff7051832b9ef014e38371756804b20425cd5a}
           - {os: macos-latest, composer: '2.2.30', php: '8.3', sha256: 8c2b4478b64f8f7cdf1574838fdb0033b29049ca821dad452db7a3dcfcdbffc2}
-          - {os: macos-latest, composer: '2.10.3', php: '8.5', sha256: 7a2d379d5b8ffdaa028580ef26494c36d2feef4b178d3dd1473a4dbc5e17c8d6}
+          # PHP 8.4 on macOS: setup-php 2.37.2 cannot install 8.5 from Homebrew
+          # since PHP 8.6 shipped (every run from 2026-10-07 23:51Z failed in
+          # "Setup PHP"). Ubuntu and Windows keep the 2.10.3 / 8.5 cell.
+          - {os: macos-latest, composer: '2.10.3', php: '8.4', sha256: 7a2d379d5b8ffdaa028580ef26494c36d2feef4b178d3dd1473a4dbc5e17c8d6}
     runs-on: ${{ matrix.os }}
     timeout-minutes: 60
     steps: *native-steps
