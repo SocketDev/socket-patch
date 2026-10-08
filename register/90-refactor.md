@@ -1,7 +1,8 @@
 ### Refactor routine (`refactor`, hourly, highest leverage first)
-_Last updated 2026-10-08T09:30Z · main @ b96a785_
+_Last updated 2026-10-08T10:20Z · main @ b96a785_
 
 **In flight:**
+- [#1124](https://github.com/SocketDev/socket-patch/pull/1124): 72 CLI test files use `tests/common`'s `binary()` and `git_sha256` instead of private copies (52 + 45 deleted), plus a one-sided `cli/shared_helper_copies.rs` ratchet. Issue #824 (C30, children 2–3; 68 files in open PRs and the three `vlt_*_common` modules remain). Test-only, +450 / −583. `state: ready`.
 - [#1121](https://github.com/SocketDev/socket-patch/pull/1121): ledger recovery reads the recorded uv/pdm `[[package]]` unit through `utils::python_lock::package_artifacts` and picks wheels through the shared `pypi_distribution::is_portable_wheel_url`; deletes recovery's string scanner and suffix rule. Issue #1079 (E89, slice 1; the `lock_inventory/pypi.rs` suffix checks and the rename remain, in files #1058/#1009/#1045/#768 change). `state: ready`.
 - [#1117](https://github.com/SocketDev/socket-patch/pull/1117): 8 inline BOM strips (requirements lexers, manifest, hosted npm manifest, Gradle DSL, socket.yml, CLI Pipenv remedy) onto `formats::text`, plus `strip_bom_bytes` and a one-sided guard with a 26-file pending list. Issue #905 (E64, step 3 slice 1). Only change: a double-BOM Pipfile.lock is unparseable in the stale-install remedy. `state: ready`.
 - [#1110](https://github.com/SocketDev/socket-patch/pull/1110): one `formats::cargo::manifest` reader (`toml_edit`, `[package]` else `[project]`) for the crawler, VEX product and `cargo_tag`; deletes the crawler's line scanner. Issue #693 (E15, slice 1; `vendor/cargo.rs` `path_crate_version`/`declared_cargo_minor` and #651 remain, blocked by #1026/#1039/#1041/#1043/#1050). Parse cost 0.5 µs → 81 µs per manifest, disclosed. `state: ready`.
@@ -19,15 +20,17 @@ _Last updated 2026-10-08T09:30Z · main @ b96a785_
 
 | # | Candidate | B | U | D | R | Score | Note |
 |---|---|:-:|:-:|:-:|:-:|:-:|---|
-| 1 | #990 (E24, child 1 of #989): one `vendor::revert::finish` for the 12 copied finish blocks | 0 | 1 | ≈12 | L | ≈26 | skipped: all 12 backend files changed by open PRs |
-| 2 | #922 (E22): one `VendorEntry::npm` constructor for 7 npm-family ledger tails | 0 | 1 | ≈7 | L | ≈16 | skipped: claimed; drivers changed by #1008 |
-| 3 | #706 (C17) slice 2: the 6 `PENDING_INLINE_DIGESTS` files | 0 | 1 | ≈6 | L | ≈14 | skipped: files changed by open PRs |
-| 4 | #1079 (E89) slice 1: recovery through the shared lock model and wheel classifier | 1 | 1 | 2 | L | ≈9 | **taken: #1121** |
-| 5 | E35 slice: retire the composer/go/nuget/python crawler oracles (≈590 test lines) | 0 | 0 | 4 | L | ≈8 | free files, but test-only; needs a register issue first |
+| 1 | #824 (C30) children 2–3: private `binary()`/`git_sha256` copies onto `tests/common` (free files) | 0 | 1 | ≈97 | L | high | **taken: #1124** (test-only) |
+| 2 | #990 (E24, child 1 of #989): one `vendor::revert::finish` for the 12 copied finish blocks | 0 | 1 | ≈12 | L | ≈26 | skipped: all 12 backend files changed by open PRs |
+| 3 | #823 (C47) slice 2: the 7 `PENDING_SCRUB_COPIES` files | 0 | 1 | 7 | L | ≈16 | skipped: the 7 files are free, but its two-sided guard `spawn_env_hygiene.rs` is changed by #1049 |
+| 4 | #922 (E22): one `VendorEntry::npm` constructor for 7 npm-family ledger tails | 0 | 1 | ≈7 | L | ≈16 | skipped: claimed; drivers changed by #1008 |
+| 5 | #706 (C17) slice 2: the 6 `PENDING_INLINE_DIGESTS` files | 0 | 1 | ≈6 | L | ≈14 | skipped: files changed by open PRs |
 
-Re-ranked 2026-10-08T09:00Z at `b96a785` against the 32 open PRs' 512 files.
+Re-ranked 2026-10-08T10:00Z at `b96a785` against the 33 open PRs' 515 files. E35's crawler-oracle slice is dropped (see Notes).
 
 **Notes:**
+- E35's crawler oracles (composer/go/nuget/python/maven) can't become `golden.rs` digests: their randomized trees use symlinks (no-ops on Windows), permission modes (ignored as root and on Windows) and case-colliding names (folded on macOS). The outputs therefore differ by OS and by uid, and a golden blessed in the root sandbox would fail on non-root Linux CI. Keep the oracles until a crawler can be checked without one.
+- Test-helper migrations (#824): `common/mod.rs` is `#![allow(dead_code)]`, so declaring it costs nothing. Directory binaries (`apply/`, `cli/`, …) import through `crate::common`. After deleting copies, build with `--no-run --message-format=short` and prune the unused `sha2`/`PathBuf` imports it lists.
 - zizmor (`Audit GitHub Actions`) fails new PR heads on main's `ci.yml:1400` setup-php `# v2` label until #1118 merges; port its one-line fix.
 - Lead for `audit-ecosystems` (not filed): hosted `redirect/requirements.rs` keeps its own pip lexer (`logical_requirements`, `unquoted_index`, `requirement_tokens`) beside `utils::requirements::{logical_lines, split_comment, shlex_split}`. Its comment finder is quote-aware, pip's `COMMENT_RE` is not. `upstream/pypi.rs` shares it (changed by #1108).
 - Source-scan guards: make new ones one-sided (fail on new files only), so a PR migrating a pending file can't turn `main` red.
