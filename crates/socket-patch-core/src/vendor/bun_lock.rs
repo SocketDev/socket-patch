@@ -1025,9 +1025,10 @@ async fn revert_bun_wiring(
             return blocked;
         }
     }
-    if dry_run {
-        return RevertOutcome::ok();
-    }
+    // A dry run replays the lock in memory like the wet run, only without
+    // the write and the artifact deletion: its preview then sees the same
+    // `vendor_lockfile_missing` / `vendor_lock_entry_removed` the wet run
+    // would, and names the same reinstall advice.
     let mut outcome = RevertOutcome::ok();
 
     // SECURITY: revert writes are restricted to the one file vendor edits — a
@@ -1071,7 +1072,7 @@ async fn revert_bun_wiring(
         for rec in entry.wiring.iter().rev().filter(|r| r.file == BUN_LOCK) {
             revert_one_record(lines, rec, &entry.uuid, &mut dirty, &mut outcome.warnings);
         }
-        if dirty {
+        if dirty && !dry_run {
             if let Err(e) = atomic_write_bytes_preserving_mode(
                 &project_root.join(BUN_LOCK),
                 lines.join("\n").as_bytes(),
@@ -1090,6 +1091,9 @@ async fn revert_bun_wiring(
     // deleting evidence out from under a lock we just refused to touch.
     if outcome.drift_skipped() {
         outcome.keep_artifact(&uuid_dir_rel);
+        return outcome;
+    }
+    if dry_run {
         return outcome;
     }
 
@@ -3468,6 +3472,45 @@ mod tests {
             .expect("the hoisted copy is reported");
         assert!(w.detail.contains("left-pad@1.3.0"), "{}", w.detail);
         assert!(w.detail.contains("`bun install --force`"), "{}", w.detail);
+    }
+
+    /// A preview names no reinstall the wet run would not: with `bun.lock`
+    /// gone, or the vendored entry removed (`bun remove`), nothing is
+    /// restored and the dry run says so like the wet run, without writing.
+    #[tokio::test]
+    async fn dry_run_revert_skips_the_advisory_when_nothing_is_restored() {
+        for removed_entry in [false, true] {
+            let fx = fixture_with(BN3_BEFORE_LOCK, "node_modules/left-pad").await;
+            let (_, entry, _) = expect_done(fx.vendor(false).await);
+            let entry = entry.unwrap();
+            let lock = fx.root().join(BUN_LOCK);
+            if removed_entry {
+                let text = tokio::fs::read_to_string(&lock).await.unwrap();
+                let kept: Vec<&str> = text
+                    .split('\n')
+                    .filter(|l| !l.contains(&entry.uuid))
+                    .collect();
+                tokio::fs::write(&lock, kept.join("\n")).await.unwrap();
+            } else {
+                tokio::fs::remove_file(&lock).await.unwrap();
+            }
+            let before = tokio::fs::read(&lock).await.ok();
+
+            let dry = revert_bun(&entry, fx.root(), true).await;
+            assert!(dry.success, "{:?}", dry.error);
+            assert!(
+                dry.warnings.iter().all(|w| w.code != REINSTALL_REQUIRED),
+                "removed_entry={removed_entry}: {:?}",
+                dry.warnings
+            );
+            assert_eq!(tokio::fs::read(&lock).await.ok(), before, "dry run wrote");
+            let wet = revert_bun(&entry, fx.root(), false).await;
+            assert!(
+                wet.warnings.iter().all(|w| w.code != REINSTALL_REQUIRED),
+                "removed_entry={removed_entry}: {:?}",
+                wet.warnings
+            );
+        }
     }
 
     /// The isolated linker relinks `node_modules/<name>` to the restored
