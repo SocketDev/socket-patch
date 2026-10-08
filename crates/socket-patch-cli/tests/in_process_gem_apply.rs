@@ -217,10 +217,8 @@ async fn gem_install_scan_sync_patches_real_file() {
             ..socket_patch_cli::args::GlobalArgs::default()
         },
         batch_size: Some(100),
-        apply: false,
         prune: false,
         sync: true,
-        vendor: false,
         mode: None,
         all_releases: false,
         vex: Default::default(),
@@ -330,10 +328,8 @@ async fn gem_crawler_finds_real_installed_gem() {
             ..socket_patch_cli::args::GlobalArgs::default()
         },
         batch_size: Some(100),
-        apply: false,
         prune: false,
         sync: false,
-        vendor: false,
         mode: None,
         all_releases: false,
         vex: Default::default(),

@@ -1,6 +1,6 @@
 //! In-process + envelope contract tests for `socket-patch vendor` (npm
 //! backend, plus the golang apply-yields-to-vendor handshake, plus the gem
-//! backend's `scan --vendor` arm — the one route into the vendor engine no
+//! backend's `scan --mode vendored` arm — the one route into the vendor engine no
 //! gem project had ever been driven through). The vlt legs live in
 //! `in_process_vendor/vlt.rs`.
 //!
@@ -716,7 +716,7 @@ async fn reconcile_leaves_detached_entries_alone() {
 // ─────────────────────────────────────────────────────────────────────
 
 /// Re-vendoring after the manifest moved to a newer patch uuid (the
-/// `scan --vendor` auto-update path) must (a) rewire the lock at the new
+/// `scan --mode vendored` auto-update path) must (a) rewire the lock at the new
 /// uuid, (b) remove the old uuid's now-orphaned artifact dir, and (c) carry
 /// the pre-vendor lock fragment forward so a later `--revert` still
 /// restores the registry spelling byte-for-byte.
@@ -2887,7 +2887,7 @@ async fn offline_service_mode_refuses_instead_of_building() {
 }
 
 // ─────────────────────────────────────────────────────────────────────
-// 13. gem through `scan --vendor` (mock-proxy API, hermetic bundler layout)
+// 13. gem through `scan --mode vendored` (mock-proxy API, hermetic bundler layout)
 // ─────────────────────────────────────────────────────────────────────
 
 const GEM_UUID: &str = "35353535-3535-4335-8335-353535353535";
@@ -2898,7 +2898,7 @@ const GEM_PURL: &str = "pkg:gem/demo-gem@1.0.0";
 const GEM_PURL_QUALIFIED: &str = "pkg:gem/demo-gem@1.0.0?platform=ruby";
 const GEM_ORIG: &[u8] = b"module DemoGem\n  STATUS = \"orig\"\nend\n";
 const GEM_PATCHED: &[u8] = b"module DemoGem\n  STATUS = \"patched\"\nend\n";
-const GEM_GEMSPEC: &str = "Gem::Specification.new do |s|\n  s.name = \"demo-gem\"\n  s.version = \"1.0.0\"\n  s.summary = \"in-process scan --vendor fixture\"\n  s.authors = [\"socket-patch e2e\"]\n  s.require_paths = [\"lib\"]\nend\n";
+const GEM_GEMSPEC: &str = "Gem::Specification.new do |s|\n  s.name = \"demo-gem\"\n  s.version = \"1.0.0\"\n  s.summary = \"in-process scan --mode vendored fixture\"\n  s.authors = [\"socket-patch e2e\"]\n  s.require_paths = [\"lib\"]\nend\n";
 const GEM_GEMFILE: &str = "source \"https://rubygems.org\"\n\ngem \"demo-gem\", \"~> 1.0\"\n";
 /// Hand-pinned bundler lock grammar (no CHECKSUMS — the 2.x/3.x default).
 const GEM_LOCK: &str = "GEM\n  remote: https://rubygems.org/\n  specs:\n    demo-gem (1.0.0)\n\nPLATFORMS\n  ruby\n\nDEPENDENCIES\n  demo-gem (~> 1.0)\n\nBUNDLED WITH\n   2.6.2\n";
@@ -2954,7 +2954,7 @@ fn gem_fixture() -> GemFixture {
 }
 
 /// Mount discovery (batch), per-package search, and the full view (inline
-/// `blobContent`, so `scan --vendor` runs against the mock alone) for the
+/// `blobContent`, so `scan --mode vendored` runs against the mock alone) for the
 /// demo gem — the gem mirror of `scan_vendor_e2e::mount_patch_api`.
 ///
 /// `patch_purl` is the purl the SERVED patch records carry ([`GEM_PURL`] or
@@ -3067,7 +3067,8 @@ fn run_scan_vendor(root: &Path, mock_uri: &str, extra: &[&str]) -> (i32, Value) 
     let mut argv = vec![
         "scan",
         "--json",
-        "--vendor",
+        "--mode",
+        "vendored",
         "--yes",
         "--api-url",
         mock_uri,
@@ -3081,12 +3082,14 @@ fn run_scan_vendor(root: &Path, mock_uri: &str, extra: &[&str]) -> (i32, Value) 
     argv.extend_from_slice(extra);
     let (code, stdout, stderr) = run_cli(root, &argv, &[]);
     let env: Value = serde_json::from_str(stdout.trim()).unwrap_or_else(|e| {
-        panic!("scan --vendor --json must emit JSON: {e}\nstdout:\n{stdout}\nstderr:\n{stderr}")
+        panic!(
+            "scan --mode vendored --json must emit JSON: {e}\nstdout:\n{stdout}\nstderr:\n{stderr}"
+        )
     });
     (code, env)
 }
 
-/// `scan --vendor` end to end on a gem project: discover → download →
+/// `scan --mode vendored` end to end on a gem project: discover → download →
 /// vendor lands the gem pair edit (Gemfile pin + `path:`, lock PATH section
 /// + `(= …)!` DEPENDENCIES pin) and the patched artifact dir, keyed in the
 /// ledger by the gem purl; a re-run is an `already_vendored` no-op; and
@@ -3101,7 +3104,7 @@ async fn scan_vendor_gem_end_to_end_and_reverts() {
     let fx = gem_fixture();
 
     let (code, env) = run_scan_vendor(fx.root(), &mock.uri(), &[]);
-    assert_eq!(code, 0, "scan --vendor must succeed: {env:#}");
+    assert_eq!(code, 0, "scan --mode vendored must succeed: {env:#}");
     assert_eq!(env["status"], "success", "envelope: {env:#}");
     assert_eq!(env["download"]["downloaded"], 1, "envelope: {env:#}");
     assert_eq!(env["vendor"]["summary"]["applied"], 1, "envelope: {env:#}");
@@ -3269,7 +3272,7 @@ async fn scan_vendor_gem_qualified_platform_ruby_purl_vendors() {
     let (code, env) = run_scan_vendor(fx.root(), &mock.uri(), &[]);
     assert_eq!(
         code, 0,
-        "scan --vendor must succeed on the qualified purl: {env:#}"
+        "scan --mode vendored must succeed on the qualified purl: {env:#}"
     );
     assert_eq!(env["status"], "success", "envelope: {env:#}");
     assert_eq!(env["download"]["downloaded"], 1, "envelope: {env:#}");
@@ -3343,7 +3346,7 @@ async fn scan_vendor_gem_qualified_platform_ruby_purl_vendors() {
     );
 }
 
-/// The QUALIFIED purl through `scan --vendor` + `vendor --revert`: a detached
+/// The QUALIFIED purl through `scan --mode vendored` + `vendor --revert`: a detached
 /// ledger entry has NO manifest fallback, so the revert must find it via its
 /// own key/`basePurl` alone. The bare-purl detached shape is covered by
 /// [`scan_vendor_gem_detached_writes_no_manifest_and_reverts`]; this pins
@@ -3357,7 +3360,7 @@ async fn scan_vendor_gem_detached_qualified_purl_reverts() {
     let (code, env) = run_scan_vendor(fx.root(), &mock.uri(), &[]);
     assert_eq!(
         code, 0,
-        "scan --vendor must succeed on the qualified purl: {env:#}"
+        "scan --mode vendored must succeed on the qualified purl: {env:#}"
     );
     assert_eq!(env["vendor"]["summary"]["applied"], 1, "envelope: {env:#}");
 
@@ -3394,7 +3397,7 @@ async fn scan_vendor_gem_detached_qualified_purl_reverts() {
     assert!(!fx.root().join(".socket/vendor").exists());
 }
 
-/// `scan --vendor` on the gem project: no manifest is written,
+/// `scan --mode vendored` on the gem project: no manifest is written,
 /// the ledger entry is detached with the patch record embedded, the pair
 /// edit still lands — and `vendor --revert` (the detached entry's only exit
 /// path) byte-restores both files.
@@ -3405,7 +3408,7 @@ async fn scan_vendor_gem_detached_writes_no_manifest_and_reverts() {
     let fx = gem_fixture();
 
     let (code, env) = run_scan_vendor(fx.root(), &mock.uri(), &[]);
-    assert_eq!(code, 0, "scan --vendor must succeed: {env:#}");
+    assert_eq!(code, 0, "scan --mode vendored must succeed: {env:#}");
     assert_eq!(env["vendor"]["summary"]["applied"], 1, "envelope: {env:#}");
 
     assert!(
@@ -3736,10 +3739,8 @@ snapshots:
                 ..GlobalArgs::default()
             },
             batch_size: Some(100),
-            apply: false,
             prune: false,
             sync: false,
-            vendor: false,
             mode: Some(ScanMode::Hosted),
             all_releases: false,
             vex: Default::default(),

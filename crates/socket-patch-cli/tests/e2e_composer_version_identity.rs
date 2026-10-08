@@ -4,7 +4,7 @@
 //! patch's base purl can say `pkg:composer/psr/log@3.0.2.0` while the
 //! project's `installed.json` and `composer.lock` say `3.0.2` or `v3.0.2`.
 //! Every mode must treat those as the same release: agent-mode `scan --sync`
-//! patches the installed copy and its prune keeps the patch, `scan --vendor`
+//! patches the installed copy and its prune keeps the patch, `scan --mode vendored`
 //! vendors and wires the lock entry (and `vex` attests it), and hosted
 //! `scan --redirect` repoints the lock entry. Each test runs the built binary
 //! against a wiremock API that serves only the padded spelling.
@@ -260,7 +260,7 @@ async fn agent_sync_applies_and_keeps_a_padded_composer_patch() {
     assert_eq!(manifest["patches"][API_PURL]["uuid"], UUID, "{manifest:#}");
 }
 
-/// Vendored mode: `scan --vendor` finds the installed `3.0.2`, finds the
+/// Vendored mode: `scan --mode vendored` finds the installed `3.0.2`, finds the
 /// lock's `3.0.2` entry for the `@3.0.2.0` patch, vendors the copy under the
 /// patch spelling and wires the entry; `vex` attests the vendored patch
 /// (lock `3.0.2` vs leaf `@3.0.2.0`); `vendor --revert` byte-restores the lock.
@@ -275,9 +275,9 @@ async fn vendor_wires_and_attests_a_padded_composer_patch() {
     let (code, env) = run_json(
         root,
         &server.uri(),
-        &["scan", "--vendor", "--vendor-source", "service"],
+        &["scan", "--mode", "vendored", "--vendor-source", "service"],
     );
-    assert_eq!(code, 0, "scan --vendor must succeed: {env:#}");
+    assert_eq!(code, 0, "scan --mode vendored must succeed: {env:#}");
     assert_eq!(env["vendor"]["summary"]["applied"], 1, "{env:#}");
     assert_eq!(env["vendor"]["summary"]["failed"], 0, "{env:#}");
 

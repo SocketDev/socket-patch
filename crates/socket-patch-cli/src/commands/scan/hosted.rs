@@ -555,7 +555,7 @@ pub(super) async fn run_redirect(
     // Scan's pre-redirect lockfile discovery (see `rollout::Gate::prior`).
     prior: Option<super::rollout::Prior<'_>>,
 ) -> i32 {
-    // Same discovery/selection as `--apply`/`--vendor`.
+    // Same discovery/selection as agent and vendored mode.
     let discovered = match discover_selected(
         api_client,
         all_packages_with_patches,

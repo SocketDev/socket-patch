@@ -524,7 +524,7 @@ async fn bun_hosted_then_scan_vendored_takeover_round_trips_to_registry() {
 
     // The scan-side vendored preview is ledger-only by contract
     // (`would_vendor` / `already_vendored` / `would_revendor`, CLI_CONTRACT
-    // "scan --vendor"): it must at least not fail and not write anything.
+    // "scan --mode vendored"): it must at least not fail and not write anything.
     let (code, preview) = scan_mode(root, &server.uri(), "vendored", &["--dry-run"]);
     assert_eq!(code, 0, "vendored preview must succeed: {preview:#}");
     assert_eq!(
