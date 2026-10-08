@@ -9,6 +9,10 @@
 //! (#361). A store inside the project is still walked from the same cwd,
 //! whether it is recorded relative or absolute.
 
+#[path = "common/mod.rs"]
+mod common;
+use common::binary;
+
 use std::path::{Path, PathBuf};
 use std::process::Command;
 
@@ -16,10 +20,6 @@ use wiremock::matchers::{method, path};
 use wiremock::{Mock, MockServer, ResponseTemplate};
 
 const ORG: &str = "test-org";
-
-fn binary() -> PathBuf {
-    env!("CARGO_BIN_EXE_socket-patch").into()
-}
 
 fn write_pkg(dir: &Path, name: &str) {
     std::fs::create_dir_all(dir).unwrap();

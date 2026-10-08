@@ -28,8 +28,10 @@ use std::path::Path;
 use std::time::Duration;
 
 use crate::args::GlobalArgs;
+use crate::commands::agent_download::{
+    download_patch_records_reusing, DetachedDownload, DownloadParams,
+};
 use crate::commands::bun_preflight::bun_vendor_preflight_with_ledger;
-use crate::commands::get::{download_patch_records_reusing, DetachedDownload, DownloadParams};
 use crate::commands::lock_cli::lock_failure;
 use crate::commands::vendor::{
     note_classic_migration_risk, symlinked_wiring_warnings, track_outcomes_for_vendor,
@@ -811,11 +813,7 @@ fn format_nothing_vendored(download_failed: u64) -> String {
 /// step: `Error (<code>): <Message>.`. The code and message are the ones
 /// the JSON envelope carries.
 pub(crate) fn format_vendor_step_error(code: &str, message: &str) -> String {
-    let mut chars = message.trim_end_matches('.').chars();
-    let message: String = match chars.next() {
-        Some(first) => first.to_uppercase().chain(chars).collect(),
-        None => String::new(),
-    };
+    let message = crate::ui::sentence_case(message.trim_end_matches('.'));
     let mut out = if message.is_empty() {
         format!("Error ({code}).")
     } else {

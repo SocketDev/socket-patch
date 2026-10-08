@@ -23,10 +23,8 @@ use super::{discover_selected, ScanArgs};
 
 mod python;
 mod takeover;
-pub(crate) mod vlt;
 
-pub(crate) use vlt::rollback_heal as vlt_rollback_heal;
-pub(crate) use vlt::takeover_heal as vlt_takeover_heal;
+use crate::commands::vlt_heal as vlt;
 
 #[cfg(test)]
 pub(crate) use socket_patch_core::hosted::guidance::{
@@ -1709,62 +1707,9 @@ const TAKEOVER_INFO_CODES: &[&str] = &[
     "redirect_would_revert_vendored",
 ];
 
-/// Lowercase tool names that must keep their spelling at the start of a
-/// sentence (`pnpm >=11 rejects…` must not become `Pnpm`).
-const LOWERCASE_TOOLS: &[&str] = &[
-    "npm",
-    "pnpm",
-    "yarn",
-    "bun",
-    "cargo",
-    "pip",
-    "pipenv",
-    "uv",
-    "poetry",
-    "pdm",
-    "hatch",
-    "go",
-    "gem",
-    "bundler",
-    "bundle",
-    "composer",
-    "mvn",
-    "gradle",
-    "dotnet",
-    "deno",
-    "rush",
-    "vlt",
-    "vlx",
-    "vlr",
-    "sbt",
-    "mill",
-    "scala-cli",
-];
-
-/// Capitalize the first letter of a message for an `Error:`/`Warning:`
-/// line, leaving it alone when the first word is an identifier rather than
-/// an English word: a file name (`pnpm-lock.yaml`), a purl, a flag, a path,
-/// or a lowercase tool name.
-fn sentence_case(msg: &str) -> String {
-    let first_word = msg.split_whitespace().next().unwrap_or("");
-    let is_word = !first_word.is_empty()
-        && first_word
-            .chars()
-            .all(|c| c.is_ascii_lowercase() || c == ',' || c == ';')
-        && !LOWERCASE_TOOLS.contains(&first_word.trim_end_matches([',', ';']));
-    if !is_word {
-        return msg.to_string();
-    }
-    let mut chars = msg.chars();
-    match chars.next() {
-        Some(c) => c.to_uppercase().chain(chars).collect(),
-        None => String::new(),
-    }
-}
-
 /// `Error: <Message>` for a hosted-flow failure.
 fn format_error_line(msg: &str) -> String {
-    format!("Error: {}", sentence_case(msg))
+    format!("Error: {}", crate::ui::sentence_case(msg))
 }
 
 /// Split `text` into wrap tokens at whitespace, except that a
@@ -1839,7 +1784,7 @@ fn split_sentences(text: &str) -> Vec<String> {
 /// each sentence stays on one line so the text remains greppable.
 fn format_warning(code: &str, detail: &str, width: Option<usize>) -> String {
     let prefix = "Warning: ";
-    let detail = sentence_case(detail.trim());
+    let detail = crate::ui::sentence_case(detail.trim());
     let (headline, bullets) = if code == "redirect_pnpm_trust_lockfile" {
         let mut sentences = split_sentences(&detail).into_iter();
         let head = sentences.next().unwrap_or_default();
@@ -2179,8 +2124,8 @@ mod tests {
     use super::{
         describe_skip_reason, format_error_line, format_next_steps, format_redirect_summary,
         format_takeover_line, format_unredirected, format_warning, join_names,
-        pnpm_lock_may_need_store_flag, pnpm_trust_rerun_reminder, sentence_case, split_sentences,
-        wrap_tokens, wrap_words, TAKEOVER_INFO_CODES,
+        pnpm_lock_may_need_store_flag, pnpm_trust_rerun_reminder, split_sentences, wrap_tokens,
+        wrap_words, TAKEOVER_INFO_CODES,
     };
     use super::{wheel_metadata_concurrency, WHEEL_METADATA_CONCURRENCY};
     use socket_patch_core::hosted::engine::REDIRECT_CANDIDATE_FILES;
@@ -3867,37 +3812,14 @@ mod tests {
     }
 
     #[test]
-    fn sentence_case_skips_identifiers_and_tool_names() {
-        assert_eq!(
-            sentence_case("failed to write x: y"),
-            "Failed to write x: y"
-        );
-        assert_eq!(
-            sentence_case("the hosted ledger ./a is malformed"),
-            "The hosted ledger ./a is malformed"
-        );
-        assert_eq!(sentence_case("pnpm >=11 rejects"), "pnpm >=11 rejects");
-        for tool in ["vlt", "vlx", "vlr"] {
-            assert_eq!(
-                sentence_case(&format!("{tool} ci fails")),
-                format!("{tool} ci fails")
-            );
-        }
-        assert_eq!(
-            sentence_case("pnpm-lock.yaml was repointed"),
-            "pnpm-lock.yaml was repointed"
-        );
-        assert_eq!(
-            sentence_case("pkg:npm/x@1 redirected"),
-            "pkg:npm/x@1 redirected"
-        );
-        assert_eq!(sentence_case("`vendor` refused"), "`vendor` refused");
-        assert_eq!(sentence_case("Already upper"), "Already upper");
-        assert_eq!(sentence_case(""), "");
-        assert_eq!(sentence_case("é accent"), "é accent");
+    fn format_error_line_sentence_cases_the_message() {
         assert_eq!(
             format_error_line("failed to resolve patch references: boom"),
             "Error: Failed to resolve patch references: boom"
+        );
+        assert_eq!(
+            format_error_line("pnpm-lock.yaml was repointed"),
+            "Error: pnpm-lock.yaml was repointed"
         );
     }
 

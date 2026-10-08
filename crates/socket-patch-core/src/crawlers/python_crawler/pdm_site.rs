@@ -6,17 +6,16 @@
 //! we never run PDM itself, which would load project and installed plugins.
 
 use std::path::{Path, PathBuf};
-use std::process::Stdio;
+use std::process::{Command, Output};
 use std::time::Duration;
 
 use tokio::io::AsyncReadExt;
 
-use crate::utils::fs::open_regular_file;
-use crate::utils::process::{command_for, resolve_tool_with};
+use crate::utils::fs::{open_regular_file, run_blocking};
+use crate::utils::process::{command_for, output_within, resolve_tool_with, PROBE_TIMEOUT};
 
 const HEADER_LIMIT: u64 = 8192;
-const OUTPUT_LIMIT: u64 = 4096;
-const PROBE_TIMEOUT: Duration = Duration::from_secs(5);
+const OUTPUT_LIMIT: usize = 4096;
 const PROBE: &str =
     "import json, platformdirs; print(json.dumps(str(platformdirs.site_config_path('pdm'))))";
 
@@ -101,30 +100,29 @@ async fn probe_runtime_site_dir(
         .prefix("socket-pdm-site-")
         .tempdir()
         .ok()?;
-    let child = runtime_probe_command(interpreter, var, cwd.path())
-        .spawn()
+    let command = runtime_probe_command(interpreter, var, cwd.path());
+    // The shared bounded spawn: null stdin, null stderr, killed and reaped
+    // at the deadline. `cwd` outlives the child.
+    let output = run_blocking(move || output_within(command, timeout))
+        .await
         .ok()?;
-    read_runtime_site_dir(child, timeout).await
+    runtime_site_dir(&output)
 }
 
 fn runtime_probe_command(
     interpreter: &Path,
     var: &impl Fn(&str) -> Option<String>,
     cwd: &Path,
-) -> tokio::process::Command {
+) -> Command {
     // Preserve the interpreter's lexical venv path. Canonicalizing bin/python
     // could launch its base Python and lose PDM's installed platformdirs.
-    let mut command = tokio::process::Command::from(command_for(interpreter));
+    let mut command = command_for(interpreter);
     command
         // Unlike -I, -E keeps normal user-site pip installs available.
         // Do not use -S: Homebrew's normal site initialization affects the
         // sys.base_prefix that platformdirs uses for its default site path.
         .args(["-E", "-B", "-c", PROBE])
-        .current_dir(cwd)
-        .stdin(Stdio::null())
-        .stdout(Stdio::piped())
-        .stderr(Stdio::null())
-        .kill_on_drop(true);
+        .current_dir(cwd);
     // -E alone is insufficient: site.py/Homebrew's sitecustomize read
     // PYTHONUSERBASE/PYTHONHOME directly, and macOS startup can honor
     // PYTHONEXECUTABLE despite it. Copy only non-Python ambient variables
@@ -148,34 +146,21 @@ fn runtime_probe_command(
     command
 }
 
-async fn read_runtime_site_dir(
-    mut child: tokio::process::Child,
-    timeout: Duration,
-) -> Option<PathBuf> {
-    let stdout = child.stdout.take()?;
-    tokio::time::timeout(timeout, async {
-        let mut output = Vec::new();
-        stdout
-            .take(OUTPUT_LIMIT + 1)
-            .read_to_end(&mut output)
-            .await
-            .ok()?;
-        if output.len() > OUTPUT_LIMIT as usize || !child.wait().await.ok()?.success() {
-            return None;
-        }
-        // Exactly one JSON string, not a guessed line in mixed diagnostics.
-        let path = PathBuf::from(serde_json::from_slice::<String>(&output).ok()?);
-        path.is_absolute().then_some(path)
-    })
-    .await
-    .ok()
-    .flatten()
+/// A successful probe printed exactly one JSON string holding an absolute
+/// path, not a guessed line in mixed diagnostics.
+fn runtime_site_dir(output: &Output) -> Option<PathBuf> {
+    if output.stdout.len() > OUTPUT_LIMIT || !output.status.success() {
+        return None;
+    }
+    let path = PathBuf::from(serde_json::from_slice::<String>(&output.stdout).ok()?);
+    path.is_absolute().then_some(path)
 }
 
 #[cfg(test)]
 mod tests {
     use super::*;
     use std::os::unix::fs::{symlink, PermissionsExt};
+    use std::process::Stdio;
 
     fn executable(path: &Path, contents: &str) {
         std::fs::write(path, contents).unwrap();
@@ -354,28 +339,33 @@ mod tests {
     async fn probe_timeout_kills_its_child() {
         let tmp = tempfile::tempdir().unwrap();
         let python = tmp.path().join("python");
-        executable(&python, "#!/bin/sh\nexec /bin/sleep 30\n");
-        let child = runtime_probe_command(&python, &|_: &str| None, tmp.path())
-            .spawn()
-            .unwrap();
-        // Capture the actual OS child identity before awaiting its timeout;
-        // do not assume a newly spawned shell has written a PID file yet.
-        let pid = child.id().unwrap() as i32;
-        let timeout = Duration::from_millis(100);
-        let started = std::time::Instant::now();
-        assert_eq!(read_runtime_site_dir(child, timeout).await, None);
-        assert!(
-            started.elapsed() >= timeout,
-            "the child failed before the deadline"
+        let pid_file = tmp.path().join("pid");
+        // `exec` keeps the recorded pid: no shell grandchild holds the pipe.
+        executable(
+            &python,
+            &format!(
+                "#!/bin/sh\necho $$ > '{}'\nexec /bin/sleep 30\n",
+                pid_file.display()
+            ),
         );
-        tokio::time::timeout(PROBE_TIMEOUT, async {
-            // Signal zero only checks existence; kill_on_drop must terminate
-            // and Tokio must reap this exact child, without a shell grandchild.
-            while unsafe { libc::kill(pid, 0) } == 0 {
-                tokio::time::sleep(Duration::from_millis(10)).await;
-            }
-        })
-        .await
-        .expect("timed-out probe was left running");
+        let timeout = Duration::from_millis(500);
+        let started = std::time::Instant::now();
+        assert_eq!(
+            probe_runtime_site_dir(&python, &|_: &str| None, timeout).await,
+            None
+        );
+        let elapsed = started.elapsed();
+        assert!(elapsed >= timeout, "the child failed before the deadline");
+        assert!(elapsed < PROBE_TIMEOUT, "the probe outlived its budget");
+        // The child is killed and reaped before the probe returns. A child
+        // killed before it recorded its pid is gone as well.
+        if let Ok(pid) = std::fs::read_to_string(&pid_file) {
+            let pid: i32 = pid.trim().parse().unwrap();
+            assert_ne!(
+                unsafe { libc::kill(pid, 0) },
+                0,
+                "timed-out probe was left running"
+            );
+        }
     }
 }

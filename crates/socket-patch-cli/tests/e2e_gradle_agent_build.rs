@@ -12,6 +12,10 @@
 //! classifier jars, build logic, the build cache, the read-only cache) in a
 //! JSON probe report per cell.
 
+#[path = "common/mod.rs"]
+mod common;
+use common::git_sha256;
+
 #[path = "common/hermetic.rs"]
 mod hermetic;
 #[path = "prebuilt_common/mod.rs"]
@@ -51,10 +55,6 @@ fn jar_leaf() -> String {
 
 fn coordinate() -> String {
     format!("{GROUP}:{VICTIM}:{VICTIM_VERSION}")
-}
-
-fn git_sha256(bytes: &[u8]) -> String {
-    socket_patch_core::hash::git_sha256::compute_git_sha256_from_bytes(bytes)
 }
 
 fn sha1_hex(bytes: &[u8]) -> String {

@@ -214,11 +214,7 @@ fn emit(command: Command, json: bool, dry_run: bool, code: &str, message: &str, 
 /// capitalized; the envelope keeps the message verbatim), then the
 /// indented hint when there is one.
 fn format_human_error(message: &str, hint: &str) -> String {
-    let mut chars = message.chars();
-    let message: String = match chars.next() {
-        Some(first) => first.to_uppercase().chain(chars).collect(),
-        None => String::new(),
-    };
+    let message = crate::ui::sentence_case(message);
     if hint.is_empty() {
         format!("Error: {message}\n")
     } else {
