@@ -1902,7 +1902,13 @@ async fn save_and_apply_patch(
     // A dry run previews against the manifest and writes nothing — not
     // even the lock (which would create `.socket/`).
     if args.common.dry_run {
-        return agent_dry_run(args, &[search_result_from_response(patch)], &[], &[]).await;
+        return agent_dry_run(
+            args,
+            &[search_result_from_response(patch)],
+            &[],
+            org_warnings,
+        )
+        .await;
     }
     // See `download_and_apply_patches_with`: the RMW runs under the lock,
     // which also creates `.socket/` and prunes it again when nothing lands;

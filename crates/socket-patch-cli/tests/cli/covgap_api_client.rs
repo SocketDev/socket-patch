@@ -196,6 +196,102 @@ async fn get_with_hash_shaped_token_under_silent_prints_no_warnings() {
     assert_eq!(json_stdout(&out)["status"], "not_found");
 }
 
+/// #648: the uuid path's agent `--dry-run` preview must report the
+/// startup downgrade in `warnings[]` like its wet run does. The org
+/// resolve 500s, the proxy serves the patch, and `get <uuid> --json
+/// --dry-run --mode agent` previews it without writing anything.
+#[tokio::test]
+async fn unresolved_org_reaches_get_uuid_dry_run_json_warnings() {
+    const PATCH: &str = "aaaaaaaa-bbbb-4ccc-8ddd-eeeeeeeeeeee";
+    let mock = MockServer::start().await;
+    Mock::given(method("GET"))
+        .and(path("/v0/organizations"))
+        .respond_with(ResponseTemplate::new(500).set_body_string("boom"))
+        .expect(1)
+        .mount(&mock)
+        .await;
+    Mock::given(wiremock::matchers::path_regex("^/v0/orgs/"))
+        .respond_with(ResponseTemplate::new(500))
+        .expect(0)
+        .mount(&mock)
+        .await;
+    Mock::given(method("GET"))
+        .and(path(format!("/patch/view/{PATCH}")))
+        .respond_with(ResponseTemplate::new(200).set_body_json(serde_json::json!({
+            "uuid": PATCH,
+            "purl": "pkg:npm/left-pad@1.3.0",
+            "publishedAt": "Fri, 27 Mar 2026 00:00:00 GMT",
+            "files": { "package/index.js": {
+                "beforeHash": "a".repeat(64), "afterHash": "b".repeat(64)
+            } },
+            "vulnerabilities": {},
+            "description": "agent patch",
+            "license": "MIT",
+            "tier": "free",
+        })))
+        .expect(1)
+        .mount(&mock)
+        .await;
+    Mock::given(method("POST"))
+        .and(path("/patch/telemetry"))
+        .respond_with(ResponseTemplate::new(201))
+        .mount(&mock)
+        .await;
+
+    let tmp = tempfile::tempdir().unwrap();
+    let cwd = tmp.path();
+    let uri = mock.uri();
+    let token = format!("sktsec_{}_api", "x".repeat(44));
+    let mut cmd = Command::new(binary());
+    for (key, _) in std::env::vars() {
+        if key.starts_with("SOCKET_") {
+            cmd.env_remove(key);
+        }
+    }
+    let out = cmd
+        .args([
+            "get",
+            PATCH,
+            "--json",
+            "--dry-run",
+            "--mode",
+            "agent",
+            "--yes",
+            "--cwd",
+            cwd.to_str().unwrap(),
+            "--api-url",
+            &uri,
+            "--proxy-url",
+            &uri,
+            "--api-token",
+            &token,
+        ])
+        .env("SOCKET_NO_CONFIG", "1")
+        .current_dir(cwd)
+        .output()
+        .expect("run socket-patch get");
+    let stderr = String::from_utf8_lossy(&out.stderr);
+    let v = json_stdout(&out);
+    assert_eq!(
+        v["dryRun"], true,
+        "the agent dry-run envelope: {v}; stderr={stderr}"
+    );
+    assert!(
+        !cwd.join(".socket").exists(),
+        "a dry run writes nothing; stderr={stderr}"
+    );
+    let warnings = v["warnings"]
+        .as_array()
+        .unwrap_or_else(|| panic!("no warnings[]: {v}; stderr={stderr}"));
+    let prefix = "(api_auth_fallback) Could not determine your organization";
+    assert!(
+        warnings
+            .iter()
+            .any(|w| w.as_str().is_some_and(|w| w.starts_with(prefix))),
+        "api_auth_fallback missing from the dry-run warnings[]: {v}; stderr={stderr}"
+    );
+}
+
 /// #648: a token whose org cannot be resolved (here `/v0/organizations`
 /// answers 500) puts the WHOLE run on the public proxy, decided once.
 /// `scan --json --vex` on a lockfile-only checkout with a hosted pin runs
