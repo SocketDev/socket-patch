@@ -828,6 +828,117 @@ fn uv_vendor_fresh_checkout_frozen_offline_and_revert() {
     );
 }
 
+/// #996: a `uv export`-ed requirements.txt names the vendored wheel. The
+/// revert restores the uv pair but must keep the wheel (and the ledger
+/// entry) while that export still installs from it; once the user
+/// re-exports from the restored lock, a second revert finishes the cleanup.
+#[test]
+#[serial_test::serial]
+fn uv_vendor_revert_keeps_wheel_while_export_references_it() {
+    let Some((uv, python)) = capstone_uv("uv-export") else {
+        return;
+    };
+    bake_leak_guards();
+    let tmp = tempfile::tempdir().unwrap();
+    let proj = tmp.path().join("proj");
+    std::fs::create_dir_all(&proj).unwrap();
+    let cache = tmp.path().join("uv-cache");
+    let mut cache_env: Vec<(&str, &str)> = vec![("UV_CACHE_DIR", cache.to_str().unwrap())];
+    if let Some(py) = python.as_deref() {
+        cache_env.push(("UV_PYTHON", py));
+    }
+    if !setup_uv_six_project(&uv, &proj, &cache_env, "uv-export") {
+        return;
+    }
+    let installed_six = site_packages(&proj.join(".venv")).join("six.py");
+    stage_patch(&proj, &installed_six);
+    let pyproject_before = std::fs::read(proj.join("pyproject.toml")).unwrap();
+    let uvlock_before = std::fs::read(proj.join("uv.lock")).unwrap();
+
+    let (code, stdout, stderr) = run_vendored(&VendorDriver::VendorOffline, &proj);
+    assert_eq!(
+        code, 0,
+        "vendor failed.\nstdout:\n{stdout}\nstderr:\n{stderr}"
+    );
+    let wheel = vendored_wheel(&proj);
+
+    // The real `uv export` writes the vendored wheel path into the export.
+    let export = |context: &str| {
+        let out = tool(
+            &uv,
+            &proj,
+            &[
+                "export",
+                "--frozen",
+                "--no-emit-project",
+                "-o",
+                "requirements.txt",
+            ],
+            &cache_env,
+        );
+        assert_tool_ok(&out, context);
+        std::fs::read_to_string(proj.join("requirements.txt")).unwrap()
+    };
+    let exported = export("`uv export` of the wired pair");
+    assert!(
+        exported.contains(&format!(".socket/vendor/pypi/{UUID}/")),
+        "uv export must name the vendored wheel:\n{exported}"
+    );
+
+    let revert = || {
+        run_socket(
+            &proj,
+            &[
+                "vendor",
+                "--revert",
+                "--json",
+                "--cwd",
+                proj.to_str().unwrap(),
+            ],
+        )
+    };
+    let (code, stdout, stderr) = revert();
+    assert_eq!(
+        code, 0,
+        "revert failed.\nstdout:\n{stdout}\nstderr:\n{stderr}"
+    );
+    assert!(
+        stdout.contains("vendor_revert_residual_reference") && stdout.contains("requirements.txt"),
+        "the keep must name the exported file:\n{stdout}"
+    );
+    let renv = parse_envelope(&stdout);
+    assert_eq!(renv["summary"]["removed"], 0, "nothing removed: {renv}");
+    assert!(
+        wheel.is_file(),
+        "the exported requirements.txt still installs the wheel; it must be kept"
+    );
+    assert!(
+        proj.join(".socket/vendor/state.json").is_file(),
+        "the ledger entry must be kept with the wheel"
+    );
+    assert_eq!(
+        std::fs::read(proj.join("pyproject.toml")).unwrap(),
+        pyproject_before,
+        "the uv pair is still restored byte-identical"
+    );
+    assert_eq!(std::fs::read(proj.join("uv.lock")).unwrap(), uvlock_before);
+
+    // Re-export from the restored lock: nothing names the wheel any more,
+    // so the kept entry now reverts and the artifact goes.
+    let re_exported = export("`uv export` of the restored pair");
+    assert!(!re_exported.contains(".socket/vendor"), "{re_exported}");
+    let (code, stdout, stderr) = revert();
+    assert_eq!(
+        code, 0,
+        "second revert failed.\nstdout:\n{stdout}\nstderr:\n{stderr}"
+    );
+    assert_eq!(parse_envelope(&stdout)["summary"]["removed"], 1, "{stdout}");
+    assert!(
+        !proj.join(".socket/vendor").exists(),
+        ".socket/vendor must be removed once nothing references it"
+    );
+}
+
 /// Vendor then revert six on a REAL uv project whose existing sources use
 /// `sources_spelling`; the unwind must be silent, byte-identical, and leave
 /// a pair `uv lock --check` accepts (#544 dotted keys, #524 sub-tables).

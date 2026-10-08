@@ -1,7 +1,10 @@
-//! The vlt steps of the hosted flow: the artifact preflight, run before any
-//! takeover or rewrite, and the warm-tree heal with its
-//! `redirect_vlt_reinstall_required` advisory, run after the writes (and by
-//! rollback/remove after the vlt pins are restored).
+//! The vlt steps shared by the hosted flow and the unwinds: the artifact
+//! preflight, run before any takeover or rewrite, and the warm-tree heal
+//! with its `redirect_vlt_reinstall_required` advisory, run after a hosted
+//! rewrite, after rollback/remove restore the vlt pins, and after a
+//! hosted→vendored takeover. A helper module, not a command: `scan`,
+//! `rollback`, `remove` and `vendor` all reach it without importing each
+//! other.
 
 use std::collections::{BTreeMap, BTreeSet};
 use std::path::Path;
@@ -16,11 +19,22 @@ use socket_patch_core::patch::redirect::vlt_preflight;
 use socket_patch_core::patch::redirect::{vlt, DepOverride};
 use socket_patch_core::vendor::lock_inventory::ProjectView;
 
-use super::StaleInstallOutcome;
+/// What the post-rewrite heal reports back to the hosted flow: its
+/// advisories, and the confirmed purls whose installed or next-installed
+/// bytes are not known to be patched (withheld from in-run VEX).
+#[derive(Debug, Default)]
+pub(crate) struct RewriteHeal {
+    pub(crate) warnings: Vec<serde_json::Value>,
+    pub(crate) stale_purls: BTreeSet<String>,
+    /// Set when the heal ran (it may invalidate store entries): the store's
+    /// bundled copies after it, discovery's only read of the installed tree
+    /// (`Discovery::vlt_bundled_copies`). `None` when nothing was healed.
+    pub(crate) healed_store: Option<std::collections::BTreeMap<String, String>>,
+}
 
-pub(super) const REINSTALL_REQUIRED: &str = "redirect_vlt_reinstall_required";
+pub(crate) const REINSTALL_REQUIRED: &str = "redirect_vlt_reinstall_required";
 /// A bundled copy of a redirected package that no rewire reaches (#471).
-pub(super) const BUNDLED_INSTANCE_SKIPPED: &str = "redirect_vlt_bundled_instance_skipped";
+pub(crate) const BUNDLED_INSTANCE_SKIPPED: &str = "redirect_vlt_bundled_instance_skipped";
 
 /// The uuids of `deps` whose purl a vlt vendored ledger entry claims: a
 /// hosted takeover reverts them to a registry node before the rewrite.
@@ -46,7 +60,7 @@ async fn vlt_vendored_uuids(cwd: &Path, deps: &[(&str, &DepOverride)]) -> BTreeS
 /// `vlt-lock.json` make no request. A vlt-vendored dep is probed through
 /// its vendored node, before the takeover reverts it, and a failure keeps
 /// it vendored.
-pub(super) async fn artifact_preflight(
+pub(crate) async fn artifact_preflight(
     common: &crate::args::GlobalArgs,
     api_client: &socket_patch_core::api::client::ApiClient,
     deps: &[(&str, &DepOverride)],
@@ -70,10 +84,10 @@ pub(super) async fn artifact_preflight(
 
 /// The origins the vlt heal treats as Socket-owned in the final lock: the
 /// patch server plus `--api-url`. Unlike discovery's
-/// [`crate::commands::rollback::patch_server_origins`], it also counts the
+/// [`crate::commands::hosted_unwind::patch_server_origins`], it also counts the
 /// `--api-url` origin (as it has since vlt support landed, #269), so a
 /// setup serving the hosted tarballs from the API origin is healed too.
-/// Discovery-facing code must use the rollback helper, not this one.
+/// Discovery-facing code must use the `hosted_unwind` helper, not this one.
 fn vlt_heal_origins(common: &crate::args::GlobalArgs) -> Vec<String> {
     common
         .patch_server_url
@@ -303,16 +317,16 @@ fn undeterminable_detail(n: usize) -> String {
 }
 
 /// What this run's vlt rewrite needs from the rest of the hosted flow.
-pub(super) struct HealInputs<'a> {
+pub(crate) struct HealInputs<'a> {
     /// The final `vlt-lock.json` (as written, or as a dry run would write it).
-    pub(super) final_lock: Option<&'a str>,
-    pub(super) preflight: &'a Preflight,
+    pub(crate) final_lock: Option<&'a str>,
+    pub(crate) preflight: &'a Preflight,
     /// This run's fetched records merged with the ledger's, keyed by purl.
-    pub(super) records: &'a BTreeMap<String, PatchRecord>,
-    pub(super) confirmed: &'a [(String, String)],
-    pub(super) confirmed_vlt: &'a BTreeSet<String>,
-    pub(super) foreign: &'a BTreeSet<String>,
-    pub(super) rewrite_warning_codes: &'a [&'a str],
+    pub(crate) records: &'a BTreeMap<String, PatchRecord>,
+    pub(crate) confirmed: &'a [(String, String)],
+    pub(crate) confirmed_vlt: &'a BTreeSet<String>,
+    pub(crate) foreign: &'a BTreeSet<String>,
+    pub(crate) rewrite_warning_codes: &'a [&'a str],
 }
 
 /// The heal after a hosted rewrite, the advisory, and the purls whose
@@ -321,11 +335,11 @@ pub(super) struct HealInputs<'a> {
 /// no heal target (a non-Socket host, a leaf that disagrees with the
 /// DepID, an artifact no preflight verified) was never checked, so it is
 /// never attested here.
-pub(super) async fn heal_after_rewrite(
+pub(crate) async fn heal_after_rewrite(
     common: &crate::args::GlobalArgs,
     inputs: &HealInputs<'_>,
-) -> StaleInstallOutcome {
-    let mut out = StaleInstallOutcome::default();
+) -> RewriteHeal {
+    let mut out = RewriteHeal::default();
     let owned: Vec<vlt_heal::OwnedInstance> = inputs
         .final_lock
         .map(|lock| vlt_heal::socket_owned_instances(lock, &vlt_heal_origins(common)))
