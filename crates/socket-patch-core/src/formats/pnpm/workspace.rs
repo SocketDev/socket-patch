@@ -59,8 +59,7 @@ pub(crate) fn top_level_key(line: &str) -> Option<(String, &str)> {
 /// The value of the last top-level `key` in a YAML settings file
 /// (pnpm-workspace.yaml, .yarnrc.yml), quotes removed.
 pub(crate) fn yaml_top_level_value(text: &str, key: &str) -> Option<String> {
-    text.strip_prefix('\u{feff}')
-        .unwrap_or(text)
+    strip_bom(text)
         .lines()
         .filter_map(top_level_key)
         .rfind(|(k, _)| k == key)
@@ -154,7 +153,7 @@ pub(crate) fn block_section_bounds(lines: &[String], name: &str) -> Option<(usiz
 /// read through [`read_package_globs`], which falls back to a full YAML
 /// parse for those.
 pub(crate) fn package_globs(text: &str) -> Result<Option<Vec<String>>, String> {
-    let text = text.strip_prefix('\u{feff}').unwrap_or(text);
+    let text = strip_bom(text);
     let lines: Vec<&str> = text
         .lines()
         .map(|l| l.strip_suffix('\r').unwrap_or(l))
