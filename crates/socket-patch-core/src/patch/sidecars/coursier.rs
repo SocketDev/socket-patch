@@ -29,6 +29,7 @@ use std::path::{Path, PathBuf};
 use sha1::Digest as _;
 
 use super::{SidecarError, SidecarFile, SidecarFileAction, SidecarPayload};
+use crate::crawlers::Ecosystem;
 use crate::patch::apply::{is_safe_relative_subpath, normalize_file_path};
 
 /// The checksum algorithms Coursier may keep a sidecar for, in the order
@@ -203,7 +204,7 @@ pub(crate) fn retry_record(
     keys: &[String],
     failed: &str,
 ) -> Option<super::SidecarRecord> {
-    if !package_key.starts_with("pkg:maven/") {
+    if Ecosystem::from_purl(package_key) != Some(Ecosystem::Maven) {
         return None;
     }
     match fixup_with(pkg_path, keys, resync_if_stale) {

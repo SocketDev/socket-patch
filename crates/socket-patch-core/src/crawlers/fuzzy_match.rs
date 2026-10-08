@@ -1,5 +1,5 @@
 use crate::crawlers::python_crawler::canonicalize_pypi_name;
-use crate::crawlers::types::CrawledPackage;
+use crate::crawlers::types::{CrawledPackage, Ecosystem};
 
 /// Match type for sorting results by relevance; declaration order is the
 /// ranking (earlier = better). Internal to this module — `fuzzy_match_packages`
@@ -31,7 +31,7 @@ fn get_full_name(pkg: &CrawledPackage) -> String {
 
 /// Whether `pkg` is a PyPI distribution, whose name is PEP 503-insensitive.
 fn is_pypi(pkg: &CrawledPackage) -> bool {
-    pkg.purl.starts_with("pkg:pypi/")
+    Ecosystem::from_purl(&pkg.purl) == Some(Ecosystem::Pypi)
 }
 
 /// Determine the match type for a package against a query, or `None` if there

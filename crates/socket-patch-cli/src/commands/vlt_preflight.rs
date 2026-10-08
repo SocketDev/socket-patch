@@ -14,6 +14,7 @@
 use std::path::Path;
 
 use socket_patch_core::api::types::PatchSearchResult;
+use socket_patch_core::crawlers::Ecosystem;
 use socket_patch_core::vendor::npm_flavor::{vlt_flavor_change_refusal, vlt_routes};
 use socket_patch_core::vendor::vlt_lock::vlt_vendor_preflight;
 
@@ -47,7 +48,7 @@ pub(crate) async fn vlt_vendor_preflight_pairs(
 ) -> Vec<(String, VltVendorRefusal)> {
     let npm: Vec<&(&str, &str)> = pairs
         .iter()
-        .filter(|(purl, _)| purl.starts_with("pkg:npm/"))
+        .filter(|(purl, _)| Ecosystem::from_purl(purl) == Some(Ecosystem::Npm))
         .collect();
     if npm.is_empty() {
         return Vec::new();
