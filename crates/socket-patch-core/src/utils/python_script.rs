@@ -41,7 +41,7 @@ pub(crate) fn script_metadata(text: &str) -> Result<(Range<usize>, String), Stri
 
 pub(crate) fn replace_script_metadata(text: &str, metadata: &str) -> Result<String, String> {
     let (span, _) = script_metadata(text)?;
-    let newline = if text.contains("\r\n") { "\r\n" } else { "\n" };
+    let newline = crate::utils::line_endings::terminator(text);
     let mut replacement = String::new();
     for line in metadata.lines() {
         replacement.push('#');
@@ -312,6 +312,18 @@ pub fn rewrite_script_metadata(
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    /// #815: the re-commented block takes the script's majority line
+    /// ending; one stray CRLF line no longer turns it CRLF.
+    #[test]
+    fn replaced_metadata_takes_the_majority_line_ending() {
+        let lf_majority = "#!/usr/bin/env python\r\n# /// script\n# dependencies = []\n# ///\nprint('x')\n";
+        let out = replace_script_metadata(lf_majority, "dependencies = [\"a\"]\n").unwrap();
+        assert!(out.contains("# dependencies = [\"a\"]\n# ///"), "{out:?}");
+        let crlf_majority = "# /// script\r\n# dependencies = []\r\n# ///\r\nprint('x')\n";
+        let out = replace_script_metadata(crlf_majority, "dependencies = [\"a\"]\n").unwrap();
+        assert!(out.contains("# dependencies = [\"a\"]\r\n# ///"), "{out:?}");
+    }
 
     #[test]
     fn sources_are_paired_without_changing_the_script() {
