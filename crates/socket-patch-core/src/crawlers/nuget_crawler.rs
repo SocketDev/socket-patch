@@ -368,18 +368,20 @@ async fn is_dotnet_project(cwd: &Path) -> bool {
     dotnet_root(cwd).await != DotnetRoot::None
 }
 
+/// The project file extensions: a directory holding one is a project.
+const PROJECT_EXTENSIONS: [&str; 3] = [".csproj", ".fsproj", ".vbproj"];
+
 /// Classify `cwd` by the .NET markers it holds ([`DotnetRoot`]).
 async fn dotnet_root(cwd: &Path) -> DotnetRoot {
     // `.slnx` is the XML solution format (GA since VS 2022 17.13 /
     // dotnet 9.0.200); migrating deletes the old `.sln`, and a solution
     // root often has no other root-level marker.
-    let project_extensions = [".csproj", ".fsproj", ".vbproj"];
     let extensions = [".sln", ".slnx"];
 
     let mut root = DotnetRoot::None;
     for entry in crate::utils::fs::list_dir_entries(cwd).await {
         if let Some(name) = entry.file_name().to_str() {
-            if project_extensions.iter().any(|ext| name.ends_with(ext)) {
+            if PROJECT_EXTENSIONS.iter().any(|ext| name.ends_with(ext)) {
                 return DotnetRoot::Project;
             }
             if extensions.iter().any(|ext| name.ends_with(ext)) {
@@ -443,12 +445,12 @@ struct PackageRoots {
     /// The roots, in priority order (see
     /// [`NuGetCrawler::get_nuget_package_paths`]).
     paths: Vec<PathBuf>,
-    /// The `(id, version)` pairs the project's restore resolved, when
-    /// `cwd` is a project ([`DotnetRoot::Project`]) whose own
-    /// `obj/project.assets.json` parsed: the shared roots (global folder,
+    /// The `(id, version)` pairs every project under `cwd` restored
+    /// ([`restore_scope`]), when `cwd` is itself a project
+    /// ([`DotnetRoot::Project`]): the shared roots (global folder,
     /// `packageFolders`) are then looked up for these instead of walked.
-    /// `None` keeps the walk: global mode, a solution root (its projects'
-    /// restores can sit at any depth), or no restore yet.
+    /// `None` keeps the walk: global mode, a root without a project file,
+    /// or any project under `cwd` without a parsed restore.
     scope: Option<Vec<(String, String)>>,
 }
 
@@ -496,39 +498,28 @@ async fn package_roots(options: &CrawlerOptions) -> PackageRoots {
     }
 
     // 3. Check obj/ dirs for project.assets.json
-    let assets = discover_assets(&options.cwd).await;
-    for p in assets.package_folders {
+    for p in discover_paths_from_assets(&options.cwd).await {
         if is_dir(&p).await && seen.insert(p.clone()) {
             roots.paths.push(p);
         }
     }
     if root == DotnetRoot::Project {
-        roots.scope = assets.libraries;
+        let cwd = options.cwd.clone();
+        roots.scope = run_blocking(move || restore_scope(&cwd)).await;
     }
 
     roots
 }
 
-/// What the `obj/project.assets.json` files under `cwd` say.
-#[derive(Debug, Default)]
-struct RestoreAssets {
-    /// Every `packageFolders` key, root project first.
-    package_folders: Vec<PathBuf>,
-    /// The resolved packages (`libraries` of type `package`) of the root
-    /// assets file and the one-level-deep ones, or `None` when the ROOT
-    /// assets file is missing or has no `libraries` object.
-    libraries: Option<Vec<(String, String)>>,
-}
-
-/// Read `cwd`'s `obj/project.assets.json` and those of its direct
-/// subdirectories (multi-project solutions), each parsed once.
-async fn discover_assets(cwd: &Path) -> RestoreAssets {
-    let mut assets = RestoreAssets::default();
+/// Discover additional package paths from `obj/project.assets.json` files:
+/// `cwd`'s own and those of its direct subdirectories (multi-project
+/// solutions).
+async fn discover_paths_from_assets(cwd: &Path) -> Vec<PathBuf> {
+    let mut paths = Vec::new();
 
     // Look for obj/project.assets.json in cwd
-    if let Some(root) = parse_project_assets(&cwd.join("obj").join("project.assets.json")).await {
-        assets.package_folders.extend(root.package_folders);
-        assets.libraries = root.libraries;
+    if let Some(root) = read_project_assets(&cwd.join("obj").join("project.assets.json")).await {
+        paths.extend(root.package_folders);
     }
 
     // Also check subdirectories one level deep for multi-project solutions
@@ -540,30 +531,35 @@ async fn discover_assets(cwd: &Path) -> RestoreAssets {
             .join(entry.file_name())
             .join("obj")
             .join("project.assets.json");
-        if let Some(sub) = parse_project_assets(&sub_assets).await {
-            assets.package_folders.extend(sub.package_folders);
-            if let (Some(all), Some(more)) = (assets.libraries.as_mut(), sub.libraries) {
-                all.extend(more);
-            }
+        if let Some(sub) = read_project_assets(&sub_assets).await {
+            paths.extend(sub.package_folders);
         }
     }
-    assets
+    paths
 }
 
-/// Discover additional package paths from `obj/project.assets.json` files.
-#[cfg(test)]
-async fn discover_paths_from_assets(cwd: &Path) -> Vec<PathBuf> {
-    discover_assets(cwd).await.package_folders
+/// What one `project.assets.json` says.
+#[derive(Debug, Default)]
+struct ProjectAssets {
+    /// The `packageFolders` keys, e.g.
+    /// `{"packageFolders": {"/home/user/.nuget/packages/": {}}}`.
+    package_folders: Vec<PathBuf>,
+    /// The `libraries` entries of type `package`, keyed `"<Id>/<Version>"`
+    /// (`"project"` entries are the solution's own projects, never in a
+    /// package folder); `None` when there is no `libraries` object.
+    libraries: Option<Vec<(String, String)>>,
 }
 
-/// Parse one `project.assets.json`: the `packageFolders` keys, e.g.
-/// `{"packageFolders": {"/home/user/.nuget/packages/": {}}}`, and the
-/// `libraries` entries of type `package`, keyed `"<Id>/<Version>"`
-/// (`"project"` entries are the solution's own projects, never in a
-/// package folder). `None` when the file is unreadable or not JSON.
-async fn parse_project_assets(path: &Path) -> Option<RestoreAssets> {
+/// Read and parse one `project.assets.json`; `None` when the file is
+/// unreadable (or not a regular file) or not JSON.
+async fn read_project_assets(path: &Path) -> Option<ProjectAssets> {
     let content = crate::utils::fs::read_regular_to_string(path).await.ok()?;
-    let json: serde_json::Value = serde_json::from_str(&content).ok()?;
+    parse_project_assets(&content)
+}
+
+/// Parse one `project.assets.json` ([`ProjectAssets`]).
+fn parse_project_assets(content: &str) -> Option<ProjectAssets> {
+    let json: serde_json::Value = serde_json::from_str(content).ok()?;
     let package_folders = json
         .get("packageFolders")
         .and_then(|folders| folders.as_object())
@@ -584,10 +580,64 @@ async fn parse_project_assets(path: &Path) -> Option<RestoreAssets> {
                 })
                 .collect()
         });
-    Some(RestoreAssets {
+    Some(ProjectAssets {
         package_folders,
         libraries,
     })
+}
+
+/// Directories [`restore_scope`] never descends into: build output, the
+/// restore's own `obj/`, a legacy `packages/` folder, and JS dependencies.
+const SCOPE_SKIPPED_DIRS: [&str; 4] = ["bin", "obj", "packages", "node_modules"];
+
+/// Directories [`restore_scope`] lists before giving up on a scope (the
+/// crawl then walks the shared roots, as before).
+const SCOPE_DIR_BUDGET: usize = 10_000;
+
+/// The packages every project under `cwd` restored: the union of the
+/// `libraries` of each project directory's `obj/project.assets.json`.
+///
+/// `None` (keep the walk) unless EVERY project file found under `cwd`
+/// (`.csproj`/`.fsproj`/`.vbproj`, at any depth) has a parsed assets file
+/// with a `libraries` object, so a project the scope cannot see (not
+/// restored yet, a relocated `obj/`, an unreadable directory) never loses
+/// its packages. Symlinked directories, hidden ones and
+/// [`SCOPE_SKIPPED_DIRS`] are not entered; more than
+/// [`SCOPE_DIR_BUDGET`] directories also means `None`.
+fn restore_scope(cwd: &Path) -> Option<Vec<(String, String)>> {
+    let mut libraries = Vec::new();
+    let mut pending = vec![cwd.to_path_buf()];
+    let mut listed = 0usize;
+    while let Some(dir) = pending.pop() {
+        listed += 1;
+        if listed > SCOPE_DIR_BUDGET {
+            return None;
+        }
+        let (entries, complete) = super::listing::list_dir_sync_complete(&dir);
+        if !complete {
+            return None;
+        }
+        let mut is_project = false;
+        for entry in &entries {
+            let Some(name) = entry.name.to_str() else {
+                continue;
+            };
+            let kind = entry.file_type?;
+            if kind.is_dir() {
+                if !name.starts_with('.') && !SCOPE_SKIPPED_DIRS.contains(&name) {
+                    pending.push(dir.join(name));
+                }
+            } else if PROJECT_EXTENSIONS.iter().any(|ext| name.ends_with(ext)) {
+                is_project = true;
+            }
+        }
+        if is_project {
+            let assets = dir.join("obj").join("project.assets.json");
+            let content = crate::utils::fs::read_regular_to_string_sync(&assets).ok()?;
+            libraries.extend(parse_project_assets(&content)?.libraries?);
+        }
+    }
+    Some(libraries)
 }
 
 /// Look up each resolved `(id, version)` in a shared (global-layout) root,
@@ -1488,7 +1538,7 @@ mod tests {
         assert_eq!(located, walked);
     }
 
-    /// One-level-deep restores join the root project's scope.
+    /// Sub-project restores, at any depth, join the root project's scope.
     #[tokio::test]
     async fn sub_project_restores_join_the_scope() {
         let dir = tempfile::tempdir().unwrap();
@@ -1499,8 +1549,13 @@ mod tests {
             .await
             .unwrap();
         write_assets(&app, &cache, app_libraries()).await;
+        let tests = app.join("tests").join("App.Tests");
+        tokio::fs::create_dir_all(&tests).await.unwrap();
+        tokio::fs::write(tests.join("App.Tests.csproj"), "<Project/>")
+            .await
+            .unwrap();
         write_assets(
-            &app.join("Tests"),
+            &tests,
             &cache,
             serde_json::json!({ "Serilog/3.1.1": { "type": "package" } }),
         )
@@ -1554,6 +1609,41 @@ mod tests {
         .unwrap();
         let crawled = NuGetCrawler.crawl_all(&local(&app)).await;
         assert_eq!(purls_of(&crawled), every);
+    }
+
+    /// A project under `cwd` the scope cannot see keeps the walk, so its
+    /// packages are never dropped: a sub-project two levels down with no
+    /// restore, and one whose assets file has no `libraries`.
+    #[tokio::test]
+    async fn an_uncovered_sub_project_keeps_the_walk() {
+        let every = [
+            "pkg:nuget/newtonsoft.json@12.0.1",
+            "pkg:nuget/newtonsoft.json@13.0.3",
+            "pkg:nuget/serilog@3.1.1",
+        ];
+        let dir = tempfile::tempdir().unwrap();
+        let cache = shared_cache(dir.path()).await;
+
+        let app = dir.path().join("app");
+        let tests = app.join("tests").join("App.Tests");
+        tokio::fs::create_dir_all(&tests).await.unwrap();
+        tokio::fs::write(app.join("App.csproj"), "<Project/>")
+            .await
+            .unwrap();
+        tokio::fs::write(tests.join("App.Tests.csproj"), "<Project/>")
+            .await
+            .unwrap();
+        write_assets(&app, &cache, app_libraries()).await;
+        let crawled = NuGetCrawler.crawl_all(&local(&app)).await;
+        assert_eq!(purls_of(&crawled), every, "unrestored sub-project");
+
+        let obj = tests.join("obj");
+        tokio::fs::create_dir_all(&obj).await.unwrap();
+        tokio::fs::write(obj.join("project.assets.json"), r#"{"version": 3}"#)
+            .await
+            .unwrap();
+        let crawled = NuGetCrawler.crawl_all(&local(&app)).await;
+        assert_eq!(purls_of(&crawled), every, "assets without libraries");
     }
 
     /// The project-local `packages/` folder is the project's own, so it
