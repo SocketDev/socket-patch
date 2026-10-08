@@ -776,12 +776,15 @@ const GEM_MANIFEST_FILES: [&str; 4] = ["Gemfile", "Gemfile.lock", "gems.rb", "ge
 /// to bundler's own choice, so it can never wire a manifest bundler
 /// ignores:
 ///
-/// - no `BUNDLE_GEMFILE`: unchanged (the rewriter's `gems.rb`-first choice
-///   and its divergence guard are bundler's default discovery);
+/// - no `BUNDLE_GEMFILE`: unchanged for a lone `Gemfile` or `gems.rb`; a
+///   `Gemfile` + `gems.rb` twin is withheld, since bundler 1.x loads the
+///   `Gemfile`, >= 2 loads `gems.rb`, and nothing says which runs
+///   ([`manifest::twin_manifest_refusal`](crate::formats::gem::manifest::twin_manifest_refusal));
 /// - `BUNDLE_GEMFILE` naming the root `Gemfile` / `gems.rb`: the other
 ///   spelling is dropped;
-/// - `BUNDLE_GEMFILE` naming anything else: every spelling is dropped and
-///   [`CandidateFiles::gem_refusal`] says why;
+/// - `BUNDLE_GEMFILE` naming anything else, or bundler 4's
+///   `BUNDLE_LOCKFILE` naming a lock other than the pair's own: every
+///   spelling is dropped and [`CandidateFiles::gem_refusal`] says why;
 /// - a bundler mirror capturing the patch-registry source (`mirror.all`,
 ///   or `mirror.<source>`; see [`crate::formats::gem::mirror`]): every
 ///   spelling is dropped the same way (#681).
@@ -792,7 +795,7 @@ async fn keep_bundler_loaded_gem_files(
     candidates: &[Candidate],
     out: &mut CandidateFiles,
 ) {
-    use crate::formats::gem::manifest::LoadedManifest;
+    use crate::formats::gem::manifest::{self, LoadedManifest};
     let sources: Vec<&str> = candidates
         .iter()
         .filter_map(|c| c.dep.registry_override.as_ref())
@@ -811,8 +814,14 @@ async fn keep_bundler_loaded_gem_files(
         }
     };
     let refusal = if let Some(detail) = loaded.unsupported_detail() {
+        let code = match &loaded {
+            LoadedManifest::UnsupportedLockfile { .. } => {
+                "redirect_gem_bundle_lockfile_unsupported"
+            }
+            _ => "redirect_gem_bundle_gemfile_unsupported",
+        };
         Some(RewriteWarning {
-            code: "redirect_gem_bundle_gemfile_unsupported".into(),
+            code: code.into(),
             detail,
         })
     } else {
@@ -829,8 +838,30 @@ async fn keep_bundler_loaded_gem_files(
             ),
         })
     };
+    // A spelling bundler sees (`File.file?`) even when this run couldn't
+    // read it: a symlink, an unreadable or a non-UTF-8 file still makes the
+    // project a twin, as lock inventory (`view.is_file`) already counts it.
+    let present = |rel: &str| {
+        out.files.contains_key(rel)
+            || view.is_file(rel)
+            || out.symlinked_reads.iter().any(|r| r == rel)
+            || out.unreadable_reads.iter().any(|r| r == rel)
+            || out.undecodable_reads.iter().any(|r| r == rel)
+    };
+    let is_twin = present("gems.rb") && present("Gemfile");
+    let mut twin_ambiguous = None;
     let keep: &[&str] = match (&loaded, &refusal) {
-        (_, Some(_)) | (LoadedManifest::Unsupported { .. }, _) => &[],
+        (_, Some(_))
+        | (LoadedManifest::Unsupported { .. } | LoadedManifest::UnsupportedLockfile { .. }, _) => {
+            &[]
+        }
+        // Default discovery of a twin: bundler 1.x loads the `Gemfile`
+        // and >= 2 loads `gems.rb`, and nothing here says which runs, so
+        // neither pair is wired (#751).
+        (LoadedManifest::Default, None) if is_twin => {
+            twin_ambiguous = Some(manifest::twin_manifest_refusal());
+            &[]
+        }
         (LoadedManifest::Default, None) => return,
         (LoadedManifest::Configured { .. }, None) => {
             let (gemfile, lock) = loaded
@@ -844,7 +875,10 @@ async fn keep_bundler_loaded_gem_files(
     out.symlinked_reads.retain(|rel| !dropped(rel));
     out.unreadable_reads.retain(|rel| !dropped(rel));
     out.undecodable_reads.retain(|rel| !dropped(rel));
-    out.gem_refusal = refusal;
+    out.gem_refusal = refusal.or(twin_ambiguous.map(|detail| RewriteWarning {
+        code: "redirect_gem_twin_manifest_ambiguous".into(),
+        detail,
+    }));
 }
 
 /// The pypi wheels whose metadata a native lock rewrite needs, in
@@ -3274,6 +3308,10 @@ mod tests {
         PLATFORMS\n  ruby\n\nDEPENDENCIES\n  rails (= 7.0.0)\n\nBUNDLED WITH\n   2.5.22\n";
 
     async fn gem_rewrite(p: &MemoryProject) -> (CandidateFiles, Rewritten) {
+        gem_rewrite_in(&ProjectView::Memory(p)).await
+    }
+
+    async fn gem_rewrite_in(view: &ProjectView<'_>) -> (CandidateFiles, Rewritten) {
         let outer = OuterAllowRemote::default;
         let options = RewriteOptions {
             dry_run: false,
@@ -3287,10 +3325,9 @@ mod tests {
             blocking: false,
         };
         let candidates = vec![gem_candidate()];
-        let view = ProjectView::Memory(p);
-        let read = read_candidate_files(&view, &BTreeSet::new(), &candidates).await;
+        let read = read_candidate_files(view, &BTreeSet::new(), &candidates).await;
         let done = rewrite(
-            &view,
+            view,
             read.clone(),
             &candidates,
             BTreeMap::new(),
@@ -3343,6 +3380,169 @@ mod tests {
             .iter()
             .map(|w| w.code.as_str())
             .collect()
+    }
+
+    /// #749: bundler 4's `BUNDLE_LOCKFILE` naming another lock leaves every
+    /// gem manifest out of the candidates, and the run says why.
+    #[tokio::test]
+    async fn bundle_lockfile_naming_another_lock_redirects_nothing() {
+        let mut p = MemoryProject::new();
+        p.insert_text("Gemfile", GEMFILE);
+        p.insert_text("Gemfile.lock", GEM_LOCK);
+        p.insert_text("custom.lock", GEM_LOCK);
+        p.insert_text(".bundle/config", "---\nBUNDLE_LOCKFILE: \"custom.lock\"\n");
+        let (read, done) = gem_rewrite(&p).await;
+        assert!(!read.files.contains_key("Gemfile"));
+        assert!(!read.files.contains_key("Gemfile.lock"));
+        assert!(
+            done.rewrite.files.is_empty(),
+            "{:?}",
+            done.rewrite.files.keys()
+        );
+        let codes = warning_codes(&done);
+        assert!(
+            codes.contains(&"redirect_gem_bundle_lockfile_unsupported"),
+            "{codes:?}"
+        );
+    }
+
+    /// #749: a memory view has no real root, so an absolute
+    /// `BUNDLE_LOCKFILE` that would land on the pair's lock if the project
+    /// sat at `/` still names a file outside the project. Bundler opens
+    /// that path, never the in-repo lock, so the pair stays out.
+    #[tokio::test]
+    async fn absolute_bundle_lockfile_redirects_nothing() {
+        for (gems_rb, lock) in [(false, "/Gemfile.lock"), (true, "/gems.locked")] {
+            let mut p = MemoryProject::new();
+            if gems_rb {
+                p.insert_text("gems.rb", GEMFILE);
+                p.insert_text("gems.locked", GEM_LOCK);
+            } else {
+                p.insert_text("Gemfile", GEMFILE);
+                p.insert_text("Gemfile.lock", GEM_LOCK);
+            }
+            p.insert_text(
+                ".bundle/config",
+                format!("---\nBUNDLE_LOCKFILE: \"{lock}\"\n").as_str(),
+            );
+            let (_read, done) = gem_rewrite(&p).await;
+            assert!(
+                done.rewrite.files.is_empty(),
+                "{lock}: {:?}",
+                done.rewrite.files.keys()
+            );
+            let codes = warning_codes(&done);
+            assert!(
+                codes.contains(&"redirect_gem_bundle_lockfile_unsupported"),
+                "{lock}: {codes:?}"
+            );
+        }
+    }
+
+    /// #751: a `Gemfile` + `gems.rb` twin is withheld whatever its locks'
+    /// `BUNDLED WITH` say (which bundler wrote a lock is not which one
+    /// installs it), and the run says why.
+    #[tokio::test]
+    async fn twin_redirects_nothing_whatever_the_locks_say() {
+        let legacy = GEM_LOCK.replace("2.5.22", "1.17.3");
+        for (gemfile_lock, gems_locked) in [
+            (legacy.as_str(), legacy.as_str()),
+            (legacy.as_str(), GEM_LOCK),
+            (GEM_LOCK, GEM_LOCK),
+        ] {
+            let mut p = MemoryProject::new();
+            p.insert_text("Gemfile", GEMFILE);
+            p.insert_text("Gemfile.lock", gemfile_lock);
+            p.insert_text("gems.rb", GEMFILE);
+            p.insert_text("gems.locked", gems_locked);
+            let (_read, done) = gem_rewrite(&p).await;
+            assert!(
+                done.rewrite.files.is_empty(),
+                "{:?}",
+                done.rewrite.files.keys()
+            );
+            let codes = warning_codes(&done);
+            assert!(
+                codes.contains(&"redirect_gem_twin_manifest_ambiguous"),
+                "{codes:?}"
+            );
+        }
+    }
+
+    /// A twin whose other spelling this run can't read (a symlink, an
+    /// unreadable or a non-UTF-8 file) is still a twin: bundler's
+    /// `File.file?` sees it, so neither pair is wired (Bugbot on #768).
+    #[tokio::test]
+    async fn twin_with_an_unreadable_spelling_redirects_nothing() {
+        for (other, entry) in [
+            ("gems.rb", MemoryEntry::Symlink),
+            ("Gemfile", MemoryEntry::Symlink),
+            (
+                "gems.rb",
+                MemoryEntry::Binary(vec![0xff, 0xfe, 0x00].into()),
+            ),
+        ] {
+            let mut p = MemoryProject::new();
+            for (rel, text) in [
+                ("Gemfile", GEMFILE),
+                ("Gemfile.lock", GEM_LOCK),
+                ("gems.rb", GEMFILE),
+                ("gems.locked", GEM_LOCK),
+            ] {
+                if rel != other {
+                    p.insert_text(rel, text);
+                }
+            }
+            p.insert(other, entry);
+            let (_read, done) = gem_rewrite(&p).await;
+            assert!(
+                done.rewrite.files.is_empty(),
+                "{other}: {:?}",
+                done.rewrite.files.keys()
+            );
+            let codes = warning_codes(&done);
+            assert!(
+                codes.contains(&"redirect_gem_twin_manifest_ambiguous"),
+                "{other}: {codes:?}"
+            );
+        }
+    }
+
+    /// On disk, a twin spelling that `stat`s as a regular file but can't
+    /// be read (permission denied) is still a twin: bundler's `File.file?`
+    /// sees it, so neither pair is wired (Bugbot on #768).
+    #[cfg(unix)]
+    #[tokio::test]
+    async fn twin_with_an_unreadable_disk_spelling_redirects_nothing() {
+        use std::os::unix::fs::PermissionsExt;
+        let tmp = tempfile::tempdir().unwrap();
+        let root = tmp.path();
+        for (rel, text) in [
+            ("Gemfile", GEMFILE),
+            ("Gemfile.lock", GEM_LOCK),
+            ("gems.rb", GEMFILE),
+            ("gems.locked", GEM_LOCK),
+        ] {
+            std::fs::write(root.join(rel), text).unwrap();
+        }
+        let gems_rb = root.join("gems.rb");
+        std::fs::set_permissions(&gems_rb, std::fs::Permissions::from_mode(0o000)).unwrap();
+        if std::fs::read(&gems_rb).is_ok() {
+            // Running as root: permissions can't make the read fail.
+            return;
+        }
+        let (_read, done) = gem_rewrite_in(&ProjectView::Disk(root)).await;
+        std::fs::set_permissions(&gems_rb, std::fs::Permissions::from_mode(0o644)).unwrap();
+        assert!(
+            done.rewrite.files.is_empty(),
+            "{:?}",
+            done.rewrite.files.keys()
+        );
+        let codes = warning_codes(&done);
+        assert!(
+            codes.contains(&"redirect_gem_twin_manifest_ambiguous"),
+            "{codes:?}"
+        );
     }
 
     /// #681: `bundle config set --local mirror.all <url>` sends the
@@ -3461,23 +3661,23 @@ mod tests {
         assert!(!done.rewrite.files.contains_key("gems.locked"));
     }
 
-    /// Without `BUNDLE_GEMFILE` nothing changes: `gems.rb` is still the
-    /// spelling bundler (and the rewriter) picks.
+    /// Without `BUNDLE_GEMFILE` a lone `gems.rb` pair is still the one
+    /// bundler (and the rewriter) picks; a twin is withheld
+    /// ([`twin_redirects_nothing_whatever_the_locks_say`]).
     #[tokio::test]
-    async fn default_discovery_still_prefers_gems_rb() {
+    async fn default_discovery_wires_a_lone_gems_rb() {
         let mut p = MemoryProject::new();
-        p.insert_text("Gemfile", GEMFILE);
-        p.insert_text("Gemfile.lock", GEM_LOCK);
         p.insert_text("gems.rb", GEMFILE);
         p.insert_text("gems.locked", GEM_LOCK);
-        let (read, done) = gem_rewrite(&p).await;
-        assert!(read.files.contains_key("Gemfile"));
+        let (_read, done) = gem_rewrite(&p).await;
         assert!(
             done.rewrite.files.contains_key("gems.rb"),
             "{:?}",
             done.rewrite.files.keys()
         );
-        assert!(!done.rewrite.files.contains_key("Gemfile"));
+        assert!(warning_codes(&done)
+            .iter()
+            .all(|c| !c.starts_with("redirect_gem_twin")));
     }
 
     /// #333: the Pipenv planner keys a live lock on the `Pipfile` beside

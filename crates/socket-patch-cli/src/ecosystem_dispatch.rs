@@ -1,7 +1,8 @@
 use socket_patch_core::crawlers::{
     CrawledPackage, CrawlerOptions, Ecosystem, NpmCrawler, PythonCrawler, RubyCrawler,
 };
-use socket_patch_core::utils::purl::{canonical_purl, normalize_purl, strip_purl_qualifiers};
+use socket_patch_core::utils::purl::strip_purl_qualifiers;
+use socket_patch_core::utils::purl_key::PurlKey;
 use std::collections::{HashMap, HashSet};
 use std::path::PathBuf;
 
@@ -578,10 +579,10 @@ pub(crate) fn npm_paths_by_identity_in(
 ) -> HashMap<String, Vec<PathBuf>> {
     let mut out = HashMap::new();
     for purl in purls {
-        let want = canonical_purl(purl);
+        let want = PurlKey::new(purl);
         let paths: Vec<PathBuf> = installed
             .iter()
-            .filter(|pkg| normalize_purl(&pkg.purl) == want)
+            .filter(|pkg| PurlKey::new(&pkg.purl) == want)
             .map(|pkg| pkg.path.clone())
             .collect();
         if !paths.is_empty() {

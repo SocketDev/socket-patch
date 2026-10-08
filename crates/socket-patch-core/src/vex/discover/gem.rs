@@ -155,7 +155,10 @@ pub(crate) async fn extract(ctx: &DiscoverCtx<'_>, out: &mut Discovery) {
         extract_file(ctx, file, &mut ignored).await;
         let why = match loaded {
             Some(lock) => format!("bundler loads {lock}, not {file}"),
-            None => "BUNDLE_GEMFILE points bundler at another manifest".to_string(),
+            None => "socket-patch cannot tell which lock bundler loads here (BUNDLE_GEMFILE or \
+                     BUNDLE_LOCKFILE names another file, or a Gemfile + gems.rb twin leaves it \
+                     to the bundler major that runs)"
+                .to_string(),
         };
         for r in ignored.refs {
             out.diag(

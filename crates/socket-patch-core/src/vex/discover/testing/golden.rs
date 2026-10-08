@@ -123,6 +123,8 @@ fn render(out: &Discovery, root: &Path) -> Value {
         unpatched_copies,
         unattested,
         contested,
+        read: _,
+        withheld: _,
         // Already folded into `unattested` by the time a run returns.
         unwired_copies: _,
     } = out;
