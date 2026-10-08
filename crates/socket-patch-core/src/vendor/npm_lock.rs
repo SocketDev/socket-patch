@@ -748,6 +748,9 @@ pub async fn revert_npm_opts(
         }
     }
 
+    // An entry npm installs from a non-registry spec (git, URL, `file:`) is
+    // never a registry upgrade, whatever its `resolved` says (#326).
+    let overrides = NpmOverrides::read(project_root).await;
     for lock_name in lock_files {
         let lock_path = project_root.join(lock_name);
         let lock_bytes = match read_regular_to_bytes(&lock_path).await {
@@ -774,12 +777,14 @@ pub async fn revert_npm_opts(
             }
         };
 
+        let non_registry = npm_non_registry_entries(&lock, &overrides);
         let mut changed = false;
         // Reverse application order, like every backend's revert.
         for rec in entry.wiring.iter().rev().filter(|r| r.file == lock_name) {
             revert_one_record(
                 &mut lock,
                 rec,
+                &non_registry,
                 &entry.uuid,
                 &mut changed,
                 &mut outcome.warnings,
@@ -1215,6 +1220,22 @@ fn version_moved_off<'a>(rec: &WiringRecord, live: &'a Value) -> Option<&'a str>
     (plain_version && leaf == format!("{basename}-{tarball}.tgz")).then_some(live_version)
 }
 
+/// The `packages` key a legacy `dependencies` wiring pointer mirrors
+/// (`/dependencies/a/dependencies/b` → `node_modules/a/node_modules/b`), or
+/// `None` for a pointer of any other shape.
+fn legacy_pointer_packages_key(pointer: &str) -> Option<String> {
+    let mut tokens = pointer.strip_prefix('/')?.split('/');
+    let mut key = String::new();
+    while let Some(field) = tokens.next() {
+        if field != "dependencies" {
+            return None;
+        }
+        let name = tokens.next()?.replace("~1", "/").replace("~0", "~");
+        key = legacy_packages_key(&key, &name);
+    }
+    (!key.is_empty()).then_some(key)
+}
+
 /// The version a lock `version` field names in its tarball file: itself,
 /// or for a legacy (lockfile v1) alias row's `npm:left-pad@1.3.0` /
 /// `npm:@scope/pkg@1.0.0` spelling, the part after the last `@`.
@@ -1249,6 +1270,7 @@ fn split_http_scheme(url: &str) -> Option<(&str, &str)> {
 fn revert_one_record(
     lock: &mut Value,
     rec: &WiringRecord,
+    non_registry: &BTreeMap<String, String>,
     entry_uuid: &str,
     changed: &mut bool,
     warnings: &mut Vec<VendorWarning>,
@@ -1313,7 +1335,12 @@ fn revert_one_record(
         // after `npm uninstall`. Nothing to restore; the caller keeps the
         // artifact only while a lock still resolves through it. A
         // same-version re-resolution stays drift: re-vendoring can undo it.
-        if let Some(live_version) = version_moved_off(rec, live) {
+        let packages_key = match rec.kind.as_str() {
+            KIND_LOCK_LEGACY_ENTRY => legacy_pointer_packages_key(key),
+            _ => Some(key.to_string()),
+        };
+        let registry_install = packages_key.is_some_and(|k| !non_registry.contains_key(&k));
+        if let Some(live_version) = version_moved_off(rec, live).filter(|_| registry_install) {
             warnings.push(VendorWarning::new(
                 super::LOCK_ENTRY_REMOVED_CODE,
                 format!(
@@ -3556,6 +3583,51 @@ mod tests {
             .root()
             .join(format!(".socket/vendor/npm/{UUID}"))
             .exists());
+    }
+
+    /// #1155 provenance guard: an edge npm installs from a git, URL or
+    /// `file:` spec is not a registry upgrade even when its `packages` entry
+    /// is written in the registry tarball shape: npm ci installs it from the
+    /// spec. It stays drift and the artifact is kept.
+    #[tokio::test]
+    async fn revert_keeps_version_change_behind_a_non_registry_spec_as_drift() {
+        for spec in [
+            "github:stevemao/left-pad#v1.3.1",
+            "https://example.com/left-pad-1.3.1.tgz",
+            "file:../left-pad",
+        ] {
+            let fx = fixture().await;
+            let (_, entry, _) = expect_done(fx.vendor(false).await);
+            let entry = entry.unwrap();
+
+            let forged = json!({
+                "version": "1.3.1",
+                "resolved": "https://registry.npmjs.org/left-pad/-/left-pad-1.3.1.tgz",
+                "integrity": "sha512-upgraded=="
+            });
+            let mut live = fx.read_lock().await;
+            live["packages"][""]["dependencies"]["left-pad"] = json!(spec);
+            live["packages"]["node_modules/left-pad"] = forged.clone();
+            live["packages"]["node_modules/foo/node_modules/left-pad"] = forged;
+            tokio::fs::write(fx.lock_path(), serialize_json(&live, "  ").unwrap())
+                .await
+                .unwrap();
+
+            let outcome = revert_npm(&entry, fx.root(), false).await;
+            assert!(outcome.success, "{spec}: {:?}", outcome.error);
+            assert!(outcome.drift_skipped(), "{spec}: {:?}", outcome.warnings);
+            assert!(outcome.kept_artifact, "{spec}: {:?}", outcome.warnings);
+        }
+    }
+
+    #[test]
+    fn legacy_pointer_maps_to_its_packages_key() {
+        assert_eq!(
+            legacy_pointer_packages_key("/dependencies/foo/dependencies/@s~1pad").as_deref(),
+            Some("node_modules/foo/node_modules/@s/pad")
+        );
+        assert_eq!(legacy_pointer_packages_key("/packages/x"), None);
+        assert_eq!(legacy_pointer_packages_key("/dependencies"), None);
     }
 
     /// #1155, old lock: npm 6 recorded `http://registry.npmjs.org/...`
