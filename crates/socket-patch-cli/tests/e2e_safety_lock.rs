@@ -469,12 +469,17 @@ mod interrupted_holder {
     /// `ignore_sigint`, the child starts with SIGINT ignored, as under
     /// `nohup` or a launcher that ignores Ctrl-C.
     fn spawn_holding_lock(root: &Path, ignore_sigint: bool) -> Child {
+        spawn_parked_at(root, "apply_lock.acquired", ignore_sigint)
+    }
+
+    /// Spawn `apply` in `root` and wait until it parks at `failpoint`.
+    fn spawn_parked_at(root: &Path, failpoint: &str, ignore_sigint: bool) -> Child {
         let ready = root.join("failpoint-ready");
         let mut cmd = hermetic_command(&binary());
         jvm_env::isolate_cli(&mut cmd);
         cmd.args(["apply", "--json"])
             .current_dir(root)
-            .env("SOCKET_PATCH_FAILPOINT", "apply_lock.acquired~pause")
+            .env("SOCKET_PATCH_FAILPOINT", format!("{failpoint}~pause"))
             .env("SOCKET_PATCH_FAILPOINT_READY", &ready)
             .stdin(Stdio::null())
             .stdout(Stdio::null())
@@ -511,12 +516,16 @@ mod interrupted_holder {
     }
 
     fn assert_interrupt_cleans_up(sig: libc::c_int) {
+        assert_interrupt_at_cleans_up("apply_lock.acquired", sig);
+    }
+
+    fn assert_interrupt_at_cleans_up(failpoint: &str, sig: libc::c_int) {
         let dir = tempfile::tempdir().unwrap();
         let socket_dir = dir.path().join(".socket");
         setup_socket_dir(&socket_dir);
         let lock = socket_dir.join("apply.lock");
 
-        let mut child = spawn_holding_lock(dir.path(), false);
+        let mut child = spawn_parked_at(dir.path(), failpoint, false);
         assert!(lock.is_file(), "the parked apply holds apply.lock");
 
         signal(&child, sig);
@@ -549,6 +558,15 @@ mod interrupted_holder {
     #[test]
     fn sighup_removes_the_lock_file() {
         assert_interrupt_cleans_up(libc::SIGHUP);
+    }
+
+    /// An interrupt that lands while the guard's drop is already under
+    /// way — before the drop's own unlink — still removes the file: the
+    /// handler ends the process without resuming the drop, so the guard
+    /// must stay in the interrupt table until the drop has unlinked it.
+    #[test]
+    fn interrupt_during_release_removes_the_lock_file() {
+        assert_interrupt_at_cleans_up("apply_lock.releasing", libc::SIGTERM);
     }
 
     /// A process started with SIGINT ignored keeps ignoring it (no handler

@@ -210,7 +210,9 @@ impl Drop for LockGuard {
         // the barrier, which can take seconds over a large vendored tree,
         // or during the identity probe) still removes the file: the CLI's
         // handler ends the process, so this drop never gets to finish.
-        //
+        // Debug-only hook: the interrupt tests park the process here and
+        // signal it.
+        crate::utils::failpoint::hit("apply_lock.releasing");
         // R1: unlink while still holding the lock — but only the file we
         // hold. The unlink is gated on the path still naming the held
         // inode: after a non-cooperating `rm` + `touch`, the path names a
