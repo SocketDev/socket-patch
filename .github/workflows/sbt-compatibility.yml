@@ -21,6 +21,7 @@ name: sbt / Mill / scala-cli compatibility
 
 on:
   pull_request:
+    types: [opened, synchronize, reopened, ready_for_review]
     # Everything the agent, hosted and vendored cells run through, shared
     # engine code included (as composer-compatibility.yml does).
     paths:
@@ -68,6 +69,7 @@ env:
 
 jobs:
   image:
+    if: github.event.pull_request.draft != true
     # Builds the sbt image once (base image first: Dockerfile.sbt is
     # `FROM socket-patch-test-base:latest`) and hands it to every leg.
     runs-on: ubuntu-latest
@@ -117,6 +119,7 @@ jobs:
           retention-days: 3
 
   linux-bins:
+    if: github.event.pull_request.draft != true
     # The Linux socket-patch and the real-tool test binaries (docker_e2e_sbt's
     # host side too, so no leg compiles), built once in the script's pinned
     # rust container. Absolute paths are kept (`tar -P`):
@@ -261,6 +264,7 @@ jobs:
     # from sbt/setup-sbt, a Temurin JDK 17, the tests' own native runner.
     # The warm-seed step boots sbt once so the tests share its caches.
     name: sbt 1.13.0 ${{ matrix.suite }} / ${{ matrix.os }}
+    if: github.event.pull_request.draft != true
     runs-on: ${{ matrix.os }}
     timeout-minutes: 60
     strategy:
@@ -268,6 +272,9 @@ jobs:
       matrix:
         os: [macos-latest, windows-latest]
         suite: [e2e_sbt_build, e2e_sbt_vendor_build]
+        exclude:
+          # macOS legs run on push to main (and nightly where scheduled), not per PR push.
+          - os: ${{ github.event_name == 'pull_request' && 'macos-latest' || '' }}
     steps:
       - uses: actions/checkout@de0fac2e4500dabe0009e67214ff5f5447ce83dd # v6.0.2
         with:
