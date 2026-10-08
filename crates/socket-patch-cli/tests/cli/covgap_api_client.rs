@@ -348,3 +348,82 @@ async fn unresolved_org_routes_the_whole_scan_vex_run_to_the_proxy_once() {
         "no proxy request carries the bearer"
     );
 }
+
+/// #648: `apply` and `vendor` seed their embedded `--vex` with the run's
+/// client, which suppresses the VEX plan's own `api_auth_fallback` note on
+/// the promise that the host reports it. So, like `scan` / `get`, their
+/// `--json` envelopes must carry the downgrade in `warnings[]` (here on a
+/// project whose manifest lists no patches: the host path still builds the
+/// client, resolves the org once and prints its envelope).
+#[tokio::test]
+async fn unresolved_org_reaches_apply_and_vendor_json_warnings() {
+    for command in ["apply", "vendor"] {
+        let mock = MockServer::start().await;
+        Mock::given(method("GET"))
+            .and(path("/v0/organizations"))
+            .respond_with(ResponseTemplate::new(500).set_body_string("boom"))
+            .expect(1)
+            .mount(&mock)
+            .await;
+        Mock::given(wiremock::matchers::path_regex("^/v0/orgs/"))
+            .respond_with(ResponseTemplate::new(500))
+            .expect(0)
+            .mount(&mock)
+            .await;
+        Mock::given(method("POST"))
+            .and(path("/patch/telemetry"))
+            .respond_with(ResponseTemplate::new(201))
+            .mount(&mock)
+            .await;
+
+        let tmp = tempfile::tempdir().unwrap();
+        let cwd = tmp.path();
+        std::fs::write(
+            cwd.join("package.json"),
+            r#"{"name":"app","version":"1.0.0"}"#,
+        )
+        .unwrap();
+        std::fs::create_dir_all(cwd.join(".socket")).unwrap();
+        std::fs::write(cwd.join(".socket/manifest.json"), r#"{"patches":{}}"#).unwrap();
+        let uri = mock.uri();
+        let token = format!("sktsec_{}_api", "x".repeat(44));
+        let mut cmd = Command::new(binary());
+        for (key, _) in std::env::vars() {
+            if key.starts_with("SOCKET_") {
+                cmd.env_remove(key);
+            }
+        }
+        let out = cmd
+            .args([
+                command,
+                "--json",
+                "--cwd",
+                cwd.to_str().unwrap(),
+                "--api-url",
+                &uri,
+                "--proxy-url",
+                &uri,
+                "--api-token",
+                &token,
+            ])
+            .env("SOCKET_NO_CONFIG", "1")
+            .current_dir(cwd)
+            .output()
+            .unwrap_or_else(|e| panic!("run socket-patch {command}: {e}"));
+        let stderr = String::from_utf8_lossy(&out.stderr);
+        let v = json_stdout(&out);
+        assert_eq!(v["command"], command, "{v}");
+        let fallback = v["warnings"]
+            .as_array()
+            .and_then(|w| w.iter().find(|w| w["code"] == "api_auth_fallback"))
+            .unwrap_or_else(|| {
+                panic!("[{command}] no api_auth_fallback warning: {v}; stderr={stderr}")
+            });
+        assert!(
+            fallback["detail"]
+                .as_str()
+                .is_some_and(|d| d.contains("Pass --org or set SOCKET_ORG_SLUG")),
+            "[{command}] the warning says how to fix it: {fallback}"
+        );
+    }
+}

@@ -1055,6 +1055,17 @@ pub async fn run(args: VendorArgs) -> i32 {
 
     let mut env = Envelope::new(Command::Vendor);
     env.dry_run = args.common.dry_run;
+    // A token whose org could not be resolved put the run on the proxy
+    // (stderr already said so); the embedded `--vex` reuses this client and
+    // leaves reporting it to the host's `warnings[]`.
+    if args.common.json {
+        if let Some(client) = vendor_service.as_ref().and_then(|(s, _)| s.client.as_ref()) {
+            env.warnings
+                .extend(crate::commands::vex_sources::api_auth_fallback_warning(
+                    client,
+                ));
+        }
+    }
 
     let mut exit = match &vendor_service {
         None => run_revert(&args, &mut env).await,
@@ -1233,8 +1244,7 @@ async fn run_check(args: &VendorArgs) -> i32 {
     // know (the ledger was ignored or dropped from the commit along with the
     // manifest) leaves every fresh install failing; the manifest keys above
     // cannot see it, so the references are read from the wiring itself.
-    let references =
-        crate::commands::vendored_backend::repair::scan_vendor_references(root).await;
+    let references = crate::commands::vendored_backend::repair::scan_vendor_references(root).await;
     for (eco, uuid, rel) in references {
         let ledgered = state
             .entries
@@ -1794,6 +1804,12 @@ async fn run_eject(args: &VendorArgs, pins: Vec<HostedPin>) -> i32 {
         }
     };
     let mut env = Envelope::new(Command::Vendor);
+    if common.json {
+        env.warnings
+            .extend(crate::commands::vex_sources::api_auth_fallback_warning(
+                &client,
+            ));
+    }
     let restore = socket_patch_core::patch::redirect::upstream::restore_upstream(
         &common.cwd,
         &pins,

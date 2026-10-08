@@ -1549,6 +1549,13 @@ pub(crate) async fn run_locked(
                 // `warnings[]` is their machine channel — stderr is
                 // suppressed under --json.
                 env.warnings.extend(run_warnings.iter().cloned());
+                // A token whose org could not be resolved put the run on the
+                // proxy (stderr already said so); the embedded `--vex` reuses
+                // this client and leaves reporting it to the host.
+                env.warnings
+                    .extend(crate::commands::vex_sources::api_auth_fallback_warning(
+                        client,
+                    ));
                 if !success {
                     env.mark_partial_failure();
                 }

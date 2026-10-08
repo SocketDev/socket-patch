@@ -192,6 +192,22 @@ pub(crate) const NOTE_RECORD_FETCH_FAILED: &str = "vex_record_fetch_failed";
 /// org could not be resolved, so the run's client is on the proxy.
 pub(crate) const NOTE_API_AUTH_FALLBACK: &str = "api_auth_fallback";
 
+/// The run-level `--json` warning for a client whose org could not be
+/// resolved (the run is on the public proxy; construction already warned on
+/// stderr). A host that seeds embedded `--vex` with its client suppresses
+/// the VEX plan's own `api_auth_fallback` note, so the host's envelope must
+/// carry this instead (`scan` / `get` / `apply` / `vendor`).
+pub(crate) fn api_auth_fallback_warning(
+    client: &ApiClient,
+) -> Option<crate::json_envelope::RunWarning> {
+    client
+        .org_unresolved()
+        .map(|reason| crate::json_envelope::RunWarning {
+            code: NOTE_API_AUTH_FALLBACK.to_string(),
+            detail: reason.to_string(),
+        })
+}
+
 /// Omission tag and note: a hosted Gradle pin is wired, but a lock file
 /// records a release above its base, which that build resolves instead
 /// (`vex::Unattested`).
