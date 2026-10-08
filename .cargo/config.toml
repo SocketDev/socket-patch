@@ -32,3 +32,10 @@ SOCKET_NO_CONFIG = "1"
 # tests opt back in with SOCKET_NO_UPDATE_CHECK=0 plus a wiremock
 # SOCKET_UPDATE_BASE_URL.
 SOCKET_NO_UPDATE_CHECK = "1"
+
+# No test child (and no dev `cargo run`) may POST telemetry to the real
+# public proxy: an unauthenticated run sends its events to
+# patches-api.socket.dev, and most spawning suites point no proxy URL at a
+# mock. Suites that assert telemetry events opt back in with
+# SOCKET_TELEMETRY_DISABLED=0 (or remove it) plus a wiremock endpoint.
+SOCKET_TELEMETRY_DISABLED = "1"
