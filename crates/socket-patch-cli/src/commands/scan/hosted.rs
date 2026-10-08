@@ -181,6 +181,10 @@ fn acquire_hosted_lock(
 struct StaleInstallOutcome {
     warnings: Vec<serde_json::Value>,
     stale_purls: std::collections::BTreeSet<String>,
+    /// The probe may have changed the installed tree (the vlt heal
+    /// invalidates store copies, which lockfile discovery reads for
+    /// bundled copies); the read-only probes never set it.
+    touched_install: bool,
 }
 
 /// The `redirect_gem_stale_install` warning for one stale installed
@@ -623,6 +627,62 @@ pub(super) async fn run_redirect(
         Some(super::rollout::Gate::new(stage, rows).with_prior(prior)),
     )
     .await
+}
+
+/// What the hosted run wrote after its rewrite read the project, for
+/// [`discovery_after_writes`].
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+enum Written<'a> {
+    /// The rewrite planned no file write (a no-op or already-redirected run).
+    Nothing,
+    /// A dry run: the rewrite planned writes, none landed.
+    Previewed,
+    /// The rewrite's files landed; these paths were not a regular file
+    /// before the write.
+    Landed { created: &'a [&'a str] },
+}
+
+/// An already-made lockfile discovery (made with the configured patch-server
+/// origins, as [`crate::commands::discover_wiring`] makes it) that equals a
+/// fresh discovery of the project as the hosted run left it, or `None` when
+/// none provably does and the caller must discover again.
+///
+/// - Anything that touched the installed tree after the rewrite
+///   (`touched_install`: the vlt heal) may change what discovery reads, so
+///   nothing is reused.
+/// - Nothing written, or a dry run: the project is as scan's pre-redirect
+///   discovery (`prior`) saw it; `prior` is `None` when a takeover changed
+///   it first. Failing that, when the rewrite planned nothing, the gate's
+///   own discovery of the unwritten project.
+/// - Files written: the gate's discovery over exactly those writes
+///   ([`FinalDiscovery::Overlaid`]), when every written path existed before
+///   or is one no discovery finds by listing a directory
+///   ([`engine::overlay_creation_is_invisible`]).
+///
+/// [`FinalDiscovery::Overlaid`]: socket_patch_core::hosted::engine::FinalDiscovery::Overlaid
+/// [`engine::overlay_creation_is_invisible`]: socket_patch_core::hosted::engine::overlay_creation_is_invisible
+fn discovery_after_writes<'d>(
+    prior: Option<&'d socket_patch_core::vex::discover::Discovery>,
+    gate: Option<&'d socket_patch_core::hosted::engine::FinalDiscovery>,
+    written: Written<'_>,
+    touched_install: bool,
+) -> Option<&'d socket_patch_core::vex::discover::Discovery> {
+    use socket_patch_core::hosted::engine::{overlay_creation_is_invisible, FinalDiscovery};
+    if touched_install {
+        return None;
+    }
+    let overlaid = match gate {
+        Some(FinalDiscovery::Overlaid(discovery)) => Some(&**discovery),
+        // The gate read `prior` itself (see `engine::rewrite`).
+        Some(FinalDiscovery::Prior) | None => None,
+    };
+    match written {
+        Written::Nothing => prior.or(overlaid),
+        Written::Previewed => prior,
+        Written::Landed { created } => {
+            overlaid.filter(|_| created.iter().all(|rel| overlay_creation_is_invisible(rel)))
+        }
+    }
 }
 
 /// The hosted-redirect flow over an ALREADY-SELECTED `(purl, uuid)` set,
@@ -1186,6 +1246,9 @@ pub(crate) async fn run_redirect_selected(
     }
 
     let rewrite = &done.rewrite;
+    // Written paths that were not a regular file before the write (see
+    // `discovery_after_writes`).
+    let mut created: Vec<&str> = Vec::new();
     if !common.dry_run {
         for (rel, content) in rewrite
             .files
@@ -1194,6 +1257,12 @@ pub(crate) async fn run_redirect_selected(
             .chain(rewrite.binary_files.iter().map(|(p, b)| (p, b.as_slice())))
         {
             let path = common.cwd.join(rel);
+            if !tokio::fs::symlink_metadata(&path)
+                .await
+                .is_ok_and(|m| m.is_file())
+            {
+                created.push(rel);
+            }
             if let Some(parent) = path.parent() {
                 let _ = std::fs::create_dir_all(parent);
             }
@@ -1306,12 +1375,41 @@ pub(crate) async fn run_redirect_selected(
     // Classified over the lockfiles as this run left them and the vendored
     // ledger as the takeover left it.
     let mut takeover_warnings: Vec<serde_json::Value> = Vec::new();
-    let hosted_now = crate::commands::hosted_state_from_lockfiles(common, &common.cwd).await;
+    // The lockfiles as this run left them: the gate's (or scan's) discovery
+    // when it provably describes them, else a fresh one.
+    let written = if !rewrite
+        .files
+        .keys()
+        .chain(rewrite.binary_files.keys())
+        .any(|rel| !socket_patch_core::patch::redirect::sbt::is_synthetic_key(rel))
+    {
+        Written::Nothing
+    } else if common.dry_run {
+        Written::Previewed
+    } else {
+        Written::Landed { created: &created }
+    };
+    let fresh_now;
+    let discovery_now = match discovery_after_writes(
+        prior_discovery,
+        done.final_discovery.as_ref(),
+        written,
+        vlt_stale.touched_install,
+    ) {
+        Some(discovery) => discovery,
+        None => {
+            fresh_now = crate::commands::discover_wiring(common, &common.cwd).await;
+            &fresh_now
+        }
+    };
+    let hosted_now = crate::commands::hosted_state_from_pins(
+        &socket_patch_core::patch::redirect::upstream::HostedPin::all(discovery_now),
+    );
     let superseded = super::classify_overlap_takeover_with(
-        common,
         &common.cwd,
         Some(&hosted_now),
         vendor_state.as_ref().ok(),
+        discovery_now,
     )
     .await
     .redirect;
@@ -2732,9 +2830,82 @@ mod tests {
         wrap_tokens, wrap_words, TAKEOVER_INFO_CODES,
     };
     use super::{wheel_metadata_concurrency, WHEEL_METADATA_CONCURRENCY};
+
     use socket_patch_core::hosted::engine::REDIRECT_CANDIDATE_FILES;
     use socket_patch_core::patch::redirect::DepOverride;
     use socket_patch_core::utils::concurrent::API_CONCURRENCY_ENV;
+
+    /// The post-write classification reuses an already-made discovery only
+    /// when it provably describes the project the run left behind, and
+    /// discovers again otherwise.
+    #[test]
+    fn the_post_write_discovery_is_reused_only_when_it_describes_the_written_project() {
+        use super::{discovery_after_writes, Written};
+        use socket_patch_core::hosted::engine::FinalDiscovery;
+        use socket_patch_core::vex::discover::Discovery;
+        let prior = Discovery::default();
+        let overlaid = FinalDiscovery::Overlaid(Box::default());
+        let Some(FinalDiscovery::Overlaid(gate)) = Some(&overlaid) else {
+            unreachable!()
+        };
+        let same = |got: Option<&Discovery>, want: &Discovery| {
+            got.is_some_and(|got| std::ptr::eq(got, want))
+        };
+        let landed = Written::Landed { created: &[] };
+
+        // Files landed: the gate's discovery over exactly those writes.
+        assert!(same(
+            discovery_after_writes(Some(&prior), Some(&overlaid), landed, false),
+            gate
+        ));
+        // ...also when it created only a root config file no listing finds.
+        for created in [&[".npmrc"][..], &["pnpm-workspace.yaml", ".npmrc"]] {
+            let written = Written::Landed { created };
+            assert!(same(
+                discovery_after_writes(None, Some(&overlaid), written, false),
+                gate
+            ));
+        }
+        // A created file a directory listing finds (a new pylock, a rush
+        // subspace lock): the overlay never listed it, so discover again.
+        let written = Written::Landed {
+            created: &[".npmrc", "pylock.toml"],
+        };
+        assert!(discovery_after_writes(Some(&prior), Some(&overlaid), written, false).is_none());
+        // Files landed, but the gate counted another origin or discovered
+        // nothing: scan's pre-write discovery is stale, so discover again.
+        assert!(discovery_after_writes(Some(&prior), None, landed, false).is_none());
+        // The vlt heal touched the installed tree discovery reads.
+        assert!(discovery_after_writes(Some(&prior), Some(&overlaid), landed, true).is_none());
+
+        // Nothing written: scan's discovery, else the gate's of the same
+        // unwritten project.
+        let reused = discovery_after_writes(
+            Some(&prior),
+            Some(&FinalDiscovery::Prior),
+            Written::Nothing,
+            false,
+        );
+        assert!(same(reused, &prior));
+        assert!(same(
+            discovery_after_writes(Some(&prior), Some(&overlaid), Written::Nothing, false),
+            &prior
+        ));
+        assert!(same(
+            discovery_after_writes(None, Some(&overlaid), Written::Nothing, false),
+            gate
+        ));
+        assert!(discovery_after_writes(None, None, Written::Nothing, false).is_none());
+        assert!(discovery_after_writes(Some(&prior), None, Written::Nothing, true).is_none());
+
+        // A dry run left the disk as scan saw it; the gate's discovery
+        // describes the preview, not the disk.
+        assert!(same(
+            discovery_after_writes(Some(&prior), Some(&overlaid), Written::Previewed, false),
+            &prior
+        ));
+        assert!(discovery_after_writes(None, Some(&overlaid), Written::Previewed, false).is_none());
+    }
 
     /// The wheel window is a patch-API window, so the documented escape
     /// hatch has to reach it: an operator behind something that caps

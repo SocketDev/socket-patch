@@ -354,6 +354,7 @@ pub(super) async fn heal_after_rewrite(
             })
             .collect();
         tally = heal_targets(common, &targets, Expected::Patched).await;
+        out.touched_install = true;
         out.warnings.push(serde_json::json!({
             "code": REINSTALL_REQUIRED,
             "detail": reinstall_detail(&tally),

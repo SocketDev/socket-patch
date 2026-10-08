@@ -1363,6 +1363,7 @@ mod tests {
                 npm_warnings: Vec::new(),
                 pnpm_rerun_only: false,
                 workspace_symlinked: false,
+                final_discovery: None,
             },
         }
     }

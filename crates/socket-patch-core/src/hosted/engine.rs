@@ -924,8 +924,8 @@ pub struct RewriteOptions<'a> {
     /// discovery, `None` when nothing was discovered or the project may
     /// have changed since). The attribution gate reuses it instead of
     /// discovering again when a pass writes nothing and this run's grants
-    /// name no origin beyond `patch_server_origins` (see
-    /// [`reusable_prior`]): the project it would discover is then the
+    /// name no origin that `patch_server_origins` does not already count
+    /// (see [`reusable_prior`]): the project it would discover is then the
     /// same, read the same way.
     pub prior_discovery: Option<&'a crate::vex::discover::Discovery>,
 }
@@ -962,6 +962,40 @@ pub struct Rewritten {
     /// In memory only: the trust auto-config would write through a
     /// symlinked `pnpm-workspace.yaml`.
     pub(crate) workspace_symlinked: bool,
+    /// The attribution gate's discovery of the project as this rewrite
+    /// leaves it, when it equals a discovery made with exactly
+    /// [`RewriteOptions::patch_server_origins`] (this run's grants name no
+    /// other origin). `None` when the gate discovered nothing (no
+    /// confirmed candidate) or counted another origin. A caller that
+    /// writes exactly [`RewriteResult::files`] and
+    /// [`RewriteResult::binary_files`] and nothing else may use it in place
+    /// of discovering the written project again (see [`FinalDiscovery`]).
+    pub final_discovery: Option<FinalDiscovery>,
+}
+
+/// Where [`Rewritten::final_discovery`] lives.
+#[derive(Debug)]
+pub enum FinalDiscovery {
+    /// The pass wrote nothing, and the gate reused the caller's
+    /// [`RewriteOptions::prior_discovery`]: still the caller's to read.
+    Prior,
+    /// A discovery of the project with the pass's writes overlaid (the
+    /// project read when the gate ran). A directory listing does not see an
+    /// overlaid file the disk lacks (see
+    /// [`DiskSnapshot::overlay`](crate::vendor::lock_inventory::DiskSnapshot::overlay)),
+    /// so it equals a discovery of the written disk only when every written
+    /// file already existed or is one no discovery lists for
+    /// ([`overlay_creation_is_invisible`]).
+    Overlaid(Box<crate::vex::discover::Discovery>),
+}
+
+/// Whether CREATING `rel` (a write over no existing regular file) leaves a
+/// discovery over the overlaid project equal to one over the written disk:
+/// the root config files the install-policy auto-configs create
+/// ([`NPMRC_REL`], [`PNPM_WORKSPACE_REL`]), which discovery reads, if at
+/// all, by path and never finds by listing a directory.
+pub fn overlay_creation_is_invisible(rel: &str) -> bool {
+    rel == NPMRC_REL || rel == PNPM_WORKSPACE_REL
 }
 
 /// The pnpm-workspace.yaml read, classified for the trust auto-config
@@ -1112,7 +1146,11 @@ pub async fn rewrite(
             options.clone(),
         )
         .await;
-        let (vetoed, lockless) = unattributed_pins(
+        let Gated {
+            vetoed,
+            lockless,
+            discovery,
+        } = unattributed_pins(
             view,
             &done,
             &kept,
@@ -1124,6 +1162,7 @@ pub async fn rewrite(
         if vetoed.is_empty() {
             done.unattributed = unattributed;
             done.rewrite.warnings.extend(lockless);
+            done.final_discovery = discovery;
             return done;
         }
         kept.retain(|c| !vetoed.iter().any(|skip| skip.uuid == c.dep.patch_uuid));
@@ -1157,14 +1196,22 @@ async fn unattributed_pins(
     exempt: &BTreeSet<String>,
     configured: &[String],
     prior: Option<&crate::vex::discover::Discovery>,
-) -> (Vec<SkippedPatch>, Vec<RewriteWarning>) {
+) -> Gated {
     if done.confirmed.is_empty() {
-        return (Vec::new(), Vec::new());
+        return Gated::default();
     }
     // The management commands' allowlist plus the hosts this run's grants
-    // name: a pin on either counts, as it will for them.
+    // name: a pin on either counts, as it will for them. A grant on
+    // Socket's own server or a configured one adds nothing discovery does
+    // not already count, so the discovery is then the one `configured`
+    // alone makes.
+    let foreign = crate::patch::redirect::upstream::foreign_dep_origins(
+        candidates.iter().map(|c| &c.dep),
+        configured,
+    );
+    let same_origins = foreign.is_empty();
     let mut origins = configured.to_vec();
-    for origin in crate::patch::redirect::upstream::dep_origins(candidates.iter().map(|c| &c.dep)) {
+    for origin in foreign {
         if !origins.contains(&origin) {
             origins.push(origin);
         }
@@ -1181,16 +1228,11 @@ async fn unattributed_pins(
     for (rel, bytes) in &done.rewrite.binary_files {
         written.push((rel.as_str(), bytes.as_slice()));
     }
-    let fresh;
-    let discovery = if let Some(prior) = reusable_prior(
-        prior,
-        written.is_empty(),
-        &opts.patch_server_origins,
-        configured,
-    ) {
-        prior
+    let reused = reusable_prior(prior, written.is_empty(), same_origins);
+    let fresh = if reused.is_some() {
+        None
     } else {
-        fresh = match view.disk_root() {
+        Some(match view.disk_root() {
             None => {
                 let ProjectView::Memory(project) = *view else {
                     unreachable!("only a memory view has no disk root")
@@ -1217,8 +1259,12 @@ async fn unattributed_pins(
                 )
                 .await
             }
-        };
-        &fresh
+        })
+    };
+    let discovery = match (reused, &fresh) {
+        (Some(prior), _) => prior,
+        (None, Some(fresh)) => fresh,
+        (None, None) => unreachable!("a pass reuses the prior discovery or discovers afresh"),
     };
     // The management commands' own view of the result: an attributable
     // pin, or contested wiring they would refuse around.
@@ -1307,20 +1353,43 @@ async fn unattributed_pins(
             }
         })
         .collect();
-    (vetoed, lockless)
+    let discovery = match (same_origins, fresh) {
+        (false, _) => None,
+        (true, None) => Some(FinalDiscovery::Prior),
+        (true, Some(fresh)) => Some(FinalDiscovery::Overlaid(Box::new(fresh))),
+    };
+    Gated {
+        vetoed,
+        lockless,
+        discovery,
+    }
+}
+
+/// What [`unattributed_pins`] decided for one pass.
+#[derive(Default)]
+struct Gated {
+    /// The confirmed candidates whose pin would be contested wiring.
+    vetoed: Vec<SkippedPatch>,
+    /// A [`REDIRECT_PIN_LOCKLESS`] warning per lockless pin.
+    lockless: Vec<RewriteWarning>,
+    /// The discovery the verdict read, for [`Rewritten::final_discovery`].
+    discovery: Option<FinalDiscovery>,
 }
 
 /// The caller's pre-rewrite discovery, when it is exactly what the gate
 /// would discover: the pass writes nothing (so the project is the one the
-/// caller discovered) and the gate's origins (`origins`: `configured` plus
-/// the grants' hosts) are the ones the caller discovered with.
-fn reusable_prior<'d>(
-    prior: Option<&'d crate::vex::discover::Discovery>,
+/// caller discovered) and the gate's origins (`configured` plus the
+/// grants' hosts) count exactly the pins the caller's (`configured` alone)
+/// did: `same_origins`, no grant on a host outside Socket's own server and
+/// `configured` ([`foreign_dep_origins`]).
+///
+/// [`foreign_dep_origins`]: crate::patch::redirect::upstream::foreign_dep_origins
+fn reusable_prior(
+    prior: Option<&crate::vex::discover::Discovery>,
     nothing_written: bool,
-    origins: &[String],
-    configured: &[String],
-) -> Option<&'d crate::vex::discover::Discovery> {
-    prior.filter(|_| nothing_written && origins == configured)
+    same_origins: bool,
+) -> Option<&crate::vex::discover::Discovery> {
+    prior.filter(|_| nothing_written && same_origins)
 }
 
 /// Warning: a confirmed pin no lockfile records a version for (a lockless
@@ -1532,6 +1601,7 @@ async fn rewrite_once(
         npm_warnings,
         pnpm_rerun_only,
         workspace_symlinked,
+        final_discovery: None,
     }
 }
 
@@ -3085,19 +3155,200 @@ mod tests {
     }
 
     /// The gate reuses the caller's discovery only for a pass that writes
-    /// nothing and whose origins are exactly the ones it was made with.
+    /// nothing and counts exactly the origins it was made with.
     #[test]
     fn the_prior_discovery_is_reused_only_unwritten_with_the_same_origins() {
         let prior = crate::vex::discover::Discovery::default();
-        let configured = vec!["https://patch.test".to_string()];
-        let extra = vec![
-            "https://patch.test".to_string(),
-            "https://other.test".to_string(),
-        ];
-        assert!(reusable_prior(Some(&prior), true, &configured, &configured).is_some());
-        assert!(reusable_prior(Some(&prior), false, &configured, &configured).is_none());
-        assert!(reusable_prior(Some(&prior), true, &extra, &configured).is_none());
-        assert!(reusable_prior(None, true, &configured, &configured).is_none());
+        assert!(reusable_prior(Some(&prior), true, true).is_some());
+        assert!(reusable_prior(Some(&prior), false, true).is_none());
+        assert!(reusable_prior(Some(&prior), true, false).is_none());
+        assert!(reusable_prior(None, true, true).is_none());
+    }
+
+    /// A registry-resolved left-pad: the hosted rewrite redirects it.
+    const LEFT_PAD_LOCK: &str = r#"{
+  "name": "app",
+  "lockfileVersion": 3,
+  "requires": true,
+  "packages": {
+    "": { "name": "app", "dependencies": { "left-pad": "1.3.0" } },
+    "node_modules/left-pad": {
+      "version": "1.3.0",
+      "resolved": "https://registry.npmjs.org/left-pad/-/left-pad-1.3.0.tgz",
+      "integrity": "sha512-UPSTREAM=="
+    }
+  }
+}
+"#;
+
+    /// The left-pad rewrite of the project on disk at `root`, counting
+    /// `configured` patch servers and handed `prior` as the caller's
+    /// pre-rewrite discovery.
+    async fn gated_left_pad_rewrite(
+        root: &std::path::Path,
+        configured: &[&str],
+        prior: Option<&crate::vex::discover::Discovery>,
+    ) -> Rewritten {
+        let outer = OuterAllowRemote::default;
+        let options = RewriteOptions {
+            dry_run: false,
+            targets_pipenv_lock: false,
+            pipenv_major: None,
+            pipenv_unknown_detail: String::new(),
+            trust_lockfile_config: true,
+            npm_allow_remote_config: true,
+            npm_outer: &outer,
+            blocking: false,
+            takeover_uuids: Default::default(),
+            patch_server_origins: configured.iter().map(|o| o.to_string()).collect(),
+            prior_discovery: prior,
+        };
+        let view = ProjectView::Disk(root);
+        let candidates = vec![left_pad_candidate()];
+        let read = read_candidate_files(&view, &BTreeSet::new(), &candidates).await;
+        rewrite(
+            &view,
+            read,
+            &candidates,
+            BTreeMap::new(),
+            &BTreeSet::new(),
+            &[],
+            options,
+        )
+        .await
+    }
+
+    /// Lockfile discovery of `root` as the management commands make it.
+    async fn discover_configured(
+        root: &std::path::Path,
+        configured: &[&str],
+    ) -> crate::vex::discover::Discovery {
+        crate::vex::discover_patched_refs_with(
+            root,
+            &crate::vex::DiscoverOptions {
+                patch_server_origins: configured.iter().map(|o| o.to_string()).collect(),
+            },
+        )
+        .await
+    }
+
+    /// Write `done`'s files under `root`, as the disk flow does.
+    fn write_rewrite(root: &std::path::Path, done: &Rewritten) {
+        for (rel, text) in &done.rewrite.files {
+            std::fs::write(root.join(rel), text).unwrap();
+        }
+        for (rel, bytes) in &done.rewrite.binary_files {
+            std::fs::write(root.join(rel), bytes).unwrap();
+        }
+    }
+
+    /// A writing pass hands back the gate's discovery over its overlaid
+    /// writes, and it is the discovery of the written disk; the caller's
+    /// prior discovery is never reused for a pass that writes.
+    #[tokio::test]
+    async fn a_writing_pass_hands_back_the_discovery_of_its_writes() {
+        let tmp = tempfile::tempdir().unwrap();
+        std::fs::write(tmp.path().join("package-lock.json"), LEFT_PAD_LOCK).unwrap();
+        let configured = ["https://patch.test"];
+        let before = discover_configured(tmp.path(), &configured).await;
+        let done = gated_left_pad_rewrite(tmp.path(), &configured, Some(&before)).await;
+        assert!(done.rewrite.files.contains_key("package-lock.json"));
+        assert_eq!(done.confirmed.len(), 1, "{:?}", done.rewrite.warnings);
+        let Some(FinalDiscovery::Overlaid(overlaid)) = &done.final_discovery else {
+            panic!(
+                "expected the overlaid discovery: {:?}",
+                done.final_discovery
+            );
+        };
+        write_rewrite(tmp.path(), &done);
+        let after = discover_configured(tmp.path(), &configured).await;
+        assert_eq!(format!("{overlaid:?}"), format!("{after:?}"));
+        assert_ne!(format!("{before:?}"), format!("{after:?}"));
+        assert_eq!(
+            crate::patch::redirect::upstream::HostedPin::all(overlaid).len(),
+            1
+        );
+    }
+
+    /// A pass that writes nothing (an already-redirected project) reuses
+    /// the caller's discovery and says so.
+    #[tokio::test]
+    async fn an_unwritten_pass_hands_back_the_prior_discovery() {
+        let tmp = tempfile::tempdir().unwrap();
+        std::fs::write(tmp.path().join("package-lock.json"), LEFT_PAD_LOCK).unwrap();
+        let configured = ["https://patch.test"];
+        let first = gated_left_pad_rewrite(tmp.path(), &configured, None).await;
+        write_rewrite(tmp.path(), &first);
+        let prior = discover_configured(tmp.path(), &configured).await;
+        let done = gated_left_pad_rewrite(tmp.path(), &configured, Some(&prior)).await;
+        assert!(
+            done.rewrite.files.is_empty(),
+            "{:?}",
+            done.rewrite.files.keys()
+        );
+        assert_eq!(done.confirmed.len(), 1);
+        assert!(matches!(done.final_discovery, Some(FinalDiscovery::Prior)));
+        // Without a prior discovery, the gate discovers the (unwritten)
+        // project itself and hands that back.
+        let done = gated_left_pad_rewrite(tmp.path(), &configured, None).await;
+        let Some(FinalDiscovery::Overlaid(fresh)) = &done.final_discovery else {
+            panic!("expected a fresh discovery: {:?}", done.final_discovery);
+        };
+        assert_eq!(format!("{fresh:?}"), format!("{prior:?}"));
+    }
+
+    /// A grant on a server the caller did not configure makes the gate count
+    /// another origin: its discovery is not the caller's, so the gate never
+    /// reuses the prior one and hands back none.
+    #[tokio::test]
+    async fn a_foreign_grant_origin_hands_back_no_discovery() {
+        let tmp = tempfile::tempdir().unwrap();
+        std::fs::write(tmp.path().join("package-lock.json"), LEFT_PAD_LOCK).unwrap();
+        let done = gated_left_pad_rewrite(tmp.path(), &[], None).await;
+        assert_eq!(done.confirmed.len(), 1, "{:?}", done.rewrite.warnings);
+        assert!(done.final_discovery.is_none());
+        write_rewrite(tmp.path(), &done);
+        // Unwritten now, with a prior discovery made without the grant's
+        // origin: still not reused.
+        let prior = discover_configured(tmp.path(), &[]).await;
+        let done = gated_left_pad_rewrite(tmp.path(), &[], Some(&prior)).await;
+        assert!(done.rewrite.files.is_empty());
+        assert_eq!(done.confirmed.len(), 1);
+        assert!(done.final_discovery.is_none());
+    }
+
+    /// Nothing confirmed: the gate discovers nothing and hands back none.
+    #[tokio::test]
+    async fn an_unconfirmed_rewrite_hands_back_no_discovery() {
+        let tmp = tempfile::tempdir().unwrap();
+        std::fs::write(
+            tmp.path().join("package-lock.json"),
+            LEFT_PAD_LOCK.replace("left-pad", "right-pad"),
+        )
+        .unwrap();
+        let prior = discover_configured(tmp.path(), &["https://patch.test"]).await;
+        let done = gated_left_pad_rewrite(tmp.path(), &["https://patch.test"], Some(&prior)).await;
+        assert!(done.confirmed.is_empty());
+        assert!(done.final_discovery.is_none());
+    }
+
+    /// Only the install-policy auto-configs' root config files may be
+    /// created under an overlaid discovery.
+    #[test]
+    fn only_root_config_files_are_invisible_overlay_creations() {
+        assert!(overlay_creation_is_invisible(".npmrc"));
+        assert!(overlay_creation_is_invisible("pnpm-workspace.yaml"));
+        for rel in [
+            "package-lock.json",
+            "pylock.toml",
+            "pylock.dev.toml",
+            "packages/a/.npmrc",
+            "common/config/subspaces/a/pnpm-lock.yaml",
+            "settings.gradle",
+            "NuGet.Config",
+        ] {
+            assert!(!overlay_creation_is_invisible(rel), "{rel}");
+        }
     }
 
     /// A lockless NuGet pin (a Socket source mapping, no

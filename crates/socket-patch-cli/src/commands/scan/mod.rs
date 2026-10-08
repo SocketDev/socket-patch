@@ -951,19 +951,24 @@ pub(super) async fn classify_overlap_takeover(common: &GlobalArgs, cwd: &Path) -
     // A malformed vendor ledger classifies like a missing one (this path
     // only feeds takeover warnings; corruption is a hard error on the
     // write/attest paths).
-    let redirect = crate::commands::hosted_state_from_lockfiles(common, cwd).await;
+    let discovery = crate::commands::discover_wiring(common, cwd).await;
+    let redirect = crate::commands::hosted_state_from_pins(
+        &socket_patch_core::patch::redirect::upstream::HostedPin::all(&discovery),
+    );
     let vendor = socket_patch_core::vendor::load_state(cwd).await.ok();
-    classify_overlap_takeover_with(common, cwd, Some(&redirect), vendor.as_ref()).await
+    classify_overlap_takeover_with(cwd, Some(&redirect), vendor.as_ref(), &discovery).await
 }
 
 /// [`classify_overlap_takeover`] over already-loaded state (the hosted
-/// engine classifies against its post-takeover vendor ledger); still reads
-/// the LIVE lockfiles in `cwd`. `None` for either yields no overlap.
+/// engine classifies against its post-takeover vendor ledger) and
+/// `discovery`, the lockfile discovery of `cwd` as it is now
+/// ([`crate::commands::discover_wiring`]). `None` for either state yields
+/// no overlap.
 pub(super) async fn classify_overlap_takeover_with(
-    common: &GlobalArgs,
     cwd: &Path,
     redirect: Option<&socket_patch_core::patch::redirect::RedirectState>,
     vendor: Option<&VendorState>,
+    discovery: &socket_patch_core::vex::discover::Discovery,
 ) -> OverlapTakeover {
     let mut out = OverlapTakeover::default();
     let Some(vendor) = vendor else {
@@ -995,8 +1000,7 @@ pub(super) async fn classify_overlap_takeover_with(
             .entry(canon(key))
             .or_insert(record.uuid.as_str());
     }
-    let discovery = crate::commands::discover_wiring(common, cwd).await;
-    let mut liveness = LedgerLiveness::new(cwd, &discovery, None);
+    let mut liveness = LedgerLiveness::new(cwd, discovery, None);
     for purl in overlap {
         let hosted_live = match redirect_uuid_by_purl.get(&purl) {
             Some(uuid) => liveness.redirect_record(&purl, uuid).await,
