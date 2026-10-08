@@ -866,7 +866,7 @@ async fn collect_requirements_files(root: &Path) -> Result<Vec<ReqFile>, (&'stat
             format!(
                 "{} is not UTF-8 text (for example UTF-16, which Windows PowerShell 5.1 \
                  writes for `pip freeze > requirements.txt`); re-save it as UTF-8 and re-run",
-                path.display()
+                root.join(rel).display()
             ),
         )),
         Err(_) if out.is_empty() => Err((

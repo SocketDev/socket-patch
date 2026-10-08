@@ -2620,6 +2620,9 @@ mod tests {
             npm_outer: &outer,
             yarn_classic_outer: &OuterYarnMirror::default,
             blocking: false,
+            takeover_uuids: Default::default(),
+            patch_server_origins: Vec::new(),
+            prior_discovery: None,
         };
 
         let tmp = tempfile::tempdir().unwrap();
