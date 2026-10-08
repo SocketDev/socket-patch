@@ -2,7 +2,7 @@
 
 ## Part 4: JavaScript lockfiles (npm, pnpm, yarn, bun, vlt)
 
-_Last checked against main @ e2d9633 on 2026-10-08 by audit-ecosystems (4.1 `formats/yarn` contents and the 4.3 yarn rows after #1057). Earlier: `ea09714` on 2026-10-08 by audit-ecosystems (the governing-lock passage after #1044 only). Earlier: `431b818` on 2026-10-07 by the October 7 reconciliation (`formats/yarn` contents, the governing-lock count, the pnpm-legacy row and the yarn grammar copies re-checked; sizes and line references in 4.1–4.4 are still from the snapshot and drift by 200–1,000 lines). Earlier: `9c43dfc` by audit-ecosystems (vendor driver skeleton re-checked at `9c43dfc`; pnpm BOM handling in `formats::pnpm` re-checked at `9c43dfc`; §4.4 vendored pnpm `package.json` writer re-checked at `4646693`; as of `045d7ec`: pnpm, berry gates, package-lock walks, JSON writers, bun-lock presence, CRLF policies, wiring-kind and lines↔JSON helpers and the 4.5 #2 layering re-checked; the rest is as of `2463257`). Owner: `audit-ecosystems`._
+_Last checked against main @ cf8b164 on 2026-10-08 by audit-ecosystems (support-tier sizes for `bun.lockb`, pnpm 5.4/6.0 and vlt eras re-measured for E47). Earlier: `e2d9633` on 2026-10-08 by audit-ecosystems (4.1 `formats/yarn` contents and the 4.3 yarn rows after #1057); older checks are in the run entries. Owner: audit-ecosystems._
 
 > Scope: `vendor/{npm_*,pnpm_*,yarn_*,bun_*,vlt_*,berry_zip}.rs`, `formats/{pnpm,yarn,bun,registry}`, `crawlers/npm_crawler*`, `vendor/lock_inventory/*`, `vex/discover/{npm,yarn,bun,vlt}.rs`, and the JS parts of `patch/redirect/` and `hosted/vlt.rs`. Line counts are production / inline-test, split at the first top-level `#[cfg(test)] mod`.
 
@@ -113,8 +113,10 @@ Five different answers to one question, and every one of them is a bug class (se
 
 ### 4.6 Complexity vs value
 
+Whether to refuse `bun.lockb` writes, vendored pnpm 5.4/6.0 and the vlt pre-1.0 eras is decision #1156. At `cf8b164` the `bun.lockb` writers are about 2.7K production lines (`vendor/bun_lockb.rs` 1,707, `vendor/bun_binary.rs` 736, plus the redirect and restore codecs), with 7 open `bun.lockb` bugs; `vendor/pnpm_lock_legacy.rs` is 1,256. {{E47}}
+
 - **`bun.lockb` (binary).**
-  - The repo itself labels it "(binary, legacy)" (`pkg_managers.rs:139-140`); Bun ≥ 1.2 writes text `bun.lock` by default.
+  - The repo itself labels it "(binary, legacy)" (`pkg_managers.rs:53`); Bun ≥ 1.2 writes text `bun.lock` by default.
   - The codec supports binary format 1 ("before 0.1.7", 2022-era Bun) with promotion and demotion.
   - It recomputes Bun's 187-line meta hash.
   - It writes a private `sktpnrm` marker into an unused union slot of the user's lockfile (`bun_lockb.rs:22-29`).

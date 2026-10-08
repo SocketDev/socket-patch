@@ -2,7 +2,7 @@
 
 ## Part 3: Hosted mode (redirect, hosted engine, upstream restore, Node addon)
 
-_Last checked against main @ e2d9633 on 2026-10-08 by audit-ecosystems (3.2 yarn writers after #1057; 3.5 restore size and `FileEdit` count re-checked for the E45 decision). Earlier: `05ecc6e` on 2026-10-07 by audit-ecosystems (3.2 `RewriteResult` sets, `merge_group_delta` and `confirm()` re-checked for E31; hosted NuGet lock walk and Maven suffix splice re-checked). Earlier: `431b818` by the October 7 reconciliation (3.1 scope note, 3.3 memory takeovers, 3.5 restore size and credentials re-checked). Earlier: `db83f01` by audit-ecosystems (3.2 `redirect/mod.rs` size and layout re-checked at `db83f01`; hosted Maven/Gradle grant handling checked at `9c43dfc`; 3.4 NuGet.config readers as of `4646693`; 3.6 vlt dead helpers as of `045d7ec`; the rest as of `203e092`). Owner: `audit-ecosystems`._
+_Last checked against main @ cf8b164 on 2026-10-08 by audit-ecosystems (hosted Maven suffix splice re-checked for #882; the NuGet writer note after #1068 was closed). Earlier: `e2d9633` on 2026-10-08 by audit-ecosystems (3.2 yarn writers after #1057; 3.5 restore size and `FileEdit` count re-checked for the E45 decision); older checks are in the run entries. Owner: audit-ecosystems._
 
 > Scope: `patch/redirect/**`, `hosted/**`, `crates/socket-patch-node/**`, CLI `scan/hosted.rs`, `scan/hosted/*`, `hosted_bundle.rs`.
 
@@ -207,7 +207,7 @@ For uv, pylock, poetry, pdm, hatch, vlt, maven and bun.lockb, the module's own f
 - {{E15}}: the hosted cargo planner `plan_cargo_toml` is a line scanner, gated by a second `toml_edit` classifier of the same declarations. It refuses `serde = { version = "1", features = [⏎ "derive",⏎] }` as "inline table does not close on its line", although cargo and `toml_edit` accept it, so hosted skips a crate that vendored mode handles. Upstream restore unpins with a third, line-level grammar.
 - {{E58}}: the hosted-vlt ledger helpers `edit_dep_id`, `lock_node_ids`, `carried_pin_original` and `vlt_heal::ledger_targets` have no production caller since #277 deleted `rebase_vlt_edits` and the ledger heal; `UpstreamClient::seed_rubygems_sha256` is a test helper compiled into production.
 - {{E73}} October 7: "is this hosted patch pinned" is decided four ways (`confirm`, `mark_pinned`, `memory_recorded`, discovery); lockless NuGet/Cargo pins are attested in-run then reported contested forever (PR #1058).
-- {{E85}} The NuGet lock writer and its restore drop CRLF and BOM (`serialize_json`), unlike every other hosted JSON writer.
+- {{E85}} The NuGet lock writer and its restore drop CRLF and BOM (`serialize_json`), unlike every other hosted JSON writer. A maintainer closed #1068 as cosmetic on 2026-10-08; the reader's BOM refusal stays open as #623.
 - {{E63}}: hosted Maven splices the API's `maven_suffixed_version` into every matching `pom.xml` `<version>` without checking it (proven with `-socket.DEADBEEF`, `-patched` and markup), while the hosted Gradle planner (#646) refuses the same grant unless it is `<base>-socket.<uuid[..8]>`. The suffix grammar has four builders (vendored `jvm::Coords`, hosted Gradle, the CLI `vex_consumed` copy and the server) and no shared validator.
 
 ---

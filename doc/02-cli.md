@@ -138,7 +138,7 @@ The decision is filed: {{C34}}. It asks for mode as project state now and the ne
 2. **The verb `scan` writes to lockfiles by default.** Most users and most CI templates expect a "scan" to be read-only. The safe preview is opt-in (`--dry-run`).
 3. **Mode is not project state.**
    - `mode` is deliberately rejected in socket.yml.
-   - Bare `scan` is hosted, and the hosted path performs the vendored→hosted takeover for npm, cargo, golang, PyPI and Gradle-built Maven entries (`takeover_capable`, `scan/hosted.rs`); PR #1039 makes it atomic. {{E70}} This is documented ("vendored → hosted conversions both work in place").
+   - Bare `scan` is hosted, and the hosted path performs the vendored→hosted takeover for npm, cargo, golang, PyPI and Gradle-built Maven entries (`takeover_capable`, `scan/hosted.rs`); #1039 made it atomic. {{E70}} This is documented ("vendored → hosted conversions both work in place").
    - So a project vendored for airgapped installs silently becomes hosted the next time someone runs the quick-start command.
    - `rollback` and `list`, by contrast, infer mode from on-disk state.
 4. **Overlapping verbs:**
