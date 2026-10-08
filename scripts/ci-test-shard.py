@@ -1,8 +1,8 @@
 #!/usr/bin/env python3
-"""Run one shard of ci.yml's `test` job: `cargo test --workspace` split over
-`COUNT` runners so the macOS / Windows legs stop being the merge queue's
-critical path (one leg spent ~10 min linking ~240 test binaries and ~15 min
-running them).
+"""Run one shard of ci.yml's `test` or `test-release` job:
+`cargo test --workspace` split over `COUNT` runners. Each runner compiles
+and executes only its assigned integration targets, shortening both the
+debug and release-mode jobs without changing their compilation profiles.
 
 Shard 1 runs the unit tests (`--lib --bins`, ~4 min of the run on Windows)
 and the doctests; the integration-test targets (`cargo metadata`, kind
@@ -15,6 +15,7 @@ Each invocation runs with `--no-fail-fast`; the exit status is non-zero if
 any of them failed.
 
     python3 scripts/ci-test-shard.py 1 2
+    python3 scripts/ci-test-shard.py 1 3 --locked --profile ci-release
 """
 
 import json

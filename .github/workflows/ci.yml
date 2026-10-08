@@ -412,16 +412,19 @@ jobs:
           python3 scripts/ci-test-shard.py "$TEST_SHARD" 2
 
   test-release:
-    # Not in the merge queue: each PR's head already ran this, and so did
-    # every PR ahead of it, so a merge group would re-spend ~30 min (23 of it
-    # compiling) on the same release-mode suite while the queue waits. It
-    # still runs on every PR and on main after each merge; `ci-ok` counts a
-    # skipped job as passing.
+    # Each PR and main push runs the complete release-mode suite. The merge
+    # queue already skips this job because each constituent PR ran it.
     if: github.event.pull_request.draft != true && github.event_name != 'merge_group'
+    strategy:
+      fail-fast: false
+      matrix:
+        shard: [1, 2, 3]
     runs-on: ubuntu-latest
-    # Every tests/ target is its own optimized link (~240 test binaries).
-    # The manifest-less VEX suites share two multi-module binaries
-    # (tests/e2e_vex_lockfile/, tests/e2e_vex_build/) to keep the count down.
+    # Warm-cache runs still spend 20-23 minutes compiling ~240 optimized
+    # test binaries, followed by 5-6 minutes executing them. Split both
+    # compilation and execution with the same partitioner as `test`:
+    # shard 1 owns the unit tests/doctests and fewer integration targets.
+    # `ci-ok` waits for every shard and fails if any shard fails.
     timeout-minutes: 40
     steps:
       - name: Checkout
@@ -449,7 +452,10 @@ jobs:
         # semantics this job exists to validate; ~23m of LTO relinking gone.
         # Default features for the same reason as the `test` job; the
         # feature-gated suites' compile rot is e2e-build's.
-        run: cargo test --workspace --profile ci-release
+        env:
+          TEST_SHARD: ${{ matrix.shard }}
+          TEST_SHARD_COUNT: ${{ strategy.job-total }}
+        run: python3 scripts/ci-test-shard.py "$TEST_SHARD" "$TEST_SHARD_COUNT" --locked --profile ci-release
 
   coverage:
     if: github.event.pull_request.draft != true
