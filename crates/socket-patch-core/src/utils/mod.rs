@@ -1,6 +1,7 @@
 pub mod cargo_workspace;
 pub mod composer_version;
 pub mod concurrent;
+pub mod containment;
 pub(crate) mod digest;
 pub(crate) mod durability;
 pub mod env_compat;

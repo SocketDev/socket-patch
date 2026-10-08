@@ -273,13 +273,17 @@ fn report_lock_failure(
     envelope
 }
 
-/// Decode a base64 string and write it to `blobs_dir/hash`. Returns whether
-/// the blob file was NEWLY created (`false`: a blob with this hash already
-/// existed — content-addressed, so it is the same bytes — and was
-/// overwritten in place), or a formatted error string referencing
-/// `file_path` and `label` on failure.
+/// Decode a base64 string and store it as the blob `blobs_dir/hash`
+/// through the one verified writer,
+/// [`store_verified_blob`](socket_patch_core::api::blob_fetcher::store_verified_blob):
+/// the bytes must hash to `hash`, a linked `.socket/blobs` or
+/// `.socket/blobs/<hash>` is refused, and the entry is staged and renamed
+/// (#726). Returns whether the blob file was NEWLY created (`false`: a
+/// verified blob with this hash already existed and was left untouched),
+/// or a formatted error string referencing `file_path` and `label` on
+/// failure.
 ///
-/// `blobs_dir` is created here, lazily — only once a blob is actually
+/// `blobs_dir` is created there, lazily — only once a blob is actually
 /// about to be persisted — so a run that records nothing (every fetch
 /// failed, every patch skipped, undecodable content) leaves no empty
 /// `.socket/blobs/` behind.
@@ -297,18 +301,9 @@ async fn write_blob_entry(
     }
     let decoded =
         base64_decode(b64).map_err(|e| format!("Failed to decode {label} for {file_path}: {e}"))?;
-    tokio::fs::create_dir_all(blobs_dir)
+    socket_patch_core::api::blob_fetcher::store_verified_blob(blobs_dir, hash, &decoded)
         .await
-        .map_err(|e| format!("Failed to create blobs directory: {e}"))?;
-    let target = blobs_dir.join(hash);
-    // Probed BEFORE the (overwriting) write: a blob that already existed —
-    // a live record's revert data, or a sibling patch's shared after-blob
-    // written earlier this run — is never this call's to remove on unwind.
-    let existed = tokio::fs::try_exists(&target).await.unwrap_or(false);
-    tokio::fs::write(&target, &decoded)
-        .await
-        .map_err(|e| format!("Failed to write {label} for {file_path}: {e}"))?;
-    Ok(!existed)
+        .map_err(|e| format!("Failed to write {label} for {file_path} ({hash}): {e}"))
 }
 
 /// Write every after/before blob for `patch` into `blobs_dir`, reporting
@@ -4001,42 +3996,27 @@ async fn run_get_vendored(
     }
 }
 
-/// Decode a patch view's `blobContent` (canonical, padded base64 as the API
-/// produces it). Hand-rolled; swapping in
-/// `base64::engine::general_purpose::STANDARD.decode(input)` must keep
-/// `DecodeError::InvalidByte(_, b)` mapped to the
-/// `Invalid base64 character: <b>` message below (pinned by a unit test).
+/// Decode a patch view's `blobContent` (canonical base64 as the API
+/// produces it; line breaks and missing padding are tolerated). An invalid
+/// byte keeps the `Invalid base64 character: <b>` message (pinned by a
+/// unit test).
 pub(crate) fn base64_decode(input: &str) -> Result<Vec<u8>, String> {
-    let chars = b"ABCDEFGHIJKLMNOPQRSTUVWXYZabcdefghijklmnopqrstuvwxyz0123456789+/";
-    let mut table = [255u8; 256];
-    for (i, &c) in chars.iter().enumerate() {
-        table[c as usize] = i as u8;
-    }
-
-    let input = input.as_bytes();
-    let mut output = Vec::with_capacity(input.len() * 3 / 4);
-
-    let mut buf = 0u32;
-    let mut bits = 0u32;
-
-    for &b in input {
-        if b == b'=' || b == b'\n' || b == b'\r' {
-            continue;
+    use base64::engine::{general_purpose, DecodePaddingMode, GeneralPurpose};
+    use base64::Engine;
+    const ENGINE: GeneralPurpose = GeneralPurpose::new(
+        &base64::alphabet::STANDARD,
+        general_purpose::PAD.with_decode_padding_mode(DecodePaddingMode::Indifferent),
+    );
+    let compact: String = input
+        .chars()
+        .filter(|c| !matches!(c, '\n' | '\r'))
+        .collect();
+    ENGINE.decode(compact).map_err(|e| match e {
+        base64::DecodeError::InvalidByte(_, b) => {
+            format!("Invalid base64 character: {}", b as char)
         }
-        let val = table[b as usize];
-        if val == 255 {
-            return Err(format!("Invalid base64 character: {}", b as char));
-        }
-        buf = (buf << 6) | val as u32;
-        bits += 6;
-        if bits >= 8 {
-            bits -= 8;
-            output.push((buf >> bits) as u8);
-            buf &= (1 << bits) - 1;
-        }
-    }
-
-    Ok(output)
+        other => format!("Invalid base64: {other}"),
+    })
 }
 
 #[cfg(test)]
@@ -4995,6 +4975,8 @@ mod tests {
 
     // "patched\n" in base64 — a valid payload so only the hash is at fault.
     const BLOB_B64: &str = "cGF0Y2hlZAo=";
+    /// base64 of `"pristine\n"`.
+    const PRISTINE_B64: &str = "cHJpc3RpbmUK";
 
     #[tokio::test]
     async fn write_blob_entry_rejects_relative_traversal_hash() {
@@ -5052,12 +5034,91 @@ mod tests {
         let blobs_dir = tmp.path().join("blobs");
         tokio::fs::create_dir_all(&blobs_dir).await.unwrap();
 
-        let hash = "1111111111111111111111111111111111111111111111111111111111111111";
-        write_blob_entry(&blobs_dir, BLOB_B64, hash, "package/index.js", "blob")
+        let hash = git_sha256(b"patched\n");
+        let created = write_blob_entry(&blobs_dir, BLOB_B64, &hash, "package/index.js", "blob")
             .await
             .expect("a canonical 64-hex hash must be accepted");
-        let written = std::fs::read(blobs_dir.join(hash)).unwrap();
+        assert!(created);
+        let written = std::fs::read(blobs_dir.join(&hash)).unwrap();
         assert_eq!(written, b"patched\n");
+    }
+
+    fn git_sha256(bytes: &[u8]) -> String {
+        socket_patch_core::hash::git_sha256::compute_git_sha256_from_bytes(bytes)
+    }
+
+    /// #726: inline content that does not hash to its name writes nothing,
+    /// and a verified blob already in the store is never replaced.
+    #[tokio::test]
+    async fn write_blob_entry_verifies_content_against_its_hash() {
+        let tmp = tempfile::tempdir().unwrap();
+        let blobs_dir = tmp.path().join("blobs");
+
+        let wrong = "1111111111111111111111111111111111111111111111111111111111111111";
+        let err = write_blob_entry(&blobs_dir, BLOB_B64, wrong, "package/index.js", "blob")
+            .await
+            .unwrap_err();
+        assert!(err.contains("content hash mismatch"), "{err}");
+        assert!(!blobs_dir.join(wrong).exists(), "nothing written");
+
+        let pristine = git_sha256(b"pristine\n");
+        tokio::fs::create_dir_all(&blobs_dir).await.unwrap();
+        tokio::fs::write(blobs_dir.join(&pristine), b"pristine\n")
+            .await
+            .unwrap();
+        write_blob_entry(&blobs_dir, BLOB_B64, &pristine, "package/index.js", "blob")
+            .await
+            .unwrap_err();
+        assert_eq!(
+            std::fs::read(blobs_dir.join(&pristine)).unwrap(),
+            b"pristine\n",
+            "a verified blob is byte-identical afterwards"
+        );
+        let created = write_blob_entry(&blobs_dir, PRISTINE_B64, &pristine, "f", "blob")
+            .await
+            .unwrap();
+        assert!(!created, "an existing verified blob is not re-created");
+    }
+
+    /// B24: a committed `.socket/blobs/<hash>` (or `.socket/blobs`) symlink
+    /// must not redirect the write out of the project.
+    #[cfg(unix)]
+    #[tokio::test]
+    async fn write_blob_entry_refuses_a_linked_blob_or_blobs_dir() {
+        let tmp = tempfile::tempdir().unwrap();
+        let victim = tmp.path().join("victim");
+        std::fs::write(&victim, b"precious").unwrap();
+        let hash = git_sha256(b"patched\n");
+
+        let socket = tmp.path().join("p/.socket");
+        let blobs_dir = socket.join("blobs");
+        std::fs::create_dir_all(&blobs_dir).unwrap();
+        std::os::unix::fs::symlink(&victim, blobs_dir.join(&hash)).unwrap();
+        let err = write_blob_entry(&blobs_dir, BLOB_B64, &hash, "package/index.js", "blob")
+            .await
+            .unwrap_err();
+        assert!(err.contains("is a symlink"), "{err}");
+        assert_eq!(std::fs::read(&victim).unwrap(), b"precious");
+
+        let outside = tmp.path().join("outside");
+        std::fs::create_dir_all(&outside).unwrap();
+        let socket2 = tmp.path().join("q/.socket");
+        std::fs::create_dir_all(&socket2).unwrap();
+        std::os::unix::fs::symlink(&outside, socket2.join("blobs")).unwrap();
+        let err = write_blob_entry(&socket2.join("blobs"), BLOB_B64, &hash, "f", "blob")
+            .await
+            .unwrap_err();
+        assert!(err.contains("is a symlink"), "{err}");
+        assert!(
+            !outside.join(&hash).exists(),
+            "nothing written through the link"
+        );
+    }
+
+    #[test]
+    fn base64_decode_tolerates_line_breaks_and_missing_padding() {
+        assert_eq!(base64_decode("cGF0\nY2hlZAo=").unwrap(), b"patched\n");
+        assert_eq!(base64_decode("cGF0Y2hlZAo").unwrap(), b"patched\n");
     }
 
     // --- short_uuid ------------------------------------------------------
@@ -5267,16 +5328,22 @@ mod tests {
         let tmp = tempfile::tempdir().unwrap();
         let blobs_dir = tmp.path().join(".socket/blobs");
 
-        let after = "a".repeat(64);
+        // A REAL git-sha256 name, so the after-blob verifies and lands
+        // before the before-blob's traversal hash is rejected.
+        let after = git_sha256(b"patched\n");
         let mut files = HashMap::new();
         let mut info = file_resp(Some("../escaped"), Some(&after));
         info.blob_content = Some(BLOB_B64.to_string());
-        info.before_blob_content = Some(BLOB_B64.to_string());
+        info.before_blob_content = Some(PRISTINE_B64.to_string());
         files.insert("package/index.js".to_string(), info);
         let patch = patch_with_files(files);
 
         let res = write_all_patch_blobs(&blobs_dir, &patch, /*quiet=*/ true).await;
         assert_eq!(res, Err(()));
+        assert!(
+            !tmp.path().join(".socket/escaped").exists(),
+            "nothing is written at the traversal target"
+        );
         assert!(
             !blobs_dir.join(&after).exists(),
             "the after-blob written before the failure is unwound"
@@ -5296,7 +5363,7 @@ mod tests {
         let tmp = tempfile::tempdir().unwrap();
         let blobs_dir = tmp.path().join(".socket/blobs");
         tokio::fs::create_dir_all(&blobs_dir).await.unwrap();
-        let after = "a".repeat(64);
+        let after = git_sha256(b"patched\n");
         tokio::fs::write(blobs_dir.join(&after), b"patched\n")
             .await
             .unwrap();
@@ -5304,7 +5371,7 @@ mod tests {
         let mut files = HashMap::new();
         let mut info = file_resp(Some("../escaped"), Some(&after));
         info.blob_content = Some(BLOB_B64.to_string());
-        info.before_blob_content = Some(BLOB_B64.to_string());
+        info.before_blob_content = Some(PRISTINE_B64.to_string());
         files.insert("package/index.js".to_string(), info);
         let patch = patch_with_files(files);
 
@@ -5317,11 +5384,11 @@ mod tests {
         );
 
         // And a fully successful write reports exactly the NEW hashes.
-        let before = "b".repeat(64);
+        let before = git_sha256(b"pristine\n");
         let mut files = HashMap::new();
         let mut info = file_resp(Some(&before), Some(&after));
         info.blob_content = Some(BLOB_B64.to_string());
-        info.before_blob_content = Some(BLOB_B64.to_string());
+        info.before_blob_content = Some(PRISTINE_B64.to_string());
         files.insert("package/index.js".to_string(), info);
         let created = write_all_patch_blobs(&blobs_dir, &patch_with_files(files), true)
             .await

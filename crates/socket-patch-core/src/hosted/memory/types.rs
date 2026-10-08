@@ -171,7 +171,9 @@ impl<'de> Deserialize<'de> for MaxNewPatchesOption {
                 if v == "none" {
                     Ok(MaxNewPatchesOption(None))
                 } else {
-                    Err(E::custom(format!("maxNewPatches must be a number or \"none\", not `{v}`")))
+                    Err(E::custom(format!(
+                        "maxNewPatches must be a number or \"none\", not `{v}`"
+                    )))
                 }
             }
         }

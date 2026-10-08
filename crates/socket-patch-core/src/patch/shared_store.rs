@@ -35,6 +35,20 @@
 //! linked `.store`) resolve inside a `node_modules` tree; the one exception,
 //! Yarn's pnpm-linker store relocated by `pnpmStoreFolder`, is recognized
 //! only for an active Yarn pnpm install and a registry entry's layout.
+//!
+//! Beyond those markers, every written directory must stay inside the
+//! install tree it was found in ([`containment::resolves_within`]): each
+//! directory a patch writes into must resolve inside the package directory,
+//! and a Composer package (`<vendor-dir>/<ns>/<name>`, recognized by
+//! `<vendor-dir>/composer/installed.json`) must resolve inside its vendor
+//! dir. A Composer path repository symlinks `vendor/<ns>/<name>` to the
+//! user's own source by default, and a link out of a package directory
+//! (`flit install --symlink`, a hand-made link) is the same first-party
+//! case; neither is an installed copy a reinstall restores. This is a
+//! containment rule, not a list of stores: a layout nobody has seen yet
+//! is refused rather than written through.
+//!
+//! [`containment::resolves_within`]: crate::utils::containment::resolves_within
 
 use std::path::{Path, PathBuf};
 
@@ -45,6 +59,13 @@ pub const SHARED_STORE_REFUSAL_MARKER: &str = "shared by other projects";
 /// The substring every linked-source refusal carries (see
 /// [`SharedStoreKind::LinkedSource`]).
 pub const LINKED_SOURCE_REFUSAL_MARKER: &str = "outside every node_modules tree";
+
+/// The substring every out-of-install-tree refusal carries (see
+/// [`SharedStoreKind::OutsideInstallTree`]).
+pub const OUTSIDE_INSTALL_TREE_REFUSAL_MARKER: &str = "outside the install tree";
+
+/// The `action` [`SharedStore::refusal`] is given by rollback.
+pub const ROLL_BACK_ACTION: &str = "roll back";
 
 /// A cross-project store a package directory resolves into.
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
@@ -57,6 +78,10 @@ pub enum SharedStoreKind {
     /// `node_modules` tree (a workspace member, a `file:` / `link:`
     /// directory dependency, an `npm link` target).
     LinkedSource,
+    /// A written directory that resolves outside the install tree it was
+    /// found in: a Composer path repository's link into first-party
+    /// source, or a directory linked out of the package.
+    OutsideInstallTree,
 }
 
 /// Where a package directory really lives, when that is a shared store.
@@ -81,6 +106,27 @@ impl SharedStore {
                 "pnpm's global virtual store (enableGlobalVirtualStore)",
                 "set enableGlobalVirtualStore to false and reinstall",
             ),
+            SharedStoreKind::OutsideInstallTree => {
+                // A rollback has nothing to "patch directly": the bytes an
+                // older in-place patch wrote there come back from the
+                // source's own history.
+                let remedy = if action == ROLL_BACK_ACTION {
+                    "Restore that source from version control (for example `git checkout \
+                     -- <file>` in its repository) instead"
+                } else {
+                    "Patch that source directly, or install the package as a copy (for \
+                     Composer, set the path repository's `symlink` option to false)"
+                };
+                return format!(
+                    "Refusing to {action} {path}: it is reached through a link and lies \
+                     {OUTSIDE_INSTALL_TREE_REFUSAL_MARKER} it was installed into (a Composer \
+                     path repository, a `--symlink` install, a package manager linking it \
+                     in from its own prefix, or another linked source directory), so it is \
+                     not an installed copy of the registry package that socket-patch owns. \
+                     {remedy}",
+                    path = self.real_path.display(),
+                );
+            }
             SharedStoreKind::LinkedSource => {
                 return format!(
                     "Refusing to {action} {path}: node_modules links to it, but it is \
@@ -142,8 +188,9 @@ pub async fn shared_store_of_patch_dirs<'a>(
             }
             Some(dir)
         }));
-        dirs.filter(|dir| seen.insert(dir.clone()))
-            .find_map(|dir| shared_store_of_blocking(&dir))
+        dirs.filter(|dir| seen.insert(dir.clone())).find_map(|dir| {
+            shared_store_of_blocking(&dir).or_else(|| outside_install_tree(&pkg_path, &dir))
+        })
     })
     .await
     .ok()
@@ -185,6 +232,38 @@ fn shared_store_of_blocking(pkg_path: &Path) -> Option<SharedStore> {
         }
     }
     linked_source_of(pkg_path, real)
+}
+
+/// [`SharedStoreKind::OutsideInstallTree`]: `dir` (the package directory
+/// itself or a directory a patch writes into below it) does not resolve
+/// inside its install tree: the Composer vendor dir for the package
+/// directory of a Composer install, the package directory for everything
+/// below it.
+fn outside_install_tree(pkg_path: &Path, dir: &Path) -> Option<SharedStore> {
+    let root = if dir == pkg_path {
+        composer_vendor_dir(pkg_path)?
+    } else {
+        pkg_path
+    };
+    if crate::utils::containment::resolves_within(root, dir) {
+        return None;
+    }
+    Some(SharedStore {
+        kind: SharedStoreKind::OutsideInstallTree,
+        real_path: std::fs::canonicalize(dir).ok()?,
+    })
+}
+
+/// The Composer vendor dir `pkg_path` (`<vendor-dir>/<ns>/<name>`) was
+/// installed into, recognized by the `composer/installed.json` Composer
+/// writes there; `None` for any other layout.
+fn composer_vendor_dir(pkg_path: &Path) -> Option<&Path> {
+    let vendor = pkg_path.parent()?.parent()?;
+    vendor
+        .join("composer")
+        .join("installed.json")
+        .is_file()
+        .then_some(vendor)
 }
 
 /// [`SharedStoreKind::LinkedSource`]: `pkg_path` is spelled as a
@@ -747,6 +826,87 @@ mod tests {
         ] {
             assert!(!is_yarn_copy_slug(bad), "{bad}");
         }
+    }
+
+    /// B25: a Composer path repository (`vendor/<ns>/<name>` linked to the
+    /// user's own source) is outside its install tree; a real vendor dir
+    /// is not.
+    #[cfg(unix)]
+    #[tokio::test]
+    async fn composer_path_repository_is_outside_the_install_tree() {
+        let dir = tempfile::tempdir().unwrap();
+        let vendor = dir.path().join("vendor");
+        std::fs::create_dir_all(vendor.join("composer")).unwrap();
+        std::fs::write(vendor.join("composer/installed.json"), "{}").unwrap();
+        std::fs::create_dir_all(vendor.join("acme")).unwrap();
+        let source = dir.path().join("packages/pkg");
+        std::fs::create_dir_all(source.join("src")).unwrap();
+        std::os::unix::fs::symlink(&source, vendor.join("acme/pkg")).unwrap();
+
+        let got = shared_store_of_patch_dirs(&vendor.join("acme/pkg"), ["src/a.php"])
+            .await
+            .expect("refused");
+        assert_eq!(got.kind, SharedStoreKind::OutsideInstallTree);
+        assert_eq!(got.real_path, std::fs::canonicalize(&source).unwrap());
+        assert!(got
+            .refusal("patch")
+            .contains(OUTSIDE_INSTALL_TREE_REFUSAL_MARKER));
+        // A rollback is told to restore the source from its history, not
+        // to "patch that source directly".
+        let rollback = got.refusal(ROLL_BACK_ACTION);
+        assert!(
+            rollback.contains(OUTSIDE_INSTALL_TREE_REFUSAL_MARKER),
+            "{rollback}"
+        );
+        assert!(rollback.contains("version control"), "{rollback}");
+        assert!(!rollback.contains("Patch that source"), "{rollback}");
+
+        let installed = vendor.join("acme/real");
+        std::fs::create_dir_all(installed.join("src")).unwrap();
+        assert_eq!(
+            shared_store_of_patch_dirs(&installed, ["src/a.php"]).await,
+            None
+        );
+        // Without Composer's marker the layout is not recognized as a
+        // vendor dir, and the package dir itself is the install tree.
+        std::fs::remove_file(vendor.join("composer/installed.json")).unwrap();
+        assert_eq!(
+            shared_store_of_patch_dirs(&vendor.join("acme/pkg"), ["src/a.php"]).await,
+            None
+        );
+    }
+
+    /// B25: a directory a patch writes into that is linked out of the
+    /// package root (`flit install --symlink` into site-packages) is
+    /// refused; a link that stays inside it is fine.
+    #[cfg(unix)]
+    #[tokio::test]
+    async fn written_dir_linked_out_of_the_package_is_refused() {
+        let dir = tempfile::tempdir().unwrap();
+        let site = dir.path().join("venv/lib/python3.12/site-packages");
+        std::fs::create_dir_all(&site).unwrap();
+        let source = dir.path().join("src/mypkg");
+        std::fs::create_dir_all(&source).unwrap();
+        std::os::unix::fs::symlink(&source, site.join("mypkg")).unwrap();
+        let got = shared_store_of_patch_dirs(&site, ["mypkg/__init__.py"])
+            .await
+            .expect("refused");
+        assert_eq!(got.kind, SharedStoreKind::OutsideInstallTree);
+
+        std::fs::create_dir_all(site.join("real/inner")).unwrap();
+        std::os::unix::fs::symlink(site.join("real/inner"), site.join("alias")).unwrap();
+        assert_eq!(
+            shared_store_of_patch_dirs(&site, ["real/x.py", "alias/y.py"]).await,
+            None
+        );
+
+        // A linked package root itself (a symlinked site-packages) is the
+        // user's layout, not a link out of the tree.
+        std::os::unix::fs::symlink(&site, dir.path().join("site-link")).unwrap();
+        assert_eq!(
+            shared_store_of_patch_dirs(&dir.path().join("site-link"), ["real/x.py"]).await,
+            None
+        );
     }
 
     #[test]

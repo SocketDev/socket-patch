@@ -2,8 +2,9 @@
 //! a workspace member reads the member's directory only, while the package
 //! manager installs from a lock in an ancestor directory. Hosted mode then
 //! either pins nothing and reports success (pnpm, #590; npm, yarn and Bun
-//! `package.json` workspaces, #884) or rewrites the member as a lockless
-//! project and breaks the workspace (cargo, #417).
+//! `package.json` workspaces, #884; vlt `vlt.json` workspaces, #942) or
+//! rewrites the member as a lockless project and breaks the workspace
+//! (cargo, #417).
 //!
 //! [`refusal`] spots these layouts before any takeover or write, so the run
 //! fails closed and names the directory to run from. It also refuses a
@@ -39,9 +40,9 @@ use super::guidance::{
 /// member) or a configured `lockfile-dir`.
 pub const PNPM_LOCKFILE_ELSEWHERE: &str = "redirect_pnpm_lockfile_elsewhere";
 
-/// Refusal code for an npm, yarn or Bun workspace member: an ancestor
-/// `package.json` lists the project directory in its `workspaces`, and the
-/// workspace's lock lives at that root.
+/// Refusal code for an npm, yarn, Bun or vlt workspace member: an ancestor
+/// `package.json` (or, for vlt, `vlt.json`) lists the project directory in
+/// its `workspaces`, and the workspace's lock lives at that root.
 pub const WORKSPACE_LOCKFILE_ELSEWHERE: &str = "redirect_workspace_lockfile_elsewhere";
 
 /// Refusal code for a pnpm workspace member with its own lock whose
@@ -51,6 +52,7 @@ pub const PNPM_SETTINGS_ELSEWHERE: &str = "redirect_pnpm_settings_elsewhere";
 
 const PNPM_LOCK: &str = "pnpm-lock.yaml";
 const PNPM_WORKSPACE: &str = "pnpm-workspace.yaml";
+const VLT_JSON: &str = "vlt.json";
 
 /// npm-family locks that, present in the project directory, make it its
 /// own lock root: the existing rewriters handle it.
@@ -91,7 +93,10 @@ pub async fn refusal(
         let workspace = if has_own_npm_family_lock(root) {
             None
         } else {
-            package_json_workspace_refusal(root).await
+            nearer_root(
+                package_json_workspace_refusal(root).await,
+                vlt_workspace_refusal(root).await,
+            )
         };
         if let Some(lock) = pnpm_lock_elsewhere(root).await {
             let dir = lock.parent().unwrap_or(&lock);
@@ -299,11 +304,17 @@ async fn package_json_workspace_refusal(root: &Path) -> Option<(PathBuf, Refusal
         if !workspaces_include(&patterns, &rel) {
             continue;
         }
-        let locks: Vec<&str> = WORKSPACE_ROOT_LOCKS
+        let mut locks: Vec<&str> = WORKSPACE_ROOT_LOCKS
             .iter()
             .copied()
             .filter(|name| ancestor.join(name).is_file())
             .collect();
+        // vlt falls back to `package.json` `workspaces` when the root's
+        // `vlt.json` declares none (Bugbot on #1073), so its lock there
+        // governs the member too.
+        if ancestor.join(VLT_LOCK).is_file() && !vlt_json_declares_workspaces(ancestor).await {
+            locks.push(VLT_LOCK);
+        }
         if locks.is_empty() {
             // Rush keeps its locks under common/config: the rewriters own
             // a run from the Rush root.
@@ -333,6 +344,108 @@ async fn package_json_workspace_refusal(root: &Path) -> Option<(PathBuf, Refusal
         return Some((ancestor.to_path_buf(), refusal));
     }
     None
+}
+
+/// #942: the project directory is a member of a vlt workspace, whose
+/// root `vlt.json` lists it under `workspaces` and holds `vlt-lock.json`.
+/// vlt reads workspaces only from `vlt.json` and keeps one lock at that
+/// root, so a hosted run here would find the member's copy, pin nothing
+/// and report success. The nearest ancestor `vlt.json` whose patterns
+/// match is the root; one without a lock (never installed) refuses
+/// nothing.
+async fn vlt_workspace_refusal(root: &Path) -> Option<(PathBuf, Refusal)> {
+    let canonical = tokio::fs::canonicalize(root)
+        .await
+        .unwrap_or_else(|_| root.to_path_buf());
+    for ancestor in canonical.ancestors().skip(1) {
+        let Ok(text) = read_regular_to_string(&ancestor.join(VLT_JSON)).await else {
+            continue;
+        };
+        let Some(patterns) = vlt_workspace_patterns(&text) else {
+            continue;
+        };
+        let Ok(rel) = canonical.strip_prefix(ancestor) else {
+            continue;
+        };
+        let rel: Vec<String> = rel
+            .components()
+            .map(|c| c.as_os_str().to_string_lossy().into_owned())
+            .collect();
+        if !workspaces_include(&patterns, &rel) {
+            continue;
+        }
+        let lock = ancestor.join(VLT_LOCK);
+        if !lock.is_file() {
+            return None;
+        }
+        let refusal = Refusal {
+            code: WORKSPACE_LOCKFILE_ELSEWHERE.to_string(),
+            message: format!(
+                "{} is a workspace member with no lockfile of its own: the workspace \
+                 root {} lists it under \"workspaces\" in {} and installs it from {}, \
+                 which a hosted run here cannot see; run socket-patch from {} (the \
+                 workspace root); nothing was written",
+                root.display(),
+                ancestor.display(),
+                ancestor.join(VLT_JSON).display(),
+                lock.display(),
+                ancestor.display()
+            ),
+        };
+        return Some((ancestor.to_path_buf(), refusal));
+    }
+    None
+}
+
+/// Whether `<dir>/vlt.json` has a `workspaces` field. vlt keys its
+/// precedence on the field: with it, `package.json` `workspaces` is
+/// ignored; without it (or without the file), vlt reads `package.json`.
+/// An unreadable or unparseable file counts as declaring none.
+async fn vlt_json_declares_workspaces(dir: &Path) -> bool {
+    read_regular_to_string(&dir.join(VLT_JSON))
+        .await
+        .ok()
+        .and_then(|text| vlt_workspace_patterns(&text))
+        .is_some()
+}
+
+/// The refusal of the nearer (deeper) of two governing roots.
+fn nearer_root(
+    a: Option<(PathBuf, Refusal)>,
+    b: Option<(PathBuf, Refusal)>,
+) -> Option<(PathBuf, Refusal)> {
+    match (a, b) {
+        (Some(a), Some(b)) => Some(if b.0.starts_with(&a.0) && b.0 != a.0 {
+            b
+        } else {
+            a
+        }),
+        (a, b) => a.or(b),
+    }
+}
+
+/// The `workspaces` patterns of a `vlt.json`: a string, an array, or an
+/// object of named groups whose values are a string or an array. `None`
+/// when the field is absent or the file does not parse.
+fn vlt_workspace_patterns(vlt_json: &str) -> Option<Vec<String>> {
+    fn strings(value: &serde_json::Value, out: &mut Vec<String>) {
+        match value {
+            serde_json::Value::String(s) => out.push(s.clone()),
+            serde_json::Value::Array(list) => {
+                out.extend(list.iter().filter_map(|v| v.as_str()).map(str::to_string))
+            }
+            _ => {}
+        }
+    }
+    let text = vlt_json.strip_prefix('\u{feff}').unwrap_or(vlt_json);
+    let doc: serde_json::Value = serde_json::from_str(text).ok()?;
+    let field = doc.get("workspaces")?;
+    let mut out = Vec::new();
+    match field {
+        serde_json::Value::Object(groups) => groups.values().for_each(|v| strings(v, &mut out)),
+        other => strings(other, &mut out),
+    }
+    Some(out)
 }
 
 /// The `workspaces` patterns of a `package.json`: the array form (npm,
@@ -991,6 +1104,149 @@ mod tests {
             code(&tmp.path().join("apps/web"), "npm").await.as_deref(),
             Some(PNPM_LOCKFILE_ELSEWHERE)
         );
+    }
+
+    /// #942: vlt's `workspaces` in `vlt.json` is a string, an array or an
+    /// object of named groups, each a string or an array.
+    #[test]
+    fn vlt_workspace_patterns_read_every_shape() {
+        assert_eq!(
+            vlt_workspace_patterns(r#"{"workspaces":"packages/*"}"#),
+            Some(vec!["packages/*".to_string()])
+        );
+        assert_eq!(
+            vlt_workspace_patterns("\u{feff}{\"workspaces\":[\"a/*\",\"b\"]}"),
+            Some(vec!["a/*".to_string(), "b".to_string()])
+        );
+        assert_eq!(
+            vlt_workspace_patterns(r#"{"workspaces":{"apps":"apps/*","libs":["libs/*","x"]}}"#),
+            Some(vec![
+                "apps/*".to_string(),
+                "libs/*".to_string(),
+                "x".to_string()
+            ])
+        );
+        assert_eq!(vlt_workspace_patterns(r#"{"registries":{}}"#), None);
+        assert_eq!(vlt_workspace_patterns("not json"), None);
+    }
+
+    /// #942: a vlt workspace member has no lock; the root's `vlt-lock.json`
+    /// governs it. The root, a directory the root does not list and a
+    /// never-installed root refuse nothing.
+    #[tokio::test]
+    async fn vlt_workspace_member_is_refused() {
+        let tmp = tempfile::tempdir().unwrap();
+        write(tmp.path(), "package.json", r#"{"private":true}"#);
+        write(
+            tmp.path(),
+            "vlt.json",
+            r#"{"workspaces":{"apps":"apps/*","libs":["packages/{a,b}"]}}"#,
+        );
+        write(tmp.path(), "packages/a/package.json", "{}");
+        write(tmp.path(), "packages/c/package.json", "{}");
+        write(tmp.path(), "apps/web/package.json", "{}");
+        let member = tmp.path().join("packages/a");
+        // Never installed: no lock anywhere, nothing to refuse.
+        assert_eq!(code(&member, "npm").await, None);
+
+        write(tmp.path(), VLT_LOCK, "{}");
+        let refusal = refusal(&ProjectView::Disk(&member), &[candidate("npm")], true)
+            .await
+            .expect("a vlt workspace member must be refused");
+        assert_eq!(refusal.code, WORKSPACE_LOCKFILE_ELSEWHERE);
+        assert!(
+            refusal.message.contains(VLT_LOCK)
+                && refusal.message.contains("vlt.json")
+                && refusal.message.contains("nothing was written"),
+            "{}",
+            refusal.message
+        );
+        assert_eq!(
+            code(&tmp.path().join("apps/web"), "npm").await.as_deref(),
+            Some(WORKSPACE_LOCKFILE_ELSEWHERE)
+        );
+        assert_eq!(code(&tmp.path().join("packages/c"), "npm").await, None);
+        assert_eq!(code(tmp.path(), "npm").await, None);
+        assert_eq!(code(&member, "pypi").await, None);
+
+        // A member with its own lock is its own root.
+        write(tmp.path(), "packages/a/vlt-lock.json", "{}");
+        assert_eq!(code(&member, "npm").await, None);
+    }
+
+    /// Bugbot on #1073: vlt falls back to `package.json` `workspaces` when
+    /// the root's `vlt.json` has no `workspaces` field, so its
+    /// `vlt-lock.json` there governs the member. With the field present,
+    /// vlt ignores `package.json` `workspaces`, and a `package-lock.json`
+    /// at a `vlt.json` root governs nothing through `vlt.json` (npm reads
+    /// only `package.json`).
+    #[tokio::test]
+    async fn vlt_reads_package_json_workspaces_only_without_vlt_json_ones() {
+        for vlt_json in [None, Some(r#"{"registries":{}}"#)] {
+            let tmp = tempfile::tempdir().unwrap();
+            write(
+                tmp.path(),
+                "package.json",
+                r#"{"private":true,"workspaces":["packages/{a,b}"]}"#,
+            );
+            if let Some(text) = vlt_json {
+                write(tmp.path(), VLT_JSON, text);
+            }
+            write(tmp.path(), VLT_LOCK, "{}");
+            write(tmp.path(), "packages/a/package.json", "{}");
+            let refusal = refusal(
+                &ProjectView::Disk(&tmp.path().join("packages/a")),
+                &[candidate("npm")],
+                true,
+            )
+            .await
+            .unwrap_or_else(|| panic!("{vlt_json:?}: member must be refused"));
+            assert_eq!(refusal.code, WORKSPACE_LOCKFILE_ELSEWHERE);
+            assert!(refusal.message.contains(VLT_LOCK), "{}", refusal.message);
+        }
+
+        // vlt.json's own `workspaces` field wins and does not list the member.
+        let tmp = tempfile::tempdir().unwrap();
+        write(
+            tmp.path(),
+            "package.json",
+            r#"{"private":true,"workspaces":["packages/*"]}"#,
+        );
+        write(tmp.path(), VLT_JSON, r#"{"workspaces":"tools/*"}"#);
+        write(tmp.path(), VLT_LOCK, "{}");
+        write(tmp.path(), "packages/a/package.json", "{}");
+        assert_eq!(code(&tmp.path().join("packages/a"), "npm").await, None);
+
+        let tmp = tempfile::tempdir().unwrap();
+        write(tmp.path(), "package.json", r#"{"private":true}"#);
+        write(tmp.path(), VLT_JSON, r#"{"workspaces":"packages/*"}"#);
+        write(tmp.path(), "package-lock.json", "{}");
+        write(tmp.path(), "packages/a/package.json", "{}");
+        assert_eq!(code(&tmp.path().join("packages/a"), "npm").await, None);
+    }
+
+    /// The nearer of a `vlt.json` root and a `package.json` root governs.
+    #[tokio::test]
+    async fn nearer_of_vlt_and_package_json_roots_is_named() {
+        let tmp = tempfile::tempdir().unwrap();
+        write(
+            tmp.path(),
+            "package.json",
+            r#"{"private":true,"workspaces":["apps/**"]}"#,
+        );
+        write(tmp.path(), "package-lock.json", "{}");
+        write(tmp.path(), "apps/vlt.json", r#"{"workspaces":["web"]}"#);
+        write(tmp.path(), "apps/package.json", "{}");
+        write(tmp.path(), "apps/vlt-lock.json", "{}");
+        write(tmp.path(), "apps/web/package.json", "{}");
+        let refusal = refusal(
+            &ProjectView::Disk(&tmp.path().join("apps/web")),
+            &[candidate("npm")],
+            true,
+        )
+        .await
+        .expect("refused");
+        assert!(refusal.message.contains(VLT_LOCK), "{}", refusal.message);
     }
 
     #[test]

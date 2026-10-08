@@ -201,7 +201,9 @@ fn apply_stderr_warning_gates_on_silent() {
         "non-silent stderr must carry the {CODE} warning; got:\n{stderr}"
     );
     assert_eq!(
-        stderr.matches("Warning: bundler app config BUNDLE_PATH").count(),
+        stderr
+            .matches("Warning: bundler app config BUNDLE_PATH")
+            .count(),
         1,
         "exactly ONE warning line (not one per discovery call); got:\n{stderr}"
     );

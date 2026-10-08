@@ -152,6 +152,16 @@ fn has_corepack_pm(pm: &str) -> bool {
 }
 
 fn corepack(cwd: &Path, pm: &str, args: &[&str]) -> Output {
+    corepack_with_retries(cwd, pm, args, false)
+}
+
+/// [`corepack`], except that an `install` keeps pnpm's own fetch retries
+/// when `registry_retries` is set. Every other install clamps them so the
+/// negative legs fail fast against the dead port or the tampered wiremock
+/// tarball; the fixture install is the one step that reaches
+/// registry.npmjs.org, where a clamp turned a single `read ECONNRESET`
+/// into a failed required leg.
+fn corepack_with_retries(cwd: &Path, pm: &str, args: &[&str], registry_retries: bool) -> Output {
     let mut cmd = pnpm_command(pm);
     let legacy = pm
         .strip_prefix("pnpm@")
@@ -171,7 +181,8 @@ fn corepack(cwd: &Path, pm: &str, args: &[&str]) -> Output {
         })
         .collect();
     cmd.args(&args).current_dir(cwd);
-    if args.first().is_some_and(|arg| arg == "install")
+    if !registry_retries
+        && args.first().is_some_and(|arg| arg == "install")
         && pm
             .strip_prefix("pnpm@")
             .and_then(|v| v.split('.').next())
@@ -504,10 +515,11 @@ async fn redirect_scanned_pnpm_project(
 
     // 1. REAL fixture: pnpm install (network allowed here, private store).
     let store = tmp.path().join("pnpm-store");
-    let install = corepack(
+    let install = corepack_with_retries(
         &proj,
         pm,
         &["install", &format!("--store-dir={}", store.display())],
+        true,
     );
     if !install.status.success() {
         assert!(
