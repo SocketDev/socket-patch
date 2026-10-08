@@ -8,14 +8,10 @@
 //! child processes, hand-written camelCase manifests, git-sha256 oracle,
 //! `--offline` throughout (before-blobs are staged, so nothing fetches).
 
+use crate::common::{binary, git_sha256};
+
 use std::path::{Path, PathBuf};
 use std::process::Command;
-
-use sha2::{Digest, Sha256};
-
-fn binary() -> PathBuf {
-    env!("CARGO_BIN_EXE_socket-patch").into()
-}
 
 /// A `rollback` command with the full `SOCKET_*` environment scrubbed and
 /// the working directory pinned (same rationale as the twin helper in
@@ -45,15 +41,6 @@ fn run(cwd: &Path, args: &[&str]) -> (i32, String, String) {
         String::from_utf8_lossy(&out.stdout).to_string(),
         String::from_utf8_lossy(&out.stderr).to_string(),
     )
-}
-
-/// Git-SHA256: SHA256("blob <len>\0" ++ content).
-fn git_sha256(content: &[u8]) -> String {
-    let header = format!("blob {}\0", content.len());
-    let mut hasher = Sha256::new();
-    hasher.update(header.as_bytes());
-    hasher.update(content);
-    hex::encode(hasher.finalize())
 }
 
 /// One hand-written camelCase manifest entry (single `package/index.js`

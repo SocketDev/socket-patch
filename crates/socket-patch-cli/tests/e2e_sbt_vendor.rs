@@ -14,6 +14,10 @@
 //! drift, `repair`, a forged ledger, an escaping symlink, the subproject
 //! and build-edit refusals.
 
+#[path = "common/mod.rs"]
+mod common;
+use common::git_sha256;
+
 #[path = "common/hermetic.rs"]
 mod hermetic;
 #[path = "prebuilt_common/mod.rs"]
@@ -49,10 +53,6 @@ const JUNIT: Gav<'static> = Gav {
 
 const GSON_TREE: &str = ".socket/vendor/maven2/com/google/code/gson/gson/2.8.9-socket.1d3c1fd2";
 const GSON_JAR: &str = ".socket/vendor/maven2/com/google/code/gson/gson/2.8.9-socket.1d3c1fd2/gson-2.8.9-socket.1d3c1fd2.jar";
-
-fn git_sha256(bytes: &[u8]) -> String {
-    socket_patch_core::hash::git_sha256::compute_git_sha256_from_bytes(bytes)
-}
 
 fn jar(notice: &[u8]) -> Vec<u8> {
     let mut zw = zip::ZipWriter::new(std::io::Cursor::new(Vec::new()));

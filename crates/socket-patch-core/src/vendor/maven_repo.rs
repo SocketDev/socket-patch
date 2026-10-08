@@ -134,7 +134,7 @@ pub async fn vendor_maven(
         return refused("vendor_jvm_shape_unsupported", detail);
     }
     if legacy_root(project_root).await {
-        return refused("vendor_jvm_shape_unsupported", LEGACY_ROOT_DETAIL);
+        return refused("vendor_jvm_shape_unsupported", legacy_root_detail());
     }
     let shape = detect_shape(project_root);
     if shape == super::jvm::Shape::Other {
@@ -317,8 +317,13 @@ pub async fn revert_maven_opts(
 // ── v5 JVM backend ─────────────────────────────────────────────────
 
 /// The `legacy_maven_root` refusal detail (see [`legacy_root`]).
-const LEGACY_ROOT_DETAIL: &str = "reason: legacy_maven_root: pom.xml is still vendored through \
-     the pre-v5 <repository> wiring; run `socket-patch vendor --revert` and vendor again";
+fn legacy_root_detail() -> String {
+    format!(
+        "reason: legacy_maven_root: pom.xml is still vendored through the pre-v5 \
+         <repository> wiring; {}",
+        super::common::REVERT_ALL_AND_REVENDOR
+    )
+}
 
 /// The planner shape of the project root (see [`super::jvm::detect`]).
 fn detect_shape(project_root: &Path) -> super::jvm::Shape {
@@ -580,10 +585,7 @@ pub async fn jvm_gate_preflight(
         return Err(("vendor_jvm_shape_unsupported", detail));
     }
     if legacy_root(project_root).await {
-        return Err((
-            "vendor_jvm_shape_unsupported",
-            LEGACY_ROOT_DETAIL.to_string(),
-        ));
+        return Err(("vendor_jvm_shape_unsupported", legacy_root_detail()));
     }
     let shape = detect_shape(project_root);
     super::jvm::sbt_gate::for_shape(shape, project_root, &g, &a, &v)

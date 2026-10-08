@@ -14,6 +14,8 @@
 //! `--hash=sha256:ab#cd` are data. Exactly one leading BOM is encoding, not
 //! data (pip decodes with utf-8-sig; uv strips it too).
 
+use crate::formats::text::strip_bom;
+
 /// Decode a requirements file the way pip's `auto_decode` does: a UTF-16
 /// or UTF-32 byte-order mark selects that encoding and is dropped; anything
 /// else is UTF-8, its one leading BOM kept for [`logical_lines`] to drop.
@@ -74,7 +76,7 @@ pub(crate) fn logical_lines(content: &str) -> Vec<LogicalLine> {
         // hide that line's comment either.
         let comment = |i: usize| {
             let line = if i == 0 {
-                lines[0].strip_prefix('\u{feff}').unwrap_or(lines[0])
+                strip_bom(lines[0])
             } else {
                 lines[i]
             };
@@ -97,9 +99,7 @@ pub(crate) fn logical_lines(content: &str) -> Vec<LogicalLine> {
         // stays raw, so a rewrite records (and a revert restores) the
         // original bytes.
         if start == 0 {
-            if let Some(stripped) = text.strip_prefix('\u{feff}') {
-                text = stripped.to_string();
-            }
+            text = strip_bom(&text).to_string();
         }
         out.push(LogicalLine {
             start,

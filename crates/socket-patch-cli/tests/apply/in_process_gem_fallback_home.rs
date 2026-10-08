@@ -20,10 +20,10 @@
 
 #![cfg(unix)]
 
+use crate::common::{binary, git_sha256};
+
 use std::path::{Path, PathBuf};
 use std::process::Command;
-
-use sha2::{Digest, Sha256};
 
 const BASE_PURL: &str = "pkg:gem/rack@3.1.0";
 const QUALIFIED_PURL: &str = "pkg:gem/rack@3.1.0?platform=ruby";
@@ -31,18 +31,6 @@ const SKIP_CODE: &str = "gem_fallback_home_skipped";
 
 const ORIGINAL: &[u8] = b"module Rack\n  VERSION = 'VULNERABLE'\nend\n";
 const MARKER: &[u8] = b"# SOCKET-PATCHED-FALLBACK\n";
-
-fn binary() -> PathBuf {
-    env!("CARGO_BIN_EXE_socket-patch").into()
-}
-
-fn git_sha256(content: &[u8]) -> String {
-    let header = format!("blob {}\0", content.len());
-    let mut hasher = Sha256::new();
-    hasher.update(header.as_bytes());
-    hasher.update(content);
-    hex::encode(hasher.finalize())
-}
 
 fn patched_bytes() -> Vec<u8> {
     let mut v = ORIGINAL.to_vec();

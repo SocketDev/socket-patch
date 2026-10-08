@@ -122,6 +122,7 @@ whole root, not a `vendor_jvm_degraded` warning on mixed Maven + Gradle roots.
 | `SOCKET_PATCH_PROXY_URL` | `SOCKET_PROXY_URL` |
 | `SOCKET_PATCH_DEBUG` | `SOCKET_DEBUG` |
 | `SOCKET_PATCH_TELEMETRY_DISABLED` | `SOCKET_TELEMETRY_DISABLED` |
+| `SOCKET_FORCE` | Pass `--force` to the one command that needs it (`apply`, `vendor`, `--update`); the variable is now ignored |
 
 Legacy `.socket/packages/` archives are no longer read. Patch data uses diff
 archives or blobs; cleanup commands remove obsolete package archives.

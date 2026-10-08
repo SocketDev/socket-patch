@@ -711,7 +711,7 @@ fn decode(ctx: &Ctx<'_>, bytes: &[u8]) -> Result<String, PolicyError> {
     if bytes.starts_with(&[0xFE, 0xFF]) || bytes.starts_with(&[0xFF, 0xFE]) {
         return Err(ctx.err("", "file is UTF-16; save it as UTF-8"));
     }
-    let bytes = bytes.strip_prefix(&[0xEF, 0xBB, 0xBF]).unwrap_or(bytes);
+    let bytes = crate::formats::text::strip_bom_bytes(bytes);
     if bytes.contains(&0) {
         return Err(ctx.err("", "file contains NUL bytes; save it as UTF-8 text"));
     }

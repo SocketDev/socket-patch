@@ -163,6 +163,8 @@ pub const CAPTURED_FILES: &[&str] = &[
     super::gradle::SCRIPT_REL,
     super::maven_reactor::GITATTRIBUTES_REL,
     super::gradle::GITATTRIBUTES_REL,
+    super::gradle::SCRIPT_GITATTRIBUTES_REL,
+    super::gradle::VENDOR_GITATTRIBUTES_REL,
     super::coursier_tree::INDEX_REL,
     super::coursier_tree::GITIGNORE_REL,
     super::coursier_tree::GITATTRIBUTES_REL,

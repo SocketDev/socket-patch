@@ -74,13 +74,17 @@
 //! equal `bun --version`, so a CI leg cannot pass by running the wrong bun
 //! or no bun at all.
 
+#[path = "common/mod.rs"]
+mod common;
+use common::{binary, git_sha256};
+
 #[path = "prebuilt_common/mod.rs"]
 mod prebuilt_common;
 
 use std::path::{Path, PathBuf};
 use std::process::{Command, Output, Stdio};
 
-use sha2::{Digest, Sha256, Sha512};
+use sha2::{Digest, Sha512};
 use wiremock::matchers::{method, path, path_regex};
 use wiremock::{Mock, MockServer, ResponseTemplate};
 
@@ -135,10 +139,6 @@ const LOCK_V1_FROM: BunVersion = (1, 2, 0);
 const LOCK_V2_FROM: BunVersion = (1, 4, 0);
 
 // ── self-contained helpers ────────────────────────────────────────────
-
-fn binary() -> PathBuf {
-    PathBuf::from(env!("CARGO_BIN_EXE_socket-patch"))
-}
 
 /// The REQUIRED gate: set AND non-empty. CI's e2e matrix passes
 /// `SOCKET_PATCH_BUN_E2E_REQUIRED: ${{ matrix.bun != '' && '1' || '' }}`,
@@ -293,13 +293,6 @@ fn run_socket(cwd: &Path, args: &[&str]) -> (i32, String, String) {
         String::from_utf8_lossy(&out.stdout).into_owned(),
         String::from_utf8_lossy(&out.stderr).into_owned(),
     )
-}
-
-fn git_sha256(content: &[u8]) -> String {
-    let mut hasher = Sha256::new();
-    hasher.update(format!("blob {}\0", content.len()).as_bytes());
-    hasher.update(content);
-    hex::encode(hasher.finalize())
 }
 
 fn b64(bytes: &[u8]) -> String {

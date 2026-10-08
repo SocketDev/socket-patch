@@ -19,15 +19,13 @@
 //! installed (`CARGO_HOME` points at an empty dir, so the cargo crawl finds
 //! nothing — hermetic, and a lockfile-only cargo entry either way).
 
-use std::path::{Path, PathBuf};
+use crate::common::binary;
+
+use std::path::Path;
 use std::process::Command;
 
 use wiremock::matchers::{method, path};
 use wiremock::{Mock, MockServer, ResponseTemplate};
-
-fn binary() -> PathBuf {
-    env!("CARGO_BIN_EXE_socket-patch").into()
-}
 
 const ORG: &str = "test-org";
 const INSTALLED_PURL: &str = "pkg:npm/installed-dep@1.0.0";

@@ -3,30 +3,15 @@
 //! asserts the JSON envelope's `dryRun: true` field — covering the
 //! dry-run flag-propagation branches each command's `run` has.
 
-use std::path::{Path, PathBuf};
+use crate::common::{binary, git_sha256};
 
-use sha2::{Digest, Sha256};
-
-fn binary() -> PathBuf {
-    env!("CARGO_BIN_EXE_socket-patch").into()
-}
+use std::path::Path;
 
 fn make_socket_with_empty_manifest(root: &std::path::Path) {
     let socket = root.join(".socket");
     std::fs::create_dir_all(&socket).unwrap();
     std::fs::write(socket.join("manifest.json"), r#"{"patches":{}}"#).unwrap();
     std::fs::create_dir_all(socket.join("blobs")).unwrap();
-}
-
-/// Git SHA-256: `SHA256("blob <len>\0" ++ content)`. Computed
-/// independently here so the manifest hashes are NOT derived from the
-/// code under test (no circular oracle).
-fn git_sha256(content: &[u8]) -> String {
-    let header = format!("blob {}\0", content.len());
-    let mut hasher = Sha256::new();
-    hasher.update(header.as_bytes());
-    hasher.update(content);
-    hex::encode(hasher.finalize())
 }
 
 const DRYRUN_PURL: &str = "pkg:npm/dryrunpkg@1.0.0";

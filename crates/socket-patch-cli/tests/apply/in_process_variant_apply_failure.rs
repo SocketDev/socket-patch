@@ -19,18 +19,14 @@
 //! Requires: `python3` with `venv` and `pip` on PATH. Skipped (visibly)
 //! when python3 is missing — same contract as `in_process_pypi_apply`.
 
+use crate::common::{binary, git_sha256};
+
 use std::path::{Path, PathBuf};
 use std::process::Command;
-
-use sha2::{Digest, Sha256};
 
 const PYPI_PACKAGE: &str = "six";
 const PYPI_VERSION: &str = "1.16.0";
 const UUID: &str = "12121212-1212-4121-8121-121212121212";
-
-fn binary() -> PathBuf {
-    env!("CARGO_BIN_EXE_socket-patch").into()
-}
 
 /// Spawn the CLI with the ambient environment scrubbed, so the flags each
 /// test passes are the only thing deciding behaviour.
@@ -70,14 +66,6 @@ fn run_apply_scrubbed(args: &[&str]) -> std::process::Output {
         }
     }
     cmd.output().expect("run socket-patch apply")
-}
-
-fn git_sha256(content: &[u8]) -> String {
-    let header = format!("blob {}\0", content.len());
-    let mut hasher = Sha256::new();
-    hasher.update(header.as_bytes());
-    hasher.update(content);
-    hex::encode(hasher.finalize())
 }
 
 fn find_python() -> Option<&'static str> {

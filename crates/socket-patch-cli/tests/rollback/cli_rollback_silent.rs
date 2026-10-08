@@ -19,14 +19,10 @@
 //! command (offline runs suppress it) and is out of scope for `rollback`'s
 //! `--silent` gating.
 
-use std::path::{Path, PathBuf};
+use crate::common::{binary, git_sha256};
+
+use std::path::Path;
 use std::process::Command;
-
-use sha2::{Digest, Sha256};
-
-fn binary() -> PathBuf {
-    env!("CARGO_BIN_EXE_socket-patch").into()
-}
 
 /// Run `socket-patch rollback` in `cwd` with the entire `SOCKET_*` ambient
 /// environment scrubbed (prefix scrub — ambient tokens, silent toggles, or
@@ -64,15 +60,6 @@ fn stderr_chatter(stderr: &str) -> Vec<String> {
         })
         .map(|l| l.to_string())
         .collect()
-}
-
-/// Git-SHA256: SHA256("blob <len>\0" ++ content).
-fn git_sha256(content: &[u8]) -> String {
-    let header = format!("blob {}\0", content.len());
-    let mut hasher = Sha256::new();
-    hasher.update(header.as_bytes());
-    hasher.update(content);
-    hex::encode(hasher.finalize())
 }
 
 /// Manifest with one npm patch whose before-blob is NOT staged — plus the

@@ -19,6 +19,8 @@
 //! | d | the generated file edited | `sbt_owned_file_modified` |
 //! | e | no ledger | nothing attested; the tree check still runs |
 
+use crate::common::git_sha256;
+
 use std::path::{Path, PathBuf};
 use std::time::{Duration, SystemTime};
 
@@ -58,10 +60,6 @@ fn jar(notice: &[u8]) -> Vec<u8> {
         zw.write_all(bytes).unwrap();
     }
     zw.finish().unwrap().into_inner()
-}
-
-fn git_sha256(bytes: &[u8]) -> String {
-    socket_patch_core::hash::git_sha256::compute_git_sha256_from_bytes(bytes)
 }
 
 /// `root/proj`: the sbt 1.13.0 probe build (gson 2.8.9 resolved in `b`),

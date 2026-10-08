@@ -489,12 +489,7 @@ async fn cargo_prelude(
     // readable, parseable regular file — and not a symlink, which the
     // atomic rewrite would replace with a detached copy (leaving the
     // link's target unwired and the revert unable to restore the link).
-    if let Err((code, detail)) = refuse_symlinked(
-        project_root,
-        &[cargo_manifest::CARGO_TOML],
-        "cargo_manifest_symlink_unsupported",
-    )
-    .await
+    if let Err((code, detail)) = refuse_symlinked(project_root, &[cargo_manifest::CARGO_TOML]).await
     {
         return Err(refused(code, detail));
     }
@@ -1920,12 +1915,12 @@ pub async fn revert_cargo_vendor_opts(
                 kept_artifact: false,
                 success: false,
                 warnings: out.warnings,
-                error: Some(
-                    "cargo_manifest_symlink_unsupported: Cargo.toml is a symbolic link; \
-                     remove the vendored `[patch.crates-io]` entry from the link's target \
-                     by hand (nothing was reverted)"
-                        .to_string(),
-                ),
+                error: Some(format!(
+                    "{}: Cargo.toml is a symbolic link; remove the vendored \
+                         `[patch.crates-io]` entry from the link's target by hand (nothing \
+                         was reverted)",
+                    crate::hosted::engine::SYMLINK_REFUSAL
+                )),
             };
         }
         Ok(_) => {}
@@ -2015,12 +2010,16 @@ pub async fn revert_cargo_vendor_opts(
     // (and the caller keeps the ledger entry), so only the deletion is
     // skipped.
     if !dry_run && !keep_artifact {
+        // Best-effort (NotFound is fine): the shared per-unit revert removal
+        // also prunes the now-empty `.socket/vendor/cargo/` and
+        // `.socket/vendor/` levels, and waits for the commit of a staged
+        // hosted takeover.
         let uuid_dir = project_root.join(&base_rel);
-        let _ = remove_tree(&uuid_dir).await; // ignore NotFound
-                                              // Best-effort: prune the now-empty `.socket/vendor/cargo/` and
-                                              // `.socket/vendor/` levels so a fully-reverted project carries no
-                                              // vendor residue. `remove_dir` fails on non-empty.
-        prune_empty_vendor_levels(&uuid_dir).await;
+        let _ = crate::utils::socket_dir::remove_tree_and_prune(
+            &uuid_dir,
+            &project_root.join(crate::constants::SOCKET_DIR),
+        )
+        .await;
     }
 
     out
@@ -4590,7 +4589,7 @@ mod tests {
         std::os::unix::fs::symlink("real.toml", root.join("Cargo.toml")).unwrap();
         expect_refused(
             run_vendor(PURL, root, &blobs, &pristine, &record, false).await,
-            "cargo_manifest_symlink_unsupported",
+            crate::hosted::engine::SYMLINK_REFUSAL,
         );
         assert!(!root.join(".socket/vendor").exists());
     }
@@ -5876,7 +5875,7 @@ mod tests {
         assert!(
             out.error
                 .as_deref()
-                .is_some_and(|e| e.contains("cargo_manifest_symlink_unsupported")),
+                .is_some_and(|e| e.contains(crate::hosted::engine::SYMLINK_REFUSAL)),
             "{:?}",
             out.error
         );

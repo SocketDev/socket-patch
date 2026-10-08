@@ -33,6 +33,10 @@
 //! rollback dispatch branch yields zero discovered packages → the
 //! assertions fail loudly.
 
+#[path = "common/mod.rs"]
+mod common;
+use common::binary;
+
 use std::path::{Path, PathBuf};
 
 use serde_json::Value;
@@ -43,10 +47,6 @@ mod hermetic;
 
 const ORIGINAL: &[u8] = b"original\n";
 const PATCHED: &[u8] = b"patched\n";
-
-fn binary() -> PathBuf {
-    env!("CARGO_BIN_EXE_socket-patch").into()
-}
 
 /// Compute the git-style blob SHA-256 (`sha256("blob <len>\0" + bytes)`)
 /// the same way the production hashing code does.
