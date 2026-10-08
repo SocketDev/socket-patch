@@ -1,7 +1,8 @@
 ### Refactor routine (`refactor`, hourly, highest leverage first)
-_Last updated 2026-10-08T18:40Z · main @ c4235a2_
+_Last updated 2026-10-08T19:40Z · main @ a845bf9_
 
 **In flight:**
+- [#1160](https://github.com/SocketDev/socket-patch/pull/1160): inline BOM handling in 8 more production files (Gradle/Ivy crawlers, yarnrc gate, hosted/upstream Gradle settings editors, vendored JSON helpers, npm dir spans, Hatch permission) onto `formats::text`; `PENDING_INLINE_BOMS` 26 → 15 (`formats/yarn/mod.rs` was already clean; sbt owned-file and the output sanitizer move to `OWN_BOM_RULE`). Issue #905 (E64, slice 2). Only change: two leading BOMs (second is content; Hatch revert keeps one). `state: ready`.
 - [#1153](https://github.com/SocketDev/socket-patch/pull/1153): one `path_safety::is_safe_name_version` for the cargo, gem and NuGet crawlers (and NuGet's oracle) and the cargo/gem/nuget and PyPI purl builders; deletes `is_safe_{cargo,gem,nuget}_coordinate` and their three test copies. Tracker #748 (E37, the #630 item; composer `normalize_version` half waits on #1108). +97 / −141 (production ≈ +12 / −45). `state: ready`.
 - [#1151](https://github.com/SocketDev/socket-patch/pull/1151): uv/PEP 751 and poetry lock inventory pick pure wheels through the shared `is_portable_wheel_url` (#1048) rule, and inventory and ledger recovery share one `portable_wheel_artifact` pick; deletes both `-none-any.whl` suffix checks and recovery's copy. Issue #1150 (E89, the rest of #1079). +30 / −32 production, +101 tests. Only change: `cp*`/`pp*`/`py2-none-any` wheels are no longer pinned by inventory. `state: ready`.
 - [#1145](https://github.com/SocketDev/socket-patch/pull/1145): Gradle's `verification-metadata.xml` and parent-pom reads go through a new `formats::xml` (the pom scanner moved out of `formats::maven`); deletes `gradle.rs`'s `mask_xml_comments`/`xml_elements`/`xml_attr`. Issue #715 (E10, item 6, Gradle half). +282 / −308 production (~120 moved), +123 tests. Only change: CDATA markup is text, malformed verification files refuse. `state: ready`.
@@ -22,15 +23,15 @@ _Last updated 2026-10-08T18:40Z · main @ c4235a2_
 | # | Candidate | B | U | D | R | Score | Note |
 |---|---|:-:|:-:|:-:|:-:|:-:|---|
 | 1 | #989 item (was #990): one `vendor::revert::finish` for the 12 copied finish blocks | 0 | 1 | ≈12 | L | ≈26 | skipped: all 12 backend files changed by open PRs (#1008, #1041, …) |
-| 2 | #594 / #717 (E10): nuget.config and pom.xml edits through the `formats::nuget` / `formats::maven` tokenizers | 3 | 1 | ≈6 | M | ≈21 | skipped: `redirect/mod.rs`, `vendor/nuget_feed.rs` (#1041) |
-| 3 | #1014 (E69): one Scala-tool build classifier for six marker lists | 1 | 0 | ≈5 | M | ≈11 | skipped: `vendor/jvm/sbt.rs` (#1036), `hosted/engine.rs` (#1007–#1009); E69 also in PR #1032 |
-| 4 | #748 item #630 (E37): crawler coordinate guards → `path_safety::is_safe_name_version` | 0 | 0 | 3 | L | ≈6 | **taken: #1153** |
-| 5 | #748 item #630 rest: composer `normalize_version` → `composer_version::strip_leading_v` | 0 | 0 | 1 | L | ≈2 | skipped: `upstream/composer.rs` (#1108) |
+| 2 | #905 (E64) slice 2: inline BOM rules in the 11 free pending files | 0 | 0 | ≈11 | L | ≈22 | **taken: #1160** |
+| 3 | #594 / #717 (E10): nuget.config and pom.xml edits through the `formats::nuget` / `formats::maven` tokenizers | 3 | 1 | ≈6 | M | ≈21 | skipped: `redirect/mod.rs`, `vendor/nuget_feed.rs` (#1041) |
+| 4 | #1014 (E69): one Scala-tool build classifier for six marker lists | 1 | 0 | ≈5 | M | ≈11 | skipped: `vendor/jvm/sbt.rs` (#1036), `hosted/engine.rs` (#1007–#1009) |
+| 5 | #705 (C18): one `utils::uuid` grammar | 0 | 0 | 3 | L | ≈6 | skipped: `api/client.rs`, CLI `lib.rs`, `path_safety.rs` (open PRs incl. #1034, #1153) |
 
-Re-ranked 2026-10-08T18:05Z at `c4235a2` against 32 open PRs (394 files in `arch-refactor/*` or `agent/fix-*`). C69/#836 (`redirect/mod.rs`), #1129 (`npm_crawler.rs`), C50/#893 (`cleanup_blobs.rs`, #1049), C77/#1144 (`commands/vex.rs`), C51/#914 (`jvm_jar.rs`), E41/E28/#782 rest (`lock_inventory`, #1141 open on #782), #705, #913, #675, #780, #936, #1128 and every `commands/*` manifest reader remain blocked by open-PR files. #706's digest slice stays deferred.
+Re-ranked 2026-10-08T18:57Z at `a845bf9` against 29 open PRs (400 files in `arch-refactor/*` or `agent/fix-*`). #748 composer `normalize_version` still waits on #1108; #913, #675, #914, #1128, #780, #1144 stay blocked by open-PR files. C69/#836 (`redirect/mod.rs`), #1129 (`npm_crawler.rs`), C50/#893 (`cleanup_blobs.rs`, #1049), C77/#1144 (`commands/vex.rs`), C51/#914 (`jvm_jar.rs`), E41/E28/#782 rest (`lock_inventory`, #1141 open on #782), #705, #913, #675, #780, #936, #1128 and every `commands/*` manifest reader remain blocked by open-PR files. #706's digest slice stays deferred.
 
 **Notes:**
-- `mode_migration_pypi::pipenv_hosted_to_vendored_names_the_unpatched_requirements` needs a GET to pypi.org and fails in the sandbox on `main` too.
+- `mode_migration_pypi::pipenv_hosted_to_vendored_*` needs pypi.org; fails in the sandbox on `main` too.
 - A closed issue whose register row is only `partly fixed` needs a new follow-up issue for the remainder (#1150 after #1079); don't reopen the closed one.
 - `formats::xml` (#1145) is the shared XML element scanner (comment + CDATA blanking, `elements`, `children`, `attr`); route new XML readers (NuGet, pom writers) through it instead of a private masker.
 - The skip rule names only `arch-refactor/*` and `agent/fix-*` PRs; `arch-fix/*`, `ci*` and `ci-janitor/*` files are not blockers by the letter, but check their hunks before touching the same lines.
@@ -38,7 +39,7 @@ Re-ranked 2026-10-08T18:05Z at `c4235a2` against 32 open PRs (394 files in `arch
 - E35's crawler oracles can't become `golden.rs` digests: their randomized trees (symlinks, modes, case collisions) differ by OS and uid. Keep them until a crawler can be checked without one.
 - Test-helper migrations (#824): directory binaries import via `crate::common`; prune the unused imports `--no-run --message-format=short` lists. `spawn_env_hygiene` scans test text, string literals included: never spell a bare binary spawn in a new test file, and run that suite before pushing.
 - Source-scan guards: one-sided (fail on new files only) and normalize `\r\n` (Windows CI checks out CRLF).
-- `toml_edit` parse: ~81 µs per crates.io `Cargo.toml` vs 0.5 µs for a line scanner; disclose it when a hot crawl path moves to it.
+- `toml_edit` parse: ~81 µs per `Cargo.toml` vs 0.5 µs for a line scanner; disclose it on hot crawl paths. It skips one leading BOM itself.
 - Equivalence goldens (`tests/equivalence/*.golden`, bless with `SOCKET_PATCH_BLESS_GOLDEN=1`) include mixed-ending inputs: prove only mixed cases move before re-blessing a line-ending change.
 - Upstream gem `restore_manifest` pins CRLF output for a CRLF Gemfile with an LF block; migrate it only together with the forward Gemfile writer in `redirect/mod.rs`.
 - Overlap check: fetch `/pulls/<n>/files` for every open PR, match exact paths; `comm -23` of `git ls-files` against that set lists the free files.
@@ -47,9 +48,9 @@ Re-ranked 2026-10-08T18:05Z at `c4235a2` against 32 open PRs (394 files in `arch
 - `redirect/pipenv.rs`, `vendor/pypi.rs` and `vendor/lock_inventory/vlt.rs` aren't rustfmt-clean on main: format only your own hunks there. Check `rustfmt --check` on the `main` copy before formatting a whole file.
 - `lock_inventory/mod.rs` `architecture_tests` forbid `hosted_patch_uuid*` in a format file's model section. Origin-policy helpers go after the `// ── registry view ──` marker.
 - 2026-10-08: ~40 refactor issues were closed `not_planned` into trackers ("Consolidated work"); that is scheduling, not rejection. Claim/`Fixes` the item's issue only if still open, else reference the tracker.
-- Ledger and branch pushes need verified signatures (org ruleset). Commit with the session's default git identity; overriding `user.email` (e.g. to a bot address) makes GitHub reject the signature.
+- Pushes need verified signatures: commit with the session's default git identity, never an overridden `user.email`.
 - Maintainer steering (2026-10-02, on #569 and #571): don't add size caps on trusted upstream data; stream instead of buffering.
 - `cargo clippy --all-targets` already fails on `main` (old test lints); CI gates `cargo clippy --workspace --all-features -- -D warnings`.
-- `cargo test -p socket-patch-cli --test repair` has 2 root-only failures (`repair_exits_zero_and_stays_quiet_when_lock_file_unremovable`, `repair_cleanup_failure_is_reported_in_json_and_silent_modes`). They chmod a directory read-only.
-- CLI test targets: 145+ files spawn `socket-patch` with a bare `Command::new(binary())`; `tests/spawn_env_hygiene.rs` keeps `PENDING_RAW_SPAWNS` / `PENDING_SCRUB_COPIES` allowlists that fail on new **and** stale entries — drop a file from the list when you migrate it.
+- `--test repair` has 2 root-only failures (they chmod a directory read-only).
+- `tests/spawn_env_hygiene.rs` allowlists (`PENDING_RAW_SPAWNS` / `PENDING_SCRUB_COPIES`) fail on new **and** stale entries: drop a file when you migrate it.
 - Probe spawns go through `utils::process::output_within` since #886 (blocking; async callers wrap it in `utils::fs::run_blocking`). It nulls stderr; don't add a new `tokio::time::timeout` + `kill_on_drop` site.
