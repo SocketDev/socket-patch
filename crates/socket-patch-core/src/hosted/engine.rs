@@ -850,6 +850,16 @@ async fn keep_bundler_loaded_gem_files(
             ),
         })
     };
+    // A spelling bundler sees (`File.file?`) even when this run couldn't
+    // read it: a symlink, an unreadable or a non-UTF-8 file still makes the
+    // project a twin, as lock inventory already counts it.
+    let present = |rel: &str| {
+        out.files.contains_key(rel)
+            || out.symlinked_reads.iter().any(|r| r == rel)
+            || out.unreadable_reads.iter().any(|r| r == rel)
+            || out.undecodable_reads.iter().any(|r| r == rel)
+    };
+    let is_twin = present("gems.rb") && present("Gemfile");
     let mut twin_ambiguous = None;
     let keep: &[&str] = match (&loaded, &refusal) {
         (_, Some(_))
@@ -859,9 +869,7 @@ async fn keep_bundler_loaded_gem_files(
         // Default discovery of a twin: bundler 1.x loads the `Gemfile`
         // and >= 2 loads `gems.rb`, and nothing here says which runs, so
         // neither pair is wired (#751).
-        (LoadedManifest::Default, None)
-            if out.files.contains_key("gems.rb") && out.files.contains_key("Gemfile") =>
-        {
+        (LoadedManifest::Default, None) if is_twin => {
             twin_ambiguous = Some(manifest::twin_manifest_refusal());
             &[]
         }
@@ -3351,6 +3359,45 @@ mod tests {
             assert!(
                 codes.contains(&"redirect_gem_twin_manifest_ambiguous"),
                 "{codes:?}"
+            );
+        }
+    }
+
+    /// A twin whose other spelling this run can't read (a symlink, an
+    /// unreadable or a non-UTF-8 file) is still a twin: bundler's
+    /// `File.file?` sees it, so neither pair is wired (Bugbot on #768).
+    #[tokio::test]
+    async fn twin_with_an_unreadable_spelling_redirects_nothing() {
+        for (other, entry) in [
+            ("gems.rb", MemoryEntry::Symlink),
+            ("Gemfile", MemoryEntry::Symlink),
+            (
+                "gems.rb",
+                MemoryEntry::Binary(vec![0xff, 0xfe, 0x00].into()),
+            ),
+        ] {
+            let mut p = MemoryProject::new();
+            for (rel, text) in [
+                ("Gemfile", GEMFILE),
+                ("Gemfile.lock", GEM_LOCK),
+                ("gems.rb", GEMFILE),
+                ("gems.locked", GEM_LOCK),
+            ] {
+                if rel != other {
+                    p.insert_text(rel, text);
+                }
+            }
+            p.insert(other, entry);
+            let (_read, done) = gem_rewrite(&p).await;
+            assert!(
+                done.rewrite.files.is_empty(),
+                "{other}: {:?}",
+                done.rewrite.files.keys()
+            );
+            let codes = warning_codes(&done);
+            assert!(
+                codes.contains(&"redirect_gem_twin_manifest_ambiguous"),
+                "{other}: {codes:?}"
             );
         }
     }
