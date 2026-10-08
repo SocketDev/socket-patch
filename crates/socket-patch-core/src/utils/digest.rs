@@ -194,9 +194,31 @@ mod tests {
             }
         }
         inline.sort();
-        assert_eq!(
-            inline, PENDING_INLINE_DIGESTS,
-            "production files computing digests inline differ from the pending list"
-        );
+        let new: Vec<&String> = inline
+            .iter()
+            .filter(|f| !PENDING_INLINE_DIGESTS.contains(&f.as_str()))
+            .collect();
+        let stale: Vec<&&str> = PENDING_INLINE_DIGESTS
+            .iter()
+            .filter(|f| !inline.iter().any(|g| g == *f))
+            .collect();
+        let mut problems = Vec::new();
+        if !new.is_empty() {
+            problems.push(format!(
+                "these files compute a digest inline: {new:?}. Call the `*_of` \
+                 helpers in crates/socket-patch-core/src/utils/digest.rs instead \
+                 (sha256_hex_of, sha1_hex_of, sha512_base64_of, sha512_sri_of). \
+                 Do not add them to PENDING_INLINE_DIGESTS."
+            ));
+        }
+        if !stale.is_empty() {
+            problems.push(format!(
+                "these files no longer compute a digest inline: {stale:?}. Delete \
+                 them from PENDING_INLINE_DIGESTS in \
+                 crates/socket-patch-core/src/utils/digest.rs (another PR may \
+                 have moved them onto the helpers; rebase and drop the entries)."
+            ));
+        }
+        assert!(problems.is_empty(), "{}", problems.join("\n"));
     }
 }

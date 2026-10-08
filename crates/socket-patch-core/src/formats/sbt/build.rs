@@ -290,18 +290,11 @@ fn normalize_dir(raw: &str) -> Option<String> {
     if raw.starts_with('/') || raw.contains('\\') || raw.contains(':') {
         return None;
     }
-    let segments: Vec<&str> = raw
-        .split('/')
-        .filter(|s| !s.is_empty() && *s != ".")
-        .collect();
-    if segments.contains(&"..") {
+    if raw.split('/').any(|s| s == "..") {
         return None;
     }
-    Some(if segments.is_empty() {
-        ".".to_string()
-    } else {
-        segments.join("/")
-    })
+    let dir = crate::utils::relpath::resolve_rel("", raw, 0)?;
+    Some(if dir.is_empty() { ".".to_string() } else { dir })
 }
 
 /// The projects the build defines, id → root-relative base directory (`.`

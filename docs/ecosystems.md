@@ -89,8 +89,13 @@ The backticked slug in each row is the value `-e`/`--ecosystems` accepts (e.g.
   the patched files. See the [compatibility matrix and workflow](testing/pnpm-compatibility.md).
 - **yarn classic** — the `yarn.lock` entry's `resolved` / `integrity` are
   rewritten to the hosted tarball. A project that sets `yarn-offline-mirror`
-  (in `.yarnrc` or `.npmrc`) is refused with
-  `redirect_yarn_classic_offline_mirror`. Yarn looks mirror tarballs up by
+  is refused with `redirect_yarn_classic_offline_mirror`. The mirror is
+  resolved the way yarn 1 resolves it: the project's `.yarnrc` / `.npmrc`,
+  the user's (`~/.yarnrc`, which `yarn config set` writes, and `~/.npmrc`),
+  `<prefix>/etc/yarnrc` / `npmrc`, every ancestor directory's, and the
+  `YARN_*` / `npm_config_*` environment variables. A file saved with a UTF-8
+  BOM counts too, and `false` in a higher-precedence layer turns the mirror
+  off. Yarn looks mirror tarballs up by
   file name, and the hosted tarball has the same name as the upstream one
   already in the mirror, so installs would get the unpatched bytes and fail
   the integrity check. Use `--mode vendored` there; it works with a mirror.
@@ -452,7 +457,13 @@ Honest limits of the Maven and NuGet flows — documented behavior, not bugs:
   (`redirect_maven_dep_unpinned`) — a literal edit would break the property reference and
   a depMgmt pin could strand sibling artifacts sharing the property. A literal version
   that matches neither the base nor the suffixed value is skipped
-  (`redirect_maven_dep_version_mismatch`).
+  (`redirect_maven_dep_version_mismatch`). A `<base>-socket.<hex8>` literal left by an
+  earlier hosted patch for the same release (the pom declares that patch's
+  `socket-patch-<uuid>` repository) is re-pinned to the new suffix: the superseded
+  `socket-patch-<uuid>` repository and its Trusted Checksums entries are removed, and a
+  repository whose grant URL changed (a rotated token) is refreshed in place. A suffixed
+  literal no hosted repository in the pom minted (a vendored `socket-patch-vendor-<uuid>`
+  pin, say) is still a mismatch and is skipped.
 * **Trusted Checksums reinforcement (hosted Maven, 3.9.4+).** When the patch server
   supplies both the jar and pom sha256, the rewriter also emits Maven
   [Trusted Checksums](https://maven.apache.org/resolver/expected-checksums.html) files —
@@ -987,6 +998,9 @@ replacement. Go uses committed `go.sum` entries without consulting the checksum
 database for those entries, so a fresh checkout needs no per-machine checksum
 exemption. A mismatched checksum still fails the build. The rewriter removes the
 replaced version's original sum lines to keep the result stable under `go mod tidy`.
+A re-pin to a newer patch (a superseding patch uuid, or the same patch republished
+at a new `-socketpatch.<n>` version) also removes the previous Socket module's sum
+lines, so `go mod tidy -diff` stays clean after a patch update.
 
 This requires a free, publicly retrievable patch reference carrying a `goproxy`
 override. CLI support does not imply a patch is published for a particular module.
