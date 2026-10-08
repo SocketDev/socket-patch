@@ -56,6 +56,12 @@ class BunTransportRetryTests(unittest.TestCase):
             self.assertEqual((evidence / 'cli.log').read_text(), 'failed request evidence')
             self.assertFalse((evidence / 'cache').exists())
 
+    def test_a_harness_fetch_reset_is_a_transport_failure(self):
+        self.assertTrue(bun.has_transport_failure(
+            {'error': '<urlopen error [Errno 104] Connection reset by peer>'}))
+        self.assertTrue(bun.has_transport_failure({'error': '[Errno 54] Connection reset by peer'}))
+        self.assertFalse(bun.has_transport_failure({'error': 'KeyError: bun.lock'}))
+
     def test_a_patch_api_5xx_is_a_transport_failure(self):
         self.assertTrue(bun.has_transport_failure({'repeat': {'error': (
             'failed to resolve patch references: API request failed with status 503: upstream '

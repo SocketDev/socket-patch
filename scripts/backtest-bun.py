@@ -188,6 +188,11 @@ BUN_TRANSPORT_FAILURE = re.compile(
     r'^error: (?:Connection\w+|FailedToOpenSocket|Timeout|TLSHandshakeTimeout) downloading '
     r'|^error: GET \S+ - 5\d\d\b', re.M)
 
+# The harness's own fetches (published record, hosted tarball digest) that
+# still fail after their in-place retries surface as the cell's `error`:
+# `<urlopen error [Errno 104] Connection reset by peer>`.
+HARNESS_TRANSPORT_FAILURE = re.compile(r'^<urlopen error |^\[(?:Win)?Errno \d+\] Connection reset')
+
 
 def bun_transport_failures(output):
     """The lines of a bun install's output that report a transport failure."""
@@ -202,7 +207,8 @@ def has_transport_failure(value):
     if isinstance(value, list):
         return any(has_transport_failure(item) for item in value)
     return isinstance(value, str) and bool(CLI_TRANSPORT_FAILURE.search(value)
-                                           or BUN_TRANSPORT_FAILURE.search(value))
+                                           or BUN_TRANSPORT_FAILURE.search(value)
+                                           or HARNESS_TRANSPORT_FAILURE.search(value))
 
 
 def retry_network_cell(run_case, job, root, attempts=3):
