@@ -23,7 +23,7 @@ name: Benchmarks
 
 on:
   pull_request:
-    types: [opened, synchronize, reopened, labeled, unlabeled]
+    types: [opened, synchronize, reopened, ready_for_review, labeled, unlabeled]
     paths:
       - '.github/workflows/bench.yml'
       - '.cargo/**'
@@ -69,8 +69,10 @@ jobs:
     name: scan performance
     # Labels re-trigger the workflow; only this one changes the outcome.
     if: >-
-      (github.event.action != 'labeled' && github.event.action != 'unlabeled')
-      || github.event.label.name == 'performance-regression-accepted'
+      github.event.pull_request.draft != true && (
+        (github.event.action != 'labeled' && github.event.action != 'unlabeled')
+        || github.event.label.name == 'performance-regression-accepted'
+      )
     # Job-level, so an unrelated label (skipped above) cannot cancel a run
     # in progress. A newer push to the same PR supersedes the older run.
     concurrency:
