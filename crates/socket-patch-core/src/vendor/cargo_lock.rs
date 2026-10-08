@@ -64,11 +64,9 @@ use std::sync::Arc;
 use toml_edit::{DocumentMut, Item, Table};
 
 use super::cargo_tag;
-use crate::formats::cargo::{
-    locked_packages, metadata_checksum_key, parse_ref, LockedPackage,
-};
 use super::parse_memo::ParseMemo;
 use super::state::CargoLockOriginal;
+use crate::formats::cargo::{locked_packages, metadata_checksum_key, parse_ref, LockedPackage};
 use crate::utils::fs::{atomic_write_bytes_preserving_mode, read_regular_to_string};
 
 /// Why a lock edit could not be performed.

@@ -1006,11 +1006,15 @@ fn gate_refusal(gate: BerryGate) -> VendorOutcome {
     refused(code, gate.detail())
 }
 
-/// The project-level refusals [`vendor_yarn_berry`] raises before any
-/// write, whatever the purl: mixed line endings in yarn.lock or
-/// package.json, an unsupported `cacheKey`, a non-zero `.yarnrc.yml`
-/// `compressionLevel`. `None` unless the project's npm flavor is yarn berry
-/// (the probe `vendor_npm_any` routes on) and every gate passes.
+/// The project-level refusals a vendored run raises for a yarn berry
+/// project before any write, whatever the purl: a configured Plug'n'Play
+/// linker (`nodeLinker: pnp`, or unset — berry's default — even before any
+/// `.pnp.*` loader exists, #539; `vendor_npm_any`'s forward-vendoring
+/// probe, checked first as it is there), then [`vendor_yarn_berry`]'s
+/// mixed line endings in yarn.lock or package.json, an unsupported
+/// `cacheKey`, a non-zero `.yarnrc.yml` `compressionLevel`. `None` unless
+/// the project's npm flavor is yarn berry (the probe `vendor_npm_any`
+/// routes on) and every gate passes.
 ///
 /// For the hosted→vendored mode takeover (`vendor`, `scan`/`get --mode
 /// vendored` over a hosted-redirected purl): the takeover reverts the
@@ -1020,12 +1024,18 @@ fn gate_refusal(gate: BerryGate) -> VendorOutcome {
 /// gone, leaving the package unpatched in both modes. Returns `(code, detail)`,
 /// exactly the refusal the backend would raise.
 pub async fn yarn_berry_vendor_preflight(project_root: &Path) -> Option<(&'static str, String)> {
-    use super::npm_flavor::{detect_npm_lock_flavor, NpmLockFlavor};
+    use super::npm_flavor::{detect_npm_lock_flavor, detect_vendorable_npm_flavor, NpmLockFlavor};
     if !matches!(
         detect_npm_lock_flavor(project_root).await,
         Ok((NpmLockFlavor::YarnBerry, _))
     ) {
         return None;
+    }
+    // A lock-only PnP project passes the read-only probe above (no loader
+    // yet), but `vendor_npm_any` refuses it: the takeover must refuse
+    // before it restores the hosted pin.
+    if let Err(refusal) = detect_vendorable_npm_flavor(project_root).await {
+        return Some(refusal);
     }
     let into_pair = |outcome: VendorOutcome| match outcome {
         VendorOutcome::Refused { code, detail } => Some((code, detail)),
@@ -3901,7 +3911,7 @@ __metadata:
                 "compressionLevel",
                 crlf(B3_BEFORE_PKG),
                 crlf(B3_BEFORE_LOCK),
-                Some("compressionLevel: 9\r\n"),
+                Some("nodeLinker: node-modules\r\ncompressionLevel: 9\r\n"),
             ),
         ] {
             let fx = fixture_with(&pkg, &lock).await;
@@ -3930,6 +3940,31 @@ __metadata:
                 None,
                 "{label}: nothing to refuse"
             );
+        }
+    }
+
+    /// #539 + Bugbot on #978: a lock-only yarn berry project configured
+    /// for Plug'n'Play (explicit `nodeLinker: pnp`, or no `nodeLinker` —
+    /// berry's default) has no `.pnp.*` loader yet, so the read-only flavor
+    /// probe accepts it. The takeover preflight must still raise the PnP
+    /// refusal `vendor_npm_any` would, before the hosted pin is restored.
+    #[tokio::test]
+    async fn preflight_refuses_a_lock_only_pnp_project() {
+        for (label, rc) in [
+            (
+                "explicit pnp",
+                "nodeLinker: pnp\nenableGlobalCache: false\n",
+            ),
+            ("default linker", "enableGlobalCache: false\n"),
+        ] {
+            let fx = fixture_with(B3_BEFORE_PKG, B3_BEFORE_LOCK).await;
+            tokio::fs::write(fx.root().join(YARNRC), rc).await.unwrap();
+            let (code, detail) = yarn_berry_vendor_preflight(fx.root())
+                .await
+                .unwrap_or_else(|| panic!("{label}: the preflight must refuse"));
+            assert_eq!(code, "vendor_yarn_berry_unsupported", "{label}: {detail}");
+            assert!(detail.contains("Plug'n'Play"), "{label}: {detail}");
+            fx.assert_untouched().await;
         }
     }
 
@@ -3975,7 +4010,7 @@ __metadata:
                 "compressionLevel mixed",
                 lf_pkg.clone(),
                 lf_lock.clone(),
-                Some("compressionLevel: mixed\n"),
+                Some("nodeLinker: node-modules\ncompressionLevel: mixed\n"),
                 Some("cache_unsupported"),
             ),
             (

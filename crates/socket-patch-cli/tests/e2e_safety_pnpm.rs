@@ -293,7 +293,11 @@ fn apply_in_a_does_not_mutate_b_or_store() {
     };
 
     // -- get + apply in proj_a only ----------------------------------
-    assert_run_ok(&fx.proj_a, &["get", NPM_UUID, "--mode", "agent"], "socket-patch get");
+    assert_run_ok(
+        &fx.proj_a,
+        &["get", NPM_UUID, "--mode", "agent"],
+        "socket-patch get",
+    );
 
     // proj_a is patched.
     assert_eq!(
@@ -397,7 +401,11 @@ fn pnpm_install_in_b_does_not_revert_a() {
         store_id
     };
 
-    assert_run_ok(&fx.proj_a, &["get", NPM_UUID, "--mode", "agent"], "socket-patch get");
+    assert_run_ok(
+        &fx.proj_a,
+        &["get", NPM_UUID, "--mode", "agent"],
+        "socket-patch get",
+    );
     assert_eq!(git_sha256_file(&index_a), AFTER_HASH);
 
     // Re-run pnpm install in proj_b with frozen lockfile — this
@@ -475,7 +483,11 @@ fn apply_in_pnpm_project_emits_layout_note() {
     let root = tempfile::tempdir().unwrap();
     let fx = setup_two_pnpm_projects(root.path());
 
-    let (_stdout, stderr) = assert_run_ok(&fx.proj_a, &["get", NPM_UUID, "--mode", "agent"], "socket-patch get");
+    let (_stdout, stderr) = assert_run_ok(
+        &fx.proj_a,
+        &["get", NPM_UUID, "--mode", "agent"],
+        "socket-patch get",
+    );
 
     // The exact phrasing is a stable contract. A bare `contains("pnpm")`
     // is worthless here — every pnpm store path printed on stderr
