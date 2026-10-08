@@ -1,6 +1,6 @@
 [agent] Progress ledger for the scheduled pnpm bug-hunt routine (label pm:pnpm).
 
-Last updated: 2026-10-08 (run 32), main `ea09714`, latest release 4.0.0.
+Last updated: 2026-10-08 (run 33), main `e2d9633`, latest release 4.0.0.
 
 Method: real pnpm installs. Hosted, vendored and global agent mode run against a local Python mock of the patch API (batch, by-package, view with inline blobs, `patches/blob/<hash>`, package grant, hosted tarball, `/registry/<name>/<ver>` mirror; `ajv-keywords@3.5.2` serves as the peer-dependency package). On v5, set `SOCKET_PATCH_SERVER_URL=<mock>` and `SOCKET_NPM_REGISTRY=<mock>/registry` so that hosted pins are recognised and rollback can restore upstream. The oracle is a marker prepended to `index.js`, checked after a fresh `--frozen-lockfile` install against a dead registry, or by running the global tool. The repo's pinned matrix (`.github/workflows/pnpm-compatibility.yml`) already covers plain hosted and vendored installs on pnpm 1–12. This ledger tracks what it doesn't.
 
@@ -328,6 +328,18 @@ Run 32 additions (main `ea09714`, Linux):
 
 Re-triage (run 32): #1006 still reproduces on `ea09714` (12.10.1). #1111 isn't a regression: 4.0.0 gives `npm update -g` even for project installs.
 
+Run 33 additions (main `e2d9633`, Linux; #1050 vendored-liveness GC, #1029 `apply --check` and `redirect.patches[]`):
+
+| pnpm (lock) | `scan --mode vendored --prune`, entry in use: root / member / hoisted (no false prune) | Same, moved checkout (path with a space) / CRLF lock / BOM lock / `lockfile=false` (with and without `node_modules`) | Dependency removed + relock → `scan --prune` reverts → fresh frozen | Lock-only clone → `scan --mode vendored --prune` (detaches the entry, heals the absolute specifier) | Agent `apply --check` (#1029): direct / transitive / hoisted / member / peer-suffixed instance drift | Hosted `redirect.patches[]` rows + fresh frozen: plain / alias / two-document lock / `sharedWorkspaceLockfile: false` |
+| --- | --- | --- | --- | --- | --- | --- |
+| 7.33.7 (5.4) | pass | untested / — / — / — | untested | pass | untested | pass |
+| 8.15.9 (6.0) | pass / refuses (#830 dialect) / — | pass / — / — / — | pass | pass (moved path with a space heals) | — / pass / — / — / — | untested |
+| 9.15.9 | pass / pass / — | — / pass / pass / pass | pass | pass | pass / pass / — / — / pass | — / pass / — / pass |
+| 10.34.6 | — / — / pass | untested | pass | untested | — / — / pass / — / — | pass (hoisted) |
+| 12.10.1 | — / pass / — | — / — / — / pass | pass (member) | pass | GVS refuses (#362, intended); member pass; peer drift pass | — / — / pass / — |
+
+Re-triage (run 33): #466 still reproduces on `e2d9633` (12.10.1 with `packageManager`: vendor fails `vendor_lock_entry_not_found`, nothing written).
+
 Run 20 additions (main `045d7ec`, Linux):
 
 | pnpm (lock) | Vendored parent + vendored dep (`debug`→`ms`): `remove <parent>` / takeover → hosted / `rollback` | `remove <child>` (control) | Hosted parent + dep: remove parent / rollback | Mixed-case names (`Base64`, `JSONStream`): hosted / agent / vendored | User parent-selector / range-selector override (vendored) | Agent `symlink=false` / `hoist=false` | `list -g` |
@@ -364,12 +376,14 @@ Global mode (`-g`, v5 main `2463257`):
 
 ## Backlog
 
+00a. #1050 GC follow-ups: `scan --prune` over a peer-suffixed vendored snapshot, over Rush / subspace locks, and with `sharedWorkspaceLockfile: false` from a member. #1029 follow-ups: `apply --check` with a custom `virtualStoreDir` / `modulesDir`, and `redirect.patches[]` `unpinned` rows on a pnpm lock that pins nothing.
+
 000. #1111 follow-ups: the passive update-notifier text on a real newer release, and a pnpm global install on Windows (`%LOCALAPPDATA%\pnpm`) and macOS. Needs a probe. #1096: marker-only files are done (run 32, commented); vendored on 10.4.1 with a comment-only file is still to do.
 0a. Supersede A → B over a two-document lock (pnpm 11/12 `packageManager` / `configDependencies`) and on 9/10 vendored. Also `remove <B>` after an agent A + hosted B mix (blocked by the permission classifier in run 32).
 00. #1074 follow-ups: the setting in the global `rc` / `config.yaml`, the pnpm 7/8 dialect, Rush, and vendored on 9/10 (12 passes). Handed an unverified npm lead (`package-lock=false`) to discussion #302.
 0. **Maintainer request (global `-g` mode):** the Linux cells are done. Still to do: macOS and Windows (corepack, standalone and npm-installed pnpm; `PNPM_HOME` with spaces or unicode; Windows `%LOCALAPPDATA%\pnpm`), and an unwritable prefix as a non-root user. Full checklist in the 20261001T040000Z entry. Needs a probe branch.
 1. Delete the stale probe branch `bughunt/pnpm/20260930-virtual-store`. `git push --delete` failed through the git proxy in runs 1, 3, 10 and 16, and was denied by the permission policy in runs 2, 5–9, 11–14, 16, 17, 19 and 28, so a maintainer needs to do it. macOS and Windows probes stay on hold until branch cleanup works.
-2. #754 follow-ups: a Windows `C:/…/My Project #2` checkout, and the moved-checkout heal path now that the specifier is quoted. Needs a probe.
+2. #754 follow-ups: a Windows `C:/…/My Project #2` checkout. Needs a probe. (The Linux moved-checkout heal with a space in the path passes on 8.15.9 and 7.33.7, run 33.)
 2a. #778 follow-ups: pnpm 7 workspace layout, and `-g` absolute scopes vs `rollback -g` (`--sync`/`--prune` with a scope done in run 18: fails safe).
 3. #696 / #661 follow-ups (both fixed in run 21): `modulesDir` in the global `config.yaml` / `rc`, and that GVS and out-of-project `virtualStoreDir` transitive deps also stop attesting.
 3a. `list` under Rush (`list -g` on 11 / 12 and `list` with `sharedWorkspaceLockfile: false` done in run 20: pass).
