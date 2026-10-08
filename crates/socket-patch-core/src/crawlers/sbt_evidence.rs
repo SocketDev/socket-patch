@@ -58,7 +58,7 @@ pub const SKIP_DIRS: &[&str] = &[
     ".idea",
     ".metals",
     ".bloop",
-    ".scala-build",
+    crate::vendor::jvm::layout::SCALA_CLI_DIR,
 ];
 
 /// The evidence files and build sources of one build root.

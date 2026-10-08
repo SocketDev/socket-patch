@@ -478,7 +478,8 @@ are patched by `socket-patch apply` like every other ecosystem:
 ### sbt / Mill / scala-cli caches in agent mode
 
 A JVM project root (any `JVM_PROJECT_MARKERS` file, `build.sbt` / `build.mill` / `build.sc` /
-`project.scala` included) makes agent-mode Maven discovery crawl the Maven local repository. Locally, only
+`project.scala` included, or a root-relative `project/build.properties` or `.scala-build/`) makes
+agent-mode Maven discovery crawl the Maven local repository. Locally, only
 an sbt / Mill / scala-cli project (`build.sbt`, `project/build.properties`, `build.mill`, `build.mill.yaml`,
 `build.sc`, `project.scala` or `.scala-build/`; a Maven or Gradle build never reads these caches) also crawls,
 after it in order and first copy winning the crawl dedup (`--global` always): every **Coursier** cache (`$COURSIER_CACHE`; `-Dcoursier.cache=`
