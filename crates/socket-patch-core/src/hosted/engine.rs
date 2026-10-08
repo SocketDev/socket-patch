@@ -533,7 +533,7 @@ pub async fn read_candidate_files(
         && out
             .files
             .get("yarn.lock")
-            .is_some_and(|lock| crate::patch::redirect::is_berry_lock(lock))
+            .is_some_and(|lock| crate::formats::yarn::is_berry_lock(lock))
     {
         out.read(view, unreadable, "package.json").await;
     // Otherwise the root manifest's `overrides` decide which git / url /
@@ -603,7 +603,7 @@ pub async fn read_candidate_files(
         && out
             .files
             .get("yarn.lock")
-            .is_some_and(|lock| !crate::patch::redirect::is_berry_lock(lock))
+            .is_some_and(|lock| !crate::formats::yarn::is_berry_lock(lock))
     {
         out.read(view, unreadable, crate::patch::redirect::YARNRC_REL)
             .await;
@@ -935,12 +935,11 @@ pub fn yarn_berry_manifest_targets<'a>(
 ) -> Vec<&'a DepOverride> {
     let Some(lock) = files
         .get("yarn.lock")
-        .filter(|lock| crate::patch::redirect::is_berry_lock(lock))
+        .filter(|lock| crate::formats::yarn::is_berry_lock(lock))
     else {
         return Vec::new();
     };
-    let lock = crate::utils::line_endings::to_lf(lock);
-    let bin_entries = crate::patch::redirect::berry_bin_entries(&lock);
+    let bin_entries = crate::formats::yarn::blocks::berry_bin_entries(lock);
     if bin_entries.is_empty() {
         return Vec::new();
     }
