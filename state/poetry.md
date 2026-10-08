@@ -1,6 +1,6 @@
 [agent] Progress ledger for the scheduled Poetry bug-hunt routine (label pm:poetry).
 
-Last updated: 2026-10-07 (run 15), main `db83f01` (includes #330, #446, #452, #456, #503, #527, #538, #540, #644, #703, #708, #950, #963), latest release 4.0.0 (previous 3.3.0). Run 9 re-measured the cells marked "r9". Runs 10–15 have their own tables below. #327 and #329 are closed: macOS / Windows cells that still show them haven't been re-run, because probe branches are blocked.
+Last updated: 2026-10-08 (run 16), main `3b4ac84` (includes #330, #446, #452, #456, #503, #527, #538, #540, #644, #703, #708, #946, #950, #963, #1025, #1035, #1044), latest release 4.0.0 (previous 3.3.0). Run 9 re-measured the cells marked "r9". Runs 10–16 have their own tables below. #327, #329, #945 and #1024 are closed: macOS / Windows cells that still show #327 / #329 haven't been re-run, because probe branches are blocked.
 
 ## Coverage matrix
 
@@ -165,14 +165,26 @@ Global installs aren't Poetry-specific (Poetry never installs globally unless `v
 | 2.5.1 | `remove` / `rollback` with a non-canonical PyPI purl (`typing_extensions`, `Typing-Extensions`), agent / hosted / vendored | fail #1024 |
 | 0.12.17 | #945 re-check | still fails (commented) |
 
+### Run 16 cells (Linux, main `3b4ac84`)
+
+| Poetry | Cell | Result |
+| --- | --- | --- |
+| 1.1.15, 1.8.5, 2.0.1, 2.4.3 (LF + CRLF) | Vendored A → vendored B (superseding uuid), dry run, `get --mode vendored` | fail #1136 (wet exit 1 `pypi_poetry_source_already_exists`; dry run `would_revendor`) |
+| 1.1.15, 1.8.5, 2.4.3 (LF + CRLF) | Hosted A → hosted B (#1035), then `remove` / `rollback`, fresh installs | pass |
+| 1.1.15, 1.8.5, 2.4.3 | Hosted A → vendored B takeover, venv holds A | fail (#1105 comment): exit 1 `package_not_installed`, dry run `would_vendor` |
+| 1.8.5 | same, no venv; or B = A | pass |
+| 2.4.3 | `poetry.lock` + exported `requirements.txt`: hosted (scan, `pip install -r`, rollback) / vendored | pass / `pypi_multiple_lockfiles` (documented) |
+| 2.4.3 | #1023 / #671 re-check | still fail |
+
 ## Backlog
 
-1. Re-check #1023 when a Poetry guard lands (PR #965 covers uv only). Confirm that `create = false` still falls back.
-2. **Lead (run 14):** with `virtualenvs.create = false`, the project global fallback (`get_global_python_site_packages`) crawls every well-known dir, including other interpreters' `/usr/lib/python3/dist-packages` and `/usr/local/lib/python3.X`. Hosted `vex` then refuses a correct install because of an unrelated apt copy, and agent mode patches dpkg-owned files. That follows from #538's "patch every copy" design, so it needs a maintainer call before anyone files it.
-3. **macOS / Windows re-checks for closed #327 / #329**, the #640 default paths, #866 on macOS, macOS XDG (`XDG_CACHE_HOME` / `XDG_CONFIG_HOME` with platformdirs ≥ 4.6), and the Windows Poetry 1.0/1.1 env hash (raw vs lowercased cwd). All need probe branches.
-4. Probe branches are still blocked: `bughunt/poetry/20260930-venv-discovery` and `bughunt/poetry/20260930-windows-modes` still exist (run 15), and deletion was denied in runs 9–15. A maintainer needs to delete them and allow deleting `bughunt/poetry/*`.
-5. Two-patch cells on a lock 1.1 (Poetry 1.1.15) and on a mixed-EOL lock. Vendored `repair` with one of two wheels deleted.
-6. Docs: `installer.modern-installation = false` (Poetry 1.4–1.8) keeps a warm same-version install, but the poetry-compatibility "Installer boundaries" table says 1.4–1.8 replace it.
+1. Re-check #1136 (vendored re-vendor to a superseding uuid) and #1105 (hosted → vendored onto a newer uuid with a warm venv) once fixed, including dry-run / wet parity.
+2. Re-check #1023 when a Poetry guard lands (PR #965 covers uv only). Confirm that `create = false` still falls back.
+3. **Lead (run 14):** with `virtualenvs.create = false`, the project global fallback (`get_global_python_site_packages`) crawls every well-known dir, including other interpreters' `/usr/lib/python3/dist-packages` and `/usr/local/lib/python3.X`. Hosted `vex` then refuses a correct install because of an unrelated apt copy, and agent mode patches dpkg-owned files. That follows from #538's "patch every copy" design, so it needs a maintainer call before anyone files it.
+4. Vendored `repair` / `scan --prune` after a superseding uuid; two-patch cells on a lock 1.1 (Poetry 1.1.15) and on a mixed-EOL lock; vendored `repair` with one of two wheels deleted.
+5. **macOS / Windows re-checks for closed #327 / #329**, the #640 default paths, #866 on macOS, macOS XDG (`XDG_CACHE_HOME` / `XDG_CONFIG_HOME` with platformdirs ≥ 4.6), and the Windows Poetry 1.0/1.1 env hash (raw vs lowercased cwd). All need probe branches.
+6. Probe branches are still blocked: `bughunt/poetry/20260930-venv-discovery` and `bughunt/poetry/20260930-windows-modes` still exist (run 16), and deletion was denied in runs 9–16. A maintainer needs to delete them and allow deleting `bughunt/poetry/*`.
+7. Docs: `installer.modern-installation = false` (Poetry 1.4–1.8) keeps a warm same-version install, but the poetry-compatibility "Installer boundaries" table says 1.4–1.8 replace it.
 
 ## Known non-bugs
 
@@ -229,3 +241,6 @@ Global installs aren't Poetry-specific (Poetry never installs globally unless `v
 - Symlinked `poetry.lock`: hosted (`redirect_symlinked_file_unsupported`) and vendored (`pypi_poetry_symlink_unsupported`) both refuse before writing. Documented.
 - With Poetry ≤ 2.2, `poetry lock` creates the project env. A "fresh checkout" cell has to delete the env after locking, or the scan correctly finds it.
 - Two patched packages: `remove` of one keeps the other's hosted / vendored wiring (r15, LF + CRLF, Poetry 1.8.5 / 2.5.1). Not a bug.
+- A mock that rebuilds its wheel on every request (zip timestamps) makes `poetry install` fail "Hash … not found in known hashes", and Poetry then keeps the bad bytes in `~/.cache/pypoetry/artifacts` (keyed by URL). Build the mock wheel deterministically and clear that cache.
+- Hosted rollback of an exported `requirements.txt` beside `poetry.lock` folds its `\` continuation lines into one line (semantically equal). It's pip's file and cosmetic, so not filed.
+- Vendored with `poetry.lock` + `requirements.txt` warns `pypi_multiple_lockfiles` and wires only `poetry.lock`. Documented.
