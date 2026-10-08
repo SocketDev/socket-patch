@@ -954,6 +954,15 @@ fn uv_vendor_revert_sub_table_sources() {
 /// the pair (#806, #821). Before the fix the pyproject side reverted alone
 /// and `uv sync --locked` failed while revert reported success.
 fn uv_relock_then_revert(tag: &str, pyproject: &str, relock: &[&str]) {
+    uv_relock_then_unwind(tag, pyproject, relock, true);
+}
+
+/// The shared body of [`uv_relock_then_revert`]. `keeps_vendored` is false
+/// for a relock that drops the dependency altogether (`uv remove six`,
+/// #1140): uv deletes every fragment that routed through the wheel, so the
+/// revert has nothing to restore, and must still converge instead of
+/// drift-keeping the entry (which kept `vendor --check` red forever).
+fn uv_relock_then_unwind(tag: &str, pyproject: &str, relock: &[&str], keeps_vendored: bool) {
     let Some((uv, python)) = capstone_uv(tag) else {
         return;
     };
@@ -1000,9 +1009,11 @@ fn uv_relock_then_revert(tag: &str, pyproject: &str, relock: &[&str]) {
         return;
     }
     let relocked = std::fs::read_to_string(proj.join("uv.lock")).unwrap();
-    assert!(
+    assert_eq!(
         relocked.contains(".socket/vendor/pypi/"),
-        "the relock must keep six vendored: {relocked}"
+        keeps_vendored,
+        "the relock must {} six vendored: {relocked}",
+        if keeps_vendored { "keep" } else { "drop" }
     );
 
     let (code, stdout, stderr) = run_socket(
@@ -1037,6 +1048,21 @@ fn uv_relock_then_revert(tag: &str, pyproject: &str, relock: &[&str]) {
     assert!(
         !proj.join(".socket/vendor").exists(),
         ".socket/vendor must be fully removed after revert"
+    );
+}
+
+/// #1140: `uv remove six` after vendoring drops the dependency, its
+/// `[tool.uv.sources]` line and every uv.lock fragment that pointed at the
+/// wheel. `vendor --revert` must retire the entry and delete the wheel
+/// instead of keeping both as drift.
+#[test]
+#[serial_test::serial]
+fn uv_vendor_revert_after_uv_remove() {
+    uv_relock_then_unwind(
+        "uv-remove",
+        "[project]\nname = \"vendor-capstone\"\nversion = \"0.1.0\"\nrequires-python = \">=3.9\"\ndependencies = [\"six==1.16.0\", \"attrs>=20\"]\n",
+        &["remove", "-q", "six"],
+        false,
     );
 }
 
