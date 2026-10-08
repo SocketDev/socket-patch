@@ -12,29 +12,29 @@ use std::ops::Range;
 use serde_json::{json, Value};
 
 use super::super::state::{WiringAction, WiringRecord};
+use super::layout::{self, safe_coordinates};
 use super::{
     adopt, changes_between, finish_writes, fragment, op_of, op_str, owned_file, replace_op,
-    safe_coordinates, sha1_hex, sha256_hex, undo_replace, Coords, FileWrite, JvmPatch, JvmPlan,
-    JvmRefusal, JvmUnplan, JvmWarning, ReadFn, CONFIG_LINE_KIND, OWNED_FILE_KIND,
-    POM_FRAGMENT_KIND, TREE_GITATTRIBUTES,
+    sha1_hex, sha256_hex, undo_replace, Coords, FileWrite, JvmPatch, JvmPlan, JvmRefusal,
+    JvmUnplan, JvmWarning, ReadFn, CONFIG_LINE_KIND, OWNED_FILE_KIND, POM_FRAGMENT_KIND,
+    TREE_GITATTRIBUTES,
 };
 
 /// The committed maven2 tree.
-pub const TREE_ROOT: &str = ".socket/vendor/maven2";
+use super::layout::MAVEN2_TREE as TREE_ROOT;
 pub const MAVEN_CONFIG: &str = ".mvn/maven.config";
 /// The tree root's `.gitattributes`, shared by every Maven patch.
 pub const GITATTRIBUTES_REL: &str = ".socket/vendor/maven2/.gitattributes";
 const OFFLINE_LINE: &str = "-Daether.offline.protocols=file";
 const OFFLINE_KEY: &str = "-Daether.offline.protocols=";
 const TAIL_KEY: &str = "-Dmaven.repo.local.tail=";
-const TAIL_DIR: &str = "${session.rootDirectory}/.socket/vendor/maven2";
+pub(crate) const TAIL_DIR: &str = "${session.rootDirectory}/.socket/vendor/maven2";
 pub const REPO_ID: &str = "socket-patch-vendor";
 pub const REPO_URL: &str = "file://${maven.multiModuleProjectDirectory}/.socket/vendor/maven2";
-const BEGIN_MARKER: &str = "<!-- socket-patch:begin -->";
+pub(crate) const BEGIN_MARKER: &str = "<!-- socket-patch:begin -->";
 const END_MARKER: &str = "<!-- socket-patch:end -->";
 /// Prefix of the comment tagging a pin: `<!-- socket-patch <uuid>: g:a:v -->`.
-const PIN_TAG: &str = "<!-- socket-patch ";
-pub const MARKER_FILE: &str = "socket-patch.vendor.json";
+pub(crate) const PIN_TAG: &str = "<!-- socket-patch ";
 /// Files whose presence makes a module directory a Maven root of its own,
 /// which would move `${maven.multiModuleProjectDirectory}` under `cd module`.
 const NESTED_MVN_FILES: &[&str] = &[
@@ -68,12 +68,7 @@ pub fn declares_modules(pom: &str) -> bool {
 
 /// The tree directory of `c`'s suffixed version.
 pub fn tree_dir(c: &Coords<'_>) -> String {
-    format!(
-        "{TREE_ROOT}/{}/{}/{}",
-        c.group_path(),
-        c.artifact_id,
-        c.suffixed_version()
-    )
+    c.tree_dir(TREE_ROOT, &c.suffixed_version())
 }
 
 /// The committed tree of `c`, as the [`JvmPatch`] bytes that re-plan it
@@ -1628,7 +1623,7 @@ fn tree_writes(
     });
     let mut marker = serde_json::to_string_pretty(&marker).expect("marker serializes");
     marker.push('\n');
-    files.insert(MARKER_FILE.to_string(), marker.into_bytes());
+    files.insert(layout::MARKER_FILE.to_string(), marker.into_bytes());
 
     let writes: Vec<FileWrite> = files
         .into_iter()

@@ -2172,8 +2172,10 @@ fn gradle_hosted_vendored_takeover_and_eject() {
 }
 
 /// A vendored Gradle build the hosted planner would refuse (a custom
-/// `lockFile`): `scan --mode hosted` refuses the takeover BEFORE reverting
-/// anything, so the vendored patch keeps working.
+/// `lockFile`): `scan --mode hosted` stages the vendored revert in memory,
+/// the planner refuses the pin, and the takeover is retracted before
+/// anything reaches the disk (the tree's jars included), so the vendored
+/// patch keeps working.
 #[test]
 #[ignore = "real Gradle; run with --ignored"]
 fn gradle_hosted_takeover_refusal_keeps_vendored() {

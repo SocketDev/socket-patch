@@ -1228,7 +1228,10 @@ async fn gradle_scan(
         .unwrap_or_default();
     let want_locks = !out.gradle_purls.is_empty();
     let Ok((gate, locked, mismatch, env)) = tokio::task::spawn_blocking(move || {
-        let gradle_build = gradle_cache::has_gradle_marker(&cwd);
+        let gradle_build = socket_patch_core::vendor::jvm::layout::has_build(
+            &cwd,
+            socket_patch_core::vendor::jvm::layout::BuildTool::Gradle,
+        );
         let env = JvmEnv::from_process();
         let gate = (!global && gradle_build).then(|| m2_gate(&cwd, &env));
         // The cwd's build locks annotate Gradle-cached packages in a global
@@ -1824,8 +1827,7 @@ async fn run_scan(
     // supplement falls back to the committed artifacts (fail-closed for the
     // prune), the key set degrades to empty (fail-open).
     let vendor_state = &ctx.loaded().await.vendor;
-    let ledger_supplement =
-        vendored_ledger_supplement(&args.common, &all_crawled, vendor_state).await;
+    let ledger_supplement = vendored_ledger_supplement(&ctx, &all_crawled, vendor_state).await;
     for pkg in &ledger_supplement.packages {
         if let Some(eco) = Ecosystem::from_purl(&pkg.purl) {
             *eco_counts.entry(eco).or_insert(0) += 1;
