@@ -1494,13 +1494,20 @@ pub(crate) async fn bundler_loaded_manifest_in(
             let gemfile = config.as_deref().and_then(manifest::config_gemfile);
             let lockfile = config.as_deref().and_then(manifest::config_lockfile);
             let root = Path::new("/");
-            manifest::classify(root, None, gemfile.as_deref(), None).with_lockfile(
-                root,
-                None,
-                lockfile.as_deref(),
-                None,
-                view.is_file("gems.rb"),
-            )
+            let gems_rb = view.is_file("gems.rb");
+            let loaded = manifest::classify(root, None, gemfile.as_deref(), None);
+            // `/` only stands in for the project root: bundler opens an
+            // absolute lockfile as is, never the project's own lock, so
+            // it must not compare equal to the pair's lock at `/`.
+            if let Some(value) = lockfile.as_deref() {
+                if Path::new(value).has_root() && loaded.pair(gems_rb).is_some() {
+                    return manifest::LoadedManifest::UnsupportedLockfile {
+                        value: value.to_string(),
+                        by: manifest::GemfileSetting::AppConfig,
+                    };
+                }
+            }
+            loaded.with_lockfile(root, None, lockfile.as_deref(), None, gems_rb)
         }
     }
 }

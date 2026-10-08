@@ -2929,6 +2929,39 @@ mod tests {
         );
     }
 
+    /// #749: a memory view has no real root, so an absolute
+    /// `BUNDLE_LOCKFILE` that would land on the pair's lock if the project
+    /// sat at `/` still names a file outside the project. Bundler opens
+    /// that path, never the in-repo lock, so the pair stays out.
+    #[tokio::test]
+    async fn absolute_bundle_lockfile_redirects_nothing() {
+        for (gems_rb, lock) in [(false, "/Gemfile.lock"), (true, "/gems.locked")] {
+            let mut p = MemoryProject::new();
+            if gems_rb {
+                p.insert_text("gems.rb", GEMFILE);
+                p.insert_text("gems.locked", GEM_LOCK);
+            } else {
+                p.insert_text("Gemfile", GEMFILE);
+                p.insert_text("Gemfile.lock", GEM_LOCK);
+            }
+            p.insert_text(
+                ".bundle/config",
+                format!("---\nBUNDLE_LOCKFILE: \"{lock}\"\n").as_str(),
+            );
+            let (_read, done) = gem_rewrite(&p).await;
+            assert!(
+                done.rewrite.files.is_empty(),
+                "{lock}: {:?}",
+                done.rewrite.files.keys()
+            );
+            let codes = warning_codes(&done);
+            assert!(
+                codes.contains(&"redirect_gem_bundle_lockfile_unsupported"),
+                "{lock}: {codes:?}"
+            );
+        }
+    }
+
     /// #751: a `Gemfile` + `gems.rb` twin whose locks disagree on the
     /// bundler major is withheld, and the run says why.
     #[tokio::test]
