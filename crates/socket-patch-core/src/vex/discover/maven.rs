@@ -94,15 +94,15 @@ use super::{
     Discovery, PatchedRef, WiringMode, DIAG_LOCKFILE_UNPARSEABLE, DIAG_REF_INVALID,
     DIAG_REF_UNATTRIBUTABLE,
 };
+use crate::formats::maven::{
+    is_maven_coordinate, is_maven_version_text, parse_pom, split_socket_version, Pom, PomDep,
+    PomRepo,
+};
 use crate::patch::redirect::{
     local_repo_artifact_path, MVN_CHECKSUMS, MVN_CONFIG, TRUSTED_CHECKSUMS_ON,
 };
 use crate::utils::digest::sha256_hex;
 use crate::vendor::lock_inventory::LockIntegrity;
-use crate::formats::maven::{
-    is_maven_coordinate, is_maven_version_text, parse_pom, split_socket_version, Pom, PomDep,
-    PomRepo,
-};
 use crate::vendor::maven_repo::{sha1_sidecar_matches, VENDOR_REPO_URL_PREFIX};
 use crate::vendor::path::{sweep_vendor_dirs, VENDOR_DIR};
 
@@ -496,7 +496,7 @@ enum RepoKind {
 fn classify_repo(ctx: &DiscoverCtx<'_>, repo: &PomRepo, out: &mut Discovery) -> RepoKind {
     let id = repo.id.as_str();
     let url = repo.url.as_str();
-    let id_socket = id.starts_with("socket-patch-");
+    let id_socket = id.starts_with(crate::patch::redirect::generation::PIN_NAME_PREFIX);
     let id_hosted = socket_patch_name_uuid(id, false);
     let id_vendored = socket_patch_name_uuid(id, true);
     let url_hosted = ctx.hosted_uuid(url);

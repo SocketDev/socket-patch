@@ -52,8 +52,7 @@
 use std::collections::HashMap;
 use std::path::Path;
 
-use crate::crawlers::python_crawler::canonicalize_pypi_name;
-use crate::utils::purl::strip_purl_qualifiers;
+use crate::utils::purl_key::PurlKey;
 
 pub(crate) mod bun;
 pub(crate) mod cargo;
@@ -240,30 +239,12 @@ pub fn unsupported_layout_warnings(unsupported: &[UnsupportedNpmLayout]) -> Vec<
 }
 
 /// Match a manifest/API purl (possibly percent-encoded, possibly carrying
-/// qualifiers) against the inventory: components decode via
-/// [`crate::utils::purl::normalize_purl`], so `pkg:npm/%40scope/x@1`
-/// matches the literal entry.
+/// qualifiers) against the inventory by [`PurlKey`]: `pkg:npm/%40scope/x@1`
+/// matches the literal entry, a PyPI name in any PEP 503 spelling matches,
+/// and a composer API purl's padded `@3.0.2.0` matches the lock's `3.0.2`.
 pub fn lookup<'a>(entries: &'a [LockfileEntry], purl: &str) -> Option<&'a LockfileEntry> {
-    let decoded = crate::utils::purl::normalize_purl(strip_purl_qualifiers(purl)).into_owned();
-    let rest = decoded.strip_prefix("pkg:")?;
-    let (purl_type, rest) = rest.split_once('/')?;
-    // purl types double as the vendor-ecosystem tags (same set the
-    // dispatcher recognizes).
-    let eco = match purl_type {
-        "npm" | "cargo" | "golang" | "pypi" | "gem" | "composer" => purl_type,
-        _ => return None,
-    };
-    let at = rest.rfind('@').filter(|&i| i > 0)?;
-    let (name, version) = (&rest[..at], &rest[at + 1..]);
-    // pypi names compare in PEP 503 normalized form.
-    let name = if eco == "pypi" {
-        canonicalize_pypi_name(name)
-    } else {
-        name.to_string()
-    };
-    entries
-        .iter()
-        .find(|e| e.ecosystem == eco && e.name == name && e.version == version)
+    let key = PurlKey::new(purl);
+    entries.iter().find(|e| PurlKey::new(&e.purl) == key)
 }
 
 /// Everything every recognized lockfile in the project resolves — the

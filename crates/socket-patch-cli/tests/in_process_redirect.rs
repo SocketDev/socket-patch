@@ -851,9 +851,10 @@ async fn scan_redirect_rewrites_crlf_and_bom_yarn_berry_locks_and_rollback_resto
             "{label}: rollback restores the pristine CRLF lock (upstream checksum \
              re-derived from the registry tarball)"
         );
-        let pkg: serde_json::Value =
-            serde_json::from_str(&std::fs::read_to_string(tmp.path().join("package.json")).unwrap())
-                .unwrap();
+        let pkg: serde_json::Value = serde_json::from_str(
+            &std::fs::read_to_string(tmp.path().join("package.json")).unwrap(),
+        )
+        .unwrap();
         assert!(
             pkg.get("resolutions").is_none(),
             "{label}: rollback drops the resolutions pin: {pkg}"
@@ -5078,4 +5079,64 @@ async fn cargo_hosted_scan_from_workspace_member_refuses() {
     assert_eq!(std::fs::read(root.join("Cargo.lock")).unwrap(), lock_before);
     assert!(!member.join(".cargo").exists(), "no member registry block");
     assert!(!member.join(".socket").exists());
+}
+
+/// `redirect.patches[]` reports every selected patch per purl (audit B12):
+/// a pinned dep is a `pinned` row, so a consumer no longer has to infer
+/// which patches the `redirected` count covers.
+#[tokio::test]
+#[serial]
+async fn hosted_json_reports_a_pinned_row_per_patch() {
+    let server = MockServer::start().await;
+    mock_discovery(&server).await;
+    mock_reference(&server).await;
+    mock_view(&server).await;
+    let tmp = tempfile::tempdir().unwrap();
+    write_project(tmp.path());
+
+    let env = run_redirect_subprocess(tmp.path(), &server.uri());
+    assert_eq!(env["redirect"]["redirected"], 1, "{env:#}");
+    assert_eq!(
+        env["redirect"]["patches"],
+        serde_json::json!([{ "purl": PURL, "uuid": UUID, "action": "pinned" }]),
+        "{env:#}"
+    );
+}
+
+/// A granted patch that no lockfile entry pins (here: no lockfile at all)
+/// used to vanish from `--json` — it is neither redirected nor skipped, and
+/// only the human output named it ("Not hosted"). It is now an `unpinned`
+/// row with `errorCode: redirect_unconfirmed`. The exit code is unchanged
+/// (0): the hosted exit policy is an open maintainer decision (#704).
+#[tokio::test]
+#[serial]
+async fn hosted_json_reports_an_unpinned_row_for_a_granted_patch_nothing_pins() {
+    let server = MockServer::start().await;
+    mock_discovery(&server).await;
+    mock_reference(&server).await;
+    mock_view(&server).await;
+    let tmp = tempfile::tempdir().unwrap();
+    std::fs::write(
+        tmp.path().join("package.json"),
+        format!(
+            r#"{{ "name": "consumer", "version": "0.0.0", "dependencies": {{ "{NAME}": "{VERSION}" }} }}"#
+        ),
+    )
+    .unwrap();
+    let pkg = tmp.path().join("node_modules").join(NAME);
+    std::fs::create_dir_all(&pkg).unwrap();
+    std::fs::write(
+        pkg.join("package.json"),
+        format!(r#"{{ "name": "{NAME}", "version": "{VERSION}" }}"#),
+    )
+    .unwrap();
+
+    let env = run_redirect_subprocess(tmp.path(), &server.uri());
+    assert_eq!(env["redirect"]["redirected"], 0, "{env:#}");
+    let rows = env["redirect"]["patches"].as_array().expect("patches[]");
+    assert_eq!(rows.len(), 1, "{env:#}");
+    assert_eq!(rows[0]["purl"], PURL, "{env:#}");
+    assert_eq!(rows[0]["uuid"], UUID, "{env:#}");
+    assert_eq!(rows[0]["action"], "unpinned", "{env:#}");
+    assert_eq!(rows[0]["errorCode"], "redirect_unconfirmed", "{env:#}");
 }

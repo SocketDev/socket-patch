@@ -364,7 +364,15 @@ async fn legacy_root(project_root: &Path) -> bool {
 /// Maven reactor, a project of a Gradle build or an sbt subproject of a
 /// build rooted above it: vendoring
 /// there would wire a build nobody runs and leave the real one unpatched
-/// (#428). Ancestors are searched up to the enclosing git checkout.
+/// (#428). Ancestors are searched up to the enclosing git checkout (a
+/// checkout at `project_root` itself does not stop the search: a submodule
+/// can still be a module of the build above it), with the repository
+/// lookup's own bounds: never into the home directory or a
+/// `GIT_CEILING_DIRECTORIES` entry ([`crate::utils::repo_root`]). Like git,
+/// the walk climbs the PHYSICAL parents (`project_root` canonicalized), so
+/// a relative root such as `.` still has ancestors; the refusal names the
+/// ancestor in the caller's own spelling of `project_root` whenever that
+/// spelling reaches it ([`shown_ancestor`]).
 pub(super) fn not_build_root(project_root: &Path) -> Option<String> {
     let project = super::jvm::apply::ProjectReader::new(project_root);
     let own_settings = ["settings.gradle", "settings.gradle.kts"]
@@ -373,26 +381,31 @@ pub(super) fn not_build_root(project_root: &Path) -> Option<String> {
     let own_build = ["build.gradle", "build.gradle.kts"]
         .iter()
         .any(|f| project_root.join(f).is_file());
-    for ancestor in project_root.ancestors().skip(1) {
+    let canonical_root =
+        std::fs::canonicalize(project_root).unwrap_or_else(|_| project_root.to_path_buf());
+    let ancestors = crate::utils::repo_root::ancestor_search_dirs(&canonical_root);
+    for ancestor in &ancestors {
+        let ancestor = ancestor.as_path();
         let reader = super::jvm::apply::ProjectReader::new(ancestor);
-        let rel = project_root
+        let rel = canonical_root
             .strip_prefix(ancestor)
             .ok()
             .map(|p| p.to_string_lossy().replace('\\', "/"));
         let Some(rel) = rel else { break };
+        let shown = || shown_ancestor(project_root, ancestor, &canonical_root);
         if super::jvm::maven_reactor::contains_module(
             &|p| reader.read(p),
             &format!("{rel}/pom.xml"),
         ) {
             return Some(format!(
                 "reason: not_build_root: run vendor from reactor root {}",
-                ancestor.display()
+                shown().display()
             ));
         }
         if super::jvm::sbt::nested_in_build(&|p: &str| project.read(p), &|p: &str| reader.read(p)) {
             return Some(format!(
                 "reason: not_build_root: run vendor from sbt build root {}",
-                ancestor.display()
+                shown().display()
             ));
         }
         let read_text = |p: &str| crate::gradle::dsl::decode(&reader.read(p)?);
@@ -411,15 +424,32 @@ pub(super) fn not_build_root(project_root: &Path) -> Option<String> {
             if owner.is_some() || undecodable || (own_build && !own_settings) {
                 return Some(format!(
                     "reason: not_build_root: run vendor from Gradle root {}",
-                    ancestor.display()
+                    shown().display()
                 ));
             }
         }
-        if ancestor.join(".git").exists() {
-            break;
-        }
     }
     None
+}
+
+/// `ancestor` (a physical ancestor of `canonical_root`, the canonical form
+/// of `project_root`) as the caller spelled it: `project_root`'s own
+/// lexical ancestor the same number of levels up when that names the same
+/// directory, else the canonical path without Windows' verbatim `\\?\`
+/// prefix (a `.` root, or a spelling through a symlink).
+fn shown_ancestor(project_root: &Path, ancestor: &Path, canonical_root: &Path) -> PathBuf {
+    let levels = canonical_root
+        .strip_prefix(ancestor)
+        .map_or(0, |rel| rel.components().count());
+    project_root
+        .ancestors()
+        .nth(levels)
+        .filter(|logical| !logical.as_os_str().is_empty())
+        .filter(|logical| std::fs::canonicalize(logical).is_ok_and(|c| c == ancestor))
+        .map(Path::to_path_buf)
+        .unwrap_or_else(|| {
+            crate::utils::pnpm_workspace::without_verbatim_prefix(ancestor.to_path_buf())
+        })
 }
 
 /// Where an upstream file of a vendored GAV is looked for locally: the
@@ -3396,6 +3426,42 @@ mod tests {
             detail.starts_with("reason: not_build_root: run vendor from Gradle root "),
             "{detail}"
         );
+    }
+
+    /// The build-root walk climbs physical parents, so a RELATIVE project
+    /// root still finds the build above it (the old lexical
+    /// `project_root.ancestors()` saw no real ancestor of `.`), and the
+    /// refusal names that root the way the caller spelled the project:
+    /// not the canonical `/private/var/…` (macOS) or `\\?\C:\…` (Windows).
+    #[cfg(unix)]
+    #[test]
+    fn not_build_root_walks_a_relative_root_and_names_the_callers_spelling() {
+        let dir = tempfile::tempdir().unwrap();
+        let root = dir.path();
+        std::fs::create_dir_all(root.join(".git")).unwrap();
+        std::fs::write(root.join("settings.gradle"), "include 'tools:gen'\n").unwrap();
+        std::fs::create_dir_all(root.join("tools/gen")).unwrap();
+        std::fs::write(root.join("tools/gen/build.gradle"), "").unwrap();
+        let want = |shown: &Path| {
+            Some(format!(
+                "reason: not_build_root: run vendor from Gradle root {}",
+                shown.display()
+            ))
+        };
+        assert_eq!(not_build_root(&root.join("tools/gen")), want(root));
+
+        // The same project reached by a path relative to the working
+        // directory: up to `/`, then down.
+        let cwd = std::env::current_dir().unwrap();
+        let mut rel_root = PathBuf::new();
+        for c in cwd.components() {
+            if matches!(c, std::path::Component::Normal(_)) {
+                rel_root.push("..");
+            }
+        }
+        rel_root.push(root.strip_prefix("/").unwrap());
+        assert!(rel_root.is_relative());
+        assert_eq!(not_build_root(&rel_root.join("tools/gen")), want(&rel_root));
     }
 
     fn fixture_record() -> PatchRecord {
