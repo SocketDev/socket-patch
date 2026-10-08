@@ -14,17 +14,15 @@ use std::path::{Path, PathBuf};
 
 use serde_json::{Map, Value};
 
-use super::{hosted_patch_uuid, vlt, RedirectState};
+use super::hosted_patch_uuid;
 use crate::constants::npm_family::{VLT_HIDDEN_LOCK_REL, VLT_STORE_DIR};
 use crate::manifest::schema::PatchRecord;
 use crate::patch::apply::{is_safe_relative_subpath, normalize_file_path};
 use crate::patch::file_hash::compute_file_git_sha256;
 use crate::patch::package::read_archive_bytes_to_map_strict;
-use crate::utils::purl::purl_parts;
 use crate::utils::purl_key::PurlKey;
 use crate::vendor::vlt_lock_text::{
-    is_default_registry, is_registry_package_name, parse_node_entry_text, sniff_lock, split_dep_id,
-    DepIdKind, LockSniff,
+    is_default_registry, is_registry_package_name, sniff_lock, split_dep_id, DepIdKind, LockSniff,
 };
 
 /// The installed state a target should be in: patched after a redirect,
@@ -102,14 +100,17 @@ pub struct Target<'a> {
     pub flags: Option<u64>,
 }
 
-/// A ledger vlt node of one purl, for the rollback heal.
+/// A Socket-hosted vlt node of one purl, for the rollback heal
+/// ([`lock_targets`]).
 #[derive(Debug, Clone, PartialEq)]
 pub struct LedgerTarget {
     pub purl: String,
     pub dep_id: String,
     pub name: String,
+    /// Always `None`: v5 keeps no hosted ledger to read a record from, so
+    /// the heal judges the installed copy against the lock's own pins.
     pub record: Option<PatchRecord>,
-    /// Slot [0] of the recorded pristine entry.
+    /// Slot [0] of the node in the pre-restore lock.
     pub flags: Option<u64>,
 }
 
@@ -482,64 +483,6 @@ pub fn lock_targets(lock: &str, origins: &[String], purls: &[String]) -> Vec<Led
             })
         })
         .collect()
-}
-
-/// The vlt nodes the ledger's `redirect_vlt_lock_node` edits name for each
-/// of `purls`, with the purl's patch record. With the pre-revert `lock`,
-/// a node vlt re-keyed (a new peer context) is named by the DepID its pin
-/// moved to, since that is where the patched installed copy lives.
-pub fn ledger_targets(
-    state: &RedirectState,
-    purls: &[String],
-    lock: Option<&str>,
-) -> Vec<LedgerTarget> {
-    let mut out: Vec<LedgerTarget> = Vec::new();
-    for purl in purls {
-        let Some((ecosystem, name, version)) = purl_parts(purl) else {
-            continue;
-        };
-        if ecosystem != "npm" {
-            continue;
-        }
-        let record = state
-            .records
-            .iter()
-            .find(|(key, _)| PurlKey::same(key, purl))
-            .map(|(_, record)| record.clone());
-        for edit in &state.edits {
-            if edit.kind != vlt::KIND
-                || !edit
-                    .key
-                    .as_deref()
-                    .is_some_and(|key| vlt::claims_key(key, &name, &version))
-            {
-                continue;
-            }
-            let Some(entry) = edit
-                .original
-                .as_ref()
-                .and_then(Value::as_str)
-                .and_then(parse_node_entry_text)
-            else {
-                continue;
-            };
-            let mut nodes = vec![(entry.key.to_string(), entry.elems[0].parse().ok())];
-            nodes.extend(lock.map_or_else(Vec::new, |text| vlt::carried_pin_ids(text, edit)));
-            for (dep_id, flags) in nodes {
-                if out.iter().any(|t| t.dep_id == dep_id && t.purl == *purl) {
-                    continue;
-                }
-                out.push(LedgerTarget {
-                    purl: purl.clone(),
-                    dep_id,
-                    name: name.clone(),
-                    record: record.clone(),
-                    flags,
-                });
-            }
-        }
-    }
-    out
 }
 
 #[cfg(test)]
@@ -991,91 +934,6 @@ mod tests {
             Some("sha512-D")
         );
         assert!(socket_owned_instances("\u{feff}{}", &[]).is_empty());
-    }
-
-    #[test]
-    fn ledger_targets_follow_the_claimed_edits() {
-        let mut state = RedirectState::new();
-        let edit = |key: &str, id: &str| FileEdit {
-            path: "vlt-lock.json".into(),
-            kind: vlt::KIND.into(),
-            action: "rewritten".into(),
-            key: Some(key.into()),
-            original: Some(Value::String(format!("\"{id}\": [0,\"x\"]"))),
-            new: Some(Value::String(format!("\"{id}\": [0,\"x\",\"s\",\"u\"]"))),
-        };
-        state.edits = vec![
-            edit("left-pad@1.3.0", "~npm~left-pad@1.3.0"),
-            edit("left-pad@1.3.0~peer.2", "~npm~left-pad@1.3.0~peer.2"),
-            edit("left-pad@1.3.1", "~npm~left-pad@1.3.1"),
-        ];
-        state
-            .records
-            .insert("pkg:npm/left-pad@1.3.0".into(), record());
-        let targets = ledger_targets(&state, &["pkg:npm/left-pad@1.3.0".into()], None);
-        let ids: Vec<&str> = targets.iter().map(|t| t.dep_id.as_str()).collect();
-        assert_eq!(ids, ["~npm~left-pad@1.3.0", "~npm~left-pad@1.3.0~peer.2"]);
-        assert!(targets.iter().all(|t| t.record.is_some()));
-        assert!(targets.iter().all(|t| t.flags == Some(0)));
-    }
-
-    #[test]
-    fn ledger_targets_follow_a_pin_vlt_carried_to_a_new_peer_context() {
-        let old_id = "~npm~left-pad@1.3.0~peer.0df72515a50372ba";
-        let new_id = "~npm~left-pad@1.3.0~peer.32643a3290c32d5d";
-        let mut state = RedirectState::new();
-        state.edits = vec![FileEdit {
-            path: "vlt-lock.json".into(),
-            kind: vlt::KIND.into(),
-            action: "rewritten".into(),
-            key: Some("left-pad@1.3.0~peer.0df72515a50372ba".into()),
-            original: Some(Value::String(format!(
-                "\"{old_id}\": [0,\"left-pad\",\"r\"]"
-            ))),
-            new: Some(Value::String(format!(
-                "\"{old_id}\": [0,\"left-pad\",\"s\",\"u\"]"
-            ))),
-        }];
-        let lock = format!(
-            "{{\n  \"lockfileVersion\": 1,\n  \"nodes\": {{\n    \"{new_id}\": \
-             [2,\"left-pad\",\"s\",\"u\"]\n  }},\n  \"edges\": {{}}\n}}\n"
-        );
-        let purls = ["pkg:npm/left-pad@1.3.0".to_string()];
-        let targets: Vec<(String, Option<u64>)> = ledger_targets(&state, &purls, Some(&lock))
-            .into_iter()
-            .map(|t| (t.dep_id, t.flags))
-            .collect();
-        assert_eq!(
-            targets,
-            [(old_id.to_string(), Some(0)), (new_id.to_string(), Some(2))]
-        );
-        let kept = lock.replace(new_id, old_id);
-        assert_eq!(ledger_targets(&state, &purls, Some(&kept)).len(), 1);
-    }
-
-    #[test]
-    fn ledger_targets_carry_the_recorded_flags() {
-        let mut state = RedirectState::new();
-        state.edits = [
-            (0, "~npm~left-pad@1.3.0"),
-            (3, "~npm~left-pad@1.3.0~peer.1"),
-        ]
-        .into_iter()
-        .map(|(flags, id)| FileEdit {
-            path: "vlt-lock.json".into(),
-            kind: vlt::KIND.into(),
-            action: "rewritten".into(),
-            key: Some(id.trim_start_matches("~npm~").into()),
-            original: Some(Value::String(format!("\"{id}\": [{flags},\"left-pad\"]"))),
-            new: None,
-        })
-        .collect();
-        let flags: Vec<Option<u64>> =
-            ledger_targets(&state, &["pkg:npm/left-pad@1.3.0".into()], None)
-                .iter()
-                .map(|t| t.flags)
-                .collect();
-        assert_eq!(flags, [Some(0), Some(3)]);
     }
 
     #[test]
