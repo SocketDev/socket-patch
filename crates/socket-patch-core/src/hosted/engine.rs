@@ -1300,8 +1300,9 @@ pub async fn rewrite(
 ///
 /// A deliberate partial redirect keeps its behavior too: a dep whose
 /// bundled or user-patched copy the rewriters knowingly left on the
-/// registry (`bundled_skipped_uuids`, or a bundled copy in vlt's store;
-/// both are warned and kept out of the in-run VEX), or one withheld from
+/// registry (`bundled_skipped_uuids`, a yarn `npm:` alias entry in
+/// `alias_skipped_entries`, or a bundled copy in vlt's store; all are
+/// warned and kept out of the in-run VEX), or one withheld from
 /// the vlt rewrite while a sibling lock takes it, and a wet vendored→hosted
 /// takeover whose vendored wiring the caller already reverted (both in
 /// `exempt`). Which unreachable copies should block a redirect is the
@@ -1451,6 +1452,7 @@ async fn unattributed_pins(
             !attributed.contains(uuid.as_str())
                 && contested.contains(uuid.as_str())
                 && !done.rewrite.bundled_skipped_uuids.contains(uuid)
+                && !done.rewrite.alias_skipped_entries.contains_key(uuid)
                 && !exempt.contains(uuid)
                 && !vlt_bundled.contains(&crate::utils::purl_key::canonical_base_purl(purl))
         })
