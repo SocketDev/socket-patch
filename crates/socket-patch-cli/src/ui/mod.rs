@@ -3,7 +3,7 @@
 //! - [`StatusLine`]: the one self-rewriting progress line.
 //! - [`confirm`], [`select_one`]: prompts.
 //! - [`print_json`]: the one `--json` document writer.
-//! - [`plural`], [`truncate`]: text shaping.
+//! - [`plural`], [`truncate`], [`sentence_case`]: text shaping.
 //! - [`next_steps`]: the one "Next steps:" block (hosted and vendored).
 //! - [`color_enabled`], [`paint`], [`severity`], [`pad`]: color policy and
 //!   ANSI-aware column alignment.
@@ -24,7 +24,24 @@ use crate::args::GlobalArgs;
 pub(crate) use prompt::confirm;
 pub use prompt::{select_one, SelectError};
 pub(crate) use status::StatusLine;
-pub(crate) use text::{next_steps, plural, truncate};
+pub(crate) use text::{
+    manifest_error_message, next_steps, plural, sentence_case, short_uuid, sweep_failure, truncate,
+};
+
+/// Where a physical copy lives, relative to `cwd` when it is inside it.
+/// Shared by `apply` and `rollback`.
+pub(crate) fn display_copy_path(package_path: &str, cwd: &std::path::Path) -> String {
+    let path = std::path::Path::new(package_path);
+    let canonical = std::fs::canonicalize(path).ok();
+    let rel = path
+        .strip_prefix(cwd)
+        .ok()
+        .or_else(|| canonical.as_deref().and_then(|c| c.strip_prefix(cwd).ok()));
+    match rel {
+        Some(r) if !r.as_os_str().is_empty() => r.display().to_string(),
+        _ => package_path.to_string(),
+    }
+}
 
 /// The one line every declined prompt prints (get, rollback, remove,
 /// `--update`).
@@ -257,6 +274,19 @@ mod tests {
     fn env<'a>(pairs: &'a [(&'a str, &'a str)]) -> impl Fn(&str) -> Option<String> + 'a {
         let map: HashMap<&str, &str> = pairs.iter().copied().collect();
         move |k| map.get(k).map(|v| v.to_string())
+    }
+
+    #[test]
+    fn copy_path_outside_cwd_stays_absolute() {
+        assert_eq!(
+            display_copy_path("/elsewhere/node_modules/x", std::path::Path::new("/p")),
+            "/elsewhere/node_modules/x"
+        );
+        assert_eq!(display_copy_path("/p", std::path::Path::new("/p")), "/p");
+        assert_eq!(
+            display_copy_path("/p/node_modules/é", std::path::Path::new("/p")),
+            "node_modules/é"
+        );
     }
 
     #[test]

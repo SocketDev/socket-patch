@@ -131,9 +131,8 @@ frozen, locked, and ordinary installation outcomes separately where supported.
   manifest-less VEX follows the lock and stops attesting either way.
 - Symlinked `uv.lock`, `pyproject.toml`, `pylock*.toml`, `*.py.lock` and
   script files are discovered for inventory and `repair`, but every writer
-  refuses before touching anything — hosted
-  `redirect_symlinked_file_unsupported`, vendored `pypi_uv_symlink_unsupported`
-  / `pypi_lock_symlink_unsupported` — because uv writes through the link
+  refuses before touching anything with `redirect_symlinked_file_unsupported`
+  (the one symlink code, hosted and vendored alike) — because uv writes through the link
   while socket-patch's atomic stage-and-rename would replace the link with a
   regular file, leaving the target unpatched and the checkout with a type
   change. A symlink that is not one of the files to be written does not block
