@@ -1,7 +1,8 @@
 ### Refactor routine (`refactor`, hourly, highest leverage first)
-_Last updated 2026-10-08T15:16Z · main @ 823810a_
+_Last updated 2026-10-08T16:17Z · main @ 823810a_
 
 **In flight:**
+- [#1145](https://github.com/SocketDev/socket-patch/pull/1145): Gradle's `verification-metadata.xml` and parent-pom reads go through a new `formats::xml` (the pom scanner moved out of `formats::maven`); deletes `gradle.rs`'s `mask_xml_comments`/`xml_elements`/`xml_attr`. Issue #715 (E10, item 6, Gradle half). +282 / −308 production (~120 moved), +123 tests. Only change: CDATA markup is text, malformed verification files refuse. `state: ready`.
 - [#1141](https://github.com/SocketDev/socket-patch/pull/1141): deletes the dead hosted-vlt redirect-ledger helpers (`vlt::{edit_dep_id, lock_node_ids, claims_key, carried_pin_*}`, `vlt_heal::ledger_targets`), gates `jvm::apply::read_project_file` to tests, and pins `lock_targets` with a unit test. Issue #782 (E58, slice 1). +13 / −194 production, +36 / −150 tests. `state: ready`.
 - [#1126](https://github.com/SocketDev/socket-patch/pull/1126): 7 inline `starts_with("pkg:<type>/")` checks (Bun/vlt preflights, PyPI fuzzy match, Coursier sidecar, VEX verify) through `Ecosystem::from_purl`, plus an equivalence table test and a one-sided guard listing 16 pending files. Issue #747 (C20, slice 1). +18 / −9 production, +155 tests. `state: ready`.
 - [#1124](https://github.com/SocketDev/socket-patch/pull/1124): 72 CLI test files use `tests/common`'s `binary()` and `git_sha256` instead of private copies (52 + 45 deleted), plus a one-sided `cli/shared_helper_copies.rs` ratchet. Issue #824 (C30, children 2–3; 68 files in open PRs and the three `vlt_*_common` modules remain). Test-only, +450 / −583. `state: ready`.
@@ -23,14 +24,15 @@ _Last updated 2026-10-08T15:16Z · main @ 823810a_
 | # | Candidate | B | U | D | R | Score | Note |
 |---|---|:-:|:-:|:-:|:-:|:-:|---|
 | 1 | #989 item (was #990): one `vendor::revert::finish` for the 12 copied finish blocks | 0 | 1 | ≈12 | L | ≈26 | skipped: all 12 backend files changed by open PRs |
-| 2 | #594 / #717 (E10): nuget.config and pom.xml edits through the `formats::nuget` / `formats::maven` tokenizers | 3 | 1 | ≈6 | M | ≈21 | skipped: hosted halves in `redirect/mod.rs`; a restore-only slice would make restore disagree with the writer |
-| 3 | #914 (C51): stream agent-mode jar members through one zip-member hasher | 0 | 0 | 1 | L | ≈5 (S 3) | skipped: `patch/jvm_jar.rs` is in #1041 (one test hunk) |
-| 4 | #782 slice 1 (E58): dead hosted-vlt ledger helpers | 0 | 0 | ≈1 | L | ≈2 | **taken: #1141** |
-| 5 | #824 item 4: core's xorshift copies onto `test_rng` | 0 | 0 | 2 | L | ≈4 | test-only; `crawlers/npm_crawler/oracle.rs` (third copy) is in an open PR |
+| 2 | #594 / #717 (E10): nuget.config and pom.xml edits through the `formats::nuget` / `formats::maven` tokenizers | 3 | 1 | ≈6 | M | ≈21 | skipped: hosted halves in `redirect/mod.rs` |
+| 3 | C69 / #836: uv/pylock hosted re-serializes the lock per patched dep (`rewrite_uv_lock`) | 0 | 0 | 0 | L | ≈3 (S 3) | skipped: `redirect/mod.rs` in #1008/#1009/#1026/#1051 |
+| 4 | #715 item 6 (E10): Gradle verification XML through a shared `formats::xml` | 0 | 1 | 3 | L–M | ≈6 | **taken: #1145** |
+| 5 | #1129 (E92): pnpm modules-dir resolution shared by crawler and `pkg_managers` | 1 | 0 | 1 | L | ≈5 | skipped: `npm_crawler.rs` in #1007/#1008/#1009 |
 
-Re-ranked 2026-10-08T15:05Z at `823810a` against 31 open PRs (551 files; 20 `arch-refactor/*` or `agent/fix-*`). #706's remaining digest slice is deferred by the maintainer's backlog review ("Defer the remaining consolidation"), so it is not ranked. Also blocked by open-PR files: #727/#630 items, #705, #913, #675, #780, #936, #1128, #931/#998/#1063/#1123 (every `commands/*` manifest reader).
+Re-ranked 2026-10-08T16:00Z at `823810a` against 32 open PRs (567 files; 482 in `arch-refactor/*` or `agent/fix-*`). #706's remaining digest slice is deferred by the maintainer's backlog review ("Defer the remaining consolidation"), so it is not ranked. Also blocked by open-PR files: #727/#630 items, #705, #913, #675, #780, #936, #1128, #931/#998/#1063/#1123 (every `commands/*` manifest reader).
 
 **Notes:**
+- `formats::xml` (#1145) is the shared XML element scanner (comment + CDATA blanking, `elements`, `children`, `attr`); route new XML readers (NuGet, pom writers) through it instead of a private masker.
 - The skip rule names only `arch-refactor/*` and `agent/fix-*` PRs; `arch-fix/*`, `ci*` and `ci-janitor/*` files are not blockers by the letter, but check their hunks before touching the same lines.
 - A maintainer-closed issue whose backlog note says "Defer" (e.g. #706) is steering: don't rank it until reopened.
 - E35's crawler oracles can't become `golden.rs` digests: their randomized trees (symlinks, modes, case collisions) differ by OS and uid. Keep them until a crawler can be checked without one.
