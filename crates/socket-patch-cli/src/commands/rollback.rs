@@ -14,10 +14,9 @@ use socket_patch_core::patch::rollback::{
     VerifyRollbackResult, VerifyRollbackStatus,
 };
 use socket_patch_core::telemetry::{track_patch_rollback_failed, track_patch_rolled_back};
-use socket_patch_core::utils::composer_version::composer_purls_equivalent;
 use socket_patch_core::utils::purl::{patch_matches, strip_purl_qualifiers};
 use socket_patch_core::vendor::{purl_keys_cover, RevertOpts, VendorState};
-use socket_patch_core::vex::discover::canonical_base_purl;
+use socket_patch_core::vex::discover::{canonical_base_purl, same_release};
 use std::collections::{HashMap, HashSet};
 use std::path::{Path, PathBuf};
 use std::time::Duration;
@@ -1281,16 +1280,14 @@ pub async fn run(args: RollbackArgs) -> i32 {
     };
     for id in &identifiers {
         let found = ledgers.matching(id);
-        let mut matched = !found.is_empty();
+        // Hosted pins live in the lockfiles, not in a store: matched by the
+        // identifier, or as another generation of a matched manifest key.
+        let pins =
+            socket_patch_core::ledgers::hosted_pins_matching(&hosted_pins, id, &found.manifest);
+        let matched = !found.is_empty() || !pins.is_empty();
         manifest_scope.extend(found.manifest);
         vendor_scope.extend(found.vendor.into_iter().map(|(k, _)| k));
-        // Hosted pins live in the lockfiles, not in a store.
-        for (purl, uuid) in &redirect_records {
-            if patch_matches(purl, uuid, id) {
-                hosted_scope.insert(purl.clone());
-                matched = true;
-            }
-        }
+        hosted_scope.extend(pins.into_iter().map(|pin| pin.purl));
         if !matched {
             let hint = if id.starts_with("pkg:") || looks_like_uuid(id) {
                 String::new()
@@ -2863,7 +2860,7 @@ pub(crate) fn superseded_by_hosted(
             let pkg = canonical_base_purl(purl);
             let same: Vec<&HostedPin> = pins
                 .iter()
-                .filter(|pin| pin.purl == pkg || composer_purls_equivalent(&pin.purl, &pkg))
+                .filter(|pin| same_release(&pin.purl, &pkg))
                 .collect();
             if same.iter().any(|pin| pin.uuid == record.uuid) {
                 return None;

@@ -1371,6 +1371,7 @@ mod tests {
                 files: BTreeMap::new(),
                 symlinked_reads: Vec::new(),
                 unreadable_reads: Vec::new(),
+                undecodable_reads: Vec::new(),
                 overrides: Vec::new(),
                 rewrite,
                 rewritten: files.iter().map(|(rel, _)| (*rel).to_string()).collect(),
@@ -1533,7 +1534,7 @@ mod tests {
     /// a repository `.yarnrc.yml` above it, as the disk walk does.
     #[tokio::test]
     async fn nested_yarn_root_follows_an_ancestor_yarnrc_linker() {
-        use crate::vendor::lock_inventory::view::detect_npm_lock_flavor_in;
+        use crate::vendor::npm_flavor::detect_npm_lock_flavor_in;
         let mut files: BTreeMap<String, SharedFile> = BTreeMap::new();
         files.insert(
             ".yarnrc.yml".into(),

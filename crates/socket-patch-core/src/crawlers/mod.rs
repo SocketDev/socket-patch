@@ -31,7 +31,7 @@ pub use go_crawler::GoCrawler;
 pub use maven_crawler::MavenCrawler;
 pub use npm_crawler::{bun_uses_global_store, NpmCrawler};
 pub use nuget_crawler::NuGetCrawler;
-pub use pkg_managers::{detect_npm_pkg_manager, NpmPkgManager};
+pub use pkg_managers::{detect_npm_pkg_manager, NpmPkgManager, YarnPnpLoader};
 pub use python_crawler::PythonCrawler;
 pub use ruby_crawler::RubyCrawler;
 pub use types::*;

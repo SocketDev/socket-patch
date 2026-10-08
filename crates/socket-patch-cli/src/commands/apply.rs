@@ -2713,7 +2713,13 @@ async fn apply_maven_base(m: &MavenBase<'_>) -> MavenApplied {
     let m2_copies: Vec<String> = copies
         .consumed
         .iter()
-        .filter(|c| c.starts_with(&m.scope.env.m2_repo))
+        .filter(|c| {
+            m.scope
+                .env
+                .m2_repo
+                .as_ref()
+                .is_some_and(|m2| c.starts_with(m2))
+        })
         .map(|p| p.display().to_string())
         .collect();
     if matches!(

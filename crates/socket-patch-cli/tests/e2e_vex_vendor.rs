@@ -2445,6 +2445,141 @@ fn reconstructed_ledger_entry_without_wiring_attests_from_the_root_lock() {
     );
 }
 
+/// REVIEW (#1033, audit B04): a pnpm lock that also holds a package with
+/// `bundledDependencies` naming the vendored package (or `true`, bundling
+/// every dependency) ships a copy pnpm unpacks from that package's own
+/// tarball, which no wiring reaches and whose version the lock does not
+/// record. `vex` must not attest the purl (`vex_pnpm_bundled_copy`), but
+/// the wiring itself is intact and no re-vendor could clear the bundled
+/// copy, so `vendor --check` must still verify the entry. Without the
+/// bundling package both attest and verify (the control).
+#[test]
+fn pnpm_bundled_copy_blocks_vex_but_not_vendor_check() {
+    let uuid = "7c8d9e0f-1a2b-4a1b-8c2d-3e4f5a6b7c8d";
+    let purl = "pkg:npm/left-pad@1.3.0";
+    let patched = b"patched left-pad\n";
+    for (label, bundling) in [
+        ("control", ""),
+        (
+            "bundledDependencies: true",
+            "  host-pkg@1.0.0:\n    resolution: {integrity: sha512-HOST==}\n    \
+             bundledDependencies: true\n",
+        ),
+        (
+            "bundledDependencies list",
+            "  host-pkg@1.0.0:\n    resolution: {integrity: sha512-HOST==}\n    \
+             bundledDependencies:\n      - left-pad\n",
+        ),
+    ] {
+        let tmp = tempfile::tempdir().unwrap();
+        let cwd = tmp.path();
+        let rel = format!(".socket/vendor/npm/{uuid}/left-pad-1.3.0.tgz");
+        let sha256 = sha256_hex(&write_member_tgz(
+            &cwd.join(&rel),
+            "package/index.js",
+            patched,
+        ));
+        std::fs::write(
+            cwd.join("pnpm-lock.yaml"),
+            format!(
+                "lockfileVersion: '9.0'\n\nimporters:\n  .:\n    dependencies:\n      \
+                 left-pad:\n        specifier: file:{rel}\n        version: file:{rel}\n\n\
+                 packages:\n  left-pad@file:{rel}:\n    resolution: {{integrity: sha512-xyz==, \
+                 tarball: file:{rel}}}\n    version: 1.3.0\n{bundling}"
+            ),
+        )
+        .unwrap();
+        std::fs::write(
+            cwd.join("package.json"),
+            format!(
+                r#"{{"name":"app","version":"1.0.0","dependencies":{{"left-pad":"file:{rel}"}}}}"#
+            ),
+        )
+        .unwrap();
+        let mut state = VendorState::new();
+        state.entries.insert(
+            purl.to_string(),
+            VendorEntry {
+                ecosystem: "npm".to_string(),
+                base_purl: purl.to_string(),
+                uuid: uuid.to_string(),
+                artifact: VendorArtifact {
+                    yarn_berry10c0: None,
+                    path: rel.clone(),
+                    sha256,
+                    size: None,
+                    platform_locked: None,
+                    file_inventory: None,
+                },
+                wiring: Vec::new(),
+                lock: None,
+                took_over_go_patches: false,
+                detached: true,
+                record: Some(make_record(
+                    uuid,
+                    "package/index.js",
+                    &compute_git_sha256_from_bytes(patched),
+                    "GHSA-bndl-aaaa",
+                    &["CVE-2026-1033"],
+                )),
+                flavor: Some("pnpm".to_string()),
+                uv: None,
+                pnpm: None,
+                poetry: None,
+                pdm: None,
+                pipenv: None,
+            },
+        );
+        std::fs::create_dir_all(cwd.join(".socket/vendor")).unwrap();
+        std::fs::write(
+            cwd.join(".socket/vendor/state.json"),
+            serde_json::to_string_pretty(&state).unwrap(),
+        )
+        .unwrap();
+
+        let check = cli()
+            .args([
+                "vendor",
+                "--check",
+                "--cwd",
+                cwd.to_str().unwrap(),
+                "--json",
+            ])
+            .output()
+            .expect("invoke vendor --check");
+        let check_env: Value = serde_json::from_slice(&check.stdout).unwrap_or_else(|e| {
+            panic!(
+                "{label}: vendor --check envelope JSON on stdout ({e}): {}",
+                String::from_utf8_lossy(&check.stdout)
+            )
+        });
+        assert!(
+            check.status.success(),
+            "{label}: the wiring is intact: {check_env}"
+        );
+
+        let (code, env) = vex_json(cwd, &["--offline"]);
+        if bundling.is_empty() {
+            assert_eq!(code, Some(0), "{label}: {env}");
+            continue;
+        }
+        assert_eq!(code, Some(1), "{label}: {env}");
+        assert!(
+            !cwd.join("out.vex.json").exists(),
+            "{label}: no document may attest the purl: {env}"
+        );
+        let event = skipped_event(&env, purl);
+        assert_eq!(
+            event["errorCode"], "vex_pnpm_bundled_copy",
+            "{label}: {env}"
+        );
+        assert!(
+            env.to_string().contains("host-pkg@1.0.0"),
+            "{label}: the run names the bundling entry: {env}"
+        );
+    }
+}
+
 // ──────────────────────────────────────────────────────────────────────
 // 9. Core discover rule 11: a vendor ledger entry whose artifact the
 // lockfiles still MENTION, but only in a shape the package manager does not
