@@ -34,6 +34,7 @@ use super::{
 };
 
 use super::layout::{self, safe_coordinates};
+use crate::formats::xml::{self, Element};
 
 /// The owned settings script. Its bytes change only with a CLI release.
 pub const SCRIPT: &str = include_str!("socket-patch.settings.gradle");
@@ -2029,31 +2030,27 @@ pub(crate) struct ArtifactHashes {
 /// signatures), so Gradle falls back to these (#487).
 const CHECKSUM_ELEMENTS: [&str; 4] = ["sha256", "sha512", "sha1", "md5"];
 
-/// Whether the artifact element `masked[start..end]` holds a checksum.
-fn has_checksum(masked: &str, start: usize, end: usize) -> bool {
+/// Whether the artifact element `art` of `masked` holds a checksum.
+fn has_checksum(masked: &str, art: &Element) -> bool {
     CHECKSUM_ELEMENTS
         .iter()
-        .any(|name| !xml_elements(masked, start, end, name).is_empty())
+        .any(|name| xml::children(masked, art, name).is_ok_and(|found| !found.is_empty()))
 }
 
-/// The artifact element `text[start..end]` (`tag_end` ends its start tag)
-/// with `<sha256 value=sha origin="socket-patch"/>` added after its other
-/// children, kept otherwise byte for byte.
-fn with_sha256(
-    text: &str,
-    masked: &str,
-    (start, tag_end, end): (usize, usize, usize),
-    sha: &str,
-) -> String {
+/// The artifact element `art` of `text` with `<sha256 value=sha
+/// origin="socket-patch"/>` added after its other children, kept otherwise
+/// byte for byte.
+fn with_sha256(text: &str, masked: &str, art: &Element, sha: &str) -> String {
     const UNIT: &str = "   ";
+    let (start, tag_end, end) = (art.start, art.inner_start, art.end);
     let nl = newline_of(text);
     let indent = line_indent(text, start);
-    let name = xml_attr(&masked[start..tag_end], "name").unwrap_or_default();
+    let name = xml::attr(art.open_tag(masked), "name").unwrap_or_default();
     if tag_end == end {
         return artifact_element(name, sha, &indent, UNIT, nl);
     }
     let el = format!("<sha256 value=\"{sha}\" origin=\"socket-patch\"/>");
-    let close = end - "</artifact>".len();
+    let close = art.inner_end;
     let at = line_start(text, close);
     if at == close {
         // `</artifact>` follows other content on its line.
@@ -2067,41 +2064,51 @@ fn with_sha256(
     format!("{}{child}{el}{nl}{}", &text[start..at], &text[at..end])
 }
 
+/// `text` blanked for scanning ([`xml::blank_non_markup`]); a file that
+/// cannot be scanned (an unterminated CDATA section) reads as having no
+/// elements.
+fn masked_or_blank(text: &str) -> String {
+    xml::blank_non_markup(text).unwrap_or_default()
+}
+
+/// Every `<name>` element of the blanked `masked` (none when it does not
+/// scan).
+fn top_elements(masked: &str, name: &str) -> Vec<Element> {
+    xml::elements(masked, name).unwrap_or_default()
+}
+
+/// Every `<name>` child of `parent` in the blanked `masked` (none when it
+/// does not scan).
+fn child_elements(masked: &str, parent: &Element, name: &str) -> Vec<Element> {
+    xml::children(masked, parent, name).unwrap_or_default()
+}
+
 /// Whether Gradle may verify metadata of the vendored pom's parent chain or
 /// imported platforms that the file does not list (read from the file
 /// repository, the pom is parsed before the `.module` redirect). A parent
 /// the file already lists is fine; imports and platforms always warn.
 pub(crate) fn verifies_metadata(verification: &str) -> bool {
-    let masked = mask_xml_comments(verification);
-    !xml_elements(&masked, 0, masked.len(), "verify-metadata")
+    let masked = masked_or_blank(verification);
+    !top_elements(&masked, "verify-metadata")
         .iter()
-        .any(|&(_, tag_end, end)| {
-            end > tag_end && masked[tag_end..end - "</verify-metadata>".len()].trim() == "false"
-        })
+        .any(|e| e.inner(&masked).trim() == "false")
 }
 
 fn unverified_parent_chain(verification: &str, pom: &str, module: Option<&[u8]>) -> bool {
-    let vm = mask_xml_comments(verification);
+    let vm = masked_or_blank(verification);
     if !verifies_metadata(&vm) {
         return false;
     }
-    let masked = mask_xml_comments(pom);
+    let masked = masked_or_blank(pom);
     if masked.contains("<scope>import</scope>")
         || module.is_some_and(|m| String::from_utf8_lossy(m).contains("\"platform\""))
     {
         return true;
     }
-    let Some(&(_, tag_end, end)) = xml_elements(&masked, 0, masked.len(), "parent").first() else {
+    let Some(parent) = top_elements(&masked, "parent").into_iter().next() else {
         return false;
     };
-    let child = |name: &str| {
-        let (open, close) = (format!("<{name}>"), format!("</{name}>"));
-        let body = &masked[tag_end..end];
-        let s = body.find(&open)? + open.len();
-        body[s..]
-            .find(&close)
-            .map(|e| body[s..s + e].trim().to_string())
-    };
+    let child = |name: &str| xml::child_text(parent.inner(&masked), name).ok().flatten();
     let (Some(g), Some(a), Some(v)) = (child("groupId"), child("artifactId"), child("version"))
     else {
         return true;
@@ -2109,95 +2116,15 @@ fn unverified_parent_chain(verification: &str, pom: &str, module: Option<&[u8]>)
     // Listed means a checksum for the parent pom: a pgp-only entry cannot
     // verify the copy Gradle reads through the vendored repository.
     let pom = format!("{a}-{v}.pom");
-    !xml_elements(&vm, 0, vm.len(), "component")
-        .iter()
-        .any(|&(s, t, e)| {
-            let tag = &vm[s..t];
-            xml_attr(tag, "group") == Some(g.as_str())
-                && xml_attr(tag, "name") == Some(a.as_str())
-                && xml_attr(tag, "version") == Some(v.as_str())
-                && xml_elements(&vm, t, e, "artifact")
-                    .iter()
-                    .any(|&(as_, at, ae)| {
-                        xml_attr(&vm[as_..at], "name") == Some(pom.as_str())
-                            && has_checksum(&vm, at, ae)
-                    })
-        })
-}
-
-/// `text` with every `<!-- … -->` replaced by spaces (same byte offsets), so
-/// commented-out elements are never matched.
-fn mask_xml_comments(text: &str) -> String {
-    let mut bytes = text.as_bytes().to_vec();
-    let mut from = 0;
-    while let Some(j) = text[from..].find("<!--") {
-        let start = from + j;
-        let end = text[start..]
-            .find("-->")
-            .map_or(text.len(), |k| start + k + 3);
-        for b in &mut bytes[start..end] {
-            if *b != b'\n' && *b != b'\r' {
-                *b = b' ';
-            }
-        }
-        from = end;
-    }
-    String::from_utf8(bytes).unwrap_or_default()
-}
-
-/// The value of attribute `name` in the start tag `tag`.
-fn xml_attr<'a>(tag: &'a str, name: &str) -> Option<&'a str> {
-    let mut rest = tag;
-    loop {
-        let at = rest.find(name)?;
-        let before = rest[..at].chars().last();
-        let after = rest[at + name.len()..].trim_start();
-        rest = &rest[at + name.len()..];
-        if !before.is_some_and(char::is_whitespace) {
-            continue;
-        }
-        let Some(after) = after.strip_prefix('=') else {
-            continue;
-        };
-        let after = after.trim_start();
-        let quote = after.chars().next()?;
-        if quote != '"' && quote != '\'' {
-            return None;
-        }
-        let body = &after[1..];
-        return body.find(quote).map(|e| &body[..e]);
-    }
-}
-
-/// Elements named `name` inside `masked[from..to]`: (start, end of start
-/// tag, end of element). Self-closing elements end with their start tag.
-fn xml_elements(masked: &str, from: usize, to: usize, name: &str) -> Vec<(usize, usize, usize)> {
-    let open = format!("<{name}");
-    let close = format!("</{name}>");
-    let mut out = Vec::new();
-    let mut i = from;
-    while let Some(j) = masked[i..to].find(&open) {
-        let s = i + j;
-        let next = masked.as_bytes().get(s + open.len()).copied();
-        if !matches!(next, Some(b' ' | b'\t' | b'\r' | b'\n' | b'>' | b'/')) {
-            i = s + open.len();
-            continue;
-        }
-        let Some(tag_end) = masked[s..to].find('>').map(|k| s + k + 1) else {
-            break;
-        };
-        let end = if masked[..tag_end].ends_with("/>") {
-            tag_end
-        } else {
-            match masked[tag_end..to].find(&close) {
-                Some(k) => tag_end + k + close.len(),
-                None => break,
-            }
-        };
-        out.push((s, tag_end, end));
-        i = end;
-    }
-    out
+    !top_elements(&vm, "component").iter().any(|comp| {
+        let tag = comp.open_tag(&vm);
+        xml::attr(tag, "group") == Some(g.as_str())
+            && xml::attr(tag, "name") == Some(a.as_str())
+            && xml::attr(tag, "version") == Some(v.as_str())
+            && child_elements(&vm, comp, "artifact").iter().any(|art| {
+                xml::attr(art.open_tag(&vm), "name") == Some(pom.as_str()) && has_checksum(&vm, art)
+            })
+    })
 }
 
 fn artifact_element(name: &str, sha: &str, indent: &str, unit: &str, nl: &str) -> String {
@@ -2277,30 +2204,31 @@ fn verification_artifact_edit(
             format!("{VERIFICATION_REL}: {why}"),
         )
     };
-    let masked = mask_xml_comments(text);
+    let masked = xml::blank_non_markup(text).map_err(|why| unparseable(&why))?;
     let nl = newline_of(text);
     const UNIT: &str = "   ";
     let (a, v) = (patch.artifact_id, patch.version);
     let jar_name = file_name.to_string();
 
-    let Some(&(cs_start, cs_tag_end, cs_end)) =
-        xml_elements(&masked, 0, masked.len(), "components").first()
+    let Some(components) = xml::elements(&masked, "components")
+        .map_err(|why| unparseable(&why))?
+        .into_iter()
+        .next()
     else {
         return Err(unparseable("no <components> element"));
     };
-    let self_closing = cs_tag_end == cs_end;
-    let comps = if self_closing {
-        Vec::new()
-    } else {
-        xml_elements(&masked, cs_tag_end, cs_end, "component")
-    };
+    let (cs_start, cs_end) = (components.start, components.end);
+    let self_closing = components.inner_start == cs_end;
+    let comps =
+        xml::children(&masked, &components, "component").map_err(|why| unparseable(&why))?;
     let key = (patch.group_id, a, v);
-    for &(s, tag_end, end) in &comps {
-        let tag = &masked[s..tag_end];
+    for comp in &comps {
+        let (s, tag_end, end) = (comp.start, comp.inner_start, comp.end);
+        let tag = comp.open_tag(&masked);
         let (Some(g), Some(n), Some(ver)) = (
-            xml_attr(tag, "group"),
-            xml_attr(tag, "name"),
-            xml_attr(tag, "version"),
+            xml::attr(tag, "group"),
+            xml::attr(tag, "name"),
+            xml::attr(tag, "version"),
         ) else {
             return Err(unparseable("a <component> lacks group, name or version"));
         };
@@ -2310,17 +2238,18 @@ fn verification_artifact_edit(
         if tag_end == end {
             return Err(unparseable("the patched component is empty"));
         }
-        let arts = xml_elements(&masked, tag_end, end, "artifact");
+        let arts = xml::children(&masked, comp, "artifact").map_err(|why| unparseable(&why))?;
         let comp_indent = line_indent(text, s);
-        for &(as_, at_end, ae) in &arts {
-            if xml_attr(&masked[as_..at_end], "name") == Some(jar_name.as_str()) {
+        for art in &arts {
+            let (as_, ae) = (art.start, art.end);
+            if xml::attr(art.open_tag(&masked), "name") == Some(jar_name.as_str()) {
                 if keep_user {
                     // The user's entry is kept; a pgp-only one gets the
                     // checksum Gradle needs for the vendored repository.
-                    if has_checksum(&masked, at_end, ae) {
+                    if has_checksum(&masked, art) {
                         return Ok((as_, ae, text[as_..ae].to_string()));
                     }
-                    let el = with_sha256(text, &masked, (as_, at_end, ae), &h.jar);
+                    let el = with_sha256(text, &masked, art, &h.jar);
                     return Ok((as_, ae, el));
                 }
                 let indent = line_indent(text, as_);
@@ -2333,10 +2262,10 @@ fn verification_artifact_edit(
         let el = artifact_element(&jar_name, &h.jar, &indent, UNIT, nl);
         let before = arts
             .iter()
-            .find(|&&(as_, at_end, _)| {
-                xml_attr(&masked[as_..at_end], "name").is_some_and(|n| n > jar_name.as_str())
+            .find(|art| {
+                xml::attr(art.open_tag(&masked), "name").is_some_and(|n| n > jar_name.as_str())
             })
-            .map(|&(as_, _, _)| as_);
+            .map(|art| art.start);
         let at = before.map_or_else(
             || line_start(text, end - "</component>".len()),
             |as_| line_start(text, as_),
@@ -2347,7 +2276,7 @@ fn verification_artifact_edit(
     let cs_indent = line_indent(text, cs_start);
     let comp_indent = comps.first().map_or_else(
         || format!("{cs_indent}{UNIT}"),
-        |&(s, _, _)| line_indent(text, s),
+        |comp| line_indent(text, comp.start),
     );
     let art_indent = format!("{comp_indent}{UNIT}");
     let mut arts = vec![
@@ -2375,16 +2304,16 @@ fn verification_artifact_edit(
         let el = format!("<components>{nl}{comp}{cs_indent}</components>");
         return Ok((cs_start, cs_end, el));
     }
-    let before = comps.iter().find(|&&(s, tag_end, _)| {
-        let tag = &masked[s..tag_end];
+    let before = comps.iter().find(|comp| {
+        let tag = comp.open_tag(&masked);
         (
-            xml_attr(tag, "group").unwrap_or(""),
-            xml_attr(tag, "name").unwrap_or(""),
-            xml_attr(tag, "version").unwrap_or(""),
+            xml::attr(tag, "group").unwrap_or(""),
+            xml::attr(tag, "name").unwrap_or(""),
+            xml::attr(tag, "version").unwrap_or(""),
         ) > key
     });
     let at = match before {
-        Some(&(s, _, _)) => line_start(text, s),
+        Some(comp) => line_start(text, comp.start),
         None => line_start(text, cs_end - "</components>".len()),
     };
     Ok((at, at, comp))
@@ -2413,7 +2342,7 @@ pub(crate) fn metadata_record_present(text: &str, record: &WiringRecord) -> bool
     if parts.len() != 3 && parts.len() != 4 {
         return false;
     }
-    let masked = mask_xml_comments(text);
+    let masked = masked_or_blank(text);
     let verifies = verifies_metadata(&masked);
     let name = format!(
         "{}-{}.{}",
@@ -2421,45 +2350,35 @@ pub(crate) fn metadata_record_present(text: &str, record: &WiringRecord) -> bool
         parts[2],
         parts.get(3).unwrap_or(&"pom")
     );
-    xml_elements(&masked, 0, masked.len(), "component")
-        .iter()
-        .any(|&(start, tag_end, end)| {
-            let tag = &masked[start..tag_end];
-            if xml_attr(tag, "group") != Some(parts[0])
-                || xml_attr(tag, "name") != Some(parts[1])
-                || xml_attr(tag, "version") != Some(parts[2])
-            {
+    top_elements(&masked, "component").iter().any(|comp| {
+        let tag = comp.open_tag(&masked);
+        if xml::attr(tag, "group") != Some(parts[0])
+            || xml::attr(tag, "name") != Some(parts[1])
+            || xml::attr(tag, "version") != Some(parts[2])
+        {
+            return false;
+        }
+        child_elements(&masked, comp, "artifact").iter().any(|art| {
+            if xml::attr(art.open_tag(&masked), "name") != Some(name.as_str()) {
                 return false;
             }
-            xml_elements(&masked, tag_end, end, "artifact")
-                .iter()
-                .any(|&(s, t, e)| {
-                    if xml_attr(&masked[s..t], "name") != Some(name.as_str()) {
-                        return false;
-                    }
-                    // With metadata verification on, a pgp-only entry fails
-                    // the build (#487): trees vendored before the fix too.
-                    if verifies && !has_checksum(&masked, t, e) {
-                        return false;
-                    }
-                    match op_str(record, "to") {
-                        None => true,
-                        Some(to) => {
-                            xml_elements(to, 0, to.len(), "sha256")
-                                .iter()
-                                .all(|&(hs, ht, _)| {
-                                    xml_attr(&to[hs..ht], "value").is_some_and(|hash| {
-                                        xml_elements(&masked, t, e, "sha256").iter().any(
-                                            |&(cs, ct, _)| {
-                                                xml_attr(&masked[cs..ct], "value") == Some(hash)
-                                            },
-                                        )
-                                    })
-                                })
-                        }
-                    }
-                })
+            // With metadata verification on, a pgp-only entry fails
+            // the build (#487): trees vendored before the fix too.
+            if verifies && !has_checksum(&masked, art) {
+                return false;
+            }
+            match op_str(record, "to") {
+                None => true,
+                Some(to) => top_elements(to, "sha256").iter().all(|wrote| {
+                    xml::attr(wrote.open_tag(to), "value").is_some_and(|hash| {
+                        child_elements(&masked, art, "sha256")
+                            .iter()
+                            .any(|has| xml::attr(has.open_tag(&masked), "value") == Some(hash))
+                    })
+                }),
+            }
         })
+    })
 }
 
 /// Add only missing parent/BOM metadata to an existing verification file.
@@ -3445,6 +3364,71 @@ mod tests {
                 "wrong refusal reason (the detail names the patch uuid, so it is not printed)"
             );
         }
+    }
+
+    /// The shared scanner (`formats::xml`) fails closed where the private
+    /// one read up to the damage: an unterminated CDATA section, start tag
+    /// or element refuses the edit instead of planning against a prefix.
+    #[test]
+    fn malformed_verification_markup_is_refused() {
+        for bad in [
+            format!("{VM_HEAD}<![CDATA[ <component> {VM_TAIL}"),
+            format!("{VM_HEAD}      <component group=\"com.google.code.gson\" name=\"gson\" version=\"2.10.1\">\n{VM_TAIL}"),
+            format!("{VM_HEAD}      <component group=\"a\" name=\"b\" version=\"1\"{VM_TAIL}"),
+        ] {
+            let files = fs(&[("settings.gradle", ""), (VERIFICATION_REL, &bad)]);
+            let err = run(&files, &patch()).unwrap_err();
+            assert!(
+                err.detail.starts_with("reason: gradle_verification_unparseable: "),
+                "{bad}"
+            );
+        }
+    }
+
+    /// Markup inside `<![CDATA[ … ]]>` is character data to Gradle's XML
+    /// parser, so no reader treats it as a component, an artifact or a
+    /// parent: the same rule `formats::maven` applies to `pom.xml`.
+    #[test]
+    fn cdata_markup_is_never_an_element() {
+        let hidden = |inner: &str| format!("<![CDATA[{inner}]]>");
+        let listed = vm_component("org.apache", "apache", "27", &[("apache-27.pom", "aa")]);
+        let adopted = adopt(
+            VERIFICATION_REL,
+            VERIFICATION_FRAGMENT_KIND,
+            "metadata:org.apache:apache:27:pom",
+        );
+        let vm = format!("{VM_HEAD}{listed}{VM_TAIL}");
+        assert!(metadata_record_present(&vm, &adopted));
+        let cdata = format!("{VM_HEAD}{}{VM_TAIL}", hidden(&listed));
+        assert!(!metadata_record_present(&cdata, &adopted));
+
+        let parent = "<parent><groupId>org.apache</groupId><artifactId>apache</artifactId><version>27</version></parent>";
+        let pom = format!("<project>{parent}</project>");
+        assert!(!unverified_parent_chain(&vm, &pom, None), "listed parent");
+        assert!(
+            unverified_parent_chain(&cdata, &pom, None),
+            "parent hidden in CDATA is unlisted"
+        );
+        let no_parent = format!(
+            "<project><description>{}</description></project>",
+            hidden(parent)
+        );
+        assert!(
+            !unverified_parent_chain(&cdata, &no_parent, None),
+            "no real parent"
+        );
+
+        let off = format!(
+            "{}{VM_TAIL}",
+            VM_HEAD.replace(
+                "<verify-metadata>true</verify-metadata>",
+                &format!(
+                    "<verify-metadata>false</verify-metadata>{}",
+                    hidden("<verify-metadata>true</verify-metadata>")
+                )
+            )
+        );
+        assert!(!verifies_metadata(&off));
     }
 
     #[test]

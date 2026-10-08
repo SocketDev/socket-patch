@@ -130,11 +130,11 @@ jobs:
 
       - name: Cache cargo
         # save-if keeps writes on main so open PRs do not churn the repo's
-        # 10 GiB cache budget; rust-cache's automatic key already includes
-        # the runner OS, so one logical key serves all three builds.
+        # 10 GiB cache budget. Share dependency artifacts with the other
+        # debug=0 E2E builders on the same runner image.
         uses: Swatinem/rust-cache@c19371144df3bb44fab255c43d04cbc2ab54d1c4 # v2.9.1
         with:
-          key: bun-native
+          shared-key: e2e-${{ matrix.os }}
           save-if: ${{ github.ref == 'refs/heads/main' }}
 
       - name: Build CLI
@@ -390,7 +390,7 @@ jobs:
         uses: Swatinem/rust-cache@c19371144df3bb44fab255c43d04cbc2ab54d1c4 # v2.9.1
         with:
           # Keep binaries linked against different glibc versions separate.
-          key: bun-native-binary-${{ matrix.os }}
+          shared-key: e2e-${{ matrix.os }}
           save-if: ${{ github.ref == 'refs/heads/main' }}
 
       - name: Setup Python
