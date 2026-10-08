@@ -415,11 +415,11 @@ jobs:
     # Each PR and main push runs the complete release-mode suite. The merge
     # queue already skips this job because each constituent PR ran it.
     if: github.event.pull_request.draft != true && github.event_name != 'merge_group'
+    runs-on: ubuntu-latest
     strategy:
       fail-fast: false
       matrix:
         shard: [1, 2, 3]
-    runs-on: ubuntu-latest
     # Warm-cache runs still spend 20-23 minutes compiling ~240 optimized
     # test binaries, followed by 5-6 minutes executing them. Split both
     # compilation and execution with the same partitioner as `test`:
