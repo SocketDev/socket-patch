@@ -91,10 +91,11 @@ pub(crate) fn verify_members(
     Ok(())
 }
 
-/// Whether a wheel filename binds an ABI or platform, and its tag triple
-/// for messages. Shared by vendored mode (`vendor_platform_locked`) and the
-/// hosted redirect (`redirect_pypi_platform_wheel`), so both modes call the
-/// same wheels portable.
+/// Whether a wheel filename binds an interpreter, ABI or platform, and its
+/// tag triple for messages. Shared by vendored mode
+/// (`vendor_platform_locked`) and the hosted redirect
+/// (`redirect_pypi_platform_wheel`), so both modes call the same wheels
+/// portable.
 pub(crate) fn wheel_platform_from_filename(wheel_name: &str) -> (bool, String) {
     let stem = wheel_name.strip_suffix(".whl").unwrap_or(wheel_name);
     let parts: Vec<&str> = stem.split('-').collect();
@@ -107,16 +108,28 @@ pub(crate) fn wheel_platform_from_filename(wheel_name: &str) -> (bool, String) {
     }
 }
 
-/// Platform-specific iff the tag triple binds an ABI or platform — `cp311-
-/// none-any` is merely version-bound, `*-cp311-*` / `*-manylinux*` lock the
-/// artifact to this machine's platform.
+/// Platform-specific unless every Python 3 interpreter on every platform
+/// installs the wheel: the ABI must be `none`, the platform `any`, and the
+/// python tag set must hold a generic Python 3 tag. pip accepts `py3` and
+/// `pyXY` (major 3) on any later 3.x, but an interpreter tag (`cp311`,
+/// `pp310`) only on that interpreter version, and `py2` never on Python 3
+/// (#1048). `*-cp311-*` / `*-manylinux*` lock the artifact to this
+/// machine's platform.
 pub(crate) fn tag_is_platform_specific(tag: &str) -> bool {
     let parts: Vec<&str> = tag.split('-').collect();
     match parts.as_slice() {
-        [_py, abi, plat] => *abi != "none" || *plat != "any",
+        [py, abi, plat] => {
+            *abi != "none" || *plat != "any" || !py.split('.').any(is_generic_py3_tag)
+        }
         // Malformed tags can't prove portability — claim platform-locked.
         _ => true,
     }
+}
+
+/// `py3` or `py3<minor>`: a python tag every later Python 3 accepts.
+fn is_generic_py3_tag(tag: &str) -> bool {
+    tag.strip_prefix("py3")
+        .is_some_and(|minor| minor.bytes().all(|b| b.is_ascii_digit()))
 }
 
 #[cfg(test)]

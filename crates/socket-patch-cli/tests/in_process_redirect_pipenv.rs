@@ -556,12 +556,23 @@ async fn live_pipfile_lock_conflict_vetoes_the_requirements_redirect() {
 #[tokio::test]
 #[serial]
 async fn platform_wheel_is_not_pinned_into_the_lock() {
+    assert_wheel_tag_is_not_pinned("cp311-cp311-manylinux_2_17_x86_64.manylinux2014_x86_64")
+        .await;
+}
+
+/// #1048: a pure wheel bound to one interpreter (`cp311-none-any`) fails
+/// `pipenv sync` on every other CPython minor, so it is refused the same
+/// way as a platform-tagged one.
+#[tokio::test]
+#[serial]
+async fn interpreter_bound_wheel_is_not_pinned_into_the_lock() {
+    assert_wheel_tag_is_not_pinned("cp311-none-any").await;
+}
+
+async fn assert_wheel_tag_is_not_pinned(tag: &str) {
     let _major = MajorGuard::set("2026");
     let server = MockServer::start().await;
-    let platform_url = HOSTED_URL.replace(
-        "py2.py3-none-any",
-        "cp311-cp311-manylinux_2_17_x86_64.manylinux2014_x86_64",
-    );
+    let platform_url = HOSTED_URL.replace("py2.py3-none-any", tag);
     mock_api_serving(&server, &platform_url).await;
     let tmp = tempfile::tempdir().unwrap();
     write_project(tmp.path());
