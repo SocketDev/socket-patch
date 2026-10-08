@@ -16,7 +16,7 @@ use socket_patch_core::manifest::schema::{PatchFileInfo, PatchManifest, PatchRec
 use socket_patch_core::patch::apply::{is_valid_blob_hash, select_installed_variants_any};
 use socket_patch_core::patch::apply_lock::{LockError, LockGuard};
 use socket_patch_core::utils::concurrent::{api_concurrency_for, ordered_concurrent};
-use socket_patch_core::utils::purl::{canonical_purl, normalize_purl, strip_purl_qualifiers};
+use socket_patch_core::utils::purl::{normalize_purl, strip_purl_qualifiers};
 use socket_patch_core::utils::purl_key::PurlKey;
 use socket_patch_core::vendor::{load_state, lookup_entry, VendorEntry, VendorState};
 use std::collections::HashMap;
