@@ -258,10 +258,14 @@ jobs:
           # the body is checked against a digest right after. A no-op elsewhere.
           # Tarball from Maven Central's CDN, digest from the Apache archive,
           # which throttles the tarball itself to minutes (ci.yml's copy).
+          # Keep the archive tarball as a fallback for CDN failures.
           file="apache-maven-${MAVEN_VERSION}-bin.tar.gz"
           url="https://repo.maven.apache.org/maven2/org/apache/maven/apache-maven/${MAVEN_VERSION}/${file}"
           sha_url="https://archive.apache.org/dist/maven/maven-3/${MAVEN_VERSION}/binaries/${file}.sha512"
-          curl -fsSL --retry 5 --retry-all-errors --ssl-revoke-best-effort "$url" -o "$RUNNER_TEMP/maven.tgz"
+          if ! curl -fsSL --retry 5 --retry-all-errors --ssl-revoke-best-effort "$url" -o "$RUNNER_TEMP/maven.tgz"; then
+            echo "::warning::Maven Central download failed; falling back to the Apache archive."
+            curl -fsSL --retry 5 --retry-all-errors --ssl-revoke-best-effort "${sha_url%.sha512}" -o "$RUNNER_TEMP/maven.tgz"
+          fi
           curl -fsSL --retry 5 --retry-all-errors --ssl-revoke-best-effort "$sha_url" -o "$RUNNER_TEMP/maven.sha512"
           python -c 'import hashlib, pathlib, os; p=pathlib.Path(os.environ["RUNNER_TEMP"]); assert hashlib.sha512((p/"maven.tgz").read_bytes()).hexdigest() == (p/"maven.sha512").read_text().split()[0]'
           python -m tarfile -e "$RUNNER_TEMP/maven.tgz" "$RUNNER_TEMP"

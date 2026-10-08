@@ -1508,8 +1508,9 @@ jobs:
         # archive.apache.org throttles bulk downloads to 1.5-5.5 minutes per
         # leg. Its sha512 still comes from the Apache archive (Central has
         # none for 3.6.3/3.8.9), so the bytes are checked against a digest
-        # from a second origin. --ssl-revoke-best-effort: see the `test`
-        # job's vexctl step.
+        # from a second origin. If the CDN fails, use the slower archive
+        # tarball rather than losing a whole CI run to a download outage.
+        # --ssl-revoke-best-effort: see the `test` job's vexctl step.
         shell: bash
         env:
           MAVEN_VERSION: ${{ matrix.maven || '3.9.16' }}
@@ -1518,7 +1519,10 @@ jobs:
           file="apache-maven-${MAVEN_VERSION}-bin.tar.gz"
           url="https://repo.maven.apache.org/maven2/org/apache/maven/apache-maven/${MAVEN_VERSION}/${file}"
           sha_url="https://archive.apache.org/dist/maven/maven-${major}/${MAVEN_VERSION}/binaries/${file}.sha512"
-          curl -fsSL --retry 5 --retry-all-errors --ssl-revoke-best-effort "$url" -o "$RUNNER_TEMP/maven.tgz"
+          if ! curl -fsSL --retry 5 --retry-all-errors --ssl-revoke-best-effort "$url" -o "$RUNNER_TEMP/maven.tgz"; then
+            echo "::warning::Maven Central download failed; falling back to the Apache archive."
+            curl -fsSL --retry 5 --retry-all-errors --ssl-revoke-best-effort "${sha_url%.sha512}" -o "$RUNNER_TEMP/maven.tgz"
+          fi
           curl -fsSL --retry 5 --retry-all-errors --ssl-revoke-best-effort "$sha_url" -o "$RUNNER_TEMP/maven.sha512"
           python -c 'import hashlib, pathlib, os; p=pathlib.Path(os.environ["RUNNER_TEMP"]); assert hashlib.sha512((p/"maven.tgz").read_bytes()).hexdigest() == (p/"maven.sha512").read_text().split()[0]'
           # Python accepts native Windows paths for both archive and destination.
