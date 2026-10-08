@@ -172,29 +172,32 @@ pub(crate) async fn vendored_ledger_supplement(
     }
     // `(ledger key, base purl, entry)`; the artifact fallback has no
     // entries to probe, so it never reports unwired keys.
-    let candidates: Vec<(String, String, Option<&socket_patch_core::vendor::VendorEntry>)> =
-        match state {
-            Ok(state) => state
-                .entries
-                .iter()
-                .map(|(key, entry)| {
-                    (
-                        key.clone(),
-                        strip_purl_qualifiers(&entry.base_purl).to_string(),
-                        Some(entry),
-                    )
-                })
-                .collect(),
-            // Corrupt/unreadable ledger (a MISSING file is Ok(empty) above):
-            // recover the vendored set from the committed artifacts, or
-            // `scan --prune` (whose ledger exemption also degrades to empty)
-            // would delete still-vendored packages' manifest entries and blobs.
-            Err(_) => vendored_purls_from_artifacts(common)
-                .await
-                .into_iter()
-                .map(|base| (base.clone(), base, None))
-                .collect(),
-        };
+    let candidates: Vec<(
+        String,
+        String,
+        Option<&socket_patch_core::vendor::VendorEntry>,
+    )> = match state {
+        Ok(state) => state
+            .entries
+            .iter()
+            .map(|(key, entry)| {
+                (
+                    key.clone(),
+                    strip_purl_qualifiers(&entry.base_purl).to_string(),
+                    Some(entry),
+                )
+            })
+            .collect(),
+        // Corrupt/unreadable ledger (a MISSING file is Ok(empty) above):
+        // recover the vendored set from the committed artifacts, or
+        // `scan --prune` (whose ledger exemption also degrades to empty)
+        // would delete still-vendored packages' manifest entries and blobs.
+        Err(_) => vendored_purls_from_artifacts(common)
+            .await
+            .into_iter()
+            .map(|base| (base.clone(), base, None))
+            .collect(),
+    };
     // Composer by release identity: a ledger `@3.0.2.0` is the crawled
     // `@3.0.2`, not a second package to supplement.
     let key = |p: &str| composer_purl_identity(p).unwrap_or_else(|| normalize_purl(p).into_owned());
@@ -1276,7 +1279,10 @@ mod tests {
             )
             .await;
             assert_eq!(
-                out.packages.iter().map(|p| p.purl.as_str()).collect::<Vec<_>>(),
+                out.packages
+                    .iter()
+                    .map(|p| p.purl.as_str())
+                    .collect::<Vec<_>>(),
                 vec!["pkg:npm/left-pad@1.3.0"],
                 "lock={lock:?}"
             );

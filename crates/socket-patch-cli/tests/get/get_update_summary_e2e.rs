@@ -75,7 +75,7 @@ async fn mount_mocks(mock: &MockServer) {
             "files": {
                 "package/index.js": {
                     "beforeHash": "0000000000000000000000000000000000000000000000000000000000000000",
-                    "afterHash":  "1111111111111111111111111111111111111111111111111111111111111111",
+                    "afterHash":  common::git_sha256(b"patched\n"),
                     "blobContent": "cGF0Y2hlZAo=",
                 }
             },

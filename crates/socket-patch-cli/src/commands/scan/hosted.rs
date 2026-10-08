@@ -137,8 +137,9 @@ fn refuse(
 }
 
 /// The apply lock for a WET hosted run: the same `<manifest dir>/apply.lock`
-/// `apply`/`rollback`/`remove`/`vendor` hold, so the takeover pre-reverts,
-/// the ledger merge and the lockfile writes never race them. `acquire`
+/// `apply`/`rollback`/`remove`/`vendor` hold, so the takeover pre-reverts
+/// (lockfiles + the vendored ledger) and the lockfile writes never race
+/// them. `acquire`
 /// creates a missing `.socket/` and the guard's drop unlinks the lock file
 /// and prunes an otherwise-empty `.socket/`, so a run that ends up writing
 /// nothing leaves no residue. Contention / IO failures render through the
@@ -297,13 +298,13 @@ async fn installed_stale_positive_evidence(
 ///   exactly like scan's own discovery; layouts the crawler grows into are
 ///   covered automatically. A `.bundle/config` path the containment guard
 ///   refuses as a write root is still READ here
-///   (`verification_only_gem_paths`): bundler installs into it.
+///   (`bundler_install_homes`): bundler installs into it. The `gem env`
+///   homes are judged only when bundler uses system gems (#1001).
 /// * Records are found BY UUID (the fetch key, stable across purl
-///   spellings): this run's fetched records first, then the redirect
-///   ledger's persisted ones — a re-scan whose `/patches/view` fetch failed
-///   transiently still re-fires from the ledger instead of silently
-///   dropping the warning (`record_fetch_failed` covers the fetch failure
-///   itself). Record availability is part of the candidate filter, and the
+///   spellings) among this run's fetched records; v5 keeps no hosted
+///   ledger to fall back on, so a uuid whose `/patches/view` fetch failed
+///   is not judged (`record_fetch_failed` surfaces that failure). Record
+///   availability is part of the candidate filter, and the
 ///   probe returns before any crawler work (or `gem env` subprocess spawn)
 ///   when no judgment is possible.
 /// * PATCHED means [`verify_patch_record`] `Ok` — the one shared oracle
@@ -326,8 +327,7 @@ async fn gem_stale_install_warnings(
     global: bool,
     global_prefix: Option<std::path::PathBuf>,
     confirmed: &[(String, String)],
-    // This run's fetched records MERGED with the ledger's persisted ones
-    // (the caller hands the post-merge ledger map).
+    // This run's fetched records, by uuid.
     records: &std::collections::BTreeMap<String, socket_patch_core::manifest::schema::PatchRecord>,
     gem_artifact_shas: &std::collections::BTreeMap<(String, String), String>,
 ) -> StaleInstallOutcome {
@@ -361,6 +361,7 @@ async fn gem_stale_install_warnings(
         leaf: String,
         patched: bool,
         positive: bool,
+        project_local: bool,
     }
     let crawler = RubyCrawler::new();
     let options = CrawlerOptions {
@@ -368,17 +369,14 @@ async fn gem_stale_install_warnings(
         global,
         global_prefix,
     };
-    let mut gem_paths = crawler.get_gem_paths(&options).await.unwrap_or_default();
-    // A `.bundle/config` path outside the project is refused as a write
-    // root, yet bundler installs into and loads from it: read it too, or a
-    // stale materialization there never warns (#709). It is this project's
-    // own bundle path, so it takes the project-local remedy.
-    let config_stores = crawler.verification_only_gem_paths(&options).await;
-    for gems_dir in &config_stores {
-        if !gem_paths.contains(gems_dir) {
-            gem_paths.push(gems_dir.clone());
-        }
-    }
+    // Only the homes `bundle install` installs into or reuses, each tagged
+    // project-local or shared by the crawler. That covers a `.bundle/config`
+    // path outside the project, which is refused as a write root but which
+    // bundler installs into and loads from (#709). It leaves out the
+    // `gem env` homes when an explicit Bundler `path` means bundler never
+    // reuses a copy there (#1001), and the project-local tag doesn't depend
+    // on how `--cwd` is spelled (#729).
+    let homes = crawler.bundler_install_homes(&options).await;
     // Every candidate's installed dir in every gem home, one blocking pass
     // (and at most one listing) per home — the per-candidate lookups the
     // loop below consumes, in the same (candidate, home) order.
@@ -386,9 +384,12 @@ async fn gem_stale_install_warnings(
         .iter()
         .map(|(purl, _)| socket_patch_core::utils::purl::strip_purl_qualifiers(purl).to_string())
         .collect();
-    let mut found_per_home = Vec::with_capacity(gem_paths.len());
-    for gems_dir in &gem_paths {
-        found_per_home.push(crawler.find_each_by_purl(gems_dir, &stripped).await);
+    let mut found_per_home = Vec::with_capacity(homes.len());
+    for home in &homes {
+        found_per_home.push((
+            crawler.find_each_by_purl(&home.gems_dir, &stripped).await,
+            home.project_local,
+        ));
     }
     let mut dir_state: std::collections::BTreeMap<std::path::PathBuf, DirJudgment> =
         std::collections::BTreeMap::new();
@@ -396,7 +397,7 @@ async fn gem_stale_install_warnings(
     // the committed archives `bundle install` installs from (#483).
     let app_cache = socket_patch_core::crawlers::ruby_crawler::bundler_app_cache_dir(cwd).await;
     for (index, (purl, record)) in candidates.iter().enumerate() {
-        for found in &found_per_home {
+        for (found, project_local) in &found_per_home {
             let Some(pkg) = &found[index] else {
                 continue;
             };
@@ -413,6 +414,7 @@ async fn gem_stale_install_warnings(
                     leaf: leaf.to_string(),
                     patched: false,
                     positive: false,
+                    project_local: *project_local,
                 });
             let judged = judge_installed_record(&pkg.path, record).await;
             if judged.patched {
@@ -433,8 +435,7 @@ async fn gem_stale_install_warnings(
         if j.patched || !j.positive {
             continue;
         }
-        let project_local =
-            dir.starts_with(cwd) || config_stores.iter().any(|store| dir.starts_with(store));
+        let project_local = j.project_local;
         let mut folded_cache: Option<std::path::PathBuf> = None;
         if project_local {
             let project_cache = app_cache.join(format!("{}.gem", j.leaf));
@@ -629,20 +630,20 @@ pub(super) async fn run_redirect(
 /// ([`socket_patch_core::hosted::engine`], over a
 /// [`ProjectView::Disk`](socket_patch_core::vendor::lock_inventory::ProjectView));
 /// what stays here is what needs the host: reference grants and the other
-/// network fetches, the apply lock (wet runs with a grant), the redirect
-/// ledger load, the vendored→hosted takeover pre-revert (symlink-checked
-/// first), the `pipenv --version` probe, the symlink guard, the ledger
-/// merge-then-persist and the file writes, the gem / Python / vlt
+/// network fetches, the apply lock (wet runs with a grant), the
+/// vendored→hosted takeover pre-revert (symlink-checked first), the
+/// `pipenv --version` probe, the symlink guard, the file writes, the gem /
+/// Python / vlt
 /// stale-install probes, and the optional VEX. Shared VERBATIM by `scan
 /// --mode hosted` (its `--json` arm through the `run_redirect` wrapper, its
 /// human arm through [`boxed_run_redirect_selected`] in `scan/mod.rs`; both
 /// select via `discover_selected`, with no prompt) and by `get --mode
 /// hosted` (which pins the advisory-resolved uuid), so all produce
-/// identical on-disk results for the same selection. The redirect ledger
-/// is loaded HERE, under the apply lock whenever this run holds one (never
-/// handed in pre-loaded: a copy read before the lock could merge over a
-/// concurrent writer's edits); a dry run or a zero-grant run reads it
-/// strictly but writes nothing, quarantine included.
+/// identical on-disk results for the same selection. v5 hosted mode keeps
+/// no ledger (the lockfiles are the only record); the VENDORED ledger the
+/// takeover needs is loaded HERE, under the apply lock whenever this run
+/// holds one (never handed in pre-loaded: a copy read before the lock could
+/// be saved over a concurrent writer's edits).
 ///
 /// `scan_result` must be `Some` exactly when `common.json` is set (the
 /// human/JSON split keys on `common.json`; a `--json` caller passing `None`
@@ -988,7 +989,8 @@ pub(crate) async fn run_redirect_selected(
             socket_patch_core::utils::fs::read_regular_to_string_sync(path).ok()
         })
     };
-    let rewrite_options = || RewriteOptions {
+    let rewrite_options = || {
+        RewriteOptions {
         dry_run: common.dry_run,
         targets_pipenv_lock,
         pipenv_major,
@@ -1000,6 +1002,7 @@ pub(crate) async fn run_redirect_selected(
         npm_allow_remote_config: !common.no_npm_allow_remote_config,
         npm_outer: &npm_outer,
         blocking: true,
+    }
     };
     // The rollout gate plans again without its deferred rows: keep what
     // the second pass needs.
@@ -1091,10 +1094,10 @@ pub(crate) async fn run_redirect_selected(
         std::collections::BTreeMap::new();
     let mut record_warnings: Vec<socket_patch_core::patch::redirect::RewriteWarning> = Vec::new();
 
-    // SYMLINK GUARD (see `engine::guard`) — before the ledger and before any
-    // write, dry runs included, so a dry run predicts the refusal. The
-    // revert side (replay.rs) already refuses linked files, so the write
-    // side must too.
+    // SYMLINK GUARD (see `engine::guard`) — before any write, dry runs
+    // included, so a dry run predicts the refusal. The revert side (the
+    // hosted → upstream restore's staged flush) already refuses linked
+    // files, so the write side must too.
     if let Some(refusal) = engine::guard(&view, &done, &candidates) {
         return refuse(common, scan_result.take(), &refusal);
     }
@@ -1176,8 +1179,8 @@ pub(crate) async fn run_redirect_selected(
     // the writes so the warning describes the project as this run leaves it.
     // Idempotent re-scans re-confirm and re-probe, so the warning keeps
     // firing until the stale materialization is actually gone. Skipped
-    // EXPLICITLY on --dry-run: the probe's ledger-record fallback would
-    // otherwise judge state the run did not (re)create.
+    // EXPLICITLY on --dry-run: nothing was written, so the probe would
+    // judge state the run did not (re)create.
     let gem_stale: StaleInstallOutcome = if common.dry_run {
         StaleInstallOutcome::default()
     } else {
@@ -1330,7 +1333,7 @@ pub(crate) async fn run_redirect_selected(
         // Stale-flagged purls are EXCLUDED from assume_applied: the same-run
         // envelope carries a redirect_gem_stale_install warning proving the
         // installed materialization unpatched, so attesting that purl from
-        // the ledger would contradict the run's own warning. Excluded purls
+        // this run's records would contradict the run's own warning. Excluded purls
         // fall back to `vex`'s normal installed-tree verification.
         // A confirmed uuid whose bundled instance the rewriter had to skip
         // (#469) leaves that copy unpatched, so it too is verified, never
@@ -1745,8 +1748,8 @@ async fn vendored_takeover(
         None
     };
     // Yarn berry twin of the bun gate: the berry rewriter's project-level
-    // refusals (mixed line endings, cacheKey, `.yarnrc.yml`
-    // compressionLevel) must be known before the takeover reverts a
+    // refusals (mixed yarn.lock / package.json line endings, cacheKey,
+    // `.yarnrc.yml` compressionLevel) must be known before the takeover reverts a
     // vendored berry purl, or the revert strips the live vendored patch
     // and the rewriter then refuses the lock. Only entries the
     // vendor ledger wired through the yarn-berry backend are gated (the
@@ -1768,8 +1771,14 @@ async fn vendored_takeover(
                 )
                 .await
                 .ok();
+                let manifest = socket_patch_core::utils::fs::read_regular_to_string(
+                    &common.cwd.join("package.json"),
+                )
+                .await
+                .ok();
                 socket_patch_core::patch::redirect::preflight_yarn_berry_hosted(
                     &lock,
+                    manifest.as_deref(),
                     yarnrc.as_deref(),
                 )
                 .err()
@@ -1875,11 +1884,30 @@ async fn vendored_takeover(
     } else {
         std::collections::HashMap::new()
     };
+    // A PyPI entry is gated on the hosted rewriter's reach after the
+    // revert: requirements.txt pins only the root file (#699), uv pins
+    // only the version the restored lock resolves (#723), and Poetry
+    // refuses every 0.x lock (#945). Checked once per purl, here, because
+    // the uv and Poetry checks read the ledger and the lock on disk.
+    let mut pypi_takeover_refusals: std::collections::HashMap<
+        String,
+        socket_patch_core::patch::redirect::RewriteWarning,
+    > = std::collections::HashMap::new();
+    for (c, entry) in &takeover {
+        let Some(entry) = entry.as_ref().filter(|_| c.purl.starts_with("pkg:pypi/")) else {
+            continue;
+        };
+        if let Err(warning) =
+            socket_patch_core::patch::redirect::preflight_pypi_takeover(&common.cwd, entry).await
+        {
+            pypi_takeover_refusals.insert(c.purl.clone(), warning);
+        }
+    }
     // The takeover refusal (if any) for one candidate: bun gates every
     // npm purl, berry and vlt only their own vendored entries, Gradle each
     // of its own purls, a pypi purl on a platform-tagged grant (#701), and a
-    // requirements.txt entry on the hosted rewriter's reach (it pins only
-    // the root file, #699). Berry also runs
+    // PyPI entry on the hosted rewriter's reach (`pypi_takeover_refusals`
+    // above). Berry also runs
     // the rewriter's per-dep grant gate (a grant without the berry cache
     // checksum is skipped by the rewriter, so reverting first would leave
     // the package in neither mode). A refused purl is never dispatched (see
@@ -1893,10 +1921,9 @@ async fn vendored_takeover(
         if c.purl.starts_with("pkg:pypi/") {
             // A platform-tagged grant is never pinned (#701 / #932): keep
             // the vendored patch rather than revert it to nothing.
-            return entry.and_then(|e| {
-                socket_patch_core::patch::redirect::pypi_platform_wheel_refusal(&c.dep).or_else(
-                    || socket_patch_core::patch::redirect::preflight_requirements_takeover(e).err(),
-                )
+            return entry.and_then(|_| {
+                socket_patch_core::patch::redirect::pypi_platform_wheel_refusal(&c.dep)
+                    .or_else(|| pypi_takeover_refusals.get(&c.purl).cloned())
             });
         }
         if !c.purl.starts_with("pkg:npm/") {
@@ -3382,8 +3409,8 @@ mod tests {
 
     /// Probe invocation with the default surface (project-local discovery,
     /// no artifact shas) — tests override the knobs they exercise.
-    /// `records` is the merged map production hands over (this run's
-    /// fetched records plus the ledger's persisted ones).
+    /// `records` is the map production hands over: this run's fetched
+    /// records, by uuid.
     async fn probe(
         cwd: &std::path::Path,
         confirmed: &[(String, String)],
@@ -3712,25 +3739,22 @@ mod tests {
         );
     }
 
-    /// RE-FIRE guarantee: when this run's record fetch failed (no fresh
-    /// records), the merged map the caller hands over still carries the
-    /// redirect ledger's PERSISTED record under whatever purl key the
-    /// ledger used — and the probe's uuid lookup judges from it, so a
-    /// transient /patches/view failure cannot silently retire the warning
-    /// while the stale materialization is still there.
+    /// The probe links a record to a confirmed purl by uuid alone: a
+    /// record keyed under the API's qualified purl spelling (not the
+    /// confirmed purl) must still judge the stale materialization.
     #[tokio::test]
-    async fn gem_stale_probe_judges_from_persisted_ledger_records() {
+    async fn gem_stale_probe_matches_records_by_uuid_not_purl_key() {
         let stale = tempfile::tempdir().unwrap();
         materialize_gem(stale.path(), GEM_UPSTREAM);
-        // Persisted under the API's qualified spelling, not the confirmed
+        // Keyed under the API's qualified spelling, not the confirmed
         // purl: only the uuid links them.
-        let mut ledger_only = std::collections::BTreeMap::new();
-        ledger_only.insert(format!("{GEM_PURL}?platform=ruby"), gem_record());
-        let out = probe(stale.path(), &one_confirmed(), &ledger_only).await;
+        let mut qualified = std::collections::BTreeMap::new();
+        qualified.insert(format!("{GEM_PURL}?platform=ruby"), gem_record());
+        let out = probe(stale.path(), &one_confirmed(), &qualified).await;
         assert_eq!(
             out.warnings.len(),
             1,
-            "the ledger records must keep the warning firing across flaky fetches"
+            "a record keyed under another purl spelling must still match by uuid"
         );
     }
 
@@ -4744,19 +4768,43 @@ mod tests {
         use super::npm_allow_remote_one_line;
         let hosts = ["patch.socket.dev"];
         let cases = [
-            (npm_allow_remote_configured_detail(&hosts, true, false), "Note: set"),
-            (npm_allow_remote_configured_detail(&hosts, false, false), "Note: set"),
-            (npm_allow_remote_configured_detail(&hosts, true, true), "Note: would set"),
-            (npm_allow_remote_already_detail(&hosts), "Note: .npmrc already"),
-            (npm_allow_remote_user_set_detail(&hosts, "none"), "Warning: npm >=12"),
-            (npm_allow_remote_env_set_detail(&hosts, "npm_config_allow_remote", "none"), "Warning: npm >=12"),
+            (
+                npm_allow_remote_configured_detail(&hosts, true, false),
+                "Note: set",
+            ),
+            (
+                npm_allow_remote_configured_detail(&hosts, false, false),
+                "Note: set",
+            ),
+            (
+                npm_allow_remote_configured_detail(&hosts, true, true),
+                "Note: would set",
+            ),
+            (
+                npm_allow_remote_already_detail(&hosts),
+                "Note: .npmrc already",
+            ),
+            (
+                npm_allow_remote_user_set_detail(&hosts, "none"),
+                "Warning: npm >=12",
+            ),
+            (
+                npm_allow_remote_env_set_detail(&hosts, "npm_config_allow_remote", "none"),
+                "Warning: npm >=12",
+            ),
             (npm_allow_remote_manual_detail(&hosts), "Warning: npm >=12"),
-            (npm_allow_remote_unreadable_detail(&hosts, "is a symlink"), "Warning: npm >=12"),
+            (
+                npm_allow_remote_unreadable_detail(&hosts, "is a symlink"),
+                "Warning: npm >=12",
+            ),
         ];
         for (detail, start) in cases {
             let line = npm_allow_remote_one_line(&detail);
             assert!(line.starts_with(start), "{line}");
-            assert!(!line.contains('\n') && line.ends_with("(details: --verbose)."), "{line}");
+            assert!(
+                !line.contains('\n') && line.ends_with("(details: --verbose)."),
+                "{line}"
+            );
         }
     }
 }

@@ -223,6 +223,68 @@ fn corrupt_manifest_json_envelope_carries_code_and_removes_stale_doc() {
     );
 }
 
+/// A failed run's stale-doc cleanup reads `--output` to check it is
+/// OpenVEX before deleting it. A FIFO there must not block that read: the
+/// run still fails promptly with its own error and leaves the FIFO alone.
+#[cfg(unix)]
+#[test]
+fn failed_run_does_not_block_on_a_fifo_at_output() {
+    use std::os::unix::fs::FileTypeExt;
+    use std::time::{Duration, Instant};
+    let tmp = tempfile::tempdir().unwrap();
+    let cwd = tmp.path();
+    let dir = cwd.join(".socket");
+    std::fs::create_dir_all(&dir).unwrap();
+    std::fs::write(dir.join("manifest.json"), "{not json").unwrap();
+    let fifo = cwd.join("out.vex.json");
+    assert!(Command::new("mkfifo")
+        .arg(&fifo)
+        .status()
+        .unwrap()
+        .success());
+
+    let mut child = cli()
+        .args([
+            "vex",
+            "--cwd",
+            cwd.to_str().unwrap(),
+            "--json",
+            "--output",
+            fifo.to_str().unwrap(),
+            "--product",
+            "pkg:npm/app@1.0.0",
+        ])
+        .stdin(std::process::Stdio::null())
+        .stdout(std::process::Stdio::piped())
+        .stderr(std::process::Stdio::piped())
+        .spawn()
+        .expect("invoke vex");
+    let started = Instant::now();
+    while child.try_wait().unwrap().is_none() {
+        if started.elapsed() > Duration::from_secs(60) {
+            let _ = child.kill();
+            panic!("vex blocked reading the FIFO at --output");
+        }
+        std::thread::sleep(Duration::from_millis(25));
+    }
+    let out = child.wait_with_output().unwrap();
+    assert_eq!(
+        out.status.code(),
+        Some(2),
+        "stdout:\n{}",
+        String::from_utf8_lossy(&out.stdout)
+    );
+    let env: Value = serde_json::from_slice(&out.stdout).expect("envelope JSON on stdout");
+    assert_eq!(env["error"]["code"], "manifest_unreadable", "{env}");
+    assert!(
+        std::fs::symlink_metadata(&fifo)
+            .unwrap()
+            .file_type()
+            .is_fifo(),
+        "a FIFO is not an OpenVEX document and must not be removed"
+    );
+}
+
 // ──────────────────────────────────────────────────────────────────────
 // corrupt pre-v5 redirect ledger → `redirect_ledger_corrupt` WARNING
 //

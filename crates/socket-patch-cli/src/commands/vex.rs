@@ -776,6 +776,26 @@ async fn generate_vex(
     // installed tree is present and running different bytes. Say so — a
     // build that bypasses the vendor wiring is unpatched until the next
     // package-manager install.
+    // A Hatch env is never resynced by an install: Hatch keeps a present
+    // release (#335), so name the remedy that recreates it.
+    let hatch_note = if outcome.vendored_out_of_sync.is_empty() || common.is_global() {
+        String::new()
+    } else {
+        match socket_patch_core::crawlers::hatch_env::hatch_environments(&common.cwd)
+            .await
+            .as_slice()
+        {
+            [] => String::new(),
+            envs => format!(
+                " A Hatch environment keeps an installed release on the next `hatch run`; \
+                 recreate it instead ({}).",
+                envs.iter()
+                    .map(|env| format!("`hatch env remove {}`", env.name))
+                    .collect::<Vec<_>>()
+                    .join(", ")
+            ),
+        }
+    };
     for purl in &outcome.vendored_out_of_sync {
         note_warning(
             warnings,
@@ -785,7 +805,7 @@ async fn generate_vex(
                 "{purl}: the installed tree does not match its vendored artifact; the \
                  attestation is based on the committed .socket/vendor artifact (the lockfile \
                  consumes it), but the live tree carries different bytes — re-run your \
-                 package manager's install to resync it."
+                 package manager's install to resync it.{hatch_note}"
             ),
         );
     }
@@ -1199,7 +1219,9 @@ async fn generate_vex_with_cleanup(
 /// Removal errors are swallowed: the non-zero exit is the contract, the
 /// deletion is hygiene. Returns whether a document was actually removed.
 async fn remove_stale_vex_doc(path: &Path) -> bool {
-    let Ok(bytes) = tokio::fs::read(path).await else {
+    // FIFO-safe read: `--vex` can name any path, and a plain read of a FIFO
+    // there would block this failure path forever.
+    let Ok(bytes) = socket_patch_core::utils::fs::read_regular_to_bytes(path).await else {
         return false;
     };
     let is_openvex = serde_json::from_slice::<serde_json::Value>(&bytes)

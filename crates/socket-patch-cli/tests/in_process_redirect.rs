@@ -851,9 +851,10 @@ async fn scan_redirect_rewrites_crlf_and_bom_yarn_berry_locks_and_rollback_resto
             "{label}: rollback restores the pristine CRLF lock (upstream checksum \
              re-derived from the registry tarball)"
         );
-        let pkg: serde_json::Value =
-            serde_json::from_str(&std::fs::read_to_string(tmp.path().join("package.json")).unwrap())
-                .unwrap();
+        let pkg: serde_json::Value = serde_json::from_str(
+            &std::fs::read_to_string(tmp.path().join("package.json")).unwrap(),
+        )
+        .unwrap();
         assert!(
             pkg.get("resolutions").is_none(),
             "{label}: rollback drops the resolutions pin: {pkg}"
@@ -1052,6 +1053,52 @@ async fn scan_redirect_refuses_a_mixed_line_ending_yarn_berry_lock() {
     let detail = redirect_warning_detail(&env, "redirect_yarn_berry_mixed_line_endings");
     assert!(detail.contains("yarn install"), "remedy named: {detail}");
     assert_eq!(std::fs::read(&lock_path).unwrap(), before, "untouched");
+    assert!(
+        !tmp.path()
+            .join(".socket/vendor/redirect-state.json")
+            .exists(),
+        "no ledger for a refused rewrite"
+    );
+}
+
+/// #628: the root `package.json` of a berry project is a file the hosted
+/// rewrite edits (its `resolutions`), so a manifest mixing CRLF and LF is
+/// refused like a mixed lock — the same decision vendored mode takes with
+/// `vendor_yarn_berry_mixed_line_endings` — instead of being re-rendered in
+/// its majority ending, which rewrote lines the user never touched and
+/// left rollback no original bytes to restore. Nothing is written.
+#[tokio::test]
+#[serial]
+async fn scan_redirect_refuses_a_mixed_line_ending_yarn_berry_manifest() {
+    let server = MockServer::start().await;
+    mock_discovery(&server).await;
+    mock_reference_with_berry(&server).await;
+    mock_view(&server).await;
+
+    let tmp = tempfile::tempdir().unwrap();
+    write_berry_project_spelled(tmp.path(), |t| t.to_string());
+    let pkg_path = tmp.path().join("package.json");
+    std::fs::write(
+        &pkg_path,
+        format!(
+            "{{\r\n  \"name\": \"consumer\",\n  \"version\": \"0.0.0\",\r\n  \
+             \"dependencies\": {{ \"{NAME}\": \"^{VERSION}\" }}\r\n}}\r\n"
+        ),
+    )
+    .unwrap();
+    let lock_path = tmp.path().join("yarn.lock");
+    let (pkg_before, lock_before) = (
+        std::fs::read(&pkg_path).unwrap(),
+        std::fs::read(&lock_path).unwrap(),
+    );
+
+    let env = run_redirect_subprocess(tmp.path(), &server.uri());
+    assert_eq!(env["redirect"]["redirected"], 0, "{env:#}");
+    let detail = redirect_warning_detail(&env, "redirect_yarn_berry_mixed_line_endings");
+    assert!(detail.contains("package.json"), "names the file: {detail}");
+    assert!(detail.contains("yarn install"), "remedy named: {detail}");
+    assert_eq!(std::fs::read(&pkg_path).unwrap(), pkg_before, "untouched");
+    assert_eq!(std::fs::read(&lock_path).unwrap(), lock_before, "untouched");
     assert!(
         !tmp.path()
             .join(".socket/vendor/redirect-state.json")

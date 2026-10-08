@@ -24,7 +24,11 @@ supported; vendored groups are refused because Hatch does not expand
 `{root:uri}` within dependency groups. Unknown direct sources require an
 explicit revert before patching. A hosted scan re-pins socket-patch's own
 earlier hosted reference (same package and version on the patch server)
-when the grant rotates or a newer patch supersedes it.
+when the grant rotates or a newer patch supersedes it. A vendored scan
+re-vendors socket-patch's own earlier vendored reference to a newer patch
+of the same release when the vendor ledger still records it: the older
+entry's wiring is reverted and the new wheel is wired in its place, so
+`vendor --revert` still restores the original declaration.
 
 Repeated vendored scans compare the declared source with the committed
 artifact path and digest, and verify an existing wheel's bytes. Missing
@@ -35,10 +39,23 @@ the direct-reference permission. Selective and preserved rollback retain the set
 project direct reference remains, and restore its original value after the
 last reference is unwired.
 
+Existing environments: Hatch keeps a project's environments out of tree
+(`<data dir>/env/virtual/<project>/<id>/<env>`, or `HATCH_DATA_DIR`,
+`[dirs.env] virtual`, an env's `path`; Hatch 1.0-1.2 use
+`<project>-<id>/<env>`), and on the next `hatch run` its pip installer (and
+uv before Hatch 1.16) keeps the release already installed there. Socket
+Patch finds those environments itself: a hosted scan warns
+`redirect_pypi_stale_install`, a vendored one `pypi_hatch_stale_install`,
+both naming `hatch env remove <env>` / `hatch env prune`; hosted `vex`
+does not attest over a stale env, and vendored `vex` discloses it with
+`vendored_tree_out_of_sync`. Agent mode crawls the same environments.
+
 Focused Rust checks:
 
 ```sh
 cargo test --locked -p socket-patch-core --lib hatch
+# real Hatch, existing envs (needs uv + PyPI):
+SOCKET_PATCH_HATCH_E2E_REQUIRED=1 cargo test -p socket-patch-cli --test e2e_vex_build -- hatch::hatch_existing_env --ignored
 ```
 
 The depscan companion PR runs real released Hatch binaries, actual CLI
