@@ -802,7 +802,13 @@ impl JvmScope {
         for path in paths {
             if self.is_read_only(path) {
                 out.read_only.push(path.clone());
-            } else if path.starts_with(&self.env.m2_repo) && !self.m2_consumed() {
+            } else if self
+                .env
+                .m2_repo
+                .as_ref()
+                .is_some_and(|m2| path.starts_with(m2))
+                && !self.m2_consumed()
+            {
                 out.m2_ignored.push(path.clone());
             } else {
                 out.consumed.push(path.clone());

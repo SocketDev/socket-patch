@@ -12,7 +12,7 @@
 //! Cargo.lock dependents check refuses a crate one of them depends on.
 
 use std::collections::BTreeSet;
-use std::path::{Component, Path};
+use std::path::Path;
 use std::sync::Arc;
 
 use toml_edit::{DocumentMut, Item, Table};
@@ -204,10 +204,13 @@ impl ManifestFacts {
 static FACTS_MEMO: ParseMemo<ManifestFacts, 512> = ParseMemo::new();
 
 fn read_manifest(path: &Path) -> Option<Arc<ManifestFacts>> {
+    // A symlinked manifest is not followed; the read itself is the
+    // non-blocking regular-file one, so a FIFO swapped in after the
+    // `lstat` fails fast instead of wedging in open(2).
     if !std::fs::symlink_metadata(path).is_ok_and(|m| m.is_file()) {
         return None;
     }
-    let text = std::fs::read_to_string(path).ok()?;
+    let text = crate::utils::fs::read_regular_to_string_sync(path).ok()?;
     FACTS_MEMO
         .parse(text.as_bytes(), || {
             text.parse::<DocumentMut>()
@@ -336,26 +339,10 @@ fn path_dependencies(doc: &DocumentMut) -> Vec<String> {
 /// `base/rel` lexically normalized to a repo-relative slash path; `None`
 /// when it is absolute or climbs out of the root.
 pub(crate) fn normalize_rel(base: &str, rel: &str) -> Option<String> {
-    let rel = rel.replace('\\', "/");
-    if rel.starts_with('/') || Path::new(&rel).is_absolute() {
+    if crate::utils::relpath::is_anchored(rel) {
         return None;
     }
-    let mut parts: Vec<String> = base
-        .split('/')
-        .filter(|s| !s.is_empty())
-        .map(str::to_string)
-        .collect();
-    for component in Path::new(&rel).components() {
-        match component {
-            Component::Normal(seg) => parts.push(seg.to_str()?.to_string()),
-            Component::CurDir => {}
-            Component::ParentDir => {
-                parts.pop()?;
-            }
-            Component::RootDir | Component::Prefix(_) => return None,
-        }
-    }
-    Some(parts.join("/"))
+    crate::utils::relpath::resolve_rel(base, rel, 0)
 }
 
 /// The directory names a cargo glob never descends into: its build
@@ -451,6 +438,19 @@ fn wildcard_match(pattern: &[u8], name: &[u8]) -> bool {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    /// B74: a FIFO at `Cargo.toml` reads as "no manifest" and returns at
+    /// once (the lstat rejects it; the read behind it is the non-blocking
+    /// regular-file one, so a FIFO swapped in after the lstat fails fast too).
+    #[cfg(unix)]
+    #[test]
+    fn read_manifest_rejects_a_fifo_without_blocking() {
+        let tmp = tempfile::tempdir().unwrap();
+        let path = tmp.path().join("Cargo.toml");
+        let c = std::ffi::CString::new(path.to_str().unwrap()).unwrap();
+        assert_eq!(unsafe { libc::mkfifo(c.as_ptr(), 0o600) }, 0);
+        assert!(read_manifest(&path).is_none());
+    }
 
     fn write(root: &Path, rel: &str, content: &str) {
         let path = root.join(rel);

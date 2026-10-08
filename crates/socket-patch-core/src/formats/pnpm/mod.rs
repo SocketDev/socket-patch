@@ -32,7 +32,9 @@ pub(crate) mod workspace;
 
 pub use version::root_only_workspace_breaks_add;
 
-pub(crate) use grammar::{entry_field, is_pnpm_lock_text, Entry, Resolution};
+pub(crate) use grammar::{
+    entry_bundled, entry_field, is_pnpm_lock_text, Bundled, Entry, Resolution,
+};
 pub(crate) use hosted::plan_hosted;
 
 use std::collections::HashSet;

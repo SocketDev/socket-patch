@@ -286,6 +286,7 @@ fn single_walk_golang_rewrite_matches_golden() {
         "redirect_golang_gosum_prune",
         "redirect_golang_stale_replace_removed",
         "redirect_golang_stale_gosum_removed",
+        "redirect_golang_superseded_gosum_removed",
     ] {
         assert!(kinds.contains(kind), "no case reached {kind}: {kinds:?}");
     }

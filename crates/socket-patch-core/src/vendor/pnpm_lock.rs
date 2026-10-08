@@ -519,10 +519,11 @@ impl ProjectLock {
 /// `--frozen-lockfile` install on the branch over the overrides the
 /// manifest gained. Also raised by the flavor probe when the branch lock
 /// is the only one.
-pub(super) async fn git_branch_lock_refusal(project_root: &Path) -> Option<(&'static str, String)> {
+pub(super) async fn git_branch_lock_refusal(
+    view: &crate::vendor::lock_inventory::ProjectView<'_>,
+) -> Option<(&'static str, String)> {
     use crate::utils::pnpm_workspace::{git_branch_locks, GitBranchLocks};
-    let view = crate::vendor::lock_inventory::ProjectView::Disk(project_root);
-    let branch = git_branch_locks(&view).await?;
+    let branch = git_branch_locks(view).await?;
     Some((
         "vendor_pnpm_git_branch_lockfile",
         format!(
@@ -561,7 +562,11 @@ async fn read_project(
             )));
         }
     };
-    if let Some(refusal) = git_branch_lock_refusal(project_root).await {
+    if let Some(refusal) = git_branch_lock_refusal(
+        &crate::vendor::lock_inventory::ProjectView::Disk(project_root),
+    )
+    .await
+    {
         return Err(Box::new(refused(refusal.0, refusal.1)));
     }
     let lock_text = match read_regular_to_string(&project_root.join(PNPM_LOCK)).await {
@@ -4310,9 +4315,7 @@ snapshots:
         // As the refusal spells it: canonical (Windows expands 8.3 names),
         // without the verbatim prefix.
         let governing = crate::utils::pnpm_workspace::without_verbatim_prefix(
-            std::fs::canonicalize(ws_root)
-                .unwrap()
-                .join(PNPM_WORKSPACE),
+            std::fs::canonicalize(ws_root).unwrap().join(PNPM_WORKSPACE),
         );
         for dry_run in [true, false] {
             let outcome = crate::vendor::test_support::vendor_pnpm(
