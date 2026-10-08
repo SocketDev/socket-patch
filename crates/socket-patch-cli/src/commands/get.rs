@@ -23,6 +23,7 @@ use socket_patch_core::utils::concurrent::{api_concurrency_for, ordered_concurre
 use socket_patch_core::utils::purl::{
     canonical_purl, is_purl, normalize_purl, strip_purl_qualifiers,
 };
+use socket_patch_core::utils::purl_key::PurlKey;
 use socket_patch_core::vendor::{load_state, lookup_entry, VendorEntry, VendorState};
 use std::collections::HashMap;
 use std::fmt;
@@ -1430,9 +1431,8 @@ struct InstalledNarrowing {
 /// runs — the coarse layer above [`filter_to_installed_releases`]'s
 /// per-release variant narrowing (which still runs later, unchanged).
 ///
-/// Presence evidence per result purl (compared on
-/// `normalize_purl(strip_purl_qualifiers(..))` — API purls are
-/// percent-encoded/qualified, crawler purls literal):
+/// Presence evidence per result purl (compared by [`PurlKey`] — API purls
+/// are percent-encoded/qualified/mixed-case, crawler purls literal):
 /// * installed on disk — `find_packages_for_rollback` over the deduped base
 ///   purls (the qualified-aware resolver; memory invariant);
 /// * already tracked in the manifest — the user opted this purl in earlier,
@@ -1465,8 +1465,6 @@ async fn filter_to_installed_purls(
     use socket_patch_core::vendor::lock_inventory;
     use std::collections::HashSet;
 
-    let canon = canonical_purl;
-
     // Deduped base purls, probed against the installed tree. The resolver
     // keys its result by the purls we pass, so canonicalize the found keys
     // the same way as the membership probes below.
@@ -1480,14 +1478,14 @@ async fn filter_to_installed_purls(
     };
     let partitioned = partition_purls(&bases, None);
     let found = find_packages_for_rollback(&partitioned, &common.crawler_options(), true).await;
-    let mut present: HashSet<String> = found.keys().map(|k| canon(k)).collect();
+    let mut present: HashSet<PurlKey> = found.keys().map(|k| PurlKey::new(k)).collect();
 
     let ctx = super::context::ProjectContext::rooted(common, common.cwd.clone());
     // Manifest membership counts as presence (read-only probe: a corrupt
     // manifest degrades to "no extension" here — the download path's
     // fail-closed read still guards every write).
     if let Some(manifest) = ctx.ledgers().await.manifest {
-        present.extend(manifest.patches.keys().map(|k| canon(k)));
+        present.extend(manifest.patches.keys().map(|k| PurlKey::new(k)));
     }
 
     // scan's lockfile + vendored-ledger discovery supplements (and their
@@ -1498,11 +1496,11 @@ async fn filter_to_installed_purls(
         let supplement = super::scan::project_lockfile_supplement(&ctx, &[], None).await;
         pnp_diags = supplement.unsupported;
         if mode != super::scan::ScanMode::Agent {
-            present.extend(supplement.entries.iter().map(|e| canon(&e.purl)));
+            present.extend(supplement.entries.iter().map(|e| PurlKey::new(&e.purl)));
             let vendored =
                 super::scan::project_vendored_supplement(common, &[], &ctx.loaded().await.vendor)
                     .await;
-            present.extend(vendored.packages.iter().map(|p| canon(&p.purl)));
+            present.extend(vendored.packages.iter().map(|p| PurlKey::new(&p.purl)));
         }
     }
 
@@ -1536,7 +1534,7 @@ async fn filter_to_installed_purls(
         warnings,
     };
     for result in accessible {
-        if present.contains(&canon(&result.purl)) {
+        if present.contains(&PurlKey::new(&result.purl)) {
             out.kept.push(result.clone());
             continue;
         }
@@ -1565,7 +1563,7 @@ async fn filter_to_installed_purls(
             // nothing — so it carries the same `package_not_installed` code
             // a non-PnP pnpm project would get; only an UNREADABLE lock
             // (no judgment possible) keeps the layout-refusal code.
-            let decoded = canon(&result.purl);
+            let decoded = canonical_purl(&result.purl);
             let coord = decoded.strip_prefix("pkg:npm/").unwrap_or(&decoded);
             if mode == super::scan::ScanMode::Hosted {
                 match (&pnpm_pnp_lock, coord.rsplit_once('@')) {
@@ -1780,7 +1778,8 @@ async fn lock_text_refusals_for(
         )
         .await,
     );
-    let claimed: Vec<String> = pins.iter().map(|pin| canonical_purl(&pin.purl)).collect();
+    let claimed: std::collections::HashSet<PurlKey> =
+        pins.iter().map(|pin| PurlKey::new(&pin.purl)).collect();
     let fetchable: Vec<&PatchSearchResult> = selected
         .iter()
         .filter(|sr| bun_refusal.filter(|r| r.applies_to(&sr.purl)).is_none())
@@ -1791,7 +1790,7 @@ async fn lock_text_refusals_for(
         .collect();
     let candidates: Vec<(&str, &str)> = fetchable
         .iter()
-        .filter(|sr| !claimed.contains(&canonical_purl(&sr.purl)))
+        .filter(|sr| !claimed.contains(&PurlKey::new(&sr.purl)))
         .map(|sr| (sr.purl.as_str(), sr.uuid.as_str()))
         .collect();
     let refused = socket_patch_core::vendor::lock_text_refusals(cwd, &candidates).await;
@@ -1815,7 +1814,7 @@ async fn lock_text_refusals_for(
             cwd,
             fetchable
                 .iter()
-                .filter(|sr| claimed.contains(&canonical_purl(&sr.purl)))
+                .filter(|sr| claimed.contains(&PurlKey::new(&sr.purl)))
                 .map(|sr| sr.purl.as_str()),
             &pins,
             false,
@@ -2389,8 +2388,8 @@ async fn run_nested_apply(
 /// qualified record (apply keys a release-variant base by its base purl).
 /// A qualified key never covers a sibling variant.
 fn apply_key_covers(key: &str, record: &str) -> bool {
-    let (key, record) = (normalize_purl(key), normalize_purl(record));
-    key == record || (!key.contains(['?', '#']) && record.split(['?', '#']).next() == Some(&*key))
+    PurlKey::qualified(key) == PurlKey::qualified(record)
+        || (!key.trim().contains(['?', '#']) && PurlKey::same(key, record))
 }
 
 /// Fold a failed nested apply into a `get` / `scan --mode agent` JSON
@@ -2433,7 +2432,8 @@ fn fold_apply_failures(
             }
         }
         let appended = patches[selected..].iter().any(|r| {
-            normalize_purl(r["purl"].as_str().unwrap_or_default()) == normalize_purl(&failure.purl)
+            PurlKey::qualified(r["purl"].as_str().unwrap_or_default())
+                == PurlKey::qualified(&failure.purl)
         });
         if !hit && !appended {
             let mut rec = serde_json::json!({

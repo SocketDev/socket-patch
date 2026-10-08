@@ -149,7 +149,7 @@ pub(crate) fn resolve_options(options: &HostedScanOptions) -> Result<ResolvedOpt
             .in_flight_patches
             .iter()
             .flatten()
-            .map(|p| crate::rollout::canonical_base_purl(p))
+            .map(|p| crate::utils::purl_key::PurlKey::new(p).into_string())
             .collect(),
         policy_overrides,
         policy_paths,

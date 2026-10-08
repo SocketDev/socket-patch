@@ -29,9 +29,9 @@ use std::path::Path;
 use crate::manifest::schema::{PatchManifest, PatchRecord};
 use crate::patch::redirect::upstream::HostedPin;
 use crate::patch::redirect::{CorruptRedirectState, RedirectState};
-use crate::utils::purl::{normalize_purl, patch_matches, strip_purl_qualifiers};
+use crate::utils::purl::{canonical_purl, patch_matches};
+use crate::utils::purl_key::PurlKey;
 use crate::vendor::{VendorEntry, VendorState};
-use crate::vex::discover::{canonical_base_purl, same_release};
 
 /// A patch store, in owner-precedence order (a lower store wins a key).
 #[derive(Debug, Clone, Copy, PartialEq, Eq, PartialOrd, Ord, Hash)]
@@ -150,7 +150,7 @@ pub fn hosted_pins_matching(
             patch_matches(&pin.purl, &pin.uuid, identifier)
                 || manifest_keys
                     .iter()
-                    .any(|key| same_release(&canonical_base_purl(key), &pin.purl))
+                    .any(|key| PurlKey::same(key, &pin.purl))
         })
         .cloned()
         .collect();
@@ -372,9 +372,10 @@ impl<'a> Ledgers<'a> {
         }
     }
 
-    /// The purls both the hosted records and the vendored ledger claim,
-    /// canonical (qualifiers dropped, percent-decoded), sorted: each is
-    /// stale in exactly one store, which only the live lockfile can tell.
+    /// The purls both the hosted records and the vendored ledger claim, in
+    /// the records' display spelling ([`canonical_purl`]: qualifiers
+    /// dropped, percent-decoded), sorted and deduplicated: each is stale in
+    /// exactly one store, which only the live lockfile can tell.
     pub fn hosted_vendored_overlap(&self) -> Vec<String> {
         let (Some(redirect), Some(vendor)) = (self.redirect, self.vendor) else {
             return Vec::new();
@@ -382,22 +383,32 @@ impl<'a> Ledgers<'a> {
         if vendor.entries.is_empty() {
             return Vec::new();
         }
-        // Canonicalize both sides (drop qualifiers, percent-decode) so the API
-        // purl form the redirect records carry matches the vendor entry's base
-        // purl — mirrors `vendored_ledger_supplement`.
-        let canon = |p: &str| normalize_purl(strip_purl_qualifiers(p)).into_owned();
-        let mut vendor_purls: std::collections::BTreeSet<String> =
-            std::collections::BTreeSet::new();
-        for (key, entry) in &vendor.entries {
-            vendor_purls.insert(canon(key));
-            vendor_purls.insert(canon(&entry.base_purl));
+        // Match by `PurlKey`, so the API purl form the redirect records carry
+        // matches the vendor entry's key or base purl in any spelling.
+        // Two spellings of one release (composer `@3.0.2` and
+        // `@3.0.2.0`, NuGet case twins) are ONE overlap: deduplicate by
+        // `PurlKey`, reporting the smallest display spelling.
+        let vendor_purls = vendor.purl_keys();
+        let mut overlap: std::collections::BTreeMap<PurlKey, String> =
+            std::collections::BTreeMap::new();
+        for purl in redirect
+            .records
+            .keys()
+            .filter(|p| crate::vendor::purl_keys_cover(&vendor_purls, p))
+        {
+            let display = canonical_purl(purl);
+            overlap
+                .entry(PurlKey::new(purl))
+                .and_modify(|kept| {
+                    if display < *kept {
+                        *kept = display.clone();
+                    }
+                })
+                .or_insert(display);
         }
-        let redirect_purls: std::collections::BTreeSet<String> =
-            redirect.records.keys().map(|p| canon(p)).collect();
-        redirect_purls
-            .intersection(&vendor_purls)
-            .cloned()
-            .collect()
+        let mut out: Vec<String> = overlap.into_values().collect();
+        out.sort();
+        out
     }
 }
 
@@ -619,6 +630,39 @@ mod tests {
         assert!(l.matching("nope").is_empty());
         assert_eq!(l.matching("hb").hosted, vec!["pkg:npm/b@1"]);
     }
+
+    #[test]
+    fn overlap_reports_one_entry_per_release_across_spellings() {
+        let v = vendor(vec![
+            (
+                "pkg:nuget/newtonsoft.json@13.0.1",
+                entry("v", "pkg:nuget/newtonsoft.json@13.0.1", true, None),
+            ),
+            (
+                "pkg:composer/acme/lib@3.0.2",
+                entry("c", "pkg:composer/acme/lib@3.0.2", true, None),
+            ),
+        ]);
+        let r = redirect(&[
+            ("pkg:nuget/Newtonsoft.Json@13.0.1", "h1"),
+            ("pkg:nuget/newtonsoft.json@13.0.1", "h2"),
+            ("pkg:composer/acme/lib@3.0.2", "h3"),
+            ("pkg:composer/acme/lib@3.0.2.0", "h4"),
+        ]);
+        let l = Ledgers {
+            manifest: None,
+            vendor: Some(&v),
+            redirect: Some(&r),
+        };
+        assert_eq!(
+            l.hosted_vendored_overlap(),
+            vec![
+                "pkg:composer/acme/lib@3.0.2".to_string(),
+                "pkg:nuget/Newtonsoft.Json@13.0.1".to_string(),
+            ]
+        );
+    }
+
     /// #999: a uuid identifier that matches the manifest's generation also
     /// selects the vendored entry the matched key claims, even when the
     /// ledger recorded an older generation; an unclaimed entry for another
