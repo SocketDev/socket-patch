@@ -790,7 +790,7 @@ async fn fetch_record_by_uuid(
         .as_ref()
         .expect("client_cache was just initialized above");
     let patch = client.fetch_patch(uuid).await.ok()??;
-    Some(crate::commands::get::record_from_patch_response(&patch))
+    Some(socket_patch_core::manifest::records::record_from_patch_response(&patch))
 }
 
 #[cfg(test)]

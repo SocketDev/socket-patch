@@ -16,7 +16,7 @@ use crate::constants::SOCKET_DIR;
 use crate::crawlers::python_crawler::canonicalize_pypi_name;
 use crate::manifest::schema::PatchRecord;
 use crate::patch::apply::{ApplyResult, PatchSources};
-use crate::utils::fs::{atomic_write_artifact, read_regular_to_string};
+use crate::utils::fs::{atomic_write_artifact, read_regular_to_bytes, read_regular_to_string};
 use crate::utils::group_commit::{self, GroupCommit};
 use crate::utils::purl::{parse_pypi_purl, strip_purl_qualifiers};
 use crate::utils::socket_dir::remove_tree_and_prune;
@@ -1910,7 +1910,7 @@ async fn guard_unwired_pypi_revert(
     uuid: &str,
     uuid_dir_rel: &str,
 ) -> Option<RevertOutcome> {
-    let clause = unwired_pypi_reference_clause(project_root, uuid).await?;
+    let clause = pypi_reference_clause(project_root, uuid, &[]).await?;
     let detail = format!(
         "refusing to remove {uuid_dir_rel}: the ledger entry records no pre-vendor wiring to \
          replay (it was likely reconstructed by `socket-patch repair`; the pre-vendor Python \
@@ -1930,18 +1930,22 @@ async fn guard_unwired_pypi_revert(
     })
 }
 
-/// The in-use probe behind [`guard_unwired_pypi_revert`]: `None` when every
-/// Python project file was read and none mentions the uuid dir; otherwise
-/// the human clause naming what blocks the revert. The probe list is the
-/// statically named project files, the root `requirements.txt` plus every
-/// `-r` include the planner may have written a pin into, and every Python
-/// lock the root directory LISTS (`uv.lock`, `pylock*.toml`, `*.py.lock`
-/// with its paired script). Every step fails closed: a root that cannot be
-/// listed, an include tree that cannot be read, or a listed lock (a symlink
-/// included — lstat only, so an unreadable target is still probed) that
-/// exists but cannot be read all block the revert, because none of them
-/// can prove the absence of a reference.
-async fn unwired_pypi_reference_clause(project_root: &Path, uuid: &str) -> Option<String> {
+/// The in-use probe behind [`guard_unwired_pypi_revert`] and the
+/// post-restore keep in [`revert_pypi_opts`]: `None` when every Python
+/// project file was read and none mentions the uuid dir; otherwise the human
+/// clause naming what blocks the deletion. The probe list is the statically
+/// named project files, the root `requirements.txt` plus every `-r` include
+/// the planner may have written a pin into, every Python lock the root
+/// directory LISTS (`uv.lock`, `pylock*.toml`, `*.py.lock` with its paired
+/// script), and every other root-level `*.txt` (a `uv export -o` target, or
+/// a `requirements-dev.txt` the user moved a vendor line into). `skip`
+/// names files left out of the probe (a dry run's not-yet-restored wiring).
+/// Every step fails closed: a root that cannot be listed, an include tree
+/// that cannot be read, or a listed file (a symlink included — lstat only,
+/// so an unreadable target is still probed) that exists but cannot be read
+/// all block the deletion, because none of them can prove the absence of a
+/// reference.
+async fn pypi_reference_clause(project_root: &Path, uuid: &str, skip: &[&str]) -> Option<String> {
     let needle = format!(".socket/vendor/pypi/{uuid}/");
     let mut names: Vec<String> = [
         "pyproject.toml",
@@ -1956,7 +1960,7 @@ async fn unwired_pypi_reference_clause(project_root: &Path, uuid: &str) -> Optio
     .iter()
     .map(|name| (*name).to_string())
     .collect();
-    match super::pypi_requirements::requirements_include_names(project_root).await {
+    match probe_include_names(project_root).await {
         Ok(includes) => names.extend(includes),
         Err(_) => {
             return Some(
@@ -1991,7 +1995,8 @@ async fn unwired_pypi_reference_clause(project_root: &Path, uuid: &str) -> Optio
         let Some(name) = entry.file_name().to_str().map(str::to_string) else {
             continue;
         };
-        if !crate::utils::python_lock::is_python_lock_name(&name) {
+        let is_lock = crate::utils::python_lock::is_python_lock_name(&name);
+        if !is_lock && !name.ends_with(".txt") {
             continue;
         }
         // lstat only: a regular file or ANY symlink is probed (the read
@@ -2004,17 +2009,25 @@ async fn unwired_pypi_reference_clause(project_root: &Path, uuid: &str) -> Optio
         {
             continue;
         }
-        if let Some(script) = crate::utils::python_lock::script_of_lock(&name) {
-            names.push(script.to_string());
+        if is_lock {
+            if let Some(script) = crate::utils::python_lock::script_of_lock(&name) {
+                names.push(script.to_string());
+            }
         }
         if !names.contains(&name) {
             names.push(name);
         }
     }
     for name in &names {
+        if skip.contains(&name.as_str()) {
+            continue;
+        }
         let path = project_root.join(name);
-        match read_regular_to_string(&path).await {
-            Ok(text) if text.contains(&needle) => {
+        // Bytes, not UTF-8 text: an unrelated Latin-1 `LICENSE.txt` or a
+        // UTF-16 `pip freeze >` output is still probed instead of failing
+        // closed on every revert with no way out.
+        match read_regular_to_bytes(&path).await {
+            Ok(bytes) if probe_text(&bytes).contains(&needle) => {
                 return Some(format!("{name} still resolves through it"));
             }
             Ok(_) => {}
@@ -2029,6 +2042,64 @@ async fn unwired_pypi_reference_clause(project_root: &Path, uuid: &str) -> Optio
         }
     }
     None
+}
+
+/// A project file's bytes as text for [`pypi_reference_clause`], in any
+/// encoding a Python project file is plausibly saved in: UTF-16 with a BOM
+/// (what PowerShell's `>` writes, and what pip reads through the BOM) is
+/// decoded; anything else is read lossily, which keeps every ASCII byte —
+/// the whole needle, and pip's `-r` grammar — of a UTF-8 or legacy 8-bit
+/// (Latin-1, cp1252) file intact.
+fn probe_text(bytes: &[u8]) -> String {
+    let utf16 = |rest: &[u8], from: fn([u8; 2]) -> u16| {
+        let units: Vec<u16> = rest.chunks_exact(2).map(|c| from([c[0], c[1]])).collect();
+        String::from_utf16_lossy(&units)
+    };
+    if let Some(rest) = bytes.strip_prefix(&[0xFF, 0xFE]) {
+        return utf16(rest, u16::from_le_bytes);
+    }
+    if let Some(rest) = bytes.strip_prefix(&[0xFE, 0xFF]) {
+        return utf16(rest, u16::from_be_bytes);
+    }
+    String::from_utf8_lossy(bytes).into_owned()
+}
+
+/// The root `requirements.txt` and every in-root `-r` include reached from
+/// it, the way [`requirements_include_names`] walks them, but read through
+/// [`probe_text`]: a file the planner could never have parsed (a UTF-16
+/// `pip freeze >` output, a Latin-1 comment) is still followed instead of
+/// blocking every revert. Only a real read error fails the walk.
+///
+/// [`requirements_include_names`]: super::pypi_requirements::requirements_include_names
+async fn probe_include_names(root: &Path) -> std::io::Result<Vec<String>> {
+    use super::pypi_requirements::{is_in_root_rel, requirements_includes};
+    let mut names: Vec<String> = Vec::new();
+    let mut stack = vec!["requirements.txt".to_string()];
+    while let Some(rel) = stack.pop() {
+        if names.contains(&rel) || !is_in_root_rel(&rel) {
+            continue;
+        }
+        names.push(rel.clone());
+        match read_regular_to_bytes(&root.join(&rel)).await {
+            Ok(bytes) => stack.extend(requirements_includes(&rel, &probe_text(&bytes))),
+            Err(e) if e.kind() == std::io::ErrorKind::NotFound => {}
+            Err(e) => return Err(e),
+        }
+    }
+    Ok(names)
+}
+
+/// The `vendor_revert_residual_reference` keep for a file the flavor revert
+/// did not restore: names it and the way out.
+fn residual_reference_warning(uuid: &str, clause: &str) -> VendorWarning {
+    VendorWarning::new(
+        "vendor_revert_residual_reference",
+        format!(
+            "kept .socket/vendor/pypi/{uuid}/: {clause}, and deleting the vendored wheel would \
+             make every install from it fail; point that file back at the registry release \
+             (or re-export it from the restored lock) and re-run `vendor --revert`"
+        ),
+    )
 }
 
 /// `VendorEntry::flavor` values the dispatch below knows how to revert —
@@ -2112,7 +2183,22 @@ pub async fn revert_pypi_opts(
             }
         }
     };
-    if !outcome.success || dry_run {
+    if !outcome.success {
+        return outcome;
+    }
+    if dry_run {
+        // Preview the residual-reference keep below. The files the flavor
+        // would restore still carry its wiring, so they are left out; the
+        // keep itself is wet-only (`kept_artifact` contract), the warning
+        // alone tells the preview the artifact would stay.
+        if !entry.wiring.is_empty() && !keep_artifact {
+            let wired: Vec<&str> = entry.wiring.iter().map(|r| r.file.as_str()).collect();
+            if let Some(clause) = pypi_reference_clause(project_root, &entry.uuid, &wired).await {
+                outcome
+                    .warnings
+                    .push(residual_reference_warning(&entry.uuid, &clause));
+            }
+        }
         return outcome;
     }
     // LOSSINESS GUARD (the RevertOutcome contract every npm-family backend
@@ -2147,6 +2233,24 @@ pub async fn revert_pypi_opts(
     // entry), so only the deletion is skipped.
     if keep_artifact {
         return outcome;
+    }
+    // RESIDUAL-REFERENCE GUARD: the flavor restored only the files it
+    // recorded. Any other project file that still names the uuid dir — a
+    // `uv export`-ed requirements.txt or pylock.toml, a vendor line the user
+    // moved into a `-r` include or a sibling requirements file — would
+    // install from a deleted wheel. Keep the artifact and the ledger entry
+    // until nothing references it (an unwired entry already passed the same
+    // probe in `guard_unwired_pypi_revert`).
+    if !entry.wiring.is_empty() {
+        if let Some(clause) = pypi_reference_clause(project_root, &entry.uuid, &[]).await {
+            outcome
+                .warnings
+                .push(residual_reference_warning(&entry.uuid, &clause));
+            let uuid_dir_rel = vendor_uuid_dir_rel("pypi", &entry.uuid)
+                .unwrap_or_else(|| format!(".socket/vendor/pypi/{:?}", entry.uuid));
+            outcome.keep_artifact(&uuid_dir_rel);
+            return outcome;
+        }
     }
     // SECURITY: entry.uuid comes from the committed, tamper-able state.json
     // and names a directory for DELETION. Re-validate through the canonical
@@ -5817,6 +5921,110 @@ wheels = [
         );
     }
 
+    /// UTF-16 with a BOM, the way PowerShell's `pip freeze > x.txt` saves it.
+    fn utf16le_bom(text: &str) -> Vec<u8> {
+        let mut bytes = vec![0xFF, 0xFE];
+        bytes.extend(text.encode_utf16().flat_map(u16::to_le_bytes));
+        bytes
+    }
+
+    /// LIVENESS: a root `*.txt` that is not UTF-8 (a Latin-1 `LICENSE.txt`,
+    /// a UTF-16 `pip freeze >` output) and names no vendored wheel is read,
+    /// not treated as an unreadable file that may hide a reference — else
+    /// every wired revert keeps the wheel and ledger entry forever, with a
+    /// way-out the user cannot satisfy.
+    #[tokio::test]
+    async fn non_utf8_root_txt_does_not_block_the_revert() {
+        use crate::vendor::pypi_requirements::wire_requirements;
+        let tmp = tempfile::tempdir().unwrap();
+        let root = tmp.path();
+        tokio::fs::write(root.join("requirements.txt"), "six==1.16.0\n")
+            .await
+            .unwrap();
+        let rel_wheel = format!(".socket/vendor/pypi/{UUID}/six-1.16.0-py2.py3-none-any.whl");
+        let wiring = wire_requirements(root, "six", "1.16.0", &rel_wheel, &"0".repeat(64))
+            .await
+            .unwrap();
+        let uuid_dir = root.join(format!(".socket/vendor/pypi/{UUID}"));
+        tokio::fs::create_dir_all(&uuid_dir).await.unwrap();
+        tokio::fs::write(uuid_dir.join("six-1.16.0-py2.py3-none-any.whl"), b"wheel")
+            .await
+            .unwrap();
+        tokio::fs::write(root.join("LICENSE.txt"), b"Copyright Andr\xe9 \xa9 2024\n")
+            .await
+            .unwrap();
+        tokio::fs::write(root.join("frozen.txt"), utf16le_bom("six==1.16.0\r\n"))
+            .await
+            .unwrap();
+
+        let entry = revert_entry("requirements", &rel_wheel, wiring);
+        let outcome = revert_pypi(&entry, root, false).await;
+        assert!(outcome.success, "{:?}", outcome.error);
+        assert!(
+            !outcome.kept_artifact,
+            "no file references the wheel: {:?}",
+            outcome.warnings
+        );
+        assert!(!uuid_dir.exists(), "the artifact must be reclaimed");
+    }
+
+    /// SAFETY twin: decoding a non-UTF-8 file must not hide the reference
+    /// it holds. A UTF-16 root `*.txt`, and a Latin-1 `-r` include that
+    /// pulls in a nested file, still keep the wheel.
+    #[tokio::test]
+    async fn non_utf8_files_still_surface_their_reference() {
+        let needle = format!(".socket/vendor/pypi/{UUID}/six-1.16.0-py2.py3-none-any.whl");
+
+        let tmp = tempfile::tempdir().unwrap();
+        let root = tmp.path();
+        tokio::fs::write(
+            root.join("frozen.txt"),
+            utf16le_bom(&format!("./{needle}\r\n")),
+        )
+        .await
+        .unwrap();
+        let clause = pypi_reference_clause(root, UUID, &[]).await;
+        assert_eq!(
+            clause.as_deref(),
+            Some("frozen.txt still resolves through it")
+        );
+
+        let tmp = tempfile::tempdir().unwrap();
+        let root = tmp.path();
+        tokio::fs::create_dir_all(root.join("reqs")).await.unwrap();
+        tokio::fs::write(root.join("requirements.txt"), "-r reqs/dev.txt\n")
+            .await
+            .unwrap();
+        tokio::fs::write(
+            root.join("reqs/dev.txt"),
+            b"# d\xe9pendances\n-r nested.txt\n".as_slice(),
+        )
+        .await
+        .unwrap();
+        tokio::fs::write(
+            root.join("reqs/nested.txt"),
+            utf16le_bom(&format!("./{needle}\n")),
+        )
+        .await
+        .unwrap();
+        let clause = pypi_reference_clause(root, UUID, &[]).await;
+        assert_eq!(
+            clause.as_deref(),
+            Some("reqs/nested.txt still resolves through it")
+        );
+
+        // A real read failure still fails closed.
+        #[cfg(unix)]
+        {
+            let tmp = tempfile::tempdir().unwrap();
+            let root = tmp.path();
+            tokio::fs::create_dir(root.join("requirements.txt"))
+                .await
+                .unwrap();
+            assert!(pypi_reference_clause(root, UUID, &[]).await.is_some());
+        }
+    }
+
     /// The splice-flavor wired-pin reader (the rebuild guard's ledgerless
     /// fallback): poetry's `url = "…"` and pdm's `path = "./…"` unit shapes
     /// both yield (path, sha) from the one-line files element vendor wrote;
@@ -6357,6 +6565,267 @@ wheels = [
                 .find(|w| w.code == "vendor_platform_locked")
                 .unwrap_or_else(|| panic!("{flavor}: {warnings:?}"));
             assert!(w.detail.contains(needle), "{flavor}: {}", w.detail);
+        }
+    }
+
+    // ───────────── residual references outside the flavor's wiring ─────────────
+
+    /// A root `*.txt` that is not UTF-8 is byte-probed, not failed closed:
+    /// an unrelated Latin-1 `LICENSE.txt` must not pin the wheel forever,
+    /// while a non-UTF-8 file that does name the uuid dir still keeps it.
+    #[tokio::test]
+    async fn reference_probe_reads_non_utf8_txt_as_bytes() {
+        let tmp = tempfile::tempdir().unwrap();
+        let root = tmp.path();
+        // "café" in Latin-1: not valid UTF-8.
+        tokio::fs::write(root.join("LICENSE.txt"), b"caf\xe9\n")
+            .await
+            .unwrap();
+        assert_eq!(pypi_reference_clause(root, UUID, &[]).await, None);
+
+        let mut extra = b"caf\xe9\n./".to_vec();
+        extra.extend_from_slice(
+            format!(".socket/vendor/pypi/{UUID}/six-1.16.0-py2.py3-none-any.whl\n").as_bytes(),
+        );
+        tokio::fs::write(root.join("extra.txt"), &extra)
+            .await
+            .unwrap();
+        let clause = pypi_reference_clause(root, UUID, &[]).await;
+        assert!(
+            clause.as_deref().is_some_and(|c| c.contains("extra.txt")),
+            "{clause:?}"
+        );
+    }
+
+    /// A BOM-marked UTF-16 `requirements.txt` (PowerShell's `pip freeze >`)
+    /// cannot be walked for `-r` includes, but pip reads it, so a vendored
+    /// line in it still keeps the wheel, and a clean one does not.
+    #[tokio::test]
+    async fn reference_probe_reads_utf16_requirements() {
+        let utf16le = |text: &str| -> Vec<u8> {
+            let mut bytes = vec![0xFF, 0xFE];
+            bytes.extend(text.encode_utf16().flat_map(u16::to_le_bytes));
+            bytes
+        };
+        let tmp = tempfile::tempdir().unwrap();
+        let root = tmp.path();
+        tokio::fs::write(root.join("requirements.txt"), utf16le("six==1.16.0\r\n"))
+            .await
+            .unwrap();
+        assert_eq!(pypi_reference_clause(root, UUID, &[]).await, None);
+
+        let line = format!("./.socket/vendor/pypi/{UUID}/six-1.16.0-py2.py3-none-any.whl\r\n");
+        tokio::fs::write(root.join("requirements.txt"), utf16le(&line))
+            .await
+            .unwrap();
+        let clause = pypi_reference_clause(root, UUID, &[]).await;
+        assert!(
+            clause
+                .as_deref()
+                .is_some_and(|c| c.contains("requirements.txt")),
+            "{clause:?}"
+        );
+    }
+
+    /// Asserts a wet revert restored its wiring but kept the artifact (and,
+    /// via `kept_artifact`, the ledger entry) because `file` still names the
+    /// uuid dir.
+    fn assert_residual_keep(outcome: &RevertOutcome, fx: &E2eFixture, wheel: &str, file: &str) {
+        assert!(outcome.success, "{:?}", outcome.error);
+        let residual = outcome
+            .warnings
+            .iter()
+            .find(|w| w.code == "vendor_revert_residual_reference")
+            .unwrap_or_else(|| panic!("no residual warning: {:?}", outcome.warnings));
+        assert!(residual.detail.contains(file), "{}", residual.detail);
+        assert!(
+            outcome.kept_artifact,
+            "a residual reference must keep the ledger entry"
+        );
+        assert!(
+            fx.root.join(wheel).is_file(),
+            "{file} still installs the vendored wheel; deleting it breaks every install"
+        );
+    }
+
+    /// The `uv export --frozen -o requirements.txt` line for a vendored wheel.
+    fn exported_line(wheel: &str) -> String {
+        format!("./{wheel} \\\n    --hash=sha256:{}\n", "0".repeat(64))
+    }
+
+    /// Vendors six into a uv project and returns the entry plus the
+    /// pre-vendor pair.
+    async fn vendor_uv_project(fx: &E2eFixture) -> VendorEntry {
+        swap_to_lock_flavor(
+            fx,
+            &[
+                ("pyproject.toml", UV_PYPROJECT),
+                ("uv.lock", UV_LOCK_REGISTRY),
+            ],
+        )
+        .await;
+        let sources = PatchSources::blobs_only(&fx.blobs);
+        let VendorOutcome::Done { result, entry, .. } = vendor_six(fx, &sources, None).await else {
+            panic!("uv vendor must be Done");
+        };
+        assert!(result.success, "{:?}", result.error);
+        let entry = entry.expect("entry on success");
+        assert_eq!(entry.flavor.as_deref(), Some("uv"));
+        entry
+    }
+
+    /// #996: a `uv export`-ed requirements.txt or pylock.toml still names
+    /// the vendored wheel after the uv pair is restored, so the wheel (and
+    /// the ledger entry) must stay; once the export is regenerated, the
+    /// next revert finishes the cleanup.
+    #[tokio::test]
+    async fn uv_revert_keeps_artifact_while_export_references_it() {
+        for export in ["requirements.txt", "pylock.toml"] {
+            let fx = e2e_fixture().await;
+            let entry = vendor_uv_project(&fx).await;
+            let wheel = entry.artifact.path.clone();
+            let exported = if export == "pylock.toml" {
+                format!(
+                    "lock-version = \"1.0\"\ncreated-by = \"uv\"\n\n[[packages]]\nname = \"six\"\nversion = \"1.16.0\"\narchive = {{ path = \"./{wheel}\" }}\n"
+                )
+            } else {
+                exported_line(&wheel)
+            };
+            touch(&fx.root, export, &exported).await;
+
+            // The dry run previews the keep without touching anything.
+            let preview = revert_pypi(&entry, &fx.root, true).await;
+            assert!(preview.success, "{export}: {:?}", preview.error);
+            assert!(
+                preview.warnings.iter().any(|w| {
+                    w.code == "vendor_revert_residual_reference" && w.detail.contains(export)
+                }),
+                "{export}: the dry run must preview the keep: {:?}",
+                preview.warnings
+            );
+
+            let outcome = revert_pypi(&entry, &fx.root, false).await;
+            assert_residual_keep(&outcome, &fx, &wheel, export);
+            assert_eq!(
+                tokio::fs::read_to_string(fx.root.join("pyproject.toml"))
+                    .await
+                    .unwrap(),
+                UV_PYPROJECT,
+                "{export}: the uv pair is still restored"
+            );
+            assert_eq!(
+                tokio::fs::read_to_string(fx.root.join("uv.lock"))
+                    .await
+                    .unwrap(),
+                UV_LOCK_REGISTRY
+            );
+
+            // The user re-exports from the restored lock: the kept entry now
+            // reverts cleanly and the artifact goes.
+            touch(&fx.root, export, "six==1.16.0\n").await;
+            let finished = revert_pypi(&entry, &fx.root, false).await;
+            assert!(finished.success, "{export}: {:?}", finished.error);
+            assert!(!finished.kept_artifact, "{:?}", finished.warnings);
+            assert!(!uuid_dir_of(&fx).exists(), "{export}");
+        }
+    }
+
+    /// #996 (script lane): `uv export --script s.py -o requirements.txt`
+    /// keeps the artifact after the script and its lock are restored.
+    #[tokio::test]
+    async fn script_lock_revert_keeps_artifact_while_export_references_it() {
+        let fx = e2e_fixture().await;
+        let script = "# /// script\n# dependencies = [\"six==1.16.0\"]\n# ///\nprint('hi')\n";
+        let lock = r#"version = 1
+revision = 3
+requires-python = ">=3.9"
+
+[manifest]
+requirements = [{name = "six", specifier = "==1.16.0"}]
+
+[[package]]
+name = "six"
+version = "1.16.0"
+source = {registry = "https://pypi.org/simple"}
+wheels = [{url = "https://files.pythonhosted.org/six.whl", hash = "sha256:upstream"}]
+"#;
+        swap_to_lock_flavor(&fx, &[("s.py", script), ("s.py.lock", lock)]).await;
+        let sources = PatchSources::blobs_only(&fx.blobs);
+        let VendorOutcome::Done { result, entry, .. } = vendor_six(&fx, &sources, None).await
+        else {
+            panic!("script vendor must be Done");
+        };
+        assert!(result.success, "{:?}", result.error);
+        let entry = entry.unwrap();
+        touch(
+            &fx.root,
+            "requirements.txt",
+            &exported_line(&entry.artifact.path),
+        )
+        .await;
+
+        let outcome = revert_pypi(&entry, &fx.root, false).await;
+        assert_residual_keep(&outcome, &fx, &entry.artifact.path, "requirements.txt");
+        assert_eq!(
+            tokio::fs::read_to_string(fx.root.join("s.py"))
+                .await
+                .unwrap(),
+            script
+        );
+        assert_eq!(
+            tokio::fs::read_to_string(fx.root.join("s.py.lock"))
+                .await
+                .unwrap(),
+            lock
+        );
+    }
+
+    /// #867: the vendored requirements line moved into a `-r` include, or
+    /// into a sibling file requirements.txt does not include. The recorded
+    /// line drift-skips; the line's new home must still keep the artifact.
+    #[tokio::test]
+    async fn requirements_revert_keeps_artifact_for_moved_vendor_line() {
+        for (root_text, home) in [
+            ("-r requirements/base.txt\n", "requirements/base.txt"),
+            ("", "requirements-dev.txt"),
+        ] {
+            let fx = e2e_fixture().await;
+            let sources = PatchSources::blobs_only(&fx.blobs);
+            let VendorOutcome::Done { result, entry, .. } = vendor_six(&fx, &sources, None).await
+            else {
+                panic!("vendor must be Done");
+            };
+            assert!(result.success, "{:?}", result.error);
+            let entry = entry.unwrap();
+            let line = read_requirements(&fx).await;
+            assert!(line.contains(&entry.artifact.path), "{line}");
+            tokio::fs::create_dir_all(fx.root.join("requirements"))
+                .await
+                .unwrap();
+            touch(&fx.root, home, &line).await;
+            touch(
+                &fx.root,
+                "requirements.txt",
+                &format!("{root_text}idna==3.7\n"),
+            )
+            .await;
+
+            let preview = revert_pypi(&entry, &fx.root, true).await;
+            assert!(
+                preview.warnings.iter().any(|w| {
+                    w.code == "vendor_revert_residual_reference" && w.detail.contains(home)
+                }),
+                "{home}: the dry run must preview the keep: {:?}",
+                preview.warnings
+            );
+
+            let outcome = revert_pypi(&entry, &fx.root, false).await;
+            assert_residual_keep(&outcome, &fx, &entry.artifact.path, home);
+            assert_eq!(
+                tokio::fs::read_to_string(fx.root.join(home)).await.unwrap(),
+                line,
+                "{home}: the moved line is left alone"
+            );
         }
     }
 
