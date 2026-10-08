@@ -183,7 +183,7 @@ fn object_members(text: &str, open: usize) -> Option<Vec<JsonMember>> {
 /// The top-level members of a JSON object document (a leading BOM is kept
 /// out of the offsets' way, never stripped from the text).
 pub(crate) fn root_members(text: &str) -> Option<Vec<JsonMember>> {
-    let body = text.strip_prefix('\u{feff}').unwrap_or(text);
+    let body = crate::formats::text::strip_bom(text);
     serde_json::from_str::<serde_json::Map<String, Value>>(body).ok()?;
     let open = skip_ws(text.as_bytes(), text.len() - body.len());
     object_members(text, open)
@@ -946,6 +946,11 @@ mod tests {
             Err(SpanError::Duplicate("devDependencies".into()))
         );
         assert_eq!(strip_dev_dependencies("[1]"), Err(SpanError::NotJson));
+        // A second BOM is content (#905): not a JSON object document.
+        assert_eq!(
+            strip_dev_dependencies("\u{feff}\u{feff}{\"devDependencies\":{}}"),
+            Err(SpanError::NotJson)
+        );
     }
 
     #[test]

@@ -1188,7 +1188,7 @@ def main():
                 lock_ok = post == relocked
             if mode == "hosted" and not hybrid:
                 # No pin, no ledger, no manifest: nothing to roll back.
-                retired = rrb.rc == 1 and erb2.get("error") == "Manifest not found"
+                retired = rrb.rc == 1 and (erb2.get("error") or {}).get("message") == "Manifest not found"
             else:
                 retired = rrb.ok()
             check("rollbackAfterRelockRetires", retired and cleared and lock_ok, {"exit": rrb.rc, "cleared": cleared, "hybridRelock": hybrid, "lockKeptRelocked": post == relocked, "lockRestoredOriginal": post == pristine_lock, "referenceLeft": marker in post, "envelope": {k: erb2.get(k) for k in ("status", "hosted", "vendoredReverted", "failed") if k in erb2}, "tail": rrb.tail(400) if not rrb.ok() else None})

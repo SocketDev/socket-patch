@@ -100,7 +100,7 @@ fn rollback_refuses_contested_hosted_wiring_and_names_it() {
     let before = snapshot(tmp.path());
     let (code, v) = run_json(&["rollback", "--json", "--yes"], tmp.path());
     assert_eq!(code, Some(1), "{v}");
-    let err = v["error"].as_str().unwrap_or_default();
+    let err = v["error"]["message"].as_str().unwrap_or_default();
     assert!(
         err.contains("npm-shrinkwrap.json") && err.contains("git checkout --"),
         "the refusal names the contested file and the remedy: {v}"

@@ -256,11 +256,7 @@ pub(crate) async fn restore(
             .collect();
 
     let escaped = content.contains("\\/");
-    let eol = if content.contains("\r\n") {
-        "\r\n"
-    } else {
-        "\n"
-    };
+    let eol = crate::utils::line_endings::terminator(&content);
     let mut content = content;
     let mut changed = false;
     for hit in &hits {

@@ -81,6 +81,19 @@ pub(crate) fn majority_terminator(text: &str) -> &'static str {
     }
 }
 
+/// The terminator a writer uses for the lines it inserts into `text`:
+/// `\r\n` for a CRLF file, `\n` for an LF file or one with no break at all,
+/// and the [`majority_terminator`] for a mixed file. Majority is stable
+/// under appending lines in its own style, so a revert that removes
+/// `{line}{terminator}` matches what the forward pass wrote.
+pub(crate) fn terminator(text: &str) -> &'static str {
+    match LineEndings::of(text) {
+        LineEndings::Crlf => "\r\n",
+        LineEndings::Mixed => majority_terminator(text),
+        LineEndings::Lf | LineEndings::None => "\n",
+    }
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
@@ -118,5 +131,19 @@ mod tests {
         assert_eq!(majority_terminator("a\r\nb\nc\n"), "\n");
         assert_eq!(majority_terminator("a\r\nb\n"), "\n", "a tie is LF");
         assert_eq!(majority_terminator("{}"), "\n", "no break: LF, not os.EOL");
+    }
+
+    #[test]
+    fn terminator_follows_the_file_and_the_majority_when_mixed() {
+        assert_eq!(terminator("a\nb\n"), "\n");
+        assert_eq!(terminator("a\r\nb\r\n"), "\r\n");
+        assert_eq!(terminator("a\r\nb"), "\r\n");
+        assert_eq!(terminator(""), "\n");
+        assert_eq!(terminator("one line"), "\n");
+        assert_eq!(terminator("a\r\nb\r\nc\n"), "\r\n", "CRLF majority");
+        assert_eq!(terminator("a\nb\nc\r\n"), "\n", "LF majority");
+        assert_eq!(terminator("a\r\nb\n"), "\n", "a tie is LF");
+        // A bare CR makes the file mixed; it is not counted as a break.
+        assert_eq!(terminator("a\rb\r\n"), "\r\n");
     }
 }
