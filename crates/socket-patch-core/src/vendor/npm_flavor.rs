@@ -34,9 +34,7 @@ use super::{
     bun_lock, npm_lock, pnpm_lock, pnpm_lock_legacy, vlt_lock, yarn_berry_lock, yarn_classic_lock,
     RevertOpts, RevertOutcome, VendorOutcome, VendorWarning,
 };
-use crate::constants::npm_family::{
-    BUN_LOCK, BUN_LOCKB, NPM_LOCKS, PNPM_LOCK, PNP_MARKERS, VLT_LOCK,
-};
+use crate::constants::npm_family::{PNPM_LOCK, PNP_MARKERS, VLT_LOCK};
 use crate::formats::governing_locks::{
     npm_governing_family, npm_lock_files, npm_locks_outside, NpmLockFamily,
 };
