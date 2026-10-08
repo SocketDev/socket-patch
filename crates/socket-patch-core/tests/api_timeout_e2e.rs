@@ -23,6 +23,11 @@ const UUID: &str = "11111111-2222-4333-8444-555555555555";
 
 /// The test bound on one silent read.
 const READ: Duration = Duration::from_millis(300);
+/// The read bound for the trickling-body test. Each 100 ms gap sits far
+/// under it, so a runner stall of up to ~1.4 s (whole process descheduled,
+/// as macOS runners do) cannot read as silence, while the whole transfer
+/// (~2 s) still outlasts it.
+const TRICKLE_READ: Duration = Duration::from_millis(1500);
 /// How long a bounded call may take in total before the test calls it a
 /// hang (generous: CI runners are slow, an unbounded call never returns).
 const GUARD: Duration = Duration::from_secs(20);
@@ -89,7 +94,8 @@ async fn stalled_json_body_server() -> String {
 }
 
 /// A server that answers `200` with a `total`-byte body, sent in `chunks`
-/// pieces `gap` apart (each gap shorter than [`READ`], the sum longer).
+/// pieces `gap` apart (each gap shorter than [`TRICKLE_READ`], the sum
+/// longer).
 async fn trickling_server(total: usize, chunks: usize, gap: Duration) -> String {
     let listener = TcpListener::bind("127.0.0.1:0").await.unwrap();
     let addr = listener.local_addr().unwrap();
@@ -136,6 +142,11 @@ async fn trickling_server(total: usize, chunks: usize, gap: Duration) -> String 
 /// A client on `uri` (authenticated, or the public proxy) with the short
 /// test read bound and JSON retries off.
 fn client(uri: &str, proxy: bool) -> ApiClient {
+    client_with_read(uri, proxy, READ)
+}
+
+/// [`client`] with a read bound of `read`.
+fn client_with_read(uri: &str, proxy: bool, read: Duration) -> ApiClient {
     ApiClient::new(ApiClientOptions {
         api_url: uri.to_string(),
         api_token: (!proxy).then(|| "tok".to_string()),
@@ -145,7 +156,7 @@ fn client(uri: &str, proxy: bool) -> ApiClient {
     .with_api_retry(ApiRetryPolicy::none(), RetryHooks::default())
     .with_api_timeouts(ApiTimeouts {
         connect: Duration::from_secs(5),
-        read: READ,
+        read,
     })
 }
 
@@ -286,13 +297,14 @@ async fn completed_malformed_json_remains_a_parse_error() {
 
 #[tokio::test]
 async fn a_body_that_keeps_streaming_past_the_bound_still_arrives() {
-    // 8 chunks 150 ms apart: every silence is under the 300 ms bound, the
-    // whole transfer (~1.2 s) is four times it.
+    // 20 chunks 100 ms apart: every silence is far under the 1.5 s bound,
+    // the whole transfer (~2 s) is longer than it.
     let total = 64 * 1024;
     for proxy in [false, true] {
-        let api = client(
-            &trickling_server(total, 8, Duration::from_millis(150)).await,
+        let api = client_with_read(
+            &trickling_server(total, 20, Duration::from_millis(100)).await,
             proxy,
+            TRICKLE_READ,
         );
         let started = Instant::now();
         let body = tokio::time::timeout(GUARD, async {
@@ -304,8 +316,8 @@ async fn a_body_that_keeps_streaming_past_the_bound_still_arrives() {
         .expect("a streaming body must not time out");
         assert_eq!(body.len(), total, "proxy={proxy}");
         assert!(
-            started.elapsed() > READ * 3,
-            "proxy={proxy}: the body trickled"
+            started.elapsed() > TRICKLE_READ,
+            "proxy={proxy}: the body trickled past the bound"
         );
     }
 }
