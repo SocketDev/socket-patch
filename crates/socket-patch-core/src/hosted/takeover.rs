@@ -40,7 +40,7 @@ pub fn any_takeover_ecosystem<'a>(mut purls: impl Iterator<Item = &'a str>) -> b
 /// A vendored JVM entry wired into a Gradle build (its revert unplans the
 /// vendored Gradle wiring), as opposed to a pom-only entry.
 pub fn is_gradle_jvm_entry(entry: &VendorEntry) -> bool {
-    entry.ecosystem == "jvm"
+    entry.ecosystem == crate::vendor::jvm::layout::LEDGER_ECOSYSTEM
         && entry.wiring.iter().any(|w| {
             w.file.ends_with(".gradle")
                 || w.file.ends_with(".gradle.kts")

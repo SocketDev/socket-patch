@@ -18,13 +18,14 @@ use std::collections::BTreeSet;
 
 use serde_json::json;
 
+use super::layout::{self, safe_coordinates};
 use super::{
-    adopt, fragment, owned_file_with, safe_coordinates, sha1_hex, sha256_hex, Coords, FileWrite,
-    JvmPatch, JvmRefusal, ReadFn, WiringAction, WiringRecord, COURSIER_INDEX_KIND,
+    adopt, fragment, owned_file_with, sha1_hex, sha256_hex, Coords, FileWrite, JvmPatch,
+    JvmRefusal, ReadFn, WiringAction, WiringRecord, COURSIER_INDEX_KIND,
 };
 
 /// The tree root.
-pub const TREE_ROOT: &str = ".socket/vendor/coursier";
+use super::layout::COURSIER_TREE as TREE_ROOT;
 /// The index of every tree file.
 pub const INDEX_REL: &str = ".socket/vendor/coursier-index.tsv";
 /// The index's first line.
@@ -35,25 +36,11 @@ pub const GITATTRIBUTES_REL: &str = ".socket/vendor/coursier/.gitattributes";
 /// The `.gitignore` body: re-include everything below.
 pub const GITIGNORE: &str = "!*\n";
 /// The per-version marker (the name every JVM tree uses).
-pub const MARKER_NAME: &str = "socket-patch.vendor.json";
-/// Files under `.socket/` a group commit captures for this tree (plus the
-/// vendored sbt tree's `.gitignore`).
-pub const CAPTURED_FILES: &[&str] = &[
-    INDEX_REL,
-    GITIGNORE_REL,
-    GITATTRIBUTES_REL,
-    super::scala_cli::GUARD_REL,
-    super::sbt::TREE_GITIGNORE_REL,
-];
+use super::layout::MARKER_FILE as MARKER_NAME;
 
 /// The patch's tree directory (same GAV).
 pub fn tree_dir(c: &Coords<'_>) -> String {
-    format!(
-        "{TREE_ROOT}/{}/{}/{}",
-        c.group_path(),
-        c.artifact_id,
-        c.version
-    )
+    c.tree_dir(TREE_ROOT, c.version)
 }
 
 /// The committed tree of `c` as `(jar, pom, None)`. `None` when either is
@@ -133,7 +120,7 @@ pub fn plan_tree(
         if !name.ends_with(".sha1") {
             new_rows.push(IndexRow {
                 gav: gav.clone(),
-                rel: format!("{}/{a}/{v}/{name}", c.group_path()),
+                rel: format!("{}/{name}", layout::version_dir(c.group_id, a, v)),
                 sha256: sha256_hex(bytes),
                 uuid: patch.uuid.to_string(),
             });
@@ -207,25 +194,8 @@ pub fn parse_index(bytes: &[u8]) -> Result<Vec<IndexRow>, String> {
 }
 
 fn parse_row(line: &str) -> Option<IndexRow> {
-    let cols: Vec<&str> = line.split('\t').collect();
-    let [gav, rel, sha, uuid] = cols.as_slice() else {
-        return None;
-    };
-    let parts: Vec<&str> = gav.split(':').collect();
-    let [g, a, v] = parts.as_slice() else {
-        return None;
-    };
-    let dir = format!("{}/{a}/{v}/", g.replace('.', "/"));
-    let ok = safe_coordinates(g, a, v)
-        && rel
-            .strip_prefix(&dir)
-            .is_some_and(|n| n.starts_with(&format!("{a}-{v}")) && !n.contains('/'))
-        && sha.len() == 64
-        && sha
-            .bytes()
-            .all(|c| c.is_ascii_digit() || (b'a'..=b'f').contains(&c))
-        && crate::patch::path_safety::is_canonical_uuid(uuid);
-    ok.then(|| IndexRow {
+    let [gav, rel, sha, uuid] = layout::index_row(line)?;
+    crate::patch::path_safety::is_canonical_uuid(uuid).then(|| IndexRow {
         gav: gav.to_string(),
         rel: rel.to_string(),
         sha256: sha.to_string(),

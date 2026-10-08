@@ -7028,10 +7028,11 @@ fn rewrite_maven_pom(
         }
 
         if jar_sha256.is_some() && pom_sha256.is_some() {
-            pinned_jar_paths.push(local_repo_artifact_path(
+            pinned_jar_paths.push(crate::vendor::jvm::layout::artifact_path(
                 &group_id,
                 &artifact_id,
                 &suffixed_version,
+                None,
                 "jar",
             ));
         }
@@ -7071,7 +7072,13 @@ fn rewrite_maven_pom(
                 }
             }
             for ext in ["jar", "pom"] {
-                checksum_drops.push(local_repo_artifact_path(&group_id, &artifact_id, old, ext));
+                checksum_drops.push(crate::vendor::jvm::layout::artifact_path(
+                    &group_id,
+                    &artifact_id,
+                    old,
+                    None,
+                    ext,
+                ));
             }
         }
 
@@ -7155,11 +7162,23 @@ fn rewrite_maven_pom(
                 });
             }
             checksum_entries.push((
-                local_repo_artifact_path(&group_id, &artifact_id, &suffixed_version, "jar"),
+                crate::vendor::jvm::layout::artifact_path(
+                    &group_id,
+                    &artifact_id,
+                    &suffixed_version,
+                    None,
+                    "jar",
+                ),
                 bare_sha256_hex(jar),
             ));
             checksum_entries.push((
-                local_repo_artifact_path(&group_id, &artifact_id, &suffixed_version, "pom"),
+                crate::vendor::jvm::layout::artifact_path(
+                    &group_id,
+                    &artifact_id,
+                    &suffixed_version,
+                    None,
+                    "pom",
+                ),
                 bare_sha256_hex(pom_hash),
             ));
         }
@@ -7428,20 +7447,6 @@ fn merge_checksums(existing: &str, entries: &[(String, String)]) -> String {
         .map(|(path, sha)| format!("{sha}  {path}"))
         .collect();
     format!("{}\n", body.join("\n"))
-}
-
-/// The local-repository-relative artifact path Maven derives for a coordinate:
-/// `<groupId-with-slashes>/<artifactId>/<version>/<artifactId>-<version>.<ext>`.
-pub(crate) fn local_repo_artifact_path(
-    group_id: &str,
-    artifact_id: &str,
-    version: &str,
-    ext: &str,
-) -> String {
-    format!(
-        "{}/{artifact_id}/{version}/{artifact_id}-{version}.{ext}",
-        group_id.replace('.', "/")
-    )
 }
 
 // ── golang (go.mod fork-replace + go.sum pin) ────────────────────────────────

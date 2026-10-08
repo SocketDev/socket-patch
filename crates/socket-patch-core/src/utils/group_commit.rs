@@ -189,16 +189,7 @@ fn is_captured(rel: &Path) -> bool {
     }
     let spelled = rel.to_string_lossy().replace('\\', "/");
     if LEDGERS.contains(&spelled.as_str())
-        || [
-            ".socket/vendor/gradle-index.tsv",
-            ".socket/gradle/socket-patch.settings.gradle",
-            ".socket/vendor/maven2/.gitattributes",
-            ".socket/vendor/gradle/.gitattributes",
-            crate::vendor::jvm::gradle::SCRIPT_GITATTRIBUTES_REL,
-            crate::vendor::jvm::gradle::VENDOR_GITATTRIBUTES_REL,
-        ]
-        .contains(&spelled.as_str())
-        || crate::vendor::jvm::coursier_tree::CAPTURED_FILES.contains(&spelled.as_str())
+        || crate::vendor::jvm::layout::CAPTURED_FILES.contains(&spelled.as_str())
         || crate::vendor::jvm::gradle::is_derived_metadata_path(&spelled)
     {
         return true;
