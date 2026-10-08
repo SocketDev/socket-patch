@@ -20,8 +20,9 @@ use std::collections::HashSet;
 use std::path::{Path, PathBuf};
 
 use super::jvm_cache::debug_log;
-use super::maven_crawler::{is_safe_maven_coordinate, parse_pom_group_artifact_version};
+use super::maven_crawler::parse_pom_group_artifact_version;
 use crate::utils::fs::read_regular_to_bytes_sync;
+use crate::vendor::jvm::layout::is_path_safe;
 
 /// The OS whose default cache locations apply (a parameter so every OS's
 /// table is testable on any host).
@@ -201,7 +202,7 @@ fn pom_root(pom: &Path, host: &Path) -> Option<PathBuf> {
     }
     let bytes = read_regular_to_bytes_sync(pom).ok()?;
     let (g, a, v) = parse_pom_group_artifact_version(&String::from_utf8_lossy(&bytes))?;
-    if a != artifact || v != version || !is_safe_maven_coordinate(&g, &a, &v) {
+    if a != artifact || v != version || !is_path_safe(&g, &a, &v) {
         return None;
     }
     let mut root = artifact_dir.parent()?;

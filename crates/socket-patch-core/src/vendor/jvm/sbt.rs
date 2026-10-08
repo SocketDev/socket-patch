@@ -25,10 +25,11 @@ use std::collections::BTreeMap;
 
 use serde_json::json;
 
+use super::layout::{self, safe_coordinates};
 use super::{
-    adopt, coursier_tree, finish_writes, fragment, maven_reactor, owned_file, safe_coordinates,
-    CommittedTree, Coords, FileWrite, JvmPatch, JvmPlan, JvmRefusal, JvmUnplan, JvmWarning, ReadFn,
-    Shape, WiringAction, WiringRecord, OWNED_FILE_KIND, SBT_FRAGMENT_KIND, TREE_GITATTRIBUTES,
+    adopt, coursier_tree, finish_writes, fragment, maven_reactor, owned_file, CommittedTree,
+    Coords, FileWrite, JvmPatch, JvmPlan, JvmRefusal, JvmUnplan, JvmWarning, ReadFn, Shape,
+    WiringAction, WiringRecord, OWNED_FILE_KIND, SBT_FRAGMENT_KIND, TREE_GITATTRIBUTES,
 };
 use crate::formats::sbt::build::{
     declared_projects, deps_digest, is_sbt_build, is_sbt_build_root, sbt_support, sbt_version,
@@ -38,9 +39,7 @@ use crate::formats::sbt::owned_file::{
     parse, render, OwnedFileError, SbtFileMode, SbtOwnedFile, SbtPin, HOSTED_FILE, VENDORED_FILE,
 };
 // Beside an sbt build, which of these builds a developer runs is unknowable.
-use crate::patch::redirect::{
-    gradle::GRADLE_ROOT_FILES as GRADLE_FILES, scala_guidance::MILL_MARKERS,
-};
+use super::layout::{GRADLE_ROOT_FILES as GRADLE_FILES, MILL_MARKERS};
 
 /// The generated root file.
 pub const BUILD_FILE: &str = VENDORED_FILE;
@@ -71,7 +70,8 @@ pub fn detect(read: ReadFn<'_>) -> Option<Shape> {
     }
     // Beside a Maven or Gradle build, a stray `project/build.properties`
     // naming no `sbt.version` is not an sbt marker.
-    let other_build = read("pom.xml").is_some() || GRADLE_FILES.iter().any(|f| read(f).is_some());
+    let other_build =
+        read(layout::POM_FILE).is_some() || GRADLE_FILES.iter().any(|f| read(f).is_some());
     if other_build && read(BUILD_SBT).is_none() && !is_sbt_build_root(&read_text) {
         return None;
     }
@@ -107,18 +107,18 @@ fn legacy_pom_wired(read: ReadFn<'_>) -> bool {
 /// reactor or a single pom): its tagged block or pin in the root pom, or
 /// its repository tail in `.mvn/maven.config`.
 fn reactor_wired(read: ReadFn<'_>) -> bool {
-    let Some(pom) = read("pom.xml").map(|b| String::from_utf8_lossy(&b).into_owned()) else {
+    let Some(pom) = read(layout::POM_FILE).map(|b| String::from_utf8_lossy(&b).into_owned()) else {
         return false;
     };
-    pom.contains("<!-- socket-patch:begin -->")
-        || pom.contains("<!-- socket-patch ")
+    pom.contains(maven_reactor::BEGIN_MARKER)
+        || pom.contains(maven_reactor::PIN_TAG)
         || read(maven_reactor::MAVEN_CONFIG)
-            .is_some_and(|c| String::from_utf8_lossy(&c).contains(".socket/vendor/maven2"))
+            .is_some_and(|c| String::from_utf8_lossy(&c).contains(layout::MAVEN2_TREE))
 }
 
 /// The Gradle backend already wired this root (its settings apply line).
 fn gradle_wired(read: ReadFn<'_>) -> bool {
-    ["settings.gradle", "settings.gradle.kts"].iter().any(|f| {
+    layout::GRADLE_SETTINGS_FILES.iter().any(|f| {
         read(f).is_some_and(|b| String::from_utf8_lossy(&b).contains(super::gradle::SCRIPT_REL))
     })
 }

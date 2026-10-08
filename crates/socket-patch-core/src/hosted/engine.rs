@@ -671,7 +671,7 @@ pub async fn read_candidate_files(
         // unreadable, which the planner would otherwise skip silently.
         out.undecodable_reads.retain(|rel| {
             !is_gradle_owned_file(rel)
-                || crate::patch::redirect::gradle::GRADLE_ROOT_FILES.contains(&rel.as_str())
+                || crate::vendor::jvm::layout::GRADLE_ROOT_FILES.contains(&rel.as_str())
         });
     }
     // An sbt build's resolution evidence rides a synthetic key (see
@@ -2073,7 +2073,7 @@ pub fn undecodable_guard(undecodable: &[String], candidates: &[Candidate]) -> Op
             // the build itself, which only maven candidates could patch.
             let eco = file_ecosystem(rel)
                 .or((rel.as_str() == "package.json").then_some("npm"))
-                .or(crate::patch::redirect::gradle::GRADLE_ROOT_FILES
+                .or(crate::vendor::jvm::layout::GRADLE_ROOT_FILES
                     .contains(&rel.as_str())
                     .then_some("maven"));
             eco.is_some_and(|eco| candidates.iter().any(|c| c.dep.ecosystem == eco))
