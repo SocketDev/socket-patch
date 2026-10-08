@@ -1691,3 +1691,33 @@ async fn an_unrestorable_orphaned_store_copy_keeps_the_superseded_record() {
         "record A and its blobs stay for a later rollback"
     );
 }
+
+/// B07: a remove/rollback identifier that names the superseded record's
+/// uuid (A) selects the whole owned pin, so the hosted pin of the same
+/// release under the superseding uuid (B) is unwound too, instead of being
+/// left live with no record.
+#[tokio::test]
+#[serial]
+async fn remove_and_rollback_by_superseded_record_uuid_unhost_the_release() {
+    for command in ["remove", "rollback"] {
+        let server = MockServer::start().await;
+        let tmp = tempfile::tempdir().unwrap();
+        let pristine = write_superseded_agent_fixture(tmp.path(), &server, B_PATCHED_INDEX).await;
+
+        let (code, envelope) = if command == "remove" {
+            run_remove_subprocess_online(tmp.path(), &server, SUPERSEDED_UUID)
+        } else {
+            run_rollback_subprocess_online(tmp.path(), &server, &[SUPERSEDED_UUID])
+        };
+        assert_eq!(code, 0, "{command}:\n{envelope:#}");
+        let restored = std::fs::read_to_string(tmp.path().join("package-lock.json")).unwrap();
+        assert_eq!(
+            restored, pristine,
+            "{command} {SUPERSEDED_UUID} must unwind the hosted pin of the same release:\n{envelope:#}"
+        );
+        assert!(
+            manifest_patch_keys(tmp.path()).is_empty(),
+            "{command}:\n{envelope:#}"
+        );
+    }
+}

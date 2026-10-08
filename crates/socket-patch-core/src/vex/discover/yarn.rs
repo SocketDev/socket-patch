@@ -402,9 +402,20 @@ fn berry_block(
     // locator itself encodes (npm: locators only).
     let (spec, locator_version) = if let Some((version, _)) = locator.npm() {
         let Some(archive) = locator.archive_url() else {
-            // A plain registry entry.
+            // A plain registry entry: an unpatched copy, which contests a
+            // wiring of the same version in this lock (berry installs every
+            // locator the lock resolves, so a registry locator beside a
+            // hosted or vendored one of the same `name@version` — scoped
+            // `resolutions`, a workspace member added after the rewire —
+            // ships the registry bytes too) and in any other.
             let version = berry_field(&block.lines, "version").unwrap_or(version);
-            out.resolved_elsewhere(YARN_LOCK, npm_purl(name, version));
+            out.unpatched_copy(
+                YARN_LOCK,
+                npm_purl(name, version),
+                &block.key,
+                "installs it from the registry, not a Socket patch (yarn berry installs \
+                 every locator the lock resolves)",
+            );
             return;
         };
         (archive, Some(version))
@@ -417,7 +428,12 @@ fn berry_block(
         // A custom-registry `__archiveUrl`: the registry package.
         if let (Some(v), false) = (locator_version, root_anchored_spelling(spec)) {
             let version = berry_field(&block.lines, "version").unwrap_or(v);
-            out.resolved_elsewhere(YARN_LOCK, npm_purl(name, version));
+            out.unpatched_copy(
+                YARN_LOCK,
+                npm_purl(name, version),
+                &block.key,
+                &format!("installs it from {spec:?}, not a Socket patch"),
+            );
         } else if locator_version.is_none() && !root_anchored_spelling(spec) {
             // A user's `file:` / url copy: yarn keys it by the DEPENDENCY
             // name (`lp2@file:…`), so which package it installs is read
@@ -1461,6 +1477,47 @@ mod tests {
                 &[("pkg:npm/left-pad@1.3.0", UUID_A, WiringMode::Vendored)],
             );
             assert!(out.refs.len() == 1, "{case}");
+        }
+    }
+
+    /// A berry registry locator beside a hosted one of the same
+    /// `name@version` (scoped `resolutions`, or a workspace member added
+    /// after the rewire, then `yarn install`) installs the registry bytes
+    /// too, so the hosted ref is contested in the same lock — the rule
+    /// `vex`'s yarn PnP loader check relies on, since a loader that names
+    /// both locators still names the patch (#1033 review). A registry
+    /// locator of another version contests nothing.
+    #[tokio::test]
+    async fn berry_registry_locator_beside_a_hosted_one_contests_it() {
+        let url = hosted_url("npm", "left-pad", "1.3.0", UUID_A, "left-pad-1.3.0.tgz");
+        let hosted = berry_block(
+            "left-pad@npm:1.3.0",
+            "1.3.0",
+            &format!("left-pad@npm:1.3.0::__archiveUrl={}", archive(&url)),
+            Some("10c0/aaaa"),
+        );
+        for (version, contested) in [("1.3.0", true), ("1.2.0", false)] {
+            let registry = berry_block(
+                &format!("left-pad@npm:^{version}"),
+                version,
+                &format!("left-pad@npm:{version}"),
+                Some("10c0/bbbb"),
+            );
+            let p = Project::new();
+            p.write("yarn.lock", berry(&[hosted.clone(), registry]));
+            let out = run(&p).await;
+            assert_eq!(out.refs.is_empty(), contested, "{version}: {:#?}", out.refs);
+            if contested {
+                assert!(
+                    out.diagnostics
+                        .iter()
+                        .any(|d| d.code == DIAG_REF_UNATTRIBUTABLE
+                            && d.detail.contains("left-pad@npm:^1.3.0")
+                            && d.detail.contains("UNPATCHED")),
+                    "{:#?}",
+                    out.diagnostics
+                );
+            }
         }
     }
 

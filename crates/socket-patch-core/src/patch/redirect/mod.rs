@@ -36,6 +36,7 @@ pub use bun_binary::{preflight_bun_binary, rewrite_bun_binary};
 mod cargo_lock_equivalence_tests;
 #[cfg(test)]
 mod composer_equivalence_tests;
+pub(crate) mod generation;
 #[cfg(test)]
 mod golang_equivalence_tests;
 pub mod golang_local;
@@ -48,45 +49,48 @@ mod pdm;
 mod pipenv;
 pub mod presence;
 // The pnpm hosted planner lives with the format's model.
-use crate::formats::pnpm::plan_hosted;
+use crate::formats::cargo::hosted::CargoLockPlan;
+#[cfg(test)]
+use crate::formats::cargo::hosted::CARGO_LOCK_REFERENCE_KIND;
 use crate::formats::cargo::CargoLock;
 use crate::formats::composer::hosted::rewrite_composer_lock;
 use crate::formats::gem::gemfile;
 use crate::formats::gem::hosted::{checksum_entry_span, converge_gem_lock_source};
-use crate::formats::gem::lock_lists_direct_dependency;
-pub(crate) use crate::formats::yarn::is_berry_lock;
-use crate::formats::cargo::hosted::CargoLockPlan;
-#[cfg(test)]
-use crate::formats::cargo::hosted::CARGO_LOCK_REFERENCE_KIND;
+use crate::formats::gem::{lock_lists_direct_dependency, locked_specs as gem_locked_specs};
 #[cfg(test)]
 use crate::formats::pnpm::hosted::pnpm_unrewritten_instances;
+use crate::formats::pnpm::plan_hosted;
 use crate::formats::yarn::berry_entry::{manifest_bin, render_pinned_entry, Pin};
+pub(crate) use crate::formats::yarn::is_berry_lock;
+pub mod gradle;
 #[cfg(test)]
 mod pnpm_equivalence_tests;
 #[cfg(test)]
 mod platform_wheel_tests;
 mod poetry;
+mod pypi_takeover;
+pub use pypi_takeover::preflight_pypi_takeover;
 #[cfg(test)]
 mod python_lock_equivalence_tests;
 mod requirements;
-pub mod gradle;
 pub mod sbt;
 pub mod scala_guidance;
 pub use requirements::preflight_requirements_takeover;
+pub(crate) mod hosted_url;
 mod staged;
 mod state;
-pub(crate) mod hosted_url;
 pub mod upstream;
 pub mod vlt;
 pub mod vlt_heal;
 pub mod vlt_preflight;
-pub use state::{
-    load_redirect_state, save_redirect_state,
-    CorruptRedirectState, RedirectState, REDIRECT_STATE_REL,
-};
+pub mod yarnrc;
 /// Hosted-artifact leaf ownership rule, shared with `vex`'s bun lockfile
 /// discovery (which recovers a URL tuple's version from that leaf).
 pub(crate) use hosted_url::{hosted_url_names, hosted_url_version};
+pub use state::{
+    load_redirect_state, save_redirect_state, CorruptRedirectState, RedirectState,
+    REDIRECT_STATE_REL,
+};
 
 /// One ecosystem's integrity hashes (mirrors the TS `PatchArtifactIntegrity`).
 #[derive(Debug, Clone, Default, Deserialize)]
@@ -499,14 +503,15 @@ pub fn pipenv_reserialized_around_reference(
 }
 
 /// Whether `pdm.lock` is the project's PyPI install driver: present, with no
-/// `uv.lock` or `poetry.lock` beside it (mirroring the vendored flavor
-/// precedence uv > poetry > pdm > pipenv). A leftover `pdm.lock` beside one
-/// of those neither blocks nor is attested through them. `pub` so the CLI's
-/// hosted confirmation gate can share the predicate instead of re-deriving it.
+/// higher-ranked tool lock (`uv.lock`, `poetry.lock`) beside it, by the
+/// shared precedence [`crate::formats::governing_locks::PYPI_TOOL_LOCKS`]. A
+/// leftover `pdm.lock` beside one of those neither blocks nor is attested
+/// through them. `pub` so the CLI's hosted confirmation gate can share the
+/// predicate instead of re-deriving it.
 pub fn pdm_drives(files: &BTreeMap<String, String>) -> bool {
-    files.contains_key("pdm.lock")
-        && !files.contains_key("uv.lock")
-        && !files.contains_key("poetry.lock")
+    crate::formats::governing_locks::pypi_tool_lock_governs("pdm.lock", |lock| {
+        files.contains_key(lock)
+    })
 }
 
 /// `overrides` minus the deps whose patch uuid is in `refused` — borrowed
@@ -547,15 +552,17 @@ pub fn rewrite_registry_redirect_with_pipenv_version(
         bun_lockb_present,
         &std::collections::BTreeSet::new(),
         &std::collections::BTreeSet::new(),
+     &yarnrc::OuterYarnMirror::default(),
     )
 }
 
 /// #701 / #932: the patch service can grant a pypi patch as a platform- or
-/// ABI-tagged wheel (`…-cp311-cp311-manylinux…whl`). Every hosted PyPI lock
-/// (uv.lock, PEP 723 script locks, pylock.toml, Pipfile.lock, poetry.lock,
-/// pdm.lock, requirements.txt, Hatch's pyproject) is meant to install on
-/// any platform its markers allow, and a hosted pin narrows the entry to
-/// that one wheel: installs on any other interpreter, OS or architecture
+/// ABI-tagged wheel (`…-cp311-cp311-manylinux…whl`), or as a pure wheel
+/// bound to one interpreter (`…-cp311-none-any.whl`, #1048). Every hosted
+/// PyPI lock (uv.lock, PEP 723 script locks, pylock.toml, Pipfile.lock,
+/// poetry.lock, pdm.lock, requirements.txt, Hatch's pyproject) is meant to
+/// install on any platform its markers allow, and a hosted pin narrows the
+/// entry to that one wheel: installs on any other interpreter, OS or architecture
 /// then fail, and hosted rollback cannot derive which upstream wheels to
 /// put back. Fail closed like hosted gem (`redirect_gem_platform_unsupported`).
 /// The tags are read the way vendored mode reads them for
@@ -581,9 +588,10 @@ pub fn pypi_platform_wheel_refusal(dep: &DepOverride) -> Option<RewriteWarning> 
     platform_locked.then(|| RewriteWarning {
         code: "redirect_pypi_platform_wheel".into(),
         detail: format!(
-            "the patched wheel for {}=={} is platform-specific ({tags}); pinning it \
-             would make the project's Python lockfiles install it on this platform \
-             only, so the redirect is skipped and nothing was written for it",
+            "the patched wheel for {}=={} is interpreter- or platform-specific \
+             ({tags}); pinning it would make the project's Python lockfiles install \
+             it on this interpreter or platform only, so the redirect is skipped and \
+             nothing was written for it",
             dep.name, dep.version
         ),
     })
@@ -614,6 +622,7 @@ fn withhold_pypi_platform_wheels<'a>(
 /// project installs from. `gradle_unreadable` are the Gradle build files
 /// the host found but could not read as text: the Gradle planner refuses
 /// the build rather than take them for absent.
+#[allow(clippy::too_many_arguments)]
 pub fn rewrite_registry_redirect_withholding_vlt(
     files: &BTreeMap<String, String>,
     overrides: &[DepOverride],
@@ -622,6 +631,7 @@ pub fn rewrite_registry_redirect_withholding_vlt(
     bun_lockb_present: bool,
     vlt_withheld: &std::collections::BTreeSet<String>,
     gradle_unreadable: &std::collections::BTreeSet<String>,
+    yarn_outer: &yarnrc::OuterYarnMirror,
 ) -> RewriteResult {
     let mut result = RewriteResult::default();
     let overrides = withhold_pypi_platform_wheels(overrides, &mut result);
@@ -647,6 +657,7 @@ pub fn rewrite_registry_redirect_withholding_vlt(
         bun_lockb_present,
         artifact_metadata,
         gradle_unreadable,
+        yarn_outer,
     );
     let mut result = rewrite_groups_parallel(result, &groups);
     result.vlt_drives = vlt::vlt_drives(files, bun_lockb_present);
@@ -672,12 +683,13 @@ fn rewriter_groups<'a>(
     bun_lockb_present: bool,
     artifact_metadata: &'a BTreeMap<String, String>,
     gradle_unreadable: &'a std::collections::BTreeSet<String>,
+    yarn_outer: &'a yarnrc::OuterYarnMirror,
 ) -> Vec<RewriterGroup<'a>> {
     vec![
         Box::new(move |result| {
             rewrite_npm_lock(files, overrides, result);
             plan_hosted(files, overrides, result);
-            rewrite_yarn_classic(files, overrides, result);
+            rewrite_yarn_classic_with(files, overrides, yarn_outer, result);
             rewrite_yarn_berry_with_manifests(files, overrides, artifact_metadata, result);
             rewrite_bun_lock(files, overrides, result);
         }),
@@ -1048,14 +1060,10 @@ fn rewrite_npm_lock(
         // lockfile exists at all. A vlt project without its lock gets
         // `redirect_vlt_no_lockfile` from the vlt rewriter instead.
         let sibling_lock_present = files.keys().any(|k| {
-            k == "yarn.lock"
-                || k == "bun.lock"
-                || k == "bun.lockb"
-                || k == "pnpm-lock.yaml"
+            crate::formats::governing_locks::npm_lock_files().any(|lock| k == lock)
                 || k.ends_with("/pnpm-lock.yaml")
                 || k == "shrinkwrap.yaml"
                 || k.ends_with("/shrinkwrap.yaml")
-                || k == crate::constants::npm_family::VLT_LOCK
                 || k == crate::constants::npm_family::VLT_CONFIG
                 || k == crate::constants::npm_family::VLT_HIDDEN_LOCK_REL
         });
@@ -1513,6 +1521,9 @@ fn rewrite_cargo(
         .map(|t| to_lf(cargo_config_key, t))
         .unwrap_or_default();
     let (mut lock_changed, mut config_changed) = (false, false);
+    // The manifests as they arrived: a generation they pin that the final
+    // manifests no longer do was superseded by this run (see below).
+    let manifests_before: Vec<String> = manifests.iter().map(|(_, t)| t.clone()).collect();
 
     for dep in &cargo {
         let Some(ov) = registry_override_of_kind(dep, "cargo-sparse") else {
@@ -1575,7 +1586,7 @@ fn rewrite_cargo(
             });
             continue;
         }
-        let reg = format!("socket-patch-{}", dep.patch_uuid);
+        let reg = generation::hosted_pin_name(&dep.patch_uuid);
         let index_url = &ov.index_url;
 
         // 1. Plan the Cargo.toml pin FIRST — it is the gate for everything
@@ -1793,6 +1804,46 @@ fn rewrite_cargo(
             LockCommit::InPlace | LockCommit::Absent => {}
         }
         result.confirmed_cargo_uuids.insert(dep.patch_uuid.clone());
+    }
+
+    // A re-pin to a superseding patch moved every declaration off the old
+    // generation's registry: its `[registries.socket-patch-<old>]` block is
+    // now referenced by nothing, so it goes with the re-pin (#864) — left in
+    // place it outlives even `remove`, token-bearing index URL and all.
+    let superseded = generation::superseded_generations(
+        manifests_before.iter().map(String::as_str),
+        manifests.iter().map(|(_, t)| t.as_str()),
+    );
+    for uuid in superseded {
+        if cargo_lock
+            .as_deref()
+            .is_some_and(|lock| lock.contains(&uuid))
+        {
+            continue;
+        }
+        let reg = generation::hosted_pin_name(&uuid);
+        let Some(removed) = upstream::cargo::remove_registry_block(&cargo_config, &reg) else {
+            continue;
+        };
+        // The block opened the file: don't leave a blank first line behind.
+        let opened_file = cargo_config
+            .lines()
+            .next()
+            .is_some_and(|l| l.trim() == format!("[registries.{reg}]"));
+        let removed = match removed.strip_prefix('\n') {
+            Some(rest) if opened_file => rest.to_string(),
+            _ => removed,
+        };
+        result.edits.push(FileEdit {
+            path: cargo_config_key.into(),
+            kind: "redirect_cargo_superseded_registry_removed".into(),
+            action: "removed".into(),
+            key: Some(reg),
+            original: None,
+            new: None,
+        });
+        cargo_config = removed;
+        config_changed = true;
     }
 
     let restore = |path: &str, text: String| -> String {
@@ -2182,27 +2233,11 @@ fn is_valid_gem_index_url(url: &str) -> bool {
         && !url.chars().any(|c| c.is_control() || c == ' ')
 }
 
-/// The uuid of a Socket-owned registry / repository / source NAME in its
-/// EXACT grammar: `socket-patch-<canonical-uuid>`, or with `vendored`
-/// `socket-patch-vendor-<canonical-uuid>` (maven's vendored repository id).
-/// No trimming: the rewriter must never treat a user's padded pin as its
-/// own, while lockfile discovery trims at its call site
-/// (`vex::discover::socket_patch_name_uuid`).
-pub(crate) fn socket_patch_name_uuid_exact(name: &str, vendored: bool) -> Option<&str> {
-    let prefix = if vendored {
-        "socket-patch-vendor-"
-    } else {
-        "socket-patch-"
-    };
-    name.strip_prefix(prefix)
-        .filter(|uuid| crate::patch::path_safety::is_canonical_uuid(uuid))
-}
-
 /// A registry name THIS rewriter owns: `socket-patch-<canonical-uuid>`. An
 /// existing pin matching this grammar was written by a previous run and may be
 /// superseded in place; any other registry pin is the user's and is refused.
 fn is_socket_patch_registry_name(value: &str) -> bool {
-    socket_patch_name_uuid_exact(value, false).is_some()
+    generation::pin_name_uuid(value, false).is_some()
 }
 
 /// The `socket-patch-<uuid>` registry name pinning `crate_name` in this
@@ -3332,84 +3367,16 @@ fn plan_cargo_config(
 /// `yarn-offline-mirror` setting.
 pub const YARNRC_REL: &str = ".yarnrc";
 
-/// The `yarn-offline-mirror` directory a project-level `.yarnrc` or
-/// `.npmrc` configures, if any. Yarn 1 reads the key from its own
-/// `.yarnrc` first and falls back to the npm config, so a `.yarnrc` entry
-/// (even `false`) wins over `.npmrc`. An empty value or `false` means no
-/// mirror.
-pub fn yarn_classic_offline_mirror(yarnrc: Option<&str>, npmrc: Option<&str>) -> Option<String> {
-    let value = yarnrc
-        .and_then(yarnrc_value_of_offline_mirror)
-        .or_else(|| npmrc.and_then(npmrc_value_of_offline_mirror))?;
-    (!value.is_empty() && value != "false").then_some(value)
-}
-
-const YARN_OFFLINE_MIRROR_KEY: &str = "yarn-offline-mirror";
-
-/// Strip one pair of matching quotes, as yarn's `.yarnrc` parser and npm's
-/// ini parser both do.
-fn unquote_rc_value(raw: &str) -> &str {
-    let raw = raw.trim();
-    for q in ['"', '\''] {
-        if raw.len() >= 2 && raw.starts_with(q) && raw.ends_with(q) {
-            return &raw[1..raw.len() - 1];
-        }
-    }
-    raw
-}
-
-/// The last `yarn-offline-mirror` value in a `.yarnrc` (`key value` or
-/// `key: value` lines, key optionally quoted, `#` comments); later lines
-/// override earlier ones.
-fn yarnrc_value_of_offline_mirror(text: &str) -> Option<String> {
-    let mut found = None;
-    for line in text.lines() {
-        let line = line.trim();
-        if line.is_empty() || line.starts_with('#') {
-            continue;
-        }
-        let (key, rest) = match line.strip_prefix('"') {
-            Some(quoted) => match quoted.split_once('"') {
-                Some((key, rest)) => (key, rest),
-                None => continue,
-            },
-            // yarn's `.yarnrc` parser also ends an unquoted key at `:`, so
-            // `key: value` and `key:value` set the key like `key value`.
-            None => match line.split_once(|c: char| c.is_whitespace() || c == ':') {
-                Some((key, rest)) => (key, rest),
-                None => (line, ""),
-            },
-        };
-        if key == YARN_OFFLINE_MIRROR_KEY {
-            let rest = rest.trim_start();
-            let rest = rest.strip_prefix(':').unwrap_or(rest);
-            found = Some(unquote_rc_value(rest).to_string());
-        }
-    }
-    found
-}
-
-/// The last top-level `yarn-offline-mirror` value in an `.npmrc` (ini
-/// `key = value` lines, `#`/`;` comments, `[section]` headers end the
-/// top level).
-fn npmrc_value_of_offline_mirror(text: &str) -> Option<String> {
-    let mut found = None;
-    for line in text.lines() {
-        let line = line.trim();
-        if line.starts_with('[') {
-            break;
-        }
-        if line.is_empty() || line.starts_with('#') || line.starts_with(';') {
-            continue;
-        }
-        let Some((key, value)) = line.split_once('=') else {
-            continue;
-        };
-        if unquote_rc_value(key) == YARN_OFFLINE_MIRROR_KEY {
-            found = Some(unquote_rc_value(value).to_string());
-        }
-    }
-    found
+/// The `yarn-offline-mirror` directory yarn 1 uses for the project, if
+/// any: the project's `.yarnrc` / `.npmrc` texts layered with the config
+/// yarn reads outside the project (`outer`, see [`yarnrc`]). `false` in
+/// either registry, or an empty value, means no mirror.
+pub fn yarn_classic_offline_mirror(
+    yarnrc: Option<&str>,
+    npmrc: Option<&str>,
+    outer: &yarnrc::OuterYarnMirror,
+) -> Option<yarnrc::MirrorSetting> {
+    yarnrc::effective_mirror(yarnrc, npmrc, outer)
 }
 
 /// The project-level refusal of the yarn classic hosted rewriter: a
@@ -3427,27 +3394,47 @@ pub fn preflight_yarn_classic_hosted(
     lock: &str,
     yarnrc: Option<&str>,
     npmrc: Option<&str>,
+    outer: &yarnrc::OuterYarnMirror,
 ) -> Result<(), RewriteWarning> {
     if is_berry_lock(lock) {
         return Ok(());
     }
-    match yarn_classic_offline_mirror(yarnrc, npmrc) {
-        Some(mirror) => Err(RewriteWarning {
+    match yarn_classic_offline_mirror(yarnrc, npmrc, outer) {
+        Some(yarnrc::MirrorSetting {
+            value: yarnrc::MirrorValue::Path(mirror),
+            origin,
+        }) => Err(RewriteWarning {
             code: "redirect_yarn_classic_offline_mirror".into(),
             detail: format!(
-                "the project sets `yarn-offline-mirror` ({mirror}); yarn looks mirror \
+                "the project sets `yarn-offline-mirror` ({mirror}, from {origin}); yarn looks mirror \
                  tarballs up by file name, and the hosted tarball has the same name as \
                  the upstream one, so installs would get the unpatched bytes and fail \
                  the integrity check; leaving yarn.lock untouched (use --mode vendored)"
             ),
         }),
-        None => Ok(()),
+        _ => Ok(()),
     }
 }
 
+/// [`rewrite_yarn_classic_with`] seeing only the project's rc files.
+#[cfg(test)]
 fn rewrite_yarn_classic(
     files: &BTreeMap<String, String>,
     overrides: &[DepOverride],
+    result: &mut RewriteResult,
+) {
+    rewrite_yarn_classic_with(
+        files,
+        overrides,
+        &yarnrc::OuterYarnMirror::default(),
+        result,
+    )
+}
+
+fn rewrite_yarn_classic_with(
+    files: &BTreeMap<String, String>,
+    overrides: &[DepOverride],
+    yarn_outer: &yarnrc::OuterYarnMirror,
     result: &mut RewriteResult,
 ) {
     use crate::vendor::yarn_classic_lock::{split_key_patterns, split_pattern};
@@ -3468,6 +3455,7 @@ fn rewrite_yarn_classic(
         raw,
         files.get(YARNRC_REL).map(String::as_str),
         files.get(npmrc::NPMRC_REL).map(String::as_str),
+        yarn_outer,
     )
     .err();
     // CRLF locks (core.autocrlf Windows checkouts — yarn v1 parses them fine)
@@ -3519,6 +3507,7 @@ fn rewrite_yarn_classic(
             Regex::new(&(String::from(r#"\n {2}version ""#) + &regex::escape(&dep.version) + "\""))
                 .expect("version regex from the escaped version is valid");
         let mut matched_any = false;
+        let mut pinned_any = false;
         let mut alias_skipped = false;
         let mut copy_skipped = false;
         for (i, block) in blocks.iter_mut().enumerate() {
@@ -3606,8 +3595,21 @@ fn rewrite_yarn_classic(
                 result
                     .refused_yarn_classic_uuids
                     .insert(dep.patch_uuid.clone());
+                // The refusal leaves this entry as it was, so it carries a
+                // hosted pin only if an earlier run already wrote one — this
+                // run's URL, or one on the same patch server from an earlier
+                // grant token or patch uuid.
+                pinned_any |= resolved_re.find(block).is_some_and(|m| {
+                    let url = m
+                        .as_str()
+                        .trim_start_matches("\n  resolved \"")
+                        .trim_end_matches('"');
+                    let url = url.split_once('#').map_or(url, |(u, _)| u);
+                    berry_hosted_pin_is_ours(url, &fname, Some(&dep.version), &dep.artifact_url)
+                });
                 continue;
             }
+            pinned_any = true;
             let frag = dep
                 .integrity
                 .sha1
@@ -3664,7 +3666,7 @@ fn rewrite_yarn_classic(
                 detail: format!("no yarn.lock entry resolving {fname}@{}", dep.version),
             });
         }
-        any_pinned |= matched_any;
+        any_pinned |= pinned_any;
     }
     // Yarn 2+ (berry) migrates a classic lock on install and re-resolves
     // every entry from the registry, dropping the hosted pins this lock now
@@ -4260,7 +4262,12 @@ fn rewrite_yarn_berry_with_manifests(
             result.edits.push(FileEdit {
                 path: BERRY_MANIFEST.into(),
                 kind: "redirect_yarn_berry_resolution".into(),
-                action: if original.is_some() { "rewritten" } else { "added" }.into(),
+                action: if original.is_some() {
+                    "rewritten"
+                } else {
+                    "added"
+                }
+                .into(),
                 key: Some(selector),
                 original: original.map(Value::String),
                 new: Some(Value::String(dep.artifact_url.clone())),
@@ -4502,7 +4509,10 @@ impl BerryResolutionsPin {
         }
         let mut changed = Vec::new();
         for selector in &self.selectors {
-            let previous = table.get(selector).and_then(Value::as_str).map(str::to_string);
+            let previous = table
+                .get(selector)
+                .and_then(Value::as_str)
+                .map(str::to_string);
             if previous.as_deref() != Some(url) {
                 table.insert(selector.clone(), Value::String(url.to_string()));
                 changed.push((selector.clone(), previous));
@@ -4684,7 +4694,11 @@ fn berry_catalog_selectors(yarnrc: Option<&str>, name: &str, ranges: &[&str]) ->
 /// order before the edit (`was_sorted`, from [`berry_entries_sorted`]; a
 /// hand-edited lock) keeps the entry in place, so a pin and its rollback
 /// still round-trip byte-exactly.
-pub(crate) fn berry_reposition_blocks(blocks: &mut Vec<String>, moved: &[String], was_sorted: bool) {
+pub(crate) fn berry_reposition_blocks(
+    blocks: &mut Vec<String>,
+    moved: &[String],
+    was_sorted: bool,
+) {
     if !was_sorted {
         return;
     }
@@ -4708,7 +4722,6 @@ pub(crate) fn berry_reposition_blocks(blocks: &mut Vec<String>, moved: &[String]
         blocks.insert(to, block);
     }
 }
-
 
 // ── bun.lock (text lockfile) ─────────────────────────────────────────────────
 // A registry 4-tuple `["name@version", "<registry>", {deps}, "sha512-…"]` is
@@ -5343,7 +5356,6 @@ fn rewrite_uv_lock(
     }
 }
 
-
 // ── composer.lock ────────────────────────────────────────────────────────────
 /// Whether `text` points at `artifact_url` in any spelling a rewritten file may
 /// carry: the raw url every rewriter emits — composer.lock included, since
@@ -5563,7 +5575,7 @@ fn rewrite_nuget(
             .strip_prefix("sha512-")
             .unwrap_or(&sha512_sri)
             .to_string();
-        let reg = format!("socket-patch-{}", dep.patch_uuid);
+        let reg = generation::hosted_pin_name(&dep.patch_uuid);
         let id_lower = ov
             .identifiers
             .nuget_id_lower
@@ -6106,6 +6118,10 @@ fn rewrite_gem(
         })
         .unwrap_or_default();
 
+    // The specs the lock resolves, read once from the lock as it was handed
+    // in: the rewrites below only re-point specs, never change a version.
+    let locked = files.get(lock_name).map(|lk| gem_locked_specs(lk));
+
     for dep in &gem {
         let Some(ov) = registry_override_of_kind(dep, "rubygems-compact-index") else {
             result.warnings.push(RewriteWarning {
@@ -6203,6 +6219,26 @@ fn rewrite_gem(
                 ),
             });
             continue;
+        }
+
+        // Hosted mode re-points the version the lock resolves; it never
+        // picks a version. In a project that installs to the shared gem
+        // home, the crawl also returns versions other projects installed,
+        // and pinning one of those overwrites the user's constraint or adds
+        // an unresolvable top-level pin, so the next `bundle install`
+        // downgrades or fails (#1055). Skip a version no `GEM` section lists.
+        if let Some(specs) = &locked {
+            if !specs.contains(&(dep.name.as_str(), dep.version.as_str())) {
+                result.warnings.push(RewriteWarning {
+                    code: "redirect_gem_version_not_locked".into(),
+                    detail: format!(
+                        "{lock_name} does not resolve {} {} (it is installed on this \
+                         machine but this project doesn't lock it); redirect skipped",
+                        dep.name, dep.version
+                    ),
+                });
+                continue;
+            }
         }
 
         // Whether THIS dep's Gemfile source redirect is in place (just
@@ -6784,10 +6820,28 @@ fn rewrite_maven_pom(
     }
     let mut pom = files.get("pom.xml").cloned();
     let mut pom_changed = false;
+    // The hosted generations whose `socket-patch-<uuid>` repository the pom
+    // declared before this run: only a suffixed literal one of these minted
+    // is an earlier generation of OUR pin. A vendored reactor / sbt pin
+    // writes the same `-socket.<hex8>` suffix under a
+    // `socket-patch-vendor-<uuid>` repository, which stays a mismatch.
+    //
+    // One pass over the pom's repositories: `(id, url)` of each, which also
+    // answers the per-dep URL-refresh check below while the pom is still
+    // unchanged (a no-op rescan then never re-scans the pom per dep).
+    let original_repos: Vec<(String, Option<String>)> =
+        pom.as_deref().map(maven_repository_ids_and_urls).unwrap_or_default();
+    let hosted_repo_generations: std::collections::BTreeSet<String> = original_repos
+        .iter()
+        .filter_map(|(id, _)| generation::pin_name_uuid(id, false).map(str::to_string))
+        .collect();
     let mut mvn_config = files.get(MVN_CONFIG).cloned().unwrap_or_default();
     let mut mvn_config_changed = false;
     // (local-repo-relative path, bare sha256 hex) entries to merge in.
     let mut checksum_entries: Vec<(String, String)> = vec![];
+    // Trusted-checksum paths of superseded generations' suffixed artifacts:
+    // their pins moved to the new generation this run, so the entries go.
+    let mut checksum_drops: Vec<String> = vec![];
     let gradle_build_present = gradle::gradle_build_present(files);
     let mut warned_no_pom = false;
     // Local-repo paths of the suffixed jars this run's Trusted Checksums pin
@@ -6833,7 +6887,7 @@ fn rewrite_maven_pom(
             continue;
         };
         // Unique-per-patch repository id (valid chars: alnum, `-`, `_`, `.`).
-        let repo_id = format!("socket-patch-{}", dep.patch_uuid);
+        let repo_id = generation::hosted_pin_name(&dep.patch_uuid);
 
         // LEGACY same-GAV fallback: no suffixed version means the patched jar is
         // served under its original GAV. Add the repository (transport checksum
@@ -6956,33 +7010,50 @@ fn rewrite_maven_pom(
                     .map(|((s, e), v)| (s, e, v))
             })
             .collect();
-        // Rewrite base → suffixed. Descending offset order so earlier edits
-        // don't shift later matches' offsets.
-        let mut to_rewrite: Vec<(usize, usize)> = versioned
+        // A `<base>-socket.<hex8>` literal for this release that is not the
+        // applied suffix, minted by a hosted `socket-patch-<uuid>` repository
+        // the pom declares, is an earlier generation of OUR pin (a
+        // superseding patch uuid): re-pin it like the base (#266).
+        let prior_generation = |v: &str| {
+            v != suffixed_version
+                && crate::formats::maven::split_socket_version(v).is_some_and(|(base, hex8)| {
+                    base == dep.version
+                        && hosted_repo_generations
+                            .iter()
+                            .any(|uuid| uuid.starts_with(hex8))
+                })
+        };
+        // Rewrite base (or a prior generation) → suffixed. Descending offset
+        // order so earlier edits don't shift later matches' offsets.
+        let mut to_rewrite: Vec<(usize, usize, String)> = versioned
             .iter()
-            .filter(|(_, _, v)| *v == dep.version)
-            .map(|(s, e, _)| (*s, *e))
+            .filter(|(_, _, v)| *v == dep.version || prior_generation(v))
+            .map(|(s, e, v)| (*s, *e, v.clone()))
             .collect();
         to_rewrite.sort_by(|a, b| b.0.cmp(&a.0));
-        for (start, end) in &to_rewrite {
+        let mut superseded_versions: Vec<String> = vec![];
+        for (start, end, was) in &to_rewrite {
             pom_text.replace_range(*start..*end, &suffixed_version);
             pom_changed = true;
             pin_landed = true;
+            if *was != dep.version && !superseded_versions.contains(was) {
+                superseded_versions.push(was.clone());
+            }
             result.edits.push(FileEdit {
                 path: "pom.xml".into(),
                 kind: "redirect_maven_dep_version".into(),
                 action: "rewritten".into(),
                 key: Some(format!("{group_id}:{artifact_id}")),
-                original: Some(Value::String(dep.version.clone())),
+                original: Some(Value::String(was.clone())),
                 new: Some(Value::String(suffixed_version.clone())),
             });
         }
-        // A literal version that is neither base nor the applied suffixed
-        // version disagrees with the row — skip it (don't guess). A dep whose
-        // only match is a mismatch adds no pin (versioned is non-empty, so the
-        // depMgmt branch below is skipped).
+        // A literal version that is neither base, the applied suffixed
+        // version nor an earlier generation disagrees with the row — skip it
+        // (don't guess). A dep whose only match is a mismatch adds no pin
+        // (versioned is non-empty, so the depMgmt branch below is skipped).
         for (_, _, v) in &versioned {
-            if *v != dep.version && *v != suffixed_version {
+            if *v != dep.version && *v != suffixed_version && !prior_generation(v) {
                 result.warnings.push(RewriteWarning {
                     code: "redirect_maven_dep_version_mismatch".into(),
                     detail: format!(
@@ -7032,6 +7103,75 @@ fn rewrite_maven_pom(
                 &suffixed_version,
                 "jar",
             ));
+        }
+
+        // The superseded generations' wiring: once no literal names an old
+        // suffix any more, its `socket-patch-<uuid>` repository and trusted
+        // checksums are referenced by nothing.
+        for old in &superseded_versions {
+            if pom_text.contains(old.as_str()) {
+                continue;
+            }
+            let hex8 = crate::formats::maven::split_socket_version(old)
+                .map(|(_, h)| h)
+                .unwrap_or_default();
+            // The suffix carries only the uuid's first eight hex digits: a
+            // `-socket.<hex8>` literal of another artifact still in the pom
+            // may be a different live pin whose uuid shares them, so its
+            // repository stays. The trusted checksums below are keyed by this
+            // artifact's own GAV, so they go either way.
+            let hex8_still_pinned = pom_text.contains(&format!("-socket.{hex8}"));
+            for old_uuid in generation::named_generations(pom_text) {
+                if hex8_still_pinned || old_uuid == dep.patch_uuid || !old_uuid.starts_with(hex8) {
+                    continue;
+                }
+                let old_id = generation::hosted_pin_name(&old_uuid);
+                if let Some(next) = remove_maven_repository(pom_text, &old_id) {
+                    *pom_text = next;
+                    pom_changed = true;
+                    result.edits.push(FileEdit {
+                        path: "pom.xml".into(),
+                        kind: "redirect_maven_superseded_repository_removed".into(),
+                        action: "removed".into(),
+                        key: Some(old_id),
+                        original: None,
+                        new: None,
+                    });
+                }
+            }
+            for ext in ["jar", "pom"] {
+                checksum_drops.push(local_repo_artifact_path(&group_id, &artifact_id, old, ext));
+            }
+        }
+
+        // A rotated grant token keeps the uuid but changes the repository
+        // URL: refresh the existing `socket-patch-<uuid>` repository in place
+        // so the pin keeps resolving through the current grant.
+        // While the pom is unchanged, `original_repos` already says whether
+        // the refresh would change anything (exactly one such repository,
+        // with a `<url>` that differs); skip the scan when it would not.
+        let refresh_may_apply = pom_changed || {
+            let mut ours = original_repos.iter().filter(|(id, _)| *id == repo_id);
+            match (ours.next(), ours.next()) {
+                (Some((_, Some(url))), None) => *url != ov.index_url,
+                _ => false,
+            }
+        };
+        if refresh_may_apply
+            && (pin_landed || versioned.iter().any(|(_, _, v)| *v == suffixed_version))
+        {
+            if let Some(next) = refresh_maven_repository_url(pom_text, &repo_id, &ov.index_url) {
+                *pom_text = next;
+                pom_changed = true;
+                result.edits.push(FileEdit {
+                    path: "pom.xml".into(),
+                    kind: "redirect_maven_repository".into(),
+                    action: "rewritten".into(),
+                    key: Some(repo_id.clone()),
+                    original: None,
+                    new: Some(json!({ "id": repo_id, "url": ov.index_url })),
+                });
+            }
         }
 
         // A pin landed this run: inject the repository (idempotent via the <id>
@@ -7102,16 +7242,31 @@ fn rewrite_maven_pom(
     if mvn_config_changed {
         result.files.insert(MVN_CONFIG.into(), mvn_config);
     }
-    if !checksum_entries.is_empty() {
-        let existing = files.get(MVN_CHECKSUMS).cloned().unwrap_or_default();
+    // LF-normalized, so the drop check and the filter below split lines the
+    // same way (a CRLF file's paths would otherwise keep a trailing `\r`).
+    let existing_checksums = files
+        .get(MVN_CHECKSUMS)
+        .map(|text| text.replace("\r\n", "\n"))
+        .unwrap_or_default();
+    let names_dropped_path = |line: &str| {
+        line.split_once("  ")
+            .is_some_and(|(_, p)| checksum_drops.iter().any(|d| d == p))
+    };
+    let drops_checksums = existing_checksums.split('\n').any(names_dropped_path);
+    if !checksum_entries.is_empty() || drops_checksums {
         let action = if files.contains_key(MVN_CHECKSUMS) {
             "rewritten"
         } else {
             "added"
         };
+        let kept: String = existing_checksums
+            .split('\n')
+            .filter(|l| !names_dropped_path(l))
+            .collect::<Vec<_>>()
+            .join("\n");
         result.files.insert(
             MVN_CHECKSUMS.into(),
-            merge_checksums(&existing, &checksum_entries),
+            merge_checksums(&kept, &checksum_entries),
         );
         result.edits.push(FileEdit {
             path: MVN_CHECKSUMS.into(),
@@ -7152,6 +7307,72 @@ fn rewrite_maven_pom(
             ),
         });
     }
+}
+
+static MAVEN_REPOSITORY_RE: LazyLock<Regex> = LazyLock::new(|| {
+    Regex::new(r"(?s)<repository>.*?</repository>").expect("static repository regex is valid")
+});
+
+/// The trimmed `<id>` and `<url>` texts of every `<repository>` element of
+/// `pom` that has an `<id>`, in document order: the same elements, ids and
+/// URLs [`maven_repositories_with_id`] and [`refresh_maven_repository_url`]
+/// read, in one pass.
+fn maven_repository_ids_and_urls(pom: &str) -> Vec<(String, Option<String>)> {
+    MAVEN_REPOSITORY_RE
+        .find_iter(pom)
+        .filter_map(|m| {
+            let id = maven_tag_text_in(pom, "id", m.start(), m.end())?;
+            let url = maven_tag_text_in(pom, "url", m.start(), m.end());
+            Some((id, url))
+        })
+        .collect()
+}
+
+/// The `<repository>` elements of `pom` whose `<id>` is `id`, as byte spans.
+pub(crate) fn maven_repositories_with_id(pom: &str, id: &str) -> Vec<(usize, usize)> {
+    MAVEN_REPOSITORY_RE
+        .find_iter(pom)
+        .filter(|m| maven_tag_text_in(pom, "id", m.start(), m.end()).as_deref() == Some(id))
+        .map(|m| (m.start(), m.end()))
+        .collect()
+}
+
+/// `pom` without the one `<repository>` whose `<id>` is `id` and the line
+/// break [`insert_maven_repository`] put before it; `None` unless exactly
+/// one such element sits on lines of its own (anything else is not the
+/// rewriter's insertion, and stays).
+pub(crate) fn remove_maven_repository(pom: &str, id: &str) -> Option<String> {
+    let [(start, end)] = maven_repositories_with_id(pom, id)[..] else {
+        return None;
+    };
+    let line_start = pom[..start].rfind('\n')?;
+    let own_lines = pom[line_start + 1..start].trim().is_empty()
+        && (pom[end..].starts_with('\n') || pom[end..].starts_with("\r\n"));
+    if !own_lines {
+        return None;
+    }
+    let cut = if pom[..line_start].ends_with('\r') {
+        line_start - 1
+    } else {
+        line_start
+    };
+    Some(format!("{}{}", &pom[..cut], &pom[end..]))
+}
+
+/// `pom` with the `<url>` of its one `<repository>` whose `<id>` is `id` set
+/// to `url`; `None` when there is no such single element or it already
+/// points there.
+fn refresh_maven_repository_url(pom: &str, id: &str, url: &str) -> Option<String> {
+    let [(start, end)] = maven_repositories_with_id(pom, id)[..] else {
+        return None;
+    };
+    let (s, e) = maven_tag_inner_range(pom, "url", start, end)?;
+    if pom[s..e].trim() == url {
+        return None;
+    }
+    let mut out = pom.to_string();
+    out.replace_range(s..e, url);
+    Some(out)
 }
 
 /// Insert the socket-patch `<repository>` block: releases enabled with
@@ -7557,6 +7778,36 @@ fn rewrite_golang(
                         dep.version
                     ))),
                 });
+            }
+        }
+        // A refresh that moved the pin to another generation (a superseding
+        // patch uuid, or the same uuid republished at a new version) owns the
+        // previous target's go.sum pair too: nothing references it any more,
+        // so `go mod tidy` would prune it, and leaving it makes the first
+        // day-2 tidy rewrite go.sum (#682).
+        if let Some((old_module, old_version)) = prior
+            .filter(|e| e.owner == Some(go_mod_edit::ReplaceOwner::Hosted))
+            .and_then(|e| e.rhs_module.as_deref().zip(e.rhs_version.as_deref()))
+            .filter(|&(m, v)| (m, v) != (rhs_module.as_str(), rhs_version.as_str()))
+        {
+            let still_targeted = go_mod_edit::parse_replace_entries(&go_mod).iter().any(|e| {
+                e.rhs_module.as_deref() == Some(old_module)
+                    && e.rhs_version.as_deref() == Some(old_version)
+            });
+            if !still_targeted {
+                if let Some(removed) =
+                    go_sum.remove_exact_module_version_lines(old_module, old_version)
+                {
+                    sum_changed = true;
+                    result.edits.push(FileEdit {
+                        path: "go.sum".into(),
+                        kind: "redirect_golang_superseded_gosum_removed".into(),
+                        action: "removed".into(),
+                        key: Some(format!("{old_module}@{old_version}")),
+                        original: Some(Value::String(removed.join("\n"))),
+                        new: None,
+                    });
+                }
             }
         }
         if go_sum.upsert_module_lines(rhs_module, rhs_version, zip_h1, gomod_h1) {
@@ -8378,7 +8629,10 @@ mod tests {
             let files = BTreeMap::from([("nuget.config".into(), config)]);
             let result = rewrite_registry_redirect(&files, &[nuget_override()]);
             let out = result.files.get("nuget.config").expect("config rewritten");
-            assert!(out.contains(&source), "original source bytes preserved: {out}");
+            assert!(
+                out.contains(&source),
+                "original source bytes preserved: {out}"
+            );
             // XML normalizes literal attribute whitespace to spaces, but
             // preserves character references. The fallback must keep the
             // same source identity under a real XML reader, not just ours.
@@ -8935,7 +9189,11 @@ mod tests {
     #[test]
     fn yarn_berry_hosted_pin_routes_resolutions_to_a_tarball_entry() {
         let checksum = format!("10c0/{}", "7".repeat(128));
-        let scoped_url = berry_hosted_url("@isaacs/string-locale-compare", "string-locale-compare", "1.1.0");
+        let scoped_url = berry_hosted_url(
+            "@isaacs/string-locale-compare",
+            "string-locale-compare",
+            "1.1.0",
+        );
         let plain_url = berry_hosted_url("left-pad", "left-pad", "1.3.0");
         let scoped = DepOverride {
             namespace: Some("@isaacs".into()),
@@ -8968,8 +9226,14 @@ mod tests {
             )),
             "unscoped entry re-keyed to its tarball: {out}"
         );
-        assert!(!out.contains("__archiveUrl") && !out.contains("@npm:"), "{out}");
-        assert!(out.ends_with("linkType: hard\n"), "trailing newline kept: {out:?}");
+        assert!(
+            !out.contains("__archiveUrl") && !out.contains("@npm:"),
+            "{out}"
+        );
+        assert!(
+            out.ends_with("linkType: hard\n"),
+            "trailing newline kept: {out:?}"
+        );
         let manifest: Value = serde_json::from_str(&r.files["package.json"]).unwrap();
         assert_eq!(
             manifest["resolutions"],
@@ -8981,11 +9245,17 @@ mod tests {
         );
         assert_eq!(manifest["name"], "app", "the rest of the manifest is kept");
         assert_eq!(
-            r.edits.iter().filter(|e| e.kind == "redirect_yarn_berry_entry").count(),
+            r.edits
+                .iter()
+                .filter(|e| e.kind == "redirect_yarn_berry_entry")
+                .count(),
             2
         );
         assert_eq!(
-            r.edits.iter().filter(|e| e.kind == "redirect_yarn_berry_resolution").count(),
+            r.edits
+                .iter()
+                .filter(|e| e.kind == "redirect_yarn_berry_resolution")
+                .count(),
             2
         );
     }
@@ -9218,10 +9488,7 @@ mod tests {
         rewrite_yarn_berry(&files, std::slice::from_ref(&ovr), &mut r);
         assert!(r.warnings.is_empty(), "{:?}", r.warnings);
         let out = &r.files["yarn.lock"];
-        let keys: Vec<&str> = out
-            .lines()
-            .filter(|l| l.starts_with('"'))
-            .collect();
+        let keys: Vec<&str> = out.lines().filter(|l| l.starts_with('"')).collect();
         assert_eq!(
             keys,
             vec![
@@ -9265,7 +9532,11 @@ mod tests {
         let mut again = RewriteResult::default();
         rewrite_yarn_berry(&pinned, std::slice::from_ref(&ovr), &mut again);
         assert!(again.warnings.is_empty(), "{:?}", again.warnings);
-        assert!(again.files.is_empty(), "repeat run rewrites nothing: {:?}", again.files);
+        assert!(
+            again.files.is_empty(),
+            "repeat run rewrites nothing: {:?}",
+            again.files
+        );
         // A pin already complete is confirmed without a write.
         assert!(again.confirmed_yarn_berry_uuids.contains(BERRY_UUID));
 
@@ -9278,7 +9549,10 @@ mod tests {
         assert!(out.contains(&format!("\"left-pad@{new_url}\":")), "{out}");
         assert!(!out.contains(BERRY_UUID), "{out}");
         let manifest: Value = serde_json::from_str(&repin.files["package.json"]).unwrap();
-        assert_eq!(manifest["resolutions"], json!({"left-pad@npm:^1.3.0": new_url}));
+        assert_eq!(
+            manifest["resolutions"],
+            json!({"left-pad@npm:^1.3.0": new_url})
+        );
     }
 
     /// The URL-keyed lock entry alone is half a pin: with its manifest
@@ -9525,7 +9799,9 @@ mod tests {
         assert!(r.warnings.is_empty(), "{:?}", r.warnings);
         let out = &r.files["yarn.lock"];
         assert!(
-            out.contains(&format!("\"left-pad@{url}\":\n  version: 1.3.0\n  resolution: \"left-pad@{url}\"\n")),
+            out.contains(&format!(
+                "\"left-pad@{url}\":\n  version: 1.3.0\n  resolution: \"left-pad@{url}\"\n"
+            )),
             "{out}"
         );
         assert!(!out.contains("__archiveUrl"), "{out}");
@@ -9551,10 +9827,17 @@ mod tests {
                 "{{\n  \"name\": \"app\",\n  \"resolutions\": {{\n    \"{selector}\": \"1.3.0\"\n  }}\n}}\n"
             );
             let mut r = RewriteResult::default();
-            rewrite_yarn_berry(&berry_files(berry_lock("10c0"), manifest), std::slice::from_ref(&ovr), &mut r);
+            rewrite_yarn_berry(
+                &berry_files(berry_lock("10c0"), manifest),
+                std::slice::from_ref(&ovr),
+                &mut r,
+            );
             assert!(r.files.is_empty(), "{label}: {:?}", r.files);
             assert_eq!(
-                r.warnings.iter().map(|w| w.code.as_str()).collect::<Vec<_>>(),
+                r.warnings
+                    .iter()
+                    .map(|w| w.code.as_str())
+                    .collect::<Vec<_>>(),
                 vec!["redirect_yarn_berry_resolutions_conflict"],
                 "{label}"
             );
@@ -9579,12 +9862,20 @@ mod tests {
             "mirror tarball"
         );
         // An unrelated user entry is kept as-is next to ours.
-        let manifest = "{\n  \"name\": \"app\",\n  \"resolutions\": {\n    \"other\": \"2.0.0\"\n  }\n}\n";
+        let manifest =
+            "{\n  \"name\": \"app\",\n  \"resolutions\": {\n    \"other\": \"2.0.0\"\n  }\n}\n";
         let mut r = RewriteResult::default();
-        rewrite_yarn_berry(&berry_files(berry_lock("10c0"), manifest.into()), std::slice::from_ref(&ovr), &mut r);
+        rewrite_yarn_berry(
+            &berry_files(berry_lock("10c0"), manifest.into()),
+            std::slice::from_ref(&ovr),
+            &mut r,
+        );
         assert!(r.warnings.is_empty(), "{:?}", r.warnings);
         let m: Value = serde_json::from_str(&r.files["package.json"]).unwrap();
-        assert_eq!(m["resolutions"], json!({"other": "2.0.0", "left-pad@npm:^1.3.0": url}));
+        assert_eq!(
+            m["resolutions"],
+            json!({"other": "2.0.0", "left-pad@npm:^1.3.0": url})
+        );
 
         let mut files = BTreeMap::new();
         files.insert("yarn.lock".to_string(), berry_lock("10c0"));
@@ -9592,7 +9883,10 @@ mod tests {
         rewrite_yarn_berry(&files, std::slice::from_ref(&ovr), &mut r);
         assert!(r.files.is_empty(), "{:?}", r.files);
         assert_eq!(
-            r.warnings.iter().map(|w| w.code.as_str()).collect::<Vec<_>>(),
+            r.warnings
+                .iter()
+                .map(|w| w.code.as_str())
+                .collect::<Vec<_>>(),
             vec!["redirect_yarn_berry_manifest_missing"]
         );
 
@@ -9603,10 +9897,17 @@ mod tests {
             berry_lock("10c0")
         );
         let mut r = RewriteResult::default();
-        rewrite_yarn_berry(&berry_files(with_patch, berry_manifest()), std::slice::from_ref(&ovr), &mut r);
+        rewrite_yarn_berry(
+            &berry_files(with_patch, berry_manifest()),
+            std::slice::from_ref(&ovr),
+            &mut r,
+        );
         assert!(r.files.is_empty(), "{:?}", r.files);
         let codes: Vec<&str> = r.warnings.iter().map(|w| w.code.as_str()).collect();
-        assert!(codes.contains(&"redirect_yarn_berry_shared_descriptor"), "{codes:?}");
+        assert!(
+            codes.contains(&"redirect_yarn_berry_shared_descriptor"),
+            "{codes:?}"
+        );
     }
 
     /// Yarn routes a URL locator to its tarball fetcher only when it is an
@@ -9631,7 +9932,10 @@ mod tests {
             assert!(r.files.is_empty(), "{url}: nothing written");
             assert!(r.edits.is_empty(), "{url}: {:?}", r.edits);
             assert_eq!(
-                r.warnings.iter().map(|w| w.code.as_str()).collect::<Vec<_>>(),
+                r.warnings
+                    .iter()
+                    .map(|w| w.code.as_str())
+                    .collect::<Vec<_>>(),
                 vec!["redirect_yarn_berry_artifact_url_unsupported"],
                 "{url}"
             );
@@ -10127,6 +10431,62 @@ mod tests {
         assert_eq!(berry_risk_count(&r), 0, "{:?}", r.warnings);
     }
 
+    /// An offline-mirror refusal writes no pin, so it must not also claim
+    /// the lock carries hosted pins; a pin an earlier run already wrote is
+    /// still at risk and still warned about.
+    #[test]
+    fn yarn_classic_berry_risk_follows_pins_under_offline_mirror_refusal() {
+        let lp = npm_override(
+            "left-pad",
+            "1.3.0",
+            "http://p.test/lp.tgz",
+            "sha512-PATCHED==",
+        );
+        let mut files = classic_files(Some(r#"{"name":"p"}"#));
+        let mut first = RewriteResult::default();
+        rewrite_yarn_classic(&files, std::slice::from_ref(&lp), &mut first);
+        let pinned_lock = first.files["yarn.lock"].clone();
+
+        files.insert(
+            YARNRC_REL.to_string(),
+            "yarn-offline-mirror ./mirror\n".to_string(),
+        );
+        let mut r = RewriteResult::default();
+        rewrite_yarn_classic(&files, std::slice::from_ref(&lp), &mut r);
+        let codes: Vec<&str> = r.warnings.iter().map(|w| w.code.as_str()).collect();
+        assert_eq!(codes, ["redirect_yarn_classic_offline_mirror"]);
+
+        files.insert("yarn.lock".into(), pinned_lock);
+        let mut r = RewriteResult::default();
+        rewrite_yarn_classic(&files, std::slice::from_ref(&lp), &mut r);
+        assert!(r.files.is_empty(), "{:?}", r.files);
+        assert_eq!(berry_risk_count(&r), 1, "{:?}", r.warnings);
+
+        // A pin from an earlier grant token or uuid on the same patch server
+        // is still lost on a berry migrate, so it is still warned about; a
+        // same-named tarball on another origin (a user mirror) is not ours.
+        let host = "https://patch.test/patch/npm/left-pad/1.3.0";
+        let current = npm_override(
+            "left-pad",
+            "1.3.0",
+            &format!("{host}/tok-new/uuid-new/left-pad-1.3.0.tgz"),
+            "sha512-PATCHED==",
+        );
+        for (old_url, expect) in [
+            (format!("{host}/tok-old/uuid-old/left-pad-1.3.0.tgz"), 1),
+            ("https://mirror.test/left-pad-1.3.0.tgz".to_string(), 0),
+        ] {
+            let pinned = classic_lock_two_entries().replace(
+                "https://registry.yarnpkg.com/left-pad/-/left-pad-1.3.0.tgz",
+                &old_url,
+            );
+            files.insert("yarn.lock".into(), pinned);
+            let mut r = RewriteResult::default();
+            rewrite_yarn_classic(&files, std::slice::from_ref(&current), &mut r);
+            assert_eq!(berry_risk_count(&r), expect, "{old_url}: {:?}", r.warnings);
+        }
+    }
+
     /// A CRLF classic lock (Windows `core.autocrlf` checkout) must rewrite
     /// the TARGET entry, not whichever entry happens to come first, and every
     /// untouched line must keep its CRLF ending byte-exactly (see the CRLF
@@ -10244,6 +10604,10 @@ mod tests {
             (YARNRC_REL, "\"yarn-offline-mirror\": \"./mirror\"\n"),
             (npmrc::NPMRC_REL, "yarn-offline-mirror = ./mirror\n"),
             (npmrc::NPMRC_REL, "yarn-offline-mirror=\"./mirror\"\n"),
+            // #1078: a BOM-prefixed rc (Notepad, PowerShell 5 utf8).
+            (YARNRC_REL, "\u{feff}yarn-offline-mirror \"./mirror\"\n"),
+            (YARNRC_REL, "\u{feff}yarn-offline-mirror \"./mirror\"\r\n"),
+            (npmrc::NPMRC_REL, "\u{feff}yarn-offline-mirror=./mirror\n"),
         ];
         for (rc, text) in cases {
             for lock in [
@@ -10276,6 +10640,109 @@ mod tests {
                 assert!(r.refused_yarn_classic_uuids.contains(&ovr.patch_uuid));
             }
         }
+    }
+
+    /// #1013: a mirror yarn reads from outside the project (an ancestor
+    /// or user rc, `yarn config set`, a `YARN_*` / `npm_config_*` env var)
+    /// refuses the rewrite like a project one, and a project `false`
+    /// still turns an outer file's mirror off.
+    #[test]
+    fn yarn_classic_outer_offline_mirror_refuses_rewrite() {
+        use yarnrc::{MirrorSetting, MirrorValue, OuterRegistryMirror, OuterYarnMirror};
+        let ovr = npm_override(
+            "left-pad",
+            "1.3.0",
+            "http://p.test/patch/npm/left-pad/1.3.0/tok/u/left-pad-1.3.0.tgz",
+            "sha512-PATCHED==",
+        );
+        let setting = |origin: &str| MirrorSetting {
+            value: MirrorValue::Path("/w/mirror".into()),
+            origin: origin.into(),
+        };
+        let file = |origin: &str| OuterRegistryMirror {
+            env: None,
+            file: Some(setting(origin)),
+        };
+        let env = |origin: &str| OuterRegistryMirror {
+            env: Some(setting(origin)),
+            file: None,
+        };
+        let refusing = [
+            OuterYarnMirror {
+                yarn: file("/w/root/.yarnrc"),
+                ..Default::default()
+            },
+            OuterYarnMirror {
+                yarn: file("/home/u/.yarnrc"),
+                ..Default::default()
+            },
+            OuterYarnMirror {
+                npm: file("/home/u/.npmrc"),
+                ..Default::default()
+            },
+            OuterYarnMirror {
+                yarn: env("YARN_YARN_OFFLINE_MIRROR"),
+                npm: env("YARN_YARN_OFFLINE_MIRROR"),
+            },
+            OuterYarnMirror {
+                npm: env("npm_config_yarn_offline_mirror"),
+                ..Default::default()
+            },
+        ];
+        for outer in &refusing {
+            let mut files = BTreeMap::new();
+            files.insert("yarn.lock".to_string(), classic_lock_two_entries());
+            let mut r = RewriteResult::default();
+            rewrite_yarn_classic_with(&files, std::slice::from_ref(&ovr), outer, &mut r);
+            assert!(
+                r.files.is_empty() && r.edits.is_empty(),
+                "{outer:?}: {:?}",
+                r.files
+            );
+            assert_eq!(
+                r.warnings
+                    .iter()
+                    .map(|w| w.code.as_str())
+                    .collect::<Vec<_>>(),
+                ["redirect_yarn_classic_offline_mirror"],
+                "{outer:?}"
+            );
+            assert!(
+                r.warnings[0].detail.contains("/w/mirror"),
+                "{}",
+                r.warnings[0].detail
+            );
+            assert!(r.refused_yarn_classic_uuids.contains(&ovr.patch_uuid));
+            assert!(preflight_yarn_classic_hosted(&files["yarn.lock"], None, None, outer).is_err());
+        }
+        // A project-level `false` overrides an outer FILE (yarn's
+        // first-found order), so the rewrite proceeds.
+        let mut files = BTreeMap::new();
+        files.insert("yarn.lock".to_string(), classic_lock_two_entries());
+        files.insert(
+            YARNRC_REL.to_string(),
+            "yarn-offline-mirror false\n".to_string(),
+        );
+        let mut r = RewriteResult::default();
+        rewrite_yarn_classic_with(&files, std::slice::from_ref(&ovr), &refusing[1], &mut r);
+        assert!(r.warnings.is_empty(), "{:?}", r.warnings);
+        assert!(r.files["yarn.lock"].contains("left-pad-1.3.0.tgz"));
+        // The full chain drives it too.
+        let mut r = rewrite_registry_redirect_withholding_vlt(
+            &BTreeMap::from([("yarn.lock".to_string(), classic_lock_two_entries())]),
+            std::slice::from_ref(&ovr),
+            &BTreeMap::new(),
+            None,
+            false,
+            &std::collections::BTreeSet::new(),
+            &std::collections::BTreeSet::new(),
+            &refusing[3],
+        );
+        assert!(!r.files.contains_key("yarn.lock"));
+        assert!(r
+            .warnings
+            .drain(..)
+            .any(|w| w.code == "redirect_yarn_classic_offline_mirror"));
     }
 
     /// No mirror, a disabled one, a look-alike key, or an `.npmrc` mirror
@@ -10320,10 +10787,12 @@ mod tests {
     #[test]
     fn yarn_classic_offline_mirror_preflight_scope() {
         let rc = Some("yarn-offline-mirror ./mirror\n");
-        assert!(preflight_yarn_classic_hosted(&classic_lock_two_entries(), rc, None).is_err());
-        assert!(preflight_yarn_classic_hosted(&classic_lock_two_entries(), None, None).is_ok());
+        let none = yarnrc::OuterYarnMirror::default();
+        let lock = classic_lock_two_entries();
+        assert!(preflight_yarn_classic_hosted(&lock, rc, None, &none).is_err());
+        assert!(preflight_yarn_classic_hosted(&lock, None, None, &none).is_ok());
         let berry = "__metadata:\n  version: 8\n  cacheKey: 10c0\n";
-        assert!(preflight_yarn_classic_hosted(berry, rc, None).is_ok());
+        assert!(preflight_yarn_classic_hosted(berry, rc, None, &none).is_ok());
 
         let other = npm_override("not-locked", "1.0.0", "http://p.test/x.tgz", "sha512-X==");
         let mut files = BTreeMap::new();
@@ -12134,6 +12603,22 @@ mod tests {
             cfg.contains(&format!("[registries.{}]", cargo_reg())),
             "{cfg}"
         );
+        // #864: the superseded generation's block is referenced by nothing
+        // any more and goes with the re-pin (no blank first line left).
+        assert!(!cfg.contains(&old_reg), "{cfg}");
+        assert_eq!(
+            cfg,
+            &format!(
+                "[registries.{}]\nindex = \"{}\"\n",
+                cargo_reg(),
+                cargo_index_url()
+            )
+        );
+        assert!(r
+            .edits
+            .iter()
+            .any(|e| e.kind == "redirect_cargo_superseded_registry_removed"
+                && e.key.as_deref() == Some(old_reg.as_str())));
         assert!(
             !r.warnings
                 .iter()
@@ -13199,6 +13684,92 @@ mod tests {
         assert!(r.confirmed_cargo_uuids.contains(CARGO_UUID));
     }
 
+    /// #1055: a gem version only another project installed into the shared
+    /// gem home reaches the redirect as a candidate. The lock resolves a
+    /// different version, so pinning the crawled one overwrites the user's
+    /// constraint (direct) or adds an unresolvable top-level pin
+    /// (transitive), and the next `bundle install` downgrades or fails.
+    /// Skip it before any write.
+    #[test]
+    fn gem_version_the_lock_does_not_resolve_is_never_pinned() {
+        let lock = "GEM\n  remote: https://rubygems.org/\n  specs:\n    colorize (1.1.0)\n    \
+                    mylib (1.0.0)\n      colorize (~> 1.0)\n    rake (13.2.1)\n\n\
+                    PLATFORMS\n  ruby\n\nDEPENDENCIES\n  DEPS\n\n\
+                    CHECKSUMS\n  colorize (1.1.0) sha256=aaaa\n\n\
+                    BUNDLED WITH\n   4.0.22\n";
+        // Direct: `gem "colorize", "~> 1.0"` locked at 1.1.0.
+        // Transitive: only `mylib` depends on colorize.
+        for (gemfile, deps) in [
+            (
+                "source \"https://rubygems.org\"\n\ngem \"rake\"\ngem \"colorize\", \"~> 1.0\"\n",
+                "colorize (~> 1.0)\n  rake",
+            ),
+            (
+                "source \"https://rubygems.org\"\n\ngem \"rake\"\ngem \"mylib\"\n",
+                "mylib\n  rake",
+            ),
+        ] {
+            let lock = lock.replace("DEPS", deps);
+            let mut files = BTreeMap::new();
+            files.insert("Gemfile".to_string(), gemfile.to_string());
+            files.insert("Gemfile.lock".to_string(), lock.clone());
+            let r = rewrite_registry_redirect(&files, &[gem_override("colorize", "0.8.1")]);
+            assert!(
+                r.files.is_empty() && r.edits.is_empty(),
+                "{gemfile}: an unlocked version must not be pinned\nfiles={:?} edits={:?}",
+                r.files,
+                r.edits
+            );
+            assert_eq!(
+                warning_codes(&r),
+                vec!["redirect_gem_version_not_locked"],
+                "{gemfile}: {:?}",
+                r.warnings
+            );
+        }
+        // A gem the lock doesn't list at all (installed for another project
+        // only) is skipped the same way, instead of being appended.
+        let mut files = BTreeMap::new();
+        files.insert(
+            "Gemfile".to_string(),
+            "source \"https://rubygems.org\"\ngem \"rake\"\n".to_string(),
+        );
+        files.insert(
+            "Gemfile.lock".to_string(),
+            lock.replace("DEPS", "rake")
+                .replace("    colorize (1.1.0)\n", "")
+                .replace("    mylib (1.0.0)\n      colorize (~> 1.0)\n", "")
+                .replace("  colorize (1.1.0) sha256=aaaa\n", ""),
+        );
+        let r = rewrite_registry_redirect(&files, &[gem_override("colorize", "0.8.1")]);
+        assert!(r.files.is_empty() && r.edits.is_empty(), "{:?}", r.files);
+        assert_eq!(
+            warning_codes(&r),
+            vec!["redirect_gem_version_not_locked"],
+            "{:?}",
+            r.warnings
+        );
+        // Control: the locked version itself is still pinned.
+        let mut files = BTreeMap::new();
+        files.insert(
+            "Gemfile".to_string(),
+            "source \"https://rubygems.org\"\n\ngem \"rake\"\ngem \"colorize\", \"~> 1.0\"\n"
+                .to_string(),
+        );
+        files.insert(
+            "Gemfile.lock".to_string(),
+            lock.replace("DEPS", "colorize (~> 1.0)\n  rake"),
+        );
+        let r = rewrite_registry_redirect(&files, &[gem_override("colorize", "1.1.0")]);
+        assert!(
+            !warning_codes(&r).contains(&"redirect_gem_version_not_locked"),
+            "{:?}",
+            r.warnings
+        );
+        let out = r.files.get("Gemfile").expect("locked version redirected");
+        assert!(out.contains("  gem \"colorize\", \"1.1.0\"\nend"), "{out}");
+    }
+
     fn gem_override(name: &str, version: &str) -> DepOverride {
         DepOverride {
             ecosystem: "gem".into(),
@@ -13332,7 +13903,11 @@ mod tests {
                 let out = r.files.get("Gemfile.lock").expect("lock rewritten");
                 let rows: Vec<&str> = out
                     .lines()
-                    .filter(|l| l.trim_start().starts_with("rails (7.0.0)") && l.starts_with("  ") && !l.starts_with("    "))
+                    .filter(|l| {
+                        l.trim_start().starts_with("rails (7.0.0)")
+                            && l.starts_with("  ")
+                            && !l.starts_with("    ")
+                    })
                     .collect();
                 assert_eq!(
                     rows,
@@ -13345,7 +13920,11 @@ mod tests {
                     "{entry}: the entry keeps its line ending: {out:?}"
                 );
                 let model = crate::formats::gem::GemfileLock::parse(out);
-                assert_eq!(model.checksum("rails", "7.0.0"), Some(patched.as_str()), "{entry}");
+                assert_eq!(
+                    model.checksum("rails", "7.0.0"),
+                    Some(patched.as_str()),
+                    "{entry}"
+                );
                 assert!(!out.contains("\r\r"), "line endings kept: {out:?}");
                 let edit = r
                     .edits
@@ -13360,7 +13939,10 @@ mod tests {
                 files.insert("Gemfile.lock".to_string(), out.clone());
                 let again = rewrite_registry_redirect(&files, &[gem_override("rails", "7.0.0")]);
                 assert!(
-                    !again.edits.iter().any(|e| e.kind == "redirect_gemfile_lock_checksum"),
+                    !again
+                        .edits
+                        .iter()
+                        .any(|e| e.kind == "redirect_gemfile_lock_checksum"),
                     "{entry}: rerun is a no-op: {:?}",
                     again.edits
                 );
@@ -13864,11 +14446,19 @@ mod tests {
         let redacted = format!(
             "https://patch.socket.dev/patch/npm/left-pad/1.3.0/<redacted>/{uuid}/left-pad-1.3.0.tgz?x=1"
         );
-        assert_eq!(redact_grant_token(&url, &url, uuid), redacted, "the URL alone");
+        assert_eq!(
+            redact_grant_token(&url, &url, uuid),
+            redacted,
+            "the URL alone"
+        );
         let text = format!("vlt would fail to verify {url}: fetch error GET {url}: reset");
-        let want = format!("vlt would fail to verify {redacted}: fetch error GET {redacted}: reset");
+        let want =
+            format!("vlt would fail to verify {redacted}: fetch error GET {redacted}: reset");
         assert_eq!(redact_grant_token(&text, &url, uuid), want, "every quote");
-        assert!(!redact_grant_token(&text, &url, uuid).contains(token), "no token left");
+        assert!(
+            !redact_grant_token(&text, &url, uuid).contains(token),
+            "no token left"
+        );
         let registry = format!("https://patch.socket.dev/patch-registry/npm/{token}/{uuid}");
         assert_eq!(
             redact_grant_token(&registry, &registry, uuid),
@@ -15730,7 +16320,10 @@ mod tests {
             ("crlf", lf.replace('\n', "\r\n")),
             ("tabs", lf.replace("  ", "\t")),
             ("bom", format!("\u{feff}{lf}")),
-            ("bom+crlf+tabs", format!("\u{feff}{}", lf.replace("  ", "\t").replace('\n', "\r\n"))),
+            (
+                "bom+crlf+tabs",
+                format!("\u{feff}{}", lf.replace("  ", "\t").replace('\n', "\r\n")),
+            ),
         ];
         for (shape, pristine) in shapes {
             let mut files = BTreeMap::new();
@@ -15746,7 +16339,10 @@ mod tests {
                     "http://patch.test/left-pad-1.3.0.tgz",
                 )
                 .replace("sha512-UPSTREAM==", "sha512-PATCHED==");
-            assert_eq!(out, &expected, "{shape}: only the rewired values may change");
+            assert_eq!(
+                out, &expected,
+                "{shape}: only the rewired values may change"
+            );
         }
     }
 
@@ -18090,7 +18686,8 @@ packages:
             );
 
             // One edit; its fragments are the on-disk bytes of the entry.
-            let lock_edits: Vec<&FileEdit> = r.edits.iter().filter(|e| e.path == "yarn.lock").collect();
+            let lock_edits: Vec<&FileEdit> =
+                r.edits.iter().filter(|e| e.path == "yarn.lock").collect();
             assert_eq!(lock_edits.len(), 1, "{label}");
             let edit = lock_edits[0];
             let (orig, new) = (
@@ -18100,15 +18697,8 @@ packages:
             assert_eq!(
                 (orig, new),
                 (
-                    respell(
-                        lf_edit
-                            .original
-                            .as_ref()
-                            .unwrap()
-                            .as_str()
-                            .unwrap()
-                    )
-                    .trim_start_matches('\u{feff}'),
+                    respell(lf_edit.original.as_ref().unwrap().as_str().unwrap())
+                        .trim_start_matches('\u{feff}'),
                     respell(lf_edit.new.as_ref().unwrap().as_str().unwrap())
                         .trim_start_matches('\u{feff}'),
                 ),
@@ -20179,7 +20769,11 @@ packages:
             format!(
                 "__metadata:\n  version: 8\n  cacheKey: 10c0\n\n{key}:\n  version: 9.0.1\n  \
                  resolution: \"x\"\n{}  languageName: node\n  linkType: hard\n",
-                if bin { "  bin:\n    uuid: dist/bin/uuid\n" } else { "" }
+                if bin {
+                    "  bin:\n    uuid: dist/bin/uuid\n"
+                } else {
+                    ""
+                }
             )
         };
         let needs = |lock: String| berry_pin_needs_manifest(&berry_bin_entries(&lock), &dep);
@@ -20190,9 +20784,14 @@ packages:
         assert!(!needs(entry("\"uuid@npm:other-uuid@^9.0.0\"", true)));
         assert!(!needs(entry("\"uuid@npm:^9.0.0, other@npm:^1.0.0\"", true)));
         assert!(!needs(entry("\"uuid@patch:uuid@npm%3A9.0.1#x\"", true)));
-        assert!(!needs(entry("\"uuid@https://mirror.example/uuid-9.0.1.tgz\"", true)));
+        assert!(!needs(entry(
+            "\"uuid@https://mirror.example/uuid-9.0.1.tgz\"",
+            true
+        )));
         // Another version of the package (`9.0.10` shares the prefix).
-        assert!(!needs(entry("\"uuid@npm:^9.0.0\"", true).replace("9.0.1\n", "9.0.10\n")));
+        assert!(!needs(
+            entry("\"uuid@npm:^9.0.0\"", true).replace("9.0.1\n", "9.0.10\n")
+        ));
     }
 
     /// A bun URL 3-tuple already at the CURRENT artifact URL but with a stale
@@ -22103,5 +22702,426 @@ mod superseding_repin_tests {
         );
         let (_, again) = scan(&repinned, &second());
         assert!(again.files.is_empty() && again.warnings.is_empty());
+    }
+}
+
+/// B07 owned-pin generations: one supersede matrix across the hosted
+/// writers whose re-pin left the previous generation's wiring behind
+/// (#864 cargo, #682 Go, #266 Maven). Each case pins generation A through
+/// the full redirect planner, re-pins to generation B, and asserts the
+/// shared invariant: no file names A any more, B is confirmed, and a
+/// re-run over the result is a no-op.
+#[cfg(test)]
+mod owned_pin_generation_matrix {
+    use super::*;
+
+    const A: &str = "aaaaaaaa-0000-4000-8000-00000000000a";
+    const B: &str = "bbbbbbbb-0000-4000-8000-00000000000b";
+
+    fn plan(
+        files: &BTreeMap<String, String>,
+        dep: &DepOverride,
+    ) -> (BTreeMap<String, String>, RewriteResult) {
+        let result = rewrite_registry_redirect(files, std::slice::from_ref(dep));
+        let mut out = files.clone();
+        out.extend(result.files.clone());
+        (out, result)
+    }
+
+    /// Pin `first`, re-pin `second`, and check the generation invariant.
+    /// `gone` is the text only the first generation's wiring carried.
+    fn supersede(
+        files: BTreeMap<String, String>,
+        first: &DepOverride,
+        second: &DepOverride,
+        gone: &str,
+    ) -> (BTreeMap<String, String>, RewriteResult) {
+        let (wired, result) = plan(&files, first);
+        assert!(
+            result.warnings.is_empty(),
+            "first pin: {:?}",
+            result.warnings
+        );
+        assert!(
+            wired.values().any(|t| t.contains(gone)),
+            "fixture: the first generation must be wired"
+        );
+        let (repinned, result) = plan(&wired, second);
+        assert!(result.warnings.is_empty(), "re-pin: {:?}", result.warnings);
+        for (path, text) in &repinned {
+            assert!(
+                !text.contains(gone),
+                "{path} kept the superseded generation `{gone}`:\n{text}"
+            );
+        }
+        let (_, again) = plan(&repinned, second);
+        assert!(
+            again.files.is_empty() && again.warnings.is_empty(),
+            "the re-pinned project must be settled: {:?} {:?}",
+            again.files.keys(),
+            again.warnings
+        );
+        (repinned, result)
+    }
+
+    fn cargo(uuid: &str) -> DepOverride {
+        DepOverride {
+            ecosystem: "cargo".into(),
+            name: "cfg-if".into(),
+            namespace: None,
+            version: "1.0.4".into(),
+            token: "tok".into(),
+            patch_uuid: uuid.into(),
+            artifact_url: format!("https://patch.test/{uuid}/cfg-if-1.0.4.crate"),
+            registry_override: Some(RegistryOverride {
+                kind: "cargo-sparse".into(),
+                index_url: format!("sparse+https://patch.test/cargo/tok-{uuid}/{uuid}/index/"),
+                identifiers: RegistryOverrideIdentifiers {
+                    name: "cfg-if".into(),
+                    version: "1.0.4".into(),
+                    cargo_cksum_sha256: Some(uuid[..1].repeat(64)),
+                    ..Default::default()
+                },
+            }),
+            integrity: Integrity::default(),
+        }
+    }
+
+    fn cargo_project(config: Option<&str>) -> BTreeMap<String, String> {
+        let mut files = BTreeMap::from([
+            (
+                "Cargo.toml".to_string(),
+                "[package]\nname = \"app\"\nversion = \"0.1.0\"\nedition = \"2021\"\n\n\
+                 [dependencies]\ncfg-if = \"1.0.4\"\n"
+                    .to_string(),
+            ),
+            (
+                "Cargo.lock".to_string(),
+                "version = 3\n\n[[package]]\nname = \"app\"\nversion = \"0.1.0\"\n\
+                 dependencies = [\n \"cfg-if\",\n]\n\n[[package]]\nname = \"cfg-if\"\n\
+                 version = \"1.0.4\"\nsource = \"registry+https://github.com/rust-lang/crates.io-index\"\n\
+                 checksum = \"0000000000000000000000000000000000000000000000000000000000000000\"\n"
+                    .to_string(),
+            ),
+        ]);
+        if let Some((key, text)) = config.map(|c| (".cargo/config", c)) {
+            files.insert(key.to_string(), text.to_string());
+        }
+        files
+    }
+
+    /// #864: the re-pin drops the old `[registries.socket-patch-A]` block,
+    /// with no prior config (the file holds only B's block afterwards) and
+    /// with a legacy `.cargo/config` the user owns (its bytes survive).
+    #[test]
+    fn cargo_repin_drops_the_superseded_registry_block() {
+        let (repinned, result) = supersede(cargo_project(None), &cargo(A), &cargo(B), A);
+        assert!(result.confirmed_cargo_uuids.contains(B));
+        assert_eq!(
+            repinned[".cargo/config.toml"],
+            format!(
+                "[registries.socket-patch-{B}]\nindex = \"sparse+https://patch.test/cargo/tok-{B}/{B}/index/\"\n"
+            )
+        );
+
+        let user = "[net]\nretry = 2\n";
+        let (repinned, _) = supersede(cargo_project(Some(user)), &cargo(A), &cargo(B), A);
+        let config = &repinned[".cargo/config"];
+        assert!(config.starts_with(user), "{config}");
+        assert!(config.contains(&format!("[registries.socket-patch-{B}]")));
+        assert!(!repinned.contains_key(".cargo/config.toml"));
+    }
+
+    fn h1(c: char) -> String {
+        format!("h1:{}=", c.to_string().repeat(43))
+    }
+
+    fn golang(uuid: &str, version: &str, c: char) -> DepOverride {
+        let module = format!("patch.socket.dev/gopatch/{uuid}");
+        DepOverride {
+            ecosystem: "golang".into(),
+            name: "example.com/up".into(),
+            namespace: None,
+            version: "v1.0.0".into(),
+            token: String::new(),
+            patch_uuid: uuid.into(),
+            artifact_url: format!(
+                "https://patch.socket.dev/patch-registry/golang/{module}/@v/{version}.zip"
+            ),
+            registry_override: Some(RegistryOverride {
+                kind: "goproxy".into(),
+                index_url: "https://patch.socket.dev/patch-registry/golang".into(),
+                identifiers: RegistryOverrideIdentifiers {
+                    name: "example.com/up".into(),
+                    version: "v1.0.0".into(),
+                    go_module_path: Some(module),
+                    go_module_version: Some(version.into()),
+                    ..Default::default()
+                },
+            }),
+            integrity: Integrity {
+                dirhash_h1: Some(h1(c)),
+                go_mod_h1: Some(h1('G')),
+                ..Default::default()
+            },
+        }
+    }
+
+    fn go_project() -> BTreeMap<String, String> {
+        BTreeMap::from([
+            (
+                "go.mod".to_string(),
+                "module example.com/app\n\ngo 1.21\n\nrequire example.com/up v1.0.0\n".to_string(),
+            ),
+            (
+                "go.sum".to_string(),
+                format!(
+                    "example.com/up v1.0.0 {}\nexample.com/up v1.0.0/go.mod {}\n",
+                    h1('U'),
+                    h1('M')
+                ),
+            ),
+        ])
+    }
+
+    /// #682: a re-pin to a superseding uuid, and the same uuid republished
+    /// at a new version, both drop the previous target's go.sum pair, so
+    /// go.sum is left exactly as `go mod tidy` would leave it.
+    #[test]
+    fn golang_repin_drops_the_superseded_gosum_pair() {
+        let first = golang(A, "v1.0.0-socketpatch.1", 'A');
+        let (repinned, result) = supersede(
+            go_project(),
+            &first,
+            &golang(B, "v1.0.0-socketpatch.2", 'B'),
+            A,
+        );
+        assert!(result.confirmed_golang_uuids.contains(B));
+        let module_b = format!("patch.socket.dev/gopatch/{B}");
+        assert_eq!(
+            repinned["go.sum"],
+            format!(
+                "{module_b} v1.0.0-socketpatch.2 {}\n{module_b} v1.0.0-socketpatch.2/go.mod {}\n",
+                h1('B'),
+                h1('G')
+            )
+        );
+        assert!(result
+            .edits
+            .iter()
+            .any(|e| e.kind == "redirect_golang_superseded_gosum_removed"));
+
+        // Same uuid, republished: the `.1` lines go, the `.2` lines stay.
+        let (repinned, _) = supersede(
+            go_project(),
+            &first,
+            &golang(A, "v1.0.0-socketpatch.2", 'B'),
+            "socketpatch.1",
+        );
+        assert_eq!(
+            repinned["go.sum"].lines().count(),
+            2,
+            "{}",
+            repinned["go.sum"]
+        );
+    }
+
+    fn maven(uuid: &str, token: &str) -> DepOverride {
+        DepOverride {
+            ecosystem: "maven".into(),
+            name: "commons-lang3".into(),
+            namespace: Some("org.apache.commons".into()),
+            version: "3.12.0".into(),
+            token: token.into(),
+            patch_uuid: uuid.into(),
+            artifact_url: format!(
+                "https://patch.socket.dev/patch/maven/org.apache.commons/commons-lang3/3.12.0/{token}/{uuid}/commons-lang3-3.12.0.jar"
+            ),
+            registry_override: Some(RegistryOverride {
+                kind: "maven2".into(),
+                index_url: format!("https://patch.socket.dev/patch-registry/maven/{token}/{uuid}/maven2"),
+                identifiers: RegistryOverrideIdentifiers {
+                    name: "org.apache.commons/commons-lang3".into(),
+                    version: "3.12.0".into(),
+                    maven_group_id: Some("org.apache.commons".into()),
+                    maven_artifact_id: Some("commons-lang3".into()),
+                    maven_suffixed_version: Some(format!("3.12.0-socket.{}", &uuid[..8])),
+                    maven_pom_sha256: Some(uuid[..1].repeat(64)),
+                    ..Default::default()
+                },
+            }),
+            integrity: Integrity {
+                sha256: Some(uuid[..1].repeat(64)),
+                ..Default::default()
+            },
+        }
+    }
+
+    fn pom_project() -> BTreeMap<String, String> {
+        BTreeMap::from([(
+            "pom.xml".to_string(),
+            "<?xml version=\"1.0\" encoding=\"UTF-8\"?>\n<project>\n  <modelVersion>4.0.0</modelVersion>\n  \
+             <groupId>dev.socket.test</groupId>\n  <artifactId>consumer</artifactId>\n  <version>1.0.0</version>\n  \
+             <dependencies>\n    <dependency>\n      <groupId>org.apache.commons</groupId>\n      \
+             <artifactId>commons-lang3</artifactId>\n      <version>3.12.0</version>\n    </dependency>\n  \
+             </dependencies>\n</project>\n"
+                .to_string(),
+        )])
+    }
+
+    /// #266: a superseding uuid re-pins the `-socket.<A>` literal to B's
+    /// suffix and replaces A's repository and trusted checksums.
+    #[test]
+    fn maven_repin_moves_the_suffix_and_drops_the_superseded_repository() {
+        let tok = "22222222-3333-4444-8555-666666666666";
+        let (repinned, result) = supersede(pom_project(), &maven(A, tok), &maven(B, tok), A);
+        let pom = &repinned["pom.xml"];
+        assert!(
+            pom.contains("<version>3.12.0-socket.bbbbbbbb</version>"),
+            "{pom}"
+        );
+        assert!(!pom.contains("socket.aaaaaaaa"), "{pom}");
+        assert_eq!(pom.matches("<repository>").count(), 1, "{pom}");
+        assert!(!result
+            .warnings
+            .iter()
+            .any(|w| w.code == "redirect_maven_dep_version_mismatch"));
+        let checksums = &repinned[MVN_CHECKSUMS];
+        assert!(!checksums.contains("aaaaaaaa"), "{checksums}");
+        assert_eq!(checksums.lines().count(), 2, "{checksums}");
+    }
+
+    /// Another artifact's live pin whose uuid shares the superseded
+    /// generation's eight hex digits keeps its repository: the re-pin of
+    /// `commons-lang3` must not strand `commons-text`'s `-socket.<hex8>`.
+    #[test]
+    fn maven_repin_keeps_a_live_pin_sharing_the_hex8() {
+        let tok = "22222222-3333-4444-8555-666666666666";
+        let twin = "aaaaaaaa-1111-4000-8000-00000000001a";
+        let mut text = maven(twin, tok);
+        let to_text = |s: &str| {
+            s.replace("commons-lang3", "commons-text")
+                .replace("3.12.0", "1.10.0")
+        };
+        text.name = "commons-text".into();
+        text.version = "1.10.0".into();
+        text.artifact_url = to_text(&text.artifact_url);
+        let ro = text.registry_override.as_mut().unwrap();
+        ro.identifiers.name = to_text(&ro.identifiers.name);
+        ro.identifiers.version = "1.10.0".into();
+        ro.identifiers.maven_artifact_id = Some("commons-text".into());
+        ro.identifiers.maven_suffixed_version = Some("1.10.0-socket.aaaaaaaa".into());
+
+        let mut files = pom_project();
+        let pom = files["pom.xml"].replace(
+            "  </dependencies>\n",
+            "    <dependency>\n      <groupId>org.apache.commons</groupId>\n      \
+             <artifactId>commons-text</artifactId>\n      <version>1.10.0</version>\n    \
+             </dependency>\n  </dependencies>\n",
+        );
+        files.insert("pom.xml".into(), pom);
+        let (wired, _) = plan(&files, &text);
+        let (wired, _) = plan(&wired, &maven(A, tok));
+        let wired_pom = &wired["pom.xml"];
+        assert!(
+            wired_pom.contains(&format!("<id>socket-patch-{twin}</id>")),
+            "{wired_pom}"
+        );
+        assert!(
+            wired_pom.contains(&format!("<id>socket-patch-{A}</id>")),
+            "{wired_pom}"
+        );
+
+        let (repinned, _) = plan(&wired, &maven(B, tok));
+        let pom = &repinned["pom.xml"];
+        assert!(
+            pom.contains("<version>3.12.0-socket.bbbbbbbb</version>"),
+            "{pom}"
+        );
+        assert!(
+            pom.contains("<version>1.10.0-socket.aaaaaaaa</version>"),
+            "{pom}"
+        );
+        assert!(
+            pom.contains(&format!("<id>socket-patch-{twin}</id>")),
+            "the live twin pin lost its repository:\n{pom}"
+        );
+        // The superseded generation's own trusted checksums are keyed by its
+        // GAV, so they go even though the hex8-sharing repository stays.
+        let checksums = &repinned[MVN_CHECKSUMS];
+        assert!(!checksums.contains("3.12.0-socket.aaaaaaaa"), "{checksums}");
+        assert!(checksums.contains("3.12.0-socket.bbbbbbbb"), "{checksums}");
+        assert!(checksums.contains("1.10.0-socket.aaaaaaaa"), "{checksums}");
+    }
+
+    /// A `-socket.<hex8>` literal that no hosted `socket-patch-<uuid>`
+    /// repository minted (a vendored reactor / sbt pin, served from a
+    /// `socket-patch-vendor-<uuid>` repository) is not an earlier hosted
+    /// generation: the mismatch is reported and the pom left untouched.
+    #[test]
+    fn maven_vendored_suffix_literal_is_not_a_prior_generation() {
+        let pom = pom_project()["pom.xml"].replace(
+            "<version>3.12.0</version>",
+            "<version>3.12.0-socket.aaaaaaaa</version>",
+        );
+        let pom = pom.replace(
+            "</dependencies>\n",
+            &format!(
+                "</dependencies>\n  <repositories>\n    <repository>\n      \
+                 <id>socket-patch-vendor-{A}</id>\n      \
+                 <url>file://${{project.basedir}}/.socket/vendor/maven/repo</url>\n    \
+                 </repository>\n  </repositories>\n"
+            ),
+        );
+        let files = BTreeMap::from([("pom.xml".to_string(), pom)]);
+        let tok = "22222222-3333-4444-8555-666666666666";
+        let (_, result) = plan(&files, &maven(B, tok));
+        assert!(
+            result
+                .warnings
+                .iter()
+                .any(|w| w.code == "redirect_maven_dep_version_mismatch"),
+            "{:?}",
+            result.warnings
+        );
+        assert!(
+            !result.files.contains_key("pom.xml"),
+            "{:?}",
+            result.files.get("pom.xml")
+        );
+    }
+
+    /// A CRLF trusted-checksums file drops the superseded generation's
+    /// entries like an LF one, and the re-pinned project is settled.
+    #[test]
+    fn maven_repin_drops_superseded_checksums_from_a_crlf_file() {
+        let tok = "22222222-3333-4444-8555-666666666666";
+        let (mut wired, _) = plan(&pom_project(), &maven(A, tok));
+        let crlf = wired[MVN_CHECKSUMS].replace('\n', "\r\n");
+        wired.insert(MVN_CHECKSUMS.to_string(), crlf);
+        let (repinned, _) = plan(&wired, &maven(B, tok));
+        let checksums = &repinned[MVN_CHECKSUMS];
+        assert!(!checksums.contains("aaaaaaaa"), "{checksums}");
+        let (_, again) = plan(&repinned, &maven(B, tok));
+        assert!(again.files.is_empty(), "{:?}", again.files.keys());
+    }
+
+    /// #266: a rotated grant token (same uuid, new token path segment)
+    /// refreshes the repository URL in place.
+    #[test]
+    fn maven_rotated_grant_token_refreshes_the_repository_url() {
+        let old = "22222222-3333-4444-8555-666666666666";
+        let new = "77777777-3333-4444-8555-666666666666";
+        let (wired, _) = plan(&pom_project(), &maven(A, old));
+        let (rotated, result) = plan(&wired, &maven(A, new));
+        assert!(result.warnings.is_empty(), "{:?}", result.warnings);
+        let pom = &rotated["pom.xml"];
+        assert!(!pom.contains(old), "{pom}");
+        assert!(
+            pom.contains(&format!("/maven/{new}/{A}/maven2</url>")),
+            "{pom}"
+        );
+        let (_, again) = plan(&rotated, &maven(A, new));
+        assert!(again.files.is_empty(), "{:?}", again.files.keys());
     }
 }

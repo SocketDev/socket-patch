@@ -1806,12 +1806,24 @@ fn print_verbose_verification(results: &[ApplyResult]) {
                 println!("      current:  {h}");
             }
             if let Some(ref h) = f.expected_hash {
-                println!("      expected: {h}");
+                println!("      expected: {}", expected_hash_label(h));
             }
             if let Some(ref h) = f.target_hash {
                 println!("      target:   {h}");
             }
         }
+    }
+}
+
+/// The verbose `expected:` value: a new-file collision carries an empty
+/// expected hash (the patch adds the file, so there is no beforeHash; see
+/// core `mark_new_file_collision`), shown as `(new file)` instead of a
+/// blank line.
+fn expected_hash_label(hash: &str) -> &str {
+    if hash.is_empty() {
+        "(new file)"
+    } else {
+        hash
     }
 }
 
@@ -2687,7 +2699,13 @@ async fn apply_maven_base(m: &MavenBase<'_>) -> MavenApplied {
     let m2_copies: Vec<String> = copies
         .consumed
         .iter()
-        .filter(|c| c.starts_with(&m.scope.env.m2_repo))
+        .filter(|c| {
+            m.scope
+                .env
+                .m2_repo
+                .as_ref()
+                .is_some_and(|m2| c.starts_with(m2))
+        })
         .map(|p| p.display().to_string())
         .collect();
     if matches!(
@@ -3107,6 +3125,15 @@ mod tests {
     use socket_patch_core::patch::apply::{
         AppliedVia as CoreAppliedVia, ApplyResult, VerifyResult, VerifyStatus,
     };
+
+    /// A new-file collision's empty expected hash reads `(new file)` in the
+    /// verbose summary; a real hash is shown as is.
+    #[test]
+    fn expected_hash_label_names_a_new_file_collision() {
+        assert_eq!(expected_hash_label(""), "(new file)");
+        let h = "a".repeat(64);
+        assert_eq!(expected_hash_label(&h), h);
+    }
 
     /// Build a successful `ApplyResult` with one patched file and one
     /// verified file. Used as the base for action-routing tests.

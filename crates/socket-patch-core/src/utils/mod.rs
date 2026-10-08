@@ -1,6 +1,7 @@
 pub mod cargo_workspace;
 pub mod composer_version;
 pub mod concurrent;
+pub mod containment;
 pub(crate) mod digest;
 pub(crate) mod durability;
 pub mod env_compat;
@@ -20,6 +21,8 @@ pub mod process;
 pub mod purl;
 pub mod python_lock;
 pub mod python_script;
+pub(crate) mod relpath;
+pub mod repo_root;
 pub(crate) mod requirements;
 pub(crate) mod serde;
 pub mod socket_cli_config;

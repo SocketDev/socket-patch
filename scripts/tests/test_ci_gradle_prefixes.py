@@ -143,7 +143,7 @@ class PrefixGuard(unittest.TestCase):
         row that runs that suite and by the gradle-compatibility.yml mode that
         runs it, so a conforming test runs on every PR and in every grid
         cell of its mode."""
-        rows = [r for r in rows_mod.matrix_include(rows_mod.jobs(CI.read_text(encoding="utf-8"))["e2e"])
+        rows = [r for r in rows_mod.job_rows(rows_mod.jobs(CI.read_text(encoding="utf-8")), "e2e")
                 if r.get("jvm_tool") == "gradle" and r["os"] == "ubuntu-latest"]
         modes = compat_modes()
         self.assertEqual(set(modes), {"agent", "hosted", "vendor"})
@@ -176,7 +176,7 @@ class PrefixGuard(unittest.TestCase):
 
 
 class AllowEmpty(unittest.TestCase):
-    rows = rows_mod.matrix_include(rows_mod.jobs(CI.read_text(encoding="utf-8"))["e2e"])
+    rows = rows_mod.job_rows(rows_mod.jobs(CI.read_text(encoding="utf-8")), "e2e")
 
     def test_allow_empty_only_while_a_suite_is_unlanded(self):
         """The allowance is for rows whose owning package has not landed. Once

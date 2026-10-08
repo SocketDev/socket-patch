@@ -110,6 +110,15 @@ fn scan_pins(content: &str, canon_name: &str, version: &str) -> (Vec<PinSpan>, b
     (exact, found_extras, found_range)
 }
 
+/// Whether one requirements file's content names the package at all (any
+/// spec, extras or marker): a file that pins it is an install source of it.
+pub(super) fn names_package(content: &str, canon_name: &str) -> bool {
+    logical_lines(content).into_iter().any(|ll| {
+        parse_requirement_line(&ll.text)
+            .is_some_and(|req| canonicalize_pypi_name(&req.name) == canon_name)
+    })
+}
+
 /// Find the target pin in one file's content. Precedence is fail-closed:
 /// any extras occurrence wins over any non-pin occurrence wins over a clean
 /// exact pin — a file that names the package ambiguously is never rewritten
@@ -986,7 +995,7 @@ pub(crate) fn requirements_includes(rel: &str, content: &str) -> Vec<String> {
             } else {
                 format!("{include_dir}/{target}")
             };
-            normalize_rel_path(&joined)
+            crate::utils::relpath::normalize_rel_keeping_escapes(&joined)
         })
         .collect()
 }
@@ -1000,64 +1009,122 @@ fn include_target(text: &str) -> Option<String> {
     include_target_with(text, |name| std::env::var(name).ok())
 }
 
+/// The long options pip's requirements-file parser knows that take a
+/// value (`SUPPORTED_OPTIONS` plus the per-requirement
+/// `SUPPORTED_OPTIONS_REQ`, and `--install-option` from older pips).
+const REQ_FILE_VALUE_OPTIONS: &[&str] = &[
+    "--index-url",
+    "--extra-index-url",
+    "--constraint",
+    "--requirement",
+    "--editable",
+    "--find-links",
+    "--no-binary",
+    "--only-binary",
+    "--trusted-host",
+    "--use-feature",
+    "--global-option",
+    "--install-option",
+    "--hash",
+    "--config-settings",
+];
+
+/// The flag-only long options of pip's requirements-file parser. Only
+/// used to resolve optparse's unique-prefix abbreviations
+/// (`--requirem` is `--requirement`, `--require` is ambiguous).
+const REQ_FILE_FLAG_OPTIONS: &[&str] =
+    &["--no-index", "--prefer-binary", "--require-hashes", "--pre"];
+
+/// Resolve a long option name the way optparse's `_match_abbrev` does: an
+/// exact name, else the one known option it is a unique prefix of.
+/// `None` for an unknown or ambiguous name.
+fn resolve_long_option(name: &str) -> Option<&'static str> {
+    let all = REQ_FILE_VALUE_OPTIONS
+        .iter()
+        .chain(REQ_FILE_FLAG_OPTIONS)
+        .copied();
+    if let Some(exact) = all.clone().find(|o| *o == name) {
+        return Some(exact);
+    }
+    let mut matches = all.filter(|o| o.starts_with(name));
+    let first = matches.next()?;
+    matches.next().is_none().then_some(first)
+}
+
 /// [`include_target`] with the environment lookup injected (tests).
+///
+/// pip splits a line into its requirement part (the leading words that
+/// don't start with `-`) and its options, and runs optparse over every
+/// option word (#1028). A line with a requirement or an `-e` is a
+/// requirement, never an include; otherwise the first `-r` value is the
+/// file pip follows (`opts.requirements[0]`). An option's value is
+/// consumed even when it looks like `-r`, as optparse does.
 fn include_target_with(text: &str, env: impl Fn(&str) -> Option<String>) -> Option<String> {
     let code = expand_env_vars(strip_comment(text), env);
+    // pip's break_args_options: a leading word without `-` is a
+    // requirement, whose per-requirement options never recurse.
+    if !code.trim_start().starts_with('-') {
+        return None;
+    }
     // An unbalanced quote is pip's "Could not split options" error: there
     // is no file to follow.
     let mut words = shlex_split(&code)?.into_iter();
-    let first = words.next()?;
-    let target = if let Some(rest) = first.strip_prefix("--requirement=") {
-        // `--requirement= dev.txt` (a space after the `=`) is read as
-        // the next word, as before the shlex split.
-        if rest.is_empty() {
-            words.next()
-        } else {
-            Some(rest.to_string())
+    let mut target: Option<String> = None;
+    while let Some(word) = words.next() {
+        if word == "--" {
+            break;
         }
-    } else {
-        match first.as_str() {
-            "-r" | "--requirement" => words.next(),
-            // pip's optparse also accepts the attached short form
-            // (`-rdev.txt`, `-r"dev reqs.txt"`). No other
-            // requirements-file option starts with `-r`.
-            t if t.starts_with("-r") && !t.starts_with("--") => Some(t[2..].to_string()),
-            _ => None,
-        }
-    };
-    target.filter(|t| !t.is_empty())
-}
-
-/// Lexically normalize a relative path (`a/../b` → `b`); escapes above the
-/// root keep their `../` prefix and absolute paths keep their leading `/`,
-/// so the caller can spot out-of-root includes.
-fn normalize_rel_path(path: &str) -> String {
-    let mut stack: Vec<&str> = Vec::new();
-    let mut leading_parents = 0usize;
-    let normalized = path.replace('\\', "/");
-    let absolute = normalized.starts_with('/');
-    for comp in normalized.split('/') {
-        match comp {
-            "" | "." => {}
-            ".." => {
-                if stack.is_empty() {
-                    leading_parents += 1;
-                } else {
-                    stack.pop();
-                }
+        if let Some(long) = word.strip_prefix("--") {
+            let (name, attached) = match long.split_once('=') {
+                Some((name, value)) => (name, Some(value.to_string())),
+                None => (long, None),
+            };
+            // An unknown option is pip's parse error; read past it as a
+            // flag rather than drop the rest of the line.
+            let Some(option) = resolve_long_option(&format!("--{name}")) else {
+                continue;
+            };
+            if !REQ_FILE_VALUE_OPTIONS.contains(&option) {
+                continue;
             }
-            other => stack.push(other),
+            let value = match attached {
+                // `--requirement= dev.txt` (a space after the `=`) is
+                // read as the next word, as before the shlex split.
+                Some(v) if v.is_empty() && option == "--requirement" => words.next(),
+                Some(v) => Some(v),
+                None => words.next(),
+            };
+            match option {
+                "--editable" => return None,
+                "--requirement" if target.is_none() => target = value,
+                _ => {}
+            }
+        } else if let Some(short) = word.strip_prefix('-') {
+            let mut chars = short.chars();
+            let Some(flag) = chars.next() else {
+                continue;
+            };
+            if !matches!(flag, 'i' | 'c' | 'r' | 'e' | 'f') {
+                continue;
+            }
+            // pip's optparse also accepts the attached short form
+            // (`-rdev.txt`, `-r"dev reqs.txt"`).
+            let rest = chars.as_str();
+            let value = if rest.is_empty() {
+                words.next()
+            } else {
+                Some(rest.to_string())
+            };
+            match flag {
+                'e' => return None,
+                'r' if target.is_none() => target = value,
+                _ => {}
+            }
         }
+        // A bare word among the options is an optparse positional that
+        // pip ignores.
     }
-    let mut out = String::new();
-    if absolute {
-        out.push('/');
-    }
-    for _ in 0..leading_parents {
-        out.push_str("../");
-    }
-    out.push_str(&stack.join("/"));
-    out
+    target.filter(|t| !t.is_empty())
 }
 
 // The logical-line lexer lives in `utils::requirements` (shared with the
@@ -2376,7 +2443,7 @@ mod tests {
     /// A `-r` inside a non-root file resolves against the INCLUDING file's
     /// directory (the module's documented contract): `deps/a.txt` reaches
     /// `b.txt` (sibling → `deps/b.txt`) and `../c.txt` (back at the root —
-    /// the interior `..` pop of `normalize_rel_path`). The pin in deps/b.txt
+    /// the interior `..` pop of `normalize_rel_keeping_escapes`). The pin in deps/b.txt
     /// is rewritten in place; nothing else is touched and no transitive
     /// duplicate is appended, proving BOTH nested includes were walked.
     #[tokio::test]
@@ -2542,6 +2609,76 @@ mod tests {
         }
     }
 
+    /// #1028: pip parses every option word of a line, so a `-r` after
+    /// other options is an include, an option's value is never read as
+    /// `-r`, and the first of several `-r`s wins (`opts.requirements[0]`).
+    /// A requirement line (`six==1.16.0 ...`) or an editable is never an
+    /// include.
+    #[test]
+    fn include_target_scans_every_option_word() {
+        let env = |_: &str| None;
+        let cases: &[(&str, Option<&str>)] = &[
+            ("--pre -r dev.txt", Some("dev.txt")),
+            ("-i https://pypi.org/simple -r dev.txt", Some("dev.txt")),
+            ("-ihttps://pypi.org/simple -r dev.txt", Some("dev.txt")),
+            ("--index-url https://x/simple -r dev.txt", Some("dev.txt")),
+            ("--index-url=https://x/simple -r dev.txt", Some("dev.txt")),
+            (
+                "--extra-index-url https://x/simple -r dev.txt",
+                Some("dev.txt"),
+            ),
+            ("--prefer-binary -r dev.txt", Some("dev.txt")),
+            ("-c c.txt -r dev.txt", Some("dev.txt")),
+            ("--constraint c.txt --requirement dev.txt", Some("dev.txt")),
+            ("--prefer-binary --requirement=dev.txt", Some("dev.txt")),
+            ("-f ./wheels -rdev.txt", Some("dev.txt")),
+            ("--no-binary :all: -r dev.txt", Some("dev.txt")),
+            ("--trusted-host h -r \"dev reqs.txt\"", Some("dev reqs.txt")),
+            ("-r dev.txt -r other.txt", Some("dev.txt")),
+            ("-r dev.txt --pre", Some("dev.txt")),
+            // optparse's unique-prefix long options.
+            ("--requirem dev.txt", Some("dev.txt")),
+            ("--pre --requirem=dev.txt", Some("dev.txt")),
+            // An option value that looks like `-r` is the value.
+            ("-i -r dev.txt", None),
+            ("--index-url -r", None),
+            ("-c -r", None),
+            // Only constraints: not a requirements include.
+            ("-c c.txt", None),
+            // A requirement line's per-requirement options never recurse.
+            ("six==1.16.0 -r dev.txt", None),
+            // An editable makes the line a requirement.
+            ("-e ./pkg -r dev.txt", None),
+            ("-r dev.txt -e ./pkg", None),
+            // `--` ends the options.
+            ("--pre -- -r dev.txt", None),
+            ("--pre", None),
+        ];
+        for (line, want) in cases {
+            assert_eq!(include_target_with(line, env).as_deref(), *want, "{line:?}");
+        }
+    }
+
+    /// #1028: the planner follows an include that comes after another
+    /// option and wires the pin there instead of appending at the root.
+    #[tokio::test]
+    async fn include_after_other_option_is_followed() {
+        let tmp = write_root("--pre -r dev.txt\n").await;
+        tokio::fs::write(tmp.path().join("dev.txt"), "six==1.16.0\n")
+            .await
+            .unwrap();
+        let wiring = wire_requirements(tmp.path(), "six", "1.16.0", REL_WHEEL, SHA)
+            .await
+            .unwrap();
+        assert_eq!(wiring.len(), 1);
+        assert_eq!(wiring[0].file, "dev.txt");
+        assert_eq!(
+            read_root(tmp.path()).await,
+            "--pre -r dev.txt\n",
+            "root untouched — no duplicate appended"
+        );
+    }
+
     /// #994: the planner follows a quoted include with a space in its name
     /// and wires the pin there instead of appending a duplicate at the root.
     #[tokio::test]
@@ -2563,24 +2700,6 @@ mod tests {
     }
 
     // ── pure-function matrices ───────────────────────────────────────────
-
-    /// Lexical normalization: interior `..` pops the stack (which decides
-    /// editable-vs-refuse for nested includes); escapes keep their `../`
-    /// prefix; absolute paths keep their leading `/`.
-    #[test]
-    fn normalize_rel_path_unit_matrix() {
-        assert_eq!(normalize_rel_path("deps/../dev.txt"), "dev.txt");
-        assert_eq!(normalize_rel_path("a/b/../../c"), "c");
-        assert_eq!(
-            normalize_rel_path("deps/../../x"),
-            "../x",
-            "pop, then the second `..` escapes"
-        );
-        assert_eq!(normalize_rel_path("./a//b/./c"), "a/b/c");
-        assert_eq!(normalize_rel_path("../x"), "../x");
-        assert_eq!(normalize_rel_path("/abs/../x"), "/x");
-        assert_eq!(normalize_rel_path("deps\\..\\dev.txt"), "dev.txt");
-    }
 
     /// Lines that do not start with a PEP 508 name are not requirements —
     /// in particular this module's OWN vendor-line shape must be invisible
