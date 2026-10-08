@@ -30,8 +30,10 @@ async fn uuid_get_with_corrupt_manifest_fails_without_clobbering() {
             "publishedAt": "2024-06-01T00:00:00Z",
             "files": {
                 "package/index.js": {
-                    "beforeHash": "0000000000000000000000000000000000000000000000000000000000000000",
-                    "afterHash":  "1111111111111111111111111111111111111111111111111111111111111111",
+                    // The real git-sha256 names of "original\n" and
+                    // "patched\n": `get` verifies inline blobs against them.
+                    "beforeHash": "9b8142d93991702a22920638c6d6768b150706c5e018b3605b74552d09fd160e",
+                    "afterHash":  "d2802877eb1c2f442d30d18abcb281cb2830875571624544f2f1acb36480997e",
                     "blobContent": "cGF0Y2hlZAo=",
                     "beforeBlobContent": "b3JpZ2luYWwK",
                 }
