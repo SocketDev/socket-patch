@@ -380,11 +380,12 @@ pub async fn rollback_package_patch(
 /// patch's bytes), so its copies are never reached. On Bun's isolated
 /// linker the store entry the hosted reinstall orphaned is such a copy:
 /// it still holds the agent patch, and the next `bun install` can link it
-/// again. Each copy holding any of the record's patched bytes (or a file
-/// that can't be checked) is rolled back with the single-copy engine and
-/// folded into the returned result, which fails if any copy fails. Copies
-/// holding neither side are left, as the primary is. `None` when no copy
-/// holds the record's patched bytes (or `package_key` is not npm).
+/// again. Each copy [`holds_this_patch`] is rolled back with the
+/// single-copy engine and folded into the returned result, which fails if
+/// any copy fails. A copy with any file at bytes the record never wrote
+/// (the superseding patch's own copies, which can share a file with this
+/// record) is left, as the primary is. `None` when no copy holds this
+/// record's patch (or `package_key` is not npm).
 pub async fn rollback_store_copies_holding_patch(
     package_key: &str,
     pkg_path: &Path,
@@ -397,7 +398,7 @@ pub async fn rollback_store_copies_holding_patch(
     }
     let mut folded: Option<RollbackResult> = None;
     for copy in crate::crawlers::npm_crawler::find_store_peer_variant_copies(pkg_path).await {
-        if !holds_patched_bytes(&copy, files).await {
+        if !holds_this_patch(&copy, files).await {
             continue;
         }
         let copy_result =
@@ -416,28 +417,39 @@ pub async fn rollback_store_copies_holding_patch(
     folded
 }
 
-/// Whether any of `files` under `dir` is at the record's patched bytes, or
-/// cannot be checked (an unsafe key, a read error other than "not found"),
-/// which may hide them.
-async fn holds_patched_bytes(dir: &Path, files: &HashMap<String, PatchFileInfo>) -> bool {
+/// Whether `dir` is a copy this record patched: every file is at the
+/// record's patched or original bytes (a new file may be absent), and at
+/// least one is at the patched bytes or cannot be checked (an unsafe key,
+/// a read error other than "not found"), which may hide them. A file at
+/// any other bytes, or a missing original file, marks a copy the record
+/// does not own, just as it marks the primary superseded.
+async fn holds_this_patch(dir: &Path, files: &HashMap<String, PatchFileInfo>) -> bool {
+    let mut patched = false;
     for (file, info) in files {
         let rel = normalize_file_path(file);
         if !crate::patch::apply::is_safe_relative_subpath(rel) {
-            return true;
+            patched = true;
+            continue;
         }
         // FIFO-safe: a FIFO or device at the leaf is refused, not opened.
         match crate::utils::fs::read_regular_to_bytes(&dir.join(rel)).await {
             Ok(bytes) => {
-                if crate::hash::git_sha256::compute_git_sha256_from_bytes(&bytes) == info.after_hash
-                {
-                    return true;
+                let hash = crate::hash::git_sha256::compute_git_sha256_from_bytes(&bytes);
+                if hash == info.after_hash {
+                    patched = true;
+                } else if hash != info.before_hash {
+                    return false;
                 }
             }
-            Err(e) if e.kind() == std::io::ErrorKind::NotFound => {}
-            Err(_) => return true,
+            Err(e) if e.kind() == std::io::ErrorKind::NotFound => {
+                if !info.before_hash.is_empty() {
+                    return false;
+                }
+            }
+            Err(_) => patched = true,
         }
     }
-    false
+    patched
 }
 
 impl crate::patch::store_copies::CopyFold for RollbackResult {

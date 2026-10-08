@@ -1664,21 +1664,9 @@ async fn an_unrestorable_orphaned_store_copy_keeps_the_superseded_record() {
     let server = MockServer::start().await;
     let tmp = tempfile::tempdir().unwrap();
     write_superseded_agent_fixture(tmp.path(), &server, B_PATCHED_INDEX).await;
-    let orphan = orphan_bun_store_copy(tmp.path());
-    std::fs::write(&orphan, b"module.exports = 'patched by A'; // and edited\n").unwrap();
-    // A second file of the copy still at A's patched bytes keeps it A's.
+    orphan_bun_store_copy(tmp.path());
     let before = socket_patch_core::hash::git_sha256::compute_git_sha256_from_bytes(ORIGINAL_INDEX);
-    let after = socket_patch_core::hash::git_sha256::compute_git_sha256_from_bytes(A_PATCHED_INDEX);
-    let manifest_path = tmp.path().join(".socket/manifest.json");
-    let mut manifest: Value =
-        serde_json::from_str(&std::fs::read_to_string(&manifest_path).unwrap()).unwrap();
-    manifest["patches"][PURL]["files"]["package/lib.js"] =
-        serde_json::json!({ "beforeHash": before, "afterHash": after });
-    std::fs::write(&manifest_path, manifest.to_string()).unwrap();
-    std::fs::write(orphan.with_file_name("lib.js"), A_PATCHED_INDEX).unwrap();
-    // B's live copy never carried A's lib.js change.
-    let live = tmp.path().join("node_modules").join(NAME).join("lib.js");
-    std::fs::write(live, ORIGINAL_INDEX).unwrap();
+    std::fs::remove_file(tmp.path().join(".socket/blobs").join(before)).unwrap();
 
     let (code, envelope) = run_rollback_subprocess_online(tmp.path(), &server, &[]);
     assert_eq!(
@@ -1688,8 +1676,49 @@ async fn an_unrestorable_orphaned_store_copy_keeps_the_superseded_record() {
     assert_eq!(
         manifest_patch_keys(tmp.path()),
         vec![PURL.to_string()],
-        "record A and its blobs stay for a later rollback"
+        "record A stays for a later rollback"
     );
+}
+
+/// #1084 review: a store copy of the superseding patch B that shares a
+/// file with record A (B's `lib.js` is A's patched `lib.js`, its
+/// `index.js` is B's own) is not A's copy. It is left, as the primary is,
+/// and the run drops record A as before instead of failing on it forever.
+#[cfg(unix)]
+#[tokio::test]
+#[serial]
+async fn a_superseding_store_copy_sharing_a_file_with_the_record_is_left() {
+    let server = MockServer::start().await;
+    let tmp = tempfile::tempdir().unwrap();
+    write_superseded_agent_fixture(tmp.path(), &server, B_PATCHED_INDEX).await;
+    let copy = orphan_bun_store_copy(tmp.path());
+    // Record A patched lib.js too; B carries the same patched lib.js.
+    let before = socket_patch_core::hash::git_sha256::compute_git_sha256_from_bytes(ORIGINAL_INDEX);
+    let after = socket_patch_core::hash::git_sha256::compute_git_sha256_from_bytes(A_PATCHED_INDEX);
+    let manifest_path = tmp.path().join(".socket/manifest.json");
+    let mut manifest: Value =
+        serde_json::from_str(&std::fs::read_to_string(&manifest_path).unwrap()).unwrap();
+    manifest["patches"][PURL]["files"]["package/lib.js"] =
+        serde_json::json!({ "beforeHash": before, "afterHash": after });
+    std::fs::write(&manifest_path, manifest.to_string()).unwrap();
+    std::fs::write(&copy, B_PATCHED_INDEX).unwrap();
+    std::fs::write(copy.with_file_name("lib.js"), A_PATCHED_INDEX).unwrap();
+    let live = tmp.path().join("node_modules").join(NAME).join("lib.js");
+    std::fs::write(live, A_PATCHED_INDEX).unwrap();
+
+    let (code, envelope) = run_rollback_subprocess_online(tmp.path(), &server, &[]);
+    assert_eq!(code, 0, "{envelope:#}");
+    assert!(
+        warning_codes(&envelope).contains(&"rollback_record_superseded".to_string()),
+        "{envelope:#}"
+    );
+    assert_eq!(std::fs::read(&copy).unwrap(), B_PATCHED_INDEX);
+    assert_eq!(
+        std::fs::read(copy.with_file_name("lib.js")).unwrap(),
+        A_PATCHED_INDEX,
+        "B's copy is the reinstall's to replace"
+    );
+    assert!(manifest_patch_keys(tmp.path()).is_empty());
 }
 
 /// B07: a remove/rollback identifier that names the superseded record's
