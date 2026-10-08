@@ -1037,6 +1037,22 @@ fn revert_one_record(
                 .and_then(|path| parse_vendor_path(&path))
                 .is_some_and(|p| p.eco == "npm" && p.uuid == entry_uuid);
         if !exact && !ours_uuid {
+            // MOVED OFF THE VENDORED VERSION, not drifted (#1155): `bun
+            // update` / `bun add pkg@other` re-locked the entry at another
+            // registry version, so the vendored version left the lock graph
+            // exactly as after `bun remove`. Nothing to restore; the caller
+            // keeps the artifact only while the lock still resolves through
+            // it. A same-version re-resolution stays drift.
+            if let Some(live_version) = version_moved_off(rec, &parsed) {
+                warnings.push(VendorWarning::new(
+                    super::LOCK_ENTRY_REMOVED_CODE,
+                    format!(
+                        "lock entry `{key}` now locks version {live_version}; the vendored \
+                         version is no longer installed, so there is nothing to restore"
+                    ),
+                ));
+                return;
+            }
             warnings.push(drifted(format!(
                 "lock entry `{key}` was re-resolved since vendoring; left alone"
             )));
@@ -1066,6 +1082,30 @@ fn revert_one_record(
         super::LOCK_ENTRY_REMOVED_CODE,
         format!("lock entry `{key}` no longer exists; nothing to restore"),
     ));
+}
+
+/// The registry version an entry tuple locks (`"left-pad@1.3.1"` → `1.3.1`),
+/// or `None` for any other spec (a vendored path, a URL, `file:`/`github:`).
+fn registry_version(entry: &BunEntry) -> Option<String> {
+    let spec = decode_json_string(entry.elems.first()?)?;
+    let (_, version) = split_name_spec(&spec)?;
+    let plain = !version.is_empty()
+        && version
+            .chars()
+            .all(|c| c.is_ascii_alphanumeric() || matches!(c, '.' | '-' | '+'));
+    plain.then(|| version.to_string())
+}
+
+/// The live entry's registry version when it differs from the pre-vendor
+/// one in `rec.original`: the user moved the package to another version
+/// since vendoring. `None` when either side has no registry version to
+/// compare (an `original: None` record, a URL or `file:` spec), which keeps
+/// the caller's drift verdict.
+fn version_moved_off(rec: &WiringRecord, live: &BunEntry) -> Option<String> {
+    let live_version = registry_version(live)?;
+    let original = rec.original.as_ref().and_then(Value::as_str)?;
+    let original_version = registry_version(&parse_entry_line(original).ok()?)?;
+    (live_version != original_version).then_some(live_version)
 }
 
 // ───────────────────────── vendor-specific classification ─────────────────
@@ -3127,14 +3167,68 @@ mod tests {
         );
     }
 
+    /// #1155: `bun update` / `bun add left-pad@1.3.1` moved the vendored
+    /// package off its patched version. The vendored version left the lock
+    /// graph exactly as after `bun remove`, so the revert has nothing to
+    /// restore and the artifact goes once nothing resolves through it,
+    /// instead of a drift-keep that `vendor --check` can never clear.
+    #[tokio::test]
+    async fn revert_after_version_change_drops_the_unreferenced_artifact() {
+        let fx = fixture_with(BN3_BEFORE_LOCK, "node_modules/left-pad").await;
+        let (_, entry, _) = expect_done(fx.vendor(false).await);
+        let entry = entry.unwrap();
+
+        let upgraded_line = "    \"left-pad\": [\"left-pad@1.3.1\", \"\", {}, \"sha512-other==\"],";
+        let live = fx.read_lock().await;
+        let new_line = entry.wiring[0]
+            .new
+            .as_ref()
+            .and_then(Value::as_str)
+            .unwrap();
+        let upgraded_lock = live.replace(new_line, upgraded_line);
+        assert_ne!(upgraded_lock, live, "test setup must move the entry");
+        tokio::fs::write(fx.root().join(BUN_LOCK), &upgraded_lock)
+            .await
+            .unwrap();
+
+        let outcome = revert_bun(&entry, fx.root(), false).await;
+        assert!(outcome.success, "{:?}", outcome.error);
+        assert!(!outcome.drift_skipped(), "{:?}", outcome.warnings);
+        assert!(!outcome.kept_artifact, "{:?}", outcome.warnings);
+        assert!(
+            outcome
+                .warnings
+                .iter()
+                .any(|w| w.code == "vendor_lock_entry_removed"
+                    && w.detail.contains("left-pad")
+                    && w.detail.contains("1.3.1")),
+            "the version change is surfaced: {:?}",
+            outcome.warnings
+        );
+        assert_eq!(
+            fx.read_lock().await,
+            upgraded_lock,
+            "the user's upgraded lock is left byte-identical"
+        );
+        assert!(
+            !fx.root()
+                .join(format!(".socket/vendor/npm/{UUID}"))
+                .exists(),
+            "nothing resolves through the artifact, so it is removed"
+        );
+    }
+
     #[tokio::test]
     async fn revert_leaves_drifted_entries_alone_with_warning() {
         let fx = fixture_with(BN3_BEFORE_LOCK, "node_modules/left-pad").await;
         let (_, entry, _) = expect_done(fx.vendor(false).await);
         let entry = entry.unwrap();
 
-        // The user re-resolved the entry behind our back (`bun update`).
-        let drifted_line = "    \"left-pad\": [\"left-pad@1.3.1\", \"\", {}, \"sha512-other==\"],";
+        // The user re-resolved the entry behind our back at the SAME
+        // version (a fork tarball). A version change is not drift (#1155);
+        // see `revert_after_version_change_drops_the_unreferenced_artifact`.
+        let drifted_line =
+            "    \"left-pad\": [\"left-pad@https://example.com/left-pad-1.3.0.tgz\", {}],";
         let live = fx.read_lock().await;
         let new_line = entry.wiring[0]
             .new

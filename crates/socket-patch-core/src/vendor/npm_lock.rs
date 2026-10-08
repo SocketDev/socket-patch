@@ -1163,6 +1163,20 @@ fn drifted_resolved_note(resolved: Option<&str>) -> String {
     }
 }
 
+/// The live entry's `version` when it names neither the version we wired
+/// (`rec.new`) nor the pre-vendor one (`rec.original`): the user moved the
+/// package to another version since vendoring. `None` when either side has
+/// no `version` to compare, which keeps the caller's drift verdict.
+fn version_moved_off<'a>(rec: &WiringRecord, live: &'a Value) -> Option<&'a str> {
+    let live_version = live.get("version").and_then(Value::as_str)?;
+    let recorded: Vec<&str> = [rec.new.as_ref(), rec.original.as_ref()]
+        .into_iter()
+        .flatten()
+        .filter_map(|v| v.get("version").and_then(Value::as_str))
+        .collect();
+    (!recorded.is_empty() && !recorded.contains(&live_version)).then_some(live_version)
+}
+
 /// Apply one wiring record in reverse: restore `original` iff the live
 /// fragment is still ours (drift = third party re-resolved it; leave theirs
 /// alone, with a warning).
@@ -1227,6 +1241,23 @@ fn revert_one_record(
         None => false,
     };
     if !ours {
+        // MOVED OFF THE VENDORED VERSION, not drifted (#1155): `npm install
+        // pkg@other` (or Dependabot) re-locked the entry at another
+        // version, so the vendored version left the lock graph exactly as
+        // after `npm uninstall`. Nothing to restore; the caller keeps the
+        // artifact only while a lock still resolves through it. A
+        // same-version re-resolution stays drift: re-vendoring can undo it.
+        if let Some(live_version) = version_moved_off(rec, live) {
+            warnings.push(VendorWarning::new(
+                super::LOCK_ENTRY_REMOVED_CODE,
+                format!(
+                    "lock entry `{key}` now locks version {live_version} ({}); the vendored \
+                     version is no longer installed, so there is nothing to restore",
+                    drifted_resolved_note(live_resolved)
+                ),
+            ));
+            return;
+        }
         warnings.push(VendorWarning::new(
             "vendor_lock_entry_drifted",
             format!(
@@ -3368,6 +3399,133 @@ mod tests {
             uninstalled,
             "the user's post-uninstall lock is left byte-identical"
         );
+    }
+
+    /// #1155: the user moved the vendored package off its patched version
+    /// (`npm install left-pad@1.3.1`, or Dependabot doing the same), so
+    /// every recorded entry still exists but now resolves another version
+    /// from the registry. The vendored version left the lock graph just as
+    /// it does after `npm uninstall`: nothing to restore, and the artifact
+    /// goes once nothing resolves through it. Keeping it as drift would
+    /// leave `vendor --check` red with remedies that can never converge.
+    #[tokio::test]
+    async fn revert_after_version_change_drops_the_unreferenced_artifact() {
+        let fx = fixture().await;
+        let (_, entry, _) = expect_done(fx.vendor(false).await);
+        let entry = entry.unwrap();
+
+        let upgraded = json!({
+            "version": "1.3.1",
+            "resolved": "https://registry.npmjs.org/left-pad/-/left-pad-1.3.1.tgz",
+            "integrity": "sha512-upgraded=="
+        });
+        let mut live = fx.read_lock().await;
+        live["packages"]["node_modules/left-pad"] = upgraded.clone();
+        live["packages"]["node_modules/foo/node_modules/left-pad"] = upgraded;
+        tokio::fs::write(fx.lock_path(), serialize_json(&live, "  ").unwrap())
+            .await
+            .unwrap();
+        let after_upgrade = tokio::fs::read(fx.lock_path()).await.unwrap();
+
+        let outcome = revert_npm(&entry, fx.root(), false).await;
+        assert!(outcome.success, "{:?}", outcome.error);
+        assert!(!outcome.drift_skipped(), "{:?}", outcome.warnings);
+        assert!(!outcome.kept_artifact, "{:?}", outcome.warnings);
+        assert!(
+            outcome
+                .warnings
+                .iter()
+                .any(|w| w.code == "vendor_lock_entry_removed"
+                    && w.detail.contains("node_modules/left-pad")
+                    && w.detail.contains("1.3.1")),
+            "the version change is surfaced: {:?}",
+            outcome.warnings
+        );
+        assert!(
+            !fx.root()
+                .join(format!(".socket/vendor/npm/{UUID}"))
+                .exists(),
+            "nothing resolves through the artifact, so it is removed"
+        );
+        assert_eq!(
+            tokio::fs::read(fx.lock_path()).await.unwrap(),
+            after_upgrade,
+            "the user's upgraded lock is left byte-identical"
+        );
+    }
+
+    /// #1155, downgrade of one instance: the direct copy moved to 1.2.0
+    /// while the nested copy is still wired. The nested copy is restored,
+    /// the direct one is left as the user locked it, and the artifact goes
+    /// because the restore leaves nothing resolving through it.
+    #[tokio::test]
+    async fn revert_after_partial_downgrade_restores_the_rest_and_drops_artifact() {
+        let fx = fixture().await;
+        let (_, entry, _) = expect_done(fx.vendor(false).await);
+        let entry = entry.unwrap();
+
+        let downgraded = json!({
+            "version": "1.2.0",
+            "resolved": "https://registry.npmjs.org/left-pad/-/left-pad-1.2.0.tgz",
+            "integrity": "sha512-older=="
+        });
+        let mut live = fx.read_lock().await;
+        live["packages"]["node_modules/left-pad"] = downgraded.clone();
+        tokio::fs::write(fx.lock_path(), serialize_json(&live, "  ").unwrap())
+            .await
+            .unwrap();
+
+        let outcome = revert_npm(&entry, fx.root(), false).await;
+        assert!(outcome.success, "{:?}", outcome.error);
+        assert!(!outcome.drift_skipped(), "{:?}", outcome.warnings);
+        assert!(!outcome.kept_artifact, "{:?}", outcome.warnings);
+        let after = fx.read_lock().await;
+        assert_eq!(after["packages"]["node_modules/left-pad"], downgraded);
+        assert_eq!(
+            after["packages"]["node_modules/foo/node_modules/left-pad"],
+            default_lock()["packages"]["node_modules/foo/node_modules/left-pad"],
+            "the still-wired instance is restored"
+        );
+        assert!(!fx
+            .root()
+            .join(format!(".socket/vendor/npm/{UUID}"))
+            .exists());
+    }
+
+    /// #1155 guard: the recorded entry moved to another version, but the
+    /// lock still resolves through the artifact under a key the wiring
+    /// never recorded. The artifact may be the only copy that install
+    /// needs, so it is kept.
+    #[tokio::test]
+    async fn revert_keeps_artifact_when_version_changed_but_uuid_still_referenced() {
+        let fx = fixture().await;
+        let (_, entry, _) = expect_done(fx.vendor(false).await);
+        let entry = entry.unwrap();
+
+        let mut live = fx.read_lock().await;
+        let packages = live["packages"].as_object_mut().unwrap();
+        let wired = packages["node_modules/left-pad"].clone();
+        packages.insert("node_modules/bar/node_modules/left-pad".into(), wired);
+        packages.insert(
+            "node_modules/left-pad".into(),
+            json!({
+                "version": "1.3.1",
+                "resolved": "https://registry.npmjs.org/left-pad/-/left-pad-1.3.1.tgz",
+                "integrity": "sha512-upgraded=="
+            }),
+        );
+        packages.remove("node_modules/foo/node_modules/left-pad");
+        tokio::fs::write(fx.lock_path(), serialize_json(&live, "  ").unwrap())
+            .await
+            .unwrap();
+
+        let outcome = revert_npm(&entry, fx.root(), false).await;
+        assert!(outcome.success, "{:?}", outcome.error);
+        assert!(outcome.kept_artifact, "{:?}", outcome.warnings);
+        assert!(fx
+            .root()
+            .join(format!(".socket/vendor/npm/{UUID}"))
+            .exists());
     }
 
     /// #665 guard: a recorded entry vanished but the lock still resolves
