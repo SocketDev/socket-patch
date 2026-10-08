@@ -19,9 +19,10 @@ use std::io::Read as _;
 use std::path::{Path, PathBuf};
 
 use super::coursier_cache::{existing_dedup, jvm_option_values, log_source, TargetOs};
-use super::maven_crawler::{is_safe_maven_coordinate, parse_pom_group_artifact_version};
+use super::maven_crawler::parse_pom_group_artifact_version;
 use super::types::CrawledPackage;
 use crate::utils::fs::{open_regular_file_sync, read_regular_to_bytes_sync};
+use crate::vendor::jvm::layout::is_path_safe;
 
 /// The artifact directories Ivy files a module's jar under, in lookup order
 /// (`bundles/` holds OSGi-packaged jars such as guava 19.0's).
@@ -120,7 +121,7 @@ pub fn find_by_purls(root: &Path, purls: &[String]) -> HashMap<String, CrawledPa
         };
         // SECURITY: untrusted coordinates are joined onto the cache root and
         // the result is patched in place.
-        if !is_safe_maven_coordinate(&g, &a, &v) {
+        if !is_path_safe(&g, &a, &v) {
             continue;
         }
         let found = org_roots.iter().find_map(|org_root| {
@@ -168,7 +169,7 @@ pub fn type_dirs(module_dir: &Path) -> Vec<String> {
 /// An `.original` from an Ivy-pattern origin is an `ivy.xml`, not a pom,
 /// and is never returned.
 pub fn installed_pom(installed_dir: &Path, g: &str, a: &str, v: &str) -> Option<Vec<u8>> {
-    if !is_safe_maven_coordinate(g, a, v) {
+    if !is_path_safe(g, a, v) {
         return None;
     }
     if let Ok(bytes) = read_regular_to_bytes_sync(&installed_dir.join(format!("{a}-{v}.pom"))) {
@@ -212,7 +213,7 @@ fn org_roots(root: &Path) -> Vec<PathBuf> {
 /// coordinates, no regular `ivy-<rev>.xml`, an `<info>` naming other
 /// coordinates, or no jar.
 fn package(module_dir: &Path, org: &str, module: &str, rev: &str) -> Option<CrawledPackage> {
-    if !is_safe_maven_coordinate(org, module, rev) {
+    if !is_path_safe(org, module, rev) {
         return None;
     }
     // Neither the module nor the organisation directory may be a link out
