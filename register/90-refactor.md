@@ -7,7 +7,7 @@ _Last updated 2026-10-08T08:15Z · main @ 829d0af_
 - [#1108](https://github.com/SocketDev/socket-patch/pull/1108): one `utils::line_endings::terminator` (CRLF → CRLF, mixed → majority, else LF) for 7 inserted-line sites: gem lock converge, composer/requirements restore, Pipfile.lock entry formatter, PEP 723 writer, go.mod append/re-join. Issue #815 (E16, slice 1; `detect_eol`, `pypi_uv::newline_of`, Maven ×2, `redirect/mod.rs`, the `crlf` flags and upstream gem's Gemfile restore remain, all in open-PR files). Re-blesses the go/uv equivalence goldens (mixed inputs only). `state: ready`.
 - [#1106](https://github.com/SocketDev/socket-patch/pull/1106): the macOS PDM site probe runs through `utils::process::output_within`; a guard test rejects new production `kill_on_drop` spawns (pending: `vendor/npm_dir.rs`). Issue #1067 (C48, slice: `pdm_site`; the `npm_dir` git exchange remains, blocked on #1026). `state: ready`, handed to the burn-down.
 - [#1103](https://github.com/SocketDev/socket-patch/pull/1103): `go.sum` edits through `GoSumEditor` only; deletes the oracle-only free functions and names the key rule once. Issue #631 (E52, slice: steps 2–3; the move to `formats/golang/sum.rs` remains). `state: ready`, handed to the burn-down.
-- Maintainer drafts (decided issues): [#1021](https://github.com/SocketDev/socket-patch/pull/1021) (#615), [#1027](https://github.com/SocketDev/socket-patch/pull/1027) (#704), [#1030](https://github.com/SocketDev/socket-patch/pull/1030) (#808), [#1031](https://github.com/SocketDev/socket-patch/pull/1031) (#966), [#1036](https://github.com/SocketDev/socket-patch/pull/1036) (#973), [#1041](https://github.com/SocketDev/socket-patch/pull/1041) (#648), [#1049](https://github.com/SocketDev/socket-patch/pull/1049) (#792), [#1051](https://github.com/SocketDev/socket-patch/pull/1051) (#580).
+- Maintainer drafts (decided issues): #1021 (#615), #1027 (#704), #1030 (#808), #1031 (#966), #1036 (#973), #1041 (#648), #1049 (#792), #1051 (#580).
 - October 7 campaign (duplicate business logic, one PR per seam; register rows in brackets): #1026 credentials [C59], #1029 trust signals [C61], #1032 JVM layout [E77, E69], #1033 VEX attestation [E72], #1034 target grammar [C62], #1035 supersede lifecycle [E71], #1038 paths and roots [C64], #1039 atomic takeover [E70], #1043 command cycles and UI text [C65, C12], #1044 governing locks [E75], #1045 `PurlKey` [C63], #1046 test hygiene [C66], #1050 vendored liveness [E74], #1057 yarn grammar [E08, E76], #1058 pinned check [E73]. Merged: #1042 [C60, C42] `ddc3bfb`, #1033 [E72], #1038 [C64], #1046 [C66], #1035 [E71], #1044 [E75].
 
 **Merged:**
@@ -26,7 +26,7 @@ _Last updated 2026-10-08T08:15Z · main @ 829d0af_
 | 4 | E35 slice: retire the composer/go/nuget/python crawler oracles (≈590 test lines) | 0 | 0 | 4 | L | ≈8 | free files, but test-only; needs a register issue first |
 | 5 | #706 (C17) slice 2: the 6 `PENDING_INLINE_DIGESTS` files | 0 | 1 | ≈6 | L | ≈14 | skipped: all 6 files changed by open PRs |
 
-Re-ranked 2026-10-08T08:00Z at `829d0af` against the files of the 34 open PRs (516 files, 174 free production `.rs` files). Free files hold #905's 8 sites, E35's crawler oracles (except maven/npm/cargo) and #649.
+Re-ranked 2026-10-08T08:00Z at `829d0af` against the 34 open PRs' 516 files.
 
 **Notes:**
 - Lead for `audit-ecosystems` (not filed): hosted `redirect/requirements.rs` keeps its own pip lexer (`logical_requirements`, `unquoted_index`, `requirement_tokens`) beside `utils::requirements::{logical_lines, split_comment, shlex_split}`. Its comment finder is quote-aware, pip's `COMMENT_RE` is not. `upstream/pypi.rs` shares it (changed by #1108).
@@ -42,7 +42,6 @@ Re-ranked 2026-10-08T08:00Z at `829d0af` against the files of the 34 open PRs (5
 - `lock_inventory/mod.rs` `architecture_tests` forbid `hosted_patch_uuid*` in a format file's model section. Origin-policy helpers go after the `// ── registry view ──` marker.
 - `redirect/mod.rs` is a hot file (4 open PRs). Prefer candidates outside it until those land.
 - `CLI_CONTRACT.md` lives at `crates/socket-patch-cli/CLI_CONTRACT.md`.
-- Runs overlap; `git pull --rebase` the ledger before writing.
 - Ledger and branch pushes need verified signatures (org ruleset). Commit with the session's default git identity; overriding `user.email` (e.g. to a bot address) makes GitHub reject the signature.
 - Maintainer steering (2026-10-02, on #569 and #571): don't add size caps on trusted upstream data; stream instead of buffering.
 - reqwest 0.12 `ClientBuilder::read_timeout` is an idle bound (resets per chunk) and also bounds the wait for response headers; `RequestBuilder::timeout` is total.
