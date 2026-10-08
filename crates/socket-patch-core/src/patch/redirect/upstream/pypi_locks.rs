@@ -57,7 +57,16 @@ fn files_value(release: &[PypiFile], by_url: bool) -> Option<toml_edit::Value> {
     let key = if by_url { "url" } else { "file" };
     let mut located: Vec<(&str, &PypiFile)> = release
         .iter()
-        .map(|f| (if by_url { f.url.as_str() } else { f.filename.as_str() }, f))
+        .map(|f| {
+            (
+                if by_url {
+                    f.url.as_str()
+                } else {
+                    f.filename.as_str()
+                },
+                f,
+            )
+        })
         .collect();
     // PDM orders each entry's files by the location it writes: a `static_urls`
     // lock by URL (so an sdist under `0c/…` precedes a wheel under `b0/…`),

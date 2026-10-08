@@ -152,7 +152,11 @@ fn committed_pre_v5_ledger_lets_a_hosted_pin_attest_offline() {
         );
     }
     api.assert_no_requests();
-    assert_eq!(std::fs::read(&ledger).unwrap(), before, "vex never rewrites it");
+    assert_eq!(
+        std::fs::read(&ledger).unwrap(),
+        before,
+        "vex never rewrites it"
+    );
 
     let other = "0b0b0b0b-0b0b-4b0b-8b0b-0b0b0b0b0b0b";
     let mut stale = left_pad_view();

@@ -20,6 +20,7 @@ use std::path::Path;
 
 use serde::Serialize;
 
+use super::containment;
 use super::fs::{atomic_write_bytes, read_regular_to_bytes};
 
 /// Best-effort: remove `dir` when it is empty, then each ancestor while it is
@@ -46,7 +47,14 @@ pub async fn prune_empty_dirs(dir: &Path, stop_dir: &Path) {
 /// now-empty parents up to but excluding `stop_dir`. Any unlink error other
 /// than NotFound propagates BEFORE any pruning: a read-only parent leaves the
 /// file — and the caller's fail-closed error — exactly where they were.
+///
+/// Refuses, before unlinking, when a directory level between the project
+/// root and `path` (`.socket` included) is a link: the unlink would land in
+/// the link's target (see [`remove_tree_and_prune`]).
 pub async fn remove_file_and_prune(path: &Path, stop_dir: &Path) -> std::io::Result<()> {
+    if let Some(parent) = path.parent() {
+        containment::ensure_unlinked(guard_root(stop_dir), parent, "delete")?;
+    }
     match super::fs::remove_file(path).await {
         Ok(()) => {}
         Err(e) if e.kind() == std::io::ErrorKind::NotFound => {}
@@ -67,18 +75,13 @@ pub async fn remove_file_and_prune(path: &Path, stop_dir: &Path) -> std::io::Res
 /// prune — the tree is still there.
 ///
 /// Refuses (before deleting anything) when `dir`, or any level between it
-/// and `stop_dir`, is a symlink or junction: socket-patch never creates
-/// links under `.socket/`, so a linked level points at a tree it does not
-/// own — another project's vendor store, say — and deleting through it
-/// would destroy that tree.
+/// and the project root (`stop_dir`'s parent) — `.socket` itself included
+/// (#887) — is a symlink or junction: socket-patch never creates links
+/// there, so a linked level points at a tree it does not own (another
+/// project's `.socket/` or vendor store, say) and deleting through it would
+/// destroy that tree. See [`containment`].
 pub async fn remove_tree_and_prune(dir: &Path, stop_dir: &Path) -> std::io::Result<()> {
-    if let Some(link) = linked_level(dir, stop_dir).await {
-        return Err(std::io::Error::other(format!(
-            "refusing to delete {}: {} is a symlink, and its target is not socket-patch's to remove",
-            dir.display(),
-            link.display()
-        )));
-    }
+    containment::ensure_unlinked(guard_root(stop_dir), dir, "delete")?;
     // A staged hosted takeover deletes the unit only once its commit is on
     // disk (see `group_commit::defer_removal`). The prune bound is the
     // level just below `stop_dir`, so `stop_dir` itself still survives.
@@ -96,25 +99,10 @@ pub async fn remove_tree_and_prune(dir: &Path, stop_dir: &Path) -> std::io::Resu
     Ok(())
 }
 
-/// The outermost of `dir` and its ancestors strictly below `stop_dir` that
-/// is a symlink (lstat), or `None`. Only `dir` itself is checked when it is
-/// not under `stop_dir`. Levels at or above `stop_dir` (the project path
-/// itself, `/tmp -> /private/tmp`) are the user's business.
-async fn linked_level<'a>(dir: &'a Path, stop_dir: &Path) -> Option<&'a Path> {
-    let levels: Vec<&Path> = if dir.starts_with(stop_dir) {
-        dir.ancestors().take_while(|a| *a != stop_dir).collect()
-    } else {
-        vec![dir]
-    };
-    for level in levels.into_iter().rev() {
-        if tokio::fs::symlink_metadata(level)
-            .await
-            .is_ok_and(|meta| meta.file_type().is_symlink())
-        {
-            return Some(level);
-        }
-    }
-    None
+/// The root the link guard starts below: the project that owns `stop_dir`
+/// (`<project>/.socket`), so `.socket` itself is a guarded level.
+fn guard_root(stop_dir: &Path) -> &Path {
+    stop_dir.parent().unwrap_or(stop_dir)
 }
 
 /// Persist a committed JSON ledger: pretty-printed with a trailing newline
@@ -133,7 +121,16 @@ async fn linked_level<'a>(dir: &'a Path, stop_dir: &Path) -> Option<&'a Path> {
 /// Unlike [`remove_file_and_prune`], nothing was written here, so pruning
 /// on the error path is the right asymmetry. A parent that already existed
 /// (the user's, or another run's) is never removed.
+///
+/// A ledger under a `.socket/` is refused, before anything is read or
+/// written, when any level between the project root and the ledger
+/// (`.socket` and the ledger itself included) is a link: socket-patch
+/// never creates one there, so its target belongs to another project or
+/// lies outside this one (#887).
 pub(crate) async fn write_json_ledger<T: Serialize>(path: &Path, value: &T) -> std::io::Result<()> {
+    if let Some(root) = containment::socket_project_root(path) {
+        containment::ensure_unlinked(root, path, "write")?;
+    }
     let mut bytes = serde_json::to_vec_pretty(value).map_err(std::io::Error::other)?;
     bytes.push(b'\n');
     if matches!(read_regular_to_bytes(path).await, Ok(existing) if existing == bytes) {
@@ -148,23 +145,13 @@ pub(crate) async fn write_json_ledger<T: Serialize>(path: &Path, value: &T) -> s
         Ok(()) => Ok(()),
         Err(e) => {
             if created_parent {
-                if let Some(stop) = nearest_socket_dir(path) {
+                if let Some(stop) = containment::nearest_socket_dir(parent) {
                     prune_empty_dirs(parent, stop).await;
                 }
             }
             Err(e)
         }
     }
-}
-
-/// The nearest ancestor of `path` literally named `.socket` — the fence for
-/// an error-path prune. `None` (a ledger that does not live under a
-/// `.socket/`) means: never climb.
-fn nearest_socket_dir(path: &Path) -> Option<&Path> {
-    path.ancestors().skip(1).find(|a| {
-        a.file_name()
-            .is_some_and(|n| n == crate::constants::SOCKET_DIR)
-    })
 }
 
 #[cfg(test)]
@@ -331,6 +318,50 @@ mod tests {
             .await
             .unwrap_err();
         assert!(shared.join("uuid/a.tgz").is_file(), "target untouched");
+    }
+
+    /// #887: `.socket` itself linked to a directory another project
+    /// shares. Deleting a unit, unlinking a ledger and writing a ledger all
+    /// refuse before touching the shared tree.
+    #[cfg(unix)]
+    #[tokio::test]
+    async fn a_linked_socket_dir_is_never_written_or_deleted_through() {
+        let tmp = tempfile::tempdir().unwrap();
+        let shared = tmp.path().join("sock");
+        let unit = shared.join("vendor/npm/uuid");
+        tokio::fs::create_dir_all(&unit).await.unwrap();
+        tokio::fs::write(unit.join("a.tgz"), b"x").await.unwrap();
+        tokio::fs::write(shared.join("vendor/state.json"), b"{}")
+            .await
+            .unwrap();
+        let project = tmp.path().join("a");
+        tokio::fs::create_dir_all(&project).await.unwrap();
+        std::os::unix::fs::symlink(&shared, project.join(".socket")).unwrap();
+        let socket = project.join(".socket");
+
+        let err = remove_tree_and_prune(&socket.join("vendor/npm/uuid"), &socket)
+            .await
+            .unwrap_err();
+        assert!(err.to_string().contains("is a symlink"), "{err}");
+        let err = remove_file_and_prune(&socket.join("vendor/state.json"), &socket)
+            .await
+            .unwrap_err();
+        assert!(err.to_string().contains("is a symlink"), "{err}");
+        let ledger = Ledger {
+            version: 1,
+            entries: vec![],
+        };
+        let err = write_json_ledger(&socket.join("vendor/state.json"), &ledger)
+            .await
+            .unwrap_err();
+        assert!(err.to_string().contains("is a symlink"), "{err}");
+
+        assert!(unit.join("a.tgz").is_file(), "shared unit untouched");
+        assert_eq!(
+            std::fs::read(shared.join("vendor/state.json")).unwrap(),
+            b"{}",
+            "shared ledger untouched"
+        );
     }
 
     /// Links at or above `stop_dir` (a project reached through a linked

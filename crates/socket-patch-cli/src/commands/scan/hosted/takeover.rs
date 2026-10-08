@@ -306,7 +306,8 @@ impl Takeover {
                 // metadata, a withheld artifact, ...).
                 Some(skip) => skip.reason.clone(),
                 None => {
-                    let (code, explained) = explain(&staged.entry, dep, warnings);
+                    let (code, explained) =
+                        explain(&common.cwd, &staged.entry, dep, warnings).await;
                     skipped.push(SkippedPatch::new(&staged.purl, &staged.uuid, &code));
                     for w in explained {
                         if !self.explained.contains(&w) {
@@ -391,17 +392,19 @@ const LANDED_PIN_ADVISORIES: &[&str] = &[
 ];
 
 /// Why the rewrite did not pin a staged purl: the skip reason, and the
-/// rewriter warnings that say so. In order: for a requirements entry wired
-/// outside the root file, the reach the hosted rewriter lacks (#699); a
-/// rewriter warning naming the package; the rewrite's first warning (a
-/// lock-level refusal names no package), skipping
-/// [`LANDED_PIN_ADVISORIES`]; else [`NOT_PINNED`].
-fn explain(
+/// rewriter warnings that say so. In order: for a PyPI entry, the reach the
+/// hosted rewriter lacks (`preflight_pypi_takeover`: a requirements entry
+/// wired outside the root file #699, a uv entry pinned down from another
+/// locked version #723, a Poetry 0.x lock #945); a rewriter warning naming
+/// the package; the rewrite's first warning (a lock-level refusal names no
+/// package), skipping [`LANDED_PIN_ADVISORIES`]; else [`NOT_PINNED`].
+async fn explain(
+    root: &std::path::Path,
     entry: &VendorEntry,
     dep: Option<&socket_patch_core::patch::redirect::DepOverride>,
     warnings: &[RewriteWarning],
 ) -> (String, Vec<RewriteWarning>) {
-    if let Err(w) = socket_patch_core::patch::redirect::preflight_requirements_takeover(entry) {
+    if let Err(w) = socket_patch_core::patch::redirect::preflight_pypi_takeover(root, entry).await {
         return (w.code.clone(), vec![w]);
     }
     if let Some(w) = dep.and_then(|dep| {
@@ -533,8 +536,8 @@ mod tests {
         ));
     }
 
-    #[test]
-    fn explain_skips_landed_pin_advisories_as_the_lock_level_cause() {
+    #[tokio::test]
+    async fn explain_skips_landed_pin_advisories_as_the_lock_level_cause() {
         let warn = |code: &str| RewriteWarning {
             code: code.into(),
             detail: "lock-wide detail".into(),
@@ -552,10 +555,11 @@ mod tests {
             warn("redirect_pnpm_trust_lockfile"),
             warn("redirect_yarn_classic_berry_migration_risk"),
         ];
-        assert_eq!(explain(&entry, None, &warnings).0, NOT_PINNED);
+        let root = std::path::Path::new(".");
+        assert_eq!(explain(root, &entry, None, &warnings).await.0, NOT_PINNED);
         let mut with_refusal = warnings.to_vec();
         with_refusal.push(warn("redirect_lock_refused"));
-        let (code, explained) = explain(&entry, None, &with_refusal);
+        let (code, explained) = explain(root, &entry, None, &with_refusal).await;
         assert_eq!(code, "redirect_lock_refused");
         assert_eq!(explained, vec![warn("redirect_lock_refused")]);
     }
