@@ -155,8 +155,8 @@ async fn successful_update_is_counted_once() {
             "publishedAt": "2024-06-01T00:00:00Z",
             "files": {
                 "package/index.js": {
-                    "beforeHash": "0000000000000000000000000000000000000000000000000000000000000000",
-                    "afterHash":  "1111111111111111111111111111111111111111111111111111111111111111",
+                    "beforeHash": "9b8142d93991702a22920638c6d6768b150706c5e018b3605b74552d09fd160e",
+                    "afterHash":  "d2802877eb1c2f442d30d18abcb281cb2830875571624544f2f1acb36480997e",
                     "blobContent": "cGF0Y2hlZAo=",
                     "beforeBlobContent": "b3JpZ2luYWwK",
                 }
@@ -218,8 +218,8 @@ async fn corrupt_manifest_is_a_hard_error_not_silently_clobbered() {
             "publishedAt": "2024-06-01T00:00:00Z",
             "files": {
                 "package/index.js": {
-                    "beforeHash": "0000000000000000000000000000000000000000000000000000000000000000",
-                    "afterHash":  "1111111111111111111111111111111111111111111111111111111111111111",
+                    "beforeHash": "9b8142d93991702a22920638c6d6768b150706c5e018b3605b74552d09fd160e",
+                    "afterHash":  "d2802877eb1c2f442d30d18abcb281cb2830875571624544f2f1acb36480997e",
                     "blobContent": "cGF0Y2hlZAo=",
                     "beforeBlobContent": "b3JpZ2luYWwK",
                 }

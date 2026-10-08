@@ -25,9 +25,7 @@ const CRATES_IO_SOURCE: &str = "registry+https://github.com/rust-lang/crates.io-
 /// The project cargo configs, in cargo's read preference.
 const CARGO_CONFIGS: [&str; 2] = [".cargo/config", ".cargo/config.toml"];
 
-fn registry_name(uuid: &str) -> String {
-    format!("socket-patch-{uuid}")
-}
+use crate::patch::redirect::generation::{self, hosted_pin_name as registry_name};
 
 struct LockHit {
     uuid: String,
@@ -97,7 +95,10 @@ pub(crate) async fn restore(
             )
         });
         let cksums: BTreeMap<String, Result<String, String>> =
-            futures_util::future::join_all(lookups).await.into_iter().collect();
+            futures_util::future::join_all(lookups)
+                .await
+                .into_iter()
+                .collect();
         let mut changed = false;
         let mut restored: Vec<(&LockHit, String)> = Vec::new();
         for hit in &hits {
@@ -116,7 +117,9 @@ pub(crate) async fn restore(
         }
         // The entries' own source + checksum values, spliced at the parse's
         // spans (every hit is a distinct block: its source names its uuid).
-        let spans = model.spans().expect("a lock parsed from text carries spans");
+        let spans = model
+            .spans()
+            .expect("a lock parsed from text carries spans");
         let mut splices: Vec<(std::ops::Range<usize>, String)> = Vec::new();
         for (hit, cksum) in &restored {
             let at = &spans.packages[hit.index];
@@ -133,7 +136,10 @@ pub(crate) async fn restore(
         }
         for (hit, cksum) in &restored {
             // Dependents' full-id references and the v1 `[metadata]` key.
-            lock = lock.replace(&format!("({})", hit.source), &format!("({CRATES_IO_SOURCE})"));
+            lock = lock.replace(
+                &format!("({})", hit.source),
+                &format!("({CRATES_IO_SOURCE})"),
+            );
             let metadata_key = format!(
                 "\"checksum {} {} ({CRATES_IO_SOURCE})\" = \"",
                 hit.name, hit.version
@@ -152,7 +158,11 @@ pub(crate) async fn restore(
         if changed {
             view.write(
                 "Cargo.lock",
-                if crlf { lock.replace('\n', "\r\n") } else { lock },
+                if crlf {
+                    lock.replace('\n', "\r\n")
+                } else {
+                    lock
+                },
             );
         }
     }
@@ -206,29 +216,41 @@ pub(crate) async fn restore(
     }
 
     // ── cargo config registry blocks ──
+    // Every hosted generation a config defines is a candidate, not only the
+    // pins found in the lock: a superseded generation's block an older CLI
+    // left behind on re-pin is referenced by nothing and would otherwise
+    // outlive the restore (#864). A block any manifest or the lock still
+    // names stays.
+    let mut configs: Vec<(&str, String)> = Vec::new();
+    for rel in CARGO_CONFIGS {
+        if let Ok(Some(config)) = view.read(rel).await {
+            configs.push((rel, config));
+        }
+    }
     let mut referenced: BTreeSet<String> = BTreeSet::new();
     for rel in manifests.iter().map(String::as_str).chain(["Cargo.lock"]) {
         if let Ok(Some(text)) = view.read(rel).await {
-            for pin in pins {
-                let reg = registry_name(&pin.uuid);
-                if text.contains(&reg) || lock_names_index(&text, &pin.uuid) {
-                    referenced.insert(pin.uuid.clone());
+            referenced.extend(generation::named_generations(&text));
+            for (_, config) in &configs {
+                for uuid in generation::named_generations(config) {
+                    if lock_names_index(&text, &uuid) {
+                        referenced.insert(uuid);
+                    }
                 }
             }
         }
     }
-    for rel in CARGO_CONFIGS {
-        let Ok(Some(config)) = view.read(rel).await else {
-            continue;
-        };
+    for (rel, config) in configs {
         let mut next = config.clone();
-        for pin in pins {
-            if result.refused.contains_key(&pin.uuid) || referenced.contains(&pin.uuid) {
+        for uuid in generation::named_generations(&config) {
+            if result.refused.contains_key(&uuid) || referenced.contains(&uuid) {
                 continue;
             }
-            if let Some(removed) = remove_registry_block(&next, &registry_name(&pin.uuid)) {
+            if let Some(removed) = remove_registry_block(&next, &registry_name(&uuid)) {
                 next = removed;
-                result.handled.insert(pin.uuid.clone());
+                if by_uuid.contains_key(uuid.as_str()) {
+                    result.handled.insert(uuid);
+                }
             }
         }
         if next != config {
@@ -239,7 +261,6 @@ pub(crate) async fn restore(
             }
         }
     }
-    let _ = by_uuid;
     result
 }
 
@@ -300,7 +321,7 @@ fn unpin_line(line: &str, reg: &str) -> Option<Option<String>> {
 
 /// The config with its `[registries.<reg>]` block (and the blank separator
 /// the rewriter put before it) removed; `None` when absent.
-fn remove_registry_block(config: &str, reg: &str) -> Option<String> {
+pub(crate) fn remove_registry_block(config: &str, reg: &str) -> Option<String> {
     let crlf = config.contains("\r\n");
     let lf = config.replace("\r\n", "\n");
     let header = format!("[registries.{reg}]");
@@ -317,11 +338,10 @@ fn remove_registry_block(config: &str, reg: &str) -> Option<String> {
         end -= 1;
     }
     let fragment = format!("{}\n", lines[i..end].join("\n"));
-    let removed = remove_appended_cargo_block(&lf, &fragment)
-        .or_else(|| {
-            // The block ends the file with no final newline.
-            remove_appended_cargo_block(&lf, fragment.trim_end_matches('\n'))
-        })?;
+    let removed = remove_appended_cargo_block(&lf, &fragment).or_else(|| {
+        // The block ends the file with no final newline.
+        remove_appended_cargo_block(&lf, fragment.trim_end_matches('\n'))
+    })?;
     Some(if crlf {
         removed.replace('\n', "\r\n")
     } else {
@@ -388,7 +408,10 @@ mod tests {
 
     #[test]
     fn table_form_line_is_dropped() {
-        assert_eq!(unpin_line(&format!("registry = \"{REG}\""), REG), Some(None));
+        assert_eq!(
+            unpin_line(&format!("registry = \"{REG}\""), REG),
+            Some(None)
+        );
     }
 
     #[test]
@@ -397,8 +420,75 @@ mod tests {
         let hosted = format!(
             "{original}\n[registries.{REG}]\nindex = \"sparse+https://patch.socket.dev/x/index/\"\n"
         );
-        assert_eq!(remove_registry_block(&hosted, REG).as_deref(), Some(original));
+        assert_eq!(
+            remove_registry_block(&hosted, REG).as_deref(),
+            Some(original)
+        );
         let created = format!("[registries.{REG}]\nindex = \"sparse+https://x/\"\n");
         assert_eq!(remove_registry_block(&created, REG).as_deref(), Some(""));
+    }
+
+    const A: &str = "aaaaaaaa-0000-4000-8000-00000000000a";
+    const B: &str = "bbbbbbbb-0000-4000-8000-00000000000b";
+    const C: &str = "cccccccc-0000-4000-8000-00000000000c";
+
+    fn block(uuid: &str) -> String {
+        format!(
+            "[registries.socket-patch-{uuid}]\nindex = \"sparse+https://patch.socket.dev/patch-registry/cargo/tok/{uuid}/index/\"\n"
+        )
+    }
+
+    /// Restore cfg-if's hosted pin `B` (lock-free, so offline) over
+    /// `manifest` and `config`; the outcome and the config after (`None`
+    /// once deleted).
+    async fn restore_b(
+        manifest: &str,
+        config: &str,
+    ) -> (super::super::RestoreOutcome, Option<String>) {
+        let tmp = tempfile::tempdir().unwrap();
+        std::fs::write(tmp.path().join("Cargo.toml"), manifest).unwrap();
+        std::fs::create_dir_all(tmp.path().join(".cargo")).unwrap();
+        std::fs::write(tmp.path().join(".cargo/config.toml"), config).unwrap();
+        let pins = [super::super::HostedPin {
+            purl: "pkg:cargo/cfg-if@1.0.4".into(),
+            uuid: B.into(),
+            files: vec!["Cargo.toml".into(), ".cargo/config.toml".into()],
+        }];
+        let opts = super::super::RestoreOptions {
+            offline: true,
+            ..Default::default()
+        };
+        let outcome = super::super::restore_upstream(tmp.path(), &pins, &opts).await;
+        let config = std::fs::read_to_string(tmp.path().join(".cargo/config.toml")).ok();
+        (outcome, config)
+    }
+
+    fn manifest(extra: &str) -> String {
+        format!(
+            "[package]\nname = \"app\"\nversion = \"0.1.0\"\n\n[dependencies]\n\
+             cfg-if = {{ version = \"1.0.4\", registry = \"socket-patch-{B}\" }}\n{extra}"
+        )
+    }
+
+    /// #864: a superseded generation's block an older CLI left beside the
+    /// live pin's is referenced by nothing; restoring the live pin sweeps
+    /// it too, and the config the rewriter created is deleted once empty.
+    #[tokio::test]
+    async fn restore_sweeps_a_leftover_superseded_registry_block() {
+        let config = format!("{}\n{}", block(A), block(B));
+        let (outcome, after) = restore_b(&manifest(""), &config).await;
+        assert_eq!(outcome.restored().count(), 1, "{:?}", outcome.pins);
+        assert_eq!(after, None, "the emptied config must be deleted");
+    }
+
+    /// A generation the restore did not select that a manifest still pins
+    /// stays wired: only unreferenced blocks are swept.
+    #[tokio::test]
+    async fn restore_keeps_an_unselected_generation_still_referenced() {
+        let config = format!("{}\n{}", block(B), block(C));
+        let other = format!("log = {{ version = \"0.4.20\", registry = \"socket-patch-{C}\" }}\n");
+        let (outcome, after) = restore_b(&manifest(&other), &config).await;
+        assert_eq!(outcome.restored().count(), 1, "{:?}", outcome.pins);
+        assert_eq!(after.as_deref().map(str::trim_start), Some(block(C).as_str()));
     }
 }

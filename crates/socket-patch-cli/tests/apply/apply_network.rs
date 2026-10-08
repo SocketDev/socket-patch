@@ -478,8 +478,7 @@ async fn apply_hash_mismatch_default_warns_and_applies_strict_fails() {
     };
 
     // DEFAULT: the mismatch is overwritten with the full verified patched
-    // content (the diff strategy would self-skip; the blob is hash-gated to
-    // afterHash) and surfaced as a warning event — exit 0.
+    // content (the blob is hash-gated to afterHash) and surfaced as a warning event — exit 0.
     let tmp = fixture();
     let out = Command::new(binary())
         .args(["apply", "--json", "--offline"])

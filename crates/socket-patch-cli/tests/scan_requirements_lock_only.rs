@@ -6,9 +6,13 @@
 //!
 //! * #523: whitespace around `==` and the legacy `name (==X)` form;
 //! * #412: pins reached through in-root `-r` includes;
+//! * #721: a UTF-16 file with a BOM (Windows PowerShell 5.1's
+//!   `pip freeze >` output), which pip decodes.
 //! * #994: include targets pip unquotes (`-r "dev reqs.txt"`,
 //!   `--requirement="dev.txt"`, `-r dev\ reqs.txt`) or expands
-//!   (`-r ${REQDIR}/dev.txt`).
+//!   (`-r ${REQDIR}/dev.txt`);
+//! * #1028: a `-r` that follows other options on the line
+//!   (`--pre -r dev.txt`, `-i URL -r dev.txt`).
 //!
 //! Driven through the built binary against a mock patch API; the
 //! assertion is what discovery sends to the batch endpoint and the
@@ -104,6 +108,19 @@ async fn assert_lock_only_discovers_with_env(
     envs: &[(&str, &str)],
     expected: &[&str],
 ) {
+    let files: Vec<(&str, &[u8])> = files.iter().map(|(r, c)| (*r, c.as_bytes())).collect();
+    assert_lock_only_discovers_bytes_with_env(&files, envs, expected).await;
+}
+
+async fn assert_lock_only_discovers_bytes(files: &[(&str, &[u8])], expected: &[&str]) {
+    assert_lock_only_discovers_bytes_with_env(files, &[], expected).await;
+}
+
+async fn assert_lock_only_discovers_bytes_with_env(
+    files: &[(&str, &[u8])],
+    envs: &[(&str, &str)],
+    expected: &[&str],
+) {
     for mode in [&[][..], &["--vendor"][..]] {
         let mock = MockServer::start().await;
         mount_empty_batch(&mock).await;
@@ -166,6 +183,32 @@ async fn lock_only_scan_discovers_included_pins() {
     .await;
 }
 
+/// #721: pip decodes a requirements file by its BOM, so a UTF-16 file
+/// (what Windows PowerShell 5.1's `pip freeze >` writes) is discovered,
+/// in either byte order, instead of reading as "No packages found".
+#[tokio::test]
+async fn lock_only_scan_discovers_utf16_pins() {
+    let text = "sp-fixture-idna==3.7\r\nsp-fixture-six==1.16.0\r\n";
+    let le: Vec<u8> = [0xFF, 0xFE]
+        .into_iter()
+        .chain(text.encode_utf16().flat_map(u16::to_le_bytes))
+        .collect();
+    let be: Vec<u8> = [0xFE, 0xFF]
+        .into_iter()
+        .chain(text.encode_utf16().flat_map(u16::to_be_bytes))
+        .collect();
+    for bytes in [le, be] {
+        assert_lock_only_discovers_bytes(
+            &[("requirements.txt", &bytes)],
+            &[
+                "pkg:pypi/sp-fixture-idna@3.7",
+                "pkg:pypi/sp-fixture-six@1.16.0",
+            ],
+        )
+        .await;
+    }
+}
+
 /// #994: pip `shlex`-splits an include line's options, so a quoted or
 /// backslash-escaped target names the file without its quotes, and a
 /// target with a space is one path, not two words.
@@ -206,4 +249,31 @@ async fn lock_only_scan_discovers_env_var_include_target() {
         &["pkg:pypi/sp-fixture-env@1.0.0"],
     )
     .await;
+}
+
+/// #1028: pip runs optparse over every option word of a line, so a `-r`
+/// that follows another option (`--pre`, `-i URL`, `-c FILE`) is still
+/// an include pip follows.
+#[tokio::test]
+async fn lock_only_scan_discovers_include_after_other_options() {
+    let cases: &[&str] = &[
+        "--pre -r dev.txt\n",
+        "-i https://pypi.org/simple -r dev.txt\n",
+        "--index-url=https://pypi.org/simple -r dev.txt\n",
+        "--prefer-binary -r dev.txt\n",
+        "-c c.txt -r dev.txt\n",
+        "--prefer-binary --requirement=dev.txt\n",
+    ];
+    for root in cases {
+        eprintln!("case {root:?}");
+        assert_lock_only_discovers(
+            &[
+                ("requirements.txt", root),
+                ("dev.txt", "sp-fixture-optfirst==1.0.0\n"),
+                ("c.txt", "\n"),
+            ],
+            &["pkg:pypi/sp-fixture-optfirst@1.0.0"],
+        )
+        .await;
+    }
 }

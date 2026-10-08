@@ -2,7 +2,7 @@ use std::collections::HashSet;
 use std::path::Path;
 
 use crate::api::client::{ApiClient, ApiError, BinaryBody};
-use crate::hash::git_sha256::compute_git_sha256_from_reader;
+use crate::hash::git_sha256::{compute_git_sha256_from_bytes, compute_git_sha256_from_reader};
 use crate::manifest::operations::get_after_hash_blobs;
 use crate::manifest::schema::PatchManifest;
 
@@ -278,6 +278,82 @@ fn concise_fetch_error<'a>(err: &'a str, id: &str) -> std::borrow::Cow<'a, str> 
     err.into()
 }
 
+/// Why [`store_verified_blob`] stored nothing.
+#[derive(Debug)]
+pub enum StoreBlobError {
+    /// The bytes hash to this, not to the blob's name.
+    HashMismatch(String),
+    /// A level of `.socket/blobs/<hash>` (the leaf included) is a link,
+    /// whose target is not socket-patch's to write (see
+    /// [`containment`](crate::utils::containment)).
+    Linked(std::io::Error),
+    /// A disk error while staging or renaming.
+    Write(std::io::Error),
+}
+
+impl std::fmt::Display for StoreBlobError {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        match self {
+            Self::HashMismatch(actual) => {
+                write!(f, "content hash mismatch: content hashes to {actual}")
+            }
+            Self::Linked(e) | Self::Write(e) => write!(f, "{e}"),
+        }
+    }
+}
+
+/// Store in-memory `bytes` as the content-addressed blob `blobs_dir/<hash>`:
+/// the one writer for blobs that arrive inline (a patch view's
+/// `blobContent` / `beforeBlobContent`), with the same rules as the
+/// download path ([`stream_cache_entry_atomic`]): refused when any level
+/// of the entry below `blobs_dir`'s parent is a link, verified against its
+/// git-sha256 name BEFORE anything is written, then staged and renamed into
+/// place (never truncated in place). An existing entry that already
+/// verifies is never rewritten. Returns whether the entry was NEWLY
+/// created. `blobs_dir` is created on demand.
+pub async fn store_verified_blob(
+    blobs_dir: &Path,
+    hash: &str,
+    bytes: &[u8],
+) -> Result<bool, StoreBlobError> {
+    let dest = blobs_dir.join(hash);
+    guard_cache_entry(&dest).map_err(StoreBlobError::Linked)?;
+    let actual = compute_git_sha256_from_bytes(bytes);
+    if !blob_hash_matches(hash, &actual) {
+        return Err(StoreBlobError::HashMismatch(actual));
+    }
+    if let Ok(existing) = crate::utils::fs::read_regular_to_bytes(&dest).await {
+        if blob_hash_matches(hash, &compute_git_sha256_from_bytes(&existing)) {
+            return Ok(false);
+        }
+    }
+    let existed = tokio::fs::symlink_metadata(&dest).await.is_ok();
+    tokio::fs::create_dir_all(blobs_dir)
+        .await
+        .map_err(StoreBlobError::Write)?;
+    let stage = crate::utils::fs::stage_path(&dest, ".socket-dl-");
+    let written = async {
+        tokio::fs::write(&stage, bytes).await?;
+        tokio::fs::rename(&stage, &dest).await
+    }
+    .await;
+    if let Err(e) = written {
+        let _ = tokio::fs::remove_file(&stage).await;
+        return Err(StoreBlobError::Write(e));
+    }
+    Ok(!existed)
+}
+
+/// Refuse a cache entry (`<socket>/blobs/<hash>`, `<socket>/diffs/<id>`)
+/// when it, or a level between it and the directory holding `blobs/` /
+/// `diffs/`, is a link: a committed `.socket/blobs` (or
+/// `.socket/blobs/<hash>`) symlink would otherwise redirect the write out
+/// of the project.
+fn guard_cache_entry(dest: &Path) -> std::io::Result<()> {
+    let root = dest.parent().and_then(Path::parent).unwrap_or(dest);
+    crate::utils::containment::ensure_unlinked(root, dest, "write")
+}
+
 // ── Internal helpers ──────────────────────────────────────────────────
 
 /// Stream `body` to `dest` atomically: copy it chunk by chunk into a temp
@@ -320,6 +396,7 @@ async fn stream_cache_entry_atomic(
     // commit, so a failure removes the directories this call created, while
     // they are still empty. An uncreatable parent surfaces as this entry's
     // write failure, like any other disk error.
+    guard_cache_entry(dest).map_err(EntryError::Write)?;
     let mut created_dirs = Vec::new();
     for dir in parent.ancestors() {
         if dir.as_os_str().is_empty() || tokio::fs::symlink_metadata(dir).await.is_ok() {
@@ -826,6 +903,56 @@ mod tests {
     async fn write_cache_entry_atomic(dest: &Path, bytes: &[u8]) -> Result<(), EntryError> {
         let (_server, mut body) = served_body(bytes).await;
         stream_cache_entry_atomic(dest, &mut body, None).await
+    }
+
+    /// The download path refuses a linked `.socket/blobs` (a committed
+    /// link to a shared cache or another project) and a linked
+    /// `.socket/blobs/<hash>` entry, end to end through
+    /// [`fetch_blobs_by_hash`]: the blob is reported failed and nothing is
+    /// written at the link's target.
+    #[cfg(unix)]
+    #[tokio::test]
+    async fn download_refuses_a_linked_blobs_dir_or_entry() {
+        let bytes = b"patched\n";
+        let hash = compute_git_sha256_from_bytes(bytes);
+        let server = wiremock::MockServer::start().await;
+        wiremock::Mock::given(wiremock::matchers::any())
+            .respond_with(wiremock::ResponseTemplate::new(200).set_body_bytes(bytes.to_vec()))
+            .mount(&server)
+            .await;
+        let client = ApiClient::new(crate::api::client::ApiClientOptions {
+            api_url: server.uri(),
+            api_token: None,
+            use_public_proxy: true,
+            org_slug: None,
+        });
+        let tmp = tempfile::tempdir().unwrap();
+        let hashes: HashSet<String> = [hash.clone()].into_iter().collect();
+
+        // A linked `.socket/blobs` directory.
+        let shared = tmp.path().join("shared-cache");
+        std::fs::create_dir_all(&shared).unwrap();
+        let proj = tmp.path().join("proj");
+        std::fs::create_dir_all(proj.join(".socket")).unwrap();
+        std::os::unix::fs::symlink(&shared, proj.join(".socket/blobs")).unwrap();
+        let res = fetch_blobs_by_hash(&hashes, &proj.join(".socket/blobs"), &client, None).await;
+        assert_eq!((res.downloaded, res.failed), (0, 1), "{res:?}");
+        let err = res.results[0].error.clone().unwrap_or_default();
+        assert!(
+            err.contains(crate::utils::containment::LINKED_LEVEL_MARKER),
+            "{err}"
+        );
+        assert_eq!(std::fs::read_dir(&shared).unwrap().count(), 0);
+
+        // A dangling `.socket/blobs/<hash>` link: `get_missing`-style
+        // presence probes see it as missing, and the write must not follow it.
+        let proj2 = tmp.path().join("proj2");
+        std::fs::create_dir_all(proj2.join(".socket/blobs")).unwrap();
+        let victim = tmp.path().join("victim");
+        std::os::unix::fs::symlink(&victim, proj2.join(".socket/blobs").join(&hash)).unwrap();
+        let res = fetch_blobs_by_hash(&hashes, &proj2.join(".socket/blobs"), &client, None).await;
+        assert_eq!((res.downloaded, res.failed), (0, 1), "{res:?}");
+        assert!(!victim.exists(), "nothing is written through the link");
     }
 
     #[tokio::test]

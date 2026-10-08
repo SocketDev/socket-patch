@@ -50,7 +50,7 @@ fn attr_value(tag: &str, attr: &str) -> Option<String> {
 /// Remove one pin's source definition and mapping, each with the line
 /// break before it (the rewriter's own insertion).
 fn remove_source(config: &str, uuid: &str, id: &str, ctx: &Ctx<'_>) -> Result<String, String> {
-    let key = format!("socket-patch-{uuid}");
+    let key = crate::patch::redirect::generation::hosted_pin_name(uuid);
     let quoted = format!(r#"(?:"{k}"|'{k}')"#, k = regex::escape(&key));
     let add_re = Regex::new(&format!(
         r"(?:\r?\n[ \t]*)?<add\s[^>]*?key\s*=\s*{quoted}[^>]*?/>"

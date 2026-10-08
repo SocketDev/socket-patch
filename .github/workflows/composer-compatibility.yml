@@ -21,6 +21,7 @@ name: Composer patch compatibility
 
 on:
   pull_request:
+    types: [opened, synchronize, reopened, ready_for_review]
     paths:
       - '.github/workflows/composer-compatibility.yml'
       - 'tests/docker/Dockerfile.composer'
@@ -68,17 +69,21 @@ on:
 permissions:
   contents: read
 
+# Supersede stale PR runs only: main runs are the only rust-cache writers
+# (save-if), so push and dispatch runs are never cancelled mid-save.
 concurrency:
   group: composer-compat-${{ github.event.pull_request.number || github.ref }}
-  cancel-in-progress: true
+  cancel-in-progress: ${{ github.event_name == 'pull_request' }}
 
 env:
   SOCKET_NO_CONFIG: '1'
   SOCKET_NO_UPDATE_CHECK: '1'
+  SOCKET_TELEMETRY_DISABLED: '1'
 
 jobs:
   native:
     name: composer ${{ matrix.composer }} / php ${{ matrix.php }} / ${{ matrix.os }}
+    if: github.event.pull_request.draft != true
     strategy:
       fail-fast: false
       matrix:
@@ -96,12 +101,9 @@ jobs:
           - {os: windows-latest, composer: '2.2.30', php: '8.3', sha256: 8c2b4478b64f8f7cdf1574838fdb0033b29049ca821dad452db7a3dcfcdbffc2}
           - {os: windows-latest, composer: '2.9.8', php: '8.4', sha256: 59b2c50e10cafa0d8efc19ede9a326d782f096c674a26baf98cf042ce23de890}
           - {os: windows-latest, composer: '2.10.3', php: '8.5', sha256: 7a2d379d5b8ffdaa028580ef26494c36d2feef4b178d3dd1473a4dbc5e17c8d6}
-          - {os: macos-latest, composer: '1.10.28', php: '8.1', sha256: 0915af36eb01e3f0e16cd309adff7051832b9ef014e38371756804b20425cd5a}
-          - {os: macos-latest, composer: '2.2.30', php: '8.3', sha256: 8c2b4478b64f8f7cdf1574838fdb0033b29049ca821dad452db7a3dcfcdbffc2}
-          - {os: macos-latest, composer: '2.10.3', php: '8.5', sha256: 7a2d379d5b8ffdaa028580ef26494c36d2feef4b178d3dd1473a4dbc5e17c8d6}
     runs-on: ${{ matrix.os }}
     timeout-minutes: 60
-    steps:
+    steps: &native-steps
       - uses: actions/checkout@de0fac2e4500dabe0009e67214ff5f5447ce83dd # v6.0.2
         with:
           persist-credentials: false
@@ -167,11 +169,29 @@ jobs:
             -- --ignored --nocapture
           cargo test -p socket-patch-cli --test e2e_vex_lockfile -- composer:: --nocapture
 
+  # The macOS rows of `native`: they run on push to main (and nightly
+  # where scheduled), not on every PR push, so PRs stop queueing on the
+  # small macOS runner pool.
+  native-macos:
+    name: composer ${{ matrix.composer }} / php ${{ matrix.php }} / ${{ matrix.os }}
+    if: github.event_name != 'pull_request'
+    strategy:
+      fail-fast: false
+      matrix:
+        include:
+          - {os: macos-latest, composer: '1.10.28', php: '8.1', sha256: 0915af36eb01e3f0e16cd309adff7051832b9ef014e38371756804b20425cd5a}
+          - {os: macos-latest, composer: '2.2.30', php: '8.3', sha256: 8c2b4478b64f8f7cdf1574838fdb0033b29049ca821dad452db7a3dcfcdbffc2}
+          - {os: macos-latest, composer: '2.10.3', php: '8.5', sha256: 7a2d379d5b8ffdaa028580ef26494c36d2feef4b178d3dd1473a4dbc5e17c8d6}
+    runs-on: ${{ matrix.os }}
+    timeout-minutes: 60
+    steps: *native-steps
+
   docker:
     # The vendored Docker capstone against an exact composer image. Its
     # fixture resolves psr/log from packagist, which no longer serves
     # Composer 1, so 1.10.28 is covered by the native legs only.
     name: docker composer ${{ matrix.composer }}
+    if: github.event.pull_request.draft != true
     runs-on: ubuntu-latest
     timeout-minutes: 35
     strategy:

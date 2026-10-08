@@ -8,17 +8,21 @@
 
 use std::path::PathBuf;
 
-use clap::Parser;
 use socket_patch_cli::commands::apply::ApplyArgs;
-use socket_patch_cli::{Cli, Commands};
+use socket_patch_cli::Commands;
+
+#[path = "common/hermetic.rs"]
+mod hermetic;
+
+use hermetic::try_parse;
 
 /// Parse `socket-patch apply <extra...>` and return the inner `ApplyArgs`.
 /// Panics if parsing fails or yields a non-`Apply` subcommand — tests for
-/// the failure path call `Cli::try_parse_from` directly.
+/// the failure path call [`try_parse`] directly.
 fn parse_apply(extra: &[&str]) -> ApplyArgs {
     let mut argv: Vec<&str> = vec!["socket-patch", "apply"];
     argv.extend_from_slice(extra);
-    let cli = Cli::try_parse_from(&argv).expect("parse");
+    let cli = try_parse(&argv).expect("parse");
     match cli.command {
         Commands::Apply(a) => a,
         _ => panic!("expected Apply"),
@@ -296,7 +300,7 @@ fn no_telemetry_long() {
 /// the trailing token is rejected as an unknown argument.
 #[test]
 fn bare_bool_does_not_consume_next_token() {
-    match Cli::try_parse_from(["socket-patch", "apply", "--force", "stray"]) {
+    match try_parse(&["socket-patch", "apply", "--force", "stray"]) {
         Ok(_) => panic!("`--force stray` must reject the stray positional"),
         Err(err) => assert_eq!(err.kind(), clap::error::ErrorKind::UnknownArgument),
     }
@@ -491,7 +495,7 @@ fn ecosystems_single_value() {
 #[test]
 fn download_mode_flag_is_removed() {
     for value in ["file", "diff"] {
-        match Cli::try_parse_from(["socket-patch", "apply", "--download-mode", value]) {
+        match try_parse(&["socket-patch", "apply", "--download-mode", value]) {
             Ok(_) => panic!("--download-mode {value} must be rejected"),
             Err(err) => {
                 assert_eq!(err.kind(), clap::error::ErrorKind::UnknownArgument);
@@ -510,7 +514,7 @@ fn download_mode_flag_is_removed() {
 fn unknown_flag_fails_with_unknown_argument() {
     // `Cli` doesn't implement `Debug`, so we can't use `.expect_err()` —
     // match the Result by hand.
-    match Cli::try_parse_from(["socket-patch", "apply", "--unknown-flag"]) {
+    match try_parse(&["socket-patch", "apply", "--unknown-flag"]) {
         Ok(_) => panic!("--unknown-flag must be rejected"),
         Err(err) => {
             assert_eq!(err.kind(), clap::error::ErrorKind::UnknownArgument);

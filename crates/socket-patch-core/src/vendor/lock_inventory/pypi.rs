@@ -724,11 +724,17 @@ async fn inventory_requirements_txt(view: &ProjectView<'_>) -> Option<Vec<Lockfi
 /// constraints never introduce requirements and are not followed;
 /// out-of-root and absolute includes are not ours to edit and are not
 /// read; an unreadable include is pip's error to report and is skipped.
-/// `None` when the root file itself cannot be read.
+/// Each file is decoded as pip decodes it
+/// ([`crate::utils::requirements::decode`]: a UTF-16 / UTF-32 BOM selects
+/// that encoding, #721). `None` when the root file itself cannot be read.
 async fn requirements_tree(view: &ProjectView<'_>) -> Option<Vec<String>> {
     use crate::vendor::pypi_requirements::{is_in_root_rel, requirements_includes};
     const ROOT: &str = "requirements.txt";
-    let root = view.read_text(ROOT).await.ok()?;
+    let read = |rel: String| async move {
+        let bytes = view.read_bytes(&rel).await.ok()?;
+        crate::utils::requirements::decode(&bytes)
+    };
+    let root = read(ROOT.to_string()).await?;
     let mut visited = std::collections::HashSet::from([ROOT.to_string()]);
     let mut stack: Vec<String> = requirements_includes(ROOT, &root);
     stack.reverse();
@@ -737,7 +743,7 @@ async fn requirements_tree(view: &ProjectView<'_>) -> Option<Vec<String>> {
         if !is_in_root_rel(&rel) || !visited.insert(rel.clone()) {
             continue;
         }
-        let Ok(text) = view.read_text(&rel).await else {
+        let Some(text) = read(rel.clone()).await else {
             continue;
         };
         let mut includes = requirements_includes(&rel, &text);

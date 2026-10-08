@@ -10,12 +10,10 @@
 
 use std::collections::{BTreeMap, BTreeSet};
 
-use regex::Regex;
 use serde_json::Value;
 
 use super::client::NpmDist;
 use super::{Ctx, FormatResult, HostedPin, View};
-use crate::utils::line_endings::{to_lf, LineEndings};
 use crate::vendor::lock_inventory::npm_legacy_identity;
 
 /// The pins by uuid.
@@ -352,7 +350,7 @@ pub(crate) async fn restore_yarn_locks(
         let Some(raw) = read_or_refuse(view, rel, &pins, &mut result).await else {
             continue;
         };
-        if super::super::is_berry_lock(&raw) {
+        if crate::formats::yarn::is_berry_lock(&raw) {
             restore_berry(view, rel, &raw, &pins, ctx, &mut result).await;
         } else {
             restore_classic(view, rel, &raw, &pins, ctx, &mut result).await;
@@ -369,56 +367,74 @@ async fn restore_classic(
     ctx: &Ctx<'_>,
     result: &mut FormatResult,
 ) {
-    use crate::vendor::yarn_classic_lock::{classic_block_is_git, split_key_patterns};
+    use crate::formats::yarn::blocks::{
+        block_eol, classic_field, classic_line_endings_supported, repin_classic_block,
+        replace_block, scan_blocks,
+    };
+    use crate::formats::yarn::patterns::{classic_key_real_name, split_key_patterns};
+    use crate::formats::yarn::source::{classic_copy_source, CopySource};
 
-    let eol = LineEndings::of(raw);
-    if eol == LineEndings::Mixed {
-        refuse_all_in(pins, rel, result, format!("{rel} mixes line endings"));
+    // The same byte splice as the hosted rewriter (see
+    // [`classic_line_endings_supported`]).
+    if !classic_line_endings_supported(raw) {
+        refuse_all_in(
+            pins,
+            rel,
+            result,
+            format!("{rel} holds bare carriage returns"),
+        );
         return;
     }
-    let content = to_lf(raw);
-    let mut blocks: Vec<String> = content.split("\n\n").map(String::from).collect();
-    let resolved_re =
-        Regex::new(r#"\n {2}resolved "([^"]*)""#).expect("static resolved-line regex is valid");
-    let integrity_re =
-        Regex::new(r"\n {2}integrity [^\n]*").expect("static integrity-line regex is valid");
-    let version_re =
-        Regex::new(r#"\n {2}version "([^"]*)""#).expect("static version-line regex is valid");
+    let blocks = scan_blocks(raw);
 
     // (block index, uuid, name, version) per hosted block.
     let mut hits: Vec<(usize, String, String, String)> = Vec::new();
     for (i, block) in blocks.iter().enumerate() {
-        let Some(uuid) = resolved_re
-            .captures(block)
-            .and_then(|c| ctx.hosted_uuid(&c[1]))
+        let Some((resolved, uuid)) =
+            classic_field(&block.lines, "resolved").and_then(|r| Some((r, ctx.hosted_uuid(r)?)))
         else {
             continue;
         };
         if !pins.contains_key(uuid.as_str()) {
             continue;
         }
-        let head = super::super::yarn_classic_block_head(block);
+        let patterns = split_key_patterns(&block.key);
         // yarn 1 fetches a git pattern with git, from `resolved` (#363): a
         // registry tarball there fails every install just as the hosted one
         // does, and the block's own git source was never recorded.
-        let patterns = head
-            .as_ref()
-            .map(|(key, _)| split_key_patterns(key))
-            .unwrap_or_default();
-        if classic_block_is_git(&patterns, None) {
-            result.refuse(
-                &uuid,
-                format!(
-                    "the {rel} entry wiring it installs from git; a registry tarball there \
-                     would still be fetched with git"
-                ),
-            );
-            continue;
+        match classic_copy_source(&patterns, Some(resolved)) {
+            CopySource::Git => {
+                result.refuse(
+                    &uuid,
+                    format!(
+                        "the {rel} entry wiring it installs from git; a registry tarball there \
+                         would still be fetched with git"
+                    ),
+                );
+                continue;
+            }
+            // A pin an older release wrote on a `file:` tarball, URL or
+            // hosted-git copy (B16): its own `resolved` was never recorded,
+            // and the registry tarball is not what that copy installed.
+            CopySource::RemoteTarball => {
+                result.refuse(
+                    &uuid,
+                    format!(
+                        "the {rel} entry wiring it is keyed by a non-registry source (a file: \
+                         tarball, URL or hosted-git dependency) whose original `resolved` was \
+                         not recorded — restore {rel} from version control"
+                    ),
+                );
+                continue;
+            }
+            _ => {}
         }
-        let name = head.and_then(|(_, n)| n);
-        let version = version_re.captures(block).map(|c| c[1].to_string());
+        let name = classic_key_real_name(&patterns);
+        let version = classic_field(&block.lines, "version");
         match (name, version) {
-            (Some(name), Some(version)) => hits.push((i, uuid, name, version)),
+            (Some(name), Some(version)) => {
+                hits.push((i, uuid, name.to_string(), version.to_string()))
+            }
             _ => result.refuse(
                 &uuid,
                 format!("a {rel} entry wiring it names no single package and version"),
@@ -430,7 +446,9 @@ async fn restore_classic(
         .map(|(_, u, n, v)| (u.clone(), n.clone(), v.clone()))
         .collect();
     let dists = fetch_dists(&wanted, ctx, result).await;
-    let mut changed = false;
+    // (block index, restored lines), spliced last-to-first below so every
+    // earlier block's byte span stays valid.
+    let mut splices: Vec<(usize, Vec<String>)> = Vec::new();
     for (i, uuid, name, version) in hits {
         if result.refused.contains_key(&uuid) {
             continue;
@@ -450,25 +468,22 @@ async fn restore_classic(
             .as_deref()
             .map(|s| format!("#{s}"))
             .unwrap_or_default();
-        let resolved = format!(
-            "\n  resolved \"{}{frag}\"",
-            yarn_classic_tarball(dist).replace('$', "$$")
-        );
-        let mut block = resolved_re
-            .replace(&blocks[i], resolved.as_str())
-            .into_owned();
-        if integrity_re.is_match(&block) {
-            block = integrity_re
-                .replace(&block, format!("\n  integrity {integrity}").as_str())
-                .into_owned();
-        }
-        blocks[i] = block;
+        let resolved = format!("{}{frag}", yarn_classic_tarball(dist));
+        splices.push((
+            i,
+            repin_classic_block(&blocks[i].lines, &resolved, integrity),
+        ));
         result.handled.insert(uuid);
-        changed = true;
     }
-    if changed {
-        view.write(rel, eol.restore(&blocks.join("\n\n")).into_owned());
+    if splices.is_empty() {
+        return;
     }
+    let mut text = raw.to_string();
+    for (i, lines) in splices.iter().rev() {
+        let block = &blocks[*i];
+        text = replace_block(&text, block, lines, block_eol(raw, block));
+    }
+    view.write(rel, text);
 }
 
 /// Whether a package manager derives `tarball` for `name@version` itself,
@@ -551,40 +566,33 @@ async fn restore_berry(
     ctx: &Ctx<'_>,
     result: &mut FormatResult,
 ) {
-    use crate::vendor::yarn_berry_lock::resolution_selector_target;
-    use crate::vendor::yarn_classic_lock::{split_berry_key_patterns, split_pattern};
-
-    let (bom, body) = match raw.strip_prefix('\u{feff}') {
-        Some(rest) => ("\u{feff}", rest),
-        None => ("", raw),
+    use crate::formats::yarn::blocks::{berry_field, with_body_field};
+    use crate::formats::yarn::patterns::{
+        resolution_selector_target, split_berry_key_patterns, split_pattern,
     };
+    use crate::formats::yarn::stanzas::{stanza_key, stanza_lines, BerryStanzas};
+
     let dir_prefix = match rel.rsplit_once('/') {
         Some((dir, _)) => format!("{dir}/"),
         None => String::new(),
     };
     let yarnrc_rel = format!("{dir_prefix}.yarnrc.yml");
     let yarnrc = view.read(&yarnrc_rel).await.ok().flatten();
-    if let Err(w) = super::super::preflight_yarn_berry_hosted(raw, yarnrc.as_deref()) {
+    // The root manifest: a hosted pin keyed by its tarball URL keeps the
+    // descriptors it replaced only as `resolutions` selectors routed there.
+    // Read before the gates: a mixed one is refused like a mixed lock.
+    let pkg_rel = format!("{dir_prefix}package.json");
+    let pkg_text = view.read(&pkg_rel).await.ok().flatten();
+    if let Err(w) =
+        super::super::preflight_yarn_berry_hosted(raw, pkg_text.as_deref(), yarnrc.as_deref())
+    {
         refuse_all_in(pins, rel, result, w.detail);
         return;
     }
-    let eol = LineEndings::of(body);
-    let content = to_lf(body).into_owned();
-    let trimmed = content.trim_end_matches('\n');
-    let trailing_newlines = content[trimmed.len()..].to_string();
-    let mut blocks: Vec<String> = trimmed.split("\n\n").map(String::from).collect();
-    let was_sorted = super::super::berry_entries_sorted(&blocks);
-    let resolution_re = Regex::new(r#"\n {2}resolution: "([^"]*)""#)
-        .expect("static resolution-line regex is valid");
-    let checksum_re =
-        Regex::new(r"\n {2}checksum: [^\n]*").expect("static checksum-line regex is valid");
-    let version_re =
-        Regex::new(r"\n {2}version: ([^\n]*)").expect("static version-line regex is valid");
+    // The preflight refused a mixed lock, so the stanza view round-trips.
+    let mut doc = BerryStanzas::parse(raw);
+    let mut blocks = std::mem::take(&mut doc.stanzas);
 
-    // The root manifest: a hosted pin keyed by its tarball URL keeps the
-    // descriptors it replaced only as `resolutions` selectors routed there.
-    let pkg_rel = format!("{dir_prefix}package.json");
-    let pkg_text = view.read(&pkg_rel).await.ok().flatten();
     let mut pkg: Option<serde_json::Value> = pkg_text
         .as_deref()
         .and_then(|t| serde_json::from_str(t.strip_prefix('\u{feff}').unwrap_or(t)).ok())
@@ -603,7 +611,8 @@ async fn restore_berry(
     }
     let mut hits: Vec<Hit> = Vec::new();
     for (i, block) in blocks.iter().enumerate() {
-        let Some(resolution) = resolution_re.captures(block).map(|c| c[1].to_string()) else {
+        let lines = stanza_lines(block);
+        let Some(resolution) = berry_field(&lines, "resolution").map(str::to_string) else {
             continue;
         };
         // The hosted pin is the tarball-URL locator `name@<url>`; locks
@@ -626,19 +635,13 @@ async fn restore_berry(
         if !pins.contains_key(uuid.as_str()) {
             continue;
         }
-        let key = block
-            .lines()
-            .next()
-            .and_then(|l| l.strip_suffix(':'))
-            .unwrap_or("");
+        let key = stanza_key(block).unwrap_or("");
         let patterns = split_berry_key_patterns(key);
         let names: BTreeSet<String> = patterns
             .iter()
             .filter_map(|p| split_pattern(p).map(|(n, _)| n.to_string()))
             .collect();
-        let version = version_re
-            .captures(block)
-            .map(|c| c[1].trim().trim_matches('"').to_string());
+        let version = berry_field(&lines, "version").map(str::to_string);
         let (Some(name), Some(version), 1) = (names.iter().next(), version, names.len()) else {
             result.refuse(
                 &uuid,
@@ -740,7 +743,7 @@ async fn restore_berry(
             )
             .await
         {
-            Ok(c) => crate::vendor::yarn_berry_lock::checksum_in_lock_spelling(&content, &c),
+            Ok(c) => crate::vendor::yarn_berry_lock::checksum_in_lock_spelling(&doc.lf, &c),
             Err(why) => {
                 result.refuse(&uuid, format!("{name}@{version}: {why}"));
                 continue;
@@ -750,27 +753,23 @@ async fn restore_berry(
             continue;
         };
         let resolution = format!(
-            "\n  resolution: \"{}\"",
+            "  resolution: \"{}\"",
             berry_registry_locator(project_registry.as_deref(), &name, &version, &dist.tarball)
-        )
-        .replace('$', "$$");
-        let mut block = resolution_re
-            .replace(&blocks[idx], resolution.as_str())
-            .into_owned();
-        if checksum_re.is_match(&block) {
-            block = checksum_re
-                .replace(&block, format!("\n  checksum: {checksum}").as_str())
-                .into_owned();
+        );
+        let mut lines = stanza_lines(&blocks[idx]);
+        if let Some(pinned) = with_body_field(&lines, "resolution", &resolution) {
+            lines = pinned;
+        }
+        if let Some(pinned) =
+            with_body_field(&lines, "checksum", &format!("  checksum: {checksum}"))
+        {
+            lines = pinned;
         }
         if let Some(key) = key {
-            let body_lines = block
-                .split_once('\n')
-                .map(|(_, r)| r.to_string())
-                .unwrap_or_default();
-            block = format!("{key}:\n{body_lines}");
+            lines[0] = format!("{key}:");
             moved.push(key);
         }
-        blocks[idx] = block;
+        blocks[idx] = lines.join("\n");
         if !selectors.is_empty() {
             if let Some(table) = pkg
                 .as_mut()
@@ -815,9 +814,8 @@ async fn restore_berry(
             }
         }
     }
-    super::super::berry_reposition_blocks(&mut blocks, &moved, was_sorted);
-    let out = format!("{}{trailing_newlines}", blocks.join("\n\n"));
-    view.write(rel, format!("{bom}{}", eol.restore(&out)));
+    doc.stanzas = blocks;
+    view.write(rel, doc.render(&moved));
 }
 
 // ── pnpm-lock.yaml ───────────────────────────────────────────────────────────

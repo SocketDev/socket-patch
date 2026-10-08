@@ -30,7 +30,7 @@ use crate::patch::apply::{
     MismatchPolicy, PatchSources,
 };
 use crate::patch::file_hash::compute_file_git_sha256;
-use crate::utils::purl::{build_golang_purl, canonical_purl, parse_golang_purl};
+use crate::utils::purl::{build_golang_purl, parse_golang_purl};
 use crate::vendor::common::{
     already_patched_result, copy_matches_after_hashes, synthesized_result,
 };
@@ -391,14 +391,18 @@ pub async fn reconcile_go_redirects(
     // (b) Orphan copy dirs not referenced by a desired PURL (catches copies left
     // behind by a hand-deleted directive or a version bump). A desired manifest
     // key may carry `?qualifiers`/`#subpath` (raw API PURL), while the PURL
-    // reconstructed from the copy dir is the canonical base — compare bases, or
-    // a qualified key's freshly applied copy is pruned as an orphan.
-    let desired_bases: HashSet<String> = desired.iter().map(|p| canonical_purl(p)).collect();
+    // reconstructed from the copy dir is the canonical base — compare by
+    // `PurlKey`, or a qualified (or `%2B`-encoded) key's freshly applied copy
+    // is pruned as an orphan.
+    let desired_bases: HashSet<crate::utils::purl_key::PurlKey> = desired
+        .iter()
+        .map(|p| crate::utils::purl_key::PurlKey::new(p))
+        .collect();
     // Re-read after (a)'s drops so the dangling-directive probe below sees the
     // current file.
     let entries = read_replace_entries(project_root).await;
     for (purl, dir) in collect_copy_modules(&project_root.join(GO_PATCHES_DIR)).await {
-        if !desired_bases.contains(&purl) {
+        if !desired_bases.contains(&crate::utils::purl_key::PurlKey::new(&purl)) {
             // A go-patches directive still targeting THIS copy dangles once the
             // copy is pruned — loop (a) keeps it whenever the module is desired
             // at ANOTHER version (a bump whose apply hasn't succeeded), and a
@@ -1896,7 +1900,7 @@ mod tests {
         .await;
         assert!(result.success, "apply failed: {:?}", result.error);
 
-        // Reconcile with the same encoded manifest key — canonical_purl
+        // Reconcile with the same encoded manifest key — PurlKey
         // decodes both sides, so they match.
         let desired: HashSet<String> = [encoded_purl.to_string()].into_iter().collect();
         let removed = reconcile_go_redirects(root, &desired, false).await;

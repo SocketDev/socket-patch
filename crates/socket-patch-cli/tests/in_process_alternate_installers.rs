@@ -5,7 +5,7 @@
 //! supports venv, pyenv, conda, system installs. This file exercises
 //! the layout variants the crawlers must handle in production.
 
-use std::path::Path;
+use std::path::{Path, PathBuf};
 use std::process::Command;
 
 use serial_test::serial;
@@ -868,6 +868,99 @@ gem 'colorize', '1.1.0'
     args.common.ecosystems = Some(vec!["gem".to_string()]);
     let code = apply_run(args).await;
     assert_eq!(code, 0, "bundler-installed gem must be patchable");
+    assert_patched(&lib_file, &patched, &before_hash, &after_hash);
+}
+
+/// #951: a hand-commented `.bundle/config` path
+/// (`BUNDLE_PATH: .gems # project-local gems`). Bundler 2.5.6+ drops the
+/// comment and installs into `.gems`; older Bundler keeps it in the
+/// directory name. Either way apply must patch the copy Bundler loads
+/// (asked from Bundler itself), not fall back to the system gem home.
+#[tokio::test]
+#[serial]
+async fn bundler_commented_config_path_apply_patches_loaded_gem() {
+    if !has("bundle") || !has("gem") {
+        println!("SKIP: bundle/gem not on PATH");
+        return;
+    }
+
+    let tmp = tempfile::tempdir().unwrap();
+    std::fs::write(
+        tmp.path().join("Gemfile"),
+        "source 'https://rubygems.org'\ngem 'colorize', '1.1.0'\n",
+    )
+    .unwrap();
+    std::fs::create_dir_all(tmp.path().join(".bundle")).unwrap();
+    std::fs::write(
+        tmp.path().join(".bundle/config"),
+        "---\nBUNDLE_PATH: .gems # project-local gems\n",
+    )
+    .unwrap();
+    let status = pm_command("bundle", &["BUNDLE_"])
+        .args(["install", "--quiet"])
+        .current_dir(tmp.path())
+        .output()
+        .expect("bundle install");
+    if !status.status.success() {
+        println!(
+            "SKIP: bundle install failed: {}",
+            String::from_utf8_lossy(&status.stderr)
+        );
+        return;
+    }
+    let loaded = pm_command("bundle", &["BUNDLE_"])
+        .args([
+            "exec",
+            "ruby",
+            "-e",
+            "print Gem.loaded_specs.fetch('colorize').full_gem_path",
+        ])
+        .current_dir(tmp.path())
+        .output()
+        .expect("bundle exec");
+    assert!(
+        loaded.status.success(),
+        "bundle exec failed: {}",
+        String::from_utf8_lossy(&loaded.stderr)
+    );
+    let lib_file = PathBuf::from(String::from_utf8(loaded.stdout).unwrap()).join("lib/colorize.rb");
+    assert!(
+        lib_file.starts_with(tmp.path().canonicalize().unwrap())
+            || lib_file.starts_with(tmp.path()),
+        "bundler must load the project copy: {lib_file:?}"
+    );
+
+    let original = std::fs::read(&lib_file).expect("read");
+    let before_hash = git_sha256(&original);
+    let mut patched = original.clone();
+    patched.extend_from_slice(b"\n# SOCKET-PATCH-BUNDLER-MARKER\n");
+    let after_hash = git_sha256(&patched);
+
+    let socket = tmp.path().join(".socket");
+    std::fs::create_dir_all(socket.join("blobs")).unwrap();
+    std::fs::write(
+        socket.join("manifest.json"),
+        format!(
+            r#"{{ "patches": {{
+                "pkg:gem/colorize@1.1.0": {{
+                    "uuid": "bundler-uuid-0951",
+                    "exportedAt": "2024-01-01T00:00:00Z",
+                    "files": {{ "package/lib/colorize.rb": {{
+                        "beforeHash": "{before_hash}", "afterHash": "{after_hash}"
+                    }}}},
+                    "vulnerabilities": {{}}, "description": "x",
+                    "license": "MIT", "tier": "free"
+                }}
+            }}}}"#
+        ),
+    )
+    .unwrap();
+    std::fs::write(socket.join("blobs").join(&after_hash), &patched).unwrap();
+
+    let mut args = default_apply(tmp.path());
+    args.common.ecosystems = Some(vec!["gem".to_string()]);
+    let code = apply_run(args).await;
+    assert_eq!(code, 0, "the Bundler-loaded gem must be patchable");
     assert_patched(&lib_file, &patched, &before_hash, &after_hash);
 }
 
