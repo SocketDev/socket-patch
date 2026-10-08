@@ -625,9 +625,10 @@ impl Discovery {
             purl: canonical_base_purl(&purl),
             file: PathBuf::from(file),
         };
-        if !self.elsewhere.contains(&entry) {
-            self.elsewhere.push(entry);
-        }
+        // Deduplicated once, in `finalize` (a per-push scan is quadratic in
+        // the lock's size); an earlier duplicate is identical, so the first
+        // match `contest_across_locks` finds is the same either way.
+        self.elsewhere.push(entry);
     }
 
     /// Record that lock `file`'s entry `key` installs its own copy of `purl`
@@ -970,6 +971,8 @@ pub(crate) struct DiscoverCtx<'a> {
     /// scratch `Discovery` (a file parsed only to explain it) still counts.
     /// A `Mutex` keeps the ctx `Sync` across the extractors' `.await`s.
     recognized: Mutex<BTreeSet<Recognized>>,
+    /// The hosts a Socket-hosted url can name (see [`DiscoverCtx::hosted_uuid`]).
+    hosted_hosts: std::sync::OnceLock<BTreeSet<String>>,
 }
 
 impl<'a> DiscoverCtx<'a> {
@@ -988,6 +991,7 @@ impl<'a> DiscoverCtx<'a> {
             view,
             patch_server_origins,
             recognized: Mutex::new(BTreeSet::new()),
+            hosted_hosts: std::sync::OnceLock::new(),
         }
     }
 
@@ -1074,7 +1078,27 @@ impl<'a> DiscoverCtx<'a> {
     /// The patch uuid of a Socket-HOSTED url, or `None` for anything else
     /// (see [`crate::patch::redirect::hosted_patch_uuid`] for the accepted
     /// spellings and the host allowlist).
+    ///
+    /// A plain url ([`plain_url_domain`]) on any other host is answered
+    /// without parsing it: every lock entry's registry url comes through
+    /// here.
     pub(crate) fn hosted_uuid(&self, url: &str) -> Option<String> {
+        if let Some(host) = plain_url_domain(url) {
+            let hosts = self.hosted_hosts.get_or_init(|| {
+                let mut hosts =
+                    BTreeSet::from([crate::patch::redirect::SOCKET_PATCH_SERVER_HOST.to_string()]);
+                hosts.extend(self.patch_server_origins.iter().filter_map(|o| {
+                    reqwest::Url::parse(o.trim())
+                        .ok()?
+                        .host_str()
+                        .map(str::to_string)
+                }));
+                hosts
+            });
+            if !hosts.contains(&host) {
+                return None;
+            }
+        }
         crate::patch::redirect::hosted_patch_uuid(url, self.patch_server_origins)
     }
 
@@ -1146,6 +1170,53 @@ impl<'a> DiscoverCtx<'a> {
 
 // ── identity helpers ─────────────────────────────────────────────────────
 
+/// The host of `url` when it is a PLAIN `http(s)` url — printable ASCII
+/// only, no `%`, `\\` or userinfo, a DNS name of letters, digits, `.` and
+/// `-` whose last label starts with a letter — lowercased, which is then
+/// exactly what [`crate::patch::redirect::hosted_patch_url_uuids`]'s url
+/// parse would call its host (no decoding, IDNA mapping or IP-address
+/// reading applies to such a name). `None` for anything else, which takes
+/// the full parse.
+fn plain_url_domain(url: &str) -> Option<String> {
+    let url = url.trim();
+    if !url
+        .bytes()
+        .all(|b| b.is_ascii_graphic() && b != b'%' && b != b'\\')
+    {
+        return None;
+    }
+    let (scheme, rest) = url.split_once("://")?;
+    // `sparse+https://…` / `registry+https://…`, as the parse strips it.
+    let scheme = match scheme.rsplit_once('+') {
+        Some((kind, scheme))
+            if !kind.is_empty() && kind.bytes().all(|b| b.is_ascii_alphabetic()) =>
+        {
+            scheme
+        }
+        _ => scheme,
+    };
+    if !scheme.eq_ignore_ascii_case("https") && !scheme.eq_ignore_ascii_case("http") {
+        return None;
+    }
+    let authority = rest.split(['/', '?', '#']).next()?;
+    let host = match authority.rsplit_once(':') {
+        Some((host, port)) if port.bytes().all(|b| b.is_ascii_digit()) => host,
+        Some(_) => return None,
+        None => authority,
+    };
+    let last = host.strip_suffix('.').unwrap_or(host).rsplit('.').next()?;
+    let plain = !host.is_empty()
+        && !rest.starts_with('/')
+        && host
+            .bytes()
+            .all(|b| b.is_ascii_alphanumeric() || b == b'.' || b == b'-')
+        && last.starts_with(|c: char| c.is_ascii_alphabetic())
+        && !host
+            .split('.')
+            .any(|label| label.len() >= 4 && label[..4].eq_ignore_ascii_case("xn--"));
+    plain.then(|| host.to_ascii_lowercase())
+}
+
 /// The uuid of a Socket-owned registry / repository / source NAME:
 /// `socket-patch-<uuid>` (cargo `[registries.*]` + Cargo.toml `registry =`,
 /// maven `<repository><id>`, nuget `<add key>`) or, with
@@ -1179,8 +1250,66 @@ pub(crate) fn socket_patch_name_uuid(name: &str, vendored: bool) -> Option<Strin
 /// escapes and (doubled) Windows backslashes are folded to `/`. Bounded
 /// work per anchor, so a tampered multi-megabyte lock costs one linear pass
 /// per anchor kind.
+///
+/// Memoized by content ([`IdentityMemo`]): one scan runs several
+/// discoveries over mostly byte-identical lockfiles, and this sweep is the
+/// largest per-file cost after parsing.
 fn socket_identities(text: &str, origins: &[String]) -> BTreeSet<(String, WiringMode)> {
-    socket_identities_inner(text, origins)
+    IdentityMemo::sweep(text, origins)
+}
+
+/// The process-wide memo behind [`socket_identities`]: the sweep's result
+/// keyed by the SHA-256 of the swept text and the (sorted, deduplicated)
+/// origin allowlist — never by path, so a pending rewrite overlaid on a
+/// path, or the file rewritten on disk, is swept afresh. The sweep is a
+/// pure function of exactly that key (the origins are only ever tested
+/// with `any`). Small texts are swept directly (hashing them saves
+/// nothing), and only the most recent [`IdentityMemo::CAPACITY`] results
+/// are kept.
+struct IdentityMemo;
+
+type IdentitySet = BTreeSet<(String, WiringMode)>;
+type IdentityKey = ([u8; 32], Vec<String>);
+
+impl IdentityMemo {
+    const CAPACITY: usize = 64;
+    /// Below this many bytes the sweep is cheaper than the hash.
+    const MIN_LEN: usize = 16 * 1024;
+
+    fn entries() -> &'static Mutex<std::collections::VecDeque<(IdentityKey, IdentitySet)>> {
+        static ENTRIES: std::sync::OnceLock<
+            Mutex<std::collections::VecDeque<(IdentityKey, IdentitySet)>>,
+        > = std::sync::OnceLock::new();
+        ENTRIES.get_or_init(|| Mutex::new(std::collections::VecDeque::new()))
+    }
+
+    fn sweep(text: &str, origins: &[String]) -> IdentitySet {
+        if text.len() < Self::MIN_LEN {
+            return socket_identities_inner(text, origins);
+        }
+        use sha2::Digest as _;
+        let mut origin_key = origins.to_vec();
+        origin_key.sort();
+        origin_key.dedup();
+        let key: IdentityKey = (sha2::Sha256::digest(text.as_bytes()).into(), origin_key);
+        let lock = || {
+            Self::entries()
+                .lock()
+                .unwrap_or_else(std::sync::PoisonError::into_inner)
+        };
+        if let Some((_, found)) = lock().iter().find(|(k, _)| *k == key) {
+            return found.clone();
+        }
+        let found = socket_identities_inner(text, origins);
+        let mut entries = lock();
+        if !entries.iter().any(|(k, _)| *k == key) {
+            if entries.len() == Self::CAPACITY {
+                entries.pop_front();
+            }
+            entries.push_back((key, found.clone()));
+        }
+        found
+    }
 }
 
 /// The hosted patch uuids `text` mentions, under the same recognition
@@ -1195,41 +1324,66 @@ pub(crate) fn hosted_uuids_in_text(text: &str, origins: &[String]) -> BTreeSet<S
 }
 
 fn socket_identities_inner(text: &str, origins: &[String]) -> BTreeSet<(String, WiringMode)> {
+    use aho_corasick::AhoCorasick;
+    use std::borrow::Cow;
+
     let mut found = BTreeSet::new();
-    let norm = decode_escapes(text)
-        .replace("\\/", "/")
-        .replace("\\\\", "/")
-        .replace('\\', "/");
+    let decoded = decode_escapes(text);
+    // The folds only ever touch a backslash.
+    let norm: Cow<'_, str> = if decoded.contains('\\') {
+        Cow::Owned(
+            decoded
+                .replace("\\/", "/")
+                .replace("\\\\", "/")
+                .replace('\\', "/"),
+        )
+    } else {
+        decoded
+    };
     let bytes = norm.as_bytes();
 
-    for sep in ['/', '+', '§'] {
-        let anchor = format!("{VENDOR_DIR}/").replace('/', &sep.to_string());
-        for (at, _) in norm.match_indices(anchor.as_str()) {
-            let rest = &norm[at + anchor.len()..];
-            for eco in ECOSYSTEM_DIRS {
-                let uuid = rest
-                    .strip_prefix(eco)
-                    .and_then(|r| r.strip_prefix(sep))
-                    .and_then(|r| r.get(..36))
-                    .filter(|u| is_canonical_uuid(u));
-                if let Some(uuid) = uuid {
-                    found.insert((uuid.to_string(), WiringMode::Vendored));
+    // Every anchor in one pass. None of them overlaps itself, so each
+    // pattern's occurrences here are exactly its `match_indices`.
+    const VENDOR_SEPS: [char; 3] = ['/', '+', '§'];
+    const GO: usize = VENDOR_SEPS.len();
+    static ANCHORS: std::sync::OnceLock<(Vec<String>, AhoCorasick)> = std::sync::OnceLock::new();
+    let (anchors, anchor_finder) = ANCHORS.get_or_init(|| {
+        let mut anchors: Vec<String> = VENDOR_SEPS
+            .iter()
+            .map(|sep| format!("{VENDOR_DIR}/").replace('/', &sep.to_string()))
+            .collect();
+        anchors.push(HOSTED_GO_MODULE_PREFIX.to_string());
+        let finder = AhoCorasick::new(&anchors).expect("literal anchor patterns");
+        (anchors, finder)
+    });
+    for m in anchor_finder.find_overlapping_iter(bytes) {
+        let (pattern, at) = (m.pattern().as_usize(), m.start());
+        if pattern == GO {
+            let start = m.end();
+            let end = token_end(bytes, start, b"@");
+            for segment in norm[start..end].split('/') {
+                if is_canonical_uuid(segment) {
+                    found.insert((segment.to_string(), WiringMode::Hosted));
                 }
             }
+            continue;
         }
-    }
-
-    for (at, _) in norm.match_indices(HOSTED_GO_MODULE_PREFIX) {
-        let start = at + HOSTED_GO_MODULE_PREFIX.len();
-        let end = token_end(bytes, start, b"@");
-        for segment in norm[start..end].split('/') {
-            if is_canonical_uuid(segment) {
-                found.insert((segment.to_string(), WiringMode::Hosted));
+        let sep = VENDOR_SEPS[pattern];
+        let rest = &norm[at + anchors[pattern].len()..];
+        for eco in ECOSYSTEM_DIRS {
+            let uuid = rest
+                .strip_prefix(eco)
+                .and_then(|r| r.strip_prefix(sep))
+                .and_then(|r| r.get(..36))
+                .filter(|u| is_canonical_uuid(u));
+            if let Some(uuid) = uuid {
+                found.insert((uuid.to_string(), WiringMode::Vendored));
             }
         }
     }
 
-    // Cheap pre-filter: only a token naming an accepted host can be ours.
+    // Cheap pre-filter: only a token naming an accepted host (any ASCII
+    // case) can be ours.
     let mut hosts = vec![crate::patch::redirect::SOCKET_PATCH_SERVER_HOST.to_string()];
     hosts.extend(origins.iter().filter_map(|o| {
         reqwest::Url::parse(o.trim())
@@ -1237,20 +1391,28 @@ fn socket_identities_inner(text: &str, origins: &[String]) -> BTreeSet<(String, 
             .host_str()
             .map(str::to_ascii_lowercase)
     }));
-    let lower = norm.to_ascii_lowercase();
-    for separator in ["://", "%3a%2f%2f"] {
-        for (at, _) in lower.match_indices(separator) {
-            let Some(start) = scheme_start(bytes, at) else {
-                continue;
-            };
-            let end = token_end(bytes, at + separator.len(), b"");
-            if !hosts.iter().any(|h| lower[start..end].contains(h.as_str())) {
-                continue;
-            }
-            let uuids = crate::patch::redirect::hosted_patch_url_uuids(&norm[start..end], origins);
-            for uuid in uuids.into_iter().flatten() {
-                found.insert((uuid, WiringMode::Hosted));
-            }
+    let host_finder = AhoCorasick::builder()
+        .ascii_case_insensitive(true)
+        .build(&hosts)
+        .expect("literal host patterns");
+    static SEPARATORS: std::sync::OnceLock<AhoCorasick> = std::sync::OnceLock::new();
+    let separators = SEPARATORS.get_or_init(|| {
+        AhoCorasick::builder()
+            .ascii_case_insensitive(true)
+            .build(["://", "%3a%2f%2f"])
+            .expect("literal separator patterns")
+    });
+    for m in separators.find_overlapping_iter(bytes) {
+        let Some(start) = scheme_start(bytes, m.start()) else {
+            continue;
+        };
+        let end = token_end(bytes, m.end(), b"");
+        if !host_finder.is_match(&bytes[start..end]) {
+            continue;
+        }
+        let uuids = crate::patch::redirect::hosted_patch_url_uuids(&norm[start..end], origins);
+        for uuid in uuids.into_iter().flatten() {
+            found.insert((uuid, WiringMode::Hosted));
         }
     }
     found
@@ -3608,6 +3770,150 @@ mod tests {
                 .collect::<Vec<_>>(),
             both
         );
+    }
+
+    /// The sweep's memo is keyed by content and origins, never by path or
+    /// by call: a large text swept twice answers the same, and the same
+    /// text with one byte changed (a pending rewrite overlaid on the same
+    /// path) or under other origins is swept afresh.
+    #[test]
+    fn socket_identities_memo_is_keyed_by_content_and_origins() {
+        let a = UUID_A;
+        let b = UUID_B;
+        let pad = "x".repeat(IdentityMemo::MIN_LEN);
+        let lock = |uuid: &str| {
+            format!(
+                "{pad}\n\"resolved\": \"http://127.0.0.1:4545/patch/npm/x/1/{TOKEN}/{uuid}/x.tgz\"\n\
+                 \"file:.socket/vendor/npm/{uuid}/x-1.0.0.tgz\"\n"
+            )
+        };
+        let staging = ["http://127.0.0.1:4545".to_string()];
+        let uuids = |text: &str, origins: &[String]| {
+            socket_identities(text, origins)
+                .into_iter()
+                .map(|(u, m)| (u, m == WiringMode::Hosted))
+                .collect::<BTreeSet<_>>()
+        };
+        let all = |uuid: &str| {
+            BTreeSet::from([
+                (uuid.to_string(), false),
+                (uuid.to_string(), true),
+                (TOKEN.to_string(), true),
+            ])
+        };
+        for _ in 0..2 {
+            assert_eq!(uuids(&lock(a), &staging), all(a));
+            assert_eq!(
+                uuids(&lock(a), &[]),
+                BTreeSet::from([(a.to_string(), false)])
+            );
+            assert_eq!(uuids(&lock(b), &staging), all(b));
+        }
+        // Origins are a set: order and duplicates do not change the key.
+        let twice = [
+            staging[0].clone(),
+            "https://patch.socket.dev".into(),
+            staging[0].clone(),
+        ];
+        assert_eq!(uuids(&lock(a), &twice), uuids(&lock(a), &staging));
+        assert_eq!(
+            socket_identities(&lock(a), &staging),
+            socket_identities_inner(&lock(a), &staging)
+        );
+    }
+
+    /// [`DiscoverCtx::hosted_uuid`]'s plain-url shortcut answers exactly
+    /// what the full parse does, for plain urls on other hosts and for
+    /// every spelling it must leave to the parse.
+    #[test]
+    fn hosted_uuid_shortcut_agrees_with_the_full_parse() {
+        let (a, t) = (UUID_A, TOKEN);
+        let path = format!("/patch/npm/x/1.0.0/{t}/{a}/x-1.0.0.tgz");
+        let hosts = [
+            "patch.socket.dev",
+            "PATCH.Socket.DEV",
+            "patch.socket.dev.",
+            "patch.socket.dev:443",
+            "patch.socket.dev:8443",
+            "patch.socket.dev:",
+            "registry.npmjs.org",
+            "registry.npmjs.org:443",
+            "127.0.0.1:4545",
+            "127.0.0.1",
+            "0x7f.0.0.1:4545",
+            "127.1:4545",
+            "[::1]:4545",
+            "staging.example.com:8443",
+            "Staging.Example.COM:8443",
+            "staging.example.com",
+            "xn--stging-bua.example.com",
+            "user@patch.socket.dev",
+            "user:pw@registry.npmjs.org",
+            "patch%2esocket.dev",
+            "patch.soc\tket.dev",
+            "patch.socket.dev\\",
+            "foo.123",
+            "foo.0x1f",
+            "",
+        ];
+        let urls: Vec<String> = hosts
+            .iter()
+            .flat_map(|host| {
+                [
+                    format!("https://{host}{path}"),
+                    format!("http://{host}{path}"),
+                    format!("HTTPS://{host}{path}"),
+                    format!("sparse+https://{host}{path}"),
+                    format!("git+https://{host}{path}"),
+                    format!("https:///{host}{path}"),
+                    format!("https://{host}?q={path}"),
+                    format!("  https://{host}{path}  "),
+                    format!("https://{host}"),
+                ]
+            })
+            .chain([
+                format!("https:\\/\\/patch.socket.dev{}", path.replace('/', "\\/")),
+                format!("https%3A%2F%2Fpatch.socket.dev{}", path.replace('/', "%2F")),
+                "file:x.tgz".to_string(),
+                "npm:x@1.0.0".to_string(),
+                "https://".to_string(),
+            ])
+            .collect();
+        for origins in [
+            vec![],
+            vec!["http://127.0.0.1:4545".to_string()],
+            vec![
+                "https://staging.example.com:8443".to_string(),
+                "http://[::1]:4545".to_string(),
+                "https://xn--stging-bua.example.com".to_string(),
+            ],
+        ] {
+            let ctx = DiscoverCtx::with_origins(Path::new("/nonexistent"), &origins);
+            for url in &urls {
+                assert_eq!(
+                    ctx.hosted_uuid(url),
+                    crate::patch::redirect::hosted_patch_uuid(url, &origins),
+                    "{url} under {origins:?}"
+                );
+            }
+            assert_eq!(
+                ctx.hosted_uuid(&format!("https://patch.socket.dev{path}"))
+                    .as_deref(),
+                Some(a)
+            );
+        }
+        assert_eq!(
+            plain_url_domain("https://Registry.NPMJS.org/x"),
+            Some("registry.npmjs.org".into())
+        );
+        for not_plain in [
+            "https://127.0.0.1/x",
+            "https://a%2eb.com/x",
+            "https://u@a.com/x",
+            "https://xn--a.com/x",
+        ] {
+            assert_eq!(plain_url_domain(not_plain), None, "{not_plain}");
+        }
     }
 
     /// The claim API: a recognized uuid is decided by the refs alone (live

@@ -655,6 +655,7 @@ pub fn lockfile_paths(graph: &ScriptGraph, files: &BTreeMap<String, String>) -> 
 // ── the planner ──────────────────────────────────────────────────────────
 
 /// A refusal: nothing is written for the dep.
+#[derive(Clone)]
 struct Refusal {
     code: &'static str,
     detail: String,
@@ -1015,28 +1016,48 @@ fn ga_refusal(
     None
 }
 
-/// Why the hosted wiring of `row` no longer holds in the build `files`
+/// Why the hosted wiring of a row no longer holds in the build `files`
 /// holds, by the planner's own build- and GA-level refusals (see
 /// [`ga_refusal`]): `(code, detail)`. Discovery's re-check of a pin made
-/// before the build changed.
-pub(crate) fn pinned_row_refusal(
-    files: &BTreeMap<String, String>,
-    graph: &ScriptGraph,
-    row: &HostedRow,
-) -> Option<(&'static str, String)> {
-    let lock_paths = lockfile_paths(graph, files);
-    project_refusal(files, graph, &Ok(Vec::new()))
-        .or_else(|| {
-            ga_refusal(
-                files,
-                graph,
-                &lock_paths,
-                &row.group,
-                &row.artifact,
-                &row.base,
+/// before the build changed. The build-level half (the project refusal and
+/// the lock paths) depends on no row, so it is worked out once, on the
+/// first row that asks.
+pub(crate) struct PinnedRowChecks<'a> {
+    files: &'a BTreeMap<String, String>,
+    graph: &'a ScriptGraph,
+    build: std::sync::OnceLock<(Vec<String>, Option<Refusal>)>,
+}
+
+impl<'a> PinnedRowChecks<'a> {
+    pub(crate) fn new(files: &'a BTreeMap<String, String>, graph: &'a ScriptGraph) -> Self {
+        Self {
+            files,
+            graph,
+            build: std::sync::OnceLock::new(),
+        }
+    }
+
+    pub(crate) fn refusal(&self, row: &HostedRow) -> Option<(&'static str, String)> {
+        let (lock_paths, project) = self.build.get_or_init(|| {
+            (
+                lockfile_paths(self.graph, self.files),
+                project_refusal(self.files, self.graph, &Ok(Vec::new())),
             )
-        })
-        .map(|r| (r.code, r.detail))
+        });
+        project
+            .clone()
+            .or_else(|| {
+                ga_refusal(
+                    self.files,
+                    self.graph,
+                    lock_paths,
+                    &row.group,
+                    &row.artifact,
+                    &row.base,
+                )
+            })
+            .map(|r| (r.code, r.detail))
+    }
 }
 
 /// Whether `version` orders above `base` (Gradle's ordering): a newer
