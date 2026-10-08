@@ -40,3 +40,22 @@ Before you mark a PR ready for review or add it to the merge queue, run
 For a finding you decide not to fix, say why in the PR description. When you
 review someone else's PR, use `/code-review <PR> --comment` to post the
 findings as inline comments.
+
+## Share the GitHub API budget
+
+Every agent and routine here calls GitHub as the same account, so all of
+them share one budget of 5,000 REST requests and 5,000 GraphQL points
+per hour. When it runs out, every agent stalls until the hourly reset.
+
+- Before a read of more than ~20 requests, check what is left with
+  `gh api -i repos/SocketDev/socket-patch | grep -i '^x-ratelimit-remaining'`.
+  Trust that header over `gh api rate_limit`. Below 1,000, do only your
+  most important write and finish early.
+- Never `--paginate` over Actions runs, jobs or issues without a date
+  filter and a page cap, and never run more than 2 GitHub requests in
+  parallel.
+- On a 403 or 429 that mentions a rate limit, stop calling GitHub and
+  report what you have. Don't retry in a loop, and don't schedule a
+  reminder just to retry after the reset.
+- Keep at most one pending re-check reminder per PR, at least 30 minutes
+  out.
