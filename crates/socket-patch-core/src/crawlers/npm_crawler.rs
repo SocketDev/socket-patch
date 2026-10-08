@@ -810,7 +810,9 @@ fn orphaned_bun_store_copies_sync(paths: &[PathBuf]) -> HashSet<PathBuf> {
             continue;
         };
         let Some((store, entry)) = bun_store_entry_of(&real).or_else(|| {
-            let (store, entry) = bun_store_entry_of(&normalize_lexically(path))?;
+            let (store, entry) = bun_store_entry_of(
+                &crate::utils::relpath::normalize_lexically_keeping_escapes(path),
+            )?;
             Some((std::fs::canonicalize(store).ok()?, entry))
         }) else {
             continue;
@@ -1101,7 +1103,11 @@ fn bun_store_link_targets_sync(
     for link in &links {
         let lexical = std::fs::read_link(link)
             .ok()
-            .and_then(|target| Some(normalize_lexically(&link.parent()?.join(target))))
+            .and_then(|target| {
+                Some(crate::utils::relpath::normalize_lexically_keeping_escapes(
+                    &link.parent()?.join(target),
+                ))
+            })
             .and_then(|path| dirs.entry_of(&path));
         if let Some(Some(entry)) = lexical {
             targets.push(entry);
@@ -6369,7 +6375,9 @@ mod tests {
         std::os::unix::fs::symlink(target, link).unwrap();
         #[cfg(windows)]
         link_dir(
-            &normalize_lexically(&link.parent().unwrap().join(target)),
+            &crate::utils::relpath::normalize_lexically_keeping_escapes(
+                &link.parent().unwrap().join(target),
+            ),
             link,
         );
     }

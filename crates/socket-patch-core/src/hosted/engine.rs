@@ -2784,6 +2784,7 @@ mod tests {
                 trust_lockfile_config: true,
                 npm_allow_remote_config: true,
                 npm_outer: &outer,
+                yarn_classic_outer: &OuterYarnMirror::default,
                 blocking: false,
             };
             let read = read_candidate_files(&view, &BTreeSet::new(), &candidates).await;
