@@ -899,6 +899,64 @@ async fn uv_takeover_without_wheel_metadata_fails_loudly() {
 /// the revert (the artifact and ledger entry are kept). The takeover must
 /// then refuse — keeping the ledger — rather than drop the entry and leave
 /// the project half vendored with no record of it.
+/// #721: a non-UTF-8 candidate file (here a UTF-16 `pip freeze` export
+/// beside a vendored Poetry project) refuses the hosted run BEFORE the
+/// takeover reverts anything, wet and `--dry-run` alike: refusing only at
+/// the rewrite would leave the reverted poetry.lock unpatched in both modes.
+#[tokio::test]
+async fn undecodable_candidate_refuses_before_the_takeover_reverts() {
+    let (_tmp, root) = project();
+    std::fs::write(
+        root.join("pyproject.toml"),
+        "[tool.poetry]\nname = \"demo\"\nversion = \"0.1.0\"\ndescription = \"\"\nauthors = [\"x <x@x>\"]\npackage-mode = false\n\n[tool.poetry.dependencies]\npython = \">=3.9\"\nsix = \"1.16.0\"\n",
+    )
+    .unwrap();
+    std::fs::write(
+        root.join("poetry.lock"),
+        POETRY_LOCK
+            .replace("WHEEL_SHA", WHEEL_SHA)
+            .replace("SDIST_SHA", SDIST_SHA),
+    )
+    .unwrap();
+    vendor_project(&root, &["poetry.lock", "pyproject.toml"]);
+    let mut utf16 = vec![0xFF, 0xFE];
+    for unit in "six==1.16.0\r\n".encode_utf16() {
+        utf16.extend(unit.to_le_bytes());
+    }
+    std::fs::write(root.join("requirements.txt"), &utf16).unwrap();
+    let lock = std::fs::read_to_string(root.join("poetry.lock")).unwrap();
+    let state = root.join(".socket/vendor/state.json");
+
+    let server = MockServer::start().await;
+    mount_hosted_api(&server, true).await;
+    let uri = server.uri();
+    for dry_run in [true, false] {
+        let mut args = hosted_scan_args(&uri);
+        if dry_run {
+            args.push("--dry-run");
+        }
+        let (code, env) = run_cli(&root, &args, &[]);
+        assert_eq!(code, 1, "dry_run={dry_run}: {env:#}");
+        let text = env.to_string();
+        assert!(
+            text.contains("candidate_file_unreadable") && text.contains("requirements.txt"),
+            "dry_run={dry_run}: {env:#}"
+        );
+        assert!(
+            !text.contains("redirect_takeover_reverted_vendored"),
+            "dry_run={dry_run}: nothing is reverted: {env:#}"
+        );
+        assert_eq!(
+            std::fs::read_to_string(root.join("poetry.lock")).unwrap(),
+            lock,
+            "dry_run={dry_run}: the vendored lock is untouched"
+        );
+        assert!(std::fs::read_to_string(&state).unwrap().contains(UUID));
+        assert!(root.join(format!(".socket/vendor/pypi/{UUID}")).exists());
+        assert_eq!(std::fs::read(root.join("requirements.txt")).unwrap(), utf16);
+    }
+}
+
 #[tokio::test]
 async fn drifted_vendored_line_refuses_takeover() {
     let (_tmp, root) = project();
@@ -1488,4 +1546,55 @@ async fn platform_wheel_takeover_is_refused_before_revert() {
         )
         .await;
     }
+}
+
+/// #612: a Pipenv project with a `requirements.txt` exported beside its
+/// lock (`pipenv requirements`). Hosted mode pins both; the hosted →
+/// vendored takeover (`vendor` over the hosted project) wires only the
+/// governing `Pipfile.lock` and restores the requirements pin to upstream,
+/// so the run must name `requirements.txt` among the install sources left
+/// UNPATCHED instead of passing in silence.
+#[tokio::test]
+async fn pipenv_hosted_to_vendored_names_the_unpatched_requirements() {
+    let (_tmp, root) = project();
+    stage_pipenv(&root);
+    std::fs::write(
+        root.join("requirements.txt"),
+        "-i https://pypi.org/simple\nsix==1.16.0\n",
+    )
+    .unwrap();
+    let server = MockServer::start().await;
+    let hosted_url = mount_hosted_api(&server, true).await;
+    let (code, env) = hosted_scan(&root, &server);
+    assert_eq!(code, 0, "hosted scan: {env:#}");
+    let hosted_reqs = std::fs::read_to_string(root.join("requirements.txt")).unwrap();
+    assert!(
+        hosted_reqs.contains(&hosted_url),
+        "hosted mode pins requirements.txt too:\n{hosted_reqs}\n{env:#}"
+    );
+
+    stage_manifest(&root);
+    // The takeover recognizes the pin only under `--patch-server-url`,
+    // which also rehosts the prebuilt download: serve the vendored wheel
+    // from the same mock.
+    prebuilt_common::mount_project(&server, &root).await;
+    let uri = server.uri();
+    let (code, env) = run_cli(
+        &root,
+        &["vendor", "--patch-server-url", &uri, "--vendor-url", &uri],
+        &[],
+    );
+    assert_eq!(code, 0, "vendor takeover: {env:#}");
+    let lock = std::fs::read_to_string(root.join("Pipfile.lock")).unwrap();
+    assert!(
+        lock.contains(&format!(".socket/vendor/pypi/{UUID}/")),
+        "Pipfile.lock is wired to the vendored wheel:\n{lock}\n{env:#}"
+    );
+    let rendered = env.to_string();
+    assert!(
+        rendered.contains("\"pypi_multiple_lockfiles\"")
+            && rendered.contains("wiring `Pipfile.lock`")
+            && rendered.contains("requirements.txt will still install the UNPATCHED"),
+        "the takeover names requirements.txt as an unpatched install source: {env:#}"
+    );
 }

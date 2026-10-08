@@ -12,11 +12,12 @@ use socket_patch_core::api::types::PatchSearchResult;
 use socket_patch_core::crawlers::types::CrawledPackage;
 use socket_patch_core::manifest::schema::PatchManifest;
 use socket_patch_core::policy::{
-    canon, find_repo_root_with_warnings, patch_severity_order, policy_block, repo_relative_checked,
+    find_repo_root_with_warnings, patch_severity_order, policy_block, repo_relative_checked,
     sanitize, severity_name, DiskPolicyFs, FilterReason, FilteredEntry, Offers, PolicyError,
     PolicySource, PolicyWarning, RetainedEntry, Root, SelectionPolicy, PATCHES_DISABLED,
 };
 use socket_patch_core::utils::purl::normalize_purl;
+use socket_patch_core::utils::purl_key::PurlKey;
 
 use super::ScanArgs;
 use crate::hosted_memory::roots::{marker_ecosystem, UNSUPPORTED_MARKERS};
@@ -441,7 +442,7 @@ impl ScanPolicy {
             }
             if root_ok && self.policy.admits_purl(&purl).is_ok() {
                 if let Some(projects) = skipped.remove(&purl) {
-                    self.report().shared_copies.insert(canon(&purl), projects);
+                    self.report().shared_copies.insert(PurlKey::new(&purl).into_string(), projects);
                 }
             }
             admitted.insert(purl);
@@ -477,14 +478,14 @@ impl ScanPolicy {
             .map(|m| {
                 m.patches
                     .iter()
-                    .map(|(purl, record)| (canon(purl), record.uuid.clone()))
+                    .map(|(purl, record)| (PurlKey::new(purl).into_string(), record.uuid.clone()))
                     .collect()
             })
             .unwrap_or_default();
     }
 
     fn recorded_uuid(&self, purl: &str) -> Option<&str> {
-        self.recorded.get(&canon(purl)).map(String::as_str)
+        self.recorded.get(&PurlKey::new(purl).into_string()).map(String::as_str)
     }
 
     /// Step 3: the root, ecosystem and package filters. Returns whether the
@@ -506,7 +507,7 @@ impl ScanPolicy {
         };
         let mut report = self.report();
         if let Some(uuid) = self.recorded_uuid(purl) {
-            let key = canon(purl);
+            let key = PurlKey::new(purl).into_string();
             if report.retained_purls.insert(key.clone()) {
                 report.retained.push(RetainedEntry {
                     purl: key,
@@ -520,9 +521,9 @@ impl ScanPolicy {
         }
         if root_excluded {
             // Already reported as the root's one entry.
-        } else if report.filtered_purls.insert(canon(purl)) {
+        } else if report.filtered_purls.insert(PurlKey::new(purl).into_string()) {
             report.filtered.push(FilteredEntry {
-                purl: Some(canon(purl)),
+                purl: Some(PurlKey::new(purl).into_string()),
                 uuid: None,
                 project: project.to_string(),
                 reason,
@@ -535,7 +536,7 @@ impl ScanPolicy {
     /// Record the purls with a newer patch (`updates[]`), for
     /// `retained[].upgradeAvailable`.
     pub(crate) fn set_update_purls<'a>(&self, purls: impl IntoIterator<Item = &'a str>) {
-        self.report().update_purls = purls.into_iter().map(canon).collect();
+        self.report().update_purls = purls.into_iter().map(|p| PurlKey::new(p).into_string()).collect();
     }
 
     /// Steps 5-6: group the tier-accessible offers, keep retained packages
@@ -549,7 +550,7 @@ impl ScanPolicy {
         {
             let report = self.report();
             for offer in accessible {
-                if report.retained_purls.contains(&canon(&offer.purl)) {
+                if report.retained_purls.contains(&PurlKey::new(&offer.purl).into_string()) {
                     continue;
                 }
                 grouped.entry(offer.purl.clone()).or_default().push(offer);
@@ -569,7 +570,7 @@ impl ScanPolicy {
                 let reason = FilterReason::Disabled;
                 match recorded {
                     Some(uuid) => {
-                        let key = canon(&purl);
+                        let key = PurlKey::new(&purl).into_string();
                         if report.retained_purls.insert(key.clone()) {
                             report.retained.push(RetainedEntry {
                                 purl: key,
@@ -581,7 +582,7 @@ impl ScanPolicy {
                         }
                     }
                     None => report.filtered.push(FilteredEntry {
-                        purl: Some(canon(&purl)),
+                        purl: Some(PurlKey::new(&purl).into_string()),
                         uuid: Some(group[0].uuid.clone()),
                         project: self.project.clone(),
                         severity: Some(patch_severity_order(&group[0])),
@@ -613,7 +614,7 @@ impl ScanPolicy {
                     chosen.is_some() && chosen == recorded_at && recorded_at != Some(0);
                 if chosen.is_none() || upgrade_withheld {
                     report.filtered.push(FilteredEntry {
-                        purl: Some(canon(&purl)),
+                        purl: Some(PurlKey::new(&purl).into_string()),
                         uuid: Some(group[0].uuid.clone()),
                         project: self.project.clone(),
                         severity: Some(patch_severity_order(&group[0])),
@@ -622,8 +623,8 @@ impl ScanPolicy {
                 }
             }
             if let Some(i) = chosen {
-                if report.shared_copies.contains_key(&canon(&purl)) {
-                    report.shared_selected.insert(canon(&purl));
+                if report.shared_copies.contains_key(&PurlKey::new(&purl).into_string()) {
+                    report.shared_selected.insert(PurlKey::new(&purl).into_string());
                 }
                 offers.selected.insert(purl.clone(), group[i].clone());
             }

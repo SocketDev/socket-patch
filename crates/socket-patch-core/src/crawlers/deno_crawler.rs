@@ -72,7 +72,9 @@ impl DenoCrawler {
         if !options.global && !is_deno_project(&options.cwd).await {
             return Ok(Vec::new());
         }
-        let cache = deno_dir().join("npm").join("jsr.io");
+        let Some(cache) = deno_dir().map(|dir| dir.join("npm").join("jsr.io")) else {
+            return Ok(Vec::new());
+        };
         if is_dir(&cache).await {
             Ok(vec![cache])
         } else {
@@ -235,41 +237,41 @@ async fn is_deno_project(cwd: &Path) -> bool {
 /// * Linux/other Unix: `$XDG_CACHE_HOME/deno`, else `$HOME/.cache/deno`.
 /// * Windows: `%LOCALAPPDATA%\deno` (falling back to `~\.cache\deno`
 ///   if LOCALAPPDATA isn't set).
-fn deno_dir() -> PathBuf {
+fn deno_dir() -> Option<PathBuf> {
     if let Ok(d) = std::env::var("DENO_DIR") {
         if !d.is_empty() {
-            return PathBuf::from(d);
+            return Some(PathBuf::from(d));
         }
     }
-    default_cache_root().join("deno")
+    Some(default_cache_root()?.join("deno"))
 }
 
 /// Per-platform system cache root that Deno appends `deno` to.
 #[cfg(target_os = "macos")]
-fn default_cache_root() -> PathBuf {
-    home_dir().join("Library").join("Caches")
+fn default_cache_root() -> Option<PathBuf> {
+    Some(home_dir()?.join("Library").join("Caches"))
 }
 
 /// Per-platform system cache root that Deno appends `deno` to.
 #[cfg(windows)]
-fn default_cache_root() -> PathBuf {
+fn default_cache_root() -> Option<PathBuf> {
     if let Ok(local) = std::env::var("LOCALAPPDATA") {
         if !local.is_empty() {
-            return PathBuf::from(local);
+            return Some(PathBuf::from(local));
         }
     }
-    home_dir().join(".cache")
+    Some(home_dir()?.join(".cache"))
 }
 
 /// Per-platform system cache root that Deno appends `deno` to.
 #[cfg(all(not(target_os = "macos"), not(windows)))]
-fn default_cache_root() -> PathBuf {
+fn default_cache_root() -> Option<PathBuf> {
     if let Ok(xdg) = std::env::var("XDG_CACHE_HOME") {
         if !xdg.is_empty() {
-            return PathBuf::from(xdg);
+            return Some(PathBuf::from(xdg));
         }
     }
-    home_dir().join(".cache")
+    Some(home_dir()?.join(".cache"))
 }
 
 #[cfg(test)]
@@ -628,7 +630,7 @@ mod tests {
     #[serial_test::serial]
     fn deno_dir_honors_explicit_env() {
         let _g = EnvGuard::set("DENO_DIR", "/tmp/custom-deno");
-        assert_eq!(deno_dir(), PathBuf::from("/tmp/custom-deno"));
+        assert_eq!(deno_dir(), Some(PathBuf::from("/tmp/custom-deno")));
     }
 
     #[test]
@@ -637,7 +639,7 @@ mod tests {
         // Empty DENO_DIR must NOT resolve to PathBuf::from("") — it falls
         // through to the platform default, which always ends in `deno`.
         let _g = EnvGuard::set("DENO_DIR", "");
-        let dir = deno_dir();
+        let dir = deno_dir().expect("a home directory");
         assert_ne!(dir, PathBuf::from(""));
         assert!(dir.ends_with("deno"), "got {dir:?}");
     }
@@ -647,7 +649,7 @@ mod tests {
     #[serial_test::serial]
     fn deno_dir_uses_library_caches_on_macos() {
         let _g = EnvGuard::unset("DENO_DIR");
-        let dir = deno_dir();
+        let dir = deno_dir().expect("a home directory");
         // Regression: macOS must NOT use ~/.cache/deno.
         assert!(
             dir.ends_with("Library/Caches/deno"),
@@ -662,7 +664,10 @@ mod tests {
     fn deno_dir_honors_xdg_cache_home_on_linux() {
         let _d = EnvGuard::unset("DENO_DIR");
         let _x = EnvGuard::set("XDG_CACHE_HOME", "/tmp/xdg-cache");
-        assert_eq!(deno_dir(), PathBuf::from("/tmp/xdg-cache").join("deno"));
+        assert_eq!(
+            deno_dir(),
+            Some(PathBuf::from("/tmp/xdg-cache").join("deno"))
+        );
     }
 
     #[cfg(all(not(target_os = "macos"), not(windows)))]
@@ -671,7 +676,7 @@ mod tests {
     fn deno_dir_falls_back_to_dot_cache_on_linux() {
         let _d = EnvGuard::unset("DENO_DIR");
         let _x = EnvGuard::unset("XDG_CACHE_HOME");
-        let dir = deno_dir();
+        let dir = deno_dir().expect("a home directory");
         assert!(dir.ends_with(".cache/deno"), "got {dir:?}");
     }
 }

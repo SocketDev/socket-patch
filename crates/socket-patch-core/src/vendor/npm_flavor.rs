@@ -27,11 +27,18 @@ use crate::manifest::schema::PatchRecord;
 use crate::patch::apply::PatchSources;
 use crate::utils::fs::{read_regular_to_bytes, read_regular_to_string};
 
+use super::lock_inventory::ProjectView;
 use super::source::PackageSource;
 use super::state::VendorEntry;
 use super::{
     bun_lock, npm_lock, pnpm_lock, pnpm_lock_legacy, vlt_lock, yarn_berry_lock, yarn_classic_lock,
     RevertOpts, RevertOutcome, VendorOutcome, VendorWarning,
+};
+use crate::constants::npm_family::{
+    BUN_LOCK, BUN_LOCKB, NPM_LOCKS, PNPM_LOCK, PNP_MARKERS, VLT_LOCK,
+};
+use crate::formats::governing_locks::{
+    npm_governing_family, npm_lock_files, npm_locks_outside, NpmLockFamily,
 };
 use crate::formats::pnpm::PnpmLockGrammar;
 use crate::formats::yarn::{sniff_grammar, YarnLockGrammar, UNIDENTIFIED_DETAIL};
@@ -57,6 +64,17 @@ pub(crate) enum NpmLockFlavor {
 }
 
 impl NpmLockFlavor {
+    /// The wiring family whose lock files this flavor's backend wires.
+    pub(crate) fn family(self) -> NpmLockFamily {
+        match self {
+            NpmLockFlavor::PackageLock => NpmLockFamily::Npm,
+            NpmLockFlavor::YarnClassic | NpmLockFlavor::YarnBerry => NpmLockFamily::Yarn,
+            NpmLockFlavor::Pnpm | NpmLockFlavor::PnpmLegacy => NpmLockFamily::Pnpm,
+            NpmLockFlavor::Bun => NpmLockFamily::Bun,
+            NpmLockFlavor::Vlt => NpmLockFamily::Vlt,
+        }
+    }
+
     /// The stable string recorded as [`VendorEntry::flavor`].
     fn as_str(self) -> &'static str {
         match self {
@@ -88,26 +106,6 @@ impl NpmLockFlavor {
     }
 }
 
-/// Yarn berry Plug'n'Play loaders: packages live inside `.yarn/cache/` zips,
-/// so there is nothing on disk to stage and no lockfile entry to rewire.
-use crate::constants::npm_family::{
-    BUN_LOCK, BUN_LOCKB, NPM_LOCKS, PNPM_LOCK, PNP_MARKERS, VLT_LOCK,
-};
-
-/// Every lockfile name the probe knows, grouped into wiring families: the
-/// flavor that owns a family wires (or supersedes) every file in it, so only
-/// files OUTSIDE the detected family get the multiple-lockfiles warning.
-const LOCKFILE_FAMILIES: [(NpmLockFlavor, &[&str]); 5] = [
-    (NpmLockFlavor::Vlt, &[VLT_LOCK]),
-    // npm itself ignores package-lock.json when npm-shrinkwrap.json exists,
-    // so the npm family never warns about its own sibling.
-    (NpmLockFlavor::PackageLock, &NPM_LOCKS),
-    (NpmLockFlavor::YarnClassic, &["yarn.lock"]),
-    (NpmLockFlavor::Pnpm, &[PNPM_LOCK]),
-    // Bun reads bun.lock when both text and binary lockfiles exist.
-    (NpmLockFlavor::Bun, &[BUN_LOCK, BUN_LOCKB]),
-];
-
 /// Where a missing lockfile was looked for, for a refusal message:
 /// `in the project root` for the default `.` (a bare `at .` reads as a
 /// typo), `at <path>` otherwise.
@@ -120,44 +118,51 @@ pub(super) fn project_root_location(project_root: &Path) -> String {
     }
 }
 
-/// Probe the project root for the lockfile flavor that drives npm installs.
+/// Probe the project root for the lockfile flavor that drives npm installs:
+/// [`detect_npm_lock_flavor_in`] over the disk.
+pub(crate) async fn detect_npm_lock_flavor(
+    project_root: &Path,
+) -> Result<(NpmLockFlavor, Vec<VendorWarning>), (&'static str, String)> {
+    detect_npm_lock_flavor_in(&ProjectView::Disk(project_root)).await
+}
+
+/// Probe a project for the lockfile flavor that drives npm installs. The
+/// one decision table for the disk, snapshot and in-memory views.
 ///
 /// Decision table, first match wins:
 /// 1. a PnP loader file → Err `vendor_yarn_berry_unsupported` — unless the
 ///    tree is pnpm's own `node-linker=pnp` layout (pnpm-lock.yaml + installed
 ///    pnpm store + no yarn.lock, see
-///    [`crate::crawlers::pkg_managers::pnpm_pnp_layout`]) → Err
+///    [`crate::crawlers::pkg_managers::pnpm_pnp_layout_in`]) → Err
 ///    `vendor_pnpm_pnp_unsupported` with a pnpm remedy;
-/// 2. `vlt-lock.json` → Vlt when it is a BOM-less JSON object with
-///    `lockfileVersion` 0 or 1; any other shape → Err
-///    `vendor_lockfile_version_unsupported` (the layout is not checked here,
-///    so read-only consumers still read a pretty-printed lock);
-/// 3. `bun.lock` or `bun.lockb` → Bun (text takes precedence);
-/// 4. `pnpm-lock.yaml` → head-sniff `lockfileVersion`: `'9.0'` → Pnpm;
-///    `5.4`/`'6.0'` (pnpm 7/8) → PnpmLegacy; anything else → Err
-///    `vendor_lockfile_version_unsupported` (version-aware remedy);
-/// 5. `yarn.lock` → head-sniff: column-0 `__metadata:` → YarnBerry
-///    (node-modules linker; PnP was already refused in step 1);
-///    `# yarn lockfile v1` → YarnClassic;
-///    neither → Err `vendor_lockfile_version_unsupported`;
-/// 6. `npm-shrinkwrap.json` | `package-lock.json` → PackageLock;
-/// 7. nothing recognized, but `rush.json` present → Err
+/// 2. the governing lock family, by the shared precedence
+///    [`crate::formats::governing_locks::NPM_PRECEDENCE`]
+///    (vlt > bun > pnpm > yarn > npm), refined by content:
+///    - `vlt-lock.json` → Vlt when it is a BOM-less JSON object with
+///      `lockfileVersion` 0 or 1; any other shape → Err
+///      `vendor_lockfile_version_unsupported` (the layout is not checked
+///      here, so read-only consumers still read a pretty-printed lock);
+///    - `bun.lock` or `bun.lockb` → Bun (text takes precedence);
+///    - `pnpm-lock.yaml` → head-sniff `lockfileVersion`: `'9.0'` → Pnpm;
+///      `5.4`/`'6.0'` (pnpm 7/8) → PnpmLegacy; anything else → Err
+///      `vendor_lockfile_version_unsupported` (version-aware remedy);
+///    - `yarn.lock` → head-sniff: column-0 `__metadata:` → YarnBerry
+///      (node-modules linker; PnP was already refused in step 1);
+///      `# yarn lockfile v1` → YarnClassic; neither → Err
+///      `vendor_lockfile_version_unsupported`;
+///    - `npm-shrinkwrap.json` | `package-lock.json` → PackageLock;
+/// 3. nothing recognized, but `rush.json` present → Err
 ///    `vendor_rush_unsupported` (Rush's generated-workspace install model
 ///    can't carry vendor's relative `file:` specs — hosted mode edits the
 ///    lock in place instead);
-/// 8. nothing → Err `vendor_lockfile_missing`.
+/// 4. nothing → Err `vendor_lockfile_missing`.
 ///
 /// `Ok` carries one `vendor_multiple_lockfiles` warning per OTHER known
 /// lockfile present (outside the detected flavor's family): installs driven
 /// by an unwired lockfile would still install the unpatched registry bytes.
-pub(crate) async fn detect_npm_lock_flavor(
-    project_root: &Path,
+pub(crate) async fn detect_npm_lock_flavor_in(
+    view: &ProjectView<'_>,
 ) -> Result<(NpmLockFlavor, Vec<VendorWarning>), (&'static str, String)> {
-    let exists = |name: &str| {
-        let p = project_root.join(name);
-        async move { tokio::fs::metadata(&p).await.is_ok() }
-    };
-
     // 1. Yarn berry PnP — checked first because it means packages are not on
     //    disk at all, whatever lockfiles are also lying around. Carve-out:
     //    pnpm's own PnP mode (`node-linker=pnp` in `.npmrc`) writes the same
@@ -169,9 +174,14 @@ pub(crate) async fn detect_npm_lock_flavor(
     //    says nothing about pnpm's own. A yarn loader the configured
     //    `nodeLinker` disowns is stale (#975) and skipped, so the yarn berry
     //    sniff below decides.
-    let present = |m: &str| std::fs::metadata(project_root.join(m)).is_ok();
-    if let Some(marker) = PNP_MARKERS.into_iter().find(|m| present(m)) {
-        if crate::crawlers::pkg_managers::pnpm_pnp_layout(project_root) {
+    let mut markers = Vec::new();
+    for marker in PNP_MARKERS {
+        if view.exists(marker).await {
+            markers.push(marker);
+        }
+    }
+    if let Some(marker) = markers.first() {
+        if crate::crawlers::pkg_managers::pnpm_pnp_layout_in(view) {
             return Err((
                 "vendor_pnpm_pnp_unsupported",
                 format!(
@@ -186,7 +196,10 @@ pub(crate) async fn detect_npm_lock_flavor(
             ));
         }
     }
-    if let Some(marker) = crate::crawlers::pkg_managers::live_pnp_marker(project_root, present) {
+    if let Some(marker) = crate::crawlers::pkg_managers::live_pnp_marker_with(
+        || view.yarn_node_linker(),
+        |m| markers.contains(&m),
+    ) {
         return Err((
             "vendor_yarn_berry_unsupported",
             format!(
@@ -197,134 +210,129 @@ pub(crate) async fn detect_npm_lock_flavor(
         ));
     }
 
-    let detected = 'flavor: {
-        // 2. vlt wins every other lock once PnP is ruled out.
-        if exists(VLT_LOCK).await {
-            let text = read_lock(project_root, VLT_LOCK).await?;
-            match vlt_lock::sniff_vendor_lock(&text) {
-                Ok(_) => break 'flavor NpmLockFlavor::Vlt,
-                Err(detail) => return Err(("vendor_lockfile_version_unsupported", detail)),
-            }
+    let mut present = Vec::new();
+    for file in npm_lock_files() {
+        if view.exists(file).await {
+            present.push(file);
         }
+    }
+    let is_present = |file: &str| present.contains(&file);
 
-        // 3. Bun's native backend accepts text and binary locks. Selection
-        // inside the backend and inventory preserves bun.lock precedence.
-        if exists(BUN_LOCK).await || exists(BUN_LOCKB).await {
-            break 'flavor NpmLockFlavor::Bun;
-        }
-
-        // 4. pnpm: lockfileVersion 9.0 routes to the v9 backend, the legacy
-        //    grammars 5.4 (pnpm 7) / 6.0 (pnpm 8) to the legacy backend;
-        //    anything else refuses with the sniff's version-aware remedy.
-        if exists(PNPM_LOCK).await {
-            let text = read_lock(project_root, PNPM_LOCK).await?;
-            match crate::formats::pnpm::sniff_lock_grammar(&text) {
-                Ok(PnpmLockGrammar::V9) => break 'flavor NpmLockFlavor::Pnpm,
-                Ok(PnpmLockGrammar::V54 | PnpmLockGrammar::V60) => {
-                    break 'flavor NpmLockFlavor::PnpmLegacy
-                }
-                Err(detail) => {
-                    return Err(("vendor_lockfile_version_unsupported", detail));
-                }
-            }
-        }
-
-        // 5. yarn: classic v1 vs berry (node-modules linker), decided by content.
-        if exists("yarn.lock").await {
-            break 'flavor sniff_yarn_lock(project_root).await?;
-        }
-
-        // 6. npm (npm_lock itself prefers the shrinkwrap when both exist).
-        if exists(NPM_LOCKS[0]).await || exists(NPM_LOCKS[1]).await {
-            break 'flavor NpmLockFlavor::PackageLock;
-        }
-
-        // 7. nothing recognizable at the root. A Rush monorepo keeps its
-        //    single source-of-truth lock under common/config/rush/ (no root
-        //    package.json/lock pair), and its overrides live in
-        //    common/config/rush/pnpm-config.json rather than the lockfile —
-        //    so vendor's file:-relative rewiring cannot survive Rush's
-        //    generated-workspace install (installs run from common/temp).
-        //    Point the user at hosted mode, which edits the lock in place.
-        if exists("rush.json").await {
-            return Err((
-                "vendor_rush_unsupported",
-                format!(
-                    "found rush.json: this is a Rush monorepo — its single pnpm lockfile \
-                     lives at {lock}, overrides are declared in \
-                     common/config/rush/pnpm-config.json (globalOverrides), and `rush \
-                     install` copies the lock into common/temp and runs pnpm there, so \
-                     vendor's relative file: specs cannot survive the copy; use \
-                     `socket-patch scan --mode hosted`, which edits {lock} in place",
-                    lock = crate::constants::npm_family::RUSH_COMMON_LOCK_REL
-                ),
-            ));
-        }
-
-        // Nothing recognizable.
-        return Err((
-            "vendor_lockfile_missing",
-            format!(
-                "no package-lock.json, npm-shrinkwrap.json, yarn.lock, pnpm-lock.yaml, \
-                 bun.lock, bun.lockb, or vlt-lock.json {} — vendoring rewires the lockfile, so one must \
-                 exist (run your package manager's install first)",
-                project_root_location(project_root)
-            ),
-        ));
-    };
-
-    // Multiple lockfiles: warn about every present file the detected
-    // flavor's wiring does not cover. Both yarn flavors wire the same
-    // yarn.lock; the family table keys that family under YarnClassic, so a
-    // berry detection claims it too (never self-warn about the wired file).
-    let family_owner = match detected {
-        NpmLockFlavor::YarnBerry => NpmLockFlavor::YarnClassic,
-        // Both pnpm backends wire the same pnpm-lock.yaml (the family table
-        // keys the family under Pnpm) — never self-warn about the wired file.
-        NpmLockFlavor::PnpmLegacy => NpmLockFlavor::Pnpm,
-        other => other,
-    };
-    let mut warnings = Vec::new();
-    for (flavor, family) in LOCKFILE_FAMILIES {
-        if flavor == family_owner {
-            continue;
-        }
-        for file in family {
-            if exists(file).await {
-                warnings.push(VendorWarning::new(
-                    "vendor_multiple_lockfiles",
+    // 2. The governing family, refined by content.
+    let detected = match npm_governing_family(is_present, None) {
+        Some(family) => sniff_family(view, family).await?,
+        None => {
+            // 3. nothing recognizable at the root. A Rush monorepo keeps its
+            //    single source-of-truth lock under common/config/rush/ (no
+            //    root package.json/lock pair), and its overrides live in
+            //    common/config/rush/pnpm-config.json rather than the
+            //    lockfile — so vendor's file:-relative rewiring cannot
+            //    survive Rush's generated-workspace install (installs run
+            //    from common/temp). Point the user at hosted mode, which
+            //    edits the lock in place.
+            if view.exists("rush.json").await {
+                return Err((
+                    "vendor_rush_unsupported",
                     format!(
-                        "multiple lockfiles present: `{file}` is not wired by the {} vendor \
-                         backend — installs driven by `{file}` will still install the \
-                         UNPATCHED registry bytes",
-                        detected.as_str()
+                        "found rush.json: this is a Rush monorepo — its single pnpm lockfile \
+                         lives at {lock}, overrides are declared in \
+                         common/config/rush/pnpm-config.json (globalOverrides), and `rush \
+                         install` copies the lock into common/temp and runs pnpm there, so \
+                         vendor's relative file: specs cannot survive the copy; use \
+                         `socket-patch scan --mode hosted`, which edits {lock} in place",
+                        lock = crate::constants::npm_family::RUSH_COMMON_LOCK_REL
                     ),
                 ));
             }
+            // 4. Nothing recognizable.
+            let location = match view {
+                ProjectView::Disk(root)
+                | ProjectView::Snapshot(super::lock_inventory::DiskSnapshot { root, .. }) => {
+                    project_root_location(root)
+                }
+                ProjectView::Memory(_) => project_root_location(Path::new(".")),
+            };
+            return Err((
+                "vendor_lockfile_missing",
+                format!(
+                    "no package-lock.json, npm-shrinkwrap.json, yarn.lock, pnpm-lock.yaml, \
+                     bun.lock, bun.lockb, or vlt-lock.json {location} — vendoring rewires the \
+                     lockfile, so one must exist (run your package manager's install first)"
+                ),
+            ));
         }
-    }
+    };
+
+    // Multiple lockfiles: warn about every present file the detected
+    // flavor's wiring does not cover (both yarn flavors wire the same
+    // yarn.lock, both pnpm backends the same pnpm-lock.yaml — never
+    // self-warn about the wired file).
+    let warnings = npm_locks_outside(detected.family(), is_present)
+        .into_iter()
+        .map(|file| {
+            VendorWarning::new(
+                "vendor_multiple_lockfiles",
+                format!(
+                    "multiple lockfiles present: `{file}` is not wired by the {} vendor \
+                     backend — installs driven by `{file}` will still install the \
+                     UNPATCHED registry bytes",
+                    detected.as_str()
+                ),
+            )
+        })
+        .collect();
     Ok((detected, warnings))
+}
+
+/// The flavor of the governing `family`, decided by the lock's content where
+/// the family has more than one grammar.
+async fn sniff_family(
+    view: &ProjectView<'_>,
+    family: NpmLockFamily,
+) -> Result<NpmLockFlavor, (&'static str, String)> {
+    match family {
+        NpmLockFamily::Vlt => {
+            let text = read_lock(view, VLT_LOCK).await?;
+            vlt_lock::sniff_vendor_lock(&text)
+                .map(|_| NpmLockFlavor::Vlt)
+                .map_err(|detail| ("vendor_lockfile_version_unsupported", detail))
+        }
+        // Bun's native backend accepts text and binary locks. Selection
+        // inside the backend and inventory preserves bun.lock precedence.
+        NpmLockFamily::Bun => Ok(NpmLockFlavor::Bun),
+        // lockfileVersion 9.0 routes to the v9 backend, the legacy grammars
+        // 5.4 (pnpm 7) / 6.0 (pnpm 8) to the legacy backend; anything else
+        // refuses with the sniff's version-aware remedy.
+        NpmLockFamily::Pnpm => {
+            let text = read_lock(view, PNPM_LOCK).await?;
+            match crate::formats::pnpm::sniff_lock_grammar(&text) {
+                Ok(PnpmLockGrammar::V9) => Ok(NpmLockFlavor::Pnpm),
+                Ok(PnpmLockGrammar::V54 | PnpmLockGrammar::V60) => Ok(NpmLockFlavor::PnpmLegacy),
+                Err(detail) => Err(("vendor_lockfile_version_unsupported", detail)),
+            }
+        }
+        NpmLockFamily::Yarn => sniff_yarn_lock(view).await,
+        // npm_lock itself prefers the shrinkwrap when both exist.
+        NpmLockFamily::Npm => Ok(NpmLockFlavor::PackageLock),
+    }
 }
 
 /// Read a lockfile for content-sniffing. An unreadable-but-present file maps
 /// to the same stable code as a missing one.
-async fn read_lock(project_root: &Path, name: &str) -> Result<String, (&'static str, String)> {
-    read_regular_to_string(&project_root.join(name))
-        .await
-        .map_err(|e| {
-            (
-                "vendor_lockfile_missing",
-                format!("cannot read {name}: {e}"),
-            )
-        })
+async fn read_lock(view: &ProjectView<'_>, name: &str) -> Result<String, (&'static str, String)> {
+    view.read_text(name).await.map_err(|e| {
+        (
+            "vendor_lockfile_missing",
+            format!("cannot read {name}: {e}"),
+        )
+    })
 }
 
-/// `yarn.lock` head sniff: berry locks carry a top-level (column-0)
-/// `__metadata:` key; classic v1 locks carry the `# yarn lockfile v1`
-/// comment header. Berry wins the check — a berry lock must never be
-/// mistaken for classic.
-async fn sniff_yarn_lock(project_root: &Path) -> Result<NpmLockFlavor, (&'static str, String)> {
-    let text = read_lock(project_root, "yarn.lock").await?;
+/// `yarn.lock` grammar, through the one decision every yarn reader shares
+/// ([`sniff_grammar`]); a lock that declares neither grammar is refused,
+/// since vendoring must know which grammar it writes.
+async fn sniff_yarn_lock(view: &ProjectView<'_>) -> Result<NpmLockFlavor, (&'static str, String)> {
+    let text = read_lock(view, "yarn.lock").await?;
     // Berry wins the check (it must never be mistaken for classic). The
     // node-modules linker keeps packages on disk for staging, and berry's
     // cache-zip checksum is reproducible from our tarball (berry_zip), so the
@@ -995,10 +1003,7 @@ mod tests {
         // vendor probe recognizes. A new lockfile spelling added in one
         // place must show up in the other (and in every other consumer's
         // guard test) instead of drifting silently.
-        let mut from_families: Vec<&str> = LOCKFILE_FAMILIES
-            .iter()
-            .flat_map(|(_, names)| names.iter().copied())
-            .collect();
+        let mut from_families: Vec<&str> = npm_lock_files().collect();
         from_families.sort_unstable();
         let mut from_table = crate::formats::registry::probe_paths("npm");
         from_table.sort_unstable();

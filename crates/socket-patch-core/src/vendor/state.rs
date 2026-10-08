@@ -31,9 +31,9 @@ use serde::{Deserialize, Serialize};
 
 use crate::constants::SOCKET_DIR;
 use crate::manifest::schema::PatchRecord;
-use crate::utils::composer_version::{composer_purl_identity, composer_purls_equivalent};
 use crate::utils::fs::{atomic_write_artifact, read_regular_to_bytes};
-use crate::utils::purl::{patch_matches, strip_purl_qualifiers};
+use crate::utils::purl::patch_matches;
+use crate::utils::purl_key::PurlKey;
 use crate::utils::serde::serialize_sorted;
 use crate::utils::socket_dir::{prune_empty_dirs, remove_file_and_prune, write_json_ledger};
 
@@ -371,15 +371,13 @@ impl VendorEntry {
     }
 
     /// Does this entry, stored under ledger `key`, own the manifest purl
-    /// `purl`? The ledger-key / qualifier-stripped-key / base-purl triple,
-    /// plus composer release identity (`@3.0.2` owns `@3.0.2.0`) — the
-    /// per-entry form of the set [`VendorState::purl_keys`] flattens.
+    /// `purl`? By [`PurlKey`] of its ledger key or its base purl (any
+    /// qualifier variant, encoding, PyPI/NuGet name spelling or composer
+    /// release spelling) — the per-entry form of the set
+    /// [`VendorState::purl_keys`] flattens.
     pub fn covers_purl(&self, key: &str, purl: &str) -> bool {
-        key == purl
-            || strip_purl_qualifiers(key) == strip_purl_qualifiers(purl)
-            || self.base_purl == strip_purl_qualifiers(purl)
-            || composer_purls_equivalent(key, purl)
-            || composer_purls_equivalent(&self.base_purl, purl)
+        let purl = PurlKey::new(purl);
+        PurlKey::new(key) == purl || PurlKey::new(&self.base_purl) == purl
     }
 }
 
@@ -399,27 +397,16 @@ impl VendorState {
         }
     }
 
-    /// Every purl spelling under which this ledger's entries are
-    /// addressable: each entry's map key (the manifest purl, possibly
-    /// qualified), its resolved base purl, the qualifier-stripped key, and
-    /// for composer the release identity of both
-    /// ([`composer_purl_identity`]). The one derivation behind every
-    /// whole-set vendor-ownership match (apply / rollback / remove / scan
-    /// prune); match against it with [`purl_keys_cover`].
+    /// The [`PurlKey`]s under which this ledger's entries are addressable:
+    /// each entry's map key (the manifest purl, possibly qualified) and its
+    /// resolved base purl. The one derivation behind every whole-set
+    /// vendor-ownership match (apply / rollback / remove / scan prune);
+    /// match against it with [`purl_keys_cover`].
     /// [`super::vendored_purl_keys`] is its load-then-derive convenience.
-    pub fn purl_keys(&self) -> HashSet<String> {
+    pub fn purl_keys(&self) -> HashSet<PurlKey> {
         self.entries
             .iter()
-            .flat_map(|(key, entry)| {
-                [
-                    Some(key.clone()),
-                    Some(entry.base_purl.clone()),
-                    Some(strip_purl_qualifiers(key).to_string()),
-                    composer_purl_identity(key),
-                    composer_purl_identity(&entry.base_purl),
-                ]
-            })
-            .flatten()
+            .flat_map(|(key, entry)| [PurlKey::new(key), PurlKey::new(&entry.base_purl)])
             .collect()
     }
 
@@ -489,13 +476,11 @@ impl VendorState {
 }
 
 /// Whether `purl` is vendor-owned according to `keys`, a
-/// [`VendorState::purl_keys`] set: by its own spelling, its
-/// qualifier-stripped base, or (composer) its release identity, so a scan
-/// that sees `@3.0.2` still finds the entry vendored as `@3.0.2.0`.
-pub fn purl_keys_cover(keys: &HashSet<String>, purl: &str) -> bool {
-    keys.contains(purl)
-        || keys.contains(strip_purl_qualifiers(purl))
-        || composer_purl_identity(purl).is_some_and(|identity| keys.contains(&identity))
+/// [`VendorState::purl_keys`] set: by its [`PurlKey`], so a scan that sees
+/// composer `@3.0.2` still finds the entry vendored as `@3.0.2.0`, and a
+/// lowercase NuGet crawl the entry the API spelled `Newtonsoft.Json`.
+pub fn purl_keys_cover(keys: &HashSet<PurlKey>, purl: &str) -> bool {
+    keys.contains(&PurlKey::new(purl))
 }
 
 impl Default for VendorState {
@@ -663,10 +648,12 @@ fn binary_snapshot_identity_matches(a: &serde_json::Value, b: &serde_json::Value
 }
 
 /// The ledger entry addressable as `purl`: the exact map key first, then
-/// any entry whose resolved `base_purl` equals it (a qualified manifest
-/// key resolves to the entry recorded under the base PURL), then, for a
-/// composer purl, the entry of the same release in another version
-/// spelling (the smallest such key, so the pick is deterministic).
+/// the entry (the smallest such key, so the pick is deterministic) whose
+/// key is `purl` in another spelling ([`PurlKey::qualified`]: encoding,
+/// PyPI/NuGet name spelling, composer release spelling — a qualified purl
+/// still names only its own variant), or whose resolved `base_purl` is the
+/// unqualified `purl` (a qualified manifest key resolves to the entry
+/// recorded under the base PURL).
 pub fn lookup_entry<'a>(
     entries: &'a HashMap<String, VendorEntry>,
     purl: &str,
@@ -679,18 +666,15 @@ pub fn lookup_entry_kv<'a>(
     entries: &'a HashMap<String, VendorEntry>,
     purl: &str,
 ) -> Option<(&'a String, &'a VendorEntry)> {
-    entries
-        .get_key_value(purl)
-        .or_else(|| entries.iter().find(|(_, e)| e.base_purl == purl))
-        .or_else(|| {
-            entries
-                .iter()
-                .filter(|(key, e)| {
-                    composer_purls_equivalent(key, purl)
-                        || composer_purls_equivalent(&e.base_purl, purl)
-                })
-                .min_by(|(a, _), (b, _)| a.cmp(b))
-        })
+    entries.get_key_value(purl).or_else(|| {
+        let want = PurlKey::qualified(purl);
+        entries
+            .iter()
+            .filter(|(key, e)| {
+                PurlKey::qualified(key) == want || PurlKey::qualified(&e.base_purl) == want
+            })
+            .min_by(|(a, _), (b, _)| a.cmp(b))
+    })
 }
 
 fn state_path(project_root: &Path) -> PathBuf {
@@ -1125,9 +1109,10 @@ mod tests {
         assert_eq!(npm.artifact.file_inventory, None, "cargo only");
     }
 
-    /// Every spelling `purl_keys` promises: the (possibly qualified,
+    /// Every spelling `purl_keys` covers: the (possibly qualified,
     /// percent-encoded) map key, the entry's base purl and the
-    /// qualifier-stripped key; an empty ledger yields the empty set.
+    /// qualifier-stripped key all share one `PurlKey`; an empty ledger
+    /// yields the empty set.
     #[test]
     fn purl_keys_carry_every_spelling() {
         let mut state = VendorState::new();
@@ -1142,9 +1127,12 @@ mod tests {
             "pkg:npm/%40scope/pkg@1.0.0",
             "pkg:npm/@scope/pkg@1.0.0",
         ] {
-            assert!(keys.contains(spelling), "missing {spelling}: {keys:?}");
+            assert!(
+                purl_keys_cover(&keys, spelling),
+                "missing {spelling}: {keys:?}"
+            );
         }
-        assert_eq!(keys.len(), 3);
+        assert_eq!(keys.len(), 1);
         assert!(VendorState::new().purl_keys().is_empty());
     }
 
@@ -1189,6 +1177,27 @@ mod tests {
         assert!(entry.covers_purl(key, "pkg:npm/@scope/pkg@1.0.0?artifact_id=y"));
         assert!(!entry.covers_purl(key, "pkg:npm/@scope/pkg@1.0.1"));
         assert!(!entry.covers_purl(key, "pkg:npm/other@1.0.0"));
+    }
+
+    /// #553 / B20: a NuGet ledger entry recorded under the lockfile's
+    /// lowercase purl is the same package as the API's mixed-case purl, for
+    /// every ownership check (per-entry, whole-set, lookup).
+    #[test]
+    fn nuget_case_spellings_are_one_vendored_package() {
+        let mut entry = sample_entry();
+        entry.base_purl = "pkg:nuget/newtonsoft.json@13.0.3".into();
+        let key = "pkg:nuget/newtonsoft.json@13.0.3";
+        let api = "pkg:nuget/Newtonsoft.Json@13.0.3";
+        assert!(entry.covers_purl(key, api));
+        let mut state = VendorState::new();
+        state.entries.insert(key.to_string(), entry);
+        assert!(purl_keys_cover(&state.purl_keys(), api));
+        assert!(!purl_keys_cover(
+            &state.purl_keys(),
+            "pkg:nuget/Newtonsoft.Json@13.0.4"
+        ));
+        let (found, _) = lookup_entry_kv(&state.entries, api).expect("case variant found");
+        assert_eq!(found, key);
     }
 
     /// A maven-shaped entry: the wiring record holds the whole pom before

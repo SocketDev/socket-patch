@@ -1429,7 +1429,7 @@ fn remove_drift_keep_excludes_manifest_entry_by_base_purl() {
 
 /// A golang ledger key carries the module path case-ENCODED
 /// (`!burnt!sushi`) while `basePurl` holds the decoded form users type;
-/// `purl_eq` does not decode `!x` escaping, so only the base_purl arm can
+/// `PurlKey` does not decode `!x` escaping, so only the base_purl arm can
 /// match. The dry-run preview proves the match end-to-end without needing
 /// a working golang revert.
 #[test]

@@ -23,6 +23,7 @@ use socket_patch_core::utils::concurrent::{api_concurrency_for, ordered_concurre
 use socket_patch_core::utils::purl::{
     canonical_purl, is_purl, normalize_purl, strip_purl_qualifiers,
 };
+use socket_patch_core::utils::purl_key::PurlKey;
 use socket_patch_core::vendor::{load_state, lookup_entry, VendorEntry, VendorState};
 use std::collections::HashMap;
 use std::fmt;
@@ -1430,9 +1431,8 @@ struct InstalledNarrowing {
 /// runs — the coarse layer above [`filter_to_installed_releases`]'s
 /// per-release variant narrowing (which still runs later, unchanged).
 ///
-/// Presence evidence per result purl (compared on
-/// `normalize_purl(strip_purl_qualifiers(..))` — API purls are
-/// percent-encoded/qualified, crawler purls literal):
+/// Presence evidence per result purl (compared by [`PurlKey`] — API purls
+/// are percent-encoded/qualified/mixed-case, crawler purls literal):
 /// * installed on disk — `find_packages_for_rollback` over the deduped base
 ///   purls (the qualified-aware resolver; memory invariant);
 /// * already tracked in the manifest — the user opted this purl in earlier,
@@ -1465,8 +1465,6 @@ async fn filter_to_installed_purls(
     use socket_patch_core::vendor::lock_inventory;
     use std::collections::HashSet;
 
-    let canon = canonical_purl;
-
     // Deduped base purls, probed against the installed tree. The resolver
     // keys its result by the purls we pass, so canonicalize the found keys
     // the same way as the membership probes below.
@@ -1480,14 +1478,14 @@ async fn filter_to_installed_purls(
     };
     let partitioned = partition_purls(&bases, None);
     let found = find_packages_for_rollback(&partitioned, &common.crawler_options(), true).await;
-    let mut present: HashSet<String> = found.keys().map(|k| canon(k)).collect();
+    let mut present: HashSet<PurlKey> = found.keys().map(|k| PurlKey::new(k)).collect();
 
     let ctx = super::context::ProjectContext::rooted(common, common.cwd.clone());
     // Manifest membership counts as presence (read-only probe: a corrupt
     // manifest degrades to "no extension" here — the download path's
     // fail-closed read still guards every write).
     if let Some(manifest) = ctx.ledgers().await.manifest {
-        present.extend(manifest.patches.keys().map(|k| canon(k)));
+        present.extend(manifest.patches.keys().map(|k| PurlKey::new(k)));
     }
 
     // scan's lockfile + vendored-ledger discovery supplements (and their
@@ -1498,11 +1496,11 @@ async fn filter_to_installed_purls(
         let supplement = super::scan::project_lockfile_supplement(&ctx, &[], None).await;
         pnp_diags = supplement.unsupported;
         if mode != super::scan::ScanMode::Agent {
-            present.extend(supplement.entries.iter().map(|e| canon(&e.purl)));
+            present.extend(supplement.entries.iter().map(|e| PurlKey::new(&e.purl)));
             let vendored =
                 super::scan::project_vendored_supplement(common, &[], &ctx.loaded().await.vendor)
                     .await;
-            present.extend(vendored.packages.iter().map(|p| canon(&p.purl)));
+            present.extend(vendored.packages.iter().map(|p| PurlKey::new(&p.purl)));
         }
     }
 
@@ -1517,10 +1515,16 @@ async fn filter_to_installed_purls(
     // mark the installed version — but the pnpm-lock.yaml the hosted
     // rewriter will edit is right there. Read its raw text once and gate the
     // keep-branch below on version membership, so a large advisory fan-out
-    // doesn't request grants for every version ever patched (raw
-    // `read_to_string` matches the hosted flow's own candidate-file reads).
+    // doesn't request grants for every version ever patched. Read FIFO-safe,
+    // like the hosted flow's own candidate-file reads: a FIFO planted at
+    // `pnpm-lock.yaml` must not wedge `get` in open(2).
     let pnpm_pnp_lock_text: Option<String> = (pnp_pnpm && mode == super::scan::ScanMode::Hosted)
-        .then(|| std::fs::read_to_string(common.cwd.join("pnpm-lock.yaml")).ok())
+        .then(|| {
+            socket_patch_core::utils::fs::read_regular_to_string_sync(
+                &common.cwd.join("pnpm-lock.yaml"),
+            )
+            .ok()
+        })
         .flatten();
     let pnpm_pnp_lock = pnpm_pnp_lock_text.as_deref().map(PnpmLock::parse);
 
@@ -1530,7 +1534,7 @@ async fn filter_to_installed_purls(
         warnings,
     };
     for result in accessible {
-        if present.contains(&canon(&result.purl)) {
+        if present.contains(&PurlKey::new(&result.purl)) {
             out.kept.push(result.clone());
             continue;
         }
@@ -1559,7 +1563,7 @@ async fn filter_to_installed_purls(
             // nothing — so it carries the same `package_not_installed` code
             // a non-PnP pnpm project would get; only an UNREADABLE lock
             // (no judgment possible) keeps the layout-refusal code.
-            let decoded = canon(&result.purl);
+            let decoded = canonical_purl(&result.purl);
             let coord = decoded.strip_prefix("pkg:npm/").unwrap_or(&decoded);
             if mode == super::scan::ScanMode::Hosted {
                 match (&pnpm_pnp_lock, coord.rsplit_once('@')) {
@@ -1774,7 +1778,8 @@ async fn lock_text_refusals_for(
         )
         .await,
     );
-    let claimed: Vec<String> = pins.iter().map(|pin| canonical_purl(&pin.purl)).collect();
+    let claimed: std::collections::HashSet<PurlKey> =
+        pins.iter().map(|pin| PurlKey::new(&pin.purl)).collect();
     let fetchable: Vec<&PatchSearchResult> = selected
         .iter()
         .filter(|sr| bun_refusal.filter(|r| r.applies_to(&sr.purl)).is_none())
@@ -1785,7 +1790,7 @@ async fn lock_text_refusals_for(
         .collect();
     let candidates: Vec<(&str, &str)> = fetchable
         .iter()
-        .filter(|sr| !claimed.contains(&canonical_purl(&sr.purl)))
+        .filter(|sr| !claimed.contains(&PurlKey::new(&sr.purl)))
         .map(|sr| (sr.purl.as_str(), sr.uuid.as_str()))
         .collect();
     let refused = socket_patch_core::vendor::lock_text_refusals(cwd, &candidates).await;
@@ -1809,7 +1814,7 @@ async fn lock_text_refusals_for(
             cwd,
             fetchable
                 .iter()
-                .filter(|sr| claimed.contains(&canonical_purl(&sr.purl)))
+                .filter(|sr| claimed.contains(&PurlKey::new(&sr.purl)))
                 .map(|sr| sr.purl.as_str()),
             &pins,
             false,
@@ -2399,8 +2404,8 @@ fn apply_warning_lines(report: Option<&ApplyRunReport>) -> Vec<String> {
 /// qualified record (apply keys a release-variant base by its base purl).
 /// A qualified key never covers a sibling variant.
 fn apply_key_covers(key: &str, record: &str) -> bool {
-    let (key, record) = (normalize_purl(key), normalize_purl(record));
-    key == record || (!key.contains(['?', '#']) && record.split(['?', '#']).next() == Some(&*key))
+    PurlKey::qualified(key) == PurlKey::qualified(record)
+        || (!key.trim().contains(['?', '#']) && PurlKey::same(key, record))
 }
 
 /// Fold a failed nested apply into a `get` / `scan --mode agent` JSON
@@ -2443,7 +2448,8 @@ fn fold_apply_failures(
             }
         }
         let appended = patches[selected..].iter().any(|r| {
-            normalize_purl(r["purl"].as_str().unwrap_or_default()) == normalize_purl(&failure.purl)
+            PurlKey::qualified(r["purl"].as_str().unwrap_or_default())
+                == PurlKey::qualified(&failure.purl)
         });
         if !hit && !appended {
             let mut rec = serde_json::json!({
@@ -6412,6 +6418,81 @@ mod tests {
         );
         assert_eq!(out.skip_records.len(), 1);
         assert_eq!(out.skip_records[0]["errorCode"], "package_not_installed");
+    }
+
+    /// B74: a FIFO planted at `pnpm-lock.yaml` of a pnpm-PnP project must
+    /// not wedge hosted `get` in open(2). A FIFO present from the start is
+    /// already refused by the lock inventory (so this guards the whole
+    /// hosted filter path, and passes on the old code too); the raw read
+    /// behind the pnpm-PnP keep-gate is now FIFO-safe as well, which closes
+    /// the window where a FIFO is swapped in after the inventory read. A
+    /// watchdog thread
+    /// opens the FIFO's write end (non-blocking) after a grace period, which
+    /// releases a reader stuck in open(2): the test then FAILS instead of
+    /// hanging the suite.
+    #[cfg(unix)]
+    #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+    async fn filter_to_installed_purls_pnpm_pnp_hosted_fifo_lock_does_not_wedge() {
+        use std::os::unix::fs::OpenOptionsExt;
+        use std::sync::atomic::{AtomicBool, Ordering};
+        use std::sync::Arc;
+
+        let tmp = tempfile::tempdir().unwrap();
+        std::fs::write(tmp.path().join(".pnp.cjs"), b"// pnp loader\n").unwrap();
+        let lock = tmp.path().join("pnpm-lock.yaml");
+        let c = std::ffi::CString::new(lock.to_str().unwrap()).unwrap();
+        assert_eq!(unsafe { libc::mkfifo(c.as_ptr(), 0o600) }, 0);
+        std::fs::create_dir_all(tmp.path().join("node_modules")).unwrap();
+        std::fs::write(tmp.path().join("node_modules/.modules.yaml"), b"").unwrap();
+
+        let done = Arc::new(AtomicBool::new(false));
+        let rescued = Arc::new(AtomicBool::new(false));
+        let watchdog = {
+            let (done, rescued, lock) = (done.clone(), rescued.clone(), lock.clone());
+            std::thread::spawn(move || {
+                let deadline = std::time::Instant::now() + std::time::Duration::from_secs(5);
+                while !done.load(Ordering::SeqCst) && std::time::Instant::now() < deadline {
+                    std::thread::sleep(std::time::Duration::from_millis(50));
+                }
+                // Keep releasing until the body returns: each open lets one
+                // blocked reader through to EOF.
+                while !done.load(Ordering::SeqCst) {
+                    if std::fs::OpenOptions::new()
+                        .write(true)
+                        .custom_flags(libc::O_NONBLOCK)
+                        .open(&lock)
+                        .is_ok()
+                    {
+                        rescued.store(true, Ordering::SeqCst);
+                    }
+                    std::thread::sleep(std::time::Duration::from_millis(50));
+                }
+            })
+        };
+
+        let common = crate::args::GlobalArgs {
+            cwd: tmp.path().to_path_buf(),
+            ..Default::default()
+        };
+        let accessible = vec![mk_patch(
+            "88888888-8888-4888-8888-888888888888",
+            "pkg:npm/covgap-judged@1.0.0",
+            "free",
+            "2024-01-01",
+        )];
+        let out = filter_to_installed_purls(
+            &accessible,
+            &common,
+            crate::commands::scan::ScanMode::Hosted,
+        )
+        .await;
+        done.store(true, Ordering::SeqCst);
+        watchdog.join().unwrap();
+        assert!(
+            !rescued.load(Ordering::SeqCst),
+            "a FIFO pnpm-lock.yaml wedged get in open(2)"
+        );
+        assert!(out.kept.is_empty(), "{:?}", out.kept);
     }
 
     /// pnpm-PnP + hosted: a purl the lock probe CANNOT judge (no `@version`

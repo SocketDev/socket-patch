@@ -37,7 +37,7 @@ use std::ffi::OsStr;
 use std::path::{Path, PathBuf};
 
 use crate::crawlers::ruby_crawler::bundle_config_setting_including_empty;
-use crate::utils::fs::normalize_lexically;
+use crate::utils::relpath::normalize_lexically;
 
 /// Where a configured `BUNDLE_GEMFILE` came from.
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]

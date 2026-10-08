@@ -77,11 +77,18 @@ fn first_token(text: &str) -> Option<(usize, usize)> {
 
 /// `dir/<leaf>.<ext>` as text when it is a regular, small, UTF-8 file.
 fn read_sidecar(path: &Path) -> Option<String> {
+    // A symlinked sidecar is not followed; the read itself is the
+    // non-blocking regular-file one, so a FIFO swapped in after the
+    // `lstat` fails fast instead of wedging in open(2).
     let meta = std::fs::symlink_metadata(path).ok()?;
     if !meta.is_file() || meta.len() > MAX_SIDECAR_BYTES {
         return None;
     }
-    String::from_utf8(std::fs::read(path).ok()?).ok()
+    let bytes = crate::utils::fs::read_regular_to_bytes_sync(path).ok()?;
+    if bytes.len() as u64 > MAX_SIDECAR_BYTES {
+        return None;
+    }
+    String::from_utf8(bytes).ok()
 }
 
 /// The checksum files beside each of `leaves` (patch-file keys, `package/`
@@ -367,6 +374,17 @@ fn md5(input: &[u8]) -> [u8; 16] {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    /// B74: a FIFO sidecar reads as absent and returns at once.
+    #[cfg(unix)]
+    #[test]
+    fn read_sidecar_rejects_a_fifo_without_blocking() {
+        let tmp = tempfile::tempdir().unwrap();
+        let path = tmp.path().join("lib-1.0.jar.sha1");
+        let c = std::ffi::CString::new(path.to_str().unwrap()).unwrap();
+        assert_eq!(unsafe { libc::mkfifo(c.as_ptr(), 0o600) }, 0);
+        assert_eq!(read_sidecar(&path), None);
+    }
 
     #[test]
     fn md5_matches_rfc1321_vectors() {

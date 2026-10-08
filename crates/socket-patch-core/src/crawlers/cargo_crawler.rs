@@ -270,7 +270,9 @@ impl CargoCrawler {
     /// Each subdirectory corresponds to a registry index
     /// (e.g. `index.crates.io-6f17d22bba15001f/`).
     async fn get_registry_src_paths() -> Vec<PathBuf> {
-        let cargo_home = Self::cargo_home();
+        let Some(cargo_home) = Self::cargo_home() else {
+            return Vec::new();
+        };
         let registry_src = cargo_home.join("registry").join("src");
 
         let mut paths = Vec::new();
@@ -346,14 +348,14 @@ impl CargoCrawler {
         Some((name.to_string(), version.to_string()))
     }
 
-    /// Get `CARGO_HOME`, defaulting to `$HOME/.cargo`. An empty value means
-    /// unset (the env_non_empty convention) — `PathBuf::from("")` would
-    /// otherwise resolve `registry/src` against the CWD and silently crawl
-    /// nothing.
-    fn cargo_home() -> PathBuf {
+    /// Get `CARGO_HOME`, defaulting to `$HOME/.cargo` (`None` with no
+    /// home). An empty value means unset (the env_non_empty convention) —
+    /// `PathBuf::from("")` would otherwise resolve `registry/src` against
+    /// the CWD and silently crawl nothing.
+    fn cargo_home() -> Option<PathBuf> {
         match std::env::var("CARGO_HOME") {
-            Ok(v) if !v.trim().is_empty() => PathBuf::from(v),
-            _ => crate::utils::fs::home_dir().join(".cargo"),
+            Ok(v) if !v.trim().is_empty() => Some(PathBuf::from(v)),
+            _ => crate::utils::fs::home_dir().map(|home| home.join(".cargo")),
         }
     }
 }

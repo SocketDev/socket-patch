@@ -62,7 +62,16 @@ fn env_set(name: &str) -> Option<OsString> {
 
 /// The npm executable under test.
 pub fn npm_program() -> OsString {
-    env_set(BIN_ENV).unwrap_or_else(|| "npm".into())
+    env_set(BIN_ENV).unwrap_or_else(path_npm)
+}
+
+/// `npm` from `PATH`, resolved the way the CLI resolves its own tools
+/// (`PATHEXT` on Windows). A bare `Command::new("npm")` cannot spawn the
+/// `npm.cmd` shim Windows installs, so without this every Windows run
+/// skipped as "npm not installed".
+fn path_npm() -> OsString {
+    socket_patch_core::utils::process::resolve_tool("npm")
+        .map_or_else(|| "npm".into(), PathBuf::into_os_string)
 }
 
 /// `SOCKET_PATCH_NPM_E2E_REQUIRED` is set (CI matrix legs).
@@ -137,7 +146,7 @@ pub fn npm_version() -> Option<String> {
 /// `SOCKET_PATCH_NPM_E2E_LOCK_WRITER_BIN`, else `npm` from `PATH` when it
 /// is not the npm under test and reports major >= 7.
 pub fn modern_npm_writer() -> Option<OsString> {
-    let candidate = env_set("SOCKET_PATCH_NPM_E2E_LOCK_WRITER_BIN").unwrap_or_else(|| "npm".into());
+    let candidate = env_set("SOCKET_PATCH_NPM_E2E_LOCK_WRITER_BIN").unwrap_or_else(path_npm);
     let probe = tempfile::tempdir().unwrap();
     let out = npm_command_for(&candidate, probe.path())
         .arg("--version")

@@ -1,7 +1,8 @@
 use socket_patch_core::crawlers::{
     CrawledPackage, CrawlerOptions, Ecosystem, NpmCrawler, PythonCrawler, RubyCrawler,
 };
-use socket_patch_core::utils::purl::{canonical_purl, normalize_purl, strip_purl_qualifiers};
+use socket_patch_core::utils::purl::strip_purl_qualifiers;
+use socket_patch_core::utils::purl_key::PurlKey;
 use std::collections::{HashMap, HashSet};
 use std::path::PathBuf;
 
@@ -575,10 +576,10 @@ pub(crate) fn npm_paths_by_identity_in(
 ) -> HashMap<String, Vec<PathBuf>> {
     let mut out = HashMap::new();
     for purl in purls {
-        let want = canonical_purl(purl);
+        let want = PurlKey::new(purl);
         let paths: Vec<PathBuf> = installed
             .iter()
-            .filter(|pkg| normalize_purl(&pkg.purl) == want)
+            .filter(|pkg| PurlKey::new(&pkg.purl) == want)
             .map(|pkg| pkg.path.clone())
             .collect();
         if !paths.is_empty() {
@@ -746,7 +747,13 @@ impl JvmScope {
         for path in paths {
             if self.is_read_only(path) {
                 out.read_only.push(path.clone());
-            } else if path.starts_with(&self.env.m2_repo) && !self.m2_consumed() {
+            } else if self
+                .env
+                .m2_repo
+                .as_ref()
+                .is_some_and(|m2| path.starts_with(m2))
+                && !self.m2_consumed()
+            {
                 out.m2_ignored.push(path.clone());
             } else {
                 out.consumed.push(path.clone());
