@@ -597,6 +597,29 @@ pub(super) async fn revert_pipenv(
             warnings.push(drifted());
             continue;
         }
+        // A relock dropped the entry (`pipenv uninstall <pkg>`, a Pipfile
+        // edit + `pipenv lock`), or, on Pipenv 2022/2023, the whole category
+        // it emptied (#1142): the vendored reference is gone with it, so
+        // retire the record rather than keep the orphan forever. Only while
+        // no other entry still routes through this uuid dir — that one
+        // would need the artifact, so it stays drift.
+        let relocked_away = |lock: &Value| {
+            if rec.action == WiringAction::Rewritten
+                && rec.original.is_some()
+                && !to_canonical_json(lock).contains(&entry.uuid)
+            {
+                VendorWarning::new(
+                    "vendor_lock_entry_relocked",
+                    format!("{LOCK_FILE} entry for {:?} was removed by a relock; the vendored reference is already gone, so the record is retired", rec.key),
+                )
+            } else {
+                drifted()
+            }
+        };
+        if lock.get(section).is_none() {
+            warnings.push(relocked_away(&lock));
+            continue;
+        }
         let Some(map) = lock.get_mut(section).and_then(Value::as_object_mut) else {
             warnings.push(drifted());
             continue;
@@ -615,17 +638,7 @@ pub(super) async fn revert_pipenv(
             continue;
         };
         let Some(live) = map.get(name) else {
-            if rec.action == WiringAction::Rewritten && rec.original.is_some() {
-                // A relock dropped the entry (`pipenv uninstall <pkg>`, a Pipfile
-                // edit + `pipenv lock`): the vendored reference is gone with
-                // it — retire the record rather than keep the orphan forever.
-                warnings.push(VendorWarning::new(
-                    "vendor_lock_entry_relocked",
-                    format!("{LOCK_FILE} entry for {:?} was removed by a relock; the vendored reference is already gone, so the record is retired", rec.key),
-                ));
-            } else {
-                warnings.push(drifted());
-            }
+            warnings.push(relocked_away(&lock));
             continue;
         };
         // Still OUR reference (`file`/`path` string identical to what we
@@ -1801,7 +1814,7 @@ mod tests {
     /// successful revert with exactly one drift warning and the lock bytes
     /// UNCHANGED (changed=false must skip re-serialization entirely).
     #[tokio::test]
-    async fn revert_drift_skips_missing_section_entry_new_and_missing_original() {
+    async fn revert_retires_missing_section_entry_and_drift_skips_new_and_missing_original() {
         use serde_json::json;
         let mut no_develop: Value = serde_json::from_str(LOCK_DIRECT_REGISTRY).unwrap();
         no_develop.as_object_mut().unwrap().remove("develop");
@@ -1856,9 +1869,9 @@ mod tests {
             let outcome = revert_pipenv(&entry_for(vec![record], meta), tmp.path(), false).await;
             assert!(outcome.success, "{label}: {:?}", outcome.error);
             assert_eq!(outcome.warnings.len(), 1, "{label}: {:?}", outcome.warnings);
-            // An entry a relock REMOVED retires the record (the reference is
-            // gone with it); every other mismatch is drift.
-            let expected = if label.contains("entry removed") {
+            // An entry or category a relock REMOVED retires the record (the
+            // reference is gone with it, #1142); every other mismatch is drift.
+            let expected = if label.contains("entry removed") || label.contains("section deleted") {
                 "vendor_lock_entry_relocked"
             } else {
                 "vendor_lock_entry_drifted"
@@ -1875,6 +1888,61 @@ mod tests {
                 "{label}: nothing restored, nothing re-serialized"
             );
         }
+    }
+
+    /// #1142: `pipenv uninstall six --categories docs` on Pipenv 2022/2023
+    /// drops the emptied `docs` key from Pipfile.lock altogether (2026 keeps
+    /// `"docs": {}`). The vendored reference left with the category, so the
+    /// record retires exactly like an entry a relock removed — reading it as
+    /// drift kept the wheel and ledger entry forever and looped
+    /// `vendor --check` → `scan --prune`. A lock that still names the uuid
+    /// anywhere (the entry moved to another category by hand) stays drift.
+    #[tokio::test]
+    async fn revert_retires_record_whose_category_a_relock_dropped() {
+        let registry_six =
+            serde_json::from_str::<Value>(LOCK_DIRECT_REGISTRY).unwrap()["default"]["six"].clone();
+        let vendored_six =
+            serde_json::from_str::<Value>(LOCK_DIRECT_VENDORED).unwrap()["default"]["six"].clone();
+        let record = WiringRecord {
+            file: LOCK_FILE.to_string(),
+            kind: KIND_LOCK_ENTRY.to_string(),
+            action: WiringAction::Rewritten,
+            key: Some("docs:six".to_string()),
+            original: Some(registry_six),
+            new: Some(vendored_six.clone()),
+        };
+        let meta = || PipenvMeta {
+            sections: vec!["docs".into()],
+        };
+
+        // The lock after the uninstall: no `docs` key, and nothing else
+        // mentions the vendored wheel.
+        let mut relocked: Value = serde_json::from_str(LOCK_DIRECT_REGISTRY).unwrap();
+        relocked["default"].as_object_mut().unwrap().remove("six");
+        let relocked_text = to_canonical_json(&relocked);
+        let tmp = write_lock(&relocked_text).await;
+        let outcome =
+            revert_pipenv(&entry_for(vec![record.clone()], meta()), tmp.path(), false).await;
+        assert!(outcome.success, "{:?}", outcome.error);
+        assert!(!outcome.drift_skipped(), "{:?}", outcome.warnings);
+        assert_eq!(outcome.warnings.len(), 1, "{:?}", outcome.warnings);
+        assert_eq!(outcome.warnings[0].code, "vendor_lock_entry_relocked");
+        assert!(outcome.warnings[0].detail.contains("docs:six"));
+        assert_eq!(read_lock(tmp.path()).await, relocked_text);
+
+        // The same record while another category still routes through the
+        // wheel: deleting it would break that install, so it is drift.
+        let mut moved = relocked.clone();
+        moved["default"]
+            .as_object_mut()
+            .unwrap()
+            .insert("six".into(), vendored_six);
+        let moved_text = to_canonical_json(&moved);
+        let tmp = write_lock(&moved_text).await;
+        let outcome = revert_pipenv(&entry_for(vec![record], meta()), tmp.path(), false).await;
+        assert!(outcome.success, "{:?}", outcome.error);
+        assert!(outcome.drift_skipped(), "{:?}", outcome.warnings);
+        assert_eq!(read_lock(tmp.path()).await, moved_text);
     }
 
     /// The Added arm removes a lock entry — a destructive edit driven by
