@@ -14,6 +14,10 @@
 //!   4. verify-mode against patched files laid on disk
 //!   5. verify-mode where one patch file is missing → omitted + warning
 
+#[path = "common/mod.rs"]
+mod common;
+use common::binary;
+
 use std::collections::HashMap;
 use std::path::Path;
 use std::process::Command;
@@ -23,10 +27,6 @@ use socket_patch_core::hash::git_sha256::compute_git_sha256_from_bytes;
 use socket_patch_core::manifest::schema::{
     PatchFileInfo, PatchManifest, PatchRecord, VulnerabilityInfo,
 };
-
-fn binary() -> &'static str {
-    env!("CARGO_BIN_EXE_socket-patch")
-}
 
 /// Build a `Command` for the CLI with the entire `SOCKET_*` environment
 /// scrubbed from the child process.

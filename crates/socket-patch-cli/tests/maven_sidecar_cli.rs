@@ -4,6 +4,10 @@
 //! and are put back exactly on rollback; absent, none is created; one that
 //! never described the file is left alone. Every rollback is byte-exact.
 
+#[path = "common/mod.rs"]
+mod common;
+use common::git_sha256;
+
 #[path = "common/hermetic.rs"]
 mod hermetic;
 #[path = "prebuilt_common/mod.rs"]
@@ -21,10 +25,6 @@ const PRISTINE: &[u8] =
     b"<project><groupId>com.example</groupId><artifactId>lib</artifactId><version>2.0</version></project>\n";
 const PATCHED: &[u8] =
     b"<project><groupId>com.example</groupId><artifactId>lib</artifactId><version>2.0</version><!-- socket --></project>\n";
-
-fn git_sha256(bytes: &[u8]) -> String {
-    socket_patch_core::hash::git_sha256::compute_git_sha256_from_bytes(bytes)
-}
 
 fn sha1_hex(bytes: &[u8]) -> String {
     hex::encode(sha1::Sha1::digest(bytes))

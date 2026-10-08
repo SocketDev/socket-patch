@@ -29,10 +29,13 @@
 
 #![cfg(feature = "docker-e2e")]
 
+#[path = "common/mod.rs"]
+mod common;
+use common::git_sha256;
+
 use std::process::Command;
 
 use base64::Engine;
-use sha2::{Digest, Sha256};
 use wiremock::matchers::{method, path, path_regex};
 use wiremock::{Mock, MockServer, ResponseTemplate};
 
@@ -44,16 +47,6 @@ const NPM_UUID: &str = "13131313-1313-4131-8131-131313131313";
 /// post-apply that the file has been overwritten.
 const PATCHED_BYTES: &[u8] =
     b"/* SOCKET-PATCH-E2E-MARKER */\nmodule.exports = function () { return {}; };\n";
-
-/// Git-SHA256: SHA256("blob <len>\0" ++ content). Matches the binary's
-/// content-addressable hashing.
-fn git_sha256(content: &[u8]) -> String {
-    let header = format!("blob {}\0", content.len());
-    let mut hasher = Sha256::new();
-    hasher.update(header.as_bytes());
-    hasher.update(content);
-    hex::encode(hasher.finalize())
-}
 
 /// Coverage instrumentation hook — same shape as every other docker
 /// e2e test file. When `SOCKET_PATCH_COV_BIN` is set, mounts the

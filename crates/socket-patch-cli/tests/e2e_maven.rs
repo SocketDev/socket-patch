@@ -13,7 +13,11 @@
 //! cargo test -p socket-patch-cli --test e2e_maven
 //! ```
 
-use std::path::{Path, PathBuf};
+#[path = "common/mod.rs"]
+mod common;
+use common::binary;
+
+use std::path::Path;
 use std::process::{Command, Output};
 
 use wiremock::matchers::{method, path};
@@ -22,10 +26,6 @@ use wiremock::{Mock, MockServer, ResponseTemplate};
 // ---------------------------------------------------------------------------
 // Helpers
 // ---------------------------------------------------------------------------
-
-fn binary() -> PathBuf {
-    env!("CARGO_BIN_EXE_socket-patch").into()
-}
 
 /// Start a mock Socket public proxy answering the scan's `POST /patch/batch`
 /// with an empty (no-patch) result, so no scan in this file ever leaves

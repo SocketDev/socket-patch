@@ -2,6 +2,8 @@
 //!
 //! One test binary per command: each module was its own binary.
 
+#[path = "../common/mod.rs"]
+mod common;
 #[path = "../vlt_hosted_common/mod.rs"]
 mod vlt_hosted_common;
 #[path = "../vlt_hosted_common/vendored.rs"]

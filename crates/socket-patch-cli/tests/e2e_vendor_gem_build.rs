@@ -58,13 +58,16 @@
 //! required) or when the fixture install cannot reach rubygems.org; every
 //! assertion after that is hard.
 
+#[path = "common/mod.rs"]
+mod common;
+use common::{binary, git_sha256};
+
 #[path = "prebuilt_common/mod.rs"]
 mod prebuilt_common;
 
 use std::path::{Path, PathBuf};
 use std::process::{Command, Output};
 
-use sha2::{Digest, Sha256};
 use wiremock::matchers::{method, path};
 use wiremock::{Mock, MockServer, ResponseTemplate};
 
@@ -84,10 +87,6 @@ const GHSA: &str = "GHSA-vend-gem-host";
 const ORG: &str = "test-org";
 
 // ── self-contained helpers ────────────────────────────────────────────
-
-fn binary() -> PathBuf {
-    PathBuf::from(env!("CARGO_BIN_EXE_socket-patch"))
-}
 
 /// The real-bundler gate (`common/bundler_e2e.rs`: the version-matrix env
 /// contract). Floor 1.17 — every bundler from the last 1.x on writes the
@@ -146,15 +145,6 @@ fn bundle(cwd: &Path, args: &[&str], frozen: bool) -> Output {
         cmd.env("BUNDLE_FROZEN", "true");
     }
     cmd.output().expect("failed to run bundle")
-}
-
-/// Git-blob SHA-256 (`sha256("blob <len>\0" ++ bytes)`) — the hash format
-/// socket-patch records in manifests.
-fn git_sha256(content: &[u8]) -> String {
-    let mut hasher = Sha256::new();
-    hasher.update(format!("blob {}\0", content.len()).as_bytes());
-    hasher.update(content);
-    hex::encode(hasher.finalize())
 }
 
 /// Base64 for the wiremock view's inline `blobContent`.

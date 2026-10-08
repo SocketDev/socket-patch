@@ -49,9 +49,9 @@
 //! `_LOCK_VERSION`) apply to the headline test.
 //! `#[ignore]` gated because it shells out to `cargo`.
 
-use std::path::{Path, PathBuf};
+use common::git_sha256;
 
-use sha2::{Digest, Sha256};
+use std::path::{Path, PathBuf};
 
 #[path = "cargo_e2e_matrix/mod.rs"]
 mod cargo_e2e_matrix;
@@ -209,17 +209,6 @@ fn git_hashes() -> (String, String) {
         git_sha256(ORIGINAL_LIB_RS.as_bytes()),
         git_sha256(PATCHED_LIB_RS.as_bytes()),
     )
-}
-
-/// Local Git-SHA-256 helper (sha2 + the "blob N\0" framing). We have
-/// one in `common` but keep an inline copy to keep the test self-
-/// readable.
-fn git_sha256(content: &[u8]) -> String {
-    let header = format!("blob {}\0", content.len());
-    let mut hasher = Sha256::new();
-    hasher.update(header.as_bytes());
-    hasher.update(content);
-    hex::encode(hasher.finalize())
 }
 
 /// Stage `.socket/manifest.json` + `.socket/blobs/<after_hash>` so
