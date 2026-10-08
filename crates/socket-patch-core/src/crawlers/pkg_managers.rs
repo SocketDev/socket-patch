@@ -183,7 +183,7 @@ impl YarnEnv {
         Self {
             node_linker: set("YARN_NODE_LINKER"),
             rc_filename: set("YARN_RC_FILENAME").unwrap_or_else(|| ".yarnrc.yml".to_string()),
-            home: Some(crate::utils::fs::home_dir()),
+            home: crate::utils::fs::home_dir(),
         }
     }
 
@@ -307,15 +307,151 @@ pub fn live_pnp_marker_with(
 /// (`crate::vendor::npm_flavor::detect_npm_lock_flavor`) so both
 /// detection sites agree on what counts as a pnpm-PnP tree.
 pub(crate) fn pnpm_pnp_layout(project_root: &Path) -> bool {
-    let node_modules = project_root.join("node_modules");
-    (node_modules.join(".modules.yaml").is_file() || node_modules.join(".pnpm").is_dir())
-        && project_root.join("pnpm-lock.yaml").is_file()
-        && !project_root.join("yarn.lock").is_file()
+    pnpm_pnp_layout_in(&crate::vendor::lock_inventory::ProjectView::Disk(
+        project_root,
+    ))
+}
+
+/// [`pnpm_pnp_layout`] over a [`crate::vendor::lock_inventory::ProjectView`].
+pub(crate) fn pnpm_pnp_layout_in(view: &crate::vendor::lock_inventory::ProjectView<'_>) -> bool {
+    (view.is_file("node_modules/.modules.yaml") || view.is_dir("node_modules/.pnpm"))
+        && view.is_file("pnpm-lock.yaml")
+        && !view.is_file("yarn.lock")
+}
+
+/// The yarn Plug'n'Play loader of a project: the text of each loader file
+/// the install wrote (the [`PNP_MARKERS`] plus berry's `.pnp.data.json`,
+/// written when `pnpEnableInlining: false`).
+///
+/// [`PNP_MARKERS`]: crate::constants::npm_family::PNP_MARKERS
+///
+/// The npm crawler cannot look inside a PnP install (the packages are
+/// zips in a cache), so "the crawler found no copy" says nothing there.
+/// What the loader CAN say is which locator each package resolved to when
+/// it was written — the evidence `vex` needs before it trusts a lock's
+/// hosted pin over a PnP install (#519).
+#[derive(Debug, Clone, Default)]
+pub struct YarnPnpLoader {
+    texts: Vec<String>,
+}
+
+impl YarnPnpLoader {
+    /// The loader at `project_root`, or `None` unless the project is a
+    /// yarn PnP layout ([`NpmPkgManager::YarnBerryPnP`] — pnpm's own
+    /// `node-linker=pnp` tree is not). A loader file that cannot be read
+    /// contributes nothing, so it never vouches for a patch.
+    pub fn detect(project_root: &Path) -> Option<Self> {
+        if detect_npm_pkg_manager(project_root) != NpmPkgManager::YarnBerryPnP {
+            return None;
+        }
+        let texts = crate::constants::npm_family::PNP_MARKERS
+            .iter()
+            .chain(std::iter::once(&".pnp.data.json"))
+            .filter_map(|name| {
+                crate::utils::fs::read_regular_to_string_sync(&project_root.join(name)).ok()
+            })
+            .collect();
+        Some(YarnPnpLoader { texts })
+    }
+
+    /// Whether the loader resolves a package through Socket patch `uuid`,
+    /// fetched from the hosted `urls`.
+    ///
+    /// * yarn berry keeps each locator's reference verbatim in the package
+    ///   registry, so a package installed from the hosted tarball names its
+    ///   url (`<origin>/…/<uuid>/<name>-<version>.tgz`, or the legacy
+    ///   percent-encoded `npm:<v>::__archiveUrl=` binding): the uuid, which
+    ///   encoding never changes (hex and `-`), is in the text.
+    /// * yarn classic names only the cache folder,
+    ///   `npm-<name>-<version>-<hash>`, whose hash is the `#<sha1>`
+    ///   fragment of the lock's `resolved` url — the patched tarball's, not
+    ///   the registry's.
+    ///
+    /// A loader written before the lock was rewired (a pulled hosted lock
+    /// over an old install) names the registry copy instead, so this is
+    /// `false` and the copy the loader runs is not the patched one.
+    pub fn resolves_patch<'a>(&self, uuid: &str, urls: impl IntoIterator<Item = &'a str>) -> bool {
+        let mut marks = vec![uuid.to_string()];
+        marks.extend(urls.into_iter().filter_map(|url| {
+            let (_, hash) = url.rsplit_once('#')?;
+            (hash.len() >= 40 && hash.bytes().all(|b| b.is_ascii_hexdigit()))
+                .then(|| format!("-{hash}"))
+        }));
+        !uuid.is_empty()
+            && self
+                .texts
+                .iter()
+                .any(|text| marks.iter().any(|mark| text.contains(mark.as_str())))
+    }
 }
 
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    /// A yarn PnP loader vouches for a patch only when it names it: berry
+    /// by the hosted url's uuid, classic by the resolved url's hash. A
+    /// stale loader (the registry locator), an unreadable or empty one, or
+    /// a non-PnP project never does (#519).
+    #[test]
+    fn yarn_pnp_loader_resolves_patch_only_when_it_names_it() {
+        const UUID: &str = "4d5e6f70-8192-4a3b-9c4d-5e6f70819243";
+        const HASH: &str = "88e54a85256e9d1b6ff92cf972a12f91ba21d4da";
+        let url = format!("https://patch.socket.dev/patch/npm/t/{UUID}/left-pad-1.3.0.tgz");
+        let classic_url = format!("{url}#{HASH}");
+
+        let d = tempfile::tempdir().unwrap();
+        assert!(YarnPnpLoader::detect(d.path()).is_none(), "not PnP");
+
+        // berry, fresh install: the registry names the hosted locator.
+        std::fs::write(
+            d.path().join(".pnp.cjs"),
+            format!("[\"left-pad\", [[\"{url}\", {{packageLocation: \"./.yarn/cache/x.zip\"}}]]]"),
+        )
+        .unwrap();
+        let loader = YarnPnpLoader::detect(d.path()).expect("berry PnP");
+        assert!(loader.resolves_patch(UUID, [url.as_str()]));
+        assert!(!loader.resolves_patch("5e6f7081-92a3-4b4c-8d5e-6f7081920354", []));
+        assert!(!loader.resolves_patch("", []));
+
+        // berry, stale install: the registry locator only.
+        std::fs::write(
+            d.path().join(".pnp.cjs"),
+            "[\"left-pad\", [[\"npm:1.3.0\", {packageLocation: \"./.yarn/cache/x.zip\"}]]]",
+        )
+        .unwrap();
+        let loader = YarnPnpLoader::detect(d.path()).unwrap();
+        assert!(!loader.resolves_patch(UUID, [url.as_str()]));
+
+        // berry with pnpEnableInlining: false — the data file names it.
+        std::fs::write(
+            d.path().join(".pnp.data.json"),
+            format!("{{\"r\":\"{url}\"}}"),
+        )
+        .unwrap();
+        assert!(YarnPnpLoader::detect(d.path())
+            .unwrap()
+            .resolves_patch(UUID, []));
+
+        // classic: the cache folder carries the resolved url's hash.
+        let c = tempfile::tempdir().unwrap();
+        std::fs::write(
+            c.path().join(".pnp.js"),
+            format!("packageLocation: \"/c/v6/npm-left-pad-1.3.0-{HASH}-integrity/\""),
+        )
+        .unwrap();
+        let loader = YarnPnpLoader::detect(c.path()).expect("classic PnP");
+        assert!(loader.resolves_patch(UUID, [classic_url.as_str()]));
+        assert!(
+            !loader.resolves_patch(UUID, [url.as_str()]),
+            "no hash to match"
+        );
+        let registry = "https://registry.yarnpkg.com/left-pad/-/left-pad-1.3.0.tgz#5b8a3a7765dfe001261dde915589e782f8c94d1e";
+        assert!(
+            !loader.resolves_patch(UUID, [registry]),
+            "stale: another hash"
+        );
+    }
 
     /// #975: yarn 4 keeps a Yarn 2 `.pnp.js` after a switch to the
     /// node-modules or pnpm linker; yarn ignores it, so must detection.

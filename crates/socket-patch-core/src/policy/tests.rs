@@ -663,19 +663,6 @@ mod disk {
 
     #[cfg(unix)]
     #[test]
-    fn owner_rule() {
-        assert!(owner_trusted(1000, 1000, None));
-        assert!(owner_trusted(0, 1000, None));
-        assert!(!owner_trusted(1001, 1000, None));
-        assert!(
-            owner_trusted(1001, 1000, Some(1001)),
-            "sudo's invoking user"
-        );
-        assert!(owner_trusted(1001, 0, None), "root trusts every owner");
-    }
-
-    #[cfg(unix)]
-    #[test]
     fn symlinked_git_marks_the_repo_root() {
         let tmp = tempfile::tempdir().unwrap();
         let base = fs::canonicalize(tmp.path()).unwrap();

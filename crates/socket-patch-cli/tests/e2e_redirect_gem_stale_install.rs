@@ -388,6 +388,56 @@ async fn gem_hosted_redirect_fresh_checkout_stays_quiet() {
     );
 }
 
+/// #1055: the installed copy is a version the project's lock doesn't
+/// resolve (another project put it in the gem home; here the lock resolves
+/// 2.0.0 under `~> 2.0` while only 1.0.0 is installed). Hosted mode must
+/// skip it with `redirect_gem_version_not_locked` and leave the Gemfile and
+/// lock byte-identical, never rewrite the declaration to the older version.
+#[tokio::test(flavor = "multi_thread")]
+async fn gem_hosted_scan_never_pins_a_version_the_lock_does_not_resolve() {
+    let server = MockServer::start().await;
+    mount_api(&server, None).await;
+    let tmp = tempfile::tempdir().unwrap();
+    let proj = tmp.path().join("proj");
+    std::fs::create_dir_all(&proj).unwrap();
+    let gemfile = format!("source \"https://rubygems.org\"\ngem \"{DEP}\", \"~> 2.0\"\n");
+    let lock = format!(
+        "GEM\n  remote: https://rubygems.org/\n  specs:\n    {DEP} (2.0.0)\n\n\
+         PLATFORMS\n  ruby\n\nDEPENDENCIES\n  {DEP} (~> 2.0)\n\n\
+         BUNDLED WITH\n   2.6.9\n"
+    );
+    std::fs::write(proj.join("Gemfile"), &gemfile).unwrap();
+    std::fs::write(proj.join("Gemfile.lock"), &lock).unwrap();
+    materialize_installed_gem(&proj, "3.3.0", UPSTREAM_LIB);
+
+    let (_code, stdout, stderr) = hosted_scan_json(&proj, &server.uri());
+    let env = common::parse_json_envelope(&stdout);
+    assert_eq!(
+        env["redirect"]["redirected"], 0,
+        "nothing may be redirected: {env}\nstderr:\n{stderr}"
+    );
+    let codes: Vec<&str> = env["redirect"]["warnings"]
+        .as_array()
+        .expect("redirect.warnings")
+        .iter()
+        .filter_map(|w| w["code"].as_str())
+        .collect();
+    assert!(
+        codes.contains(&"redirect_gem_version_not_locked"),
+        "the unlocked version must be reported: {env}"
+    );
+    assert_eq!(
+        std::fs::read_to_string(proj.join("Gemfile")).unwrap(),
+        gemfile,
+        "the user's `~> 2.0` constraint must survive"
+    );
+    assert_eq!(
+        std::fs::read_to_string(proj.join("Gemfile.lock")).unwrap(),
+        lock,
+        "the lock must stay byte-identical"
+    );
+}
+
 /// TWO gem homes (two ruby versions under vendor/bundle) both stale: one
 /// warning per home, each naming its own home's paths — multiplicity is
 /// per materialization, not per purl.
