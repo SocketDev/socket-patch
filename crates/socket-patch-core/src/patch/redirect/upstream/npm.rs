@@ -1127,15 +1127,21 @@ fn bun_lookup_registry(
             }
             // A scope entry with no URL (a token only) takes the configured
             // default registry, never the environment's, with its own
-            // credentials.
+            // credentials. With no default configured that is npmjs, which
+            // still gets the scope's token: a private npmjs scope 401s
+            // without it.
             if entry.is_table_like() && entry.get("url").is_none() {
-                return configured().map(|r| match toml_auth(entry) {
-                    Some(own) => ProjectRegistry {
-                        authorization: Some(own),
+                let own = toml_auth(entry);
+                return match configured() {
+                    Some(r) => Some(ProjectRegistry {
+                        authorization: own.or(r.authorization),
                         ..r
-                    },
-                    None => r,
-                });
+                    }),
+                    None => own.map(|own| ProjectRegistry {
+                        base: format!("{}/", crate::vendor::registry_fetch::DEFAULT_NPM_REGISTRY),
+                        authorization: Some(own),
+                    }),
+                };
             }
         }
     }
@@ -1736,6 +1742,19 @@ mod tests {
             auth(None, Some(bunfig), Some("https://e.example/"), "@own/w"),
             some("https://b.example/", Some("Bearer own"))
         );
+        // ...and with no default registry configured, npmjs with that
+        // token (a private npmjs scope), still not the environment's.
+        let npmjs_scope = "[install.scopes]\nown = { token = \"$CORP_TOKEN\" }\n\
+                           none = { username = \"u\" }\n";
+        for env in [None, Some("https://e.example/")] {
+            assert_eq!(
+                auth(None, Some(npmjs_scope), env, "@own/w"),
+                some("https://registry.npmjs.org/", Some("Bearer from-env")),
+                "{env:?}"
+            );
+        }
+        // A token-less scope entry with nothing configured stays npmjs.
+        assert_eq!(auth(None, Some(npmjs_scope), None, "@none/w"), None);
         // The default registry's table token; the environment's registry
         // carries none of bunfig's.
         assert_eq!(
