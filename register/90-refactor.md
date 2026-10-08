@@ -30,7 +30,7 @@ Re-ranked 2026-10-08T10:00Z at `b96a785` against the 33 open PRs' 515 files. E35
 
 **Notes:**
 - E35's crawler oracles (composer/go/nuget/python/maven) can't become `golden.rs` digests: their randomized trees use symlinks (no-ops on Windows), permission modes (ignored as root and on Windows) and case-colliding names (folded on macOS). The outputs therefore differ by OS and by uid, and a golden blessed in the root sandbox would fail on non-root Linux CI. Keep the oracles until a crawler can be checked without one.
-- Test-helper migrations (#824): `common/mod.rs` is `#![allow(dead_code)]`, so declaring it costs nothing. Directory binaries (`apply/`, `cli/`, …) import through `crate::common`. After deleting copies, build with `--no-run --message-format=short` and prune the unused `sha2`/`PathBuf` imports it lists.
+- Test-helper migrations (#824): directory binaries import via `crate::common`; prune the unused imports `--no-run --message-format=short` lists. `spawn_env_hygiene` scans test text, string literals included: never spell a bare binary spawn in a new test file, and run that suite before pushing.
 - zizmor (`Audit GitHub Actions`) fails new PR heads on main's `ci.yml:1400` setup-php `# v2` label until #1118 merges; port its one-line fix.
 - Lead for `audit-ecosystems` (not filed): hosted `redirect/requirements.rs` keeps its own pip lexer beside `utils::requirements` (quote-aware comment finder vs pip's `COMMENT_RE`).
 - Source-scan guards: make new ones one-sided (fail on new files only), so a PR migrating a pending file can't turn `main` red.
