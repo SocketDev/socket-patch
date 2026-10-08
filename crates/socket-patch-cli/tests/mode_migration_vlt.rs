@@ -723,7 +723,7 @@ async fn vlt_pinned_matrix_migration_pm_switch_vlt_to_npm() {
     let files = package_files(&fx.proj);
     let out = rollback_all(&fx, &fx.proj, &[]);
     assert_eq!(
-        (out.code, out.json()["error"].as_str()),
+        (out.code, out.json()["error"]["message"].as_str()),
         (1, Some("Manifest not found")),
         "no lock, no pin, nothing to roll back: {out}"
     );

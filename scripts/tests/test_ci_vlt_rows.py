@@ -127,11 +127,12 @@ def matrix_include(job_lines):
 
 
 def job_rows(jobs_by_id, job):
-    """`matrix_include` of a job plus its `<job>-macos` sibling, which holds
-    the macOS rows that run off the pull_request path."""
+    """All rows of a job family, including its independent OS siblings."""
     rows = matrix_include(jobs_by_id[job])
-    if f"{job}-macos" in jobs_by_id:
-        rows += matrix_include(jobs_by_id[f"{job}-macos"])
+    for os_name in ("windows", "macos"):
+        sibling = f"{job}-{os_name}"
+        if sibling in jobs_by_id:
+            rows += matrix_include(jobs_by_id[sibling])
     return rows
 
 

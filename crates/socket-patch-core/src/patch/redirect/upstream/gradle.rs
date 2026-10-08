@@ -150,7 +150,9 @@ pub(crate) async fn restore(
             }
             let created = apply_line_created(&text, t.dsl, &t.prefix());
             match without_apply_line(&text, t.dsl, &t.prefix()) {
-                Some(next) if created && next.trim_start_matches('\u{feff}').trim().is_empty() => {
+                Some(next)
+                    if created && crate::formats::text::strip_bom(&next).trim().is_empty() =>
+                {
                     staged.insert(t.rel.clone(), None);
                 }
                 Some(next) => {

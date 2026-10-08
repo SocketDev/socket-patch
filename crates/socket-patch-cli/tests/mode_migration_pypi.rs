@@ -479,6 +479,16 @@ fn stage_poetry(root: &Path) -> &'static [&'static str] {
     &["poetry.lock", "pyproject.toml"]
 }
 
+/// [`stage_poetry`] with CRLF line endings.
+fn stage_poetry_crlf(root: &Path) -> &'static [&'static str] {
+    let files = stage_poetry(root);
+    for f in files {
+        let text = std::fs::read_to_string(root.join(f)).unwrap();
+        std::fs::write(root.join(f), text.replace('\n', "\r\n")).unwrap();
+    }
+    files
+}
+
 #[tokio::test]
 async fn poetry_vendored_to_hosted() {
     let (_tmp, root) = project();
@@ -519,6 +529,93 @@ async fn pipenv_vendored_to_hosted() {
     let (_tmp, root) = project();
     let files = stage_pipenv(&root);
     assert_vendored_to_hosted(&root, files).await;
+}
+
+/// A vendored Pipenv project beside a requirements `-r` include the hosted
+/// rewriter does not reach (the #567 shape). The attribution gate would
+/// veto the Pipfile.lock pin as contested, but a wet takeover has already
+/// reverted the vendored wiring by then: dropping it would strand the
+/// package on the unpatched registry release (exit 1) while the dry run
+/// reported success. A takeover keeps the rewriters' verdict, so the dry
+/// run and the wet run agree and the package is never left unpatched.
+#[tokio::test]
+async fn pipenv_takeover_beside_an_unreached_include_is_never_stranded() {
+    let (_tmp, root) = project();
+    let files = stage_pipenv(&root);
+    vendor_project(&root, files);
+    std::fs::write(root.join("requirements.txt"), "-r req/base.txt\n").unwrap();
+    std::fs::create_dir_all(root.join("req")).unwrap();
+    std::fs::write(root.join("req/base.txt"), "six==1.16.0\n").unwrap();
+    let vendored_lock = std::fs::read_to_string(root.join("Pipfile.lock")).unwrap();
+    let server = MockServer::start().await;
+    let hosted_url = mount_hosted_api(&server, true).await;
+    let uri = server.uri();
+
+    let mut dry = hosted_scan_args(&uri);
+    dry.push("--dry-run");
+    let (dry_code, dry_env) = run_cli(&root, &dry, &[]);
+    assert_eq!(
+        std::fs::read_to_string(root.join("Pipfile.lock")).unwrap(),
+        vendored_lock,
+        "a dry run writes nothing"
+    );
+
+    let (code, env) = hosted_scan(&root, &server);
+    assert_eq!(code, 0, "the takeover is not stranded: {env:#}");
+    assert!(
+        !env.to_string().contains("redirect_takeover_unpatched"),
+        "{env:#}"
+    );
+    assert_eq!(env["redirect"]["redirected"], 1, "{env:#}");
+    let lock = std::fs::read_to_string(root.join("Pipfile.lock")).unwrap();
+    assert!(
+        lock.contains(&hosted_url),
+        "six is pinned to the patch:\n{lock}"
+    );
+    assert!(!lock.contains(".socket/vendor/"), "{lock}");
+    assert_eq!(
+        (dry_code, &dry_env["redirect"]["redirected"]),
+        (code, &env["redirect"]["redirected"]),
+        "the dry run predicts the wet run: {dry_env:#}"
+    );
+}
+
+/// #567 without a takeover: the Pipfile.lock pin the hosted rewriter would
+/// land is contested by an `-r` include it does not reach, so the patch is
+/// left out — reported in `redirect.skipped[]` as `redirect_unattributable`
+/// with discovery's finding — nothing is written and the exit code is 0.
+#[tokio::test]
+async fn pipenv_redirect_beside_an_unreached_include_is_skipped_unattributable() {
+    let (_tmp, root) = project();
+    stage_pipenv(&root);
+    std::fs::write(root.join("requirements.txt"), "-r req/base.txt\n").unwrap();
+    std::fs::create_dir_all(root.join("req")).unwrap();
+    std::fs::write(root.join("req/base.txt"), "six==1.16.0\n").unwrap();
+    let pristine = std::fs::read_to_string(root.join("Pipfile.lock")).unwrap();
+    let server = MockServer::start().await;
+    mount_hosted_api(&server, true).await;
+
+    let (code, env) = hosted_scan(&root, &server);
+    assert_eq!(
+        code, 0,
+        "an unattributable pin is a skip, not a failure: {env:#}"
+    );
+    assert_eq!(env["redirect"]["redirected"], 0, "{env:#}");
+    let skipped = env["redirect"]["skipped"].as_array().expect("skipped[]");
+    assert_eq!(skipped.len(), 1, "{env:#}");
+    assert_eq!(skipped[0]["purl"], PURL, "{env:#}");
+    assert_eq!(skipped[0]["reason"], "redirect_unattributable", "{env:#}");
+    assert!(
+        skipped[0]["detail"]
+            .as_str()
+            .is_some_and(|d| d.contains("req/base.txt")),
+        "the detail names the contesting file: {env:#}"
+    );
+    assert_eq!(
+        std::fs::read_to_string(root.join("Pipfile.lock")).unwrap(),
+        pristine,
+        "nothing is written for it"
+    );
 }
 
 /// A superseding patch for the same release (a fixed patch, or one
@@ -609,6 +706,43 @@ async fn pipenv_revendors_to_a_superseding_patch() {
     }
 }
 
+/// #1136: a Poetry project whose venv was installed from patch A's
+/// vendored wheel (`poetry install` after the first vendor) still moves to
+/// the superseding patch B: poetry.lock is rewired to B and A's artifact is
+/// swept, instead of `pypi_poetry_source_already_exists` (exit 1).
+#[tokio::test]
+async fn poetry_revendors_to_a_superseding_patch_over_a_patched_venv() {
+    let (_tmp, root) = project();
+    let files = stage_poetry(&root);
+    let original = std::fs::read_to_string(root.join("poetry.lock")).unwrap();
+    vendor_project(&root, files);
+
+    let venv = root.join("../patched-venv");
+    venv_installed_from_patch_a(&venv);
+    let extra = [("VIRTUAL_ENV", venv.to_str().unwrap())];
+    stage_manifest_with(&root, UUID_B, PATCHED_B);
+    let (code, env) = run_cli(&root, &["vendor"], &extra);
+    assert_eq!(code, 0, "re-vendor to B: {env:#}");
+    assert!(
+        env.to_string().contains("vendor_stale_artifact_removed"),
+        "A's artifact is swept: {env:#}"
+    );
+    let lock = std::fs::read_to_string(root.join("poetry.lock")).unwrap();
+    assert!(
+        lock.contains(&format!(".socket/vendor/pypi/{UUID_B}/")) && !lock.contains(UUID),
+        "poetry.lock is rewired to B:\n{lock}"
+    );
+    assert!(!root.join(format!(".socket/vendor/pypi/{UUID}")).exists());
+
+    let (code, env) = run_cli(&root, &["vendor", "--revert"], &extra);
+    assert_eq!(code, 0, "revert B: {env:#}");
+    assert_eq!(
+        std::fs::read_to_string(root.join("poetry.lock")).unwrap(),
+        original,
+        "revert restores the registry lock"
+    );
+}
+
 const UV_LOCK: &str = r#"version = 1
 revision = 2
 requires-python = ">=3.9"
@@ -695,22 +829,25 @@ fn stage_script_lock(root: &Path) -> &'static [&'static str] {
     &["job.py", "job.py.lock"]
 }
 
-/// #742 / #650: a vendored uv project, uv script lock and Hatch project pick
-/// up a superseding patch. The manifest moves `six` from patch A to patch B
+/// #742 / #650 / #1136: a vendored uv project, uv script lock, Hatch
+/// project and Poetry project (LF and CRLF) pick up a superseding patch. The manifest moves `six` from patch A to patch B
 /// (different patched bytes); the next `vendor` must wire B's wheel, remove
 /// A's uuid dir (`vendor_stale_artifact_removed`) and exit 0. Before the fix
 /// it failed `pypi_uv_source_already_exists`,
-/// `pypi_lock_source_already_exists` or `pypi_hatch_unsupported` (exit 1)
+/// `pypi_lock_source_already_exists`, `pypi_hatch_unsupported` or
+/// `pypi_poetry_source_already_exists` (exit 1)
 /// and the project kept installing patch A. `vendor --revert` afterwards
 /// restores the user's original files byte for byte.
 #[tokio::test]
 async fn pyproject_flavors_vendored_revendor_superseding_patch() {
     const UUID_B: &str = "5c3e1a2b-7d4f-4e6a-9b8c-1d2e3f4a5b6d";
     const PATCHED_B: &[u8] = b"# six\nVERSION = '1.16.0'\nSOCKET_PATCHED = 2\n";
-    let stages: [(&str, StageFn); 3] = [
+    let stages: [(&str, StageFn); 5] = [
         ("uv", stage_uv),
         ("script lock", stage_script_lock),
         ("hatch", stage_hatch),
+        ("poetry", stage_poetry),
+        ("poetry crlf", stage_poetry_crlf),
     ];
     for (flavor, stage) in stages {
         let (_tmp, root) = project();

@@ -5,8 +5,16 @@
 //! (status 86, no destructors, no further writes) at the `n`-th time
 //! (default: the first) it reaches [`hit`] with that name — the observable
 //! effect of a crash at that point: whatever was written before is on disk,
-//! nothing after it is. Release builds compile [`hit`] to nothing, so no
-//! environment variable can make a shipped binary stop half-way; the same
+//! nothing after it is.
+//!
+//! `<name>[@<n>]~pause` parks the process there instead, forever, so a test
+//! can signal it at a known point (the interrupt tests do this with the
+//! apply lock held). Before parking it prints a `failpoint … paused` line
+//! to stderr and, when `SOCKET_PATCH_FAILPOINT_READY=<file>` is set,
+//! creates that file as the test's ready marker.
+//!
+//! Release builds compile [`hit`] to nothing, so no environment variable
+//! can make a shipped binary stop half-way; the same
 //! goes for [`switched_off`]. The `failpoints` feature compiles them into an
 //! optimized build as well; only the CLI's dev-dependencies enable it, so
 //! it reaches the optimized test binaries (`cargo test --release`) and
@@ -32,10 +40,25 @@ pub fn hit(name: &str) {
             *count
         };
         for point in spec.split(',') {
-            let (point, at) = match point.trim().split_once('@') {
-                Some((p, n)) => (p, n.parse::<usize>().unwrap_or(1)),
-                None => (point.trim(), 1),
+            let point = point.trim();
+            let (point, pause) = match point.strip_suffix("~pause") {
+                Some(point) => (point, true),
+                None => (point, false),
             };
+            let (point, at) = match point.split_once('@') {
+                Some((p, n)) => (p, n.parse::<usize>().unwrap_or(1)),
+                None => (point, 1),
+            };
+            if point == name && at == count && pause {
+                drop(hits);
+                eprintln!("socket-patch: failpoint `{name}` #{count} paused");
+                if let Some(ready) = std::env::var_os("SOCKET_PATCH_FAILPOINT_READY") {
+                    let _ = std::fs::write(ready, b"");
+                }
+                loop {
+                    std::thread::sleep(std::time::Duration::from_secs(3600));
+                }
+            }
             if point == name && at == count {
                 eprintln!("socket-patch: failpoint `{name}` #{count} hit; exiting");
                 std::process::exit(86);

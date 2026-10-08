@@ -465,10 +465,10 @@ enum WiringPlan {
     /// The ledger entry of an OLDER patch uuid whose Pipfile.lock wiring the
     /// guards admitted for an in-place re-wire (#769), if any.
     Pipenv(Box<PipenvProject>, Option<Box<VendorEntry>>),
-    /// The uv, script-lock or Hatch wiring routes this package through an
-    /// OLDER patch uuid's vendored wheel that the ledger still records
-    /// (#742, #650): replay that entry's revert, then wire this uuid fresh
-    /// ([`unwire_superseded`]).
+    /// The uv, script-lock, Hatch, Poetry or PDM wiring routes this package
+    /// through an OLDER patch uuid's vendored wheel that the ledger still
+    /// records (#742, #650, #1136): replay that entry's revert, then wire
+    /// this uuid fresh ([`unwire_superseded`]).
     Supersede(Box<Superseded>),
     /// The lock already routes this package through THIS patch uuid's
     /// vendored wheel: no wiring — verify (or rebuild) the artifact only.
@@ -947,7 +947,10 @@ async fn pypi_prelude<'p>(
                     warnings.extend(project.warnings.iter().cloned());
                     WiringPlan::Poetry(Box::new(project))
                 }
-                Err((code, detail)) => return Err(refused(code, detail)),
+                Err(refusal) => {
+                    supersede_or_refuse(project_root, flavor, &canon_name, version, record, refusal)
+                        .await?
+                }
             }
         }
         PypiFlavor::Pdm => {
@@ -965,7 +968,10 @@ async fn pypi_prelude<'p>(
                     warnings.extend(project.warnings.iter().cloned());
                     WiringPlan::Pdm(Box::new(project))
                 }
-                Err((code, detail)) => return Err(refused(code, detail)),
+                Err(refusal) => {
+                    supersede_or_refuse(project_root, flavor, &canon_name, version, record, refusal)
+                        .await?
+                }
             }
         }
         PypiFlavor::Pipenv => {
@@ -1577,16 +1583,18 @@ pub async fn vendor_pypi_with_pipenv_version<'a>(
 /// patch uuid of the release (alongside user sources the same codes cover):
 /// uv's `[tool.uv.sources]` path, a script lock / pylock `path` source, and
 /// Hatch's `{root:uri}` direct reference.
-const SUPERSEDABLE_REFUSALS: [&str; 3] = [
+const SUPERSEDABLE_REFUSALS: [&str; 5] = [
     "pypi_uv_source_already_exists",
     "pypi_lock_source_already_exists",
     "pypi_hatch_unsupported",
+    "pypi_poetry_source_already_exists",
+    "pypi_pdm_source_already_exists",
 ];
 
 /// A pyproject-family flavor guard refused the wiring it found. When that
 /// wiring is socket-patch's own, for an OLDER patch uuid of this release
 /// that the ledger still records, it is a superseding patch to re-vendor
-/// (#742, #650) — the same promise the requirements flavor keeps (#765).
+/// (#742, #650, #1136) — the same promise the requirements flavor keeps (#765).
 /// Otherwise the refusal stands.
 async fn supersede_or_refuse(
     project_root: &Path,
@@ -1673,6 +1681,8 @@ fn superseded_files(prev: &VendorEntry, flavor: PypiFlavor) -> Option<Vec<String
     let fixed: &[&str] = match flavor {
         PypiFlavor::UvProject => &["pyproject.toml", "uv.lock"],
         PypiFlavor::Hatch => &["pyproject.toml", "hatch.toml"],
+        PypiFlavor::Poetry => &["poetry.lock"],
+        PypiFlavor::Pdm => &["pdm.lock"],
         _ => &[],
     };
     let mut files: Vec<String> = fixed.iter().map(|f| f.to_string()).collect();
@@ -1878,6 +1888,26 @@ async fn fresh_pyproject_plan(
             }
             Ok((WiringPlan::Hatch(project), Vec::new()))
         }
+        PypiFlavor::Poetry => {
+            let project = super::pypi_poetry::load_poetry_project(project_root).await?;
+            match super::pypi_poetry::check_target_guards(&project, canon_name, version, uuid)? {
+                PoetryTarget::Fresh => {
+                    let warnings = project.warnings.clone();
+                    Ok((WiringPlan::Poetry(Box::new(project)), warnings))
+                }
+                PoetryTarget::InSync => not_fresh("pypi_poetry_source_already_exists"),
+            }
+        }
+        PypiFlavor::Pdm => {
+            let project = super::pypi_pdm::load_pdm_project(project_root).await?;
+            match super::pypi_pdm::check_target_guards(&project, canon_name, version, uuid)? {
+                PdmTarget::Fresh => {
+                    let warnings = project.warnings.clone();
+                    Ok((WiringPlan::Pdm(Box::new(project)), warnings))
+                }
+                PdmTarget::InSync => not_fresh("pypi_pdm_source_already_exists"),
+            }
+        }
         other => Err((
             "pypi_vendor_flavor_mismatch",
             format!("{} wiring cannot supersede a patch", other.as_str()),
@@ -1938,7 +1968,9 @@ async fn guard_unwired_pypi_revert(
 /// the planner may have written a pin into, every Python lock the root
 /// directory LISTS (`uv.lock`, `pylock*.toml`, `*.py.lock` with its paired
 /// script), and every other root-level `*.txt` (a `uv export -o` target, or
-/// a `requirements-dev.txt` the user moved a vendor line into). `skip`
+/// a `requirements-dev.txt` the user moved a vendor line into), plus every
+/// `*.txt` in a project subdirectory ([`subdir_txt_names`]: a
+/// `requirements/dev.txt` the root never includes, #1167). `skip`
 /// names files left out of the probe (a dry run's not-yet-restored wiring).
 /// Every step fails closed: a root that cannot be listed, an include tree
 /// that cannot be read, or a listed file (a symlink included — lstat only,
@@ -2018,6 +2050,11 @@ async fn pypi_reference_clause(project_root: &Path, uuid: &str, skip: &[&str]) -
             names.push(name);
         }
     }
+    for name in subdir_txt_names(project_root) {
+        if !names.contains(&name) {
+            names.push(name);
+        }
+    }
     for name in &names {
         if skip.contains(&name.as_str()) {
             continue;
@@ -2042,6 +2079,85 @@ async fn pypi_reference_clause(project_root: &Path, uuid: &str, skip: &[&str]) -
         }
     }
     None
+}
+
+/// Directory names [`subdir_txt_names`] never descends into: VCS metadata,
+/// socket-patch's own state, and tool or cache trees whose `*.txt` files
+/// are package payloads, not requirements files anyone installs from.
+const PROBE_SKIPPED_DIRS: &[&str] = &[
+    ".git",
+    ".hg",
+    ".svn",
+    ".socket",
+    ".tox",
+    ".nox",
+    ".venv",
+    ".mypy_cache",
+    ".pytest_cache",
+    ".ruff_cache",
+    "__pycache__",
+    "node_modules",
+    "site-packages",
+];
+
+/// Every `*.txt` below the project root's subdirectories, as `/`-joined
+/// root-relative names in a stable order (#1167): `pip install -r
+/// requirements/dev.txt` installs from a file the root `-r` tree never
+/// reaches, and `pip freeze > requirements/lock.txt` or `uv export -o
+/// requirements/lock.txt` writes one. The walk skips [`PROBE_SKIPPED_DIRS`]
+/// and any virtualenv or conda env (a dir holding `pyvenv.cfg` or
+/// `conda-meta`), and does not follow symlinked directories, so it always
+/// terminates inside the project. A subdirectory that cannot be listed is
+/// skipped rather than failing closed: pip running as the same user could
+/// not reach a requirements file in it either, and an unrelated unreadable
+/// dir (a container volume) must not pin every vendored wheel forever. A
+/// listed file that then cannot be read still fails closed in the caller.
+fn subdir_txt_names(project_root: &Path) -> Vec<String> {
+    let mut out: Vec<String> = Vec::new();
+    let mut stack: Vec<String> = vec![String::new()];
+    while let Some(rel) = stack.pop() {
+        let dir = if rel.is_empty() {
+            project_root.to_path_buf()
+        } else {
+            project_root.join(&rel)
+        };
+        let Ok(listing) = std::fs::read_dir(&dir) else {
+            continue;
+        };
+        let mut entries: Vec<(String, std::fs::FileType)> = listing
+            .filter_map(Result::ok)
+            .filter_map(|entry| {
+                let name = entry.file_name().to_str()?.to_string();
+                Some((name, entry.file_type().ok()?))
+            })
+            .collect();
+        entries.sort_by(|a, b| a.0.cmp(&b.0));
+        let mut subdirs: Vec<String> = Vec::new();
+        for (name, ft) in entries {
+            let child = if rel.is_empty() {
+                name.clone()
+            } else {
+                format!("{rel}/{name}")
+            };
+            if ft.is_dir() {
+                if PROBE_SKIPPED_DIRS.contains(&name.as_str()) {
+                    continue;
+                }
+                let child_dir = project_root.join(&child);
+                if child_dir.join("pyvenv.cfg").exists() || child_dir.join("conda-meta").exists() {
+                    continue;
+                }
+                subdirs.push(child);
+            } else if !rel.is_empty() && name.ends_with(".txt") && (ft.is_file() || ft.is_symlink())
+            {
+                // Root-level files are the caller's own listing.
+                out.push(child);
+            }
+        }
+        // Reverse so the stack pops subdirectories in name order.
+        stack.extend(subdirs.into_iter().rev());
+    }
+    out
 }
 
 /// A project file's bytes as text for [`pypi_reference_clause`], in any
@@ -2237,10 +2353,11 @@ pub async fn revert_pypi_opts(
     // RESIDUAL-REFERENCE GUARD: the flavor restored only the files it
     // recorded. Any other project file that still names the uuid dir — a
     // `uv export`-ed requirements.txt or pylock.toml, a vendor line the user
-    // moved into a `-r` include or a sibling requirements file — would
-    // install from a deleted wheel. Keep the artifact and the ledger entry
-    // until nothing references it (an unwired entry already passed the same
-    // probe in `guard_unwired_pypi_revert`).
+    // moved into a `-r` include, a sibling or subdirectory requirements
+    // file (`requirements/dev.txt`, #1167) — would install from a deleted
+    // wheel. Keep the artifact and the ledger entry until nothing
+    // references it (an unwired entry already passed the same probe in
+    // `guard_unwired_pypi_revert`).
     if !entry.wiring.is_empty() {
         if let Some(clause) = pypi_reference_clause(project_root, &entry.uuid, &[]).await {
             outcome
@@ -5864,6 +5981,144 @@ wheels = [
         );
     }
 
+    /// #1167: a requirements file in a subdirectory that the root
+    /// `requirements.txt` does not `-r` include (`pip freeze >
+    /// requirements/lock.txt`, a vendor line moved into
+    /// `requirements/dev.txt`) still installs from the wheel. The dry run
+    /// previews the keep and the wet revert keeps the wheel and the ledger
+    /// entry; once the file stops naming the wheel the next revert cleans up.
+    #[tokio::test]
+    async fn requirements_revert_keeps_artifact_for_subdir_requirements_file() {
+        use crate::vendor::pypi_requirements::wire_requirements;
+        for (file, content) in [
+            (
+                "requirements/lock.txt",
+                "six @ file:///proj/.socket/vendor/pypi/{UUID}/six-1.16.0-py2.py3-none-any.whl\n",
+            ),
+            (
+                "requirements/dev.txt",
+                "-r ../requirements.txt\n./.socket/vendor/pypi/{UUID}/six-1.16.0-py2.py3-none-any.whl  # socket-patch vendor: six==1.16.0\n",
+            ),
+            (
+                "deploy/requirements/prod.txt",
+                "./.socket/vendor/pypi/{UUID}/six-1.16.0-py2.py3-none-any.whl\n",
+            ),
+        ] {
+            let tmp = tempfile::tempdir().unwrap();
+            let root = tmp.path();
+            tokio::fs::write(root.join("requirements.txt"), "six==1.16.0\n")
+                .await
+                .unwrap();
+            let rel_wheel = format!(".socket/vendor/pypi/{UUID}/six-1.16.0-py2.py3-none-any.whl");
+            let wiring = wire_requirements(root, "six", "1.16.0", &rel_wheel, &"0".repeat(64))
+                .await
+                .unwrap();
+            let uuid_dir = root.join(format!(".socket/vendor/pypi/{UUID}"));
+            tokio::fs::create_dir_all(&uuid_dir).await.unwrap();
+            let wheel = uuid_dir.join("six-1.16.0-py2.py3-none-any.whl");
+            tokio::fs::write(&wheel, b"wheel bytes").await.unwrap();
+            let path = root.join(file);
+            tokio::fs::create_dir_all(path.parent().unwrap())
+                .await
+                .unwrap();
+            tokio::fs::write(&path, content.replace("{UUID}", UUID))
+                .await
+                .unwrap();
+
+            let entry = revert_entry("requirements", &rel_wheel, wiring);
+            let preview = revert_pypi(&entry, root, true).await;
+            assert!(preview.success, "{file}: {:?}", preview.error);
+            assert!(
+                preview.warnings.iter().any(|w| {
+                    w.code == "vendor_revert_residual_reference" && w.detail.contains(file)
+                }),
+                "{file}: the dry run must preview the keep: {:?}",
+                preview.warnings
+            );
+
+            let outcome = revert_pypi(&entry, root, false).await;
+            assert!(outcome.success, "{file}: {:?}", outcome.error);
+            assert!(
+                outcome.warnings.iter().any(|w| {
+                    w.code == "vendor_revert_residual_reference" && w.detail.contains(file)
+                }),
+                "{file}: {:?}",
+                outcome.warnings
+            );
+            assert!(outcome.kept_artifact, "{file}: the ledger entry must stay");
+            assert!(
+                wheel.is_file(),
+                "{file} still installs the wheel; deleting it breaks that install"
+            );
+            assert_eq!(
+                tokio::fs::read_to_string(root.join("requirements.txt"))
+                    .await
+                    .unwrap(),
+                "six==1.16.0\n",
+                "{file}: the root wiring is still restored"
+            );
+
+            tokio::fs::write(&path, "six==1.16.0\n").await.unwrap();
+            let finished = revert_pypi(&entry, root, false).await;
+            assert!(finished.success, "{file}: {:?}", finished.error);
+            assert!(!finished.kept_artifact, "{file}: {:?}", finished.warnings);
+            assert!(!uuid_dir.exists(), "{file}: the artifact must be reclaimed");
+        }
+    }
+
+    /// #1167 scope: the subdirectory walk reads `*.txt` files at any depth
+    /// but never descends into VCS, `.socket`, `node_modules`, cache or
+    /// virtualenv trees, and never follows a symlinked directory. A
+    /// reference inside one of those does not pin the wheel.
+    #[tokio::test]
+    async fn reference_probe_walks_subdirs_but_skips_tool_trees() {
+        let line = format!("./.socket/vendor/pypi/{UUID}/six-1.16.0-py2.py3-none-any.whl\n");
+        let tmp = tempfile::tempdir().unwrap();
+        let root = tmp.path();
+        for skipped in [
+            ".git/info/x.txt",
+            ".socket/vendor/pypi/notes.txt",
+            "node_modules/pkg/LICENSE.txt",
+            "__pycache__/x.txt",
+            ".tox/py311/x.txt",
+            "env/lib/x.txt",
+        ] {
+            let path = root.join(skipped);
+            tokio::fs::create_dir_all(path.parent().unwrap())
+                .await
+                .unwrap();
+            tokio::fs::write(&path, &line).await.unwrap();
+        }
+        // `env/` is a virtualenv (pyvenv.cfg), whatever its name.
+        tokio::fs::write(root.join("env/pyvenv.cfg"), "home = /usr/bin\n")
+            .await
+            .unwrap();
+        tokio::fs::create_dir_all(root.join("docs")).await.unwrap();
+        tokio::fs::write(root.join("docs/readme.txt"), "unrelated\n")
+            .await
+            .unwrap();
+        assert_eq!(pypi_reference_clause(root, UUID, &[]).await, None);
+
+        #[cfg(unix)]
+        {
+            let outside = tempfile::tempdir().unwrap();
+            tokio::fs::write(outside.path().join("lock.txt"), &line)
+                .await
+                .unwrap();
+            std::os::unix::fs::symlink(outside.path(), root.join("linked")).unwrap();
+            assert_eq!(pypi_reference_clause(root, UUID, &[]).await, None);
+        }
+
+        tokio::fs::create_dir_all(root.join("a/b/c")).await.unwrap();
+        tokio::fs::write(root.join("a/b/c/deep.txt"), &line)
+            .await
+            .unwrap();
+        assert_eq!(
+            pypi_reference_clause(root, UUID, &[]).await.as_deref(),
+            Some("a/b/c/deep.txt still resolves through it")
+        );
+    }
+
     /// LIVENESS twin of the requirements gate: a hand-RESTORED line (the
     /// vendored line replaced back with the original pin) still raises
     /// `vendor_revert_line_drifted`, but nothing references the uuid dir any
@@ -6922,8 +7177,9 @@ wheels = [{url = "https://files.pythonhosted.org/six.whl", hash = "sha256:upstre
     const SCRIPT_LOCK: &str = "version = 1\nrevision = 3\nrequires-python = \">=3.9\"\n\n[manifest]\nrequirements = [{name = \"six\", specifier = \"==1.16.0\"}]\n\n[[package]]\nname = \"six\"\nversion = \"1.16.0\"\nsource = {registry = \"https://pypi.org/simple\"}\nwheels = [{url = \"https://files.pythonhosted.org/six.whl\", hash = \"sha256:upstream\"}]\n";
     const HATCH_PROJECT: &str = "[build-system]\nrequires = [\"hatchling\"]\nbuild-backend = \"hatchling.build\"\n\n[project]\nname = \"proj\"\nversion = \"0.1.0\"\ndependencies = [\"six==1.16.0\"]\n";
 
-    /// The pyproject-family flavors #742 (uv project, PEP 723 script lock)
-    /// and #650 (Hatch) cover, each with the files it wires.
+    /// The pyproject-family flavors #742 (uv project, PEP 723 script lock),
+    /// #650 (Hatch) and #1136 (Poetry, PDM) cover, each with the files it
+    /// wires.
     fn superseding_flavors() -> Vec<(&'static str, Vec<(&'static str, &'static str)>)> {
         vec![
             (
@@ -6938,7 +7194,17 @@ wheels = [{url = "https://files.pythonhosted.org/six.whl", hash = "sha256:upstre
                 vec![("example.py", SCRIPT_PY), ("example.py.lock", SCRIPT_LOCK)],
             ),
             ("hatch", vec![("pyproject.toml", HATCH_PROJECT)]),
+            // #1136: Poetry and PDM, LF and CRLF (a CRLF poetry.lock takes
+            // the line-preserving edit path).
+            ("poetry", vec![("poetry.lock", POETRY_LOCK_REGISTRY)]),
+            ("poetry", vec![("poetry.lock", crlf(POETRY_LOCK_REGISTRY))]),
+            ("pdm", vec![("pdm.lock", PDM_LOCK_REGISTRY)]),
+            ("pdm", vec![("pdm.lock", crlf(PDM_LOCK_REGISTRY))]),
         ]
+    }
+
+    fn crlf(text: &str) -> &'static str {
+        Box::leak(text.replace('\n', "\r\n").into_boxed_str())
     }
 
     async fn vendor_six_as(
@@ -7971,9 +8237,11 @@ wheels = [{url = "https://files.pythonhosted.org/six.whl", hash = "sha256:upstre
 
     /// The splice-flavor mirror of
     /// `uv_stale_uuid_vendor_refuses_through_orchestrator`: a lock already
-    /// wired to an EARLIER patch uuid refuses through the orchestrator (the
-    /// poetry/pdm/pipenv guard-Err plan arms), before any new uuid dir is
-    /// created, naming the stale uuid and the revert remediation.
+    /// wired to an EARLIER patch uuid that NO ledger entry records refuses
+    /// through the orchestrator (the poetry/pdm/pipenv guard-Err plan arms),
+    /// before any new uuid dir is created, naming the stale uuid and the
+    /// revert remediation. With the ledger entry it re-vendors instead
+    /// (`pyproject_flavors_revendor_to_a_superseding_uuid`).
     #[tokio::test]
     async fn splice_flavor_stale_uuid_vendor_refuses_through_orchestrator() {
         const UUID2: &str = "0a1b2c3d-4e5f-4a6b-8c7d-9e0f1a2b3c4d";

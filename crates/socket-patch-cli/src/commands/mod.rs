@@ -135,6 +135,7 @@ pub(crate) async fn hosted_inventory(
 /// edits) — it is never persisted.
 ///
 /// [`RedirectState`]: socket_patch_core::patch::redirect::RedirectState
+#[cfg(test)]
 pub(crate) async fn hosted_state_from_lockfiles(
     common: &crate::args::GlobalArgs,
     root: &Path,

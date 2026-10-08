@@ -433,6 +433,41 @@ async fn lock_only_pipenv_project_redirects_attests_rescans_and_rolls_back() {
     );
 }
 
+/// #567: the project's requirements tree pins the package through an `-r`
+/// include the hosted requirements rewriter does not reach. Rewiring only
+/// `Pipfile.lock` would leave a lock pair lockfile discovery reads as
+/// contested — `vex`, `rollback` and `vendor` refuse it, and re-running the
+/// scan changes nothing — so the run leaves the patch out (skipped as
+/// `redirect_unattributable`) and writes nothing.
+#[tokio::test]
+#[serial]
+async fn an_unreached_requirements_include_vetoes_the_pipfile_lock_redirect() {
+    let _major = MajorGuard::set("2026");
+    let server = MockServer::start().await;
+    mock_api(&server).await;
+    let tmp = tempfile::tempdir().unwrap();
+    write_project(tmp.path());
+    std::fs::write(tmp.path().join("requirements.txt"), "-r req/base.txt\n").unwrap();
+    std::fs::create_dir_all(tmp.path().join("req")).unwrap();
+    std::fs::write(tmp.path().join("req/base.txt"), "urllib3==1.26.18\n").unwrap();
+
+    let code = run(hosted_args(tmp.path(), server.uri(), None)).await;
+    assert_eq!(code, 0, "an unattributable pin is a skip, not a failure");
+    assert_eq!(
+        read(&tmp.path().join("Pipfile.lock")),
+        LOCK,
+        "a pin discovery would contest is never written"
+    );
+    assert_eq!(read(&tmp.path().join("req/base.txt")), "urllib3==1.26.18\n");
+    let inventory = socket_patch_core::patch::redirect::upstream::HostedInventory::of(
+        &socket_patch_core::vex::discover_patched_refs(tmp.path()).await,
+    );
+    assert!(
+        inventory.is_empty(),
+        "no hosted wiring is left for rollback to refuse: {inventory:?}"
+    );
+}
+
 #[tokio::test]
 #[serial]
 async fn legacy_installer_major_selects_path_references() {

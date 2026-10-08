@@ -156,7 +156,7 @@ async fn get_by_purl_with_multiple_patches_emits_selection_required() {
     // happens by re-running with the chosen UUID as the positional
     // identifier; a "Specify --id <UUID>" instruction would send users
     // straight into a clap usage error.
-    let err = v["error"].as_str().unwrap_or("");
+    let err = v["error"]["message"].as_str().unwrap_or("");
     assert!(
         !err.contains("--id <"),
         "error must not instruct the value-taking `--id <UUID>` form the CLI rejects; got {err:?}"
@@ -268,7 +268,7 @@ async fn get_uuid_returning_500_emits_error() {
     let v: serde_json::Value =
         serde_json::from_str(stdout.trim()).expect("valid JSON error envelope");
     assert_eq!(v["status"], "error", "5xx must surface as error");
-    let err = v["error"]
+    let err = v["error"]["message"]
         .as_str()
         .expect("error envelope must carry an error string");
     assert!(
@@ -296,7 +296,7 @@ async fn get_uuid_returning_malformed_json_emits_error() {
     let v: serde_json::Value =
         serde_json::from_str(stdout.trim()).expect("valid JSON error envelope");
     assert_eq!(v["status"], "error", "parse failure must surface as error");
-    let err = v["error"]
+    let err = v["error"]["message"]
         .as_str()
         .expect("error envelope must carry an error string");
     assert!(

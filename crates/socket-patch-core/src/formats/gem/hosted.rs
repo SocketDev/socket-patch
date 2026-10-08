@@ -62,7 +62,7 @@ pub(crate) fn converge_gem_lock_source(
     lock_changed: &mut bool,
     result: &mut RewriteResult,
 ) -> bool {
-    let eol = if lk.contains("\r\n") { "\r\n" } else { "\n" };
+    let eol = crate::utils::line_endings::terminator(lk);
     let mut lines: Vec<String> = lk.split_inclusive('\n').map(str::to_string).collect();
     let is_header = |c: &str| !c.is_empty() && !c.starts_with(' ');
 
