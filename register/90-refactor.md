@@ -16,10 +16,7 @@ _Last updated 2026-10-08T22:55Z · main @ 830749f_
 - [#1151](https://github.com/SocketDev/socket-patch/pull/1151): one `portable_wheel_artifact` for uv/poetry inventory and recovery. Issue #1150 (E89 fixed).
 - [#1145](https://github.com/SocketDev/socket-patch/pull/1145): Gradle XML through `formats::xml`. Issue #715 (E10, Gradle half).
 - [#1141](https://github.com/SocketDev/socket-patch/pull/1141): dead hosted-vlt ledger helpers deleted, −181 production. Issue #782 (E58 slice 1).
-- [#1106](https://github.com/SocketDev/socket-patch/pull/1106): PDM site probe through `utils::process::output_within` + `kill_on_drop` guard test. Issue #1067 (C48). `c4235a2`.
-- [#1110](https://github.com/SocketDev/socket-patch/pull/1110): one `formats::cargo::manifest` `[package]` reader for crawler, VEX and `cargo_tag`. Issue #693 (E15 slice 1). `d52a67b`.
-- [#1117](https://github.com/SocketDev/socket-patch/pull/1117): 8 inline BOM strips onto `formats::text` + one-sided guard. Issue #905 (E64). `d13657b`.
-- Earlier: #1121 (E89 slice 1), #1124 (C30), #1021 (C05), #1015 (E61; left: dead `eco == "maven2"` arm in `commands/vendor.rs`), #889, #876, #886, #870, #865, #858, #850, #607, #602, #597, #587, #583, #581, #574, #572 (see `entries/refactor/`).
+- Earlier: #1106 (C48), #1110 (E15 slice 1), #1117 (E64), #1121 (E89 slice 1), #1124 (C30), #1021 (C05), #1015 (E61; left: dead `eco == "maven2"` arm in `commands/vendor.rs`), #889, #876, #886, #870, #865, #858, #850, #607, #602, #597, #587, #583, #581, #574, #572 (see `entries/refactor/`).
 
 **Queue** (B bugs closed, U unblocks, D duplication removed, R risk; score = 3B + 2U + 2D + S − risk). Since the 2026-10-08 backlog review, standalone refactor issues are closed as `not_planned` and kept as checklist items of their tracker; rank the tracker's next unchecked item.
 
