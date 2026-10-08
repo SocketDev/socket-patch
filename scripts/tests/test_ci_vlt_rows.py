@@ -126,6 +126,15 @@ def matrix_include(job_lines):
     return rows
 
 
+def job_rows(jobs_by_id, job):
+    """`matrix_include` of a job plus its `<job>-macos` sibling, which holds
+    the macOS rows that run off the pull_request path."""
+    rows = matrix_include(jobs_by_id[job])
+    if f"{job}-macos" in jobs_by_id:
+        rows += matrix_include(jobs_by_id[f"{job}-macos"])
+    return rows
+
+
 def steps(job_lines):
     """[(name, text)] of a job's steps."""
     out, current = [], None
@@ -148,7 +157,7 @@ def step(job_lines, name):
 
 class CiE2eVltRows(unittest.TestCase):
     ci = jobs(CI.read_text(encoding="utf-8"))
-    rows = matrix_include(ci["e2e"])
+    rows = job_rows(ci, "e2e")
     vlt_rows = [r for r in rows if "vlt" in r or "vlt" in r.get("suite", "")]
 
     def test_every_vlt_row_pins_a_release_and_includes_the_ignored_legs(self):
@@ -241,7 +250,7 @@ class CiE2eVltRows(unittest.TestCase):
 
 class CompatibilityWorkflow(unittest.TestCase):
     compat = jobs(COMPAT.read_text(encoding="utf-8"))
-    rows = matrix_include(compat["install-proof"])
+    rows = job_rows(compat, "install-proof")
 
     def covered(self):
         cells = set()
