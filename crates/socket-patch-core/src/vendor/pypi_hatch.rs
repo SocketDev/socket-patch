@@ -364,7 +364,7 @@ pub(super) async fn revert(entry: &VendorEntry, root: &Path, dry_run: bool) -> R
 fn permission_held_by_live_references(files: &BTreeMap<String, String>) -> bool {
     files
         .get(hatch::HATCH_FILES[0])
-        .and_then(|text| text.trim_start_matches('\u{feff}').parse().ok())
+        .and_then(|text| crate::formats::text::strip_bom(text).parse().ok())
         .is_some_and(|document: toml_edit::DocumentMut| {
             crate::vendor::common::pyproject_dependency_specs(&document)
                 .into_iter()
@@ -380,8 +380,7 @@ fn permission_held_by_live_references(files: &BTreeMap<String, String>) -> bool 
 /// `text` without its direct-reference permission and the tables that
 /// leaves empty, or `None` when the permission is not set there.
 fn drop_owned_permission(text: &str, file: &str) -> Option<String> {
-    let body = text.trim_start_matches('\u{feff}');
-    let bom = &text[..text.len() - body.len()];
+    let (bom, body) = crate::formats::text::split_bom(text);
     let mut document = body.parse::<toml_edit::DocumentMut>().ok()?;
     let keys = hatch::permission_keys(file == hatch::HATCH_FILES[1]);
     hatch::drop_direct_reference_permission(&mut document, keys)
@@ -411,6 +410,33 @@ mod tests {
             "artifact": {"path": wheel, "sha256": hash}
         }))
         .unwrap()
+    }
+
+    /// The permission readers split off one leading BOM (#905) and the
+    /// writer puts it back. toml_edit skips one more BOM itself, so a file
+    /// with two still parses; its second BOM is not written back.
+    #[test]
+    fn permission_readers_split_one_leading_bom() {
+        let permitted = "[tool.hatch.metadata]\nallow-direct-references = true\n";
+        let one = drop_owned_permission(&format!("\u{feff}{permitted}"), "pyproject.toml").unwrap();
+        assert!(one.starts_with('\u{feff}') && !one[3..].starts_with('\u{feff}'));
+        assert!(!one.contains("allow-direct-references"), "{one}");
+        assert_eq!(
+            drop_owned_permission(&format!("\u{feff}\u{feff}{permitted}"), "pyproject.toml")
+                .as_deref(),
+            Some("\u{feff}")
+        );
+
+        let held = |text: String| {
+            permission_held_by_live_references(&BTreeMap::from([(
+                "pyproject.toml".to_string(),
+                text,
+            )]))
+        };
+        let live = "[project]\ndependencies = [\"x @ file:///elsewhere/x.whl\"]\n";
+        assert!(held(live.to_string()));
+        assert!(held(format!("\u{feff}{live}")));
+        assert!(held(format!("\u{feff}\u{feff}{live}")));
     }
 
     #[tokio::test]
