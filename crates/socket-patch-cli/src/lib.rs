@@ -8,6 +8,7 @@
 pub mod args;
 pub mod commands;
 pub(crate) mod ecosystem_dispatch;
+pub mod interrupt;
 /// The in-memory hosted engine, which lives in core
 /// ([`socket_patch_core::hosted::memory`]); re-exported under its old path
 /// for the `hosted-bundle` harness and the integration tests.
