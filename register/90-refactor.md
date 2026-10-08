@@ -1,34 +1,34 @@
 ### Refactor routine (`refactor`, hourly, highest leverage first)
-_Last updated 2026-10-08T08:15Z · main @ 829d0af_
+_Last updated 2026-10-08T09:30Z · main @ b96a785_
 
 **In flight:**
+- [#1121](https://github.com/SocketDev/socket-patch/pull/1121): ledger recovery reads the recorded uv/pdm `[[package]]` unit through `utils::python_lock::package_artifacts` and picks wheels through the shared `pypi_distribution::is_portable_wheel_url`; deletes recovery's string scanner and suffix rule. Issue #1079 (E89, slice 1; the two `lock_inventory/pypi.rs` suffix checks and the `pure_wheel_from_uv_unit` rename remain, in files #1058/#1009/#1045/#768 change). Fixes the wrong-hash pairing (red→green). `state: ready`.
 - [#1117](https://github.com/SocketDev/socket-patch/pull/1117): 8 inline BOM strips (requirements lexers, manifest, hosted npm manifest, Gradle DSL, socket.yml, CLI Pipenv remedy) onto `formats::text`, plus `strip_bom_bytes` and a one-sided guard with a 26-file pending list. Issue #905 (E64, step 3 slice 1). Only change: a double-BOM Pipfile.lock is unparseable in the stale-install remedy. `state: ready`.
 - [#1110](https://github.com/SocketDev/socket-patch/pull/1110): one `formats::cargo::manifest` reader (`toml_edit`, `[package]` else `[project]`) for the crawler, VEX product and `cargo_tag`; deletes the crawler's line scanner. Issue #693 (E15, slice 1; `vendor/cargo.rs` `path_crate_version`/`declared_cargo_minor` and #651 remain, blocked by #1026/#1039/#1041/#1043/#1050). Parse cost 0.5 µs → 81 µs per manifest, disclosed. `state: ready`.
 - [#1108](https://github.com/SocketDev/socket-patch/pull/1108): one `utils::line_endings::terminator` (CRLF → CRLF, mixed → majority, else LF) for 7 inserted-line sites: gem lock converge, composer/requirements restore, Pipfile.lock entry formatter, PEP 723 writer, go.mod append/re-join. Issue #815 (E16, slice 1; `detect_eol`, `pypi_uv::newline_of`, Maven ×2, `redirect/mod.rs`, the `crlf` flags and upstream gem's Gemfile restore remain, all in open-PR files). Re-blesses the go/uv equivalence goldens (mixed inputs only). `state: ready`.
 - [#1106](https://github.com/SocketDev/socket-patch/pull/1106): the macOS PDM site probe runs through `utils::process::output_within`; a guard test rejects new production `kill_on_drop` spawns (pending: `vendor/npm_dir.rs`). Issue #1067 (C48, slice: `pdm_site`; the `npm_dir` git exchange remains, blocked on #1026). `state: ready`, handed to the burn-down.
 - [#1103](https://github.com/SocketDev/socket-patch/pull/1103): `go.sum` edits through `GoSumEditor` only; deletes the oracle-only free functions and names the key rule once. Issue #631 (E52, slice: steps 2–3; the move to `formats/golang/sum.rs` remains). `state: ready`, handed to the burn-down.
 - Maintainer drafts (decided issues): #1021 (#615), #1027 (#704), #1030 (#808), #1031 (#966), #1036 (#973), #1041 (#648), #1049 (#792), #1051 (#580).
-- October 7 campaign (duplicate business logic, one PR per seam; register rows in brackets): #1026 credentials [C59], #1029 trust signals [C61], #1032 JVM layout [E77, E69], #1033 VEX attestation [E72], #1034 target grammar [C62], #1035 supersede lifecycle [E71], #1038 paths and roots [C64], #1039 atomic takeover [E70], #1043 command cycles and UI text [C65, C12], #1044 governing locks [E75], #1045 `PurlKey` [C63], #1046 test hygiene [C66], #1050 vendored liveness [E74], #1057 yarn grammar [E08, E76], #1058 pinned check [E73]. Merged: #1042 [C60, C42] `ddc3bfb`, #1033 [E72], #1038 [C64], #1046 [C66], #1035 [E71], #1044 [E75].
+- October 7 campaign (duplicate business logic, one PR per seam; register rows in brackets): #1026 credentials [C59], #1029 trust signals [C61], #1032 JVM layout [E77, E69], #1033 VEX attestation [E72], #1034 target grammar [C62], #1035 supersede lifecycle [E71], #1038 paths and roots [C64], #1039 atomic takeover [E70], #1043 command cycles and UI text [C65, C12], #1044 governing locks [E75], #1045 `PurlKey` [C63], #1046 test hygiene [C66], #1050 vendored liveness [E74], #1057 yarn grammar [E08, E76], #1058 pinned check [E73]. Merged: #1042 [C60, C42] `ddc3bfb`, #1033 [E72], #1038 [C64], #1046 [C66], #1035 [E71], #1044 [E75], #1029 [C61] `6fcc51b`, #1057 [E08, E76] `b96a785`.
 
 **Merged:**
-- [#1015](https://github.com/SocketDev/socket-patch/pull/1015): the vendored-reference scan reads every `VENDORED` row and accepts the bare uuid dir. Issues #832, #958 (E61). `8e521f9` (+308 / −41). Left: dead `eco == "maven2"` arm in `commands/vendor.rs`.
-- [#876](https://github.com/SocketDev/socket-patch/pull/876): registry clients under `ApiTimeouts` through one `registry_client_builder`. Issue #872 (C49). `e2300cc` (+154 / −33).
-- [#889](https://github.com/SocketDev/socket-patch/pull/889): vendor-service retries share `api::retry` (`Retry-After` HTTP-date, jitter). Issue #677 (C15 child 1). `835601b` (+209 / −38). Left: blob/diff fetches have no retry (#676).
-- Earlier: #886, #870, #865, #858, #850, #607, #602, #597, #587, #583, #581, #574, #572 (see `entries/refactor/`).
+- [#1015](https://github.com/SocketDev/socket-patch/pull/1015): vendored-reference scan reads every `VENDORED` row. Issues #832, #958 (E61). `8e521f9` (+308 / −41). Left: dead `eco == "maven2"` arm in `commands/vendor.rs`.
+- Earlier: #889, #876, #886, #870, #865, #858, #850, #607, #602, #597, #587, #583, #581, #574, #572 (see `entries/refactor/`).
 
 **Queue** (B bugs closed, U unblocks, D duplication removed, R risk; score = 3B + 2U + 2D + S − risk):
 
 | # | Candidate | B | U | D | R | Score | Note |
 |---|---|:-:|:-:|:-:|:-:|:-:|---|
-| 1 | #905 (E64) step 3 slice 1: 8 free-file BOM strips onto `formats::text` + guard | 0 | 0 | ≈8 | L | ≈16 | **taken: #1117** |
-| 2 | #990 (E24, child 1 of #989): one `vendor::revert::finish` for the 12 copied finish blocks | 0 | 1 | ≈12 | L | ≈26 | skipped: backend files changed by open PRs |
-| 3 | #922 (E22): one `VendorEntry::npm` constructor for 7 npm-family ledger tails | 0 | 1 | ≈7 | L | ≈16 | skipped: claimed; drivers changed by #1008 |
-| 4 | E35 slice: retire the composer/go/nuget/python crawler oracles (≈590 test lines) | 0 | 0 | 4 | L | ≈8 | free files, but test-only; needs a register issue first |
-| 5 | #706 (C17) slice 2: the 6 `PENDING_INLINE_DIGESTS` files | 0 | 1 | ≈6 | L | ≈14 | skipped: all 6 files changed by open PRs |
+| 1 | #990 (E24, child 1 of #989): one `vendor::revert::finish` for the 12 copied finish blocks | 0 | 1 | ≈12 | L | ≈26 | skipped: all 12 backend files changed by open PRs |
+| 2 | #922 (E22): one `VendorEntry::npm` constructor for 7 npm-family ledger tails | 0 | 1 | ≈7 | L | ≈16 | skipped: claimed; drivers changed by #1008 |
+| 3 | #706 (C17) slice 2: the 6 `PENDING_INLINE_DIGESTS` files | 0 | 1 | ≈6 | L | ≈14 | skipped: files changed by open PRs |
+| 4 | #1079 (E89) slice 1: recovery through the shared lock model and wheel classifier | 1 | 1 | 2 | L | ≈9 | **taken: #1121** |
+| 5 | E35 slice: retire the composer/go/nuget/python crawler oracles (≈590 test lines) | 0 | 0 | 4 | L | ≈8 | free files, but test-only; needs a register issue first |
 
-Re-ranked 2026-10-08T08:00Z at `829d0af` against the 34 open PRs' 516 files.
+Re-ranked 2026-10-08T09:00Z at `b96a785` against the 32 open PRs' 512 files.
 
 **Notes:**
+- zizmor (`Audit GitHub Actions`) fails new PR heads on main's `ci.yml:1400` setup-php `# v2` label until #1118 merges; port its one-line fix.
 - Lead for `audit-ecosystems` (not filed): hosted `redirect/requirements.rs` keeps its own pip lexer (`logical_requirements`, `unquoted_index`, `requirement_tokens`) beside `utils::requirements::{logical_lines, split_comment, shlex_split}`. Its comment finder is quote-aware, pip's `COMMENT_RE` is not. `upstream/pypi.rs` shares it (changed by #1108).
 - Source-scan guards: make new ones one-sided (fail on new files only), so a PR migrating a pending file can't turn `main` red.
 - `toml_edit::Document::parse` costs about 81 µs per real crates.io `Cargo.toml` (release), against 0.5 µs for an early-exit line scanner. Disclose it whenever a hot crawl path moves to `toml_edit`.
@@ -44,7 +44,6 @@ Re-ranked 2026-10-08T08:00Z at `829d0af` against the 34 open PRs' 516 files.
 - `CLI_CONTRACT.md` lives at `crates/socket-patch-cli/CLI_CONTRACT.md`.
 - Ledger and branch pushes need verified signatures (org ruleset). Commit with the session's default git identity; overriding `user.email` (e.g. to a bot address) makes GitHub reject the signature.
 - Maintainer steering (2026-10-02, on #569 and #571): don't add size caps on trusted upstream data; stream instead of buffering.
-- reqwest 0.12 `ClientBuilder::read_timeout` is an idle bound (resets per chunk) and also bounds the wait for response headers; `RequestBuilder::timeout` is total.
 - `rustfmt <file>` also formats that file's out-of-line child modules (formatting `crawlers/mod.rs` rewrote `python_crawler.rs`). Check `git diff --stat` after formatting and restore any file you didn't mean to touch.
 - `cargo clippy --all-targets` (and `-p socket-patch-core --tests`) already fails on `main` from older lints in test code. CI's gate is `cargo clippy --workspace --all-features -- -D warnings`.
 - Windows CI checks out with CRLF. A test that scans source text for `\n`-joined markers must normalize `\r\n` first: #602 failed `test (windows-latest)` this way.
