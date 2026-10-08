@@ -1192,8 +1192,25 @@ fn version_moved_off<'a>(rec: &WiringRecord, live: &'a Value) -> Option<&'a str>
     if live_scheme != original_scheme && (original_scheme, live_scheme) != ("http", "https") {
         return None;
     }
+    // The tarball file must be exactly `<basename>-<version>.tgz`, with the
+    // basename taken from the pre-vendor tarball and a plain version, so
+    // no separator, `..`, `\`, query or fragment can steer npm's fetch to
+    // another package after it normalizes the URL.
+    let original_leaf = split_http_scheme(original_resolved)?
+        .1
+        .strip_prefix(prefix)?;
+    let original_version = rec
+        .original
+        .as_ref()?
+        .get("version")
+        .and_then(Value::as_str)?;
+    let basename = original_leaf.strip_suffix(&format!("-{original_version}.tgz"))?;
+    let plain_version = !live_version.is_empty()
+        && live_version
+            .chars()
+            .all(|c| c.is_ascii_alphanumeric() || matches!(c, '.' | '-' | '+'));
     let leaf = live_rest.strip_prefix(prefix)?;
-    (leaf.ends_with(".tgz") && !leaf.contains('/')).then_some(live_version)
+    (plain_version && leaf == format!("{basename}-{live_version}.tgz")).then_some(live_version)
 }
 
 /// `https://registry.npmjs.org/left-pad/-/left-pad-1.3.0.tgz` →
@@ -3598,6 +3615,9 @@ mod tests {
             "https://registry.npmjs.org/not-left-pad/-/not-left-pad-1.3.1.tgz",
             "https://example.com/left-pad-1.3.1.tgz",
             "file:../left-pad-1.3.1.tgz",
+            "https://registry.npmjs.org/left-pad/-/..\\..\\not-left-pad\\-\\not-left-pad-1.3.1.tgz",
+            "https://registry.npmjs.org/left-pad/-/left-pad-1.3.1.tgz?x=/../../evil",
+            "https://registry.npmjs.org/left-pad/-/other-1.3.1.tgz",
         ] {
             let fx = fixture().await;
             let (_, entry, _) = expect_done(fx.vendor(false).await);
