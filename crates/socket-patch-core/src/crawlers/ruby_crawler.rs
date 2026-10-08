@@ -629,6 +629,63 @@ impl RubyCrawler {
             .collect()
     }
 
+    /// The gem homes `bundle install` installs into or reuses for this
+    /// project, each tagged project-local or shared, for the hosted
+    /// stale-install guard: a stale copy only matters where Bundler would
+    /// keep it instead of fetching the patched gem.
+    ///
+    /// Unlike [`Self::get_gem_paths`] (apply's write targets, which keep
+    /// the `gem env` homes for default gems), the `gem env` homes count
+    /// here only when Bundler uses system gems: no deployment store under
+    /// the default `vendor/bundle` and no explicit install `path`
+    /// ([`bundler_sets_explicit_path`]). The refused out-of-tree
+    /// config root ([`Self::verification_only_gem_paths`]) is included,
+    /// since Bundler installs into it. See [`bundler_gem_homes_from`] for
+    /// the project-local rule.
+    pub async fn bundler_install_homes(&self, options: &CrawlerOptions) -> Vec<BundlerGemHome> {
+        if options.global || options.global_prefix.is_some() {
+            let paths = self.get_gem_paths(options).await.unwrap_or_default();
+            return bundler_gem_homes_from(&options.cwd, &[], &[], &paths);
+        }
+        let discovery = Self::discover_bundle_stores(&options.cwd).await;
+        let verification = match &discovery.skipped_config_root {
+            Some(root) => Self::bundle_root_gems_dirs(root).await,
+            None => Vec::new(),
+        };
+        let ignore_config = bundler_ignores_config();
+        let uses_system_gems = !discovery.default_root_has_stores
+            && Self::has_bundler_manifest(&options.cwd).await
+            && !bundler_sets_explicit_path(BundlerPathTiers {
+                local: read_app_config(
+                    &options.cwd,
+                    std::env::var_os("BUNDLE_APP_CONFIG").as_deref(),
+                    ignore_config,
+                )
+                .await,
+                env: BundlerPathSettings::from_env(
+                    std::env::var_os("BUNDLE_PATH").as_deref(),
+                    std::env::var_os("BUNDLE_PATH__SYSTEM").as_deref(),
+                    std::env::var_os("BUNDLE_DISABLE_SHARED_GEMS").as_deref(),
+                ),
+                global: read_global_config(
+                    ambient_bundler_global_config_file(&options.cwd).as_deref(),
+                    ignore_config,
+                )
+                .await,
+            });
+        let system_homes = if uses_system_gems {
+            Self::gem_env_gems_dirs().await
+        } else {
+            Vec::new()
+        };
+        bundler_gem_homes_from(
+            &options.cwd,
+            &discovery.stores,
+            &verification,
+            &system_homes,
+        )
+    }
+
     /// The installed-gem `gems/` dirs under one bundler install root, in
     /// both layouts bundler produces:
     ///
@@ -1086,6 +1143,142 @@ fn verify_gem_at_path_sync(path: &Path) -> bool {
             .to_str()
             .is_some_and(|name| name.ends_with(".gemspec"))
     })
+}
+
+/// One Bundler settings tier's `path`, `path.system` and
+/// `disable_shared_gems` values, each `None` when the tier doesn't set it
+/// (an empty string counts as set).
+#[derive(Debug, Default, Clone, PartialEq, Eq)]
+pub(crate) struct BundlerPathSettings {
+    path: Option<String>,
+    path_system: Option<String>,
+    disable_shared_gems: Option<String>,
+}
+
+impl BundlerPathSettings {
+    fn from_config_text(text: &str) -> Self {
+        Self {
+            path: bundle_config_setting_including_empty(text, "BUNDLE_PATH"),
+            path_system: bundle_config_setting_including_empty(text, "BUNDLE_PATH__SYSTEM"),
+            disable_shared_gems: bundle_config_setting_including_empty(
+                text,
+                "BUNDLE_DISABLE_SHARED_GEMS",
+            ),
+        }
+    }
+
+    fn from_env(
+        path: Option<&OsStr>,
+        path_system: Option<&OsStr>,
+        disable_shared_gems: Option<&OsStr>,
+    ) -> Self {
+        let text = |v: Option<&OsStr>| v.map(|v| v.to_string_lossy().into_owned());
+        Self {
+            path: text(path),
+            path_system: text(path_system),
+            disable_shared_gems: text(disable_shared_gems),
+        }
+    }
+}
+
+/// The settings tiers Bundler's `Settings#path` reads, highest first: the
+/// app config (`local`) and global config texts (`None` when missing or
+/// under `BUNDLE_IGNORE_CONFIG`) and the environment.
+pub(crate) struct BundlerPathTiers {
+    pub(crate) local: Option<String>,
+    pub(crate) env: BundlerPathSettings,
+    pub(crate) global: Option<String>,
+}
+
+/// Whether Bundler installs into an explicit `path` instead of the system
+/// gems, following `Bundler::Settings#path`: the first tier (local, env,
+/// global) that sets `path`, `path.system` or `disable_shared_gems` decides
+/// alone, and it uses system gems when `path.system` is truthy or
+/// `disable_shared_gems` is falsy ([`bundler_truthy`]). Bundler never reuses a `gem env` copy
+/// of a non-default gem under an explicit path (`use_system_gems?` is
+/// false).
+///
+/// An empty `path` counts as not explicit, so the caller keeps judging the
+/// system homes: when unsure, it's safer to warn than to skip a copy
+/// Bundler may load.
+pub(crate) fn bundler_sets_explicit_path(tiers: BundlerPathTiers) -> bool {
+    let settings = [
+        tiers
+            .local
+            .as_deref()
+            .map(BundlerPathSettings::from_config_text),
+        Some(tiers.env),
+        tiers
+            .global
+            .as_deref()
+            .map(BundlerPathSettings::from_config_text),
+    ];
+    for tier in settings.into_iter().flatten() {
+        if tier.path.is_none() && tier.path_system.is_none() && tier.disable_shared_gems.is_none() {
+            continue;
+        }
+        // Both flags go through Bundler's `to_bool` coercion.
+        let system = tier.path_system.as_deref().is_some_and(bundler_truthy)
+            || tier
+                .disable_shared_gems
+                .as_deref()
+                .is_some_and(|v| !bundler_truthy(v));
+        return !system && tier.path.is_some_and(|p| !p.is_empty());
+    }
+    false
+}
+
+/// One gem home from [`RubyCrawler::bundler_install_homes`].
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct BundlerGemHome {
+    /// The home's `gems/` dir.
+    pub gems_dir: PathBuf,
+    /// The home belongs to this project (under the project root, or the
+    /// project's own `.bundle/config` path even when that sits outside the
+    /// tree), as opposed to a gem home other projects share.
+    pub project_local: bool,
+}
+
+/// Tag `stores` (the Bundler install stores), `config_stores` (the refused
+/// out-of-tree `.bundle/config` root's stores) and `shared_homes` (the
+/// `gem env` homes) with their [`BundlerGemHome::project_local`] flag,
+/// deduped in that order.
+///
+/// Containment is decided on absolute, lexically normalized paths, so the
+/// answer doesn't depend on how `--cwd` is spelled: with the default `.`,
+/// the discovered stores come back as `vendor/bundle/…`, which no lexical
+/// `starts_with(".")` matches.
+pub fn bundler_gem_homes_from(
+    project_root: &Path,
+    stores: &[PathBuf],
+    config_stores: &[PathBuf],
+    shared_homes: &[PathBuf],
+) -> Vec<BundlerGemHome> {
+    fn absolute(path: &Path) -> Option<PathBuf> {
+        let abs = std::path::absolute(path).ok()?;
+        Some(normalize_lexically(&abs).unwrap_or(abs))
+    }
+    let base = absolute(project_root).filter(|b| !b.as_os_str().is_empty());
+    let under_root = |dir: &Path| match (&base, absolute(dir)) {
+        (Some(base), Some(dir)) => dir.starts_with(base),
+        _ => false,
+    };
+    let mut seen = HashSet::new();
+    let mut homes = Vec::new();
+    let tagged = stores
+        .iter()
+        .map(|d| (d, under_root(d)))
+        .chain(config_stores.iter().map(|d| (d, true)))
+        .chain(shared_homes.iter().map(|d| (d, under_root(d))));
+    for (gems_dir, project_local) in tagged {
+        if seen.insert(gems_dir.clone()) {
+            homes.push(BundlerGemHome {
+                gems_dir: gems_dir.clone(),
+                project_local,
+            });
+        }
+    }
+    homes
 }
 
 /// Result of probing the Bundler install roots.
@@ -3619,6 +3812,139 @@ mod tests {
             paths.is_empty(),
             "path.system=true must drop the config-sourced root: {paths:?}"
         );
+    }
+
+    /// #1001: Bundler installs into an explicit `path` only when the first
+    /// tier (local, env, global) that sets `path`, `path.system` or
+    /// `disable_shared_gems` sets a non-empty path without turning system
+    /// gems back on. A higher tier's `path.system: true` beats a lower
+    /// tier's path (Bugbot on #1002).
+    #[test]
+    fn bundler_sets_explicit_path_follows_settings_tiers() {
+        let env = |path: Option<&str>, system: Option<&str>, disable: Option<&str>| {
+            BundlerPathSettings::from_env(
+                path.map(OsStr::new),
+                system.map(OsStr::new),
+                disable.map(OsStr::new),
+            )
+        };
+        let tiers = |local: Option<&str>, env: BundlerPathSettings, global: Option<&str>| {
+            bundler_sets_explicit_path(BundlerPathTiers {
+                local: local.map(str::to_string),
+                env,
+                global: global.map(str::to_string),
+            })
+        };
+        let none = || env(None, None, None);
+        let local_path = "---\nBUNDLE_PATH: \"vendor/bundle\"\n";
+        let local_system = "---\nBUNDLE_PATH__SYSTEM: \"true\"\n";
+
+        assert!(!tiers(None, none(), None), "no setting: system gems");
+        assert!(tiers(Some(local_path), none(), None), "local path");
+        assert!(
+            tiers(None, env(Some("vendor/bundle"), None, None), None),
+            "env path"
+        );
+        assert!(
+            tiers(None, none(), Some("---\nBUNDLE_PATH: \"/opt/bundle\"\n")),
+            "global path"
+        );
+        assert!(
+            !tiers(
+                Some("---\nBUNDLE_PATH: \"vendor/bundle\"\nBUNDLE_PATH__SYSTEM: \"true\"\n"),
+                none(),
+                None
+            ),
+            "path.system in the same tier"
+        );
+        assert!(
+            !tiers(
+                Some(local_system),
+                env(Some("vendor/bundle"), None, None),
+                None
+            ),
+            "a local path.system beats an env path"
+        );
+        assert!(
+            !tiers(None, env(Some("vendor/bundle"), Some("true"), None), None),
+            "env path.system beside the env path"
+        );
+        assert!(
+            !tiers(None, env(Some("vendor/bundle"), Some("1"), None), None),
+            "path.system goes through Bundler's to_bool"
+        );
+        assert!(
+            tiers(None, env(Some("vendor/bundle"), Some("no"), None), None),
+            "a falsy path.system keeps the explicit path"
+        );
+        assert!(
+            !tiers(None, env(Some("vendor/bundle"), None, Some("no")), None),
+            "a falsy disable_shared_gems turns system gems back on"
+        );
+        assert!(
+            !tiers(None, env(None, None, Some("false")), Some(local_path)),
+            "env disable_shared_gems=false decides before the global path"
+        );
+        assert!(
+            tiers(Some(local_path), env(None, Some("true"), None), None),
+            "a local path beats an env path.system"
+        );
+        assert!(
+            !tiers(None, env(Some(""), None, None), Some(local_path)),
+            "an empty env path stops at the env tier and isn't explicit"
+        );
+        assert!(
+            !tiers(
+                Some("---\nBUNDLE_PATH__SYSTEM: \"false\"\n"),
+                env(Some("vendor/bundle"), None, None),
+                None
+            ),
+            "a local path.system=false stops at the local tier with no path"
+        );
+    }
+
+    /// #729: project-local tagging compares absolute, normalized paths, so a
+    /// relative `--cwd` (the default `.`) still tags the project's own
+    /// `vendor/bundle` store local. Stores outside the root and `gem env`
+    /// homes are shared, refused config stores are local, and a home
+    /// reachable two ways is listed once.
+    #[test]
+    fn bundler_gem_homes_from_tags_project_local_by_absolute_path() {
+        let cwd = std::env::current_dir().unwrap();
+        let local_store = Path::new("vendor")
+            .join("bundle")
+            .join("ruby")
+            .join("3.3.0")
+            .join("gems");
+        let outside = std::env::temp_dir().join("sp-shared-home").join("gems");
+        let config_store = std::env::temp_dir().join("sp-config-root").join("gems");
+        for project_root in [Path::new("."), Path::new(""), cwd.as_path()] {
+            let homes = bundler_gem_homes_from(
+                project_root,
+                &[local_store.clone(), outside.clone()],
+                &[config_store.clone()],
+                &[
+                    outside.clone(),
+                    cwd.join("vendor").join("rubies").join("gems"),
+                ],
+            );
+            let tag = |dir: &Path| {
+                homes
+                    .iter()
+                    .find(|h| h.gems_dir == dir)
+                    .map(|h| h.project_local)
+            };
+            assert_eq!(homes.len(), 4, "root {project_root:?}: {homes:?}");
+            // An empty root has no base to contain anything.
+            let expect_local = !project_root.as_os_str().is_empty();
+            assert_eq!(
+                tag(&local_store),
+                Some(expect_local),
+                "root {project_root:?}"
+            );
+            assert_eq!(tag(&outside), Some(false), "root {project_root:?}");
+            assert_eq!(tag(&config_store), Some(true), "root {project_root:?}");
+        }
     }
 
     /// Stage a project that used to install into `vendor/bundle` (the

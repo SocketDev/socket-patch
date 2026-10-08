@@ -899,7 +899,11 @@ fn max_new_patches_takes_a_count_or_none() {
         ("NONE", None),
     ] {
         let args = parse_scan(&["--max-new-patches", raw]);
-        assert_eq!(args.rollout.max_new_patches, Some(MaxNewPatches(want)), "{raw}");
+        assert_eq!(
+            args.rollout.max_new_patches,
+            Some(MaxNewPatches(want)),
+            "{raw}"
+        );
     }
 }
 
@@ -990,20 +994,33 @@ fn min_severity_flag_and_env() {
     assert_eq!(parse_scan(&[]).socket_yml.min_severity, None);
     assert_eq!(overrides(&[], &[]).unwrap().min_severity, None);
     assert_eq!(
-        overrides(&["--min-severity", "High"], &[]).unwrap().min_severity,
+        overrides(&["--min-severity", "High"], &[])
+            .unwrap()
+            .min_severity,
         Some((Some(1), OverrideSource::Flag))
     );
     assert_eq!(
-        overrides(&["--min-severity", "none"], &[("SOCKET_MIN_SEVERITY", "critical")]).unwrap().min_severity,
+        overrides(
+            &["--min-severity", "none"],
+            &[("SOCKET_MIN_SEVERITY", "critical")]
+        )
+        .unwrap()
+        .min_severity,
         Some((None, OverrideSource::Flag))
     );
     assert_eq!(
-        overrides(&[], &[("SOCKET_MIN_SEVERITY", "moderate")]).unwrap().min_severity,
+        overrides(&[], &[("SOCKET_MIN_SEVERITY", "moderate")])
+            .unwrap()
+            .min_severity,
         Some((Some(2), OverrideSource::Env))
     );
-    assert_eq!(overrides(&[], &[("SOCKET_MIN_SEVERITY", "")]).unwrap().min_severity, None);
+    assert_eq!(
+        overrides(&[], &[("SOCKET_MIN_SEVERITY", "")])
+            .unwrap()
+            .min_severity,
+        None
+    );
     assert!(overrides(&[], &[("SOCKET_MIN_SEVERITY", "severe")]).is_err());
     assert!(try_parse_scan(&["--min-severity", "severe"]).is_err());
     assert!(overrides(&["--no-socket-yml"], &[]).unwrap().bypass);
 }
-

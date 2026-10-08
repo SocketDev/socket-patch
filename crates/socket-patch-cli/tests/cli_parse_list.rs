@@ -370,7 +370,11 @@ fn missing_manifest_under_valid_cwd_is_not_an_error_via_binary() {
     let out = run_list_binary(tmp.path(), &["--json"]);
     let v: serde_json::Value = serde_json::from_str(String::from_utf8_lossy(&out.stdout).trim())
         .expect("stdout must be valid JSON envelope");
-    assert_eq!(out.status.code(), Some(0), "missing manifest is an empty list");
+    assert_eq!(
+        out.status.code(),
+        Some(0),
+        "missing manifest is an empty list"
+    );
     assert_eq!(v["status"], "success", "envelope: {v}");
     assert_eq!(v["summary"]["discovered"], 0, "envelope: {v}");
 }
@@ -1307,7 +1311,10 @@ fn missing_manifest_with_corrupt_ledger_keeps_warning_in_the_envelope_via_binary
     assert_eq!(v["status"], "success", "envelope={v}");
     let warnings = v["warnings"].as_array().expect("warnings[] present");
     assert_eq!(warnings.len(), 1, "envelope={v}");
-    assert_eq!(warnings[0]["code"], "redirect_ledger_corrupt", "envelope={v}");
+    assert_eq!(
+        warnings[0]["code"], "redirect_ledger_corrupt",
+        "envelope={v}"
+    );
     assert!(
         out.stderr.is_empty(),
         "--json must keep stderr clean: {}",
