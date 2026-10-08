@@ -9,6 +9,10 @@
 //! (`jvm_fixture_repo`) and scans it; toolchain selection is
 //! `gradle_build_common`'s `SOCKET_PATCH_GRADLE_E2E_*` knobs.
 
+#[path = "common/mod.rs"]
+mod common;
+use common::binary;
+
 #[path = "common/hermetic.rs"]
 mod hermetic;
 #[path = "prebuilt_common/mod.rs"]
@@ -35,10 +39,6 @@ const ORG: &str = "test-org";
 const COMMONS_TEXT: &str = "pkg:maven/org.apache.commons/commons-text@1.10.0";
 const BUILD_PLUGIN: &str = "pkg:maven/com.example/build-plugin@1.0";
 const M2_ONLY: &str = "pkg:maven/com.example/m2-only@3.0";
-
-fn binary() -> PathBuf {
-    env!("CARGO_BIN_EXE_socket-patch").into()
-}
 
 /// A batch endpoint that answers every queried purl with one free patch,
 /// so each crawled package shows up in `packages[]`.
