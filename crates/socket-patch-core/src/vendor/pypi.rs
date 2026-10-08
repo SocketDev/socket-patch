@@ -460,10 +460,10 @@ enum WiringPlan {
     /// The ledger entry of an OLDER patch uuid whose Pipfile.lock wiring the
     /// guards admitted for an in-place re-wire (#769), if any.
     Pipenv(Box<PipenvProject>, Option<Box<VendorEntry>>),
-    /// The uv, script-lock or Hatch wiring routes this package through an
-    /// OLDER patch uuid's vendored wheel that the ledger still records
-    /// (#742, #650): replay that entry's revert, then wire this uuid fresh
-    /// ([`unwire_superseded`]).
+    /// The uv, script-lock, Hatch, Poetry or PDM wiring routes this package
+    /// through an OLDER patch uuid's vendored wheel that the ledger still
+    /// records (#742, #650, #1136): replay that entry's revert, then wire
+    /// this uuid fresh ([`unwire_superseded`]).
     Supersede(Box<Superseded>),
     /// The lock already routes this package through THIS patch uuid's
     /// vendored wheel: no wiring — verify (or rebuild) the artifact only.
@@ -942,7 +942,10 @@ async fn pypi_prelude<'p>(
                     warnings.extend(project.warnings.iter().cloned());
                     WiringPlan::Poetry(Box::new(project))
                 }
-                Err((code, detail)) => return Err(refused(code, detail)),
+                Err(refusal) => {
+                    supersede_or_refuse(project_root, flavor, &canon_name, version, record, refusal)
+                        .await?
+                }
             }
         }
         PypiFlavor::Pdm => {
@@ -960,7 +963,10 @@ async fn pypi_prelude<'p>(
                     warnings.extend(project.warnings.iter().cloned());
                     WiringPlan::Pdm(Box::new(project))
                 }
-                Err((code, detail)) => return Err(refused(code, detail)),
+                Err(refusal) => {
+                    supersede_or_refuse(project_root, flavor, &canon_name, version, record, refusal)
+                        .await?
+                }
             }
         }
         PypiFlavor::Pipenv => {
@@ -1572,16 +1578,18 @@ pub async fn vendor_pypi_with_pipenv_version<'a>(
 /// patch uuid of the release (alongside user sources the same codes cover):
 /// uv's `[tool.uv.sources]` path, a script lock / pylock `path` source, and
 /// Hatch's `{root:uri}` direct reference.
-const SUPERSEDABLE_REFUSALS: [&str; 3] = [
+const SUPERSEDABLE_REFUSALS: [&str; 5] = [
     "pypi_uv_source_already_exists",
     "pypi_lock_source_already_exists",
     "pypi_hatch_unsupported",
+    "pypi_poetry_source_already_exists",
+    "pypi_pdm_source_already_exists",
 ];
 
 /// A pyproject-family flavor guard refused the wiring it found. When that
 /// wiring is socket-patch's own, for an OLDER patch uuid of this release
 /// that the ledger still records, it is a superseding patch to re-vendor
-/// (#742, #650) — the same promise the requirements flavor keeps (#765).
+/// (#742, #650, #1136) — the same promise the requirements flavor keeps (#765).
 /// Otherwise the refusal stands.
 async fn supersede_or_refuse(
     project_root: &Path,
@@ -1668,6 +1676,8 @@ fn superseded_files(prev: &VendorEntry, flavor: PypiFlavor) -> Option<Vec<String
     let fixed: &[&str] = match flavor {
         PypiFlavor::UvProject => &["pyproject.toml", "uv.lock"],
         PypiFlavor::Hatch => &["pyproject.toml", "hatch.toml"],
+        PypiFlavor::Poetry => &["poetry.lock"],
+        PypiFlavor::Pdm => &["pdm.lock"],
         _ => &[],
     };
     let mut files: Vec<String> = fixed.iter().map(|f| f.to_string()).collect();
@@ -1872,6 +1882,26 @@ async fn fresh_pyproject_plan(
                 return not_fresh("pypi_hatch_unsupported");
             }
             Ok((WiringPlan::Hatch(project), Vec::new()))
+        }
+        PypiFlavor::Poetry => {
+            let project = super::pypi_poetry::load_poetry_project(project_root).await?;
+            match super::pypi_poetry::check_target_guards(&project, canon_name, version, uuid)? {
+                PoetryTarget::Fresh => {
+                    let warnings = project.warnings.clone();
+                    Ok((WiringPlan::Poetry(Box::new(project)), warnings))
+                }
+                PoetryTarget::InSync => not_fresh("pypi_poetry_source_already_exists"),
+            }
+        }
+        PypiFlavor::Pdm => {
+            let project = super::pypi_pdm::load_pdm_project(project_root).await?;
+            match super::pypi_pdm::check_target_guards(&project, canon_name, version, uuid)? {
+                PdmTarget::Fresh => {
+                    let warnings = project.warnings.clone();
+                    Ok((WiringPlan::Pdm(Box::new(project)), warnings))
+                }
+                PdmTarget::InSync => not_fresh("pypi_pdm_source_already_exists"),
+            }
         }
         other => Err((
             "pypi_vendor_flavor_mismatch",
@@ -6875,8 +6905,9 @@ wheels = [{url = "https://files.pythonhosted.org/six.whl", hash = "sha256:upstre
     const SCRIPT_LOCK: &str = "version = 1\nrevision = 3\nrequires-python = \">=3.9\"\n\n[manifest]\nrequirements = [{name = \"six\", specifier = \"==1.16.0\"}]\n\n[[package]]\nname = \"six\"\nversion = \"1.16.0\"\nsource = {registry = \"https://pypi.org/simple\"}\nwheels = [{url = \"https://files.pythonhosted.org/six.whl\", hash = \"sha256:upstream\"}]\n";
     const HATCH_PROJECT: &str = "[build-system]\nrequires = [\"hatchling\"]\nbuild-backend = \"hatchling.build\"\n\n[project]\nname = \"proj\"\nversion = \"0.1.0\"\ndependencies = [\"six==1.16.0\"]\n";
 
-    /// The pyproject-family flavors #742 (uv project, PEP 723 script lock)
-    /// and #650 (Hatch) cover, each with the files it wires.
+    /// The pyproject-family flavors #742 (uv project, PEP 723 script lock),
+    /// #650 (Hatch) and #1136 (Poetry, PDM) cover, each with the files it
+    /// wires.
     fn superseding_flavors() -> Vec<(&'static str, Vec<(&'static str, &'static str)>)> {
         vec![
             (
@@ -6891,7 +6922,17 @@ wheels = [{url = "https://files.pythonhosted.org/six.whl", hash = "sha256:upstre
                 vec![("example.py", SCRIPT_PY), ("example.py.lock", SCRIPT_LOCK)],
             ),
             ("hatch", vec![("pyproject.toml", HATCH_PROJECT)]),
+            // #1136: Poetry and PDM, LF and CRLF (a CRLF poetry.lock takes
+            // the line-preserving edit path).
+            ("poetry", vec![("poetry.lock", POETRY_LOCK_REGISTRY)]),
+            ("poetry", vec![("poetry.lock", crlf(POETRY_LOCK_REGISTRY))]),
+            ("pdm", vec![("pdm.lock", PDM_LOCK_REGISTRY)]),
+            ("pdm", vec![("pdm.lock", crlf(PDM_LOCK_REGISTRY))]),
         ]
+    }
+
+    fn crlf(text: &str) -> &'static str {
+        Box::leak(text.replace('\n', "\r\n").into_boxed_str())
     }
 
     async fn vendor_six_as(
@@ -7924,9 +7965,11 @@ wheels = [{url = "https://files.pythonhosted.org/six.whl", hash = "sha256:upstre
 
     /// The splice-flavor mirror of
     /// `uv_stale_uuid_vendor_refuses_through_orchestrator`: a lock already
-    /// wired to an EARLIER patch uuid refuses through the orchestrator (the
-    /// poetry/pdm/pipenv guard-Err plan arms), before any new uuid dir is
-    /// created, naming the stale uuid and the revert remediation.
+    /// wired to an EARLIER patch uuid that NO ledger entry records refuses
+    /// through the orchestrator (the poetry/pdm/pipenv guard-Err plan arms),
+    /// before any new uuid dir is created, naming the stale uuid and the
+    /// revert remediation. With the ledger entry it re-vendors instead
+    /// (`pyproject_flavors_revendor_to_a_superseding_uuid`).
     #[tokio::test]
     async fn splice_flavor_stale_uuid_vendor_refuses_through_orchestrator() {
         const UUID2: &str = "0a1b2c3d-4e5f-4a6b-8c7d-9e0f1a2b3c4d";

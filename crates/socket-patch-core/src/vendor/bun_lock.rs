@@ -1092,10 +1092,10 @@ fn classify_rewritable(
     name: &str,
     target_leaf: &str,
 ) -> Option<TupleShape> {
-    if is_bundled_entry(entry) {
-        return None;
-    }
-    classify(entry, target_spec, name, target_leaf)
+    // The cheap spec match runs first; the bundled parse only for a match
+    // (#580).
+    let shape = classify(entry, target_spec, name, target_leaf)?;
+    (!is_bundled_entry(entry)).then_some(shape)
 }
 
 /// Keys of the bundled entries that resolve the target `name@version`.
@@ -1107,7 +1107,7 @@ fn bundled_matches(
 ) -> Vec<String> {
     entries
         .iter()
-        .filter(|e| is_bundled_entry(e) && classify(e, target_spec, name, target_leaf).is_some())
+        .filter(|e| classify(e, target_spec, name, target_leaf).is_some() && is_bundled_entry(e))
         .map(|e| e.key.clone())
         .collect()
 }

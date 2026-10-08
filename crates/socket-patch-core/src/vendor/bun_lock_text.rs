@@ -229,6 +229,12 @@ pub(crate) fn is_bundled_entry(entry: &BunEntry) -> bool {
     let Some(meta) = entry.elems.iter().skip(1).find(|e| e.starts_with('{')) else {
         return false;
     };
+    // Fast path (#580): a meta that never spells `bundled` cannot carry the
+    // key. A backslash could hide it behind a JSON escape, so only a meta
+    // with neither skips the parse.
+    if !meta.contains("bundled") && !meta.contains('\\') {
+        return false;
+    }
     match serde_json::from_str::<serde_json::Value>(meta) {
         Ok(value) => value.get("bundled").and_then(serde_json::Value::as_bool) == Some(true),
         Err(_) => meta.contains("\"bundled\""),
@@ -714,6 +720,26 @@ mod tests {
         ));
         assert!(!bundled(
             r#"    "q": ["q@1.0.0", "", { "bundled": false }, "sha512-X=="],"#
+        ));
+    }
+
+    /// The substring fast path (#580) never changes the answer: a meta that
+    /// never spells `bundled` is not bundled, a malformed meta that does
+    /// still fails closed, and a JSON-escaped key still takes the parse.
+    #[test]
+    fn bundled_fast_path_matches_the_full_parse() {
+        let bundled = |line: &str| is_bundled_entry(&parse_entry_line(line).unwrap());
+        assert!(!bundled(
+            r#"    "q": ["q@1.0.0", "", { "dependencies": { "a": "1" } }, "sha512-X=="],"#
+        ));
+        assert!(!bundled(
+            r#"    "q": ["q@1.0.0", "", { "x": , }, "sha512-X=="],"#
+        ));
+        assert!(bundled(
+            r#"    "q": ["q@1.0.0", "", { "bundled": true, "x": , }, "sha512-X=="],"#
+        ));
+        assert!(bundled(
+            r#"    "q": ["q@1.0.0", "", { "bundl\u0065d": true }, "sha512-X=="],"#
         ));
     }
 

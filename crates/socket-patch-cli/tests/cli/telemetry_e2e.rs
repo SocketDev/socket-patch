@@ -301,7 +301,10 @@ async fn scan_skips_telemetry_in_airgap_mode() {
         "offline scan must report an error envelope; stdout={stdout}"
     );
     assert!(
-        v["error"].as_str().unwrap_or_default().contains("offline"),
+        v["error"]["message"]
+            .as_str()
+            .unwrap_or_default()
+            .contains("offline"),
         "offline scan's error must name the offline gate; stdout={stdout}"
     );
 
@@ -452,7 +455,10 @@ async fn get_skips_telemetry_in_airgap_mode() {
         "offline get must report an error envelope; stdout={stdout}"
     );
     assert!(
-        v["error"].as_str().unwrap_or_default().contains("offline"),
+        v["error"]["message"]
+            .as_str()
+            .unwrap_or_default()
+            .contains("offline"),
         "offline get's error must name the offline gate; stdout={stdout}"
     );
 

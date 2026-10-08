@@ -572,24 +572,22 @@ async fn paths_with_hosted_or_vendored_mode_name_project_directories() {
             "a PATH that is not a directory is a usage error (exit 2) under --mode {mode}; \
              stdout={stdout}; stderr={stderr}"
         );
-        assert!(
-            stderr.contains("`packages/app` is not a directory"),
-            "stderr={stderr}"
-        );
-        assert!(
-            stdout.trim().is_empty(),
-            "a usage error must not print a JSON envelope; stdout={stdout}"
+        // Under --json a usage error prints the coded error on stdout.
+        assert_usage_error(
+            &stdout,
+            "path_not_directory",
+            "`packages/app` is not a directory",
         );
     }
 
     // --json keeps stdout one document: one project directory only.
     let (code, stdout, stderr) = run_scan(tmp.path(), "http://127.0.0.1:1", &["apps/*"]);
     assert_eq!(code, 2, "stdout={stdout}; stderr={stderr}");
-    assert!(
-        stderr.contains("--json takes one project directory (2 given)"),
-        "stderr={stderr}"
+    assert_usage_error(
+        &stdout,
+        "invalid_args",
+        "--json takes one project directory (2 given)",
     );
-    assert!(stdout.trim().is_empty(), "stdout={stdout}");
 
     // --vex names one output document, so it takes one project directory
     // too: two runs would overwrite (or on a failure remove) the same file.
@@ -634,10 +632,23 @@ async fn paths_with_hosted_or_vendored_mode_name_project_directories() {
         code, 2,
         "an invalid glob must be a usage error (exit 2); stdout={stdout}; stderr={stderr}"
     );
+    assert_usage_error(&stdout, "path_glob_invalid", "invalid path pattern");
+}
+
+/// A `--json` usage error: exactly `{status: "error", error: {code,
+/// message}}` on stdout, the message containing `needle`.
+fn assert_usage_error(stdout: &str, code: &str, needle: &str) {
+    let v = parse_envelope(stdout);
+    assert_eq!(v["status"], "error", "{v}");
+    assert_eq!(v["error"]["code"], code, "{v}");
     assert!(
-        stderr.to_lowercase().contains("invalid path pattern"),
-        "the error must name the invalid pattern; stderr={stderr}"
+        v["error"]["message"]
+            .as_str()
+            .is_some_and(|m| m.contains(needle)),
+        "{v}"
     );
+    assert!(v.get("errorCode").is_none(), "{v}");
+    assert_eq!(v.as_object().unwrap().len(), 2, "{v}");
 }
 
 // ---------------------------------------------------------------------------

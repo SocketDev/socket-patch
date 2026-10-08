@@ -58,6 +58,7 @@ use super::{
     bare_sha256_hex, registry_override_of_kind, DepOverride, FileEdit, RewriteResult,
     RewriteWarning,
 };
+use crate::formats::text::{split_bom, strip_bom};
 use crate::gradle::dsl::{self, is_ident, is_punct, Dsl, Tok, Token};
 use crate::gradle::eol::{eol_eq, newline_of, to_lf};
 use crate::gradle::graph::{
@@ -381,7 +382,7 @@ pub fn with_apply_line(
     let line = apply_line(dsl, prefix, digest, created);
     let nl = newline_of(text);
     let mut out = text.to_string();
-    if !out.is_empty() && !out.ends_with('\n') && out != "\u{feff}" {
+    if !strip_bom(&out).is_empty() && !out.ends_with('\n') {
         out.push_str(nl);
     }
     out.push_str(&line);
@@ -396,14 +397,10 @@ pub fn without_apply_line(text: &str, dsl: Dsl, prefix: &str) -> Option<String> 
     let (start, end) = apply_line_span(text, dsl, prefix)?;
     let line_start = text[..start].rfind('\n').map_or(0, |i| i + 1);
     let lead = &text[line_start..start];
-    if !lead.trim_start_matches('\u{feff}').trim().is_empty() {
+    let (keep_bom, lead) = split_bom(lead);
+    if !lead.trim().is_empty() {
         return None;
     }
-    let keep_bom = if lead.starts_with('\u{feff}') {
-        "\u{feff}"
-    } else {
-        ""
-    };
     let mut cut_end = end;
     if text[cut_end..].starts_with("\r\n") {
         cut_end += 2;
@@ -1870,6 +1867,18 @@ mod tests {
         assert_eq!(
             with_apply_line(kts, Dsl::Kotlin, "", "4567", true).as_deref(),
             Some("\u{feff}apply(from = \".socket/gradle/socket-patch.hosted.settings.gradle\") // socket-patch-hosted 4567\r\nrootProject.name = \"x\"\r\n")
+        );
+        // A second BOM is content (#905): the apply line shares its line
+        // with it, so it is not cut out.
+        let two = format!("\u{feff}{kts}");
+        assert_eq!(without_apply_line(&two, Dsl::Kotlin, ""), None);
+        // A file holding only a BOM gets no blank line before the apply line.
+        assert_eq!(
+            with_apply_line("\u{feff}", Dsl::Kotlin, "", "4567", true)
+                .unwrap()
+                .split_once("apply(")
+                .map(|(head, _)| head),
+            Some("\u{feff}")
         );
     }
 

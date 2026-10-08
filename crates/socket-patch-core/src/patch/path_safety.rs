@@ -25,6 +25,15 @@ pub(crate) fn is_safe_single_segment(s: &str) -> bool {
         && !s.contains('\0')
 }
 
+/// A `name` + `version` pair that each key one path segment: the cargo
+/// `<name>-<version>` registry dir, the gem `<name>-<version>` dir, the
+/// NuGet `<id>/<version>` and legacy `<Id>.<Version>` dirs, and the purls
+/// built from them. Every crawler that resolves a manifest purl to a
+/// directory it then patches in place checks both halves here, fail closed.
+pub(crate) fn is_safe_name_version(name: &str, version: &str) -> bool {
+    is_safe_single_segment(name) && is_safe_single_segment(version)
+}
+
 /// A multi-segment relative path (Go module path `github.com/foo/bar`, npm
 /// scoped name `@scope/name`, composer `vendor/name`): every `/`-separated
 /// segment must be safe on its own, which also rejects the empty string, a
@@ -84,6 +93,81 @@ mod tests {
         // A leading `C:` is an absolute Windows path under `Path::join`.
         assert!(!is_safe_single_segment("C:evil"));
         assert!(!is_safe_single_segment("c:"));
+    }
+
+    /// The cargo, gem and NuGet coordinates the crawlers' former
+    /// `is_safe_{cargo,gem,nuget}_coordinate` copies were pinned on.
+    const SAFE_NAME_VERSIONS: &[(&str, &str)] = &[
+        ("serde", "1.0.200"),
+        ("serde_json", "1.0.120"),
+        ("sha-1", "0.10.0"),
+        ("crate", "1.0.0-rc.1"),
+        ("wasi", "0.11.0+wasi-snapshot-preview1"),
+        ("rails", "7.1.0"),
+        ("aws-sdk-s3", "1.143.0"),
+        ("ruby2_keywords", "0.0.5"),
+        ("nokogiri", "1.16.5.pre.rc1"),
+        ("Newtonsoft.Json", "13.0.3"),
+        ("Contoso.Widgets", "2.0.0-RC1"),
+        ("xunit", "2.6.2+build.5"),
+    ];
+
+    /// Traversal, separator, NUL, empty and drive-relative (`C:`) halves:
+    /// the union of the three crawler test copies.
+    const UNSAFE_NAME_VERSIONS: &[(&str, &str)] = &[
+        ("", "1.0.0"),
+        ("a", ""),
+        ("..", "1.0.0"),
+        (".", "1.0.0"),
+        ("a", ".."),
+        ("a", "."),
+        ("../escaped", "1.0.0"),
+        ("/abs/evil", "1.0.0"),
+        ("a/b", "1.0.0"),
+        ("a", "1/0"),
+        ("a", "../../escaped/1.0.0"),
+        ("rails", "1.0/../../x"),
+        ("a\\b", "1.0.0"),
+        ("a\0b", "1.0.0"),
+        ("C:evil", "1.0.0"),
+        ("a", "C:1.0.0"),
+    ];
+
+    #[test]
+    fn name_version_accepts_real_coordinates_and_fails_closed() {
+        for &(name, version) in SAFE_NAME_VERSIONS {
+            assert!(is_safe_name_version(name, version), "{name:?} {version:?}");
+        }
+        for &(name, version) in UNSAFE_NAME_VERSIONS {
+            assert!(!is_safe_name_version(name, version), "{name:?} {version:?}");
+        }
+    }
+
+    /// The purl builders that inlined the same check now share it: each
+    /// builds exactly the pairs the guard accepts.
+    #[test]
+    fn purl_builders_agree_with_the_name_version_guard() {
+        use crate::utils::purl::{pypi_purl, simple_purl};
+        for &(name, version) in SAFE_NAME_VERSIONS.iter().chain(UNSAFE_NAME_VERSIONS) {
+            let safe = is_safe_name_version(name, version);
+            for ty in ["cargo", "gem", "nuget"] {
+                assert_eq!(
+                    simple_purl(ty, name, version).is_some(),
+                    safe,
+                    "{ty} {name:?} {version:?}"
+                );
+            }
+            // PyPI canonicalizes the name first; `.`/`..` and `_` names
+            // change shape, so only compare the names it keeps verbatim.
+            let canonical = crate::crawlers::python_crawler::canonicalize_pypi_name(name);
+            if canonical == name {
+                assert_eq!(
+                    pypi_purl(name, version).is_some(),
+                    safe,
+                    "pypi {name:?} {version:?}"
+                );
+            }
+        }
     }
 
     #[test]

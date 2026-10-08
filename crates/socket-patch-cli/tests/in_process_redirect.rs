@@ -1925,7 +1925,7 @@ async fn symlinked_bun_lockb_refuses_before_editing_including_dry_run() {
         let env: serde_json::Value = serde_json::from_slice(&output.stdout).unwrap();
         assert_eq!(output.status.code(), Some(1), "{env:#}");
         assert_eq!(
-            env["errorCode"], "redirect_symlinked_file_unsupported",
+            env["error"]["code"], "redirect_symlinked_file_unsupported",
             "{env:#}"
         );
         assert_eq!(
@@ -3736,7 +3736,9 @@ async fn redirect_json_mode_failures_emit_error_envelope() {
             "{leg}: envelope status; stdout=\n{stdout}"
         );
         assert!(
-            v["error"].as_str().is_some_and(|m| !m.is_empty()),
+            v["error"]["message"]
+                .as_str()
+                .is_some_and(|m| !m.is_empty()),
             "{leg}: envelope must carry the error message; stdout=\n{stdout}"
         );
         assert_eq!(
@@ -3840,7 +3842,9 @@ fn assert_write_failure_envelope(out: &std::process::Output, leg: &str) {
     });
     assert_eq!(v["status"], "error", "{leg}: status; stdout=\n{stdout}");
     assert!(
-        v["error"].as_str().is_some_and(|m| !m.is_empty()),
+        v["error"]["message"]
+            .as_str()
+            .is_some_and(|m| !m.is_empty()),
         "{leg}: envelope must carry the error message; stdout=\n{stdout}"
     );
     assert_eq!(
@@ -5886,11 +5890,11 @@ async fn cargo_hosted_scan_from_workspace_member_refuses() {
     assert_eq!(out.status.code(), Some(1), "{doc}");
     assert_eq!(doc["status"], "error", "{doc}");
     assert_eq!(
-        doc["errorCode"], "cargo_manifest_not_workspace_root",
+        doc["error"]["code"], "cargo_manifest_not_workspace_root",
         "{doc}"
     );
     assert!(
-        doc["error"]
+        doc["error"]["message"]
             .as_str()
             .is_some_and(|m| m.contains("workspace root") && m.contains("nothing was written")),
         "{doc}"
