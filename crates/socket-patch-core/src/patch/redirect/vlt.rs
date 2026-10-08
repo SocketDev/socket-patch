@@ -90,15 +90,6 @@ pub(super) fn parse_hosted_lock(text: &str) -> Result<HostedLock, RewriteWarning
     Ok(HostedLock { parsed, nodes })
 }
 
-/// The lock-level refusal alone, run before any vendored vlt entry is
-/// reverted for a hosted takeover. An absent lock passes.
-pub fn preflight_vlt_hosted(files: &BTreeMap<String, String>) -> Result<(), RewriteWarning> {
-    match files.get(VLT_LOCK) {
-        Some(text) => parse_hosted_lock(text).map(|_| ()),
-        None => Ok(()),
-    }
-}
-
 /// Is `id` a registry node of `name@version`, and is its segment the
 /// default registry? `None` for any other node.
 fn registry_instance(
@@ -673,6 +664,14 @@ pub fn carried_pin_original(fresh: &FileEdit, old: &FileEdit) -> Option<Value> {
 mod tests {
     use super::*;
 
+    /// The rewriter's lock-level refusal alone. An absent lock passes.
+    fn lock_level_refusal(files: &BTreeMap<String, String>) -> Result<(), RewriteWarning> {
+        match files.get(VLT_LOCK) {
+            Some(text) => parse_hosted_lock(text).map(|_| ()),
+            None => Ok(()),
+        }
+    }
+
     const SHA: &str = "sha512-PATCHED==";
     const URL: &str = "https://patch.socket.dev/patch/npm/t/u/left-pad-1.3.0.tgz";
     const REG_SHA: &str = "sha512-REGISTRY==";
@@ -901,7 +900,7 @@ mod tests {
     #[test]
     fn lock_level_parse_refusals() {
         let refused = |text: &str| {
-            preflight_vlt_hosted(&files(&[(VLT_LOCK, text)]))
+            lock_level_refusal(&files(&[(VLT_LOCK, text)]))
                 .unwrap_err()
                 .detail
         };
@@ -912,10 +911,10 @@ mod tests {
             "{{\n  \"lockfileVersion\": 1,\n  \"nodes\": {{\n    \"{ID}\": [\n      0,\n      \"left-pad\"\n    ]\n  }}\n}}\n"
         );
         assert!(refused(&pretty).contains("canonical layout"));
-        assert!(preflight_vlt_hosted(&files(&[])).is_ok());
-        assert!(preflight_vlt_hosted(&files(&[(VLT_LOCK, "{\"nodes\": {}}")])).is_ok());
+        assert!(lock_level_refusal(&files(&[])).is_ok());
+        assert!(lock_level_refusal(&files(&[(VLT_LOCK, "{\"nodes\": {}}")])).is_ok());
         let ok = lock_with(&[&registry_entry()]);
-        assert!(preflight_vlt_hosted(&files(&[(VLT_LOCK, &ok)])).is_ok());
+        assert!(lock_level_refusal(&files(&[(VLT_LOCK, &ok)])).is_ok());
     }
 
     #[test]
@@ -994,7 +993,7 @@ mod tests {
             &format!("\"{peer}\": [6,\"left-pad\",\"{REG_SHA}\",\"{BR_URL}\"]"),
             "\"~npm~other@1.0.0\": [5,\"other\",\"sha512-O==\"]",
         ]);
-        assert!(preflight_vlt_hosted(&files(&[(VLT_LOCK, &lock)])).is_ok());
+        assert!(lock_level_refusal(&files(&[(VLT_LOCK, &lock)])).is_ok());
 
         let result = rewrite(&lock, &[dep("left-pad", "1.3.0", Some(SHA))]);
         assert!(codes(&result).is_empty(), "{:?}", result.warnings);

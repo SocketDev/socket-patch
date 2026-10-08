@@ -511,13 +511,12 @@ pub(crate) async fn revert(entry: &VendorEntry, root: &Path, opts: RevertOpts) -
     }
     if !opts.keep_artifact {
         for mirror in mirrors_to_remove {
-            if let Err(e) = tokio::fs::remove_file(&mirror).await {
+            if let Err(e) = remove_mirror(&mirror).await {
                 return RevertOutcome::failed(format!(
                     "cannot remove workspace tarball {}: {e}",
                     mirror.display()
                 ));
             }
-            prune_mirror_parents(&mirror).await;
         }
         // The last npm-family entry leaves `.socket/vendor/npm/` (and
         // `.socket/vendor/`) empty: the shared helper prunes them so a
@@ -579,6 +578,24 @@ pub(super) fn validate_mirror_path(root: &Path, rel: &str) -> Result<PathBuf, St
         }
     }
     Ok(path)
+}
+
+/// Remove a reverted workspace tarball and prune its emptied parents
+/// through the workspace's `.socket/`, or queue both for after the commit
+/// of a staged hosted takeover (see `group_commit::defer_removal`).
+pub(super) async fn remove_mirror(path: &Path) -> std::io::Result<()> {
+    let bound = path
+        .ancestors()
+        .skip(1)
+        .take(5)
+        .find(|dir| dir.file_name().is_some_and(|name| name == ".socket"))
+        .unwrap_or(path);
+    if crate::utils::group_commit::defer_removal(path, bound) {
+        return Ok(());
+    }
+    tokio::fs::remove_file(path).await?;
+    prune_mirror_parents(path).await;
+    Ok(())
 }
 
 pub(super) async fn prune_mirror_parents(path: &Path) {
