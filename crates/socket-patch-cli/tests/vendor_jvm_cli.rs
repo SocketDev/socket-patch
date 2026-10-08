@@ -657,6 +657,54 @@ fn check_refuses_a_missing_ledger_and_honors_manifest_path() {
     assert_eq!(snapshot(root), before);
 }
 
+/// B62: committed JVM trees with no JVM ledger entry are orphans even when
+/// the ledger records OTHER ecosystems' entries — the guard used to fire
+/// only on an entirely empty ledger.
+#[test]
+fn check_reports_jvm_trees_without_a_jvm_entry_beside_other_entries() {
+    let tmp = tempfile::tempdir().unwrap();
+    let root = tmp.path();
+    fixture(root, Shape::Gradle, &[("foo", FOO_UUID)]);
+    ok(root, &["vendor"]);
+    std::fs::remove_file(root.join("proj/.socket/manifest.json")).unwrap();
+    let state_path = root.join("proj/.socket/vendor/state.json");
+    let mut state: serde_json::Value =
+        serde_json::from_str(&std::fs::read_to_string(&state_path).unwrap()).unwrap();
+    let other = "1a2b3c4d-5e6f-4a1b-8c2d-9e0f1a2b3c4d";
+    state["entries"] = serde_json::json!({
+        "pkg:npm/left-pad@1.3.0": {
+            "ecosystem": "npm",
+            "basePurl": "pkg:npm/left-pad@1.3.0",
+            "uuid": other,
+            "artifact": {
+                "path": format!(".socket/vendor/npm/{other}/left-pad-1.3.0.tgz"),
+                "sha256": "",
+            },
+            "wiring": [],
+        }
+    });
+    std::fs::write(&state_path, state.to_string()).unwrap();
+    let before = snapshot(root);
+    let (code, env) = socket(root, &["vendor", "--check"]);
+    assert_eq!(code, Some(1), "{env}");
+    let events = env["events"].as_array().expect("events");
+    let orphan = events
+        .iter()
+        .find(|e| {
+            e.to_string().contains("vendor_ledger_missing") && e["details"]["ecosystem"] == "maven"
+        })
+        .unwrap_or_else(|| panic!("no JVM orphan event: {env}"));
+    // The event names the orphaned JVM layout itself, not the npm entry
+    // (which fails `--check` on its own for its missing artifact).
+    let path = orphan["details"]["path"].as_str().expect("orphan path");
+    assert!(
+        socket_patch_core::vendor::jvm::apply::LEDGER_OWNED_PATHS.contains(&path),
+        "{path}: {env}"
+    );
+    assert!(root.join("proj").join(path).exists(), "{path}");
+    assert_eq!(snapshot(root), before);
+}
+
 #[test]
 fn vex_reports_an_unreadable_jvm_layout_instead_of_an_unwired_patch() {
     for shape in [Shape::Reactor, Shape::Gradle] {
