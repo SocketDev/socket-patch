@@ -11,6 +11,7 @@ on:
   # compile (a later `!` pattern excludes, a later plain one re-includes).
   # Main pushes stay unfiltered.
   pull_request:
+    types: [opened, synchronize, reopened, ready_for_review]
     paths:
       - '.github/actions/upload-artifact/**'
       - 'Cargo.lock'
@@ -45,6 +46,7 @@ concurrency:
 
 jobs:
   build:
+    if: github.event.pull_request.draft != true
     runs-on: ubuntu-latest
     timeout-minutes: 25
     steps:

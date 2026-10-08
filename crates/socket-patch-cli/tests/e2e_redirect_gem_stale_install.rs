@@ -1255,3 +1255,233 @@ async fn gem_hosted_stale_install_under_out_of_tree_config_path_is_not_attested(
         UPSTREAM_LIB
     );
 }
+
+/// Lay down a stale UNPATCHED copy in a machine gem home (`<home>/gems/…`,
+/// plus its cache `.gem` and specifications entry) and a fake `gem` on
+/// `<bin_dir>` whose `gem env gemdir` answers that home (and whose
+/// `gempath` fails), so the crawler's `gem env` fallback resolves to
+/// exactly this one home. Returns the installed gem dir.
+#[cfg(unix)]
+fn stage_system_home_copy(home: &Path, bin_dir: &Path) -> PathBuf {
+    use std::os::unix::fs::PermissionsExt;
+    let gem_dir = home.join("gems").join(format!("{DEP}-{DEP_VERSION}"));
+    std::fs::create_dir_all(gem_dir.join("lib")).unwrap();
+    std::fs::write(gem_dir.join("lib").join("stale_probe_gem.rb"), UPSTREAM_LIB).unwrap();
+    std::fs::create_dir_all(home.join("cache")).unwrap();
+    std::fs::write(
+        home.join("cache").join(format!("{DEP}-{DEP_VERSION}.gem")),
+        b"upstream-gem-archive-bytes",
+    )
+    .unwrap();
+    std::fs::create_dir_all(home.join("specifications")).unwrap();
+    std::fs::write(
+        home.join("specifications")
+            .join(format!("{DEP}-{DEP_VERSION}.gemspec")),
+        "# stub gemspec\n",
+    )
+    .unwrap();
+    std::fs::create_dir_all(bin_dir).unwrap();
+    let script = format!(
+        "#!/bin/sh\nif [ \"$1\" = env ] && [ \"$2\" = gemdir ]; then\n  printf '%s\\n' \"{}\"\n  exit 0\nfi\nexit 1\n",
+        home.display()
+    );
+    let bin = bin_dir.join("gem");
+    std::fs::write(&bin, script).unwrap();
+    std::fs::set_permissions(&bin, std::fs::Permissions::from_mode(0o755)).unwrap();
+    gem_dir
+}
+
+/// One `scan --mode hosted --json --vex` run over `proj` with `PATH`
+/// narrowed to `bin_dir` (the fake `gem`) plus `extra_env`.
+#[cfg(unix)]
+fn hosted_vex_scan_with_gem_on_path(
+    proj: &Path,
+    api: &str,
+    bin_dir: &Path,
+    extra_env: &[(&str, &str)],
+) -> (i32, serde_json::Value, String, PathBuf) {
+    let vex_path = proj.join("out.vex.json");
+    let path_env = bin_dir.to_str().unwrap().to_string();
+    let mut env: Vec<(&str, &str)> = vec![("PATH", path_env.as_str())];
+    env.extend_from_slice(extra_env);
+    let (code, stdout, stderr) = common::run_with_env(
+        proj,
+        &[
+            "scan",
+            "--mode",
+            "hosted",
+            "--json",
+            "--yes",
+            "--cwd",
+            proj.to_str().unwrap(),
+            "--api-url",
+            api,
+            "--org",
+            ORG,
+            "--api-token",
+            "fake",
+            "--vex",
+            vex_path.to_str().unwrap(),
+            "--vex-product",
+            "pkg:gem/app@1.0.0",
+        ],
+        &env,
+    );
+    let env = common::parse_json_envelope(&stdout);
+    (code, env, stderr, vex_path)
+}
+
+/// #1001: the project sets an explicit Bundler install `path` (local config
+/// or env `BUNDLE_PATH`) that isn't installed yet, as on every fresh clone
+/// or cold CI cache. Bundler then fetches non-default gems into that path
+/// and never reuses a copy in the machine's `gem env` home, so an unpatched
+/// copy there is not stale for this project: no warning, and the same
+/// run's `--vex` attests the purl (exit 0).
+#[cfg(unix)]
+#[tokio::test(flavor = "multi_thread")]
+async fn gem_hosted_explicit_bundle_path_ignores_system_home_copy() {
+    let server = MockServer::start().await;
+    mount_api(&server, None).await;
+    for via_env in [false, true] {
+        let tmp = tempfile::tempdir().unwrap();
+        let proj = tmp.path().join("proj");
+        std::fs::create_dir_all(&proj).unwrap();
+        write_manifest_pair(&proj);
+        let extra: &[(&str, &str)] = if via_env {
+            &[("BUNDLE_PATH", "vendor/bundle")]
+        } else {
+            std::fs::create_dir_all(proj.join(".bundle")).unwrap();
+            std::fs::write(
+                proj.join(".bundle").join("config"),
+                "---\nBUNDLE_PATH: \"vendor/bundle\"\n",
+            )
+            .unwrap();
+            &[]
+        };
+        let bin_dir = tmp.path().join("fake-bin");
+        let system_copy = stage_system_home_copy(&tmp.path().join("system-home"), &bin_dir);
+
+        let (code, env, stderr, vex_path) =
+            hosted_vex_scan_with_gem_on_path(&proj, &server.uri(), &bin_dir, extra);
+        assert!(
+            stale_warnings(&env).is_empty(),
+            "via_env={via_env}: bundler never reuses {} under an explicit path: {env}",
+            system_copy.display()
+        );
+        assert_eq!(
+            code, 0,
+            "via_env={via_env}: the run must attest, not fail.\nenvelope: {env}\nstderr:\n{stderr}"
+        );
+        let doc = std::fs::read_to_string(&vex_path).expect("VEX written");
+        assert!(
+            doc.contains(PURL),
+            "via_env={via_env}: purl not attested:\n{doc}"
+        );
+    }
+}
+
+/// #1001 control: with no Bundler `path` setting, `bundle install` installs
+/// into and reuses the `gem env` home, so a stale copy there still warns
+/// (shared-home flavor) and stays out of the same run's VEX. The same holds
+/// when a local `path.system: true` outranks an env `BUNDLE_PATH`: Bundler's
+/// first deciding tier turns system gems back on.
+#[cfg(unix)]
+#[tokio::test(flavor = "multi_thread")]
+async fn gem_hosted_system_install_still_flags_system_home_copy() {
+    let server = MockServer::start().await;
+    mount_api(&server, None).await;
+    for local_system_over_env_path in [false, true] {
+        let tmp = tempfile::tempdir().unwrap();
+        let proj = tmp.path().join("proj");
+        std::fs::create_dir_all(&proj).unwrap();
+        write_manifest_pair(&proj);
+        let extra: &[(&str, &str)] = if local_system_over_env_path {
+            std::fs::create_dir_all(proj.join(".bundle")).unwrap();
+            std::fs::write(
+                proj.join(".bundle").join("config"),
+                "---\nBUNDLE_PATH__SYSTEM: \"true\"\n",
+            )
+            .unwrap();
+            &[("BUNDLE_PATH", "vendor/bundle")]
+        } else {
+            &[]
+        };
+        let bin_dir = tmp.path().join("fake-bin");
+        let system_copy = stage_system_home_copy(&tmp.path().join("system-home"), &bin_dir);
+
+        let (code, env, stderr, vex_path) =
+            hosted_vex_scan_with_gem_on_path(&proj, &server.uri(), &bin_dir, extra);
+        let case = format!("local_system_over_env_path={local_system_over_env_path}");
+        let warnings = stale_warnings(&env);
+        assert_eq!(warnings.len(), 1, "{case}: {env}");
+        assert!(
+            warnings[0].contains(&system_copy.display().to_string())
+                && warnings[0].contains("shared gem home"),
+            "{case}: {}",
+            warnings[0]
+        );
+        if let Ok(doc) = std::fs::read_to_string(&vex_path) {
+            assert!(!doc.contains(PURL), "{case}: stale purl attested:\n{doc}");
+        }
+        assert_ne!(
+            code, 0,
+            "{case}: an all-stale --vex run must fail.\nstderr:\n{stderr}"
+        );
+    }
+}
+
+/// #729: run from the project root with `--cwd` left at its default (`.`).
+/// The project's own `vendor/bundle` is project-local whatever spelling
+/// `--cwd` has, so the stale copy there takes the delete-list remedy (not
+/// the "shared gem home" caveat), and the committed `vendor/cache`
+/// archive is folded into that warning instead of warning separately.
+#[tokio::test(flavor = "multi_thread")]
+async fn gem_hosted_default_cwd_keeps_project_local_remedy() {
+    let server = MockServer::start().await;
+    mount_api(&server, None).await;
+    let tmp = tempfile::tempdir().unwrap();
+    let proj = tmp.path().join("proj");
+    std::fs::create_dir_all(&proj).unwrap();
+    write_manifest_pair(&proj);
+    materialize_installed_gem(&proj, "3.3.0", UPSTREAM_LIB);
+    std::fs::create_dir_all(proj.join("vendor").join("cache")).unwrap();
+    std::fs::write(
+        proj.join("vendor")
+            .join("cache")
+            .join(format!("{DEP}-{DEP_VERSION}.gem")),
+        b"upstream-gem-archive-bytes",
+    )
+    .unwrap();
+
+    for cwd_args in [&[][..], &["--cwd", "."][..]] {
+        let mut args = vec!["scan", "--mode", "hosted", "--json", "--yes", "--api-url"];
+        let uri = server.uri();
+        args.push(&uri);
+        args.extend_from_slice(&["--org", ORG, "--api-token", "fake"]);
+        args.extend_from_slice(cwd_args);
+        let (code, stdout, stderr) = common::run_with_env(&proj, &args, &[]);
+        assert_eq!(
+            code, 0,
+            "args={args:?}\nstdout:\n{stdout}\nstderr:\n{stderr}"
+        );
+        let env = common::parse_json_envelope(&stdout);
+        let warnings = stale_warnings(&env);
+        assert_eq!(
+            warnings.len(),
+            1,
+            "args={args:?}: one project-local warning with the cache archive folded in: {env}"
+        );
+        let detail = &warnings[0];
+        assert!(
+            detail.contains("Remove the stale") && !detail.contains("shared gem home"),
+            "args={args:?}: the project's own vendor/bundle is project-local: {detail}"
+        );
+        let cache_archive = Path::new("vendor")
+            .join("cache")
+            .join(format!("{DEP}-{DEP_VERSION}.gem"));
+        assert!(
+            detail.contains(&cache_archive.display().to_string()),
+            "args={args:?}: the committed cache archive belongs in the delete list: {detail}"
+        );
+    }
+}

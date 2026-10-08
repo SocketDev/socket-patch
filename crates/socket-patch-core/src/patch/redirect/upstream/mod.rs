@@ -471,9 +471,7 @@ pub struct RestoreOutcome {
 
 impl RestoreOutcome {
     pub fn restored(&self) -> impl Iterator<Item = &PinResult> {
-        self.pins
-            .iter()
-            .filter(|p| p.status == PinStatus::Restored)
+        self.pins.iter().filter(|p| p.status == PinStatus::Restored)
     }
 
     pub fn refused(&self) -> impl Iterator<Item = (&PinResult, &str)> {
@@ -808,9 +806,7 @@ async fn restore_pass(view: &mut View<'_>, active: &[&HostedPin], ctx: &Ctx<'_>)
             Format::YarnLock => npm::restore_yarn_locks(view, &pins, &files, ctx).await,
             Format::PnpmLock => npm::restore_pnpm_locks(view, &pins, &files, ctx).await,
             Format::BunLock => npm::restore_bun_locks(view, &pins, &files, ctx).await,
-            Format::BunLockb if ctx.bun_lockb => {
-                bun_lockb::restore(view, &pins, &files, ctx).await
-            }
+            Format::BunLockb if ctx.bun_lockb => bun_lockb::restore(view, &pins, &files, ctx).await,
             Format::Cargo => cargo::restore(view, &pins, &files, ctx).await,
             Format::Golang => golang::restore(view, &pins, &files, ctx).await,
             Format::Gem => gem::restore(view, &pins, &files, ctx).await,

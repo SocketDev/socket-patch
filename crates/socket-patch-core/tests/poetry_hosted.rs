@@ -1,6 +1,4 @@
-use socket_patch_core::patch::redirect::{
-    rewrite_registry_redirect, DepOverride, Integrity,
-};
+use socket_patch_core::patch::redirect::{rewrite_registry_redirect, DepOverride, Integrity};
 use socket_patch_core::utils::poetry_lock::rewrite_poetry_lock;
 use std::collections::BTreeMap;
 
@@ -63,7 +61,11 @@ fn native_lock_generations_redirect_idempotently() {
             let codes: Vec<&str> = result.warnings.iter().map(|w| w.code.as_str()).collect();
             assert_eq!(
                 codes,
-                if pre_1_4 { vec!["redirect_poetry_stale_install_risk"] } else { vec![] },
+                if pre_1_4 {
+                    vec!["redirect_poetry_stale_install_risk"]
+                } else {
+                    vec![]
+                },
                 "{version}: {:?}",
                 result.warnings
             );
@@ -92,12 +94,24 @@ fn hosted_shapes_match_each_lock_generations_installer() {
     )
     .files["poetry.lock"]
         .clone();
-    assert!(lock10.contains(&format!("url = \"{URL}#sha256={sha}&\"")), "{lock10}");
+    assert!(
+        lock10.contains(&format!("url = \"{URL}#sha256={sha}&\"")),
+        "{lock10}"
+    );
     assert!(lock10.contains("reference = \"\""), "{lock10}");
-    assert!(lock10.contains(&format!("urllib3 = [{{ file = \"{WHEEL}\", hash = \"sha256:{sha}\" }}]")), "{lock10}");
+    assert!(
+        lock10.contains(&format!(
+            "urllib3 = [{{ file = \"{WHEEL}\", hash = \"sha256:{sha}\" }}]"
+        )),
+        "{lock10}"
+    );
     // Poetry >= 1.2 consuming this 1.0 lock verifies the package `files`
     // entry, so it is written too (1.0 ignores the extra key).
-    assert_eq!(lock10.matches(&format!("sha256:{sha}")).count(), 2, "{lock10}");
+    assert_eq!(
+        lock10.matches(&format!("sha256:{sha}")).count(),
+        2,
+        "{lock10}"
+    );
     let doc: toml_edit::DocumentMut = lock10.parse().unwrap();
     assert!(doc["package"][0]["files"].is_array(), "{lock10}");
 
@@ -124,7 +138,11 @@ fn hosted_shapes_match_each_lock_generations_installer() {
         &BTreeMap::from([("poetry.lock".to_string(), lock10_populated)]),
         &[patch()],
     );
-    assert!(rerun.files.is_empty() && rerun.warnings.is_empty(), "{:?}", rerun.warnings);
+    assert!(
+        rerun.files.is_empty() && rerun.warnings.is_empty(),
+        "{:?}",
+        rerun.warnings
+    );
 
     let lock11 = rewrite_registry_redirect(
         &BTreeMap::from([("poetry.lock".to_string(), original("1.2.2"))]),
@@ -132,8 +150,15 @@ fn hosted_shapes_match_each_lock_generations_installer() {
     )
     .files["poetry.lock"]
         .clone();
-    assert_eq!(lock11.matches(&format!("sha256:{sha}")).count(), 2, "package files + metadata.files:\n{lock11}");
-    assert!(lock11.contains(&format!("url = \"{URL}\"")), "no fragment on 1.1");
+    assert_eq!(
+        lock11.matches(&format!("sha256:{sha}")).count(),
+        2,
+        "package files + metadata.files:\n{lock11}"
+    );
+    assert!(
+        lock11.contains(&format!("url = \"{URL}\"")),
+        "no fragment on 1.1"
+    );
     assert!(!lock11.contains("reference"), "{lock11}");
     let doc: toml_edit::DocumentMut = lock11.parse().unwrap();
     assert!(doc["package"][0]["files"].is_array());
@@ -145,11 +170,19 @@ fn hosted_shapes_match_each_lock_generations_installer() {
     )
     .files["poetry.lock"]
         .clone();
-    assert_eq!(lock21.matches(&format!("sha256:{sha}")).count(), 1, "{lock21}");
+    assert_eq!(
+        lock21.matches(&format!("sha256:{sha}")).count(),
+        1,
+        "{lock21}"
+    );
     assert!(!lock21.contains("reference"));
     let pristine: toml_edit::DocumentMut = original("2.4.3").parse().unwrap();
     let doc: toml_edit::DocumentMut = lock21.parse().unwrap();
-    assert_eq!(doc["metadata"].to_string(), pristine["metadata"].to_string(), "[metadata] untouched on 2.x");
+    assert_eq!(
+        doc["metadata"].to_string(),
+        pristine["metadata"].to_string(),
+        "[metadata] untouched on 2.x"
+    );
 }
 
 #[test]
@@ -248,14 +281,21 @@ fn absent_entries_warn_once_and_missing_sha256_is_gated_once_per_dep() {
     let codes: Vec<&str> = result.warnings.iter().map(|w| w.code.as_str()).collect();
     assert_eq!(
         codes,
-        vec!["redirect_poetry_entry_not_found", "redirect_poetry_entry_not_found"]
+        vec![
+            "redirect_poetry_entry_not_found",
+            "redirect_poetry_entry_not_found"
+        ]
     );
     let mut missing_hash = patch();
     missing_hash.integrity.sha256 = None;
     let result = rewrite_registry_redirect(&files, &[missing_hash]);
     assert!(result.files.is_empty());
     let codes: Vec<&str> = result.warnings.iter().map(|w| w.code.as_str()).collect();
-    assert_eq!(codes, vec!["redirect_poetry_missing_sha256"], "gated once, not once per lock");
+    assert_eq!(
+        codes,
+        vec!["redirect_poetry_missing_sha256"],
+        "gated once, not once per lock"
+    );
 }
 
 /// A future Poetry that bumps the lock minor (2.2) is rewritten like 2.1 in
@@ -278,11 +318,20 @@ fn rotated_grant_token_supersedes_the_prior_hosted_url() {
     let first = rewrite_registry_redirect(&files, &[patch()]);
     let mut rotated = patch();
     rotated.token = "00000000-0000-4000-8000-000000000000".into();
-    rotated.artifact_url = URL.replace("7e52b8b6-53f2-4dc8-860a-1ae7ebd8be0e", "00000000-0000-4000-8000-000000000000");
+    rotated.artifact_url = URL.replace(
+        "7e52b8b6-53f2-4dc8-860a-1ae7ebd8be0e",
+        "00000000-0000-4000-8000-000000000000",
+    );
     let second = rewrite_registry_redirect(&first.files, &[rotated.clone()]);
     assert!(second.warnings.is_empty(), "{:?}", second.warnings);
     let lock = &second.files["poetry.lock"];
     assert!(lock.contains(&rotated.artifact_url) && !lock.contains(URL));
     assert_eq!(second.edits.len(), 1);
-    assert!(second.edits[0].original.as_ref().unwrap().as_str().unwrap().contains(URL));
+    assert!(second.edits[0]
+        .original
+        .as_ref()
+        .unwrap()
+        .as_str()
+        .unwrap()
+        .contains(URL));
 }

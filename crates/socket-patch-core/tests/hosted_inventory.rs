@@ -51,9 +51,15 @@ async fn contradicted_hosted_lock_is_contested_not_absent() {
     assert!(!inv.is_empty(), "contested wiring is hosted state: {inv:?}");
     let refusal = inv.contested_refusal().expect("a refusal");
     assert!(refusal.contains("npm-shrinkwrap.json"), "{refusal}");
-    assert!(refusal.contains("git checkout -- npm-shrinkwrap.json"), "{refusal}");
+    assert!(
+        refusal.contains("git checkout -- npm-shrinkwrap.json"),
+        "{refusal}"
+    );
     assert!(refusal.contains("patched_ref_unattributable"), "{refusal}");
-    assert!(!refusal.contains(GRANT), "the grant token is not a patch: {refusal}");
+    assert!(
+        !refusal.contains(GRANT),
+        "the grant token is not a patch: {refusal}"
+    );
 }
 
 #[tokio::test]
