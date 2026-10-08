@@ -1000,10 +1000,11 @@ async fn native_binary_scan_vendored() {
 /// #1132: `bun remove minimist` after a vendored scan leaves neither the
 /// vendored nor the pre-vendor record in bun.lockb. `vendor --revert` must
 /// retire the entry and delete its tarball; reading the removal as drift
-/// kept both forever and left `vendor --check` red.
+/// kept both forever and left `vendor --check` red. Named outside the
+/// `native_binary_` prefix: `scripts/backtest-bun-lockb.py` pins that set.
 #[tokio::test(flavor = "multi_thread")]
 #[serial_test::serial]
-async fn native_binary_vendored_revert_after_bun_remove() {
+async fn binary_vendored_revert_after_bun_remove() {
     let Some(fixture) = Fixture::new("direct") else {
         return;
     };
