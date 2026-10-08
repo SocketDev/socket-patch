@@ -13,6 +13,7 @@
 
 use std::borrow::Cow;
 
+use crate::formats::text::split_bom;
 use crate::utils::line_endings::{to_lf, LineEndings};
 
 /// A berry lock split into its stanzas (see the module docs).
@@ -31,10 +32,7 @@ impl BerryStanzas {
     /// Split `raw`. A [`LineEndings::Mixed`] lock must be refused by the
     /// caller first; one would be rendered back in a single style.
     pub(crate) fn parse(raw: &str) -> Self {
-        let (bom, body) = match raw.strip_prefix('\u{feff}') {
-            Some(rest) => ("\u{feff}", rest),
-            None => ("", raw),
-        };
+        let (bom, body) = split_bom(raw);
         let eol = LineEndings::of(body);
         let lf = to_lf(body).into_owned();
         let trimmed = lf.trim_end_matches('\n');

@@ -131,11 +131,7 @@ impl std::fmt::Display for TagError {
 /// literal (quotes included) and the quote character.
 fn version_literal(text: &str) -> Result<(String, std::ops::Range<usize>, char), TagError> {
     let doc = toml_edit::Document::parse(text).map_err(|e| TagError::Unparseable(e.to_string()))?;
-    // `[project]` is the legacy spelling of `[package]` cargo still accepts
-    // (crates published before manifest normalization ship it verbatim).
-    let item = ["package", "project"]
-        .iter()
-        .find_map(|table| doc.get(table).and_then(toml_edit::Item::as_table_like))
+    let item = crate::formats::cargo::manifest::package_table(doc.as_table())
         .and_then(|p| p.get("version"))
         .ok_or(TagError::NoVersion)?;
     let value = item.as_str().ok_or(TagError::NoVersion)?.to_string();
