@@ -48,9 +48,10 @@ const HOSTILE_SEEDS: &[(&str, &str)] = &[
 
 /// A `Command` for `bin` with the hermetic `SOCKET_*` environment: the
 /// hostile seeds scrubbed, every other ambient `SOCKET_*` removed (removing
-/// `SOCKET_API_TOKEN` also forces the public proxy), and the two opt-outs
-/// forced on. Callers add args, cwd and their own env afterwards; caller env
-/// lands last, so explicit injections survive the scrub.
+/// `SOCKET_API_TOKEN` also forces the public proxy), and the three opt-outs
+/// (config layer, update notifier, telemetry) forced on. Callers add args,
+/// cwd and their own env afterwards; caller env lands last, so explicit
+/// injections survive the scrub.
 pub fn command(bin: &Path) -> Command {
     let mut cmd = Command::new(bin);
     for (k, v) in HOSTILE_SEEDS {
@@ -72,6 +73,12 @@ pub fn command(bin: &Path) -> Command {
     // this force-set is the layer that holds there. Notifier tests opt back
     // in via caller env (which lands last).
     cmd.env("SOCKET_NO_UPDATE_CHECK", "1");
+    // And for telemetry: an unauthenticated child POSTs its events to the
+    // real public proxy unless a suite points it at a mock. The workspace
+    // `[env]` default can be overridden by the developer's shell, so force
+    // it here too. Telemetry suites opt back in via caller env with
+    // `SOCKET_TELEMETRY_DISABLED=0` and a wiremock endpoint.
+    cmd.env("SOCKET_TELEMETRY_DISABLED", "1");
     cmd
 }
 
@@ -95,6 +102,35 @@ pub fn scrub_socket_vars(cmd: &mut Command) {
             cmd.env_remove(&key);
         }
     }
+}
+
+/// The in-process half, for test binaries that only parse argv with clap:
+/// clap reads every env-bound `SOCKET_*` flag at parse time, so an ambient
+/// value (or a `.cargo/config.toml` `[env]` default such as
+/// `SOCKET_TELEMETRY_DISABLED=1`) changes what a parse yields. Removes every
+/// `SOCKET_*` var from this process, once; later calls wait for the first.
+/// Nothing is restored, so call it only from binaries where no test needs a
+/// `SOCKET_*` var, and call it before every parse so no parse reads the
+/// environment while it is being changed.
+pub fn scrub_process_socket_env() {
+    static ONCE: std::sync::Once = std::sync::Once::new();
+    ONCE.call_once(|| {
+        for (key, _) in std::env::vars_os() {
+            if key.to_string_lossy().starts_with("SOCKET_") {
+                std::env::remove_var(&key);
+            }
+        }
+    });
+}
+
+/// `Cli::try_parse_from` with the ambient `SOCKET_*` environment removed
+/// first (see [`scrub_process_socket_env`]): clap reads the env-bound flags
+/// at parse time, so without it the workspace `SOCKET_TELEMETRY_DISABLED=1`
+/// default (or a developer's shell) would set `--no-telemetry` and friends
+/// in every parse.
+pub fn try_parse(argv: &[&str]) -> Result<socket_patch_cli::Cli, clap::Error> {
+    scrub_process_socket_env();
+    <socket_patch_cli::Cli as clap::Parser>::try_parse_from(argv)
 }
 
 /// Opt-in scrubs for the ambient config of the tools a suite drives.
