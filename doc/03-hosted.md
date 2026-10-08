@@ -2,7 +2,7 @@
 
 ## Part 3: Hosted mode (redirect, hosted engine, upstream restore, Node addon)
 
-_Last checked against main @ 05ecc6e on 2026-10-07 by audit-ecosystems (3.2 `RewriteResult` sets, `merge_group_delta` and `confirm()` re-checked for E31; hosted NuGet lock walk and Maven suffix splice re-checked). Earlier: `431b818` by the October 7 reconciliation (3.1 scope note, 3.3 memory takeovers, 3.5 restore size and credentials re-checked). Earlier: `db83f01` by audit-ecosystems (3.2 `redirect/mod.rs` size and layout re-checked at `db83f01`; hosted Maven/Gradle grant handling checked at `9c43dfc`; 3.4 NuGet.config readers as of `4646693`; 3.6 vlt dead helpers as of `045d7ec`; the rest as of `203e092`). Owner: `audit-ecosystems`._
+_Last checked against main @ e2d9633 on 2026-10-08 by audit-ecosystems (3.2 yarn writers after #1057; 3.5 restore size and `FileEdit` count re-checked for the E45 decision). Earlier: `05ecc6e` on 2026-10-07 by audit-ecosystems (3.2 `RewriteResult` sets, `merge_group_delta` and `confirm()` re-checked for E31; hosted NuGet lock walk and Maven suffix splice re-checked). Earlier: `431b818` by the October 7 reconciliation (3.1 scope note, 3.3 memory takeovers, 3.5 restore size and credentials re-checked). Earlier: `db83f01` by audit-ecosystems (3.2 `redirect/mod.rs` size and layout re-checked at `db83f01`; hosted Maven/Gradle grant handling checked at `9c43dfc`; 3.4 NuGet.config readers as of `4646693`; 3.6 vlt dead helpers as of `045d7ec`; the rest as of `203e092`). Owner: `audit-ecosystems`._
 
 > Scope: `patch/redirect/**`, `hosted/**`, `crates/socket-patch-node/**`, CLI `scan/hosted.rs`, `scan/hosted/*`, `hosted_bundle.rs`.
 
@@ -106,7 +106,7 @@ The shared stages are good: `build_candidates`, `read_candidate_files`, `rewrite
 A "one model per format" layer (`formats/`) has been started, and **hosted mode is the main holdout.** Several module docs say so explicitly.
 
 - **package-lock.json: four walks and two serializers.** Hosted `serialize_json` (`mod.rs:273`) always writes 2-space JSON. Vendor's serializer preserves the file's indent. Upstream restore uses the hosted one, so hosted rewrites *and rollback* reformat a 4-space or tab-indented lock in full (open issue #324).
-- **yarn.lock: five copies of a `split("\n\n")` + regex grammar** (`mod.rs:2992`, `:3159`, `:3278`, `upstream/npm.rs:289`, `:390`), alongside the shared `scan_blocks` used by vendor, inventory and VEX.
+- **yarn.lock: one grammar module.** Hosted classic rewrite and restore splice blocks through `formats::yarn::blocks` (`scan_blocks`, `repin_classic_block`), the reader vendor, inventory and VEX use; hosted berry rewrite and restore re-key entries through `formats::yarn::stanzas`, and the grammar is decided once (`formats::yarn::grammar`). The five `split("\n\n")` + regex copies were deleted (#1057). {{E08}}
 - **NuGet.config: two readers.** Hosted routing and splice anchors now go through `formats::nuget::parse_config`, the bounded tokenizer that upstream restore and VEX use; the hosted regex reader `nuget_package_source_keys` and the regex anchors were deleted (#597). Vendored `nuget_feed.rs` still keeps its own comment-blanking reader ([`parse_config_source_keys`](https://github.com/SocketDev/socket-patch/blob/4646693150cf5efca6222b87092e1620e58566f8/crates/socket-patch-core/src/vendor/nuget_feed.rs#L1053-L1112)) and `find`-based anchors. {{E10}}
   - A commented-out `<add key="…">` no longer suppresses the nuget.org seed, because hosted reads through the shared reader (#597). {{E01}}
 - **requirements.txt:** `utils/requirements.rs:1-9` says vendor, inventory and VEX share `logical_lines`, but "the hosted requirements rewriter … keeps its own line splitter" (`redirect/requirements.rs:17`). Upstream has a fourth reader.
@@ -127,9 +127,9 @@ A "one model per format" layer (`formats/`) has been started, and **hosted mode 
 
 ### 3.5 Upstream restore: rebuilding what was thrown away
 
-**Cost.** ~8.8K production lines at `1c6c509` (7,446 at the snapshot: Python 2,474 (`uv` 1,152), infrastructure 1,395, gem 743, npm 754, maven 400, composer 373, cargo 361, nuget 350, vlt 329, bun.lockb 153, golang 114). PR #918 has since taken over part of this section's npm restore; #919 and #992 remain open. Tests add 1,605 inline lines, 1,913 lines of golden tests and about 1.9K lines of `in_process_rollback_hosted`.
+**Cost.** 8,769 production lines at `e2d9633` (7,446 at the snapshot: Python 2,474 (`uv` 1,152), infrastructure 1,395, gem 743, npm 754, maven 400, composer 373, cargo 361, nuget 350, vlt 329, bun.lockb 153, golang 114). PR #918 has since taken over part of this section's npm restore; #919 and #992 remain open. Tests add 1,605 inline lines, 1,913 lines of golden tests and about 1.9K lines of `in_process_rollback_hosted`.
 
-**Why it exists.** v5 dropped the redirect ledger. Yet every rewriter still computes `FileEdit { original, new }`, with 30 `FileEdit {` literals in `mod.rs`. In production, `original` is read only by the Composer reinstall hint (`cli composer_hints.rs:69-99`). **So the original bytes are computed, discarded, and later re-derived from the network.**
+**Why it exists.** v5 dropped the redirect ledger. Yet every rewriter still computes `FileEdit { original, new }`, with 36 `FileEdit {` literals in `mod.rs` at `e2d9633`. In production, `original` is read only by the Composer reinstall hint (`cli composer_hints.rs:69-99`). **So the original bytes are computed, discarded, and later re-derived from the network.**
 
 **Network dependencies:** the npm registry, the crates.io sparse index, the Go proxy and `sum.golang.org`, the PyPI JSON API, RubyGems, Packagist, NuGet `registration5-gz`, and a Socket `/upstream/npm/<uuid>.json` endpoint for berry checksums. That last one may download the whole upstream tarball to verify it.
 
@@ -158,7 +158,7 @@ For uv, pylock, poetry, pdm, hatch, vlt, maven and bun.lockb, the module's own f
 - `poetry lock --no-update`
 - `bundle lock --update X`
 
-**There are two cheaper alternatives:**
+**There are two cheaper alternatives** (owner decision: {{E45}}):
 - **(a) Narrow restore** to the pure-function formats and refuse the rest with a precise remedy: about −3.3K production and −2K test lines.
 - **(b) Keep the originals the rewriters already compute** in a tiny content-addressed sidecar, for example `.socket/hosted-originals/<sha>.json`, ignorable and git-committable. Byte-exact rollback then needs no network at all. This is the same "record original → splice back" approach vendored mode uses.
 
@@ -187,7 +187,7 @@ For uv, pylock, poetry, pdm, hatch, vlt, maven and bun.lockb, the module's own f
 2. **Introduce `trait HostedRewriter { ecosystem(); drives(&FileSet) -> bool; rewrite(&FileSet, &[&DepOverride]) -> Outcome }`**, with `Outcome { files, edits, warnings, per_dep: BTreeMap<Uuid, DepStatus> }` where `DepStatus` is Confirmed, Refused, Foreign or Unclaimed. It replaces the 27 `RewriteResult` sets, `merge_group_delta` and most of `confirm()`. The "driver" rules for pdm/vlt/uv/sbt become `drives()`. {{E31}}: tracking #1075, step 1 (one report map, mechanical) is #1076.
 3. **Finish one codec per format** in `formats/`, in this order:
    - package-lock (4 walks → 1, indent-preserving);
-   - yarn (five `split("\n\n")` sites → `scan_blocks`);
+   - yarn (done: #1057 moved every yarn.lock grammar into `formats/yarn`);
    - NuGet config (3 readers → 1, which fixes the comment bug);
    - requirements;
    - Cargo.toml (regex scanner → `toml_edit`).

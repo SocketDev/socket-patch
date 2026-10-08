@@ -1,5 +1,5 @@
 ### Ecosystems and formats (`audit-ecosystems`)
-_Last updated 2026-10-08T06:50Z · main @ ea09714_
+_Last updated 2026-10-08T13:00Z · main @ e2d9633_
 
 | ID | P | Problem | Source | Issues | Status |
 |---|:-:|---|---|---|---|
@@ -10,12 +10,12 @@ _Last updated 2026-10-08T06:50Z · main @ ea09714_
 | E05 | 1 | Cache crawls aren't project-scoped: cargo, go, maven, nuget and deno enumerate the whole machine cache, and scan sends all of it to the API (#265). | 6.6 | #595 | filed #595; tracking, children #427, #265 |
 | E06 | 1 | NuGet and cargo crawler reads weren't FIFO-safe. | 6.6 | #592 | fixed (#602) |
 | E07 | 2 | package-lock has four entry walks (inventory, vendored, hosted, restore) with copied identity/skip rules and two pointer escapes. Target: one addressed walk. Serializers fixed by #357. | 4.4; 4.7 E | #663 | in PR #1008 |
-| E08 | 2 | yarn has seven `split("\n\n")` + regex grammars beside `scan_blocks` (redirect/mod.rs ×5, upstream/npm.rs ×2); the grammar is decided three ways (B60) and the regex replacement is unescaped. Target: writers and restorers on `formats/yarn`. | 3.7 #3; 4.7 D | | in PR #1057; confirmed at `1c6c509` (7 splits) |
+| E08 | 2 | yarn.lock had seven `split("\n\n")` + regex writer grammars beside `scan_blocks`, and the grammar was decided three ways (B60). | 3.7 #3; 4.7 D | | fixed (#1057) |
 | E09 | 2 | Yarn berry gates were written twice (cacheKey, mixed-EOL and `compressionLevel` refusals with different codes); hosted didn't gate a mixed-EOL root `package.json` (merged E51). | 4.4; new finding | #629, #628 | fixed (#657) |
 | E10 | 2 | XML has eight hand-rolled scanners and four attribute extractors; the writers (`nuget_feed.rs`, `maven_repo.rs`) never use the shared readers. Merged: NuGet config's three readers (was E11) and Maven's two `declares_modules` (was E55). | 5.4; 3.7 #3 | #715, #716, #717, #594 | filed #715, #716, #717, #594; NuGet hosted reader fixed (#597) |
 | E12 | 2 | pnpm v9 and legacy 5.4/6.0 were near-copies; v9 still has two lookup paths (a linear scan and `LockIndex`, `pnpm_lock.rs:1524-1538`). | 4.4; 4.5 #4; 4.7 B/G | | partly fixed (#583); copies merged, v9 dual lookup remains (pnpm workstream, #1007) |
 | E13 | 2 | `utils/poetry_lock.rs` ≈ `utils/pdm_lock.rs` (identical `*_lock_edits`). | 5.4 | #694 | fixed (#703) |
-| E14 | 2 | Pipfile.lock is written two ways: vendored mode re-serializes it, while hosted mode splices spans. | 5.4 | | to verify; present on 045d7ec, no drift proven (pipenv writes canonical JSON), not filed yet |
+| E14 | 2 | Pipfile.lock is written two ways: vendored mode re-serializes the whole lock (loses `\uXXXX` escapes, refuses a BOM), while hosted mode splices spans (executed twice). | 5.4 | #1128 | filed #1128 |
 | E15 | 2 | Cargo.toml `[package]` is read five ways and has drifted on BOM, `[project]` and dotted keys; hosted `plan_cargo_toml` is a line scanner that refuses a multi-line `features` array (merged E57). | 5.4; 3.7 #3 | #693, #757 | in PR #1110 (#693 slice 1); filed #757 |
 | E16 | 2 | CRLF has five npm-family policies and three for `toml_edit` output; the "any `\r\n` → CRLF" rule is written 14 times (merged E60). Target: one line-ending policy. | 4.4; new finding | #814, #815 | filed #814, #815; tracking #814, child 1 #815; slice 1 (7 copies outside open-PR files) in PR #1108 |
 | E17 | 2 | "Is a bun lock present" is asked at seven sites with three semantics (lstat, `exists`, `is_file`). With a dangling `bun.lock` symlink, Bun and the writers use `bun.lockb`, but the inventory returns nothing. | 4.4 | #735 | in PR #1009 |
@@ -46,7 +46,7 @@ _Last updated 2026-10-08T06:50Z · main @ ea09714_
 | E42 | 2 | The embedded `--vex` glue is copied per command (scan, apply, and vendor ×3), each with caller-injected bypass sets. Target: one `EmbeddedVex` helper. | 6.5; R13 | #966 | decision #966; whether `--vex` stays embedded (Q2) is undecided |
 | E43 | 2 | Fail closed on unmodeled resolution config in one shared place. | 2.2 #3 | #458 | partly fixed; `gradle.lockfile`, `BUNDLE_GEMFILE`, `virtualStoreDir` and mirrors are modelled, npm linked-store alias fixed (#987); `go.work` remains (#458, E81) |
 | E44 | 2 | Decide: the napi addon and in-memory engine. Will depscan adopt it (then delete the TS rewriters), or should it be deleted (−4.8K prod)? | §6 Q1; 3.7 #6 | | decision pending; no decision issue filed yet |
-| E45 | 2 | Decide: hosted rollback. Is an originals sidecar acceptable, or should restore be narrowed to formats whose original is a pure function of registry data? | §6 Q5; 2.3 | | decision pending; no decision issue filed yet |
+| E45 | 2 | Decide: hosted rollback. Is an originals sidecar acceptable, or should restore be narrowed to formats whose original is a pure function of registry data? | §6 Q5; 2.3 | #1130 | decision #1130 |
 | E46 | 2 | Decide: VEX evidence. Should `not_affected` require consumed evidence by default, so that wired-only evidence (`lockfile_basis_ok`) needs an opt-in? About 46 open false-attestation issues (B05). | §6 Q4; 2.2; 6.5 | #1099 | decision #1099 |
 | E47 | 3 | Decide: support tiers for `bun.lockb` writes, vendored pnpm 7/8, vlt pre-1.0 encodings and hosted pnpm ≤ 6, and whether hosted JVM ships as beta. | §5; §6 Q3; 4.6 | | decision pending; no decision issue filed yet |
 | E48 | 3 | Discovery re-implements package-manager layouts (venv-name hashing, global prefixes, the pnpm store). Target: ask the package manager (`poetry env info -p`, `pipenv --venv`, `npm query`, …). | 2.2 #2; 6.6 | | to verify |
@@ -68,9 +68,9 @@ _Last updated 2026-10-08T06:50Z · main @ ea09714_
 | E71 | 1 | The supersede/re-pin lifecycle had no owned-pin generation model: older generations' wiring survived a re-pin or remove. | audit B07 | #999, #864, #682, #266 | partly fixed (#1035, #943); vendored/agent supersede policy remains (#954, in PR #1008) |
 | E72 | 1 | VEX attests `not_affected` from wiring the package manager doesn't consume: yarn Plug'n'Play loaders, pnpm bundled copies and deno.lock npm copies. | audit B04, B05 | #519, #406 | partly fixed (#1033); #406 in-run `scan --vex` path open, Maven `integrity_required` waits on E46 |
 | E73 | 2 | "Is this hosted patch pinned" is decided four ways (`confirm`, `mark_pinned`, `memory_recorded`, discovery); lockless NuGet/Cargo pins are reported contested forever. | audit B13, B58 | #567, #260 | in PR #1058; lockless pins wait on E45 |
-| E74 | 2 | "Is this vendored entry still in use" has four answers; six ecosystems' entries are never pruned; JVM orphans are invisible; legacy Maven/NuGet "wired" is a substring check. | audit B19, B61, B62 | | in PR #1050 |
+| E74 | 2 | "Is this vendored entry still in use" had four answers; six ecosystems' entries were never pruned (B19, B61, B62). | audit B19, B61, B62 | | fixed (#1050) |
 | E75 | 2 | Which lockfile governs installs is decided in ≥8 places; vendored and hosted patch different PyPI locks and a takeover restores the losers unpatched. | audit B31 | #612 | partly fixed (#1044); #612 takeover restore scope, `pdm_drives` vs pylock and the inventory PyPI order (E91) remain |
-| E76 | 2 | Hosted yarn classic replaces `file:`, URL and codeload copies with the Socket artifact and rollback corrupts the key; there is no shared copy-source classifier. | audit B16 | | in PR #1057 |
+| E76 | 2 | Hosted yarn classic replaced `file:`, URL and codeload copies with the Socket artifact (B16). | audit B16 | | fixed (#1057) |
 | E77 | 2 | JVM layout is spelled in ~13 places with two coordinate grammars; `--ecosystems maven` skips `jvm` ledger entries (B17); `service_preflight` grants downloads the backend then skips (B18); sbt roots with only `project/build.properties` get no crawl (B65). | audit B17, B18, B65 | #1014 | in PR #1032 |
 | E78 | 1 | pnpm readers and writers ignore `---`, so a two-document pnpm 11+ lock gets the wrong document edited and success reported. | audit B06 | #466 | in PR #1007 (pnpm workstream) |
 | E79 | 2 | Hosted mode meeting a vendored package has 4+ outcomes per ecosystem. Target: one pre-rewrite decision. Depends on C34. | audit B30 | #536 | filed #536 |
@@ -86,6 +86,7 @@ _Last updated 2026-10-08T06:50Z · main @ ea09714_
 | E89 | 3 | Pure-wheel rule written 4× (inventory and recovery skip `wheel_platform_from_filename`); recovery pairs a hashless pure wheel with another wheel's hash (executed twice). | new finding | #1079 | in PR #1121 (slice 1: recovery; the two `lock_inventory/pypi.rs` suffix checks remain) |
 | E90 | 2 | Which gem homes Bundler loads has two answers: `vex` and agent `apply` use `get_gem_paths` (keeps `gem env` homes under an explicit `path`), only the stale guard uses `bundler_install_homes` (executed twice). | new finding | #1098 | filed #1098 |
 | E91 | 3 | PyPI tool-lock precedence is written twice since #1044: the inventory keys on "yielded entries", the vendored router on presence. A package-less `poetry.lock`/`pdm.lock` beside `requirements.txt` makes scan offer a package vendored refuses (`pypi_poetry_lock_package_missing`; executed twice). | new finding | #1114 | filed #1114 |
+| E92 | 3 | pnpm `modulesDir` is honored by the crawler but not by `pkg_managers`: `node-linker=pnp` + `modulesDir` is classified yarn PnP, so apply refuses (`yarn_pnp_unsupported`), vendored gives the yarn remedy and VEX reads the wrong loader (real pnpm 10.28, executed twice). | new finding | #1129 | filed #1129 |
 
 **Handed off:** none yet.
 
