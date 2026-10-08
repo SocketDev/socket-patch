@@ -11,7 +11,7 @@ _Last updated 2026-10-08T11:20Z · main @ 628542d_
 - [#1106](https://github.com/SocketDev/socket-patch/pull/1106): the macOS PDM site probe runs through `utils::process::output_within`; a guard test rejects new production `kill_on_drop` spawns (pending: `vendor/npm_dir.rs`). Issue #1067 (C48, slice: `pdm_site`; the `npm_dir` git exchange remains, blocked on #1026). `state: ready`, handed to the burn-down.
 - [#1103](https://github.com/SocketDev/socket-patch/pull/1103): `go.sum` edits through `GoSumEditor` only; deletes the oracle-only free functions and names the key rule once. Issue #631 (E52, slice: steps 2–3; the move to `formats/golang/sum.rs` remains). `state: ready`, handed to the burn-down.
 - Maintainer drafts (decided issues): #1021 (#615), #1027 (#704), #1030 (#808), #1031 (#966), #1036 (#973), #1041 (#648), #1049 (#792), #1051 (#580).
-- October 7 campaign (one PR per duplicated-logic seam): open #1026, #1032, #1034, #1039, #1043, #1045, #1050, #1058; merged #1042, #1033, #1038, #1046, #1035, #1044, #1029, #1057 (rows in `register/20-audit-core.md` and `10-audit-ecosystems.md`).
+- October 7 campaign: open #1026, #1032, #1034, #1039, #1043, #1050, #1058; merged #1042, #1033, #1038, #1046, #1035, #1044, #1029, #1057, #1045 (rows in the auditors' registers).
 
 **Merged:**
 - [#1015](https://github.com/SocketDev/socket-patch/pull/1015): vendored-reference scan reads every `VENDORED` row. Issues #832, #958 (E61). `8e521f9` (+308 / −41). Left: dead `eco == "maven2"` arm in `commands/vendor.rs`.
