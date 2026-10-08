@@ -42,9 +42,9 @@ on:
   pull_request:
     types: [opened, synchronize, reopened, ready_for_review]
     paths:
+      - 'scripts/maven-sha512.json'
       - '.github/workflows/gradle-compatibility.yml'
       - 'scripts/ci-e2e-bundle.py'
-      - 'scripts/maven-sha512.json'
       - 'Cargo.lock'
       - 'Cargo.toml'
       - 'crates/*/Cargo.toml'
