@@ -173,7 +173,7 @@ async fn mock_view_with_blob(server: &MockServer) {
             "files": {
                 "package/index.js": {
                     "beforeHash": "0000000000000000000000000000000000000000000000000000000000000000",
-                    "afterHash":  "1111111111111111111111111111111111111111111111111111111111111111",
+                    "afterHash":  "d2802877eb1c2f442d30d18abcb281cb2830875571624544f2f1acb36480997e",
                     "blobContent": "cGF0Y2hlZAo=",
                 }
             },
@@ -377,7 +377,7 @@ async fn scan_apply_wet_writes_manifest_and_blob() {
     // fixture's blobContent "cGF0Y2hlZAo=" decodes to exactly "patched\n";
     // asserting the bytes (not just existence) catches a regression that
     // wrote an empty/garbled blob.
-    let after_hash = "1111111111111111111111111111111111111111111111111111111111111111";
+    let after_hash = "d2802877eb1c2f442d30d18abcb281cb2830875571624544f2f1acb36480997e";
     let blob = tmp.path().join(".socket/blobs").join(after_hash);
     assert!(blob.exists(), "after-blob must be written");
     assert_eq!(
@@ -550,7 +550,7 @@ async fn mock_view_for(server: &MockServer, uuid: &str, published_at: &str) {
             "files": {
                 "package/index.js": {
                     "beforeHash": "0000000000000000000000000000000000000000000000000000000000000000",
-                    "afterHash":  "1111111111111111111111111111111111111111111111111111111111111111",
+                    "afterHash":  "d2802877eb1c2f442d30d18abcb281cb2830875571624544f2f1acb36480997e",
                     "blobContent": "cGF0Y2hlZAo=",
                 }
             },
@@ -815,7 +815,7 @@ async fn scan_sync_full_cycle_against_clean_project() {
         "sync manifest must record {PURL}; got {manifest}"
     );
 
-    let after_hash = "1111111111111111111111111111111111111111111111111111111111111111";
+    let after_hash = "d2802877eb1c2f442d30d18abcb281cb2830875571624544f2f1acb36480997e";
     let blob = tmp.path().join(".socket/blobs").join(after_hash);
     assert!(blob.exists(), "sync must write the after-blob");
     assert_eq!(std::fs::read(&blob).unwrap(), b"patched\n");

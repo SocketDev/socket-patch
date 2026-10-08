@@ -23,6 +23,7 @@ use socket_patch_core::utils::concurrent::{api_concurrency_for, ordered_concurre
 use socket_patch_core::utils::purl::{
     canonical_purl, is_purl, normalize_purl, strip_purl_qualifiers,
 };
+use socket_patch_core::utils::purl_key::PurlKey;
 use socket_patch_core::vendor::{load_state, lookup_entry, VendorEntry, VendorState};
 use std::collections::HashMap;
 use std::fmt;
@@ -273,13 +274,17 @@ fn report_lock_failure(
     envelope
 }
 
-/// Decode a base64 string and write it to `blobs_dir/hash`. Returns whether
-/// the blob file was NEWLY created (`false`: a blob with this hash already
-/// existed — content-addressed, so it is the same bytes — and was
-/// overwritten in place), or a formatted error string referencing
-/// `file_path` and `label` on failure.
+/// Decode a base64 string and store it as the blob `blobs_dir/hash`
+/// through the one verified writer,
+/// [`store_verified_blob`](socket_patch_core::api::blob_fetcher::store_verified_blob):
+/// the bytes must hash to `hash`, a linked `.socket/blobs` or
+/// `.socket/blobs/<hash>` is refused, and the entry is staged and renamed
+/// (#726). Returns whether the blob file was NEWLY created (`false`: a
+/// verified blob with this hash already existed and was left untouched),
+/// or a formatted error string referencing `file_path` and `label` on
+/// failure.
 ///
-/// `blobs_dir` is created here, lazily — only once a blob is actually
+/// `blobs_dir` is created there, lazily — only once a blob is actually
 /// about to be persisted — so a run that records nothing (every fetch
 /// failed, every patch skipped, undecodable content) leaves no empty
 /// `.socket/blobs/` behind.
@@ -297,18 +302,9 @@ async fn write_blob_entry(
     }
     let decoded =
         base64_decode(b64).map_err(|e| format!("Failed to decode {label} for {file_path}: {e}"))?;
-    tokio::fs::create_dir_all(blobs_dir)
+    socket_patch_core::api::blob_fetcher::store_verified_blob(blobs_dir, hash, &decoded)
         .await
-        .map_err(|e| format!("Failed to create blobs directory: {e}"))?;
-    let target = blobs_dir.join(hash);
-    // Probed BEFORE the (overwriting) write: a blob that already existed —
-    // a live record's revert data, or a sibling patch's shared after-blob
-    // written earlier this run — is never this call's to remove on unwind.
-    let existed = tokio::fs::try_exists(&target).await.unwrap_or(false);
-    tokio::fs::write(&target, &decoded)
-        .await
-        .map_err(|e| format!("Failed to write {label} for {file_path}: {e}"))?;
-    Ok(!existed)
+        .map_err(|e| format!("Failed to write {label} for {file_path} ({hash}): {e}"))
 }
 
 /// Write every after/before blob for `patch` into `blobs_dir`, reporting
@@ -1434,9 +1430,8 @@ struct InstalledNarrowing {
 /// runs — the coarse layer above [`filter_to_installed_releases`]'s
 /// per-release variant narrowing (which still runs later, unchanged).
 ///
-/// Presence evidence per result purl (compared on
-/// `normalize_purl(strip_purl_qualifiers(..))` — API purls are
-/// percent-encoded/qualified, crawler purls literal):
+/// Presence evidence per result purl (compared by [`PurlKey`] — API purls
+/// are percent-encoded/qualified/mixed-case, crawler purls literal):
 /// * installed on disk — `find_packages_for_rollback` over the deduped base
 ///   purls (the qualified-aware resolver; memory invariant);
 /// * already tracked in the manifest — the user opted this purl in earlier,
@@ -1469,8 +1464,6 @@ async fn filter_to_installed_purls(
     use socket_patch_core::vendor::lock_inventory;
     use std::collections::HashSet;
 
-    let canon = canonical_purl;
-
     // Deduped base purls, probed against the installed tree. The resolver
     // keys its result by the purls we pass, so canonicalize the found keys
     // the same way as the membership probes below.
@@ -1484,14 +1477,14 @@ async fn filter_to_installed_purls(
     };
     let partitioned = partition_purls(&bases, None);
     let found = find_packages_for_rollback(&partitioned, &common.crawler_options(), true).await;
-    let mut present: HashSet<String> = found.keys().map(|k| canon(k)).collect();
+    let mut present: HashSet<PurlKey> = found.keys().map(|k| PurlKey::new(k)).collect();
 
     let ctx = super::context::ProjectContext::rooted(common, common.cwd.clone());
     // Manifest membership counts as presence (read-only probe: a corrupt
     // manifest degrades to "no extension" here — the download path's
     // fail-closed read still guards every write).
     if let Some(manifest) = ctx.ledgers().await.manifest {
-        present.extend(manifest.patches.keys().map(|k| canon(k)));
+        present.extend(manifest.patches.keys().map(|k| PurlKey::new(k)));
     }
 
     // scan's lockfile + vendored-ledger discovery supplements (and their
@@ -1502,11 +1495,11 @@ async fn filter_to_installed_purls(
         let supplement = super::scan::project_lockfile_supplement(&ctx, &[], None).await;
         pnp_diags = supplement.unsupported;
         if mode != super::scan::ScanMode::Agent {
-            present.extend(supplement.entries.iter().map(|e| canon(&e.purl)));
+            present.extend(supplement.entries.iter().map(|e| PurlKey::new(&e.purl)));
             let vendored =
                 super::scan::project_vendored_supplement(common, &[], &ctx.loaded().await.vendor)
                     .await;
-            present.extend(vendored.packages.iter().map(|p| canon(&p.purl)));
+            present.extend(vendored.packages.iter().map(|p| PurlKey::new(&p.purl)));
         }
     }
 
@@ -1521,10 +1514,16 @@ async fn filter_to_installed_purls(
     // mark the installed version — but the pnpm-lock.yaml the hosted
     // rewriter will edit is right there. Read its raw text once and gate the
     // keep-branch below on version membership, so a large advisory fan-out
-    // doesn't request grants for every version ever patched (raw
-    // `read_to_string` matches the hosted flow's own candidate-file reads).
+    // doesn't request grants for every version ever patched. Read FIFO-safe,
+    // like the hosted flow's own candidate-file reads: a FIFO planted at
+    // `pnpm-lock.yaml` must not wedge `get` in open(2).
     let pnpm_pnp_lock_text: Option<String> = (pnp_pnpm && mode == super::scan::ScanMode::Hosted)
-        .then(|| std::fs::read_to_string(common.cwd.join("pnpm-lock.yaml")).ok())
+        .then(|| {
+            socket_patch_core::utils::fs::read_regular_to_string_sync(
+                &common.cwd.join("pnpm-lock.yaml"),
+            )
+            .ok()
+        })
         .flatten();
     let pnpm_pnp_lock = pnpm_pnp_lock_text.as_deref().map(PnpmLock::parse);
 
@@ -1534,7 +1533,7 @@ async fn filter_to_installed_purls(
         warnings,
     };
     for result in accessible {
-        if present.contains(&canon(&result.purl)) {
+        if present.contains(&PurlKey::new(&result.purl)) {
             out.kept.push(result.clone());
             continue;
         }
@@ -1563,7 +1562,7 @@ async fn filter_to_installed_purls(
             // nothing — so it carries the same `package_not_installed` code
             // a non-PnP pnpm project would get; only an UNREADABLE lock
             // (no judgment possible) keeps the layout-refusal code.
-            let decoded = canon(&result.purl);
+            let decoded = canonical_purl(&result.purl);
             let coord = decoded.strip_prefix("pkg:npm/").unwrap_or(&decoded);
             if mode == super::scan::ScanMode::Hosted {
                 match (&pnpm_pnp_lock, coord.rsplit_once('@')) {
@@ -1778,7 +1777,8 @@ async fn lock_text_refusals_for(
         )
         .await,
     );
-    let claimed: Vec<String> = pins.iter().map(|pin| canonical_purl(&pin.purl)).collect();
+    let claimed: std::collections::HashSet<PurlKey> =
+        pins.iter().map(|pin| PurlKey::new(&pin.purl)).collect();
     let fetchable: Vec<&PatchSearchResult> = selected
         .iter()
         .filter(|sr| bun_refusal.filter(|r| r.applies_to(&sr.purl)).is_none())
@@ -1789,7 +1789,7 @@ async fn lock_text_refusals_for(
         .collect();
     let candidates: Vec<(&str, &str)> = fetchable
         .iter()
-        .filter(|sr| !claimed.contains(&canonical_purl(&sr.purl)))
+        .filter(|sr| !claimed.contains(&PurlKey::new(&sr.purl)))
         .map(|sr| (sr.purl.as_str(), sr.uuid.as_str()))
         .collect();
     let refused = socket_patch_core::vendor::lock_text_refusals(cwd, &candidates).await;
@@ -1813,7 +1813,7 @@ async fn lock_text_refusals_for(
             cwd,
             fetchable
                 .iter()
-                .filter(|sr| claimed.contains(&canonical_purl(&sr.purl)))
+                .filter(|sr| claimed.contains(&PurlKey::new(&sr.purl)))
                 .map(|sr| sr.purl.as_str()),
             &pins,
             false,
@@ -2387,8 +2387,8 @@ async fn run_nested_apply(
 /// qualified record (apply keys a release-variant base by its base purl).
 /// A qualified key never covers a sibling variant.
 fn apply_key_covers(key: &str, record: &str) -> bool {
-    let (key, record) = (normalize_purl(key), normalize_purl(record));
-    key == record || (!key.contains(['?', '#']) && record.split(['?', '#']).next() == Some(&*key))
+    PurlKey::qualified(key) == PurlKey::qualified(record)
+        || (!key.trim().contains(['?', '#']) && PurlKey::same(key, record))
 }
 
 /// Fold a failed nested apply into a `get` / `scan --mode agent` JSON
@@ -2431,7 +2431,8 @@ fn fold_apply_failures(
             }
         }
         let appended = patches[selected..].iter().any(|r| {
-            normalize_purl(r["purl"].as_str().unwrap_or_default()) == normalize_purl(&failure.purl)
+            PurlKey::qualified(r["purl"].as_str().unwrap_or_default())
+                == PurlKey::qualified(&failure.purl)
         });
         if !hit && !appended {
             let mut rec = serde_json::json!({
@@ -3971,42 +3972,27 @@ async fn run_get_vendored(
     }
 }
 
-/// Decode a patch view's `blobContent` (canonical, padded base64 as the API
-/// produces it). Hand-rolled; swapping in
-/// `base64::engine::general_purpose::STANDARD.decode(input)` must keep
-/// `DecodeError::InvalidByte(_, b)` mapped to the
-/// `Invalid base64 character: <b>` message below (pinned by a unit test).
+/// Decode a patch view's `blobContent` (canonical base64 as the API
+/// produces it; line breaks and missing padding are tolerated). An invalid
+/// byte keeps the `Invalid base64 character: <b>` message (pinned by a
+/// unit test).
 pub(crate) fn base64_decode(input: &str) -> Result<Vec<u8>, String> {
-    let chars = b"ABCDEFGHIJKLMNOPQRSTUVWXYZabcdefghijklmnopqrstuvwxyz0123456789+/";
-    let mut table = [255u8; 256];
-    for (i, &c) in chars.iter().enumerate() {
-        table[c as usize] = i as u8;
-    }
-
-    let input = input.as_bytes();
-    let mut output = Vec::with_capacity(input.len() * 3 / 4);
-
-    let mut buf = 0u32;
-    let mut bits = 0u32;
-
-    for &b in input {
-        if b == b'=' || b == b'\n' || b == b'\r' {
-            continue;
+    use base64::engine::{general_purpose, DecodePaddingMode, GeneralPurpose};
+    use base64::Engine;
+    const ENGINE: GeneralPurpose = GeneralPurpose::new(
+        &base64::alphabet::STANDARD,
+        general_purpose::PAD.with_decode_padding_mode(DecodePaddingMode::Indifferent),
+    );
+    let compact: String = input
+        .chars()
+        .filter(|c| !matches!(c, '\n' | '\r'))
+        .collect();
+    ENGINE.decode(compact).map_err(|e| match e {
+        base64::DecodeError::InvalidByte(_, b) => {
+            format!("Invalid base64 character: {}", b as char)
         }
-        let val = table[b as usize];
-        if val == 255 {
-            return Err(format!("Invalid base64 character: {}", b as char));
-        }
-        buf = (buf << 6) | val as u32;
-        bits += 6;
-        if bits >= 8 {
-            bits -= 8;
-            output.push((buf >> bits) as u8);
-            buf &= (1 << bits) - 1;
-        }
-    }
-
-    Ok(output)
+        other => format!("Invalid base64: {other}"),
+    })
 }
 
 #[cfg(test)]
@@ -4965,6 +4951,8 @@ mod tests {
 
     // "patched\n" in base64 — a valid payload so only the hash is at fault.
     const BLOB_B64: &str = "cGF0Y2hlZAo=";
+    /// base64 of `"pristine\n"`.
+    const PRISTINE_B64: &str = "cHJpc3RpbmUK";
 
     #[tokio::test]
     async fn write_blob_entry_rejects_relative_traversal_hash() {
@@ -5022,12 +5010,91 @@ mod tests {
         let blobs_dir = tmp.path().join("blobs");
         tokio::fs::create_dir_all(&blobs_dir).await.unwrap();
 
-        let hash = "1111111111111111111111111111111111111111111111111111111111111111";
-        write_blob_entry(&blobs_dir, BLOB_B64, hash, "package/index.js", "blob")
+        let hash = git_sha256(b"patched\n");
+        let created = write_blob_entry(&blobs_dir, BLOB_B64, &hash, "package/index.js", "blob")
             .await
             .expect("a canonical 64-hex hash must be accepted");
-        let written = std::fs::read(blobs_dir.join(hash)).unwrap();
+        assert!(created);
+        let written = std::fs::read(blobs_dir.join(&hash)).unwrap();
         assert_eq!(written, b"patched\n");
+    }
+
+    fn git_sha256(bytes: &[u8]) -> String {
+        socket_patch_core::hash::git_sha256::compute_git_sha256_from_bytes(bytes)
+    }
+
+    /// #726: inline content that does not hash to its name writes nothing,
+    /// and a verified blob already in the store is never replaced.
+    #[tokio::test]
+    async fn write_blob_entry_verifies_content_against_its_hash() {
+        let tmp = tempfile::tempdir().unwrap();
+        let blobs_dir = tmp.path().join("blobs");
+
+        let wrong = "1111111111111111111111111111111111111111111111111111111111111111";
+        let err = write_blob_entry(&blobs_dir, BLOB_B64, wrong, "package/index.js", "blob")
+            .await
+            .unwrap_err();
+        assert!(err.contains("content hash mismatch"), "{err}");
+        assert!(!blobs_dir.join(wrong).exists(), "nothing written");
+
+        let pristine = git_sha256(b"pristine\n");
+        tokio::fs::create_dir_all(&blobs_dir).await.unwrap();
+        tokio::fs::write(blobs_dir.join(&pristine), b"pristine\n")
+            .await
+            .unwrap();
+        write_blob_entry(&blobs_dir, BLOB_B64, &pristine, "package/index.js", "blob")
+            .await
+            .unwrap_err();
+        assert_eq!(
+            std::fs::read(blobs_dir.join(&pristine)).unwrap(),
+            b"pristine\n",
+            "a verified blob is byte-identical afterwards"
+        );
+        let created = write_blob_entry(&blobs_dir, PRISTINE_B64, &pristine, "f", "blob")
+            .await
+            .unwrap();
+        assert!(!created, "an existing verified blob is not re-created");
+    }
+
+    /// B24: a committed `.socket/blobs/<hash>` (or `.socket/blobs`) symlink
+    /// must not redirect the write out of the project.
+    #[cfg(unix)]
+    #[tokio::test]
+    async fn write_blob_entry_refuses_a_linked_blob_or_blobs_dir() {
+        let tmp = tempfile::tempdir().unwrap();
+        let victim = tmp.path().join("victim");
+        std::fs::write(&victim, b"precious").unwrap();
+        let hash = git_sha256(b"patched\n");
+
+        let socket = tmp.path().join("p/.socket");
+        let blobs_dir = socket.join("blobs");
+        std::fs::create_dir_all(&blobs_dir).unwrap();
+        std::os::unix::fs::symlink(&victim, blobs_dir.join(&hash)).unwrap();
+        let err = write_blob_entry(&blobs_dir, BLOB_B64, &hash, "package/index.js", "blob")
+            .await
+            .unwrap_err();
+        assert!(err.contains("is a symlink"), "{err}");
+        assert_eq!(std::fs::read(&victim).unwrap(), b"precious");
+
+        let outside = tmp.path().join("outside");
+        std::fs::create_dir_all(&outside).unwrap();
+        let socket2 = tmp.path().join("q/.socket");
+        std::fs::create_dir_all(&socket2).unwrap();
+        std::os::unix::fs::symlink(&outside, socket2.join("blobs")).unwrap();
+        let err = write_blob_entry(&socket2.join("blobs"), BLOB_B64, &hash, "f", "blob")
+            .await
+            .unwrap_err();
+        assert!(err.contains("is a symlink"), "{err}");
+        assert!(
+            !outside.join(&hash).exists(),
+            "nothing written through the link"
+        );
+    }
+
+    #[test]
+    fn base64_decode_tolerates_line_breaks_and_missing_padding() {
+        assert_eq!(base64_decode("cGF0\nY2hlZAo=").unwrap(), b"patched\n");
+        assert_eq!(base64_decode("cGF0Y2hlZAo").unwrap(), b"patched\n");
     }
 
     // --- short_uuid ------------------------------------------------------
@@ -5237,16 +5304,22 @@ mod tests {
         let tmp = tempfile::tempdir().unwrap();
         let blobs_dir = tmp.path().join(".socket/blobs");
 
-        let after = "a".repeat(64);
+        // A REAL git-sha256 name, so the after-blob verifies and lands
+        // before the before-blob's traversal hash is rejected.
+        let after = git_sha256(b"patched\n");
         let mut files = HashMap::new();
         let mut info = file_resp(Some("../escaped"), Some(&after));
         info.blob_content = Some(BLOB_B64.to_string());
-        info.before_blob_content = Some(BLOB_B64.to_string());
+        info.before_blob_content = Some(PRISTINE_B64.to_string());
         files.insert("package/index.js".to_string(), info);
         let patch = patch_with_files(files);
 
         let res = write_all_patch_blobs(&blobs_dir, &patch, /*quiet=*/ true).await;
         assert_eq!(res, Err(()));
+        assert!(
+            !tmp.path().join(".socket/escaped").exists(),
+            "nothing is written at the traversal target"
+        );
         assert!(
             !blobs_dir.join(&after).exists(),
             "the after-blob written before the failure is unwound"
@@ -5266,7 +5339,7 @@ mod tests {
         let tmp = tempfile::tempdir().unwrap();
         let blobs_dir = tmp.path().join(".socket/blobs");
         tokio::fs::create_dir_all(&blobs_dir).await.unwrap();
-        let after = "a".repeat(64);
+        let after = git_sha256(b"patched\n");
         tokio::fs::write(blobs_dir.join(&after), b"patched\n")
             .await
             .unwrap();
@@ -5274,7 +5347,7 @@ mod tests {
         let mut files = HashMap::new();
         let mut info = file_resp(Some("../escaped"), Some(&after));
         info.blob_content = Some(BLOB_B64.to_string());
-        info.before_blob_content = Some(BLOB_B64.to_string());
+        info.before_blob_content = Some(PRISTINE_B64.to_string());
         files.insert("package/index.js".to_string(), info);
         let patch = patch_with_files(files);
 
@@ -5287,11 +5360,11 @@ mod tests {
         );
 
         // And a fully successful write reports exactly the NEW hashes.
-        let before = "b".repeat(64);
+        let before = git_sha256(b"pristine\n");
         let mut files = HashMap::new();
         let mut info = file_resp(Some(&before), Some(&after));
         info.blob_content = Some(BLOB_B64.to_string());
-        info.before_blob_content = Some(BLOB_B64.to_string());
+        info.before_blob_content = Some(PRISTINE_B64.to_string());
         files.insert("package/index.js".to_string(), info);
         let created = write_all_patch_blobs(&blobs_dir, &patch_with_files(files), true)
             .await
@@ -6323,6 +6396,81 @@ mod tests {
         );
         assert_eq!(out.skip_records.len(), 1);
         assert_eq!(out.skip_records[0]["errorCode"], "package_not_installed");
+    }
+
+    /// B74: a FIFO planted at `pnpm-lock.yaml` of a pnpm-PnP project must
+    /// not wedge hosted `get` in open(2). A FIFO present from the start is
+    /// already refused by the lock inventory (so this guards the whole
+    /// hosted filter path, and passes on the old code too); the raw read
+    /// behind the pnpm-PnP keep-gate is now FIFO-safe as well, which closes
+    /// the window where a FIFO is swapped in after the inventory read. A
+    /// watchdog thread
+    /// opens the FIFO's write end (non-blocking) after a grace period, which
+    /// releases a reader stuck in open(2): the test then FAILS instead of
+    /// hanging the suite.
+    #[cfg(unix)]
+    #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+    async fn filter_to_installed_purls_pnpm_pnp_hosted_fifo_lock_does_not_wedge() {
+        use std::os::unix::fs::OpenOptionsExt;
+        use std::sync::atomic::{AtomicBool, Ordering};
+        use std::sync::Arc;
+
+        let tmp = tempfile::tempdir().unwrap();
+        std::fs::write(tmp.path().join(".pnp.cjs"), b"// pnp loader\n").unwrap();
+        let lock = tmp.path().join("pnpm-lock.yaml");
+        let c = std::ffi::CString::new(lock.to_str().unwrap()).unwrap();
+        assert_eq!(unsafe { libc::mkfifo(c.as_ptr(), 0o600) }, 0);
+        std::fs::create_dir_all(tmp.path().join("node_modules")).unwrap();
+        std::fs::write(tmp.path().join("node_modules/.modules.yaml"), b"").unwrap();
+
+        let done = Arc::new(AtomicBool::new(false));
+        let rescued = Arc::new(AtomicBool::new(false));
+        let watchdog = {
+            let (done, rescued, lock) = (done.clone(), rescued.clone(), lock.clone());
+            std::thread::spawn(move || {
+                let deadline = std::time::Instant::now() + std::time::Duration::from_secs(5);
+                while !done.load(Ordering::SeqCst) && std::time::Instant::now() < deadline {
+                    std::thread::sleep(std::time::Duration::from_millis(50));
+                }
+                // Keep releasing until the body returns: each open lets one
+                // blocked reader through to EOF.
+                while !done.load(Ordering::SeqCst) {
+                    if std::fs::OpenOptions::new()
+                        .write(true)
+                        .custom_flags(libc::O_NONBLOCK)
+                        .open(&lock)
+                        .is_ok()
+                    {
+                        rescued.store(true, Ordering::SeqCst);
+                    }
+                    std::thread::sleep(std::time::Duration::from_millis(50));
+                }
+            })
+        };
+
+        let common = crate::args::GlobalArgs {
+            cwd: tmp.path().to_path_buf(),
+            ..Default::default()
+        };
+        let accessible = vec![mk_patch(
+            "88888888-8888-4888-8888-888888888888",
+            "pkg:npm/covgap-judged@1.0.0",
+            "free",
+            "2024-01-01",
+        )];
+        let out = filter_to_installed_purls(
+            &accessible,
+            &common,
+            crate::commands::scan::ScanMode::Hosted,
+        )
+        .await;
+        done.store(true, Ordering::SeqCst);
+        watchdog.join().unwrap();
+        assert!(
+            !rescued.load(Ordering::SeqCst),
+            "a FIFO pnpm-lock.yaml wedged get in open(2)"
+        );
+        assert!(out.kept.is_empty(), "{:?}", out.kept);
     }
 
     /// pnpm-PnP + hosted: a purl the lock probe CANNOT judge (no `@version`

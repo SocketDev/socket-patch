@@ -547,8 +547,6 @@ fn write_vendored_ledger(root: &Path, ledger_uuid: &str) -> PathBuf {
 /// Fully offline: no files in the record, vendor-owned purl (so the
 /// rollback returns before the before-blob gate), empty wiring.
 #[test]
-#[ignore = "RED: pins a ledger-generation matching fix in remove.rs that was not \
-            part of this change."]
 fn remove_by_uuid_reverts_vendoring_when_ledger_generation_is_older() {
     let tmp = tempfile::tempdir().expect("tempdir");
     let socket = write_vendored_manifest(tmp.path(), MANIFEST_UUID);
@@ -586,6 +584,38 @@ fn remove_by_uuid_reverts_vendoring_when_ledger_generation_is_older() {
             && e["purl"] == VENDORED_PURL
             && e["action"] == "removed"),
         "expected a vendor_reverted Removed event for the vendored purl: {events:?}"
+    );
+}
+
+/// The rollback twin of the test above (#999): `rollback <manifest uuid>`
+/// resolves through the same ledger matching, so the vendored generation
+/// one behind the manifest must be reverted too, not left wired while the
+/// run reports success.
+#[test]
+fn rollback_by_uuid_reverts_vendoring_when_ledger_generation_is_older() {
+    let tmp = tempfile::tempdir().expect("tempdir");
+    write_vendored_manifest(tmp.path(), MANIFEST_UUID);
+    let artifact_dir = write_vendored_ledger(tmp.path(), LEDGER_UUID);
+
+    let (code, stdout, stderr) = common::run_with_env(
+        tmp.path(),
+        &["rollback", MANIFEST_UUID, "--json", "--yes"],
+        &[("SOCKET_TELEMETRY_DISABLED", "1")],
+    );
+    assert_eq!(code, 0, "stdout=\n{stdout}\nstderr=\n{stderr}");
+    let v: serde_json::Value = serde_json::from_str(&stdout).expect("valid JSON");
+    assert!(
+        !tmp.path().join(".socket/vendor/state.json").exists(),
+        "rollback must revert the older vendored generation; envelope={v}"
+    );
+    assert!(
+        !artifact_dir.exists(),
+        "the vendored artifact must be deleted; envelope={v}"
+    );
+    assert_eq!(
+        v["vendoredReverted"],
+        serde_json::json!([VENDORED_PURL]),
+        "envelope={v}"
     );
 }
 
