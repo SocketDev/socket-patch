@@ -55,7 +55,7 @@ use crate::formats::cargo::CargoLock;
 use crate::formats::composer::hosted::rewrite_composer_lock;
 use crate::formats::gem::gemfile;
 use crate::formats::gem::hosted::{checksum_entry_span, converge_gem_lock_source};
-use crate::formats::gem::lock_lists_direct_dependency;
+use crate::formats::gem::{lock_lists_direct_dependency, locked_specs as gem_locked_specs};
 #[cfg(test)]
 use crate::formats::pnpm::hosted::pnpm_unrewritten_instances;
 use crate::formats::pnpm::plan_hosted;
@@ -553,11 +553,12 @@ pub fn rewrite_registry_redirect_with_pipenv_version(
 }
 
 /// #701 / #932: the patch service can grant a pypi patch as a platform- or
-/// ABI-tagged wheel (`…-cp311-cp311-manylinux…whl`). Every hosted PyPI lock
-/// (uv.lock, PEP 723 script locks, pylock.toml, Pipfile.lock, poetry.lock,
-/// pdm.lock, requirements.txt, Hatch's pyproject) is meant to install on
-/// any platform its markers allow, and a hosted pin narrows the entry to
-/// that one wheel: installs on any other interpreter, OS or architecture
+/// ABI-tagged wheel (`…-cp311-cp311-manylinux…whl`), or as a pure wheel
+/// bound to one interpreter (`…-cp311-none-any.whl`, #1048). Every hosted
+/// PyPI lock (uv.lock, PEP 723 script locks, pylock.toml, Pipfile.lock,
+/// poetry.lock, pdm.lock, requirements.txt, Hatch's pyproject) is meant to
+/// install on any platform its markers allow, and a hosted pin narrows the
+/// entry to that one wheel: installs on any other interpreter, OS or architecture
 /// then fail, and hosted rollback cannot derive which upstream wheels to
 /// put back. Fail closed like hosted gem (`redirect_gem_platform_unsupported`).
 /// The tags are read the way vendored mode reads them for
@@ -583,9 +584,10 @@ pub fn pypi_platform_wheel_refusal(dep: &DepOverride) -> Option<RewriteWarning> 
     platform_locked.then(|| RewriteWarning {
         code: "redirect_pypi_platform_wheel".into(),
         detail: format!(
-            "the patched wheel for {}=={} is platform-specific ({tags}); pinning it \
-             would make the project's Python lockfiles install it on this platform \
-             only, so the redirect is skipped and nothing was written for it",
+            "the patched wheel for {}=={} is interpreter- or platform-specific \
+             ({tags}); pinning it would make the project's Python lockfiles install \
+             it on this interpreter or platform only, so the redirect is skipped and \
+             nothing was written for it",
             dep.name, dep.version
         ),
     })
@@ -6132,6 +6134,10 @@ fn rewrite_gem(
         })
         .unwrap_or_default();
 
+    // The specs the lock resolves, read once from the lock as it was handed
+    // in: the rewrites below only re-point specs, never change a version.
+    let locked = files.get(lock_name).map(|lk| gem_locked_specs(lk));
+
     for dep in &gem {
         let Some(ov) = registry_override_of_kind(dep, "rubygems-compact-index") else {
             result.warnings.push(RewriteWarning {
@@ -6229,6 +6235,26 @@ fn rewrite_gem(
                 ),
             });
             continue;
+        }
+
+        // Hosted mode re-points the version the lock resolves; it never
+        // picks a version. In a project that installs to the shared gem
+        // home, the crawl also returns versions other projects installed,
+        // and pinning one of those overwrites the user's constraint or adds
+        // an unresolvable top-level pin, so the next `bundle install`
+        // downgrades or fails (#1055). Skip a version no `GEM` section lists.
+        if let Some(specs) = &locked {
+            if !specs.contains(&(dep.name.as_str(), dep.version.as_str())) {
+                result.warnings.push(RewriteWarning {
+                    code: "redirect_gem_version_not_locked".into(),
+                    detail: format!(
+                        "{lock_name} does not resolve {} {} (it is installed on this \
+                         machine but this project doesn't lock it); redirect skipped",
+                        dep.name, dep.version
+                    ),
+                });
+                continue;
+            }
         }
 
         // Whether THIS dep's Gemfile source redirect is in place (just
@@ -13332,6 +13358,92 @@ mod tests {
             "{toml}"
         );
         assert!(r.confirmed_cargo_uuids.contains(CARGO_UUID));
+    }
+
+    /// #1055: a gem version only another project installed into the shared
+    /// gem home reaches the redirect as a candidate. The lock resolves a
+    /// different version, so pinning the crawled one overwrites the user's
+    /// constraint (direct) or adds an unresolvable top-level pin
+    /// (transitive), and the next `bundle install` downgrades or fails.
+    /// Skip it before any write.
+    #[test]
+    fn gem_version_the_lock_does_not_resolve_is_never_pinned() {
+        let lock = "GEM\n  remote: https://rubygems.org/\n  specs:\n    colorize (1.1.0)\n    \
+                    mylib (1.0.0)\n      colorize (~> 1.0)\n    rake (13.2.1)\n\n\
+                    PLATFORMS\n  ruby\n\nDEPENDENCIES\n  DEPS\n\n\
+                    CHECKSUMS\n  colorize (1.1.0) sha256=aaaa\n\n\
+                    BUNDLED WITH\n   4.0.22\n";
+        // Direct: `gem "colorize", "~> 1.0"` locked at 1.1.0.
+        // Transitive: only `mylib` depends on colorize.
+        for (gemfile, deps) in [
+            (
+                "source \"https://rubygems.org\"\n\ngem \"rake\"\ngem \"colorize\", \"~> 1.0\"\n",
+                "colorize (~> 1.0)\n  rake",
+            ),
+            (
+                "source \"https://rubygems.org\"\n\ngem \"rake\"\ngem \"mylib\"\n",
+                "mylib\n  rake",
+            ),
+        ] {
+            let lock = lock.replace("DEPS", deps);
+            let mut files = BTreeMap::new();
+            files.insert("Gemfile".to_string(), gemfile.to_string());
+            files.insert("Gemfile.lock".to_string(), lock.clone());
+            let r = rewrite_registry_redirect(&files, &[gem_override("colorize", "0.8.1")]);
+            assert!(
+                r.files.is_empty() && r.edits.is_empty(),
+                "{gemfile}: an unlocked version must not be pinned\nfiles={:?} edits={:?}",
+                r.files,
+                r.edits
+            );
+            assert_eq!(
+                warning_codes(&r),
+                vec!["redirect_gem_version_not_locked"],
+                "{gemfile}: {:?}",
+                r.warnings
+            );
+        }
+        // A gem the lock doesn't list at all (installed for another project
+        // only) is skipped the same way, instead of being appended.
+        let mut files = BTreeMap::new();
+        files.insert(
+            "Gemfile".to_string(),
+            "source \"https://rubygems.org\"\ngem \"rake\"\n".to_string(),
+        );
+        files.insert(
+            "Gemfile.lock".to_string(),
+            lock.replace("DEPS", "rake")
+                .replace("    colorize (1.1.0)\n", "")
+                .replace("    mylib (1.0.0)\n      colorize (~> 1.0)\n", "")
+                .replace("  colorize (1.1.0) sha256=aaaa\n", ""),
+        );
+        let r = rewrite_registry_redirect(&files, &[gem_override("colorize", "0.8.1")]);
+        assert!(r.files.is_empty() && r.edits.is_empty(), "{:?}", r.files);
+        assert_eq!(
+            warning_codes(&r),
+            vec!["redirect_gem_version_not_locked"],
+            "{:?}",
+            r.warnings
+        );
+        // Control: the locked version itself is still pinned.
+        let mut files = BTreeMap::new();
+        files.insert(
+            "Gemfile".to_string(),
+            "source \"https://rubygems.org\"\n\ngem \"rake\"\ngem \"colorize\", \"~> 1.0\"\n"
+                .to_string(),
+        );
+        files.insert(
+            "Gemfile.lock".to_string(),
+            lock.replace("DEPS", "colorize (~> 1.0)\n  rake"),
+        );
+        let r = rewrite_registry_redirect(&files, &[gem_override("colorize", "1.1.0")]);
+        assert!(
+            !warning_codes(&r).contains(&"redirect_gem_version_not_locked"),
+            "{:?}",
+            r.warnings
+        );
+        let out = r.files.get("Gemfile").expect("locked version redirected");
+        assert!(out.contains("  gem \"colorize\", \"1.1.0\"\nend"), "{out}");
     }
 
     fn gem_override(name: &str, version: &str) -> DepOverride {
