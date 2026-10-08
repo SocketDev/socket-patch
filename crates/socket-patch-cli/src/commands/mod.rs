@@ -1,3 +1,4 @@
+pub(crate) mod agent_download;
 pub mod apply;
 pub(crate) mod bun_preflight;
 pub(crate) mod composer_hints;
@@ -5,6 +6,7 @@ pub(crate) mod context;
 pub(crate) mod fetch_stage;
 pub mod get;
 pub mod hosted_bundle;
+pub(crate) mod hosted_unwind;
 pub mod list;
 pub(crate) mod lock_cli;
 pub mod remove;
@@ -17,6 +19,7 @@ pub(crate) mod vendored_backend;
 pub mod vex;
 pub(crate) mod vex_consumed;
 pub(crate) mod vex_sources;
+pub(crate) mod vlt_heal;
 pub(crate) mod vlt_preflight;
 
 use std::path::Path;
@@ -106,12 +109,7 @@ pub(crate) async fn discover_wiring_in(
 
 fn discover_options(common: &crate::args::GlobalArgs) -> socket_patch_core::vex::DiscoverOptions {
     socket_patch_core::vex::DiscoverOptions {
-        patch_server_origins: common
-            .patch_server_url
-            .iter()
-            .filter(|url| !url.trim().is_empty())
-            .cloned()
-            .collect(),
+        patch_server_origins: hosted_unwind::patch_server_origins(common),
     }
 }
 

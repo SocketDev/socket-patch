@@ -2,7 +2,8 @@
 //!
 //! These tests pin the public CLI contract for `socket-patch vendor`: every
 //! flag, every default, the embedded-VEX passthrough surface, env-var
-//! wiring (`SOCKET_FORCE`, `SOCKET_VENDOR_REVERT`, `SOCKET_VEX*`), the
+//! wiring (`SOCKET_VENDOR_REVERT`, `SOCKET_VEX*`; the retired `SOCKET_FORCE`
+//! is pinned as ignored), the
 //! subcommand's presence in the top-level command list, and that the
 //! bare-UUID convenience fallback still routes to `get` — never to
 //! `vendor`. Changing any assertion here is a breaking change to the CLI
@@ -61,7 +62,8 @@ const SOCKET_ENV_VARS: &[&str] = &[
     "SOCKET_NO_TRUST_LOCKFILE_CONFIG",
     "SOCKET_NO_NPM_ALLOW_REMOTE_CONFIG",
     "SOCKET_NO_VLT_INSTALL_CLEANUP",
-    // VendorArgs-specific
+    // VendorArgs-specific (`SOCKET_FORCE` is retired but still scrubbed so a
+    // stale export can't leak into the "is ignored" test)
     "SOCKET_FORCE",
     "SOCKET_VENDOR_REVERT",
     // VexEmbedArgs (flattened embedded-VEX passthrough)
@@ -432,41 +434,16 @@ fn ecosystems_csv_splits_into_vec() {
 // injected variable, so the parsed value can only have come from that
 // variable (not from the shell, and not from a flag).
 
+/// v5 retired `SOCKET_FORCE` (#615): `--force` is flag-only, so a stale
+/// export leaves `force` at its default instead of bypassing the variant
+/// probe. The var stays in the scrub list so this test controls it.
 #[test]
 #[serial_test::serial]
-fn env_socket_force_true_sets_force() {
-    let a = parse_vendor_with_env(&[("SOCKET_FORCE", "true")], &[]).expect("parse");
-    let mut want = expected_defaults();
-    want.force = true;
-    assert_eq!(snapshot(&a), want);
-}
-
-#[test]
-#[serial_test::serial]
-fn env_socket_force_false_keeps_force_off() {
-    let a = parse_vendor_with_env(&[("SOCKET_FORCE", "false")], &[]).expect("parse");
-    assert_eq!(snapshot(&a), expected_defaults());
-}
-
-/// The contract every other bool env var on this CLI follows (`SOCKET_JSON=1`,
-/// `SOCKET_OFFLINE=yes`, `SOCKET_VENDOR_REVERT=1` all work): boolish tokens
-/// must be accepted. `SOCKET_FORCE=1` should set `force = true`.
-#[test]
-#[serial_test::serial]
-fn env_socket_force_numeric_one_should_set_force() {
-    let a = parse_vendor_with_env(&[("SOCKET_FORCE", "1")], &[])
-        .expect("boolish env tokens should be accepted like every other SOCKET_* bool");
-    let mut want = expected_defaults();
-    want.force = true;
-    assert_eq!(snapshot(&a), want);
-}
-
-#[test]
-#[serial_test::serial]
-fn env_socket_force_empty_should_parse_as_false() {
-    let a = parse_vendor_with_env(&[("SOCKET_FORCE", "")], &[])
-        .expect("an exported-but-empty bool env var must not abort the parse");
-    assert_eq!(snapshot(&a), expected_defaults());
+fn env_socket_force_is_ignored() {
+    for val in ["1", "true", "yes", ""] {
+        let a = parse_vendor_with_env(&[("SOCKET_FORCE", val)], &[]).expect("parse");
+        assert_eq!(snapshot(&a), expected_defaults(), "SOCKET_FORCE={val:?}");
+    }
 }
 
 #[test]

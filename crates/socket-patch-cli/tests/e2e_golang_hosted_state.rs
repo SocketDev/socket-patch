@@ -101,24 +101,36 @@ async fn mount_sumdb(server: &MockServer) {
 }
 
 fn get_hosted(consumer: &Path, server: &MockServer, modcache: &Path) -> serde_json::Value {
+    get_hosted_with(consumer, server, modcache, &[])
+}
+
+fn get_hosted_with(
+    consumer: &Path,
+    server: &MockServer,
+    modcache: &Path,
+    extra: &[&str],
+) -> serde_json::Value {
+    let uri = server.uri();
+    let mut args = vec![
+        "get",
+        UUID_H,
+        "--mode",
+        "hosted",
+        "--json",
+        "--yes",
+        "--cwd",
+        consumer.to_str().unwrap(),
+        "--api-url",
+        &uri,
+        "--org",
+        ORG,
+        "--api-token",
+        "fake",
+    ];
+    args.extend_from_slice(extra);
     let (code, stdout, stderr) = run_with_prebuilt(
         consumer,
-        &[
-            "get",
-            UUID_H,
-            "--mode",
-            "hosted",
-            "--json",
-            "--yes",
-            "--cwd",
-            consumer.to_str().unwrap(),
-            "--api-url",
-            &server.uri(),
-            "--org",
-            ORG,
-            "--api-token",
-            "fake",
-        ],
+        &args,
         &[("GOMODCACHE", modcache.to_str().unwrap())],
     );
     assert_eq!(
@@ -126,6 +138,24 @@ fn get_hosted(consumer: &Path, server: &MockServer, modcache: &Path) -> serde_js
         "get --mode hosted failed\nstdout:\n{stdout}\nstderr:\n{stderr}"
     );
     serde_json::from_str(&stdout).unwrap_or_else(|e| panic!("not JSON: {e}\n{stdout}"))
+}
+
+/// Every file under `root`, `.socket/` included (relative path → bytes).
+fn tree_snapshot(root: &Path) -> std::collections::BTreeMap<String, Vec<u8>> {
+    fn walk(root: &Path, dir: &Path, out: &mut std::collections::BTreeMap<String, Vec<u8>>) {
+        for e in std::fs::read_dir(dir).unwrap() {
+            let p = e.unwrap().path();
+            if std::fs::symlink_metadata(&p).unwrap().is_dir() {
+                walk(root, &p, out);
+            } else {
+                let rel = p.strip_prefix(root).unwrap().to_string_lossy().into_owned();
+                out.insert(rel, std::fs::read(&p).unwrap());
+            }
+        }
+    }
+    let mut out = std::collections::BTreeMap::new();
+    walk(root, root, &mut out);
+    out
 }
 
 fn write_consumer(consumer: &Path, go_mod_tail: &str, go_sum: &str) {
@@ -296,6 +326,22 @@ async fn hosted_takeover_of_vendored_module_removes_vendored_state() {
 
     let server = MockServer::start().await;
     mount_hosted_grant(&server).await;
+    // The dry run stages the same revert in memory and drops it: every
+    // byte of the project, `.socket/` included, stays as it was.
+    let before = tree_snapshot(&consumer);
+    let preview = get_hosted_with(&consumer, &server, &modcache, &["--dry-run"]);
+    assert!(
+        preview
+            .to_string()
+            .contains("redirect_would_revert_vendored"),
+        "the takeover is previewed: {preview}"
+    );
+    assert_eq!(
+        tree_snapshot(&consumer),
+        before,
+        "a dry-run takeover changes nothing: {preview}"
+    );
+
     let env = get_hosted(&consumer, &server, &modcache);
     assert_eq!(env["redirect"]["redirected"], 1, "envelope: {env}");
 

@@ -14,15 +14,14 @@ use socket_patch_core::vendor::{
 use std::collections::HashSet;
 use std::time::Duration;
 
-use super::get::short_uuid;
-use super::rollback::{
-    rollback_patches_inner, run_hosted_leg, sweep_failure, HostedLegOutcome, InnerSelection,
-};
+use super::rollback::{rollback_patches_inner, InnerSelection};
 use crate::args::{apply_env_toggles, GlobalArgs};
+use crate::commands::hosted_unwind::{run_hosted_leg, HostedLegOutcome};
 use crate::commands::lock_cli::acquire_or_emit;
 use crate::commands::vendored_backend::{RevertedEntry, VendorRevertStep, VendoredBackend};
 use crate::json_envelope::{Command, Envelope, EnvelopeError, PatchAction, PatchEvent, Status};
-use crate::ui::plural;
+use crate::ui::short_uuid;
+use crate::ui::{plural, sweep_failure};
 
 /// Vendor-ledger entries matching a remove identifier
 /// ([`socket_patch_core::ledgers::Ledgers::matching`]), sorted by key for
@@ -107,7 +106,7 @@ fn emit_error_envelope(json: bool, dry_run: bool, code: &str, message: String) {
         env.mark_error(EnvelopeError::new(code, message));
         println!("{}", env.to_pretty_json());
     } else {
-        eprintln!("Error: {}", super::rollback::capitalize_first(&message));
+        eprintln!("Error: {}", crate::ui::sentence_case(&message));
     }
 }
 
@@ -748,8 +747,7 @@ pub async fn run(args: RemoveArgs) -> i32 {
                     leg
                 }
                 Err(err) => {
-                    let (code, msg) = hosted_unwind_error(err, true);
-                    emit_error_envelope(args.common.json, args.common.dry_run, code, msg);
+                    emit_hosted_unwind_error(&args.common, err, true);
                     return 1;
                 }
             };
@@ -1301,6 +1299,20 @@ fn hosted_unwind_error(err: HostedUnwindError, manifest_backed: bool) -> (&'stat
     )
 }
 
+/// Report a stopped hosted unwind. JSON carries the whole message in the
+/// error envelope. A human run already saw `Error: <why>` — the hosted leg
+/// prints each refusal as it happens — so only the manifest-backed path's
+/// extra fact is added; printing the refusal again would show the same
+/// error twice (B77).
+fn emit_hosted_unwind_error(common: &GlobalArgs, err: HostedUnwindError, manifest_backed: bool) {
+    let (code, msg) = hosted_unwind_error(err, manifest_backed);
+    if common.json {
+        emit_error_envelope(true, common.dry_run, code, msg);
+    } else if manifest_backed {
+        eprintln!("The manifest was not modified.");
+    }
+}
+
 /// Remove path for identifiers that match ONLY hosted lockfile pins (no
 /// manifest entry, no vendor-ledger entry): confirm, restore each pin's
 /// upstream registry entry, and report `Removed`/`hosted_reverted` events. Like the ledger-only vendored path,
@@ -1369,8 +1381,7 @@ async fn remove_hosted_only(
         Ok(leg) => leg,
         Err(err) => {
             track_patch_remove_failed("hosted redirect revert failed", telemetry).await;
-            let (code, msg) = hosted_unwind_error(err, false);
-            emit_error_envelope(args.common.json, args.common.dry_run, code, msg);
+            emit_hosted_unwind_error(&args.common, err, false);
             return 1;
         }
     };

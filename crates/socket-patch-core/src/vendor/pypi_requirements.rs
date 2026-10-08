@@ -195,9 +195,9 @@ pub(super) async fn preflight_requirements(
                     "pypi_requirements_already_vendored",
                     format!(
                         "{}: already routes {canon_name} to the socket-patch vendored wheel for \
-                         patch {found}{why}; run `socket-patch vendor --revert` before \
-                         re-vendoring",
-                        file.rel
+                         patch {found}{why}; {remedy}",
+                        file.rel,
+                        remedy = super::common::REVERT_ALL_AND_REVENDOR,
                     ),
                 )
             };
@@ -309,9 +309,9 @@ pub(super) async fn rewire_requirements(
         (
             "pypi_requirements_already_vendored",
             format!(
-                "cannot re-wire {canon_name} from patch {}: {why}; run `socket-patch vendor \
-                     --revert` before re-vendoring",
-                prev.uuid
+                "cannot re-wire {canon_name} from patch {}: {why}; {remedy}",
+                prev.uuid,
+                remedy = super::common::REVERT_ALL_AND_REVENDOR,
             ),
         )
     })?;
@@ -327,7 +327,7 @@ async fn write_plan(
     // Before ANY write: a symlinked requirements file (root or `-r` include)
     // would be replaced by the rename-over.
     let planned: Vec<&str> = plan.iter().map(|f| f.rel.as_str()).collect();
-    refuse_symlinked(root, &planned, "pypi_requirements_symlink_unsupported").await?;
+    refuse_symlinked(root, &planned).await?;
     let mut wiring = Vec::new();
     let mut written: Vec<&PlannedFile> = Vec::new();
     for file in plan {
@@ -406,9 +406,7 @@ pub(super) async fn revert_requirements(
     // its target stale and never restoring the link. Keep the artifact (the
     // wiring still routes through the linked file) and fail.
     let file_refs: Vec<&str> = files.iter().map(String::as_str).collect();
-    if let Err((code, detail)) =
-        refuse_symlinked(root, &file_refs, "pypi_requirements_symlink_unsupported").await
-    {
+    if let Err((code, detail)) = refuse_symlinked(root, &file_refs).await {
         return RevertOutcome {
             kept_artifact: true,
             success: false,
@@ -911,37 +909,6 @@ pub async fn requirements_include_names(root: &Path) -> std::io::Result<Vec<Stri
     .await?;
     names.sort_by_key(|rel| rel != "requirements.txt");
     Ok(names)
-}
-
-/// The prune/discovery in-use probe for a `requirements`-flavored entry:
-/// does pip still install the wheel under `.socket/vendor/pypi/<uuid>/`?
-/// The requirements tree IS this flavor's lock, so the answer is whether
-/// any requirement line (its code, not its comment) reached from the root
-/// `requirements.txt` through in-root `-r` includes still names the uuid
-/// dir. `Some(false)` when the tree was read and none does — the user
-/// removed the pin, or bumped it to another release; `None` when no file
-/// of the tree could be read, or a reached include exists but cannot be
-/// read (cannot prove the absence of a reference: callers keep the entry).
-pub(super) async fn requirements_entry_in_use(root: &Path, uuid: &str) -> Option<bool> {
-    let needle = format!(".socket/vendor/pypi/{uuid}/");
-    let names = requirements_include_names(root).await.ok()?;
-    let mut any_readable = false;
-    for name in &names {
-        match read_regular_to_string(&root.join(name)).await {
-            Ok(content) => {
-                any_readable = true;
-                if logical_lines(&content)
-                    .iter()
-                    .any(|ll| split_comment(&ll.text).0.contains(&needle))
-                {
-                    return Some(true);
-                }
-            }
-            Err(e) if e.kind() == std::io::ErrorKind::NotFound => {}
-            Err(_) => return None,
-        }
-    }
-    any_readable.then_some(false)
 }
 
 /// A root-relative requirements path that stays inside the project root
@@ -2792,7 +2759,7 @@ mod tests {
         let err = wire_requirements(&root, "six", "1.16.0", REL_WHEEL, SHA)
             .await
             .unwrap_err();
-        assert_eq!(err.0, "pypi_requirements_symlink_unsupported");
+        assert_eq!(err.0, crate::hosted::engine::SYMLINK_REFUSAL);
         assert!(std::fs::symlink_metadata(root.join("requirements.txt"))
             .unwrap()
             .file_type()
@@ -2818,7 +2785,7 @@ mod tests {
             outcome
                 .error
                 .as_deref()
-                .is_some_and(|e| e.contains("pypi_requirements_symlink_unsupported")),
+                .is_some_and(|e| e.contains(crate::hosted::engine::SYMLINK_REFUSAL)),
             "{:?}",
             outcome.error
         );
@@ -2838,6 +2805,28 @@ mod tests {
     // ── in-use probe (#786) ───────────────────────────────────────────────
 
     const PROBE_UUID: &str = "9f6b2c4e-1d3a-4f6b-8c2d-7e5a9b1c3d5f";
+
+    /// The prune GC's in-use verdict for the requirements-flavored entry
+    /// of [`probe_vendor_line`]'s wheel
+    /// ([`crate::vex::discover::Discovery::vendor_entry_in_use`]).
+    async fn in_use(root: &Path) -> Option<bool> {
+        let entry: crate::vendor::state::VendorEntry = serde_json::from_value(serde_json::json!({
+            "ecosystem": "pypi",
+            "basePurl": "pkg:pypi/six@1.16.0",
+            "uuid": PROBE_UUID,
+            "artifact": {
+                "path": format!(".socket/vendor/pypi/{PROBE_UUID}/six-1.16.0-py2.py3-none-any.whl"),
+                "sha256": "",
+            },
+            "wiring": [],
+            "flavor": "requirements",
+        }))
+        .expect("a minimal vendor entry");
+        crate::vex::discover::discover_patched_refs(root)
+            .await
+            .vendor_entry_in_use(root, &entry)
+            .await
+    }
 
     fn probe_vendor_line(transitive: bool) -> String {
         vendor_line(
@@ -2877,7 +2866,7 @@ mod tests {
                     .unwrap();
             }
             assert_eq!(
-                requirements_entry_in_use(root, PROBE_UUID).await,
+                in_use(root).await,
                 Some(true),
                 "root={root_txt:?} include={include:?}"
             );
@@ -2899,11 +2888,7 @@ mod tests {
             tokio::fs::write(tmp.path().join("requirements.txt"), &root_txt)
                 .await
                 .unwrap();
-            assert_eq!(
-                requirements_entry_in_use(tmp.path(), PROBE_UUID).await,
-                Some(false),
-                "{root_txt:?}"
-            );
+            assert_eq!(in_use(tmp.path()).await, Some(false), "{root_txt:?}");
         }
         // A line for ANOTHER uuid (a superseding patch) does not keep this
         // one in use either.
@@ -2914,10 +2899,7 @@ mod tests {
         )
         .await
         .unwrap();
-        assert_eq!(
-            requirements_entry_in_use(tmp.path(), PROBE_UUID).await,
-            Some(false)
-        );
+        assert_eq!(in_use(tmp.path()).await, Some(false));
     }
 
     /// Nothing proves the entry unused when the tree cannot be read: no
@@ -2927,19 +2909,13 @@ mod tests {
     #[tokio::test]
     async fn in_use_probe_is_undeterminable_without_a_readable_tree() {
         let tmp = tempfile::tempdir().unwrap();
-        assert_eq!(
-            requirements_entry_in_use(tmp.path(), PROBE_UUID).await,
-            None
-        );
+        assert_eq!(in_use(tmp.path()).await, None);
 
         let tmp = tempfile::tempdir().unwrap();
         tokio::fs::write(tmp.path().join("requirements.txt"), "-r base.txt\n")
             .await
             .unwrap();
         mkfifo(&tmp.path().join("base.txt"));
-        assert_eq!(
-            requirements_entry_in_use(tmp.path(), PROBE_UUID).await,
-            None
-        );
+        assert_eq!(in_use(tmp.path()).await, None);
     }
 }

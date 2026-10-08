@@ -21,9 +21,12 @@
 //! * the vendored planner (`vendor::cargo_lock`) edits the same document
 //!   with `toml_edit`;
 //!
+//! [`manifest`] is the one reader of a `Cargo.toml`'s `[package]` identity.
+//!
 //! Everything here is pure; the callers own the reads.
 
 pub(crate) mod hosted;
+pub mod manifest;
 
 use std::ops::Range;
 

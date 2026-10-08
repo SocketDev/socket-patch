@@ -33,7 +33,9 @@ use crate::commands::vex::{generate_vex_from_manifest_path, VexEmbedArgs};
 use crate::ecosystem_dispatch::{crawl_ecosystems, crawl_ecosystems_with_npm};
 use crate::ui::{self, plural, print_json, StatusLine};
 
-use super::get::{download_and_apply_patches_with, DownloadParams, DownloadRun};
+use crate::commands::agent_download::{
+    download_and_apply_patches_with, DownloadParams, DownloadRun,
+};
 
 use self::policy::{load_invocation_policy, InvocationPolicy, PolicyLoadError, ScanPolicy};
 pub use self::socket_yml_args::{SocketYmlArgs, MIN_SEVERITY_ENV};
@@ -64,7 +66,6 @@ pub(crate) use self::discovery::{
 use self::gc::gc_json;
 pub(crate) use self::hosted::boxed_run_redirect_selected;
 use self::hosted::run_redirect;
-pub(crate) use self::hosted::{vlt_rollback_heal, vlt_takeover_heal};
 use self::vendor_flow::{
     boxed_vendor_interactive_path, boxed_vendor_json_path, fold_vendored_skips_into_apply,
     partition_skipped_selected,
@@ -1230,7 +1231,10 @@ async fn gradle_scan(
         .unwrap_or_default();
     let want_locks = !out.gradle_purls.is_empty();
     let Ok((gate, locked, mismatch, env)) = tokio::task::spawn_blocking(move || {
-        let gradle_build = gradle_cache::has_gradle_marker(&cwd);
+        let gradle_build = socket_patch_core::vendor::jvm::layout::has_build(
+            &cwd,
+            socket_patch_core::vendor::jvm::layout::BuildTool::Gradle,
+        );
         let env = JvmEnv::from_process();
         let gate = (!global && gradle_build).then(|| m2_gate(&cwd, &env));
         // The cwd's build locks annotate Gradle-cached packages in a global
@@ -1836,8 +1840,7 @@ async fn run_scan(
     // supplement falls back to the committed artifacts (fail-closed for the
     // prune), the key set degrades to empty (fail-open).
     let vendor_state = &ctx.loaded().await.vendor;
-    let ledger_supplement =
-        vendored_ledger_supplement(&args.common, &all_crawled, vendor_state).await;
+    let ledger_supplement = vendored_ledger_supplement(&ctx, &all_crawled, vendor_state).await;
     for pkg in &ledger_supplement.packages {
         if let Some(eco) = Ecosystem::from_purl(&pkg.purl) {
             *eco_counts.entry(eco).or_insert(0) += 1;
@@ -2530,21 +2533,27 @@ async fn run_scan(
                 let mut patches: Vec<serde_json::Value> = selected
                     .iter()
                     .map(|p| {
-                        match super::get::decide_patch_action(
+                        match crate::commands::agent_download::decide_patch_action(
                             manifest_for_preview,
                             &p.purl,
                             &p.uuid,
                         ) {
-                            super::get::PatchAction::Added => serde_json::json!({
-                                "purl": p.purl, "uuid": p.uuid, "action": "added",
-                            }),
-                            super::get::PatchAction::Updated { old_uuid } => serde_json::json!({
-                                "purl": p.purl, "uuid": p.uuid,
-                                "action": "updated", "oldUuid": old_uuid,
-                            }),
-                            super::get::PatchAction::Skipped => serde_json::json!({
-                                "purl": p.purl, "uuid": p.uuid, "action": "skipped",
-                            }),
+                            crate::commands::agent_download::PatchAction::Added => {
+                                serde_json::json!({
+                                    "purl": p.purl, "uuid": p.uuid, "action": "added",
+                                })
+                            }
+                            crate::commands::agent_download::PatchAction::Updated { old_uuid } => {
+                                serde_json::json!({
+                                    "purl": p.purl, "uuid": p.uuid,
+                                    "action": "updated", "oldUuid": old_uuid,
+                                })
+                            }
+                            crate::commands::agent_download::PatchAction::Skipped => {
+                                serde_json::json!({
+                                    "purl": p.purl, "uuid": p.uuid, "action": "skipped",
+                                })
+                            }
                         }
                     })
                     .collect();

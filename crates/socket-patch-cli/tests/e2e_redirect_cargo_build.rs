@@ -66,6 +66,10 @@
 //! unreachable for the fixture build (a failure instead under
 //! `SOCKET_PATCH_CARGO_E2E_REQUIRED=1`); every assertion after that is hard.
 
+#[path = "common/mod.rs"]
+mod common;
+use common::binary;
+
 use std::path::{Path, PathBuf};
 use std::process::{Command, Output};
 
@@ -102,10 +106,6 @@ const PATCH_SUFFIX: &str =
     "\n/// Socket-patch capstone marker (added by the hosted patch).\npub fn socket_patched() -> u32 { 1 }\n";
 
 // ── self-contained helpers ────────────────────────────────────────────
-
-fn binary() -> PathBuf {
-    PathBuf::from(env!("CARGO_BIN_EXE_socket-patch"))
-}
 
 /// Run socket-patch with ambient `SOCKET_*` vars scrubbed and the fixture's
 /// private CARGO_HOME injected (the cargo crawler resolves the registry

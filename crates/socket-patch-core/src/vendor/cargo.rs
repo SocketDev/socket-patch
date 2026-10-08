@@ -190,50 +190,6 @@ async fn is_vendored(project_root: &Path, name: &str, version: &str) -> bool {
     false
 }
 
-/// Is this vendored cargo entry still consumed by the project's `Cargo.lock`
-/// dependency graph? The lock is the truth source:
-///
-/// * entry absent from the lock → `Some(false)` (the dependency left the
-///   graph; the `[patch]` would be unused);
-/// * entry carries a registry `source` (crates.io re-resolve or a hosted
-///   socket-patch takeover) → `Some(false)` — the committed copy is NOT what
-///   the lock consumes, so GC may reclaim the entry (its revert restores /
-///   keeps the registry resolution and drops the dead `[patch]` wiring);
-/// * entry detached (tagged for any uuid, or untagged — vendored before
-///   tagged versions) AND a Socket-owned `[patch.crates-io]` entry (root
-///   manifest, or a legacy project-config one) points at THIS entry's
-///   committed copy → `Some(true)` (the wired vendored shape). A lock tag
-///   for ANOTHER uuid is then only stale (a checkout/merge of the lock from
-///   another patch generation): cargo re-locks any unlocked build to this
-///   copy, and the vendor hot path retags it — reclaiming the entry would
-///   leave the stale tag with no provider and silently build pristine
-///   crates.io bytes;
-/// * detached but the `[patch]` points elsewhere / is gone → `Some(false)`
-///   (nothing consumes the copy — a lock tagged for another uuid builds
-///   that generation's copy; the revert re-attaches the recorded registry
-///   originals, repairing the half-wired lock);
-/// * no readable lock → `None` (cannot determine — callers keep, fail-safe).
-pub async fn vendored_entry_in_use(entry: &VendorEntry, project_root: &Path) -> Option<bool> {
-    let (name, version) = parse_cargo_purl(&entry.base_purl)?;
-    let (name, version) = (name.as_ref(), version.as_ref());
-    match cargo_lock::probe_lock_entry_for(project_root, name, version, Some(&entry.uuid)).await {
-        cargo_lock::LockEntryProbe::NoLockfile | cargo_lock::LockEntryProbe::Unreadable => None,
-        cargo_lock::LockEntryProbe::EntryMissing => Some(false),
-        cargo_lock::LockEntryProbe::Source(_) => Some(false),
-        cargo_lock::LockEntryProbe::Detached(_) => {
-            let marker = vendor_uuid_dir_rel("cargo", &entry.uuid)?;
-            let wired = socket_patch_paths(project_root, name)
-                .await
-                .iter()
-                .any(|p| {
-                    cargo_manifest::normalize_socket_path(p)
-                        .is_some_and(|n| n.starts_with(&format!("{marker}/")))
-                });
-            Some(wired)
-        }
-    }
-}
-
 /// The run's parse of the workspace-root `Cargo.toml` for the per-crate
 /// pre-flight, which only reads it: a cargo vendor run asks it about every
 /// patched crate, and on an in-sync re-run the manifest never changes. See
@@ -533,12 +489,7 @@ async fn cargo_prelude(
     // readable, parseable regular file — and not a symlink, which the
     // atomic rewrite would replace with a detached copy (leaving the
     // link's target unwired and the revert unable to restore the link).
-    if let Err((code, detail)) = refuse_symlinked(
-        project_root,
-        &[cargo_manifest::CARGO_TOML],
-        "cargo_manifest_symlink_unsupported",
-    )
-    .await
+    if let Err((code, detail)) = refuse_symlinked(project_root, &[cargo_manifest::CARGO_TOML]).await
     {
         return Err(refused(code, detail));
     }
@@ -1964,12 +1915,12 @@ pub async fn revert_cargo_vendor_opts(
                 kept_artifact: false,
                 success: false,
                 warnings: out.warnings,
-                error: Some(
-                    "cargo_manifest_symlink_unsupported: Cargo.toml is a symbolic link; \
-                     remove the vendored `[patch.crates-io]` entry from the link's target \
-                     by hand (nothing was reverted)"
-                        .to_string(),
-                ),
+                error: Some(format!(
+                    "{}: Cargo.toml is a symbolic link; remove the vendored \
+                         `[patch.crates-io]` entry from the link's target by hand (nothing \
+                         was reverted)",
+                    crate::hosted::engine::SYMLINK_REFUSAL
+                )),
             };
         }
         Ok(_) => {}
@@ -2059,12 +2010,16 @@ pub async fn revert_cargo_vendor_opts(
     // (and the caller keeps the ledger entry), so only the deletion is
     // skipped.
     if !dry_run && !keep_artifact {
+        // Best-effort (NotFound is fine): the shared per-unit revert removal
+        // also prunes the now-empty `.socket/vendor/cargo/` and
+        // `.socket/vendor/` levels, and waits for the commit of a staged
+        // hosted takeover.
         let uuid_dir = project_root.join(&base_rel);
-        let _ = remove_tree(&uuid_dir).await; // ignore NotFound
-                                              // Best-effort: prune the now-empty `.socket/vendor/cargo/` and
-                                              // `.socket/vendor/` levels so a fully-reverted project carries no
-                                              // vendor residue. `remove_dir` fails on non-empty.
-        prune_empty_vendor_levels(&uuid_dir).await;
+        let _ = crate::utils::socket_dir::remove_tree_and_prune(
+            &uuid_dir,
+            &project_root.join(crate::constants::SOCKET_DIR),
+        )
+        .await;
     }
 
     out
@@ -3998,6 +3953,15 @@ mod tests {
 
     // ── cross-mode takeover: in-use probe + fail-closed hosted guard ─────
 
+    /// The prune GC's in-use verdict for `entry`
+    /// ([`crate::vex::discover::Discovery::vendor_entry_in_use`]).
+    async fn in_use(entry: &VendorEntry, root: &Path) -> Option<bool> {
+        crate::vex::discover::discover_patched_refs(root)
+            .await
+            .vendor_entry_in_use(root, entry)
+            .await
+    }
+
     fn ledger_entry_for(uuid: &str) -> VendorEntry {
         VendorEntry {
             ecosystem: "cargo".into(),
@@ -4039,20 +4003,20 @@ mod tests {
         tokio::fs::remove_file(root.join("Cargo.lock"))
             .await
             .unwrap();
-        assert_eq!(vendored_entry_in_use(&entry_probe, root).await, None);
+        assert_eq!(in_use(&entry_probe, root).await, None);
         tokio::fs::write(root.join("Cargo.lock"), lock_body())
             .await
             .unwrap();
 
         // Registry-sourced (pre-vendor / re-resolved): not consumed.
-        assert_eq!(vendored_entry_in_use(&entry_probe, root).await, Some(false));
+        assert_eq!(in_use(&entry_probe, root).await, Some(false));
 
         // Fully vendored: detached lock + our [patch] entry ⇒ in use.
         let (result, entry, _w) =
             expect_done(run_vendor(PURL, root, &blobs, &pristine, &record, false).await);
         assert!(result.success, "{:?}", result.error);
         let entry = entry.unwrap();
-        assert_eq!(vendored_entry_in_use(&entry, root).await, Some(true));
+        assert_eq!(in_use(&entry, root).await, Some(true));
 
         // Hosted takeover shape: the lock re-sourced to a socket-patch sparse
         // index (the [patch] entry survives, but nothing consumes the copy).
@@ -4065,7 +4029,7 @@ mod tests {
         )
         .await
         .unwrap();
-        assert_eq!(vendored_entry_in_use(&entry, root).await, Some(false));
+        assert_eq!(in_use(&entry, root).await, Some(false));
 
         // Dependency left the lock graph entirely: reclaimable.
         tokio::fs::write(
@@ -4074,7 +4038,7 @@ mod tests {
         )
         .await
         .unwrap();
-        assert_eq!(vendored_entry_in_use(&entry, root).await, Some(false));
+        assert_eq!(in_use(&entry, root).await, Some(false));
 
         // Detached lock but the [patch] points at ANOTHER uuid's copy: this
         // entry's artifact is not what the lock consumes.
@@ -4084,10 +4048,7 @@ mod tests {
         )
         .await
         .unwrap();
-        assert_eq!(
-            vendored_entry_in_use(&ledger_entry_for(UUID2), root).await,
-            Some(false)
-        );
+        assert_eq!(in_use(&ledger_entry_for(UUID2), root).await, Some(false));
     }
 
     /// FAIL CLOSED: vendoring over a LIVE hosted redirect the upstream
@@ -4627,7 +4588,7 @@ mod tests {
         std::os::unix::fs::symlink("real.toml", root.join("Cargo.toml")).unwrap();
         expect_refused(
             run_vendor(PURL, root, &blobs, &pristine, &record, false).await,
-            "cargo_manifest_symlink_unsupported",
+            crate::hosted::engine::SYMLINK_REFUSAL,
         );
         assert!(!root.join(".socket/vendor").exists());
     }
@@ -5074,8 +5035,8 @@ mod tests {
             let (_, e, w) = expect_done(run_vendor(purl, root, &blobs, src, rec, false).await);
             assert!(e.is_none() && w.is_empty(), "{purl}: {w:?}");
         }
-        assert_eq!(vendored_entry_in_use(&e1, root).await, Some(true));
-        assert_eq!(vendored_entry_in_use(&e2, root).await, Some(true));
+        assert_eq!(in_use(&e1, root).await, Some(true));
+        assert_eq!(in_use(&e2, root).await, Some(true));
         // Reverting one version leaves the other wired.
         assert!(revert_cargo_vendor(&e2, root, false).await.success);
         assert_eq!(manifest_path(root).await, Some(copy_rel()));
@@ -5913,7 +5874,7 @@ mod tests {
         assert!(
             out.error
                 .as_deref()
-                .is_some_and(|e| e.contains("cargo_manifest_symlink_unsupported")),
+                .is_some_and(|e| e.contains(crate::hosted::engine::SYMLINK_REFUSAL)),
             "{:?}",
             out.error
         );
@@ -6239,14 +6200,14 @@ mod tests {
         let (_, entry, _) =
             expect_done(run_vendor(PURL, root, &blobs, &pristine, &record, false).await);
         let entry = entry.unwrap();
-        assert_eq!(vendored_entry_in_use(&entry, root).await, Some(true));
+        assert_eq!(in_use(&entry, root).await, Some(true));
         let stale = lock_text(root).await.replace(UUID, UUID2);
         tokio::fs::write(root.join("Cargo.lock"), &stale)
             .await
             .unwrap();
-        assert_eq!(vendored_entry_in_use(&entry, root).await, Some(true));
+        assert_eq!(in_use(&entry, root).await, Some(true));
         assert_eq!(
-            vendored_entry_in_use(&ledger_entry_for(UUID2), root).await,
+            in_use(&ledger_entry_for(UUID2), root).await,
             Some(false),
             "the lock's uuid is wired nowhere"
         );
@@ -6256,7 +6217,7 @@ mod tests {
         assert!(result.success, "{:?}", result.error);
         assert!(warnings.iter().any(|w| w.code == VERSION_TAGGED));
         assert!(lock_text(root).await.contains(&tagged(UUID)));
-        assert_eq!(vendored_entry_in_use(&entry, root).await, Some(true));
+        assert_eq!(in_use(&entry, root).await, Some(true));
     }
 
     /// A patch that edits the crate's own `Cargo.toml`: the tag is written
@@ -6460,7 +6421,7 @@ mod tests {
         tokio::fs::write(root.join("Cargo.lock"), &with_fork)
             .await
             .unwrap();
-        assert_eq!(vendored_entry_in_use(&entry, root).await, Some(true));
+        assert_eq!(in_use(&entry, root).await, Some(true));
 
         let (result, again, warnings) =
             expect_done(run_vendor(PURL, root, &blobs, &pristine, &record, false).await);

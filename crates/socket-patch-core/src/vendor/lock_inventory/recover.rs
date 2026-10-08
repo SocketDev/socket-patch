@@ -4,11 +4,14 @@
 use std::path::Path;
 
 use serde_json::Value;
+use toml_edit::{DocumentMut, Item, TableLike};
 
 use crate::crawlers::python_crawler::canonicalize_pypi_name;
 use crate::formats::composer::ComposerLockPackage;
 use crate::utils::digest::{is_hex, is_sri_pin, sha256_hex};
 use crate::utils::purl::percent_decode_purl_component;
+use crate::utils::python_lock::package_artifacts;
+use crate::vendor::pypi_distribution::is_portable_wheel_url;
 
 use super::gem::{gem_download_url, gem_remotes};
 use super::pypi::python_lock_inventory;
@@ -451,29 +454,28 @@ pub(super) fn inline_yaml_field(line: &str, field: &str) -> Option<String> {
     (!v.is_empty()).then_some(v)
 }
 
-/// First `{ url = "…", hash = "sha256:…" }` wheel in a uv.lock `[[package]]`
-/// unit whose filename is a PURE wheel (`-none-any.whl`).
+/// The first hash-pinned, portable, http(s) wheel of a recorded uv / pdm
+/// `[[package]]` unit (or a bare artifact-array fragment), as
+/// `(url, sha256)`. The unit is read as TOML through the shared lock model
+/// ([`package_artifacts`]), so each artifact's url is paired with **that
+/// artifact's** hash (#1079), and portability is the shared
+/// [`is_portable_wheel_url`] rule vendored and hosted mode use. Anything
+/// unparseable, unpinned or platform-bound yields `None`: fail-closed,
+/// never a guessed pairing.
 pub(super) fn pure_wheel_from_uv_unit(unit: &str) -> Option<(String, String)> {
-    let mut search = unit;
-    while let Some(uidx) = search.find("url = \"") {
-        let after = &search[uidx + 7..];
-        let uend = after.find('"')?;
-        let url = &after[..uend];
-        let rest = &after[uend..];
-        let advance = uidx + 7 + uend;
-        if url.ends_with("-none-any.whl") {
-            if let Some(hidx) = rest.find("hash = \"sha256:") {
-                let hafter = &rest[hidx + 15..];
-                let hend = hafter.find('"')?;
-                let sha = &hafter[..hend];
-                if is_hex(sha, 64) {
-                    if let Some(url) = http_url(url) {
-                        return Some((url, sha.to_ascii_lowercase()));
-                    }
-                }
+    let document: DocumentMut = unit.parse().ok()?;
+    let root = document.as_table();
+    let package: &dyn TableLike = match root.get("package").and_then(Item::as_array_of_tables) {
+        Some(units) => units.get(0)?,
+        None => root,
+    };
+    package_artifacts(package, &["archive", "wheels", "wheel", "files"])
+        .into_iter()
+        .find_map(|artifact| {
+            let url = artifact.url?;
+            if !is_portable_wheel_url(url) {
+                return None;
             }
-        }
-        search = &search[advance..];
-    }
-    None
+            Some((http_url(url)?, artifact.sha256?))
+        })
 }
