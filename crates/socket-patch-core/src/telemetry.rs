@@ -164,12 +164,13 @@ fn build_telemetry_context(command: &str) -> PatchTelemetryContext {
 pub fn sanitize_error_message(message: &str) -> String {
     let message = crate::utils::redact::redact_urls_in(message);
     let message = message.as_ref();
-    let home = home_dir();
+    let Some(home) = home_dir() else {
+        return message.to_string();
+    };
     let home = home.to_string_lossy();
-    // `home_dir()` falls back to a literal `"~"` when no home is set, and
-    // replacing `"~"` with `"~"` is a no-op. A set-but-empty HOME must be
-    // skipped explicitly — replacing `""` would splice `~` between every byte.
-    // Trailing separators are trimmed so a `HOME=/home/user/` redaction keeps
+    // `home_dir()` is `None` with no (absolute) home set, so a set-but-empty
+    // HOME never reaches here — replacing `""` would splice `~` between
+    // every byte. Trailing separators are trimmed so a `HOME=/home/user/` redaction keeps
     // the separator (`~/.cache`, not `~.cache`); a home that trims to nothing
     // (`HOME=/`, common for unmapped-UID containers) is a filesystem root with
     // no user-identifying prefix to redact — replacing it would splice `~`

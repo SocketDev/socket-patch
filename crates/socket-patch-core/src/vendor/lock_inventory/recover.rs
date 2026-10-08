@@ -346,7 +346,7 @@ fn recover_npm_fragment(
             }
             if let Some(rest) = t.strip_prefix("resolved ") {
                 let v = rest.trim().trim_matches('"');
-                let (u, frag_sha1) = crate::vendor::yarn_classic_lock::split_resolved_sha1(v);
+                let (u, frag_sha1) = crate::formats::yarn::patterns::split_resolved_sha1(v);
                 url = http_url(u);
                 if frag_sha1.is_some() {
                     sha1 = frag_sha1;

@@ -27,8 +27,10 @@ use std::collections::{HashMap, HashSet};
 use std::path::Path;
 
 use crate::manifest::schema::{PatchManifest, PatchRecord};
+use crate::patch::redirect::upstream::HostedPin;
 use crate::patch::redirect::{CorruptRedirectState, RedirectState};
-use crate::utils::purl::{normalize_purl, patch_matches, strip_purl_qualifiers};
+use crate::utils::purl::{canonical_purl, patch_matches};
+use crate::utils::purl_key::PurlKey;
 use crate::vendor::{VendorEntry, VendorState};
 
 /// A patch store, in owner-precedence order (a lower store wins a key).
@@ -127,6 +129,33 @@ impl Matches {
     pub fn is_empty(&self) -> bool {
         self.manifest.is_empty() && self.vendor.is_empty() && self.hosted.is_empty()
     }
+}
+
+/// The lockfiles' hosted pins a remove/rollback `identifier` selects,
+/// sorted by purl: every pin the identifier names by purl or uuid, plus
+/// every pin wiring the same release as one of `manifest_keys` (the
+/// manifest entries the identifier matched). The second half is the hosted
+/// twin of [`Ledgers::matching`]'s claim groups: `remove <uuid>` of a
+/// manifest record whose package a later hosted scan re-pinned to another
+/// patch generation unwinds that pin too, instead of leaving it live with
+/// no record.
+pub fn hosted_pins_matching(
+    pins: &[HostedPin],
+    identifier: &str,
+    manifest_keys: &[String],
+) -> Vec<HostedPin> {
+    let mut matches: Vec<HostedPin> = pins
+        .iter()
+        .filter(|pin| {
+            patch_matches(&pin.purl, &pin.uuid, identifier)
+                || manifest_keys
+                    .iter()
+                    .any(|key| PurlKey::same(key, &pin.purl))
+        })
+        .cloned()
+        .collect();
+    matches.sort_by(|a, b| a.purl.cmp(&b.purl).then(a.uuid.cmp(&b.uuid)));
+    matches
 }
 
 fn sorted_keys<V>(map: &HashMap<String, V>) -> Vec<&String> {
@@ -296,7 +325,16 @@ impl<'a> Ledgers<'a> {
     /// Every entry a remove/rollback `identifier` (purl or uuid) matches:
     /// manifest and hosted records by [`patch_matches`] on their key,
     /// vendored entries by [`VendorEntry::matches_identifier`] (key or base
-    /// purl).
+    /// purl) or by belonging to a matched manifest key's claim group (rule 1
+    /// of the module docs).
+    ///
+    /// The claim group is what makes a uuid identifier generation-blind: a
+    /// manifest key and the vendored entry it claims are ONE owned pin,
+    /// whichever patch generation each store recorded. When `get`/`scan`
+    /// recorded a superseding patch B in the manifest while the ledger still
+    /// holds the vendored generation A, `remove <B>` must revert A's
+    /// vendoring too (#999), or the lockfile keeps consuming A's artifact
+    /// with no record left.
     pub fn matching(&self, identifier: &str) -> Matches {
         let mut manifest: Vec<String> = self
             .manifest
@@ -306,11 +344,17 @@ impl<'a> Ledgers<'a> {
             .map(|(key, _)| key.clone())
             .collect();
         manifest.sort();
+        let claimed_by_match = |key: &str, entry: &VendorEntry| {
+            self.claimant(key, entry)
+                .is_some_and(|owner| manifest.binary_search_by(|m| m.as_str().cmp(owner)).is_ok())
+        };
         let mut vendor: Vec<(String, VendorEntry)> = self
             .vendor
             .into_iter()
             .flat_map(|s| s.entries.iter())
-            .filter(|(key, entry)| entry.matches_identifier(key, identifier))
+            .filter(|(key, entry)| {
+                entry.matches_identifier(key, identifier) || claimed_by_match(key, entry)
+            })
             .map(|(k, e)| (k.clone(), e.clone()))
             .collect();
         vendor.sort_by(|a, b| a.0.cmp(&b.0));
@@ -328,9 +372,10 @@ impl<'a> Ledgers<'a> {
         }
     }
 
-    /// The purls both the hosted records and the vendored ledger claim,
-    /// canonical (qualifiers dropped, percent-decoded), sorted: each is
-    /// stale in exactly one store, which only the live lockfile can tell.
+    /// The purls both the hosted records and the vendored ledger claim, in
+    /// the records' display spelling ([`canonical_purl`]: qualifiers
+    /// dropped, percent-decoded), sorted and deduplicated: each is stale in
+    /// exactly one store, which only the live lockfile can tell.
     pub fn hosted_vendored_overlap(&self) -> Vec<String> {
         let (Some(redirect), Some(vendor)) = (self.redirect, self.vendor) else {
             return Vec::new();
@@ -338,22 +383,32 @@ impl<'a> Ledgers<'a> {
         if vendor.entries.is_empty() {
             return Vec::new();
         }
-        // Canonicalize both sides (drop qualifiers, percent-decode) so the API
-        // purl form the redirect records carry matches the vendor entry's base
-        // purl — mirrors `vendored_ledger_supplement`.
-        let canon = |p: &str| normalize_purl(strip_purl_qualifiers(p)).into_owned();
-        let mut vendor_purls: std::collections::BTreeSet<String> =
-            std::collections::BTreeSet::new();
-        for (key, entry) in &vendor.entries {
-            vendor_purls.insert(canon(key));
-            vendor_purls.insert(canon(&entry.base_purl));
+        // Match by `PurlKey`, so the API purl form the redirect records carry
+        // matches the vendor entry's key or base purl in any spelling.
+        // Two spellings of one release (composer `@3.0.2` and
+        // `@3.0.2.0`, NuGet case twins) are ONE overlap: deduplicate by
+        // `PurlKey`, reporting the smallest display spelling.
+        let vendor_purls = vendor.purl_keys();
+        let mut overlap: std::collections::BTreeMap<PurlKey, String> =
+            std::collections::BTreeMap::new();
+        for purl in redirect
+            .records
+            .keys()
+            .filter(|p| crate::vendor::purl_keys_cover(&vendor_purls, p))
+        {
+            let display = canonical_purl(purl);
+            overlap
+                .entry(PurlKey::new(purl))
+                .and_modify(|kept| {
+                    if display < *kept {
+                        *kept = display.clone();
+                    }
+                })
+                .or_insert(display);
         }
-        let redirect_purls: std::collections::BTreeSet<String> =
-            redirect.records.keys().map(|p| canon(p)).collect();
-        redirect_purls
-            .intersection(&vendor_purls)
-            .cloned()
-            .collect()
+        let mut out: Vec<String> = overlap.into_values().collect();
+        out.sort();
+        out
     }
 }
 
@@ -574,5 +629,101 @@ mod tests {
         assert_eq!(found.hosted, vec!["pkg:npm/a@1"]);
         assert!(l.matching("nope").is_empty());
         assert_eq!(l.matching("hb").hosted, vec!["pkg:npm/b@1"]);
+    }
+
+    #[test]
+    fn overlap_reports_one_entry_per_release_across_spellings() {
+        let v = vendor(vec![
+            (
+                "pkg:nuget/newtonsoft.json@13.0.1",
+                entry("v", "pkg:nuget/newtonsoft.json@13.0.1", true, None),
+            ),
+            (
+                "pkg:composer/acme/lib@3.0.2",
+                entry("c", "pkg:composer/acme/lib@3.0.2", true, None),
+            ),
+        ]);
+        let r = redirect(&[
+            ("pkg:nuget/Newtonsoft.Json@13.0.1", "h1"),
+            ("pkg:nuget/newtonsoft.json@13.0.1", "h2"),
+            ("pkg:composer/acme/lib@3.0.2", "h3"),
+            ("pkg:composer/acme/lib@3.0.2.0", "h4"),
+        ]);
+        let l = Ledgers {
+            manifest: None,
+            vendor: Some(&v),
+            redirect: Some(&r),
+        };
+        assert_eq!(
+            l.hosted_vendored_overlap(),
+            vec![
+                "pkg:composer/acme/lib@3.0.2".to_string(),
+                "pkg:nuget/Newtonsoft.Json@13.0.1".to_string(),
+            ]
+        );
+    }
+
+    /// #999: a uuid identifier that matches the manifest's generation also
+    /// selects the vendored entry the matched key claims, even when the
+    /// ledger recorded an older generation; an unclaimed entry for another
+    /// package does not ride along.
+    #[test]
+    fn matching_by_uuid_spans_the_claimed_vendored_generation() {
+        let m = manifest(&[("pkg:npm/a@1", "new")]);
+        let v = vendor(vec![
+            ("pkg:npm/a@1", entry("old", "pkg:npm/a@1", false, None)),
+            ("pkg:npm/b@1", entry("other", "pkg:npm/b@1", false, None)),
+        ]);
+        let l = Ledgers {
+            manifest: Some(&m),
+            vendor: Some(&v),
+            redirect: None,
+        };
+        let found = l.matching("new");
+        assert_eq!(found.manifest, vec!["pkg:npm/a@1"]);
+        let keys: Vec<&str> = found.vendor.iter().map(|(k, _)| k.as_str()).collect();
+        assert_eq!(keys, vec!["pkg:npm/a@1"]);
+        // Without the manifest, the old generation only matches its own uuid.
+        let ledger_only = Ledgers {
+            vendor: Some(&v),
+            ..Default::default()
+        };
+        assert!(ledger_only.matching("new").vendor.is_empty());
+        assert_eq!(ledger_only.matching("old").vendor.len(), 1);
+    }
+
+    fn pin(purl: &str, uuid: &str) -> HostedPin {
+        HostedPin {
+            purl: purl.into(),
+            uuid: uuid.into(),
+            files: vec![],
+        }
+    }
+
+    #[test]
+    fn hosted_pins_matching_spans_generations_of_matched_keys() {
+        let pins = vec![
+            pin("pkg:npm/a@1", "hosted-b"),
+            pin("pkg:npm/c@1", "hosted-c"),
+            pin("pkg:pypi/six@1.16.0", "hosted-six"),
+        ];
+        // By identifier alone.
+        let by_uuid = hosted_pins_matching(&pins, "hosted-c", &[]);
+        assert_eq!(by_uuid, vec![pin("pkg:npm/c@1", "hosted-c")]);
+        // A matched manifest key (another generation, qualifiers and all)
+        // selects the pin wiring its release.
+        let keys = vec![
+            "pkg:npm/a@1".to_string(),
+            "pkg:pypi/six@1.16.0?artifact_id=x".to_string(),
+        ];
+        let got = hosted_pins_matching(&pins, "agent-a", &keys);
+        assert_eq!(
+            got,
+            vec![
+                pin("pkg:npm/a@1", "hosted-b"),
+                pin("pkg:pypi/six@1.16.0", "hosted-six")
+            ]
+        );
+        assert!(hosted_pins_matching(&pins, "nope", &[]).is_empty());
     }
 }

@@ -139,7 +139,6 @@ use std::path::Path;
 use crate::manifest::schema::PatchRecord;
 use crate::patch::apply::{is_safe_relative_subpath, normalize_file_path, ApplyResult};
 use crate::utils::fs::read_regular_to_string_sync;
-use crate::utils::purl::strip_purl_qualifiers;
 
 /// A non-fatal advisory surfaced as a warning event (`code` is a stable
 /// reason tag from the CLI contract; `detail` is human text).
@@ -389,9 +388,10 @@ pub async fn harvest_artifact_blobs_from(
             continue;
         }
         let Some(entry) = entries.get(purl).or_else(|| {
+            let key = crate::utils::purl_key::PurlKey::new(purl);
             entries
                 .values()
-                .find(|e| e.base_purl == strip_purl_qualifiers(purl))
+                .find(|e| crate::utils::purl_key::PurlKey::new(&e.base_purl) == key)
         }) else {
             continue;
         };
@@ -873,7 +873,7 @@ pub async fn lock_text_refusals(
 /// (apply / rollback / scan prune). An unreadable ledger degrades to the
 /// empty set (fail-open); mutating callers that need fail-closed semantics
 /// use [`load_state`] directly.
-pub async fn vendored_purl_keys(project_root: &Path) -> HashSet<String> {
+pub async fn vendored_purl_keys(project_root: &Path) -> HashSet<crate::utils::purl_key::PurlKey> {
     load_state(project_root)
         .await
         .map(|state| state.purl_keys())
@@ -1830,9 +1830,9 @@ mod harvest_tests {
         );
     }
 
-    /// Every spelling `vendored_purl_keys` promises: the entry's map key
+    /// Every spelling `vendored_purl_keys` covers: the entry's map key
     /// (possibly qualified), its resolved base purl, and the
-    /// qualifier-stripped key.
+    /// qualifier-stripped key — one `PurlKey`.
     #[tokio::test]
     async fn vendored_purl_keys_lists_all_addressable_spellings() {
         let tmp = tempfile::tempdir().unwrap();
@@ -1842,12 +1842,15 @@ mod harvest_tests {
         write_ledger_entries(tmp.path(), &[(qualified, base, UUID, &rel)]);
 
         let keys = vendored_purl_keys(tmp.path()).await;
-        assert!(keys.contains(qualified), "map key spelling: {keys:?}");
         assert!(
-            keys.contains(base),
+            purl_keys_cover(&keys, qualified),
+            "map key spelling: {keys:?}"
+        );
+        assert!(
+            purl_keys_cover(&keys, base),
             "base purl / stripped spelling: {keys:?}"
         );
-        assert_eq!(keys.len(), 2, "base and stripped coincide here: {keys:?}");
+        assert_eq!(keys.len(), 1, "every spelling shares one key: {keys:?}");
     }
 
     /// The documented fail-open degrade: no ledger yields the empty set, and

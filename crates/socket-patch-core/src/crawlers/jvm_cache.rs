@@ -219,8 +219,9 @@ pub fn all_local_roots_with(cwd: &Path, env: &super::maven_crawler::JvmEnv) -> V
     }
     let m2 = env
         .m2_repo
-        .is_dir()
-        .then(|| JvmCacheRoot::new(env.m2_repo.clone(), JvmCacheLayout::Maven2));
+        .as_ref()
+        .filter(|repo| repo.is_dir())
+        .map(|repo| JvmCacheRoot::new(repo.clone(), JvmCacheLayout::Maven2));
     if super::gradle_cache::has_gradle_marker(cwd) {
         gradle.extend(m2);
         gradle

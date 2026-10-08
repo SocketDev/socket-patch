@@ -59,9 +59,8 @@ pub use select::{candidate_files, safe_repo_path, select_paths};
 pub use types::*;
 
 use crate::policy::{
-    canon, patch_severity_order, policy_block, FilterReason, FilteredEntry, MemoryPolicyFs,
-    PolicyError, PolicySource, Root, RootFile, SelectionPolicy, PATCHES_DISABLED,
-    POLICY_FILE_NAMES,
+    patch_severity_order, policy_block, FilterReason, FilteredEntry, MemoryPolicyFs, PolicyError,
+    PolicySource, Root, RootFile, SelectionPolicy, PATCHES_DISABLED, POLICY_FILE_NAMES,
 };
 use crate::rollout::stage::{
     classify, lookup_incomplete, mentioned_uuids, offers_from_results, Offers, RecordedIndex, Row,
@@ -69,6 +68,7 @@ use crate::rollout::stage::{
 };
 use discover::Provider;
 use stages::{Planned, RewriteRefused, Rewritten, StageOptions};
+use crate::utils::purl_key::PurlKey;
 
 /// `"<crate version>+<git sha or 'unknown'>"`; the sha comes from the
 /// `SOCKET_PATCH_GIT_SHA` build-time variable.
@@ -613,7 +613,7 @@ async fn engine(
             match policy.admits_purl(&purl) {
                 Ok(()) => admitted.push(purl),
                 Err(reason) => policy_filtered.push(FilteredEntry {
-                    purl: Some(canon(&purl)),
+                    purl: Some(PurlKey::new(&purl).into_string()),
                     uuid: None,
                     project: state.root.clone(),
                     reason,
@@ -1020,9 +1020,10 @@ async fn engine(
         let redirect = match &state.error {
             Some(_) => serde_json::json!({ "mode": "hosted" }),
             None => crate::hosted::render::redirect_json_block(
-                0,
+                &[],
+                &[],
                 Vec::new(),
-                Vec::new(),
+                &[],
                 Vec::new(),
                 options.dry_run,
             ),
@@ -1174,7 +1175,7 @@ fn select_with_policy(
             detail: Some(reason.detail()),
         });
         filtered.push(FilteredEntry {
-            purl: Some(canon(&purl)),
+            purl: Some(PurlKey::new(&purl).into_string()),
             uuid: Some(winner.uuid.clone()),
             project: root.to_string(),
             severity: Some(patch_severity_order(&winner)),
@@ -1199,6 +1200,7 @@ fn finish_root(
         skipped,
         pre_warnings,
         done,
+        unconfirmed,
     } = done;
     let crate::hosted::engine::Rewritten {
         rewrite,
@@ -1299,14 +1301,11 @@ fn finish_root(
     warnings.extend(npm_warnings);
     warnings.extend(pre_warnings);
     let redirect_warnings = crate::hosted::render::rewrite_warnings_json(&warnings);
-    let skipped_values: Vec<serde_json::Value> = skipped
-        .iter()
-        .map(crate::hosted::render::skipped_json)
-        .collect();
     let redirect = crate::hosted::render::redirect_json_block(
-        confirmed.len(),
+        &confirmed,
+        &unconfirmed,
         rewritten,
-        skipped_values,
+        &skipped,
         redirect_warnings,
         dry_run,
     );
@@ -1367,10 +1366,12 @@ mod tests {
             project: MemoryProject::new(),
             skipped: Vec::new(),
             pre_warnings: Vec::new(),
+            unconfirmed: Vec::new(),
             done: crate::hosted::engine::Rewritten {
                 files: BTreeMap::new(),
                 symlinked_reads: Vec::new(),
                 unreadable_reads: Vec::new(),
+                undecodable_reads: Vec::new(),
                 overrides: Vec::new(),
                 rewrite,
                 rewritten: files.iter().map(|(rel, _)| (*rel).to_string()).collect(),
@@ -1533,7 +1534,7 @@ mod tests {
     /// a repository `.yarnrc.yml` above it, as the disk walk does.
     #[tokio::test]
     async fn nested_yarn_root_follows_an_ancestor_yarnrc_linker() {
-        use crate::vendor::lock_inventory::view::detect_npm_lock_flavor_in;
+        use crate::vendor::npm_flavor::detect_npm_lock_flavor_in;
         let mut files: BTreeMap<String, SharedFile> = BTreeMap::new();
         files.insert(
             ".yarnrc.yml".into(),
