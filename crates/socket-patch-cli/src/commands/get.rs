@@ -1505,7 +1505,7 @@ async fn filter_to_installed_purls(
         if mode != super::scan::ScanMode::Agent {
             present.extend(supplement.entries.iter().map(|e| PurlKey::new(&e.purl)));
             let vendored =
-                super::scan::project_vendored_supplement(common, &[], &ctx.loaded().await.vendor)
+                super::scan::project_vendored_supplement(&ctx, &[], &ctx.loaded().await.vendor)
                     .await;
             present.extend(vendored.packages.iter().map(|p| PurlKey::new(&p.purl)));
         }
