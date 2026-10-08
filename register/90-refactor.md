@@ -1,7 +1,8 @@
 ### Refactor routine (`refactor`, hourly, highest leverage first)
-_Last updated 2026-10-08T22:20Z · main @ 830749f_
+_Last updated 2026-10-08T22:55Z · main @ 830749f_
 
 **In flight:**
+- [#1183](https://github.com/SocketDev/socket-patch/pull/1183): project-mode NuGet crawl of a restored project looks up the shared roots for the restore's `libraries` instead of walking them; one `project.assets.json` reader. Issue #427 (E05, #595 NuGet child). +130 production, +220 tests. Only change: unresolved shared-cache packages are no longer crawled. 3,000-package cache: 58 ms → 0.8 ms. `state: ready`.
 - [#1185](https://github.com/SocketDev/socket-patch/pull/1185): every vendored Poetry lock wires through `utils::poetry_lock`; the engine writes 2.x `files` one file per line; deletes the LF line scanner, `toml_surgery::{package_unit_lines, replace_files_array}` and `common::unit_has_canon_name`. Issue #936 (E66). +37/−166 production. Only change: hosted and CRLF-vendored 2.x `files` layout (Poetry's own); `name="…"` / files-less units wire instead of refusing. `state: ready`.
 - [#1163](https://github.com/SocketDev/socket-patch/pull/1163): `PatchFileInfo` hashes load as lowercase hex (`deserialize_with`), so agent apply/rollback `==` checks, blob names and vendored pins share one case rule. Issue #707 (C41). +18 production, +112 tests. Only change: an uppercase-hash manifest now applies and rolls back, and is written back lowercase. `state: ready`.
 - [#1160](https://github.com/SocketDev/socket-patch/pull/1160): inline BOM handling in 8 more files onto `formats::text`; `PENDING_INLINE_BOMS` 26 → 15. Issue #905 (E64, slice 2). Only change: two leading BOMs. `state: ready`.
@@ -28,11 +29,13 @@ _Last updated 2026-10-08T22:20Z · main @ 830749f_
 | 2 | #717 (E10): hosted pom edits + restore through `formats::xml` / `formats::maven` | 3 | 1 | ≈4 | M | ≈17 | skipped: `redirect/mod.rs` (#1008, #1009, #1026); `upstream/maven.rs` and `formats/maven` are free |
 | 3 | #594 (E10): nuget.config edits through `formats::nuget` | 1 | 1 | ≈3 | M | ≈9 | skipped: `redirect/mod.rs`, `vendor/nuget_feed.rs` (#1041) |
 | 4 | #936 (E66): one Poetry forward splicer | 0 | 1 | ≈1.6 | M | ≈3 | **taken: #1185** |
-| 5 | #705 (C18): one `utils::uuid` grammar | 0 | 0 | 3 | L | ≈6 | skipped: `api/client.rs`, CLI `lib.rs` (#1034, #1041, #1049) |
+| 5 | #427 (E05, #595 NuGet child): scope project-mode NuGet crawl to the restore's `libraries` | 1 | 1 | ≈0.5 | M | ≈7 (S 3) | **taken: #1183** (parallel run). Next free #595 children: cargo, go, Deno (crawler files) |
 
 Re-ranked 2026-10-08T22:00Z at `830749f` against 29 open PRs (387 files in `arch-refactor/*` or `agent/fix-*`). Still blocked by open-PR files: #1144 (CLI `commands/vex.rs`, #1027/#1041), #914 (`jvm_jar.rs`, #1041), #893 (`cleanup_blobs.rs`, #1049), #780 (`vendor/gem.rs`), #1128 (`pypi_pipenv.rs`, #1147), #1064 (`vex/product.rs`, #1007), #913/#675/#676 (`api/client.rs`), #823/#824, #833, #1014 (`jvm/sbt.rs`, #1036), every CLI `commands/*` site. Free but low-leverage: #715's crawler-reader item (`maven_crawler.rs` is free, `vex/product.rs` is not; the crawler path is hot, so it needs timings).
 
 **Notes:**
+- NuGet crawl scope (#1183): only a `cwd` with a project file is scoped; a solution root keeps the walk (restores at any depth). Extend through `PackageRoots::scope`, not a second assets reader.
+- Two runs of this routine can overlap (22:00Z run opened #1185 while the 21:52Z run opened #1183): re-fetch the ledger and open PRs right before claiming.
 - Poetry 2.x `files` is written one file per line by the shared engine since #1185; a test or golden that greps `files = [{ file` only sees 1.0/1.1 package-level `files` now.
 - A hash read from a manifest is lowercase after #1163; `api::blob_fetcher::blob_hash_matches` and vendored `eq_ignore_ascii_case` sites become plain `==` once their files are free (#707 remainder).
 - `mode_migration_pypi::pipenv_hosted_to_vendored_*` needs pypi.org; fails in the sandbox on `main` too.

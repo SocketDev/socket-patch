@@ -7,7 +7,7 @@ _Last updated 2026-10-08T18:49Z · main @ cf8b164_
 | E02 | 1 | `bun.lockb` vendoring hard-coded `registry.npmjs.org`. | §1 #7; 4.4 | #562 | fixed (#574); partly not a defect |
 | E03 | 1 | vlt `registry_base` had two implementations. | §1 #7; 4.4 | #562 | fixed (#574) |
 | E04 | 1 | Hosted-PyPI-URL recognition drifted (merged E49). Three recognizers remain: `hosted_patch_uuid`, `hosted_pypi_reference`/`hosted_artifact_url`, Pipenv `owned_url`. | 5.4; new finding | #563 | partly fixed (#572); three recognizers remain (re-checked `431b818`) |
-| E05 | 1 | Cache crawls aren't project-scoped: cargo, go, maven, nuget and deno enumerate the whole machine cache, and scan sends all of it to the API (#265). | 6.6 | #595 | filed #595; tracking, children #427, #265 |
+| E05 | 1 | Cache crawls aren't project-scoped: cargo, go, maven, nuget and deno enumerate the whole machine cache, and scan sends all of it to the API (#265). | 6.6 | #595 | in PR #1183 (NuGet child #427: shared roots looked up by the restore's `libraries`); filed #595; tracking, children #427, #265 |
 | E06 | 1 | NuGet and cargo crawler reads weren't FIFO-safe. | 6.6 | #592 | fixed (#602) |
 | E07 | 2 | package-lock has four entry walks (inventory, vendored, hosted, restore) with copied identity/skip rules and two pointer escapes. Target: one addressed walk. Serializers fixed by #357. | 4.4; 4.7 E | #663 | in PR #1008 |
 | E08 | 2 | yarn.lock had seven writer grammars beside `scan_blocks`. | 3.7 #3; 4.7 D |  | fixed (#1057) |
