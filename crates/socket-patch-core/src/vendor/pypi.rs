@@ -229,15 +229,20 @@ const SETUP_ALTERNATIVE: &str =
      install), which patches installed site-packages without lockfile edits";
 
 /// Whether the root `requirements.txt` pins the package being vendored (any
-/// spec naming it; with no target, whether the file exists at all). An
-/// unreadable file pins nothing.
+/// spec naming it; with no target, whether the file exists at all). The
+/// file is decoded as pip decodes it (a UTF-16 export from Windows
+/// PowerShell 5.1 still pins, #1120); one that exists but cannot be
+/// decoded may pin it, so it counts (fail closed). A missing or unreadable
+/// file pins nothing.
 async fn requirements_pins_target(project_root: &Path, target: Option<(&str, &str)>) -> bool {
     let path = project_root.join(crate::formats::governing_locks::PYPI_REQUIREMENTS);
     match target {
         None => tokio::fs::metadata(&path).await.is_ok(),
-        Some((name, _)) => read_regular_to_string(&path)
-            .await
-            .is_ok_and(|text| super::pypi_requirements::names_package(&text, name)),
+        Some((name, _)) => match crate::utils::fs::read_regular_to_bytes(&path).await {
+            Ok(bytes) => crate::utils::requirements::decode(&bytes)
+                .is_none_or(|text| super::pypi_requirements::names_package(&text, name)),
+            Err(_) => false,
+        },
     }
 }
 
@@ -2513,6 +2518,48 @@ mod tests {
             assert!(
                 warnings.iter().all(|w| w.code != "pypi_multiple_lockfiles"),
                 "{lock}: {warnings:?}"
+            );
+        }
+    }
+
+    /// #1120: a `requirements.txt` exported beside the governing lock in
+    /// UTF-16 (`uv export > requirements.txt` in Windows PowerShell 5.1)
+    /// is installed by pip and uv like its UTF-8 twin, so it is a loud
+    /// loser too. A file that exists but cannot be decoded may pin the
+    /// package, so it is named as well (fail closed).
+    #[tokio::test]
+    async fn non_utf8_requirements_beside_the_governing_lock_is_a_loud_loser() {
+        let text = "attrs==23.1.0\r\nsix==1.16.0\r\n";
+        let le: Vec<u8> = [0xFF, 0xFE]
+            .into_iter()
+            .chain(text.encode_utf16().flat_map(u16::to_le_bytes))
+            .collect();
+        let be: Vec<u8> = [0xFE, 0xFF]
+            .into_iter()
+            .chain(text.encode_utf16().flat_map(u16::to_be_bytes))
+            .collect();
+        let latin1 = b"# -*- coding: latin-1 -*-\n# Jos\xe9\nsix==1.16.0\n".to_vec();
+        let undecodable = b"# Jos\xe9\nidna==3.7\n".to_vec();
+        for (case, bytes) in [
+            ("utf-16 le", le),
+            ("utf-16 be", be),
+            ("pep 263", latin1),
+            ("undecodable", undecodable),
+        ] {
+            let tmp = tempfile::tempdir().unwrap();
+            touch(tmp.path(), "uv.lock", "version = 1\n").await;
+            tokio::fs::write(tmp.path().join("requirements.txt"), &bytes)
+                .await
+                .unwrap();
+            let (selected, warnings) = detect_pypi_flavor(tmp.path(), Some(("six", "1.16.0")))
+                .await
+                .unwrap();
+            assert_eq!(selected, PypiFlavor::UvProject, "{case}");
+            assert!(
+                warnings.iter().any(|w| w.code == "pypi_multiple_lockfiles"
+                    && w.detail.contains("wiring `uv.lock`")
+                    && w.detail.contains("requirements.txt")),
+                "{case}: {warnings:?}"
             );
         }
     }

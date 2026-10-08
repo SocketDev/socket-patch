@@ -24,7 +24,9 @@ use std::collections::HashSet;
 use std::path::{Path, PathBuf};
 
 use crate::crawlers::python_crawler::canonicalize_pypi_name;
-use crate::utils::fs::{atomic_write_bytes_preserving_mode, read_regular_to_string};
+use crate::utils::fs::{
+    atomic_write_bytes_preserving_mode, read_regular_to_bytes, read_regular_to_string,
+};
 use crate::utils::requirements::{
     expand_env_vars, hash_options, logical_lines, requires_hashes, shlex_split, split_comment,
     strip_comment, vendor_tag,
@@ -844,7 +846,13 @@ pub(in crate::vendor) fn vendor_line(
 /// must never edit them. The root file is always element 0.
 async fn collect_requirements_files(root: &Path) -> Result<Vec<ReqFile>, (&'static str, String)> {
     let mut out: Vec<ReqFile> = Vec::new();
-    walk_requirements_tree(root, |rel, path, read| match read {
+    // Strict UTF-8: the planner rewrites these files byte-exact, so a file
+    // in another encoding is refused below rather than re-encoded.
+    let utf8 = |bytes: Vec<u8>| {
+        String::from_utf8(bytes)
+            .map_err(|e| std::io::Error::new(std::io::ErrorKind::InvalidData, e))
+    };
+    walk_requirements_tree(root, utf8, |rel, path, read| match read {
         Ok(content) => {
             // Out-of-root (`../`) and absolute includes resolve outside any
             // committable root — readable so a pin inside can refuse, never
@@ -897,7 +905,9 @@ async fn collect_requirements_files(root: &Path) -> Result<Vec<ReqFile>, (&'stat
 /// followed.
 pub async fn requirements_include_names(root: &Path) -> std::io::Result<Vec<String>> {
     let mut names: Vec<String> = Vec::new();
-    walk_requirements_tree(root, |rel, _path, read| {
+    // Decoded as pip decodes it (#1120): a UTF-16 or PEP 263 file is read
+    // and descended into, not taken for an unreadable one.
+    walk_requirements_tree(root, decode_requirements, |rel, _path, read| {
         if !is_in_root_rel(rel) {
             return Ok(false);
         }
@@ -919,15 +929,30 @@ pub(crate) fn is_in_root_rel(rel: &str) -> bool {
     !rel.starts_with("../") && !Path::new(rel).is_absolute()
 }
 
+/// A requirements file's bytes decoded as pip decodes them
+/// ([`crate::utils::requirements::decode`]); `InvalidData` when pip's
+/// rules give no text this reader can model.
+pub(crate) fn decode_requirements(bytes: Vec<u8>) -> std::io::Result<String> {
+    crate::utils::requirements::decode(&bytes).ok_or_else(|| {
+        std::io::Error::new(
+            std::io::ErrorKind::InvalidData,
+            "not text pip's decoding rules can read (a byte-order mark, a PEP 263 \
+             coding line, or UTF-8)",
+        )
+    })
+}
+
 /// The shared include walk behind [`collect_requirements_files`] and
 /// [`requirements_include_names`]: depth-first from the root
 /// `requirements.txt`, each `-r`/`--requirement` target resolved against the
 /// INCLUDING file's directory and lexically normalized, visited-set cycle
-/// guard, FIFO-safe reads. `visit` sees every reached file with its read
-/// result and answers whether to descend into its includes (`Ok(true)`), or
-/// aborts the walk with its own error.
+/// guard, FIFO-safe reads, each file's bytes turned into text by `decode`.
+/// `visit` sees every reached file with its read result and answers whether
+/// to descend into its includes (`Ok(true)`), or aborts the walk with its
+/// own error.
 async fn walk_requirements_tree<E>(
     root: &Path,
+    decode: impl Fn(Vec<u8>) -> std::io::Result<String>,
     mut visit: impl FnMut(&str, &Path, std::io::Result<String>) -> Result<bool, E>,
 ) -> Result<(), E> {
     let mut visited: HashSet<String> = HashSet::new();
@@ -939,7 +964,7 @@ async fn walk_requirements_tree<E>(
         if !visited.insert(rel.clone()) {
             continue;
         }
-        let read = read_regular_to_string(&path).await;
+        let read = read_regular_to_bytes(&path).await.and_then(&decode);
         // Parse the includes BEFORE handing the content over (the visitor
         // takes it by value); nothing is pushed unless it asks to descend.
         let includes: Vec<String> = match &read {
@@ -1168,6 +1193,46 @@ fn parse_requirement_line(text: &str) -> Option<ParsedRequirement> {
 mod tests {
     use super::*;
     use crate::vendor::state::VendorArtifact;
+
+    /// #1120: [`requirements_include_names`] decodes each file as pip does,
+    /// so the includes of a UTF-16 root file (a Windows PowerShell 5.1
+    /// export) and of a PEP 263 include are named, not an `Err` that reads
+    /// as an unknowable tree.
+    #[tokio::test]
+    async fn requirements_include_names_decodes_as_pip_does() {
+        let tmp = tempfile::tempdir().unwrap();
+        let root = tmp.path();
+        let root_bytes: Vec<u8> = [0xFF, 0xFE]
+            .into_iter()
+            .chain(
+                "-r base.txt\r\nsix==1.16.0\r\n"
+                    .encode_utf16()
+                    .flat_map(u16::to_le_bytes),
+            )
+            .collect();
+        tokio::fs::write(root.join("requirements.txt"), root_bytes)
+            .await
+            .unwrap();
+        tokio::fs::write(
+            root.join("base.txt"),
+            b"# -*- coding: latin-1 -*-\n# Jos\xe9\n-r dev.txt\n",
+        )
+        .await
+        .unwrap();
+        tokio::fs::write(root.join("dev.txt"), "pytest\n")
+            .await
+            .unwrap();
+        assert_eq!(
+            requirements_include_names(root).await.unwrap(),
+            vec!["requirements.txt", "base.txt", "dev.txt"]
+        );
+        // The vendored planner, which rewrites byte-exact, still refuses
+        // a file that is not UTF-8.
+        let Err(err) = collect_requirements_files(root).await else {
+            panic!("a UTF-16 root file must be refused by the planner");
+        };
+        assert!(err.1.contains("is not UTF-8 text"), "{}", err.1);
+    }
 
     /// [`requirements_include_names`] names every file the planner may
     /// have pinned into — root first, nested includes resolved against the
