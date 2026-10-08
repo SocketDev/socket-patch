@@ -129,7 +129,7 @@ impl CargoCrawler {
                 // root. Reject before touching the filesystem —
                 // `verify_crate_at_path` is no defense, since it compares
                 // against the escaped directory's own Cargo.toml.
-                if !is_safe_cargo_coordinate(name, version) {
+                if !path_safety::is_safe_name_version(name, version) {
                     continue;
                 }
 
@@ -302,20 +302,6 @@ fn read_crate_cargo_toml(crate_path: &Path, dir_name: &str) -> Option<(String, S
     // Fallback: parse directory name as <name>-<version>
     package_name_version(&content)
         .or_else(|| CargoCrawler::parse_dir_name_version(dir_name))
-}
-
-/// SECURITY: `find_by_purls` formats name/version into a `<name>-<version>`
-/// registry dir (and the bare `<name>` vendor dir) joined onto the scanned
-/// source root, after which the resolved directory is patched in place — so
-/// a tampered PURL must not be able to traverse out of the root. A real
-/// crates.io name/version never contains a separator, a `.`/`..` segment, a
-/// backslash, a colon, or a NUL. Delegates to
-/// [`path_safety::is_safe_single_segment`], which also rejects `:` — a
-/// Windows drive-relative coordinate (`C:evil`) joins as an absolute path.
-/// Fails closed. Mirrors the nuget/maven/go/deno/npm/ruby crawler
-/// coordinate guards.
-fn is_safe_cargo_coordinate(name: &str, version: &str) -> bool {
-    path_safety::is_safe_single_segment(name) && path_safety::is_safe_single_segment(version)
 }
 
 impl Default for CargoCrawler {
@@ -817,37 +803,6 @@ version = "fake"
 
         assert_eq!(result.len(), 1);
         assert!(result.contains_key("pkg:cargo/serde@1.0.200"));
-    }
-
-    #[test]
-    fn test_is_safe_cargo_coordinate() {
-        // Real coordinates pass, including hyphen/underscore names,
-        // prerelease tags, and build metadata.
-        assert!(is_safe_cargo_coordinate("serde", "1.0.200"));
-        assert!(is_safe_cargo_coordinate("serde_json", "1.0.120"));
-        assert!(is_safe_cargo_coordinate("sha-1", "0.10.0"));
-        assert!(is_safe_cargo_coordinate("crate", "1.0.0-rc.1"));
-        assert!(is_safe_cargo_coordinate(
-            "wasi",
-            "0.11.0+wasi-snapshot-preview1"
-        ));
-
-        // Traversal / separator smuggling fails closed.
-        assert!(!is_safe_cargo_coordinate("..", "1.0.0"));
-        assert!(!is_safe_cargo_coordinate("../escaped", "1.0.0"));
-        assert!(!is_safe_cargo_coordinate("a/b", "1.0.0"));
-        assert!(!is_safe_cargo_coordinate("a\\b", "1.0.0"));
-        assert!(!is_safe_cargo_coordinate("a\0b", "1.0.0"));
-        assert!(!is_safe_cargo_coordinate("a", ".."));
-        assert!(!is_safe_cargo_coordinate("a", "../../escaped"));
-        assert!(!is_safe_cargo_coordinate("a", "1/0"));
-        assert!(!is_safe_cargo_coordinate("a", "."));
-        assert!(!is_safe_cargo_coordinate("", "1.0.0"));
-        assert!(!is_safe_cargo_coordinate("a", ""));
-        // Windows drive-relative escape: a `:` (e.g. `C:evil`) makes the
-        // joined path absolute under `Path::join`.
-        assert!(!is_safe_cargo_coordinate("C:evil", "1.0.0"));
-        assert!(!is_safe_cargo_coordinate("a", "C:1.0.0"));
     }
 
     /// SECURITY regression: a tampered manifest PURL whose name or version
