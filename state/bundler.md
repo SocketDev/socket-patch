@@ -1,6 +1,6 @@
 [agent] Progress ledger for the scheduled Bundler (RubyGems) bug-hunt routine (label pm:bundler).
 
-Last updated: 2026-10-08 (run 31), main `05fd82b` (now also includes #1002 → #1001 / #729), latest release v4.0.0 (npm; no git tags). Newest Bundler tested: 4.1.0.beta1 (no newer release as of 2026-10-07).
+Last updated: 2026-10-08 (run 32), main `b96a785` (now also includes #1060 → #1055, and #1029's full `apply --check`), latest release v4.0.0 (npm; no git tags). Newest Bundler tested: 4.1.0.beta1 (no newer release as of 2026-10-07).
 
 ## Coverage matrix
 
@@ -288,6 +288,17 @@ Also on 4.0.17: BOM `Gemfile` passes; symlinked `Gemfile` / lock is refused (pas
 | Same, `simulate_version 5` / `default_install_uses_path true` | **fail #1109** (real Bundler installs into `.bundle`) | — |
 | Control: no setting (system gems) | pass (warns) | — |
 
+### Run 32 (main `b96a785`; Linux Ruby 3.3.6; agent hand-written manifest + `apply --offline` / `apply --check`; hosted via a scratch copy of `e2e_redirect_gem_build.rs` with real `bundle install`)
+
+| Cell | 4.0.18 | 2.5.22 |
+| --- | --- | --- |
+| Repo gem e2e suites (redirect 32 / stale 37 / vendor 22 / multi-platform 7) | pass | — |
+| Agent `apply --check`: system install / #915 / #967 / #951 / out-of-tree config + env path shapes | pass | — |
+| Agent `apply --check`: #952 shape | fail #952 | — |
+| Agent `apply --check`: #1092 dual-platform pair (both key spellings); `rollback` | fail #1092; rollback pass | — |
+| Hosted, lockless Gemfile `~> 2.0`, older version only in the shared home | **fail #1125** | **fail #1125** |
+| Hosted, lockless Gemfile not declaring the shared-home gem | **fail #1125** | **fail #1125** |
+
 ### Global mode (`-g`)
 
 | OS | Ruby / Bundler | `scan -g` report | `-g` vs project scoping | `scan -g --mode hosted` refused | `get -g` / `apply -g` | `rollback -g` byte-exact | `vex -g` | `--global-prefix <gems dir>` / `SOCKET_GLOBAL=1` | Non-writable gem dir |
@@ -310,12 +321,12 @@ Also on 4.0.17: BOM `Gemfile` passes; symlinked `Gemfile` / lock is refused (pas
 
 ## Backlog
 
-1. Re-run #749 / #751 / #896 / #952 / #985 / #1055 / #1056 / #1092 / #1109 when fixes merge (PR #1060 → #1055, PR #768 → #749 / #751). #951 (#953) and #1001 / #729 (#1002) are fixed on main; spot-check it in a real install on Bundler 2.3 (legacy era: comment kept) and 4.x, together with the earlier fixes (#681, #775, #826, #915, #967).
-2. #1092 neighbours: `rollback` / `remove` on the dual-platform shape; Windows `x64-mingw-ucrt` + `x64-mingw32` pairs (probe branch); hosted and vendored modes with a lock listing several platform variants of one gem.
-3. #1055 neighbours: `get <purl> --mode hosted` and `vendor` on the shared-home shape; `scan --vex`; `-g` inside a project.
-4. #1056 neighbours: CRLF Gemfile and `gems.rb` spellings; H→V takeover of a gem inside a `source … do` block.
-5. #1109 neighbours: global-tier `deployment` / `path` with the stale guard; standalone `vex` on the deployment shape once #1098 lands (it reuses `bundler_install_homes`).
-6. Bundler 1.17 hosted unwind (Ruby 3.1.6 is available locally via rbenv); `rollback` / `remove` on a custom-lock project.
+1. Re-run #749 / #751 / #896 / #952 / #985 / #1056 / #1092 / #1109 / #1125 when fixes merge (PR #768 → #749 / #751). #1055 is fixed by #1060 (the locked shape passes in the e2e suite).
+2. #1125 neighbours: `gems.rb` without `gems.locked`; `get <uuid> --mode hosted` and `vendor` on a lockless project.
+3. Hosted re-pin to a superseding patch generation (same version, new sha, #1035 era): the stale guard on the old generation's installed bytes; `rollback` after the re-pin.
+4. #1092 neighbours: Windows `x64-mingw-ucrt` + `x64-mingw32` pairs (probe branch); hosted and vendored modes with a lock listing several platform variants of one gem.
+5. #1056 neighbours: CRLF Gemfile and `gems.rb` spellings; H→V takeover of a gem inside a `source … do` block. Bundler 1.17 hosted unwind.
+6. #1109 neighbours: global-tier `deployment` / `path` with the stale guard.
 
 ## Known non-bugs
 
@@ -409,3 +420,5 @@ Also on 4.0.17: BOM `Gemfile` passes; symlinked `Gemfile` / lock is refused (pas
 - To get both builds of a native gem into one gem home: `gem install <x> -v V --platform ruby` then `gem install <x> -v V` (needs gcc + libffi-dev for `ffi`, both present). Bundler 2.6+ locks list every platform variant by default (run 30).
 - Bundler's `deployment true` (local or env) and `simulate_version 5` never reuse a system gem-home copy: they fetch into `vendor/bundle` / `.bundle` (verified with real installs, run 31). The hosted stale guard's false warning there is #1109.
 - The worktree is a fresh container each run: there's no rbenv now, only `/usr/local/bin/ruby` 3.3.6 with Bundler 2.5.22 (default) + 4.0.18. Install other Bundlers into an isolated `GEM_HOME` (run 31).
+- Hand-written agent manifests need BOTH blobs (`beforeHash` and `afterHash`) in `.socket/blobs`, or `rollback --offline` fails with "Before blob not found" (run 32 near-miss). Never derive a fixture from an already-patched file.
+- A scratch hosted test in `e2e_redirect_gem_build.rs` needs `GEM_PATH=<shared home>:<system gem dir>` to pick a non-default Bundler via `BUNDLER_VERSION`; otherwise it silently falls back to the default 2.5.22 (run 32).
