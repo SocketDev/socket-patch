@@ -26,8 +26,9 @@ pub(super) async fn stale_install_warnings(
     records: &BTreeMap<String, PatchRecord>,
 ) -> StaleInstallOutcome {
     let mut out = StaleInstallOutcome::default();
-    let pipenv_lock: Option<serde_json::Value> =
-        pipenv_lock.and_then(|text| serde_json::from_str(text.trim_start_matches('\u{feff}')).ok());
+    let pipenv_lock: Option<serde_json::Value> = pipenv_lock.and_then(|text| {
+        serde_json::from_str(socket_patch_core::formats::text::strip_bom(text)).ok()
+    });
     let candidates: Vec<_> = confirmed
         .iter()
         .filter(|(purl, _)| purl.starts_with("pkg:pypi/"))
