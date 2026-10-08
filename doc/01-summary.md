@@ -356,7 +356,7 @@ This is a MAJOR change. Because v5 is still a prerelease, **now is the cheapest 
 1. Will depscan adopt the napi engine? That decides ~5K production lines.
 2. What is agent mode's future?
 3. Do we have telemetry on vlt, `bun.lockb`, pnpm ≤ 8 and Gradle usage, to set tiers?
-4. Is wired-only VEX attestation an acceptable default?
+4. Is wired-only VEX attestation an acceptable default? {{E46}}
 5. Is a hosted-originals sidecar acceptable, or is "no `.socket/` in hosted mode" a hard requirement?
 6. Can v5 GA absorb the command-model change?
 

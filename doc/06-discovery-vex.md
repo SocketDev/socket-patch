@@ -2,7 +2,7 @@
 
 ## Part 6: Discovery, inventory and VEX
 
-_Last checked against main @ 05ecc6e on 2026-10-07 by audit-ecosystems (PyPI pure-wheel selection in `lock_inventory` and ledger recovery checked for E89). Earlier: `431b818` by the October 7 reconciliation (extractor count and the false-attestation backlog re-checked; this part does not yet cover the JVM-cache crawl or `formats::registry`). Earlier: `db83f01` by audit-ecosystems (6.6 JVM crawler build-tool markers and npm alias discovery re-checked at `db83f01`; 6.4 layering inversion and the Bundler lock rule re-checked at `9c43dfc`; 6.5 `vex_consumed.rs` and npm alias discovery as of `4646693`; as of `045d7ec`: gem lock selection, the go.mod row, 6.4 dead code and the product probe table re-checked). Owner: `audit-ecosystems`._
+_Last checked against main @ e61a845 on 2026-10-08 by audit-ecosystems (gem home selection in the crawler, the stale guard and the `vex` installed lookup checked for E90; the lockfile basis checked for E46; 6.4 coordinate guards and the product probe table re-checked). Earlier: `05ecc6e` on 2026-10-07 by audit-ecosystems (PyPI pure-wheel selection in `lock_inventory` and ledger recovery checked for E89). Earlier: `431b818` by the October 7 reconciliation (extractor count and the false-attestation backlog re-checked; this part does not yet cover the JVM-cache crawl or `formats::registry`). Earlier: `db83f01` by audit-ecosystems (6.6 JVM crawler build-tool markers and npm alias discovery re-checked at `db83f01`; 6.4 layering inversion and the Bundler lock rule re-checked at `9c43dfc`; 6.5 `vex_consumed.rs` and npm alias discovery as of `4646693`; as of `045d7ec`: gem lock selection, the go.mod row, 6.4 dead code and the product probe table re-checked). Owner: `audit-ecosystems`._
 
 > Scope: `vex/**` (incl. `vex/discover/*`), `crawlers/**`, `formats/**`, `vendor/lock_inventory/*`, and the CLI consumers `vex.rs`, `vex_sources.rs`, `vex_consumed.rs`, `scan/discovery.rs`, `context.rs`, `list.rs`, `ecosystem_dispatch.rs`.
 
@@ -103,7 +103,7 @@ Across the repo that is **eight hand-rolled XML scanners**, 4–5 independent wa
 - **"Wired" vs "consumed" evidence.**
   - *Wired* means a lockfile pin on an allowlisted host plus an integrity pin. `lockfile_basis_ok` lets an attestation stand with no installed bytes.
   - *Consumed* means hashing the installed copy that the wiring routes to.
-  - **This is where the open "VEX attests not_affected while unpatched" bugs come from** (16 at review, about 46 on 2026-10-07; #940 and PR #1033 address the same-lock, PnP, pnpm-bundled and deno groups). {{E72}} Requiring consumed evidence by default is open decision E46. The wired basis assumes the package manager honors the pin. Every package-manager quirk that breaks that assumption becomes a false attestation:
+  - **This is where the open "VEX attests not_affected while unpatched" bugs come from** (16 at review, about 46 on 2026-10-07; #940 and PR #1033 address the same-lock, PnP, pnpm-bundled and deno groups). {{E72}} Requiring consumed evidence by default is open decision E46 {{E46}}. The wired basis assumes the package manager honors the pin. Every package-manager quirk that breaks that assumption becomes a false attestation:
     - warm caches (#352);
     - a `go.work` override (#393);
     - Bun's isolated linker (#405);
@@ -168,6 +168,7 @@ cli: ProjectContext owns ONE Inventory; one EmbeddedVex helper
 - {{E72}} October 7: VEX attested over yarn Plug'n'Play loaders, pnpm bundled copies and deno.lock npm copies (#519, #406; PR #1033).
 - {{E87}} Product detection has no Gradle or sbt probe, and `scan --vex` resolves the product only after writing.
 - {{E89}} The pure-wheel rule is written four times: lock inventory and ledger recovery use `ends_with("-none-any.whl")` instead of the shared `wheel_platform_from_filename` (so the #1053 fix won't reach them), and recovery re-parses the uv.lock unit with a string scanner that paired a hashless pure wheel with the next wheel's hash (executed twice).
+- {{E90}} Which gem homes Bundler loads has two answers since #1002: the stale guard uses `bundler_install_homes`, while `vex` (and agent `apply`) still use `get_gem_paths`, which keeps the `gem env` homes under an explicit Bundler `path`. An unused, unpatched system-home copy then blocks standalone `vex` from attesting (proven by execution).
 
 - One rule now picks the live Bundler lock: lock inventory and VEX discovery follow Bundler's loaded pair (`gems.rb` → `gems.locked`, a stale `Gemfile.lock` twin ignored), as hosted, vendored and the crawler do through `LoadedManifest::pair` (#750). {{E56}}
 
