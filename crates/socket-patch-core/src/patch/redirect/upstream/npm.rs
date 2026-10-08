@@ -1127,15 +1127,20 @@ fn bun_lookup_registry(
             }
             // A scope entry with no URL (a token only) takes the configured
             // default registry, never the environment's, with its own
-            // credentials.
+            // credentials; with none configured, npmjs with that token (a
+            // private scope on npmjs).
             if entry.is_table_like() && entry.get("url").is_none() {
-                return configured().map(|r| match toml_auth(entry) {
-                    Some(own) => ProjectRegistry {
-                        authorization: Some(own),
+                let own = toml_auth(entry);
+                return match configured() {
+                    Some(r) => Some(ProjectRegistry {
+                        authorization: own.or(r.authorization),
                         ..r
-                    },
-                    None => r,
-                });
+                    }),
+                    None => own.map(|own| ProjectRegistry {
+                        base: crate::vendor::registry_fetch::DEFAULT_NPM_REGISTRY.to_string(),
+                        authorization: Some(own),
+                    }),
+                };
             }
         }
     }
@@ -1681,6 +1686,20 @@ mod tests {
         assert_eq!(
             lookup(None, None, Some("https://e%40m:p%3Aw@e.example/"), "a"),
             Some(("https://e.example/".to_string(), basic("e@m:p:w")))
+        );
+        // A token-only scope with no default registry configured: npmjs,
+        // with the scope's token (Bun sends it to npmjs).
+        assert_eq!(
+            lookup(
+                None,
+                Some("[install.scopes]\npriv = { token = \"$TOKEN\" }\n"),
+                None,
+                "@priv/w"
+            ),
+            Some((
+                "https://registry.npmjs.org".to_string(),
+                Some("Bearer s3cret".to_string())
+            ))
         );
         // No userinfo: unchanged.
         assert_eq!(
