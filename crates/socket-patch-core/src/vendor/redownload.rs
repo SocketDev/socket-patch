@@ -106,15 +106,8 @@ pub async fn restore(
         }
         Err(reason) => return Err(reason),
     };
-    let mut cursor = root.to_path_buf();
-    for part in entry.artifact.path.split('/') {
-        cursor.push(part);
-        if tokio::fs::symlink_metadata(&cursor)
-            .await
-            .is_ok_and(|m| m.file_type().is_symlink())
-        {
-            return Err("vendor_path_unsafe: artifact path contains a symlink".into());
-        }
+    if crate::utils::containment::linked_level(root, &root.join(&entry.artifact.path)).is_some() {
+        return Err("vendor_path_unsafe: artifact path contains a symlink".into());
     }
     let file_shaped = !super::verify::is_vlt_dir_entry(entry)
         && super::verify::artifact_is_file_shaped(&entry.artifact.path);
@@ -331,15 +324,8 @@ pub async fn restore(
             }
             // Same guard as the artifact's own path: never swap a tree
             // reached through a link (the swap deletes what it replaces).
-            let mut cursor = root.to_path_buf();
-            for part in rel.split('/') {
-                cursor.push(part);
-                if tokio::fs::symlink_metadata(&cursor)
-                    .await
-                    .is_ok_and(|m| m.file_type().is_symlink())
-                {
-                    return Err("vendor_path_unsafe: artifact path contains a symlink".into());
-                }
+            if crate::utils::containment::linked_level(root, &root.join(rel)).is_some() {
+                return Err("vendor_path_unsafe: artifact path contains a symlink".into());
             }
             tokio::fs::create_dir_all(target.parent().ok_or("tree has no parent")?)
                 .await

@@ -97,7 +97,6 @@ fn synth_lock(rng: &mut Rng, blocks: usize, v1: bool) -> String {
     out
 }
 
-
 const INDEX: &str = "sparse+https://socket.example/cargo/index/";
 
 fn plan_new(lock: &str, name: &str, version: &str, cksum: &str) -> CargoLockPlan {
@@ -182,7 +181,8 @@ fn span_splice_matches_golden_on_hand_written_locks() {
         "[root]\nname = \"app\"\nversion = \"0.1.0\"\ndependencies = [\n \"d 1.0.0 ({crates_io})\",\n]\n\n[[package]]\nname = \"d\"\nversion = \"1.0.0\"\nsource = \"{crates_io}\"\n\n[[package]]\nname = \"u\"\nversion = \"2.0.0\"\nsource = \"{crates_io}\"\ndependencies = [\n \"d 1.0.0 ({crates_io})\",\n]\n\n[metadata]\n\"checksum d 1.0.0 ({crates_io})\" = \"cc\"\n\"checksum u 2.0.0 ({crates_io})\" = \"dd\"\n"
     );
     let sourceless_v1 = "[[package]]\nname = \"s\"\nversion = \"1.0.0\"\n\n[metadata]\n\"checksum s 1.0.0 (registry+x)\" = \"ee\"\n".to_string();
-    let source_at_eof = format!("[[package]]\nname = \"e\"\nversion = \"1.0.0\"\nsource = \"{crates_io}\"");
+    let source_at_eof =
+        format!("[[package]]\nname = \"e\"\nversion = \"1.0.0\"\nsource = \"{crates_io}\"");
     let bare = "version = 3\n\n[[package]]\nname = \"b\"\nversion = \"1.0.0\"\n\n[[package]]\nname = \"c\"\nversion = \"1.0.0\"\n".to_string();
     let mut g = Golden::new(
         "cargo_lock_hand_written",

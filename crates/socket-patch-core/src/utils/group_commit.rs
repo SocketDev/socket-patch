@@ -312,9 +312,9 @@ where
     // write the lock edits beside the pre-run ledger. Put the caller's value
     // back before the unwind continues — the same value a caught-and-
     // continued caller holds.
-    if let Err(panic) = std::panic::catch_unwind(std::panic::AssertUnwindSafe(|| {
-        edit(Arc::make_mut(value))
-    })) {
+    if let Err(panic) =
+        std::panic::catch_unwind(std::panic::AssertUnwindSafe(|| edit(Arc::make_mut(value))))
+    {
         files.insert(key, captured(value));
         drop(files);
         std::panic::resume_unwind(panic);
@@ -663,7 +663,7 @@ impl GroupCommit {
         // the file other checkouts read, unpatched. Refuse the whole commit
         // before anything is written, as the hosted guard does.
         for change in &changes {
-            if is_symlink(&root.join(&change.rel)) {
+            if crate::utils::containment::is_link(&root.join(&change.rel)) {
                 return Err(std::io::Error::new(
                     std::io::ErrorKind::InvalidInput,
                     SymlinkedTarget(rel_string(&change.rel)),
@@ -1063,30 +1063,9 @@ fn carries_commit(item: &Replay) -> Option<bool> {
 /// run, which captures nothing, to predict that refusal.
 pub fn symlinked_paths<'a>(root: &Path, rels: impl IntoIterator<Item = &'a str>) -> Vec<String> {
     rels.into_iter()
-        .filter(|rel| is_symlink(&root.join(rel)))
+        .filter(|rel| crate::utils::containment::is_link(&root.join(rel)))
         .map(str::to_string)
         .collect()
-}
-
-fn is_symlink(path: &Path) -> bool {
-    std::fs::symlink_metadata(path).is_ok_and(|m| m.file_type().is_symlink())
-}
-
-/// Whether any existing level of `rel` below `root` — the file itself
-/// included — is a symbolic link: a journal must never write through one
-/// (out of the project, or onto a file it does not name).
-fn crosses_symlink(root: &Path, rel: &Path) -> std::io::Result<bool> {
-    let mut at = root.to_path_buf();
-    for component in rel.components() {
-        at.push(component);
-        match std::fs::symlink_metadata(&at) {
-            Ok(meta) if meta.file_type().is_symlink() => return Ok(true),
-            Ok(_) => {}
-            Err(e) if e.kind() == std::io::ErrorKind::NotFound => return Ok(false),
-            Err(e) => return Err(e),
-        }
-    }
-    Ok(false)
 }
 
 fn write_sync(path: &Path, bytes: Option<&[u8]>, preserve_mode: bool) -> std::io::Result<()> {
@@ -1151,7 +1130,12 @@ pub fn recover(project_root: &Path) -> std::io::Result<Recovery> {
         let rel = Path::new(&file.path);
         if relative_to(Path::new(""), rel).is_none()
             || !is_captured(rel)
-            || crosses_symlink(project_root, rel)?
+            // A journal must never write through a link (out of the
+            // project, or onto a file it does not name). A level that
+            // cannot be probed (EACCES, ENOTDIR) fails recovery closed:
+            // the journal stays and the locked command does not proceed.
+            || crate::utils::containment::try_linked_level(project_root, &project_root.join(rel))?
+                .is_some()
         {
             return set_aside(SetAsideOutcome::Refused);
         }
@@ -1750,6 +1734,34 @@ mod tests {
         }
     }
 
+    /// A journaled path whose level cannot be probed (here ENOTDIR: a
+    /// regular file sits where a directory should) fails recovery closed:
+    /// `recover` errors, the journal stays in place, and nothing is
+    /// written, rather than the probe error being read as "not a link".
+    #[cfg(unix)]
+    #[test]
+    fn recovery_fails_closed_when_a_level_cannot_be_probed() {
+        let tmp = tempfile::tempdir().unwrap();
+        let root = tmp.path();
+        std::fs::write(root.join("blocker"), b"file").unwrap();
+        let changes = vec![
+            change("b.lock", b"b", b"b2"),
+            Change {
+                rel: "blocker/x.lock".into(),
+                before: None,
+                after: Some(b"new".to_vec()),
+                preserve_mode: false,
+            },
+        ];
+        write_journal(root, &changes);
+        assert!(recover(root).is_err());
+        assert!(
+            root.join(COMMIT_JOURNAL_REL).is_file(),
+            "the journal is kept"
+        );
+        assert!(!root.join("b.lock").exists(), "nothing applied");
+    }
+
     /// #627: a commit never renames over a symbolic link (a shared lock, a
     /// linked `package.json` / `nuget.config`): it refuses before writing
     /// anything, naming the link, so the link and its target stay as they
@@ -1916,7 +1928,10 @@ mod tests {
             .unwrap();
         remove_dir_after_commit(&dir).await;
         drop(dropped);
-        assert!(dir.join("config.toml").exists(), "an abandoned commit removes nothing");
+        assert!(
+            dir.join("config.toml").exists(),
+            "an abandoned commit removes nothing"
+        );
 
         let group = GroupCommit::begin(root);
         super::super::fs::remove_file(&dir.join("config.toml"))
@@ -1925,7 +1940,10 @@ mod tests {
         remove_dir_after_commit(&dir).await;
         assert!(dir.join("config.toml").exists(), "captured, still on disk");
         group.commit().await.unwrap();
-        assert!(!dir.exists(), "the emptied directory is removed after the commit");
+        assert!(
+            !dir.exists(),
+            "the emptied directory is removed after the commit"
+        );
 
         std::fs::create_dir_all(&dir).unwrap();
         std::fs::write(dir.join("config.toml"), b"[patch]\n").unwrap();
@@ -1937,7 +1955,10 @@ mod tests {
         remove_dir_after_commit(&dir).await;
         group.commit().await.unwrap();
         assert!(!dir.join("config.toml").exists());
-        assert!(dir.join("credentials.toml").exists(), "a non-empty directory is kept");
+        assert!(
+            dir.join("credentials.toml").exists(),
+            "a non-empty directory is kept"
+        );
 
         remove_dir_after_commit(&root.join("gone")).await;
         std::fs::remove_file(dir.join("credentials.toml")).unwrap();
