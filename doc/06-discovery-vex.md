@@ -2,7 +2,7 @@
 
 ## Part 6: Discovery, inventory and VEX
 
-_Last checked against main @ e61a845 on 2026-10-08 by audit-ecosystems (gem home selection in the crawler, the stale guard and the `vex` installed lookup checked for E90; the lockfile basis checked for E46; 6.4 coordinate guards and the product probe table re-checked). Earlier: `05ecc6e` on 2026-10-07 by audit-ecosystems (PyPI pure-wheel selection in `lock_inventory` and ledger recovery checked for E89). Earlier: `431b818` by the October 7 reconciliation (extractor count and the false-attestation backlog re-checked; this part does not yet cover the JVM-cache crawl or `formats::registry`). Earlier: `db83f01` by audit-ecosystems (6.6 JVM crawler build-tool markers and npm alias discovery re-checked at `db83f01`; 6.4 layering inversion and the Bundler lock rule re-checked at `9c43dfc`; 6.5 `vex_consumed.rs` and npm alias discovery as of `4646693`; as of `045d7ec`: gem lock selection, the go.mod row, 6.4 dead code and the product probe table re-checked). Owner: `audit-ecosystems`._
+_Last checked against main @ ea09714 on 2026-10-08 by audit-ecosystems (6.2 discovery systems, the fabricated scan paths and the `vex::discover` importers re-checked for E36; PyPI lock precedence in the inventory checked for E91; 6.5 VEX attestation after #1033). Earlier: `e61a845` on 2026-10-08 by audit-ecosystems (gem home selection in the crawler, the stale guard and the `vex` installed lookup checked for E90; the lockfile basis checked for E46; 6.4 coordinate guards and the product probe table re-checked). Earlier: `05ecc6e` on 2026-10-07 by audit-ecosystems (PyPI pure-wheel selection in `lock_inventory` and ledger recovery checked for E89). Earlier: `431b818` by the October 7 reconciliation (extractor count and the false-attestation backlog re-checked; this part does not yet cover the JVM-cache crawl or `formats::registry`). Earlier: `db83f01` by audit-ecosystems (6.6 JVM crawler build-tool markers and npm alias discovery re-checked at `db83f01`; 6.4 layering inversion and the Bundler lock rule re-checked at `9c43dfc`; 6.5 `vex_consumed.rs` and npm alias discovery as of `4646693`; as of `045d7ec`: gem lock selection, the go.mod row, 6.4 dead code and the product probe table re-checked). Owner: `audit-ecosystems`._
 
 > Scope: `vex/**` (incl. `vex/discover/*`), `crawlers/**`, `formats/**`, `vendor/lock_inventory/*`, and the CLI consumers `vex.rs`, `vex_sources.rs`, `vex_consumed.rs`, `scan/discovery.rs`, `context.rs`, `list.rs`, `ecosystem_dispatch.rs`.
 
@@ -22,20 +22,20 @@ The VEX stack is about **13K production lines tested by about 59K test lines**: 
 
 | System | Entry point | Reads | Returns |
 |---|---|---|---|
-| **A. Crawlers** | `crawl_every_ecosystem` (`ecosystem_dispatch.rs:719-815`); nine crawlers in a `tokio::join!` | installed trees (`node_modules`, `site-packages`, `vendor/composer/installed.json`) **and whole machine caches**: `$CARGO_HOME/registry/src`, `GOMODCACHE`, `~/.m2`, `~/.nuget/packages`, `DENO_DIR` | `CrawledPackage {name, version, namespace, purl, path}` |
-| **B. Lock inventory** | `inventory_project_diagnosed_in` / `union_views_in` (`lock_inventory/mod.rs:320-370`) | one lockfile per ecosystem, chosen by precedence (shrinkwrap wins; uv is exclusive; poetry → pdm → Pipfile). **No Maven, NuGet or Deno.** | `LockfileEntry {ecosystem: &'static str, name, version, purl, resolved, integrity, source_kind}` |
-| **C. Wiring discovery** | `discover_with_ctx` (`vex/discover/mod.rs:725-745`); 15 extractors in fixed order (13 at review), then `contest_across_locks` | **every** lock/config present ("rule 1: never apply precedence"), each swept for Socket identities | `Discovery {refs: Vec<PatchedRef>, diagnostics, recognized, unlocked_pins, elsewhere}` |
+| **A. Crawlers** | `crawl_every_ecosystem` (`ecosystem_dispatch.rs:860`); nine crawlers in a `tokio::join!` | installed trees (`node_modules`, `site-packages`, `vendor/composer/installed.json`) **and whole machine caches**: `$CARGO_HOME/registry/src`, `GOMODCACHE`, `~/.m2`, `~/.nuget/packages`, `DENO_DIR` | `CrawledPackage {name, version, namespace, purl, path}` |
+| **B. Lock inventory** | `inventory_project_diagnosed_in` / `union_views_in` (`lock_inventory/mod.rs:273-330`) | one lockfile per ecosystem, chosen by precedence (shrinkwrap wins; uv is exclusive; poetry → pdm → Pipfile). **No Maven, NuGet or Deno.** | `LockfileEntry {ecosystem: &'static str, name, version, purl, resolved, integrity, source_kind}` |
+| **C. Wiring discovery** | `discover_with_ctx` (`vex/discover/mod.rs:1000-1022`); 15 extractors in fixed order (13 at review), then `contest_across_locks` | **every** lock/config present ("rule 1: never apply precedence"), each swept for Socket identities | `Discovery {refs: Vec<PatchedRef>, diagnostics, recognized, unlocked_pins, elsewhere}` |
 | **D. Vendor-ledger supplement** | `vendored_ledger_supplement` (`scan/discovery.rs:141`) | `.socket/vendor/state.json` + artifacts | fabricated `CrawledPackage`s |
 
 How `scan` combines them (`scan/mod.rs:1589-1660`):
 1. **Crawl first, in every mode.**
-2. Append lockfile-only entries as fabricated `CrawledPackage`s. `crawled_from_purl` (`discovery.rs:113-133`) sets `path: cwd.join("node_modules").join(name_part)` **for every ecosystem**, including cargo and pypi.
+2. Append lockfile-only entries as fabricated `CrawledPackage`s. `crawled_from_purl` (`discovery.rs:113-133`) sets `path: cwd.join("node_modules").join(name_part)` **for every ecosystem**, including cargo and pypi. The caller keeps a side set, `supplement_purls` (`scan/mod.rs:1807-1835`), so that the PATH-scope filter can skip the fake paths. {{E36}}
 3. Append ledger-only entries.
 4. Fold hosted pins from C into update detection.
 
 **Overlaps:**
 - B and C walk the same per-format entries. B keeps registry entries; C classifies the Socket-owned ones *and* emits `ResolvedElsewhere`, which is a second registry view.
-- Liveness then calls B a **third** time, straight from disk (`inventory_project_every_lock(root)`, `mod.rs:1602`), bypassing the shared `DiskSnapshot`.
+- Liveness then calls B a **third** time, straight from disk (`inventory_project_every_lock(root)`, `vex/discover/mod.rs:1898`), bypassing the shared `DiskSnapshot`.
 - B has two parallel modes, `Instances::Every` and `Instances::Collapsed`, with an if/else for every format.
 - A is unrelated to B and C.
 
@@ -103,7 +103,7 @@ Across the repo that is **eight hand-rolled XML scanners**, 4–5 independent wa
 - **"Wired" vs "consumed" evidence.**
   - *Wired* means a lockfile pin on an allowlisted host plus an integrity pin. `lockfile_basis_ok` lets an attestation stand with no installed bytes.
   - *Consumed* means hashing the installed copy that the wiring routes to.
-  - **This is where the open "VEX attests not_affected while unpatched" bugs come from** (16 at review, about 46 on 2026-10-07; #940 and PR #1033 address the same-lock, PnP, pnpm-bundled and deno groups). {{E72}} Requiring consumed evidence by default is open decision E46 {{E46}}. The wired basis assumes the package manager honors the pin. Every package-manager quirk that breaks that assumption becomes a false attestation:
+  - **This is where the open "VEX attests not_affected while unpatched" bugs come from** (16 at review, about 46 on 2026-10-07; #1033 fixed the yarn PnP, pnpm-bundled and standalone deno groups, and #940 targets the same-lock group). {{E72}} Requiring consumed evidence by default is open decision E46 {{E46}}. The wired basis assumes the package manager honors the pin. Every package-manager quirk that breaks that assumption becomes a false attestation:
     - warm caches (#352);
     - a `go.work` override (#393);
     - Bun's isolated linker (#405);
@@ -117,7 +117,7 @@ Across the repo that is **eight hand-rolled XML scanners**, 4–5 independent wa
   - The rendering glue is duplicated per command: dry-run skip, JSON folding, "nothing to attest", exit codes. It appears in `scan/mod.rs:360-470` and `apply.rs:790-860`, and in three variants inside `vendor.rs`.
 - **Low-value paths:**
   - The pre-v5 redirect-ledger path. No command writes it (`state.rs:148`: "socket-patch v5 never writes this file"), yet it still drives `redirect_record_live`/`LedgerLiveness`, `hosted_wiring_in_files` and `HostedFileRole` (~430 lines), plus the CLI-side handling.
-  - **Naming:** `vex::discover` is really the v5 *hosted-state store*. Scan, get, apply, vendor, rollback, list and core hosted rollback all use it. It is not VEX-specific.
+  - **Naming:** `vex::discover` is really the v5 *hosted-state store*. On `ea09714`, 42 files outside `vex/` import it, including six `formats/` modules (a `formats` → `vex` edge). It is not VEX-specific. {{E36}}
 
 ### 6.6 Crawlers
 
@@ -165,9 +165,10 @@ cli: ProjectContext owns ONE Inventory; one EmbeddedVex helper
 
 - npm alias discovery is written twice: core `NpmCrawler::alias_copies` (apply, rollback, the VEX installed lookup) and the CLI's `vex_consumed` walk (hosted VEX). They have drifted on case: on Linux, an alias dir whose name differs from the package only by case is a copy for VEX but invisible to apply (proven by execution). This is behind #851 and #852. {{E40}}
 
-- {{E72}} October 7: VEX attested over yarn Plug'n'Play loaders, pnpm bundled copies and deno.lock npm copies (#519, #406; PR #1033).
+- {{E72}} October 7: VEX attested over yarn Plug'n'Play loaders, pnpm bundled copies and deno.lock npm copies. Standalone `vex` no longer does (#1033, fixing #519). The in-run `scan --mode hosted --vex` path still attests a deno project's `package-lock.json` pin (#406), and npm and vlt still emit their own bundled-copy diagnostics.
 - {{E87}} Product detection has no Gradle or sbt probe, and `scan --vex` resolves the product only after writing.
 - {{E89}} The pure-wheel rule is written four times: lock inventory and ledger recovery use `ends_with("-none-any.whl")` instead of the shared `wheel_platform_from_filename` (so the #1053 fix won't reach them), and recovery re-parses the uv.lock unit with a string scanner that paired a hashless pure wheel with the next wheel's hash (executed twice).
+- {{E91}} PyPI tool-lock precedence is written twice since #1044: the lock inventory keys on "the lock yielded entries", the vendored router on presence. With a package-less `poetry.lock` or `pdm.lock` beside a pinned `requirements.txt`, scan offers a package that vendored then refuses with `pypi_poetry_lock_package_missing` (executed twice).
 - {{E90}} Which gem homes Bundler loads has two answers since #1002: the stale guard uses `bundler_install_homes`, while `vex` (and agent `apply`) still use `get_gem_paths`, which keeps the `gem env` homes under an explicit Bundler `path`. An unused, unpatched system-home copy then blocks standalone `vex` from attesting (proven by execution).
 
 - One rule now picks the live Bundler lock: lock inventory and VEX discovery follow Bundler's loaded pair (`gems.rb` → `gems.locked`, a stale `Gemfile.lock` twin ignored), as hosted, vendored and the crawler do through `LoadedManifest::pair` (#750). {{E56}}
