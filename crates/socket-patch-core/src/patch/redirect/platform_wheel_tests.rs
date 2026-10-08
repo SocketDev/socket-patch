@@ -1,13 +1,21 @@
 //! #701 / #932: a pypi patch granted as a platform- or ABI-tagged wheel is
 //! never pinned into a cross-platform Python lock. Each lane first proves
 //! its fixture redirects a pure wheel (the control), then that the same
-//! project with a `cp311-cp311-manylinux` wheel is left untouched, warned
-//! about once, and confirms nothing.
+//! project with a `cp311-cp311-manylinux` wheel, or an interpreter-bound
+//! `cp311-none-any` one (#1048), is left untouched, warned about once, and
+//! confirms nothing.
 
 use super::*;
 
 const PURE: &str = "urllib3-1.26.18-py2.py3-none-any.whl";
 const PLATFORM: &str = "urllib3-1.26.18-cp311-cp311-manylinux_2_17_x86_64.manylinux2014_x86_64.whl";
+/// #1048: pip installs a `cp311-none-any` wheel on CPython 3.11 only.
+const INTERPRETER: &str = "urllib3-1.26.18-cp311-none-any.whl";
+/// Every wheel each lane must withhold, with the tag the warning names.
+const REFUSED: [(&str, &str); 2] = [
+    (PLATFORM, "cp311-cp311-manylinux"),
+    (INTERPRETER, "cp311-none-any"),
+];
 const UUID: &str = "aaaaaaaa-0000-4000-8000-000000000701";
 const HEX: &str = "34b97092d7e0a3a8cf7cd10e386f401b3737364026c45e622aa02903dffe0f07";
 
@@ -69,24 +77,26 @@ fn assert_lane(lane: &str, files: &[(&str, &str)], lock: &str) {
     assert!(confirmed(&control), "{lane}: control not confirmed");
     assert_eq!(platform_warnings(&control), 0, "{lane}");
 
-    let result = rewrite_registry_redirect(&files, &[dep(PLATFORM)]);
-    assert!(
-        result.files.is_empty() && result.edits.is_empty(),
-        "{lane}: platform wheel was pinned: {:?}",
-        result.files.keys().collect::<Vec<_>>()
-    );
-    assert!(!confirmed(&result), "{lane}: platform wheel confirmed");
-    assert_eq!(
-        platform_warnings(&result),
-        1,
-        "{lane}: {:?}",
-        result.warnings
-    );
-    let detail = &result.warnings[0].detail;
-    assert!(
-        detail.contains("urllib3==1.26.18") && detail.contains("cp311-cp311-manylinux"),
-        "{lane}: {detail}"
-    );
+    for (wheel, tag) in REFUSED {
+        let result = rewrite_registry_redirect(&files, &[dep(wheel)]);
+        assert!(
+            result.files.is_empty() && result.edits.is_empty(),
+            "{lane}: {wheel} was pinned: {:?}",
+            result.files.keys().collect::<Vec<_>>()
+        );
+        assert!(!confirmed(&result), "{lane}: {wheel} confirmed");
+        assert_eq!(
+            platform_warnings(&result),
+            1,
+            "{lane}: {wheel}: {:?}",
+            result.warnings
+        );
+        let detail = &result.warnings[0].detail;
+        assert!(
+            detail.contains("urllib3==1.26.18") && detail.contains(tag),
+            "{lane}: {detail}"
+        );
+    }
 }
 
 /// #701: a uv project's `uv.lock` (and its `[tool.uv.sources]`).
@@ -156,20 +166,22 @@ fn pipfile_lock_refuses_a_platform_wheel() {
             control.warnings
         );
         assert!(confirmed(&control));
-        let result = rewrite_registry_redirect_with_pipenv_version(
-            &files,
-            &[dep(PLATFORM)],
-            &BTreeMap::new(),
-            major,
-            false,
-        );
-        assert!(
-            result.files.is_empty(),
-            "pipenv {major:?}: {:?}",
-            result.files
-        );
-        assert!(!confirmed(&result));
-        assert_eq!(platform_warnings(&result), 1, "{:?}", result.warnings);
+        for (wheel, _) in REFUSED {
+            let result = rewrite_registry_redirect_with_pipenv_version(
+                &files,
+                &[dep(wheel)],
+                &BTreeMap::new(),
+                major,
+                false,
+            );
+            assert!(
+                result.files.is_empty(),
+                "pipenv {major:?}: {wheel}: {:?}",
+                result.files
+            );
+            assert!(!confirmed(&result));
+            assert_eq!(platform_warnings(&result), 1, "{:?}", result.warnings);
+        }
     }
     assert_lane(
         "Pipfile.lock",
@@ -234,9 +246,11 @@ fn hatch_refuses_a_platform_wheel() {
     assert_lane("hatch", &[("pyproject.toml", pyproject)], "pyproject.toml");
 }
 
-/// The tag rule matches vendored mode's: a version-bound `cp311-none-any`
-/// wheel and an sdist stay redirectable, an `abi3` or platform-only tag
-/// does not, and a query or fragment on the serve URL is ignored.
+/// The tag rule matches vendored mode's: a wheel any Python 3 accepts
+/// (`py3`, `py2.py3`, `py311`, which later 3.x accept too) and an sdist
+/// stay redirectable; an interpreter-bound python tag (`cp311`, `pp310`,
+/// #1048), a Python-2-only one, an `abi3` or a platform-only tag does
+/// not; and a query or fragment on the serve URL is ignored.
 #[test]
 fn only_platform_or_abi_tagged_wheels_are_withheld() {
     let files: BTreeMap<String, String> = [(
@@ -247,7 +261,13 @@ fn only_platform_or_abi_tagged_wheels_are_withheld() {
     .collect();
     for (artifact, refused) in [
         (PURE.to_string(), false),
-        ("urllib3-1.26.18-cp311-none-any.whl".to_string(), false),
+        ("urllib3-1.26.18-py3-none-any.whl".to_string(), false),
+        ("urllib3-1.26.18-py311-none-any.whl".to_string(), false),
+        ("urllib3-1.26.18-cp311.py3-none-any.whl".to_string(), false),
+        (INTERPRETER.to_string(), true),
+        ("urllib3-1.26.18-pp310-none-any.whl".to_string(), true),
+        ("urllib3-1.26.18-py2-none-any.whl".to_string(), true),
+        ("urllib3-1.26.18-cp311.cp312-none-any.whl".to_string(), true),
         ("urllib3-1.26.18.tar.gz".to_string(), false),
         (format!("{PURE}?token=x#sha256={HEX}"), false),
         (PLATFORM.to_string(), true),

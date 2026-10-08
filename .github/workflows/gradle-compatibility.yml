@@ -40,6 +40,7 @@ name: Gradle patch compatibility
 
 on:
   pull_request:
+    types: [opened, synchronize, reopened, ready_for_review]
     paths:
       - '.github/workflows/gradle-compatibility.yml'
       - 'scripts/ci-e2e-bundle.py'
@@ -99,10 +100,14 @@ env:
 jobs:
   build:
     name: build ${{ matrix.os }}
+    if: github.event.pull_request.draft != true
     strategy:
       fail-fast: false
       matrix:
         os: [ubuntu-latest, macos-latest, windows-latest]
+        exclude:
+          # macOS legs run on push to main (and nightly where scheduled), not per PR push.
+          - os: ${{ github.event_name == 'pull_request' && 'macos-latest' || '' }}
     runs-on: ${{ matrix.os }}
     timeout-minutes: 60
     env:
@@ -175,6 +180,9 @@ jobs:
           - {gradle: '7.6.6', java: '17', label: '', gradle_args: '', real_central: '', suites: '', test_filter: ''}
           - {gradle: '8.14.3', java: '21', label: '', gradle_args: '', real_central: '', suites: '', test_filter: ''}
           - {gradle: '9.8.0', java: '21', label: '', gradle_args: '', real_central: '', suites: '', test_filter: ''}
+        exclude:
+          # macOS legs run on push to main (and nightly where scheduled), not per PR push.
+          - os: ${{ github.event_name == 'pull_request' && 'macos-latest' || '' }}
     runs-on: ${{ matrix.os }}
     timeout-minutes: 60
     steps: &cell-steps

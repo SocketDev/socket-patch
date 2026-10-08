@@ -940,7 +940,10 @@ async fn apply_online_ignores_legacy_package_archive_when_downloads_fail() {
         "a legacy package archive must not cover the patch; stdout={stdout}\nstderr={stderr}"
     );
     let content = std::fs::read(tmp.path().join("node_modules/pkgcache/index.js")).unwrap();
-    assert_eq!(content, before, "the file must not be patched from the legacy archive");
+    assert_eq!(
+        content, before,
+        "the file must not be patched from the legacy archive"
+    );
 
     let requests = mock.received_requests().await.unwrap_or_default();
     let blob_path = format!("/v0/orgs/{ORG_SLUG}/patches/blob/{after_hash}");
@@ -1043,10 +1046,7 @@ async fn mismatch_blob_topup_probes_every_copy_of_a_duplicated_package() {
         v["summary"]["applied"], 1,
         "the drifted nested copy must be warn-overwritten.\nstdout={v:#}"
     );
-    assert_eq!(
-        v["summary"]["failed"], 0,
-        "no copy may fail.\nstdout={v:#}"
-    );
+    assert_eq!(v["summary"]["failed"], 0, "no copy may fail.\nstdout={v:#}");
 
     // The nested copy's blob was fetched on demand…
     let requests = mock.received_requests().await.unwrap();
