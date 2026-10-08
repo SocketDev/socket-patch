@@ -308,9 +308,12 @@ pub async fn vendor_maven(
         if let VendorOutcome::Done { warnings, .. } = &mut outcome {
             warnings.push(VendorWarning::new(
                 super::jvm::gradle::DEGRADED,
-                "reason: legacy_maven_root: pom.xml is vendored through its <repository>, which \
-                 the Gradle build beside it never reads, so that build stays unpatched; run \
-                 `socket-patch vendor --revert` and vendor again to wire both builds",
+                format!(
+                    "reason: legacy_maven_root: pom.xml is vendored through its <repository>, \
+                     which the Gradle build beside it never reads, so that build stays \
+                     unpatched; {} to wire both builds",
+                    super::common::REVERT_ALL_AND_REVENDOR
+                ),
             ));
         }
     }

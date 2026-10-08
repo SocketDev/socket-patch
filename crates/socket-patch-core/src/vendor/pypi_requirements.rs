@@ -195,9 +195,9 @@ pub(super) async fn preflight_requirements(
                     "pypi_requirements_already_vendored",
                     format!(
                         "{}: already routes {canon_name} to the socket-patch vendored wheel for \
-                         patch {found}{why}; run `socket-patch vendor --revert` before \
-                         re-vendoring",
-                        file.rel
+                         patch {found}{why}; {remedy}",
+                        file.rel,
+                        remedy = super::common::REVERT_ALL_AND_REVENDOR,
                     ),
                 )
             };
@@ -309,9 +309,9 @@ pub(super) async fn rewire_requirements(
         (
             "pypi_requirements_already_vendored",
             format!(
-                "cannot re-wire {canon_name} from patch {}: {why}; run `socket-patch vendor \
-                     --revert` before re-vendoring",
-                prev.uuid
+                "cannot re-wire {canon_name} from patch {}: {why}; {remedy}",
+                prev.uuid,
+                remedy = super::common::REVERT_ALL_AND_REVENDOR,
             ),
         )
     })?;
@@ -327,7 +327,7 @@ async fn write_plan(
     // Before ANY write: a symlinked requirements file (root or `-r` include)
     // would be replaced by the rename-over.
     let planned: Vec<&str> = plan.iter().map(|f| f.rel.as_str()).collect();
-    refuse_symlinked(root, &planned, "pypi_requirements_symlink_unsupported").await?;
+    refuse_symlinked(root, &planned).await?;
     let mut wiring = Vec::new();
     let mut written: Vec<&PlannedFile> = Vec::new();
     for file in plan {
@@ -406,9 +406,7 @@ pub(super) async fn revert_requirements(
     // its target stale and never restoring the link. Keep the artifact (the
     // wiring still routes through the linked file) and fail.
     let file_refs: Vec<&str> = files.iter().map(String::as_str).collect();
-    if let Err((code, detail)) =
-        refuse_symlinked(root, &file_refs, "pypi_requirements_symlink_unsupported").await
-    {
+    if let Err((code, detail)) = refuse_symlinked(root, &file_refs).await {
         return RevertOutcome {
             kept_artifact: true,
             success: false,
@@ -2761,7 +2759,7 @@ mod tests {
         let err = wire_requirements(&root, "six", "1.16.0", REL_WHEEL, SHA)
             .await
             .unwrap_err();
-        assert_eq!(err.0, "pypi_requirements_symlink_unsupported");
+        assert_eq!(err.0, crate::hosted::engine::SYMLINK_REFUSAL);
         assert!(std::fs::symlink_metadata(root.join("requirements.txt"))
             .unwrap()
             .file_type()
@@ -2787,7 +2785,7 @@ mod tests {
             outcome
                 .error
                 .as_deref()
-                .is_some_and(|e| e.contains("pypi_requirements_symlink_unsupported")),
+                .is_some_and(|e| e.contains(crate::hosted::engine::SYMLINK_REFUSAL)),
             "{:?}",
             outcome.error
         );

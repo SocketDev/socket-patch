@@ -755,6 +755,24 @@ async fn npm_hosted_round_trip_envelope() {
 #[tokio::test]
 #[serial]
 async fn pypi_requirements_hosted_round_trip() {
+    pypi_requirements_round_trip("flask==2.0.1\nrequests==2.31.0\n", &[]).await;
+}
+
+/// REGRESSION (#1086): the same round trip when an in-root `-r` include
+/// pins the same `requests==2.31.0` (split base/dev files), with the `-r`
+/// line before and after the root pin. pip reads the root and its includes
+/// as one requirement set, where the hosted direct reference wins, so the
+/// include's compatible pin is not a competing lock: `vex` attests the
+/// patch and `rollback` restores the root line (it used to exit 2 and 1).
+#[tokio::test]
+#[serial]
+async fn pypi_requirements_hosted_round_trip_with_a_duplicate_include_pin() {
+    let dev = [("dev.txt", "requests==2.31.0\n")];
+    pypi_requirements_round_trip("-r dev.txt\nflask==2.0.1\nrequests==2.31.0\n", &dev).await;
+    pypi_requirements_round_trip("flask==2.0.1\nrequests==2.31.0\n-r dev.txt\n", &dev).await;
+}
+
+async fn pypi_requirements_round_trip(pristine: &'static str, includes: &[(&str, &str)]) {
     const PY_UUID: &str = "a1a1a1a1-a1a1-4a1a-8a1a-a1a1a1a1a1a1";
     const PY_PURL: &str = "pkg:pypi/requests@2.31.0";
     const SHA256: &str = "0123456789abcdef0123456789abcdef0123456789abcdef0123456789abcdef";
@@ -809,8 +827,10 @@ async fn pypi_requirements_hosted_round_trip() {
         .await;
 
     let tmp = tempfile::tempdir().unwrap();
-    let pristine = "flask==2.0.1\nrequests==2.31.0\n";
     std::fs::write(tmp.path().join("requirements.txt"), pristine).unwrap();
+    for (file, text) in includes {
+        std::fs::write(tmp.path().join(file), text).unwrap();
+    }
 
     let get_args = socket_patch_cli::commands::get::GetArgs {
         common: socket_patch_cli::args::GlobalArgs {
@@ -887,6 +907,10 @@ async fn pypi_requirements_hosted_round_trip() {
         !tmp.path().join(".socket").exists(),
         "a fully unwound hosted project keeps no .socket/ residue"
     );
+    for (file, text) in includes {
+        let after = std::fs::read_to_string(tmp.path().join(file)).unwrap();
+        assert_eq!(&after, text, "hosted mode never edits the include {file}");
+    }
 
     // After the rollback nothing references the patch any more: VEX finds
     // nothing to attest (online, the API would still vouch for the uuid).
@@ -1609,6 +1633,157 @@ async fn remove_unhosts_a_package_whose_agent_record_is_superseded() {
         envelope.to_string().contains("rollback_record_superseded"),
         "the superseded record is reported:\n{envelope:#}"
     );
+}
+
+/// Re-shape the superseded fixture as Bun's isolated linker leaves it
+/// after `bun install` of the hosted pin (#1084): `node_modules/<name>`
+/// links to the new store entry holding B's bytes, and the old
+/// `node_modules/.bun/<name>@<version>` entry Bun never prunes still holds
+/// agent record A's patched bytes. Returns the orphan's `index.js`.
+#[cfg(unix)]
+fn orphan_bun_store_copy(root: &Path) -> std::path::PathBuf {
+    let nm = root.join("node_modules");
+    let top = nm.join(NAME);
+    let store = nm.join(".bun");
+    let live = store
+        .join(format!("{NAME}@http+++patch.test+bbbbbbbb"))
+        .join("node_modules")
+        .join(NAME);
+    let orphan = store
+        .join(format!("{NAME}@{VERSION}"))
+        .join("node_modules")
+        .join(NAME);
+    for (dir, index) in [(&live, B_PATCHED_INDEX), (&orphan, A_PATCHED_INDEX)] {
+        std::fs::create_dir_all(dir).unwrap();
+        std::fs::copy(top.join("package.json"), dir.join("package.json")).unwrap();
+        std::fs::write(dir.join("index.js"), index).unwrap();
+    }
+    std::fs::remove_dir_all(&top).unwrap();
+    std::os::unix::fs::symlink(&live, &top).unwrap();
+    orphan.join("index.js")
+}
+
+/// #1084: the live copy holds B's bytes, but an orphaned Bun store copy
+/// still holds A's. Rollback restores that copy before dropping record A,
+/// so the next `bun install` cannot relink agent patch A unrecorded.
+#[cfg(unix)]
+#[tokio::test]
+#[serial]
+async fn rollback_restores_an_orphaned_store_copy_of_a_superseded_record() {
+    let server = MockServer::start().await;
+    let tmp = tempfile::tempdir().unwrap();
+    let pristine = write_superseded_agent_fixture(tmp.path(), &server, B_PATCHED_INDEX).await;
+    let orphan = orphan_bun_store_copy(tmp.path());
+
+    let (code, envelope) = run_rollback_subprocess_online(tmp.path(), &server, &[]);
+    assert_eq!(code, 0, "{envelope:#}");
+    assert_eq!(
+        std::fs::read(&orphan).unwrap(),
+        ORIGINAL_INDEX,
+        "the orphaned store copy at A's patched bytes is restored:\n{envelope:#}"
+    );
+    let live = tmp.path().join("node_modules").join(NAME).join("index.js");
+    assert_eq!(
+        std::fs::read(live).unwrap(),
+        B_PATCHED_INDEX,
+        "B's live copy is still the reinstall's to replace"
+    );
+    assert!(
+        warning_codes(&envelope).contains(&"rollback_record_superseded".to_string()),
+        "{envelope:#}"
+    );
+    let restored = std::fs::read_to_string(tmp.path().join("package-lock.json")).unwrap();
+    assert_eq!(restored, pristine);
+    assert!(manifest_patch_keys(tmp.path()).is_empty());
+}
+
+/// #1084: `remove <purl>` restores the orphaned copy the same way.
+#[cfg(unix)]
+#[tokio::test]
+#[serial]
+async fn remove_restores_an_orphaned_store_copy_of_a_superseded_record() {
+    let server = MockServer::start().await;
+    let tmp = tempfile::tempdir().unwrap();
+    let pristine = write_superseded_agent_fixture(tmp.path(), &server, B_PATCHED_INDEX).await;
+    let orphan = orphan_bun_store_copy(tmp.path());
+
+    let (code, envelope) = run_remove_subprocess_online(tmp.path(), &server, PURL);
+    assert_eq!(code, 0, "{envelope:#}");
+    assert_eq!(
+        std::fs::read(&orphan).unwrap(),
+        ORIGINAL_INDEX,
+        "the orphaned store copy at A's patched bytes is restored:\n{envelope:#}"
+    );
+    let restored = std::fs::read_to_string(tmp.path().join("package-lock.json")).unwrap();
+    assert_eq!(restored, pristine);
+    assert!(manifest_patch_keys(tmp.path()).is_empty());
+}
+
+/// #1084: a store copy that holds A's bytes but cannot be restored (its
+/// before-blob is gone) fails the run and keeps record A, instead of
+/// dropping the only data that could restore it.
+#[cfg(unix)]
+#[tokio::test]
+#[serial]
+async fn an_unrestorable_orphaned_store_copy_keeps_the_superseded_record() {
+    let server = MockServer::start().await;
+    let tmp = tempfile::tempdir().unwrap();
+    write_superseded_agent_fixture(tmp.path(), &server, B_PATCHED_INDEX).await;
+    orphan_bun_store_copy(tmp.path());
+    let before = socket_patch_core::hash::git_sha256::compute_git_sha256_from_bytes(ORIGINAL_INDEX);
+    std::fs::remove_file(tmp.path().join(".socket/blobs").join(before)).unwrap();
+
+    let (code, envelope) = run_rollback_subprocess_online(tmp.path(), &server, &[]);
+    assert_eq!(
+        code, 1,
+        "a copy still holding A's bytes that cannot be restored fails:\n{envelope:#}"
+    );
+    assert_eq!(
+        manifest_patch_keys(tmp.path()),
+        vec![PURL.to_string()],
+        "record A stays for a later rollback"
+    );
+}
+
+/// #1084 review: a store copy of the superseding patch B that shares a
+/// file with record A (B's `lib.js` is A's patched `lib.js`, its
+/// `index.js` is B's own) is not A's copy. It is left, as the primary is,
+/// and the run drops record A as before instead of failing on it forever.
+#[cfg(unix)]
+#[tokio::test]
+#[serial]
+async fn a_superseding_store_copy_sharing_a_file_with_the_record_is_left() {
+    let server = MockServer::start().await;
+    let tmp = tempfile::tempdir().unwrap();
+    write_superseded_agent_fixture(tmp.path(), &server, B_PATCHED_INDEX).await;
+    let copy = orphan_bun_store_copy(tmp.path());
+    // Record A patched lib.js too; B carries the same patched lib.js.
+    let before = socket_patch_core::hash::git_sha256::compute_git_sha256_from_bytes(ORIGINAL_INDEX);
+    let after = socket_patch_core::hash::git_sha256::compute_git_sha256_from_bytes(A_PATCHED_INDEX);
+    let manifest_path = tmp.path().join(".socket/manifest.json");
+    let mut manifest: Value =
+        serde_json::from_str(&std::fs::read_to_string(&manifest_path).unwrap()).unwrap();
+    manifest["patches"][PURL]["files"]["package/lib.js"] =
+        serde_json::json!({ "beforeHash": before, "afterHash": after });
+    std::fs::write(&manifest_path, manifest.to_string()).unwrap();
+    std::fs::write(&copy, B_PATCHED_INDEX).unwrap();
+    std::fs::write(copy.with_file_name("lib.js"), A_PATCHED_INDEX).unwrap();
+    let live = tmp.path().join("node_modules").join(NAME).join("lib.js");
+    std::fs::write(live, A_PATCHED_INDEX).unwrap();
+
+    let (code, envelope) = run_rollback_subprocess_online(tmp.path(), &server, &[]);
+    assert_eq!(code, 0, "{envelope:#}");
+    assert!(
+        warning_codes(&envelope).contains(&"rollback_record_superseded".to_string()),
+        "{envelope:#}"
+    );
+    assert_eq!(std::fs::read(&copy).unwrap(), B_PATCHED_INDEX);
+    assert_eq!(
+        std::fs::read(copy.with_file_name("lib.js")).unwrap(),
+        A_PATCHED_INDEX,
+        "B's copy is the reinstall's to replace"
+    );
+    assert!(manifest_patch_keys(tmp.path()).is_empty());
 }
 
 /// B07: a remove/rollback identifier that names the superseded record's
