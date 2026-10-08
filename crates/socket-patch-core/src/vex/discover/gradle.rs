@@ -50,7 +50,8 @@
 use std::collections::BTreeMap;
 
 use super::{
-    maven_purl, DiscoverCtx, Discovery, PatchedRef, DIAG_LOCKFILE_UNPARSEABLE, DIAG_REF_INVALID,
+    maven_purl, DiscoverCtx, Discovery, PatchedRef, UnattestedKind, DIAG_LOCKFILE_UNPARSEABLE,
+    DIAG_REF_INVALID,
 };
 use crate::gradle::eol::eol_eq;
 use crate::gradle::locks;
@@ -193,7 +194,13 @@ pub(crate) async fn extract(ctx: &DiscoverCtx<'_>, out: &mut Discovery) {
             continue;
         };
         if let Some((rel, detail)) = bypass {
-            out.unattested(&purl, &row.uuid, &rel, detail);
+            out.unattested(
+                &purl,
+                &row.uuid,
+                &rel,
+                detail,
+                UnattestedKind::LockAboveBase,
+            );
         }
         out.push(PatchedRef::hosted(
             purl,
