@@ -22,7 +22,11 @@ jobs:
     steps:
       - name: Checkout
         uses: actions/checkout@de0fac2e4500dabe0009e67214ff5f5447ce83dd # v6.0.2
+        # Run the canceller as it is on the base branch, never the queued
+        # PRs' copy: this job holds an actions:write token, so executing
+        # merge-group-head bytes would hand that token to any queued PR.
         with:
+          ref: ${{ github.event.merge_group.base_sha }}
           persist-credentials: false
           sparse-checkout: scripts/merge-queue-fail-fast.py
           sparse-checkout-cone-mode: false
@@ -31,4 +35,10 @@ jobs:
         env:
           GH_TOKEN: ${{ github.token }}
           HEAD_SHA: ${{ github.event.merge_group.head_sha }}
-        run: python3 -B scripts/merge-queue-fail-fast.py
+        # Until this workflow lands, the base branch has no canceller to run.
+        run: |
+          if [ ! -f scripts/merge-queue-fail-fast.py ]; then
+            echo "scripts/merge-queue-fail-fast.py is not on the base branch yet; nothing to watch."
+            exit 0
+          fi
+          python3 -B scripts/merge-queue-fail-fast.py
