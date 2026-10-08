@@ -3683,6 +3683,88 @@ mod tests {
         }
     }
 
+    /// The hosted takeover stages a vendored revert in a group that defers
+    /// artifact removals, then either drops the group (`--dry-run`), rolls
+    /// the revert back (a planner-refused, retracted takeover) or commits.
+    /// Only the commit may change the disk: the tree files, the derived
+    /// `maven-metadata.xml` (rewritten while a sibling version stays,
+    /// deleted with the last one) and the owned `.gitattributes` files all
+    /// stay byte-identical until then, and the commit lands exactly the
+    /// plain revert's result.
+    #[tokio::test]
+    async fn a_staged_revert_changes_nothing_until_its_group_commits() {
+        use crate::utils::group_commit::GroupCommit;
+        #[derive(Clone, Copy, Debug)]
+        enum End {
+            Drop,
+            Rollback,
+            Commit,
+        }
+        let sibling = JvmPatch {
+            version: "2.11.0",
+            uuid: UUID_B,
+            ..patch()
+        };
+        let shapes: [&[(&str, &str)]; 2] = [
+            &[("settings.gradle", "rootProject.name = 'x'\n")],
+            &[("settings.gradle", "plugins {\n  id 'x' version '1'\n}\n")],
+        ];
+        for files in shapes {
+            for with_sibling in [false, true] {
+                for end in [End::Drop, End::Rollback, End::Commit] {
+                    let dir = tempfile::tempdir().unwrap();
+                    let root = dir.path();
+                    testing::populate(root, files);
+                    let mut ledger = BTreeMap::new();
+                    testing::vendor(root, Shape::Gradle, &patch(), &mut ledger)
+                        .await
+                        .unwrap();
+                    if with_sibling {
+                        testing::vendor(root, Shape::Gradle, &sibling, &mut ledger)
+                            .await
+                            .unwrap();
+                    }
+                    let (before, before_dirs) = (testing::snapshot(root), testing::dirs(root));
+
+                    // What the plain (unstaged) revert leaves, on a copy.
+                    let expected_dir = tempfile::tempdir().unwrap();
+                    for (rel, bytes) in &before {
+                        let path = expected_dir.path().join(rel);
+                        std::fs::create_dir_all(path.parent().unwrap()).unwrap();
+                        std::fs::write(path, bytes).unwrap();
+                    }
+                    let mut expected_ledger = ledger.clone();
+                    let out =
+                        testing::revert(expected_dir.path(), &patch(), &mut expected_ledger).await;
+                    assert!(out.success, "{out:?}");
+                    let expected = testing::snapshot(expected_dir.path());
+
+                    let group = GroupCommit::begin(root);
+                    group.defer_removals();
+                    let savepoint = group.savepoint();
+                    let out = testing::revert(root, &patch(), &mut ledger).await;
+                    assert!(out.success && !out.kept_artifact, "{out:?}");
+                    let ctx = format!("{files:?} sibling={with_sibling} {end:?}");
+                    assert_eq!(testing::snapshot(root), before, "staged: {ctx}");
+                    match end {
+                        End::Drop => drop(group),
+                        End::Rollback => {
+                            group.rollback_to(savepoint);
+                            group.commit().await.unwrap();
+                        }
+                        End::Commit => {
+                            group.commit().await.unwrap();
+                            assert_eq!(testing::snapshot(root), expected, "{ctx}");
+                            continue;
+                        }
+                    }
+                    assert_eq!(testing::snapshot(root), before, "{ctx}");
+                    assert_eq!(testing::dirs(root), before_dirs, "{ctx}");
+                }
+            }
+        }
+    }
+
     #[test]
     fn an_apply_line_inside_a_comment_does_not_count() {
         let line = vendored_line(false, "");

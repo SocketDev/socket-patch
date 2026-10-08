@@ -18,8 +18,11 @@
 //! and [`GroupCommit::commit`] writes the final state once.
 //!
 //! **What is captured.** Files under the root whose relative path has no
-//! `.socket` component, plus the two ledgers (`.socket/vendor/state.json`,
-//! `.socket/vendor/redirect-state.json`). Everything else under `.socket/`
+//! `.socket` component, the two ledgers (`.socket/vendor/state.json`,
+//! `.socket/vendor/redirect-state.json`), and the small text files the JVM
+//! wiring owns under `.socket/` (the Gradle index and settings script, the
+//! owned `.gitattributes` files, the derived `maven-metadata.xml` files, the
+//! Coursier index). Everything else under `.socket/`
 //! — the artifacts under `.socket/vendor/<eco>/`, workspace members'
 //! `.socket/vendor/` mirrors, blobs, the manifest — is written straight to
 //! disk as before: artifacts are read back by path (zip readers, hashing,
@@ -148,6 +151,10 @@ struct Overlay {
     /// Directories to remove once the commit is on disk, if empty then
     /// (see [`remove_dir_after_commit`]).
     dirs_after_commit: Mutex<Vec<PathBuf>>,
+    /// Set by [`GroupCommit::defer_removals`]: the vendored artifacts a
+    /// revert deletes are queued for after the commit too (see
+    /// [`defer_removal`]).
+    defer_removals: std::sync::atomic::AtomicBool,
 }
 
 static ACTIVE: Mutex<Vec<Arc<Overlay>>> = Mutex::new(Vec::new());
@@ -183,6 +190,7 @@ fn is_captured(rel: &Path) -> bool {
     let spelled = rel.to_string_lossy().replace('\\', "/");
     if LEDGERS.contains(&spelled.as_str())
         || crate::vendor::jvm::layout::CAPTURED_FILES.contains(&spelled.as_str())
+        || crate::vendor::jvm::gradle::is_derived_metadata_path(&spelled)
     {
         return true;
     }
@@ -338,7 +346,7 @@ pub(crate) fn read_value<T: Any + Send + Sync>(path: &Path) -> Option<Arc<T>> {
 }
 
 /// Whether `path` exists as the run sees it; `None` when not captured.
-pub(crate) fn exists(path: &Path) -> Option<bool> {
+pub fn exists(path: &Path) -> Option<bool> {
     let (overlay, key) = resolve(path)?;
     let files = overlay
         .files
@@ -430,6 +438,42 @@ pub(crate) async fn remove_after_commit(tree: &Path, prune_bound: &Path) {
     remove_tree_pruned(tree, prune_bound).await;
 }
 
+/// Queue the deletion of `tree` (a vendored artifact a revert removes: a
+/// `.socket/vendor/<eco>/<uuid>/` unit or a workspace tarball) and the
+/// pruning of its now-empty parents up to and including `prune_bound` for
+/// after the commit, when an open group covering `tree` was asked to
+/// [`GroupCommit::defer_removals`]. `false` (nothing queued: the caller
+/// deletes now) otherwise.
+///
+/// The hosted takeover stages a whole vendored revert in a group it may
+/// roll back ([`GroupCommit::rollback_to`]) or never commit (a dry run, a
+/// refused rewrite): the captured lock edits then never reach the disk, so
+/// the artifact they still name must not be deleted either.
+pub(crate) fn defer_removal(tree: &Path, prune_bound: &Path) -> bool {
+    if ACTIVE_COUNT.load(Ordering::Acquire) == 0 {
+        return false;
+    }
+    let overlay = active()
+        .iter()
+        .find(|o| {
+            o.defer_removals.load(Ordering::Acquire)
+                && (tree.starts_with(&o.root)
+                    || o.canonical_root
+                        .as_deref()
+                        .is_some_and(|r| tree.starts_with(r)))
+        })
+        .cloned();
+    let Some(overlay) = overlay else {
+        return false;
+    };
+    overlay
+        .after_commit
+        .lock()
+        .unwrap_or_else(std::sync::PoisonError::into_inner)
+        .push((tree.to_path_buf(), prune_bound.to_path_buf()));
+    true
+}
+
 /// Remove the directory `dir` if it is empty — the `.cargo/` a deleted
 /// socket-created `.cargo/config.toml` leaves — once the run's commit is on
 /// disk. A captured removal of the file inside it only reaches the disk at
@@ -465,7 +509,15 @@ pub(crate) async fn remove_dir_after_commit(dir: &Path) {
 /// something else fails and stops the prune; a level already gone is
 /// skipped.
 async fn remove_tree_pruned(tree: &Path, bound: &Path) {
-    let _ = crate::patch::copy_tree::remove_tree(tree).await;
+    // A deferred artifact may be a single file (a workspace tarball).
+    match tokio::fs::symlink_metadata(tree).await {
+        Ok(meta) if !meta.is_dir() => {
+            let _ = tokio::fs::remove_file(tree).await;
+        }
+        _ => {
+            let _ = crate::patch::copy_tree::remove_tree(tree).await;
+        }
+    }
     let mut parent = tree.parent().map(Path::to_path_buf);
     while let Some(dir) = parent {
         if !dir.starts_with(bound) {
@@ -552,6 +604,13 @@ struct Change {
 }
 
 impl GroupCommit {
+    /// Also defer the vendored artifact deletions (see [`defer_removal`]) to
+    /// after the commit, so a staged revert can be rolled back or dropped
+    /// with its artifacts intact.
+    pub fn defer_removals(&self) {
+        self.overlay.defer_removals.store(true, Ordering::Release);
+    }
+
     /// Start capturing the commit points under `root`.
     pub fn begin(root: &Path) -> Self {
         let overlay = Arc::new(Overlay {
@@ -560,6 +619,7 @@ impl GroupCommit {
             files: Mutex::new(BTreeMap::new()),
             after_commit: Mutex::new(Vec::new()),
             dirs_after_commit: Mutex::new(Vec::new()),
+            defer_removals: std::sync::atomic::AtomicBool::new(false),
         });
         let mut active = active();
         active.push(Arc::clone(&overlay));
@@ -598,7 +658,7 @@ impl GroupCommit {
     /// it held before the commit.
     pub async fn commit_changes(mut self) -> std::io::Result<Vec<CommittedFile>> {
         self.close();
-        let changed = self.write().await?;
+        let changed = self.write(true).await?;
         let removals = std::mem::take(
             &mut *self
                 .overlay
@@ -622,7 +682,19 @@ impl GroupCommit {
         Ok(changed)
     }
 
-    async fn write(&mut self) -> std::io::Result<Vec<CommittedFile>> {
+    /// [`Self::commit`] without the crash journal, for a run that must
+    /// write nothing under `.socket/` (hosted mode without a takeover): the
+    /// files are replaced one by one, and a failed replacement puts the
+    /// ones already replaced back. A crash part-way leaves the files
+    /// replaced so far (the pre-journal behavior); nothing is ever left
+    /// half-written.
+    pub async fn commit_unjournaled(mut self) -> std::io::Result<Vec<String>> {
+        self.close();
+        let changed = self.write(false).await?;
+        Ok(changed.into_iter().map(|c| c.rel).collect())
+    }
+
+    async fn write(&mut self, journaled: bool) -> std::io::Result<Vec<CommittedFile>> {
         let root = self.overlay.root.clone();
         let captured = std::mem::take(
             &mut *self
@@ -681,10 +753,40 @@ impl GroupCommit {
             apply_durably(&root, only).await?;
             return Ok(committed(changes));
         }
+        if !journaled {
+            for (at, change) in changes.iter().enumerate() {
+                if let Err(e) = apply_durably(&root, change).await {
+                    let _ = restore(&root, &changes[..at]).await;
+                    return Err(e);
+                }
+            }
+            return Ok(committed(changes));
+        }
         let journal = root.join(COMMIT_JOURNAL_REL);
+        // The outermost directory the journal's parent chain lacks: a
+        // hosted run (no vendored ledger) creates `.socket/vendor/` only to
+        // hold the journal, and prunes it again once the journal is gone.
+        let mut created: Option<PathBuf> = None;
         if let Some(parent) = journal.parent() {
+            created = parent
+                .ancestors()
+                .take_while(|dir| *dir != root && std::fs::symlink_metadata(dir).is_err())
+                .last()
+                .map(Path::to_path_buf);
             tokio::fs::create_dir_all(parent).await?;
         }
+        let prune_created = |journal: &Path| {
+            let Some(top) = created.as_deref() else {
+                return;
+            };
+            let mut level = journal.parent();
+            while let Some(dir) = level {
+                if !dir.starts_with(top) || std::fs::remove_dir(dir).is_err() {
+                    break;
+                }
+                level = dir.parent();
+            }
+        };
         super::fs::atomic_write_bytes(&journal, &journal_bytes(&changes)?).await?;
         crate::utils::failpoint::hit("group_commit_journal");
         for (at, change) in changes.iter().enumerate() {
@@ -696,7 +798,9 @@ impl GroupCommit {
                 // command rolls the commit forward.
                 return match restore(&root, &changes[..at]).await {
                     Ok(()) => {
-                        let _ = tokio::fs::remove_file(&journal).await;
+                        if tokio::fs::remove_file(&journal).await.is_ok() {
+                            prune_created(&journal);
+                        }
                         Err(e)
                     }
                     Err(_) => Err(std::io::Error::new(e.kind(), CommitPending(e))),
@@ -712,6 +816,7 @@ impl GroupCommit {
             && tokio::fs::remove_file(&journal).await.is_ok()
         {
             sync_dir(journal.parent());
+            prune_created(&journal);
         }
         Ok(committed(changes))
     }
@@ -1226,7 +1331,11 @@ mod tests {
             (".socket/gradle/socket-patch.settings.gradle", true),
             (".socket/vendor/maven2/.gitattributes", true),
             (".socket/vendor/gradle/.gitattributes", true),
+            (".socket/gradle/.gitattributes", true),
+            (".socket/vendor/.gitattributes", true),
+            (".socket/vendor/gradle/g/a/maven-metadata.xml", true),
             (".socket/vendor/gradle/g/a/1/a-1.jar", false),
+            (".socket/vendor/gradle/g/a/1/socket-patch.vendor.json", false),
             (".socket/vendor/npm/u/left-pad-1.3.0.tgz", false),
             (".socket/manifest.json", false),
             ("packages/a/.socket/vendor/npm/u/a.tgz", false),
@@ -1294,6 +1403,77 @@ mod tests {
         assert_eq!(std::fs::read(&lock).unwrap(), b"hosted");
         assert_eq!(std::fs::read(&ws).unwrap(), b"trustLockfile: true\n");
         assert_eq!(std::fs::read(&npmrc).unwrap(), b"earlier");
+    }
+
+    /// A group that defers removals keeps a reverted vendored unit until
+    /// its commit: a rollback or a dropped group leaves the unit (and the
+    /// lock wiring naming it) intact, and only a commit deletes it, pruning
+    /// the emptied `<eco>/` and `vendor/` levels but never `.socket/`.
+    #[tokio::test]
+    async fn deferred_unit_removals_wait_for_the_commit() {
+        use crate::utils::socket_dir::remove_tree_and_prune;
+        let tmp = tempfile::tempdir().unwrap();
+        let root = tmp.path();
+        let socket = root.join(".socket");
+        let unit = socket.join("vendor/npm/u1");
+        std::fs::create_dir_all(&unit).unwrap();
+        std::fs::write(unit.join("a.tgz"), b"tgz").unwrap();
+        std::fs::write(socket.join("apply.lock"), b"").unwrap();
+
+        // Not deferring: the removal is immediate, as before.
+        let other = socket.join("vendor/npm/u0");
+        std::fs::create_dir_all(&other).unwrap();
+        let plain = GroupCommit::begin(root);
+        remove_tree_and_prune(&other, &socket).await.unwrap();
+        assert!(!other.exists());
+        drop(plain);
+
+        for keep in [true, false] {
+            let group = GroupCommit::begin(root);
+            group.defer_removals();
+            let savepoint = group.savepoint();
+            remove_tree_and_prune(&unit, &socket).await.unwrap();
+            assert!(unit.exists(), "nothing is deleted before the commit");
+            if keep {
+                group.rollback_to(savepoint);
+                group.commit().await.unwrap();
+                assert!(unit.join("a.tgz").exists(), "a rolled-back removal is forgotten");
+            } else {
+                drop(group);
+                assert!(unit.join("a.tgz").exists(), "a dropped group deletes nothing");
+            }
+        }
+
+        let group = GroupCommit::begin(root);
+        group.defer_removals();
+        remove_tree_and_prune(&unit, &socket).await.unwrap();
+        group.commit().await.unwrap();
+        assert!(!unit.exists());
+        assert!(!socket.join("vendor").exists(), "the emptied levels are pruned");
+        assert!(socket.join("apply.lock").exists(), "`.socket/` itself stays");
+    }
+
+    /// A journal the commit had to create `.socket/vendor/` for (a hosted
+    /// run with no vendored ledger) leaves no empty directory behind.
+    #[tokio::test]
+    async fn a_journal_directory_the_commit_created_is_pruned() {
+        let tmp = tempfile::tempdir().unwrap();
+        let root = tmp.path();
+        std::fs::create_dir_all(root.join(".socket")).unwrap();
+        std::fs::write(root.join("a.lock"), b"old a").unwrap();
+        std::fs::write(root.join("b.lock"), b"old b").unwrap();
+        let group = GroupCommit::begin(root);
+        super::super::fs::atomic_write_bytes(&root.join("a.lock"), b"new a")
+            .await
+            .unwrap();
+        super::super::fs::atomic_write_bytes(&root.join("b.lock"), b"new b")
+            .await
+            .unwrap();
+        let changed = group.commit().await.unwrap();
+        assert_eq!(changed.len(), 2, "two files go through the journal");
+        assert_eq!(std::fs::read(root.join("b.lock")).unwrap(), b"new b");
+        assert!(!root.join(".socket/vendor").exists());
+        assert!(root.join(".socket").exists());
     }
 
     #[tokio::test]

@@ -678,12 +678,16 @@ pub async fn revert_go_vendor_opts(
     // (and the caller keeps the ledger entry), so only the deletion is
     // skipped.
     if !dry_run && !keep_artifact {
+        // Best-effort (NotFound is fine): the shared per-unit revert removal
+        // also prunes the now-empty `.socket/vendor/golang/` and
+        // `.socket/vendor/` levels, and waits for the commit of a staged
+        // hosted takeover.
         let uuid_dir = project_root.join(&base_rel);
-        let _ = remove_tree(&uuid_dir).await; // ignore NotFound
-                                              // Best-effort: prune the now-empty `.socket/vendor/golang/` and
-                                              // `.socket/vendor/` levels so a fully-reverted project carries no
-                                              // vendor residue. `remove_dir` fails on non-empty.
-        prune_empty_vendor_levels(&uuid_dir).await;
+        let _ = crate::utils::socket_dir::remove_tree_and_prune(
+            &uuid_dir,
+            &project_root.join(crate::constants::SOCKET_DIR),
+        )
+        .await;
     }
 
     if entry.took_over_go_patches {

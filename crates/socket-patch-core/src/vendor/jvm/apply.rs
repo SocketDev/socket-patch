@@ -657,7 +657,7 @@ pub async fn revert(root: &Path, entry: &VendorEntry, opts: RevertOpts) -> Rever
             Some(bytes) => write_bytes(&path, bytes).await,
             None => {
                 removed.push(rel.clone());
-                remove_file(&path).await
+                remove_staged(rel, &path).await
             }
         };
         if let Err(e) = res {
@@ -670,7 +670,9 @@ pub async fn revert(root: &Path, entry: &VendorEntry, opts: RevertOpts) -> Rever
         // worse than a kept one.
         for w in present.into_iter().filter(|_| !kept) {
             let res = match reader.resolve(&w.file) {
-                Ok(path) => remove_file(&path).await.map_err(|e| e.to_string()),
+                Ok(path) => remove_staged(&w.file, &path)
+                    .await
+                    .map_err(|e| e.to_string()),
                 Err(e) => Err(e),
             };
             if let Err(e) = res {
@@ -686,6 +688,19 @@ pub async fn revert(root: &Path, entry: &VendorEntry, opts: RevertOpts) -> Rever
         error: None,
         kept_artifact: kept,
     }
+}
+
+/// Remove the project file `rel` (at `path`) for a revert. A captured file
+/// goes through the overlay; an uncaptured one (a vendored tree file) is,
+/// inside a group that defers removals (the hosted takeover's staged
+/// revert), deleted only once that group commits: a dry run, a retracted
+/// takeover or a failed commit leaves the artifact the restored wiring
+/// still names.
+async fn remove_staged(rel: &str, path: &Path) -> std::io::Result<()> {
+    if !group_commit::captures(rel) && group_commit::defer_removal(path, path) {
+        return Ok(());
+    }
+    remove_file(path).await
 }
 
 /// The committed JVM layout only a JVM ledger entry ([`is_jvm_entry`]) can
