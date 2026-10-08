@@ -641,7 +641,7 @@ impl Discovery {
         let key = canonical_base_purl(purl);
         self.refs
             .iter()
-            .any(|r| r.uuid == uuid && r.mode == mode && same_package(&r.purl, &key))
+            .any(|r| r.uuid == uuid && r.mode == mode && same_release(&r.purl, &key))
     }
 
     /// Whether some file discovery read mentions patch `uuid` as a `mode`
@@ -848,7 +848,7 @@ impl Discovery {
             self.refs.iter().any(|r| {
                 r.uuid == uuid
                     && r.mode == WiringMode::Vendored
-                    && same_package(&r.purl, &key)
+                    && same_release(&r.purl, &key)
                     && r.artifact_rel.as_deref() == Some(artifact)
             })
         })
@@ -862,7 +862,7 @@ impl Discovery {
     pub fn vendored_contest(&self, purl: &str, uuid: &str) -> Option<&ContestedRef> {
         let key = canonical_base_purl(purl);
         self.contested.iter().find(|c| {
-            c.uuid == uuid && c.mode == WiringMode::Vendored && same_package(&c.purl, &key)
+            c.uuid == uuid && c.mode == WiringMode::Vendored && same_release(&c.purl, &key)
         })
     }
 
@@ -871,9 +871,9 @@ impl Discovery {
     /// ([`Discovery::resolved_elsewhere`]).
     pub fn resolves_package(&self, purl: &str) -> bool {
         let key = canonical_base_purl(purl);
-        self.refs.iter().any(|r| same_package(&r.purl, &key))
-            || self.contested.iter().any(|c| same_package(&c.purl, &key))
-            || self.elsewhere.iter().any(|e| same_package(&e.purl, &key))
+        self.refs.iter().any(|r| same_release(&r.purl, &key))
+            || self.contested.iter().any(|c| same_release(&c.purl, &key))
+            || self.elsewhere.iter().any(|e| same_release(&e.purl, &key))
     }
 
     fn recognize(&mut self, uuid: &str, mode: WiringMode, file: &str) {
@@ -1197,7 +1197,7 @@ impl<'a> DiscoverCtx<'a> {
 /// `vendored = true`, `socket-patch-vendor-<uuid>` (maven's vendored repo
 /// id). Exact grammar only — a suffix or a non-canonical uuid is not ours.
 pub(crate) fn socket_patch_name_uuid(name: &str, vendored: bool) -> Option<String> {
-    crate::patch::redirect::socket_patch_name_uuid_exact(name.trim(), vendored).map(str::to_string)
+    crate::patch::redirect::generation::pin_name_uuid(name.trim(), vendored).map(str::to_string)
 }
 
 /// Every Socket patch identity `text` MENTIONS, by wiring mode — the sweep
@@ -1753,12 +1753,13 @@ pub fn canonical_base_purl(purl: &str) -> String {
     }
 }
 
-/// Whether a ref's [`canonical_base_purl`] and `key` (another canonical
-/// base) name the same package release: equal, or for composer the same
-/// release in another version spelling (a ledger's `@3.0.2.0` is the lock's
-/// `@3.0.2`).
-fn same_package(ref_purl: &str, key: &str) -> bool {
-    ref_purl == key || crate::utils::composer_version::composer_purls_equivalent(ref_purl, key)
+/// Whether two [`canonical_base_purl`] spellings name the same package
+/// release, whichever patch generation each side recorded: equal, or for
+/// composer the same release in another version spelling (a ledger's
+/// `@3.0.2.0` is the lock's `@3.0.2`). The one same-release predicate the
+/// ledgers, `vex` and `remove` / `rollback` share.
+pub fn same_release(a: &str, b: &str) -> bool {
+    a == b || crate::utils::composer_version::composer_purls_equivalent(a, b)
 }
 
 /// [`canonical_base_purl`] for a ref about to be pushed, plus shape checks:
@@ -1791,7 +1792,7 @@ impl Discovery {
         let key = canonical_base_purl(purl);
         self.refs
             .iter()
-            .any(|r| r.mode == mode && same_package(&r.purl, &key))
+            .any(|r| r.mode == mode && same_release(&r.purl, &key))
     }
 
     /// Liveness of a VENDOR-ledger entry — the ONE rule every reader of the

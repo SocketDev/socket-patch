@@ -36,6 +36,7 @@ pub use bun_binary::{preflight_bun_binary, rewrite_bun_binary};
 mod cargo_lock_equivalence_tests;
 #[cfg(test)]
 mod composer_equivalence_tests;
+pub(crate) mod generation;
 #[cfg(test)]
 mod golang_equivalence_tests;
 pub mod golang_local;
@@ -1523,6 +1524,9 @@ fn rewrite_cargo(
         .map(|t| to_lf(cargo_config_key, t))
         .unwrap_or_default();
     let (mut lock_changed, mut config_changed) = (false, false);
+    // The manifests as they arrived: a generation they pin that the final
+    // manifests no longer do was superseded by this run (see below).
+    let manifests_before: Vec<String> = manifests.iter().map(|(_, t)| t.clone()).collect();
 
     for dep in &cargo {
         let Some(ov) = registry_override_of_kind(dep, "cargo-sparse") else {
@@ -1585,7 +1589,7 @@ fn rewrite_cargo(
             });
             continue;
         }
-        let reg = format!("socket-patch-{}", dep.patch_uuid);
+        let reg = generation::hosted_pin_name(&dep.patch_uuid);
         let index_url = &ov.index_url;
 
         // 1. Plan the Cargo.toml pin FIRST — it is the gate for everything
@@ -1803,6 +1807,46 @@ fn rewrite_cargo(
             LockCommit::InPlace | LockCommit::Absent => {}
         }
         result.confirmed_cargo_uuids.insert(dep.patch_uuid.clone());
+    }
+
+    // A re-pin to a superseding patch moved every declaration off the old
+    // generation's registry: its `[registries.socket-patch-<old>]` block is
+    // now referenced by nothing, so it goes with the re-pin (#864) — left in
+    // place it outlives even `remove`, token-bearing index URL and all.
+    let superseded = generation::superseded_generations(
+        manifests_before.iter().map(String::as_str),
+        manifests.iter().map(|(_, t)| t.as_str()),
+    );
+    for uuid in superseded {
+        if cargo_lock
+            .as_deref()
+            .is_some_and(|lock| lock.contains(&uuid))
+        {
+            continue;
+        }
+        let reg = generation::hosted_pin_name(&uuid);
+        let Some(removed) = upstream::cargo::remove_registry_block(&cargo_config, &reg) else {
+            continue;
+        };
+        // The block opened the file: don't leave a blank first line behind.
+        let opened_file = cargo_config
+            .lines()
+            .next()
+            .is_some_and(|l| l.trim() == format!("[registries.{reg}]"));
+        let removed = match removed.strip_prefix('\n') {
+            Some(rest) if opened_file => rest.to_string(),
+            _ => removed,
+        };
+        result.edits.push(FileEdit {
+            path: cargo_config_key.into(),
+            kind: "redirect_cargo_superseded_registry_removed".into(),
+            action: "removed".into(),
+            key: Some(reg),
+            original: None,
+            new: None,
+        });
+        cargo_config = removed;
+        config_changed = true;
     }
 
     let restore = |path: &str, text: String| -> String {
@@ -2192,27 +2236,11 @@ fn is_valid_gem_index_url(url: &str) -> bool {
         && !url.chars().any(|c| c.is_control() || c == ' ')
 }
 
-/// The uuid of a Socket-owned registry / repository / source NAME in its
-/// EXACT grammar: `socket-patch-<canonical-uuid>`, or with `vendored`
-/// `socket-patch-vendor-<canonical-uuid>` (maven's vendored repository id).
-/// No trimming: the rewriter must never treat a user's padded pin as its
-/// own, while lockfile discovery trims at its call site
-/// (`vex::discover::socket_patch_name_uuid`).
-pub(crate) fn socket_patch_name_uuid_exact(name: &str, vendored: bool) -> Option<&str> {
-    let prefix = if vendored {
-        "socket-patch-vendor-"
-    } else {
-        "socket-patch-"
-    };
-    name.strip_prefix(prefix)
-        .filter(|uuid| crate::patch::path_safety::is_canonical_uuid(uuid))
-}
-
 /// A registry name THIS rewriter owns: `socket-patch-<canonical-uuid>`. An
 /// existing pin matching this grammar was written by a previous run and may be
 /// superseded in place; any other registry pin is the user's and is refused.
 fn is_socket_patch_registry_name(value: &str) -> bool {
-    socket_patch_name_uuid_exact(value, false).is_some()
+    generation::pin_name_uuid(value, false).is_some()
 }
 
 /// The `socket-patch-<uuid>` registry name pinning `crate_name` in this
@@ -5550,7 +5578,7 @@ fn rewrite_nuget(
             .strip_prefix("sha512-")
             .unwrap_or(&sha512_sri)
             .to_string();
-        let reg = format!("socket-patch-{}", dep.patch_uuid);
+        let reg = generation::hosted_pin_name(&dep.patch_uuid);
         let id_lower = ov
             .identifiers
             .nuget_id_lower
@@ -6795,10 +6823,28 @@ fn rewrite_maven_pom(
     }
     let mut pom = files.get("pom.xml").cloned();
     let mut pom_changed = false;
+    // The hosted generations whose `socket-patch-<uuid>` repository the pom
+    // declared before this run: only a suffixed literal one of these minted
+    // is an earlier generation of OUR pin. A vendored reactor / sbt pin
+    // writes the same `-socket.<hex8>` suffix under a
+    // `socket-patch-vendor-<uuid>` repository, which stays a mismatch.
+    //
+    // One pass over the pom's repositories: `(id, url)` of each, which also
+    // answers the per-dep URL-refresh check below while the pom is still
+    // unchanged (a no-op rescan then never re-scans the pom per dep).
+    let original_repos: Vec<(String, Option<String>)> =
+        pom.as_deref().map(maven_repository_ids_and_urls).unwrap_or_default();
+    let hosted_repo_generations: std::collections::BTreeSet<String> = original_repos
+        .iter()
+        .filter_map(|(id, _)| generation::pin_name_uuid(id, false).map(str::to_string))
+        .collect();
     let mut mvn_config = files.get(MVN_CONFIG).cloned().unwrap_or_default();
     let mut mvn_config_changed = false;
     // (local-repo-relative path, bare sha256 hex) entries to merge in.
     let mut checksum_entries: Vec<(String, String)> = vec![];
+    // Trusted-checksum paths of superseded generations' suffixed artifacts:
+    // their pins moved to the new generation this run, so the entries go.
+    let mut checksum_drops: Vec<String> = vec![];
     let gradle_build_present = gradle::gradle_build_present(files);
     let mut warned_no_pom = false;
     // Local-repo paths of the suffixed jars this run's Trusted Checksums pin
@@ -6844,7 +6890,7 @@ fn rewrite_maven_pom(
             continue;
         };
         // Unique-per-patch repository id (valid chars: alnum, `-`, `_`, `.`).
-        let repo_id = format!("socket-patch-{}", dep.patch_uuid);
+        let repo_id = generation::hosted_pin_name(&dep.patch_uuid);
 
         // LEGACY same-GAV fallback: no suffixed version means the patched jar is
         // served under its original GAV. Add the repository (transport checksum
@@ -6967,33 +7013,50 @@ fn rewrite_maven_pom(
                     .map(|((s, e), v)| (s, e, v))
             })
             .collect();
-        // Rewrite base → suffixed. Descending offset order so earlier edits
-        // don't shift later matches' offsets.
-        let mut to_rewrite: Vec<(usize, usize)> = versioned
+        // A `<base>-socket.<hex8>` literal for this release that is not the
+        // applied suffix, minted by a hosted `socket-patch-<uuid>` repository
+        // the pom declares, is an earlier generation of OUR pin (a
+        // superseding patch uuid): re-pin it like the base (#266).
+        let prior_generation = |v: &str| {
+            v != suffixed_version
+                && crate::formats::maven::split_socket_version(v).is_some_and(|(base, hex8)| {
+                    base == dep.version
+                        && hosted_repo_generations
+                            .iter()
+                            .any(|uuid| uuid.starts_with(hex8))
+                })
+        };
+        // Rewrite base (or a prior generation) → suffixed. Descending offset
+        // order so earlier edits don't shift later matches' offsets.
+        let mut to_rewrite: Vec<(usize, usize, String)> = versioned
             .iter()
-            .filter(|(_, _, v)| *v == dep.version)
-            .map(|(s, e, _)| (*s, *e))
+            .filter(|(_, _, v)| *v == dep.version || prior_generation(v))
+            .map(|(s, e, v)| (*s, *e, v.clone()))
             .collect();
         to_rewrite.sort_by(|a, b| b.0.cmp(&a.0));
-        for (start, end) in &to_rewrite {
+        let mut superseded_versions: Vec<String> = vec![];
+        for (start, end, was) in &to_rewrite {
             pom_text.replace_range(*start..*end, &suffixed_version);
             pom_changed = true;
             pin_landed = true;
+            if *was != dep.version && !superseded_versions.contains(was) {
+                superseded_versions.push(was.clone());
+            }
             result.edits.push(FileEdit {
                 path: "pom.xml".into(),
                 kind: "redirect_maven_dep_version".into(),
                 action: "rewritten".into(),
                 key: Some(format!("{group_id}:{artifact_id}")),
-                original: Some(Value::String(dep.version.clone())),
+                original: Some(Value::String(was.clone())),
                 new: Some(Value::String(suffixed_version.clone())),
             });
         }
-        // A literal version that is neither base nor the applied suffixed
-        // version disagrees with the row — skip it (don't guess). A dep whose
-        // only match is a mismatch adds no pin (versioned is non-empty, so the
-        // depMgmt branch below is skipped).
+        // A literal version that is neither base, the applied suffixed
+        // version nor an earlier generation disagrees with the row — skip it
+        // (don't guess). A dep whose only match is a mismatch adds no pin
+        // (versioned is non-empty, so the depMgmt branch below is skipped).
         for (_, _, v) in &versioned {
-            if *v != dep.version && *v != suffixed_version {
+            if *v != dep.version && *v != suffixed_version && !prior_generation(v) {
                 result.warnings.push(RewriteWarning {
                     code: "redirect_maven_dep_version_mismatch".into(),
                     detail: format!(
@@ -7043,6 +7106,75 @@ fn rewrite_maven_pom(
                 &suffixed_version,
                 "jar",
             ));
+        }
+
+        // The superseded generations' wiring: once no literal names an old
+        // suffix any more, its `socket-patch-<uuid>` repository and trusted
+        // checksums are referenced by nothing.
+        for old in &superseded_versions {
+            if pom_text.contains(old.as_str()) {
+                continue;
+            }
+            let hex8 = crate::formats::maven::split_socket_version(old)
+                .map(|(_, h)| h)
+                .unwrap_or_default();
+            // The suffix carries only the uuid's first eight hex digits: a
+            // `-socket.<hex8>` literal of another artifact still in the pom
+            // may be a different live pin whose uuid shares them, so its
+            // repository stays. The trusted checksums below are keyed by this
+            // artifact's own GAV, so they go either way.
+            let hex8_still_pinned = pom_text.contains(&format!("-socket.{hex8}"));
+            for old_uuid in generation::named_generations(pom_text) {
+                if hex8_still_pinned || old_uuid == dep.patch_uuid || !old_uuid.starts_with(hex8) {
+                    continue;
+                }
+                let old_id = generation::hosted_pin_name(&old_uuid);
+                if let Some(next) = remove_maven_repository(pom_text, &old_id) {
+                    *pom_text = next;
+                    pom_changed = true;
+                    result.edits.push(FileEdit {
+                        path: "pom.xml".into(),
+                        kind: "redirect_maven_superseded_repository_removed".into(),
+                        action: "removed".into(),
+                        key: Some(old_id),
+                        original: None,
+                        new: None,
+                    });
+                }
+            }
+            for ext in ["jar", "pom"] {
+                checksum_drops.push(local_repo_artifact_path(&group_id, &artifact_id, old, ext));
+            }
+        }
+
+        // A rotated grant token keeps the uuid but changes the repository
+        // URL: refresh the existing `socket-patch-<uuid>` repository in place
+        // so the pin keeps resolving through the current grant.
+        // While the pom is unchanged, `original_repos` already says whether
+        // the refresh would change anything (exactly one such repository,
+        // with a `<url>` that differs); skip the scan when it would not.
+        let refresh_may_apply = pom_changed || {
+            let mut ours = original_repos.iter().filter(|(id, _)| *id == repo_id);
+            match (ours.next(), ours.next()) {
+                (Some((_, Some(url))), None) => *url != ov.index_url,
+                _ => false,
+            }
+        };
+        if refresh_may_apply
+            && (pin_landed || versioned.iter().any(|(_, _, v)| *v == suffixed_version))
+        {
+            if let Some(next) = refresh_maven_repository_url(pom_text, &repo_id, &ov.index_url) {
+                *pom_text = next;
+                pom_changed = true;
+                result.edits.push(FileEdit {
+                    path: "pom.xml".into(),
+                    kind: "redirect_maven_repository".into(),
+                    action: "rewritten".into(),
+                    key: Some(repo_id.clone()),
+                    original: None,
+                    new: Some(json!({ "id": repo_id, "url": ov.index_url })),
+                });
+            }
         }
 
         // A pin landed this run: inject the repository (idempotent via the <id>
@@ -7113,16 +7245,31 @@ fn rewrite_maven_pom(
     if mvn_config_changed {
         result.files.insert(MVN_CONFIG.into(), mvn_config);
     }
-    if !checksum_entries.is_empty() {
-        let existing = files.get(MVN_CHECKSUMS).cloned().unwrap_or_default();
+    // LF-normalized, so the drop check and the filter below split lines the
+    // same way (a CRLF file's paths would otherwise keep a trailing `\r`).
+    let existing_checksums = files
+        .get(MVN_CHECKSUMS)
+        .map(|text| text.replace("\r\n", "\n"))
+        .unwrap_or_default();
+    let names_dropped_path = |line: &str| {
+        line.split_once("  ")
+            .is_some_and(|(_, p)| checksum_drops.iter().any(|d| d == p))
+    };
+    let drops_checksums = existing_checksums.split('\n').any(names_dropped_path);
+    if !checksum_entries.is_empty() || drops_checksums {
         let action = if files.contains_key(MVN_CHECKSUMS) {
             "rewritten"
         } else {
             "added"
         };
+        let kept: String = existing_checksums
+            .split('\n')
+            .filter(|l| !names_dropped_path(l))
+            .collect::<Vec<_>>()
+            .join("\n");
         result.files.insert(
             MVN_CHECKSUMS.into(),
-            merge_checksums(&existing, &checksum_entries),
+            merge_checksums(&kept, &checksum_entries),
         );
         result.edits.push(FileEdit {
             path: MVN_CHECKSUMS.into(),
@@ -7163,6 +7310,72 @@ fn rewrite_maven_pom(
             ),
         });
     }
+}
+
+static MAVEN_REPOSITORY_RE: LazyLock<Regex> = LazyLock::new(|| {
+    Regex::new(r"(?s)<repository>.*?</repository>").expect("static repository regex is valid")
+});
+
+/// The trimmed `<id>` and `<url>` texts of every `<repository>` element of
+/// `pom` that has an `<id>`, in document order: the same elements, ids and
+/// URLs [`maven_repositories_with_id`] and [`refresh_maven_repository_url`]
+/// read, in one pass.
+fn maven_repository_ids_and_urls(pom: &str) -> Vec<(String, Option<String>)> {
+    MAVEN_REPOSITORY_RE
+        .find_iter(pom)
+        .filter_map(|m| {
+            let id = maven_tag_text_in(pom, "id", m.start(), m.end())?;
+            let url = maven_tag_text_in(pom, "url", m.start(), m.end());
+            Some((id, url))
+        })
+        .collect()
+}
+
+/// The `<repository>` elements of `pom` whose `<id>` is `id`, as byte spans.
+pub(crate) fn maven_repositories_with_id(pom: &str, id: &str) -> Vec<(usize, usize)> {
+    MAVEN_REPOSITORY_RE
+        .find_iter(pom)
+        .filter(|m| maven_tag_text_in(pom, "id", m.start(), m.end()).as_deref() == Some(id))
+        .map(|m| (m.start(), m.end()))
+        .collect()
+}
+
+/// `pom` without the one `<repository>` whose `<id>` is `id` and the line
+/// break [`insert_maven_repository`] put before it; `None` unless exactly
+/// one such element sits on lines of its own (anything else is not the
+/// rewriter's insertion, and stays).
+pub(crate) fn remove_maven_repository(pom: &str, id: &str) -> Option<String> {
+    let [(start, end)] = maven_repositories_with_id(pom, id)[..] else {
+        return None;
+    };
+    let line_start = pom[..start].rfind('\n')?;
+    let own_lines = pom[line_start + 1..start].trim().is_empty()
+        && (pom[end..].starts_with('\n') || pom[end..].starts_with("\r\n"));
+    if !own_lines {
+        return None;
+    }
+    let cut = if pom[..line_start].ends_with('\r') {
+        line_start - 1
+    } else {
+        line_start
+    };
+    Some(format!("{}{}", &pom[..cut], &pom[end..]))
+}
+
+/// `pom` with the `<url>` of its one `<repository>` whose `<id>` is `id` set
+/// to `url`; `None` when there is no such single element or it already
+/// points there.
+fn refresh_maven_repository_url(pom: &str, id: &str, url: &str) -> Option<String> {
+    let [(start, end)] = maven_repositories_with_id(pom, id)[..] else {
+        return None;
+    };
+    let (s, e) = maven_tag_inner_range(pom, "url", start, end)?;
+    if pom[s..e].trim() == url {
+        return None;
+    }
+    let mut out = pom.to_string();
+    out.replace_range(s..e, url);
+    Some(out)
 }
 
 /// Insert the socket-patch `<repository>` block: releases enabled with
@@ -7568,6 +7781,36 @@ fn rewrite_golang(
                         dep.version
                     ))),
                 });
+            }
+        }
+        // A refresh that moved the pin to another generation (a superseding
+        // patch uuid, or the same uuid republished at a new version) owns the
+        // previous target's go.sum pair too: nothing references it any more,
+        // so `go mod tidy` would prune it, and leaving it makes the first
+        // day-2 tidy rewrite go.sum (#682).
+        if let Some((old_module, old_version)) = prior
+            .filter(|e| e.owner == Some(go_mod_edit::ReplaceOwner::Hosted))
+            .and_then(|e| e.rhs_module.as_deref().zip(e.rhs_version.as_deref()))
+            .filter(|&(m, v)| (m, v) != (rhs_module.as_str(), rhs_version.as_str()))
+        {
+            let still_targeted = go_mod_edit::parse_replace_entries(&go_mod).iter().any(|e| {
+                e.rhs_module.as_deref() == Some(old_module)
+                    && e.rhs_version.as_deref() == Some(old_version)
+            });
+            if !still_targeted {
+                if let Some(removed) =
+                    go_sum.remove_exact_module_version_lines(old_module, old_version)
+                {
+                    sum_changed = true;
+                    result.edits.push(FileEdit {
+                        path: "go.sum".into(),
+                        kind: "redirect_golang_superseded_gosum_removed".into(),
+                        action: "removed".into(),
+                        key: Some(format!("{old_module}@{old_version}")),
+                        original: Some(Value::String(removed.join("\n"))),
+                        new: None,
+                    });
+                }
             }
         }
         if go_sum.upsert_module_lines(rhs_module, rhs_version, zip_h1, gomod_h1) {
@@ -12363,6 +12606,22 @@ mod tests {
             cfg.contains(&format!("[registries.{}]", cargo_reg())),
             "{cfg}"
         );
+        // #864: the superseded generation's block is referenced by nothing
+        // any more and goes with the re-pin (no blank first line left).
+        assert!(!cfg.contains(&old_reg), "{cfg}");
+        assert_eq!(
+            cfg,
+            &format!(
+                "[registries.{}]\nindex = \"{}\"\n",
+                cargo_reg(),
+                cargo_index_url()
+            )
+        );
+        assert!(r
+            .edits
+            .iter()
+            .any(|e| e.kind == "redirect_cargo_superseded_registry_removed"
+                && e.key.as_deref() == Some(old_reg.as_str())));
         assert!(
             !r.warnings
                 .iter()
@@ -22446,5 +22705,426 @@ mod superseding_repin_tests {
         );
         let (_, again) = scan(&repinned, &second());
         assert!(again.files.is_empty() && again.warnings.is_empty());
+    }
+}
+
+/// B07 owned-pin generations: one supersede matrix across the hosted
+/// writers whose re-pin left the previous generation's wiring behind
+/// (#864 cargo, #682 Go, #266 Maven). Each case pins generation A through
+/// the full redirect planner, re-pins to generation B, and asserts the
+/// shared invariant: no file names A any more, B is confirmed, and a
+/// re-run over the result is a no-op.
+#[cfg(test)]
+mod owned_pin_generation_matrix {
+    use super::*;
+
+    const A: &str = "aaaaaaaa-0000-4000-8000-00000000000a";
+    const B: &str = "bbbbbbbb-0000-4000-8000-00000000000b";
+
+    fn plan(
+        files: &BTreeMap<String, String>,
+        dep: &DepOverride,
+    ) -> (BTreeMap<String, String>, RewriteResult) {
+        let result = rewrite_registry_redirect(files, std::slice::from_ref(dep));
+        let mut out = files.clone();
+        out.extend(result.files.clone());
+        (out, result)
+    }
+
+    /// Pin `first`, re-pin `second`, and check the generation invariant.
+    /// `gone` is the text only the first generation's wiring carried.
+    fn supersede(
+        files: BTreeMap<String, String>,
+        first: &DepOverride,
+        second: &DepOverride,
+        gone: &str,
+    ) -> (BTreeMap<String, String>, RewriteResult) {
+        let (wired, result) = plan(&files, first);
+        assert!(
+            result.warnings.is_empty(),
+            "first pin: {:?}",
+            result.warnings
+        );
+        assert!(
+            wired.values().any(|t| t.contains(gone)),
+            "fixture: the first generation must be wired"
+        );
+        let (repinned, result) = plan(&wired, second);
+        assert!(result.warnings.is_empty(), "re-pin: {:?}", result.warnings);
+        for (path, text) in &repinned {
+            assert!(
+                !text.contains(gone),
+                "{path} kept the superseded generation `{gone}`:\n{text}"
+            );
+        }
+        let (_, again) = plan(&repinned, second);
+        assert!(
+            again.files.is_empty() && again.warnings.is_empty(),
+            "the re-pinned project must be settled: {:?} {:?}",
+            again.files.keys(),
+            again.warnings
+        );
+        (repinned, result)
+    }
+
+    fn cargo(uuid: &str) -> DepOverride {
+        DepOverride {
+            ecosystem: "cargo".into(),
+            name: "cfg-if".into(),
+            namespace: None,
+            version: "1.0.4".into(),
+            token: "tok".into(),
+            patch_uuid: uuid.into(),
+            artifact_url: format!("https://patch.test/{uuid}/cfg-if-1.0.4.crate"),
+            registry_override: Some(RegistryOverride {
+                kind: "cargo-sparse".into(),
+                index_url: format!("sparse+https://patch.test/cargo/tok-{uuid}/{uuid}/index/"),
+                identifiers: RegistryOverrideIdentifiers {
+                    name: "cfg-if".into(),
+                    version: "1.0.4".into(),
+                    cargo_cksum_sha256: Some(uuid[..1].repeat(64)),
+                    ..Default::default()
+                },
+            }),
+            integrity: Integrity::default(),
+        }
+    }
+
+    fn cargo_project(config: Option<&str>) -> BTreeMap<String, String> {
+        let mut files = BTreeMap::from([
+            (
+                "Cargo.toml".to_string(),
+                "[package]\nname = \"app\"\nversion = \"0.1.0\"\nedition = \"2021\"\n\n\
+                 [dependencies]\ncfg-if = \"1.0.4\"\n"
+                    .to_string(),
+            ),
+            (
+                "Cargo.lock".to_string(),
+                "version = 3\n\n[[package]]\nname = \"app\"\nversion = \"0.1.0\"\n\
+                 dependencies = [\n \"cfg-if\",\n]\n\n[[package]]\nname = \"cfg-if\"\n\
+                 version = \"1.0.4\"\nsource = \"registry+https://github.com/rust-lang/crates.io-index\"\n\
+                 checksum = \"0000000000000000000000000000000000000000000000000000000000000000\"\n"
+                    .to_string(),
+            ),
+        ]);
+        if let Some((key, text)) = config.map(|c| (".cargo/config", c)) {
+            files.insert(key.to_string(), text.to_string());
+        }
+        files
+    }
+
+    /// #864: the re-pin drops the old `[registries.socket-patch-A]` block,
+    /// with no prior config (the file holds only B's block afterwards) and
+    /// with a legacy `.cargo/config` the user owns (its bytes survive).
+    #[test]
+    fn cargo_repin_drops_the_superseded_registry_block() {
+        let (repinned, result) = supersede(cargo_project(None), &cargo(A), &cargo(B), A);
+        assert!(result.confirmed_cargo_uuids.contains(B));
+        assert_eq!(
+            repinned[".cargo/config.toml"],
+            format!(
+                "[registries.socket-patch-{B}]\nindex = \"sparse+https://patch.test/cargo/tok-{B}/{B}/index/\"\n"
+            )
+        );
+
+        let user = "[net]\nretry = 2\n";
+        let (repinned, _) = supersede(cargo_project(Some(user)), &cargo(A), &cargo(B), A);
+        let config = &repinned[".cargo/config"];
+        assert!(config.starts_with(user), "{config}");
+        assert!(config.contains(&format!("[registries.socket-patch-{B}]")));
+        assert!(!repinned.contains_key(".cargo/config.toml"));
+    }
+
+    fn h1(c: char) -> String {
+        format!("h1:{}=", c.to_string().repeat(43))
+    }
+
+    fn golang(uuid: &str, version: &str, c: char) -> DepOverride {
+        let module = format!("patch.socket.dev/gopatch/{uuid}");
+        DepOverride {
+            ecosystem: "golang".into(),
+            name: "example.com/up".into(),
+            namespace: None,
+            version: "v1.0.0".into(),
+            token: String::new(),
+            patch_uuid: uuid.into(),
+            artifact_url: format!(
+                "https://patch.socket.dev/patch-registry/golang/{module}/@v/{version}.zip"
+            ),
+            registry_override: Some(RegistryOverride {
+                kind: "goproxy".into(),
+                index_url: "https://patch.socket.dev/patch-registry/golang".into(),
+                identifiers: RegistryOverrideIdentifiers {
+                    name: "example.com/up".into(),
+                    version: "v1.0.0".into(),
+                    go_module_path: Some(module),
+                    go_module_version: Some(version.into()),
+                    ..Default::default()
+                },
+            }),
+            integrity: Integrity {
+                dirhash_h1: Some(h1(c)),
+                go_mod_h1: Some(h1('G')),
+                ..Default::default()
+            },
+        }
+    }
+
+    fn go_project() -> BTreeMap<String, String> {
+        BTreeMap::from([
+            (
+                "go.mod".to_string(),
+                "module example.com/app\n\ngo 1.21\n\nrequire example.com/up v1.0.0\n".to_string(),
+            ),
+            (
+                "go.sum".to_string(),
+                format!(
+                    "example.com/up v1.0.0 {}\nexample.com/up v1.0.0/go.mod {}\n",
+                    h1('U'),
+                    h1('M')
+                ),
+            ),
+        ])
+    }
+
+    /// #682: a re-pin to a superseding uuid, and the same uuid republished
+    /// at a new version, both drop the previous target's go.sum pair, so
+    /// go.sum is left exactly as `go mod tidy` would leave it.
+    #[test]
+    fn golang_repin_drops_the_superseded_gosum_pair() {
+        let first = golang(A, "v1.0.0-socketpatch.1", 'A');
+        let (repinned, result) = supersede(
+            go_project(),
+            &first,
+            &golang(B, "v1.0.0-socketpatch.2", 'B'),
+            A,
+        );
+        assert!(result.confirmed_golang_uuids.contains(B));
+        let module_b = format!("patch.socket.dev/gopatch/{B}");
+        assert_eq!(
+            repinned["go.sum"],
+            format!(
+                "{module_b} v1.0.0-socketpatch.2 {}\n{module_b} v1.0.0-socketpatch.2/go.mod {}\n",
+                h1('B'),
+                h1('G')
+            )
+        );
+        assert!(result
+            .edits
+            .iter()
+            .any(|e| e.kind == "redirect_golang_superseded_gosum_removed"));
+
+        // Same uuid, republished: the `.1` lines go, the `.2` lines stay.
+        let (repinned, _) = supersede(
+            go_project(),
+            &first,
+            &golang(A, "v1.0.0-socketpatch.2", 'B'),
+            "socketpatch.1",
+        );
+        assert_eq!(
+            repinned["go.sum"].lines().count(),
+            2,
+            "{}",
+            repinned["go.sum"]
+        );
+    }
+
+    fn maven(uuid: &str, token: &str) -> DepOverride {
+        DepOverride {
+            ecosystem: "maven".into(),
+            name: "commons-lang3".into(),
+            namespace: Some("org.apache.commons".into()),
+            version: "3.12.0".into(),
+            token: token.into(),
+            patch_uuid: uuid.into(),
+            artifact_url: format!(
+                "https://patch.socket.dev/patch/maven/org.apache.commons/commons-lang3/3.12.0/{token}/{uuid}/commons-lang3-3.12.0.jar"
+            ),
+            registry_override: Some(RegistryOverride {
+                kind: "maven2".into(),
+                index_url: format!("https://patch.socket.dev/patch-registry/maven/{token}/{uuid}/maven2"),
+                identifiers: RegistryOverrideIdentifiers {
+                    name: "org.apache.commons/commons-lang3".into(),
+                    version: "3.12.0".into(),
+                    maven_group_id: Some("org.apache.commons".into()),
+                    maven_artifact_id: Some("commons-lang3".into()),
+                    maven_suffixed_version: Some(format!("3.12.0-socket.{}", &uuid[..8])),
+                    maven_pom_sha256: Some(uuid[..1].repeat(64)),
+                    ..Default::default()
+                },
+            }),
+            integrity: Integrity {
+                sha256: Some(uuid[..1].repeat(64)),
+                ..Default::default()
+            },
+        }
+    }
+
+    fn pom_project() -> BTreeMap<String, String> {
+        BTreeMap::from([(
+            "pom.xml".to_string(),
+            "<?xml version=\"1.0\" encoding=\"UTF-8\"?>\n<project>\n  <modelVersion>4.0.0</modelVersion>\n  \
+             <groupId>dev.socket.test</groupId>\n  <artifactId>consumer</artifactId>\n  <version>1.0.0</version>\n  \
+             <dependencies>\n    <dependency>\n      <groupId>org.apache.commons</groupId>\n      \
+             <artifactId>commons-lang3</artifactId>\n      <version>3.12.0</version>\n    </dependency>\n  \
+             </dependencies>\n</project>\n"
+                .to_string(),
+        )])
+    }
+
+    /// #266: a superseding uuid re-pins the `-socket.<A>` literal to B's
+    /// suffix and replaces A's repository and trusted checksums.
+    #[test]
+    fn maven_repin_moves_the_suffix_and_drops_the_superseded_repository() {
+        let tok = "22222222-3333-4444-8555-666666666666";
+        let (repinned, result) = supersede(pom_project(), &maven(A, tok), &maven(B, tok), A);
+        let pom = &repinned["pom.xml"];
+        assert!(
+            pom.contains("<version>3.12.0-socket.bbbbbbbb</version>"),
+            "{pom}"
+        );
+        assert!(!pom.contains("socket.aaaaaaaa"), "{pom}");
+        assert_eq!(pom.matches("<repository>").count(), 1, "{pom}");
+        assert!(!result
+            .warnings
+            .iter()
+            .any(|w| w.code == "redirect_maven_dep_version_mismatch"));
+        let checksums = &repinned[MVN_CHECKSUMS];
+        assert!(!checksums.contains("aaaaaaaa"), "{checksums}");
+        assert_eq!(checksums.lines().count(), 2, "{checksums}");
+    }
+
+    /// Another artifact's live pin whose uuid shares the superseded
+    /// generation's eight hex digits keeps its repository: the re-pin of
+    /// `commons-lang3` must not strand `commons-text`'s `-socket.<hex8>`.
+    #[test]
+    fn maven_repin_keeps_a_live_pin_sharing_the_hex8() {
+        let tok = "22222222-3333-4444-8555-666666666666";
+        let twin = "aaaaaaaa-1111-4000-8000-00000000001a";
+        let mut text = maven(twin, tok);
+        let to_text = |s: &str| {
+            s.replace("commons-lang3", "commons-text")
+                .replace("3.12.0", "1.10.0")
+        };
+        text.name = "commons-text".into();
+        text.version = "1.10.0".into();
+        text.artifact_url = to_text(&text.artifact_url);
+        let ro = text.registry_override.as_mut().unwrap();
+        ro.identifiers.name = to_text(&ro.identifiers.name);
+        ro.identifiers.version = "1.10.0".into();
+        ro.identifiers.maven_artifact_id = Some("commons-text".into());
+        ro.identifiers.maven_suffixed_version = Some("1.10.0-socket.aaaaaaaa".into());
+
+        let mut files = pom_project();
+        let pom = files["pom.xml"].replace(
+            "  </dependencies>\n",
+            "    <dependency>\n      <groupId>org.apache.commons</groupId>\n      \
+             <artifactId>commons-text</artifactId>\n      <version>1.10.0</version>\n    \
+             </dependency>\n  </dependencies>\n",
+        );
+        files.insert("pom.xml".into(), pom);
+        let (wired, _) = plan(&files, &text);
+        let (wired, _) = plan(&wired, &maven(A, tok));
+        let wired_pom = &wired["pom.xml"];
+        assert!(
+            wired_pom.contains(&format!("<id>socket-patch-{twin}</id>")),
+            "{wired_pom}"
+        );
+        assert!(
+            wired_pom.contains(&format!("<id>socket-patch-{A}</id>")),
+            "{wired_pom}"
+        );
+
+        let (repinned, _) = plan(&wired, &maven(B, tok));
+        let pom = &repinned["pom.xml"];
+        assert!(
+            pom.contains("<version>3.12.0-socket.bbbbbbbb</version>"),
+            "{pom}"
+        );
+        assert!(
+            pom.contains("<version>1.10.0-socket.aaaaaaaa</version>"),
+            "{pom}"
+        );
+        assert!(
+            pom.contains(&format!("<id>socket-patch-{twin}</id>")),
+            "the live twin pin lost its repository:\n{pom}"
+        );
+        // The superseded generation's own trusted checksums are keyed by its
+        // GAV, so they go even though the hex8-sharing repository stays.
+        let checksums = &repinned[MVN_CHECKSUMS];
+        assert!(!checksums.contains("3.12.0-socket.aaaaaaaa"), "{checksums}");
+        assert!(checksums.contains("3.12.0-socket.bbbbbbbb"), "{checksums}");
+        assert!(checksums.contains("1.10.0-socket.aaaaaaaa"), "{checksums}");
+    }
+
+    /// A `-socket.<hex8>` literal that no hosted `socket-patch-<uuid>`
+    /// repository minted (a vendored reactor / sbt pin, served from a
+    /// `socket-patch-vendor-<uuid>` repository) is not an earlier hosted
+    /// generation: the mismatch is reported and the pom left untouched.
+    #[test]
+    fn maven_vendored_suffix_literal_is_not_a_prior_generation() {
+        let pom = pom_project()["pom.xml"].replace(
+            "<version>3.12.0</version>",
+            "<version>3.12.0-socket.aaaaaaaa</version>",
+        );
+        let pom = pom.replace(
+            "</dependencies>\n",
+            &format!(
+                "</dependencies>\n  <repositories>\n    <repository>\n      \
+                 <id>socket-patch-vendor-{A}</id>\n      \
+                 <url>file://${{project.basedir}}/.socket/vendor/maven/repo</url>\n    \
+                 </repository>\n  </repositories>\n"
+            ),
+        );
+        let files = BTreeMap::from([("pom.xml".to_string(), pom)]);
+        let tok = "22222222-3333-4444-8555-666666666666";
+        let (_, result) = plan(&files, &maven(B, tok));
+        assert!(
+            result
+                .warnings
+                .iter()
+                .any(|w| w.code == "redirect_maven_dep_version_mismatch"),
+            "{:?}",
+            result.warnings
+        );
+        assert!(
+            !result.files.contains_key("pom.xml"),
+            "{:?}",
+            result.files.get("pom.xml")
+        );
+    }
+
+    /// A CRLF trusted-checksums file drops the superseded generation's
+    /// entries like an LF one, and the re-pinned project is settled.
+    #[test]
+    fn maven_repin_drops_superseded_checksums_from_a_crlf_file() {
+        let tok = "22222222-3333-4444-8555-666666666666";
+        let (mut wired, _) = plan(&pom_project(), &maven(A, tok));
+        let crlf = wired[MVN_CHECKSUMS].replace('\n', "\r\n");
+        wired.insert(MVN_CHECKSUMS.to_string(), crlf);
+        let (repinned, _) = plan(&wired, &maven(B, tok));
+        let checksums = &repinned[MVN_CHECKSUMS];
+        assert!(!checksums.contains("aaaaaaaa"), "{checksums}");
+        let (_, again) = plan(&repinned, &maven(B, tok));
+        assert!(again.files.is_empty(), "{:?}", again.files.keys());
+    }
+
+    /// #266: a rotated grant token (same uuid, new token path segment)
+    /// refreshes the repository URL in place.
+    #[test]
+    fn maven_rotated_grant_token_refreshes_the_repository_url() {
+        let old = "22222222-3333-4444-8555-666666666666";
+        let new = "77777777-3333-4444-8555-666666666666";
+        let (wired, _) = plan(&pom_project(), &maven(A, old));
+        let (rotated, result) = plan(&wired, &maven(A, new));
+        assert!(result.warnings.is_empty(), "{:?}", result.warnings);
+        let pom = &rotated["pom.xml"];
+        assert!(!pom.contains(old), "{pom}");
+        assert!(
+            pom.contains(&format!("/maven/{new}/{A}/maven2</url>")),
+            "{pom}"
+        );
+        let (_, again) = plan(&rotated, &maven(A, new));
+        assert!(again.files.is_empty(), "{:?}", again.files.keys());
     }
 }

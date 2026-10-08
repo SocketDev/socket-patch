@@ -61,9 +61,6 @@ const CARGO_VENDOR_DIR: &str = ".socket/vendor/cargo";
 pub(crate) const CONFIG_LEGACY: &str = ".cargo/config";
 /// The project config cargo reads when [`CONFIG_LEGACY`] does not exist.
 pub(crate) const CONFIG_TOML: &str = ".cargo/config.toml";
-/// The prefix every Socket-owned registry name carries
-/// (`socket-patch-<uuid>`, as the hosted rewriter defines and pins it).
-pub(crate) const SOCKET_REGISTRY_PREFIX: &str = "socket-patch-";
 
 /// Info about one `[patch.crates-io]` entry, for vendor pre-flight / verify.
 #[derive(Debug, Clone)]
@@ -272,7 +269,7 @@ pub(crate) fn registry_definitions(doc: &DocumentMut) -> Vec<(String, String)> {
     };
     registries
         .iter()
-        .filter(|(name, _)| name.starts_with(SOCKET_REGISTRY_PREFIX))
+        .filter(|(name, _)| name.starts_with(crate::patch::redirect::generation::PIN_NAME_PREFIX))
         .filter_map(|(name, item)| {
             let index = item.as_table_like()?.get("index")?.as_str()?;
             Some((name.to_string(), index.to_string()))
