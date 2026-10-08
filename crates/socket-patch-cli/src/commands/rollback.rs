@@ -692,19 +692,12 @@ fn missing_blob_abort_results(
 }
 
 /// Legacy top-level error emission (the pre-envelope rollback shape):
-/// `{status: "error", error}` on `--json`, an `Error:` stderr line
-/// otherwise. Errors print even under --silent ("errors only", never
-/// "nothing").
-fn emit_rollback_error(json: bool, msg: &str) {
+/// `{status: "error", error: {code, message}}` on `--json`, an `Error:`
+/// stderr line otherwise. Errors print even under --silent ("errors only",
+/// never "nothing").
+fn emit_rollback_error(json: bool, code: &str, msg: &str) {
     if json {
-        println!(
-            "{}",
-            serde_json::to_string_pretty(&serde_json::json!({
-                "status": "error",
-                "error": msg,
-            }))
-            .expect("serializing an in-memory JSON value cannot fail")
-        );
+        crate::json_envelope::print_legacy_error(code, msg);
     } else {
         eprintln!("Error: {}", crate::ui::sentence_case(msg));
     }
@@ -856,13 +849,25 @@ pub async fn run(args: RollbackArgs) -> i32 {
         }
     }
 
-    // An unparseable glob is a usage error — same exit-2 stderr shape as
-    // scan's self-enforced mode conflicts.
+    // An unparseable glob is a usage error — same exit-2 shape as scan's
+    // self-enforced usage errors.
     let path_scope = match crate::path_scope::PathScope::parse(&path_patterns) {
         Ok(s) => s,
         Err(e) => {
-            eprintln!("Error: {}", crate::ui::sentence_case(&e.to_string()));
-            return 2;
+            // Like emit_rollback_error: JSON keeps the verbatim message,
+            // only the human stderr line is sentence-cased.
+            let message = if args.common.json {
+                e.to_string()
+            } else {
+                crate::ui::sentence_case(&e.to_string())
+            };
+            return crate::json_envelope::usage_error(
+                crate::json_envelope::Command::Rollback,
+                args.common.json,
+                args.common.dry_run,
+                "path_glob_invalid",
+                &message,
+            );
         }
     };
 
@@ -910,7 +915,7 @@ pub async fn run(args: RollbackArgs) -> i32 {
         // Hosted wiring the lockfiles name but cannot attribute is still
         // hosted state: refuse, naming it, instead of "Manifest not found".
         if let Some(refusal) = hosted_inventory.contested_refusal() {
-            emit_rollback_error(args.common.json, &refusal);
+            emit_rollback_error(args.common.json, "hosted_wiring_contested", &refusal);
             return 1;
         }
         // Only a pre-v5 hosted ledger left: no lockfile pins it any more,
@@ -965,6 +970,7 @@ pub async fn run(args: RollbackArgs) -> i32 {
         if !wired.is_empty() {
             emit_rollback_error(
                 args.common.json,
+                "vendor_ledger_missing",
                 "lockfiles still reference .socket/vendor/ artifacts but the vendor ledger \
                  is missing — restore .socket/vendor/state.json from version control, then \
                  roll back (or restore the lockfiles with `git checkout -- <lockfile>`)",
@@ -976,7 +982,10 @@ pub async fn run(args: RollbackArgs) -> i32 {
                 "{}",
                 serde_json::to_string_pretty(&serde_json::json!({
                     "status": "error",
-                    "error": "Manifest not found",
+                    "error": {
+                        "code": "manifest_not_found",
+                        "message": "Manifest not found",
+                    },
                     "path": manifest_path.display().to_string(),
                 }))
                 .expect("serializing an in-memory JSON value cannot fail")
@@ -1044,13 +1053,13 @@ pub async fn run(args: RollbackArgs) -> i32 {
                     org_slug.as_deref(),
                 )
                 .await;
-                emit_rollback_error(args.common.json, "Invalid manifest");
+                emit_rollback_error(args.common.json, "manifest_invalid", "Invalid manifest");
                 return 1;
             }
             Err(e) => {
                 let msg = e.to_string();
                 track_patch_rollback_failed(&msg, api_token.as_deref(), org_slug.as_deref()).await;
-                emit_rollback_error(args.common.json, &msg);
+                emit_rollback_error(args.common.json, "manifest_unreadable", &msg);
                 return 1;
             }
         }
@@ -1140,7 +1149,7 @@ pub async fn run(args: RollbackArgs) -> i32 {
         hosted_scope.extend(pins.into_iter().map(|pin| pin.purl));
         if let Some(msg) = ambiguity {
             track_patch_rollback_failed(&msg, api_token.as_deref(), org_slug.as_deref()).await;
-            emit_rollback_error(args.common.json, &msg);
+            emit_rollback_error(args.common.json, "ambiguous_target", &msg);
             return 1;
         }
         if !matched {
@@ -1156,7 +1165,7 @@ pub async fn run(args: RollbackArgs) -> i32 {
                     "{}",
                     serde_json::to_string_pretty(&serde_json::json!({
                         "status": "error",
-                        "error": msg,
+                        "error": { "code": "patch_not_found", "message": msg },
                         "rolledBack": 0,
                         "alreadyOriginal": 0,
                         "failed": 0,
@@ -1230,7 +1239,7 @@ pub async fn run(args: RollbackArgs) -> i32 {
                 unmatched.1
             );
             track_patch_rollback_failed(&msg, api_token.as_deref(), org_slug.as_deref()).await;
-            emit_rollback_error(args.common.json, &msg);
+            emit_rollback_error(args.common.json, "path_glob_no_match", &msg);
             return 1;
         }
         for purl in &path_selected {
@@ -1879,7 +1888,7 @@ pub async fn run(args: RollbackArgs) -> i32 {
                     "{}",
                     serde_json::to_string_pretty(&serde_json::json!({
                         "status": "error",
-                        "error": e,
+                        "error": { "code": "rollback_failed", "message": e },
                         "rolledBack": 0,
                         "alreadyOriginal": 0,
                         "failed": 0,
@@ -2542,10 +2551,29 @@ pub(crate) async fn rollback_patches_inner(
             continue;
         }
         let files = target.files.as_ref().unwrap_or(&patch.files);
+        let mut result = result;
         if let Some(warning) = superseded_record_skip(target, &result, files, superseded).await {
-            warnings.push(warning);
-            superseded_left.push(purl.clone());
-            continue;
+            // The superseded primary never reached its store copies; one
+            // still at this record's patched bytes (Bun's orphaned
+            // isolated-store entry, #1084) is restored here, or fails the
+            // run and keeps the record, before the record is dropped.
+            match socket_patch_core::patch::rollback::rollback_store_copies_holding_patch(
+                purl,
+                pkg_path,
+                files,
+                &blobs_path,
+                common.dry_run,
+            )
+            .await
+            {
+                Some(copies) if !copies.success => result = copies,
+                restored => {
+                    warnings.push(warning);
+                    superseded_left.push(purl.clone());
+                    results.extend(restored);
+                    continue;
+                }
+            }
         }
         if !result.success {
             has_errors = true;

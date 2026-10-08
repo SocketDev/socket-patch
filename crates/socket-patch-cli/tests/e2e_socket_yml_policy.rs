@@ -652,8 +652,8 @@ async fn invalid_file_fails_closed_before_any_request_or_write() {
     let (code, doc) = scan_json(&repo.dir("services/web"), &server.uri(), &[], &[]);
     assert_eq!(code, 1);
     assert_eq!(doc["status"], "error");
-    assert_eq!(doc["errorCode"], "socket_yml_invalid");
-    let message = doc["error"].as_str().unwrap();
+    assert_eq!(doc["error"]["code"], "socket_yml_invalid");
+    let message = doc["error"]["message"].as_str().unwrap();
     assert!(message.contains("patches.minSeverty"), "{message}");
     assert!(message.contains("did you mean `minSeverity`"), "{message}");
     assert!(message.contains("--no-socket-yml"), "{message}");
@@ -701,7 +701,7 @@ async fn both_files_disagreeing_is_ambiguous() {
     .unwrap();
     let (code, doc) = scan_json(&repo.dir("services/web"), &server.uri(), &[], &[]);
     assert_eq!(code, 1);
-    assert_eq!(doc["errorCode"], "socket_yml_ambiguous");
+    assert_eq!(doc["error"]["code"], "socket_yml_ambiguous");
 }
 
 #[tokio::test]
@@ -870,7 +870,7 @@ async fn report_only_json_fails_when_every_detail_query_fails() {
     assert_eq!(code, 1, "{doc:#}");
     assert_eq!(doc["status"], "error", "{doc:#}");
     assert!(
-        doc["error"]
+        doc["error"]["message"]
             .as_str()
             .unwrap_or_default()
             .contains("patch-detail queries failed"),

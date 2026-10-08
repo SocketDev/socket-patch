@@ -315,15 +315,14 @@ pub async fn run(args: VexArgs) -> i32 {
     if args.common.json && output.is_none() {
         // A usage error, not a generation failure: no telemetry POST and no
         // config read (argument errors never report), just the envelope.
-        emit_envelope_error(
-            &args,
+        return crate::json_envelope::usage_error(
+            Command::Vex,
+            args.common.json,
+            args.common.dry_run,
             "json_requires_output",
             "--json requires --output (the VEX document is itself JSON; \
              route it to a file so the envelope can use stdout)",
-            &[],
-            &[],
         );
-        return 2;
     }
 
     // `-o` is `--org`, `-O` is `--output`: a file-shaped org slug is almost

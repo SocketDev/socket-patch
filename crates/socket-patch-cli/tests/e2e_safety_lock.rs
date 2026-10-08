@@ -449,3 +449,148 @@ fn lock_timeout_waits_then_reports_held() {
 fn _compile_witness() -> Duration {
     Duration::from_secs(0)
 }
+
+/// An interrupted holder removes `apply.lock` on its way out (#808). The
+/// binary is parked by the debug-only `apply_lock.acquired~pause`
+/// failpoint with the lock held, then signalled. It must die by that
+/// signal (the exit status a shell reports is unchanged) and leave no lock
+/// file, while the manifest, real state, survives.
+#[cfg(unix)]
+mod interrupted_holder {
+    use std::os::unix::process::{CommandExt, ExitStatusExt};
+    use std::path::Path;
+    use std::process::{Child, Stdio};
+    use std::time::{Duration, Instant};
+
+    use super::common::{binary, hermetic_command, jvm_env};
+    use super::setup_socket_dir;
+
+    /// Spawn `apply` in `root` and wait until it holds the lock. With
+    /// `ignore_sigint`, the child starts with SIGINT ignored, as under
+    /// `nohup` or a launcher that ignores Ctrl-C.
+    fn spawn_holding_lock(root: &Path, ignore_sigint: bool) -> Child {
+        spawn_parked_at(root, "apply_lock.acquired", ignore_sigint)
+    }
+
+    /// Spawn `apply` in `root` and wait until it parks at `failpoint`.
+    fn spawn_parked_at(root: &Path, failpoint: &str, ignore_sigint: bool) -> Child {
+        let ready = root.join("failpoint-ready");
+        let mut cmd = hermetic_command(&binary());
+        jvm_env::isolate_cli(&mut cmd);
+        cmd.args(["apply", "--json"])
+            .current_dir(root)
+            .env("SOCKET_PATCH_FAILPOINT", format!("{failpoint}~pause"))
+            .env("SOCKET_PATCH_FAILPOINT_READY", &ready)
+            .stdin(Stdio::null())
+            .stdout(Stdio::null())
+            .stderr(Stdio::null());
+        if ignore_sigint {
+            // SAFETY: only an async-signal-safe `signal` call between fork
+            // and exec.
+            unsafe {
+                cmd.pre_exec(|| {
+                    libc::signal(libc::SIGINT, libc::SIG_IGN);
+                    Ok(())
+                });
+            }
+        }
+        let mut child = cmd.spawn().expect("spawn socket-patch apply");
+        let deadline = Instant::now() + Duration::from_secs(60);
+        while !ready.exists() {
+            if let Some(status) = child.try_wait().unwrap() {
+                panic!("apply exited ({status}) before reaching the lock failpoint");
+            }
+            assert!(
+                Instant::now() < deadline,
+                "apply never reached the lock failpoint"
+            );
+            std::thread::sleep(Duration::from_millis(20));
+        }
+        child
+    }
+
+    fn signal(child: &Child, sig: libc::c_int) {
+        // SAFETY: plain kill(2) on our own child's pid.
+        let rc = unsafe { libc::kill(child.id() as libc::pid_t, sig) };
+        assert_eq!(rc, 0, "kill({sig}) failed");
+    }
+
+    fn assert_interrupt_cleans_up(sig: libc::c_int) {
+        assert_interrupt_at_cleans_up("apply_lock.acquired", sig);
+    }
+
+    fn assert_interrupt_at_cleans_up(failpoint: &str, sig: libc::c_int) {
+        let dir = tempfile::tempdir().unwrap();
+        let socket_dir = dir.path().join(".socket");
+        setup_socket_dir(&socket_dir);
+        let lock = socket_dir.join("apply.lock");
+
+        let mut child = spawn_parked_at(dir.path(), failpoint, false);
+        assert!(lock.is_file(), "the parked apply holds apply.lock");
+
+        signal(&child, sig);
+        let status = child.wait().unwrap();
+        assert_eq!(
+            status.signal(),
+            Some(sig),
+            "the process must still die by the signal; got {status}"
+        );
+        assert!(
+            !lock.exists(),
+            "an interrupted run must not leave apply.lock behind (signal {sig})"
+        );
+        assert!(
+            socket_dir.join("manifest.json").is_file(),
+            "real .socket/ state survives the interrupt"
+        );
+    }
+
+    #[test]
+    fn sigint_removes_the_lock_file() {
+        assert_interrupt_cleans_up(libc::SIGINT);
+    }
+
+    #[test]
+    fn sigterm_removes_the_lock_file() {
+        assert_interrupt_cleans_up(libc::SIGTERM);
+    }
+
+    #[test]
+    fn sighup_removes_the_lock_file() {
+        assert_interrupt_cleans_up(libc::SIGHUP);
+    }
+
+    /// An interrupt that lands while the guard's drop is already under
+    /// way — before the drop's own unlink — still removes the file: the
+    /// handler ends the process without resuming the drop, so the guard
+    /// must stay in the interrupt table until the drop has unlinked it.
+    #[test]
+    fn interrupt_during_release_removes_the_lock_file() {
+        assert_interrupt_at_cleans_up("apply_lock.releasing", libc::SIGTERM);
+    }
+
+    /// A process started with SIGINT ignored keeps ignoring it (no handler
+    /// is installed over SIG_IGN), and SIGTERM still cleans up.
+    #[test]
+    fn ignored_sigint_stays_ignored_and_sigterm_still_cleans_up() {
+        let dir = tempfile::tempdir().unwrap();
+        let socket_dir = dir.path().join(".socket");
+        setup_socket_dir(&socket_dir);
+        let lock = socket_dir.join("apply.lock");
+
+        let mut child = spawn_holding_lock(dir.path(), true);
+        signal(&child, libc::SIGINT);
+        std::thread::sleep(Duration::from_millis(300));
+        assert!(
+            child.try_wait().unwrap().is_none(),
+            "an ignored SIGINT must not end the run"
+        );
+        assert!(lock.is_file(), "and must not touch the held lock");
+
+        signal(&child, libc::SIGTERM);
+        let status = child.wait().unwrap();
+        assert_eq!(status.signal(), Some(libc::SIGTERM), "got {status}");
+        assert!(!lock.exists(), "SIGTERM removes apply.lock");
+        assert!(socket_dir.join("manifest.json").is_file());
+    }
+}

@@ -976,6 +976,12 @@ async fn gem_hosted_global_gemfile_setting_is_refused() {
     let proj = tmp.path().join("proj");
     std::fs::create_dir_all(&proj).unwrap();
     write_manifest_pair(&proj);
+    // The refused lock contributes no packages, so the scan only reaches
+    // the redirect (and its refusal) through an installed copy of the gem.
+    // Lay one down in the project rather than leaning on whatever `gem env`
+    // reports for the host: on Windows that probe can outlive its 10s
+    // budget, the scan then finds nothing, and the refusal never runs.
+    materialize_installed_gem(&proj, "3.3.0", UPSTREAM_LIB);
     std::fs::write(
         proj.join("Gemfile.next"),
         format!("source \"https://rubygems.org\"\ngem \"{DEP}\", \"{DEP_VERSION}\"\n"),

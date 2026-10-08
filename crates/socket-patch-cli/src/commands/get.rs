@@ -43,6 +43,7 @@ use crate::commands::vlt_preflight::{
     vlt_refusal_for, vlt_vendor_preflight_selected, VltVendorRefusal,
 };
 use crate::ecosystem_dispatch::{crawl_ecosystems, find_packages_for_rollback, partition_purls};
+use crate::json_envelope::{usage_error, Command as JsonCommand};
 use crate::ui::{print_json, select_one, SelectError};
 
 /// Best-effort ecosystem extractor for a `pkg:<eco>/...` PURL. Used as
@@ -82,7 +83,7 @@ async fn report_fetch_failure(
 ) -> i32 {
     let msg = error.to_string();
     track_patch_fetch_failed(identifier, &msg, fallback_to_proxy, api_token, org_slug).await;
-    report_error(json, msg);
+    report_error(json, "patch_fetch_failed", msg);
     1
 }
 
@@ -615,6 +616,11 @@ fn format_single_save(
 /// `--ghsa`, so a typo fails fast with a readable message instead of a raw
 /// API 400 body. `None` when it is well-formed (or the type is not
 /// shape-checked).
+///
+/// The message never echoes the argument: it reaches stderr, and CodeQL
+/// treats anything that may be a patch uuid as sensitive
+/// (rust/cleartext-logging). The user typed it, so naming the expected
+/// form is enough.
 fn forced_identifier_error(target: &Target) -> Option<String> {
     if target.shape_ok() {
         return None;
@@ -626,7 +632,7 @@ fn forced_identifier_error(target: &Target) -> Option<String> {
         TargetKind::Purl | TargetKind::Name => return None,
     };
     Some(format!(
-        "\"{target}\" is not a valid {what} (expected {form})"
+        "The identifier is not a valid {what} (expected {form})"
     ))
 }
 
@@ -726,7 +732,10 @@ pub(crate) fn select_patches(
                         .collect();
                     print_json(&serde_json::json!({
                         "status": "selection_required",
-                        "error": format!("Multiple patches available for {purl}. Re-run with the chosen UUID as the identifier (`socket-patch get <uuid>`) to select one."),
+                        "error": {
+                            "code": "selection_required",
+                            "message": format!("Multiple patches available for {purl}. Re-run with the chosen UUID as the identifier (`socket-patch get <uuid>`) to select one."),
+                        },
                         "purl": purl,
                         "options": options_json,
                     }));
@@ -1000,11 +1009,13 @@ pub async fn run(args: GetArgs) -> i32 {
         .filter(|&&f| f)
         .count();
     if type_flags > 1 {
-        report_error(
+        return usage_error(
+            JsonCommand::Get,
             args.common.json,
+            args.common.dry_run,
+            "invalid_args",
             "Only one of --id, --cve, --ghsa, or --package can be specified",
         );
-        return 2;
     }
     // v5: hosted by default, like scan. `--save-only` (records a manifest
     // entry) and global installs (no project lockfile) mean agent mode.
@@ -1019,20 +1030,27 @@ pub async fn run(args: GetArgs) -> i32 {
     // Global installs have no project lockfile: an explicit hosted or
     // vendored mode would rewire the cwd project, not the global copy.
     if let Some(conflict) = super::global_mode_conflict(&args.common, mode) {
-        report_error(args.common.json, conflict);
-        return 2;
+        return usage_error(
+            JsonCommand::Get,
+            args.common.json,
+            args.common.dry_run,
+            "global_scope_unsupported",
+            &conflict,
+        );
     }
     if args.save_only && mode != super::scan::ScanMode::Agent {
-        report_error(
+        return usage_error(
+            JsonCommand::Get,
             args.common.json,
-            format!(
+            args.common.dry_run,
+            "invalid_args",
+            &format!(
                 "--save-only cannot be used with --mode {}: hosted mode never writes the \
                  manifest, and vendored mode's vendor step IS the persistence (plain \
                  `get --save-only` already records without applying)",
                 mode.cli_name()
             ),
         );
-        return 2;
     }
     // Strict airgap (CLI_CONTRACT.md `--offline`: never contact the
     // network; operations that need remote data fail loudly). Every `get`
@@ -1043,6 +1061,7 @@ pub async fn run(args: GetArgs) -> i32 {
     if args.common.offline {
         report_error(
             args.common.json,
+            "offline_unsupported",
             "Fetching patches needs network access, so `get` cannot run with \
              --offline/SOCKET_OFFLINE (strict airgap)",
         );
@@ -1068,8 +1087,13 @@ pub async fn run(args: GetArgs) -> i32 {
     // a typo reads as a plain message instead of a raw API 400 body.
     if args.id || args.cve || args.ghsa {
         if let Some(err) = forced_identifier_error(&target) {
-            report_error(args.common.json, err);
-            return 2;
+            return usage_error(
+                JsonCommand::Get,
+                args.common.json,
+                args.common.dry_run,
+                "identifier_invalid",
+                &err,
+            );
         }
     }
 
@@ -1342,7 +1366,7 @@ pub async fn run(args: GetArgs) -> i32 {
             // `@angular/core` and `@babel/core`) is refused: `get` acts on
             // one package per name.
             if let Some(msg) = target.ambiguity(matched.iter().map(String::as_str)) {
-                report_error(args.common.json, msg);
+                report_error(args.common.json, "ambiguous_target", &msg);
                 return 1;
             }
             if !quiet {
@@ -1764,7 +1788,11 @@ async fn agent_dry_run(
     let manifest = match read_manifest(&args.common.resolved_manifest_path()).await {
         Ok(m) => m.unwrap_or_else(PatchManifest::new),
         Err(e) => {
-            report_error(args.common.json, format!("Failed to read manifest: {e}"));
+            report_error(
+                args.common.json,
+                "manifest_unreadable",
+                format!("Failed to read manifest: {e}"),
+            );
             return 1;
         }
     };
@@ -1854,7 +1882,11 @@ async fn save_patch_record(
         // treated as empty would be rewritten below with only this one
         // patch, destroying every tracked record.
         Err(e) => {
-            report_error(args.common.json, format!("Failed to read manifest: {e}"));
+            report_error(
+                args.common.json,
+                "manifest_unreadable",
+                format!("Failed to read manifest: {e}"),
+            );
             return Err(1);
         }
     };
@@ -1871,6 +1903,7 @@ async fn save_patch_record(
     if files.is_empty() {
         report_error(
             args.common.json,
+            "patch_no_applicable_files",
             format!(
                 "Patch {} has no applicable files; nothing to apply",
                 patch.purl
@@ -1896,7 +1929,10 @@ async fn save_patch_record(
                 "found": 1,
                 "downloaded": 0,
                 "applied": 0,
-                "error": "Blob decode or write failed",
+                "error": {
+                    "code": "blob_write_failed",
+                    "message": "Blob decode or write failed",
+                },
                 "patches": [{
                     "purl": patch.purl,
                     "uuid": patch.uuid,
@@ -1919,7 +1955,11 @@ async fn save_patch_record(
     if let Err(e) = write_manifest(manifest_path, &manifest).await {
         // No record points at the blobs just written: unwind exactly those.
         unwind_new_blobs(&blobs_dir, &new_blobs).await;
-        report_error(args.common.json, format!("Failed to write manifest: {e}"));
+        report_error(
+            args.common.json,
+            "manifest_write_failed",
+            format!("Failed to write manifest: {e}"),
+        );
         return Err(1);
     }
     Ok(action)
@@ -2381,8 +2421,10 @@ async fn run_get_vendored(
                     result["vendor"] =
                         serde_json::to_value(&*venv).unwrap_or_else(|_| serde_json::json!({}));
                 }
-                result["status"] = serde_json::json!("error");
-                result["error"] = serde_json::json!({ "code": code, "message": message });
+                crate::json_envelope::set_error(
+                    &mut result,
+                    crate::json_envelope::EnvelopeError::new(code, message),
+                );
                 print_json(&result);
             } else {
                 eprintln!(
@@ -3352,8 +3394,12 @@ mod tests {
             applied: Vec::new(),
         };
         assert_eq!(fold_apply_failures(&mut env, &report, |_| None), 0);
-        assert_eq!(env["errorCode"], "yarn_pnp_unsupported", "{env}");
-        assert_eq!(env["error"], "pnp", "{env}");
+        assert!(env.get("errorCode").is_none(), "{env}");
+        assert_eq!(
+            env["error"],
+            serde_json::json!({"code": "yarn_pnp_unsupported", "message": "pnp"}),
+            "{env}"
+        );
         assert_eq!(env["failed"], 0, "{env}");
     }
 
@@ -4380,15 +4426,15 @@ mod tests {
     fn forced_identifier_shapes() {
         assert_eq!(
             forced_identifier_error(&Target::with_kind("lodash", TargetKind::Uuid)).as_deref(),
-            Some("\"lodash\" is not a valid patch UUID (expected xxxxxxxx-xxxx-xxxx-xxxx-xxxxxxxxxxxx)")
+            Some("The identifier is not a valid patch UUID (expected xxxxxxxx-xxxx-xxxx-xxxx-xxxxxxxxxxxx)")
         );
         assert_eq!(
             forced_identifier_error(&Target::with_kind("lodash", TargetKind::Cve)).as_deref(),
-            Some("\"lodash\" is not a valid CVE ID (expected CVE-YYYY-NNNN)")
+            Some("The identifier is not a valid CVE ID (expected CVE-YYYY-NNNN)")
         );
         assert_eq!(
             forced_identifier_error(&Target::with_kind("GHSA-1", TargetKind::Ghsa)).as_deref(),
-            Some("\"GHSA-1\" is not a valid GHSA ID (expected GHSA-xxxx-xxxx-xxxx)")
+            Some("The identifier is not a valid GHSA ID (expected GHSA-xxxx-xxxx-xxxx)")
         );
         assert_eq!(
             forced_identifier_error(&Target::with_kind(

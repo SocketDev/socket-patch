@@ -85,7 +85,7 @@ async fn search_get_json_engine_hard_error_prints_one_document() {
     });
     assert_eq!(v["status"], "error", "envelope drifted: {v}");
     assert!(
-        v["error"]
+        v["error"]["message"]
             .as_str()
             .is_some_and(|m| m.contains("Failed to read manifest")),
         "error message drifted: {v}"
