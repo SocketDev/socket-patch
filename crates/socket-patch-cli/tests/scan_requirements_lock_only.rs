@@ -8,7 +8,9 @@
 //! * #412: pins reached through in-root `-r` includes;
 //! * #994: include targets pip unquotes (`-r "dev reqs.txt"`,
 //!   `--requirement="dev.txt"`, `-r dev\ reqs.txt`) or expands
-//!   (`-r ${REQDIR}/dev.txt`).
+//!   (`-r ${REQDIR}/dev.txt`);
+//! * #1028: a `-r` that follows other options on the line
+//!   (`--pre -r dev.txt`, `-i URL -r dev.txt`).
 //!
 //! Driven through the built binary against a mock patch API; the
 //! assertion is what discovery sends to the batch endpoint and the
@@ -206,4 +208,31 @@ async fn lock_only_scan_discovers_env_var_include_target() {
         &["pkg:pypi/sp-fixture-env@1.0.0"],
     )
     .await;
+}
+
+/// #1028: pip runs optparse over every option word of a line, so a `-r`
+/// that follows another option (`--pre`, `-i URL`, `-c FILE`) is still
+/// an include pip follows.
+#[tokio::test]
+async fn lock_only_scan_discovers_include_after_other_options() {
+    let cases: &[&str] = &[
+        "--pre -r dev.txt\n",
+        "-i https://pypi.org/simple -r dev.txt\n",
+        "--index-url=https://pypi.org/simple -r dev.txt\n",
+        "--prefer-binary -r dev.txt\n",
+        "-c c.txt -r dev.txt\n",
+        "--prefer-binary --requirement=dev.txt\n",
+    ];
+    for root in cases {
+        eprintln!("case {root:?}");
+        assert_lock_only_discovers(
+            &[
+                ("requirements.txt", root),
+                ("dev.txt", "sp-fixture-optfirst==1.0.0\n"),
+                ("c.txt", "\n"),
+            ],
+            &["pkg:pypi/sp-fixture-optfirst@1.0.0"],
+        )
+        .await;
+    }
 }
