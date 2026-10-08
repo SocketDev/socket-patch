@@ -324,10 +324,9 @@ async fn read_lock(view: &ProjectView<'_>, name: &str) -> Result<String, (&'stat
     })
 }
 
-/// `yarn.lock` head sniff: berry locks carry a top-level (column-0)
-/// `__metadata:` key; classic v1 locks carry the `# yarn lockfile v1`
-/// comment header. Berry wins the check — a berry lock must never be
-/// mistaken for classic.
+/// `yarn.lock` grammar, through the one decision every yarn reader shares
+/// ([`sniff_grammar`]); a lock that declares neither grammar is refused,
+/// since vendoring must know which grammar it writes.
 async fn sniff_yarn_lock(view: &ProjectView<'_>) -> Result<NpmLockFlavor, (&'static str, String)> {
     let text = read_lock(view, "yarn.lock").await?;
     // Berry wins the check (it must never be mistaken for classic). The

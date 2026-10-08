@@ -228,6 +228,8 @@ pub(crate) struct Rewritten {
     pub(crate) skipped: Vec<SkippedPatch>,
     pub(crate) pre_warnings: Vec<crate::patch::redirect::RewriteWarning>,
     pub(crate) done: engine::Rewritten,
+    /// Granted candidates nothing pins ([`engine::unconfirmed_candidates`]).
+    pub(crate) unconfirmed: Vec<(String, String)>,
 }
 
 /// A refused rewrite: its refusal and the skips recorded before the
@@ -346,11 +348,13 @@ pub(crate) async fn rewrite(
         });
     }
     skipped.extend(done.unattributed.iter().cloned());
+    let unconfirmed = engine::unconfirmed_candidates(&candidates, &done.confirmed, &skipped);
     Ok(Rewritten {
         project,
         skipped,
         pre_warnings,
         done,
+        unconfirmed,
     })
 }
 

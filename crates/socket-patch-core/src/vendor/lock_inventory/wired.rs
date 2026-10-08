@@ -7,6 +7,7 @@ use toml_edit::{DocumentMut, Item};
 
 use crate::constants::npm_family::{BUN_LOCK, BUN_LOCKB, NPM_LOCKS, PNPM_LOCK};
 use crate::formats::pnpm::PnpmLock;
+use crate::formats::yarn::blocks::{berry_field, classic_field};
 use crate::formats::yarn::is_berry_lock;
 use crate::utils::digest::is_sri_pin;
 use crate::utils::fs::{read_regular_to_bytes, read_regular_to_string};
@@ -15,8 +16,6 @@ use crate::utils::python_lock::{
 };
 use crate::vendor::bun_lock_text::{decode_json_string, split_name_spec};
 use crate::vendor::bun_lockb::BunLockb;
-use crate::vendor::yarn_berry_lock::berry_field;
-use crate::vendor::yarn_classic_lock::classic_field;
 use crate::vex::discover::{vendor_ref, vendor_ref_decorated};
 
 use super::bun::bun_text_entries;

@@ -2079,9 +2079,10 @@ async fn run_scan(
                     warnings.push(hosted::prune_ignored_warning());
                 }
                 result["redirect"] = hosted::redirect_json_block(
-                    0,
+                    &[],
+                    &[],
                     Vec::new(),
-                    Vec::new(),
+                    &[],
                     warnings,
                     args.common.dry_run,
                 );

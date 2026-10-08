@@ -940,7 +940,7 @@ async fn generate_vex(
 /// install of it and is dropped, as apply does. One holding only some of
 /// them is kept: the keys it lacks verify as not found, so the statement
 /// is withheld while the build loads the held (unpatched) jar.
-async fn vex_copy_sets(
+pub(crate) async fn vex_copy_sets(
     common: &GlobalArgs,
     manifest: &PatchManifest,
     copies: &HashMap<String, Vec<PathBuf>>,
