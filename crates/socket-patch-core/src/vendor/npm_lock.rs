@@ -1183,21 +1183,35 @@ fn version_moved_off<'a>(rec: &WiringRecord, live: &'a Value) -> Option<&'a str>
         return None;
     }
     let original_resolved = rec.original.as_ref()?.get("resolved")?.as_str()?;
-    let prefix = registry_tarball_prefix(original_resolved)?;
+    let (original_scheme, prefix) = registry_tarball_prefix(original_resolved)?;
     let live_resolved = live.get("resolved").and_then(Value::as_str)?;
-    let leaf = live_resolved.strip_prefix(prefix)?;
+    let (live_scheme, live_rest) = split_http_scheme(live_resolved)?;
+    // npm rewrites an old lock's `http://` registry URLs to `https://` on
+    // the next install, so that upgrade is the same registry; a move from
+    // `https://` down to `http://` is not.
+    if live_scheme != original_scheme && (original_scheme, live_scheme) != ("http", "https") {
+        return None;
+    }
+    let leaf = live_rest.strip_prefix(prefix)?;
     (leaf.ends_with(".tgz") && !leaf.contains('/')).then_some(live_version)
 }
 
 /// `https://registry.npmjs.org/left-pad/-/left-pad-1.3.0.tgz` →
-/// `https://registry.npmjs.org/left-pad/-/`: the registry tarball directory
-/// of one package, which every version of it shares.
-fn registry_tarball_prefix(resolved: &str) -> Option<&str> {
-    if !(resolved.starts_with("https://") || resolved.starts_with("http://")) {
-        return None;
-    }
-    let at = resolved.rfind("/-/")?;
-    Some(&resolved[..at + 3])
+/// `("https", "registry.npmjs.org/left-pad/-/")`: the scheme and the
+/// registry tarball directory of one package, which every version of it
+/// shares.
+fn registry_tarball_prefix(resolved: &str) -> Option<(&str, &str)> {
+    let (scheme, rest) = split_http_scheme(resolved)?;
+    let at = rest.rfind("/-/")?;
+    Some((scheme, &rest[..at + 3]))
+}
+
+/// `https://host/path` → `("https", "host/path")`; `None` for anything but
+/// an `http`/`https` URL.
+fn split_http_scheme(url: &str) -> Option<(&str, &str)> {
+    ["https", "http"]
+        .into_iter()
+        .find_map(|scheme| Some((scheme, url.strip_prefix(scheme)?.strip_prefix("://")?)))
 }
 
 /// Apply one wiring record in reverse: restore `original` iff the live
@@ -3513,6 +3527,62 @@ mod tests {
             .root()
             .join(format!(".socket/vendor/npm/{UUID}"))
             .exists());
+    }
+
+    /// #1155, old lock: npm 6 recorded `http://registry.npmjs.org/...`
+    /// tarball URLs, and the next `npm install` writes `https://`. That
+    /// upgrade is from the same registry, so it reverts like any other.
+    /// The reverse (an `https` entry moved to `http`) stays drift.
+    #[tokio::test]
+    async fn revert_after_version_change_accepts_http_to_https_upgrade_only() {
+        for (original, moved, reverts) in [
+            (
+                "http://registry.npmjs.org/left-pad/-/left-pad-1.3.0.tgz",
+                "https://registry.npmjs.org/left-pad/-/left-pad-1.3.1.tgz",
+                true,
+            ),
+            (
+                "https://registry.npmjs.org/left-pad/-/left-pad-1.3.0.tgz",
+                "http://registry.npmjs.org/left-pad/-/left-pad-1.3.1.tgz",
+                false,
+            ),
+        ] {
+            let mut lock = default_lock();
+            lock["packages"]["node_modules/left-pad"]["resolved"] = json!(original);
+            lock["packages"]["node_modules/foo/node_modules/left-pad"]["resolved"] =
+                json!(original);
+            let fx = fixture_with("left-pad", "1.3.0", lock).await;
+            let (_, entry, _) = expect_done(fx.vendor(false).await);
+            let entry = entry.unwrap();
+
+            let upgraded = json!({
+                "version": "1.3.1",
+                "resolved": moved,
+                "integrity": "sha512-upgraded=="
+            });
+            let mut live = fx.read_lock().await;
+            live["packages"]["node_modules/left-pad"] = upgraded.clone();
+            live["packages"]["node_modules/foo/node_modules/left-pad"] = upgraded;
+            tokio::fs::write(fx.lock_path(), serialize_json(&live, "  ").unwrap())
+                .await
+                .unwrap();
+
+            let outcome = revert_npm(&entry, fx.root(), false).await;
+            assert!(outcome.success, "{moved}: {:?}", outcome.error);
+            assert_eq!(
+                outcome.drift_skipped(),
+                !reverts,
+                "{moved}: {:?}",
+                outcome.warnings
+            );
+            assert_eq!(
+                fx.root()
+                    .join(format!(".socket/vendor/npm/{UUID}"))
+                    .exists(),
+                !reverts,
+                "{moved}"
+            );
+        }
     }
 
     /// #1155 provenance guard: a version change is only an upgrade when the
