@@ -5588,7 +5588,7 @@ mod tests {
             tokio::fs::create_dir_all(&d).await.unwrap();
             tokio::fs::write(d.join("config.toml"), body).await.unwrap();
         }
-        let chain = cargo_config::read_config_chain_with(&root, &home).await;
+        let chain = cargo_config::read_config_chain_with(&root, Some(&home)).await;
         let got: Vec<(String, bool, bool, PathBuf)> = chain
             .iter()
             .map(|c| {

@@ -14,6 +14,7 @@ use crate::hosted::engine::{
 };
 use crate::hosted::vlt::Preflight;
 use crate::patch::redirect::npmrc::OuterAllowRemote;
+use crate::patch::redirect::yarnrc::OuterYarnMirror;
 use crate::patch::redirect::DepOverride;
 use crate::utils::purl::strip_purl_qualifiers;
 use crate::vendor::lock_inventory::{MemoryEntry, MemoryProject, ProjectView};
@@ -305,8 +306,9 @@ pub(crate) async fn rewrite(
 
     let view = ProjectView::Memory(&project);
     let targets_pipenv_lock = engine::pipenv_lock_targets(&read.files, &candidates);
-    // The in-memory host sees no user / global npm config.
+    // The in-memory host sees no user / global npm or yarn config.
     let npm_outer = OuterAllowRemote::default;
+    let yarn_classic_outer = OuterYarnMirror::default;
     let done = engine::rewrite(
         &view,
         read,
@@ -329,6 +331,7 @@ pub(crate) async fn rewrite(
             trust_lockfile_config: options.trust_lockfile_config,
             npm_allow_remote_config: options.npm_allow_remote_config,
             npm_outer: &npm_outer,
+            yarn_classic_outer: &yarn_classic_outer,
             blocking: false,
         },
     )

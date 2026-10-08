@@ -13,9 +13,8 @@ use std::collections::BTreeMap;
 use serde_json::{Map, Value};
 
 use super::{full_name, DepOverride, FileEdit, RewriteResult, RewriteWarning};
-use crate::constants::npm_family::{
-    BUN_LOCK, BUN_LOCKB, NPM_LOCKS, PNPM_LOCK, VLT_CONFIG, VLT_HIDDEN_LOCK_REL, VLT_LOCK,
-};
+use crate::constants::npm_family::{BUN_LOCKB, VLT_CONFIG, VLT_HIDDEN_LOCK_REL, VLT_LOCK};
+use crate::formats::governing_locks::{npm_locks_outside, NpmLockFamily};
 use crate::vendor::vlt_lock_text::{
     brotli_for_slot3, entry_text, has_brotli_flag, installs_outside_registry, is_default_registry,
     is_registry_url_segment, nodes_block, parse_node_entry_text, parse_node_line,
@@ -26,26 +25,13 @@ use crate::vendor::vlt_lock_text::{
 /// The ledger kind of a hosted vlt node splice.
 pub const KIND: &str = "redirect_vlt_lock_node";
 
-/// Every other npm-family lock whose presence makes `vlt-lock.json`
-/// ambiguous as the install driver.
-const SIBLING_LOCKS: [&str; 6] = [
-    NPM_LOCKS[1],
-    NPM_LOCKS[0],
-    "yarn.lock",
-    PNPM_LOCK,
-    BUN_LOCK,
-    BUN_LOCKB,
-];
-
-/// The other npm-family locks present. `bun_lockb_present` reports a
-/// `bun.lockb` on disk, which a caller holding its bytes keeps out of
-/// `files`.
+/// The other npm-family locks present, in the shared precedence order
+/// ([`npm_locks_outside`]). `bun_lockb_present` reports a `bun.lockb` on
+/// disk, which a caller holding its bytes keeps out of `files`.
 fn sibling_locks(files: &BTreeMap<String, String>, bun_lockb_present: bool) -> Vec<&'static str> {
-    SIBLING_LOCKS
-        .iter()
-        .copied()
-        .filter(|lock| files.contains_key(*lock) || (*lock == BUN_LOCKB && bun_lockb_present))
-        .collect()
+    npm_locks_outside(NpmLockFamily::Vlt, |lock| {
+        files.contains_key(lock) || (lock == BUN_LOCKB && bun_lockb_present)
+    })
 }
 
 /// Does vlt drive hosted confirmation and the artifact preflight?
@@ -761,7 +747,7 @@ mod tests {
         assert!(!vlt_drives(&files(&[sentinel, (VLT_CONFIG, "{}")]), false));
         assert!(vlt_drives(&files(&[lock]), false));
         assert!(vlt_drives(&files(&[lock, (VLT_CONFIG, "{}")]), false));
-        for sibling in SIBLING_LOCKS {
+        for sibling in npm_locks_outside(NpmLockFamily::Vlt, |_| true) {
             let other = (sibling, "x");
             assert!(!vlt_drives(&files(&[lock, other]), false), "{sibling}");
             assert!(
