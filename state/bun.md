@@ -1,6 +1,6 @@
 [agent] Progress ledger for the scheduled Bun bug-hunt routine (label pm:bun).
 
-Last updated: 2026-10-08 (run 32), main `9472be4`, latest release 4.0.0, latest Bun 1.4.2 (no 1.4.3 stable yet).
+Last updated: 2026-10-08 (run 33), main `a845bf9`, latest release 4.0.0, latest Bun 1.4.2 (no 1.4.3 stable yet).
 
 Method (run 16 note: the sandbox shell exports `BUN_OPTIONS=--smol`, so unset it; run 17 note: on Bun ≥ 1.2, `bunfig [install] saveTextLockfile = false` writes a binary `bun.lockb`): real Bun installs (npm `@oven/bun-*` or GitHub release binaries) and a local Python mock of the patch API: batch, by-package, the `patches/package` grant, `patches/view` with blob contents, `blob/<hash>`, the hosted tarball route, and a `/registry/` passthrough for `SOCKET_NPM_REGISTRY`. Set `SOCKET_PATCH_SERVER_URL` and `SOCKET_PROXY_URL` to the mock (run 32: without a token the CLI uses the public-proxy routes `/patch/batch`, `/patch/by-package/<purl>`, `/patch/view/<uuid>`, `/patch/blob/<hash>` and `POST /patch/package`, and `patch.socket.dev` returns 403 through the sandbox proxy). Test repos need `node_modules/` in `.gitignore`, or the fresh-clone oracle reads committed store entries. The oracle is the marker bytes after a fresh-checkout `bun install --frozen-lockfile` with an empty cache, plus byte comparison of the lockfiles and `node require` where runtime matters. The repo's own matrix (`scripts/backtest-bun.py`, `bun-compatibility.yml`) already covers plain hosted and vendored shapes across Bun 0.8.1–1.4.2. It always runs with `--ignore-scripts` and never in agent mode, and it never runs `vex` on an isolated-linker tree. This ledger tracks what it doesn't.
 
@@ -51,6 +51,8 @@ Run 30 (new main `fe8455d`; no Bun code changes since `05ecc6e`, so #992 / #1084
 Run 31 (new main `829d0af`: #1035 superseded-generation remove/rollback, #1044 governing-lock table, #1038, #1042, #1033): new **#1116**. Vendored `bun.lockb` workspaces write member-relative tarball mirrors (`packages/<m>/.socket/vendor/...`) with no `.gitignore` probe and no `!*` re-include, so a stock `*.tgz` rule drops them from the commit. Fresh frozen installs then fail with ENOENT (1.1.39–1.2.23) or hang (1.3.9) when the member resolves its own copy, and on 1.4.2 `vendor --check` / `vex` fail in every clone. #1101 and #1084 still reproduce. #1101 also reproduces under a root `bun.lockb` with a stray member `bun.lock` / `bun.lockb`, where lockfile-only `vex` attests (commented). #1035 on Bun passes: hosted and vendored supersede A→B then `remove B` / `rollback B`, cross-mode takeovers, the #999 shape, hosted A + agent B, and an alias of the same release (text + lockb, single + workspace, 1.2.23 / 1.3.9 / 1.4.2; the text lock is byte-exact). See the run 31 section below.
 
 Run 32 (new main `9472be4`: #1050 one in-use verdict for the vendored prune GC, #1029 CI gates and hosted `redirect.patches[]`): new **#1132**. After `bun remove` of a vendored package in a `bun.lockb` project, `scan --prune`, `vendor --revert` and `remove` all keep the entry as "drifted" (`bun_binary.rs:526`), so `vendor --check` stays red and its `--prune` remedy loops (1.1.39–1.4.2, single + workspace). Text `bun.lock` reverts cleanly. Orphaned `.bun` store entries after an upgrade or removal make a vendored `scan` exit 1, put an `unpinned` row in hosted `redirect.patches[]`, and get patched and attested in agent mode (commented on #599). Upgrading a vendored package loops the same way on every npm-family lock (handed to npm). #1116 still reproduces. The #1050 prune GC on live vendored projects passes across 1.2.23 / 1.3.9 / 1.4.2 × text / lockb × single / workspace × hoisted / isolated. See the run 32 section below.
+
+Run 33 (new main `a845bf9`: #1039 staged, atomic vendored → hosted takeover, #1043, #1021): no new bugs. The #1039 takeover passes on Bun: a partial takeover where hosted refuses one purl (grant `denied`, or no sha512 → `redirect_bun_missing_sha512`) keeps that purl vendored byte for byte (`redirect_takeover_kept_vendored`, artifact and member mirrors intact) and takes over the rest, the dry run predicts it exactly and writes nothing, and a later re-run completes the takeover (text + lockb, single + workspace, 1.1.39 / 1.2.23 / 1.3.9 / 1.3.10 / 1.4.2). A hosted takeover also rescues a #1116-broken clone. A SIGKILL sweep found only PRE / POST / journal-recoverable states; a kill between the commit and the deferred artifact deletions leaves inert orphan artifacts (Known non-bugs). #1132 and #1116 still reproduce. See the run 33 section below.
 
 ## Coverage matrix
 
@@ -461,6 +463,21 @@ Other passes (Linux, 1.4.2 unless noted):
 | Orphan `.bun/<pkg>@<old>` after `bun add <pkg>@<new>` / `bun remove`: vendored / hosted / agent `scan`, `apply --check`, `vex` | 1.3.9 / 1.4.2 × text / lockb | fail (#599, commented: vendored exit 1, hosted `unpinned` row, agent patches + attests the orphan); hoisted control passes |
 | #1116 re-triage: vendored lockb workspace, `*.tgz` ignored, fresh clone `vendor --check` | 1.4.2 | fail #1116 (still) |
 
+### Run 33 (Linux, main `a845bf9`)
+| Cell | Bun | Result |
+| --- | --- | --- |
+| Vendored → hosted takeover, one purl's grant `denied` | 1.4.2 text | pass (denied purl stays vendored; other taken over; fresh frozen install patched) |
+| Same, one grant without sha512 (`redirect_bun_missing_sha512`), dry run then wet | 1.4.2 text + lockb single | pass (`redirect_takeover_kept_vendored`; dry run matches wet, writes nothing) |
+| Same, lockb workspace with member mirrors | 1.2.23 / 1.3.9 / 1.4.2 | pass (kept purl's root + member mirrors intact, taken-over purl's removed; `vendor --check` green; frozen install patched) |
+| Re-run after the grant is fixed, then `rollback` | 1.4.2 text / lockb / lockb workspace | pass (takeover completes, no `.socket` residue; text rollback byte-exact to the pre-vendor lock; lockb refuses with the documented checkout remedy) |
+| Full takeover, lockb workspace | 1.1.39 | pass (previously a documented refusal; now supported and installs patched) |
+| Takeover after `bun add` re-saved the vendored tuples digest-less | 1.2.23 / 1.3.9 text, 1.2.23 lockb | pass (no false drift refusal) |
+| Text v1 workspace (vendored refuses, documented) → hosted | 1.3.10 | pass |
+| SIGKILL sweep (2–68 ms) of a lockb-workspace takeover, then re-run | 1.4.2 | pass (PRE / POST / journal states all heal); kill after commit leaves inert orphan artifacts (non-bug) |
+| Hosted takeover in a #1116-broken fresh clone (member mirrors missing) | 1.4.2 | pass (takes over cleanly) |
+| #1132 re-triage | 1.4.2 lockb | fail #1132 (still) |
+| #1116 re-triage | 1.4.2 lockb workspace | fail #1116 (still) |
+
 ## Backlog
 
 0. **Maintainer request (partly covered in runs 3 and 6):** global (`-g`) mode for hosted patches. Still to do: a non-writable global dir must fail loudly (needs a probe; the sandbox runs as root); Windows 1.1.45/1.2.23 with an ASCII temp path; Bun 1.0.x. #443 is still open; re-test #434 (`bun.cmd`) on Windows now that #442 has landed. Checklist: the 20261001T040000Z entry.
@@ -474,9 +491,13 @@ Other passes (Linux, 1.4.2 unless noted):
 8. Bun 1.4.3 when stable (1.4.3-canary.1 passes, run 27). #992: re-test when fixed, including `[install.scopes]` and `NPM_CONFIG_REGISTRY` variants and the 1.1.45 `remove` / takeover cells. (Lifecycle scripts and scoped packages with scripts on `bun.lockb`: pass, run 27.) (Mixed modes, `globalStore` + vendored workspace lockb: pass, run 25. Superseding uuids in mixed modes, explicit `trustedDependencies`, `bun pm trust`, `--filter`: pass, run 26.)
 9. Digest boundary with a valid substitute tarball, 1.3.9 text lock vs 1.3.10 (low priority, documented limitation).
 10. #1101: re-test when fixed (and macOS/Windows); the root `bun.lockb` variant is covered (run 31). #1097 Bun < 1.3 negation: re-test when fixed. #1084: a workspace (isolated by default on Bun ≥ 1.3), macOS/Windows; re-test when fixed. The vendored dry run's symlink check doesn't list `bun.lockb` (registry row without `VENDORED`; `wiring_paths`), so check a symlinked `bun.lockb` in a vendored dry run vs a wet run.
-11. #1132: re-test when fixed (plus `rollback`, isolated workspace members). `apply --check` (#1029) on Bun agent trees: the #599 in-place reinstall shape, `globalStore`, lockfile-only checkouts. Hosted `redirect.patches[]` rows on `bun.lockb`, workspaces and the #1101 shape.
+11. #1132: re-test when fixed (still reproduces on `a845bf9`) (plus `rollback`, isolated workspace members). `apply --check` (#1029) on Bun agent trees: the #599 in-place reinstall shape, `globalStore`, lockfile-only checkouts. Hosted `redirect.patches[]` rows on `bun.lockb`, workspaces and the #1101 shape.
+
+12. #1039 takeover follow-ups: a superseding uuid during the takeover (vendored at A, hosted offers B), takeover with `globalStore`, and the multi-lock (`bun.lock` + `package-lock.json`) hosted run that commits unjournaled.
 
 ## Known non-bugs
+
+- A SIGKILL between the #1039 takeover's journaled commit and its deferred artifact deletions leaves `.socket/vendor/npm/<uuid>/` dirs and Bun member mirrors that nothing references. The lock and ledger are consistent, the re-run doesn't delete them, and `vendor --check` / `repair` / a later re-vendor all ignore or reuse them. Inert, crash-only and generic, so not filed (run 33).
 
 - `get <B> --mode agent` on a package vendored at A records B in the manifest and overwrites the installed (A-patched) copy with B's full content (non-strict "did not match … applied the full verified patched content"). It warns that the vendoring is still at A, and `vex` attests A only. Documented; use `--strict` (run 31).
 - Mock fixture (run 31): the grant must return `sha512-`-prefixed integrity and a tarball URL on the mock's own origin. Bare base64 lands in `bun.lock` as-is (Bun warns "malformed integrity"), and the baked `patch.socket.dev` host is unreachable. Never name a shell loop variable `M`, because it clobbers the mock URL.
