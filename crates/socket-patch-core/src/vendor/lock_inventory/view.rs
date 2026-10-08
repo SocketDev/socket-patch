@@ -214,6 +214,8 @@ struct Tracking {
     /// Each root-relative path any access touched, with its fingerprint
     /// taken before that first access.
     seen: std::collections::HashMap<String, Fingerprint>,
+    /// When each fingerprint in [`Self::seen`] was taken.
+    taken: std::collections::HashMap<String, std::time::SystemTime>,
     /// The open recording window ([`DiskSnapshot::begin_recording`]): the
     /// paths touched in it, and whether something read the disk around the
     /// view (its fingerprints then cannot cover what was read).
@@ -347,11 +349,34 @@ fn listing(dir: &Path, at_root: bool) -> Vec<(String, bool)> {
 
 /// Every path a [`DiskSnapshot::tracked`] snapshot touched while recording
 /// (see [`DiskSnapshot::begin_recording`]), with the fingerprint each had
-/// before it was first read. Stats only: checking it never reads a file.
+/// before it was first read. Stats only, except for a racily-current file
+/// (see [`RACY_WINDOW`]), whose content is compared too.
 #[derive(Debug, Clone)]
 pub struct ReadSet {
     root: std::path::PathBuf,
     paths: BTreeMap<String, Fingerprint>,
+    /// The files modified within [`RACY_WINDOW`] of their fingerprint: a
+    /// later write in the same timestamp tick leaves their stats unchanged,
+    /// so they hold only while their content is still the content the view
+    /// read (`None`: no content the view read to compare, never holds).
+    racy: BTreeMap<String, Option<Arc<[u8]>>>,
+}
+
+/// How close to its fingerprint a file's modification time may be before
+/// the stats alone cannot vouch for it (git's "racily clean" files).
+/// Filesystems stamp times in ticks: about 16 ms on Windows, jiffies on
+/// Linux, a second on HFS+ and two on FAT, so a rewrite of the same length
+/// inside one tick of the write before it keeps every stat.
+const RACY_WINDOW: std::time::Duration = std::time::Duration::from_secs(2);
+
+/// Whether a file stamped `modified` may be rewritten unseen after a
+/// fingerprint taken at `taken`.
+fn racy(modified: Option<std::time::SystemTime>, taken: std::time::SystemTime) -> bool {
+    modified.is_none_or(|modified| {
+        taken
+            .checked_sub(RACY_WINDOW)
+            .is_none_or(|horizon| modified >= horizon)
+    })
 }
 
 impl ReadSet {
@@ -359,9 +384,15 @@ impl ReadSet {
     /// was first read: no file was written, replaced, created or removed and
     /// no listed directory gained or lost an entry since.
     pub fn unchanged(&self) -> bool {
-        self.paths
-            .iter()
-            .all(|(rel, before)| before.holds(&self.root, rel))
+        self.paths.iter().all(|(rel, before)| {
+            before.holds(&self.root, rel)
+                && self.racy.get(rel).is_none_or(|read| {
+                    read.as_ref().is_some_and(|read| {
+                        crate::utils::fs::read_regular_to_bytes_sync(&self.root.join(rel))
+                            .is_ok_and(|now| now[..] == read[..])
+                    })
+                })
+        })
     }
 
     /// How many paths [`Self::unchanged`] re-stats.
@@ -434,13 +465,38 @@ impl<'a> DiskSnapshot<'a> {
         if raw {
             return None;
         }
-        let paths = touched
+        let paths: BTreeMap<String, Fingerprint> = touched
             .into_iter()
             .filter_map(|rel| Some((rel.clone(), tracking.seen.get(&rel)?.clone())))
+            .collect();
+        let racy_paths: Vec<String> = paths
+            .iter()
+            .filter(|(rel, print)| {
+                let taken = tracking.taken.get(*rel).copied();
+                [&print.entry, &print.target]
+                    .into_iter()
+                    .flatten()
+                    .filter(|stat| stat.kind == 0)
+                    .any(|stat| taken.is_none_or(|taken| racy(stat.modified, taken)))
+            })
+            .map(|(rel, _)| rel.clone())
+            .collect();
+        drop(tracking);
+        let reads = self.lock();
+        let racy = racy_paths
+            .into_iter()
+            .map(|rel| {
+                let read = match reads.get(&rel) {
+                    Some(Ok(bytes)) if !self.is_overlaid(&rel) => Some(Arc::clone(bytes)),
+                    _ => None,
+                };
+                (rel, read)
+            })
             .collect();
         Some(ReadSet {
             root: self.root.to_path_buf(),
             paths,
+            racy,
         })
     }
 
@@ -464,8 +520,10 @@ impl<'a> DiskSnapshot<'a> {
             .get(rel)
             .is_some_and(|print| access == Access::Probe || print.listing.is_some());
         if !known {
+            let taken = std::time::SystemTime::now();
             let print = Fingerprint::of(self.root, rel, access);
             tracking.seen.insert(rel.to_string(), print);
+            tracking.taken.insert(rel.to_string(), taken);
         }
         if let Some((touched, _)) = &mut tracking.window {
             touched.insert(rel.to_string());
@@ -1136,6 +1194,54 @@ mod tests {
         .unwrap();
         std::fs::remove_file(root.join("a.lock")).unwrap();
         assert!(!set.unchanged(), "a removed file");
+    }
+
+    /// A file written just before its fingerprint is racily current: its
+    /// stats may survive a same-length rewrite in the same timestamp tick,
+    /// so its content is compared too: what the view read must still be
+    /// there, and a racy file the view only probed (no content to compare)
+    /// never holds. An old file is judged by stats alone.
+    #[tokio::test]
+    async fn a_racily_current_file_is_compared_by_content() {
+        let tmp = tempfile::tempdir().unwrap();
+        let root = tmp.path();
+        std::fs::write(root.join("a.lock"), "one").unwrap();
+        fn read(
+            view: ProjectView<'_>,
+        ) -> std::pin::Pin<Box<dyn std::future::Future<Output = ()> + '_>> {
+            Box::pin(async move {
+                view.read_text("a.lock").await.unwrap();
+            })
+        }
+        let set = recorded(root, read).await.unwrap();
+        assert_eq!(set.racy.len(), 1, "written just now");
+        // The content compared is what the view read.
+        assert_eq!(set.racy["a.lock"].as_deref(), Some(&b"one"[..]));
+        assert!(set.unchanged());
+        let set = recorded(root, read).await.unwrap();
+        std::fs::write(root.join("a.lock"), "two").unwrap();
+        assert!(!set.unchanged(), "a same-length rewrite");
+
+        let probed = recorded(root, |view| {
+            Box::pin(async move {
+                assert!(view.exists("a.lock").await);
+            })
+        })
+        .await
+        .unwrap();
+        assert!(!probed.unchanged(), "nothing read to compare");
+
+        let old = std::time::SystemTime::now() - std::time::Duration::from_secs(3600);
+        std::fs::File::options()
+            .write(true)
+            .open(root.join("a.lock"))
+            .unwrap()
+            .set_modified(old)
+            .unwrap();
+        let set = recorded(root, read).await.unwrap();
+        assert!(set.racy.is_empty(), "an old file");
+        assert!(set.unchanged());
+        assert!(racy(None, std::time::SystemTime::now()), "no time known");
     }
 
     /// A listed directory breaks the read set when it gains or loses an
