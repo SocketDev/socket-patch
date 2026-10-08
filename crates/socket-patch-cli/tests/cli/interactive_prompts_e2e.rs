@@ -112,9 +112,8 @@ fn run_in_pty_bytes(args: &[&str], cwd: &Path, input: &[u8], timeout: Duration) 
     // closed. The previous design used a chunked read+mpsc loop
     // because it interleaved with a try_wait poll; the simplified
     // design serializes wait → drop master → read_to_end joins.
-    let reader_handle = crate::pty_io::PtyOutput::spawn(
-        pair.master.try_clone_reader().expect("clone reader"),
-    );
+    let reader_handle =
+        crate::pty_io::PtyOutput::spawn(pair.master.try_clone_reader().expect("clone reader"));
 
     // Watchdog: detach a thread that kills the child after `timeout`.
     // The cloned ChildKiller is independent of the main `child`

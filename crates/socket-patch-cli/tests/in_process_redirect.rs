@@ -851,9 +851,10 @@ async fn scan_redirect_rewrites_crlf_and_bom_yarn_berry_locks_and_rollback_resto
             "{label}: rollback restores the pristine CRLF lock (upstream checksum \
              re-derived from the registry tarball)"
         );
-        let pkg: serde_json::Value =
-            serde_json::from_str(&std::fs::read_to_string(tmp.path().join("package.json")).unwrap())
-                .unwrap();
+        let pkg: serde_json::Value = serde_json::from_str(
+            &std::fs::read_to_string(tmp.path().join("package.json")).unwrap(),
+        )
+        .unwrap();
         assert!(
             pkg.get("resolutions").is_none(),
             "{label}: rollback drops the resolutions pin: {pkg}"
@@ -2190,10 +2191,10 @@ async fn directory_at_the_legacy_ledger_path_does_not_block_the_run() {
 }
 
 /// A MID-RUN lockfile write failure (second of two locks unwritable) exits
-/// 1; the first lock landed, the failed lock stays byte-untouched (atomic
-/// stage+rename, no truncation), and no ledger is written (v5: a landed
-/// hosted pin is undone by `rollback`'s upstream restore, which needs no
-/// recorded originals).
+/// 1 and changes NOTHING: the run's writes are one commit, so the lock
+/// already replaced is put back, the failed lock stays byte-untouched
+/// (atomic stage+rename, no truncation), and no ledger is written. Before,
+/// the first lock stayed redirected while the second did not.
 ///
 /// unix-only: a read-only directory does not block file creation on Windows.
 #[cfg(unix)]
@@ -2213,6 +2214,8 @@ async fn partial_lockfile_write_failure_exits_1_and_writes_no_ledger() {
     // (common/config/rush/…) is written before the subspace lock
     // (common/config/subspaces/…).
     write_rush_project(tmp.path(), false);
+    let common_path = tmp.path().join("common/config/rush/pnpm-lock.yaml");
+    let before_common = std::fs::read_to_string(&common_path).unwrap();
     let subspace_dir = tmp.path().join("common/config/subspaces/frontend");
     let before_subspace = std::fs::read_to_string(subspace_dir.join("pnpm-lock.yaml")).unwrap();
     std::fs::set_permissions(&subspace_dir, std::fs::Permissions::from_mode(0o555)).unwrap();
@@ -2222,12 +2225,11 @@ async fn partial_lockfile_write_failure_exits_1_and_writes_no_ledger() {
     std::fs::set_permissions(&subspace_dir, std::fs::Permissions::from_mode(0o755)).unwrap();
     assert_eq!(code, 1, "a mid-run lockfile write failure must exit 1");
 
-    // The first lock landed before the failure…
-    let common =
-        std::fs::read_to_string(tmp.path().join("common/config/rush/pnpm-lock.yaml")).unwrap();
-    assert!(
-        common.contains(HOSTED_URL),
-        "the common lock was written before the subspace failure; got:\n{common}"
+    // The first lock was put back when the second failed…
+    assert_eq!(
+        std::fs::read_to_string(&common_path).unwrap(),
+        before_common,
+        "the common lock is restored after the subspace failure"
     );
     vlt_hosted_common::assert_no_ledger(tmp.path());
 
@@ -5078,4 +5080,64 @@ async fn cargo_hosted_scan_from_workspace_member_refuses() {
     assert_eq!(std::fs::read(root.join("Cargo.lock")).unwrap(), lock_before);
     assert!(!member.join(".cargo").exists(), "no member registry block");
     assert!(!member.join(".socket").exists());
+}
+
+/// `redirect.patches[]` reports every selected patch per purl (audit B12):
+/// a pinned dep is a `pinned` row, so a consumer no longer has to infer
+/// which patches the `redirected` count covers.
+#[tokio::test]
+#[serial]
+async fn hosted_json_reports_a_pinned_row_per_patch() {
+    let server = MockServer::start().await;
+    mock_discovery(&server).await;
+    mock_reference(&server).await;
+    mock_view(&server).await;
+    let tmp = tempfile::tempdir().unwrap();
+    write_project(tmp.path());
+
+    let env = run_redirect_subprocess(tmp.path(), &server.uri());
+    assert_eq!(env["redirect"]["redirected"], 1, "{env:#}");
+    assert_eq!(
+        env["redirect"]["patches"],
+        serde_json::json!([{ "purl": PURL, "uuid": UUID, "action": "pinned" }]),
+        "{env:#}"
+    );
+}
+
+/// A granted patch that no lockfile entry pins (here: no lockfile at all)
+/// used to vanish from `--json` — it is neither redirected nor skipped, and
+/// only the human output named it ("Not hosted"). It is now an `unpinned`
+/// row with `errorCode: redirect_unconfirmed`. The exit code is unchanged
+/// (0): the hosted exit policy is an open maintainer decision (#704).
+#[tokio::test]
+#[serial]
+async fn hosted_json_reports_an_unpinned_row_for_a_granted_patch_nothing_pins() {
+    let server = MockServer::start().await;
+    mock_discovery(&server).await;
+    mock_reference(&server).await;
+    mock_view(&server).await;
+    let tmp = tempfile::tempdir().unwrap();
+    std::fs::write(
+        tmp.path().join("package.json"),
+        format!(
+            r#"{{ "name": "consumer", "version": "0.0.0", "dependencies": {{ "{NAME}": "{VERSION}" }} }}"#
+        ),
+    )
+    .unwrap();
+    let pkg = tmp.path().join("node_modules").join(NAME);
+    std::fs::create_dir_all(&pkg).unwrap();
+    std::fs::write(
+        pkg.join("package.json"),
+        format!(r#"{{ "name": "{NAME}", "version": "{VERSION}" }}"#),
+    )
+    .unwrap();
+
+    let env = run_redirect_subprocess(tmp.path(), &server.uri());
+    assert_eq!(env["redirect"]["redirected"], 0, "{env:#}");
+    let rows = env["redirect"]["patches"].as_array().expect("patches[]");
+    assert_eq!(rows.len(), 1, "{env:#}");
+    assert_eq!(rows[0]["purl"], PURL, "{env:#}");
+    assert_eq!(rows[0]["uuid"], UUID, "{env:#}");
+    assert_eq!(rows[0]["action"], "unpinned", "{env:#}");
+    assert_eq!(rows[0]["errorCode"], "redirect_unconfirmed", "{env:#}");
 }

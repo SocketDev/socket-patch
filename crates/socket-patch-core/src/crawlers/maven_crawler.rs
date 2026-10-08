@@ -9,8 +9,8 @@ use super::walk_pool::{par_map, run_walk};
 use crate::gradle::graph::MavenLocal;
 use crate::gradle::home::GradleHome;
 use crate::gradle::{Env, Os};
-use crate::patch::path_safety;
 use crate::utils::fs::is_dir;
+use crate::vendor::jvm::layout::{self, BuildTool};
 
 #[cfg(test)]
 mod oracle;
@@ -338,11 +338,6 @@ pub fn parse_pom_group_artifact_version(content: &str) -> Option<(String, String
 // Path coordinate helpers
 // ---------------------------------------------------------------------------
 
-/// Convert a Maven groupId to a path segment (e.g. `org.apache.commons` -> `org/apache/commons`).
-fn group_id_to_path(group_id: &str) -> String {
-    group_id.replace('.', "/")
-}
-
 /// Extract Maven coordinates from a directory path relative to the repository root.
 ///
 /// The Maven repository layout is: `<groupId-as-path>/<artifactId>/<version>/`
@@ -515,34 +510,6 @@ impl LayoutTrust {
     }
 }
 
-/// Whether the PURL-derived Maven coordinates are safe to join onto the
-/// repository root in [`MavenCrawler::find_by_purls`].
-///
-/// The coordinates come straight from the (untrusted) manifest PURL and are
-/// joined onto the repo root, after which the resolved directory is patched IN
-/// PLACE (Maven has no `replace`-redirect backend). A tampered PURL must not be
-/// able to traverse out of the repository. `has_pom_file` only checks for a
-/// `.pom` file, so it is no defense — this gate is. Fails closed.
-///
-/// - `artifact_id` and `version` are each a single path segment, so a real one
-///   never contains a separator, a `.`/`..` segment, a backslash, a colon, or
-///   a NUL — [`path_safety::is_safe_single_segment`].
-/// - `group_id` is dot-separated and run through [`group_id_to_path`] (each
-///   `.` becomes `/`), so every dot-split segment must independently satisfy
-///   [`path_safety::is_safe_single_segment`]. That rejects the forms that
-///   would convert to an absolute or `..`-bearing path (`.` -> `/`, `.a` ->
-///   `/a`, `a..b` -> `a//b`) and — unlike the previous local check — a `/`
-///   smuggled inside a dot-split segment (`/etc`, `com/evil`).
-///
-/// The delegation also rejects `:` everywhere — a Windows drive-relative
-/// coordinate (`C:evil`) joins as an absolute path. Mirrors the `go_crawler`
-/// / `deno_crawler` coordinate guards.
-pub(crate) fn is_safe_maven_coordinate(group_id: &str, artifact_id: &str, version: &str) -> bool {
-    group_id.split('.').all(path_safety::is_safe_single_segment)
-        && path_safety::is_safe_single_segment(artifact_id)
-        && path_safety::is_safe_single_segment(version)
-}
-
 /// A Coursier per-repository root as a cache root: tagged with the layout
 /// its path spells, so `find_by_purls` (which recovers the layout from the
 /// path alone) resolves it the same way. A repository at the host itself
@@ -566,8 +533,9 @@ fn coursier_repo_root(path: PathBuf) -> JvmCacheRoot {
 /// environment; [`JvmEnv::resolve`] an explicit one (tests).
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub struct JvmEnv {
-    /// The Maven local repository (see [`MavenCrawler::get_maven_repo_paths`]).
-    pub m2_repo: PathBuf,
+    /// The Maven local repository (see [`MavenCrawler::get_maven_repo_paths`]);
+    /// `None` when nothing names one and there is no usable home.
+    pub m2_repo: Option<PathBuf>,
     /// The Gradle user home; `None` when none can be resolved.
     pub gradle: Option<GradleHome>,
 }
@@ -628,22 +596,26 @@ pub fn is_ro_root(path: &Path) -> bool {
 
 /// The Maven local repository `env` names: `$MAVEN_REPO_LOCAL`, else
 /// `$M2_HOME/repository`, else `<home>/.m2/repository` with `<home>` =
-/// `$HOME`, `$USERPROFILE`, `home_dir`, or `~`. A set-but-empty variable
-/// counts as unset (see [`MavenCrawler::m2_repo_path`]).
-pub fn m2_repo_path_with(env: &dyn Env, home_dir: Option<&Path>) -> PathBuf {
+/// `$HOME`, `$USERPROFILE` or `home_dir`, the first that is set and rooted
+/// ([`crate::utils::fs::home_from_env`]). A set-but-empty variable counts
+/// as unset (see [`MavenCrawler::m2_repo_path`]). `None` when there is no
+/// usable home: a relative or literal `~` would resolve against the working
+/// directory and treat a `~/.m2` inside the scanned project as the user's
+/// local repository (B66).
+pub fn m2_repo_path_with(env: &dyn Env, home_dir: Option<&Path>) -> Option<PathBuf> {
     let set = |k: &str| env.var(k).filter(|v| !v.is_empty());
     if let Some(repo_local) = set("MAVEN_REPO_LOCAL") {
-        return PathBuf::from(repo_local);
+        return Some(PathBuf::from(repo_local));
     }
     if let Some(m2_home) = set("M2_HOME") {
-        return PathBuf::from(m2_home).join("repository");
+        return Some(PathBuf::from(m2_home).join("repository"));
     }
-    let home = set("HOME")
-        .or_else(|| set("USERPROFILE"))
-        .map(PathBuf::from)
-        .or_else(|| home_dir.map(Path::to_path_buf))
-        .unwrap_or_else(|| PathBuf::from("~"));
-    home.join(".m2").join("repository")
+    let home = crate::utils::fs::home_from_env(|k| set(k).map(Into::into)).or_else(|| {
+        home_dir
+            .filter(|h| crate::utils::fs::is_usable_home(h))
+            .map(Path::to_path_buf)
+    })?;
+    Some(home.join(".m2").join("repository"))
 }
 
 /// A `--global-prefix` as the cache root it names: a Gradle user home
@@ -686,14 +658,14 @@ pub enum M2Gate {
 /// See [`M2Gate`]. Reads the build's scripts and the init scripts of
 /// `env`'s Gradle user home.
 ///
-/// A Scala-tool build beside the Gradle one ([`SCALA_TOOL_MARKERS`]) keeps
+/// A Scala-tool build beside the Gradle one ([`layout::is_scala_tool_build`]) keeps
 /// m2 as a lone sbt / Mill / scala-cli root does: its own resolvers (an
 /// sbt `Resolver.mavenLocal`, say) are not the Gradle scripts', so the
 /// Gradle build's silence on `mavenLocal()` cannot rule `~/.m2` out.
 pub fn m2_gate(cwd: &Path, env: &JvmEnv) -> M2Gate {
-    if cwd.join("pom.xml").exists()
-        || !gradle_cache::has_gradle_marker(cwd)
-        || has_scala_tool_marker(cwd)
+    if layout::has_build(cwd, BuildTool::Maven)
+        || !layout::has_build(cwd, BuildTool::Gradle)
+        || layout::is_scala_tool_build(cwd)
     {
         return M2Gate::NotGradleOnly;
     }
@@ -723,40 +695,11 @@ pub fn maven_local_undetermined(cwd: &Path) -> Option<String> {
 // MavenCrawler
 // ---------------------------------------------------------------------------
 
-/// Files (root-relative) that make a directory an sbt, Mill or scala-cli
-/// project: the builds whose artifacts live in the Coursier / Ivy caches.
-const SCALA_TOOL_MARKERS: &[&str] = &[
-    "build.sbt",
-    "project/build.properties",
-    "build.mill",
-    "build.mill.yaml",
-    "build.sc",
-    "project.scala",
-    ".scala-build",
-];
-
-/// [`scala_tool_project`] for a blocking caller (the walk pool).
-fn has_scala_tool_marker(dir: &Path) -> bool {
-    SCALA_TOOL_MARKERS
-        .iter()
-        .any(|marker| std::fs::symlink_metadata(dir.join(marker)).is_ok())
-}
-
 /// `path` with its symlinks resolved, or as given when it cannot be.
 async fn canonical_or_self(path: &Path) -> PathBuf {
     tokio::fs::canonicalize(path)
         .await
         .unwrap_or_else(|_| path.to_path_buf())
-}
-
-/// Whether `dir` holds any [`SCALA_TOOL_MARKERS`] entry.
-async fn scala_tool_project(dir: &Path) -> bool {
-    for marker in SCALA_TOOL_MARKERS {
-        if tokio::fs::symlink_metadata(dir.join(marker)).await.is_ok() {
-            return true;
-        }
-    }
-    false
 }
 
 /// Whether `path` is spelled like a Coursier per-repository root (an
@@ -828,7 +771,7 @@ impl MavenCrawler {
     /// - The Gradle caches count for a Gradle build (a Gradle marker in the
     ///   cwd) or in global mode.
     /// - The Coursier / Ivy caches count for an sbt, Mill or scala-cli
-    ///   project (`SCALA_TOOL_MARKERS`) or in global mode; their
+    ///   project ([`layout::is_scala_tool_build`]) or in global mode; their
     ///   directories are read from the process environment.
     /// - The Maven local repository counts in global mode, for a `pom.xml`,
     ///   a Scala-tool build or a cwd with no Gradle marker, and for a
@@ -854,7 +797,7 @@ impl MavenCrawler {
         }
         let gradle_build = !options.global && {
             let cwd = options.cwd.clone();
-            run_walk(move || gradle_cache::has_gradle_marker(&cwd)).await
+            run_walk(move || layout::has_build(&cwd, BuildTool::Gradle)).await
         };
         let mut roots = Vec::new();
         if options.global || gradle_build {
@@ -864,18 +807,21 @@ impl MavenCrawler {
             let (cwd, env) = (options.cwd.clone(), env.clone());
             run_walk(move || m2_gate(&cwd, &env)).await != M2Gate::Ignored
         };
-        if m2 && is_dir(&env.m2_repo).await {
-            roots.push(JvmCacheRoot::new(
-                env.m2_repo.clone(),
-                JvmCacheLayout::Maven2,
-            ));
+        if let Some(m2_repo) = env.m2_repo.as_ref().filter(|_| m2) {
+            if is_dir(m2_repo).await {
+                roots.push(JvmCacheRoot::new(m2_repo.clone(), JvmCacheLayout::Maven2));
+            }
         }
         // sbt / Mill / scala-cli: Coursier's per-repository roots, the Ivy
         // caches, then the caches local sbt evidence points into (the
         // directory walks are blocking). The first root holding a PURL wins
         // the crawl dedup. Locally only for a Scala-tool project: a Maven or
         // Gradle build never reads those caches.
-        if !options.global && !scala_tool_project(&options.cwd).await {
+        let scala_tool = !options.global && {
+            let cwd = options.cwd.clone();
+            run_walk(move || layout::is_scala_tool_build(&cwd)).await
+        };
+        if !options.global && !scala_tool {
             return roots;
         }
         let cwd = options.cwd.clone();
@@ -950,8 +896,10 @@ impl MavenCrawler {
         let jvm = options.global_prefix.is_none()
             && (options.global || jvm_cache::is_jvm_project(&options.cwd).await);
         let mut paths = Vec::new();
-        if jvm && is_dir(&env.m2_repo).await {
-            paths.push(env.m2_repo.clone());
+        if let Some(m2_repo) = env.m2_repo.as_ref().filter(|_| jvm) {
+            if is_dir(m2_repo).await {
+                paths.push(m2_repo.clone());
+            }
         }
         // One physical cache once, however it is spelled (a root reached
         // through a symlinked home names the `~/.m2` pushed above): the
@@ -1060,14 +1008,12 @@ impl MavenCrawler {
                 // onto the repo root and then patched IN PLACE. Reject anything
                 // that could traverse out of the repository before touching the
                 // filesystem — the `.pom` check below is no defense.
-                if !is_safe_maven_coordinate(group_id, artifact_id, version) {
+                if !layout::is_path_safe(group_id, artifact_id, version) {
                     continue;
                 }
 
-                let expected_path = src_path
-                    .join(group_id_to_path(group_id))
-                    .join(artifact_id)
-                    .join(version);
+                let expected_path =
+                    layout::version_dir_path(src_path, group_id, artifact_id, version);
 
                 // The path already encodes the coordinates
                 // (groupId/artifactId/version), so verifying the package is
@@ -1119,7 +1065,7 @@ impl MavenCrawler {
     ///
     /// Same rule as `nuget_home()`, `deno_dir()`, `go_crawler`'s
     /// `get_gomodcache`, and `utils::fs::home_dir`.
-    fn m2_repo_path() -> PathBuf {
+    fn m2_repo_path() -> Option<PathBuf> {
         m2_repo_path_with(&gradle_cache::ProcessEnv, None)
     }
 
@@ -1231,7 +1177,7 @@ impl MavenCrawler {
                 version.into_owned(),
             );
             // SECURITY: `is_installed` refuses unsafe coordinates before
-            // joining them onto the root (see `is_safe_maven_coordinate`).
+            // joining them onto the root (see `layout::is_path_safe`).
             if !gradle_cache::is_installed(root, &gav) {
                 continue;
             }
@@ -2271,15 +2217,6 @@ mod tests {
         assert_eq!(extract_xml_value("  <groupId></groupId>", "groupId"), None);
     }
 
-    // ---- group_id_to_path tests ----
-
-    #[test]
-    fn test_group_id_to_path() {
-        assert_eq!(group_id_to_path("org.apache.commons"), "org/apache/commons");
-        assert_eq!(group_id_to_path("com.google.guava"), "com/google/guava");
-        assert_eq!(group_id_to_path("single"), "single");
-    }
-
     // ---- parse_path_coordinates tests ----
 
     #[test]
@@ -2379,53 +2316,6 @@ mod tests {
         );
     }
 
-    #[test]
-    fn test_is_safe_maven_coordinate() {
-        // Legit coordinates pass.
-        assert!(is_safe_maven_coordinate(
-            "org.apache.commons",
-            "commons-lang3",
-            "3.12.0"
-        ));
-        assert!(is_safe_maven_coordinate(
-            "com.google.guava",
-            "guava",
-            "32.1.3-jre"
-        ));
-        // `..` in any single-segment coordinate is rejected.
-        assert!(!is_safe_maven_coordinate("g", "..", "1.0.0"));
-        assert!(!is_safe_maven_coordinate("g", "../../escaped", "1.0.0"));
-        assert!(!is_safe_maven_coordinate("g", "a", ".."));
-        // A `/` in the artifactId/version (never legitimate) is rejected.
-        assert!(!is_safe_maven_coordinate("g", "a/b", "1.0.0"));
-        assert!(!is_safe_maven_coordinate("g", "a", "1/0"));
-        // groupId forms that convert to an absolute or empty-segment path
-        // (`.` -> `/`, `.a` -> `/a`) are rejected.
-        assert!(!is_safe_maven_coordinate(".", "a", "1.0.0"));
-        assert!(!is_safe_maven_coordinate("..", "a", "1.0.0"));
-        assert!(!is_safe_maven_coordinate(".org", "a", "1.0.0"));
-        assert!(!is_safe_maven_coordinate("org.", "a", "1.0.0"));
-        assert!(!is_safe_maven_coordinate("a..b", "a", "1.0.0"));
-        // Backslash / NUL anywhere is rejected.
-        assert!(!is_safe_maven_coordinate("g", "a\\b", "1.0.0"));
-        assert!(!is_safe_maven_coordinate("g\0x", "a", "1.0.0"));
-        // Empty coordinates are rejected.
-        assert!(!is_safe_maven_coordinate("", "a", "1.0.0"));
-        assert!(!is_safe_maven_coordinate("g", "", "1.0.0"));
-        assert!(!is_safe_maven_coordinate("g", "a", ""));
-        // Windows drive-relative escape: a `:` (e.g. `C:evil`) makes the
-        // joined path absolute under `Path::join`; rejected in every
-        // coordinate, including inside a dot-split groupId segment.
-        assert!(!is_safe_maven_coordinate("C:evil.org", "a", "1.0.0"));
-        assert!(!is_safe_maven_coordinate("g", "C:evil", "1.0.0"));
-        assert!(!is_safe_maven_coordinate("g", "a", "C:1.0.0"));
-        // A `/` smuggled inside a dot-split groupId segment never hits the
-        // per-dot-segment checks (`/etc` has no dots at all) but converts to
-        // an absolute or deeper path via `group_id_to_path`.
-        assert!(!is_safe_maven_coordinate("/etc", "a", "1.0.0"));
-        assert!(!is_safe_maven_coordinate("com/evil", "a", "1.0.0"));
-    }
-
     // ---- m2_repo_path env tests ----
 
     /// Save and restore an env var around a test body.
@@ -2454,6 +2344,38 @@ mod tests {
         }
     }
 
+    /// B66: with no usable home the default used to be the literal
+    /// RELATIVE `~/.m2/repository`, which resolves against the working
+    /// directory: a `~/.m2` inside the scanned project was crawled (and
+    /// patched in place) as the user's local repository. A relative `HOME`
+    /// is no home either; an absolute `USERPROFILE` or injected home still
+    /// names one.
+    #[test]
+    fn m2_repo_path_with_no_usable_home_names_no_repository() {
+        let env = |pairs: &[(&str, &str)]| -> HashMap<String, String> {
+            pairs
+                .iter()
+                .map(|(k, v)| (k.to_string(), v.to_string()))
+                .collect()
+        };
+        assert_eq!(m2_repo_path_with(&env(&[]), None), None);
+        assert_eq!(m2_repo_path_with(&env(&[("HOME", "")]), None), None);
+        assert_eq!(m2_repo_path_with(&env(&[("HOME", "~")]), None), None);
+        assert_eq!(
+            m2_repo_path_with(&env(&[("HOME", "rel/home")]), Some(Path::new("also-rel"))),
+            None
+        );
+        let abs = std::env::temp_dir();
+        let abs_s = abs.to_str().unwrap();
+        let want = Some(abs.join(".m2").join("repository"));
+        assert_eq!(
+            m2_repo_path_with(&env(&[("HOME", "rel"), ("USERPROFILE", abs_s)]), None),
+            want
+        );
+        assert_eq!(m2_repo_path_with(&env(&[("HOME", "~")]), Some(&abs)), want);
+        assert_eq!(m2_repo_path_with(&env(&[("HOME", abs_s)]), None), want);
+    }
+
     #[test]
     #[serial_test::serial]
     fn m2_repo_path_treats_empty_maven_repo_local_as_unset() {
@@ -2471,7 +2393,7 @@ mod tests {
         let repo = MavenCrawler::m2_repo_path();
         assert_eq!(
             repo,
-            m2_home.path().join("repository"),
+            Some(m2_home.path().join("repository")),
             "empty MAVEN_REPO_LOCAL must fall through to the M2_HOME arm, got {repo:?}"
         );
     }
@@ -2491,11 +2413,12 @@ mod tests {
         let repo = MavenCrawler::m2_repo_path();
         assert_ne!(
             repo,
-            PathBuf::from("repository"),
+            Some(PathBuf::from("repository")),
             "empty M2_HOME must not yield a CWD-relative repo path"
         );
         assert!(
-            repo.ends_with(".m2/repository"),
+            repo.as_deref()
+                .is_none_or(|r| r.ends_with(".m2/repository")),
             "empty M2_HOME must fall through to the ~/.m2/repository default, got {repo:?}"
         );
     }

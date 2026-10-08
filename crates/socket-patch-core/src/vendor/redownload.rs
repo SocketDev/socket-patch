@@ -8,6 +8,7 @@ use crate::utils::purl::{
 };
 
 use super::common::{copy_matches_after_hashes, swap_stage_into_place};
+use super::jvm::layout;
 use super::service_fetch::{
     fetch_verified_archive, ServiceAttempt, ServicePolicy, ServiceTerminal, VerifiedArchive,
 };
@@ -67,9 +68,7 @@ pub async fn restore(
     service: &VendorServiceConfig,
 ) -> Result<Vec<VendorWarning>, String> {
     let ecosystem = super::ecosystem_dir_for_purl(&entry.base_purl);
-    if ecosystem != Some(entry.ecosystem.as_str())
-        && !(ecosystem == Some("maven") && entry.ecosystem == "jvm")
-    {
+    if ecosystem != Some(layout::ledger_ecosystem(&entry.ecosystem)) {
         return Err("ledger package identity does not match its artifact ecosystem".into());
     }
     // The download would land in (and repair would vouch for) a store this
@@ -85,7 +84,7 @@ pub async fn restore(
     }
     // A JVM tree belongs to its build root: repairing from a subproject
     // would restore it where the real build never looks (#428).
-    if entry.ecosystem == "jvm" {
+    if entry.ecosystem == layout::LEDGER_ECOSYSTEM {
         if let Some(detail) = super::maven_repo::not_build_root(root) {
             return Err(format!("vendor_jvm_shape_unsupported: {detail}"));
         }
@@ -93,7 +92,7 @@ pub async fn restore(
     let artifact = match super::verify::checked_artifact_path(root, entry, record) {
         Ok(path) => path,
         Err(reason)
-            if entry.ecosystem == "jvm"
+            if entry.ecosystem == layout::LEDGER_ECOSYSTEM
                 && matches!(
                     reason.as_str(),
                     "vendor_artifact_missing" | "vendor_artifact_unreadable"
@@ -107,15 +106,8 @@ pub async fn restore(
         }
         Err(reason) => return Err(reason),
     };
-    let mut cursor = root.to_path_buf();
-    for part in entry.artifact.path.split('/') {
-        cursor.push(part);
-        if tokio::fs::symlink_metadata(&cursor)
-            .await
-            .is_ok_and(|m| m.file_type().is_symlink())
-        {
-            return Err("vendor_path_unsafe: artifact path contains a symlink".into());
-        }
+    if crate::utils::containment::linked_level(root, &root.join(&entry.artifact.path)).is_some() {
+        return Err("vendor_path_unsafe: artifact path contains a symlink".into());
     }
     let file_shaped = !super::verify::is_vlt_dir_entry(entry)
         && super::verify::artifact_is_file_shaped(&entry.artifact.path);
@@ -180,7 +172,7 @@ pub async fn restore(
         crate::utils::fs::atomic_write_artifact(&stage, &archive.bytes)
             .await
             .map_err(|e| e.to_string())?;
-        if entry.ecosystem == "maven" || entry.ecosystem == "jvm" {
+        if layout::ledger_ecosystem(&entry.ecosystem) == "maven" {
             jvm_trees = restore_maven_metadata(
                 root,
                 temporary.path(),
@@ -316,7 +308,7 @@ pub async fn restore(
             super::verify::verify_dir_inventory(&stage, inventory, uuid).await?;
         }
     }
-    if entry.ecosystem == "maven" || entry.ecosystem == "jvm" {
+    if layout::ledger_ecosystem(&entry.ecosystem) == "maven" {
         let target = artifact.parent().ok_or("artifact has no parent")?;
         tokio::fs::create_dir_all(target.parent().ok_or("artifact tree has no parent")?)
             .await
@@ -332,15 +324,8 @@ pub async fn restore(
             }
             // Same guard as the artifact's own path: never swap a tree
             // reached through a link (the swap deletes what it replaces).
-            let mut cursor = root.to_path_buf();
-            for part in rel.split('/') {
-                cursor.push(part);
-                if tokio::fs::symlink_metadata(&cursor)
-                    .await
-                    .is_ok_and(|m| m.file_type().is_symlink())
-                {
-                    return Err("vendor_path_unsafe: artifact path contains a symlink".into());
-                }
+            if crate::utils::containment::linked_level(root, &root.join(rel)).is_some() {
+                return Err("vendor_path_unsafe: artifact path contains a symlink".into());
             }
             tokio::fs::create_dir_all(target.parent().ok_or("tree has no parent")?)
                 .await
@@ -349,7 +334,7 @@ pub async fn restore(
                 .await
                 .map_err(|e| e.to_string())?;
         }
-        if entry.ecosystem == "jvm" {
+        if entry.ecosystem == layout::LEDGER_ECOSYSTEM {
             restore_jvm_owned_files(root, entry).await?;
         }
     } else {
@@ -450,7 +435,7 @@ async fn restore_maven_metadata(
     // The classifier artifacts the tree recorded (#533), downloaded again
     // and checked against their upstream checksums.
     let mut extras = Vec::new();
-    let gradle_tree = format!("{}/", super::jvm::gradle::TREE_ROOT);
+    let gradle_tree = format!("{}/", super::jvm::layout::GRADLE_TREE);
     for w in entry
         .wiring
         .iter()

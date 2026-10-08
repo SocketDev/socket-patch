@@ -566,8 +566,7 @@ async fn wet_takeover_refuses_unrevertable_vendored_flavor_fail_closed() {
         "the human skipped line must name purl + reason; stderr=\n{stderr}"
     );
     assert!(
-        stderr.contains("Warning: ")
-            && stderr.contains("could not be reverted"),
+        stderr.contains("Warning: ") && stderr.contains("could not be reverted"),
         "the takeover pre-warning must reach human stderr; stderr=\n{stderr}"
     );
 }
@@ -814,7 +813,10 @@ async fn zero_grant_wet_run_ignores_a_malformed_pre_v5_ledger() {
     let lock_before = std::fs::read(root.join("package-lock.json")).unwrap();
 
     let assert_ignored = |code: i32, doc: &Value, label: &str| {
-        assert_eq!(code, 0, "{label}: a pre-v5 ledger is never an error: {doc:#}");
+        assert_eq!(
+            code, 0,
+            "{label}: a pre-v5 ledger is never an error: {doc:#}"
+        );
         assert_eq!(doc["status"], "success", "{label}: {doc:#}");
         assert!(
             !doc.to_string().contains("redirect-state.json"),
@@ -1017,7 +1019,10 @@ async fn hosted_human_empty_discovery_ignores_a_malformed_pre_v5_ledger() {
 
     for extra in [&[][..], &["--silent"][..]] {
         let (code, stdout, stderr) = scan_hosted(root, &server.uri(), extra, &[]);
-        assert_eq!(code, 0, "{extra:?}: an empty discovery exits 0; stderr=\n{stderr}");
+        assert_eq!(
+            code, 0,
+            "{extra:?}: an empty discovery exits 0; stderr=\n{stderr}"
+        );
         if extra.is_empty() {
             assert!(
                 stdout.contains("No patches available for installed packages."),
@@ -1404,16 +1409,22 @@ async fn native_bun_lockb_hosting_dry_run_rerun_and_rollback_without_bun() {
         ],
         &env,
     );
-    assert_eq!(code, 1, "a binary bun.lockb pin is refused: {stdout}\n{stderr}");
+    assert_eq!(
+        code, 1,
+        "a binary bun.lockb pin is refused: {stdout}\n{stderr}"
+    );
     let doc: Value = serde_json::from_str(&stdout).unwrap_or_else(|e| panic!("{e}: {stdout}"));
     assert_eq!(doc["status"], "partial_failure", "{doc:#}");
-    let failed = doc["hosted"]["failed"].as_array().unwrap_or_else(|| panic!("{doc:#}"));
+    let failed = doc["hosted"]["failed"]
+        .as_array()
+        .unwrap_or_else(|| panic!("{doc:#}"));
     assert_eq!(failed.len(), 1, "{doc:#}");
     assert_eq!(failed[0]["purl"], purl, "{doc:#}");
     let error = failed[0]["error"].as_str().unwrap_or_default();
     assert!(
-        error.starts_with(&format!("cannot restore {purl} to its upstream registry entry: "))
-            && error.contains("bun.lockb")
+        error.starts_with(&format!(
+            "cannot restore {purl} to its upstream registry entry: "
+        )) && error.contains("bun.lockb")
             && error.contains("git checkout"),
         "{error}"
     );
@@ -1819,7 +1830,9 @@ async fn unreadable_pnpm_workspace_gets_warning_only_guidance_in_a_live_run() {
         "the unreadable workspace file must be left byte-identical"
     );
     assert!(
-        !tmp.path().join(".socket/vendor/redirect-state.json").exists(),
+        !tmp.path()
+            .join(".socket/vendor/redirect-state.json")
+            .exists(),
         "v5 hosted mode writes no redirect ledger"
     );
 }
@@ -1931,9 +1944,8 @@ async fn live_hosted_overlap_fires_redirect_supersedes_vendored() {
     let (code, _stdout, stderr) = scan_hosted(root, &server.uri(), &psu, &[]);
     assert_eq!(code, 0, "human overlap run exits 0; stderr=\n{stderr}");
     assert!(
-        stderr.contains(
-            "Warning: Hosted wiring superseded the vendored ledger for:"
-        ) && stderr.contains(XPURL),
+        stderr.contains("Warning: Hosted wiring superseded the vendored ledger for:")
+            && stderr.contains(XPURL),
         "the supersedes warning must reach human stderr; stderr=\n{stderr}"
     );
 }
@@ -1981,8 +1993,7 @@ async fn human_dry_run_prints_would_rewrite_pnpm_guidance_and_vex_skip() {
         "the requested-but-skipped VEX must be announced; stderr=\n{stderr}"
     );
     assert!(
-        stderr.contains("Warning: ")
-            && stderr.contains("trustLockfile"),
+        stderr.contains("Warning: ") && stderr.contains("trustLockfile"),
         "the pnpm trust guidance must reach human stderr; stderr=\n{stderr}"
     );
     assert!(
@@ -2135,16 +2146,13 @@ async fn human_rush_run_prints_the_repo_state_stale_warning_line() {
 
 // ───────── ledger save failure after a successful revert ─────────
 
-/// save_state failure AFTER a successful takeover revert: the wiring is gone
-/// but the vendored ledger still claims it, so the purl must fail CLOSED —
-/// `redirect_vendored_revert_failed` with the could-not-be-updated detail, a
-/// `vendored_revert_failed` skip, and no redirect — and, since the package
-/// is now unpatched in both modes, `redirect_takeover_unpatched` with
-/// `partial_failure` and exit 1. Reached by making
-/// `.socket/vendor` itself read-only (0o555): the entry's empty wiring
-/// reverts trivially and its artifact dir under the still-writable
-/// `.socket/vendor/npm/` is removed, but persisting the now-empty ledger
-/// needs a write in `.socket/vendor` and fails.
+/// The vendored ledger cannot be updated (`.socket/vendor` itself is
+/// read-only, 0o555): the takeover's revert, the hosted pin and the ledger
+/// are one commit, which then fails before it replaces anything. The run
+/// fails (exit 1) and NOTHING changed — the lock, the ledger and the
+/// artifact are byte-identical, so the package stays vendored and patched.
+/// Before the staged takeover, the revert was already on disk, leaving the
+/// package unpatched in both modes.
 #[cfg(unix)]
 #[tokio::test]
 async fn ledger_save_failure_after_successful_revert_fails_closed() {
@@ -2174,6 +2182,7 @@ async fn ledger_save_failure_after_successful_revert_fails_closed() {
     std::fs::create_dir_all(&artifact_dir).unwrap();
     std::fs::write(artifact_dir.join(format!("{NAME}-{VERSION}.tgz")), b"tgz").unwrap();
     let lock_before = std::fs::read(root.join("package-lock.json")).unwrap();
+    let state_before = std::fs::read(root.join(".socket/vendor/state.json")).unwrap();
 
     let vendor_dir = root.join(".socket/vendor");
     std::fs::set_permissions(&vendor_dir, std::fs::Permissions::from_mode(0o555)).unwrap();
@@ -2187,36 +2196,24 @@ async fn ledger_save_failure_after_successful_revert_fails_closed() {
 
     let (code, doc) = scan_hosted_json(root, &server.uri(), &[], &[]);
 
-    // The vendored wiring and artifact are already gone, so the package is
-    // unpatched in both modes: a stranded takeover, never a success.
-    assert_eq!(code, 1, "a stranded takeover exits 1: {doc:#}");
-    assert_eq!(doc["status"], "partial_failure", "envelope: {doc:#}");
-    assert!(
-        warning_detail(&doc, "redirect_takeover_unpatched").contains(PURL),
-        "the stranded package is named: {doc:#}"
-    );
-    let detail = warning_detail(&doc, "redirect_vendored_revert_failed");
-    assert!(
-        detail.contains("could not be updated"),
-        "the post-revert ledger-save failure must be named: {detail}"
-    );
-    assert!(
-        doc["redirect"]["skipped"].as_array().is_some_and(|s| s
-            .iter()
-            .any(|e| e["purl"] == PURL && e["reason"] == "vendored_revert_failed")),
-        "the refusal must be accounted as skipped: {doc:#}"
-    );
-    assert_eq!(doc["redirect"]["redirected"], 0, "envelope: {doc:#}");
-    let lock_after = std::fs::read(root.join("package-lock.json")).unwrap();
+    assert_eq!(code, 1, "the failed commit fails the run: {doc:#}");
+    assert_eq!(doc["status"], "error", "envelope: {doc:#}");
+    let text = doc.to_string();
+    assert!(text.contains("nothing was changed"), "{doc:#}");
+    assert!(!text.contains("redirect_takeover_unpatched"), "{doc:#}");
     assert_eq!(
-        lock_after, lock_before,
-        "no redirect may land when the ledger cannot record the takeover"
+        std::fs::read(root.join("package-lock.json")).unwrap(),
+        lock_before,
+        "no redirect lands"
     );
-    // Fail-closed residue this warning exists to explain: the wiring/artifact
-    // are reverted but the ledger still claims the entry.
+    assert_eq!(
+        std::fs::read(root.join(".socket/vendor/state.json")).unwrap(),
+        state_before,
+        "the ledger still claims the package"
+    );
     assert!(
-        root.join(".socket/vendor/state.json").exists(),
-        "the stale ledger survives (the warning tells the user to fix it)"
+        artifact_dir.join(format!("{NAME}-{VERSION}.tgz")).exists(),
+        "the artifact is kept"
     );
 }
 
@@ -2429,7 +2426,8 @@ async fn human_pnpm_rerun_prints_only_the_reminder_and_heal_restores_guidance() 
     let (code, stdout, stderr) = scan_hosted(root, &server.uri(), &[], &[]);
     assert_eq!(code, 0, "stdout=\n{stdout}\nstderr=\n{stderr}");
     assert!(
-        engine_stdout(&stdout).starts_with("Switched 1 package to hosted patches; rewrote 2 files.\n"),
+        engine_stdout(&stdout)
+            .starts_with("Switched 1 package to hosted patches; rewrote 2 files.\n"),
         "{stdout}"
     );
     // Everything from the pnpm warning on (the lines above it are the
@@ -2481,10 +2479,9 @@ async fn human_pnpm_rerun_prints_only_the_reminder_and_heal_restores_guidance() 
 
 // ───────────────────────────── vlt ─────────────────────────────
 
-/// A vendored vlt entry is never reverted for a hosted takeover the vlt
-/// rewriter would then refuse: the lock-level refusal (here a BOM) is known
-/// first, the purl is skipped with that code, and the vendored ledger and
-/// the lock stay byte-identical.
+/// A vendored vlt entry over a lock vlt cannot read (here a BOM) is never
+/// taken over: the staged revert refuses the unreadable lock itself, so the
+/// purl is skipped and the vendored ledger and the lock stay byte-identical.
 #[tokio::test]
 async fn vlt_takeover_refusal_before_revert() {
     let server = MockServer::start().await;
@@ -2509,11 +2506,11 @@ async fn vlt_takeover_refusal_before_revert() {
     assert!(
         doc["redirect"]["skipped"].as_array().is_some_and(|s| s
             .iter()
-            .any(|e| e["purl"] == PURL && e["reason"] == "redirect_vlt_lock_unsupported")),
+            .any(|e| e["purl"] == PURL && e["reason"] == "vendored_revert_failed")),
         "{doc:#}"
     );
-    assert!(warning_detail(&doc, "redirect_vlt_lock_unsupported").contains("BOM"));
-    assert!(!warning_codes(&doc).contains(&"redirect_vendored_revert_failed".to_string()));
+    assert!(warning_detail(&doc, "redirect_vendored_revert_failed").contains("vlt-lock.json"));
+    assert!(!warning_codes(&doc).contains(&"redirect_takeover_reverted_vendored".to_string()));
     assert_eq!(
         std::fs::read(tmp.path().join(".socket/vendor/state.json")).unwrap(),
         state_before

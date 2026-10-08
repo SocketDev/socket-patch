@@ -675,10 +675,192 @@ async fn hatch_vendored_to_hosted() {
     assert_vendored_to_hosted(&root, files).await;
 }
 
-/// The uv lock rewrite needs the hosted wheel's METADATA, fetched only
-/// after the takeover reverted the vendored wiring. When it is unavailable
-/// the package is left on the unpatched registry release in both modes, so
-/// the run must fail loudly instead of reporting success.
+/// Stages one flavor's project files; returns its wiring files.
+type StageFn = fn(&Path) -> &'static [&'static str];
+
+/// A uv PEP 723 script with its `.py.lock`; returns its wiring files.
+fn stage_script_lock(root: &Path) -> &'static [&'static str] {
+    std::fs::write(
+        root.join("job.py"),
+        "# /// script\n# requires-python = \">=3.9\"\n# dependencies = [\"six==1.16.0\"]\n# ///\nimport six\n",
+    )
+    .unwrap();
+    std::fs::write(
+        root.join("job.py.lock"),
+        format!(
+            "version = 1\nrevision = 3\nrequires-python = \">=3.9\"\n\n[manifest]\nrequirements = [{{name = \"six\", specifier = \"==1.16.0\"}}]\n\n[[package]]\nname = \"six\"\nversion = \"1.16.0\"\nsource = {{registry = \"https://pypi.org/simple\"}}\nwheels = [{{url = \"https://files.pythonhosted.org/six-1.16.0-py2.py3-none-any.whl\", hash = \"sha256:{WHEEL_SHA}\"}}]\n"
+        ),
+    )
+    .unwrap();
+    &["job.py", "job.py.lock"]
+}
+
+/// #742 / #650: a vendored uv project, uv script lock and Hatch project pick
+/// up a superseding patch. The manifest moves `six` from patch A to patch B
+/// (different patched bytes); the next `vendor` must wire B's wheel, remove
+/// A's uuid dir (`vendor_stale_artifact_removed`) and exit 0. Before the fix
+/// it failed `pypi_uv_source_already_exists`,
+/// `pypi_lock_source_already_exists` or `pypi_hatch_unsupported` (exit 1)
+/// and the project kept installing patch A. `vendor --revert` afterwards
+/// restores the user's original files byte for byte.
+#[tokio::test]
+async fn pyproject_flavors_vendored_revendor_superseding_patch() {
+    const UUID_B: &str = "5c3e1a2b-7d4f-4e6a-9b8c-1d2e3f4a5b6d";
+    const PATCHED_B: &[u8] = b"# six\nVERSION = '1.16.0'\nSOCKET_PATCHED = 2\n";
+    let stages: [(&str, StageFn); 3] = [
+        ("uv", stage_uv),
+        ("script lock", stage_script_lock),
+        ("hatch", stage_hatch),
+    ];
+    for (flavor, stage) in stages {
+        let (_tmp, root) = project();
+        let files = stage(&root);
+        let originals: Vec<String> = files
+            .iter()
+            .map(|f| std::fs::read_to_string(root.join(f)).unwrap())
+            .collect();
+        vendor_project(&root, files);
+
+        stage_manifest_with(&root, UUID_B, PATCHED_B);
+        let (code, env) = run_cli(&root, &["vendor"], &[]);
+        assert_eq!(
+            code, 0,
+            "{flavor}: re-vendor to the superseding patch: {env:#}"
+        );
+        let rendered = env.to_string();
+        assert!(!rendered.contains("already_exists"), "{flavor}: {env:#}");
+        assert!(
+            rendered.contains("vendor_stale_artifact_removed"),
+            "{flavor}: patch A's artifact is reclaimed: {env:#}"
+        );
+        let wired_b: Vec<String> = files
+            .iter()
+            .map(|f| std::fs::read_to_string(root.join(f)).unwrap())
+            .collect();
+        for (f, text) in files.iter().zip(&wired_b) {
+            assert!(!text.contains(UUID), "{flavor}: {f} kept uuid A:\n{text}");
+        }
+        assert!(
+            wired_b
+                .iter()
+                .any(|t| t.contains(&format!(".socket/vendor/pypi/{UUID_B}/"))),
+            "{flavor}: wired to patch B: {wired_b:#?}"
+        );
+        assert!(
+            !root.join(format!(".socket/vendor/pypi/{UUID}")).exists(),
+            "{flavor}"
+        );
+        assert!(
+            root.join(format!(".socket/vendor/pypi/{UUID_B}")).is_dir(),
+            "{flavor}"
+        );
+        let ledger = std::fs::read_to_string(root.join(".socket/vendor/state.json")).unwrap();
+        assert!(
+            ledger.contains(UUID_B) && !ledger.contains(UUID),
+            "{flavor}: {ledger}"
+        );
+
+        // Re-running is settled: in sync, nothing rewritten.
+        let (code, env) = run_cli(&root, &["vendor"], &[]);
+        assert_eq!(code, 0, "{flavor}: {env:#}");
+        for (f, text) in files.iter().zip(&wired_b) {
+            assert_eq!(
+                &std::fs::read_to_string(root.join(f)).unwrap(),
+                text,
+                "{flavor}: {f}"
+            );
+        }
+
+        let (code, env) = run_cli(&root, &["vendor", "--revert"], &[]);
+        assert_eq!(code, 0, "{flavor}: revert after the re-vendor: {env:#}");
+        for (f, text) in files.iter().zip(&originals) {
+            assert_eq!(
+                &std::fs::read_to_string(root.join(f)).unwrap(),
+                text,
+                "{flavor}: {f} restored to the user's original"
+            );
+        }
+        assert!(
+            !root.join(format!(".socket/vendor/pypi/{UUID_B}")).exists(),
+            "{flavor}"
+        );
+    }
+}
+
+/// A Hatch guard unrelated to the old wiring (here the uv installer, which
+/// Hatch reports under the same `pypi_hatch_unsupported` code, selected by
+/// environment variable or by an environment's `installer` / `uv-path`
+/// setting) refuses the superseding patch BEFORE patch A's wiring is
+/// unwound: the project files, the ledger and patch A's artifact are left
+/// exactly as they were, and no patch B wheel is built.
+#[tokio::test]
+async fn hatch_unrelated_guard_refuses_superseding_patch_before_unwinding() {
+    const UUID_B: &str = "5c3e1a2b-7d4f-4e6a-9b8c-1d2e3f4a5b6d";
+    const PATCHED_B: &[u8] = b"# six\nVERSION = '1.16.0'\nSOCKET_PATCHED = 2\n";
+    const UV_PATH: &[(&str, &str)] = &[("HATCH_ENV_TYPE_VIRTUAL_UV_PATH", "/usr/bin/uv")];
+    let cases = [
+        ("env var", "", UV_PATH),
+        (
+            "installer",
+            "\n[tool.hatch.envs.default]\ninstaller = \"uv\"\n",
+            &[],
+        ),
+        (
+            "uv-path",
+            "\n[tool.hatch.envs.default]\nuv-path = \"/usr/bin/uv\"\n",
+            &[],
+        ),
+    ];
+    for (case, setting, extra) in cases {
+        let (_tmp, root) = project();
+        let files = stage_hatch(&root);
+        vendor_project(&root, files);
+        if !setting.is_empty() {
+            let path = root.join("pyproject.toml");
+            let wired = std::fs::read_to_string(&path).unwrap();
+            std::fs::write(&path, wired + setting).unwrap();
+        }
+        let wired_a: Vec<String> = files
+            .iter()
+            .map(|f| std::fs::read_to_string(root.join(f)).unwrap())
+            .collect();
+        let ledger_a = std::fs::read_to_string(root.join(".socket/vendor/state.json")).unwrap();
+
+        stage_manifest_with(&root, UUID_B, PATCHED_B);
+        let (code, env) = run_cli(&root, &["vendor"], extra);
+        assert_eq!(code, 1, "{case}: {env:#}");
+        let rendered = env.to_string();
+        assert!(
+            rendered.contains("pypi_hatch_unsupported") && rendered.contains("pip installer"),
+            "{case}: the installer guard is the reported refusal: {env:#}"
+        );
+        for (f, text) in files.iter().zip(&wired_a) {
+            assert_eq!(
+                &std::fs::read_to_string(root.join(f)).unwrap(),
+                text,
+                "{case}: {f} untouched"
+            );
+        }
+        assert_eq!(
+            std::fs::read_to_string(root.join(".socket/vendor/state.json")).unwrap(),
+            ledger_a,
+            "{case}"
+        );
+        assert!(
+            root.join(format!(".socket/vendor/pypi/{UUID}")).is_dir(),
+            "{case}"
+        );
+        assert!(
+            !root.join(format!(".socket/vendor/pypi/{UUID_B}")).exists(),
+            "{case}"
+        );
+    }
+}
+
+/// The uv lock rewrite needs the hosted wheel's METADATA. When it is
+/// unavailable the rewrite cannot pin the package, so the staged takeover
+/// is retracted: the package stays vendored (and patched), byte for byte,
+/// and the run neither strands it unpatched nor fails.
 /// A vendored uv project whose hosted wheel the API cannot serve.
 async fn stranded_uv_project() -> (tempfile::TempDir, std::path::PathBuf, MockServer) {
     let (tmp, root) = project();
@@ -700,23 +882,208 @@ async fn stranded_uv_project() -> (tempfile::TempDir, std::path::PathBuf, MockSe
     (tmp, root, server)
 }
 
+/// The vendored wiring, ledger and artifact files of a project, byte for
+/// byte.
+fn vendored_snapshot(root: &Path) -> Vec<(String, Option<Vec<u8>>)> {
+    let mut out: Vec<(String, Option<Vec<u8>>)> =
+        ["uv.lock", "pyproject.toml", ".socket/vendor/state.json"]
+            .iter()
+            .map(|rel| (rel.to_string(), std::fs::read(root.join(rel)).ok()))
+            .collect();
+    let unit = root.join(format!(".socket/vendor/pypi/{UUID}"));
+    let mut artifacts: Vec<(String, Option<Vec<u8>>)> = std::fs::read_dir(&unit)
+        .map(|dir| {
+            dir.flatten()
+                .map(|e| {
+                    (
+                        e.file_name().to_string_lossy().into_owned(),
+                        std::fs::read(e.path()).ok(),
+                    )
+                })
+                .collect()
+        })
+        .unwrap_or_default();
+    artifacts.sort();
+    out.push((
+        "artifact files".into(),
+        (!artifacts.is_empty()).then(Vec::new),
+    ));
+    out.extend(artifacts);
+    out
+}
+
 #[tokio::test]
-async fn uv_takeover_without_wheel_metadata_fails_loudly() {
+async fn uv_takeover_without_wheel_metadata_keeps_the_package_vendored() {
+    for dry_run in [true, false] {
+        let (_tmp, root, server) = stranded_uv_project().await;
+        let before = vendored_snapshot(&root);
+        assert!(
+            before.iter().all(|(_, bytes)| bytes.is_some()),
+            "the fixture is vendored: {before:?}"
+        );
+        let uri = server.uri();
+        let mut args = hosted_scan_args(&uri);
+        if dry_run {
+            args.push("--dry-run");
+        }
+        let (code, env) = run_cli(&root, &args, &[]);
+        let ctx = format!("dry_run={dry_run}: {env:#}");
+        assert_eq!(code, 0, "a retracted takeover is not a failure: {ctx}");
+        assert_eq!(env["redirect"]["redirected"], 0, "{ctx}");
+        let text = env.to_string();
+        assert!(!text.contains("redirect_takeover_unpatched"), "{ctx}");
+        assert!(
+            !text.contains("redirect_takeover_reverted_vendored")
+                && !text.contains("redirect_would_revert_vendored"),
+            "no takeover is announced: {ctx}"
+        );
+        assert!(text.contains("redirect_takeover_kept_vendored"), "{ctx}");
+        assert!(
+            env["redirect"]["skipped"]
+                .as_array()
+                .is_some_and(|s| s.iter().any(|s| s["uuid"] == UUID)),
+            "the purl is skipped with its cause: {ctx}"
+        );
+        assert_eq!(
+            vendored_snapshot(&root),
+            before,
+            "the vendored wiring, ledger and wheel stay byte-identical: {ctx}"
+        );
+    }
+}
+
+/// Human output for a retracted takeover: no "Migrated … to hosted"
+/// progress line and no "keep the hosted patches" next steps.
+#[tokio::test]
+async fn retracted_takeover_human_output_is_not_a_migration() {
     let (_tmp, root, server) = stranded_uv_project().await;
-    let (code, env) = hosted_scan(&root, &server);
-    assert_eq!(code, 1, "a stranded takeover is a failure: {env:#}");
-    assert_eq!(env["status"], "partial_failure", "{env:#}");
-    assert_eq!(env["redirect"]["redirected"], 0, "{env:#}");
+    let uri = server.uri();
+    let (code, stdout, stderr) = run_raw(&root, &hosted_scan_args(&uri), &[]);
+    assert_eq!(code, 0, "stdout:\n{stdout}\nstderr:\n{stderr}");
     assert!(
-        env.to_string().contains("redirect_takeover_unpatched"),
-        "the unpatched package is named: {env:#}"
+        !stderr.contains("Migrated pkg:pypi/six@1.16.0"),
+        "a retracted package is not reported migrated:\n{stderr}"
     );
+    assert!(
+        !stdout.contains("keep the hosted patches") && !stdout.contains("Reinstall"),
+        "no next steps for a retracted takeover:\n{stdout}"
+    );
+    assert!(stderr.contains("stays vendored"), "{stderr}");
+}
+
+/// The takeover's revert, the hosted pin and the vendored ledger reach the
+/// disk in ONE journaled commit. A crash inside that commit (the journal
+/// written, no file or the first file replaced) never leaves the package
+/// unpatched in both modes: the next run that takes the apply lock finishes
+/// the commit first, and the project ends purely hosted. Before, the revert
+/// was written first and the hosted pin later, by separate writes.
+#[tokio::test]
+async fn a_crash_inside_the_takeover_commit_is_finished_by_the_next_run() {
+    for failpoint in ["group_commit_journal", "group_commit_file@1"] {
+        let (_tmp, root) = project();
+        let files = stage_requirements(&root);
+        vendor_project(&root, files);
+        let vendored = std::fs::read_to_string(root.join("requirements.txt")).unwrap();
+        let server = MockServer::start().await;
+        let hosted_url = mount_hosted_api(&server, true).await;
+        let uri = server.uri();
+        let (code, stdout, stderr) = run_raw(
+            &root,
+            &hosted_scan_args(&uri),
+            &[("SOCKET_PATCH_FAILPOINT", failpoint)],
+        );
+        assert_eq!(
+            code, 86,
+            "{failpoint}: the run crashes inside the commit\nstdout:\n{stdout}\nstderr:\n{stderr}"
+        );
+        let journal = root.join(".socket/vendor/.commit-journal.json");
+        assert!(journal.exists(), "{failpoint}: the commit is journaled");
+        if failpoint == "group_commit_journal" {
+            assert_eq!(
+                std::fs::read_to_string(root.join("requirements.txt")).unwrap(),
+                vendored,
+                "nothing is replaced before the journal is complete"
+            );
+        }
+
+        let (code, env) = run_cli(&root, &hosted_scan_args(&uri), &[]);
+        assert_eq!(code, 0, "{failpoint}: the next run: {env:#}");
+        assert!(!journal.exists(), "{failpoint}: the journal was replayed");
+        let text = std::fs::read_to_string(root.join("requirements.txt")).unwrap();
+        assert!(
+            text.contains(&hosted_url) && !text.contains(".socket/vendor/"),
+            "{failpoint}: the project is purely hosted:\n{text}"
+        );
+        let state = std::fs::read_to_string(root.join(".socket/vendor/state.json"));
+        assert!(
+            state.as_deref().map_or(true, |s| !s.contains(UUID)),
+            "{failpoint}: the ledger no longer claims the package: {state:?}"
+        );
+    }
 }
 
 /// A vendored requirements line edited since vendoring is left in place by
 /// the revert (the artifact and ledger entry are kept). The takeover must
 /// then refuse — keeping the ledger — rather than drop the entry and leave
 /// the project half vendored with no record of it.
+/// #721: a non-UTF-8 candidate file (here a UTF-16 `pip freeze` export
+/// beside a vendored Poetry project) refuses the hosted run BEFORE the
+/// takeover reverts anything, wet and `--dry-run` alike: refusing only at
+/// the rewrite would leave the reverted poetry.lock unpatched in both modes.
+#[tokio::test]
+async fn undecodable_candidate_refuses_before_the_takeover_reverts() {
+    let (_tmp, root) = project();
+    std::fs::write(
+        root.join("pyproject.toml"),
+        "[tool.poetry]\nname = \"demo\"\nversion = \"0.1.0\"\ndescription = \"\"\nauthors = [\"x <x@x>\"]\npackage-mode = false\n\n[tool.poetry.dependencies]\npython = \">=3.9\"\nsix = \"1.16.0\"\n",
+    )
+    .unwrap();
+    std::fs::write(
+        root.join("poetry.lock"),
+        POETRY_LOCK
+            .replace("WHEEL_SHA", WHEEL_SHA)
+            .replace("SDIST_SHA", SDIST_SHA),
+    )
+    .unwrap();
+    vendor_project(&root, &["poetry.lock", "pyproject.toml"]);
+    let mut utf16 = vec![0xFF, 0xFE];
+    for unit in "six==1.16.0\r\n".encode_utf16() {
+        utf16.extend(unit.to_le_bytes());
+    }
+    std::fs::write(root.join("requirements.txt"), &utf16).unwrap();
+    let lock = std::fs::read_to_string(root.join("poetry.lock")).unwrap();
+    let state = root.join(".socket/vendor/state.json");
+
+    let server = MockServer::start().await;
+    mount_hosted_api(&server, true).await;
+    let uri = server.uri();
+    for dry_run in [true, false] {
+        let mut args = hosted_scan_args(&uri);
+        if dry_run {
+            args.push("--dry-run");
+        }
+        let (code, env) = run_cli(&root, &args, &[]);
+        assert_eq!(code, 1, "dry_run={dry_run}: {env:#}");
+        let text = env.to_string();
+        assert!(
+            text.contains("candidate_file_unreadable") && text.contains("requirements.txt"),
+            "dry_run={dry_run}: {env:#}"
+        );
+        assert!(
+            !text.contains("redirect_takeover_reverted_vendored"),
+            "dry_run={dry_run}: nothing is reverted: {env:#}"
+        );
+        assert_eq!(
+            std::fs::read_to_string(root.join("poetry.lock")).unwrap(),
+            lock,
+            "dry_run={dry_run}: the vendored lock is untouched"
+        );
+        assert!(std::fs::read_to_string(&state).unwrap().contains(UUID));
+        assert!(root.join(format!(".socket/vendor/pypi/{UUID}")).exists());
+        assert_eq!(std::fs::read(root.join("requirements.txt")).unwrap(), utf16);
+    }
+}
+
 #[tokio::test]
 async fn drifted_vendored_line_refuses_takeover() {
     let (_tmp, root) = project();
@@ -758,40 +1125,6 @@ async fn drifted_vendored_line_refuses_takeover() {
     );
 }
 
-/// Human output for a stranded takeover: no "Migrated … to hosted" progress
-/// line and no "keep the hosted patches" next steps, only the warning.
-#[tokio::test]
-async fn stranded_takeover_human_output_is_not_a_migration() {
-    let (_tmp, root, server) = stranded_uv_project().await;
-    let uri = server.uri();
-    let (code, stdout, stderr) = run_raw(&root, &hosted_scan_args(&uri), &[]);
-    assert_eq!(code, 1, "stdout:\n{stdout}\nstderr:\n{stderr}");
-    assert!(
-        !stderr.contains("Migrated pkg:pypi/six@1.16.0"),
-        "a stranded package is not reported migrated:\n{stderr}"
-    );
-    assert!(
-        !stdout.contains("keep the hosted patches") && !stdout.contains("Reinstall"),
-        "no next steps for a stranded takeover:\n{stdout}"
-    );
-    assert!(stderr.contains("UNPATCHED"), "{stderr}");
-}
-
-/// `--silent` keeps errors: the stranded takeover's exit 1 is explained.
-#[tokio::test]
-async fn stranded_takeover_is_reported_under_silent() {
-    let (_tmp, root, server) = stranded_uv_project().await;
-    let uri = server.uri();
-    let mut args = hosted_scan_args(&uri);
-    args.push("--silent");
-    let (code, stdout, stderr) = run_raw(&root, &args, &[]);
-    assert_eq!(code, 1, "stdout:\n{stdout}\nstderr:\n{stderr}");
-    assert!(
-        stderr.contains("UNPATCHED") && stderr.contains("pkg:pypi/six@1.16.0"),
-        "the failure is diagnosable under --silent:\n{stderr}"
-    );
-}
-
 /// `--dry-run` predicts the drifted-wiring refusal instead of previewing a
 /// takeover the wet run would refuse.
 #[tokio::test]
@@ -828,18 +1161,19 @@ async fn dry_run_predicts_drifted_takeover_refusal() {
     );
 }
 
-/// The revert succeeds but the vendored ledger cannot be updated (a
-/// read-only `.socket/vendor/`): the wiring and wheel are already gone,
-/// so the package is unpatched in both modes. That is a stranded takeover
-/// (exit 1, `partial_failure`, `redirect_takeover_unpatched`), never a
-/// success.
+/// The vendored ledger cannot be updated (a read-only `.socket/vendor/`):
+/// the revert, the hosted pin and the ledger are one commit, which fails
+/// before it replaces anything. The run fails and nothing changed, so the
+/// package stays vendored and patched — never unpatched in both modes.
 #[cfg(unix)]
 #[tokio::test]
-async fn ledger_update_failure_after_revert_is_stranded() {
+async fn ledger_update_failure_changes_nothing() {
     use std::os::unix::fs::PermissionsExt as _;
     let (_tmp, root) = project();
     std::fs::write(root.join("requirements.txt"), "six==1.16.0\n").unwrap();
     vendor_project(&root, &["requirements.txt"]);
+    let vendored = std::fs::read(root.join("requirements.txt")).unwrap();
+    let state = std::fs::read(root.join(".socket/vendor/state.json")).unwrap();
     let vendor_dir = root.join(".socket/vendor");
     let set_mode = |mode| {
         std::fs::set_permissions(&vendor_dir, std::fs::Permissions::from_mode(mode)).unwrap()
@@ -859,11 +1193,12 @@ async fn ledger_update_failure_after_revert_is_stranded() {
     mount_hosted_api(&server, true).await;
     let (code, env) = hosted_scan(&root, &server);
     set_mode(0o755);
-    let text = env.to_string();
-    assert!(text.contains("redirect_vendored_revert_failed"), "{env:#}");
-    assert!(text.contains("redirect_takeover_unpatched"), "{env:#}");
-    assert_eq!(env["status"], "partial_failure", "{env:#}");
     assert_eq!(code, 1, "{env:#}");
+    assert_eq!(env["status"], "error", "{env:#}");
+    assert!(!env.to_string().contains("redirect_takeover_unpatched"), "{env:#}");
+    assert_eq!(std::fs::read(root.join("requirements.txt")).unwrap(), vendored);
+    assert_eq!(std::fs::read(root.join(".socket/vendor/state.json")).unwrap(), state);
+    assert!(root.join(format!(".socket/vendor/pypi/{UUID}")).exists());
 }
 
 // ── `vendor --check` wiring audit (#725) ─────────────────────────────────
@@ -952,27 +1287,36 @@ async fn vendor_check_fails_after_hatch_dependency_reset() {
 /// revert — the vendored patch, ledger entry and wheel are kept — and the
 /// dry run must predict that refusal instead of a clean takeover.
 async fn assert_unreachable_takeover_refused(root: &Path, wired: &str, dry_run: bool) {
-    assert_takeover_refused_before_revert(
+    assert_takeover_refused(
         root,
-        wired,
-        dry_run,
-        WHEEL,
+        &[wired, "requirements.txt"],
         "redirect_requirements_takeover_unreachable",
+        dry_run,
     )
     .await;
 }
 
-/// A takeover hosted mode cannot complete is refused before the revert:
-/// the vendored line, ledger entry and wheel are kept and `code` names why.
-async fn assert_takeover_refused_before_revert(
+/// A vendored → hosted takeover the hosted rewriter cannot carry through
+/// is refused BEFORE the revert, in the wet run and the dry run alike:
+/// the refusal `code` is named, nothing is redirected, the run exits 0,
+/// and every wiring file in `files`, the ledger entry and the vendored
+/// wheel are kept byte for byte.
+async fn assert_takeover_refused(root: &Path, files: &[&str], code_name: &str, dry_run: bool) {
+    assert_takeover_refused_serving(root, files, code_name, dry_run, WHEEL).await;
+}
+
+/// [`assert_takeover_refused`] with the hosted API granting `wheel_name`.
+async fn assert_takeover_refused_serving(
     root: &Path,
-    wired: &str,
+    files: &[&str],
+    code_name: &str,
     dry_run: bool,
     wheel_name: &str,
-    code_name: &str,
 ) {
-    let before = std::fs::read_to_string(root.join(wired)).unwrap();
-    let root_before = std::fs::read_to_string(root.join("requirements.txt")).unwrap();
+    let before: Vec<String> = files
+        .iter()
+        .map(|f| std::fs::read_to_string(root.join(f)).unwrap())
+        .collect();
     let state = root.join(".socket/vendor/state.json");
     let server = MockServer::start().await;
     mount_hosted_api_serving(&server, true, wheel_name).await;
@@ -998,16 +1342,13 @@ async fn assert_takeover_refused_before_revert(
         code, 0,
         "a refused takeover keeps the package vendored: {env:#}"
     );
-    assert_eq!(
-        std::fs::read_to_string(root.join(wired)).unwrap(),
-        before,
-        "{wired}: the vendored line is kept"
-    );
-    assert_eq!(
-        std::fs::read_to_string(root.join("requirements.txt")).unwrap(),
-        root_before,
-        "requirements.txt is untouched"
-    );
+    for (f, before) in files.iter().zip(&before) {
+        assert_eq!(
+            &std::fs::read_to_string(root.join(f)).unwrap(),
+            before,
+            "{f}: the vendored wiring is kept"
+        );
+    }
     assert!(
         std::fs::read_to_string(&state).unwrap().contains(UUID),
         "the ledger entry is kept"
@@ -1085,6 +1426,201 @@ async fn dry_run_previews_root_pin_takeover() {
     assert_eq!(env["redirect"]["redirected"], 1, "{env:#}");
 }
 
+/// uv.lock resolving `six` 1.17.0, either as a direct `six>=1.15` or
+/// through `python-dateutil`. Vendoring the manifest's `six@1.16.0` pins
+/// the lock entry down to 1.16.0, so the revert brings 1.17.0 back.
+const UV_LOCK_DRIFTED_DIRECT: &str = r#"version = 1
+revision = 2
+requires-python = ">=3.9"
+
+[[package]]
+name = "demo"
+version = "0.1.0"
+source = { virtual = "." }
+dependencies = [
+    { name = "six" },
+]
+
+[package.metadata]
+requires-dist = [{ name = "six", specifier = ">=1.15" }]
+
+[[package]]
+name = "six"
+version = "1.17.0"
+source = { registry = "https://pypi.org/simple" }
+sdist = { url = "https://files.pythonhosted.org/packages/94/e7/b2c673351809dca68a0e064b6af791aa332cf192da575fd474ed7d6f16a2/six-1.17.0.tar.gz", hash = "sha256:ff70335d468e7eb6ec65b95b99d3a2836546063f63acc5171de367e834932a81", size = 34031, upload-time = "2024-12-04T17:35:28.174Z" }
+wheels = [
+    { url = "https://files.pythonhosted.org/packages/b7/ce/149a00dd41f10bc29e5921b496af8b574d8413afcd5e30dfa0ed46c2cc5e/six-1.17.0-py2.py3-none-any.whl", hash = "sha256:4721f391ed90541fddacab5acf947aa0d3dc7d27b2e1e8eda2be8970586c3274", size = 11050, upload-time = "2024-12-04T17:35:26.475Z" },
+]
+"#;
+
+const UV_LOCK_DRIFTED_TRANSITIVE: &str = r#"version = 1
+revision = 2
+requires-python = ">=3.9"
+
+[[package]]
+name = "demo"
+version = "0.1.0"
+source = { virtual = "." }
+dependencies = [
+    { name = "python-dateutil" },
+]
+
+[package.metadata]
+requires-dist = [{ name = "python-dateutil", specifier = "==2.9.0.post0" }]
+
+[[package]]
+name = "python-dateutil"
+version = "2.9.0.post0"
+source = { registry = "https://pypi.org/simple" }
+dependencies = [
+    { name = "six" },
+]
+sdist = { url = "https://files.pythonhosted.org/packages/66/c0/0c8b6ad9f17a802ee498c46e004a0eb49bc148f2fd230864601a86dcf6db/python-dateutil-2.9.0.post0.tar.gz", hash = "sha256:37dd54208da7e1cd875388217d5e00ebd4179249f90fb72437e91a35459a0ad3", size = 342432, upload-time = "2024-03-01T18:36:20.211Z" }
+wheels = [
+    { url = "https://files.pythonhosted.org/packages/ec/57/56b9bcc3c9c6a792fcbaf139543cee77261f3651ca9da0c93f5c1221264b/python_dateutil-2.9.0.post0-py2.py3-none-any.whl", hash = "sha256:a8b2bc7bffae282281c8140a97d3aa9c14da0b136dfe83f850eea9a5f7470427", size = 229892, upload-time = "2024-03-01T18:36:18.57Z" },
+]
+
+[[package]]
+name = "six"
+version = "1.17.0"
+source = { registry = "https://pypi.org/simple" }
+sdist = { url = "https://files.pythonhosted.org/packages/94/e7/b2c673351809dca68a0e064b6af791aa332cf192da575fd474ed7d6f16a2/six-1.17.0.tar.gz", hash = "sha256:ff70335d468e7eb6ec65b95b99d3a2836546063f63acc5171de367e834932a81", size = 34031, upload-time = "2024-12-04T17:35:28.174Z" }
+wheels = [
+    { url = "https://files.pythonhosted.org/packages/b7/ce/149a00dd41f10bc29e5921b496af8b574d8413afcd5e30dfa0ed46c2cc5e/six-1.17.0-py2.py3-none-any.whl", hash = "sha256:4721f391ed90541fddacab5acf947aa0d3dc7d27b2e1e8eda2be8970586c3274", size = 11050, upload-time = "2024-12-04T17:35:26.475Z" },
+]
+"#;
+
+/// #723: vendor a uv project whose lock resolves `six` 1.17.0 while the
+/// manifest patches `six@1.16.0`; vendored uv pins the lock down to the
+/// patch version.
+fn drifted_uv_project(dependency: &str, lock: &str) -> (tempfile::TempDir, std::path::PathBuf) {
+    let (tmp, root) = project();
+    std::fs::write(
+        root.join("pyproject.toml"),
+        format!(
+            "[project]\nname = \"demo\"\nversion = \"0.1.0\"\nrequires-python = \">=3.9\"\ndependencies = [\"{dependency}\"]\n"
+        ),
+    )
+    .unwrap();
+    std::fs::write(root.join("uv.lock"), lock).unwrap();
+    vendor_project(&root, &["uv.lock", "pyproject.toml"]);
+    (tmp, root)
+}
+
+fn drifted_uv_direct() -> (tempfile::TempDir, std::path::PathBuf) {
+    drifted_uv_project("six>=1.15", UV_LOCK_DRIFTED_DIRECT)
+}
+
+fn drifted_uv_transitive() -> (tempfile::TempDir, std::path::PathBuf) {
+    drifted_uv_project("python-dateutil==2.9.0.post0", UV_LOCK_DRIFTED_TRANSITIVE)
+}
+
+#[tokio::test]
+async fn uv_pinned_down_direct_takeover_is_refused_before_revert() {
+    let (_tmp, root) = drifted_uv_direct();
+    assert_takeover_refused(
+        &root,
+        &["uv.lock", "pyproject.toml"],
+        "redirect_uv_takeover_version_unreachable",
+        false,
+    )
+    .await;
+}
+
+#[tokio::test]
+async fn dry_run_predicts_uv_pinned_down_direct_takeover_refusal() {
+    let (_tmp, root) = drifted_uv_direct();
+    assert_takeover_refused(
+        &root,
+        &["uv.lock", "pyproject.toml"],
+        "redirect_uv_takeover_version_unreachable",
+        true,
+    )
+    .await;
+}
+
+#[tokio::test]
+async fn uv_pinned_down_transitive_takeover_is_refused_before_revert() {
+    let (_tmp, root) = drifted_uv_transitive();
+    assert_takeover_refused(
+        &root,
+        &["uv.lock", "pyproject.toml"],
+        "redirect_uv_takeover_version_unreachable",
+        false,
+    )
+    .await;
+}
+
+#[tokio::test]
+async fn dry_run_predicts_uv_pinned_down_transitive_takeover_refusal() {
+    let (_tmp, root) = drifted_uv_transitive();
+    assert_takeover_refused(
+        &root,
+        &["uv.lock", "pyproject.toml"],
+        "redirect_uv_takeover_version_unreachable",
+        true,
+    )
+    .await;
+}
+
+/// A Poetry 0.12 lock: no `lock-version`, hashes in `[metadata.hashes]`.
+const POETRY_0_LOCK: &str = r#"[[package]]
+category = "main"
+description = "Python 2 and 3 compatibility utilities"
+name = "six"
+optional = false
+python-versions = ">=2.7, !=3.0.*, !=3.1.*, !=3.2.*"
+version = "1.16.0"
+
+[metadata]
+content-hash = "4b42a89b7ff7b26511b06acdc458dbd85312e5083db8f212b017482bc68cdd01"
+python-versions = ">=3.9"
+
+[metadata.hashes]
+six = ["sha256:WHEEL_SHA", "sha256:SDIST_SHA"]
+"#;
+
+/// #945: vendored mode supports a Poetry 0.12 lock, hosted mode refuses
+/// every one of them.
+fn poetry_0_project() -> (tempfile::TempDir, std::path::PathBuf) {
+    let (tmp, root) = project();
+    let files = stage_poetry(&root);
+    std::fs::write(
+        root.join("poetry.lock"),
+        POETRY_0_LOCK
+            .replace("WHEEL_SHA", WHEEL_SHA)
+            .replace("SDIST_SHA", SDIST_SHA),
+    )
+    .unwrap();
+    vendor_project(&root, files);
+    (tmp, root)
+}
+
+#[tokio::test]
+async fn poetry_0_lock_takeover_is_refused_before_revert() {
+    let (_tmp, root) = poetry_0_project();
+    assert_takeover_refused(
+        &root,
+        &["poetry.lock", "pyproject.toml"],
+        "redirect_poetry_lock_unsupported",
+        false,
+    )
+    .await;
+}
+
+#[tokio::test]
+async fn dry_run_predicts_poetry_0_lock_takeover_refusal() {
+    let (_tmp, root) = poetry_0_project();
+    assert_takeover_refused(
+        &root,
+        &["poetry.lock", "pyproject.toml"],
+        "redirect_poetry_lock_unsupported",
+        true,
+    )
+    .await;
+}
+
 /// #701 / #932: a hosted grant that is a platform-tagged wheel is never
 /// pinned, so a vendored → hosted takeover onto it must be refused BEFORE
 /// the revert (keeping the vendored patch) instead of stranding the
@@ -1096,13 +1632,64 @@ async fn platform_wheel_takeover_is_refused_before_revert() {
         let (_tmp, root) = project();
         let files = stage_requirements(&root);
         vendor_project(&root, files);
-        assert_takeover_refused_before_revert(
+        assert_takeover_refused_serving(
             &root,
-            "requirements.txt",
+            &["requirements.txt"],
+            "redirect_pypi_platform_wheel",
             dry_run,
             PLATFORM,
-            "redirect_pypi_platform_wheel",
         )
         .await;
     }
+}
+
+/// #612: a Pipenv project with a `requirements.txt` exported beside its
+/// lock (`pipenv requirements`). Hosted mode pins both; the hosted →
+/// vendored takeover (`vendor` over the hosted project) wires only the
+/// governing `Pipfile.lock` and restores the requirements pin to upstream,
+/// so the run must name `requirements.txt` among the install sources left
+/// UNPATCHED instead of passing in silence.
+#[tokio::test]
+async fn pipenv_hosted_to_vendored_names_the_unpatched_requirements() {
+    let (_tmp, root) = project();
+    stage_pipenv(&root);
+    std::fs::write(
+        root.join("requirements.txt"),
+        "-i https://pypi.org/simple\nsix==1.16.0\n",
+    )
+    .unwrap();
+    let server = MockServer::start().await;
+    let hosted_url = mount_hosted_api(&server, true).await;
+    let (code, env) = hosted_scan(&root, &server);
+    assert_eq!(code, 0, "hosted scan: {env:#}");
+    let hosted_reqs = std::fs::read_to_string(root.join("requirements.txt")).unwrap();
+    assert!(
+        hosted_reqs.contains(&hosted_url),
+        "hosted mode pins requirements.txt too:\n{hosted_reqs}\n{env:#}"
+    );
+
+    stage_manifest(&root);
+    // The takeover recognizes the pin only under `--patch-server-url`,
+    // which also rehosts the prebuilt download: serve the vendored wheel
+    // from the same mock.
+    prebuilt_common::mount_project(&server, &root).await;
+    let uri = server.uri();
+    let (code, env) = run_cli(
+        &root,
+        &["vendor", "--patch-server-url", &uri, "--vendor-url", &uri],
+        &[],
+    );
+    assert_eq!(code, 0, "vendor takeover: {env:#}");
+    let lock = std::fs::read_to_string(root.join("Pipfile.lock")).unwrap();
+    assert!(
+        lock.contains(&format!(".socket/vendor/pypi/{UUID}/")),
+        "Pipfile.lock is wired to the vendored wheel:\n{lock}\n{env:#}"
+    );
+    let rendered = env.to_string();
+    assert!(
+        rendered.contains("\"pypi_multiple_lockfiles\"")
+            && rendered.contains("wiring `Pipfile.lock`")
+            && rendered.contains("requirements.txt will still install the UNPATCHED"),
+        "the takeover names requirements.txt as an unpatched install source: {env:#}"
+    );
 }

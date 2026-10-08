@@ -17,7 +17,9 @@ use wiremock::{Mock, MockServer, ResponseTemplate};
 const ORG: &str = "test-org";
 const UUID: &str = "22222222-2222-4222-8222-222222222222";
 const PURL: &str = "pkg:npm/fallback-pkg@1.0.0";
-const AFTER_HASH: &str = "1111111111111111111111111111111111111111111111111111111111111111";
+/// The git-sha256 of `patched\n`, the view's inline blob content (inline
+/// blobs are verified against their name, #726).
+const AFTER_HASH: &str = "d2802877eb1c2f442d30d18abcb281cb2830875571624544f2f1acb36480997e";
 
 #[tokio::test]
 #[serial]
@@ -40,7 +42,7 @@ async fn stale_token_uuid_get_falls_back_to_proxy_end_to_end() {
             "publishedAt": "2024-06-01T00:00:00Z",
             "files": {
                 "package/index.js": {
-                    "beforeHash": "0000000000000000000000000000000000000000000000000000000000000000",
+                    "beforeHash": "9b8142d93991702a22920638c6d6768b150706c5e018b3605b74552d09fd160e",
                     "afterHash": AFTER_HASH,
                     "blobContent": "cGF0Y2hlZAo=",
                     "beforeBlobContent": "b3JpZ2luYWwK",

@@ -1693,12 +1693,14 @@ fn rest_blocks_edit(rest: &str) -> Option<String> {
     }
     // A `**opts` splat or hash literal is kept after `path:` (#847): a
     // source hidden in it makes bundler refuse the Gemfile loudly.
-    gemfile::source_option(rest).filter(|opt| !opt.dynamic).map(|opt| {
-        format!(
-            "the declaration already carries `{}` (revert any previous vendoring first)",
-            opt.spelling
-        )
-    })
+    gemfile::source_option(rest)
+        .filter(|opt| !opt.dynamic)
+        .map(|opt| {
+            format!(
+                "the declaration already carries `{}` (revert any previous vendoring first)",
+                opt.spelling
+            )
+        })
 }
 
 /// The quoted `path:` option value on a gem line's argument tail (only the
@@ -2970,6 +2972,43 @@ mod tests {
         assert_eq!(
             tokio::fs::read_to_string(root.join(GEMFILE)).await.unwrap(),
             GEMFILE_DIRECT
+        );
+        assert_eq!(
+            tokio::fs::read_to_string(root.join(GEMFILE_LOCK))
+                .await
+                .unwrap(),
+            LOCK_DIRECT
+        );
+        assert!(!root.join(".socket/vendor").exists());
+    }
+
+    /// #749: bundler 4's `bundle config set lockfile custom.lock` makes
+    /// bundler read `custom.lock`, which vendored mode never wires: wiring
+    /// `Gemfile.lock` would leave the lock bundler installs from untouched.
+    /// Refused before any write.
+    #[tokio::test]
+    async fn a_bundler4_custom_lockfile_is_refused() {
+        let (_tmp, root, installed, blobs, record) = fixture(GEMFILE_DIRECT, LOCK_DIRECT).await;
+        tokio::fs::write(root.join("custom.lock"), LOCK_DIRECT)
+            .await
+            .unwrap();
+        tokio::fs::create_dir_all(root.join(".bundle"))
+            .await
+            .unwrap();
+        tokio::fs::write(
+            root.join(".bundle/config"),
+            "---\nBUNDLE_LOCKFILE: \"custom.lock\"\n",
+        )
+        .await
+        .unwrap();
+
+        let (code, detail) =
+            unwrap_refused(run_vendor(&root, &blobs, &installed, &record, false).await);
+        assert_eq!(code, "gemfile_not_loaded");
+        assert!(detail.contains("custom.lock"), "{detail}");
+        assert!(
+            detail.contains("bundle config unset --local lockfile"),
+            "{detail}"
         );
         assert_eq!(
             tokio::fs::read_to_string(root.join(GEMFILE_LOCK))

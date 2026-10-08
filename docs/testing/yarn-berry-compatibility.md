@@ -11,7 +11,18 @@ vendored (`vendor` wires the root
 linkers are covered end to end; Plug'n'Play keeps packages inside
 `.yarn/cache` zips, so `vendor` refuses it (`vendor_yarn_berry_unsupported`)
 and so does `apply` (`yarn_pnp_unsupported`), while standalone `vex` still
-attests a hosted lock's `checksum:` pin.
+attests a hosted lock's `checksum:` pin once the PnP loader (`.pnp.cjs`)
+resolves the package through the hosted url. A loader written before the lock
+was rewired still runs the registry copy, so `vex` omits the package
+(`package_not_found`) until `yarn install` rewrites it (#519). Plug'n'Play is
+decided by the configured linker (`YARN_NODE_LINKER`, else the nearest rc file
+at or above the project that sets `nodeLinker`, else the home folder's rc file;
+the rc file is `.yarnrc.yml` unless `YARN_RC_FILENAME` renames it; unset means
+berry's default, `pnp`), not by whether a `.pnp.*` loader happens to exist:
+`vendor` refuses a lock-only PnP checkout up front, and a stale `.pnp.js` left
+by a Yarn 2 migration to `node-modules` or `pnpm` is ignored. Yarn 1 PnP
+(`installConfig.pnp`, a classic `yarn.lock`) has no `nodeLinker`, so its
+loader is always refused, whatever a berry setting says.
 
 ## Hosted pin shape and registry credentials
 
@@ -108,7 +119,7 @@ What socket-patch does with those files:
 | leading BOM | kept | kept, both files |
 | mixed CRLF / LF, or a bare CR | refused untouched: `redirect_yarn_berry_mixed_line_endings` | refused before any write: `vendor_yarn_berry_mixed_line_endings` |
 | revert (`rollback`, `remove`, takeovers) | upstream entries reconstructed from registry metadata; mixed endings refuse as drift | byte-exact; a lock mixed after vendoring gets the restored entry in the terminator of the entry it replaces |
-| mode takeover into this mode | the berry gates (line endings, `cacheKey`, `compressionLevel`) run BEFORE the vendored wiring is reverted; a refused purl stays vendored, byte-identical | the backend's project gates (both files' line endings, `cacheKey`, `compressionLevel`) run BEFORE the hosted redirect is reverted; a refused purl stays hosted, byte-identical |
+| mode takeover into this mode | the vendored revert is staged and the hosted rewrite planned against it; a purl the berry rewriter refuses (line endings, `cacheKey`, `compressionLevel`, no berry checksum) is retracted and stays vendored, byte-identical | the backend's project gates (both files' line endings, `cacheKey`, `compressionLevel`) run BEFORE the hosted redirect is reverted; a refused purl stays hosted, byte-identical |
 
 Every reader — manifest-less `vex`, the lockfile inventory, the npm flavor
 sniff, `repair` — splits CRLF lines like LF ones and skips a leading BOM.

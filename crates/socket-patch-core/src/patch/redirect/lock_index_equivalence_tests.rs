@@ -267,6 +267,7 @@ fn indexed_yarn_classic_rewrite_matches_golden() {
         "redirect_yarn_classic_missing_sha512",
         "redirect_yarn_classic_alias_skipped",
         "redirect_yarn_classic_entry_not_found",
+        "redirect_yarn_classic_unresolved_entry_skipped",
         "redirect_yarn_classic_unsupported_line_endings",
     ] {
         assert!(codes.contains(code), "missing {code}: {codes:?}");

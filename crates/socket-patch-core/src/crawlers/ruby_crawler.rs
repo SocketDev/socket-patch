@@ -4,10 +4,9 @@ use std::path::{Path, PathBuf};
 
 use super::types::{CrawledPackage, CrawlerOptions};
 use crate::patch::path_safety;
-use crate::utils::fs::{
-    entry_is_dir, home_dir, is_dir, is_file, list_dir_entries, normalize_lexically, run_blocking,
-};
+use crate::utils::fs::{entry_is_dir, home_dir, is_dir, is_file, list_dir_entries, run_blocking};
 use crate::utils::process::{CommandRunner, SystemCommandRunner};
+use crate::utils::relpath::normalize_lexically;
 use crate::vendor::lock_inventory::{DiskSnapshot, ProjectView};
 
 /// Ruby/RubyGems ecosystem crawler for discovering gems in Bundler vendor
@@ -629,6 +628,63 @@ impl RubyCrawler {
             .collect()
     }
 
+    /// The gem homes `bundle install` installs into or reuses for this
+    /// project, each tagged project-local or shared, for the hosted
+    /// stale-install guard: a stale copy only matters where Bundler would
+    /// keep it instead of fetching the patched gem.
+    ///
+    /// Unlike [`Self::get_gem_paths`] (apply's write targets, which keep
+    /// the `gem env` homes for default gems), the `gem env` homes count
+    /// here only when Bundler uses system gems: no deployment store under
+    /// the default `vendor/bundle` and no explicit install `path`
+    /// ([`bundler_sets_explicit_path`]). The refused out-of-tree
+    /// config root ([`Self::verification_only_gem_paths`]) is included,
+    /// since Bundler installs into it. See [`bundler_gem_homes_from`] for
+    /// the project-local rule.
+    pub async fn bundler_install_homes(&self, options: &CrawlerOptions) -> Vec<BundlerGemHome> {
+        if options.global || options.global_prefix.is_some() {
+            let paths = self.get_gem_paths(options).await.unwrap_or_default();
+            return bundler_gem_homes_from(&options.cwd, &[], &[], &paths);
+        }
+        let discovery = Self::discover_bundle_stores(&options.cwd).await;
+        let verification = match &discovery.skipped_config_root {
+            Some(root) => Self::bundle_root_gems_dirs(root).await,
+            None => Vec::new(),
+        };
+        let ignore_config = bundler_ignores_config();
+        let uses_system_gems = !discovery.default_root_has_stores
+            && Self::has_bundler_manifest(&options.cwd).await
+            && !bundler_sets_explicit_path(BundlerPathTiers {
+                local: read_app_config(
+                    &options.cwd,
+                    std::env::var_os("BUNDLE_APP_CONFIG").as_deref(),
+                    ignore_config,
+                )
+                .await,
+                env: BundlerPathSettings::from_env(
+                    std::env::var_os("BUNDLE_PATH").as_deref(),
+                    std::env::var_os("BUNDLE_PATH__SYSTEM").as_deref(),
+                    std::env::var_os("BUNDLE_DISABLE_SHARED_GEMS").as_deref(),
+                ),
+                global: read_global_config(
+                    ambient_bundler_global_config_file(&options.cwd).as_deref(),
+                    ignore_config,
+                )
+                .await,
+            });
+        let system_homes = if uses_system_gems {
+            Self::gem_env_gems_dirs().await
+        } else {
+            Vec::new()
+        };
+        bundler_gem_homes_from(
+            &options.cwd,
+            &discovery.stores,
+            &verification,
+            &system_homes,
+        )
+    }
+
     /// The installed-gem `gems/` dirs under one bundler install root, in
     /// both layouts bundler produces:
     ///
@@ -765,14 +821,16 @@ impl RubyCrawler {
         let mut paths = Self::gem_env_gems_dirs().await;
         let mut seen: HashSet<PathBuf> = paths.iter().cloned().collect();
 
-        // Fallback well-known paths
-        let home = home_dir();
-
-        let fallback_globs = [
-            home.join(".gem").join("ruby"),
-            home.join(".rbenv").join("versions"),
-            home.join(".rvm").join("gems"),
-        ];
+        // Fallback well-known paths (none without a home directory)
+        let fallback_globs: Vec<PathBuf> = home_dir()
+            .map(|home| {
+                vec![
+                    home.join(".gem").join("ruby"),
+                    home.join(".rbenv").join("versions"),
+                    home.join(".rvm").join("gems"),
+                ]
+            })
+            .unwrap_or_default();
 
         for base in &fallback_globs {
             for entry in list_dir_entries(base).await {
@@ -1088,6 +1146,142 @@ fn verify_gem_at_path_sync(path: &Path) -> bool {
     })
 }
 
+/// One Bundler settings tier's `path`, `path.system` and
+/// `disable_shared_gems` values, each `None` when the tier doesn't set it
+/// (an empty string counts as set).
+#[derive(Debug, Default, Clone, PartialEq, Eq)]
+pub(crate) struct BundlerPathSettings {
+    path: Option<String>,
+    path_system: Option<String>,
+    disable_shared_gems: Option<String>,
+}
+
+impl BundlerPathSettings {
+    fn from_config_text(text: &str) -> Self {
+        Self {
+            path: bundle_config_setting_including_empty(text, "BUNDLE_PATH"),
+            path_system: bundle_config_setting_including_empty(text, "BUNDLE_PATH__SYSTEM"),
+            disable_shared_gems: bundle_config_setting_including_empty(
+                text,
+                "BUNDLE_DISABLE_SHARED_GEMS",
+            ),
+        }
+    }
+
+    fn from_env(
+        path: Option<&OsStr>,
+        path_system: Option<&OsStr>,
+        disable_shared_gems: Option<&OsStr>,
+    ) -> Self {
+        let text = |v: Option<&OsStr>| v.map(|v| v.to_string_lossy().into_owned());
+        Self {
+            path: text(path),
+            path_system: text(path_system),
+            disable_shared_gems: text(disable_shared_gems),
+        }
+    }
+}
+
+/// The settings tiers Bundler's `Settings#path` reads, highest first: the
+/// app config (`local`) and global config texts (`None` when missing or
+/// under `BUNDLE_IGNORE_CONFIG`) and the environment.
+pub(crate) struct BundlerPathTiers {
+    pub(crate) local: Option<String>,
+    pub(crate) env: BundlerPathSettings,
+    pub(crate) global: Option<String>,
+}
+
+/// Whether Bundler installs into an explicit `path` instead of the system
+/// gems, following `Bundler::Settings#path`: the first tier (local, env,
+/// global) that sets `path`, `path.system` or `disable_shared_gems` decides
+/// alone, and it uses system gems when `path.system` is truthy or
+/// `disable_shared_gems` is falsy ([`bundler_truthy`]). Bundler never reuses a `gem env` copy
+/// of a non-default gem under an explicit path (`use_system_gems?` is
+/// false).
+///
+/// An empty `path` counts as not explicit, so the caller keeps judging the
+/// system homes: when unsure, it's safer to warn than to skip a copy
+/// Bundler may load.
+pub(crate) fn bundler_sets_explicit_path(tiers: BundlerPathTiers) -> bool {
+    let settings = [
+        tiers
+            .local
+            .as_deref()
+            .map(BundlerPathSettings::from_config_text),
+        Some(tiers.env),
+        tiers
+            .global
+            .as_deref()
+            .map(BundlerPathSettings::from_config_text),
+    ];
+    for tier in settings.into_iter().flatten() {
+        if tier.path.is_none() && tier.path_system.is_none() && tier.disable_shared_gems.is_none() {
+            continue;
+        }
+        // Both flags go through Bundler's `to_bool` coercion.
+        let system = tier.path_system.as_deref().is_some_and(bundler_truthy)
+            || tier
+                .disable_shared_gems
+                .as_deref()
+                .is_some_and(|v| !bundler_truthy(v));
+        return !system && tier.path.is_some_and(|p| !p.is_empty());
+    }
+    false
+}
+
+/// One gem home from [`RubyCrawler::bundler_install_homes`].
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct BundlerGemHome {
+    /// The home's `gems/` dir.
+    pub gems_dir: PathBuf,
+    /// The home belongs to this project (under the project root, or the
+    /// project's own `.bundle/config` path even when that sits outside the
+    /// tree), as opposed to a gem home other projects share.
+    pub project_local: bool,
+}
+
+/// Tag `stores` (the Bundler install stores), `config_stores` (the refused
+/// out-of-tree `.bundle/config` root's stores) and `shared_homes` (the
+/// `gem env` homes) with their [`BundlerGemHome::project_local`] flag,
+/// deduped in that order.
+///
+/// Containment is decided on absolute, lexically normalized paths, so the
+/// answer doesn't depend on how `--cwd` is spelled: with the default `.`,
+/// the discovered stores come back as `vendor/bundle/…`, which no lexical
+/// `starts_with(".")` matches.
+pub fn bundler_gem_homes_from(
+    project_root: &Path,
+    stores: &[PathBuf],
+    config_stores: &[PathBuf],
+    shared_homes: &[PathBuf],
+) -> Vec<BundlerGemHome> {
+    fn absolute(path: &Path) -> Option<PathBuf> {
+        let abs = std::path::absolute(path).ok()?;
+        Some(normalize_lexically(&abs).unwrap_or(abs))
+    }
+    let base = absolute(project_root).filter(|b| !b.as_os_str().is_empty());
+    let under_root = |dir: &Path| match (&base, absolute(dir)) {
+        (Some(base), Some(dir)) => dir.starts_with(base),
+        _ => false,
+    };
+    let mut seen = HashSet::new();
+    let mut homes = Vec::new();
+    let tagged = stores
+        .iter()
+        .map(|d| (d, under_root(d)))
+        .chain(config_stores.iter().map(|d| (d, true)))
+        .chain(shared_homes.iter().map(|d| (d, under_root(d))));
+    for (gems_dir, project_local) in tagged {
+        if seen.insert(gems_dir.clone()) {
+            homes.push(BundlerGemHome {
+                gems_dir: gems_dir.clone(),
+                project_local,
+            });
+        }
+    }
+    homes
+}
+
 /// Result of probing the Bundler install roots.
 ///
 /// Public so CLI consumers (apply's store-class split, scan/apply's
@@ -1141,13 +1335,11 @@ pub fn config_path_ignored_warning(value: &str) -> (&'static str, String) {
     )
 }
 
-/// The ambient home directory as an env value (`HOME`, else Windows'
-/// `USERPROFILE`), `None` when unset or empty — the `~`-expansion base for
-/// ambient runs; tests inject theirs through the `_with_env` seams.
+/// The ambient home directory ([`home_dir`]) as an env value — the
+/// `~`-expansion base for ambient runs; tests inject theirs through the
+/// `_with_env` seams.
 fn ambient_home() -> Option<std::ffi::OsString> {
-    std::env::var_os("HOME")
-        .filter(|v| !v.is_empty())
-        .or_else(|| std::env::var_os("USERPROFILE").filter(|v| !v.is_empty()))
+    home_dir().map(PathBuf::into_os_string)
 }
 
 /// Pure parser for `gem env <key>` stdout. Returns the trimmed path
@@ -1253,22 +1445,41 @@ fn expand_tilde(value: &Path, home: Option<&Path>) -> PathBuf {
 
 /// [`crate::formats::gem::manifest::classify`] for `root` on disk: the
 /// manifest bundler loads, reading the ambient `BUNDLE_GEMFILE` /
-/// `BUNDLE_APP_CONFIG` and the app config file.
+/// `BUNDLE_LOCKFILE` / `BUNDLE_APP_CONFIG` and the app config file.
 pub async fn bundler_loaded_manifest(root: &Path) -> crate::formats::gem::manifest::LoadedManifest {
     bundler_loaded_manifest_with_env(
         root,
-        std::env::var_os("BUNDLE_GEMFILE").as_deref(),
-        std::env::var_os("BUNDLE_APP_CONFIG").as_deref(),
-        bundler_ignores_config(),
-        ambient_bundler_global_config_file(root).as_deref(),
+        BundlerEnv {
+            gemfile: std::env::var_os("BUNDLE_GEMFILE").as_deref(),
+            lockfile: std::env::var_os("BUNDLE_LOCKFILE").as_deref(),
+            app_config: std::env::var_os("BUNDLE_APP_CONFIG").as_deref(),
+            ignore_config: bundler_ignores_config(),
+            global_config: ambient_bundler_global_config_file(root).as_deref(),
+        },
     )
     .await
+}
+
+/// The bundler environment [`bundler_loaded_manifest_with_env`] reads.
+#[derive(Debug, Clone, Copy, Default)]
+pub struct BundlerEnv<'a> {
+    /// `BUNDLE_GEMFILE`.
+    pub gemfile: Option<&'a OsStr>,
+    /// `BUNDLE_LOCKFILE` (bundler 4).
+    pub lockfile: Option<&'a OsStr>,
+    /// `BUNDLE_APP_CONFIG`.
+    pub app_config: Option<&'a OsStr>,
+    /// [`bundler_ignores_config`].
+    pub ignore_config: bool,
+    /// [`bundler_global_config_file`].
+    pub global_config: Option<&'a Path>,
 }
 
 /// [`bundler_loaded_manifest`] for the project `view` shows. A disk view
 /// (or a snapshot of one) reads the ambient environment and the app config
 /// like bundler; a memory view has no environment, so only its own
-/// `.bundle/config` counts.
+/// `.bundle/config` counts (its `BUNDLE_GEMFILE` and bundler 4's
+/// `BUNDLE_LOCKFILE`).
 pub(crate) async fn bundler_loaded_manifest_in(
     view: &ProjectView<'_>,
 ) -> crate::formats::gem::manifest::LoadedManifest {
@@ -1279,8 +1490,23 @@ pub(crate) async fn bundler_loaded_manifest_in(
         }
         ProjectView::Memory(_) => {
             let config = view.read_text(".bundle/config").await.ok();
-            let value = config.as_deref().and_then(manifest::config_gemfile);
-            manifest::classify(Path::new("/"), None, value.as_deref(), None)
+            let gemfile = config.as_deref().and_then(manifest::config_gemfile);
+            let lockfile = config.as_deref().and_then(manifest::config_lockfile);
+            let root = Path::new("/");
+            let gems_rb = view.is_file("gems.rb");
+            let loaded = manifest::classify(root, None, gemfile.as_deref(), None);
+            // `/` only stands in for the project root: bundler opens an
+            // absolute lockfile as is, never the project's own lock, so
+            // it must not compare equal to the pair's lock at `/`.
+            if let Some(value) = lockfile.as_deref() {
+                if Path::new(value).has_root() && loaded.pair(gems_rb).is_some() {
+                    return manifest::LoadedManifest::UnsupportedLockfile {
+                        value: value.to_string(),
+                        by: manifest::GemfileSetting::AppConfig,
+                    };
+                }
+            }
+            loaded.with_lockfile(root, None, lockfile.as_deref(), None, gems_rb)
         }
     }
 }
@@ -1289,37 +1515,78 @@ pub(crate) async fn bundler_loaded_manifest_in(
 /// [`LoadedManifest::pair`](crate::formats::gem::manifest::LoadedManifest::pair)
 /// — `gems.locked` when the root holds a `gems.rb` file and nothing
 /// configures `BUNDLE_GEMFILE`, else `Gemfile.lock` — or `None` when
-/// `BUNDLE_GEMFILE` names a manifest outside the two default pairs. Every
-/// lock READER asks this (lock inventory, ledger recovery, VEX discovery),
-/// so none reads a twin bundler ignores (#736).
+/// `BUNDLE_GEMFILE` names a manifest outside the two default pairs, or
+/// bundler 4's `BUNDLE_LOCKFILE` names a lock other than the pair's own
+/// (#749). A `Gemfile` + `gems.rb` twin under default discovery is `None`:
+/// bundler 1.x loads the `Gemfile` and >= 2 loads `gems.rb`, and nothing
+/// says which runs (#751). Every lock READER asks this (lock
+/// inventory, ledger recovery, VEX discovery), so none reads a twin
+/// bundler ignores (#736).
 pub(crate) async fn bundler_loaded_lock_in(view: &ProjectView<'_>) -> Option<&'static str> {
-    bundler_loaded_manifest_in(view)
-        .await
-        .pair(view.is_file("gems.rb"))
-        .map(|(_, lock)| lock)
+    bundler_loaded_lock_diagnosed_in(view).await.ok()
+}
+
+/// [`bundler_loaded_lock_in`], with the reason when bundler loads no lock
+/// socket-patch reads: the detail of the unsupported `BUNDLE_GEMFILE` /
+/// `BUNDLE_LOCKFILE`, or of the `Gemfile` + `gems.rb` twin. Lock inventory surfaces it so a lockfile-only scan does not
+/// skip the project's gems silently.
+pub(crate) async fn bundler_loaded_lock_diagnosed_in(
+    view: &ProjectView<'_>,
+) -> Result<&'static str, String> {
+    use crate::formats::gem::manifest::{self, LoadedManifest};
+    let loaded = bundler_loaded_manifest_in(view).await;
+    let gems_rb = view.is_file("gems.rb");
+    if loaded == LoadedManifest::Default
+        && bundler_may_see_file(view, "gems.rb")
+        && bundler_may_see_file(view, "Gemfile")
+    {
+        return Err(manifest::twin_manifest_refusal());
+    }
+    match loaded.pair(gems_rb) {
+        Some((_, lock)) => Ok(lock),
+        None => Err(loaded.unsupported_detail().unwrap_or_default()),
+    }
+}
+
+/// Whether bundler's `File.file?` may find `rel` in `view`: a regular file
+/// (through symlinks on disk), or, on a memory view, a symlink, whose
+/// target the view doesn't carry. The twin check fails closed on it
+/// rather than guess that the link dangles.
+fn bundler_may_see_file(view: &ProjectView<'_>, rel: &str) -> bool {
+    view.is_file(rel) || matches!(view, ProjectView::Memory(project) if project.is_symlink(rel))
 }
 
 /// [`bundler_loaded_manifest`] with the environment passed explicitly (hermetic
-/// tests). `ignore_config` is [`bundler_ignores_config`]; `global_config` is
-/// [`bundler_global_config_file`].
+/// tests).
 pub async fn bundler_loaded_manifest_with_env(
     root: &Path,
-    gemfile_env: Option<&OsStr>,
-    app_config_env: Option<&OsStr>,
-    ignore_config: bool,
-    global_config: Option<&Path>,
+    env: BundlerEnv<'_>,
 ) -> crate::formats::gem::manifest::LoadedManifest {
-    let config_value = read_app_config(root, app_config_env, ignore_config)
+    use crate::formats::gem::manifest;
+    let config = read_app_config(root, env.app_config, env.ignore_config).await;
+    let config = config.as_deref();
+    let gemfile = config.and_then(manifest::config_gemfile);
+    let lockfile = config.and_then(manifest::config_lockfile);
+    // Bundler's `File.file?`, which the lock readers' `is_file` mirrors: a
+    // regular file, through symlinks. A directory or a dangling symlink
+    // named `gems.rb` leaves the `Gemfile` pair loaded.
+    let gems_rb_present = tokio::fs::metadata(root.join("gems.rb"))
         .await
-        .and_then(|text| crate::formats::gem::manifest::config_gemfile(&text));
-    let global_value = read_global_config(global_config, ignore_config)
-        .await
-        .and_then(|text| crate::formats::gem::manifest::config_gemfile(&text));
-    crate::formats::gem::manifest::classify(
+        .is_ok_and(|m| m.is_file());
+    let global = read_global_config(env.global_config, env.ignore_config).await;
+    let global = global.as_deref();
+    manifest::classify(
         root,
-        gemfile_env,
-        config_value.as_deref(),
-        global_value.as_deref(),
+        env.gemfile,
+        gemfile.as_deref(),
+        global.and_then(manifest::config_gemfile).as_deref(),
+    )
+    .with_lockfile(
+        root,
+        env.lockfile,
+        lockfile.as_deref(),
+        global.and_then(manifest::config_lockfile).as_deref(),
+        gems_rb_present,
     )
 }
 
@@ -1849,7 +2116,7 @@ mod tests {
             "---\nBUNDLE_GEMFILE: \"Gemfile.next\"\n",
         )
         .unwrap();
-        let m = bundler_loaded_manifest_with_env(dir.path(), None, None, false, None).await;
+        let m = bundler_loaded_manifest_with_env(dir.path(), BundlerEnv::default()).await;
         assert!(matches!(
             m,
             crate::formats::gem::manifest::LoadedManifest::Unsupported {
@@ -1860,15 +2127,22 @@ mod tests {
         // BUNDLE_APP_CONFIG moves the config file away from `.bundle`.
         let m = bundler_loaded_manifest_with_env(
             dir.path(),
-            None,
-            Some(std::ffi::OsStr::new("elsewhere")),
-            false,
-            None,
+            BundlerEnv {
+                app_config: Some(std::ffi::OsStr::new("elsewhere")),
+                ..BundlerEnv::default()
+            },
         )
         .await;
         assert_eq!(m, crate::formats::gem::manifest::LoadedManifest::Default);
         // BUNDLE_IGNORE_CONFIG: bundler reads no config file at all.
-        let m = bundler_loaded_manifest_with_env(dir.path(), None, None, true, None).await;
+        let m = bundler_loaded_manifest_with_env(
+            dir.path(),
+            BundlerEnv {
+                ignore_config: true,
+                ..BundlerEnv::default()
+            },
+        )
+        .await;
         assert_eq!(m, crate::formats::gem::manifest::LoadedManifest::Default);
     }
 
@@ -1886,10 +2160,10 @@ mod tests {
         .unwrap();
         let m = bundler_loaded_manifest_with_env(
             dir.path(),
-            Some(std::ffi::OsStr::new("Gemfile")),
-            None,
-            false,
-            None,
+            BundlerEnv {
+                gemfile: Some(std::ffi::OsStr::new("Gemfile")),
+                ..BundlerEnv::default()
+            },
         )
         .await;
         assert_eq!(
@@ -1899,6 +2173,120 @@ mod tests {
                 by: crate::formats::gem::manifest::GemfileSetting::AppConfig,
             }
         );
+    }
+
+    /// #749: bundler only counts a `gems.rb` that `File.file?` accepts (a
+    /// regular file, through symlinks). A directory or a dangling symlink
+    /// named `gems.rb` leaves the `Gemfile` pair loaded, so
+    /// `BUNDLE_LOCKFILE: gems.locked` names a lock other than its own and
+    /// must stay unsupported rather than bind `Gemfile.lock`.
+    #[tokio::test]
+    async fn a_non_regular_gems_rb_does_not_make_gems_locked_the_pairs_lock() {
+        use crate::formats::gem::manifest::LoadedManifest;
+        let config = "---\nBUNDLE_LOCKFILE: \"gems.locked\"\n";
+        let project = |make_gems_rb: &dyn Fn(&Path)| {
+            let dir = tempfile::tempdir().unwrap();
+            std::fs::create_dir(dir.path().join(".bundle")).unwrap();
+            std::fs::write(dir.path().join(".bundle/config"), config).unwrap();
+            std::fs::write(dir.path().join("Gemfile"), "gem \"rack\"\n").unwrap();
+            make_gems_rb(&dir.path().join("gems.rb"));
+            dir
+        };
+        let dir = project(&|p| std::fs::create_dir(p).unwrap());
+        let m = bundler_loaded_manifest_with_env(dir.path(), BundlerEnv::default()).await;
+        assert!(
+            matches!(m, LoadedManifest::UnsupportedLockfile { .. }),
+            "directory gems.rb: {m:?}"
+        );
+        #[cfg(unix)]
+        {
+            let dir = project(&|p| std::os::unix::fs::symlink("missing.rb", p).unwrap());
+            let m = bundler_loaded_manifest_with_env(dir.path(), BundlerEnv::default()).await;
+            assert!(
+                matches!(m, LoadedManifest::UnsupportedLockfile { .. }),
+                "dangling gems.rb: {m:?}"
+            );
+            // A symlink to a regular gems.rb is one bundler loads.
+            let dir = project(&|p| {
+                std::fs::write(p.with_file_name("real.rb"), "gem \"rack\"\n").unwrap();
+                std::os::unix::fs::symlink("real.rb", p).unwrap();
+            });
+            let m = bundler_loaded_manifest_with_env(dir.path(), BundlerEnv::default()).await;
+            assert_eq!(m, LoadedManifest::Default);
+        }
+    }
+
+    /// #749: bundler 4's configured lockfile (`BUNDLE_LOCKFILE`, the
+    /// environment first, then the app config) naming anything but the
+    /// loaded pair's own lock is unsupported; naming that lock is a no-op.
+    #[tokio::test]
+    async fn loaded_manifest_reads_the_lockfile_setting() {
+        use crate::formats::gem::manifest::{GemfileSetting, LoadedManifest};
+        let dir = tempfile::tempdir().unwrap();
+        std::fs::create_dir(dir.path().join(".bundle")).unwrap();
+        let config = |value: &str| {
+            std::fs::write(
+                dir.path().join(".bundle/config"),
+                format!("---\nBUNDLE_LOCKFILE: \"{value}\"\n"),
+            )
+            .unwrap()
+        };
+        config("custom.lock");
+        let m = bundler_loaded_manifest_with_env(dir.path(), BundlerEnv::default()).await;
+        assert_eq!(
+            m,
+            LoadedManifest::UnsupportedLockfile {
+                value: "custom.lock".into(),
+                by: GemfileSetting::AppConfig
+            }
+        );
+        assert_eq!(m.pair(false), None);
+        // The environment wins over the app config, as in `Bundler::CLI`.
+        let m = bundler_loaded_manifest_with_env(
+            dir.path(),
+            BundlerEnv {
+                lockfile: Some(std::ffi::OsStr::new("Gemfile.lock")),
+                ..BundlerEnv::default()
+            },
+        )
+        .await;
+        assert_eq!(m, LoadedManifest::Default);
+        let m = bundler_loaded_manifest_with_env(
+            dir.path(),
+            BundlerEnv {
+                lockfile: Some(std::ffi::OsStr::new("other.lock")),
+                ..BundlerEnv::default()
+            },
+        )
+        .await;
+        assert!(matches!(
+            m,
+            LoadedManifest::UnsupportedLockfile {
+                by: GemfileSetting::Env,
+                ..
+            }
+        ));
+        // BUNDLE_IGNORE_CONFIG drops the app config value.
+        let m = bundler_loaded_manifest_with_env(
+            dir.path(),
+            BundlerEnv {
+                ignore_config: true,
+                ..BundlerEnv::default()
+            },
+        )
+        .await;
+        assert_eq!(m, LoadedManifest::Default);
+        // The default lock of the pair bundler loads is a no-op; with a
+        // gems.rb, that lock is gems.locked, not Gemfile.lock.
+        config("Gemfile.lock");
+        let m = bundler_loaded_manifest_with_env(dir.path(), BundlerEnv::default()).await;
+        assert_eq!(m, LoadedManifest::Default);
+        std::fs::write(dir.path().join("gems.rb"), "").unwrap();
+        let m = bundler_loaded_manifest_with_env(dir.path(), BundlerEnv::default()).await;
+        assert!(matches!(m, LoadedManifest::UnsupportedLockfile { .. }));
+        config("./gems.locked");
+        let m = bundler_loaded_manifest_with_env(dir.path(), BundlerEnv::default()).await;
+        assert_eq!(m, LoadedManifest::Default);
     }
 
     /// #483: bundler's cache dir is the `cache_path` setting — the app
@@ -2088,7 +2476,14 @@ mod tests {
         )
         .unwrap();
         assert!(matches!(
-            bundler_loaded_manifest_with_env(root, None, Some(OsStr::new("")), false, None).await,
+            bundler_loaded_manifest_with_env(
+                root,
+                BundlerEnv {
+                    app_config: Some(OsStr::new("")),
+                    ..BundlerEnv::default()
+                }
+            )
+            .await,
             crate::formats::gem::manifest::LoadedManifest::Unsupported { .. }
         ));
         assert_eq!(
@@ -3050,7 +3445,14 @@ mod tests {
         let global = dir.path().join("global-config");
         std::fs::write(&global, "---\nBUNDLE_GEMFILE: \"Gemfile.next\"\n").unwrap();
         let g = Some(global.as_path());
-        let m = bundler_loaded_manifest_with_env(&root, None, None, false, g).await;
+        let m = bundler_loaded_manifest_with_env(
+            &root,
+            BundlerEnv {
+                global_config: g,
+                ..BundlerEnv::default()
+            },
+        )
+        .await;
         assert_eq!(
             m,
             LoadedManifest::Unsupported {
@@ -3067,10 +3469,11 @@ mod tests {
         assert_eq!(
             bundler_loaded_manifest_with_env(
                 &root,
-                Some(std::ffi::OsStr::new("Gemfile")),
-                None,
-                false,
-                g
+                BundlerEnv {
+                    gemfile: Some(std::ffi::OsStr::new("Gemfile")),
+                    global_config: g,
+                    ..BundlerEnv::default()
+                }
             )
             .await,
             LoadedManifest::Configured {
@@ -3086,15 +3489,51 @@ mod tests {
         )
         .unwrap();
         assert_eq!(
-            bundler_loaded_manifest_with_env(&root, None, None, false, g).await,
+            bundler_loaded_manifest_with_env(
+                &root,
+                BundlerEnv {
+                    global_config: g,
+                    ..BundlerEnv::default()
+                }
+            )
+            .await,
             LoadedManifest::Configured {
                 manifest: "gems.rb",
                 by: GemfileSetting::AppConfig
             }
         );
+        // `bundle config set --global lockfile` is read from the same file,
+        // below the local app config (#749 on top of #577).
+        std::fs::write(
+            &global,
+            "---\nBUNDLE_GEMFILE: \"Gemfile.next\"\nBUNDLE_LOCKFILE: \"custom.lock\"\n",
+        )
+        .unwrap();
+        assert_eq!(
+            bundler_loaded_manifest_with_env(
+                &root,
+                BundlerEnv {
+                    global_config: g,
+                    ..BundlerEnv::default()
+                }
+            )
+            .await,
+            LoadedManifest::UnsupportedLockfile {
+                value: "custom.lock".into(),
+                by: GemfileSetting::GlobalConfig
+            }
+        );
         // BUNDLE_IGNORE_CONFIG skips both files.
         assert_eq!(
-            bundler_loaded_manifest_with_env(&root, None, None, true, g).await,
+            bundler_loaded_manifest_with_env(
+                &root,
+                BundlerEnv {
+                    ignore_config: true,
+                    global_config: g,
+                    ..BundlerEnv::default()
+                }
+            )
+            .await,
             LoadedManifest::Default
         );
     }
@@ -3112,21 +3551,43 @@ mod tests {
         // An exported empty value shadows the global file and leaves
         // Bundler's default Gemfile/gems.rb discovery active.
         assert_eq!(
-            bundler_loaded_manifest_with_env(&root, Some(OsStr::new("")), None, false, g).await,
+            bundler_loaded_manifest_with_env(
+                &root,
+                BundlerEnv {
+                    gemfile: Some(OsStr::new("")),
+                    global_config: g,
+                    ..BundlerEnv::default()
+                }
+            )
+            .await,
             LoadedManifest::Default
         );
         // The same value written by `bundle config set --local gemfile ''`
         // is present even though it names no file.
         std::fs::write(root.join(".bundle/config"), "---\nBUNDLE_GEMFILE: \"\"\n").unwrap();
         assert_eq!(
-            bundler_loaded_manifest_with_env(&root, None, None, false, g).await,
+            bundler_loaded_manifest_with_env(
+                &root,
+                BundlerEnv {
+                    global_config: g,
+                    ..BundlerEnv::default()
+                }
+            )
+            .await,
             LoadedManifest::Default
         );
         // Bundler does not re-export an empty local setting, so an existing
         // non-empty environment value still chooses the manifest.
         assert_eq!(
-            bundler_loaded_manifest_with_env(&root, Some(OsStr::new("Gemfile")), None, false, g)
-                .await,
+            bundler_loaded_manifest_with_env(
+                &root,
+                BundlerEnv {
+                    gemfile: Some(OsStr::new("Gemfile")),
+                    global_config: g,
+                    ..BundlerEnv::default()
+                }
+            )
+            .await,
             LoadedManifest::Configured {
                 manifest: "Gemfile",
                 by: GemfileSetting::Env
@@ -3619,6 +4080,139 @@ mod tests {
             paths.is_empty(),
             "path.system=true must drop the config-sourced root: {paths:?}"
         );
+    }
+
+    /// #1001: Bundler installs into an explicit `path` only when the first
+    /// tier (local, env, global) that sets `path`, `path.system` or
+    /// `disable_shared_gems` sets a non-empty path without turning system
+    /// gems back on. A higher tier's `path.system: true` beats a lower
+    /// tier's path (Bugbot on #1002).
+    #[test]
+    fn bundler_sets_explicit_path_follows_settings_tiers() {
+        let env = |path: Option<&str>, system: Option<&str>, disable: Option<&str>| {
+            BundlerPathSettings::from_env(
+                path.map(OsStr::new),
+                system.map(OsStr::new),
+                disable.map(OsStr::new),
+            )
+        };
+        let tiers = |local: Option<&str>, env: BundlerPathSettings, global: Option<&str>| {
+            bundler_sets_explicit_path(BundlerPathTiers {
+                local: local.map(str::to_string),
+                env,
+                global: global.map(str::to_string),
+            })
+        };
+        let none = || env(None, None, None);
+        let local_path = "---\nBUNDLE_PATH: \"vendor/bundle\"\n";
+        let local_system = "---\nBUNDLE_PATH__SYSTEM: \"true\"\n";
+
+        assert!(!tiers(None, none(), None), "no setting: system gems");
+        assert!(tiers(Some(local_path), none(), None), "local path");
+        assert!(
+            tiers(None, env(Some("vendor/bundle"), None, None), None),
+            "env path"
+        );
+        assert!(
+            tiers(None, none(), Some("---\nBUNDLE_PATH: \"/opt/bundle\"\n")),
+            "global path"
+        );
+        assert!(
+            !tiers(
+                Some("---\nBUNDLE_PATH: \"vendor/bundle\"\nBUNDLE_PATH__SYSTEM: \"true\"\n"),
+                none(),
+                None
+            ),
+            "path.system in the same tier"
+        );
+        assert!(
+            !tiers(
+                Some(local_system),
+                env(Some("vendor/bundle"), None, None),
+                None
+            ),
+            "a local path.system beats an env path"
+        );
+        assert!(
+            !tiers(None, env(Some("vendor/bundle"), Some("true"), None), None),
+            "env path.system beside the env path"
+        );
+        assert!(
+            !tiers(None, env(Some("vendor/bundle"), Some("1"), None), None),
+            "path.system goes through Bundler's to_bool"
+        );
+        assert!(
+            tiers(None, env(Some("vendor/bundle"), Some("no"), None), None),
+            "a falsy path.system keeps the explicit path"
+        );
+        assert!(
+            !tiers(None, env(Some("vendor/bundle"), None, Some("no")), None),
+            "a falsy disable_shared_gems turns system gems back on"
+        );
+        assert!(
+            !tiers(None, env(None, None, Some("false")), Some(local_path)),
+            "env disable_shared_gems=false decides before the global path"
+        );
+        assert!(
+            tiers(Some(local_path), env(None, Some("true"), None), None),
+            "a local path beats an env path.system"
+        );
+        assert!(
+            !tiers(None, env(Some(""), None, None), Some(local_path)),
+            "an empty env path stops at the env tier and isn't explicit"
+        );
+        assert!(
+            !tiers(
+                Some("---\nBUNDLE_PATH__SYSTEM: \"false\"\n"),
+                env(Some("vendor/bundle"), None, None),
+                None
+            ),
+            "a local path.system=false stops at the local tier with no path"
+        );
+    }
+
+    /// #729: project-local tagging compares absolute, normalized paths, so a
+    /// relative `--cwd` (the default `.`) still tags the project's own
+    /// `vendor/bundle` store local. Stores outside the root and `gem env`
+    /// homes are shared, refused config stores are local, and a home
+    /// reachable two ways is listed once.
+    #[test]
+    fn bundler_gem_homes_from_tags_project_local_by_absolute_path() {
+        let cwd = std::env::current_dir().unwrap();
+        let local_store = Path::new("vendor")
+            .join("bundle")
+            .join("ruby")
+            .join("3.3.0")
+            .join("gems");
+        let outside = std::env::temp_dir().join("sp-shared-home").join("gems");
+        let config_store = std::env::temp_dir().join("sp-config-root").join("gems");
+        for project_root in [Path::new("."), Path::new(""), cwd.as_path()] {
+            let homes = bundler_gem_homes_from(
+                project_root,
+                &[local_store.clone(), outside.clone()],
+                &[config_store.clone()],
+                &[
+                    outside.clone(),
+                    cwd.join("vendor").join("rubies").join("gems"),
+                ],
+            );
+            let tag = |dir: &Path| {
+                homes
+                    .iter()
+                    .find(|h| h.gems_dir == dir)
+                    .map(|h| h.project_local)
+            };
+            assert_eq!(homes.len(), 4, "root {project_root:?}: {homes:?}");
+            // An empty root has no base to contain anything.
+            let expect_local = !project_root.as_os_str().is_empty();
+            assert_eq!(
+                tag(&local_store),
+                Some(expect_local),
+                "root {project_root:?}"
+            );
+            assert_eq!(tag(&outside), Some(false), "root {project_root:?}");
+            assert_eq!(tag(&config_store), Some(true), "root {project_root:?}");
+        }
     }
 
     /// Stage a project that used to install into `vendor/bundle` (the

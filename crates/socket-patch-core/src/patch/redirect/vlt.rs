@@ -13,9 +13,8 @@ use std::collections::BTreeMap;
 use serde_json::{Map, Value};
 
 use super::{full_name, DepOverride, FileEdit, RewriteResult, RewriteWarning};
-use crate::constants::npm_family::{
-    BUN_LOCK, BUN_LOCKB, NPM_LOCKS, PNPM_LOCK, VLT_CONFIG, VLT_HIDDEN_LOCK_REL, VLT_LOCK,
-};
+use crate::constants::npm_family::{BUN_LOCKB, VLT_CONFIG, VLT_HIDDEN_LOCK_REL, VLT_LOCK};
+use crate::formats::governing_locks::{npm_locks_outside, NpmLockFamily};
 use crate::vendor::vlt_lock_text::{
     brotli_for_slot3, entry_text, has_brotli_flag, installs_outside_registry, is_default_registry,
     is_registry_url_segment, nodes_block, parse_node_entry_text, parse_node_line,
@@ -26,26 +25,13 @@ use crate::vendor::vlt_lock_text::{
 /// The ledger kind of a hosted vlt node splice.
 pub const KIND: &str = "redirect_vlt_lock_node";
 
-/// Every other npm-family lock whose presence makes `vlt-lock.json`
-/// ambiguous as the install driver.
-const SIBLING_LOCKS: [&str; 6] = [
-    NPM_LOCKS[1],
-    NPM_LOCKS[0],
-    "yarn.lock",
-    PNPM_LOCK,
-    BUN_LOCK,
-    BUN_LOCKB,
-];
-
-/// The other npm-family locks present. `bun_lockb_present` reports a
-/// `bun.lockb` on disk, which a caller holding its bytes keeps out of
-/// `files`.
+/// The other npm-family locks present, in the shared precedence order
+/// ([`npm_locks_outside`]). `bun_lockb_present` reports a `bun.lockb` on
+/// disk, which a caller holding its bytes keeps out of `files`.
 fn sibling_locks(files: &BTreeMap<String, String>, bun_lockb_present: bool) -> Vec<&'static str> {
-    SIBLING_LOCKS
-        .iter()
-        .copied()
-        .filter(|lock| files.contains_key(*lock) || (*lock == BUN_LOCKB && bun_lockb_present))
-        .collect()
+    npm_locks_outside(NpmLockFamily::Vlt, |lock| {
+        files.contains_key(lock) || (lock == BUN_LOCKB && bun_lockb_present)
+    })
 }
 
 /// Does vlt drive hosted confirmation and the artifact preflight?
@@ -102,15 +88,6 @@ pub(super) fn parse_hosted_lock(text: &str) -> Result<HostedLock, RewriteWarning
         ));
     }
     Ok(HostedLock { parsed, nodes })
-}
-
-/// The lock-level refusal alone, run before any vendored vlt entry is
-/// reverted for a hosted takeover. An absent lock passes.
-pub fn preflight_vlt_hosted(files: &BTreeMap<String, String>) -> Result<(), RewriteWarning> {
-    match files.get(VLT_LOCK) {
-        Some(text) => parse_hosted_lock(text).map(|_| ()),
-        None => Ok(()),
-    }
 }
 
 /// Is `id` a registry node of `name@version`, and is its segment the
@@ -687,6 +664,14 @@ pub fn carried_pin_original(fresh: &FileEdit, old: &FileEdit) -> Option<Value> {
 mod tests {
     use super::*;
 
+    /// The rewriter's lock-level refusal alone. An absent lock passes.
+    fn lock_level_refusal(files: &BTreeMap<String, String>) -> Result<(), RewriteWarning> {
+        match files.get(VLT_LOCK) {
+            Some(text) => parse_hosted_lock(text).map(|_| ()),
+            None => Ok(()),
+        }
+    }
+
     const SHA: &str = "sha512-PATCHED==";
     const URL: &str = "https://patch.socket.dev/patch/npm/t/u/left-pad-1.3.0.tgz";
     const REG_SHA: &str = "sha512-REGISTRY==";
@@ -762,7 +747,7 @@ mod tests {
         assert!(!vlt_drives(&files(&[sentinel, (VLT_CONFIG, "{}")]), false));
         assert!(vlt_drives(&files(&[lock]), false));
         assert!(vlt_drives(&files(&[lock, (VLT_CONFIG, "{}")]), false));
-        for sibling in SIBLING_LOCKS {
+        for sibling in npm_locks_outside(NpmLockFamily::Vlt, |_| true) {
             let other = (sibling, "x");
             assert!(!vlt_drives(&files(&[lock, other]), false), "{sibling}");
             assert!(
@@ -915,7 +900,7 @@ mod tests {
     #[test]
     fn lock_level_parse_refusals() {
         let refused = |text: &str| {
-            preflight_vlt_hosted(&files(&[(VLT_LOCK, text)]))
+            lock_level_refusal(&files(&[(VLT_LOCK, text)]))
                 .unwrap_err()
                 .detail
         };
@@ -926,10 +911,10 @@ mod tests {
             "{{\n  \"lockfileVersion\": 1,\n  \"nodes\": {{\n    \"{ID}\": [\n      0,\n      \"left-pad\"\n    ]\n  }}\n}}\n"
         );
         assert!(refused(&pretty).contains("canonical layout"));
-        assert!(preflight_vlt_hosted(&files(&[])).is_ok());
-        assert!(preflight_vlt_hosted(&files(&[(VLT_LOCK, "{\"nodes\": {}}")])).is_ok());
+        assert!(lock_level_refusal(&files(&[])).is_ok());
+        assert!(lock_level_refusal(&files(&[(VLT_LOCK, "{\"nodes\": {}}")])).is_ok());
         let ok = lock_with(&[&registry_entry()]);
-        assert!(preflight_vlt_hosted(&files(&[(VLT_LOCK, &ok)])).is_ok());
+        assert!(lock_level_refusal(&files(&[(VLT_LOCK, &ok)])).is_ok());
     }
 
     #[test]
@@ -1008,7 +993,7 @@ mod tests {
             &format!("\"{peer}\": [6,\"left-pad\",\"{REG_SHA}\",\"{BR_URL}\"]"),
             "\"~npm~other@1.0.0\": [5,\"other\",\"sha512-O==\"]",
         ]);
-        assert!(preflight_vlt_hosted(&files(&[(VLT_LOCK, &lock)])).is_ok());
+        assert!(lock_level_refusal(&files(&[(VLT_LOCK, &lock)])).is_ok());
 
         let result = rewrite(&lock, &[dep("left-pad", "1.3.0", Some(SHA))]);
         assert!(codes(&result).is_empty(), "{:?}", result.warnings);

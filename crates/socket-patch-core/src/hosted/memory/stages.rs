@@ -14,6 +14,7 @@ use crate::hosted::engine::{
 };
 use crate::hosted::vlt::Preflight;
 use crate::patch::redirect::npmrc::OuterAllowRemote;
+use crate::patch::redirect::yarnrc::OuterYarnMirror;
 use crate::patch::redirect::DepOverride;
 use crate::utils::purl::strip_purl_qualifiers;
 use crate::vendor::lock_inventory::{MemoryEntry, MemoryProject, ProjectView};
@@ -92,19 +93,20 @@ fn refuse_takeovers(
     skipped: &mut Vec<SkippedPatch>,
     pre_warnings: &mut Vec<crate::patch::redirect::RewriteWarning>,
 ) {
-    let takeover_capable = |p: &str| {
-        p.starts_with("pkg:cargo/") || p.starts_with("pkg:npm/") || p.starts_with("pkg:golang/")
-    };
-    if !candidates.iter().any(|c| takeover_capable(&c.purl)) {
+    use super::super::takeover;
+    if !takeover::any_takeover_ecosystem(candidates.iter().map(|c| c.purl.as_str())) {
         return;
     }
     let vendored = vendored_entries(project);
     let mut refused: BTreeSet<String> = BTreeSet::new();
-    for candidate in candidates.iter().filter(|c| takeover_capable(&c.purl)) {
-        let has_entry = vendored.as_ref().is_some_and(|s| {
+    for candidate in candidates.iter() {
+        let entry = vendored.as_ref().and_then(|s| {
             crate::vendor::lookup_entry(&s.entries, strip_purl_qualifiers(&candidate.purl))
-                .is_some()
         });
+        if !takeover::in_reach(&candidate.purl, entry) {
+            continue;
+        }
+        let has_entry = entry.is_some();
         let cargo_wired = !has_entry
             && candidate.purl.starts_with("pkg:cargo/")
             && cargo_vendored_wiring(project, &candidate.dep.name, &candidate.dep.version);
@@ -227,6 +229,8 @@ pub(crate) struct Rewritten {
     pub(crate) skipped: Vec<SkippedPatch>,
     pub(crate) pre_warnings: Vec<crate::patch::redirect::RewriteWarning>,
     pub(crate) done: engine::Rewritten,
+    /// Granted candidates nothing pins ([`engine::unconfirmed_candidates`]).
+    pub(crate) unconfirmed: Vec<(String, String)>,
 }
 
 /// A refused rewrite: its refusal and the skips recorded before the
@@ -304,15 +308,15 @@ pub(crate) async fn rewrite(
 
     let view = ProjectView::Memory(&project);
     let targets_pipenv_lock = engine::pipenv_lock_targets(&read.files, &candidates);
-    // The in-memory host sees no user / global npm config.
+    // The in-memory host sees no user / global npm or yarn config.
     let npm_outer = OuterAllowRemote::default;
+    let yarn_classic_outer = OuterYarnMirror::default;
     let done = engine::rewrite(
         &view,
         read,
         &candidates,
         python_metadata,
         &vlt_preflight.withheld_from_vlt,
-        &[],
         RewriteOptions {
             dry_run: options.dry_run,
             targets_pipenv_lock,
@@ -329,6 +333,7 @@ pub(crate) async fn rewrite(
             trust_lockfile_config: options.trust_lockfile_config,
             npm_allow_remote_config: options.npm_allow_remote_config,
             npm_outer: &npm_outer,
+            yarn_classic_outer: &yarn_classic_outer,
             blocking: false,
         },
     )
@@ -339,11 +344,13 @@ pub(crate) async fn rewrite(
             skipped: skipped_before,
         });
     }
+    let unconfirmed = engine::unconfirmed_candidates(&candidates, &done.confirmed, &skipped);
     Ok(Rewritten {
         project,
         skipped,
         pre_warnings,
         done,
+        unconfirmed,
     })
 }
 
