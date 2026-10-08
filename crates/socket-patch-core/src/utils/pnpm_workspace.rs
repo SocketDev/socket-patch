@@ -431,19 +431,32 @@ pub struct GitBranchLocks {
     /// Where the setting is turned on, as the refusal names it (e.g.
     /// `gitBranchLockfile: true` in pnpm-workspace.yaml).
     pub setting: String,
-    /// The root branch-lock names, sorted.
+    /// The branch-lock paths found, root-relative and sorted.
     pub locks: Vec<String>,
+    /// Why the members that install from their own lock cannot be listed,
+    /// when they cannot: a branch lock in one of them cannot be ruled out.
+    pub members_unlisted: Option<String>,
 }
 
 impl GitBranchLocks {
     /// What pnpm does with the setting, for a refusal's detail.
     pub fn describe(&self) -> String {
+        let found = match (self.locks.is_empty(), &self.members_unlisted) {
+            (false, None) => self.locks.join(", "),
+            (false, Some(why)) => format!(
+                "{}, and the workspace members' own branch locks cannot be listed: {why}",
+                self.locks.join(", ")
+            ),
+            (true, why) => format!(
+                "any workspace member's own branch lock cannot be listed: {}",
+                why.as_deref().unwrap_or_default()
+            ),
+        };
         format!(
-            "{} makes pnpm install a git branch from its own lock ({}) rather than \
+            "{} makes pnpm install a git branch from its own lock ({found}) rather than \
              {PNPM_LOCK} whenever that lock exists, and socket-patch cannot tell which \
              branch lock is live or pin one",
             self.setting,
-            self.locks.join(", ")
         )
     }
 
@@ -479,11 +492,13 @@ pub fn is_git_branch_lock_name(name: &str) -> bool {
 }
 
 /// The project's per-branch locks (see [`GitBranchLocks`]), `None` unless
-/// the setting is on AND a branch lock exists: with no branch lock pnpm
-/// installs from `pnpm-lock.yaml`, which is then pinned as usual. pnpm
-/// picks the branch lock's name once and looks for it in every directory
-/// it installs a lock from, so the branch locks of the members that install
-/// from their own lock ([`member_locks`]) count beside the root's.
+/// the setting is on AND a branch lock exists (or the members that install
+/// from their own lock cannot be listed, so one cannot be ruled out): with
+/// no branch lock pnpm installs from `pnpm-lock.yaml`, which is then pinned
+/// as usual. pnpm picks the branch lock's name once and looks for it in
+/// every directory it installs a lock from, so the branch locks of the
+/// members that install from their own lock ([`member_locks`]) count beside
+/// the root's.
 ///
 /// The setting is read through the view's FIFO-safe reader from the
 /// project's own `pnpm-workspace.yaml` / `.npmrc`; on disk, a project with
@@ -494,12 +509,17 @@ pub fn is_git_branch_lock_name(name: &str) -> bool {
 /// environment spellings count too.
 pub async fn git_branch_locks(view: &ProjectView<'_>) -> Option<GitBranchLocks> {
     let mut locks = branch_lock_names(view, "").await;
-    if let Members::Dirs { dirs, .. } = workspace_members(view).await {
-        for dir in dirs {
-            locks.extend(branch_lock_names(view, &dir).await);
+    let mut members_unlisted = None;
+    match workspace_members(view).await {
+        Members::Dirs { dirs, .. } => {
+            for dir in dirs {
+                locks.extend(branch_lock_names(view, &dir).await);
+            }
         }
+        Members::Unresolved(why) => members_unlisted = Some(why),
+        Members::Shared => {}
     }
-    if locks.is_empty() {
+    if locks.is_empty() && members_unlisted.is_none() {
         return None;
     }
     let workspace = view.read_text(PNPM_WORKSPACE).await.ok();
@@ -523,7 +543,11 @@ pub async fn git_branch_locks(view: &ProjectView<'_>) -> Option<GitBranchLocks> 
     }
     let setting =
         git_branch_on(setting.or_else(|| view_setting(view, None, None, KEYS.0, KEYS.1)))?;
-    Some(GitBranchLocks { setting, locks })
+    Some(GitBranchLocks {
+        setting,
+        locks,
+        members_unlisted,
+    })
 }
 
 /// The `pnpm-lock.<branch>.yaml` files in root-relative `dir` (`""` for
@@ -994,6 +1018,38 @@ mod tests {
         assert_eq!(found.locks, ["pnpm-lock.a.yaml", "pnpm-lock.b.yaml"]);
         assert!(found.setting.contains(PNPM_WORKSPACE), "{}", found.setting);
         write(root, PNPM_WORKSPACE, "packages: []\n");
+        assert_eq!(git_branch_locks(&view).await, None);
+    }
+
+    /// Members that install from their own lock but cannot be listed may
+    /// hold a `pnpm-lock.<branch>.yaml` no walk can find, so with the
+    /// setting on the answer fails closed instead of reading as "no branch
+    /// lock".
+    #[tokio::test]
+    async fn git_branch_locks_fail_closed_on_an_unlisted_member_set() {
+        let tmp = tempfile::tempdir().unwrap();
+        let root = tmp.path();
+        let view = ProjectView::Disk(root);
+        write(root, PNPM_LOCK, "lockfileVersion: '9.0'\n");
+        // No `packages:` list: the members cannot be found.
+        write(
+            root,
+            PNPM_WORKSPACE,
+            "sharedWorkspaceLockfile: false\ngitBranchLockfile: true\n",
+        );
+        let found = git_branch_locks(&view).await.unwrap();
+        assert!(found.locks.is_empty(), "{:?}", found.locks);
+        assert!(found.members_unlisted.is_some());
+        assert!(
+            found.describe().contains("cannot be listed"),
+            "{}",
+            found.describe()
+        );
+        // The setting off: nothing to refuse.
+        write(root, PNPM_WORKSPACE, "sharedWorkspaceLockfile: false\n");
+        assert_eq!(git_branch_locks(&view).await, None);
+        // A shared lock: members never install from a lock of their own.
+        write(root, PNPM_WORKSPACE, "gitBranchLockfile: true\n");
         assert_eq!(git_branch_locks(&view).await, None);
     }
 
