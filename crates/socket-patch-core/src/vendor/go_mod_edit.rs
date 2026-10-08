@@ -1883,8 +1883,14 @@ replace (
     #[test]
     fn mixed_go_mod_append_takes_the_majority_line_ending() {
         for (original, eol) in [
-            ("module m\r\n\ngo 1.21\n\nrequire github.com/foo/bar v1.4.2\n", "\n"),
-            ("module m\r\n\r\ngo 1.21\n\r\nrequire github.com/foo/bar v1.4.2\r\n", "\r\n"),
+            (
+                "module m\r\n\ngo 1.21\n\nrequire github.com/foo/bar v1.4.2\n",
+                "\n",
+            ),
+            (
+                "module m\r\n\r\ngo 1.21\n\r\nrequire github.com/foo/bar v1.4.2\r\n",
+                "\r\n",
+            ),
         ] {
             let upserted =
                 upsert_replace_entry(original, "github.com/foo/bar", "v1.4.2", GO_PATCHES_DIR)

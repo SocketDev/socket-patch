@@ -317,7 +317,8 @@ mod tests {
     /// ending; one stray CRLF line no longer turns it CRLF.
     #[test]
     fn replaced_metadata_takes_the_majority_line_ending() {
-        let lf_majority = "#!/usr/bin/env python\r\n# /// script\n# dependencies = []\n# ///\nprint('x')\n";
+        let lf_majority =
+            "#!/usr/bin/env python\r\n# /// script\n# dependencies = []\n# ///\nprint('x')\n";
         let out = replace_script_metadata(lf_majority, "dependencies = [\"a\"]\n").unwrap();
         assert!(out.contains("# dependencies = [\"a\"]\n# ///"), "{out:?}");
         let crlf_majority = "# /// script\r\n# dependencies = []\r\n# ///\r\nprint('x')\n";

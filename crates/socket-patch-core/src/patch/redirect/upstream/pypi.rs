@@ -1027,14 +1027,20 @@ mod tests {
     #[serial_test::serial]
     async fn restored_hash_continuation_takes_the_majority_line_ending() {
         let other = format!("idna==3.4 \\\n    --hash=sha256:{}\n", "c".repeat(64));
-        for (head, eol) in [("# pinned\r\n", "\n"), ("# pinned\r\n# by pip-compile\r\n# x\r\n# y\r\n", "\r\n")] {
+        for (head, eol) in [
+            ("# pinned\r\n", "\n"),
+            ("# pinned\r\n# by pip-compile\r\n# x\r\n# y\r\n", "\r\n"),
+        ] {
             let (outcome, after) = restore_six(&format!("{head}{other}{}\n", hashed_line())).await;
             assert_restored(&outcome);
             assert!(
                 after.contains(&format!("six==1.16.0 \\{eol}    --hash=sha256:")),
                 "{after:?}"
             );
-            assert_eq!(after.matches("\\\r\n").count(), if eol == "\r\n" { 2 } else { 0 });
+            assert_eq!(
+                after.matches("\\\r\n").count(),
+                if eol == "\r\n" { 2 } else { 0 }
+            );
         }
     }
     use wiremock::matchers::{method, path};
