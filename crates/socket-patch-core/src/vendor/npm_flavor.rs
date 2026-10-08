@@ -508,8 +508,9 @@ fn flavor_change_detail(
         let prior = entry.flavor.as_deref().unwrap_or("package-lock");
         Some(format!(
             "{purl} is vendored through the `{prior}` lockfile flavor, but this project now \
-             installs through `{}`; run `socket-patch vendor --revert` for it while the lock it \
-             was vendored under still drives installs, then vendor it again",
+             installs through `{}`; while the lock it was vendored under still drives \
+             installs, run `socket-patch vendor --revert` (it reverts EVERY vendored package \
+             in the project, not just this one), then vendor again",
             detected.as_str()
         ))
     })

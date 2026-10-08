@@ -21,7 +21,7 @@ use std::collections::{BTreeMap, HashMap, HashSet};
 use std::path::{Path, PathBuf};
 use std::time::Duration;
 
-use crate::args::{apply_env_toggles, GlobalArgs};
+use crate::args::{apply_env_toggles, is_local_go, GlobalArgs};
 use crate::commands::fetch_stage::{stage_patch_sources, StageOutcome};
 use crate::commands::lock_cli::acquire_or_emit;
 use crate::commands::vex::{
@@ -157,14 +157,6 @@ impl ApplyArgs {
 // ── local-go redirect helpers ────────────────────────────────────────────────
 // In local mode a `pkg:golang/…` PURL redirects to a project-local patched copy under `.socket/go-patches/` wired via
 // a `go.mod` `replace` directive.
-
-/// True for a golang PURL in local mode (no `--global` / `--global-prefix`).
-/// Shared with `rollback`, which drops the same redirects this creates.
-pub(crate) fn is_local_go(purl: &str, common: &GlobalArgs) -> bool {
-    !common.global
-        && common.global_prefix.is_none()
-        && Ecosystem::from_purl(purl) == Some(Ecosystem::Golang)
-}
 
 /// Whether this run can touch `eco`'s LOCAL install tree at all: local mode
 /// (a `--global` / `--global-prefix` run crawls a different tree, so the
@@ -1454,7 +1446,7 @@ async fn report_apply_failure(
         env.mark_error(EnvelopeError::new("apply_failed", error.to_string()));
         println!("{}", env.to_pretty_json());
     } else {
-        eprintln!("Error: {}", super::rollback::capitalize_first(error));
+        eprintln!("Error: {}", crate::ui::sentence_case(error));
     }
     1
 }
@@ -1744,7 +1736,7 @@ fn format_results_block(results: &[ApplyResult], dry_run: bool, cwd: &Path) -> V
             .copied()
             .unwrap_or(0)
             > 1)
-        .then(|| super::rollback::display_copy_path(&result.package_path, cwd));
+        .then(|| crate::ui::display_copy_path(&result.package_path, cwd));
         lines.push(format_patched_line(
             &normalize_purl(&result.package_key),
             copy.as_deref(),

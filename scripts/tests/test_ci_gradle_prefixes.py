@@ -175,6 +175,63 @@ class PrefixGuard(unittest.TestCase):
                     self.assertTrue(row.get("suites"), "a narrowed filter names the suite that owns it")
 
 
+def libtest_selects(words, name):
+    """libtest's filter semantics for the argument words a row passes: a
+    name runs when it contains any positional filter (all names when there
+    is none) and no `--skip` word."""
+    filters, skips, it = [], [], iter(words)
+    for word in it:
+        if word == "--skip":
+            skips.append(next(it))
+        elif not word.startswith("--"):
+            filters.append(word)
+    return (not filters or any(f in name for f in filters)) and not any(s in name for s in skips)
+
+
+class HostedShards(unittest.TestCase):
+    """The hosted suite runs as several legs per Gradle line (it is the
+    merge-queue critical path in one leg). Every hosted test must run in
+    exactly one leg of each line, and the catch-all leg's `--skip` words
+    must be exactly the other legs' hosted words."""
+    SUITE = "e2e_redirect_gradle_build"
+
+    def rows_by_line(self):
+        rows = [r for r in rows_mod.job_rows(rows_mod.jobs(CI.read_text(encoding="utf-8")), "e2e")
+                if r.get("jvm_tool") == "gradle" and self.SUITE in r["suite"].split()]
+        lines = {}
+        for row in rows:
+            lines.setdefault(row["gradle"], []).append(row["test_filter"].split())
+        return lines
+
+    def test_every_hosted_test_runs_in_exactly_one_leg_per_line(self):
+        names = [n for path in bundle.suite_files(self.SUITE)
+                 for n in bundle.ignored_tests(path.read_text(encoding="utf-8"))]
+        self.assertGreater(len(names), 20)
+        lines = self.rows_by_line()
+        self.assertTrue(lines)
+        for line, filters in lines.items():
+            for name in names:
+                with self.subTest(gradle=line, test=name):
+                    self.assertEqual(sum(libtest_selects(f, name) for f in filters), 1)
+
+    def test_catch_all_skips_exactly_the_other_legs_words(self):
+        for line, filters in self.rows_by_line().items():
+            with self.subTest(gradle=line):
+                catch_all = [f for f in filters if "--skip" in f]
+                self.assertEqual(len(catch_all), 1)
+                skips = {w for a, w in zip(catch_all[0], catch_all[0][1:]) if a == "--skip"}
+                named = {w for f in filters if f is not catch_all[0]
+                         for w in f if w.startswith("gradle_hosted_")}
+                self.assertEqual(skips, named)
+
+    def test_libtest_selects_negative(self):
+        self.assertFalse(libtest_selects(["--ignored", "gradle_hosted_b"], "gradle_hosted_catalog"))
+        self.assertFalse(libtest_selects(["--ignored", "gradle_hosted_", "--skip", "gradle_hosted_c"],
+                                         "gradle_hosted_catalog"))
+        self.assertTrue(libtest_selects(["--ignored", "gradle_hosted_", "--skip", "gradle_hosted_c"],
+                                        "gradle_hosted_tamper_fails"))
+
+
 class AllowEmpty(unittest.TestCase):
     rows = rows_mod.job_rows(rows_mod.jobs(CI.read_text(encoding="utf-8")), "e2e")
 

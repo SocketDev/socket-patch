@@ -2,7 +2,7 @@ use clap::Args;
 use socket_patch_core::api::blob_fetcher::{fetch_blobs_by_hash, format_fetch_result};
 use socket_patch_core::api::client::{get_api_client_with_overrides, ApiClient};
 use socket_patch_core::crawlers::{CrawlerOptions, Ecosystem};
-use socket_patch_core::manifest::cleanup_blobs::{ArtifactReferences, CleanupResult};
+use socket_patch_core::manifest::cleanup_blobs::ArtifactReferences;
 use socket_patch_core::manifest::operations::{
     get_before_hash_blobs, read_manifest, write_manifest,
 };
@@ -21,8 +21,8 @@ use std::collections::{HashMap, HashSet};
 use std::path::{Path, PathBuf};
 use std::time::Duration;
 
-use crate::args::{apply_env_toggles, parse_bool_flag, GlobalArgs};
-use crate::commands::apply::is_local_go;
+use crate::args::{apply_env_toggles, is_local_go, parse_bool_flag, GlobalArgs};
+use crate::commands::hosted_unwind::run_hosted_leg;
 use crate::commands::lock_cli::acquire_or_emit;
 use crate::commands::vendored_backend::{RevertedEntry, VendorRevertStep, VendoredBackend};
 use crate::ecosystem_dispatch::{find_all_packages_for_rollback, partition_purls, JvmScope};
@@ -76,39 +76,12 @@ pub(crate) fn join_clauses(clauses: &[String]) -> String {
     }
 }
 
-/// `msg` with its first character uppercased: human `Error: …` lines
-/// start with a capital even when the message (shared with the JSON
-/// envelope, which keeps it verbatim) does not. A message that opens with
-/// a value rather than a word — a purl, a patch UUID, a path, a flag — is
-/// returned unchanged: capitalizing it would corrupt text the user may
-/// copy and paste.
-pub(crate) fn capitalize_first(msg: &str) -> String {
-    let first_word = msg
-        .split_whitespace()
-        .next()
-        .unwrap_or("")
-        .trim_end_matches([',', '.', ';', ':']);
-    let is_plain_word = !first_word.is_empty()
-        && first_word
-            .chars()
-            .all(|c| c.is_alphabetic() || c == '\'' || c == '-')
-        && first_word.chars().next().is_some_and(char::is_alphabetic);
-    if !is_plain_word {
-        return msg.to_string();
-    }
-    let mut chars = msg.chars();
-    match chars.next() {
-        Some(first) => format!("{}{}", first.to_uppercase(), chars.as_str()),
-        None => String::new(),
-    }
-}
-
 /// Capitalize the first character and end with `?`.
 pub(crate) fn as_question(text: &str) -> String {
     if text.is_empty() {
         return String::new();
     }
-    format!("{}?", capitalize_first(text))
+    format!("{}?", crate::ui::sentence_case(text))
 }
 
 /// The default (destructive) rollback's confirmation prompt, naming only
@@ -143,21 +116,6 @@ fn rollback_prompt(manifest: usize, vendored: usize, hosted: usize) -> String {
         ));
     }
     as_question(&join_clauses(&clauses))
-}
-
-/// Where a physical copy lives, relative to `cwd` when it is inside it.
-/// Shared with `apply`.
-pub(crate) fn display_copy_path(package_path: &str, cwd: &Path) -> String {
-    let path = Path::new(package_path);
-    let canonical = std::fs::canonicalize(path).ok();
-    let rel = path
-        .strip_prefix(cwd)
-        .ok()
-        .or_else(|| canonical.as_deref().and_then(|c| c.strip_prefix(cwd).ok()));
-    match rel {
-        Some(r) if !r.as_os_str().is_empty() => r.display().to_string(),
-        _ => package_path.to_string(),
-    }
 }
 
 /// `Error: Failed to roll back <purl>: <why>` — the per-package failure
@@ -257,7 +215,7 @@ fn copy_label(
         .iter()
         .filter(|o| o.package_key == r.package_key)
         .count();
-    let copy = (copies > 1).then(|| display_copy_path(&r.package_path, cwd));
+    let copy = (copies > 1).then(|| crate::ui::display_copy_path(&r.package_path, cwd));
     match (copy, note) {
         (Some(c), Some(n)) => format!("  {} ({c}, {n})", r.package_key),
         (Some(c), None) => format!("  {} ({c})", r.package_key),
@@ -738,7 +696,7 @@ fn emit_rollback_error(json: bool, msg: &str) {
             .expect("serializing an in-memory JSON value cannot fail")
         );
     } else {
-        eprintln!("Error: {}", capitalize_first(msg));
+        eprintln!("Error: {}", crate::ui::sentence_case(msg));
     }
 }
 
@@ -758,32 +716,6 @@ struct VendoredLegOutcome {
     kept: Vec<(String, String)>,
     failed: Vec<(String, String)>,
     warnings: Vec<(String, String)>,
-}
-
-/// What the hosted leg did. Shared with remove's hosted leg.
-#[derive(Default)]
-pub(crate) struct HostedLegOutcome {
-    pub(crate) reverted: Vec<String>,
-    pub(crate) failed: Vec<(String, String)>,
-    /// Scoped targets whose ecosystem has no per-purl hosted revert.
-    pub(crate) unsupported: Vec<String>,
-    pub(crate) warnings: Vec<(String, String)>,
-    pub(crate) edited_files: std::collections::BTreeSet<String>,
-}
-
-/// The `cleanup_failed` detail for one sweep pass labelled `label`: the
-/// directory-level error that stopped the pass, or — after a pass that
-/// kept sweeping past unlink failures — the files it could not remove
-/// (their counts of what WAS reclaimed still stand). `None` for a clean
-/// pass. Every consumer renders it as `<label> cleanup failed: …`.
-pub(crate) fn sweep_failure(label: &str, pass: &std::io::Result<CleanupResult>) -> Option<String> {
-    match pass {
-        Err(e) => Some(format!("{label} cleanup failed: {e}")),
-        Ok(r) if !r.failed.is_empty() => {
-            Some(format!("{label} cleanup failed: {}", r.failed.join("; ")))
-        }
-        Ok(_) => None,
-    }
 }
 
 /// Unwire the in-scope vendored entries. `preserve` keeps artifacts and
@@ -867,103 +799,6 @@ async fn run_vendored_leg(
     out
 }
 
-/// The patch-server origins that count as hosted, besides Socket's own:
-/// the operator's `--patch-server-url` (discovery's allowlist).
-pub(crate) fn patch_server_origins(common: &GlobalArgs) -> Vec<String> {
-    common
-        .patch_server_url
-        .iter()
-        .filter(|url| !url.trim().is_empty())
-        .cloned()
-        .collect()
-}
-
-/// Restore the in-scope hosted pins to their default upstream registry
-/// entries (core `patch::redirect::upstream`): v5 hosted mode keeps no
-/// ledger, so each pin's lock entry is re-resolved from the registry, and a
-/// pin that cannot be is refused with the `git checkout` remedy. Shared
-/// with remove's hosted leg.
-pub(crate) async fn run_hosted_leg(common: &GlobalArgs, pins: &[HostedPin]) -> HostedLegOutcome {
-    use socket_patch_core::patch::redirect::upstream::{
-        restore_upstream, PinStatus, RestoreOptions,
-    };
-
-    let mut out = HostedLegOutcome::default();
-    if pins.is_empty() {
-        return out;
-    }
-    // The vlt nodes the restored pins pin, read before the restore rewrites
-    // them: the heal below invalidates the patched installed copies once the
-    // registry pins are back.
-    let vlt_lock = socket_patch_core::utils::fs::read_regular_to_string(
-        &common
-            .cwd
-            .join(socket_patch_core::constants::npm_family::VLT_LOCK),
-    )
-    .await
-    .ok();
-    let origins = patch_server_origins(common);
-    let purls: Vec<String> = pins.iter().map(|p| p.purl.clone()).collect();
-    let vlt_targets = vlt_lock
-        .as_deref()
-        .map(|lock| {
-            socket_patch_core::patch::redirect::vlt_heal::lock_targets(lock, &origins, &purls)
-        })
-        .unwrap_or_default();
-    let opts = RestoreOptions {
-        dry_run: common.dry_run,
-        offline: common.offline,
-        patch_server_origins: origins,
-        // A binary bun.lockb pin refuses with the checkout remedy: its
-        // rebuilt registry record is not byte-exact for every lock.
-        bun_lockb: false,
-    };
-    let outcome = restore_upstream(&common.cwd, pins, &opts).await;
-    for pin in &outcome.pins {
-        match &pin.status {
-            PinStatus::Restored => {
-                if !common.json && !common.silent {
-                    if common.dry_run {
-                        println!("Would restore {} to its upstream registry entry", pin.purl);
-                    } else {
-                        println!("Restored {} to its upstream registry entry", pin.purl);
-                    }
-                }
-                out.reverted.push(pin.purl.clone());
-            }
-            PinStatus::Refused(why) => {
-                // Errors print even under --silent: this drives exit 1.
-                if !common.json {
-                    eprintln!("Error: {}", capitalize_first(why));
-                }
-                out.failed.push((pin.purl.clone(), why.clone()));
-            }
-        }
-    }
-    if let Some(e) = &outcome.flush_error {
-        let why = format!("writing the restored lockfiles failed: {e}");
-        if !common.json {
-            eprintln!("Error: {}", capitalize_first(&why));
-        }
-        out.failed.push(("files".to_string(), why));
-    }
-    out.warnings.extend(
-        outcome
-            .warnings
-            .iter()
-            .map(|(code, detail)| (code.to_string(), detail.clone())),
-    );
-    out.edited_files
-        .extend(outcome.reverted_files.iter().cloned());
-    let unwound: Vec<_> = vlt_targets
-        .into_iter()
-        .filter(|t| out.reverted.iter().any(|p| p == &t.purl))
-        .collect();
-    out.warnings
-        .extend(crate::commands::scan::vlt_rollback_heal(common, &unwound).await);
-    out
-}
-
 /// Delete a pre-v5 hosted ledger once no hosted pin is left for it to
 /// describe (v5 never writes it; it is read only for migration). A wet run
 /// only; a failure is a warning (the file is inert).
@@ -1016,7 +851,7 @@ pub async fn run(args: RollbackArgs) -> i32 {
     let path_scope = match crate::path_scope::PathScope::parse(&path_patterns) {
         Ok(s) => s,
         Err(e) => {
-            eprintln!("Error: {}", capitalize_first(&e.to_string()));
+            eprintln!("Error: {}", crate::ui::sentence_case(&e.to_string()));
             return 2;
         }
     };
@@ -1094,7 +929,7 @@ pub async fn run(args: RollbackArgs) -> i32 {
                     .expect("serializing an in-memory JSON value cannot fail")
                 );
             } else if let Some((_, detail)) = &warning {
-                eprintln!("Warning: {}", capitalize_first(detail));
+                eprintln!("Warning: {}", crate::ui::sentence_case(detail));
             } else if !args.common.silent {
                 println!(
                     "{} the pre-v5 hosted ledger {}: no lockfile pins a hosted patch.",
@@ -1502,7 +1337,7 @@ pub async fn run(args: RollbackArgs) -> i32 {
             if !scoped {
                 if let Some(refusal) = hosted_inventory.contested_refusal() {
                     if !args.common.json {
-                        eprintln!("Error: {}", capitalize_first(&refusal));
+                        eprintln!("Error: {}", crate::ui::sentence_case(&refusal));
                     }
                     hosted_leg
                         .failed
@@ -1617,7 +1452,7 @@ pub async fn run(args: RollbackArgs) -> i32 {
                     ("diffs", sweep.diffs),
                     ("packages", sweep.packages),
                 ]) {
-                    if let Some(detail) = sweep_failure(label, &result) {
+                    if let Some(detail) = crate::ui::sweep_failure(label, &result) {
                         run_warnings.push(("cleanup_failed".into(), detail));
                     }
                     if let Ok(r) = result {
@@ -1957,7 +1792,7 @@ pub async fn run(args: RollbackArgs) -> i32 {
                 }
                 for (code, detail) in &run_warnings {
                     if code == "vendor_state_unreadable" {
-                        eprintln!("Error ({code}): {}", capitalize_first(detail));
+                        eprintln!("Error ({code}): {}", crate::ui::sentence_case(detail));
                     }
                 }
             }
@@ -2004,7 +1839,7 @@ pub async fn run(args: RollbackArgs) -> i32 {
             } else {
                 // Errors print even under --silent ("errors only", never
                 // "nothing"): exit 1 with no message would be undiagnosable.
-                eprintln!("Error: {}", capitalize_first(&e));
+                eprintln!("Error: {}", crate::ui::sentence_case(&e));
             }
             1
         }
@@ -5147,41 +4982,6 @@ mod tests {
             rollback_prompt(0, 2, 0),
             "Delete 2 vendored artifacts and their ledger records?"
         );
-    }
-
-    #[test]
-    fn copy_path_outside_cwd_stays_absolute() {
-        assert_eq!(
-            display_copy_path("/elsewhere/node_modules/x", Path::new("/p")),
-            "/elsewhere/node_modules/x"
-        );
-        assert_eq!(display_copy_path("/p", Path::new("/p")), "/p");
-        assert_eq!(
-            display_copy_path("/p/node_modules/é", Path::new("/p")),
-            "node_modules/é"
-        );
-    }
-
-    #[test]
-    fn capitalize_first_is_char_safe() {
-        assert_eq!(capitalize_first(""), "");
-        assert_eq!(capitalize_first("path pattern x"), "Path pattern x");
-        assert_eq!(capitalize_first("Already"), "Already");
-        assert_eq!(capitalize_first("ülk"), "Ülk");
-        assert_eq!(capitalize_first("--preserve-state"), "--preserve-state");
-        assert_eq!(capitalize_first("cannot read x: y"), "Cannot read x: y");
-        assert_eq!(capitalize_first("can't, really"), "Can't, really");
-        // Values the user may copy back are never altered.
-        assert_eq!(
-            capitalize_first("pkg:npm/a@1 matches only hosted records"),
-            "pkg:npm/a@1 matches only hosted records"
-        );
-        assert_eq!(
-            capitalize_first("a1b2c3d4-0000-4000-8000-000000000000 matches nothing"),
-            "a1b2c3d4-0000-4000-8000-000000000000 matches nothing"
-        );
-        assert_eq!(capitalize_first("abcdef matches"), "Abcdef matches");
-        assert_eq!(capitalize_first(".socket/x is bad"), ".socket/x is bad");
     }
 
     #[test]

@@ -2133,7 +2133,9 @@ mod tests {
     }
 
     /// A blob-only fixture: the original file on disk and its patched
-    /// content staged as a per-file blob.
+    /// content staged as a per-file blob. Only the macOS `chflags` test
+    /// below still uses it.
+    #[cfg(target_os = "macos")]
     async fn make_fixture() -> (
         tempfile::TempDir,  // root holding pkg/ and blobs/
         std::path::PathBuf, // pkg dir

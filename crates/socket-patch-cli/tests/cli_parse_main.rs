@@ -161,6 +161,12 @@ fn setup_subcommand_is_removed() {
     // instead. Pin the removal so the name can't quietly come back.
     let err = expect_err(parse(&["socket-patch", "setup"]));
     assert_eq!(err.kind(), clap::error::ErrorKind::InvalidSubcommand);
+    // B76: clap's typo tip pointed at the hidden `self-update`; the error
+    // names the removal and the replacement instead.
+    let text = err.to_string();
+    assert!(text.contains("removed in v5.0"), "{text}");
+    assert!(text.contains("socket-patch apply"), "{text}");
+    assert!(!text.contains("self-update"), "{text}");
 }
 
 #[test]
@@ -178,6 +184,33 @@ fn unlock_subcommand_is_removed() {
     // Pin the removal so the name can't quietly come back half-wired.
     let err = expect_err(parse(&["socket-patch", "unlock"]));
     assert_eq!(err.kind(), clap::error::ErrorKind::InvalidSubcommand);
+    let text = err.to_string();
+    assert!(text.contains("removed in v4.0"), "{text}");
+    assert!(!text.contains("self-update"), "{text}");
+}
+
+#[test]
+fn unknown_subcommand_never_suggests_a_hidden_one() {
+    // B76: the hidden `self-update` / `hosted-bundle` carry no stability
+    // guarantee, so clap must not offer them as typo fixes. `update`
+    // points at the public `--update` flag instead.
+    for typo in ["update", "self-updat", "hosted-bundl"] {
+        let err = expect_err(parse(&["socket-patch", typo]));
+        assert_eq!(
+            err.kind(),
+            clap::error::ErrorKind::InvalidSubcommand,
+            "{typo}"
+        );
+        let text = err.to_string();
+        assert!(!text.contains("'self-update'"), "{typo}: {text}");
+        assert!(!text.contains("'hosted-bundle'"), "{typo}: {text}");
+        assert!(text.contains(&format!("'{typo}'")), "{typo}: {text}");
+    }
+    let text = expect_err(parse(&["socket-patch", "update"])).to_string();
+    assert!(text.contains("socket-patch --update"), "{text}");
+    // A typo of a public subcommand keeps clap's own tip.
+    let text = expect_err(parse(&["socket-patch", "scna"])).to_string();
+    assert!(text.contains("'scan'"), "{text}");
 }
 
 #[test]
