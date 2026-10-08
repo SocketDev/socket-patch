@@ -533,8 +533,7 @@ fn bare_word_target_stays_identifier_error() {
         )],
         false,
     );
-    let manifest_before =
-        std::fs::read(socket.join("manifest.json")).expect("read manifest bytes");
+    let manifest_before = std::fs::read(socket.join("manifest.json")).expect("read manifest bytes");
 
     let (code, stdout, stderr) = run(tmp.path(), &["--offline", "lodash"]);
     assert_eq!(

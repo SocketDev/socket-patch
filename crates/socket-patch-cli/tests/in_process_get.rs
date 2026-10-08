@@ -54,7 +54,7 @@ async fn make_view_mock(server: &MockServer, uuid: &str, purl: &str, tier: &str)
             "files": {
                 "package/index.js": {
                     "beforeHash": "0000000000000000000000000000000000000000000000000000000000000000",
-                    "afterHash":  "1111111111111111111111111111111111111111111111111111111111111111",
+                    "afterHash":  "d2802877eb1c2f442d30d18abcb281cb2830875571624544f2f1acb36480997e",
                     "blobContent": "cGF0Y2hlZAo=",  // base64("patched\n")
                 }
             },
@@ -114,7 +114,9 @@ async fn start_wiremock() -> (MockServer, String) {
 /// The after_hash declared by `make_view_mock` and the exact decoded bytes
 /// of its `blobContent` (`base64("patched\n")`). Derived here independently
 /// of the production decode path so a regression that mangles the blob shows.
-const AFTER_HASH: &str = "1111111111111111111111111111111111111111111111111111111111111111";
+/// `AFTER_HASH` is the real git-sha256 of `BLOB_BYTES`: inline blobs are
+/// verified against their name before they are stored (#726).
+const AFTER_HASH: &str = "d2802877eb1c2f442d30d18abcb281cb2830875571624544f2f1acb36480997e";
 const BEFORE_HASH: &str = "0000000000000000000000000000000000000000000000000000000000000000";
 const BLOB_BYTES: &[u8] = b"patched\n";
 /// The single patched file path declared by `make_view_mock`. The saved

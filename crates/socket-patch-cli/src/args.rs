@@ -95,7 +95,11 @@ pub(crate) const GLOBAL_OPTIONS: &str = "Global options";
 //
 // **Every** global flag is parseable on **every** subcommand. Commands that
 // don't use a given flag ignore it silently — e.g. `list --global` parses
-// fine and the `global` field is unused at runtime.
+// fine and the `global` field is unused at runtime. The one exception is
+// the path flags (`--cwd`, `--global-prefix`, `--manifest-path`): `main`
+// validates them on every project command, used or not
+// ([`GlobalArgs::validate_paths`]), because a path that names nothing must
+// never read as an empty project.
 //
 // (Plain `//` comments: clap turns a doc comment here into the `--help`
 // description of any subcommand that has none of its own.)
@@ -383,6 +387,76 @@ pub struct GlobalArgs {
 }
 
 impl GlobalArgs {
+    /// Reject path flags that name nothing: `--cwd` and `--global-prefix`
+    /// (flag or env) must be existing directories, and a `--manifest-path`
+    /// other than the default must sit in an existing project directory and
+    /// must not itself be a directory. `main` maps `Err` to the usage exit
+    /// (2), the same exit a hosted/vendored `scan` PATH that is not a
+    /// directory gets.
+    ///
+    /// Without this a typo in `--cwd` / `SOCKET_CWD` read as an empty
+    /// project: `apply`, `list`, `scan`, `get` and the `vendor --check` CI
+    /// gate all exited 0 having checked nothing.
+    ///
+    /// A missing manifest FILE stays legal: hosted and vendored projects
+    /// have none, and `get` / `scan --mode agent` create it. Only its
+    /// project directory has to exist — except for the commands that
+    /// create the manifest (`creates_manifest`: `get`, `scan`), which make
+    /// a missing directory as they always have; writing it is no vacuous
+    /// pass.
+    pub fn validate_paths(&self, creates_manifest: bool) -> Result<(), String> {
+        let not_dir = |flag: &str, env: &str, path: &Path, what: &str| {
+            format!("{flag} (or {env}) `{}` {what}", path.display())
+        };
+        if !self.cwd.is_dir() {
+            let what = if self.cwd.exists() {
+                "is not a directory"
+            } else {
+                "does not exist"
+            };
+            return Err(not_dir("--cwd", "SOCKET_CWD", &self.cwd, what));
+        }
+        if let Some(prefix) = &self.global_prefix {
+            if !prefix.is_dir() {
+                let what = if prefix.exists() {
+                    "is not a directory"
+                } else {
+                    "does not exist"
+                };
+                return Err(not_dir(
+                    "--global-prefix",
+                    "SOCKET_GLOBAL_PREFIX",
+                    prefix,
+                    what,
+                ));
+            }
+        }
+        if self.manifest_path != DEFAULT_PATCH_MANIFEST_PATH {
+            let manifest = self.resolved_manifest_path();
+            if manifest.is_dir() {
+                return Err(not_dir(
+                    "--manifest-path",
+                    "SOCKET_MANIFEST_PATH",
+                    &manifest,
+                    "is a directory, not a manifest file",
+                ));
+            }
+            let root = self.project_root();
+            if !creates_manifest && !root.is_dir() {
+                return Err(not_dir(
+                    "--manifest-path",
+                    "SOCKET_MANIFEST_PATH",
+                    &manifest,
+                    &format!(
+                        "is in a project directory that does not exist ({})",
+                        root.display()
+                    ),
+                ));
+            }
+        }
+        Ok(())
+    }
+
     /// The crawler options this run's `--cwd` / `--global` /
     /// `--global-prefix` select.
     pub(crate) fn crawler_options(&self) -> socket_patch_core::crawlers::CrawlerOptions {

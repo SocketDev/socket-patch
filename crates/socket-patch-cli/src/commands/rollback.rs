@@ -14,11 +14,10 @@ use socket_patch_core::patch::rollback::{
     VerifyRollbackResult, VerifyRollbackStatus,
 };
 use socket_patch_core::telemetry::{track_patch_rollback_failed, track_patch_rolled_back};
-use socket_patch_core::utils::composer_version::composer_purls_equivalent;
 use socket_patch_core::utils::purl::strip_purl_qualifiers;
+use socket_patch_core::utils::purl_key::PurlKey;
 use socket_patch_core::utils::target::{is_path_shaped, Target, TargetKind};
 use socket_patch_core::vendor::{purl_keys_cover, RevertOpts, VendorState};
-use socket_patch_core::vex::discover::canonical_base_purl;
 use std::collections::{HashMap, HashSet};
 use std::path::{Path, PathBuf};
 use std::time::Duration;
@@ -1179,7 +1178,7 @@ pub async fn run(args: RollbackArgs) -> i32 {
     // runs, and the ledger does not own the global copies, so the in-place
     // leg restores them.
     let loaded_vendor_state = socket_patch_core::vendor::load_state(&cwd).await;
-    let project_vendored_keys: HashSet<String> = loaded_vendor_state
+    let project_vendored_keys: HashSet<PurlKey> = loaded_vendor_state
         .as_ref()
         .map(VendorState::purl_keys)
         .unwrap_or_default();
@@ -1192,7 +1191,7 @@ pub async fn run(args: RollbackArgs) -> i32 {
     let vendor_corrupt = vendor_state_result.is_err();
     // An unreadable ledger degrades to "nothing vendored" for the in-place
     // leg (its own containment is the `vendor_state_unreadable` exit below).
-    let vendored_keys: HashSet<String> = vendor_state_result
+    let vendored_keys: HashSet<PurlKey> = vendor_state_result
         .as_ref()
         .map(VendorState::purl_keys)
         .unwrap_or_default();
@@ -1252,13 +1251,15 @@ pub async fn run(args: RollbackArgs) -> i32 {
         let mut identifiers = identifiers;
         let mut globs: Vec<String> = Vec::new();
         for raw in path_scope.raw() {
-            let named = is_name_shaped_path(raw).then(|| Target::parse(raw)).filter(|t| {
-                t.kind() == TargetKind::Name
-                    && (!ledgers.matching(t).is_empty()
-                        || redirect_records
-                            .iter()
-                            .any(|(purl, uuid)| t.matches_patch(purl, uuid)))
-            });
+            let named = is_name_shaped_path(raw)
+                .then(|| Target::parse(raw))
+                .filter(|t| {
+                    t.kind() == TargetKind::Name
+                        && (!ledgers.matching(t).is_empty()
+                            || redirect_records
+                                .iter()
+                                .any(|(purl, uuid)| t.matches_patch(purl, uuid)))
+                });
             match named {
                 Some(t) => identifiers.push(t),
                 None => globs.push(raw.clone()),
@@ -1283,16 +1284,11 @@ pub async fn run(args: RollbackArgs) -> i32 {
     }
     for id in &identifiers {
         let found = ledgers.matching(id);
-        let mut matched = !found.is_empty();
-        // Hosted pins live in the lockfiles, not in a store.
-        let mut hosted_found: Vec<&str> = Vec::new();
-        for (purl, uuid) in &redirect_records {
-            if id.matches_patch(purl, uuid) {
-                hosted_scope.insert(purl.clone());
-                hosted_found.push(purl);
-                matched = true;
-            }
-        }
+        // Hosted pins live in the lockfiles, not in a store: matched by the
+        // target, or as another generation of a matched manifest key.
+        let pins =
+            socket_patch_core::ledgers::hosted_pins_matching(&hosted_pins, id, &found.manifest);
+        let matched = !found.is_empty() || !pins.is_empty();
         // A name reaching several packages by last segment (`core` →
         // `@angular/core` and `@babel/core`) is refused across every
         // store: `rollback` acts on one package per name.
@@ -1302,10 +1298,11 @@ pub async fn run(args: RollbackArgs) -> i32 {
                 .iter()
                 .map(String::as_str)
                 .chain(found.vendor.iter().map(|(k, e)| e.ambiguity_purl(k, id)))
-                .chain(hosted_found),
+                .chain(pins.iter().map(|pin| pin.purl.as_str())),
         );
         manifest_scope.extend(found.manifest);
         vendor_scope.extend(found.vendor.into_iter().map(|(k, _)| k));
+        hosted_scope.extend(pins.into_iter().map(|pin| pin.purl));
         if let Some(msg) = ambiguity {
             track_patch_rollback_failed(&msg, api_token.as_deref(), org_slug.as_deref()).await;
             emit_rollback_error(args.common.json, &msg);
@@ -2076,7 +2073,7 @@ pub(crate) async fn rollback_patches_inner(
     common: &GlobalArgs,
     socket_dir: &Path,
     manifest: &PatchManifest,
-    vendored_keys: &HashSet<String>,
+    vendored_keys: &HashSet<PurlKey>,
     selection: InnerSelection<'_>,
     // Manifest purl -> the hosted uuid a live lockfile pin superseded its
     // record with ([`superseded_by_hosted`]); empty when no hosted pin
@@ -2865,10 +2862,10 @@ pub(crate) fn superseded_by_hosted(
         .patches
         .iter()
         .filter_map(|(purl, record)| {
-            let pkg = canonical_base_purl(purl);
+            let pkg = PurlKey::new(purl);
             let same: Vec<&HostedPin> = pins
                 .iter()
-                .filter(|pin| pin.purl == pkg || composer_purls_equivalent(&pin.purl, &pkg))
+                .filter(|pin| PurlKey::new(&pin.purl) == pkg)
                 .collect();
             if same.iter().any(|pin| pin.uuid == record.uuid) {
                 return None;
