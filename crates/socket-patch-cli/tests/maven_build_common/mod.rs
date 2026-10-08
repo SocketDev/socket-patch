@@ -238,6 +238,27 @@ impl Mvn {
 /// How many times the warm-up asks Maven Central before giving up.
 const WARM_ATTEMPTS: u32 = 3;
 
+/// Google's official Maven Central mirror (a separate CDN). Warm-up retries
+/// go here: Central's own CDN rate-limits shared runner IPs with 429s,
+/// which Maven reports as an absent artifact, so retrying the same host
+/// seconds later fails the same way (CI run 37843887676).
+const CENTRAL_FALLBACK: &str = "https://maven-central.storage-download.googleapis.com/maven2";
+
+/// A user `settings.xml` that sends `central` to [`CENTRAL_FALLBACK`]. The
+/// mirror keeps the id `central`, so the local repository records the same
+/// origin as a direct fetch and later runs with plain settings reuse it.
+fn write_fallback_settings(path: &Path) {
+    std::fs::write(
+        path,
+        format!(
+            "<settings xmlns=\"http://maven.apache.org/SETTINGS/1.0.0\">\n  <mirrors>\n    \
+             <mirror>\n      <id>central</id>\n      <mirrorOf>central</mirrorOf>\n      \
+             <url>{CENTRAL_FALLBACK}</url>\n    </mirror>\n  </mirrors>\n</settings>\n"
+        ),
+    )
+    .unwrap();
+}
+
 /// Whether a failed Maven run failed to FETCH from the remote repository
 /// (a CDN blip that briefly serves a released plugin/artifact as absent, a
 /// dropped connection), as opposed to any other build failure.
@@ -321,21 +342,25 @@ pub fn warm_fixture(
     // The warm-up is the one step that fetches from Maven Central, and it
     // asks only for fixed, long-published releases, so a resolution failure
     // here is transient: Central's CDN has served `maven-dependency-plugin`
-    // 3.6.1 as absent for a moment (CI run 36899218369). Maven records that
-    // miss in the local repository and refuses to re-ask until the update
-    // interval elapses, so a retry must force the check with `-U`.
+    // 3.6.1 as absent for a moment (CI run 36899218369) and rate-limits
+    // runners with 429s. Retries go through Central's Google mirror. Maven
+    // records a miss in the local repository and refuses to re-ask until the
+    // update interval elapses, so a retry must force the check with `-U`.
     let mut out = mvn.copy_dependencies(proj, m2, settings, "target/warm");
+    let fallback = proj.join("warm-fallback-settings.xml");
     for attempt in 2..=WARM_ATTEMPTS {
         if ok(&out) || !is_resolution_failure(&out) {
             break;
         }
         println!(
             "{suite}: fixture warm-up could not resolve from Maven Central; \
-             retrying with -U ({attempt}/{WARM_ATTEMPTS})"
+             retrying with -U via {CENTRAL_FALLBACK} ({attempt}/{WARM_ATTEMPTS})"
         );
-        std::thread::sleep(std::time::Duration::from_secs(5 * u64::from(attempt - 1)));
-        out = mvn.copy_dependencies_with(proj, m2, settings, "target/warm", &["-U"]);
+        std::thread::sleep(std::time::Duration::from_secs(5 * u64::from(attempt - 2)));
+        write_fallback_settings(&fallback);
+        out = mvn.copy_dependencies_with(proj, m2, &fallback, "target/warm", &["-U"]);
     }
+    let _ = std::fs::remove_file(&fallback);
     if !ok(&out) {
         skip(
             suite,
