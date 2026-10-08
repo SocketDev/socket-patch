@@ -426,7 +426,11 @@ fn test_pypi_dry_run() {
     let original_hash = git_sha256_file(&messages_py);
 
     // Download without applying.
-    assert_run_ok(cwd, &["get", PYPI_UUID, "--mode", "agent", "--save-only"], "get --save-only");
+    assert_run_ok(
+        cwd,
+        &["get", PYPI_UUID, "--mode", "agent", "--save-only"],
+        "get --save-only",
+    );
 
     // File should be unchanged.
     assert_eq!(
