@@ -1,6 +1,6 @@
 [agent] Progress ledger for the scheduled Bun bug-hunt routine (label pm:bun).
 
-Last updated: 2026-10-08 (run 30), main `fe8455d`, latest release 4.0.0, latest Bun 1.4.2 (no 1.4.3 stable yet).
+Last updated: 2026-10-08 (run 31), main `829d0af`, latest release 4.0.0, latest Bun 1.4.2 (no 1.4.3 stable yet).
 
 Method (run 16 note: the sandbox shell exports `BUN_OPTIONS=--smol`, so unset it; run 17 note: on Bun ≥ 1.2, `bunfig [install] saveTextLockfile = false` writes a binary `bun.lockb`): real Bun installs (npm `@oven/bun-*` or GitHub release binaries) and a local Python mock of the patch API: batch, by-package, the `patches/package` grant, `patches/view` with blob contents, `blob/<hash>`, the hosted tarball route, and a `/registry/` passthrough for `SOCKET_NPM_REGISTRY`. Set `SOCKET_PATCH_SERVER_URL` to the mock. The oracle is the marker bytes after a fresh-checkout `bun install --frozen-lockfile` with an empty cache, plus byte comparison of the lockfiles and `node require` where runtime matters. The repo's own matrix (`scripts/backtest-bun.py`, `bun-compatibility.yml`) already covers plain hosted and vendored shapes across Bun 0.8.1–1.4.2. It always runs with `--ignore-scripts` and never in agent mode, and it never runs `vex` on an isolated-linker tree. This ledger tracks what it doesn't.
 
@@ -47,6 +47,8 @@ Run 28 (new main `db83f01`): #992 and #861 still reproduce (the fix is pending i
 Run 29 (new main `05ecc6e`): #992 still reproduces (fix pending in draft #1009). New: **#1084**. On the isolated linker, after an agent A → hosted B (superseding) migration and a `bun install`, `rollback` / `remove` exit 0 and drop record A and its blobs. #934's `rollback_record_superseded` skip ignores the orphaned `.bun/<pkg>@<ver>` store entry, which still holds A's bytes, and the advised `bun install` relinks it (first bad `04885c3`). The agent → vendored takeover leaves the same A-patched orphan behind after a revert, which was commented on #764. #934 on hoisted text locks passes. See the run 29 section below.
 
 Run 30 (new main `fe8455d`; no Bun code changes since `05ecc6e`, so #992 / #1084 weren't re-run, and their fixes are still pending in draft #1009): new **#1101**. A hosted or vendored scan / `get` run from a Bun workspace member that holds a stray `bun.lock` / `bun.lockb` pins that lock, which Bun never reads. It exits 0, and `vex` attests `not_affected` while Bun installs unpatched (the Bun variant of #1094; PR #1095 explicitly keeps Bun's own-lock shortcut, verified on its head `cddf38d`). Bun 1.1.39–1.2.23 ignore `!` workspace patterns (1.3.0+ honour them), so #1097's negation half reproduces on old Bun (commented). #1073's brace / class / `**` / object-form member refusals pass on 1.4.2. A symlinked `bun.lock` / `bun.lockb` dry run vs wet run passes (backlog 10). See the run 30 section below.
+
+Run 31 (new main `829d0af`: #1035 superseded-generation remove/rollback, #1044 governing-lock table, #1038, #1042, #1033): new **#1116**. Vendored `bun.lockb` workspaces write member-relative tarball mirrors (`packages/<m>/.socket/vendor/...`) with no `.gitignore` probe and no `!*` re-include, so a stock `*.tgz` rule drops them from the commit. Fresh frozen installs then fail with ENOENT (1.1.39–1.2.23) or hang (1.3.9) when the member resolves its own copy, and on 1.4.2 `vendor --check` / `vex` fail in every clone. #1101 and #1084 still reproduce. #1101 also reproduces under a root `bun.lockb` with a stray member `bun.lock` / `bun.lockb`, where lockfile-only `vex` attests (commented). #1035 on Bun passes: hosted and vendored supersede A→B then `remove B` / `rollback B`, cross-mode takeovers, the #999 shape, hosted A + agent B, and an alias of the same release (text + lockb, single + workspace, 1.2.23 / 1.3.9 / 1.4.2; the text lock is byte-exact). See the run 31 section below.
 
 ## Coverage matrix
 
@@ -426,21 +428,44 @@ Other passes (Linux, 1.4.2 unless noted):
 | Extglob `packages/@(a\|b)` | 1.2.23 / 1.4.2 | n/a (`bun install` rejects the package.json) |
 | Symlinked `bun.lockb` / `bun.lock`, vendored `--dry-run` vs wet, plus hosted wet | 1.4.2 | pass (lockb dry run: `would_refuse vendor_bun_lockb_invalid`; text dry run: `vendor_would_refuse_symlinked_file`; wet runs exit 1 with the link and its target untouched; hosted `redirect_symlinked_file_unsupported`) |
 
+### Run 31 (Linux, main `829d0af`)
+| Cell | Bun | Result |
+| --- | --- | --- |
+| Hosted A → hosted B (superseding) → `remove B` / `rollback`, text | 1.2.23 / 1.3.9 / 1.4.2 | pass (B pinned, fresh frozen B; then registry restored, original; byte-exact) |
+| Same, `bun.lockb` | 1.2.23 / 1.3.9 / 1.4.2 | supersede pass; remove → documented `hosted_revert_failed` (git checkout remedy) |
+| Vendored A → vendored B → `remove B`, text + lockb | 1.2.23 / 1.3.9 / 1.4.2 | pass |
+| Vendored A → hosted B and hosted A → vendored B, then `remove B` / `rollback B` | 1.4.2 text + lockb | pass (lockb hosted end: documented refusal) |
+| Workspace (root + member) hosted / vendored supersede + `remove B` | 1.4.2 text v2 + lockb | pass |
+| #999 shape: vendored A, `get B --mode agent`, `remove B` | 1.4.2 text + lockb | pass (vendoring reverted; `get` warns "vendored at A but the manifest now records B", `vex` attests A only) |
+| Hosted A + agent B (manifest), `remove B` / `rollback B`, hoisted + isolated | 1.4.2 | pass (#1035 `hosted_pins_matching` unpins A) |
+| Same release under two keys (`left-pad` + `lp: npm:left-pad@1.3.0`), hosted / vendored supersede + remove | 1.4.2 text + lockb | pass (both keys re-pinned and restored; text byte-exact) |
+| `bun.lock`/`bun.lockb` + leftover `package-lock.json` (#1044 table) | 1.4.2 | pass (hosted pins both; vendored wires bun + documented `vendor_multiple_lockfiles`; `vex` refuses with `patched_ref_unattributable`) |
+| #1101 re-triage, text root | 1.4.2 | fail #1101 (still) |
+| #1101, root `bun.lockb` + stray member `bun.lock` / `bun.lockb` | 1.4.2 | **fail**, commented on #1101 (lock-only member `vex` attests) |
+| #1084 re-triage: agent A → hosted B → rollback / remove, isolated | 1.4.2 | fail #1084 (still) |
+| #635: globalStore agent cross-project patching after #1042 | 1.4.2 | fail #635 (still) |
+| #831 cell: vendored lockb workspace with root `*.tgz`, member `*.tgz`, member `.socket/` | 1.1.39 / 1.1.45 / 1.2.23 / 1.3.9 / 1.4.2 | **fail #1116** (member mirrors ignored; nested shape: ENOENT / hang / `--check` red) |
+| Same, root `vendor/` | 1.4.2 | pass (refused `vendor_artifact_gitignored`) |
+| Text `bun.lock` workspace with `*.tgz` | 1.4.2 | pass (no mirrors written) |
+
 ## Backlog
 
 0. **Maintainer request (partly covered in runs 3 and 6):** global (`-g`) mode for hosted patches. Still to do: a non-writable global dir must fail loudly (needs a probe; the sandbox runs as root); Windows 1.1.45/1.2.23 with an ASCII temp path; Bun 1.0.x. #443 is still open; re-test #434 (`bun.cmd`) on Windows now that #442 has landed. Checklist: the 20261001T040000Z entry.
-1. A maintainer needs to delete the probe branches `bughunt/bun/20260930-default-trust`, `bughunt/bun/20260930-isolated-bunpatch`, `bughunt/bun/20261001-vex-isolated` and `bughunt/bun/20261001-global-dirs`. Deletion is still refused from the sandbox (runs 7–26; run 26: blocked by the session permission classifier), so no new probes until then.
+1. A maintainer needs to delete the probe branches `bughunt/bun/20260930-default-trust`, `bughunt/bun/20260930-isolated-bunpatch`, `bughunt/bun/20261001-vex-isolated` and `bughunt/bun/20261001-global-dirs`. Deletion is still refused from the sandbox (runs 7–26; run 26: blocked by the session permission classifier), so no new probes until then. They still existed in run 31.
 2. #861: macOS/Windows; re-test when fixed (the existing-member `bun add` variant reproduces, run 23). #884 and #367 verified fixed on Linux (run 28). #1019: workspace members, Bun 1.4.0-written keys, macOS/Windows; re-test when fixed. Most open issues are claimed by draft #1009: re-test all of them when it merges.
-3. #831: verified on Bun 1.4.2 text + `bun.lockb` (run 28); the isolated-workspace cell is still to do. `vendor --check` after `bun remove` (#970). #764 follow-up: macOS/Windows. Real Windows autocrlf checkouts.
+3. #831: verified on Bun 1.4.2 text + `bun.lockb` (run 28). The workspace cell is now #1116; re-test it when fixed (also on the isolated linker, and with a `.gitattributes` / LFS rule). `vendor --check` after `bun remove` (#970). #764 follow-up: macOS/Windows. Real Windows autocrlf checkouts.
 4. #861, #831, #784, #764, #635, #599 and #497: re-test when fixed. #626 on Bun once PR #634 merges. Also `globalStore` + workspaces and `globalStore` on macOS/Windows. (#605/#774 store copies on Bun peer-variant entries: pass, run 21.)
 5. macOS/Windows re-runs of the #366 / #405 / #469 / #803 fixes (Windows isolated uses junctions).
 6. #497 `github:` tuples (needs a probe).
 7. Hosted rollback on real macOS and Windows checkouts.
 8. Bun 1.4.3 when stable (1.4.3-canary.1 passes, run 27). #992: re-test when fixed, including `[install.scopes]` and `NPM_CONFIG_REGISTRY` variants and the 1.1.45 `remove` / takeover cells. (Lifecycle scripts and scoped packages with scripts on `bun.lockb`: pass, run 27.) (Mixed modes, `globalStore` + vendored workspace lockb: pass, run 25. Superseding uuids in mixed modes, explicit `trustedDependencies`, `bun pm trust`, `--filter`: pass, run 26.)
 9. Digest boundary with a valid substitute tarball, 1.3.9 text lock vs 1.3.10 (low priority, documented limitation).
-10. #1101: re-test when fixed (and macOS/Windows); also a stray member lock under a root `bun.lockb`. #1097 Bun < 1.3 negation: re-test when fixed. #1084: a workspace (isolated by default on Bun ≥ 1.3), macOS/Windows; re-test when fixed. The vendored dry run's symlink check doesn't list `bun.lockb` (registry row without `VENDORED`; `wiring_paths`), so check a symlinked `bun.lockb` in a vendored dry run vs a wet run.
+10. #1101: re-test when fixed (and macOS/Windows); the root `bun.lockb` variant is covered (run 31). #1097 Bun < 1.3 negation: re-test when fixed. #1084: a workspace (isolated by default on Bun ≥ 1.3), macOS/Windows; re-test when fixed. The vendored dry run's symlink check doesn't list `bun.lockb` (registry row without `VENDORED`; `wiring_paths`), so check a symlinked `bun.lockb` in a vendored dry run vs a wet run.
 
 ## Known non-bugs
+
+- `get <B> --mode agent` on a package vendored at A records B in the manifest and overwrites the installed (A-patched) copy with B's full content (non-strict "did not match … applied the full verified patched content"). It warns that the vendoring is still at A, and `vex` attests A only. Documented; use `--strict` (run 31).
+- Mock fixture (run 31): the grant must return `sha512-`-prefixed integrity and a tarball URL on the mock's own origin. Bare base64 lands in `bun.lock` as-is (Bun warns "malformed integrity"), and the baked `patch.socket.dev` host is unreachable. Never name a shell loop variable `M`, because it clobbers the mock URL.
 
 - A hosted `scan` from a **hoisted** workspace member (no member `node_modules`) reports `success` with `scannedPackages: 0` and no refusal, because there are no candidates to gate. It claims nothing, and npm behaves the same; `get <uuid>` from the same member is refused. Not filed (run 30).
 - A refused wet vendored run on a symlinked `bun.lock` leaves unreferenced `.socket/vendor/npm/<uuid>/` artifacts. That's documented (CLI_CONTRACT `redirect_symlinked_file_unsupported`: "the artifacts written are unreferenced orphans") (run 30).
