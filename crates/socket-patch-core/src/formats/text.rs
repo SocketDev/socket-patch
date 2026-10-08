@@ -12,7 +12,7 @@
 
 /// `(bom, rest)`: a leading UTF-8 BOM split off (`""` when there is none),
 /// so an edit can read `rest` and restore `bom` byte-exact on write.
-pub fn split_bom(text: &str) -> (&str, &str) {
+pub fn split_bom(text: &str) -> (&'static str, &str) {
     match text.strip_prefix('\u{feff}') {
         Some(rest) => ("\u{feff}", rest),
         None => ("", text),
