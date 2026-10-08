@@ -1,6 +1,6 @@
 [agent] Progress ledger for the scheduled Yarn classic (1.x) bug-hunt routine (label pm:yarn-classic).
 
-Last updated: 2026-10-08 (run 31), main `ea09714`, latest release v4.0.0. Runs 5–31 added the cells in "Run 5 cells" through "Run 31 cells" below. #1013 / #1078 / #519 are closed by #1083 / #1033; run 31 verified the mirror fix cross-OS. Since run 28, #364, #921, #857, #884, #831, #974, #938 (#940) and #907 (#917) are closed by merged fixes, and #1071 (#1073) and #975 (#978) have landed too; the old `fail #364` cells now mean a project-level mirror is refused (pass), and #1115 (a mirror in a workspace member's `.yarnrc`) is the remaining mirror gap. The project-mode matrix below was measured on `f6b7fb9` (v4); cells marked "(v5)", the global matrix and the "v5 project-mode cells" list were re-run on v5.
+Last updated: 2026-10-08 (run 32), main `e2d9633`, latest release v4.0.0. Runs 5–32 added the cells in "Run 5 cells" through "Run 32 cells" below. Run 32 checked #1057 (the yarn grammar refactor; it fixes the hosted half of #467), #1050 and #1029 with no regressions. #1013 / #1078 / #519 are closed by #1083 / #1033; run 31 verified the mirror fix cross-OS. Since run 28, #364, #921, #857, #884, #831, #974, #938 (#940) and #907 (#917) are closed by merged fixes, and #1071 (#1073) and #975 (#978) have landed too; the old `fail #364` cells now mean a project-level mirror is refused (pass), and #1115 (a mirror in a workspace member's `.yarnrc`) is the remaining mirror gap. The project-mode matrix below was measured on `f6b7fb9` (v4); cells marked "(v5)", the global matrix and the "v5 project-mode cells" list were re-run on v5.
 
 ## Coverage matrix
 
@@ -222,9 +222,17 @@ Other cells that pass on Linux 1.22.22 (some also on older releases; see the ent
 - #1044: yarn.lock + package-lock / shrinkwrap, H and V: unchanged, pass. yarn.lock + stale pnpm-lock.yaml: vendored routes to pnpm and warns that yarn.lock stays unpatched (documented).
 - Re-triage: #1081 and #758 still reproduce; #1097 also reproduces via `get` (all commented).
 
+### Run 32 cells (`e2d9633`)
+- #1057 battery, H/V + frozen install + VEX + rollback (1.22.22; base / CRLF / alias-merge also on 1.7.0 and 1.10.1; H on 1.0.2 / 1.4.0): key shapes `latest` / `*` / `>=1 <2` / `1.x || ^1.3.0` / `resolutions` version force, and lock shapes CRLF / BOM+CRLF / no trailing newline / comment line / extra blank lines: pass.
+- #467: hosted mixed-EOL **fixed** (each line keeps its own ending through scan and rollback). Vendored mixed-EOL still fails on Linux / macOS / Windows (probe 37781119597).
+- Cross-OS probe 37781119597 (ubuntu / macos / windows × 1.10.1 / 1.22.22): H/V × native / LF / CRLF / BOM+CRLF locks, plus `file:` fork tarballs with backslash and `./` specs skipped or refused: pass.
+- B16 forks: `resolutions` / member `file:` or URL forks are skipped and VEX doesn't attest them. v4.0.0 legacy hosted pins are named and rollback refuses them with a remedy. v4.0.0 legacy vendored wiring is kept and rolls back byte-exact: pass.
+- #1050 `scan --vendored --prune` keeps live wiring in 8 shapes and reverts after `yarn remove` (×2): pass. #1029 agent `apply --check` (workspaces, nested copies, modules-folder, nohoist): pass.
+- #558 still reproduces. #1115 also triggers through a member `.npmrc` (commented).
+
 ## Backlog
 
-000. #1115 follow-ups: member `.npmrc`, `yarn workspace <m> add`, V→H takeover in that shape; macOS / Windows.
+000. #1115 follow-ups (member `.npmrc` done in run 32): `yarn workspace <m> add`, V→H takeover in that shape; macOS / Windows.
 00. #1097 follow-ups (`get` done in run 31): the same `!` / extglob member shapes from `get` and on yarn berry / npm / bun roots (hand over npm extglob if it reproduces; npm supports negation, so only extglob applies there). Dot-dir members (`packages/.x`, which minimatch `*` skips).
 0. #1013 / #1078 follow-ups: the vendored→hosted takeover preflight with a user-level mirror; macOS / Windows home config paths; a BOM `.yarnrc` on a Windows probe (PowerShell 5 `Set-Content -Encoding utf8`). Re-check #1081 on berry aliases (hand over to yarn-berry if `redirect_yarn_berry_alias_skipped` also attests in-run), and on npm / pnpm alias skips.
 1. Re-check #991 on npm / pnpm vendored, and hand it over if it's family-wide. #974 / #921 / #857 / #884 / #364 / #831 are closed (run 28 verified #364 / #884 / #921 on main). Re-check #975's yarn-1 PnP cell once PR #978 merges. Re-check once merged: #828 (PR #1008, incl. the run-29 alias trigger), #1057 (re-run the run-29 battery on its final head), #921 / #857 (PR #924, #921 verified run 25), #884 (PR #901, verified run 22; also covers the positional PATH form), #364 (PR #839), #831 (PR #837), #907 (PR #917), #778 (yarn classic nested copies, run 25), plus #828's yarn git-sibling shape. Then #467 / #519 / #558 / #591 / #691 / #692 / #758.
@@ -341,3 +349,8 @@ Other cells that pass on Linux 1.22.22 (some also on older releases; see the ent
 - Running `yarn config set` as root writes `/usr/local/share/.yarnrc`; a probe harness must clean that too between cells, or mirror settings leak.
 - yarn.lock + a stale pnpm-lock.yaml: vendored follows the governing-lock precedence (pnpm > yarn) and warns `vendor_multiple_lockfiles` that yarn.lock stays unpatched. Documented, not filed.
 - A member-`.yarnrc` mirror (#1115) only breaks installs once the mirror holds the upstream tarball (a cold member install populates it); a no-op member install after a root install leaves it empty.
+- Agent mode overwrites a same-name@version `file:` / URL fork copy with Socket's patched file. That's the documented default mismatch policy (`--strict` refuses), and the missing warning in `scan --json` is #1004. Hosted / vendored skip such copies (B16).
+- A vendored fork-only yarn classic project exits 1 with `vendor_lock_entry_not_rewritable`. Documented.
+- An API purl that lowercases an uppercase npm name (`pkg:npm/jsonstream`) fails closed in every mode. It can't be checked against the real service, so it's not filed. A case-preserving purl works.
+- Leftover probe branch (deletion blocked): `bughunt/yarn-classic/20261008-grammar-xos`.
+- Run-32 harness: `battery.sh <yarnfn> <name> <deps> [resolutions]` (H/V, `MUTATE` hook), `prune.sh`, `agent.sh`, and a parameterised mock (`MNAME` / `MVER` env). The probe script is in the run-32 workflow commit `43a8c51`.
