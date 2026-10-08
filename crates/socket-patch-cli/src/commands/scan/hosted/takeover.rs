@@ -174,6 +174,24 @@ impl Takeover {
                 }
             }
         }
+        // NON-UTF-8 PRE-CHECK (#721) — the GUARD's undecodable-file rule
+        // (`engine::undecodable_guard`), checked before any revert is
+        // staged (and under --dry-run too), on the project as it is on disk.
+        if !out.attempts.is_empty() {
+            let view = socket_patch_core::vendor::lock_inventory::ProjectView::Disk(&common.cwd);
+            let read = socket_patch_core::hosted::engine::read_candidate_files(
+                &view,
+                &std::collections::BTreeSet::new(),
+                candidates,
+            )
+            .await;
+            if let Some(refusal) = socket_patch_core::hosted::engine::undecodable_guard(
+                &read.undecodable_reads,
+                candidates,
+            ) {
+                return Err(refusal);
+            }
+        }
         // SYMLINK PRE-CHECK — the same rule as the hosted SYMLINK GUARD,
         // applied to each ledger entry's recorded wiring (the revert
         // backends also stage and rename over the file), dry runs included.
