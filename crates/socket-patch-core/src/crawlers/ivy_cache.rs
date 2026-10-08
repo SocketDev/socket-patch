@@ -295,7 +295,7 @@ fn attribute<'a>(tag: &'a str, name: &str) -> Option<&'a str> {
 /// Whether `text`'s root element is `<project` (after a BOM, the XML
 /// declaration, comments and a doctype).
 fn is_pom_root(text: &str) -> bool {
-    let mut rest = text.trim_start_matches('\u{feff}');
+    let mut rest = crate::formats::text::strip_bom(text);
     loop {
         rest = rest.trim_start();
         let skip_to = if rest.starts_with("<?") {
@@ -700,6 +700,9 @@ mod tests {
             "\u{feff}<?xml version=\"1.0\"?>\n<!-- a -->\n<!DOCTYPE x>\n<project xmlns=\"y\">"
         ));
         assert!(!is_pom_root("<projects>"));
+        // Exactly one leading BOM is encoding (#905); a second is content.
+        assert!(is_pom_root("\u{feff}<project>"));
+        assert!(!is_pom_root("\u{feff}\u{feff}<project>"));
         assert!(!is_pom_root("<ivy-module><project>"));
         assert!(!is_pom_root("<!-- unterminated"));
         assert!(!is_pom_root(""));

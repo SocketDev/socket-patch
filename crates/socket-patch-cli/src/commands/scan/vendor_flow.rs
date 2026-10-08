@@ -660,11 +660,10 @@ async fn run_vendor_json_path(
                 result["vendor"] =
                     serde_json::to_value(&*venv).unwrap_or_else(|_| serde_json::json!({}));
             }
-            result["status"] = serde_json::json!("error");
-            result["error"] = serde_json::json!({
-                "code": code,
-                "message": message,
-            });
+            crate::json_envelope::set_error(
+                result,
+                crate::json_envelope::EnvelopeError::new(code, message),
+            );
             if let Some(obj) = result.as_object_mut() {
                 obj.remove("rollout");
             }

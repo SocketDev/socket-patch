@@ -1961,6 +1961,7 @@ dependencies = [
  "toml_edit",
  "uuid",
  "walkdir",
+ "windows-sys 0.59.0",
  "wiremock",
  "zip",
 ]

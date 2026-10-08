@@ -371,6 +371,87 @@ pub async fn rollback_package_patch(
     .await
 }
 
+/// Roll back the other pnpm/vlt/Bun store copies of `pkg_path` that still
+/// hold this record's patched bytes, when the primary copy was left to a
+/// superseding hosted pin (#1084).
+///
+/// [`rollback_package_patch`] visits a package's store copies only after
+/// the primary succeeds. A superseded primary fails (it holds the hosted
+/// patch's bytes), so its copies are never reached. On Bun's isolated
+/// linker the store entry the hosted reinstall orphaned is such a copy:
+/// it still holds the agent patch, and the next `bun install` can link it
+/// again. Each copy [`holds_this_patch`] is rolled back with the
+/// single-copy engine and folded into the returned result, which fails if
+/// any copy fails. A copy with any file at bytes the record never wrote
+/// (the superseding patch's own copies, which can share a file with this
+/// record) is left, as the primary is. `None` when no copy holds this
+/// record's patch (or `package_key` is not npm).
+pub async fn rollback_store_copies_holding_patch(
+    package_key: &str,
+    pkg_path: &Path,
+    files: &HashMap<String, PatchFileInfo>,
+    blobs_path: &Path,
+    dry_run: bool,
+) -> Option<RollbackResult> {
+    if !package_key.starts_with("pkg:npm/") {
+        return None;
+    }
+    let mut folded: Option<RollbackResult> = None;
+    for copy in crate::crawlers::npm_crawler::find_store_peer_variant_copies(pkg_path).await {
+        if !holds_this_patch(&copy, files).await {
+            continue;
+        }
+        let copy_result =
+            rollback_package_patch_at(package_key, &copy, files, blobs_path, dry_run).await;
+        let result = folded.get_or_insert_with(|| RollbackResult {
+            package_key: package_key.to_string(),
+            package_path: pkg_path.display().to_string(),
+            success: true,
+            files_verified: Vec::new(),
+            files_rolled_back: Vec::new(),
+            error: None,
+            sidecar: None,
+        });
+        crate::patch::store_copies::fold(result, &copy, copy_result);
+    }
+    folded
+}
+
+/// Whether `dir` is a copy this record patched: every file is at the
+/// record's patched or original bytes (a new file may be absent), and at
+/// least one is at the patched bytes or cannot be checked (an unsafe key,
+/// a read error other than "not found"), which may hide them. A file at
+/// any other bytes, or a missing original file, marks a copy the record
+/// does not own, just as it marks the primary superseded.
+async fn holds_this_patch(dir: &Path, files: &HashMap<String, PatchFileInfo>) -> bool {
+    let mut patched = false;
+    for (file, info) in files {
+        let rel = normalize_file_path(file);
+        if !crate::patch::apply::is_safe_relative_subpath(rel) {
+            patched = true;
+            continue;
+        }
+        // FIFO-safe: a FIFO or device at the leaf is refused, not opened.
+        match crate::utils::fs::read_regular_to_bytes(&dir.join(rel)).await {
+            Ok(bytes) => {
+                let hash = crate::hash::git_sha256::compute_git_sha256_from_bytes(&bytes);
+                if hash == info.after_hash {
+                    patched = true;
+                } else if hash != info.before_hash {
+                    return false;
+                }
+            }
+            Err(e) if e.kind() == std::io::ErrorKind::NotFound => {
+                if !info.before_hash.is_empty() {
+                    return false;
+                }
+            }
+            Err(_) => patched = true,
+        }
+    }
+    patched
+}
+
 impl crate::patch::store_copies::CopyFold for RollbackResult {
     const VERB: &'static str = "roll back";
 

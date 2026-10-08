@@ -327,8 +327,10 @@ fn assert_refused_untouched(
         "a symlinked rewrite target must fail the run: {doc:#}"
     );
     assert_eq!(doc["status"], "error", "{doc:#}");
-    assert_eq!(doc["errorCode"], CODE, "{doc:#}");
-    let message = doc["error"].as_str().unwrap_or_else(|| panic!("{doc:#}"));
+    assert_eq!(doc["error"]["code"], CODE, "{doc:#}");
+    let message = doc["error"]["message"]
+        .as_str()
+        .unwrap_or_else(|| panic!("{doc:#}"));
     assert!(
         message.contains(linked) && message.contains("symbolic link"),
         "the error must name the linked file: {message}"
