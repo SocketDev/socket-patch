@@ -533,6 +533,7 @@ fn scan_json_empty_cwd_emits_updates_key() {
             "redirected": 0,
             "rewrittenFiles": [],
             "skipped": [],
+            "patches": [],
             "warnings": [],
             "dryRun": false
         },

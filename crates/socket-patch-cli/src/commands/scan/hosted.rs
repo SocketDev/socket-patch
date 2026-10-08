@@ -1407,18 +1407,26 @@ pub(crate) async fn run_redirect_selected(
     warnings.extend(takeover_warnings.iter().cloned());
     warnings.extend(prune_warnings.iter().cloned());
 
+    // Granted, but nothing in the project pins it (no lock entry,
+    // unreadable lock, ...): reported per purl (`redirect.patches[]`
+    // `unpinned` rows; the human "Not hosted" lines) so it never vanishes
+    // silently. (A skipped uuid — e.g. unavailable wheel metadata — is
+    // already listed with its reason.)
+    let unconfirmed = socket_patch_core::hosted::engine::unconfirmed_candidates(
+        &candidates,
+        &confirmed,
+        &skipped,
+    );
     if common.json {
         // Nest the redirect result under `redirect` inside the classic scan
         // object (built by `run`, threaded in via `scan_result`), mirroring
         // vendored mode's nested `vendor` block, so the hosted `--json`
         // envelope keeps the same top-level scan keys as every other scan.
         let redirect = redirect_json_block(
-            confirmed.len(),
+            &confirmed,
+            &unconfirmed,
             done.rewritten.clone(),
-            skipped
-                .iter()
-                .map(socket_patch_core::hosted::render::skipped_json)
-                .collect(),
+            &skipped,
             warnings,
             common.dry_run,
         );
@@ -1500,23 +1508,11 @@ pub(crate) async fn run_redirect_selected(
                 .filter(|s| s.reason != super::rollout::ROLLOUT_DEFERRED)
                 .map(|s| (s.purl.clone(), s.reason.clone()))
                 .collect();
-            // Granted, but nothing in the project pins it (no lock entry,
-            // unreadable lock, ...): listed so it never vanishes silently.
-            // (A skipped uuid — e.g. unavailable wheel metadata — is already
-            // listed with its reason.)
-            let unconfirmed: Vec<String> = candidates
-                .iter()
-                .filter(|c| {
-                    !confirmed
-                        .iter()
-                        .any(|(cp, cu)| *cp == c.purl && *cu == c.dep.patch_uuid)
-                })
-                .filter(|c| !skipped.iter().any(|s| s.uuid == c.dep.patch_uuid))
-                .map(|c| c.purl.clone())
-                .collect();
+            let unconfirmed_purls: Vec<String> =
+                unconfirmed.iter().map(|(purl, _)| purl.clone()).collect();
             for line in format_unredirected(
                 &skipped_pairs,
-                &unconfirmed,
+                &unconfirmed_purls,
                 confirmed.is_empty(),
                 // Only the lockfile rewriters' own warnings explain a
                 // missing lock entry; unrelated guidance (pnpm trust, VEX,
@@ -1961,6 +1957,26 @@ async fn vendored_takeover(
                     .filter(|_| entry.is_some_and(vlt_entry))
             })
     };
+    // NON-UTF-8 PRE-CHECK (#721) — the GUARD's undecodable-file rule
+    // (`engine::undecodable_guard`), checked BEFORE any revert dispatches
+    // (and under --dry-run too): a takeover that reverted first and was
+    // then refused by the guard would leave the reverted purls unpatched
+    // in both modes.
+    if takeover.iter().any(|(_, entry)| entry.is_some()) {
+        let view = socket_patch_core::vendor::lock_inventory::ProjectView::Disk(&common.cwd);
+        let read = socket_patch_core::hosted::engine::read_candidate_files(
+            &view,
+            &std::collections::BTreeSet::new(),
+            candidates,
+        )
+        .await;
+        if let Some(refusal) = socket_patch_core::hosted::engine::undecodable_guard(
+            &read.undecodable_reads,
+            candidates,
+        ) {
+            return Err(refusal);
+        }
+    }
     // SYMLINK PRE-CHECK for the takeover reverts — the same rule as the
     // SYMLINK GUARD below, applied to each ledger entry's recorded wiring
     // (the revert backends also stage and rename over the file). Checked
@@ -2691,7 +2707,7 @@ fn created_settings_over_existing(
 }
 
 /// [`created_settings_over_existing`]'s code for `socket-patch.sbt`.
-const SBT_OWNED_FILE_UNREADABLE: &str = "redirect_sbt_owned_file_unreadable";
+use socket_patch_core::hosted::engine::SBT_OWNED_FILE_UNREADABLE;
 
 #[cfg(test)]
 mod tests {
@@ -3298,9 +3314,10 @@ mod tests {
         // spelling of the block (`run`'s zero-discovery arm uses the same
         // helper).
         let redirect = redirect_json_block(
-            1,
+            &[("pkg:npm/minimist@1.2.2".to_string(), "abc-123".to_string())],
+            &[],
             vec!["package-lock.json".to_string()],
-            Vec::new(),
+            &[],
             vec![prune_ignored_warning()],
             false,
         );
