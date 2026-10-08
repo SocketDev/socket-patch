@@ -351,8 +351,8 @@ async fn npm_member_stray_lock_refusal(root: &Path) -> Option<(PathBuf, Refusal)
     let refusal = Refusal {
         code: WORKSPACE_LOCKFILE_ELSEWHERE.to_string(),
         message: format!(
-            "{detail}; run socket-patch from {} (the workspace root), or delete the \
-             stray member lock; nothing was written",
+            "{detail}; run socket-patch from {} (the workspace root); nothing was \
+             written",
             ancestor.display()
         ),
     };
@@ -1203,7 +1203,10 @@ mod tests {
                 refused.message.contains(root_lock)
                     && refused.message.contains(member_lock)
                     && refused.message.contains("ignores")
-                    && refused.message.contains("nothing was written"),
+                    && refused.message.contains("nothing was written")
+                    // The only convergent remedy: the directory stays a
+                    // listed member whatever lock it holds (Bugbot on #1095).
+                    && !refused.message.contains("delete"),
                 "{}",
                 refused.message
             );

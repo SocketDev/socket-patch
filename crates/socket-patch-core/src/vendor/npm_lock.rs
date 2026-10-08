@@ -417,8 +417,10 @@ pub async fn vendor_npm<'a>(
 }
 
 /// The project-level refusal [`vendor_npm`]'s step 2 raises whatever the
-/// purl: the primary lock (`npm-shrinkwrap.json`, else `package-lock.json`)
-/// is not parseable JSON or not a v2/v3 lock. `None` unless the project's
+/// purl: the project is an npm workspace member whose own lock npm never
+/// reads (#1094, [`super::npm_flavor::npm_member_stray_lock_refusal`]), or
+/// the primary lock (`npm-shrinkwrap.json`, else `package-lock.json`) is
+/// not parseable JSON or not a v2/v3 lock. `None` unless the project's
 /// npm flavor is package-lock (the probe `vendor_npm_any` routes on) and
 /// that lock fails the gate; a missing or unreadable lock is left to the
 /// backend's own refusal.
@@ -436,6 +438,9 @@ pub async fn npm_lock_vendor_preflight(project_root: &Path) -> Option<(&'static 
         Ok((NpmLockFlavor::PackageLock, _))
     ) {
         return None;
+    }
+    if let Some(refusal) = super::npm_flavor::npm_member_stray_lock_refusal(project_root).await {
+        return Some(refusal);
     }
     let (lock_name, lock_bytes, _) = select_lockfile(project_root).await.ok()??;
     let gate = match LOCK_MEMO.parse(&lock_bytes, || parse_json_manifest(&lock_bytes)) {

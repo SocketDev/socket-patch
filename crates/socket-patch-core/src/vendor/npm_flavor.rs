@@ -389,6 +389,26 @@ async fn detect_vendorable_npm_flavor_with(
     ))
 }
 
+/// #1094: a package-lock project that is a member of an npm workspace
+/// holds a lock npm never reads (members install from the workspace
+/// root's lock), so vendoring into it would wire nothing. Refused as a
+/// member without that lock is (`vendor_lockfile_missing`). Shared by
+/// [`vendor_npm_any`] and the hosted→vendored takeover preflight
+/// ([`super::npm_lock::npm_lock_vendor_preflight`]), which must refuse
+/// before the takeover restores the hosted pin.
+pub(crate) async fn npm_member_stray_lock_refusal(
+    project_root: &Path,
+) -> Option<(&'static str, String)> {
+    let (root, detail) = crate::hosted::governing_root::npm_member_stray_lock(project_root).await?;
+    Some((
+        "vendor_lockfile_missing",
+        format!(
+            "{detail}; vendor from {} (the workspace root)",
+            root.display()
+        ),
+    ))
+}
+
 /// Vendor one npm package through whichever lockfile-flavor backend serves
 /// this project (package-lock / yarn classic / yarn berry node-modules /
 /// pnpm / pnpm legacy / bun / vlt). Probe refusals (PnP, unsupported lock
@@ -411,19 +431,9 @@ pub async fn vendor_npm_any<'a>(
         Ok(found) => found,
         Err((code, detail)) => return VendorOutcome::Refused { code, detail },
     };
-    // #1094: a workspace member's own npm lock is one npm never reads; the
-    // member is refused as it is without that lock.
     if flavor == NpmLockFlavor::PackageLock {
-        if let Some((_, detail)) =
-            crate::hosted::governing_root::npm_member_stray_lock(project_root).await
-        {
-            return VendorOutcome::Refused {
-                code: "vendor_lockfile_missing",
-                detail: format!(
-                    "{detail}; vendor from the workspace root, or delete the stray member \
-                     lock"
-                ),
-            };
+        if let Some((code, detail)) = npm_member_stray_lock_refusal(project_root).await {
+            return VendorOutcome::Refused { code, detail };
         }
     }
     if let Some(detail) = flavor_change_refusal(project_root, purl, flavor).await {
@@ -1771,6 +1781,13 @@ mod tests {
             .await
             .unwrap();
 
+        // The hosted→vendored takeover preflight raises the same refusal
+        // first, so a leftover hosted pin is never restored only to be
+        // refused (Bugbot on #1095).
+        let preflight = crate::vendor::npm_lock_vendor_preflight(&member)
+            .await
+            .expect("the takeover preflight refuses the member");
+
         let outcome = vendor_any(&member, &record).await;
         let VendorOutcome::Refused { code, detail } = outcome else {
             panic!("expected Refused, got {outcome:?}");
@@ -1780,6 +1797,8 @@ mod tests {
             detail.contains("workspace") && detail.contains("ignores"),
             "{detail}"
         );
+        assert!(!detail.contains("delete"), "{detail}");
+        assert_eq!(preflight, (code, detail));
         assert!(!member.join(".socket/vendor").exists());
         assert_eq!(
             tokio::fs::read(member.join("package-lock.json"))
