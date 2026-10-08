@@ -44,6 +44,10 @@
 //! Skips (with a println) when `cargo` is missing or crates.io is
 //! unreachable (a failure instead under `SOCKET_PATCH_CARGO_E2E_REQUIRED=1`).
 
+#[path = "common/mod.rs"]
+mod common;
+use common::binary;
+
 use std::collections::BTreeMap;
 use std::path::{Path, PathBuf};
 use std::process::{Command, Output};
@@ -105,10 +109,6 @@ struct Shape {
     /// A shape hosted mode must REFUSE: the rewriter warning code every
     /// patch is skipped with. The scan must leave every file untouched.
     refused: Option<&'static str>,
-}
-
-fn binary() -> PathBuf {
-    PathBuf::from(env!("CARGO_BIN_EXE_socket-patch"))
 }
 
 fn run_socket(cwd: &Path, args: &[&str], cargo_home: &Path) -> (i32, String, String) {

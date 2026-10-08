@@ -67,6 +67,7 @@ use crate::gradle::locks;
 use crate::gradle::selector::{admits, gradle_version_cmp, parse_selector, Selector};
 use crate::patch::path_safety::is_canonical_uuid;
 use crate::vendor::jvm::gradle as vendored;
+use crate::vendor::jvm::layout::GRADLE_ROOT_FILES;
 
 /// The owned hosted settings script. Its bytes change only with a CLI
 /// release.
@@ -91,14 +92,6 @@ const REPO_NAME_PREFIX: &str = "socketPatchHosted";
 const VENDORED_INDEX_REL: &str = vendored::INDEX_REL;
 const VERIFICATION_REL: &str = vendored::VERIFICATION_REL;
 const WRAPPER_PROPERTIES_REL: &str = "gradle/wrapper/gradle-wrapper.properties";
-
-/// Root-level files whose presence makes the checkout a Gradle build.
-pub const GRADLE_ROOT_FILES: &[&str] = &[
-    "settings.gradle",
-    "settings.gradle.kts",
-    "build.gradle",
-    "build.gradle.kts",
-];
 
 /// Whether `rel` is a settings-classpath lock (`settings-gradle.lockfile`
 /// of any build). Gradle resolves that classpath before any settings
@@ -181,7 +174,7 @@ impl HostedRow {
     /// whitespace and two lowercase sha256s.
     pub fn valid(&self) -> bool {
         let hex64 = |s: &str| crate::utils::digest::is_hex64_lower(s);
-        vendored::safe_coordinates(&self.group, &self.artifact, &self.base)
+        crate::vendor::jvm::layout::safe_coordinates(&self.group, &self.artifact, &self.base)
             && self.base.chars().any(|c| c != '.')
             && is_canonical_uuid(&self.uuid)
             && self.uuid == self.uuid.to_ascii_lowercase()
@@ -1059,56 +1052,6 @@ fn may_admit_above(sel: &Selector, base: &str) -> bool {
         }
         Selector::Latest(_) | Selector::Unknown => true,
     }
-}
-
-/// Whether the hosted planner would refuse `dep` in the build `files`
-/// holds once its vendored Gradle wiring is reverted: every refusal of
-/// [`rewrite_gradle_hosted`] except the vendored-index conflict, which the
-/// takeover's revert clears. The vendored backend serves the original GAV
-/// and leaves lock files alone, so the lock checks hold before the revert
-/// too. A takeover runs this before reverting anything, so a refused purl
-/// keeps its working vendored patch. `None` when there is no Gradle build.
-pub fn takeover_refusal(
-    files: &BTreeMap<String, String>,
-    unreadable: &BTreeSet<String>,
-    dep: &DepOverride,
-) -> Option<RewriteWarning> {
-    if !gradle_build_present(files) {
-        return None;
-    }
-    let (group, artifact) = coords_of(dep);
-    let warning = |r: Refusal| RewriteWarning {
-        code: r.code.into(),
-        detail: format!(
-            "{}; the vendored patch of {group}:{artifact}:{} stays in place (NOT switched to \
-             hosted)",
-            r.detail, dep.version
-        ),
-    };
-    if registry_override_of_kind(dep, "maven2").is_none() {
-        return Some(warning(refusal(
-            "redirect_gradle_override_invalid",
-            "the hosted grant carries no maven2 repository",
-        )));
-    }
-    let graph = graph_of(files);
-    let lock_paths = lockfile_paths(&graph, files);
-    let index = files
-        .get(HOSTED_INDEX_REL)
-        .map_or(Ok(Vec::new()), |t| parse_index(t));
-    let project = unreadable_refusal(unreadable).or_else(|| project_refusal(files, &graph, &index));
-    let rows = index.unwrap_or_default();
-    plan_dep(
-        dep,
-        files,
-        &graph,
-        &lock_paths,
-        &rows,
-        &BTreeSet::new(),
-        project.as_ref(),
-    )
-    .err()
-    .map(warning)
 }
 
 /// `(groupId, artifactId)` of a maven dep.
@@ -2399,103 +2342,6 @@ mod tests {
             dep(),
             "redirect_gradle_version_conflict",
         );
-    }
-
-    /// The takeover preflight refuses what the planner would refuse once
-    /// the vendored wiring is gone, and ignores the vendored index itself.
-    #[test]
-    fn takeover_refusal_mirrors_the_planner_except_the_vendored_index() {
-        let vendored = (
-            ".socket/vendor/gradle-index.tsv",
-            "#socket-patch-gradle-index 1\ncom.socketfixture:victim:1.10.0\tx\ty\tz\n",
-        );
-        let s = ("settings.gradle", "rootProject.name = 'app'\n");
-        let none = BTreeSet::new();
-        assert!(takeover_refusal(&files(&[s, vendored]), &none, &dep()).is_none());
-        assert!(takeover_refusal(&files(&[("pom.xml", "<project/>")]), &none, &dep()).is_none());
-        // A build file that exists but cannot be read refuses the takeover.
-        let unreadable: BTreeSet<String> = ["settings.gradle".to_string()].into();
-        assert_eq!(
-            takeover_refusal(
-                &files(&[("build.gradle", ""), vendored]),
-                &unreadable,
-                &dep()
-            )
-            .map(|w| w.code)
-            .as_deref(),
-            Some(UNREADABLE_REFUSAL_CODE)
-        );
-        let code = |input: &[(&str, &str)], d: DepOverride| {
-            takeover_refusal(&files(input), &none, &d).map(|w| w.code)
-        };
-        assert_eq!(
-            code(
-                &[
-                    s,
-                    vendored,
-                    (
-                        "build.gradle",
-                        "dependencyLocking { lockFile = file('x.lockfile') }\n"
-                    )
-                ],
-                dep()
-            )
-            .as_deref(),
-            Some("redirect_gradle_lock_location_unknown")
-        );
-        let mut legacy = dep();
-        legacy
-            .registry_override
-            .as_mut()
-            .unwrap()
-            .identifiers
-            .maven_suffixed_version = None;
-        assert_eq!(
-            code(&[s, vendored], legacy).as_deref(),
-            Some("redirect_gradle_same_gav_unsupported")
-        );
-        let mut no_sha = dep();
-        no_sha.integrity.sha256 = None;
-        assert_eq!(
-            code(&[s, vendored], no_sha).as_deref(),
-            Some("redirect_gradle_override_invalid")
-        );
-        let mut no_override = dep();
-        no_override.registry_override = None;
-        assert_eq!(
-            code(&[s, vendored], no_override).as_deref(),
-            Some("redirect_gradle_override_invalid")
-        );
-        assert_eq!(
-            code(
-                &[
-                    s,
-                    vendored,
-                    (
-                        "settings-gradle.lockfile",
-                        "com.socketfixture:victim:1.10.0=classpath\n"
-                    ),
-                ],
-                dep()
-            )
-            .as_deref(),
-            Some("redirect_gradle_settings_classpath")
-        );
-        let w = takeover_refusal(
-            &files(&[
-                s,
-                vendored,
-                (
-                    "gradle.lockfile",
-                    "com.socketfixture:victim:1.9=runtimeClasspath\n",
-                ),
-            ]),
-            &none,
-            &dep(),
-        )
-        .unwrap();
-        assert_eq!(w.code, "redirect_gradle_lock_conflict");
-        assert!(w.detail.contains("stays in place"), "{}", w.detail);
     }
 
     /// The files a restore can touch: every build's settings (a missing

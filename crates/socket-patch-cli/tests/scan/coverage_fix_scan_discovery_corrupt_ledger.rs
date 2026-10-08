@@ -8,16 +8,13 @@
 //! Modeled on `scan_vendor_e2e.rs` (mock API + real fixture through the
 //! built binary).
 
-use std::path::{Path, PathBuf};
+use crate::common::{binary, git_sha256};
+
+use std::path::Path;
 use std::process::Command;
 
-use sha2::{Digest, Sha256};
 use wiremock::matchers::{method, path};
 use wiremock::{Mock, MockServer, ResponseTemplate};
-
-fn binary() -> PathBuf {
-    env!("CARGO_BIN_EXE_socket-patch").into()
-}
 
 const ORG_SLUG: &str = "test-org";
 /// The vendored cargo patch: uuid + purl of the entry that must survive.
@@ -25,14 +22,6 @@ const UUID: &str = "11111111-1111-4111-8111-111111111111";
 const CARGO_PURL: &str = "pkg:cargo/foo@1.0.0";
 const BEFORE: &[u8] = b"before\n";
 const AFTER: &[u8] = b"after\n";
-
-fn git_sha256(content: &[u8]) -> String {
-    let header = format!("blob {}\0", content.len());
-    let mut hasher = Sha256::new();
-    hasher.update(header.as_bytes());
-    hasher.update(content);
-    hex::encode(hasher.finalize())
-}
 
 /// One installed npm package so the crawl finds ≥1 package and scan does
 /// not take the zero-package early return (which skips the GC entirely).

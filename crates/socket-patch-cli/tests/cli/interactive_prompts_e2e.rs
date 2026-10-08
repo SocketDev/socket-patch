@@ -7,14 +7,12 @@
 
 #![cfg(unix)]
 
-use std::path::{Path, PathBuf};
+use crate::common::binary;
+
+use std::path::Path;
 use std::time::Duration;
 
 use portable_pty::{native_pty_system, CommandBuilder, PtySize};
-
-fn binary() -> PathBuf {
-    env!("CARGO_BIN_EXE_socket-patch").into()
-}
 
 /// Spawn the socket-patch binary inside a PTY, send `input`, and
 /// collect all output until the child exits. Returns `(exit_code,

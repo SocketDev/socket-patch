@@ -450,31 +450,53 @@ pub(crate) async fn any_live_file_references(
     false
 }
 
+/// The repair remedy for wiring an earlier socket-patch vendoring left in a
+/// stale or foreign shape. `vendor --revert` takes no package argument, so
+/// the remedy names its whole-project reach instead of implying a
+/// per-package form that does not exist (B80).
+///
+/// `socket-patch rollback <purl>` reverts one entry through the same
+/// per-entry revert, but it is not a drop-in "then vendor again": without
+/// `--preserve-state` it also deletes the artifact, the ledger record and
+/// the purl's manifest entry, so the following `vendor` has nothing left to
+/// vendor (the user would have to `get` the patch again); with
+/// `--preserve-state` it keeps a ledger entry whose wiring records are spent,
+/// and re-vendoring over that from a stale-shape lock (gem CHECKSUMS,
+/// Poetry/PDM/Pipenv sources) is not covered by any test. Until that path is
+/// proven, the remedy stays the whole-project revert, which keeps the
+/// manifest and re-vendors every package from it.
+pub(crate) const REVERT_ALL_AND_REVENDOR: &str = "run `socket-patch vendor --revert` (it reverts \
+     EVERY vendored package in the project, not just this one), then vendor again";
+
 // ── pre-write guards shared by the pypi lock flavors ────────────────────────
 
-/// Refuse (with the flavor's stable `code`) when any of `files` (root-relative)
-/// is itself a symbolic link. Every lock writer stages a replacement next to
-/// the path and renames over it, which REPLACES the link with a detached
-/// regular file: the shared target the link points at stays unpatched (git
-/// shows a 120000→100644 typechange), and `revert` restores bytes but never
-/// the link. Both wire and revert check before any write — the package
-/// managers themselves write THROUGH a linked lock.
+/// Refuse when any of `files` (root-relative) is itself a symbolic link,
+/// with the one symlink refusal every mode uses
+/// ([`crate::hosted::engine::symlink_refusal`]: hosted rewrites, the
+/// vendored group commit, and each backend's own pre-write check). Every
+/// lock writer stages a replacement next to the path and renames over it,
+/// which REPLACES the link with a detached regular file: the shared target
+/// the link points at stays unpatched (git shows a 120000→100644
+/// typechange), and `revert` restores bytes but never the link. Both wire
+/// and revert check before any write — the package managers themselves
+/// write THROUGH a linked lock.
 pub(crate) async fn refuse_symlinked(
     root: &Path,
     files: &[&str],
-    code: &'static str,
 ) -> Result<(), (&'static str, String)> {
     match first_symlink(root, files.iter().copied()).await {
-        Some(file) => Err((
-            code,
-            format!(
-                "{file} is a symbolic link; the atomic rewrite would replace the link with \
-                 a regular file and leave its target stale — vendor the real file's directory \
-                 instead"
-            ),
-        )),
+        Some(file) => Err(symlink_refusal(file)),
         None => Ok(()),
     }
+}
+
+/// [`crate::hosted::engine::symlink_refusal`] as a vendored backend's
+/// `(code, detail)` failure.
+pub(crate) fn symlink_refusal(file: &str) -> (&'static str, String) {
+    (
+        crate::hosted::engine::SYMLINK_REFUSAL,
+        crate::hosted::engine::symlink_refusal(file).message,
+    )
 }
 
 /// Refuse (with the flavor's stable `code`) when `file` (root-relative) no

@@ -449,7 +449,7 @@ pub fn composer_purl(name: &str, version: &str) -> Option<String> {
 /// artifact and the version each a safe single segment — an empty group
 /// fails as one empty segment).
 pub fn maven_purl(group: &str, artifact: &str, version: &str) -> Option<String> {
-    crate::crawlers::maven_crawler::is_safe_maven_coordinate(group, artifact, version)
+    crate::vendor::jvm::layout::is_path_safe(group, artifact, version)
         .then(|| build_maven_purl(group, artifact, version))
 }
 

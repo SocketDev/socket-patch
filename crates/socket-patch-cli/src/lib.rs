@@ -319,7 +319,78 @@ fn first_operand_is_uuid(args: &[String], subcommands: &[String]) -> bool {
 /// no rewrite applies or the applicable rewrite also genuinely fails.
 ///
 /// Pulled out of `main.rs` so the fallback paths are unit-testable.
+///
+/// An unknown subcommand that names a retired one (`setup`, `unlock`), or
+/// whose clap typo tip would point at a hidden internal subcommand
+/// (`self-update`, `hosted-bundle`), gets a precise usage error instead of
+/// the misleading tip (B76). Still a usage error: exit 2.
 pub fn parse_argv_with_shortcuts(argv: Vec<String>) -> Result<Cli, clap::Error> {
+    parse_with_rewrites(argv).map_err(explain_unknown_subcommand)
+}
+
+/// Subcommands earlier majors had, with what to do instead.
+const RETIRED_SUBCOMMANDS: &[(&str, &str)] = &[
+    (
+        "setup",
+        "was removed in v5.0, together with the install hooks it wired. In CI, run \
+         `socket-patch apply` after each install (agent mode), or switch to \
+         `socket-patch scan --mode hosted` or `--mode vendored`, whose lockfile edits \
+         need no hook",
+    ),
+    (
+        "unlock",
+        "was removed in v4.0: a lock left by a crashed run never blocks the next run, \
+         so there is nothing to unlock",
+    ),
+];
+
+const SELF_UPDATE_TIP: &str = "to update socket-patch itself, run `socket-patch --update`";
+
+/// Hidden subcommands clap may still suggest as a typo fix, with the tip
+/// that replaces the suggestion (`None`: no tip).
+const HIDDEN_SUBCOMMAND_TIPS: &[(&str, Option<&str>)] = &[
+    ("self-update", Some(SELF_UPDATE_TIP)),
+    ("hosted-bundle", None),
+];
+
+/// Replace clap's tip for an unknown subcommand when it would mislead: a
+/// retired v4 spelling (`setup` suggests the hidden `self-update`) or any
+/// suggestion naming a hidden internal subcommand.
+fn explain_unknown_subcommand(err: clap::Error) -> clap::Error {
+    use clap::error::{ContextKind, ContextValue, ErrorKind};
+    if err.kind() != ErrorKind::InvalidSubcommand {
+        return err;
+    }
+    let Some(ContextValue::String(name)) = err.get(ContextKind::InvalidSubcommand) else {
+        return err;
+    };
+    let message = if let Some((_, why)) = RETIRED_SUBCOMMANDS.iter().find(|(n, _)| n == name) {
+        format!("the `{name}` subcommand {why}")
+    } else if name == "update" {
+        // Self-update is the root `--update` flag, not a subcommand.
+        format!("unrecognized subcommand '{name}'\n\n  tip: {SELF_UPDATE_TIP}")
+    } else {
+        let suggested: Vec<&str> = match err.get(ContextKind::SuggestedSubcommand) {
+            Some(ContextValue::String(s)) => vec![s.as_str()],
+            Some(ContextValue::Strings(s)) => s.iter().map(String::as_str).collect(),
+            _ => Vec::new(),
+        };
+        let Some((_, tip)) = HIDDEN_SUBCOMMAND_TIPS
+            .iter()
+            .find(|(hidden, _)| suggested.contains(hidden))
+        else {
+            return err;
+        };
+        match tip {
+            Some(tip) => format!("unrecognized subcommand '{name}'\n\n  tip: {tip}"),
+            None => format!("unrecognized subcommand '{name}'"),
+        }
+    };
+    clap::Error::raw(ErrorKind::InvalidSubcommand, format!("{message}\n"))
+        .format(&mut cli_command())
+}
+
+fn parse_with_rewrites(argv: Vec<String>) -> Result<Cli, clap::Error> {
     match try_parse_cli(&argv) {
         Ok(cli) => Ok(cli),
         Err(err) => {
