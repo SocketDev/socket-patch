@@ -139,15 +139,31 @@ The backticked slug in each row is the value `-e`/`--ecosystems` accepts (e.g.
   (`redirect_yarn_classic_git_skipped` / `vendor_yarn_classic_git_entry_skipped`) and
   that copy stays unpatched; `vex` never attests the package from that lock while the
   git copy is there, and rollback refuses a hosted pin an older release wrote on one.
-  The hosted-git shorthands (`owner/repo`, `github:owner/repo`) lock to a codeload
-  tarball and are rewired normally.
+- **yarn classic non-registry tarballs** — a `file:` tarball (`left-pad@file:./x.tgz`),
+  a URL (`left-pad@https://host/fork.tgz`) or a hosted-git shorthand (`owner/repo`,
+  `github:owner/repo`, which yarn locks to a GitHub codeload tarball) is the project's
+  own artifact, not the registry package the patch is built for. Hosted and vendored
+  modes both pin to Socket's build of the registry package, so they leave such an
+  entry untouched (`redirect_yarn_classic_non_registry_entry_skipped` /
+  `vendor_yarn_classic_non_registry_entry_skipped`) and that copy stays unpatched;
+  rollback refuses a hosted pin an older release wrote on one, since its original
+  `resolved` was never recorded. Such a copy an older release already pinned installs
+  Socket's build, not an unpatched one: a hosted re-run names it
+  (`redirect_yarn_classic_non_registry_legacy_pin`, restore `yarn.lock` from version
+  control to undo it), and a vendored re-run keeps the existing wiring in sync and names
+  it (`vendor_yarn_classic_non_registry_legacy_wiring`, undone by `vendor --revert`).
+- **yarn classic entries with no `resolved`** — a registry entry with no `resolved`
+  line is a stale lock with no tarball to repoint; `yarn install` re-locks it from the
+  registry. Hosted mode leaves it untouched and names it
+  (`redirect_yarn_classic_unresolved_entry_skipped`); vendored mode skips it
+  (`vendor_link_entry_skipped`).
 - **yarn classic `file:` directory dependencies** — yarn 1 copies a `file:` directory
   (an entry with no `resolved` tarball) into `node_modules`, so no lock rewrite reaches
   that copy. Hosted and vendored modes leave the entry untouched
   (`redirect_yarn_classic_directory_skipped` / `vendor_link_entry_skipped`, naming it) and
   that copy stays unpatched; `vex` never attests the package from that lock while the
-  copy is there. When every entry of the package is such a copy (git, `file:` directory
-  or `link:`), vendoring refuses with `vendor_lock_entry_not_rewritable` naming them,
+  copy is there. When every entry of the package is such a copy (git, `file:` directory,
+  non-registry tarball or `link:`), vendoring refuses with `vendor_lock_entry_not_rewritable` naming them,
   since `yarn install` can't help.
 - **bun** — text `bun.lock` lockfileVersion 0, 1 or 2: 0 is the `--save-text-lockfile`
   opt-in lock of Bun 1.1.39–1.1.45, 1 the 1.2–1.3 default, 2 the 1.4+ default; all three
