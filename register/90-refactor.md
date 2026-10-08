@@ -45,7 +45,7 @@ Re-ranked 2026-10-08T13:00Z at `e2d9633` against the same 32 open PRs' 581 files
 - `redirect/mod.rs` is a hot file (4 open PRs). Prefer candidates outside it until those land.
 - Ledger and branch pushes need verified signatures (org ruleset). Commit with the session's default git identity; overriding `user.email` (e.g. to a bot address) makes GitHub reject the signature.
 - Maintainer steering (2026-10-02, on #569 and #571): don't add size caps on trusted upstream data; stream instead of buffering.
-- `rustfmt <file>` also formats that file's out-of-line child modules (formatting `crawlers/mod.rs` rewrote `python_crawler.rs`). Check `git diff --stat` after formatting and restore any file you didn't mean to touch.
+- `rustfmt <file>` also formats its out-of-line child modules: check `git diff --stat` and restore files you didn't mean to touch.
 - `cargo clippy --all-targets` already fails on `main` (old test lints); CI gates `cargo clippy --workspace --all-features -- -D warnings`.
 - Windows CI checks out CRLF: source-scan tests must normalize `\r\n` first (#602 failed this way).
 - `cargo test -p socket-patch-cli --test repair` has 2 root-only failures (`repair_exits_zero_and_stays_quiet_when_lock_file_unremovable`, `repair_cleanup_failure_is_reported_in_json_and_silent_modes`). They chmod a directory read-only.
