@@ -1163,10 +1163,15 @@ fn drifted_resolved_note(resolved: Option<&str>) -> String {
     }
 }
 
-/// The live entry's `version` when it names neither the version we wired
-/// (`rec.new`) nor the pre-vendor one (`rec.original`): the user moved the
-/// package to another version since vendoring. `None` when either side has
-/// no `version` to compare, which keeps the caller's drift verdict.
+/// The live entry's `version` when the user moved the package to another
+/// version from the same registry since vendoring: the version differs
+/// from both the one we wired (`rec.new`) and the pre-vendor one
+/// (`rec.original`), and `resolved` is the same package's tarball on the
+/// registry the pre-vendor entry used (same `<registry>/<name>/-/` prefix).
+/// `None` otherwise, which keeps the caller's drift verdict: a missing
+/// version or pre-vendor `resolved`, or a resolution anywhere else (another
+/// host, another package, a URL or `file:` spec) is not a plain upgrade
+/// and must keep the artifact and leave `vendor --check` red.
 fn version_moved_off<'a>(rec: &WiringRecord, live: &'a Value) -> Option<&'a str> {
     let live_version = live.get("version").and_then(Value::as_str)?;
     let recorded: Vec<&str> = [rec.new.as_ref(), rec.original.as_ref()]
@@ -1174,7 +1179,25 @@ fn version_moved_off<'a>(rec: &WiringRecord, live: &'a Value) -> Option<&'a str>
         .flatten()
         .filter_map(|v| v.get("version").and_then(Value::as_str))
         .collect();
-    (!recorded.is_empty() && !recorded.contains(&live_version)).then_some(live_version)
+    if recorded.is_empty() || recorded.contains(&live_version) {
+        return None;
+    }
+    let original_resolved = rec.original.as_ref()?.get("resolved")?.as_str()?;
+    let prefix = registry_tarball_prefix(original_resolved)?;
+    let live_resolved = live.get("resolved").and_then(Value::as_str)?;
+    let leaf = live_resolved.strip_prefix(prefix)?;
+    (leaf.ends_with(".tgz") && !leaf.contains('/')).then_some(live_version)
+}
+
+/// `https://registry.npmjs.org/left-pad/-/left-pad-1.3.0.tgz` →
+/// `https://registry.npmjs.org/left-pad/-/`: the registry tarball directory
+/// of one package, which every version of it shares.
+fn registry_tarball_prefix(resolved: &str) -> Option<&str> {
+    if !(resolved.starts_with("https://") || resolved.starts_with("http://")) {
+        return None;
+    }
+    let at = resolved.rfind("/-/")?;
+    Some(&resolved[..at + 3])
 }
 
 /// Apply one wiring record in reverse: restore `original` iff the live
@@ -3490,6 +3513,51 @@ mod tests {
             .root()
             .join(format!(".socket/vendor/npm/{UUID}"))
             .exists());
+    }
+
+    /// #1155 provenance guard: a version change is only an upgrade when the
+    /// new tarball is the same package on the registry the pre-vendor entry
+    /// used. A version change that resolves anywhere else (another host,
+    /// another package's tarball, a bare URL) is not something `npm
+    /// install pkg@x` writes, so it stays drift: the artifact is kept and
+    /// `vendor --check` stays red.
+    #[tokio::test]
+    async fn revert_keeps_version_change_resolved_off_the_recorded_registry_as_drift() {
+        for resolved in [
+            "https://evil.example.com/left-pad/-/left-pad-1.3.1.tgz",
+            "https://registry.npmjs.org/not-left-pad/-/not-left-pad-1.3.1.tgz",
+            "https://example.com/left-pad-1.3.1.tgz",
+            "file:../left-pad-1.3.1.tgz",
+        ] {
+            let fx = fixture().await;
+            let (_, entry, _) = expect_done(fx.vendor(false).await);
+            let entry = entry.unwrap();
+
+            let moved = json!({
+                "version": "1.3.1",
+                "resolved": resolved,
+                "integrity": "sha512-upgraded=="
+            });
+            let mut live = fx.read_lock().await;
+            live["packages"]["node_modules/left-pad"] = moved.clone();
+            live["packages"]["node_modules/foo/node_modules/left-pad"] = moved;
+            tokio::fs::write(fx.lock_path(), serialize_json(&live, "  ").unwrap())
+                .await
+                .unwrap();
+
+            let outcome = revert_npm(&entry, fx.root(), false).await;
+            assert!(outcome.success, "{resolved}: {:?}", outcome.error);
+            assert!(
+                outcome.drift_skipped(),
+                "{resolved}: {:?}",
+                outcome.warnings
+            );
+            assert!(outcome.kept_artifact, "{resolved}: {:?}", outcome.warnings);
+            assert!(fx
+                .root()
+                .join(format!(".socket/vendor/npm/{UUID}"))
+                .exists());
+        }
     }
 
     /// #1155 guard: the recorded entry moved to another version, but the

@@ -1084,28 +1084,34 @@ fn revert_one_record(
     ));
 }
 
-/// The registry version an entry tuple locks (`"left-pad@1.3.1"` → `1.3.1`),
-/// or `None` for any other spec (a vendored path, a URL, `file:`/`github:`).
-fn registry_version(entry: &BunEntry) -> Option<String> {
+/// The package name and registry version an entry tuple locks
+/// (`"left-pad@1.3.1"` → `("left-pad", "1.3.1")`), or `None` for any other
+/// spec (a vendored path, a URL, `file:`/`github:`).
+fn registry_name_version(entry: &BunEntry) -> Option<(String, String)> {
     let spec = decode_json_string(entry.elems.first()?)?;
-    let (_, version) = split_name_spec(&spec)?;
+    let (name, version) = split_name_spec(&spec)?;
     let plain = !version.is_empty()
         && version
             .chars()
             .all(|c| c.is_ascii_alphanumeric() || matches!(c, '.' | '-' | '+'));
-    plain.then(|| version.to_string())
+    plain.then(|| (name.to_string(), version.to_string()))
 }
 
-/// The live entry's registry version when it differs from the pre-vendor
-/// one in `rec.original`: the user moved the package to another version
-/// since vendoring. `None` when either side has no registry version to
-/// compare (an `original: None` record, a URL or `file:` spec), which keeps
-/// the caller's drift verdict.
+/// The live entry's registry version when the user moved the package to
+/// another version from the same registry since vendoring: same package
+/// name, same registry field (the tuple's second element) as the pre-vendor
+/// tuple in `rec.original`, different version. `None` otherwise, which
+/// keeps the caller's drift verdict: an `original: None` record, a URL or
+/// `file:` spec, another package or another registry is not a plain upgrade
+/// and must keep the artifact and leave `vendor --check` red.
 fn version_moved_off(rec: &WiringRecord, live: &BunEntry) -> Option<String> {
-    let live_version = registry_version(live)?;
-    let original = rec.original.as_ref().and_then(Value::as_str)?;
-    let original_version = registry_version(&parse_entry_line(original).ok()?)?;
-    (live_version != original_version).then_some(live_version)
+    let (live_name, live_version) = registry_name_version(live)?;
+    let original = parse_entry_line(rec.original.as_ref().and_then(Value::as_str)?).ok()?;
+    let (original_name, original_version) = registry_name_version(&original)?;
+    let same_registry = matches!((live.elems.get(1), original.elems.get(1)),
+        (Some(l), Some(o)) if decode_json_string(l).is_some() && decode_json_string(l) == decode_json_string(o));
+    (same_registry && live_name == original_name && live_version != original_version)
+        .then_some(live_version)
 }
 
 // ───────────────────────── vendor-specific classification ─────────────────
@@ -3216,6 +3222,38 @@ mod tests {
                 .exists(),
             "nothing resolves through the artifact, so it is removed"
         );
+    }
+
+    /// #1155 provenance guard: a version change counts as an upgrade only
+    /// for the same package from the same registry field as the pre-vendor
+    /// tuple. Another registry or another package name stays drift.
+    #[tokio::test]
+    async fn revert_keeps_version_change_from_another_registry_as_drift() {
+        for moved_line in [
+            "    \"left-pad\": [\"left-pad@1.3.1\", \"https://evil.example.com/\", {}, \"sha512-other==\"],",
+            "    \"left-pad\": [\"not-left-pad@1.3.1\", \"\", {}, \"sha512-other==\"],",
+        ] {
+            let fx = fixture_with(BN3_BEFORE_LOCK, "node_modules/left-pad").await;
+            let (_, entry, _) = expect_done(fx.vendor(false).await);
+            let entry = entry.unwrap();
+            let live = fx.read_lock().await;
+            let new_line = entry.wiring[0]
+                .new
+                .as_ref()
+                .and_then(Value::as_str)
+                .unwrap();
+            let moved_lock = live.replace(new_line, moved_line);
+            assert_ne!(moved_lock, live, "test setup must move the entry");
+            tokio::fs::write(fx.root().join(BUN_LOCK), &moved_lock)
+                .await
+                .unwrap();
+
+            let outcome = revert_bun(&entry, fx.root(), false).await;
+            assert!(outcome.success, "{moved_line}: {:?}", outcome.error);
+            assert!(outcome.drift_skipped(), "{moved_line}: {:?}", outcome.warnings);
+            assert!(outcome.kept_artifact, "{moved_line}: {:?}", outcome.warnings);
+            assert_eq!(fx.read_lock().await, moved_lock, "left alone");
+        }
     }
 
     #[tokio::test]
