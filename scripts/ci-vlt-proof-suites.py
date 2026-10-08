@@ -39,7 +39,7 @@ def proof_upgrade(vlt, node):
 
 def ci_cells(text=None):
     reader = load_reader()
-    rows = reader.matrix_include(reader.jobs(text if text is not None else CI.read_text(encoding="utf-8"))["e2e"])
+    rows = reader.job_rows(reader.jobs(text if text is not None else CI.read_text(encoding="utf-8")), "e2e")
     return {(r["suite"], r["os"], r["vlt"], r.get("vlt_store_linker", ""), r.get("vlt_upgrade", ""))
             for r in rows if r.get("vlt") and r.get("test_filter") == "--include-ignored vlt_pinned_matrix"}
 

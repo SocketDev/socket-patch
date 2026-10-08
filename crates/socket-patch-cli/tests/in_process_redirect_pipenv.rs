@@ -60,7 +60,8 @@ const MAJOR_ENV: &str = socket_patch_core::utils::pipenv::MAJOR_OVERRIDE_ENV;
 
 const LOCK: &str =
     include_str!("../../socket-patch-core/tests/fixtures/pipenv/2026.8.0/Pipfile.lock");
-const PIPFILE: &str = include_str!("../../socket-patch-core/tests/fixtures/pipenv/2026.8.0/Pipfile");
+const PIPFILE: &str =
+    include_str!("../../socket-patch-core/tests/fixtures/pipenv/2026.8.0/Pipfile");
 
 /// The upstream and patched bytes of the record's one file, so the venv
 /// tests can materialize a real `Ready` (upstream) install.
@@ -130,7 +131,9 @@ async fn mock_api_serving(server: &MockServer, hosted_url: &str) {
         .mount(server)
         .await;
     Mock::given(method("GET"))
-        .and(path_regex(format!("^/v0/orgs/{ORG}/patches/by-package/.+$")))
+        .and(path_regex(format!(
+            "^/v0/orgs/{ORG}/patches/by-package/.+$"
+        )))
         .respond_with(ResponseTemplate::new(200).set_body_json(serde_json::json!({
             "patches": [{
                 "uuid": UUID, "purl": RECORD_PURL,
@@ -379,8 +382,15 @@ async fn lock_only_pipenv_project_redirects_attests_rescans_and_rolls_back() {
     );
     let before: serde_json::Value = serde_json::from_str(LOCK).unwrap();
     let after: serde_json::Value = serde_json::from_str(&redirected).unwrap();
-    assert_eq!(after["_meta"], before["_meta"], "the Pipfile content hash stays");
-    assert_eq!(read(&tmp.path().join("Pipfile")), PIPFILE, "Pipfile untouched");
+    assert_eq!(
+        after["_meta"], before["_meta"],
+        "the Pipfile content hash stays"
+    );
+    assert_eq!(
+        read(&tmp.path().join("Pipfile")),
+        PIPFILE,
+        "Pipfile untouched"
+    );
     assert_no_ledger(tmp.path());
     // Attested from this run's fetched record (keyed by RECORD_PURL, assume
     // applied) although the base purl the run confirmed differs from the
@@ -388,13 +398,25 @@ async fn lock_only_pipenv_project_redirects_attests_rescans_and_rolls_back() {
     let vex: serde_json::Value = serde_json::from_str(&read(&vex_path)).unwrap();
     let statements = vex["statements"].as_array().expect("statements");
     assert_eq!(statements.len(), 1, "{vex}");
-    assert_eq!(statements[0]["vulnerability"]["name"].as_str(), Some(GHSA), "{vex}");
-    assert_eq!(statements[0]["status"].as_str(), Some("not_affected"), "{vex}");
+    assert_eq!(
+        statements[0]["vulnerability"]["name"].as_str(),
+        Some(GHSA),
+        "{vex}"
+    );
+    assert_eq!(
+        statements[0]["status"].as_str(),
+        Some("not_affected"),
+        "{vex}"
+    );
 
     // 2. Idempotent re-scan: no further edits, lock byte-identical.
     let code = run(hosted_args(tmp.path(), server.uri(), None)).await;
     assert_eq!(code, 0);
-    assert_eq!(read(&lock_path), redirected, "re-scan must not touch the lock");
+    assert_eq!(
+        read(&lock_path),
+        redirected,
+        "re-scan must not touch the lock"
+    );
     assert_no_ledger(tmp.path());
 
     // Manifest-less VEX over the committed state (the depscan / CI shape).
@@ -404,7 +426,11 @@ async fn lock_only_pipenv_project_redirects_attests_rescans_and_rolls_back() {
 
     // 3. rollback restores the upstream registry entry.
     roll_back(tmp.path(), &server).await;
-    assert_eq!(read(&lock_path), LOCK, "rollback must restore the pristine lock byte for byte");
+    assert_eq!(
+        read(&lock_path),
+        LOCK,
+        "rollback must restore the pristine lock byte for byte"
+    );
 }
 
 #[tokio::test]
@@ -427,7 +453,10 @@ async fn legacy_installer_major_selects_path_references() {
         "Pipenv 7–11 install `path` references: {redirected}"
     );
     assert!(entry.get("file").is_none(), "{entry}");
-    assert_eq!(entry["hashes"], serde_json::json!([format!("sha256:{}", sha256())]));
+    assert_eq!(
+        entry["hashes"],
+        serde_json::json!([format!("sha256:{}", sha256())])
+    );
 
     // The legacy `path` reference is discovered just like `file`.
     manifestless_vex(tmp.path(), "pipenv legacy path", &|p: &Path| {
@@ -448,7 +477,9 @@ async fn stale_pipfile_lock_does_not_veto_the_requirements_redirect() {
     write_project(tmp.path());
     // The Pipfile.lock left behind pins a DIFFERENT package; the project
     // installs from requirements.txt.
-    let stale = LOCK.replace("\"urllib3\"", "\"six\"").replace("==1.26.18", "==1.16.0");
+    let stale = LOCK
+        .replace("\"urllib3\"", "\"six\"")
+        .replace("==1.26.18", "==1.16.0");
     std::fs::write(tmp.path().join("Pipfile.lock"), &stale).unwrap();
     // An unpatched, unhashed sibling makes the file's hash mode derivable,
     // so rollback can restore the hosted line (a file whose every line is a
@@ -476,10 +507,7 @@ async fn stale_pipfile_lock_does_not_veto_the_requirements_redirect() {
     });
 
     roll_back(tmp.path(), &server).await;
-    assert_eq!(
-        read(&tmp.path().join("requirements.txt")),
-        REQS
-    );
+    assert_eq!(read(&tmp.path().join("requirements.txt")), REQS);
     assert_eq!(read(&tmp.path().join("Pipfile.lock")), stale);
 }
 
@@ -528,12 +556,23 @@ async fn live_pipfile_lock_conflict_vetoes_the_requirements_redirect() {
 #[tokio::test]
 #[serial]
 async fn platform_wheel_is_not_pinned_into_the_lock() {
+    assert_wheel_tag_is_not_pinned("cp311-cp311-manylinux_2_17_x86_64.manylinux2014_x86_64")
+        .await;
+}
+
+/// #1048: a pure wheel bound to one interpreter (`cp311-none-any`) fails
+/// `pipenv sync` on every other CPython minor, so it is refused the same
+/// way as a platform-tagged one.
+#[tokio::test]
+#[serial]
+async fn interpreter_bound_wheel_is_not_pinned_into_the_lock() {
+    assert_wheel_tag_is_not_pinned("cp311-none-any").await;
+}
+
+async fn assert_wheel_tag_is_not_pinned(tag: &str) {
     let _major = MajorGuard::set("2026");
     let server = MockServer::start().await;
-    let platform_url = HOSTED_URL.replace(
-        "py2.py3-none-any",
-        "cp311-cp311-manylinux_2_17_x86_64.manylinux2014_x86_64",
-    );
+    let platform_url = HOSTED_URL.replace("py2.py3-none-any", tag);
     mock_api_serving(&server, &platform_url).await;
     let tmp = tempfile::tempdir().unwrap();
     write_project(tmp.path());
@@ -601,16 +640,27 @@ async fn warm_venv_with_the_upstream_release_is_not_attested() {
     // attested and the embedded-VEX contract fails the command.
     let code = run(hosted_args(tmp.path(), server.uri(), Some(&vex_path))).await;
     let redirected = read(&lock_path);
-    assert!(redirected.contains(HOSTED_URL), "the lock is still repointed: {redirected}");
+    assert!(
+        redirected.contains(HOSTED_URL),
+        "the lock is still repointed: {redirected}"
+    );
     let attested = vex_path
         .exists()
         .then(|| serde_json::from_str::<serde_json::Value>(&read(&vex_path)).unwrap())
         .and_then(|v| v["statements"].as_array().map(Vec::len))
         .unwrap_or(0);
-    assert_eq!(attested, 0, "a stale install must not be attested from the fetched record");
+    assert_eq!(
+        attested, 0,
+        "a stale install must not be attested from the fetched record"
+    );
     assert_ne!(code, 0, "nothing to attest fails the embedded-VEX run");
     assert_eq!(
-        std::fs::read(site_packages(tmp.path()).join("urllib3").join("response.py")).unwrap(),
+        std::fs::read(
+            site_packages(tmp.path())
+                .join("urllib3")
+                .join("response.py")
+        )
+        .unwrap(),
         UPSTREAM,
         "the probe is read-only"
     );

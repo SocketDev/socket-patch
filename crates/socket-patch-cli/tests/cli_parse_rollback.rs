@@ -7,15 +7,19 @@
 //! these tests is a breaking change and requires a MAJOR bump per
 //! `crates/socket-patch-cli/CLI_CONTRACT.md`.
 
-use clap::Parser;
 use socket_patch_cli::commands::rollback::RollbackArgs;
-use socket_patch_cli::{Cli, Commands};
+use socket_patch_cli::Commands;
 use std::path::PathBuf;
+
+#[path = "common/hermetic.rs"]
+mod hermetic;
+
+use hermetic::try_parse;
 
 fn parse_rollback(extra: &[&str]) -> RollbackArgs {
     let mut argv = vec!["socket-patch", "rollback"];
     argv.extend_from_slice(extra);
-    let cli = Cli::try_parse_from(&argv).expect("parse");
+    let cli = try_parse(&argv).expect("parse");
     match cli.command {
         Commands::Rollback(a) => a,
         _ => panic!("expected Rollback"),
@@ -366,7 +370,11 @@ fn bare_bool_does_not_consume_next_token() {
 /// relied on the rejection get a test-visible flip instead of a silent one.
 #[test]
 fn multiple_targets_parse_in_order() {
-    let args = parse_rollback(&["pkg:npm/foo@1", "packages/api/**", "b0630680-4da6-45f9-bba8-b888e0ffd58c"]);
+    let args = parse_rollback(&[
+        "pkg:npm/foo@1",
+        "packages/api/**",
+        "b0630680-4da6-45f9-bba8-b888e0ffd58c",
+    ]);
     assert_eq!(
         args.targets,
         vec![
@@ -398,7 +406,7 @@ fn preserve_state_does_not_consume_next_token() {
 
 #[test]
 fn unknown_flag_fails() {
-    let err = match Cli::try_parse_from(["socket-patch", "rollback", "--unknown-flag"]) {
+    let err = match try_parse(&["socket-patch", "rollback", "--unknown-flag"]) {
         Ok(_) => panic!("expected parse failure"),
         Err(e) => e,
     };
@@ -407,7 +415,7 @@ fn unknown_flag_fails() {
 
 #[test]
 fn removed_one_off_flag_is_unknown() {
-    let err = match Cli::try_parse_from(["socket-patch", "rollback", "--one-off"]) {
+    let err = match try_parse(&["socket-patch", "rollback", "--one-off"]) {
         Ok(_) => panic!("expected parse error for the v5-removed --one-off"),
         Err(e) => e,
     };

@@ -70,19 +70,14 @@ impl HostedListing {
     /// One listing per hosted pin in `pins`, detailed from `legacy` where
     /// it records the same purl and uuid.
     pub(crate) fn from_pins(pins: &[HostedPin], legacy: Option<&RedirectState>) -> Vec<Self> {
-        let canon = |p: &str| {
-            socket_patch_core::utils::purl::normalize_purl(
-                socket_patch_core::utils::purl::strip_purl_qualifiers(p),
-            )
-            .into_owned()
-        };
+        use socket_patch_core::utils::purl_key::PurlKey;
         pins.iter()
             .map(|pin| {
                 let record = legacy
                     .and_then(|l| {
                         l.records
                             .iter()
-                            .find(|(k, r)| canon(k) == canon(&pin.purl) && r.uuid == pin.uuid)
+                            .find(|(k, r)| PurlKey::same(k, &pin.purl) && r.uuid == pin.uuid)
                             .map(|(_, r)| r.clone())
                     })
                     .unwrap_or_else(|| PatchRecord {
@@ -431,7 +426,10 @@ pub async fn run(args: ListArgs) -> i32 {
                 detail: detail.clone(),
             });
         } else if !args.common.silent {
-            eprintln!("Warning: {}", crate::commands::rollback::capitalize_first(detail));
+            eprintln!(
+                "Warning: {}",
+                crate::commands::rollback::capitalize_first(detail)
+            );
         }
     }
     let vendor_state = crate::commands::vendor_state_lenient(&loaded.vendor, args.common.silent);
@@ -767,12 +765,18 @@ mod tests {
         let listings = HostedListing::from_pins(
             &[
                 pin("pkg:npm/minimist@1.2.2", &record.uuid),
-                pin("pkg:npm/other@1.0.0", "33333333-3333-4333-8333-333333333333"),
+                pin(
+                    "pkg:npm/other@1.0.0",
+                    "33333333-3333-4333-8333-333333333333",
+                ),
             ],
             Some(&legacy),
         );
         assert_eq!(listings[0].record, record);
-        assert_eq!(listings[1].record.uuid, "33333333-3333-4333-8333-333333333333");
+        assert_eq!(
+            listings[1].record.uuid,
+            "33333333-3333-4333-8333-333333333333"
+        );
         assert!(listings[1].record.vulnerabilities.is_empty());
         assert_eq!(listings[1].lockfiles, vec!["yarn.lock".to_string()]);
     }

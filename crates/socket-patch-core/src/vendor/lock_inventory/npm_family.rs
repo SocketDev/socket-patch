@@ -5,9 +5,9 @@
 #[cfg(test)]
 use std::path::Path;
 
-use crate::constants::npm_family::{
-    BUN_LOCK, BUN_LOCKB, NPM_LOCKS, PNPM_SHRINKWRAP_LEGACY, VLT_LOCK,
-};
+use crate::constants::npm_family::{BUN_LOCK, PNPM_SHRINKWRAP_LEGACY};
+use crate::formats::governing_locks::{npm_governing_family, npm_lock_files, NpmLockFamily};
+use crate::formats::yarn::{grammar as yarn_grammar, YarnLockGrammar};
 use crate::utils::purl::npm_purl;
 use crate::vendor::npm_flavor::NpmLockFlavor;
 
@@ -16,10 +16,11 @@ use super::npm::inventory_package_lock_in;
 use super::pnpm::{
     inventory_pnpm_lock_in, inventory_pnpm_lock_rel_in, inventory_rush_pnpm_locks_in,
 };
-use super::view::{detect_npm_lock_flavor_in, ProjectView};
+use super::view::ProjectView;
 use super::vlt::inventory_vlt_in;
 use super::yarn::{inventory_yarn_berry_in, inventory_yarn_classic_in};
 use super::{dedup_prefer_integrity, LockfileEntry, UnsupportedNpmLayout};
+use crate::vendor::npm_flavor::detect_npm_lock_flavor_in;
 
 // ── registry view ──
 
@@ -165,62 +166,67 @@ pub(super) async fn inventory_npm_lock_raw_in(
 /// The live sibling lock a version-refused root `pnpm-lock.yaml` may be
 /// shadowing, or `None` when no sibling lock file exists at all.
 ///
-/// [`detect_npm_lock_flavor`] cannot be re-asked (it already refused on its
-/// pnpm step), so this mirrors the rest of its precedence by hand — vlt,
-/// bun, then yarn, then npm — on file EXISTENCE, and returns the first present
-/// sibling's inventory (possibly empty: presence alone proves the pnpm lock
-/// is migration debris, so the caller must not fall back to it). Raw
-/// entries — the caller guards and collapses them.
+/// [`detect_npm_lock_flavor_in`] cannot be re-asked (it already refused on
+/// its pnpm step), so this asks the shared precedence table
+/// ([`npm_governing_family`]) for the family the router would have chosen
+/// with pnpm skipped, on file EXISTENCE, and returns that family's
+/// inventory (possibly empty: presence alone proves the pnpm lock is
+/// migration debris, so the caller must not fall back to it). Raw entries —
+/// the caller guards and collapses them.
 pub(super) async fn inventory_live_sibling_lock_in(
     view: &ProjectView<'_>,
 ) -> Option<(NpmLockFlavor, Vec<LockfileEntry>)> {
-    if view.exists(VLT_LOCK).await {
-        return Some((
+    let mut present = Vec::new();
+    for file in npm_lock_files() {
+        if view.exists(file).await {
+            present.push(file);
+        }
+    }
+    let family = npm_governing_family(|file| present.contains(&file), Some(NpmLockFamily::Pnpm))?;
+    Some(match family {
+        NpmLockFamily::Vlt => (
             NpmLockFlavor::Vlt,
             inventory_vlt_in(view).await.unwrap_or_default(),
-        ));
-    }
-    // bun.lock — router step 3. That step runs BEFORE the pnpm sniff, so
-    // when the version refusal fired no bun.lock can actually be present;
-    // probed anyway to keep this a literal transcription of the router's
-    // order. The binary lock shares the same routing precedence.
-    if view.exists(BUN_LOCK).await {
-        return Some((
+        ),
+        // The router's bun step runs BEFORE its pnpm sniff, so when the
+        // version refusal fired no bun lock can actually be present; kept
+        // for the table's sake. The text lock wins over the binary one.
+        NpmLockFamily::Bun if present.contains(&BUN_LOCK) => (
             NpmLockFlavor::Bun,
             inventory_bun_in(view).await.unwrap_or_default(),
-        ));
-    }
-    if view.exists(BUN_LOCKB).await {
-        return Some((
+        ),
+        NpmLockFamily::Bun => (
             NpmLockFlavor::Bun,
             inventory_bun_binary_in(view).await.unwrap_or_default(),
-        ));
-    }
-    // yarn.lock — router step 5, where classic vs berry is a content
-    // decision. Rather than re-deriving that head sniff, try both readers:
-    // each yields entries only for its own grammar (classic's `version "…"`
-    // fields vs berry's `resolution:` lines), so a non-empty result is the
-    // sniff's answer. Berry PnP needs no carve-out: a PnP marker would have
-    // refused at the router's step 1 with a code this fallback ignores.
-    if view.exists("yarn.lock").await {
-        let classic = inventory_yarn_classic_in(view).await.unwrap_or_default();
-        if !classic.is_empty() {
-            return Some((NpmLockFlavor::YarnClassic, classic));
+        ),
+        // Classic vs berry is a content decision in the router. The router
+        // refused the lock because it declares neither grammar; the
+        // read-only fallback reads it the way yarn does, through the one
+        // grammar decision ([`yarn_grammar`]: a header-less lock is
+        // classic). Berry PnP needs no carve-out: a PnP marker would have
+        // refused at the router's step 1 with a code this fallback ignores.
+        NpmLockFamily::Yarn => {
+            let text = view.read_text("yarn.lock").await.unwrap_or_default();
+            match yarn_grammar(&text) {
+                YarnLockGrammar::Berry => (
+                    NpmLockFlavor::YarnBerry,
+                    inventory_yarn_berry_in(view).await.unwrap_or_default(),
+                ),
+                YarnLockGrammar::Classic => (
+                    NpmLockFlavor::YarnClassic,
+                    inventory_yarn_classic_in(view).await.unwrap_or_default(),
+                ),
+            }
         }
-        return Some((
-            NpmLockFlavor::YarnBerry,
-            inventory_yarn_berry_in(view).await.unwrap_or_default(),
-        ));
-    }
-    // npm — router step 6 (`inventory_package_lock` itself prefers the
-    // shrinkwrap when both exist, mirroring npm).
-    if view.exists(NPM_LOCKS[0]).await || view.exists(NPM_LOCKS[1]).await {
-        return Some((
+        // `inventory_package_lock` itself prefers the shrinkwrap when both
+        // exist, mirroring npm.
+        NpmLockFamily::Npm => (
             NpmLockFlavor::PackageLock,
             inventory_package_lock_in(view).await.unwrap_or_default(),
-        ));
-    }
-    None
+        ),
+        // Skipped by the query above.
+        NpmLockFamily::Pnpm => return None,
+    })
 }
 
 /// Guard + dedup the raw npm entries: unsafe names/versions are dropped

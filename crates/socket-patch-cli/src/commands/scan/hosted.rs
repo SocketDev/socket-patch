@@ -10,6 +10,7 @@ use futures_util::StreamExt;
 use socket_patch_core::api::client::hold_back_debug;
 use socket_patch_core::api::types::BatchPackagePatches;
 use socket_patch_core::patch::apply_lock::LockGuard;
+use socket_patch_core::patch::redirect::yarnrc::resolve_outer_yarn_mirror_for_process;
 use socket_patch_core::patch::redirect::DepOverride;
 use socket_patch_core::utils::concurrent::{
     api_concurrency, api_concurrency_for, ordered_concurrent,
@@ -298,7 +299,8 @@ async fn installed_stale_positive_evidence(
 ///   exactly like scan's own discovery; layouts the crawler grows into are
 ///   covered automatically. A `.bundle/config` path the containment guard
 ///   refuses as a write root is still READ here
-///   (`verification_only_gem_paths`): bundler installs into it.
+///   (`bundler_install_homes`): bundler installs into it. The `gem env`
+///   homes are judged only when bundler uses system gems (#1001).
 /// * Records are found BY UUID (the fetch key, stable across purl
 ///   spellings) among this run's fetched records; v5 keeps no hosted
 ///   ledger to fall back on, so a uuid whose `/patches/view` fetch failed
@@ -360,6 +362,7 @@ async fn gem_stale_install_warnings(
         leaf: String,
         patched: bool,
         positive: bool,
+        project_local: bool,
     }
     let crawler = RubyCrawler::new();
     let options = CrawlerOptions {
@@ -367,17 +370,14 @@ async fn gem_stale_install_warnings(
         global,
         global_prefix,
     };
-    let mut gem_paths = crawler.get_gem_paths(&options).await.unwrap_or_default();
-    // A `.bundle/config` path outside the project is refused as a write
-    // root, yet bundler installs into and loads from it: read it too, or a
-    // stale materialization there never warns (#709). It is this project's
-    // own bundle path, so it takes the project-local remedy.
-    let config_stores = crawler.verification_only_gem_paths(&options).await;
-    for gems_dir in &config_stores {
-        if !gem_paths.contains(gems_dir) {
-            gem_paths.push(gems_dir.clone());
-        }
-    }
+    // Only the homes `bundle install` installs into or reuses, each tagged
+    // project-local or shared by the crawler. That covers a `.bundle/config`
+    // path outside the project, which is refused as a write root but which
+    // bundler installs into and loads from (#709). It leaves out the
+    // `gem env` homes when an explicit Bundler `path` means bundler never
+    // reuses a copy there (#1001), and the project-local tag doesn't depend
+    // on how `--cwd` is spelled (#729).
+    let homes = crawler.bundler_install_homes(&options).await;
     // Every candidate's installed dir in every gem home, one blocking pass
     // (and at most one listing) per home — the per-candidate lookups the
     // loop below consumes, in the same (candidate, home) order.
@@ -385,9 +385,12 @@ async fn gem_stale_install_warnings(
         .iter()
         .map(|(purl, _)| socket_patch_core::utils::purl::strip_purl_qualifiers(purl).to_string())
         .collect();
-    let mut found_per_home = Vec::with_capacity(gem_paths.len());
-    for gems_dir in &gem_paths {
-        found_per_home.push(crawler.find_each_by_purl(gems_dir, &stripped).await);
+    let mut found_per_home = Vec::with_capacity(homes.len());
+    for home in &homes {
+        found_per_home.push((
+            crawler.find_each_by_purl(&home.gems_dir, &stripped).await,
+            home.project_local,
+        ));
     }
     let mut dir_state: std::collections::BTreeMap<std::path::PathBuf, DirJudgment> =
         std::collections::BTreeMap::new();
@@ -395,7 +398,7 @@ async fn gem_stale_install_warnings(
     // the committed archives `bundle install` installs from (#483).
     let app_cache = socket_patch_core::crawlers::ruby_crawler::bundler_app_cache_dir(cwd).await;
     for (index, (purl, record)) in candidates.iter().enumerate() {
-        for found in &found_per_home {
+        for (found, project_local) in &found_per_home {
             let Some(pkg) = &found[index] else {
                 continue;
             };
@@ -412,6 +415,7 @@ async fn gem_stale_install_warnings(
                     leaf: leaf.to_string(),
                     patched: false,
                     positive: false,
+                    project_local: *project_local,
                 });
             let judged = judge_installed_record(&pkg.path, record).await;
             if judged.patched {
@@ -432,8 +436,7 @@ async fn gem_stale_install_warnings(
         if j.patched || !j.positive {
             continue;
         }
-        let project_local =
-            dir.starts_with(cwd) || config_stores.iter().any(|store| dir.starts_with(store));
+        let project_local = j.project_local;
         let mut folded_cache: Option<std::path::PathBuf> = None;
         if project_local {
             let project_cache = app_cache.join(format!("{}.gem", j.leaf));
@@ -987,7 +990,12 @@ pub(crate) async fn run_redirect_selected(
             socket_patch_core::utils::fs::read_regular_to_string_sync(path).ok()
         })
     };
-    let rewrite_options = || RewriteOptions {
+    // The yarn 1 config layers outside the project (env, user, global and
+    // ancestor rc files), located the way yarn 1 does: a mirror set in any
+    // of them refuses the classic rewrite like a project one.
+    let yarn_classic_outer = || resolve_outer_yarn_mirror_for_process(&common.cwd);
+    let rewrite_options = || {
+        RewriteOptions {
         dry_run: common.dry_run,
         targets_pipenv_lock,
         pipenv_major,
@@ -998,7 +1006,9 @@ pub(crate) async fn run_redirect_selected(
         trust_lockfile_config: !common.no_trust_lockfile_config,
         npm_allow_remote_config: !common.no_npm_allow_remote_config,
         npm_outer: &npm_outer,
+        yarn_classic_outer: &yarn_classic_outer,
         blocking: true,
+    }
     };
     // The rollout gate plans again without its deferred rows: keep what
     // the second pass needs.
@@ -1397,18 +1407,26 @@ pub(crate) async fn run_redirect_selected(
     warnings.extend(takeover_warnings.iter().cloned());
     warnings.extend(prune_warnings.iter().cloned());
 
+    // Granted, but nothing in the project pins it (no lock entry,
+    // unreadable lock, ...): reported per purl (`redirect.patches[]`
+    // `unpinned` rows; the human "Not hosted" lines) so it never vanishes
+    // silently. (A skipped uuid — e.g. unavailable wheel metadata — is
+    // already listed with its reason.)
+    let unconfirmed = socket_patch_core::hosted::engine::unconfirmed_candidates(
+        &candidates,
+        &confirmed,
+        &skipped,
+    );
     if common.json {
         // Nest the redirect result under `redirect` inside the classic scan
         // object (built by `run`, threaded in via `scan_result`), mirroring
         // vendored mode's nested `vendor` block, so the hosted `--json`
         // envelope keeps the same top-level scan keys as every other scan.
         let redirect = redirect_json_block(
-            confirmed.len(),
+            &confirmed,
+            &unconfirmed,
             done.rewritten.clone(),
-            skipped
-                .iter()
-                .map(socket_patch_core::hosted::render::skipped_json)
-                .collect(),
+            &skipped,
             warnings,
             common.dry_run,
         );
@@ -1490,23 +1508,11 @@ pub(crate) async fn run_redirect_selected(
                 .filter(|s| s.reason != super::rollout::ROLLOUT_DEFERRED)
                 .map(|s| (s.purl.clone(), s.reason.clone()))
                 .collect();
-            // Granted, but nothing in the project pins it (no lock entry,
-            // unreadable lock, ...): listed so it never vanishes silently.
-            // (A skipped uuid — e.g. unavailable wheel metadata — is already
-            // listed with its reason.)
-            let unconfirmed: Vec<String> = candidates
-                .iter()
-                .filter(|c| {
-                    !confirmed
-                        .iter()
-                        .any(|(cp, cu)| *cp == c.purl && *cu == c.dep.patch_uuid)
-                })
-                .filter(|c| !skipped.iter().any(|s| s.uuid == c.dep.patch_uuid))
-                .map(|c| c.purl.clone())
-                .collect();
+            let unconfirmed_purls: Vec<String> =
+                unconfirmed.iter().map(|(purl, _)| purl.clone()).collect();
             for line in format_unredirected(
                 &skipped_pairs,
-                &unconfirmed,
+                &unconfirmed_purls,
                 confirmed.is_empty(),
                 // Only the lockfile rewriters' own warnings explain a
                 // missing lock entry; unrelated guidance (pnpm trust, VEX,
@@ -1606,16 +1612,17 @@ fn stranded_takeovers(
     confirmed: &[(String, String)],
     dry_run: bool,
 ) -> Vec<String> {
-    use socket_patch_core::utils::purl::{canonical_purl, strip_purl_qualifiers};
+    use socket_patch_core::utils::purl_key::PurlKey;
     if dry_run {
         return Vec::new();
     }
-    let key = |purl: &str| canonical_purl(strip_purl_qualifiers(purl));
-    let pinned: std::collections::HashSet<String> =
-        confirmed.iter().map(|(purl, _)| key(purl)).collect();
+    let pinned: std::collections::HashSet<PurlKey> = confirmed
+        .iter()
+        .map(|(purl, _)| PurlKey::new(purl))
+        .collect();
     migrated
         .iter()
-        .filter(|purl| !pinned.contains(&key(purl)))
+        .filter(|purl| !pinned.contains(&PurlKey::new(purl)))
         .cloned()
         .collect()
 }
@@ -1681,7 +1688,8 @@ async fn vendored_takeover(
         // No takeover-capable candidates — nothing to reconcile.
         return Ok(out);
     }
-    use socket_patch_core::utils::purl::{canonical_purl as canon, strip_purl_qualifiers};
+    use socket_patch_core::utils::purl::strip_purl_qualifiers;
+    use socket_patch_core::utils::purl_key::PurlKey;
     // Each takeover-capable candidate with its vendored ledger entry, if
     // any (cloned out so the loop can mutate the state).
     let takeover: Vec<(&Candidate, Option<socket_patch_core::vendor::VendorEntry>)> = candidates
@@ -1812,6 +1820,7 @@ async fn vendored_takeover(
                     &lock,
                     yarnrc.as_deref(),
                     npmrc.as_deref(),
+                    &resolve_outer_yarn_mirror_for_process(&common.cwd),
                 )
                 .err()
             }
@@ -1880,11 +1889,30 @@ async fn vendored_takeover(
     } else {
         std::collections::HashMap::new()
     };
+    // A PyPI entry is gated on the hosted rewriter's reach after the
+    // revert: requirements.txt pins only the root file (#699), uv pins
+    // only the version the restored lock resolves (#723), and Poetry
+    // refuses every 0.x lock (#945). Checked once per purl, here, because
+    // the uv and Poetry checks read the ledger and the lock on disk.
+    let mut pypi_takeover_refusals: std::collections::HashMap<
+        String,
+        socket_patch_core::patch::redirect::RewriteWarning,
+    > = std::collections::HashMap::new();
+    for (c, entry) in &takeover {
+        let Some(entry) = entry.as_ref().filter(|_| c.purl.starts_with("pkg:pypi/")) else {
+            continue;
+        };
+        if let Err(warning) =
+            socket_patch_core::patch::redirect::preflight_pypi_takeover(&common.cwd, entry).await
+        {
+            pypi_takeover_refusals.insert(c.purl.clone(), warning);
+        }
+    }
     // The takeover refusal (if any) for one candidate: bun gates every
     // npm purl, berry and vlt only their own vendored entries, Gradle each
     // of its own purls, a pypi purl on a platform-tagged grant (#701), and a
-    // requirements.txt entry on the hosted rewriter's reach (it pins only
-    // the root file, #699). Berry also runs
+    // PyPI entry on the hosted rewriter's reach (`pypi_takeover_refusals`
+    // above). Berry also runs
     // the rewriter's per-dep grant gate (a grant without the berry cache
     // checksum is skipped by the rewriter, so reverting first would leave
     // the package in neither mode). A refused purl is never dispatched (see
@@ -1898,10 +1926,9 @@ async fn vendored_takeover(
         if c.purl.starts_with("pkg:pypi/") {
             // A platform-tagged grant is never pinned (#701 / #932): keep
             // the vendored patch rather than revert it to nothing.
-            return entry.and_then(|e| {
-                socket_patch_core::patch::redirect::pypi_platform_wheel_refusal(&c.dep).or_else(
-                    || socket_patch_core::patch::redirect::preflight_requirements_takeover(e).err(),
-                )
+            return entry.and_then(|_| {
+                socket_patch_core::patch::redirect::pypi_platform_wheel_refusal(&c.dep)
+                    .or_else(|| pypi_takeover_refusals.get(&c.purl).cloned())
             });
         }
         if !c.purl.starts_with("pkg:npm/") {
@@ -1930,6 +1957,26 @@ async fn vendored_takeover(
                     .filter(|_| entry.is_some_and(vlt_entry))
             })
     };
+    // NON-UTF-8 PRE-CHECK (#721) — the GUARD's undecodable-file rule
+    // (`engine::undecodable_guard`), checked BEFORE any revert dispatches
+    // (and under --dry-run too): a takeover that reverted first and was
+    // then refused by the guard would leave the reverted purls unpatched
+    // in both modes.
+    if takeover.iter().any(|(_, entry)| entry.is_some()) {
+        let view = socket_patch_core::vendor::lock_inventory::ProjectView::Disk(&common.cwd);
+        let read = socket_patch_core::hosted::engine::read_candidate_files(
+            &view,
+            &std::collections::BTreeSet::new(),
+            candidates,
+        )
+        .await;
+        if let Some(refusal) = socket_patch_core::hosted::engine::undecodable_guard(
+            &read.undecodable_reads,
+            candidates,
+        ) {
+            return Err(refusal);
+        }
+    }
     // SYMLINK PRE-CHECK for the takeover reverts — the same rule as the
     // SYMLINK GUARD below, applied to each ledger entry's recorded wiring
     // (the revert backends also stage and rename over the file). Checked
@@ -2042,7 +2089,7 @@ async fn vendored_takeover(
                 .expect("a vendored ledger entry was looked up in this state, so it loaded");
             state
                 .entries
-                .retain(|k, e| canon(k) != canon(purl) && canon(&e.base_purl) != canon(purl));
+                .retain(|k, e| !PurlKey::same(k, purl) && !PurlKey::same(&e.base_purl, purl));
             if let Err(e) = socket_patch_core::vendor::save_state(&common.cwd, state).await {
                 // The wiring is reverted but the ledger still claims it;
                 // redirecting now would leave a ledger asserting wiring
@@ -2660,7 +2707,7 @@ fn created_settings_over_existing(
 }
 
 /// [`created_settings_over_existing`]'s code for `socket-patch.sbt`.
-const SBT_OWNED_FILE_UNREADABLE: &str = "redirect_sbt_owned_file_unreadable";
+use socket_patch_core::hosted::engine::SBT_OWNED_FILE_UNREADABLE;
 
 #[cfg(test)]
 mod tests {
@@ -3267,9 +3314,10 @@ mod tests {
         // spelling of the block (`run`'s zero-discovery arm uses the same
         // helper).
         let redirect = redirect_json_block(
-            1,
+            &[("pkg:npm/minimist@1.2.2".to_string(), "abc-123".to_string())],
+            &[],
             vec!["package-lock.json".to_string()],
-            Vec::new(),
+            &[],
             vec![prune_ignored_warning()],
             false,
         );
@@ -4746,19 +4794,43 @@ mod tests {
         use super::npm_allow_remote_one_line;
         let hosts = ["patch.socket.dev"];
         let cases = [
-            (npm_allow_remote_configured_detail(&hosts, true, false), "Note: set"),
-            (npm_allow_remote_configured_detail(&hosts, false, false), "Note: set"),
-            (npm_allow_remote_configured_detail(&hosts, true, true), "Note: would set"),
-            (npm_allow_remote_already_detail(&hosts), "Note: .npmrc already"),
-            (npm_allow_remote_user_set_detail(&hosts, "none"), "Warning: npm >=12"),
-            (npm_allow_remote_env_set_detail(&hosts, "npm_config_allow_remote", "none"), "Warning: npm >=12"),
+            (
+                npm_allow_remote_configured_detail(&hosts, true, false),
+                "Note: set",
+            ),
+            (
+                npm_allow_remote_configured_detail(&hosts, false, false),
+                "Note: set",
+            ),
+            (
+                npm_allow_remote_configured_detail(&hosts, true, true),
+                "Note: would set",
+            ),
+            (
+                npm_allow_remote_already_detail(&hosts),
+                "Note: .npmrc already",
+            ),
+            (
+                npm_allow_remote_user_set_detail(&hosts, "none"),
+                "Warning: npm >=12",
+            ),
+            (
+                npm_allow_remote_env_set_detail(&hosts, "npm_config_allow_remote", "none"),
+                "Warning: npm >=12",
+            ),
             (npm_allow_remote_manual_detail(&hosts), "Warning: npm >=12"),
-            (npm_allow_remote_unreadable_detail(&hosts, "is a symlink"), "Warning: npm >=12"),
+            (
+                npm_allow_remote_unreadable_detail(&hosts, "is a symlink"),
+                "Warning: npm >=12",
+            ),
         ];
         for (detail, start) in cases {
             let line = npm_allow_remote_one_line(&detail);
             assert!(line.starts_with(start), "{line}");
-            assert!(!line.contains('\n') && line.ends_with("(details: --verbose)."), "{line}");
+            assert!(
+                !line.contains('\n') && line.ends_with("(details: --verbose)."),
+                "{line}"
+            );
         }
     }
 }

@@ -344,8 +344,7 @@ impl VendoredBackend<'_> {
                 );
                 continue;
             }
-            if socket_patch_core::utils::purl::canonical_purl(purl)
-                != socket_patch_core::utils::purl::canonical_purl(&entry.base_purl)
+            if !socket_patch_core::utils::purl_key::PurlKey::same(purl, &entry.base_purl)
                 || !vendor::is_vendorable(&entry.base_purl)
             {
                 fail(
