@@ -82,6 +82,7 @@ pub mod upstream;
 pub mod vlt;
 pub mod vlt_heal;
 pub mod vlt_preflight;
+pub mod yarnrc;
 /// Hosted-artifact leaf ownership rule, shared with `vex`'s bun lockfile
 /// discovery (which recovers a URL tuple's version from that leaf).
 pub(crate) use hosted_url::{hosted_url_names, hosted_url_version};
@@ -549,6 +550,7 @@ pub fn rewrite_registry_redirect_with_pipenv_version(
         bun_lockb_present,
         &std::collections::BTreeSet::new(),
         &std::collections::BTreeSet::new(),
+     &yarnrc::OuterYarnMirror::default(),
     )
 }
 
@@ -618,6 +620,7 @@ fn withhold_pypi_platform_wheels<'a>(
 /// project installs from. `gradle_unreadable` are the Gradle build files
 /// the host found but could not read as text: the Gradle planner refuses
 /// the build rather than take them for absent.
+#[allow(clippy::too_many_arguments)]
 pub fn rewrite_registry_redirect_withholding_vlt(
     files: &BTreeMap<String, String>,
     overrides: &[DepOverride],
@@ -626,6 +629,7 @@ pub fn rewrite_registry_redirect_withholding_vlt(
     bun_lockb_present: bool,
     vlt_withheld: &std::collections::BTreeSet<String>,
     gradle_unreadable: &std::collections::BTreeSet<String>,
+    yarn_outer: &yarnrc::OuterYarnMirror,
 ) -> RewriteResult {
     let mut result = RewriteResult::default();
     let overrides = withhold_pypi_platform_wheels(overrides, &mut result);
@@ -651,6 +655,7 @@ pub fn rewrite_registry_redirect_withholding_vlt(
         bun_lockb_present,
         artifact_metadata,
         gradle_unreadable,
+        yarn_outer,
     );
     let mut result = rewrite_groups_parallel(result, &groups);
     result.vlt_drives = vlt::vlt_drives(files, bun_lockb_present);
@@ -676,12 +681,13 @@ fn rewriter_groups<'a>(
     bun_lockb_present: bool,
     artifact_metadata: &'a BTreeMap<String, String>,
     gradle_unreadable: &'a std::collections::BTreeSet<String>,
+    yarn_outer: &'a yarnrc::OuterYarnMirror,
 ) -> Vec<RewriterGroup<'a>> {
     vec![
         Box::new(move |result| {
             rewrite_npm_lock(files, overrides, result);
             plan_hosted(files, overrides, result);
-            rewrite_yarn_classic(files, overrides, result);
+            rewrite_yarn_classic_with(files, overrides, yarn_outer, result);
             rewrite_yarn_berry_with_manifests(files, overrides, artifact_metadata, result);
             rewrite_bun_lock(files, overrides, result);
         }),
@@ -3336,84 +3342,16 @@ fn plan_cargo_config(
 /// `yarn-offline-mirror` setting.
 pub const YARNRC_REL: &str = ".yarnrc";
 
-/// The `yarn-offline-mirror` directory a project-level `.yarnrc` or
-/// `.npmrc` configures, if any. Yarn 1 reads the key from its own
-/// `.yarnrc` first and falls back to the npm config, so a `.yarnrc` entry
-/// (even `false`) wins over `.npmrc`. An empty value or `false` means no
-/// mirror.
-pub fn yarn_classic_offline_mirror(yarnrc: Option<&str>, npmrc: Option<&str>) -> Option<String> {
-    let value = yarnrc
-        .and_then(yarnrc_value_of_offline_mirror)
-        .or_else(|| npmrc.and_then(npmrc_value_of_offline_mirror))?;
-    (!value.is_empty() && value != "false").then_some(value)
-}
-
-const YARN_OFFLINE_MIRROR_KEY: &str = "yarn-offline-mirror";
-
-/// Strip one pair of matching quotes, as yarn's `.yarnrc` parser and npm's
-/// ini parser both do.
-fn unquote_rc_value(raw: &str) -> &str {
-    let raw = raw.trim();
-    for q in ['"', '\''] {
-        if raw.len() >= 2 && raw.starts_with(q) && raw.ends_with(q) {
-            return &raw[1..raw.len() - 1];
-        }
-    }
-    raw
-}
-
-/// The last `yarn-offline-mirror` value in a `.yarnrc` (`key value` or
-/// `key: value` lines, key optionally quoted, `#` comments); later lines
-/// override earlier ones.
-fn yarnrc_value_of_offline_mirror(text: &str) -> Option<String> {
-    let mut found = None;
-    for line in text.lines() {
-        let line = line.trim();
-        if line.is_empty() || line.starts_with('#') {
-            continue;
-        }
-        let (key, rest) = match line.strip_prefix('"') {
-            Some(quoted) => match quoted.split_once('"') {
-                Some((key, rest)) => (key, rest),
-                None => continue,
-            },
-            // yarn's `.yarnrc` parser also ends an unquoted key at `:`, so
-            // `key: value` and `key:value` set the key like `key value`.
-            None => match line.split_once(|c: char| c.is_whitespace() || c == ':') {
-                Some((key, rest)) => (key, rest),
-                None => (line, ""),
-            },
-        };
-        if key == YARN_OFFLINE_MIRROR_KEY {
-            let rest = rest.trim_start();
-            let rest = rest.strip_prefix(':').unwrap_or(rest);
-            found = Some(unquote_rc_value(rest).to_string());
-        }
-    }
-    found
-}
-
-/// The last top-level `yarn-offline-mirror` value in an `.npmrc` (ini
-/// `key = value` lines, `#`/`;` comments, `[section]` headers end the
-/// top level).
-fn npmrc_value_of_offline_mirror(text: &str) -> Option<String> {
-    let mut found = None;
-    for line in text.lines() {
-        let line = line.trim();
-        if line.starts_with('[') {
-            break;
-        }
-        if line.is_empty() || line.starts_with('#') || line.starts_with(';') {
-            continue;
-        }
-        let Some((key, value)) = line.split_once('=') else {
-            continue;
-        };
-        if unquote_rc_value(key) == YARN_OFFLINE_MIRROR_KEY {
-            found = Some(unquote_rc_value(value).to_string());
-        }
-    }
-    found
+/// The `yarn-offline-mirror` directory yarn 1 uses for the project, if
+/// any: the project's `.yarnrc` / `.npmrc` texts layered with the config
+/// yarn reads outside the project (`outer`, see [`yarnrc`]). `false` in
+/// either registry, or an empty value, means no mirror.
+pub fn yarn_classic_offline_mirror(
+    yarnrc: Option<&str>,
+    npmrc: Option<&str>,
+    outer: &yarnrc::OuterYarnMirror,
+) -> Option<yarnrc::MirrorSetting> {
+    yarnrc::effective_mirror(yarnrc, npmrc, outer)
 }
 
 /// The project-level refusal of the yarn classic hosted rewriter: a
@@ -3431,27 +3369,47 @@ pub fn preflight_yarn_classic_hosted(
     lock: &str,
     yarnrc: Option<&str>,
     npmrc: Option<&str>,
+    outer: &yarnrc::OuterYarnMirror,
 ) -> Result<(), RewriteWarning> {
     if is_berry_lock(lock) {
         return Ok(());
     }
-    match yarn_classic_offline_mirror(yarnrc, npmrc) {
-        Some(mirror) => Err(RewriteWarning {
+    match yarn_classic_offline_mirror(yarnrc, npmrc, outer) {
+        Some(yarnrc::MirrorSetting {
+            value: yarnrc::MirrorValue::Path(mirror),
+            origin,
+        }) => Err(RewriteWarning {
             code: "redirect_yarn_classic_offline_mirror".into(),
             detail: format!(
-                "the project sets `yarn-offline-mirror` ({mirror}); yarn looks mirror \
+                "the project sets `yarn-offline-mirror` ({mirror}, from {origin}); yarn looks mirror \
                  tarballs up by file name, and the hosted tarball has the same name as \
                  the upstream one, so installs would get the unpatched bytes and fail \
                  the integrity check; leaving yarn.lock untouched (use --mode vendored)"
             ),
         }),
-        None => Ok(()),
+        _ => Ok(()),
     }
 }
 
+/// [`rewrite_yarn_classic_with`] seeing only the project's rc files.
+#[cfg(test)]
 fn rewrite_yarn_classic(
     files: &BTreeMap<String, String>,
     overrides: &[DepOverride],
+    result: &mut RewriteResult,
+) {
+    rewrite_yarn_classic_with(
+        files,
+        overrides,
+        &yarnrc::OuterYarnMirror::default(),
+        result,
+    )
+}
+
+fn rewrite_yarn_classic_with(
+    files: &BTreeMap<String, String>,
+    overrides: &[DepOverride],
+    yarn_outer: &yarnrc::OuterYarnMirror,
     result: &mut RewriteResult,
 ) {
     use crate::vendor::yarn_classic_lock::{split_key_patterns, split_pattern};
@@ -3472,6 +3430,7 @@ fn rewrite_yarn_classic(
         raw,
         files.get(YARNRC_REL).map(String::as_str),
         files.get(npmrc::NPMRC_REL).map(String::as_str),
+        yarn_outer,
     )
     .err();
     // CRLF locks (core.autocrlf Windows checkouts — yarn v1 parses them fine)
@@ -10405,6 +10364,10 @@ mod tests {
             (YARNRC_REL, "\"yarn-offline-mirror\": \"./mirror\"\n"),
             (npmrc::NPMRC_REL, "yarn-offline-mirror = ./mirror\n"),
             (npmrc::NPMRC_REL, "yarn-offline-mirror=\"./mirror\"\n"),
+            // #1078: a BOM-prefixed rc (Notepad, PowerShell 5 utf8).
+            (YARNRC_REL, "\u{feff}yarn-offline-mirror \"./mirror\"\n"),
+            (YARNRC_REL, "\u{feff}yarn-offline-mirror \"./mirror\"\r\n"),
+            (npmrc::NPMRC_REL, "\u{feff}yarn-offline-mirror=./mirror\n"),
         ];
         for (rc, text) in cases {
             for lock in [
@@ -10437,6 +10400,109 @@ mod tests {
                 assert!(r.refused_yarn_classic_uuids.contains(&ovr.patch_uuid));
             }
         }
+    }
+
+    /// #1013: a mirror yarn reads from outside the project (an ancestor
+    /// or user rc, `yarn config set`, a `YARN_*` / `npm_config_*` env var)
+    /// refuses the rewrite like a project one, and a project `false`
+    /// still turns an outer file's mirror off.
+    #[test]
+    fn yarn_classic_outer_offline_mirror_refuses_rewrite() {
+        use yarnrc::{MirrorSetting, MirrorValue, OuterRegistryMirror, OuterYarnMirror};
+        let ovr = npm_override(
+            "left-pad",
+            "1.3.0",
+            "http://p.test/patch/npm/left-pad/1.3.0/tok/u/left-pad-1.3.0.tgz",
+            "sha512-PATCHED==",
+        );
+        let setting = |origin: &str| MirrorSetting {
+            value: MirrorValue::Path("/w/mirror".into()),
+            origin: origin.into(),
+        };
+        let file = |origin: &str| OuterRegistryMirror {
+            env: None,
+            file: Some(setting(origin)),
+        };
+        let env = |origin: &str| OuterRegistryMirror {
+            env: Some(setting(origin)),
+            file: None,
+        };
+        let refusing = [
+            OuterYarnMirror {
+                yarn: file("/w/root/.yarnrc"),
+                ..Default::default()
+            },
+            OuterYarnMirror {
+                yarn: file("/home/u/.yarnrc"),
+                ..Default::default()
+            },
+            OuterYarnMirror {
+                npm: file("/home/u/.npmrc"),
+                ..Default::default()
+            },
+            OuterYarnMirror {
+                yarn: env("YARN_YARN_OFFLINE_MIRROR"),
+                npm: env("YARN_YARN_OFFLINE_MIRROR"),
+            },
+            OuterYarnMirror {
+                npm: env("npm_config_yarn_offline_mirror"),
+                ..Default::default()
+            },
+        ];
+        for outer in &refusing {
+            let mut files = BTreeMap::new();
+            files.insert("yarn.lock".to_string(), classic_lock_two_entries());
+            let mut r = RewriteResult::default();
+            rewrite_yarn_classic_with(&files, std::slice::from_ref(&ovr), outer, &mut r);
+            assert!(
+                r.files.is_empty() && r.edits.is_empty(),
+                "{outer:?}: {:?}",
+                r.files
+            );
+            assert_eq!(
+                r.warnings
+                    .iter()
+                    .map(|w| w.code.as_str())
+                    .collect::<Vec<_>>(),
+                ["redirect_yarn_classic_offline_mirror"],
+                "{outer:?}"
+            );
+            assert!(
+                r.warnings[0].detail.contains("/w/mirror"),
+                "{}",
+                r.warnings[0].detail
+            );
+            assert!(r.refused_yarn_classic_uuids.contains(&ovr.patch_uuid));
+            assert!(preflight_yarn_classic_hosted(&files["yarn.lock"], None, None, outer).is_err());
+        }
+        // A project-level `false` overrides an outer FILE (yarn's
+        // first-found order), so the rewrite proceeds.
+        let mut files = BTreeMap::new();
+        files.insert("yarn.lock".to_string(), classic_lock_two_entries());
+        files.insert(
+            YARNRC_REL.to_string(),
+            "yarn-offline-mirror false\n".to_string(),
+        );
+        let mut r = RewriteResult::default();
+        rewrite_yarn_classic_with(&files, std::slice::from_ref(&ovr), &refusing[1], &mut r);
+        assert!(r.warnings.is_empty(), "{:?}", r.warnings);
+        assert!(r.files["yarn.lock"].contains("left-pad-1.3.0.tgz"));
+        // The full chain drives it too.
+        let mut r = rewrite_registry_redirect_withholding_vlt(
+            &BTreeMap::from([("yarn.lock".to_string(), classic_lock_two_entries())]),
+            std::slice::from_ref(&ovr),
+            &BTreeMap::new(),
+            None,
+            false,
+            &std::collections::BTreeSet::new(),
+            &std::collections::BTreeSet::new(),
+            &refusing[3],
+        );
+        assert!(!r.files.contains_key("yarn.lock"));
+        assert!(r
+            .warnings
+            .drain(..)
+            .any(|w| w.code == "redirect_yarn_classic_offline_mirror"));
     }
 
     /// No mirror, a disabled one, a look-alike key, or an `.npmrc` mirror
@@ -10481,10 +10547,12 @@ mod tests {
     #[test]
     fn yarn_classic_offline_mirror_preflight_scope() {
         let rc = Some("yarn-offline-mirror ./mirror\n");
-        assert!(preflight_yarn_classic_hosted(&classic_lock_two_entries(), rc, None).is_err());
-        assert!(preflight_yarn_classic_hosted(&classic_lock_two_entries(), None, None).is_ok());
+        let none = yarnrc::OuterYarnMirror::default();
+        let lock = classic_lock_two_entries();
+        assert!(preflight_yarn_classic_hosted(&lock, rc, None, &none).is_err());
+        assert!(preflight_yarn_classic_hosted(&lock, None, None, &none).is_ok());
         let berry = "__metadata:\n  version: 8\n  cacheKey: 10c0\n";
-        assert!(preflight_yarn_classic_hosted(berry, rc, None).is_ok());
+        assert!(preflight_yarn_classic_hosted(berry, rc, None, &none).is_ok());
 
         let other = npm_override("not-locked", "1.0.0", "http://p.test/x.tgz", "sha512-X==");
         let mut files = BTreeMap::new();
