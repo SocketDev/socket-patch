@@ -1,19 +1,20 @@
 ### Refactor routine (`refactor`, hourly, highest leverage first)
-_Last updated 2026-10-08T20:13Z · main @ a845bf9_
+_Last updated 2026-10-08T22:20Z · main @ 830749f_
 
 **In flight:**
+- [#1185](https://github.com/SocketDev/socket-patch/pull/1185): every vendored Poetry lock wires through `utils::poetry_lock`; the engine writes 2.x `files` one file per line; deletes the LF line scanner, `toml_surgery::{package_unit_lines, replace_files_array}` and `common::unit_has_canon_name`. Issue #936 (E66). +37/−166 production. Only change: hosted and CRLF-vendored 2.x `files` layout (Poetry's own); `name="…"` / files-less units wire instead of refusing. `state: ready`.
 - [#1163](https://github.com/SocketDev/socket-patch/pull/1163): `PatchFileInfo` hashes load as lowercase hex (`deserialize_with`), so agent apply/rollback `==` checks, blob names and vendored pins share one case rule. Issue #707 (C41). +18 production, +112 tests. Only change: an uppercase-hash manifest now applies and rolls back, and is written back lowercase. `state: ready`.
 - [#1160](https://github.com/SocketDev/socket-patch/pull/1160): inline BOM handling in 8 more files onto `formats::text`; `PENDING_INLINE_BOMS` 26 → 15. Issue #905 (E64, slice 2). Only change: two leading BOMs. `state: ready`.
-- [#1153](https://github.com/SocketDev/socket-patch/pull/1153): one `path_safety::is_safe_name_version`; deletes `is_safe_{cargo,gem,nuget}_coordinate`. Tracker #748 (E37; composer `normalize_version` waits on #1108). `state: ready`.
-- [#1151](https://github.com/SocketDev/socket-patch/pull/1151): uv/poetry inventory and recovery share one `portable_wheel_artifact` pick. Issue #1150 (E89). Only change: `cp*`/`pp*`/`py2-none-any` wheels not pinned by inventory. `state: ready`.
-- [#1145](https://github.com/SocketDev/socket-patch/pull/1145): Gradle XML reads through a new `formats::xml`; deletes `gradle.rs`'s private XML scanner. Issue #715 (E10, Gradle half). `state: ready`.
-- [#1141](https://github.com/SocketDev/socket-patch/pull/1141): deletes the dead hosted-vlt ledger helpers. Issue #782 (E58, slice 1). −181 production. `state: ready`.
 - [#1126](https://github.com/SocketDev/socket-patch/pull/1126): 7 inline purl-type checks through `Ecosystem::from_purl` + guard. Issue #747 (C20, slice 1). `state: ready`.
 - [#1108](https://github.com/SocketDev/socket-patch/pull/1108): one `utils::line_endings::terminator` for 7 inserted-line sites. Issue #815 (E16, slice 1; the rest is in open-PR files). Re-blesses mixed-ending go/uv goldens only. `state: ready`.
 - [#1103](https://github.com/SocketDev/socket-patch/pull/1103): `go.sum` edits through `GoSumEditor` only; deletes the oracle-only free functions and names the key rule once. Issue #631 (E52, slice: steps 2–3; the move to `formats/golang/sum.rs` remains). `state: ready`, handed to the burn-down.
-- Maintainer drafts (decided issues): #1027 (#704), #1030 (#808), #1031 (#966), #1036 (#973), #1041 (#648), #1049 (#792), #1051 (#580).
+- Maintainer drafts (decided issues): #1027 (#704), #1031 (#966), #1036 (#973), #1041 (#648), #1049 (#792). #1030 (#808) and #1051 (#580) merged.
 
 **Merged:**
+- [#1153](https://github.com/SocketDev/socket-patch/pull/1153): one `path_safety::is_safe_name_version` for the cargo/gem/nuget crawlers. Tracker #748 (E37).
+- [#1151](https://github.com/SocketDev/socket-patch/pull/1151): one `portable_wheel_artifact` for uv/poetry inventory and recovery. Issue #1150 (E89 fixed).
+- [#1145](https://github.com/SocketDev/socket-patch/pull/1145): Gradle XML through `formats::xml`. Issue #715 (E10, Gradle half).
+- [#1141](https://github.com/SocketDev/socket-patch/pull/1141): dead hosted-vlt ledger helpers deleted, −181 production. Issue #782 (E58 slice 1).
 - [#1106](https://github.com/SocketDev/socket-patch/pull/1106): PDM site probe through `utils::process::output_within` + `kill_on_drop` guard test. Issue #1067 (C48). `c4235a2`.
 - [#1110](https://github.com/SocketDev/socket-patch/pull/1110): one `formats::cargo::manifest` `[package]` reader for crawler, VEX and `cargo_tag`. Issue #693 (E15 slice 1). `d52a67b`.
 - [#1117](https://github.com/SocketDev/socket-patch/pull/1117): 8 inline BOM strips onto `formats::text` + one-sided guard. Issue #905 (E64). `d13657b`.
@@ -23,15 +24,16 @@ _Last updated 2026-10-08T20:13Z · main @ a845bf9_
 
 | # | Candidate | B | U | D | R | Score | Note |
 |---|---|:-:|:-:|:-:|:-:|:-:|---|
-| 1 | #989 item (was #990): one `vendor::revert::finish` for the 12 copied finish blocks | 0 | 1 | ≈12 | L | ≈26 | skipped: all 12 backend files changed by open PRs (#1008, #1041, …) |
-| 2 | #594 / #717 (E10): nuget.config and pom.xml edits through the `formats::nuget` / `formats::maven` tokenizers | 3 | 1 | ≈6 | M | ≈21 | skipped: `redirect/mod.rs` (#1008, #1009, #1051, #1161), `vendor/nuget_feed.rs` (#1041); wait for #1145's `formats::xml` too |
-| 3 | #1012 (in #959): archive extractors to `utils::archive` | 0 | 2 | ≈1 | L | ≈6 | skipped: `utils/mod.rs` (#1007) and most importers |
-| 4 | #707 (C41): one hash case rule, at manifest load | 1 | 0 | ≈1 | L | ≈5 | **taken: #1163** |
-| 5 | #705 (C18): one `utils::uuid` grammar | 0 | 0 | 3 | L | ≈6 | skipped: `api/client.rs`, CLI `lib.rs`, `path_safety.rs` (open PRs incl. #1034, #1153) |
+| 1 | #989 item (was #990): one `vendor::revert::finish` for the 12 copied finish blocks | 0 | 1 | ≈12 | L | ≈26 | skipped: backend files changed by open PRs (#1008, #1041, #1026, …) |
+| 2 | #717 (E10): hosted pom edits + restore through `formats::xml` / `formats::maven` | 3 | 1 | ≈4 | M | ≈17 | skipped: `redirect/mod.rs` (#1008, #1009, #1026); `upstream/maven.rs` and `formats/maven` are free |
+| 3 | #594 (E10): nuget.config edits through `formats::nuget` | 1 | 1 | ≈3 | M | ≈9 | skipped: `redirect/mod.rs`, `vendor/nuget_feed.rs` (#1041) |
+| 4 | #936 (E66): one Poetry forward splicer | 0 | 1 | ≈1.6 | M | ≈3 | **taken: #1185** |
+| 5 | #705 (C18): one `utils::uuid` grammar | 0 | 0 | 3 | L | ≈6 | skipped: `api/client.rs`, CLI `lib.rs` (#1034, #1041, #1049) |
 
-Re-ranked 2026-10-08T20:00Z at `a845bf9` against 33 open PRs (415 files in `arch-refactor/*` or `agent/fix-*`). Also blocked: #823/#824 scrub copies (`spawn_env_hygiene.rs`, #1049), #833 codec moves (`vendor/mod.rs`, `formats/mod.rs`), #675/#614/#676 (`api/client.rs`, CLI scan), #1014 `.mill-version` (`vendor/jvm/sbt.rs`, and needs a rule decision). #748 composer `normalize_version` still waits on #1108; #913, #675, #914, #1128, #780, #1144 stay blocked by open-PR files. C69/#836 (`redirect/mod.rs`), #1129 (`npm_crawler.rs`), C50/#893 (`cleanup_blobs.rs`, #1049), C77/#1144 (`commands/vex.rs`), C51/#914 (`jvm_jar.rs`), E41/E28/#782 rest (`lock_inventory`, #1141 open on #782), #705, #913, #675, #780, #936, #1128 and every `commands/*` manifest reader remain blocked by open-PR files. #706's digest slice stays deferred.
+Re-ranked 2026-10-08T22:00Z at `830749f` against 29 open PRs (387 files in `arch-refactor/*` or `agent/fix-*`). Still blocked by open-PR files: #1144 (CLI `commands/vex.rs`, #1027/#1041), #914 (`jvm_jar.rs`, #1041), #893 (`cleanup_blobs.rs`, #1049), #780 (`vendor/gem.rs`), #1128 (`pypi_pipenv.rs`, #1147), #1064 (`vex/product.rs`, #1007), #913/#675/#676 (`api/client.rs`), #823/#824, #833, #1014 (`jvm/sbt.rs`, #1036), every CLI `commands/*` site. Free but low-leverage: #715's crawler-reader item (`maven_crawler.rs` is free, `vex/product.rs` is not; the crawler path is hot, so it needs timings).
 
 **Notes:**
+- Poetry 2.x `files` is written one file per line by the shared engine since #1185; a test or golden that greps `files = [{ file` only sees 1.0/1.1 package-level `files` now.
 - A hash read from a manifest is lowercase after #1163; `api::blob_fetcher::blob_hash_matches` and vendored `eq_ignore_ascii_case` sites become plain `==` once their files are free (#707 remainder).
 - `mode_migration_pypi::pipenv_hosted_to_vendored_*` needs pypi.org; fails in the sandbox on `main` too.
 - A closed issue whose register row is only `partly fixed` needs a new follow-up issue for the remainder (#1150 after #1079); don't reopen the closed one.

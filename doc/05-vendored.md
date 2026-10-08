@@ -118,11 +118,11 @@ Revert/restore/unwind code in the non-npm backends totals **about 3,540 lines**:
 **Format parsers live in three homes** (`formats/`, `utils/`, `vendor/`), and `formats/` has no pypi, golang or package-lock model. 50 non-vendor files import `crate::vendor::*`: 48 references to `vendor::lock_inventory`, 15 to `registry_fetch` and 9 to `go_mod_edit`. `vendor/pypi.rs:87-230` holds hosted-mode wheel-metadata code that is used by `hosted/memory/discover.rs` and CLI `scan/hosted.rs`.
 
 **XML: eight hand-rolled scanners and no XML crate.**
-- `<!--` handling is implemented independently in 8 files, including two strippers inside `maven_repo.rs`.
+- `<!--` handling is implemented in 8 files, including two strippers inside `maven_repo.rs`; one of them is the shared `formats::xml` scanner, which Gradle's verification-metadata reader uses since #1145.
 - There are four attribute extractors with three different tokenization rules:
   - `nuget_feed.rs:1094 attr_value` matches any substring, with no word boundary;
   - `redirect/upstream/nuget.rs:39` uses a regex;
-  - `jvm/gradle.rs:1538` checks for preceding whitespace;
+  - `formats::xml::attr` (Gradle's reader since #1145, which deleted `jvm/gradle.rs`'s private scanner);
   - `formats/nuget/mod.rs:41` does a real tag parse.
 - The vendored NuGet writer (`nuget_feed.rs`) never uses the shared reader `formats::nuget::parse_config`, **so its reader and writer can disagree about what a file contains**. The hosted splicer now uses it (#597). {{E10}}
 - `pom.xml` alone has seven scanners (checked on `045d7ec`): `formats::maven::parse_pom` (VEX, restore gate); the hosted rewriter's raw regex (`MAVEN_DEPENDENCY_BLOCK_RE`, `insert_maven_*`), which upstream restore reuses and which masks nothing; vendored `maven_repo.rs` (`comment_spans`/`profiles_spans`, plus a second `declares_modules`); the reactor's `mask` + `Doc` tree and, in the same file, `scan_pom_project` (a depscan port); and the crawler's and `vex/product.rs`'s own readers. None of the three writers (hosted, restore, vendored single-pom) locates elements through a reader. Target: one masked element tree in `formats::maven` that readers and splicing writers both query. {{E10}}
