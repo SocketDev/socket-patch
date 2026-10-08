@@ -78,6 +78,7 @@ run `socket-patch apply` once after migration to confirm the manifest still appl
 | `get --no-apply` | `get --save-only` (`SOCKET_SAVE_ONLY` is unchanged) |
 | `socket-patch download` | `socket-patch get` |
 | `socket-patch gc` | `socket-patch repair` |
+| `SOCKET_FORCE` | Pass `--force` to the one command that needs it (`apply`, `vendor`, `--update`); the variable is now ignored |
 
 A removed spelling is a usage error (exit 2). `scan --sync` stays as the
 shorthand for `scan --mode agent --prune`.

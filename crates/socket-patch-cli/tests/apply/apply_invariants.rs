@@ -15,14 +15,12 @@
 //! crawler won't match, which trips the "no packages found / offline"
 //! branches and exercises the invariants without needing a real fixture.
 
+use crate::common::{binary, git_sha256};
+
 use std::path::{Path, PathBuf};
 use std::process::Command;
 
 use sha2::{Digest, Sha256};
-
-fn binary() -> PathBuf {
-    env!("CARGO_BIN_EXE_socket-patch").into()
-}
 
 /// Minimal manifest with one synthetic patch entry. The PURL points at a
 /// package that won't be found on disk; the `afterHash` blob is missing
@@ -150,17 +148,6 @@ fn assert_summary_all_zero(summary: &serde_json::Value) {
 const SCOPED_NPM_PURL: &str = "pkg:npm/scopedpkg@1.0.0";
 const SCOPED_ORIGINAL: &[u8] = b"module.exports = function vulnerable() { return 'pwn'; };\n";
 const SCOPED_PATCHED: &[u8] = b"module.exports = function safe() { return 'ok'; };\n";
-
-/// Git SHA-256: `SHA256("blob <len>\0" ++ content)`. Computed
-/// independently here so the manifest hashes are NOT derived from the
-/// code under test (no circular oracle).
-fn git_sha256(content: &[u8]) -> String {
-    let header = format!("blob {}\0", content.len());
-    let mut hasher = Sha256::new();
-    hasher.update(header.as_bytes());
-    hasher.update(content);
-    hex::encode(hasher.finalize())
-}
 
 /// Lay down a project with TWO manifest patches:
 ///   - an npm patch that is fully applicable offline (package installed,

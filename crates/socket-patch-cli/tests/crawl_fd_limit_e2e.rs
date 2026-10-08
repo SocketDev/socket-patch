@@ -19,14 +19,14 @@
 //! ceiling — see the `walk_pool` module docs.
 #![cfg(unix)]
 
-use std::path::{Path, PathBuf};
+#[path = "common/mod.rs"]
+mod common;
+use common::binary;
+
+use std::path::Path;
 use std::process::{Command, Output};
 
 use serde_json::Value;
-
-fn binary() -> PathBuf {
-    env!("CARGO_BIN_EXE_socket-patch").into()
-}
 
 fn write_package(dir: &Path, name: &str, version: &str) {
     std::fs::create_dir_all(dir).unwrap();

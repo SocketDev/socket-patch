@@ -45,6 +45,10 @@
 //! `scripts/yarn-berry-vex-matrix.sh`); `SOCKET_PATCH_YARN_E2E_REQUIRED=1`
 //! turns every soft-skip into a failure.
 
+#[path = "common/mod.rs"]
+mod common;
+use common::binary;
+
 use std::path::{Path, PathBuf};
 use std::process::{Command, Output, Stdio};
 
@@ -87,10 +91,6 @@ macro_rules! skip {
 }
 
 // ── self-contained helpers ────────────────────────────────────────────
-
-fn binary() -> PathBuf {
-    PathBuf::from(env!("CARGO_BIN_EXE_socket-patch"))
-}
 
 /// Probe corepack from a NEUTRAL temp dir: a `packageManager` field in an
 /// ancestor `package.json` (e.g. this monorepo's root) makes corepack refuse

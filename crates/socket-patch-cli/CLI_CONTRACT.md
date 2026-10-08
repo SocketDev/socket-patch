@@ -84,9 +84,9 @@ Beyond the globals above, each subcommand defines a small set of local arguments
 
 | Subcommand | Local arg | Env var | Purpose |
 |---|---|---|---|
-| `apply` | `--force` / `-f` | `SOCKET_FORCE` | Bypass beforeHash check |
+| `apply` | `--force` / `-f` | — | Bypass beforeHash check |
 | `apply` | `--check` | — | Read-only audit that every in-scope (`--ecosystems`) manifest patch is in place, for CI / GitHub-App auditing (v5.0: previously Go-only, which passed on any unpatched non-Go tree). Local Go patches: the committed `.socket/go-patches/` copies and `go.mod` `replace` directives match the manifest (`go_redirect_drift`). Every other patch: each installed copy hashes to the record's `afterHash` — the `vex` verifier over the `vex` copy lookup; the copies are narrowed by `apply`'s own rules: a release variant (a qualified purl such as `?artifact_id=` / `?platform=`) is judged only on the copies holding its distribution, matched against every variant of its base as `apply` matches them, and an installed copy that holds none of them is drift of the base purl (`no_matching_variant`, the copy `apply` fails with "no matching variant found"; a Gradle / Ivy cache dir is exempt, as in `apply`); for gem, once a bundle-store copy exists the `gem env` fallback-home copies are not judged (`apply` treats them as best-effort). Drift is a `failed` event per patch with `errorCode` `not_applied` (still unpatched), `hash_mismatch` (neither the original nor the patched bytes), `file_not_found` or `no_matching_variant`, status `partialFailure`, exit 1, and the human `Error: Patches are OUT OF SYNC:` report (printed even under `--silent`). In sync is exit 0: `Patches are in sync (N checked).` and, under `--json`, a `skipped` event per verified patch (`errorCode: already_patched`). A patch with no installed copy is skipped as `apply` skips it (`package_not_installed`; the human line adds `M not installed, skipped`). Vendor-owned patches are excluded (`vendor --check` audits them). Lock-free, fetch-free, offline-safe; it never writes. An unreadable manifest is drift (`manifest_unreadable`, exit 1) |
-| `vendor` | `--force` / `-f` | `SOCKET_FORCE` | Tolerate missing patch-target files in the stage + bypass the variant probe. A beforeHash mismatch no longer needs it: vendor staging auto-overwrites with the verified patched content (`vendor_content_mismatch_overwritten` warning) |
+| `vendor` | `--force` / `-f` | — | Tolerate missing patch-target files in the stage + bypass the variant probe. A beforeHash mismatch no longer needs it: vendor staging auto-overwrites with the verified patched content (`vendor_content_mismatch_overwritten` warning) |
 | `vendor` | `--revert` | `SOCKET_VENDOR_REVERT` | Undo vendoring: restore recorded original lockfile fragments + remove `.socket/vendor/` artifacts. Works without a manifest. A package vendored over a hosted pin returns to its upstream registry entry, never to hosted (see "Takeover reconciliation") |
 | `vendor` | `--check` | — | Offline, read-only artifact and wiring audit; exits 1 on drift. Conflicts with `--revert`. |
 | `vendor` | `--local-repo <path>` | — | With `--check`, also inspect suffixed Maven jar/POM copies in this cache for conflicts. |
@@ -981,7 +981,7 @@ Synopsis and behavior:
 |---|---|
 | `--update` | Resolve the latest release; install it if newer than the running version. Already-newest (including a dev build newer than any release): informational no-op, exit 0. `latest` never downgrades. |
 | `--update 3.4.0` | Install exactly that version, **up or down** — an explicit pin is explicit intent, no `--force` needed. Pin == current: no-op, exit 0. The inline `--update=3.4.0` spelling is equivalent. Also settable via `SOCKET_PATCH_VERSION` (the same pin env `install.sh` honors); a malformed version is a usage error (exit 2). |
-| `--update --force` | Reinstall/downgrade even when already at the target version, and proceed past a managed-install refusal (with a warning that the owning manager's next upgrade will overwrite the binary). Env: `SOCKET_FORCE`. |
+| `--update --force` | Reinstall/downgrade even when already at the target version, and proceed past a managed-install refusal (with a warning that the owning manager's next upgrade will overwrite the binary). Flag only (no env var). |
 | `--update --dry-run` | **Check-only**: one metadata request, zero downloads, zero mutation, exit 0 — and always the `verified`/`update_check` event shape, whether or not an update exists. `--json` details carry `{current, latest, updateAvailable, target, asset, path}` — the cheap scriptable "is an update available" probe. |
 | `--update --offline` | Refused up front (strict airgap, before any client exists), exit 1. `--force` does **not** bypass it. |
 
@@ -1029,7 +1029,7 @@ State lives at `$XDG_CACHE_HOME`|`~/.cache` (Unix/macOS) or `%LOCALAPPDATA%` (Wi
 
 ## Environment variables
 
-Public configuration uses the `SOCKET_*` names below. The three deprecated v3/v4 environment aliases were removed in v5; see [Removed env vars](#removed-env-vars).
+Public configuration uses the `SOCKET_*` names below. The three deprecated v3/v4 environment aliases and `SOCKET_FORCE` were removed in v5; see [Removed env vars](#removed-env-vars).
 
 Four `SOCKET_CLI_*` names from the sibling JS Socket CLI are additionally accepted as **peer aliases** (supported, not deprecated — no warning): `SOCKET_CLI_API_TOKEN` → `SOCKET_API_TOKEN`, `SOCKET_CLI_ORG_SLUG` → `SOCKET_ORG_SLUG`, `SOCKET_CLI_API_BASE_URL` → `SOCKET_API_URL`, `SOCKET_CLI_NO_API_TOKEN` → `SOCKET_NO_API_TOKEN`. The canonical `SOCKET_*` name always wins when both are set; promotion is silent and happens in-process before clap parses. Other socket-cli names (`SOCKET_CLI_CONFIG`, `SOCKET_CLI_API_PROXY`, `SOCKET_CLI_DEBUG`) are deliberately **not** honored.
 
@@ -1063,7 +1063,6 @@ Empty string means unset at every layer: exported-but-empty flag-bound vars are 
 | `SOCKET_NO_TRUST_LOCKFILE_CONFIG` | `--no-trust-lockfile-config` | `false` | Hosted mode: skip the `trustLockfile: true` write to `pnpm-workspace.yaml`. |
 | `SOCKET_NO_NPM_ALLOW_REMOTE_CONFIG` | `--no-npm-allow-remote-config` | `false` | Hosted mode: skip the `allow-remote=all` write to the project `.npmrc`. |
 | `SOCKET_NO_VLT_INSTALL_CLEANUP` | `--no-vlt-install-cleanup` | `false` | Hosted mode, `rollback`, `remove`: keep stale vlt installed copies. |
-| `SOCKET_FORCE` | `apply --force` / `-f`, `vendor --force` / `-f`, `--update --force` | `false` | Local to `apply`, `vendor` and `--update`. |
 | `SOCKET_PATCH_VERSION` | `--update <VERSION>` | (latest) | Local to `--update`; the same pin `install.sh` honors. |
 | `SOCKET_BATCH_SIZE` | `scan --batch-size` | `500` authenticated / `100` proxy | Local to `scan`. |
 | `SOCKET_MAX_NEW_PATCHES` | `scan --max-new-patches` | (unlimited) | Local to `scan` (v5.0): a count or `none`; empty is unset, malformed exits 2. |
@@ -1147,6 +1146,8 @@ These exist for mirrors and testing. They are **internal**: names, semantics, an
 ### Removed env vars
 
 The v3.0 legacy names `SOCKET_PATCH_PROXY_URL`, `SOCKET_PATCH_DEBUG` and `SOCKET_PATCH_TELEMETRY_DISABLED` were removed in v5.0 and are ignored; use `SOCKET_PROXY_URL`, `SOCKET_DEBUG` and `SOCKET_TELEMETRY_DISABLED`.
+
+`SOCKET_FORCE` was removed in v5.0 and is ignored without a warning (#615). `apply --force`, `vendor --force` and `--update --force` are flag-only: exporting the variable for one command no longer weakens the checks of the others. A stale export now leaves the beforeHash check and the managed-install refusal on.
 
 ## CSV value parsing
 

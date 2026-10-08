@@ -1,9 +1,10 @@
 //! Service vendoring of portable gems without a local install or registry fetch.
 
-use std::path::{Path, PathBuf};
+use crate::common::{binary, git_sha256};
+
+use std::path::Path;
 use std::process::Command;
 
-use sha2::{Digest, Sha256};
 use wiremock::matchers::{method, path as wm_path};
 use wiremock::{Mock, MockServer, ResponseTemplate};
 
@@ -16,17 +17,6 @@ const UUID: &str = "11111111-1111-4111-8111-111111111111";
 const LIB: &str = "lib/socketfixturegem.rb";
 const PRISTINE: &[u8] = b"module SocketFixtureGem; VERSION = '1.0.0'; end\n";
 const PATCHED: &[u8] = b"module SocketFixtureGem; VERSION = '1.0.0'; SAFE = true; end\n";
-
-fn binary() -> PathBuf {
-    env!("CARGO_BIN_EXE_socket-patch").into()
-}
-
-fn git_sha256(content: &[u8]) -> String {
-    let mut hasher = Sha256::new();
-    hasher.update(format!("blob {}\0", content.len()).as_bytes());
-    hasher.update(content);
-    hex::encode(hasher.finalize())
-}
 
 /// A minimal `.gem`: an uncompressed tar whose only entry the fetcher reads
 /// is `data.tar.gz`, itself a gzipped tar of the gem's files at the root.
