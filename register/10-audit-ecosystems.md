@@ -55,7 +55,7 @@ _Last updated 2026-10-08T13:00Z · main @ e2d9633_
 | E53 | 2 | Vendored pnpm wrote the root `package.json` with `serialize_json` (lost CRLF, refused BOM). | new finding | #662 | fixed (#810) |
 | E54 | 3 | Poetry and PDM lock rewriters restored line endings with two rules. | new finding | #695 | fixed (#703) |
 | E56 | 2 | Lock inventory read only `Gemfile.lock`, so a `gems.rb` project's `gems.locked` was invisible. | new finding | #736 | fixed (#750) |
-| E58 | 3 | Production `pub fn`s with no production caller, orphaned by #277 (`committed_artifact_intact`, `go_sum_edit::remove_lines`, hosted-vlt ledger helpers, three test-only helpers). | new finding; 3.6 | #782 | filed #782 |
+| E58 | 3 | Production `pub fn`s with no production caller, orphaned by #277 (`committed_artifact_intact`, `go_sum_edit::remove_lines`, hosted-vlt ledger helpers, three test-only helpers). | new finding; 3.6 | #782 | in PR #1141 (slice 1: hosted-vlt ledger helpers, `read_project_file` gated; `committed_artifact_intact`, `remove_lines`, `seed_rubygems_sha256`, `copy_manifest_tag` remain in open-PR files) |
 | E59 | 2 | Vendored gem `edit_lock` searched only the first `GEM` section. | new finding | #779 | fixed (#805) |
 | E61 | 2 | The vendored-reference scan never saw NuGet, Maven or `hatch.toml` wiring, so the orphan sweep could delete a still-wired feed, repository or wheel (merged E67). | new finding | #832, #958 | fixed (#1015) |
 | E63 | 2 | Hosted Maven splices the API `maven_suffixed_version` into `pom.xml` unchecked, while hosted Gradle refuses a malformed suffix; four suffix builders (executed twice). | new finding | #882 | filed #882 |
