@@ -1,6 +1,6 @@
 [agent] Progress ledger for the scheduled npm bug-hunt routine (label pm:npm).
 
-Last updated: 2026-10-07T18Z (run 29 with a ledger), main `05ecc6e` (27 commits past `859a279`, including #901 (#884 member refusal), #987 (#852 linked alias), #970 (#900), #934 (#933), #940 and #1015), latest release v4.0.0 (previous v3.3.0, both from npm `@socketsecurity/socket-patch`). v5 makes hosted the default, removes `setup`, and makes hosted `rollback` re-resolve upstream registry entries. Cells marked (v4) were last verified on `f6b7fb9`. #432 (closed by #813), #798 (closed by #799), #852 (closed by #987, verified 18Z), #884 (closed by #901; brace/class globs still fail, #1071), #900 (closed by #970) and #933 (closed by #934, verified 18Z) are fixed; their old `fail` marks below are historical. The #688 takeover half is fixed by #963; its refusal half is still open.
+Last updated: 2026-10-08T00Z (run 30 with a ledger; main unchanged since run 29), main `05ecc6e` (27 commits past `859a279`, including #901 (#884 member refusal), #987 (#852 linked alias), #970 (#900), #934 (#933), #940 and #1015), latest release v4.0.0 (previous v3.3.0, both from npm `@socketsecurity/socket-patch`). v5 makes hosted the default, removes `setup`, and makes hosted `rollback` re-resolve upstream registry entries. Cells marked (v4) were last verified on `f6b7fb9`. #432 (closed by #813), #798 (closed by #799), #852 (closed by #987, verified 18Z), #884 (closed by #901; brace/class globs still fail, #1071), #900 (closed by #970) and #933 (closed by #934, verified 18Z) are fixed; their old `fail` marks below are historical. The #688 takeover half is fixed by #963; its refusal half is still open.
 
 ## Coverage matrix
 
@@ -21,6 +21,11 @@ Cells are "pass", "fail #N" or "untested". Every cell uses a real npm install. H
 | Windows | 10.9.7 | pass: linked `.store` apply/vex/rollback (main). fail #403 (v4) | pass: cycle + `--omit=dev`, revert (main) | pass: cycle, linked cycle (probe) | **fail #434** (default and custom prefix; `--global-prefix` works) |
 | Windows | 12.1.0 / 12.2.0 | pass: linked `.store` apply/vex/rollback (main). fail #356, #403 (v4) | pass: cycle + `--omit=dev`, revert (main) | pass: cycle, linked cycle (probe) | **fail #434** |
 | Windows 2022 | 10.9.7 / 12.2.0 | pass: linked `.store` apply/vex/rollback (main) | pass: cycle + `--omit=dev`, revert (main) | pass: linked cycle (probe) | **fail #434** |
+
+## Workspace member with a stray own lock (#1094) (2026-10-08T00Z, main `05ecc6e`)
+
+- A workspace member that has its own (stray) `package-lock.json`: hosted `scan` / `get <uuid>` and vendored `scan` from the member rewrite that ignored lock and exit 0 with `success`, root `npm ci` installs unpatched, and `vex` from the member attests `not_affected`. **fail #1094** on Linux npm 7.24.2 / 8.19.4 / 10.9.4 / 12.2.0 (hosted ×2 each; `get` and vendored on 10.9.4). v4.0.0 behaves the same (not a regression).
+- `["!packages/b", "packages/*"]`: npm excludes `b`, and a scan from `b` pins nothing (correct): pass.
 
 ## Workspace glob refusal gap (#1071) and lost-ledger remedy loop (#1072) (2026-10-07T18Z, main `05ecc6e`)
 
@@ -110,6 +115,7 @@ The same `name@version` gets a new patch UUID with different bytes. Mock: left-p
 
 ## Backlog
 
+- **New 2026-10-08T00Z:** #1094 on yarn / Bun workspaces (same `has_own_npm_family_lock` early exit; hand over if confirmed), a stray member `npm-shrinkwrap.json`, `rollback` / `remove` from the member; case-insensitive workspace globs on macOS / Windows (probe branch).
 - **New 2026-10-07T18Z:** #1071 on yarn / Bun roots (shared matcher; hand over if not covered), `!` negation order and `./` patterns vs real npm; re-check #325 / #433 / #490 / #665 on `05ecc6e`. (#1005 on a `scan --mode vendored` partial takeover: done 18Z, pass.)
 - **New 2026-10-07T12Z:** #1005 on `scan --mode vendored` partial takeovers (does the human summary match disk?); #1004 siblings (other nested-apply warnings dropped from `scan --json`: `package_not_installed` next to a success, sidecar advisories); re-check #325 / #433 / #490 / #665 on `859a279`. (#852 scoped alias confirmed and commented; #688 takeover half verified fixed; #828 still reproduces on `859a279`.)
 - **New 2026-10-07T00Z:** #969 follow-ups (hosted→vendored takeover under `allow-file=root`; user / global `.npmrc` layers; a workspace member's vendored deps under `root`; `allow-directory` with `file:` directory deps).
@@ -148,6 +154,8 @@ The same `name@version` gets a new patch UUID with different bytes. Mock: left-p
 
 ## Known non-bugs
 
+- A `workspaces` negation listed before the positive pattern (`["!packages/b", "packages/*"]`): npm excludes `b`, and a hosted scan from `b` pins nothing because `b` is its own project (npm 10.9.4, 2026-10-08T00Z).
+- pnpm handover #1074's npm analogue (`package-lock=false`): `npm ci` still honors the lock, so a lock-only attestation matches `npm ci`, and `vex` refuses after a plain `npm install` (see the entry below; re-reviewed 2026-10-08T00Z).
 - An `.npmrc` that ends inside an ini `[section]`: hosted inserts `allow-remote=all` before the first section, and an `allow-remote` that sits only inside a section is (correctly) not treated as set (npm 12.2.0, 2026-10-07T18Z).
 - A lost `.socket/vendor/state.json` with the lock still wired: every command keeps the artifacts and `npm ci` stays patched (fail-safe). Only the `vendor --revert` remedy text is wrong (#1072).
 - The eject `vendor --dry-run` reports `eject_planned` (exit 0) even when the wet eject will refuse a pin. CLI_CONTRACT eject step (3) says the dry run stops at the restore plan. The `scan` / `get --mode vendored --dry-run` takeover preview listing `would_vendor` is documented too ("does not model the takeover yet"). (2026-10-07T12Z)
