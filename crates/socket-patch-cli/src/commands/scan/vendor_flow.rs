@@ -28,8 +28,10 @@ use std::path::Path;
 use std::time::Duration;
 
 use crate::args::GlobalArgs;
+use crate::commands::agent_download::{
+    download_patch_records_reusing, DetachedDownload, DownloadParams,
+};
 use crate::commands::bun_preflight::bun_vendor_preflight_with_ledger;
-use crate::commands::get::{download_patch_records_reusing, DetachedDownload, DownloadParams};
 use crate::commands::lock_cli::lock_failure;
 use crate::commands::vendor::{
     note_classic_migration_risk, symlinked_wiring_warnings, track_outcomes_for_vendor,
@@ -196,7 +198,7 @@ pub(super) async fn preflight_refused_purls(
     let vlt_refusals =
         vlt_vendor_preflight_selected(cwd, selected, state.as_ref().map(|s| &s.entries)).await;
     let npm_lock_refusal = npm_lock_refusal(cwd, selected).await;
-    let origins = crate::commands::rollback::patch_server_origins(common);
+    let origins = crate::commands::hosted_unwind::patch_server_origins(common);
     let pnpm_refusals =
         hosted_pnpm_refusals(cwd, selected, &origins, &state.unwrap_or_default()).await;
     let gem_refusals = crate::commands::vendor::gem_takeover_preview_refusals(
@@ -233,7 +235,7 @@ async fn npm_lock_refusal(
 
 /// The lock-text refusals a hosted → vendored takeover of `selected` meets
 /// in a pnpm project (#853), keyed by the selected purl: each npm purl the
-/// lockfiles pin hosted (see [`crate::commands::get::hosted_claimed_purls`])
+/// lockfiles pin hosted (see [`crate::commands::agent_download::hosted_claimed_purls`])
 /// and the ledger does not already hold at this uuid, refused by the pnpm
 /// backend on the project's lock and manifest text
 /// ([`socket_patch_core::vendor::pnpm_takeover_lock_text_refusals`]). The
@@ -254,7 +256,8 @@ async fn hosted_pnpm_refusals(
     {
         return HashMap::new();
     }
-    let claimed = crate::commands::get::hosted_claimed_purls(cwd, origins.to_vec()).await;
+    let claimed =
+        crate::commands::agent_download::hosted_claimed_purls(cwd, origins.to_vec()).await;
     let candidates: Vec<(&str, &str)> = selected
         .iter()
         .filter(npm)
@@ -640,7 +643,7 @@ async fn run_vendor_json_path(
     // The planning pass: a patch the preflight refuses holds no slot (it
     // still reaches the engine, which reports the refusal).
     let writers = writers_of(&rows);
-    let origins = crate::commands::rollback::patch_server_origins(&args.common);
+    let origins = crate::commands::hosted_unwind::patch_server_origins(&args.common);
     let refused = preflight_refused_purls(&args.common, &writers).await;
     stage.plan(&rows, |r| !refused.contains(&r.writer.purl));
     let deferred = stage.deferred_keys();
@@ -867,11 +870,7 @@ fn format_nothing_vendored(download_failed: u64) -> String {
 /// step: `Error (<code>): <Message>.`. The code and message are the ones
 /// the JSON envelope carries.
 pub(crate) fn format_vendor_step_error(code: &str, message: &str) -> String {
-    let mut chars = message.trim_end_matches('.').chars();
-    let message: String = match chars.next() {
-        Some(first) => first.to_uppercase().chain(chars).collect(),
-        None => String::new(),
-    };
+    let message = crate::ui::sentence_case(message.trim_end_matches('.'));
     let mut out = if message.is_empty() {
         format!("Error ({code}).")
     } else {

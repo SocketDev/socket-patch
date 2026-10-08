@@ -15,8 +15,12 @@
 //! cargo test -p socket-patch-cli --test e2e_golang
 //! ```
 
+#[path = "common/mod.rs"]
+mod common;
+use common::binary;
+
 use std::collections::BTreeSet;
-use std::path::{Path, PathBuf};
+use std::path::Path;
 use std::process::Output;
 
 use wiremock::matchers::{method, path};
@@ -29,10 +33,6 @@ use wiremock::{Mock, MockServer, ResponseTemplate};
 /// Org slug pinned via `SOCKET_ORG_SLUG` so the authenticated batch endpoint
 /// resolves to a fixed path and no `/v0/organizations` lookup is needed.
 const ORG: &str = "testorg";
-
-fn binary() -> PathBuf {
-    env!("CARGO_BIN_EXE_socket-patch").into()
-}
 
 /// Mount a batch endpoint that returns "no patches" (200, empty `packages`).
 ///

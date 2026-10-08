@@ -18,6 +18,10 @@
 //! with `SOCKET_PATCH_GRADLE_E2E_REQUIRED` (`gradle_build_common`). Maven
 //! for #395 via `SOCKET_PATCH_MAVEN_E2E_{MVN,VERSION,REQUIRED}`.
 
+#[path = "common/mod.rs"]
+mod common;
+use common::{binary, git_sha256};
+
 #[path = "common/hermetic.rs"]
 mod hermetic;
 #[path = "prebuilt_common/mod.rs"]
@@ -48,14 +52,6 @@ use jvm_fixture_repo::{
 const UUID: &str = "1d3c1fd2-7b4e-4c1a-9f0e-2a3b4c5d6e7f";
 const UUID_2: &str = "9a8b7c6d-7b4e-4c1a-9f0e-2a3b4c5d6e7f";
 const DEP: &str = "com.socketfixture:victim:1.10.0";
-
-fn binary() -> PathBuf {
-    env!("CARGO_BIN_EXE_socket-patch").into()
-}
-
-fn git_sha256(bytes: &[u8]) -> String {
-    socket_patch_core::hash::git_sha256::compute_git_sha256_from_bytes(bytes)
-}
 
 /// `Victim.class` in `state` (`pristine` upstream, `patched` vendored).
 fn victim_member(state: &str) -> Vec<u8> {

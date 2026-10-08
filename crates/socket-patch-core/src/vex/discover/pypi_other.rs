@@ -234,6 +234,9 @@ async fn extract_requirements(ctx: &DiscoverCtx<'_>, out: &mut Discovery) {
         }
     };
     for file in files.iter().take(MAX_REQUIREMENTS_FILES) {
+        // pip installs the root and every include it reaches as ONE
+        // requirement set, so they contest other locks as one (#1086).
+        out.install_tree(file, ROOT_REQUIREMENTS);
         let Some(text) = ctx.read_text(file, out).await else {
             continue;
         };

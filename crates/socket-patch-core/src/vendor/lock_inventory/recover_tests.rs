@@ -661,3 +661,91 @@ async fn recover_present_but_invalid_npm_fragments_fail_closed() {
         "every invalid fragment must fall through to the fail-closed error: {err}"
     );
 }
+
+/// #1079 repro: a uv unit whose pure wheel carries no hash, followed by a
+/// hashed platform wheel. The old string scanner paired the pure wheel's
+/// URL with the NEXT wheel's digest; recovery must instead report that no
+/// hash-pinned pure wheel exists.
+#[tokio::test]
+async fn recover_uv_never_pairs_a_pure_wheel_with_another_wheels_hash() {
+    let tmp = tempfile::tempdir().unwrap();
+    let unit = format!(
+        "[[package]]\nname = \"six\"\nversion = \"1.16.0\"\nsource = {{ registry = \"https://pypi.org/simple\" }}\nwheels = [\n    {{ url = \"https://files.example/six-1.16.0-py3-none-any.whl\" }},\n    {{ url = \"https://files.example/six-1.16.0-cp312-cp312-manylinux_2_17_x86_64.whl\", hash = \"sha256:{}\" }},\n]\n",
+        "b".repeat(64)
+    );
+    assert_eq!(pure_wheel_from_uv_unit(&unit), None);
+    let uv = entry(
+        "pypi",
+        "pkg:pypi/six@1.16.0",
+        vec![rec("uv_lock_package", serde_json::json!(unit))],
+    );
+    let err = recover_lock_entry(tmp.path(), &uv).await.unwrap_err();
+    assert!(err.contains("no fetchable registry URL"), "{err}");
+}
+
+/// Recovery's pure-wheel pick agrees with the shared classifier that
+/// vendored (`vendor_platform_locked`) and hosted
+/// (`redirect_pypi_platform_wheel`) mode use, on every wheel tag where the
+/// old `-none-any.whl` suffix rule disagreed with it or could misread the
+/// URL. Each row runs through a uv `wheels` unit and a pdm `files` unit.
+#[test]
+fn recovery_pure_wheel_matches_the_shared_portability_rule() {
+    let sha = "a".repeat(64);
+    let rows: &[(&str, bool)] = &[
+        ("https://h/x-1.0-py3-none-any.whl", true),
+        ("https://h/x-1.0-py2.py3-none-any.whl", true),
+        ("https://h/x-1.0-py310-none-any.whl", true),
+        ("https://h/x-1.0-1-py3-none-any.whl", true),
+        // Interpreter-bound / Python 2-only: non-portable since #1048.
+        ("https://h/x-1.0-cp311-none-any.whl", false),
+        ("https://h/x-1.0-pp310-none-any.whl", false),
+        ("https://h/x-1.0-py2-none-any.whl", false),
+        ("https://h/x-1.0-cp38-abi3-manylinux_2_17_x86_64.whl", false),
+        // Query / fragment are stripped before classifying; the recorded
+        // URL is kept whole.
+        ("https://h/x-1.0-py3-none-any.whl#sha256=abc", true),
+        ("https://h/x-1.0-py3-none-any.whl?raw=1", true),
+        ("https://h/x-1.0.tar.gz", false),
+    ];
+    for (url, portable) in rows {
+        let file = url
+            .split(['?', '#'])
+            .next()
+            .unwrap()
+            .rsplit('/')
+            .next()
+            .unwrap();
+        let shared = file.ends_with(".whl")
+            && !crate::vendor::pypi_distribution::wheel_platform_from_filename(file).0;
+        assert_eq!(shared, *portable, "shared classifier on {url}");
+        for key in ["wheels", "files"] {
+            let unit = format!(
+                "[[package]]\nname = \"x\"\nversion = \"1.0\"\n{key} = [\n    {{ url = \"{url}\", hash = \"sha256:{sha}\" }},\n]\n"
+            );
+            let want = portable.then(|| (url.to_string(), sha.clone()));
+            assert_eq!(pure_wheel_from_uv_unit(&unit), want, "{key}: {url}");
+        }
+    }
+}
+
+/// Every artifact keeps its own hash: the first portable PINNED wheel
+/// wins even when an unpinned portable wheel comes first, an uppercase
+/// digest is lowercased, and a unit that is not TOML (a bare
+/// `requirements_line`) recovers nothing.
+#[test]
+fn recovery_pure_wheel_pairs_each_url_with_its_own_hash() {
+    let upper = "C".repeat(64);
+    let unit = format!(
+        "[[package]]\nname = \"six\"\nversion = \"1.16.0\"\nsdist = {{ url = \"https://h/six-1.16.0.tar.gz\", hash = \"sha256:{}\" }}\nwheels = [\n    {{ url = \"https://h/six-1.16.0-py3-none-any.whl\" }},\n    {{ url = \"https://h/six-1.16.0-py2.py3-none-any.whl\", hash = \"sha256:{upper}\" }},\n]\n\n[package.metadata]\nrequires-dist = [{{ name = \"a\" }}]\n",
+        "d".repeat(64)
+    );
+    assert_eq!(
+        pure_wheel_from_uv_unit(&unit),
+        Some((
+            "https://h/six-1.16.0-py2.py3-none-any.whl".to_string(),
+            "c".repeat(64)
+        ))
+    );
+    let line = format!("six==1.16.0 --hash=sha256:{}", "a".repeat(64));
+    assert_eq!(pure_wheel_from_uv_unit(&line), None);
+}

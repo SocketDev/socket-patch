@@ -77,7 +77,6 @@ pub struct VendorArgs {
     #[arg(
         short = 'f',
         long,
-        env = "SOCKET_FORCE",
         default_value_t = false,
         value_parser = crate::args::parse_bool_flag,
     )]
@@ -1325,7 +1324,7 @@ pub(crate) async fn gem_takeover_preview_refusals<'a>(
         gems.into_iter(),
         &pins,
         common.offline,
-        crate::commands::rollback::patch_server_origins(common),
+        crate::commands::hosted_unwind::patch_server_origins(common),
     )
     .await
 }
@@ -1634,7 +1633,8 @@ async fn run_eject(args: &VendorArgs, pins: Vec<HostedPin>) -> i32 {
         };
         match view {
             Ok(Some(patch)) => {
-                let (_, record) = crate::commands::get::record_from_patch_response(&patch);
+                let (_, record) =
+                    socket_patch_core::manifest::records::record_from_patch_response(&patch);
                 records.insert(pin.purl.clone(), record);
             }
             Ok(None) => fetch_failures.push((
@@ -1681,7 +1681,7 @@ async fn run_eject(args: &VendorArgs, pins: Vec<HostedPin>) -> i32 {
     // Plan the upstream restore before touching anything: every pin must
     // re-resolve to its registry entry (a dry resolve), or the eject is
     // refused whole with each pin's remedy.
-    let origins = crate::commands::rollback::patch_server_origins(common);
+    let origins = crate::commands::hosted_unwind::patch_server_origins(common);
     let plan = socket_patch_core::patch::redirect::upstream::restore_upstream(
         &common.cwd,
         &pins,
@@ -1832,10 +1832,7 @@ async fn run_eject(args: &VendorArgs, pins: Vec<HostedPin>) -> i32 {
     if let Some(why) = restore_failure {
         env.mark_error(EnvelopeError::new("redirect_revert_failed", why.clone()));
         if !common.json {
-            eprintln!(
-                "Error: {}",
-                crate::commands::rollback::capitalize_first(&why)
-            );
+            eprintln!("Error: {}", crate::ui::sentence_case(&why));
         }
         exit = 1;
     } else {
@@ -2938,7 +2935,7 @@ pub(crate) async fn vendor_records_reusing(
             // once it does (see `TakeoverUndo`).
             let mut takeover_undo: Option<TakeoverUndo> = None;
             if let Some(pin) = hosted_pin_of(candidate) {
-                let origins = crate::commands::rollback::patch_server_origins(common);
+                let origins = crate::commands::hosted_unwind::patch_server_origins(common);
                 let restore_opts = socket_patch_core::patch::redirect::upstream::RestoreOptions {
                     dry_run: common.dry_run,
                     offline: common.offline,
@@ -3441,9 +3438,9 @@ pub(crate) async fn vendor_records_reusing(
             // restored registry pin.
             if let Some(targets) = vlt_takeover_targets.remove(candidate) {
                 let detail = if vendored {
-                    crate::commands::scan::vlt_takeover_heal(common, &targets).await
+                    crate::commands::vlt_heal::takeover_heal(common, &targets).await
                 } else {
-                    crate::commands::scan::vlt_rollback_heal(common, &targets)
+                    crate::commands::vlt_heal::rollback_heal(common, &targets)
                         .await
                         .into_iter()
                         .map(|(_, detail)| detail)
@@ -4024,7 +4021,7 @@ async fn run_revert(args: &VendorArgs, env: &mut Envelope) -> i32 {
                 .filter(|pin| reverted.contains(&PurlKey::new(&pin.purl)))
                 .collect();
         if !rehosted.is_empty() {
-            let leg = crate::commands::rollback::run_hosted_leg(common, &rehosted).await;
+            let leg = crate::commands::hosted_unwind::run_hosted_leg(common, &rehosted).await;
             for purl in &leg.reverted {
                 record_warning(
                     env,

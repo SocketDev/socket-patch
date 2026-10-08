@@ -27,6 +27,10 @@
 
 #![cfg_attr(windows, allow(dead_code, unused_imports))]
 
+#[path = "common/mod.rs"]
+mod common;
+use common::git_sha256;
+
 #[path = "common/hermetic.rs"]
 mod hermetic_spawn;
 #[path = "prebuilt_common/mod.rs"]
@@ -53,10 +57,6 @@ const ROOT_BYTES: &str =
     "// managed by socket-patch\n//> using file .socket/vendor/coursier/socket-patch.scala\n";
 const GUARD_BYTES: &str = "// managed by socket-patch\n//> using repository file://${.}\n";
 const INDEX: &str = ".socket/vendor/coursier-index.tsv";
-
-fn git_sha256(bytes: &[u8]) -> String {
-    socket_patch_core::hash::git_sha256::compute_git_sha256_from_bytes(bytes)
-}
 
 fn purl(name: &str) -> String {
     format!("pkg:maven/org.example/{name}@1.0")

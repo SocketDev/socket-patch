@@ -108,6 +108,17 @@ pub(crate) fn wheel_platform_from_filename(wheel_name: &str) -> (bool, String) {
     }
 }
 
+/// Whether a lock artifact URL (or bare filename) names a wheel every
+/// Python 3 interpreter on every platform installs: `?query` / `#fragment`
+/// stripped, the last path segment a `.whl` that
+/// [`wheel_platform_from_filename`] calls portable. Ledger recovery's pick
+/// of a "pure" wheel, so it agrees with vendored and hosted mode.
+pub(crate) fn is_portable_wheel_url(url: &str) -> bool {
+    let path = url.split(['?', '#']).next().unwrap_or(url);
+    let file = path.rsplit('/').next().unwrap_or(path);
+    file.ends_with(".whl") && !wheel_platform_from_filename(file).0
+}
+
 /// Platform-specific unless every Python 3 interpreter on every platform
 /// installs the wheel: the ABI must be `none`, the platform `any`, and the
 /// python tag set must hold a generic Python 3 tag. pip accepts `py3` and
