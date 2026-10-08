@@ -1297,8 +1297,8 @@ pub async fn vendor_pypi_with_pipenv_version<'a>(
         warnings.push(VendorWarning::new(
             "vendor_platform_locked",
             format!(
-                "the vendored wheel for {canon_name}=={version} is platform-specific \
-                 ({platform_tags_display}); {per_flavor}"
+                "the vendored wheel for {canon_name}=={version} is interpreter- or \
+                 platform-specific ({platform_tags_display}); {per_flavor}"
             ),
         ));
     }
@@ -3557,10 +3557,65 @@ wheels = [
         );
     }
 
+    /// #1048: a pure wheel whose python tag binds one interpreter
+    /// (`cp311-none-any`) installs on CPython 3.11 only, so it gets the same
+    /// `vendor_platform_locked` advisory as an ABI- or platform-tagged one.
+    #[tokio::test]
+    async fn interpreter_bound_tag_sets_platform_locked_and_warns() {
+        let fx = e2e_fixture().await;
+        tokio::fs::write(
+            fx.site_packages.join("six-1.16.0.dist-info/WHEEL"),
+            "Wheel-Version: 1.0\nRoot-Is-Purelib: true\nTag: cp311-none-any\n",
+        )
+        .await
+        .unwrap();
+        let sources = PatchSources::blobs_only(&fx.blobs);
+        let outcome = crate::vendor::test_support::vendor_pypi(
+            "pkg:pypi/six@1.16.0",
+            &fx.site_packages,
+            &fx.root,
+            &fx.record,
+            &sources,
+            "2026-06-09T00:00:00Z",
+            false,
+            false,
+            None,
+        )
+        .await;
+        let VendorOutcome::Done {
+            result,
+            entry,
+            warnings,
+        } = outcome
+        else {
+            panic!("expected Done, got {outcome:?}");
+        };
+        assert!(result.success, "{:?}", result.error);
+        let entry = entry.unwrap();
+        assert!(entry
+            .artifact
+            .path
+            .ends_with("six-1.16.0-cp311-none-any.whl"));
+        assert_eq!(entry.artifact.platform_locked, Some(true));
+        let warning = warnings
+            .iter()
+            .find(|w| w.code == "vendor_platform_locked")
+            .unwrap_or_else(|| panic!("{warnings:?}"));
+        assert!(warning.detail.contains("cp311-none-any"), "{warning:?}");
+    }
+
     #[test]
     fn platform_specific_tag_detection() {
         assert!(!tag_is_platform_specific("py3-none-any"));
-        assert!(!tag_is_platform_specific("cp311-none-any"));
+        assert!(!tag_is_platform_specific("py2.py3-none-any"));
+        assert!(!tag_is_platform_specific("py311-none-any"));
+        assert!(!tag_is_platform_specific("cp311.py3-none-any"));
+        // #1048: pip installs these on one interpreter (or Python 2) only.
+        assert!(tag_is_platform_specific("cp311-none-any"));
+        assert!(tag_is_platform_specific("pp310-none-any"));
+        assert!(tag_is_platform_specific("py2-none-any"));
+        assert!(tag_is_platform_specific("py-none-any"));
+        assert!(tag_is_platform_specific("py3x-none-any"));
         assert!(tag_is_platform_specific(
             "cp311-cp311-manylinux_2_17_x86_64"
         ));
@@ -7229,6 +7284,10 @@ wheels = [
         assert_eq!(
             wheel_platform_from_filename("x-1.0-cp312-cp312-manylinux_2_17_x86_64.whl"),
             (true, "cp312-cp312-manylinux_2_17_x86_64".to_string())
+        );
+        assert_eq!(
+            wheel_platform_from_filename("six-1.16.0-cp311-none-any.whl"),
+            (true, "cp311-none-any".to_string())
         );
         // Short stems fall back closed and surface the stem verbatim.
         assert_eq!(
