@@ -375,6 +375,49 @@ pub fn has_project_direct_references(files: &BTreeMap<String, String>) -> bool {
         })
 }
 
+/// Refuse a project whose Hatch environments use the uv installer
+/// (`installer = "uv"` or a non-empty `uv-path`): uv does not enforce local
+/// wheel fragment hashes, so a vendored wheel needs pip.
+pub fn require_pip_installer(files: &BTreeMap<String, String>) -> Result<(), String> {
+    let mut documents = Vec::new();
+    for file in HATCH_FILES {
+        if let Some(text) = files.get(file) {
+            documents.push(
+                text.parse::<DocumentMut>()
+                    .map_err(|error| format!("{file}: {error}"))?,
+            );
+        }
+    }
+    require_pip_installer_documents(documents.iter())
+}
+
+fn require_pip_installer_documents<'a>(
+    documents: impl Iterator<Item = &'a DocumentMut>,
+) -> Result<(), String> {
+    for document in documents {
+        let hatch = document
+            .get("tool")
+            .and_then(|tool| tool.get("hatch"))
+            .unwrap_or(document.as_item());
+        if hatch
+            .get("envs")
+            .and_then(Item::as_table_like)
+            .is_some_and(|envs| {
+                envs.iter().any(|(_, env)| {
+                    env.get("installer").and_then(Item::as_str) == Some("uv")
+                        || env
+                            .get("uv-path")
+                            .and_then(Item::as_str)
+                            .is_some_and(|path| !path.is_empty())
+                })
+            })
+        {
+            return Err("vendored Hatch wheels require the pip installer: uv does not enforce local wheel fragment hashes".into());
+        }
+    }
+    Ok(())
+}
+
 pub fn plan(
     files: &BTreeMap<String, String>,
     name: &str,
@@ -393,27 +436,7 @@ pub fn plan(
         }
     }
     if url.starts_with("{root:uri}") {
-        for document in documents.values() {
-            let hatch = document
-                .get("tool")
-                .and_then(|tool| tool.get("hatch"))
-                .unwrap_or(document.as_item());
-            if hatch
-                .get("envs")
-                .and_then(Item::as_table_like)
-                .is_some_and(|envs| {
-                    envs.iter().any(|(_, env)| {
-                        env.get("installer").and_then(Item::as_str) == Some("uv")
-                            || env
-                                .get("uv-path")
-                                .and_then(Item::as_str)
-                                .is_some_and(|path| !path.is_empty())
-                    })
-                })
-            {
-                return Err("vendored Hatch wheels require the pip installer: uv does not enforce local wheel fragment hashes".into());
-            }
-        }
+        require_pip_installer_documents(documents.values())?;
     }
     let mut matched = 0;
     let mut project_matched = 0;
@@ -681,6 +704,27 @@ mod tests {
             )
             .unwrap_err()
             .contains("pip installer"));
+        }
+    }
+
+    #[test]
+    fn require_pip_installer_refuses_uv_settings_in_either_file() {
+        for setting in ["installer='uv'", "uv-path='uv'"] {
+            let project = files(&format!("[project]\ndependencies=[\"urllib3==1.26.18\"]\n[tool.hatch.envs.default]\n{setting}\n"));
+            assert!(require_pip_installer(&project)
+                .unwrap_err()
+                .contains("pip installer"));
+            let external = both(
+                "[project]\ndependencies=[\"urllib3==1.26.18\"]",
+                Some(&format!("[envs.default]\n{setting}\n")),
+            );
+            assert!(require_pip_installer(&external)
+                .unwrap_err()
+                .contains("pip installer"));
+        }
+        for allowed in ["installer='pip'", "uv-path=''"] {
+            let project = files(&format!("[project]\ndependencies=[\"urllib3==1.26.18\"]\n[tool.hatch.envs.default]\n{allowed}\n"));
+            assert!(require_pip_installer(&project).is_ok(), "{allowed}");
         }
     }
 
