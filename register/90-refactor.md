@@ -32,13 +32,11 @@ Re-ranked 2026-10-08T11:00Z at `628542d` against the 33 open PRs' 580 files; #82
 **Notes:**
 - E35's crawler oracles (composer/go/nuget/python/maven) can't become `golden.rs` digests: their randomized trees use symlinks (no-ops on Windows), permission modes (ignored as root and on Windows) and case-colliding names (folded on macOS). The outputs therefore differ by OS and by uid, and a golden blessed in the root sandbox would fail on non-root Linux CI. Keep the oracles until a crawler can be checked without one.
 - Test-helper migrations (#824): directory binaries import via `crate::common`; prune the unused imports `--no-run --message-format=short` lists. `spawn_env_hygiene` scans test text, string literals included: never spell a bare binary spawn in a new test file, and run that suite before pushing.
-- zizmor (`Audit GitHub Actions`) fails new PR heads on main's `ci.yml:1400` setup-php `# v2` label until #1118 merges; port its one-line fix.
-- Lead for `audit-ecosystems` (not filed): hosted `redirect/requirements.rs` keeps its own pip lexer beside `utils::requirements` (quote-aware comment finder vs pip's `COMMENT_RE`).
 - Source-scan guards: make new ones one-sided (fail on new files only), so a PR migrating a pending file can't turn `main` red.
 - `toml_edit::Document::parse` costs about 81 µs per real crates.io `Cargo.toml` (release), against 0.5 µs for an early-exit line scanner. Disclose it whenever a hot crawl path moves to `toml_edit`.
 - Equivalence goldens (`tests/equivalence/*.golden`, bless with `SOCKET_PATCH_BLESS_GOLDEN=1`) run one input in five through a mixed-ending generator: any line-ending rule change moves them; prove only mixed cases move before re-blessing.
 - Upstream gem `restore_manifest` pins CRLF output for a CRLF Gemfile with an LF block; migrate it only together with the forward Gemfile writer in `redirect/mod.rs`.
-- `crawlers/python_crawler/pdm_site.rs` is macOS-only; to test it here, temporarily make its `mod` line `#[cfg(unix)] #[allow(dead_code)]` and revert.
+- `pdm_site.rs` is macOS-only; to test it here, make its `mod` line `#[cfg(unix)] #[allow(dead_code)]` and revert.
 - Overlap check: fetch `/pulls/<n>/files` for every open PR and match exact paths (suffix matches on `mod.rs`/`client.rs` are false positives); `comm -23` of `git ls-files` against that set lists the free files.
 - Deleting a refactor oracle: refactor the kept code under the oracle, pin its outputs on odd inputs, then delete it (#1103).
 - The sandbox runs as root, so 4 core lib tests fail on main and on branches alike: `copy_tree::relax_loop_must_not_traverse_symlinked_root`, `vlt_heal::an_unremovable_hidden_lock_keeps_every_store_entry`, `pypi_poetry::wire_write_failure_maps_error_and_leaves_lock_untouched`, `pypi_requirements::wire_failure_rolls_back_already_written_files`.
