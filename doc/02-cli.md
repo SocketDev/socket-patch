@@ -118,9 +118,9 @@ $ socket-patch get nope --offline --json             → {"status":"error","erro
 ```
 
 - `repair`, `remove` and `vex` use the envelope, with an `error` object that carries a stable `code`.
-- `scan`, `get` and `rollback` have no fixed `error` type. `rollback` emits a bare string except for its lock failure, which `acquire_or_emit` writes as a coded envelope (`rollback.rs:1145`); `scan` and `get` each emit a bare string on some paths and a `{code, message}` object on others (scan's embedded-VEX failure, get's vendored failure); `get`'s lock failure adds a sibling `errorCode`. A script must type-check `.error` before reading it. Decided (#704): option 1, every top-level `error` becomes `{code, message}`; fix pending. {{C14}}
+- Every top-level `--json` `error` is a `{code, message}` object (#1027): `scan`, `get` and `rollback` print the minimal `{status: "error", error: {code, message}}` shape through `json_envelope::legacy_error`, and the sibling `errorCode` is gone. A guard test rejects a new string-typed top-level `error`. {{C14}}
 - Codes are free strings, so one condition gets a different code per command: an unparseable `.socket/manifest.json` is `manifest_invalid` (list, remove), `manifest_unreadable` (`apply --check`, `vendor --check`, vex), `apply_failed`, `repair_failed`, the undocumented `invalid_manifest` (vendor) or a bare string (rollback) on `9c43dfc`. {{C13}} The typed-registry plan is. A manifest that exists but can't be stat'd (ENOTDIR, ELOOP, EACCES) is worse: five commands probe with `metadata().is_err()` ahead of `read_manifest`, so `apply`, `apply --check` and `vendor` report `noManifest` and exit 0, and `repair`/`remove`/`rollback` say `manifest_not_found`. {{C56}}
-- Exit-2 usage errors under `--json` have no single channel. `scan`, `remove` and `rollback` print nothing on stdout, as clap does; `get` prints a bare-string object; `vendor`, `repair` and `vex` print a full envelope with a code. The same `--global --mode vendored` refusal gives three different stdouts on `scan`, `get` and `vendor`. Decided (#704): every self-enforced exit 2 prints the coded error on stdout under `--json` through one `usage_error` helper; clap errors stay stdout-free; fix pending. {{C14}}
+- Exit-2 usage errors under `--json` have one channel since #1027: every self-enforced exit 2 prints the coded error on stdout through `json_envelope::usage_error` (an envelope for envelope commands, the legacy shape for `scan`/`get`/`rollback`); clap errors stay stdout-free, and a guard test rejects a bare `return 2;` in `commands/`. {{C14}}
 - Status is `partialFailure` in the envelope but `partial_failure` in the legacy shapes.
 - The paid-plan refusal is documented but not emitted: the contract lists `status: "paidRequired"` and an `errorCode` `paid_required` for get and scan, but `get` writes the legacy `{"status":"paid_required",…}` from two hand-written blocks, `scan` reports only `paidPatches`, and `Status::PaidRequired` is never constructed. {{C54}}
 - `get --mode vendored` nests an `Envelope` inside a legacy object.
@@ -195,7 +195,7 @@ That is **7 verbs instead of 9 visible + 2 hidden + 2 aliases + 3 hidden flag sp
 
 - {{C13}} One corrupt manifest, five `--json` codes: only `list` and `remove` implement the contract's `manifest_invalid`/`manifest_unreadable` split (two hand-written copies); `apply` and `vendor` each disagree with their own `--check` path. Child 1 of the typed-code tracking issue ().
 
-- {{C14}} Usage errors (exit 2) choose their own `--json` channel per site: 4 of the ~17 `return 2` sites in `commands/` write JSON, the rest stderr only. This is folded into the envelope decision as its second question; decided (#704, rule b), fix pending.
+- {{C14}} Usage errors (exit 2) go through one `json_envelope::usage_error` helper (#1027, decided #704 rule b).
 
 - {{C54}} The contract's paid-tier codes match no command: `get` emits `status: "paid_required"` (snake_case, no events or `errorCode`) and `scan` emits nothing paid-specific, while `CLI_CONTRACT.md` documents `status=paidRequired` for both. The fix is documentation plus one shared `get` emitter.
 

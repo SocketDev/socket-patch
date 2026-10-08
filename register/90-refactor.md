@@ -1,36 +1,34 @@
 ### Refactor routine (`refactor`, hourly, highest leverage first)
-_Last updated 2026-10-08T22:55Z · main @ 830749f_
+_Last updated 2026-10-08T23:20Z · main @ ef48495_
 
 **In flight:**
+- [#1188](https://github.com/SocketDev/socket-patch/pull/1188): one `Pipfile.lock` writer: the hosted span reader moves to `formats::pipenv` (+ `splice_entry`); vendored wire/revert splice instead of re-serializing; Composer's `escape_non_ascii` shared as `formats::json`. Issue #1128 (E14). +303/−235 production (≈170 moved), +154/−32 tests. Only change: untouched entries keep their bytes (`\uXXXX`), BOM locks vendor; `redirect/mod.rs` wrapper `pipenv_reserialized_around_reference` left for when that file is free. `state: ready`.
 - [#1183](https://github.com/SocketDev/socket-patch/pull/1183): project-mode NuGet crawl of a restored project looks up the shared roots for the restore's `libraries` instead of walking them; one `project.assets.json` reader. Issue #427 (E05, #595 NuGet child). +130 production, +220 tests. Only change: unresolved shared-cache packages are no longer crawled. 3,000-package cache: 58 ms → 0.8 ms. `state: ready`.
 - [#1185](https://github.com/SocketDev/socket-patch/pull/1185): every vendored Poetry lock wires through `utils::poetry_lock`; the engine writes 2.x `files` one file per line; deletes the LF line scanner, `toml_surgery::{package_unit_lines, replace_files_array}` and `common::unit_has_canon_name`. Issue #936 (E66). +37/−166 production. Only change: hosted and CRLF-vendored 2.x `files` layout (Poetry's own); `name="…"` / files-less units wire instead of refusing. `state: ready`.
-- [#1163](https://github.com/SocketDev/socket-patch/pull/1163): `PatchFileInfo` hashes load as lowercase hex (`deserialize_with`), so agent apply/rollback `==` checks, blob names and vendored pins share one case rule. Issue #707 (C41). +18 production, +112 tests. Only change: an uppercase-hash manifest now applies and rolls back, and is written back lowercase. `state: ready`.
-- [#1160](https://github.com/SocketDev/socket-patch/pull/1160): inline BOM handling in 8 more files onto `formats::text`; `PENDING_INLINE_BOMS` 26 → 15. Issue #905 (E64, slice 2). Only change: two leading BOMs. `state: ready`.
 - [#1126](https://github.com/SocketDev/socket-patch/pull/1126): 7 inline purl-type checks through `Ecosystem::from_purl` + guard. Issue #747 (C20, slice 1). `state: ready`.
-- [#1108](https://github.com/SocketDev/socket-patch/pull/1108): one `utils::line_endings::terminator` for 7 inserted-line sites. Issue #815 (E16, slice 1; the rest is in open-PR files). Re-blesses mixed-ending go/uv goldens only. `state: ready`.
 - [#1103](https://github.com/SocketDev/socket-patch/pull/1103): `go.sum` edits through `GoSumEditor` only; deletes the oracle-only free functions and names the key rule once. Issue #631 (E52, slice: steps 2–3; the move to `formats/golang/sum.rs` remains). `state: ready`, handed to the burn-down.
-- Maintainer drafts (decided issues): #1027 (#704), #1031 (#966), #1036 (#973), #1041 (#648), #1049 (#792). #1030 (#808) and #1051 (#580) merged.
+- Maintainer drafts (decided issues): #1031 (#966), #1036 (#973), #1041 (#648), #1049 (#792). #1027 (#704), #1030 (#808) and #1051 (#580) merged.
 
 **Merged:**
-- [#1153](https://github.com/SocketDev/socket-patch/pull/1153): one `path_safety::is_safe_name_version` for the cargo/gem/nuget crawlers. Tracker #748 (E37).
-- [#1151](https://github.com/SocketDev/socket-patch/pull/1151): one `portable_wheel_artifact` for uv/poetry inventory and recovery. Issue #1150 (E89 fixed).
-- [#1145](https://github.com/SocketDev/socket-patch/pull/1145): Gradle XML through `formats::xml`. Issue #715 (E10, Gradle half).
-- [#1141](https://github.com/SocketDev/socket-patch/pull/1141): dead hosted-vlt ledger helpers deleted, −181 production. Issue #782 (E58 slice 1).
-- Earlier: #1106 (C48), #1110 (E15 slice 1), #1117 (E64), #1121 (E89 slice 1), #1124 (C30), #1021 (C05), #1015 (E61; left: dead `eco == "maven2"` arm in `commands/vendor.rs`), #889, #876, #886, #870, #865, #858, #850, #607, #602, #597, #587, #583, #581, #574, #572 (see `entries/refactor/`).
+- [#1108](https://github.com/SocketDev/socket-patch/pull/1108): 7 inserted-line sites through `utils::line_endings::terminator`. Issue #815 (E16 slice 1).
+- [#1163](https://github.com/SocketDev/socket-patch/pull/1163): manifest hashes load lowercase. Issue #707 (C41 partly fixed; `blob_hash_matches` remains).
+- [#1160](https://github.com/SocketDev/socket-patch/pull/1160): 11 more files onto `formats::text`; `PENDING_INLINE_BOMS` 15. Issue #905 (E64 slice 2).
+- Earlier: #1153, #1151, #1145, #1141 (see entries), #1106 (C48), #1110 (E15 slice 1), #1117 (E64), #1121 (E89 slice 1), #1124 (C30), #1021 (C05), #1015 (E61; left: dead `eco == "maven2"` arm in `commands/vendor.rs`), #889, #876, #886, #870, #865, #858, #850, #607, #602, #597, #587, #583, #581, #574, #572 (see `entries/refactor/`).
 
 **Queue** (B bugs closed, U unblocks, D duplication removed, R risk; score = 3B + 2U + 2D + S − risk). Since the 2026-10-08 backlog review, standalone refactor issues are closed as `not_planned` and kept as checklist items of their tracker; rank the tracker's next unchecked item.
 
 | # | Candidate | B | U | D | R | Score | Note |
 |---|---|:-:|:-:|:-:|:-:|:-:|---|
-| 1 | #989 item (was #990): one `vendor::revert::finish` for the 12 copied finish blocks | 0 | 1 | ≈12 | L | ≈26 | skipped: backend files changed by open PRs (#1008, #1041, #1026, …) |
-| 2 | #717 (E10): hosted pom edits + restore through `formats::xml` / `formats::maven` | 3 | 1 | ≈4 | M | ≈17 | skipped: `redirect/mod.rs` (#1008, #1009, #1026); `upstream/maven.rs` and `formats/maven` are free |
-| 3 | #594 (E10): nuget.config edits through `formats::nuget` | 1 | 1 | ≈3 | M | ≈9 | skipped: `redirect/mod.rs`, `vendor/nuget_feed.rs` (#1041) |
-| 4 | #936 (E66): one Poetry forward splicer | 0 | 1 | ≈1.6 | M | ≈3 | **taken: #1185** |
-| 5 | #427 (E05, #595 NuGet child): scope project-mode NuGet crawl to the restore's `libraries` | 1 | 1 | ≈0.5 | M | ≈7 (S 3) | **taken: #1183** (parallel run). Next free #595 children: cargo, go, Deno (crawler files) |
+| 1 | #989 item: one `vendor::revert::finish` for the 12 copied finish blocks | 0 | 1 | ≈12 | L | ≈26 | skipped: backend files changed by open PRs (#1008, #1041, #1036, …) |
+| 2 | #717 (E10): hosted pom edits + restore through `formats::maven` | 3 | 1 | ≈4 | M | ≈17 | skipped: `redirect/mod.rs` (#1008, #1009, #1180) |
+| 3 | #1128 (E14): one Pipfile.lock splicer | 1 | 1 | ≈2 | M | ≈5 | **taken: #1188** |
+| 4 | #595 child (E05): scope cargo / go / Deno crawls to the project's lock | 0 | 1 | ≈0.5 | M | ≈4 (S 3) | free (`cargo_crawler.rs`, `go_crawler.rs`, `deno_crawler.rs`); needs a child issue and timings |
+| 5 | #814 (E16) slice 2: `pypi_uv::newline_of`, upstream gem onto `terminator` | 0 | 0 | ≈2 | L | ≈4 | free files, but moves mixed-ending outputs: needs golden proof; `common::detect_eol` (#1185) and `maven_reactor.rs` (#1036) blocked |
 
-Re-ranked 2026-10-08T22:00Z at `830749f` against 29 open PRs (387 files in `arch-refactor/*` or `agent/fix-*`). Still blocked by open-PR files: #1144 (CLI `commands/vex.rs`, #1027/#1041), #914 (`jvm_jar.rs`, #1041), #893 (`cleanup_blobs.rs`, #1049), #780 (`vendor/gem.rs`), #1128 (`pypi_pipenv.rs`, #1147), #1064 (`vex/product.rs`, #1007), #913/#675/#676 (`api/client.rs`), #823/#824, #833, #1014 (`jvm/sbt.rs`, #1036), every CLI `commands/*` site. Free but low-leverage: #715's crawler-reader item (`maven_crawler.rs` is free, `vex/product.rs` is not; the crawler path is hot, so it needs timings).
+Re-ranked 2026-10-08T23:00Z at `ef48495` against 18 `arch-refactor/*` / `agent/fix-*` PRs (362 files); every CLI `commands/*` module except `context.rs`, `lock_cli.rs`, `update.rs` and `composer_hints.rs` is in one. Still blocked by open-PR files: #1144 (CLI `commands/vex.rs`, #1027/#1041), #914 (`jvm_jar.rs`, #1041), #893 (`cleanup_blobs.rs`, #1049), #780 (`vendor/gem.rs`), #1128 (`pypi_pipenv.rs`, #1147), #1064 (`vex/product.rs`, #1007), #913/#675/#676 (`api/client.rs`), #823/#824, #833, #1014 (`jvm/sbt.rs`, #1036), every CLI `commands/*` site. Free but low-leverage: #715's crawler-reader item (`maven_crawler.rs` is free, `vex/product.rs` is not; the crawler path is hot, so it needs timings).
 
 **Notes:**
+- `Pipfile.lock` edits go through `formats::pipenv::splice_entry` since #1188: sort the value (`sort_all_objects`) before splicing; never re-serialize the whole lock.
 - NuGet crawl scope (#1183): only a `cwd` with a project file is scoped; a solution root keeps the walk (restores at any depth). Extend through `PackageRoots::scope`, not a second assets reader.
 - Two runs of this routine can overlap (22:00Z run opened #1185 while the 21:52Z run opened #1183): re-fetch the ledger and open PRs right before claiming.
 - Poetry 2.x `files` is written one file per line by the shared engine since #1185; a test or golden that greps `files = [{ file` only sees 1.0/1.1 package-level `files` now.
