@@ -228,6 +228,19 @@ const SETUP_ALTERNATIVE: &str =
     "use agent mode instead (`scan --mode agent`, then `socket-patch apply` after each \
      install), which patches installed site-packages without lockfile edits";
 
+/// Whether the root `requirements.txt` pins the package being vendored (any
+/// spec naming it; with no target, whether the file exists at all). An
+/// unreadable file pins nothing.
+async fn requirements_pins_target(project_root: &Path, target: Option<(&str, &str)>) -> bool {
+    let path = project_root.join(crate::formats::governing_locks::PYPI_REQUIREMENTS);
+    match target {
+        None => tokio::fs::metadata(&path).await.is_ok(),
+        Some((name, _)) => read_regular_to_string(&path)
+            .await
+            .is_ok_and(|text| super::pypi_requirements::names_package(&text, name)),
+    }
+}
+
 /// Route the project to a wiring flavor, first match wins. Lockfiles are the
 /// authoritative "this tool manages installs" signal, so locks are compared
 /// with locks (precedence follows migration direction / ecosystem currency:
@@ -244,10 +257,15 @@ const SETUP_ALTERNATIVE: &str =
 /// 8. `hatch.toml` / `[tool.hatch]` / hatchling build backend → hatch;
 /// 9. a lone pyproject → refuse;  10. nothing → refuse.
 ///
-/// When more than one tool lockfile coexists, the winner is wired and a LOUD
-/// `pypi_multiple_lockfiles` warning names the ignored locks — they go
-/// stale-but-valid, which is otherwise invisible. Standalone locks that don't
-/// contain the package get a `pypi_unmatched_lockfiles` warning instead.
+/// The tool-lock order is the shared table
+/// [`crate::formats::governing_locks::PYPI_TOOL_LOCKS`].
+///
+/// When more than one tool lockfile coexists, or a `requirements.txt` that
+/// pins the package sits beside the winning tool lock (#612), the winner is
+/// wired and a LOUD `pypi_multiple_lockfiles` warning names the ignored
+/// files — they go stale-but-valid, which is otherwise invisible. Standalone
+/// locks that don't contain the package get a `pypi_unmatched_lockfiles`
+/// warning instead.
 async fn detect_pypi_flavor(
     project_root: &Path,
     target: Option<(&str, &str)>,
@@ -256,22 +274,26 @@ async fn detect_pypi_flavor(
         let p = project_root.join(name);
         async move { tokio::fs::metadata(&p).await.is_ok() }
     };
-    let has_uv_lock = exists("uv.lock").await;
-    let has_poetry_lock = exists("poetry.lock").await;
-    let has_pdm_lock = exists("pdm.lock").await;
-    let has_pipfile_lock = exists("Pipfile.lock").await;
+    use crate::formats::governing_locks::{
+        pypi_governing_tool_lock, pypi_locks_outside, PYPI_REQUIREMENTS, PYPI_TOOL_LOCKS,
+    };
+    let mut tool_locks: Vec<&str> = Vec::new();
+    for lock in PYPI_TOOL_LOCKS {
+        if exists(lock).await {
+            tool_locks.push(lock);
+        }
+    }
+    let governing = pypi_governing_tool_lock(|lock| tool_locks.contains(&lock));
+    let has_uv_lock = governing == Some("uv.lock");
     let has_pipfile = exists("Pipfile").await;
 
     // Coexisting tool locks: wire the precedence winner, warn about the rest.
-    let mut present: Vec<&str> = [
-        ("uv.lock", has_uv_lock),
-        ("poetry.lock", has_poetry_lock),
-        ("pdm.lock", has_pdm_lock),
-        ("Pipfile.lock", has_pipfile_lock),
-    ]
-    .into_iter()
-    .filter_map(|(name, present)| present.then_some(name))
-    .collect();
+    let mut present: Vec<&str> = governing.into_iter().collect();
+    if let Some(governing) = governing {
+        present.extend(pypi_locks_outside(governing, |lock| {
+            tool_locks.contains(&lock)
+        }));
+    }
     let additional_locks: Vec<String> = crate::utils::python_lock::python_lock_paths(project_root)
         .map_err(|error| ("pypi_lock_read_failed", error.to_string()))?
         .into_iter()
@@ -286,8 +308,8 @@ async fn detect_pypi_flavor(
         !additional_locks.is_empty()
     };
     if !has_uv_lock && matching_additional_lock {
-        if exists("requirements.txt").await {
-            present.push("requirements.txt");
+        if exists(PYPI_REQUIREMENTS).await {
+            present.push(PYPI_REQUIREMENTS);
         }
         if !present.is_empty() {
             warnings.push(VendorWarning::new(
@@ -303,7 +325,15 @@ async fn detect_pypi_flavor(
     }
     if has_uv_lock {
         present.extend(additional_locks.iter().map(String::as_str));
-    } else if !additional_locks.is_empty() {
+    }
+    // #612: a `requirements.txt` exported beside the governing tool lock
+    // (`pipenv requirements`, `uv export`) is an install source the
+    // single-lock wiring leaves untouched — name it among the losers when it
+    // pins this package.
+    if governing.is_some() && requirements_pins_target(project_root, target).await {
+        present.push(PYPI_REQUIREMENTS);
+    }
+    if !has_uv_lock && !additional_locks.is_empty() {
         warnings.push(VendorWarning::new(
             "pypi_unmatched_lockfiles",
             format!(
@@ -324,23 +354,18 @@ async fn detect_pypi_flavor(
         ));
     }
 
-    if has_uv_lock {
-        return Ok((PypiFlavor::UvProject, warnings));
-    }
-    if has_poetry_lock {
-        return Ok((PypiFlavor::Poetry, warnings));
-    }
-    if has_pdm_lock {
-        return Ok((PypiFlavor::Pdm, warnings));
-    }
-    if has_pipfile_lock {
-        return Ok((PypiFlavor::Pipenv, warnings));
+    match governing {
+        Some("uv.lock") => return Ok((PypiFlavor::UvProject, warnings)),
+        Some("poetry.lock") => return Ok((PypiFlavor::Poetry, warnings)),
+        Some("pdm.lock") => return Ok((PypiFlavor::Pdm, warnings)),
+        Some(_) => return Ok((PypiFlavor::Pipenv, warnings)),
+        None => {}
     }
 
     let pyproject_text = read_regular_to_string(&project_root.join("pyproject.toml"))
         .await
         .ok();
-    let has_requirements = exists("requirements.txt").await;
+    let has_requirements = exists(PYPI_REQUIREMENTS).await;
     let has_pyproject_table = |prefix: &str| {
         pyproject_text
             .as_deref()
@@ -1862,22 +1887,6 @@ pub async fn revert_pypi(entry: &VendorEntry, project_root: &Path, dry_run: bool
     revert_pypi_opts(entry, project_root, RevertOpts::new(dry_run)).await
 }
 
-/// Is this pypi-vendored entry still consumed by its project? The prune GC
-/// and the vendored discovery supplement ask this; `None` keeps the entry.
-///
-/// Only the `requirements` flavor has a probe: its requirements tree is
-/// the lock pip installs from, so a pin the user removed or bumped there
-/// proves the entry unused. The other flavors report `None` (cannot
-/// determine), as before.
-pub async fn vendored_entry_in_use(entry: &VendorEntry, project_root: &Path) -> Option<bool> {
-    match entry.flavor.as_deref() {
-        Some("requirements") => {
-            super::pypi_requirements::requirements_entry_in_use(project_root, &entry.uuid).await
-        }
-        _ => None,
-    }
-}
-
 /// Fail-closed twin of [`super::npm_lock::guard_unwired_textual_revert`]
 /// for the Python backends. A ledger entry with NO wiring records cannot
 /// restore any project file — that is the shape `socket-patch repair`
@@ -2457,6 +2466,55 @@ mod tests {
 
     async fn touch(root: &Path, name: &str, content: &str) {
         tokio::fs::write(root.join(name), content).await.unwrap();
+    }
+
+    /// #612 / B31: a `requirements.txt` exported beside the governing tool
+    /// lock (`pipenv requirements`, `uv export`) is an install source the
+    /// single-lock wiring leaves UNPATCHED, so it must be named by the
+    /// documented `pypi_multiple_lockfiles` warning — but only when it pins
+    /// the package being vendored.
+    #[tokio::test]
+    async fn requirements_beside_the_governing_lock_is_a_loud_loser() {
+        for (lock, content, flavor) in [
+            ("Pipfile.lock", "{}", PypiFlavor::Pipenv),
+            ("uv.lock", "version = 1\n", PypiFlavor::UvProject),
+            ("poetry.lock", "", PypiFlavor::Poetry),
+            ("pdm.lock", "", PypiFlavor::Pdm),
+        ] {
+            let tmp = tempfile::tempdir().unwrap();
+            touch(tmp.path(), lock, content).await;
+            touch(
+                tmp.path(),
+                "requirements.txt",
+                "idna==3.7\nsix==1.16.0 ; python_version >= \"3\"\n",
+            )
+            .await;
+            let (selected, warnings) = detect_pypi_flavor(tmp.path(), Some(("six", "1.16.0")))
+                .await
+                .unwrap();
+            assert_eq!(selected, flavor, "{lock}");
+            let loud: Vec<_> = warnings
+                .iter()
+                .filter(|w| w.code == "pypi_multiple_lockfiles")
+                .collect();
+            assert_eq!(loud.len(), 1, "{lock}: {warnings:?}");
+            assert!(
+                loud[0].detail.contains(&format!("wiring `{lock}`"))
+                    && loud[0].detail.contains("requirements.txt")
+                    && loud[0].detail.contains("UNPATCHED"),
+                "{lock}: {}",
+                loud[0].detail
+            );
+
+            // A requirements file that never names the package stays quiet.
+            let (_, warnings) = detect_pypi_flavor(tmp.path(), Some(("urllib3", "2.0.0")))
+                .await
+                .unwrap();
+            assert!(
+                warnings.iter().all(|w| w.code != "pypi_multiple_lockfiles"),
+                "{lock}: {warnings:?}"
+            );
+        }
     }
 
     /// One assert per row of the routing table (locks > lock-less markers

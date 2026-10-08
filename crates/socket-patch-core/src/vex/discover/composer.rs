@@ -12,7 +12,7 @@
 //! composer's leading-`v` normalization
 //! ([`crate::crawlers::composer_crawler::normalize_version`]: locks carry the
 //! pretty `v6.4.1`, purls the bare `6.4.1`). A vendored leaf matches it by
-//! release identity ([`composer_purls_equivalent`]: a leaf keyed by the
+//! release identity ([`PurlKey`]: a leaf keyed by the
 //! patch's padded `3.0.2.0` is the lock's `3.0.2`). The rewritten `dist` is
 //! what composer's default install consumes and the only block either
 //! backend rewrites, so it is what a ref is read from — unless composer
@@ -72,12 +72,13 @@
 use serde_json::Value;
 
 use super::{
-    canonical_base_purl, composer_purl, names_vendor_dir, parse_json, vendored_leaf_purl,
-    DiscoverCtx, Discovery, LocateOpts, PatchedRef, DIAG_LOCKFILE_UNPARSEABLE, DIAG_REF_INVALID,
+    composer_purl, names_vendor_dir, parse_json, vendored_leaf_purl, DiscoverCtx, Discovery,
+    LocateOpts, PatchedRef, DIAG_LOCKFILE_UNPARSEABLE, DIAG_REF_INVALID,
 };
 use crate::crawlers::composer_crawler::normalize_version;
 use crate::formats::composer::{ComposerLock, ComposerLockPackage};
-use crate::utils::composer_version::{composer_purls_equivalent, composer_version_normalize};
+use crate::utils::composer_version::composer_version_normalize;
+use crate::utils::purl_key::PurlKey;
 
 /// The lock both backends rewrite (root-relative).
 const COMPOSER_LOCK: &str = "composer.lock";
@@ -285,9 +286,8 @@ fn entry_ref(
     if let Some(vref) = vendored {
         // The leaf carries the patch purl's spelling (`@3.0.2.0`), the lock
         // its own (`3.0.2`): the same release either way.
-        let leaf_matches = vendored_leaf_purl("composer", &vref.leaf).is_some_and(|leaf| {
-            leaf == canonical_base_purl(&purl) || composer_purls_equivalent(&leaf, &purl)
-        });
+        let leaf_matches = vendored_leaf_purl("composer", &vref.leaf)
+            .is_some_and(|leaf| PurlKey::same(&leaf, &purl));
         if vref.eco != "composer" || !leaf_matches {
             out.diag(
                 DIAG_REF_INVALID,

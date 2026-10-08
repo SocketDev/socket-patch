@@ -14,6 +14,7 @@ use crate::hosted::engine::{
 };
 use crate::hosted::vlt::Preflight;
 use crate::patch::redirect::npmrc::OuterAllowRemote;
+use crate::patch::redirect::yarnrc::OuterYarnMirror;
 use crate::patch::redirect::DepOverride;
 use crate::utils::purl::strip_purl_qualifiers;
 use crate::vendor::lock_inventory::{MemoryEntry, MemoryProject, ProjectView};
@@ -227,6 +228,8 @@ pub(crate) struct Rewritten {
     pub(crate) skipped: Vec<SkippedPatch>,
     pub(crate) pre_warnings: Vec<crate::patch::redirect::RewriteWarning>,
     pub(crate) done: engine::Rewritten,
+    /// Granted candidates nothing pins ([`engine::unconfirmed_candidates`]).
+    pub(crate) unconfirmed: Vec<(String, String)>,
 }
 
 /// A refused rewrite: its refusal and the skips recorded before the
@@ -304,8 +307,9 @@ pub(crate) async fn rewrite(
 
     let view = ProjectView::Memory(&project);
     let targets_pipenv_lock = engine::pipenv_lock_targets(&read.files, &candidates);
-    // The in-memory host sees no user / global npm config.
+    // The in-memory host sees no user / global npm or yarn config.
     let npm_outer = OuterAllowRemote::default;
+    let yarn_classic_outer = OuterYarnMirror::default;
     let done = engine::rewrite(
         &view,
         read,
@@ -329,6 +333,7 @@ pub(crate) async fn rewrite(
             trust_lockfile_config: options.trust_lockfile_config,
             npm_allow_remote_config: options.npm_allow_remote_config,
             npm_outer: &npm_outer,
+            yarn_classic_outer: &yarn_classic_outer,
             blocking: false,
         },
     )
@@ -339,11 +344,13 @@ pub(crate) async fn rewrite(
             skipped: skipped_before,
         });
     }
+    let unconfirmed = engine::unconfirmed_candidates(&candidates, &done.confirmed, &skipped);
     Ok(Rewritten {
         project,
         skipped,
         pre_warnings,
         done,
+        unconfirmed,
     })
 }
 

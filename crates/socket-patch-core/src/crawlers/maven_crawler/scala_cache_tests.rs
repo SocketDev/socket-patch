@@ -409,19 +409,19 @@ async fn local_scala_caches_only_for_scala_tool_projects() {
     for marker in ["build.gradle", "settings.gradle.kts"] {
         assert_eq!(roots_of(marker).await, Vec::new(), "{marker}");
     }
+    // Every Scala-tool marker alone makes the project one: an sbt build
+    // defined in `project/*.scala` has only `project/build.properties`, and
+    // a scala-cli build may have only its `.scala-build/` output.
     for marker in [
         "build.sbt",
         "build.mill",
+        "build.mill.yaml",
         "build.sc",
         "project.scala",
         "project/build.properties",
+        ".scala-build",
     ] {
         let roots = roots_of(marker).await;
-        if marker == "project/build.properties" {
-            // Not a JVM project marker on its own (too generic a name).
-            assert!(roots.is_empty(), "{marker}: {roots:?}");
-            continue;
-        }
         assert!(
             roots.contains(&JvmCacheRoot::new(repo.clone(), JvmCacheLayout::Coursier)),
             "{marker}: {roots:?}"

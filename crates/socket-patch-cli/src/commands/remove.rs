@@ -1,11 +1,13 @@
 use clap::Args;
 use socket_patch_core::api::client::get_api_client_with_overrides;
+use socket_patch_core::ledgers::hosted_pins_matching;
 use socket_patch_core::manifest::cleanup_blobs::{format_bytes, ArtifactReferences};
 use socket_patch_core::manifest::operations::{read_manifest, write_manifest};
 use socket_patch_core::manifest::schema::PatchManifest;
 use socket_patch_core::patch::redirect::upstream::HostedPin;
 use socket_patch_core::telemetry::{track_patch_remove_failed, track_patch_removed};
 use socket_patch_core::utils::purl::patch_matches;
+use socket_patch_core::utils::purl_key::PurlKey;
 use socket_patch_core::vendor::{
     load_state, RevertOpts, VendorEntry, VendorState, VENDOR_STATE_REL,
 };
@@ -24,26 +26,21 @@ use crate::ui::plural;
 
 /// Vendor-ledger entries matching a remove identifier
 /// ([`socket_patch_core::ledgers::Ledgers::matching`]), sorted by key for
-/// deterministic event order.
-fn vendor_entries_matching(state: &VendorState, identifier: &str) -> Vec<(String, VendorEntry)> {
+/// deterministic event order. With the manifest, an entry the matched
+/// manifest keys claim matches whatever patch generation it recorded
+/// (#999); the ledger-only path passes `None`.
+fn vendor_entries_matching(
+    state: &VendorState,
+    manifest: Option<&PatchManifest>,
+    identifier: &str,
+) -> Vec<(String, VendorEntry)> {
     socket_patch_core::ledgers::Ledgers {
+        manifest,
         vendor: Some(state),
         ..Default::default()
     }
     .matching(identifier)
     .vendor
-}
-
-/// The lockfiles' hosted pins matching a remove identifier (by purl or
-/// patch uuid), sorted by purl.
-fn hosted_pins_matching(pins: &[HostedPin], identifier: &str) -> Vec<HostedPin> {
-    let mut matches: Vec<HostedPin> = pins
-        .iter()
-        .filter(|pin| patch_matches(&pin.purl, &pin.uuid, identifier))
-        .cloned()
-        .collect();
-    matches.sort_by(|a, b| a.purl.cmp(&b.purl));
-    matches
 }
 
 /// Drop every manifest entry matching `identifier` except `exclusions`
@@ -444,6 +441,7 @@ pub async fn run(args: RemoveArgs) -> i32 {
         .filter(|(purl, patch)| patch_matches(purl, &patch.uuid, &args.identifier))
         .collect();
     matching.sort_by(|a, b| a.0.cmp(b.0));
+    let matched_keys: Vec<String> = matching.iter().map(|(purl, _)| (*purl).clone()).collect();
 
     // The vendor ledger, loaded ONCE under the lock: it scopes the nested
     // rollback (vendor-owned purls are not restored in place) and drives
@@ -462,7 +460,7 @@ pub async fn run(args: RemoveArgs) -> i32 {
         // --revert`'s all-at-once). An unreadable ledger falls through to
         // `not_found`: nothing is mutated on that path.
         if let Ok(state) = vendor_state_result {
-            let ledger_matches = vendor_entries_matching(&state, &args.identifier);
+            let ledger_matches = vendor_entries_matching(&state, None, &args.identifier);
             if !ledger_matches.is_empty() {
                 return remove_ledger_only(
                     &args,
@@ -478,7 +476,7 @@ pub async fn run(args: RemoveArgs) -> i32 {
         // Hosted-only patches likewise have no manifest entry — their
         // lockfile pins are their only persistence, and `remove` is their
         // per-purl exit path (restoring the upstream entry IS the removal).
-        let hosted_matches = hosted_pins_matching(&hosted_pins, &args.identifier);
+        let hosted_matches = hosted_pins_matching(&hosted_pins, &args.identifier, &[]);
         if !hosted_matches.is_empty() {
             return remove_hosted_only(
                 &args,
@@ -541,9 +539,9 @@ pub async fn run(args: RemoveArgs) -> i32 {
         } else {
             let vendored = vendor_state_result
                 .as_ref()
-                .map(|st| vendor_entries_matching(st, &args.identifier).len())
+                .map(|st| vendor_entries_matching(st, Some(&manifest), &args.identifier).len())
                 .unwrap_or(0);
-            let hosted = hosted_pins_matching(&hosted_pins, &args.identifier).len();
+            let hosted = hosted_pins_matching(&hosted_pins, &args.identifier, &matched_keys).len();
             (vendored, hosted)
         };
         let prompt = remove_prompt(
@@ -565,7 +563,7 @@ pub async fn run(args: RemoveArgs) -> i32 {
     // Vendor-owned purls are excluded from the in-place restore (the
     // vendored leg below reverts them); an unreadable ledger degrades to
     // "nothing vendored" here and fails closed at that leg.
-    let vendored_keys: HashSet<String> = vendor_state_result
+    let vendored_keys: HashSet<PurlKey> = vendor_state_result
         .as_ref()
         .map(socket_patch_core::vendor::VendorState::purl_keys)
         .unwrap_or_default();
@@ -723,7 +721,8 @@ pub async fn run(args: RemoveArgs) -> i32 {
             return 1;
         }
     };
-    let vendored_matches = vendor_entries_matching(&vendor_state, &args.identifier);
+    let vendored_matches =
+        vendor_entries_matching(&vendor_state, Some(&manifest), &args.identifier);
     let mut vendor_leg = RemoveVendorLeg::default();
     if !vendored_matches.is_empty() {
         if args.skip_rollback {
@@ -772,7 +771,7 @@ pub async fn run(args: RemoveArgs) -> i32 {
     // carried into the success envelope's `warnings[]`.
     let mut hosted_leg_warnings: Vec<(String, String)> = Vec::new();
     if !args.skip_rollback {
-        let hosted_matches = hosted_pins_matching(&hosted_pins, &args.identifier);
+        let hosted_matches = hosted_pins_matching(&hosted_pins, &args.identifier, &matched_keys);
         if !hosted_matches.is_empty() {
             let leg = match unwind_hosted(&args.common, &hosted_matches).await {
                 Ok(leg) => {
