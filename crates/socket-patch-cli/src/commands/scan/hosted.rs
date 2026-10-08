@@ -22,10 +22,9 @@ use crate::commands::vex::generate_vex_from_manifest_path;
 use super::{discover_selected, ScanArgs};
 
 mod python;
-pub(crate) mod vlt;
+mod takeover;
 
-pub(crate) use vlt::rollback_heal as vlt_rollback_heal;
-pub(crate) use vlt::takeover_heal as vlt_takeover_heal;
+use crate::commands::vlt_heal as vlt;
 
 #[cfg(test)]
 pub(crate) use socket_patch_core::hosted::guidance::{
@@ -784,8 +783,8 @@ pub(crate) async fn run_redirect_selected(
 
     // The apply lock (see `acquire_hosted_lock`), taken only by a WET run
     // that holds at least one granted reference — the only runs that can
-    // write anything: the takeover pre-reverts (lockfiles + the vendored
-    // ledger) and the lockfile writes. Dry runs
+    // write anything: the takeover's reverts (lockfiles + the vendored
+    // ledger) and the lockfile writes, committed together. Dry runs
     // and zero-grant runs never touch `.socket/`, so they never lock (a
     // preview must not create `.socket/`, flip to `lock_held` under a
     // concurrent wet run, or fail on a read-only checkout). Held to the end
@@ -813,33 +812,46 @@ pub(crate) async fn run_redirect_selected(
     // stale-install probes and the in-run VEX attestation. A pre-v5 ledger
     // on disk is left untouched: it is read only for migration.
     // The vendored ledger, loaded ONCE per run (under the same lock, so no
-    // other writer can move the on-disk file under it): the takeover below
-    // mutates it in place per reverted purl (saving after each), and the
-    // post-write overlap classification reads that post-takeover state —
-    // never a pre-takeover snapshot, which would flag every migrated purl
-    // as still vendored. `Err` (unreadable / malformed) is "no vendored
-    // ownership known" for both consumers.
+    // other writer can move the on-disk file under it): a takeover drops
+    // the migrated entries from it, and the post-write overlap
+    // classification reads that post-takeover state — never a pre-takeover
+    // snapshot, which would flag every migrated purl as still vendored.
+    // `Err` (unreadable / malformed) is "no vendored ownership known" for
+    // both consumers.
     let mut vendor_state = socket_patch_core::vendor::load_state(&common.cwd).await;
 
-    // Cross-mode takeover of still-vendored purls (see `vendored_takeover`).
-    let Takeover {
-        pre_warnings: takeover_pre_warnings,
-        dry_run: dry_run_takeover,
-        migrated: takeover_migrated,
-        unrecorded: takeover_unrecorded,
-        files: takeover_files,
-        previews: dry_run_takeover_urls,
-    } = match vendored_takeover(common, &mut candidates, &mut vendor_state, &mut skipped).await {
+    // Every project write of this run — a takeover's vendored reverts, the
+    // hosted pins and the vendored ledger — is staged in one group commit
+    // and reaches the disk at once, after every check has passed (see
+    // `socket_patch_core::utils::group_commit`): an exit before the commit
+    // writes nothing, and a dry run drops the group instead of committing.
+    // Vendored artifacts the reverts delete go only after the commit.
+    let group = socket_patch_core::utils::group_commit::GroupCommit::begin(&common.cwd);
+    group.defer_removals();
+
+    // Cross-mode takeover of still-vendored purls (see `takeover`): their
+    // vendored wiring is reverted in the group's overlay, so the rewrite
+    // below plans against the reverted project.
+    let mut takeover = match takeover::Takeover::plan(
+        common,
+        &group,
+        &mut candidates,
+        &vendor_state,
+        &mut skipped,
+    )
+    .await
+    {
         Ok(t) => t,
         Err(refusal) => return refuse(common, scan_result.take(), &refusal),
     };
+    takeover
+        .stage(common, &group, &mut candidates, &mut skipped)
+        .await;
 
-    // Read the project's candidate files. Skipped when no candidate
-    // survived and no dry-run takeover preview is pending (the rewriters do
-    // nothing without a dep); everything after the rewrite still runs. A
-    // dry-run takeover preview still needs the root locks for the
-    // install-policy previews below.
-    let read = if !candidates.is_empty() || !dry_run_takeover_urls.is_empty() {
+    // Read the project's candidate files (through the overlay). Skipped
+    // when no candidate survived (the rewriters do nothing without a dep);
+    // everything after the rewrite still runs.
+    let read = if !candidates.is_empty() {
         engine::read_candidate_files(&view, &std::collections::BTreeSet::new(), &candidates).await
     } else {
         CandidateFiles::default()
@@ -1015,13 +1027,14 @@ pub(crate) async fn run_redirect_selected(
     let second_pass = rollout
         .is_some()
         .then(|| (read.clone(), python_metadata.clone()));
+    // A retracted takeover rewrites again without it (see below).
+    let takeover_metadata = takeover.is_staged().then(|| python_metadata.clone());
     let mut done = engine::rewrite(
         &view,
         read,
         &candidates,
         python_metadata,
         &vlt_preflight.withheld_from_vlt,
-        &dry_run_takeover_urls,
         rewrite_options(),
     )
     .await;
@@ -1057,7 +1070,6 @@ pub(crate) async fn run_redirect_selected(
                 &candidates,
                 python_metadata,
                 &vlt_preflight.withheld_from_vlt,
-                &dry_run_takeover_urls,
                 rewrite_options(),
             )
             .await;
@@ -1072,24 +1084,55 @@ pub(crate) async fn run_redirect_selected(
             }
         }
     }
+    // A staged takeover the rewrite did not pin must not happen: undo every
+    // staged revert, keep that purl vendored, and stage and rewrite the
+    // rest again. Each pass drops at least one purl, so this ends.
+    loop {
+        let unpinned = takeover.unpinned(&done.confirmed);
+        if unpinned.is_empty() {
+            break;
+        }
+        takeover
+            .retract(
+                common,
+                &group,
+                &unpinned,
+                &done.rewrite.warnings,
+                &mut candidates,
+                &mut skipped,
+            )
+            .await;
+        let read = if candidates.is_empty() {
+            CandidateFiles::default()
+        } else {
+            engine::read_candidate_files(&view, &std::collections::BTreeSet::new(), &candidates)
+                .await
+        };
+        done = engine::rewrite(
+            &view,
+            read,
+            &candidates,
+            takeover_metadata.clone().unwrap_or_default(),
+            &vlt_preflight.withheld_from_vlt,
+            rewrite_options(),
+        )
+        .await;
+    }
+    let takeover::Finished {
+        warnings: takeover_pre_warnings,
+        migrated: takeover_migrated,
+        files: takeover_files,
+    } = takeover.finish(common.dry_run, &mut vendor_state, &done.rewrite.warnings);
+    // A takeover writes the vendored ledger: hold the lock for it too.
+    if lock.is_none() && !common.dry_run && !takeover_migrated.is_empty() {
+        match acquire_hosted_lock(common, &mut scan_result) {
+            Ok(guard) => lock = Some(guard),
+            Err(code) => return code,
+        }
+    }
     // Held to the end of the function.
     let _lock = lock;
-    // Dry-run mode-takeover previews were withheld from the rewriters (their
-    // lock fragments still carry the vendored wiring the wet run reverts
-    // first), so the presence probe cannot see them: the wet run reverts
-    // then redirects each one, and the preview's `redirected` count must
-    // report that outcome. Populated only under --dry-run.
-    let mut confirmed = done.confirmed.clone();
-    confirmed.extend(dry_run_takeover);
-    // The takeover already reverted these purls' vendored wiring; one the
-    // rewrite then did not pin (a refused lock, unavailable wheel
-    // metadata) is left on the unpatched registry release in BOTH modes.
-    // That must never pass as success.
-    let mut stranded = stranded_takeovers(&takeover_migrated, &confirmed, common.dry_run);
-    // A takeover whose revert succeeded but whose ledger update failed is
-    // refused (never redirected), yet its vendored wiring and artifact are
-    // already gone: it is unpatched in both modes all the same.
-    stranded.extend(takeover_unrecorded);
+    let confirmed = done.confirmed.clone();
 
     // Fetch the full patch view (file hashes + vulnerabilities) for each
     // CONFIRMED redirect and persist it so a post-install `socket-patch vex`
@@ -1153,32 +1196,17 @@ pub(crate) async fn run_redirect_selected(
     }
 
     let rewrite = &done.rewrite;
-    if !common.dry_run {
-        for (rel, content) in rewrite
-            .files
-            .iter()
-            .map(|(p, s)| (p, s.as_bytes()))
-            .chain(rewrite.binary_files.iter().map(|(p, b)| (p, b.as_slice())))
-        {
-            let path = common.cwd.join(rel);
-            if let Some(parent) = path.parent() {
-                let _ = std::fs::create_dir_all(parent);
-            }
-            // Atomic stage+rename, mode-preserving (the vendored backend's
-            // writer): a bare `fs::write` truncates first, so a crash
-            // mid-write could leave a torn lockfile behind.
-            if let Err(e) =
-                socket_patch_core::utils::fs::atomic_write_bytes_preserving_mode(&path, content)
-                    .await
-            {
-                let message = format!("failed to write {rel}: {e}");
-                eprintln!("{}", format_error_line(&message));
-                if common.json {
-                    emit_json_error(scan_result.take(), &message);
-                }
-                return 1;
-            }
+    if common.dry_run {
+        // A preview: the staged reverts never reach the disk.
+        drop(group);
+    } else if let Err(message) =
+        commit_hosted_writes(common, group, rewrite, &vendor_state, &takeover_migrated).await
+    {
+        eprintln!("{}", format_error_line(&message));
+        if common.json {
+            emit_json_error(scan_result.take(), &message);
         }
+        return 1;
     }
 
     // Gem stale-install probe (see `gem_stale_install_warnings`): runs after
@@ -1392,18 +1420,6 @@ pub(crate) async fn run_redirect_selected(
     warnings.extend(python_stale.warnings.iter().cloned());
     warnings.extend(vlt_stale.warnings.iter().cloned());
     warnings.extend(takeover_pre_warnings.iter().cloned());
-    warnings.extend(stranded.iter().map(|purl| {
-        serde_json::json!({
-            "code": "redirect_takeover_unpatched",
-            "detail": format!(
-                "{purl} was vendored and its vendored wiring was reverted, but it \
-                 was not pinned to hosted (see the warnings above), so the \
-                 project now installs the UNPATCHED registry release — fix the \
-                 reported cause and re-run `scan --mode hosted`, or run `scan \
-                 --mode vendored` to vendor it again"
-            ),
-        })
-    }));
     warnings.extend(takeover_warnings.iter().cloned());
     warnings.extend(prune_warnings.iter().cloned());
 
@@ -1431,9 +1447,6 @@ pub(crate) async fn run_redirect_selected(
             common.dry_run,
         );
         let mut result = build_redirect_json_envelope(scan_result.take(), redirect);
-        if !stranded.is_empty() {
-            result["status"] = serde_json::json!("partial_failure");
-        }
         if let Some(gate) = &rollout {
             super::finish_rollout_json(gate.stage, &mut result);
         }
@@ -1465,16 +1478,12 @@ pub(crate) async fn run_redirect_selected(
             // line per sentence so CI can grep them.
             let width =
                 std::io::IsTerminal::is_terminal(&std::io::stderr()).then(crate::ui::stderr_width);
-            // A stranded takeover was NOT migrated to hosted: its
-            // `redirect_takeover_unpatched` warning below says so instead.
-            for purl in takeover_migrated.iter().filter(|p| !stranded.contains(p)) {
+            for purl in &takeover_migrated {
                 eprintln!("{}", format_takeover_line(purl, common.dry_run));
             }
             // The files a takeover's revert touched (or, on --dry-run,
-            // would touch) count alongside the rewriters' own: a dry-run
-            // takeover is withheld from the rewriters, and a wet revert can
-            // touch a wiring file the hosted rewriter never rewrites. The
-            // same union in both modes keeps preview and wet counts equal.
+            // would touch) count alongside the rewriters' own: a revert can
+            // touch a wiring file the hosted rewriter never rewrites.
             let mut human_files = done.rewritten.clone();
             human_files.extend(takeover_files.iter().cloned());
             human_files.sort();
@@ -1565,9 +1574,7 @@ pub(crate) async fn run_redirect_selected(
             if let Some(line) = rollout_line {
                 println!("{line}");
             }
-            // "Commit … to keep the hosted patches" / "reinstall" would be
-            // wrong for a stranded takeover, whose warning names the remedy.
-            let mut next_steps = if common.dry_run || !stranded.is_empty() {
+            let mut next_steps = if common.dry_run {
                 Vec::new()
             } else {
                 format_next_steps(&human_files, &rewrite.edits, !takeover_migrated.is_empty())
@@ -1582,667 +1589,115 @@ pub(crate) async fn run_redirect_selected(
         if let Some(e) = &vex_error {
             e.print_embedded(common);
         }
-        if common.silent {
-            for w in warnings
-                .iter()
-                .filter(|w| w["code"] == "redirect_takeover_unpatched")
-            {
-                eprintln!(
-                    "{}",
-                    format_warning(
-                        "redirect_takeover_unpatched",
-                        w["detail"].as_str().unwrap_or_default(),
-                        None
-                    )
-                );
-            }
-        }
-    }
-    if vex_code == 0 && !stranded.is_empty() {
-        return 1;
     }
     vex_code
 }
 
-/// The purls a WET takeover migrated (vendored wiring reverted) that the
-/// rewrite did not confirm as pinned. Empty under `--dry-run`, whose
-/// takeover previews are counted as confirmed without a rewrite.
-fn stranded_takeovers(
-    migrated: &[String],
-    confirmed: &[(String, String)],
-    dry_run: bool,
-) -> Vec<String> {
-    use socket_patch_core::utils::purl::{canonical_purl, strip_purl_qualifiers};
-    if dry_run {
-        return Vec::new();
-    }
-    let key = |purl: &str| canonical_purl(strip_purl_qualifiers(purl));
-    let pinned: std::collections::HashSet<String> =
-        confirmed.iter().map(|(purl, _)| key(purl)).collect();
-    migrated
-        .iter()
-        .filter(|purl| !pinned.contains(&key(purl)))
-        .cloned()
-        .collect()
-}
-
-/// Cross-mode takeover: a purl this run is about to redirect may still be
-/// VENDORED — for cargo a committed `[patch.crates-io]` path entry, a
-/// detached Cargo.lock entry, a committed copy, and a vendored ledger
-/// entry; for the npm family a `file:./.socket/vendor/…` lock resolution
-/// (plus a berry `resolutions` pin) and its committed tarball; for golang
-/// the vendor-owned go.mod `replace`, its committed module copy, and its
-/// ledger entry. The hosted rewriters know nothing about that wiring
-/// (cargo would refuse `--locked` builds over the unused `[patch]` entry;
-/// yarn classic would hijack a resolution the vendored ledger still
-/// claims; yarn berry refuses `file:` outright). A takeover must leave the
-/// project FULLY hosted: revert each such purl's vendored state first (the
-/// per-purl machinery `vendor --revert` runs), and only then redirect —
-/// which also hands the redirect the PRISTINE registry lock fragment to
-/// record as its own revert original. A purl
-/// whose vendored state cannot be cleanly reverted (revert failure, or
-/// vendored wiring with a missing/corrupt ledger) is REFUSED — skipped
-/// with an actionable error — never half-migrated.
-///
-/// Refused purls are moved from `candidates` into `skipped`; dry-run
-/// takeover previews leave `candidates` too (see [`Takeover::dry_run`]).
-/// `Err` is the symlinked-wiring refusal (nothing was written).
-async fn vendored_takeover(
+/// Write the hosted pins and commit `group` (see `run_redirect_selected`):
+/// the takeover's staged reverts, the pins and the vendored ledger reach
+/// the disk together. A file the group does not capture (the Gradle hosted
+/// index and script under `.socket/gradle/`, which only the captured settings
+/// line makes live) is written first, straight to disk, and put back when a
+/// later step fails. `Err` is the error line: on a failed commit nothing was
+/// left changed, or an interrupted commit's journal is kept for the next
+/// locked command to finish.
+async fn commit_hosted_writes(
     common: &crate::args::GlobalArgs,
-    candidates: &mut Vec<socket_patch_core::hosted::engine::Candidate>,
-    vendor_state: &mut std::io::Result<socket_patch_core::vendor::VendorState>,
-    skipped: &mut Vec<socket_patch_core::hosted::engine::SkippedPatch>,
-) -> Result<Takeover, socket_patch_core::hosted::engine::Refusal> {
-    use socket_patch_core::hosted::engine::{Candidate, SkippedPatch, TakeoverPreview};
-    let mut out = Takeover::default();
-    // Which root locks each dry-run takeover purl is vendored into (from
-    // its vendor ledger wiring): the wet run reverts that wiring and then
-    // splices the hosted URL there, so the install-policy auto-configs
-    // (npm `.npmrc` allow-remote, pnpm `trustLockfile`) must be PREVIEWED
-    // for those locks even though the rewriters never see these purls.
-    let mut dry_run_locks: std::collections::HashMap<String, Vec<String>> =
-        std::collections::HashMap::new();
-    // Maven takes over only a Gradle build's vendored JVM entry (its revert
-    // unplans the vendored Gradle wiring); a pom-only vendored entry stays.
-    // PyPI: every Python rewriter (requirements.txt, Poetry, Pipenv, uv,
-    // Hatch, PDM, pylock) refuses a non-registry source as user-authored,
-    // including the vendored one socket-patch wrote itself, so a vendored
-    // purl must be reverted to its registry entry first (#328).
-    let takeover_capable = |p: &str| {
-        p.starts_with("pkg:cargo/")
-            || p.starts_with("pkg:npm/")
-            || p.starts_with("pkg:golang/")
-            || p.starts_with("pkg:pypi/")
-            || p.starts_with("pkg:maven/")
-    };
-    let gradle_jvm_entry = |entry: &socket_patch_core::vendor::VendorEntry| {
-        entry.ecosystem == "jvm"
-            && entry.wiring.iter().any(|w| {
-                w.file.ends_with(".gradle")
-                    || w.file.ends_with(".gradle.kts")
-                    || w.file == socket_patch_core::vendor::jvm::gradle::INDEX_REL
-            })
-    };
-    if !candidates.iter().any(|c| takeover_capable(&c.purl)) {
-        // No takeover-capable candidates — nothing to reconcile.
-        return Ok(out);
-    }
-    use socket_patch_core::utils::purl::{canonical_purl as canon, strip_purl_qualifiers};
-    // Each takeover-capable candidate with its vendored ledger entry, if
-    // any (cloned out so the loop can mutate the state).
-    let takeover: Vec<(&Candidate, Option<socket_patch_core::vendor::VendorEntry>)> = candidates
+    group: socket_patch_core::utils::group_commit::GroupCommit,
+    rewrite: &socket_patch_core::patch::redirect::RewriteResult,
+    vendor_state: &std::io::Result<socket_patch_core::vendor::VendorState>,
+    takeover_migrated: &[String],
+) -> Result<(), String> {
+    use socket_patch_core::utils::group_commit::{captures, is_pending};
+    let files: Vec<(&String, &[u8])> = rewrite
+        .files
         .iter()
-        .filter(|c| takeover_capable(&c.purl))
-        .map(|c| {
-            let entry = vendor_state
-                .as_ref()
-                .ok()
-                .and_then(|s| {
-                    socket_patch_core::vendor::lookup_entry(
-                        &s.entries,
-                        strip_purl_qualifiers(&c.purl),
-                    )
-                })
-                .cloned();
-            (c, entry)
-        })
-        .filter(|(c, entry)| {
-            !c.purl.starts_with("pkg:maven/") || entry.as_ref().is_some_and(gradle_jvm_entry)
-        })
+        .map(|(p, s)| (p, s.as_bytes()))
+        .chain(rewrite.binary_files.iter().map(|(p, b)| (p, b.as_slice())))
         .collect();
-    if takeover.is_empty() {
-        return Ok(out);
-    }
-    // Compatibility must be known before the takeover removes a live
-    // patch. In particular, a v0 workspace can keep an existing local
-    // tuple even though hosted mode cannot replace it with a URL. Only
-    // an npm purl WITH a vendored entry can be taken over, so the bun
-    // locks are read here only when one exists — the candidate-file
-    // read below covers every other run.
-    let bun_takeover_refusal = if takeover
-        .iter()
-        .any(|(c, entry)| entry.is_some() && c.purl.starts_with("pkg:npm/"))
-    {
-        match socket_patch_core::utils::fs::read_regular_to_string(&common.cwd.join("bun.lock"))
-            .await
-        {
-            Ok(content) => socket_patch_core::patch::redirect::preflight_bun_hosted(&content).err(),
-            Err(e) if e.kind() == std::io::ErrorKind::NotFound => {
-                match socket_patch_core::utils::fs::read_regular_to_bytes_sync(
-                    &common.cwd.join("bun.lockb"),
-                ) {
-                    Ok(bytes) => {
-                        socket_patch_core::patch::redirect::preflight_bun_binary(&bytes).err()
-                    }
-                    Err(e) if e.kind() == std::io::ErrorKind::NotFound => None,
-                    Err(e) => Some(socket_patch_core::patch::redirect::RewriteWarning {
-                        code: "redirect_bun_lockb_invalid".into(),
-                        detail: format!("cannot read bun.lockb: {e}"),
-                    }),
+    // Uncaptured files first: the commit below is the step that makes the
+    // pins live. Each one's previous bytes are kept to put it back.
+    let (staged, direct): (Vec<_>, Vec<_>) = files.into_iter().partition(|(rel, _)| captures(rel));
+    let mut written: Vec<(std::path::PathBuf, Option<Vec<u8>>)> = Vec::new();
+    let result = async {
+        for (rel, content) in direct.into_iter().chain(staged) {
+            let path = common.cwd.join(rel);
+            if !captures(rel) {
+                if let Some(parent) = path.parent() {
+                    std::fs::create_dir_all(parent)
+                        .map_err(|e| format!("failed to create the directory of {rel}: {e}"))?;
                 }
+                let previous =
+                    match socket_patch_core::utils::fs::read_regular_to_bytes(&path).await {
+                        Ok(bytes) => Some(bytes),
+                        Err(e) if e.kind() == std::io::ErrorKind::NotFound => None,
+                        Err(e) => {
+                            return Err(format!("failed to read {rel}: {e} (nothing was changed)"))
+                        }
+                    };
+                written.push((path.clone(), previous));
             }
-            Err(e) => Some(socket_patch_core::patch::redirect::RewriteWarning {
-                code: "redirect_bun_lock_unsupported".into(),
-                detail: format!("cannot read bun.lock before mode takeover: {e}"),
-            }),
-        }
-    } else {
-        None
-    };
-    // Yarn berry twin of the bun gate: the berry rewriter's project-level
-    // refusals (mixed yarn.lock / package.json line endings, cacheKey,
-    // `.yarnrc.yml` compressionLevel) must be known before the takeover reverts a
-    // vendored berry purl, or the revert strips the live vendored patch
-    // and the rewriter then refuses the lock. Only entries the
-    // vendor ledger wired through the yarn-berry backend are gated (the
-    // lock is read only when one exists); an unreadable lock is left to
-    // the revert's own diagnostics.
-    let berry_entry = |entry: &socket_patch_core::vendor::VendorEntry| {
-        entry.ecosystem == "npm" && entry.flavor.as_deref() == Some("yarn-berry")
-    };
-    let berry_takeover_refusal = if takeover
-        .iter()
-        .any(|(_, entry)| entry.as_ref().is_some_and(berry_entry))
-    {
-        match socket_patch_core::utils::fs::read_regular_to_string(&common.cwd.join("yarn.lock"))
-            .await
-        {
-            Ok(lock) => {
-                let yarnrc = socket_patch_core::utils::fs::read_regular_to_string(
-                    &common.cwd.join(".yarnrc.yml"),
-                )
+            // Atomic stage+rename, mode-preserving (the vendored backend's
+            // writer); captured by the group until the commit.
+            socket_patch_core::utils::fs::atomic_write_bytes_preserving_mode(&path, content)
                 .await
-                .ok();
-                let manifest = socket_patch_core::utils::fs::read_regular_to_string(
-                    &common.cwd.join("package.json"),
-                )
-                .await
-                .ok();
-                socket_patch_core::patch::redirect::preflight_yarn_berry_hosted(
-                    &lock,
-                    manifest.as_deref(),
-                    yarnrc.as_deref(),
-                )
-                .err()
-            }
-            Err(_) => None,
+                .map_err(|e| format!("failed to write {rel}: {e} (nothing was changed)"))?;
         }
-    } else {
-        None
-    };
-    // Yarn classic twin: an offline mirror refuses the hosted rewrite
-    // (vendored mode works with one), so a vendored yarn classic entry
-    // must stay vendored rather than be reverted into neither mode.
-    let classic_entry = |entry: &socket_patch_core::vendor::VendorEntry| {
-        entry.ecosystem == "npm" && entry.flavor.as_deref() == Some("yarn-classic")
-    };
-    let classic_takeover_refusal = if takeover
-        .iter()
-        .any(|(_, entry)| entry.as_ref().is_some_and(classic_entry))
-    {
-        match socket_patch_core::utils::fs::read_regular_to_string(&common.cwd.join("yarn.lock"))
-            .await
-        {
-            Ok(lock) => {
-                let read_rc = |rel: &str| {
-                    let path = common.cwd.join(rel);
-                    async move {
-                        socket_patch_core::utils::fs::read_regular_to_string(&path)
-                            .await
-                            .ok()
-                    }
-                };
-                let yarnrc = read_rc(socket_patch_core::patch::redirect::YARNRC_REL).await;
-                let npmrc = read_rc(socket_patch_core::patch::redirect::npmrc::NPMRC_REL).await;
-                socket_patch_core::patch::redirect::preflight_yarn_classic_hosted(
-                    &lock,
-                    yarnrc.as_deref(),
-                    npmrc.as_deref(),
-                    &resolve_outer_yarn_mirror_for_process(&common.cwd),
-                )
-                .err()
+        if !takeover_migrated.is_empty() {
+            if let Ok(state) = vendor_state {
+                socket_patch_core::vendor::save_state(&common.cwd, state)
+                    .await
+                    .map_err(|e| {
+                        format!(
+                            "failed to update .socket/vendor/state.json: {e} (nothing was \
+                             changed: the vendored packages stay vendored)"
+                        )
+                    })?;
             }
-            Err(_) => None,
         }
+        Ok(())
+    }
+    .await;
+    if let Err(e) = result {
+        put_back(&written).await;
+        return Err(e);
+    }
+    // A takeover's commit spans the project and the vendored ledger, so it
+    // is journaled (`.socket/vendor/` is in use anyway). A hosted-only run
+    // writes nothing under `.socket/vendor/`: its files are replaced one by
+    // one and put back if one fails.
+    let committed = if takeover_migrated.is_empty() {
+        group.commit_unjournaled().await
     } else {
-        None
+        group.commit().await
     };
-    // vlt twin: the hosted rewriter's lock-level refusal must be known
-    // before a vendored vlt entry is reverted, or the revert strips the
-    // live vendored patch and the rewrite then refuses the lock.
-    let vlt_entry = |entry: &socket_patch_core::vendor::VendorEntry| {
-        entry.ecosystem == "npm" && entry.flavor.as_deref() == Some("vlt")
-    };
-    let vlt_takeover_refusal = if takeover
-        .iter()
-        .any(|(_, entry)| entry.as_ref().is_some_and(vlt_entry))
-    {
-        match socket_patch_core::utils::fs::read_regular_to_string(
-            &common
-                .cwd
-                .join(socket_patch_core::constants::npm_family::VLT_LOCK),
-        )
-        .await
-        {
-            Ok(lock) => {
-                let files = std::collections::BTreeMap::from([(
-                    socket_patch_core::constants::npm_family::VLT_LOCK.to_string(),
-                    lock,
-                )]);
-                socket_patch_core::patch::redirect::vlt::preflight_vlt_hosted(&files).err()
+    match committed {
+        Ok(_) => Ok(()),
+        // The journal finishes the commit, which the direct writes belong to.
+        Err(e) if is_pending(&e) => Err(format!(
+            "failed to write the hosted pins: {e} (the interrupted write is journaled; \
+             the next socket-patch command finishes it)"
+        )),
+        Err(e) => {
+            put_back(&written).await;
+            Err(format!(
+                "failed to write the hosted pins: {e} (nothing was changed)"
+            ))
+        }
+    }
+}
+
+/// Put the files [`commit_hosted_writes`] wrote straight to disk back to
+/// their previous bytes (removing the ones it created), best-effort.
+async fn put_back(written: &[(std::path::PathBuf, Option<Vec<u8>>)]) {
+    for (path, previous) in written.iter().rev() {
+        let _ = match previous {
+            Some(bytes) => {
+                socket_patch_core::utils::fs::atomic_write_bytes_preserving_mode(path, bytes).await
             }
-            Err(_) => None,
-        }
-    } else {
-        None
-    };
-    // Gradle twin: the hosted Gradle planner refuses builds and grants the
-    // vendored backend accepts (a custom `lockFile`, a settings-classpath
-    // GA, a same-GAV or incomplete grant, ...). Each refusal must be known
-    // before the revert strips the live vendored patch, or the planner
-    // then writes nothing and the build resolves the unpatched upstream.
-    // Every Gradle JVM takeover purl is checked against the build on disk.
-    let gradle_takeover_refusals: std::collections::HashMap<
-        String,
-        socket_patch_core::patch::redirect::RewriteWarning,
-    > = if takeover.iter().any(|(c, entry)| {
-        c.purl.starts_with("pkg:maven/") && entry.as_ref().is_some_and(gradle_jvm_entry)
-    }) {
-        let build =
-            socket_patch_core::patch::redirect::gradle::read_build_from_disk(&common.cwd).await;
-        takeover
-            .iter()
-            .filter(|(c, entry)| {
-                c.purl.starts_with("pkg:maven/") && entry.as_ref().is_some_and(gradle_jvm_entry)
-            })
-            .filter_map(|(c, _)| {
-                socket_patch_core::patch::redirect::gradle::takeover_refusal(
-                    &build.files,
-                    &build.unreadable,
-                    &c.dep,
-                )
-                .map(|w| (c.purl.clone(), w))
-            })
-            .collect()
-    } else {
-        std::collections::HashMap::new()
-    };
-    // A PyPI entry is gated on the hosted rewriter's reach after the
-    // revert: requirements.txt pins only the root file (#699), uv pins
-    // only the version the restored lock resolves (#723), and Poetry
-    // refuses every 0.x lock (#945). Checked once per purl, here, because
-    // the uv and Poetry checks read the ledger and the lock on disk.
-    let mut pypi_takeover_refusals: std::collections::HashMap<
-        String,
-        socket_patch_core::patch::redirect::RewriteWarning,
-    > = std::collections::HashMap::new();
-    for (c, entry) in &takeover {
-        let Some(entry) = entry.as_ref().filter(|_| c.purl.starts_with("pkg:pypi/")) else {
-            continue;
+            None => tokio::fs::remove_file(path).await,
         };
-        if let Err(warning) =
-            socket_patch_core::patch::redirect::preflight_pypi_takeover(&common.cwd, entry).await
-        {
-            pypi_takeover_refusals.insert(c.purl.clone(), warning);
-        }
     }
-    // The takeover refusal (if any) for one candidate: bun gates every
-    // npm purl, berry and vlt only their own vendored entries, Gradle each
-    // of its own purls, a pypi purl on a platform-tagged grant (#701), and a
-    // PyPI entry on the hosted rewriter's reach (`pypi_takeover_refusals`
-    // above). Berry also runs
-    // the rewriter's per-dep grant gate (a grant without the berry cache
-    // checksum is skipped by the rewriter, so reverting first would leave
-    // the package in neither mode). A refused purl is never dispatched (see
-    // the loop), so its wiring is not a write target here.
-    let takeover_refusal = |c: &Candidate,
-                            entry: Option<&socket_patch_core::vendor::VendorEntry>|
-     -> Option<socket_patch_core::patch::redirect::RewriteWarning> {
-        if c.purl.starts_with("pkg:maven/") {
-            return gradle_takeover_refusals.get(&c.purl).cloned();
-        }
-        if c.purl.starts_with("pkg:pypi/") {
-            // A platform-tagged grant is never pinned (#701 / #932): keep
-            // the vendored patch rather than revert it to nothing.
-            return entry.and_then(|_| {
-                socket_patch_core::patch::redirect::pypi_platform_wheel_refusal(&c.dep)
-                    .or_else(|| pypi_takeover_refusals.get(&c.purl).cloned())
-            });
-        }
-        if !c.purl.starts_with("pkg:npm/") {
-            return None;
-        }
-        let berry = entry.is_some_and(berry_entry);
-        bun_takeover_refusal
-            .clone()
-            .or_else(|| berry_takeover_refusal.clone().filter(|_| berry))
-            .or_else(|| {
-                berry
-                    .then(|| {
-                        socket_patch_core::patch::redirect::preflight_yarn_berry_hosted_dep(&c.dep)
-                            .err()
-                    })
-                    .flatten()
-            })
-            .or_else(|| {
-                classic_takeover_refusal
-                    .clone()
-                    .filter(|_| entry.is_some_and(classic_entry))
-            })
-            .or_else(|| {
-                vlt_takeover_refusal
-                    .clone()
-                    .filter(|_| entry.is_some_and(vlt_entry))
-            })
-    };
-    // NON-UTF-8 PRE-CHECK (#721) — the GUARD's undecodable-file rule
-    // (`engine::undecodable_guard`), checked BEFORE any revert dispatches
-    // (and under --dry-run too): a takeover that reverted first and was
-    // then refused by the guard would leave the reverted purls unpatched
-    // in both modes.
-    if takeover.iter().any(|(_, entry)| entry.is_some()) {
-        let view = socket_patch_core::vendor::lock_inventory::ProjectView::Disk(&common.cwd);
-        let read = socket_patch_core::hosted::engine::read_candidate_files(
-            &view,
-            &std::collections::BTreeSet::new(),
-            candidates,
-        )
-        .await;
-        if let Some(refusal) = socket_patch_core::hosted::engine::undecodable_guard(
-            &read.undecodable_reads,
-            candidates,
-        ) {
-            return Err(refusal);
-        }
-    }
-    // SYMLINK PRE-CHECK for the takeover reverts — the same rule as the
-    // SYMLINK GUARD below, applied to each ledger entry's recorded wiring
-    // (the revert backends also stage and rename over the file). Checked
-    // BEFORE any revert dispatches (and under --dry-run too) so "nothing
-    // was written" stays true.
-    let revert_targets = takeover
-        .iter()
-        .filter_map(|(c, entry)| {
-            entry
-                .as_ref()
-                .filter(|e| takeover_refusal(c, Some(e)).is_none())
-        })
-        .flat_map(|entry| entry.wiring.iter().map(|w| w.file.as_str()));
-    if let Some(linked) =
-        socket_patch_core::utils::fs::first_symlink(&common.cwd, revert_targets).await
-    {
-        return Err(socket_patch_core::hosted::engine::symlink_refusal(linked));
-    }
-    let mut refused: Vec<String> = Vec::new();
-    for (candidate, ledger_entry) in &takeover {
-        let purl = &candidate.purl;
-        let uuid = &candidate.dep.patch_uuid;
-        if let Some(entry) = ledger_entry {
-            if let Some(warning) = takeover_refusal(candidate, Some(entry)) {
-                refused.push(purl.clone());
-                // Project-level refusals repeat per purl; report each once.
-                let warning = serde_json::json!(warning);
-                if !out.pre_warnings.contains(&warning) {
-                    out.pre_warnings.push(warning);
-                }
-                continue;
-            }
-            if common.dry_run {
-                // Preview through the same per-purl revert machinery the
-                // wet run dispatches (write-free under dry_run): a
-                // vendored state the wet run would refuse to revert is
-                // refused here too, and one it would revert is announced
-                // as a takeover — never handed to the rewriters, which
-                // would refuse the still-vendored wiring.
-                let outcome =
-                    crate::commands::vendor::dispatch_revert_one(entry, &common.cwd, true).await;
-                if outcome.success && revert_keeps_wiring(&outcome) {
-                    refused.push(purl.clone());
-                    out.pre_warnings.push(drifted_takeover_warning(purl));
-                    continue;
-                }
-                if !outcome.success {
-                    refused.push(purl.clone());
-                    out.pre_warnings.push(serde_json::json!({
-                        "code": "redirect_vendored_revert_failed",
-                        "detail": format!(
-                            "{purl} is vendored and its vendored state could not be \
-                             reverted ({}); NOT switched to hosted — run `socket-patch vendor \
-                             --revert` to clean up, then re-run `scan --mode hosted`",
-                            outcome.error.as_deref().unwrap_or("unknown error")
-                        ),
-                    }));
-                    continue;
-                }
-                out.pre_warnings.push(serde_json::json!({
-                    "code": "redirect_would_revert_vendored",
-                    "detail": format!(
-                        "{purl} is currently vendored; the hosted wiring will \
-                         revert its vendored wiring, ledger entry, and committed \
-                         artifact first, then switch to hosted (mode takeover)"
-                    ),
-                }));
-                out.dry_run.push((purl.clone(), uuid.clone()));
-                out.migrated.push(purl.clone());
-                out.files
-                    .extend(entry.wiring.iter().map(|w| w.file.clone()));
-                dry_run_locks.insert(
-                    purl.clone(),
-                    entry.wiring.iter().map(|w| w.file.clone()).collect(),
-                );
-                continue;
-            }
-            let outcome =
-                crate::commands::vendor::dispatch_revert_one(entry, &common.cwd, false).await;
-            if !outcome.success {
-                refused.push(purl.clone());
-                out.pre_warnings.push(serde_json::json!({
-                    "code": "redirect_vendored_revert_failed",
-                    "detail": format!(
-                        "{purl} is vendored and its vendored state could not be \
-                         reverted ({}); NOT switched to hosted — run `socket-patch vendor \
-                         --revert` to clean up, then re-run `scan --mode hosted`",
-                        outcome.error.as_deref().unwrap_or("unknown error")
-                    ),
-                }));
-                continue;
-            }
-            if revert_keeps_wiring(&outcome) {
-                // A wiring record drifted and was left in place, so the
-                // project may still resolve through the vendored artifact
-                // and the ledger entry holds the only recorded originals
-                // (the RevertOutcome contract): keep both and refuse,
-                // exactly as `vendor --revert` reports it skipped.
-                refused.push(purl.clone());
-                out.pre_warnings.push(drifted_takeover_warning(purl));
-                continue;
-            }
-            // Drop the reverted entry from the in-memory ledger and
-            // persist per purl so a crash mid-run leaves a ledger
-            // matching the on-disk wiring. The entry stays dropped even
-            // when the save fails: its wiring and artifact ARE gone, so
-            // a later successful save in this loop writes the truth.
-            let state = vendor_state
-                .as_mut()
-                .expect("a vendored ledger entry was looked up in this state, so it loaded");
-            state
-                .entries
-                .retain(|k, e| canon(k) != canon(purl) && canon(&e.base_purl) != canon(purl));
-            if let Err(e) = socket_patch_core::vendor::save_state(&common.cwd, state).await {
-                // The wiring is reverted but the ledger still claims it;
-                // redirecting now would leave a ledger asserting wiring
-                // that is gone. Fail closed for this purl — and since its
-                // vendored wiring is already gone, report it as stranded.
-                refused.push(purl.clone());
-                out.unrecorded.push(purl.clone());
-                out.pre_warnings.push(serde_json::json!({
-                    "code": "redirect_vendored_revert_failed",
-                    "detail": format!(
-                        "{purl}: vendored wiring reverted but the vendored ledger \
-                         could not be updated ({e}); NOT switched to hosted — fix \
-                         .socket/vendor/state.json and re-run"
-                    ),
-                }));
-                continue;
-            }
-            out.pre_warnings.push(serde_json::json!({
-                "code": "redirect_takeover_reverted_vendored",
-                "detail": format!(
-                    "{purl} was vendored; reverted its vendored wiring, ledger \
-                     entry, and committed artifact before switching to hosted (mode \
-                     takeover: the project is now fully hosted for this package)"
-                ),
-            }));
-            out.pre_warnings.extend(
-                outcome
-                    .warnings
-                    .iter()
-                    .filter(|w| w.code == socket_patch_core::vendor::vlt_lock::REINSTALL_REQUIRED)
-                    .map(|w| serde_json::json!({ "code": w.code, "detail": w.detail })),
-            );
-            out.migrated.push(purl.clone());
-            out.files
-                .extend(entry.wiring.iter().map(|w| w.file.clone()));
-        } else {
-            // No usable ledger entry. If socket-owned vendored wiring for
-            // this crate is nevertheless present, the ledger is missing or
-            // corrupt — the originals needed to revert are unrecoverable,
-            // so redirecting on top would wedge the project. Refuse.
-            // (Cargo-only probe: Socket-owned `[patch.crates-io]` entries
-            // for exactly this name@version in the root Cargo.toml or a
-            // legacy `.cargo/config*` — another vendored version of the
-            // crate has its own ledger entry. An npm purl in this state
-            // falls through to the rewriters' own per-flavor
-            // diagnostics.)
-            let coords = purl
-                .starts_with("pkg:cargo/")
-                .then(|| purl_parts(purl).map(|(_, name, version)| (name, version)))
-                .flatten();
-            let wired = match &coords {
-                Some((n, v)) => {
-                    socket_patch_core::vendor::cargo::socket_wiring_present(&common.cwd, n, v).await
-                }
-                None => false,
-            };
-            if wired {
-                refused.push(purl.clone());
-                out.pre_warnings.push(serde_json::json!({
-                    "code": "redirect_vendored_revert_failed",
-                    "detail": format!(
-                        "{purl} has socket-owned vendored `[patch.crates-io]` \
-                         wiring but no usable vendored ledger entry \
-                         (.socket/vendor/state.json is missing or corrupt); NOT \
-                         redirected — restore the ledger or remove the vendored \
-                         wiring manually, then re-run"
-                    ),
-                }));
-            }
-        }
-    }
-    for purl in &refused {
-        if let Some((c, entry)) = takeover.iter().find(|(c, _)| &c.purl == purl) {
-            let reason = takeover_refusal(c, entry.as_ref())
-                .map_or_else(|| "vendored_revert_failed".to_string(), |w| w.code);
-            skipped.push(SkippedPatch::new(purl, &c.dep.patch_uuid, &reason));
-        }
-    }
-    // Purls leaving the rewrite set: refused takeovers, plus the dry-run
-    // takeover previews (still vendored on disk — the wet run reverts
-    // them before the rewriters ever see their files).
-    let withheld: std::collections::HashSet<&str> = refused
-        .iter()
-        .map(String::as_str)
-        .chain(out.dry_run.iter().map(|(p, _)| p.as_str()))
-        .collect();
-    if !withheld.is_empty() {
-        // Keep the dry-run takeover candidates' URLs (and the root locks
-        // their purl is vendored into) for the install-policy previews.
-        for (purl, _) in &out.dry_run {
-            let locks = dry_run_locks.get(purl).cloned().unwrap_or_default();
-            for c in candidates.iter().filter(|c| &c.purl == purl) {
-                out.previews.push(TakeoverPreview {
-                    artifact_url: c.dep.artifact_url.clone(),
-                    locks: locks.clone(),
-                });
-            }
-        }
-        candidates.retain(|c| !withheld.contains(c.purl.as_str()));
-    }
-    Ok(out)
-}
-
-/// Whether a takeover revert left (or, on `--dry-run`, would leave) vendored
-/// wiring in place: a drift-skipped record, or a reverted file that still
-/// references the artifact dir. The backends compute both signals on dry
-/// runs too, while `kept_artifact` itself is set only on wet runs.
-fn revert_keeps_wiring(outcome: &socket_patch_core::vendor::RevertOutcome) -> bool {
-    outcome.kept_artifact
-        || outcome.drift_skipped()
-        || outcome
-            .warnings
-            .iter()
-            .any(|w| w.code == "vendor_revert_residual_reference")
-}
-
-/// The refusal for a takeover whose vendored wiring drifted since vendoring.
-fn drifted_takeover_warning(purl: &str) -> serde_json::Value {
-    serde_json::json!({
-        "code": "redirect_vendored_revert_failed",
-        "detail": format!(
-            "{purl} is vendored and part of its vendored wiring was edited since \
-             vendoring, so it is left in place; NOT switched to hosted — restore or \
-             remove that wiring (`socket-patch vendor --revert` lists it), then re-run \
-             `scan --mode hosted`"
-        ),
-    })
-}
-
-/// What [`vendored_takeover`] did (or, on `--dry-run`, would do).
-#[derive(Default)]
-struct Takeover {
-    /// Its warnings, reported after the rewriters' own.
-    pre_warnings: Vec<serde_json::Value>,
-    /// Dry-run takeover previews: `(purl, uuid)` pairs whose vendored state
-    /// the wet run would revert and then redirect. Withheld from the
-    /// rewriters (their lock fragments still carry the vendored wiring the
-    /// wet run reverts FIRST) and counted as redirected, so the preview's
-    /// envelope matches the wet run's outcome.
-    dry_run: Vec<(String, String)>,
-    /// Human output: the purls migrated (or, on --dry-run, to be migrated)
-    /// from vendored to hosted.
-    migrated: Vec<String>,
-    /// Wet takeovers whose vendored wiring was reverted but whose ledger
-    /// update then failed: refused (never redirected), so unpatched in
-    /// both modes.
-    unrecorded: Vec<String>,
-    /// The files their revert touches (or would touch). Both modes count
-    /// `rewritten ∪ files`, so the preview's file count matches the wet
-    /// run's even for wiring files the hosted rewriter does not also
-    /// rewrite (a Gemfile line, a uv source).
-    files: std::collections::BTreeSet<String>,
-    /// The withheld dry-run takeover candidates' artifact URLs and wired
-    /// root locks, for the install-policy previews.
-    previews: Vec<socket_patch_core::hosted::engine::TakeoverPreview>,
 }
 
 // ── Human-output formatting ────────────────────────────────────────────────
@@ -2261,62 +1716,9 @@ const TAKEOVER_INFO_CODES: &[&str] = &[
     "redirect_would_revert_vendored",
 ];
 
-/// Lowercase tool names that must keep their spelling at the start of a
-/// sentence (`pnpm >=11 rejects…` must not become `Pnpm`).
-const LOWERCASE_TOOLS: &[&str] = &[
-    "npm",
-    "pnpm",
-    "yarn",
-    "bun",
-    "cargo",
-    "pip",
-    "pipenv",
-    "uv",
-    "poetry",
-    "pdm",
-    "hatch",
-    "go",
-    "gem",
-    "bundler",
-    "bundle",
-    "composer",
-    "mvn",
-    "gradle",
-    "dotnet",
-    "deno",
-    "rush",
-    "vlt",
-    "vlx",
-    "vlr",
-    "sbt",
-    "mill",
-    "scala-cli",
-];
-
-/// Capitalize the first letter of a message for an `Error:`/`Warning:`
-/// line, leaving it alone when the first word is an identifier rather than
-/// an English word: a file name (`pnpm-lock.yaml`), a purl, a flag, a path,
-/// or a lowercase tool name.
-fn sentence_case(msg: &str) -> String {
-    let first_word = msg.split_whitespace().next().unwrap_or("");
-    let is_word = !first_word.is_empty()
-        && first_word
-            .chars()
-            .all(|c| c.is_ascii_lowercase() || c == ',' || c == ';')
-        && !LOWERCASE_TOOLS.contains(&first_word.trim_end_matches([',', ';']));
-    if !is_word {
-        return msg.to_string();
-    }
-    let mut chars = msg.chars();
-    match chars.next() {
-        Some(c) => c.to_uppercase().chain(chars).collect(),
-        None => String::new(),
-    }
-}
-
 /// `Error: <Message>` for a hosted-flow failure.
 fn format_error_line(msg: &str) -> String {
-    format!("Error: {}", sentence_case(msg))
+    format!("Error: {}", crate::ui::sentence_case(msg))
 }
 
 /// Split `text` into wrap tokens at whitespace, except that a
@@ -2391,7 +1793,7 @@ fn split_sentences(text: &str) -> Vec<String> {
 /// each sentence stays on one line so the text remains greppable.
 fn format_warning(code: &str, detail: &str, width: Option<usize>) -> String {
     let prefix = "Warning: ";
-    let detail = sentence_case(detail.trim());
+    let detail = crate::ui::sentence_case(detail.trim());
     let (headline, bullets) = if code == "redirect_pnpm_trust_lockfile" {
         let mut sentences = split_sentences(&detail).into_iter();
         let head = sentences.next().unwrap_or_default();
@@ -2683,10 +2085,17 @@ fn created_settings_over_existing(
         .keys()
         .filter(|rel| {
             let base = rel.rsplit('/').next().unwrap_or(rel);
-            (matches!(base, "settings.gradle" | "settings.gradle.kts") || base == SBT_HOSTED_FILE)
+            (socket_patch_core::vendor::jvm::layout::is_gradle_settings(rel)
+                || base == SBT_HOSTED_FILE)
                 && !done.files.contains_key(rel.as_str())
         })
-        .find(|rel| std::fs::symlink_metadata(cwd.join(rel)).is_ok())
+        // Through the run's group commit: a takeover's staged revert may
+        // have removed a settings file the vendored wiring created.
+        .find(|rel| {
+            let path = cwd.join(rel);
+            socket_patch_core::utils::group_commit::exists(&path)
+                .unwrap_or_else(|| std::fs::symlink_metadata(&path).is_ok())
+        })
         .map(|rel| {
             let sbt = rel.rsplit('/').next() == Some(SBT_HOSTED_FILE);
             socket_patch_core::hosted::engine::Refusal {
@@ -2724,8 +2133,8 @@ mod tests {
     use super::{
         describe_skip_reason, format_error_line, format_next_steps, format_redirect_summary,
         format_takeover_line, format_unredirected, format_warning, join_names,
-        pnpm_lock_may_need_store_flag, pnpm_trust_rerun_reminder, sentence_case, split_sentences,
-        wrap_tokens, wrap_words, TAKEOVER_INFO_CODES,
+        pnpm_lock_may_need_store_flag, pnpm_trust_rerun_reminder, split_sentences, wrap_tokens,
+        wrap_words, TAKEOVER_INFO_CODES,
     };
     use super::{wheel_metadata_concurrency, WHEEL_METADATA_CONCURRENCY};
     use socket_patch_core::hosted::engine::REDIRECT_CANDIDATE_FILES;
@@ -4412,37 +3821,14 @@ mod tests {
     }
 
     #[test]
-    fn sentence_case_skips_identifiers_and_tool_names() {
-        assert_eq!(
-            sentence_case("failed to write x: y"),
-            "Failed to write x: y"
-        );
-        assert_eq!(
-            sentence_case("the hosted ledger ./a is malformed"),
-            "The hosted ledger ./a is malformed"
-        );
-        assert_eq!(sentence_case("pnpm >=11 rejects"), "pnpm >=11 rejects");
-        for tool in ["vlt", "vlx", "vlr"] {
-            assert_eq!(
-                sentence_case(&format!("{tool} ci fails")),
-                format!("{tool} ci fails")
-            );
-        }
-        assert_eq!(
-            sentence_case("pnpm-lock.yaml was repointed"),
-            "pnpm-lock.yaml was repointed"
-        );
-        assert_eq!(
-            sentence_case("pkg:npm/x@1 redirected"),
-            "pkg:npm/x@1 redirected"
-        );
-        assert_eq!(sentence_case("`vendor` refused"), "`vendor` refused");
-        assert_eq!(sentence_case("Already upper"), "Already upper");
-        assert_eq!(sentence_case(""), "");
-        assert_eq!(sentence_case("é accent"), "é accent");
+    fn format_error_line_sentence_cases_the_message() {
         assert_eq!(
             format_error_line("failed to resolve patch references: boom"),
             "Error: Failed to resolve patch references: boom"
+        );
+        assert_eq!(
+            format_error_line("pnpm-lock.yaml was repointed"),
+            "Error: pnpm-lock.yaml was repointed"
         );
     }
 

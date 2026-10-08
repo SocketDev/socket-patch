@@ -50,6 +50,10 @@
 //! unavailable or the fixture install cannot reach the registry — unless
 //! `SOCKET_PATCH_YARN_E2E_REQUIRED=1`; every assertion after is hard.
 
+#[path = "common/mod.rs"]
+mod common;
+use common::binary;
+
 use std::path::{Path, PathBuf};
 use std::process::{Command, Output};
 
@@ -91,10 +95,6 @@ macro_rules! skip {
 }
 
 // ── self-contained helpers ────────────────────────────────────────────
-
-fn binary() -> PathBuf {
-    PathBuf::from(env!("CARGO_BIN_EXE_socket-patch"))
-}
 
 fn scrub_socket_env(cmd: &mut Command) {
     for (k, _) in std::env::vars_os() {

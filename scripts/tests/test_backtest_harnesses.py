@@ -753,9 +753,9 @@ class VltReleaseTests(unittest.TestCase):
         for version in vlt.VERSIONS:
             self.assertEqual(vlt.release_status(version, self.supported, self.excluded),
                              'supported')
-        self.assertEqual(vlt.release_status('1.3.0', self.supported, self.excluded), 'unlisted')
-        self.assertEqual(vlt.unlisted_releases(['1.2.0', '0.0.0-22', '1.3.0', '0.0.0-0.17'],
-                                               self.supported, self.excluded), ['1.3.0'])
+        self.assertEqual(vlt.release_status('9.9.9', self.supported, self.excluded), 'unlisted')
+        self.assertEqual(vlt.unlisted_releases(['1.3.7', '0.0.0-22', '9.9.9', '0.0.0-0.17'],
+                                               self.supported, self.excluded), ['9.9.9'])
 
     def test_main_refuses_an_excluded_release(self):
         with self.assertRaises(SystemExit), patch('sys.stderr'):
@@ -770,9 +770,10 @@ class VltReleaseTests(unittest.TestCase):
                                    '1.2.0'])
         eras = {v: vlt.era_of(v) for v in ('0.0.0-18', '0.0.0-19', '1.0.0-rc.8', '1.0.0-rc.9',
                                            '1.0.0-rc.14', '1.0.0-rc.15', '1.0.0-rc.32',
-                                           '1.0.0-rc.33', '1.0.7', '1.0.8', '1.1.1', '1.2.0')}
+                                           '1.0.0-rc.33', '1.0.7', '1.0.8', '1.1.1', '1.2.0',
+                                           '1.3.7')}
         self.assertEqual(list(eras.values()),
-                         ['A0', 'A', 'A', 'B', 'B', 'C', 'C', 'D', 'D', 'E', 'E', 'F'])
+                         ['A0', 'A', 'A', 'B', 'B', 'C', 'C', 'D', 'D', 'E', 'E', 'F', 'F'])
 
     def test_pinned_integrity_covers_every_supported_release(self):
         pinned = json.loads(vlt.HISTORICAL_INTEGRITY.read_text())

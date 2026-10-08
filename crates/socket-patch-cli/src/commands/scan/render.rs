@@ -350,7 +350,7 @@ pub(super) fn already_recorded_line(purl: &str, uuid: &str, reapply: bool) -> St
     let tag = if reapply { "re-apply" } else { "skip" };
     format!(
         "  [{tag}] {purl} (already recorded: {})",
-        super::super::get::short_uuid(uuid)
+        crate::ui::short_uuid(uuid)
     )
 }
 
@@ -470,7 +470,7 @@ pub(super) fn patch_block(b: &PatchBlock) -> Vec<String> {
     let replaces = b
         .replaces
         .as_ref()
-        .map(|r| format!(" (replaces {})", super::super::get::short_uuid(r.uuid)))
+        .map(|r| format!(" (replaces {})", crate::ui::short_uuid(r.uuid)))
         .unwrap_or_default();
     lines.push(format!(
         "  {} [{}] {}{replaces}",

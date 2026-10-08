@@ -19,12 +19,12 @@ use crate::api::ranking::max_severity_order;
 use crate::api::types::PatchSearchResult;
 use crate::crawlers::python_crawler::canonicalize_pypi_name;
 use crate::crawlers::Ecosystem;
-use crate::utils::purl::{normalize_purl, strip_purl_qualifiers};
+use crate::utils::purl_key::PurlKey;
 
 use self::paths::{PathHit, PathMatcher};
 use self::socket_yml::{parse_file, ParsedFile, PatchesBlock};
 
-pub use self::report::{canon, policy_block, FilteredEntry, RetainedEntry};
+pub use self::report::{policy_block, FilteredEntry, RetainedEntry};
 pub use self::socket_yml::MAX_FILE_BYTES;
 
 /// Root file names, in the order they are read.
@@ -746,17 +746,16 @@ pub struct Offers {
 /// form, so `typing_extensions` and `typing.extensions` name the project
 /// whose purl is `pkg:pypi/typing-extensions`.
 pub fn package_spec_matches(spec: &str, purl: &str) -> bool {
-    // Versioned Composer specs name a release, including its pretty/padded
-    // spellings. Compare before lowercasing: dev branch names retain case.
-    if crate::utils::composer_version::composer_purl_identity(spec.trim()).is_some() {
-        return crate::utils::composer_version::composer_purls_equivalent(spec.trim(), purl);
-    }
-    let decoded = canonical_pypi_purl(normalize_purl(strip_purl_qualifiers(purl)).to_lowercase());
-    let spec = spec.trim().to_lowercase();
+    let spec = spec.trim();
     if spec.is_empty() {
         return false;
     }
-    let Some(rest) = decoded.strip_prefix("pkg:") else {
+    let key = PurlKey::new(purl);
+    // A filter spec is matched leniently: the package's identity
+    // (decoded, PyPI/NuGet/Composer names folded), then compared
+    // case-insensitively.
+    let folded = key.as_str().to_lowercase();
+    let Some(rest) = folded.strip_prefix("pkg:") else {
         return false;
     };
     let Some((eco, name_version)) = rest.split_once('/') else {
@@ -766,40 +765,33 @@ pub fn package_spec_matches(spec: &str, purl: &str) -> bool {
         Some(at) => &name_version[..at],
         None => name_version,
     };
-    if let Some(spec_rest) = spec.strip_prefix("pkg:") {
-        let spec_purl = canonical_pypi_purl(
-            normalize_purl(strip_purl_qualifiers(&format!("pkg:{spec_rest}"))).to_lowercase(),
-        );
-        let spec_rest = &spec_purl[4..];
-        let has_version = spec_rest
+    if spec
+        .get(..4)
+        .is_some_and(|p| p.eq_ignore_ascii_case("pkg:"))
+    {
+        let spec_key = PurlKey::new(&format!("pkg:{}", &spec[4..]));
+        let spec_folded = spec_key.as_str().to_lowercase();
+        let has_version = spec_folded[4..]
             .split_once('/')
             .is_some_and(|(_, nv)| nv.rfind('@').is_some_and(|i| i > 0));
-        return if has_version {
-            decoded == spec_purl
-        } else {
-            decoded
-                .strip_prefix(&spec_purl)
+        return if !has_version {
+            folded
+                .strip_prefix(&spec_folded)
                 .is_some_and(|tail| tail.starts_with('@'))
+        } else if eco == "composer" {
+            // A versioned Composer spec names a release, including its
+            // pretty/padded spellings; dev branch names retain case.
+            spec_key == key
+        } else {
+            spec_folded == folded
         };
     }
+    let spec = spec.to_lowercase();
     if eco == "pypi" {
         return name == canonicalize_pypi_name(&spec);
     }
     let spec = spec.replace(':', "/");
     name == spec || name.rsplit('/').next() == Some(spec.as_str())
-}
-
-/// Rewrite the name of a lowercased `pkg:pypi/<name>[@<version>]` purl to
-/// its PEP 503 canonical form; any other purl is returned unchanged.
-fn canonical_pypi_purl(purl: String) -> String {
-    let Some(name_version) = purl.strip_prefix("pkg:pypi/") else {
-        return purl;
-    };
-    let (name, version) = match name_version.rfind('@').filter(|&i| i > 0) {
-        Some(at) => name_version.split_at(at),
-        None => (name_version, ""),
-    };
-    format!("pkg:pypi/{}{version}", canonicalize_pypi_name(name))
 }
 
 /// The repo root for `cwd` (4.5) with the lookup's warnings: the checkout

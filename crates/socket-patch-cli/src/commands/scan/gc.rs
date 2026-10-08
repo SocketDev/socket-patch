@@ -5,8 +5,7 @@
 use socket_patch_core::manifest::cleanup_blobs::{ArtifactReferences, CleanupResult};
 use socket_patch_core::manifest::operations::{read_manifest, write_manifest};
 use socket_patch_core::manifest::schema::PatchManifest;
-use socket_patch_core::utils::composer_version::purl_identity_key;
-use socket_patch_core::utils::purl::strip_purl_qualifiers;
+use socket_patch_core::utils::purl_key::PurlKey;
 use socket_patch_core::vendor::{purl_keys_cover, VENDOR_STATE_REL};
 use std::collections::HashSet;
 use std::path::Path;
@@ -14,8 +13,8 @@ use std::time::Duration;
 
 use crate::args::GlobalArgs;
 use crate::commands::lock_cli::lock_failure;
-use crate::commands::rollback::sweep_failure;
 use crate::commands::vendor::{run_vendor_gc, VendorGcSummary};
+use crate::ui::sweep_failure;
 
 /// Aggregated outcome of a GC pass (or preview). Serialized into the
 /// `scan --json` output's `gc` sub-object. See CLI_CONTRACT.md for the
@@ -191,7 +190,7 @@ pub(super) async fn run_apply_gc(
     manifest_path: &Path,
     socket_dir: &Path,
     scanned_purls: &HashSet<String>,
-    vendored: &HashSet<String>,
+    vendored: &HashSet<PurlKey>,
 ) -> GcSummary {
     // Existence gate BEFORE the lock: `acquire` creates `.socket/`, and a
     // pristine checkout with neither a manifest nor a ledger must not gain
@@ -303,7 +302,7 @@ async fn preview_apply_gc(
     manifest_path: &Path,
     socket_dir: &Path,
     scanned_purls: &HashSet<String>,
-    vendored: &HashSet<String>,
+    vendored: &HashSet<PurlKey>,
 ) -> GcSummary {
     // Read-only preview of the vendored-state GC (lists, never reverts).
     let vendor_gc = run_vendor_gc(common, manifest_path, /*dry_run=*/ true).await;
@@ -314,11 +313,23 @@ async fn preview_apply_gc(
     };
     // Mirror the wet pass, which drops an unused vendored entry's manifest
     // keys before the blob sweep, or the preview under-reports orphans.
-    for purl in &vendor_gc.unused_reverted {
-        let base = strip_purl_qualifiers(purl).to_string();
-        manifest
-            .patches
-            .retain(|k, _| k != purl && strip_purl_qualifiers(k) != base);
+    // The dry pass reverted nothing, so the ledger still holds each entry
+    // (its base purl is part of the relation: a `!x`-encoded golang key).
+    if !vendor_gc.unused_reverted.is_empty() {
+        if let Ok(state) = socket_patch_core::vendor::load_state(&common.cwd).await {
+            for purl in &vendor_gc.unused_reverted {
+                let Some(entry) = state.entries.get(purl) else {
+                    continue;
+                };
+                for k in crate::commands::vendor::unused_vendored_manifest_keys(
+                    &manifest.patches,
+                    purl,
+                    entry,
+                ) {
+                    manifest.patches.remove(&k);
+                }
+            }
+        }
     }
     let prunable = detect_prunable(&manifest, scanned_purls, vendored);
     // Likewise drop the prunable entries in memory before the sweep: the
@@ -339,7 +350,7 @@ pub(super) async fn gc_json(
     manifest_path: &Path,
     socket_dir: &Path,
     scanned_purls: &HashSet<String>,
-    vendored: &HashSet<String>,
+    vendored: &HashSet<PurlKey>,
     dry_run: bool,
 ) -> serde_json::Value {
     if dry_run {
@@ -453,7 +464,7 @@ pub(super) async fn run_human_gc(
     manifest_path: &Path,
     socket_dir: &Path,
     scanned_purls: &HashSet<String>,
-    vendored: &HashSet<String>,
+    vendored: &HashSet<PurlKey>,
 ) {
     let preview = common.dry_run;
     let gc = if preview {
@@ -488,11 +499,11 @@ pub(super) fn print_human_gc(gc: &GcSummary, preview: bool) {
 /// installed (or no longer reachable to the crawler). Pure / no I/O so
 /// it's unit-testable.
 ///
-/// Comparison is on the canonical **base** PURL (qualifiers stripped,
-/// percent-decoded) on both sides: a manifest may hold several qualified
-/// release variants of one installed package, and API keys are encoded
-/// (`pkg:npm/%40scope/x@1`) where crawler purls are literal. Otherwise
-/// `--prune`/`--sync` would GC the very patches it just downloaded.
+/// Comparison is by [`PurlKey`] on both sides: a manifest may hold several
+/// qualified release variants of one installed package, API keys are
+/// encoded (`pkg:npm/%40scope/x@1`) and mixed-case (`pkg:nuget/Newtonsoft.Json`)
+/// where crawler purls are literal (the NuGet global cache is lowercase).
+/// Otherwise `--prune`/`--sync` would GC the very patches it just downloaded.
 ///
 /// `vendored` (the ledger's purl-key set) is always exempt: a vendored
 /// package is consumed from the committed `.socket/vendor/` artifact, so
@@ -504,15 +515,14 @@ pub(super) fn print_human_gc(gc: &GcSummary, preview: bool) {
 fn detect_prunable(
     manifest: &PatchManifest,
     scanned_purls: &HashSet<String>,
-    vendored: &HashSet<String>,
+    vendored: &HashSet<PurlKey>,
 ) -> Vec<String> {
-    let scanned_bases: HashSet<String> =
-        scanned_purls.iter().map(|p| purl_identity_key(p)).collect();
+    let scanned_bases: HashSet<PurlKey> = scanned_purls.iter().map(|p| PurlKey::new(p)).collect();
     manifest
         .patches
         .keys()
         .filter(|p| {
-            !scanned_bases.contains(&purl_identity_key(p))
+            !scanned_bases.contains(&PurlKey::new(p))
                 && !purl_keys_cover(vendored, p)
                 && crate::ecosystem_dispatch::crawl_covers_purl(p.as_str())
         })
@@ -591,7 +601,7 @@ mod tests {
     }
 
     /// The "nothing vendored" set most prune tests run with.
-    fn no_vendored() -> HashSet<String> {
+    fn no_vendored() -> HashSet<PurlKey> {
         HashSet::new()
     }
 
@@ -704,7 +714,7 @@ mod tests {
         // A vendored package is consumed from the committed artifact —
         // the crawler not seeing an installed copy is its normal state.
         let m = manifest_with(&[("pkg:npm/foo@1.0", "uuid-a"), ("pkg:npm/bar@2.0", "uuid-b")]);
-        let vendored: HashSet<String> = ["pkg:npm/foo@1.0".to_string()].into_iter().collect();
+        let vendored: HashSet<PurlKey> = [PurlKey::new("pkg:npm/foo@1.0")].into_iter().collect();
         let out = detect_prunable(&m, &scanned(&[]), &vendored);
         assert_eq!(
             out,
@@ -771,13 +781,35 @@ mod tests {
         );
     }
 
+    /// B20: the NuGet global-cache crawl spells the purl lowercase
+    /// (`newtonsoft.json`) while the manifest key is the API's mixed-case
+    /// `Newtonsoft.Json`; NuGet names and versions are case-insensitive, so
+    /// the installed package keeps its entry. Same for a PEP 503 spelling.
+    #[test]
+    fn detect_prunable_keeps_case_and_pep503_spellings_of_installed_packages() {
+        let m = manifest_with(&[
+            ("pkg:nuget/Newtonsoft.Json@13.0.3", "uuid-a"),
+            ("pkg:pypi/typing_extensions@4.12.2", "uuid-b"),
+            ("pkg:nuget/Gone.Package@1.0.0", "uuid-c"),
+        ]);
+        let s = scanned(&[
+            "pkg:nuget/newtonsoft.json@13.0.3",
+            "pkg:pypi/typing-extensions@4.12.2",
+        ]);
+        assert_eq!(
+            detect_prunable(&m, &s, &no_vendored()),
+            vec!["pkg:nuget/Gone.Package@1.0.0".to_string()]
+        );
+    }
+
     #[test]
     fn detect_prunable_exempts_qualified_variant_of_vendored_base() {
         // The ledger key set carries qualifier-stripped bases, so a
         // qualified manifest variant of a vendored package is exempt via
         // its base purl.
         let m = manifest_with(&[("pkg:pypi/six@1.16.0?artifact_id=wheel-a", "uuid-a")]);
-        let vendored: HashSet<String> = ["pkg:pypi/six@1.16.0".to_string()].into_iter().collect();
+        let vendored: HashSet<PurlKey> =
+            [PurlKey::new("pkg:pypi/six@1.16.0")].into_iter().collect();
         let out = detect_prunable(&m, &scanned(&[]), &vendored);
         assert!(
             out.is_empty(),
@@ -1304,7 +1336,7 @@ mod tests {
             .unwrap();
         let state_before = std::fs::read(tmp.path().join(".socket/vendor/state.json")).unwrap();
 
-        let vendored: HashSet<String> = [PURL.to_string()].into_iter().collect();
+        let vendored: HashSet<PurlKey> = [PurlKey::new(PURL)].into_iter().collect();
         let gc = preview_apply_gc(
             &gc_common(tmp.path()),
             &manifest_path,
@@ -1438,7 +1470,7 @@ mod tests {
             .await
             .unwrap();
 
-        let vendored: HashSet<String> = [PURL.to_string()].into_iter().collect();
+        let vendored: HashSet<PurlKey> = [PurlKey::new(PURL)].into_iter().collect();
         let gc = run_apply_gc(
             &gc_common(tmp.path()),
             &manifest_path,

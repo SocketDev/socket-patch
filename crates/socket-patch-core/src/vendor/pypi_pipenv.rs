@@ -255,9 +255,9 @@ pub(super) fn check_target_guards_superseding(
                         "pypi_pipenv_source_already_exists",
                         format!(
                             "{LOCK_FILE} already routes {section}.{key} through \
-                             .socket/vendor/pypi/{} (an earlier socket-patch vendor){why}; run \
-                             `socket-patch vendor --revert` for it and re-vendor",
-                            parts.uuid
+                             .socket/vendor/pypi/{} (an earlier socket-patch vendor){why}; {}",
+                            parts.uuid,
+                            super::common::REVERT_ALL_AND_REVENDOR,
                         ),
                     ));
                 }
@@ -392,7 +392,7 @@ pub(super) async fn wire_pipenv_superseding(
     superseded: Option<&VendorEntry>,
 ) -> Result<(Vec<WiringRecord>, PipenvMeta), (&'static str, String)> {
     // Before ANY write: a symlinked lock would be replaced by the rename-over.
-    refuse_symlinked(root, &[LOCK_FILE], "pypi_pipenv_symlink_unsupported").await?;
+    refuse_symlinked(root, &[LOCK_FILE]).await?;
     match check_target_guards_superseding(
         p,
         canon_name,
@@ -524,9 +524,7 @@ pub(super) async fn revert_pipenv(
     // A symlinked lock would be replaced by the atomic rewrite-over, leaving
     // its target stale and never restoring the link. Keep the artifact (the
     // wiring still routes through the linked file) and fail.
-    if let Err((code, detail)) =
-        refuse_symlinked(root, &[LOCK_FILE], "pypi_pipenv_symlink_unsupported").await
-    {
+    if let Err((code, detail)) = refuse_symlinked(root, &[LOCK_FILE]).await {
         return RevertOutcome {
             kept_artifact: true,
             success: false,
@@ -2025,7 +2023,7 @@ mod tests {
         let err = wire_pipenv(&p, &root, "six", "1.16.0", REL_WHEEL, WHEEL_SHA, UUID, &[])
             .await
             .unwrap_err();
-        assert_eq!(err.0, "pypi_pipenv_symlink_unsupported");
+        assert_eq!(err.0, crate::hosted::engine::SYMLINK_REFUSAL);
         assert!(std::fs::symlink_metadata(root.join(LOCK_FILE))
             .unwrap()
             .file_type()
@@ -2051,7 +2049,7 @@ mod tests {
             outcome
                 .error
                 .as_deref()
-                .is_some_and(|e| e.contains("pypi_pipenv_symlink_unsupported")),
+                .is_some_and(|e| e.contains(crate::hosted::engine::SYMLINK_REFUSAL)),
             "{:?}",
             outcome.error
         );

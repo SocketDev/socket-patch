@@ -21,16 +21,17 @@ use socket_patch_core::api::types::{BatchPackagePatches, PatchResponse, PatchSea
 use socket_patch_core::manifest::operations::{read_manifest, write_manifest};
 use socket_patch_core::manifest::schema::PatchRecord;
 use socket_patch_core::telemetry::{track_patch_vendor_failed, PendingTelemetry};
-use socket_patch_core::utils::composer_version::composer_purls_equivalent;
-use socket_patch_core::utils::purl::strip_purl_qualifiers;
+use socket_patch_core::utils::purl_key::PurlKey;
 use socket_patch_core::vendor::{load_state, lookup_entry, save_state, VendorState};
 use std::collections::{HashMap, HashSet};
 use std::path::Path;
 use std::time::Duration;
 
 use crate::args::GlobalArgs;
+use crate::commands::agent_download::{
+    download_patch_records_reusing, DetachedDownload, DownloadParams,
+};
 use crate::commands::bun_preflight::bun_vendor_preflight_with_ledger;
-use crate::commands::get::{download_patch_records_reusing, DetachedDownload, DownloadParams};
 use crate::commands::lock_cli::lock_failure;
 use crate::commands::vendor::{
     note_classic_migration_risk, symlinked_wiring_warnings, track_outcomes_for_vendor,
@@ -481,16 +482,11 @@ async fn migrate_legacy_manifest_records(
         if !(entry.detached && entry.record.is_some() && entry.uuid == record.uuid) {
             continue;
         }
-        let base = strip_purl_qualifiers(&entry.base_purl);
+        let base = PurlKey::new(&entry.base_purl);
         let keys: Vec<String> = manifest
             .patches
             .keys()
-            .filter(|k| {
-                *k == &key
-                    || *k == purl
-                    || strip_purl_qualifiers(k) == base
-                    || composer_purls_equivalent(k, base)
-            })
+            .filter(|k| *k == &key || *k == purl || PurlKey::new(k) == base)
             .cloned()
             .collect();
         for k in keys {
@@ -550,7 +546,7 @@ async fn run_vendor_json_path(
     manifest_path: &Path,
     socket_dir: &Path,
     scanned_purls: &HashSet<String>,
-    vendored_purls: &HashSet<String>,
+    vendored_purls: &HashSet<PurlKey>,
     prune: bool,
     telemetry_token: Option<&str>,
     telemetry_org: Option<&str>,
@@ -730,7 +726,7 @@ async fn run_vendor_interactive_path(
     manifest_path: &Path,
     socket_dir: &Path,
     scanned_purls: &HashSet<String>,
-    vendored_purls: &HashSet<String>,
+    vendored_purls: &HashSet<PurlKey>,
     prune: bool,
     telemetry_token: Option<&str>,
     telemetry_org: Option<&str>,
@@ -818,11 +814,7 @@ fn format_nothing_vendored(download_failed: u64) -> String {
 /// step: `Error (<code>): <Message>.`. The code and message are the ones
 /// the JSON envelope carries.
 pub(crate) fn format_vendor_step_error(code: &str, message: &str) -> String {
-    let mut chars = message.trim_end_matches('.').chars();
-    let message: String = match chars.next() {
-        Some(first) => first.to_uppercase().chain(chars).collect(),
-        None => String::new(),
-    };
+    let message = crate::ui::sentence_case(message.trim_end_matches('.'));
     let mut out = if message.is_empty() {
         format!("Error ({code}).")
     } else {
@@ -915,7 +907,7 @@ pub(super) fn boxed_vendor_json_path<'a>(
     manifest_path: &'a Path,
     socket_dir: &'a Path,
     scanned_purls: &'a HashSet<String>,
-    vendored_purls: &'a HashSet<String>,
+    vendored_purls: &'a HashSet<PurlKey>,
     prune: bool,
     telemetry_token: Option<&'a str>,
     telemetry_org: Option<&'a str>,
@@ -958,7 +950,7 @@ pub(super) fn boxed_vendor_interactive_path<'a>(
     manifest_path: &'a Path,
     socket_dir: &'a Path,
     scanned_purls: &'a HashSet<String>,
-    vendored_purls: &'a HashSet<String>,
+    vendored_purls: &'a HashSet<PurlKey>,
     prune: bool,
     telemetry_token: Option<&'a str>,
     telemetry_org: Option<&'a str>,

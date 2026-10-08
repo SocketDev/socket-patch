@@ -16,6 +16,7 @@ use crate::api::client::{ApiError, ApiFuture, PatchApi};
 use crate::api::ranking::cmp_search_results;
 use crate::api::types::{BatchPackagePatches, PackageVendorResult, PatchResponse, SearchResponse};
 use crate::utils::purl::{normalize_purl, strip_purl_qualifiers};
+use crate::utils::purl_key::PurlKey;
 
 use super::types::MAX_REFERENCE_BATCH;
 
@@ -200,6 +201,19 @@ pub(crate) async fn batch_search(
             owners.entry(purl.as_str()).or_default().push(root.as_str());
         }
     }
+    // Response packages are matched to their askers by identity, not by
+    // spelling: the API may answer `Newtonsoft.Json` for a crawled
+    // `newtonsoft.json`, `typing_extensions` for `typing-extensions`, or a
+    // composer `@3.0.2.0` for `@3.0.2`.
+    let mut owners_by_key: HashMap<PurlKey, Vec<&str>> = HashMap::new();
+    for (purl, roots) in &owners {
+        let list = owners_by_key.entry(PurlKey::new(purl)).or_default();
+        for root in roots {
+            if !list.contains(root) {
+                list.push(root);
+            }
+        }
+    }
     let union: Vec<String> = owners.keys().map(|p| p.to_string()).collect();
     let chunks: Vec<Vec<String>> = union
         .chunks(batch_size.max(1))
@@ -229,8 +243,7 @@ pub(crate) async fn batch_search(
                     if pkg.patches.is_empty() {
                         continue;
                     }
-                    let key = normalize_purl(strip_purl_qualifiers(&pkg.purl)).into_owned();
-                    let targets: Vec<&str> = match owners.get(key.as_str()) {
+                    let targets: Vec<&str> = match owners_by_key.get(&PurlKey::new(&pkg.purl)) {
                         Some(roots) => roots.clone(),
                         None => chunk_roots.iter().copied().collect(),
                     };
@@ -467,5 +480,78 @@ mod tests {
             ]
         );
         assert_eq!(pairs(true)[0].1, "a-paid");
+    }
+
+    /// Answers every batch with the mixed-case NuGet spelling of
+    /// `pkg:nuget/newtonsoft.json@13.0.1`, as the API does.
+    struct CasedNuget;
+
+    impl PatchApi for CasedNuget {
+        fn uses_public_proxy(&self) -> bool {
+            false
+        }
+        fn search_patches_batch<'a>(
+            &'a self,
+            _purls: &'a [String],
+        ) -> ApiFuture<'a, crate::api::types::BatchSearchResponse> {
+            Box::pin(async {
+                Ok(crate::api::types::BatchSearchResponse {
+                    packages: vec![crate::api::types::BatchPackagePatches {
+                        purl: "pkg:nuget/Newtonsoft.Json@13.0.1".to_string(),
+                        patches: vec![crate::api::types::BatchPatchInfo {
+                            uuid: "u-1".to_string(),
+                            purl: "pkg:nuget/Newtonsoft.Json@13.0.1".to_string(),
+                            tier: "free".to_string(),
+                            cve_ids: Vec::new(),
+                            ghsa_ids: Vec::new(),
+                            severity: None,
+                            title: String::new(),
+                            published_at: None,
+                        }],
+                    }],
+                    can_access_paid_patches: false,
+                })
+            })
+        }
+        fn search_patches_by_package<'a>(
+            &'a self,
+            _purl: &'a str,
+        ) -> ApiFuture<'a, crate::api::types::SearchResponse> {
+            Box::pin(async { Err(ApiError::Other("unused".into())) })
+        }
+        fn fetch_registry_references<'a>(
+            &'a self,
+            _uuids: &'a [String],
+        ) -> ApiFuture<'a, HashMap<String, crate::api::types::PackageVendorResult>> {
+            Box::pin(async { Err(ApiError::Other("unused".into())) })
+        }
+        fn fetch_patch<'a>(
+            &'a self,
+            _uuid: &'a str,
+        ) -> ApiFuture<'a, Option<crate::api::types::PatchResponse>> {
+            Box::pin(async { Err(ApiError::Other("unused".into())) })
+        }
+        fn download_artifact<'a>(&'a self, _url: &'a str, _max: u64) -> ApiFuture<'a, Vec<u8>> {
+            Box::pin(async { Err(ApiError::Other("unused".into())) })
+        }
+    }
+
+    #[tokio::test]
+    async fn batch_search_credits_a_respelled_response_only_to_its_asker() {
+        let provider = Provider::new(Arc::new(CasedNuget), Duration::from_secs(5), 2);
+        let mut roots: BTreeMap<String, Vec<String>> = BTreeMap::new();
+        roots.insert(
+            "a".to_string(),
+            vec!["pkg:nuget/newtonsoft.json@13.0.1".to_string()],
+        );
+        roots.insert("b".to_string(), vec!["pkg:npm/left-pad@1.3.0".to_string()]);
+        // One chunk holds both roots' purls: a spelling-keyed owner lookup
+        // misses and falls back to crediting every root in the chunk.
+        let outcome = batch_search(&provider, &roots, 10).await;
+        assert_eq!(outcome.roots["a"].packages.len(), 1);
+        assert!(
+            outcome.roots["b"].packages.is_empty(),
+            "a NuGet package must not be credited to a root that never asked for it"
+        );
     }
 }

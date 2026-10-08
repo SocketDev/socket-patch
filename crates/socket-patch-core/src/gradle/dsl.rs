@@ -33,7 +33,7 @@ pub fn dsl_of(rel: &str) -> Option<Dsl> {
 /// Script bytes as text: a leading BOM is dropped and anything that is not
 /// UTF-8 is `None` (unparseable), never decoded lossily.
 pub fn decode(bytes: &[u8]) -> Option<String> {
-    let bytes = bytes.strip_prefix(b"\xef\xbb\xbf").unwrap_or(bytes);
+    let bytes = crate::formats::text::strip_bom_bytes(bytes);
     String::from_utf8(bytes.to_vec()).ok()
 }
 
@@ -97,7 +97,7 @@ fn lex(src: &str, dsl: Dsl) -> (Vec<Token>, bool) {
     let b = src.as_bytes();
     let mut out = Vec::new();
     let mut clean = true;
-    let mut i = if src.starts_with('\u{feff}') { 3 } else { 0 };
+    let mut i = crate::formats::text::split_bom(src).0.len();
     // A `#!` first line (shebang) is a comment in both DSLs.
     if b[i..].starts_with(b"#!") {
         while i < b.len() && b[i] != b'\n' {

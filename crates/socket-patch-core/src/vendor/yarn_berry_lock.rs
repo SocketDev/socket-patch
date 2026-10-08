@@ -318,7 +318,7 @@ pub async fn vendor_yarn_berry<'a>(
         // A reused tarball is kept as is, so retrying cannot help when the
         // service serves other bytes: only a fresh vendor can wire it.
         None if reused && service_serves_other_bytes => return done_failure_unstage(purl,
-            format!("the patch service now serves other bytes than the committed {rel_tgz}, and no Yarn Berry checksum is recorded for it; restore yarn.lock from version control, or run `socket-patch vendor --revert` (it reverts every vendored package) and vendor again"),
+            format!("the patch service now serves other bytes than the committed {rel_tgz}, and no Yarn Berry checksum is recorded for it; restore yarn.lock from version control, or {}", super::common::REVERT_ALL_AND_REVENDOR),
             project_root, &uuid_dir_rel, uuid_dir_preexisted).await,
         None if reused => return done_failure_unstage(purl,
             format!("no Yarn Berry checksum is recorded for the committed {rel_tgz}; re-run online so the patch service can supply it"),

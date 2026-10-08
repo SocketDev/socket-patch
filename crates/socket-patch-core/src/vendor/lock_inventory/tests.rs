@@ -1660,6 +1660,94 @@ async fn gem_inventory_memory_view_reads_the_lock_bundler_loads() {
     assert_eq!(gem_purls(&entries), vec!["pkg:gem/rack@2.0.0"]);
 }
 
+/// #749 / #751: a gem project whose lock bundler loads is none
+/// socket-patch reads (a custom `BUNDLE_LOCKFILE`, an unsupported
+/// `BUNDLE_GEMFILE`, a `Gemfile` + `gems.rb` twin)
+/// yields no gem entries AND a `gem_lock_unsupported` diagnosis, so a
+/// lockfile-only scan says the gems were not scanned instead of reporting
+/// none. Supported layouts, and projects without gem files, stay quiet.
+#[tokio::test]
+async fn gem_inventory_diagnoses_a_lock_it_cannot_read() {
+    let diagnosed = |project: &MemoryProject| {
+        let project = project.clone();
+        async move {
+            let (entries, unsupported) =
+                inventory_project_diagnosed_in(&ProjectView::Memory(&project)).await;
+            let codes: Vec<&str> = unsupported.iter().map(|d| d.code).collect();
+            let detail = unsupported
+                .iter()
+                .find(|d| d.code == "gem_lock_unsupported")
+                .map(|d| d.detail.clone());
+            (gem_purls(&entries), codes, detail)
+        }
+    };
+    let lock =
+        |bundled: &str| rack_lock("https://rubygems.org/", "2.2.8").replace("2.6.9", bundled);
+
+    let mut custom = MemoryProject::new();
+    custom.insert_text("Gemfile", "gem \"rack\"\n");
+    custom.insert_text("Gemfile.lock", lock("2.6.2"));
+    custom.insert_text("custom.lock", lock("2.6.2"));
+    custom.insert_text(".bundle/config", "---\nBUNDLE_LOCKFILE: \"custom.lock\"\n");
+    let (purls, codes, detail) = diagnosed(&custom).await;
+    assert!(purls.is_empty(), "{purls:?}");
+    assert_eq!(codes, vec!["gem_lock_unsupported"]);
+    let detail = detail.unwrap();
+    assert!(
+        detail.contains("NOT scanned") && detail.contains("custom.lock"),
+        "{detail}"
+    );
+
+    let mut gemfile = MemoryProject::new();
+    gemfile.insert_text("Gemfile.lock", lock("2.6.2"));
+    gemfile.insert_text(".bundle/config", "---\nBUNDLE_GEMFILE: \"Gemfile.next\"\n");
+    let (purls, codes, _) = diagnosed(&gemfile).await;
+    assert!(purls.is_empty(), "{purls:?}");
+    assert_eq!(codes, vec!["gem_lock_unsupported"]);
+
+    let mut twin = MemoryProject::new();
+    twin.insert_text("Gemfile", "gem \"rack\"\n");
+    twin.insert_text("gems.rb", "gem \"rack\"\n");
+    twin.insert_text("Gemfile.lock", lock("1.17.3"));
+    twin.insert_text("gems.locked", lock("2.6.2"));
+    let (purls, codes, detail) = diagnosed(&twin).await;
+    assert!(purls.is_empty(), "{purls:?}");
+    assert_eq!(codes, vec!["gem_lock_unsupported"]);
+    assert!(detail.unwrap().contains("gems.rb"));
+    // Locks that agree on the major still leave the installing bundler
+    // unknown: a twin is never read.
+    let mut bundler1 = twin.clone();
+    bundler1.insert_text("gems.locked", lock("1.17.3"));
+    let (purls, codes, _) = diagnosed(&bundler1).await;
+    assert!(purls.is_empty(), "{purls:?}");
+    assert_eq!(codes, vec!["gem_lock_unsupported"]);
+
+    // A symlinked spelling (a git mode-120000 entry, whose target the
+    // memory view doesn't carry) may still be a file to bundler, so the
+    // twin stays unread (security review on #768).
+    for linked in ["gems.rb", "Gemfile"] {
+        let mut symlinked = twin.clone();
+        symlinked.insert(linked, MemoryEntry::Symlink);
+        let (purls, codes, _) = diagnosed(&symlinked).await;
+        assert!(purls.is_empty(), "{linked}: {purls:?}");
+        assert_eq!(codes, vec!["gem_lock_unsupported"], "{linked}");
+    }
+
+    // Supported layouts: entries, no diagnosis.
+    let mut plain = MemoryProject::new();
+    plain.insert_text("Gemfile", "gem \"rack\"\n");
+    plain.insert_text("Gemfile.lock", lock("2.6.2"));
+    let (purls, codes, _) = diagnosed(&plain).await;
+    assert_eq!(purls, vec!["pkg:gem/rack@2.2.8"]);
+    assert!(codes.is_empty(), "{codes:?}");
+
+    // No gem files: a stray bundler setting is not a gem project.
+    let mut npm = MemoryProject::new();
+    npm.insert_text(".bundle/config", "---\nBUNDLE_LOCKFILE: \"custom.lock\"\n");
+    let (_, codes, _) = diagnosed(&npm).await;
+    assert!(codes.is_empty(), "{codes:?}");
+}
+
 /// #736: ledger recovery's GEM remote set comes from the lock bundler
 /// loads too, never from an ignored twin's sources.
 #[tokio::test]
@@ -3562,4 +3650,26 @@ async fn requirements_index_option_in_an_include_spans_the_tree() {
         entry(&entries, "idna").integrity,
         LockIntegrity::Sha256AnyOf(vec![sha.clone()])
     );
+}
+
+#[tokio::test]
+async fn lookup_matches_by_purl_identity() {
+    let entry = |ecosystem: &'static str, name: &str, version: &str| LockfileEntry {
+        ecosystem,
+        source_kind: SourceKind::Unspecified,
+        name: name.into(),
+        version: version.into(),
+        purl: format!("pkg:{ecosystem}/{name}@{version}"),
+        resolved: None,
+        integrity: LockIntegrity::None,
+    };
+    let entries = vec![
+        entry("composer", "psr/log", "3.0.2"),
+        entry("pypi", "typing-extensions", "4.12.2"),
+    ];
+    // The API pads composer releases and may spell a PyPI name either way.
+    assert!(lookup(&entries, "pkg:composer/psr/log@3.0.2.0").is_some());
+    assert!(lookup(&entries, "pkg:composer/Psr/Log@v3.0.2").is_some());
+    assert!(lookup(&entries, "pkg:composer/psr/log@3.0.3").is_none());
+    assert!(lookup(&entries, "pkg:pypi/typing_extensions@4.12.2").is_some());
 }

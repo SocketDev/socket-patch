@@ -19,9 +19,9 @@ use socket_patch_core::manifest::schema::PatchManifest;
 use socket_patch_core::telemetry::{
     spawn_patch_scan_failed, spawn_patch_scanned, PendingTelemetry,
 };
-use socket_patch_core::utils::composer_version::purl_identity_key;
 use socket_patch_core::utils::concurrent::{api_concurrency_for, ordered_concurrent};
-use socket_patch_core::utils::purl::{normalize_purl, strip_purl_qualifiers};
+use socket_patch_core::utils::purl::{canonical_purl, normalize_purl};
+use socket_patch_core::utils::purl_key::{canonical_base_purl, PurlKey};
 use socket_patch_core::vendor::{purl_keys_cover, VendorState};
 use socket_patch_core::vex::discover::{LedgerLiveness, WiringMode};
 use std::collections::{HashMap, HashSet};
@@ -33,7 +33,9 @@ use crate::commands::vex::{generate_vex_from_manifest_path, VexEmbedArgs};
 use crate::ecosystem_dispatch::{crawl_ecosystems, crawl_ecosystems_with_npm};
 use crate::ui::{self, plural, print_json, StatusLine};
 
-use super::get::{download_and_apply_patches_with, DownloadParams, DownloadRun};
+use crate::commands::agent_download::{
+    download_and_apply_patches_with, DownloadParams, DownloadRun,
+};
 
 use self::policy::{load_invocation_policy, InvocationPolicy, PolicyLoadError, ScanPolicy};
 pub use self::socket_yml_args::{SocketYmlArgs, MIN_SEVERITY_ENV};
@@ -64,7 +66,6 @@ pub(crate) use self::discovery::{
 use self::gc::gc_json;
 pub(crate) use self::hosted::boxed_run_redirect_selected;
 use self::hosted::run_redirect;
-pub(crate) use self::hosted::{vlt_rollback_heal, vlt_takeover_heal};
 use self::vendor_flow::{
     boxed_vendor_interactive_path, boxed_vendor_json_path, fold_vendored_skips_into_apply,
     partition_skipped_selected,
@@ -791,7 +792,7 @@ struct AgentSelection {
 
 fn partition_agent_selection(
     selected: Vec<PatchSearchResult>,
-    vendored: &HashSet<String>,
+    vendored: &HashSet<PurlKey>,
     lockfile_only: &LockfileSupplement,
 ) -> AgentSelection {
     let (kept, vendored_records) =
@@ -975,34 +976,33 @@ pub(super) async fn classify_overlap_takeover_with(
     }
     // Each overlapping vendored entry's uuid + the lockfiles it wired
     // (revert reads the same set).
-    let canon = |p: &str| normalize_purl(strip_purl_qualifiers(p)).into_owned();
     let mut vendor_by_purl: std::collections::HashMap<
-        String,
+        PurlKey,
         &socket_patch_core::vendor::VendorEntry,
     > = std::collections::HashMap::new();
     for (key, entry) in &vendor.entries {
-        vendor_by_purl.entry(canon(key)).or_insert(entry);
+        vendor_by_purl.entry(PurlKey::new(key)).or_insert(entry);
         vendor_by_purl
-            .entry(canon(&entry.base_purl))
+            .entry(PurlKey::new(&entry.base_purl))
             .or_insert(entry);
     }
     // Each hosted pin's patch uuid (embedded in every hosted artifact URL,
     // whatever the host). A non-empty overlap proves `redirect` is `Some`.
-    let mut redirect_uuid_by_purl: std::collections::HashMap<String, &str> =
+    let mut redirect_uuid_by_purl: std::collections::HashMap<PurlKey, &str> =
         std::collections::HashMap::new();
     for (key, record) in redirect.iter().flat_map(|r| &r.records) {
         redirect_uuid_by_purl
-            .entry(canon(key))
+            .entry(PurlKey::new(key))
             .or_insert(record.uuid.as_str());
     }
     let discovery = crate::commands::discover_wiring(common, cwd).await;
     let mut liveness = LedgerLiveness::new(cwd, &discovery, None);
     for purl in overlap {
-        let hosted_live = match redirect_uuid_by_purl.get(&purl) {
+        let hosted_live = match redirect_uuid_by_purl.get(&PurlKey::new(&purl)) {
             Some(uuid) => liveness.redirect_record(&purl, uuid).await,
             None => discovery.wires_package(&purl, WiringMode::Hosted),
         };
-        let vendored_live = match vendor_by_purl.get(&purl) {
+        let vendored_live = match vendor_by_purl.get(&PurlKey::new(&purl)) {
             Some(entry) => liveness.vendor_entry(entry).await,
             None => false,
         };
@@ -1154,7 +1154,10 @@ pub(super) const GRADLE_USER_HOME_DIFFERS: &str = "gradle_user_home_differs";
 struct GradleScan {
     /// `(code, detail)` run-level warnings.
     notes: Vec<(String, String)>,
-    /// Base purls (normalized) of the packages crawled from a Gradle cache.
+    /// Base purls ([`canonical_base_purl`]) of the packages crawled from a
+    /// Gradle cache. Maven coordinates are case-sensitive, so the canonical
+    /// spelling is already the identity; these stay strings because the
+    /// lock-file GAVs they are checked against are built as strings.
     gradle_purls: HashSet<String>,
     /// Base purls the build's lock files name; `None` when they were not
     /// read (no Gradle build at the cwd, or no Gradle-cached package to
@@ -1204,7 +1207,7 @@ async fn gradle_scan(
         gradle_purls: crawled
             .iter()
             .filter(|p| gradle_cache::is_gradle_version_dir(&p.path))
-            .map(|p| normalize_purl(strip_purl_qualifiers(&p.purl)).into_owned())
+            .map(|p| canonical_base_purl(&p.purl))
             .collect(),
         ..GradleScan::default()
     };
@@ -1220,13 +1223,16 @@ async fn gradle_scan(
             m.patches
                 .keys()
                 .filter(|k| k.starts_with("pkg:maven/"))
-                .map(|k| normalize_purl(strip_purl_qualifiers(k)).into_owned())
+                .map(|k| canonical_base_purl(k))
                 .collect()
         })
         .unwrap_or_default();
     let want_locks = !out.gradle_purls.is_empty();
     let Ok((gate, locked, mismatch, env)) = tokio::task::spawn_blocking(move || {
-        let gradle_build = gradle_cache::has_gradle_marker(&cwd);
+        let gradle_build = socket_patch_core::vendor::jvm::layout::has_build(
+            &cwd,
+            socket_patch_core::vendor::jvm::layout::BuildTool::Gradle,
+        );
         let env = JvmEnv::from_process();
         let gate = (!global && gradle_build).then(|| m2_gate(&cwd, &env));
         // The cwd's build locks annotate Gradle-cached packages in a global
@@ -1342,20 +1348,19 @@ pub(super) async fn hosted_wiring_retained_purls(
     if redirect.records.is_empty() {
         return Vec::new();
     }
-    let canon = |p: &str| normalize_purl(strip_purl_qualifiers(p)).into_owned();
     // By release identity: a record keyed `@3.0.2.0` names the scanned
-    // composer `@3.0.2`.
-    let scanned: std::collections::BTreeSet<String> = scanned_purls
+    // composer `@3.0.2`, a `Newtonsoft.Json` record the lowercase NuGet crawl.
+    let scanned: std::collections::BTreeSet<PurlKey> = scanned_purls
         .into_iter()
-        .map(|p| purl_identity_key(p.as_ref()))
+        .map(|p| PurlKey::new(p.as_ref()))
         .collect();
     // Cheap no-I/O gate: skip the lockfile proofs when no record names a
     // scanned purl.
     let candidates: Vec<(String, &str)> = redirect
         .records
         .iter()
-        .filter(|(key, _)| scanned.contains(&purl_identity_key(key)))
-        .map(|(key, record)| (canon(key), record.uuid.as_str()))
+        .filter(|(key, _)| scanned.contains(&PurlKey::new(key)))
+        .map(|(key, record)| (canonical_purl(key), record.uuid.as_str()))
         .collect();
     if candidates.is_empty() {
         return Vec::new();
@@ -1438,13 +1443,12 @@ pub(super) fn redirect_state_json(
     if redirect.records.is_empty() {
         return None;
     }
-    let canon = |p: &str| normalize_purl(strip_purl_qualifiers(p)).into_owned();
     let records: Vec<serde_json::Value> = redirect
         .records
         .iter()
         .map(|(key, record)| {
             serde_json::json!({
-                "purl": canon(key),
+                "purl": canonical_purl(key),
                 "uuid": record.uuid,
             })
         })
@@ -1824,8 +1828,7 @@ async fn run_scan(
     // supplement falls back to the committed artifacts (fail-closed for the
     // prune), the key set degrades to empty (fail-open).
     let vendor_state = &ctx.loaded().await.vendor;
-    let ledger_supplement =
-        vendored_ledger_supplement(&args.common, &all_crawled, vendor_state).await;
+    let ledger_supplement = vendored_ledger_supplement(&ctx, &all_crawled, vendor_state).await;
     for pkg in &ledger_supplement.packages {
         if let Some(eco) = Ecosystem::from_purl(&pkg.purl) {
             *eco_counts.entry(eco).or_insert(0) += 1;
@@ -1859,7 +1862,7 @@ async fn run_scan(
     // Vendor-ledger purl keys, shared by the prune exemption (a vendored
     // package's normal state is absent from the crawl) and the
     // vendored-skip in the apply path. A corrupt ledger yields the empty set.
-    let vendored_purls: HashSet<String> = vendor_state
+    let vendored_purls: HashSet<PurlKey> = vendor_state
         .as_ref()
         .map(VendorState::purl_keys)
         .unwrap_or_default();
@@ -1867,7 +1870,7 @@ async fn run_scan(
     // scan's agent leg patches the global copy even when the cwd project
     // vendors the same purl (see `project_state_in_scope`).
     let project_state = crate::commands::project_state_in_scope(&args.common);
-    let vendor_owned_purls: HashSet<String> = if project_state {
+    let vendor_owned_purls: HashSet<PurlKey> = if project_state {
         vendored_purls.clone()
     } else {
         HashSet::new()
@@ -2384,16 +2387,13 @@ async fn run_scan(
             push_scan_json_warning(&mut result, API_BATCH_FAILED, detail);
         }
         policy.fold_into_json(&mut result);
-        // Flag lockfile-only packages (additive; absent means installed).
-        // `normalize_purl` bridges the API's percent-encoded spelling to the
-        // supplement's literal form.
+        // Flag lockfile-only packages (additive; absent means installed),
+        // with the same predicate as the `[NOT INSTALLED]` marker.
         if let Some(packages) = result["packages"].as_array_mut() {
             for pkg in packages {
-                let is_lockfile_only = pkg["purl"].as_str().is_some_and(|p| {
-                    lockfile_only
-                        .purls
-                        .contains(normalize_purl(strip_purl_qualifiers(p)).as_ref())
-                });
+                let is_lockfile_only = pkg["purl"]
+                    .as_str()
+                    .is_some_and(|p| lockfile_only_contains(&lockfile_only.purls, p));
                 if is_lockfile_only {
                     pkg["notInstalled"] = serde_json::json!(true);
                 }
@@ -2401,7 +2401,7 @@ async fn run_scan(
                 // name them (additive; an annotation, never a filter).
                 if let Some(base) = pkg["purl"]
                     .as_str()
-                    .map(|p| normalize_purl(strip_purl_qualifiers(p)).into_owned())
+                    .map(canonical_base_purl)
                     .filter(|base| gradle.gradle_purls.contains(base))
                 {
                     if let Some(locked) = &gradle.locked {
@@ -2520,21 +2520,27 @@ async fn run_scan(
                 let mut patches: Vec<serde_json::Value> = selected
                     .iter()
                     .map(|p| {
-                        match super::get::decide_patch_action(
+                        match crate::commands::agent_download::decide_patch_action(
                             manifest_for_preview,
                             &p.purl,
                             &p.uuid,
                         ) {
-                            super::get::PatchAction::Added => serde_json::json!({
-                                "purl": p.purl, "uuid": p.uuid, "action": "added",
-                            }),
-                            super::get::PatchAction::Updated { old_uuid } => serde_json::json!({
-                                "purl": p.purl, "uuid": p.uuid,
-                                "action": "updated", "oldUuid": old_uuid,
-                            }),
-                            super::get::PatchAction::Skipped => serde_json::json!({
-                                "purl": p.purl, "uuid": p.uuid, "action": "skipped",
-                            }),
+                            crate::commands::agent_download::PatchAction::Added => {
+                                serde_json::json!({
+                                    "purl": p.purl, "uuid": p.uuid, "action": "added",
+                                })
+                            }
+                            crate::commands::agent_download::PatchAction::Updated { old_uuid } => {
+                                serde_json::json!({
+                                    "purl": p.purl, "uuid": p.uuid,
+                                    "action": "updated", "oldUuid": old_uuid,
+                                })
+                            }
+                            crate::commands::agent_download::PatchAction::Skipped => {
+                                serde_json::json!({
+                                    "purl": p.purl, "uuid": p.uuid, "action": "skipped",
+                                })
+                            }
                         }
                     })
                     .collect();

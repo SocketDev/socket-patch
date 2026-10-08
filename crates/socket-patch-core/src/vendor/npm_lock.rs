@@ -617,9 +617,9 @@ pub(crate) async fn preflight_packages(
 /// them — it cannot un-wire the lock — so removing the artifact while the
 /// lockfile still resolves through it bricks every subsequent install
 /// (ENOENT on the missing `file:` tarball).
-/// The in-use probe is textual and EXACT for these flavors (the uuid dir
-/// path appears iff some resolution still points at the artifact — see
-/// [`super::npm_flavor::vendored_entry_in_use`]), over every lock in
+/// The probe is textual and EXACT for these flavors (the uuid dir path
+/// appears iff some resolution still points at the artifact), over every
+/// lock in
 /// `lock_names` (a mention in any of them counts — npm 12 installs from the
 /// package-lock.json beside a shrinkwrap). Mentioned ⇒
 /// refuse; readable and provably absent ⇒ `None`, the caller's removal

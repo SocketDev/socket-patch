@@ -17,6 +17,7 @@ pub mod apply;
 pub mod coursier_gate;
 pub mod coursier_tree;
 pub mod gradle;
+pub mod layout;
 pub mod maven_reactor;
 pub mod sbt;
 pub mod sbt_gate;
@@ -120,7 +121,12 @@ pub struct Coords<'a> {
 impl Coords<'_> {
     /// `org.apache.commons` → `org/apache/commons`.
     pub fn group_path(&self) -> String {
-        self.group_id.replace('.', "/")
+        layout::group_path(self.group_id)
+    }
+
+    /// `version`'s directory of this GA in `tree` ([`layout::tree_dir`]).
+    pub fn tree_dir(&self, tree: &str, version: &str) -> String {
+        layout::tree_dir(tree, self.group_id, self.artifact_id, version)
     }
 
     /// First 8 lowercase hex of the uuid.
@@ -325,16 +331,9 @@ impl Detected {
     }
 }
 
-const GRADLE_FILES: &[&str] = &[
-    "settings.gradle",
-    "settings.gradle.kts",
-    "build.gradle",
-    "build.gradle.kts",
-];
-
 /// Every build the project root holds.
 pub fn detect_builds(read: ReadFn<'_>) -> Detected {
-    let maven = read("pom.xml").map(|pom| {
+    let maven = read(layout::POM_FILE).map(|pom| {
         if maven_reactor::declares_modules(&String::from_utf8_lossy(&pom)) {
             MavenShape::Reactor
         } else {
@@ -343,7 +342,7 @@ pub fn detect_builds(read: ReadFn<'_>) -> Detected {
     });
     Detected {
         maven,
-        gradle: GRADLE_FILES.iter().any(|f| read(f).is_some()),
+        gradle: layout::GRADLE_ROOT_FILES.iter().any(|f| read(f).is_some()),
         scala: sbt::detect(read).or_else(|| scala_cli::detect(read)),
     }
 }
@@ -412,26 +411,6 @@ fn compose(maven: JvmPlan, gradle: JvmPlan) -> JvmPlan {
         tree_dir: maven.tree_dir,
         jar_rel: maven.jar_rel,
     }
-}
-
-/// Safe coordinates that every written file accepts unescaped: g is
-/// dot-separated `[A-Za-z0-9_-]` segments, a is `[A-Za-z0-9_.-]`, v is
-/// `[A-Za-z0-9_.+-]` not ending in `+` nor starting with `latest.`; neither a
-/// nor v is all dots, and none holds `--` (it ends an XML comment).
-pub fn safe_coordinates(g: &str, a: &str, v: &str) -> bool {
-    let seg = |s: &str, extra: &str| {
-        !s.is_empty()
-            && s.chars()
-                .all(|c| c.is_ascii_alphanumeric() || "_-".contains(c) || extra.contains(c))
-    };
-    g.split('.').all(|s| seg(s, ""))
-        && seg(a, ".")
-        && seg(v, ".+")
-        && !a.chars().all(|c| c == '.')
-        && !v.chars().all(|c| c == '.')
-        && !v.ends_with('+')
-        && !v.starts_with("latest.")
-        && ![g, a, v].iter().any(|s| s.contains("--"))
 }
 
 /// A fragment record. `op` (a JSON object with an `"op"` field) goes in
@@ -793,6 +772,7 @@ mod tests {
 
     #[test]
     fn safe_coordinates_follow_d15_and_forbid_comment_dashes() {
+        use super::layout::safe_coordinates;
         assert!(safe_coordinates(
             "org.apache.commons",
             "commons-text",

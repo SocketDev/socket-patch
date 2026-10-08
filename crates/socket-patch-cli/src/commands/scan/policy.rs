@@ -11,11 +11,12 @@ use socket_patch_core::api::ranking::cmp_search_results;
 use socket_patch_core::api::types::PatchSearchResult;
 use socket_patch_core::manifest::schema::PatchManifest;
 use socket_patch_core::policy::{
-    canon, find_repo_root_with_warnings, patch_severity_order, policy_block, repo_relative_checked,
+    find_repo_root_with_warnings, patch_severity_order, policy_block, repo_relative_checked,
     sanitize, severity_name, DiskPolicyFs, FilterReason, FilteredEntry, Offers, PolicyError,
     PolicySource, PolicyWarning, RetainedEntry, Root, SelectionPolicy, PATCHES_DISABLED,
 };
 use socket_patch_core::utils::purl::normalize_purl;
+use socket_patch_core::utils::purl_key::PurlKey;
 
 use super::ScanArgs;
 use crate::hosted_memory::roots::{marker_ecosystem, UNSUPPORTED_MARKERS};
@@ -96,10 +97,14 @@ pub(crate) fn dir_markers(dir: &Path) -> Vec<String> {
         })
         .unwrap_or_default();
     if markers.is_empty() {
-        // No lockfile: the manifests say what the project is.
+        // No lockfile: the manifests say what the project is. Every name
+        // here, JVM build files included, must be a regular file: the
+        // root-marker report lists files, so it deliberately keeps
+        // `is_file` rather than `layout::marker_present` (which lets a
+        // directory named like a build file mark a JVM build).
         markers = MANIFEST_MARKERS
             .iter()
-            .chain(socket_patch_core::crawlers::jvm_cache::JVM_PROJECT_MARKERS)
+            .chain(socket_patch_core::vendor::jvm::layout::JVM_PROJECT_MARKERS)
             .filter(|name| dir.join(name).is_file())
             .map(|name| name.to_string())
             .collect();
@@ -109,7 +114,7 @@ pub(crate) fn dir_markers(dir: &Path) -> Vec<String> {
 }
 
 /// Manifests that stand in as markers for a root with no lockfile (plus
-/// every JVM build file, `jvm_cache::JVM_PROJECT_MARKERS`).
+/// every JVM build file, `layout::JVM_PROJECT_MARKERS`).
 const MANIFEST_MARKERS: [&str; 6] = [
     "package.json",
     "pyproject.toml",
@@ -225,14 +230,14 @@ impl ScanPolicy {
             .map(|m| {
                 m.patches
                     .iter()
-                    .map(|(purl, record)| (canon(purl), record.uuid.clone()))
+                    .map(|(purl, record)| (PurlKey::new(purl).into_string(), record.uuid.clone()))
                     .collect()
             })
             .unwrap_or_default();
     }
 
     fn recorded_uuid(&self, purl: &str) -> Option<&str> {
-        self.recorded.get(&canon(purl)).map(String::as_str)
+        self.recorded.get(&PurlKey::new(purl).into_string()).map(String::as_str)
     }
 
     /// Step 3: the root, ecosystem and package filters. Returns whether the
@@ -250,7 +255,7 @@ impl ScanPolicy {
         };
         let mut report = self.report();
         if let Some(uuid) = self.recorded_uuid(purl) {
-            let key = canon(purl);
+            let key = PurlKey::new(purl).into_string();
             if report.retained_purls.insert(key.clone()) {
                 report.retained.push(RetainedEntry {
                     purl: key,
@@ -264,9 +269,9 @@ impl ScanPolicy {
         }
         if self.root_verdict.is_err() {
             // Already reported as the root's one entry.
-        } else if report.filtered_purls.insert(canon(purl)) {
+        } else if report.filtered_purls.insert(PurlKey::new(purl).into_string()) {
             report.filtered.push(FilteredEntry {
-                purl: Some(canon(purl)),
+                purl: Some(PurlKey::new(purl).into_string()),
                 uuid: None,
                 project: self.project.clone(),
                 reason,
@@ -279,7 +284,7 @@ impl ScanPolicy {
     /// Record the purls with a newer patch (`updates[]`), for
     /// `retained[].upgradeAvailable`.
     pub(crate) fn set_update_purls<'a>(&self, purls: impl IntoIterator<Item = &'a str>) {
-        self.report().update_purls = purls.into_iter().map(canon).collect();
+        self.report().update_purls = purls.into_iter().map(|p| PurlKey::new(p).into_string()).collect();
     }
 
     /// Steps 5-6: group the tier-accessible offers, keep retained packages
@@ -293,7 +298,7 @@ impl ScanPolicy {
         {
             let report = self.report();
             for offer in accessible {
-                if report.retained_purls.contains(&canon(&offer.purl)) {
+                if report.retained_purls.contains(&PurlKey::new(&offer.purl).into_string()) {
                     continue;
                 }
                 grouped.entry(offer.purl.clone()).or_default().push(offer);
@@ -313,7 +318,7 @@ impl ScanPolicy {
                 let reason = FilterReason::Disabled;
                 match recorded {
                     Some(uuid) => {
-                        let key = canon(&purl);
+                        let key = PurlKey::new(&purl).into_string();
                         if report.retained_purls.insert(key.clone()) {
                             report.retained.push(RetainedEntry {
                                 purl: key,
@@ -325,7 +330,7 @@ impl ScanPolicy {
                         }
                     }
                     None => report.filtered.push(FilteredEntry {
-                        purl: Some(canon(&purl)),
+                        purl: Some(PurlKey::new(&purl).into_string()),
                         uuid: Some(group[0].uuid.clone()),
                         project: self.project.clone(),
                         severity: Some(patch_severity_order(&group[0])),
@@ -357,7 +362,7 @@ impl ScanPolicy {
                     chosen.is_some() && chosen == recorded_at && recorded_at != Some(0);
                 if chosen.is_none() || upgrade_withheld {
                     report.filtered.push(FilteredEntry {
-                        purl: Some(canon(&purl)),
+                        purl: Some(PurlKey::new(&purl).into_string()),
                         uuid: Some(group[0].uuid.clone()),
                         project: self.project.clone(),
                         severity: Some(patch_severity_order(&group[0])),
