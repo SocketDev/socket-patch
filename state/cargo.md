@@ -1,6 +1,8 @@
 [agent] Progress ledger for the scheduled Cargo bug-hunt routine (label pm:cargo).
 
-Last updated: 2026-10-07 (run 15), main `db83f01` (34 new commits; cargo-relevant: #963, which keeps the hosted pin when a vendored takeover is refused), CLI 4.0.0, latest release v4.0.0. Re-triage: #651 still reproduces.
+Last updated: 2026-10-08 (run 16), main `9472be4` (47 new commits; cargo-relevant: #1035 generation sweep, which closed #864; #1050 vendored in-use verdict for `--prune`; #1029 `apply --check` now covers cargo; #1038 shared home resolver), CLI 4.0.0, latest release v4.0.0. Re-triage: #864 verified fixed; #863 still reproduces (`remove` and `rollback`).
+
+Run 16 added these cells (Linux, cargo 1.93.1; not yet in the table): hosted re-pin A→B (single, workspace member, two crates with one superseded, A's block in a legacy / CRLF / CRLF-legacy config): pass, nothing names A, and `remove` is byte-identical. Vendored `scan --prune` on lock v1–v4 × {plain, transitive} × {unchanged, a second `cfg-if` version relocked, `cargo update`}: 24/24 pass (kept); with the dependency dropped, it reverts (pass). Agent `apply --check`: drift detected (pass), but a second index dir holding an unpatched copy passes (#339, commented). Agent scan with `HOME` unset: fail #1135.
 
 Run 15 added these cells (Linux; not yet in the table): hosted → vendored takeover refused after the restore (in-tree `vendor/`, missing prebuilt, #679 contested lock) on 1.93.1: pass, rolled back byte-identically, and `vendor --dry-run` parity passes. Vendored → hosted takeover with a dotted / single-quoted / `registry = "crates-io"` dependency on 1.93.1 v4 and 1.97.0 v3/v4: fail #1020. Hosted `rollback` (with or without a purl) on the #679 contested lock: fail (same as #863, commented).
 
@@ -31,7 +33,9 @@ Cells marked (pre-v5) were last verified on `f6b7fb9` and need a re-check on v5.
 
 0. **Maintainer request (Linux done in runs 3 and 11):** global `-g` mode on macOS and Windows across the Cargo majors: scan report, hosted refusal, apply, rollback and vex. The full checklist is in the 20261001T040000Z entry.
 1. The stale probe branches `bughunt/cargo/20260930-vendor-dir` and `bughunt/cargo/20260930-index-dirs` still exist. Deleting them failed through the git proxy or was denied by policy in runs 1–14. A maintainer needs to delete them. Until then, avoid new probe branches.
-2. (run 15: contested-lock `rollback` fails like #863; the hosted→vendored takeover there passes after #963) Next: a v1 contested lock from an old cargo; #864 with two crates where only one is superseded; #1020 variants (`get --mode hosted`, workspace-member dependency).
+2. (run 16: #864 verified fixed, including the two-crate partial supersede) Next: a v1 contested lock from an old cargo; #1020 variants (`get --mode hosted`, workspace-member dependency).
+2a. #1135 variants: `-g` with `HOME` unset; the `$CARGO_HOME/config.toml` `[patch]` check that `read_config_chain` skips without a home; Windows with `USERPROFILE` unset.
+2c. #573's exact repro after #1050 (bump plus a later plain scan, warm vs pruned cache).
 2b. Hosted with a `[patch]` override in `$CARGO_HOME/config.toml` or an ancestor config: same root cause as #480, so only worth a live check once #480 is fixed.
 3. (1.45 BOM/CRLF × lock v1–v3 done in run 14) Vendored on `+1.41`, the vendored workspace shape on old cargo, and vendored on Windows and macOS. Also vendored + `cargo vendor` with a multi-crate graph.
 4. Re-triage #387 and #339 live once cargo code changes on main.
@@ -46,7 +50,7 @@ Cells marked (pre-v5) were last verified on `f6b7fb9` and need a re-check on v5.
 - `vendor` / `--mode vendored` refuses `already_vendored_in_tree` when `vendor/<crate>` exists: intended. What's wrong is only the hard-coded `vendor/` detection (#338).
 - `cargo vendor -q DIR` prints no source-replacement snippet, so write `.cargo/config.toml` by hand in fixtures.
 - Release 3.3.0's `apply` doesn't accept the hand-staged manifest (`partialFailure`), so it can't be compared.
-- `apply --check` is Go-only (CLI_CONTRACT).
+- (superseded in run 16) `apply --check` was Go-only. Since #1029 it verifies cargo agent patches too: drift is `not_applied`, exit 1, and an uninstalled crate is skipped as `package_not_installed`.
 - (v5) `setup` was removed, and agent-mode `vex` attests cargo patches without any `setup.manual` declaration. The old `ecosystem_not_setup` note no longer applies.
 - `[patch."sparse+https://index.crates.io/"]` isn't honoured by cargo 1.93, so ignoring it is correct. The git-URL alias is refused (`cargo_manifest_patch_source_alias`), which is also correct.
 - An "unpatched" build right after `cargo vendor` re-runs or re-applies is usually cargo's rlib cache (#387). Run `cargo clean -p <crate>` before judging.
@@ -74,3 +78,7 @@ Cells marked (pre-v5) were last verified on `f6b7fb9` and need a re-check on v5.
 - The hosted / vendored workspace-root check doesn't stop its ancestor walk at `$CARGO_HOME` as cargo does. That only matters for a project inside `CARGO_HOME`, so it isn't filed (run 14).
 - `[registry] default` affects only publish/login, not dependency resolution, so there is no hosted alt-registry case (run 14).
 - A hosted → vendored takeover that the cargo vendored backend refuses (`already_vendored_in_tree`, `vendor_prebuilt_required`, `locked_multi_source_conflict`) keeps the hosted pin byte-identical and exits 1: correct since #963 (run 15).
+- In this sandbox the CLI's own HTTP client can't reach index.crates.io through the proxy (even with `SSL_CERT_FILE`), so a hosted `remove` / `rollback` fails with `hosted_revert_failed`. Point `SOCKET_CRATES_INDEX` at a local sparse mirror of the pristine checksums (run 16).
+- `cargo --manifest-path <dir>/Cargo.toml` run from another cwd ignores `<dir>/.cargo/config*`, because cargo reads config from the cwd. Always `cd` into the fresh checkout for hosted oracle builds (run 16).
+- `scan --offline` refuses outright ("strict airgap"), so `scan --prune` cells need a patch-API stand-in (run 16).
+- After `--prune` reverts a dropped vendored dependency, a `[[patch.unused]]` for the tagged version is left in `Cargo.lock`. `--locked` builds, and cargo drops it on the next relock. Cosmetic (run 16).
