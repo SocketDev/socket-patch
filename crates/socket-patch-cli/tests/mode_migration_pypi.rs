@@ -1279,6 +1279,67 @@ async fn vendor_check_fails_after_hatch_dependency_reset() {
     assert_check_catches_relock(&root, files);
 }
 
+/// #1120: a `requirements.txt` exported beside `uv.lock` pins the
+/// package from PyPI, so the uv-only wiring leaves installs from it
+/// unpatched. `uv export > requirements.txt` in Windows PowerShell 5.1
+/// writes it as UTF-16 with a byte-order mark, which pip and uv read like
+/// its UTF-8 twin, so `vendor` must name it (`pypi_multiple_lockfiles`)
+/// and `vendor --check` must fail on the contested wiring in every
+/// encoding, not pass as if the file were absent.
+#[tokio::test]
+async fn uv_requirements_export_contests_the_wiring_in_any_encoding() {
+    let text = "six==1.16.0\r\n";
+    let le: Vec<u8> = [0xFF, 0xFE]
+        .into_iter()
+        .chain(text.encode_utf16().flat_map(u16::to_le_bytes))
+        .collect();
+    let be: Vec<u8> = [0xFE, 0xFF]
+        .into_iter()
+        .chain(text.encode_utf16().flat_map(u16::to_be_bytes))
+        .collect();
+    for (case, bytes) in [
+        ("utf-8", text.as_bytes().to_vec()),
+        ("utf-16 le", le),
+        ("utf-16 be", be),
+    ] {
+        let (_tmp, root) = project();
+        stage_uv(&root);
+        std::fs::write(root.join("requirements.txt"), &bytes).unwrap();
+        stage_manifest(&root);
+        let (code, env) = run_cli(&root, &["vendor"], &[]);
+        assert_eq!(code, 0, "{case}: {env:#}");
+        assert!(
+            std::fs::read_to_string(root.join("uv.lock"))
+                .unwrap()
+                .contains(&format!(".socket/vendor/pypi/{UUID}/")),
+            "{case}: uv.lock is wired: {env:#}"
+        );
+        assert!(
+            env.to_string().contains("pypi_multiple_lockfiles"),
+            "{case}: vendor names requirements.txt as an unpatched install source: {env:#}"
+        );
+
+        let (code, env) = run_cli(&root, &["vendor", "--check"], &[]);
+        assert_eq!(
+            code, 1,
+            "{case}: requirements.txt installs unpatched: {env:#}"
+        );
+        let event = &env["events"][0];
+        assert_eq!(event["errorCode"], "vendor_check_failed", "{case}: {env:#}");
+        let reason = event["reason"].as_str().unwrap_or_default();
+        assert!(
+            reason.contains("wiring contested") && reason.contains("requirements.txt"),
+            "{case}: {env:#}"
+        );
+        // The vendored file is left as the user wrote it.
+        assert_eq!(
+            std::fs::read(root.join("requirements.txt")).unwrap(),
+            bytes,
+            "{case}"
+        );
+    }
+}
+
 /// #699: hosted mode rewrites only the ROOT `requirements.txt`, while
 /// vendored mode also wires a pin in a `-r` include or appends a managed
 /// `(transitive)` line. A vendored → hosted takeover of such a pin used to
