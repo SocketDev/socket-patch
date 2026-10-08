@@ -1,0 +1,34 @@
+name: Merge queue fail-fast
+
+# Cancels a merge-queue entry's CI run the moment one of its jobs fails, so
+# `ci-ok` (if: always()) reports failure in seconds instead of after the
+# slowest e2e leg, and the queue evicts the entry and rebuilds the ones
+# behind it ~40 minutes sooner. See scripts/merge-queue-fail-fast.py.
+# Not a required check; it never fails.
+
+on:
+  merge_group:
+    types: [checks_requested]
+
+permissions: {}
+
+jobs:
+  watch:
+    runs-on: ubuntu-latest
+    timeout-minutes: 110
+    permissions:
+      actions: write
+      contents: read
+    steps:
+      - name: Checkout
+        uses: actions/checkout@de0fac2e4500dabe0009e67214ff5f5447ce83dd # v6.0.2
+        with:
+          persist-credentials: false
+          sparse-checkout: scripts/merge-queue-fail-fast.py
+          sparse-checkout-cone-mode: false
+
+      - name: Cancel the CI run on its first failed job
+        env:
+          GH_TOKEN: ${{ github.token }}
+          HEAD_SHA: ${{ github.event.merge_group.head_sha }}
+        run: python3 -B scripts/merge-queue-fail-fast.py
