@@ -2,7 +2,7 @@
 
 The routine runs every 6 hours. Each run adds one comment here with the socket-patch commit it tested, the OS × Pipenv-version × mode cells it covered, the issues it filed, updated or closed, and what it plans to probe next. The routine treats this thread as its only memory.
 
-Last run: 2026-10-08 ~09:37Z, main `b96a785`. Filed #1122 (vendored `use_pylock = true` wires pylock.toml, Pipenv installs from Pipfile.lock). #612 partly fixed by #1044 (warning + red `vendor --check`; takeover still unpatches requirements.txt, commented). New `apply --check` (#1029) passes on every Pipenv venv shape. #744 still fails. Previous run: 2026-10-08 ~03:31Z.
+Last run: 2026-10-08 ~15:39Z, main `823810a`. Filed #1142 (after `pipenv uninstall` empties a named category on Pipenv 2022 / 2023, prune / revert / remove / rollback drift-keep the vendored entry and the `vendor --check` remedy loops). #1039 takeover and platform-wheel retraction pass. Commented on #612 (an `-r` include gets no scan-time warning). #1122 and #744 still fail. Previous run: 2026-10-08 ~09:37Z.
 
 ## Coverage matrix
 
@@ -88,10 +88,13 @@ Stale-install remedy followed verbatim, `15:30Z` run, `045d7ec`: `default` patch
 
 `09:37Z` run (2026-10-08), `b96a785`: `apply --check` (#1029) on agent Pipenv projects: WORKON venv, `.env` WORKON_HOME + custom name (2026.8.0), the #645 shape incl. `--cwd` (2023.12.1), stray `venv/` and VIRTUAL_ENV + IGNORE (2025.1.3), and venv-less with system six: all pass (exit 1 on any stale copy, 0 in sync, not-installed skipped). Hosted `patches` block (pinned / unpinned `redirect_unconfirmed`): pass. `use_pylock = true` with both locks: hosted pass; vendored wires only pylock.toml and Pipenv installs from Pipfile.lock → UPSTREAM on 2026.0.0 / 2026.4.0 / 2026.8.0 (fail #1122). 2025.1.3 stray `venv/` and VIRTUAL_ENV + IGNORE cells: pass.
 
+`15:39Z` run (2026-10-08), `823810a`: the #1050 prune GC keeps live vendored entries in `default` / `develop` / `[docs]` on 2022 / 2023 / 2026 (pass), re-wires after a relock (pass), and reclaims a removed dependency (pass). The exception is a named category that Pipenv 2022 / 2023 drop from the lock once it's empty: fail #1142. #1039 vendored → hosted takeover (2022 / 2026, `default` / `docs`: dry run byte-identical, sync PATCHED) pass. The `cp311-none-any` retraction (`redirect_takeover_kept_vendored`, byte-identical) passes on 2023 / 2026. Vendored + `-r` include requirements.txt: `vendor --check` is red but there's no scan-time warning (#612, commented).
+
 macOS/Windows rows are from the 2026-09-30 probes on `f6b7fb9`. No probe ran on v5 because branch deletion through the git proxy still fails (re-checked 2026-10-03 03:30Z); `bughunt/pipenv/20260930-venv-discovery` and `bughunt/pipenv/20260930-virtualenv` still need a maintainer to delete them.
 
 ## Backlog
 
+0000000000. #1142: re-verify once fixed (also `[dev-packages]` uninstall and a named category with packages left in it). #1050 GC on the #1122 pylock-wired shape and on BOM / CRLF locks: untested.
 000000000. #1122: re-verify once fixed; variants `pylock_name` with both files, standalone `vendor` from an agent manifest, revert / rollback on the pylock-wired project. #612: the takeover policy is still open (warning and red check verified 2026-10-08 09:37Z). `apply --check` × #842 shape and `apply --check -g` (Docker `--system`).
 00000000. (#1048 verified fixed on `b762f41`, 2026-10-08; the withholding runs before every rewriter, so category / Pipenv 11 variants share it.) Service-vendoring mock: rebuild it (http.server: batch filtered by purl, by-package, by-cve, view with inline base64 blobs, blob route, grant with sha256 + sha512) and reuse it for the #612 / #567 vendored variants.
 0000000. #981: re-verify once fixed. (Bisect: first bad 2023.7.9; `--dev` / `--categories` exports also have no hash. Done 2026-10-07 09:46Z.) Re-verify #477 for Pipenv once fixed (the rollback / remove / `vendor --revert` remedy should name `pipenv run pip uninstall -y <pkg> && pipenv sync` with the lock's category args).
@@ -187,3 +190,6 @@ macOS/Windows rows are from the 2026-09-30 probes on `f6b7fb9`. No probe ran on 
 - The lost-ledger `vendor --revert` remedy loop is #1072 (pm:npm), and the same message appears for Pipenv. Don't re-file it.
 - HOME unset (and USERPROFILE unset): Pipenv falls back to the passwd home for its default WORKON_HOME, but socket-patch probes no home-relative venv (#1038; unit-tested `python_crawler.rs` "no env, no home → nothing"). Agent apply says not found and `apply --check` passes with 0 checked; vex refuses. A deliberate fail-closed: set HOME or WORKON_HOME. Not filed.
 - Harness note: the hosted → vendored takeover needs the PyPI JSON forwarder (`SOCKET_PYPI_JSON_API=<mock>/pypi`), or it fails `redirect_revert_failed`. Start the mock with a pid file; `pkill -f` kills the calling shell.
+- Harness note: with `PIPENV_PYTHON` set at lock / sync time, Pipenv uses a `-python3.11`-suffixed venv. Read `pipenv --venv` with the same `PIPENV_PYTHON`, or `pipenv run` finds an empty, unsuffixed venv ("No module named six").
+- Deleting a `[docs]` header from the Pipfile and running `pipenv lock` keeps the stale `docs` category in the lock on 2022 / 2023 / 2026 (Pipenv's behaviour). The vendored wiring stays live, so the green check is correct.
+- `remove` / `rollback` with a purl carrying an unknown qualifier (`?foo=bar`) → "No patch found". That's cross-PM identifier behaviour (`PurlKey::qualified`).
