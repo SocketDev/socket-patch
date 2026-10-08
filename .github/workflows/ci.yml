@@ -1526,15 +1526,8 @@ jobs:
         shell: bash
         env:
           GRADLE_VERSION: ${{ matrix.gradle }}
-        run: |
-          url="https://services.gradle.org/distributions/gradle-${GRADLE_VERSION}-bin.zip"
-          curl -fsSL --retry 5 --retry-all-errors --ssl-revoke-best-effort "$url" -o "$RUNNER_TEMP/gradle.zip"
-          curl -fsSL --retry 5 --retry-all-errors --ssl-revoke-best-effort "$url.sha256" -o "$RUNNER_TEMP/gradle.sha256"
-          python -c 'import hashlib, pathlib, os; p=pathlib.Path(os.environ["RUNNER_TEMP"]); assert hashlib.sha256((p/"gradle.zip").read_bytes()).hexdigest() == (p/"gradle.sha256").read_text().strip()'
-          unzip -q "$RUNNER_TEMP/gradle.zip" -d "$RUNNER_TEMP"
-          launcher="$RUNNER_TEMP/gradle-${GRADLE_VERSION}/bin/gradle"
-          if [ "$RUNNER_OS" = Windows ]; then launcher="${launcher}.bat"; fi
-          echo "SOCKET_PATCH_GRADLE_E2E_GRADLE=$launcher" >> "$GITHUB_ENV"
+        # Pinned digest, GitHub-release origin: see the script.
+        run: scripts/install-gradle.sh "$GRADLE_VERSION" "$RUNNER_TEMP" >> "$GITHUB_ENV"
 
       - name: Setup .NET SDK
         if: matrix.dotnet != ''
