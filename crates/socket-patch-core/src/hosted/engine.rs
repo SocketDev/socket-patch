@@ -71,7 +71,9 @@ pub const SYMLINK_REFUSAL: &str = "redirect_symlinked_file_unsupported";
 
 /// Refusal code for a candidate file that exists but whose content the
 /// in-memory host did not provide (oversize, an LFS pointer,
-/// presence-only); disk would read and rewrite it.
+/// presence-only), and, on disk and in memory alike, for one that is not
+/// UTF-8 text (#721): no rewriter can edit it, and reading it as absent
+/// would leave its pins unpatched behind an exit-0 run.
 pub const UNREADABLE_REFUSAL: &str = "candidate_file_unreadable";
 
 /// Rush's repo-state file, whose `pnpmShrinkwrapHash` a lock edit
@@ -153,6 +155,33 @@ fn unreadable_refusal(rel: &str) -> Refusal {
             "{rel} exists but its content was not provided (too large, an LFS pointer, or \
              not fetched), so it cannot be rewritten alongside the other lockfiles; nothing \
              was written"
+        ),
+    }
+}
+
+/// The refusal for an unreadable `socket-patch.sbt`, the file the sbt
+/// planner owns and would otherwise create over the user's bytes.
+pub const SBT_OWNED_FILE_UNREADABLE: &str = "redirect_sbt_owned_file_unreadable";
+
+fn undecodable_refusal(rel: &str) -> Refusal {
+    // Keeps the sbt planner's own refusal code, and still refuses here,
+    // before any vendored->hosted takeover revert.
+    if rel == crate::formats::sbt::owned_file::HOSTED_FILE {
+        return Refusal {
+            code: SBT_OWNED_FILE_UNREADABLE.to_string(),
+            message: format!(
+                "{rel} is not UTF-8 text, so the hosted sbt wiring would replace it; \
+                 re-save it as UTF-8 and re-run; nothing was written"
+            ),
+        };
+    }
+    Refusal {
+        code: UNREADABLE_REFUSAL.to_string(),
+        message: format!(
+            "{rel} is not UTF-8 text (for example UTF-16, which Windows PowerShell 5.1 \
+             writes for `pip freeze > requirements.txt`), so it cannot be rewritten \
+             alongside the other lockfiles; re-save it as UTF-8 and re-run; nothing was \
+             written"
         ),
     }
 }
@@ -305,6 +334,11 @@ pub struct CandidateFiles {
     /// project whose candidates could rewrite (or whose rewrite depends on)
     /// one is refused, since the rewriters would treat it as absent.
     pub unreadable_reads: Vec<String>,
+    /// Candidate files that exist but are not UTF-8 text (a UTF-16
+    /// requirements.txt pip reads, #721), on disk and in memory alike. They
+    /// are left out of `files`; a project whose candidates could rewrite
+    /// one is refused rather than read as if the file were absent.
+    pub undecodable_reads: Vec<String>,
     /// Gradle build files the script graph reached that exist but cannot be
     /// read as text (any view): the hosted Gradle planner refuses the build
     /// instead of taking them for absent (and creating a settings file over
@@ -331,7 +365,14 @@ impl CandidateFiles {
             // (non-blocking open + fstat regular-file check), so a FIFO
             // under a candidate name is skipped like a missing file instead
             // of wedging the run in open(2).
-            ProjectView::Disk(_) | ProjectView::Snapshot(_) => view.read_text(rel).await.ok(),
+            ProjectView::Disk(_) | ProjectView::Snapshot(_) => match view.read_text(rel).await {
+                Ok(text) => Some(text),
+                Err(e) if e.kind() == std::io::ErrorKind::InvalidData => {
+                    self.undecodable_reads.push(rel.to_string());
+                    None
+                }
+                Err(_) => None,
+            },
             ProjectView::Memory(project) => {
                 if project.is_symlink(rel) {
                     self.symlinked_reads.push(rel.to_string());
@@ -341,13 +382,17 @@ impl CandidateFiles {
                     self.unreadable_reads.push(rel.to_string());
                     return false;
                 }
-                // Disk reads any UTF-8 regular file; a non-UTF-8 one is
-                // absent to it as well.
+                // Disk reads any UTF-8 regular file and records a non-UTF-8
+                // one as undecodable; so does memory.
                 match project.get(rel) {
                     Some(MemoryEntry::Text(text)) => Some(text.to_string()),
-                    Some(MemoryEntry::Binary(bytes)) => {
-                        std::str::from_utf8(bytes).ok().map(str::to_string)
-                    }
+                    Some(MemoryEntry::Binary(bytes)) => match std::str::from_utf8(bytes) {
+                        Ok(text) => Some(text.to_string()),
+                        Err(_) => {
+                            self.undecodable_reads.push(rel.to_string());
+                            None
+                        }
+                    },
                     _ => None,
                 }
             }
@@ -571,6 +616,22 @@ pub async fn read_candidate_files(
         && crate::patch::redirect::gradle::gradle_build_present(&out.files)
     {
         read_gradle_files(view, unreadable, &mut out).await;
+        // The Gradle planner refuses a build over a file it cannot read as
+        // text and the scan carries on, so such a file is not a reason to
+        // refuse the whole run (#721).
+        let gradle_unreadable = &out.gradle_unreadable;
+        out.undecodable_reads
+            .retain(|rel| !gradle_unreadable.contains(rel));
+    } else {
+        // No readable Gradle build: the Gradle planner never runs, so a
+        // stray Gradle file it would own (a lock, a nested script) is never
+        // rewritten and must not refuse the rest of the run. A root build
+        // or settings script still refuses: it may be the build itself,
+        // unreadable, which the planner would otherwise skip silently.
+        out.undecodable_reads.retain(|rel| {
+            !is_gradle_owned_file(rel)
+                || crate::patch::redirect::gradle::GRADLE_ROOT_FILES.contains(&rel.as_str())
+        });
     }
     // An sbt build's resolution evidence rides a synthetic key (see
     // `patch::redirect::sbt::SBT_RESOLUTION_KEY`).
@@ -588,6 +649,8 @@ pub async fn read_candidate_files(
     out.symlinked_reads.dedup();
     out.unreadable_reads.sort();
     out.unreadable_reads.dedup();
+    out.undecodable_reads.sort();
+    out.undecodable_reads.dedup();
     out
 }
 
@@ -751,6 +814,7 @@ async fn keep_bundler_loaded_gem_files(
     out.files.retain(|rel, _| !dropped(rel));
     out.symlinked_reads.retain(|rel| !dropped(rel));
     out.unreadable_reads.retain(|rel| !dropped(rel));
+    out.undecodable_reads.retain(|rel| !dropped(rel));
     out.gem_refusal = refusal;
 }
 
@@ -943,6 +1007,7 @@ pub struct Rewritten {
     pub files: BTreeMap<String, String>,
     pub symlinked_reads: Vec<String>,
     pub unreadable_reads: Vec<String>,
+    pub undecodable_reads: Vec<String>,
     /// The rewriters' override slice (the candidates' deps).
     pub overrides: Vec<DepOverride>,
     pub rewrite: RewriteResult,
@@ -1436,6 +1501,7 @@ async fn rewrite_once(
         rush_lock_keys,
         symlinked_reads,
         unreadable_reads,
+        undecodable_reads,
         gradle_unreadable,
         gem_refusal,
     } = read;
@@ -1625,6 +1691,7 @@ async fn rewrite_once(
         files,
         symlinked_reads,
         unreadable_reads,
+        undecodable_reads,
         overrides,
         rewrite,
         rewritten,
@@ -2273,12 +2340,51 @@ fn file_ecosystem(rel: &str) -> Option<&'static str> {
         .then_some("pypi")
 }
 
+/// A file only the hosted Gradle planner reads or writes: a settings or
+/// build script, a dependency lock, the verification metadata, the wrapper
+/// properties, or the planner's own owned files.
+fn is_gradle_owned_file(rel: &str) -> bool {
+    let base = rel.rsplit('/').next().unwrap_or(rel);
+    base.ends_with(".gradle")
+        || base.ends_with(".gradle.kts")
+        || base.ends_with(".lockfile")
+        || rel == "gradle/verification-metadata.xml"
+        || rel == "gradle/wrapper/gradle-wrapper.properties"
+        || rel.starts_with(".socket/gradle/")
+}
+
+/// The [`guard`]'s non-UTF-8 rule on its own (#721): the first of
+/// `undecodable` (a [`CandidateFiles::undecodable_reads`]) whose ecosystem
+/// has a candidate refuses the run. The vendored→hosted takeover runs it
+/// before reverting anything, so a refusal never strands a reverted purl.
+pub fn undecodable_guard(undecodable: &[String], candidates: &[Candidate]) -> Option<Refusal> {
+    undecodable
+        .iter()
+        .find(|rel| {
+            // The root manifest is read strictly only as a yarn berry
+            // rewrite target (its `resolutions`); advisory reads never
+            // record it, so here it is always an npm rewrite target. A root
+            // Gradle script left here (no readable build beside it) may be
+            // the build itself, which only maven candidates could patch.
+            let eco = file_ecosystem(rel)
+                .or((rel.as_str() == "package.json").then_some("npm"))
+                .or(crate::patch::redirect::gradle::GRADLE_ROOT_FILES
+                    .contains(&rel.as_str())
+                    .then_some("maven"));
+            eco.is_some_and(|eco| candidates.iter().any(|c| c.dep.ecosystem == eco))
+        })
+        .map(|rel| undecodable_refusal(rel))
+}
+
 /// SYMLINK GUARD — fail-closed, whole rewrite, before any write (hosted
 /// rewrites are transactional). The writer stages next to
 /// the path and renames over it, which REPLACES a symbolic link with a
 /// detached regular copy: the link target goes stale and a revert restores
 /// bytes but never the link. Applies to every ecosystem's files and to dry
 /// runs, so a dry run predicts the refusal.
+///
+/// On disk and in memory: a candidate file that is not UTF-8 text, when a
+/// candidate of its ecosystem could rewrite it (#721).
 ///
 /// In memory, additionally: a candidate file read through a link (its bytes
 /// are unknown) or present without content, when a candidate of its
@@ -2301,13 +2407,16 @@ pub fn guard(
     if let Some(linked) = written().find(|k| view.is_symlink(k)) {
         return Some(symlink_refusal(linked));
     }
-    let ProjectView::Memory(project) = view else {
-        return None;
-    };
+    if let Some(refusal) = undecodable_guard(&done.undecodable_reads, candidates) {
+        return Some(refusal);
+    }
     let candidate_ecosystems: BTreeSet<&str> = candidates
         .iter()
         .map(|c| c.dep.ecosystem.as_str())
         .collect();
+    let ProjectView::Memory(project) = view else {
+        return None;
+    };
     if let Some(linked) = done
         .symlinked_reads
         .iter()
@@ -2467,6 +2576,146 @@ mod tests {
         // A non-UTF-8 file is absent to disk too: not a refusal.
         let read = read_candidate_files(&view, &BTreeSet::new(), &candidates).await;
         assert!(read.unreadable_reads.is_empty());
+    }
+
+    /// #721: a candidate file that is not UTF-8 (a UTF-16 requirements.txt,
+    /// which pip reads) is refused by name, on disk and in memory alike,
+    /// when a candidate of its ecosystem could rewrite it, instead of being
+    /// treated as absent (exit 0, nothing pinned, no diagnostic).
+    #[tokio::test]
+    async fn an_undecodable_candidate_file_refuses_its_ecosystem() {
+        let purl = "pkg:pypi/six@1.16.0";
+        let uuid = "u-721";
+        let mut refs = HashMap::new();
+        refs.insert(
+            uuid.to_string(),
+            reference(serde_json::json!({
+                "status": "granted",
+                "url": format!("https://patch.example/patch/pypi/six/1.16.0/tok/{uuid}/six-1.16.0-py2.py3-none-any.whl"),
+                "purl": purl,
+                "artifacts": [{"kind": "tarball", "url": null, "integrity": {"sha256": "ab"}}],
+                "registryOverride": null
+            })),
+        );
+        let selected = vec![(purl.to_string(), uuid.to_string())];
+        let mut skipped = Vec::new();
+        let candidates = build_candidates(&selected, &refs, &mut skipped);
+        assert_eq!(candidates.len(), 1, "{skipped:?}");
+        let utf16: Vec<u8> = [0xFF, 0xFE]
+            .into_iter()
+            .chain(
+                "idna==3.7\r\nsix==1.16.0\r\n"
+                    .encode_utf16()
+                    .flat_map(u16::to_le_bytes),
+            )
+            .collect();
+        let outer = OuterAllowRemote::default;
+        let options = || RewriteOptions {
+            dry_run: false,
+            targets_pipenv_lock: false,
+            pipenv_major: None,
+            pipenv_unknown_detail: String::new(),
+            trust_lockfile_config: true,
+            npm_allow_remote_config: true,
+            npm_outer: &outer,
+            yarn_classic_outer: &OuterYarnMirror::default,
+            blocking: false,
+        };
+
+        let tmp = tempfile::tempdir().unwrap();
+        std::fs::write(tmp.path().join("requirements.txt"), &utf16).unwrap();
+        let mut memory = MemoryProject::new();
+        memory.insert(
+            "requirements.txt",
+            MemoryEntry::Binary(utf16.clone().into()),
+        );
+        for view in [ProjectView::Disk(tmp.path()), ProjectView::Memory(&memory)] {
+            let read = read_candidate_files(&view, &BTreeSet::new(), &candidates).await;
+            assert_eq!(read.undecodable_reads, vec!["requirements.txt"]);
+            let done = rewrite(
+                &view,
+                read,
+                &candidates,
+                BTreeMap::new(),
+                &BTreeSet::new(),
+                &[],
+                options(),
+            )
+            .await;
+            let refusal = guard(&view, &done, &candidates).expect("refused");
+            assert_eq!(refusal.code, UNREADABLE_REFUSAL);
+            assert!(
+                refusal.message.contains("requirements.txt") && refusal.message.contains("UTF-8"),
+                "{}",
+                refusal.message
+            );
+
+            // Another ecosystem's run is not blocked by it.
+            let (cargo_selected, cargo_refs) = cargo_reference("u-2");
+            let cargo = build_candidates(&cargo_selected, &cargo_refs, &mut Vec::new());
+            let read = read_candidate_files(&view, &BTreeSet::new(), &cargo).await;
+            let done = rewrite(
+                &view,
+                read,
+                &cargo,
+                BTreeMap::new(),
+                &BTreeSet::new(),
+                &[],
+                options(),
+            )
+            .await;
+            assert!(guard(&view, &done, &cargo).is_none());
+        }
+    }
+
+    /// #721 review: beside a yarn berry lock the root `package.json` is a
+    /// rewrite target (its `resolutions`), so a non-UTF-8 one refuses the
+    /// run instead of being taken for absent. Beside an npm lock it is
+    /// advisory only and never refuses.
+    #[tokio::test]
+    async fn a_non_utf8_berry_manifest_refuses_the_npm_run() {
+        use crate::patch::redirect::Integrity;
+        let candidates = vec![Candidate {
+            purl: "pkg:npm/left-pad@1.3.0".into(),
+            dep: DepOverride {
+                ecosystem: "npm".into(),
+                name: "left-pad".into(),
+                namespace: None,
+                version: "1.3.0".into(),
+                token: "tok".into(),
+                patch_uuid: "uuid".into(),
+                artifact_url:
+                    "https://patch.socket.dev/patch/npm/left-pad/1.3.0/tok/uuid/left-pad-1.3.0.tgz"
+                        .into(),
+                registry_override: None,
+                integrity: Integrity::default(),
+            },
+        }];
+        let berry = "__metadata:\n  version: 8\n  cacheKey: 10c0\n\n\"left-pad@npm:^1.3.0\":\n  \
+                     version: 1.3.0\n  resolution: \"left-pad@npm:1.3.0\"\n";
+        let latin1: &[u8] = b"{\"name\": \"Andr\xe9\"}\n";
+        let tmp = tempfile::tempdir().unwrap();
+        std::fs::write(tmp.path().join("yarn.lock"), berry).unwrap();
+        std::fs::write(tmp.path().join("package.json"), latin1).unwrap();
+        let view = ProjectView::Disk(tmp.path());
+        let read = read_candidate_files(&view, &BTreeSet::new(), &candidates).await;
+        assert_eq!(read.undecodable_reads, vec!["package.json"]);
+        let refusal = undecodable_guard(&read.undecodable_reads, &candidates).expect("refused");
+        assert_eq!(refusal.code, UNREADABLE_REFUSAL);
+
+        // Beside an npm lock the manifest is advisory: never refused.
+        std::fs::remove_file(tmp.path().join("yarn.lock")).unwrap();
+        std::fs::write(
+            tmp.path().join("package-lock.json"),
+            "{\"lockfileVersion\": 3, \"packages\": {}}\n",
+        )
+        .unwrap();
+        let read = read_candidate_files(&view, &BTreeSet::new(), &candidates).await;
+        assert!(
+            read.undecodable_reads.is_empty(),
+            "{:?}",
+            read.undecodable_reads
+        );
     }
 
     /// A hosted URL left in a berry project's `package.json` `resolutions`
@@ -3049,6 +3298,14 @@ mod tests {
                 "{:?}",
                 read.gradle_unreadable
             );
+            // Only the Gradle build is refused, not the whole run (#721).
+            assert!(
+                !read
+                    .undecodable_reads
+                    .contains(&"settings.gradle".to_string()),
+                "{:?}",
+                read.undecodable_reads
+            );
             assert!(done.rewrite.refused_gradle_uuids.contains(GRADLE_UUID));
             assert!(
                 !done.rewrite.files.contains_key("settings.gradle"),
@@ -3108,6 +3365,78 @@ mod tests {
         assert!(read.gradle_unreadable.is_empty());
         let text = &done.rewrite.files["settings.gradle"];
         assert!(text.contains("include 'core'"), "{text}");
+    }
+
+    /// #721 review: with no readable Gradle build the Gradle planner never
+    /// runs, so a stray non-UTF-8 Gradle lock does not refuse the rest of a
+    /// Maven run. A non-UTF-8 root build or settings script does: it may be
+    /// the whole build, unreadable, which would otherwise be skipped
+    /// silently (a Gradle-only project exiting 0 unpatched).
+    #[tokio::test]
+    async fn non_utf8_gradle_files_without_a_readable_build() {
+        const POM: &str = "<project><dependencies><dependency><groupId>com.socketfixture</groupId><artifactId>victim</artifactId><version>1.10.0</version></dependency></dependencies></project>\n";
+        let latin1: &[u8] = b"rootProject.name = 'Andr\xe9'\n";
+        let candidates = vec![gradle_candidate()];
+
+        // A stray lock beside a pom.xml: not refused.
+        let tmp = tempfile::tempdir().unwrap();
+        std::fs::write(tmp.path().join("pom.xml"), POM).unwrap();
+        std::fs::write(tmp.path().join("gradle.lockfile"), latin1).unwrap();
+        let mut memory = MemoryProject::new();
+        memory.insert_text("pom.xml", POM);
+        memory.insert(
+            "gradle.lockfile",
+            MemoryEntry::Binary(latin1.to_vec().into()),
+        );
+        for view in [ProjectView::Disk(tmp.path()), ProjectView::Memory(&memory)] {
+            let (read, done) = gradle_rewrite_in(&view).await;
+            assert!(
+                read.undecodable_reads.is_empty(),
+                "{:?}",
+                read.undecodable_reads
+            );
+            assert!(guard(&view, &done, &candidates).is_none());
+        }
+
+        // A Gradle-only project whose root scripts are all non-UTF-8:
+        // refused, never skipped.
+        for root in ["settings.gradle", "build.gradle", "build.gradle.kts"] {
+            let tmp = tempfile::tempdir().unwrap();
+            std::fs::write(tmp.path().join(root), latin1).unwrap();
+            let mut memory = MemoryProject::new();
+            memory.insert(root, MemoryEntry::Binary(latin1.to_vec().into()));
+            for view in [ProjectView::Disk(tmp.path()), ProjectView::Memory(&memory)] {
+                let (read, done) = gradle_rewrite_in(&view).await;
+                assert_eq!(read.undecodable_reads, vec![root.to_string()]);
+                let refusal = guard(&view, &done, &candidates).expect("refused");
+                assert_eq!(refusal.code, UNREADABLE_REFUSAL);
+            }
+        }
+    }
+
+    /// #721 review: an unreadable `socket-patch.sbt` is refused by the
+    /// run-wide check itself, which also runs before any vendored->hosted
+    /// takeover revert, and keeps the sbt planner's own refusal code.
+    #[tokio::test]
+    async fn an_unreadable_sbt_owned_file_refuses_early_with_the_sbt_code() {
+        let latin1: &[u8] = b"// Auteur: Andr\xe9\n";
+        let tmp = tempfile::tempdir().unwrap();
+        std::fs::write(tmp.path().join("socket-patch.sbt"), latin1).unwrap();
+        let candidates = vec![gradle_candidate()];
+        let read = read_candidate_files(
+            &ProjectView::Disk(tmp.path()),
+            &BTreeSet::new(),
+            &candidates,
+        )
+        .await;
+        assert_eq!(read.undecodable_reads, vec!["socket-patch.sbt"]);
+        let refusal = undecodable_guard(&read.undecodable_reads, &candidates).expect("refused");
+        assert_eq!(refusal.code, SBT_OWNED_FILE_UNREADABLE);
+        assert!(
+            refusal.message.contains("socket-patch.sbt"),
+            "{}",
+            refusal.message
+        );
     }
 
     /// A refused Gradle build is never confirmed by a snippet pasted into a

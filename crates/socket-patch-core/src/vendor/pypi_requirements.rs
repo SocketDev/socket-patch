@@ -859,6 +859,16 @@ async fn collect_requirements_files(root: &Path) -> Result<Vec<ReqFile>, (&'stat
             });
             Ok(true)
         }
+        // pip decodes a UTF-16 file by its BOM (#721), so a pin inside one
+        // is installed; wiring around it would leave that pin unpatched.
+        Err(e) if e.kind() == std::io::ErrorKind::InvalidData => Err((
+            "pypi_no_requirements",
+            format!(
+                "{} is not UTF-8 text (for example UTF-16, which Windows PowerShell 5.1 \
+                 writes for `pip freeze > requirements.txt`); re-save it as UTF-8 and re-run",
+                path.display()
+            ),
+        )),
         Err(_) if out.is_empty() => Err((
             "pypi_no_requirements",
             format!("cannot read {}", root.join(rel).display()),
@@ -1283,6 +1293,43 @@ mod tests {
             .await
             .unwrap();
         tmp
+    }
+
+    /// #721: pip installs from a UTF-16 requirements file (what Windows
+    /// PowerShell 5.1's `pip freeze >` writes), so vendoring must refuse it
+    /// by name, as the root file or as an include, never wire around it.
+    #[tokio::test]
+    async fn a_utf16_requirements_file_is_refused_by_name() {
+        let utf16 = |text: &str| -> Vec<u8> {
+            let mut out = vec![0xFF, 0xFE];
+            for unit in text.encode_utf16() {
+                out.extend(unit.to_le_bytes());
+            }
+            out
+        };
+        let tmp = tempfile::tempdir().unwrap();
+        std::fs::write(
+            tmp.path().join("requirements.txt"),
+            utf16("six==1.16.0\r\n"),
+        )
+        .unwrap();
+        let err = wire_requirements(tmp.path(), "six", "1.16.0", REL_WHEEL, SHA)
+            .await
+            .unwrap_err();
+        assert_eq!(err.0, "pypi_no_requirements");
+        assert!(
+            err.1.contains("requirements.txt is not UTF-8 text"),
+            "{}",
+            err.1
+        );
+
+        let tmp = write_root("-r inc.txt\nidna==3.7\n").await;
+        std::fs::write(tmp.path().join("inc.txt"), utf16("six==1.16.0\r\n")).unwrap();
+        let err = wire_requirements(tmp.path(), "six", "1.16.0", REL_WHEEL, SHA)
+            .await
+            .unwrap_err();
+        assert!(err.1.contains("inc.txt is not UTF-8 text"), "{}", err.1);
+        assert_eq!(read_root(tmp.path()).await, "-r inc.txt\nidna==3.7\n");
     }
 
     async fn read_root(root: &Path) -> String {
