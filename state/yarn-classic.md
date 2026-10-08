@@ -1,6 +1,6 @@
 [agent] Progress ledger for the scheduled Yarn classic (1.x) bug-hunt routine (label pm:yarn-classic).
 
-Last updated: 2026-10-08 (run 32), main `e2d9633`, latest release v4.0.0. Runs 5–32 added the cells in "Run 5 cells" through "Run 32 cells" below. Run 32 checked #1057 (the yarn grammar refactor; it fixes the hosted half of #467), #1050 and #1029 with no regressions. #1013 / #1078 / #519 are closed by #1083 / #1033; run 31 verified the mirror fix cross-OS. Since run 28, #364, #921, #857, #884, #831, #974, #938 (#940) and #907 (#917) are closed by merged fixes, and #1071 (#1073) and #975 (#978) have landed too; the old `fail #364` cells now mean a project-level mirror is refused (pass), and #1115 (a mirror in a workspace member's `.yarnrc`) is the remaining mirror gap. The project-mode matrix below was measured on `f6b7fb9` (v4); cells marked "(v5)", the global matrix and the "v5 project-mode cells" list were re-run on v5.
+Last updated: 2026-10-08 (run 33), main `cf8b164`, latest release v4.0.0. Runs 5–33 added the cells in "Run 5 cells" through "Run 33 cells" below. Run 33 checked #1039 (the staged, atomic vendored→hosted takeover) and #1117 (BOM handling); the only new fail is #1158 (a takeover un-patches a vendored `npm:` alias copy beside a pinned direct copy). Run 32 checked #1057 (the yarn grammar refactor; it fixes the hosted half of #467), #1050 and #1029 with no regressions. #1013 / #1078 / #519 are closed by #1083 / #1033; run 31 verified the mirror fix cross-OS. Since run 28, #364, #921, #857, #884, #831, #974, #938 (#940) and #907 (#917) are closed by merged fixes, and #1071 (#1073) and #975 (#978) have landed too; the old `fail #364` cells now mean a project-level mirror is refused (pass), and #1115 (a mirror in a workspace member's `.yarnrc`) is the remaining mirror gap. The project-mode matrix below was measured on `f6b7fb9` (v4); cells marked "(v5)", the global matrix and the "v5 project-mode cells" list were re-run on v5.
 
 ## Coverage matrix
 
@@ -230,8 +230,15 @@ Other cells that pass on Linux 1.22.22 (some also on older releases; see the ent
 - #1050 `scan --vendored --prune` keeps live wiring in 8 shapes and reverts after `yarn remove` (×2): pass. #1029 agent `apply --check` (workspaces, nested copies, modules-folder, nohoist): pass.
 - #558 still reproduces. #1115 also triggers through a member `.npmrc` (commented).
 
+### Run 33 cells (Linux, `cf8b164`)
+
+- #1039 staged takeover V→H (1.22.22): wet takeover + fresh frozen install, dry run byte-identical, project `.yarnrc` mirror retract (`redirect_takeover_kept_vendored`, byte-identical), alias-only retract (byte-identical): pass. Mirror retract then clean takeover on 1.7.0 / 1.10.1: pass.
+- **Alias + direct copy (two blocks, 1.22.22) V→H takeover: the alias copy is un-patched and the takeover isn't retracted: fail #1158** (v4.0.0 does the same).
+- #1117 BOM: BOM `package.json` + BOM lock, H/V + frozen install + VEX + rollback; BOM+CRLF lock V→H→V chain (endings and BOM kept, every hop patched): pass.
+
 ## Backlog
 
+0000. #1158 follow-ups: scoped alias and workspace-member alias takeover shapes; ask yarn-berry about the same partial-pin takeover gap with `redirect_yarn_berry_alias_skipped`. #1115 in the now-staged V→H takeover.
 000. #1115 follow-ups (member `.npmrc` done in run 32): `yarn workspace <m> add`, V→H takeover in that shape; macOS / Windows.
 00. #1097 follow-ups (`get` done in run 31): the same `!` / extglob member shapes from `get` and on yarn berry / npm / bun roots (hand over npm extglob if it reproduces; npm supports negation, so only extglob applies there). Dot-dir members (`packages/.x`, which minimatch `*` skips).
 0. #1013 / #1078 follow-ups: the vendored→hosted takeover preflight with a user-level mirror; macOS / Windows home config paths; a BOM `.yarnrc` on a Windows probe (PowerShell 5 `Set-Content -Encoding utf8`). Re-check #1081 on berry aliases (hand over to yarn-berry if `redirect_yarn_berry_alias_skipped` also attests in-run), and on npm / pnpm alias skips.
@@ -250,7 +257,8 @@ Other cells that pass on Linux 1.22.22 (some also on older releases; see the ent
 
 - `patches-api.socket.dev` isn't used here. Use a local mock API (`--api-url`). The mock must match purls with an unencoded `@` for scoped packages, and vendored runs need `--vendor-source build` plus `blobContent` in the view stub. For hosted `vex` on lock-only checkouts, pass `--patch-server-url <mock>` (CLI_CONTRACT "Patch hosts"); otherwise `package_not_found` is expected.
 - **yarn 1.0.2 – 1.6.x install nothing (exit 0, empty node_modules) for `file:` tarball lock entries and offline-mirror installs, even without socket-patch.** Bisected in run 2: Node 10.24.1 / 14.21.3 / 16.20.2 / 22 all behave the same, and 1.7.0 works on all of them. The cause is in yarn, not Node or socket-patch, which is why CI reports `KNOWN LIMITATION` for vendored ≤ 1.6. Not in docs/ecosystems.md.
-- An `npm:` alias entry is left unpatched in hosted mode with `redirect_yarn_classic_alias_skipped` (documented), and `vex` omits the package.
+- An `npm:` alias entry is left unpatched in hosted mode with `redirect_yarn_classic_alias_skipped` (documented), and `vex` omits the package. (Exception: a vendored→hosted takeover that un-patches an alias copy the vendored wiring had patched is #1158.)
+- #467 (vendored rewrite of a **mixed** CRLF/LF yarn.lock re-ends the block CRLF; rollback not byte-exact) was closed `not_planned` by a maintainer on 2026-10-08. The hosted half is fixed by #1057. Don't re-file the vendored mixed-ending shape.
 - A BOM plus no yarn header comment makes the first entry `entry_not_found`. Yarn always writes the header, so this is synthetic.
 - `file:` directory and `link:` deps are skipped by design. (`file:` **tarball** deps are rewired and work.)
 - The GitHub shorthand `owner/repo#tag` locks as a codeload tarball and is correctly rewired; only `git+…` patterns are #363.
