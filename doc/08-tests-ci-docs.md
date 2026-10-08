@@ -32,8 +32,8 @@ PR #277 has already started cleaning up: it deleted 237,608 lines, including 136
 **Duplicated helpers.**
 - `common/mod.rs` (792 lines) is `#[path]`-included and recompiled by ~60 binaries, and `vex_e2e_common` (876) by ~53. 34 helper files carry `#![allow(dead_code)]`.
 - Helpers that `common` already exports are redefined locally:
-  - `fn binary()` in **103 files** (7 variants);
-  - `fn git_sha256` in **86 files** (10 variants), although `common::git_sha256` exists and core exports `compute_git_sha256_from_bytes`;
+  - `fn binary()` in **51 files** (103 before #1124 moved 72 files onto `tests/common`; a one-sided ratchet stops new copies);
+  - `fn git_sha256` in **54 files** (86 before #1124), although `common::git_sha256` exists and core exports `compute_git_sha256_from_bytes`;
   - `copy_dir_recursive` in 26 files;
   - `scrub_socket_env`: since #850, child processes are built by one `common/hermetic.rs` builder, and 7 per-file copies remain (the `PENDING_SCRUB_COPIES` list in `tests/spawn_env_hygiene.rs`); 2 files still spawn the binary with no scrub (see {{C47}}). {{C30}}
 - `vex_pdm_hatch_common` and `vex_pipenv_pip_common` share **977 identical non-blank lines** (78% similar).

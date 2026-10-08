@@ -1,21 +1,23 @@
 ### Refactor routine (`refactor`, hourly, highest leverage first)
-_Last updated 2026-10-08T16:17Z · main @ 823810a_
+_Last updated 2026-10-08T17:20Z · main @ 30a45b3_
 
 **In flight:**
+- [#1151](https://github.com/SocketDev/socket-patch/pull/1151): uv/PEP 751 and poetry lock inventory pick pure wheels through the shared `is_portable_wheel_url` (#1048) rule, and inventory and ledger recovery share one `portable_wheel_artifact` pick; deletes both `-none-any.whl` suffix checks and recovery's copy. Issue #1150 (E89, the rest of #1079). +30 / −32 production, +101 tests. Only change: `cp*`/`pp*`/`py2-none-any` wheels are no longer pinned by inventory. `state: ready`.
 - [#1145](https://github.com/SocketDev/socket-patch/pull/1145): Gradle's `verification-metadata.xml` and parent-pom reads go through a new `formats::xml` (the pom scanner moved out of `formats::maven`); deletes `gradle.rs`'s `mask_xml_comments`/`xml_elements`/`xml_attr`. Issue #715 (E10, item 6, Gradle half). +282 / −308 production (~120 moved), +123 tests. Only change: CDATA markup is text, malformed verification files refuse. `state: ready`.
 - [#1141](https://github.com/SocketDev/socket-patch/pull/1141): deletes the dead hosted-vlt redirect-ledger helpers (`vlt::{edit_dep_id, lock_node_ids, claims_key, carried_pin_*}`, `vlt_heal::ledger_targets`), gates `jvm::apply::read_project_file` to tests, and pins `lock_targets` with a unit test. Issue #782 (E58, slice 1). +13 / −194 production, +36 / −150 tests. `state: ready`.
 - [#1126](https://github.com/SocketDev/socket-patch/pull/1126): 7 inline `starts_with("pkg:<type>/")` checks (Bun/vlt preflights, PyPI fuzzy match, Coursier sidecar, VEX verify) through `Ecosystem::from_purl`, plus an equivalence table test and a one-sided guard listing 16 pending files. Issue #747 (C20, slice 1). +18 / −9 production, +155 tests. `state: ready`.
-- [#1124](https://github.com/SocketDev/socket-patch/pull/1124): 72 CLI test files use `tests/common`'s `binary()`/`git_sha256`, plus a one-sided ratchet. Issue #824 (C30, children 2–3). Test-only, +450 / −583. `state: ready`.
-- [#1121](https://github.com/SocketDev/socket-patch/pull/1121): ledger recovery reads the recorded uv/pdm `[[package]]` unit through `utils::python_lock::package_artifacts` and picks wheels through the shared `pypi_distribution::is_portable_wheel_url`; deletes recovery's string scanner and suffix rule. Issue #1079 (E89, slice 1; the `lock_inventory/pypi.rs` suffix checks and the rename remain, in files #1058/#1009/#1045/#768 change). `state: ready`.
 - [#1117](https://github.com/SocketDev/socket-patch/pull/1117): 8 inline BOM strips onto `formats::text`, plus a one-sided guard (26-file pending list). Issue #905 (E64, step 3 slice 1). `state: ready`.
 - [#1110](https://github.com/SocketDev/socket-patch/pull/1110): one `formats::cargo::manifest` reader for the crawler, VEX product and `cargo_tag`. Issue #693 (E15, slice 1). Parse cost 0.5 µs → 81 µs per manifest, disclosed. `state: ready`.
 - [#1108](https://github.com/SocketDev/socket-patch/pull/1108): one `utils::line_endings::terminator` for 7 inserted-line sites. Issue #815 (E16, slice 1; the rest is in open-PR files). Re-blesses mixed-ending go/uv goldens only. `state: ready`.
 - [#1106](https://github.com/SocketDev/socket-patch/pull/1106): the macOS PDM site probe runs through `utils::process::output_within`; a guard test rejects new production `kill_on_drop` spawns (pending: `vendor/npm_dir.rs`). Issue #1067 (C48, slice: `pdm_site`; the `npm_dir` git exchange remains, blocked on #1026). `state: ready`, handed to the burn-down.
 - [#1103](https://github.com/SocketDev/socket-patch/pull/1103): `go.sum` edits through `GoSumEditor` only; deletes the oracle-only free functions and names the key rule once. Issue #631 (E52, slice: steps 2–3; the move to `formats/golang/sum.rs` remains). `state: ready`, handed to the burn-down.
-- Maintainer drafts (decided issues): #1021 (#615), #1027 (#704), #1030 (#808), #1031 (#966), #1036 (#973), #1041 (#648), #1049 (#792), #1051 (#580).
+- Maintainer drafts (decided issues): #1027 (#704), #1030 (#808), #1031 (#966), #1036 (#973), #1041 (#648), #1049 (#792), #1051 (#580).
 - October 7 campaign: open #1026, #1034, #1043, #1058; the rest merged (#1039 last; rows in the auditors' registers).
 
 **Merged:**
+- [#1121](https://github.com/SocketDev/socket-patch/pull/1121): ledger recovery reads uv/pdm units through `utils::python_lock::package_artifacts` and the shared wheel rule. Issue #1079 (E89, slice 1). `9b815a7`.
+- [#1124](https://github.com/SocketDev/socket-patch/pull/1124): 72 CLI test files on `tests/common`'s `binary()`/`git_sha256` (now 51 / 54 local copies left). Issue #824 (C30). `aa558c5`, test-only +450 / −583.
+- [#1021](https://github.com/SocketDev/socket-patch/pull/1021) (maintainer draft): `SOCKET_FORCE` binding removed. Issue #615 (C05). `d410ee7`.
 - [#1015](https://github.com/SocketDev/socket-patch/pull/1015): vendored-reference scan reads every `VENDORED` row. Issues #832, #958 (E61). `8e521f9` (+308 / −41). Left: dead `eco == "maven2"` arm in `commands/vendor.rs`.
 - Earlier: #889, #876, #886, #870, #865, #858, #850, #607, #602, #597, #587, #583, #581, #574, #572 (see `entries/refactor/`).
 
@@ -23,15 +25,17 @@ _Last updated 2026-10-08T16:17Z · main @ 823810a_
 
 | # | Candidate | B | U | D | R | Score | Note |
 |---|---|:-:|:-:|:-:|:-:|:-:|---|
-| 1 | #989 item (was #990): one `vendor::revert::finish` for the 12 copied finish blocks | 0 | 1 | ≈12 | L | ≈26 | skipped: all 12 backend files changed by open PRs |
-| 2 | #594 / #717 (E10): nuget.config and pom.xml edits through the `formats::nuget` / `formats::maven` tokenizers | 3 | 1 | ≈6 | M | ≈21 | skipped: hosted halves in `redirect/mod.rs` |
-| 3 | C69 / #836: uv/pylock hosted re-serializes the lock per patched dep (`rewrite_uv_lock`) | 0 | 0 | 0 | L | ≈3 (S 3) | skipped: `redirect/mod.rs` in #1008/#1009/#1026/#1051 |
-| 4 | #715 item 6 (E10): Gradle verification XML through a shared `formats::xml` | 0 | 1 | 3 | L–M | ≈6 | **taken: #1145** |
+| 1 | #1150 (E89 rest): inventory's pure-wheel suffix checks and duplicate pick onto the shared rule | 1 | 0 | 2 | L | ≈7 | **taken: #1151** |
+| 2 | #989 item (was #990): one `vendor::revert::finish` for the 12 copied finish blocks | 0 | 1 | ≈12 | L | ≈26 | skipped: all 12 backend files changed by open PRs |
+| 3 | #594 / #717 (E10): nuget.config and pom.xml edits through the `formats::nuget` / `formats::maven` tokenizers | 3 | 1 | ≈6 | M | ≈21 | skipped: `redirect/mod.rs`, `vendor/nuget_feed.rs` (#1041) |
+| 4 | C69 / #836: uv/pylock hosted re-serializes the lock per patched dep (`rewrite_uv_lock`) | 0 | 0 | 0 | L | ≈3 (S 3) | skipped: `redirect/mod.rs` in open PRs |
 | 5 | #1129 (E92): pnpm modules-dir resolution shared by crawler and `pkg_managers` | 1 | 0 | 1 | L | ≈5 | skipped: `npm_crawler.rs` in #1007/#1008/#1009 |
 
-Re-ranked 2026-10-08T16:00Z at `823810a` against 32 open PRs (567 files; 482 in `arch-refactor/*` or `agent/fix-*`). #706's remaining digest slice is deferred by the maintainer's backlog review ("Defer the remaining consolidation"), so it is not ranked. Also blocked by open-PR files: #727/#630 items, #705, #913, #675, #780, #936, #1128, #931/#998/#1063/#1123 (every `commands/*` manifest reader).
+Re-ranked 2026-10-08T17:00Z at `30a45b3` against 32 open PRs (407 files in `arch-refactor/*` or `agent/fix-*`). #706's remaining digest slice is deferred by the maintainer's backlog review ("Defer the remaining consolidation"), so it is not ranked. Also blocked by open-PR files: #727/#630 items, #705, #913, #675, #780, #936, #1128, #931/#998/#1063/#1123 (every `commands/*` manifest reader).
 
 **Notes:**
+- `mode_migration_pypi::pipenv_hosted_to_vendored_names_the_unpatched_requirements` needs a GET to pypi.org and fails in the sandbox on `main` too.
+- A closed issue whose register row is only `partly fixed` needs a new follow-up issue for the remainder (#1150 after #1079); don't reopen the closed one.
 - `formats::xml` (#1145) is the shared XML element scanner (comment + CDATA blanking, `elements`, `children`, `attr`); route new XML readers (NuGet, pom writers) through it instead of a private masker.
 - The skip rule names only `arch-refactor/*` and `agent/fix-*` PRs; `arch-fix/*`, `ci*` and `ci-janitor/*` files are not blockers by the letter, but check their hunks before touching the same lines.
 - A maintainer-closed issue whose backlog note says "Defer" (e.g. #706) is steering: don't rank it until reopened.
