@@ -2,7 +2,7 @@
 
 The routine runs every 6 hours. Each run adds one comment here with the socket-patch commit it tested, the OS × Pipenv-version × mode cells it covered, the issues it filed, updated or closed, and what it plans to probe next. The routine treats this thread as its only memory.
 
-Last run: 2026-10-08 ~15:39Z, main `823810a`. Filed #1142 (after `pipenv uninstall` empties a named category on Pipenv 2022 / 2023, prune / revert / remove / rollback drift-keep the vendored entry and the `vendor --check` remedy loops). #1039 takeover and platform-wheel retraction pass. Commented on #612 (an `-r` include gets no scan-time warning). #1122 and #744 still fail. Previous run: 2026-10-08 ~09:37Z.
+Last run: 2026-10-08 ~21:58Z, main `830749f`. Filed #1184 (a #997 residual-reference keep after a `pipenv requirements` export is reported by remove / rollback / the hosted takeover as drift, and the printed remedy loops). Commented the Pipenv lane on #1167 (subdirectory export, wheel deleted). #1142 and #981 still fail. CRLF prune and `--dev` uninstall prune pass. Previous run: 2026-10-08 ~15:39Z.
 
 ## Coverage matrix
 
@@ -90,10 +90,13 @@ Stale-install remedy followed verbatim, `15:30Z` run, `045d7ec`: `default` patch
 
 `15:39Z` run (2026-10-08), `823810a`: the #1050 prune GC keeps live vendored entries in `default` / `develop` / `[docs]` on 2022 / 2023 / 2026 (pass), re-wires after a relock (pass), and reclaims a removed dependency (pass). The exception is a named category that Pipenv 2022 / 2023 drop from the lock once it's empty: fail #1142. #1039 vendored → hosted takeover (2022 / 2026, `default` / `docs`: dry run byte-identical, sync PATCHED) pass. The `cp311-none-any` retraction (`redirect_takeover_kept_vendored`, byte-identical) passes on 2023 / 2026. Vendored + `-r` include requirements.txt: `vendor --check` is red but there's no scan-time warning (#612, commented).
 
+`21:58Z` run (2026-10-08), `830749f`, rebuilt mock: a #997 residual keep from a root `pipenv requirements` export on 2022.12.19 / 2023.12.1 / 2026.8.0 keeps the wheel correctly, but remove / rollback / the takeover call it drift and the remedy loops (fail #1184). A subdirectory export (`requirements/prod.txt`) is unprobed, and the revert deletes the wheel (#1167, commented). #1050 prune on CRLF locks (2022 / 2026) and `pipenv uninstall --dev` prune (2022 / 2026): pass. VEX in the half-reverted state is honest.
+
 macOS/Windows rows are from the 2026-09-30 probes on `f6b7fb9`. No probe ran on v5 because branch deletion through the git proxy still fails (re-checked 2026-10-03 03:30Z); `bughunt/pipenv/20260930-venv-discovery` and `bughunt/pipenv/20260930-virtualenv` still need a maintainer to delete them.
 
 ## Backlog
 
+00000000000. #1184: re-verify once fixed (remove / rollback / takeover wording and the loop). #1167: re-verify once #1168 merges, with Pipenv `requirements/prod.txt` and `docker/requirements.txt` exports.
 0000000000. #1142: re-verify once fixed (also `[dev-packages]` uninstall and a named category with packages left in it). #1050 GC on the #1122 pylock-wired shape and on BOM / CRLF locks: untested.
 000000000. #1122: re-verify once fixed; variants `pylock_name` with both files, standalone `vendor` from an agent manifest, revert / rollback on the pylock-wired project. #612: the takeover policy is still open (warning and red check verified 2026-10-08 09:37Z). `apply --check` × #842 shape and `apply --check -g` (Docker `--system`).
 00000000. (#1048 verified fixed on `b762f41`, 2026-10-08; the withholding runs before every rewriter, so category / Pipenv 11 variants share it.) Service-vendoring mock: rebuild it (http.server: batch filtered by purl, by-package, by-cve, view with inline base64 blobs, blob route, grant with sha256 + sha512) and reuse it for the #612 / #567 vendored variants.
@@ -193,3 +196,5 @@ macOS/Windows rows are from the 2026-09-30 probes on `f6b7fb9`. No probe ran on 
 - Harness note: with `PIPENV_PYTHON` set at lock / sync time, Pipenv uses a `-python3.11`-suffixed venv. Read `pipenv --venv` with the same `PIPENV_PYTHON`, or `pipenv run` finds an empty, unsuffixed venv ("No module named six").
 - Deleting a `[docs]` header from the Pipfile and running `pipenv lock` keeps the stale `docs` category in the lock on 2022 / 2023 / 2026 (Pipenv's behaviour). The vendored wiring stays live, so the green check is correct.
 - `remove` / `rollback` with a purl carrying an unknown qualifier (`?foo=bar`) → "No patch found". That's cross-PM identifier behaviour (`PurlKey::qualified`).
+- Harness note (2026-10-08 21:58Z): the mock is rebuilt each run; it isn't on the ledger branch. Public-proxy routes plus `SOCKET_PROXY_URL` / `SOCKET_PATCH_SERVER_URL` / `SOCKET_PYPI_JSON_API` pointed at it are enough for hosted, vendored and vex (no token needed). The shape is in the 20261008T215835Z entry.
+- Vendored → hosted takeover with a root requirements.txt export of the vendored lock: refused with `redirect_vendored_revert_failed`, still patched. That refusal is documented; only its wording and remedy are #1184.
