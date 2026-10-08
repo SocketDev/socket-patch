@@ -835,7 +835,21 @@ fn uv_vendor_fresh_checkout_frozen_offline_and_revert() {
 #[test]
 #[serial_test::serial]
 fn uv_vendor_revert_keeps_wheel_while_export_references_it() {
-    let Some((uv, python)) = capstone_uv("uv-export") else {
+    uv_vendor_revert_keeps_wheel_while_export_at("uv-export", "requirements.txt");
+}
+
+/// #1167: the same keep when the export lands in a subdirectory the root
+/// `requirements.txt` never includes (`uv export -o requirements/lock.txt`,
+/// the common `requirements/` layout). Before the fix the probe listed only
+/// the project root, so the revert deleted the wheel that file installs.
+#[test]
+#[serial_test::serial]
+fn uv_vendor_revert_keeps_wheel_while_subdir_export_references_it() {
+    uv_vendor_revert_keeps_wheel_while_export_at("uv-export-subdir", "requirements/lock.txt");
+}
+
+fn uv_vendor_revert_keeps_wheel_while_export_at(tag: &str, out: &str) {
+    let Some((uv, python)) = capstone_uv(tag) else {
         return;
     };
     bake_leak_guards();
@@ -847,7 +861,7 @@ fn uv_vendor_revert_keeps_wheel_while_export_references_it() {
     if let Some(py) = python.as_deref() {
         cache_env.push(("UV_PYTHON", py));
     }
-    if !setup_uv_six_project(&uv, &proj, &cache_env, "uv-export") {
+    if !setup_uv_six_project(&uv, &proj, &cache_env, tag) {
         return;
     }
     let installed_six = site_packages(&proj.join(".venv")).join("six.py");
@@ -861,23 +875,20 @@ fn uv_vendor_revert_keeps_wheel_while_export_references_it() {
         "vendor failed.\nstdout:\n{stdout}\nstderr:\n{stderr}"
     );
     let wheel = vendored_wheel(&proj);
+    if let Some(parent) = std::path::Path::new(out).parent() {
+        std::fs::create_dir_all(proj.join(parent)).unwrap();
+    }
 
     // The real `uv export` writes the vendored wheel path into the export.
     let export = |context: &str| {
-        let out = tool(
+        let output = tool(
             &uv,
             &proj,
-            &[
-                "export",
-                "--frozen",
-                "--no-emit-project",
-                "-o",
-                "requirements.txt",
-            ],
+            &["export", "--frozen", "--no-emit-project", "-o", out],
             &cache_env,
         );
-        assert_tool_ok(&out, context);
-        std::fs::read_to_string(proj.join("requirements.txt")).unwrap()
+        assert_tool_ok(&output, context);
+        std::fs::read_to_string(proj.join(out)).unwrap()
     };
     let exported = export("`uv export` of the wired pair");
     assert!(
@@ -903,14 +914,14 @@ fn uv_vendor_revert_keeps_wheel_while_export_references_it() {
         "revert failed.\nstdout:\n{stdout}\nstderr:\n{stderr}"
     );
     assert!(
-        stdout.contains("vendor_revert_residual_reference") && stdout.contains("requirements.txt"),
+        stdout.contains("vendor_revert_residual_reference") && stdout.contains(out),
         "the keep must name the exported file:\n{stdout}"
     );
     let renv = parse_envelope(&stdout);
     assert_eq!(renv["summary"]["removed"], 0, "nothing removed: {renv}");
     assert!(
         wheel.is_file(),
-        "the exported requirements.txt still installs the wheel; it must be kept"
+        "the exported {out} still installs the wheel; it must be kept"
     );
     assert!(
         proj.join(".socket/vendor/state.json").is_file(),
