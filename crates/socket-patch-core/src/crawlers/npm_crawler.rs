@@ -108,7 +108,7 @@ fn pnpm_modules_dir_setting(start_path: &Path) -> Option<String> {
         .ancestors()
         .find_map(|dir| read(dir.join("pnpm-workspace.yaml")))
         .and_then(|yaml| {
-            crate::utils::serde::strip_bom(&yaml)
+            crate::formats::text::strip_bom(&yaml)
                 .lines()
                 .filter_map(crate::formats::pnpm::workspace::top_level_key)
                 .rfind(|(key, _)| key == "modulesDir")
@@ -156,8 +156,8 @@ pub fn pnpm_store_outside_project(project: &Path) -> bool {
         let Some(recorded) = parse_modules_yaml_virtual_store_dir(&text) else {
             return false;
         };
-        let importer = normalize_lexically(project);
-        let store = normalize_lexically(&nm.join(recorded));
+        let importer = crate::utils::relpath::normalize_lexically_keeping_escapes(project);
+        let store = crate::utils::relpath::normalize_lexically_keeping_escapes(&nm.join(recorded));
         store_below_importer(&importer, &store).is_none()
     })
 }
@@ -245,16 +245,8 @@ fn resolve_modules_folder(project_in_rc_dir: &[String], raw: &str) -> Option<Str
     if raw.starts_with(['/', '\\']) {
         return None;
     }
-    let mut segments: Vec<&str> = Vec::new();
-    for segment in raw.split(['/', '\\']) {
-        match segment {
-            "" | "." => {}
-            ".." => {
-                segments.pop()?;
-            }
-            other => segments.push(other),
-        }
-    }
+    let resolved = crate::utils::relpath::resolve_rel("", raw, 0)?;
+    let segments: Vec<&str> = resolved.split('/').filter(|s| !s.is_empty()).collect();
     let inside = segments.get(project_in_rc_dir.len()..)?;
     let at_project = segments.iter().zip(project_in_rc_dir).all(|(s, p)| s == p);
     if !at_project || inside.is_empty() {
@@ -367,7 +359,7 @@ fn parse_package_json_identity(content: &str) -> Option<(String, String)> {
     // (Windows-authored packages ship them), but serde_json rejects it —
     // a BOM'd install would be invisible to scan and unpatchable.
     let pkg: PackageJsonPartial =
-        serde_json::from_str(crate::utils::serde::strip_bom(content)).ok()?;
+        serde_json::from_str(crate::formats::text::strip_bom(content)).ok()?;
     let name = pkg.name?;
     let version = pkg.version?;
     if name.is_empty() || version.is_empty() {
@@ -591,7 +583,7 @@ const PNPM_MODULES_YAML: &str = ".modules.yaml";
 /// The `virtualStoreDir` value of a `.modules.yaml`: JSON on pnpm 10+,
 /// YAML before (a top-level `virtualStoreDir:` scalar, maybe quoted).
 fn parse_modules_yaml_virtual_store_dir(text: &str) -> Option<String> {
-    let text = crate::utils::serde::strip_bom(text);
+    let text = crate::formats::text::strip_bom(text);
     if let Ok(value) = serde_json::from_str::<serde_json::Value>(text) {
         return value
             .get("virtualStoreDir")?
@@ -611,24 +603,6 @@ fn parse_modules_yaml_virtual_store_dir(text: &str) -> Option<String> {
         raw.to_string()
     };
     (!value.is_empty()).then_some(value)
-}
-
-/// `path` with `.` and `..` resolved lexically (no filesystem access), so
-/// a recorded `../.vstore` joins to the same spelling the walks use.
-fn normalize_lexically(path: &Path) -> PathBuf {
-    let mut out = PathBuf::new();
-    for component in path.components() {
-        match component {
-            std::path::Component::CurDir => {}
-            std::path::Component::ParentDir => {
-                if !out.pop() {
-                    out.push(component);
-                }
-            }
-            other => out.push(other),
-        }
-    }
-    out
 }
 
 /// `store` relative to `importer`, when it names a directory strictly
@@ -683,8 +657,8 @@ fn store_below_importer(importer: &Path, store: &Path) -> Option<PathBuf> {
 fn relocated_pnpm_virtual_store_sync(nm: &Path) -> Option<PathBuf> {
     let text = crate::utils::fs::read_regular_to_string_sync(&nm.join(PNPM_MODULES_YAML)).ok()?;
     let recorded = parse_modules_yaml_virtual_store_dir(&text)?;
-    let importer = normalize_lexically(nm.parent()?);
-    let store = normalize_lexically(&nm.join(recorded));
+    let importer = crate::utils::relpath::normalize_lexically_keeping_escapes(nm.parent()?);
+    let store = crate::utils::relpath::normalize_lexically_keeping_escapes(&nm.join(recorded));
     let below = store_below_importer(&importer, &store)?;
     // The default location (or `node_modules` itself), however it is
     // spelled: compared on the importer-relative tail, so an absolute

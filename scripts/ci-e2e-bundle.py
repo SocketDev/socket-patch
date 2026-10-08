@@ -119,7 +119,7 @@ def suites_for(os_name, text=None):
     jobs = reader.jobs(text if text is not None else CI.read_text(encoding="utf-8"))
     suites = set(CARGO_VEX_SUITES)
     for job in MATRIX_JOBS:
-        for row in reader.matrix_include(jobs[job]):
+        for row in reader.job_rows(jobs, job):
             if row["os"] == os_name:
                 suites.update(row_suites(row))
     return sorted(suites)

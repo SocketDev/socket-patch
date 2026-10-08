@@ -15,13 +15,13 @@ use crate::patch::redirect::npmrc::NPMRC_REL;
 use crate::utils::python_lock::is_python_lock_name;
 
 use crate::policy::{
-    MemoryPolicyFs, PolicyOverrides, PolicySource, Root, RootFile, SelectionPolicy, POLICY_FILE_NAMES,
-    SOCKET_YML_INVALID,
+    MemoryPolicyFs, PolicyOverrides, PolicySource, Root, RootFile, SelectionPolicy,
+    POLICY_FILE_NAMES, SOCKET_YML_INVALID,
 };
 
 use super::roots::{
-    detect_roots, join_root, root_markers, split_path, strip_root, EXCLUDED_ROOT_SEGMENTS,
-    UNSUPPORTED_MARKERS,
+    detect_roots, join_root, root_markers, split_path, strict_ancestors, strip_root,
+    EXCLUDED_ROOT_SEGMENTS, UNSUPPORTED_MARKERS, YARNRC_NAME,
 };
 use super::types::{
     IgnoredPath, PathSelection, PolicyErrorInfo, PolicyFileInput, SelectOptions, TreeEntryInput,
@@ -186,7 +186,10 @@ fn classify(rel: &str, root_files: &BTreeSet<&str>) -> Option<Need> {
 /// The listed root policy files with the text the caller fetched first. A
 /// listed file with no text (not passed, `missing`, or a symlink) is present
 /// without content, so loading it fails closed.
-fn selection_policy_fs(blobs: &BTreeMap<String, bool>, supplied: &[PolicyFileInput]) -> MemoryPolicyFs {
+fn selection_policy_fs(
+    blobs: &BTreeMap<String, bool>,
+    supplied: &[PolicyFileInput],
+) -> MemoryPolicyFs {
     let mut fs = MemoryPolicyFs::default();
     for name in POLICY_FILE_NAMES {
         let Some(&symlink) = blobs.get(name) else {
@@ -212,7 +215,10 @@ fn selection_policy(
     options: &SelectOptions,
 ) -> Result<SelectionPolicy, PolicyErrorInfo> {
     let supplied = options.policy_files.as_deref().unwrap_or_default();
-    if let Some(bad) = supplied.iter().find(|f| !POLICY_FILE_NAMES.contains(&f.path.as_str())) {
+    if let Some(bad) = supplied
+        .iter()
+        .find(|f| !POLICY_FILE_NAMES.contains(&f.path.as_str()))
+    {
         return Err(PolicyErrorInfo {
             code: SOCKET_YML_INVALID.to_string(),
             detail: format!(
@@ -360,6 +366,17 @@ pub fn select_paths(entries: &[TreeEntryInput], options: &SelectOptions) -> Path
             let slot = needs.entry(full).or_insert(need);
             *slot = (*slot).min(need);
         }
+        // A PnP loader is live only under yarn berry's configured
+        // `nodeLinker`, which yarn also reads from the rc files above the
+        // project (#975), so a nested root fetches those too.
+        if PNP_MARKERS.iter().any(|m| files.contains(m)) {
+            for dir in strict_ancestors(root) {
+                let rc = join_root(dir, YARNRC_NAME);
+                if blobs.contains_key(&rc) {
+                    needs.insert(rc, Need::Text);
+                }
+            }
+        }
     }
 
     for (eco, markers) in UNSUPPORTED_MARKERS {
@@ -504,6 +521,33 @@ mod tests {
         assert_eq!(s.present_only, vec![".pnp.cjs"]);
         assert_eq!(s.symlinks, vec!["pnpm-workspace.yaml"]);
         assert_eq!(s.ignored_count, 2);
+    }
+
+    /// #975: a nested root's PnP loader is judged by the `nodeLinker` of the
+    /// rc files above it too, so those are fetched; a root without a loader
+    /// (or an rc beside no root) does not pull them in.
+    #[test]
+    fn a_nested_pnp_root_fetches_the_yarnrc_files_above_it() {
+        let entries = vec![
+            blob(".yarnrc.yml"),
+            blob("apps/.yarnrc.yml"),
+            blob("apps/web/yarn.lock"),
+            blob("apps/web/.pnp.cjs"),
+            blob("other/.yarnrc.yml"),
+            blob("tools/yarn.lock"),
+        ];
+        let s = select_paths(&entries, &SelectOptions::default());
+        assert_eq!(s.roots, vec!["apps/web", "tools"]);
+        assert_eq!(
+            s.fetch_text,
+            vec![
+                ".yarnrc.yml",
+                "apps/.yarnrc.yml",
+                "apps/web/yarn.lock",
+                "tools/yarn.lock"
+            ]
+        );
+        assert_eq!(s.present_only, vec!["apps/web/.pnp.cjs"]);
     }
 
     #[test]

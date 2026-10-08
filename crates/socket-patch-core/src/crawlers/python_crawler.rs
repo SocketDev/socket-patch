@@ -334,7 +334,11 @@ async fn find_site_packages_under(
 /// 3. Poetry's out-of-tree virtualenv(s), when Poetry itself would not use
 ///    `./.venv` for the project (see [`find_poetry_virtualenv_site_packages`])
 /// 4. `.venv` directory in `cwd`
-/// 5. `venv` directory in `cwd`
+/// 5. `venv` directory in `cwd` (a PDM project with neither: PEP 582)
+/// 6. Hatch's out-of-tree envs for the project (see
+///    [`super::hatch_env::hatch_environments`]), added to whichever of the
+///    above answered: `hatch run` never uses an env another manager
+///    records or activates, so its envs stay the project's (#335)
 pub async fn find_local_venv_site_packages(cwd: &Path) -> Vec<PathBuf> {
     let var = |name: &str| std::env::var(name).ok();
     find_local_venv_site_packages_with(cwd, &var).await
@@ -343,6 +347,25 @@ pub async fn find_local_venv_site_packages(cwd: &Path) -> Vec<PathBuf> {
 /// [`find_local_venv_site_packages`] over an explicit environment (tests pass
 /// a closure instead of mutating the process environment).
 async fn find_local_venv_site_packages_with(
+    cwd: &Path,
+    var: &impl Fn(&str) -> Option<String>,
+) -> Vec<PathBuf> {
+    let mut found = managed_or_local_site_packages(cwd, var).await;
+    add_hatch_site_packages(cwd, var, &mut found).await;
+    found
+}
+
+/// Steps 0-5 of [`find_local_venv_site_packages`] (no Hatch envs): the env
+/// a package manager records or activates, else the project's local venvs.
+/// What a non-Hatch manager's own reinstall reaches, e.g. Pipenv's venv.
+pub async fn non_hatch_local_venv_site_packages(cwd: &Path) -> Vec<PathBuf> {
+    let var = |name: &str| std::env::var(name).ok();
+    managed_or_local_site_packages(cwd, &var).await
+}
+
+/// Steps 0-5 of [`find_local_venv_site_packages`]: the env a package
+/// manager records or activates, else the project's local venvs.
+async fn managed_or_local_site_packages(
     cwd: &Path,
     var: &impl Fn(&str) -> Option<String>,
 ) -> Vec<PathBuf> {
@@ -401,6 +424,28 @@ async fn find_local_venv_site_packages_with(
     }
 
     results
+}
+
+/// Appends the `site-packages` of every existing Hatch env of the project
+/// at `cwd` (see [`super::hatch_env::hatch_environments`]) not already in
+/// `results`.
+async fn add_hatch_site_packages(
+    cwd: &Path,
+    var: &impl Fn(&str) -> Option<String>,
+    results: &mut Vec<PathBuf>,
+) {
+    for env in super::hatch_env::hatch_environments_with(cwd, var).await {
+        for site in hatch_env_site_packages(&env).await {
+            if !results.contains(&site) {
+                results.push(site);
+            }
+        }
+    }
+}
+
+/// The `site-packages` directories of one Hatch env.
+pub async fn hatch_env_site_packages(env: &super::hatch_env::HatchEnvironment) -> Vec<PathBuf> {
+    find_site_packages_under(&env.prefix, "site-packages").await
 }
 
 /// The `site-packages` of the env the project's package manager records for
@@ -498,9 +543,7 @@ async fn pdm_project_setting(
     table: &str,
     key: &str,
 ) -> Option<toml_edit::Item> {
-    let home = var("HOME")
-        .or_else(|| var("USERPROFILE"))
-        .map(PathBuf::from);
+    let home = env_home(var);
     let files = [cwd.join(".pdm.toml"), cwd.join("pdm.toml")]
         .into_iter()
         .chain(pdm_user_config_files(home.as_deref(), var));
@@ -560,11 +603,13 @@ fn pdm_env_flag(var: &impl Fn(&str) -> Option<String>, name: &str) -> bool {
 }
 
 /// Whether PDM installs the project at `cwd`: a PDM project (see
-/// [`is_pdm_project`], or a `.pdm-python`) with no `uv.lock` or
-/// `poetry.lock`, which drive installs ahead of `pdm.lock` (the hosted
-/// rewriters' precedence).
+/// [`is_pdm_project`], or a `.pdm-python`) with no tool lock that drives
+/// installs ahead of `pdm.lock` (`uv.lock`, `poetry.lock`: the shared
+/// precedence [`crate::formats::governing_locks::PYPI_TOOL_LOCKS`]).
 async fn pdm_drives_project(cwd: &Path) -> bool {
-    if cwd.join("uv.lock").is_file() || cwd.join("poetry.lock").is_file() {
+    if crate::formats::governing_locks::pypi_tool_lock_shadowed("pdm.lock", |lock| {
+        cwd.join(lock).is_file()
+    }) {
         return false;
     }
     cwd.join(".pdm-python").is_file() || is_pdm_project(cwd).await
@@ -582,9 +627,7 @@ async fn pdm_saved_interpreter(cwd: &Path) -> Option<PathBuf> {
     let saved = match read_regular_to_string(&cwd.join(".pdm-python")).await {
         Ok(text) => text.trim().to_string(),
         Err(_) => {
-            let text = read_regular_to_string(&cwd.join(".pdm.toml"))
-                .await
-                .ok()?;
+            let text = read_regular_to_string(&cwd.join(".pdm.toml")).await.ok()?;
             let doc = text.parse::<toml_edit::DocumentMut>().ok()?;
             doc.get("python")?.get("path")?.as_str()?.trim().to_string()
         }
@@ -639,6 +682,19 @@ async fn uv_project_environment_site_packages(
     var: &impl Fn(&str) -> Option<String>,
 ) -> Option<Vec<PathBuf>> {
     let env = var("UV_PROJECT_ENVIRONMENT").filter(|v| !v.trim().is_empty())?;
+    let uv_project = cwd.join("uv.lock").is_file()
+        || (cwd.join("pyproject.toml").is_file() && !claimed_by_non_uv_manager(cwd).await);
+    if !uv_project {
+        return None;
+    }
+    let found = find_site_packages_under(&cwd.join(env), "site-packages").await;
+    (!found.is_empty()).then_some(found)
+}
+
+/// Whether a manager other than uv records or locks the project at `cwd`:
+/// Poetry, PDM or Pipenv files, or a lockless Poetry (`[tool.poetry]`) or
+/// PDM project.
+async fn claimed_by_non_uv_manager(cwd: &Path) -> bool {
     let other_lock = [
         "poetry.lock",
         "poetry.toml",
@@ -649,19 +705,34 @@ async fn uv_project_environment_site_packages(
     ]
     .iter()
     .any(|marker| cwd.join(marker).exists());
-    // A lockless Poetry (`[tool.poetry]`) or PDM project is still theirs.
-    let other_manager = other_lock
+    other_lock
         || is_pdm_project(cwd).await
         || read_regular_to_string(&cwd.join("pyproject.toml"))
             .await
-            .is_ok_and(|text| text.contains("[tool.poetry"));
-    let uv_project =
-        cwd.join("uv.lock").is_file() || (cwd.join("pyproject.toml").is_file() && !other_manager);
-    if !uv_project {
-        return None;
+            .is_ok_and(|text| text.contains("[tool.poetry"))
+}
+
+/// Whether only uv installs for `cwd`, so its env is only ever uv's own: a
+/// `uv.lock` no other manager shares (uv syncs it into `./.venv` or
+/// `UV_PROJECT_ENVIRONMENT`), or a directory whose only Python markers are
+/// PEP 723 script locks (`*.py.lock`, whose envs live in uv's cache).
+async fn uv_owns_project_env(cwd: &Path) -> bool {
+    if claimed_by_non_uv_manager(cwd).await {
+        return false;
     }
-    let found = find_site_packages_under(&cwd.join(env), "site-packages").await;
-    (!found.is_empty()).then_some(found)
+    if cwd.join("uv.lock").is_file() {
+        return true;
+    }
+    let other_marker = [
+        "pyproject.toml",
+        "setup.py",
+        "setup.cfg",
+        "requirements.txt",
+    ]
+    .iter()
+    .any(|marker| cwd.join(marker).exists());
+    let locks = crate::utils::python_lock::python_lock_paths(cwd).unwrap_or_default();
+    !other_marker && !locks.is_empty() && locks.iter().all(|name| name.ends_with(".py.lock"))
 }
 
 /// Whether `cwd` is a Pipenv project: a `Pipfile` or a `Pipfile.lock`.
@@ -1316,9 +1387,7 @@ fn poetry_user_config_path(var: &impl Fn(&str) -> Option<String>) -> Option<Path
     if let Some(dir) = var("POETRY_CONFIG_DIR").filter(|v| !v.trim().is_empty()) {
         return Some(PathBuf::from(dir).join("config.toml"));
     }
-    let home = var("HOME")
-        .or_else(|| var("USERPROFILE"))
-        .map(PathBuf::from);
+    let home = env_home(var);
     let dir = if cfg!(windows) {
         var("APPDATA")
             .map(PathBuf::from)
@@ -1343,9 +1412,7 @@ fn poetry_user_config_path(var: &impl Fn(&str) -> Option<String>) -> Option<Path
 /// `$XDG_CACHE_HOME`/`~/.cache` + `/pypoetry` (other unix),
 /// `%LOCALAPPDATA%\pypoetry\Cache` (Windows).
 fn poetry_default_cache_dir(var: &impl Fn(&str) -> Option<String>) -> Option<PathBuf> {
-    let home = var("HOME")
-        .or_else(|| var("USERPROFILE"))
-        .map(PathBuf::from);
+    let home = env_home(var);
     if cfg!(windows) {
         Some(
             var("LOCALAPPDATA")
@@ -1685,9 +1752,7 @@ fn poetry_installer_data_dir(var: &impl Fn(&str) -> Option<String>) -> Option<Pa
     if let Some(home) = var("POETRY_HOME").filter(|v| !v.trim().is_empty()) {
         return Some(expand_home(&home, var));
     }
-    let home = var("HOME")
-        .or_else(|| var("USERPROFILE"))
-        .map(PathBuf::from);
+    let home = env_home(var);
     let base = if cfg!(windows) {
         var("APPDATA")
             .filter(|v| !v.trim().is_empty())
@@ -1706,16 +1771,24 @@ fn poetry_installer_data_dir(var: &impl Fn(&str) -> Option<String>) -> Option<Pa
 
 fn expand_home(raw: &str, var: &impl Fn(&str) -> Option<String>) -> PathBuf {
     if let Some(rest) = raw.strip_prefix("~/").or_else(|| raw.strip_prefix("~\\")) {
-        if let Some(home) = var("HOME").or_else(|| var("USERPROFILE")) {
-            return PathBuf::from(home).join(rest);
+        if let Some(home) = env_home(var) {
+            return home.join(rest);
         }
     }
     if raw == "~" {
-        if let Some(home) = var("HOME").or_else(|| var("USERPROFILE")) {
-            return PathBuf::from(home);
+        if let Some(home) = env_home(var) {
+            return home;
         }
     }
     PathBuf::from(raw)
+}
+
+/// `HOME`, then `USERPROFILE`, from an injected environment, under the
+/// shared rule ([`crate::utils::fs::home_from_env`]): an empty or relative
+/// value is no home, so the pdm/poetry probes never resolve against the
+/// working directory.
+fn env_home(var: &impl Fn(&str) -> Option<String>) -> Option<PathBuf> {
+    crate::utils::fs::home_from_env(|k| var(k).map(Into::into))
 }
 
 /// `site-packages` of every virtualenv Poetry created for the project at
@@ -2070,8 +2143,12 @@ fn pipenv_home_dir(var: &impl Fn(&str) -> Option<String>) -> Option<PathBuf> {
             })
             .or_else(|| var("HOME").and_then(non_empty))
             .map(PathBuf::from)
+            .filter(|h| crate::utils::fs::is_usable_home(h))
     } else {
-        var("HOME").and_then(non_empty).map(PathBuf::from)
+        var("HOME")
+            .and_then(non_empty)
+            .map(PathBuf::from)
+            .filter(|h| crate::utils::fs::is_usable_home(h))
     }
 }
 
@@ -2443,8 +2520,10 @@ pub async fn get_global_python_site_packages() -> Vec<PathBuf> {
         )
         .await;
         // pip --user on Unix
-        let user_local = home_dir.join(".local");
-        scan_well_known(&user_local, "site-packages", &mut seen, &mut results).await;
+        if let Some(home_dir) = &home_dir {
+            let user_local = home_dir.join(".local");
+            scan_well_known(&user_local, "site-packages", &mut seen, &mut results).await;
+        }
     }
 
     // macOS-specific
@@ -2482,13 +2561,15 @@ pub async fn get_global_python_site_packages() -> Vec<PathBuf> {
         // interpreter first on PATH — so on a stock Mac with both Apple's
         // python3 and a Homebrew/pyenv python3, user installs under every
         // other interpreter were invisible.
-        let user_fw_matches = find_python_dirs(
-            &home_dir.join("Library").join("Python"),
-            &["*", "lib", "python", "site-packages"],
-        )
-        .await;
-        for m in user_fw_matches {
-            add_path(m, &mut seen, &mut results);
+        if let Some(home_dir) = &home_dir {
+            let user_fw_matches = find_python_dirs(
+                &home_dir.join("Library").join("Python"),
+                &["*", "lib", "python", "site-packages"],
+            )
+            .await;
+            for m in user_fw_matches {
+                add_path(m, &mut seen, &mut results);
+            }
         }
     }
 
@@ -2536,25 +2617,31 @@ pub async fn get_global_python_site_packages() -> Vec<PathBuf> {
     #[cfg(not(windows))]
     {
         let pyenv_root = std::env::var("PYENV_ROOT")
+            .ok()
             .map(PathBuf::from)
-            .unwrap_or_else(|_| home_dir.join(".pyenv"));
-        let pyenv_versions = pyenv_root.join("versions");
-        let pyenv_matches =
-            find_python_dirs(&pyenv_versions, &["*", "lib", "python3.*", "site-packages"]).await;
-        for m in pyenv_matches {
-            add_path(m, &mut seen, &mut results);
+            .or_else(|| home_dir.as_ref().map(|h| h.join(".pyenv")));
+        if let Some(pyenv_root) = pyenv_root {
+            let pyenv_versions = pyenv_root.join("versions");
+            let pyenv_matches =
+                find_python_dirs(&pyenv_versions, &["*", "lib", "python3.*", "site-packages"])
+                    .await;
+            for m in pyenv_matches {
+                add_path(m, &mut seen, &mut results);
+            }
         }
     }
 
     // Conda
-    let anaconda = home_dir.join("anaconda3");
-    scan_well_known(&anaconda, "site-packages", &mut seen, &mut results).await;
-    let miniconda = home_dir.join("miniconda3");
-    scan_well_known(&miniconda, "site-packages", &mut seen, &mut results).await;
+    if let Some(home_dir) = &home_dir {
+        let anaconda = home_dir.join("anaconda3");
+        scan_well_known(&anaconda, "site-packages", &mut seen, &mut results).await;
+        let miniconda = home_dir.join("miniconda3");
+        scan_well_known(&miniconda, "site-packages", &mut seen, &mut results).await;
+    }
 
     // uv tool envs (`uv tool install`): one venv per tool under every
     // root uv may use (see `uv_dir_candidates`).
-    for tools in uv_dir_candidates(&home_dir, "UV_TOOL_DIR", "tools") {
+    for tools in uv_dir_candidates(home_dir.as_deref(), "UV_TOOL_DIR", "tools") {
         for m in find_child_env_site_packages(&tools).await {
             add_path(m, &mut seen, &mut results);
         }
@@ -2565,7 +2652,7 @@ pub async fn get_global_python_site_packages() -> Vec<PathBuf> {
     // scanned, not just the one pipx would pick today: an app installed
     // under an older default is still a real install, and `seen` dedups
     // overlaps (e.g. PIPX_HOME set to the default).
-    for pipx_home in pipx_home_candidates(&home_dir) {
+    for pipx_home in pipx_home_candidates(home_dir.as_deref()) {
         let venvs = pipx_home.join("venvs");
         #[cfg(not(windows))]
         let mut matches =
@@ -2612,7 +2699,7 @@ pub async fn get_global_python_site_packages() -> Vec<PathBuf> {
     // can install packages directly into the managed interpreter (e.g. via
     // `uv pip install --system --python <uv-python>`), and globally
     // discovered crawls should surface those.
-    for python in uv_dir_candidates(&home_dir, "UV_PYTHON_INSTALL_DIR", "python") {
+    for python in uv_dir_candidates(home_dir.as_deref(), "UV_PYTHON_INSTALL_DIR", "python") {
         for m in find_child_env_site_packages(&python).await {
             add_path(m, &mut seen, &mut results);
         }
@@ -2620,7 +2707,7 @@ pub async fn get_global_python_site_packages() -> Vec<PathBuf> {
 
     // PDM's global project (`pdm add -g`) and PDM-managed interpreters
     // (`pdm python install`).
-    for m in pdm_global_site_packages(&home_dir).await {
+    for m in pdm_global_site_packages(home_dir.as_deref()).await {
         add_path(m, &mut seen, &mut results);
     }
 
@@ -2683,7 +2770,7 @@ fn absolute_env_dir(var: &str) -> Option<PathBuf> {
 /// `%LOCALAPPDATA%\uv`, which earlier socket-patch releases scanned, on
 /// Windows. Callers skip the ones that don't exist.
 #[cfg_attr(windows, allow(unused_variables))]
-fn uv_dir_candidates(home_dir: &Path, override_var: &str, bucket: &str) -> Vec<PathBuf> {
+fn uv_dir_candidates(home_dir: Option<&Path>, override_var: &str, bucket: &str) -> Vec<PathBuf> {
     let mut dirs = Vec::new();
     if let Some(dir) = std::env::var_os(override_var).filter(|v| !v.is_empty()) {
         let dir = PathBuf::from(dir);
@@ -2694,22 +2781,15 @@ fn uv_dir_candidates(home_dir: &Path, override_var: &str, bucket: &str) -> Vec<P
         if let Some(xdg) = absolute_env_dir("XDG_DATA_HOME") {
             dirs.push(xdg.join("uv").join(bucket));
         }
-        dirs.push(
-            home_dir
-                .join(".local")
-                .join("share")
-                .join("uv")
-                .join(bucket),
-        );
+        dirs.extend(home_dir.map(|h| h.join(".local").join("share").join("uv").join(bucket)));
     }
     #[cfg(target_os = "macos")]
-    dirs.push(
-        home_dir
-            .join("Library")
+    dirs.extend(home_dir.map(|h| {
+        h.join("Library")
             .join("Application Support")
             .join("uv")
-            .join(bucket),
-    );
+            .join(bucket)
+    }));
     #[cfg(windows)]
     for var in ["APPDATA", "LOCALAPPDATA"] {
         if let Some(base) = std::env::var_os(var).filter(|v| !v.is_empty()) {
@@ -2726,7 +2806,8 @@ fn uv_dir_candidates(home_dir: &Path, override_var: &str, bucket: &str) -> Vec<P
 /// macOS), `~/<unix_default>/pdm` on Linux,
 /// `~/Library/Application Support/pdm` on macOS, and
 /// `%LOCALAPPDATA%\pdm\pdm` on Windows.
-#[cfg_attr(windows, allow(unused_variables))]
+// `unix_default` is Linux-only, `var` / `xdg_var` unused on Windows.
+#[cfg_attr(any(windows, target_os = "macos"), allow(unused_variables))]
 fn pdm_dir_candidates(
     home_dir: Option<&Path>,
     var: &impl Fn(&str) -> Option<String>,
@@ -2825,19 +2906,18 @@ async fn pdm_site_config_dirs(var: &impl Fn(&str) -> Option<String>) -> Vec<Path
 /// or `<user config dir>/pdm/config.toml`, and from the site config
 /// ([`pdm_site_config_dirs`]) PDM layers under it. Every candidate is
 /// collected, and the ones that don't exist yield nothing.
-async fn pdm_global_site_packages(home_dir: &Path) -> Vec<PathBuf> {
+async fn pdm_global_site_packages(home_dir: Option<&Path>) -> Vec<PathBuf> {
     pdm_global_site_packages_with(home_dir, &|name: &str| std::env::var(name).ok()).await
 }
 
 /// [`pdm_global_site_packages`] with the environment read through `env`.
 async fn pdm_global_site_packages_with(
-    home_dir: &Path,
+    home_dir: Option<&Path>,
     env: &impl Fn(&str) -> Option<String>,
 ) -> Vec<PathBuf> {
-    let config_dirs =
-        pdm_dir_candidates(Some(home_dir), env, "XDG_CONFIG_HOME", Path::new(".config"));
+    let config_dirs = pdm_dir_candidates(home_dir, env, "XDG_CONFIG_HOME", Path::new(".config"));
     let data_dirs = pdm_dir_candidates(
-        Some(home_dir),
+        home_dir,
         env,
         "XDG_DATA_HOME",
         &Path::new(".local").join("share"),
@@ -2932,12 +3012,12 @@ async fn pdm_global_site_packages_with(
 /// `%USERPROFILE%\pipx` on Windows (with `%LOCALAPPDATA%\pipx\pipx` as its
 /// platformdirs fallback). All of them are returned; callers skip the ones
 /// that don't exist.
-fn pipx_home_candidates(home_dir: &Path) -> Vec<PathBuf> {
+fn pipx_home_candidates(home_dir: Option<&Path>) -> Vec<PathBuf> {
     let mut homes = Vec::new();
     if let Some(pipx_home) = std::env::var_os("PIPX_HOME").filter(|v| !v.is_empty()) {
         homes.push(PathBuf::from(pipx_home));
     }
-    homes.push(home_dir.join(".local").join("pipx"));
+    homes.extend(home_dir.map(|h| h.join(".local").join("pipx")));
     #[cfg(all(not(target_os = "macos"), not(windows)))]
     {
         // platformdirs ignores a relative XDG_DATA_HOME, per the XDG spec.
@@ -2947,18 +3027,13 @@ fn pipx_home_candidates(home_dir: &Path) -> Vec<PathBuf> {
         {
             homes.push(xdg.join("pipx"));
         }
-        homes.push(home_dir.join(".local").join("share").join("pipx"));
+        homes.extend(home_dir.map(|h| h.join(".local").join("share").join("pipx")));
     }
     #[cfg(target_os = "macos")]
-    homes.push(
-        home_dir
-            .join("Library")
-            .join("Application Support")
-            .join("pipx"),
-    );
+    homes.extend(home_dir.map(|h| h.join("Library").join("Application Support").join("pipx")));
     #[cfg(windows)]
     {
-        homes.push(home_dir.join("pipx"));
+        homes.extend(home_dir.map(|h| h.join("pipx")));
         if let Ok(local) = std::env::var("LOCALAPPDATA") {
             homes.push(PathBuf::from(local).join("pipx").join("pipx"));
         }
@@ -3022,15 +3097,15 @@ impl PythonCrawler {
     ///      `.venv`, and `venv` directories, then Poetry's and Pipenv's
     ///      out-of-tree virtualenvs.
     ///   2. If no venv was found AND the cwd looks like a Python
-    ///      project (see `is_python_project`) that is not a Pipenv
-    ///      project (whose env is only ever Pipenv's own), fall through
+    ///      project (see `is_python_project`) whose env is not only ever
+    ///      Pipenv's own (`is_pipenv_project`) or uv's own (see
+    ///      `uv_owns_project_env`), fall through
     ///      to `get_global_python_site_packages`. This mirrors the
     ///      cargo / ruby / go pattern where a project marker
     ///      indicates "scan this ecosystem globally for this project".
     ///
-    /// Without the marker fallback, a fresh clone with
-    /// `pyproject.toml` + `uv.lock` but no `.venv` would silently
-    /// return zero packages.
+    /// A fresh uv clone (`uv.lock`, no `.venv` yet) returns nothing:
+    /// its lock-only packages come from `uv.lock` instead.
     pub async fn get_site_packages_paths(
         &self,
         options: &CrawlerOptions,
@@ -3050,6 +3125,12 @@ impl PythonCrawler {
         // installed for the project, and its lock-only packages come from
         // `Pipfile.lock`; the OS Python is never its env (#504, #947).
         if is_pipenv_project(&options.cwd) {
+            return Ok(Vec::new());
+        }
+        // A uv project or script lock installs only into uv's own env. With
+        // none synced yet nothing is installed for it, and its lock-only
+        // packages come from the lock; the OS Python is never its env (#964).
+        if uv_owns_project_env(&options.cwd).await {
             return Ok(Vec::new());
         }
         if is_python_project(&options.cwd).await {
@@ -3410,6 +3491,99 @@ mod tests {
         }
     }
 
+    /// #335: Hatch keeps a project's envs out of tree, under
+    /// `<data dir>/env/virtual/<name>/<id>/<env>`, and never uses `./.venv`
+    /// for them. Every existing env is the project's (stale-install probes,
+    /// VEX's installed basis and agent mode see them all), alongside a
+    /// `./.venv` another tool made.
+    #[tokio::test]
+    async fn hatch_out_of_tree_envs_are_project_envs() {
+        let tmp = tempfile::tempdir().unwrap();
+        let project = tmp.path().join("app");
+        std::fs::create_dir_all(&project).unwrap();
+        std::fs::write(
+            project.join("pyproject.toml"),
+            "[build-system]\nrequires = [\"hatchling\"]\nbuild-backend = \"hatchling.build\"\n\n[project]\nname = \"app\"\nversion = \"0.1.0\"\ndependencies = [\"six==1.16.0\"]\n",
+        )
+        .unwrap();
+        let data = tmp.path().join("hatch-data");
+        let var = env_of(&[
+            ("HATCH_DATA_DIR", data.to_string_lossy().into_owned()),
+            (
+                "HOME",
+                tmp.path().join("home").to_string_lossy().into_owned(),
+            ),
+        ]);
+        assert!(find_local_venv_site_packages_with(&project, &var)
+            .await
+            .is_empty());
+
+        let envs = super::super::hatch_env::hatch_environments_with(&project, &var).await;
+        assert!(envs.is_empty());
+        let storage_root = data.join("env").join("virtual").join("app");
+        // Hatch's own id for the project root, whichever casefolding applies.
+        let real = std::fs::canonicalize(&project).unwrap();
+        let mut sites = Vec::new();
+        for id in super::super::hatch_env::project_ids_for_tests(&real) {
+            let (_, site) = fake_venv_root(&storage_root.join(&id).join("app"));
+            sites.push(site);
+        }
+        let found = find_local_venv_site_packages_with(&project, &var).await;
+        assert!(!found.is_empty());
+        assert!(found.iter().all(|s| sites.contains(s)), "{found:?}");
+
+        // An activated venv that is not Hatch's does not hide them.
+        let other = tempfile::tempdir().unwrap();
+        let activated_site = fake_venv(other.path(), "tool-venv");
+        let mut activated = vec![(
+            "VIRTUAL_ENV",
+            other
+                .path()
+                .join("tool-venv")
+                .to_string_lossy()
+                .into_owned(),
+        )];
+        activated.push(("HATCH_DATA_DIR", data.to_string_lossy().into_owned()));
+        activated.push((
+            "HOME",
+            tmp.path().join("home").to_string_lossy().into_owned(),
+        ));
+        let found = find_local_venv_site_packages_with(&project, &env_of(&activated)).await;
+        assert_eq!(found.first(), Some(&activated_site), "{found:?}");
+        assert!(found.iter().any(|s| sites.contains(s)), "{found:?}");
+
+        // Nor does a `UV_PROJECT_ENVIRONMENT` venv (a Hatch project's
+        // pyproject alone makes it a uv project).
+        let uv_env = tmp.path().join("uv-env");
+        let uv_site = fake_venv(&uv_env, "venv");
+        let uv_vars = env_of(&[
+            (
+                "UV_PROJECT_ENVIRONMENT",
+                uv_env.join("venv").to_string_lossy().into_owned(),
+            ),
+            ("HATCH_DATA_DIR", data.to_string_lossy().into_owned()),
+            (
+                "HOME",
+                tmp.path().join("home").to_string_lossy().into_owned(),
+            ),
+        ]);
+        let found = find_local_venv_site_packages_with(&project, &uv_vars).await;
+        assert_eq!(found.first(), Some(&uv_site), "{found:?}");
+        assert!(found.iter().any(|s| sites.contains(s)), "{found:?}");
+
+        // Nor does Pipenv's own resolution (a `Pipfile` beside pyproject).
+        std::fs::write(project.join("Pipfile"), "[packages]\n").unwrap();
+        let found = find_local_venv_site_packages_with(&project, &var).await;
+        assert!(found.iter().any(|s| sites.contains(s)), "{found:?}");
+        std::fs::remove_file(project.join("Pipfile")).unwrap();
+
+        // A `./.venv` beside them is kept too.
+        let dot = fake_venv(&project, ".venv");
+        let found = find_local_venv_site_packages_with(&project, &var).await;
+        assert!(found.contains(&dot));
+        assert!(found.iter().any(|s| sites.contains(s)));
+    }
+
     /// #502: PDM installs into the interpreter saved in `.pdm-python` (an
     /// out-of-tree `venv.in_project = false` venv, or one bound with
     /// `pdm use`), ahead of a stray `./.venv` and an activated venv.
@@ -3678,7 +3852,11 @@ mod tests {
         fake_venv(&tmp.path().join("uv-env"), "venv");
         let uv_env = env_of(&[(
             "UV_PROJECT_ENVIRONMENT",
-            tmp.path().join("uv-env").join("venv").to_string_lossy().into_owned(),
+            tmp.path()
+                .join("uv-env")
+                .join("venv")
+                .to_string_lossy()
+                .into_owned(),
         )]);
         assert_eq!(
             find_local_venv_site_packages_with(&project, &uv_env).await,
@@ -4119,7 +4297,7 @@ mod tests {
             ),
         )
         .unwrap();
-        let found = pdm_global_site_packages_with(&home, &env_of(&pairs)).await;
+        let found = pdm_global_site_packages_with(Some(&home), &env_of(&pairs)).await;
         assert!(found.contains(&project_site), "{found:?}");
         assert!(found.contains(&managed_site), "{found:?}");
     }
@@ -5884,6 +6062,30 @@ G=
         );
     }
 
+    /// B66: an empty or relative injected `HOME` is no home. It used to be
+    /// joined as-is, so the pdm/poetry config, cache and installer probes
+    /// read `./.config/pypoetry/…` (and the like) under the working
+    /// directory.
+    #[test]
+    fn injected_home_must_be_rooted() {
+        fn only_home(home: &'static str) -> impl Fn(&str) -> Option<String> {
+            move |k: &str| (k == "HOME").then(|| home.to_string())
+        }
+        for bad in ["", "rel", "~"] {
+            let var = only_home(bad);
+            assert_eq!(env_home(&var), None, "HOME={bad:?}");
+            assert_eq!(poetry_user_config_path(&var), None, "HOME={bad:?}");
+            assert_eq!(poetry_default_cache_dir(&var), None, "HOME={bad:?}");
+            assert_eq!(poetry_installer_data_dir(&var), None, "HOME={bad:?}");
+            assert_eq!(pipenv_home_dir(&var), None, "HOME={bad:?}");
+            assert_eq!(expand_home("~/x", &var), PathBuf::from("~/x"));
+        }
+        let abs = std::env::temp_dir();
+        let var = |k: &str| (k == "HOME").then(|| abs.to_string_lossy().into_owned());
+        assert_eq!(env_home(&var), Some(abs.clone()));
+        assert_eq!(expand_home("~/x", &var), abs.join("x"));
+    }
+
     #[test]
     fn poetry_data_dir_recursively_resolves_only_referenced_settings() {
         let cwd = Path::new("/project");
@@ -6626,15 +6828,14 @@ G=
     #[test]
     #[serial_test::serial]
     fn test_home_dir_detection() {
-        // Verify the shared fallback chain (HOME -> USERPROFILE -> "~")
-        // yields a real path, not the "~" sentinel, on any CI or dev machine.
+        // Verify the shared chain (HOME -> USERPROFILE, absolute only)
+        // yields a real path on any CI or dev machine.
         // `serial`: other tests in this binary mutate HOME (go_crawler's
         // gomodcache fallback chain, utils::fs's empty-HOME regression) —
-        // reading home_dir() while one of them holds HOME="" would see the
-        // "~" sentinel and fail spuriously.
-        let home = crate::utils::fs::home_dir();
-        assert_ne!(home, PathBuf::from("~"), "expected a real home directory");
-        assert!(!home.as_os_str().is_empty());
+        // reading home_dir() while one of them holds HOME="" would see no
+        // home and fail spuriously.
+        let home = crate::utils::fs::home_dir().expect("expected a real home directory");
+        assert!(home.is_absolute());
     }
 
     /// Global discovery must honor `PYENV_ROOT`: a pyenv install tree at

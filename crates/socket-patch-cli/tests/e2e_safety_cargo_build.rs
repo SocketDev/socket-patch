@@ -419,7 +419,11 @@ fn manifestless_agent_patch_is_not_attested(consumer: &Path, cargo_home: &Path) 
             "description": "d"
         }
     });
-    std::fs::write(&manifest_path, serde_json::to_vec_pretty(&manifest).unwrap()).unwrap();
+    std::fs::write(
+        &manifest_path,
+        serde_json::to_vec_pretty(&manifest).unwrap(),
+    )
+    .unwrap();
     let out = run_vex(&bin, consumer, &run);
     assert_eq!(out.code, Some(0), "manifest-backed vex:\n{out}");
     assert!(

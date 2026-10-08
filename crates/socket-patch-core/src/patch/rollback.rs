@@ -552,7 +552,7 @@ async fn rollback_package_patch_at(
         )
         .await
         {
-            result.error = Some(store.refusal("roll back"));
+            result.error = Some(store.refusal(crate::patch::shared_store::ROLL_BACK_ACTION));
             return result;
         }
     }
@@ -1752,8 +1752,10 @@ mod tests {
         assert!(pkg.path().join("lib/old/c.js").exists());
     }
 
-    /// A symlinked parent directory is never removed or followed by the
-    /// prune: only real, empty directories inside the package go.
+    /// A symlinked parent directory that leads out of the package is never
+    /// deleted through or pruned: the rollback refuses before touching
+    /// anything (B25 containment), so the file, `inner` and the link all
+    /// stay.
     #[cfg(unix)]
     #[tokio::test]
     async fn test_rollback_new_file_prune_never_follows_a_symlinked_dir() {
@@ -1771,10 +1773,13 @@ mod tests {
             rollback_package_patch("pkg:npm/x@1.0.0", pkg.path(), &files, blobs.path(), false)
                 .await;
 
-        assert!(result.success, "{:?}", result.error);
-        assert!(!target.join("inner/added.js").exists());
-        // `inner` is reached through the symlink, so it lives outside the
-        // package and stays; so does `link` itself.
+        assert!(!result.success);
+        let err = result.error.as_deref().unwrap_or_default();
+        assert!(
+            err.contains(crate::patch::shared_store::OUTSIDE_INSTALL_TREE_REFUSAL_MARKER),
+            "{err}"
+        );
+        assert!(target.join("inner/added.js").exists(), "nothing deleted");
         assert!(target.join("inner").is_dir());
         assert!(tokio::fs::symlink_metadata(pkg.path().join("link"))
             .await

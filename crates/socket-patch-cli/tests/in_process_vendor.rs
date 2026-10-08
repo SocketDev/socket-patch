@@ -1078,6 +1078,82 @@ async fn berry_mixed_line_endings_fail_closed_with_code() {
     }
 }
 
+/// #975: a Yarn 2 → Yarn 4 migration that switched `nodeLinker` away from
+/// `pnp` keeps the old `.pnp.js` (yarn 4 never deletes it). Yarn ignores
+/// it, so vendor must too: the configured linker decides, not the file.
+#[tokio::test]
+async fn berry_stale_pnp_loader_under_non_pnp_linker_vendors() {
+    for linker in ["node-modules", "pnpm"] {
+        let tmp = tempfile::tempdir().unwrap();
+        let root = tmp.path();
+        stage_berry_project(root, BERRY_WIN_PKG, &berry_win_lock());
+        std::fs::write(
+            root.join(".yarnrc.yml"),
+            format!("nodeLinker: {linker}\nenableGlobalCache: false\n"),
+        )
+        .unwrap();
+        std::fs::write(root.join(".pnp.js"), "// stale Yarn 2 loader\n").unwrap();
+        let (code, env) = vendor_cli(root, &[]);
+        assert_eq!(code, 0, "{linker}: {env:#}");
+        assert_eq!(env["summary"]["applied"], 1, "{linker}: {env:#}");
+        assert!(
+            std::fs::read_to_string(root.join("yarn.lock"))
+                .unwrap()
+                .contains(".socket/vendor/npm/"),
+            "{linker}: wired"
+        );
+    }
+}
+
+/// #539: a lock-only checkout of a Plug'n'Play project (`nodeLinker: pnp`,
+/// or no `nodeLinker` at all, berry's default) has no loader file yet. The
+/// configured linker makes it PnP all the same, so vendor refuses up front,
+/// as it does once `yarn install` writes `.pnp.cjs`, instead of wiring a
+/// project every later re-run refuses. Nothing is written.
+#[tokio::test]
+async fn berry_lock_only_pnp_project_refused_up_front() {
+    for (label, yarnrc) in [
+        (
+            "explicit pnp",
+            Some("nodeLinker: pnp\nenableGlobalCache: false\n"),
+        ),
+        ("default linker", Some("enableGlobalCache: false\n")),
+        ("no yarnrc", None),
+    ] {
+        let tmp = tempfile::tempdir().unwrap();
+        let root = tmp.path();
+        let lock = berry_win_lock();
+        stage_berry_project(root, BERRY_WIN_PKG, &lock);
+        match yarnrc {
+            Some(rc) => std::fs::write(root.join(".yarnrc.yml"), rc).unwrap(),
+            None => std::fs::remove_file(root.join(".yarnrc.yml")).unwrap(),
+        }
+        for run in ["lock-only", "after install"] {
+            if run == "after install" {
+                std::fs::write(root.join(".pnp.cjs"), "/* pnp */\n").unwrap();
+            }
+            let (code, env) = vendor_cli(root, &[]);
+            assert_eq!(code, 1, "{label} {run}: {env:#}");
+            let failed = find_event(&env, "failed", Some("vendor_yarn_berry_unsupported"));
+            assert!(
+                failed.to_string().contains("Plug'n'Play"),
+                "{label} {run}: {failed}"
+            );
+            assert_eq!(
+                std::fs::read_to_string(root.join("package.json")).unwrap(),
+                BERRY_WIN_PKG,
+                "{label} {run}"
+            );
+            assert_eq!(
+                std::fs::read_to_string(root.join("yarn.lock")).unwrap(),
+                lock,
+                "{label} {run}"
+            );
+            assert!(!root.join(".socket/vendor").exists(), "{label} {run}");
+        }
+    }
+}
+
 /// Mount the hosted-mode API (batch discovery, per-package search, a granted
 /// reference carrying the yarn-berry-zip checksum, the patch view) for the
 /// berry takeover legs. Returns the hosted tarball URL.
@@ -1545,6 +1621,19 @@ async fn berry_takeovers_refuse_before_reverting_the_old_mode() {
         )
         .unwrap();
     };
+    // #539 (Bugbot on #978): the project switches to Plug'n'Play, explicitly
+    // or by dropping `nodeLinker` (berry's default), before `yarn install`
+    // writes a loader — a lock-only PnP project vendored mode refuses.
+    let pnp_linker: Break = |root, _| {
+        std::fs::write(
+            root.join(".yarnrc.yml"),
+            "nodeLinker: pnp\r\nenableGlobalCache: false\r\n",
+        )
+        .unwrap();
+    };
+    let default_linker: Break = |root, _| {
+        std::fs::write(root.join(".yarnrc.yml"), "enableGlobalCache: false\r\n").unwrap();
+    };
 
     // ── vendored → hosted ──
     for (label, breakage, rel, code) in [
@@ -1552,6 +1641,15 @@ async fn berry_takeovers_refuse_before_reverting_the_old_mode() {
             "mixed lock",
             mix,
             "yarn.lock",
+            "redirect_yarn_berry_mixed_line_endings",
+        ),
+        // #628: hosted mode re-renders the root manifest (its
+        // `resolutions`), so a mixed one is refused before the revert, the
+        // same decision the hosted→vendored leg below takes.
+        (
+            "mixed package.json",
+            mix,
+            "package.json",
             "redirect_yarn_berry_mixed_line_endings",
         ),
         (
@@ -1621,6 +1719,18 @@ async fn berry_takeovers_refuse_before_reverting_the_old_mode() {
             compression,
             "",
             "vendor_yarn_berry_cache_unsupported",
+        ),
+        (
+            "pnp linker",
+            pnp_linker,
+            "",
+            "vendor_yarn_berry_unsupported",
+        ),
+        (
+            "default pnp linker",
+            default_linker,
+            "",
+            "vendor_yarn_berry_unsupported",
         ),
     ] {
         for dry in [true, false] {
@@ -3948,7 +4058,10 @@ snapshots:
             hosted_npmrc,
             "the hosted .npmrc must be untouched"
         );
-        assert!(!root.join(".socket/vendor/npm").exists(), "nothing is staged");
+        assert!(
+            !root.join(".socket/vendor/npm").exists(),
+            "nothing is staged"
+        );
     }
 
     /// Hosted → vendored over a linked `.socket/vendor/npm` (#664): the

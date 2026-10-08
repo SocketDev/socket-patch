@@ -183,10 +183,10 @@ use std::collections::BTreeSet;
 use std::path::{Path, PathBuf};
 use std::sync::Mutex;
 
-use crate::crawlers::python_crawler::canonicalize_pypi_name;
 use crate::crawlers::Ecosystem;
 use crate::patch::path_safety::{is_canonical_uuid, is_safe_multi_segment};
-use crate::utils::purl::{normalize_purl, strip_purl_qualifiers};
+use crate::utils::purl_key::canonical_base_purl;
+use crate::utils::purl_key::PurlKey;
 use crate::vendor::go_mod_edit::HOSTED_GO_MODULE_PREFIX;
 use crate::vendor::lock_inventory::{
     inventory_project_every_lock, lookup, LockIntegrity, LockfileEntry, SourceKind,
@@ -408,6 +408,23 @@ pub struct ResolvedElsewhere {
     pub file: PathBuf,
 }
 
+/// A lock entry that installs its OWN copy of a package — a `file:`
+/// directory or tarball, a user url, git, a registry block no Socket rewrite
+/// reached — beside a Socket wiring of the same `name@version` in the SAME
+/// lock (see [`Discovery::unpatched_copy`]). The package manager installs
+/// that copy too (or instead), so the lock's wiring is never attested.
+#[derive(Debug, Clone, PartialEq, Eq, PartialOrd, Ord)]
+pub struct UnpatchedCopy {
+    /// Canonical base purl ([`canonical_base_purl`]).
+    pub purl: String,
+    /// Root-relative lock file.
+    pub file: PathBuf,
+    /// The lock entry's key, as the lock spells it.
+    pub key: String,
+    /// How that entry installs, completing "lock entry `<key>` …".
+    pub how: String,
+}
+
 /// A ref another lock contests ([`Discovery::contest_across_locks`]): it
 /// was dropped from `refs` and diagnosed [`DIAG_REF_UNATTRIBUTABLE`]. Kept
 /// so a ledger reader can name the contesting lock instead of reporting the
@@ -424,12 +441,31 @@ pub struct ContestedRef {
     pub other: PathBuf,
 }
 
-/// A ref discovery emits (so rollback, remove and list find the wiring)
-/// that must not be attested: the files show a build that resolves the
-/// package from somewhere the pin does not reach. Today: a Gradle lock
-/// entry above the hosted pin's base (the owned script lets that newer
-/// upstream release resolve), so that build consumes no patch. The CLI's
-/// VEX plan omits every candidate of `(purl, uuid)` with `detail`.
+/// Why an [`Unattested`] ref's wiring does not reach the copy a build runs.
+#[derive(Debug, Clone, Copy, PartialEq, Eq, PartialOrd, Ord)]
+pub enum UnattestedKind {
+    /// A Gradle lock entry above the hosted pin's base: the owned script
+    /// lets that newer upstream release resolve.
+    LockAboveBase,
+    /// The ref's own pnpm lock names a package that bundles a copy of it
+    /// (`bundledDependencies`): pnpm unpacks that copy from the parent's
+    /// tarball, where no wiring reaches, and does not lock its version.
+    BundledCopy,
+    /// `deno.lock` locks the same `name@version`: `deno install` installs
+    /// a `package.json` project's npm deps from it, never from the
+    /// npm-family lock that carries the wiring.
+    DenoLock,
+}
+
+/// A ref discovery emits (so rollback, remove and list find the wiring,
+/// and the ledgers' liveness gates still see it wired) that must not be
+/// attested: the files show a build that may run a copy the pin does not
+/// reach ([`UnattestedKind`]). The CLI's VEX plan omits every candidate of
+/// `(purl, uuid)` with `detail`. Unlike a contest
+/// ([`Discovery::unpatched_copy`], [`Discovery::contest_across_locks`]),
+/// this never drops the ref, so `vendor --check` and `scan` keep treating
+/// the wiring as live — the right answer when re-running `scan` / `vendor`
+/// could never clear the evidence.
 #[derive(Debug, Clone, PartialEq, Eq, PartialOrd, Ord)]
 pub struct Unattested {
     /// Canonical base purl ([`canonical_base_purl`]).
@@ -438,6 +474,49 @@ pub struct Unattested {
     /// Root-relative file that shows the bypass.
     pub file: PathBuf,
     pub detail: String,
+    pub kind: UnattestedKind,
+}
+
+/// Which refs an [`UnwiredCopy`] may stand beside.
+#[derive(Debug, Clone, PartialEq, Eq, PartialOrd, Ord)]
+pub enum CopyTarget {
+    /// Exactly this canonical base purl.
+    Purl(String),
+    /// An npm package of this name, whatever its version.
+    NpmName(String),
+    /// Every ref.
+    Any,
+}
+
+/// A copy some build installs where no Socket wiring reaches, recorded by
+/// an extractor ([`Discovery::unwired_copy`]) and turned into
+/// [`Unattested`] marks for the refs it may stand beside once every
+/// extractor has run ([`Discovery::unattest_unwired_copies`]).
+#[derive(Debug, Clone, PartialEq, Eq, PartialOrd, Ord)]
+pub struct UnwiredCopy {
+    /// Only refs of this root-relative file; `None` = refs of any file.
+    pub(crate) scope: Option<PathBuf>,
+    pub(crate) target: CopyTarget,
+    /// Root-relative file that shows the copy.
+    pub(crate) file: PathBuf,
+    /// Completes "patch <uuid> is wired, but …"; names the file.
+    pub(crate) detail: String,
+    pub(crate) kind: UnattestedKind,
+}
+
+impl UnwiredCopy {
+    fn covers(&self, r: &PatchedRef) -> bool {
+        if self.scope.as_ref().is_some_and(|f| *f != r.source_file) {
+            return false;
+        }
+        match &self.target {
+            CopyTarget::Purl(purl) => PurlKey::same(purl, &r.purl),
+            CopyTarget::NpmName(name) => crate::utils::purl::purl_name_version(&r.purl)
+                .and_then(|(_, version)| npm_purl(name, version))
+                .is_some_and(|p| PurlKey::same(&p, &r.purl)),
+            CopyTarget::Any => true,
+        }
+    }
 }
 
 /// Everything [`discover_patched_refs`] found.
@@ -457,8 +536,14 @@ pub struct Discovery {
     /// non-Socket source — the evidence the cross-lock contest
     /// ([`discover_patched_refs_with`]) weighs against another lock's ref.
     pub elsewhere: Vec<ResolvedElsewhere>,
+    /// Same-lock copies that contest that lock's own refs
+    /// ([`Discovery::unpatched_copy`]).
+    pub unpatched_copies: Vec<UnpatchedCopy>,
     /// Refs in `refs` whose wiring a build bypasses ([`Unattested`]).
     pub unattested: Vec<Unattested>,
+    /// Copies no wiring reaches, pending [`Discovery::unattest_unwired_copies`];
+    /// always empty once discovery returns (folded into `unattested`).
+    pub unwired_copies: Vec<UnwiredCopy>,
     /// Refs dropped because another lock contests them ([`ContestedRef`]).
     pub contested: Vec<ContestedRef>,
 }
@@ -556,7 +641,7 @@ impl Discovery {
         let key = canonical_base_purl(purl);
         self.refs
             .iter()
-            .any(|r| r.uuid == uuid && r.mode == mode && same_package(&r.purl, &key))
+            .any(|r| r.uuid == uuid && r.mode == mode && PurlKey::same(&r.purl, &key))
     }
 
     /// Whether some file discovery read mentions patch `uuid` as a `mode`
@@ -595,6 +680,69 @@ impl Discovery {
         };
         if !self.elsewhere.contains(&entry) {
             self.elsewhere.push(entry);
+        }
+    }
+
+    /// Record that lock `file`'s entry `key` installs its own copy of `purl`
+    /// (`None` is ignored), `how` saying from where. The cross-lock contest
+    /// only weighs OTHER locks (a lock that wires a package is never its
+    /// own contester there), so this is the one same-lock rule every
+    /// extractor shares (#935, #938, #939): the copy is also
+    /// [`Discovery::resolved_elsewhere`] evidence, and
+    /// [`Discovery::contest_within_locks`] drops every ref of the same
+    /// `name@version` in the same file.
+    pub(crate) fn unpatched_copy(
+        &mut self,
+        file: &str,
+        purl: Option<String>,
+        key: &str,
+        how: &str,
+    ) {
+        let Some(purl) = purl else {
+            return;
+        };
+        self.resolved_elsewhere(file, Some(purl.clone()));
+        // Deduplicated once, in `finalize`: a per-push scan is quadratic
+        // over a lock with thousands of registry blocks.
+        self.unpatched_copies.push(UnpatchedCopy {
+            purl: canonical_base_purl(&purl),
+            file: PathBuf::from(file),
+            key: key.to_string(),
+            how: how.to_string(),
+        });
+    }
+
+    /// Drop every ref whose OWN lock also installs an unpatched copy of the
+    /// same `name@version` ([`Discovery::unpatched_copy`]): the build ships
+    /// that copy whatever the wiring does, so the ref is diagnosed
+    /// ([`DIAG_REF_UNATTRIBUTABLE`], naming the entry) and not emitted. Its
+    /// uuid stays recognized (rule 11).
+    fn contest_within_locks(&mut self) {
+        if self.unpatched_copies.is_empty() {
+            return;
+        }
+        let refs = std::mem::take(&mut self.refs);
+        for r in refs {
+            let copy = self
+                .unpatched_copies
+                .iter()
+                .find(|c| c.purl == r.purl && c.file == r.source_file)
+                .cloned();
+            match copy {
+                Some(c) => {
+                    let file = r.source_file.to_string_lossy().into_owned();
+                    self.diag(
+                        DIAG_REF_UNATTRIBUTABLE,
+                        &file,
+                        format!(
+                            "{file}: {} is wired to Socket patch {} but lock entry `{}` {}; \
+                             that copy stays UNPATCHED and nothing is attested",
+                            r.purl, r.uuid, c.key, c.how
+                        ),
+                    );
+                }
+                None => self.refs.push(r),
+            }
         }
     }
 
@@ -700,7 +848,7 @@ impl Discovery {
             self.refs.iter().any(|r| {
                 r.uuid == uuid
                     && r.mode == WiringMode::Vendored
-                    && same_package(&r.purl, &key)
+                    && PurlKey::same(&r.purl, &key)
                     && r.artifact_rel.as_deref() == Some(artifact)
             })
         })
@@ -714,7 +862,7 @@ impl Discovery {
     pub fn vendored_contest(&self, purl: &str, uuid: &str) -> Option<&ContestedRef> {
         let key = canonical_base_purl(purl);
         self.contested.iter().find(|c| {
-            c.uuid == uuid && c.mode == WiringMode::Vendored && same_package(&c.purl, &key)
+            c.uuid == uuid && c.mode == WiringMode::Vendored && PurlKey::same(&c.purl, &key)
         })
     }
 
@@ -723,9 +871,9 @@ impl Discovery {
     /// ([`Discovery::resolved_elsewhere`]).
     pub fn resolves_package(&self, purl: &str) -> bool {
         let key = canonical_base_purl(purl);
-        self.refs.iter().any(|r| same_package(&r.purl, &key))
-            || self.contested.iter().any(|c| same_package(&c.purl, &key))
-            || self.elsewhere.iter().any(|e| same_package(&e.purl, &key))
+        self.refs.iter().any(|r| PurlKey::same(&r.purl, &key))
+            || self.contested.iter().any(|c| PurlKey::same(&c.purl, &key))
+            || self.elsewhere.iter().any(|e| PurlKey::same(&e.purl, &key))
     }
 
     fn recognize(&mut self, uuid: &str, mode: WiringMode, file: &str) {
@@ -738,18 +886,60 @@ impl Discovery {
 
     /// Record that the ref `(purl, uuid)` is wired but bypassed by the
     /// build `file` shows ([`Unattested`]). Pushed beside the ref itself.
-    pub(crate) fn unattested(&mut self, purl: &str, uuid: &str, file: &str, detail: String) {
+    pub(crate) fn unattested(
+        &mut self,
+        purl: &str,
+        uuid: &str,
+        file: &str,
+        detail: String,
+        kind: UnattestedKind,
+    ) {
         self.unattested.push(Unattested {
             purl: canonical_base_purl(purl),
             uuid: uuid.to_string(),
             file: PathBuf::from(file),
             detail,
+            kind,
         });
+    }
+
+    /// Record a copy some build installs where no Socket wiring reaches,
+    /// when the files cannot tie it to a ref's exact `name@version` or
+    /// cannot say the build runs it ([`UnwiredCopy`]). Every ref it may
+    /// stand beside is marked [`Unattested`] — a missed attestation at
+    /// worst, never a false one — and stays a ref, so no ledger claim dies
+    /// over evidence a rewire could never clear.
+    pub(crate) fn unwired_copy(&mut self, copy: UnwiredCopy) {
+        self.unwired_copies.push(copy);
+    }
+
+    /// Mark every surviving ref an [`UnwiredCopy`] covers [`Unattested`]
+    /// (the first covering copy names the cause), once every extractor has
+    /// run.
+    fn unattest_unwired_copies(&mut self) {
+        let copies = std::mem::take(&mut self.unwired_copies);
+        let marks: Vec<Unattested> = self
+            .refs
+            .iter()
+            .filter_map(|r| {
+                let c = copies.iter().find(|c| c.covers(r))?;
+                Some(Unattested {
+                    purl: r.purl.clone(),
+                    uuid: r.uuid.clone(),
+                    file: c.file.clone(),
+                    detail: c.detail.clone(),
+                    kind: c.kind,
+                })
+            })
+            .collect();
+        self.unattested.extend(marks);
     }
 
     fn finalize(&mut self) {
         self.elsewhere.sort();
         self.elsewhere.dedup();
+        self.unpatched_copies.sort();
+        self.unpatched_copies.dedup();
         self.unattested.sort();
         self.unattested.dedup();
         self.contested.sort();
@@ -824,7 +1014,9 @@ async fn discover_with_ctx(ctx: DiscoverCtx<'_>) -> Discovery {
     sbt::extract(&ctx, &mut out).await;
     nuget::extract(&ctx, &mut out).await;
     deno::extract(&ctx, &mut out).await;
+    out.contest_within_locks();
     out.contest_across_locks();
+    out.unattest_unwired_copies();
     out.recognized.extend(ctx.take_recognized());
     out.finalize();
     out
@@ -967,6 +1159,12 @@ impl<'a> DiscoverCtx<'a> {
         self.view.read_text(rel).await.ok()
     }
 
+    /// Bytes twin of [`DiscoverCtx::read_advisory_text`] (a user's `file:`
+    /// tarball, read only to name the package it holds).
+    pub(crate) async fn read_advisory_bytes(&self, rel: &str) -> Option<Vec<u8>> {
+        self.view.read_bytes(rel).await.ok()
+    }
+
     /// Bytes twin of [`DiscoverCtx::read_text`] (JSON and binary locks). A
     /// binary lock is swept through its lossy UTF-8 view: string pools store
     /// resolutions verbatim, and a stale string an older patch generation
@@ -999,7 +1197,7 @@ impl<'a> DiscoverCtx<'a> {
 /// `vendored = true`, `socket-patch-vendor-<uuid>` (maven's vendored repo
 /// id). Exact grammar only — a suffix or a non-canonical uuid is not ours.
 pub(crate) fn socket_patch_name_uuid(name: &str, vendored: bool) -> Option<String> {
-    crate::patch::redirect::socket_patch_name_uuid_exact(name.trim(), vendored).map(str::to_string)
+    crate::patch::redirect::generation::pin_name_uuid(name.trim(), vendored).map(str::to_string)
 }
 
 /// Every Socket patch identity `text` MENTIONS, by wiring mode — the sweep
@@ -1527,42 +1725,6 @@ pub(crate) fn toml_or_diag(
 
 // ── purl helpers ─────────────────────────────────────────────────────────
 
-/// The comparison key for "the same package" across purl spellings:
-/// qualifiers and subpath stripped, components percent-decoded, the type
-/// lowercased, and the name folded where the ecosystem's own resolution is
-/// insensitive — pypi (PEP 503: case + `-`/`_`/`.` runs), composer and
-/// nuget (case). Used to match discovered refs against manifest / ledger
-/// keys and API purls; it is also the form [`PatchedRef::purl`] carries.
-/// Never used to build filesystem paths.
-pub fn canonical_base_purl(purl: &str) -> String {
-    let base = normalize_purl(strip_purl_qualifiers(purl.trim())).into_owned();
-    let Some(rest) = base.strip_prefix("pkg:") else {
-        return base;
-    };
-    let Some((ty, tail)) = rest.split_once('/') else {
-        return base;
-    };
-    let ty = ty.to_ascii_lowercase();
-    match ty.as_str() {
-        "pypi" => match tail.rsplit_once('@') {
-            Some((name, version)) => {
-                format!("pkg:pypi/{}@{version}", canonicalize_pypi_name(name))
-            }
-            None => format!("pkg:pypi/{}", canonicalize_pypi_name(tail)),
-        },
-        "composer" | "nuget" => format!("pkg:{ty}/{}", tail.to_lowercase()),
-        _ => format!("pkg:{ty}/{tail}"),
-    }
-}
-
-/// Whether a ref's [`canonical_base_purl`] and `key` (another canonical
-/// base) name the same package release: equal, or for composer the same
-/// release in another version spelling (a ledger's `@3.0.2.0` is the lock's
-/// `@3.0.2`).
-fn same_package(ref_purl: &str, key: &str) -> bool {
-    ref_purl == key || crate::utils::composer_version::composer_purls_equivalent(ref_purl, key)
-}
-
 /// [`canonical_base_purl`] for a ref about to be pushed, plus shape checks:
 /// a known ecosystem type and a non-empty name and version (the version
 /// after the LAST `@`, containing no `/`).
@@ -1593,7 +1755,7 @@ impl Discovery {
         let key = canonical_base_purl(purl);
         self.refs
             .iter()
-            .any(|r| r.mode == mode && same_package(&r.purl, &key))
+            .any(|r| r.mode == mode && PurlKey::same(&r.purl, &key))
     }
 
     /// Liveness of a VENDOR-ledger entry — the ONE rule every reader of the
@@ -2120,6 +2282,23 @@ pub(crate) mod testing {
     /// the patch uuid after it.
     pub(crate) const TOKEN: &str = "11111111-2222-4333-8444-555555555555";
 
+    /// A minimal npm tarball (`package/package.json` naming
+    /// `name@version`) — a user's `file:` tarball copy.
+    pub(crate) fn npm_tgz(name: &str, version: &str) -> Vec<u8> {
+        let manifest = format!(r#"{{"name":"{name}","version":"{version}"}}"#);
+        let mut tar = tar::Builder::new(flate2::write::GzEncoder::new(
+            Vec::new(),
+            flate2::Compression::default(),
+        ));
+        let mut header = tar::Header::new_gnu();
+        header.set_size(manifest.len() as u64);
+        header.set_mode(0o644);
+        header.set_cksum();
+        tar.append_data(&mut header, "package/package.json", manifest.as_bytes())
+            .unwrap();
+        tar.into_inner().unwrap().finish().unwrap()
+    }
+
     /// Production artifact-URL shape on Socket's patch server
     /// (`…/patch/<eco>/<name>/<version>/<token>/<uuid>/<leaf>`).
     pub(crate) fn hosted_url(
@@ -2217,6 +2396,10 @@ pub(crate) mod testing {
             let ctx = self.ctx();
             let mut out = Discovery::default();
             extract(&ctx, &mut out).await;
+            // Same-lock copies contest within one extractor's own locks,
+            // and its unwired copies mark its own refs.
+            out.contest_within_locks();
+            out.unattest_unwired_copies();
             let swept = ctx.take_recognized();
             assert_recognition_covers_refs(&out, &swept, "the ctx sweep", Some(self.root()));
             out.recognized.extend(swept);
@@ -2419,35 +2602,6 @@ mod tests {
             Some("pkg:cargo/serde@1.0.0")
         );
         assert_eq!(vendored_leaf_purl("npm", "not-a-tarball"), None);
-    }
-
-    #[test]
-    fn canonical_base_purl_folds_only_insensitive_ecosystems() {
-        assert_eq!(
-            canonical_base_purl("pkg:pypi/Python_Dateutil@2.8.2?artifact_id=py3-none-any-whl"),
-            "pkg:pypi/python-dateutil@2.8.2"
-        );
-        assert_eq!(
-            canonical_base_purl("pkg:npm/%40scope/Name@1.0.0"),
-            "pkg:npm/@scope/Name@1.0.0",
-            "npm is case-sensitive; only percent-decoding applies"
-        );
-        assert_eq!(
-            canonical_base_purl("pkg:nuget/Newtonsoft.Json@13.0.1"),
-            "pkg:nuget/newtonsoft.json@13.0.1"
-        );
-        assert_eq!(
-            canonical_base_purl("pkg:composer/Monolog/Monolog@2.0.0"),
-            "pkg:composer/monolog/monolog@2.0.0"
-        );
-        assert_eq!(
-            canonical_base_purl("pkg:gem/nokogiri@1.16.5?platform=java"),
-            "pkg:gem/nokogiri@1.16.5"
-        );
-        assert_eq!(
-            canonical_base_purl("pkg:golang/github.com/Foo/bar@v1.0.0#sub/dir"),
-            "pkg:golang/github.com/Foo/bar@v1.0.0"
-        );
     }
 
     #[test]

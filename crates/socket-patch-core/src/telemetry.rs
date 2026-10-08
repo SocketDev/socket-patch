@@ -4,9 +4,7 @@ use once_cell::sync::Lazy;
 use uuid::Uuid;
 
 use crate::constants::USER_AGENT;
-use crate::utils::env_compat::{
-    is_debug_enabled, is_offline_env, proxy_url_from_env,
-};
+use crate::utils::env_compat::{is_debug_enabled, is_offline_env, proxy_url_from_env};
 use crate::utils::fs::home_dir;
 use crate::vex::time::unix_to_ymdhms;
 
@@ -164,12 +162,13 @@ fn build_telemetry_context(command: &str) -> PatchTelemetryContext {
 /// Replaces the user's home directory path with `~` to avoid leaking
 /// sensitive file system information.
 pub fn sanitize_error_message(message: &str) -> String {
-    let home = home_dir();
+    let Some(home) = home_dir() else {
+        return message.to_string();
+    };
     let home = home.to_string_lossy();
-    // `home_dir()` falls back to a literal `"~"` when no home is set, and
-    // replacing `"~"` with `"~"` is a no-op. A set-but-empty HOME must be
-    // skipped explicitly — replacing `""` would splice `~` between every byte.
-    // Trailing separators are trimmed so a `HOME=/home/user/` redaction keeps
+    // `home_dir()` is `None` with no (absolute) home set, so a set-but-empty
+    // HOME never reaches here — replacing `""` would splice `~` between
+    // every byte. Trailing separators are trimmed so a `HOME=/home/user/` redaction keeps
     // the separator (`~/.cache`, not `~.cache`); a home that trims to nothing
     // (`HOME=/`, common for unmapped-UID containers) is a filesystem root with
     // no user-identifying prefix to redact — replacing it would splice `~`
