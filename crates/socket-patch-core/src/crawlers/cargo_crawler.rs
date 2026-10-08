@@ -602,25 +602,6 @@ mod tests {
 
     // --- regression: table-header parsing tolerance --------------------
 
-    #[test]
-    fn test_parse_table_header_variants() {
-        assert_eq!(parse_table_header("[package]"), Some("package"));
-        assert_eq!(
-            parse_table_header("[package] # main crate"),
-            Some("package")
-        );
-        assert_eq!(parse_table_header("[ package ]"), Some("package"));
-        assert_eq!(
-            parse_table_header("[package.metadata]"),
-            Some("package.metadata")
-        );
-        // Not a header line.
-        assert_eq!(parse_table_header("name = \"x\""), None);
-        // Array value lines don't start with '[' once trimmed by the caller,
-        // but a bare unterminated bracket is rejected.
-        assert_eq!(parse_table_header("[oops"), None);
-    }
-
     /// A `[package]` header with a trailing inline comment is valid TOML.
     /// The parser must still recognize it and read name/version — a
     /// too-strict `== "[package]"` would drop the crate, and in the
@@ -663,7 +644,7 @@ version = "fake"
     // --- regression: single-quoted (literal) string values -------------
 
     /// TOML literal strings use single quotes and are valid in a
-    /// `Cargo.toml`. The minimal parser must read `name`/`version` from
+    /// `Cargo.toml`. The reader must read `name`/`version` from
     /// them just as it does from basic (double-quoted) strings.
     #[test]
     fn test_parse_cargo_toml_single_quoted_values() {

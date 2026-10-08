@@ -2070,13 +2070,34 @@ mod tests {
         use crate::vendor::cargo_tag::tag_manifest_text;
         const UUID: &str = "80630680-4da6-45f9-bba8-b888e0ffd58c";
         let rows: [(&str, Option<&str>); 8] = [
-            ("[package]\nname = \"old\"\nversion = \"0.1.0\"\n", Some("0.1.0")),
-            ("\u{feff}[package]\nname = \"old\"\nversion = \"0.1.0\"\n", Some("0.1.0")),
-            ("[project]\nname = \"old\"\nversion = \"0.1.0\"\n", Some("0.1.0")),
-            ("package.name = \"old\"\npackage.version = \"0.1.0\"\n", Some("0.1.0")),
-            ("package = { name = \"old\", version = \"0.1.0\" }\n", Some("0.1.0")),
-            ("[package]\nname = \"old\"\nversion.workspace = true\n", None),
-            ("[package] junk\nname = \"old\"\nversion = \"0.1.0\"\n", None),
+            (
+                "[package]\nname = \"old\"\nversion = \"0.1.0\"\n",
+                Some("0.1.0"),
+            ),
+            (
+                "\u{feff}[package]\nname = \"old\"\nversion = \"0.1.0\"\n",
+                Some("0.1.0"),
+            ),
+            (
+                "[project]\nname = \"old\"\nversion = \"0.1.0\"\n",
+                Some("0.1.0"),
+            ),
+            (
+                "package.name = \"old\"\npackage.version = \"0.1.0\"\n",
+                Some("0.1.0"),
+            ),
+            (
+                "package = { name = \"old\", version = \"0.1.0\" }\n",
+                Some("0.1.0"),
+            ),
+            (
+                "[package]\nname = \"old\"\nversion.workspace = true\n",
+                None,
+            ),
+            (
+                "[package] junk\nname = \"old\"\nversion = \"0.1.0\"\n",
+                None,
+            ),
             ("[dependencies]\nold = \"0.1.0\"\n", None),
         ];
         for (text, version) in rows {

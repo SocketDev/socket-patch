@@ -2,9 +2,9 @@
 
 use std::path::Path;
 
-use socket_patch_core::formats::cargo::manifest::package_name_version;
 use socket_patch_core::crawlers::types::CrawlerOptions;
 use socket_patch_core::crawlers::CargoCrawler;
+use socket_patch_core::formats::cargo::manifest::package_name_version;
 
 const ORG_PURL: &str = "pkg:cargo/serde@1.0.200";
 
@@ -261,21 +261,35 @@ async fn find_by_purls_vendor_layout_finds_crate() {
 #[serial_test::parallel]
 async fn find_by_purls_vendor_layout_reads_every_manifest_spelling() {
     let manifests = [
-        ("bom", "\u{feff}[package]\nname = \"bom\"\nversion = \"1.0.0\"\n"),
-        ("legacy", "[project]\nname = \"legacy\"\nversion = \"1.0.0\"\n"),
-        ("dotted", "package.name = \"dotted\"\npackage.version = \"1.0.0\"\n"),
+        (
+            "bom",
+            "\u{feff}[package]\nname = \"bom\"\nversion = \"1.0.0\"\n",
+        ),
+        (
+            "legacy",
+            "[project]\nname = \"legacy\"\nversion = \"1.0.0\"\n",
+        ),
+        (
+            "dotted",
+            "package.name = \"dotted\"\npackage.version = \"1.0.0\"\n",
+        ),
     ];
     let tmp = tempfile::tempdir().unwrap();
     for (name, text) in manifests {
         let pkg = tmp.path().join(name);
         tokio::fs::create_dir_all(&pkg).await.unwrap();
-        tokio::fs::write(pkg.join("Cargo.toml"), text).await.unwrap();
+        tokio::fs::write(pkg.join("Cargo.toml"), text)
+            .await
+            .unwrap();
     }
     let purls: Vec<String> = manifests
         .iter()
         .map(|(name, _)| format!("pkg:cargo/{name}@1.0.0"))
         .collect();
-    let result = CargoCrawler.find_by_purls(tmp.path(), &purls).await.unwrap();
+    let result = CargoCrawler
+        .find_by_purls(tmp.path(), &purls)
+        .await
+        .unwrap();
     for purl in &purls {
         assert!(result.contains_key(purl), "{purl} not found: {result:?}");
     }
