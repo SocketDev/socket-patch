@@ -701,12 +701,10 @@ const GEM_MANIFEST_FILES: [&str; 4] = ["Gemfile", "Gemfile.lock", "gems.rb", "ge
 /// to bundler's own choice, so it can never wire a manifest bundler
 /// ignores:
 ///
-/// - no `BUNDLE_GEMFILE`: unchanged (the rewriter's `gems.rb`-first choice
-///   and its divergence guard are bundler >= 2's default discovery) —
-///   except a `Gemfile` + `gems.rb` twin whose locks say bundler 1.x wrote
-///   them, which loads the `Gemfile` pair, and a twin whose locks disagree
-///   on the bundler major, which is withheld
-///   ([`manifest::default_twin_manifest`](crate::formats::gem::manifest::default_twin_manifest));
+/// - no `BUNDLE_GEMFILE`: unchanged for a lone `Gemfile` or `gems.rb`; a
+///   `Gemfile` + `gems.rb` twin is withheld, since bundler 1.x loads the
+///   `Gemfile`, >= 2 loads `gems.rb`, and nothing says which runs
+///   ([`manifest::twin_manifest_refusal`](crate::formats::gem::manifest::twin_manifest_refusal));
 /// - `BUNDLE_GEMFILE` naming the root `Gemfile` / `gems.rb`: the other
 ///   spelling is dropped;
 /// - `BUNDLE_GEMFILE` naming anything else, or bundler 4's
@@ -771,23 +769,14 @@ async fn keep_bundler_loaded_gem_files(
         | (LoadedManifest::Unsupported { .. } | LoadedManifest::UnsupportedLockfile { .. }, _) => {
             &[]
         }
-        // Default discovery: the rewriter's `gems.rb`-first choice and its
-        // divergence guard are bundler >= 2's order. A twin the locks say
-        // bundler 1.x wrote is loaded through its `Gemfile` instead (#751).
+        // Default discovery of a twin: bundler 1.x loads the `Gemfile`
+        // and >= 2 loads `gems.rb`, and nothing here says which runs, so
+        // neither pair is wired (#751).
         (LoadedManifest::Default, None)
             if out.files.contains_key("gems.rb") && out.files.contains_key("Gemfile") =>
         {
-            match manifest::default_twin_manifest(
-                out.files.get("Gemfile.lock").map(String::as_str),
-                out.files.get("gems.locked").map(String::as_str),
-            ) {
-                Ok("gems.rb") => return,
-                Ok(_) => &["Gemfile", "Gemfile.lock"],
-                Err(detail) => {
-                    twin_ambiguous = Some(detail);
-                    &[]
-                }
-            }
+            twin_ambiguous = Some(manifest::twin_manifest_refusal());
+            &[]
         }
         (LoadedManifest::Default, None) => return,
         (LoadedManifest::Configured { .. }, None) => {
@@ -802,7 +791,7 @@ async fn keep_bundler_loaded_gem_files(
     out.symlinked_reads.retain(|rel| !dropped(rel));
     out.unreadable_reads.retain(|rel| !dropped(rel));
     out.gem_refusal = refusal.or(twin_ambiguous.map(|detail| RewriteWarning {
-        code: "redirect_gem_twin_bundler_versions_diverge".into(),
+        code: "redirect_gem_twin_manifest_ambiguous".into(),
         detail,
     }));
 }
@@ -2962,27 +2951,34 @@ mod tests {
         }
     }
 
-    /// #751: a `Gemfile` + `gems.rb` twin whose locks disagree on the
-    /// bundler major is withheld, and the run says why.
+    /// #751: a `Gemfile` + `gems.rb` twin is withheld whatever its locks'
+    /// `BUNDLED WITH` say (which bundler wrote a lock is not which one
+    /// installs it), and the run says why.
     #[tokio::test]
-    async fn twin_with_diverging_bundler_majors_redirects_nothing() {
+    async fn twin_redirects_nothing_whatever_the_locks_say() {
         let legacy = GEM_LOCK.replace("2.5.22", "1.17.3");
-        let mut p = MemoryProject::new();
-        p.insert_text("Gemfile", GEMFILE);
-        p.insert_text("Gemfile.lock", legacy.as_str());
-        p.insert_text("gems.rb", GEMFILE);
-        p.insert_text("gems.locked", GEM_LOCK);
-        let (_read, done) = gem_rewrite(&p).await;
-        assert!(
-            done.rewrite.files.is_empty(),
-            "{:?}",
-            done.rewrite.files.keys()
-        );
-        let codes = warning_codes(&done);
-        assert!(
-            codes.contains(&"redirect_gem_twin_bundler_versions_diverge"),
-            "{codes:?}"
-        );
+        for (gemfile_lock, gems_locked) in [
+            (legacy.as_str(), legacy.as_str()),
+            (legacy.as_str(), GEM_LOCK),
+            (GEM_LOCK, GEM_LOCK),
+        ] {
+            let mut p = MemoryProject::new();
+            p.insert_text("Gemfile", GEMFILE);
+            p.insert_text("Gemfile.lock", gemfile_lock);
+            p.insert_text("gems.rb", GEMFILE);
+            p.insert_text("gems.locked", gems_locked);
+            let (_read, done) = gem_rewrite(&p).await;
+            assert!(
+                done.rewrite.files.is_empty(),
+                "{:?}",
+                done.rewrite.files.keys()
+            );
+            let codes = warning_codes(&done);
+            assert!(
+                codes.contains(&"redirect_gem_twin_manifest_ambiguous"),
+                "{codes:?}"
+            );
+        }
     }
 
     /// #681: `bundle config set --local mirror.all <url>` sends the
@@ -3101,23 +3097,23 @@ mod tests {
         assert!(!done.rewrite.files.contains_key("gems.locked"));
     }
 
-    /// Without `BUNDLE_GEMFILE` nothing changes: `gems.rb` is still the
-    /// spelling bundler (and the rewriter) picks.
+    /// Without `BUNDLE_GEMFILE` a lone `gems.rb` pair is still the one
+    /// bundler (and the rewriter) picks; a twin is withheld
+    /// ([`twin_redirects_nothing_whatever_the_locks_say`]).
     #[tokio::test]
-    async fn default_discovery_still_prefers_gems_rb() {
+    async fn default_discovery_wires_a_lone_gems_rb() {
         let mut p = MemoryProject::new();
-        p.insert_text("Gemfile", GEMFILE);
-        p.insert_text("Gemfile.lock", GEM_LOCK);
         p.insert_text("gems.rb", GEMFILE);
         p.insert_text("gems.locked", GEM_LOCK);
-        let (read, done) = gem_rewrite(&p).await;
-        assert!(read.files.contains_key("Gemfile"));
+        let (_read, done) = gem_rewrite(&p).await;
         assert!(
             done.rewrite.files.contains_key("gems.rb"),
             "{:?}",
             done.rewrite.files.keys()
         );
-        assert!(!done.rewrite.files.contains_key("Gemfile"));
+        assert!(warning_codes(&done)
+            .iter()
+            .all(|c| !c.starts_with("redirect_gem_twin")));
     }
 
     /// #333: the Pipenv planner keys a live lock on the `Pipfile` beside

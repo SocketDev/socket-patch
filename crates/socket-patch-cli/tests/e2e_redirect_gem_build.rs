@@ -463,11 +463,11 @@ enum Driver {
     /// run must redirect nothing and attest nothing. Bundler >= 4 only; the
     /// fixture asserts the contract itself and yields `None`.
     ScanVexCustomLockfile,
-    /// [`Driver::ScanVex`] on a `Gemfile` + `gems.rb` twin locked by
-    /// bundler 1.x (#751): bundler 1.x loads the `Gemfile`, so the run must
-    /// wire the `Gemfile` pair and leave `gems.rb` / `gems.locked`
-    /// untouched. Bundler < 2 only.
-    ScanVexBundler1Twin,
+    /// [`Driver::ScanVex`] on a `Gemfile` + `gems.rb` twin (#751): bundler
+    /// 1.x loads the `Gemfile` and >= 2 loads `gems.rb`, and the scan cannot
+    /// see which runs, so it must redirect and attest nothing and leave all
+    /// four files byte-identical. Every bundler line.
+    ScanVexTwin,
     /// [`Driver::ScanVex`] on a Gemfile that declares the gem inside a
     /// `group :development do … end` block (#775): hosted mode wraps it in
     /// a source block inside the group, but vendored mode cannot edit an
@@ -520,9 +520,7 @@ impl Driver {
                 "scan --mode hosted (config Gemfile.next, env BUNDLE_GEMFILE=Gemfile)"
             }
             Driver::ScanVexCustomLockfile => "scan --mode hosted (lockfile custom.lock)",
-            Driver::ScanVexBundler1Twin => {
-                "scan --mode hosted (bundler 1.x Gemfile + gems.rb twin)"
-            }
+            Driver::ScanVexTwin => "scan --mode hosted (Gemfile + gems.rb twin)",
             Driver::ScanVexGroupBlock => "scan --mode hosted (gem in a group block)",
             Driver::ScanVexSemicolonJoinedDeclaration => {
                 "scan --mode hosted (two `;`-joined gem declarations)"
@@ -641,9 +639,6 @@ async fn redirect_scanned_project(
     let only = match driver {
         Driver::ScanVexCustomLockfile if !bundler.at_least(4, 0) => {
             Some("custom lockfiles need bundler >= 4")
-        }
-        Driver::ScanVexBundler1Twin if bundler.at_least(2, 0) => {
-            Some("bundler >= 2 loads a twin's gems.rb (covered in-process)")
         }
         _ => None,
     };
@@ -1021,9 +1016,10 @@ async fn redirect_scanned_project(
             String::from_utf8_lossy(&cfg.stderr)
         );
     }
-    if driver == Driver::ScanVexBundler1Twin {
-        // Identical twins, both `BUNDLED WITH 1.x`: bundler 1.x loads the
-        // Gemfile pair.
+    let twin = driver == Driver::ScanVexTwin;
+    if twin {
+        // Identical twins: which pair installs depends only on the bundler
+        // that runs.
         std::fs::copy(proj.join(gemfile_name), proj.join("gems.rb")).unwrap();
         std::fs::copy(proj.join(lock_name), proj.join("gems.locked")).unwrap();
     }
@@ -1060,7 +1056,7 @@ async fn redirect_scanned_project(
         | Driver::ScanVexMirrorSourceEnv
         | Driver::ScanVexMirrorAllEnv
         | Driver::ScanVexCustomLockfile
-        | Driver::ScanVexBundler1Twin
+        | Driver::ScanVexTwin
         | Driver::ScanVexDualBoot
         | Driver::ScanVexDualBootEnvGemfile
         | Driver::ScanVexDuplicateDeclaration
@@ -1139,10 +1135,29 @@ async fn redirect_scanned_project(
     if custom_lockfile {
         assert_custom_lockfile_redirects_nothing(
             &bundler,
+            "redirect_gem_bundle_lockfile_unsupported",
             (code, &stdout, &stderr),
             &proj,
-            &pristine_gemfile,
-            &pristine_lock,
+            &[
+                ("Gemfile", &pristine_gemfile),
+                ("Gemfile.lock", &pristine_lock),
+                ("custom.lock", &pristine_lock),
+            ],
+        );
+        return None;
+    }
+    if twin {
+        assert_custom_lockfile_redirects_nothing(
+            &bundler,
+            "redirect_gem_twin_manifest_ambiguous",
+            (code, &stdout, &stderr),
+            &proj,
+            &[
+                ("Gemfile", &pristine_gemfile),
+                ("Gemfile.lock", &pristine_lock),
+                ("gems.rb", &pristine_gemfile),
+                ("gems.locked", &pristine_lock),
+            ],
         );
         return None;
     }
@@ -1248,7 +1263,6 @@ async fn redirect_scanned_project(
     }
     match driver {
         Driver::ScanVex
-        | Driver::ScanVexBundler1Twin
         | Driver::ScanVexGroupBlock
         | Driver::ScanVexTrailingSemicolonDeclaration => {
             assert_eq!(env["vex"]["statements"], 1, "vex block: {env}");
@@ -1260,6 +1274,7 @@ async fn redirect_scanned_project(
         Driver::ScanVexDualBoot
         | Driver::ScanVexDualBootEnvGemfile
         | Driver::ScanVexCustomLockfile
+        | Driver::ScanVexTwin
         | Driver::ScanVexDuplicateDeclaration
         | Driver::ScanVexEvalGemfile
         | Driver::ScanVexMirrorAll
@@ -1372,17 +1387,17 @@ fn assert_unwirable_declaration_redirects_nothing(
     );
 }
 
-/// #749's contract on a bundler 4 project whose `.bundle/config` names
-/// `custom.lock`: the hosted scan names the setting, leaves the Gemfile,
-/// the leftover `Gemfile.lock` (which bundler ignores) and `custom.lock`
-/// byte-identical, and attests nothing. Bundler still installs the
-/// untouched project frozen (before the fix every frozen install failed).
+/// The contract of a hosted scan that must refuse every gem: #749's
+/// `custom.lock` named in `.bundle/config` (bundler 4), or #751's
+/// `Gemfile` + `gems.rb` twin. The scan reports `refusal`, redirects and
+/// attests nothing, leaves every one of `files` byte-identical, and bundler
+/// still installs the untouched project frozen.
 fn assert_custom_lockfile_redirects_nothing(
     bundler: &bundler_e2e::Bundler,
+    refusal: &str,
     (code, stdout, stderr): (i32, &str, &str),
     proj: &Path,
-    pristine_gemfile: &[u8],
-    pristine_lock: &[u8],
+    files: &[(&str, &[u8])],
 ) {
     let env: serde_json::Value = serde_json::from_str(stdout)
         .unwrap_or_else(|e| panic!("not JSON: {e}\nstdout:\n{stdout}\nstderr:\n{stderr}"));
@@ -1391,8 +1406,8 @@ fn assert_custom_lockfile_redirects_nothing(
         .map(|a| a.iter().filter_map(|w| w["code"].as_str()).collect())
         .unwrap_or_default();
     assert!(
-        warning_codes.contains(&"redirect_gem_bundle_lockfile_unsupported"),
-        "the BUNDLE_LOCKFILE refusal must be reported: {env}"
+        warning_codes.contains(&refusal),
+        "the {refusal} refusal must be reported: {env}"
     );
     assert_ne!(code, 0, "nothing was patched or attested: {env}");
     assert_eq!(
@@ -1403,14 +1418,10 @@ fn assert_custom_lockfile_redirects_nothing(
         env["vex"]["statements"].as_u64().unwrap_or(0) == 0,
         "no in-run attestation for a lock that was never pinned: {env}"
     );
-    for (file, want) in [
-        ("Gemfile", pristine_gemfile),
-        ("Gemfile.lock", pristine_lock),
-        ("custom.lock", pristine_lock),
-    ] {
+    for (file, want) in files {
         assert_eq!(
             std::fs::read(proj.join(file)).unwrap(),
-            want,
+            *want,
             "{file} must be byte-untouched"
         );
     }
@@ -2206,45 +2217,26 @@ async fn gem_hosted_bundler4_custom_lockfile_redirects_nothing() {
     assert!(fx.is_none(), "the custom-lockfile driver asserts in place");
 }
 
-/// #751: bundler 1.x loads a twin's `Gemfile`, not its `gems.rb`. The
-/// hosted scan used to wire `gems.rb` and attest while bundler 1.17
-/// installed the unpatched gem from the `Gemfile`; it must wire the
-/// `Gemfile` pair, and a fresh checkout of the twin must install the
-/// patched bytes.
+/// #751: bundler 1.x loads a twin's `Gemfile` and bundler >= 2 its
+/// `gems.rb`. The hosted scan used to wire `gems.rb` and attest while
+/// bundler 1.17 installed the unpatched gem from the `Gemfile`; since a
+/// lock's `BUNDLED WITH` does not say which bundler installs, it must
+/// refuse the twin on every bundler line, and the untouched twin must
+/// still install.
 #[tokio::test(flavor = "multi_thread")]
-#[ignore = "host capstone: shells out to a real ruby/gem/bundler (< 2.0 for this arm); \
+#[ignore = "host capstone: shells out to a real ruby/gem/bundler (>= 1.17); \
             the unpinned `test` job skips it, an e2e job with a pinned toolchain runs it via --ignored"]
-async fn gem_hosted_bundler1_twin_wires_the_gemfile_and_installs() {
-    let Some(fx) = redirect_scanned_project(
-        "bundler1-twin",
+async fn gem_hosted_twin_redirects_nothing() {
+    let fx = redirect_scanned_project(
+        "twin",
         Spelling::Gemfile,
         false,
         true,
         None,
-        Driver::ScanVexBundler1Twin,
+        Driver::ScanVexTwin,
     )
-    .await
-    else {
-        return;
-    };
-    let gems_rb = std::fs::read(fx.proj.join("gems.rb")).unwrap();
-    let gems_locked = std::fs::read(fx.proj.join("gems.locked")).unwrap();
-    assert_eq!(gems_rb, fx.pristine_gemfile, "gems.rb must be untouched");
-    assert_eq!(
-        gems_locked, fx.pristine_lock,
-        "gems.locked must be untouched"
-    );
-    let fresh = stage_fresh_checkout(&fx, "fresh");
-    std::fs::write(fresh.join("gems.rb"), &gems_rb).unwrap();
-    std::fs::write(fresh.join("gems.locked"), &gems_locked).unwrap();
-    let install = bundle(&fresh, &["install"]);
-    assert!(
-        install.status.success(),
-        "fresh-checkout `bundle install` of the twin must succeed.\nstdout:\n{}\nstderr:\n{}",
-        String::from_utf8_lossy(&install.stdout),
-        String::from_utf8_lossy(&install.stderr),
-    );
-    assert_patched_install(&fx, &fresh);
+    .await;
+    assert!(fx.is_none(), "the twin driver asserts in place");
 }
 
 /// #548: a gem declared in two `group` blocks must not be half-rewritten

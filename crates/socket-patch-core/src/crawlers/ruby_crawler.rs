@@ -1518,10 +1518,9 @@ pub(crate) async fn bundler_loaded_manifest_in(
 /// configures `BUNDLE_GEMFILE`, else `Gemfile.lock` — or `None` when
 /// `BUNDLE_GEMFILE` names a manifest outside the two default pairs, or
 /// bundler 4's `BUNDLE_LOCKFILE` names a lock other than the pair's own
-/// (#749). A `Gemfile` + `gems.rb` twin under default discovery follows
-/// [`default_twin_manifest`](crate::formats::gem::manifest::default_twin_manifest):
-/// `Gemfile.lock` when its locks say bundler 1.x wrote them, `None` when
-/// they disagree on the major (#751). Every lock READER asks this (lock
+/// (#749). A `Gemfile` + `gems.rb` twin under default discovery is `None`:
+/// bundler 1.x loads the `Gemfile` and >= 2 loads `gems.rb`, and nothing
+/// says which runs (#751). Every lock READER asks this (lock
 /// inventory, ledger recovery, VEX discovery), so none reads a twin
 /// bundler ignores (#736).
 pub(crate) async fn bundler_loaded_lock_in(view: &ProjectView<'_>) -> Option<&'static str> {
@@ -1530,8 +1529,7 @@ pub(crate) async fn bundler_loaded_lock_in(view: &ProjectView<'_>) -> Option<&'s
 
 /// [`bundler_loaded_lock_in`], with the reason when bundler loads no lock
 /// socket-patch reads: the detail of the unsupported `BUNDLE_GEMFILE` /
-/// `BUNDLE_LOCKFILE`, or of the twin whose locks disagree on the bundler
-/// major. Lock inventory surfaces it so a lockfile-only scan does not
+/// `BUNDLE_LOCKFILE`, or of the `Gemfile` + `gems.rb` twin. Lock inventory surfaces it so a lockfile-only scan does not
 /// skip the project's gems silently.
 pub(crate) async fn bundler_loaded_lock_diagnosed_in(
     view: &ProjectView<'_>,
@@ -1540,15 +1538,7 @@ pub(crate) async fn bundler_loaded_lock_diagnosed_in(
     let loaded = bundler_loaded_manifest_in(view).await;
     let gems_rb = view.is_file("gems.rb");
     if loaded == LoadedManifest::Default && gems_rb && view.is_file("Gemfile") {
-        let gemfile_lock = view.read_text("Gemfile.lock").await.ok();
-        let gems_locked = view.read_text("gems.locked").await.ok();
-        return match manifest::default_twin_manifest(
-            gemfile_lock.as_deref(),
-            gems_locked.as_deref(),
-        )? {
-            "Gemfile" => Ok("Gemfile.lock"),
-            _ => Ok("gems.locked"),
-        };
+        return Err(manifest::twin_manifest_refusal());
     }
     match loaded.pair(gems_rb) {
         Some((_, lock)) => Ok(lock),

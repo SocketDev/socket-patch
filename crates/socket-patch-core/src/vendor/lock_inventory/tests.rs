@@ -1599,7 +1599,7 @@ async fn gem_inventory_memory_view_reads_the_lock_bundler_loads() {
 
 /// #749 / #751: a gem project whose lock bundler loads is none
 /// socket-patch reads (a custom `BUNDLE_LOCKFILE`, an unsupported
-/// `BUNDLE_GEMFILE`, a twin whose locks disagree on the bundler major)
+/// `BUNDLE_GEMFILE`, a `Gemfile` + `gems.rb` twin)
 /// yields no gem entries AND a `gem_lock_unsupported` diagnosis, so a
 /// lockfile-only scan says the gems were not scanned instead of reporting
 /// none. Supported layouts, and projects without gem files, stay quiet.
@@ -1650,18 +1650,20 @@ async fn gem_inventory_diagnoses_a_lock_it_cannot_read() {
     let (purls, codes, detail) = diagnosed(&twin).await;
     assert!(purls.is_empty(), "{purls:?}");
     assert_eq!(codes, vec!["gem_lock_unsupported"]);
-    assert!(detail.unwrap().contains("BUNDLED WITH"));
+    assert!(detail.unwrap().contains("gems.rb"));
+    // Locks that agree on the major still leave the installing bundler
+    // unknown: a twin is never read.
+    let mut bundler1 = twin.clone();
+    bundler1.insert_text("gems.locked", lock("1.17.3"));
+    let (purls, codes, _) = diagnosed(&bundler1).await;
+    assert!(purls.is_empty(), "{purls:?}");
+    assert_eq!(codes, vec!["gem_lock_unsupported"]);
 
     // Supported layouts: entries, no diagnosis.
     let mut plain = MemoryProject::new();
     plain.insert_text("Gemfile", "gem \"rack\"\n");
     plain.insert_text("Gemfile.lock", lock("2.6.2"));
     let (purls, codes, _) = diagnosed(&plain).await;
-    assert_eq!(purls, vec!["pkg:gem/rack@2.2.8"]);
-    assert!(codes.is_empty(), "{codes:?}");
-    let mut bundler1 = twin.clone();
-    bundler1.insert_text("gems.locked", lock("1.17.3"));
-    let (purls, codes, _) = diagnosed(&bundler1).await;
     assert_eq!(purls, vec!["pkg:gem/rack@2.2.8"]);
     assert!(codes.is_empty(), "{codes:?}");
 

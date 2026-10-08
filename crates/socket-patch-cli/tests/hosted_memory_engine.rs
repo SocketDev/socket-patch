@@ -1109,57 +1109,28 @@ fn gem_twin(
     files
 }
 
-/// #751: bundler 1.x loads `Gemfile` before `gems.rb`. A twin whose locks
-/// say bundler 1.17 wrote them is wired through the `Gemfile` pair (the
-/// one that installs), never `gems.rb`.
+/// #751: bundler 1.x loads a twin's `Gemfile` and bundler >= 2 its
+/// `gems.rb`, and a lock's `BUNDLED WITH` records who wrote it, not who
+/// installs it, so no twin is wired whatever its locks say: refused,
+/// nothing written. No lock is the one bundler loads (#736), so the
+/// memory tree yields no gem candidate and the run reports
+/// `gem_lock_unsupported`; the per-candidate
+/// `redirect_gem_twin_manifest_ambiguous` refusal is covered by the engine
+/// unit tests.
 #[tokio::test]
-async fn a_bundler1_twin_wires_the_gemfile_pair() {
+async fn a_gemfile_gems_rb_twin_is_refused() {
     let (server, input) = gem_server_and_input().await;
-    let files = gem_twin(&input, ("1.17.3", "1.17.3"));
-    let output = run_engine(&server, build_input(&files, &[], options(false))).await;
-    let project = &output.projects[0];
-    assert!(project.error.is_none(), "{:?}", project.error);
-    assert_eq!(
-        project.redirected.len(),
-        1,
-        "{:?}",
-        warning_codes(&project.redirect)
-    );
-    assert_eq!(changed_paths(&output), vec!["Gemfile", "Gemfile.lock"]);
-}
-
-/// #751 control: a bundler >= 2 twin still wires `gems.rb`, as bundler
-/// >= 2 loads it.
-#[tokio::test]
-async fn a_bundler2_twin_still_wires_gems_rb() {
-    let (server, input) = gem_server_and_input().await;
-    let files = gem_twin(&input, ("2.6.2", "2.6.2"));
-    let output = run_engine(&server, build_input(&files, &[], options(false))).await;
-    let project = &output.projects[0];
-    assert_eq!(
-        project.redirected.len(),
-        1,
-        "{:?}",
-        warning_codes(&project.redirect)
-    );
-    assert_eq!(changed_paths(&output), vec!["gems.locked", "gems.rb"]);
-}
-
-/// #751: twin locks written by different bundler majors leave no safe
-/// spelling to wire: refused, nothing written. No lock is the one bundler
-/// loads (#736), so the memory tree yields no gem candidate and the run
-/// reports `gem_lock_unsupported`; the per-candidate
-/// `redirect_gem_twin_bundler_versions_diverge` refusal is covered by the
-/// engine unit tests.
-#[tokio::test]
-async fn a_twin_with_diverging_bundler_majors_is_refused() {
-    let (server, input) = gem_server_and_input().await;
-    for versions in [("1.17.3", "2.6.2"), ("2.6.2", "1.17.3")] {
+    for versions in [
+        ("1.17.3", "1.17.3"),
+        ("2.6.2", "2.6.2"),
+        ("1.17.3", "2.6.2"),
+        ("2.6.2", "1.17.3"),
+    ] {
         let files = gem_twin(&input, versions);
         let output = run_engine(&server, build_input(&files, &[], options(false))).await;
         let project = &output.projects[0];
         assert!(project.redirected.is_empty(), "{versions:?}");
-        assert!(changed_paths(&output).is_empty());
+        assert!(changed_paths(&output).is_empty(), "{versions:?}");
         assert_gem_lock_unsupported(&output);
     }
 }

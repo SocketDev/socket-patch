@@ -61,8 +61,8 @@ pub(super) async fn inventory_gemfile_lock_raw_in(
 /// Why the project's Bundler lock was not inventoried, when it holds gem
 /// files ([`GEM_FILES`]) but bundler loads no lock socket-patch reads
 /// ([`bundler_loaded_lock_diagnosed_in`]): an unsupported `BUNDLE_GEMFILE`
-/// or `BUNDLE_LOCKFILE`, or a `Gemfile` + `gems.rb` twin whose locks
-/// disagree on the bundler major. Without it a lockfile-only scan would
+/// or `BUNDLE_LOCKFILE`, or a `Gemfile` + `gems.rb` twin (which pair
+/// loads depends on the bundler that runs). Without it a lockfile-only scan would
 /// report the project's gems as absent rather than unscanned.
 pub(super) async fn unsupported_gem_layout_in(
     view: &ProjectView<'_>,

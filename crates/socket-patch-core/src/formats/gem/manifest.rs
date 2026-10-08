@@ -39,9 +39,9 @@
 //! (#749).
 //!
 //! A `Gemfile` + `gems.rb` twin under default discovery is ambiguous across
-//! bundler majors (1.x loads the `Gemfile`, >= 2 loads `gems.rb`);
-//! [`default_twin_manifest`] settles it from the `BUNDLED WITH` lines of
-//! the two locks (#751).
+//! bundler majors (1.x loads the `Gemfile`, >= 2 loads `gems.rb`), and
+//! nothing on disk says which bundler runs: callers refuse it with
+//! [`twin_manifest_refusal`] (#751).
 //!
 //! The model is pure:
 //! the disk and environment reads live in
@@ -217,40 +217,19 @@ pub fn config_lockfile(contents: &str) -> Option<String> {
     bundle_config_setting_including_empty(contents, "BUNDLE_LOCKFILE")
 }
 
-/// Which manifest bundler's DEFAULT discovery loads when the root holds
-/// both a `Gemfile` and a `gems.rb`, judged from the twin locks' texts
-/// (`None` = absent): bundler 1.x tries `Gemfile` first and >= 2 tries
-/// `gems.rb` first, and the bundler that runs is the one the locks were
-/// written with. `Ok("Gemfile")` when every recorded `BUNDLED WITH` is
-/// 1.x, `Ok("gems.rb")` when none is (bundler >= 2's order, also when no
-/// lock records a version), and `Err(detail)` when the two locks disagree
-/// on the major — then no spelling is safe to wire.
-pub fn default_twin_manifest(
-    gemfile_lock: Option<&str>,
-    gems_locked: Option<&str>,
-) -> Result<&'static str, String> {
-    let majors: Vec<(&str, u32)> = [("Gemfile.lock", gemfile_lock), ("gems.locked", gems_locked)]
-        .into_iter()
-        .filter_map(|(file, text)| Some((file, super::bundled_with_major(text?)?)))
-        .collect();
-    let legacy = majors.iter().filter(|(_, major)| *major < 2).count();
-    if legacy == 0 {
-        Ok("gems.rb")
-    } else if legacy == majors.len() {
-        Ok("Gemfile")
-    } else {
-        let said: Vec<String> = majors
-            .iter()
-            .map(|(file, major)| format!("{file} is BUNDLED WITH {major}.x"))
-            .collect();
-        Err(format!(
-            "both Gemfile and gems.rb are present and {}; bundler 1.x loads the Gemfile while \
-             bundler >= 2 loads gems.rb, so socket-patch cannot tell which pair is installed \
-             and left the gem manifests untouched (remove the spelling you don't use, and \
-             re-run)",
-            said.join(" but ")
-        ))
-    }
+/// Why a `Gemfile` + `gems.rb` twin under DEFAULT discovery is never
+/// wired: bundler 1.x loads the `Gemfile` and bundler >= 2 loads `gems.rb`,
+/// and only the bundler that runs decides. A lock's `BUNDLED WITH` records
+/// who wrote it, not who installs it (bundler >= 2 installs a 1.x lock and
+/// 1.x installs a 2.x one, each from its own spelling), so nothing a scan
+/// can read picks the pair and attesting either could leave the installed
+/// one unpatched (#751). Vendored mode refuses the twin the same way.
+pub fn twin_manifest_refusal() -> String {
+    "both Gemfile and gems.rb are present; bundler 1.x loads the Gemfile while bundler >= 2 \
+     loads gems.rb, and socket-patch cannot tell which bundler installs the project, so it \
+     left the gem manifests untouched (remove the spelling you don't use, or set \
+     BUNDLE_GEMFILE to the one you do, and re-run)"
+        .to_string()
 }
 
 /// The `BUNDLE_GEMFILE:` value of a bundler app config file (flat YAML that
@@ -628,31 +607,6 @@ mod tests {
             );
             assert_eq!(cleared, LoadedManifest::Default, "{env:?} {config:?}");
         }
-    }
-
-    /// #751: bundler 1.x loads a twin's `Gemfile`, >= 2 its `gems.rb`;
-    /// locks that disagree on the major leave no safe answer.
-    #[test]
-    fn default_twin_manifest_follows_the_locks_bundler_major() {
-        let lock = |v: &str| format!("GEM\n  specs:\n\nBUNDLED WITH\n   {v}\n");
-        let (one, two) = (lock("1.17.3"), lock("2.6.2"));
-        assert_eq!(default_twin_manifest(Some(&one), Some(&one)), Ok("Gemfile"));
-        assert_eq!(default_twin_manifest(Some(&one), None), Ok("Gemfile"));
-        assert_eq!(default_twin_manifest(None, Some(&one)), Ok("Gemfile"));
-        assert_eq!(default_twin_manifest(Some(&two), Some(&two)), Ok("gems.rb"));
-        assert_eq!(default_twin_manifest(None, None), Ok("gems.rb"));
-        // A lock without BUNDLED WITH says nothing either way.
-        assert_eq!(
-            default_twin_manifest(Some("GEM\n"), Some(&one)),
-            Ok("Gemfile")
-        );
-        let err = default_twin_manifest(Some(&one), Some(&two)).unwrap_err();
-        assert!(
-            err.contains("Gemfile.lock is BUNDLED WITH 1.x")
-                && err.contains("gems.locked is BUNDLED WITH 2.x"),
-            "{err}"
-        );
-        assert!(default_twin_manifest(Some(&two), Some(&one)).is_err());
     }
 
     #[test]
