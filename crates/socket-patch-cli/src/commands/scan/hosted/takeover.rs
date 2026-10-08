@@ -40,7 +40,8 @@ use std::collections::BTreeSet;
 use socket_patch_core::hosted::engine::{Candidate, Refusal, SkippedPatch};
 use socket_patch_core::patch::redirect::RewriteWarning;
 use socket_patch_core::utils::group_commit::{GroupCommit, Savepoint};
-use socket_patch_core::utils::purl::{canonical_purl, purl_parts, strip_purl_qualifiers};
+use socket_patch_core::utils::purl::{purl_parts, strip_purl_qualifiers};
+use socket_patch_core::utils::purl_key::PurlKey;
 use socket_patch_core::vendor::{RevertOutcome, VendorEntry, VendorState};
 
 /// The warning that announces a staged takeover the run did not complete:
@@ -87,10 +88,6 @@ pub(super) struct Finished {
     /// files`: a revert can touch a wiring file the hosted rewriter does not
     /// also rewrite (a Gemfile line, a uv source).
     pub files: BTreeSet<String>,
-}
-
-fn key(purl: &str) -> String {
-    canonical_purl(strip_purl_qualifiers(purl))
 }
 
 impl Takeover {
@@ -385,9 +382,9 @@ impl Takeover {
             warnings.extend(staged.advisories);
             if !dry_run {
                 if let Ok(state) = vendor_state.as_mut() {
-                    state
-                        .entries
-                        .retain(|k, e| key(k) != key(purl) && key(&e.base_purl) != key(purl));
+                    state.entries.retain(|k, e| {
+                        !PurlKey::same(k, purl) && !PurlKey::same(&e.base_purl, purl)
+                    });
                 }
             }
             files.extend(staged.entry.wiring.iter().map(|w| w.file.clone()));
