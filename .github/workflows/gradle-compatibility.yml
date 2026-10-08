@@ -44,6 +44,7 @@ on:
     paths:
       - '.github/workflows/gradle-compatibility.yml'
       - 'scripts/ci-e2e-bundle.py'
+      - 'scripts/maven-sha512.json'
       - 'Cargo.lock'
       - 'Cargo.toml'
       - 'crates/*/Cargo.toml'
@@ -256,18 +257,22 @@ jobs:
           # TLS handshake with CRYPT_E_REVOCATION_OFFLINE whenever the CA's
           # revocation server is unreachable. A revoked certificate still fails;
           # the body is checked against a digest right after. A no-op elsewhere.
-          # Tarball from Maven Central's CDN, digest from the Apache archive,
-          # which throttles the tarball itself to minutes (ci.yml's copy).
-          # Keep the archive tarball as a fallback for CDN failures.
+          # Use Maven Central's fast CDN, falling back to the slower Apache
+          # archive. Both must match the committed digest (ci.yml's copy).
           file="apache-maven-${MAVEN_VERSION}-bin.tar.gz"
           url="https://repo.maven.apache.org/maven2/org/apache/maven/apache-maven/${MAVEN_VERSION}/${file}"
-          sha_url="https://archive.apache.org/dist/maven/maven-3/${MAVEN_VERSION}/binaries/${file}.sha512"
+          archive_url="https://archive.apache.org/dist/maven/maven-3/${MAVEN_VERSION}/binaries/${file}"
           if ! curl -fsSL --retry 5 --retry-all-errors --ssl-revoke-best-effort "$url" -o "$RUNNER_TEMP/maven.tgz"; then
             echo "::warning::Maven Central download failed; falling back to the Apache archive."
-            curl -fsSL --retry 5 --retry-all-errors --ssl-revoke-best-effort "${sha_url%.sha512}" -o "$RUNNER_TEMP/maven.tgz"
+            curl -fsSL --retry 5 --retry-all-errors --ssl-revoke-best-effort "$archive_url" -o "$RUNNER_TEMP/maven.tgz"
           fi
-          curl -fsSL --retry 5 --retry-all-errors --ssl-revoke-best-effort "$sha_url" -o "$RUNNER_TEMP/maven.sha512"
-          python -c 'import hashlib, pathlib, os; p=pathlib.Path(os.environ["RUNNER_TEMP"]); assert hashlib.sha512((p/"maven.tgz").read_bytes()).hexdigest() == (p/"maven.sha512").read_text().split()[0]'
+          python - "$MAVEN_VERSION" "$RUNNER_TEMP/maven.tgz" <<'PY'
+          import hashlib, json, sys
+          from pathlib import Path
+          expected = json.loads(Path("scripts/maven-sha512.json").read_text())[sys.argv[1]]
+          if hashlib.sha512(Path(sys.argv[2]).read_bytes()).hexdigest() != expected:
+              raise SystemExit("Maven archive SHA512 mismatch")
+          PY
           python -m tarfile -e "$RUNNER_TEMP/maven.tgz" "$RUNNER_TEMP"
           launcher="$RUNNER_TEMP/apache-maven-${MAVEN_VERSION}/bin/mvn"
           if [ "$RUNNER_OS" = Windows ]; then launcher="${launcher}.cmd"; fi
