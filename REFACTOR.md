@@ -7,7 +7,9 @@ The open items come from three places:
 - the living document (`doc/`);
 - the open issues.
 
-The routine's prompt defines `{SLUG}` = `refactor` and `{REGISTER}` = `register/90-refactor.md`. Maintainers edit this file to retune it. `MAX_OPEN` = **3**: the most `arch-refactor/*` PRs this routine keeps open at once.
+The routine's prompt defines `{SLUG}` = `refactor` and `{REGISTER}` = `register/90-refactor.md`. Maintainers edit this file to retune it. There is **no cap on open PRs**: every run that finds an eligible candidate opens a PR, however many `arch-refactor/*` PRs are already open. The file-overlap skip rule below still applies, so parallel PRs never touch the same files.
+
+**Focus.** This routine works on architecture problems: duplicated code and logic, missing or leaky abstractions, layering and module-boundary problems, dead code, and structure that makes hot paths slow (repeated parses, repeated walks, buffering instead of streaming, N×M lookups). Its goal is a codebase that's easier to understand and faster. Pure bug fixes with no structural cause are the fixer's job, and new features are out of scope.
 
 **Scope:** only the socket-patch CLI in this repository: `crates/socket-patch-core`, `crates/socket-patch-cli`, their tests, the wrapper packages (`npm/`, `pypi/`, `gem/`), `docs/` and `CLI_CONTRACT.md`. Never work on depscan or any other repository.
 
@@ -55,7 +57,7 @@ next: <one line: what remains>
 - Never leave `state: in-progress` behind when you exit.
 
 ## How to rank leverage
-Leverage is how much of the backlog one PR retires. Rank every candidate by these four factors.
+Leverage is how much of the backlog one PR retires. Rank every candidate by these five factors.
 
 **B: bugs closed.** The open issues this change fixes. Look at:
 - the issue's Symptoms;
@@ -70,11 +72,13 @@ Count each issue once.
 
 **D: duplication removed.** The number of duplicate implementations it collapses, plus its net deleted production lines divided by 200.
 
+**S: speed.** 0 to 3 for the speed-up on a hot path (scan, apply, lockfile parsing, crawling, hashing): 3 for a structural fix you can measure (a repeated parse or walk removed, streaming instead of buffering, an N×M lookup made linear), 1 for a plausible but unmeasured win, 0 for none. Back any S of 2 or more with before/after timings in the PR body.
+
 **R: risk and size,** for the first slice that can land alone:
 - aim for at most ~800 changed production lines;
 - rate the behavior risk L, M or H.
 
-**Score.** `3·B + 2·U + D`, minus 2 for risk M or 5 for risk H. Break ties by the register's P, then by the review's §3 rank, then by the oldest issue.
+**Score.** `3·B + 2·U + 2·D + S`, minus 2 for risk M or 5 for risk H. Break ties by the register's P, then by the review's §3 rank, then by the oldest issue.
 
 **Skip a candidate when:**
 - it needs an owner decision: it carries `agent:needs-human`, or it depends on an open "Decide:" issue;
@@ -102,7 +106,7 @@ Get the start time with `date -u +%Y-%m-%dT%H:%M:%SZ` and track elapsed time you
    - **A PR closed without merging:** read why, and release its claims (remove `agent:claimed` from its issues and comment why). Record the lesson under Notes. Never retry an approach that a human rejected.
    - **A design question or a block:** if a maintainer asked a design question on your PR, or the burn-down marked it `blocked`, answer the question or rework the PR. That is this run's unit of work.
    - **Anything else on a `ready` PR** (CI, Bugbot, conflicts, review threads) is the burn-down routine's job.
-4. **Check capacity.** If `MAX_OPEN` or more `arch-refactor/*` PRs are open, re-rank (step 5), update the Queue in your register, and stop.
+4. **No capacity check.** There is no cap on open PRs. Go on to step 5 every run.
 5. **Rank.**
    - **Candidates:** every register row whose status isn't `fixed`, `already fixed`, `rejected`, `handed off` or `decision`. Add every open issue labelled `refactor`, or labelled `arch-audit` with kind bug or refactor. For a tracking issue, rank its next unchecked child or slice.
    - Score each candidate with "How to rank leverage", and take the best one that isn't skipped.
