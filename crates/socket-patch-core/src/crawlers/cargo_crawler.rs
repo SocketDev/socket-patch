@@ -3,115 +3,12 @@ use std::path::{Path, PathBuf};
 
 use super::listing::list_dir_sync;
 use super::types::{CrawledPackage, CrawlerOptions};
+use crate::formats::cargo::manifest::package_name_version;
 use crate::patch::path_safety;
 use crate::utils::fs::{is_dir, run_blocking};
 
 #[cfg(test)]
 mod oracle;
-
-// ---------------------------------------------------------------------------
-// Cargo.toml minimal parser
-// ---------------------------------------------------------------------------
-
-/// Parse `name` and `version` from a `Cargo.toml` `[package]` section.
-///
-/// Uses a simple line-based parser — no TOML crate dependency.
-/// Handles `name = "..."` and `version = "..."` within the `[package]` table.
-/// Returns `None` if `version.workspace = true` or fields are missing.
-pub fn parse_cargo_toml_name_version(content: &str) -> Option<(String, String)> {
-    let mut in_package = false;
-    let mut name: Option<String> = None;
-    let mut version: Option<String> = None;
-
-    for line in content.lines() {
-        let trimmed = line.trim();
-
-        // Skip comments and empty lines
-        if trimmed.starts_with('#') || trimmed.is_empty() {
-            continue;
-        }
-
-        // Track table headers. Use `parse_table_header` rather than an
-        // exact `== "[package]"` comparison so a header carrying a
-        // trailing inline comment (`[package] # ...`) or whitespace
-        // inside the brackets (`[ package ]`) is still recognized —
-        // both are valid TOML and a too-strict match would silently
-        // drop the package's name/version.
-        if trimmed.starts_with('[') {
-            if let Some(table) = parse_table_header(trimmed) {
-                if table == "package" {
-                    in_package = true;
-                } else if in_package {
-                    // We left the [package] section (a sibling table or
-                    // a `[package.*]` subtable — bare keys can no longer
-                    // follow per TOML, so stop scanning).
-                    break;
-                }
-            }
-            continue;
-        }
-
-        if !in_package {
-            continue;
-        }
-
-        if let Some(val) = extract_string_value(trimmed, "name") {
-            name = Some(val);
-        } else if let Some(val) = extract_string_value(trimmed, "version") {
-            version = Some(val);
-        } else if trimmed.starts_with("version") && trimmed.contains("workspace") {
-            // version.workspace = true — cannot determine version from this file
-            return None;
-        }
-
-        if name.is_some() && version.is_some() {
-            break;
-        }
-    }
-
-    match (name, version) {
-        (Some(n), Some(v)) if !n.is_empty() && !v.is_empty() => Some((n, v)),
-        _ => None,
-    }
-}
-
-/// Extract the table name from a TOML header line.
-///
-/// `[package]` -> `Some("package")`, `[package] # comment` ->
-/// `Some("package")`, `[ package ]` -> `Some("package")`. Returns
-/// `None` for a line that is not a `[...]` header. Anything after the
-/// closing `]` (typically an inline comment) is ignored.
-fn parse_table_header(line: &str) -> Option<&str> {
-    let rest = line.strip_prefix('[')?;
-    let end = rest.find(']')?;
-    Some(rest[..end].trim())
-}
-
-/// Extract a quoted string value from a `key = "value"` line.
-///
-/// Handles both TOML string flavors that Cargo accepts for `name` /
-/// `version`: basic strings (`"..."`) and literal strings (`'...'`).
-/// A too-strict double-quote-only match would silently drop a crate
-/// whose manifest uses single quotes — and in the vendor layout, where
-/// the directory name carries no version, that crate would become
-/// undiscoverable (and thus unpatchable).
-fn extract_string_value(line: &str, key: &str) -> Option<String> {
-    let rest = line.strip_prefix(key)?;
-    let rest = rest.trim_start();
-    let rest = rest.strip_prefix('=')?;
-    let rest = rest.trim_start();
-    // The value must open with a quote of one kind; the matching close
-    // is the next quote of the *same* kind (literal strings have no
-    // escapes, and basic strings used for name/version never contain an
-    // escaped quote in practice).
-    let quote = match rest.chars().next()? {
-        c @ ('"' | '\'') => c,
-        _ => return None,
-    };
-    let rest = &rest[1..];
-    let end = rest.find(quote)?;
-    Some(rest[..end].to_string())
-}
 
 // ---------------------------------------------------------------------------
 // CargoCrawler
@@ -293,7 +190,7 @@ impl CargoCrawler {
             Err(_) => return false,
         };
 
-        match parse_cargo_toml_name_version(&content) {
+        match package_name_version(&content) {
             Some((n, v)) => n == name && v == version,
             // Fallback: check directory name
             None => path
@@ -403,7 +300,7 @@ fn read_crate_cargo_toml(crate_path: &Path, dir_name: &str) -> Option<(String, S
     let content = crate::utils::fs::read_regular_to_string_sync(&cargo_toml_path).ok()?;
 
     // Fallback: parse directory name as <name>-<version>
-    parse_cargo_toml_name_version(&content)
+    package_name_version(&content)
         .or_else(|| CargoCrawler::parse_dir_name_version(dir_name))
 }
 
@@ -430,96 +327,6 @@ impl Default for CargoCrawler {
 #[cfg(test)]
 mod tests {
     use super::*;
-
-    #[test]
-    fn test_parse_cargo_toml_basic() {
-        let content = r#"
-[package]
-name = "serde"
-version = "1.0.200"
-edition = "2021"
-"#;
-        let (name, version) = parse_cargo_toml_name_version(content).unwrap();
-        assert_eq!(name, "serde");
-        assert_eq!(version, "1.0.200");
-    }
-
-    #[test]
-    fn test_parse_cargo_toml_with_comments() {
-        let content = r#"
-# This is a comment
-[package]
-name = "tokio" # inline comment ignored since we stop at first "
-version = "1.38.0"
-"#;
-        let (name, version) = parse_cargo_toml_name_version(content).unwrap();
-        assert_eq!(name, "tokio");
-        assert_eq!(version, "1.38.0");
-    }
-
-    #[test]
-    fn test_parse_cargo_toml_workspace_version() {
-        let content = r#"
-[package]
-name = "my-crate"
-version.workspace = true
-"#;
-        assert!(parse_cargo_toml_name_version(content).is_none());
-    }
-
-    /// The inline-table spelling `version = { workspace = true }` is the
-    /// equally-valid sibling of the tested `version.workspace = true`.
-    /// `extract_string_value` must bail on the `{` (not a quote), after
-    /// which the `version`+`workspace` short-circuit returns `None` for
-    /// the whole manifest — the version cannot be determined here.
-    #[test]
-    fn test_parse_cargo_toml_inline_table_workspace_version() {
-        let content = "[package]\nname = \"my-crate\"\nversion = { workspace = true }\n";
-        assert!(parse_cargo_toml_name_version(content).is_none());
-    }
-
-    /// A malformed bracket line (`[oops` — no closing `]`) inside
-    /// `[package]` is not a table header: it must be skipped without
-    /// terminating the section, so keys after it are still read.
-    #[test]
-    fn test_parse_cargo_toml_malformed_header_line_skipped() {
-        let content = "[package]\nname = \"a\"\n[oops\nversion = \"1.0\"\n";
-        assert_eq!(
-            parse_cargo_toml_name_version(content),
-            Some(("a".to_string(), "1.0".to_string()))
-        );
-    }
-
-    #[test]
-    fn test_parse_cargo_toml_missing_fields() {
-        let content = r#"
-[package]
-name = "incomplete"
-"#;
-        assert!(parse_cargo_toml_name_version(content).is_none());
-    }
-
-    #[test]
-    fn test_parse_cargo_toml_no_package_section() {
-        let content = r#"
-[dependencies]
-serde = "1.0"
-"#;
-        assert!(parse_cargo_toml_name_version(content).is_none());
-    }
-
-    #[test]
-    fn test_parse_cargo_toml_stops_at_next_section() {
-        let content = r#"
-[package]
-name = "foo"
-
-[dependencies]
-version = "fake"
-"#;
-        // Should not find version since it's under [dependencies]
-        assert!(parse_cargo_toml_name_version(content).is_none());
-    }
 
     #[test]
     fn test_parse_dir_name_version() {
@@ -826,7 +633,7 @@ version = "fake"
 name = "serde"
 version = "1.0.200"
 "#;
-        let (name, version) = parse_cargo_toml_name_version(content).unwrap();
+        let (name, version) = package_name_version(content).unwrap();
         assert_eq!(name, "serde");
         assert_eq!(version, "1.0.200");
     }
@@ -834,7 +641,7 @@ version = "1.0.200"
     #[test]
     fn test_parse_cargo_toml_header_with_inner_spaces() {
         let content = "[ package ]\nname = \"tokio\"\nversion = \"1.38.0\"\n";
-        let (name, version) = parse_cargo_toml_name_version(content).unwrap();
+        let (name, version) = package_name_version(content).unwrap();
         assert_eq!(name, "tokio");
         assert_eq!(version, "1.38.0");
     }
@@ -850,7 +657,7 @@ name = "foo"
 version = "fake"
 "#;
         // `version` lives under the metadata subtable, not [package].
-        assert!(parse_cargo_toml_name_version(content).is_none());
+        assert!(package_name_version(content).is_none());
     }
 
     // --- regression: single-quoted (literal) string values -------------
@@ -861,7 +668,7 @@ version = "fake"
     #[test]
     fn test_parse_cargo_toml_single_quoted_values() {
         let content = "[package]\nname = 'serde'\nversion = '1.0.200'\n";
-        let (name, version) = parse_cargo_toml_name_version(content).unwrap();
+        let (name, version) = package_name_version(content).unwrap();
         assert_eq!(name, "serde");
         assert_eq!(version, "1.0.200");
     }
@@ -870,7 +677,7 @@ version = "fake"
     #[test]
     fn test_parse_cargo_toml_mixed_quote_values() {
         let content = "[package]\nname = 'tokio'\nversion = \"1.38.0\"\n";
-        let (name, version) = parse_cargo_toml_name_version(content).unwrap();
+        let (name, version) = package_name_version(content).unwrap();
         assert_eq!(name, "tokio");
         assert_eq!(version, "1.38.0");
     }
@@ -881,7 +688,7 @@ version = "fake"
     #[test]
     fn test_parse_cargo_toml_single_quoted_with_comment() {
         let content = "[package]\nname = 'serde' # the lib\nversion = '1.0.200'\n";
-        let (name, version) = parse_cargo_toml_name_version(content).unwrap();
+        let (name, version) = package_name_version(content).unwrap();
         assert_eq!(name, "serde");
         assert_eq!(version, "1.0.200");
     }
@@ -891,7 +698,7 @@ version = "fake"
     #[test]
     fn test_parse_cargo_toml_workspace_still_none_after_quote_fix() {
         let content = "[package]\nname = 'my-crate'\nversion.workspace = true\n";
-        assert!(parse_cargo_toml_name_version(content).is_none());
+        assert!(package_name_version(content).is_none());
     }
 
     /// End-to-end: a vendored crate whose `Cargo.toml` uses single-quoted

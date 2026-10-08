@@ -166,7 +166,7 @@ fn parse_pyproject(content: &str) -> Option<String> {
 }
 
 fn parse_cargo_toml(content: &str) -> Option<String> {
-    let (name, version) = scan_toml_section(strip_bom(content), "package")?;
+    let (name, version) = crate::formats::cargo::manifest::package_name_version(content)?;
     Some(format!("pkg:cargo/{name}@{version}"))
 }
 
@@ -358,13 +358,13 @@ async fn single_root_file_with_extension(cwd: &Path, ext: &str) -> Option<String
 /// Minimal line-based TOML scanner for `[<section>]` blocks. Reads
 /// `name = "..."` and `version = "..."` from the named section and
 /// stops at the next `[` header. Robust enough for the well-formed
-/// `pyproject.toml` / `Cargo.toml` files we expect at the top level —
-/// no full TOML parser dependency.
+/// `pyproject.toml` files we expect at the top level — no full TOML
+/// parser dependency. (`Cargo.toml` reads through
+/// [`crate::formats::cargo::manifest`].)
 ///
 /// Returns `None` if either key is missing, both keys appear outside
-/// the section, the value is empty, or the value is `version.workspace
-/// = true` (matches the cargo crawler's behavior of skipping workspace
-/// inheritance).
+/// the section, the value is empty, or the value is not a quoted
+/// string (`version.workspace = true`).
 fn scan_toml_section(content: &str, section: &str) -> Option<(String, String)> {
     let mut in_section = false;
     let mut name: Option<String> = None;
@@ -2059,6 +2059,45 @@ mod tests {
     // the section never opened. Same policy as the package.json /
     // Cargo.toml BOM fix: a file the user's own toolchain accepts must
     // not silently yield no PURL.
+
+    /// #693: VEX product detection, the cargo crawler and `cargo_tag` read
+    /// `Cargo.toml` through one reader, so they agree on every spelling —
+    /// including the rows where the old line scanners drifted (`[project]`,
+    /// dotted keys, inline table, invalid TOML).
+    #[test]
+    fn cargo_manifest_readers_agree() {
+        use crate::formats::cargo::manifest::package_name_version;
+        use crate::vendor::cargo_tag::tag_manifest_text;
+        const UUID: &str = "80630680-4da6-45f9-bba8-b888e0ffd58c";
+        let rows: [(&str, Option<&str>); 8] = [
+            ("[package]\nname = \"old\"\nversion = \"0.1.0\"\n", Some("0.1.0")),
+            ("\u{feff}[package]\nname = \"old\"\nversion = \"0.1.0\"\n", Some("0.1.0")),
+            ("[project]\nname = \"old\"\nversion = \"0.1.0\"\n", Some("0.1.0")),
+            ("package.name = \"old\"\npackage.version = \"0.1.0\"\n", Some("0.1.0")),
+            ("package = { name = \"old\", version = \"0.1.0\" }\n", Some("0.1.0")),
+            ("[package]\nname = \"old\"\nversion.workspace = true\n", None),
+            ("[package] junk\nname = \"old\"\nversion = \"0.1.0\"\n", None),
+            ("[dependencies]\nold = \"0.1.0\"\n", None),
+        ];
+        for (text, version) in rows {
+            let crawler = package_name_version(text);
+            assert_eq!(
+                crawler,
+                version.map(|v| ("old".to_string(), v.to_string())),
+                "crawler: {text:?}"
+            );
+            assert_eq!(
+                parse_cargo_toml(text),
+                version.map(|v| format!("pkg:cargo/old@{v}")),
+                "VEX product: {text:?}"
+            );
+            assert_eq!(
+                tag_manifest_text(text, "0.1.0", UUID).is_ok(),
+                version.is_some(),
+                "cargo_tag: {text:?}"
+            );
+        }
+    }
 
     #[test]
     fn scan_origin_url_tolerates_leading_bom() {

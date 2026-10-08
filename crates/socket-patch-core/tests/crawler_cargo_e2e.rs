@@ -2,7 +2,7 @@
 
 use std::path::Path;
 
-use socket_patch_core::crawlers::cargo_crawler::parse_cargo_toml_name_version;
+use socket_patch_core::formats::cargo::manifest::package_name_version;
 use socket_patch_core::crawlers::types::CrawlerOptions;
 use socket_patch_core::crawlers::CargoCrawler;
 
@@ -41,14 +41,14 @@ async fn stage_vendor_crate(src: &Path, name: &str, version: &str) -> std::path:
     pkg
 }
 
-// ── parse_cargo_toml_name_version ──────────────────────────────
+// ── package_name_version ──────────────────────────────
 
 #[test]
 #[serial_test::parallel]
 fn parse_cargo_toml_well_formed() {
     let toml = "[package]\nname = \"serde\"\nversion = \"1.0.200\"\nedition = \"2021\"\n";
     assert_eq!(
-        parse_cargo_toml_name_version(toml),
+        package_name_version(toml),
         Some(("serde".to_string(), "1.0.200".to_string()))
     );
 }
@@ -57,21 +57,21 @@ fn parse_cargo_toml_well_formed() {
 #[serial_test::parallel]
 fn parse_cargo_toml_missing_name_returns_none() {
     let toml = "[package]\nversion = \"1.0.200\"\n";
-    assert_eq!(parse_cargo_toml_name_version(toml), None);
+    assert_eq!(package_name_version(toml), None);
 }
 
 #[test]
 #[serial_test::parallel]
 fn parse_cargo_toml_missing_version_returns_none() {
     let toml = "[package]\nname = \"serde\"\n";
-    assert_eq!(parse_cargo_toml_name_version(toml), None);
+    assert_eq!(package_name_version(toml), None);
 }
 
 #[test]
 #[serial_test::parallel]
 fn parse_cargo_toml_malformed_returns_none() {
     let toml = "this is not toml at all";
-    assert_eq!(parse_cargo_toml_name_version(toml), None);
+    assert_eq!(package_name_version(toml), None);
 }
 
 /// Parser must stop scanning when it leaves the `[package]` table.
@@ -82,7 +82,7 @@ fn parse_cargo_toml_malformed_returns_none() {
 fn parse_cargo_toml_stops_at_next_section() {
     let toml = "[package]\nname = \"foo\"\nversion = \"1.0.0\"\n\n[dependencies]\nname = \"bar\"\n";
     assert_eq!(
-        parse_cargo_toml_name_version(toml),
+        package_name_version(toml),
         Some(("foo".to_string(), "1.0.0".to_string()))
     );
 }
@@ -95,7 +95,7 @@ fn parse_cargo_toml_ignores_lines_before_package_section() {
     let toml =
         "[profile.release]\nname = \"wrong\"\n\n[package]\nname = \"foo\"\nversion = \"1.0.0\"\n";
     assert_eq!(
-        parse_cargo_toml_name_version(toml),
+        package_name_version(toml),
         Some(("foo".to_string(), "1.0.0".to_string()))
     );
 }
@@ -251,6 +251,34 @@ async fn find_by_purls_vendor_layout_finds_crate() {
     assert_eq!(found.purl, ORG_PURL);
     // Vendor dir name carries no version, so this proves the version was
     // read from the manifest, not invented from the directory name.
+}
+
+/// #693: a vendored crate whose manifest cargo accepts in any spelling
+/// (a BOM, the legacy `[project]` table, dotted keys) is found. The vendor
+/// dir name carries no version, so the old line scanner left these crates
+/// undiscoverable.
+#[tokio::test]
+#[serial_test::parallel]
+async fn find_by_purls_vendor_layout_reads_every_manifest_spelling() {
+    let manifests = [
+        ("bom", "\u{feff}[package]\nname = \"bom\"\nversion = \"1.0.0\"\n"),
+        ("legacy", "[project]\nname = \"legacy\"\nversion = \"1.0.0\"\n"),
+        ("dotted", "package.name = \"dotted\"\npackage.version = \"1.0.0\"\n"),
+    ];
+    let tmp = tempfile::tempdir().unwrap();
+    for (name, text) in manifests {
+        let pkg = tmp.path().join(name);
+        tokio::fs::create_dir_all(&pkg).await.unwrap();
+        tokio::fs::write(pkg.join("Cargo.toml"), text).await.unwrap();
+    }
+    let purls: Vec<String> = manifests
+        .iter()
+        .map(|(name, _)| format!("pkg:cargo/{name}@1.0.0"))
+        .collect();
+    let result = CargoCrawler.find_by_purls(tmp.path(), &purls).await.unwrap();
+    for purl in &purls {
+        assert!(result.contains_key(purl), "{purl} not found: {result:?}");
+    }
 }
 
 #[tokio::test]
@@ -505,13 +533,13 @@ async fn find_by_purls_verify_fallback_via_dir_name() {
 /// `version.workspace = true` in a top-level `[package]` block must
 /// bail: the crawler can't infer the actual version from
 /// just this file. `find_by_purls` then has to fall back to dir-name
-/// parsing — but `parse_cargo_toml_name_version` itself must return
+/// parsing — but `package_name_version` itself must return
 /// None up front.
 #[test]
 #[serial_test::parallel]
 fn parse_cargo_toml_version_workspace_returns_none() {
     let toml = "[package]\nname = \"foo\"\nversion.workspace = true\n";
-    assert_eq!(parse_cargo_toml_name_version(toml), None);
+    assert_eq!(package_name_version(toml), None);
 }
 
 /// `verify_crate_at_path` with a dir-name-only parse (workspace
@@ -669,7 +697,7 @@ async fn crawl_all_skips_top_level_files() {
 }
 
 /// A crate directory with a broken `Cargo.toml` AND a non-conforming
-/// directory name → `parse_cargo_toml_name_version` returns None
+/// directory name → `package_name_version` returns None
 /// (broken toml) AND `parse_dir_name_version` returns None (no `-`
 /// followed by digit), so the chain short-circuits and
 /// the package is silently skipped.
