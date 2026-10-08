@@ -1,15 +1,15 @@
 ### Refactor routine (`refactor`, hourly, highest leverage first)
-_Last updated 2026-10-08T23:20Z · main @ ef48495_
+_Last updated 2026-10-08T23:52Z · main @ 16106b1_
 
 **In flight:**
 - [#1188](https://github.com/SocketDev/socket-patch/pull/1188): one `Pipfile.lock` writer: the hosted span reader moves to `formats::pipenv` (+ `splice_entry`); vendored wire/revert splice instead of re-serializing; Composer's `escape_non_ascii` shared as `formats::json`. Issue #1128 (E14). +303/−235 production (≈170 moved), +154/−32 tests. Only change: untouched entries keep their bytes (`\uXXXX`), BOM locks vendor; `redirect/mod.rs` wrapper `pipenv_reserialized_around_reference` left for when that file is free. `state: ready`.
 - [#1183](https://github.com/SocketDev/socket-patch/pull/1183): project-mode NuGet crawl of a restored project looks up the shared roots for the restore's `libraries` instead of walking them; one `project.assets.json` reader. Issue #427 (E05, #595 NuGet child). +130 production, +220 tests. Only change: unresolved shared-cache packages are no longer crawled. 3,000-package cache: 58 ms → 0.8 ms. `state: ready`.
-- [#1185](https://github.com/SocketDev/socket-patch/pull/1185): every vendored Poetry lock wires through `utils::poetry_lock`; the engine writes 2.x `files` one file per line; deletes the LF line scanner, `toml_surgery::{package_unit_lines, replace_files_array}` and `common::unit_has_canon_name`. Issue #936 (E66). +37/−166 production. Only change: hosted and CRLF-vendored 2.x `files` layout (Poetry's own); `name="…"` / files-less units wire instead of refusing. `state: ready`.
 - [#1126](https://github.com/SocketDev/socket-patch/pull/1126): 7 inline purl-type checks through `Ecosystem::from_purl` + guard. Issue #747 (C20, slice 1). `state: ready`.
 - [#1103](https://github.com/SocketDev/socket-patch/pull/1103): `go.sum` edits through `GoSumEditor` only; deletes the oracle-only free functions and names the key rule once. Issue #631 (E52, slice: steps 2–3; the move to `formats/golang/sum.rs` remains). `state: ready`, handed to the burn-down.
 - Maintainer drafts (decided issues): #1031 (#966), #1036 (#973), #1041 (#648), #1049 (#792). #1027 (#704), #1030 (#808) and #1051 (#580) merged.
 
 **Merged:**
+- [#1185](https://github.com/SocketDev/socket-patch/pull/1185): one Poetry forward splicer (`utils::poetry_lock`); 2.x `files` multi-line in both modes. Issue #936 (E66 fixed). +37/−166 production.
 - [#1108](https://github.com/SocketDev/socket-patch/pull/1108): 7 inserted-line sites through `utils::line_endings::terminator`. Issue #815 (E16 slice 1).
 - [#1163](https://github.com/SocketDev/socket-patch/pull/1163): manifest hashes load lowercase. Issue #707 (C41 partly fixed; `blob_hash_matches` remains).
 - [#1160](https://github.com/SocketDev/socket-patch/pull/1160): 11 more files onto `formats::text`; `PENDING_INLINE_BOMS` 15. Issue #905 (E64 slice 2).
