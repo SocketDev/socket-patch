@@ -156,7 +156,9 @@ fn good_files() -> serde_json::Value {
     serde_json::json!({
         "package/index.js": {
             "beforeHash": "0".repeat(64),
-            "afterHash": "1".repeat(64),
+            // The real git-sha256 of the content: inline blobs are
+            // verified against their name before they are stored (#726).
+            "afterHash": git_hash(b"patched\n"),
             "blobContent": "cGF0Y2hlZAo=", // base64("patched\n")
         }
     })

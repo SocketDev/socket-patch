@@ -260,6 +260,22 @@ active Yarn pnpm install (a `yarn.lock`, and `nodeLinker: pnpm` with
 git; never `workspace:`, `portal:` or `link:`), and only when that store
 does not contain the project.
 
+The same rule covers every ecosystem, as a containment check rather than a
+list of known stores: agent-mode `apply` and `rollback` refuse, dry run
+included, any directory they would write into that resolves outside the
+install tree it was found in. Each directory a patch writes into must
+resolve inside the package directory (a `flit install --symlink` package
+linked from `site-packages` into its source is refused), and a Composer
+package must resolve inside its vendor dir: a Composer path repository
+symlinks `vendor/<ns>/<name>` to your own source by default, and that
+source is patched directly, or installed as a copy with the repository's
+`symlink` option set to `false`. A package that a package manager links into
+`site-packages` from its own prefix (Homebrew links formula Python packages
+in from the Cellar, Nix from the store) resolves outside the install tree
+too and is refused the same way; install it into a virtualenv to patch it.
+`rollback` refuses the same directories: a file an older socket-patch
+patched in place there is restored from that source's version control.
+
 Every command that looks for installed npm copies walks these same trees, not
 only `scan`. A package installed only under a pruned directory is therefore
 "not installed" to `scan --prune` / `--sync`, which garbage-collect its
