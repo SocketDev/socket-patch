@@ -852,9 +852,10 @@ async fn keep_bundler_loaded_gem_files(
     };
     // A spelling bundler sees (`File.file?`) even when this run couldn't
     // read it: a symlink, an unreadable or a non-UTF-8 file still makes the
-    // project a twin, as lock inventory already counts it.
+    // project a twin, as lock inventory (`view.is_file`) already counts it.
     let present = |rel: &str| {
         out.files.contains_key(rel)
+            || view.is_file(rel)
             || out.symlinked_reads.iter().any(|r| r == rel)
             || out.unreadable_reads.iter().any(|r| r == rel)
             || out.undecodable_reads.iter().any(|r| r == rel)
@@ -3205,6 +3206,10 @@ mod tests {
         PLATFORMS\n  ruby\n\nDEPENDENCIES\n  rails (= 7.0.0)\n\nBUNDLED WITH\n   2.5.22\n";
 
     async fn gem_rewrite(p: &MemoryProject) -> (CandidateFiles, Rewritten) {
+        gem_rewrite_in(&ProjectView::Memory(p)).await
+    }
+
+    async fn gem_rewrite_in(view: &ProjectView<'_>) -> (CandidateFiles, Rewritten) {
         let outer = OuterAllowRemote::default;
         let options = RewriteOptions {
             dry_run: false,
@@ -3218,10 +3223,9 @@ mod tests {
             blocking: false,
         };
         let candidates = vec![gem_candidate()];
-        let view = ProjectView::Memory(p);
-        let read = read_candidate_files(&view, &BTreeSet::new(), &candidates).await;
+        let read = read_candidate_files(view, &BTreeSet::new(), &candidates).await;
         let done = rewrite(
-            &view,
+            view,
             read.clone(),
             &candidates,
             BTreeMap::new(),
@@ -3400,6 +3404,43 @@ mod tests {
                 "{other}: {codes:?}"
             );
         }
+    }
+
+    /// On disk, a twin spelling that `stat`s as a regular file but can't
+    /// be read (permission denied) is still a twin: bundler's `File.file?`
+    /// sees it, so neither pair is wired (Bugbot on #768).
+    #[cfg(unix)]
+    #[tokio::test]
+    async fn twin_with_an_unreadable_disk_spelling_redirects_nothing() {
+        use std::os::unix::fs::PermissionsExt;
+        let tmp = tempfile::tempdir().unwrap();
+        let root = tmp.path();
+        for (rel, text) in [
+            ("Gemfile", GEMFILE),
+            ("Gemfile.lock", GEM_LOCK),
+            ("gems.rb", GEMFILE),
+            ("gems.locked", GEM_LOCK),
+        ] {
+            std::fs::write(root.join(rel), text).unwrap();
+        }
+        let gems_rb = root.join("gems.rb");
+        std::fs::set_permissions(&gems_rb, std::fs::Permissions::from_mode(0o000)).unwrap();
+        if std::fs::read(&gems_rb).is_ok() {
+            // Running as root: permissions can't make the read fail.
+            return;
+        }
+        let (_read, done) = gem_rewrite_in(&ProjectView::Disk(root)).await;
+        std::fs::set_permissions(&gems_rb, std::fs::Permissions::from_mode(0o644)).unwrap();
+        assert!(
+            done.rewrite.files.is_empty(),
+            "{:?}",
+            done.rewrite.files.keys()
+        );
+        let codes = warning_codes(&done);
+        assert!(
+            codes.contains(&"redirect_gem_twin_manifest_ambiguous"),
+            "{codes:?}"
+        );
     }
 
     /// #681: `bundle config set --local mirror.all <url>` sends the
