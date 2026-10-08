@@ -619,6 +619,43 @@ async fn pipenv_revendors_to_a_superseding_patch() {
     }
 }
 
+/// #1136: a Poetry project whose venv was installed from patch A's
+/// vendored wheel (`poetry install` after the first vendor) still moves to
+/// the superseding patch B: poetry.lock is rewired to B and A's artifact is
+/// swept, instead of `pypi_poetry_source_already_exists` (exit 1).
+#[tokio::test]
+async fn poetry_revendors_to_a_superseding_patch_over_a_patched_venv() {
+    let (_tmp, root) = project();
+    let files = stage_poetry(&root);
+    let original = std::fs::read_to_string(root.join("poetry.lock")).unwrap();
+    vendor_project(&root, files);
+
+    let venv = root.join("../patched-venv");
+    venv_installed_from_patch_a(&venv);
+    let extra = [("VIRTUAL_ENV", venv.to_str().unwrap())];
+    stage_manifest_with(&root, UUID_B, PATCHED_B);
+    let (code, env) = run_cli(&root, &["vendor"], &extra);
+    assert_eq!(code, 0, "re-vendor to B: {env:#}");
+    assert!(
+        env.to_string().contains("vendor_stale_artifact_removed"),
+        "A's artifact is swept: {env:#}"
+    );
+    let lock = std::fs::read_to_string(root.join("poetry.lock")).unwrap();
+    assert!(
+        lock.contains(&format!(".socket/vendor/pypi/{UUID_B}/")) && !lock.contains(UUID),
+        "poetry.lock is rewired to B:\n{lock}"
+    );
+    assert!(!root.join(format!(".socket/vendor/pypi/{UUID}")).exists());
+
+    let (code, env) = run_cli(&root, &["vendor", "--revert"], &extra);
+    assert_eq!(code, 0, "revert B: {env:#}");
+    assert_eq!(
+        std::fs::read_to_string(root.join("poetry.lock")).unwrap(),
+        original,
+        "revert restores the registry lock"
+    );
+}
+
 const UV_LOCK: &str = r#"version = 1
 revision = 2
 requires-python = ">=3.9"
