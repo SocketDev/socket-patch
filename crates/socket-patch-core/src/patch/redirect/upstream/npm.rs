@@ -828,6 +828,9 @@ struct PnpmTarballPolicy {
     workspace: Option<String>,
     npmrc: Option<String>,
     major: Option<u32>,
+    /// The `dir/` prefix those settings were read from
+    /// ([`pnpm_settings_prefix`]), for the guess warning.
+    settings_prefix: String,
 }
 
 impl PnpmTarballPolicy {
@@ -1188,6 +1191,45 @@ async fn read_sibling(view: &mut View<'_>, dir_prefix: &str, name: &str) -> Opti
         .flatten()
 }
 
+/// The directory (as a `dir/` prefix, `""` for the project root) whose
+/// pnpm-workspace.yaml, `.npmrc` and `package.json` pnpm reads for the lock
+/// `rel`: the lock's own directory, except for a workspace member lock
+/// (`sharedWorkspaceLockfile: false`). pnpm reads a member's settings only
+/// from its workspace root: the nearest ancestor with a
+/// pnpm-workspace.yaml whose `packages:` lists the member's directory
+/// ([`lists_as_member`]), when the member has no such file of its own. A
+/// Rush lock keeps its own directory (see [`rush_lock_root`]).
+///
+/// [`lists_as_member`]: crate::utils::pnpm_workspace::lists_as_member
+async fn pnpm_settings_prefix(view: &mut View<'_>, rel: &str) -> String {
+    let Some((dir, _)) = rel.rsplit_once('/') else {
+        return String::new();
+    };
+    let own = format!("{dir}/");
+    if rush_lock_root(rel).is_some()
+        || read_sibling(view, &own, "pnpm-workspace.yaml")
+            .await
+            .is_some()
+    {
+        return own;
+    }
+    let parts: Vec<&str> = dir.split('/').collect();
+    for depth in (0..parts.len()).rev() {
+        let prefix: String = parts[..depth].iter().map(|p| format!("{p}/")).collect();
+        let Some(yaml) = read_sibling(view, &prefix, "pnpm-workspace.yaml").await else {
+            continue;
+        };
+        let member: Vec<String> = parts[depth..].iter().map(|p| p.to_string()).collect();
+        // pnpm stops at the nearest workspace file.
+        return if crate::utils::pnpm_workspace::lists_as_member(&yaml, &member) {
+            prefix
+        } else {
+            own
+        };
+    }
+    own
+}
+
 /// The `upstream_pnpm_tarball_setting_guessed` detail (#902): nothing
 /// showed which pnpm wrote the lock `rel`, so the restore read
 /// `lockfileIncludeTarballUrl` as pnpm 10 does (`guess`) for the derivable
@@ -1196,14 +1238,11 @@ async fn read_sibling(view: &mut View<'_>, dir_prefix: &str, name: &str) -> Opti
 /// run and every caller (rollback, remove, a vendor takeover or eject).
 fn pnpm_tarball_guess_warning(
     rel: &str,
+    dir_prefix: &str,
     guess: PnpmTarballGuess,
     rush: bool,
     entries: &[&str],
 ) -> String {
-    let dir_prefix = match rel.rsplit_once('/') {
-        Some((dir, _)) => format!("{dir}/"),
-        None => String::new(),
-    };
     let workspace = format!("{dir_prefix}pnpm-workspace.yaml");
     let npmrc = format!("{dir_prefix}.npmrc");
     let ws_value = |value: Option<bool>| match value {
@@ -1278,7 +1317,8 @@ async fn pnpm_tarball_policy(
     text: &str,
     ctx: &Ctx<'_>,
 ) -> PnpmTarballPolicy {
-    let dir_prefix = match rel.rsplit_once('/') {
+    let dir_prefix = pnpm_settings_prefix(view, rel).await;
+    let lock_prefix = match rel.rsplit_once('/') {
         Some((dir, _)) => format!("{dir}/"),
         None => String::new(),
     };
@@ -1295,12 +1335,19 @@ async fn pnpm_tarball_policy(
     let pm_major = if let Some(rush_json) = rush_json.as_deref() {
         rush_json_pnpm_major(rush_json)
     } else {
-        // What installed the project, else what it pins.
-        match read_sibling(view, &dir_prefix, "node_modules/.modules.yaml")
-            .await
-            .as_deref()
-            .and_then(modules_yaml_pnpm_major)
-        {
+        // What installed the project (the workspace root's install
+        // record, else the member's own), else what it pins.
+        let mut installed = None;
+        for prefix in [&dir_prefix, &lock_prefix] {
+            installed = read_sibling(view, prefix, "node_modules/.modules.yaml")
+                .await
+                .as_deref()
+                .and_then(modules_yaml_pnpm_major);
+            if installed.is_some() || dir_prefix == lock_prefix {
+                break;
+            }
+        }
+        match installed {
             Some(major) => Some(major),
             None => read_sibling(view, &dir_prefix, "package.json")
                 .await
@@ -1322,6 +1369,7 @@ async fn pnpm_tarball_policy(
         workspace,
         npmrc,
         major: pnpm_settings_major(text, pm_major),
+        settings_prefix: dir_prefix,
     }
 }
 
@@ -1432,7 +1480,13 @@ pub(crate) async fn restore_pnpm_locks(
         if let Some(guess) = policy.guess.filter(|_| !guessed.is_empty()) {
             result.warnings.push((
                 "upstream_pnpm_tarball_setting_guessed",
-                pnpm_tarball_guess_warning(rel, guess, policy.rush, &guessed),
+                pnpm_tarball_guess_warning(
+                    rel,
+                    &policy.settings_prefix,
+                    guess,
+                    policy.rush,
+                    &guessed,
+                ),
             ));
         }
         let mut out = String::with_capacity(text.len());
@@ -1722,7 +1776,7 @@ mod tests {
             workspace: None,
             npmrc: Some(true),
         };
-        let detail = pnpm_tarball_guess_warning(rel, npmrc_only, false, &["a@1.0.0"]);
+        let detail = pnpm_tarball_guess_warning(rel, "apps/web/", npmrc_only, false, &["a@1.0.0"]);
         for needle in [
             "apps/web/pnpm-lock.yaml: nothing shows which pnpm wrote this lock",
             "no unpinned registry entry that shows the setting",
@@ -1746,7 +1800,7 @@ mod tests {
             npmrc: Some(true),
         };
         let detail =
-            pnpm_tarball_guess_warning("pnpm-lock.yaml", workspace_off, false, &["a@1.0.0"]);
+            pnpm_tarball_guess_warning("pnpm-lock.yaml", "", workspace_off, false, &["a@1.0.0"]);
         for needle in [
             "from `lockfileIncludeTarballUrl: false` in pnpm-workspace.yaml",
             "restores a@1.0.0 without `tarball:`",
@@ -1759,6 +1813,7 @@ mod tests {
         // A Rush lock: the pin is rush.json's, at the Rush root.
         let detail = pnpm_tarball_guess_warning(
             "repo/common/config/rush/pnpm-lock.yaml",
+            "repo/common/config/rush/",
             npmrc_only,
             true,
             &["a@1.0.0"],

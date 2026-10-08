@@ -2106,6 +2106,62 @@ async fn hosted_scan_pins_every_member_lock_with_shared_workspace_lockfile_false
     }
 }
 
+/// Bugbot on #1007: pnpm reads `lockfileIncludeTarballUrl` (and the
+/// registry) for a member lock (`sharedWorkspaceLockfile: false`) from the
+/// workspace root's pnpm-workspace.yaml and `.npmrc`, never from the
+/// member's directory. Rollback used to look beside the member lock, found
+/// no settings there, and restored the entry without the `tarball:` pnpm
+/// wrote.
+#[tokio::test]
+#[serial]
+async fn rollback_reads_member_lock_settings_from_the_workspace_root() {
+    let server = MockServer::start().await;
+    mock_discovery(&server).await;
+    mock_reference(&server).await;
+    mock_view(&server).await;
+    let registry = format!("{}/npm-registry", server.uri());
+    let tmp = tempfile::tempdir().unwrap();
+    let root = tmp.path();
+    write_member_lock_workspace(
+        root,
+        "packages:\n  - 'packages/*'\nsharedWorkspaceLockfile: false\n\
+         lockfileIncludeTarballUrl: true\n",
+        "shared-workspace-lockfile=false\nlockfile-include-tarball-url=true\n",
+        Some("lockfileVersion: '9.0'\n\nimporters:\n\n  .: {}\n"),
+        |dep, version| {
+            v9_member_lock(dep, version)
+                .replace(
+                    &format!("integrity: {UPSTREAM_SHA512}}}"),
+                    &format!(
+                        "integrity: {UPSTREAM_SHA512}, \
+                         tarball: {registry}/{NAME}/-/{NAME}-{VERSION}.tgz}}"
+                    ),
+                )
+                .replace(
+                    "integrity: sha512-DEPb==}",
+                    &format!(
+                        "integrity: sha512-DEPb==, tarball: {registry}/dep-b/-/dep-b-1.0.0.tgz}}"
+                    ),
+                )
+        },
+    );
+    let lock = root.join("packages/a/pnpm-lock.yaml");
+    let pristine = std::fs::read_to_string(&lock).unwrap();
+    assert!(pristine.contains("tarball: "), "{pristine}");
+
+    let (code, doc) = run_hosted_json(root, &server.uri());
+    assert_eq!(code, Some(0), "{doc}");
+    assert!(
+        std::fs::read_to_string(&lock)
+            .unwrap()
+            .contains(&format!("tarball: {HOSTED_URL}")),
+        "{doc}"
+    );
+    let code = rollback_hosted(root, &server).await;
+    assert_eq!(code, 0, "rollback must restore the member pins");
+    assert_eq!(std::fs::read_to_string(&lock).unwrap(), pristine);
+}
+
 /// #492 on pnpm 7: `shared-workspace-lockfile=false` in `.npmrc` writes no
 /// root lock at all, only lockfile 5.4 member locks. The run used to warn
 /// `redirect_pnpm_no_lockfile` ("run `pnpm install`", which never writes a
