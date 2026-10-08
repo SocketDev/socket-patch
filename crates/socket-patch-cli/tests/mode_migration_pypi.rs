@@ -1547,3 +1547,54 @@ async fn platform_wheel_takeover_is_refused_before_revert() {
         .await;
     }
 }
+
+/// #612: a Pipenv project with a `requirements.txt` exported beside its
+/// lock (`pipenv requirements`). Hosted mode pins both; the hosted →
+/// vendored takeover (`vendor` over the hosted project) wires only the
+/// governing `Pipfile.lock` and restores the requirements pin to upstream,
+/// so the run must name `requirements.txt` among the install sources left
+/// UNPATCHED instead of passing in silence.
+#[tokio::test]
+async fn pipenv_hosted_to_vendored_names_the_unpatched_requirements() {
+    let (_tmp, root) = project();
+    stage_pipenv(&root);
+    std::fs::write(
+        root.join("requirements.txt"),
+        "-i https://pypi.org/simple\nsix==1.16.0\n",
+    )
+    .unwrap();
+    let server = MockServer::start().await;
+    let hosted_url = mount_hosted_api(&server, true).await;
+    let (code, env) = hosted_scan(&root, &server);
+    assert_eq!(code, 0, "hosted scan: {env:#}");
+    let hosted_reqs = std::fs::read_to_string(root.join("requirements.txt")).unwrap();
+    assert!(
+        hosted_reqs.contains(&hosted_url),
+        "hosted mode pins requirements.txt too:\n{hosted_reqs}\n{env:#}"
+    );
+
+    stage_manifest(&root);
+    // The takeover recognizes the pin only under `--patch-server-url`,
+    // which also rehosts the prebuilt download: serve the vendored wheel
+    // from the same mock.
+    prebuilt_common::mount_project(&server, &root).await;
+    let uri = server.uri();
+    let (code, env) = run_cli(
+        &root,
+        &["vendor", "--patch-server-url", &uri, "--vendor-url", &uri],
+        &[],
+    );
+    assert_eq!(code, 0, "vendor takeover: {env:#}");
+    let lock = std::fs::read_to_string(root.join("Pipfile.lock")).unwrap();
+    assert!(
+        lock.contains(&format!(".socket/vendor/pypi/{UUID}/")),
+        "Pipfile.lock is wired to the vendored wheel:\n{lock}\n{env:#}"
+    );
+    let rendered = env.to_string();
+    assert!(
+        rendered.contains("\"pypi_multiple_lockfiles\"")
+            && rendered.contains("wiring `Pipfile.lock`")
+            && rendered.contains("requirements.txt will still install the UNPATCHED"),
+        "the takeover names requirements.txt as an unpatched install source: {env:#}"
+    );
+}

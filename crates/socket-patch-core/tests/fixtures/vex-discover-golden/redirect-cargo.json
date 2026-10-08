@@ -417,11 +417,6 @@
     "diagnostics": [],
     "recognized": [
       {
-        "uuid": "00000000-0000-0000-0000-000000000000",
-        "mode": "hosted",
-        "file": ".cargo/config.toml"
-      },
-      {
         "uuid": "11111111-1111-1111-1111-111111111111",
         "mode": "hosted",
         "file": ".cargo/config.toml"

@@ -32,6 +32,7 @@ use crate::patch::redirect::npmrc::{
     NPMRC_REL,
 };
 use crate::patch::redirect::presence::groups_present;
+use crate::patch::redirect::yarnrc::OuterYarnMirror;
 use crate::patch::redirect::{
     artifact_url_spellings, rewrite_registry_redirect_withholding_vlt, DepOverride, FileEdit,
     RewriteResult, RewriteWarning,
@@ -984,6 +985,10 @@ pub struct RewriteOptions<'a> {
     /// The npm config layers outside the project `.npmrc`, resolved only
     /// when an npm lock carries a hosted URL.
     pub npm_outer: &'a (dyn Fn() -> OuterAllowRemote + Send + Sync),
+    /// The yarn 1 config layers outside the project's `.yarnrc` / `.npmrc`,
+    /// resolved only beside a classic `yarn.lock` (its offline-mirror
+    /// refusal).
+    pub yarn_classic_outer: &'a (dyn Fn() -> OuterYarnMirror + Send + Sync),
     /// Run the rewriters on the blocking pool (the disk flow: pure CPU over
     /// every lock text).
     pub blocking: bool,
@@ -1179,6 +1184,17 @@ pub async fn rewrite(
         .cloned()
         .collect();
     let pipenv_major = options.pipenv_major;
+    // The yarn config outside the project decides the classic rewriter's
+    // offline-mirror refusal too: resolved only beside a classic lock.
+    let yarn_outer = if rewrite_overrides.iter().any(|o| o.ecosystem == "npm")
+        && files
+            .get("yarn.lock")
+            .is_some_and(|lock| !crate::patch::redirect::is_berry_lock(lock))
+    {
+        (options.yarn_classic_outer)()
+    } else {
+        OuterYarnMirror::default()
+    };
     let (files, mut rewrite) = if options.blocking {
         // Pure CPU over every lock text (the independent rewriter groups
         // run concurrently inside), so it runs on the blocking pool rather
@@ -1193,6 +1209,7 @@ pub async fn rewrite(
                 bun_lockb,
                 &withheld,
                 &gradle_unreadable,
+                &yarn_outer,
             );
             (files, rewrite)
         })
@@ -1210,6 +1227,7 @@ pub async fn rewrite(
             bun_lockb,
             withheld_from_vlt,
             &gradle_unreadable,
+            &yarn_outer,
         );
         (files, rewrite)
     };
@@ -2177,6 +2195,7 @@ mod tests {
             trust_lockfile_config: true,
             npm_allow_remote_config: true,
             npm_outer: &outer,
+            yarn_classic_outer: &OuterYarnMirror::default,
             blocking: false,
         };
         let mut skipped = Vec::new();
@@ -2537,6 +2556,7 @@ mod tests {
             trust_lockfile_config: true,
             npm_allow_remote_config: true,
             npm_outer: &outer,
+            yarn_classic_outer: &OuterYarnMirror::default,
             blocking: false,
         };
         let candidates = vec![left_pad_candidate()];
@@ -2656,6 +2676,7 @@ mod tests {
                 trust_lockfile_config: true,
                 npm_allow_remote_config: true,
                 npm_outer: &outer,
+                yarn_classic_outer: &OuterYarnMirror::default,
                 blocking: false,
             };
             let read = read_candidate_files(&view, &BTreeSet::new(), &candidates).await;
@@ -2830,6 +2851,7 @@ mod tests {
             trust_lockfile_config: true,
             npm_allow_remote_config: true,
             npm_outer: &outer,
+            yarn_classic_outer: &OuterYarnMirror::default,
             blocking: false,
         };
         let candidates = vec![gradle_candidate()];
@@ -3136,6 +3158,7 @@ mod tests {
             trust_lockfile_config: true,
             npm_allow_remote_config: true,
             npm_outer: &outer,
+            yarn_classic_outer: &OuterYarnMirror::default,
             blocking: false,
         };
         let candidates = vec![gem_candidate()];

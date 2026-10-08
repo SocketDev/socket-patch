@@ -108,21 +108,8 @@ pub(crate) fn resolve_rel(floor: &str, base: &str, p: &str) -> Option<String> {
     {
         return None;
     }
-    let mut parts: Vec<&str> = base.split('/').filter(|s| !s.is_empty()).collect();
     let floor_len = floor.split('/').filter(|s| !s.is_empty()).count();
-    for seg in p.split('/') {
-        match seg {
-            "" | "." => {}
-            ".." => {
-                if parts.len() <= floor_len {
-                    return None;
-                }
-                parts.pop();
-            }
-            s => parts.push(s),
-        }
-    }
-    Some(parts.join("/"))
+    crate::utils::relpath::resolve_rel(base, p, floor_len)
 }
 
 /// 1-based line number of byte offset `at` in `text`.
