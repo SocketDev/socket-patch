@@ -305,3 +305,40 @@ fn check_judges_a_qualified_gem_on_its_own_copy() {
         "{stdout}"
     );
 }
+
+/// A `.bundle/config` `BUNDLE_PATH` the containment guard refuses (it
+/// resolves outside the project) is still where Bundler loads gems from.
+/// A patched decoy copy under the in-project `vendor/bundle` store must
+/// not hide the unpatched copy in that refused root: `--check` is drift.
+#[test]
+fn check_fails_on_an_unpatched_copy_in_a_refused_bundle_path() {
+    let tmp = gem_project(GEM_PATCHED);
+    let outside = tempfile::tempdir().unwrap();
+    let loaded = outside
+        .path()
+        .join("ruby/3.4.0/gems/nokogiri-1.16.5/lib/nokogiri.rb");
+    std::fs::create_dir_all(loaded.parent().unwrap()).unwrap();
+    std::fs::write(&loaded, GEM_ORIGINAL).unwrap();
+    std::fs::create_dir_all(outside.path().join("ruby/3.4.0/specifications")).unwrap();
+    std::fs::create_dir_all(tmp.path().join(".bundle")).unwrap();
+    std::fs::write(
+        tmp.path().join(".bundle/config"),
+        format!(
+            "---\nBUNDLE_PATH: {}\n",
+            serde_json::to_string(&outside.path().to_string_lossy()).unwrap()
+        ),
+    )
+    .unwrap();
+
+    let (code, stdout, stderr) = run_check(tmp.path(), &["--json", "--ecosystems", "gem"]);
+    assert_eq!(code, 1, "stdout={stdout}\nstderr={stderr}");
+    let env = parse_json_envelope(stdout.trim());
+    assert!(
+        events(&env).iter().any(|e| e["action"] == "failed"
+            && e["purl"] == GEM_LINUX
+            && e["errorCode"] == "not_applied"),
+        "{env}"
+    );
+    // The refused root is only read: the loaded copy stays unpatched.
+    assert_eq!(std::fs::read(&loaded).unwrap(), GEM_ORIGINAL);
+}

@@ -680,7 +680,8 @@ async fn run_check(args: &ApplyArgs, manifest_path: &Path) -> i32 {
 /// * Gem: once a bundle-store copy exists, `gem env` fallback-home copies
 ///   (rvm `@global`, system gem dirs) are dropped — `apply` treats them as
 ///   best-effort once the store copy is patched, and an unpatched store
-///   copy is drift on its own.
+///   copy is drift on its own. Copies under a containment-refused
+///   `.bundle/config` `BUNDLE_PATH` root are kept: Bundler loads them.
 async fn verify_installed_tree(
     common: &GlobalArgs,
     tree: &PatchManifest,
@@ -695,17 +696,16 @@ async fn verify_installed_tree(
     let mut copies = crate::commands::vex::vex_copy_sets(common, tree, &found).await;
 
     // Gem copy classes, decided exactly as `apply` decides them.
-    let gem_stores: Vec<PathBuf> = if !common.global
+    let (gem_stores, refused_root): (Vec<PathBuf>, Option<PathBuf>) = if !common.global
         && common.global_prefix.is_none()
         && purls
             .iter()
             .any(|p| Ecosystem::from_purl(p) == Some(Ecosystem::Gem))
     {
-        RubyCrawler::discover_bundle_stores(&common.cwd)
-            .await
-            .stores
+        let discovery = RubyCrawler::discover_bundle_stores(&common.cwd).await;
+        (discovery.stores, discovery.skipped_config_root)
     } else {
-        Vec::new()
+        (Vec::new(), None)
     };
     if !gem_stores.is_empty() {
         for (purl, paths) in copies.iter_mut() {
@@ -713,8 +713,13 @@ async fn verify_installed_tree(
                 continue;
             }
             let in_store = |p: &PathBuf| gem_stores.iter().any(|s| p.starts_with(s));
+            // Only `gem env` fallback homes are dropped: a copy under the
+            // containment-refused `.bundle/config` root is the one Bundler
+            // loads, so it stays verified even when a store copy matches.
+            let in_refused_root =
+                |p: &PathBuf| refused_root.as_ref().is_some_and(|r| p.starts_with(r));
             if paths.iter().any(in_store) {
-                paths.retain(in_store);
+                paths.retain(|p| in_store(p) || in_refused_root(p));
             }
         }
     }
