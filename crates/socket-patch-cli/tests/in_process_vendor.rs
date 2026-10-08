@@ -852,6 +852,66 @@ async fn superseding_patch_without_a_served_artifact_keeps_the_vendored_one() {
     }
 }
 
+/// The #954 skip keeps only an older vendoring that is still wired: once a
+/// relock dropped its `file:.socket/vendor/...` reference the package is
+/// patched in neither mode, so the unserved upgrade still fails (the
+/// `vendor --check` liveness verdict) instead of claiming the old patch.
+#[tokio::test]
+async fn superseding_patch_without_a_served_artifact_fails_when_the_old_one_is_unwired() {
+    use wiremock::matchers::{method, path_regex};
+    use wiremock::{Mock, MockServer, ResponseTemplate};
+    const UUID2: &str = "0a1b2c3d-4e5f-6a7b-8c9d-0e1f2a3b4c5d";
+    let fx = npm_fixture();
+    assert_eq!(vendor_run(vendor_args(fx.root())).await, 0);
+    // A relock: the lock no longer references the vendored artifact.
+    std::fs::write(fx.lock_path(), &fx.original_lock).unwrap();
+
+    let mut manifest: Value =
+        serde_json::from_slice(&std::fs::read(fx.manifest_path()).unwrap()).unwrap();
+    manifest["patches"][PURL]["uuid"] = json!(UUID2);
+    std::fs::write(
+        fx.manifest_path(),
+        serde_json::to_vec_pretty(&manifest).unwrap(),
+    )
+    .unwrap();
+
+    let server = MockServer::start().await;
+    Mock::given(method("POST"))
+        .and(path_regex(r"/(patch|patches)/package$"))
+        .respond_with(
+            ResponseTemplate::new(200)
+                .set_body_json(json!({ "results": { UUID2: { "status": "pending_build" } } })),
+        )
+        .mount(&server)
+        .await;
+    let uri = server.uri();
+    let (code, env) = vendor_cli(
+        fx.root(),
+        &[
+            "--api-url",
+            &uri,
+            "--vendor-url",
+            &uri,
+            "--api-token",
+            "sktsec_placeholder_value_for_tests_api",
+            "--org",
+            "acme",
+            "--lock-timeout",
+            "5",
+        ],
+    );
+    assert_eq!(code, 1, "an unwired older patch is not kept: {env:#}");
+    let failed = find_event(&env, "failed", None);
+    assert_eq!(failed["purl"], PURL);
+    assert!(failed.to_string().contains("still building"), "{failed}");
+    assert!(
+        events(&env)
+            .iter()
+            .all(|e| e["errorCode"] != "vendor_prebuilt_pending"),
+        "no unserved marker leaks out of a real failure: {env:#}"
+    );
+}
+
 /// The #954 skip is only for a package vendored at ANOTHER patch: a first
 /// vendor whose artifact is still building has nothing to keep and fails.
 #[tokio::test]

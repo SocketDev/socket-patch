@@ -124,13 +124,20 @@ fn refusal_is_benign(code: &str) -> bool {
 /// older vendoring is still in force: like hosted mode, which keeps its pin
 /// and skips the upgrade, the package is a benign skip under the unserved
 /// code instead of a failure that would fail every re-run until the server
-/// builds the artifact. Any other outcome passes through, a failure minus
-/// the unserved marker (its error already says it).
-fn keep_older_vendored_patch(
+/// builds the artifact. Only an older vendoring whose wiring is still live
+/// (the [`Discovery::vendor_entry_live`] verdict `vendor --check` and `vex`
+/// use) is in force: once a relock dropped its `.socket/vendor/` reference
+/// the package is patched in neither mode, so the unserved upgrade stays a
+/// failure. Any other outcome passes through, a failure minus the unserved
+/// marker (its error already says it).
+///
+/// [`Discovery::vendor_entry_live`]: socket_patch_core::vex::discover::Discovery::vendor_entry_live
+async fn keep_older_vendored_patch(
     outcome: Option<VendorOutcome>,
     state: &VendorState,
     purl: &str,
     uuid: &str,
+    common: &GlobalArgs,
 ) -> Option<VendorOutcome> {
     let Some(VendorOutcome::Done {
         result,
@@ -149,6 +156,18 @@ fn keep_older_vendored_patch(
         }) {
             let unserved = warnings.remove(i);
             if let Some(kept) = lookup_entry(&state.entries, purl).filter(|e| e.uuid != uuid) {
+                let root = common.project_root();
+                if !crate::commands::discover_wiring(common, &root)
+                    .await
+                    .vendor_entry_live(&root, kept)
+                    .await
+                {
+                    return Some(VendorOutcome::Done {
+                        result,
+                        entry,
+                        warnings,
+                    });
+                }
                 return Some(VendorOutcome::Refused {
                     code: unserved.code,
                     detail: format!(
@@ -3376,7 +3395,8 @@ pub(crate) async fn vendor_records_reusing(
                 }
             }
 
-            let outcome = keep_older_vendored_patch(outcome, &state, candidate, &record.uuid);
+            let outcome =
+                keep_older_vendored_patch(outcome, &state, candidate, &record.uuid, common).await;
             match outcome {
                 None => {
                     env.record(
