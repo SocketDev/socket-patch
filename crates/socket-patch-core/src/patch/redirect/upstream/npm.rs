@@ -1202,23 +1202,36 @@ async fn read_sibling(view: &mut View<'_>, dir_prefix: &str, name: &str) -> Opti
 /// (`sharedWorkspaceLockfile: false`). pnpm reads a member's settings only
 /// from its workspace root: the nearest ancestor with a
 /// pnpm-workspace.yaml whose `packages:` lists the member's directory
-/// ([`lists_as_member`]), when the member has no such file of its own. A
-/// Rush lock keeps its own directory (see [`rush_lock_root`]).
+/// ([`lists_as_member`]), when the member has no such file of its own.
+/// That root may sit above the project root (a rollback run from the
+/// member itself, its lock `pnpm-lock.yaml`): it is then found on disk
+/// ([`governing_workspace_file`]) and returned as an absolute directory
+/// prefix. A Rush lock (see [`rush_lock_root`], settled by its
+/// `rush.json`) keeps its own directory.
 ///
 /// [`lists_as_member`]: crate::utils::pnpm_workspace::lists_as_member
+/// [`governing_workspace_file`]: crate::utils::pnpm_workspace::governing_workspace_file
 async fn pnpm_settings_prefix(view: &mut View<'_>, rel: &str) -> String {
-    let Some((dir, _)) = rel.rsplit_once('/') else {
-        return String::new();
+    let (dir, own) = match rel.rsplit_once('/') {
+        Some((dir, _)) => (dir, format!("{dir}/")),
+        None => ("", String::new()),
     };
-    let own = format!("{dir}/");
-    if rush_lock_root(rel).is_some()
-        || read_sibling(view, &own, "pnpm-workspace.yaml")
-            .await
-            .is_some()
+    if let Some(root) = rush_lock_root(rel) {
+        if read_sibling(view, root, "rush.json").await.is_some() {
+            return own;
+        }
+    }
+    if read_sibling(view, &own, "pnpm-workspace.yaml")
+        .await
+        .is_some()
     {
         return own;
     }
-    let parts: Vec<&str> = dir.split('/').collect();
+    let parts: Vec<&str> = if dir.is_empty() {
+        Vec::new()
+    } else {
+        dir.split('/').collect()
+    };
     for depth in (0..parts.len()).rev() {
         let prefix: String = parts[..depth].iter().map(|p| format!("{p}/")).collect();
         let Some(yaml) = read_sibling(view, &prefix, "pnpm-workspace.yaml").await else {
@@ -1232,7 +1245,15 @@ async fn pnpm_settings_prefix(view: &mut View<'_>, rel: &str) -> String {
             own
         };
     }
-    own
+    // No workspace file inside the project: pnpm keeps looking above it.
+    let member = view.root().join(dir);
+    match crate::utils::pnpm_workspace::governing_workspace_file(&member)
+        .as_deref()
+        .and_then(std::path::Path::parent)
+    {
+        Some(root) => format!("{}{}", root.display(), std::path::MAIN_SEPARATOR),
+        None => own,
+    }
 }
 
 /// The `upstream_pnpm_tarball_setting_guessed` detail (#902): nothing
@@ -2210,5 +2231,65 @@ mod tests {
             Some("https://b.example")
         );
         assert_eq!(yaml_top_level_value("packages: []\n", "registry"), None);
+    }
+
+    fn write(root: &std::path::Path, rel: &str, text: &str) {
+        let path = root.join(rel);
+        std::fs::create_dir_all(path.parent().unwrap()).unwrap();
+        std::fs::write(path, text).unwrap();
+    }
+
+    /// A member lock (`sharedWorkspaceLockfile: false`) rolled back from
+    /// the member itself reads the workspace root's settings above the
+    /// project root, as pnpm does; a path shaped like a Rush subspace lock
+    /// is a Rush lock only with its `rush.json`.
+    #[tokio::test]
+    async fn pnpm_settings_come_from_the_governing_workspace_root() {
+        use super::super::View;
+        use super::{pnpm_settings_prefix, read_sibling};
+
+        let dir = tempfile::tempdir().unwrap();
+        let ws = std::fs::canonicalize(dir.path()).unwrap();
+        write(
+            &ws,
+            "pnpm-workspace.yaml",
+            "packages:\n  - 'packages/*'\n  - 'common/config/subspaces/*'\n",
+        );
+        write(&ws, ".npmrc", "registry=https://ws.example/\n");
+        write(&ws, "packages/a/pnpm-lock.yaml", "lockfileVersion: '9.0'\n");
+        write(
+            &ws,
+            "packages/a/.npmrc",
+            "registry=https://member.example/\n",
+        );
+        let sub = "common/config/subspaces/x/pnpm-lock.yaml";
+        write(&ws, sub, "lockfileVersion: '9.0'\n");
+
+        let member = ws.join("packages/a");
+        let mut view = View::new(&member);
+        let prefix = pnpm_settings_prefix(&mut view, "pnpm-lock.yaml").await;
+        assert_eq!(
+            prefix,
+            format!("{}{}", ws.display(), std::path::MAIN_SEPARATOR)
+        );
+        assert_eq!(
+            read_sibling(&mut view, &prefix, ".npmrc").await.as_deref(),
+            Some("registry=https://ws.example/\n")
+        );
+
+        // Inside the view, as before.
+        let mut view = View::new(&ws);
+        assert_eq!(
+            pnpm_settings_prefix(&mut view, "packages/a/pnpm-lock.yaml").await,
+            ""
+        );
+        // Not a Rush lock without rush.json: a listed member.
+        assert_eq!(pnpm_settings_prefix(&mut view, sub).await, "");
+        write(&ws, "rush.json", "{}");
+        let mut view = View::new(&ws);
+        assert_eq!(
+            pnpm_settings_prefix(&mut view, sub).await,
+            "common/config/subspaces/x/"
+        );
     }
 }
