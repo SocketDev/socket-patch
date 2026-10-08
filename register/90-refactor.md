@@ -1,7 +1,8 @@
 ### Refactor routine (`refactor`, hourly, highest leverage first)
-_Last updated 2026-10-08T10:20Z · main @ b96a785_
+_Last updated 2026-10-08T11:20Z · main @ 628542d_
 
 **In flight:**
+- [#1126](https://github.com/SocketDev/socket-patch/pull/1126): 7 inline `starts_with("pkg:<type>/")` checks (Bun/vlt preflights, PyPI fuzzy match, Coursier sidecar, VEX verify) through `Ecosystem::from_purl`, plus an equivalence table test and a one-sided guard listing 16 pending files. Issue #747 (C20, slice 1). +18 / −9 production, +155 tests. `state: ready`.
 - [#1124](https://github.com/SocketDev/socket-patch/pull/1124): 72 CLI test files use `tests/common`'s `binary()` and `git_sha256` instead of private copies (52 + 45 deleted), plus a one-sided `cli/shared_helper_copies.rs` ratchet. Issue #824 (C30, children 2–3; 68 files in open PRs and the three `vlt_*_common` modules remain). Test-only, +450 / −583. `state: ready`.
 - [#1121](https://github.com/SocketDev/socket-patch/pull/1121): ledger recovery reads the recorded uv/pdm `[[package]]` unit through `utils::python_lock::package_artifacts` and picks wheels through the shared `pypi_distribution::is_portable_wheel_url`; deletes recovery's string scanner and suffix rule. Issue #1079 (E89, slice 1; the `lock_inventory/pypi.rs` suffix checks and the rename remain, in files #1058/#1009/#1045/#768 change). `state: ready`.
 - [#1117](https://github.com/SocketDev/socket-patch/pull/1117): 8 inline BOM strips (requirements lexers, manifest, hosted npm manifest, Gradle DSL, socket.yml, CLI Pipenv remedy) onto `formats::text`, plus `strip_bom_bytes` and a one-sided guard with a 26-file pending list. Issue #905 (E64, step 3 slice 1). Only change: a double-BOM Pipfile.lock is unparseable in the stale-install remedy. `state: ready`.
@@ -20,13 +21,13 @@ _Last updated 2026-10-08T10:20Z · main @ b96a785_
 
 | # | Candidate | B | U | D | R | Score | Note |
 |---|---|:-:|:-:|:-:|:-:|:-:|---|
-| 1 | #824 (C30) children 2–3: private `binary()`/`git_sha256` copies onto `tests/common` (free files) | 0 | 1 | ≈97 | L | high | **taken: #1124** (test-only) |
+| 1 | #747 (C20) slice 1: 7 inline purl-type checks in free files onto `Ecosystem::from_purl` | 0 | 1 | 7 | L | ≈16 | **taken: #1126** |
 | 2 | #990 (E24, child 1 of #989): one `vendor::revert::finish` for the 12 copied finish blocks | 0 | 1 | ≈12 | L | ≈26 | skipped: all 12 backend files changed by open PRs |
-| 3 | #823 (C47) slice 2: the 7 `PENDING_SCRUB_COPIES` files | 0 | 1 | 7 | L | ≈16 | skipped: the 7 files are free, but its two-sided guard `spawn_env_hygiene.rs` is changed by #1049 |
-| 4 | #922 (E22): one `VendorEntry::npm` constructor for 7 npm-family ledger tails | 0 | 1 | ≈7 | L | ≈16 | skipped: claimed; drivers changed by #1008 |
-| 5 | #706 (C17) slice 2: the 6 `PENDING_INLINE_DIGESTS` files | 0 | 1 | ≈6 | L | ≈14 | skipped: files changed by open PRs |
+| 3 | #727 (C19): `utils::env` for truthiness, non-empty vars and home dir | 0 | 1 | ≈6 | L | ≈14 | skipped: `utils/mod.rs`, `env_compat.rs`, `telemetry.rs`, `args.rs` changed by open PRs |
+| 4 | #706 (C17) slice 2: the 6 `PENDING_INLINE_DIGESTS` files | 0 | 1 | ≈6 | L | ≈14 | skipped: all 6 changed by open PRs |
+| 5 | #630 (E37): one name/version coordinate guard + composer `strip_leading_v` | 0 | 0 | 4 | L | ≈8 | skipped: cargo/ruby/maven crawlers, `formats/composer`, `upstream/composer` changed by open PRs |
 
-Re-ranked 2026-10-08T10:00Z at `b96a785` against the 33 open PRs' 515 files. E35's crawler-oracle slice is dropped (see Notes).
+Re-ranked 2026-10-08T11:00Z at `628542d` against the 33 open PRs' 580 files; #824 children 2–3 are in #1124. #594's remaining (vendored) half and #675's CLI half sit in open-PR files.
 
 **Notes:**
 - E35's crawler oracles (composer/go/nuget/python/maven) can't become `golden.rs` digests: their randomized trees use symlinks (no-ops on Windows), permission modes (ignored as root and on Windows) and case-colliding names (folded on macOS). The outputs therefore differ by OS and by uid, and a golden blessed in the root sandbox would fail on non-root Linux CI. Keep the oracles until a crawler can be checked without one.
