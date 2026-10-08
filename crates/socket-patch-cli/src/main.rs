@@ -27,6 +27,10 @@ async fn main() {
     // pipe.
     restore_default_sigpipe();
 
+    // Ctrl-C / SIGTERM / SIGHUP remove a held `.socket/apply.lock` before
+    // the signal ends the process (see `interrupt`).
+    socket_patch_cli::interrupt::install();
+
     // Accept the JS socket-cli's SOCKET_CLI_* peer names (silently —
     // they are aliases, not deprecations) so `socket login` / socket-cli
     // env setups work for socket-patch unchanged. Canonical names win.

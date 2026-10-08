@@ -2498,10 +2498,29 @@ pub(crate) async fn rollback_patches_inner(
             continue;
         }
         let files = target.files.as_ref().unwrap_or(&patch.files);
+        let mut result = result;
         if let Some(warning) = superseded_record_skip(target, &result, files, superseded).await {
-            warnings.push(warning);
-            superseded_left.push(purl.clone());
-            continue;
+            // The superseded primary never reached its store copies; one
+            // still at this record's patched bytes (Bun's orphaned
+            // isolated-store entry, #1084) is restored here, or fails the
+            // run and keeps the record, before the record is dropped.
+            match socket_patch_core::patch::rollback::rollback_store_copies_holding_patch(
+                purl,
+                pkg_path,
+                files,
+                &blobs_path,
+                common.dry_run,
+            )
+            .await
+            {
+                Some(copies) if !copies.success => result = copies,
+                restored => {
+                    warnings.push(warning);
+                    superseded_left.push(purl.clone());
+                    results.extend(restored);
+                    continue;
+                }
+            }
         }
         if !result.success {
             has_errors = true;
