@@ -1056,6 +1056,47 @@ async fn native_binary_scan_vendored() {
     fixture.frozen("reverted", &fixture.original, "minimist");
 }
 
+/// #1132: `bun remove minimist` after a vendored scan leaves neither the
+/// vendored nor the pre-vendor record in bun.lockb. `vendor --revert` must
+/// retire the entry and delete its tarball; reading the removal as drift
+/// kept both forever and left `vendor --check` red. Named outside the
+/// `native_binary_` prefix: `scripts/backtest-bun-lockb.py` pins that set.
+#[tokio::test(flavor = "multi_thread")]
+#[serial_test::serial]
+async fn binary_vendored_revert_after_bun_remove() {
+    let Some(fixture) = Fixture::new("direct") else {
+        return;
+    };
+    let server = MockServer::start().await;
+    mock_api(&server, &fixture, "minimist").await;
+    let result = scan(&fixture.project, &server, "vendored", &[]);
+    assert_eq!(
+        result["vendor"]["summary"]["applied"], 1,
+        "scan vendored: {result}"
+    );
+    let mut remove = command(&fixture.reader, &fixture.project);
+    remove
+        .args(["remove", "minimist", "--ignore-scripts"])
+        .env(
+            "BUN_INSTALL_CACHE_DIR",
+            fixture.temp.path().join("remove-cache"),
+        )
+        .env("BUN_INSTALL", fixture.temp.path().join("remove-home"));
+    require_success(remove.output().unwrap(), "bun remove minimist");
+    assert!(!fixture.project.join("bun.lock").exists());
+
+    let result = cli(&fixture.project, &["vendor", "--revert"]);
+    assert_eq!(result["status"], "success", "vendor revert: {result}");
+    assert!(
+        !result.to_string().contains("vendor_lock_entry_drifted"),
+        "a removed dependency is not drift: {result}"
+    );
+    assert!(
+        !fixture.project.join(".socket/vendor").exists(),
+        "the vendored tarball must be deleted: {result}"
+    );
+}
+
 #[tokio::test(flavor = "multi_thread")]
 #[serial_test::serial]
 async fn native_binary_alias_and_transitive() {

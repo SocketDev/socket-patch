@@ -487,7 +487,7 @@ async fn all_batches_failed_reports_the_last_chunks_error() {
     let v: serde_json::Value = serde_json::from_str(&stdout).unwrap();
     assert_eq!(v["status"], "error");
     assert_eq!(
-        v["error"].as_str().unwrap(),
+        v["error"]["message"].as_str().unwrap(),
         format!(
             "API request failed with status 500: boom-{}",
             NAMES[order[5]]
@@ -760,7 +760,7 @@ async fn all_detail_fetches_failed_reports_the_last_packages_error() {
     );
     assert_eq!(code, 1, "stdout={stdout} stderr={stderr}");
     let v: serde_json::Value = serde_json::from_str(&stdout).unwrap();
-    let err = v["error"].as_str().unwrap();
+    let err = v["error"]["message"].as_str().unwrap();
     assert!(
         err.starts_with("all 6 patch-detail queries failed: ")
             && err.ends_with(&format!("detail-boom-{}", NAMES[5])),

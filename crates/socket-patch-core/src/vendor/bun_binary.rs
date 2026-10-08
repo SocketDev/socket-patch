@@ -623,6 +623,20 @@ pub(crate) async fn revert(entry: &VendorEntry, root: &Path, opts: RevertOpts) -
                 .iter()
                 .any(|key| pair[0].get(key) != pair[1].get(key))
         });
+    // REMOVED, not drift (#1132): `bun remove <pkg>` (or an upgrade off the
+    // patched version) leaves neither snapshot in the lock. When no package
+    // resolves through this uuid dir any more, there is nothing to restore
+    // and nothing an install needs the artifact for. Probed once, before any
+    // record is restored; an unreadable package table fails closed (drift).
+    let uuid_lower = entry.uuid.to_ascii_lowercase();
+    let unreferenced = match &lock {
+        RevertLock::Binary(lock) => lock.packages().is_ok_and(|packages| {
+            !packages
+                .iter()
+                .any(|p| p.resolution.to_ascii_lowercase().contains(&uuid_lower))
+        }),
+        RevertLock::Migrated(_) => false,
+    };
     let mut mirrors_to_remove = Vec::new();
     for rec in entry.wiring.iter().rev() {
         if rec.kind == MIRROR_KIND {
@@ -672,6 +686,7 @@ pub(crate) async fn revert(entry: &VendorEntry, root: &Path, opts: RevertOpts) -
             }
             continue;
         }
+        // `Ok(true)`: the record left the lock (see `unreferenced`).
         let restore = (|| {
             // A same-uuid re-vendor on the migrated bun.lock re-pins our own
             // tuple as a text record next to the binary records it carried
@@ -686,7 +701,7 @@ pub(crate) async fn revert(entry: &VendorEntry, root: &Path, opts: RevertOpts) -
                         &mut dirty,
                         &mut outcome.warnings,
                     );
-                    return Ok(());
+                    return Ok(false);
                 }
             }
             if rec.file != LOCK || rec.kind != KIND {
@@ -719,7 +734,7 @@ pub(crate) async fn revert(entry: &VendorEntry, root: &Path, opts: RevertOpts) -
                             ),
                         ));
                     }
-                    return Ok(());
+                    return Ok(false);
                 }
             };
             let new = rec
@@ -731,15 +746,25 @@ pub(crate) async fn revert(entry: &VendorEntry, root: &Path, opts: RevertOpts) -
             // original never makes this record appear already reverted.
             let id = match lock.find_snapshot_id(id, new)? {
                 Some(id) => id,
-                None if lock.find_snapshot_id(id, original)?.is_some() => return Ok(()),
+                None if lock.find_snapshot_id(id, original)?.is_some() => return Ok(false),
+                None if unreferenced => return Ok(true),
                 None => return Err("binary package resolution has drifted".into()),
             };
-            lock.restore(id, original)
+            lock.restore(id, original).map(|()| false)
         })();
-        if let Err(e) = restore {
-            outcome
+        match restore {
+            Ok(true) => outcome.warnings.push(VendorWarning::new(
+                super::LOCK_ENTRY_REMOVED_CODE,
+                format!(
+                    "{LOCK} no longer resolves {} through {dir} (the dependency was removed or \
+                     re-resolved); nothing to restore",
+                    entry.base_purl
+                ),
+            )),
+            Ok(false) => {}
+            Err(e) => outcome
                 .warnings
-                .push(VendorWarning::new("vendor_lock_entry_drifted", e));
+                .push(VendorWarning::new("vendor_lock_entry_drifted", e)),
         }
     }
     if outcome.drift_skipped() {
@@ -1344,6 +1369,58 @@ mod rebuild_tests {
         );
         assert_eq!(ts::snapshot(&fx).await, before);
         assert_eq!(ts::request_count(&server).await, 0);
+    }
+
+    /// #1132: once `bun remove minimist` (or `bun add minimist@1.2.8`)
+    /// moves the vendored record off its vendored resolution, neither the
+    /// rewritten nor the pre-vendor snapshot is in bun.lockb and nothing
+    /// resolves through the uuid dir. There is nothing to restore, so the
+    /// revert warns `vendor_lock_entry_removed` and finishes; reading it as
+    /// drift kept the tarball and ledger entry forever and looped
+    /// `vendor --check` → `scan --prune`.
+    #[tokio::test]
+    async fn revert_after_package_left_the_lock_is_not_drift() {
+        use base64::Engine as _;
+        let fx = flip_fixture().await;
+        let root = fx.root();
+        let VendorOutcome::Done {
+            result,
+            entry: Some(entry),
+            ..
+        } = flip_run(&fx, None).await
+        else {
+            panic!("vendoring must wire the binary lock");
+        };
+        assert!(result.success, "{result:?}");
+        let binary = entry.wiring.iter().find(|r| r.kind == KIND).unwrap();
+        let id: usize = binary.key.as_ref().unwrap().parse().unwrap();
+        let mut lock = BunLockb::parse(&std::fs::read(root.join(LOCK)).unwrap()).unwrap();
+        let integrity = format!(
+            "sha512-{}",
+            base64::engine::general_purpose::STANDARD.encode([7u8; 64])
+        );
+        lock.set_registry_package(
+            id,
+            "1.2.8",
+            "https://registry.npmjs.org/minimist/-/minimist-1.2.8.tgz",
+            &integrity,
+        )
+        .unwrap();
+        let relocked = lock.bytes();
+        assert!(!lock
+            .packages()
+            .unwrap()
+            .iter()
+            .any(|p| p.resolution.contains(UUID)));
+        std::fs::write(root.join(LOCK), &relocked).unwrap();
+
+        let outcome = revert(&entry, root, RevertOpts::new(false)).await;
+        assert!(outcome.success, "{outcome:?}");
+        assert!(!outcome.drift_skipped(), "{outcome:?}");
+        assert!(outcome.lock_entry_removed(), "{outcome:?}");
+        assert!(!outcome.kept_artifact, "{outcome:?}");
+        assert_eq!(std::fs::read(root.join(LOCK)).unwrap(), relocked);
+        assert!(!root.join(&entry.artifact.path).exists());
     }
 
     /// With the canonical tarball GONE, an outage switches the same UUID

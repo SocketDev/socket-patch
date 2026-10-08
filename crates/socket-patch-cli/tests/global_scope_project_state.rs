@@ -84,7 +84,7 @@ fn get_refuses_project_modes_under_global_scope() {
             let v = parse(&stdout, "");
             assert_eq!(v["status"], "error", "{v}");
             assert!(
-                v["error"]
+                v["error"]["message"]
                     .as_str()
                     .unwrap()
                     .starts_with(&expected["Error: ".len()..]),
