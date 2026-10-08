@@ -127,6 +127,8 @@ fn render(out: &Discovery, root: &Path) -> Value {
         // finding: every copy it found already shows as a contest and a
         // diagnostic above.
         vlt_bundled_copies: _,
+        read: _,
+        withheld: _,
         // Already folded into `unattested` by the time a run returns.
         unwired_copies: _,
     } = out;

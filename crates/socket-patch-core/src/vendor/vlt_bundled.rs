@@ -264,7 +264,7 @@ mod tests {
             "pkg:npm/%40scope/x@2.0.0",
             "pkg:npm/%40scope/x@2.0.0?vcs_url=x",
         ] {
-            let key = crate::vex::discover::canonical_base_purl(spelling);
+            let key = crate::utils::purl_key::canonical_base_purl(spelling);
             assert!(keys.contains_key(&key), "{spelling} -> {key}: {keys:?}");
         }
     }

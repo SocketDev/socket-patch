@@ -389,7 +389,7 @@ pub(super) async fn heal_after_rewrite(
         for purl in inputs.records.keys() {
             // The store's keys are decoded purls: look a `%40scope` record
             // up the way the attribution gate does.
-            let base = socket_patch_core::vex::discover::canonical_base_purl(purl);
+            let base = socket_patch_core::utils::purl_key::canonical_base_purl(purl);
             let Some(location) = copies.get(&base) else {
                 continue;
             };

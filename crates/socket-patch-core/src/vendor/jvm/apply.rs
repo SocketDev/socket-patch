@@ -697,15 +697,28 @@ pub async fn revert(root: &Path, entry: &VendorEntry, opts: RevertOpts) -> Rever
 /// The vendored repository trees JVM entries write under `.socket/vendor`
 /// (sbt's Coursier tree included).
 pub(crate) const VENDOR_TREES: &[&str] = &[
-    ".socket/vendor/maven2",
-    ".socket/vendor/gradle",
+    maven_reactor::TREE_ROOT,
+    gradle::TREE_ROOT,
     coursier_tree::TREE_ROOT,
+];
+
+/// The committed JVM layout only a JVM ledger entry ([`is_jvm_entry`]) can
+/// own — the repository trees plus the indexes and the generated sbt build
+/// file beside them. Any of them present with no JVM entry in the ledger is
+/// an orphan: `vendor --check` reports `vendor_ledger_missing` for it.
+pub const LEDGER_OWNED_PATHS: &[&str] = &[
+    maven_reactor::TREE_ROOT,
+    gradle::TREE_ROOT,
+    gradle::INDEX_REL,
+    coursier_tree::TREE_ROOT,
+    coursier_tree::INDEX_REL,
+    sbt::BUILD_FILE,
 ];
 
 /// Owned directories pruned once empty, up to and including themselves.
 const OWNED_DIRS: &[&str] = &[
-    ".socket/vendor/maven2",
-    ".socket/vendor/gradle",
+    maven_reactor::TREE_ROOT,
+    gradle::TREE_ROOT,
     ".socket/gradle",
     coursier_tree::TREE_ROOT,
 ];
@@ -794,6 +807,9 @@ pub fn entry_wired(root: &Path, entry: &VendorEntry) -> bool {
 /// Whether the project still references the JVM `entry`'s tree (its
 /// suffixed version in a reactor pom; its index rows plus the root apply
 /// line for Gradle): what a revert must not pull from under a peer.
+/// Fails closed: a file that exists but cannot be read or parsed (or
+/// resolves outside the checkout) proves nothing absent, so the answer is
+/// `true` — the `scan --prune` GC reverts on `false`.
 pub fn entry_references(root: &Path, entry: &VendorEntry) -> bool {
     let Ok((g, a, v)) = entry_gav(entry) else {
         return true;
@@ -806,15 +822,18 @@ pub fn entry_references(root: &Path, entry: &VendorEntry) -> bool {
     };
     let reader = ProjectReader::new(root);
     let read = |rel: &str| reader.read(rel);
-    if sbt::owns(&entry.wiring) {
-        return sbt::wired_checked(&read, &c).unwrap_or(true);
-    }
-    if scala_cli::owns(&entry.wiring) {
-        return scala_cli::wired_checked(&read, &c).unwrap_or(true);
-    }
-    let (maven, gradle) = sides(&entry.wiring);
-    (maven && maven_reactor::wired_checked(&read, &c).unwrap_or(true))
-        || (gradle && gradle::references(&read, &c))
+    let referenced = if sbt::owns(&entry.wiring) {
+        sbt::wired_checked(&read, &c).unwrap_or(true)
+    } else if scala_cli::owns(&entry.wiring) {
+        scala_cli::wired_checked(&read, &c).unwrap_or(true)
+    } else {
+        let (maven, gradle) = sides(&entry.wiring);
+        (maven && maven_reactor::wired_checked(&read, &c).unwrap_or(true))
+            || (gradle && gradle::references_checked(&read, &c).unwrap_or(true))
+    };
+    // `read` answers `None` for an unreadable file as for a missing one;
+    // the error it recorded is what tells the two apart.
+    referenced || reader.read_error.borrow().is_some()
 }
 
 /// The liveness proof `vex` needs: every half of the entry is wired, and
@@ -1128,6 +1147,53 @@ mod tests {
         JvmPlan {
             writes,
             ..JvmPlan::default()
+        }
+    }
+
+    /// The `scan --prune` GC reverts when [`entry_references`] says
+    /// `false`, so a Gradle file that exists but cannot be read or parsed
+    /// must answer `true` (keep), as the maven/sbt/scala-cli arms do.
+    #[test]
+    fn gradle_references_fail_closed_on_unreadable_files() {
+        let gradle_entry = || {
+            entry(vec![
+                record(SETTINGS_FRAGMENT_KIND, "settings.gradle"),
+                record(TREE_KIND, ".socket/vendor/gradle/g/a/1/a-1.jar"),
+            ])
+        };
+        assert!(is_jvm_entry(&gradle_entry()));
+        // The root settings file still applies the script.
+        let settings = |dir: &Path| {
+            std::fs::write(
+                dir.join("settings.gradle"),
+                "apply from: '.socket/gradle/socket-patch.settings.gradle' // socket-patch\n",
+            )
+            .unwrap()
+        };
+        // Decidable: applied, but no index lists the entry — unreferenced.
+        let dir = tempfile::tempdir().unwrap();
+        settings(dir.path());
+        assert!(!entry_references(dir.path(), &gradle_entry()));
+        // A malformed index proves nothing absent.
+        let dir = tempfile::tempdir().unwrap();
+        settings(dir.path());
+        std::fs::create_dir_all(dir.path().join(".socket/vendor")).unwrap();
+        std::fs::write(dir.path().join(gradle::INDEX_REL), "garbage\n").unwrap();
+        assert!(entry_references(dir.path(), &gradle_entry()));
+        // An index the reader cannot read (here: a link out of the checkout).
+        #[cfg(unix)]
+        {
+            let dir = tempfile::tempdir().unwrap();
+            let outside = tempfile::tempdir().unwrap();
+            settings(dir.path());
+            std::fs::create_dir_all(dir.path().join(".socket/vendor")).unwrap();
+            std::fs::write(outside.path().join("index.tsv"), "x").unwrap();
+            std::os::unix::fs::symlink(
+                outside.path().join("index.tsv"),
+                dir.path().join(gradle::INDEX_REL),
+            )
+            .unwrap();
+            assert!(entry_references(dir.path(), &gradle_entry()));
         }
     }
 

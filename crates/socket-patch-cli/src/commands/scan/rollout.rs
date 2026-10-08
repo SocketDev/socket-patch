@@ -5,9 +5,8 @@
 use std::collections::{BTreeMap, BTreeSet, HashSet};
 
 pub(crate) use socket_patch_core::rollout::stage::*;
-use socket_patch_core::rollout::{
-    canonical_base_purl, severity_label, MaxNew, MaxNewSource, Recorded, RolloutPlan,
-};
+use socket_patch_core::rollout::{severity_label, MaxNew, MaxNewSource, Recorded, RolloutPlan};
+use socket_patch_core::utils::purl_key::PurlKey;
 
 use super::discovery::UpdateInfo;
 
@@ -16,7 +15,7 @@ use super::discovery::UpdateInfo;
 pub(super) fn upgrades(rows: &[Row], package_purls: &[String]) -> Vec<UpdateInfo> {
     let by_base: BTreeMap<String, &String> = package_purls
         .iter()
-        .map(|p| (canonical_base_purl(p), p))
+        .map(|p| (PurlKey::new(p).into_string(), p))
         .collect();
     let mut seen: HashSet<String> = HashSet::new();
     let mut out = Vec::new();
@@ -103,7 +102,7 @@ impl<'a> Gate<'a> {
                 && self
                     .stage
                     .already_admitted
-                    .contains(&canonical_base_purl(purl)))
+                    .contains(&PurlKey::new(purl).into_string()))
     }
 }
 
@@ -119,13 +118,13 @@ pub(super) fn merge_updates(
     let offered: BTreeSet<String> = offers
         .unfiltered
         .keys()
-        .map(|p| canonical_base_purl(p))
+        .map(|p| PurlKey::new(p).into_string())
         .collect();
     let mut out = upgrades(rows, package_purls);
     out.extend(
         batch
             .into_iter()
-            .filter(|u| !offered.contains(&canonical_base_purl(&u.purl))),
+            .filter(|u| !offered.contains(&PurlKey::new(&u.purl).into_string())),
     );
     out.sort_by(|a, b| a.purl.cmp(&b.purl));
     out.dedup_by(|a, b| a.purl == b.purl);

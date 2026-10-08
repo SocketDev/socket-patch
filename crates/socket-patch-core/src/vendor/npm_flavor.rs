@@ -25,7 +25,7 @@ use std::path::Path;
 
 use crate::manifest::schema::PatchRecord;
 use crate::patch::apply::PatchSources;
-use crate::utils::fs::{read_regular_to_bytes, read_regular_to_string};
+use crate::utils::fs::read_regular_to_string;
 
 use super::lock_inventory::ProjectView;
 use super::source::PackageSource;
@@ -34,9 +34,7 @@ use super::{
     bun_lock, npm_lock, pnpm_lock, pnpm_lock_legacy, vlt_lock, yarn_berry_lock, yarn_classic_lock,
     RevertOpts, RevertOutcome, VendorOutcome, VendorWarning,
 };
-use crate::constants::npm_family::{
-    BUN_LOCK, BUN_LOCKB, NPM_LOCKS, PNPM_LOCK, PNP_MARKERS, VLT_LOCK,
-};
+use crate::constants::npm_family::{PNPM_LOCK, PNP_MARKERS, VLT_LOCK};
 use crate::formats::governing_locks::{
     npm_governing_family, npm_lock_files, npm_locks_outside, NpmLockFamily,
 };
@@ -632,58 +630,6 @@ pub async fn lock_text_refusals(
         });
     }
     refusals
-}
-
-/// Is this npm-vendored entry still consumed by its lockfile's dependency
-/// graph?
-///
-/// `Some(true)`: the lockfile still resolves something to the entry's
-/// artifact. `Some(false)`: the lockfile is present and parses but no
-/// resolution references `.socket/vendor/npm/<uuid>/` — the dependency
-/// was removed and re-locked, so the vendoring is unused (an override/
-/// resolutions DECLARATION alone does not count: pnpm's mirrored
-/// `overrides:` section is excluded by the flavor probe, and the other
-/// flavors carry no declaration inside the lock at all). `None`: cannot
-/// determine (missing lock, unknown flavor) — callers keep the entry,
-/// fail-safe. Detached entries are wired into the lock exactly like
-/// manifest-tracked ones, so the probe applies to every entry.
-pub async fn vendored_entry_in_use(entry: &VendorEntry, project_root: &Path) -> Option<bool> {
-    match NpmLockFlavor::from_recorded(entry.flavor.as_deref())? {
-        NpmLockFlavor::Pnpm => pnpm_lock::pnpm_entry_in_use(entry, project_root).await,
-        NpmLockFlavor::PnpmLegacy => {
-            pnpm_lock_legacy::pnpm_legacy_entry_in_use(entry, project_root).await
-        }
-        // The remaining flavors wire resolutions into the lock itself
-        // (resolved URLs / file: ranges / package tuples), so a textual
-        // probe for the uuid dir is exact: the path appears iff some
-        // resolution still points at the artifact. Both npm locks are
-        // probed: npm <= 11 installs from the shrinkwrap, npm 12 from the
-        // package-lock beside it.
-        NpmLockFlavor::PackageLock => {
-            lock_text_mentions_uuid(project_root, &NPM_LOCKS, &entry.uuid).await
-        }
-        NpmLockFlavor::YarnClassic | NpmLockFlavor::YarnBerry => {
-            lock_text_mentions_uuid(project_root, &["yarn.lock"], &entry.uuid).await
-        }
-        NpmLockFlavor::Bun => {
-            if super::lock_inventory::bun::bun_text_lock_present(project_root).await {
-                return lock_text_mentions_uuid(project_root, &[BUN_LOCK], &entry.uuid).await;
-            }
-            let bytes = read_regular_to_bytes(&project_root.join(BUN_LOCKB))
-                .await
-                .ok()?;
-            let needle = format!(".socket/vendor/npm/{}/", entry.uuid);
-            // The string pool can retain superseded paths. Only active
-            // package resolutions count, so stale bytes do not prevent GC.
-            Some(
-                super::bun_lockb::BunLockb::parse_packages(&bytes)
-                    .ok()?
-                    .iter()
-                    .any(|package| package.resolution.contains(&needle)),
-            )
-        }
-        NpmLockFlavor::Vlt => vlt_lock::vlt_entry_in_use(entry, project_root).await,
-    }
 }
 
 /// Every readable lockfile from `names`, probed for the uuid artifact dir:
@@ -1836,6 +1782,15 @@ mod tests {
     }
 
     /// One minimal npm vendor entry stamped with the given flavor.
+    /// The prune GC's in-use verdict for `entry`
+    /// ([`crate::vex::discover::Discovery::vendor_entry_in_use`]).
+    async fn in_use(entry: &VendorEntry, root: &Path) -> Option<bool> {
+        crate::vex::discover::discover_patched_refs(root)
+            .await
+            .vendor_entry_in_use(root, entry)
+            .await
+    }
+
     fn probe_entry(flavor: Option<&str>) -> VendorEntry {
         VendorEntry {
             ecosystem: "npm".into(),
@@ -1872,22 +1827,22 @@ mod tests {
 
         // Missing lock: undeterminable.
         let tmp = tempfile::tempdir().unwrap();
-        assert_eq!(vendored_entry_in_use(&entry, tmp.path()).await, None);
+        assert_eq!(in_use(&entry, tmp.path()).await, None);
 
         // Lock resolves to our artifact: in use.
         touch(
             tmp.path(),
             "package-lock.json",
             &format!(
-                "{{\"packages\":{{\"node_modules/left-pad\":{{\"resolved\":\"file:.socket/vendor/npm/{UUID}/left-pad-1.3.0.tgz\"}}}}}}"
+                "{{\"packages\":{{\"node_modules/left-pad\":{{\"version\":\"1.3.0\",\"resolved\":\"file:.socket/vendor/npm/{UUID}/left-pad-1.3.0.tgz\"}}}}}}"
             ),
         )
         .await;
-        assert_eq!(vendored_entry_in_use(&entry, tmp.path()).await, Some(true));
+        assert_eq!(in_use(&entry, tmp.path()).await, Some(true));
 
         // Dep removed + re-locked (no reference left): unused.
         touch(tmp.path(), "package-lock.json", "{\"packages\":{}}").await;
-        assert_eq!(vendored_entry_in_use(&entry, tmp.path()).await, Some(false));
+        assert_eq!(in_use(&entry, tmp.path()).await, Some(false));
 
         // A mention in either npm lock counts (npm <= 11 installs from the
         // shrinkwrap, npm 12 from package-lock.json).
@@ -1895,11 +1850,11 @@ mod tests {
             tmp.path(),
             "npm-shrinkwrap.json",
             &format!(
-                "{{\"packages\":{{\"node_modules/left-pad\":{{\"resolved\":\"file:.socket/vendor/npm/{UUID}/left-pad-1.3.0.tgz\"}}}}}}"
+                "{{\"packages\":{{\"node_modules/left-pad\":{{\"version\":\"1.3.0\",\"resolved\":\"file:.socket/vendor/npm/{UUID}/left-pad-1.3.0.tgz\"}}}}}}"
             ),
         )
         .await;
-        assert_eq!(vendored_entry_in_use(&entry, tmp.path()).await, Some(true));
+        assert_eq!(in_use(&entry, tmp.path()).await, Some(true));
 
         // yarn flavors probe yarn.lock.
         let entry = probe_entry(Some("yarn-classic"));
@@ -1907,23 +1862,25 @@ mod tests {
         touch(
             tmp.path(),
             "yarn.lock",
-            &format!("left-pad@1.3.0:\n  resolved \"file:./.socket/vendor/npm/{UUID}/left-pad-1.3.0.tgz#abc\"\n"),
+            &format!("left-pad@1.3.0:\n  version \"1.3.0\"\n  resolved \"file:./.socket/vendor/npm/{UUID}/left-pad-1.3.0.tgz#abc\"\n"),
         )
         .await;
-        assert_eq!(vendored_entry_in_use(&entry, tmp.path()).await, Some(true));
+        assert_eq!(in_use(&entry, tmp.path()).await, Some(true));
         touch(tmp.path(), "yarn.lock", "# yarn lockfile v1\n").await;
-        assert_eq!(vendored_entry_in_use(&entry, tmp.path()).await, Some(false));
+        assert_eq!(in_use(&entry, tmp.path()).await, Some(false));
 
-        // Unknown flavor: undeterminable, fail-safe keep.
+        // The verdict reads every lock discovery reads, whatever flavor the
+        // entry recorded: a lock that wires nothing proves it unused.
         let entry = probe_entry(Some("future-pm"));
-        assert_eq!(vendored_entry_in_use(&entry, tmp.path()).await, None);
+        assert_eq!(in_use(&entry, tmp.path()).await, Some(false));
 
         // vlt is structural: only a `file` node under the uuid dir counts,
         // never a mention in an edge spec or another node's slot.
-        let entry = probe_entry(Some("vlt"));
+        let mut entry = probe_entry(Some("vlt"));
         let tmp = tempfile::tempdir().unwrap();
-        assert_eq!(vendored_entry_in_use(&entry, tmp.path()).await, None);
+        assert_eq!(in_use(&entry, tmp.path()).await, None);
         let rel = format!(".socket/vendor/npm/{UUID}/left-pad-1.3.0/node_modules/left-pad");
+        entry.artifact.path = rel.clone();
         let file_id =
             format!("file~.socket+vendor+npm+{UUID}+left-pad-1.3.0+node__modules+left-pad");
         touch(
@@ -1934,7 +1891,7 @@ mod tests {
             ),
         )
         .await;
-        assert_eq!(vendored_entry_in_use(&entry, tmp.path()).await, Some(true));
+        assert_eq!(in_use(&entry, tmp.path()).await, Some(true));
         touch(
             tmp.path(),
             "vlt-lock.json",
@@ -1943,9 +1900,93 @@ mod tests {
             ),
         )
         .await;
-        assert_eq!(vendored_entry_in_use(&entry, tmp.path()).await, Some(false));
+        assert_eq!(in_use(&entry, tmp.path()).await, Some(false));
         touch(tmp.path(), "vlt-lock.json", "\u{feff}{}").await;
-        assert_eq!(vendored_entry_in_use(&entry, tmp.path()).await, None);
+        assert_eq!(in_use(&entry, tmp.path()).await, None);
+    }
+
+    /// Attestation drops a vendored ref it cannot attribute to the one copy
+    /// the install uses (`DIAG_REF_UNATTRIBUTABLE`), but the package manager
+    /// may still install the artifact: the GC verdict must keep the entry.
+    /// Each lock here still routes `node_modules/left-pad` through the
+    /// vendored tarball while another entry of the SAME lock installs an
+    /// unpatched copy.
+    #[tokio::test]
+    async fn unattributable_wiring_stays_in_use() {
+        let vendored = format!("file:.socket/vendor/npm/{UUID}/left-pad-1.3.0.tgz");
+        let registry = "https://registry.npmjs.org/left-pad/-/left-pad-1.3.0.tgz";
+        let cases = [
+            (
+                "lockfileVersion 2 whose legacy `dependencies` mirror resolves to the registry",
+                serde_json::json!({
+                    "lockfileVersion": 2,
+                    "packages": {
+                        "": {"dependencies": {"left-pad": "1.3.0"}},
+                        "node_modules/left-pad": {"version": "1.3.0", "resolved": vendored},
+                    },
+                    "dependencies": {
+                        "left-pad": {"version": "1.3.0", "resolved": registry},
+                    },
+                }),
+            ),
+            (
+                "lockfileVersion 3 with a nested git copy of the same version",
+                serde_json::json!({
+                    "lockfileVersion": 3,
+                    "packages": {
+                        "": {"dependencies": {"left-pad": "1.3.0", "foo": "1.0.0"}},
+                        "node_modules/left-pad": {"version": "1.3.0", "resolved": vendored},
+                        "node_modules/foo": {
+                            "version": "1.0.0",
+                            "resolved": "https://registry.npmjs.org/foo/-/foo-1.0.0.tgz",
+                            "dependencies": {"left-pad": "github:x/left-pad#abc"},
+                        },
+                        "node_modules/foo/node_modules/left-pad": {
+                            "version": "1.3.0",
+                            "resolved": "git+ssh://git@github.com/x/left-pad.git#abc",
+                        },
+                    },
+                }),
+            ),
+        ];
+        let entry = probe_entry(Some("package-lock"));
+        for (label, lock) in cases {
+            let tmp = tempfile::tempdir().unwrap();
+            touch(tmp.path(), "package-lock.json", &lock.to_string()).await;
+            let discovery = crate::vex::discover::discover_patched_refs(tmp.path()).await;
+            assert!(
+                discovery.refs.is_empty()
+                    && discovery
+                        .diagnostics
+                        .iter()
+                        .any(|d| d.code == crate::vex::discover::DIAG_REF_UNATTRIBUTABLE),
+                "{label}: the wiring must be dropped as unattributable: {:?}",
+                discovery.diagnostics
+            );
+            assert_eq!(in_use(&entry, tmp.path()).await, Some(true), "{label}");
+        }
+
+        // vlt: the vendored node beside another registry instance of the
+        // same version.
+        let mut entry = probe_entry(Some("vlt"));
+        let rel = format!(".socket/vendor/npm/{UUID}/left-pad-1.3.0/node_modules/left-pad");
+        entry.artifact.path = rel.clone();
+        let file_id =
+            format!("file~.socket+vendor+npm+{UUID}+left-pad-1.3.0+node__modules+left-pad");
+        let tmp = tempfile::tempdir().unwrap();
+        touch(
+            tmp.path(),
+            "vlt-lock.json",
+            &format!(
+                "{{\n  \"lockfileVersion\": 1,\n  \"nodes\": {{\n    \"{file_id}\": [0,\"left-pad\",null,\"{rel}\"],\n    \"~npm~left-pad@1.3.0\": [0,\"left-pad\",\"sha512-UPSTREAM==\",null]\n  }},\n  \"edges\": {{}}\n}}\n"
+            ),
+        )
+        .await;
+        assert_eq!(
+            in_use(&entry, tmp.path()).await,
+            Some(true),
+            "vlt other instance"
+        );
     }
 
     #[tokio::test]
@@ -1959,14 +2000,16 @@ mod tests {
             .into_iter()
             .find(|package| package.name == "minimist")
             .unwrap();
-        let entry = probe_entry(Some("bun"));
+        let mut entry = probe_entry(Some("bun"));
         let target = format!(".socket/vendor/npm/{UUID}/minimist-1.2.2.tgz");
+        entry.base_purl = "pkg:npm/minimist@1.2.2".into();
+        entry.artifact.path = target.clone();
         let sri = format!("sha512-{}", "A".repeat(86) + "==");
         lock.set_package(package.id, &target, &sri).unwrap();
         tokio::fs::write(tmp.path().join("bun.lockb"), lock.bytes())
             .await
             .unwrap();
-        assert_eq!(vendored_entry_in_use(&entry, tmp.path()).await, Some(true));
+        assert_eq!(in_use(&entry, tmp.path()).await, Some(true));
         assert!(
             bun_lock::wired_instances_all_ours(tmp.path(), "pkg:npm/minimist@1.2.2")
                 .await
@@ -1988,7 +2031,7 @@ mod tests {
             .await
             .unwrap();
         assert_eq!(
-            vendored_entry_in_use(&entry, tmp.path()).await,
+            in_use(&entry, tmp.path()).await,
             Some(false),
             "old string-pool references do not prevent garbage collection"
         );
@@ -2002,9 +2045,14 @@ mod tests {
         tokio::fs::write(tmp.path().join("bun.lockb"), lock.bytes())
             .await
             .unwrap();
-        touch(tmp.path(), "bun.lock", "{\n  \"packages\": {}\n}\n").await;
+        touch(
+            tmp.path(),
+            "bun.lock",
+            "{\n  \"lockfileVersion\": 1,\n  \"workspaces\": {\n    \"\": {\n      \"name\": \"app\",\n    },\n  },\n  \"packages\": {\n    \"minimist\": [\"minimist@1.2.8\", \"\", {}, \"sha512-AAAA==\"],\n  }\n}\n",
+        )
+        .await;
         assert_eq!(
-            vendored_entry_in_use(&entry, tmp.path()).await,
+            in_use(&entry, tmp.path()).await,
             Some(false),
             "text wins even when binary still references the artifact"
         );
@@ -2015,7 +2063,7 @@ mod tests {
             .await
             .unwrap();
         assert_eq!(
-            vendored_entry_in_use(&entry, tmp.path()).await,
+            in_use(&entry, tmp.path()).await,
             None,
             "malformed means unknown, never garbage collect"
         );
@@ -2033,7 +2081,7 @@ mod tests {
 
         // Missing lock: undeterminable.
         let tmp = tempfile::tempdir().unwrap();
-        assert_eq!(vendored_entry_in_use(&entry, tmp.path()).await, None);
+        assert_eq!(in_use(&entry, tmp.path()).await, None);
 
         // A legacy-grammar lock whose packages section keys our artifact:
         // in use — only the legacy backend's structural probe says so.
@@ -2048,7 +2096,7 @@ mod tests {
             ),
         )
         .await;
-        assert_eq!(vendored_entry_in_use(&entry, tmp.path()).await, Some(true));
+        assert_eq!(in_use(&entry, tmp.path()).await, Some(true));
 
         // Dep removed + re-locked (no packages key references the artifact):
         // provably unused.
@@ -2060,12 +2108,12 @@ mod tests {
              name: consumer\n    version: 1.0.0\n",
         )
         .await;
-        assert_eq!(vendored_entry_in_use(&entry, tmp.path()).await, Some(false));
+        assert_eq!(in_use(&entry, tmp.path()).await, Some(false));
 
-        // A v9 grammar is not the legacy backend's to judge: undeterminable,
-        // fail-safe keep.
+        // A v9 lock that references nothing: unused, whichever grammar the
+        // entry was vendored under.
         touch(tmp.path(), "pnpm-lock.yaml", "lockfileVersion: '9.0'\n").await;
-        assert_eq!(vendored_entry_in_use(&entry, tmp.path()).await, None);
+        assert_eq!(in_use(&entry, tmp.path()).await, Some(false));
     }
 
     #[cfg(unix)]
@@ -2119,10 +2167,10 @@ mod tests {
                 detect_npm_lock_flavor(pnpm_dir.path()).await,
                 detect_npm_lock_flavor(yarn_dir.path()).await,
                 detect_npm_lock_flavor(vlt_dir.path()).await,
-                vendored_entry_in_use(&probe_entry(Some("package-lock")), in_use_dir.path()).await,
-                vendored_entry_in_use(&probe_entry(Some("yarn-classic")), in_use_dir.path()).await,
-                vendored_entry_in_use(&probe_entry(Some("bun")), in_use_dir.path()).await,
-                vendored_entry_in_use(&probe_entry(Some("vlt")), in_use_dir.path()).await,
+                in_use(&probe_entry(Some("package-lock")), in_use_dir.path()).await,
+                in_use(&probe_entry(Some("yarn-classic")), in_use_dir.path()).await,
+                in_use(&probe_entry(Some("bun")), in_use_dir.path()).await,
+                in_use(&probe_entry(Some("vlt")), in_use_dir.path()).await,
             )
         };
         let Ok((pnpm, yarn, vlt, npm_use, yarn_use, bun_use, vlt_use)) =

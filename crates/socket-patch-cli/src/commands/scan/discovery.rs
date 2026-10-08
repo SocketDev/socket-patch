@@ -9,9 +9,9 @@ use socket_patch_core::api::types::{
     BatchPackagePatches, BatchPatchInfo, PatchResponse, PatchSearchResult,
 };
 use socket_patch_core::manifest::schema::{PatchManifest, PatchRecord};
-use socket_patch_core::utils::composer_version::{composer_purl_identity, purl_identity_key};
 use socket_patch_core::utils::concurrent::{api_concurrency_for, ordered_concurrent};
-use socket_patch_core::utils::purl::{normalize_purl, purl_eq, strip_purl_qualifiers};
+use socket_patch_core::utils::purl::{normalize_purl, strip_purl_qualifiers};
+use socket_patch_core::utils::purl_key::PurlKey;
 use socket_patch_core::vendor::lock_inventory::LockfileEntry;
 use socket_patch_core::vendor::VendorState;
 use std::collections::{HashMap, HashSet};
@@ -33,8 +33,9 @@ pub(super) struct UpdateInfo {
 #[derive(Default)]
 pub(crate) struct LockfileSupplement {
     pub(crate) packages: Vec<socket_patch_core::crawlers::types::CrawledPackage>,
-    /// Literal crawler-form purls, for fast membership tests.
-    pub(crate) purls: HashSet<String>,
+    /// The lockfile-only packages' identities ([`PurlKey`]), keyed once so
+    /// [`lockfile_only_contains`] is a single hash lookup.
+    pub(crate) purls: HashSet<PurlKey>,
     /// The FULL lockfile inventory the supplement was derived from (installed
     /// packages included), kept so the hosted-wiring probes reuse it instead
     /// of re-parsing every project lockfile. Empty for global scans.
@@ -74,7 +75,29 @@ pub(crate) async fn lockfile_supplement(
     if entries.is_empty() {
         return out;
     }
-    let crawled_purls: HashSet<&str> = crawled.iter().map(|p| p.purl.as_str()).collect();
+    (out.packages, out.purls) = lockfile_only_packages(entries, crawled, only, &common.cwd);
+    out.entries = entries.clone();
+    out
+}
+
+/// The lockfile entries with no crawled counterpart, fabricated as crawl
+/// entries, plus their [`PurlKey`]s. "Crawled" is by [`PurlKey`], the same
+/// relation [`lockfile_only_contains`] answers by: a lock spelling that
+/// differs from the installed crawl's only in encoding, NuGet case, PEP 503
+/// form or composer padding is the installed package, not a lockfile-only
+/// one — keyed in, its every spelling would read as not installed.
+fn lockfile_only_packages(
+    entries: &[LockfileEntry],
+    crawled: &[socket_patch_core::crawlers::types::CrawledPackage],
+    only: Option<&[String]>,
+    cwd: &std::path::Path,
+) -> (
+    Vec<socket_patch_core::crawlers::types::CrawledPackage>,
+    HashSet<PurlKey>,
+) {
+    let mut packages = Vec::new();
+    let mut purls = HashSet::new();
+    let crawled_keys: HashSet<PurlKey> = crawled.iter().map(|p| PurlKey::new(&p.purl)).collect();
     let in_scope = |purl: &str| {
         only.is_none_or(|list| {
             socket_patch_core::crawlers::Ecosystem::from_purl(purl)
@@ -82,30 +105,28 @@ pub(crate) async fn lockfile_supplement(
         })
     };
     for entry in entries {
-        if crawled_purls.contains(entry.purl.as_str()) || !in_scope(&entry.purl) {
+        let key = PurlKey::new(&entry.purl);
+        if crawled_keys.contains(&key) || !in_scope(&entry.purl) {
             continue;
         }
-        let Some(pkg) = crawled_from_purl(&entry.purl, &common.cwd) else {
+        let Some(pkg) = crawled_from_purl(&entry.purl, cwd) else {
             continue;
         };
-        out.purls.insert(entry.purl.clone());
-        out.packages.push(pkg);
+        purls.insert(key);
+        packages.push(pkg);
     }
-    out.entries = entries.clone();
-    out
+    (packages, purls)
 }
 
 /// Whether an API-spelled purl (percent-encoded, possibly qualified) names
-/// a lockfile-only package: `purls` holds the crawler's literal spelling, so
-/// the comparison bridges the two via `normalize_purl`. The ONE predicate
-/// behind the `notInstalled` flag, the `[NOT INSTALLED]` marker, the
+/// a lockfile-only package: `purls` holds the crawler spellings' keys, so
+/// the comparison bridges the two by [`PurlKey`] (encoding, qualifiers,
+/// PyPI/NuGet name folding, composer release identity: the API may serve
+/// the padded `@3.0.2.0` for a lock's `3.0.2`). The ONE predicate behind the
+/// `notInstalled` flag, the `[NOT INSTALLED]` marker, the
 /// `package_not_installed` skip partition and the vendor baseline pre-check.
-/// A composer purl also matches its lock spelling of the same release (the
-/// API may serve the padded `@3.0.2.0` for a lock's `3.0.2`).
-pub(super) fn lockfile_only_contains(purls: &HashSet<String>, api_purl: &str) -> bool {
-    let base = strip_purl_qualifiers(api_purl);
-    purls.contains(normalize_purl(base).as_ref())
-        || (base.starts_with("pkg:composer/") && purls.iter().any(|p| purl_eq(p, base)))
+pub(super) fn lockfile_only_contains(purls: &HashSet<PurlKey>, api_purl: &str) -> bool {
+    purls.contains(&PurlKey::new(api_purl))
 }
 
 /// A displayable crawl entry fabricated from a purl (decoded form). The
@@ -152,16 +173,20 @@ pub(crate) struct LedgerSupplement {
 /// the ledger `run` already loaded (`vendor::load_state`).
 ///
 /// That holds only while the lock still wires the artifact. An entry the
-/// lockfile in-use probe (the one the prune GC reverts by) answers
-/// `Some(false)` for is the dependency having left the lock — bumped or
+/// project no longer consumes ([`Discovery::vendor_entry_in_use`] is
+/// `Some(false)` — the verdict the prune GC reverts by, read from `ctx`'s
+/// discovery) is the dependency having left the lock — bumped or
 /// uninstalled — and is reported in [`LedgerSupplement::unwired`] instead:
 /// re-vendoring it would fail against a lock that no longer has it. `None`
-/// (no probe for the ecosystem, or no readable lock) keeps the entry.
+/// (no readable lock for the ecosystem) keeps the entry.
+///
+/// [`Discovery::vendor_entry_in_use`]: socket_patch_core::vex::discover::Discovery::vendor_entry_in_use
 pub(crate) async fn vendored_ledger_supplement(
-    common: &GlobalArgs,
+    ctx: &crate::commands::context::ProjectContext<'_>,
     crawled: &[socket_patch_core::crawlers::types::CrawledPackage],
     state: &std::io::Result<VendorState>,
 ) -> LedgerSupplement {
+    let common = ctx.common;
     let mut out = LedgerSupplement::default();
     if common.is_global() {
         return out;
@@ -194,18 +219,23 @@ pub(crate) async fn vendored_ledger_supplement(
             .map(|base| (base.clone(), base, None))
             .collect(),
     };
-    // Composer by release identity: a ledger `@3.0.2.0` is the crawled
-    // `@3.0.2`, not a second package to supplement.
-    let key = |p: &str| composer_purl_identity(p).unwrap_or_else(|| normalize_purl(p).into_owned());
-    let crawled_norm: HashSet<String> = crawled.iter().map(|p| key(&p.purl)).collect();
-    let mut seen: HashSet<String> = HashSet::new();
+    // By release identity: a ledger `@3.0.2.0` is the crawled composer
+    // `@3.0.2`, a ledger `Newtonsoft.Json` the crawled `newtonsoft.json` —
+    // not a second package to supplement.
+    let crawled_norm: HashSet<PurlKey> = crawled.iter().map(|p| PurlKey::new(&p.purl)).collect();
+    let mut seen: HashSet<PurlKey> = HashSet::new();
     for (ledger_key, base, entry) in &candidates {
-        let norm = key(base);
+        let norm = PurlKey::new(base);
         if crawled_norm.contains(&norm) || seen.contains(&norm) {
             continue;
         }
         if let Some(entry) = entry {
-            if crate::commands::vendor::dispatch_in_use_one(entry, &common.cwd).await == Some(false)
+            if ctx
+                .discovery()
+                .await
+                .vendor_entry_in_use(&common.cwd, entry)
+                .await
+                == Some(false)
             {
                 out.unwired.push(ledger_key.clone());
                 continue;
@@ -268,7 +298,7 @@ pub(super) async fn preverify_vendor_baselines<W: std::io::Write>(
     api_client: &socket_patch_core::api::client::ApiClient,
     selected: &[PatchSearchResult],
     crawled: &[socket_patch_core::crawlers::types::CrawledPackage],
-    lockfile_only: &HashSet<String>,
+    lockfile_only: &HashSet<PurlKey>,
     vendor: Option<&HashMap<String, socket_patch_core::vendor::VendorEntry>>,
     status: &mut crate::ui::StatusLine<W>,
 ) -> (HashSet<String>, HashMap<String, PatchResponse>) {
@@ -291,7 +321,7 @@ pub(super) async fn preverify_vendor_baselines<W: std::io::Write>(
         .iter()
         .map(|patch| {
             // API purls come percent-encoded, crawler purls literal —
-            // purl_eq bridges the two spellings.
+            // PurlKey bridges the two spellings.
             let base = strip_purl_qualifiers(&patch.purl);
             // Lockfile-only packages have no installed bytes to compare
             // — the vendor engine fetches them pristine (nothing to
@@ -299,7 +329,7 @@ pub(super) async fn preverify_vendor_baselines<W: std::io::Write>(
             if lockfile_only_contains(lockfile_only, base) {
                 return None;
             }
-            let pkg = crawled.iter().find(|c| purl_eq(&c.purl, base))?;
+            let pkg = crawled.iter().find(|c| PurlKey::same(&c.purl, base))?;
             // The same predicate as the download phase's ledger
             // idempotency skip: its no-fetch set and this one must be
             // the same set.
@@ -427,19 +457,20 @@ pub(super) fn detect_updates(
         // artifact-pinned ecosystems, qualified (`?artifact_id=...`); the
         // batch *package* purl is the crawler's literal spelling. Bridge
         // both divergences like the lockfile-only partition does: exact hit
-        // first, then a normalized qualifier-stripped comparison (composer
-        // by release identity: a `@3.0.2.0` key is the crawler's `@3.0.2`).
+        // first, then by [`PurlKey`] (a composer `@3.0.2.0` key is the
+        // crawler's `@3.0.2`, a NuGet `Newtonsoft.Json` key its lowercase
+        // global-cache spelling).
         //
         // Qualifier TWINS (e.g. a pypi wheel + sdist pair) all match the
         // stripped form: any stale twin means an update, so prefer the
         // first (sorted-key order, for stability) whose uuid differs.
         let existing = manifest.patches.get(&pkg.purl).or_else(|| {
-            let want = purl_identity_key(&pkg.purl);
+            let want = PurlKey::new(&pkg.purl);
             let mut twins: Vec<(&String, &socket_patch_core::manifest::schema::PatchRecord)> =
                 manifest
                     .patches
                     .iter()
-                    .filter(|(k, _)| purl_identity_key(k) == want)
+                    .filter(|(k, _)| PurlKey::new(k) == want)
                     .collect();
             twins.sort_by(|a, b| a.0.cmp(b.0));
             twins
@@ -553,6 +584,56 @@ mod tests {
     use std::borrow::Cow;
 
     use crate::commands::scan::tests::manifest_with;
+
+    // ---- lockfile_only_packages --------------------------------------------
+
+    fn lock_entry(ecosystem: &'static str, purl: &str) -> LockfileEntry {
+        use socket_patch_core::vendor::lock_inventory::{LockIntegrity, SourceKind};
+        LockfileEntry {
+            ecosystem,
+            name: String::new(),
+            version: String::new(),
+            purl: purl.to_string(),
+            resolved: None,
+            integrity: LockIntegrity::None,
+            source_kind: SourceKind::Unspecified,
+        }
+    }
+
+    fn crawled_from(purl: &str) -> socket_patch_core::crawlers::types::CrawledPackage {
+        crawled_from_purl(purl, std::path::Path::new("/p")).unwrap()
+    }
+
+    /// An installed package whose lock spelling differs from the crawl's
+    /// (NuGet case, PEP 503 form, composer padding) is NOT lockfile-only:
+    /// keyed in, [`lockfile_only_contains`] would mark every spelling of the
+    /// live install `package_not_installed`. A truly absent one still is.
+    #[test]
+    fn lockfile_only_packages_excludes_crawled_spelling_variants() {
+        let entries = vec![
+            lock_entry("nuget", "pkg:nuget/Newtonsoft.Json@13.0.1"),
+            lock_entry("pypi", "pkg:pypi/typing_extensions@4.12.2"),
+            lock_entry("composer", "pkg:composer/psr/log@3.0.2"),
+            lock_entry("npm", "pkg:npm/lockonly@1.0.0"),
+        ];
+        let crawled = vec![
+            crawled_from("pkg:nuget/newtonsoft.json@13.0.1"),
+            crawled_from("pkg:pypi/typing-extensions@4.12.2"),
+            crawled_from("pkg:composer/psr/log@3.0.2.0"),
+        ];
+        let (packages, purls) =
+            lockfile_only_packages(&entries, &crawled, None, std::path::Path::new("/p"));
+        let got: Vec<&str> = packages.iter().map(|p| p.purl.as_str()).collect();
+        assert_eq!(got, vec!["pkg:npm/lockonly@1.0.0"]);
+        assert!(lockfile_only_contains(&purls, "pkg:npm/lockonly@1.0.0"));
+        for api in [
+            "pkg:nuget/Newtonsoft.Json@13.0.1",
+            "pkg:pypi/typing-extensions@4.12.2",
+            "pkg:composer/psr/log@3.0.2.0",
+        ] {
+            assert!(!lockfile_only_contains(&purls, api), "{api}");
+        }
+    }
 
     // ---- severity_order ----------------------------------------------------
 
@@ -1048,9 +1129,13 @@ mod tests {
             ..GlobalArgs::default()
         };
         let state = socket_patch_core::vendor::load_state(root).await;
-        vendored_ledger_supplement(&args, crawled, &state)
-            .await
-            .packages
+        vendored_ledger_supplement(
+            &crate::commands::context::ProjectContext::new(&args),
+            crawled,
+            &state,
+        )
+        .await
+        .packages
     }
 
     /// A ledger entry vendored as `@3.0.2.0` is the crawled composer
@@ -1076,18 +1161,26 @@ mod tests {
             cwd: tmp.path().to_path_buf(),
             ..GlobalArgs::default()
         };
-        let out = vendored_ledger_supplement(&args, &[crawled], &Ok(state.clone()))
-            .await
-            .packages;
+        let out = vendored_ledger_supplement(
+            &crate::commands::context::ProjectContext::new(&args),
+            &[crawled],
+            &Ok(state.clone()),
+        )
+        .await
+        .packages;
         assert!(
             out.is_empty(),
             "{:?}",
             out.iter().map(|p| &p.purl).collect::<Vec<_>>()
         );
 
-        let out = vendored_ledger_supplement(&args, &[], &Ok(state))
-            .await
-            .packages;
+        let out = vendored_ledger_supplement(
+            &crate::commands::context::ProjectContext::new(&args),
+            &[],
+            &Ok(state),
+        )
+        .await
+        .packages;
         assert_eq!(
             out.iter().map(|p| p.purl.as_str()).collect::<Vec<_>>(),
             vec!["pkg:composer/psr/log@3.0.2.0"]
@@ -1157,7 +1250,12 @@ mod tests {
         })
         .to_string();
         let state = npm_ledger_with_lock(tmp.path(), Some(&bumped)).await;
-        let out = vendored_ledger_supplement(&args(tmp.path()), &[], &state).await;
+        let out = vendored_ledger_supplement(
+            &crate::commands::context::ProjectContext::new(&args(tmp.path())),
+            &[],
+            &state,
+        )
+        .await;
         assert!(out.packages.is_empty(), "{:?}", out.packages);
         assert_eq!(out.unwired, vec!["pkg:npm/left-pad@1.3.0".to_string()]);
 
@@ -1165,9 +1263,67 @@ mod tests {
         let tmp = tempfile::tempdir().unwrap();
         let removed = r#"{"name":"app","lockfileVersion":3,"packages":{"":{"name":"app"}}}"#;
         let state = npm_ledger_with_lock(tmp.path(), Some(removed)).await;
-        let out = vendored_ledger_supplement(&args(tmp.path()), &[], &state).await;
+        let out = vendored_ledger_supplement(
+            &crate::commands::context::ProjectContext::new(&args(tmp.path())),
+            &[],
+            &state,
+        )
+        .await;
         assert!(out.packages.is_empty(), "{:?}", out.packages);
         assert_eq!(out.unwired, vec!["pkg:npm/left-pad@1.3.0".to_string()]);
+    }
+
+    /// B19: the supplement and the prune GC share one in-use verdict for
+    /// every ecosystem, not only npm/cargo/pypi-requirements. A COMPOSER
+    /// entry whose dependency composer.lock bumped to a registry release is
+    /// unwired — before, it was resurrected as a discovered package forever.
+    #[tokio::test]
+    async fn ledger_supplement_reports_a_bumped_composer_entry_unwired() {
+        const COMPOSER_PURL: &str = "pkg:composer/monolog/monolog@3.0.0";
+        let tmp = tempfile::tempdir().unwrap();
+        let root = tmp.path();
+        let leaf = format!(".socket/vendor/composer/{VENDORED_UUID}/monolog/monolog@3.0.0");
+        let entry: socket_patch_core::vendor::VendorEntry =
+            serde_json::from_value(serde_json::json!({
+                "ecosystem": "composer",
+                "basePurl": COMPOSER_PURL,
+                "uuid": VENDORED_UUID,
+                "artifact": {"path": leaf, "sha256": ""},
+                "wiring": [],
+                "detached": true,
+            }))
+            .unwrap();
+        let mut state = VendorState::default();
+        state.entries.insert(COMPOSER_PURL.to_string(), entry);
+        std::fs::write(
+            root.join("composer.lock"),
+            serde_json::json!({
+                "packages": [{
+                    "name": "monolog/monolog",
+                    "version": "3.1.0",
+                    "dist": {
+                        "type": "zip",
+                        "url": "https://api.github.com/repos/Seldaek/monolog/zipball/abc",
+                        "reference": "abc",
+                    },
+                }],
+                "packages-dev": [],
+            })
+            .to_string(),
+        )
+        .unwrap();
+        let args = GlobalArgs {
+            cwd: root.to_path_buf(),
+            ..GlobalArgs::default()
+        };
+        let out = vendored_ledger_supplement(
+            &crate::commands::context::ProjectContext::new(&args),
+            &[],
+            &Ok(state),
+        )
+        .await;
+        assert!(out.packages.is_empty(), "{:?}", out.packages);
+        assert_eq!(out.unwired, vec![COMPOSER_PURL.to_string()]);
     }
 
     /// The fresh-clone case the supplement exists for: the lock still
@@ -1188,7 +1344,12 @@ mod tests {
                 ..GlobalArgs::default()
             };
             let state = npm_ledger_with_lock(tmp.path(), lock.as_deref()).await;
-            let out = vendored_ledger_supplement(&args, &[], &state).await;
+            let out = vendored_ledger_supplement(
+                &crate::commands::context::ProjectContext::new(&args),
+                &[],
+                &state,
+            )
+            .await;
             assert_eq!(
                 out.packages
                     .iter()
@@ -1713,8 +1874,8 @@ mod tests {
                 std::path::PathBuf::from("/nonexistent"),
             ),
         ];
-        let lockfile_only: HashSet<String> =
-            std::iter::once("pkg:npm/@scope/lockonly@1.0.0".to_string()).collect();
+        let lockfile_only: HashSet<PurlKey> =
+            std::iter::once(PurlKey::new("pkg:npm/@scope/lockonly@1.0.0")).collect();
 
         // A live status line: every step is shown, and the line is gone
         // once the check returns (nothing left over for the preview).
@@ -2182,7 +2343,7 @@ mod tests {
             &api_client_for(&mock.uri()),
             &selected,
             &crawled,
-            &std::iter::once("pkg:npm/lockonly@1.0.0".to_string()).collect(),
+            &std::iter::once(PurlKey::new("pkg:npm/lockonly@1.0.0")).collect(),
             Some(&ledger),
             &mut crate::ui::StatusLine::new(Vec::new(), false, false, 80),
         )
