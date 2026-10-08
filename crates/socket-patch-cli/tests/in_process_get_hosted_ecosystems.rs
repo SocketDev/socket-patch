@@ -315,6 +315,61 @@ async fn pypi_requirements_hosted_rewrites_pep440_equivalent_pin() {
     }
 }
 
+/// #721: Windows PowerShell 5.1 writes `pip freeze > requirements.txt` as
+/// UTF-16 with a BOM, and pip installs from it. The hosted grant must not
+/// treat that file as absent and exit 0 with the project unpatched: it is
+/// refused by name (`candidate_file_unreadable`, exit 1), nothing written.
+#[tokio::test]
+#[serial]
+async fn pypi_requirements_hosted_refuses_a_utf16_file() {
+    const UUID: &str = "a1a1a1a1-a1a1-4a1a-8a1a-a1a1a1a1a1a3";
+    const PURL: &str = "pkg:pypi/requests@2.31.0";
+    const SHA256: &str = "0123456789abcdef0123456789abcdef0123456789abcdef0123456789abcdef";
+    let url = format!(
+        "http://patch.test/patch/pypi/requests/2.31.0/{TOKEN}/{UUID}/requests-2.31.0-py3-none-any.whl"
+    );
+
+    let text = "flask==2.0.1\r\nrequests==2.31.0\r\n";
+    let le: Vec<u8> = [0xFF, 0xFE]
+        .into_iter()
+        .chain(text.encode_utf16().flat_map(u16::to_le_bytes))
+        .collect();
+    let be: Vec<u8> = [0xFE, 0xFF]
+        .into_iter()
+        .chain(text.encode_utf16().flat_map(u16::to_be_bytes))
+        .collect();
+    for (what, bytes) in [("utf-16le", le), ("utf-16be", be)] {
+        let server = MockServer::start().await;
+        mock_view(&server, UUID, PURL).await;
+        mock_reference(
+            &server,
+            UUID,
+            PURL,
+            &url,
+            serde_json::json!({ "sha256": SHA256 }),
+            serde_json::Value::Null,
+        )
+        .await;
+
+        let tmp = tempfile::tempdir().unwrap();
+        std::fs::write(tmp.path().join("requirements.txt"), &bytes).unwrap();
+
+        let code =
+            socket_patch_cli::commands::get::run(get_hosted_args(UUID, tmp.path(), server.uri()))
+                .await;
+        assert_eq!(
+            code, 1,
+            "{what}: a requirements.txt hosted mode cannot read must refuse, not exit 0 unpatched"
+        );
+        assert_eq!(
+            std::fs::read(tmp.path().join("requirements.txt")).unwrap(),
+            bytes,
+            "{what}: the refused file must stay byte-identical"
+        );
+        assert_no_manifest_no_blobs(tmp.path());
+    }
+}
+
 // ---------------------------------------------------------------------------
 // maven — pom.xml fail-closed suffixed-version pin (rewrite_maven_pom)
 // ---------------------------------------------------------------------------
@@ -519,7 +574,11 @@ fn maven_hosted_get_state_attests_without_manifest(
         &[(purl, vlt_hosted_common::legacy_record_from_view(&view))],
     );
     let out = run_vex(&binary(), project, &offline);
-    assert_eq!(out.code, Some(0), "a pre-v5 ledger record serves offline: {out}");
+    assert_eq!(
+        out.code,
+        Some(0),
+        "a pre-v5 ledger record serves offline: {out}"
+    );
     assert_attested(out.doc(), purl, uuid, Marker::Redirected, &vulns);
     quiet.assert_no_requests();
 
@@ -800,7 +859,11 @@ fn nuget_hosted_manifestless_vex(root: &Path, uuid: &str, purl: &str) {
         &[(purl, vlt_hosted_common::legacy_record_from_view(&view))],
     );
     let out = run(VexRun::offline());
-    assert_eq!(out.code, Some(0), "a pre-v5 ledger record serves offline: {out}");
+    assert_eq!(
+        out.code,
+        Some(0),
+        "a pre-v5 ledger record serves offline: {out}"
+    );
     assert_attested(out.doc(), purl, uuid, Marker::Redirected, vulns);
 
     std::fs::write(

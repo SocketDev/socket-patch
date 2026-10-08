@@ -57,11 +57,11 @@ use std::collections::{BTreeMap, BTreeSet};
 use regex::Regex;
 
 use super::{Ctx, FormatResult, HostedPin, View};
-use crate::utils::line_endings::{to_lf, LineEndings};
-use crate::vendor::gem::{gem_declaration_any, quoted_literal};
 use crate::formats::gem::{
     bundler_manifest_for, parse_spec, same_remote, split_checksum_entry, BUNDLER_LOCKS,
 };
+use crate::utils::line_endings::{to_lf, LineEndings};
+use crate::vendor::gem::{gem_declaration_any, quoted_literal};
 
 /// The default upstream `GEM` remote.
 const RUBYGEMS_REMOTE: &str = "https://rubygems.org/";
@@ -250,17 +250,14 @@ fn choose_upstream(
 /// The line after which a spec named `name-version` sorts into `sec`
 /// (bundler writes specs sorted by full name).
 fn insertion_point(sec: &GemSec, full_name: &str) -> Option<usize> {
-    let pred = sec
-        .entries
-        .iter()
-        .rfind(|e| {
-            let full = if e.version.is_empty() {
-                e.name.clone()
-            } else {
-                format!("{}-{}", e.name, e.version)
-            };
-            full.as_str() < full_name
-        });
+    let pred = sec.entries.iter().rfind(|e| {
+        let full = if e.version.is_empty() {
+            e.name.clone()
+        } else {
+            format!("{}-{}", e.name, e.version)
+        };
+        full.as_str() < full_name
+    });
     pred.map(|e| e.last).or(sec.specs_line)
 }
 

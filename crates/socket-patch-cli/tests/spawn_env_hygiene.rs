@@ -272,6 +272,137 @@ fn command_scrubs_ambient_socket_vars_and_forces_the_opt_outs() {
     );
 }
 
+/// B69: a test child must never POST telemetry to the real public proxy.
+/// An ambient opt-in (`SOCKET_TELEMETRY_DISABLED=0`, or a developer shell
+/// that removed the `.cargo/config.toml` default) must not reach the child;
+/// a suite that asserts telemetry sets its own value after `command`.
+#[test]
+#[serial]
+fn command_forces_telemetry_off() {
+    for ambient in ["0", ""] {
+        with_ambient(&[("SOCKET_TELEMETRY_DISABLED", ambient)], || {
+            let env = effective_env(&hermetic::command(Path::new("socket-patch")));
+            assert_eq!(
+                get(&env, "SOCKET_TELEMETRY_DISABLED"),
+                Some("1"),
+                "ambient SOCKET_TELEMETRY_DISABLED={ambient:?} must not re-enable telemetry"
+            );
+        });
+    }
+    let mut cmd = hermetic::command(Path::new("socket-patch"));
+    cmd.env("SOCKET_TELEMETRY_DISABLED", "0");
+    assert_eq!(
+        get(&effective_env(&cmd), "SOCKET_TELEMETRY_DISABLED"),
+        Some("0"),
+        "a telemetry suite's own opt-in lands last"
+    );
+}
+
+/// B69: every process `cargo test` / `cargo run` starts (and every child it
+/// spawns without a scrub) inherits the three opt-outs from the workspace
+/// `.cargo/config.toml` `[env]` table.
+#[test]
+fn cargo_config_env_carries_the_opt_outs() {
+    let config = Path::new(env!("CARGO_MANIFEST_DIR")).join("../../.cargo/config.toml");
+    let text = std::fs::read_to_string(&config)
+        .unwrap_or_else(|e| panic!("read {}: {e}", config.display()))
+        .replace("\r\n", "\n");
+    let env_table = text
+        .split("\n[env]\n")
+        .nth(1)
+        .unwrap_or_else(|| panic!("{} has no [env] table", config.display()));
+    let env_table = env_table.split("\n[").next().unwrap_or(env_table);
+    for var in [
+        "SOCKET_NO_CONFIG",
+        "SOCKET_NO_UPDATE_CHECK",
+        "SOCKET_TELEMETRY_DISABLED",
+    ] {
+        assert!(
+            env_table
+                .lines()
+                .any(|line| line.trim() == format!("{var} = \"1\"")),
+            "{} [env] must set {var} = \"1\"",
+            config.display()
+        );
+    }
+}
+
+/// B69: CI legs that run the prebuilt test binaries directly (not through
+/// cargo) do not get the `[env]` table, so their workflow env blocks copy it
+/// by hand. Any env block that copies one opt-out must copy all three.
+#[test]
+fn workflow_env_copies_carry_every_opt_out() {
+    const OPT_OUTS: [&str; 3] = [
+        "SOCKET_NO_CONFIG",
+        "SOCKET_NO_UPDATE_CHECK",
+        "SOCKET_TELEMETRY_DISABLED",
+    ];
+    let dir = Path::new(env!("CARGO_MANIFEST_DIR")).join("../../.github/workflows");
+    let mut entries: Vec<_> = std::fs::read_dir(&dir)
+        .unwrap_or_else(|e| panic!("read {}: {e}", dir.display()))
+        .map(|e| e.expect("workflow dir entry").path())
+        .filter(|p| p.extension().is_some_and(|x| x == "yml" || x == "yaml"))
+        .collect();
+    entries.sort();
+    let mut copies = 0;
+    let mut missing = Vec::new();
+    for path in entries {
+        let text = std::fs::read_to_string(&path)
+            .unwrap_or_else(|e| panic!("read {}: {e}", path.display()))
+            .replace("\r\n", "\n");
+        let lines: Vec<&str> = text.lines().collect();
+        // An env block is a run of `KEY: value` lines at one indent; find
+        // every run that sets any opt-out and check it sets them all.
+        let mut i = 0;
+        while i < lines.len() {
+            let line = lines[i];
+            let Some(var) = OPT_OUTS
+                .iter()
+                .find(|v| line.trim_start().starts_with(&format!("{v}:")))
+            else {
+                i += 1;
+                continue;
+            };
+            let indent = line.len() - line.trim_start().len();
+            let same_block = |l: &&str| {
+                let t = l.trim_start();
+                l.len() - t.len() == indent && !t.is_empty() && !t.starts_with('-')
+            };
+            let mut start = i;
+            while start > 0 && same_block(&lines[start - 1]) {
+                start -= 1;
+            }
+            let mut end = i;
+            while end + 1 < lines.len() && same_block(&lines[end + 1]) {
+                end += 1;
+            }
+            let block = &lines[start..=end];
+            copies += 1;
+            for want in OPT_OUTS {
+                let set = block.iter().any(|l| l.trim() == format!("{want}: '1'"));
+                if !set {
+                    missing.push(format!(
+                        "{}:{} (block with {var}) lacks {want}: '1'",
+                        path.display(),
+                        start + 1
+                    ));
+                }
+            }
+            i = end + 1;
+        }
+    }
+    assert!(
+        copies > 0,
+        "found no workflow env copy of the [env] opt-outs"
+    );
+    assert!(
+        missing.is_empty(),
+        "workflow env blocks that copy .cargo/config.toml [env] must set all \
+         three opt-outs:\n{}",
+        missing.join("\n")
+    );
+}
+
 #[test]
 #[serial]
 fn command_never_leaks_its_hostile_seeds() {
@@ -460,8 +591,10 @@ fn no_new_private_scrub_socket_env_copies() {
         .collect();
     assert!(
         unexpected.is_empty(),
-        "spawn through `common/hermetic.rs` (hermetic::command + scrub_extra) \
-         instead of a private scrub_socket_env: {unexpected:?}"
+        "these test files define a private scrub_socket_env: {unexpected:?}. \
+         Spawn through `tests/common/hermetic.rs` instead (hermetic::command \
+         for the binary, scrub_socket_vars + scrub_extra for package-manager \
+         children). Do not add them to PENDING_SCRUB_COPIES."
     );
     let stale: Vec<&&str> = PENDING_SCRUB_COPIES
         .iter()
@@ -469,8 +602,10 @@ fn no_new_private_scrub_socket_env_copies() {
         .collect();
     assert!(
         stale.is_empty(),
-        "these files no longer carry a scrub_socket_env copy; drop them from \
-         PENDING_SCRUB_COPIES: {stale:?}"
+        "these files no longer carry a scrub_socket_env copy: {stale:?}. Delete \
+         them from PENDING_SCRUB_COPIES in \
+         crates/socket-patch-cli/tests/spawn_env_hygiene.rs (another PR may \
+         have migrated them; rebase and drop the entries)."
     );
 }
 
@@ -487,8 +622,11 @@ fn no_new_bare_binary_spawns() {
         .collect();
     assert!(
         unexpected.is_empty(),
-        "spawn the binary through `hermetic::command` / `common::run*`, not a \
-         bare Command::new: {unexpected:?}"
+        "these test files spawn the binary with a bare Command::new: \
+         {unexpected:?}. Use `hermetic::command(&bin)` / \
+         `hermetic::binary_command()` or `common::run*` (tests/common/) so the \
+         child gets the hermetic SOCKET_* environment. Do not add them to \
+         PENDING_RAW_SPAWNS."
     );
     let stale: Vec<&&str> = PENDING_RAW_SPAWNS
         .iter()
@@ -496,7 +634,9 @@ fn no_new_bare_binary_spawns() {
         .collect();
     assert!(
         stale.is_empty(),
-        "these files no longer spawn the binary bare; drop them from \
-         PENDING_RAW_SPAWNS: {stale:?}"
+        "these files no longer spawn the binary bare: {stale:?}. Delete them \
+         from PENDING_RAW_SPAWNS in \
+         crates/socket-patch-cli/tests/spawn_env_hygiene.rs (another PR may \
+         have migrated them; rebase and drop the entries)."
     );
 }

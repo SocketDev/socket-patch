@@ -42,12 +42,7 @@ impl ResolvedOptions {
     /// as `flag`), then the socket.yml `patches.maxNewPatches`, then
     /// unlimited; `maxNewPatchesCap` only tightens it.
     pub(crate) fn max_new(&self, file: Option<u32>) -> crate::rollout::MaxNew {
-        crate::rollout::resolve_max_new(
-            self.max_new_patches,
-            None,
-            file,
-            self.max_new_patches_cap,
-        )
+        crate::rollout::resolve_max_new(self.max_new_patches, None, file, self.max_new_patches_cap)
     }
 }
 
@@ -79,8 +74,9 @@ pub(crate) fn resolve_options(options: &HostedScanOptions) -> Result<ResolvedOpt
     let min_severity = match options.min_severity.as_deref() {
         None => None,
         Some(value) => Some((
-            crate::policy::parse_min_severity(value)
-                .map_err(|e| EngineError::invalid("invalid_min_severity", format!("minSeverity: {e}")))?,
+            crate::policy::parse_min_severity(value).map_err(|e| {
+                EngineError::invalid("invalid_min_severity", format!("minSeverity: {e}"))
+            })?,
             crate::policy::OverrideSource::Flag,
         )),
     };
@@ -153,7 +149,7 @@ pub(crate) fn resolve_options(options: &HostedScanOptions) -> Result<ResolvedOpt
             .in_flight_patches
             .iter()
             .flatten()
-            .map(|p| crate::rollout::canonical_base_purl(p))
+            .map(|p| crate::utils::purl_key::PurlKey::new(p).into_string())
             .collect(),
         policy_overrides,
         policy_paths,

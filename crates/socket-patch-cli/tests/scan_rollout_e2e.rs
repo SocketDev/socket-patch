@@ -353,6 +353,12 @@ async fn hosted_cap_rolls_nine_packages_forward_three_per_run() {
             let mut block = block.clone();
             let obj = block.as_object_mut().unwrap();
             obj.remove("dryRun");
+            // `patches[]` rows switch tense too: `would_pin` / `pinned`.
+            for row in obj["patches"].as_array_mut().unwrap() {
+                if row["action"] == "would_pin" {
+                    row["action"] = json!("pinned");
+                }
+            }
             let codes: Vec<Value> = obj["warnings"]
                 .as_array()
                 .unwrap()

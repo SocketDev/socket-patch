@@ -44,7 +44,9 @@ Every `--json` failure now reports its top-level `error` as an object,
   rollback's `results[*].error` stay strings.
 - Usage errors (exit 2) that `scan`, `remove` and `rollback` enforce themselves
   now print the coded error on stdout under `--json`, as `get`, `repair`,
-  `vendor` and `vex` do. Clap's own parse errors still print nothing on stdout.
+  `vendor` and `vex` do. Clap's own parse errors, and the check that a
+  `--cwd`, `--global-prefix` or `--manifest-path` names something, still print
+  nothing on stdout.
 
 ```bash
 socket-patch scan --json | jq -r 'select(.status == "error") | .error.code'

@@ -11,11 +11,12 @@ use socket_patch_core::api::ranking::cmp_search_results;
 use socket_patch_core::api::types::PatchSearchResult;
 use socket_patch_core::manifest::schema::PatchManifest;
 use socket_patch_core::policy::{
-    canon, find_repo_root_with_warnings, policy_block, FilteredEntry, RetainedEntry, patch_severity_order, repo_relative_checked, sanitize, severity_name,
-    DiskPolicyFs, FilterReason, Offers, PolicyError, PolicySource, PolicyWarning, Root, SelectionPolicy,
-    PATCHES_DISABLED,
+    find_repo_root_with_warnings, patch_severity_order, policy_block, repo_relative_checked,
+    sanitize, severity_name, DiskPolicyFs, FilterReason, FilteredEntry, Offers, PolicyError,
+    PolicySource, PolicyWarning, RetainedEntry, Root, SelectionPolicy, PATCHES_DISABLED,
 };
 use socket_patch_core::utils::purl::normalize_purl;
+use socket_patch_core::utils::purl_key::PurlKey;
 
 use super::ScanArgs;
 use crate::hosted_memory::roots::{marker_ecosystem, UNSUPPORTED_MARKERS};
@@ -42,12 +43,18 @@ pub(crate) struct InvocationPolicy {
 /// Load the policy for `args` (4.5): `--global` scans have no repo and read
 /// no file; everything else reads the repo root's socket.yml.
 pub(crate) fn load_invocation_policy(args: &ScanArgs) -> Result<InvocationPolicy, PolicyLoadError> {
-    let overrides = args.socket_yml.overrides().map_err(PolicyLoadError::Usage)?;
+    let overrides = args
+        .socket_yml
+        .overrides()
+        .map_err(PolicyLoadError::Usage)?;
     let cwd = std::fs::canonicalize(&args.common.cwd).unwrap_or_else(|_| args.common.cwd.clone());
     if args.common.is_global() {
-        let policy = SelectionPolicy::load(&socket_patch_core::policy::MemoryPolicyFs::default(), &overrides)
-            .map_err(PolicyLoadError::Policy)?
-            .0;
+        let policy = SelectionPolicy::load(
+            &socket_patch_core::policy::MemoryPolicyFs::default(),
+            &overrides,
+        )
+        .map_err(PolicyLoadError::Policy)?
+        .0;
         return Ok(InvocationPolicy {
             policy,
             repo_root: cwd,
@@ -56,8 +63,8 @@ pub(crate) fn load_invocation_policy(args: &ScanArgs) -> Result<InvocationPolicy
         });
     }
     let (repo_root, mut warnings) = find_repo_root_with_warnings(&cwd);
-    let (policy, load_warnings) =
-        SelectionPolicy::load(&DiskPolicyFs::new(&repo_root), &overrides).map_err(PolicyLoadError::Policy)?;
+    let (policy, load_warnings) = SelectionPolicy::load(&DiskPolicyFs::new(&repo_root), &overrides)
+        .map_err(PolicyLoadError::Policy)?;
     warnings.extend(load_warnings);
     Ok(InvocationPolicy {
         policy,
@@ -141,7 +148,12 @@ pub(crate) struct ScanPolicy {
 
 impl ScanPolicy {
     /// The policy for the project rooted at `root_dir`.
-    pub(crate) fn for_root(invocation: &InvocationPolicy, root_dir: &Path, explicit: bool, global: bool) -> Self {
+    pub(crate) fn for_root(
+        invocation: &InvocationPolicy,
+        root_dir: &Path,
+        explicit: bool,
+        global: bool,
+    ) -> Self {
         let root_dir = std::fs::canonicalize(root_dir).unwrap_or_else(|_| root_dir.to_path_buf());
         let project = repo_relative_checked(&invocation.repo_root, &root_dir).unwrap_or_default();
         let root_verdict = if global {
@@ -174,7 +186,9 @@ impl ScanPolicy {
                 severity: None,
             });
         }
-        let announce_warnings = !invocation.warned.swap(true, std::sync::atomic::Ordering::Relaxed);
+        let announce_warnings = !invocation
+            .warned
+            .swap(true, std::sync::atomic::Ordering::Relaxed);
         Self {
             policy: invocation.policy.clone(),
             warnings,
@@ -212,14 +226,14 @@ impl ScanPolicy {
             .map(|m| {
                 m.patches
                     .iter()
-                    .map(|(purl, record)| (canon(purl), record.uuid.clone()))
+                    .map(|(purl, record)| (PurlKey::new(purl).into_string(), record.uuid.clone()))
                     .collect()
             })
             .unwrap_or_default();
     }
 
     fn recorded_uuid(&self, purl: &str) -> Option<&str> {
-        self.recorded.get(&canon(purl)).map(String::as_str)
+        self.recorded.get(&PurlKey::new(purl).into_string()).map(String::as_str)
     }
 
     /// Step 3: the root, ecosystem and package filters. Returns whether the
@@ -227,14 +241,17 @@ impl ScanPolicy {
     /// exclude stays in the query (so `upgradeAvailable` can be reported)
     /// but joins the retained set, which never reaches a writer.
     pub(crate) fn admit_crawled(&self, purl: &str) -> bool {
-        let verdict = self.root_verdict.clone().and_then(|()| self.policy.admits_purl(purl));
+        let verdict = self
+            .root_verdict
+            .clone()
+            .and_then(|()| self.policy.admits_purl(purl));
         let reason = match verdict {
             Ok(()) => return true,
             Err(reason) => reason,
         };
         let mut report = self.report();
         if let Some(uuid) = self.recorded_uuid(purl) {
-            let key = canon(purl);
+            let key = PurlKey::new(purl).into_string();
             if report.retained_purls.insert(key.clone()) {
                 report.retained.push(RetainedEntry {
                     purl: key,
@@ -248,9 +265,9 @@ impl ScanPolicy {
         }
         if self.root_verdict.is_err() {
             // Already reported as the root's one entry.
-        } else if report.filtered_purls.insert(canon(purl)) {
+        } else if report.filtered_purls.insert(PurlKey::new(purl).into_string()) {
             report.filtered.push(FilteredEntry {
-                purl: Some(canon(purl)),
+                purl: Some(PurlKey::new(purl).into_string()),
                 uuid: None,
                 project: self.project.clone(),
                 reason,
@@ -263,7 +280,7 @@ impl ScanPolicy {
     /// Record the purls with a newer patch (`updates[]`), for
     /// `retained[].upgradeAvailable`.
     pub(crate) fn set_update_purls<'a>(&self, purls: impl IntoIterator<Item = &'a str>) {
-        self.report().update_purls = purls.into_iter().map(canon).collect();
+        self.report().update_purls = purls.into_iter().map(|p| PurlKey::new(p).into_string()).collect();
     }
 
     /// Steps 5-6: group the tier-accessible offers, keep retained packages
@@ -277,7 +294,7 @@ impl ScanPolicy {
         {
             let report = self.report();
             for offer in accessible {
-                if report.retained_purls.contains(&canon(&offer.purl)) {
+                if report.retained_purls.contains(&PurlKey::new(&offer.purl).into_string()) {
                     continue;
                 }
                 grouped.entry(offer.purl.clone()).or_default().push(offer);
@@ -297,7 +314,7 @@ impl ScanPolicy {
                 let reason = FilterReason::Disabled;
                 match recorded {
                     Some(uuid) => {
-                        let key = canon(&purl);
+                        let key = PurlKey::new(&purl).into_string();
                         if report.retained_purls.insert(key.clone()) {
                             report.retained.push(RetainedEntry {
                                 purl: key,
@@ -309,7 +326,7 @@ impl ScanPolicy {
                         }
                     }
                     None => report.filtered.push(FilteredEntry {
-                        purl: Some(canon(&purl)),
+                        purl: Some(PurlKey::new(&purl).into_string()),
                         uuid: Some(group[0].uuid.clone()),
                         project: self.project.clone(),
                         severity: Some(patch_severity_order(&group[0])),
@@ -337,10 +354,11 @@ impl ScanPolicy {
             // (not when a lower-ranked admitted patch simply wins).
             let top_withheld = self.policy.admits_severity(patch_severity_order(&group[0]));
             if let Err(reason) = top_withheld {
-                let upgrade_withheld = chosen.is_some() && chosen == recorded_at && recorded_at != Some(0);
+                let upgrade_withheld =
+                    chosen.is_some() && chosen == recorded_at && recorded_at != Some(0);
                 if chosen.is_none() || upgrade_withheld {
                     report.filtered.push(FilteredEntry {
-                        purl: Some(canon(&purl)),
+                        purl: Some(PurlKey::new(&purl).into_string()),
                         uuid: Some(group[0].uuid.clone()),
                         project: self.project.clone(),
                         severity: Some(patch_severity_order(&group[0])),
@@ -524,17 +542,20 @@ pub(crate) fn policy_bypass_warnings(
         let verdict = if !policy.enabled() {
             Err(FilterReason::Disabled)
         } else {
-            root_verdict.clone().and_then(|()| policy.admits_purl(purl)).and_then(|()| {
-                // The floor only hides a package when none of its patches pass.
-                match group
-                    .iter()
-                    .map(|p| policy.admits_severity(patch_severity_order(p)))
-                    .find(Result::is_ok)
-                {
-                    Some(ok) => ok,
-                    None => policy.admits_severity(patch_severity_order(group[0])),
-                }
-            })
+            root_verdict
+                .clone()
+                .and_then(|()| policy.admits_purl(purl))
+                .and_then(|()| {
+                    // The floor only hides a package when none of its patches pass.
+                    match group
+                        .iter()
+                        .map(|p| policy.admits_severity(patch_severity_order(p)))
+                        .find(Result::is_ok)
+                    {
+                        Some(ok) => ok,
+                        None => policy.admits_severity(patch_severity_order(group[0])),
+                    }
+                })
         };
         if let Err(reason) = verdict {
             out.push((
