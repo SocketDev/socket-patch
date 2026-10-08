@@ -23,7 +23,7 @@ pub fn decode_hosted_npm_manifest(bytes: &[u8], sha512: Option<&str>) -> Result<
         .ok_or_else(|| "hosted tarball has no package/package.json".to_string())?;
     let text = std::str::from_utf8(manifest)
         .map_err(|_| "hosted tarball package.json is not UTF-8".to_string())?;
-    let text = text.strip_prefix('\u{feff}').unwrap_or(text);
+    let text = crate::formats::text::strip_bom(text);
     if !serde_json::from_str::<serde_json::Value>(text).is_ok_and(|v| v.is_object()) {
         return Err("hosted tarball package.json is not a JSON object".to_string());
     }
@@ -95,5 +95,27 @@ mod tests {
             .unwrap_err()
             .contains("not a JSON object"));
         assert!(decode_hosted_npm_manifest(b"not gzip", None).is_err());
+    }
+
+    /// One leading BOM is encoding (npm strips it); a second is content
+    /// and leaves the manifest unparseable, as for every `formats::text`
+    /// reader.
+    #[test]
+    fn reads_past_one_bom_only() {
+        let one = tgz(&[(
+            "package/package.json",
+            "\u{feff}{\"name\":\"uuid\"}".as_bytes(),
+        )]);
+        assert_eq!(
+            decode_hosted_npm_manifest(&one, None).unwrap(),
+            "{\"name\":\"uuid\"}"
+        );
+        let two = tgz(&[(
+            "package/package.json",
+            "\u{feff}\u{feff}{\"name\":\"uuid\"}".as_bytes(),
+        )]);
+        assert!(decode_hosted_npm_manifest(&two, None)
+            .unwrap_err()
+            .contains("not a JSON object"));
     }
 }

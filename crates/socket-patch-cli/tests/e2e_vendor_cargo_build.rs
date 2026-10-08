@@ -79,6 +79,10 @@
 //! the fixture build (a failure instead under
 //! `SOCKET_PATCH_CARGO_E2E_REQUIRED=1`); all assertions after that are hard.
 
+#[path = "common/mod.rs"]
+mod common;
+use common::{binary, git_sha256};
+
 #[path = "prebuilt_common/mod.rs"]
 mod prebuilt_common;
 
@@ -200,10 +204,6 @@ fn metadata_version(dir: &Path, cargo_home: &Path) -> String {
 
 // ── self-contained helpers ────────────────────────────────────────────
 
-fn binary() -> PathBuf {
-    PathBuf::from(env!("CARGO_BIN_EXE_socket-patch"))
-}
-
 /// Run socket-patch with ambient `SOCKET_*` vars scrubbed and the fixture's
 /// private CARGO_HOME injected (the cargo crawler resolves the registry
 /// source tree through it).
@@ -239,13 +239,6 @@ fn cargo(cwd: &Path, args: &[&str], cargo_home: &Path) -> Output {
         .args(args)
         .output()
         .expect("failed to run cargo")
-}
-
-fn git_sha256(content: &[u8]) -> String {
-    let mut hasher = Sha256::new();
-    hasher.update(format!("blob {}\0", content.len()).as_bytes());
-    hasher.update(content);
-    hex::encode(hasher.finalize())
 }
 
 fn b64(bytes: &[u8]) -> String {

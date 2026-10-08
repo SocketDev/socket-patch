@@ -5,7 +5,7 @@
 use std::collections::HashSet;
 use std::path::Path;
 
-use super::{parse_cargo_toml_name_version, CargoCrawler};
+use super::{package_name_version, CargoCrawler};
 use crate::crawlers::types::{CrawledPackage, CrawlerOptions};
 
 pub(super) struct LegacyCargoCrawler;
@@ -60,7 +60,7 @@ impl LegacyCargoCrawler {
         let cargo_toml_path = crate_path.join("Cargo.toml");
         let content = tokio::fs::read_to_string(&cargo_toml_path).await.ok()?;
 
-        let (name, version) = parse_cargo_toml_name_version(&content)
+        let (name, version) = package_name_version(&content)
             .or_else(|| CargoCrawler::parse_dir_name_version(dir_name))?;
 
         let purl = crate::utils::purl::build_cargo_purl(&name, &version);

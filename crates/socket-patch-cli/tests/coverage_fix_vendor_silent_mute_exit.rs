@@ -20,14 +20,14 @@
 //! machine channel (`error.code = no_local_source`, as `in_process_vendor.rs`
 //! pins for the offline flavor).
 
-use std::path::{Path, PathBuf};
+#[path = "common/mod.rs"]
+mod common;
+use common::binary;
+
+use std::path::Path;
 use std::process::Command;
 
 use socket_patch_cli::args::GLOBAL_ARG_ENV_VARS;
-
-fn binary() -> PathBuf {
-    env!("CARGO_BIN_EXE_socket-patch").into()
-}
 
 /// Run `socket-patch vendor` in `cwd` with a scrubbed SOCKET_* environment
 /// so ambient developer/CI configuration (tokens, silent toggles) can't

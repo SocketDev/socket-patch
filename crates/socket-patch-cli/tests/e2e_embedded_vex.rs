@@ -30,7 +30,7 @@ fn binary() -> &'static str {
 /// Every embedded-VEX flag has an env fallback (`--vex`/`SOCKET_VEX`,
 /// `--vex-product`/`SOCKET_VEX_PRODUCT`, `--vex-no-verify`/
 /// `SOCKET_VEX_NO_VERIFY`, `--vex-doc-id`, `--vex-compact`), as do the
-/// `GlobalArgs` (`SOCKET_OFFLINE`, `SOCKET_FORCE`, `SOCKET_API_TOKEN`,
+/// `GlobalArgs` (`SOCKET_OFFLINE`, `SOCKET_API_TOKEN`,
 /// `SOCKET_ORG_SLUG`, …). If the ambient environment leaks any of these into
 /// the child, a test silently stops exercising the path it names —
 /// `apply_vex_failure_flips_exit_code` would no longer hit

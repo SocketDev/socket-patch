@@ -17,25 +17,12 @@
 //! physical copy is patched (and later restored) AND that the JSON summary
 //! counts every copy.
 
+use crate::common::{binary, git_sha256};
+
 use std::path::{Path, PathBuf};
 use std::process::Command;
 
-use sha2::{Digest, Sha256};
-
 const PURL: &str = "pkg:gem/rack@3.1.0";
-
-fn binary() -> PathBuf {
-    env!("CARGO_BIN_EXE_socket-patch").into()
-}
-
-/// Git-SHA256: SHA256("blob <len>\0" ++ content).
-fn git_sha256(content: &[u8]) -> String {
-    let header = format!("blob {}\0", content.len());
-    let mut hasher = Sha256::new();
-    hasher.update(header.as_bytes());
-    hasher.update(content);
-    hex::encode(hasher.finalize())
-}
 
 /// Write a gem copy at `gem_dir` with `lib/rack.rb` holding `bytes`,
 /// returning the file path.
