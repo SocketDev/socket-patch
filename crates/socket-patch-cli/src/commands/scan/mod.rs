@@ -1267,19 +1267,20 @@ async fn gradle_scan(
                 .collect();
             candidates.sort();
             candidates.dedup();
-            let only_m2: Vec<String> = if candidates.is_empty() {
-                Vec::new()
-            } else {
+            let m2_repo = env.m2_repo.as_ref().filter(|_| !candidates.is_empty());
+            let only_m2: Vec<String> = if let Some(m2_repo) = m2_repo {
                 let mut found: Vec<String> = socket_patch_core::crawlers::MavenCrawler
-                    .find_by_purls(&env.m2_repo, &candidates)
+                    .find_by_purls(m2_repo, &candidates)
                     .await
                     .unwrap_or_default()
                     .into_keys()
                     .collect();
                 found.sort();
                 found
+            } else {
+                Vec::new()
             };
-            if !only_m2.is_empty() {
+            if let Some(m2_repo) = m2_repo.filter(|_| !only_m2.is_empty()) {
                 const SHOWN: usize = 5;
                 let mut list = only_m2[..only_m2.len().min(SHOWN)].join(", ");
                 if only_m2.len() > SHOWN {
@@ -1291,7 +1292,7 @@ async fn gradle_scan(
                         "this Gradle build declares no mavenLocal(), so it does not resolve \
                          from the Maven local repository ({}); {} found only there {} not \
                          scanned: {list}",
-                        env.m2_repo.display(),
+                        m2_repo.display(),
                         plural(only_m2.len(), "module", "modules"),
                         if only_m2.len() == 1 { "is" } else { "are" },
                     ),

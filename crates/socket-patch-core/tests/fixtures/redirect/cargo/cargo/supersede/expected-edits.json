@@ -21,5 +21,11 @@
     "key": "serde@1.0.190",
     "original": "[[package]]\nname = \"serde\"\nversion = \"1.0.190\"\nsource = \"sparse+https://patch.socket.dev/patch-registry/cargo/11111111-1111-1111-1111-111111111111/00000000-0000-0000-0000-000000000000/index/\"\nchecksum = \"1111beefdeadbeefdeadbeefdeadbeefdeadbeefdeadbeefdeadbeefdead1111\"",
     "new": "[[package]]\nname = \"serde\"\nversion = \"1.0.190\"\nsource = \"sparse+https://patch.socket.dev/patch-registry/cargo/11111111-1111-1111-1111-111111111111/55555555-5555-5555-5555-555555555555/index/\"\nchecksum = \"deadbeefdeadbeefdeadbeefdeadbeefdeadbeefdeadbeefdeadbeefdeadbeef\""
+  },
+  {
+    "path": ".cargo/config.toml",
+    "kind": "redirect_cargo_superseded_registry_removed",
+    "action": "removed",
+    "key": "socket-patch-00000000-0000-0000-0000-000000000000"
   }
 ]

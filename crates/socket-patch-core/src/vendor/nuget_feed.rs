@@ -216,7 +216,7 @@ async fn nuget_prelude(
     let copy_rel = format!("{uuid_dir_rel}/{leaf}");
     let uuid_dir = project_root.join(&uuid_dir_rel);
     let nupkg_path = project_root.join(&copy_rel);
-    let source_key = format!("socket-patch-{}", record.uuid);
+    let source_key = crate::patch::redirect::generation::hosted_pin_name(&record.uuid);
 
     // A patch with no files is meaningless to vendor: no-op success, no edits.
     if record.files.is_empty() {

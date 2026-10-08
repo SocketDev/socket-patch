@@ -1691,17 +1691,7 @@ fn resolve_dir(base: &str, p: &str) -> Option<String> {
     if p.starts_with('/') || p.contains('\\') || p.contains(':') {
         return None;
     }
-    let mut parts: Vec<&str> = base.split('/').filter(|s| !s.is_empty()).collect();
-    for seg in p.split('/') {
-        match seg {
-            "" | "." => {}
-            ".." => {
-                parts.pop()?;
-            }
-            s => parts.push(s),
-        }
-    }
-    Some(parts.join("/"))
+    crate::utils::relpath::resolve_rel(base, p, 0)
 }
 
 // ── in-block pluginManagement entry ──────────────────────────────────────

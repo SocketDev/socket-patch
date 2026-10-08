@@ -10,6 +10,7 @@ use futures_util::StreamExt;
 use socket_patch_core::api::client::hold_back_debug;
 use socket_patch_core::api::types::BatchPackagePatches;
 use socket_patch_core::patch::apply_lock::LockGuard;
+use socket_patch_core::patch::redirect::yarnrc::resolve_outer_yarn_mirror_for_process;
 use socket_patch_core::patch::redirect::DepOverride;
 use socket_patch_core::utils::concurrent::{
     api_concurrency, api_concurrency_for, ordered_concurrent,
@@ -989,6 +990,10 @@ pub(crate) async fn run_redirect_selected(
             socket_patch_core::utils::fs::read_regular_to_string_sync(path).ok()
         })
     };
+    // The yarn 1 config layers outside the project (env, user, global and
+    // ancestor rc files), located the way yarn 1 does: a mirror set in any
+    // of them refuses the classic rewrite like a project one.
+    let yarn_classic_outer = || resolve_outer_yarn_mirror_for_process(&common.cwd);
     let rewrite_options = || {
         RewriteOptions {
         dry_run: common.dry_run,
@@ -1001,6 +1006,7 @@ pub(crate) async fn run_redirect_selected(
         trust_lockfile_config: !common.no_trust_lockfile_config,
         npm_allow_remote_config: !common.no_npm_allow_remote_config,
         npm_outer: &npm_outer,
+        yarn_classic_outer: &yarn_classic_outer,
         blocking: true,
     }
     };
@@ -1816,6 +1822,7 @@ async fn vendored_takeover(
                     &lock,
                     yarnrc.as_deref(),
                     npmrc.as_deref(),
+                    &resolve_outer_yarn_mirror_for_process(&common.cwd),
                 )
                 .err()
             }
@@ -1952,6 +1959,26 @@ async fn vendored_takeover(
                     .filter(|_| entry.is_some_and(vlt_entry))
             })
     };
+    // NON-UTF-8 PRE-CHECK (#721) — the GUARD's undecodable-file rule
+    // (`engine::undecodable_guard`), checked BEFORE any revert dispatches
+    // (and under --dry-run too): a takeover that reverted first and was
+    // then refused by the guard would leave the reverted purls unpatched
+    // in both modes.
+    if takeover.iter().any(|(_, entry)| entry.is_some()) {
+        let view = socket_patch_core::vendor::lock_inventory::ProjectView::Disk(&common.cwd);
+        let read = socket_patch_core::hosted::engine::read_candidate_files(
+            &view,
+            &std::collections::BTreeSet::new(),
+            candidates,
+        )
+        .await;
+        if let Some(refusal) = socket_patch_core::hosted::engine::undecodable_guard(
+            &read.undecodable_reads,
+            candidates,
+        ) {
+            return Err(refusal);
+        }
+    }
     // SYMLINK PRE-CHECK for the takeover reverts — the same rule as the
     // SYMLINK GUARD below, applied to each ledger entry's recorded wiring
     // (the revert backends also stage and rename over the file). Checked
@@ -2682,7 +2709,7 @@ fn created_settings_over_existing(
 }
 
 /// [`created_settings_over_existing`]'s code for `socket-patch.sbt`.
-const SBT_OWNED_FILE_UNREADABLE: &str = "redirect_sbt_owned_file_unreadable";
+use socket_patch_core::hosted::engine::SBT_OWNED_FILE_UNREADABLE;
 
 #[cfg(test)]
 mod tests {
