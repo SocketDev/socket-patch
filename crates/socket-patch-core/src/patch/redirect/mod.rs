@@ -554,11 +554,12 @@ pub fn rewrite_registry_redirect_with_pipenv_version(
 }
 
 /// #701 / #932: the patch service can grant a pypi patch as a platform- or
-/// ABI-tagged wheel (`…-cp311-cp311-manylinux…whl`). Every hosted PyPI lock
-/// (uv.lock, PEP 723 script locks, pylock.toml, Pipfile.lock, poetry.lock,
-/// pdm.lock, requirements.txt, Hatch's pyproject) is meant to install on
-/// any platform its markers allow, and a hosted pin narrows the entry to
-/// that one wheel: installs on any other interpreter, OS or architecture
+/// ABI-tagged wheel (`…-cp311-cp311-manylinux…whl`), or as a pure wheel
+/// bound to one interpreter (`…-cp311-none-any.whl`, #1048). Every hosted
+/// PyPI lock (uv.lock, PEP 723 script locks, pylock.toml, Pipfile.lock,
+/// poetry.lock, pdm.lock, requirements.txt, Hatch's pyproject) is meant to
+/// install on any platform its markers allow, and a hosted pin narrows the
+/// entry to that one wheel: installs on any other interpreter, OS or architecture
 /// then fail, and hosted rollback cannot derive which upstream wheels to
 /// put back. Fail closed like hosted gem (`redirect_gem_platform_unsupported`).
 /// The tags are read the way vendored mode reads them for
@@ -584,9 +585,10 @@ pub fn pypi_platform_wheel_refusal(dep: &DepOverride) -> Option<RewriteWarning> 
     platform_locked.then(|| RewriteWarning {
         code: "redirect_pypi_platform_wheel".into(),
         detail: format!(
-            "the patched wheel for {}=={} is platform-specific ({tags}); pinning it \
-             would make the project's Python lockfiles install it on this platform \
-             only, so the redirect is skipped and nothing was written for it",
+            "the patched wheel for {}=={} is interpreter- or platform-specific \
+             ({tags}); pinning it would make the project's Python lockfiles install \
+             it on this interpreter or platform only, so the redirect is skipped and \
+             nothing was written for it",
             dep.name, dep.version
         ),
     })
