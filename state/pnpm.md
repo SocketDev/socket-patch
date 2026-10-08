@@ -1,6 +1,6 @@
 [agent] Progress ledger for the scheduled pnpm bug-hunt routine (label pm:pnpm).
 
-Last updated: 2026-10-08 (run 33), main `e2d9633`, latest release 4.0.0.
+Last updated: 2026-10-08 (run 34), main `cf8b164`, latest release 4.0.0.
 
 Method: real pnpm installs. Hosted, vendored and global agent mode run against a local Python mock of the patch API (batch, by-package, view with inline blobs, `patches/blob/<hash>`, package grant, hosted tarball, `/registry/<name>/<ver>` mirror; `ajv-keywords@3.5.2` serves as the peer-dependency package). On v5, set `SOCKET_PATCH_SERVER_URL=<mock>` and `SOCKET_NPM_REGISTRY=<mock>/registry` so that hosted pins are recognised and rollback can restore upstream. The oracle is a marker prepended to `index.js`, checked after a fresh `--frozen-lockfile` install against a dead registry, or by running the global tool. The repo's pinned matrix (`.github/workflows/pnpm-compatibility.yml`) already covers plain hosted and vendored installs on pnpm 1–12. This ledger tracks what it doesn't.
 
@@ -340,6 +340,21 @@ Run 33 additions (main `e2d9633`, Linux; #1050 vendored-liveness GC, #1029 `appl
 
 Re-triage (run 33): #466 still reproduces on `e2d9633` (12.10.1 with `packageManager`: vendor fails `vendor_lock_entry_not_found`, nothing written).
 
+Run 34 additions (main `cf8b164`, Linux; #1039 atomic vendored → hosted takeover, #1117 BOM consolidation):
+
+| pnpm (lock) | Takeover vendored → hosted: dry run byte-identical / wet / fresh frozen | Takeover after user drift (`pnpm add`, extra workspace key, re-quoted override key) | Takeover, 2 pkgs, one retracted (mock drops sha512): kept vendored byte-identical, fresh frozen both patched, `rollback` | Mixed vendored A + `get <uuid B>` hosted → fresh frozen → `rollback` | Shared-lock workspace takeover (member dep) | BOM `package.json` / lock / workspace file: hosted + vendored scan, fresh frozen, `rollback` | Agent `apply --check` with `modulesDir` / out-of-project `virtualStoreDir` | Hosted `redirect.patches[]` `unpinned` (stale `node_modules`, lock pins nothing) | Standalone project under a settings-only parent workspace file |
+| --- | --- | --- | --- | --- | --- | --- | --- | --- | --- |
+| 7.33.7 (5.4) | pass (moved checkout, absolute specifier) | — | — | — | — | — | — | — | — |
+| 8.15.9 (6.0) | pass (moved checkout) | — | — | pass (rollback byte-exact; a moved copy needs the documented one-time relock) | — | — | — | — | — |
+| 9.15.9 | pass | — (`pnpm add` fails, #734) | pass / residue (non-bug, see below) | pass / residue (non-bug) | pass | pass ×6 (workspace file: `pnpm_trust_lockfile_left`, documented) | — / pass | pass (no lock write, `vex` refuses honestly) | — |
+| 10.34.6 | — | pass (`pnpm add`) | — | — | — | — | pass / — | — | n/a (pnpm 10 installs nothing in the child) |
+| 11.28.5 | — | — | — | — | — | — | — | — | fail #1006 (comment) |
+| 12.10.1 | pass | pass (workspace key, re-quoted key) | pass / residue (non-bug) | pass / residue (non-bug) | pass | pass ×6 | pass / pass | pass | fail #1006 (comment) |
+
+Interrupted takeover (debug build, `SOCKET_PATCH_FAILPOINT` = `group_commit_journal` / `group_commit_file@1` / `@2`), 9.15.9 and 12.10.1: the next locked command replays the journal, the hosted pin lands and a fresh frozen install is patched, but the vendored artifact dir is orphaned for good. Filed as #1157 (journal omits the deferred removals; vendor GC skips its orphan sweep without a ledger).
+
+Re-triage (run 34): #466's takeover half is fixed by #1039 (fails closed with `redirect_vendored_revert_failed`, nothing touched, ledger kept); its `vendor --revert` / `rollback` halves still reproduce on 12.10.1 (commented). #734 still reproduces (9.15.9 hosted, `ERR_PNPM_ADDING_TO_ROOT`).
+
 Run 20 additions (main `045d7ec`, Linux):
 
 | pnpm (lock) | Vendored parent + vendored dep (`debug`→`ms`): `remove <parent>` / takeover → hosted / `rollback` | `remove <child>` (control) | Hosted parent + dep: remove parent / rollback | Mixed-case names (`Base64`, `JSONStream`): hosted / agent / vendored | User parent-selector / range-selector override (vendored) | Agent `symlink=false` / `hoist=false` | `list -g` |
@@ -376,7 +391,8 @@ Global mode (`-g`, v5 main `2463257`):
 
 ## Backlog
 
-00a. #1050 GC follow-ups: `scan --prune` over a peer-suffixed vendored snapshot, over Rush / subspace locks, and with `sharedWorkspaceLockfile: false` from a member. #1029 follow-ups: `apply --check` with a custom `virtualStoreDir` / `modulesDir`, and `redirect.patches[]` `unpinned` rows on a pnpm lock that pins nothing.
+00a. #1050 GC follow-ups: `scan --prune` over a peer-suffixed vendored snapshot and over Rush / subspace locks. (`sharedWorkspaceLockfile: false` member: vendored now refuses `vendor_pnpm_settings_elsewhere` on 10.34.6 too, by design. #1029 `modulesDir` / `virtualStoreDir` and `unpinned` rows: done in run 34.)
+00b. #1039 follow-ups: the takeover over a `pnpm patch`-ed vendored package, a takeover on Windows (CRLF autocrlf checkout), and an interrupted vendored-only commit (`scan --mode vendored` with a failpoint) to see whether its deferred deletions are lost too. The interrupted takeover is #1157.
 
 000. #1111 follow-ups: the passive update-notifier text on a real newer release, and a pnpm global install on Windows (`%LOCALAPPDATA%\pnpm`) and macOS. Needs a probe. #1096: marker-only files are done (run 32, commented); vendored on 10.4.1 with a comment-only file is still to do.
 0a. Supersede A → B over a two-document lock (pnpm 11/12 `packageManager` / `configDependencies`) and on 9/10 vendored. Also `remove <B>` after an agent A + hosted B mix (blocked by the permission classifier in run 32).
@@ -397,7 +413,7 @@ Global mode (`-g`, v5 main `2463257`):
 8b. #853 follow-ups: the takeover over a peer-suffixed snapshot key and over a pnpm ≤6 legacy lock, and `vendor --dry-run` (manifest-driven) parity.
 8d. v5 rollout and policy over pnpm locks: `--max-new-patches 1` passes on 12.10.1, hosted and vendored (run 32). Still to do: 9.15.9, a two-document lock on 12.x, and socket.yml `includePaths` in a workspace with `sharedWorkspaceLockfile: false`.
 8e. #935 follow-up: `git+` / `github:` copies (`link:` copy done in run 29: pass).
-8f. #1006 follow-ups: a settings-only parent `pnpm-workspace.yaml` (no `packages:`), negated globs (`!examples/**`), pnpm 10 `ignore-workspace`, and vendored from a real member on 11/12 (expect `vendor_pnpm_settings_elsewhere`).
+8f. #1006 follow-ups (settings-only parent done in run 34, commented): negated globs (`!examples/**`), pnpm 10 `ignore-workspace`, and vendored from a real member on 11/12 (expect `vendor_pnpm_settings_elsewhere`).
 9. Re-verify the open set when fixes land (#853 core and #880/#881 verified in run 29; #956, #903, #904 and the #935 VEX half verified in run 30): #435, #466, #492, #556, #633, #713, #714, #734, #778, #830, #831 (PR #837, pnpm gitignore matrix), #853, #854, #880, #881, #902, #903, #904 (fix PR #909), #919, #935 (scan half), #1006, #1074, #1096 and #1111.
 9a. BOM follow-ups (#903 / #904): a fresh install of a hosted BOM-`package.json` pin, and Windows checkouts (needs a probe). (Vendored BOM workspace file on 9.15.9 / 10.34.5 done in run 25: #904 reproduces.)
 9b. #902 follow-ups: the setting in the global `rc` / `config.yaml`. (Mirror + tarball URLs became #919 in run 24.)
@@ -481,3 +497,5 @@ Global mode (`-g`, v5 main `2463257`):
 - pnpm 11 / 12 ignore `.npmrc` `lockfile=false`, so #1074 applies there only through the `pnpm-workspace.yaml` `lockfile: false` key (run 31).
 - With a stale sibling lock, vendored wires only the governing lock in the #1044 precedence table (vlt > bun > pnpm > yarn > npm) and warns `vendor_multiple_lockfiles`. That's documented. Hosted rewrites every present lock (run 32).
 - `remove <uuid A>` on a release where the agent manifest holds A and a hosted pin holds a superseding B also unwinds B's pin. #1035 designed it that way: every generation of the release goes (run 32).
+- `vendor --revert` (and the vendored leg of `rollback`) removes its override line from `pnpm-workspace.yaml` but leaves an empty `overrides:` header when another key follows the block, for example the user's own key or hosted mode's `trustLockfile`. pnpm 8–12 accept the null value. After a mixed vendored A + hosted B (`get <uuid B>`, or a takeover that retracts one package), `rollback` then leaves `packages: ['.']` / `overrides:` / `trustLockfile: true` in a project that had no workspace file. It warns `pnpm_trust_lockfile_left` (the same class as the run-30 hosted → vendored residue, and #401 was closed on the warning), and on 8.x–10.4 the leftover scaffold is #734. Not filed (run 34).
+- Vendored from a `shared-workspace-lockfile=false` member refuses with `vendor_pnpm_settings_elsewhere` on pnpm 10 as well (run 22 passed on 10.34.5 before the #881 fix). That's correct: pnpm 10 honours the member's own `pnpm.overrides` only for an install run from the member. A root `pnpm install --frozen-lockfile` fails with `ERR_PNPM_LOCKFILE_CONFIG_MISMATCH` (run 34).
