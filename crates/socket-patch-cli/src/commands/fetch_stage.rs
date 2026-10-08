@@ -248,8 +248,14 @@ pub(crate) async fn stage_patch_sources(
         let missing_blobs = get_missing_blobs(manifest, &staged.blobs).await;
         if !patches_without_source(manifest, &missing_blobs).is_empty() {
             // An error, not progress chatter: prints even under --silent
-            // (same rule as report_offline_missing above).
+            // (same rule as report_offline_missing above), with the
+            // per-blob reasons the quiet summary above held back.
             if !common.json {
+                if quiet {
+                    for line in format_fetch_failures(&fetch_result) {
+                        eprintln!("{line}");
+                    }
+                }
                 eprintln!(
                     "Error: Some patch artifacts could not be downloaded; cannot apply patches."
                 );

@@ -155,6 +155,11 @@ fn apply_silent_online_download_failure_keeps_error_output() {
         "--silent must keep the download-failure error (errors only, \
          never nothing); stderr was: {stderr:?}"
     );
+    assert!(
+        chatter.iter().any(|l| l.contains("Failed to download")),
+        "--silent must keep the per-blob failure reasons with the error; \
+         stderr was: {stderr:?}"
+    );
 }
 
 /// Overshoot guard: under `--json` the envelope is the machine channel —
