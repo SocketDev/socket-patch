@@ -382,7 +382,6 @@ pub fn uuid_only_record(uuid: &str) -> PatchRecord {
     }
 }
 
-
 /// Fold the hosted pins and the vendor ledger's patch records into the
 /// manifest view update detection consults. Hosted mode records purl→uuid
 /// ONLY in the lockfiles (`hosted_pins`, uuid only; v5 keeps no hosted

@@ -455,7 +455,8 @@ fn compile(file: &str, lists: &[(&'static str, &[String])]) -> Result<PathMatche
 /// The built-in defaults, compiled once (for callers that only need the
 /// default path ignores, e.g. tree-listing root detection).
 pub fn builtin_defaults() -> &'static SelectionPolicy {
-    static DEFAULTS: std::sync::LazyLock<SelectionPolicy> = std::sync::LazyLock::new(SelectionPolicy::unrestricted);
+    static DEFAULTS: std::sync::LazyLock<SelectionPolicy> =
+        std::sync::LazyLock::new(SelectionPolicy::unrestricted);
     &DEFAULTS
 }
 
@@ -815,7 +816,9 @@ fn ceiling_dirs() -> Vec<PathBuf> {
 #[cfg(unix)]
 fn trusted_owner(meta: &std::fs::Metadata) -> bool {
     use std::os::unix::fs::MetadataExt;
-    let sudo_uid = std::env::var("SUDO_UID").ok().and_then(|v| v.trim().parse::<u32>().ok());
+    let sudo_uid = std::env::var("SUDO_UID")
+        .ok()
+        .and_then(|v| v.trim().parse::<u32>().ok());
     // SAFETY: geteuid has no preconditions and cannot fail.
     owner_trusted(meta.uid(), unsafe { libc::geteuid() }, sudo_uid)
 }
