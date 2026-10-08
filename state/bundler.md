@@ -1,6 +1,6 @@
 [agent] Progress ledger for the scheduled Bundler (RubyGems) bug-hunt routine (label pm:bundler).
 
-Last updated: 2026-10-07 (run 30), main `05ecc6e` (now also includes #953 → #951 and #1015), latest release v4.0.0 (npm; no git tags). Newest Bundler tested: 4.1.0.beta1 (no newer release as of 2026-10-07).
+Last updated: 2026-10-08 (run 31), main `05fd82b` (now also includes #1002 → #1001 / #729), latest release v4.0.0 (npm; no git tags). Newest Bundler tested: 4.1.0.beta1 (no newer release as of 2026-10-07).
 
 ## Coverage matrix
 
@@ -278,6 +278,16 @@ Also on 4.0.17: BOM `Gemfile` passes; symlinked `Gemfile` / lock is refused (pas
 | #952 variant without a root `Gemfile` | pass (nothing applied, `vex` writes nothing) | — |
 | Bisect #1092 on v4.0.0 | also patches only the ruby dir (pre-v5) | — |
 
+### Run 31 (main `05fd82b`; Linux Ruby 3.3.6; hosted stale guard via the `e2e_redirect_gem_stale_install.rs` harness, ×2 incl. real `gem env`; real `bundle install` for Bundler's own behaviour)
+
+| Cell | 4.0.18 | 2.5.22 |
+| --- | --- | --- |
+| Hosted stale guard, explicit `path` not installed + unused system copy (#1001 fix) | pass | — |
+| Same, local `deployment true` (no `path`) | **fail #1109** (real Bundler installs into `vendor/bundle`) | — |
+| Same, env `BUNDLE_DEPLOYMENT=true` | **fail #1109** | real Bundler installs into `vendor/bundle` |
+| Same, `simulate_version 5` / `default_install_uses_path true` | **fail #1109** (real Bundler installs into `.bundle`) | — |
+| Control: no setting (system gems) | pass (warns) | — |
+
 ### Global mode (`-g`)
 
 | OS | Ruby / Bundler | `scan -g` report | `-g` vs project scoping | `scan -g --mode hosted` refused | `get -g` / `apply -g` | `rollback -g` byte-exact | `vex -g` | `--global-prefix <gems dir>` / `SOCKET_GLOBAL=1` | Non-writable gem dir |
@@ -300,11 +310,11 @@ Also on 4.0.17: BOM `Gemfile` passes; symlinked `Gemfile` / lock is refused (pas
 
 ## Backlog
 
-1. Re-run #729 / #749 / #751 / #896 / #952 / #985 / #1001 / #1055 / #1056 / #1092 when fixes merge. #951 is fixed on main (`05ecc6e`, #953); spot-check it in a real install on Bundler 2.3 (legacy era: comment kept) and 4.x, together with the earlier fixes (#681, #775, #826, #915, #967).
+1. Re-run #749 / #751 / #896 / #952 / #985 / #1055 / #1056 / #1092 / #1109 when fixes merge (PR #1060 → #1055, PR #768 → #749 / #751). #951 (#953) and #1001 / #729 (#1002) are fixed on main; spot-check it in a real install on Bundler 2.3 (legacy era: comment kept) and 4.x, together with the earlier fixes (#681, #775, #826, #915, #967).
 2. #1092 neighbours: `rollback` / `remove` on the dual-platform shape; Windows `x64-mingw-ucrt` + `x64-mingw32` pairs (probe branch); hosted and vendored modes with a lock listing several platform variants of one gem.
 3. #1055 neighbours: `get <purl> --mode hosted` and `vendor` on the shared-home shape; `scan --vex`; `-g` inside a project.
 4. #1056 neighbours: CRLF Gemfile and `gems.rb` spellings; H→V takeover of a gem inside a `source … do` block.
-5. #1001 neighbours: `deployment true` without `path`, and a global-tier `path` with the stale guard.
+5. #1109 neighbours: global-tier `deployment` / `path` with the stale guard; standalone `vex` on the deployment shape once #1098 lands (it reuses `bundler_install_homes`).
 6. Bundler 1.17 hosted unwind (Ruby 3.1.6 is available locally via rbenv); `rollback` / `remove` on a custom-lock project.
 
 ## Known non-bugs
@@ -397,3 +407,5 @@ Also on 4.0.17: BOM `Gemfile` passes; symlinked `Gemfile` / lock is refused (pas
 - The #951 fix (#953) models Bundler's `strip_comment` exactly as Bundler 2.5.22 / 2.6.9 / 4.0.18 do (`x#y` → `x`, `"a#b"` → `a`, a value starting with `#` kept), so those spellings are not bugs (run 30).
 - The sandbox's rbenv also has Ruby 3.1.6 (Bundler 2.6.9 installable) and 3.2.6, plus Bundler 4.0.18 on 3.3.6. Use an isolated `GEM_HOME` per cell so the system gems stay clean (run 30).
 - To get both builds of a native gem into one gem home: `gem install <x> -v V --platform ruby` then `gem install <x> -v V` (needs gcc + libffi-dev for `ffi`, both present). Bundler 2.6+ locks list every platform variant by default (run 30).
+- Bundler's `deployment true` (local or env) and `simulate_version 5` never reuse a system gem-home copy: they fetch into `vendor/bundle` / `.bundle` (verified with real installs, run 31). The hosted stale guard's false warning there is #1109.
+- The worktree is a fresh container each run: there's no rbenv now, only `/usr/local/bin/ruby` 3.3.6 with Bundler 2.5.22 (default) + 4.0.18. Install other Bundlers into an isolated `GEM_HOME` (run 31).
