@@ -194,7 +194,10 @@ async fn maven_prelude(
         ));
     }
 
-    let wired = pom_xml_text.contains(&repo_id);
+    // Wired = our `<repository>` id where Maven reads it: a commented-out
+    // or profile-scoped block serves nothing (the same masking the
+    // forward writer's anchors use), so it must not take the hot path.
+    let wired = find_wireable_anchor(&pom_xml_text, &repo_id).is_some();
     let in_sync = wired && artifact_in_sync(&leaf_dir, &jar_leaf, &pom_leaf, &record.files).await;
     Ok(MavenPrelude {
         group_id: group_id.to_string(),
@@ -2710,6 +2713,48 @@ mod tests {
             w2.iter()
                 .any(|w| w.code == "vendor_maven_local_cache_shadow"),
             "shadow warning fires on the hot path too"
+        );
+    }
+
+    /// B61: a commented-out vendored `<repository>` is not wiring Maven
+    /// reads, so a re-run must rewire instead of taking the in-sync hot path
+    /// on a raw substring match of the repository id.
+    #[tokio::test]
+    #[serial_test::serial]
+    async fn commented_out_repository_is_not_wired() {
+        let (dir, blobs, installed, record) = fixture(Some(project_pom()), true, true).await;
+        let root = dir.path();
+        let (r1, e1, _) = unwrap_done(run_vendor(root, &blobs, &installed, &record, false).await);
+        assert!(r1.success && e1.is_some());
+
+        let block = repository_block(
+            &format!("{VENDOR_REPO_ID_PREFIX}{UUID}"),
+            &format!(".socket/vendor/maven/{UUID}"),
+        );
+        let pom = tokio::fs::read_to_string(root.join(PROJECT_POM))
+            .await
+            .unwrap();
+        assert!(pom.contains(&block), "first run wires our block: {pom}");
+        tokio::fs::write(
+            root.join(PROJECT_POM),
+            pom.replacen(&block, &format!("<!--\n{block}-->\n"), 1),
+        )
+        .await
+        .unwrap();
+
+        let (r2, e2, _) = unwrap_done(run_vendor(root, &blobs, &installed, &record, false).await);
+        assert!(r2.success, "{:?}", r2.error);
+        assert!(
+            e2.is_some(),
+            "a commented-out repository must not take the in-sync hot path"
+        );
+        let rewired = tokio::fs::read_to_string(root.join(PROJECT_POM))
+            .await
+            .unwrap();
+        assert!(
+            strip_xml_comments(&rewired)
+                .contains(&format!("<id>{VENDOR_REPO_ID_PREFIX}{UUID}</id>")),
+            "the re-run wires a live repository: {rewired}"
         );
     }
 

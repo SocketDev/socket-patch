@@ -143,9 +143,12 @@ pub const VENDOR_TREES: &[&str] = &[MAVEN2_TREE, GRADLE_TREE, COURSIER_TREE];
 /// The per-version marker every tree (and every `<eco>/<uuid>` unit) holds.
 pub(crate) use crate::vendor::state::VENDOR_MARKER_FILE as MARKER_FILE;
 
-/// Paths whose presence without a vendor ledger means JVM artifacts were
-/// orphaned (`vendor --check`'s `vendor_ledger_missing`).
-pub const ORPHAN_PATHS: &[&str] = &[
+/// The committed JVM layout only a JVM ledger entry
+/// ([`super::apply::is_jvm_entry`]) can own: the repository trees plus the
+/// indexes and the generated sbt build file beside them. Any of them present
+/// with no JVM entry in the ledger is an orphan: `vendor --check` reports
+/// `vendor_ledger_missing` for it.
+pub const LEDGER_OWNED_PATHS: &[&str] = &[
     MAVEN2_TREE,
     GRADLE_TREE,
     super::gradle::INDEX_REL,
