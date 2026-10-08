@@ -1921,6 +1921,9 @@ jobs:
     # No `needs: [test, coverage]`: nothing here consumes their outputs,
     # and waiting on the ~30 min windows `test` leg made this the merge
     # queue's critical path.
+    # Dropping that `needs` also dropped the draft skip it inherited, so
+    # gate on draft here directly (push/merge_group/schedule still run).
+    if: github.event.pull_request.draft != true
     runs-on: ubuntu-latest
     timeout-minutes: 40
     strategy:
@@ -1959,6 +1962,9 @@ jobs:
     # No `needs: [test, coverage]`: nothing here consumes their outputs,
     # and waiting on the ~30 min windows `test` leg made this the merge
     # queue's critical path.
+    # Dropping that `needs` also dropped the draft skip it inherited, so
+    # gate on draft here directly (push/merge_group/schedule still run).
+    if: github.event.pull_request.draft != true
     strategy:
       fail-fast: false
       matrix:
@@ -2171,6 +2177,9 @@ jobs:
     # No `needs: [test, coverage]`: nothing here consumes their outputs,
     # and waiting on the ~30 min windows `test` leg made this the merge
     # queue's critical path.
+    # Dropping that `needs` also dropped the draft skip it inherited, so
+    # gate on draft here directly (push/merge_group/schedule still run).
+    if: github.event.pull_request.draft != true
     runs-on: ubuntu-latest
     timeout-minutes: 30
     steps:
