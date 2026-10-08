@@ -653,7 +653,7 @@ pub async fn read_candidate_files(
         // unreadable, which the planner would otherwise skip silently.
         out.undecodable_reads.retain(|rel| {
             !is_gradle_owned_file(rel)
-                || crate::patch::redirect::gradle::GRADLE_ROOT_FILES.contains(&rel.as_str())
+                || crate::vendor::jvm::layout::GRADLE_ROOT_FILES.contains(&rel.as_str())
         });
     }
     // An sbt build's resolution evidence rides a synthetic key (see
@@ -995,16 +995,6 @@ pub fn pipenv_lock_targets(files: &BTreeMap<String, String>, candidates: &[Candi
     crate::patch::redirect::pipenv_lock_targets(files, &overrides)
 }
 
-/// A dry-run vendored→hosted takeover the disk caller withheld from the
-/// rewriters: its artifact URL and the root locks its vendored wiring
-/// lives in (the wet run splices the hosted URL there, so the
-/// install-policy auto-configs are previewed for those locks).
-#[derive(Debug, Clone)]
-pub struct TakeoverPreview {
-    pub artifact_url: String,
-    pub locks: Vec<String>,
-}
-
 /// The host-dependent inputs of [`rewrite`].
 #[derive(Clone)]
 pub struct RewriteOptions<'a> {
@@ -1031,12 +1021,12 @@ pub struct RewriteOptions<'a> {
     /// Run the rewriters on the blocking pool (the disk flow: pure CPU over
     /// every lock text).
     pub blocking: bool,
-    /// Uuids of the wet run's vendored→hosted takeovers: the caller already
-    /// reverted their vendored wiring (and saved the ledger) before the
-    /// rewrite, so the attribution gate never drops them — that would leave
-    /// the package on the unpatched registry release — and their pin keeps
-    /// the rewriters' verdict, as a dry run's withheld takeover preview
-    /// does. Empty for the in-memory engine, which takes nothing over.
+    /// Uuids of the run's staged vendored→hosted takeovers (wet and dry
+    /// runs alike): the caller reverted their vendored wiring in the group
+    /// overlay before the rewrite, so the attribution gate never drops
+    /// them, and their pin keeps the rewriters' verdict (a takeover the
+    /// rewriters do not pin is retracted by the caller and stays vendored).
+    /// Empty for the in-memory engine, which takes nothing over.
     pub takeover_uuids: BTreeSet<String>,
     /// The operator's extra patch-server origins (`--patch-server-url`):
     /// the allowlist `vex`, `list`, `rollback`, `remove` and `vendor`
@@ -1242,14 +1232,13 @@ pub fn candidate_presence_needles(dep: &DepOverride) -> Vec<String> {
 ///
 /// `python_metadata` maps a wheel's artifact URL to its fetched METADATA;
 /// `withheld_from_vlt` are the uuids the vlt preflight kept out of the vlt
-/// rewrite; `takeover_previews` are the disk dry run's withheld takeovers.
+/// rewrite.
 pub async fn rewrite(
     view: &ProjectView<'_>,
     read: CandidateFiles,
     candidates: &[Candidate],
     python_metadata: BTreeMap<String, String>,
     withheld_from_vlt: &BTreeSet<String>,
-    takeover_previews: &[TakeoverPreview],
     options: RewriteOptions<'_>,
 ) -> Rewritten {
     // The run must never leave wiring that lockfile discovery — what `vex`,
@@ -1258,9 +1247,9 @@ pub async fn rewrite(
     // package version (another lock resolving the same version elsewhere, a
     // pin Maven never consumes) would be refused by every later command, so
     // it is dropped and the rest rewritten without it. Each pass drops at
-    // least one candidate, so this ends. A wet takeover is never dropped
+    // least one candidate, so this ends. A staged takeover is never dropped
     // (see [`RewriteOptions::takeover_uuids`]): its vendored wiring is
-    // already gone, and its pin keeps the rewriters' verdict.
+    // reverted in the overlay, and its pin keeps the rewriters' verdict.
     let exempt: BTreeSet<String> = withheld_from_vlt
         .union(&options.takeover_uuids)
         .cloned()
@@ -1274,7 +1263,6 @@ pub async fn rewrite(
             &kept,
             python_metadata.clone(),
             withheld_from_vlt,
-            takeover_previews,
             options.clone(),
         )
         .await;
@@ -1549,7 +1537,6 @@ async fn rewrite_once(
     candidates: &[Candidate],
     python_metadata: BTreeMap<String, String>,
     withheld_from_vlt: &BTreeSet<String>,
-    takeover_previews: &[TakeoverPreview],
     options: RewriteOptions<'_>,
 ) -> Rewritten {
     let CandidateFiles {
@@ -1708,22 +1695,10 @@ async fn rewrite_once(
         ));
     }
 
-    let (pnpm_warnings, trust_config_write, pnpm_rerun_only, workspace_symlinked) = pnpm_trust(
-        view,
-        &files,
-        &rewrite,
-        &overrides,
-        takeover_previews,
-        &options,
-    );
-    let (npm_warnings, npmrc_config_write) = npm_allow_remote(
-        view,
-        &files,
-        &rewrite,
-        &overrides,
-        takeover_previews,
-        &options,
-    );
+    let (pnpm_warnings, trust_config_write, pnpm_rerun_only, workspace_symlinked) =
+        pnpm_trust(view, &files, &rewrite, &overrides, &options);
+    let (npm_warnings, npmrc_config_write) =
+        npm_allow_remote(view, &files, &rewrite, &overrides, &options);
     if let Some((text, edit)) = trust_config_write {
         rewrite.files.insert(PNPM_WORKSPACE_REL.to_string(), text);
         // Appended last, after the lock edits it serves. v5 keeps no hosted
@@ -1794,7 +1769,6 @@ fn pnpm_trust(
     files: &BTreeMap<String, String>,
     rewrite: &RewriteResult,
     overrides: &[DepOverride],
-    takeover_previews: &[TakeoverPreview],
     options: &RewriteOptions<'_>,
 ) -> (Vec<RewriteWarning>, ConfigWrite, bool, bool) {
     let mut pnpm_warnings: Vec<RewriteWarning> = Vec::new();
@@ -1829,26 +1803,6 @@ fn pnpm_trust(
     if let Some(text) = heal_root {
         pnpm_lock_texts.push(text);
     }
-    // A dry-run vendored→hosted takeover of a purl vendored into the root
-    // pnpm lock: the wet run reverts that wiring and splices the hosted URL
-    // into it, so the trust config is previewed against the root lock (the
-    // vendored text carries the same lockfileVersion).
-    let takeover_pnpm_urls: Vec<&str> = takeover_previews
-        .iter()
-        .filter(|t| t.locks.iter().any(|l| l == "pnpm-lock.yaml"))
-        .map(|t| t.artifact_url.as_str())
-        .collect();
-    let takeover_root: Option<&String> = if takeover_pnpm_urls.is_empty()
-        || heal_root.is_some()
-        || rewrite.files.contains_key("pnpm-lock.yaml")
-    {
-        None
-    } else {
-        files.get("pnpm-lock.yaml")
-    };
-    if let Some(text) = takeover_root {
-        pnpm_lock_texts.push(text);
-    }
     if pnpm_lock_texts.is_empty() {
         return (
             pnpm_warnings,
@@ -1874,8 +1828,6 @@ fn pnpm_trust(
         .zip(present)
         .filter(|(_, present)| *present)
         .filter_map(|(o, _)| url_host(&o.artifact_url))
-        // Dry-run takeover purls land in the root lock on the wet run.
-        .chain(takeover_pnpm_urls.iter().filter_map(|url| url_host(url)))
         .collect();
     hosts.sort_unstable();
     hosts.dedup();
@@ -1888,7 +1840,6 @@ fn pnpm_trust(
     // gets the auto-config — spliced this run, or detected
     // already-redirected (heal path).
     let root_lock_v9 = heal_root
-        .or(takeover_root)
         .and_then(|text| pnpm_lock_version_major(text))
         .is_some_and(|major| major >= 9)
         || rewrite
@@ -2059,7 +2010,6 @@ fn npm_allow_remote(
     files: &BTreeMap<String, String>,
     rewrite: &RewriteResult,
     overrides: &[DepOverride],
-    takeover_previews: &[TakeoverPreview],
     options: &RewriteOptions<'_>,
 ) -> (Vec<RewriteWarning>, ConfigWrite) {
     let mut npm_warnings: Vec<RewriteWarning> = Vec::new();
@@ -2080,15 +2030,6 @@ fn npm_allow_remote(
             .zip(present)
             .filter(|(_, present)| *present)
             .filter_map(|(o, _)| url_host(&o.artifact_url))
-            // A dry-run vendored→hosted takeover: the wet run reverts the
-            // vendored wiring in a root npm lock and splices the hosted URL
-            // there, so preview the `.npmrc` write too.
-            .chain(
-                takeover_previews
-                    .iter()
-                    .filter(|t| t.locks.iter().any(|l| NPM_LOCKS.contains(&l.as_str())))
-                    .filter_map(|t| url_host(&t.artifact_url)),
-            )
             .collect();
         hosts.sort_unstable();
         hosts.dedup();
@@ -2424,7 +2365,7 @@ pub fn undecodable_guard(undecodable: &[String], candidates: &[Candidate]) -> Op
             // the build itself, which only maven candidates could patch.
             let eco = file_ecosystem(rel)
                 .or((rel.as_str() == "package.json").then_some("npm"))
-                .or(crate::patch::redirect::gradle::GRADLE_ROOT_FILES
+                .or(crate::vendor::jvm::layout::GRADLE_ROOT_FILES
                     .contains(&rel.as_str())
                     .then_some("maven"));
             eco.is_some_and(|eco| candidates.iter().any(|c| c.dep.ecosystem == eco))
@@ -2620,7 +2561,6 @@ mod tests {
             &candidates,
             BTreeMap::new(),
             &BTreeSet::new(),
-            &[],
             options,
         )
         .await;
@@ -2697,7 +2637,6 @@ mod tests {
                 &candidates,
                 BTreeMap::new(),
                 &BTreeSet::new(),
-                &[],
                 options(),
             )
             .await;
@@ -2719,7 +2658,6 @@ mod tests {
                 &cargo,
                 BTreeMap::new(),
                 &BTreeSet::new(),
-                &[],
                 options(),
             )
             .await;
@@ -2994,7 +2932,6 @@ mod tests {
             &candidates,
             BTreeMap::new(),
             &BTreeSet::new(),
-            &[],
             options,
         )
         .await;
@@ -3119,7 +3056,6 @@ mod tests {
                 &candidates,
                 BTreeMap::new(),
                 &BTreeSet::new(),
-                &[],
                 options,
             )
             .await;
@@ -3299,7 +3235,6 @@ mod tests {
             &candidates,
             BTreeMap::new(),
             &BTreeSet::new(),
-            &[],
             options,
         )
         .await;
@@ -3640,7 +3575,6 @@ mod tests {
             &candidates,
             BTreeMap::new(),
             &BTreeSet::new(),
-            &[],
             options,
         )
         .await
@@ -3855,7 +3789,6 @@ mod tests {
             &candidates,
             BTreeMap::new(),
             &BTreeSet::new(),
-            &[],
             options,
         )
         .await;
@@ -3908,7 +3841,6 @@ mod tests {
             &candidates,
             BTreeMap::new(),
             &BTreeSet::new(),
-            &[],
             options,
         )
         .await;
