@@ -250,6 +250,11 @@ jobs:
       fail-fast: false
       matrix:
         os: [macos-latest, windows-latest]
+        # Two legs per OS (scripts/ci-test-shard.py): one leg linked ~240
+        # test binaries and ran them serially for ~26 min, the merge queue's
+        # critical path. Shard 1 = unit tests + doctests + a third of the
+        # integration targets; shard 2 = the rest.
+        shard: [1, 2]
         exclude:
           # macOS legs run on main, the merge queue and nightly, not per PR push.
           - os: ${{ github.event_name == 'pull_request' && 'macos-latest' || '' }}
@@ -400,11 +405,19 @@ jobs:
           # `zip`, and assert the pinned release.
           SOCKET_PATCH_GO_E2E_REQUIRED: '1'
           SOCKET_PATCH_GO_E2E_VERSION: '1.24'
+          TEST_SHARD: ${{ matrix.shard }}
+        # This leg's share of `cargo test --workspace --no-fail-fast`; the
+        # shards together run exactly that selection (test_ci_test_shard.py).
         run: |
-          cargo test --workspace --no-fail-fast
+          python3 scripts/ci-test-shard.py "$TEST_SHARD" 2
 
   test-release:
-    if: github.event.pull_request.draft != true
+    # Not in the merge queue: each PR's head already ran this, and so did
+    # every PR ahead of it, so a merge group would re-spend ~30 min (23 of it
+    # compiling) on the same release-mode suite while the queue waits. It
+    # still runs on every PR and on main after each merge; `ci-ok` counts a
+    # skipped job as passing.
+    if: github.event.pull_request.draft != true && github.event_name != 'merge_group'
     runs-on: ubuntu-latest
     # Every tests/ target is its own optimized link (~240 test binaries).
     # The manifest-less VEX suites share two multi-module binaries

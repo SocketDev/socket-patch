@@ -1,0 +1,55 @@
+name: Merge queue janitor
+
+# Cancels merge-group runs the queue has orphaned. Each queue entry runs CI on
+# its own `gh-readonly-queue/main/pr-<n>-<base sha>` ref, so ci.yml's
+# concurrency group never lets a newer run cancel an older one. When an entry
+# ahead fails or is removed, the queue deletes the refs of every entry behind
+# it and rebuilds them on new refs, but the runs on the deleted refs keep going
+# (each one is a full ~200-job CI run, macOS legs included). A run whose ref no
+# longer exists can never merge, so it is cancelled here. Every rebuild creates
+# a new merge group, which triggers this sweep.
+#
+# Not a required check, and it never fails the merge group: a sweep error is
+# only a warning.
+
+on:
+  merge_group:
+    types: [checks_requested]
+  workflow_dispatch:
+
+permissions: {}
+
+concurrency:
+  group: merge-queue-janitor
+  cancel-in-progress: false
+
+jobs:
+  cancel-orphaned-runs:
+    runs-on: ubuntu-latest
+    timeout-minutes: 5
+    permissions:
+      actions: write
+      contents: read
+    steps:
+      - name: Cancel merge-group runs whose queue ref is gone
+        env:
+          GH_TOKEN: ${{ github.token }}
+          REPO: ${{ github.repository }}
+        run: |
+          set -uo pipefail
+          for status in queued in_progress; do
+            gh api --paginate "repos/$REPO/actions/runs?event=merge_group&status=$status&per_page=100" \
+              -q '.workflow_runs[] | "\(.id) \(.head_branch)"' || echo "::warning::could not list $status runs"
+          done | sort -u | while read -r id branch; do
+            case "$branch" in gh-readonly-queue/*) ;; *) continue ;; esac
+            # Only a definite 404 means the entry is gone; any other lookup
+            # error (rate limit, 5xx) leaves the run alone.
+            if err=$(gh api "repos/$REPO/git/ref/heads/$branch" --silent 2>&1); then
+              continue
+            fi
+            case "$err" in *"HTTP 404"*) ;; *) echo "::warning::ref lookup for $branch failed: $err"; continue ;; esac
+            echo "Cancelling run $id: $branch is no longer in the queue"
+            gh api -X POST "repos/$REPO/actions/runs/$id/cancel" --silent \
+              || echo "::warning::could not cancel run $id"
+          done
+          exit 0
