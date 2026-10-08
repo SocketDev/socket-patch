@@ -552,6 +552,8 @@ pub(super) async fn run_redirect(
     recorded: &super::rollout::RecordedState<'_>,
     batch_failed: bool,
     stage: &mut super::rollout::Stage,
+    // Scan's pre-redirect lockfile discovery (see `rollout::Gate::prior`).
+    prior: Option<super::rollout::Prior<'_>>,
 ) -> i32 {
     // Same discovery/selection as `--apply`/`--vendor`.
     let discovered = match discover_selected(
@@ -609,9 +611,69 @@ pub(super) async fn run_redirect(
         &pairs,
         scan_result,
         npm_prior,
-        Some(super::rollout::Gate::new(stage, rows)),
+        Some(super::rollout::Gate::new(stage, rows).with_prior(prior)),
     )
     .await
+}
+
+/// What the hosted run wrote after its rewrite read the project, for
+/// [`discovery_after_writes`].
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+enum Written<'a> {
+    /// The rewrite planned no file write (a no-op or already-redirected run).
+    Nothing,
+    /// A dry run: the rewrite planned writes, none landed.
+    Previewed,
+    /// The rewrite's files landed; these paths were not a regular file
+    /// before the write.
+    Landed { created: &'a [&'a str] },
+}
+
+/// An already-made lockfile discovery (made with the configured patch-server
+/// origins, as [`crate::commands::discover_wiring`] makes it) that equals a
+/// fresh discovery of the project as the hosted run left it, or `None` when
+/// none provably does and the caller must discover again.
+///
+/// - After a vlt heal (`healed_store`: the store's bundled copies after
+///   it), only a discovery that saw exactly those copies
+///   (`Discovery::vlt_bundled_copies`) is reused: the heal may have removed
+///   store entries, and the bundled copies are all discovery reads there.
+/// - Nothing written, or a dry run: the project is as scan's pre-redirect
+///   discovery (`prior`) saw it; `prior` is `None` when a takeover changed
+///   it first. Failing that, when the rewrite planned nothing, the gate's
+///   own discovery of the unwritten project.
+/// - Files written: the gate's discovery over exactly those writes
+///   ([`FinalDiscovery::Overlaid`]), when every written path existed
+///   before, or discovery read only through the overlaid view (which shows
+///   created files too), or each created path is one no read around the
+///   view sees ([`engine::overlay_creation_is_invisible`]).
+///
+/// [`FinalDiscovery::Overlaid`]: socket_patch_core::hosted::engine::FinalDiscovery::Overlaid
+/// [`engine::overlay_creation_is_invisible`]: socket_patch_core::hosted::engine::overlay_creation_is_invisible
+fn discovery_after_writes<'d>(
+    prior: Option<&'d socket_patch_core::vex::discover::Discovery>,
+    gate: Option<&'d socket_patch_core::hosted::engine::FinalDiscovery>,
+    written: Written<'_>,
+    healed_store: Option<&std::collections::BTreeMap<String, String>>,
+) -> Option<&'d socket_patch_core::vex::discover::Discovery> {
+    use socket_patch_core::hosted::engine::{overlay_creation_is_invisible, FinalDiscovery};
+    let (overlaid, view_only) = match gate {
+        Some(FinalDiscovery::Overlaid {
+            discovery,
+            view_only,
+        }) => (Some(&**discovery), *view_only),
+        // The gate read `prior` itself (see `engine::rewrite`).
+        Some(FinalDiscovery::Prior) | None => (None, false),
+    };
+    let candidate = match written {
+        Written::Nothing => prior.or(overlaid),
+        Written::Previewed => prior,
+        Written::Landed { created } => overlaid
+            .filter(|_| view_only || created.iter().all(|rel| overlay_creation_is_invisible(rel))),
+    };
+    candidate.filter(|discovery| {
+        healed_store.is_none_or(|after| discovery.vlt_bundled_copies.as_ref() == Some(after))
+    })
 }
 
 /// The hosted-redirect flow over an ALREADY-SELECTED `(purl, uuid)` set,
@@ -769,6 +831,28 @@ pub(crate) async fn run_redirect_selected(
         &vlt_preflight.withheld_everywhere,
         &mut skipped,
     );
+    // A NEW row the lockfiles already pin on the patch server these
+    // references name (not a configured one, so the recorded view's
+    // discovery could not see it) is ALREADY: decided here, before the lock
+    // decision below, so a run that will write such a row locks before it
+    // reads anything it writes.
+    if let Some(gate) = rollout.as_mut() {
+        if super::rollout::any_new(&gate.rows) {
+            let configured = crate::commands::hosted_unwind::patch_server_origins(common);
+            let foreign = socket_patch_core::patch::redirect::upstream::foreign_dep_origins(
+                candidates.iter().map(|c| &c.dep),
+                &configured,
+            );
+            if !foreign.is_empty() {
+                let origins: Vec<String> = configured.into_iter().chain(foreign).collect();
+                let pins = socket_patch_core::patch::redirect::upstream::HostedPin::discover(
+                    view, &origins,
+                )
+                .await;
+                super::rollout::mark_pinned(&mut gate.rows, &pins);
+            }
+        }
+    }
 
     // The apply lock (see `acquire_hosted_lock`), taken only by a WET run
     // that holds at least one granted reference — the only runs that can
@@ -991,6 +1075,24 @@ pub(crate) async fn run_redirect_selected(
             socket_patch_core::utils::fs::read_regular_to_string_sync(path).ok()
         })
     };
+    // The staged takeovers' uuids (wet and dry runs alike): their vendored
+    // wiring is reverted in the overlay, and the rewriters' verdict decides
+    // them, so the rewrite's attribution gate must not drop them (an
+    // unpinned one is retracted below and stays vendored).
+    let takeover_uuids: std::collections::BTreeSet<String> = takeover.staged_uuids();
+    let patch_server_origins = crate::commands::hosted_unwind::patch_server_origins(common);
+    // Scan's discovery predates this run's writes and the apply lock, so it
+    // is reused only when nothing changed the project since: no takeover
+    // staged reverts above (the overlay, not the disk it re-stats, holds
+    // them), and every path it read re-stats the same now, under the lock
+    // (a concurrent writer that finished before the lock was taken shows up
+    // here). It was made with `patch_server_origins`
+    // (`discover_wiring`).
+    let prior_discovery = rollout
+        .as_ref()
+        .and_then(|gate| gate.prior)
+        .filter(|_| !takeover.is_staged())
+        .and_then(|prior| prior.still_current());
     // The yarn 1 config layers outside the project (env, user, global and
     // ancestor rc files), located the way yarn 1 does: a mirror set in any
     // of them refuses the classic rewrite like a project one.
@@ -1009,6 +1111,9 @@ pub(crate) async fn run_redirect_selected(
         npm_outer: &npm_outer,
         yarn_classic_outer: &yarn_classic_outer,
         blocking: true,
+        takeover_uuids: takeover_uuids.clone(),
+        patch_server_origins: patch_server_origins.clone(),
+        prior_discovery,
     }
     };
     // The rollout gate plans again without its deferred rows: keep what
@@ -1042,8 +1147,6 @@ pub(crate) async fn run_redirect_selected(
                 (purl.to_string(), uuid.clone())
             })
             .collect();
-        let texts: Vec<&str> = done.files.values().map(String::as_str).collect();
-        super::rollout::mark_pinned(&mut gate.rows, &texts);
         let unknown = gate.stage.reference_failed.is_some();
         gate.stage.plan(&gate.rows, |row| {
             unknown || eligible.contains(&(row.writer.purl.clone(), row.writer.uuid.clone()))
@@ -1062,15 +1165,6 @@ pub(crate) async fn run_redirect_selected(
                 rewrite_options(),
             )
             .await;
-        }
-        // A row that turned out to be pinned already (`mark_pinned`: a pin
-        // discovery did not recognize) still gets written: take the lock
-        // skipped above. Only NEW rows ran without it, so no takeover did.
-        if lock.is_none() && !common.dry_run && !candidates.is_empty() {
-            match acquire_hosted_lock(common, &mut scan_result) {
-                Ok(guard) => lock = Some(guard),
-                Err(code) => return code,
-            }
         }
     }
     // A staged takeover the rewrite did not pin must not happen: undo every
@@ -1107,6 +1201,9 @@ pub(crate) async fn run_redirect_selected(
         )
         .await;
     }
+    // Candidates the rewrite left out because discovery would not attribute
+    // their pin (`engine::rewrite`).
+    skipped.extend(done.unattributed.iter().cloned());
     let takeover::Finished {
         warnings: takeover_pre_warnings,
         migrated: takeover_migrated,
@@ -1185,6 +1282,38 @@ pub(crate) async fn run_redirect_selected(
     }
 
     let rewrite = &done.rewrite;
+    // Paths whose existence the commit below changes as discovery's reads
+    // around the overlaid view (directory listings) see the disk: written
+    // paths that are not a regular file there yet, and takeover-reverted
+    // files the overlay creates or removes (see `discovery_after_writes`).
+    // Taken before the commit, while the disk is still as discovery saw it.
+    let mut created_paths: Vec<String> = Vec::new();
+    if !common.dry_run {
+        let on_disk = |rel: &str| {
+            let path = common.cwd.join(rel);
+            async move {
+                tokio::fs::symlink_metadata(&path)
+                    .await
+                    .is_ok_and(|m| m.is_file())
+            }
+        };
+        for rel in rewrite.files.keys().chain(rewrite.binary_files.keys()) {
+            if !on_disk(rel).await {
+                created_paths.push(rel.clone());
+            }
+        }
+        for rel in &takeover_files {
+            if created_paths.contains(rel) {
+                continue;
+            }
+            let disk = on_disk(rel).await;
+            let staged = socket_patch_core::utils::group_commit::exists(&common.cwd.join(rel))
+                .unwrap_or(disk);
+            if staged != disk {
+                created_paths.push(rel.clone());
+            }
+        }
+    }
     if common.dry_run {
         // A preview: the staged reverts never reach the disk.
         drop(group);
@@ -1290,12 +1419,45 @@ pub(crate) async fn run_redirect_selected(
     // Classified over the lockfiles as this run left them and the vendored
     // ledger as the takeover left it.
     let mut takeover_warnings: Vec<serde_json::Value> = Vec::new();
-    let hosted_now = crate::commands::hosted_state_from_lockfiles(common, &common.cwd).await;
+    // The lockfiles as this run left them: the gate's (or scan's) discovery
+    // when it provably describes them, else a fresh one. A takeover's
+    // reverts are writes too (the gate's discovery saw them in the overlay;
+    // a dry run drops them).
+    let created: Vec<&str> = created_paths.iter().map(String::as_str).collect();
+    let written = if takeover_migrated.is_empty()
+        && !rewrite
+            .files
+            .keys()
+            .chain(rewrite.binary_files.keys())
+            .any(|rel| !socket_patch_core::patch::redirect::sbt::is_synthetic_key(rel))
+    {
+        Written::Nothing
+    } else if common.dry_run {
+        Written::Previewed
+    } else {
+        Written::Landed { created: &created }
+    };
+    let fresh_now;
+    let discovery_now = match discovery_after_writes(
+        prior_discovery,
+        done.final_discovery.as_ref(),
+        written,
+        vlt_stale.healed_store.as_ref(),
+    ) {
+        Some(discovery) => discovery,
+        None => {
+            fresh_now = crate::commands::discover_wiring(common, &common.cwd).await;
+            &fresh_now
+        }
+    };
+    let hosted_now = crate::commands::hosted_state_from_pins(
+        &socket_patch_core::patch::redirect::upstream::HostedPin::all(discovery_now),
+    );
     let superseded = super::classify_overlap_takeover_with(
-        common,
         &common.cwd,
         Some(&hosted_now),
         vendor_state.as_ref().ok(),
+        discovery_now,
     )
     .await
     .redirect;
@@ -1875,6 +2037,12 @@ fn describe_skip_reason(reason: &str) -> String {
         "redirect_vlt_artifact_unverifiable" => {
             "vlt could not verify the hosted artifact (see the warning)".into()
         }
+        "redirect_unattributable" => {
+            "lockfile discovery could not attribute its pin to one package version, so \
+             nothing was written for it (reconcile the project's lockfiles; --json has the \
+             detail)"
+                .into()
+        }
         other => format!("server status `{other}`"),
     }
 }
@@ -2128,9 +2296,134 @@ mod tests {
         wrap_words, TAKEOVER_INFO_CODES,
     };
     use super::{wheel_metadata_concurrency, WHEEL_METADATA_CONCURRENCY};
+
     use socket_patch_core::hosted::engine::REDIRECT_CANDIDATE_FILES;
     use socket_patch_core::patch::redirect::DepOverride;
     use socket_patch_core::utils::concurrent::API_CONCURRENCY_ENV;
+
+    /// The post-write classification reuses an already-made discovery only
+    /// when it provably describes the project the run left behind, and
+    /// discovers again otherwise.
+    #[test]
+    fn the_post_write_discovery_is_reused_only_when_it_describes_the_written_project() {
+        use super::{discovery_after_writes, Written};
+        use socket_patch_core::hosted::engine::FinalDiscovery;
+        use socket_patch_core::vex::discover::Discovery;
+        let prior = Discovery::default();
+        let overlaid = FinalDiscovery::Overlaid {
+            discovery: Box::default(),
+            view_only: false,
+        };
+        let Some(FinalDiscovery::Overlaid {
+            discovery: gate, ..
+        }) = Some(&overlaid)
+        else {
+            unreachable!()
+        };
+        let same = |got: Option<&Discovery>, want: &Discovery| {
+            got.is_some_and(|got| std::ptr::eq(got, want))
+        };
+        let landed = Written::Landed { created: &[] };
+
+        // Files landed: the gate's discovery over exactly those writes.
+        assert!(same(
+            discovery_after_writes(Some(&prior), Some(&overlaid), landed, None),
+            gate
+        ));
+        // ...also when it created only a root config file no listing finds.
+        for created in [&[".npmrc"][..], &["pnpm-workspace.yaml", ".npmrc"]] {
+            let written = Written::Landed { created };
+            assert!(same(
+                discovery_after_writes(None, Some(&overlaid), written, None),
+                gate
+            ));
+        }
+        // Any other created file, when discovery also read around the
+        // overlaid view (which alone shows created files): discover again.
+        let written = Written::Landed {
+            created: &[".npmrc", "pylock.toml"],
+        };
+        assert!(discovery_after_writes(Some(&prior), Some(&overlaid), written, None).is_none());
+        // ...but a discovery that read only through the view saw it.
+        let view_only = FinalDiscovery::Overlaid {
+            discovery: Box::default(),
+            view_only: true,
+        };
+        let Some(FinalDiscovery::Overlaid {
+            discovery: seen, ..
+        }) = Some(&view_only)
+        else {
+            unreachable!()
+        };
+        assert!(same(
+            discovery_after_writes(Some(&prior), Some(&view_only), written, None),
+            seen
+        ));
+        // Files landed, but the gate counted another origin or discovered
+        // nothing: scan's pre-write discovery is stale, so discover again.
+        assert!(discovery_after_writes(Some(&prior), None, landed, None).is_none());
+        // After a vlt heal, only a discovery that saw the store's bundled
+        // copies as the heal left them.
+        let after: std::collections::BTreeMap<String, String> = [(
+            "pkg:npm/b@1.0.0".to_string(),
+            "node_modules/.vlt/x".to_string(),
+        )]
+        .into();
+        assert!(
+            discovery_after_writes(Some(&prior), Some(&overlaid), landed, Some(&after)).is_none()
+        );
+        let saw = |copies: &std::collections::BTreeMap<String, String>| FinalDiscovery::Overlaid {
+            discovery: Box::new(Discovery {
+                vlt_bundled_copies: Some(copies.clone()),
+                ..Discovery::default()
+            }),
+            view_only: false,
+        };
+        let current = saw(&after);
+        let Some(FinalDiscovery::Overlaid {
+            discovery: current_gate,
+            ..
+        }) = Some(&current)
+        else {
+            unreachable!()
+        };
+        assert!(same(
+            discovery_after_writes(None, Some(&current), landed, Some(&after)),
+            current_gate
+        ));
+        let stale = saw(&Default::default());
+        assert!(discovery_after_writes(None, Some(&stale), landed, Some(&after)).is_none());
+
+        // Nothing written: scan's discovery, else the gate's of the same
+        // unwritten project.
+        let reused = discovery_after_writes(
+            Some(&prior),
+            Some(&FinalDiscovery::Prior),
+            Written::Nothing,
+            None,
+        );
+        assert!(same(reused, &prior));
+        assert!(same(
+            discovery_after_writes(Some(&prior), Some(&overlaid), Written::Nothing, None),
+            &prior
+        ));
+        assert!(same(
+            discovery_after_writes(None, Some(&overlaid), Written::Nothing, None),
+            gate
+        ));
+        assert!(discovery_after_writes(None, None, Written::Nothing, None).is_none());
+        assert!(
+            discovery_after_writes(Some(&prior), None, Written::Nothing, Some(&after)).is_none()
+        );
+
+        // A dry run left the disk as scan saw it; the gate's discovery
+        // describes the preview, not the disk.
+        assert!(same(
+            discovery_after_writes(Some(&prior), Some(&overlaid), Written::Previewed, None),
+            &prior
+        ));
+        assert!(discovery_after_writes(None, Some(&overlaid), Written::Previewed, None).is_none());
+    }
 
     /// The wheel window is a patch-API window, so the documented escape
     /// hatch has to reach it: an operator behind something that caps
@@ -3730,6 +4023,12 @@ mod tests {
             describe_skip_reason("redirect_requirements_takeover_unreachable"),
             "hosted mode cannot pin it where vendored mode wired it, so it stays vendored \
              (see the warning)"
+        );
+        assert_eq!(
+            describe_skip_reason(socket_patch_core::hosted::engine::REDIRECT_UNATTRIBUTABLE),
+            "lockfile discovery could not attribute its pin to one package version, so \
+             nothing was written for it (reconcile the project's lockfiles; --json has the \
+             detail)"
         );
         assert_eq!(describe_skip_reason("mystery"), "server status `mystery`");
         for code in [
