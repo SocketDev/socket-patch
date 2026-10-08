@@ -123,7 +123,8 @@ pub(crate) fn entries(text: &str) -> Result<Vec<(String, Property)>, String> {
 /// Render `value` as Pipenv writes it at byte `start` of `text`: 4-space
 /// indent continued from the line it sits on, the lock's line ending, and
 /// non-ASCII as `\uXXXX` escapes (Pipenv's `json.dumps` keeps the default
-/// `ensure_ascii`) unless the lock already spells some character raw.
+/// `ensure_ascii`) unless the lock already spells some character raw
+/// (a leading BOM does not count).
 pub(crate) fn format_entry(value: &Value, text: &str, start: usize) -> Result<String, String> {
     let mut bytes = Vec::new();
     let formatter = serde_json::ser::PrettyFormatter::with_indent(b"    ");
@@ -138,7 +139,8 @@ pub(crate) fn format_entry(value: &Value, text: &str, start: usize) -> Result<St
         .chars()
         .take_while(|c| *c == ' ' || *c == '\t')
         .collect();
-    let formatted = if text.is_ascii() {
+    // A BOM is the editor's, not Pipenv's spelling of a character.
+    let formatted = if super::text::strip_bom(text).is_ascii() {
         super::json::escape_non_ascii(&formatted)
     } else {
         formatted
@@ -297,6 +299,11 @@ mod tests {
         assert_eq!(
             format_entry(&value, "{\"x\": \"\u{e9}\"}", 0).unwrap(),
             "{\n    \"path\": \"./caf\u{e9}\"\n}"
+        );
+        assert_eq!(
+            format_entry(&value, "\u{feff}{}", 0).unwrap(),
+            "{\n    \"path\": \"./caf\\u00e9\"\n}",
+            "a BOM alone does not make the lock raw-Unicode"
         );
     }
 }
