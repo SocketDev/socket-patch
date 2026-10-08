@@ -658,7 +658,7 @@ async fn resave_install_rollback(name: &'static str, crlf: bool) {
         let dropped = lock_bytes(&fx.proj);
         let out = fx.rollback(&[]);
         assert_eq!(
-            (out.code, out.json()["error"].as_str()),
+            (out.code, out.json()["error"]["message"].as_str()),
             (1, Some("Manifest not found")),
             "a URL-less node is no hosted pin: {out}"
         );
@@ -729,7 +729,7 @@ async fn vlt_pinned_matrix_hosted_resave_update_rollback() {
         // The update already put the lock back on the registry: v5 keeps no
         // ledger, so no hosted pin (and no heal target) is left to find.
         assert_eq!(
-            (out.code, out.json()["error"].as_str()),
+            (out.code, out.json()["error"]["message"].as_str()),
             (1, Some("Manifest not found")),
             "already reverted: nothing to roll back: {out}"
         );
@@ -1203,7 +1203,7 @@ async fn vlt_pinned_matrix_hosted_idempotence() {
     let files = package_files(&fx.proj);
     let out = fx.rollback(&[]);
     assert_eq!(
-        (out.code, out.json()["error"].as_str()),
+        (out.code, out.json()["error"]["message"].as_str()),
         (1, Some("Manifest not found")),
         "a second rollback finds no state: {out}"
     );

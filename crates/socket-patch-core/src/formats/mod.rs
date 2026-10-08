@@ -37,6 +37,7 @@ pub mod pnpm;
 pub mod registry;
 pub mod sbt;
 pub mod text;
+pub(crate) mod xml;
 pub mod yarn;
 
 pub use registry::registry;
