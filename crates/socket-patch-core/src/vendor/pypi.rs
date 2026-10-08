@@ -1955,12 +1955,8 @@ async fn pypi_reference_clause(project_root: &Path, uuid: &str, skip: &[&str]) -
     .iter()
     .map(|name| (*name).to_string())
     .collect();
-    match super::pypi_requirements::requirements_include_names(project_root).await {
+    match probe_include_names(project_root).await {
         Ok(includes) => names.extend(includes),
-        // A root requirements.txt that is not UTF-8 (pip decodes a UTF-16
-        // file by its BOM) cannot be walked for includes, but the root-level
-        // `*.txt` scan below still byte-probes it.
-        Err(e) if e.kind() == std::io::ErrorKind::InvalidData => {}
         Err(_) => {
             return Some(
                 "the requirements.txt include tree could not be read to prove no requirements \
@@ -2022,10 +2018,11 @@ async fn pypi_reference_clause(project_root: &Path, uuid: &str, skip: &[&str]) -
             continue;
         }
         let path = project_root.join(name);
-        // Bytes, not text: an unrelated Latin-1 `LICENSE.txt` must not read
-        // as unreadable and pin the wheel forever.
+        // Bytes, not UTF-8 text: an unrelated Latin-1 `LICENSE.txt` or a
+        // UTF-16 `pip freeze >` output is still probed instead of failing
+        // closed on every revert with no way out.
         match read_regular_to_bytes(&path).await {
-            Ok(bytes) if bytes_reference(&bytes, &needle) => {
+            Ok(bytes) if probe_text(&bytes).contains(&needle) => {
                 return Some(format!("{name} still resolves through it"));
             }
             Ok(_) => {}
@@ -2042,19 +2039,49 @@ async fn pypi_reference_clause(project_root: &Path, uuid: &str, skip: &[&str]) -
     None
 }
 
-/// Whether `bytes` contain `needle` as UTF-8 or as UTF-16 in either byte
-/// order (pip reads a BOM-marked UTF-16 requirements file, e.g. one
-/// PowerShell's `pip freeze >` wrote).
-fn bytes_reference(bytes: &[u8], needle: &str) -> bool {
-    let utf16 = |be: bool| -> Vec<u8> {
-        needle
-            .encode_utf16()
-            .flat_map(|u| if be { u.to_be_bytes() } else { u.to_le_bytes() })
-            .collect()
+/// A project file's bytes as text for [`pypi_reference_clause`], in any
+/// encoding a Python project file is plausibly saved in: UTF-16 with a BOM
+/// (what PowerShell's `>` writes, and what pip reads through the BOM) is
+/// decoded; anything else is read lossily, which keeps every ASCII byte —
+/// the whole needle, and pip's `-r` grammar — of a UTF-8 or legacy 8-bit
+/// (Latin-1, cp1252) file intact.
+fn probe_text(bytes: &[u8]) -> String {
+    let utf16 = |rest: &[u8], from: fn([u8; 2]) -> u16| {
+        let units: Vec<u16> = rest.chunks_exact(2).map(|c| from([c[0], c[1]])).collect();
+        String::from_utf16_lossy(&units)
     };
-    [needle.as_bytes().to_vec(), utf16(false), utf16(true)]
-        .iter()
-        .any(|pat| bytes.windows(pat.len()).any(|w| w == pat.as_slice()))
+    if let Some(rest) = bytes.strip_prefix(&[0xFF, 0xFE]) {
+        return utf16(rest, u16::from_le_bytes);
+    }
+    if let Some(rest) = bytes.strip_prefix(&[0xFE, 0xFF]) {
+        return utf16(rest, u16::from_be_bytes);
+    }
+    String::from_utf8_lossy(bytes).into_owned()
+}
+
+/// The root `requirements.txt` and every in-root `-r` include reached from
+/// it, the way [`requirements_include_names`] walks them, but read through
+/// [`probe_text`]: a file the planner could never have parsed (a UTF-16
+/// `pip freeze >` output, a Latin-1 comment) is still followed instead of
+/// blocking every revert. Only a real read error fails the walk.
+///
+/// [`requirements_include_names`]: super::pypi_requirements::requirements_include_names
+async fn probe_include_names(root: &Path) -> std::io::Result<Vec<String>> {
+    use super::pypi_requirements::{is_in_root_rel, requirements_includes};
+    let mut names: Vec<String> = Vec::new();
+    let mut stack = vec!["requirements.txt".to_string()];
+    while let Some(rel) = stack.pop() {
+        if names.contains(&rel) || !is_in_root_rel(&rel) {
+            continue;
+        }
+        names.push(rel.clone());
+        match read_regular_to_bytes(&root.join(&rel)).await {
+            Ok(bytes) => stack.extend(requirements_includes(&rel, &probe_text(&bytes))),
+            Err(e) if e.kind() == std::io::ErrorKind::NotFound => {}
+            Err(e) => return Err(e),
+        }
+    }
+    Ok(names)
 }
 
 /// The `vendor_revert_residual_reference` keep for a file the flavor revert
@@ -5845,6 +5872,110 @@ wheels = [
                 .unwrap(),
             "six==1.16.0\n"
         );
+    }
+
+    /// UTF-16 with a BOM, the way PowerShell's `pip freeze > x.txt` saves it.
+    fn utf16le_bom(text: &str) -> Vec<u8> {
+        let mut bytes = vec![0xFF, 0xFE];
+        bytes.extend(text.encode_utf16().flat_map(u16::to_le_bytes));
+        bytes
+    }
+
+    /// LIVENESS: a root `*.txt` that is not UTF-8 (a Latin-1 `LICENSE.txt`,
+    /// a UTF-16 `pip freeze >` output) and names no vendored wheel is read,
+    /// not treated as an unreadable file that may hide a reference — else
+    /// every wired revert keeps the wheel and ledger entry forever, with a
+    /// way-out the user cannot satisfy.
+    #[tokio::test]
+    async fn non_utf8_root_txt_does_not_block_the_revert() {
+        use crate::vendor::pypi_requirements::wire_requirements;
+        let tmp = tempfile::tempdir().unwrap();
+        let root = tmp.path();
+        tokio::fs::write(root.join("requirements.txt"), "six==1.16.0\n")
+            .await
+            .unwrap();
+        let rel_wheel = format!(".socket/vendor/pypi/{UUID}/six-1.16.0-py2.py3-none-any.whl");
+        let wiring = wire_requirements(root, "six", "1.16.0", &rel_wheel, &"0".repeat(64))
+            .await
+            .unwrap();
+        let uuid_dir = root.join(format!(".socket/vendor/pypi/{UUID}"));
+        tokio::fs::create_dir_all(&uuid_dir).await.unwrap();
+        tokio::fs::write(uuid_dir.join("six-1.16.0-py2.py3-none-any.whl"), b"wheel")
+            .await
+            .unwrap();
+        tokio::fs::write(root.join("LICENSE.txt"), b"Copyright Andr\xe9 \xa9 2024\n")
+            .await
+            .unwrap();
+        tokio::fs::write(root.join("frozen.txt"), utf16le_bom("six==1.16.0\r\n"))
+            .await
+            .unwrap();
+
+        let entry = revert_entry("requirements", &rel_wheel, wiring);
+        let outcome = revert_pypi(&entry, root, false).await;
+        assert!(outcome.success, "{:?}", outcome.error);
+        assert!(
+            !outcome.kept_artifact,
+            "no file references the wheel: {:?}",
+            outcome.warnings
+        );
+        assert!(!uuid_dir.exists(), "the artifact must be reclaimed");
+    }
+
+    /// SAFETY twin: decoding a non-UTF-8 file must not hide the reference
+    /// it holds. A UTF-16 root `*.txt`, and a Latin-1 `-r` include that
+    /// pulls in a nested file, still keep the wheel.
+    #[tokio::test]
+    async fn non_utf8_files_still_surface_their_reference() {
+        let needle = format!(".socket/vendor/pypi/{UUID}/six-1.16.0-py2.py3-none-any.whl");
+
+        let tmp = tempfile::tempdir().unwrap();
+        let root = tmp.path();
+        tokio::fs::write(
+            root.join("frozen.txt"),
+            utf16le_bom(&format!("./{needle}\r\n")),
+        )
+        .await
+        .unwrap();
+        let clause = pypi_reference_clause(root, UUID, &[]).await;
+        assert_eq!(
+            clause.as_deref(),
+            Some("frozen.txt still resolves through it")
+        );
+
+        let tmp = tempfile::tempdir().unwrap();
+        let root = tmp.path();
+        tokio::fs::create_dir_all(root.join("reqs")).await.unwrap();
+        tokio::fs::write(root.join("requirements.txt"), "-r reqs/dev.txt\n")
+            .await
+            .unwrap();
+        tokio::fs::write(
+            root.join("reqs/dev.txt"),
+            b"# d\xe9pendances\n-r nested.txt\n".as_slice(),
+        )
+        .await
+        .unwrap();
+        tokio::fs::write(
+            root.join("reqs/nested.txt"),
+            utf16le_bom(&format!("./{needle}\n")),
+        )
+        .await
+        .unwrap();
+        let clause = pypi_reference_clause(root, UUID, &[]).await;
+        assert_eq!(
+            clause.as_deref(),
+            Some("reqs/nested.txt still resolves through it")
+        );
+
+        // A real read failure still fails closed.
+        #[cfg(unix)]
+        {
+            let tmp = tempfile::tempdir().unwrap();
+            let root = tmp.path();
+            tokio::fs::create_dir(root.join("requirements.txt"))
+                .await
+                .unwrap();
+            assert!(pypi_reference_clause(root, UUID, &[]).await.is_some());
+        }
     }
 
     /// The splice-flavor wired-pin reader (the rebuild guard's ledgerless
