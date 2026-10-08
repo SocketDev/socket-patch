@@ -455,7 +455,8 @@ fn compile(file: &str, lists: &[(&'static str, &[String])]) -> Result<PathMatche
 /// The built-in defaults, compiled once (for callers that only need the
 /// default path ignores, e.g. tree-listing root detection).
 pub fn builtin_defaults() -> &'static SelectionPolicy {
-    static DEFAULTS: std::sync::LazyLock<SelectionPolicy> = std::sync::LazyLock::new(SelectionPolicy::unrestricted);
+    static DEFAULTS: std::sync::LazyLock<SelectionPolicy> =
+        std::sync::LazyLock::new(SelectionPolicy::unrestricted);
     &DEFAULTS
 }
 

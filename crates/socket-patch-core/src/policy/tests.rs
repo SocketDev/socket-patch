@@ -502,8 +502,14 @@ fn composer_package_filters_match_release_identity_and_preserve_branch_case() {
         Err(FilterReason::PackageIgnored { .. })
     ));
     assert!(policy.admits_purl("pkg:composer/psr/log@3.0.3").is_ok());
-    assert!(package_spec_matches("pkg:composer/PSR/Log@3.0.2.0", "pkg:composer/psr/log@3.0.2"));
-    assert!(!package_spec_matches("pkg:composer/psr/log@dev-Feature", "pkg:composer/psr/log@dev-feature"));
+    assert!(package_spec_matches(
+        "pkg:composer/PSR/Log@3.0.2.0",
+        "pkg:composer/psr/log@3.0.2"
+    ));
+    assert!(!package_spec_matches(
+        "pkg:composer/psr/log@dev-Feature",
+        "pkg:composer/psr/log@dev-feature"
+    ));
 }
 
 #[test]
@@ -672,13 +678,21 @@ mod disk {
 fn this_repos_socket_yml_loads_and_excludes_its_fixtures() {
     let repo = Path::new(env!("CARGO_MANIFEST_DIR")).join("../..");
     let (policy, warnings) =
-        SelectionPolicy::load(&DiskPolicyFs::new(&repo), &PolicyOverrides::default()).expect("valid");
+        SelectionPolicy::load(&DiskPolicyFs::new(&repo), &PolicyOverrides::default())
+            .expect("valid");
     assert!(warnings.is_empty(), "{warnings:?}");
     assert!(matches!(policy.source(), PolicySource::File { path, .. } if path == "socket.yml"));
     let lock = strings(&["package-lock.json"]);
     let err = policy
-        .admits_root(&root("crates/socket-patch-core/tests/fixtures/redirect/npm", &lock, true))
+        .admits_root(&root(
+            "crates/socket-patch-core/tests/fixtures/redirect/npm",
+            &lock,
+            true,
+        ))
         .unwrap_err();
-    assert_eq!(err.detail(), "crates/socket-patch-core/tests/fixtures/** (projectIgnorePaths)");
+    assert_eq!(
+        err.detail(),
+        "crates/socket-patch-core/tests/fixtures/** (projectIgnorePaths)"
+    );
     assert!(policy.admits_root(&root("", &lock, true)).is_ok());
 }
