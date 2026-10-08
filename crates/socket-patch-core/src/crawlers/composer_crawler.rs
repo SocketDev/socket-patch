@@ -5,8 +5,9 @@ use std::path::{Path, PathBuf};
 use super::types::{CrawledPackage, CrawlerOptions};
 use crate::patch::path_safety;
 use crate::utils::composer_version::composer_versions_equivalent;
-use crate::utils::fs::{is_dir, is_dir_sync, is_file, normalize_lexically, run_blocking};
+use crate::utils::fs::{is_dir, is_dir_sync, is_file, run_blocking};
 use crate::utils::process::{CommandRunner, GlobalProbeRunner};
+use crate::utils::relpath::normalize_lexically;
 
 #[cfg(test)]
 mod oracle;
@@ -530,17 +531,7 @@ fn normalize_config_vendor_dir(raw: &str) -> Option<String> {
     if raw.starts_with(['/', '\\']) {
         return None;
     }
-    let mut segments: Vec<&str> = Vec::new();
-    for segment in raw.split(['/', '\\']) {
-        match segment {
-            "" | "." => {}
-            ".." => {
-                segments.pop()?;
-            }
-            other => segments.push(other),
-        }
-    }
-    (!segments.is_empty()).then(|| segments.join("/"))
+    crate::utils::relpath::resolve_rel("", raw, 0).filter(|segments| !segments.is_empty())
 }
 
 /// Read `config.vendor-dir` from a composer.json on disk. Read with
@@ -589,8 +580,7 @@ async fn resolve_project_root(vendor_path: &Path) -> PathBuf {
 }
 
 // `normalize_lexically` (resolve `.`/`..` without touching the filesystem)
-// lives in `crate::utils::fs` — shared with the ruby crawler's
-// config-sourced `BUNDLE_PATH` containment guard.
+// lives in `crate::utils::relpath` with every other lexical normalizer.
 
 /// Resolve an installed.json `install-path` against the vendor tree.
 ///
@@ -1595,26 +1585,6 @@ mod tests {
         assert!(!crate::patch::path_safety::is_safe_multi_segment(
             "C:/Users/x/vendor"
         ));
-    }
-
-    #[test]
-    fn test_normalize_lexically() {
-        let n = |p: &str| normalize_lexically(Path::new(p));
-        // `.` drops out, `..` pops the previous segment.
-        assert_eq!(
-            n("/a/b/composer/../monolog/monolog").unwrap(),
-            PathBuf::from("/a/b/monolog/monolog")
-        );
-        assert_eq!(
-            n("/a/b/composer/./installers").unwrap(),
-            PathBuf::from("/a/b/composer/installers")
-        );
-        assert_eq!(n("/a/b/c/../../../web/x").unwrap(), PathBuf::from("/web/x"));
-        // Popping above the path's own root fails closed.
-        assert_eq!(n("/a/../.."), None);
-        assert_eq!(n("../x"), None);
-        // Relative paths stay relative.
-        assert_eq!(n("a/b/../c").unwrap(), PathBuf::from("a/c"));
     }
 
     #[tokio::test]

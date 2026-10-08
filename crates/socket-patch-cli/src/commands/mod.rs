@@ -1,8 +1,8 @@
 pub(crate) mod agent_download;
 pub mod apply;
 pub(crate) mod bun_preflight;
-pub(crate) mod context;
 pub(crate) mod composer_hints;
+pub(crate) mod context;
 pub(crate) mod fetch_stage;
 pub mod get;
 pub mod hosted_bundle;
@@ -11,11 +11,11 @@ pub mod list;
 pub(crate) mod lock_cli;
 pub mod remove;
 pub mod repair;
-pub(crate) mod vendored_backend;
 pub mod rollback;
 pub mod scan;
 pub mod update;
 pub mod vendor;
+pub(crate) mod vendored_backend;
 pub mod vex;
 pub(crate) mod vex_consumed;
 pub(crate) mod vex_sources;
@@ -139,9 +139,11 @@ pub(crate) async fn hosted_state_from_lockfiles(
     common: &crate::args::GlobalArgs,
     root: &Path,
 ) -> socket_patch_core::patch::redirect::RedirectState {
-    hosted_state_from_pins(&socket_patch_core::patch::redirect::upstream::HostedPin::all(
-        &discover_wiring(common, root).await,
-    ))
+    hosted_state_from_pins(
+        &socket_patch_core::patch::redirect::upstream::HostedPin::all(
+            &discover_wiring(common, root).await,
+        ),
+    )
 }
 
 /// [`hosted_state_from_lockfiles`] over already-discovered pins. A purl
@@ -151,10 +153,8 @@ pub(crate) fn hosted_state_from_pins(
 ) -> socket_patch_core::patch::redirect::RedirectState {
     let mut state = socket_patch_core::patch::redirect::RedirectState::new();
     for pin in pins {
-        state
-            .records
-            .entry(pin.purl.clone())
-            .or_insert_with(|| socket_patch_core::manifest::schema::PatchRecord {
+        state.records.entry(pin.purl.clone()).or_insert_with(|| {
+            socket_patch_core::manifest::schema::PatchRecord {
                 uuid: pin.uuid.clone(),
                 exported_at: String::new(),
                 files: Default::default(),
@@ -162,7 +162,8 @@ pub(crate) fn hosted_state_from_pins(
                 description: String::new(),
                 license: String::new(),
                 tier: String::new(),
-            });
+            }
+        });
     }
     state
 }
@@ -189,4 +190,3 @@ pub(crate) fn vendor_state_lenient(
         }
     }
 }
-

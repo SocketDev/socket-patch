@@ -33,8 +33,6 @@
 //! and — when the project file is silent — the user / global / builtin
 //! config files ([`resolve_outer_allow_remote`]).
 
-
-
 /// Repo-relative path of the project `.npmrc` the auto-config edits.
 pub const NPMRC_REL: &str = ".npmrc";
 
@@ -356,7 +354,7 @@ impl NpmConfigEnv {
 
     /// [`Self::var_raw`] with empty read as unset (npm tests `PREFIX` /
     /// `DESTDIR` / `HOME` for truthiness).
-    fn var(&self, name: &str) -> Option<&str> {
+    pub(crate) fn var(&self, name: &str) -> Option<&str> {
         self.var_raw(name).filter(|v| !v.is_empty())
     }
 
@@ -1137,5 +1135,4 @@ mod tests {
             );
         }
     }
-
 }

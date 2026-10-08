@@ -17,6 +17,7 @@ use socket_patch_core::patch::apply::{is_valid_blob_hash, select_installed_varia
 use socket_patch_core::patch::apply_lock::{LockError, LockGuard};
 use socket_patch_core::utils::concurrent::{api_concurrency_for, ordered_concurrent};
 use socket_patch_core::utils::purl::{canonical_purl, normalize_purl, strip_purl_qualifiers};
+use socket_patch_core::utils::purl_key::PurlKey;
 use socket_patch_core::vendor::{load_state, lookup_entry, VendorEntry, VendorState};
 use std::collections::HashMap;
 use std::path::{Path, PathBuf};
@@ -215,13 +216,17 @@ pub(crate) fn report_lock_failure(
     envelope
 }
 
-/// Decode a base64 string and write it to `blobs_dir/hash`. Returns whether
-/// the blob file was NEWLY created (`false`: a blob with this hash already
-/// existed — content-addressed, so it is the same bytes — and was
-/// overwritten in place), or a formatted error string referencing
-/// `file_path` and `label` on failure.
+/// Decode a base64 string and store it as the blob `blobs_dir/hash`
+/// through the one verified writer,
+/// [`store_verified_blob`](socket_patch_core::api::blob_fetcher::store_verified_blob):
+/// the bytes must hash to `hash`, a linked `.socket/blobs` or
+/// `.socket/blobs/<hash>` is refused, and the entry is staged and renamed
+/// (#726). Returns whether the blob file was NEWLY created (`false`: a
+/// verified blob with this hash already existed and was left untouched),
+/// or a formatted error string referencing `file_path` and `label` on
+/// failure.
 ///
-/// `blobs_dir` is created here, lazily — only once a blob is actually
+/// `blobs_dir` is created there, lazily — only once a blob is actually
 /// about to be persisted — so a run that records nothing (every fetch
 /// failed, every patch skipped, undecodable content) leaves no empty
 /// `.socket/blobs/` behind.
@@ -239,18 +244,9 @@ pub(crate) async fn write_blob_entry(
     }
     let decoded =
         base64_decode(b64).map_err(|e| format!("Failed to decode {label} for {file_path}: {e}"))?;
-    tokio::fs::create_dir_all(blobs_dir)
+    socket_patch_core::api::blob_fetcher::store_verified_blob(blobs_dir, hash, &decoded)
         .await
-        .map_err(|e| format!("Failed to create blobs directory: {e}"))?;
-    let target = blobs_dir.join(hash);
-    // Probed BEFORE the (overwriting) write: a blob that already existed —
-    // a live record's revert data, or a sibling patch's shared after-blob
-    // written earlier this run — is never this call's to remove on unwind.
-    let existed = tokio::fs::try_exists(&target).await.unwrap_or(false);
-    tokio::fs::write(&target, &decoded)
-        .await
-        .map_err(|e| format!("Failed to write {label} for {file_path}: {e}"))?;
-    Ok(!existed)
+        .map_err(|e| format!("Failed to write {label} for {file_path} ({hash}): {e}"))
 }
 
 /// Write every after/before blob for `patch` into `blobs_dir`, reporting
@@ -811,7 +807,8 @@ pub(crate) async fn lock_text_refusals_for(
         )
         .await,
     );
-    let claimed: Vec<String> = pins.iter().map(|pin| canonical_purl(&pin.purl)).collect();
+    let claimed: std::collections::HashSet<PurlKey> =
+        pins.iter().map(|pin| PurlKey::new(&pin.purl)).collect();
     let fetchable: Vec<&PatchSearchResult> = selected
         .iter()
         .filter(|sr| bun_refusal.filter(|r| r.applies_to(&sr.purl)).is_none())
@@ -822,7 +819,7 @@ pub(crate) async fn lock_text_refusals_for(
         .collect();
     let candidates: Vec<(&str, &str)> = fetchable
         .iter()
-        .filter(|sr| !claimed.contains(&canonical_purl(&sr.purl)))
+        .filter(|sr| !claimed.contains(&PurlKey::new(&sr.purl)))
         .map(|sr| (sr.purl.as_str(), sr.uuid.as_str()))
         .collect();
     let refused = socket_patch_core::vendor::lock_text_refusals(cwd, &candidates).await;
@@ -846,7 +843,7 @@ pub(crate) async fn lock_text_refusals_for(
             cwd,
             fetchable
                 .iter()
-                .filter(|sr| claimed.contains(&canonical_purl(&sr.purl)))
+                .filter(|sr| claimed.contains(&PurlKey::new(&sr.purl)))
                 .map(|sr| sr.purl.as_str()),
             &pins,
             false,
@@ -1399,8 +1396,8 @@ pub(crate) async fn run_nested_apply(
 /// qualified record (apply keys a release-variant base by its base purl).
 /// A qualified key never covers a sibling variant.
 pub(crate) fn apply_key_covers(key: &str, record: &str) -> bool {
-    let (key, record) = (normalize_purl(key), normalize_purl(record));
-    key == record || (!key.contains(['?', '#']) && record.split(['?', '#']).next() == Some(&*key))
+    PurlKey::qualified(key) == PurlKey::qualified(record)
+        || (!key.trim().contains(['?', '#']) && PurlKey::same(key, record))
 }
 
 /// Fold a failed nested apply into a `get` / `scan --mode agent` JSON
@@ -1443,7 +1440,8 @@ pub(crate) fn fold_apply_failures(
             }
         }
         let appended = patches[selected..].iter().any(|r| {
-            normalize_purl(r["purl"].as_str().unwrap_or_default()) == normalize_purl(&failure.purl)
+            PurlKey::qualified(r["purl"].as_str().unwrap_or_default())
+                == PurlKey::qualified(&failure.purl)
         });
         if !hit && !appended {
             let mut rec = serde_json::json!({
@@ -1668,40 +1666,25 @@ pub async fn download_and_apply_patches_with(
     (exit_code, result_json)
 }
 
-/// Decode a patch view's `blobContent` (canonical, padded base64 as the API
-/// produces it). Hand-rolled; swapping in
-/// `base64::engine::general_purpose::STANDARD.decode(input)` must keep
-/// `DecodeError::InvalidByte(_, b)` mapped to the
-/// `Invalid base64 character: <b>` message below (pinned by a unit test).
+/// Decode a patch view's `blobContent` (canonical base64 as the API
+/// produces it; line breaks and missing padding are tolerated). An invalid
+/// byte keeps the `Invalid base64 character: <b>` message (pinned by a
+/// unit test).
 pub(crate) fn base64_decode(input: &str) -> Result<Vec<u8>, String> {
-    let chars = b"ABCDEFGHIJKLMNOPQRSTUVWXYZabcdefghijklmnopqrstuvwxyz0123456789+/";
-    let mut table = [255u8; 256];
-    for (i, &c) in chars.iter().enumerate() {
-        table[c as usize] = i as u8;
-    }
-
-    let input = input.as_bytes();
-    let mut output = Vec::with_capacity(input.len() * 3 / 4);
-
-    let mut buf = 0u32;
-    let mut bits = 0u32;
-
-    for &b in input {
-        if b == b'=' || b == b'\n' || b == b'\r' {
-            continue;
+    use base64::engine::{general_purpose, DecodePaddingMode, GeneralPurpose};
+    use base64::Engine;
+    const ENGINE: GeneralPurpose = GeneralPurpose::new(
+        &base64::alphabet::STANDARD,
+        general_purpose::PAD.with_decode_padding_mode(DecodePaddingMode::Indifferent),
+    );
+    let compact: String = input
+        .chars()
+        .filter(|c| !matches!(c, '\n' | '\r'))
+        .collect();
+    ENGINE.decode(compact).map_err(|e| match e {
+        base64::DecodeError::InvalidByte(_, b) => {
+            format!("Invalid base64 character: {}", b as char)
         }
-        let val = table[b as usize];
-        if val == 255 {
-            return Err(format!("Invalid base64 character: {}", b as char));
-        }
-        buf = (buf << 6) | val as u32;
-        bits += 6;
-        if bits >= 8 {
-            bits -= 8;
-            output.push((buf >> bits) as u8);
-            buf &= (1 << bits) - 1;
-        }
-    }
-
-    Ok(output)
+        other => format!("Invalid base64: {other}"),
+    })
 }

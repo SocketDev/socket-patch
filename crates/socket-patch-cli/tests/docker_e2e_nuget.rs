@@ -24,11 +24,12 @@ use wiremock::{Mock, MockServer, ResponseTemplate};
 
 const ORG: &str = "test-org";
 // The nuget crawler reports installed packages with the lowercased
-// directory name (because ~/.nuget/packages stores them as lowercase
-// dirs). The wiremock fixture must return the same casing so scan's
-// GC pass doesn't prune the freshly-saved manifest entry as
-// "not-in-scanned-purls".
+// directory name (~/.nuget/packages stores them as lowercase dirs), and the
+// batch endpoint echoes the queried purl back; the patch itself carries the
+// API's own mixed-case spelling, which lands in the manifest verbatim. NuGet
+// ids are case-insensitive, so scan's GC pass must keep that entry (B20).
 const PURL: &str = "pkg:nuget/newtonsoft.json@13.0.3";
+const API_PURL: &str = "pkg:nuget/Newtonsoft.Json@13.0.3";
 const UUID: &str = "18181818-1818-4181-8181-181818181818";
 /// The vulnerability the staged manifest carries so the agent-mode VEX leg
 /// has something to attest (plain agent provenance — no vendored/redirected
@@ -87,7 +88,7 @@ async fn make_mock_server(after_hash: &str) -> MockServer {
             "packages": [{
                 "purl": PURL,
                 "patches": [{
-                    "uuid": UUID, "purl": PURL,
+                    "uuid": UUID, "purl": API_PURL,
                     "tier": "free", "cveIds": [], "ghsaIds": [],
                     "severity": "medium", "title": "nuget e2e fixture"
                 }]
@@ -103,7 +104,7 @@ async fn make_mock_server(after_hash: &str) -> MockServer {
         )))
         .respond_with(ResponseTemplate::new(200).set_body_json(serde_json::json!({
             "patches": [{
-                "uuid": UUID, "purl": PURL,
+                "uuid": UUID, "purl": API_PURL,
                 "publishedAt": "2024-01-01T00:00:00Z",
                 "description": "nuget e2e fixture",
                 "license": "MIT", "tier": "free",
@@ -119,7 +120,7 @@ async fn make_mock_server(after_hash: &str) -> MockServer {
         .and(path(format!("/v0/orgs/{ORG}/patches/view/{UUID}")))
         .respond_with(ResponseTemplate::new(200).set_body_json(serde_json::json!({
             "uuid": UUID,
-            "purl": PURL,
+            "purl": API_PURL,
             "publishedAt": "2024-01-01T00:00:00Z",
             "files": {
                 // nuget uses `package/<rel>`; apply strips and joins
@@ -592,7 +593,8 @@ async fn nuget_local_install_full_apply_chain() {
         stderr.contains("===VEX VERIFIED==="),
         "agent-mode VEX leg did not run/pass (===VEX VERIFIED=== missing).\nstderr=\n{stderr}"
     );
-    assert_vex_agent_attested(&stdout, PURL);
+    // Agent VEX names the manifest key: the API's spelling.
+    assert_vex_agent_attested(&stdout, API_PURL);
     assert!(
         stderr.contains("===MANIFESTLESS VEX VERIFIED==="),
         "manifest-less agent-mode VEX leg did not run/pass.\nstderr=\n{stderr}"

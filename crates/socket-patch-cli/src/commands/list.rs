@@ -68,19 +68,14 @@ impl HostedListing {
     /// One listing per hosted pin in `pins`, detailed from `legacy` where
     /// it records the same purl and uuid.
     pub(crate) fn from_pins(pins: &[HostedPin], legacy: Option<&RedirectState>) -> Vec<Self> {
-        let canon = |p: &str| {
-            socket_patch_core::utils::purl::normalize_purl(
-                socket_patch_core::utils::purl::strip_purl_qualifiers(p),
-            )
-            .into_owned()
-        };
+        use socket_patch_core::utils::purl_key::PurlKey;
         pins.iter()
             .map(|pin| {
                 let record = legacy
                     .and_then(|l| {
                         l.records
                             .iter()
-                            .find(|(k, r)| canon(k) == canon(&pin.purl) && r.uuid == pin.uuid)
+                            .find(|(k, r)| PurlKey::same(k, &pin.purl) && r.uuid == pin.uuid)
                             .map(|(_, r)| r.clone())
                     })
                     .unwrap_or_else(|| PatchRecord {

@@ -873,6 +873,18 @@ fn corrupt_manifest_under_pnp_layout_reports_manifest_error_not_refusal() {
         stderr.contains("Plug'n'Play layout is not supported"),
         "the refusal must fire when the manifest IS readable and targets npm; stderr={stderr}"
     );
+
+    // (c) `--check` refuses the same tree instead of reading every hidden
+    // npm copy as not installed and exiting 0.
+    let (code, stdout, stderr) = run_apply(tmp.path(), &["--offline", "--check"], &[]);
+    assert_eq!(
+        code, 1,
+        "PnP + npm patch must refuse --check; stdout={stdout} stderr={stderr}"
+    );
+    assert!(
+        stderr.contains("Plug'n'Play layout is not supported"),
+        "--check must run apply's PnP refusal; stderr={stderr}"
+    );
 }
 
 // ═══════════ 6. gem fallback-home skip on human stderr ═══════════

@@ -179,11 +179,12 @@ impl GoCrawler {
         // GOMODCACHE and GOPATH guards above: honoring `""` would yield the
         // RELATIVE path `go/pkg/mod`, pointing the crawl at a directory
         // inside the user's project instead of a real module cache.
-        let home = std::env::var("HOME")
-            .ok()
-            .filter(|h| !h.is_empty())
-            .or_else(|| std::env::var("USERPROFILE").ok().filter(|h| !h.is_empty()))?;
-        Some(PathBuf::from(home).join("go").join("pkg").join("mod"))
+        Some(
+            crate::utils::fs::home_dir()?
+                .join("go")
+                .join("pkg")
+                .join("mod"),
+        )
     }
 
     /// The unit tests' entry point to [`parse_versioned_dir`] (the walk

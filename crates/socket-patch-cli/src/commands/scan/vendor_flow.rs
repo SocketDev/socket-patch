@@ -21,8 +21,7 @@ use socket_patch_core::api::types::{BatchPackagePatches, PatchResponse, PatchSea
 use socket_patch_core::manifest::operations::{read_manifest, write_manifest};
 use socket_patch_core::manifest::schema::PatchRecord;
 use socket_patch_core::telemetry::{track_patch_vendor_failed, PendingTelemetry};
-use socket_patch_core::utils::composer_version::composer_purls_equivalent;
-use socket_patch_core::utils::purl::strip_purl_qualifiers;
+use socket_patch_core::utils::purl_key::PurlKey;
 use socket_patch_core::vendor::{load_state, lookup_entry, save_state, VendorState};
 use std::collections::{HashMap, HashSet};
 use std::path::Path;
@@ -483,16 +482,11 @@ async fn migrate_legacy_manifest_records(
         if !(entry.detached && entry.record.is_some() && entry.uuid == record.uuid) {
             continue;
         }
-        let base = strip_purl_qualifiers(&entry.base_purl);
+        let base = PurlKey::new(&entry.base_purl);
         let keys: Vec<String> = manifest
             .patches
             .keys()
-            .filter(|k| {
-                *k == &key
-                    || *k == purl
-                    || strip_purl_qualifiers(k) == base
-                    || composer_purls_equivalent(k, base)
-            })
+            .filter(|k| *k == &key || *k == purl || PurlKey::new(k) == base)
             .cloned()
             .collect();
         for k in keys {
@@ -552,7 +546,7 @@ async fn run_vendor_json_path(
     manifest_path: &Path,
     socket_dir: &Path,
     scanned_purls: &HashSet<String>,
-    vendored_purls: &HashSet<String>,
+    vendored_purls: &HashSet<PurlKey>,
     prune: bool,
     telemetry_token: Option<&str>,
     telemetry_org: Option<&str>,
@@ -732,7 +726,7 @@ async fn run_vendor_interactive_path(
     manifest_path: &Path,
     socket_dir: &Path,
     scanned_purls: &HashSet<String>,
-    vendored_purls: &HashSet<String>,
+    vendored_purls: &HashSet<PurlKey>,
     prune: bool,
     telemetry_token: Option<&str>,
     telemetry_org: Option<&str>,
@@ -913,7 +907,7 @@ pub(super) fn boxed_vendor_json_path<'a>(
     manifest_path: &'a Path,
     socket_dir: &'a Path,
     scanned_purls: &'a HashSet<String>,
-    vendored_purls: &'a HashSet<String>,
+    vendored_purls: &'a HashSet<PurlKey>,
     prune: bool,
     telemetry_token: Option<&'a str>,
     telemetry_org: Option<&'a str>,
@@ -956,7 +950,7 @@ pub(super) fn boxed_vendor_interactive_path<'a>(
     manifest_path: &'a Path,
     socket_dir: &'a Path,
     scanned_purls: &'a HashSet<String>,
-    vendored_purls: &'a HashSet<String>,
+    vendored_purls: &'a HashSet<PurlKey>,
     prune: bool,
     telemetry_token: Option<&'a str>,
     telemetry_org: Option<&'a str>,
