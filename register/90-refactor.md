@@ -52,6 +52,6 @@ Re-ranked 2026-10-08T11:00Z at `628542d` against the 33 open PRs' 580 files; #82
 - CLI test targets: 145+ files spawn `socket-patch` with a bare `Command::new(binary())`; `tests/spawn_env_hygiene.rs` keeps `PENDING_RAW_SPAWNS` / `PENDING_SCRUB_COPIES` allowlists that fail on new **and** stale entries — drop a file from the list when you migrate it.
 - Test modules lean on the parent's imports via `use super::*`: removing a production import can break only `cargo test --lib --no-run`.
 - go.mod's lexer treats `//` as a comment anywhere (`module a//b` declares `a`).
-- Never share a process-global `reqwest::Client` in core tests (pooled connections bind to one tokio runtime); build per call from a shared builder.
+- Never share a process-global `reqwest::Client` in core tests (pooled connections bind to one tokio runtime).
 - The sandbox (root) also fails 3 `covgap_commands_vendor` state-write-failure tests (chmod-based) on main and branches alike.
 - Probe spawns go through `utils::process::output_within` since #886 (blocking; async callers wrap it in `utils::fs::run_blocking`). It nulls stderr; don't add a new `tokio::time::timeout` + `kill_on_drop` site.
