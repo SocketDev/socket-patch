@@ -269,8 +269,9 @@ impl ProjectReader {
     }
 }
 
-/// Read a project file for the planners (see [`ProjectReader::read`]).
-pub fn read_project_file(root: &Path, rel: &str) -> Option<Vec<u8>> {
+/// Read a project file for the planners' tests (see [`ProjectReader::read`]).
+#[cfg(test)]
+pub(crate) fn read_project_file(root: &Path, rel: &str) -> Option<Vec<u8>> {
     ProjectReader::new(root).read(rel)
 }
 

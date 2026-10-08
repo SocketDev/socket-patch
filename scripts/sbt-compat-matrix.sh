@@ -181,26 +181,33 @@ STATUS=0
 report() {
   # PASS / FAIL / SKIP per `test <name> ... <result>` line of log $1.
   local log="$1" label="$2"
-  local lines
+  local lines failed=0
   lines=$(grep -E '^test [^ ]+ \.\.\. ' "$log" || true)
   if [ -z "$lines" ]; then
     echo "FAIL $label (no test ran; see $log)"
-    STATUS=1
-    return
+    failed=1
+  else
+    while IFS= read -r line; do
+      name=$(echo "$line" | awk '{print $2}')
+      case "$line" in
+        *"... ok") echo "PASS $label $name" ;;
+        *"... ignored"*) echo "SKIP $label $name" ;;
+        *) echo "FAIL $label $name"; failed=1 ;;
+      esac
+    done <<< "$lines"
+    if grep -q '^SKIP ' "$log"; then
+      grep '^SKIP ' "$log" | sed "s/^/NOTE $label /"
+    fi
+    if ! grep -qE '^test result: ok\.' "$log"; then
+      failed=1
+    fi
   fi
-  while IFS= read -r line; do
-    name=$(echo "$line" | awk '{print $2}')
-    case "$line" in
-      *"... ok") echo "PASS $label $name" ;;
-      *"... ignored"*) echo "SKIP $label $name" ;;
-      *) echo "FAIL $label $name"; STATUS=1 ;;
-    esac
-  done <<< "$lines"
-  if grep -q '^SKIP ' "$log"; then
-    grep '^SKIP ' "$log" | sed "s/^/NOTE $label /"
-  fi
-  if ! grep -qE '^test result: ok\.' "$log"; then
+  if [ "$failed" = 1 ]; then
     STATUS=1
+    # The log is uploaded only as an artifact; show why in the job log too.
+    echo "::group::tail of $log" >&2
+    tail -n 60 "$log" >&2
+    echo "::endgroup::" >&2
   fi
 }
 

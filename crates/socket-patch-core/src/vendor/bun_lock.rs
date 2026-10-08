@@ -1231,7 +1231,10 @@ fn classify_rewritable(
     name: &str,
     target_leaf: &str,
 ) -> Option<TupleShape> {
-    classify(entry, target_spec, name, target_leaf).filter(|_| !is_bundled_entry(entry))
+    // The cheap spec match runs first; the bundled parse only for a match
+    // (#580).
+    let shape = classify(entry, target_spec, name, target_leaf)?;
+    (!is_bundled_entry(entry)).then_some(shape)
 }
 
 /// Keys of the bundled entries that resolve the target `name@version`.

@@ -4808,6 +4808,17 @@ fn rewrite_bun_lock(
         Some(content),
     );
 
+    // Decode each entry's spec once per lock, not once per (patch, entry)
+    // pair. The bundled flag needs a full JSON parse of the entry's meta
+    // object, so it is computed lazily, only for entries whose spec matches
+    // some patch, and cached (#580: the eager per-patch parse made bun scans
+    // O(entries x patches) JSON parses).
+    let specs: Vec<Option<String>> = entries
+        .iter()
+        .map(|e| e.elems.first().and_then(|s| decode_json_string(s)))
+        .collect();
+    let mut bundled: Vec<Option<bool>> = vec![None; entries.len()];
+
     let mut changed = false;
     let mut pinned_any = false;
     for dep in &npm {
@@ -4828,20 +4839,20 @@ fn rewrite_bun_lock(
         // A non-bundled instance now resolves to the hosted URL.
         let mut wired = false;
         let mut user_tarball_skipped = false;
-        for entry in &entries {
-            let Some(spec) = entry.elems.first().and_then(|e| decode_json_string(e)) else {
+        for (i, entry) in entries.iter().enumerate() {
+            let Some(spec) = specs[i].as_deref() else {
                 continue;
             };
             // Bun unpacks a bundled copy from its PARENT's tarball and never
             // reads the entry's spec (#469), so a rewrite here would count
             // as redirected (and VEX-attest the patch) while the unpatched
             // bundled bytes keep installing. Mirrors npm's `inBundle` guard.
-            // The spec compare runs first: the bundled check JSON-parses the
-            // meta, which per dep × entry doubled bun/hosted wall (#578).
+            // The cheap spec match runs first; the bundled parse only for
+            // a match (#580).
             if (spec == target_spec
                 || spec == url_spec
-                || is_prior_hosted_bun_spec(&spec, &fname, &dep.artifact_url))
-                && is_bundled_entry(entry)
+                || is_prior_hosted_bun_spec(spec, &fname, &dep.artifact_url))
+                && *bundled[i].get_or_insert_with(|| is_bundled_entry(entry))
             {
                 matched_any = true;
                 result.bundled_skipped_uuids.insert(dep.patch_uuid.clone());
@@ -4886,7 +4897,7 @@ fn rewrite_bun_lock(
                 deps_verbatim = entry.elems[1].clone();
             } else if matches!(entry.elems.len(), 2 | 3)
                 && entry.elems[1].starts_with('{')
-                && is_prior_hosted_bun_spec(&spec, &fname, &dep.artifact_url)
+                && is_prior_hosted_bun_spec(spec, &fname, &dep.artifact_url)
             {
                 // A URL tuple written by an EARLIER redirect whose artifact
                 // URL has since changed (a patch republish rotates the uuid
@@ -4905,7 +4916,7 @@ fn rewrite_bun_lock(
                 // this very version is installed from that spec beside the
                 // pinned copy and stays unpatched (#497, npm's #326): say so,
                 // and keep the in-run VEX from assuming the uuid patched.
-                if spec != url_spec && is_user_tarball_spec(&spec, &fname, &dep.version) {
+                if spec != url_spec && is_user_tarball_spec(spec, &fname, &dep.version) {
                     user_tarball_skipped = true;
                     result.bundled_skipped_uuids.insert(dep.patch_uuid.clone());
                     result.warnings.push(RewriteWarning {
@@ -12034,6 +12045,48 @@ mod tests {
             assert!(r.warnings.is_empty(), "{other}: {:?}", r.warnings);
             assert!(r.bundled_skipped_uuids.is_empty());
         }
+    }
+
+    /// #580: the bundled check runs only for entries whose spec matches the
+    /// patch. A bundled copy of ANOTHER package (or another version) beside
+    /// the target never warns or keeps the patch out of VEX, while a bundled
+    /// copy of the target itself still does, across several patches.
+    #[test]
+    fn bun_lock_bundled_check_only_applies_to_matching_entries() {
+        let sha512 = format!("sha512-{}==", "A".repeat(86));
+        let ovr = npm_override("is-number", "7.0.0", "http://p.test/isn.tgz", &sha512);
+        let regular = "\"is-number\": [\"is-number@7.0.0\", \"\", {}, \"sha512-UP==\"],";
+        let other_bundled = "\"@bh/bund/kind-of\": [\"kind-of@6.0.3\", \"\", { \"bundled\": true }, \"sha512-KO==\"],";
+        let other_version_bundled = "\"@bh/bund/is-number\": [\"is-number@6.0.0\", \"\", { \"bundled\": true }, \"sha512-OV==\"],";
+
+        let lock = format!("{regular}\n    {other_bundled}\n    {other_version_bundled}");
+        let mut files = BTreeMap::new();
+        files.insert("bun.lock".to_string(), bun_lock_file(&lock, 1));
+        let mut r = RewriteResult::default();
+        rewrite_bun_lock(&files, std::slice::from_ref(&ovr), &mut r);
+        assert_eq!(r.edits.len(), 1, "{:?}", r.edits);
+        assert_eq!(r.edits[0].key.as_deref(), Some("is-number"));
+        assert!(r.warnings.is_empty(), "{:?}", r.warnings);
+        assert!(r.bundled_skipped_uuids.is_empty());
+        let out = r.files.get("bun.lock").expect("lock rewritten");
+        assert!(out.contains(other_bundled) && out.contains(other_version_bundled));
+
+        // A second patch whose target IS bundled still warns, and only for
+        // its own uuid.
+        let mut kind_of = npm_override("kind-of", "6.0.3", "http://p.test/ko.tgz", &sha512);
+        kind_of.patch_uuid = "33333333-3333-4333-8333-333333333333".into();
+        let mut r = RewriteResult::default();
+        rewrite_bun_lock(&files, &[ovr.clone(), kind_of.clone()], &mut r);
+        assert_eq!(r.edits.len(), 1, "{:?}", r.edits);
+        assert_eq!(
+            warning_codes(&r),
+            vec!["redirect_bun_bundled_instance_skipped"],
+            "{:?}",
+            r.warnings
+        );
+        assert!(r.warnings[0].detail.contains("@bh/bund/kind-of"));
+        assert!(r.bundled_skipped_uuids.contains(&kind_of.patch_uuid));
+        assert!(!r.bundled_skipped_uuids.contains(&ovr.patch_uuid));
     }
 
     /// REGRESSION (#367): `bun patch --commit` keys the project's own patch
