@@ -16,7 +16,7 @@ use crate::constants::SOCKET_DIR;
 use crate::crawlers::python_crawler::canonicalize_pypi_name;
 use crate::manifest::schema::PatchRecord;
 use crate::patch::apply::{ApplyResult, PatchSources};
-use crate::utils::fs::{atomic_write_artifact, read_regular_to_string};
+use crate::utils::fs::{atomic_write_artifact, read_regular_to_bytes, read_regular_to_string};
 use crate::utils::group_commit::{self, GroupCommit};
 use crate::utils::purl::{parse_pypi_purl, strip_purl_qualifiers};
 use crate::utils::socket_dir::remove_tree_and_prune;
@@ -1957,6 +1957,10 @@ async fn pypi_reference_clause(project_root: &Path, uuid: &str, skip: &[&str]) -
     .collect();
     match super::pypi_requirements::requirements_include_names(project_root).await {
         Ok(includes) => names.extend(includes),
+        // A root requirements.txt that is not UTF-8 (pip decodes a UTF-16
+        // file by its BOM) cannot be walked for includes, but the root-level
+        // `*.txt` scan below still byte-probes it.
+        Err(e) if e.kind() == std::io::ErrorKind::InvalidData => {}
         Err(_) => {
             return Some(
                 "the requirements.txt include tree could not be read to prove no requirements \
@@ -2018,8 +2022,10 @@ async fn pypi_reference_clause(project_root: &Path, uuid: &str, skip: &[&str]) -
             continue;
         }
         let path = project_root.join(name);
-        match read_regular_to_string(&path).await {
-            Ok(text) if text.contains(&needle) => {
+        // Bytes, not text: an unrelated Latin-1 `LICENSE.txt` must not read
+        // as unreadable and pin the wheel forever.
+        match read_regular_to_bytes(&path).await {
+            Ok(bytes) if bytes_reference(&bytes, &needle) => {
                 return Some(format!("{name} still resolves through it"));
             }
             Ok(_) => {}
@@ -2034,6 +2040,21 @@ async fn pypi_reference_clause(project_root: &Path, uuid: &str, skip: &[&str]) -
         }
     }
     None
+}
+
+/// Whether `bytes` contain `needle` as UTF-8 or as UTF-16 in either byte
+/// order (pip reads a BOM-marked UTF-16 requirements file, e.g. one
+/// PowerShell's `pip freeze >` wrote).
+fn bytes_reference(bytes: &[u8], needle: &str) -> bool {
+    let utf16 = |be: bool| -> Vec<u8> {
+        needle
+            .encode_utf16()
+            .flat_map(|u| if be { u.to_be_bytes() } else { u.to_le_bytes() })
+            .collect()
+    };
+    [needle.as_bytes().to_vec(), utf16(false), utf16(true)]
+        .iter()
+        .any(|pat| bytes.windows(pat.len()).any(|w| w == pat.as_slice()))
 }
 
 /// The `vendor_revert_residual_reference` keep for a file the flavor revert
@@ -6370,6 +6391,63 @@ wheels = [
     }
 
     // ───────────── residual references outside the flavor's wiring ─────────────
+
+    /// A root `*.txt` that is not UTF-8 is byte-probed, not failed closed:
+    /// an unrelated Latin-1 `LICENSE.txt` must not pin the wheel forever,
+    /// while a non-UTF-8 file that does name the uuid dir still keeps it.
+    #[tokio::test]
+    async fn reference_probe_reads_non_utf8_txt_as_bytes() {
+        let tmp = tempfile::tempdir().unwrap();
+        let root = tmp.path();
+        // "café" in Latin-1: not valid UTF-8.
+        tokio::fs::write(root.join("LICENSE.txt"), b"caf\xe9\n")
+            .await
+            .unwrap();
+        assert_eq!(pypi_reference_clause(root, UUID, &[]).await, None);
+
+        let mut extra = b"caf\xe9\n./".to_vec();
+        extra.extend_from_slice(
+            format!(".socket/vendor/pypi/{UUID}/six-1.16.0-py2.py3-none-any.whl\n").as_bytes(),
+        );
+        tokio::fs::write(root.join("extra.txt"), &extra)
+            .await
+            .unwrap();
+        let clause = pypi_reference_clause(root, UUID, &[]).await;
+        assert!(
+            clause.as_deref().is_some_and(|c| c.contains("extra.txt")),
+            "{clause:?}"
+        );
+    }
+
+    /// A BOM-marked UTF-16 `requirements.txt` (PowerShell's `pip freeze >`)
+    /// cannot be walked for `-r` includes, but pip reads it, so a vendored
+    /// line in it still keeps the wheel, and a clean one does not.
+    #[tokio::test]
+    async fn reference_probe_reads_utf16_requirements() {
+        let utf16le = |text: &str| -> Vec<u8> {
+            let mut bytes = vec![0xFF, 0xFE];
+            bytes.extend(text.encode_utf16().flat_map(u16::to_le_bytes));
+            bytes
+        };
+        let tmp = tempfile::tempdir().unwrap();
+        let root = tmp.path();
+        tokio::fs::write(root.join("requirements.txt"), utf16le("six==1.16.0\r\n"))
+            .await
+            .unwrap();
+        assert_eq!(pypi_reference_clause(root, UUID, &[]).await, None);
+
+        let line = format!("./.socket/vendor/pypi/{UUID}/six-1.16.0-py2.py3-none-any.whl\r\n");
+        tokio::fs::write(root.join("requirements.txt"), utf16le(&line))
+            .await
+            .unwrap();
+        let clause = pypi_reference_clause(root, UUID, &[]).await;
+        assert!(
+            clause
+                .as_deref()
+                .is_some_and(|c| c.contains("requirements.txt")),
+            "{clause:?}"
+        );
+    }
 
     /// Asserts a wet revert restored its wiring but kept the artifact (and,
     /// via `kept_artifact`, the ledger entry) because `file` still names the
