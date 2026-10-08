@@ -163,7 +163,7 @@ fn the_detector_sees_every_former_copy_shape() {
     }
     for not_a_copy in [
         "use common::{binary, git_sha256};",
-        "let out = Command::new(binary()).output();",
+        "let bin = binary();",
         "pub fn git_sha256_file(path: &Path) -> String {",
     ] {
         assert!(
