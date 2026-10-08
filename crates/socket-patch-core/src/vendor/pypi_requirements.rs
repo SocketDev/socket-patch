@@ -110,6 +110,15 @@ fn scan_pins(content: &str, canon_name: &str, version: &str) -> (Vec<PinSpan>, b
     (exact, found_extras, found_range)
 }
 
+/// Whether one requirements file's content names the package at all (any
+/// spec, extras or marker): a file that pins it is an install source of it.
+pub(super) fn names_package(content: &str, canon_name: &str) -> bool {
+    logical_lines(content).into_iter().any(|ll| {
+        parse_requirement_line(&ll.text)
+            .is_some_and(|req| canonicalize_pypi_name(&req.name) == canon_name)
+    })
+}
+
 /// Find the target pin in one file's content. Precedence is fail-closed:
 /// any extras occurrence wins over any non-pin occurrence wins over a clean
 /// exact pin — a file that names the package ambiguously is never rewritten
