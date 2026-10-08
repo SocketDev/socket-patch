@@ -12,7 +12,7 @@ _Last updated 2026-10-08T03:10Z · main @ b762f41_
 - [#1015](https://github.com/SocketDev/socket-patch/pull/1015): the vendored-reference scan reads every `VENDORED` row and accepts the bare uuid dir. Issues #832, #958 (E61). `8e521f9` (+308 / −41). Left: dead `eco == "maven2"` arm in `commands/vendor.rs`.
 - [#876](https://github.com/SocketDev/socket-patch/pull/876): registry clients under `ApiTimeouts` through one `registry_client_builder`. Issue #872 (C49). `e2300cc` (+154 / −33).
 - [#889](https://github.com/SocketDev/socket-patch/pull/889): vendor-service retries share `api::retry` (`Retry-After` HTTP-date, jitter). Issue #677 (C15 child 1). `835601b` (+209 / −38). Left: blob/diff fetches have no retry (#676).
-- Earlier: [#886](https://github.com/SocketDev/socket-patch/pull/886) (#845, C48 slice 1), [#870](https://github.com/SocketDev/socket-patch/pull/870) (#781), [#865](https://github.com/SocketDev/socket-patch/pull/865) (#706 slice 1), [#858](https://github.com/SocketDev/socket-patch/pull/858) (#728), [#850](https://github.com/SocketDev/socket-patch/pull/850) (#823 slice 1), [#607](https://github.com/SocketDev/socket-patch/pull/607) (#571), [#602](https://github.com/SocketDev/socket-patch/pull/602) (#592), [#597](https://github.com/SocketDev/socket-patch/pull/597) (#561, E01), [#587](https://github.com/SocketDev/socket-patch/pull/587) (#569, C01), [#583](https://github.com/SocketDev/socket-patch/pull/583) (E12), [#581](https://github.com/SocketDev/socket-patch/pull/581) (#570), [#574](https://github.com/SocketDev/socket-patch/pull/574) (#562), [#572](https://github.com/SocketDev/socket-patch/pull/572) (#563).
+- Earlier: #886, #870, #865, #858, #850, #607, #602, #597, #587, #583, #581, #574, #572 (issues and lines in `entries/refactor/`).
 
 **Queue** (B bugs closed, U unblocks, D duplication removed, R risk; score = 3B + 2U + 2D + S − risk):
 
@@ -36,7 +36,7 @@ Re-ranked 2026-10-08T03:00Z at `b762f41`. Every open `refactor`/`arch-audit` iss
 - `redirect/mod.rs` is a hot file (4 open PRs). Prefer candidates outside it until those land.
 - `CLI_CONTRACT.md` lives at `crates/socket-patch-cli/CLI_CONTRACT.md`.
 - vlt registry semantics: `hydrate` and `Spec` memoize by id/spec and ignore options, so run each vlt case in a fresh `node` process. `scoped-registries[scope]` wins for every segment; `~~` splits to `npm`. Cite `@vltpkg/dep-id` `hydrateTuple` and `@vltpkg/spec` (`registry ?? registries[default-registry-alias]`); the packages download from npm.
-- Runs overlap: two runs started within minutes of each other on 2026-10-02. Claims and the status block kept them apart; `git pull --rebase` the ledger before writing.
+- Runs overlap; `git pull --rebase` the ledger before writing.
 - Ledger and branch pushes need verified signatures (org ruleset). Commit with the session's default git identity; overriding `user.email` (e.g. to a bot address) makes GitHub reject the signature.
 - Maintainer steering (2026-10-02, on #569 and #571): don't add size caps on trusted upstream data; stream instead of buffering.
 - reqwest 0.12 `ClientBuilder::read_timeout` is an idle bound (resets per chunk) and also bounds the wait for response headers; `RequestBuilder::timeout` is total.
