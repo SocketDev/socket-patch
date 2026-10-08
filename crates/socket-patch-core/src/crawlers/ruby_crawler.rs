@@ -1557,9 +1557,12 @@ pub async fn bundler_loaded_manifest_with_env(
     let config = config.as_deref();
     let gemfile = config.and_then(manifest::config_gemfile);
     let lockfile = config.and_then(manifest::config_lockfile);
-    let gems_rb_present = tokio::fs::symlink_metadata(root.join("gems.rb"))
+    // Bundler's `File.file?`, which the lock readers' `is_file` mirrors: a
+    // regular file, through symlinks. A directory or a dangling symlink
+    // named `gems.rb` leaves the `Gemfile` pair loaded.
+    let gems_rb_present = tokio::fs::metadata(root.join("gems.rb"))
         .await
-        .is_ok();
+        .is_ok_and(|m| m.is_file());
     let global = read_global_config(env.global_config, env.ignore_config).await;
     let global = global.as_deref();
     manifest::classify(
@@ -2160,6 +2163,47 @@ mod tests {
                 by: crate::formats::gem::manifest::GemfileSetting::AppConfig,
             }
         );
+    }
+
+    /// #749: bundler only counts a `gems.rb` that `File.file?` accepts (a
+    /// regular file, through symlinks). A directory or a dangling symlink
+    /// named `gems.rb` leaves the `Gemfile` pair loaded, so
+    /// `BUNDLE_LOCKFILE: gems.locked` names a lock other than its own and
+    /// must stay unsupported rather than bind `Gemfile.lock`.
+    #[tokio::test]
+    async fn a_non_regular_gems_rb_does_not_make_gems_locked_the_pairs_lock() {
+        use crate::formats::gem::manifest::LoadedManifest;
+        let config = "---\nBUNDLE_LOCKFILE: \"gems.locked\"\n";
+        let project = |make_gems_rb: &dyn Fn(&Path)| {
+            let dir = tempfile::tempdir().unwrap();
+            std::fs::create_dir(dir.path().join(".bundle")).unwrap();
+            std::fs::write(dir.path().join(".bundle/config"), config).unwrap();
+            std::fs::write(dir.path().join("Gemfile"), "gem \"rack\"\n").unwrap();
+            make_gems_rb(&dir.path().join("gems.rb"));
+            dir
+        };
+        let dir = project(&|p| std::fs::create_dir(p).unwrap());
+        let m = bundler_loaded_manifest_with_env(dir.path(), BundlerEnv::default()).await;
+        assert!(
+            matches!(m, LoadedManifest::UnsupportedLockfile { .. }),
+            "directory gems.rb: {m:?}"
+        );
+        #[cfg(unix)]
+        {
+            let dir = project(&|p| std::os::unix::fs::symlink("missing.rb", p).unwrap());
+            let m = bundler_loaded_manifest_with_env(dir.path(), BundlerEnv::default()).await;
+            assert!(
+                matches!(m, LoadedManifest::UnsupportedLockfile { .. }),
+                "dangling gems.rb: {m:?}"
+            );
+            // A symlink to a regular gems.rb is one bundler loads.
+            let dir = project(&|p| {
+                std::fs::write(p.with_file_name("real.rb"), "gem \"rack\"\n").unwrap();
+                std::os::unix::fs::symlink("real.rb", p).unwrap();
+            });
+            let m = bundler_loaded_manifest_with_env(dir.path(), BundlerEnv::default()).await;
+            assert_eq!(m, LoadedManifest::Default);
+        }
     }
 
     /// #749: bundler 4's configured lockfile (`BUNDLE_LOCKFILE`, the
