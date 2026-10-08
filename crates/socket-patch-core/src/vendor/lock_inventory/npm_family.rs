@@ -7,6 +7,7 @@ use std::path::Path;
 
 use crate::constants::npm_family::{BUN_LOCK, PNPM_SHRINKWRAP_LEGACY};
 use crate::formats::governing_locks::{npm_governing_family, npm_lock_files, NpmLockFamily};
+use crate::formats::yarn::{grammar as yarn_grammar, YarnLockGrammar};
 use crate::utils::purl::npm_purl;
 use crate::vendor::npm_flavor::NpmLockFlavor;
 
@@ -207,21 +208,23 @@ pub(super) async fn inventory_live_sibling_lock_in(
             NpmLockFlavor::Bun,
             inventory_bun_binary_in(view).await.unwrap_or_default(),
         ),
-        // Classic vs berry is a content decision in the router. Rather than
-        // re-deriving that head sniff, try both readers: each yields entries
-        // only for its own grammar (classic's `version "…"` fields vs
-        // berry's `resolution:` lines), so a non-empty result is the sniff's
-        // answer. Berry PnP needs no carve-out: a PnP marker would have
+        // Classic vs berry is a content decision in the router. The router
+        // refused the lock because it declares neither grammar; the
+        // read-only fallback reads it the way yarn does, through the one
+        // grammar decision ([`yarn_grammar`]: a header-less lock is
+        // classic). Berry PnP needs no carve-out: a PnP marker would have
         // refused at the router's step 1 with a code this fallback ignores.
         NpmLockFamily::Yarn => {
-            let classic = inventory_yarn_classic_in(view).await.unwrap_or_default();
-            if classic.is_empty() {
-                (
+            let text = view.read_text("yarn.lock").await.unwrap_or_default();
+            match yarn_grammar(&text) {
+                YarnLockGrammar::Berry => (
                     NpmLockFlavor::YarnBerry,
                     inventory_yarn_berry_in(view).await.unwrap_or_default(),
-                )
-            } else {
-                (NpmLockFlavor::YarnClassic, classic)
+                ),
+                YarnLockGrammar::Classic => (
+                    NpmLockFlavor::YarnClassic,
+                    inventory_yarn_classic_in(view).await.unwrap_or_default(),
+                ),
             }
         }
         // `inventory_package_lock` itself prefers the shrinkwrap when both

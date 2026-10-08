@@ -12,6 +12,7 @@
 //! same decision on them; the detail text lives here so it reads the same
 //! in either mode.
 
+use super::blocks::{berry_field, berry_metadata, scan_blocks, LockBlock};
 use crate::utils::line_endings::LineEndings;
 
 /// The lock file the gates read.
@@ -140,10 +141,11 @@ pub fn check_line_endings(file: &'static str, text: &str) -> Result<(), BerryGat
 /// compression; only [`SUPPORTED_CACHE_KEY`] is reproducible offline, and a
 /// guessed `checksum:` bricks installs (YN0018).
 pub fn check_cache_key(lock: &str) -> Result<(), BerryGate> {
-    let Some(mut fields) = metadata_fields(lock) else {
+    let blocks = scan_blocks(lock);
+    let Some(metadata) = berry_metadata(&blocks) else {
         return Err(BerryGate::NoMetadata);
     };
-    let found = fields.find_map(|line| scalar_field(line, "cacheKey"));
+    let found = berry_field(&metadata.lines, "cacheKey");
     if found == Some(SUPPORTED_CACHE_KEY) {
         return Ok(());
     }
@@ -169,10 +171,12 @@ pub fn check_yarnrc(yarnrc: Yarnrc<'_>) -> Result<(), BerryGate> {
     }
 }
 
-/// The lock's `cacheKey` (berry writes it unquoted: `  cacheKey: 10c0`),
-/// `None` without a `__metadata` block or a `cacheKey` line in it.
-pub fn cache_key(lock: &str) -> Option<&str> {
-    metadata_fields(lock)?.find_map(|line| scalar_field(line, "cacheKey"))
+/// The `cacheKey` of a scanned lock (berry writes it unquoted:
+/// `  cacheKey: 10c0`), `None` without a `__metadata` block or a
+/// `cacheKey` field in it. Read through the shared block grammar
+/// ([`berry_metadata`] + [`berry_field`]), like every other berry field.
+pub(crate) fn cache_key(blocks: &[LockBlock]) -> Option<&str> {
+    berry_field(&berry_metadata(blocks)?.lines, "cacheKey")
 }
 
 /// The `.yarnrc.yml` `compressionLevel` value, when set. A flat line scan is
@@ -209,27 +213,6 @@ pub fn yarnrc_scalar<'a>(rc: &'a str, key: &str) -> Option<&'a str> {
     })
 }
 
-/// The body lines of the lock's column-0 `__metadata:` block (CRLF and a
-/// leading BOM tolerated), up to the next blank or column-0 line; `None`
-/// when there is no such block.
-fn metadata_fields(lock: &str) -> Option<impl Iterator<Item = &str>> {
-    let lock = lock.strip_prefix('\u{feff}').unwrap_or(lock);
-    let mut lines = lock.lines();
-    lines.find(|line| line.trim_end() == "__metadata:")?;
-    Some(lines.take_while(|line| line.starts_with(' ')))
-}
-
-/// A 2-space body field `  <field>: <value>` (value possibly quoted).
-/// Deeper sub-map lines are not body fields.
-fn scalar_field<'a>(line: &'a str, field: &str) -> Option<&'a str> {
-    let rest = line.strip_prefix("  ")?;
-    if rest.starts_with(' ') {
-        return None;
-    }
-    let value = rest.strip_prefix(field)?.strip_prefix(':')?;
-    Some(value.trim().trim_matches('"'))
-}
-
 #[cfg(test)]
 mod tests {
     use super::*;
@@ -253,7 +236,7 @@ mod tests {
             check(&lf, None, Yarnrc::Text("compressionLevel: 0 # default\n")),
             Ok(())
         );
-        assert_eq!(cache_key(&crlf), Some("10c0"));
+        assert_eq!(cache_key(&scan_blocks(&crlf)), Some("10c0"));
     }
 
     #[test]
@@ -326,7 +309,7 @@ mod tests {
     fn a_sub_map_or_later_block_never_supplies_the_cache_key() {
         let text = "__metadata:\n  version: 8\n  nested:\n    cacheKey: 10c0\n\n\
                     \"x@npm:1\":\n  cacheKey: 10c0\n";
-        assert_eq!(cache_key(text), None);
+        assert_eq!(cache_key(&scan_blocks(text)), None);
     }
 
     /// A `.yarnrc.yml` saved with a BOM (and CRLF) still has its first-line

@@ -1168,6 +1168,49 @@ async fn a_git_pattern_hosted_pin_is_refused_not_restored_to_the_registry() {
     );
 }
 
+/// B16: an older release pinned a URL-keyed yarn-classic block (the
+/// project's own fork tarball) to the hosted artifact. The fork's own
+/// `resolved` was never recorded, and the registry tarball is not what
+/// that copy installed, so the pin is refused and the block left as it is;
+/// a registry pin beside it still restores. The old restore wrote the
+/// registry tarball under the fork's key.
+#[tokio::test]
+#[serial]
+async fn a_non_registry_keyed_hosted_pin_is_refused_not_restored_to_the_registry() {
+    let server = MockServer::start().await;
+    mock_yarn_registry(&server, "left-pad", "1.2.3").await;
+    mock_yarn_registry(&server, "is-odd", "3.0.1").await;
+    let tmp = tempfile::tempdir().unwrap();
+    let fork_wired = format!(
+        "\"left-pad@https://host.test/fork/left-pad-1.2.3.tgz\":\n  \
+         version \"1.2.3\"\n  resolved \"{LP_HOSTED_URL}\"\n  integrity sha512-PATCHEDpatched=="
+    );
+    std::fs::write(
+        tmp.path().join("yarn.lock"),
+        yarn_lock_content(&format!("{fork_wired}\n\n{}", io_redirected_block())),
+    )
+    .unwrap();
+
+    let (code, envelope) = run_rollback_subprocess_online(tmp.path(), &server, &[]);
+    assert_eq!(code, 1, "{envelope}");
+    assert_eq!(envelope["status"], "partial_failure", "{envelope}");
+    assert_eq!(envelope["hosted"]["reverted"], serde_json::json!([IO_PURL]));
+    assert!(
+        envelope["hosted"]["failed"][0]["error"]
+            .as_str()
+            .is_some_and(|e| e.contains("non-registry source")),
+        "{envelope}"
+    );
+    assert_eq!(
+        std::fs::read_to_string(tmp.path().join("yarn.lock")).unwrap(),
+        yarn_lock_content(&format!(
+            "{fork_wired}\n\n{}",
+            yarn_upstream_block("is-odd", "3.0.1")
+        )),
+        "the fork block is left as it was; the registry pin is restored"
+    );
+}
+
 // ---------------------------------------------------------------------------
 // 5. manifest-less hosted-only project vs. the truly-empty project
 // ---------------------------------------------------------------------------

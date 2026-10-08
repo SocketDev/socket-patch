@@ -380,17 +380,14 @@ fn missing_manifest_under_valid_cwd_is_not_an_error_via_binary() {
 }
 
 #[test]
-fn manifest_path_is_existing_directory_reports_unreadable_via_binary() {
-    // A genuine I/O error reaching an *existing* path must be
-    // `manifest_unreadable`, never `manifest_not_found`. Here the manifest path
-    // points at a directory, so the read fails with a non-absence I/O error
-    // (Unix `IsADirectory` / Windows `PermissionDenied`) — present, but
-    // unreadable. (We use a directory rather than a `<regular-file>/manifest`
-    // path because the latter is `ENOTDIR` on Unix but a NotFound-class error
-    // on Windows, where traversing through a file is legitimately "path not
-    // found"; a directory yields a non-NotFound error on every platform.)
-    // A stat failure must not be folded into `manifest_not_found`:
-    // `read_manifest`'s I/O error classifies it.
+fn manifest_path_is_existing_directory_is_a_usage_error_via_binary() {
+    // A `--manifest-path` naming a directory is never a manifest: v5.0
+    // rejects it before the command runs, as a usage error (exit 2, the
+    // `Error:` line naming the flag), on every project command
+    // (`GlobalArgs::validate_paths`). Before, `list` reached `read_manifest`
+    // and failed with `manifest_unreadable` (exit 1); the I/O
+    // classification itself (a non-absence error is never
+    // `manifest_not_found`) is pinned on `read_manifest` in core.
     let tmp = tempfile::tempdir().unwrap();
     let manifest_path = tmp.path().join("manifest-is-a-dir");
     std::fs::create_dir(&manifest_path).unwrap();
@@ -399,14 +396,11 @@ fn manifest_path_is_existing_directory_reports_unreadable_via_binary() {
         tmp.path(),
         &["--json", "--manifest-path", manifest_path.to_str().unwrap()],
     );
-    let v: serde_json::Value = serde_json::from_str(String::from_utf8_lossy(&out.stdout).trim())
-        .expect("stdout must be valid JSON envelope");
-    assert_eq!(out.status.code(), Some(1), "I/O error must exit 1");
-    assert_eq!(v["status"], "error");
-    assert_eq!(
-        v["error"]["code"], "manifest_unreadable",
-        "a non-absence I/O error must be manifest_unreadable, not \
-         manifest_not_found, got envelope: {v}"
+    let stderr = String::from_utf8_lossy(&out.stderr);
+    assert_eq!(out.status.code(), Some(2), "stderr={stderr}");
+    assert!(
+        stderr.contains("--manifest-path") && stderr.contains("is a directory"),
+        "{stderr}"
     );
 }
 
