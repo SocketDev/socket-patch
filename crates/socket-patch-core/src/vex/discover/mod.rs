@@ -4280,3 +4280,109 @@ mod tests {
         assert!(out.diagnostics.is_empty(), "{:?}", out.diagnostics);
     }
 }
+
+#[cfg(test)]
+mod member_stray_lock_tests {
+    use super::testing::fixture_path;
+    use super::*;
+
+    fn copy_dir(src: &Path, dest: &Path) {
+        for entry in std::fs::read_dir(src).unwrap() {
+            let path = entry.unwrap().path();
+            let target = dest.join(path.file_name().unwrap());
+            if path.is_dir() {
+                std::fs::create_dir_all(&target).unwrap();
+                copy_dir(&path, &target);
+            } else {
+                std::fs::create_dir_all(dest).unwrap();
+                std::fs::copy(&path, &target).unwrap();
+            }
+        }
+    }
+
+    /// #1101 (Bun), #1134 (vlt), #1094 (npm): a workspace member's own
+    /// hosted-pinned lock is one its package manager never reads (the
+    /// member installs from the workspace root's lock), so lock-only VEX
+    /// from the member must not attest its pins. The lock is read as
+    /// absent, its uuid stays recognized (a ledger claim on it is dead),
+    /// and one diagnostic names it. The same lock outside a workspace is
+    /// read as usual.
+    #[tokio::test]
+    async fn a_member_lock_its_manager_ignores_attests_nothing() {
+        for (fixture, lock, uuid, root_files) in [
+            (
+                "redirect/npm/bun/basic/expected",
+                "bun.lock",
+                "77777777-7777-7777-7777-777777777777",
+                &[
+                    (
+                        "package.json",
+                        r#"{"private":true,"workspaces":["packages/*"]}"#,
+                    ),
+                    ("bun.lockb", "binary"),
+                ][..],
+            ),
+            (
+                "redirect/npm/vlt/basic/expected",
+                "vlt-lock.json",
+                "aaaaaaaa-aaaa-4aaa-8aaa-aaaaaaaaaaaa",
+                &[
+                    ("vlt.json", r#"{"workspaces":"packages/*"}"#),
+                    ("vlt-lock.json", "{}"),
+                ][..],
+            ),
+            (
+                "redirect/npm/package-lock-v3/basic/expected",
+                "package-lock.json",
+                "22222222-2222-2222-2222-222222222222",
+                &[
+                    (
+                        "package.json",
+                        r#"{"private":true,"workspaces":["packages/*"]}"#,
+                    ),
+                    ("package-lock.json", "{}"),
+                ][..],
+            ),
+        ] {
+            let ws = tempfile::tempdir().unwrap();
+            let member = ws.path().join("packages/a");
+            copy_dir(&fixture_path(fixture), &member);
+            std::fs::write(member.join("package.json"), r#"{"name":"a"}"#).unwrap();
+
+            // Control: not a workspace member yet, so the pin is wiring.
+            let out = discover_patched_refs(&member).await;
+            assert!(
+                out.refs.iter().any(|r| r.uuid == uuid),
+                "{fixture}: {:?}",
+                out.refs
+            );
+
+            for (rel, text) in root_files {
+                std::fs::write(ws.path().join(rel), text).unwrap();
+            }
+            let out = discover_patched_refs(&member).await;
+            assert!(
+                out.refs.is_empty(),
+                "{fixture}: a stray member lock wires nothing: {:?}",
+                out.refs
+            );
+            assert!(
+                out.recognized
+                    .iter()
+                    .any(|r| r.uuid == uuid && r.file == Path::new(lock)),
+                "{fixture}: {:?}",
+                out.recognized
+            );
+            let diag = out
+                .diagnostics
+                .iter()
+                .find(|d| d.code == DIAG_REF_UNATTRIBUTABLE && d.file == Path::new(lock))
+                .unwrap_or_else(|| panic!("{fixture}: {:?}", out.diagnostics));
+            assert!(
+                diag.detail.contains("ignores") && diag.detail.contains("not attested"),
+                "{fixture}: {}",
+                diag.detail
+            );
+        }
+    }
+}
