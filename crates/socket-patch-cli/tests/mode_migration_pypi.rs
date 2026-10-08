@@ -479,6 +479,16 @@ fn stage_poetry(root: &Path) -> &'static [&'static str] {
     &["poetry.lock", "pyproject.toml"]
 }
 
+/// [`stage_poetry`] with CRLF line endings.
+fn stage_poetry_crlf(root: &Path) -> &'static [&'static str] {
+    let files = stage_poetry(root);
+    for f in files {
+        let text = std::fs::read_to_string(root.join(f)).unwrap();
+        std::fs::write(root.join(f), text.replace('\n', "\r\n")).unwrap();
+    }
+    files
+}
+
 #[tokio::test]
 async fn poetry_vendored_to_hosted() {
     let (_tmp, root) = project();
@@ -695,22 +705,25 @@ fn stage_script_lock(root: &Path) -> &'static [&'static str] {
     &["job.py", "job.py.lock"]
 }
 
-/// #742 / #650: a vendored uv project, uv script lock and Hatch project pick
-/// up a superseding patch. The manifest moves `six` from patch A to patch B
+/// #742 / #650 / #1136: a vendored uv project, uv script lock, Hatch
+/// project and Poetry project (LF and CRLF) pick up a superseding patch. The manifest moves `six` from patch A to patch B
 /// (different patched bytes); the next `vendor` must wire B's wheel, remove
 /// A's uuid dir (`vendor_stale_artifact_removed`) and exit 0. Before the fix
 /// it failed `pypi_uv_source_already_exists`,
-/// `pypi_lock_source_already_exists` or `pypi_hatch_unsupported` (exit 1)
+/// `pypi_lock_source_already_exists`, `pypi_hatch_unsupported` or
+/// `pypi_poetry_source_already_exists` (exit 1)
 /// and the project kept installing patch A. `vendor --revert` afterwards
 /// restores the user's original files byte for byte.
 #[tokio::test]
 async fn pyproject_flavors_vendored_revendor_superseding_patch() {
     const UUID_B: &str = "5c3e1a2b-7d4f-4e6a-9b8c-1d2e3f4a5b6d";
     const PATCHED_B: &[u8] = b"# six\nVERSION = '1.16.0'\nSOCKET_PATCHED = 2\n";
-    let stages: [(&str, StageFn); 3] = [
+    let stages: [(&str, StageFn); 5] = [
         ("uv", stage_uv),
         ("script lock", stage_script_lock),
         ("hatch", stage_hatch),
+        ("poetry", stage_poetry),
+        ("poetry crlf", stage_poetry_crlf),
     ];
     for (flavor, stage) in stages {
         let (_tmp, root) = project();
