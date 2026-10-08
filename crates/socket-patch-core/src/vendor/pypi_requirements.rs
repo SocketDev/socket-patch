@@ -110,6 +110,15 @@ fn scan_pins(content: &str, canon_name: &str, version: &str) -> (Vec<PinSpan>, b
     (exact, found_extras, found_range)
 }
 
+/// Whether one requirements file's content names the package at all (any
+/// spec, extras or marker): a file that pins it is an install source of it.
+pub(super) fn names_package(content: &str, canon_name: &str) -> bool {
+    logical_lines(content).into_iter().any(|ll| {
+        parse_requirement_line(&ll.text)
+            .is_some_and(|req| canonicalize_pypi_name(&req.name) == canon_name)
+    })
+}
+
 /// Find the target pin in one file's content. Precedence is fail-closed:
 /// any extras occurrence wins over any non-pin occurrence wins over a clean
 /// exact pin — a file that names the package ambiguously is never rewritten
@@ -986,7 +995,7 @@ pub(crate) fn requirements_includes(rel: &str, content: &str) -> Vec<String> {
             } else {
                 format!("{include_dir}/{target}")
             };
-            normalize_rel_path(&joined)
+            crate::utils::relpath::normalize_rel_keeping_escapes(&joined)
         })
         .collect()
 }
@@ -1116,38 +1125,6 @@ fn include_target_with(text: &str, env: impl Fn(&str) -> Option<String>) -> Opti
         // pip ignores.
     }
     target.filter(|t| !t.is_empty())
-}
-
-/// Lexically normalize a relative path (`a/../b` → `b`); escapes above the
-/// root keep their `../` prefix and absolute paths keep their leading `/`,
-/// so the caller can spot out-of-root includes.
-fn normalize_rel_path(path: &str) -> String {
-    let mut stack: Vec<&str> = Vec::new();
-    let mut leading_parents = 0usize;
-    let normalized = path.replace('\\', "/");
-    let absolute = normalized.starts_with('/');
-    for comp in normalized.split('/') {
-        match comp {
-            "" | "." => {}
-            ".." => {
-                if stack.is_empty() {
-                    leading_parents += 1;
-                } else {
-                    stack.pop();
-                }
-            }
-            other => stack.push(other),
-        }
-    }
-    let mut out = String::new();
-    if absolute {
-        out.push('/');
-    }
-    for _ in 0..leading_parents {
-        out.push_str("../");
-    }
-    out.push_str(&stack.join("/"));
-    out
 }
 
 // The logical-line lexer lives in `utils::requirements` (shared with the
@@ -2466,7 +2443,7 @@ mod tests {
     /// A `-r` inside a non-root file resolves against the INCLUDING file's
     /// directory (the module's documented contract): `deps/a.txt` reaches
     /// `b.txt` (sibling → `deps/b.txt`) and `../c.txt` (back at the root —
-    /// the interior `..` pop of `normalize_rel_path`). The pin in deps/b.txt
+    /// the interior `..` pop of `normalize_rel_keeping_escapes`). The pin in deps/b.txt
     /// is rewritten in place; nothing else is touched and no transitive
     /// duplicate is appended, proving BOTH nested includes were walked.
     #[tokio::test]
@@ -2723,24 +2700,6 @@ mod tests {
     }
 
     // ── pure-function matrices ───────────────────────────────────────────
-
-    /// Lexical normalization: interior `..` pops the stack (which decides
-    /// editable-vs-refuse for nested includes); escapes keep their `../`
-    /// prefix; absolute paths keep their leading `/`.
-    #[test]
-    fn normalize_rel_path_unit_matrix() {
-        assert_eq!(normalize_rel_path("deps/../dev.txt"), "dev.txt");
-        assert_eq!(normalize_rel_path("a/b/../../c"), "c");
-        assert_eq!(
-            normalize_rel_path("deps/../../x"),
-            "../x",
-            "pop, then the second `..` escapes"
-        );
-        assert_eq!(normalize_rel_path("./a//b/./c"), "a/b/c");
-        assert_eq!(normalize_rel_path("../x"), "../x");
-        assert_eq!(normalize_rel_path("/abs/../x"), "/x");
-        assert_eq!(normalize_rel_path("deps\\..\\dev.txt"), "dev.txt");
-    }
 
     /// Lines that do not start with a PEP 508 name are not requirements —
     /// in particular this module's OWN vendor-line shape must be invisible
