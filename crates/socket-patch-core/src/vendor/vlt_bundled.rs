@@ -240,6 +240,35 @@ mod tests {
         package
     }
 
+    /// The store's keys are what `canonical_base_purl` makes of any
+    /// spelling of the purl (the attribution gate and the scan's bundled
+    /// warning both look them up that way).
+    #[tokio::test]
+    async fn store_keys_are_canonical_base_purls() {
+        let tmp = tempfile::tempdir().unwrap();
+        let root = tmp.path();
+        let package = format!("{VLT_STORE_DIR}/key/node_modules/bund");
+        write(
+            root,
+            &format!("{package}/package.json"),
+            r#"{"name":"bund","version":"1.0.0"}"#,
+        );
+        write(
+            root,
+            &format!("{package}/node_modules/@scope/x/package.json"),
+            r#"{"name":"@scope/x","version":"2.0.0"}"#,
+        );
+        let keys = store_bundled_copies(root, [("key", "bund")]).await;
+        for spelling in [
+            "pkg:npm/@scope/x@2.0.0",
+            "pkg:npm/%40scope/x@2.0.0",
+            "pkg:npm/%40scope/x@2.0.0?vcs_url=x",
+        ] {
+            let key = crate::vex::discover::canonical_base_purl(spelling);
+            assert!(keys.contains_key(&key), "{spelling} -> {key}: {keys:?}");
+        }
+    }
+
     async fn copies(root: &Path, key: &str) -> Vec<String> {
         store_bundled_copies(root, [(key, "bund")])
             .await

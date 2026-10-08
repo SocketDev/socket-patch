@@ -387,8 +387,10 @@ pub(super) async fn heal_after_rewrite(
             out.healed_store = Some(copies.clone());
         }
         for purl in inputs.records.keys() {
-            let base = socket_patch_core::utils::purl::strip_purl_qualifiers(purl);
-            let Some(location) = copies.get(base) else {
+            // The store's keys are decoded purls: look a `%40scope` record
+            // up the way the attribution gate does.
+            let base = socket_patch_core::vex::discover::canonical_base_purl(purl);
+            let Some(location) = copies.get(&base) else {
                 continue;
             };
             let Some((name, version)) = base
