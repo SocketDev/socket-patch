@@ -22,12 +22,12 @@ _Last updated 2026-10-08T12:05Z · main @ e2d9633_
 | # | Candidate | B | U | D | R | Score | Note |
 |---|---|:-:|:-:|:-:|:-:|:-:|---|
 | 1 | #990 (E24, child 1 of #989): one `vendor::revert::finish` for the 12 copied finish blocks | 0 | 1 | ≈12 | L | ≈26 | skipped: all 12 backend files changed by open PRs |
-| 2 | C69 / #836, #761: uv/pylock and cargo hosted re-serialize or re-parse the lock per patch | 0 | 0 | 0 | M | ≈1 (S 3) | skipped: the per-dep loops are in `redirect/mod.rs` (6 open PRs) |
+| 2 | C69 / #836, #761: uv/pylock and cargo hosted re-serialize or re-parse the lock per patch | 0 | 0 | 0 | M | ≈1 (S 3) | skipped: loops in `redirect/mod.rs` (6 PRs) |
 | 3 | #727 (C19): `utils::env` for truthiness, non-empty vars and home dir | 0 | 1 | ≈6 | L | ≈14 | skipped: `utils/mod.rs`, `env_compat.rs`, `telemetry.rs`, `args.rs` changed by open PRs |
 | 4 | #706 (C17) slice 2: the 6 `PENDING_INLINE_DIGESTS` files | 0 | 1 | ≈6 | L | ≈14 | skipped: all 6 changed by open PRs |
 | 5 | #630 (E37): one name/version coordinate guard + composer `strip_leading_v` | 0 | 0 | 4 | L | ≈8 | skipped: only the NuGet guard is free; moving it alone collapses no copy |
 
-Re-ranked 2026-10-08T12:00Z at `e2d9633` against the 32 open PRs' 581 files: nothing eligible scored above zero. Also blocked by open-PR files: #678, #949, #782, #801, #883, #705, #914, #1012.
+Re-ranked 2026-10-08T12:00Z at `e2d9633` against 32 open PRs' 581 files: nothing eligible. Also blocked by open-PR files: #678, #949, #782, #801, #883, #705, #914, #1012.
 
 **Notes:**
 - E35's crawler oracles (composer/go/nuget/python/maven) can't become `golden.rs` digests: their randomized trees use symlinks (no-ops on Windows), permission modes (ignored as root and on Windows) and case-colliding names (folded on macOS). The outputs therefore differ by OS and by uid, and a golden blessed in the root sandbox would fail on non-root Linux CI. Keep the oracles until a crawler can be checked without one.
