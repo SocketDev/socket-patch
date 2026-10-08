@@ -1088,7 +1088,7 @@ pub(crate) async fn run_redirect_selected(
     // staged revert, keep that purl vendored, and stage and rewrite the
     // rest again. Each pass drops at least one purl, so this ends.
     loop {
-        let unpinned = takeover.unpinned(&done.confirmed);
+        let unpinned = takeover.unpinned(&done.confirmed, &done.rewrite.alias_skipped_entries);
         if unpinned.is_empty() {
             break;
         }
@@ -1369,12 +1369,15 @@ pub(crate) async fn run_redirect_selected(
         // installed materialization unpatched, so attesting that purl from
         // this run's records would contradict the run's own warning. Excluded purls
         // fall back to `vex`'s normal installed-tree verification.
-        // A confirmed uuid whose bundled instance the rewriter had to skip
-        // (#469) leaves that copy unpatched, so it too is verified, never
-        // assumed.
+        // A confirmed uuid whose bundled instance (#469) or `npm:` alias
+        // entry (#1081) the rewriter had to skip leaves that copy
+        // unpatched, so it too is verified, never assumed.
         params.assume_applied = confirmed
             .iter()
-            .filter(|(_, uuid)| !rewrite.bundled_skipped_uuids.contains(uuid))
+            .filter(|(_, uuid)| {
+                !rewrite.bundled_skipped_uuids.contains(uuid)
+                    && !rewrite.alias_skipped_entries.contains_key(uuid)
+            })
             .map(|(purl, _)| purl.clone())
             .filter(|purl| {
                 !gem_stale.stale_purls.contains(purl)

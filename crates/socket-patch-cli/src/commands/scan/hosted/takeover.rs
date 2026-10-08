@@ -35,7 +35,7 @@
 //! A dry run runs the same steps and drops the overlay instead of
 //! committing, so it reports exactly what the wet run would do.
 
-use std::collections::BTreeSet;
+use std::collections::{BTreeMap, BTreeSet};
 
 use socket_patch_core::hosted::engine::{Candidate, Refusal, SkippedPatch};
 use socket_patch_core::patch::redirect::RewriteWarning;
@@ -281,11 +281,23 @@ impl Takeover {
     }
 
     /// The staged purls the rewrite did not pin (`confirmed` is the
-    /// rewrite's `(purl, uuid)` list).
-    pub(super) fn unpinned(&self, confirmed: &[(String, String)]) -> Vec<String> {
+    /// rewrite's `(purl, uuid)` list), or pinned only partly: a yarn.lock
+    /// `npm:` alias entry the vendored wiring had repointed, which the
+    /// hosted rewrite leaves on the registry (`alias_skipped`, the
+    /// rewrite's `RewriteResult::alias_skipped_entries`). Committing that
+    /// takeover would un-patch the alias copy (#1158), so it is retracted
+    /// like a purl with no pin at all.
+    pub(super) fn unpinned(
+        &self,
+        confirmed: &[(String, String)],
+        alias_skipped: &BTreeMap<String, BTreeSet<String>>,
+    ) -> Vec<String> {
         self.staged
             .iter()
-            .filter(|s| !confirmed.iter().any(|(_, uuid)| *uuid == s.uuid))
+            .filter(|s| {
+                !confirmed.iter().any(|(_, uuid)| *uuid == s.uuid)
+                    || unwires_alias_copy(&s.entry, alias_skipped.get(&s.uuid))
+            })
             .map(|s| s.uuid.clone())
             .collect()
     }
@@ -438,6 +450,24 @@ async fn explain(
         Some(w) => (w.code.clone(), vec![w.clone()]),
         None => (NOT_PINNED.to_string(), Vec::new()),
     }
+}
+
+/// Whether `entry`'s vendored wiring repointed a yarn.lock entry among
+/// `skipped`, the alias entries the hosted rewrite left untouched for its
+/// uuid. Both sides key an entry by its lock key line as the shared
+/// `formats::yarn::blocks` scanner reads it. An alias entry the vendored wiring
+/// never touched (yarn berry vendoring skips aliases too) was unpatched
+/// before the run, so the takeover does not change it.
+fn unwires_alias_copy(entry: &VendorEntry, skipped: Option<&BTreeSet<String>>) -> bool {
+    let Some(skipped) = skipped else {
+        return false;
+    };
+    entry.wiring.iter().any(|w| {
+        std::path::Path::new(&w.file)
+            .file_name()
+            .is_some_and(|f| f == "yarn.lock")
+            && w.key.as_ref().is_some_and(|k| skipped.contains(k))
+    })
 }
 
 /// The [`KEPT_VENDORED`] warning for `purl`, naming the `code` that kept it.
