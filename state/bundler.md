@@ -1,6 +1,6 @@
 [agent] Progress ledger for the scheduled Bundler (RubyGems) bug-hunt routine (label pm:bundler).
 
-Last updated: 2026-10-08 (run 32), main `b96a785` (now also includes #1060 → #1055, and #1029's full `apply --check`), latest release v4.0.0 (npm; no git tags). Newest Bundler tested: 4.1.0.beta1 (no newer release as of 2026-10-07).
+Last updated: 2026-10-08 (run 33), main `823810a` (now also includes #768 → #749 / #751, and #1039, the atomic V→H takeover), latest release v4.0.0 (npm; no git tags). Newest Bundler tested: 4.1.0.beta1 (no newer release as of 2026-10-07).
 
 ## Coverage matrix
 
@@ -299,6 +299,14 @@ Also on 4.0.17: BOM `Gemfile` passes; symlinked `Gemfile` / lock is refused (pas
 | Hosted, lockless Gemfile `~> 2.0`, older version only in the shared home | **fail #1125** | **fail #1125** |
 | Hosted, lockless Gemfile not declaring the shared-home gem | **fail #1125** | **fail #1125** |
 
+### Run 33 (main `823810a`; Linux Ruby 3.3.6; scratch copy of `e2e_redirect_gem_build.rs`, real `bundle install`)
+
+| Cell | 4.0.18 |
+| --- | --- |
+| Hosted `lockfile custom.lock` via `.bundle/config` + leftover `Gemfile.lock` (#749 fixture) | pass (refused) |
+| Hosted `Gemfile` + `gems.rb` twin (#751 fixture) | pass (refused) |
+| Hosted Gemfile DSL `lockfile "custom.lock"` + leftover `Gemfile.lock` | **fail, #749 gap** (commented; ×2) |
+
 ### Global mode (`-g`)
 
 | OS | Ruby / Bundler | `scan -g` report | `-g` vs project scoping | `scan -g --mode hosted` refused | `get -g` / `apply -g` | `rollback -g` byte-exact | `vex -g` | `--global-prefix <gems dir>` / `SOCKET_GLOBAL=1` | Non-writable gem dir |
@@ -321,12 +329,13 @@ Also on 4.0.17: BOM `Gemfile` passes; symlinked `Gemfile` / lock is refused (pas
 
 ## Backlog
 
-1. Re-run #749 / #751 / #896 / #952 / #985 / #1056 / #1092 / #1109 / #1125 when fixes merge (PR #768 → #749 / #751). #1055 is fixed by #1060 (the locked shape passes in the e2e suite).
-2. #1125 neighbours: `gems.rb` without `gems.locked`; `get <uuid> --mode hosted` and `vendor` on a lockless project.
-3. Hosted re-pin to a superseding patch generation (same version, new sha, #1035 era): the stale guard on the old generation's installed bytes; `rollback` after the re-pin.
-4. #1092 neighbours: Windows `x64-mingw-ucrt` + `x64-mingw32` pairs (probe branch); hosted and vendored modes with a lock listing several platform variants of one gem.
-5. #1056 neighbours: CRLF Gemfile and `gems.rb` spellings; H→V takeover of a gem inside a `source … do` block. Bundler 1.17 hosted unwind.
-6. #1109 neighbours: global-tier `deployment` / `path` with the stale guard.
+1. #749 DSL gap: re-run when it's fixed or the issue is reopened; also the vendored DSL shape and `lockfile false`.
+2. #1039: re-check the V→H gem takeover (the run-16 "refused" known non-bug may be stale).
+3. Re-run #896 / #952 / #985 / #1056 / #1092 / #1109 / #1125 when fixes merge.
+4. #1125 neighbours: `gems.rb` without `gems.locked`; `get <uuid> --mode hosted` and `vendor` on a lockless project.
+5. Hosted re-pin to a superseding patch generation (same version, new sha): the stale guard and `rollback`.
+6. #1092 neighbours: Windows `x64-mingw-ucrt` + `x64-mingw32` pairs (probe branch); a lock listing several platform variants.
+7. #1056 neighbours: CRLF Gemfile and `gems.rb`; the Bundler 1.17 hosted unwind. #1109 neighbours: global-tier `deployment` / `path`.
 
 ## Known non-bugs
 
@@ -422,3 +431,5 @@ Also on 4.0.17: BOM `Gemfile` passes; symlinked `Gemfile` / lock is refused (pas
 - The worktree is a fresh container each run: there's no rbenv now, only `/usr/local/bin/ruby` 3.3.6 with Bundler 2.5.22 (default) + 4.0.18. Install other Bundlers into an isolated `GEM_HOME` (run 31).
 - Hand-written agent manifests need BOTH blobs (`beforeHash` and `afterHash`) in `.socket/blobs`, or `rollback --offline` fails with "Before blob not found" (run 32 near-miss). Never derive a fixture from an already-patched file.
 - A scratch hosted test in `e2e_redirect_gem_build.rs` needs `GEM_PATH=<shared home>:<system gem dir>` to pick a non-default Bundler via `BUNDLER_VERSION`; otherwise it silently falls back to the default 2.5.22 (run 32).
+- Bundler 4.0.18 refuses every frozen install of a project whose Gemfile uses the `lockfile "x.lock"` DSL when no `Gemfile.lock` exists ("The frozen setting requires a lockfile"). With a leftover `Gemfile.lock` it passes that check and reads the DSL lock. That's Bundler's own behaviour (run 33).
+- `#749` / `#751` are fixed for the config / env / global spellings and the twin (#768). The DSL spelling is tracked as a comment on #749.
