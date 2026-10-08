@@ -1197,17 +1197,7 @@ fn normalize(base_dir: &str, rel: &str) -> Option<String> {
     if rel.starts_with('/') || rel.starts_with('\\') || rel.contains(':') {
         return None;
     }
-    let mut segments: Vec<&str> = base_dir.split('/').filter(|s| !s.is_empty()).collect();
-    for segment in rel.split(['/', '\\']) {
-        match segment {
-            "" | "." => {}
-            ".." => {
-                segments.pop()?;
-            }
-            s => segments.push(s),
-        }
-    }
-    Some(segments.join("/"))
+    crate::utils::relpath::resolve_rel(base_dir, rel, 0)
 }
 
 fn is_range(version: &str) -> bool {

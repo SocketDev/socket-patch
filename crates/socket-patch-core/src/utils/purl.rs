@@ -2,6 +2,7 @@ use std::borrow::Cow;
 
 use crate::crawlers::python_crawler::canonicalize_pypi_name;
 use crate::patch::path_safety::{is_safe_multi_segment, is_safe_single_segment};
+use crate::utils::purl_key::PurlKey;
 
 /// Strip the trailing `?qualifiers` and `#subpath` components from a PURL,
 /// leaving the canonical `pkg:type/namespace/name@version` base.
@@ -81,13 +82,12 @@ pub fn percent_decode_purl_component(component: &str) -> Cow<'_, str> {
     }
 }
 
-/// Canonical string form for purl-to-purl comparison and display:
-/// percent-decode each `/`-separated component of the
-/// `pkg:type/...@version` base; qualifiers/subpath are appended verbatim.
+/// Display form of a purl: percent-decode each `/`-separated component of
+/// the `pkg:type/...@version` base; qualifiers/subpath are appended verbatim.
 ///
-/// Used ONLY for string equality (`purl_eq`) and human output — never to
-/// build filesystem paths (a `%2f` decoding into a name can at worst make
-/// two distinct purls compare equal, not change a write location).
+/// For human output and for recovering a literal coordinate — never to
+/// build filesystem paths, and not an equality relation: compare purls with
+/// [`crate::utils::purl_key::PurlKey`].
 pub fn normalize_purl(purl: &str) -> Cow<'_, str> {
     if !purl.contains('%') {
         return Cow::Borrowed(purl);
@@ -103,41 +103,6 @@ pub fn normalize_purl(purl: &str) -> Cow<'_, str> {
     }
     out.push_str(suffix);
     Cow::Owned(out)
-}
-
-/// Purl equality up to percent-encoding of the base components
-/// (`pkg:npm/%40scope/x@1` ≡ `pkg:npm/@scope/x@1`) and, for composer, up to
-/// the version spelling of one release (`@3.0.2` ≡ `@v3.0.2` ≡ `@3.0.2.0`,
-/// name case-insensitive; see [`crate::utils::composer_version`]) and, for
-/// pypi, up to the PEP 503 spelling of the name (`typing_extensions` ≡
-/// `Typing-Extensions` ≡ `typing-extensions`).
-/// Qualifiers and subpath must still match exactly.
-pub fn purl_eq(a: &str, b: &str) -> bool {
-    let (a, b) = (normalize_purl(a), normalize_purl(b));
-    if a == b {
-        return true;
-    }
-    let split = |p: &str| p.find(['?', '#']).unwrap_or(p.len());
-    let (base_a, suffix_a) = a.split_at(split(&a));
-    let (base_b, suffix_b) = b.split_at(split(&b));
-    suffix_a == suffix_b
-        && (crate::utils::composer_version::composer_bases_equivalent(base_a, base_b)
-            || pypi_bases_equivalent(base_a, base_b))
-}
-
-/// Whether two decoded `pkg:pypi/<name>@<version>` bases name the same
-/// release once both names are in PEP 503 canonical form. `false` unless
-/// both are pypi bases.
-fn pypi_bases_equivalent(a: &str, b: &str) -> bool {
-    fn canonical(base: &str) -> Option<String> {
-        let rest = base.strip_prefix("pkg:pypi/")?;
-        let (name, version) = match rest.rfind('@').filter(|&i| i > 0) {
-            Some(at) => rest.split_at(at),
-            None => (rest, ""),
-        };
-        Some(format!("{}{version}", canonicalize_pypi_name(name)))
-    }
-    matches!((canonical(a), canonical(b)), (Some(x), Some(y)) if x == y)
 }
 
 /// Extract the value of a single PURL qualifier (`?key=value&…`), if present.
@@ -161,12 +126,13 @@ pub fn purl_qualifier<'a>(purl: &'a str, key: &str) -> Option<&'a str> {
     })
 }
 
-/// The ledger / lookup spelling of a purl: `?qualifiers` and `#subpath`
-/// stripped, then percent-decoded per component ([`normalize_purl`]). Two
-/// purls naming the same package version compare equal after this, whatever
-/// URL escaping or `?artifact_id=` decoration they arrived with — the one
-/// composition every ledger key match (redirect takeover, vendor GC, the
-/// hosted→vendored reconciliation) goes through.
+/// The display spelling of a purl's release: `?qualifiers` and `#subpath`
+/// stripped, then percent-decoded per component ([`normalize_purl`]).
+///
+/// It keeps the name's case and spelling (and composer's version
+/// spelling), so it is NOT an identity: `pkg:nuget/Newtonsoft.Json@13.0.3`
+/// and `pkg:nuget/newtonsoft.json@13.0.3` stay distinct here. Compare purls
+/// with [`crate::utils::purl_key::PurlKey`].
 pub fn canonical_purl(purl: &str) -> String {
     normalize_purl(strip_purl_qualifiers(purl)).into_owned()
 }
@@ -413,21 +379,17 @@ pub fn is_purl(s: &str) -> bool {
 ///
 /// For keys without a qualifier this reduces to plain equality.
 ///
-/// Comparison is encoding-tolerant (`purl_eq`): manifest keys come from
-/// the API in percent-encoded form (`pkg:npm/%40scope/x@1`) while users
-/// type the literal form — both spellings must match either way around.
+/// Comparison is by [`PurlKey`]: manifest keys come from the API in
+/// percent-encoded, mixed-case form (`pkg:npm/%40scope/x@1`,
+/// `pkg:nuget/Newtonsoft.Json@13.0.3`) while users type the literal form or
+/// another PEP 503 spelling — every spelling of the release matches.
 pub fn purl_matches_identifier(manifest_key: &str, identifier: &str) -> bool {
     if identifier.contains('?') {
-        purl_eq(manifest_key, identifier)
+        PurlKey::qualified(manifest_key) == PurlKey::qualified(identifier)
     } else {
-        // Base identifier: compare bases. Strip both sides so a subpath
-        // (`#...`) carried by either the key or the identifier doesn't
-        // defeat the match — `strip_purl_qualifiers(identifier)` is a no-op
-        // for a plain base PURL, so existing behaviour is unchanged.
-        purl_eq(
-            strip_purl_qualifiers(manifest_key),
-            strip_purl_qualifiers(identifier),
-        )
+        // Base identifier: compare bases (a subpath `#...` carried by
+        // either side doesn't defeat the match).
+        PurlKey::same(manifest_key, identifier)
     }
 }
 
@@ -1268,20 +1230,21 @@ mod tests {
     }
 
     #[test]
-    fn test_normalize_purl_and_purl_eq() {
+    fn test_normalize_purl_and_qualified_purl_key() {
+        let qualified_eq = |a: &str, b: &str| PurlKey::qualified(a) == PurlKey::qualified(b);
         assert_eq!(
             normalize_purl("pkg:npm/%40modelcontextprotocol/sdk@1.12.0"),
             "pkg:npm/@modelcontextprotocol/sdk@1.12.0"
         );
-        assert!(purl_eq(
+        assert!(qualified_eq(
             "pkg:npm/%40scope/x@1.0.0",
             "pkg:npm/@scope/x@1.0.0"
         ));
-        assert!(purl_eq(
+        assert!(qualified_eq(
             "pkg:npm/@scope/x@1.0.0",
             "pkg:npm/%40scope/x@1.0.0"
         ));
-        assert!(!purl_eq(
+        assert!(!qualified_eq(
             "pkg:npm/%40scope/x@1.0.0",
             "pkg:npm/@scope/x@2.0.0"
         ));
@@ -1292,24 +1255,25 @@ mod tests {
             "pkg:composer/Psr/Log@3.0.2",
         ] {
             assert!(
-                purl_eq("pkg:composer/psr/log@3.0.2", spelling),
+                qualified_eq("pkg:composer/psr/log@3.0.2", spelling),
                 "{spelling}"
             );
             assert!(
-                purl_eq(spelling, "pkg:composer/psr/log@3.0.2"),
+                qualified_eq(spelling, "pkg:composer/psr/log@3.0.2"),
                 "{spelling}"
             );
         }
-        assert!(!purl_eq(
+        assert!(!qualified_eq(
             "pkg:composer/psr/log@3.0.2",
             "pkg:composer/psr/log@3.0.20"
         ));
-        assert!(!purl_eq(
+        assert!(!qualified_eq(
             "pkg:composer/psr/log@3.0.2?a=1",
             "pkg:composer/psr/log@3.0.2.0?a=2"
         ));
-        // Only composer: other ecosystems stay spelling-exact.
-        assert!(!purl_eq("pkg:npm/x@1.0", "pkg:npm/x@1.0.0.0"));
+        // Only composer gets release identity: other ecosystems stay
+        // version-exact.
+        assert!(!qualified_eq("pkg:npm/x@1.0", "pkg:npm/x@1.0.0.0"));
         // Qualifiers/subpath are preserved verbatim (not decoded).
         assert_eq!(
             normalize_purl("pkg:npm/%40s/x@1?artifact_id=a%2Fb"),
@@ -1319,6 +1283,42 @@ mod tests {
         assert!(matches!(
             normalize_purl("pkg:npm/lodash@4.17.21"),
             Cow::Borrowed(_)
+        ));
+    }
+
+    /// B73: remove/rollback identifiers fold what the ecosystem folds: a
+    /// PEP 503 spelling or a NuGet case variant names the recorded patch.
+    #[test]
+    fn test_purl_matches_identifier_folds_pep503_and_nuget_case() {
+        assert!(patch_matches(
+            "pkg:pypi/typing-extensions@4.12.2",
+            "uuid",
+            "pkg:pypi/typing_extensions@4.12.2"
+        ));
+        assert!(purl_matches_identifier(
+            "pkg:pypi/typing-extensions@4.12.2?artifact_id=whl",
+            "pkg:pypi/Typing.Extensions@4.12.2"
+        ));
+        assert!(purl_matches_identifier(
+            "pkg:nuget/Newtonsoft.Json@13.0.3",
+            "pkg:nuget/newtonsoft.json@13.0.3"
+        ));
+        assert!(purl_matches_identifier(
+            "pkg:pypi/typing-extensions@4.12.2?artifact_id=whl",
+            "pkg:pypi/typing_extensions@4.12.2?artifact_id=whl"
+        ));
+        assert!(!purl_matches_identifier(
+            "pkg:pypi/typing-extensions@4.12.2?artifact_id=whl",
+            "pkg:pypi/typing_extensions@4.12.2?artifact_id=sdist"
+        ));
+        assert!(!purl_matches_identifier(
+            "pkg:nuget/Newtonsoft.Json@13.0.3",
+            "pkg:nuget/newtonsoft.json@13.0.4"
+        ));
+        // Case-sensitive ecosystems stay exact.
+        assert!(!purl_matches_identifier(
+            "pkg:maven/Org.Foo/bar@1.0",
+            "pkg:maven/org.foo/bar@1.0"
         ));
     }
 
@@ -1344,6 +1344,10 @@ mod tests {
         // #1024: patch keys are PEP 503 canonical, but users type the
         // name as the project declares it. Every spelling must select the
         // patch, for base and qualified identifiers alike.
+        let purl_eq = |a: &str, b: &str| {
+            crate::utils::purl_key::PurlKey::qualified(a)
+                == crate::utils::purl_key::PurlKey::qualified(b)
+        };
         let key = "pkg:pypi/typing-extensions@4.7.1";
         let qualified = "pkg:pypi/typing-extensions@4.7.1?artifact_id=abc";
         for spelling in [

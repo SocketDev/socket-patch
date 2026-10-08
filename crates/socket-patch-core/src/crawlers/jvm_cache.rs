@@ -203,8 +203,9 @@ pub fn all_local_roots_with(cwd: &Path, env: &super::maven_crawler::JvmEnv) -> V
     }
     let m2 = env
         .m2_repo
-        .is_dir()
-        .then(|| JvmCacheRoot::new(env.m2_repo.clone(), JvmCacheLayout::Maven2));
+        .as_ref()
+        .filter(|repo| repo.is_dir())
+        .map(|repo| JvmCacheRoot::new(repo.clone(), JvmCacheLayout::Maven2));
     if layout::has_build(cwd, layout::BuildTool::Gradle) {
         gradle.extend(m2);
         gradle
