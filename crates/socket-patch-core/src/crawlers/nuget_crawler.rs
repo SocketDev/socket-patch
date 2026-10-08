@@ -42,9 +42,10 @@ impl NuGetCrawler {
             if let Some(ref custom) = options.global_prefix {
                 return Ok(vec![custom.clone()]);
             }
-            let home = nuget_home();
-            if is_dir(&home).await {
-                return Ok(vec![home]);
+            if let Some(home) = nuget_home() {
+                if is_dir(&home).await {
+                    return Ok(vec![home]);
+                }
             }
             return Ok(Vec::new());
         }
@@ -72,9 +73,10 @@ impl NuGetCrawler {
         }
 
         // 2. Fall back to the global cache.
-        let home = nuget_home();
-        if is_dir(&home).await && seen.insert(home.clone()) {
-            paths.push(home);
+        if let Some(home) = nuget_home() {
+            if is_dir(&home).await && seen.insert(home.clone()) {
+                paths.push(home);
+            }
         }
 
         // 3. Check obj/ dirs for project.assets.json
@@ -388,18 +390,19 @@ fn is_safe_nuget_coordinate(name: &str, version: &str) -> bool {
 
 /// Get the NuGet global packages folder.
 ///
-/// Checks `NUGET_PACKAGES` env var, falls back to `~/.nuget/packages/`.
-fn nuget_home() -> PathBuf {
+/// Checks `NUGET_PACKAGES` env var, falls back to `~/.nuget/packages/`
+/// (`None` with no home directory).
+fn nuget_home() -> Option<PathBuf> {
     // NuGet itself treats an empty NUGET_PACKAGES as unset and falls back
     // to the default folder; honoring "" here would make global discovery
     // probe `is_dir("")` and silently scan nothing.
     if let Ok(custom) = std::env::var("NUGET_PACKAGES") {
         if !custom.is_empty() {
-            return PathBuf::from(custom);
+            return Some(PathBuf::from(custom));
         }
     }
 
-    crate::utils::fs::home_dir().join(".nuget").join("packages")
+    crate::utils::fs::home_dir().map(|home| home.join(".nuget").join("packages"))
 }
 
 /// Check if the cwd contains any .NET project indicators.
@@ -1027,7 +1030,7 @@ mod tests {
         let custom = "/tmp/test-nuget-packages";
         std::env::set_var("NUGET_PACKAGES", custom);
         let home = nuget_home();
-        assert_eq!(home, PathBuf::from(custom));
+        assert_eq!(home, Some(PathBuf::from(custom)));
         std::env::remove_var("NUGET_PACKAGES");
     }
 
@@ -1041,7 +1044,7 @@ mod tests {
     async fn test_nuget_home_empty_env_var_falls_back_to_default() {
         let prev = std::env::var("NUGET_PACKAGES").ok();
         std::env::set_var("NUGET_PACKAGES", "");
-        let home = nuget_home();
+        let home = nuget_home().expect("a home directory");
         match prev {
             Some(v) => std::env::set_var("NUGET_PACKAGES", v),
             None => std::env::remove_var("NUGET_PACKAGES"),

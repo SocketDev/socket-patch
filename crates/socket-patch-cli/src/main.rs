@@ -79,6 +79,14 @@ async fn main() {
         std::process::exit(2);
     }
 
+    // A `--cwd`, `--global-prefix` or `--manifest-path` that names nothing
+    // is a usage error, checked once here before any command runs: read as
+    // an empty project it made every verifier pass vacuously.
+    if let Err(message) = cli.command.validate_paths() {
+        eprintln!("Error: {message}");
+        std::process::exit(2);
+    }
+
     // Human-output policy (core advisories and prompt notes go quiet under
     // --silent/--json) is fixed once, before any command code runs.
     socket_patch_cli::ui::init(cli.command.global_args());

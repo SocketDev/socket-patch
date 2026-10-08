@@ -28,10 +28,10 @@ use socket_patch_core::manifest::schema::{PatchManifest, PatchRecord};
 use socket_patch_core::patch::apply::{verify_file_patch, PatchSources};
 use socket_patch_core::patch::redirect::upstream::HostedPin;
 use socket_patch_core::telemetry::{track_patch_vendor_failed, track_patch_vendored};
-use socket_patch_core::utils::composer_version::composer_purls_equivalent;
 use socket_patch_core::utils::concurrent::ordered_concurrent;
 use socket_patch_core::utils::group_commit::{CommittedFile, GroupCommit};
-use socket_patch_core::utils::purl::{canonical_purl, normalize_purl, strip_purl_qualifiers};
+use socket_patch_core::utils::purl::{normalize_purl, strip_purl_qualifiers};
+use socket_patch_core::utils::purl_key::PurlKey;
 use socket_patch_core::utils::socket_dir::remove_tree_and_prune;
 use socket_patch_core::vendor::{
     self, ecosystem_dir_for_purl, load_state, lock_inventory, lookup_entry, lookup_entry_kv,
@@ -442,10 +442,7 @@ async fn unwired_check_failure(
 /// entry (fail-safe): ecosystems other than npm, cargo and pypi (whose
 /// probe covers the requirements flavor only) have no in-use probe yet,
 /// and a missing/unreadable lockfile proves nothing.
-pub(crate) async fn dispatch_in_use_one(
-    entry: &VendorEntry,
-    project_root: &Path,
-) -> Option<bool> {
+pub(crate) async fn dispatch_in_use_one(entry: &VendorEntry, project_root: &Path) -> Option<bool> {
     match entry.ecosystem.as_str() {
         "npm" => vendor::npm_flavor::vendored_entry_in_use(entry, project_root).await,
         // Cargo probes the lock entry's shape: detached + `[patch]` pointing
@@ -1283,6 +1280,83 @@ fn emit_eject_refusal(common: &GlobalArgs, code: &'static str, message: &str) ->
         eprintln!("Error ({code}): {message}");
     }
     1
+}
+
+/// The gem vendored backend's refusals a hosted→vendored takeover raises
+/// BEFORE it restores `pin` upstream, so a gem vendored mode cannot wire
+/// keeps its hosted wiring instead of ending up unpatched in both modes:
+/// the manifest gate (a `gems.rb` twin, `BUNDLE_GEMFILE`) and the Gemfile
+/// declaration gate on the restored Gemfile (a declaration inside a
+/// `group` block, #775).
+async fn gem_takeover_refusal(
+    cwd: &Path,
+    candidate: &str,
+    pin: &HostedPin,
+    restore_opts: &socket_patch_core::patch::redirect::upstream::RestoreOptions,
+) -> Option<(&'static str, String)> {
+    match socket_patch_core::vendor::gem::gem_manifest_refusal(cwd).await {
+        Some(refusal) => Some(refusal),
+        None => {
+            socket_patch_core::vendor::gem::gem_vendor_target_preflight(
+                cwd,
+                candidate,
+                pin,
+                restore_opts,
+            )
+            .await
+        }
+    }
+}
+
+/// [`gem_takeover_refusal`] for the dry-run preview of `scan` / `get
+/// --mode vendored`: each selected gem purl the lockfiles still pin hosted
+/// whose takeover the wet run would refuse, keyed by the selected purl.
+/// Nothing is written (the restore is resolved as a dry run).
+pub(crate) async fn gem_takeover_preview_refusals<'a>(
+    common: &GlobalArgs,
+    purls: impl Iterator<Item = &'a str>,
+) -> HashMap<String, (&'static str, String)> {
+    let gems: Vec<&str> = purls.filter(|p| p.starts_with("pkg:gem/")).collect();
+    if gems.is_empty() {
+        return HashMap::new();
+    }
+    let pins = HostedPin::all(&crate::commands::discover_wiring(common, &common.cwd).await);
+    gem_takeover_refusals_for(
+        &common.cwd,
+        gems.into_iter(),
+        &pins,
+        common.offline,
+        crate::commands::rollback::patch_server_origins(common),
+    )
+    .await
+}
+
+/// [`gem_takeover_preview_refusals`] over already-discovered hosted `pins`:
+/// the vendored download phase reads the pins itself, so it refuses these
+/// gems before fetching their views instead of after.
+pub(crate) async fn gem_takeover_refusals_for<'a>(
+    cwd: &Path,
+    purls: impl Iterator<Item = &'a str>,
+    pins: &[HostedPin],
+    offline: bool,
+    patch_server_origins: Vec<String>,
+) -> HashMap<String, (&'static str, String)> {
+    let mut refusals = HashMap::new();
+    let restore_opts = socket_patch_core::patch::redirect::upstream::RestoreOptions {
+        dry_run: true,
+        offline,
+        patch_server_origins,
+        bun_lockb: true,
+    };
+    for purl in purls.filter(|p| p.starts_with("pkg:gem/")) {
+        let Some(pin) = pins.iter().find(|pin| PurlKey::same(&pin.purl, purl)) else {
+            continue;
+        };
+        if let Some(refusal) = gem_takeover_refusal(cwd, purl, pin, &restore_opts).await {
+            refusals.insert(purl.to_string(), refusal);
+        }
+    }
+    refusals
 }
 
 /// The hosted pins whose ecosystem `--ecosystems` selects.
@@ -2660,7 +2734,7 @@ pub(crate) async fn vendor_records_reusing(
     let hosted_pin_of = |purl: &str| {
         hosted_pins
             .iter()
-            .find(|pin| canonical_purl(&pin.purl) == canonical_purl(purl))
+            .find(|pin| PurlKey::same(&pin.purl, purl))
     };
 
     // Yarn berry / npm package-lock takeover preflight (see
@@ -2877,11 +2951,13 @@ pub(crate) async fn vendor_records_reusing(
                 // code and detail, in the dry run and the wet run alike —
                 // so the hosted wiring stays untouched.
                 // The gem backend's manifest refusal, likewise raised before
-                // the restore (a hosted `gems.rb` project cannot vendor).
+                // the restore (a hosted `gems.rb` project cannot vendor), and
+                // its Gemfile declaration refusal, evaluated on the restored
+                // Gemfile (a gem declared inside a `group` block stays hosted).
                 if candidate.starts_with("pkg:gem/") {
-                    if let Some((code, detail)) =
-                        socket_patch_core::vendor::gem::gem_manifest_refusal(&common.cwd).await
-                    {
+                    let refusal =
+                        gem_takeover_refusal(&common.cwd, candidate, pin, &restore_opts).await;
+                    if let Some((code, detail)) = refusal {
                         has_errors = true;
                         env.record(
                             PatchEvent::new(PatchAction::Failed, candidate.clone())
@@ -3457,11 +3533,8 @@ pub(crate) async fn vendor_records_reusing(
         .collect();
     unmatched.sort();
     // A base that vendored one variant accounts for its qualified siblings.
-    let vendored_bases: HashSet<String> = matched
-        .iter()
-        .map(|p| strip_purl_qualifiers(p).to_string())
-        .collect();
-    unmatched.retain(|p| !vendored_bases.contains(strip_purl_qualifiers(p)));
+    let vendored_bases: HashSet<PurlKey> = matched.iter().map(|p| PurlKey::new(p)).collect();
+    unmatched.retain(|p| !vendored_bases.contains(&PurlKey::new(p)));
     has_errors |= !fetch_failed.is_empty();
     if !unmatched.is_empty() {
         has_errors = true;
@@ -3928,16 +4001,16 @@ async fn run_revert(args: &VendorArgs, env: &mut Envelope) -> i32 {
     // to their upstream registry entries too (a wet run only — a dry revert
     // wrote nothing to inspect).
     if !common.dry_run {
-        let reverted: HashSet<String> = env
+        let reverted: HashSet<PurlKey> = env
             .events
             .iter()
             .filter(|e| e.action == PatchAction::Removed)
-            .filter_map(|e| e.purl.as_deref().map(canonical_purl))
+            .filter_map(|e| e.purl.as_deref().map(PurlKey::new))
             .collect();
         let rehosted: Vec<HostedPin> =
             HostedPin::all(&crate::commands::discover_wiring(common, &common.cwd).await)
                 .into_iter()
-                .filter(|pin| reverted.contains(&canonical_purl(&pin.purl)))
+                .filter(|pin| reverted.contains(&PurlKey::new(&pin.purl)))
                 .collect();
         if !rehosted.is_empty() {
             let leg = crate::commands::rollback::run_hosted_leg(common, &rehosted).await;
@@ -4074,6 +4147,26 @@ pub(crate) struct VendorGcSummary {
     /// happened on disk; the stale record is what the caller must report.
     pub write_failures: Vec<(&'static str, String)>,
 }
+/// The manifest keys an unused vendored `entry`, stored under ledger key
+/// `purl`, owns: every key with the same [`PurlKey`] as the ledger key OR
+/// the entry's base purl ([`VendorEntry::covers_purl`]: any qualifier set,
+/// encoding, NuGet case, PEP 503 spelling or composer release padding). The
+/// base purl matters for golang, whose ledger key may keep the module
+/// proxy's `!x` case encoding (`!burnt!sushi`) while the manifest holds the
+/// decoded `BurntSushi` spelling. The ONE relation behind the wet vendor
+/// GC's manifest drop and `scan --prune --dry-run`'s preview of it, so the
+/// two never report different prune sets.
+pub(crate) fn unused_vendored_manifest_keys<V>(
+    patches: &std::collections::HashMap<String, V>,
+    purl: &str,
+    entry: &VendorEntry,
+) -> Vec<String> {
+    patches
+        .keys()
+        .filter(|k| k.as_str() == purl || entry.covers_purl(purl, k))
+        .cloned()
+        .collect()
+}
 
 /// The vendored-state GC behind `scan --prune`:
 ///
@@ -4189,18 +4282,7 @@ pub(crate) async fn run_vendor_gc(
         state.entries.remove(&purl);
         ledger_dirty = true;
         if let Some(m) = manifest.as_mut() {
-            let base = strip_purl_qualifiers(&entry.base_purl).to_string();
-            let dropped: Vec<String> = m
-                .patches
-                .keys()
-                .filter(|k| {
-                    *k == &purl
-                        || strip_purl_qualifiers(k) == base
-                        || composer_purls_equivalent(k, &base)
-                })
-                .cloned()
-                .collect();
-            for k in dropped {
+            for k in unused_vendored_manifest_keys(&m.patches, &purl, &entry) {
                 m.patches.remove(&k);
                 manifest_dirty = true;
             }
@@ -6797,5 +6879,102 @@ mod eject_snapshot_tests {
         .expect("a FIFO must not wedge the eject snapshot");
         let err = taken.err().expect("a FIFO must fail the snapshot");
         assert_eq!(err.kind(), std::io::ErrorKind::InvalidInput);
+    }
+}
+
+#[cfg(test)]
+mod unused_vendored_manifest_keys_tests {
+    use super::unused_vendored_manifest_keys;
+    use socket_patch_core::vendor::state::{VendorArtifact, VendorEntry};
+    use std::collections::HashMap;
+
+    /// A ledger entry whose base purl is `base_purl`; only the purl
+    /// matters to the manifest-key relation.
+    fn entry(ecosystem: &str, base_purl: &str) -> VendorEntry {
+        VendorEntry {
+            ecosystem: ecosystem.into(),
+            base_purl: base_purl.into(),
+            uuid: "11111111-1111-4111-8111-111111111111".into(),
+            artifact: VendorArtifact {
+                yarn_berry10c0: None,
+                path: String::new(),
+                sha256: String::new(),
+                size: None,
+                platform_locked: None,
+                file_inventory: None,
+            },
+            wiring: Vec::new(),
+            lock: None,
+            took_over_go_patches: false,
+            detached: false,
+            record: None,
+            flavor: None,
+            uv: None,
+            pnpm: None,
+            poetry: None,
+            pdm: None,
+            pipenv: None,
+        }
+    }
+
+    /// The keys an unused ledger entry `key` (base purl = the key) owns.
+    fn keys_for(patches: &HashMap<String, ()>, eco: &str, key: &str) -> Vec<String> {
+        let mut out = unused_vendored_manifest_keys(patches, key, &entry(eco, key));
+        out.sort();
+        out
+    }
+
+    /// A golang ledger key may keep the module proxy's `!x` case encoding
+    /// while the entry's base purl and the manifest key are the decoded
+    /// spelling; [`PurlKey`](socket_patch_core::utils::purl_key::PurlKey)
+    /// does not decode `!x`, so the base purl must be matched too or the
+    /// manifest entry (and its blobs) survive the revert.
+    #[test]
+    fn covers_the_decoded_golang_base_purl_of_a_bang_encoded_key() {
+        let patches: HashMap<String, ()> = [
+            "pkg:golang/github.com/BurntSushi/toml@v1.0.0",
+            "pkg:golang/github.com/BurntSushi/toml@v1.1.0",
+        ]
+        .into_iter()
+        .map(|k| (k.to_string(), ()))
+        .collect();
+        let key = "pkg:golang/github.com/!burnt!sushi/toml@v1.0.0";
+        let e = entry("golang", "pkg:golang/github.com/BurntSushi/toml@v1.0.0");
+        assert_eq!(
+            unused_vendored_manifest_keys(&patches, key, &e),
+            vec!["pkg:golang/github.com/BurntSushi/toml@v1.0.0".to_string()]
+        );
+    }
+
+    /// The wet vendor GC and `scan --prune --dry-run`'s preview both drop
+    /// these keys, so they must cover every spelling of the release and
+    /// nothing else.
+    #[test]
+    fn covers_every_spelling_of_the_release() {
+        let patches: HashMap<String, ()> = [
+            "pkg:nuget/Newtonsoft.Json@13.0.1",
+            "pkg:nuget/newtonsoft.json@13.0.1?x=1",
+            "pkg:nuget/newtonsoft.json@13.0.2",
+            "pkg:pypi/typing-extensions@4.12.2",
+            "pkg:composer/psr/log@3.0.2",
+        ]
+        .into_iter()
+        .map(|k| (k.to_string(), ()))
+        .collect();
+        assert_eq!(
+            keys_for(&patches, "nuget", "pkg:nuget/newtonsoft.json@13.0.1"),
+            vec![
+                "pkg:nuget/Newtonsoft.Json@13.0.1".to_string(),
+                "pkg:nuget/newtonsoft.json@13.0.1?x=1".to_string(),
+            ]
+        );
+        assert_eq!(
+            keys_for(&patches, "pypi", "pkg:pypi/typing_extensions@4.12.2"),
+            vec!["pkg:pypi/typing-extensions@4.12.2".to_string()]
+        );
+        assert_eq!(
+            keys_for(&patches, "composer", "pkg:composer/psr/log@3.0.2.0"),
+            vec!["pkg:composer/psr/log@3.0.2".to_string()]
+        );
     }
 }

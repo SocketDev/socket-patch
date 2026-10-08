@@ -230,6 +230,23 @@ fn mismatched_fallback_home_copy_is_nonfatal_when_store_patched() {
     );
 }
 
+/// `apply --check` uses the same copy classes: once the store copy is
+/// patched, a fallback-home copy no variant matches is no drift — `apply`
+/// left it alone and exited 0, so the check must not send CI back to an
+/// `apply` that will never act on it.
+#[test]
+fn check_ignores_a_mismatched_fallback_home_copy_when_store_patched() {
+    let fx = build_fixture(true, b"totally different bytes\n", QUALIFIED_PURL);
+    let (code, _, stderr) = run_apply(&fx, &["--json"]);
+    assert_eq!(code, 0, "stderr:\n{stderr}");
+
+    let (code, stdout, stderr) = run_apply(&fx, &["--check"]);
+    assert_eq!(
+        code, 0,
+        "apply exited 0 on this tree, so --check must too.\nstdout={stdout}\nstderr={stderr}"
+    );
+}
+
 /// (b) Parity pin: with NO bundle-store copy, the fallback-home copy IS
 /// the primary install — a mismatch there is a loud failure (exit 1), as
 /// in plain apply.
@@ -246,6 +263,26 @@ fn fallback_only_mismatch_keeps_loud_failure_parity() {
     assert!(
         find_skip_event(&env).is_none(),
         "no best-effort skip without a patched store copy.\nenvelope: {env}"
+    );
+
+    // `apply --check` on the same tree fails too: the copy holds no
+    // release variant of the manifest's base, which is drift, never
+    // "not installed, skipped".
+    let (code, stdout, stderr) = run_apply(&fx, &["--check", "--json"]);
+    assert_eq!(
+        code, 1,
+        "--check must match apply's exit.\nstdout={stdout}\nstderr={stderr}"
+    );
+    let env = parse_env(&stdout);
+    assert!(
+        env["events"]
+            .as_array()
+            .unwrap()
+            .iter()
+            .any(|e| e["action"] == "failed"
+                && e["purl"] == BASE_PURL
+                && e["errorCode"] == "no_matching_variant"),
+        "envelope: {env}"
     );
 }
 
@@ -319,5 +356,13 @@ fn failing_fallback_home_copy_write_is_nonfatal_when_store_patched() {
     assert_eq!(
         failed_events, 0,
         "no Failed event for a best-effort home copy.\nenvelope: {env}"
+    );
+
+    // `apply --check` agrees: the diverged home copy is best-effort, so
+    // the patched store copy is what it judges.
+    let (code, stdout, stderr) = run_apply(&fx, &["--check"]);
+    assert_eq!(
+        code, 0,
+        "apply exited 0 on this tree, so --check must too.\nstdout={stdout}\nstderr={stderr}"
     );
 }

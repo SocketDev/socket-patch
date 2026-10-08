@@ -7,10 +7,13 @@
 
 use std::ops::Range;
 
+use crate::formats::text::strip_bom;
+
 /// Early pnpm 1 writes shrinkwrapVersion 3 without a minor version and
 /// unconditionally drops registry tarball URLs on install. Its frozen flag
 /// cannot preserve this redirect (verified with pnpm 1.0.0).
 pub(crate) fn unsupported_early_shrinkwrap(content: &str) -> bool {
+    let content = strip_bom(content);
     let version = content
         .lines()
         .find_map(|line| line.strip_prefix("shrinkwrapVersion:"));
@@ -77,9 +80,11 @@ pub(crate) fn unquote(s: &str) -> &str {
 
 /// Whether `text` is a pnpm lock at all: a column-0 `lockfileVersion:`
 /// (pnpm >= 3) or `shrinkwrapVersion:` (pnpm 1 / 2) line — lockfile
-/// discovery's sniff before it reads any entry.
+/// discovery's sniff before it reads any entry. A leading BOM is encoding,
+/// not key text: pnpm reads a BOM lock like its plain twin (#903).
 pub(crate) fn is_pnpm_lock_text(text: &str) -> bool {
-    text.lines()
+    strip_bom(text)
+        .lines()
         .any(|line| line.starts_with("lockfileVersion:") || line.starts_with("shrinkwrapVersion:"))
 }
 
@@ -100,6 +105,56 @@ pub(crate) fn entry_field<'a>(entry: &Entry<'a>, field: &str) -> Option<&'a str>
     });
     let first = values.next().filter(|v| !v.is_empty())?;
     values.next().is_none().then_some(first)
+}
+
+/// What a packages entry's `bundledDependencies:` field says the package
+/// ships inside its own tarball (see [`entry_bundled`]).
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub(crate) enum Bundled<'a> {
+    /// The named dependencies (a block or flow list).
+    Names(Vec<&'a str>),
+    /// Every dependency (`bundledDependencies: true`), or a value the
+    /// grammar cannot read: pnpm does not lock bundled dependencies, so
+    /// which names these are is not in the lock.
+    All,
+}
+
+/// The entry-level `bundledDependencies:` field of a packages entry, as
+/// real pnpm writes it (checked with pnpm 11.27, lockfile 9.0): a block
+/// list (`      - left-pad`), a flow list, or `true`. pnpm never resolves a
+/// bundled dependency, so the lock has no entry for it, and its version is
+/// whatever the parent's tarball carries. `None` when the field is absent,
+/// `false` or an empty list; a value this grammar cannot read is
+/// [`Bundled::All`] (fail closed).
+pub(crate) fn entry_bundled<'a>(entry: &Entry<'a>) -> Option<Bundled<'a>> {
+    let mut lines = entry.body.lines().map(|line| line.trim_end_matches('\r'));
+    let value = lines.by_ref().find_map(|line| {
+        let rest = line.strip_prefix("    ").filter(|r| !r.starts_with(' '))?;
+        let (key, value) = rest.split_once(':')?;
+        matches!(key, "bundledDependencies" | "bundleDependencies").then(|| value.trim())
+    })?;
+    let names: Vec<&str> = match value {
+        "false" => return None,
+        "true" => return Some(Bundled::All),
+        "" => lines
+            .take_while(|line| line.starts_with("     "))
+            .map(|line| line.trim_start().strip_prefix("- ").map(str::trim))
+            .collect::<Option<_>>()
+            .unwrap_or_else(|| vec![""]),
+        flow => match flow.strip_prefix('[').and_then(|f| f.strip_suffix(']')) {
+            Some(inner) => inner
+                .split(',')
+                .map(str::trim)
+                .filter(|name| !name.is_empty())
+                .collect(),
+            None => vec![""],
+        },
+    };
+    let names: Vec<&str> = names.into_iter().map(unquote).collect();
+    if names.iter().any(|name| name.is_empty()) {
+        return Some(Bundled::All);
+    }
+    (!names.is_empty()).then_some(Bundled::Names(names))
 }
 
 /// Loose identity match, also used to refuse unsupported suffixes atomically.
@@ -354,4 +409,48 @@ pub(crate) fn resolution<'a>(entry: &Entry<'a>) -> Option<Resolution<'a>> {
         });
     }
     None
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    /// `entry_bundled` of a lock whose first packages entry ends in `field`.
+    fn assert_bundled(field: &str, expected: Option<Bundled<'_>>) {
+        let lock = format!(
+            "lockfileVersion: '9.0'\n\npackages:\n\n  host@1.0.0:\n    resolution: \
+             {{integrity: sha512-AA==}}\n    version: 1.0.0\n{field}\n  other@1.0.0:\n    \
+             resolution: {{integrity: sha512-BB==}}\n"
+        );
+        let entries = entries(&lock);
+        assert_eq!(entry_bundled(&entries[0]), expected, "{field:?}");
+    }
+
+    /// Every spelling of `bundledDependencies:` real pnpm writes (block
+    /// list, `true`) plus the flow list and quoted names; an unreadable
+    /// value fails closed to [`Bundled::All`].
+    #[test]
+    fn entry_bundled_reads_every_spelling() {
+        let names = |n: Vec<&'static str>| Some(Bundled::Names(n));
+        assert_bundled("", None);
+        assert_bundled(
+            "    bundledDependencies:\n      - left-pad\n      - '@s/x'",
+            names(vec!["left-pad", "@s/x"]),
+        );
+        assert_bundled(
+            "    bundledDependencies:\r\n      - left-pad\r",
+            names(vec!["left-pad"]),
+        );
+        assert_bundled(
+            "    bundledDependencies: [left-pad, '@s/x']",
+            names(vec!["left-pad", "@s/x"]),
+        );
+        assert_bundled("    bundledDependencies: true", Some(Bundled::All));
+        assert_bundled("    bundledDependencies: false", None);
+        assert_bundled("    bundledDependencies: []", None);
+        // Not a list: fail closed.
+        assert_bundled("    bundledDependencies: left-pad", Some(Bundled::All));
+        // A nested field of the same name is not the entry's.
+        assert_bundled("    engines:\n      bundledDependencies: true", None);
+    }
 }

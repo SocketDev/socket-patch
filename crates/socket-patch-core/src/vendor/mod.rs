@@ -139,7 +139,6 @@ use std::path::Path;
 use crate::manifest::schema::PatchRecord;
 use crate::patch::apply::{is_safe_relative_subpath, normalize_file_path, ApplyResult};
 use crate::utils::fs::read_regular_to_string_sync;
-use crate::utils::purl::strip_purl_qualifiers;
 
 /// A non-fatal advisory surfaced as a warning event (`code` is a stable
 /// reason tag from the CLI contract; `detail` is human text).
@@ -184,22 +183,9 @@ pub fn yarn_classic_berry_migration_risk(project_root: &Path) -> Option<VendorWa
     if !lock.contains("# yarn lockfile v1") || !lock.contains(".socket/vendor/") {
         return None;
     }
-    if let Some(pm) = read_regular_to_string_sync(&project_root.join("package.json"))
-        .ok()
-        .and_then(|pkg| serde_json::from_str::<serde_json::Value>(&pkg).ok())
-        .and_then(|v| {
-            v.get("packageManager")
-                .and_then(|p| p.as_str().map(String::from))
-        })
-    {
-        let major = pm.trim().strip_prefix("yarn@").map(|rest| {
-            rest.chars()
-                .take_while(char::is_ascii_digit)
-                .collect::<String>()
-        });
-        if major.as_deref() == Some("1") {
-            return None;
-        }
+    let manifest = read_regular_to_string_sync(&project_root.join("package.json")).ok();
+    if manifest_pins_yarn_classic(manifest.as_deref()) {
+        return None;
     }
     Some(VendorWarning::new(
         "yarn_classic_berry_migration_risk",
@@ -208,6 +194,30 @@ pub fn yarn_classic_berry_migration_risk(project_root: &Path) -> Option<VendorWa
          from the registry. Pin yarn classic (e.g. \"packageManager\": \"yarn@1.22.22\" in \
          package.json) so every install uses yarn 1.",
     ))
+}
+
+/// Whether a root `package.json` text pins yarn classic through corepack's
+/// `packageManager: yarn@1…`, which makes a stray yarn 2+ (berry) install
+/// refuse instead of migrating a classic `yarn.lock` and dropping its
+/// pins. A missing, unreadable or malformed manifest vouches for nothing
+/// (`false`), so callers fail toward warning. Shared by the vendored probe
+/// above and the hosted yarn classic rewriter, so both modes warn alike.
+pub(crate) fn manifest_pins_yarn_classic(manifest: Option<&str>) -> bool {
+    let Some(pm) = manifest
+        .and_then(|pkg| serde_json::from_str::<serde_json::Value>(pkg).ok())
+        .and_then(|v| {
+            v.get("packageManager")
+                .and_then(|p| p.as_str().map(String::from))
+        })
+    else {
+        return false;
+    };
+    let major = pm.trim().strip_prefix("yarn@").map(|rest| {
+        rest.chars()
+            .take_while(char::is_ascii_digit)
+            .collect::<String>()
+    });
+    major.as_deref() == Some("1")
 }
 
 /// Vendoring acquires immutable artifacts from the patch service.
@@ -371,9 +381,10 @@ pub async fn harvest_artifact_blobs_from(
             continue;
         }
         let Some(entry) = entries.get(purl).or_else(|| {
+            let key = crate::utils::purl_key::PurlKey::new(purl);
             entries
                 .values()
-                .find(|e| e.base_purl == strip_purl_qualifiers(purl))
+                .find(|e| crate::utils::purl_key::PurlKey::new(&e.base_purl) == key)
         }) else {
             continue;
         };
@@ -855,7 +866,7 @@ pub async fn lock_text_refusals(
 /// (apply / rollback / scan prune). An unreadable ledger degrades to the
 /// empty set (fail-open); mutating callers that need fail-closed semantics
 /// use [`load_state`] directly.
-pub async fn vendored_purl_keys(project_root: &Path) -> HashSet<String> {
+pub async fn vendored_purl_keys(project_root: &Path) -> HashSet<crate::utils::purl_key::PurlKey> {
     load_state(project_root)
         .await
         .map(|state| state.purl_keys())
@@ -1812,9 +1823,9 @@ mod harvest_tests {
         );
     }
 
-    /// Every spelling `vendored_purl_keys` promises: the entry's map key
+    /// Every spelling `vendored_purl_keys` covers: the entry's map key
     /// (possibly qualified), its resolved base purl, and the
-    /// qualifier-stripped key.
+    /// qualifier-stripped key — one `PurlKey`.
     #[tokio::test]
     async fn vendored_purl_keys_lists_all_addressable_spellings() {
         let tmp = tempfile::tempdir().unwrap();
@@ -1824,12 +1835,15 @@ mod harvest_tests {
         write_ledger_entries(tmp.path(), &[(qualified, base, UUID, &rel)]);
 
         let keys = vendored_purl_keys(tmp.path()).await;
-        assert!(keys.contains(qualified), "map key spelling: {keys:?}");
         assert!(
-            keys.contains(base),
+            purl_keys_cover(&keys, qualified),
+            "map key spelling: {keys:?}"
+        );
+        assert!(
+            purl_keys_cover(&keys, base),
             "base purl / stripped spelling: {keys:?}"
         );
-        assert_eq!(keys.len(), 2, "base and stripped coincide here: {keys:?}");
+        assert_eq!(keys.len(), 1, "every spelling shares one key: {keys:?}");
     }
 
     /// The documented fail-open degrade: no ledger yields the empty set, and

@@ -4,14 +4,16 @@
 #[cfg(test)]
 use std::path::Path;
 
+use crate::formats::yarn::blocks::{
+    berry_field, classic_field, live_blocks, scan_blocks, LockBlock,
+};
+use crate::formats::yarn::patterns::{
+    parse_berry_locator, pattern_real_name, split_berry_key_patterns, split_key_patterns,
+    split_pattern, split_resolved_sha1, BerryLocator,
+};
+use crate::formats::yarn::source::{classic_copy_source, CopySource};
 use crate::utils::digest::is_hex;
-use crate::vendor::yarn_berry_lock::{
-    berry_field, berry_metadata, parse_berry_locator, BerryLocator,
-};
-use crate::vendor::yarn_classic_lock::{
-    self, classic_field, live_blocks, scan_blocks, split_berry_key_patterns, split_key_patterns,
-    split_resolved_sha1, LockBlock,
-};
+use crate::vendor::yarn_classic_lock;
 
 use super::view::ProjectView;
 use super::{http_url, LockIntegrity, LockfileEntry};
@@ -79,9 +81,7 @@ pub(crate) struct BerryLock {
 /// discovery share (see [`classic_entries`]).
 pub(crate) fn berry_entries(text: &str) -> BerryLock {
     let blocks = scan_blocks(text);
-    let cache_key = berry_metadata(&blocks)
-        .and_then(|meta| berry_field(&meta.lines, "cacheKey"))
-        .map(str::to_string);
+    let cache_key = crate::formats::yarn::berry_gates::cache_key(&blocks).map(str::to_string);
     let mut entries = yarn_entries(blocks, split_berry_key_patterns);
     entries.retain(|e| e.block.key != "__metadata");
     BerryLock { cache_key, entries }
@@ -129,24 +129,26 @@ fn classic_registry_view(text: &str) -> Vec<LockfileEntry> {
         if yarn_classic_lock::block_points_into_vendor(&block.lines) {
             continue;
         }
-        let Some(name) = patterns
-            .first()
-            .and_then(|p| yarn_classic_lock::pattern_real_name(p))
-        else {
+        let Some(name) = patterns.first().and_then(|p| pattern_real_name(p)) else {
             continue;
         };
         let Some(version) = classic_field(&block.lines, "version") else {
             continue;
         };
         // `resolved "url#sha1hex"` — the fragment is the legacy verifier of
-        // a registry tarball. A non-registry resolution (a git repository,
-        // over any protocol, or a local file) records hashes of an artifact
-        // no registry serves — a git fragment is a commit id — so neither it
-        // nor an `integrity` field verifies a registry fetch.
+        // a registry tarball. A non-registry copy (git over any protocol, a
+        // `file:` tarball, a URL or hosted-git tarball — the shared
+        // [`classic_copy_source`] rule the rewriters use) records hashes of
+        // an artifact no registry serves — a git fragment is a commit id —
+        // so neither it nor an `integrity` field verifies a registry fetch.
         let (resolved, sha1_hex, registry) = match classic_field(&block.lines, "resolved") {
             Some(raw) => {
                 let (url, sha1) = split_resolved_sha1(raw);
-                match http_url(url).filter(|u| !is_git_resolution(raw, u)) {
+                let registry_copy = !matches!(
+                    classic_copy_source(&patterns, Some(raw)),
+                    CopySource::Git | CopySource::RemoteTarball
+                );
+                match http_url(url).filter(|_| registry_copy) {
                     Some(url) => (Some(url), sha1, true),
                     None => (None, None, false),
                 }
@@ -161,18 +163,6 @@ fn classic_registry_view(text: &str) -> Vec<LockfileEntry> {
         out.push(LockfileEntry::npm(name, version, resolved, integrity));
     }
     out
-}
-
-/// Whether a classic `resolved` value names a git repository rather than a
-/// registry tarball: a `git+`/`git:`/`github:`/`ssh:` spec, an http(s) URL
-/// of a `.git` repository, or a GitHub codeload tarball of a commit.
-fn is_git_resolution(raw: &str, url: &str) -> bool {
-    let path = url.split(['?', '#']).next().unwrap_or(url);
-    ["git+", "git:", "github:", "ssh:"]
-        .iter()
-        .any(|p| raw.starts_with(p))
-        || path.ends_with(".git")
-        || path.contains("://codeload.github.com/")
 }
 
 #[cfg(test)]
@@ -201,7 +191,6 @@ fn berry_hosted_tarball_entry(
     version: &str,
     reference: &str,
 ) -> bool {
-    use crate::vendor::yarn_classic_lock::split_pattern;
     crate::patch::redirect::hosted_url::hosted_url_names(reference, name, version)
         && !entry.patterns.is_empty()
         && entry.patterns.iter().all(|p| {

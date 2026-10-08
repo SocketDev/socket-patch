@@ -9,6 +9,12 @@ on:
     # workflow (cache-poisoning).
     branches: [main]
   pull_request:
+    types: [opened, synchronize, reopened, ready_for_review]
+  # The merge queue tests each queued PR merged onto the tip of main (plus
+  # the PRs ahead of it) before it lands. `ci-ok` below is the required
+  # check, so this event has to run the same pull_request-tier job set.
+  merge_group:
+    types: [checks_requested]
   schedule:
     # Nightly on main: the `full` tier (e2e-full, cargo-vex-matrix-full,
     # yarn-berry-full) and e2e-docker, which pull_request runs skip.
@@ -27,17 +33,19 @@ permissions:
   contents: read
 
 # A newer push to the same PR supersedes its older run; nothing else is
-# cancelled. Push, dispatch and schedule runs always finish: main runs are
-# the ONLY rust-cache writers (save-if) and must not die mid-save, and a
-# dispatched base-branch run is the base's only CI verdict. The nightly
-# gets its own group: a group holds one pending run, so sharing main's would
-# let a queued push and the nightly cancel each other.
+# cancelled. Push runs are grouped per commit: a concurrency group holds only
+# ONE pending run, so a shared `refs/heads/main` group silently cancelled every
+# queued push but the newest during a merge burst, and most main commits never
+# got a verdict. Merge-group refs (gh-readonly-queue/...) are unique per queue
+# entry already. The nightly keeps its own group so it never queues behind (or
+# cancels) a push.
 concurrency:
-  group: ci-${{ github.event.pull_request.number || github.ref }}${{ github.event_name == 'schedule' && '-nightly' || '' }}
+  group: ci-${{ github.event.pull_request.number || (github.event_name == 'push' && github.sha) || github.ref }}${{ github.event_name == 'schedule' && '-nightly' || '' }}
   cancel-in-progress: ${{ github.event_name == 'pull_request' }}
 
 jobs:
   clippy:
+    if: github.event.pull_request.draft != true
     runs-on: ubuntu-latest
     timeout-minutes: 20
     steps:
@@ -70,6 +78,7 @@ jobs:
   # The napi addon is only ever loaded by Node, so cargo's own tests never
   # exercise its JS loader or the engine/provider boundary.
   node-addon:
+    if: github.event.pull_request.draft != true
     runs-on: ubuntu-latest
     timeout-minutes: 30
     steps:
@@ -102,6 +111,7 @@ jobs:
   # Check the standalone installer, release scripts, and native installer
   # test harnesses.
   lint-ecosystems:
+    if: github.event.pull_request.draft != true
     runs-on: ubuntu-latest
     timeout-minutes: 10
     steps:
@@ -193,6 +203,7 @@ jobs:
   #     CHANGELOG has a dated, non-empty section for the new version and the
   #     tag doesn't already exist.
   release-readiness:
+    if: github.event.pull_request.draft != true
     runs-on: ubuntu-latest
     steps:
       - name: Checkout
@@ -230,6 +241,7 @@ jobs:
           bash scripts/release-lint.sh --sync-only
 
   test:
+    if: github.event.pull_request.draft != true
     # No ubuntu-latest leg: `coverage` runs this same `cargo test
     # --workspace` (debug, default features, plus Go and vexctl) on ubuntu,
     # instrumented, and fails on any test failure. A plain ubuntu leg ran
@@ -238,6 +250,9 @@ jobs:
       fail-fast: false
       matrix:
         os: [macos-latest, windows-latest]
+        exclude:
+          # macOS legs run on main, the merge queue and nightly, not per PR push.
+          - os: ${{ github.event_name == 'pull_request' && 'macos-latest' || '' }}
     runs-on: ${{ matrix.os }}
     timeout-minutes: 50
     env:
@@ -389,6 +404,7 @@ jobs:
           cargo test --workspace --no-fail-fast
 
   test-release:
+    if: github.event.pull_request.draft != true
     runs-on: ubuntu-latest
     # Every tests/ target is its own optimized link (~240 test binaries).
     # The manifest-less VEX suites share two multi-module binaries
@@ -423,6 +439,7 @@ jobs:
         run: cargo test --workspace --profile ci-release
 
   coverage:
+    if: github.event.pull_request.draft != true
     # Code coverage via cargo-llvm-cov (LLVM source-based instrumentation).
     # Reports as a markdown table in the job summary and uploads the raw
     # lcov.info file as a workflow artifact. No threshold gating — the
@@ -535,6 +552,7 @@ jobs:
   # Dockerfile.base compiles the full-LTO release binary inside Docker, with
   # no cache. Build it once per run and hand the image to every docker leg.
   docker-base:
+    if: github.event.pull_request.draft != true
     runs-on: ubuntu-22.04
     timeout-minutes: 30
     permissions:
@@ -784,6 +802,7 @@ jobs:
           retention-days: 30
 
   dispatch-tests:
+    if: github.event.pull_request.draft != true
     runs-on: ubuntu-latest
     timeout-minutes: 10
     steps:
@@ -800,16 +819,33 @@ jobs:
       - name: Run npm dispatch tests
         run: node --test npm/socket-patch/bin/socket-patch.test.mjs
 
+      - name: Run npm schema tests
+        # The `./schema` export's zod tests. `npm install --no-save`, not
+        # `npm ci`, for the reason publish-npm.yml gives (a version-synced
+        # lock can name platform packages not yet on the registry); the
+        # platform binaries are optional and not needed here. The pack
+        # test runs again once `npm test` has built dist/, so it also
+        # checks that the compiled schema ships.
+        working-directory: npm/socket-patch
+        run: |
+          npm install --no-save --ignore-scripts --no-audit --no-fund --omit=optional
+          npm test
+          node --test --test-name-pattern="npm package contents" bin/socket-patch.test.mjs
+
   # Compiles the CLI and every CLI test target once per OS (--all-features,
   # so this is also the feature-gated suites' compile-rot check) and uploads
   # the binaries the e2e, e2e-full and cargo-vex legs run. The legs run the
   # test binaries directly from the same checkout path, so `CARGO_BIN_EXE_*`
   # and `CARGO_MANIFEST_DIR` resolve as they did under `cargo test`.
   e2e-build:
+    if: github.event.pull_request.draft != true
     strategy:
       fail-fast: false
       matrix:
         os: [ubuntu-latest, macos-latest, windows-latest]
+        exclude:
+          # macOS legs run on main, the merge queue and nightly, not per PR push.
+          - os: ${{ github.event_name == 'pull_request' && 'macos-latest' || '' }}
     runs-on: ${{ matrix.os }}
     # Windows compiles the same ~240 targets ~1.6x slower (see `test`).
     timeout-minutes: ${{ matrix.os == 'windows-latest' && 60 || 45 }}
@@ -935,8 +971,6 @@ jobs:
           # every cargo-vex-matrix leg (ubuntu, macOS and Windows).
           - os: ubuntu-latest
             suite: e2e_safety_pnpm
-          - os: macos-latest
-            suite: e2e_safety_pnpm
           # pnpm-on-Windows uses junctions for symlinks and copies
           # (not hardlinks) by default, so the CoW invariant holds
           # vacuously. Test still runs to verify apply doesn't error
@@ -956,20 +990,15 @@ jobs:
           # setup-node step, no version change.
           #
           # `npm_required` turns the npm suites' "npm not installed" soft-skip
-          # into a hard failure. Not on Windows: `Command::new("npm")` cannot
-          # resolve `npm.cmd` there, so that leg still skips (a known gap; see
-          # docs/testing/npm-compatibility.md).
+          # into a hard failure, on every OS: the suite resolves npm through
+          # PATHEXT, so Windows finds the `npm.cmd` shim instead of skipping.
           - os: ubuntu-latest
-            suite: e2e_redirect_npm_build
-            npm_required: '1'
-          - os: macos-latest
             suite: e2e_redirect_npm_build
             npm_required: '1'
           - os: windows-latest
             suite: e2e_redirect_npm_build
+            npm_required: '1'
           - os: ubuntu-latest
-            suite: e2e_redirect_rush_sim
-          - os: macos-latest
             suite: e2e_redirect_rush_sim
           - os: windows-latest
             suite: e2e_redirect_rush_sim
@@ -1001,10 +1030,6 @@ jobs:
             suite: e2e_redirect_bun_build
             bun: '1.4.2'
             test_filter: --include-ignored
-          - os: macos-latest
-            suite: e2e_redirect_bun_build
-            bun: '1.4.2'
-            test_filter: --include-ignored
           - os: windows-latest
             suite: e2e_redirect_bun_build
             bun: '1.4.2'
@@ -1021,10 +1046,6 @@ jobs:
             suite: e2e_vendor_bun_build
             bun: '1.4.2'
             test_filter: --include-ignored
-          - os: macos-latest
-            suite: e2e_vendor_bun_build
-            bun: '1.4.2'
-            test_filter: --include-ignored
           - os: windows-latest
             suite: e2e_vendor_bun_build
             bun: '1.4.2'
@@ -1038,10 +1059,6 @@ jobs:
             bun: '1.2.23'
             test_filter: --include-ignored
           - os: ubuntu-latest
-            suite: mode_migration_bun
-            bun: '1.4.2'
-            test_filter: --include-ignored
-          - os: macos-latest
             suite: mode_migration_bun
             bun: '1.4.2'
             test_filter: --include-ignored
@@ -1078,7 +1095,6 @@ jobs:
           # 0.0.0-32, B rc.12/rc.14 (rc.14 legs reach public npm), C rc.32,
           # D 1.0.4/1.0.7, E 1.1.1, F 1.2.0.
           - {os: ubuntu-latest, suite: e2e_redirect_vlt_build, vlt: '1.2.0', test_filter: --include-ignored vlt_pinned_matrix}
-          - {os: macos-latest, suite: e2e_redirect_vlt_build, vlt: '1.2.0', test_filter: --include-ignored vlt_pinned_matrix}
           - {os: windows-latest, suite: e2e_redirect_vlt_build, vlt: '1.2.0', test_filter: --include-ignored vlt_pinned_matrix}
           - {os: ubuntu-latest, suite: e2e_redirect_vlt_build, vlt: '0.0.0-16', test_filter: --include-ignored vlt_pinned_matrix}
           - {os: ubuntu-latest, suite: e2e_redirect_vlt_build, vlt: '0.0.0-32', test_filter: --include-ignored vlt_pinned_matrix}
@@ -1087,7 +1103,6 @@ jobs:
           - {os: ubuntu-latest, suite: e2e_redirect_vlt_build, vlt: '1.0.4', test_filter: --include-ignored vlt_pinned_matrix}
           - {os: ubuntu-latest, suite: e2e_redirect_vlt_build, vlt: '1.1.1', test_filter: --include-ignored vlt_pinned_matrix}
           - {os: ubuntu-latest, suite: e2e_vendor_vlt_build, vlt: '1.2.0', test_filter: --include-ignored vlt_pinned_matrix}
-          - {os: macos-latest, suite: e2e_vendor_vlt_build, vlt: '1.2.0', test_filter: --include-ignored vlt_pinned_matrix}
           - {os: windows-latest, suite: e2e_vendor_vlt_build, vlt: '1.2.0', test_filter: --include-ignored vlt_pinned_matrix}
           - {os: ubuntu-latest, suite: e2e_vendor_vlt_build, vlt: '0.0.0-32', test_filter: --include-ignored vlt_pinned_matrix}
           - {os: ubuntu-latest, suite: e2e_vendor_vlt_build, vlt: '1.0.0-rc.14', test_filter: --include-ignored vlt_pinned_matrix}
@@ -1095,7 +1110,6 @@ jobs:
           - {os: ubuntu-latest, suite: e2e_vendor_vlt_build, vlt: '1.0.4', test_filter: --include-ignored vlt_pinned_matrix}
           - {os: windows-latest, suite: e2e_vendor_vlt_build, vlt: '1.0.0-rc.14', test_filter: --include-ignored vlt_pinned_matrix}
           - {os: ubuntu-latest, suite: mode_migration_vlt, vlt: '1.2.0', test_filter: --include-ignored vlt_pinned_matrix}
-          - {os: macos-latest, suite: mode_migration_vlt, vlt: '1.2.0', test_filter: --include-ignored vlt_pinned_matrix}
           - {os: windows-latest, suite: mode_migration_vlt, vlt: '1.2.0', test_filter: --include-ignored vlt_pinned_matrix}
           - {os: ubuntu-latest, suite: mode_migration_vlt, vlt: '0.0.0-32', test_filter: --include-ignored vlt_pinned_matrix}
           - {os: ubuntu-latest, suite: mode_migration_vlt, vlt: '1.0.0-rc.14', test_filter: --include-ignored vlt_pinned_matrix, vlt_upgrade: '1.2.0'}
@@ -1104,12 +1118,10 @@ jobs:
           # explicit hardlink linker.
           - {os: ubuntu-latest, suite: e2e_safety_vlt, vlt: '1.2.0', test_filter: --include-ignored vlt_pinned_matrix}
           - {os: ubuntu-latest, suite: e2e_safety_vlt, vlt: '1.2.0', test_filter: --include-ignored vlt_pinned_matrix, vlt_store_linker: 'hardlink'}
-          - {os: macos-latest, suite: e2e_safety_vlt, vlt: '1.2.0', test_filter: --include-ignored vlt_pinned_matrix, vlt_store_linker: 'hardlink'}
           - {os: windows-latest, suite: e2e_safety_vlt, vlt: '1.2.0', test_filter: --include-ignored vlt_pinned_matrix, vlt_store_linker: 'hardlink'}
           # rc.12 gets the definite no-hook advisory; windows rc.14 runs the
           # legacy DepIDs on NTFS with pre-junction symlinks.
           - {os: ubuntu-latest, suite: e2e_vlt, vlt: '1.2.0', test_filter: --include-ignored vlt_pinned_matrix}
-          - {os: macos-latest, suite: e2e_vlt, vlt: '1.2.0', test_filter: --include-ignored vlt_pinned_matrix}
           - {os: windows-latest, suite: e2e_vlt, vlt: '1.2.0', test_filter: --include-ignored vlt_pinned_matrix}
           - {os: ubuntu-latest, suite: e2e_vlt, vlt: '0.0.0-32', test_filter: --include-ignored vlt_pinned_matrix}
           - {os: ubuntu-latest, suite: e2e_vlt, vlt: '1.0.0-rc.12', test_filter: --include-ignored vlt_pinned_matrix}
@@ -1122,7 +1134,6 @@ jobs:
           # skip. Node 24 (step below): the
           # corepack pnpm@10/11 legs require it.
           - {os: ubuntu-latest, suite: e2e_redirect_pnpm_build, test_filter: '--ignored --skip pnpm_pinned_matrix'}
-          - {os: macos-latest, suite: e2e_redirect_pnpm_build, test_filter: '--ignored --skip pnpm_pinned_matrix'}
           - {os: windows-latest, suite: e2e_redirect_pnpm_build, test_filter: '--ignored --skip pnpm_pinned_matrix'}
           # Real-uv hosted/vendored capstones ending in manifest-less VEX:
           # the oldest and newest line + the 0.5.x boundary (0.5.4 still
@@ -1133,12 +1144,10 @@ jobs:
           - {os: ubuntu-latest, suite: e2e_redirect_uv_build, uv: '0.5.4'}
           - {os: ubuntu-latest, suite: e2e_redirect_uv_build, uv: '0.5.5'}
           - {os: ubuntu-latest, suite: e2e_redirect_uv_build, uv: '0.12.17'}
-          - {os: macos-latest, suite: e2e_redirect_uv_build, uv: '0.12.17'}
           - {os: ubuntu-latest, suite: e2e_vendor_pypi_build, uv: '0.1.45', test_filter: --include-ignored}
           - {os: ubuntu-latest, suite: e2e_vendor_pypi_build, uv: '0.5.4', test_filter: --include-ignored}
           - {os: ubuntu-latest, suite: e2e_vendor_pypi_build, uv: '0.5.5', test_filter: --include-ignored}
           - {os: ubuntu-latest, suite: e2e_vendor_pypi_build, uv: '0.12.17', test_filter: --include-ignored}
-          - {os: macos-latest, suite: e2e_vendor_pypi_build, uv: '0.12.17', test_filter: --include-ignored}
           # The Poetry / PDM / Hatch / Pipenv / pip / deno manifest-less VEX
           # capstones share ONE test binary (`e2e_vex_build`, a module per
           # tool — one optimized link in test-release instead of six), so
@@ -1153,7 +1162,6 @@ jobs:
           - {os: ubuntu-latest, suite: e2e_vex_build, test_filter: 'poetry:: --ignored', poetry: '1.8.5'}
           - {os: ubuntu-latest, suite: e2e_vex_build, test_filter: 'poetry:: --ignored', poetry: '2.0.1'}
           - {os: ubuntu-latest, suite: e2e_vex_build, test_filter: 'poetry:: --ignored', poetry: '2.4.3'}
-          - {os: macos-latest, suite: e2e_vex_build, test_filter: 'poetry:: --ignored', poetry: '2.4.3'}
           # Real PDM / Hatch capstones (wiremock Socket API that also serves
           # the hosted wheel; PyPI for the tool bootstrap + six).
           # PDM: lock 2 (1.4), refused 3.1 (1.15) and 4.2 (2.7), 4.3 (2.8),
@@ -1164,7 +1172,6 @@ jobs:
           - {os: ubuntu-latest, suite: e2e_vex_build, test_filter: 'pdm:: --ignored', pdm: '2.8.2'}
           - {os: ubuntu-latest, suite: e2e_vex_build, test_filter: 'pdm:: --ignored', pdm: '2.25.9'}
           - {os: ubuntu-latest, suite: e2e_vex_build, test_filter: 'pdm:: --ignored', pdm: '2.29.2'}
-          - {os: macos-latest, suite: e2e_vex_build, test_filter: 'pdm:: --ignored', pdm: '2.29.2'}
           # Hatch: 1.0 (hatch.toml env vendoring refused, needs >= 1.2),
           # 1.2, the virtualenv<21 window (1.9, 1.14) and current.
           - {os: ubuntu-latest, suite: e2e_vex_build, test_filter: 'hatch:: --ignored', hatch: '1.0.0'}
@@ -1172,16 +1179,13 @@ jobs:
           - {os: ubuntu-latest, suite: e2e_vex_build, test_filter: 'hatch:: --ignored', hatch: '1.9.7'}
           - {os: ubuntu-latest, suite: e2e_vex_build, test_filter: 'hatch:: --ignored', hatch: '1.14.2'}
           - {os: ubuntu-latest, suite: e2e_vex_build, test_filter: 'hatch:: --ignored', hatch: '1.18.1'}
-          - {os: macos-latest, suite: e2e_vex_build, test_filter: 'hatch:: --ignored', hatch: '1.18.1'}
           # Real Pipenv / pip capstones (mock patch server; the tools are
           # bootstrapped from PyPI). `pipenv:` / `pip:` hold one or more
           # space-separated releases the suite loops over. The middle
           # Pipenv releases are in e2e-full.
           - {os: ubuntu-latest, suite: e2e_vex_build, test_filter: 'pipenv:: --ignored', pipenv: '2022.12.19'}
           - {os: ubuntu-latest, suite: e2e_vex_build, test_filter: 'pipenv:: --ignored', pipenv: '2026.8.0'}
-          - {os: macos-latest, suite: e2e_vex_build, test_filter: 'pipenv:: --ignored', pipenv: '2022.12.19 2026.8.0'}
           - {os: ubuntu-latest, suite: e2e_vex_build, test_filter: 'pip:: --ignored', pip: '22 23 24 25 26'}
-          - {os: macos-latest, suite: e2e_vex_build, test_filter: 'pip:: --ignored', pip: '22 26'}
           # Real-Maven hosted + vendored capstones, one leg per Maven line:
           # 3.6 (pre http-blocker), 3.8 (resolver 1.6: no trusted checksums),
           # 3.9 (trusted checksums), 4.0 rc. Hosted also runs both sides of
@@ -1193,18 +1197,15 @@ jobs:
           - {os: ubuntu-latest, suite: e2e_redirect_maven_build, jvm_tool: maven, maven: '3.9.4'}
           - {os: ubuntu-latest, suite: e2e_redirect_maven_build, jvm_tool: maven, maven: '3.9.16'}
           - {os: ubuntu-latest, suite: e2e_redirect_maven_build, jvm_tool: maven, maven: '4.0.0-rc-6'}
-          - {os: macos-latest, suite: e2e_redirect_maven_build, jvm_tool: maven, maven: '3.9.16'}
           - {os: ubuntu-latest, suite: e2e_vendor_maven_build, jvm_tool: maven, maven: '3.6.3'}
           - {os: ubuntu-latest, suite: e2e_vendor_maven_build, jvm_tool: maven, maven: '3.8.9'}
           - {os: ubuntu-latest, suite: e2e_vendor_maven_build, jvm_tool: maven, maven: '3.9.16'}
           - {os: ubuntu-latest, suite: e2e_vendor_maven_build, jvm_tool: maven, maven: '4.0.0-rc-6'}
-          - {os: macos-latest, suite: e2e_vendor_maven_build, jvm_tool: maven, maven: '3.9.16'}
           - {os: ubuntu-latest, suite: e2e_vendor_jvm_build, jvm_tool: maven, maven: '3.6.3', test_filter: '--ignored maven_reactor'}
           - {os: ubuntu-latest, suite: e2e_vendor_jvm_build, jvm_tool: maven, maven: '3.8.9', test_filter: '--ignored maven_reactor'}
           - {os: ubuntu-latest, suite: e2e_vendor_jvm_build, jvm_tool: maven, maven: '3.9.2', test_filter: '--ignored maven_reactor'}
           - {os: ubuntu-latest, suite: e2e_vendor_jvm_build, jvm_tool: maven, maven: '3.9.16', test_filter: '--ignored maven_reactor'}
           - {os: ubuntu-latest, suite: e2e_vendor_jvm_build, jvm_tool: maven, maven: '4.0.0-rc-6', test_filter: '--ignored maven_reactor'}
-          - {os: macos-latest, suite: e2e_vendor_jvm_build, jvm_tool: maven, maven: '3.9.16', test_filter: '--ignored maven_reactor'}
           - {os: windows-latest, suite: e2e_vendor_jvm_build, jvm_tool: maven, maven: '3.9.16', test_filter: '--ignored maven_reactor'}
           # Real-Gradle capstones, PR tier: one leg per Gradle line x {agent +
           # hosted, vendor + multi-project} on ubuntu, each on its line's LTS
@@ -1237,7 +1238,6 @@ jobs:
           # the oldest and newest here, 7-9 on ubuntu in e2e-full.
           - {os: ubuntu-latest, suite: e2e_nuget_dotnet_build, dotnet: '6'}
           - {os: ubuntu-latest, suite: e2e_nuget_dotnet_build, dotnet: '10'}
-          - {os: macos-latest, suite: e2e_nuget_dotnet_build, dotnet: '8'}
           # Real deno negative capstone (no hosted/vendored wiring exists for
           # deno; VEX must attest nothing), one leg per major.
           - {os: ubuntu-latest, suite: e2e_vex_build, test_filter: 'deno:: --ignored', deno: '1.46.3'}
@@ -1252,6 +1252,7 @@ jobs:
     env:
       SOCKET_NO_CONFIG: '1'
       SOCKET_NO_UPDATE_CHECK: '1'
+      SOCKET_TELEMETRY_DISABLED: '1'
     # e2e-full runs these same steps over its rows.
     steps: &e2e-steps
       - name: Checkout
@@ -1396,7 +1397,7 @@ jobs:
         # The composer capstones shell out to a real composer; `composer:`
         # pins the release line (1, 2.2 LTS, 2) so the composer.lock grammar
         # the edits assert stays stable across runners.
-        uses: shivammathur/setup-php@f3e473d116dcccaddc5834248c87452386958240 # v2
+        uses: shivammathur/setup-php@f3e473d116dcccaddc5834248c87452386958240 # 2.37.2
         with:
           php-version: '8.2'
           tools: composer:${{ matrix.composer }}
@@ -1617,14 +1618,15 @@ jobs:
           SOCKET_PATCH_SBT_E2E_VERSION: ${{ matrix.sbt }}
           E2E_SUITE: ${{ matrix.suite }}
           E2E_TEST_FILTER: ${{ matrix.test_filter || '--ignored' }}
-          E2E_JVM_TOOL: ${{ matrix.jvm_tool }}
           E2E_ALLOW_EMPTY: ${{ matrix.allow_empty }}
         shell: bash
         # Runs from the package root with CARGO_MANIFEST_DIR set, as
         # `cargo test` would. `suite` may name several binaries; an
         # `allow_empty` row skips the ones whose test file has not landed.
-        # Every suite a Gradle leg runs must run at least one test (per
-        # suite, so one suite's tests never hide another's empty filter).
+        # Every suite a leg runs must run at least one test (per suite, so
+        # one suite's tests never hide another's empty filter): a renamed
+        # module, a dropped `#[ignore]` under the default `--ignored`
+        # selector or a stale `test_filter` would otherwise pass as 0/0.
         run: |
           set -uo pipefail
           exe=''
@@ -1644,8 +1646,8 @@ jobs:
               continue
             fi
             passed=$(sed -n 's/^test result: .* \([0-9][0-9]*\) passed;.*/\1/p' "$log" | head -n 1)
-            if [ "$E2E_JVM_TOOL" = gradle ] && [ "${passed:-0}" = 0 ]; then
-              echo "::error::$suite ran no test in this Gradle leg ($E2E_TEST_FILTER)"
+            if [ "${passed:-0}" = 0 ]; then
+              echo "::error::$suite ran no test in this leg (filter: $E2E_TEST_FILTER). Fix the row's suite or test_filter so it selects the tests it is meant to run."
               status=1
             fi
           done
@@ -1692,8 +1694,71 @@ jobs:
   # and newest release of each tool and every vlt era there); main pushes,
   # v5 landings, the nightly schedule and dispatch run them with the `e2e`
   # steps.
+
+  # The macOS rows of `e2e`: they run on main, the merge queue and
+  # nightly, not on every PR push, so PRs stop queueing on the small
+  # macOS runner pool.
+  e2e-macos:
+    if: github.event_name != 'pull_request'
+    # These jobs consume e2e-build's binaries and can run alongside unit tests.
+    needs: [e2e-build]
+    strategy:
+      fail-fast: false
+      matrix:
+        include:
+          - os: macos-latest
+            suite: e2e_safety_pnpm
+          - os: macos-latest
+            suite: e2e_redirect_npm_build
+            npm_required: '1'
+          - os: macos-latest
+            suite: e2e_redirect_rush_sim
+          - os: macos-latest
+            suite: e2e_redirect_bun_build
+            bun: '1.4.2'
+            test_filter: --include-ignored
+          - os: macos-latest
+            suite: e2e_vendor_bun_build
+            bun: '1.4.2'
+            test_filter: --include-ignored
+          - os: macos-latest
+            suite: mode_migration_bun
+            bun: '1.4.2'
+            test_filter: --include-ignored
+          - {os: macos-latest, suite: e2e_redirect_vlt_build, vlt: '1.2.0', test_filter: --include-ignored vlt_pinned_matrix}
+          - {os: macos-latest, suite: e2e_vendor_vlt_build, vlt: '1.2.0', test_filter: --include-ignored vlt_pinned_matrix}
+          - {os: macos-latest, suite: mode_migration_vlt, vlt: '1.2.0', test_filter: --include-ignored vlt_pinned_matrix}
+          - {os: macos-latest, suite: e2e_safety_vlt, vlt: '1.2.0', test_filter: --include-ignored vlt_pinned_matrix, vlt_store_linker: 'hardlink'}
+          - {os: macos-latest, suite: e2e_vlt, vlt: '1.2.0', test_filter: --include-ignored vlt_pinned_matrix}
+          - {os: macos-latest, suite: e2e_redirect_pnpm_build, test_filter: '--ignored --skip pnpm_pinned_matrix'}
+          - {os: macos-latest, suite: e2e_redirect_uv_build, uv: '0.12.17'}
+          - {os: macos-latest, suite: e2e_vendor_pypi_build, uv: '0.12.17', test_filter: --include-ignored}
+          - {os: macos-latest, suite: e2e_vex_build, test_filter: 'poetry:: --ignored', poetry: '2.4.3'}
+          - {os: macos-latest, suite: e2e_vex_build, test_filter: 'pdm:: --ignored', pdm: '2.29.2'}
+          - {os: macos-latest, suite: e2e_vex_build, test_filter: 'hatch:: --ignored', hatch: '1.18.1'}
+          - {os: macos-latest, suite: e2e_vex_build, test_filter: 'pipenv:: --ignored', pipenv: '2022.12.19 2026.8.0'}
+          - {os: macos-latest, suite: e2e_vex_build, test_filter: 'pip:: --ignored', pip: '22 26'}
+          - {os: macos-latest, suite: e2e_redirect_maven_build, jvm_tool: maven, maven: '3.9.16'}
+          - {os: macos-latest, suite: e2e_vendor_maven_build, jvm_tool: maven, maven: '3.9.16'}
+          - {os: macos-latest, suite: e2e_vendor_jvm_build, jvm_tool: maven, maven: '3.9.16', test_filter: '--ignored maven_reactor'}
+          - {os: macos-latest, suite: e2e_nuget_dotnet_build, dotnet: '8'}
+    runs-on: ${{ matrix.os }}
+    # The real-toolchain capstones loop several releases per leg (pip,
+    # pipenv) or bootstrap a tool from PyPI before the suite (poetry, pdm,
+    # hatch), hence more than the 25 minutes the older legs needed.
+    timeout-minutes: 40
+    # What .cargo/config.toml's [env] gives processes cargo launches; these
+    # legs launch the test binaries themselves.
+    env:
+      SOCKET_NO_CONFIG: '1'
+      SOCKET_NO_UPDATE_CHECK: '1'
+      SOCKET_TELEMETRY_DISABLED: '1'
+    # e2e-full runs these same steps over its rows.
+    steps: *e2e-steps
+
   e2e-full:
-    if: github.event_name != 'pull_request' || github.head_ref == 'release/v5-prerelease'
+    # merge_group runs the pull_request tier: the queue gates on ci-ok.
+    if: (github.event_name != 'pull_request' && github.event_name != 'merge_group') || github.head_ref == 'release/v5-prerelease'
     needs: [test, coverage, e2e-build]
     strategy:
       fail-fast: false
@@ -1736,6 +1801,7 @@ jobs:
     env:
       SOCKET_NO_CONFIG: '1'
       SOCKET_NO_UPDATE_CHECK: '1'
+      SOCKET_TELEMETRY_DISABLED: '1'
     steps: *e2e-steps
 
   # ----------------------------------------------------------------------
@@ -1885,7 +1951,6 @@ jobs:
           - {os: ubuntu-latest, yarn: '4.0.2'}
           - {os: ubuntu-latest, yarn: '4.1.0'}
           - {os: ubuntu-latest, yarn: '4.18.0'}
-          - {os: macos-latest, yarn: '4.12.0'}
           - {os: windows-latest, yarn: '4.12.0'}
     runs-on: ${{ matrix.os }}
     timeout-minutes: 30
@@ -1912,9 +1977,30 @@ jobs:
         run: scripts/yarn-berry-vex-matrix.sh "$YARN_BERRY_RELEASE"
 
   # Skipped on pull_request (except v5 landings), like e2e-full.
+
+  # The macOS rows of `yarn-berry-e2e`: they run on main, the merge queue and
+  # nightly, not on every PR push, so PRs stop queueing on the small
+  # macOS runner pool.
+  yarn-berry-e2e-macos:
+    if: github.event_name != 'pull_request'
+    name: yarn-berry ${{ matrix.yarn }} (${{ matrix.os }})
+    needs: [test, coverage]
+    strategy:
+      fail-fast: false
+      matrix:
+        # 4.0.2 bare-hex checksum writer (4.0.0-4.0.2), 4.1.0 first
+        # `10c0/` writer, current, and 4.12.0 on macOS / Windows. The rest
+        # of the spread (4.6.0, 4.12.0 on ubuntu) is yarn-berry-full.
+        include:
+          - {os: macos-latest, yarn: '4.12.0'}
+    runs-on: ${{ matrix.os }}
+    timeout-minutes: 30
+    steps: *yarn-berry-steps
+
   yarn-berry-full:
     name: yarn-berry ${{ matrix.yarn }} (${{ matrix.os }})
-    if: github.event_name != 'pull_request' || github.head_ref == 'release/v5-prerelease'
+    # merge_group runs the pull_request tier: the queue gates on ci-ok.
+    if: (github.event_name != 'pull_request' && github.event_name != 'merge_group') || github.head_ref == 'release/v5-prerelease'
     needs: [test, coverage]
     strategy:
       fail-fast: false
@@ -1944,6 +2030,7 @@ jobs:
     env:
       SOCKET_NO_CONFIG: '1'
       SOCKET_NO_UPDATE_CHECK: '1'
+      SOCKET_TELEMETRY_DISABLED: '1'
     strategy:
       fail-fast: false
       matrix:
@@ -1953,9 +2040,7 @@ jobs:
           - {os: ubuntu-latest, toolchain: stable, lock: '2'}
           - {os: ubuntu-latest, toolchain: '1.82.0', lock: '3'}
           - {os: ubuntu-latest, toolchain: '1.93.1', lock: '4'}
-          - {os: macos-latest, toolchain: stable, lock: '1'}
           - {os: windows-latest, toolchain: stable, lock: '1'}
-          - {os: macos-latest, toolchain: '1.93.1', lock: ''}
           - {os: windows-latest, toolchain: '1.93.1', lock: ''}
     steps: &cargo-vex-steps
       - name: Checkout
@@ -2004,9 +2089,12 @@ jobs:
           "../../target/e2e-bin/e2e_safety_cargo_build$exe" --ignored || status=1
           exit "$status"
 
-  cargo-vex-matrix-full:
+  # The macOS rows of `cargo-vex-matrix`: they run on main, the merge queue and
+  # nightly, not on every PR push, so PRs stop queueing on the small
+  # macOS runner pool.
+  cargo-vex-matrix-macos:
+    if: github.event_name != 'pull_request'
     name: cargo ${{ matrix.toolchain }} lock-v${{ matrix.lock || 'own' }} (${{ matrix.os }})
-    if: github.event_name != 'pull_request' || github.head_ref == 'release/v5-prerelease'
     needs: [test, coverage, e2e-build]
     runs-on: ${{ matrix.os }}
     timeout-minutes: 40
@@ -2015,6 +2103,28 @@ jobs:
     env:
       SOCKET_NO_CONFIG: '1'
       SOCKET_NO_UPDATE_CHECK: '1'
+      SOCKET_TELEMETRY_DISABLED: '1'
+    strategy:
+      fail-fast: false
+      matrix:
+        include:
+          - {os: macos-latest, toolchain: stable, lock: '1'}
+          - {os: macos-latest, toolchain: '1.93.1', lock: ''}
+    steps: *cargo-vex-steps
+
+  cargo-vex-matrix-full:
+    name: cargo ${{ matrix.toolchain }} lock-v${{ matrix.lock || 'own' }} (${{ matrix.os }})
+    # merge_group runs the pull_request tier: the queue gates on ci-ok.
+    if: (github.event_name != 'pull_request' && github.event_name != 'merge_group') || github.head_ref == 'release/v5-prerelease'
+    needs: [test, coverage, e2e-build]
+    runs-on: ${{ matrix.os }}
+    timeout-minutes: 40
+    # What .cargo/config.toml's [env] gives processes cargo launches; these
+    # legs launch the test binaries themselves.
+    env:
+      SOCKET_NO_CONFIG: '1'
+      SOCKET_NO_UPDATE_CHECK: '1'
+      SOCKET_TELEMETRY_DISABLED: '1'
     strategy:
       fail-fast: false
       matrix:
@@ -2068,7 +2178,8 @@ jobs:
           cargo test -p socket-patch-cli --test e2e_vendor_cargo_build -- old_toolchain --nocapture
 
   # ----------------------------------------------------------------------
-  # Hosted-mode production e2e — REQUIRED status check, with a kill switch.
+  # Hosted-mode production e2e — merge-blocking through `ci-ok`, with a kill
+  # switch.
   #
   # Drives `scan --mode hosted` against the REAL production endpoints
   # (patches-api.socket.dev + patch.socket.dev) and the REAL upstream
@@ -2080,8 +2191,8 @@ jobs:
   # The suite itself is `#[ignore]`-gated, so it stays OUT of the `test` and
   # `e2e` jobs and only runs where it is explicitly asked for — here.
   #
-  # INVARIANTS (this job is registered in branch protection as a required
-  # check named exactly `hosted-e2e`):
+  # INVARIANTS (`ci-ok` needs this job, and older rulesets may still name the
+  # check `hosted-e2e` directly):
   #   * NO job-level `if:` — a *skipped* required check is ambiguous to branch
   #     protection and can wedge a PR at "Expected — waiting for status".
   #     The kill switch gates the STEPS, never the job.
@@ -2100,15 +2211,18 @@ jobs:
   #   hosted_e2e = force (ignore the variable) | skip (bypass this run).
   # ----------------------------------------------------------------------
   hosted-e2e:
-    name: hosted-e2e            # registered in branch protection; do not rename
+    name: hosted-e2e            # may be a required check; do not rename
+    if: github.event.pull_request.draft != true
     runs-on: ubuntu-latest
     permissions:
       contents: read
     timeout-minutes: 30
     concurrency:
       # These are real requests against a real production service — keep it to
-      # one run per ref rather than one per push.
-      group: hosted-e2e-${{ github.ref }}
+      # one run per PR ref rather than one per push. Main pushes group per
+      # commit like the workflow: a group holds ONE pending job, so a shared
+      # main group cancelled queued pushes and ci-ok failed them.
+      group: hosted-e2e-${{ (github.event_name == 'push' && github.sha) || github.ref }}
       cancel-in-progress: ${{ github.event_name == 'pull_request' }}
     env:
       HOSTED_E2E_DISABLED: ${{ vars.HOSTED_E2E_DISABLED }}
@@ -2296,3 +2410,25 @@ jobs:
           done
           echo "::error title=hosted-e2e::the vendored vlt production proof failed on all 3 attempts"
           exit 1
+
+  # The single required status check for the merge queue (and PRs). It needs
+  # every job above, so adding a job here is how it becomes merge-blocking.
+  # Skipped jobs (the nightly `full` tier) pass; failed or cancelled ones fail.
+  ci-ok:
+    name: ci-ok                 # registered as a required check; do not rename
+    if: always()
+    needs: [clippy, node-addon, lint-ecosystems, release-readiness, test, test-release, coverage, docker-base, coverage-docker, coverage-merge, dispatch-tests, e2e-build, e2e, e2e-full, e2e-docker, yarn-classic-matrix, yarn-berry-e2e, yarn-berry-full, cargo-vex-matrix, cargo-vex-matrix-full, cargo-old-toolchains, hosted-e2e, e2e-macos, yarn-berry-e2e-macos, cargo-vex-matrix-macos]
+    runs-on: ubuntu-latest
+    timeout-minutes: 5
+    steps:
+      - name: Check every needed job
+        env:
+          RESULTS: ${{ toJSON(needs) }}
+        run: |
+          echo "$RESULTS" | python3 -c '
+          import json, sys
+          bad = {k: v["result"] for k, v in json.load(sys.stdin).items()
+                 if v["result"] not in ("success", "skipped")}
+          for k, v in sorted(bad.items()):
+              print(f"::error::{k}: {v}")
+          sys.exit(1 if bad else 0)'

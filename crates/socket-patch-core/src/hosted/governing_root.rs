@@ -2,8 +2,9 @@
 //! a workspace member reads the member's directory only, while the package
 //! manager installs from a lock in an ancestor directory. Hosted mode then
 //! either pins nothing and reports success (pnpm, #590; npm, yarn and Bun
-//! `package.json` workspaces, #884) or rewrites the member as a lockless
-//! project and breaks the workspace (cargo, #417).
+//! `package.json` workspaces, #884; vlt `vlt.json` workspaces, #942) or
+//! rewrites the member as a lockless project and breaks the workspace
+//! (cargo, #417).
 //!
 //! [`refusal`] spots these layouts before any takeover or write, so the run
 //! fails closed and names the directory to run from. It also refuses a
@@ -20,7 +21,8 @@
 
 use std::path::{Path, PathBuf};
 
-use crate::constants::npm_family::{NPM_LOCKS, VLT_LOCK};
+use crate::constants::npm_family::VLT_LOCK;
+use crate::formats::governing_locks::{npm_lock_files, NpmLockFamily};
 use crate::patch::redirect::npmrc::npmrc_top_level_value;
 use crate::utils::fs::{read_regular_to_string, read_regular_to_string_sync};
 use crate::utils::pnpm_workspace::governing_workspace_file;
@@ -38,9 +40,9 @@ use super::guidance::{
 /// member) or a configured `lockfile-dir`.
 pub const PNPM_LOCKFILE_ELSEWHERE: &str = "redirect_pnpm_lockfile_elsewhere";
 
-/// Refusal code for an npm, yarn or Bun workspace member: an ancestor
-/// `package.json` lists the project directory in its `workspaces`, and the
-/// workspace's lock lives at that root.
+/// Refusal code for an npm, yarn, Bun or vlt workspace member: an ancestor
+/// `package.json` (or, for vlt, `vlt.json`) lists the project directory in
+/// its `workspaces`, and the workspace's lock lives at that root.
 pub const WORKSPACE_LOCKFILE_ELSEWHERE: &str = "redirect_workspace_lockfile_elsewhere";
 
 /// Refusal code for a pnpm workspace member with its own lock whose
@@ -50,16 +52,12 @@ pub const PNPM_SETTINGS_ELSEWHERE: &str = "redirect_pnpm_settings_elsewhere";
 
 const PNPM_LOCK: &str = "pnpm-lock.yaml";
 const PNPM_WORKSPACE: &str = "pnpm-workspace.yaml";
+const VLT_JSON: &str = "vlt.json";
 
-/// npm-family locks that, present in the project directory, make it its
-/// own lock root: the existing rewriters handle it.
-const OWN_LOCKS: [&str; 5] = [
-    PNPM_LOCK,
-    "shrinkwrap.yaml",
-    "yarn.lock",
-    "bun.lock",
-    "bun.lockb",
-];
+/// Lock names beyond the governing table's root locks that, present in the
+/// project directory, still make it its own lock root: pnpm's pre-v3
+/// `shrinkwrap.yaml`, which the legacy pnpm rewriter reads.
+const EXTRA_OWN_LOCKS: [&str; 1] = ["shrinkwrap.yaml"];
 
 const HOSTED_CARGO_ROOT_HINT: &str =
     "hosted mode pins the crate in the workspace's Cargo.lock and in every member \
@@ -90,7 +88,10 @@ pub async fn refusal(
         let workspace = if has_own_npm_family_lock(root) {
             None
         } else {
-            package_json_workspace_refusal(root).await
+            nearer_root(
+                package_json_workspace_refusal(root).await,
+                vlt_workspace_refusal(root).await,
+            )
         };
         if let Some(lock) = pnpm_lock_elsewhere(root).await {
             let dir = lock.parent().unwrap_or(&lock);
@@ -240,25 +241,20 @@ async fn pnpm_lock_elsewhere(root: &Path) -> Option<PathBuf> {
 /// a lock the rewriters read, or is a Rush repo (Rush keeps its locks under
 /// common/config, read by the rewriter).
 fn has_own_npm_family_lock(root: &Path) -> bool {
-    OWN_LOCKS
-        .iter()
-        .chain(NPM_LOCKS.iter())
-        .chain(std::iter::once(&VLT_LOCK))
+    npm_lock_files()
+        .chain(EXTRA_OWN_LOCKS)
         .any(|name| root.join(name).exists())
         || root.join("rush.json").exists()
 }
 
-/// Locks of the package managers that read `package.json` `workspaces`
-/// (npm, yarn, Bun). pnpm reads only `pnpm-workspace.yaml` and vlt only
-/// `vlt.json`, so their locks at a `workspaces` root govern no member
-/// through that field; the pnpm check owns pnpm workspaces.
-const WORKSPACE_ROOT_LOCKS: [&str; 5] = [
-    "package-lock.json",
-    "npm-shrinkwrap.json",
-    "yarn.lock",
-    "bun.lock",
-    "bun.lockb",
-];
+/// Lock families of the package managers that read `package.json`
+/// `workspaces` (npm, yarn, Bun), in the order a refusal names them. pnpm
+/// reads only `pnpm-workspace.yaml`, so its lock at a `workspaces` root
+/// governs no member through that field; the pnpm check owns pnpm
+/// workspaces. vlt reads `package.json` `workspaces` only as a fallback when
+/// `vlt.json` declares none, which the refusal checks separately.
+const WORKSPACE_ROOT_FAMILIES: [NpmLockFamily; 3] =
+    [NpmLockFamily::Npm, NpmLockFamily::Yarn, NpmLockFamily::Bun];
 
 /// #884: the project directory is a member of an npm, yarn (classic or
 /// berry) or Bun workspace, whose root `package.json` lists it under
@@ -297,11 +293,17 @@ async fn package_json_workspace_refusal(root: &Path) -> Option<(PathBuf, Refusal
         if !workspaces_include(&patterns, &rel) {
             continue;
         }
-        let locks: Vec<&str> = WORKSPACE_ROOT_LOCKS
+        let mut locks: Vec<&str> = WORKSPACE_ROOT_FAMILIES
             .iter()
-            .copied()
+            .flat_map(|family| family.files().iter().copied())
             .filter(|name| ancestor.join(name).is_file())
             .collect();
+        // vlt falls back to `package.json` `workspaces` when the root's
+        // `vlt.json` declares none (Bugbot on #1073), so its lock there
+        // governs the member too.
+        if ancestor.join(VLT_LOCK).is_file() && !vlt_json_declares_workspaces(ancestor).await {
+            locks.push(VLT_LOCK);
+        }
         if locks.is_empty() {
             // Rush keeps its locks under common/config: the rewriters own
             // a run from the Rush root.
@@ -333,6 +335,108 @@ async fn package_json_workspace_refusal(root: &Path) -> Option<(PathBuf, Refusal
     None
 }
 
+/// #942: the project directory is a member of a vlt workspace, whose
+/// root `vlt.json` lists it under `workspaces` and holds `vlt-lock.json`.
+/// vlt reads workspaces only from `vlt.json` and keeps one lock at that
+/// root, so a hosted run here would find the member's copy, pin nothing
+/// and report success. The nearest ancestor `vlt.json` whose patterns
+/// match is the root; one without a lock (never installed) refuses
+/// nothing.
+async fn vlt_workspace_refusal(root: &Path) -> Option<(PathBuf, Refusal)> {
+    let canonical = tokio::fs::canonicalize(root)
+        .await
+        .unwrap_or_else(|_| root.to_path_buf());
+    for ancestor in canonical.ancestors().skip(1) {
+        let Ok(text) = read_regular_to_string(&ancestor.join(VLT_JSON)).await else {
+            continue;
+        };
+        let Some(patterns) = vlt_workspace_patterns(&text) else {
+            continue;
+        };
+        let Ok(rel) = canonical.strip_prefix(ancestor) else {
+            continue;
+        };
+        let rel: Vec<String> = rel
+            .components()
+            .map(|c| c.as_os_str().to_string_lossy().into_owned())
+            .collect();
+        if !workspaces_include(&patterns, &rel) {
+            continue;
+        }
+        let lock = ancestor.join(VLT_LOCK);
+        if !lock.is_file() {
+            return None;
+        }
+        let refusal = Refusal {
+            code: WORKSPACE_LOCKFILE_ELSEWHERE.to_string(),
+            message: format!(
+                "{} is a workspace member with no lockfile of its own: the workspace \
+                 root {} lists it under \"workspaces\" in {} and installs it from {}, \
+                 which a hosted run here cannot see; run socket-patch from {} (the \
+                 workspace root); nothing was written",
+                root.display(),
+                ancestor.display(),
+                ancestor.join(VLT_JSON).display(),
+                lock.display(),
+                ancestor.display()
+            ),
+        };
+        return Some((ancestor.to_path_buf(), refusal));
+    }
+    None
+}
+
+/// Whether `<dir>/vlt.json` has a `workspaces` field. vlt keys its
+/// precedence on the field: with it, `package.json` `workspaces` is
+/// ignored; without it (or without the file), vlt reads `package.json`.
+/// An unreadable or unparseable file counts as declaring none.
+async fn vlt_json_declares_workspaces(dir: &Path) -> bool {
+    read_regular_to_string(&dir.join(VLT_JSON))
+        .await
+        .ok()
+        .and_then(|text| vlt_workspace_patterns(&text))
+        .is_some()
+}
+
+/// The refusal of the nearer (deeper) of two governing roots.
+fn nearer_root(
+    a: Option<(PathBuf, Refusal)>,
+    b: Option<(PathBuf, Refusal)>,
+) -> Option<(PathBuf, Refusal)> {
+    match (a, b) {
+        (Some(a), Some(b)) => Some(if b.0.starts_with(&a.0) && b.0 != a.0 {
+            b
+        } else {
+            a
+        }),
+        (a, b) => a.or(b),
+    }
+}
+
+/// The `workspaces` patterns of a `vlt.json`: a string, an array, or an
+/// object of named groups whose values are a string or an array. `None`
+/// when the field is absent or the file does not parse.
+fn vlt_workspace_patterns(vlt_json: &str) -> Option<Vec<String>> {
+    fn strings(value: &serde_json::Value, out: &mut Vec<String>) {
+        match value {
+            serde_json::Value::String(s) => out.push(s.clone()),
+            serde_json::Value::Array(list) => {
+                out.extend(list.iter().filter_map(|v| v.as_str()).map(str::to_string))
+            }
+            _ => {}
+        }
+    }
+    let text = vlt_json.strip_prefix('\u{feff}').unwrap_or(vlt_json);
+    let doc: serde_json::Value = serde_json::from_str(text).ok()?;
+    let field = doc.get("workspaces")?;
+    let mut out = Vec::new();
+    match field {
+        serde_json::Value::Object(groups) => groups.values().for_each(|v| strings(v, &mut out)),
+        other => strings(other, &mut out),
+    }
+    Some(out)
+}
+
 /// The `workspaces` patterns of a `package.json`: the array form (npm,
 /// yarn, Bun) or the object form's `packages` array (yarn classic's
 /// `nohoist` shape, Bun's catalogs shape). `None` when the field is absent
@@ -358,52 +462,234 @@ fn workspace_patterns(package_json: &str) -> Option<Vec<String>> {
 
 /// Whether the member path (`rel`, relative to the workspace root, one
 /// entry per component) matches a `workspaces` pattern and no later
-/// `!`-negated one. A pattern is a `/`-separated glob: `*` and `?` match
-/// within one component, `**` matches any number of components.
+/// `!`-negated one. A pattern is a `/`-separated glob in the grammar npm
+/// (minimatch), yarn and Bun share: brace sets (`{a,b}`, nested, and
+/// `{1..3}` / `{a..c}` sequences) expand first, then `*`, `?` and
+/// character classes (`[abc]`, `[a-c]`, `[!a]`, `[^a]`) match within one
+/// component and `**` matches any number of components (#1071).
 fn workspaces_include(patterns: &[String], rel: &[String]) -> bool {
     if rel.is_empty() {
         return false;
     }
+    let rel: Vec<Vec<char>> = rel.iter().map(|c| c.chars().collect()).collect();
     let mut included = false;
     for pattern in patterns {
         let (negated, pattern) = match pattern.strip_prefix('!') {
             Some(rest) => (true, rest),
             None => (false, pattern.as_str()),
         };
-        let segments: Vec<&str> = pattern
-            .trim()
-            .split(['/', '\\'])
-            .filter(|s| !s.is_empty() && *s != ".")
-            .collect();
-        if segments.is_empty() {
-            continue;
-        }
-        if path_glob_matches(&segments, rel) {
+        let matched = expand_braces(pattern.trim()).iter().any(|alternative| {
+            let segments: Vec<Vec<char>> = alternative
+                .split(['/', '\\'])
+                .filter(|s| !s.is_empty() && *s != ".")
+                .map(|s| s.chars().collect())
+                .collect();
+            !segments.is_empty() && path_glob_matches(&segments, &rel)
+        });
+        if matched {
             included = !negated;
         }
     }
     included
 }
 
-fn path_glob_matches(pattern: &[&str], path: &[String]) -> bool {
+/// Cap on the alternatives one pattern expands to, so a pathological
+/// sequence (`{1..1000000}`) cannot stall the run.
+const MAX_BRACE_EXPANSIONS: usize = 4096;
+
+/// The brace expansion of a glob, as minimatch's `brace-expansion` does it:
+/// the first `{...}` group holding a top-level `,` or a `x..y[..step]`
+/// sequence is replaced by each alternative, recursively. A group with
+/// neither, and an unbalanced `{`, stay literal.
+fn expand_braces(pattern: &str) -> Vec<String> {
+    let mut out = Vec::new();
+    expand_braces_into(pattern, &mut out);
+    out
+}
+
+fn expand_braces_into(pattern: &str, out: &mut Vec<String>) {
+    if out.len() >= MAX_BRACE_EXPANSIONS {
+        return;
+    }
+    for (open, _) in pattern.match_indices('{') {
+        let Some(close) = matching_brace(pattern, open) else {
+            continue;
+        };
+        let body = &pattern[open + 1..close];
+        let alternatives = split_top_level_commas(body);
+        let alternatives = if alternatives.len() > 1 {
+            alternatives
+        } else if let Some(sequence) = brace_sequence(body) {
+            sequence
+        } else {
+            continue;
+        };
+        let (prefix, suffix) = (&pattern[..open], &pattern[close + 1..]);
+        for alternative in alternatives {
+            expand_braces_into(&format!("{prefix}{alternative}{suffix}"), out);
+            if out.len() >= MAX_BRACE_EXPANSIONS {
+                return;
+            }
+        }
+        return;
+    }
+    out.push(pattern.to_string());
+}
+
+/// The byte index of the `}` closing the `{` at `open`.
+fn matching_brace(pattern: &str, open: usize) -> Option<usize> {
+    let mut depth = 0usize;
+    for (i, c) in pattern[open..].char_indices() {
+        match c {
+            '{' => depth += 1,
+            '}' => {
+                depth -= 1;
+                if depth == 0 {
+                    return Some(open + i);
+                }
+            }
+            _ => {}
+        }
+    }
+    None
+}
+
+fn split_top_level_commas(body: &str) -> Vec<String> {
+    let mut parts = Vec::new();
+    let (mut depth, mut start) = (0usize, 0usize);
+    for (i, c) in body.char_indices() {
+        match c {
+            '{' => depth += 1,
+            '}' => depth = depth.saturating_sub(1),
+            ',' if depth == 0 => {
+                parts.push(body[start..i].to_string());
+                start = i + 1;
+            }
+            _ => {}
+        }
+    }
+    parts.push(body[start..].to_string());
+    parts
+}
+
+/// A `{x..y}` or `{x..y..step}` sequence body: integers (zero-padded when
+/// either end is) or single characters.
+fn brace_sequence(body: &str) -> Option<Vec<String>> {
+    let parts: Vec<&str> = body.split("..").collect();
+    let (from, to, step) = match parts.as_slice() {
+        [from, to] => (*from, *to, None),
+        [from, to, step] => (*from, *to, Some(*step)),
+        _ => return None,
+    };
+    let step = match step {
+        Some(step) => step.parse::<i64>().ok()?.unsigned_abs().max(1),
+        None => 1,
+    };
+    let (start, end, width, as_char) =
+        if let (Ok(a), Ok(b)) = (from.parse::<i64>(), to.parse::<i64>()) {
+            let padded = |s: &str| {
+                s.trim_start_matches('-').len() > 1 && s.trim_start_matches('-').starts_with('0')
+            };
+            let width = if padded(from) || padded(to) {
+                from.len().max(to.len())
+            } else {
+                0
+            };
+            (a, b, width, false)
+        } else {
+            let (mut a, mut b) = (from.chars(), to.chars());
+            let (Some(a), None, Some(b), None) = (a.next(), a.next(), b.next(), b.next()) else {
+                return None;
+            };
+            (a as i64, b as i64, 0, true)
+        };
+    let mut out = Vec::new();
+    let mut n = start;
+    loop {
+        out.push(if as_char {
+            char::from_u32(u32::try_from(n).ok()?)?.to_string()
+        } else {
+            format!("{n:0width$}")
+        });
+        if n == end || out.len() >= MAX_BRACE_EXPANSIONS {
+            break;
+        }
+        let next = if start <= end {
+            n.checked_add(step as i64)?
+        } else {
+            n.checked_sub(step as i64)?
+        };
+        if (start <= end && next > end) || (start > end && next < end) {
+            break;
+        }
+        n = next;
+    }
+    Some(out)
+}
+
+fn path_glob_matches(pattern: &[Vec<char>], path: &[Vec<char>]) -> bool {
     match pattern.split_first() {
         None => path.is_empty(),
-        Some((&"**", rest)) => (0..=path.len()).any(|skip| path_glob_matches(rest, &path[skip..])),
+        Some((first, rest)) if first.as_slice() == ['*', '*'] => {
+            (0..=path.len()).any(|skip| path_glob_matches(rest, &path[skip..]))
+        }
         Some((first, rest)) => path.split_first().is_some_and(|(head, tail)| {
-            segment_glob_matches(first.as_bytes(), head.as_bytes()) && path_glob_matches(rest, tail)
+            segment_glob_matches(first, head) && path_glob_matches(rest, tail)
         }),
     }
 }
 
-fn segment_glob_matches(pattern: &[u8], name: &[u8]) -> bool {
+fn segment_glob_matches(pattern: &[char], name: &[char]) -> bool {
     match pattern.split_first() {
         None => name.is_empty(),
-        Some((b'*', rest)) => {
-            (0..=name.len()).any(|skip| segment_glob_matches(rest, &name[skip..]))
-        }
-        Some((b'?', rest)) => !name.is_empty() && segment_glob_matches(rest, &name[1..]),
+        Some(('*', rest)) => (0..=name.len()).any(|skip| segment_glob_matches(rest, &name[skip..])),
+        Some(('?', rest)) => !name.is_empty() && segment_glob_matches(rest, &name[1..]),
+        Some(('[', rest)) => match char_class(rest) {
+            Some((class, after)) => name
+                .split_first()
+                .is_some_and(|(c, tail)| class.matches(*c) && segment_glob_matches(after, tail)),
+            None => name.first() == Some(&'[') && segment_glob_matches(rest, &name[1..]),
+        },
         Some((c, rest)) => name.first() == Some(c) && segment_glob_matches(rest, &name[1..]),
     }
+}
+
+/// A parsed `[...]` character class.
+struct CharClass {
+    negated: bool,
+    ranges: Vec<(char, char)>,
+}
+
+impl CharClass {
+    fn matches(&self, c: char) -> bool {
+        self.ranges.iter().any(|&(lo, hi)| lo <= c && c <= hi) != self.negated
+    }
+}
+
+/// The class after a `[`, and the pattern after its closing `]`. A `!` or
+/// `^` first negates it; a `]` right after that is a member. `None` when
+/// the class never closes (the `[` is then literal).
+fn char_class(pattern: &[char]) -> Option<(CharClass, &[char])> {
+    let (negated, mut i) = match pattern.first() {
+        Some('!' | '^') => (true, 1),
+        _ => (false, 0),
+    };
+    let mut ranges = Vec::new();
+    let first = i;
+    while i < pattern.len() {
+        let c = pattern[i];
+        if c == ']' && i > first {
+            return Some((CharClass { negated, ranges }, &pattern[i + 1..]));
+        }
+        if pattern.get(i + 1) == Some(&'-') && pattern.get(i + 2).is_some_and(|&h| h != ']') {
+            ranges.push((c, pattern[i + 2]));
+            i += 3;
+        } else {
+            ranges.push((c, c));
+            i += 1;
+        }
+    }
+    None
 }
 
 async fn npmrc_lockfile_dir(root: &Path) -> Option<String> {
@@ -427,24 +713,24 @@ async fn lock_elsewhere(project: &Path, base: &Path, dir: &str) -> Option<PathBu
 }
 
 /// The top-level `lockfileDir:` scalar of a `pnpm-workspace.yaml`, read
-/// line-wise (a block key at column 0, bare or quoted, an optional quoted
-/// value, an optional trailing comment). A leading UTF-8 BOM is skipped,
-/// and the last assignment wins, as in the `.npmrc` reader.
+/// through the workspace splices' own key grammar
+/// ([`top_level_key`](crate::formats::pnpm::workspace::top_level_key):
+/// every key spelling, a trailing comment, a leading UTF-8 BOM). The last
+/// assignment wins, as in the `.npmrc` reader.
 fn workspace_lockfile_dir(yaml: &str) -> Option<String> {
-    let yaml = yaml.strip_prefix('\u{feff}').unwrap_or(yaml);
-    // The last assignment wins: scan from the end.
-    yaml.lines().rev().find_map(|line| {
-        let rest = ["lockfileDir", "\"lockfileDir\"", "'lockfileDir'"]
-            .iter()
-            .find_map(|key| line.strip_prefix(key))?
-            .trim_start();
-        let value = rest.strip_prefix(':')?.trim();
-        let value = match value.chars().next() {
-            Some(q @ ('"' | '\'')) => value[1..].split(q).next().unwrap_or(""),
-            _ => value.split(" #").next().unwrap_or("").trim(),
-        };
-        (!value.is_empty()).then(|| value.to_string())
-    })
+    yaml.lines()
+        .filter_map(crate::formats::pnpm::workspace::top_level_key)
+        .rfind(|(key, _)| key == "lockfileDir")
+        .map(|(_, value)| unquote_scalar(value).to_string())
+        .filter(|value| !value.is_empty())
+}
+
+/// A YAML scalar value without its surrounding quotes.
+fn unquote_scalar(value: &str) -> &str {
+    match value.as_bytes() {
+        [q @ (b'"' | b'\''), .., last] if last == q => &value[1..value.len() - 1],
+        _ => value,
+    }
 }
 
 #[cfg(test)]
@@ -1026,6 +1312,197 @@ mod tests {
         assert!(!workspaces_include(&pats(&["*"]), &[]));
     }
 
+    /// #1071: npm (minimatch), yarn and Bun expand brace sets and match
+    /// character classes in `workspaces`.
+    #[test]
+    fn workspaces_patterns_expand_braces_and_match_classes() {
+        let rel = |p: &str| p.split('/').map(str::to_string).collect::<Vec<_>>();
+        let pats = |p: &[&str]| p.iter().map(|s| s.to_string()).collect::<Vec<_>>();
+        let yes = |p: &str, r: &str| assert!(workspaces_include(&pats(&[p]), &rel(r)), "{p} ~ {r}");
+        let no =
+            |p: &str, r: &str| assert!(!workspaces_include(&pats(&[p]), &rel(r)), "{p} !~ {r}");
+        // Brace sets, nested, spanning separators, and sequences.
+        yes("packages/{a,b}", "packages/a");
+        yes("packages/{a,b}", "packages/b");
+        no("packages/{a,b}", "packages/c");
+        yes("{apps,packages}/*", "apps/web");
+        yes("packages/{a,{b,c}x}", "packages/cx");
+        no("packages/{a,{b,c}x}", "packages/c");
+        yes("{packages/a,tools/*}", "tools/t");
+        yes("packages/pkg-{1..3}", "packages/pkg-2");
+        no("packages/pkg-{1..3}", "packages/pkg-4");
+        yes("packages/{a..c}", "packages/b");
+        yes("packages/v{01..10}", "packages/v07");
+        yes("packages/{,x}a", "packages/a");
+        // A brace group with no comma or range is literal, as in minimatch.
+        yes("packages/{a}", "packages/{a}");
+        no("packages/{a}", "packages/a");
+        yes("packages/{a,b", "packages/{a,b");
+        // Character classes: sets, ranges, negation, a literal `]` first.
+        yes("packages/[a-c]", "packages/b");
+        no("packages/[a-c]", "packages/d");
+        yes("packages/[ab]x", "packages/bx");
+        yes("packages/[!b]", "packages/a");
+        no("packages/[!b]", "packages/b");
+        yes("packages/[^b]", "packages/c");
+        yes("packages/[]a]", "packages/]");
+        yes("packages/[a-c]*", "packages/core");
+        // An unclosed class is a literal `[`.
+        yes("packages/[a", "packages/[a");
+        no("packages/[a", "packages/a");
+        // Non-ASCII names match one character per `?` and class.
+        yes("packages/?", "packages/é");
+        yes("packages/[é]", "packages/é");
+        // Negation applies to the expanded alternatives too.
+        assert!(!workspaces_include(
+            &pats(&["packages/*", "!packages/{b,c}"]),
+            &rel("packages/b")
+        ));
+    }
+
+    /// #942: vlt's `workspaces` in `vlt.json` is a string, an array or an
+    /// object of named groups, each a string or an array.
+    #[test]
+    fn vlt_workspace_patterns_read_every_shape() {
+        assert_eq!(
+            vlt_workspace_patterns(r#"{"workspaces":"packages/*"}"#),
+            Some(vec!["packages/*".to_string()])
+        );
+        assert_eq!(
+            vlt_workspace_patterns("\u{feff}{\"workspaces\":[\"a/*\",\"b\"]}"),
+            Some(vec!["a/*".to_string(), "b".to_string()])
+        );
+        assert_eq!(
+            vlt_workspace_patterns(r#"{"workspaces":{"apps":"apps/*","libs":["libs/*","x"]}}"#),
+            Some(vec![
+                "apps/*".to_string(),
+                "libs/*".to_string(),
+                "x".to_string()
+            ])
+        );
+        assert_eq!(vlt_workspace_patterns(r#"{"registries":{}}"#), None);
+        assert_eq!(vlt_workspace_patterns("not json"), None);
+    }
+
+    /// #942: a vlt workspace member has no lock; the root's `vlt-lock.json`
+    /// governs it. The root, a directory the root does not list and a
+    /// never-installed root refuse nothing.
+    #[tokio::test]
+    async fn vlt_workspace_member_is_refused() {
+        let tmp = tempfile::tempdir().unwrap();
+        write(tmp.path(), "package.json", r#"{"private":true}"#);
+        write(
+            tmp.path(),
+            "vlt.json",
+            r#"{"workspaces":{"apps":"apps/*","libs":["packages/{a,b}"]}}"#,
+        );
+        write(tmp.path(), "packages/a/package.json", "{}");
+        write(tmp.path(), "packages/c/package.json", "{}");
+        write(tmp.path(), "apps/web/package.json", "{}");
+        let member = tmp.path().join("packages/a");
+        // Never installed: no lock anywhere, nothing to refuse.
+        assert_eq!(code(&member, "npm").await, None);
+
+        write(tmp.path(), VLT_LOCK, "{}");
+        let refusal = refusal(&ProjectView::Disk(&member), &[candidate("npm")], true)
+            .await
+            .expect("a vlt workspace member must be refused");
+        assert_eq!(refusal.code, WORKSPACE_LOCKFILE_ELSEWHERE);
+        assert!(
+            refusal.message.contains(VLT_LOCK)
+                && refusal.message.contains("vlt.json")
+                && refusal.message.contains("nothing was written"),
+            "{}",
+            refusal.message
+        );
+        assert_eq!(
+            code(&tmp.path().join("apps/web"), "npm").await.as_deref(),
+            Some(WORKSPACE_LOCKFILE_ELSEWHERE)
+        );
+        assert_eq!(code(&tmp.path().join("packages/c"), "npm").await, None);
+        assert_eq!(code(tmp.path(), "npm").await, None);
+        assert_eq!(code(&member, "pypi").await, None);
+
+        // A member with its own lock is its own root.
+        write(tmp.path(), "packages/a/vlt-lock.json", "{}");
+        assert_eq!(code(&member, "npm").await, None);
+    }
+
+    /// Bugbot on #1073: vlt falls back to `package.json` `workspaces` when
+    /// the root's `vlt.json` has no `workspaces` field, so its
+    /// `vlt-lock.json` there governs the member. With the field present,
+    /// vlt ignores `package.json` `workspaces`, and a `package-lock.json`
+    /// at a `vlt.json` root governs nothing through `vlt.json` (npm reads
+    /// only `package.json`).
+    #[tokio::test]
+    async fn vlt_reads_package_json_workspaces_only_without_vlt_json_ones() {
+        for vlt_json in [None, Some(r#"{"registries":{}}"#)] {
+            let tmp = tempfile::tempdir().unwrap();
+            write(
+                tmp.path(),
+                "package.json",
+                r#"{"private":true,"workspaces":["packages/{a,b}"]}"#,
+            );
+            if let Some(text) = vlt_json {
+                write(tmp.path(), VLT_JSON, text);
+            }
+            write(tmp.path(), VLT_LOCK, "{}");
+            write(tmp.path(), "packages/a/package.json", "{}");
+            let refusal = refusal(
+                &ProjectView::Disk(&tmp.path().join("packages/a")),
+                &[candidate("npm")],
+                true,
+            )
+            .await
+            .unwrap_or_else(|| panic!("{vlt_json:?}: member must be refused"));
+            assert_eq!(refusal.code, WORKSPACE_LOCKFILE_ELSEWHERE);
+            assert!(refusal.message.contains(VLT_LOCK), "{}", refusal.message);
+        }
+
+        // vlt.json's own `workspaces` field wins and does not list the member.
+        let tmp = tempfile::tempdir().unwrap();
+        write(
+            tmp.path(),
+            "package.json",
+            r#"{"private":true,"workspaces":["packages/*"]}"#,
+        );
+        write(tmp.path(), VLT_JSON, r#"{"workspaces":"tools/*"}"#);
+        write(tmp.path(), VLT_LOCK, "{}");
+        write(tmp.path(), "packages/a/package.json", "{}");
+        assert_eq!(code(&tmp.path().join("packages/a"), "npm").await, None);
+
+        let tmp = tempfile::tempdir().unwrap();
+        write(tmp.path(), "package.json", r#"{"private":true}"#);
+        write(tmp.path(), VLT_JSON, r#"{"workspaces":"packages/*"}"#);
+        write(tmp.path(), "package-lock.json", "{}");
+        write(tmp.path(), "packages/a/package.json", "{}");
+        assert_eq!(code(&tmp.path().join("packages/a"), "npm").await, None);
+    }
+
+    /// The nearer of a `vlt.json` root and a `package.json` root governs.
+    #[tokio::test]
+    async fn nearer_of_vlt_and_package_json_roots_is_named() {
+        let tmp = tempfile::tempdir().unwrap();
+        write(
+            tmp.path(),
+            "package.json",
+            r#"{"private":true,"workspaces":["apps/**"]}"#,
+        );
+        write(tmp.path(), "package-lock.json", "{}");
+        write(tmp.path(), "apps/vlt.json", r#"{"workspaces":["web"]}"#);
+        write(tmp.path(), "apps/package.json", "{}");
+        write(tmp.path(), "apps/vlt-lock.json", "{}");
+        write(tmp.path(), "apps/web/package.json", "{}");
+        let refusal = refusal(
+            &ProjectView::Disk(&tmp.path().join("apps/web")),
+            &[candidate("npm")],
+            true,
+        )
+        .await
+        .expect("refused");
+        assert!(refusal.message.contains(VLT_LOCK), "{}", refusal.message);
+    }
+
     #[test]
     fn workspace_patterns_reads_both_field_shapes() {
         assert_eq!(
@@ -1101,5 +1578,13 @@ mod tests {
             workspace_lockfile_dir("lockfileDir: ../a\nlockfileDir: ../b\n").as_deref(),
             Some("../b")
         );
+        // #905: read through the shared `top_level_key` grammar, so every
+        // spelling the workspace splices accept is read here too.
+        assert_eq!(
+            workspace_lockfile_dir("lockfileDir : ../x # shared lock\n").as_deref(),
+            Some("../x")
+        );
+        assert_eq!(workspace_lockfile_dir("lockfileDir: \"\"\n"), None);
+        assert_eq!(workspace_lockfile_dir("# lockfileDir: ..\n"), None);
     }
 }
