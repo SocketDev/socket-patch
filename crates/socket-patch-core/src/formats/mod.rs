@@ -29,6 +29,7 @@
 pub(crate) mod bun;
 pub mod cargo;
 pub mod composer;
+pub mod governing_locks;
 pub mod gem;
 pub(crate) mod maven;
 pub(crate) mod nuget;

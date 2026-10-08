@@ -20,7 +20,7 @@
 //! A block `name@range[, name@range2]:` with `version "X"` and
 //! `resolved "<spec>"`. The package is the REAL name of the key patterns
 //! (`alias@npm:real@range` names `real` —
-//! [`crate::vendor::yarn_classic_lock::pattern_real_name`]); every pattern
+//! [`crate::formats::yarn::patterns::pattern_real_name`]); every pattern
 //! must agree, otherwise a Socket-wired block is diagnosed (the rewriters
 //! refuse mixed keys). `link:` keys are skipped: yarn installs them from the
 //! working tree, never from `resolved`.
@@ -89,16 +89,18 @@ use super::{
     DiscoverCtx, Discovery, LocateOpts, PatchedRef, VendorRef, Wired, DIAG_LOCKFILE_UNPARSEABLE,
     DIAG_REF_INVALID, DIAG_REF_UNATTRIBUTABLE,
 };
-use crate::patch::redirect::is_berry_lock;
+use crate::formats::yarn::blocks::{berry_field, classic_field};
+use crate::formats::yarn::patterns::{
+    classic_key_real_name, pattern_real_name, resolution_selector_target, split_resolved_sha1,
+    BerryLocator,
+};
+use crate::formats::yarn::source::{classic_copy_source, CopySource};
+use crate::formats::yarn::is_berry_lock;
 use crate::utils::digest::is_sri_pin;
 use crate::vendor::lock_inventory::yarn::{
     berry_checksum_pin, berry_entries, classic_entries, BerryLock, YarnEntry,
 };
 use crate::vendor::lock_inventory::LockIntegrity;
-use crate::vendor::yarn_berry_lock::{berry_field, resolution_selector_target, BerryLocator};
-use crate::vendor::yarn_classic_lock::{
-    classic_block_source, classic_field, pattern_real_name, split_resolved_sha1, ClassicBlockSource,
-};
 
 const YARN_LOCK: &str = "yarn.lock";
 const PACKAGE_JSON: &str = "package.json";
@@ -147,16 +149,11 @@ fn extract_classic(ctx: &DiscoverCtx<'_>, entries: Vec<YarnEntry>, out: &mut Dis
 
 /// The purl a block stands for when every key pattern names one package.
 fn classic_block_purl(entry: &YarnEntry) -> Option<String> {
-    let patterns = &entry.patterns;
     match (
-        patterns.first().and_then(|p| pattern_real_name(p)),
+        classic_key_real_name(&entry.patterns),
         classic_field(&entry.block.lines, "version"),
     ) {
-        (Some(name), Some(version))
-            if patterns.iter().all(|p| pattern_real_name(p) == Some(name)) =>
-        {
-            npm_purl(name, version)
-        }
+        (Some(name), Some(version)) => npm_purl(name, version),
         _ => None,
     }
 }
@@ -173,10 +170,10 @@ fn classic_block(ctx: &DiscoverCtx<'_>, entry: &YarnEntry, out: &mut Discovery) 
         block, patterns, ..
     } = entry;
     let resolved = classic_field(&block.lines, "resolved");
-    match classic_block_source(patterns, resolved) {
+    match classic_copy_source(patterns, resolved) {
         // yarn 1 fetches a git pattern with git, from `resolved` (#363): the
         // copy is the git bytes, whatever `resolved` names.
-        ClassicBlockSource::Git => {
+        CopySource::Git => {
             // A Socket wiring here (an older release rewired it) is inert.
             if resolved.is_some_and(|r| classify(ctx, r, YARN_LOCK, &block.key, out).is_some()) {
                 out.diag(
@@ -200,7 +197,7 @@ fn classic_block(ctx: &DiscoverCtx<'_>, entry: &YarnEntry, out: &mut Discovery) 
         }
         // yarn 1 copies a `file:` directory into node_modules (#921): that
         // copy is the directory's bytes, and no `resolved` there is fetched.
-        ClassicBlockSource::Directory => {
+        CopySource::Directory => {
             out.unpatched_copy(
                 YARN_LOCK,
                 classic_block_purl(entry),
@@ -211,8 +208,10 @@ fn classic_block(ctx: &DiscoverCtx<'_>, entry: &YarnEntry, out: &mut Discovery) 
             return;
         }
         // `link:` ranges install from the working tree; `resolved` is inert.
-        ClassicBlockSource::Link | ClassicBlockSource::Unresolved => return,
-        ClassicBlockSource::Tarball => {}
+        CopySource::Link | CopySource::Unresolved => return,
+        // A hosted pin an older release wrote on a remote tarball copy
+        // replaced it with the registry artifact, so that copy IS Socket's.
+        CopySource::Registry | CopySource::RemoteTarball => {}
     }
     let Some(resolved) = resolved else {
         return;

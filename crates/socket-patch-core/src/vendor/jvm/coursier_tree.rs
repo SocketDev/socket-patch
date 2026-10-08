@@ -46,10 +46,6 @@ pub const CAPTURED_FILES: &[&str] = &[
     super::sbt::TREE_GITIGNORE_REL,
 ];
 
-/// Paths whose presence without a vendor ledger means JVM artifacts were
-/// orphaned (`vendor --check`'s `vendor_ledger_missing`).
-pub const ORPHAN_PATHS: &[&str] = &[TREE_ROOT, INDEX_REL];
-
 /// The patch's tree directory (same GAV).
 pub fn tree_dir(c: &Coords<'_>) -> String {
     format!(

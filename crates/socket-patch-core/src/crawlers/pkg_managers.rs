@@ -183,7 +183,7 @@ impl YarnEnv {
         Self {
             node_linker: set("YARN_NODE_LINKER"),
             rc_filename: set("YARN_RC_FILENAME").unwrap_or_else(|| ".yarnrc.yml".to_string()),
-            home: Some(crate::utils::fs::home_dir()),
+            home: crate::utils::fs::home_dir(),
         }
     }
 
@@ -307,10 +307,16 @@ pub fn live_pnp_marker_with(
 /// (`crate::vendor::npm_flavor::detect_npm_lock_flavor`) so both
 /// detection sites agree on what counts as a pnpm-PnP tree.
 pub(crate) fn pnpm_pnp_layout(project_root: &Path) -> bool {
-    let node_modules = project_root.join("node_modules");
-    (node_modules.join(".modules.yaml").is_file() || node_modules.join(".pnpm").is_dir())
-        && project_root.join("pnpm-lock.yaml").is_file()
-        && !project_root.join("yarn.lock").is_file()
+    pnpm_pnp_layout_in(&crate::vendor::lock_inventory::ProjectView::Disk(
+        project_root,
+    ))
+}
+
+/// [`pnpm_pnp_layout`] over a [`crate::vendor::lock_inventory::ProjectView`].
+pub(crate) fn pnpm_pnp_layout_in(view: &crate::vendor::lock_inventory::ProjectView<'_>) -> bool {
+    (view.is_file("node_modules/.modules.yaml") || view.is_dir("node_modules/.pnpm"))
+        && view.is_file("pnpm-lock.yaml")
+        && !view.is_file("yarn.lock")
 }
 
 /// The yarn Plug'n'Play loader of a project: the text of each loader file

@@ -19,12 +19,12 @@ use crate::api::ranking::max_severity_order;
 use crate::api::types::PatchSearchResult;
 use crate::crawlers::python_crawler::canonicalize_pypi_name;
 use crate::crawlers::Ecosystem;
-use crate::utils::purl::{normalize_purl, strip_purl_qualifiers};
+use crate::utils::purl_key::PurlKey;
 
 use self::paths::{PathHit, PathMatcher};
 use self::socket_yml::{parse_file, ParsedFile, PatchesBlock};
 
-pub use self::report::{canon, policy_block, FilteredEntry, RetainedEntry};
+pub use self::report::{policy_block, FilteredEntry, RetainedEntry};
 pub use self::socket_yml::MAX_FILE_BYTES;
 
 /// Root file names, in the order they are read.
@@ -746,17 +746,16 @@ pub struct Offers {
 /// form, so `typing_extensions` and `typing.extensions` name the project
 /// whose purl is `pkg:pypi/typing-extensions`.
 pub fn package_spec_matches(spec: &str, purl: &str) -> bool {
-    // Versioned Composer specs name a release, including its pretty/padded
-    // spellings. Compare before lowercasing: dev branch names retain case.
-    if crate::utils::composer_version::composer_purl_identity(spec.trim()).is_some() {
-        return crate::utils::composer_version::composer_purls_equivalent(spec.trim(), purl);
-    }
-    let decoded = canonical_pypi_purl(normalize_purl(strip_purl_qualifiers(purl)).to_lowercase());
-    let spec = spec.trim().to_lowercase();
+    let spec = spec.trim();
     if spec.is_empty() {
         return false;
     }
-    let Some(rest) = decoded.strip_prefix("pkg:") else {
+    let key = PurlKey::new(purl);
+    // A filter spec is matched leniently: the package's identity
+    // (decoded, PyPI/NuGet/Composer names folded), then compared
+    // case-insensitively.
+    let folded = key.as_str().to_lowercase();
+    let Some(rest) = folded.strip_prefix("pkg:") else {
         return false;
     };
     let Some((eco, name_version)) = rest.split_once('/') else {
@@ -766,22 +765,28 @@ pub fn package_spec_matches(spec: &str, purl: &str) -> bool {
         Some(at) => &name_version[..at],
         None => name_version,
     };
-    if let Some(spec_rest) = spec.strip_prefix("pkg:") {
-        let spec_purl = canonical_pypi_purl(
-            normalize_purl(strip_purl_qualifiers(&format!("pkg:{spec_rest}"))).to_lowercase(),
-        );
-        let spec_rest = &spec_purl[4..];
-        let has_version = spec_rest
+    if spec
+        .get(..4)
+        .is_some_and(|p| p.eq_ignore_ascii_case("pkg:"))
+    {
+        let spec_key = PurlKey::new(&format!("pkg:{}", &spec[4..]));
+        let spec_folded = spec_key.as_str().to_lowercase();
+        let has_version = spec_folded[4..]
             .split_once('/')
             .is_some_and(|(_, nv)| nv.rfind('@').is_some_and(|i| i > 0));
-        return if has_version {
-            decoded == spec_purl
-        } else {
-            decoded
-                .strip_prefix(&spec_purl)
+        return if !has_version {
+            folded
+                .strip_prefix(&spec_folded)
                 .is_some_and(|tail| tail.starts_with('@'))
+        } else if eco == "composer" {
+            // A versioned Composer spec names a release, including its
+            // pretty/padded spellings; dev branch names retain case.
+            spec_key == key
+        } else {
+            spec_folded == folded
         };
     }
+    let spec = spec.to_lowercase();
     if eco == "pypi" {
         return name == canonicalize_pypi_name(&spec);
     }
@@ -789,102 +794,27 @@ pub fn package_spec_matches(spec: &str, purl: &str) -> bool {
     name == spec || name.rsplit('/').next() == Some(spec.as_str())
 }
 
-/// Rewrite the name of a lowercased `pkg:pypi/<name>[@<version>]` purl to
-/// its PEP 503 canonical form; any other purl is returned unchanged.
-fn canonical_pypi_purl(purl: String) -> String {
-    let Some(name_version) = purl.strip_prefix("pkg:pypi/") else {
-        return purl;
-    };
-    let (name, version) = match name_version.rfind('@').filter(|&i| i > 0) {
-        Some(at) => name_version.split_at(at),
-        None => (name_version, ""),
-    };
-    format!("pkg:pypi/{}{version}", canonicalize_pypi_name(name))
-}
-
-fn home_dir() -> Option<PathBuf> {
-    let var = if cfg!(windows) { "USERPROFILE" } else { "HOME" };
-    std::env::var_os(var)
-        .filter(|v| !v.is_empty())
-        .map(PathBuf::from)
-        .map(|p| std::fs::canonicalize(&p).unwrap_or(p))
-}
-
-fn ceiling_dirs() -> Vec<PathBuf> {
-    std::env::var_os("GIT_CEILING_DIRECTORIES")
-        .map(|v| {
-            std::env::split_paths(&v)
-                .filter(|p| !p.as_os_str().is_empty())
-                .map(|p| std::fs::canonicalize(&p).unwrap_or(p))
-                .collect()
-        })
-        .unwrap_or_default()
-}
-
-#[cfg(unix)]
-fn trusted_owner(meta: &std::fs::Metadata) -> bool {
-    use std::os::unix::fs::MetadataExt;
-    let sudo_uid = std::env::var("SUDO_UID")
-        .ok()
-        .and_then(|v| v.trim().parse::<u32>().ok());
-    // SAFETY: geteuid has no preconditions and cannot fail.
-    owner_trusted(meta.uid(), unsafe { libc::geteuid() }, sudo_uid)
-}
-
-/// `.git` is trusted when it belongs to the invoking user, to root, or
-/// (under sudo) to the user sudo ran for. Root trusts every owner: a root
-/// process is exposed to the whole filesystem anyway, and CI containers
-/// commonly run as root over a checkout owned by another uid, where
-/// distrust would silently drop the repo's policy (which only narrows).
-#[cfg(unix)]
-fn owner_trusted(owner: u32, euid: u32, sudo_uid: Option<u32>) -> bool {
-    euid == 0 || owner == euid || owner == 0 || sudo_uid == Some(owner)
-}
-
-#[cfg(not(unix))]
-fn trusted_owner(_meta: &std::fs::Metadata) -> bool {
-    true
-}
-
-/// The repo root for `cwd` (4.5) with the lookup's warnings: the nearest
-/// ancestor (inclusive) holding a `.git` directory or file, not walking
-/// past `GIT_CEILING_DIRECTORIES` or into the home directory, and (Unix)
-/// only when `.git` belongs to a trusted owner ([`owner_trusted`]).
-/// Otherwise `cwd`.
+/// The repo root for `cwd` (4.5) with the lookup's warnings: the checkout
+/// [`crate::utils::repo_root::find_git_repo`] finds (nearest `.git`
+/// directory or file, not past `GIT_CEILING_DIRECTORIES` or into the home
+/// directory), when its `.git` belongs to a trusted owner. Otherwise
+/// `cwd`.
 pub fn find_repo_root_with_warnings(cwd: &Path) -> (PathBuf, Vec<PolicyWarning>) {
     let cwd = std::fs::canonicalize(cwd).unwrap_or_else(|_| cwd.to_path_buf());
-    let ceilings = ceiling_dirs();
-    let home = home_dir();
     let mut warnings = Vec::new();
-    let mut dir: &Path = &cwd;
-    loop {
-        if dir != cwd && home.as_deref() == Some(dir) {
-            break;
-        }
-        // `metadata` follows a `.git` symlink, as git does.
-        if let Ok(meta) = std::fs::metadata(dir.join(".git")) {
-            if meta.is_dir() || meta.is_file() {
-                if trusted_owner(&meta) {
-                    return (dir.to_path_buf(), warnings);
-                }
-                warnings.push(PolicyWarning {
-                    code: SOCKET_YML_REPO_UNTRUSTED,
-                    detail: format!(
-                        "{} is owned by another user; using {} as the repository root",
-                        dir.join(".git").display(),
-                        cwd.display()
-                    ),
-                });
-                break;
-            }
-        }
-        let Some(parent) = dir.parent() else { break };
-        if ceilings.iter().any(|c| c == parent) {
-            break;
-        }
-        dir = parent;
+    match crate::utils::repo_root::find_git_repo(&cwd) {
+        Some(repo) if repo.trusted => return (repo.root, warnings),
+        Some(repo) => warnings.push(PolicyWarning {
+            code: SOCKET_YML_REPO_UNTRUSTED,
+            detail: format!(
+                "{} is owned by another user; using {} as the repository root",
+                repo.dot_git().display(),
+                cwd.display()
+            ),
+        }),
+        None => {}
     }
-    (cwd.clone(), warnings)
+    (cwd, warnings)
 }
 
 /// [`find_repo_root_with_warnings`] without the warnings.

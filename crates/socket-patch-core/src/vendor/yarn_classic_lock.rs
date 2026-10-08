@@ -27,6 +27,12 @@ use std::sync::Arc;
 use serde_json::Value;
 
 use crate::constants::SOCKET_DIR;
+use crate::formats::yarn::blocks::{
+    block_eol, body_field_line, classic_field, repin_classic_block, replace_block, scan_blocks,
+    LockBlock,
+};
+use crate::formats::yarn::patterns::{classic_key_real_name, split_key_patterns};
+use crate::formats::yarn::source::{classic_copy_source, CopySource};
 use crate::manifest::schema::PatchRecord;
 use crate::patch::apply::PatchSources;
 use crate::utils::fs::{atomic_write_bytes_preserving_mode, read_regular_to_string};
@@ -284,7 +290,8 @@ fn refuse_berry_lock(text: &str) -> Result<(), Box<VendorOutcome>> {
 
 /// [`vendor_yarn_classic`]'s step 3: classify every block of
 /// `name@version` and return the rewritable keys plus a named warning for
-/// each copy that can't be rewired (link, `file:` directory, git). Refused
+/// each copy that can't be rewired (link, `file:` directory, git, a
+/// non-registry tarball). Refused
 /// when nothing is rewritable — as `vendor_lock_entry_not_rewritable`,
 /// naming the skipped copies, when the package IS locked but only through
 /// such copies (#857: `yarn install` can't help there) — or when a key sits
@@ -317,6 +324,20 @@ fn rewritable_candidates(
             BlockClass::UnresolvedSkip(detail) => {
                 skipped.push(VendorWarning::new("vendor_link_entry_skipped", detail));
             }
+            BlockClass::RemoteSkip(detail) => {
+                unrewritable.push(detail.clone());
+                skipped.push(VendorWarning::new(
+                    "vendor_yarn_classic_non_registry_entry_skipped",
+                    detail,
+                ));
+            }
+            BlockClass::LegacyWired(detail) => {
+                candidate_keys.push(block.key.clone());
+                skipped.push(VendorWarning::new(
+                    "vendor_yarn_classic_non_registry_legacy_wiring",
+                    detail,
+                ));
+            }
             BlockClass::NoMatch => {}
         }
     }
@@ -325,9 +346,9 @@ fn rewritable_candidates(
         return Err(Box::new(refused(
             "vendor_lock_entry_not_rewritable",
             format!(
-                "every {YARN_LOCK} block for {name}@{version} installs from git, a link or a \
-                 file: directory, which vendoring can't rewire — those copies stay UNPATCHED \
-                 and `yarn install` will not help: {}",
+                "every {YARN_LOCK} block for {name}@{version} installs from git, a link, a \
+                 file: directory or a non-registry tarball, which vendoring can't rewire — \
+                 those copies stay UNPATCHED and `yarn install` will not help: {}",
                 details.join("; ")
             ),
         )));
@@ -698,19 +719,23 @@ enum BlockClass {
     /// Matches the target but has no `resolved` (a stale lock `yarn install`
     /// re-locks); carries the warning detail.
     UnresolvedSkip(String),
+    /// Matches the target but installs a non-registry tarball (B16);
+    /// carries the warning detail.
+    RemoteSkip(String),
+    /// A non-registry copy an older release already wired into
+    /// `.socket/vendor/` (B16 upgrade state): kept as a candidate so an
+    /// in-sync re-run stays a no-op, but named; carries the warning detail.
+    LegacyWired(String),
     NoMatch,
 }
 
 /// Does this block stand for `name@version`, and can it be rewired?
 fn classify_classic_block(block: &LockBlock, name: &str, version: &str) -> BlockClass {
     let patterns = split_key_patterns(&block.key);
-    if patterns.is_empty() {
-        return BlockClass::NoMatch;
-    }
     // Every key pattern must resolve to the target package's real name (an
     // `alias@npm:left-pad@^1.3.0` pattern carries the real name inside the
     // range — spike Y5's alias block).
-    if !patterns.iter().all(|p| pattern_real_name(p) == Some(name)) {
+    if classic_key_real_name(&patterns) != Some(name) {
         return BlockClass::NoMatch;
     }
     if classic_field(&block.lines, "version") != Some(version) {
@@ -719,25 +744,46 @@ fn classify_classic_block(block: &LockBlock, name: &str, version: &str) -> Block
     // link: and file:-DIRECTORY ranges resolve from the working tree, not a
     // tarball — rewriting their resolved would not change what installs.
     let resolved = classic_field(&block.lines, "resolved");
-    match classic_block_source(&patterns, resolved) {
-        ClassicBlockSource::Tarball => BlockClass::Candidate,
-        ClassicBlockSource::Link => BlockClass::LinkSkip(format!(
+    match classic_copy_source(&patterns, resolved) {
+        CopySource::Registry => BlockClass::Candidate,
+        // The vendored tarball is the patch service's build of the REGISTRY
+        // package (B16): wiring a fork, local build or hosted-git copy to it
+        // would swap the user's code for registry bytes.
+        // Checked before the copy-source refusal: a block whose `resolved`
+        // is already ours installs the vendored build, not the user's own
+        // artifact, and its original is in the ledger for `vendor --revert`.
+        CopySource::RemoteTarball if block_points_into_vendor(&block.lines) => {
+            BlockClass::LegacyWired(format!(
+                "lock block `{}` is a file: tarball, URL or hosted-git dependency that an \
+                 older release wired to the vendored registry build of {name}@{version}, so \
+                 it installs that build rather than your own; `socket-patch vendor --revert` \
+                 restores its original source",
+                block.key
+            ))
+        }
+        CopySource::RemoteTarball => BlockClass::RemoteSkip(format!(
+            "lock block `{}` installs from a tarball that is not the registry's (a \
+             file: tarball, URL or hosted-git dependency), and the vendored artifact is \
+             built from the registry package; skipped, so that copy stays unpatched",
+            block.key
+        )),
+        CopySource::Link => BlockClass::LinkSkip(format!(
             "lock block `{}` is a link: dependency; skipped",
             block.key
         )),
-        ClassicBlockSource::Directory => BlockClass::LinkSkip(format!(
+        CopySource::Directory => BlockClass::LinkSkip(format!(
             "lock block `{}` is a file: directory dependency; skipped, so that copy \
              stays unpatched",
             block.key
         )),
-        ClassicBlockSource::Unresolved => BlockClass::UnresolvedSkip(format!(
+        CopySource::Unresolved => BlockClass::UnresolvedSkip(format!(
             "lock block `{}` has no resolved tarball; skipped",
             block.key
         )),
         // yarn fetches a git pattern with git, from `resolved` (#363): a
         // vendored tarball there makes every install fail, and the copy is
         // the git bytes.
-        ClassicBlockSource::Git => BlockClass::GitSkip(format!(
+        CopySource::Git => BlockClass::GitSkip(format!(
             "lock block `{}` installs from git, which yarn fetches from the git \
              source rather than a tarball; skipped, so that copy stays unpatched",
             block.key
@@ -745,8 +791,8 @@ fn classify_classic_block(block: &LockBlock, name: &str, version: &str) -> Block
     }
 }
 
-/// Rebuild a block's lines with the vendored `resolved`/`integrity` (adding
-/// the integrity line when absent — yarn then enforces both hashes) and,
+/// Rebuild a block's lines with the vendored `resolved`/`integrity`
+/// ([`repin_classic_block`], the pin every classic writer shares) and,
 /// when the patch rewrote the package's own manifest, the recomputed
 /// dependency sub-maps.
 fn rewrite_classic_block(
@@ -755,58 +801,41 @@ fn rewrite_classic_block(
     integrity_value: &str,
     staged_pkg: Option<&Value>,
 ) -> Vec<String> {
-    let has_integrity = lines
-        .iter()
-        .skip(1)
-        .any(|l| body_field_line(l).is_some_and(|r| r.starts_with("integrity ")));
-    let mut out = vec![lines[0].clone()];
-    let mut i = 1;
-    while i < lines.len() {
-        let line = &lines[i];
-        if let Some(rest) = body_field_line(line) {
-            if rest.starts_with("resolved ") {
-                out.push(format!("  resolved \"{resolved_value}\""));
-                if !has_integrity {
-                    // yarn's field order: version, resolved, integrity, deps.
-                    out.push(format!("  integrity {integrity_value}"));
-                }
+    let pinned = repin_classic_block(lines, resolved_value, integrity_value);
+    let Some(pkg) = staged_pkg else {
+        return pinned;
+    };
+    let mut out = Vec::with_capacity(pinned.len());
+    let mut i = 0;
+    while i < pinned.len() {
+        if i > 0
+            && body_field_line(&pinned[i])
+                .is_some_and(|r| r == "dependencies:" || r == "optionalDependencies:")
+        {
+            // Drop the stale sub-map (header + 4-space entries); the
+            // recomputed ones are appended below in yarn's order.
+            i += 1;
+            while i < pinned.len() && body_field_line(&pinned[i]).is_none() {
                 i += 1;
-                continue;
             }
-            if rest.starts_with("integrity ") {
-                out.push(format!("  integrity {integrity_value}"));
-                i += 1;
-                continue;
-            }
-            if staged_pkg.is_some() && (rest == "dependencies:" || rest == "optionalDependencies:")
-            {
-                // Drop the stale sub-map (header + 4-space entries); the
-                // recomputed ones are appended below in yarn's order.
-                i += 1;
-                while i < lines.len() && body_field_line(&lines[i]).is_none() {
-                    i += 1;
-                }
-                continue;
-            }
+            continue;
         }
-        out.push(line.clone());
+        out.push(pinned[i].clone());
         i += 1;
     }
-    if let Some(pkg) = staged_pkg {
-        for field in ["dependencies", "optionalDependencies"] {
-            let Some(map) = pkg.get(field).and_then(Value::as_object) else {
-                continue;
-            };
-            if map.is_empty() {
-                continue;
-            }
-            out.push(format!("  {field}:"));
-            let mut keys: Vec<&String> = map.keys().collect();
-            keys.sort_unstable();
-            for k in keys {
-                if let Some(range) = map.get(k).and_then(Value::as_str) {
-                    out.push(format!("    {} \"{range}\"", quote_yarn_key(k)));
-                }
+    for field in ["dependencies", "optionalDependencies"] {
+        let Some(map) = pkg.get(field).and_then(Value::as_object) else {
+            continue;
+        };
+        if map.is_empty() {
+            continue;
+        }
+        out.push(format!("  {field}:"));
+        let mut keys: Vec<&String> = map.keys().collect();
+        keys.sort_unstable();
+        for k in keys {
+            if let Some(range) = map.get(k).and_then(Value::as_str) {
+                out.push(format!("    {} \"{range}\"", quote_yarn_key(k)));
             }
         }
     }
@@ -819,12 +848,6 @@ pub(super) fn block_points_into_vendor(lines: &[String]) -> bool {
     classic_field(lines, "resolved")
         .and_then(parse_vendor_path)
         .is_some_and(|p| p.eco == "npm")
-}
-
-/// `file:` path → tarball or directory? Directories cannot be rewired.
-fn is_tarball_path(path: &str) -> bool {
-    let path = path.split('#').next().unwrap_or(path).trim_end_matches('/');
-    path.ends_with(".tgz") || path.ends_with(".tar.gz")
 }
 
 // ─────────────────── shared yarn-lock text helpers ───────────────────
@@ -852,20 +875,6 @@ pub(super) async fn read_yarn_lock(project_root: &Path) -> Result<String, Box<Ve
     }
 }
 
-/// One key-line block of a yarn lockfile (classic or berry).
-pub(crate) struct LockBlock {
-    /// Byte offset of the key line's first byte.
-    pub start: usize,
-    /// Byte offset one past the last body line (incl. its terminator).
-    pub end: usize,
-    /// Whether the final line carried a terminator (false only at EOF).
-    pub terminated: bool,
-    /// Key line text without the trailing `:` (quotes kept verbatim).
-    pub key: String,
-    /// Verbatim block lines (key line first), without line terminators.
-    pub lines: Vec<String>,
-}
-
 /// The run's yarn-lock block scans. `scan_blocks` walks every line of the
 /// lock and copies each one into the block it belongs to, and BOTH yarn
 /// backends re-scan the whole lock for every patched package — plus once
@@ -886,340 +895,6 @@ pub(crate) fn scan_blocks_shared(text: &str) -> Arc<Vec<LockBlock>> {
 /// is how a write stops the memo holding a scan nothing will hit again.
 pub(super) fn forget_block_scans() {
     BLOCK_MEMO.invalidate();
-}
-
-/// Scan a lockfile into blocks, CRLF-aware. Comments, blank lines, and
-/// anything else outside blocks are left to the splicer untouched. A
-/// leading UTF-8 BOM is encoding, not text (yarn's parsers drop it): it is
-/// stripped from the first line and kept OUT of that line's span, so a
-/// header-less lock still yields its first key and a splice keeps the BOM.
-pub(crate) fn scan_blocks(text: &str) -> Vec<LockBlock> {
-    // (start, end-incl-terminator, content-without-terminator, terminated)
-    let mut lines: Vec<(usize, usize, &str, bool)> = Vec::new();
-    let mut pos = 0;
-    for seg in text.split_inclusive('\n') {
-        let mut start = pos;
-        pos += seg.len();
-        let terminated = seg.ends_with('\n');
-        let mut content = seg;
-        if terminated {
-            content = &content[..content.len() - 1];
-        }
-        let mut content = content.strip_suffix('\r').unwrap_or(content);
-        if start == 0 {
-            if let Some(rest) = content.strip_prefix('\u{feff}') {
-                start = '\u{feff}'.len_utf8();
-                content = rest;
-            }
-        }
-        lines.push((start, pos, content, terminated));
-    }
-    let mut blocks = Vec::new();
-    let mut i = 0;
-    while i < lines.len() {
-        let (start, _, content, _) = lines[i];
-        if is_key_line(content) {
-            let mut j = i + 1;
-            while j < lines.len() && is_body_line(lines[j].2) {
-                j += 1;
-            }
-            blocks.push(LockBlock {
-                start,
-                end: lines[j - 1].1,
-                terminated: lines[j - 1].3,
-                key: content[..content.len() - 1].to_string(),
-                lines: lines[i..j].iter().map(|l| l.2.to_string()).collect(),
-            });
-            i = j;
-        } else {
-            i += 1;
-        }
-    }
-    blocks
-}
-
-fn is_key_line(s: &str) -> bool {
-    !s.is_empty() && !s.starts_with([' ', '\t', '#']) && s.ends_with(':')
-}
-
-fn is_body_line(s: &str) -> bool {
-    s.starts_with(' ') || s.starts_with('\t')
-}
-
-/// The line terminator `block` is written in: its first line's (`\r\n` or
-/// `\n`), else — a block that is one unterminated last line — the file's
-/// dominant one ([`detect_eol`]). For a uniformly-ended lock this is the
-/// file's own terminator; in a lock whose endings were mixed after the
-/// fact it keeps a restored block in the style of the block it replaces.
-pub(super) fn block_eol(text: &str, block: &LockBlock) -> &'static str {
-    let span = &text[block.start..block.end];
-    match span.find('\n') {
-        Some(i) if span[..i].ends_with('\r') => "\r\n",
-        Some(_) => "\n",
-        None => detect_eol(text),
-    }
-}
-
-/// Splice `new_lines` over `block`'s byte range, preserving every byte
-/// outside it.
-pub(super) fn replace_block(
-    text: &str,
-    block: &LockBlock,
-    new_lines: &[String],
-    eol: &str,
-) -> String {
-    let mut replacement = new_lines.join(eol);
-    if block.terminated {
-        replacement.push_str(eol);
-    }
-    format!(
-        "{}{}{}",
-        &text[..block.start],
-        replacement,
-        &text[block.end..]
-    )
-}
-
-/// A 2-space body field line (`version "1.3.0"` / `resolution: "..."`),
-/// returned without the indent; deeper sub-map lines return `None`.
-pub(super) fn body_field_line(line: &str) -> Option<&str> {
-    let rest = line.strip_prefix("  ")?;
-    if rest.starts_with(' ') {
-        return None;
-    }
-    Some(rest)
-}
-
-/// Read a classic scalar field (`<name> "<value>"`, integrity unquoted).
-pub(crate) fn classic_field<'a>(lines: &'a [String], field: &str) -> Option<&'a str> {
-    for line in lines.iter().skip(1) {
-        let Some(rest) = body_field_line(line) else {
-            continue;
-        };
-        let Some(value) = rest.strip_prefix(field) else {
-            continue;
-        };
-        let Some(value) = value.strip_prefix(' ') else {
-            continue;
-        };
-        return Some(value.trim().trim_matches('"'));
-    }
-    None
-}
-
-/// Split a comma-joined key into its patterns, honoring quoting; the
-/// surrounding quotes are dropped from each pattern.
-pub(crate) fn split_key_patterns(key: &str) -> Vec<String> {
-    let mut out = Vec::new();
-    let mut cur = String::new();
-    let mut in_quotes = false;
-    for ch in key.chars() {
-        match ch {
-            '"' => in_quotes = !in_quotes,
-            ',' if !in_quotes => {
-                let p = cur.trim();
-                if !p.is_empty() {
-                    out.push(p.to_string());
-                }
-                cur.clear();
-            }
-            _ => cur.push(ch),
-        }
-    }
-    let p = cur.trim();
-    if !p.is_empty() {
-        out.push(p.to_string());
-    }
-    out
-}
-
-/// Split a berry lock key into its comma-joined descriptor patterns. yarn
-/// wraps a multi-descriptor key in ONE outer quote pair (`"a@npm:^1,
-/// a@npm:^2"`), so strip a single wrapping pair first, THEN split on `, ` —
-/// that surfaces every descriptor (letting a genuinely mixed-name key be
-/// detected as ambiguous) while a single quoted descriptor stays intact.
-/// Twin of the TS `splitKeyPatterns`. The ONE berry key splitter: the
-/// vendored and hosted berry backends and the lock inventory's
-/// `berry_entries` (lockfile discovery's entry model) all read berry keys
-/// with it — [`split_key_patterns`] is the classic grammar's, and treats
-/// the outer pair as one quoted pattern.
-pub(crate) fn split_berry_key_patterns(key: &str) -> Vec<String> {
-    let trimmed = key.trim();
-    let inner = if trimmed.len() >= 2 && trimmed.starts_with('"') && trimmed.ends_with('"') {
-        &trimmed[1..trimmed.len() - 1]
-    } else {
-        trimmed
-    };
-    inner
-        .split(", ")
-        .map(str::trim)
-        .filter(|p| !p.is_empty())
-        .map(str::to_string)
-        .collect()
-}
-
-/// Split `name@range` at the first `@` past a leading `@scope/` marker.
-pub(crate) fn split_pattern(pattern: &str) -> Option<(&str, &str)> {
-    let from = usize::from(pattern.starts_with('@'));
-    let at = pattern[from..].find('@')? + from;
-    let (name, range) = (&pattern[..at], &pattern[at + 1..]);
-    if name.is_empty() || range.is_empty() {
-        return None;
-    }
-    Some((name, range))
-}
-
-/// The real package a key pattern stands for: its name, unless the range is
-/// an `npm:` alias — then the aliased target's name.
-pub(crate) fn pattern_real_name(pattern: &str) -> Option<&str> {
-    let (name, range) = split_pattern(pattern)?;
-    if let Some(aliased) = range.strip_prefix("npm:") {
-        return match split_pattern(aliased) {
-            Some((real, _)) => Some(real),
-            None => Some(aliased), // `npm:left-pad` with no range
-        };
-    }
-    Some(name)
-}
-
-/// Where yarn 1 installs a lock block's copy from, as far as a lock
-/// rewrite is concerned. Hosted, vendored and `vex` all classify a block of
-/// the patched `name@version` through this one rule (#857, #921), so a copy
-/// one of them cannot rewire is never silently counted as wired by another.
-#[derive(Debug, Clone, Copy, PartialEq, Eq)]
-pub(crate) enum ClassicBlockSource {
-    /// A tarball `resolved` (registry, URL or `file:` tarball): rewritable.
-    Tarball,
-    /// A `link:` range: a symlink into the working tree.
-    Link,
-    /// A `file:` directory range: yarn COPIES the directory into
-    /// `node_modules`, so that copy keeps its own bytes.
-    Directory,
-    /// Fetched by yarn's git fetcher ([`classic_block_is_git`]).
-    Git,
-    /// Any other range with no `resolved`: not something yarn writes for a
-    /// locked package, so the lock is stale and `yarn install` re-locks it.
-    Unresolved,
-}
-
-/// [`ClassicBlockSource`] of a block from its key patterns and `resolved`.
-pub(crate) fn classic_block_source(
-    patterns: &[String],
-    resolved: Option<&str>,
-) -> ClassicBlockSource {
-    for pattern in patterns {
-        let range = split_pattern(pattern).map(|(_, r)| r).unwrap_or("");
-        if range.starts_with("link:") {
-            return ClassicBlockSource::Link;
-        }
-        if let Some(path) = range.strip_prefix("file:") {
-            if !is_tarball_path(path) {
-                return ClassicBlockSource::Directory;
-            }
-        }
-    }
-    if classic_block_is_git(patterns, resolved) {
-        return ClassicBlockSource::Git;
-    }
-    match resolved {
-        Some(_) => ClassicBlockSource::Tarball,
-        None => ClassicBlockSource::Unresolved,
-    }
-}
-
-/// Whether yarn 1 fetches a lock block with its GIT fetcher (#363): when any
-/// key pattern's range (an `npm:` alias's target range included) is one
-/// yarn's `GitResolver.isVersion` accepts, or the block's `resolved` is
-/// itself a git remote. Yarn picks the fetcher from the PATTERN and hands it
-/// the `resolved` value as a git remote, so rewriting that `resolved` to a
-/// tarball breaks every later install (`git ls-remote` on a `.tgz`). The
-/// hosted-git shorthands (`owner/repo`, `github:owner/repo`) are not git
-/// here: yarn locks them to a codeload tarball and fetches that as one.
-pub(crate) fn classic_block_is_git(patterns: &[String], resolved: Option<&str>) -> bool {
-    patterns.iter().any(|p| {
-        split_pattern(p).is_some_and(|(_, range)| {
-            let range = match range.strip_prefix("npm:") {
-                Some(aliased) => split_pattern(aliased).map_or("", |(_, r)| r),
-                None => range,
-            };
-            yarn_classic_range_is_git(range)
-        })
-    }) || resolved.is_some_and(yarn_classic_range_is_git)
-}
-
-/// yarn 1's `GitResolver.isVersion` over node's legacy `url.parse`: a url
-/// with a scheme whose path ends in `.git`, a `git+<x>:` / `git:` / `ssh:`
-/// scheme, or a `github.com` / `gitlab.com` / `bitbucket.{com,org}` url
-/// naming exactly `<owner>/<repo>` (not a file inside the repo, such as an
-/// `/archive/v1.tar.gz`).
-pub(crate) fn yarn_classic_range_is_git(range: &str) -> bool {
-    let range = range.trim();
-    let scheme_len = range
-        .find(|c: char| !(c.is_ascii_alphanumeric() || matches!(c, '.' | '+' | '-')))
-        .unwrap_or(range.len());
-    if scheme_len == 0 || !range[scheme_len..].starts_with(':') {
-        return false;
-    }
-    let scheme = range[..scheme_len].to_ascii_lowercase();
-    let rest = &range[scheme_len + 1..];
-    let rest = rest.split('#').next().unwrap_or(rest);
-    let (host, path) = match rest.strip_prefix("//") {
-        Some(after) => {
-            let end = after.find(['/', '?']).unwrap_or(after.len());
-            let authority = &after[..end];
-            let host = authority.rsplit('@').next().unwrap_or(authority);
-            let host = host.split(':').next().unwrap_or(host).to_ascii_lowercase();
-            (Some(host), &after[end..])
-        }
-        None => (None, rest),
-    };
-    let pathname = path.split('?').next().unwrap_or(path);
-    if pathname.ends_with(".git") {
-        return true;
-    }
-    if (scheme.starts_with("git+") && scheme.len() > 4) || scheme == "git" || scheme == "ssh" {
-        return true;
-    }
-    match host {
-        Some(host)
-            if matches!(
-                host.as_str(),
-                "github.com" | "gitlab.com" | "bitbucket.com" | "bitbucket.org"
-            ) =>
-        {
-            path.split('/').filter(|s| !s.is_empty()).count() == 2
-        }
-        _ => false,
-    }
-}
-
-/// Which blocks yarn actually keeps, by block index: a block survives while
-/// at least one of its key patterns is not re-keyed by a LATER block (yarn
-/// parses the lock into an object, so duplicate keys are last-wins). A
-/// block with no patterns is never live.
-pub(crate) fn live_blocks(patterns: &[Vec<String>]) -> Vec<bool> {
-    let mut last: std::collections::HashMap<&str, usize> = std::collections::HashMap::new();
-    for (i, pats) in patterns.iter().enumerate() {
-        for p in pats {
-            last.insert(p.as_str(), i);
-        }
-    }
-    patterns
-        .iter()
-        .enumerate()
-        .map(|(i, pats)| pats.iter().any(|p| last.get(p.as_str()) == Some(&i)))
-        .collect()
-}
-
-/// A classic `resolved` value split at its first `#`: the url before it,
-/// and the fragment as a lowercase sha1 when it is 40 hex digits (either
-/// case) — the legacy tarball verifier yarn v1 enforces when no
-/// `integrity` line is present.
-pub(crate) fn split_resolved_sha1(raw: &str) -> (&str, Option<String>) {
-    match raw.split_once('#') {
-        Some((url, frag)) => (url, crate::utils::digest::sha1_hex(frag)),
-        None => (raw, None),
-    }
 }
 
 /// yarn v1's lockfile key quoting (stringify.js `shouldWrapKey`): wrap when
@@ -1254,6 +929,7 @@ pub(super) fn json_to_lines(value: &Value) -> Option<Vec<String>> {
 #[cfg(test)]
 mod tests {
     use super::*;
+    use crate::formats::yarn::patterns::pattern_real_name;
     use crate::hash::git_sha256::compute_git_sha256_from_bytes;
     use crate::manifest::schema::PatchFileInfo;
     use crate::patch::apply::{ApplyResult, VerifyStatus};
@@ -1807,6 +1483,47 @@ left-pad@^1.3.0:
             tgz_first,
             "tarball byte-identical across re-runs"
         );
+    }
+
+    /// B16 upgrade state: an older release wired a URL-keyed fork block
+    /// into `.socket/vendor/`. That block is ours, so an in-sync re-run
+    /// stays a byte-stable no-op (not `vendor_lock_entry_not_rewritable`,
+    /// and never "stays UNPATCHED"), and the legacy wiring is named with
+    /// the way back.
+    #[tokio::test]
+    async fn legacy_wired_non_registry_copy_rerun_is_in_sync_and_named() {
+        let fx = fixture_with_lock(Y2_BEFORE).await;
+        expect_done(fx.vendor(false).await);
+        let wired = fx.lock_text().await;
+        let legacy = wired.replacen(
+            "left-pad@^1.3.0:",
+            "\"left-pad@https://host.test/fork/left-pad-1.3.0.tgz\":",
+            1,
+        );
+        assert_ne!(legacy, wired, "fixture re-keys the wired block");
+        tokio::fs::write(fx.lock_path(), &legacy).await.unwrap();
+
+        let (result, entry, warnings) = expect_done(fx.vendor(false).await);
+        assert!(result.success, "{:?}", result.error);
+        assert!(entry.is_none(), "in sync: no new ledger entry");
+        let codes: Vec<&str> = warnings
+            .iter()
+            .map(|w| w.code)
+            .filter(|&c| c != "vendor_prebuilt_downloaded")
+            .collect();
+        assert_eq!(codes, ["vendor_yarn_classic_non_registry_legacy_wiring"]);
+        let detail = &warnings
+            .iter()
+            .find(|w| w.code == codes[0])
+            .unwrap()
+            .detail;
+        assert!(
+            detail.contains("host.test/fork")
+                && detail.contains("vendor --revert")
+                && !detail.contains("UNPATCHED"),
+            "{detail}"
+        );
+        assert_eq!(fx.lock_text().await, legacy, "lock byte-stable");
     }
 
     #[tokio::test]
@@ -2610,12 +2327,12 @@ left-pad@^1.3.0:
         );
     }
 
-    /// A `file:`-TARBALL range (unlike a `file:` directory) resolves from a
-    /// packable tarball, so it must fall through the LinkSkip gate and be
-    /// rewritten — a flipped `is_tarball_path` polarity would silently skip
-    /// real tarball deps.
+    /// B16: a `file:`-TARBALL range is the user's own artifact, not the
+    /// registry package the vendored tarball is built from, so it is never
+    /// wired to it: as the only copy it is refused as not rewritable, the
+    /// lock untouched. (It used to be rewired to the registry build.)
     #[tokio::test]
-    async fn file_tarball_range_block_is_rewritten_not_skipped() {
+    async fn file_tarball_range_only_copy_is_refused_untouched() {
         let lock = r#"# yarn lockfile v1
 
 "left-pad@file:./old/left-pad-1.3.0.tgz":
@@ -2623,35 +2340,13 @@ left-pad@^1.3.0:
   resolved "file:./old/left-pad-1.3.0.tgz#0123456789abcdef0123456789abcdef01234567"
 "#;
         let fx = fixture_with_lock(lock).await;
-        let (result, entry, warnings) = expect_done(fx.vendor(false).await);
-        assert!(result.success, "{:?}", result.error);
+        let detail = expect_refused(fx.vendor(false).await, "vendor_lock_entry_not_rewritable");
         assert!(
-            !warnings
-                .iter()
-                .any(|w| w.code == "vendor_link_entry_skipped"),
-            "a file: TARBALL range is rewritable, not a link-skip: {warnings:?}"
+            detail.contains("left-pad@file:./old/left-pad-1.3.0.tgz")
+                && detail.contains("not the registry's"),
+            "{detail}"
         );
-        let entry = entry.expect("success carries a ledger entry");
-        assert_eq!(entry.wiring.len(), 1);
-        assert_eq!(
-            entry.wiring[0].key.as_deref(),
-            Some("\"left-pad@file:./old/left-pad-1.3.0.tgz\""),
-            "verbatim quoted key line (no colon)"
-        );
-
-        let (sha1, sri) = fx.packed_hashes().await;
-        let text = fx.lock_text().await;
-        let lines: Vec<&str> = text.lines().collect();
-        assert_eq!(
-            lines[4],
-            format!("  resolved \"file:./.socket/vendor/npm/{UUID}/left-pad-1.3.0.tgz#{sha1}\""),
-            "resolved repointed at the vendored tarball"
-        );
-        assert_eq!(
-            lines[5],
-            format!("  integrity {sri}"),
-            "integrity line added so both hash checks are enforced"
-        );
+        assert_eq!(fx.lock_text().await, lock);
     }
 
     /// `--preserve-state` (`keep_artifact`): the wiring restore runs
@@ -3247,63 +2942,6 @@ left-pad@^1.3.0:
         assert_eq!(planned, looped);
     }
 
-    /// yarn 1's `GitResolver.isVersion`, case by case (#363).
-    #[test]
-    fn yarn_classic_git_ranges_are_recognized() {
-        for range in [
-            "git+https://github.com/stevemao/left-pad.git#v1.3.0",
-            "git+ssh://git@github.com/stevemao/left-pad.git#ff8e7ba",
-            "git+file:///tmp/lpgit#v1.3.0",
-            "git://github.com/stevemao/left-pad.git",
-            "ssh://git@example.com/left-pad",
-            "https://example.com/left-pad.git",
-            "https://example.com/left-pad.git#v1.3.0",
-            "https://github.com/stevemao/left-pad",
-            "https://github.com/stevemao/left-pad#v1.3.0",
-            "https://gitlab.com/stevemao/left-pad/",
-            "http://bitbucket.org/stevemao/left-pad",
-            "GIT+HTTPS://github.com/stevemao/left-pad.git",
-        ] {
-            assert!(yarn_classic_range_is_git(range), "{range:?} is a git range");
-        }
-        for range in [
-            "^1.3.0",
-            "1.3.0",
-            "latest",
-            "stevemao/left-pad#v1.3.0",
-            "github:stevemao/left-pad#v1.3.0",
-            "https://codeload.github.com/stevemao/left-pad/tar.gz/ff8e7ba",
-            "https://github.com/stevemao/left-pad/archive/v1.3.0.tar.gz",
-            "https://registry.yarnpkg.com/left-pad/-/left-pad-1.3.0.tgz#5b8a3a7",
-            "file:./old/left-pad-1.3.0.tgz",
-            "file:./.socket/vendor/npm/x/left-pad-1.3.0.tgz",
-            "link:../left-pad",
-            "",
-        ] {
-            assert!(
-                !yarn_classic_range_is_git(range),
-                "{range:?} is not a git range"
-            );
-        }
-        let pats = |p: &[&str]| p.iter().map(|s| s.to_string()).collect::<Vec<_>>();
-        assert!(classic_block_is_git(
-            &pats(&["left-pad@git+https://h/x.git#v1"]),
-            Some("https://p.test/lp.tgz")
-        ));
-        assert!(classic_block_is_git(
-            &pats(&["pad@npm:left-pad@git+https://h/x.git"]),
-            None
-        ));
-        assert!(
-            classic_block_is_git(&pats(&["left-pad@^1.3.0"]), Some("git+ssh://h/x.git#abc")),
-            "a git `resolved` alone decides it too"
-        );
-        assert!(!classic_block_is_git(
-            &pats(&["left-pad@stevemao/left-pad#v1.3.0"]),
-            Some("https://codeload.github.com/stevemao/left-pad/tar.gz/ff8e7ba")
-        ));
-    }
-
     /// #363: a git-pattern block is fetched by yarn 1's git fetcher from its
     /// `resolved`, so vendoring must never rewrite it — the registry block
     /// beside it is still wired, and the skip is named, not silent.
@@ -3403,20 +3041,31 @@ left-pad@^1.3.0:
         assert!(fx.lock_text().await.contains(extra.trim_start()));
     }
 
-    /// #363 scope note: the hosted-git SHORTHAND locks to a codeload tarball
-    /// that yarn fetches as a tarball, so it stays rewritable.
+    /// B16: a hosted-git shorthand (locked to a codeload tarball) or URL
+    /// copy beside the registry block: the registry block is wired, and
+    /// each non-registry copy is named as staying unpatched, its block
+    /// byte-identical.
     #[tokio::test]
-    async fn codeload_shorthand_block_is_still_rewritten() {
-        let lock = r#"# yarn lockfile v1
-
-
-left-pad@stevemao/left-pad#v1.3.0:
-  version "1.3.0"
-  resolved "https://codeload.github.com/stevemao/left-pad/tar.gz/ff8e7ba5b0b3a5ad2f1bb06a4e6aef1c6b2c3d4e"
-"#;
-        let fx = fixture_with_lock(lock).await;
+    async fn non_registry_tarball_copies_beside_registry_are_skipped_with_warning() {
+        let extra = "\nleft-pad@stevemao/left-pad#v1.3.0:\n  version \"1.3.0\"\n  \
+                     resolved \"https://codeload.github.com/stevemao/left-pad/tar.gz/ff8e7ba5\"\n\
+                     \n\"left-pad@https://host.test/fork/left-pad-1.3.0.tgz\":\n  version \"1.3.0\"\n  \
+                     resolved \"https://host.test/fork/left-pad-1.3.0.tgz\"\n";
+        let lock = format!("{Y2_BEFORE}{extra}");
+        let fx = fixture_with_lock(&lock).await;
         let (result, entry, warnings) = expect_done(fx.vendor(false).await);
         assert!(result.success, "{:?}", result.error);
-        assert_eq!(entry.unwrap().wiring.len(), 1, "{warnings:?}");
+        assert_eq!(entry.unwrap().wiring.len(), 1, "only the registry block");
+        let skipped: Vec<&VendorWarning> = warnings
+            .iter()
+            .filter(|w| w.code == "vendor_yarn_classic_non_registry_entry_skipped")
+            .collect();
+        assert_eq!(skipped.len(), 2, "{warnings:?}");
+        assert!(
+            skipped[0].detail.contains("stevemao/left-pad#v1.3.0"),
+            "{skipped:?}"
+        );
+        assert!(skipped[1].detail.contains("host.test/fork"), "{skipped:?}");
+        assert!(fx.lock_text().await.ends_with(extra));
     }
 }
