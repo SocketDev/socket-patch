@@ -273,20 +273,24 @@ impl Walk<'_> {
     /// Queue `decl` read in `chain`'s context. A transitive edge also takes
     /// any version the reactor's management assigns its artifact.
     fn declare(&mut self, decl: &PomDecl, chain: &Chain, direct: bool) {
+        // Coordinates interpolate like the version (`${project.groupId}`):
+        // a raw placeholder never names a repository path or crawl entry.
+        let group = interpolate(&decl.group, chain).unwrap_or_else(|| decl.group.clone());
+        let artifact = interpolate(&decl.artifact, chain).unwrap_or_else(|| decl.artifact.clone());
         if !direct {
             let reactor = std::mem::take(&mut self.reactor_chains);
             for (i, rc) in reactor.iter().enumerate() {
-                let key = (i, decl.group.clone(), decl.artifact.clone());
+                let key = (i, group.clone(), artifact.clone());
                 let managed = match self.reactor_managed.get(&key) {
                     Some(found) => found.clone(),
                     None => {
-                        let found = self.managed_version(rc, &decl.group, &decl.artifact, 0);
+                        let found = self.managed_version(rc, &group, &artifact, 0);
                         self.reactor_managed.insert(key, found.clone());
                         found
                     }
                 };
                 if let Some(version) = managed {
-                    self.enqueue(&decl.group, &decl.artifact, version);
+                    self.enqueue(&group, &artifact, version);
                 }
             }
             self.reactor_chains = reactor;
@@ -294,10 +298,10 @@ impl Walk<'_> {
         let version = match &decl.version {
             Some(raw) => Some(interpolate(raw, chain)),
             None => self
-                .managed_version(chain, &decl.group, &decl.artifact, 0)
+                .managed_version(chain, &group, &artifact, 0)
                 .or(Some(None)),
         };
-        self.enqueue(&decl.group, &decl.artifact, version.flatten());
+        self.enqueue(&group, &artifact, version.flatten());
     }
 
     /// The version `chain` manages `g:a` at: its parent chain's management,
@@ -310,7 +314,12 @@ impl Walk<'_> {
         a: &str,
         depth: usize,
     ) -> Option<Option<String>> {
-        let is_ga = |d: &PomDecl| d.group == g && d.artifact == a && !is_import(d);
+        let is_ga = |d: &PomDecl| {
+            let coord = |raw: &str, want: &str| {
+                raw == want || interpolate(raw, chain).is_some_and(|v| v == want)
+            };
+            coord(&d.group, g) && coord(&d.artifact, a) && !is_import(d)
+        };
         for node in chain {
             if let Some(decl) = node.model.managed.iter().find(|d| is_ga(d)) {
                 return Some(decl.version.as_deref().and_then(|v| interpolate(v, chain)));
@@ -558,6 +567,41 @@ mod tests {
 
     fn deps(list: &[String]) -> String {
         format!("<dependencies>{}</dependencies>", list.concat())
+    }
+
+    #[test]
+    fn property_coordinates_are_interpolated() {
+        let dir = tempfile::tempdir().unwrap();
+        let (cwd, repo) = (dir.path().join("p"), dir.path().join("m2"));
+        write(
+            &cwd,
+            "pom.xml",
+            &pom(
+                "com.example",
+                "app",
+                "1",
+                &deps(&[dep("${project.groupId}", "${lib.name}", Some("2"), "")]).replace(
+                    "<dependencies>",
+                    "<properties><lib.name>lib</lib.name></properties><dependencies>",
+                ),
+            ),
+        );
+        cache(
+            &repo,
+            "com.example",
+            "lib",
+            "2",
+            &deps(&[dep(
+                "${project.groupId}",
+                "lib-core",
+                Some("${project.version}"),
+                "",
+            )]),
+        );
+        cache(&repo, "com.example", "lib-core", "2", "");
+        let scope = project_scope(&cwd, &repo).unwrap();
+        assert!(scope.admits("com.example", "lib", "2"));
+        assert!(scope.admits("com.example", "lib-core", "2"));
     }
 
     #[test]
