@@ -75,8 +75,8 @@ use crate::formats::yarn::blocks::{
     classic_line_endings_supported, repin_classic_block, scan_blocks, LockBlock,
 };
 use crate::formats::yarn::patterns::{
-    berry_npm_alias_target, classic_key_real_name, split_berry_key_patterns, split_key_patterns,
-    split_pattern,
+    berry_npm_alias_target, classic_key_real_name, split_berry_key_patterns, split_classic_pattern,
+    split_key_patterns, split_pattern,
 };
 use crate::formats::yarn::source::{classic_copy_source, CopySource};
 use crate::formats::yarn::stanzas::{stanza_key, BerryStanzas};
@@ -3852,7 +3852,7 @@ fn rewrite_yarn_classic_with(
             // unpatched artifact.
             if !patterns
                 .iter()
-                .any(|p| split_pattern(p).is_some_and(|(n, _)| n == fname))
+                .any(|p| split_classic_pattern(p).is_some_and(|(n, _)| n == fname))
             {
                 alias_skipped = true;
                 result.warnings.push(RewriteWarning {
@@ -10469,6 +10469,47 @@ mod tests {
 
     /// #907: a hosted pin in a classic lock is dropped by a yarn 2+ install
     /// exactly like vendored wiring, so the hosted rewrite must warn the
+    /// #1271: a classic block keyed by an empty range (`left-pad@:` from
+    /// `"left-pad": ""`), alone or merged ahead of another member's range,
+    /// is the registry copy: hosted pins it, keeping the key line, and
+    /// names no alias skip or missing entry.
+    #[test]
+    fn yarn_classic_empty_range_key_is_pinned() {
+        let ovr = npm_override(
+            "left-pad",
+            "1.3.0",
+            "http://p.test/lp.tgz",
+            "sha512-PATCHED==",
+        );
+        for key in ["left-pad@:", "left-pad@, left-pad@^1.3.0:"] {
+            let lock = format!(
+                "# yarn lockfile v1\n\n\n{key}\n  version \"1.3.0\"\n  \
+                 resolved \"https://registry.yarnpkg.com/left-pad/-/left-pad-1.3.0.tgz#5b8a3a7765dfe001261dde915589e782f8c94d1e\"\n  \
+                 integrity sha512-ORIG==\n"
+            );
+            let mut files = BTreeMap::new();
+            files.insert("yarn.lock".to_string(), lock);
+            let mut r = RewriteResult::default();
+            rewrite_yarn_classic(&files, std::slice::from_ref(&ovr), &mut r);
+            let out = r
+                .files
+                .get("yarn.lock")
+                .unwrap_or_else(|| panic!("{key}: the block must be pinned: {:?}", r.warnings));
+            assert!(out.contains(&format!("\n{key}\n")), "{key}: {out}");
+            assert!(
+                out.contains("resolved \"http://p.test/lp.tgz\"")
+                    && out.contains("integrity sha512-PATCHED=="),
+                "{key}: {out}"
+            );
+            assert!(
+                !r.warnings.iter().any(|w| w.code.contains("not_found")
+                    || w.code == "redirect_yarn_classic_alias_skipped"),
+                "{key}: {:?}",
+                r.warnings
+            );
+        }
+    }
+
     /// way the vendored probe does — with no `packageManager` pin, with a
     /// non-1 yarn declared (`yarn@10` must not prefix-match `yarn@1`), and
     /// when the manifest is unparseable (fail toward warning).

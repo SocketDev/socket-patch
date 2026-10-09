@@ -20,7 +20,7 @@
 //! A block `name@range[, name@range2]:` with `version "X"` and
 //! `resolved "<spec>"`. The package is the REAL name of the key patterns
 //! (`alias@npm:real@range` names `real` —
-//! [`crate::formats::yarn::patterns::pattern_real_name`]); every pattern
+//! [`crate::formats::yarn::patterns::classic_pattern_real_name`]); every pattern
 //! must agree, otherwise a Socket-wired block is diagnosed (the rewriters
 //! refuse mixed keys). `link:` keys are skipped: yarn installs them from the
 //! working tree, never from `resolved`.
@@ -92,8 +92,8 @@ use super::{
 use crate::formats::yarn::blocks::{berry_field, classic_field};
 use crate::formats::yarn::is_berry_lock;
 use crate::formats::yarn::patterns::{
-    classic_key_real_name, pattern_real_name, resolution_selector_target, split_resolved_sha1,
-    BerryLocator,
+    classic_key_real_name, classic_pattern_real_name, resolution_selector_target,
+    split_resolved_sha1, BerryLocator,
 };
 use crate::formats::yarn::source::{classic_copy_source, CopySource};
 use crate::utils::digest::is_sri_pin;
@@ -216,8 +216,10 @@ fn classic_block(ctx: &DiscoverCtx<'_>, entry: &YarnEntry, out: &mut Discovery) 
     let Some(resolved) = resolved else {
         return;
     };
-    let names: std::collections::BTreeSet<Option<&str>> =
-        patterns.iter().map(|p| pattern_real_name(p)).collect();
+    let names: std::collections::BTreeSet<Option<&str>> = patterns
+        .iter()
+        .map(|p| classic_pattern_real_name(p))
+        .collect();
     let names: Vec<Option<&str>> = names.into_iter().collect();
     let Some(wiring) = classify(ctx, resolved, YARN_LOCK, &block.key, out) else {
         // Not Socket's (a rejected Socket spelling was diagnosed instead):
@@ -990,6 +992,32 @@ mod tests {
 
     /// Multi-pattern keys, scoped names, and `npm:` alias keys: the purl is
     /// the REAL package every pattern stands for.
+    /// #1271: a hosted pin on a block keyed by an empty range
+    /// (`left-pad@:` from `"left-pad": ""`), alone or merged ahead of
+    /// another range, is attributed like any registry key.
+    #[tokio::test]
+    async fn classic_hosted_empty_range_keys() {
+        let lp = hosted_url("npm", "left-pad", "1.3.0", UUID_A, "left-pad-1.3.0.tgz");
+        for key in ["left-pad@", "left-pad@, left-pad@^1.3.0"] {
+            let p = Project::new();
+            p.write(
+                "yarn.lock",
+                classic(&[classic_block(
+                    key,
+                    "1.3.0",
+                    &format!("{lp}#{SHA1}"),
+                    Some(SRI),
+                )]),
+            );
+            let out = run(&p).await;
+            assert_refs(
+                &out,
+                &[("pkg:npm/left-pad@1.3.0", UUID_A, WiringMode::Hosted)],
+            );
+            assert!(out.diagnostics.is_empty(), "{key}: {:?}", out.diagnostics);
+        }
+    }
+
     #[tokio::test]
     async fn classic_hosted_scoped_multi_pattern_and_alias_keys() {
         let lp = hosted_url("npm", "left-pad", "1.3.0", UUID_A, "left-pad-1.3.0.tgz");

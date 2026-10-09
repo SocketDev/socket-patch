@@ -1707,6 +1707,34 @@ left-pad@^1.3.0:
 
         let fx = fixture_with_lock(Y2_BEFORE).await;
         tokio::fs::remove_file(fx.lock_path()).await.unwrap();
+    /// #1271: yarn 1 locks `"left-pad": ""` (an empty range, the same as
+    /// `*`) under `left-pad@:`, merged with another member's range as
+    /// `left-pad@, left-pad@^1.3.0:`. Both blocks are the installed
+    /// registry copy: vendoring wires them (key line kept) and the revert
+    /// restores the lock byte-for-byte.
+    #[tokio::test]
+    async fn empty_range_key_is_wired_and_reverted() {
+        for key in ["left-pad@:", "left-pad@, left-pad@^1.3.0:"] {
+            let lock = Y2_BEFORE.replace("left-pad@^1.3.0:", key);
+            let fx = fixture_with_lock(&lock).await;
+            let (result, entry, _) = expect_done(fx.vendor(false).await);
+            assert!(result.success, "{key}: {:?}", result.error);
+            let entry = entry.expect("success carries a ledger entry");
+            assert_eq!(entry.wiring.len(), 1, "{key}");
+            let wired = fx.lock_text().await;
+            assert!(wired.contains(&format!("\n{key}\n")), "{key}: {wired}");
+            assert!(
+                !wired.contains("registry.yarnpkg.com") && wired.contains(".socket/vendor/npm/"),
+                "{key}: {wired}"
+            );
+
+            let outcome = revert_yarn_classic(&entry, fx.root(), false).await;
+            assert!(outcome.success, "{key}: {:?}", outcome.error);
+            assert!(outcome.warnings.is_empty(), "{key}: {:?}", outcome.warnings);
+            assert_eq!(fx.lock_text().await, lock, "{key}: lock restored");
+        }
+    }
+
         let detail = expect_refused(fx.vendor(false).await, "vendor_lockfile_missing");
         assert!(detail.contains("yarn install"), "{detail}");
     }
