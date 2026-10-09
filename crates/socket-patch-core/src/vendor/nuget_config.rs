@@ -91,7 +91,25 @@ pub(crate) mod tests_support {
 /// parent directory's config from the filesystem root down, each `<clear />`
 /// dropping the farther ones. A file that cannot be read or parsed is
 /// skipped: it contributes nothing NuGet could use either.
+#[cfg(test)]
 pub(crate) async fn inherited_source_keys(project_root: &std::path::Path) -> Vec<String> {
+    inherited_source_keys_traced(project_root).await.0.keys
+}
+
+/// What the configs NuGet merges below the project's own contribute.
+#[derive(Debug, Default, Clone, PartialEq, Eq)]
+pub(crate) struct Inherited {
+    /// Their package source keys ([`inherited_source_keys`]).
+    pub(crate) keys: Vec<String>,
+    /// One of them maps packages already: NuGet merges
+    /// `packageSourceMapping` across the chain too, so their patterns
+    /// already route every other package, and a `*` catch-all written here
+    /// would WIDEN a source they restrict.
+    pub(crate) mapped: bool,
+}
+
+/// [`Inherited`] for `project_root`.
+pub(crate) async fn inherited_sources(project_root: &std::path::Path) -> Inherited {
     inherited_source_keys_traced(project_root).await.0
 }
 
@@ -99,7 +117,7 @@ pub(crate) async fn inherited_source_keys(project_root: &std::path::Path) -> Vec
 /// for a read cache that fingerprints reads it did not mediate.
 pub(crate) async fn inherited_source_keys_traced(
     project_root: &std::path::Path,
-) -> (Vec<String>, Vec<std::path::PathBuf>) {
+) -> (Inherited, Vec<std::path::PathBuf>) {
     use crate::formats::nuget::{effective_source_keys, parse_config, NugetConfig};
     let mut touched: Vec<std::path::PathBuf> = Vec::new();
     let mut chain: Vec<NugetConfig> = Vec::new();
@@ -139,7 +157,14 @@ pub(crate) async fn inherited_source_keys_traced(
             break;
         }
     }
-    (effective_source_keys(&chain), touched)
+    let mapped = chain.iter().any(|cfg| !cfg.mappings.is_empty());
+    (
+        Inherited {
+            keys: effective_source_keys(&chain),
+            mapped,
+        },
+        touched,
+    )
 }
 
 #[cfg(test)]
@@ -214,5 +239,22 @@ mod tests {
         USER_CONFIG.with(|c| *c.borrow_mut() = None);
         std::fs::remove_file(tmp.path().join("repo/NuGet.Config")).unwrap();
         assert_eq!(inherited_source_keys(&project).await, ["nuget.org"]);
+    }
+
+    /// An inherited `packageSourceMapping` is reported (NuGet merges it).
+    #[tokio::test]
+    async fn inherited_mapping_is_reported() {
+        let tmp = tempfile::tempdir().unwrap();
+        let project = tmp.path().join("repo/app");
+        std::fs::create_dir_all(&project).unwrap();
+        assert!(!super::inherited_sources(&project).await.mapped);
+        std::fs::write(
+            tmp.path().join("repo/nuget.config"),
+            "<configuration><packageSources><add key=\"corp\" value=\"https://corp/\" /></packageSources><packageSourceMapping><packageSource key=\"corp\"><package pattern=\"*\" /></packageSource></packageSourceMapping></configuration>",
+        )
+        .unwrap();
+        let got = super::inherited_sources(&project).await;
+        assert!(got.mapped);
+        assert_eq!(got.keys, ["nuget.org", "corp"]);
     }
 }

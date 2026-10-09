@@ -643,13 +643,19 @@ pub async fn read_candidate_files(
         // handed to it as such reads (asking for its raw root would end a
         // re-scan read cache's recording).
         if let Some(root) = view.disk_root_reading(std::iter::empty::<&str>()) {
-            let (keys, touched) =
+            let (inherited, touched) =
                 crate::vendor::nuget_config::inherited_source_keys_traced(root).await;
             view.disk_root_reading(&touched);
             out.files.insert(
                 crate::patch::redirect::NUGET_INHERITED_SOURCES_KEY.to_string(),
-                keys.join("\n"),
+                inherited.keys.join("\n"),
             );
+            if inherited.mapped {
+                out.files.insert(
+                    crate::patch::redirect::NUGET_INHERITED_MAPPING_KEY.to_string(),
+                    String::new(),
+                );
+            }
         }
     }
 

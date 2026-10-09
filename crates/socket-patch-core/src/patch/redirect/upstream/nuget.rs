@@ -450,6 +450,7 @@ mod tests {
             config,
             &parse_config(config).unwrap(),
             None,
+            false,
             &format!("socket-patch-{UUID}"),
             &index_url(),
             "Newtonsoft.Json",

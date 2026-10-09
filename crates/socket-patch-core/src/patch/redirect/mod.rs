@@ -5656,6 +5656,7 @@ fn add_nuget_source(
     config: &str,
     parsed: &crate::formats::nuget::NugetConfig,
     inherited: Option<&[String]>,
+    inherited_mapped: bool,
     reg: &str,
     index_url: &str,
     pkg_id: &str,
@@ -5684,9 +5685,13 @@ fn add_nuget_source(
         .is_none_or(|section| section.close_start.is_none());
     // nuget.org is only seeded when the inherited configs have it (or
     // nothing): a parent that cleared it for a mirror keeps that choice.
+    // An inherited mapping already routes everything else (NuGet merges
+    // mappings too): no catch-all, which would widen a source it restricts.
     let seed_nuget_org = creating_mapping
         && !own_sources
+        && !inherited_mapped
         && (inherited.is_empty() || inherited.iter().any(|k| k == NUGET_ORG_KEY));
+    let creating_mapping = creating_mapping && !inherited_mapped;
     let reg = nuget_xml_attribute(reg);
     let mut source_lines = format!(
         "    <add key=\"{reg}\" value=\"{}\" />",
@@ -5786,6 +5791,10 @@ fn nuget_xml_attribute(value: &str) -> String {
 /// directories), one per line ([`crate::vendor::nuget_config::inherited_source_keys`]).
 /// Never a path (see [`sbt::SYNTHETIC_KEY_PREFIX`]).
 pub const NUGET_INHERITED_SOURCES_KEY: &str = "<socket-patch:nuget-inherited-sources>";
+
+/// The synthetic candidate key present when one of those configs maps
+/// packages already (`packageSourceMapping`, which NuGet merges too).
+pub const NUGET_INHERITED_MAPPING_KEY: &str = "<socket-patch:nuget-inherited-mapping>";
 
 /// A config with no sources, the base of a fresh one when the inherited
 /// configs dropped nuget.org.
@@ -5911,6 +5920,7 @@ fn rewrite_nuget(
                 &config,
                 &parsed,
                 inherited.as_deref(),
+                files.contains_key(NUGET_INHERITED_MAPPING_KEY),
                 &reg,
                 &ov.index_url,
                 &dep.name,
@@ -22729,6 +22739,18 @@ packages:
         let config = &r.files["nuget.config"];
         assert_eq!(nuget_catch_all(config), ["mirror"], "{config}");
         assert!(!config.contains("nuget.org"), "{config}");
+
+        // An inherited mapping already routes everything else: only the
+        // Socket pattern is written (#354 review).
+        let mut files = BTreeMap::new();
+        files.insert("nuget.config".to_string(), default_nuget_config());
+        files.insert(
+            NUGET_INHERITED_SOURCES_KEY.to_string(),
+            "nuget.org\ncorp".to_string(),
+        );
+        files.insert(NUGET_INHERITED_MAPPING_KEY.to_string(), String::new());
+        let r = rewrite_registry_redirect(&files, &[nuget_override()]);
+        assert!(nuget_catch_all(&r.files["nuget.config"]).is_empty());
 
         // Without the key (the in-memory engine) the file alone decides.
         let mut files = BTreeMap::new();

@@ -386,7 +386,9 @@ const SET_ASIDE_CLOSE: &str = " -->";
 /// pattern is commented out where it stands (the whole `<packageSource>`
 /// when it was its only pattern: NuGet rejects an element with none), in a
 /// comment naming `key` that [`restore_set_aside`] turns back into the
-/// original bytes. Other Socket sources are left alone (their own wiring).
+/// original bytes. A `socket-patch-*` key is no exception: the key alone
+/// proves nothing about the feed behind it (a stale uuid, or any URL under a
+/// Socket-looking name), and only the source this run wires may serve `id`.
 ///
 /// `Ok((text, keys))` with the sources set aside (empty: nothing competed);
 /// `Err` when an element cannot be put in a comment (it holds `--`).
@@ -399,7 +401,7 @@ pub(crate) fn set_aside_competing_patterns(
     let mut cuts: Vec<std::ops::Range<usize>> = Vec::new();
     let mut keys: Vec<String> = Vec::new();
     for ((source, patterns), span) in cfg.mappings.iter().zip(&cfg.mapping_spans) {
-        if source == key || source.starts_with("socket-patch-") {
+        if source == key {
             continue;
         }
         let hits: Vec<usize> = (0..patterns.len())
@@ -556,6 +558,18 @@ mod tests {
             super::restore_set_aside(&out2, "socket-patch-u"),
             open_close
         );
+        // A Socket-looking key is a competitor like any other.
+        let lookalike = COMPETING.replace("key=\"corp\"", "key=\"socket-patch-evil\"");
+        let cfg3 = super::parse_config(&lookalike).unwrap();
+        let (out3, keys3) = super::set_aside_competing_patterns(
+            &lookalike,
+            &cfg3,
+            "socket-patch-u",
+            "Newtonsoft.Json",
+        )
+        .unwrap();
+        assert_eq!(keys3, ["nuget.org", "socket-patch-evil"]);
+        assert_eq!(super::restore_set_aside(&out3, "socket-patch-u"), lookalike);
         // Another key's markers are not ours to restore.
         assert_eq!(super::restore_set_aside(&out, "socket-patch-v"), out);
     }

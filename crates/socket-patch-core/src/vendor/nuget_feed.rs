@@ -516,9 +516,11 @@ pub async fn vendor_nuget(
     let new_hash = sha512_base64_of(&nupkg_bytes);
 
     // ── nuget.config wiring (runs after the artifact) ─────────────────────
+    let inherited = super::nuget_config::inherited_sources(project_root).await;
     let config_edit = match build_config_edit_with(
         config_text.as_deref(),
-        &super::nuget_config::inherited_source_keys(project_root).await,
+        &inherited.keys,
+        inherited.mapped,
         &source_key,
         &uuid_dir_rel,
         name,
@@ -883,7 +885,7 @@ fn build_config_edit(
 ) -> Result<ConfigEdit, String> {
     // No inherited configs: the file-only reading the writer had before
     // #354 (its own tests cover the inherited sources).
-    build_config_edit_with(original, &[], source_key, source_rel, patched_id)
+    build_config_edit_with(original, &[], false, source_key, source_rel, patched_id)
 }
 
 /// [`build_config_edit`] over `inherited`: the source keys the configs NuGet
@@ -892,10 +894,14 @@ fn build_config_edit(
 /// exists NuGet drops every source no pattern names, inherited ones
 /// included (#354) — and nuget.org is only seeded when the inherited set
 /// has it (or nothing): a parent that cleared nuget.org for a mirror keeps
-/// that choice.
+/// that choice. When an inherited config maps packages already
+/// (`inherited_mapped`), no catch-all is written at all: NuGet merges its
+/// patterns, which already route everything else, and a `*` here would widen
+/// a source it restricts.
 fn build_config_edit_with(
     original: Option<&str>,
     inherited: &[String],
+    inherited_mapped: bool,
     source_key: &str,
     source_rel: &str,
     patched_id: &str,
@@ -910,9 +916,13 @@ fn build_config_edit_with(
             // patched id to us while `*` keeps everything else on the
             // sources NuGet inherits. nuget.org (the implicit default) is
             // seeded unless the inherited configs dropped it.
-            let mut catch_all: Vec<String> = inherited.to_vec();
+            let mut catch_all: Vec<String> = if inherited_mapped {
+                Vec::new()
+            } else {
+                inherited.to_vec()
+            };
             let mut sources = String::new();
-            if seed_allowed {
+            if seed_allowed && !inherited_mapped {
                 sources.push_str(&format!(
                     "    <add key=\"{NUGET_ORG_SOURCE_KEY}\" value=\"{NUGET_ORG_SOURCE_URL}\" />\n"
                 ));
@@ -992,7 +1002,11 @@ fn build_config_edit_with(
             }
             let seed_nuget_org = creating_mapping
                 && !own_sources
+                && !inherited_mapped
                 && (inherited.is_empty() || inherited.iter().any(|k| k == NUGET_ORG_SOURCE_KEY));
+            if inherited_mapped {
+                catch_all_keys.clear();
+            }
 
             let source_add = format!("    <add key=\"{source_key}\" value=\"{source_rel}\" />\n");
             let org_add = format!(
@@ -4345,6 +4359,7 @@ mod tests {
         build_config_edit_with(
             original,
             &inherited,
+            false,
             &source_key(),
             &format!(".socket/vendor/nuget/{UUID}"),
             "Newtonsoft.Json",
@@ -4444,6 +4459,33 @@ mod tests {
             after,
             cfg.replace("</configuration>", "<!-- x -->\n</configuration>")
         );
+    }
+
+    /// #354 review: an inherited config that maps packages already routes
+    /// everything else (NuGet merges mappings too), so no `*` catch-all is
+    /// written — it would widen a source the parent restricts.
+    #[test]
+    fn inherited_mapping_gets_no_catch_all() {
+        let own = "<configuration>\n  <packageSources>\n    <add key=\"local\" value=\"./feed\" />\n  </packageSources>\n</configuration>\n";
+        for original in [None, Some(own)] {
+            let t = build_config_edit_with(
+                original,
+                &["nuget.org".to_string(), "corp".to_string()],
+                true,
+                &source_key(),
+                &format!(".socket/vendor/nuget/{UUID}"),
+                "Newtonsoft.Json",
+            )
+            .unwrap()
+            .new_text;
+            assert!(catch_all_of(&t).is_empty(), "{t}");
+            let parsed = crate::formats::nuget::parse_config(&t).unwrap();
+            assert_eq!(
+                parsed.mappings,
+                [(source_key(), vec!["Newtonsoft.Json".to_string()])],
+                "{t}"
+            );
+        }
     }
 
     /// #354 end to end: the project sits under a directory whose
