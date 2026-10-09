@@ -21,6 +21,10 @@
 //! * `lockless_other_dependencies` — the same project with no committed
 //!   `Cargo.lock`: with no resolved graph to read, a crate declared beside
 //!   any other dependency is refused just as loudly.
+//! * `user_patch_same_crate` / `config_patch_same_crate` — the user
+//!   overrides the patched crate with a `[patch]` path entry (root manifest
+//!   or `.cargo/config.toml`): hosted mode refuses it rather than dropping
+//!   the override and breaking `--locked` (#480).
 //!
 //! Every shape runs the same chain against the real cargo: a baseline build
 //! with a private CARGO_HOME (network to crates.io for fixture setup only),
@@ -109,6 +113,11 @@ struct Shape {
     /// A shape hosted mode must REFUSE: the rewriter warning code every
     /// patch is skipped with. The scan must leave every file untouched.
     refused: Option<&'static str>,
+    /// Extra crates.io dependencies fetched into the CARGO_HOME by a helper
+    /// project before the scan: a patched crate the project itself resolves
+    /// elsewhere (a `[patch]` override) still needs its registry copy for
+    /// the served `.crate`, exactly as on a machine that built it before.
+    prefetch: &'static str,
 }
 
 fn run_socket(cwd: &Path, args: &[&str], cargo_home: &Path) -> (i32, String, String) {
@@ -477,6 +486,19 @@ async fn run_shape(shape: Shape) -> Option<()> {
     if shape.lockless {
         std::fs::remove_file(proj.join("Cargo.lock")).unwrap();
     }
+    if !shape.prefetch.is_empty() {
+        let helper = tmp.path().join("prefetch");
+        std::fs::create_dir_all(helper.join("src")).unwrap();
+        std::fs::write(helper.join("Cargo.toml"), helper_manifest(shape.prefetch)).unwrap();
+        std::fs::write(helper.join("src/main.rs"), "fn main() {}\n").unwrap();
+        let fetched = cargo(&helper, &["build", "-q"], &home);
+        assert!(
+            fetched.status.success(),
+            "{}: the prefetch helper must build:\n{}",
+            shape.tag,
+            stderr(&fetched)
+        );
+    }
     let before = snapshot(&proj);
 
     let mut served = Vec::new();
@@ -787,6 +809,10 @@ fn pin_patched_versions(proj: &Path, home: &Path, patches: &[Patch]) {
     }
 }
 
+fn helper_manifest(deps: &str) -> String {
+    format!("[package]\nname = \"prefetch\"\nversion = \"0.1.0\"\nedition = \"2018\"\n\n[dependencies]\n{deps}")
+}
+
 fn consumer_manifest(deps: &str) -> String {
     format!("[package]\nname = \"consumer\"\nversion = \"0.1.0\"\nedition = \"2018\"\n\n[dependencies]\n{deps}")
 }
@@ -814,6 +840,7 @@ async fn cargo_hosted_multi_version_pins_each_declaration_and_removes_cleanly() 
         crlf: false,
         lockless: false,
         refused: None,
+        prefetch: "",
     };
     let _ = run_shape(shape).await;
 }
@@ -837,6 +864,7 @@ async fn cargo_hosted_legacy_config_is_restored_byte_for_byte() {
         crlf: false,
         lockless: false,
         refused: None,
+        prefetch: "",
     };
     let _ = run_shape(shape).await;
 }
@@ -875,6 +903,7 @@ async fn cargo_hosted_config_trailing_bytes_are_restored() {
             crlf: false,
             lockless: false,
             refused: None,
+            prefetch: "",
         };
         if run_shape(shape).await.is_none() {
             return;
@@ -908,6 +937,7 @@ async fn cargo_hosted_same_line_in_two_sections_removes_cleanly() {
         crlf: false,
         lockless: false,
         refused: None,
+        prefetch: "",
     };
     let _ = run_shape(shape).await;
 }
@@ -947,6 +977,7 @@ async fn cargo_hosted_workspace_member_declaration_is_pinned() {
         crlf: false,
         lockless: false,
         refused: None,
+        prefetch: "",
     };
     let _ = run_shape(shape).await;
 }
@@ -969,6 +1000,7 @@ async fn cargo_hosted_crlf_project_keeps_its_line_endings() {
         crlf: true,
         lockless: false,
         refused: None,
+        prefetch: "",
     };
     let _ = run_shape(shape).await;
 }
@@ -994,6 +1026,7 @@ async fn cargo_hosted_refuses_a_crate_another_crate_depends_on() {
         crlf: false,
         lockless: false,
         refused: Some("redirect_cargo_transitive_dependents"),
+        prefetch: "",
     };
     let _ = run_shape(shape).await;
 }
@@ -1020,6 +1053,82 @@ async fn cargo_hosted_refuses_a_lockless_project_with_other_dependencies() {
         crlf: false,
         lockless: true,
         refused: Some("redirect_cargo_lockless_dependents"),
+        prefetch: "",
+    };
+    let _ = run_shape(shape).await;
+}
+
+fn local_crate(name: &str, version: &str) -> String {
+    format!("[package]\nname = \"{name}\"\nversion = \"{version}\"\nedition = \"2018\"\n")
+}
+
+/// #480: the user overrides the patched crate with a root
+/// `[patch.crates-io]` path entry. Pinning the declaration to the Socket
+/// registry would silently drop the override (cargo: "patch … was not used
+/// in the crate graph") and, with a lock, break `cargo fetch --locked`, so
+/// hosted mode refuses it and rewrites nothing. The project has no
+/// committed `Cargo.lock` (a library): the crawl then walks the whole
+/// registry cache, finds the crates.io copy another project fetched, and
+/// hands the crate to the rewriter — which must read the override table.
+/// (With a lock the rewriter refuses from the sourceless lock block; the
+/// unit tests cover that, as the lock-scoped crawl never discovers it.)
+#[tokio::test(flavor = "multi_thread")]
+async fn cargo_hosted_refuses_a_crate_the_root_manifest_patch_overrides() {
+    let shape = Shape {
+        tag: "user-patch-same-crate",
+        files: vec![
+            (
+                "Cargo.toml",
+                format!(
+                    "{}\n[patch.crates-io]\ncfg-if = {{ path = \"cfg-if-local\" }}\n",
+                    consumer_manifest("cfg-if = \"1.0.4\"\n")
+                ),
+            ),
+            ("src/main.rs", "fn main() {}\n".to_string()),
+            ("cfg-if-local/Cargo.toml", local_crate("cfg-if", "1.0.4")),
+            (
+                "cfg-if-local/src/lib.rs",
+                "pub fn user_fork() {}\n".to_string(),
+            ),
+        ],
+        patches: vec![CFG_IF_1],
+        oracle: Vec::new(),
+        crlf: false,
+        lockless: true,
+        refused: Some("redirect_cargo_dep_overridden"),
+        prefetch: "cfg-if = \"=1.0.4\"\n",
+    };
+    let _ = run_shape(shape).await;
+}
+
+/// #480: the same override in the project `.cargo/config.toml` under the
+/// index-URL spelling (cargo merges `[patch]` from the config chain): the
+/// manifest says nothing, and the redirect is still refused.
+#[tokio::test(flavor = "multi_thread")]
+async fn cargo_hosted_refuses_a_crate_a_config_patch_overrides() {
+    let shape = Shape {
+        tag: "config-patch-same-crate",
+        files: vec![
+            ("Cargo.toml", consumer_manifest("cfg-if = \"1.0.4\"\n")),
+            (
+                ".cargo/config.toml",
+                "[patch.\"https://github.com/rust-lang/crates.io-index\"]\n\
+                 cfg-if = { path = \"local/cfg-if\" }\n"
+                    .to_string(),
+            ),
+            ("src/main.rs", "fn main() {}\n".to_string()),
+            ("local/cfg-if/Cargo.toml", local_crate("cfg-if", "1.0.4")),
+            (
+                "local/cfg-if/src/lib.rs",
+                "pub fn user_fork() {}\n".to_string(),
+            ),
+        ],
+        patches: vec![CFG_IF_1],
+        oracle: Vec::new(),
+        crlf: false,
+        lockless: true,
+        refused: Some("redirect_cargo_dep_overridden"),
+        prefetch: "cfg-if = \"=1.0.4\"\n",
     };
     let _ = run_shape(shape).await;
 }
