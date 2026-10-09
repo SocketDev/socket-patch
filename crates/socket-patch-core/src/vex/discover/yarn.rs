@@ -90,12 +90,12 @@ use super::{
     DIAG_REF_INVALID, DIAG_REF_UNATTRIBUTABLE,
 };
 use crate::formats::yarn::blocks::{berry_field, classic_field};
+use crate::formats::yarn::is_berry_lock;
 use crate::formats::yarn::patterns::{
     classic_key_real_name, pattern_real_name, resolution_selector_target, split_resolved_sha1,
     BerryLocator,
 };
 use crate::formats::yarn::source::{classic_copy_source, CopySource};
-use crate::formats::yarn::is_berry_lock;
 use crate::utils::digest::is_sri_pin;
 use crate::vendor::lock_inventory::yarn::{
     berry_checksum_pin, berry_entries, classic_entries, BerryLock, YarnEntry,

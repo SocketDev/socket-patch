@@ -702,7 +702,7 @@ const WRAPPER_PROPERTIES: &str = "gradle/wrapper/gradle-wrapper.properties";
 /// `\r`, `\f`, `\uXXXX` and `\<char>` escapes are resolved. A later key
 /// wins.
 fn parse_properties(bytes: &[u8]) -> HashMap<String, String> {
-    let bytes = bytes.strip_prefix(b"\xEF\xBB\xBF").unwrap_or(bytes);
+    let bytes = crate::formats::text::strip_bom_bytes(bytes);
     let text: String = bytes.iter().map(|&b| b as char).collect();
     let text = text.replace("\r\n", "\n");
     let is_ws = |c: char| matches!(c, ' ' | '\t' | '\x0c');
@@ -1009,4 +1009,24 @@ pub fn locked_gavs(cwd: &Path) -> BTreeSet<Gav> {
         }
     }
     out
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    /// `Properties.load` drops one leading UTF-8 BOM (#905); the bytes of a
+    /// second one are ISO-8859-1 content of the first key.
+    #[test]
+    fn parse_properties_drops_one_leading_bom_only() {
+        let one = parse_properties(b"\xef\xbb\xbfdistributionUrl=x\n");
+        assert_eq!(one.get("distributionUrl").map(String::as_str), Some("x"));
+        let two = parse_properties(b"\xef\xbb\xbf\xef\xbb\xbfdistributionUrl=x\n");
+        assert_eq!(two.get("distributionUrl"), None);
+        assert_eq!(
+            two.get("\u{ef}\u{bb}\u{bf}distributionUrl")
+                .map(String::as_str),
+            Some("x")
+        );
+    }
 }

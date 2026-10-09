@@ -531,6 +531,93 @@ async fn pipenv_vendored_to_hosted() {
     assert_vendored_to_hosted(&root, files).await;
 }
 
+/// A vendored Pipenv project beside a requirements `-r` include the hosted
+/// rewriter does not reach (the #567 shape). The attribution gate would
+/// veto the Pipfile.lock pin as contested, but a wet takeover has already
+/// reverted the vendored wiring by then: dropping it would strand the
+/// package on the unpatched registry release (exit 1) while the dry run
+/// reported success. A takeover keeps the rewriters' verdict, so the dry
+/// run and the wet run agree and the package is never left unpatched.
+#[tokio::test]
+async fn pipenv_takeover_beside_an_unreached_include_is_never_stranded() {
+    let (_tmp, root) = project();
+    let files = stage_pipenv(&root);
+    vendor_project(&root, files);
+    std::fs::write(root.join("requirements.txt"), "-r req/base.txt\n").unwrap();
+    std::fs::create_dir_all(root.join("req")).unwrap();
+    std::fs::write(root.join("req/base.txt"), "six==1.16.0\n").unwrap();
+    let vendored_lock = std::fs::read_to_string(root.join("Pipfile.lock")).unwrap();
+    let server = MockServer::start().await;
+    let hosted_url = mount_hosted_api(&server, true).await;
+    let uri = server.uri();
+
+    let mut dry = hosted_scan_args(&uri);
+    dry.push("--dry-run");
+    let (dry_code, dry_env) = run_cli(&root, &dry, &[]);
+    assert_eq!(
+        std::fs::read_to_string(root.join("Pipfile.lock")).unwrap(),
+        vendored_lock,
+        "a dry run writes nothing"
+    );
+
+    let (code, env) = hosted_scan(&root, &server);
+    assert_eq!(code, 0, "the takeover is not stranded: {env:#}");
+    assert!(
+        !env.to_string().contains("redirect_takeover_unpatched"),
+        "{env:#}"
+    );
+    assert_eq!(env["redirect"]["redirected"], 1, "{env:#}");
+    let lock = std::fs::read_to_string(root.join("Pipfile.lock")).unwrap();
+    assert!(
+        lock.contains(&hosted_url),
+        "six is pinned to the patch:\n{lock}"
+    );
+    assert!(!lock.contains(".socket/vendor/"), "{lock}");
+    assert_eq!(
+        (dry_code, &dry_env["redirect"]["redirected"]),
+        (code, &env["redirect"]["redirected"]),
+        "the dry run predicts the wet run: {dry_env:#}"
+    );
+}
+
+/// #567 without a takeover: the Pipfile.lock pin the hosted rewriter would
+/// land is contested by an `-r` include it does not reach, so the patch is
+/// left out — reported in `redirect.skipped[]` as `redirect_unattributable`
+/// with discovery's finding — nothing is written and the exit code is 0.
+#[tokio::test]
+async fn pipenv_redirect_beside_an_unreached_include_is_skipped_unattributable() {
+    let (_tmp, root) = project();
+    stage_pipenv(&root);
+    std::fs::write(root.join("requirements.txt"), "-r req/base.txt\n").unwrap();
+    std::fs::create_dir_all(root.join("req")).unwrap();
+    std::fs::write(root.join("req/base.txt"), "six==1.16.0\n").unwrap();
+    let pristine = std::fs::read_to_string(root.join("Pipfile.lock")).unwrap();
+    let server = MockServer::start().await;
+    mount_hosted_api(&server, true).await;
+
+    let (code, env) = hosted_scan(&root, &server);
+    assert_eq!(
+        code, 0,
+        "an unattributable pin is a skip, not a failure: {env:#}"
+    );
+    assert_eq!(env["redirect"]["redirected"], 0, "{env:#}");
+    let skipped = env["redirect"]["skipped"].as_array().expect("skipped[]");
+    assert_eq!(skipped.len(), 1, "{env:#}");
+    assert_eq!(skipped[0]["purl"], PURL, "{env:#}");
+    assert_eq!(skipped[0]["reason"], "redirect_unattributable", "{env:#}");
+    assert!(
+        skipped[0]["detail"]
+            .as_str()
+            .is_some_and(|d| d.contains("req/base.txt")),
+        "the detail names the contesting file: {env:#}"
+    );
+    assert_eq!(
+        std::fs::read_to_string(root.join("Pipfile.lock")).unwrap(),
+        pristine,
+        "nothing is written for it"
+    );
+}
+
 /// A superseding patch for the same release (a fixed patch, or one
 /// covering more CVEs).
 const UUID_B: &str = "6d4f2b3c-8e5a-4f7b-9c9d-2e3f4a5b6c7d";
@@ -1327,6 +1414,67 @@ async fn vendor_check_fails_after_hatch_dependency_reset() {
     let (_tmp, root) = project();
     let files = stage_hatch(&root);
     assert_check_catches_relock(&root, files);
+}
+
+/// #1120: a `requirements.txt` exported beside `uv.lock` pins the
+/// package from PyPI, so the uv-only wiring leaves installs from it
+/// unpatched. `uv export > requirements.txt` in Windows PowerShell 5.1
+/// writes it as UTF-16 with a byte-order mark, which pip and uv read like
+/// its UTF-8 twin, so `vendor` must name it (`pypi_multiple_lockfiles`)
+/// and `vendor --check` must fail on the contested wiring in every
+/// encoding, not pass as if the file were absent.
+#[tokio::test]
+async fn uv_requirements_export_contests_the_wiring_in_any_encoding() {
+    let text = "six==1.16.0\r\n";
+    let le: Vec<u8> = [0xFF, 0xFE]
+        .into_iter()
+        .chain(text.encode_utf16().flat_map(u16::to_le_bytes))
+        .collect();
+    let be: Vec<u8> = [0xFE, 0xFF]
+        .into_iter()
+        .chain(text.encode_utf16().flat_map(u16::to_be_bytes))
+        .collect();
+    for (case, bytes) in [
+        ("utf-8", text.as_bytes().to_vec()),
+        ("utf-16 le", le),
+        ("utf-16 be", be),
+    ] {
+        let (_tmp, root) = project();
+        stage_uv(&root);
+        std::fs::write(root.join("requirements.txt"), &bytes).unwrap();
+        stage_manifest(&root);
+        let (code, env) = run_cli(&root, &["vendor"], &[]);
+        assert_eq!(code, 0, "{case}: {env:#}");
+        assert!(
+            std::fs::read_to_string(root.join("uv.lock"))
+                .unwrap()
+                .contains(&format!(".socket/vendor/pypi/{UUID}/")),
+            "{case}: uv.lock is wired: {env:#}"
+        );
+        assert!(
+            env.to_string().contains("pypi_multiple_lockfiles"),
+            "{case}: vendor names requirements.txt as an unpatched install source: {env:#}"
+        );
+
+        let (code, env) = run_cli(&root, &["vendor", "--check"], &[]);
+        assert_eq!(
+            code, 1,
+            "{case}: requirements.txt installs unpatched: {env:#}"
+        );
+        let event = &env["events"][0];
+        assert_eq!(event["errorCode"], "vendor_check_failed", "{case}: {env:#}");
+        let reason = event["reason"].as_str().unwrap_or_default();
+        assert!(
+            reason.contains("wiring contested") && reason.contains("requirements.txt"),
+            "{case}: {env:#}"
+        );
+        // The vendored file is left as the user wrote it.
+        assert_eq!(
+            std::fs::read(root.join("requirements.txt")).unwrap(),
+            bytes,
+            "{case}"
+        );
+    }
 }
 
 /// #699: hosted mode rewrites only the ROOT `requirements.txt`, while

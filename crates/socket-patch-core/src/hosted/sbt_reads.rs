@@ -31,7 +31,7 @@ use crate::vendor::lock_inventory::ProjectView;
 pub async fn extra_resolution(view: &ProjectView<'_>) -> Option<String> {
     let root: PathBuf = match view {
         ProjectView::Disk(root) => root.to_path_buf(),
-        ProjectView::Snapshot(snap) => snap.root.to_path_buf(),
+        ProjectView::Snapshot(snap) => snap.root().to_path_buf(),
         ProjectView::Memory(_) => return None,
     };
     let doc = tokio::task::spawn_blocking(move || sbt_evidence::distill(&root))

@@ -570,7 +570,7 @@ fn get_with_explicit_cve_flag_works() {
         v["status"], "error",
         "must report a structured error; got: {stdout}"
     );
-    let err = v["error"].as_str().unwrap_or_default();
+    let err = v["error"]["message"].as_str().unwrap_or_default();
     assert!(
         err.contains("by-cve/CVE-2099-99999"),
         "--cve must route to the by-cve endpoint; got error: {err}"
@@ -678,7 +678,7 @@ fn bare_uuid_fallback_treats_uuid_as_get_identifier() {
     let v: serde_json::Value =
         serde_json::from_str(stdout.trim()).expect("must emit parseable JSON");
     assert_eq!(v["status"], "error", "got: {stdout}");
-    let err = v["error"].as_str().unwrap_or_default();
+    let err = v["error"]["message"].as_str().unwrap_or_default();
     assert!(
         err.contains("patches/view/11111111-1111-4111-8111-111111111111"),
         "bare-UUID fallback must route to the patch-view endpoint; got error: {err}"
@@ -693,7 +693,7 @@ fn bare_uuid_fallback_treats_uuid_as_get_identifier() {
 fn each_subcommand_help_prints_usage() {
     let tmp = tempfile::tempdir().unwrap();
     let subcommands = [
-        "apply", "rollback", "get", "scan", "list", "remove", "repair", "gc",
+        "apply", "rollback", "get", "scan", "list", "remove", "repair",
     ];
     for sub in subcommands {
         let (code, stdout, _stderr) = common::run_with_env(tmp.path(), &[sub, "--help"], &[]);
@@ -718,8 +718,6 @@ fn top_level_help_prints_all_subcommands() {
             "top-level help missing {sub}; got: {stdout}"
         );
     }
-    // `gc` is the visible alias.
-    assert!(stdout.contains("gc"), "top-level help missing `gc` alias");
 }
 
 #[test]

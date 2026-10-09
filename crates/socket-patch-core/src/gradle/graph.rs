@@ -1463,7 +1463,10 @@ pub fn wrapper_version(read: TextReadFn<'_>, root: &str) -> Option<(u32, u32, u3
                 .unwrap_or(rest);
             Some(rest.trim().replace('\\', ""))
         })?;
-    let re = regex::Regex::new(r"gradle-(\d+)\.(\d+)(?:\.(\d+))?").ok()?;
+    static RE: std::sync::OnceLock<regex::Regex> = std::sync::OnceLock::new();
+    let re = RE.get_or_init(|| {
+        regex::Regex::new(r"gradle-(\d+)\.(\d+)(?:\.(\d+))?").expect("valid wrapper regex")
+    });
     let caps = re.captures(&url)?;
     Some((
         caps[1].parse().ok()?,

@@ -133,7 +133,7 @@ async fn make_mock_server(after_hash: &str) -> MockServer {
         .mount(&server)
         .await;
 
-    // 2. By-package lookup (used by scan --apply for full PatchSearchResult).
+    // 2. By-package lookup (used by scan --mode agent for full PatchSearchResult).
     Mock::given(method("GET"))
         .and(path_regex(format!(
             "^/v0/orgs/{ORG}/patches/by-package/.+$"

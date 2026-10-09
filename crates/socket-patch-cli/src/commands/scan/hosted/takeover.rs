@@ -204,6 +204,11 @@ impl Takeover {
         Ok(out)
     }
 
+    /// The uuids of the purls staged now.
+    pub(super) fn staged_uuids(&self) -> BTreeSet<String> {
+        self.staged.iter().map(|s| s.uuid.clone()).collect()
+    }
+
     /// Whether any purl is (still) staged.
     pub(super) fn is_staged(&self) -> bool {
         !self.staged.is_empty()

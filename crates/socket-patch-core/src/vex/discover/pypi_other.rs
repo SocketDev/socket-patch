@@ -219,25 +219,26 @@ async fn extract_pipfile_lock(ctx: &DiscoverCtx<'_>, out: &mut Discovery) {
 // ── requirements files ───────────────────────────────────────────────────
 
 async fn extract_requirements(ctx: &DiscoverCtx<'_>, out: &mut Discovery) {
-    let files = match crate::vendor::requirements_include_names(ctx.root).await {
-        Ok(files) => files,
-        Err(e) => {
-            // A reached include exists but cannot be read: the tree is
-            // unknowable past it. Still read the root file (its own read
-            // diagnoses if IT is the unreadable one).
-            out.diag(
-                DIAG_LOCKFILE_UNREADABLE,
-                ROOT_REQUIREMENTS,
-                format!("cannot read the -r include tree of {ROOT_REQUIREMENTS}: {e}"),
-            );
-            vec![ROOT_REQUIREMENTS.to_string()]
-        }
-    };
+    let files =
+        match crate::vendor::pypi_requirements::requirements_include_names_in(ctx.view).await {
+            Ok(files) => files,
+            Err(e) => {
+                // A reached include exists but cannot be read: the tree is
+                // unknowable past it. Still read the root file (its own read
+                // diagnoses if IT is the unreadable one).
+                out.diag(
+                    DIAG_LOCKFILE_UNREADABLE,
+                    ROOT_REQUIREMENTS,
+                    format!("cannot read the -r include tree of {ROOT_REQUIREMENTS}: {e}"),
+                );
+                vec![ROOT_REQUIREMENTS.to_string()]
+            }
+        };
     for file in files.iter().take(MAX_REQUIREMENTS_FILES) {
         // pip installs the root and every include it reaches as ONE
         // requirement set, so they contest other locks as one (#1086).
         out.install_tree(file, ROOT_REQUIREMENTS);
-        let Some(text) = ctx.read_text(file, out).await else {
+        let Some(text) = ctx.read_requirements_text(file, out).await else {
             continue;
         };
         for line in logical_lines(&text) {
@@ -1003,6 +1004,78 @@ mod tests {
             &[("pkg:pypi/six@1.16.0", UUID_A, WiringMode::Vendored)],
         );
         assert_eq!(only_ref(&out).locked_integrity, None);
+    }
+
+    /// #1120: pip and uv decode a requirements file by its byte-order mark,
+    /// so a UTF-16 export beside a wired lock (`uv export` in Windows
+    /// PowerShell 5.1) and a UTF-16 or PEP 263 include are read as evidence
+    /// like their UTF-8 twins: their registry pins resolve the package
+    /// elsewhere, which contests the lock's wiring. A file pip's rules
+    /// cannot decode is diagnosed unreadable, never taken for absent.
+    #[tokio::test]
+    async fn requirements_files_decode_as_pip_does() {
+        fn utf16(text: &str, le: bool) -> Vec<u8> {
+            let bom: [u8; 2] = if le { [0xFF, 0xFE] } else { [0xFE, 0xFF] };
+            bom.into_iter()
+                .chain(text.encode_utf16().flat_map(|u| {
+                    if le {
+                        u.to_le_bytes()
+                    } else {
+                        u.to_be_bytes()
+                    }
+                }))
+                .collect()
+        }
+        let elsewhere = |out: &Discovery| {
+            let mut found: Vec<(String, String)> = out
+                .elsewhere
+                .iter()
+                .map(|e| (e.purl.clone(), e.file.display().to_string()))
+                .collect();
+            found.sort();
+            found
+        };
+        for le in [true, false] {
+            let p = Project::new();
+            p.write(
+                "requirements.txt",
+                utf16("-r dev.txt\r\nsix==1.16.0\r\n", le),
+            );
+            p.write("dev.txt", utf16("-r base.txt\r\nidna==3.7\r\n", !le));
+            p.write(
+                "base.txt",
+                b"# -*- coding: latin-1 -*-\n# Jos\xe9\nattrs==23.1.0\n".to_vec(),
+            );
+            let out = run(&p).await;
+            assert!(out.diagnostics.is_empty(), "le={le}: {:?}", out.diagnostics);
+            assert_eq!(
+                elsewhere(&out),
+                vec![
+                    ("pkg:pypi/attrs@23.1.0".to_string(), "base.txt".to_string()),
+                    ("pkg:pypi/idna@3.7".to_string(), "dev.txt".to_string()),
+                    (
+                        "pkg:pypi/six@1.16.0".to_string(),
+                        "requirements.txt".to_string()
+                    ),
+                ],
+                "le={le}"
+            );
+        }
+
+        let p = Project::new();
+        p.write("requirements.txt", b"# Jos\xe9\nsix==1.16.0\n".to_vec());
+        let out = run(&p).await;
+        assert!(out.elsewhere.is_empty(), "{:?}", out.elsewhere);
+        assert!(
+            !out.diagnostics.is_empty()
+                && out
+                    .diagnostics
+                    .iter()
+                    .all(|d| d.code == DIAG_LOCKFILE_UNREADABLE
+                        && d.file == std::path::Path::new("requirements.txt")),
+            "{:?}",
+            out.diagnostics
+        );
     }
 
     /// A vendored server sdist is wired like a wheel (requirements line,
