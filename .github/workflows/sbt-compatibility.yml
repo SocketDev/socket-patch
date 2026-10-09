@@ -24,7 +24,8 @@ on:
     types: [opened, synchronize, reopened, ready_for_review]
     # Only this ecosystem's own files. A change to shared engine code
     # (vendor/, patch/, vex/, scan/, Cargo.lock, ...) runs the full matrix on
-    # push to main, or on demand via workflow_dispatch on the PR branch;
+    # push to main (when it is in the push filter below) or nightly, or on
+    # demand via workflow_dispatch on the PR branch;
     # ci.yml's per-ecosystem blocking slice still runs on every PR and in
     # the merge queue (#1198).
     paths:
@@ -51,6 +52,50 @@ on:
       - 'crates/socket-patch-cli/tests/sbt_common/**'
   push:
     branches: [main]
+    # The ecosystem's pre-#1198 relevance set (the shared engine code its
+    # cells run through), its PR paths and the toolchain files. A main
+    # push outside this set waits for the nightly run below.
+    paths:
+      - '.github/workflows/sbt-compatibility.yml'
+      - 'scripts/sbt-compat-matrix.sh'
+      - 'scripts/sbt-warm-seed.sh'
+      - 'docs/testing/sbt-compatibility.md'
+      - 'tests/docker/Dockerfile.sbt'
+      - 'tests/docker/Dockerfile.base'
+      - 'Cargo.toml'
+      - '.github/actions/upload-artifact/**'
+      - 'Cargo.lock'
+      - 'crates/*/Cargo.toml'
+      - 'crates/socket-patch-core/src/formats/**'
+      - 'crates/socket-patch-core/src/crawlers/**'
+      - 'crates/socket-patch-core/src/hosted/**'
+      - 'crates/socket-patch-core/src/patch/**'
+      - 'crates/socket-patch-core/src/manifest/**'
+      - 'crates/socket-patch-core/src/api/**'
+      - 'crates/socket-patch-core/src/utils/**'
+      - 'crates/socket-patch-core/src/vendor/**'
+      - 'crates/socket-patch-core/src/vex/**'
+      - 'crates/socket-patch-cli/src/**'
+      - 'crates/socket-patch-cli/tests/docker_e2e_sbt.rs'
+      - 'crates/socket-patch-cli/tests/e2e_sbt_build.rs'
+      - 'crates/socket-patch-cli/tests/e2e_sbt_vendor_build.rs'
+      - 'crates/socket-patch-cli/tests/e2e_scala_cli_vendor.rs'
+      - 'crates/socket-patch-cli/tests/sbt_build_common/**'
+      - 'crates/socket-patch-cli/tests/sbt_vendor_build_common/**'
+      - 'crates/socket-patch-cli/tests/sbt_e2e_shared/**'
+      - 'crates/socket-patch-cli/tests/sbt_common/**'
+      - 'crates/*/src/**/*sbt*'
+      - 'crates/*/src/**/*sbt*/**'
+      - 'crates/*/src/**/*scala*'
+      - 'crates/*/src/**/*scala*/**'
+      - 'crates/*/src/**/*coursier*'
+      - 'crates/*/src/**/*ivy*'
+      - 'rust-toolchain.toml'
+      - '.cargo/**'
+  schedule:
+    # Nightly full matrix, so a main change outside the push filter
+    # still gets a run within a day.
+    - cron: '17 4 * * *'
   workflow_dispatch:
 
 permissions:
