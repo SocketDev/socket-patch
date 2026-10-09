@@ -1,6 +1,6 @@
 [agent] Progress ledger for the scheduled Bundler (RubyGems) bug-hunt routine (label pm:bundler).
 
-Last updated: 2026-10-09 (run 35), main `f3c6313`, latest release v4.0.0 (npm; no git tags). Newest Bundler tested: 4.1.0.beta2; newest stable 4.0.22.
+Last updated: 2026-10-09 (run 36), main `a80b89e`, latest release v4.0.0 (npm; no git tags). Newest Bundler tested: 4.1.0.beta2; newest stable 4.0.22.
 
 ## Coverage matrix
 
@@ -326,6 +326,17 @@ Also on 4.0.17: BOM `Gemfile` passes; symlinked `Gemfile` / lock is refused (pas
 | Hosted superseding patch under `--max-new-patches 0`, no-CHECKSUMS | — | — | fail (#1224 comment; predates #1058) |
 | Same, CHECKSUMS lock | — | pass (`upgrade: 1`) | — |
 
+### Run 36 (main `a80b89e`; Linux Ruby 3.3.6; 3–4 gem hosted mock + real rubygems.org upstream)
+
+| Cell | 4.1.0.beta2 | 4.0.22 | 2.6.9 | 2.5.22 |
+| --- | --- | --- | --- | --- |
+| Hosted 3 gems CHECKSUMS: `rollback` first / middle / last / all, `remove` middle → frozen install | pass (middle) | pass | pass (middle) | — |
+| Unfrozen install between scan and `rollback` | pass | — | pass | — |
+| Patched gem with deps (`rack-test` → `rack`) cycle + `rollback` | — | pass | — | — |
+| In-run `--vex` with 1 of 3 refused | — | pass | — | — |
+| #1224 fix, capped re-scan `Gemfile` / `gems.rb` / lockless | — | — | — | pass |
+| `bundle cache` after scan → `rollback` / `remove` | fail #1260 | fail #1260 | fail #1260 | fail #1260 |
+
 ### Global mode (`-g`)
 
 | OS | Ruby / Bundler | `scan -g` report | `-g` vs project scoping | `scan -g --mode hosted` refused | `get -g` / `apply -g` | `rollback -g` byte-exact | `vex -g` | `--global-prefix <gems dir>` / `SOCKET_GLOBAL=1` | Non-writable gem dir |
@@ -348,12 +359,11 @@ Also on 4.0.17: BOM `Gemfile` passes; symlinked `Gemfile` / lock is refused (pas
 
 ## Backlog
 
-1. #1224 neighbours: `gems.rb` spelling; lockless Gemfile (#1125 shape) under a cap; cap via `SOCKET_MAX_NEW_PATCHES` / socket.yml.
-2. #1186 neighbours: `rollback` / `remove` of one of 3 hosted gems on a CHECKSUMS lock; Bundler 2.6.9.
+1. Vendored with a committed `vendor/cache` (`bundle cache --all` and the `.socket/vendor` path gem; `vendor --revert` with a stale cache).
+2. H→V takeover with the hosted patched archive in `vendor/cache` (#1260 neighbour).
 3. #749 DSL gap: vendored DSL `lockfile`, and `lockfile false`.
-4. Bundler 4.1 `override "x", from:, to:` (new in beta2) vs a hosted transitive redirect and `vex`.
-5. Re-run #896 / #952 / #985 / #1056 / #1092 / #1109 / #1125 / #1224 when fixes merge; check PR #1221 (#780) once it lands.
-6. #1092 neighbours: Windows `x64-mingw-ucrt` + `x64-mingw32` pairs (probe branch). #1056 neighbours: CRLF Gemfile and `gems.rb`.
+4. #1092 neighbours: Windows `x64-mingw-ucrt` + `x64-mingw32` pairs (probe branch). #1056 neighbours: CRLF Gemfile and `gems.rb`.
+5. Re-run #896 / #952 / #985 / #1056 / #1092 / #1109 / #1125 / #1260 when fixes merge.
 
 ## Known non-bugs
 
@@ -457,3 +467,5 @@ Also on 4.0.17: BOM `Gemfile` passes; symlinked `Gemfile` / lock is refused (pas
 - A capped hosted re-scan never un-wires a deferred gem: the Gemfile `source` block stays, so #1224 is a stuck rollout, not silent unpatching (run 35).
 - Bundler 4.1.0.beta2 lock / DSL changes (`OPTIONS` regex allows `_` for `sparse_checkout:`, the `override from:/to:` DSL, empty-CHECKSUMS re-resolve only when fetching remotely) don't touch the shapes socket-patch writes; the gem suites pass (run 35).
 - Bisect without rebuilding tests: temporarily make `binary()` in the e2e file honour a `ZZ_BIN` env override, and build the old commit's release binary into its own `CARGO_TARGET_DIR` (about 6 min) (run 35). `std::env::var("X").is_ok()` is true for `X=""`, so leave scratch toggles unset rather than empty.
+- A 3–4 gem hosted mock (run 36) is in the run-36 entry's description: one uuid per gem, so the patch-registry `GEM` sections sort in a known order, and the compact-index `info` carries `deps` (`rack-test` → `rack:>= 1.3`). Its `/patches/batch` offers every gem whatever the query, so a lockless or shared-home scan "finds" gems the project never declared (a mock artifact, not #1125).
+- A partial hosted `rollback` leaves a VEX statement whose subcomponents list only the still-patched gems, even when they share one advisory with the rolled-back gem (correct OpenVEX scoping, run 36).
