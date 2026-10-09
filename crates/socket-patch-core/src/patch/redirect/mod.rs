@@ -7051,6 +7051,31 @@ fn rewrite_maven_pom(
         return;
     }
     let mut pom = files.get("pom.xml").cloned();
+    // A reactor root: this rewriter reads only the root pom, and a module's
+    // own literal `<version>` beats any pin written here, so that module
+    // would keep the unpatched upstream jar while the dep counts as
+    // redirected and VEX attests it (#261). Refuse the whole root, untouched;
+    // vendored mode's reactor planner rewrites each module's declaration.
+    if pom
+        .as_deref()
+        .is_some_and(crate::vendor::jvm::maven_reactor::declares_modules)
+    {
+        let gas: Vec<String> = maven
+            .iter()
+            .map(|dep| match &dep.namespace {
+                Some(ns) => format!("{ns}:{}", dep.name),
+                None => dep.name.clone(),
+            })
+            .collect();
+        result.warnings.push(RewriteWarning {
+            code: "redirect_maven_multimodule_unsupported".into(),
+            detail: format!(
+                "pom.xml declares <modules>/<subprojects>; hosted mode reads only the root pom, so a module's own <version> of {} would stay unpatched. pom.xml and .mvn/ were left as they are and the dep is not counted as redirected; use `scan --mode vendored`, which pins each module's declaration",
+                gas.join(", ")
+            ),
+        });
+        return;
+    }
     let mut pom_changed = false;
     // The hosted generations whose `socket-patch-<uuid>` repository the pom
     // declared before this run: only a suffixed literal one of these minted
@@ -8390,6 +8415,72 @@ mod tests {
             second.files.keys(),
             second.edits
         );
+    }
+
+    /// A reactor root (`<modules>`, Maven 4 `<subprojects>`, or a profile's
+    /// modules): hosted mode reads only the root pom, so a module's own
+    /// literal `<version>` would shadow any root pin and stay unpatched
+    /// (#261). Refuse the whole root: no pom / `.mvn` edits, one warning
+    /// naming vendored mode, whose reactor planner rewrites the modules.
+    #[test]
+    fn maven_pom_reactor_root_is_refused() {
+        let dep = "<dependencies>\n    <dependency>\n      <groupId>org.slf4j</groupId>\n      <artifactId>slf4j-api</artifactId>\n      <version>1.7.36</version>\n    </dependency>\n  </dependencies>\n";
+        for (case, reactor) in [
+            ("modules", "<modules>\n    <module>child</module>\n  </modules>\n"),
+            (
+                "subprojects",
+                "<subprojects>\n    <subproject>child</subproject>\n  </subprojects>\n",
+            ),
+            (
+                "profile modules",
+                "<profiles>\n    <profile>\n      <id>all</id>\n      <modules>\n        <module>child</module>\n      </modules>\n    </profile>\n  </profiles>\n",
+            ),
+        ] {
+            // Whether or not the root itself declares the GA: the module
+            // literal is what Maven resolves for that module.
+            for body in [String::new(), dep.to_string()] {
+                let mut files = BTreeMap::new();
+                files.insert(
+                    "pom.xml".to_string(),
+                    format!(
+                        "<project>\n  <groupId>com.example</groupId>\n  <artifactId>root</artifactId>\n  <version>1.0.0</version>\n  <packaging>pom</packaging>\n  {reactor}  {body}</project>\n"
+                    ),
+                );
+                let r = rewrite_registry_redirect(&files, &[maven_override()]);
+                assert!(
+                    r.files.is_empty() && r.edits.is_empty(),
+                    "{case}: a reactor root must not be edited: files={:?} edits={:?}",
+                    r.files.keys(),
+                    r.edits
+                );
+                assert_eq!(
+                    warning_codes(&r),
+                    vec!["redirect_maven_multimodule_unsupported"],
+                    "{case}"
+                );
+                let detail = &r.warnings[0].detail;
+                assert!(
+                    detail.contains("org.slf4j:slf4j-api") && detail.contains("--mode vendored"),
+                    "{case}: {detail}"
+                );
+            }
+        }
+
+        // A commented-out <modules> or one in plugin configuration is not a
+        // reactor: the single-module rewrite still lands.
+        let mut files = BTreeMap::new();
+        files.insert(
+            "pom.xml".to_string(),
+            format!(
+                "<project>\n  <!-- <modules><module>child</module></modules> -->\n  {dep}</project>\n"
+            ),
+        );
+        let r = rewrite_registry_redirect(&files, &[maven_override()]);
+        assert!(
+            r.files["pom.xml"].contains(MAVEN_SUFFIXED),
+            "single-module root still rewritten"
+        );
+        assert!(!warning_codes(&r).contains(&"redirect_maven_multimodule_unsupported"));
     }
 
     /// Fail-closed transitive-only (no matching dependency): a
