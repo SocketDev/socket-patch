@@ -36,6 +36,7 @@ use super::{
 use super::layout::{self, safe_coordinates};
 use crate::formats::text::{split_bom, strip_bom};
 use crate::formats::xml::{self, Element};
+use crate::utils::line_endings;
 
 /// The owned settings script. Its bytes change only with a CLI release.
 pub const SCRIPT: &str = include_str!("socket-patch.settings.gradle");
@@ -549,7 +550,7 @@ pub fn plan(
                 Some(&text[start..end]).filter(|f| !f.contains("origin=\"socket-patch\""));
             let mut replacement = replacement;
             if text[start..end].starts_with("<components") && text[start..end].ends_with("/>") {
-                let nl = newline_of(&text);
+                let nl = line_endings::terminator(&text);
                 let indent = line_indent(&text, start);
                 let shell = format!("<components>{nl}{indent}</components>");
                 records.pop();
@@ -963,11 +964,7 @@ pub fn unplan(read: ReadFn<'_>, c: &Coords<'_>, records: &[WiringRecord]) -> Jvm
         // elements span lines in the file's vendor-time newline, and a
         // `core.autocrlf` checkout converts the whole file.
         let holds_to = |t: &str| {
-            t.contains(to)
-                || t.contains(&crate::gradle::eol::apply_eol(
-                    to,
-                    crate::gradle::eol::sniff_crlf(t.as_bytes()),
-                ))
+            t.contains(to) || t.contains(&line_endings::respell(to, line_endings::terminator(t)))
         };
         let Some(from) = op_str(w, "from") else {
             if holds_to(t) {
@@ -1047,8 +1044,7 @@ pub fn unplan(read: ReadFn<'_>, c: &Coords<'_>, records: &[WiringRecord]) -> Jvm
             {
                 let Some(t) = text.as_deref() else { break };
                 let written = op_str(w, "text").unwrap_or_default();
-                let crlf = crate::gradle::eol::sniff_crlf(t.as_bytes());
-                let written_here = crate::gradle::eol::apply_eol(written, crlf);
+                let written_here = line_endings::respell(written, line_endings::terminator(t));
                 *text = match op_of(w) {
                     "create" if is_ours(Some(t.as_bytes()), written) => None,
                     "create" => {
@@ -1108,8 +1104,7 @@ pub fn unplan(read: ReadFn<'_>, c: &Coords<'_>, records: &[WiringRecord]) -> Jvm
                 },
                 ("line", Some(t)) => {
                     let written = op_str(w, "text").unwrap_or_default();
-                    let crlf = crate::gradle::eol::sniff_crlf(t.as_bytes());
-                    let here = crate::gradle::eol::apply_eol(written, crlf);
+                    let here = line_endings::respell(written, line_endings::terminator(t));
                     Some(
                         match t
                             .strip_suffix(here.as_str())
@@ -1158,10 +1153,10 @@ pub fn unplan(read: ReadFn<'_>, c: &Coords<'_>, records: &[WiringRecord]) -> Jvm
 /// `core.autocrlf` checkout of a settings file vendor edited with LF).
 fn undo_replace_eol(text: &str, from: &str, to: &str) -> Option<String> {
     undo_replace(text, from, to).or_else(|| {
-        let crlf = crate::gradle::eol::sniff_crlf(text.as_bytes());
+        let nl = line_endings::terminator(text);
         let (from, to) = (
-            crate::gradle::eol::apply_eol(from, crlf),
-            crate::gradle::eol::apply_eol(to, crlf),
+            line_endings::respell(from, nl),
+            line_endings::respell(to, nl),
         );
         undo_replace(text, &from, &to)
     })
@@ -1505,13 +1500,8 @@ pub(crate) fn remove_apply_line(
     Some(format!("{}{}", &text[..start], &text[end..]))
 }
 
-/// The newline the file already uses (CRLF when its first line ends so).
-fn newline_of(text: &str) -> &'static str {
-    crate::gradle::eol::newline_of(text)
-}
-
 fn append_line(text: &str, line: &str) -> String {
-    let nl = newline_of(text);
+    let nl = line_endings::terminator(text);
     let mut out = text.to_string();
     if !strip_bom(&out).is_empty() && !out.ends_with('\n') {
         out.push_str(nl);
@@ -1718,7 +1708,7 @@ fn scoped_in_block_entry(
         return InBlock::Unneeded;
     }
     let entry = in_block_line(kotlin, prefix, patch);
-    let nl = newline_of(text);
+    let nl = line_endings::terminator(text);
     let unit = indent_unit(text);
     let Some((pm_name, pm_open, pm_close)) = find_block(&toks, 0, toks.len(), scope) else {
         if scope == "buildscript" {
@@ -2044,7 +2034,7 @@ fn has_checksum(masked: &str, art: &Element) -> bool {
 fn with_sha256(text: &str, masked: &str, art: &Element, sha: &str) -> String {
     const UNIT: &str = "   ";
     let (start, tag_end, end) = (art.start, art.inner_start, art.end);
-    let nl = newline_of(text);
+    let nl = line_endings::terminator(text);
     let indent = line_indent(text, start);
     let name = xml::attr(art.open_tag(masked), "name").unwrap_or_default();
     if tag_end == end {
@@ -2206,7 +2196,7 @@ fn verification_artifact_edit(
         )
     };
     let masked = xml::blank_non_markup(text).map_err(|why| unparseable(&why))?;
-    let nl = newline_of(text);
+    let nl = line_endings::terminator(text);
     const UNIT: &str = "   ";
     let (a, v) = (patch.artifact_id, patch.version);
     let jar_name = file_name.to_string();
@@ -3922,7 +3912,7 @@ mod tests {
             let text = String::from_utf8(out[*rel].clone()).unwrap();
             out.insert(
                 rel.to_string(),
-                crate::gradle::eol::apply_eol(&text, true).into_bytes(),
+                line_endings::respell(&text, "\r\n").into_bytes(),
             );
         }
         out
@@ -4003,6 +3993,40 @@ mod tests {
             out["settings.gradle"],
             crlf(&files, &["settings.gradle"])["settings.gradle"]
         );
+    }
+
+    /// #815: a mixed CRLF/LF settings file gets its inserted lines in the
+    /// majority terminator (`line_endings::terminator`, the rule every
+    /// other line-inserting writer uses) — not the first line's — whichever
+    /// way the first line and the majority disagree, and the revert finds
+    /// what the forward pass wrote and restores the file byte for byte.
+    #[test]
+    fn mixed_settings_take_the_majority_terminator_and_revert_byte_exact() {
+        for (src, nl) in [
+            (
+                "rootProject.name = 'x'\ninclude 'a'\r\ninclude 'b'\r\n",
+                "\r\n",
+            ),
+            ("rootProject.name = 'x'\r\ninclude 'a'\ninclude 'b'\n", "\n"),
+        ] {
+            let files = fs(&[("settings.gradle", src)]);
+            let p = patch();
+            let plan = run(&files, &p).unwrap();
+            assert_eq!(
+                text_of(&plan, "settings.gradle"),
+                format!("{src}{}{nl}", vendored_line(false, "")),
+                "{src:?}"
+            );
+            let after = applied(&files, &plan);
+            assert!(run(&after, &p).unwrap().writes.is_empty(), "{src:?}");
+            let undo = unplan(&|rel| after.get(rel).cloned(), &p.coords(), &plan.records);
+            assert!(undo.drifted.is_empty(), "{src:?}: {:?}", undo.drifted);
+            assert_eq!(
+                reverted(&after, &undo)["settings.gradle"],
+                src.as_bytes(),
+                "{src:?}"
+            );
+        }
     }
 
     /// A settings file vendor created is deleted once only whitespace is
