@@ -13,7 +13,9 @@ use socket_patch_core::api::client::{
     is_fallback_candidate, ApiClient, ApiError,
 };
 use socket_patch_core::api::types::{BatchPackagePatches, BatchSearchResponse, PatchSearchResult};
-use socket_patch_core::crawlers::ruby_crawler::config_path_ignored_warning;
+use socket_patch_core::crawlers::ruby_crawler::{
+    config_path_ignored_warning, stale_plugin_registration_warning,
+};
 use socket_patch_core::crawlers::Ecosystem;
 use socket_patch_core::manifest::schema::PatchManifest;
 use socket_patch_core::telemetry::{
@@ -1850,6 +1852,16 @@ async fn run_scan(
     if let Some(value) = skipped_bundle_config_path {
         if args.common.ecosystem_selected(Ecosystem::Gem) {
             let (code, detail) = config_path_ignored_warning(&value);
+            layout_refusals.push((code.to_string(), detail));
+        }
+    }
+    // A Bundler plugin registration v4's `setup` left in this checkout,
+    // pointing at a plugin dir the v5 migration deleted (#1295).
+    if args.common.ecosystem_selected(Ecosystem::Gem)
+        && !args.common.global
+        && args.common.global_prefix.is_none()
+    {
+        if let Some((code, detail)) = stale_plugin_registration_warning(&args.common.cwd).await {
             layout_refusals.push((code.to_string(), detail));
         }
     }

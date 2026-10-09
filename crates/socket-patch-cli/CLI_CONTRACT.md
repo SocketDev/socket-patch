@@ -455,6 +455,17 @@ hand (the `postinstall`/`dependencies` entries, the `socket-patch[hook]` depende
 `post-install-cmd`/`post-update-cmd` entries). The `socket-patch-hook` wheel and the
 `socket-patch-bundler` gem are no longer published.
 
+Bundler also keeps a machine-local registration of the plugin in the uncommitted
+`.bundle/plugin/index`, which v4's `setup --remove` cleared and nothing in v5 does. Every
+checkout that ran `bundle install` under v4 must run `bundle plugin uninstall socket-patch` (or
+delete `.bundle/plugin/`) once: with the plugin directory gone, Bundler 2.3–2.5 fail every
+`bundle install` with a `LoadError` and 2.6+ warn on each run. `scan` (gem ecosystem selected,
+project mode) and `apply` (gem patches in scope, project mode) detect a registration of
+`socket-patch` at a path that no longer exists and report it as a `gem_bundler_plugin_stale`
+run-level `warnings[]` entry under `--json` (detail names the registered path, the index file and
+the remedy), and as one stderr `Warning: …` line otherwise (`apply` gates it on `!--silent`). A
+registration whose directory still exists is a working v4 setup and is not reported.
+
 Prefer hosted or vendored mode: their lockfile (and `.socket/vendor/`) edits are the persistence, so
 no Socket Patch install hook is needed. Agent mode (`scan --mode agent`, `get --mode agent`, `apply`) patches the installed tree
 in place, which the next package-manager install reverts; wire it into CI yourself:
