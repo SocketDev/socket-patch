@@ -64,19 +64,35 @@ pub(super) struct NpmCoords {
 /// vendor, arbitrary delete on revert) — reject fail-closed before any disk
 /// access. `Err` carries a ready [`VendorOutcome::Refused`] to bubble
 /// verbatim.
-/// True when the project's own `.npmrc` or `bunfig.toml` could make npm or
-/// Bun fetch a registry package from somewhere other than the URL its lock
-/// records (a `registry` / `@scope:registry` / `replace-registry-host`
-/// line, a Bun scope table), or can't be read. Deliberately coarse: a
-/// revert that would delete a vendored copy because a version moved
-/// "within the same registry" trusts that move only when this is false
-/// (#1155).
+/// True when npm or Bun might fetch a registry package from somewhere other
+/// than the URL its lock records, as far as the project and the process
+/// environment can tell: the project's own `.npmrc` or `bunfig.toml` sets
+/// anything at all (a registry, a scope table, a proxy, TLS settings, ...)
+/// or can't be read, or `NPM_CONFIG_REGISTRY` / `npm_config_registry` /
+/// `BUN_CONFIG_REGISTRY` is set. Deliberately coarse: a revert that would
+/// delete a vendored copy because a version moved "within the same
+/// registry" trusts that move only when this is false (#1155). User- and
+/// machine-level config files (`~/.npmrc`, `~/.bunfig.toml`, the global
+/// npmrc) are not read.
 pub(super) async fn project_may_redirect_registry(project_root: &Path) -> bool {
+    let env_registry = [
+        "NPM_CONFIG_REGISTRY",
+        "npm_config_registry",
+        "BUN_CONFIG_REGISTRY",
+    ]
+    .iter()
+    .any(|var| std::env::var_os(var).is_some_and(|v| !v.is_empty()));
+    if env_registry {
+        return true;
+    }
     for name in [".npmrc", "bunfig.toml"] {
         match crate::utils::fs::read_regular_to_string(&project_root.join(name)).await {
             Ok(text) => {
-                let text = text.to_ascii_lowercase();
-                if text.contains("registry") || text.contains("scope") {
+                let configures_something = text.lines().any(|line| {
+                    let line = line.trim();
+                    !line.is_empty() && !line.starts_with('#') && !line.starts_with(';')
+                });
+                if configures_something {
                     return true;
                 }
             }

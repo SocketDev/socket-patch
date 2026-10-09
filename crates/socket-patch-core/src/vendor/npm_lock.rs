@@ -3692,11 +3692,13 @@ mod tests {
     /// (`replace-registry-host`), so with a registry configured there a
     /// version move's recorded host proves nothing. It stays drift.
     #[tokio::test]
-    async fn revert_keeps_version_change_as_drift_while_npmrc_configures_a_registry() {
+    async fn revert_keeps_version_change_as_drift_while_a_project_npmrc_sets_anything() {
         for npmrc in [
             "registry=https://evil.example.com/\n",
             "@s:registry=https://evil.example.com/\n",
             "replace-registry-host=always\n",
+            "https-proxy=http://evil.example.com:8080\nstrict-ssl=false\n",
+            "cafile=./evil-ca.pem\n",
         ] {
             let fx = fixture().await;
             let (_, entry, _) = expect_done(fx.vendor(false).await);
@@ -3721,6 +3723,34 @@ mod tests {
             assert!(outcome.drift_skipped(), "{npmrc}: {:?}", outcome.warnings);
             assert!(outcome.kept_artifact, "{npmrc}: {:?}", outcome.warnings);
         }
+    }
+
+    /// A project `.npmrc` that holds only comments or blank lines changes
+    /// nothing about where npm fetches, so the upgrade is still trusted.
+    #[tokio::test]
+    async fn revert_after_version_change_ignores_a_comment_only_npmrc() {
+        let fx = fixture().await;
+        let (_, entry, _) = expect_done(fx.vendor(false).await);
+        let entry = entry.unwrap();
+        tokio::fs::write(fx.root().join(".npmrc"), "# nothing here\n\n; nor here\n")
+            .await
+            .unwrap();
+        let upgraded = json!({
+            "version": "1.3.1",
+            "resolved": "https://registry.npmjs.org/left-pad/-/left-pad-1.3.1.tgz",
+            "integrity": "sha512-upgraded=="
+        });
+        let mut live = fx.read_lock().await;
+        live["packages"]["node_modules/left-pad"] = upgraded.clone();
+        live["packages"]["node_modules/foo/node_modules/left-pad"] = upgraded;
+        tokio::fs::write(fx.lock_path(), serialize_json(&live, "  ").unwrap())
+            .await
+            .unwrap();
+
+        let outcome = revert_npm(&entry, fx.root(), false).await;
+        assert!(outcome.success, "{:?}", outcome.error);
+        assert!(!outcome.drift_skipped(), "{:?}", outcome.warnings);
+        assert!(!outcome.kept_artifact, "{:?}", outcome.warnings);
     }
 
     #[test]
