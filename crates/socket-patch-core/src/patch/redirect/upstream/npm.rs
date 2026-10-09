@@ -1701,7 +1701,8 @@ fn bun_lookup_layered(
     } else {
         npmrcs.chain(bunfigs).collect()
     };
-    // The configured default registry before the environment applies.
+    // The configured default registry before the environment applies,
+    // and whether the user's own file (not the project's) set it.
     let configured = || {
         sources.iter().find_map(|source| match source {
             Source::Npmrc(file) => {
@@ -1711,13 +1712,13 @@ fn bun_lookup_layered(
                     &bun_file_var(var, file.users),
                     false,
                 ))?;
-                Some(with_npmrc_auth(base, None))
+                Some((with_npmrc_auth(base, None), file.users))
             }
             Source::Bunfig(doc, users) => {
                 let item = doc.get("install")?.get("registry")?;
                 let var = bun_file_var(var, *users);
                 let base = toml_url(item, &var)?;
-                Some(with_npmrc_auth(base, toml_auth(item, &var)))
+                Some((with_npmrc_auth(base, toml_auth(item, &var)), *users))
             }
         })
     };
@@ -1746,14 +1747,21 @@ fn bun_lookup_layered(
                 // configured default registry, never the environment's,
                 // with its own credentials. With no default configured
                 // that is npmjs, which still gets the scope's token: a
-                // private npmjs scope 401s without it.
+                // private npmjs scope 401s without it. A token from the
+                // user's own file never goes to a default registry the
+                // project's file names: the repository would pick the host
+                // that receives the user's credential.
                 if !entry.is_table_like() || entry.get("url").is_some() {
                     return None;
                 }
                 let own = toml_auth(entry, &var);
                 Some(match configured() {
-                    Some(r) => Some(ProjectRegistry {
-                        authorization: own.or(r.authorization),
+                    Some((r, from_users)) => Some(ProjectRegistry {
+                        authorization: if *users && !from_users {
+                            r.authorization
+                        } else {
+                            own.or(r.authorization)
+                        },
                         ..r
                     }),
                     None => own.map(|own| ProjectRegistry {
@@ -1769,7 +1777,7 @@ fn bun_lookup_layered(
     }
     match env_registry.and_then(url) {
         Some(base) => Some(with_npmrc_auth(base, None)),
-        None => configured(),
+        None => configured().map(|(r, _)| r),
     }
 }
 
@@ -2491,6 +2499,28 @@ mod tests {
             (r.base.as_str(), r.authorization.as_deref()),
             ("https://ureg.example/", Some("Bearer t"))
         );
+        // It never goes to a default registry the project's file names,
+        // in either order: the repository would pick the host that gets
+        // the user's token.
+        for (npmrc, bunfig) in [
+            (vec![("registry=https://evil.example/\n", false)], vec![]),
+            (
+                vec![],
+                vec![("[install]\nregistry = \"https://evil.example/\"\n", false)],
+            ),
+        ] {
+            let mut bunfig = bunfig;
+            bunfig.push(("[install.scopes]\ns = { token = \"t\" }\n", true));
+            let leaked = files(&npmrc, &bunfig);
+            for bunfig_first in [false, true] {
+                let r = super::bun_lookup_layered(&leaked, None, &|_| None, "@s/a", bunfig_first)
+                    .unwrap();
+                assert_eq!(
+                    (r.base.as_str(), r.authorization.as_deref()),
+                    ("https://evil.example/", None)
+                );
+            }
+        }
     }
 
     #[test]
