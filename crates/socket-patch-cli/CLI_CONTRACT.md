@@ -381,7 +381,7 @@ Discovery is read-only, never touches the network, and never fails the run: a ma
 | pypi | `uv.lock` (confirmed by `pyproject.toml` `[tool.uv.sources]` when present), PEP 723 `<script>.py.lock`, `pylock.toml` / `pylock.<name>.toml`, `poetry.lock`, `pdm.lock`, `Pipfile.lock`, `requirements.txt` + its in-root `-r` includes, PEP 508 direct references in `pyproject.toml` / `hatch.toml` | Socket-host artifact url | `.socket/vendor/pypi/<uuid>/<wheel>` naming the entry's own dist | sha256, required |
 | gem | `Gemfile.lock` and `gems.locked` (the `Gemfile` / `gems.rb` only to cross-check a merged multi-remote `GEM` section) | a `GEM` section whose remote ends `patch-registry/gem/<token>/<uuid>` | `PATH` remote `.socket/vendor/gem/<uuid>/<name>-<ver>` | `CHECKSUMS` sha256, required only when the lock has a `CHECKSUMS` section (bundler ≥ 2.6) |
 | composer | `composer.lock` (`packages` + `packages-dev`) | `dist.url` on the patch host | `dist: {type: "path", url: ".socket/vendor/composer/<uuid>/…", reference: "<uuid>"}` | `dist.shasum`, required |
-| maven | `pom.xml` (+ `.mvn/maven.config`, `.mvn/checksums/checksums.sha256`) | a dependency version `<base>-socket.<hex8>` matching exactly ONE `socket-patch-<uuid>` repository on the patch host | `socket-patch-vendor-<uuid>` repository + exactly one jar under `.socket/vendor/maven/<uuid>/` with a matching `.sha1` | Trusted Checksums line when enabled; not required (the suffixed version is the pin) |
+| maven | `pom.xml` (+ `.mvn/maven.config`, `.mvn/checksums/checksums.sha256`) | a dependency version `<base>-socket.<hex8>` matching exactly ONE `socket-patch-<uuid>` repository on the patch host | pre-v5 single-POM wiring only: `socket-patch-vendor-<uuid>` repository + exactly one jar under `.socket/vendor/maven/<uuid>/` with a matching `.sha1`. A v5 suffixed pin served from `.socket/vendor/maven2` is no reference here: its ledger entry's wiring check gates it, so without a ledger it is not attested | Trusted Checksums line when enabled; not required (the suffixed version is the pin) |
 | gradle (v5.0) | `.socket/gradle/hosted-index.tsv`, the owned hosted script, and every settings script and lock file the script graph reaches | an index row whose repository URL is on the patch host and names the row's uuid, live only while the owned script is intact, every build's settings file applies it with the current index digest, every lock entry of the GA is the suffixed version, no `settings-gradle.lockfile` names the GA and no build script sets a custom `lockFile` (otherwise `patched_ref_invalid`) | none here: a vendored Gradle entry is gated by its ledger entry's wiring check | the suffixed copies installed in the Gradle cache; required (never the lock basis), because the script lets a higher upstream version resolve |
 | nuget | the first of `nuget.config` / `NuGet.config` / `NuGet.Config`, + `packages.lock.json` | source `socket-patch-<uuid>` + its exclusive exact-id `<packageSourceMapping>`; version from `packages.lock.json` | the same mapping onto `.socket/vendor/nuget/<uuid>`; version from the lock, else the feed's single nupkg | `contentHash`, required |
 | deno | `deno.lock`'s npm section, only as evidence against an npm-family pin of a `name@version` it also locks, which `vex` then omits (see **Unattested references**, #406) | — (no hosted mode) | — (no vendored backend) | — |
@@ -753,7 +753,7 @@ to **six flavors**.
 | pypi / pipenv (Pipfile.lock) | (rebuilt wheel) | lock-only: the `default`/`develop` entry → `{file, hashes:[sha256-of-our-wheel]}`. Pipfile + `_meta.hash` untouched. Emits `vendor_integrity_unverified` — pipenv does not hash-check file entries; the committed wheel bytes are the protection | `pipenv install --deploy` (+ `pipenv verify`), cold cache |
 | pypi / requirements.txt (pip / `uv pip`) | (rebuilt wheel) | pin line → `./<wheel>` (markers carried over; transitive deps appended), plus `--hash=sha256:<hex>` only when the requirements tree is already in pip's hash-checking mode (any `--hash` or `--require-hashes`) | `pip install -r` / `uv pip install -r` **run from the project root** (both resolve bare paths against the CWD) |
 | nuget | deterministically rebuilt `.nupkg` at `<idLower>.<versionNorm>.nupkg` (the uuid dir IS a NuGet folder feed; the stale embedded signature is dropped — unsigned is accepted under NuGet's default validation) | `nuget.config` source + `packageSourceMapping` for the id (creating the mapping from scratch ALSO fans a `<package pattern="*" />` out to every pre-existing source — mapping is exclusive, NU1100 otherwise) **+** `packages.lock.json` `contentHash` → `base64(sha512(nupkg))` when the lock exists (`vendor_nuget_no_lockfile` warning otherwise) | `dotnet restore --locked-mode`, cold cache, `--network none` (tampered nupkg fails NU1403) |
-| maven | deterministically rebuilt `.jar` + the **verbatim upstream pom** (transitives survive; refused via `vendor_maven_pom_unavailable` rather than fabricated) + `.sha1` sidecars, laid out as a maven2 repository under the uuid dir | `pom.xml` `<repository>` (`id=socket-patch-vendor-<uuid>`, `url=file://${project.basedir}/.socket/vendor/maven/<uuid>`, `checksumPolicy=fail`, snapshots disabled). Multi-module aggregator poms refused (`vendor_maven_multimodule_unsupported`); gradle-only projects refused (`vendor_gradle_unsupported`); always-on `vendor_maven_local_cache_shadow` advisory (warm `~/.m2` wins over any repository) | `mvn` build on a fresh checkout with the GAV purged from the local repo, `--network none` (docker capstone; note `mvn -o` refuses `file://` repositories outright) |
+| maven | the patched `.jar` + the upstream pom (only its `<version>` suffixed; transitives survive) + `.sha1` sidecars + an ownership marker under `.socket/vendor/maven2/<g-path>/<a>/<v>-socket.<hex8>/` | every pom root, single-module (a reactor of one) or multi-module: the pinned `<version>` + `<dependencyManagement>` pin, `.mvn/maven.config` (`maven.repo.local.tail`) and the `socket-patch-vendor` fallback file repository (`checksumPolicy=fail`); Gradle, sbt and scala-cli roots go to the same JVM backend (ledger ecosystem `jvm`). Pre-v5 `maven_pom_repository` entries (`<repository>` to `.socket/vendor/maven/<uuid>`) are revert-only: vendoring their root is refused (`vendor_jvm_shape_unsupported`, `legacy_maven_root`) | `mvn` build on a fresh checkout with a warm local repository and behind `mirrorOf external:*` (host capstone `e2e_vendor_maven_build` across the Maven matrix) |
 
 Ecosystems with no vendor backend (jsr) refuse per-purl with
 `vendor_unsupported_ecosystem`. yarn-berry **PnP**
@@ -1836,7 +1836,8 @@ If you add a new flag/subcommand/JSON key, add a test here that locks the new su
 
 ### Vendored JVM support (v5)
 
-Maven reactors and Gradle 6.8+ route to the JVM backend automatically. Ledger
+Every Maven root (a single-module `pom.xml` is a reactor of one) and Gradle 6.8+
+route to the JVM backend automatically. Ledger
 entries use ecosystem `jvm` with Maven PURLs. Revert, remove, rollback and repair
 share the v5 vendored backend; existing prototype wiring remains readable.
 See [the JVM design](../../docs/design/maven-vendoring.md) for supported shapes.
@@ -1934,8 +1935,8 @@ tree root's `jvm_owned_file`s, and the usual tree/upstream records. Revert drops
 the patch's rows in any order and deletes the generated file, after a strict
 parse proves it socket-patch's, once no pins remain; an edited file is
 `vendor_lock_entry_drifted` and keeps the tree while it still names the patch.
-A project already vendored through the Maven reactor, the single-pom path or the
-Gradle backend stays on it when sbt files appear. A generated file left without
+A project already vendored through the Maven reactor (single-module or not), the
+pre-v5 single-pom path or the Gradle backend stays on it when sbt files appear. A generated file left without
 a ledger is `vendor_ledger_missing` for `vendor --check`. Refusals (nothing written):
 `vendor_sbt_build_root_unknown` (no `sbt.version`; a subproject directory
 inside an sbt build is `vendor_jvm_shape_unsupported` with
@@ -2215,12 +2216,20 @@ with `reason: <reason>: `:
 
 | Code | Effect | Gradle reasons |
 |---|---|---|
-| `vendor_jvm_shape_unsupported` | refusal, nothing written | `gradle_below_6_8`, `android_or_kmp` (also `available-at` module redirects), `gradle_exclusive_content_conflict` (a user rule claiming the module, in any script), `gradle_range_excludes_vendored` (no declared selector admits the vendored version), `gradle_verification_unparseable`, `gradle_index_unreadable`, `build_file_unreadable` (including a non-UTF-8 settings file), `build_file_outside_root`, `not_build_root` (run from a directory an ancestor settings file includes or may include, from a project with no settings file of its own below one, or below an ancestor settings file that is not UTF-8; `repair` refuses there too), `no_build_file` |
+| `vendor_jvm_shape_unsupported` | refusal, nothing written | `gradle_below_6_8`, `android_or_kmp` (also `available-at` module redirects), `gradle_exclusive_content_conflict` (a user rule claiming the module, in any script), `gradle_range_excludes_vendored` (no declared selector admits the vendored version), `gradle_verification_unparseable`, `gradle_index_unreadable`, `build_file_unreadable` (including a non-UTF-8 settings file), `build_file_outside_root`, `not_build_root` (run from a directory an ancestor settings file includes or may include, from a project with no settings file of its own below one, or below an ancestor settings file that is not UTF-8; `repair` refuses there too), `no_build_file` (no `pom.xml`, Gradle, sbt or scala-cli build at the root), `legacy_maven_root` (the root's ledger still holds a pre-v5 single-POM `maven_pom_repository` entry; the whole root is refused until `vendor --revert`, then vendor again) |
 | `vendor_jvm_upstream_unavailable` | refusal | `classifier_unavailable` (a declared classifier jar no cache or registry has), `module_unavailable` (the pom declares Gradle module metadata that cannot be sourced), `pom_unavailable`, `verification_metadata_unavailable` |
-| `vendor_jvm_degraded` | applied, VEX withheld | `gradle_unscanned_build_logic`, `unwired_build_logic` (a nonliteral included build), `settings_plugins_unwired`, `classifier_unpatched_copy` (a classifier jar carries an unpatched copy of a patched member), `verification_parent_chain_unhandled`, `legacy_maven_root` (a single-POM root next to a Gradle build whose ledger already holds a single-POM entry; the Gradle build stays unpatched until `vendor --revert` and vendor again) |
+| `vendor_jvm_degraded` | applied, VEX withheld | `gradle_unscanned_build_logic`, `unwired_build_logic` (a nonliteral included build), `settings_plugins_unwired`, `classifier_unpatched_copy` (a classifier jar carries an unpatched copy of a patched member), `verification_parent_chain_unhandled` |
 | `vendor_jvm_note` | applied, informational | `range_declared` (a range, prefix or rich selector lists versions from the derived `maven-metadata.xml`), `ide_sources_unavailable` |
 | `vendor_jvm_upstream_unverified` | warning | Upstream metadata was taken offline and not authenticated against registry checksums. |
-| `vendor_gradle_unsupported` | refusal | Legacy single-POM path only: a Gradle project with no `pom.xml` that the JVM backend did not route. |
+
+The Maven half of a root (single-module, reactor or mixed) also reports
+`vendor_jvm_degraded` with `reason: maven_f_outside_root` (Maven 3.9.2–3.9.8
+cannot read the repository tail with `-f` from outside the root) and
+`reason: maven_mirror_of_all` (Maven before 3.9.2, or `--maven-config=none`,
+reads the fallback file repository, which a `mirrorOf=*` mirror captures)
+whenever `.mvn/wrapper/maven-wrapper.properties` does not prove a Maven outside
+those ranges — so every wrapper-less project gets both. The patch is applied
+and these two do not withhold VEX.
 
 A root holding both `pom.xml` and a Gradle build vendors both in one ledger entry
 (#395); either half refusing writes nothing. A derived
