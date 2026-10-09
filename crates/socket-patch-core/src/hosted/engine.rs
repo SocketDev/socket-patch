@@ -632,6 +632,20 @@ pub async fn read_candidate_files(
         }
     }
 
+    // NuGet merges the user config and every parent directory's config
+    // under the project's own: a catch-all mapping the rewriter creates
+    // must name their sources too (#354). Disk only (the in-memory engine
+    // refuses NuGet, and could not see them).
+    if candidates.iter().any(|c| c.dep.ecosystem == "nuget") {
+        if let Some(root) = view.disk_root() {
+            let keys = crate::vendor::nuget_config::inherited_source_keys(root).await;
+            out.files.insert(
+                crate::patch::redirect::NUGET_INHERITED_SOURCES_KEY.to_string(),
+                keys.join("\n"),
+            );
+        }
+    }
+
     for path in view.python_lock_paths() {
         if let Some(script) = crate::utils::python_lock::script_of_lock(&path) {
             out.read(view, unreadable, script).await;

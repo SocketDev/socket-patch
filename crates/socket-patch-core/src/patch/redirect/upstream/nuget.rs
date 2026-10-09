@@ -105,7 +105,9 @@ fn remove_source(config: &str, uuid: &str, id: &str, ctx: &Ctx<'_>) -> Result<St
 }
 
 /// Drop a `<packageSourceMapping>` that no longer routes anything: empty,
-/// or a `*` fan-out for exactly every remaining source.
+/// or a `*` fan-out naming every remaining source of the file (and, as the
+/// writers author it on disk, the sources inherited from the user and
+/// parent configs, #354).
 fn drop_fanout_mapping(config: &str) -> String {
     let Some(cfg) = parse_config(config) else {
         return config.to_string();
@@ -118,7 +120,8 @@ fn drop_fanout_mapping(config: &str) -> String {
         .mappings
         .iter()
         .all(|(_, patterns)| matches!(&patterns[..], [p] if p == "*"));
-    if !(cfg.mappings.is_empty() || (fanout_only && mapped == sources)) {
+    let covers_sources = sources.iter().all(|s| mapped.contains(s));
+    if !(cfg.mappings.is_empty() || (fanout_only && covers_sources)) {
         return config.to_string();
     }
     let re = Regex::new(r"(?s)<packageSourceMapping\s*>.*?</packageSourceMapping\s*>")
@@ -232,7 +235,11 @@ pub(crate) async fn restore(
                 result.refuse(&pin.uuid, format!("{} is not a NuGet purl", pin.purl));
                 continue;
             };
-            match remove_source(&text, &pin.uuid, &id, ctx) {
+            // Put back the patterns the rewriter set aside first: their
+            // comments name the Socket source (#462).
+            let key = crate::patch::redirect::generation::hosted_pin_name(&pin.uuid);
+            let unaside = crate::formats::nuget::restore_set_aside(&text, &key);
+            match remove_source(&unaside, &pin.uuid, &id, ctx) {
                 Ok(next) => {
                     text = next;
                     restored.push((pin, id, version));
@@ -324,7 +331,8 @@ pub(crate) async fn restore(
         {
             continue;
         }
-        if text == super::super::default_nuget_config() {
+        if text == super::super::default_nuget_config() || text == super::super::EMPTY_NUGET_CONFIG
+        {
             result.warnings.push((
                 "nuget_default_config_left",
                 format!(
@@ -441,6 +449,7 @@ mod tests {
         super::super::super::add_nuget_source(
             config,
             &parse_config(config).unwrap(),
+            None,
             &format!("socket-patch-{UUID}"),
             &index_url(),
             "Newtonsoft.Json",
@@ -517,6 +526,34 @@ mod tests {
         assert_eq!(config, USER_MAPPING);
         assert_eq!(lock_after, lock(UPSTREAM));
         assert!(outcome.warnings.is_empty(), "{:?}", outcome.warnings);
+    }
+
+    /// #462: the pattern the rewriter set aside comes back byte-exact.
+    #[tokio::test]
+    #[serial_test::serial]
+    async fn a_set_aside_pattern_is_restored() {
+        let user = USER_MAPPING.replace(
+            "      <package pattern=\"*\" />\n",
+            "      <package pattern=\"*\" />\n      <package pattern=\"Newtonsoft.Json\" />\n",
+        );
+        let hosted = hosted_config(&user);
+        let key = format!("socket-patch-{UUID}");
+        let (aside, moved) = crate::formats::nuget::set_aside_competing_patterns(
+            &hosted,
+            &parse_config(&hosted).unwrap(),
+            &key,
+            "Newtonsoft.Json",
+        )
+        .unwrap();
+        assert_eq!(moved, ["nuget.org"]);
+        let (outcome, config, _) = run(&aside, false).await;
+        assert_eq!(
+            outcome.pins[0].status,
+            PinStatus::Restored,
+            "{:?}",
+            outcome.pins
+        );
+        assert_eq!(config, user);
     }
 
     #[tokio::test]
