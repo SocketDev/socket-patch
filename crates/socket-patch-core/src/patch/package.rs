@@ -1,10 +1,9 @@
-//! Patch-archive tarball helpers.
+//! Bounded tarball readers.
 //!
-//! Diff archives (`.socket/diffs/<uuid>.tar.gz`) are a gzipped tar
-//! containing one entry per patched file. The entry's path matches the
-//! **normalized** relative file path (i.e. without the `package/` prefix
-//! used by the API), and each entry holds a bsdiff delta that transforms
-//! the corresponding `beforeHash` content into the `afterHash` content.
+//! The vendored and hosted backends read registry tarballs (npm `.tgz`,
+//! PyPI sdists) into memory through these helpers. Entry paths are
+//! **normalized** (the `package/` prefix is stripped), and every reader
+//! enforces the size, entry-count and path-safety limits below.
 
 use std::collections::HashMap;
 use std::io::Read;
@@ -13,7 +12,6 @@ use std::path::Path;
 use flate2::read::GzDecoder;
 use tar::Archive;
 
-use crate::manifest::schema::PatchFileInfo;
 use crate::patch::apply::{is_safe_relative_subpath, normalize_file_path};
 
 /// Maximum cumulative *decompressed* bytes we accept from a single
@@ -310,26 +308,6 @@ fn read_archive_from_reader<R: Read>(
     Ok(out)
 }
 
-/// Subset of `read_archive_to_map` that only keeps entries whose normalized
-/// path appears in `expected_files`. Anything else in the archive is
-/// silently dropped — this is defense-in-depth so a malicious archive
-/// cannot drop arbitrary files into the package directory.
-pub fn read_archive_filtered(
-    archive_path: &Path,
-    expected_files: &HashMap<String, PatchFileInfo>,
-) -> Result<HashMap<String, Vec<u8>>, ArchiveError> {
-    let allowed: std::collections::HashSet<String> = expected_files
-        .keys()
-        .map(|k| normalize_file_path(k).to_string())
-        .collect();
-
-    let all = read_archive_to_map(archive_path)?;
-    Ok(all
-        .into_iter()
-        .filter(|(k, _)| allowed.contains(k))
-        .collect())
-}
-
 #[cfg(test)]
 mod tests {
     use super::*;
@@ -363,25 +341,6 @@ mod tests {
         header.set_cksum();
         builder.append_link(&mut header, link_name, target).unwrap();
         builder.into_inner().unwrap().finish().unwrap();
-    }
-
-    fn make_file_info() -> HashMap<String, PatchFileInfo> {
-        let mut files = HashMap::new();
-        files.insert(
-            "package/index.js".to_string(),
-            PatchFileInfo {
-                before_hash: "a".repeat(64),
-                after_hash: "b".repeat(64),
-            },
-        );
-        files.insert(
-            "lib/util.js".to_string(),
-            PatchFileInfo {
-                before_hash: "c".repeat(64),
-                after_hash: "d".repeat(64),
-            },
-        );
-        files
     }
 
     #[test]
@@ -694,28 +653,6 @@ mod tests {
         // Symlink entries should be silently skipped.
         let map = read_archive_to_map(&archive).unwrap();
         assert!(map.is_empty());
-    }
-
-    #[test]
-    fn test_read_archive_filtered_drops_unexpected_entries() {
-        let dir = tempfile::tempdir().unwrap();
-        let archive = dir.path().join("arc.tar.gz");
-        write_archive(
-            &archive,
-            &[
-                ("package/index.js", b"patched index"),
-                ("lib/util.js", b"patched util"),
-                ("bonus/extra.js", b"unwanted"),
-            ],
-        );
-
-        let files = make_file_info();
-        let map = read_archive_filtered(&archive, &files).unwrap();
-        // Only the two expected paths survive.
-        assert_eq!(map.len(), 2);
-        assert!(map.contains_key("index.js"));
-        assert!(map.contains_key("lib/util.js"));
-        assert!(!map.contains_key("bonus/extra.js"));
     }
 
     #[test]
