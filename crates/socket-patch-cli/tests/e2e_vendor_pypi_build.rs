@@ -866,7 +866,10 @@ fn uv_vendor_revert_keeps_wheel_while_subdir_pylock_references_it() {
 #[test]
 #[serial_test::serial]
 fn uv_vendor_revert_keeps_wheel_while_lock_named_export_references_it() {
-    uv_vendor_revert_keeps_wheel_while_export_at("uv-export-requirements-lock", "requirements.lock");
+    uv_vendor_revert_keeps_wheel_while_export_at(
+        "uv-export-requirements-lock",
+        "requirements.lock",
+    );
     uv_vendor_revert_keeps_wheel_while_export_at(
         "uv-export-subdir-requirements-lock",
         "deploy/requirements.lock",
