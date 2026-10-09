@@ -52,9 +52,36 @@ enum PatchTelemetryEventType {
     // OpenVEX attestation (added in #81)
     VexGenerated,
     VexFailed,
+    // Self-update (`socket-patch --update`)
+    CliUpdated,
+    CliUpdateFailed,
 }
 
 impl PatchTelemetryEventType {
+    /// Every variant, for the backend-contract test.
+    #[cfg(test)]
+    const ALL: [Self; 19] = [
+        Self::PatchApplied,
+        Self::PatchApplyFailed,
+        Self::PatchRemoved,
+        Self::PatchRemoveFailed,
+        Self::PatchRolledBack,
+        Self::PatchRollbackFailed,
+        Self::PatchScanned,
+        Self::PatchScanFailed,
+        Self::PatchFetched,
+        Self::PatchFetchFailed,
+        Self::PatchVendored,
+        Self::PatchVendorFailed,
+        Self::PatchListed,
+        Self::PatchRepaired,
+        Self::PatchRepairFailed,
+        Self::VexGenerated,
+        Self::VexFailed,
+        Self::CliUpdated,
+        Self::CliUpdateFailed,
+    ];
+
     /// Return the wire-format string for this event type.
     fn as_str(&self) -> &'static str {
         match self {
@@ -75,6 +102,8 @@ impl PatchTelemetryEventType {
             Self::PatchRepairFailed => "patch_repair_failed",
             Self::VexGenerated => "vex_generated",
             Self::VexFailed => "vex_failed",
+            Self::CliUpdated => "cli_updated",
+            Self::CliUpdateFailed => "cli_update_failed",
         }
     }
 }
@@ -464,12 +493,16 @@ async fn fire_prepared(prepared: Option<PreparedSend>) {
     }
 }
 
-/// Track a successful patch application.
+/// Track a successful in-place (agent mode) patch application.
 pub async fn track_patch_applied(patches_count: usize, dry_run: bool, auth: &TelemetryAuth) {
     fire(
         PatchTelemetryEventType::PatchApplied,
         "apply",
-        serde_json::json!({ "patches_count": patches_count, "dry_run": dry_run }),
+        serde_json::json!({
+            "patches_count": patches_count,
+            "dry_run": dry_run,
+            "mode": "agent",
+        }),
         None::<&str>,
         auth,
     )
@@ -488,7 +521,52 @@ pub async fn track_patch_apply_failed(
     fire(
         PatchTelemetryEventType::PatchApplyFailed,
         "apply",
-        serde_json::json!({ "dry_run": dry_run }),
+        serde_json::json!({ "dry_run": dry_run, "mode": "agent" }),
+        Some(error),
+        auth,
+    )
+    .await;
+}
+
+/// Track a hosted-mode run (`scan`/`get --mode hosted`) that pinned
+/// patched dependencies to Socket's hosted patch server. Sent as
+/// `patch_applied` with `mode: "hosted"`: the lockfile pin is how hosted
+/// mode applies a patch, and the backend's adoption views count
+/// `patch_applied`. `files_count` is the number of lockfiles/manifests
+/// rewritten.
+pub async fn track_patch_hosted(
+    command: &'static str,
+    patches_count: usize,
+    files_count: usize,
+    dry_run: bool,
+    auth: &TelemetryAuth,
+) {
+    fire(
+        PatchTelemetryEventType::PatchApplied,
+        command,
+        serde_json::json!({
+            "patches_count": patches_count,
+            "files_count": files_count,
+            "dry_run": dry_run,
+            "mode": "hosted",
+        }),
+        None::<&str>,
+        auth,
+    )
+    .await;
+}
+
+/// Track a failed hosted-mode run (see [`track_patch_hosted`]).
+pub async fn track_patch_hosted_failed(
+    command: &'static str,
+    error: impl std::fmt::Display,
+    dry_run: bool,
+    auth: &TelemetryAuth,
+) {
+    fire(
+        PatchTelemetryEventType::PatchApplyFailed,
+        command,
+        serde_json::json!({ "dry_run": dry_run, "mode": "hosted" }),
         Some(error),
         auth,
     )
@@ -834,6 +912,54 @@ pub async fn track_vex_failed(error: impl std::fmt::Display, auth: &TelemetryAut
     .await;
 }
 
+// ---------------------------------------------------------------------------
+// Self-update trackers
+// ---------------------------------------------------------------------------
+
+/// Track a successful self-update (`socket-patch --update`). The event's
+/// `context.version` is the running (pre-update) build; `to_version` is
+/// what was installed. `channel` is the detected install channel
+/// (`standalone`, or the package manager a `--force` overrode).
+pub async fn track_cli_updated(
+    to_version: &str,
+    channel: &str,
+    pinned: bool,
+    forced: bool,
+    auth: &TelemetryAuth,
+) {
+    fire(
+        PatchTelemetryEventType::CliUpdated,
+        "update",
+        serde_json::json!({
+            "from_version": PACKAGE_VERSION,
+            "to_version": to_version,
+            "channel": channel,
+            "pinned": pinned,
+            "forced": forced,
+        }),
+        None::<&str>,
+        auth,
+    )
+    .await;
+}
+
+/// Track a failed self-update. `error_code` is the machine code the
+/// `--json` envelope carries (e.g. `managed_install`, `check_failed`).
+pub async fn track_cli_update_failed(
+    error_code: &str,
+    error: impl std::fmt::Display,
+    auth: &TelemetryAuth,
+) {
+    fire(
+        PatchTelemetryEventType::CliUpdateFailed,
+        "update",
+        serde_json::json!({ "error_code": error_code }),
+        Some(error),
+        auth,
+    )
+    .await;
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
@@ -1167,6 +1293,217 @@ mod tests {
             "vex_generated"
         );
         assert_eq!(PatchTelemetryEventType::VexFailed.as_str(), "vex_failed");
+        // Self-update
+        assert_eq!(PatchTelemetryEventType::CliUpdated.as_str(), "cli_updated");
+        assert_eq!(
+            PatchTelemetryEventType::CliUpdateFailed.as_str(),
+            "cli_update_failed"
+        );
+    }
+
+    /// The `event_type` strings depscan's `/v0/orgs/:slug/telemetry`
+    /// endpoint maps onto the `patch-lifecycle` ClickHouse category
+    /// (`PATCH_EVENT_TYPES_BY_STRING` in depscan's
+    /// `workspaces/api-v0/src/endpoints/orgs/telemetry-discriminators.ts`,
+    /// mirroring `TelemetryEventType` in
+    /// `workspaces/analytics-shared/src/telemetry/types.ts`). A type missing
+    /// there is still stored, but lands as `event_type = 'external'` and
+    /// drops out of every patch dashboard — so a new event type here needs
+    /// the depscan map extended first, then this list.
+    const DEPSCAN_PATCH_EVENT_TYPES: &[&str] = &[
+        "patch_applied",
+        "patch_apply_failed",
+        "patch_removed",
+        "patch_remove_failed",
+        "autopatch_pr_created",
+        "autopatch_pr_failed",
+        "autopatch_pr_closed",
+        "autopatch_pr_merged",
+        "patch_searched",
+        "patch_downloaded",
+        "patch_rolled_back",
+        "patch_rollback_failed",
+        "patch_scanned",
+        "patch_scan_failed",
+        "patch_fetched",
+        "patch_fetch_failed",
+        "patch_vendored",
+        "patch_vendor_failed",
+        "patch_listed",
+        "patch_repaired",
+        "patch_repair_failed",
+        "patch_setup",
+        "vex_generated",
+        "vex_failed",
+        "cli_updated",
+        "cli_update_failed",
+    ];
+
+    #[test]
+    fn every_event_type_is_one_the_backend_maps() {
+        for event_type in PatchTelemetryEventType::ALL {
+            assert!(
+                DEPSCAN_PATCH_EVENT_TYPES.contains(&event_type.as_str()),
+                "{} is not in depscan's patch event map",
+                event_type.as_str()
+            );
+        }
+    }
+
+    /// The body shape depscan's v0 telemetry handler reads. It pulls
+    /// `event_sender_created_at` / `event_kind` / `artifact_purl` /
+    /// `input_purl` / `client_action` / `alert_action` / `user_agent` out
+    /// as columns and keeps the rest as extra-data JSON, deriving the
+    /// ClickHouse discriminators from `event_type` (and `context.source`).
+    /// Two of those matter here:
+    ///
+    /// * no `event_kind`: an event without one is "required" and is stored
+    ///   even when the org has not opted into optional telemetry (anonymous
+    ///   events go to the public patch org through the proxy). Sending
+    ///   `event_kind: "informative"` would silently drop them.
+    /// * `event_sender_created_at` must parse with `Date.parse` and fall
+    ///   within [now - 25h, now + 1h], or it is discarded for the receive
+    ///   time.
+    #[test]
+    fn wire_shape_matches_the_backend_extractor() {
+        let mut metadata = HashMap::new();
+        metadata.insert("patches_count".to_string(), serde_json::json!(2));
+        let before = chrono_now_iso();
+        let event = build_telemetry_event(
+            PatchTelemetryEventType::PatchApplyFailed,
+            "apply",
+            Some(metadata),
+            Some(("Error".to_string(), "boom".to_string())),
+        );
+        let v = serde_json::to_value(&event).unwrap();
+        let obj = v.as_object().unwrap();
+        let mut keys: Vec<&str> = obj.keys().map(String::as_str).collect();
+        keys.sort_unstable();
+        assert_eq!(
+            keys,
+            [
+                "context",
+                "error",
+                "event_sender_created_at",
+                "event_type",
+                "metadata",
+                "session_id"
+            ]
+        );
+        for column in [
+            "event_kind",
+            "artifact_purl",
+            "input_purl",
+            "client_action",
+            "alert_action",
+            "user_agent",
+        ] {
+            assert!(
+                !obj.contains_key(column),
+                "unexpected column field {column}"
+            );
+        }
+        assert_eq!(v["event_type"], "patch_apply_failed");
+        let mut ctx: Vec<&str> = v["context"]
+            .as_object()
+            .unwrap()
+            .keys()
+            .map(String::as_str)
+            .collect();
+        ctx.sort_unstable();
+        assert_eq!(ctx, ["arch", "command", "platform", "version"]);
+        assert_eq!(v["error"]["type"], "Error");
+        assert_eq!(v["error"]["message"], "boom");
+        assert_eq!(v["metadata"]["patches_count"], 2);
+        assert!(uuid::Uuid::parse_str(v["session_id"].as_str().unwrap()).is_ok());
+
+        // Timestamp: fixed-width RFC 3339 UTC, so string order is time
+        // order, and taken at send time (well inside the window).
+        let after = chrono_now_iso();
+        let ts = v["event_sender_created_at"].as_str().unwrap();
+        assert!(
+            before.as_str() <= ts && ts <= after.as_str(),
+            "timestamp {ts} is not current ({before}..{after})"
+        );
+    }
+
+    /// Each public tracker posts the event type and metadata the backend
+    /// and its dashboards key on, to the org endpoint with the bearer.
+    #[tokio::test]
+    #[serial_test::serial]
+    async fn trackers_post_the_documented_events() {
+        use wiremock::matchers::{method, path};
+        use wiremock::{Mock, MockServer, ResponseTemplate};
+
+        let server = MockServer::start().await;
+        Mock::given(method("POST"))
+            .and(path("/v0/orgs/acme/telemetry"))
+            .respond_with(ResponseTemplate::new(201))
+            .mount(&server)
+            .await;
+
+        let saved: Vec<(&str, Option<String>)> =
+            ["SOCKET_TELEMETRY_DISABLED", "SOCKET_OFFLINE", "VITEST"]
+                .iter()
+                .map(|&k| (k, std::env::var(k).ok()))
+                .collect();
+        for (key, _) in &saved {
+            std::env::remove_var(key);
+        }
+
+        let auth = TelemetryAuth {
+            url: format!("{}/v0/orgs/acme/telemetry", server.uri()),
+            bearer: Some("tok".to_string()),
+        };
+        track_patch_applied(3, false, &auth).await;
+        track_patch_hosted("scan", 2, 1, false, &auth).await;
+        track_patch_hosted_failed("get", "lockfile write failed", true, &auth).await;
+        track_cli_updated("9.9.9", "standalone", false, false, &auth).await;
+        track_cli_update_failed("managed_install", "managed by npm", &auth).await;
+
+        for (key, value) in saved {
+            match value {
+                Some(value) => std::env::set_var(key, value),
+                None => std::env::remove_var(key),
+            }
+        }
+
+        let reqs = server.received_requests().await.unwrap();
+        let bodies: Vec<serde_json::Value> = reqs
+            .iter()
+            .map(|r| {
+                assert_eq!(r.headers.get("authorization").unwrap(), "Bearer tok");
+                serde_json::from_slice(&r.body).unwrap()
+            })
+            .collect();
+        assert_eq!(bodies.len(), 5);
+
+        assert_eq!(bodies[0]["event_type"], "patch_applied");
+        assert_eq!(bodies[0]["context"]["command"], "apply");
+        assert_eq!(bodies[0]["metadata"]["mode"], "agent");
+        assert_eq!(bodies[0]["metadata"]["patches_count"], 3);
+
+        assert_eq!(bodies[1]["event_type"], "patch_applied");
+        assert_eq!(bodies[1]["context"]["command"], "scan");
+        assert_eq!(bodies[1]["metadata"]["mode"], "hosted");
+        assert_eq!(bodies[1]["metadata"]["patches_count"], 2);
+        assert_eq!(bodies[1]["metadata"]["files_count"], 1);
+
+        assert_eq!(bodies[2]["event_type"], "patch_apply_failed");
+        assert_eq!(bodies[2]["context"]["command"], "get");
+        assert_eq!(bodies[2]["metadata"]["mode"], "hosted");
+        assert_eq!(bodies[2]["metadata"]["dry_run"], true);
+        assert_eq!(bodies[2]["error"]["message"], "lockfile write failed");
+
+        assert_eq!(bodies[3]["event_type"], "cli_updated");
+        assert_eq!(bodies[3]["context"]["command"], "update");
+        assert_eq!(bodies[3]["metadata"]["from_version"], PACKAGE_VERSION);
+        assert_eq!(bodies[3]["metadata"]["to_version"], "9.9.9");
+        assert_eq!(bodies[3]["metadata"]["channel"], "standalone");
+
+        assert_eq!(bodies[4]["event_type"], "cli_update_failed");
+        assert_eq!(bodies[4]["metadata"]["error_code"], "managed_install");
+        assert_eq!(bodies[4]["error"]["message"], "managed by npm");
     }
 
     #[test]

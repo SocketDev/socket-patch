@@ -1048,6 +1048,22 @@ The notice is preceded by one blank line (it follows the command's own output, o
 
 State lives at `$XDG_CACHE_HOME`|`~/.cache` (Unix/macOS) or `%LOCALAPPDATA%` (Windows) + `/socket-patch/update-check.json` (camelCase JSON: `schemaVersion`, `lastCheckAt`, `latestSeen`, `lastNotifiedAt`; unix seconds). A completed `--update` refreshes `latestSeen`, so the notifier never nags about a version the user just installed.
 
+## Telemetry events
+
+Each command POSTs its outcome as one JSON event (`{event_sender_created_at, event_type, context: {version, platform, arch, command}, session_id, metadata?, error?: {type, message}}`; no `event_kind`, so the backend stores it as a required event) to `<api>/v0/orgs/<org>/telemetry` with the bearer when the run has a token and an org, else anonymously to `<proxy>/patch/telemetry`. `--no-telemetry`/`SOCKET_TELEMETRY_DISABLED`, `SOCKET_OFFLINE`/`--offline` and `VITEST=true` send nothing. Error messages have the home directory replaced by `~`. Every `event_type` must be in depscan's patch event map (`telemetry-discriminators.ts`), or it is stored as `external` and drops out of the patch dashboards; `telemetry.rs` pins that list in a test.
+
+| Command | Success | Failure | Metadata |
+|---|---|---|---|
+| `scan` | `patch_scanned` | `patch_scan_failed` | `packages_scanned`, `free_patches`, `paid_patches`, `can_access_paid`, `ecosystems` (found by the crawl), `fallback_to_proxy` |
+| `scan`/`get --mode hosted` (non-empty selection) | `patch_applied` | `patch_apply_failed` | `mode: "hosted"`, `patches_count` (pins confirmed), `files_count` (files rewritten), `dry_run` |
+| `apply` (and the nested apply of `scan`/`get --mode agent`) | `patch_applied` | `patch_apply_failed` | `mode: "agent"`, `patches_count`, `dry_run` |
+| `vendor` / `scan`/`get --mode vendored` | `patch_vendored` | `patch_vendor_failed` | `patches_count`, `dry_run` |
+| `get` | `patch_fetched` | `patch_fetch_failed` | `uuid`, `tier`, `ecosystem`, `download_mode`, `fallback_to_proxy` |
+| `remove` / `rollback` | `patch_removed` / `patch_rolled_back` | `patch_remove_failed` / `patch_rollback_failed` | `removed_count` / `rolled_back_count` |
+| `list` / `repair` | `patch_listed` / `patch_repaired` | — / `patch_repair_failed` | `patches_count` / `blobs_added`, `blobs_removed`, `bytes_freed` |
+| `vex` | `vex_generated` | `vex_failed` | `advisories_count`, `format`, `output_kind` |
+| `--update` (an install, not a no-op or `--dry-run`) | `cli_updated` | `cli_update_failed` | `from_version`, `to_version`, `channel`, `pinned`, `forced` / `error_code` (the envelope's) |
+
 ## Environment variables
 
 Public configuration uses the `SOCKET_*` names below. The three deprecated v3/v4 environment aliases and `SOCKET_FORCE` were removed in v5; see [Removed env vars](#removed-env-vars).

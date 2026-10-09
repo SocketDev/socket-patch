@@ -1483,6 +1483,17 @@ fn print_zero_error_envelope(code: &str, err: &str, paths: &[String]) {
     print_json(&result);
 }
 
+/// The ecosystems `purls` span, by CLI name, sorted and deduplicated.
+fn scanned_ecosystems(purls: &[String]) -> Vec<String> {
+    purls
+        .iter()
+        .filter_map(|purl| Ecosystem::from_purl(purl))
+        .map(|eco| eco.cli_name().to_string())
+        .collect::<std::collections::BTreeSet<_>>()
+        .into_iter()
+        .collect()
+}
+
 pub async fn run(args: ScanArgs) -> i32 {
     // Scan's telemetry sends run off the critical path: each is spawned
     // where its event fires and flushed before the first stdout write that
@@ -2129,20 +2140,7 @@ async fn run_scan(
             }
         }
         // Telemetry: empty-scan still counts as a successful scan.
-        spawn_patch_scanned(
-            telemetry,
-            0,
-            0,
-            0,
-            false,
-            args.common
-                .ecosystems
-                .clone()
-                .unwrap_or_default()
-                .as_slice(),
-            false,
-            &telemetry_auth,
-        );
+        spawn_patch_scanned(telemetry, 0, 0, 0, false, &[], false, &telemetry_auth);
         // The result prints right away: nothing to overlap the send with.
         telemetry.flush().await;
         if args.common.json {
@@ -2449,18 +2447,16 @@ async fn run_scan(
     }
     let total_patches = free_patches + paid_patches;
 
-    // Telemetry: record the scan outcome with the per-tier counts.
+    // Telemetry: record the scan outcome with the per-tier counts and the
+    // ecosystems the crawl actually found (not the `--ecosystems` filter,
+    // which is empty on a default run).
     spawn_patch_scanned(
         telemetry,
         package_count,
         free_patches,
         paid_patches,
         can_access_paid_patches,
-        args.common
-            .ecosystems
-            .clone()
-            .unwrap_or_default()
-            .as_slice(),
+        &scanned_ecosystems(&all_purls),
         fallback_to_proxy,
         &telemetry_auth,
     );
@@ -3041,6 +3037,7 @@ async fn run_scan(
             None,
             npm_crawl.as_ref(),
             Some(rollout::Gate::new(&mut stage, rows).with_prior(prior_discovery)),
+            "scan",
         )
         .await;
     }

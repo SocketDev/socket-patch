@@ -8,6 +8,7 @@
 //! machinery lives in `socket_patch_core::update`.
 
 use clap::Args;
+use socket_patch_core::telemetry::{track_cli_update_failed, track_cli_updated};
 use socket_patch_core::update::{
     self as core_update, asset_name_for_target, channel_label, current_version, detect_channel,
     fetch_latest_version, is_newer, upgrade_hint_for, ChannelEnv, InstallChannel, UpdateEndpoints,
@@ -75,8 +76,11 @@ fn parse_version_pin(raw: &str) -> Result<String, String> {
 
 /// Emit an error in the mode-appropriate shape and return the exit code.
 /// The envelope keeps the message verbatim; the human line capitalizes it
-/// (`Error: Could not check for updates: ...`).
-fn fail(args: &UpdateArgs, code: &str, message: &str) -> i32 {
+/// (`Error: Could not check for updates: ...`). The `cli_update_failed`
+/// telemetry event goes out first, so a closed stdout cannot lose it (and
+/// `--offline` disables it like every other send).
+async fn fail(args: &UpdateArgs, code: &str, message: &str) -> i32 {
+    track_cli_update_failed(code, message, &args.common.telemetry_auth()).await;
     if args.common.json {
         let env = error_envelope(Command::Update, args.common.dry_run, code, message);
         println!("{}", env.to_pretty_json());
@@ -84,6 +88,19 @@ fn fail(args: &UpdateArgs, code: &str, message: &str) -> i32 {
         eprintln!("Error: {}", crate::ui::sentence_case(message));
     }
     1
+}
+
+/// A stable machine name for `channel` (telemetry), unlike the
+/// human-facing [`channel_label`] (`cargo install`, `the RubyGems launcher`).
+fn channel_id(channel: InstallChannel) -> &'static str {
+    match channel {
+        InstallChannel::Standalone => "standalone",
+        InstallChannel::Npm => "npm",
+        InstallChannel::Pypi => "pypi",
+        InstallChannel::Cargo => "cargo",
+        InstallChannel::LauncherCache => "launcher_cache",
+        InstallChannel::Homebrew => "homebrew",
+    }
 }
 
 /// The no-op message when there is nothing to install: a pin already
@@ -193,13 +210,14 @@ pub async fn run(args: UpdateArgs) -> i32 {
             "offline",
             "update requires network access to check releases and cannot run with \
              --offline/SOCKET_OFFLINE (strict airgap)",
-        );
+        )
+        .await;
     }
 
     // 2. Where is this binary, and who manages it? Zero network so far.
     let install_path = match core_update::resolve_install_path() {
         Ok(p) => p,
-        Err(e) => return fail(&args, e.error_code(), &e.to_string()),
+        Err(e) => return fail(&args, e.error_code(), &e.to_string()).await,
     };
     let channel = detect_channel(&install_path, &ChannelEnv::from_env());
     let hint = upgrade_hint_for(channel, &install_path);
@@ -226,7 +244,8 @@ pub async fn run(args: UpdateArgs) -> i32 {
                     channel_label(channel),
                     hint
                 ),
-            );
+            )
+            .await;
         }
     }
 
@@ -239,7 +258,9 @@ pub async fn run(args: UpdateArgs) -> i32 {
             Ok(v) => (v, true),
             // Unreachable via clap (value_parser validates), but the env
             // path deserves a real error over a panic.
-            Err(e) => return fail(&args, "check_failed", &format!("invalid version pin: {e}")),
+            Err(e) => {
+                return fail(&args, "check_failed", &format!("invalid version pin: {e}")).await
+            }
         },
         None => {
             // The check can take a while on a slow network (two probes,
@@ -251,7 +272,7 @@ pub async fn run(args: UpdateArgs) -> i32 {
             status.finish();
             match latest {
                 Ok(v) => (v, false),
-                Err(e) => return fail(&args, e.error_code(), &e.to_string()),
+                Err(e) => return fail(&args, e.error_code(), &e.to_string()).await,
             }
         }
     };
@@ -367,13 +388,23 @@ pub async fn run(args: UpdateArgs) -> i32 {
                      or re-run the installer",
                 );
             }
-            return fail(&args, e.error_code(), &message);
+            return fail(&args, e.error_code(), &message).await;
         }
     };
 
     for warning in &outcome.warnings {
         note_warning(&mut warnings, quiet, "update_warning", warning.clone());
     }
+
+    // Before the result prints, like `fail`'s failure event.
+    track_cli_updated(
+        &target_version.to_string(),
+        channel_id(channel),
+        pinned,
+        args.force,
+        &args.common.telemetry_auth(),
+    )
+    .await;
 
     if args.common.json {
         let mut env = Envelope::new(Command::Update);

@@ -612,6 +612,7 @@ pub(super) async fn run_redirect(
         scan_result,
         npm_prior,
         Some(super::rollout::Gate::new(stage, rows).with_prior(prior)),
+        "scan",
     )
     .await
 }
@@ -700,8 +701,62 @@ fn discovery_after_writes<'d>(
 /// human/JSON split keys on `common.json`; a `--json` caller passing `None`
 /// would get a minimal envelope that drops its own keys). `prune_requested`
 /// only feeds the `redirect_prune_ignored` warning — `get` passes `false`.
+///
+/// Telemetry: a run with a non-empty selection reports `patch_applied`
+/// (`mode: "hosted"`, sent before the result prints) or, on a non-zero
+/// exit before that point, `patch_apply_failed`. `command` names the
+/// caller (`scan` / `get`) in the event's context.
 #[allow(clippy::too_many_arguments)]
 pub(crate) async fn run_redirect_selected(
+    common: &crate::args::GlobalArgs,
+    vex: &crate::commands::vex::VexEmbedArgs,
+    prune_requested: bool,
+    api_client: &socket_patch_core::api::client::ApiClient,
+    selected: &[(String, String)],
+    scan_result: Option<serde_json::Value>,
+    npm_prior: Option<&crate::ecosystem_dispatch::NpmCrawlSnapshot>,
+    rollout: Option<super::rollout::Gate<'_>>,
+    command: &'static str,
+) -> i32 {
+    let mut telemetry = HostedTelemetry {
+        command,
+        auth: socket_patch_core::telemetry::TelemetryAuth::for_client(api_client),
+        sent: false,
+    };
+    let code = run_redirect_selected_untracked(
+        common,
+        vex,
+        prune_requested,
+        api_client,
+        selected,
+        scan_result,
+        npm_prior,
+        rollout,
+        &mut telemetry,
+    )
+    .await;
+    if code != 0 && !telemetry.sent && !selected.is_empty() {
+        socket_patch_core::telemetry::track_patch_hosted_failed(
+            command,
+            "hosted redirect failed",
+            common.dry_run,
+            &telemetry.auth,
+        )
+        .await;
+    }
+    code
+}
+
+/// Where [`run_redirect_selected`]'s outcome event goes, and whether the
+/// success event already went out.
+struct HostedTelemetry {
+    command: &'static str,
+    auth: socket_patch_core::telemetry::TelemetryAuth,
+    sent: bool,
+}
+
+#[allow(clippy::too_many_arguments)]
+async fn run_redirect_selected_untracked(
     common: &crate::args::GlobalArgs,
     vex: &crate::commands::vex::VexEmbedArgs,
     prune_requested: bool,
@@ -712,6 +767,7 @@ pub(crate) async fn run_redirect_selected(
     // `scan`'s rollout gate: NEW rows past the budget are deferred after
     // every write-free eligibility check below (§5.2). `get` passes `None`.
     mut rollout: Option<super::rollout::Gate<'_>>,
+    telemetry: &mut HostedTelemetry,
 ) -> i32 {
     use socket_patch_core::hosted::engine::{
         self, Candidate, CandidateFiles, RewriteOptions, SkippedPatch,
@@ -1594,6 +1650,19 @@ pub(crate) async fn run_redirect_selected(
         &confirmed,
         &skipped,
     );
+    // Sent before the result prints: a consumer that closes stdout early
+    // (SIGPIPE on the first write) must not lose it.
+    if !selected.is_empty() {
+        socket_patch_core::telemetry::track_patch_hosted(
+            telemetry.command,
+            confirmed.len(),
+            done.rewritten.len(),
+            common.dry_run,
+            &telemetry.auth,
+        )
+        .await;
+    }
+    telemetry.sent = true;
     if common.json {
         // Nest the redirect result under `redirect` inside the classic scan
         // object (built by `run`, threaded in via `scan_result`), mirroring
@@ -2210,6 +2279,7 @@ pub(crate) fn boxed_run_redirect_selected<'a>(
     scan_result: Option<serde_json::Value>,
     npm_prior: Option<&'a crate::ecosystem_dispatch::NpmCrawlSnapshot>,
     rollout: Option<super::rollout::Gate<'a>>,
+    command: &'static str,
 ) -> std::pin::Pin<Box<dyn std::future::Future<Output = i32> + 'a>> {
     Box::pin(run_redirect_selected(
         common,
@@ -2220,6 +2290,7 @@ pub(crate) fn boxed_run_redirect_selected<'a>(
         scan_result,
         npm_prior,
         rollout,
+        command,
     ))
 }
 
