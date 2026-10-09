@@ -463,24 +463,53 @@ pub async fn atomic_write_bytes_preserving_mode(
 /// its permission bits; a symlink is written through to its target, as a
 /// plain `write` would, so the user's link stays a link. Anything else that
 /// already exists (`/dev/stdout`, a FIFO, a character device) has no inode to
-/// swap, so it is written in place. Never captured by an open group commit:
-/// the path is the user's output, not one of the run's commit points.
+/// swap, so it is written in place: on Windows a DOS device name (`NUL`,
+/// `CON`, `COM1`) or a `\\.\` device path such as a named pipe, which std
+/// reports as a file. Never captured by an open group commit: the path is
+/// the user's output, not one of the run's commit points.
 pub async fn write_user_output(path: &Path, content: &[u8]) -> std::io::Result<()> {
-    match tokio::fs::metadata(path).await {
-        Ok(meta) if !meta.is_file() && !meta.is_dir() => tokio::fs::write(path, content).await,
+    let special = (cfg!(windows) && is_windows_device_path(path))
+        || matches!(
+            tokio::fs::metadata(path).await,
+            Ok(meta) if !meta.is_file() && !meta.is_dir()
+        );
+    if special {
+        return tokio::fs::write(path, content).await;
+    }
+    let target = tokio::fs::canonicalize(path)
+        .await
+        .unwrap_or_else(|_| path.to_path_buf());
+    write_atomic(
+        &target,
+        content,
+        WriteOpts {
+            preserve_mode: true,
+            ..WriteOpts::UNSYNCED
+        },
+    )
+    .await
+}
+
+/// Whether Windows resolves `path` to a device rather than a file: the
+/// `\\.\` device namespace (named pipes, `\\.\COM1`), or a final
+/// component whose name before the first dot, trailing spaces dropped, is a
+/// reserved DOS device (`NUL`, `nul.json`, `CON`, `COM1`, `LPT9`, …).
+/// Spelled on the path's text so it runs, and is tested, on every platform.
+fn is_windows_device_path(path: &Path) -> bool {
+    let text = path.to_string_lossy();
+    if text.starts_with("\\\\.\\") || text.starts_with("//./") {
+        return true;
+    }
+    let name = text.rsplit(['/', '\\']).next().unwrap_or("");
+    let stem = name.split('.').next().unwrap_or("").trim_end_matches(' ');
+    let stem = stem.to_ascii_uppercase();
+    match stem.as_str() {
+        "CON" | "PRN" | "AUX" | "NUL" | "CONIN$" | "CONOUT$" => true,
         _ => {
-            let target = tokio::fs::canonicalize(path)
-                .await
-                .unwrap_or_else(|_| path.to_path_buf());
-            write_atomic(
-                &target,
-                content,
-                WriteOpts {
-                    preserve_mode: true,
-                    ..WriteOpts::UNSYNCED
-                },
-            )
-            .await
+            let bytes = stem.as_bytes();
+            bytes.len() == 4
+                && (stem.starts_with("COM") || stem.starts_with("LPT"))
+                && (b'1'..=b'9').contains(&bytes[3])
         }
     }
 }
@@ -1069,6 +1098,39 @@ mod tests {
         );
         drop(group);
         assert_eq!(std::fs::read(&fresh).unwrap(), b"doc");
+    }
+
+    /// Windows device names and the `\\.\` namespace are written in place
+    /// (Bugbot on #1262: std reports `NUL` and named pipes as files there).
+    #[test]
+    fn windows_device_paths_are_recognized() {
+        for device in [
+            "NUL",
+            "nul",
+            "nul.json",
+            "C:\\out\\CON",
+            "out/aux.vex.json",
+            "COM1",
+            "lpt9.txt",
+            "NUL ",
+            "CONOUT$",
+            "\\\\.\\pipe\\vex",
+            "//./COM10",
+        ] {
+            assert!(is_windows_device_path(Path::new(device)), "{device}");
+        }
+        for file in [
+            "out.vex.json",
+            "null.json",
+            "console.json",
+            "COM0",
+            "COM10",
+            "LPTX",
+            "C:\\out\\nul-dir\\vex.json",
+            "nulls/vex.json",
+        ] {
+            assert!(!is_windows_device_path(Path::new(file)), "{file}");
+        }
     }
 
     /// One stage-name builder for the `utils::fs` writers and the blob
