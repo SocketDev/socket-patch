@@ -87,7 +87,7 @@ pub async fn refusal(
     }
     if candidates.iter().any(|c| c.dep.ecosystem == "npm") {
         let workspace = if has_own_npm_family_lock(root) {
-            npm_member_stray_lock_refusal(root).await
+            member_stray_lock_refusal(root).await
         } else {
             nearer_root(
                 package_json_workspace_refusal(root).await,
@@ -291,66 +291,168 @@ async fn package_json_workspace_refusal(root: &Path) -> Option<(PathBuf, Refusal
     Some((ancestor, refusal))
 }
 
-/// #1094: the project directory holds only npm locks (`package-lock.json`,
-/// `npm-shrinkwrap.json`) and is a member of a `package.json` workspace
-/// whose root holds an npm lock. npm installs every workspace member from
-/// the root's lock and never reads a lock inside the member (a stray one,
-/// typically left behind when the package moved into the monorepo), so a
-/// run here would pin or vendor a lock npm ignores and report success.
-///
-/// A member that also holds a lock its own manager reads (pnpm, yarn, Bun,
-/// vlt, or a Rush repo) keeps the own-lock shortcut: pnpm and vlt ignore
-/// `package.json` workspaces, and yarn berry treats a nested `yarn.lock`
-/// as a separate project. A root with no npm lock is left alone too.
-///
-/// Returns the workspace root with a one-line detail naming both locks,
-/// `None` otherwise.
-pub(crate) async fn npm_member_stray_lock(root: &Path) -> Option<(PathBuf, String)> {
-    let npm_locks = NpmLockFamily::Npm.files();
-    let own: Vec<&str> = npm_locks
-        .iter()
-        .copied()
-        .filter(|name| root.join(name).exists())
-        .collect();
-    let other_own = npm_lock_files()
-        .filter(|name| !npm_locks.contains(name))
-        .chain(EXTRA_OWN_LOCKS)
-        .any(|name| root.join(name).exists())
-        || root.join("rush.json").exists();
-    if own.is_empty() || other_own {
-        return None;
-    }
-    let (ancestor, locks) = package_json_workspace_root(root).await?;
-    let root_npm_locks: Vec<&str> = locks
-        .into_iter()
-        .filter(|name| npm_locks.contains(name))
-        .collect();
-    if root_npm_locks.is_empty() {
-        return None;
-    }
-    let detail = format!(
-        "{} is a member of the npm workspace rooted at {}: npm installs it from {} and \
-         ignores its own {}, so a lock rewritten here would never be installed",
-        root.display(),
-        ancestor.display(),
-        join_paths(&ancestor, &root_npm_locks),
-        join_paths(root, &own)
-    );
-    Some((ancestor, detail))
+/// A workspace member's own locks that its package manager never reads
+/// (see [`member_stray_lock`]).
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub(crate) struct MemberStrayLock {
+    /// The workspace root whose lock installs the member.
+    pub(crate) root: PathBuf,
+    /// The member's own lock files (root-relative names), every one of
+    /// them ignored.
+    pub(crate) ignored: Vec<&'static str>,
+    /// A one-line detail naming the root's locks and the ignored ones.
+    pub(crate) detail: String,
 }
 
-/// The hosted refusal for [`npm_member_stray_lock`].
-async fn npm_member_stray_lock_refusal(root: &Path) -> Option<(PathBuf, Refusal)> {
-    let (ancestor, detail) = npm_member_stray_lock(root).await?;
+/// The package managers that never read a lock inside one of their
+/// workspace members, with the name a refusal gives them.
+const STRAY_LOCK_FAMILIES: [(NpmLockFamily, &str); 3] = [
+    (NpmLockFamily::Vlt, "vlt"),
+    (NpmLockFamily::Bun, "Bun"),
+    (NpmLockFamily::Npm, "npm"),
+];
+
+/// The project-directory files [`member_stray_lock`] reads; everything
+/// else it reads is above the project. VEX discovery declares these to a
+/// read recording so the check does not make it unusable.
+pub(crate) fn member_stray_lock_own_files() -> impl Iterator<Item = &'static str> {
+    npm_lock_files()
+        .chain(EXTRA_OWN_LOCKS)
+        .chain(["rush.json", VLT_JSON])
+}
+
+/// The project directory is a workspace member whose own locks are all
+/// ones its package manager never reads (a stray lock, typically left
+/// behind when a standalone package moved into the monorepo), so a run
+/// here would pin or vendor a lock nothing installs from and report
+/// success:
+///
+/// - npm (#1094) and Bun (#1101) install every `package.json` workspace
+///   member from the root's lock: a member `package-lock.json` /
+///   `npm-shrinkwrap.json` is stray when the root holds an npm lock, a
+///   member `bun.lock` / `bun.lockb` when the root holds a Bun lock.
+/// - vlt (#1134) resolves a member with no `vlt.json` of its own to the
+///   workspace root (its `vlt.json` `workspaces`, or `package.json`
+///   `workspaces` when `vlt.json` declares none) and installs it from the
+///   root's `vlt-lock.json`.
+///
+/// A member that also holds a lock its own manager does read (pnpm, yarn,
+/// or a family the root does not hold), or a Rush repo, keeps the
+/// own-lock shortcut: pnpm ignores `package.json` workspaces, and yarn
+/// berry treats a nested `yarn.lock` as a separate project.
+///
+/// Shared by the hosted refusal, the vendored refusal
+/// (`vendor_lockfile_missing`) and VEX discovery, which reads the ignored
+/// locks as absent.
+pub(crate) async fn member_stray_lock(root: &Path) -> Option<MemberStrayLock> {
+    let own: Vec<&'static str> = npm_lock_files()
+        .filter(|name| root.join(name).exists())
+        .collect();
+    let other_own = EXTRA_OWN_LOCKS.iter().any(|name| root.join(name).exists())
+        || root.join("rush.json").exists();
+    // Every own lock must belong to a manager that ignores it in a member.
+    let all_strayable = own.iter().all(|name| {
+        STRAY_LOCK_FAMILIES
+            .iter()
+            .any(|(family, _)| family.files().contains(name))
+    });
+    if own.is_empty() || other_own || !all_strayable {
+        return None;
+    }
+    let mut package_json_root = None;
+    let mut governing: Option<(PathBuf, Vec<&'static str>, &str)> = None;
+    for (family, manager) in STRAY_LOCK_FAMILIES {
+        let files = family.files();
+        if !own.iter().any(|name| files.contains(name)) {
+            continue;
+        }
+        let found = match family {
+            NpmLockFamily::Vlt => {
+                if root.join(VLT_JSON).exists() {
+                    return None;
+                }
+                vlt_lock_root(root, &mut package_json_root).await
+            }
+            _ => cached_package_json_root(root, &mut package_json_root)
+                .await
+                .clone(),
+        };
+        let (ancestor, locks) = found?;
+        let root_locks: Vec<&'static str> = locks
+            .into_iter()
+            .filter(|name| files.contains(name))
+            .collect();
+        if root_locks.is_empty() {
+            return None;
+        }
+        governing.get_or_insert((ancestor, root_locks, manager));
+    }
+    let (ancestor, root_locks, manager) = governing?;
+    let detail = format!(
+        "{} is a member of the {manager} workspace rooted at {}: {manager} installs it from {} \
+         and ignores its own {}, so a lock rewritten here would never be installed",
+        root.display(),
+        ancestor.display(),
+        join_paths(&ancestor, &root_locks),
+        join_paths(root, &own)
+    );
+    Some(MemberStrayLock {
+        root: ancestor,
+        ignored: own,
+        detail,
+    })
+}
+
+/// [`package_json_workspace_root`], walked at most once per check.
+async fn cached_package_json_root<'a>(
+    root: &Path,
+    cache: &'a mut Option<Option<(PathBuf, Vec<&'static str>)>>,
+) -> &'a Option<(PathBuf, Vec<&'static str>)> {
+    if cache.is_none() {
+        *cache = Some(package_json_workspace_root(root).await);
+    }
+    cache.as_ref().unwrap_or(&None)
+}
+
+/// The vlt workspace root that installs a member and its locks: the nearer
+/// of the `vlt.json` `workspaces` root and the `package.json` `workspaces`
+/// root whose `vlt-lock.json` vlt reads (see [`package_json_workspace_root`]).
+async fn vlt_lock_root(
+    root: &Path,
+    package_json_root: &mut Option<Option<(PathBuf, Vec<&'static str>)>>,
+) -> Option<(PathBuf, Vec<&'static str>)> {
+    let from_vlt_json = vlt_workspace_root(root).await;
+    let from_package_json = cached_package_json_root(root, package_json_root)
+        .await
+        .clone()
+        .filter(|(_, locks)| locks.contains(&VLT_LOCK))
+        .map(|(ancestor, _)| ancestor);
+    let ancestor = match (from_vlt_json, from_package_json) {
+        (Some(a), Some(b)) => {
+            if b.starts_with(&a) {
+                b
+            } else {
+                a
+            }
+        }
+        (a, b) => a.or(b)?,
+    };
+    Some((ancestor, vec![VLT_LOCK]))
+}
+
+/// The hosted refusal for [`member_stray_lock`].
+async fn member_stray_lock_refusal(root: &Path) -> Option<(PathBuf, Refusal)> {
+    let stray = member_stray_lock(root).await?;
     let refusal = Refusal {
         code: WORKSPACE_LOCKFILE_ELSEWHERE.to_string(),
         message: format!(
-            "{detail}; run socket-patch from {} (the workspace root); nothing was \
+            "{}; run socket-patch from {} (the workspace root); nothing was \
              written",
-            ancestor.display()
+            stray.detail,
+            stray.root.display()
         ),
     };
-    Some((ancestor, refusal))
+    Some((stray.root, refusal))
 }
 
 fn join_paths(dir: &Path, names: &[&str]) -> String {
@@ -418,6 +520,29 @@ async fn package_json_workspace_root(root: &Path) -> Option<(PathBuf, Vec<&'stat
 /// match is the root; one without a lock (never installed) refuses
 /// nothing.
 async fn vlt_workspace_refusal(root: &Path) -> Option<(PathBuf, Refusal)> {
+    let ancestor = vlt_workspace_root(root).await?;
+    let lock = ancestor.join(VLT_LOCK);
+    let refusal = Refusal {
+        code: WORKSPACE_LOCKFILE_ELSEWHERE.to_string(),
+        message: format!(
+            "{} is a workspace member with no lockfile of its own: the workspace \
+             root {} lists it under \"workspaces\" in {} and installs it from {}, \
+             which a hosted run here cannot see; run socket-patch from {} (the \
+             workspace root); nothing was written",
+            root.display(),
+            ancestor.display(),
+            ancestor.join(VLT_JSON).display(),
+            lock.display(),
+            ancestor.display()
+        ),
+    };
+    Some((ancestor, refusal))
+}
+
+/// The nearest ancestor `vlt.json` whose `workspaces` patterns match the
+/// project directory, when it holds `vlt-lock.json` (see
+/// [`vlt_workspace_refusal`]).
+async fn vlt_workspace_root(root: &Path) -> Option<PathBuf> {
     let canonical = tokio::fs::canonicalize(root)
         .await
         .unwrap_or_else(|_| root.to_path_buf());
@@ -438,25 +563,10 @@ async fn vlt_workspace_refusal(root: &Path) -> Option<(PathBuf, Refusal)> {
         if !workspaces_include(&patterns, &rel) {
             continue;
         }
-        let lock = ancestor.join(VLT_LOCK);
-        if !lock.is_file() {
+        if !ancestor.join(VLT_LOCK).is_file() {
             return None;
         }
-        let refusal = Refusal {
-            code: WORKSPACE_LOCKFILE_ELSEWHERE.to_string(),
-            message: format!(
-                "{} is a workspace member with no lockfile of its own: the workspace \
-                 root {} lists it under \"workspaces\" in {} and installs it from {}, \
-                 which a hosted run here cannot see; run socket-patch from {} (the \
-                 workspace root); nothing was written",
-                root.display(),
-                ancestor.display(),
-                ancestor.join(VLT_JSON).display(),
-                lock.display(),
-                ancestor.display()
-            ),
-        };
-        return Some((ancestor.to_path_buf(), refusal));
+        return Some(ancestor.to_path_buf());
     }
     None
 }
@@ -1303,9 +1413,144 @@ mod tests {
         assert_eq!(code(tmp.path(), "npm").await, None);
         assert_eq!(code(&member, "pypi").await, None);
 
-        // A member with its own lock is its own root.
+        // A member with its own `vlt.json` is its own vlt project, so its
+        // own lock governs it (#1134 covers the lock without the config).
         write(tmp.path(), "packages/a/vlt-lock.json", "{}");
+        write(tmp.path(), "packages/a/vlt.json", "{}");
         assert_eq!(code(&member, "npm").await, None);
+    }
+
+    /// #1134: vlt resolves a `vlt.json` workspace member with no `vlt.json`
+    /// of its own to the workspace root and installs it from the root's
+    /// `vlt-lock.json`, so a stray `vlt-lock.json` in the member (left
+    /// behind when a standalone package moved into the monorepo) is never
+    /// read. The member is refused as it is without the stray lock.
+    #[tokio::test]
+    async fn vlt_member_with_stray_vlt_lock_is_refused() {
+        for package_json_fallback in [false, true] {
+            let tmp = tempfile::tempdir().unwrap();
+            if package_json_fallback {
+                // vlt reads `package.json` `workspaces` when `vlt.json`
+                // declares none.
+                write(
+                    tmp.path(),
+                    "package.json",
+                    r#"{"private":true,"workspaces":["packages/*"]}"#,
+                );
+                write(tmp.path(), "vlt.json", r#"{"registries":{}}"#);
+            } else {
+                write(tmp.path(), "package.json", r#"{"private":true}"#);
+                write(tmp.path(), "vlt.json", r#"{"workspaces":"packages/*"}"#);
+            }
+            write(tmp.path(), VLT_LOCK, "{}");
+            write(tmp.path(), "packages/a/package.json", "{}");
+            write(tmp.path(), "packages/a/vlt-lock.json", "{}");
+            let member = tmp.path().join("packages/a");
+            let case = format!("package.json fallback: {package_json_fallback}");
+            let refused = refusal(&ProjectView::Disk(&member), &[candidate("npm")], true)
+                .await
+                .unwrap_or_else(|| panic!("{case}: member must be refused"));
+            assert_eq!(refused.code, WORKSPACE_LOCKFILE_ELSEWHERE, "{case}");
+            assert!(
+                refused.message.contains(VLT_LOCK)
+                    && refused.message.contains("ignores")
+                    && refused.message.contains("nothing was written")
+                    && refused
+                        .message
+                        .contains(&member.join(VLT_LOCK).display().to_string()),
+                "{case}: {}",
+                refused.message
+            );
+            assert_eq!(code(tmp.path(), "npm").await, None, "{case}");
+
+            // A member with its own vlt.json is its own vlt project.
+            write(tmp.path(), "packages/a/vlt.json", "{}");
+            assert_eq!(code(&member, "npm").await, None, "{case}");
+            std::fs::remove_file(member.join("vlt.json")).unwrap();
+            // A root that was never installed governs nothing.
+            std::fs::remove_file(tmp.path().join(VLT_LOCK)).unwrap();
+            assert_eq!(code(&member, "npm").await, None, "{case}");
+        }
+    }
+
+    /// #1101: Bun installs every `package.json` workspace member from the
+    /// root's `bun.lock` / `bun.lockb` and never reads a lock inside the
+    /// member, so a stray member Bun lock does not make the member its own
+    /// lock root when the workspace root holds a Bun lock. Every mix of
+    /// text and binary locks, on either side, is refused.
+    #[tokio::test]
+    async fn bun_member_with_stray_bun_lock_is_refused() {
+        for (root_lock, member_lock) in [
+            ("bun.lock", "bun.lock"),
+            ("bun.lock", "bun.lockb"),
+            ("bun.lockb", "bun.lock"),
+            ("bun.lockb", "bun.lockb"),
+        ] {
+            let tmp = tempfile::tempdir().unwrap();
+            write(
+                tmp.path(),
+                "package.json",
+                r#"{"name":"root","private":true,"workspaces":["packages/*"]}"#,
+            );
+            write(tmp.path(), root_lock, "{}");
+            write(tmp.path(), "packages/a/package.json", "{}");
+            write(tmp.path(), &format!("packages/a/{member_lock}"), "{}");
+            let member = tmp.path().join("packages/a");
+            let case = format!("root {root_lock}, member {member_lock}");
+            let refused = refusal(&ProjectView::Disk(&member), &[candidate("npm")], true)
+                .await
+                .unwrap_or_else(|| panic!("{case}: member must be refused"));
+            assert_eq!(refused.code, WORKSPACE_LOCKFILE_ELSEWHERE, "{case}");
+            assert!(
+                refused
+                    .message
+                    // The root is named canonical (`\\?\` on Windows,
+                    // `/private` on macOS), as the walk resolves it.
+                    .contains(
+                        &std::fs::canonicalize(tmp.path())
+                            .unwrap()
+                            .join(root_lock)
+                            .display()
+                            .to_string()
+                    )
+                    && refused
+                        .message
+                        .contains(&member.join(member_lock).display().to_string())
+                    && refused.message.contains("Bun")
+                    && refused.message.contains("ignores")
+                    && refused.message.contains("nothing was written"),
+                "{case}: {}",
+                refused.message
+            );
+            assert_eq!(code(tmp.path(), "npm").await, None, "{case}");
+        }
+
+        let tmp = tempfile::tempdir().unwrap();
+        write(
+            tmp.path(),
+            "package.json",
+            r#"{"private":true,"workspaces":["packages/*"]}"#,
+        );
+        write(tmp.path(), "packages/a/package.json", "{}");
+        write(tmp.path(), "packages/a/bun.lock", "{}");
+        let member = tmp.path().join("packages/a");
+        // No Bun lock at the root (never installed, or another manager's).
+        assert_eq!(code(&member, "npm").await, None);
+        write(tmp.path(), "yarn.lock", "");
+        assert_eq!(code(&member, "npm").await, None);
+        write(tmp.path(), "bun.lock", "{}");
+        assert_eq!(
+            code(&member, "npm").await.as_deref(),
+            Some(WORKSPACE_LOCKFILE_ELSEWHERE)
+        );
+        // A member that also holds a lock its own manager reads keeps the
+        // own-lock shortcut, and so does one with an npm lock the root
+        // does not back with its own npm lock.
+        for own in ["yarn.lock", "pnpm-lock.yaml", "package-lock.json"] {
+            write(tmp.path(), &format!("packages/a/{own}"), "");
+            assert_eq!(code(&member, "npm").await, None, "{own}");
+            std::fs::remove_file(member.join(own)).unwrap();
+        }
     }
 
     /// Bugbot on #1073: vlt falls back to `package.json` `workspaces` when

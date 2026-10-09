@@ -159,6 +159,9 @@ fn check_workspace_compatibility(
 /// project vendored before it grew a workspace member all reach the
 /// engine instead of dying here.
 pub async fn preflight_vendor(project_root: &Path) -> Result<(), (&'static str, String)> {
+    if let Some(refusal) = super::npm_flavor::member_stray_lock_refusal(project_root).await {
+        return Err(refusal);
+    }
     let path = project_root.join(BUN_LOCK);
     let text = match read_regular_to_string(&path).await {
         Ok(text) => text,
