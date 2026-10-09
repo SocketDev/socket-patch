@@ -751,6 +751,8 @@ pub async fn revert_npm_opts(
     // An entry npm installs from a non-registry spec (git, URL, `file:`) is
     // never a registry upgrade, whatever its `resolved` says (#326).
     let overrides = NpmOverrides::read(project_root).await;
+    let upgrades_trusted = overrides.is_empty()
+        && !super::npm_common::project_may_redirect_registry(project_root).await;
     for lock_name in lock_files {
         let lock_path = project_root.join(lock_name);
         let lock_bytes = match read_regular_to_bytes(&lock_path).await {
@@ -778,13 +780,12 @@ pub async fn revert_npm_opts(
         };
 
         let mut non_registry = npm_non_registry_entries(&lock, &overrides);
-        // An override can also swap a registry edge for a git / URL /
-        // `file:` spec, which that set does not report. Any override that
-        // names the vendored package keeps every record off the upgrade
-        // path; the revert then drift-keeps as before #1155.
-        let overridden = super::npm_common::parse_npm_purl(&entry.base_purl)
-            .is_none_or(|(name, _)| overrides.mentions(&name));
-        if overridden {
+        // Any `overrides` rule (it can swap a registry edge, alias edges
+        // included, for a git / URL / `file:` spec npm ci installs instead
+        // of the lock's `resolved`) or a project `.npmrc` that can rebind
+        // the registry host keeps every record off the upgrade path; the
+        // revert then drift-keeps as before #1155.
+        if !upgrades_trusted {
             for rec in entry.wiring.iter().filter(|r| r.file == lock_name) {
                 if let Some(key) = rec.key.as_deref() {
                     let key = match rec.kind.as_str() {
@@ -792,7 +793,7 @@ pub async fn revert_npm_opts(
                         _ => Some(key.to_string()),
                     };
                     if let Some(key) = key {
-                        non_registry.insert(key, "an override names the package".to_string());
+                        non_registry.insert(key, "project config can redirect it".to_string());
                     }
                 }
             }
@@ -3639,16 +3640,18 @@ mod tests {
         }
     }
 
-    /// #1155 provenance guard: an override can swap a registry edge for a
-    /// git / URL / `file:` spec that npm ci installs instead of the lock's
-    /// `resolved`. While any override names the vendored package, a version
-    /// change is not trusted as a registry upgrade and stays drift.
+    /// #1155 provenance guard: an override can swap a registry edge (alias
+    /// edges included) for a git / URL / `file:` spec that npm ci installs
+    /// instead of the lock's `resolved`. While the project declares any
+    /// override, a version change is not trusted as a registry upgrade and
+    /// stays drift.
     #[tokio::test]
-    async fn revert_keeps_version_change_as_drift_while_an_override_names_the_package() {
+    async fn revert_keeps_version_change_as_drift_while_any_override_is_declared() {
         for overrides in [
             json!({ "left-pad": "file:../left-pad" }),
             json!({ "foo": { "left-pad": "github:evil/left-pad" } }),
             json!({ "left-pad@1.3.0": "https://example.com/left-pad.tgz" }),
+            json!({ "foo": { "aliased": "git+file:///evil" } }),
         ] {
             let fx = fixture().await;
             let (_, entry, _) = expect_done(fx.vendor(false).await);
@@ -3681,6 +3684,42 @@ mod tests {
                 outcome.warnings
             );
             assert!(outcome.kept_artifact, "{overrides}: {:?}", outcome.warnings);
+        }
+    }
+
+    /// #1155 provenance guard: npm rewrites a `registry.npmjs.org` dist URL
+    /// to the project `.npmrc` registry at fetch time
+    /// (`replace-registry-host`), so with a registry configured there a
+    /// version move's recorded host proves nothing. It stays drift.
+    #[tokio::test]
+    async fn revert_keeps_version_change_as_drift_while_npmrc_configures_a_registry() {
+        for npmrc in [
+            "registry=https://evil.example.com/\n",
+            "@s:registry=https://evil.example.com/\n",
+            "replace-registry-host=always\n",
+        ] {
+            let fx = fixture().await;
+            let (_, entry, _) = expect_done(fx.vendor(false).await);
+            let entry = entry.unwrap();
+            tokio::fs::write(fx.root().join(".npmrc"), npmrc)
+                .await
+                .unwrap();
+            let upgraded = json!({
+                "version": "1.3.1",
+                "resolved": "https://registry.npmjs.org/left-pad/-/left-pad-1.3.1.tgz",
+                "integrity": "sha512-upgraded=="
+            });
+            let mut live = fx.read_lock().await;
+            live["packages"]["node_modules/left-pad"] = upgraded.clone();
+            live["packages"]["node_modules/foo/node_modules/left-pad"] = upgraded;
+            tokio::fs::write(fx.lock_path(), serialize_json(&live, "  ").unwrap())
+                .await
+                .unwrap();
+
+            let outcome = revert_npm(&entry, fx.root(), false).await;
+            assert!(outcome.success, "{npmrc}: {:?}", outcome.error);
+            assert!(outcome.drift_skipped(), "{npmrc}: {:?}", outcome.warnings);
+            assert!(outcome.kept_artifact, "{npmrc}: {:?}", outcome.warnings);
         }
     }
 

@@ -64,6 +64,29 @@ pub(super) struct NpmCoords {
 /// vendor, arbitrary delete on revert) — reject fail-closed before any disk
 /// access. `Err` carries a ready [`VendorOutcome::Refused`] to bubble
 /// verbatim.
+/// True when the project's own `.npmrc` or `bunfig.toml` could make npm or
+/// Bun fetch a registry package from somewhere other than the URL its lock
+/// records (a `registry` / `@scope:registry` / `replace-registry-host`
+/// line, a Bun scope table), or can't be read. Deliberately coarse: a
+/// revert that would delete a vendored copy because a version moved
+/// "within the same registry" trusts that move only when this is false
+/// (#1155).
+pub(super) async fn project_may_redirect_registry(project_root: &Path) -> bool {
+    for name in [".npmrc", "bunfig.toml"] {
+        match crate::utils::fs::read_regular_to_string(&project_root.join(name)).await {
+            Ok(text) => {
+                let text = text.to_ascii_lowercase();
+                if text.contains("registry") || text.contains("scope") {
+                    return true;
+                }
+            }
+            Err(e) if e.kind() == std::io::ErrorKind::NotFound => {}
+            Err(_) => return true,
+        }
+    }
+    false
+}
+
 pub(super) fn guard_coordinates(
     purl: &str,
     record: &PatchRecord,

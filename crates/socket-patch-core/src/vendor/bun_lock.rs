@@ -929,10 +929,11 @@ pub(crate) async fn revert_bun_opts(
     }
 
     // An empty registry field means "the default registry", which a
-    // committed bunfig.toml or .npmrc can rebind; with either naming a
-    // registry, an empty field proves nothing about where an upgrade
-    // installs from (#1155).
-    let default_registry_pinned = !project_configures_a_registry(project_root).await;
+    // committed bunfig.toml or .npmrc can rebind (`registry`, a scope
+    // table); with either configuring one, an empty field proves nothing
+    // about where an upgrade installs from (#1155).
+    let default_registry_pinned =
+        !super::npm_common::project_may_redirect_registry(project_root).await;
     let mut dirty = false;
     if let Some(lines) = lines.as_mut() {
         for rec in entry.wiring.iter().rev().filter(|r| r.file == BUN_LOCK) {
@@ -1130,21 +1131,6 @@ fn version_moved_off(
         && (!live_registry.is_empty() || default_registry_pinned);
     (same_registry && live_name == original_name && live_version != original_version)
         .then_some(live_version)
-}
-
-/// True when the project's own `bunfig.toml` or `.npmrc` mentions a
-/// registry at all (or can't be read), so Bun's default registry may not
-/// be npmjs. Deliberately coarse: any doubt keeps the drift verdict.
-async fn project_configures_a_registry(project_root: &Path) -> bool {
-    for name in ["bunfig.toml", ".npmrc"] {
-        match read_regular_to_string(&project_root.join(name)).await {
-            Ok(text) if text.to_ascii_lowercase().contains("registry") => return true,
-            Ok(_) => {}
-            Err(e) if e.kind() == std::io::ErrorKind::NotFound => {}
-            Err(_) => return true,
-        }
-    }
-    false
 }
 
 // ───────────────────────── vendor-specific classification ─────────────────
@@ -3301,6 +3287,10 @@ mod tests {
                 "[install]\nregistry = \"https://evil.example.com/\"\n",
             ),
             (".npmrc", "registry=https://evil.example.com/\n"),
+            (
+                "bunfig.toml",
+                "[install.scopes]\n\"@s\" = \"https://evil.example.com/\"\n",
+            ),
         ] {
             let fx = fixture_with(BN3_BEFORE_LOCK, "node_modules/left-pad").await;
             let (_, entry, _) = expect_done(fx.vendor(false).await);
