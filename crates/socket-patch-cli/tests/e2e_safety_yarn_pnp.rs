@@ -1218,3 +1218,47 @@ fn pnp_loader_under_explicit_pnp_linker_still_refuses() {
     assert_eq!(envelope_error_code(&env), Some("yarn_pnp_unsupported"));
     assert_eq!(std::fs::read(&index).unwrap(), ORIGINAL_BYTES);
 }
+
+/// #1129: pnpm's `node-linker=pnp` with a custom `modulesDir` keeps its
+/// store in `<modulesDir>/.pnpm`, not `node_modules/.pnpm`. The layout
+/// detector reads the same modules dirs as the crawler, so the tree is
+/// pnpm (not yarn berry) and apply patches the copy the crawler finds
+/// there instead of refusing with `yarn_pnp_unsupported`. Both settings
+/// files spell `modulesDir`.
+#[test]
+fn pnpm_pnp_with_a_custom_modules_dir_applies() {
+    for (file, text) in [
+        (".npmrc", "node-linker=pnp\nmodules-dir=deps\n"),
+        ("pnpm-workspace.yaml", "nodeLinker: pnp\nmodulesDir: deps\n"),
+    ] {
+        let dir = tempfile::tempdir().unwrap();
+        let cwd = dir.path();
+        std::fs::write(
+            cwd.join("package.json"),
+            r#"{"name":"pnpm-pnp-deps","version":"0.0.0","private":true}"#,
+        )
+        .unwrap();
+        std::fs::write(cwd.join(file), text).unwrap();
+        std::fs::write(cwd.join(".pnp.cjs"), b"// pnpm PnP loader\n").unwrap();
+        std::fs::write(cwd.join("pnpm-lock.yaml"), "lockfileVersion: '9.0'\n").unwrap();
+        stage_applicable_package(cwd);
+        // What pnpm installs with `modulesDir: deps`: the store and the
+        // package under deps/, nothing under node_modules/.
+        std::fs::rename(cwd.join("node_modules"), cwd.join("deps")).unwrap();
+        std::fs::create_dir_all(cwd.join("deps/.pnpm")).unwrap();
+        let index = cwd.join("deps/dummy/index.js");
+
+        let (code, stdout, stderr) = run(cwd, &["apply", "--json"]);
+        let env = parse_json_envelope(&stdout);
+        assert_ne!(
+            envelope_error_code(&env),
+            Some("yarn_pnp_unsupported"),
+            "{file}: pnpm's PnP tree is not yarn berry.\nenvelope: {env}"
+        );
+        assert_eq!(
+            code, 0,
+            "{file}: apply patches the deps/ copy.\nstdout:\n{stdout}\nstderr:\n{stderr}"
+        );
+        assert_eq!(std::fs::read(&index).unwrap(), PATCHED_BYTES, "{file}");
+    }
+}

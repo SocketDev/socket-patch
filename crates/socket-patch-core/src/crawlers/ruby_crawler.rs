@@ -635,9 +635,8 @@ impl RubyCrawler {
     ///
     /// Unlike [`Self::get_gem_paths`] (apply's write targets, which keep
     /// the `gem env` homes for default gems), the `gem env` homes count
-    /// here only when Bundler uses system gems: no deployment store under
-    /// the default `vendor/bundle` and no explicit install `path`
-    /// ([`bundler_sets_explicit_path`]). The refused out-of-tree
+    /// here only when Bundler uses system gems
+    /// ([`Self::bundler_uses_system_gems`]). The refused out-of-tree
     /// config root ([`Self::verification_only_gem_paths`]) is included,
     /// since Bundler installs into it. See [`bundler_gem_homes_from`] for
     /// the project-local rule.
@@ -651,28 +650,7 @@ impl RubyCrawler {
             Some(root) => Self::bundle_root_gems_dirs(root).await,
             None => Vec::new(),
         };
-        let ignore_config = bundler_ignores_config();
-        let uses_system_gems = !discovery.default_root_has_stores
-            && Self::has_bundler_manifest(&options.cwd).await
-            && !bundler_sets_explicit_path(BundlerPathTiers {
-                local: read_app_config(
-                    &options.cwd,
-                    std::env::var_os("BUNDLE_APP_CONFIG").as_deref(),
-                    ignore_config,
-                )
-                .await,
-                env: BundlerPathSettings::from_env(
-                    std::env::var_os("BUNDLE_PATH").as_deref(),
-                    std::env::var_os("BUNDLE_PATH__SYSTEM").as_deref(),
-                    std::env::var_os("BUNDLE_DISABLE_SHARED_GEMS").as_deref(),
-                ),
-                global: read_global_config(
-                    ambient_bundler_global_config_file(&options.cwd).as_deref(),
-                    ignore_config,
-                )
-                .await,
-            });
-        let system_homes = if uses_system_gems {
+        let system_homes = if Self::bundler_uses_system_gems(&options.cwd, &discovery).await {
             Self::gem_env_gems_dirs().await
         } else {
             Vec::new()
@@ -683,6 +661,57 @@ impl RubyCrawler {
             &verification,
             &system_homes,
         )
+    }
+
+    /// The `gem env` homes Bundler never loads this project's gems from,
+    /// for read-only verifiers (`vex`): [`Self::get_gem_paths`] keeps them
+    /// as apply write targets for default gems, but under an explicit or
+    /// deployment `path` Bundler fetches every other gem into that path, so
+    /// an unpatched copy there is not one the project runs (#1098). Empty
+    /// in global / `--global-prefix` mode and whenever Bundler uses system
+    /// gems. A home that is also one of the project's Bundler stores is
+    /// never listed.
+    pub async fn bundler_unused_system_gem_homes(&self, options: &CrawlerOptions) -> Vec<PathBuf> {
+        if options.global || options.global_prefix.is_some() {
+            return Vec::new();
+        }
+        let discovery = Self::discover_bundle_stores(&options.cwd).await;
+        if Self::bundler_uses_system_gems(&options.cwd, &discovery).await {
+            return Vec::new();
+        }
+        Self::gem_env_gems_dirs()
+            .await
+            .into_iter()
+            .filter(|home| !discovery.stores.contains(home))
+            .collect()
+    }
+
+    /// Whether `bundle install` installs into, and loads from, the system
+    /// gem homes for the project at `cwd`: a Ruby project with no
+    /// deployment store under the default `vendor/bundle` and no explicit
+    /// install `path` ([`bundler_sets_explicit_path`], which also counts
+    /// `deployment`). The one answer both the stale-install guard
+    /// ([`Self::bundler_install_homes`]) and `vex`
+    /// ([`Self::bundler_unused_system_gem_homes`]) use.
+    async fn bundler_uses_system_gems(cwd: &Path, discovery: &BundleStoreDiscovery) -> bool {
+        if discovery.default_root_has_stores || !Self::has_bundler_manifest(cwd).await {
+            return false;
+        }
+        let ignore_config = bundler_ignores_config();
+        !bundler_sets_explicit_path(BundlerPathTiers {
+            local: read_app_config(
+                cwd,
+                std::env::var_os("BUNDLE_APP_CONFIG").as_deref(),
+                ignore_config,
+            )
+            .await,
+            env: BundlerPathSettings::from_ambient_env(),
+            global: read_global_config(
+                ambient_bundler_global_config_file(cwd).as_deref(),
+                ignore_config,
+            )
+            .await,
+        })
     }
 
     /// The installed-gem `gems/` dirs under one bundler install root, in
@@ -1146,14 +1175,15 @@ fn verify_gem_at_path_sync(path: &Path) -> bool {
     })
 }
 
-/// One Bundler settings tier's `path`, `path.system` and
-/// `disable_shared_gems` values, each `None` when the tier doesn't set it
-/// (an empty string counts as set).
+/// One Bundler settings tier's `path`, `path.system`,
+/// `disable_shared_gems` and `deployment` values, each `None` when the tier
+/// doesn't set it (an empty string counts as set).
 #[derive(Debug, Default, Clone, PartialEq, Eq)]
 pub(crate) struct BundlerPathSettings {
     path: Option<String>,
     path_system: Option<String>,
     disable_shared_gems: Option<String>,
+    deployment: Option<String>,
 }
 
 impl BundlerPathSettings {
@@ -1165,6 +1195,7 @@ impl BundlerPathSettings {
                 text,
                 "BUNDLE_DISABLE_SHARED_GEMS",
             ),
+            deployment: bundle_config_setting_including_empty(text, "BUNDLE_DEPLOYMENT"),
         }
     }
 
@@ -1172,13 +1203,26 @@ impl BundlerPathSettings {
         path: Option<&OsStr>,
         path_system: Option<&OsStr>,
         disable_shared_gems: Option<&OsStr>,
+        deployment: Option<&OsStr>,
     ) -> Self {
         let text = |v: Option<&OsStr>| v.map(|v| v.to_string_lossy().into_owned());
         Self {
             path: text(path),
             path_system: text(path_system),
             disable_shared_gems: text(disable_shared_gems),
+            deployment: text(deployment),
         }
+    }
+
+    /// The ambient environment tier (`BUNDLE_PATH`, `BUNDLE_PATH__SYSTEM`,
+    /// `BUNDLE_DISABLE_SHARED_GEMS`, `BUNDLE_DEPLOYMENT`).
+    fn from_ambient_env() -> Self {
+        Self::from_env(
+            std::env::var_os("BUNDLE_PATH").as_deref(),
+            std::env::var_os("BUNDLE_PATH__SYSTEM").as_deref(),
+            std::env::var_os("BUNDLE_DISABLE_SHARED_GEMS").as_deref(),
+            std::env::var_os("BUNDLE_DEPLOYMENT").as_deref(),
+        )
     }
 }
 
@@ -1195,15 +1239,21 @@ pub(crate) struct BundlerPathTiers {
 /// gems, following `Bundler::Settings#path`: the first tier (local, env,
 /// global) that sets `path`, `path.system` or `disable_shared_gems` decides
 /// alone, and it uses system gems when `path.system` is truthy or
-/// `disable_shared_gems` is falsy ([`bundler_truthy`]). Bundler never reuses a `gem env` copy
-/// of a non-default gem under an explicit path (`use_system_gems?` is
-/// false).
+/// `disable_shared_gems` is falsy ([`bundler_truthy`]). When no tier sets
+/// any of them, a truthy `deployment` (the first tier that sets it wins)
+/// makes `vendor/bundle` the explicit path (#1109). Bundler never reuses a
+/// `gem env` copy of a non-default gem under an explicit path
+/// (`use_system_gems?` is false).
 ///
 /// An empty `path` counts as not explicit, so the caller keeps judging the
 /// system homes: when unsure, it's safer to warn than to skip a copy
-/// Bundler may load.
+/// Bundler may load. For the same reason the `.bundle` default that
+/// `default_install_uses_path` (honored by Bundler 2.x only) and
+/// `simulate_version 5` (Bundler 4.x only) select is not modeled here:
+/// which one applies depends on the Bundler that runs, which a scan can't
+/// read.
 pub(crate) fn bundler_sets_explicit_path(tiers: BundlerPathTiers) -> bool {
-    let settings = [
+    let settings: Vec<BundlerPathSettings> = [
         tiers
             .local
             .as_deref()
@@ -1213,8 +1263,11 @@ pub(crate) fn bundler_sets_explicit_path(tiers: BundlerPathTiers) -> bool {
             .global
             .as_deref()
             .map(BundlerPathSettings::from_config_text),
-    ];
-    for tier in settings.into_iter().flatten() {
+    ]
+    .into_iter()
+    .flatten()
+    .collect();
+    for tier in &settings {
         if tier.path.is_none() && tier.path_system.is_none() && tier.disable_shared_gems.is_none() {
             continue;
         }
@@ -1224,9 +1277,31 @@ pub(crate) fn bundler_sets_explicit_path(tiers: BundlerPathTiers) -> bool {
                 .disable_shared_gems
                 .as_deref()
                 .is_some_and(|v| !bundler_truthy(v));
-        return !system && tier.path.is_some_and(|p| !p.is_empty());
+        return !system && tier.path.as_deref().is_some_and(|p| !p.is_empty());
     }
-    false
+    // `path = "vendor/bundle" if self[:deployment]`, after the tier loop.
+    settings
+        .iter()
+        .find_map(|tier| tier.deployment.as_deref())
+        .is_some_and(bundler_truthy)
+}
+
+/// Whether the installed gem dir `copy` (`<home>/gems/<name>-<version>`)
+/// is a default gem: its spec sits in `<home>/specifications/default/`.
+/// Bundler loads a default gem from the system home even under an explicit
+/// `path`, so a verifier that drops the unused `gem env` homes
+/// ([`RubyCrawler::bundler_unused_system_gem_homes`]) still judges it.
+pub fn is_default_gem_copy(copy: &Path) -> bool {
+    let (Some(dir_name), Some(home)) = (copy.file_name(), copy.parent().and_then(Path::parent))
+    else {
+        return false;
+    };
+    let mut spec = dir_name.to_os_string();
+    spec.push(".gemspec");
+    home.join("specifications")
+        .join("default")
+        .join(spec)
+        .is_file()
 }
 
 /// One gem home from [`RubyCrawler::bundler_install_homes`].
@@ -4096,6 +4171,7 @@ mod tests {
                 path.map(OsStr::new),
                 system.map(OsStr::new),
                 disable.map(OsStr::new),
+                None,
             )
         };
         let tiers = |local: Option<&str>, env: BundlerPathSettings, global: Option<&str>| {
@@ -4171,6 +4247,92 @@ mod tests {
             ),
             "a local path.system=false stops at the local tier with no path"
         );
+    }
+
+    /// #1098: a `gem env` copy whose spec sits in
+    /// `specifications/default/` is a default gem, which Bundler loads from
+    /// the system home under any path; a regular spec is not.
+    #[test]
+    fn is_default_gem_copy_reads_the_default_specifications_dir() {
+        let tmp = tempfile::tempdir().unwrap();
+        let home = tmp.path();
+        let json = home.join("gems").join("json-2.7.2");
+        let rack = home.join("gems").join("rack-3.1.8");
+        std::fs::create_dir_all(&json).unwrap();
+        std::fs::create_dir_all(&rack).unwrap();
+        std::fs::create_dir_all(home.join("specifications").join("default")).unwrap();
+        std::fs::write(
+            home.join("specifications")
+                .join("default")
+                .join("json-2.7.2.gemspec"),
+            "",
+        )
+        .unwrap();
+        std::fs::write(home.join("specifications").join("rack-3.1.8.gemspec"), "").unwrap();
+        assert!(is_default_gem_copy(&json));
+        assert!(!is_default_gem_copy(&rack));
+        assert!(!is_default_gem_copy(Path::new("json-2.7.2")));
+    }
+
+    /// #1109: with no tier setting `path`, `path.system` or
+    /// `disable_shared_gems`, a truthy `deployment` makes `vendor/bundle`
+    /// the explicit path (`Settings#path`, Bundler 2.5 and 4.0 alike). The
+    /// first tier that sets `deployment` decides, through `to_bool`, and
+    /// any tier that decides the path outranks it. The version-dependent
+    /// `.bundle` flags are left to the system-gems answer.
+    #[test]
+    fn bundler_sets_explicit_path_counts_deployment() {
+        let env = |deployment: Option<&str>, system: Option<&str>| {
+            BundlerPathSettings::from_env(
+                None,
+                system.map(OsStr::new),
+                None,
+                deployment.map(OsStr::new),
+            )
+        };
+        let tiers = |local: Option<&str>, env: BundlerPathSettings, global: Option<&str>| {
+            bundler_sets_explicit_path(BundlerPathTiers {
+                local: local.map(str::to_string),
+                env,
+                global: global.map(str::to_string),
+            })
+        };
+        let local_deploy = "---\nBUNDLE_DEPLOYMENT: \"true\"\n";
+
+        assert!(tiers(Some(local_deploy), env(None, None), None), "local");
+        assert!(tiers(None, env(Some("true"), None), None), "env");
+        assert!(tiers(None, env(None, None), Some(local_deploy)), "global");
+        assert!(tiers(None, env(Some("1"), None), None), "to_bool");
+        assert!(!tiers(None, env(Some("false"), None), None), "falsy");
+        assert!(
+            !tiers(
+                Some("---\nBUNDLE_DEPLOYMENT: \"false\"\n"),
+                env(Some("true"), None),
+                None
+            ),
+            "a local falsy deployment shadows the env one"
+        );
+        assert!(
+            !tiers(Some(local_deploy), env(None, Some("true")), None),
+            "an env path.system decides the path before deployment is read"
+        );
+        assert!(
+            !tiers(
+                Some("---\nBUNDLE_DISABLE_SHARED_GEMS: \"false\"\n"),
+                env(Some("true"), None),
+                None
+            ),
+            "a falsy disable_shared_gems decides before deployment is read"
+        );
+        for flag in [
+            "BUNDLE_SIMULATE_VERSION: \"5\"",
+            "BUNDLE_DEFAULT_INSTALL_USES_PATH: \"true\"",
+        ] {
+            assert!(
+                !tiers(Some(&format!("---\n{flag}\n")), env(None, None), None),
+                "{flag} depends on the Bundler version: keep the system homes"
+            );
+        }
     }
 
     /// #729: project-local tagging compares absolute, normalized paths, so a

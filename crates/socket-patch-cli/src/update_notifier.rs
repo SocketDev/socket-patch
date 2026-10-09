@@ -146,7 +146,10 @@ pub struct Notifier {
 
 fn debug_log(debug: bool, message: &str) {
     if debug {
-        eprintln!("[socket-patch update] {message}");
+        eprintln!(
+            "[socket-patch update] {}",
+            socket_patch_core::utils::redact::redact_urls_in(message)
+        );
     }
 }
 

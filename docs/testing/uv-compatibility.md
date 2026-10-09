@@ -117,7 +117,10 @@ frozen, locked, and ordinary installation outcomes separately where supported.
   the repointed entry under `--locked`, 0.5.5 accepts it — the effective
   boundary is 0.5.5; the advisory keeps its `0_5_6` name.
 - Transitive targets are wired through `[tool.uv] override-dependencies` plus
-  a `[tool.uv.sources]` entry. uv applies sources to overrides only from
+  a `[tool.uv.sources]` entry. Hosted mode puts a `# socket-patch hosted: …`
+  comment line above the override entry it adds; rollback / remove remove
+  only a marked entry, so a user's own `<name>==<version>` override survives
+  the round trip (#411). uv applies sources to overrides only from
   0.5.6: on 0.2.35–0.5.3 `--frozen` installs the patched wheel from the lock,
   but a plain `uv sync` re-resolves the override against the registry and
   reinstalls the pristine wheel (and rewrites the lock). The CLI cannot tell
@@ -154,8 +157,11 @@ frozen, locked, and ordinary installation outcomes separately where supported.
   those cases requires marker-specific source mappings. Standalone PEP 751
   rewriting selects the exact package version; duplicate entries for the same
   name and version are refused when source selection is ambiguous.
-- Hosted requirements select exact `==`/`===` pins or identifiable archive URLs.
-  Other versions remain unchanged. A bare requirement is rewritten only when
+- Hosted requirements select exact `==`/`===` pins or socket-patch's own
+  hosted archive URLs. A user-authored direct reference to the patched release
+  (`name @ <url>` on any other origin, `files.pythonhosted.org` and `file://`
+  included) is refused with `redirect_requirements_direct_reference` and left
+  unchanged. Other versions remain unchanged. A bare requirement is rewritten only when
   one row and one override version identify the selection. Ranges, wildcard
   pins, opaque URLs, and ambiguous unpinned rows are reported as
   `redirect_requirements_version_ambiguous` and preserved.
