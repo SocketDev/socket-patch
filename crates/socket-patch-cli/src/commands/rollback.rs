@@ -1127,31 +1127,43 @@ pub async fn run(args: RollbackArgs) -> i32 {
         hosted_scope.extend(redirect_records.iter().map(|(p, _)| p.clone()));
     }
     for id in &identifiers {
-        let found = ledgers.matching(id);
         // Hosted pins live in the lockfiles, not in a store: matched by the
         // target, or as another generation of a matched manifest key.
-        let pins =
-            socket_patch_core::ledgers::hosted_pins_matching(&hosted_pins, id, &found.manifest);
-        let matched = !found.is_empty() || !pins.is_empty();
+        let select = |id: &Target| {
+            let found = ledgers.matching(id);
+            let pins =
+                socket_patch_core::ledgers::hosted_pins_matching(&hosted_pins, id, &found.manifest);
+            (found, pins)
+        };
         // A name reaching several packages by last segment (`core` →
         // `@angular/core` and `@babel/core`) is refused across every
-        // store: `rollback` acts on one package per name.
-        let ambiguity = id.ambiguity(
-            found
-                .manifest
-                .iter()
-                .map(String::as_str)
-                .chain(found.vendor.iter().map(|(k, e)| e.ambiguity_purl(k, id)))
-                .chain(pins.iter().map(|pin| pin.purl.as_str())),
-        );
+        // store: `rollback` acts on one package per name, and only on the
+        // one the check settled on (`lodash` beside `@types/lodash` is
+        // `lodash` alone).
+        let settled = {
+            let (found, pins) = select(id);
+            id.settle(
+                found
+                    .manifest
+                    .iter()
+                    .map(String::as_str)
+                    .chain(found.vendor.iter().map(|(k, e)| e.ambiguity_purl(k, id)))
+                    .chain(pins.iter().map(|pin| pin.purl.as_str())),
+            )
+        };
+        let id = match settled {
+            Ok(settled) => settled,
+            Err(msg) => {
+                track_patch_rollback_failed(&msg, api_token.as_deref(), org_slug.as_deref()).await;
+                emit_rollback_error(args.common.json, "ambiguous_target", &msg);
+                return 1;
+            }
+        };
+        let (found, pins) = select(&id);
+        let matched = !found.is_empty() || !pins.is_empty();
         manifest_scope.extend(found.manifest);
         vendor_scope.extend(found.vendor.into_iter().map(|(k, _)| k));
         hosted_scope.extend(pins.into_iter().map(|pin| pin.purl));
-        if let Some(msg) = ambiguity {
-            track_patch_rollback_failed(&msg, api_token.as_deref(), org_slug.as_deref()).await;
-            emit_rollback_error(args.common.json, "ambiguous_target", &msg);
-            return 1;
-        }
         if !matched {
             let hint = if matches!(id.kind(), TargetKind::Purl | TargetKind::Uuid) {
                 String::new()

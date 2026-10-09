@@ -1363,11 +1363,19 @@ pub async fn run(args: GetArgs) -> i32 {
 
             // A name reaching several packages by last segment (`core` →
             // `@angular/core` and `@babel/core`) is refused: `get` acts on
-            // one package per name.
-            if let Some(msg) = target.ambiguity(matched.iter().map(String::as_str)) {
-                report_error(args.common.json, "ambiguous_target", &msg);
-                return 1;
-            }
+            // one package per name, and only on the one the check settled
+            // on (`lodash` beside `@types/lodash` is `lodash` alone).
+            let target = match target.settle(matched.iter().map(String::as_str)) {
+                Ok(settled) => settled,
+                Err(msg) => {
+                    report_error(args.common.json, "ambiguous_target", &msg);
+                    return 1;
+                }
+            };
+            let matched: Vec<String> = matched
+                .into_iter()
+                .filter(|purl| target.matches_package(purl))
+                .collect();
             if !quiet {
                 eprintln!("{}", format_matched_packages(&matched));
             }

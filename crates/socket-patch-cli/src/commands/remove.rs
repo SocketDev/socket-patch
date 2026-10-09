@@ -439,16 +439,6 @@ pub async fn run(args: RemoveArgs) -> i32 {
         }
     };
 
-    // Find matching patches to show what will be removed (sorted: the
-    // manifest is a HashMap, and the listing must be deterministic).
-    let mut matching: Vec<_> = manifest
-        .patches
-        .iter()
-        .filter(|(purl, patch)| target.matches_patch(purl, &patch.uuid))
-        .collect();
-    matching.sort_by(|a, b| a.0.cmp(b.0));
-    let matched_keys: Vec<String> = matching.iter().map(|(purl, _)| (*purl).clone()).collect();
-
     // The vendor ledger, loaded ONCE under the lock: it scopes the nested
     // rollback (vendor-owned purls are not restored in place) and drives
     // the vendored leg. An unreadable ledger degrades to "nothing vendored"
@@ -462,8 +452,9 @@ pub async fn run(args: RemoveArgs) -> i32 {
 
     // A name reaching several packages by last segment (`core` →
     // `@angular/core` and `@babel/core`) is refused across every store:
-    // `remove` acts on one package per name.
-    {
+    // `remove` acts on one package per name, and only on the one the
+    // check settled on (`lodash` beside `@types/lodash` is `lodash` alone).
+    let target = {
         let ledger_purls: Vec<&str> = vendor_state_result
             .as_ref()
             .map(|state| {
@@ -480,16 +471,29 @@ pub async fn run(args: RemoveArgs) -> i32 {
             .map(String::as_str)
             .chain(ledger_purls)
             .chain(hosted_pins.iter().map(|pin| pin.purl.as_str()));
-        if let Some(msg) = target.ambiguity(candidates) {
-            emit_error_envelope(
-                args.common.json,
-                args.common.dry_run,
-                "ambiguous_target",
-                msg,
-            );
-            return 1;
+        match target.settle(candidates) {
+            Ok(settled) => settled,
+            Err(msg) => {
+                emit_error_envelope(
+                    args.common.json,
+                    args.common.dry_run,
+                    "ambiguous_target",
+                    msg,
+                );
+                return 1;
+            }
         }
-    }
+    };
+
+    // Find matching patches to show what will be removed (sorted: the
+    // manifest is a HashMap, and the listing must be deterministic).
+    let mut matching: Vec<_> = manifest
+        .patches
+        .iter()
+        .filter(|(purl, patch)| target.matches_patch(purl, &patch.uuid))
+        .collect();
+    matching.sort_by(|a, b| a.0.cmp(b.0));
+    let matched_keys: Vec<String> = matching.iter().map(|(purl, _)| (*purl).clone()).collect();
 
     if matching.is_empty() {
         // Ledger-only entries (vendored mode keeps no manifest record) —

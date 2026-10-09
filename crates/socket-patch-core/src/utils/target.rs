@@ -62,6 +62,9 @@ impl fmt::Display for TargetKind {
 pub struct Target {
     kind: TargetKind,
     text: String,
+    /// Set by [`Target::settle`] when a name's full-name match won over
+    /// last-segment ones: the name then selects only that full name.
+    full_name_only: bool,
 }
 
 impl fmt::Display for Target {
@@ -94,6 +97,7 @@ impl Target {
         Self {
             kind,
             text: token.to_string(),
+            full_name_only: false,
         }
     }
 
@@ -142,6 +146,8 @@ impl Target {
             return false;
         }
         package_spec_matches(&self.text, purl)
+            && (!self.full_name_only
+                || package_identity(purl).is_some_and(|identity| self.is_full_name_of(&identity)))
     }
 
     /// For a package name, the distinct packages it selects among `purls`
@@ -149,12 +155,22 @@ impl Target {
     /// versionless purl) and how to pick one. `None` for every other kind,
     /// and for a name that selects one package (any number of its
     /// versions) or none.
+    pub fn ambiguity<'a>(&self, purls: impl IntoIterator<Item = &'a str>) -> Option<String> {
+        self.settle(purls).err()
+    }
+
+    /// [`Self::ambiguity`] as the target to act on: `Err(message)` for an
+    /// ambiguous name, otherwise the target narrowed to what the check
+    /// settled on. A name whose full-name match won over last-segment
+    /// ones (`lodash` beside `@types/lodash`) selects only the full name
+    /// from then on; every other target comes back unchanged.
     ///
     /// `get`, `remove` and `rollback` refuse an ambiguous name instead of
-    /// acting on every package it reaches by last segment.
-    pub fn ambiguity<'a>(&self, purls: impl IntoIterator<Item = &'a str>) -> Option<String> {
-        if self.kind != TargetKind::Name {
-            return None;
+    /// acting on every package it reaches by last segment, and act on the
+    /// settled target so they never select more than the check allowed.
+    pub fn settle<'a>(&self, purls: impl IntoIterator<Item = &'a str>) -> Result<Target, String> {
+        if self.kind != TargetKind::Name || self.full_name_only {
+            return Ok(self.clone());
         }
         let mut packages: Vec<String> = purls
             .into_iter()
@@ -171,16 +187,19 @@ impl Target {
             .filter(|identity| self.is_full_name_of(identity))
             .cloned()
             .collect();
+        let mut settled = self.clone();
         if !full.is_empty() {
+            settled.full_name_only = full.len() < packages.len();
             packages = full;
         }
-        (packages.len() > 1).then(|| {
-            format!(
+        if packages.len() > 1 {
+            return Err(format!(
                 "\"{}\" is ambiguous: it names {}; use the full name or a purl",
                 self.text,
                 packages.join(", ")
-            )
-        })
+            ));
+        }
+        Ok(settled)
     }
 
     /// Is this name the full name of the package `identity` (as
@@ -505,6 +524,16 @@ mod tests {
         // `lodash` beside `@types/lodash`, `core` beside `@x/core`.
         let typed = ["pkg:npm/lodash@4.17.21", "pkg:npm/@types/lodash@4.17.0"];
         assert_eq!(Target::parse("lodash").ambiguity(typed), None);
+        // ...and the settled target selects only the full name, so acting
+        // on it leaves `@types/lodash` alone.
+        let settled = Target::parse("lodash").settle(typed).unwrap();
+        assert!(settled.matches_package(typed[0]));
+        assert!(settled.matches_patch(typed[0], "u1"));
+        assert!(!settled.matches_package(typed[1]));
+        assert!(!settled.matches_patch(typed[1], "u2"));
+        // Without a competing last-segment match nothing narrows.
+        let alone = Target::parse("lodash").settle([typed[1]]).unwrap();
+        assert!(alone.matches_patch(typed[1], "u2"));
         assert_eq!(
             core.ambiguity(["pkg:npm/core@1.0.0", "pkg:npm/@x/core@2.0.0"]),
             None
