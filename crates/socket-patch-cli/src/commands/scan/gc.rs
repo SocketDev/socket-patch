@@ -158,7 +158,7 @@ async fn run_gc(
     socket_dir: &Path,
     dry_run: bool,
 ) -> GcSummary {
-    let sweep = ArtifactReferences::for_apply(manifest)
+    let sweep = ArtifactReferences::active(manifest)
         .sweep(socket_dir, dry_run)
         .await;
     let mut warnings = Vec::new();

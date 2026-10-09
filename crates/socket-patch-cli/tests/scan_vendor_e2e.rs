@@ -1407,8 +1407,8 @@ async fn scan_vendor_prune_reconciles_unwired_entry_on_an_empty_crawl() {
 
 /// Interactive (non-JSON) `scan --mode vendored` pre-verifies patch baselines:
 /// installed content matching NEITHER hash is annotated before vendoring
-/// starts, and the run still vendors (auto-force) with the
-/// `vendor_content_mismatch_overwritten` warning on stderr.
+/// starts, and the run still vendors the server's verified artifact (no
+/// mismatch warning: vendoring never reads the installed bytes).
 #[tokio::test]
 async fn scan_vendor_annotates_mismatched_baseline_and_vendors_anyway() {
     let mock = MockServer::start().await;

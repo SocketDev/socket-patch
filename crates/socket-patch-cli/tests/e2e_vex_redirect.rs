@@ -30,6 +30,10 @@
 //! lockfile still resolves the dependency from its hosted patch (a reverted
 //! lockfile with the ledger left behind must not keep attesting).
 
+#[path = "common/mod.rs"]
+mod common;
+use common::binary;
+
 #[path = "vex_e2e_common/mod.rs"]
 mod vex_e2e_common;
 
@@ -91,10 +95,6 @@ fn write_hosted_package_lock(cwd: &Path, deps: &[(&str, &str, &str)], pinned: bo
         .to_string(),
     )
     .unwrap();
-}
-
-fn binary() -> &'static str {
-    env!("CARGO_BIN_EXE_socket-patch")
 }
 
 /// CLI invocation with the ambient `SOCKET_*` environment scrubbed (explicit

@@ -262,7 +262,10 @@ pub(crate) async fn restore(
                 continue;
             }
         };
-        let mut lock: Option<Value> = match lock_text.as_deref().map(serde_json::from_str) {
+        let mut lock: Option<Value> = match lock_text
+            .as_deref()
+            .map(crate::formats::nuget::lock::parse_lock)
+        {
             None => None,
             Some(Ok(v)) => Some(v),
             Some(Err(_)) => {
@@ -279,17 +282,15 @@ pub(crate) async fn restore(
             let Some(lock) = lock.as_mut() else {
                 continue;
             };
-            let entries: Vec<&mut serde_json::Map<String, Value>> = lock
-                .get_mut("dependencies")
-                .and_then(Value::as_object_mut)
-                .into_iter()
-                .flat_map(|fws| fws.values_mut())
-                .filter_map(Value::as_object_mut)
-                .flat_map(|fw| fw.iter_mut())
-                .filter(|(k, _)| k.eq_ignore_ascii_case(id))
-                .filter_map(|(_, e)| e.as_object_mut())
-                .filter(|e| e.contains_key("contentHash"))
-                .collect();
+            // Only the entries at the pinned version: another version of
+            // the id was never re-pinned (#593).
+            let norm = normalize_nuget_version(version);
+            let entries: Vec<&mut serde_json::Map<String, Value>> =
+                crate::formats::nuget::lock::locked_at_mut(lock, id, &norm)
+                    .into_iter()
+                    .map(|(_, e)| e)
+                    .filter(|e| e.contains_key("contentHash"))
+                    .collect();
             if entries.is_empty() {
                 continue;
             }
@@ -297,7 +298,6 @@ pub(crate) async fn restore(
                 result.refuse(&pin.uuid, why);
                 continue;
             }
-            let norm = normalize_nuget_version(version);
             let hash = match ctx.client.nuget_content_hash(id, &norm).await {
                 Ok(h) => h,
                 Err(why) => {
@@ -306,13 +306,6 @@ pub(crate) async fn restore(
                 }
             };
             for entry in entries {
-                let keeps_resolved = entry
-                    .get("resolved")
-                    .and_then(Value::as_str)
-                    .is_some_and(|r| normalize_nuget_version(r).eq_ignore_ascii_case(&norm));
-                if !keeps_resolved {
-                    entry.insert("resolved".into(), Value::String(norm.clone()));
-                }
                 entry.insert("contentHash".into(), Value::String(hash.clone()));
             }
         }
@@ -335,9 +328,13 @@ pub(crate) async fn restore(
         }
         view.write(rel, text);
         if let (Some(lock), Some(before)) = (lock, lock_text) {
-            let after = super::super::serialize_json(&lock);
-            if serde_json::from_str::<Value>(&before).ok().as_ref() != Some(&lock) {
-                view.write(&lock_rel, after);
+            // In the lock's own layout (BOM, indent, line endings).
+            if crate::formats::nuget::lock::parse_lock(&before)
+                .ok()
+                .as_ref()
+                != Some(&lock)
+            {
+                view.write(&lock_rel, super::super::serialize_json_like(&lock, &before));
             }
         }
         result

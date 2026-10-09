@@ -2881,9 +2881,10 @@ fn vendor_after_in_place_apply_emits_applied_event() {
 
 /// Installed content matching NEITHER hash (a patch built against different
 /// bytes than the installed artifact — the flatted@3.3.1 case) still vendors:
-/// the stage is overwritten with the verified patched content, the run exits
-/// 0 with an `applied` event, and the overwrite surfaces as a
-/// `vendor_content_mismatch_overwritten` warning event.
+/// vendoring commits the server's verified artifact without reading the
+/// installed bytes, so the run exits 0 with an `applied` event and the
+/// `vendor_prebuilt_downloaded` advisory, and the installed tree is left
+/// untouched.
 #[test]
 fn mismatched_install_does_not_change_the_server_artifact() {
     let fx = npm_fixture();

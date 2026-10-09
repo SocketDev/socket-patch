@@ -93,12 +93,15 @@ serves the unpatched archive, so the hosted rewrite removes it.
 | Composer | `composer install` after the lock was rewritten |
 | --- | --- |
 | 2.x | Reinstalls the package (its dist or source reference changed): patched |
-| 1.x | Leaves an installed stable package as it is: **pristine**. Remove `vendor/<vendor>/<name>` first, then run `composer install` |
+| 1.x | Leaves an installed stable package as it is: **pristine**. Remove `<vendor-dir>/<vendor>/<name>` first, then run `composer install` |
 
 A fresh checkout installs the patched bytes on every version. `vendor`,
 `scan --mode vendored` and `get --mode vendored` print both instructions after
 a run that leaves composer packages vendored; `scan --mode hosted` names them in
-its next steps. Nothing else prints a Composer reinstall hint.
+its next steps. Nothing else prints a Composer reinstall hint. The directory
+the hints name is the one Composer installed into: `COMPOSER_VENDOR_DIR`, else
+`config.vendor-dir`, else `vendor` (a project with `"vendor-dir": "lib"` is told
+to remove `lib/<vendor>/<name>`).
 
 ## Vendored copies and Composer's mirror filters
 
