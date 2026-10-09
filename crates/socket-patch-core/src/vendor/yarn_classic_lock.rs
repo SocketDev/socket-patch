@@ -123,6 +123,9 @@ impl NpmLockBackend for YarnClassicBackend {
         let (candidate_keys, skipped) =
             rewritable_candidates(&blocks, &coords.name, &coords.version)?;
         warnings.extend(skipped);
+        warnings.extend(
+            other_name_copy_warnings(project_root, &blocks, &coords.name, &coords.version).await,
+        );
         Ok(YarnClassicPlan {
             text,
             candidate_keys,
@@ -335,6 +338,68 @@ fn rewritable_candidates(
         }
     }
     Ok((candidate_keys, skipped))
+}
+
+/// A named warning for each block that installs `name@version` under
+/// ANOTHER dependency name (#1236): yarn 1 keys a `file:` directory or url
+/// copy by the name the depender gave it (`"lp2@file:./lpdir"`), so which
+/// package it is comes from the copy itself (the directory's
+/// `package.json`, the registry url's path). No re-lock of `name` reaches
+/// that copy, so it stays unpatched; the registry blocks are still wired.
+async fn other_name_copy_warnings(
+    project_root: &Path,
+    blocks: &[LockBlock],
+    name: &str,
+    version: &str,
+) -> Vec<VendorWarning> {
+    let mut out = Vec::new();
+    for block in blocks {
+        let patterns = split_key_patterns(&block.key);
+        if classic_key_real_name(&patterns) == Some(name)
+            || classic_field(&block.lines, "version") != Some(version)
+        {
+            continue;
+        }
+        let manifest = crate::formats::yarn::source::classic_file_directory(&patterns).map(|dir| {
+            if dir.is_empty() {
+                "package.json".to_string()
+            } else {
+                format!("{dir}/package.json")
+            }
+        });
+        let text = match manifest {
+            Some(rel) => read_regular_to_string(&project_root.join(&rel)).await.ok(),
+            None => None,
+        };
+        let copy = crate::formats::yarn::source::classic_copy_real_name(
+            &patterns,
+            classic_field(&block.lines, "resolved"),
+            version,
+            |_| text.clone(),
+        );
+        let Some((_, source)) = copy.filter(|(n, _)| n == name) else {
+            continue;
+        };
+        let (code, from) = match source {
+            CopySource::Directory => (
+                "vendor_link_entry_skipped",
+                "a file: directory, which yarn copies into node_modules",
+            ),
+            _ => (
+                "vendor_yarn_classic_non_registry_entry_skipped",
+                "a URL tarball",
+            ),
+        };
+        out.push(VendorWarning::new(
+            code,
+            format!(
+                "lock entry `{}` installs {name}@{version} under another dependency name, \
+                 from {from}; vendoring can't rewire it, so this copy stays UNPATCHED",
+                block.key
+            ),
+        ));
+    }
+    out
 }
 
 /// The lock as [`vendor_yarn_classic`]'s step 2 leaves it: read, re-sniffed
@@ -1566,6 +1631,54 @@ left-pad@^1.3.0:
         let text = fx.lock_text().await;
         assert!(text.contains("\"left-pad@link:../somewhere\":\n  version \"1.3.0\""));
         assert!(text.contains("\"left-pad@file:./local-left-pad\":\n  version \"1.3.0\""));
+    }
+
+    /// #1236: yarn 1 locks a `file:` directory or url copy under the
+    /// DEPENDENCY name, so a copy of left-pad@1.3.0 declared as `lp2` is
+    /// read from the copy itself and named; the registry block is still
+    /// wired and the copy stays byte-untouched. Control: a directory
+    /// holding another package is not named.
+    #[tokio::test]
+    async fn issue_1236_other_name_copies_are_named() {
+        let extra = r#"
+"lp2@file:./lpdir":
+  version "1.3.0"
+
+"lp3@https://registry.npmjs.org/left-pad/-/left-pad-1.3.0.tgz":
+  version "1.3.0"
+  resolved "https://registry.npmjs.org/left-pad/-/left-pad-1.3.0.tgz#bbbb"
+"#;
+        let lock = format!("{Y2_BEFORE}{extra}");
+        for (fork, named) in [("left-pad", true), ("other-pkg", false)] {
+            let fx = fixture_with_lock(&lock).await;
+            tokio::fs::create_dir_all(fx.root().join("lpdir"))
+                .await
+                .unwrap();
+            tokio::fs::write(
+                fx.root().join("lpdir/package.json"),
+                format!(r#"{{"name":"{fork}","version":"1.3.0"}}"#),
+            )
+            .await
+            .unwrap();
+            let (result, entry, warnings) = expect_done(fx.vendor(false).await);
+            assert!(result.success, "{:?}", result.error);
+            assert_eq!(entry.unwrap().wiring.len(), 1, "the registry block");
+            let dir: Vec<&VendorWarning> = warnings
+                .iter()
+                .filter(|w| w.code == "vendor_link_entry_skipped" && w.detail.contains("lp2@"))
+                .collect();
+            assert_eq!(dir.len(), usize::from(named), "{fork}: {warnings:?}");
+            let url: Vec<&VendorWarning> = warnings
+                .iter()
+                .filter(|w| {
+                    w.code == "vendor_yarn_classic_non_registry_entry_skipped"
+                        && w.detail.contains("lp3@")
+                })
+                .collect();
+            assert_eq!(url.len(), 1, "{fork}: {warnings:?}");
+            let text = fx.lock_text().await;
+            assert!(text.contains("\"lp2@file:./lpdir\":\n  version \"1.3.0\""));
+        }
     }
 
     #[tokio::test]

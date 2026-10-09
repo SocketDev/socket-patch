@@ -95,7 +95,9 @@ use crate::formats::yarn::patterns::{
     classic_key_real_name, pattern_real_name, resolution_selector_target, split_pattern,
     split_resolved_sha1, BerryLocator,
 };
-use crate::formats::yarn::source::{classic_copy_source, CopySource};
+use crate::formats::yarn::source::{
+    classic_copy_source, manifest_name, registry_tarball_name, CopySource,
+};
 use crate::utils::digest::is_sri_pin;
 use crate::vendor::lock_inventory::yarn::{
     berry_checksum_pin, berry_entries, classic_entries, BerryLock, YarnEntry,
@@ -882,46 +884,10 @@ fn is_tarball_leaf(path: &str) -> bool {
     path.ends_with(".tgz") || path.ends_with(".tar.gz")
 }
 
-/// `name` of a `package.json`.
-fn manifest_name(bytes: &[u8]) -> Option<String> {
-    let bytes = bytes.strip_prefix(b"\xef\xbb\xbf").unwrap_or(bytes);
-    serde_json::from_slice::<Value>(bytes)
-        .ok()?
-        .get("name")?
-        .as_str()
-        .map(str::to_string)
-}
-
 /// `name` of the `package.json` inside an npm tarball.
 fn tarball_package_name(bytes: &[u8]) -> Option<String> {
     let map = crate::patch::package::read_archive_bytes_to_map(bytes).ok()?;
     manifest_name(map.get(PACKAGE_JSON)?)
-}
-
-/// The package an npm registry tarball url serves, from its
-/// `/<name>/-/<leaf>-<version>.tgz` path (`<name>` may be `@scope/leaf`,
-/// its `@` / `/` possibly percent-encoded); `None` for any other shape.
-fn registry_tarball_name(url: &str, version: &str) -> Option<String> {
-    let path = url.split_once("://").map_or(url, |(_, rest)| rest);
-    let path = path.split(['?']).next()?;
-    let (before, file) = path.rsplit_once("/-/")?;
-    let mut segs: Vec<String> = before
-        .split('/')
-        .skip(1) // the host
-        .map(|seg| crate::utils::purl::percent_decode_purl_component(seg).into_owned())
-        .collect();
-    let leaf_name = segs.pop()?;
-    let (scope, leaf_name) = match leaf_name.split_once('/') {
-        Some((scope, leaf)) => (Some(scope.to_string()), leaf.to_string()),
-        None => (segs.pop().filter(|s| s.starts_with('@')), leaf_name),
-    };
-    if file != format!("{leaf_name}-{version}.tgz") {
-        return None;
-    }
-    Some(match scope {
-        Some(scope) => format!("{scope}/{leaf_name}"),
-        None => leaf_name,
-    })
 }
 
 #[cfg(test)]
