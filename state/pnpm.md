@@ -1,6 +1,6 @@
 [agent] Progress ledger for the scheduled pnpm bug-hunt routine (label pm:pnpm).
 
-Last updated: 2026-10-09 (run 37), main `a80b89e`, latest release 4.0.0.
+Last updated: 2026-10-09 (run 38), main `9ab72d4`, latest release 5.0.0.
 
 Method: real pnpm installs. Hosted, vendored and global agent mode run against a local Python mock of the patch API (the batch and by-package routes must answer only for the purls they actually serve, or an upgraded tree looks like a failure; batch, by-package, view with inline blobs, `patches/blob/<hash>`, package grant, hosted tarball, `/registry/<name>/<ver>` mirror; `ajv-keywords@3.5.2` serves as the peer-dependency package). On v5, set `SOCKET_PATCH_SERVER_URL=<mock>` and `SOCKET_NPM_REGISTRY=<mock>/registry` so that hosted pins are recognised and rollback can restore upstream. The oracle is a marker prepended to `index.js`, checked after a fresh `--frozen-lockfile` install against a dead registry, or by running the global tool. The repo's pinned matrix (`.github/workflows/pnpm-compatibility.yml`) already covers plain hosted and vendored installs on pnpm 1–12. This ledger tracks what it doesn't.
 
@@ -424,9 +424,18 @@ Post-#1007 re-verification (run 37, main `a80b89e`, Linux, Node 22):
 | #854 exact-pin takeover | 10.34.6 / 12.10.1, plain / quoted / commented / `name@ver` keys | vendored patched, rollback byte-exact (comment restored) | pass |
 | #778 agent path scope | 9.15.9 / 12.10.1 | `scan packages/a` patches only a's deps, `rollback packages/a` unwinds them | pass |
 
+Run 38 additions (main `9ab72d4`, release 5.0.0, Linux):
+
+| pnpm | Agent `scan packages/a` / `rollback packages/a` over a member's `npm:` alias | Scoped hosted `rollback packages/a` with `sharedWorkspaceLockfile: false` | Agent, BOM workspace file with `virtualStoreDir` / `modulesDir` first | Alias + plain dep: vendored → hosted takeover, fresh frozen, rollback | Hosted `remove` by bare name / versionless purl / upper case (#1034) |
+| --- | --- | --- | --- | --- | --- |
+| 9.15.9 | fail #1266 / fail #1266 | — | — | pass (vendored refuses the alias, as documented) | pass ×3 |
+| 10.34.6 | fail #1266 / fail #1266 | — | — | — | — |
+| 12.11.2 | fail #1266 / fail #1266 (plain-name control pass) | both member locks restored (documented); `trustLockfile` left = #1268 | pass / pass | pass | pass ×3 |
+
 ## Backlog
 
-0z. Post-#1007 follow-ups: #1268 with a scoped rollback (root lock restored while a member lock stays hosted, where `still_hosted` checks only the root); #734's gate when `.modules.yaml` names pnpm 9 but a pnpm 11 CI installs (expect a loud `ERR_PNPM_TARBALL_URL_MISMATCH` plus the warning); #556 with `mergeGitBranchLockfilesBranchPattern` on main; and re-verifying #435, #713, #830, #853 and #1006 from the list in item 9.
+0y. #1266 (npm handover, pnpm cells commented in run 38): a scoped alias, a transitive alias and the hoisted linker.
+0z. Post-#1007 follow-ups: #734's gate when `.modules.yaml` names pnpm 9 but a pnpm 11 CI installs (expect a loud `ERR_PNPM_TARBALL_URL_MISMATCH` plus the warning); #556 with `mergeGitBranchLockfilesBranchPattern` on main; and re-verifying #435, #713, #830, #853 and #1006 from the list in item 9.
 00a. #1050 GC follow-ups: `scan --prune` over a peer-suffixed vendored snapshot and over Rush / subspace locks. (`sharedWorkspaceLockfile: false` member: vendored now refuses `vendor_pnpm_settings_elsewhere` on 10.34.6 too, by design. #1029 `modulesDir` / `virtualStoreDir` and `unpinned` rows: done in run 34.)
 00b. #1039 follow-ups: the takeover over a `pnpm patch`-ed vendored package, and a takeover on Windows (CRLF autocrlf checkout). The interrupted takeover is #1157. (Interrupted vendored-only commit: done in run 35, pass.)
 00c. #1197 follow-ups: a workspace member's orphan, and re-verification on 7–12 once fixed. (Upgrade orphan on 12 and agent `vex` over an orphan: done in run 36.)
@@ -546,3 +555,6 @@ Post-#1007 re-verification (run 37, main `a80b89e`, Linux, Node 22):
 - An interrupted vendored-only commit at `group_commit_file@N` leaves the superseded uuid dir until `scan --prune`. It's listed as `vendorOrphanDirs` and reclaimed there, so it fails safe, unlike the takeover in #1157 (run 35).
 - pnpm with `gitBranchLockfile` on writes `pnpm-lock.<branch>.yaml` even on `main` (there's no `pnpm-lock.yaml` unless the branch locks are merged), so hosted and vendored refuse such projects on every branch. That's the loud, documented #556 refusal (run 37).
 - Fixture note (run 37): a stray `package.json` with `packageManager` in a parent directory (for example `/tmp`) makes pnpm 11+ switch versions for child fixtures. Keep fixtures under a clean tree, and put `/opt/node22/bin` ahead of `/usr/local/bin` (Node 20 there lacks the `node:sqlite` that pnpm 11 needs).
+- A path-scoped hosted `rollback packages/a` in a `sharedWorkspaceLockfile: false` workspace also restores the other members' locks for the same purl. That's documented ("Rollback restores EVERY installed copy of a selected patch"; run 38).
+- `rollback left-pad@1.3.0` / `rollback lp` (an alias name) give `patch_not_found`: the #1034 grammar matches names exactly, and `name@version` isn't a target. Use a purl (run 38).
+- Fixture note (run 38): corepack on Node 22 can't launch pnpm 12.11.x. Install pnpm with `npm i -g --prefix <dir> pnpm@<v>`.
