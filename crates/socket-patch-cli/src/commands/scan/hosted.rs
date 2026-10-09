@@ -21,6 +21,7 @@ use crate::commands::vex::generate_vex_from_manifest_path;
 
 use super::{discover_selected, ScanArgs};
 
+mod nuget;
 mod python;
 mod takeover;
 
@@ -1380,6 +1381,15 @@ pub(crate) async fn run_redirect_selected(
         .await
     };
 
+    // NuGet global packages folder probe (#352): a copy extracted from the
+    // upstream bytes shadows the Socket source. Read-only, like the gem
+    // probe; skipped on --dry-run for the same reason.
+    let nuget_stale = if common.dry_run {
+        StaleInstallOutcome::default()
+    } else {
+        nuget::stale_install_warnings(common, &confirmed, &done.overrides).await
+    };
+
     // vlt warm-tree heal: stale installed copies of the Socket-owned nodes
     // are invalidated (classified only on a dry run or
     // with --no-vlt-install-cleanup), and every confirmed vlt purl whose
@@ -1539,6 +1549,7 @@ pub(crate) async fn run_redirect_selected(
             .map(|(purl, _)| purl.clone())
             .filter(|purl| {
                 !gem_stale.stale_purls.contains(purl)
+                    && !nuget_stale.stale_purls.contains(purl)
                     && !python_stale.stale_purls.contains(purl)
                     && !vlt_stale.stale_purls.contains(purl)
             })
@@ -1549,6 +1560,7 @@ pub(crate) async fn run_redirect_selected(
         params.known_stale = python_stale
             .stale_purls
             .iter()
+            .chain(&nuget_stale.stale_purls)
             .chain(&vlt_stale.stale_purls)
             .cloned()
             .collect();
@@ -1578,6 +1590,7 @@ pub(crate) async fn run_redirect_selected(
     let mut warnings: Vec<serde_json::Value> =
         socket_patch_core::hosted::render::rewrite_warnings_json(&engine_warnings);
     warnings.extend(gem_stale.warnings.iter().cloned());
+    warnings.extend(nuget_stale.warnings.iter().cloned());
     warnings.extend(python_stale.warnings.iter().cloned());
     warnings.extend(vlt_stale.warnings.iter().cloned());
     warnings.extend(takeover_pre_warnings.iter().cloned());

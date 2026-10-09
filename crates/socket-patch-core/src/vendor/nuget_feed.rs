@@ -378,10 +378,29 @@ pub async fn vendor_nuget(
     // originals, and re-recording here would clobber them.
     if config_wired {
         if in_sync {
+            // The warning keeps firing on re-runs until the stale copy is
+            // gone (#352).
+            let mut warnings = Vec::new();
+            if let (Some(cached), Some(bytes)) = (
+                extracted_content_hash(installed_dir).await,
+                read_zip_artifact(&nupkg_path).await,
+            ) {
+                if cached != sha512_base64_of(&bytes) {
+                    warnings.push(VendorWarning::new(
+                        "vendor_nuget_stale_global_package",
+                        stale_global_package_detail(
+                            name,
+                            version,
+                            installed_dir,
+                            "the vendored feed",
+                        ),
+                    ));
+                }
+            }
             return done(
                 already_patched_result(purl, &nupkg_path, &record.files),
                 None,
-                Vec::new(),
+                warnings,
             );
         }
         // Wired but the committed nupkg is missing/stale: rebuild the ARTIFACT
@@ -602,9 +621,21 @@ pub async fn vendor_nuget(
             format!(
                 "no project under the root restores into a {PACKAGES_LOCK} (or a \
                  packages.<Project>.lock.json); the vendored feed serves {name} from the patched \
-                 copy but its contentHash is not pinned"
+                 copy but its contentHash is not pinned, so nothing rejects an unpatched copy \
+                 restored from elsewhere (a warm global packages folder)"
             ),
         ));
+    }
+
+    // A warm global packages folder shadows the vendored feed (#352): the
+    // crawler found the package there, extracted from other bytes.
+    if let Some(cached) = extracted_content_hash(installed_dir).await {
+        if cached != new_hash {
+            warnings.push(VendorWarning::new(
+                "vendor_nuget_stale_global_package",
+                stale_global_package_detail(name, version, installed_dir, "the vendored feed"),
+            ));
+        }
     }
 
     // ── marker + ledger entry ────────────────────────────────────────────
@@ -653,7 +684,43 @@ pub async fn vendor_nuget(
     done(result, Some(entry), warnings)
 }
 
-/// The ledger entry for a vendored nupkg: `wiring` is the config + lock
+// ── warm global packages folder (#352) ──────────────────────────────────────
+
+/// The `contentHash` NuGet recorded in `<dir>/.nupkg.metadata` when it
+/// extracted a package into its global packages folder (`dir` is
+/// `<folder>/<idLower>/<version>/`). `None` when there is none (not a
+/// global-packages-folder dir, or unreadable).
+pub async fn extracted_content_hash(dir: &Path) -> Option<String> {
+    let text = read_regular_to_string(&dir.join(".nupkg.metadata"))
+        .await
+        .ok()?;
+    let doc: Value = serde_json::from_str(crate::formats::text::strip_bom(&text)).ok()?;
+    doc.get("contentHash")
+        .and_then(Value::as_str)
+        .map(str::to_string)
+}
+
+/// Why and how to drop a stale copy of `id version` from NuGet's global
+/// packages folder: NuGet restores a package already in that folder
+/// without asking any source, so a patch that keeps the upstream id and
+/// version is shadowed there — silently unpatched without a lock, NU1403
+/// against the re-pinned lock with one. `how` names what now serves the
+/// patch (the vendored feed, the Socket source).
+pub fn stale_global_package_detail(id: &str, version: &str, dir: &Path, how: &str) -> String {
+    format!(
+        "{id} {version} is now served by {how}, but NuGet's global packages folder already holds \
+         the UNPATCHED copy at {} — NuGet restores from that folder before asking any source, so \
+         `dotnet restore` keeps the upstream bytes (or fails NU1403 against the re-pinned lock). \
+         Delete that directory (NuGet downloads the patched package again on the next restore), \
+         or clear the folder with `dotnet nuget locals global-packages --clear`, then run \
+         `dotnet restore`. Other machines and CI runners that restore a cached global packages \
+         folder must drop that entry too (key the CI cache on packages.lock.json with no \
+         fallback restore key)",
+        dir.display()
+    )
+}
+
+/// The ledger entry for a vendored nupkg:/// The ledger entry for a vendored nupkg: `wiring` is the config + lock
 /// records on a full vendor, only the re-pinned lock record on an
 /// artifact-only rebuild (see the hot path).
 fn nuget_entry(
@@ -2219,6 +2286,62 @@ mod tests {
                 .await
                 .unwrap(),
             lock
+        );
+    }
+
+    /// #352: the crawler found the package in NuGet's global packages
+    /// folder, extracted from the upstream bytes; NuGet would restore that
+    /// copy before asking the vendored feed, so the run says so (first run
+    /// and the in-sync re-run alike), and stays quiet once it is patched.
+    #[tokio::test]
+    async fn warm_global_packages_folder_is_reported() {
+        let (dir, blobs, installed, record) = fixture(true, None).await;
+        let root = dir.path();
+        let metadata = |hash: &str| {
+            format!("{{\"version\":2,\"contentHash\":\"{hash}\",\"source\":\"https://api.nuget.org/v3/index.json\"}}")
+        };
+        tokio::fs::write(installed.join(".nupkg.metadata"), metadata("UPSTREAM=="))
+            .await
+            .unwrap();
+        let (result, _entry, warnings) =
+            unwrap_done(run_vendor(root, &blobs, &installed, &record, false).await);
+        assert!(result.success, "{:?}", result.error);
+        let stale: Vec<&VendorWarning> = warnings
+            .iter()
+            .filter(|w| w.code == "vendor_nuget_stale_global_package")
+            .collect();
+        assert_eq!(stale.len(), 1, "{warnings:?}");
+        assert!(
+            stale[0].detail.contains(&installed.display().to_string())
+                && stale[0]
+                    .detail
+                    .contains("dotnet nuget locals global-packages --clear"),
+            "{}",
+            stale[0].detail
+        );
+        let (_r, _e, rerun) =
+            unwrap_done(run_vendor(root, &blobs, &installed, &record, false).await);
+        assert!(
+            rerun
+                .iter()
+                .any(|w| w.code == "vendor_nuget_stale_global_package"),
+            "{rerun:?}"
+        );
+        // Extracted from the vendored bytes: nothing to report.
+        let nupkg = tokio::fs::read(root.join(copy_rel())).await.unwrap();
+        tokio::fs::write(
+            installed.join(".nupkg.metadata"),
+            metadata(&sha512_base64_of(&nupkg)),
+        )
+        .await
+        .unwrap();
+        let (_r, _e, quiet) =
+            unwrap_done(run_vendor(root, &blobs, &installed, &record, false).await);
+        assert!(
+            !quiet
+                .iter()
+                .any(|w| w.code == "vendor_nuget_stale_global_package"),
+            "{quiet:?}"
         );
     }
 
