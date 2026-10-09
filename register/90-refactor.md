@@ -1,5 +1,5 @@
 ### Refactor routine (`refactor`, hourly, highest leverage first)
-_Last updated 2026-10-09T17:45Z · main @ a8e9397_
+_Last updated 2026-10-09T17:16Z · main @ a8e9397_
 
 **In flight:**
 - [#1347](https://github.com/SocketDev/socket-patch/pull/1347): one `crawlers::pnpm_layout` answers where pnpm installs (crawler roots, `detect_npm_pkg_manager`, PnP carve-out over disk/snapshot/memory); `node_modules`-only probes deleted. Fixes #1129 (E92). +191/−92 prod, +213 tests. `state: ready`.
