@@ -1429,9 +1429,16 @@ async fn scan_discovers_maven_and_nuget_in_every_mode() {
 
     let tmp = tempfile::tempdir().unwrap();
     write_root_package_json(tmp.path());
-    // Maven: java-project marker + a local repository the crawler reaches
-    // via MAVEN_REPO_LOCAL (verified by the version dir's `.pom`).
-    std::fs::write(tmp.path().join("pom.xml"), "<project></project>\n").unwrap();
+    // Maven: a pom declaring the artifact (a project-mode crawl keeps only
+    // what the project's poms reach, #265) + a local repository the crawler
+    // reaches via MAVEN_REPO_LOCAL (verified by the version dir's `.pom`).
+    std::fs::write(
+        tmp.path().join("pom.xml"),
+        "<project><dependencies><dependency><groupId>org.example</groupId>\
+         <artifactId>foo</artifactId><version>1.0.0</version></dependency>\
+         </dependencies></project>\n",
+    )
+    .unwrap();
     let artifact_dir = tmp.path().join("m2repo/org/example/foo/1.0.0");
     std::fs::create_dir_all(&artifact_dir).unwrap();
     std::fs::write(artifact_dir.join("foo-1.0.0.pom"), "<project/>").unwrap();

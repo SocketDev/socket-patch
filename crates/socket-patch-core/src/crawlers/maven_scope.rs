@@ -119,6 +119,14 @@ impl Walk<'_> {
         parsed
     }
 
+    /// Whether `path` stays inside the checkout (lexically).
+    fn inside(&self, path: &Path) -> bool {
+        match (normalize(path), normalize(self.cwd)) {
+            (Some(p), Some(root)) => p.starts_with(root),
+            _ => false,
+        }
+    }
+
     fn repo_pom(&self, (g, a, v): &Gav) -> Option<PathBuf> {
         let safe = |s: &str| {
             !s.is_empty()
@@ -159,7 +167,7 @@ impl Walk<'_> {
                 if !rel.ends_with(".xml") {
                     path = path.join("pom.xml");
                 }
-                let inside = normalize(&path).is_some_and(|p| p.starts_with(self.cwd));
+                let inside = self.inside(&path);
                 inside
                     .then(|| self.model(&path, true).map(|m| (m, path)))
                     .flatten()
@@ -220,7 +228,7 @@ impl Walk<'_> {
                 if !module.ends_with(".xml") {
                     path = path.join("pom.xml");
                 }
-                if !normalize(&path).is_some_and(|p| p.starts_with(self.cwd))
+                if !self.inside(&path)
                     || !seen.insert(path.clone())
                 {
                     continue;
