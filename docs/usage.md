@@ -7,12 +7,15 @@ flags, response fields, and diagnostic codes live in the
 
 ## Select patches
 
-A bare `scan` discovers patches from project dependency files and writes hosted
-references without prompting. Supported lockfiles work from a fresh checkout
-before installing dependencies. Agent mode needs installed packages, and some
-ecosystems need resolution records first (see [sbt and scala-cli](#sbt-and-scala-cli)
-and the [ecosystem notes](ecosystems.md)). Use `--dry-run` to inspect what would
-change, and `--json` for a machine-readable result:
+A bare `scan` discovers patches from project dependency files and applies them
+without prompting, in the mode the project already uses: hosted (writing hosted
+references) for a new project, vendored or agent if `.socket/` already holds
+patches in that mode. Pass `--mode` to choose or switch modes. Supported lockfiles
+work from a fresh checkout before installing dependencies. Agent mode needs
+installed packages, and some ecosystems need resolution records first (see
+[sbt and scala-cli](#sbt-and-scala-cli) and the [ecosystem notes](ecosystems.md)).
+Use `--dry-run` to inspect what would change, and `--json` for a machine-readable
+result:
 
 ```sh
 socket-patch scan --dry-run --json
