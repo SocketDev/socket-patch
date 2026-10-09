@@ -1077,7 +1077,7 @@ async fn scan_delivers_telemetry_before_writing_to_a_closed_stderr() {
 const HOSTED_NAME: &str = "telemetry-hosted";
 const HOSTED_PURL: &str = "pkg:npm/telemetry-hosted@1.0.0";
 const HOSTED_UUID: &str = "11111111-1111-4111-8111-111111111111";
-const HOSTED_URL: &str = "http://patch.test/patch/npm/telemetry-hosted/1.0.0/22222222-2222-4222-8222-222222222222/11111111-1111-4111-8111-111111111111/telemetry-hosted-1.0.0.tgz";
+const HOSTED_URL: &str = "https://patch.socket.dev/patch/npm/telemetry-hosted/1.0.0/22222222-2222-4222-8222-222222222222/11111111-1111-4111-8111-111111111111/telemetry-hosted-1.0.0.tgz";
 
 /// An npm project whose lockfile resolves [`HOSTED_NAME`] upstream (the
 /// `covgap_commands_scan_hosted.rs` `write_npm_project` shape).
@@ -1225,6 +1225,9 @@ async fn hosted_scan_reports_patch_applied_with_hosted_mode() {
         scanned["metadata"]["ecosystems"],
         serde_json::json!(["npm"])
     );
+    // Default mode, on a project nothing is wired into yet.
+    assert_eq!(scanned["metadata"]["mode"], "hosted");
+    assert_eq!(scanned["metadata"]["project_modes"], serde_json::json!([]));
     assert_eq!(scanned["metadata"]["free_patches"], 1);
 
     let applied = &bodies[1];
@@ -1244,6 +1247,80 @@ async fn hosted_scan_reports_patch_applied_with_hosted_mode() {
     assert_eq!(
         applied["session_id"], scanned["session_id"],
         "one run, one session"
+    );
+
+    // A re-scan sees the hosted pins the first run wrote.
+    let (code, stdout, stderr) = run_cmd(tmp.path(), &mock.uri(), "scan", &[], &[]);
+    assert_eq!(code, 0, "stdout:\n{stdout}\nstderr:\n{stderr}");
+    let bodies = telemetry_bodies(&mock).await;
+    let rescanned = bodies
+        .iter()
+        .filter(|b| b["event_type"] == "patch_scanned")
+        .nth(1)
+        .expect("the re-scan's patch_scanned");
+    assert_eq!(
+        rescanned["metadata"]["project_modes"],
+        serde_json::json!(["hosted"])
+    );
+    assert_ne!(rescanned["session_id"], scanned["session_id"]);
+}
+
+/// `patch_scanned` carries the requested mode and the modes the project is
+/// already wired for: here an agent manifest, scanned with `--mode agent`.
+#[tokio::test]
+async fn scan_reports_requested_and_project_modes() {
+    let mock = setup_mock(
+        serde_json::json!({ "packages": [], "canAccessPaidPatches": false }),
+        None,
+    )
+    .await;
+    let tmp = tempfile::tempdir().expect("tempdir");
+    write_root_package_json(tmp.path());
+    write_npm_package(tmp.path(), "minimist", "1.2.2");
+    let socket = tmp.path().join(".socket");
+    std::fs::create_dir_all(&socket).unwrap();
+    std::fs::write(
+        socket.join("manifest.json"),
+        serde_json::json!({
+            "patches": {
+                "pkg:npm/minimist@1.2.2": {
+                    "uuid": "33333333-3333-4333-8333-333333333333",
+                    "exportedAt": "2024-01-01T00:00:00Z",
+                    "files": {},
+                    "vulnerabilities": {},
+                    "description": "x",
+                    "license": "MIT",
+                    "tier": "free"
+                }
+            }
+        })
+        .to_string(),
+    )
+    .unwrap();
+
+    let (code, stdout, stderr) = run_cmd(
+        tmp.path(),
+        &mock.uri(),
+        "scan",
+        &["--mode", "agent", "--dry-run"],
+        &[],
+    );
+    assert_eq!(code, 0, "stdout:\n{stdout}\nstderr:\n{stderr}");
+
+    let bodies = telemetry_bodies(&mock).await;
+    let scanned = bodies
+        .iter()
+        .find(|b| b["event_type"] == "patch_scanned")
+        .unwrap_or_else(|| panic!("no patch_scanned: {bodies:#?}"));
+    assert_eq!(scanned["metadata"]["mode"], "agent");
+    assert_eq!(
+        scanned["metadata"]["project_modes"],
+        serde_json::json!(["agent"])
+    );
+    assert_eq!(
+        scanned["context"]["version"],
+        env!("CARGO_PKG_VERSION"),
+        "every event carries the client version"
     );
 }
 

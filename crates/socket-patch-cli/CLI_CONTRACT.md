@@ -1050,11 +1050,11 @@ State lives at `$XDG_CACHE_HOME`|`~/.cache` (Unix/macOS) or `%LOCALAPPDATA%` (Wi
 
 ## Telemetry events
 
-Each command POSTs its outcome as one JSON event (`{event_sender_created_at, event_type, context: {version, platform, arch, command}, session_id, metadata?, error?: {type, message}}`; no `event_kind`, so the backend stores it as a required event) to `<api>/v0/orgs/<org>/telemetry` with the bearer when the run has a token and an org, else anonymously to `<proxy>/patch/telemetry`. `--no-telemetry`/`SOCKET_TELEMETRY_DISABLED`, `SOCKET_OFFLINE`/`--offline` and `VITEST=true` send nothing. Error messages have the home directory replaced by `~`. Every `event_type` must be in depscan's patch event map (`telemetry-discriminators.ts`), or it is stored as `external` and drops out of the patch dashboards; `telemetry.rs` pins that list in a test.
+Each command POSTs its outcome as one JSON event (`{event_sender_created_at, event_type, context: {version, platform, arch, command}, session_id, metadata?, error?: {type, message}}`; no `event_kind`, so the backend stores it as a required event) to `<api>/v0/orgs/<org>/telemetry` with the bearer when the run has a token and an org, else anonymously to `<proxy>/patch/telemetry`. `--no-telemetry`/`SOCKET_TELEMETRY_DISABLED`, `SOCKET_OFFLINE`/`--offline` and `VITEST=true` send nothing. Every event's `context.version` is the client version. Error messages have the home directory replaced by `~`. Every `event_type` must be in depscan's patch event map (`telemetry-discriminators.ts`), or it is stored as `external` and drops out of the patch dashboards; `telemetry.rs` pins that list in a test.
 
 | Command | Success | Failure | Metadata |
 |---|---|---|---|
-| `scan` | `patch_scanned` | `patch_scan_failed` | `packages_scanned`, `free_patches`, `paid_patches`, `can_access_paid`, `ecosystems` (found by the crawl), `fallback_to_proxy` |
+| `scan` | `patch_scanned` | `patch_scan_failed` | `packages_scanned`, `free_patches`, `paid_patches`, `can_access_paid`, `ecosystems` (found by the crawl), `fallback_to_proxy`, `mode` (requested: `hosted` / `vendored` / `agent`, or `report` with none), `project_modes` (already wired: `hosted` lockfile pins, `vendored` ledger, `agent` manifest) |
 | `scan`/`get --mode hosted` (non-empty selection) | `patch_applied` | `patch_apply_failed` | `mode: "hosted"`, `patches_count` (pins confirmed), `files_count` (files rewritten), `dry_run` |
 | `apply` (and the nested apply of `scan`/`get --mode agent`) | `patch_applied` | `patch_apply_failed` | `mode: "agent"`, `patches_count`, `dry_run` |
 | `vendor` / `scan`/`get --mode vendored` | `patch_vendored` | `patch_vendor_failed` | `patches_count`, `dry_run` |

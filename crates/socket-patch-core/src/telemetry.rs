@@ -654,9 +654,12 @@ pub async fn track_patch_rollback_failed(error: impl std::fmt::Display, auth: &T
 // ---------------------------------------------------------------------------
 
 /// The whole `patch_scanned` event — type, command and metadata (per-tier
-/// patch counts and whether the call was downgraded to the public proxy
-/// after an auth-endpoint 401/403). Both wrappers below build their event
-/// here, so the inline and background paths can never drift apart.
+/// patch counts, whether the call was downgraded to the public proxy
+/// after an auth-endpoint 401/403, the mode the run was asked for —
+/// `hosted` / `vendored` / `agent`, or `report` with none — and the modes
+/// the project is already wired for, from its hosted lockfile pins, vendor
+/// ledger and agent manifest). Both wrappers below build their event here,
+/// so the inline and background paths can never drift apart.
 #[allow(clippy::too_many_arguments)]
 fn prepare_patch_scanned(
     packages_scanned: usize,
@@ -665,6 +668,8 @@ fn prepare_patch_scanned(
     can_access_paid: bool,
     ecosystems: &[String],
     fallback_to_proxy: bool,
+    mode: &str,
+    project_modes: &[&str],
     auth: &TelemetryAuth,
 ) -> Option<PreparedSend> {
     prepare(
@@ -677,6 +682,8 @@ fn prepare_patch_scanned(
             "can_access_paid": can_access_paid,
             "ecosystems": ecosystems,
             "fallback_to_proxy": fallback_to_proxy,
+            "mode": mode,
+            "project_modes": project_modes,
         }),
         None::<&str>,
         auth,
@@ -704,6 +711,8 @@ pub async fn track_patch_scanned(
     can_access_paid: bool,
     ecosystems: &[String],
     fallback_to_proxy: bool,
+    mode: &str,
+    project_modes: &[&str],
     auth: &TelemetryAuth,
 ) {
     fire_prepared(prepare_patch_scanned(
@@ -713,6 +722,8 @@ pub async fn track_patch_scanned(
         can_access_paid,
         ecosystems,
         fallback_to_proxy,
+        mode,
+        project_modes,
         auth,
     ))
     .await;
@@ -730,6 +741,8 @@ pub fn spawn_patch_scanned(
     can_access_paid: bool,
     ecosystems: &[String],
     fallback_to_proxy: bool,
+    mode: &str,
+    project_modes: &[&str],
     auth: &TelemetryAuth,
 ) {
     pending.spawn_prepared(prepare_patch_scanned(
@@ -739,6 +752,8 @@ pub fn spawn_patch_scanned(
         can_access_paid,
         ecosystems,
         fallback_to_proxy,
+        mode,
+        project_modes,
         auth,
     ));
 }
@@ -1121,8 +1136,30 @@ mod tests {
         let ecosystems = vec!["npm".to_string(), "pypi".to_string()];
         let auth = TelemetryAuth::from_credentials(None, None);
         let mut pending = PendingTelemetry::new();
-        track_patch_scanned(5, 3, 2, true, &ecosystems, true, &auth).await;
-        spawn_patch_scanned(&mut pending, 5, 3, 2, true, &ecosystems, true, &auth);
+        track_patch_scanned(
+            5,
+            3,
+            2,
+            true,
+            &ecosystems,
+            true,
+            "hosted",
+            &["vendored"],
+            &auth,
+        )
+        .await;
+        spawn_patch_scanned(
+            &mut pending,
+            5,
+            3,
+            2,
+            true,
+            &ecosystems,
+            true,
+            "hosted",
+            &["vendored"],
+            &auth,
+        );
         pending.flush().await;
         track_patch_scan_failed("all batches failed", true, &auth).await;
         spawn_patch_scan_failed(&mut pending, "all batches failed", true, &auth);
@@ -1151,6 +1188,11 @@ mod tests {
         assert_eq!(bodies[0]["event_type"], "patch_scanned");
         assert_eq!(bodies[0]["context"]["command"], "scan");
         assert_eq!(bodies[0]["metadata"]["free_patches"], 3);
+        assert_eq!(bodies[0]["metadata"]["mode"], "hosted");
+        assert_eq!(
+            bodies[0]["metadata"]["project_modes"],
+            serde_json::json!(["vendored"])
+        );
         assert_eq!(bodies[2]["event_type"], "patch_scan_failed");
         assert_eq!(bodies[2]["context"]["command"], "scan");
         assert_eq!(bodies[2]["error"]["message"], "all batches failed");

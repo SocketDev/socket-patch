@@ -1963,6 +1963,23 @@ async fn run_scan(
             read_set: read_set.as_ref(),
         })
     };
+    // Telemetry: the mode this run was asked for, and the modes the
+    // project is already wired for (it may hold more than one mid-migration).
+    let requested_mode = args.mode.map_or("report", ScanMode::cli_name);
+    let project_modes: Vec<&str> = [
+        (
+            !hosted_pin_list.is_empty() || !hosted_unlocked_pins.is_empty(),
+            "hosted",
+        ),
+        (!vendored_purls.is_empty(), "vendored"),
+        (
+            existing_manifest.is_some_and(|m| !m.patches.is_empty()),
+            "agent",
+        ),
+    ]
+    .into_iter()
+    .filter_map(|(present, mode)| present.then_some(mode))
+    .collect();
     let hosted_state = (!args.common.is_global())
         .then(|| crate::commands::hosted_state_from_pins(&hosted_pin_list));
     let redirect_state = hosted_state.as_ref();
@@ -2140,7 +2157,18 @@ async fn run_scan(
             }
         }
         // Telemetry: empty-scan still counts as a successful scan.
-        spawn_patch_scanned(telemetry, 0, 0, 0, false, &[], false, &telemetry_auth);
+        spawn_patch_scanned(
+            telemetry,
+            0,
+            0,
+            0,
+            false,
+            &[],
+            false,
+            requested_mode,
+            &project_modes,
+            &telemetry_auth,
+        );
         // The result prints right away: nothing to overlap the send with.
         telemetry.flush().await;
         if args.common.json {
@@ -2458,6 +2486,8 @@ async fn run_scan(
         can_access_paid_patches,
         &scanned_ecosystems(&all_purls),
         fallback_to_proxy,
+        requested_mode,
+        &project_modes,
         &telemetry_auth,
     );
 
