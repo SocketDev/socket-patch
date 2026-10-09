@@ -92,13 +92,24 @@ pub(crate) mod tests_support {
 /// dropping the farther ones. A file that cannot be read or parsed is
 /// skipped: it contributes nothing NuGet could use either.
 pub(crate) async fn inherited_source_keys(project_root: &std::path::Path) -> Vec<String> {
+    inherited_source_keys_traced(project_root).await.0
+}
+
+/// [`inherited_source_keys`] plus every path it probed or read (absolute),
+/// for a read cache that fingerprints reads it did not mediate.
+pub(crate) async fn inherited_source_keys_traced(
+    project_root: &std::path::Path,
+) -> (Vec<String>, Vec<std::path::PathBuf>) {
     use crate::formats::nuget::{effective_source_keys, parse_config, NugetConfig};
+    let mut touched: Vec<std::path::PathBuf> = Vec::new();
     let mut chain: Vec<NugetConfig> = Vec::new();
     let user = match user_config_path() {
-        Some(path) => crate::utils::fs::read_regular_to_string(&path)
-            .await
-            .ok()
-            .and_then(|t| parse_config(crate::formats::text::strip_bom(&t))),
+        Some(path) => {
+            let read = crate::utils::fs::read_regular_to_string(&path).await;
+            touched.push(path);
+            read.ok()
+                .and_then(|t| parse_config(crate::formats::text::strip_bom(&t)))
+        }
         None => None,
     };
     chain.push(user.unwrap_or_else(|| NugetConfig {
@@ -113,7 +124,9 @@ pub(crate) async fn inherited_source_keys(project_root: &std::path::Path) -> Vec
     for dir in ancestors {
         for name in CONFIG_NAMES {
             let path = dir.join(name);
-            if !crate::utils::fs::file_exists(&path).await {
+            let exists = crate::utils::fs::file_exists(&path).await;
+            touched.push(path.clone());
+            if !exists {
                 continue;
             }
             if let Some(cfg) = crate::utils::fs::read_regular_to_string(&path)
@@ -126,7 +139,7 @@ pub(crate) async fn inherited_source_keys(project_root: &std::path::Path) -> Vec
             break;
         }
     }
-    effective_source_keys(&chain)
+    (effective_source_keys(&chain), touched)
 }
 
 #[cfg(test)]

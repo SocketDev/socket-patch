@@ -636,9 +636,16 @@ pub async fn read_candidate_files(
     // under the project's own: a catch-all mapping the rewriter creates
     // must name their sources too (#354). Disk only (the in-memory engine
     // refuses NuGet, and could not see them).
-    if candidates.iter().any(|c| c.dep.ecosystem == "nuget") {
-        if let Some(root) = view.disk_root() {
-            let keys = crate::vendor::nuget_config::inherited_source_keys(root).await;
+    if candidates.iter().any(|c| c.dep.ecosystem == "nuget")
+        && !matches!(view, ProjectView::Memory(_))
+    {
+        // The configs live outside the project: read beside the view, then
+        // handed to it as such reads (asking for its raw root would end a
+        // re-scan read cache's recording).
+        if let Some(root) = view.disk_root_reading(std::iter::empty::<&str>()) {
+            let (keys, touched) =
+                crate::vendor::nuget_config::inherited_source_keys_traced(root).await;
+            view.disk_root_reading(&touched);
             out.files.insert(
                 crate::patch::redirect::NUGET_INHERITED_SOURCES_KEY.to_string(),
                 keys.join("\n"),
