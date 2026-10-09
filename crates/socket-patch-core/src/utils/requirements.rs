@@ -61,6 +61,9 @@ pub(crate) fn decode(bytes: &[u8]) -> Option<String> {
                     .then(|| String::from_utf8_lossy(bytes).into_owned()),
                 Codec::Latin1 => Some(bytes.iter().map(|&b| char::from(b)).collect()),
                 Codec::Cp1252 => bytes.iter().map(|&b| cp1252_char(b)).collect(),
+                Codec::AsciiCompatible => bytes
+                    .is_ascii()
+                    .then(|| String::from_utf8_lossy(bytes).into_owned()),
             };
         }
     }
@@ -74,6 +77,9 @@ enum Codec {
     Ascii,
     Latin1,
     Cp1252,
+    /// A codec with no table here whose low half is ASCII: plain-ASCII
+    /// bytes decode as ASCII under it, anything else is unreadable.
+    AsciiCompatible,
 }
 
 /// The encoding name of pip's PEP 263 check: the first of the file's first
@@ -104,8 +110,9 @@ fn coding_line(bytes: &[u8]) -> Option<String> {
 
 /// Python's codec lookup for the names [`decode`] models: case-folded,
 /// `-` and ` ` read as `_`, then Python's alias table for UTF-8, ASCII,
-/// Latin-1 and cp1252. Any other codec (pip would use it) is `None`, so
-/// the file reads as undecodable rather than being guessed at.
+/// Latin-1 and cp1252, then [`ASCII_COMPATIBLE_CODECS`] (#1212). Any
+/// other codec (pip would use it) is `None`, so the file reads as
+/// undecodable rather than being guessed at.
 fn coding_line_codec(name: &str) -> Option<Codec> {
     let name = name.to_ascii_lowercase().replace(['-', ' '], "_");
     Some(match name.as_str() {
@@ -120,9 +127,69 @@ fn coding_line_codec(name: &str) -> Option<Codec> {
             Codec::Latin1
         }
         "cp1252" | "windows_1252" | "1252" => Codec::Cp1252,
+        _ if ASCII_COMPATIBLE_CODECS
+            .split_ascii_whitespace()
+            .any(|known| known == python_codec_key(&name)) =>
+        {
+            Codec::AsciiCompatible
+        }
         _ => return None,
     })
 }
+
+/// A codec name as Python's `encodings.search_function` looks it up:
+/// runs of anything but ASCII letters, digits and `.` become one `_`
+/// (`normalize_encoding`), then `.` reads as `_`.
+fn python_codec_key(name: &str) -> String {
+    name.split(|c: char| !(c.is_ascii_alphanumeric() || c == '.'))
+        .filter(|part| !part.is_empty())
+        .collect::<Vec<_>>()
+        .join("_")
+        .replace('.', "_")
+}
+
+/// Every name (module and alias, as [`python_codec_key`] spells it) of
+/// the Python 3.11 codecs, beyond those [`coding_line_codec`] models,
+/// that decode each ASCII byte as itself: the ISO-8859, Windows, DOS,
+/// Mac, KOI8 and CJK multibyte families. A header copied from a template
+/// (`# -*- coding: iso-8859-15 -*-`) over a plain-ASCII file is the
+/// common case, and pip reads it as ASCII. Left out, so still `None`:
+/// codecs that read ASCII bytes differently (EBCDIC, cp864, UTF-16/32,
+/// UTF-7, HZ, ISO-2022, Shift_JIS-2004, the escape codecs, idna,
+/// punycode) and the bytes-to-bytes codecs pip cannot decode text with.
+/// Space-separated, sorted.
+const ASCII_COMPATIBLE_CODECS: &str =
+    "1125 1250 1251 1253 1254 1255 1256 1257 1258 437 775 850 852 855 857 858 860 861 862 863 \
+     865 866 869 932 936 949 950 arabic asmo_708 big5 big5_hkscs big5_tw big5hkscs chinese \
+     cp1006 cp1051 cp1125 cp1250 cp1251 cp1253 cp1254 cp1255 cp1256 cp1257 cp1258 cp1361 \
+     cp154 cp437 cp720 cp737 cp775 cp850 cp852 cp855 cp856 cp857 cp858 cp860 cp861 cp862 \
+     cp863 cp865 cp866 cp866u cp869 cp874 cp932 cp936 cp949 cp950 cp_gr cp_is csbig5 csibm855 \
+     csibm857 csibm858 csibm860 csibm861 csibm863 csibm865 csibm866 csibm869 csiso58gb231280 \
+     csisolatin2 csisolatin3 csisolatin4 csisolatin5 csisolatin6 csisolatinarabic \
+     csisolatincyrillic csisolatingreek csisolatinhebrew cskoi8r cspc775baltic \
+     cspc850multilingual cspc862latinhebrew cspc8codepage437 cspcp852 csptcp154 csshiftjis \
+     cyrillic cyrillic_asian ecma_114 ecma_118 elot_928 euc_cn euc_jis2004 euc_jis_2004 \
+     euc_jisx0213 euc_jp euc_kr euccn eucgb2312_cn eucjis2004 eucjisx0213 eucjp euckr gb18030 \
+     gb18030_2000 gb2312 gb2312_1980 gb2312_80 gbk greek greek8 hebrew hkscs hp_roman8 \
+     ibm1051 ibm1125 ibm437 ibm775 ibm850 ibm852 ibm855 ibm857 ibm858 ibm860 ibm861 ibm862 \
+     ibm863 ibm865 ibm866 ibm869 iso8859_10 iso8859_11 iso8859_13 iso8859_14 iso8859_15 \
+     iso8859_16 iso8859_2 iso8859_3 iso8859_4 iso8859_5 iso8859_6 iso8859_7 iso8859_8 \
+     iso8859_9 iso_8859_10 iso_8859_10_1992 iso_8859_11 iso_8859_11_2001 iso_8859_13 \
+     iso_8859_14 iso_8859_14_1998 iso_8859_15 iso_8859_16 iso_8859_16_2001 iso_8859_2 \
+     iso_8859_2_1987 iso_8859_3 iso_8859_3_1988 iso_8859_4 iso_8859_4_1988 iso_8859_5 \
+     iso_8859_5_1988 iso_8859_6 iso_8859_6_1987 iso_8859_7 iso_8859_7_1987 iso_8859_8 \
+     iso_8859_8_1988 iso_8859_9 iso_8859_9_1989 iso_celtic iso_ir_101 iso_ir_109 iso_ir_110 \
+     iso_ir_126 iso_ir_127 iso_ir_138 iso_ir_144 iso_ir_148 iso_ir_157 iso_ir_166 iso_ir_199 \
+     iso_ir_226 iso_ir_58 jisx0213 johab koi8_r koi8_t koi8_u korean ks_c_5601 ks_c_5601_1987 \
+     ks_x_1001 ksc5601 ksx1001 kz1048 kz_1048 l10 l2 l3 l4 l5 l6 l7 l8 l9 latin10 latin2 \
+     latin3 latin4 latin5 latin6 latin7 latin8 latin9 mac_arabic mac_centeuro mac_croatian \
+     mac_cyrillic mac_farsi mac_greek mac_iceland mac_latin2 mac_roman mac_romanian \
+     mac_turkish maccentraleurope maccyrillic macgreek maciceland macintosh maclatin2 \
+     macroman macturkish ms1361 ms932 ms936 ms949 ms950 ms_kanji mskanji palmos pt154 ptcp154 \
+     r8 rk1048 roman8 ruscii s_jis shift_jis shiftjis sjis strk1048_2002 thai tis620 tis_620 \
+     tis_620_0 tis_620_2529_0 tis_620_2529_1 u_jis uhc ujis windows_1250 windows_1251 \
+     windows_1253 windows_1254 windows_1255 windows_1256 windows_1257 windows_1258 \
+     x_mac_japanese x_mac_korean x_mac_simp_chinese x_mac_trad_chinese";
 
 /// One cp1252 byte as Python decodes it: Latin-1 outside `0x80..=0x9F`,
 /// Windows punctuation inside it, and five bytes Python leaves undefined.
@@ -535,8 +602,9 @@ mod tests {
     fn decode_reads_ascii_under_any_ascii_compatible_coding_line() {
         for coding in [
             "iso-8859-15",
-            "latin-9",
+            "latin9",
             "ISO8859_15",
+            "iso.8859.15",
             "l9",
             "cp1250",
             "windows-1250",
@@ -578,6 +646,9 @@ mod tests {
             "punycode",
             "rot13",
             "hex",
+            // Not names Python's lookup knows (pip raises LookupError).
+            "latin-9",
+            "cp-1250",
             "no-such-codec",
         ] {
             let text = format!("# coding: {coding}\nsix==1.16.0\n");

@@ -248,7 +248,7 @@ async fn lock_only_scan_discovers_pep_263_pins() {
 /// pins are discovered instead of reading as "No packages found".
 #[tokio::test]
 async fn lock_only_scan_discovers_ascii_pins_under_any_ascii_coding_line() {
-    for coding in ["iso-8859-15", "latin-9", "cp1250", "mac-roman", "gbk"] {
+    for coding in ["iso-8859-15", "latin9", "cp1250", "mac-roman", "gbk"] {
         let root = format!("# -*- coding: {coding} -*-\nsp-fixture-six==1.16.0\n");
         assert_lock_only_discovers_bytes(
             &[("requirements.txt", root.as_bytes())],
