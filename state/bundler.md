@@ -1,6 +1,6 @@
 [agent] Progress ledger for the scheduled Bundler (RubyGems) bug-hunt routine (label pm:bundler).
 
-Last updated: 2026-10-08 (run 34), main `cb16bdd`, latest release v4.0.0 (npm; no git tags). Newest Bundler tested: 4.1.0.beta1; newest stable 4.0.22.
+Last updated: 2026-10-09 (run 35), main `f3c6313`, latest release v4.0.0 (npm; no git tags). Newest Bundler tested: 4.1.0.beta2; newest stable 4.0.22.
 
 ## Coverage matrix
 
@@ -313,7 +313,18 @@ Also on 4.0.17: BOM `Gemfile` passes; symlinked `Gemfile` / lock is refused (pas
 | --- | --- | --- |
 | Hosted 1-gem superseding patch (new uuid, same version): re-scan, stale warning, cold frozen install of gen B, `vex` | — | pass |
 | Hosted 2-gem re-scan, sorted section insert | pass | pass |
-| Hosted 2-gem re-scan superseding one gem to a later-sorting uuid | **fail #1186** (×2) | lock re-sorted by Bundler (warning only) |
+| Hosted 2-gem re-scan superseding one gem to a later-sorting uuid | fixed #1186 (#1190) | lock re-sorted by Bundler (warning only) |
+
+### Run 35 (main `f3c6313`; Linux Ruby 3.3.6; scratch copies of `e2e_redirect_gem_build.rs`; rollout cap)
+
+| Cell | 4.1.0.beta2 | 4.0.22 | 2.5.22 |
+| --- | --- | --- | --- |
+| Repo gem e2e suites (redirect 35 / stale 37 / vendor 41 / multi-platform 7) | pass | — | — |
+| Hosted, no-CHECKSUMS lock, re-scan `--max-new-patches 0` | — | **fail #1224** | **fail #1224** |
+| Hosted, 2 gems, no-CHECKSUMS lock, `--max-new-patches 1` ×4 | — | **fail #1224** (starves) | **fail #1224** (first bad `4d06019`) |
+| Same, CHECKSUMS lock | — | pass | n/a |
+| Hosted superseding patch under `--max-new-patches 0`, no-CHECKSUMS | — | — | fail (#1224 comment; predates #1058) |
+| Same, CHECKSUMS lock | — | pass (`upgrade: 1`) | — |
 
 ### Global mode (`-g`)
 
@@ -337,12 +348,12 @@ Also on 4.0.17: BOM `Gemfile` passes; symlinked `Gemfile` / lock is refused (pas
 
 ## Backlog
 
-1. #1186 neighbours: rotated grant token only (same uuids) on a 2-gem project; `rollback` / `remove` of one of 3 hosted gems; Bundler 2.6.9.
-2. #749 DSL gap: re-run when it's fixed or the issue is reopened; also the vendored DSL shape and `lockfile false`.
-3. Re-run #896 / #952 / #985 / #1056 / #1092 / #1109 / #1125 / #1186 when fixes merge.
-4. #1125 neighbours: `gems.rb` without `gems.locked`; `get <uuid> --mode hosted` and `vendor` on a lockless project.
-5. #1092 neighbours: Windows `x64-mingw-ucrt` + `x64-mingw32` pairs (probe branch); a lock listing several platform variants.
-6. #1056 neighbours: CRLF Gemfile and `gems.rb`; the Bundler 1.17 hosted unwind. #1109 neighbours: global-tier `deployment` / `path`.
+1. #1224 neighbours: `gems.rb` spelling; lockless Gemfile (#1125 shape) under a cap; cap via `SOCKET_MAX_NEW_PATCHES` / socket.yml.
+2. #1186 neighbours: `rollback` / `remove` of one of 3 hosted gems on a CHECKSUMS lock; Bundler 2.6.9.
+3. #749 DSL gap: vendored DSL `lockfile`, and `lockfile false`.
+4. Bundler 4.1 `override "x", from:, to:` (new in beta2) vs a hosted transitive redirect and `vex`.
+5. Re-run #896 / #952 / #985 / #1056 / #1092 / #1109 / #1125 / #1224 when fixes merge; check PR #1221 (#780) once it lands.
+6. #1092 neighbours: Windows `x64-mingw-ucrt` + `x64-mingw32` pairs (probe branch). #1056 neighbours: CRLF Gemfile and `gems.rb`.
 
 ## Known non-bugs
 
@@ -443,3 +454,6 @@ Also on 4.0.17: BOM `Gemfile` passes; symlinked `Gemfile` / lock is refused (pas
 - #1039 made the V→H takeover atomic, but gem is not in `hosted::takeover::takeover_ecosystem` (cargo / npm / golang / pypi / maven), so the run-16 gem V→H refusal is unchanged (run 34).
 - A hosted single-gem superseding patch (same version, new uuid) works: the re-scan rewrites the block, lock remote and CHECKSUMS, and the stale guard flags the gen-A install (its wording says "UNPATCHED" for older-patch bytes; fail-safe, not filed) (run 34).
 - Layer extra patch generations over the e2e fixture's mocks with wiremock `Mock::with_priority(1|2)` (default priority is 5); `cargo test` on a cold target takes >10 min, so run it with a long background timeout (run 34).
+- A capped hosted re-scan never un-wires a deferred gem: the Gemfile `source` block stays, so #1224 is a stuck rollout, not silent unpatching (run 35).
+- Bundler 4.1.0.beta2 lock / DSL changes (`OPTIONS` regex allows `_` for `sparse_checkout:`, the `override from:/to:` DSL, empty-CHECKSUMS re-resolve only when fetching remotely) don't touch the shapes socket-patch writes; the gem suites pass (run 35).
+- Bisect without rebuilding tests: temporarily make `binary()` in the e2e file honour a `ZZ_BIN` env override, and build the old commit's release binary into its own `CARGO_TARGET_DIR` (about 6 min) (run 35). `std::env::var("X").is_ok()` is true for `X=""`, so leave scratch toggles unset rather than empty.
