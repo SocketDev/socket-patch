@@ -657,7 +657,7 @@ jobs:
       contents: read
     strategy:
       fail-fast: false
-      max-parallel: 2
+      max-parallel: 4
       matrix:
         ecosystem: [npm, pypi, gem, cargo, golang, maven, composer, nuget, deno, sbt]
     steps:
@@ -961,7 +961,7 @@ jobs:
     needs: [e2e-build]
     strategy:
       fail-fast: false
-      max-parallel: 4
+      max-parallel: 8
       matrix:
         include:
           # (No e2e_cargo / e2e_golang rows: neither suite has an
@@ -1857,7 +1857,7 @@ jobs:
     needs: [e2e-build]
     strategy:
       fail-fast: false
-      max-parallel: 2
+      max-parallel: 4
       matrix:
         include:
           - {os: ubuntu-latest, suite: e2e_redirect_gem_build e2e_vendor_gem_build, ruby: '3.3', bundler: '2.7.2'}
