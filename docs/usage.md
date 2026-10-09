@@ -7,7 +7,9 @@ flags, response fields, and diagnostic codes live in the
 
 ## Select patches
 
-A bare `scan` applies hosted patches without prompting. Use `--dry-run` to inspect
+A bare `scan` applies patches without prompting, in the mode the project already
+uses: hosted for a new project, vendored or agent if `.socket/` already holds patches
+in that mode. Pass `--mode` to choose or switch modes. Use `--dry-run` to inspect
 what it would change, and `--json` for a machine-readable result:
 
 ```sh

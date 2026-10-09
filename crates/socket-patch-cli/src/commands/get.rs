@@ -143,7 +143,8 @@ pub struct GetArgs {
     pub all_releases: bool,
 
     /// How to consume the patches: the same modes as `scan --mode`
-    /// [default: hosted; agent with `--save-only` or `--global`]
+    /// [default: the mode the project's patch state already records, else
+    /// hosted; agent with `--save-only` or `--global`]
     // agent = record in .socket/manifest.json + blobs and apply in place;
     // hosted = rewrite lockfiles so the patched deps resolve to Socket's
     // hosted patch server (no manifest, no blobs, no ledger: the lockfile
@@ -1016,16 +1017,34 @@ pub async fn run(args: GetArgs) -> i32 {
             "Only one of --id, --cve, --ghsa, or --package can be specified",
         );
     }
-    // v5: hosted by default, like scan. `--save-only` (records a manifest
-    // entry) and global installs (no project lockfile) mean agent mode.
-    // Usage errors exit 2, like clap's and scan's (v5.0).
-    let mode = args
-        .mode
-        .unwrap_or(if args.save_only || args.common.is_global() {
-            super::scan::ScanMode::Agent
-        } else {
-            super::scan::ScanMode::Hosted
-        });
+    // v5: with no `--mode`, like scan, the project keeps the mode its
+    // state already records (#1088) and a project with no state is hosted.
+    // `--save-only` (records a manifest entry) and global installs (no
+    // project lockfile) mean agent mode. Usage errors exit 2, like clap's
+    // and scan's (v5.0).
+    let mode = match args.mode {
+        Some(mode) => mode,
+        None if args.save_only || args.common.is_global() => super::scan::ScanMode::Agent,
+        None => match super::mode_from_project_state(&args.common).await {
+            Ok(mode) => {
+                if !args.common.json && !args.common.silent {
+                    if let Some(note) = super::kept_mode_note(mode) {
+                        eprintln!("{note}");
+                    }
+                }
+                mode
+            }
+            Err(message) => {
+                return usage_error(
+                    JsonCommand::Get,
+                    args.common.json,
+                    args.common.dry_run,
+                    "mode_ambiguous",
+                    &message,
+                );
+            }
+        },
+    };
     // Global installs have no project lockfile: an explicit hosted or
     // vendored mode would rewire the cwd project, not the global copy.
     if let Some(conflict) = super::global_mode_conflict(&args.common, mode) {

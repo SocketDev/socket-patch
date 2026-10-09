@@ -6,9 +6,15 @@ existing scripts against the new CLI; the [changelog](../CHANGELOG.md) and
 
 ## Defaults and stored state
 
-- Bare `scan` and `get` now patch in hosted mode. `scan` never prompts;
-  hosted and vendored `get` do not prompt either. Use `scan --dry-run` for a preview
-  or `--mode agent` to retain in-place patching. Global scans and a mode-less
+- Bare `scan` and `get` now patch in hosted mode when the project has no patch
+  state yet. `scan` never prompts; hosted and vendored `get` do not prompt either.
+  Use `scan --dry-run` for a preview or `--mode agent` to retain in-place patching.
+- A bare `scan` or `get` keeps the mode a project already uses: a project with a
+  vendor ledger (`.socket/vendor/state.json`) stays vendored, and one whose
+  `.socket/manifest.json` holds patches stays in agent mode. Switching modes needs an
+  explicit `--mode` (for example `scan --mode hosted` converts a vendored project in
+  place). A project holding both agent and vendored patches must pass `--mode`
+  (`mode_ambiguous`, exit 2). Global scans and a mode-less
   `scan --prune` do not acquire new patches; `--prune` still performs cleanup.
 - Hosted state lives in dependency files. No command writes
   `.socket/vendor/redirect-state.json`. Legacy hosted records can still supply

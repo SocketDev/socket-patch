@@ -48,6 +48,61 @@ pub(crate) fn project_state_in_scope(common: &crate::args::GlobalArgs) -> bool {
     !common.is_global()
 }
 
+/// The mode a `scan`/`get` run with no `--mode` uses for the `--cwd`
+/// project (CLI_CONTRACT.md, Mode resolution): the mode the project's own
+/// patch state already records, so a bare run never converts the project
+/// to another mode. Hosted is the default for a project with no state.
+///
+/// * a non-empty vendor ledger (`.socket/vendor/state.json`) → vendored;
+/// * a manifest (`.socket/manifest.json`) holding patches → agent;
+/// * neither → hosted (hosted mode keeps no ledger of its own);
+/// * both → `Err(usage message)`: the run cannot tell which mode to keep,
+///   so it asks for an explicit `--mode` rather than guess.
+///
+/// An unreadable or malformed vendor ledger counts as vendored, so the
+/// vendored flow reports the corruption instead of a hosted takeover
+/// running over it. An unreadable manifest is not agent evidence (hosted
+/// and vendored mode never read it). Only called in project scope.
+pub(crate) async fn mode_from_project_state(
+    common: &crate::args::GlobalArgs,
+) -> Result<scan::ScanMode, String> {
+    let manifest_path = common.resolved_manifest_path();
+    let (manifest, vendor) = tokio::join!(
+        socket_patch_core::manifest::operations::read_manifest(&manifest_path),
+        socket_patch_core::vendor::load_state(&common.cwd),
+    );
+    let vendored = !matches!(vendor, Ok(state) if state.entries.is_empty());
+    let agent = matches!(manifest, Ok(Some(m)) if !m.patches.is_empty());
+    match (vendored, agent) {
+        (true, true) => Err(format!(
+            "{} holds both agent-mode patches ({}) and vendored patches \
+             (.socket/vendor/state.json): pass --mode agent, --mode vendored or \
+             --mode hosted to choose the mode this run uses",
+            common.cwd.display(),
+            manifest_path.display(),
+        )),
+        (true, false) => Ok(scan::ScanMode::Vendored),
+        (false, true) => Ok(scan::ScanMode::Agent),
+        (false, false) => Ok(scan::ScanMode::Hosted),
+    }
+}
+
+/// The stderr note a human-mode `scan`/`get` prints when it kept a
+/// non-default mode from the project's state.
+pub(crate) fn kept_mode_note(mode: scan::ScanMode) -> Option<String> {
+    let store = match mode {
+        scan::ScanMode::Hosted => return None,
+        scan::ScanMode::Vendored => ".socket/vendor/state.json",
+        scan::ScanMode::Agent => "the manifest",
+    };
+    Some(format!(
+        "Note: using --mode {} because {store} already holds {} patches; pass \
+         --mode explicitly to switch modes",
+        mode.cli_name(),
+        mode.cli_name(),
+    ))
+}
+
 /// The usage error for a mode that rewires the project (`hosted`,
 /// `vendored`) under global scope, or `None` when `mode` is allowed.
 /// Shared by `scan` and `get` so both refuse the same combinations with

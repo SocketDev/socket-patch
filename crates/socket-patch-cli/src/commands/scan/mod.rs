@@ -262,8 +262,10 @@ pub struct ScanArgs {
     #[arg(long, default_value_t = false)]
     pub sync: bool,
 
-    /// How discovered patches are consumed [default: hosted]. A `--prune`
-    /// or `--global` scan with no mode only reports
+    /// How discovered patches are consumed [default: the mode the
+    /// project's patch state already records, else hosted]. Switching an
+    /// existing vendored or agent-mode project to another mode needs this
+    /// flag. A `--prune` or `--global` scan with no mode only reports
     // `--sync` also selects agent; combining it with a different `--mode`
     // is rejected in `resolve_mode_flags`.
     #[arg(long = "mode", value_enum)]
@@ -1545,10 +1547,14 @@ fn project_dirs(
 /// name, as if each were `--cwd`. The exit code is the worst of the runs.
 /// `--json` takes one directory, so stdout stays one document. Every
 /// directory must be inside the repository root the policy was read from.
+///
+/// `mode_inferred`: the mode came from `--cwd`'s state rather than
+/// `--mode`, so each directory takes its mode from its own state.
 async fn run_project_dirs(
     args: ScanArgs,
     telemetry: &mut PendingTelemetry,
     invocation: &InvocationPolicy,
+    mode_inferred: bool,
 ) -> i32 {
     let usage = |code: &str, message: &str| {
         usage_error(
@@ -1622,6 +1628,9 @@ async fn run_project_dirs(
         child.paths.clear();
         child.common.cwd = dir.clone();
         child.rollout.carry = Some(carry.clone());
+        if mode_inferred {
+            child.mode = None;
+        }
         code = code.max(Box::pin(run_scan(child, telemetry, Some(invocation), *explicit)).await);
     }
     code
@@ -1659,6 +1668,9 @@ async fn run_scan(
 ) -> i32 {
     apply_env_toggles(&args.common);
 
+    // Whether the user chose the mode (`--mode`, or `--sync` = agent).
+    // Without it, the mode comes from the project's own state below.
+    let mode_explicit = args.mode.is_some() || args.sync;
     // Resolve `--mode`/`--sync` into `args.mode` (see
     // `resolve_mode_flags`). `--sync` with another mode is a usage error
     // (exit 2); under --json it prints the coded error on stdout.
@@ -1675,6 +1687,24 @@ async fn run_scan(
             "invalid_args"
         };
         return scan_usage_error(&args, code, &message);
+    }
+    // A bare scan keeps the mode the project already has (#1088): only an
+    // explicit `--mode` converts a vendored or agent-mode project. The
+    // hosted default above is the only one this replaces (a `--prune` or
+    // global scan with no mode stays report-only).
+    let mode_inferred = !mode_explicit && args.mode == Some(ScanMode::Hosted);
+    if mode_inferred {
+        match crate::commands::mode_from_project_state(&args.common).await {
+            Ok(mode) => {
+                if !args.common.json && !args.common.silent {
+                    if let Some(note) = crate::commands::kept_mode_note(mode) {
+                        eprintln!("{note}");
+                    }
+                }
+                args.mode = Some(mode);
+            }
+            Err(message) => return scan_usage_error(&args, "mode_ambiguous", &message),
+        }
     }
 
     // The repo's socket.yml policy, read once per invocation before any
@@ -1699,7 +1729,7 @@ async fn run_scan(
     if matches!(args.mode, Some(ScanMode::Hosted) | Some(ScanMode::Vendored))
         && !args.paths.is_empty()
     {
-        return Box::pin(run_project_dirs(args, telemetry, invocation)).await;
+        return Box::pin(run_project_dirs(args, telemetry, invocation, mode_inferred)).await;
     }
 
     let mut policy = Box::new(ScanPolicy::for_root(
