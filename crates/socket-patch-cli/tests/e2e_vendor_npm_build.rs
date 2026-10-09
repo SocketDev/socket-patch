@@ -1058,8 +1058,9 @@ async fn npm_get_uuid_vendored_fresh_checkout_npm_ci() {
 /// removed the command and keeps a package-lock.json twin beside a committed
 /// shrinkwrap — and installs FROM the twin — so BOTH locks must be rewired
 /// (the dual-lock vendor fix) for the fresh `npm ci` to install the patched
-/// bytes; the manifest-less tail then attests them, and revert restores
-/// every lock byte-for-byte.
+/// bytes; the manifest-less tail then attests them (a shrinkwrap-only
+/// checkout only once its package-lock.json twin is committed: npm 12 never
+/// reads the shrinkwrap, #899), and revert restores every lock byte-for-byte.
 #[test]
 fn npm_vendor_shrinkwrap_fresh_checkout_npm_ci_and_manifestless_vex() {
     let suite = "e2e_vendor_npm_build (shrinkwrap)";

@@ -996,7 +996,9 @@ fn post_install_vex(fresh: &Path, server: &str) {
 /// renamed), npm 12's shrinkwrap + package-lock.json twin (the command is
 /// gone and installs read the twin). The redirect must land in EVERY
 /// committed lock, the fresh `npm ci` must install the patched bytes, and
-/// the manifest-less VEX tail must attest them (and stop once reverted).
+/// the manifest-less VEX tail must attest them (and stop once reverted) —
+/// a shrinkwrap-only checkout only once its package-lock.json twin is
+/// committed (npm 12 never reads the shrinkwrap, #899).
 #[tokio::test(flavor = "multi_thread")]
 #[ignore = "wall-bound real-npm install (~150s); runs on all 3 OSes as an e2e CI matrix leg"]
 async fn npm_redirect_shrinkwrap_fresh_checkout_and_manifestless_vex() {

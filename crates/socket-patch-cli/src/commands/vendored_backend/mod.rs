@@ -16,13 +16,12 @@ use std::collections::HashMap;
 use std::path::Path;
 
 use socket_patch_core::manifest::schema::{PatchManifest, PatchRecord};
-use socket_patch_core::utils::group_commit::CommittedFile;
 use socket_patch_core::vendor::{
     save_state, RevertOpts, VendorServiceConfig, VendorState, VendorWarning,
 };
 
 use crate::args::GlobalArgs;
-use crate::commands::vendor::{dispatch_revert_one_opts, vendor_records_reusing};
+use crate::commands::vendor::{dispatch_revert_one_opts, vendor_records_reusing, EjectCapture};
 use crate::ecosystem_dispatch::NpmCrawlSnapshot;
 use crate::json_envelope::Envelope;
 
@@ -48,9 +47,12 @@ pub(crate) struct ApplyRequest<'a> {
     /// The npm half of a crawl this process already made over an untouched
     /// tree (see [`vendor_records_reusing`]).
     pub(crate) prior: Option<&'a NpmCrawlSnapshot>,
-    /// Receives every project file the run's group commit wrote, with the
-    /// bytes it held before (the eject's rollback undoes exactly these).
-    pub(crate) committed: Option<&'a mut Vec<CommittedFile>>,
+    /// The hosted→vendored eject's hand-back: every project file the run's
+    /// group commit wrote, with the bytes it held before (the eject's
+    /// rollback undoes exactly these), and the wired flavors. With it, the
+    /// run's human summary and "Next steps:" are left to the eject, which
+    /// prints them only once it knows the eject stands.
+    pub(crate) eject: Option<&'a mut EjectCapture>,
 }
 
 impl<'a> VendoredBackend<'a> {
@@ -85,7 +87,7 @@ impl<'a> VendoredBackend<'a> {
             self.service,
             req.ledger,
             req.prior,
-            req.committed,
+            req.eject,
         ))
         .await
     }

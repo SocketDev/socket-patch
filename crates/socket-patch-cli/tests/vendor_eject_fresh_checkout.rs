@@ -85,32 +85,12 @@ fn run_json_with(
     args: &[&str],
     extra: &[(&str, String)],
 ) -> (i32, Value) {
-    let cargo_home = root.join("../cargo-home");
-    std::fs::create_dir_all(&cargo_home).unwrap();
-    let mut cmd = Command::new(env!("CARGO_BIN_EXE_socket-patch"));
-    cmd.args(args)
+    let mut cmd = command(root, server, extra);
+    let out = cmd
+        .args(args)
         .arg("--json")
         .arg("--cwd")
         .arg(root)
-        .current_dir(root);
-    for (key, _) in std::env::vars() {
-        if key.starts_with("SOCKET_") {
-            cmd.env_remove(key);
-        }
-    }
-    let uri = server.uri();
-    let out = cmd
-        .env("SOCKET_TELEMETRY_DISABLED", "1")
-        .env("SOCKET_API_URL", &uri)
-        .env("SOCKET_API_TOKEN", "fake-token")
-        .env("SOCKET_ORG_SLUG", ORG)
-        .env("SOCKET_NPM_REGISTRY", &uri)
-        .env("SOCKET_CRATES_INDEX", format!("{uri}/index"))
-        .env("SOCKET_CRATES_REGISTRY", format!("{uri}/crates"))
-        .env("SOCKET_PATCH_SERVER_URL", &uri)
-        .env("SOCKET_VENDOR_SOURCE", "service")
-        .env("CARGO_HOME", &cargo_home)
-        .envs(extra.iter().map(|(k, v)| (*k, v.as_str())))
         .output()
         .expect("spawn socket-patch");
     let stdout = String::from_utf8_lossy(&out.stdout);
@@ -121,6 +101,34 @@ fn run_json_with(
         )
     });
     (out.status.code().unwrap_or(-1), env)
+}
+
+/// The binary in `root` (the caller adds the args, then `--cwd`), with
+/// every ambient `SOCKET_*` var scrubbed, an empty `CARGO_HOME`, and the
+/// API / registries / patch origin on `server`.
+fn command(root: &Path, server: &MockServer, extra: &[(&str, String)]) -> Command {
+    let cargo_home = root.join("../cargo-home");
+    std::fs::create_dir_all(&cargo_home).unwrap();
+    let mut cmd = Command::new(env!("CARGO_BIN_EXE_socket-patch"));
+    cmd.current_dir(root);
+    for (key, _) in std::env::vars() {
+        if key.starts_with("SOCKET_") {
+            cmd.env_remove(key);
+        }
+    }
+    let uri = server.uri();
+    cmd.env("SOCKET_TELEMETRY_DISABLED", "1")
+        .env("SOCKET_API_URL", &uri)
+        .env("SOCKET_API_TOKEN", "fake-token")
+        .env("SOCKET_ORG_SLUG", ORG)
+        .env("SOCKET_NPM_REGISTRY", &uri)
+        .env("SOCKET_CRATES_INDEX", format!("{uri}/index"))
+        .env("SOCKET_CRATES_REGISTRY", format!("{uri}/crates"))
+        .env("SOCKET_PATCH_SERVER_URL", &uri)
+        .env("SOCKET_VENDOR_SOURCE", "service")
+        .env("CARGO_HOME", &cargo_home)
+        .envs(extra.iter().map(|(k, v)| (*k, v.as_str())));
+    cmd
 }
 
 fn applied(env: &Value, purl: &str) -> bool {
@@ -400,5 +408,200 @@ async fn pypi_eject_needs_no_virtualenv() {
     assert!(
         reqs.contains(&format!(".socket/vendor/pypi/{UUID}/")),
         "the requirement is wired to the vendored wheel: {reqs}"
+    );
+}
+
+/// #1005: an eject where one package vendors and another fails is rolled
+/// back whole, and the report says so. The human run prints the
+/// `eject_rolled_back` warning, never "Vendored 1 package" or the advice to
+/// commit `.socket/vendor/`; the JSON envelope does not count the
+/// rolled-back package as applied.
+#[tokio::test]
+async fn rolled_back_eject_reports_nothing_vendored() {
+    const LEFT_PAD_UUID: &str = "9f6b2c4e-1d3a-4f6b-8c2d-7e5a9b1c3d5f";
+    const MS_UUID: &str = "7a1e3c5b-2d4f-4a6b-9c8d-0e1f2a3b4c5d";
+    const LEFT_PAD: &str = "pkg:npm/left-pad@1.3.0";
+    const MS: &str = "pkg:npm/ms@2.1.3";
+    const ORIG: &[u8] = b"module.exports = () => 'orig';\n";
+    const PATCHED: &[u8] = b"module.exports = () => 'patched';\n";
+    let server = MockServer::start().await;
+    let uri = server.uri();
+
+    // left-pad vendors: packument, pristine tarball and service artifact.
+    let tarball = tgz(
+        "package",
+        &[
+            ("package.json", br#"{"name":"left-pad","version":"1.3.0"}"#),
+            ("index.js", ORIG),
+        ],
+    );
+    let integrity = format!(
+        "sha512-{}",
+        base64::engine::general_purpose::STANDARD.encode(Sha512::digest(&tarball))
+    );
+    Mock::given(method("GET"))
+        .and(path("/left-pad/1.3.0"))
+        .respond_with(ResponseTemplate::new(200).set_body_json(json!({
+            "name": "left-pad",
+            "version": "1.3.0",
+            "dist": { "tarball": format!("{uri}/left-pad/-/left-pad-1.3.0.tgz"), "integrity": integrity }
+        })))
+        .mount(&server)
+        .await;
+    Mock::given(method("GET"))
+        .and(path("/left-pad/-/left-pad-1.3.0.tgz"))
+        .respond_with(ResponseTemplate::new(200).set_body_bytes(tarball))
+        .mount(&server)
+        .await;
+    mock_view(
+        &server,
+        LEFT_PAD_UUID,
+        LEFT_PAD,
+        "package/index.js",
+        ORIG,
+        PATCHED,
+    )
+    .await;
+
+    // ms restores upstream (its packument resolves) but cannot vendor: its
+    // record has no service artifact and its pristine tarball is a 500.
+    Mock::given(method("GET"))
+        .and(path("/ms/2.1.3"))
+        .respond_with(ResponseTemplate::new(200).set_body_json(json!({
+            "name": "ms",
+            "version": "2.1.3",
+            "dist": {
+                "tarball": format!("{uri}/ms/-/ms-2.1.3.tgz"),
+                "integrity": "sha512-msUPSTREAMmsUPSTREAM=="
+            }
+        })))
+        .mount(&server)
+        .await;
+    Mock::given(method("GET"))
+        .and(path("/ms/-/ms-2.1.3.tgz"))
+        .respond_with(ResponseTemplate::new(500))
+        .mount(&server)
+        .await;
+    Mock::given(method("GET"))
+        .and(path(format!("/v0/orgs/{ORG}/patches/view/{MS_UUID}")))
+        .respond_with(ResponseTemplate::new(200).set_body_json(json!({
+            "uuid": MS_UUID,
+            "purl": MS,
+            "publishedAt": "2026-01-01T00:00:00Z",
+            "files": {
+                "package/index.js": {
+                    "beforeHash": compute_git_sha256_from_bytes(ORIG),
+                    "afterHash": compute_git_sha256_from_bytes(PATCHED)
+                }
+            },
+            "vulnerabilities": {},
+            "description": "eject fixture",
+            "license": "MIT",
+            "tier": "free"
+        })))
+        .mount(&server)
+        .await;
+
+    let hosted = |name: &str, uuid: &str, version: &str| {
+        format!(
+            "{uri}/patch/npm/{name}/{version}/55555555-5555-4555-8555-555555555555/{uuid}/{name}-{version}.tgz"
+        )
+    };
+    let lock = serde_json::to_string_pretty(&json!({
+        "name": "fixture", "version": "1.0.0", "lockfileVersion": 3, "requires": true,
+        "packages": {
+            "": {
+                "name": "fixture", "version": "1.0.0",
+                "dependencies": { "left-pad": "1.3.0", "ms": "2.1.3" }
+            },
+            "node_modules/left-pad": {
+                "version": "1.3.0", "resolved": hosted("left-pad", LEFT_PAD_UUID, "1.3.0"),
+                "integrity": "sha512-HOSTEDpatchedHOSTEDpatched==", "license": "WTFPL"
+            },
+            "node_modules/ms": {
+                "version": "2.1.3", "resolved": hosted("ms", MS_UUID, "2.1.3"),
+                "integrity": "sha512-HOSTEDmsHOSTEDms==", "license": "MIT"
+            }
+        }
+    }))
+    .unwrap()
+        + "\n";
+    let tmp = tempfile::tempdir().unwrap();
+    let fresh = |name: &str| {
+        let root = tmp.path().join(name);
+        std::fs::create_dir_all(&root).unwrap();
+        std::fs::write(
+            root.join("package.json"),
+            br#"{"name":"fixture","version":"1.0.0","private":true,"dependencies":{"left-pad":"1.3.0","ms":"2.1.3"}}"#,
+        )
+        .unwrap();
+        std::fs::write(root.join("package-lock.json"), &lock).unwrap();
+        root
+    };
+    let still_hosted = |root: &Path| {
+        assert_eq!(
+            std::fs::read_to_string(root.join("package-lock.json")).unwrap(),
+            lock,
+            "the eject is rolled back"
+        );
+        assert!(
+            std::fs::read_dir(root.join(".socket/vendor"))
+                .map(|mut d| d.next().is_none())
+                .unwrap_or(true),
+            "no vendored residue"
+        );
+    };
+
+    let root = fresh("json");
+    let (code, env) = run_json(&root, &server, &["vendor"]);
+    assert_eq!(code, 1, "{env:#}");
+    still_hosted(&root);
+    assert!(
+        env["warnings"]
+            .as_array()
+            .is_some_and(|w| w.iter().any(|w| w["code"] == "eject_rolled_back")),
+        "{env:#}"
+    );
+    assert!(
+        !applied(&env, LEFT_PAD),
+        "rolled back, not applied: {env:#}"
+    );
+    assert_eq!(env["summary"]["applied"], 0, "{env:#}");
+    assert!(
+        env["events"]
+            .as_array()
+            .unwrap()
+            .iter()
+            .any(|e| e["purl"] == LEFT_PAD
+                && e["action"] == "skipped"
+                && e["errorCode"] == "eject_rolled_back"),
+        "{env:#}"
+    );
+    assert!(
+        env["events"]
+            .as_array()
+            .unwrap()
+            .iter()
+            .any(|e| e["purl"] == MS && e["action"] == "failed"),
+        "{env:#}"
+    );
+
+    let root = fresh("human");
+    let out = command(&root, &server, &[])
+        .args(["vendor", "--cwd"])
+        .arg(&root)
+        .output()
+        .unwrap();
+    let stdout = String::from_utf8_lossy(&out.stdout);
+    let stderr = String::from_utf8_lossy(&out.stderr);
+    assert_eq!(out.status.code(), Some(1), "{stdout}\n{stderr}");
+    still_hosted(&root);
+    assert!(
+        stderr.contains("the project is still hosted, exactly as before"),
+        "the rollback is announced: {stdout}\n{stderr}"
+    );
+    assert!(
+        !stdout.contains("Vendored") && !stdout.contains("Next steps"),
+        "nothing was vendored: {stdout}\n{stderr}"
     );
 }

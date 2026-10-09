@@ -1195,6 +1195,18 @@ mod tests {
             p.write("yarn.lock", classic(&blocks));
             let out = run(&p).await;
             assert!(out.refs.is_empty(), "{case}: {:#?}", out.refs);
+            // The registry wiring beside the git copy is withheld, not lost:
+            // rollback / remove / the takeover still unwind it (#828).
+            let shadowed = out
+                .shadowed
+                .iter()
+                .any(|r| r.purl == "pkg:npm/left-pad@1.3.0");
+            assert_eq!(
+                shadowed,
+                case.starts_with("registry"),
+                "{case}: {:#?}",
+                out.shadowed
+            );
             assert!(
                 out.diagnostics
                     .iter()

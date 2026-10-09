@@ -82,22 +82,31 @@ impl HostedPin {
             .collect()
     }
 
-    /// Every hosted pin a discovery holds.
+    /// Every hosted pin a discovery holds: its refs, plus the refs it
+    /// withholds from attestation only because an unreachable unpatched
+    /// copy installs beside them ([`Discovery::shadowed`], #828) — that
+    /// wiring is still one package version's pin, so it is restorable.
     pub fn all(discovery: &Discovery) -> Vec<HostedPin> {
-        Self::from_refs(&discovery.refs)
+        Self::from_refs(discovery.refs.iter().chain(&discovery.shadowed))
     }
 
     /// Every hosted pin the project RECORDS: [`HostedPin::all`] plus the
-    /// pins discovery withheld because an unpatched copy of the same
-    /// version installs beside them ([`Discovery::shadowed`]: an `npm:`
-    /// alias added after the pin, an unpinned twin lock, a bundled copy).
-    /// Such a pin attests nothing and management commands do not act on
-    /// it, but it is still the project's patch for that package, so the
-    /// rollout's recorded view reads it as ALREADY (or an UPGRADE), never
-    /// NEW: a capped re-scan then rewires the stray copy instead of
-    /// deferring it forever (#1195).
+    /// pins discovery withheld because another copy of the same version
+    /// that a re-run can rewire still resolves elsewhere
+    /// ([`Discovery::rewirable`]: an `npm:` alias added after the pin, an
+    /// unpinned twin lock). Such a pin attests nothing and the management
+    /// commands do not act on it, but it is still the project's patch for
+    /// that package, so the rollout's recorded view reads it as ALREADY (or
+    /// an UPGRADE), never NEW: a capped re-scan then rewires the other copy
+    /// instead of deferring it forever (#1195).
     pub fn recorded(discovery: &Discovery) -> Vec<HostedPin> {
-        Self::from_refs(discovery.refs.iter().chain(&discovery.shadowed))
+        Self::from_refs(
+            discovery
+                .refs
+                .iter()
+                .chain(&discovery.shadowed)
+                .chain(&discovery.rewirable),
+        )
     }
 
     /// THE "is this patch pinned" answer: the attributable hosted pins
@@ -116,7 +125,7 @@ impl HostedPin {
     }
 
     /// [`HostedPin::discover`]'s rollout twin: the pins the project records
-    /// ([`HostedPin::recorded`]), withheld ones included.
+    /// ([`HostedPin::recorded`]), rewirable ones included.
     pub async fn discover_recorded(
         view: crate::vendor::lock_inventory::ProjectView<'_>,
         origins: &[String],
@@ -210,6 +219,7 @@ impl HostedInventory {
             let urls = discovery
                 .refs
                 .iter()
+                .chain(&discovery.shadowed)
                 .filter(|r| r.mode == WiringMode::Hosted)
                 .filter_map(|r| Some((r.url.as_deref()?, r.uuid.as_str())))
                 .chain(

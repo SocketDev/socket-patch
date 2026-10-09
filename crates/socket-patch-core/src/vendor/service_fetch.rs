@@ -224,6 +224,26 @@ impl<'a> ServicePolicy<'a> {
         }))
     }
 
+    /// Refuse a patch the service has no artifact for (`code` is
+    /// [`super::VENDOR_PREBUILT_PENDING`] or [`super::VENDOR_PREBUILT_UNAVAILABLE`]):
+    /// the same hard failure as [`Self::hard`], except that the npm backends'
+    /// failed `Done` also carries `code` as a warning, so the vendor loop can
+    /// tell "not served (yet)" from a real failure and keep an older vendored
+    /// patch of the same package instead of failing the run (#954).
+    fn unserved<T>(&self, code: &'static str, detail: String) -> ServiceAttempt<T> {
+        match self.terminal {
+            ServiceTerminal::Refused => self.hard("vendor_prebuilt_required", detail),
+            ServiceTerminal::Failure(purl) => {
+                let warning = VendorWarning::new(code, detail.clone());
+                ServiceAttempt::HardFail(Box::new(super::common::done(
+                    super::common::failed_result(purl, std::path::Path::new(""), detail),
+                    None,
+                    vec![warning],
+                )))
+            }
+        }
+    }
+
     /// Refuse an unavailable server artifact.
     pub(crate) fn miss<T>(
         &self,
@@ -254,14 +274,13 @@ impl<'a> ServicePolicy<'a> {
                      refusing to fall back to a local build on tampered bytes"
                 ),
             )),
-            ServiceArtifact::Pending => Err(self.miss(
-                warnings,
-                "vendor_prebuilt_pending",
+            ServiceArtifact::Pending => Err(self.unserved(
+                super::VENDOR_PREBUILT_PENDING,
                 format!("prebuilt {noun} is still building"),
             )),
             // No artifact is available for these coordinates or entitlements.
-            ServiceArtifact::Unavailable(reason) => Err(self.hard(
-                "vendor_prebuilt_required",
+            ServiceArtifact::Unavailable(reason) => Err(self.unserved(
+                super::VENDOR_PREBUILT_UNAVAILABLE,
                 format!("prebuilt {noun} unavailable: {reason}"),
             )),
             ServiceArtifact::Failed(reason) => Err(self.miss(

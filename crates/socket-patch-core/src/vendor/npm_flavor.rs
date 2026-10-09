@@ -477,12 +477,26 @@ pub async fn vendor_npm_any<'a>(
     // backend. Each backend already self-stamps `flavor`; we re-assert it from
     // the probe for belt-and-braces (the values are identical).
     if let VendorOutcome::Done {
-        entry, warnings, ..
+        result,
+        entry,
+        warnings,
     } = &mut outcome
     {
         warnings.splice(0..0, probe_warnings);
         if let Some(entry) = entry {
             entry.flavor = Some(flavor.as_str().to_string());
+        }
+        // npm >= 11.14's `allow-file` gates the `file:` specs the
+        // package-lock wiring writes (#969); the other flavors' package
+        // managers do not read it.
+        if flavor == NpmLockFlavor::PackageLock && result.success {
+            if let Some((name, version)) = super::npm_common::parse_npm_purl(purl) {
+                if let Some(detail) =
+                    npm_lock::allow_file_refusal(project_root, &name, &version).await
+                {
+                    warnings.push(VendorWarning::new(npm_lock::ALLOW_FILE_WARNING, detail));
+                }
+            }
         }
     }
     outcome
@@ -795,7 +809,19 @@ pub async fn revert_npm_any(
 /// left to the artifact check and `vex`.
 pub async fn check_npm_wiring(entry: &VendorEntry, project_root: &Path) -> Result<(), String> {
     match NpmLockFlavor::from_recorded(entry.flavor.as_deref()) {
-        Some(NpmLockFlavor::PackageLock) => npm_lock::check_wiring(entry, project_root).await,
+        Some(NpmLockFlavor::PackageLock) => {
+            npm_lock::check_wiring(entry, project_root).await?;
+            // A lock npm's `allow-file` refuses fails every install (#969).
+            match super::npm_common::parse_npm_purl(&entry.base_purl) {
+                Some((name, version)) => {
+                    match npm_lock::allow_file_refusal(project_root, &name, &version).await {
+                        Some(detail) => Err(detail),
+                        None => Ok(()),
+                    }
+                }
+                None => Ok(()),
+            }
+        }
         _ => Ok(()),
     }
 }
@@ -1703,6 +1729,47 @@ mod tests {
         assert!(lock.contains(&format!(
             "file:.socket/vendor/npm/{UUID}/left-pad-1.3.0.tgz"
         )));
+    }
+
+    /// #969: a project `.npmrc` whose `allow-file` refuses the vendored
+    /// `file:` tarball (here `root`, and the root manifest does not declare
+    /// left-pad) still vendors, but the run SAYS every install will fail
+    /// EALLOWFILE, and `vendor --check` fails the entry; lifting the setting
+    /// clears both.
+    #[tokio::test]
+    async fn package_lock_arm_warns_and_check_fails_when_allow_file_refuses() {
+        let (tmp, record) = npm_project().await;
+        touch(tmp.path(), ".npmrc", "allow-file=root\n").await;
+
+        let outcome = vendor_any(tmp.path(), &record).await;
+        let VendorOutcome::Done {
+            result,
+            entry,
+            warnings,
+        } = outcome
+        else {
+            panic!("expected Done, got {outcome:?}");
+        };
+        assert!(result.success, "{:?}", result.error);
+        let warning = warnings
+            .iter()
+            .find(|w| w.code == npm_lock::ALLOW_FILE_WARNING)
+            .unwrap_or_else(|| panic!("no allow-file advisory: {warnings:?}"));
+        assert!(warning.detail.contains("EALLOWFILE"), "{warning:?}");
+        assert!(
+            warning
+                .detail
+                .contains("package-lock.json `node_modules/left-pad`"),
+            "{warning:?}"
+        );
+        let entry = entry.expect("success carries a ledger entry");
+        let err = check_npm_wiring(&entry, tmp.path())
+            .await
+            .expect_err("vendor --check must flag the refused wiring");
+        assert!(err.contains("allow-file"), "{err}");
+
+        touch(tmp.path(), ".npmrc", "allow-file=all\n").await;
+        assert_eq!(check_npm_wiring(&entry, tmp.path()).await, Ok(()));
     }
 
     /// #1094: a workspace member's own package-lock.json is a lock npm never

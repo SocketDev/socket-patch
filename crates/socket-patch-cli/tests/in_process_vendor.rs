@@ -776,6 +776,187 @@ async fn revendor_new_uuid_cleans_stale_artifact_and_still_reverts() {
 }
 
 // ─────────────────────────────────────────────────────────────────────
+// 8c'. a superseding patch the service has not built keeps the old one
+// ─────────────────────────────────────────────────────────────────────
+
+/// #954: the package is vendored at `UUID`, then its patch moves to `UUID2`
+/// whose prebuilt artifact the service has not built (`pending_build`) or
+/// cannot serve (`build_failed`, `not_found`). The older vendoring is still
+/// in force — nothing is touched — so the run keeps it and reports a skip
+/// under the unserved code (exit 0), the way hosted mode keeps its pin,
+/// instead of failing every re-run until the server builds the artifact.
+#[tokio::test]
+async fn superseding_patch_without_a_served_artifact_keeps_the_vendored_one() {
+    use wiremock::matchers::{method, path_regex};
+    use wiremock::{Mock, MockServer, ResponseTemplate};
+    const UUID2: &str = "0a1b2c3d-4e5f-6a7b-8c9d-0e1f2a3b4c5d";
+    for (status, code) in [
+        ("pending_build", "vendor_prebuilt_pending"),
+        ("build_failed", "vendor_prebuilt_unavailable"),
+        ("not_found", "vendor_prebuilt_unavailable"),
+    ] {
+        let fx = npm_fixture();
+        assert_eq!(vendor_run(vendor_args(fx.root())).await, 0);
+        let wired_lock = fx.lock_bytes();
+        let state_before = std::fs::read(fx.state_path()).unwrap();
+
+        let mut manifest: Value =
+            serde_json::from_slice(&std::fs::read(fx.manifest_path()).unwrap()).unwrap();
+        manifest["patches"][PURL]["uuid"] = json!(UUID2);
+        std::fs::write(
+            fx.manifest_path(),
+            serde_json::to_vec_pretty(&manifest).unwrap(),
+        )
+        .unwrap();
+
+        let server = MockServer::start().await;
+        Mock::given(method("POST"))
+            .and(path_regex(r"/(patch|patches)/package$"))
+            .respond_with(
+                ResponseTemplate::new(200)
+                    .set_body_json(json!({ "results": { UUID2: { "status": status } } })),
+            )
+            .mount(&server)
+            .await;
+        let uri = server.uri();
+        let (code_out, env) = vendor_cli(
+            fx.root(),
+            &[
+                "--api-url",
+                &uri,
+                "--vendor-url",
+                &uri,
+                "--api-token",
+                "sktsec_placeholder_value_for_tests_api",
+                "--org",
+                "acme",
+                "--lock-timeout",
+                "5",
+            ],
+        );
+        assert_eq!(code_out, 0, "{status}: the older patch is kept: {env:#}");
+        let skipped = find_event(&env, "skipped", Some(code));
+        assert_eq!(skipped["purl"], PURL);
+        assert!(
+            skipped.to_string().contains(UUID) && skipped.to_string().contains(UUID2),
+            "{status}: names the kept and the unserved patch: {skipped}"
+        );
+        assert_eq!(env["summary"]["failed"], 0, "{status}: {env:#}");
+        assert_eq!(fx.lock_bytes(), wired_lock, "{status}: wiring untouched");
+        assert_eq!(
+            std::fs::read(fx.state_path()).unwrap(),
+            state_before,
+            "{status}: ledger untouched"
+        );
+        assert!(fx.tgz_path().is_file(), "{status}: old artifact kept");
+    }
+}
+
+/// The #954 skip keeps only an older vendoring that is still wired: once a
+/// relock dropped its `file:.socket/vendor/...` reference the package is
+/// patched in neither mode, so the unserved upgrade still fails (the
+/// `vendor --check` liveness verdict) instead of claiming the old patch.
+#[tokio::test]
+async fn superseding_patch_without_a_served_artifact_fails_when_the_old_one_is_unwired() {
+    use wiremock::matchers::{method, path_regex};
+    use wiremock::{Mock, MockServer, ResponseTemplate};
+    const UUID2: &str = "0a1b2c3d-4e5f-6a7b-8c9d-0e1f2a3b4c5d";
+    let fx = npm_fixture();
+    assert_eq!(vendor_run(vendor_args(fx.root())).await, 0);
+    // A relock: the lock no longer references the vendored artifact.
+    std::fs::write(fx.lock_path(), &fx.original_lock).unwrap();
+
+    let mut manifest: Value =
+        serde_json::from_slice(&std::fs::read(fx.manifest_path()).unwrap()).unwrap();
+    manifest["patches"][PURL]["uuid"] = json!(UUID2);
+    std::fs::write(
+        fx.manifest_path(),
+        serde_json::to_vec_pretty(&manifest).unwrap(),
+    )
+    .unwrap();
+
+    let server = MockServer::start().await;
+    Mock::given(method("POST"))
+        .and(path_regex(r"/(patch|patches)/package$"))
+        .respond_with(
+            ResponseTemplate::new(200)
+                .set_body_json(json!({ "results": { UUID2: { "status": "pending_build" } } })),
+        )
+        .mount(&server)
+        .await;
+    let uri = server.uri();
+    let (code, env) = vendor_cli(
+        fx.root(),
+        &[
+            "--api-url",
+            &uri,
+            "--vendor-url",
+            &uri,
+            "--api-token",
+            "sktsec_placeholder_value_for_tests_api",
+            "--org",
+            "acme",
+            "--lock-timeout",
+            "5",
+        ],
+    );
+    assert_eq!(code, 1, "an unwired older patch is not kept: {env:#}");
+    let failed = find_event(&env, "failed", None);
+    assert_eq!(failed["purl"], PURL);
+    assert!(failed.to_string().contains("still building"), "{failed}");
+    assert!(
+        events(&env)
+            .iter()
+            .all(|e| e["errorCode"] != "vendor_prebuilt_pending"),
+        "no unserved marker leaks out of a real failure: {env:#}"
+    );
+}
+
+/// The #954 skip is only for a package vendored at ANOTHER patch: a first
+/// vendor whose artifact is still building has nothing to keep and fails.
+#[tokio::test]
+async fn unserved_first_vendor_still_fails() {
+    use wiremock::matchers::{method, path_regex};
+    use wiremock::{Mock, MockServer, ResponseTemplate};
+    let fx = npm_fixture();
+    let server = MockServer::start().await;
+    Mock::given(method("POST"))
+        .and(path_regex(r"/(patch|patches)/package$"))
+        .respond_with(
+            ResponseTemplate::new(200)
+                .set_body_json(json!({ "results": { UUID: { "status": "pending_build" } } })),
+        )
+        .mount(&server)
+        .await;
+    let uri = server.uri();
+    let (code, env) = vendor_cli(
+        fx.root(),
+        &[
+            "--api-url",
+            &uri,
+            "--vendor-url",
+            &uri,
+            "--api-token",
+            "sktsec_placeholder_value_for_tests_api",
+            "--org",
+            "acme",
+            "--lock-timeout",
+            "5",
+        ],
+    );
+    assert_eq!(code, 1, "{env:#}");
+    let failed = find_event(&env, "failed", None);
+    assert!(failed.to_string().contains("still building"), "{failed}");
+    assert!(
+        events(&env)
+            .iter()
+            .all(|e| e["errorCode"] != "vendor_prebuilt_pending"),
+        "no unserved marker leaks out of a real failure: {env:#}"
+    );
+    assert_eq!(fx.lock_bytes(), fx.original_lock);
+}
+
+// ─────────────────────────────────────────────────────────────────────
 // 8d. re-vendor under a new patch uuid — yarn berry
 // ─────────────────────────────────────────────────────────────────────
 
@@ -3967,7 +4148,8 @@ snapshots:
     /// refuses the hosted tarball otherwise); the vendor takeover restores
     /// the last hosted pin to its upstream registry entry and, in the same transaction, deletes
     /// the `.npmrc` it created — vendored `file:` specs never need it (npm
-    /// gates them by `allow-file`, default `all`).
+    /// gates them by `allow-file`, default `all`; a refusing value is the
+    /// `vendor_npm_allow_file` advisory, #969).
     #[tokio::test]
     #[serial]
     async fn hosted_then_vendor_takeover_removes_the_npmrc_allow_remote_config() {
@@ -4007,6 +4189,196 @@ snapshots:
             !root.join(".socket/vendor/redirect-state.json").exists(),
             "no hosted ledger exists at any point"
         );
+    }
+
+    /// [`write_package_lock_project`] plus a parent package `bund` that
+    /// BUNDLES the same `name@version` (`inBundle: true`): the hosted run
+    /// rewires only the hoisted entry (`redirect_npm_bundled_instance_skipped`).
+    fn write_package_lock_project_with_bundled_copy(root: &Path) {
+        write_package_lock_project(root);
+        let path = root.join("package-lock.json");
+        let mut lock: Value = serde_json::from_slice(&std::fs::read(&path).unwrap()).unwrap();
+        let packages = lock["packages"].as_object_mut().unwrap();
+        packages.insert(
+            "node_modules/bund".to_string(),
+            json!({ "version": "1.0.0", "resolved": "file:bund-1.0.0.tgz", "dependencies": { CONV_NAME: CONV_VERSION }, "bundleDependencies": [CONV_NAME] }),
+        );
+        packages.insert(
+            format!("node_modules/bund/node_modules/{CONV_NAME}"),
+            json!({
+                "version": CONV_VERSION,
+                "resolved": format!("https://registry.npmjs.org/{CONV_NAME}/-/{CONV_NAME}-{CONV_VERSION}.tgz"),
+                "integrity": UPSTREAM_SHA512,
+                "inBundle": true
+            }),
+        );
+        let mut bytes = serde_json::to_vec_pretty(&lock).unwrap();
+        bytes.push(b'\n');
+        std::fs::write(&path, bytes).unwrap();
+    }
+
+    /// [`write_package_lock_project`] plus a parent package `@bh/sw` that
+    /// ships its own npm-shrinkwrap.json (`hasShrinkwrap: true`) with a
+    /// nested copy of the same `name@version`: npm 7–11 install that copy
+    /// from the parent's shrinkwrap, so the hosted run rewires only the
+    /// hoisted entry (`redirect_npm_shrinkwrapped_instance_skipped`, #753).
+    fn write_package_lock_project_with_shrinkwrapped_copy(root: &Path) {
+        write_package_lock_project(root);
+        let path = root.join("package-lock.json");
+        let mut lock: Value = serde_json::from_slice(&std::fs::read(&path).unwrap()).unwrap();
+        let packages = lock["packages"].as_object_mut().unwrap();
+        packages.insert(
+            "node_modules/@bh/sw".to_string(),
+            json!({
+                "version": "1.0.0",
+                "resolved": "https://registry.npmjs.org/@bh/sw/-/sw-1.0.0.tgz",
+                "integrity": "sha512-sw==",
+                "hasShrinkwrap": true,
+                "dependencies": { CONV_NAME: CONV_VERSION }
+            }),
+        );
+        packages.insert(
+            format!("node_modules/@bh/sw/node_modules/{CONV_NAME}"),
+            json!({
+                "version": CONV_VERSION,
+                "resolved": format!("https://registry.npmjs.org/{CONV_NAME}/-/{CONV_NAME}-{CONV_VERSION}.tgz"),
+                "integrity": UPSTREAM_SHA512
+            }),
+        );
+        let mut bytes = serde_json::to_vec_pretty(&lock).unwrap();
+        bytes.push(b'\n');
+        std::fs::write(&path, bytes).unwrap();
+    }
+
+    /// REGRESSION (#828): a hosted pin beside a BUNDLED copy of the same
+    /// `name@version` is withheld from VEX (the bundled copy stays
+    /// unpatched), but it is still the hosted run's own wiring of one
+    /// package version. `rollback` must restore it (it refused it as
+    /// `patched_ref_unattributable`, remedy "re-run scan --mode hosted", a
+    /// loop) and delete the `.npmrc` the hosted run created.
+    #[tokio::test]
+    #[serial]
+    async fn hosted_pin_beside_a_bundled_copy_rolls_back_to_upstream() {
+        hosted_pin_beside_an_unreachable_copy_rolls_back(
+            write_package_lock_project_with_bundled_copy,
+        )
+        .await;
+    }
+
+    /// REGRESSION (#828 over #753): the same for a copy beneath a
+    /// `hasShrinkwrap` package — discovery dropped the hoisted pin outright
+    /// instead of shadowing it, so rollback refused it as
+    /// `hosted_wiring_contested`.
+    #[tokio::test]
+    #[serial]
+    async fn hosted_pin_beside_a_shrinkwrapped_copy_rolls_back_to_upstream() {
+        hosted_pin_beside_an_unreachable_copy_rolls_back(
+            write_package_lock_project_with_shrinkwrapped_copy,
+        )
+        .await;
+    }
+
+    async fn hosted_pin_beside_an_unreachable_copy_rolls_back(write: fn(&Path)) {
+        let server = MockServer::start().await;
+        mock_hosted_api(&server).await;
+        let registry = mock_registry(&server).await;
+        let tmp = tempfile::tempdir().unwrap();
+        let root = tmp.path();
+        write(root);
+        let pristine_lock = std::fs::read_to_string(root.join("package-lock.json")).unwrap();
+
+        assert_eq!(scan_run(hosted_args(root, server.uri())).await, 0);
+        assert!(std::fs::read_to_string(root.join("package-lock.json"))
+            .unwrap()
+            .contains(HOSTED_URL));
+        assert!(root.join(".npmrc").exists());
+
+        let env_pairs = online_env(&registry, PATCH_ORIGIN);
+        let env_pairs: Vec<(&str, &str)> =
+            env_pairs.iter().map(|(k, v)| (*k, v.as_str())).collect();
+        let (code, stdout, stderr) = run_cli(
+            root,
+            &[
+                "rollback",
+                "--json",
+                "--yes",
+                "--cwd",
+                root.to_str().unwrap(),
+            ],
+            &env_pairs,
+        );
+        assert_eq!(code, 0, "rollback: {stdout}\n{stderr}");
+        let lock = std::fs::read_to_string(root.join("package-lock.json")).unwrap();
+        let lock: Value = serde_json::from_str(&lock).unwrap();
+        let pristine: Value = serde_json::from_str(&pristine_lock).unwrap();
+        assert_eq!(lock, pristine, "rollback restores the upstream lock");
+        assert!(
+            !root.join(".npmrc").exists(),
+            "the hosted run's allow-remote .npmrc goes with the last hosted pin"
+        );
+    }
+
+    /// REGRESSION (#828): the hosted → vendored takeover over a hosted pin
+    /// beside a bundled copy restores the upstream entry first, exactly as
+    /// without the bundled copy: `vendor_takeover_reverted_redirect`, the
+    /// `.npmrc` deleted, the vendor ledger's original the REGISTRY entry
+    /// (it recorded the grant-tokenized hosted URL), and `vendor --revert`
+    /// lands on upstream, never back on hosted.
+    #[tokio::test]
+    #[serial]
+    async fn hosted_pin_beside_a_bundled_copy_is_restored_by_the_vendor_takeover() {
+        hosted_pin_beside_an_unreachable_copy_is_restored_by_the_takeover(
+            write_package_lock_project_with_bundled_copy,
+        )
+        .await;
+    }
+
+    /// REGRESSION (#828 over #753): the same takeover beside a copy beneath
+    /// a `hasShrinkwrap` package.
+    #[tokio::test]
+    #[serial]
+    async fn hosted_pin_beside_a_shrinkwrapped_copy_is_restored_by_the_vendor_takeover() {
+        hosted_pin_beside_an_unreachable_copy_is_restored_by_the_takeover(
+            write_package_lock_project_with_shrinkwrapped_copy,
+        )
+        .await;
+    }
+
+    async fn hosted_pin_beside_an_unreachable_copy_is_restored_by_the_takeover(write: fn(&Path)) {
+        let server = MockServer::start().await;
+        mock_hosted_api(&server).await;
+        let registry = mock_registry(&server).await;
+        let tmp = tempfile::tempdir().unwrap();
+        let root = tmp.path();
+        write(root);
+
+        assert_eq!(scan_run(hosted_args(root, server.uri())).await, 0);
+        assert!(std::fs::read_to_string(root.join("package-lock.json"))
+            .unwrap()
+            .contains(HOSTED_URL));
+
+        seed_manifest_and_blob(root);
+        let (code, env) = vendor_online_cli(root, &registry, PATCH_ORIGIN, &[]);
+        assert_eq!(code, 0, "vendor over the hosted lock must succeed: {env:#}");
+        find_event(&env, "skipped", Some("vendor_takeover_reverted_redirect"));
+        assert!(
+            !root.join(".npmrc").exists(),
+            "the takeover must remove the .npmrc the hosted run created: {env:#}"
+        );
+        let state = std::fs::read_to_string(root.join(".socket/vendor/state.json")).unwrap();
+        assert!(
+            !state.contains("patch.socket.dev"),
+            "the ledger original is the registry entry, not the hosted pin: {state}"
+        );
+
+        let (code, env) = vendor_online_cli(root, &registry, PATCH_ORIGIN, &["--revert"]);
+        assert_eq!(code, 0, "vendor --revert: {env:#}");
+        let lock = std::fs::read_to_string(root.join("package-lock.json")).unwrap();
+        assert!(
+            !lock.contains(HOSTED_URL) && !lock.contains(".socket/vendor/"),
+            "vendor --revert lands on upstream: {lock}"
+        );
+        assert!(!root.join(".npmrc").exists());
     }
 
     /// Hosted → vendored in a git project that ignores `.socket/` (#831):
@@ -4306,6 +4678,32 @@ async fn vendor_check_fails_when_lock_no_longer_wires_artifact() {
             .is_some_and(|r| r.contains("wiring")),
         "{env:#}"
     );
+}
+
+/// REGRESSION (#969): npm >= 11.14 refuses a vendored `file:` tarball
+/// (EALLOWFILE) under a project `allow-file=none`, so every install of the
+/// lock fails — but `vendor --check` verified it. It must fail the entry,
+/// name the setting and the remedy, and pass again once it is lifted.
+#[tokio::test]
+async fn vendor_check_fails_when_npm_allow_file_refuses_the_tarball() {
+    let fx = npm_fixture();
+    assert_eq!(vendor_run(vendor_args(fx.root())).await, 0, "vendor");
+    std::fs::write(fx.root().join(".npmrc"), "allow-file=none\n").unwrap();
+
+    let (code, env) = vendor_cli(fx.root(), &["--check"]);
+    assert_eq!(code, 1, "{env:#}");
+    let event = find_event(&env, "failed", Some("vendor_check_failed"));
+    let reason = event["reason"].as_str().unwrap_or_default();
+    assert!(
+        reason.contains("EALLOWFILE") && reason.contains("`allow-file=none`"),
+        "{env:#}"
+    );
+    assert!(reason.contains("npm ci --allow-file=all"), "{env:#}");
+
+    std::fs::write(fx.root().join(".npmrc"), "allow-file=all\n").unwrap();
+    let (code, env) = vendor_cli(fx.root(), &["--check"]);
+    assert_eq!(code, 0, "{env:#}");
+    find_event(&env, "verified", Some("vendor_check_ok"));
 }
 
 /// REGRESSION (#900, `npm uninstall` trigger): once the dependency leaves

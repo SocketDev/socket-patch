@@ -9,6 +9,7 @@ use std::sync::Mutex;
 
 use socket_patch_core::api::ranking::cmp_search_results;
 use socket_patch_core::api::types::PatchSearchResult;
+use socket_patch_core::crawlers::types::CrawledPackage;
 use socket_patch_core::manifest::schema::PatchManifest;
 use socket_patch_core::policy::{
     find_repo_root_with_warnings, patch_severity_order, policy_block, repo_relative_checked,
@@ -81,21 +82,7 @@ pub(crate) fn load_invocation_policy(args: &ScanArgs) -> Result<InvocationPolicy
 /// the in-memory engine has no such fallback (manifests alone never make
 /// a root there), so for a lockless directory the two engines disagree.
 pub(crate) fn dir_markers(dir: &Path) -> Vec<String> {
-    let mut markers: Vec<String> = std::fs::read_dir(dir)
-        .map(|entries| {
-            entries
-                .filter_map(|e| e.ok())
-                .filter(|e| e.file_type().is_ok_and(|t| t.is_file() || t.is_symlink()))
-                .filter_map(|e| e.file_name().into_string().ok())
-                .filter(|name| {
-                    marker_ecosystem(name).is_some()
-                        || UNSUPPORTED_MARKERS
-                            .iter()
-                            .any(|(_, names)| names.contains(&name.as_str()))
-                })
-                .collect()
-        })
-        .unwrap_or_default();
+    let mut markers = lock_markers(dir);
     if markers.is_empty() {
         // No lockfile: the manifests say what the project is. Every name
         // here, JVM build files included, must be a regular file: the
@@ -111,6 +98,26 @@ pub(crate) fn dir_markers(dir: &Path) -> Vec<String> {
     }
     markers.sort();
     markers
+}
+
+/// The lockfile markers in `dir` (unsorted): what makes a directory a
+/// project root of its own rather than a member of an enclosing one.
+fn lock_markers(dir: &Path) -> Vec<String> {
+    std::fs::read_dir(dir)
+        .map(|entries| {
+            entries
+                .filter_map(|e| e.ok())
+                .filter(|e| e.file_type().is_ok_and(|t| t.is_file() || t.is_symlink()))
+                .filter_map(|e| e.file_name().into_string().ok())
+                .filter(|name| {
+                    marker_ecosystem(name).is_some()
+                        || UNSUPPORTED_MARKERS
+                            .iter()
+                            .any(|(_, names)| names.contains(&name.as_str()))
+                })
+                .collect()
+        })
+        .unwrap_or_default()
 }
 
 /// Manifests that stand in as markers for a root with no lockfile (plus
@@ -131,7 +138,33 @@ struct Report {
     retained_purls: BTreeSet<String>,
     filtered_purls: HashSet<String>,
     update_purls: HashSet<String>,
+    /// Admitted purls with a copy under a nested project root the policy
+    /// skips: canonical purl -> those roots (see
+    /// [`ScanPolicy::admit_crawled_copies`]).
+    shared_copies: BTreeMap<String, BTreeSet<String>>,
+    /// The [`Self::shared_copies`] entries a patch was selected for.
+    shared_selected: BTreeSet<String>,
     human_printed: bool,
+}
+
+/// A copy's owning root: its repo-relative dir and the root filter's verdict.
+type Owner = (String, Result<(), FilterReason>);
+
+/// The nested project roots under an agent / report-only scan's root
+/// (#554): such a scan crawls every nested project's `node_modules` and
+/// patches copies in place, so each copy is judged by the root that owns
+/// it, not only the scan root.
+struct NestedRoots {
+    repo_root: PathBuf,
+    /// The scan root as given and canonicalized (crawled paths are built
+    /// from the former).
+    scan_dirs: Vec<PathBuf>,
+    /// Owning root per `node_modules` parent directory: `None` for the scan
+    /// root, else the root's repo-relative dir and verdict.
+    owners: HashMap<PathBuf, Option<Owner>>,
+    /// More installed copies per purl ([`ScanPolicy::locate_nested_copies`]):
+    /// the crawl keeps one copy per purl.
+    more_copies: HashMap<String, Vec<PathBuf>>,
 }
 
 /// One project root's view of the invocation policy (disk scans run one
@@ -147,6 +180,7 @@ pub(crate) struct ScanPolicy {
     root_verdict: Result<(), FilterReason>,
     /// Recorded patches of this root: canonical purl → uuid.
     recorded: HashMap<String, String>,
+    nested: Option<NestedRoots>,
     report: Mutex<Report>,
 }
 
@@ -200,8 +234,228 @@ impl ScanPolicy {
             project,
             root_verdict,
             recorded: HashMap::new(),
+            nested: None,
             report: Mutex::new(report),
         }
+    }
+
+    /// Judge crawled copies under a nested project's `node_modules` by that
+    /// project's own root (agent and report-only scans, which patch the
+    /// crawled copies in place, see [`NestedRoots`]). A nested root is a
+    /// directory below `scan_dir` holding a lockfile; a member without one
+    /// belongs to the enclosing root. Nested roots are discovered, so the
+    /// built-in default ignores apply to them.
+    pub(crate) fn judge_nested_roots(&mut self, invocation: &InvocationPolicy, scan_dir: &Path) {
+        let mut scan_dirs = vec![scan_dir.to_path_buf()];
+        if let Ok(canonical) = std::fs::canonicalize(scan_dir) {
+            if canonical != scan_dir {
+                scan_dirs.push(canonical);
+            }
+        }
+        self.nested = Some(NestedRoots {
+            repo_root: invocation.repo_root.clone(),
+            scan_dirs,
+            owners: HashMap::new(),
+            more_copies: HashMap::new(),
+        });
+    }
+
+    /// Whether [`Self::judge_nested_roots`] is on.
+    pub(crate) fn judges_nested_roots(&self) -> bool {
+        self.nested.is_some()
+    }
+
+    /// The nested root owning the crawled copy at `path` (`None`: the scan
+    /// root owns it). A newly seen root filtered as a whole is reported as
+    /// one entry, like the scan root.
+    fn nested_owner(&mut self, path: &Path) -> Option<Owner> {
+        let nested = self.nested.as_mut()?;
+        let (scan_dir, rel) = nested
+            .scan_dirs
+            .iter()
+            .find_map(|dir| path.strip_prefix(dir).ok().map(|rel| (dir.clone(), rel)))?;
+        // Only the directories above the first `node_modules`: anything
+        // inside one is a package, not a project.
+        let parts: Vec<&std::ffi::OsStr> = rel
+            .components()
+            .map_while(|c| match c {
+                std::path::Component::Normal(part) => Some(part),
+                _ => None,
+            })
+            .collect();
+        let depth = parts.iter().position(|p| *p == "node_modules")?;
+        let mut dir = scan_dir.clone();
+        dir.extend(&parts[..depth]);
+        if let Some(owner) = nested.owners.get(&dir) {
+            return owner.clone();
+        }
+        let owner = (1..=depth).rev().find_map(|k| {
+            let mut root = scan_dir.clone();
+            root.extend(&parts[..k]);
+            if lock_markers(&root).is_empty() {
+                return None;
+            }
+            let canonical = std::fs::canonicalize(&root).unwrap_or(root.clone());
+            let project = repo_relative_checked(&nested.repo_root, &canonical)?;
+            let markers = dir_markers(&root);
+            let verdict = self.policy.admits_root(&Root {
+                rel_dir: &project,
+                markers: &markers,
+                explicit: false,
+            });
+            Some((project, verdict))
+        });
+        if let Some((project, Err(reason))) = &owner {
+            let mut report = self.report.lock().unwrap_or_else(|e| e.into_inner());
+            let known = report
+                .filtered
+                .iter()
+                .any(|f| f.purl.is_none() && &f.project == project);
+            if !known {
+                report.filtered.push(FilteredEntry {
+                    purl: None,
+                    uuid: None,
+                    project: project.clone(),
+                    reason: reason.clone(),
+                    severity: None,
+                });
+            }
+        }
+        nested.owners.insert(dir, owner.clone());
+        owner
+    }
+
+    /// The owner of a crawled copy: its nested root, else the scan root.
+    fn copy_owner(&mut self, path: &Path) -> Owner {
+        self.nested_owner(path)
+            .unwrap_or_else(|| (self.project.clone(), self.root_verdict.clone()))
+    }
+
+    /// The crawl keeps one installed copy per purl, but a package can be
+    /// installed under several roots. When some `node_modules` roots
+    /// (`nm_roots`, as the npm crawler walks them) are skipped and others
+    /// are not, find the other copies of each npm package whose crawled
+    /// copy sits on the other side, so [`Self::admit_crawled_copies`] sees
+    /// every root that installs it.
+    pub(crate) async fn locate_nested_copies(
+        &mut self,
+        nm_roots: &[PathBuf],
+        pkgs: &[CrawledPackage],
+    ) {
+        if self.nested.is_none() {
+            return;
+        }
+        let roots: Vec<(PathBuf, bool)> = nm_roots
+            .iter()
+            .map(|root| (root.clone(), self.copy_owner(root).1.is_ok()))
+            .collect();
+        if roots.iter().all(|(_, ok)| *ok) || roots.iter().all(|(_, ok)| !*ok) {
+            return;
+        }
+        let mut admitted_purls = Vec::new();
+        let mut skipped_purls = Vec::new();
+        for pkg in pkgs.iter().filter(|p| p.purl.starts_with("pkg:npm/")) {
+            if self.copy_owner(&pkg.path).1.is_ok() {
+                admitted_purls.push(pkg.purl.clone());
+            } else {
+                skipped_purls.push(pkg.purl.clone());
+            }
+        }
+        let crawler = socket_patch_core::crawlers::NpmCrawler::new();
+        let mut more: HashMap<String, Vec<PathBuf>> = HashMap::new();
+        for (root, ok) in roots {
+            // An admitted root may hold a copy of a package crawled under a
+            // skipped one, and the reverse.
+            let wanted = if ok { &skipped_purls } else { &admitted_purls };
+            if wanted.is_empty() {
+                continue;
+            }
+            let Ok(found) = crawler.find_by_purls(&root, wanted).await else {
+                continue;
+            };
+            for (purl, copies) in found {
+                more.entry(purl)
+                    .or_default()
+                    .extend(copies.into_iter().map(|c| c.path));
+            }
+        }
+        if let Some(nested) = self.nested.as_mut() {
+            nested.more_copies = more;
+        }
+    }
+
+    /// Step 3 over the whole crawl: [`Self::admit_crawled`], with each copy
+    /// judged by its owning root when nested roots are on. A package stays
+    /// when any copy's root admits it: patches are recorded per package
+    /// version, so its copies under skipped roots are patched too (noted
+    /// once a patch is selected for it). Supplement purls (`supplements`,
+    /// no installed copy) belong to the scan root.
+    pub(crate) fn admit_crawled_copies(
+        &mut self,
+        pkgs: Vec<CrawledPackage>,
+        supplements: &HashSet<String>,
+    ) -> Vec<CrawledPackage> {
+        if self.nested.is_none() {
+            return pkgs
+                .into_iter()
+                .filter(|p| self.admit_crawled(&p.purl))
+                .collect();
+        }
+        // Each purl's first admitting root, else its first root.
+        let mut owners: BTreeMap<String, Owner> = BTreeMap::new();
+        let mut skipped: BTreeMap<String, BTreeSet<String>> = BTreeMap::new();
+        let more_copies = self
+            .nested
+            .as_mut()
+            .map(|n| std::mem::take(&mut n.more_copies))
+            .unwrap_or_default();
+        for pkg in &pkgs {
+            let mut paths: Vec<&Path> = vec![&pkg.path];
+            if supplements.contains(&pkg.purl) {
+                paths.clear();
+            } else if let Some(more) = more_copies.get(&pkg.purl) {
+                paths.extend(more.iter().map(PathBuf::as_path));
+            }
+            let mut copy_owners: Vec<Owner> = paths
+                .into_iter()
+                .map(|path| self.copy_owner(path))
+                .collect();
+            if copy_owners.is_empty() {
+                copy_owners.push((self.project.clone(), self.root_verdict.clone()));
+            }
+            for (project, verdict) in copy_owners {
+                if verdict.is_err() {
+                    skipped
+                        .entry(pkg.purl.clone())
+                        .or_default()
+                        .insert(project.clone());
+                }
+                let slot = owners
+                    .entry(pkg.purl.clone())
+                    .or_insert_with(|| (project.clone(), verdict.clone()));
+                if slot.1.is_err() && verdict.is_ok() {
+                    *slot = (project, verdict);
+                }
+            }
+        }
+        let mut admitted = HashSet::new();
+        for (purl, (project, verdict)) in owners {
+            let root_ok = verdict.is_ok();
+            if !self.admit_in(&purl, &project, verdict) {
+                continue;
+            }
+            if root_ok && self.policy.admits_purl(&purl).is_ok() {
+                if let Some(projects) = skipped.remove(&purl) {
+                    self.report()
+                        .shared_copies
+                        .insert(PurlKey::new(&purl).into_string(), projects);
+                }
+            }
+            admitted.insert(purl);
+        }
+        pkgs.into_iter()
+            .filter(|p| admitted.contains(&p.purl))
+            .collect()
     }
 
     /// Whether selection can filter anything (a floor, or patching
@@ -247,10 +501,14 @@ impl ScanPolicy {
     /// exclude stays in the query (so `upgradeAvailable` can be reported)
     /// but joins the retained set, which never reaches a writer.
     pub(crate) fn admit_crawled(&self, purl: &str) -> bool {
-        let verdict = self
-            .root_verdict
-            .clone()
-            .and_then(|()| self.policy.admits_purl(purl));
+        self.admit_in(purl, &self.project, self.root_verdict.clone())
+    }
+
+    /// [`Self::admit_crawled`] for a copy owned by the root `project`
+    /// with the verdict `root_verdict`.
+    fn admit_in(&self, purl: &str, project: &str, root_verdict: Result<(), FilterReason>) -> bool {
+        let root_excluded = root_verdict.is_err();
+        let verdict = root_verdict.and_then(|()| self.policy.admits_purl(purl));
         let reason = match verdict {
             Ok(()) => return true,
             Err(reason) => reason,
@@ -261,7 +519,7 @@ impl ScanPolicy {
             if report.retained_purls.insert(key.clone()) {
                 report.retained.push(RetainedEntry {
                     purl: key,
-                    project: self.project.clone(),
+                    project: project.to_string(),
                     recorded_uuid: uuid.to_string(),
                     reason,
                     upgrade_available: false,
@@ -269,7 +527,7 @@ impl ScanPolicy {
             }
             return true;
         }
-        if self.root_verdict.is_err() {
+        if root_excluded {
             // Already reported as the root's one entry.
         } else if report
             .filtered_purls
@@ -278,7 +536,7 @@ impl ScanPolicy {
             report.filtered.push(FilteredEntry {
                 purl: Some(PurlKey::new(purl).into_string()),
                 uuid: None,
-                project: self.project.clone(),
+                project: project.to_string(),
                 reason,
                 severity: None,
             });
@@ -382,6 +640,14 @@ impl ScanPolicy {
                 }
             }
             if let Some(i) = chosen {
+                if report
+                    .shared_copies
+                    .contains_key(&PurlKey::new(&purl).into_string())
+                {
+                    report
+                        .shared_selected
+                        .insert(PurlKey::new(&purl).into_string());
+                }
                 offers.selected.insert(purl.clone(), group[i].clone());
             }
             offers.unfiltered.insert(purl, group);
@@ -413,7 +679,7 @@ impl ScanPolicy {
             .entry("warnings")
             .or_insert_with(|| serde_json::json!([]));
         if let Some(arr) = warnings.as_array_mut() {
-            for w in &self.warnings {
+            for w in self.warnings.iter().chain(&self.shared_copy_warnings()) {
                 let present = arr
                     .iter()
                     .any(|e| e["code"] == w.code && e["detail"] == w.detail.as_str());
@@ -425,6 +691,23 @@ impl ScanPolicy {
                 result.as_object_mut().map(|o| o.remove("warnings"));
             }
         }
+    }
+
+    /// One `policy_shared_copy` warning per selected package that is also
+    /// installed under a nested root the policy skips.
+    fn shared_copy_warnings(&self) -> Vec<PolicyWarning> {
+        let report = self.report();
+        report
+            .shared_selected
+            .iter()
+            .filter_map(|purl| {
+                let projects = report.shared_copies.get(purl)?;
+                Some(PolicyWarning {
+                    code: POLICY_SHARED_COPY,
+                    detail: shared_copy_detail(purl, projects),
+                })
+            })
+            .collect()
     }
 
     /// Print the policy warnings (stderr) once, human path.
@@ -476,8 +759,8 @@ impl ScanPolicy {
             }
             let what = match &f.purl {
                 Some(purl) => sanitize(&normalize_purl(purl)),
-                None if self.project.is_empty() => "this project".to_string(),
-                None => format!("project {}", sanitize(&self.project)),
+                None if f.project.is_empty() => "this project".to_string(),
+                None => format!("project {}", sanitize(&f.project)),
             };
             let severity = f
                 .severity
@@ -485,6 +768,11 @@ impl ScanPolicy {
                 .map(|s| format!(" ({s})"))
                 .unwrap_or_default();
             println!("  skipped {what}{severity}: {}", f.reason.detail());
+        }
+        for purl in &report.shared_selected {
+            if let Some(projects) = report.shared_copies.get(purl) {
+                println!("  note: {}", shared_copy_detail(purl, projects));
+            }
         }
         if verbose {
             for r in &report.retained {
@@ -497,6 +785,30 @@ impl ScanPolicy {
             }
         }
     }
+}
+
+/// Warning code: a selected package is also installed under a nested
+/// project root the policy skips, and that copy is patched too.
+pub(crate) const POLICY_SHARED_COPY: &str = "policy_shared_copy";
+
+fn shared_copy_detail(purl: &str, projects: &BTreeSet<String>) -> String {
+    let projects: Vec<String> = projects
+        .iter()
+        .map(|p| {
+            if p.is_empty() {
+                "the repo root".to_string()
+            } else {
+                sanitize(p)
+            }
+        })
+        .collect();
+    format!(
+        "{} is patched for an included project, so its installed copy under skipped project{} {} \
+         is patched too (patches are recorded per package version)",
+        sanitize(&normalize_purl(purl)),
+        if projects.len() == 1 { "" } else { "s" },
+        projects.join(", ")
+    )
 }
 
 /// The JSON error object for a policy file that cannot be honored: scan's
@@ -585,4 +897,189 @@ pub(crate) fn policy_bypass_warnings(
         }
     }
     out
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    fn invocation(repo: &Path, yml: &str) -> InvocationPolicy {
+        std::fs::write(repo.join("socket.yml"), yml).unwrap();
+        let (policy, warnings) = SelectionPolicy::load(
+            &DiskPolicyFs::new(repo),
+            &socket_patch_core::policy::PolicyOverrides::default(),
+        )
+        .unwrap();
+        InvocationPolicy {
+            policy,
+            repo_root: repo.to_path_buf(),
+            warnings,
+            warned: Default::default(),
+        }
+    }
+
+    fn copy(dir: &Path, name: &str) -> CrawledPackage {
+        let path = dir.join("node_modules").join(name);
+        std::fs::create_dir_all(&path).unwrap();
+        std::fs::write(
+            path.join("package.json"),
+            format!(r#"{{"name": "{name}", "version": "1.0.0"}}"#),
+        )
+        .unwrap();
+        CrawledPackage {
+            name: name.to_string(),
+            version: "1.0.0".to_string(),
+            namespace: None,
+            purl: format!("pkg:npm/{name}@1.0.0"),
+            path,
+        }
+    }
+
+    fn project(dir: &Path, lock: bool) {
+        std::fs::create_dir_all(dir).unwrap();
+        std::fs::write(dir.join("package.json"), "{}").unwrap();
+        if lock {
+            std::fs::write(dir.join("package-lock.json"), "{}").unwrap();
+        }
+    }
+
+    /// #554: copies under a nested project's `node_modules` are judged by
+    /// that project's root, not only the scan root.
+    #[test]
+    fn nested_copies_follow_their_own_root() {
+        let tmp = tempfile::tempdir().unwrap();
+        let repo = std::fs::canonicalize(tmp.path()).unwrap();
+        project(&repo, true);
+        project(&repo.join("services/legacy"), true);
+        project(&repo.join("tests/e2e"), true);
+        // A lockless workspace member belongs to the repo root.
+        project(&repo.join("packages/member"), false);
+        let invocation = invocation(
+            &repo,
+            "version: 2\npatches:\n  ignorePaths: [\"/services/\"]\n",
+        );
+        let mut policy = ScanPolicy::for_root(&invocation, &repo, true, false);
+        policy.judge_nested_roots(&invocation, &repo);
+        let crawl = vec![
+            copy(&repo, "shared"),
+            copy(&repo.join("services/legacy"), "shared"),
+            copy(&repo.join("services/legacy"), "legacy-only"),
+            copy(
+                &repo.join("services/legacy/node_modules/legacy-only"),
+                "deep",
+            ),
+            copy(&repo.join("tests/e2e"), "fixture-only"),
+            copy(&repo.join("packages/member"), "member-dep"),
+        ];
+        let kept: Vec<String> = policy
+            .admit_crawled_copies(crawl, &HashSet::new())
+            .into_iter()
+            .map(|p| p.purl)
+            .collect();
+        assert_eq!(
+            kept,
+            [
+                "pkg:npm/shared@1.0.0",
+                "pkg:npm/shared@1.0.0",
+                "pkg:npm/member-dep@1.0.0"
+            ]
+        );
+        let doc = policy.json();
+        let roots: Vec<(&str, &str)> = doc["filtered"]
+            .as_array()
+            .unwrap()
+            .iter()
+            .map(|f| {
+                (
+                    f["project"].as_str().unwrap(),
+                    f["reason"].as_str().unwrap(),
+                )
+            })
+            .collect();
+        assert_eq!(
+            roots,
+            [
+                ("services/legacy", "policy_path_excluded"),
+                ("tests/e2e", "policy_path_excluded")
+            ]
+        );
+        // The shared package is noted only once a patch is selected for it.
+        assert!(policy.shared_copy_warnings().is_empty());
+        let offer: PatchSearchResult = serde_json::from_value(serde_json::json!({
+            "uuid": "11111111-1111-4111-8111-111111111111",
+            "purl": "pkg:npm/shared@1.0.0",
+            "publishedAt": "2024-01-01T00:00:00Z",
+            "description": "d",
+            "license": "MIT",
+            "tier": "free",
+            "vulnerabilities": {}
+        }))
+        .unwrap();
+        policy.select(vec![offer]);
+        let warnings = policy.shared_copy_warnings();
+        assert_eq!(warnings.len(), 1);
+        assert_eq!(warnings[0].code, POLICY_SHARED_COPY);
+        assert!(
+            warnings[0].detail.contains("services/legacy"),
+            "{}",
+            warnings[0].detail
+        );
+    }
+
+    /// The crawl keeps one copy per purl: when that copy sits under a
+    /// skipped root, the copy under an admitted root is looked up.
+    #[tokio::test]
+    async fn a_package_crawled_under_a_skipped_root_is_found_under_an_admitted_one() {
+        let tmp = tempfile::tempdir().unwrap();
+        let repo = std::fs::canonicalize(tmp.path()).unwrap();
+        project(&repo, true);
+        project(&repo.join("services/legacy"), true);
+        let invocation = invocation(
+            &repo,
+            "version: 2\npatches:\n  ignorePaths: [\"/services/\"]\n",
+        );
+        let mut policy = ScanPolicy::for_root(&invocation, &repo, true, false);
+        policy.judge_nested_roots(&invocation, &repo);
+        copy(&repo, "shared");
+        let crawl = vec![
+            copy(&repo.join("services/legacy"), "shared"),
+            copy(&repo.join("services/legacy"), "legacy-only"),
+        ];
+        let nm_roots = [
+            repo.join("node_modules"),
+            repo.join("services/legacy/node_modules"),
+        ];
+        policy.locate_nested_copies(&nm_roots, &crawl).await;
+        let kept: Vec<String> = policy
+            .admit_crawled_copies(crawl, &HashSet::new())
+            .into_iter()
+            .map(|p| p.purl)
+            .collect();
+        assert_eq!(kept, ["pkg:npm/shared@1.0.0"]);
+        assert_eq!(
+            policy.report().shared_copies.get("pkg:npm/shared@1.0.0"),
+            Some(&BTreeSet::from(["services/legacy".to_string()]))
+        );
+    }
+
+    /// Without nested roots (hosted / vendored), every copy follows the
+    /// scan root as before.
+    #[test]
+    fn without_nested_roots_every_copy_follows_the_scan_root() {
+        let tmp = tempfile::tempdir().unwrap();
+        let repo = std::fs::canonicalize(tmp.path()).unwrap();
+        project(&repo, true);
+        project(&repo.join("services/legacy"), true);
+        let invocation = invocation(
+            &repo,
+            "version: 2\npatches:\n  ignorePaths: [\"/services/\"]\n",
+        );
+        let mut policy = ScanPolicy::for_root(&invocation, &repo, true, false);
+        let kept = policy.admit_crawled_copies(
+            vec![copy(&repo.join("services/legacy"), "a")],
+            &HashSet::new(),
+        );
+        assert_eq!(kept.len(), 1);
+        assert_eq!(policy.json()["counts"]["filtered"], 0);
+    }
 }

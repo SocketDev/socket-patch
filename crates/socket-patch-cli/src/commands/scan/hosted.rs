@@ -1420,48 +1420,54 @@ pub(crate) async fn run_redirect_selected(
     // Classified over the lockfiles as this run left them and the vendored
     // ledger as the takeover left it.
     let mut takeover_warnings: Vec<serde_json::Value> = Vec::new();
-    // The lockfiles as this run left them: the gate's (or scan's) discovery
-    // when it provably describes them, else a fresh one. A takeover's
-    // reverts are writes too (the gate's discovery saw them in the overlay;
-    // a dry run drops them).
-    let created: Vec<&str> = created_paths.iter().map(String::as_str).collect();
-    let written = if takeover_migrated.is_empty()
-        && !rewrite
-            .files
-            .keys()
-            .chain(rewrite.binary_files.keys())
-            .any(|rel| !socket_patch_core::patch::redirect::sbt::is_synthetic_key(rel))
-    {
-        Written::Nothing
-    } else if common.dry_run {
-        Written::Previewed
+    // Nothing vendored, nothing to overlap: skip the lockfile walk (#993).
+    let vendor_now = vendor_state.as_ref().ok().filter(|v| !v.entries.is_empty());
+    let superseded = if vendor_now.is_none() {
+        Vec::new()
     } else {
-        Written::Landed { created: &created }
+        // The lockfiles as this run left them: the gate's (or scan's) discovery
+        // when it provably describes them, else a fresh one. A takeover's
+        // reverts are writes too (the gate's discovery saw them in the overlay;
+        // a dry run drops them).
+        let created: Vec<&str> = created_paths.iter().map(String::as_str).collect();
+        let written = if takeover_migrated.is_empty()
+            && !rewrite
+                .files
+                .keys()
+                .chain(rewrite.binary_files.keys())
+                .any(|rel| !socket_patch_core::patch::redirect::sbt::is_synthetic_key(rel))
+        {
+            Written::Nothing
+        } else if common.dry_run {
+            Written::Previewed
+        } else {
+            Written::Landed { created: &created }
+        };
+        let fresh_now;
+        let discovery_now = match discovery_after_writes(
+            prior_discovery,
+            done.final_discovery.as_ref(),
+            written,
+            vlt_stale.healed_store.as_ref(),
+        ) {
+            Some(discovery) => discovery,
+            None => {
+                fresh_now = crate::commands::discover_wiring(common, &common.cwd).await;
+                &fresh_now
+            }
+        };
+        let hosted_now = crate::commands::hosted_state_from_pins(
+            &socket_patch_core::patch::redirect::upstream::HostedPin::all(discovery_now),
+        );
+        super::classify_overlap_takeover_with(
+            &common.cwd,
+            Some(&hosted_now),
+            vendor_now,
+            discovery_now,
+        )
+        .await
+        .redirect
     };
-    let fresh_now;
-    let discovery_now = match discovery_after_writes(
-        prior_discovery,
-        done.final_discovery.as_ref(),
-        written,
-        vlt_stale.healed_store.as_ref(),
-    ) {
-        Some(discovery) => discovery,
-        None => {
-            fresh_now = crate::commands::discover_wiring(common, &common.cwd).await;
-            &fresh_now
-        }
-    };
-    let hosted_now = crate::commands::hosted_state_from_pins(
-        &socket_patch_core::patch::redirect::upstream::HostedPin::all(discovery_now),
-    );
-    let superseded = super::classify_overlap_takeover_with(
-        &common.cwd,
-        Some(&hosted_now),
-        vendor_state.as_ref().ok(),
-        discovery_now,
-    )
-    .await
-    .redirect;
     if !superseded.is_empty() {
         takeover_warnings.push(serde_json::json!({
             "code": super::REDIRECT_SUPERSEDES_VENDORED,
