@@ -149,8 +149,7 @@ fn batch_chunks(purls: &[String], batch_size: usize, max_body_bytes: usize) -> V
 }
 
 /// The three patch-application modes `scan` can drive, selectable via
-/// `--mode`. Vendored and agent also keep a hidden deprecated boolean
-/// spelling (`--vendor`, `--apply`/`--sync`).
+/// `--mode`. `--sync` is shorthand for `--mode agent --prune`.
 //
 // The `///` docs on the variants are user-facing `--help` text (shared
 // with `get --mode`); keep implementation notes in `//` comments.
@@ -162,12 +161,10 @@ pub enum ScanMode {
     Hosted,
     /// Commit patched artifacts to `.socket/vendor/`: hermetic,
     /// offline-safe installs at the cost of repo size
-    // Equivalent to `--vendor`.
     Vendored,
     /// Record patches in `.socket/manifest.json` plus blobs and re-apply
     /// them in place (e.g. from CI): smallest repo footprint, but every
     /// install environment must run the agent
-    // Equivalent to `--apply`.
     Agent,
 }
 
@@ -183,53 +180,34 @@ impl ScanMode {
     }
 }
 
-/// Fold the boolean spellings (`--vendor` / `--apply` / `--sync`) into
-/// `args.mode`, so `ScanMode` is the single
-/// source of truth everything downstream reads (the booleans are input
-/// spellings only, never consulted after this returns), and enforce the
+/// Resolve `args.mode` from `--mode` and `--sync`, so `ScanMode` is the
+/// single source of truth everything downstream reads, and enforce the
 /// cross-flag rules clap cannot express:
 ///
-/// * `--mode X` combined with a boolean belonging to a DIFFERENT mode is a
-///   contradiction → `Err`. Clap's `conflicts_with` is value-independent —
-///   it could not allow `--mode vendored --vendor` while rejecting
-///   `--mode hosted --vendor` — so the check lives here.
-/// * The same mode spelled both ways (`--mode vendored --vendor`) is
-///   redundant but accepted: both spellings mean one thing.
-/// * `--sync` implies `--apply`, so it counts as an agent-mode spelling;
-///   `--prune` is an orthogonal GC knob and never conflicts. (`--sync`'s
+/// * `--sync` means `--mode agent --prune`, so `--mode X --sync` with any
+///   mode other than agent is a contradiction → `Err`. Clap's
+///   `conflicts_with` is value-independent — it could not allow
+///   `--mode agent --sync` while rejecting `--mode hosted --sync` — so the
+///   check lives here. `--mode agent --sync` is redundant but accepted.
+/// * `--prune` is an orthogonal GC knob and never conflicts. (`--sync`'s
 ///   prune half is orthogonal too, and stays a separate read in `run`.)
 ///   Hosted mode runs no GC, so `--mode hosted --prune` stays accepted but
 ///   emits an explicit `redirect_prune_ignored` warning in `run` rather
 ///   than silently dropping the flag.
 ///
 /// Public (not `pub(crate)`) so the CLI-contract tests can exercise the
-/// fold without driving a full `run()`.
+/// resolution without driving a full `run()`.
 pub fn resolve_mode_flags(args: &mut ScanArgs) -> Result<(), String> {
     if let Some(mode) = args.mode {
-        // First boolean that selects a mode OTHER than the requested one.
-        let mut conflicting: Option<&'static str> = None;
-        if args.vendor && mode != ScanMode::Vendored {
-            conflicting = Some("--vendor");
-        }
-        if args.apply && mode != ScanMode::Agent {
-            conflicting = Some("--apply");
-        }
         if args.sync && mode != ScanMode::Agent {
-            conflicting = Some("--sync");
-        }
-        if let Some(flag) = conflicting {
             // "cannot be used with" phrasing matches clap's conflict errors —
             // the scan_vendor_e2e contract test accepts exactly that shape.
             return Err(format!(
-                "--mode {} cannot be used with {flag}: the flags select different \
-                 modes (--vendor means --mode vendored; --apply and --sync mean \
-                 --mode agent)",
+                "--mode {} cannot be used with --sync: --sync means --mode agent --prune",
                 mode.cli_name(),
             ));
         }
-    } else if args.vendor {
-        args.mode = Some(ScanMode::Vendored);
-    } else if args.apply || args.sync {
+    } else if args.sync {
         args.mode = Some(ScanMode::Agent);
     } else if !args.prune && !args.common.is_global() {
         // v5: hosted is the default. A `--prune` or global scan with no mode
@@ -266,11 +244,6 @@ pub struct ScanArgs {
     #[arg(long = "batch-size", env = "SOCKET_BATCH_SIZE")]
     pub batch_size: Option<usize>,
 
-    // Hidden, deprecated spelling of `--mode agent`: download the selected
-    // patches and apply them in place.
-    #[arg(long, default_value_t = false, hide = true)]
-    pub apply: bool,
-
     /// Garbage-collect after the scan: prune manifest entries for
     /// packages that are no longer installed, then delete orphan blob,
     /// diff and package-archive files from `.socket/`. Off by default so
@@ -286,19 +259,10 @@ pub struct ScanArgs {
     #[arg(long, default_value_t = false)]
     pub sync: bool,
 
-    // Hidden, deprecated spelling of `--mode vendored`: vendor every
-    // patched dependency the scan selects into the committable
-    // `.socket/vendor/` tree instead of applying patches in place.
-    #[arg(long, default_value_t = false, hide = true, conflicts_with_all = ["apply", "sync"])]
-    pub vendor: bool,
-
     /// How discovered patches are consumed [default: hosted]. A `--prune`
     /// or `--global` scan with no mode only reports
-    // The hidden `--vendor` and `--apply` are deprecated spellings of
-    // `--mode vendored` and `--mode agent` (`--sync` also selects agent);
-    // hosted has no boolean spelling. Combining `--mode` with a boolean
-    // from a DIFFERENT mode is rejected in `resolve_mode_flags`; the same
-    // mode spelled both ways is accepted.
+    // `--sync` also selects agent; combining it with a different `--mode`
+    // is rejected in `resolve_mode_flags`.
     #[arg(long = "mode", value_enum)]
     pub mode: Option<ScanMode>,
 
@@ -326,7 +290,7 @@ pub struct ScanArgs {
     /// On a successful scan, also generate an OpenVEX 0.2.0 document.
     /// `--vex <path>` is the trigger; the `--vex-*` knobs mirror the
     /// standalone `vex` command. The document is built from the manifest
-    /// as it stands after the scan (including any `--apply`/`--sync`
+    /// as it stands after the scan (including any `--mode agent`/`--sync`
     /// writes) and verified against on-disk state. A requested-but-failed
     /// VEX makes the command exit non-zero.
     #[command(flatten)]
@@ -776,8 +740,8 @@ fn emit_discovery_error_json(result: &mut serde_json::Value, message: &str) {
 /// owned purls leave first (any uuid: the committed artifact IS the patch,
 /// and a manifest moved past the vendored uuid would break VEX verification
 /// until a vendor run refreshes the artifact — a newer patch still surfaces
-/// in `updates[]`, the operator's signal to run `scan --vendor`), then
-/// lockfile-only purls (nothing installed to patch in place; `scan --vendor`
+/// in `updates[]`, the operator's signal to run `scan --mode vendored`), then
+/// lockfile-only purls (nothing installed to patch in place; `scan --mode vendored`
 /// fetches them pristine). Both classes become calm `skipped` records —
 /// never an error.
 struct AgentSelection {
@@ -864,7 +828,7 @@ fn download_params(args: &ScanArgs, save_only: bool, json: bool, silent: bool) -
 
 /// The run-level context the agent engine borrows from scan: the client
 /// `run` already built (proxy fallback included) and the flags the nested
-/// apply inherits — so `scan --apply` honors `--lock-timeout` and never
+/// apply inherits — so `scan --mode agent` honors `--lock-timeout` and never
 /// rebuilds the client.
 fn download_run<'a>(args: &ScanArgs, api_client: &'a ApiClient) -> DownloadRun<'a> {
     DownloadRun {
@@ -957,33 +921,39 @@ pub(super) async fn classify_overlap_takeover(common: &GlobalArgs, cwd: &Path) -
     // only feeds takeover warnings; corruption is a hard error on the
     // write/attest paths).
     let vendor = socket_patch_core::vendor::load_state(cwd).await.ok();
-    classify_overlap_takeover_with(common, cwd, vendor.as_ref()).await
-}
-
-/// [`classify_overlap_takeover`] against an already-loaded vendored ledger
-/// (the hosted engine classifies against its post-takeover ledger); the
-/// hosted side is the LIVE lockfiles' pins in `cwd`. `None` or an empty
-/// ledger yields no overlap.
-///
-/// The lockfiles are discovered at most once, and not at all without a
-/// vendored entry to overlap: discovery re-walks every lockfile of the
-/// project, which is a real share of a hosted scan's time (#993), and a
-/// project that never vendored (the hosted common case) has nothing for
-/// it to decide.
-pub(super) async fn classify_overlap_takeover_with(
-    common: &GlobalArgs,
-    cwd: &Path,
-    vendor: Option<&VendorState>,
-) -> OverlapTakeover {
-    let mut out = OverlapTakeover::default();
+    // Nothing vendored, nothing to overlap: skip the lockfile walk (#993).
     let Some(vendor) = vendor.filter(|v| !v.entries.is_empty()) else {
-        return out;
+        return OverlapTakeover::default();
     };
     let discovery = crate::commands::discover_wiring(common, cwd).await;
     let redirect = crate::commands::hosted_state_from_pins(
         &socket_patch_core::patch::redirect::upstream::HostedPin::all(&discovery),
     );
-    let overlap = overlap_from_states(Some(&redirect), vendor);
+    classify_overlap_takeover_with(cwd, Some(&redirect), Some(&vendor), &discovery).await
+}
+
+/// [`classify_overlap_takeover`] over already-loaded state (the hosted
+/// engine classifies against its post-takeover vendor ledger) and
+/// `discovery`, the lockfile discovery of `cwd` as it is now
+/// ([`crate::commands::discover_wiring`]). `None` for either state, or an
+/// empty vendored ledger, yields no overlap.
+///
+/// Callers hand in a discovery they already hold and should skip
+/// discovering at all when the vendored ledger has no entries: discovery
+/// re-walks every lockfile of the project, which is a real share of a
+/// hosted scan's time (#993), and a project that never vendored (the
+/// hosted common case) has nothing for it to decide.
+pub(super) async fn classify_overlap_takeover_with(
+    cwd: &Path,
+    redirect: Option<&socket_patch_core::patch::redirect::RedirectState>,
+    vendor: Option<&VendorState>,
+    discovery: &socket_patch_core::vex::discover::Discovery,
+) -> OverlapTakeover {
+    let mut out = OverlapTakeover::default();
+    let Some(vendor) = vendor.filter(|v| !v.entries.is_empty()) else {
+        return out;
+    };
+    let overlap = overlap_from_states(redirect, vendor);
     if overlap.is_empty() {
         return out;
     }
@@ -1000,15 +970,15 @@ pub(super) async fn classify_overlap_takeover_with(
             .or_insert(entry);
     }
     // Each hosted pin's patch uuid (embedded in every hosted artifact URL,
-    // whatever the host).
+    // whatever the host). A non-empty overlap proves `redirect` is `Some`.
     let mut redirect_uuid_by_purl: std::collections::HashMap<PurlKey, &str> =
         std::collections::HashMap::new();
-    for (key, record) in &redirect.records {
+    for (key, record) in redirect.iter().flat_map(|r| &r.records) {
         redirect_uuid_by_purl
             .entry(PurlKey::new(key))
             .or_insert(record.uuid.as_str());
     }
-    let mut liveness = LedgerLiveness::new(cwd, &discovery, None);
+    let mut liveness = LedgerLiveness::new(cwd, discovery, None);
     for purl in overlap {
         let hosted_live = match redirect_uuid_by_purl.get(&PurlKey::new(&purl)) {
             Some(uuid) => liveness.redirect_record(&purl, uuid).await,
@@ -1684,9 +1654,9 @@ async fn run_scan(
 ) -> i32 {
     apply_env_toggles(&args.common);
 
-    // Fold the legacy mode booleans into `args.mode` (see
-    // `resolve_mode_flags`). Cross-mode combinations are usage errors
-    // (exit 2); under --json they print the coded error on stdout.
+    // Resolve `--mode`/`--sync` into `args.mode` (see
+    // `resolve_mode_flags`). `--sync` with another mode is a usage error
+    // (exit 2); under --json it prints the coded error on stdout.
     if let Err(message) = resolve_mode_flags(&mut args) {
         // The global-install refusal is the one with its own code: it is
         // exactly `global_mode_conflict`'s message for the folded mode.
@@ -1944,6 +1914,25 @@ async fn run_scan(
         } else {
             socket_patch_core::patch::redirect::upstream::HostedPin::all(ctx.discovery().await)
         };
+    // Lockless cargo/nuget pins are never refs, so `HostedPin::all` drops
+    // them; the rollout's recorded view still counts them (otherwise a
+    // re-scan reads the pin it wrote as NEW and spends a cap slot).
+    let hosted_unlocked_pins = if args.common.is_global() {
+        Vec::new()
+    } else {
+        ctx.discovery().await.unlocked_pins.clone()
+    };
+    // The same discovery, handed to the hosted redirect's attribution gate
+    // (nothing below writes before it; see `rollout::Gate::prior`).
+    let prior_discovery = if args.common.is_global() {
+        None
+    } else {
+        let (discovery, read_set) = ctx.recorded_discovery().await;
+        Some(rollout::Prior {
+            discovery,
+            read_set: read_set.as_ref(),
+        })
+    };
     let hosted_state = (!args.common.is_global())
         .then(|| crate::commands::hosted_state_from_pins(&hosted_pin_list));
     let redirect_state = hosted_state.as_ref();
@@ -2414,7 +2403,8 @@ async fn run_scan(
     policy.set_update_purls(updates.iter().map(|u| u.purl.as_str()));
     let recorded = rollout::RecordedState {
         manifest: update_manifest.as_deref(),
-        index: rollout::RecordedIndex::new(update_manifest.as_deref(), &hosted_pins),
+        index: rollout::RecordedIndex::new(update_manifest.as_deref(), &hosted_pins)
+            .with_unlocked_pins(hosted_unlocked_pins),
     };
 
     // The hosted-wiring probes below take `all_purls` (POST-filter: only
@@ -2487,6 +2477,7 @@ async fn run_scan(
                 &recorded,
                 batch_error_count > 0,
                 &mut stage,
+                prior_discovery,
             )
             .await;
         }
@@ -2665,7 +2656,7 @@ async fn run_scan(
                 }
                 push_scan_json_warning(&mut result, HOSTED_WIRING_RETAINED, &detail);
             }
-        // --- Vendor path (if requested; conflicts with --apply/--sync) ---
+        // --- Vendor path (if requested; --sync selects agent instead) ---
         } else if vendor {
             // Must STAY a boxed fn: this branch's temporaries would otherwise
             // live in the enclosing poll frame in debug builds, which has to
@@ -2695,7 +2686,7 @@ async fn run_scan(
         }
 
         // The GC and the VEX build below can write to stderr; the report-
-        // only arm has not flushed the scan event yet (the `--apply` arm
+        // only arm has not flushed the scan event yet (the agent arm
         // did, in `discover_selected`).
         telemetry.flush().await;
 
@@ -2974,7 +2965,7 @@ async fn run_scan(
             &pairs,
             None,
             npm_crawl.as_ref(),
-            Some(rollout::Gate::new(&mut stage, rows)),
+            Some(rollout::Gate::new(&mut stage, rows).with_prior(prior_discovery)),
         )
         .await;
     }
@@ -4485,19 +4476,24 @@ mod tests {
         let root = tmp.path();
         write_lock_pointing_at_hosted(root, "minimist", "1.2.2").await;
 
-        for vendor in [None, Some(VendorState::new())] {
+        // No vendored ledger, then an empty one: nothing to overlap.
+        for write_empty in [false, true] {
+            if write_empty {
+                socket_patch_core::vendor::save_state(root, &VendorState::new())
+                    .await
+                    .unwrap();
+            }
             let before = discoveries();
             assert_eq!(
-                classify_overlap_takeover_with(&common_at(root), root, vendor.as_ref()).await,
+                classify_overlap_takeover(&common_at(root), root).await,
                 OverlapTakeover::default()
             );
             assert_eq!(discoveries(), before, "no vendored entry, no discovery");
         }
 
         write_vendor_ledger_wired(root, &["pkg:npm/minimist@1.2.2"]).await;
-        let vendor = socket_patch_core::vendor::load_state(root).await.unwrap();
         let before = discoveries();
-        let takeover = classify_overlap_takeover_with(&common_at(root), root, Some(&vendor)).await;
+        let takeover = classify_overlap_takeover(&common_at(root), root).await;
         assert_eq!(discoveries(), before + 1, "one discovery serves both sides");
         assert_eq!(
             takeover.redirect,

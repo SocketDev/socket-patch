@@ -123,7 +123,6 @@ pub struct GetArgs {
     // exported-but-empty `SOCKET_SAVE_ONLY=`) would abort every `get`.
     #[arg(
         long = "save-only",
-        alias = "no-apply",
         env = "SOCKET_SAVE_ONLY",
         default_value_t = false,
         value_parser = crate::args::parse_bool_flag,

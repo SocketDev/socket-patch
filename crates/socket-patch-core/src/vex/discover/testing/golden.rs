@@ -124,6 +124,10 @@ fn render(out: &Discovery, root: &Path) -> Value {
         unattested,
         contested,
         shadowed,
+        // Bookkeeping of what the vlt extractor read from the store, not a
+        // finding: every copy it found already shows as a contest and a
+        // diagnostic above.
+        vlt_bundled_copies: _,
         install_trees,
         read: _,
         withheld: _,
@@ -185,6 +189,7 @@ fn render(out: &Discovery, root: &Path) -> Value {
                 uuid,
                 file,
                 version_reqs,
+                index_url: _,
             } = p;
             json!({
                 "ecosystem": ecosystem,

@@ -7,7 +7,7 @@ use crate::patch::path_safety;
 use crate::utils::fs::{entry_is_dir, home_dir, is_dir, is_file, list_dir_entries, run_blocking};
 use crate::utils::process::{CommandRunner, SystemCommandRunner};
 use crate::utils::relpath::normalize_lexically;
-use crate::vendor::lock_inventory::{DiskSnapshot, ProjectView};
+use crate::vendor::lock_inventory::ProjectView;
 
 /// Ruby/RubyGems ecosystem crawler for discovering gems in Bundler vendor
 /// directories or global gem installation paths.
@@ -1443,6 +1443,18 @@ fn expand_tilde(value: &Path, home: Option<&Path>) -> PathBuf {
     value.to_path_buf()
 }
 
+/// The files [`bundler_loaded_manifest`] reads for `root`: the app config,
+/// the global config when there is one, and the `gems.rb` its pair choice
+/// probes.
+fn bundler_config_files(root: &Path) -> Vec<PathBuf> {
+    let app = bundler_app_config_dir(root, std::env::var_os("BUNDLE_APP_CONFIG").as_deref())
+        .join("config");
+    [app, PathBuf::from("gems.rb")]
+        .into_iter()
+        .chain(ambient_bundler_global_config_file(root))
+        .collect()
+}
+
 /// [`crate::formats::gem::manifest::classify`] for `root` on disk: the
 /// manifest bundler loads, reading the ambient `BUNDLE_GEMFILE` /
 /// `BUNDLE_LOCKFILE` / `BUNDLE_APP_CONFIG` and the app config file.
@@ -1485,7 +1497,12 @@ pub(crate) async fn bundler_loaded_manifest_in(
 ) -> crate::formats::gem::manifest::LoadedManifest {
     use crate::formats::gem::manifest;
     match view {
-        ProjectView::Disk(root) | ProjectView::Snapshot(DiskSnapshot { root, .. }) => {
+        ProjectView::Disk(root) => bundler_loaded_manifest(root).await,
+        ProjectView::Snapshot(snap) => {
+            // The only files the probe reads: the app config, the global
+            // config and `gems.rb` (the environment it also reads is fixed
+            // for the run).
+            let root = snap.root_reading(bundler_config_files(snap.root_reading::<&Path>([])));
             bundler_loaded_manifest(root).await
         }
         ProjectView::Memory(_) => {

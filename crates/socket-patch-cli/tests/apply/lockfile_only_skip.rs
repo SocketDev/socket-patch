@@ -5,7 +5,7 @@
 //!
 //! The tree is in its correct end state, so such a purl is a calm
 //! `skipped`/`package_not_installed` that never fails the run — the same
-//! treatment `scan --apply` gives lockfile-only packages. A purl with NO
+//! treatment `scan --mode agent` gives lockfile-only packages. A purl with NO
 //! lock evidence still fails the all-miss run (the wrong-`--cwd` guard).
 
 use std::path::Path;

@@ -350,3 +350,49 @@ async fn npm_pin_beside_a_shrinkwrapped_or_git_copy_is_an_attributable_pin() {
         assert!(inv.contested_refusal().is_none(), "{case}: {inv:?}");
     }
 }
+
+/// A lockless NuGet pin (an exclusive Socket source mapping, no
+/// `packages.lock.json`: `rewrite_nuget`'s output for most projects) is
+/// contested wiring nothing can attribute to a version. Its refusal names
+/// the remedy that makes it attributable — create the lockfile — never a
+/// hosted re-scan, which would only write the same pin again (B13).
+#[tokio::test]
+async fn lockless_nuget_pin_refusal_names_the_lockfile_remedy() {
+    let tmp = tempfile::tempdir().unwrap();
+    let key = format!("socket-patch-{PATCH}");
+    let index = format!("https://patch.socket.dev/patch-registry/nuget/{GRANT}/{PATCH}/index.json");
+    std::fs::write(
+        tmp.path().join("nuget.config"),
+        format!(
+            "<?xml version=\"1.0\" encoding=\"utf-8\"?>\n<configuration>\n  <packageSources>\n    \
+             <add key=\"{key}\" value=\"{index}\" />\n  </packageSources>\n  \
+             <packageSourceMapping>\n    <packageSource key=\"{key}\">\n      \
+             <package pattern=\"Newtonsoft.Json\" />\n    </packageSource>\n  \
+             </packageSourceMapping>\n</configuration>\n"
+        ),
+    )
+    .unwrap();
+    let inv = inventory(tmp.path()).await;
+    assert!(inv.pins.is_empty(), "{inv:?}");
+    let lockless: Vec<_> = inv
+        .contested
+        .iter()
+        .filter(|c| !c.lockless.is_empty())
+        .collect();
+    assert_eq!(lockless.len(), 1, "{inv:?}");
+    assert!(lockless[0].lockless.contains("nuget"), "{inv:?}");
+    let refusal = inv.contested_refusal().expect("a refusal");
+    assert!(refusal.contains("no lockfile records"), "{refusal}");
+    assert!(
+        refusal.contains("dotnet restore --use-lock-file"),
+        "{refusal}"
+    );
+    assert!(
+        refusal.contains("git checkout -- nuget.config"),
+        "{refusal}"
+    );
+    assert!(
+        !refusal.contains("re-run `socket-patch scan --mode hosted`"),
+        "a hosted re-scan cannot attribute a lockless pin: {refusal}"
+    );
+}
