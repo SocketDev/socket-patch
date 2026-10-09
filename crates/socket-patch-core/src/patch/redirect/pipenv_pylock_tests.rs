@@ -127,3 +127,50 @@ fn pylock_without_a_pipenv_consumer_or_beside_pipfile_lock_still_pins() {
         .iter()
         .all(|w| w.code != "redirect_pipenv_pylock_unsupported"));
 }
+
+/// A leftover `Pipfile` beside a governing uv / Poetry / PDM lock does not
+/// make Pipenv the installer: the pylock is pinned as before, and no Pipenv
+/// refusal vetoes the sibling lock's confirmation.
+#[test]
+fn pylock_beside_a_governing_tool_lock_is_not_pipenvs() {
+    let uv_lock = format!(
+        "version = 1\nrevision = 3\nrequires-python = \">=3.9\"\n\n[[package]]\nname = \"six\"\nversion = \"1.16.0\"\nsource = {{ registry = \"https://pypi.org/simple\" }}\nwheels = [{{ url = \"https://files.pythonhosted.org/packages/d9/5a/{WHEEL}\", hash = \"sha256:{HEX}\" }}]\n"
+    );
+    for (lock, text) in [
+        ("uv.lock", uv_lock),
+        ("poetry.lock", String::new()),
+        ("pdm.lock", String::new()),
+    ] {
+        let result = rewrite(&files(&[
+            ("Pipfile", PIPFILE.into()),
+            (lock, text),
+            ("pylock.toml", pylock()),
+        ]));
+        assert!(
+            result
+                .warnings
+                .iter()
+                .all(|w| w.code != "redirect_pipenv_pylock_unsupported"),
+            "{lock}: {:?}",
+            result.warnings
+        );
+        // Only the real uv.lock fixture pins cleanly; the empty Poetry /
+        // PDM stubs are refused by their own rewriters.
+        if lock != "uv.lock" {
+            continue;
+        }
+        assert!(
+            !result.refused_python_lock_uuids.contains(UUID),
+            "{lock}: {:?}",
+            result.warnings
+        );
+        assert!(
+            result
+                .files
+                .get("pylock.toml")
+                .is_some_and(|t| t.contains(WHEEL) && t.contains("archive")),
+            "{lock}: {:?}",
+            result.warnings
+        );
+    }
+}

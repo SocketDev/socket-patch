@@ -185,19 +185,23 @@ pub fn is_pep751_lock_name(name: &str) -> bool {
 
 /// #912 / #1122: whether Pipenv installs from the PEP 751 lock `rel` (a
 /// project-relative path). A `Pipfile` beside the lock makes Pipenv the
-/// installer, and Pipenv reads a pylock only when that directory has no
-/// `Pipfile.lock`. Its reader (`PylockFile.convert_to_pipenv_lockfile`)
-/// keeps a package's version, marker and wheel / sdist hashes and nothing
-/// else, so no hosted or vendored `archive` entry survives it: such a lock
-/// can't carry a patch. `exists` answers for project-relative paths.
+/// installer — unless a higher-ranked tool lock (`uv.lock`, `poetry.lock`,
+/// `pdm.lock`) governs the directory, leaving the Pipfile a leftover — and
+/// Pipenv reads a pylock only when that directory has no `Pipfile.lock`.
+/// Its reader (`PylockFile.convert_to_pipenv_lockfile`) keeps a package's
+/// version, marker and wheel / sdist hashes and nothing else, so no hosted
+/// or vendored `archive` entry survives it: such a lock can't carry a
+/// patch. `exists` answers for project-relative paths.
 pub fn pipenv_reads_pylock(rel: &str, exists: impl Fn(&str) -> bool) -> bool {
     let (dir, name) = match rel.rsplit_once('/') {
         Some((dir, name)) => (format!("{dir}/"), name),
         None => (String::new(), rel),
     };
+    let in_dir = |file: &str| exists(&format!("{dir}{file}"));
     is_pep751_lock_name(name)
-        && exists(&format!("{dir}Pipfile"))
-        && !exists(&format!("{dir}Pipfile.lock"))
+        && in_dir("Pipfile")
+        && !crate::formats::governing_locks::pypi_tool_lock_shadowed("Pipfile.lock", in_dir)
+        && !in_dir("Pipfile.lock")
 }
 
 pub fn python_lock_paths(root: &Path) -> std::io::Result<Vec<String>> {

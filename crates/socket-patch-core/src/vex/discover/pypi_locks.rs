@@ -614,18 +614,18 @@ async fn load_pairing(ctx: &DiscoverCtx<'_>, lock: &str, out: &mut Discovery) ->
 }
 
 /// A PEP 751 lock stands alone — unless Pipenv is its installer (#912):
-/// with a `Pipfile` beside it and no `Pipfile.lock`, Pipenv reads the
-/// pylock but keeps only each entry's version and hashes, so no Socket
-/// `archive` it carries is what gets installed.
+/// with a `Pipfile` beside it, no governing uv / Poetry / PDM lock and no
+/// `Pipfile.lock`, Pipenv reads the pylock but keeps only each entry's
+/// version and hashes, so no Socket `archive` it carries is what gets
+/// installed.
 async fn pylock_pairing(ctx: &DiscoverCtx<'_>, lock: &str) -> Pairing {
-    let pipfile = ctx.exists(PIPFILE).await;
-    let pipfile_lock = ctx.exists(PIPFILE_LOCK).await;
-    let exists = |rel: &str| match rel {
-        PIPFILE => pipfile,
-        PIPFILE_LOCK => pipfile_lock,
-        _ => false,
-    };
-    if pipenv_reads_pylock(lock, exists) {
+    let mut present = Vec::new();
+    for file in [PIPFILE, PIPFILE_LOCK, UV_LOCK, POETRY_LOCK, PDM_LOCK] {
+        if ctx.exists(file).await {
+            present.push(file);
+        }
+    }
+    if pipenv_reads_pylock(lock, |rel| present.contains(&rel)) {
         unusable(
             PIPFILE,
             "makes Pipenv the installer, and with no Pipfile.lock Pipenv installs from this \
@@ -1348,6 +1348,37 @@ mod tests {
             p.write("Pipfile.lock", "{}");
             let out = run(&p).await;
             assert_refs(&out, &[(CLICK, uuid, mode)]);
+        }
+    }
+
+    /// A leftover `Pipfile` beside a governing Poetry / PDM lock does not
+    /// make Pipenv the pylock's installer: the reference is discovered.
+    #[tokio::test]
+    async fn pylock_beside_a_governing_tool_lock_is_trusted() {
+        let url = click_url(UUID_A);
+        let lock = rewrite_python_lock(
+            &pylock_registry(),
+            "click",
+            "8.1.7",
+            ArtifactSource::Url(&url),
+            SHA,
+        )
+        .unwrap()
+        .unwrap();
+        for tool_lock in ["poetry.lock", "pdm.lock"] {
+            let p = Project::new();
+            p.write("pylock.toml", &lock)
+                .write("Pipfile", "[packages]\n")
+                .write(tool_lock, "");
+            let out = run(&p).await;
+            assert!(
+                out.refs
+                    .iter()
+                    .any(|r| r.source_file.ends_with("pylock.toml")),
+                "{tool_lock}: {:?} {:?}",
+                out.refs,
+                out.diagnostics
+            );
         }
     }
 
