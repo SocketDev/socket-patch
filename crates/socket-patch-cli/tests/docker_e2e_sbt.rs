@@ -88,14 +88,8 @@ fn hex_of<D: Digest>(bytes: &[u8]) -> String {
 /// [`CENTRAL_JAR_SHA1`]) and the patched one: every member copied raw, plus
 /// [`MARKER`].
 async fn jars() -> (Vec<u8>, Vec<u8>) {
-    // reqwest sends no User-Agent by default; identify the client so
-    // Central's edge does not treat the fetch as anonymous traffic.
     let client = reqwest::Client::builder()
         .timeout(std::time::Duration::from_secs(60))
-        .user_agent(concat!(
-            "socket-patch-docker-e2e/",
-            env!("CARGO_PKG_VERSION")
-        ))
         .build()
         .expect("reqwest client");
     let pristine = fetch_from_central(&client, CENTRAL_JAR_PATH).await;
