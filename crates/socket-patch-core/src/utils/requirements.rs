@@ -524,6 +524,67 @@ mod tests {
         );
     }
 
+    /// #1212: pip decodes with whatever codec the coding line names, and
+    /// every ASCII-compatible codec decodes ASCII bytes as ASCII, so a
+    /// plain-ASCII file under a header naming one this reader has no table
+    /// for (copied from a template) reads as its text. Its non-ASCII bytes
+    /// are still unreadable, and so is ASCII under a codec that decodes it
+    /// differently (EBCDIC, UTF-16/32, UTF-7, HZ, ISO-2022, escape codecs)
+    /// or a name Python does not know (pip fails on those).
+    #[test]
+    fn decode_reads_ascii_under_any_ascii_compatible_coding_line() {
+        for coding in [
+            "iso-8859-15",
+            "latin-9",
+            "ISO8859_15",
+            "l9",
+            "cp1250",
+            "windows-1250",
+            "mac-roman",
+            "macintosh",
+            "gbk",
+            "GB18030",
+            "shift_jis",
+            "big5",
+            "euc-kr",
+            "koi8-r",
+            "cp437",
+            "iso-8859-2",
+            "tis-620",
+        ] {
+            let text = format!("# -*- coding: {coding} -*-\nsix==1.16.0\n");
+            assert_eq!(
+                decode(text.as_bytes()).as_deref(),
+                Some(&text[..]),
+                "{coding}"
+            );
+            let mut high = text.into_bytes();
+            high.extend_from_slice(b"# Jos\xe9\n");
+            assert_eq!(decode(&high), None, "{coding}");
+        }
+        for coding in [
+            "cp037",
+            "cp500",
+            "cp864",
+            "utf-16",
+            "utf-32-le",
+            "utf-7",
+            "hz",
+            "iso2022_jp",
+            "shift_jis_2004",
+            "unicode_escape",
+            "raw_unicode_escape",
+            "idna",
+            "punycode",
+            "rot13",
+            "hex",
+            "no-such-codec",
+        ] {
+            let text = format!("# coding: {coding}\nsix==1.16.0\n");
+            assert_eq!(decode(text.as_bytes()), None, "{coding}");
+        }
+    }
+
     #[test]
     fn requires_hashes_reads_pip_hash_checking_mode() {
         for hashed in [

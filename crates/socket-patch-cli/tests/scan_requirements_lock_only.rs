@@ -10,6 +10,8 @@
 //!   `pip freeze >` output), which pip decodes.
 //! * #1119: a file pip decodes through a PEP 263 coding line
 //!   (`# -*- coding: latin-1 -*-`), as the root file or an include.
+//! * #1212: a plain-ASCII file whose coding line names any other
+//!   ASCII-compatible codec (`iso-8859-15`, `cp1250`, `mac-roman`, `gbk`).
 //! * #994: include targets pip unquotes (`-r "dev reqs.txt"`,
 //!   `--requirement="dev.txt"`, `-r dev\ reqs.txt`) or expands
 //!   (`-r ${REQDIR}/dev.txt`);
@@ -238,6 +240,37 @@ async fn lock_only_scan_discovers_pep_263_pins() {
         ],
     )
     .await;
+}
+
+/// #1212: a coding line naming a codec the decoder has no table for
+/// (copied from a template; the file itself is plain ASCII) decodes like
+/// ASCII under every ASCII-compatible codec, as it does for pip, so the
+/// pins are discovered instead of reading as "No packages found".
+#[tokio::test]
+async fn lock_only_scan_discovers_ascii_pins_under_any_ascii_coding_line() {
+    for coding in ["iso-8859-15", "latin-9", "cp1250", "mac-roman", "gbk"] {
+        let root = format!("# -*- coding: {coding} -*-\nsp-fixture-six==1.16.0\n");
+        assert_lock_only_discovers_bytes(
+            &[("requirements.txt", root.as_bytes())],
+            &["pkg:pypi/sp-fixture-six@1.16.0"],
+        )
+        .await;
+        let dev = format!("# coding={coding}\nsp-fixture-six==1.16.0\n");
+        assert_lock_only_discovers_bytes(
+            &[
+                (
+                    "requirements.txt",
+                    &b"-r dev.txt\nsp-fixture-idna==3.7\n"[..],
+                ),
+                ("dev.txt", dev.as_bytes()),
+            ],
+            &[
+                "pkg:pypi/sp-fixture-idna@3.7",
+                "pkg:pypi/sp-fixture-six@1.16.0",
+            ],
+        )
+        .await;
+    }
 }
 
 /// #994: pip `shlex`-splits an include line's options, so a quoted or
