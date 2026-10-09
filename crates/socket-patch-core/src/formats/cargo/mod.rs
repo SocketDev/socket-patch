@@ -68,7 +68,7 @@ impl LockedPackage {
     /// `sparse+…`), the only sources cargo extracts under
     /// `$CARGO_HOME/registry/src/` (git, path and local-registry sources
     /// never are).
-    pub(crate) fn from_registry(&self) -> bool {
+    pub(crate) fn is_from_registry(&self) -> bool {
         self.source.as_deref().is_some_and(is_registry_source)
     }
 }

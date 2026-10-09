@@ -278,7 +278,7 @@ async fn source_roots(options: &CrawlerOptions) -> (Vec<PathBuf>, bool) {
 }
 
 /// The `(name, version)` of every registry-sourced `[[package]]` in
-/// `<cwd>/Cargo.lock` (`LockedPackage::from_registry`), in lock order.
+/// `<cwd>/Cargo.lock` (`LockedPackage::is_from_registry`), in lock order.
 /// `None` when there is no readable lock or it is not TOML: the crawl then
 /// keeps walking the whole cache.
 async fn lock_scope(cwd: &Path) -> Option<Vec<(String, String)>> {
@@ -289,7 +289,7 @@ async fn lock_scope(cwd: &Path) -> Option<Vec<(String, String)>> {
     Some(
         lock.packages()
             .iter()
-            .filter(|p| p.from_registry())
+            .filter(|p| p.is_from_registry())
             .map(|p| (p.name.clone(), p.version.clone()))
             .collect(),
     )
