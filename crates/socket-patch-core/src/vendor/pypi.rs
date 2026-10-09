@@ -5785,6 +5785,72 @@ wheels = [
         .await
     }
 
+    /// #612: `pipenv requirements > requirements.txt` beside Pipfile.lock is
+    /// a second install source (Docker / plain pip). Vendored mode must wire
+    /// both, as hosted mode does, and revert must restore both byte for byte.
+    #[tokio::test]
+    async fn pipenv_vendor_wires_the_exported_sibling_requirements() {
+        const EXPORTED: &str =
+            "-i https://pypi.org/simple\nsix==1.16.0 ; python_version >= '2.7'\n";
+        let fx = pipenv_e2e_fixture().await;
+        touch(&fx.root, "requirements.txt", EXPORTED).await;
+        let VendorOutcome::Done {
+            entry, warnings, ..
+        } = pipenv_vendor(&fx, &fx.record).await
+        else {
+            panic!("vendor did not complete");
+        };
+        let requirements = tokio::fs::read_to_string(fx.root.join("requirements.txt"))
+            .await
+            .unwrap();
+        assert!(
+            requirements.contains(&format!(".socket/vendor/pypi/{UUID}/")),
+            "requirements.txt left unpatched:\n{requirements}"
+        );
+        let lock = tokio::fs::read_to_string(fx.root.join("Pipfile.lock"))
+            .await
+            .unwrap();
+        assert!(lock.contains(UUID), "Pipfile.lock not wired:\n{lock}");
+        assert!(
+            warnings.iter().all(|w| w.code != "pypi_multiple_lockfiles"),
+            "{warnings:?}"
+        );
+        // What `vendor --check` and `vex` read: both files wire the same
+        // vendored wheel, so neither contests the other.
+        let discovery = crate::vex::discover::discover_patched_refs(&fx.root).await;
+        assert!(discovery.contested.is_empty(), "{:?}", discovery.contested);
+        let wired_in: std::collections::BTreeSet<String> = discovery
+            .refs
+            .iter()
+            .filter(|r| r.uuid == UUID)
+            .map(|r| r.source_file.to_string_lossy().replace('\\', "/"))
+            .collect();
+        assert!(
+            wired_in.contains("Pipfile.lock") && wired_in.contains("requirements.txt"),
+            "{:?}",
+            discovery.refs
+        );
+
+        let outcome = revert_pypi(
+            entry.as_ref().expect("a wet vendor records its entry"),
+            &fx.root,
+            false,
+        )
+        .await;
+        assert!(outcome.success, "{:?}", outcome.error);
+        assert!(!outcome.kept_artifact, "{:?}", outcome.warnings);
+        assert_eq!(
+            tokio::fs::read_to_string(fx.root.join("requirements.txt"))
+                .await
+                .unwrap(),
+            EXPORTED
+        );
+        assert_eq!(
+            read_json(&fx.root, "Pipfile.lock").await,
+            serde_json::from_str::<serde_json::Value>(PIPENV_REGISTRY_LOCK).unwrap()
+        );
+    }
+
     async fn read_json(root: &Path, name: &str) -> serde_json::Value {
         serde_json::from_str(&tokio::fs::read_to_string(root.join(name)).await.unwrap()).unwrap()
     }
