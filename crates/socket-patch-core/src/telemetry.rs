@@ -325,7 +325,7 @@ fn prepare_send(event: PatchTelemetryEvent, auth: &TelemetryAuth) -> PreparedSen
 async fn send_telemetry_event(prepared: PreparedSend) {
     let PreparedSend { event, url, bearer } = prepared;
 
-    let client = match reqwest::Client::builder()
+    let client = match crate::utils::http::client_builder()
         .connect_timeout(std::time::Duration::from_secs(2))
         .timeout(std::time::Duration::from_secs(5))
         .build()

@@ -26,6 +26,8 @@ sha2 = { workspace = true }
 sha1 = { workspace = true }
 hex = { workspace = true }
 reqwest = { workspace = true }
+rustls-native-certs = { workspace = true }
+rustls = { workspace = true }
 tokio = { workspace = true }
 # CancellationToken for the in-memory hosted engine (`hosted::memory`).
 tokio-util = { workspace = true }
@@ -84,3 +86,4 @@ tempfile = { workspace = true }
 tokio = { workspace = true, features = ["full", "test-util"] }
 serial_test = { workspace = true }
 wiremock = { workspace = true }
+tokio-rustls = { workspace = true }

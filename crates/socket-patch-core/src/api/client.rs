@@ -1992,7 +1992,7 @@ fn api_client(api_token: Option<&str>, timeouts: &ApiTimeouts) -> reqwest::Clien
     }
 
     timeouts
-        .apply(reqwest::Client::builder().default_headers(default_headers))
+        .apply(crate::utils::http::client_builder().default_headers(default_headers))
         .build()
         .expect("failed to build reqwest client")
 }
@@ -2009,7 +2009,7 @@ fn plain_client(timeouts: &ApiTimeouts) -> reqwest::Client {
         HeaderValue::from_static(USER_AGENT_VALUE),
     );
     timeouts
-        .apply(reqwest::Client::builder().default_headers(headers))
+        .apply(crate::utils::http::client_builder().default_headers(headers))
         .build()
         .expect("failed to build plain reqwest client")
 }
