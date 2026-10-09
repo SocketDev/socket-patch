@@ -2925,7 +2925,11 @@ async fn rush_pnpm_trust_warning_gives_rush_remedy() {
             "the Rush trust detail must name `{needle}`; got:\n{detail}"
         );
     }
-    for needle in ["pnpm install --trust-lockfile", "--store-dir", "pnpm clean --lockfile"] {
+    for needle in [
+        "pnpm install --trust-lockfile",
+        "--store-dir",
+        "pnpm clean --lockfile",
+    ] {
         assert!(
             !detail.contains(needle),
             "the Rush trust detail must not offer the pnpm-only `{needle}`; got:\n{detail}"
@@ -2979,7 +2983,10 @@ async fn rush_rerun_on_redirected_locks_reissues_the_rush_remedy() {
         detail.contains("pnpm_config_trust_lockfile=true rush install"),
         "{detail}"
     );
-    assert!(!detail.contains("pnpm install --trust-lockfile"), "{detail}");
+    assert!(
+        !detail.contains("pnpm install --trust-lockfile"),
+        "{detail}"
+    );
     assert!(
         !tmp.path().join("pnpm-workspace.yaml").exists(),
         "a Rush re-run must not create a root pnpm-workspace.yaml"
