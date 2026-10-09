@@ -277,6 +277,17 @@ async fn detect_pypi_flavor(
     project_root: &Path,
     target: Option<(&str, &str)>,
 ) -> Result<(PypiFlavor, Vec<VendorWarning>), (&'static str, String)> {
+    // #1138: a uv workspace member installs from the workspace root's
+    // uv.lock, which this run cannot see; routing it by its own files would
+    // rewrite it as a lockless (Hatch) project, or rewrite a lock left in
+    // the member that uv never reads, and leave the root lock stale.
+    if let Some(workspace) = crate::utils::uv_workspace::governing_uv_workspace(project_root).await
+    {
+        return Err((
+            "pypi_uv_workspace_unsupported",
+            crate::utils::uv_workspace::member_detail(project_root, &workspace),
+        ));
+    }
     let exists = |name: &str| {
         let p = project_root.join(name);
         async move { tokio::fs::metadata(&p).await.is_ok() }
@@ -403,17 +414,6 @@ async fn detect_pypi_flavor(
         Some("pdm.lock") => return Ok((PypiFlavor::Pdm, warnings)),
         Some(_) => return Ok((PypiFlavor::Pipenv, warnings)),
         None => {}
-    }
-
-    // #1138: a uv workspace member installs from the workspace root's
-    // uv.lock, which this run cannot see; routing it by its own files would
-    // rewrite it as a lockless (Hatch) project and leave that lock stale.
-    if let Some(workspace) = crate::utils::uv_workspace::governing_uv_workspace(project_root).await
-    {
-        return Err((
-            "pypi_uv_workspace_unsupported",
-            crate::utils::uv_workspace::member_detail(project_root, &workspace),
-        ));
     }
 
     let pyproject_text = read_regular_to_string(&project_root.join("pyproject.toml"))

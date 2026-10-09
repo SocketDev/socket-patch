@@ -19,17 +19,20 @@ use std::path::{Path, PathBuf};
 
 use toml_edit::{DocumentMut, Item};
 
-use crate::formats::governing_locks::PYPI_TOOL_LOCKS;
 use crate::utils::fs::read_regular_to_string;
 use crate::utils::workspace_globs::glob_matches;
 
 /// The uv workspace that governs `dir`: `Some(root)` when `dir` holds a
-/// `pyproject.toml` but no Python lock of its own (no `uv.lock`,
-/// `poetry.lock`, `pdm.lock`, `Pipfile.lock`, `pylock*.toml` or script
-/// lock), and the nearest ancestor `pyproject.toml` declaring
-/// `[tool.uv.workspace]` lists it as a member. As in uv, the nearest
-/// workspace decides: one that does not list `dir` (or excludes it)
-/// governs nothing here, and no outer root is consulted.
+/// `pyproject.toml` and the nearest ancestor `pyproject.toml` declaring
+/// `[tool.uv.workspace]` lists it as a member. Discovery follows uv's: the
+/// nearest workspace decides (one that does not list `dir`, or excludes
+/// it, governs nothing here and no outer root is consulted), and an
+/// ancestor `pyproject.toml` with a `[project]` table but no workspace
+/// ends the walk (`dir` is nested in a standalone project, e.g. its tests
+/// or examples). A member's own lock files do not make it standalone: uv
+/// installs a listed member from the workspace root's `uv.lock` and never
+/// reads a `uv.lock`, `poetry.lock`, `pdm.lock`, `Pipfile.lock` or pylock
+/// left in the member directory.
 pub(crate) async fn governing_uv_workspace(dir: &Path) -> Option<PathBuf> {
     let dir = tokio::fs::canonicalize(dir)
         .await
@@ -38,14 +41,6 @@ pub(crate) async fn governing_uv_workspace(dir: &Path) -> Option<PathBuf> {
         .await
         .is_err()
     {
-        return None;
-    }
-    for lock in PYPI_TOOL_LOCKS {
-        if tokio::fs::metadata(dir.join(lock)).await.is_ok() {
-            return None;
-        }
-    }
-    if crate::utils::python_lock::python_lock_paths(&dir).is_ok_and(|locks| !locks.is_empty()) {
         return None;
     }
     for ancestor in dir.ancestors().skip(1) {
@@ -63,6 +58,9 @@ pub(crate) async fn governing_uv_workspace(dir: &Path) -> Option<PathBuf> {
             .and_then(|uv| uv.get("workspace"))
             .and_then(Item::as_table_like)
         else {
+            if doc.contains_key("project") {
+                return None;
+            }
             continue;
         };
         let rel: Vec<String> = dir
@@ -148,9 +146,14 @@ mod tests {
         assert_eq!(governing_uv_workspace(&root.join("tools/x")).await, None);
         // The workspace root itself is not governed from above.
         assert_eq!(governing_uv_workspace(&root).await, None);
-        // A member with a lock of its own is its own project.
+        // A lock left in the member does not make it standalone: uv still
+        // installs it from the root's uv.lock.
         write(&root, "packages/a/poetry.lock", "");
-        assert_eq!(governing_uv_workspace(&root.join("packages/a")).await, None);
+        write(&root, "packages/a/uv.lock", "version = 1\n");
+        assert_eq!(
+            governing_uv_workspace(&root.join("packages/a")).await,
+            Some(root.clone())
+        );
         // A directory with no pyproject.toml is not a uv project.
         write(&root, "packages/b/requirements.txt", "six==1.16.0\n");
         assert_eq!(governing_uv_workspace(&root.join("packages/b")).await, None);
@@ -176,6 +179,36 @@ mod tests {
         assert_eq!(
             governing_uv_workspace(&root.join("packages/a/libs/l")).await,
             Some(root.join("packages/a"))
+        );
+    }
+
+    /// As in uv, a standalone project (`[project]`, no workspace) between
+    /// the directory and a workspace root that would list it ends the walk;
+    /// an ancestor `pyproject.toml` with only tool configuration does not.
+    #[tokio::test]
+    async fn an_intermediate_project_is_a_boundary() {
+        let tmp = tempfile::tempdir().unwrap();
+        let root = tmp.path().canonicalize().unwrap();
+        write(
+            &root,
+            "pyproject.toml",
+            "[project]\nname = \"root\"\n\n[tool.uv.workspace]\nmembers = [\"**\"]\n",
+        );
+        write(&root, "app/pyproject.toml", "[project]\nname = \"app\"\n");
+        write(&root, "app/examples/demo/pyproject.toml", MEMBER);
+        assert_eq!(
+            governing_uv_workspace(&root.join("app/examples/demo")).await,
+            None
+        );
+        write(
+            &root,
+            "tools/pyproject.toml",
+            "[tool.ruff]\nline-length = 100\n",
+        );
+        write(&root, "tools/x/pyproject.toml", MEMBER);
+        assert_eq!(
+            governing_uv_workspace(&root.join("tools/x")).await,
+            Some(root.clone())
         );
     }
 }
