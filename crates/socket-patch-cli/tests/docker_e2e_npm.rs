@@ -25,6 +25,10 @@
 
 #![cfg(feature = "docker-e2e")]
 
+#[path = "common/mod.rs"]
+mod common;
+use common::git_sha256;
+
 #[path = "docker_vendor_common/mod.rs"]
 mod docker_vendor_common;
 
@@ -33,7 +37,6 @@ use std::path::{Path, PathBuf};
 use std::process::Command;
 use std::time::Duration;
 
-use sha2::{Digest, Sha256};
 use wiremock::matchers::{method, path, path_regex};
 use wiremock::{Mock, MockServer, ResponseTemplate};
 
@@ -49,16 +52,6 @@ const GHSA: &str = "GHSA-agent-npm-real";
 /// post-apply that the file has been overwritten.
 const PATCHED_BYTES: &[u8] =
     b"/* SOCKET-PATCH-E2E-MARKER */\nmodule.exports = function () { return {}; };\n";
-
-/// Git-SHA256: SHA256("blob <len>\0" ++ content). Matches the binary's
-/// content-addressable hashing for fetched blobs.
-fn git_sha256(content: &[u8]) -> String {
-    let header = format!("blob {}\0", content.len());
-    let mut hasher = Sha256::new();
-    hasher.update(header.as_bytes());
-    hasher.update(content);
-    hex::encode(hasher.finalize())
-}
 
 /// Coverage instrumentation hook. The CI coverage-docker job sets
 /// SOCKET_PATCH_COV_BIN (host path to an llvm-cov-instrumented

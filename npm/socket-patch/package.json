@@ -1,6 +1,6 @@
 {
   "name": "@socketsecurity/socket-patch",
-  "version": "4.0.0",
+  "version": "5.0.0",
   "description": "CLI tool and schema library for applying security patches to dependencies",
   "bin": {
     "socket-patch": "bin/socket-patch"
@@ -49,19 +49,19 @@
     "@types/node": "20.19.41"
   },
   "optionalDependencies": {
-    "@socketsecurity/socket-patch-android-arm64": "4.0.0",
-    "@socketsecurity/socket-patch-darwin-arm64": "4.0.0",
-    "@socketsecurity/socket-patch-darwin-x64": "4.0.0",
-    "@socketsecurity/socket-patch-linux-arm-gnu": "4.0.0",
-    "@socketsecurity/socket-patch-linux-arm-musl": "4.0.0",
-    "@socketsecurity/socket-patch-linux-arm64-gnu": "4.0.0",
-    "@socketsecurity/socket-patch-linux-arm64-musl": "4.0.0",
-    "@socketsecurity/socket-patch-linux-ia32-gnu": "4.0.0",
-    "@socketsecurity/socket-patch-linux-ia32-musl": "4.0.0",
-    "@socketsecurity/socket-patch-linux-x64-gnu": "4.0.0",
-    "@socketsecurity/socket-patch-linux-x64-musl": "4.0.0",
-    "@socketsecurity/socket-patch-win32-arm64": "4.0.0",
-    "@socketsecurity/socket-patch-win32-ia32": "4.0.0",
-    "@socketsecurity/socket-patch-win32-x64": "4.0.0"
+    "@socketsecurity/socket-patch-android-arm64": "5.0.0",
+    "@socketsecurity/socket-patch-darwin-arm64": "5.0.0",
+    "@socketsecurity/socket-patch-darwin-x64": "5.0.0",
+    "@socketsecurity/socket-patch-linux-arm-gnu": "5.0.0",
+    "@socketsecurity/socket-patch-linux-arm-musl": "5.0.0",
+    "@socketsecurity/socket-patch-linux-arm64-gnu": "5.0.0",
+    "@socketsecurity/socket-patch-linux-arm64-musl": "5.0.0",
+    "@socketsecurity/socket-patch-linux-ia32-gnu": "5.0.0",
+    "@socketsecurity/socket-patch-linux-ia32-musl": "5.0.0",
+    "@socketsecurity/socket-patch-linux-x64-gnu": "5.0.0",
+    "@socketsecurity/socket-patch-linux-x64-musl": "5.0.0",
+    "@socketsecurity/socket-patch-win32-arm64": "5.0.0",
+    "@socketsecurity/socket-patch-win32-ia32": "5.0.0",
+    "@socketsecurity/socket-patch-win32-x64": "5.0.0"
   }
 }

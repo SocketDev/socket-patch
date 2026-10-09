@@ -7,6 +7,7 @@ use serde::Deserialize;
 
 use super::types::{CrawledPackage, CrawlerOptions};
 use super::walk_pool::{par_map, run_walk};
+use crate::formats::text::strip_bom;
 use crate::patch::path_safety;
 use crate::utils::fs::{is_dir, is_dir_sync, read_dir_entries_sync};
 use crate::utils::purl::{percent_decode_purl_component, strip_purl_qualifiers};
@@ -273,7 +274,7 @@ struct YarnrcModulesFolder {
 /// each key the last setting wins.
 fn parse_yarnrc_modules_folder(rc: &str) -> YarnrcModulesFolder {
     let mut found = YarnrcModulesFolder::default();
-    for line in rc.trim_start_matches('\u{feff}').lines() {
+    for line in strip_bom(rc).lines() {
         let line = line.trim();
         if line.is_empty() || line.starts_with('#') {
             continue;
@@ -796,7 +797,7 @@ fn bun_workspace_pattern_members_sync(root: &Path) -> Option<Vec<PathBuf>> {
         Err(e) if e.kind() == std::io::ErrorKind::NotFound => return Some(Vec::new()),
         Err(_) => return None,
     };
-    let text = text.strip_prefix('\u{feff}').unwrap_or(&text);
+    let text = strip_bom(&text);
     let doc: serde_json::Value = serde_json::from_str(text).ok()?;
     let patterns = match doc.get("workspaces") {
         None | Some(serde_json::Value::Null) => Vec::new(),
@@ -7260,6 +7261,42 @@ mod tests {
                 .is_none_or(|copies| copies.is_empty()),
             "{found:?}"
         );
+    }
+
+    /// The `.yarnrc` and Bun `package.json` workspace readers skip one
+    /// leading BOM (`formats::text`); a second one is content.
+    #[test]
+    fn yarnrc_and_bun_workspaces_read_past_one_bom_only() {
+        let rc = "--modules-folder deps\n";
+        for bom in ["", "\u{feff}"] {
+            assert_eq!(
+                parse_yarnrc_modules_folder(&format!("{bom}{rc}"))
+                    .general
+                    .as_deref(),
+                Some("deps")
+            );
+        }
+        assert_eq!(
+            parse_yarnrc_modules_folder(&format!("\u{feff}\u{feff}{rc}")),
+            YarnrcModulesFolder::default()
+        );
+
+        let dir = tempfile::tempdir().unwrap();
+        std::fs::create_dir(dir.path().join("a")).unwrap();
+        let manifest = r#"{"workspaces":["a"]}"#;
+        for bom in ["", "\u{feff}"] {
+            std::fs::write(dir.path().join("package.json"), format!("{bom}{manifest}")).unwrap();
+            assert_eq!(
+                bun_workspace_pattern_members_sync(dir.path()),
+                Some(vec![dir.path().join("a")])
+            );
+        }
+        std::fs::write(
+            dir.path().join("package.json"),
+            format!("\u{feff}\u{feff}{manifest}"),
+        )
+        .unwrap();
+        assert_eq!(bun_workspace_pattern_members_sync(dir.path()), None);
     }
 
     /// `.yarnrc` `--modules-folder` parsing: bare and quoted keys and

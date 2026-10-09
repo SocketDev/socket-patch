@@ -11,19 +11,11 @@
 //! like SOCKET_DRY_RUN — an ambient SOCKET_DRY_RUN=true turned every
 //! apply below into a silent no-op and failed the on-disk assertions.
 
+use crate::common::git_sha256;
+
 use std::path::Path;
 
-use sha2::{Digest, Sha256};
-
 use crate::common;
-
-fn git_sha256(content: &[u8]) -> String {
-    let header = format!("blob {}\0", content.len());
-    let mut hasher = Sha256::new();
-    hasher.update(header.as_bytes());
-    hasher.update(content);
-    hex::encode(hasher.finalize())
-}
 
 fn write_root(root: &Path) {
     std::fs::write(

@@ -61,6 +61,7 @@ use crate::formats::pnpm::{
     classify_pnpm_key, entry_bundled, entry_field, pnpm_registry_key, Bundled, PnpmKey, PnpmLock,
     PnpmPackage,
 };
+use crate::formats::text::strip_bom;
 use crate::utils::digest::is_sri_pin;
 use crate::vendor::lock_inventory::pnpm::rush_lock_rels;
 use crate::vendor::lock_inventory::{
@@ -812,9 +813,9 @@ async fn record_pnpm_file_copies(
                         } else {
                             format!("{rel}/package.json")
                         };
-                        ctx.read_advisory_text(&manifest).await.and_then(|t| {
-                            serde_json::from_str(t.trim_start_matches('\u{feff}')).ok()
-                        })
+                        ctx.read_advisory_text(&manifest)
+                            .await
+                            .and_then(|t| serde_json::from_str(strip_bom(&t)).ok())
                     }
                     Some(rel) => match ctx.read_advisory_bytes(&rel).await {
                         Some(bytes) => tokio::task::spawn_blocking(move || {
@@ -2704,6 +2705,39 @@ mod tests {
         p.write(
             "forks/left-pad/package.json",
             r#"{"name":"left-pad","version":"2.0.0"}"#,
+        );
+        assert_refs(
+            &run(&p).await,
+            &[("pkg:npm/left-pad@1.3.0", UUID_A, WiringMode::Hosted)],
+        );
+    }
+
+    /// A `file:` directory's `package.json` is read past one leading BOM
+    /// (`formats::text`): with one it still contests the ref; with two the
+    /// manifest does not parse, so the copy is left alone like any
+    /// unreadable one.
+    #[tokio::test]
+    async fn pnpm_file_directory_manifest_reads_past_one_bom_only() {
+        let url = hosted_url("npm", "left-pad", "1.3.0", UUID_A, "left-pad-1.3.0.tgz");
+        let lock = format!(
+            "lockfileVersion: '9.0'\n\npackages:\n\n  \
+             left-pad@1.3.0:\n    resolution: {{integrity: {SRI}, tarball: {url}}}\n\n  \
+             left-pad@file:forks/left-pad:\n    \
+             resolution: {{directory: forks/left-pad, type: directory}}\n\n"
+        );
+        let manifest = r#"{"name":"left-pad","version":"1.3.0"}"#;
+        for bom in ["", "\u{feff}"] {
+            let p = Project::new();
+            p.write("pnpm-lock.yaml", lock.clone());
+            p.write("forks/left-pad/package.json", format!("{bom}{manifest}"));
+            let out = run(&p).await;
+            assert!(out.refs.is_empty(), "{bom:?}: {:#?}", out.refs);
+        }
+        let p = Project::new();
+        p.write("pnpm-lock.yaml", lock.clone());
+        p.write(
+            "forks/left-pad/package.json",
+            format!("\u{feff}\u{feff}{manifest}"),
         );
         assert_refs(
             &run(&p).await,

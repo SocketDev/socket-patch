@@ -566,7 +566,7 @@ pub async fn restore_jvm_owned_files(root: &Path, entry: &VendorEntry) -> Result
         let current = read(&rel);
         if current
             .as_deref()
-            .is_some_and(|c| crate::gradle::eol::eol_eq(c, text.as_bytes()))
+            .is_some_and(|c| crate::utils::line_endings::eol_eq(c, text.as_bytes()))
         {
             continue;
         }

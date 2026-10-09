@@ -1988,9 +1988,10 @@ async fn guard_unwired_pypi_revert(
 /// named project files, the root `requirements.txt` plus every `-r` include
 /// the planner may have written a pin into, every Python lock the root
 /// directory LISTS (`uv.lock`, `pylock*.toml`, `*.py.lock` with its paired
-/// script), and every other root-level `*.txt` (a `uv export -o` target, or
-/// a `requirements-dev.txt` the user moved a vendor line into), plus every
-/// `*.txt` or Python lock in a project subdirectory
+/// script), and every other root-level `*.txt` or `*.lock` (a `uv export -o`
+/// target such as Rye's `requirements.lock`, #1252, or a
+/// `requirements-dev.txt` the user moved a vendor line into), plus every
+/// `*.txt`, `*.lock` or Python lock in a project subdirectory
 /// ([`subdir_probe_names`]: a `requirements/dev.txt` the root never
 /// includes, #1167, or a `deploy/pylock.toml` export, #1213). `skip`
 /// names files left out of the probe (a dry run's not-yet-restored wiring).
@@ -2050,7 +2051,7 @@ async fn pypi_reference_clause(project_root: &Path, uuid: &str, skip: &[&str]) -
             continue;
         };
         let is_lock = crate::utils::python_lock::is_python_lock_name(&name);
-        if !is_lock && !name.ends_with(".txt") {
+        if !is_lock && !is_export_name(&name) {
             continue;
         }
         // lstat only: a regular file or ANY symlink is probed (the read
@@ -2103,6 +2104,16 @@ async fn pypi_reference_clause(project_root: &Path, uuid: &str, skip: &[&str]) -
     None
 }
 
+/// Whether a file that is not a Python lock name may still be a
+/// requirements-format export [`pypi_reference_clause`] must read: any
+/// `*.txt` (`pip freeze >`, `uv export -o requirements.txt`) and any
+/// `*.lock` (#1252: Rye's `requirements.lock` / `requirements-dev.lock`,
+/// which `uv export -o` and `uv pip compile -o` keep writing after a
+/// Rye -> uv move; both accept any output name).
+fn is_export_name(name: &str) -> bool {
+    name.ends_with(".txt") || name.ends_with(".lock")
+}
+
 /// Directory names [`subdir_probe_names`] never descends into: VCS metadata,
 /// socket-patch's own state, and tool or cache trees whose `*.txt` files
 /// are package payloads, not requirements files anyone installs from.
@@ -2122,8 +2133,8 @@ const PROBE_SKIPPED_DIRS: &[&str] = &[
     "site-packages",
 ];
 
-/// Every `*.txt` and every Python lock (with a script lock's paired
-/// script) below the project root's subdirectories, as `/`-joined
+/// Every `*.txt`, every `*.lock` and every Python lock (with a script
+/// lock's paired script) below the project root's subdirectories, as `/`-joined
 /// root-relative names in a stable order (#1167, #1213): `pip install -r
 /// requirements/dev.txt` installs from a file the root `-r` tree never
 /// reaches, `pip freeze > requirements/lock.txt` or `uv export -o
@@ -2176,7 +2187,7 @@ fn subdir_probe_names(project_root: &Path) -> Vec<String> {
             } else if !rel.is_empty() && (ft.is_file() || ft.is_symlink()) {
                 // Root-level files are the caller's own listing.
                 let is_lock = crate::utils::python_lock::is_python_lock_name(&name);
-                if !is_lock && !name.ends_with(".txt") {
+                if !is_lock && !is_export_name(&name) {
                     continue;
                 }
                 if is_lock {
@@ -6020,8 +6031,7 @@ wheels = [
     /// entry; once the file stops naming the wheel the next revert cleans up.
     #[tokio::test]
     async fn requirements_revert_keeps_artifact_for_subdir_requirements_file() {
-        use crate::vendor::pypi_requirements::wire_requirements;
-        for (file, content) in [
+        assert_revert_keeps_artifact_for(&[
             (
                 "requirements/lock.txt",
                 "six @ file:///proj/.socket/vendor/pypi/{UUID}/six-1.16.0-py2.py3-none-any.whl\n",
@@ -6034,7 +6044,41 @@ wheels = [
                 "deploy/requirements/prod.txt",
                 "./.socket/vendor/pypi/{UUID}/six-1.16.0-py2.py3-none-any.whl\n",
             ),
-        ] {
+        ])
+        .await;
+    }
+
+    /// #1252: `uv export -o` and `uv pip compile -o` write any file name,
+    /// and Rye's `requirements.lock` / `requirements-dev.lock` keep being
+    /// written after a Rye -> uv move. Such an export at the root or in a
+    /// subdirectory installs from the wheel exactly like a `*.txt` one, so
+    /// the revert keeps the wheel until the export stops naming it.
+    #[tokio::test]
+    async fn requirements_revert_keeps_artifact_for_lock_named_export() {
+        assert_revert_keeps_artifact_for(&[
+            (
+                "requirements.lock",
+                "six @ file:///proj/.socket/vendor/pypi/{UUID}/six-1.16.0-py2.py3-none-any.whl\n",
+            ),
+            (
+                "requirements-dev.lock",
+                "six @ file:///proj/.socket/vendor/pypi/{UUID}/six-1.16.0-py2.py3-none-any.whl\n",
+            ),
+            (
+                "deploy/requirements.lock",
+                "./../.socket/vendor/pypi/{UUID}/six-1.16.0-py2.py3-none-any.whl\n",
+            ),
+        ])
+        .await;
+    }
+
+    /// Wires the root `requirements.txt`, writes each `(file, content)`
+    /// export naming the wheel, and checks that the dry run and the wet
+    /// revert keep the wheel for it, and that the revert reclaims the
+    /// artifact once the export stops naming it.
+    async fn assert_revert_keeps_artifact_for(cases: &[(&str, &str)]) {
+        use crate::vendor::pypi_requirements::wire_requirements;
+        for &(file, content) in cases {
             let tmp = tempfile::tempdir().unwrap();
             let root = tmp.path();
             tokio::fs::write(root.join("requirements.txt"), "six==1.16.0\n")

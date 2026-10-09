@@ -39,6 +39,8 @@
 //! Plus the embedded entry points (`scan --mode hosted --vex`, `scan --mode vendored
 //! --vex`, `apply --vex`).
 
+use crate::common::binary;
+
 use crate::vex_e2e_common;
 
 use std::collections::HashMap;
@@ -663,10 +665,6 @@ impl Api {
 }
 
 // ── running the CLI ─────────────────────────────────────────────────────
-
-fn binary() -> &'static str {
-    env!("CARGO_BIN_EXE_socket-patch")
-}
 
 /// The CLI with the ambient `SOCKET_*` / python / uv discovery environment
 /// scrubbed and uv's cache pointed into `p.home`.

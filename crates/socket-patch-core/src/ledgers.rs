@@ -29,8 +29,9 @@ use std::path::Path;
 use crate::manifest::schema::{PatchManifest, PatchRecord};
 use crate::patch::redirect::upstream::HostedPin;
 use crate::patch::redirect::{CorruptRedirectState, RedirectState};
-use crate::utils::purl::{canonical_purl, patch_matches};
+use crate::utils::purl::canonical_purl;
 use crate::utils::purl_key::PurlKey;
+use crate::utils::target::Target;
 use crate::vendor::{VendorEntry, VendorState};
 
 /// A patch store, in owner-precedence order (a lower store wins a key).
@@ -131,23 +132,23 @@ impl Matches {
     }
 }
 
-/// The lockfiles' hosted pins a remove/rollback `identifier` selects,
-/// sorted by purl: every pin the identifier names by purl or uuid, plus
+/// The lockfiles' hosted pins a remove/rollback `target` selects, sorted
+/// by purl: every pin the target names ([`Target::matches_patch`]), plus
 /// every pin wiring the same release as one of `manifest_keys` (the
-/// manifest entries the identifier matched). The second half is the hosted
+/// manifest entries the target matched). The second half is the hosted
 /// twin of [`Ledgers::matching`]'s claim groups: `remove <uuid>` of a
 /// manifest record whose package a later hosted scan re-pinned to another
 /// patch generation unwinds that pin too, instead of leaving it live with
 /// no record.
 pub fn hosted_pins_matching(
     pins: &[HostedPin],
-    identifier: &str,
+    target: &Target,
     manifest_keys: &[String],
 ) -> Vec<HostedPin> {
     let mut matches: Vec<HostedPin> = pins
         .iter()
         .filter(|pin| {
-            patch_matches(&pin.purl, &pin.uuid, identifier)
+            target.matches_patch(&pin.purl, &pin.uuid)
                 || manifest_keys
                     .iter()
                     .any(|key| PurlKey::same(key, &pin.purl))
@@ -322,25 +323,24 @@ impl<'a> Ledgers<'a> {
         out
     }
 
-    /// Every entry a remove/rollback `identifier` (purl or uuid) matches:
-    /// manifest and hosted records by [`patch_matches`] on their key,
-    /// vendored entries by [`VendorEntry::matches_identifier`] (key or base
-    /// purl) or by belonging to a matched manifest key's claim group (rule 1
-    /// of the module docs).
+    /// Every entry a remove/rollback `target` matches: manifest and hosted
+    /// records by [`Target::matches_patch`] on their key, vendored entries
+    /// by [`VendorEntry::matches_target`] (key or base purl) or by belonging
+    /// to a matched manifest key's claim group (rule 1 of the module docs).
     ///
-    /// The claim group is what makes a uuid identifier generation-blind: a
+    /// The claim group is what makes a uuid target generation-blind: a
     /// manifest key and the vendored entry it claims are ONE owned pin,
     /// whichever patch generation each store recorded. When `get`/`scan`
     /// recorded a superseding patch B in the manifest while the ledger still
     /// holds the vendored generation A, `remove <B>` must revert A's
     /// vendoring too (#999), or the lockfile keeps consuming A's artifact
     /// with no record left.
-    pub fn matching(&self, identifier: &str) -> Matches {
+    pub fn matching(&self, target: &Target) -> Matches {
         let mut manifest: Vec<String> = self
             .manifest
             .into_iter()
             .flat_map(|m| m.patches.iter())
-            .filter(|(key, rec)| patch_matches(key, &rec.uuid, identifier))
+            .filter(|(key, rec)| target.matches_patch(key, &rec.uuid))
             .map(|(key, _)| key.clone())
             .collect();
         manifest.sort();
@@ -353,7 +353,7 @@ impl<'a> Ledgers<'a> {
             .into_iter()
             .flat_map(|s| s.entries.iter())
             .filter(|(key, entry)| {
-                entry.matches_identifier(key, identifier) || claimed_by_match(key, entry)
+                entry.matches_target(key, target) || claimed_by_match(key, entry)
             })
             .map(|(k, e)| (k.clone(), e.clone()))
             .collect();
@@ -362,7 +362,7 @@ impl<'a> Ledgers<'a> {
             .redirect
             .into_iter()
             .flat_map(|r| r.records.iter())
-            .filter(|(key, rec)| patch_matches(key, &rec.uuid, identifier))
+            .filter(|(key, rec)| target.matches_patch(key, &rec.uuid))
             .map(|(key, _)| key.clone())
             .collect();
         Matches {
@@ -623,12 +623,12 @@ mod tests {
             vendor: Some(&v),
             redirect: Some(&r),
         };
-        let found = l.matching("pkg:npm/a@1");
+        let found = l.matching(&Target::parse("pkg:npm/a@1"));
         assert_eq!(found.manifest, vec!["pkg:npm/a@1"]);
         assert_eq!(found.vendor.len(), 1);
         assert_eq!(found.hosted, vec!["pkg:npm/a@1"]);
-        assert!(l.matching("nope").is_empty());
-        assert_eq!(l.matching("hb").hosted, vec!["pkg:npm/b@1"]);
+        assert!(l.matching(&Target::parse("nope")).is_empty());
+        assert_eq!(l.matching(&Target::parse("hb")).hosted, vec!["pkg:npm/b@1"]);
     }
 
     #[test]
@@ -679,7 +679,7 @@ mod tests {
             vendor: Some(&v),
             redirect: None,
         };
-        let found = l.matching("new");
+        let found = l.matching(&Target::parse("new"));
         assert_eq!(found.manifest, vec!["pkg:npm/a@1"]);
         let keys: Vec<&str> = found.vendor.iter().map(|(k, _)| k.as_str()).collect();
         assert_eq!(keys, vec!["pkg:npm/a@1"]);
@@ -688,8 +688,11 @@ mod tests {
             vendor: Some(&v),
             ..Default::default()
         };
-        assert!(ledger_only.matching("new").vendor.is_empty());
-        assert_eq!(ledger_only.matching("old").vendor.len(), 1);
+        assert!(ledger_only
+            .matching(&Target::parse("new"))
+            .vendor
+            .is_empty());
+        assert_eq!(ledger_only.matching(&Target::parse("old")).vendor.len(), 1);
     }
 
     fn pin(purl: &str, uuid: &str) -> HostedPin {
@@ -708,7 +711,7 @@ mod tests {
             pin("pkg:pypi/six@1.16.0", "hosted-six"),
         ];
         // By identifier alone.
-        let by_uuid = hosted_pins_matching(&pins, "hosted-c", &[]);
+        let by_uuid = hosted_pins_matching(&pins, &Target::parse("hosted-c"), &[]);
         assert_eq!(by_uuid, vec![pin("pkg:npm/c@1", "hosted-c")]);
         // A matched manifest key (another generation, qualifiers and all)
         // selects the pin wiring its release.
@@ -716,7 +719,7 @@ mod tests {
             "pkg:npm/a@1".to_string(),
             "pkg:pypi/six@1.16.0?artifact_id=x".to_string(),
         ];
-        let got = hosted_pins_matching(&pins, "agent-a", &keys);
+        let got = hosted_pins_matching(&pins, &Target::parse("agent-a"), &keys);
         assert_eq!(
             got,
             vec![
@@ -724,6 +727,6 @@ mod tests {
                 pin("pkg:pypi/six@1.16.0", "hosted-six")
             ]
         );
-        assert!(hosted_pins_matching(&pins, "nope", &[]).is_empty());
+        assert!(hosted_pins_matching(&pins, &Target::parse("nope"), &[]).is_empty());
     }
 }

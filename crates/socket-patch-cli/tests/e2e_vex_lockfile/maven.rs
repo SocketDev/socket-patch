@@ -41,6 +41,8 @@
 //! alive by a ledger under `--no-verify`, and agent-mode (`apply`) patches,
 //! which have no lockfile wiring to discover.
 
+use crate::common::binary;
+
 #[path = "../prebuilt_common/mod.rs"]
 mod prebuilt_common;
 
@@ -73,10 +75,6 @@ const GHSA: &str = "GHSA-mnd0-lock-vex0";
 const CVE: &str = "CVE-2026-7100";
 
 // ── process plumbing ─────────────────────────────────────────────────────
-
-fn binary() -> &'static str {
-    env!("CARGO_BIN_EXE_socket-patch")
-}
 
 /// The CLI with every ambient `SOCKET_*` variable scrubbed (explicit flags
 /// are the only source of truth), telemetry/config/token off, and the

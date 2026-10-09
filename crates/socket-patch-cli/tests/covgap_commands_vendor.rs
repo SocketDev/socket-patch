@@ -11,8 +11,11 @@
 //! the built binary with a scrubbed child environment (`run_cli` /
 //! `vendor_cli`). No test mutates this process's environment.
 
+#[path = "common/envelope.rs"]
+mod envelope;
 #[path = "prebuilt_common/mod.rs"]
 mod prebuilt_common;
+use envelope::{events, find_event};
 
 async fn vendor_run(mut args: VendorArgs) -> i32 {
     let server = prebuilt_common::Server::project(&args.common.cwd);
@@ -241,19 +244,6 @@ fn vendor_cli(cwd: &Path, extra: &[&str]) -> (i32, Value) {
         panic!("vendor --json must emit an envelope: {e}\nstdout:\n{stdout}\nstderr:\n{stderr}")
     });
     (code, env)
-}
-
-fn events(envelope: &Value) -> &Vec<Value> {
-    envelope["events"].as_array().expect("events array")
-}
-
-fn find_event<'a>(envelope: &'a Value, action: &str, error_code: Option<&str>) -> &'a Value {
-    events(envelope)
-        .iter()
-        .find(|e| e["action"] == action && error_code.is_none_or(|c| e["errorCode"] == c))
-        .unwrap_or_else(|| {
-            panic!("expected a `{action}` event (errorCode={error_code:?}) in:\n{envelope:#}")
-        })
 }
 
 /// A synthetic ledger with one entry of `eco` for [`PURL`], written via the
