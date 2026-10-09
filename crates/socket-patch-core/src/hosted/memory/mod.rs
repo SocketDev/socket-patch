@@ -1106,14 +1106,19 @@ async fn engine(
             .await,
         );
     }
-    let npm_sha1s: BTreeSet<(String, String)> = planned
+    let npm_classic: BTreeSet<(String, String)> = planned
         .iter()
-        .flat_map(|(_, p)| p.npm_sha1s.iter().cloned())
+        .flat_map(|(_, p)| p.npm_classic.iter().cloned())
         .collect();
-    let artifact_sha1s = if npm_sha1s.is_empty() {
+    let artifact_classic = if npm_classic.is_empty() {
         BTreeMap::new()
     } else {
-        discover::fetch_npm_sha1s(&provider, &npm_sha1s, options.limits.max_artifact_bytes).await
+        discover::fetch_classic_artifacts(
+            &provider,
+            &npm_classic,
+            options.limits.max_artifact_bytes,
+        )
+        .await
     };
     phases.mark("plan");
 
@@ -1130,7 +1135,7 @@ async fn engine(
         if stage.capped() {
             first_plans.insert(index, plan.clone());
         }
-        match stages::rewrite(plan, &artifact_metadata, &artifact_sha1s, stage_options).await {
+        match stages::rewrite(plan, &artifact_metadata, &artifact_classic, stage_options).await {
             Ok(done) => rewritten.push((index, done)),
             Err(RewriteRefused { refusal, skipped }) => {
                 states[index].skipped = skipped;
@@ -1217,7 +1222,8 @@ async fn engine(
                 .retain(|c| !root_deferred.contains(&c.dep.patch_uuid));
             plan.skipped
                 .extend(states[index].deferred.iter().map(deferred_skip));
-            match stages::rewrite(plan, &artifact_metadata, &artifact_sha1s, stage_options).await {
+            match stages::rewrite(plan, &artifact_metadata, &artifact_classic, stage_options).await
+            {
                 Ok(done) => again.push((index, done)),
                 Err(RewriteRefused { refusal, skipped }) => {
                     states[index].skipped = skipped;

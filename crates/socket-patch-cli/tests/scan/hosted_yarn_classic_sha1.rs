@@ -262,3 +262,70 @@ fn assert_skipped_untouched(root: &Path, server: &MockServer, doc: &Value, stder
         "no fragmentless hosted pin is written"
     );
 }
+
+/// #591: the served tarball's package.json adds a dependency yarn.lock
+/// doesn't lock. Yarn 1 installs only what the lock names, so a pin would
+/// install the patched package without it (and `vex` would attest it):
+/// the scan refuses the pin with an actionable warning and leaves the
+/// lock alone. The grant carries a sha1 here, so only the dependency
+/// check needs the tarball.
+#[tokio::test]
+async fn issue_591_served_dependency_the_lock_does_not_lock_is_refused() {
+    let server = MockServer::start().await;
+    let tarball = tgz(&[
+        (
+            "package/package.json",
+            br#"{"name":"left-pad","version":"1.3.0","dependencies":{"is-odd":"^3.0.0"}}"#,
+        ),
+        ("package/index.js", b"module.exports = require('is-odd');\n"),
+    ]);
+    mock_api_with_sha1(&server, &tarball).await;
+    let tmp = tempfile::tempdir().unwrap();
+    let root = tmp.path().join("proj");
+    write_classic_project(&root);
+
+    let (code, doc, stderr) = scan(&root, &server.uri());
+    assert_eq!(code, 0, "{doc:#}\n{stderr}");
+    assert_eq!(doc["redirect"]["redirected"], 0, "{doc:#}");
+    let warning = doc["redirect"]["warnings"]
+        .as_array()
+        .unwrap()
+        .iter()
+        .find(|w| w["code"] == "redirect_yarn_classic_dep_manifest_unlocked")
+        .unwrap_or_else(|| panic!("refusal warning: {doc:#}"));
+    let detail = warning["detail"].as_str().unwrap();
+    assert!(
+        detail.contains("is-odd@^3.0.0") && detail.contains("yarn add is-odd@^3.0.0"),
+        "{detail}"
+    );
+    assert_eq!(
+        std::fs::read_to_string(root.join("yarn.lock")).unwrap(),
+        LOCK,
+        "nothing is pinned with an incomplete dependency graph"
+    );
+}
+
+/// [`mock_api`] with a grant that carries the tarball's sha1 too.
+async fn mock_api_with_sha1(server: &MockServer, tarball: &[u8]) {
+    let artifact = format!("/patch/npm/left-pad/1.3.0/{TOKEN}/{UUID}/left-pad-1.3.0.tgz");
+    let url = format!("{}{artifact}", server.uri());
+    Mock::given(method("POST"))
+        .and(path(format!("/v0/orgs/{ORG}/patches/package")))
+        .respond_with(ResponseTemplate::new(200).set_body_json(json!({
+            "results": {
+                UUID: {
+                    "status": "granted",
+                    "url": url,
+                    "purl": PURL,
+                    "artifacts": [{
+                        "kind": "tarball", "url": url,
+                        "integrity": { "sha512": sha512_sri(tarball), "sha1": sha1_hex(tarball) }
+                    }],
+                    "registryOverride": null
+                }
+            }
+        })))
+        .mount(server)
+        .await;
+    mock_api(server, tarball, Some(tarball.to_vec())).await;
+}

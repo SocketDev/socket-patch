@@ -1108,14 +1108,18 @@ pub fn yarn_berry_manifest_targets<'a>(
         .collect()
 }
 
-/// The npm deps whose yarn classic pin needs the sha1 of the served
-/// tarball (#558): the grant carries a sha512 but no sha1, and the
-/// project's `yarn.lock` is a classic lock that names the package. Yarn 1
-/// keys its cache slot by the `resolved` URL's `#<sha1>` fragment, so the
-/// pin must carry one. One per distinct artifact URL.
-pub fn yarn_classic_sha1_targets<'a>(
+/// The npm deps whose yarn classic pin reads the served tarball, one per
+/// distinct artifact URL: the project's `yarn.lock` is a classic lock that
+/// names the package, the grant carries a sha512, and either the grant has
+/// no sha1 for the `resolved` fragment yarn 1 keys its cache slot on
+/// (#558), or the lock doesn't pin this artifact yet, so the tarball's own
+/// dependencies must be checked against the lock (#591).
+/// A lock the project's offline mirror refuses outright (`yarn_outer`: the
+/// mirror settings outside the project files) needs none.
+pub fn yarn_classic_artifact_targets<'a>(
     candidates: &'a [Candidate],
     files: &BTreeMap<String, String>,
+    yarn_outer: &OuterYarnMirror,
 ) -> Vec<&'a DepOverride> {
     let Some(lock) = files
         .get("yarn.lock")
@@ -1123,14 +1127,19 @@ pub fn yarn_classic_sha1_targets<'a>(
     else {
         return Vec::new();
     };
+    if crate::patch::redirect::yarn_classic_hosted_refused(files, yarn_outer) {
+        return Vec::new();
+    }
     let mut seen = BTreeSet::new();
     candidates
         .iter()
         .map(|c| &c.dep)
-        .filter(|dep| dep.ecosystem == "npm")
-        .filter(|dep| dep.integrity.sha1.is_none() && dep.integrity.sha512.is_some())
+        .filter(|dep| dep.ecosystem == "npm" && dep.integrity.sha512.is_some())
         .filter(|dep| {
             classic_locks_registry_copy(lock, &crate::patch::redirect::full_name(dep), &dep.version)
+        })
+        .filter(|dep| {
+            dep.integrity.sha1.is_none() || !lock.contains(&format!("\"{}#", dep.artifact_url))
         })
         .filter(|dep| seen.insert(dep.artifact_url.clone()))
         .collect()
@@ -1157,21 +1166,28 @@ fn classic_locks_registry_copy(lock: &str, name: &str, version: &str) -> bool {
     })
 }
 
-/// Record the sha1 derived from the served tarball at `url` on every
-/// candidate granted that artifact.
-pub fn set_derived_sha1(candidates: &mut [Candidate], url: &str, sha1: &str) {
+/// Record what the served tarball at `url` yielded: its sha1 on every
+/// candidate granted that artifact without one, and its manifest (keyed by
+/// URL) for the rewriter.
+pub fn record_classic_artifact(
+    candidates: &mut [Candidate],
+    manifests: &mut BTreeMap<String, String>,
+    url: &str,
+    artifact: &crate::hosted::npm_manifest::HostedClassicArtifact,
+) {
     for candidate in candidates
         .iter_mut()
         .filter(|c| c.dep.artifact_url == url && c.dep.integrity.sha1.is_none())
     {
-        candidate.dep.integrity.sha1 = Some(sha1.to_string());
+        candidate.dep.integrity.sha1 = Some(artifact.sha1.clone());
     }
+    manifests.insert(url.to_string(), artifact.manifest.clone());
 }
 
 /// The skip recorded for an npm dep whose served tarball could not be
-/// fetched or did not match its grant's sha512, so no sha1 could be
-/// derived for its yarn classic pin (the grant token in `detail` is
-/// redacted to `<hosted artifact>`).
+/// fetched, did not match its grant's sha512 or had no readable
+/// package.json, so its yarn classic pin could not be checked (the grant
+/// token in `detail` is redacted to `<hosted artifact>`).
 pub fn npm_tarball_unavailable(dep: &DepOverride, detail: &str) -> SkippedPatch {
     SkippedPatch {
         purl: format!(

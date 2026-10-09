@@ -2719,6 +2719,59 @@ fn write_yarn_classic_project(root: &Path, package_manager: Option<&str>) {
     .unwrap();
 }
 
+/// A granted reference whose tarball the mock serves (a yarn classic pin
+/// reads it, #558 / #591), with the grant's hashes matching it; returns its
+/// URL.
+async fn mock_served_classic_reference(server: &MockServer) -> String {
+    use base64::Engine as _;
+    use sha1::Digest as _;
+    let manifest = format!(r#"{{"name":"{NAME}","version":"{VERSION}"}}"#);
+    let mut builder = tar::Builder::new(flate2::write::GzEncoder::new(
+        Vec::new(),
+        flate2::Compression::default(),
+    ));
+    let mut header = tar::Header::new_gnu();
+    header.set_size(manifest.len() as u64);
+    header.set_mode(0o644);
+    header.set_cksum();
+    builder
+        .append_data(&mut header, "package/package.json", manifest.as_bytes())
+        .unwrap();
+    let tgz = builder.into_inner().unwrap().finish().unwrap();
+    let artifact = format!("/patch/npm/{NAME}/{VERSION}/22222222-2222-4222-8222-222222222222/{UUID}/{NAME}-{VERSION}.tgz");
+    let url = format!("{}{artifact}", server.uri());
+    mock_reference_results(
+        server,
+        json!({
+            UUID: {
+                "status": "granted",
+                "url": url,
+                "purl": PURL,
+                "artifacts": [{
+                    "kind": "tarball",
+                    "url": url,
+                    "integrity": {
+                        "sha512": format!(
+                            "sha512-{}",
+                            base64::engine::general_purpose::STANDARD
+                                .encode(sha2::Sha512::digest(&tgz))
+                        ),
+                        "sha1": hex::encode(sha1::Sha1::digest(&tgz)),
+                    }
+                }],
+                "registryOverride": null
+            }
+        }),
+    )
+    .await;
+    Mock::given(method("GET"))
+        .and(path(artifact))
+        .respond_with(ResponseTemplate::new(200).set_body_raw(tgz, "application/octet-stream"))
+        .mount(server)
+        .await;
+    url
+}
+
 /// #907: a hosted pin in a classic yarn.lock is dropped by the next yarn 2+
 /// (berry) install exactly like vendored wiring, so `scan --mode hosted`
 /// must warn `redirect_yarn_classic_berry_migration_risk` — on a dry run, on
@@ -2729,7 +2782,7 @@ async fn hosted_yarn_classic_pin_warns_berry_migration_risk() {
     for package_manager in [None, Some("yarn@4.18.1")] {
         let server = MockServer::start().await;
         mock_discovery(&server, PURL, UUID).await;
-        mock_granted_reference(&server, UUID, PURL, HOSTED_URL).await;
+        let hosted_url = mock_served_classic_reference(&server).await;
         mock_view(&server, UUID, PURL).await;
         let tmp = tempfile::tempdir().unwrap();
         write_yarn_classic_project(tmp.path(), package_manager);
@@ -2755,7 +2808,7 @@ async fn hosted_yarn_classic_pin_warns_berry_migration_risk() {
         }
         let lock = std::fs::read_to_string(tmp.path().join("yarn.lock")).unwrap();
         assert!(
-            lock.contains(HOSTED_URL),
+            lock.contains(&hosted_url),
             "the warning never blocks the pin: {lock}"
         );
     }
@@ -2768,7 +2821,7 @@ async fn hosted_yarn_classic_pin_warns_berry_migration_risk() {
 async fn hosted_yarn_classic_pin_with_yarn1_package_manager_stays_silent() {
     let server = MockServer::start().await;
     mock_discovery(&server, PURL, UUID).await;
-    mock_granted_reference(&server, UUID, PURL, HOSTED_URL).await;
+    let hosted_url = mock_served_classic_reference(&server).await;
     mock_view(&server, UUID, PURL).await;
     let tmp = tempfile::tempdir().unwrap();
     write_yarn_classic_project(tmp.path(), Some("yarn@1.22.22"));
@@ -2783,5 +2836,5 @@ async fn hosted_yarn_classic_pin_with_yarn1_package_manager_stays_silent() {
         "a yarn 1 pin suppresses the advisory: {codes:?}"
     );
     let lock = std::fs::read_to_string(tmp.path().join("yarn.lock")).unwrap();
-    assert!(lock.contains(HOSTED_URL), "{lock}");
+    assert!(lock.contains(&hosted_url), "{lock}");
 }
