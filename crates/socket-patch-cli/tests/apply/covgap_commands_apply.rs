@@ -3,7 +3,7 @@
 //! The uncovered surface of apply.rs is dominated by HUMAN-mode output —
 //! nearly every existing apply test passes `--json` and/or `--silent` — plus
 //! two never-fired go-drift variants, the whole Bun layout arm, the
-//! `--check --json` envelopes, and the mismatch-blob prefetch messages.
+//! `--check --json` envelopes.
 //! Themes:
 //!
 //!   1. `apply --check --json`: the in-sync success envelope and the
@@ -12,22 +12,18 @@
 //!      (hand-built `go.mod` fixtures — the other variants are covered);
 //!   3. `reconcile_local_go`'s human report (`Removed` / `Would remove`
 //!      N stale go patch redirect(s));
-//!   4. mismatch-blob prefetch messages: the `--offline` warning, the
-//!      transient "Downloading ..." status resolving to the "Downloaded N
-//!      full patched blob(s)" result line, and the broken-TMPDIR
-//!      transient-stage failure warning;
-//!   5. human-mode output block: "No patches to apply.", the no-matching-
+//!   4. human-mode output block: "No patches to apply.", the no-matching-
 //!      packages warning, the npm per-package failure line, the dry-run
 //!      "already patched" count, `--verbose` per-file labels, the
 //!      pnpm/bun/vlt layout notes, and the corrupt-manifest-under-PnP
 //!      fall-through;
-//!   6. gem fallback-home skip surfacing on human stderr;
-//!   7. apply-loop wiring: a vendored release-variant base with its
+//!   5. gem fallback-home skip surfacing on human stderr;
+//!   6. apply-loop wiring: a vendored release-variant base with its
 //!      installed tree PRESENT is skipped (not re-patched), and a qualified
 //!      singleton whose record holds only NEW files (no representative)
 //!      is treated as installed and applied; a ledger-only vendored
 //!      project with no manifest is the `noManifest` no-op;
-//!   8. the `apply --dry-run --vex` skip message.
+//!   7. the `apply --dry-run --vex` skip message.
 //!
 //! Binary-driven throughout (`common::run_with_env`, `SOCKET_*`-scrubbed
 //! children), hand-written camelCase manifests, git-sha256 oracle,
@@ -36,8 +32,6 @@
 use std::path::{Path, PathBuf};
 
 use serde_json::{json, Value};
-use wiremock::matchers::{method, path};
-use wiremock::{Mock, MockServer, ResponseTemplate};
 
 use crate::common;
 
@@ -125,35 +119,6 @@ fn install_gem(root: &Path, leaf: &str, file_rel: &str, contents: &[u8]) -> Path
     std::fs::create_dir_all(file.parent().unwrap()).expect("create gem dir");
     std::fs::write(&file, contents).expect("write gem file");
     file
-}
-
-/// Write a cached `.socket/diffs/<uuid>.tar.gz` whose mere existence makes
-/// the stage step conclude nothing needs downloading (default
-/// `--download-mode diff`) — its content is never consulted for a
-/// mismatched file, which can only take the full blob.
-fn write_diff_archive(root: &Path, uuid: &str) {
-    use std::io::Write as _;
-    let diffs = root.join(".socket").join("diffs");
-    std::fs::create_dir_all(&diffs).unwrap();
-    let mut builder = tar::Builder::new(flate2::write::GzEncoder::new(
-        std::fs::File::create(diffs.join(format!("{uuid}.tar.gz"))).unwrap(),
-        flate2::Compression::default(),
-    ));
-    let mut header = tar::Header::new_gnu();
-    let bytes = b"unrelated";
-    header.set_size(bytes.len() as u64);
-    header.set_mode(0o644);
-    header.set_cksum();
-    builder
-        .append_data(&mut header, "other.js", &bytes[..])
-        .unwrap();
-    builder
-        .into_inner()
-        .unwrap()
-        .finish()
-        .unwrap()
-        .flush()
-        .unwrap();
 }
 
 // ═══════════════════ 1. `--check --json` envelopes ═══════════════════
@@ -383,159 +348,12 @@ fn reconcile_dry_run_says_would_remove_and_touches_nothing() {
     );
 }
 
-// ═══════════ 4. mismatch-blob prefetch messages ═══════════
-
+// Shared fixture bytes for the sections below.
 const MM_BEFORE: &[u8] = b"pristine content\n";
 const MM_AFTER: &[u8] = b"patched content\n";
 const MM_LOCAL: &[u8] = b"locally modified content\n";
-const MM_UUID: &str = "62626262-6262-4262-8262-626262626262";
 
-/// npm package whose only patched file matches NEITHER hash, a cached diff
-/// archive (so staging succeeds with direct `.socket/` paths), and an
-/// EMPTY blobs dir — the shape that forces the on-demand afterHash-blob
-/// prefetch. Returns the drifted file's path.
-fn mismatch_prefetch_fixture(root: &Path, pkg: &str) -> PathBuf {
-    write_root_package_json(root);
-    let file = install_npm_pkg(root, pkg, "1.0.0", MM_LOCAL);
-    write_manifest(
-        root,
-        json!({
-            format!("pkg:npm/{pkg}@1.0.0"): patch_record(
-                MM_UUID,
-                json!({ "package/index.js": {
-                    "beforeHash": git_sha256(MM_BEFORE),
-                    "afterHash": git_sha256(MM_AFTER),
-                }}),
-            )
-        }),
-    );
-    write_diff_archive(root, MM_UUID);
-    // Fixture sanity: the on-disk bytes must match neither hash, or the
-    // mismatch-prefetch path under test is never taken.
-    assert_ne!(git_sha256(MM_LOCAL), git_sha256(MM_BEFORE));
-    assert_ne!(git_sha256(MM_LOCAL), git_sha256(MM_AFTER));
-    file
-}
-
-/// `--offline` + a mismatched file whose afterHash blob is not staged:
-/// human mode warns that the blob cannot be fetched, the file fails to
-/// apply (per-package failure line — the npm-branch human failure output),
-/// and the drifted bytes stay untouched.
-#[test]
-fn offline_mismatch_blob_gap_warns_and_fails_in_human_mode() {
-    let tmp = tempfile::tempdir().unwrap();
-    let file = mismatch_prefetch_fixture(tmp.path(), "mmoff");
-
-    let (code, _stdout, stderr) = run_apply(tmp.path(), &["--offline"], &[]);
-    assert_eq!(code, 1, "the blob-less mismatch must fail; stderr={stderr}");
-    assert!(
-        stderr.contains("the full patched blob, but --offline prevents fetching"),
-        "the offline prefetch warning must print; stderr={stderr}"
-    );
-    assert!(
-        stderr.contains("Failed to patch pkg:npm/mmoff@1.0.0"),
-        "the npm-branch human failure line must name the package; stderr={stderr}"
-    );
-    assert_eq!(
-        std::fs::read(&file).unwrap(),
-        MM_LOCAL,
-        "a failed apply must leave the drifted bytes untouched"
-    );
-}
-
-/// Online, human mode: the transient "Downloading ..." status resolves to
-/// the "Downloaded 1 full patched blob for mismatched files" result line, the blob is fetched from the
-/// API into a transient overlay (never `.socket/blobs/`), and the mismatch
-/// is warn-overwritten with the verified patched bytes.
-#[tokio::test]
-async fn online_mismatch_prefetch_prints_download_line_in_human_mode() {
-    let after_hash = git_sha256(MM_AFTER);
-    let mock = MockServer::start().await;
-    Mock::given(method("GET"))
-        .and(path(format!("/v0/orgs/test-org/patches/blob/{after_hash}")))
-        .respond_with(ResponseTemplate::new(200).set_body_bytes(MM_AFTER.to_vec()))
-        .mount(&mock)
-        .await;
-
-    let tmp = tempfile::tempdir().unwrap();
-    let file = mismatch_prefetch_fixture(tmp.path(), "mmnet");
-
-    let (code, _stdout, stderr) = run_apply(
-        tmp.path(),
-        &[],
-        &[
-            ("SOCKET_API_URL", &mock.uri()),
-            ("SOCKET_API_TOKEN", "fake-token-for-test"),
-            ("SOCKET_ORG_SLUG", "test-org"),
-        ],
-    );
-    assert_eq!(
-        code, 0,
-        "the default policy warn-overwrites the mismatch; stderr={stderr}"
-    );
-    assert!(
-        stderr.contains("Downloaded 1 full patched blob for mismatched files"),
-        "the human progress line must print before the prefetch; stderr={stderr}"
-    );
-    assert!(
-        stderr.contains("did not match the patch's expected original content"),
-        "the overwrite must be surfaced as the mismatch warning; stderr={stderr}"
-    );
-    assert_eq!(
-        std::fs::read(&file).unwrap(),
-        MM_AFTER,
-        "the mismatched file must carry the verified patched bytes"
-    );
-    // Apply stays read-only against the persistent cache.
-    let blobs: Vec<_> = std::fs::read_dir(tmp.path().join(".socket/blobs"))
-        .unwrap()
-        .collect();
-    assert!(
-        blobs.is_empty(),
-        "the on-demand blob must land in a transient overlay, never .socket/blobs/: {blobs:?}"
-    );
-}
-
-/// When the transient blob overlay cannot be staged (tempdir creation
-/// fails — TMPDIR points at a nonexistent dir), apply prints the
-/// diagnostic warning instead of failing silently, then the mismatched
-/// file fails to apply. Unix-only: TMPDIR drives `env::temp_dir()`.
-#[cfg(unix)]
-#[test]
-fn broken_tmpdir_surfaces_transient_blob_stage_warning() {
-    let tmp = tempfile::tempdir().unwrap();
-    let file = mismatch_prefetch_fixture(tmp.path(), "mmtmp");
-    let broken_tmpdir = tmp.path().join("no-such-tmpdir");
-    assert!(!broken_tmpdir.exists());
-
-    // Online (not --offline) so the run reaches writable_blobs(); the API
-    // URL is a dead loopback port, but the else-branch returns before any
-    // fetch is attempted.
-    let (code, _stdout, stderr) = run_apply(
-        tmp.path(),
-        &[],
-        &[
-            ("TMPDIR", broken_tmpdir.to_str().unwrap()),
-            ("SOCKET_API_URL", "http://127.0.0.1:1"),
-        ],
-    );
-    assert_eq!(code, 1, "the blob-less mismatch must fail; stderr={stderr}");
-    assert!(
-        stderr.contains("could not stage a transient blob directory"),
-        "the staging failure must be diagnosed, not silent; stderr={stderr}"
-    );
-    assert!(
-        stderr.contains("Failed to patch pkg:npm/mmtmp@1.0.0"),
-        "stderr={stderr}"
-    );
-    assert_eq!(
-        std::fs::read(&file).unwrap(),
-        MM_LOCAL,
-        "a failed apply must leave the drifted bytes untouched"
-    );
-}
-
-// ═══════════ 5. human-mode apply output block ═══════════
+// ═══════════ 4. human-mode apply output block ═══════════
 
 /// The empty-scope clean success prints "No patches to apply." — the
 /// postinstall-hook UX for fresh projects (json/silent suppress the line).
@@ -887,7 +705,7 @@ fn corrupt_manifest_under_pnp_layout_reports_manifest_error_not_refusal() {
     );
 }
 
-// ═══════════ 6. gem fallback-home skip on human stderr ═══════════
+// ═══════════ 5. gem fallback-home skip on human stderr ═══════════
 
 /// Unix-only: the fallback home comes from a fake `gem` binary on PATH
 /// (the `in_process_gem_fallback_home.rs` fixture shape, re-run in HUMAN
@@ -1027,7 +845,7 @@ mod gem_fallback_home_human {
     }
 }
 
-// ═══════════ 7. apply-loop wiring: vendored base skip + new-file-only variant ═══════════
+// ═══════════ 6. apply-loop wiring: vendored base skip + new-file-only variant ═══════════
 
 const GEM_BASE_PURL: &str = "pkg:gem/rack@3.1.0";
 const GEM_PRISTINE: &[u8] = b"module Rack\n  VERSION = '3.1.0'\nend\n";
@@ -1229,7 +1047,7 @@ fn qualified_singleton_with_only_new_files_is_attempted_and_applied() {
     );
 }
 
-// ═══════════ 8. dry-run --vex skip message ═══════════
+// ═══════════ 7. dry-run --vex skip message ═══════════
 
 /// `apply --dry-run --vex <path>` in human mode: nothing was applied, so
 /// VEX generation is skipped WITH the explanatory message, and no

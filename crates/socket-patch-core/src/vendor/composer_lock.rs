@@ -70,7 +70,9 @@ use super::state::{
     write_marker_or_warn, VendorArtifact, VendorEntry, VendorMarker, WiringAction, WiringRecord,
 };
 use super::{RevertOpts, RevertOutcome, VendorOutcome, VendorServiceConfig, VendorWarning};
-use crate::formats::composer::{composer_lock_packages, ComposerLockPackage};
+use crate::formats::composer::{
+    composer_lock_packages, ComposerLockPackage, ORIGIN_BOUND_ENTRY_KEYS,
+};
 
 mod lock_text;
 pub(super) mod mirror_filters;
@@ -732,13 +734,7 @@ pub(super) async fn composer_service_copy(
             format!("cannot move the extracted dist into place: {e}"),
         );
     }
-    warnings.push(VendorWarning::new(
-        "vendor_prebuilt_downloaded",
-        format!(
-            "vendored {pkg} from the patch service ({})",
-            archive.source_url
-        ),
-    ));
+    warnings.push(archive.downloaded_warning(pkg));
     ComposerServiceCopy::Used(())
 }
 
@@ -797,8 +793,7 @@ pub(crate) fn rewrite_lock_entry(
     let mut replaced_dist = false;
     for (k, v) in original {
         match k.as_str() {
-            "source" => {}
-            "transport-options" => {}
+            k if ORIGIN_BOUND_ENTRY_KEYS.contains(&k) => {}
             "dist" => {
                 out.insert("dist".to_string(), dist.clone());
                 out.insert("transport-options".to_string(), transport.clone());

@@ -26,7 +26,7 @@ fn binary() -> PathBuf {
 ///   * `SOCKET_MANIFEST_PATH` / `SOCKET_CWD` could point the binary at a
 ///     different manifest than the fixture each test writes, so the
 ///     manifest-not-found / override assertions would be meaningless;
-///   * `SOCKET_DOWNLOAD_ONLY` / `SOCKET_DOWNLOAD_MODE` / `SOCKET_DRY_RUN`
+///   * `SOCKET_DOWNLOAD_ONLY` / `SOCKET_DRY_RUN`
 ///     could flip the cleanup-vs-download branch out from under the test.
 ///
 /// Scrubbing is by prefix, not an explicit list: an explicit list drifts
@@ -463,11 +463,9 @@ fn repair_download_only_skips_cleanup() {
     // We can't use `run_repair` here because it injects `--offline`,
     // and `--offline` is mutually exclusive with `--download-only`
     // (offline = strict airgap, download-only = network-only). Invoke
-    // the binary directly. We pin `--download-mode file` so the
-    // already-present `afterHash` blob fully satisfies the download
-    // phase — there's nothing missing to fetch, so the test stays
-    // hermetic (no network). The default `diff` mode would instead look
-    // for `<uuid>.tar.gz`, which is absent, and try to hit the network.
+    // the binary directly. The already-present `afterHash` blob fully
+    // satisfies the download phase — there's nothing missing to fetch, so
+    // the test stays hermetic (no network).
     let tmp = tempfile::tempdir().expect("tempdir");
     let socket = make_socket_dir(tmp.path());
     write_blob(&socket, REFERENCED_HASH, b"patched content");
@@ -475,13 +473,7 @@ fn repair_download_only_skips_cleanup() {
     write_blob(&socket, &orphan_hash, b"orphaned content");
 
     let out = socket_cmd(tmp.path())
-        .args([
-            "repair",
-            "--json",
-            "--download-only",
-            "--download-mode",
-            "file",
-        ])
+        .args(["repair", "--json", "--download-only"])
         .output()
         .expect("run socket-patch");
     let code = out.status.code().unwrap_or(-1);
@@ -786,8 +778,6 @@ async fn repair_json_reports_unresolved_org_fallback_in_warnings() {
         .args([
             "repair",
             "--json",
-            "--download-mode",
-            "file",
             "--download-only",
             "--api-url",
             &mock.uri(),
@@ -863,13 +853,7 @@ async fn repair_online_downloads_missing_blob() {
     std::fs::write(socket.join("manifest.json"), manifest).unwrap();
 
     let out = socket_cmd(tmp.path())
-        .args([
-            "repair",
-            "--json",
-            "--download-mode",
-            "file",
-            "--download-only",
-        ])
+        .args(["repair", "--json", "--download-only"])
         .env("SOCKET_API_URL", mock.uri())
         .env("SOCKET_API_TOKEN", "fake-token-for-test")
         .env("SOCKET_ORG_SLUG", ORG_SLUG)
