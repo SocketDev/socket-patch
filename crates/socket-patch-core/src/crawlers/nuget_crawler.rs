@@ -5,6 +5,7 @@ use super::listing::{list_dir_sync, ListedEntry};
 use super::types::{CrawledPackage, CrawlerOptions};
 use crate::patch::path_safety;
 use crate::utils::fs::{is_dir, is_dir_sync, run_blocking};
+use crate::vendor::nuget_feed::normalize_nuget_version;
 
 #[cfg(test)]
 mod oracle;
@@ -147,25 +148,38 @@ fn find_by_purls_sync(pkg_path: &Path, purls: &[String]) -> HashMap<String, Craw
             continue;
         }
 
-        // Global cache layout: <lowercase-name>/<lowercase-version>/.
-        // NuGet lowercases BOTH the id and the version when it lays
-        // out the global packages folder, so a prerelease tag like
-        // `2.0.0-RC1` lives on disk as `2.0.0-rc1`. Lowercasing only
-        // the name (but not the version) would miss those packages.
-        let global_dir = pkg_path
-            .join(name.to_lowercase())
-            .join(version.to_lowercase());
+        // NuGet's package identity is the normalized version
+        // (`1.0.0.0` = `1.0.0` = `1.00.0`), the rule `PurlKey` and the
+        // vendored feed share.
+        let normalized = normalize_nuget_version(version);
+        // Global cache layout: <lowercase-name>/<normalized-version>/.
+        // NuGet lays out the global packages folder under the lowercased
+        // id and the lowercased normalized version, so a prerelease tag
+        // like `2.0.0-RC1` lives on disk as `2.0.0-rc1` and a 4-part
+        // `1.0.0.0` as `1.0.0`. The as-written spelling (lowercased) is
+        // tried after it, for a folder some other tool laid out verbatim.
+        let name_dir = pkg_path.join(name.to_lowercase());
+        let global_dirs = [
+            Some(name_dir.join(&normalized)),
+            (normalized != version.to_lowercase()).then(|| name_dir.join(version.to_lowercase())),
+        ];
         // Legacy layout: <Name>.<Version>/, tried exact-case first, then
-        // case-insensitively (NuGet names are case-insensitive).
+        // by identity (case-insensitive id, normalized version) over the
+        // root's listing: `packages.config` folders keep the version as
+        // the project wrote it, so `Foo.1.0.0.0/` holds `@1.0.0`.
         let legacy_dir = pkg_path.join(format!("{name}.{version}"));
 
-        let found = if verify_nuget_package(&global_dir) {
-            Some(global_dir)
+        let found = if let Some(dir) = global_dirs
+            .into_iter()
+            .flatten()
+            .find(|dir| verify_nuget_package(dir))
+        {
+            Some(dir)
         } else if verify_nuget_package(&legacy_dir) {
             Some(legacy_dir)
         } else {
             let names = super::listing::names_memoized(pkg_path, &mut root_names);
-            find_legacy_dir_case_insensitive(pkg_path, &names, name, version)
+            find_legacy_dir_by_identity(pkg_path, &names, name, &normalized)
         };
 
         if let Some(path) = found {
@@ -310,18 +324,18 @@ fn verify_nuget_package(path: &Path) -> bool {
     })
 }
 
-/// Find a legacy package directory with case-insensitive matching, over the
-/// package root's (lossy) entry names in readdir order.
-fn find_legacy_dir_case_insensitive(
+/// Find a legacy `<Id>.<Version>/` package directory for `name` at the
+/// normalized version `normalized` ([`normalize_nuget_version`]), over the
+/// package root's (lossy) entry names in readdir order: the id matches
+/// case-insensitively and the folder's version normalizes to `normalized`.
+fn find_legacy_dir_by_identity(
     pkg_path: &Path,
     root_names: &[String],
     name: &str,
-    version: &str,
+    normalized: &str,
 ) -> Option<PathBuf> {
-    let target = format!("{}.{}", name.to_lowercase(), version.to_lowercase());
-
     for dir_name_str in root_names {
-        if dir_name_str.to_lowercase() == target {
+        if legacy_dir_is(dir_name_str, name, normalized) {
             let path = pkg_path.join(dir_name_str);
             if verify_nuget_package(&path) {
                 return Some(path);
@@ -330,6 +344,20 @@ fn find_legacy_dir_case_insensitive(
     }
 
     None
+}
+
+/// Whether the legacy folder name `dir_name` is `<name>.<version>` for an
+/// id equal to `name` ignoring case and a version that normalizes to
+/// `normalized`. Every `.` is a candidate boundary, since both the id and
+/// the version may contain dots.
+fn legacy_dir_is(dir_name: &str, name: &str, normalized: &str) -> bool {
+    let name = name.to_lowercase();
+    dir_name.match_indices('.').any(|(i, _)| {
+        let version = &dir_name[i + 1..];
+        !version.is_empty()
+            && dir_name[..i].to_lowercase() == name
+            && normalize_nuget_version(version) == normalized
+    })
 }
 
 /// Get the NuGet global packages folder.
@@ -1339,7 +1367,119 @@ mod tests {
         assert!(result.contains_key("pkg:nuget/Contoso.Widgets@2.0.0-RC1"));
     }
 
-    /// Guard on `find_legacy_dir_case_insensitive`'s verification gate: a
+    /// NuGet identity (#1202): the global packages folder is laid out under
+    /// the normalized version, so a 4-part `@1.0.0.0` (the spelling a
+    /// `packages.config` project and its legacy folders carry) and a
+    /// zero-padded `@1.00.0` both resolve to `foo/1.0.0/`, through the same
+    /// `normalize_nuget_version` the vendored feed and lock match use.
+    #[tokio::test]
+    async fn test_find_by_purls_global_cache_normalizes_version() {
+        let dir = tempfile::tempdir().unwrap();
+        let pkg_dir = dir.path().join("foo").join("1.0.0");
+        tokio::fs::create_dir_all(pkg_dir.join("lib"))
+            .await
+            .unwrap();
+
+        let purls: Vec<String> = [
+            "pkg:nuget/Foo@1.0.0.0",
+            "pkg:nuget/Foo@1.00.0",
+            "pkg:nuget/Foo@1.0.0+build.7",
+        ]
+        .iter()
+        .map(|p| p.to_string())
+        .collect();
+        let result = NuGetCrawler::new()
+            .find_by_purls(dir.path(), &purls)
+            .await
+            .unwrap();
+        for purl in &purls {
+            let pkg = result
+                .get(purl)
+                .unwrap_or_else(|| panic!("{purl} not found: {result:?}"));
+            assert_eq!(pkg.path, pkg_dir);
+            assert_eq!(pkg.purl, *purl, "the row keeps the requested purl");
+        }
+        // A different release is still a different package.
+        let other = vec!["pkg:nuget/Foo@1.0.0.1".to_string()];
+        let result = NuGetCrawler::new()
+            .find_by_purls(dir.path(), &other)
+            .await
+            .unwrap();
+        assert!(result.is_empty(), "{result:?}");
+    }
+
+    /// A global-layout folder written under the as-written version (not
+    /// NuGet's own layout) is still found, after the normalized one.
+    #[tokio::test]
+    async fn test_find_by_purls_global_cache_as_written_version_still_found() {
+        let dir = tempfile::tempdir().unwrap();
+        let pkg_dir = dir.path().join("foo").join("1.0.0.0");
+        tokio::fs::create_dir_all(pkg_dir.join("lib"))
+            .await
+            .unwrap();
+
+        let purls = vec!["pkg:nuget/Foo@1.0.0.0".to_string()];
+        let result = NuGetCrawler::new()
+            .find_by_purls(dir.path(), &purls)
+            .await
+            .unwrap();
+        assert_eq!(result["pkg:nuget/Foo@1.0.0.0"].path, pkg_dir);
+    }
+
+    /// NuGet identity (#1202): a legacy `packages/<Id>.<Version>/` folder
+    /// keeps the version as `packages.config` spelled it, so
+    /// `Foo.1.0.0.0/` holds `@1.0.0` and `Foo.1.0.0/` holds `@1.0.0.0`.
+    #[tokio::test]
+    async fn test_find_by_purls_legacy_layout_normalizes_version() {
+        for (folder, purl) in [
+            ("Foo.1.0.0.0", "pkg:nuget/Foo@1.0.0"),
+            ("Foo.1.0.0", "pkg:nuget/Foo@1.0.0.0"),
+            ("foo.01.0.0", "pkg:nuget/FOO@1.0.0"),
+            ("Foo.2.0.0-RC1", "pkg:nuget/Foo@2.0.0.0-rc1"),
+        ] {
+            let dir = tempfile::tempdir().unwrap();
+            let pkg_dir = dir.path().join(folder);
+            tokio::fs::create_dir_all(pkg_dir.join("lib"))
+                .await
+                .unwrap();
+
+            let purls = vec![purl.to_string()];
+            let result = NuGetCrawler::new()
+                .find_by_purls(dir.path(), &purls)
+                .await
+                .unwrap();
+            assert_eq!(
+                result.get(purl).map(|p| &p.path),
+                Some(&pkg_dir),
+                "{folder} should hold {purl}"
+            );
+        }
+    }
+
+    /// The identity match splits `<Id>.<Version>` at every dot, but only an
+    /// id equal to the purl's and a version equal after normalization
+    /// match: `Foo.Bar.1.0.0` is not `Foo`, `Foo.1.0.0.1` is not `@1.0.0`.
+    #[test]
+    fn legacy_dir_is_matches_identity_only() {
+        assert!(legacy_dir_is("Foo.Bar.1.0.0.0", "foo.bar", "1.0.0"));
+        assert!(legacy_dir_is("Foo.Bar.1.0.0", "FOO.BAR", "1.0.0"));
+        assert!(!legacy_dir_is("Foo.Bar.1.0.0", "Foo", "1.0.0"));
+        assert!(!legacy_dir_is("Foo.1.0.0.1", "Foo", "1.0.0"));
+        assert!(!legacy_dir_is("Foo.1.0.0", "Fo", "1.0.0"));
+        assert!(!legacy_dir_is("Foo", "Foo", "1.0.0"));
+        assert!(
+            !legacy_dir_is("Foo.", "Foo", "0.0.0"),
+            "an empty version is no version"
+        );
+        // The as-written spelling still matches, whatever it is.
+        assert!(legacy_dir_is(
+            "Foo.latest",
+            "foo",
+            &normalize_nuget_version("LATEST")
+        ));
+    }
+
+    /// Guard on `find_legacy_dir_by_identity`'s verification gate: a
     /// directory whose NAME matches the legacy `<name>.<version>` target
     /// case-insensitively but whose contents do not verify as a NuGet
     /// package (no `lib/`, no `.nuspec`) must be skipped — the lookup
@@ -1850,15 +1990,15 @@ mod tests {
                 "hollow.1.0.0".to_string(),
             ];
             assert_eq!(
-                find_legacy_dir_case_insensitive(&root, &names, "NEWTONSOFT.JSON", "13.0.3"),
+                find_legacy_dir_by_identity(&root, &names, "NEWTONSOFT.JSON", "13.0.3"),
                 Some(root.join("newtonsoft.json.13.0.3"))
             );
             assert_eq!(
-                find_legacy_dir_case_insensitive(&root, &names, "Hollow", "1.0.0"),
+                find_legacy_dir_by_identity(&root, &names, "Hollow", "1.0.0"),
                 None
             );
             assert_eq!(
-                find_legacy_dir_case_insensitive(&root, &names, "Missing", "9.9.9"),
+                find_legacy_dir_by_identity(&root, &names, "Missing", "9.9.9"),
                 None
             );
 
