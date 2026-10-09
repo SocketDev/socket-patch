@@ -543,6 +543,88 @@ async fn rollback_after_dependency_removed_cleans_up_and_converges() {
     assert!(events(&env).is_empty(), "nothing left to revert: {env:#}");
 }
 
+/// What `npm install left-pad@1.3.1` leaves behind after vendoring 1.3.0:
+/// the same lock key, now resolving the new version from the registry.
+fn upgrade_vendored_left_pad(fx: &NpmFixture) -> Vec<u8> {
+    let mut lock = fx.lock_value();
+    lock["packages"]["node_modules/left-pad"] = json!({
+        "version": "1.3.1",
+        "resolved": "https://registry.npmjs.org/left-pad/-/left-pad-1.3.1.tgz",
+        "integrity": "sha512-upgraded=="
+    });
+    let mut upgraded = serde_json::to_vec_pretty(&lock).unwrap();
+    upgraded.push(b'\n');
+    std::fs::write(fx.lock_path(), &upgraded).unwrap();
+    upgraded
+}
+
+/// #1155: moving a vendored package off its patched version (`npm install
+/// left-pad@1.3.1`, a Dependabot bump) takes the vendored version out of
+/// the lock graph just like `npm uninstall`. `rollback` used to call that
+/// drift, keep the artifact and ledger entry and exit 1 on every run, so
+/// `vendor --check` stayed red. Now the first rollback cleans up, leaves
+/// the user's upgraded lock alone, and later runs are clean no-ops.
+#[tokio::test]
+async fn rollback_after_version_upgrade_cleans_up_and_converges() {
+    let fx = npm_fixture();
+    assert_eq!(vendor_run(vendor_args(fx.root())).await, 0);
+    let upgraded = upgrade_vendored_left_pad(&fx);
+
+    let cwd = fx.root().to_str().unwrap();
+    let (code, stdout, stderr) = run_cli(
+        fx.root(),
+        &["rollback", "--json", "--yes", "--offline", "--cwd", cwd],
+        &[],
+    );
+    assert_eq!(code, 0, "rollback must succeed:\n{stdout}\n{stderr}");
+    assert!(
+        !stdout.contains("vendor_artifact_kept") && !stdout.contains("drifted"),
+        "nothing is kept as drift:\n{stdout}"
+    );
+    assert!(
+        !fx.vendor_dir().exists(),
+        "the unreferenced artifact and ledger are cleaned up:\n{stdout}"
+    );
+    assert_eq!(fx.lock_bytes(), upgraded, "the user's lock is untouched");
+
+    let (code, env) = vendor_cli(fx.root(), &["--revert"]);
+    assert_eq!(code, 0, "{env:#}");
+    assert!(events(&env).is_empty(), "nothing left to revert: {env:#}");
+    let (code, env) = vendor_cli(fx.root(), &["--check"]);
+    assert_eq!(code, 0, "vendor --check is green again: {env:#}");
+}
+
+/// #1155, `remove` leg: it used to end on "drift-kept …; re-run `scan
+/// --mode vendored` to normalize, then remove again", a remedy that
+/// changes nothing. Now it reverts the entry and exits 0.
+#[tokio::test]
+async fn remove_after_version_upgrade_reverts_vendoring() {
+    let fx = npm_fixture();
+    assert_eq!(vendor_run(vendor_args(fx.root())).await, 0);
+    let upgraded = upgrade_vendored_left_pad(&fx);
+
+    let (code, stdout, stderr) = run_cli(
+        fx.root(),
+        &[
+            "remove",
+            PURL,
+            "--json",
+            "--offline",
+            "--yes",
+            "--cwd",
+            fx.root().to_str().unwrap(),
+        ],
+        &[],
+    );
+    assert_eq!(code, 0, "remove must succeed:\n{stdout}\n{stderr}");
+    let env: Value = serde_json::from_str(&stdout).unwrap();
+    let reverted = find_event(&env, "removed", Some("vendor_reverted"));
+    assert_eq!(reverted["purl"], PURL);
+    assert!(!stdout.contains("drift-kept"), "{env:#}");
+    assert!(!fx.vendor_dir().exists(), "vendor tree fully removed");
+    assert_eq!(fx.lock_bytes(), upgraded, "the user's lock is untouched");
+}
+
 // ─────────────────────────────────────────────────────────────────────
 // 5. revert works without a manifest
 // ─────────────────────────────────────────────────────────────────────
