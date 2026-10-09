@@ -874,6 +874,52 @@ mod tests {
         assert_eq!(e.version.as_deref(), Some(VERSION));
     }
 
+    /// #346: Go extracts module-cache files read-only (on Windows, the
+    /// read-only attribute). The copy must still be patchable — Windows'
+    /// rename refuses to replace a read-only destination — and the cache
+    /// itself must stay read-only and pristine.
+    #[tokio::test]
+    async fn test_apply_redirect_over_a_read_only_module_cache() {
+        let (dir, blobs, pristine, files, _after) = fixture().await;
+        let root = dir.path();
+        let set_readonly = |readonly: bool| {
+            for name in ["bar.go", "go.mod"] {
+                let path = pristine.join(name);
+                let mut perms = std::fs::metadata(&path).unwrap().permissions();
+                #[allow(clippy::permissions_set_readonly_false)]
+                perms.set_readonly(readonly);
+                std::fs::set_permissions(&path, perms).unwrap();
+            }
+        };
+        set_readonly(true);
+        let sources = PatchSources::blobs_only(&blobs);
+
+        for base in [GO_PATCHES_DIR, ".socket/vendor/golang/u"] {
+            let result = apply_go_redirect(
+                PURL,
+                MODULE,
+                VERSION,
+                &pristine,
+                root,
+                base,
+                &files,
+                &sources,
+                false,
+                MismatchPolicy::Warn,
+            )
+            .await;
+            assert!(result.success, "{base}: apply failed: {:?}", result.error);
+            let copy = root.join(base).join("github.com/foo/bar@v1.4.2");
+            assert_eq!(std::fs::read(copy.join("bar.go")).unwrap(), PATCHED);
+        }
+        assert_eq!(std::fs::read(pristine.join("bar.go")).unwrap(), PRISTINE);
+        assert!(std::fs::metadata(pristine.join("bar.go"))
+            .unwrap()
+            .permissions()
+            .readonly());
+        set_readonly(false);
+    }
+
     #[tokio::test]
     async fn test_apply_is_idempotent_byte_for_byte() {
         let (dir, blobs, pristine, files, _after) = fixture().await;
