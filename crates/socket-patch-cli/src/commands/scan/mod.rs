@@ -102,6 +102,53 @@ const BATCH_BODY_BYTE_CAP: usize = 256 * 1024;
 /// authenticated API and [`DEFAULT_PROXY_BATCH_SIZE`] on the public proxy.
 /// Floored at 1: `--batch-size 0` is otherwise unvalidated and would make
 /// the chunking below panic, so it degrades to one-package batches.
+/// `purls` plus, for each lockfile-only PyPI purl among them, its other
+/// PEP 440 spellings of the same release (#604), deduplicated in order.
+fn with_pypi_equivalents(purls: &[String], lockfile_only: &HashSet<PurlKey>) -> Vec<String> {
+    let mut out = purls.to_vec();
+    let mut seen: HashSet<PurlKey> = purls.iter().map(|p| PurlKey::new(p)).collect();
+    for purl in purls {
+        if !lockfile_only_contains(lockfile_only, purl) {
+            continue;
+        }
+        for spelling in socket_patch_core::utils::purl_key::pypi_equivalent_purls(purl) {
+            if seen.insert(PurlKey::new(&spelling)) {
+                out.push(spelling);
+            }
+        }
+    }
+    out
+}
+
+/// Mark each API purl that names a lockfile-only PyPI pin under another
+/// PEP 440 spelling (`@1.16.0` for a lock's `@1.16`, #604) as lockfile-only
+/// too, so the `notInstalled` flag, the `[NOT INSTALLED]` marker and the
+/// vendored baseline pre-check treat it as the package it is. A spelling an
+/// installed copy already carries is left alone.
+fn adopt_pypi_equivalents(
+    packages: &[BatchPackagePatches],
+    scanned: &[String],
+    lockfile_only: &mut HashSet<PurlKey>,
+) {
+    let scanned_keys: HashSet<PurlKey> = scanned.iter().map(|p| PurlKey::new(p)).collect();
+    let lock_only_pypi: Vec<&String> = scanned
+        .iter()
+        .filter(|p| p.starts_with("pkg:pypi/") && lockfile_only_contains(lockfile_only, p))
+        .collect();
+    for pkg in packages {
+        let key = PurlKey::new(&pkg.purl);
+        if scanned_keys.contains(&key) {
+            continue;
+        }
+        if lock_only_pypi
+            .iter()
+            .any(|lock| socket_patch_core::utils::purl_key::pypi_same_release(lock, &pkg.purl))
+        {
+            lockfile_only.insert(key);
+        }
+    }
+}
+
 fn effective_batch_size(requested: Option<usize>, use_public_proxy: bool) -> usize {
     requested
         .unwrap_or(if use_public_proxy {
@@ -1829,7 +1876,10 @@ async fn run_scan(
     // that have NO installed copy (fresh clone, partial install). They join
     // discovery and are flagged "not yet installed". Scoped to the crawled
     // ecosystems.
-    let lockfile_only = lockfile_supplement(&ctx, &all_crawled, crawl_scope).await;
+    let mut lockfile_only = lockfile_supplement(&ctx, &all_crawled, crawl_scope).await;
+    // Counted once: #604 adds the API's spellings of lockfile-only PyPI pins
+    // to `lockfile_only.purls` after the batch query.
+    let lockfile_only_count = lockfile_only.purls.len();
     // Unsupported layouts and malformed binary Bun locks, kept on empty
     // scans too: an unreadable graph is not evidence of no dependencies.
     let mut layout_refusals = unsupported_layout_warnings(&lockfile_only.unsupported);
@@ -2266,8 +2316,8 @@ async fn run_scan(
         plural(package_count, "package", "packages")
     ));
     if human {
-        if !lockfile_only.purls.is_empty() {
-            eprintln!("{}", render::lockfile_only_note(lockfile_only.purls.len()));
+        if lockfile_only_count > 0 {
+            eprintln!("{}", render::lockfile_only_note(lockfile_only_count));
         }
         print_layout_refusals(&layout_refusals, args.common.silent);
         policy.print_warnings(args.common.silent);
@@ -2276,7 +2326,12 @@ async fn run_scan(
     // Query API in batches
     let mut all_packages_with_patches: Vec<BatchPackagePatches> = Vec::new();
     let mut can_access_paid_patches = false;
-    let chunks: Vec<&[String]> = batch_chunks(&all_purls, batch_size, BATCH_BODY_BYTE_CAP);
+    // #604: a lockfile-only PyPI pin is spelled as the user wrote it
+    // (`six==1.16` → `@1.16`) while the API keys the release as the
+    // registry published it (`@1.16.0`); pip treats both as one release
+    // (PEP 440). Ask for its equivalent spellings too.
+    let query_purls = with_pypi_equivalents(&all_purls, &lockfile_only.purls);
+    let chunks: Vec<&[String]> = batch_chunks(&query_purls, batch_size, BATCH_BODY_BYTE_CAP);
     let total_batches = chunks.len();
     let mut batch_error_count = 0usize;
     let mut last_batch_error: Option<String> = None;
@@ -2387,6 +2442,13 @@ async fn run_scan(
     // drives the table, the `--json` `packages` array and the apply order,
     // which operators diff across runs.
     all_packages_with_patches.sort_by(|a, b| a.purl.cmp(&b.purl));
+    // #604: a patch the API returned under an equivalent spelling of a
+    // lockfile-only PyPI pin is that lockfile-only package.
+    adopt_pypi_equivalents(
+        &all_packages_with_patches,
+        &all_purls,
+        &mut lockfile_only.purls,
+    );
 
     // If every batch errored, surface a full scan failure rather than
     // silently reporting zero patches.
@@ -2401,7 +2463,7 @@ async fn run_scan(
                 "status": "error",
                 "error": { "code": API_BATCH_FAILED, "message": err },
                 "scannedPackages": package_count,
-                "lockfileOnlyPackages": lockfile_only.purls.len(),
+                "lockfileOnlyPackages": lockfile_only_count,
                 "packagesWithPatches": 0,
                 "totalPatches": 0,
                 "freePatches": 0,
@@ -2481,7 +2543,7 @@ async fn run_scan(
         let mut result = serde_json::json!({
             "status": "success",
             "scannedPackages": package_count,
-            "lockfileOnlyPackages": lockfile_only.purls.len(),
+            "lockfileOnlyPackages": lockfile_only_count,
             "packagesWithPatches": all_packages_with_patches.len(),
             "totalPatches": total_patches,
             "freePatches": free_patches,
