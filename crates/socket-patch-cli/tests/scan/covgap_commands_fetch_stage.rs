@@ -153,25 +153,22 @@ fn apply_offline_nonquiet_lists_capped_missing_purls_and_repair_hint() {
 }
 
 // ---------------------------------------------------------------------------
-// Non-quiet online staging: download announcement + diff→blob fallback.
+// Non-quiet online staging: cold-cache blob download.
 // ---------------------------------------------------------------------------
 
-/// A human-mode (no `--json`/`--silent`) online apply in the default
-/// `diff` download mode, where the server has no diff archive but serves
-/// the per-file blob: the download and fallback progress are transient
-/// status lines (nothing permanent on a non-terminal stderr), the diff
-/// archive's 404 is not reported (the blobs cover it), and only the
-/// "Downloaded 1 blob" result line persists before the apply. `.socket/`
-/// stays untouched (downloads land in the overlay tempdir).
+/// A human-mode (no `--json`/`--silent`) online apply with a cold cache:
+/// the download progress is a transient status line (nothing permanent on
+/// a non-terminal stderr), only the "Downloaded 1 blob" result line
+/// persists before the apply, and no request ever goes to a diff archive
+/// route (v5 fetches per-file blobs only). `.socket/` stays untouched
+/// (downloads land in the overlay tempdir).
 #[tokio::test]
-async fn apply_online_nonquiet_prints_download_progress_and_diff_fallback() {
+async fn apply_online_nonquiet_cold_cache_fetches_only_blobs() {
     let before_hash = git_sha256(BEFORE);
     let after_hash = git_sha256(AFTER);
 
     let mock = MockServer::start().await;
-    // Only the per-file blob endpoint is mounted; the diff/package archive
-    // endpoints 404 (wiremock's default for unmounted routes), so the
-    // default diff-mode fetch fails and the blob fallback closes the gap.
+    // Only the per-file blob endpoint is mounted.
     Mock::given(method("GET"))
         .and(path(format!(
             "/v0/orgs/{ORG_SLUG}/patches/blob/{after_hash}"
@@ -211,7 +208,7 @@ async fn apply_online_nonquiet_prints_download_progress_and_diff_fallback() {
                         }
                     },
                     "vulnerabilities": {},
-                    "description": "diff fallback target",
+                    "description": "cold cache target",
                     "license": "MIT",
                     "tier": "free",
                 }
@@ -239,25 +236,33 @@ async fn apply_online_nonquiet_prints_download_progress_and_diff_fallback() {
     // on a non-terminal stderr); its result lines stay, on stderr (stdout
     // is for results).
     assert!(
-        !stderr.contains("Downloading missing patch artifacts")
-            && !stderr.contains("unavailable; fetching"),
+        !stderr.contains("Downloading missing patch artifacts"),
         "progress is transient, never a permanent line; stderr={stderr}"
     );
     assert!(
-        !stderr.contains("Failed to download") && !stderr.contains("Diff archive not found"),
-        "a missing diff archive the blob fallback covers is not reported as a failure; \
-         stderr={stderr}"
+        !stderr.contains("Failed to download"),
+        "the blob download succeeded; stderr={stderr}"
     );
     assert!(
         stderr.contains("Downloaded 1 blob"),
-        "the fallback's own result line is printed; stderr={stderr}"
+        "the blob download's result line is printed; stderr={stderr}"
     );
+    let requests = mock.received_requests().await.unwrap();
+    assert!(
+        requests.iter().all(|r| !r.url.path().contains("/diff")),
+        "a cold-cache apply must never request a diff archive; got {:?}",
+        requests
+            .iter()
+            .map(|r| r.url.path().to_string())
+            .collect::<Vec<_>>()
+    );
+    assert!(!socket.join("diffs").exists());
     assert!(
         !stdout.contains("Downloading") && !stdout.contains("Downloaded"),
         "no progress on stdout; stdout={stdout}"
     );
 
-    // The fallback actually applied the patch…
+    // The download actually applied the patch…
     assert_eq!(
         std::fs::read(pkg.join("index.js")).unwrap(),
         AFTER,

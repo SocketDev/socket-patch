@@ -405,11 +405,11 @@ pub enum PatchAction {
 
 /// Patch-source strategy used to apply a file. Mirrors the existing
 /// `socket_patch_core::patch::apply::AppliedVia` enum, but lives here so
-/// the JSON layer doesn't depend on core internals.
+/// the JSON layer doesn't depend on core internals. `blob` is the only
+/// value since v5 removed the diff download path.
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize)]
 #[serde(rename_all = "camelCase")]
 pub enum AppliedVia {
-    Diff,
     Blob,
 }
 
@@ -417,7 +417,6 @@ impl AppliedVia {
     pub fn from_core(via: socket_patch_core::patch::apply::AppliedVia) -> Self {
         use socket_patch_core::patch::apply::AppliedVia as Core;
         match via {
-            Core::Diff => AppliedVia::Diff,
             Core::Blob => AppliedVia::Blob,
         }
     }
@@ -451,12 +450,6 @@ pub enum Status {
     /// there's nothing to apply. Distinct from `Success` because some
     /// consumers want to early-exit on this state.
     NoManifest,
-    /// Reserved: the requested patch requires a paid plan but the caller's
-    /// API token isn't entitled. Nothing emits it yet (`get` reports this
-    /// via its legacy `status: "paid_required"` shape; scan never does).
-    /// Distinct from `Error` so PR bots can post a "upgrade your plan"
-    /// comment instead of failing.
-    PaidRequired,
     /// `remove` / `rollback`: the patch identifier didn't resolve to
     /// anything in the local manifest.
     NotFound,
@@ -984,7 +977,7 @@ mod tests {
                 PatchEventFile {
                     path: "package/index.js".into(),
                     verified: true,
-                    applied_via: Some(AppliedVia::Diff),
+                    applied_via: Some(AppliedVia::Blob),
                 },
                 PatchEventFile {
                     path: "package/lib/util.js".into(),
@@ -998,7 +991,7 @@ mod tests {
         assert_eq!(files.len(), 2);
         assert_eq!(files[0]["path"], "package/index.js");
         assert_eq!(files[0]["verified"], true);
-        assert_eq!(files[0]["appliedVia"], "diff");
+        assert_eq!(files[0]["appliedVia"], "blob");
         assert_eq!(files[1]["appliedVia"], "blob");
     }
 
@@ -1193,7 +1186,6 @@ mod tests {
         // codes on these strings.
         for (status, tag) in [
             (Status::NoManifest, "noManifest"),
-            (Status::PaidRequired, "paidRequired"),
             (Status::NotFound, "notFound"),
         ] {
             let mut env = Envelope::new(Command::Remove);
@@ -1288,10 +1280,10 @@ mod tests {
         // ("Exit 1 when status is partialFailure (any events[*].action ==
         // \"failed\")"). `record` enforces that by escalating every
         // non-Error status — including the success-like specials
-        // (`notFound`, `noManifest`, `paidRequired`) — to PartialFailure.
+        // (`notFound`, `noManifest`) — to PartialFailure.
         // Only a hard `Error` outranks it. Pin that so the auto-escalation
         // can't regress to leaving a `failed` event under an exit-0 status.
-        for start in [Status::NotFound, Status::NoManifest, Status::PaidRequired] {
+        for start in [Status::NotFound, Status::NoManifest] {
             let mut env = Envelope::new(Command::Remove);
             env.status = start;
             env.record(

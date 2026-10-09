@@ -217,7 +217,7 @@ class HostedShards(unittest.TestCase):
     def test_catch_all_skips_exactly_the_other_legs_words(self):
         for line, filters in self.rows_by_line().items():
             with self.subTest(gradle=line):
-                catch_all = [f for f in filters if "gradle_hosted_" in f]
+                catch_all = [f for f in filters if "--skip" in f]
                 self.assertEqual(len(catch_all), 1)
                 skips = {w for a, w in zip(catch_all[0], catch_all[0][1:]) if a == "--skip"}
                 named = {w for f in filters if f is not catch_all[0]

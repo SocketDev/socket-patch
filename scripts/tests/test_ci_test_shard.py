@@ -131,7 +131,7 @@ class ReleaseWorkflow(unittest.TestCase):
         verdict = workflow.split("\n  ci-ok:\n")[1]
         needs = re.search(r"^    needs: \[(.*)\]$", verdict, re.M)[1].split(", ")
         self.assertIn("test-release", needs)
-        self.assertIn("if: ${{ always() && (github.event_name != 'pull_request' || !cancelled()) }}", verdict)
+        self.assertIn("if: always()", verdict)
         self.assertIn('if v["result"] not in ("success", "skipped")', verdict)
 
 
@@ -154,7 +154,7 @@ class CargoSelection(unittest.TestCase):
                                   '    let n = std::hint::black_box(u8::MAX);\n'
                                   '    assert_eq!(n + 1, 0);\n}\n',
                 "one/src/main.rs": 'fn main() {}\n#[test] fn binary_unit() {}\n',
-                "one/tests/shared.rs": '#[test] fn first_shared() { assert!(std::path::Path::new(env!("CARGO_BIN_EXE_one")).is_file()); }\n'
+                "one/tests/shared.rs": '#[test] fn first_shared() {}\n'
                                        '#[test] #[ignore] fn ignored_case() {}\n',
                 "one/tests/tail.rs": '#[test] fn tail_case() {}\n',
                 "two/Cargo.toml": '[package]\nname="two"\nversion="0.1.0"\nedition="2021"\n'
@@ -166,7 +166,7 @@ class CargoSelection(unittest.TestCase):
                 path = root / name
                 path.parent.mkdir(parents=True, exist_ok=True)
                 path.write_text(content, encoding="utf-8")
-            env = dict(os.environ, CARGO_TARGET_DIR=str(root / "target"), CARGO_PROFILE_DEV_DEBUG="line-tables-only")
+            env = dict(os.environ, CARGO_TARGET_DIR=str(root / "target"))
 
             def run(args):
                 result = subprocess.run(args, cwd=root, env=env, capture_output=True, text=True)

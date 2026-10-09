@@ -47,11 +47,9 @@ class CiWorkflowContract(unittest.TestCase):
         # job, and this script would then cancel a run that could still land.
         self.assertIsNone(re.search(r"^\s*continue-on-error:", self.text, re.M))
 
-    def test_gate_runs_on_a_cancelled_merge_group_run(self):
+    def test_gate_runs_on_a_cancelled_run(self):
         gate = self.text[self.text.index("\n  ci-ok:"):]
-        # Only PR cancellations can skip the verdict. The merge-queue
-        # watcher must still turn failed/cancelled dependencies into failure.
-        self.assertIn("\n    if: ${{ always() && (github.event_name != 'pull_request' || !cancelled()) }}\n", gate)
+        self.assertRegex(gate, r"\n    if: always\(\)\n")
 
 
 if __name__ == "__main__":

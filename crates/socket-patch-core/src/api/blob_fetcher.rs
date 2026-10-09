@@ -5,44 +5,6 @@ use crate::api::client::{ApiClient, ApiError, BinaryBody};
 use crate::hash::git_sha256::{compute_git_sha256_from_bytes, compute_git_sha256_from_reader};
 use crate::manifest::operations::get_after_hash_blobs;
 use crate::manifest::schema::PatchManifest;
-use crate::patch::apply::PatchSources;
-
-/// Selects which kind of patch artifact `fetch_missing_sources` downloads.
-///
-/// * `File` — per-file blobs (legacy, largest, always applicable).
-/// * `Diff` — per-patch tar.gz of bsdiff deltas (smallest, only useful
-///   when the original file is on disk).
-#[derive(Debug, Clone, Copy, PartialEq, Eq)]
-pub enum DownloadMode {
-    Diff,
-    File,
-}
-
-impl DownloadMode {
-    /// Short lowercase tag, suitable for JSON output and `--download-mode`
-    /// flag values.
-    pub fn as_tag(&self) -> &'static str {
-        match self {
-            DownloadMode::Diff => "diff",
-            DownloadMode::File => "file",
-        }
-    }
-
-    /// Parse `--download-mode` flag values.
-    pub fn parse(s: &str) -> Result<Self, String> {
-        match s.to_ascii_lowercase().as_str() {
-            "diff" => Ok(DownloadMode::Diff),
-            // Removed: no deployed server ever served its GET archive route,
-            // so every fetch failed and fell back to per-file blobs.
-            "package" => Err("download mode 'package' was removed; use diff or file".to_string()),
-            "file" | "blob" => Ok(DownloadMode::File),
-            other => Err(format!(
-                "unknown download mode '{}'. Expected diff or file.",
-                other
-            )),
-        }
-    }
-}
 
 /// Result of fetching a single blob.
 #[derive(Debug, Clone)]
@@ -117,7 +79,7 @@ pub async fn fetch_missing_blobs(
     // (`stream_cache_entry_atomic`), never up front: a fetch that lands
     // nothing leaves no `.socket/blobs/` husk behind.
     let hashes: Vec<String> = missing.into_iter().collect();
-    download_entries(&hashes, blobs_path, client, on_progress, Entry::Blob).await
+    download_entries(&hashes, blobs_path, client, on_progress).await
 }
 
 /// Download specific blobs identified by their hashes.
@@ -167,8 +129,7 @@ pub async fn fetch_blobs_by_hash(
         };
     }
 
-    let download_result =
-        download_entries(&to_download, blobs_path, client, on_progress, Entry::Blob).await;
+    let download_result = download_entries(&to_download, blobs_path, client, on_progress).await;
     results.extend(download_result.results);
 
     FetchMissingBlobsResult {
@@ -178,70 +139,6 @@ pub async fn fetch_blobs_by_hash(
         skipped,
         results,
     }
-}
-
-/// Return the set of patch UUIDs whose archive at
-/// `<archives_dir>/<uuid>.tar.gz` is missing from disk. Used as the
-/// "what do I need to download" query for diff mode.
-pub async fn get_missing_archives(
-    manifest: &PatchManifest,
-    archives_dir: &Path,
-) -> HashSet<String> {
-    let mut missing = HashSet::new();
-    for record in manifest.patches.values() {
-        let archive_path = archives_dir.join(format!("{}.tar.gz", record.uuid));
-        if tokio::fs::metadata(&archive_path).await.is_err() {
-            missing.insert(record.uuid.clone());
-        }
-    }
-    missing
-}
-
-/// Download all missing archives for the chosen [`DownloadMode`].
-///
-/// * [`DownloadMode::File`] delegates to [`fetch_missing_blobs`].
-/// * [`DownloadMode::Diff`] downloads each missing `<uuid>.tar.gz` into
-///   `sources.diffs_path` via [`ApiClient::fetch_diff`].
-///
-/// Returns a [`FetchMissingBlobsResult`] in which each `BlobFetchResult`'s
-/// `hash` field carries the patch UUID (not a blob hash) for diff mode. A
-/// `sources.diffs_path` of `None` while requesting diff mode yields an
-/// immediate empty result — the caller is expected to fall back to a
-/// different mode in that case.
-pub async fn fetch_missing_sources(
-    manifest: &PatchManifest,
-    sources: &PatchSources<'_>,
-    mode: DownloadMode,
-    client: &ApiClient,
-    on_progress: Option<&OnProgress>,
-) -> FetchMissingBlobsResult {
-    let dir = match mode {
-        DownloadMode::File => {
-            return fetch_missing_blobs(manifest, sources.blobs_path, client, on_progress).await
-        }
-        DownloadMode::Diff => sources.diffs_path,
-    };
-    match dir {
-        Some(dir) => fetch_missing_diff_archives(manifest, dir, client, on_progress).await,
-        None => FetchMissingBlobsResult::default(),
-    }
-}
-
-async fn fetch_missing_diff_archives(
-    manifest: &PatchManifest,
-    archives_dir: &Path,
-    client: &ApiClient,
-    on_progress: Option<&OnProgress>,
-) -> FetchMissingBlobsResult {
-    let missing = get_missing_archives(manifest, archives_dir).await;
-    if missing.is_empty() {
-        return FetchMissingBlobsResult::default();
-    }
-
-    // `archives_dir` is created by the first successful write, never up
-    // front (see `fetch_missing_blobs`).
-    let uuids: Vec<String> = missing.into_iter().collect();
-    download_entries(&uuids, archives_dir, client, on_progress, Entry::Diff).await
 }
 
 /// What kind of artifact a fetch or cleanup result counts, for human
@@ -282,7 +179,9 @@ pub const BLOB: ArtifactNoun = ArtifactNoun {
     abbreviate_ids: true,
 };
 
-/// Per-patch diff archives (`.socket/diffs/<uuid>.tar.gz`).
+/// Legacy per-patch diff archives (`.socket/diffs/<uuid>.tar.gz`). v5
+/// removed the diff download path, so nothing writes or reads them any
+/// more; only the cleanup sweeps name them.
 pub const DIFF_ARCHIVE: ArtifactNoun = ArtifactNoun {
     one: "diff archive",
     many: "diff archives",
@@ -296,16 +195,6 @@ pub const PACKAGE_ARCHIVE: ArtifactNoun = ArtifactNoun {
     many: "package archives",
     abbreviate_ids: false,
 };
-
-impl DownloadMode {
-    /// The artifact noun a download in this mode fetches.
-    pub fn noun(&self) -> ArtifactNoun {
-        match self {
-            DownloadMode::Diff => DIFF_ARCHIVE,
-            DownloadMode::File => BLOB,
-        }
-    }
-}
 
 /// How many failures a fetch result lists before "... and N more".
 const MAX_LISTED_FAILURES: usize = 5;
@@ -375,7 +264,7 @@ pub fn format_fetch_failures(result: &FetchMissingBlobsResult, noun: ArtifactNou
 }
 
 /// Drop the id the client's error repeats: the line already starts with
-/// it, so `Network error fetching diff <uuid>: <cause>` reads as
+/// it, so `Network error fetching blob <hash>: <cause>` reads as
 /// `network error: <cause>`. Anything else is returned unchanged.
 fn concise_fetch_error<'a>(err: &'a str, id: &str) -> std::borrow::Cow<'a, str> {
     if let Some(rest) = err.strip_prefix("Network error fetching ") {
@@ -473,11 +362,11 @@ fn guard_cache_entry(dest: &Path) -> std::io::Result<()> {
 /// never held in memory whole (#571).
 ///
 /// The destinations here are *content-addressed* cache entries —
-/// `blobs/<hash>` and `archives/<uuid>.tar.gz`. A plain `tokio::fs::write`
+/// `blobs/<hash>`. A plain `tokio::fs::write`
 /// truncates-then-writes in place, so an interrupted write (ENOSPC, crash,
 /// killed process) can leave a partial file at the final path. Because the
-/// "is it already downloaded?" check ([`get_missing_blobs`] /
-/// [`get_missing_archives`]) only tests for presence, such a truncated file
+/// "is it already downloaded?" check ([`get_missing_blobs`]) only tests
+/// for presence, such a truncated file
 /// is then trusted forever — its content no longer hashes to its name, yet
 /// it is never re-downloaded. Staging in the same directory and renaming
 /// makes the final path always either the complete bytes or absent, never a
@@ -500,7 +389,7 @@ async fn stream_cache_entry_atomic(
             "cache entry path has no parent directory",
         ))
     })?;
-    // The cache directory (`.socket/blobs/`, `.socket/diffs/`) is created
+    // The cache directory (`.socket/blobs/`) is created
     // here, by the first download, and nowhere earlier. A fetch that lands
     // nothing (all 404, offline, every hash mismatched, every body cut
     // short) must not leave an empty directory behind for the user to
@@ -594,25 +483,15 @@ fn blob_hash_matches(expected: &str, actual: &str) -> bool {
     expected.eq_ignore_ascii_case(actual)
 }
 
-/// The two kinds of cache entry [`download_entries`] stores.
-#[derive(Debug, Clone, Copy)]
-enum Entry {
-    /// `blobs/<hash>`, verified against its git-sha256 name.
-    Blob,
-    /// `diffs/<uuid>.tar.gz`, stored as served.
-    Diff,
-}
-
-/// Download `ids` sequentially, streaming each into its cache entry under
-/// `dir` (see [`stream_cache_entry_atomic`]). The one download loop behind
-/// [`fetch_missing_blobs`], [`fetch_blobs_by_hash`] and diff-mode
-/// [`fetch_missing_sources`].
+/// Download the blobs `ids` sequentially, streaming each into
+/// `dir/<hash>` and verifying it against its git-sha256 name (see
+/// [`stream_cache_entry_atomic`]). The one download loop behind
+/// [`fetch_missing_blobs`] and [`fetch_blobs_by_hash`].
 async fn download_entries(
     ids: &[String],
     dir: &Path,
     client: &ApiClient,
     on_progress: Option<&OnProgress>,
-    entry: Entry,
 ) -> FetchMissingBlobsResult {
     let total = ids.len();
     let mut downloaded: usize = 0;
@@ -624,29 +503,13 @@ async fn download_entries(
             cb(id, i + 1, total);
         }
 
-        let (fetched, dest, expected_hash, noun, not_found) = match entry {
-            Entry::Blob => (
-                client.fetch_blob(id).await,
-                dir.join(id),
-                Some(id.as_str()),
-                "blob",
-                "Blob not found on server",
-            ),
-            Entry::Diff => (
-                client.fetch_diff(id).await,
-                dir.join(format!("{}.tar.gz", id)),
-                None,
-                "archive",
-                "Diff archive not found on server",
-            ),
-        };
-        let error = match fetched {
+        let error = match client.fetch_blob(id).await {
             Ok(Some(mut body)) => {
-                match stream_cache_entry_atomic(&dest, &mut body, expected_hash).await {
+                match stream_cache_entry_atomic(&dir.join(id), &mut body, Some(id)).await {
                     Ok(()) => None,
                     Err(EntryError::Body(e)) => Some(e.to_string()),
                     Err(EntryError::Write(e)) => {
-                        Some(format!("Failed to write {} to disk: {}", noun, e))
+                        Some(format!("Failed to write blob to disk: {}", e))
                     }
                     Err(EntryError::HashMismatch(actual)) => Some(format!(
                         "Content hash mismatch: expected {}, got {}",
@@ -654,7 +517,7 @@ async fn download_entries(
                     )),
                 }
             }
-            Ok(None) => Some(not_found.to_string()),
+            Ok(None) => Some("Blob not found on server".to_string()),
             Err(e) => Some(e.to_string()),
         };
         if error.is_none() {
@@ -927,106 +790,6 @@ mod tests {
         assert!(output.contains("unknown error"));
     }
 
-    // ── DownloadMode + archive helpers ──────────────────────────────
-
-    #[test]
-    fn test_download_mode_parse() {
-        assert_eq!(DownloadMode::parse("diff").unwrap(), DownloadMode::Diff);
-        assert_eq!(DownloadMode::parse("DIFF").unwrap(), DownloadMode::Diff);
-        // `package` was removed; the error names the surviving modes.
-        assert!(DownloadMode::parse("package")
-            .unwrap_err()
-            .contains("removed"));
-        assert_eq!(DownloadMode::parse("file").unwrap(), DownloadMode::File);
-        // `blob` aliases to `file` so users can think in pre-2.2 terms.
-        assert_eq!(DownloadMode::parse("blob").unwrap(), DownloadMode::File);
-        assert!(DownloadMode::parse("nope").is_err());
-    }
-
-    #[test]
-    fn test_download_mode_tag() {
-        assert_eq!(DownloadMode::Diff.as_tag(), "diff");
-        assert_eq!(DownloadMode::File.as_tag(), "file");
-    }
-
-    fn make_manifest_with_uuids(uuids: &[&str]) -> PatchManifest {
-        let mut patches = HashMap::new();
-        for (i, uuid) in uuids.iter().enumerate() {
-            let key = format!("pkg:npm/test-{}@1.0.0", i);
-            patches.insert(
-                key,
-                PatchRecord {
-                    uuid: (*uuid).to_string(),
-                    exported_at: "2024-01-01T00:00:00Z".to_string(),
-                    files: HashMap::new(),
-                    vulnerabilities: HashMap::new(),
-                    description: "test".to_string(),
-                    license: "MIT".to_string(),
-                    tier: "free".to_string(),
-                },
-            );
-        }
-        PatchManifest {
-            patches,
-            setup: None,
-        }
-    }
-
-    #[tokio::test]
-    async fn test_get_missing_archives_all_missing() {
-        let dir = tempfile::tempdir().unwrap();
-        let archives = dir.path().join("packages");
-        tokio::fs::create_dir_all(&archives).await.unwrap();
-
-        let u1 = "11111111-1111-4111-8111-111111111111";
-        let u2 = "22222222-2222-4222-8222-222222222222";
-        let manifest = make_manifest_with_uuids(&[u1, u2]);
-
-        let missing = get_missing_archives(&manifest, &archives).await;
-        assert_eq!(missing.len(), 2);
-        assert!(missing.contains(u1));
-        assert!(missing.contains(u2));
-    }
-
-    #[tokio::test]
-    async fn test_get_missing_archives_some_present() {
-        let dir = tempfile::tempdir().unwrap();
-        let archives = dir.path().join("packages");
-        tokio::fs::create_dir_all(&archives).await.unwrap();
-
-        let u1 = "11111111-1111-4111-8111-111111111111";
-        let u2 = "22222222-2222-4222-8222-222222222222";
-
-        tokio::fs::write(archives.join(format!("{u1}.tar.gz")), b"data")
-            .await
-            .unwrap();
-
-        let manifest = make_manifest_with_uuids(&[u1, u2]);
-        let missing = get_missing_archives(&manifest, &archives).await;
-        assert_eq!(missing.len(), 1);
-        assert!(missing.contains(u2));
-        assert!(!missing.contains(u1));
-    }
-
-    #[tokio::test]
-    async fn test_fetch_missing_sources_unsupported_mode_returns_empty() {
-        // Asking for Diff mode without a diffs_path yields an empty result
-        // rather than panicking.
-        let dir = tempfile::tempdir().unwrap();
-        let blobs = dir.path().join("blobs");
-        tokio::fs::create_dir_all(&blobs).await.unwrap();
-        let sources = PatchSources::blobs_only(&blobs);
-
-        let manifest = make_manifest_with_uuids(&["11111111-1111-4111-8111-111111111111"]);
-        let (client, _) = crate::api::client::get_api_client_from_env(None).await;
-
-        let res =
-            fetch_missing_sources(&manifest, &sources, DownloadMode::Diff, &client, None).await;
-        assert_eq!(res.total, 0);
-        assert_eq!(res.downloaded, 0);
-        assert_eq!(res.failed, 0);
-    }
-
     // ── Regression: skipped accounting in format ─────────────────────
 
     #[test]
@@ -1128,7 +891,7 @@ mod tests {
             route: crate::api::client::ApiRoute::Proxy,
         });
         let body = client
-            .fetch_diff("11111111-1111-4111-8111-111111111111")
+            .fetch_blob(&"a".repeat(64))
             .await
             .unwrap()
             .expect("200 serves a body");
@@ -1350,8 +1113,6 @@ mod tests {
         assert_eq!(DIFF_ARCHIVE.count(1), "1 diff archive");
         assert_eq!(DIFF_ARCHIVE.count(3), "3 diff archives");
         assert_eq!(PACKAGE_ARCHIVE.count(1), "1 package archive");
-        assert_eq!(DownloadMode::Diff.noun(), DIFF_ARCHIVE);
-        assert_eq!(DownloadMode::File.noun(), BLOB);
     }
 
     #[test]
@@ -1369,33 +1130,6 @@ mod tests {
         // UUIDs are the lookup key: always in full.
         let uuid = "11111111-1111-4111-8111-111111111111";
         assert_eq!(DIFF_ARCHIVE.display_id(uuid), uuid);
-    }
-
-    #[test]
-    fn diff_mode_result_names_diff_archives_and_full_uuids_sorted() {
-        let result = failed_result(vec![
-            failure(
-                "22222222-2222-4222-8222-222222222222",
-                "Diff archive not found on server",
-            ),
-            failure(
-                "11111111-1111-4111-8111-111111111111",
-                "Network error fetching diff 11111111-1111-4111-8111-111111111111: \
-                 error sending request for url (http://127.0.0.1:9/patch/diff/x)",
-            ),
-        ]);
-        assert_eq!(
-            format_fetch_result_for(&result, DIFF_ARCHIVE),
-            "Failed to download 2 diff archives\n\
-             \x20 - 11111111-1111-4111-8111-111111111111: network error: \
-             error sending request for url (http://127.0.0.1:9/patch/diff/x)\n\
-             \x20 - 22222222-2222-4222-8222-222222222222: Diff archive not found on server"
-        );
-        let empty = FetchMissingBlobsResult::default();
-        assert_eq!(
-            format_fetch_result_for(&empty, DIFF_ARCHIVE),
-            "All diff archives are present locally."
-        );
     }
 
     #[test]

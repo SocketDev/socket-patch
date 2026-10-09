@@ -165,10 +165,6 @@ async fn get_by_uuid_nested_apply_uses_api_flags_not_env() {
             "agent",
             "--yes",
             "--json",
-            // `file` mode goes straight for the per-file blob endpoint; the
-            // point here is which CLIENT does the fetch, not which artifact.
-            "--download-mode",
-            "file",
             "--api-url",
             &uri,
             "--api-token",
@@ -221,8 +217,6 @@ async fn get_by_purl_nested_apply_uses_api_flags_not_env() {
             "agent",
             "--yes",
             "--json",
-            "--download-mode",
-            "file",
             "--api-url",
             &uri,
             "--api-token",
@@ -303,8 +297,6 @@ async fn get_by_uuid_nested_apply_uses_proxy_url_flag_when_tokenless() {
             "agent",
             "--yes",
             "--json",
-            "--download-mode",
-            "file",
             "--proxy-url",
             &uri,
         ],
