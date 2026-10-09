@@ -548,10 +548,12 @@ impl UpstreamClient {
         result
     }
 
-    /// The `packages.lock.json` `contentHash` of `id@version` on nuget.org
-    /// (base64 sha512 of the `.nupkg`): the `packageHash` of the catalog
-    /// entry its registration leaf points at — the hash nuget.org computed
-    /// over the repository-signed package, without downloading it.
+    /// The `packages.lock.json` `contentHash` of `id@version` on nuget.org:
+    /// NuGet's content hash of the `.nupkg` its flat container serves,
+    /// which excludes the repository signature
+    /// ([`crate::formats::nuget::package::package_content_hash`]). The
+    /// catalog's `packageHash` is the hash of the signed file as served, so
+    /// it never matches a lock's `contentHash` (#624).
     pub(crate) async fn nuget_content_hash(
         &self,
         id: &str,
@@ -566,67 +568,26 @@ impl UpstreamClient {
                 return Err(OFFLINE.to_string());
             }
             let (id_lower, version_lower) = &key;
-            let url = format!(
-                "{}/v3/registration5-gz-semver2/{}/{}.json",
-                nuget_api_base(),
+            let (id_seg, version_seg) = (
                 crate::utils::uri::encode_uri_component(id_lower),
-                crate::utils::uri::encode_uri_component(version_lower)
+                crate::utils::uri::encode_uri_component(version_lower),
             );
-            let leaf = self.get_json_maybe_gzip(&url).await?;
-            let catalog = leaf
-                .get("catalogEntry")
-                .and_then(Value::as_str)
-                .ok_or_else(|| format!("{url} names no catalog entry"))?;
-            let entry = self.get_json_maybe_gzip(catalog).await?;
-            let same_id = entry
-                .get("id")
-                .and_then(Value::as_str)
-                .is_some_and(|i| i.eq_ignore_ascii_case(id_lower));
-            let same_version = entry
-                .get("version")
-                .and_then(Value::as_str)
-                .is_some_and(|v| {
-                    crate::vendor::nuget_feed::normalize_nuget_version(v)
-                        .eq_ignore_ascii_case(version_lower)
-                });
-            if !same_id || !same_version {
-                return Err(format!(
-                    "{catalog} is not the catalog entry of {id} {version}"
-                ));
-            }
-            let sha512 = entry
-                .get("packageHashAlgorithm")
-                .and_then(Value::as_str)
-                .is_some_and(|a| a.eq_ignore_ascii_case("SHA512"));
-            match entry.get("packageHash").and_then(Value::as_str) {
-                Some(hash) if sha512 && is_base64_digest(hash) => Ok(hash.to_string()),
-                _ => Err(format!("{catalog} records no SHA512 packageHash")),
-            }
+            let url = format!(
+                "{}/v3-flatcontainer/{id_seg}/{version_seg}/{id_seg}.{version_seg}.nupkg",
+                nuget_api_base(),
+            );
+            let bytes = crate::vendor::registry_fetch::download(&self.http, &url).await?;
+            crate::formats::nuget::package::package_content_hash(&bytes)
+                .map_err(|why| format!("{url}: {why}"))
         }
         .await;
         self.nuget.lock().await.insert(key, result.clone());
         result
     }
-
-    /// A JSON document that nuget.org may serve gzip-encoded whatever the
-    /// request asked for (the `registration5-gz-*` hives).
-    async fn get_json_maybe_gzip(&self, url: &str) -> Result<Value, String> {
-        use std::io::Read as _;
-        let mut bytes = crate::vendor::registry_fetch::download(&self.http, url).await?;
-        if bytes.starts_with(&[0x1f, 0x8b]) {
-            let mut plain = Vec::new();
-            flate2::read::GzDecoder::new(bytes.as_slice())
-                .take(crate::vendor::registry_fetch::MAX_DOWNLOAD_BYTES)
-                .read_to_end(&mut plain)
-                .map_err(|e| format!("{url}: bad gzip body: {e}"))?;
-            bytes = plain;
-        }
-        serde_json::from_slice(&bytes).map_err(|e| format!("{url} is not JSON: {e}"))
-    }
 }
 
 /// nuget.org's API host; `SOCKET_NUGET_URL` names another (tests, mirrors
-/// serving the same `/v3/registration5-gz-semver2/` hive).
+/// serving the same `/v3-flatcontainer/` hive).
 pub(crate) const DEFAULT_NUGET_API: &str = "https://api.nuget.org";
 
 fn nuget_api_base() -> String {
@@ -635,17 +596,6 @@ fn nuget_api_base() -> String {
         .map(|v| v.trim().trim_end_matches('/').to_string())
         .filter(|v| !v.is_empty())
         .unwrap_or_else(|| DEFAULT_NUGET_API.to_string())
-}
-
-/// A base64 digest token (the alphabet and padding only: the lock stores
-/// whatever nuget.org recorded, so its length is not second-guessed).
-fn is_base64_digest(s: &str) -> bool {
-    let body = s.trim_end_matches('=');
-    !body.is_empty()
-        && s.len() - body.len() <= 2
-        && body
-            .bytes()
-            .all(|b| b.is_ascii_alphanumeric() || b == b'+' || b == b'/')
 }
 
 /// The release files of a PyPI JSON API version document, sorted by

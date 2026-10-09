@@ -10,6 +10,8 @@
 //! and DOCTYPEs are skipped; an unterminated tag or comment, an unquoted
 //! attribute or a mismatched close tag makes the whole file `None`.
 
+pub(crate) mod package;
+
 use std::collections::BTreeSet;
 use std::ops::Range;
 
