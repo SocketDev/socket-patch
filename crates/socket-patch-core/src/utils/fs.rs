@@ -455,6 +455,36 @@ pub async fn atomic_write_bytes_preserving_mode(
     .await
 }
 
+/// Write a file the user named on the command line (`vex --output`, the
+/// embedded `--vex <path>`): a reader, or a failed write, sees the complete
+/// old or the complete new bytes, never a prefix.
+///
+/// A regular file (or a symlink to one) is replaced by stage + rename, keeping
+/// its permission bits; a symlink is written through to its target, as a
+/// plain `write` would, so the user's link stays a link. Anything else that
+/// already exists (`/dev/stdout`, a FIFO, a character device) has no inode to
+/// swap, so it is written in place. Never captured by an open group commit:
+/// the path is the user's output, not one of the run's commit points.
+pub async fn write_user_output(path: &Path, content: &[u8]) -> std::io::Result<()> {
+    match tokio::fs::metadata(path).await {
+        Ok(meta) if !meta.is_file() && !meta.is_dir() => tokio::fs::write(path, content).await,
+        _ => {
+            let target = tokio::fs::canonicalize(path)
+                .await
+                .unwrap_or_else(|_| path.to_path_buf());
+            write_atomic(
+                &target,
+                content,
+                WriteOpts {
+                    preserve_mode: true,
+                    ..WriteOpts::UNSYNCED
+                },
+            )
+            .await
+        }
+    }
+}
+
 /// Atomically write a CONTENT-VERIFIED artifact (a vendored `.tgz`, wheel,
 /// jar, marker, …) via stage + rename, without an fsync: the next durable
 /// commit point's [`super::durability::barrier`] makes it durable before
@@ -949,7 +979,7 @@ mod tests {
             m
         };
         assert_ne!(fresh_mode, 0o600, "umask must make 0600 distinguishable");
-        let cases: [(&str, bool); 8] = [
+        let cases: [(&str, bool); 9] = [
             ("bytes", false),
             ("bytes_preserving", true),
             ("artifact", false),
@@ -958,6 +988,7 @@ mod tests {
             ("unsynced_preserving", true),
             ("sync_plain", false),
             ("sync_preserving", true),
+            ("user_output", true),
         ];
         for (name, preserves) in cases {
             let dir = tmp.path().join(name);
@@ -978,6 +1009,7 @@ mod tests {
                 "unsynced_preserving" => atomic_write_unsynced(&path, content, true).await,
                 "sync_plain" => atomic_write_sync(&path, content, false),
                 "sync_preserving" => atomic_write_sync(&path, content, true),
+                "user_output" => write_user_output(&path, content).await,
                 _ => unreachable!(),
             }
             .unwrap_or_else(|e| panic!("{name}: {e}"));
@@ -991,6 +1023,52 @@ mod tests {
                 .collect();
             assert_eq!(names, ["f"], "{name}: stage litter {names:?}");
         }
+    }
+
+    /// A user-named output path (`vex --output`) keeps what the user put
+    /// there: a symlink stays a link and its target gets the new bytes, a
+    /// character device (`/dev/null`, like `/dev/stdout`) is written in
+    /// place rather than swapped for a regular file, and an open group
+    /// commit does not hold the write back (#1144).
+    #[cfg(unix)]
+    #[tokio::test]
+    async fn user_output_writes_through_links_and_devices() {
+        let tmp = tempfile::tempdir().unwrap();
+        let target = tmp.path().join("real.vex.json");
+        std::fs::write(&target, b"old").unwrap();
+        let link = tmp.path().join("out.vex.json");
+        std::os::unix::fs::symlink(&target, &link).unwrap();
+        write_user_output(&link, b"new").await.unwrap();
+        assert!(std::fs::symlink_metadata(&link)
+            .unwrap()
+            .file_type()
+            .is_symlink());
+        assert_eq!(std::fs::read(&target).unwrap(), b"new");
+        let names: Vec<String> = std::fs::read_dir(tmp.path())
+            .unwrap()
+            .map(|e| e.unwrap().file_name().to_string_lossy().into_owned())
+            .collect();
+        assert_eq!(names.len(), 2, "stage litter {names:?}");
+
+        write_user_output(Path::new("/dev/null"), b"doc")
+            .await
+            .unwrap();
+        use std::os::unix::fs::FileTypeExt as _;
+        assert!(std::fs::metadata("/dev/null")
+            .unwrap()
+            .file_type()
+            .is_char_device());
+
+        let group = super::super::group_commit::GroupCommit::begin(tmp.path());
+        let fresh = tmp.path().join("fresh.vex.json");
+        write_user_output(&fresh, b"doc").await.unwrap();
+        assert_eq!(
+            std::fs::read(&fresh).unwrap(),
+            b"doc",
+            "written, not captured"
+        );
+        drop(group);
+        assert_eq!(std::fs::read(&fresh).unwrap(), b"doc");
     }
 
     /// One stage-name builder for the `utils::fs` writers and the blob
