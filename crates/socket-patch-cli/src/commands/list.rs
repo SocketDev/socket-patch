@@ -413,7 +413,7 @@ pub async fn run(args: ListArgs) -> i32 {
         // hosted URL carries its grant token, which output never prints.
         let detail = format!(
             "{} keeps a hosted `resolutions` entry for {} that no lockfile installs any \
-             more; `socket-patch rollback` or `socket-patch remove {}` removes it",
+             more; `socket-patch remove {}` removes that entry alone",
             pin.files.join(", "),
             pin.purl,
             pin.purl
