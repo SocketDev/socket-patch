@@ -83,7 +83,12 @@ pub(crate) fn loses_default_trust(manifest: Option<&str>, lock: Option<&str>, na
     // The list lookup is cheap and almost always false, so it runs first:
     // the hosted rewriter calls this per wired dep, and the manifest parse
     // plus whole-lock scan must not land in its per-dep loop (#578).
-    if !DEFAULT_TRUSTED.lines().any(|trusted| trusted == name) {
+    static TRUSTED: std::sync::OnceLock<std::collections::HashSet<&'static str>> =
+        std::sync::OnceLock::new();
+    if !TRUSTED
+        .get_or_init(|| DEFAULT_TRUSTED.lines().collect())
+        .contains(name)
+    {
         return false;
     }
     let declared = manifest.and_then(parse_manifest).is_some_and(|value| {
@@ -234,9 +239,8 @@ pub(crate) fn split_name_spec(s: &str) -> Option<(&str, &str)> {
 /// registry tarball and `npm pack` output carries. A leaf naming no version
 /// yields `None`, and so does our own vendored path.
 pub(crate) fn user_tarball_version<'t>(name: &str, target: &'t str) -> Option<&'t str> {
-    if crate::vendor::path::parse_vendor_path(target).is_some() {
-        return None;
-    }
+    // The leaf checks are cheap and reject a registry spec (`name@1.2.3`)
+    // at once; the vendor-path parse runs only for a tarball leaf (#578).
     let path = target.split(['?', '#']).next().unwrap_or(target);
     let leaf = path.rsplit(['/', '\\']).next()?;
     let bare = name.rsplit('/').next().unwrap_or(name);
@@ -244,6 +248,9 @@ pub(crate) fn user_tarball_version<'t>(name: &str, target: &'t str) -> Option<&'
     let version = version
         .strip_suffix(".tgz")
         .or_else(|| version.strip_suffix(".tar.gz"))?;
+    if crate::vendor::path::parse_vendor_path(target).is_some() {
+        return None;
+    }
     semver::Version::parse(version).is_ok().then_some(version)
 }
 
@@ -260,7 +267,13 @@ pub(crate) fn is_user_tarball_entry(entry: &BunEntry, name: &str, version: &str)
 /// [`is_user_tarball_entry`] on an already-decoded `name@<target>` spec,
 /// for hot loops that decoded it once already. The name is matched by a
 /// prefix strip, so an entry of another package costs one compare.
+#[inline]
 pub(crate) fn is_user_tarball_spec(spec: &str, name: &str, version: &str) -> bool {
+    // Length and separator first: the hosted rewriter asks this of every
+    // lock entry per patch, nearly all of another package (#578).
+    if spec.as_bytes().get(name.len()) != Some(&b'@') {
+        return false;
+    }
     spec.strip_prefix(name)
         .and_then(|rest| rest.strip_prefix('@'))
         .is_some_and(|target| user_tarball_version(name, target) == Some(version))

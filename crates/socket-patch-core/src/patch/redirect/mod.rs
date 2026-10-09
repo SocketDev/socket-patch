@@ -4916,7 +4916,7 @@ fn rewrite_bun_lock(
                 // this very version is installed from that spec beside the
                 // pinned copy and stays unpatched (#497, npm's #326): say so,
                 // and keep the in-run VEX from assuming the uuid patched.
-                if spec != url_spec && is_user_tarball_spec(spec, &fname, &dep.version) {
+                if is_user_tarball_spec(spec, &fname, &dep.version) && spec != url_spec {
                     user_tarball_skipped = true;
                     result.bundled_skipped_uuids.insert(dep.patch_uuid.clone());
                     result.warnings.push(RewriteWarning {

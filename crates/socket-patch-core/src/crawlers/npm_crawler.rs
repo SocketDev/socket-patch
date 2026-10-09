@@ -962,7 +962,9 @@ fn reach_bun_store_entries_sync(
                 listings.insert(entry, listing);
             }
             for target in targets? {
-                if live.insert(target.clone()) {
+                // Most targets are already live: check before cloning.
+                if !live.contains(&target) {
+                    live.insert(target.clone());
                     let nm = dirs.entry_node_modules(&target);
                     frontier.push((Some(target), nm));
                 }
@@ -1063,8 +1065,11 @@ fn bun_store_link_targets_sync(
     names: Option<&BunStoreNames>,
 ) -> Option<Vec<OsString>> {
     let mut targets = Vec::new();
-    // (link, the package its name spells)
-    let mut links: Vec<(PathBuf, String)> = Vec::new();
+    // A link whose package name guesses its entry is never read, and is
+    // looked up before any path is built: a quick walk visits every link
+    // of every live entry, so the allocations add up (#578).
+    let guess = |package: &str| names.and_then(|names| names.unique.get(package));
+    let mut links: Vec<PathBuf> = Vec::new();
     for entry in &listing.entries {
         let Some(file_type) = entry.file_type else {
             continue;
@@ -1073,7 +1078,10 @@ fn bun_store_link_targets_sync(
             continue;
         }
         if file_type.is_symlink() {
-            links.push((nm.join(&entry.name), entry.name_str.clone()));
+            match guess(&entry.name_str) {
+                Some(target) => targets.push(target.clone()),
+                None => links.push(nm.join(&entry.name)),
+            }
         } else if file_type.is_dir() && entry.name_str.starts_with('@') {
             if let Some(entries) = names.and_then(|names| names.scopes.get(&entry.name_str)) {
                 targets.extend(entries.iter().cloned());
@@ -1083,23 +1091,14 @@ fn bun_store_link_targets_sync(
             for scoped in list_dir_sync(&scope).entries {
                 if scoped.file_type.is_some_and(|ft| ft.is_symlink()) {
                     let package = format!("{}/{}", entry.name_str, scoped.name_str);
-                    links.push((scope.join(&scoped.name), package));
+                    match guess(&package) {
+                        Some(target) => targets.push(target.clone()),
+                        None => links.push(scope.join(&scoped.name)),
+                    }
                 }
             }
         }
     }
-    let links: Vec<PathBuf> = links
-        .into_iter()
-        .filter_map(
-            |(link, package)| match names.and_then(|names| names.unique.get(&package)) {
-                Some(entry) => {
-                    targets.push(entry.clone());
-                    None
-                }
-                None => Some(link),
-            },
-        )
-        .collect();
     for link in &links {
         let lexical = std::fs::read_link(link)
             .ok()
