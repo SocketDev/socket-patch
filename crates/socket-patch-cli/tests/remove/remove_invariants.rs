@@ -624,7 +624,7 @@ fn rollback_by_uuid_reverts_vendoring_when_ledger_generation_is_older() {
         "the vendored artifact must be deleted; envelope={v}"
     );
     assert_eq!(
-        v["vendoredReverted"],
+        crate::rollback_json::vendored_reverted(&v),
         serde_json::json!([VENDORED_PURL]),
         "envelope={v}"
     );

@@ -402,14 +402,14 @@ fn rollback_with_empty_manifest_emits_envelope() {
     // Empty-but-valid manifest: rollback is a clean success that touches nothing.
     assert_eq!(out.status.code(), Some(0), "rollback should exit 0: {v}");
     assert_eq!(v["status"], "success", "expected success status: {v}");
-    assert_eq!(v["rolledBack"], 0, "nothing should roll back: {v}");
-    assert_eq!(v["alreadyOriginal"], 0, "no files to inspect: {v}");
-    assert_eq!(v["failed"], 0, "no rollback should fail: {v}");
+    assert_eq!(v["command"], "rollback", "{v}");
     assert_eq!(
-        v["results"],
-        serde_json::json!([]),
-        "unexpected results: {v}"
+        v["summary"]["rolledBack"], 0,
+        "nothing should roll back: {v}"
     );
+    assert_eq!(v["summary"]["skipped"], 0, "no files to inspect: {v}");
+    assert_eq!(v["summary"]["failed"], 0, "no rollback should fail: {v}");
+    assert_eq!(v["events"], serde_json::json!([]), "unexpected events: {v}");
 }
 
 /// `remove --json` with no manifest at all: the early-exit

@@ -19,6 +19,9 @@
 //! No test mutates this process's environment, so none of them need
 //! `#[serial]` — each runs in its own tempdir.
 
+#[path = "common/rollback_json.rs"]
+mod rollback_json;
+
 #[path = "prebuilt_common/mod.rs"]
 mod prebuilt_common;
 
@@ -2279,8 +2282,8 @@ async fn vendored_npm_purl_skipped_even_without_installed_tree() {
 // ─────────────────────────────────────────────────────────────────────
 
 /// `rollback` reverts vendor-owned purls (lock restored byte-for-byte,
-/// artifact + ledger entry gone, manifest entry removed), surfaced in
-/// `vendoredReverted`; both the unscoped and identifier-scoped spellings
+/// artifact + ledger entry gone, manifest entry removed), surfaced as a
+/// `rolledBack` event with `details.mode: "vendored"`; both the unscoped and identifier-scoped spellings
 /// act.
 #[tokio::test]
 async fn vendored_purl_excluded_from_rollback() {
@@ -2321,18 +2324,18 @@ async fn vendored_purl_excluded_from_rollback() {
         assert_eq!(code, 0, "vendored rollback exits 0: {out:#}");
         assert_eq!(out["status"], "success", "{out:#}");
         assert_eq!(
-            out["vendored"],
+            rollback_json::skipped_with(&out, "vendored"),
             json!([]),
             "no benign skip remains — the vendored leg acted: {out:#}"
         );
         assert_eq!(
-            out["vendoredReverted"],
+            rollback_json::vendored_reverted(&out),
             json!([PURL]),
             "the revert must be surfaced: {out:#}"
         );
-        assert_eq!(out["failed"], 0, "{out:#}");
+        assert_eq!(out["summary"]["failed"], 0, "{out:#}");
         assert_eq!(
-            out["manifest"]["removedEntries"],
+            rollback_json::manifest_removed(&out),
             json!([PURL]),
             "the manifest entry leaves with the vendored state: {out:#}"
         );

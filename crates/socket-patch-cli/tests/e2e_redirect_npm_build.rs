@@ -58,6 +58,9 @@
 //! cannot reach the registry — unless `SOCKET_PATCH_NPM_E2E_REQUIRED` is set;
 //! every assertion after that is hard.
 
+#[path = "common/rollback_json.rs"]
+mod rollback_json;
+
 #[path = "common/mod.rs"]
 mod common;
 use common::binary;
@@ -770,7 +773,7 @@ fn rollback_removes_npmrc(fx: &RedirectFixture) {
     let env: serde_json::Value = serde_json::from_str(&stdout)
         .unwrap_or_else(|e| panic!("rollback --json is not JSON: {e}\n{stdout}"));
     assert_eq!(
-        env["hosted"]["reverted"],
+        rollback_json::hosted_reverted(&env),
         serde_json::json!([PURL]),
         "rollback restores the hosted pin to its upstream entry: {env}"
     );

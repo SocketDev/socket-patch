@@ -16,6 +16,9 @@
 //! be read back; no parent-process env is ever mutated, so no
 //! serialization is needed.
 
+#[path = "common/rollback_json.rs"]
+mod rollback_json;
+
 use std::path::Path;
 
 use serde_json::{json, Value};
@@ -1313,7 +1316,7 @@ async fn ledgerless_cargo_wiring_refuses(manifest_wiring: bool) {
 /// executable or installed dependencies. A fresh clone works immediately.
 /// No run writes a redirect ledger (v5), and `rollback` cannot restore a
 /// binary `bun.lockb` pin to its upstream entry: it refuses the pin
-/// (`partial_failure`, exit 1) naming the `git checkout` remedy and leaves
+/// (`rollback_failed`, exit 1) naming the `git checkout` remedy and leaves
 /// the lock byte-identical.
 #[tokio::test]
 async fn native_bun_lockb_hosting_dry_run_rerun_and_rollback_without_bun() {
@@ -1406,10 +1409,9 @@ async fn native_bun_lockb_hosting_dry_run_rerun_and_rollback_without_bun() {
     // The refused pin is the only outcome: a total failure (#1066).
     assert_eq!(doc["status"], "error", "{doc:#}");
     assert_eq!(doc["error"]["code"], "rollback_failed", "{doc:#}");
-    assert_eq!(doc["failed"], 1, "{doc:#}");
-    let failed = doc["hosted"]["failed"]
-        .as_array()
-        .unwrap_or_else(|| panic!("{doc:#}"));
+    assert_eq!(doc["summary"]["failed"], 1, "{doc:#}");
+    let failed_view = rollback_json::hosted_failed(&doc);
+    let failed = failed_view.as_array().unwrap_or_else(|| panic!("{doc:#}"));
     assert_eq!(failed.len(), 1, "{doc:#}");
     assert_eq!(failed[0]["purl"], purl, "{doc:#}");
     let error = failed[0]["error"].as_str().unwrap_or_default();

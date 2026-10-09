@@ -124,8 +124,7 @@ fn write_manifest(root: &Path, purls: &[&str]) {
 fn event<'a>(v: &'a Value, purl: &str) -> &'a Value {
     v["events"]
         .as_array()
-        .or_else(|| v["results"].as_array())
-        .expect("events or results array")
+        .expect("events array")
         .iter()
         .find(|e| e["purl"] == purl)
         .unwrap_or_else(|| panic!("no event for {purl}: {v}"))
@@ -188,7 +187,10 @@ fn rollback_refuses_bun_global_store_packages() {
     );
 
     let v = run(&proj, "rollback");
-    assert_eq!(v["status"], "partial_failure", "{v}");
+    // Both refused and nothing rolled back: the run failed as a whole.
+    assert_eq!(v["status"], "error", "{v}");
+    assert_eq!(v["error"]["code"], "rollback_failed", "{v}");
+    assert_eq!(v["summary"]["failed"], 2, "{v}");
     assert_refused(&v, "pkg:npm/left-pad@1.3.0");
     assert_refused(&v, "pkg:npm/is-number@6.0.0");
     assert_eq!(std::fs::read(left_pad.join("index.js")).unwrap(), AFTER);

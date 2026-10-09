@@ -15,6 +15,9 @@
 //! The hermetic twins of these suites are the same-named modules of
 //! `tests/e2e_vex_lockfile/`.
 
+#[path = "../common/rollback_json.rs"]
+mod rollback_json;
+
 #[path = "../vex_e2e_common/mod.rs"]
 mod vex_e2e_common;
 #[cfg(unix)]

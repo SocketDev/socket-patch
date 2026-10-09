@@ -1,8 +1,9 @@
 //! #704: every `--json` failure carries its top-level `error` as a
 //! `{code, message}` object, with no top-level `errorCode`, on every
 //! command. Self-enforced usage errors (exit 2) print that coded error on
-//! stdout: a full envelope for the envelope commands, `{status, error}` for
-//! `scan`, `get` and `rollback`. None of these cases reaches the network.
+//! stdout: a full envelope for the envelope commands (`rollback` among
+//! them since v5.0), `{status, error}` for `scan` and `get`. None of these
+//! cases reaches the network.
 
 use std::path::Path;
 
@@ -131,7 +132,11 @@ fn get_usage_errors_print_the_coded_error() {
 
 #[test]
 fn rollback_usage_error_prints_the_coded_error() {
-    assert_legacy_usage(&["rollback", "x[", "--json"], &[], "path_glob_invalid");
+    assert_envelope_usage(
+        &["rollback", "x[", "--json"],
+        "rollback",
+        "path_glob_invalid",
+    );
     // JSON carries the verbatim message; only stderr is capitalized.
     let tmp = tempfile::tempdir().unwrap();
     let (_, stdout, _) = run(tmp.path(), &["rollback", "x[", "--json"], &[]);
@@ -209,6 +214,8 @@ fn rollback_on_an_empty_project_is_manifest_not_found() {
     let (exit, stdout, _) = run(tmp.path(), &["rollback", "--json"], &[]);
     assert_eq!(exit, 1, "{stdout}");
     let v = assert_error_object(&stdout, "manifest_not_found");
+    assert_eq!(v["command"], "rollback", "{v}");
+    assert_eq!(v["events"], serde_json::json!([]), "{v}");
     assert_eq!(v["error"]["message"], "Manifest not found", "{v}");
     assert!(v["path"].is_string(), "{v}");
 }
@@ -226,5 +233,7 @@ fn rollback_unknown_identifier_is_patch_not_found() {
     );
     assert_eq!(exit, 1, "{stdout}");
     let v = assert_error_object(&stdout, "patch_not_found");
-    assert_eq!(v["results"], serde_json::json!([]), "{v}");
+    assert_eq!(v["command"], "rollback", "{v}");
+    assert_eq!(v["events"], serde_json::json!([]), "{v}");
+    assert_eq!(v["summary"]["failed"], 0, "{v}");
 }

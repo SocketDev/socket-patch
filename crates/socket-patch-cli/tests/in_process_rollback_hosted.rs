@@ -27,6 +27,9 @@
 //! `#[serial]`: every command's `run` mirrors env toggles into
 //! process-global env vars (`apply_env_toggles`).
 
+#[path = "common/rollback_json.rs"]
+mod rollback_json;
+
 use std::collections::HashMap;
 use std::path::Path;
 
@@ -723,7 +726,7 @@ async fn npm_hosted_round_trip_envelope() {
     assert_eq!(code, 0, "bare rollback should exit 0: {envelope}");
     assert_eq!(envelope["status"], "success", "{envelope}");
     assert_eq!(
-        envelope["hosted"]["reverted"],
+        rollback_json::hosted_reverted(&envelope),
         serde_json::json!([PURL]),
         "the unwound purl must be reported: {envelope}"
     );
@@ -731,10 +734,12 @@ async fn npm_hosted_round_trip_envelope() {
         envelope["hosted"]["editedFiles"].as_u64().unwrap_or(0) >= 1,
         "at least the lockfile was rewritten: {envelope}"
     );
-    assert_eq!(envelope["hosted"]["failed"], serde_json::json!([]));
-    assert_eq!(envelope["hosted"]["unsupported"], serde_json::json!([]));
     assert_eq!(
-        envelope["manifest"]["removedEntries"],
+        rollback_json::hosted_failed(&envelope),
+        serde_json::json!([])
+    );
+    assert_eq!(
+        rollback_json::manifest_removed(&envelope),
         serde_json::json!([]),
         "hosted state lives in the lockfile, not the manifest: {envelope}"
     );
@@ -992,11 +997,14 @@ async fn scoped_rollback_restores_only_the_named_pin() {
     assert_eq!(code, 0, "{envelope}");
     assert_eq!(envelope["status"], "success", "{envelope}");
     assert_eq!(
-        envelope["hosted"]["reverted"],
+        rollback_json::hosted_reverted(&envelope),
         serde_json::json!([LP_PURL]),
         "only the named pin is restored: {envelope}"
     );
-    assert_eq!(envelope["hosted"]["failed"], serde_json::json!([]));
+    assert_eq!(
+        rollback_json::hosted_failed(&envelope),
+        serde_json::json!([])
+    );
     assert_eq!(
         std::fs::read_to_string(tmp.path().join("yarn.lock")).unwrap(),
         yarn_lock_content(&format!(
@@ -1068,7 +1076,7 @@ async fn legacy_ledger_edits_of_any_kind_are_never_replayed() {
         let (code, envelope) = run_rollback_subprocess_online(tmp.path(), &server, targets);
         assert_eq!(code, 0, "scoped={scoped}: {envelope}");
         assert_eq!(
-            envelope["hosted"]["reverted"],
+            rollback_json::hosted_reverted(&envelope),
             serde_json::json!([LP_PURL]),
             "scoped={scoped}: {envelope}"
         );
@@ -1118,10 +1126,14 @@ async fn a_refused_pin_fails_closed_beside_a_restored_one() {
     // counters span the hosted leg (#1066).
     assert_eq!(envelope["status"], "error", "{envelope}");
     assert_eq!(envelope["error"]["code"], "rollback_failed", "{envelope}");
-    assert_eq!(envelope["failed"], 2, "{envelope}");
-    assert_eq!(envelope["rolledBack"], 0, "{envelope}");
-    assert_eq!(envelope["hosted"]["reverted"], serde_json::json!([]));
-    let failed: Vec<&str> = envelope["hosted"]["failed"]
+    assert_eq!(envelope["summary"]["failed"], 2, "{envelope}");
+    assert_eq!(envelope["summary"]["rolledBack"], 0, "{envelope}");
+    assert_eq!(
+        rollback_json::hosted_reverted(&envelope),
+        serde_json::json!([])
+    );
+    let failed_view = rollback_json::hosted_failed(&envelope);
+    let failed: Vec<&str> = failed_view
         .as_array()
         .unwrap()
         .iter()
@@ -1129,7 +1141,7 @@ async fn a_refused_pin_fails_closed_beside_a_restored_one() {
         .collect();
     assert_eq!(failed, [IO_PURL, LP_PURL], "{envelope}");
     assert!(
-        envelope["hosted"]["failed"][0]["error"]
+        rollback_json::hosted_failed(&envelope)[0]["error"]
             .as_str()
             .is_some_and(|e| e.contains("this run is offline")
                 && e.contains(
@@ -1146,16 +1158,19 @@ async fn a_refused_pin_fails_closed_beside_a_restored_one() {
     // Online, left-pad unanswered (404): is-odd restores on its own.
     let (code, envelope) = run_rollback_subprocess_online(tmp.path(), &server, &[]);
     assert_eq!(code, 1, "{envelope}");
-    assert_eq!(envelope["status"], "partial_failure", "{envelope}");
+    assert_eq!(envelope["status"], "partialFailure", "{envelope}");
     // The top-level counters span the hosted leg (#1066): they were 0/0.
-    assert_eq!(envelope["rolledBack"], 1, "{envelope}");
-    assert_eq!(envelope["failed"], 1, "{envelope}");
-    assert_eq!(envelope["hosted"]["reverted"], serde_json::json!([IO_PURL]));
+    assert_eq!(envelope["summary"]["rolledBack"], 1, "{envelope}");
+    assert_eq!(envelope["summary"]["failed"], 1, "{envelope}");
     assert_eq!(
-        envelope["hosted"]["failed"][0]["purl"], LP_PURL,
+        rollback_json::hosted_reverted(&envelope),
+        serde_json::json!([IO_PURL])
+    );
+    assert_eq!(
+        rollback_json::hosted_failed(&envelope)[0]["purl"],
+        LP_PURL,
         "{envelope}"
     );
-    assert_eq!(envelope["hosted"]["unsupported"], serde_json::json!([]));
     assert_eq!(
         std::fs::read_to_string(tmp.path().join("yarn.lock")).unwrap(),
         yarn_lock_content(&format!(
@@ -1192,17 +1207,22 @@ async fn a_git_pattern_hosted_pin_is_refused_not_restored_to_the_registry() {
 
     let (code, envelope) = run_rollback_subprocess_online(tmp.path(), &server, &[]);
     assert_eq!(code, 1, "{envelope}");
-    assert_eq!(envelope["status"], "partial_failure", "{envelope}");
-    assert_eq!(envelope["hosted"]["reverted"], serde_json::json!([IO_PURL]));
+    assert_eq!(envelope["status"], "partialFailure", "{envelope}");
+    assert_eq!(
+        rollback_json::hosted_reverted(&envelope),
+        serde_json::json!([IO_PURL])
+    );
     // Discovery already refuses to attribute the git-wired entry, so the
     // pin fails closed as contested wiring before any restore is planned.
     assert_eq!(
-        envelope["hosted"]["failed"].as_array().map(Vec::len),
+        rollback_json::hosted_failed(&envelope)
+            .as_array()
+            .map(Vec::len),
         Some(1),
         "{envelope}"
     );
     assert!(
-        envelope["hosted"]["failed"][0]["error"]
+        rollback_json::hosted_failed(&envelope)[0]["error"]
             .as_str()
             .is_some_and(
                 |e| e.contains("installs from git") && e.contains("`git checkout -- yarn.lock`")
@@ -1244,10 +1264,13 @@ async fn a_non_registry_keyed_hosted_pin_is_refused_not_restored_to_the_registry
 
     let (code, envelope) = run_rollback_subprocess_online(tmp.path(), &server, &[]);
     assert_eq!(code, 1, "{envelope}");
-    assert_eq!(envelope["status"], "partial_failure", "{envelope}");
-    assert_eq!(envelope["hosted"]["reverted"], serde_json::json!([IO_PURL]));
+    assert_eq!(envelope["status"], "partialFailure", "{envelope}");
+    assert_eq!(
+        rollback_json::hosted_reverted(&envelope),
+        serde_json::json!([IO_PURL])
+    );
     assert!(
-        envelope["hosted"]["failed"][0]["error"]
+        rollback_json::hosted_failed(&envelope)[0]["error"]
             .as_str()
             .is_some_and(|e| e.contains("non-registry source")),
         "{envelope}"
@@ -1346,7 +1369,7 @@ async fn preserve_state_still_unwinds_hosted() {
     );
     assert_eq!(envelope["status"], "success", "{envelope}");
     assert_eq!(
-        envelope["hosted"]["reverted"],
+        rollback_json::hosted_reverted(&envelope),
         serde_json::json!([LP_PURL]),
         "the pin must still be restored under --preserve-state: {envelope}"
     );
@@ -1355,11 +1378,12 @@ async fn preserve_state_still_unwinds_hosted() {
         "restoring hosted pins under --preserve-state must be surfaced: {envelope}"
     );
     assert_eq!(
-        envelope["manifest"]["preserved"], true,
+        rollback_json::manifest_removed(&envelope),
+        serde_json::json!([]),
         "manifest cleanup must be skipped: {envelope}"
     );
-    assert_eq!(
-        envelope["gc"]["skipped"], true,
+    assert!(
+        envelope.get("gc").is_none(),
         "GC must be skipped under --preserve-state: {envelope}"
     );
 
@@ -1502,7 +1526,7 @@ async fn yarn_classic_hosted_pin_beside_a_git_copy_rolls_back() {
     let (code, envelope) = run_rollback_subprocess_online(tmp.path(), &server, &[]);
     assert_eq!(code, 0, "rollback must restore the pin: {envelope}");
     assert_eq!(
-        envelope["hosted"]["reverted"],
+        rollback_json::hosted_reverted(&envelope),
         serde_json::json!([LP_PURL]),
         "{envelope}"
     );

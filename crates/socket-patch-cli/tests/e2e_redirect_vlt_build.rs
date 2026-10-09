@@ -11,6 +11,9 @@
 //! Run: `SOCKET_PATCH_VLT_E2E_JS=<vlt.js> cargo test -p socket-patch-cli
 //! --test e2e_redirect_vlt_build -- --include-ignored vlt_pinned_matrix`.
 
+#[path = "common/rollback_json.rs"]
+mod rollback_json;
+
 use std::path::Path;
 
 use serde_json::{json, Value};
@@ -1307,7 +1310,7 @@ async fn vlt_pinned_matrix_hosted_ts_written_lock() {
     let out = rollback_upstream(&proj, &reg.url(), None, &[]);
     assert_eq!(out.code, 0, "{out}");
     assert_eq!(
-        out.json()["hosted"]["reverted"],
+        rollback_json::hosted_reverted(&out.json()),
         json!(["pkg:npm/left-pad@1.3.0"]),
         "{out}"
     );
