@@ -49,22 +49,27 @@ concurrency:
 # values stay `ubuntu-latest`/`ubuntu-22.04`, so job names, cache keys and
 # scripts are unchanged; only `runs-on` maps them. Kill switch: set the
 # repository variable DISABLE_DEPOT_RUNNERS=true to fall back to GitHub-hosted
-# runners (the same switch depscan uses). The compatibility workflows follow
+# runners (the same switch depscan uses). The compile-bound critical-path
+# jobs (clippy, coverage, e2e-build, test-release) use 16-vCPU Depot runners
+# (depot-ubuntu-24.04-16). The compatibility workflows follow
 # the same mapping. Release, publish and merge-queue workflows stay
 # GitHub-hosted (provenance / write tokens).
 # LEAN SCOPE (temporary, while org runner capacity is constrained): unless
 # the repository variable CI_SCOPE is `full`, pull_request, merge_group and
-# push runs skip the Windows/macOS legs, the yarn and old-toolchain
-# matrices, the sbt Docker coverage slice, test-release and the
-# live-production hosted-e2e. They still run in the nightly schedule and
-# on workflow_dispatch. Set CI_SCOPE=full to restore the old gate without
-# a commit. ci-ok treats skipped jobs as passing.
+# push runs use one targeted e2e row per package manager (the rest are in
+# e2e-extended), one row each of the yarn and cargo VEX matrices, and skip
+# the Windows/macOS legs, test, test-release, old cargo toolchains and the
+# sbt Docker coverage slice. Everything runs in the nightly schedule and on
+# workflow_dispatch. Set CI_SCOPE=full to restore the old gate without a
+# commit. ci-ok treats skipped jobs as passing. hosted-e2e is not scoped:
+# it always runs, and its step-level HOSTED_E2E_DISABLED switch is the only
+# bypass.
 jobs:
   # Required independently of ci-ok so the merge queue sees a compile/lint
   # failure immediately. Expensive jobs also depend on this preflight.
   clippy:
     if: github.event.pull_request.draft != true
-    runs-on: ${{ vars.DISABLE_DEPOT_RUNNERS == 'true' && 'ubuntu-latest' || 'depot-ubuntu-24.04-4' }}
+    runs-on: ${{ vars.DISABLE_DEPOT_RUNNERS == 'true' && 'ubuntu-latest' || 'depot-ubuntu-24.04-16' }}
     timeout-minutes: 20
     steps:
       - name: Checkout
@@ -450,7 +455,7 @@ jobs:
     # queue already skips this job because each constituent PR ran it.
     if: (github.event.pull_request.draft != true && github.event_name != 'merge_group') && (vars.CI_SCOPE == 'full' || github.event_name == 'schedule' || github.event_name == 'workflow_dispatch')
     needs: clippy
-    runs-on: ${{ vars.DISABLE_DEPOT_RUNNERS == 'true' && 'ubuntu-latest' || 'depot-ubuntu-24.04-4' }}
+    runs-on: ${{ vars.DISABLE_DEPOT_RUNNERS == 'true' && 'ubuntu-latest' || 'depot-ubuntu-24.04-16' }}
     strategy:
       fail-fast: false
       matrix:
@@ -502,7 +507,7 @@ jobs:
     # numbers are report-only so contributors get visibility without flaky
     # CI when coverage shifts naturally with test edits. A failing TEST
     # fails the job: this is the Linux leg of `test`.
-    runs-on: ${{ vars.DISABLE_DEPOT_RUNNERS == 'true' && 'ubuntu-latest' || 'depot-ubuntu-24.04-4' }}
+    runs-on: ${{ vars.DISABLE_DEPOT_RUNNERS == 'true' && 'ubuntu-latest' || 'depot-ubuntu-24.04-16' }}
     timeout-minutes: 35
     permissions:
       contents: read
@@ -608,7 +613,7 @@ jobs:
   # Dockerfile.base compiles the full-LTO release binary inside Docker, with
   # no cache. Build it once per run and hand the image to every docker leg.
   docker-base:
-    if: (github.event.pull_request.draft != true) && (vars.CI_SCOPE == 'full' || github.event_name == 'schedule' || github.event_name == 'workflow_dispatch')
+    if: (github.event.pull_request.draft != true) && (vars.CI_SCOPE == 'full' || github.event_name == 'schedule' || github.event_name == 'workflow_dispatch' || github.head_ref == 'release/v5-prerelease')
     needs: clippy
     runs-on: ${{ vars.DISABLE_DEPOT_RUNNERS == 'true' && 'ubuntu-22.04' || 'depot-ubuntu-22.04-4' }}
     timeout-minutes: 30
@@ -898,7 +903,7 @@ jobs:
       fail-fast: false
       matrix:
         os: [ubuntu-latest]
-    runs-on: ${{ vars.DISABLE_DEPOT_RUNNERS != 'true' && (matrix.os == 'ubuntu-latest' && 'depot-ubuntu-24.04-4' || matrix.os == 'ubuntu-22.04' && 'depot-ubuntu-22.04-4') || matrix.os }}
+    runs-on: ${{ vars.DISABLE_DEPOT_RUNNERS != 'true' && (matrix.os == 'ubuntu-latest' && 'depot-ubuntu-24.04-16' || matrix.os == 'ubuntu-22.04' && 'depot-ubuntu-22.04-4') || matrix.os }}
     timeout-minutes: 45
     env: &e2e-build-env
       CARGO_PROFILE_DEV_DEBUG: '0'
@@ -2384,7 +2389,7 @@ jobs:
   # ----------------------------------------------------------------------
   hosted-e2e:
     name: hosted-e2e            # may be a required check; do not rename
-    if: (github.event.pull_request.draft != true) && (vars.CI_SCOPE == 'full' || github.event_name == 'schedule' || github.event_name == 'workflow_dispatch')
+    if: github.event.pull_request.draft != true
     needs: clippy
     runs-on: ${{ vars.DISABLE_DEPOT_RUNNERS == 'true' && 'ubuntu-latest' || 'depot-ubuntu-24.04-4' }}
     permissions:

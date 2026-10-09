@@ -132,10 +132,13 @@ def matrix_include(job_lines):
     return rows
 
 
-def job_rows(jobs_by_id, job):
-    """All rows of a job family, including its independent OS siblings."""
+def job_rows(jobs_by_id, job, extended=True):
+    """All rows of a job family, including its independent OS siblings.
+
+    `extended=False` leaves out the `-extended` sibling, whose rows run only
+    with CI_SCOPE=full or nightly, not on every pull request."""
     rows = matrix_include(jobs_by_id[job])
-    for os_name in ("windows", "macos", "extended"):
+    for os_name in ("windows", "macos") + (("extended",) if extended else ()):
         sibling = f"{job}-{os_name}"
         if sibling in jobs_by_id:
             rows += matrix_include(jobs_by_id[sibling])
