@@ -829,22 +829,49 @@ pub(super) async fn revert_uv(entry: &VendorEntry, root: &Path, dry_run: bool) -
     // fragment carried it has nothing left to restore; it warns
     // `vendor_lock_entry_removed` so the revert converges. Probed once,
     // before any record is reverted, so only the user's own edits count.
+    //
+    // #1287: for a TRANSITIVE package, `uv remove <parent>` drops only its
+    // `[[package]]` unit; the `[tool.uv]` override + source and the lock's
+    // `[manifest]` records this entry wrote survive verbatim (uv never
+    // touches them). Those are this entry's own references, which the loop
+    // below reverts, not the user's: they are set aside before probing.
     let uuid_lower = entry.uuid.to_ascii_lowercase();
-    let unreferenced = ![&pyproject_text, &lock_text]
-        .iter()
-        .any(|text| text.to_ascii_lowercase().contains(&uuid_lower));
+    let in_pyproject = |kind: &str| matches!(kind, "uv_sources_entry" | "uv_override");
+    let own_fragments_removed = |text: &str, pyproject: bool| {
+        let mut residual = text.to_string();
+        for rec in &entry.wiring {
+            let Some(new) = rec.new.as_ref().and_then(serde_json::Value::as_str) else {
+                continue;
+            };
+            if in_pyproject(&rec.kind) != pyproject || new.is_empty() {
+                continue;
+            }
+            if let Some(at) = residual.find(new) {
+                residual.replace_range(at..at + new.len(), "");
+            }
+        }
+        residual.to_ascii_lowercase()
+    };
+    let unreferenced = !own_fragments_removed(&pyproject_text, true).contains(&uuid_lower)
+        && !own_fragments_removed(&lock_text, false).contains(&uuid_lower);
+    // The pre-revert texts: a record is removed only when its OWN fragment
+    // is gone from them (a surviving one is reverted, or is drift).
+    let (pyproject_before, lock_before) = (pyproject_text.clone(), lock_text.clone());
     let removed = |rec: &WiringRecord| {
-        let carried_uuid = rec
-            .new
-            .as_ref()
-            .and_then(serde_json::Value::as_str)
-            .is_some_and(|new| new.to_ascii_lowercase().contains(&uuid_lower));
-        (unreferenced && carried_uuid).then(|| {
+        let new = rec.new.as_ref().and_then(serde_json::Value::as_str);
+        let carried_uuid = new.is_some_and(|new| new.to_ascii_lowercase().contains(&uuid_lower));
+        let before = if in_pyproject(&rec.kind) {
+            &pyproject_before
+        } else {
+            &lock_before
+        };
+        let gone = new.is_some_and(|new| !before.contains(new));
+        (unreferenced && carried_uuid && gone).then(|| {
             VendorWarning::new(
                 super::LOCK_ENTRY_REMOVED_CODE,
                 format!(
-                    "{} entry for {:?} no longer exists and nothing references {needle} any \
-                     more (the dependency was removed); nothing to restore",
+                    "{} entry for {:?} no longer exists and nothing else references {needle} \
+                     (the dependency was removed); nothing to restore",
                     rec.kind, rec.key
                 ),
             )
@@ -2949,6 +2976,74 @@ wheels = [
         assert!(!outcome.lock_entry_removed(), "{:?}", outcome.warnings);
         let (_, lock) = read_pair(tmp.path()).await;
         assert_eq!(lock, edited);
+    }
+
+    /// #1287: `uv remove python-dateutil` after vendoring its transitive
+    /// `six` drops only six's `[[package]]` unit (captured from uv 0.11.19):
+    /// the `[tool.uv]` override + source and the lock's `[manifest]
+    /// overrides` this entry wrote survive verbatim. Those are its own
+    /// references, so the vanished unit is REMOVED, not drift, and the
+    /// surviving records revert: both files end up as uv writes them for
+    /// the project without six.
+    #[tokio::test]
+    async fn revert_after_uv_remove_of_the_parent_is_not_drift() {
+        const REMOVED_PYPROJECT: &str = "[project]\nname = \"proj\"\nversion = \"0.1.0\"\n\
+            requires-python = \">=3.10\"\ndependencies = []\n";
+        const UNWIRED_LOCK: &str = "version = 1\nrevision = 3\nrequires-python = \">=3.10\"\n\n\
+            [[package]]\nname = \"proj\"\nversion = \"0.1.0\"\nsource = { virtual = \".\" }\n";
+        let tmp = write_pair(TRANSITIVE_REGISTRY_PYPROJECT, TRANSITIVE_REGISTRY_LOCK).await;
+        let p = load_uv_project(tmp.path()).await.unwrap();
+        let (wiring, meta, _) = wire_uv(
+            &p,
+            tmp.path(),
+            "six",
+            "1.16.0",
+            REL_WHEEL,
+            WHEEL_NAME,
+            WHEEL_SHA,
+            UUID,
+        )
+        .await
+        .unwrap();
+        let entry = entry_for(wiring, meta);
+        let (wired_pyproject, _) = read_pair(tmp.path()).await;
+        // What `uv remove python-dateutil` leaves (uv 0.11.19).
+        let after_remove_pyproject = wired_pyproject.replace(
+            "dependencies = [\"python-dateutil==2.8.2\"]",
+            "dependencies = []",
+        );
+        let after_remove_lock = format!(
+            "version = 1\nrevision = 3\nrequires-python = \">=3.10\"\n\n[manifest]\n\
+             overrides = [{{ name = \"six\", path = \"{REL_WHEEL}\" }}]\n\n[[package]]\n\
+             name = \"proj\"\nversion = \"0.1.0\"\nsource = {{ virtual = \".\" }}\n"
+        );
+        tokio::fs::write(tmp.path().join("pyproject.toml"), &after_remove_pyproject)
+            .await
+            .unwrap();
+        tokio::fs::write(tmp.path().join("uv.lock"), &after_remove_lock)
+            .await
+            .unwrap();
+        let outcome = revert_uv(&entry, tmp.path(), false).await;
+        assert!(outcome.success, "{:?}", outcome.error);
+        assert!(!outcome.drift_skipped(), "{:?}", outcome.warnings);
+        assert!(outcome.lock_entry_removed(), "{:?}", outcome.warnings);
+        let (pyproject, lock) = read_pair(tmp.path()).await;
+        assert_eq!(pyproject, REMOVED_PYPROJECT);
+        assert_eq!(lock, UNWIRED_LOCK);
+
+        // A user's own edit that still routes through the uuid dir (here a
+        // second source line naming the wheel) keeps everything.
+        let edited = format!("{after_remove_pyproject}# other = {{ path = \"{REL_WHEEL}\" }}\n");
+        tokio::fs::write(tmp.path().join("pyproject.toml"), &edited)
+            .await
+            .unwrap();
+        tokio::fs::write(tmp.path().join("uv.lock"), &after_remove_lock)
+            .await
+            .unwrap();
+        let outcome = revert_uv(&entry, tmp.path(), false).await;
+        assert!(outcome.drift_skipped(), "{:?}", outcome.warnings);
+        assert!(!outcome.lock_entry_removed(), "{:?}", outcome.warnings);
+        assert_eq!(read_pair(tmp.path()).await, (edited, after_remove_lock));
     }
 
     #[tokio::test]
