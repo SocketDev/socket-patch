@@ -4,6 +4,7 @@ vlt-compatibility.yml. Parses the workflows with a small reader of the YAML
 subset they use (no PyYAML on the runners)."""
 
 import importlib.util
+import json
 import re
 import unittest
 from pathlib import Path
@@ -102,6 +103,11 @@ def jobs(text):
 def matrix_include(job_lines):
     """The `strategy.matrix.include` rows of a job (flow or block style)."""
     lines = [strip_comment(l) for l in job_lines]
+    scoped = next((l for l in job_lines if l.strip().startswith("include: ${{ fromJSON(")), None)
+    if scoped is not None:
+        # CI_SCOPE-switched rows: the first JSON literal is the full table.
+        literal = re.search(r"&& '(\[.*?\])'", scoped).group(1)
+        return [{k: str(v) for k, v in row.items()} for row in json.loads(literal)]
     at = next(i for i, l in enumerate(lines) if l.strip() == "include:")
     base = indent(lines[at])
     rows, current, item_indent = [], None, None
@@ -129,7 +135,7 @@ def matrix_include(job_lines):
 def job_rows(jobs_by_id, job):
     """All rows of a job family, including its independent OS siblings."""
     rows = matrix_include(jobs_by_id[job])
-    for os_name in ("windows", "macos"):
+    for os_name in ("windows", "macos", "extended"):
         sibling = f"{job}-{os_name}"
         if sibling in jobs_by_id:
             rows += matrix_include(jobs_by_id[sibling])
