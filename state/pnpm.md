@@ -1,6 +1,6 @@
 [agent] Progress ledger for the scheduled pnpm bug-hunt routine (label pm:pnpm).
 
-Last updated: 2026-10-09 (run 36), main `f3c6313`, latest release 4.0.0.
+Last updated: 2026-10-09 (run 37), main `a80b89e`, latest release 4.0.0.
 
 Method: real pnpm installs. Hosted, vendored and global agent mode run against a local Python mock of the patch API (the batch and by-package routes must answer only for the purls they actually serve, or an upgraded tree looks like a failure; batch, by-package, view with inline blobs, `patches/blob/<hash>`, package grant, hosted tarball, `/registry/<name>/<ver>` mirror; `ajv-keywords@3.5.2` serves as the peer-dependency package). On v5, set `SOCKET_PATCH_SERVER_URL=<mock>` and `SOCKET_NPM_REGISTRY=<mock>/registry` so that hosted pins are recognised and rollback can restore upstream. The oracle is a marker prepended to `index.js`, checked after a fresh `--frozen-lockfile` install against a dead registry, or by running the global tool. The repo's pinned matrix (`.github/workflows/pnpm-compatibility.yml`) already covers plain hosted and vendored installs on pnpm 1–12. This ledger tracks what it doesn't.
 
@@ -411,8 +411,22 @@ Global mode (`-g`, v5 main `2463257`):
 | Linux | any | unwritable global prefix | blocked (sandbox runs as root) | | | | | | |
 | macOS / Windows | all | | untested | untested | untested | untested | untested | untested | untested |
 
+Post-#1007 re-verification (run 37, main `a80b89e`, Linux, Node 22):
+
+| Fix | pnpm | Cell | Result |
+| --- | --- | --- | --- |
+| #734 version-gated scaffold | 9.15.9 / 10.4.1 (`packageManager` pin, no workspace file) | hosted + vendored: no file created, fresh frozen install patched, `pnpm add` works, rollback byte-exact | pass |
+| #466 two-document lock | 12.10.1 (`packageManagerDependencies` env doc), 11.28.5 | vendored: fresh frozen install patched, rollback lock byte-exact | pass |
+| #556 gitBranchLockfile | 10.34.6 (`.npmrc`) / 12.10.1 (yaml), branch `feat/x` | hosted warns `redirect_pnpm_git_branch_lockfile`, vendored refuses, nothing written | pass |
+| #492 per-member locks | 9.15.9 / 10.34.6 / 12.10.1 | hosted pins both member locks, fresh frozen root install patches both | pass |
+| #492 per-member locks | 9.15.9 / 10.34.6 / 12.10.1 | rollback / remove: `trustLockfile: true` left with no `pnpm_trust_lockfile_left` | fail #1268 |
+| #919 mirror restore | 9.15.9 (`.npmrc`), 11.28.5 / 12.10.1 (`.npmrc` and workspace `registry:`) | restore reads the mirror; a mirror serving npmjs `dist.tarball` loses its `tarball:` (not byte-exact) | residual, commented on #919 |
+| #854 exact-pin takeover | 10.34.6 / 12.10.1, plain / quoted / commented / `name@ver` keys | vendored patched, rollback byte-exact (comment restored) | pass |
+| #778 agent path scope | 9.15.9 / 12.10.1 | `scan packages/a` patches only a's deps, `rollback packages/a` unwinds them | pass |
+
 ## Backlog
 
+0z. Post-#1007 follow-ups: #1268 with a scoped rollback (root lock restored while a member lock stays hosted, where `still_hosted` checks only the root); #734's gate when `.modules.yaml` names pnpm 9 but a pnpm 11 CI installs (expect a loud `ERR_PNPM_TARBALL_URL_MISMATCH` plus the warning); #556 with `mergeGitBranchLockfilesBranchPattern` on main; and re-verifying #435, #713, #830, #853 and #1006 from the list in item 9.
 00a. #1050 GC follow-ups: `scan --prune` over a peer-suffixed vendored snapshot and over Rush / subspace locks. (`sharedWorkspaceLockfile: false` member: vendored now refuses `vendor_pnpm_settings_elsewhere` on 10.34.6 too, by design. #1029 `modulesDir` / `virtualStoreDir` and `unpinned` rows: done in run 34.)
 00b. #1039 follow-ups: the takeover over a `pnpm patch`-ed vendored package, and a takeover on Windows (CRLF autocrlf checkout). The interrupted takeover is #1157. (Interrupted vendored-only commit: done in run 35, pass.)
 00c. #1197 follow-ups: a workspace member's orphan, and re-verification on 7–12 once fixed. (Upgrade orphan on 12 and agent `vex` over an orphan: done in run 36.)
@@ -440,7 +454,7 @@ Global mode (`-g`, v5 main `2463257`):
 8d. v5 rollout and policy over pnpm locks: `--max-new-patches 1` passes on 12.10.1, hosted and vendored (run 32). Still to do: 9.15.9, a two-document lock on 12.x, and socket.yml `includePaths` in a workspace with `sharedWorkspaceLockfile: false`.
 8e. #935 follow-up: `git+` / `github:` copies (`link:` copy done in run 29: pass).
 8f. #1006 follow-ups (settings-only parent done in run 34; negated globs done in run 35; both commented): pnpm 10 `ignore-workspace`, and vendored from a real member on 11/12 (expect `vendor_pnpm_settings_elsewhere`).
-9. Re-verify the open set when fixes land (#853 core and #880/#881 verified in run 29; #956, #903, #904 and the #935 VEX half verified in run 30): #435, #466, #492, #556, #633, #713, #714, #734, #778, #830, #831 (PR #837, pnpm gitignore matrix), #853, #854, #880, #881, #902, #903, #904 (fix PR #909), #919, #935 (vendored scan-warning half; hosted now skips loudly), #1006, #1197, #1074, #1096 and #1111.
+9. Re-verify the open set when fixes land. #1007 closed #435, #466, #492, #556, #633, #713, #714, #734, #778, #830, #853, #854, #902, #919 and #1006 (run 37 verified #466, #492, #556, #734, #778, #854 and #919 on Linux). Still open: #935, #1074 (still reproduces on 12.10.1, run 37), #1096 (still reproduces on 9.15.9, run 37, all four cells), #1111, #1155 (cross-PM), #1157, #1197 and #1268. Not yet re-verified after #1007: #435 (`-g` on 11/12), #633, #713 / #714 (Rush), #830, #853, #902 and #1006.
 9a. BOM follow-ups (#903 / #904): a fresh install of a hosted BOM-`package.json` pin, and Windows checkouts (needs a probe). (Vendored BOM workspace file on 9.15.9 / 10.34.5 done in run 25: #904 reproduces.)
 9b. #902 follow-ups: the setting in the global `rc` / `config.yaml`. (Mirror + tarball URLs became #919 in run 24.)
 9c. #919 follow-ups: scoped `@scope:registry=` mirrors, the hosted → vendored takeover + `vendor --revert` on a mirror, pnpm 7/8 lock dialects, and re-verification once PR #918 (or a successor) covers `restore_pnpm_locks`.
@@ -530,3 +544,5 @@ Global mode (`-g`, v5 main `2463257`):
 - Since #1058 (run 35), hosted refuses to pin a registry copy when another lock entry installs the same name@version from a `file:` tarball (`redirect_unattributable`, nothing written, exit 0). That's deliberate: it matches the VEX contested-lock rule. The vendored scan-warning gap is still #935.
 - After `pnpm remove` of a vendored package, `vendor --check` exits 1 with "dependency removed … run `scan --mode vendored --prune`" (run 35). That's correct and actionable; the prune retires the entry (its own exit 1 on 7–11 is #1197).
 - An interrupted vendored-only commit at `group_commit_file@N` leaves the superseded uuid dir until `scan --prune`. It's listed as `vendorOrphanDirs` and reclaimed there, so it fails safe, unlike the takeover in #1157 (run 35).
+- pnpm with `gitBranchLockfile` on writes `pnpm-lock.<branch>.yaml` even on `main` (there's no `pnpm-lock.yaml` unless the branch locks are merged), so hosted and vendored refuse such projects on every branch. That's the loud, documented #556 refusal (run 37).
+- Fixture note (run 37): a stray `package.json` with `packageManager` in a parent directory (for example `/tmp`) makes pnpm 11+ switch versions for child fixtures. Keep fixtures under a clean tree, and put `/opt/node22/bin` ahead of `/usr/local/bin` (Node 20 there lacks the `node:sqlite` that pnpm 11 needs).
