@@ -89,7 +89,7 @@ _Last updated 2026-10-09T12:58Z · main @ a80b89e_
 | E92 | 3 | pnpm `modulesDir` is honored by the crawler but not by `pkg_managers`: `node-linker=pnp` + `modulesDir` is classified yarn PnP, so apply refuses (`yarn_pnp_unsupported`), vendored gives the yarn remedy and VEX reads the wrong loader (real pnpm 10.28, executed twice). | new finding | #1129 | in PR #1347 |
 | E93 | 3 | NuGet version identity: vendor normalizes (`normalize_nuget_version`), `PurlKey`/crawler only lowercase; a vendored `@13.0.3.0` is judged unused, so `scan --prune` reverts it (executed 3×). | new finding | #1202 | partly fixed (#1230, #1239); `PurlKey` and the crawler lookup normalize; the move of `normalize_nuget_version` to `formats::nuget` remains |
 | E94 | 2 | "Keep the older vendored patch while the superseding one is unserved" (#954) is npm-only: `ServicePolicy::unserved` carries the code only under `ServiceTerminal::Failure`; other backends refuse `vendor_prebuilt_required`, so re-runs exit 1 (Composer, executed twice). | new finding | #1235 | filed #1235 |
-| E95 | 3 | sbt evidence fails closed on an unreadable record; `scala_evidence::discover` skips one, so a truncated `-test` twin hides a `test.dep` conflict and the scala-cli gate passes (executed twice). | new finding | #1270 | filed #1270 |
+| E95 | 3 | sbt evidence fails closed on an unreadable record; `scala_evidence::discover` skips one, so a truncated `-test` twin hides a `test.dep` conflict and the scala-cli gate passes (executed twice). | new finding | #1270 | in PR #1358 |
 
 **Handed off:** none yet.
 
