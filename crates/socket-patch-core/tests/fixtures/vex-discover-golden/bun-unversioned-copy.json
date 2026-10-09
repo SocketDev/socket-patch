@@ -1,0 +1,106 @@
+{
+  "bun-unversioned-copy/lockb/file": {
+    "refs": [],
+    "diagnostics": [],
+    "recognized": [],
+    "unlocked_pins": [],
+    "elsewhere": [
+      {
+        "purl": "pkg:npm/minimist@1.2.2",
+        "file": "bun.lockb"
+      }
+    ],
+    "live_claims": []
+  },
+  "bun-unversioned-copy/lockb/git": {
+    "refs": [],
+    "diagnostics": [],
+    "recognized": [],
+    "unlocked_pins": [],
+    "elsewhere": [
+      {
+        "purl": "pkg:npm/minimist@1.2.2",
+        "file": "bun.lockb"
+      }
+    ],
+    "live_claims": []
+  },
+  "bun-unversioned-copy/lockb/url": {
+    "refs": [],
+    "diagnostics": [],
+    "recognized": [],
+    "unlocked_pins": [],
+    "elsewhere": [
+      {
+        "purl": "pkg:npm/minimist@1.2.2",
+        "file": "bun.lockb"
+      }
+    ],
+    "live_claims": []
+  },
+  "bun-unversioned-copy/text-0/file": {
+    "refs": [],
+    "diagnostics": [],
+    "recognized": [],
+    "unlocked_pins": [],
+    "elsewhere": [
+      {
+        "purl": "pkg:npm/minimist@1.2.2",
+        "file": "bun.lock"
+      }
+    ],
+    "live_claims": []
+  },
+  "bun-unversioned-copy/text-1/file": {
+    "refs": [],
+    "diagnostics": [],
+    "recognized": [],
+    "unlocked_pins": [],
+    "elsewhere": [
+      {
+        "purl": "pkg:npm/minimist@1.2.2",
+        "file": "bun.lock"
+      }
+    ],
+    "live_claims": []
+  },
+  "bun-unversioned-copy/text-2/file": {
+    "refs": [],
+    "diagnostics": [],
+    "recognized": [],
+    "unlocked_pins": [],
+    "elsewhere": [
+      {
+        "purl": "pkg:npm/minimist@1.2.2",
+        "file": "bun.lock"
+      }
+    ],
+    "live_claims": []
+  },
+  "bun-unversioned-copy/text-2/git": {
+    "refs": [],
+    "diagnostics": [],
+    "recognized": [],
+    "unlocked_pins": [],
+    "elsewhere": [
+      {
+        "purl": "pkg:npm/minimist@1.2.2",
+        "file": "bun.lock"
+      }
+    ],
+    "live_claims": []
+  },
+  "bun-unversioned-copy/text-2/url": {
+    "refs": [],
+    "diagnostics": [],
+    "recognized": [],
+    "unlocked_pins": [],
+    "elsewhere": [
+      {
+        "purl": "pkg:npm/minimist@1.2.2",
+        "file": "bun.lock"
+      }
+    ],
+    "live_claims": []
+  }
+}

@@ -2239,6 +2239,45 @@ mod tests {
         );
     }
 
+    /// REGRESSION (#735): a dangling `bun.lock` link is absent to Bun,
+    /// which installs from `bun.lockb`, so the GC probe resolves through
+    /// the binary lock instead of reading the link and never deciding.
+    #[cfg(unix)]
+    #[tokio::test]
+    async fn binary_bun_in_use_sees_through_a_dangling_text_lock_link() {
+        let tmp = tempfile::tempdir().unwrap();
+        let bytes = include_bytes!("../../tests/fixtures/bun-lockb/1.3.14/bun.lockb");
+        let mut lock = super::super::bun_lockb::BunLockb::parse(bytes).unwrap();
+        let package = lock
+            .packages()
+            .unwrap()
+            .into_iter()
+            .find(|package| package.name == "minimist")
+            .unwrap();
+        let mut entry = probe_entry(Some("bun"));
+        let target = format!(".socket/vendor/npm/{UUID}/minimist-1.2.2.tgz");
+        entry.base_purl = "pkg:npm/minimist@1.2.2".into();
+        entry.artifact.path = target.clone();
+        let sri = format!("sha512-{}", "A".repeat(86) + "==");
+        lock.set_package(package.id, &target, &sri).unwrap();
+        tokio::fs::write(tmp.path().join("bun.lockb"), lock.bytes())
+            .await
+            .unwrap();
+        std::os::unix::fs::symlink("missing-target", tmp.path().join("bun.lock")).unwrap();
+        assert_eq!(in_use(&entry, tmp.path()).await, Some(true));
+
+        lock.set_package(
+            package.id,
+            "https://registry.example/minimist-1.2.2.tgz",
+            &sri,
+        )
+        .unwrap();
+        tokio::fs::write(tmp.path().join("bun.lockb"), lock.bytes())
+            .await
+            .unwrap();
+        assert_eq!(in_use(&entry, tmp.path()).await, Some(false));
+    }
+
     /// An entry stamped `flavor="pnpm-legacy"` must dispatch to the legacy
     /// backend's structural packages-key probe — not fall into the
     /// unknown-flavor `Some(_) => None` arm (a typo'd match string would

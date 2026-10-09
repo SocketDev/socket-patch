@@ -1310,6 +1310,92 @@ async fn bun_isolated_linker_transitive_only_dep_apply_patches_store() {
     );
 }
 
+/// #635: with Bun's global store (`globalStore = true`, Bun >= 1.3.14) every
+/// `node_modules/.bun/<entry>` links into `<cache>/links/<entry>-<hash>`,
+/// which every project using that cache shares. Agent-mode apply in one
+/// project must refuse the transitive `is-number` there (not skip it as not
+/// installed, and not write through the link into the other project).
+#[tokio::test]
+#[serial]
+async fn bun_global_store_transitive_dep_apply_is_refused() {
+    if !has("bun") {
+        println!("SKIP: bun not on PATH");
+        return;
+    }
+
+    let tmp = tempfile::tempdir().unwrap();
+    let cache = tmp.path().join("bun-cache");
+    for project in ["a", "b"] {
+        let dir = tmp.path().join(project);
+        std::fs::create_dir_all(&dir).unwrap();
+        std::fs::write(
+            dir.join("package.json"),
+            format!(
+                r#"{{ "name": "bun-gs-{project}", "version": "0.0.0", "dependencies": {{ "is-odd": "3.0.1" }} }}"#
+            ),
+        )
+        .unwrap();
+        std::fs::write(
+            dir.join("bunfig.toml"),
+            "[install]\nlinker = \"isolated\"\nglobalStore = true\n",
+        )
+        .unwrap();
+        let out = pm_command("bun", &["npm_config_", "BUN_"])
+            .args(["install", "--no-progress"])
+            .current_dir(&dir)
+            .env("BUN_INSTALL_CACHE_DIR", &cache)
+            .stdout(std::process::Stdio::piped())
+            .stderr(std::process::Stdio::piped())
+            .output()
+            .expect("bun install");
+        if !out.status.success() {
+            println!(
+                "SKIP: bun install failed: {}",
+                String::from_utf8_lossy(&out.stderr)
+            );
+            return;
+        }
+    }
+    let project = tmp.path().join("a");
+    let entry = project.join("node_modules/.bun/is-number@6.0.0");
+    if !std::fs::symlink_metadata(&entry).is_ok_and(|m| m.file_type().is_symlink()) {
+        println!("SKIP: this bun has no global store (Bun < 1.3.14)");
+        return;
+    }
+    let other = tmp
+        .path()
+        .join("b/node_modules/.bun/is-number@6.0.0/node_modules/is-number/index.js");
+    assert_eq!(
+        std::fs::canonicalize(&other).unwrap(),
+        std::fs::canonicalize(entry.join("node_modules/is-number/index.js")).unwrap(),
+        "premise: both projects load is-number from the shared store"
+    );
+
+    let index = entry.join("node_modules/is-number/index.js");
+    let original = std::fs::read(&index).expect("read is-number/index.js");
+    let before_hash = git_sha256(&original);
+    let mut patched = original.clone();
+    patched.extend_from_slice(b"\n// SOCKET-PATCH-BUN-GLOBAL-STORE-MARKER\n");
+    let after_hash = git_sha256(&patched);
+    let socket = project.join(".socket");
+    write_manifest(
+        &socket,
+        "pkg:npm/is-number@6.0.0",
+        &before_hash,
+        &after_hash,
+    );
+    std::fs::create_dir_all(socket.join("blobs")).unwrap();
+    std::fs::write(socket.join("blobs").join(&after_hash), &patched).unwrap();
+
+    let code = apply_run(default_apply(&project)).await;
+    assert_ne!(code, 0, "apply must refuse the shared store copy");
+    assert_eq!(
+        std::fs::read(&other).unwrap(),
+        original,
+        "the other project's copy must stay untouched"
+    );
+}
+
 /// #373: Deno's isolated `nodeModulesDir` keeps a transitive npm package
 /// only at `node_modules/.deno/<name>@<version>/node_modules/<name>`
 /// (beside `.deno/.deno.lock` and the `.deno/node_modules` hoist dir).

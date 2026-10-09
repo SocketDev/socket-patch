@@ -212,7 +212,7 @@ fn path_glob_matches(pattern: &[Vec<char>], path: &[Vec<char>], dot: bool) -> bo
     }
 }
 
-fn segment_glob_matches(pattern: &[char], name: &[char]) -> bool {
+pub(crate) fn segment_glob_matches(pattern: &[char], name: &[char]) -> bool {
     match pattern.split_first() {
         None => name.is_empty(),
         Some(('*', rest)) => (0..=name.len()).any(|skip| segment_glob_matches(rest, &name[skip..])),

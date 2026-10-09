@@ -1,0 +1,9 @@
+{
+  "name": "trusted-lockb-fixture",
+  "version": "1.0.0",
+  "private": true,
+  "dependencies": {
+    "simple-git-hooks": "2.11.1",
+    "is-number": "7.0.0"
+  }
+}

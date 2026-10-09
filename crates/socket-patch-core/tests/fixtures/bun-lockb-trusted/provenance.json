@@ -1,0 +1,8 @@
+{
+  "bun": "1.4.2",
+  "os": "darwin",
+  "arch": "aarch64",
+  "command": "bun install --ignore-scripts",
+  "sha256": "d556a6f991edb902cf74833fc00c8f639e13301871a63e231ce53477f3b32350",
+  "note": "simple-git-hooks is on Bun's default trusted list (#371); is-number is not"
+}

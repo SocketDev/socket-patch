@@ -47,3 +47,11 @@ crates/socket-patch-core/tests/fixtures/sbt/** -text
 # (sbt-compatibility.yml); a CRLF checkout breaks them ($'\r').
 scripts/sbt-warm-seed.sh text eol=lf
 scripts/sbt-compat-matrix.sh text eol=lf
+
+# Real `bun install --save-text-lockfile` output: the migrated-lock revert
+# tests compare restored bun.lock bytes against it exactly (#784).
+crates/socket-patch-core/tests/fixtures/bun-lockb/1.2.23-migrated/*.lock -text
+
+# Real Bun locks with a version-less own-source copy (#497): the VEX tests
+# rewire the nested registry entry of the captured bytes in place.
+crates/socket-patch-core/tests/fixtures/bun-unversioned-copy/** -text

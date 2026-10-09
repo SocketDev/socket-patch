@@ -487,14 +487,28 @@ impl RestoreOutcome {
 }
 
 /// The remedy every refusal names: restore the file from version control.
+/// For a Bun lock it also names `bun install --force`: Bun's hoisted linker
+/// keeps the installed patched copy when the restored entry is the registry
+/// copy of the same `name@version`, so a plain `bun install` after the
+/// checkout reports no changes (#764).
 pub fn checkout_remedy(files: &[String]) -> String {
     if files.is_empty() {
         return "restore the lockfile from version control (`git checkout -- <lockfile>`)"
             .to_string();
     }
+    use crate::constants::npm_family::{BUN_LOCK, BUN_LOCKB};
+    let bun = files.iter().any(|f| {
+        let name = f.rsplit(['/', '\\']).next().unwrap_or(f);
+        name == BUN_LOCK || name == BUN_LOCKB
+    });
     format!(
-        "restore it from version control instead (`git checkout -- {}`)",
-        files.join(" ")
+        "restore it from version control instead (`git checkout -- {}`){}",
+        files.join(" "),
+        if bun {
+            ", then run `bun install --force` (a plain `bun install` keeps the patched copy)"
+        } else {
+            ""
+        }
     )
 }
 
@@ -858,4 +872,26 @@ async fn restore_pass(view: &mut View<'_>, active: &[&HostedPin], ctx: &Ctx<'_>)
     // npm-family lock entry needs them any more.
     npm::cleanup_side_config(view, ctx, &mut out).await;
     out
+}
+
+#[cfg(test)]
+mod tests {
+    use super::checkout_remedy;
+
+    #[test]
+    fn bun_lock_remedies_name_the_forced_reinstall() {
+        for file in ["bun.lockb", "bun.lock", "packages/app/bun.lockb"] {
+            let remedy = checkout_remedy(&[file.to_string()]);
+            assert!(remedy.contains(&format!("`git checkout -- {file}`")), "{remedy}");
+            assert!(remedy.ends_with(
+                ", then run `bun install --force` (a plain `bun install` keeps the patched copy)"
+            ), "{remedy}");
+        }
+        for file in ["yarn.lock", "package-lock.json", "bun.lock.bak"] {
+            assert_eq!(
+                checkout_remedy(&[file.to_string()]),
+                format!("restore it from version control instead (`git checkout -- {file}`)")
+            );
+        }
+    }
 }
