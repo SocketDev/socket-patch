@@ -119,12 +119,11 @@ Revert/restore/unwind code in the non-npm backends totals **about 3,540 lines**:
 
 **XML: eight hand-rolled scanners and no XML crate.**
 - `<!--` handling is implemented in 8 files, including two strippers inside `maven_repo.rs`; one of them is the shared `formats::xml` scanner, which Gradle's verification-metadata reader uses since #1145.
-- There are four attribute extractors with three different tokenization rules:
-  - `nuget_feed.rs:1094 attr_value` matches any substring, with no word boundary;
+- There are three attribute extractors with three different tokenization rules (the vendored NuGet writer's substring `attr_value` was deleted, #1288):
   - `redirect/upstream/nuget.rs:39` uses a regex;
   - `formats::xml::attr` (Gradle's reader since #1145, which deleted `jvm/gradle.rs`'s private scanner);
   - `formats/nuget/mod.rs:41` does a real tag parse.
-- The vendored NuGet writer (`nuget_feed.rs`) never uses the shared reader `formats::nuget::parse_config`, **so its reader and writer can disagree about what a file contains**. The hosted splicer now uses it (#597). {{E10}}
+- The vendored NuGet writer (`nuget_feed.rs`) takes its keys and anchors from `formats::nuget::parse_config`, the reader the hosted splicer also uses (#597, #1288). Its revert excision (`excise_source_mapping`) still matches the exact bytes it wrote. {{E10}}
 - `pom.xml` alone has seven scanners (checked on `045d7ec`): `formats::maven::parse_pom` (VEX, restore gate); the hosted rewriter's raw regex (`MAVEN_DEPENDENCY_BLOCK_RE`, `insert_maven_*`), which upstream restore reuses and which masks nothing; vendored `maven_repo.rs` (`comment_spans`/`profiles_spans`, plus a second `declares_modules`); the reactor's `mask` + `Doc` tree and, in the same file, `scan_pom_project` (a depscan port); and the crawler's and `vex/product.rs`'s own readers. None of the three writers (hosted, restore, vendored single-pom) locates elements through a reader. Target: one masked element tree in `formats::maven` that readers and splicing writers both query. {{E10}}
 - The Maven share of the open backlog is mostly this: #259 "edits commented-out, plugin and profile markup", #342 "adds a second section when the existing one is self-closed or has a comment", #683 (`<exclusions>` first) and {{E10}}.
 
