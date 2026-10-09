@@ -647,7 +647,7 @@ fn spec_ref(
                 file,
                 Some(*remote),
                 lock.integrity(spec.name, spec.version),
-                lock.checksums.is_some(),
+                lock.has_checksums(),
             ));
         }
         Wiring::Vendored(vref) => {
