@@ -1,16 +1,16 @@
 ### Refactor routine (`refactor`, hourly, highest leverage first)
-_Last updated 2026-10-09T09:15Z · main @ f6a9fea_
+_Last updated 2026-10-09T10:15Z · main @ a80b89e_
 
 **In flight:**
-- [#1253](https://github.com/SocketDev/socket-patch/pull/1253): agent-mode `jvm_jar::verify_member_bytes` streams members through `hash::git_sha256::zip_member_git_sha256` (302 → 30 MiB peak on a 256 MiB member). #914 slice (C51); `vendor/common.rs` caller waits for #1227. +17/−11 prod, +85 tests. `state: ready`.
+- [#1258](https://github.com/SocketDev/socket-patch/pull/1258): 40 more CLI test files import `tests/common`'s `binary()` / `git_sha256` (31 + 25 copies deleted). #824 children 2–3 slice 2 (C30). +142/−401 tests, 0 prod. `state: ready`.
+- [#1253](https://github.com/SocketDev/socket-patch/pull/1253): agent-mode `jvm_jar::verify_member_bytes` streams members through `hash::git_sha256::zip_member_git_sha256` (302 → 30 MiB peak on a 256 MiB member). #914 slice (C51); `vendor/common.rs` caller is free since #1227 merged; it needs #1253's helper. +17/−11 prod, +85 tests. `state: ready`.
 - [#1245](https://github.com/SocketDev/socket-patch/pull/1245): `vendor::revert::finish` + `KeepPolicy` (`OnDrift`, `OnDriftWhileReferenced`, `NpmFamily`); gem, composer, Maven legacy, NuGet and pnpm finish through it. #989 item 1 slice (E24). +133/−157 prod (helper 90), +271 tests. `state: ready`.
 - [#1239](https://github.com/SocketDev/socket-patch/pull/1239): NuGet crawler `find_by_purls` looks up the global folder and legacy `<Id>.<Version>/` folders by the normalized version (`1.0.0.0` = `1.0.0`) through `normalize_nuget_version`. #1202 crawler slice (E93). +47/−19 prod, +116/−4 tests. `state: ready`.
-- [#1227](https://github.com/SocketDev/socket-patch/pull/1227): `common::detect_eol`, `pypi_uv::newline_of` and the `.npmrc` splice through `line_endings::terminator`. #815 slice 2 (E16). +25/−44 prod, +93 tests; golang golden re-blessed (mixed go.sum inputs only). `state: ready`.
 - [#1188](https://github.com/SocketDev/socket-patch/pull/1188): one `Pipfile.lock` writer (`formats::pipenv::splice_entry`, `formats::json`). Issue #1128 (E14). +303/−235 production. `redirect/mod.rs` wrapper `pipenv_reserialized_around_reference` left for when that file is free. `state: ready`.
 - [#1126](https://github.com/SocketDev/socket-patch/pull/1126): 7 inline purl-type checks through `Ecosystem::from_purl` + guard. Issue #747 (C20, slice 1). `state: ready`.
 - Maintainer drafts (decided issues): #1049 (#792). #1036 (#973), #1041 (#648), #1027, #1030, #1031 and #1051 merged.
 
-**Merged:** #1221 (E19 hosted gem sections, +213/−140 prod), #1230 (E93 `PurlKey`, +37/−7 prod), #1217 (E05 Deno crawl, +108/−43 prod), #1209 (E05 Go crawl, +132/−44 prod), #1205 (E05 cargo crawl), #1183 (E05 NuGet crawl); earlier #1191, #1185, #1103, #1108, #1163, #1160, #1153, #1151, #1145, #1141, #1106, #1110, #1117, #1121, #1124, #1021, #1015, #889, #876, #886, #870, #865, #858, #850, #607, #602, #597, #587, #583, #581, #574, #572 (see `entries/refactor/`). Leftovers: `blob_hash_matches` (#1163), dead `eco == "maven2"` arm in `commands/vendor.rs` (#1015).
+**Merged:** #1227 (E16 slice 2, +25/−44 prod), #1221 (E19 hosted gem sections, +213/−140 prod), #1230 (E93 `PurlKey`, +37/−7 prod), #1217 (E05 Deno crawl, +108/−43 prod), #1209 (E05 Go crawl, +132/−44 prod), #1205 (E05 cargo crawl), #1183 (E05 NuGet crawl); 32 earlier PRs (#572 … #1191, see `entries/refactor/`). Leftovers: `blob_hash_matches` (#1163), dead `eco == "maven2"` arm in `commands/vendor.rs` (#1015).
 
 **Queue** (B bugs closed, U unblocks, D duplication removed, R risk; score = 3B + 2U + 2D + S − risk). Since the 2026-10-08 backlog review, standalone refactor issues are closed as `not_planned` and kept as checklist items of their tracker; rank the tracker's next unchecked item.
 
@@ -18,11 +18,11 @@ _Last updated 2026-10-09T09:15Z · main @ f6a9fea_
 |---|---|:-:|:-:|:-:|:-:|:-:|---|
 | 1 | #989 item 1: one `vendor::revert::finish` for the 12 copied finish blocks | 0 | 1 | ≈12 | L | ≈26 | **taken: #1245**; bun ×2 (#1009), npm (#1161, #1187), vlt (#1161), pypi (#1026), yarn classic (#1242) and berry remain |
 | 2 | #931 + #998 + #1063 + #1123: one manifest load + error mapper for every command | 4 | 1 | ≈6 | M | ≈24 | skipped: `apply.rs`, `vendor.rs`, `rollback.rs` (#1009, #1049), `remove.rs` (#1034, #1049), `repair.rs` (#1049) |
-| 3 | #717 (E10): hosted pom edits + restore through `formats::maven` | 3 | 1 | ≈4 | M | ≈17 | skipped: `redirect/mod.rs` (#1009, #1026, #1180, #1242) |
-| 4 | #1220 (C78): bound upstream-restore fan-out through `utils::concurrent::registry_concurrency` | 1 | 0 | ≈4 | L | ≈11 | skipped: `upstream/mod.rs` (#1009, #1211), `concurrent.rs` (#1026) |
-| 5 | #914 (C51): agent-mode jar members through the streaming zip hasher | 0 | 0 | ≈1 | L | ≈7 | **taken: #1253** (`jvm_jar.rs`); `vendor/common.rs` caller after #1227 |
+| 3 | #717 (E10): hosted pom edits + restore through `formats::maven` | 3 | 1 | ≈4 | M | ≈17 | skipped: `redirect/mod.rs` (#1009, #1026, #1180, #1242, #1254) |
+| 4 | #1220 (C78): bound upstream-restore fan-out through `utils::concurrent::registry_concurrency` | 1 | 0 | ≈4 | L | ≈11 | skipped: the `join_all` sites in upstream `cargo.rs` (#1254), `pypi.rs` (#1188), `composer.rs` (#1026), `npm.rs` (#1009); `upstream/mod.rs` (#1009, #1211) |
+| 5 | #824 children 2–3 slice 2 (C30): 56 test-helper copies onto `tests/common` | 0 | 0 | 56 test | L | test-only | **taken: #1258**; 27 files changed by open PRs + 4 shared modules remain |
 
-Re-ranked 2026-10-09T09:00Z at `f6a9fea` against 29 open PRs changing 392 files (#1221 merged; #780 vendored slice waits on `vendor/gem.rs`, #1245/#1026; claim released). #1098 (E90) still needs `ecosystem_dispatch.rs`/`vex_consumed.rs` (#1009, #1026, #1034). #1202 `formats::nuget` move is free now (D 1). Free but lower: #1014 (`.mill-version` needs a decision), #265 Maven crawl (risk H), E37 (composer `normalize_version` ≡ `strip_leading_v`, D 1).
+Re-ranked 2026-10-09T10:00Z at `a80b89e` against 27 open PRs (17 agent PRs change 294 files). #1227 merged and frees `vendor/common.rs` for #914's last caller, but that needs #1253's helper first. Also skipped: #675 (`scan/mod.rs` #1049/#1211, `client.rs` #1026/#1034/#1049), #705 (`client.rs`, CLI `lib.rs` #1034), #794 (command files), #594/#1202 move (`nuget_feed.rs` #1245, `redirect/mod.rs`), #757/E15 (`redirect/mod.rs`, `vendor/cargo.rs` #1026), #782 remainder (`state.rs`, `wired.rs` #1009/#1034). Free but low: E64 BOM in `formats/pnpm/lines.rs`, `vex/discover/pypi_other.rs` (D ≈1 each), E37, #833 `vlt_lock_text.rs` move.
 
 **Notes:**
 - Revert finish (#1245): new backends end their revert with `revert::finish(outcome, root, rel, opts, KeepPolicy::…)`; the npm family keeps its bare `cannot remove <rel>` failure (warnings dropped), the rest keep warnings with `failed to remove <abs>`. Yarn berry/classic and npm add a still-wired refusal before the delete: extend the policy, do not re-copy the sequence.
@@ -35,7 +35,6 @@ Re-ranked 2026-10-09T09:00Z at `f6a9fea` against 29 open PRs changing 392 files 
 - Cargo crawl scope (#1205): only a registry cache with a parseable `<cwd>/Cargo.lock` is scoped. "Only the crawl vouches" tests put the crate in `vendor/`. Narrowing a crawl changes `scan --prune`: say so in the PR.
 - `Pipfile.lock` edits go through `formats::pipenv::splice_entry` since #1188: sort the value (`sort_all_objects`) before splicing; never re-serialize the whole lock.
 - NuGet crawl scope (#1183): only a `cwd` with a project file is scoped; a solution root keeps the walk (restores at any depth). Extend through `PackageRoots::scope`, not a second assets reader.
-- Poetry 2.x `files` is written one file per line by the shared engine since #1185; a test or golden that greps `files = [{ file` only sees 1.0/1.1 package-level `files` now.
 - A hash read from a manifest is lowercase after #1163; `api::blob_fetcher::blob_hash_matches` and vendored `eq_ignore_ascii_case` sites become plain `==` once their files are free (#707 remainder).
 - `formats::xml` (#1145) is the shared XML element scanner (comment + CDATA blanking, `elements`, `children`, `attr`); route new XML readers (NuGet, pom writers) through it instead of a private masker.
 - The skip rule names `arch-refactor/*` and `agent/fix-*` PRs only; still check `arch-fix/*` and `ci*` hunks before touching the same lines.

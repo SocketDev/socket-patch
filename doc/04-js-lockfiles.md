@@ -93,7 +93,7 @@ The question "which lockfile drives installs?" was answered in **at least eight 
 - npm_lock keeps the file's layout through `JsonLayout` (#357), and so does vendored pnpm's `package.json` writer (#810, {{E53}});
 - vlt has its own `strip_cr`.
 
-Five different answers to one question, and every one of them is a bug class (see the open-issue appendix). Across the whole crate there are five terminator rules (any-CRLF, first line, majority, CRLF-only re-expansion, refuse); since #1108, seven inserted-line sites pick through `utils::line_endings::terminator` (CRLF only for a CRLF file, the majority for a mixed one), while the any-CRLF rule is still written in `common::detect_eol`, a byte-identical `pypi_uv::newline_of` and inline copies (`maven_reactor.rs` ×2, upstream gem, the hosted Gemfile edit), and `gradle::newline_of` uses the first-line rule under the same name. A probe on `045d7ec` gives three answers for one mixed input. {{E16}}
+Five different answers to one question, and every one of them is a bug class (see the open-issue appendix). Across the whole crate there are five terminator rules (any-CRLF, first line, majority, CRLF-only re-expansion, refuse); since #1108, seven inserted-line sites pick through `utils::line_endings::terminator` (CRLF only for a CRLF file, the majority for a mixed one), and since #1227 the vendored `common` and `pypi_uv` writers and the `.npmrc` splice do too (`detect_eol` and `pypi_uv::newline_of` are gone), while the any-CRLF rule is still written inline in `maven_reactor.rs` (×2), upstream gem and the hosted Gemfile edit, and `gradle::newline_of` uses the first-line rule under the same name. A probe on `045d7ec` gives three answers for one mixed input. {{E16}}
 
 ### 4.5 Architecture defects
 
