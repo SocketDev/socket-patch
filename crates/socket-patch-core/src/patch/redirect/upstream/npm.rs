@@ -1007,7 +1007,7 @@ fn bun_lookup_registry(
         let value = item
             .as_str()
             .or_else(|| item.get("url").and_then(toml_edit::Item::as_str))?;
-        url(&expand_env(value, var, true))
+        url(&expand_url_env(value, var, true))
     };
     let toml_auth = |item: &toml_edit::Item| -> Option<String> {
         let field = |key: &str| {
@@ -1031,6 +1031,11 @@ fn bun_lookup_registry(
             .and_then(|text| npmrc_top_level_value(text, key))
             .map(|v| expand_env(&v, var, false))
     };
+    let npmrc_url = |key: &str| {
+        npmrc
+            .and_then(|text| npmrc_top_level_value(text, key))
+            .and_then(|v| url(&expand_url_env(&v, var, false)))
+    };
     // Credentials in the URL itself (`https://user:${TOKEN}@host/`) go on
     // the request only: the base is written into bun.lock and warnings.
     let with_npmrc_auth = |base: String, own: Option<String>| -> ProjectRegistry {
@@ -1047,7 +1052,7 @@ fn bun_lookup_registry(
     let install = bunfig.as_ref().and_then(|doc| doc.get("install"));
     // The configured default registry before the environment applies.
     let configured = || -> Option<ProjectRegistry> {
-        if let Some(base) = npmrc_value("registry").and_then(|value| url(&value)) {
+        if let Some(base) = npmrc_url("registry") {
             return Some(with_npmrc_auth(base, None));
         }
         let item = install?.get("registry")?;
@@ -1055,9 +1060,7 @@ fn bun_lookup_registry(
         Some(with_npmrc_auth(base, toml_auth(item)))
     };
     if let Some((scope, _)) = name.strip_prefix('@').and_then(|rest| rest.split_once('/')) {
-        if let Some(scoped) =
-            npmrc_value(&format!("@{scope}:registry")).and_then(|value| url(&value))
-        {
+        if let Some(scoped) = npmrc_url(&format!("@{scope}:registry")) {
             return Some(with_npmrc_auth(scoped, None));
         }
         let entry = install.and_then(|i| i.get("scopes")).and_then(|scopes| {
@@ -1099,6 +1102,33 @@ fn bun_lookup_registry(
 /// registry and credentials a Bun restore sends: the conventional npm
 /// token variables, nothing else.
 const BUN_EXPANDED_VARS: &[&str] = &["NPM_TOKEN", "NODE_AUTH_TOKEN", "BUN_AUTH_TOKEN"];
+
+/// A registry URL with its variables expanded only inside its userinfo
+/// (`https://user:${NPM_TOKEN}@host/`), which goes on the request's
+/// `Authorization` header (see [`split_userinfo`]). A reference anywhere
+/// else expands to nothing: the rest of the URL is requested, printed in
+/// `upstream_registry_fallback` and written into the lock, so a token
+/// there would leak into all three.
+fn expand_url_env(value: &str, var: &dyn Fn(&str) -> Option<String>, bare: bool) -> String {
+    let none = |_: &str| None;
+    let (scheme, rest) = value.split_once("://").unwrap_or(("", value));
+    let authority_end = rest.find(['/', '?', '#']).unwrap_or(rest.len());
+    let (userinfo, after) = match rest[..authority_end].rsplit_once('@') {
+        Some((userinfo, host)) => (Some(userinfo), &rest[authority_end - host.len()..]),
+        None => (None, rest),
+    };
+    let mut out = String::with_capacity(value.len());
+    if value.contains("://") {
+        out.push_str(scheme);
+        out.push_str("://");
+    }
+    if let Some(userinfo) = userinfo {
+        out.push_str(&expand_env(userinfo, var, bare));
+        out.push('@');
+    }
+    out.push_str(&expand_env(after, &none, bare));
+    out
+}
 
 /// `value` with each `${VAR}` (and, for a bunfig value, `$VAR`) replaced
 /// by `var(VAR)`, empty when unset.
@@ -1523,8 +1553,8 @@ pub(crate) async fn cleanup_side_config(
 mod tests {
     use super::{
         berry_lookup_registry, berry_registry_locator, bun_env_registry, bun_lookup_registry,
-        bun_registry_slot, bun_tarball_url, non_default_registry, registry_derives_tarball,
-        split_userinfo, yaml_top_level_value, ProjectDist,
+        bun_registry_slot, bun_tarball_url, expand_url_env, non_default_registry,
+        registry_derives_tarball, split_userinfo, yaml_top_level_value, ProjectDist,
     };
     use crate::patch::redirect::upstream::client::NpmDist;
 
@@ -1668,7 +1698,8 @@ mod tests {
                       own = { token = \"own\" }\n\
                       unset = { url = \"https://un.example/\", token = \"$NOPE\" }\n\
                       other = { url = \"https://ot.example/\", token = \"${GITHUB_TOKEN}\" }\n\
-                      inurl = \"https://u:$GITHUB_TOKEN@iu.example/\"\n";
+                      inurl = \"https://u:$GITHUB_TOKEN@iu.example/\"\n\
+                      inpath = \"https://ip.example/$NODE_AUTH_TOKEN/\"\n";
         assert_eq!(
             auth(None, Some(bunfig), None, "@corp/w"),
             some("https://corp.example/npm/", Some("Bearer from-env"))
@@ -1707,6 +1738,30 @@ mod tests {
         assert!(
             !String::from_utf8_lossy(&sent.unwrap_or_default()).contains("not-for-registries"),
             "the userinfo expanded $GITHUB_TOKEN"
+        );
+        // Even an allowed token stays out of the URL's host, path and
+        // query, which are requested, printed and written into the lock;
+        // only userinfo (moved onto the request header) expands.
+        assert_eq!(
+            auth(None, Some(bunfig), None, "@inpath/w"),
+            some("https://ip.example//", None)
+        );
+        assert_eq!(
+            auth(
+                Some("@p:registry=https://h.example/${BUN_AUTH_TOKEN}/?t=${BUN_AUTH_TOKEN}\n"),
+                None,
+                None,
+                "@p/w"
+            ),
+            some("https://h.example//?t=", None)
+        );
+        assert_eq!(
+            expand_url_env(
+                "https://u:$NODE_AUTH_TOKEN@h.example/$NODE_AUTH_TOKEN",
+                &vars,
+                true
+            ),
+            "https://u:from-env@h.example/"
         );
         // A token-only scope: the configured default registry, its own token.
         assert_eq!(

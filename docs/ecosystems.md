@@ -215,7 +215,9 @@ The backticked slug in each row is the value `-e`/`--ecosystems` accepts (e.g.
   registries, `BUN_CONFIG_REGISTRY` / `NPM_CONFIG_REGISTRY`), sending the credentials
   those settings give it — a bunfig `token` or `username` / `password` (`$VAR`
   expanded only for `NPM_TOKEN`, `NODE_AUTH_TOKEN` and `BUN_AUTH_TOKEN`; any other
-  variable expands to nothing, so a project's config cannot send other secrets), else the `.npmrc` `//host/path/:_authToken` / `_auth` / `username` +
+  variable expands to nothing, so a project's config cannot send other secrets; in a
+  registry URL only its `user:password@` part expands, which is sent as the
+  `Authorization` header and never printed or written into the lock), else the `.npmrc` `//host/path/:_authToken` / `_auth` / `username` +
   `_password` covering the registry URL (`BUN_CONFIG_TOKEN` is not read); a registry
   that still cannot be read falls back to the default registry's document with an
   `upstream_registry_fallback` warning. Bun's hoisted linker keeps an installed copy whose lock entry
