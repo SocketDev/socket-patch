@@ -1299,7 +1299,8 @@ async fn generate_vex_from_manifest_path_inner(
         manifest,
         vendor,
         redirect,
-    } = socket_patch_core::ledgers::LoadedLedgers::load(&common.cwd, manifest_path).await;
+    } = socket_patch_core::ledgers::LoadedLedgers::load(&common.project_root(), manifest_path)
+        .await;
     let manifest_file = match manifest {
         Ok(m) => m,
         Err(e) => {
@@ -1346,11 +1347,12 @@ async fn generate_vex_from_manifest_path_inner(
             return Err(fail(common, params, "vendor_ledger_corrupt", message).await);
         }
     };
-    // Rooted where the ledgers are (`--cwd`), and run under `--global` /
-    // `--global-prefix` too: discovery is what gates the ledgers (core
-    // discover rule 11); without it the raw-text fallbacks would decide a
-    // uuid a lockfile mentions, attesting a commented-out or rejected pin.
-    let discovery = crate::commands::discover_wiring(common, &common.cwd).await;
+    // Rooted where the ledgers are (the manifest's project, `--cwd` for the
+    // default layout; #745), and run under `--global` / `--global-prefix`
+    // too: discovery is what gates the ledgers (core discover rule 11);
+    // without it the raw-text fallbacks would decide a uuid a lockfile
+    // mentions, attesting a commented-out or rejected pin.
+    let discovery = crate::commands::discover_wiring(common, &common.project_root()).await;
     for diag in &discovery.diagnostics {
         note_warning(warnings, common, diag.code, diag.detail.clone());
     }

@@ -28,7 +28,10 @@ use crate::json_envelope::Envelope;
 /// The vendored-mode backend for one run: the run's global args and its
 /// patch-service config (`--revert` does not need one).
 pub(crate) struct VendoredBackend<'a> {
-    pub(crate) common: &'a GlobalArgs,
+    /// The run's args re-rooted at the manifest's project
+    /// ([`GlobalArgs::at_project_root`]): the ledger, its artifacts and the
+    /// lockfile wiring they record always belong to one project (#745).
+    pub(crate) common: std::borrow::Cow<'a, GlobalArgs>,
     pub(crate) service: Option<&'a VendorServiceConfig>,
 }
 
@@ -57,7 +60,10 @@ pub(crate) struct ApplyRequest<'a> {
 
 impl<'a> VendoredBackend<'a> {
     pub(crate) fn new(common: &'a GlobalArgs, service: Option<&'a VendorServiceConfig>) -> Self {
-        Self { common, service }
+        Self {
+            common: common.at_project_root(),
+            service,
+        }
     }
 
     /// Vendor `req.manifest`'s records. The caller holds the apply lock.
@@ -69,7 +75,7 @@ impl<'a> VendoredBackend<'a> {
     /// caller's poll frame embeds it (Windows' 1 MiB main-thread stack; see
     /// `scan_run_fits_windows_main_thread_stack`).
     pub(crate) async fn apply(&self, req: ApplyRequest<'_>, env: &mut Envelope) -> bool {
-        let common = self.common;
+        let common: &GlobalArgs = &self.common;
         let blobs = req.socket_dir.join("blobs");
         let sources = socket_patch_core::patch::apply::PatchSources {
             blobs_path: &blobs,
@@ -173,9 +179,10 @@ pub(crate) struct VendorRevertResult {
     pub(crate) step: VendorRevertStep,
 }
 
-/// Revert the vendored ledger entry `key` (see [`VendorRevertStep`]).
+/// Revert the vendored ledger entry `key` (see [`VendorRevertStep`]) of
+/// the project at `root` (its ledger, artifacts and lockfile wiring).
 pub(crate) async fn revert_vendor_entry(
-    cwd: &Path,
+    root: &Path,
     key: &str,
     state: &mut VendorState,
     opts: RevertOpts,
@@ -186,7 +193,7 @@ pub(crate) async fn revert_vendor_entry(
             step: VendorRevertStep::Missing,
         };
     };
-    let outcome = dispatch_revert_one_opts(&entry, cwd, opts).await;
+    let outcome = dispatch_revert_one_opts(&entry, root, opts).await;
     let step = if !outcome.success {
         VendorRevertStep::Failed(outcome.error.unwrap_or_else(|| "unknown error".into()))
     } else if outcome.kept_artifact {
@@ -197,7 +204,7 @@ pub(crate) async fn revert_vendor_entry(
         VendorRevertStep::Preserved
     } else {
         state.entries.remove(key);
-        match save_state(cwd, state).await {
+        match save_state(root, state).await {
             Ok(()) => VendorRevertStep::Reverted,
             Err(e) => VendorRevertStep::LedgerWriteFailed(e.to_string()),
         }

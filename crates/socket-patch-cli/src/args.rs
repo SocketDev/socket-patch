@@ -514,21 +514,47 @@ impl GlobalArgs {
     /// interleave two projects' state (CLI_CONTRACT.md: both stores always
     /// come from the SAME project).
     pub(crate) fn project_root(&self) -> PathBuf {
-        let manifest_path = self.resolved_manifest_path();
-        match manifest_path.parent() {
-            Some(dir)
-                if dir.file_name()
-                    == Some(std::ffi::OsStr::new(
-                        socket_patch_core::constants::SOCKET_DIR,
-                    )) =>
-            {
-                dir.parent()
-                    .map(Path::to_path_buf)
-                    .unwrap_or_else(|| self.cwd.clone())
-            }
-            Some(dir) => dir.to_path_buf(),
-            None => self.cwd.clone(),
+        project_root_of(&self.resolved_manifest_path(), &self.cwd)
+    }
+
+    /// Whether the resolved manifest belongs to a project other than
+    /// `--cwd` ([`Self::project_root`] names a different directory). Only
+    /// a non-default `--manifest-path` / `SOCKET_MANIFEST_PATH` can make
+    /// this true.
+    pub(crate) fn manifest_project_is_foreign(&self) -> bool {
+        let root = self.project_root();
+        if root == self.cwd {
+            return false;
         }
+        match (
+            std::fs::canonicalize(&root),
+            std::fs::canonicalize(&self.cwd),
+        ) {
+            (Ok(root), Ok(cwd)) => root != cwd,
+            _ => true,
+        }
+    }
+
+    /// `self` with `cwd` moved to [`Self::project_root`] (and the manifest
+    /// path re-expressed relative to it, so it resolves to the same file):
+    /// the view the vendored backend runs under, so a revert or repair
+    /// touches the ledger, `.socket/vendor/` artifacts and lockfile wiring
+    /// of ONE project — the manifest's (#745). Borrowed unchanged for the
+    /// default layout.
+    pub(crate) fn at_project_root(&self) -> std::borrow::Cow<'_, GlobalArgs> {
+        let root = self.project_root();
+        if root == self.cwd {
+            return std::borrow::Cow::Borrowed(self);
+        }
+        let manifest = self.resolved_manifest_path();
+        let mut rooted = self.clone();
+        rooted.manifest_path = manifest
+            .strip_prefix(&root)
+            .unwrap_or(&manifest)
+            .to_string_lossy()
+            .into_owned();
+        rooted.cwd = root;
+        std::borrow::Cow::Owned(rooted)
     }
 
     /// The directory the manifest lives in — where `apply.lock`, `blobs/`,
@@ -610,6 +636,26 @@ impl GlobalArgs {
 /// wrong under a non-default `--cwd`. [`GlobalArgs::resolved_manifest_path`]
 /// always joins a relative path onto `cwd`, so the fallback is reachable
 /// only for callers handed an unresolved path.
+/// [`GlobalArgs::project_root`] for a caller holding a resolved manifest
+/// path: the manifest's `.socket` parent's parent in the standard layout,
+/// else the manifest file's own directory (`cwd` when it has none).
+pub(crate) fn project_root_of(manifest_path: &Path, cwd: &Path) -> PathBuf {
+    match manifest_path.parent() {
+        Some(dir)
+            if dir.file_name()
+                == Some(std::ffi::OsStr::new(
+                    socket_patch_core::constants::SOCKET_DIR,
+                )) =>
+        {
+            dir.parent()
+                .map(Path::to_path_buf)
+                .unwrap_or_else(|| cwd.to_path_buf())
+        }
+        Some(dir) if !dir.as_os_str().is_empty() => dir.to_path_buf(),
+        _ => cwd.to_path_buf(),
+    }
+}
+
 pub(crate) fn socket_dir_of(manifest_path: &Path, cwd: &Path) -> PathBuf {
     manifest_path
         .parent()

@@ -319,7 +319,7 @@ async fn preview_apply_gc(
     // The dry pass reverted nothing, so the ledger still holds each entry
     // (its base purl is part of the relation: a `!x`-encoded golang key).
     if !vendor_gc.unused_reverted.is_empty() {
-        if let Ok(state) = socket_patch_core::vendor::load_state(&common.cwd).await {
+        if let Ok(state) = socket_patch_core::vendor::load_state(&common.project_root()).await {
             for purl in &vendor_gc.unused_reverted {
                 let Some(entry) = state.entries.get(purl) else {
                     continue;

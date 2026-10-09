@@ -25,6 +25,12 @@ existing scripts against the new CLI; the [changelog](../CHANGELOG.md) and
   `<version>+socket.<uuid>` versions. Re-running vendoring or repair migrates
   older wiring. The tag is visible in `CARGO_PKG_VERSION`; see
   [Cargo details](ecosystems.md#cargo-vendored-wiring-in-cargotoml).
+- `--manifest-path` (`SOCKET_MANIFEST_PATH`) now selects one project for every
+  command: the vendor ledger `.socket/vendor/state.json` and its artifacts are
+  read and written in the manifest's project, never in `--cwd`'s. Hosted and
+  vendored `scan` / `get` and `vendor` (other than `--check`) rewire `--cwd`'s
+  lockfiles, so they refuse a manifest in another project with
+  `manifest_path_foreign_project` (exit 2). Run them from the manifest's project.
 - `list` succeeds on an empty project. Hosted results identify lockfiles instead
   of a hosted ledger. Scripts must use the updated
   [JSON shapes and exit codes](../crates/socket-patch-cli/CLI_CONTRACT.md#json-output-shapes).

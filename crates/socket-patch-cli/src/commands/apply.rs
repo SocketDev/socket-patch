@@ -578,7 +578,7 @@ async fn run_check(args: &ApplyArgs, manifest_path: &Path) -> i32 {
             .flatten()
             .collect();
     let vendored = if crate::commands::project_state_in_scope(&args.common) {
-        socket_patch_core::vendor::vendored_purl_keys(&args.common.cwd).await
+        socket_patch_core::vendor::vendored_purl_keys(&args.common.project_root()).await
     } else {
         Default::default()
     };
@@ -2180,7 +2180,7 @@ async fn apply_patches_inner(
     // and patches the global copy even when the cwd project vendors the
     // same purl (see `project_state_in_scope`).
     let vendored_purls = if crate::commands::project_state_in_scope(&args.common) {
-        socket_patch_core::vendor::vendored_purl_keys(&args.common.cwd).await
+        socket_patch_core::vendor::vendored_purl_keys(&args.common.project_root()).await
     } else {
         Default::default()
     };

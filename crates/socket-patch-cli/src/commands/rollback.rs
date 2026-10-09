@@ -910,6 +910,11 @@ pub async fn run(args: RollbackArgs) -> i32 {
 
     let manifest_path = args.common.resolved_manifest_path();
     let cwd = args.common.cwd.clone();
+    // The vendor ledger, its artifacts and the lockfile references to them
+    // belong to the manifest's project (#745): with `--manifest-path` into
+    // another project, rollback unwinds THAT project's vendoring, under that
+    // project's apply lock, and never touches `--cwd`'s ledger.
+    let ledger_root = args.common.project_root();
 
     // ── state discovery ─────────────────────────────────────────────────
     // Rollback infers what to undo from three sources: the manifest
@@ -931,7 +936,7 @@ pub async fn run(args: RollbackArgs) -> i32 {
     let project_state = crate::commands::project_state_in_scope(&args.common);
     let manifest_missing = tokio::fs::metadata(&manifest_path).await.is_err();
     let vendor_ledger_exists = project_state
-        && tokio::fs::metadata(cwd.join(".socket/vendor/state.json"))
+        && tokio::fs::metadata(ledger_root.join(".socket/vendor/state.json"))
             .await
             .is_ok();
     // The hosted pins the lockfiles wire (read-only discovery; the restore
@@ -995,7 +1000,7 @@ pub async fn run(args: RollbackArgs) -> i32 {
         // ledger holds the pre-vendor originals, so it must come back from
         // version control first.)
         let wired = if project_state {
-            crate::commands::vendored_backend::repair::scan_vendor_references(&cwd).await
+            crate::commands::vendored_backend::repair::scan_vendor_references(&ledger_root).await
         } else {
             Default::default()
         };
@@ -1053,7 +1058,7 @@ pub async fn run(args: RollbackArgs) -> i32 {
     // vendored manifest records (see the cleanup below): no vendored leg
     // runs, and the ledger does not own the global copies, so the in-place
     // leg restores them.
-    let loaded_vendor_state = socket_patch_core::vendor::load_state(&cwd).await;
+    let loaded_vendor_state = socket_patch_core::vendor::load_state(&ledger_root).await;
     let project_vendored_keys: HashSet<PurlKey> = loaded_vendor_state
         .as_ref()
         .map(VendorState::purl_keys)
