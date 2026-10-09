@@ -225,7 +225,7 @@ async fn issue_558_served_tarball_not_matching_the_grant_skips_the_patch() {
     write_classic_project(&root);
 
     let (_, doc, stderr) = scan(&root, &server.uri());
-    assert_skipped_untouched(&root, &server, &doc, &stderr);
+    assert_skipped_untouched(&root, &doc, &stderr);
 }
 
 #[tokio::test]
@@ -238,10 +238,18 @@ async fn issue_558_unfetchable_tarball_skips_the_patch() {
     write_classic_project(&root);
 
     let (_, doc, stderr) = scan(&root, &server.uri());
-    assert_skipped_untouched(&root, &server, &doc, &stderr);
+    let detail = assert_skipped_untouched(&root, &doc, &stderr);
+    // The detail still says where the fetch went, with the token redacted.
+    assert!(
+        detail.contains(&format!(
+            "cannot fetch the hosted tarball: artifact not found: {}/patch/npm/left-pad/1.3.0/<redacted>/{UUID}/left-pad-1.3.0.tgz",
+            server.uri()
+        )),
+        "{detail}"
+    );
 }
 
-fn assert_skipped_untouched(root: &Path, server: &MockServer, doc: &Value, stderr: &str) {
+fn assert_skipped_untouched(root: &Path, doc: &Value, stderr: &str) -> String {
     let skipped: Vec<&Value> = doc["redirect"]["skipped"]
         .as_array()
         .unwrap_or_else(|| panic!("redirect.skipped: {doc:#}\n{stderr}"))
@@ -250,10 +258,12 @@ fn assert_skipped_untouched(root: &Path, server: &MockServer, doc: &Value, stder
         .collect();
     assert_eq!(skipped.len(), 1, "{doc:#}");
     assert_eq!(skipped[0]["purl"], PURL, "{doc:#}");
+    // The served URL's grant token authorizes the org's download: never
+    // shown, whatever the detail says.
     let detail = skipped[0]["detail"].as_str().unwrap();
     assert!(
-        !detail.contains(&server.uri()),
-        "the hosted URL is redacted: {detail}"
+        !detail.contains(TOKEN),
+        "the grant token is redacted: {detail}"
     );
     assert_eq!(doc["redirect"]["redirected"], 0, "{doc:#}");
     assert_eq!(
@@ -261,6 +271,7 @@ fn assert_skipped_untouched(root: &Path, server: &MockServer, doc: &Value, stder
         LOCK,
         "no fragmentless hosted pin is written"
     );
+    detail.to_string()
 }
 
 /// #591: the served tarball's package.json adds a dependency yarn.lock

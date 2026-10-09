@@ -10819,7 +10819,7 @@ mod tests {
                 .unwrap_or_else(|| panic!("{key}: the block must be pinned: {:?}", r.warnings));
             assert!(out.contains(&format!("\n{key}\n")), "{key}: {out}");
             assert!(
-                out.contains("resolved \"http://p.test/lp.tgz\"")
+                out.contains("resolved \"http://p.test/lp.tgz#5ha1\"")
                     && out.contains("integrity sha512-PATCHED=="),
                 "{key}: {out}"
             );

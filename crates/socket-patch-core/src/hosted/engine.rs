@@ -1210,8 +1210,8 @@ pub fn record_classic_artifact(
 
 /// The skip recorded for an npm dep whose served tarball could not be
 /// fetched, did not match its grant's sha512 or had no readable
-/// package.json, so its yarn classic pin could not be checked (the grant
-/// token in `detail` is redacted to `<hosted artifact>`).
+/// package.json, so its yarn classic pin could not be checked (`detail`
+/// redacted by [`redact_artifact_text`]).
 pub fn npm_tarball_unavailable(dep: &DepOverride, detail: &str) -> SkippedPatch {
     SkippedPatch {
         purl: format!(
@@ -1221,7 +1221,11 @@ pub fn npm_tarball_unavailable(dep: &DepOverride, detail: &str) -> SkippedPatch 
         ),
         uuid: dep.patch_uuid.clone(),
         reason: "npm_tarball_unavailable".to_string(),
-        detail: Some(detail.replace(&dep.artifact_url, "<hosted artifact>")),
+        detail: Some(redact_artifact_text(
+            detail,
+            &dep.artifact_url,
+            &dep.patch_uuid,
+        )),
     }
 }
 
