@@ -849,10 +849,8 @@ fn record_check_skips(env: &mut Envelope, in_sync: &[String], not_installed: &[S
 /// `--global-prefix`, `--ecosystems`). A bare `socket-patch apply` would
 /// act on another tree, exit 0 and leave the drift in place (#1219).
 fn check_remedy(common: &GlobalArgs) -> String {
-    format!(
-        "Run `socket-patch apply{}` to regenerate them.",
-        crate::ui::scope_args(common)
-    )
+    let command = format!("socket-patch apply{}", crate::ui::scope_args(common));
+    format!("Run `{command}` to regenerate them.")
 }
 
 /// The `apply --check` success line: how many patches were checked, and how
