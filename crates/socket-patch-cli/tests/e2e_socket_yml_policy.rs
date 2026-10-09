@@ -1100,7 +1100,9 @@ async fn agent_mode_retains_a_recorded_patch_the_policy_now_excludes() {
 async fn agent_mode_judges_nested_project_copies_by_their_own_root() {
     let server = MockServer::start().await;
     mount_api(&server, catalog()).await;
-    let repo = Repo::new(Some("version: 2\npatches:\n  ignorePaths: [\"/services/legacy/\"]\n"));
+    let repo = Repo::new(Some(
+        "version: 2\npatches:\n  ignorePaths: [\"/services/legacy/\"]\n",
+    ));
     // left-pad is installed in both web (admitted) and legacy (ignored).
     write_npm_root(&repo.dir("services/legacy"), &["gamma", "left-pad"]);
     let (code, doc) = scan_json(&repo.root, &server.uri(), &["--mode", "agent"], &[]);
@@ -1169,7 +1171,9 @@ async fn agent_mode_judges_nested_project_copies_by_their_own_root() {
 
     // includePaths: the docs' headline example selects nested projects from
     // the repo root (which itself is not included).
-    let repo = Repo::new(Some("version: 2\npatches:\n  includePaths: [\"/services/legacy/\"]\n"));
+    let repo = Repo::new(Some(
+        "version: 2\npatches:\n  includePaths: [\"/services/legacy/\"]\n",
+    ));
     let (code, doc) = scan_json(&repo.root, &server.uri(), &["--mode", "agent"], &[]);
     assert_eq!(code, 0, "{doc:#}");
     assert_eq!(

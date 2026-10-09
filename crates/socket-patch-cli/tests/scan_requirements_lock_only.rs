@@ -17,6 +17,8 @@
 //!   (`-r ${REQDIR}/dev.txt`);
 //! * #1028: a `-r` that follows other options on the line
 //!   (`--pre -r dev.txt`, `-i URL -r dev.txt`).
+//! * #1249: a last line ending in a dangling `\` continuation
+//!   (`six==1.16.0 \` at EOF), which pip joins and installs.
 //!
 //! Driven through the built binary against a mock patch API; the
 //! assertion is what discovery sends to the batch endpoint and the
@@ -340,4 +342,37 @@ async fn lock_only_scan_discovers_include_after_other_options() {
         )
         .await;
     }
+}
+
+/// #1249: pip's `join_lines` strips the backslash of a continued last
+/// line and yields it at EOF, so `name==X \` with nothing after it is
+/// the pin `name==X`, in the root file or a `-r` include, LF or CRLF.
+#[tokio::test]
+async fn lock_only_scan_discovers_pin_with_dangling_eof_continuation() {
+    for root in [
+        "sp-fixture-dangle==1.16.0 \\",
+        "sp-fixture-dangle==1.16.0 \\\n",
+        "sp-fixture-dangle==1.16.0 \\\r\n",
+    ] {
+        eprintln!("case {root:?}");
+        assert_lock_only_discovers(
+            &[("requirements.txt", root)],
+            &["pkg:pypi/sp-fixture-dangle@1.16.0"],
+        )
+        .await;
+    }
+    assert_lock_only_discovers(
+        &[
+            ("requirements.txt", "-r dev.txt\n"),
+            (
+                "dev.txt",
+                "sp-fixture-idna==3.4\nsp-fixture-dangle==1.16.0 \\\n",
+            ),
+        ],
+        &[
+            "pkg:pypi/sp-fixture-idna@3.4",
+            "pkg:pypi/sp-fixture-dangle@1.16.0",
+        ],
+    )
+    .await;
 }
