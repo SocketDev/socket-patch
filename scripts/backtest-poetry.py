@@ -893,7 +893,7 @@ def main():
             # Hosted and vendored runs are manifest-free (v5.0): nothing may
             # have been written to `.socket/manifest.json` at any point.
             check("noManifestWritten", not mf.exists())
-        info["rollbackEnvelope"] = {k: erb.get(k) for k in ("status", "rolledBack", "failed", "hosted", "vendoredReverted", "manifest") if k in erb}
+        info["rollbackEnvelope"] = {k: erb.get(k) for k in ("status", "summary", "hosted", "error", "warnings") if k in erb}
         row["passed"] = not failed_required_checks(row)
         return row
 

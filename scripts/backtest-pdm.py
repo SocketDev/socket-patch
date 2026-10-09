@@ -1329,7 +1329,7 @@ def main():
             check("rollbackClearsManifest", ledger_cleared(project, "agent"), None, rb)
             check("rollbackKeepsPyproject", (project / "pyproject.toml").read_bytes() == pristine_pyproject)
             check("rollbackKeepsLock", (project / lockname).read_bytes() == lock_now)
-            info["rollbackEnvelope"] = {k: erb.get(k) for k in ("status", "rolledBack", "failed") if k in erb}
+            info["rollbackEnvelope"] = {k: erb.get(k) for k in ("status", "summary", "error", "warnings") if k in erb}
             return finish("PASS" if all(checks.values()) else "FAIL")
 
         # ------------------------------------------------ hosted / vendored
@@ -1483,9 +1483,9 @@ def main():
         check("rollbackClearsLedger", ledger_cleared(project, mode), None, rb)
         if mode == "vendored":
             check("rollbackRemovesVendoredWheel", not (project / ".socket/vendor/pypi" / (uuid or "x")).exists(), None, rb)
-        info["rollbackEnvelope"] = {k: erb.get(k) for k in ("status", "rolledBack", "failed", "vendoredReverted") if k in erb}
+        info["rollbackEnvelope"] = {k: erb.get(k) for k in ("status", "summary", "error", "warnings") if k in erb}
         if erb.get("hosted"):
-            info["rollbackEnvelope"]["hosted"] = {k: erb["hosted"].get(k) for k in ("reverted", "failed", "unsupported", "editedFiles")}
+            info["rollbackEnvelope"]["hosted"] = {"editedFiles": erb["hosted"].get("editedFiles")}
         return finish("PASS" if all(checks.values()) else "FAIL")
 
     # --------------------------------------------------------- execution
