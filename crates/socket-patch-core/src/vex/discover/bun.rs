@@ -257,6 +257,7 @@ impl Bundled {
                     r.purl,
                 ),
             );
+            out.shadow(r);
         }
     }
 }

@@ -28,8 +28,8 @@ use crate::constants::npm_family::{
     RUSH_COMMON_LOCK_REL, RUSH_SUBSPACES_DIR, VLT_HIDDEN_LOCK_REL, VLT_LOCK,
 };
 use crate::patch::redirect::npmrc::{
-    plan_npmrc_allow_remote_with, NpmrcPlan, OuterAllowRemote, NPMRC_ALLOW_REMOTE_EDIT_KIND,
-    NPMRC_REL,
+    effective_replace_registry_host, plan_npmrc_allow_remote_with, replace_registry_host_rewrites,
+    NpmrcPlan, OuterAllowRemote, NPMRC_ALLOW_REMOTE_EDIT_KIND, NPMRC_REL,
 };
 use crate::patch::redirect::presence::groups_present;
 use crate::patch::redirect::yarnrc::OuterYarnMirror;
@@ -45,13 +45,13 @@ use super::guidance::{
     npm_allow_remote_already_detail, npm_allow_remote_configured_detail,
     npm_allow_remote_env_set_detail, npm_allow_remote_manual_detail,
     npm_allow_remote_outer_set_detail, npm_allow_remote_unreadable_detail,
-    npm_allow_remote_user_set_detail, npm_lock_url_needles, plan_workspace_trust, pnpm_heal_root,
-    pnpm_is_shrinkwrap_lock, pnpm_lock_may_need_store_flag, pnpm_lock_version_major,
-    pnpm_trust_configured_detail, pnpm_trust_legacy_detail, pnpm_trust_manual_guidance,
-    pnpm_trust_policy_preamble, pnpm_trust_workspace_unreadable_detail,
+    npm_allow_remote_user_set_detail, npm_lock_url_needles, npm_replace_registry_host_detail,
+    plan_workspace_trust, pnpm_heal_root, pnpm_is_shrinkwrap_lock, pnpm_lock_may_need_store_flag,
+    pnpm_lock_version_major, pnpm_trust_configured_detail, pnpm_trust_legacy_detail,
+    pnpm_trust_manual_guidance, pnpm_trust_policy_preamble, pnpm_trust_workspace_unreadable_detail,
     pnpm_trust_workspace_unsupported_detail, read_npmrc_for_allow_remote, read_workspace_for_trust,
-    url_host, TrustPlan, NPM_LOCKS, PNPM_TRUST_TRADEOFF_AND_CAUTION, PNPM_WORKSPACE_REL,
-    REDIRECT_PNPM_WORKSPACE_TRUST_EDIT_KIND,
+    url_host, TrustPlan, NPM_LOCKS, NPM_REPLACE_REGISTRY_HOST_CODE,
+    PNPM_TRUST_TRADEOFF_AND_CAUTION, PNPM_WORKSPACE_REL, REDIRECT_PNPM_WORKSPACE_TRUST_EDIT_KIND,
 };
 use super::vlt::bun_lockb_present;
 
@@ -2010,7 +2010,9 @@ fn governing_workspace(view: &ProjectView<'_>) -> Option<std::path::PathBuf> {
 /// opts out entirely; every variant still WARNS
 /// (`redirect_npm_allow_remote`) with the whole-tree tradeoff. Vendored
 /// mode is unaffected: its `file:.socket/vendor/…` specs are npm `file`
-/// specs, gated by `allow-file` (default `all`), not `allow-remote`.
+/// specs, gated by `allow-file` (default `all`), not `allow-remote` — an
+/// explicit refusing `allow-file` is the vendored flow's own advisory
+/// (`vendor_npm_allow_file`, #969).
 fn npm_allow_remote(
     view: &ProjectView<'_>,
     files: &BTreeMap<String, String>,
@@ -2052,34 +2054,52 @@ fn npm_allow_remote(
         original: None,
         new: Some(serde_json::json!("all")),
     };
-    let detail = match read_npmrc(view) {
+    let npmrc = read_npmrc(view);
+    let outer = (options.npm_outer)();
+    let detail = match &npmrc {
         // Opt-out still reports an explicit / already-set value truthfully;
         // only the WRITE is suppressed.
-        Ok(existing) => {
-            match plan_npmrc_allow_remote_with(existing.as_deref(), &(options.npm_outer)()) {
-                NpmrcPlan::AlreadyAll => npm_allow_remote_already_detail(&npm_hosts),
-                NpmrcPlan::UserSet(value) => npm_allow_remote_user_set_detail(&npm_hosts, &value),
-                NpmrcPlan::EnvSet { var, value } => {
-                    npm_allow_remote_env_set_detail(&npm_hosts, &var, &value)
-                }
-                NpmrcPlan::OuterSet { layer, path, value } => {
-                    npm_allow_remote_outer_set_detail(&npm_hosts, layer, &path, &value)
-                }
-                NpmrcPlan::Unsupported(why) => npm_allow_remote_unreadable_detail(&npm_hosts, &why),
-                _ if !options.npm_allow_remote_config => npm_allow_remote_manual_detail(&npm_hosts),
-                NpmrcPlan::Create(text) => {
-                    npmrc_config_write = Some((text, edit("created")));
-                    npm_allow_remote_configured_detail(&npm_hosts, true, options.dry_run)
-                }
-                NpmrcPlan::Append(text) => {
-                    npmrc_config_write = Some((text, edit("added")));
-                    npm_allow_remote_configured_detail(&npm_hosts, false, options.dry_run)
-                }
+        Ok(existing) => match plan_npmrc_allow_remote_with(existing.as_deref(), &outer) {
+            NpmrcPlan::AlreadyAll => npm_allow_remote_already_detail(&npm_hosts),
+            NpmrcPlan::UserSet(value) => npm_allow_remote_user_set_detail(&npm_hosts, &value),
+            NpmrcPlan::EnvSet { var, value } => {
+                npm_allow_remote_env_set_detail(&npm_hosts, &var, &value)
             }
-        }
-        Err(why) => npm_allow_remote_unreadable_detail(&npm_hosts, &why),
+            NpmrcPlan::OuterSet { layer, path, value } => {
+                npm_allow_remote_outer_set_detail(&npm_hosts, layer, &path, &value)
+            }
+            NpmrcPlan::Unsupported(why) => npm_allow_remote_unreadable_detail(&npm_hosts, &why),
+            _ if !options.npm_allow_remote_config => npm_allow_remote_manual_detail(&npm_hosts),
+            NpmrcPlan::Create(text) => {
+                npmrc_config_write = Some((text, edit("created")));
+                npm_allow_remote_configured_detail(&npm_hosts, true, options.dry_run)
+            }
+            NpmrcPlan::Append(text) => {
+                npmrc_config_write = Some((text, edit("added")));
+                npm_allow_remote_configured_detail(&npm_hosts, false, options.dry_run)
+            }
+        },
+        Err(why) => npm_allow_remote_unreadable_detail(&npm_hosts, why),
     };
     npm_warnings.push(warning("redirect_npm_allow_remote", detail));
+    // #812: npm >= 8's `replace-registry-host` (`always`, or the pinned
+    // host itself) rewrites the hosted pins to the configured registry,
+    // so every install 404s. The setting is the user's, so it is reported
+    // (from whichever layer sets it), never overridden.
+    let project = npmrc.as_ref().ok().and_then(|t| t.as_deref());
+    if let Some((value, source)) = effective_replace_registry_host(project, &outer) {
+        let blocked: Vec<&str> = npm_hosts
+            .iter()
+            .copied()
+            .filter(|host| replace_registry_host_rewrites(&value, host))
+            .collect();
+        if !blocked.is_empty() {
+            npm_warnings.push(warning(
+                NPM_REPLACE_REGISTRY_HOST_CODE,
+                npm_replace_registry_host_detail(&blocked, &value, &source),
+            ));
+        }
+    }
     (npm_warnings, npmrc_config_write)
 }
 
@@ -2151,7 +2171,9 @@ fn confirm(
             let uuid = c.dep.patch_uuid.as_str();
             // vlt decides before the binary-bun rule, so `bun.lockb` beside
             // a vlt-driven `vlt-lock.json` never confirms an npm purl.
-            if rewrite.refused_vlt_uuids.contains(uuid) || rewrite.refused_bun_uuids.contains(uuid)
+            if rewrite.refused_vlt_uuids.contains(uuid)
+                || rewrite.refused_bun_uuids.contains(uuid)
+                || rewrite.refused_npm_uuids.contains(uuid)
             {
                 return ProbeStep::Decided(false);
             }

@@ -21,7 +21,7 @@
 //!   `hosted_wiring_retained` stderr warning after an in-place apply;
 //! * human runs: a bare scan runs hosted mode; a mode-less `--prune`/global
 //!   scan is report-only (no download, no `.socket/`, prints the
-//!   `scan --mode agent` hint), while `--mode agent` / `--apply` apply
+//!   `scan --mode agent` hint), while `--mode agent` / `--sync` apply
 //!   without prompting;
 //! * the hosted human arm's results table and `[UPDATE]` detection (parity
 //!   with the agent/vendored arms);
@@ -316,13 +316,11 @@ fn seed_manifest(root: &Path, entries: &[(&str, &str)]) {
 }
 
 // ---------------------------------------------------------------------------
-// resolve_mode_flags — the remaining cross-mode conflict arms
+// resolve_mode_flags — the `--sync` cross-mode conflict
 // ---------------------------------------------------------------------------
-// Only the `--mode hosted --vendor` arm is pinned in cli_parse_scan.rs;
-// these cover the --apply / --sync / --vendor booleans against a
-// different --mode, plus ScanMode::Agent.cli_name() rendering into the
-// message. Clap parses each combination fine (no value-dependent conflict
-// is expressible); the fold is what rejects them.
+// `--sync` means `--mode agent --prune`, so it contradicts any other
+// `--mode`. Clap parses each combination fine (no value-dependent conflict
+// is expressible); the fold is what rejects them, naming the mode.
 
 mod mode_fold {
     use clap::Parser;
@@ -369,18 +367,8 @@ mod mode_fold {
 
     #[test]
     #[serial_test::serial]
-    fn mode_vendored_with_apply_boolean_errors() {
-        let err = fold_err(&["--mode", "vendored", "--apply"]);
-        assert!(
-            err.contains("--mode vendored cannot be used with --apply"),
-            "the --apply arm must name the conflicting boolean: {err}"
-        );
-    }
-
-    #[test]
-    #[serial_test::serial]
     fn mode_hosted_with_sync_boolean_errors() {
-        // --sync counts as an agent-mode spelling, so it contradicts hosted.
+        // --sync means agent mode, so it contradicts hosted.
         let err = fold_err(&["--mode", "hosted", "--sync"]);
         assert!(
             err.contains("--mode hosted cannot be used with --sync"),
@@ -390,13 +378,11 @@ mod mode_fold {
 
     #[test]
     #[serial_test::serial]
-    fn mode_agent_with_vendor_boolean_errors_naming_agent() {
-        // Pins ScanMode::Agent.cli_name(): "agent" must render into the
-        // message (the only user-visible spelling of the variant).
-        let err = fold_err(&["--mode", "agent", "--vendor"]);
+    fn mode_vendored_with_sync_boolean_errors() {
+        let err = fold_err(&["--mode", "vendored", "--sync"]);
         assert!(
-            err.contains("--mode agent cannot be used with --vendor"),
-            "the agent arm must render cli_name() and the boolean: {err}"
+            err.contains("--mode vendored cannot be used with --sync"),
+            "the vendored arm must render cli_name(): {err}"
         );
     }
 }
@@ -1348,10 +1334,10 @@ async fn scan_global_report_only_hint_keeps_the_global_scope() {
     );
 }
 
-/// Each spelling that folds to `--mode agent` applies without prompting.
+/// Each spelling that selects `--mode agent` applies without prompting.
 #[tokio::test]
 async fn scan_human_agent_mode_applies_without_prompting() {
-    for flags in [&["--mode", "agent"][..], &["--apply"][..]] {
+    for flags in [&["--mode", "agent"][..], &["--sync"][..]] {
         let mock = MockServer::start().await;
         let purl = "pkg:npm/silent-target@1.0.0";
         let before = b"before\n";
@@ -2320,10 +2306,10 @@ fn scan_hosted_rejects_global() {
 #[test]
 fn scan_mode_conflict_error_is_capitalized_and_names_no_hidden_flag() {
     let tmp = tempfile::tempdir().unwrap();
-    let (code, _, stderr) = run_scan(tmp.path(), &["--mode", "hosted", "--vendor"]);
+    let (code, _, stderr) = run_scan(tmp.path(), &["--mode", "hosted", "--sync"]);
     assert_eq!(code, 2);
     assert!(
-        stderr.starts_with("Error: --mode hosted cannot be used with --vendor"),
+        stderr.starts_with("Error: --mode hosted cannot be used with --sync"),
         "{stderr:?}"
     );
     assert!(!stderr.contains("--redirect"), "{stderr:?}");
@@ -2757,4 +2743,43 @@ async fn scan_agent_json_nested_apply_failure_reaches_the_apply_block() {
         "the apply error text must reach the envelope: {v}"
     );
     assert_eq!(std::fs::read(member.join("index.js")).unwrap(), b"before\n",);
+}
+
+/// `scan --mode agent --json` over an installed file a local edit changed
+/// (neither beforeHash nor afterHash): the default policy overwrites it,
+/// and the `apply` block's `warnings[]` must report that overwrite — the
+/// same `content_mismatch_overwritten` warning `apply --json` and the human
+/// scan print — instead of dropping it (#1004).
+#[tokio::test]
+async fn scan_agent_json_mismatch_overwrite_reaches_the_apply_block() {
+    let mock = MockServer::start().await;
+    let purl = "pkg:npm/locally-edited@1.0.0";
+    mount_one_patch_api(&mock, purl, b"before\n").await;
+
+    let tmp = tempfile::tempdir().unwrap();
+    write_root_package_json(tmp.path());
+    write_npm_package(
+        tmp.path(),
+        "locally-edited",
+        "1.0.0",
+        b"before\n// local edit\n",
+    );
+
+    let (code, stdout, stderr) = run_scan_agent(tmp.path(), &mock.uri(), &["--json"]);
+    assert_eq!(code, 0, "stdout={stdout}\nstderr={stderr}");
+    let v: serde_json::Value = serde_json::from_str(stdout.trim()).expect("one JSON envelope");
+    let apply = &v["apply"];
+    assert_eq!(apply["applied"], 1, "{v}");
+    let warned = apply["warnings"].as_array().is_some_and(|ws| {
+        ws.iter().filter_map(|w| w.as_str()).any(|w| {
+            w.starts_with("(content_mismatch_overwritten) ")
+                && w.contains(purl)
+                && w.contains("package/index.js")
+        })
+    });
+    assert!(warned, "the overwrite must be reported: {v}");
+    assert_eq!(
+        std::fs::read(tmp.path().join("node_modules/locally-edited/index.js")).unwrap(),
+        b"after\n"
+    );
 }

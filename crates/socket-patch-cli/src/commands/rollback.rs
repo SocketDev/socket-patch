@@ -76,6 +76,19 @@ pub(crate) fn join_clauses(clauses: &[String]) -> String {
     }
 }
 
+/// The `hosted_state_not_preservable` run warning: a `--preserve-state`
+/// run (rollback or remove) restored hosted pins to upstream anyway — the
+/// lockfile pins are hosted mode's only record, so there is no local
+/// state to keep.
+pub(crate) fn hosted_state_not_preservable_warning() -> (String, String) {
+    (
+        "hosted_state_not_preservable".into(),
+        "hosted wiring has no preservable local state: the lockfile pins are the only \
+         record, and they now resolve upstream; re-run `scan --mode hosted` to re-wire"
+            .into(),
+    )
+}
+
 /// Capitalize the first character and end with `?`.
 pub(crate) fn as_question(text: &str) -> String {
     if text.is_empty() {
@@ -1519,13 +1532,7 @@ pub async fn run(args: RollbackArgs) -> i32 {
                 ));
             }
             if args.preserve_state && !hosted_leg.reverted.is_empty() {
-                run_warnings.push((
-                    "hosted_state_not_preservable".into(),
-                    "hosted wiring has no preservable local state: the lockfile pins are \
-                     the only record, and they now resolve upstream; re-run \
-                     `scan --mode hosted` to re-wire"
-                        .into(),
-                ));
+                run_warnings.push(hosted_state_not_preservable_warning());
             }
             if !path_scope.is_empty() {
                 let scope = path_scope.bind(&cwd);

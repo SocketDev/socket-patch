@@ -82,9 +82,12 @@ impl HostedPin {
             .collect()
     }
 
-    /// Every hosted pin a discovery holds.
+    /// Every hosted pin a discovery holds: its refs, plus the refs it
+    /// withholds from attestation only because an unreachable unpatched
+    /// copy installs beside them ([`Discovery::shadowed`], #828) — that
+    /// wiring is still one package version's pin, so it is restorable.
     pub fn all(discovery: &Discovery) -> Vec<HostedPin> {
-        Self::from_refs(&discovery.refs)
+        Self::from_refs(discovery.refs.iter().chain(&discovery.shadowed))
     }
 
     /// THE "is this patch pinned" answer: the attributable hosted pins
@@ -181,6 +184,7 @@ impl HostedInventory {
             let urls = discovery
                 .refs
                 .iter()
+                .chain(&discovery.shadowed)
                 .filter(|r| r.mode == WiringMode::Hosted)
                 .filter_map(|r| Some((r.url.as_deref()?, r.uuid.as_str())))
                 .chain(

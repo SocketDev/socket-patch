@@ -195,7 +195,8 @@ fn run_scan_vendor(root: &Path, mock_uri: &str, extra: &[&str]) -> (i32, String,
     let mut argv = vec![
         "scan",
         "--json",
-        "--vendor",
+        "--mode",
+        "vendored",
         "--yes",
         "--api-url",
         mock_uri,
@@ -355,8 +356,8 @@ async fn scan_vendor_dry_run_reports_already_vendored() {
     );
 }
 
-/// `scan --json --vendor --dry-run --prune` (a legal combination —
-/// `--vendor` conflicts only with `--apply`/`--sync`): the vendor JSON
+/// `scan --json --mode vendored --dry-run --prune` (a legal combination —
+/// `--mode vendored` conflicts only with `--mode agent`/`--sync`): the vendor JSON
 /// path's dry-run arm must emit the GC PREVIEW (`prunable*`/`orphan*`
 /// field names, per `to_preview_json`) and mutate nothing on disk.
 #[tokio::test]

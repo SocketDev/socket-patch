@@ -167,8 +167,7 @@ fn is_old_lockfile_ignored<'a>(
             && (dep_id.first.is_empty() || is_registry_url_segment(&dep_id.first, options))
     });
     let declares_modifiers = vlt_config.is_some_and(|text| {
-        let text = text.strip_prefix('\u{feff}').unwrap_or(text);
-        serde_json::from_str::<Value>(text)
+        serde_json::from_str::<Value>(crate::formats::text::strip_bom(text))
             .ok()
             .and_then(|v| v.as_object().map(|o| o.contains_key("modifiers")))
             .unwrap_or(false)
@@ -675,6 +674,28 @@ mod tests {
             &format!("{{\"registry\": \"{r}\", \"registries\": {{\"acme\": \"{r}\"}}}}"),
             "·acme·left-pad@1.3.0"
         )));
+    }
+
+    /// `vlt.json`'s `modifiers` probe reads past exactly one leading BOM
+    /// (`formats::text::strip_bom`): a second one is content, so the file
+    /// is not JSON and declares nothing.
+    #[test]
+    fn modifiers_probe_reads_past_one_vlt_json_bom_only() {
+        let lock = "{\n  \"lockfileVersion\": 0,\n  \"options\": {},\n  \"nodes\": {\n    \"··left-pad@1.3.0\": [0,\"left-pad\",\"sha512-REGISTRY==\"]\n  },\n  \"edges\": {}\n}\n";
+        let old_lockfile = |config: &str| {
+            let mut result = RewriteResult::default();
+            rewrite_vlt_lock(
+                &files(&[(VLT_LOCK, lock), (VLT_CONFIG, config)]),
+                &[dep("left-pad", "1.3.0", Some(SHA))],
+                false,
+                &mut result,
+            );
+            codes(&result).contains(&"redirect_vlt_old_lockfile_ignored")
+        };
+        assert!(!old_lockfile("{\"modifiers\": {}}"));
+        assert!(!old_lockfile("\u{feff}{\"modifiers\": {}}"));
+        assert!(old_lockfile("\u{feff}\u{feff}{\"modifiers\": {}}"));
+        assert!(old_lockfile("{}"));
     }
 
     #[test]

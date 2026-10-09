@@ -2605,6 +2605,91 @@ async fn vlt_decides_before_binary_bun_and_a_refused_uuid_is_never_confirmed() {
     assert_eq!(confirmed["redirect"]["redirected"], 1, "{confirmed:#}");
 }
 
+/// REGRESSION (#899): npm 12 never reads npm-shrinkwrap.json. A project
+/// whose only npm lock is the shrinkwrap is still redirected (npm <= 11
+/// installs from it), but the run warns `redirect_npm_shrinkwrap_only` —
+/// in `--json` and on human stderr — and the in-run `--vex` attests nothing
+/// for it (`vex_npm_shrinkwrap_only`), as a lockfile-only `vex` does.
+#[tokio::test]
+async fn shrinkwrap_only_project_warns_npm12_ignores_it_and_vex_omits_it() {
+    let server = MockServer::start().await;
+    mock_discovery(&server, PURL, UUID).await;
+    mock_granted_reference(&server, UUID, PURL, HOSTED_URL).await;
+    mock_view(&server, UUID, PURL).await;
+
+    let tmp = tempfile::tempdir().unwrap();
+    write_npm_project(tmp.path(), NAME);
+    std::fs::rename(
+        tmp.path().join("package-lock.json"),
+        tmp.path().join("npm-shrinkwrap.json"),
+    )
+    .unwrap();
+
+    let (code, doc) = scan_hosted_json(
+        tmp.path(),
+        &server.uri(),
+        &[
+            "--vex",
+            "out.vex.json",
+            "--vex-product",
+            "pkg:npm/consumer@0.0.0",
+            "--patch-server-url",
+            "http://patch.test",
+        ],
+        &[],
+    );
+    // Still redirected: npm <= 11 installs from the shrinkwrap.
+    assert_eq!(doc["redirect"]["redirected"], 1, "{doc:#}");
+    let lock = std::fs::read_to_string(tmp.path().join("npm-shrinkwrap.json")).unwrap();
+    assert!(lock.contains(HOSTED_URL), "{lock}");
+    assert!(
+        !tmp.path().join("package-lock.json").exists(),
+        "no package-lock.json is invented"
+    );
+    let detail = warning_detail(&doc, "redirect_npm_shrinkwrap_only");
+    for needle in ["covgap-hosted@1.0.0", "npm >= 12", "no package-lock.json"] {
+        assert!(detail.contains(needle), "{needle}: {detail}");
+    }
+    // The in-run VEX omits it, so the requested VEX fails the run.
+    assert_eq!(code, 1, "{doc:#}");
+    assert_eq!(doc["error"]["code"], "no_applicable_patches", "{doc:#}");
+    assert!(
+        doc["warnings"]
+            .as_array()
+            .is_some_and(|w| w.iter().any(|w| w["code"] == "vex_npm_shrinkwrap_only"
+                && w["detail"].as_str().is_some_and(|d| d.contains(PURL)))),
+        "{doc:#}"
+    );
+    assert!(!tmp.path().join("out.vex.json").exists());
+
+    // With the package-lock.json twin npm 12 reads, the re-run rewires it
+    // too, the warning is gone and the in-run VEX attests.
+    std::fs::copy(
+        tmp.path().join("npm-shrinkwrap.json"),
+        tmp.path().join("package-lock.json"),
+    )
+    .unwrap();
+    let (code, doc) = scan_hosted_json(
+        tmp.path(),
+        &server.uri(),
+        &[
+            "--vex",
+            "out.vex.json",
+            "--vex-product",
+            "pkg:npm/consumer@0.0.0",
+            "--patch-server-url",
+            "http://patch.test",
+        ],
+        &[],
+    );
+    assert_eq!(code, 0, "{doc:#}");
+    assert!(
+        !warning_codes(&doc).contains(&"redirect_npm_shrinkwrap_only".to_string()),
+        "{doc:#}"
+    );
+    assert_eq!(doc["vex"]["statements"], 1, "{doc:#}");
+}
+
 // ───────────────── yarn classic berry-migration advisory ─────────────────
 
 /// Yarn classic project: package.json (with `package_manager` when given) +

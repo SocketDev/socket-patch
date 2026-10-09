@@ -908,10 +908,21 @@ jobs:
           BUNDLE_OS: ${{ matrix.os }}
         run: python3 scripts/ci-e2e-bundle.py --os "$BUNDLE_OS" --cargo-json target-build.json --dest target/e2e-bin
 
+      - name: Compress the e2e binaries
+        # Compress the bundle as one stream so identical Rust code across
+        # test binaries shares a dictionary. Zstd is on every runner image.
+        # The 128 MiB window cuts the Linux artifact from ~200 MB to ~94 MB;
+        # ZIP compresses each binary separately and repeats the common code.
+        shell: bash
+        run: |
+          set -euo pipefail
+          tar -C target/e2e-bin -cf - . | zstd -q -f -10 --long=27 -o target/e2e-bin.tar.zst
+
       - uses: ./.github/actions/upload-artifact
         with:
           name: e2e-bin-${{ matrix.os }}
-          path: target/e2e-bin/
+          path: target/e2e-bin.tar.zst
+          compression-level: 0
           if-no-files-found: error
           retention-days: 3
 
@@ -1307,7 +1318,20 @@ jobs:
         with:
           pattern: e2e-bin-${{ matrix.os }}*
           merge-multiple: true
-          path: target/e2e-bin
+          path: target/e2e-archive
+
+      - name: Unpack the e2e binaries
+        shell: bash
+        # Decompress to a file, not into `| tar -xf -`: a tar that exits at
+        # the end-of-archive marker without draining stdin (macOS's does)
+        # leaves zstd writing into a closed pipe, and pipefail turns its
+        # "Broken pipe" into a failed leg that evicts the queue entry.
+        run: |
+          set -euo pipefail
+          mkdir -p target/e2e-bin
+          zstd -q -d -f target/e2e-archive/e2e-bin.tar.zst -o target/e2e-bin.tar
+          tar -xf target/e2e-bin.tar -C target/e2e-bin
+          rm target/e2e-bin.tar
 
       - name: Stage the CLI where the test binaries expect it
         # `CARGO_BIN_EXE_socket-patch` was baked in at compile time as
@@ -2149,7 +2173,19 @@ jobs:
         with:
           pattern: e2e-bin-${{ matrix.os }}*
           merge-multiple: true
-          path: target/e2e-bin
+          path: target/e2e-archive
+      - name: Unpack the e2e binaries
+        shell: bash
+        # Decompress to a file, not into `| tar -xf -`: a tar that exits at
+        # the end-of-archive marker without draining stdin (macOS's does)
+        # leaves zstd writing into a closed pipe, and pipefail turns its
+        # "Broken pipe" into a failed leg that evicts the queue entry.
+        run: |
+          set -euo pipefail
+          mkdir -p target/e2e-bin
+          zstd -q -d -f target/e2e-archive/e2e-bin.tar.zst -o target/e2e-bin.tar
+          tar -xf target/e2e-bin.tar -C target/e2e-bin
+          rm target/e2e-bin.tar
       - name: Install Rust
         run: rustup show
       - name: Install the cargo under test

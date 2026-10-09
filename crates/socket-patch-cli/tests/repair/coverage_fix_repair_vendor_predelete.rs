@@ -187,9 +187,9 @@ fn events_of(v: &serde_json::Value) -> Vec<serde_json::Value> {
     v["events"].as_array().cloned().unwrap_or_default()
 }
 
-/// `scan --vendor --yes` the gem fixture; returns the vendored copy dir.
+/// `scan --mode vendored --yes` the gem fixture; returns the vendored copy dir.
 fn vendor_gem_project(root: &Path, mock_uri: &str) -> PathBuf {
-    let (code, stdout, stderr) = run_cli(root, mock_uri, &["scan", "--vendor", "--yes"]);
+    let (code, stdout, stderr) = run_cli(root, mock_uri, &["scan", "--mode", "vendored", "--yes"]);
     assert_eq!(code, 0, "gem vendor setup failed: {stdout} {stderr}");
     let copy = root.join(gem_copy_rel());
     assert_eq!(

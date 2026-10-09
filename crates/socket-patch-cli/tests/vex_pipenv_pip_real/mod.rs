@@ -95,7 +95,7 @@ impl Mode {
     pub fn scan_flags(self) -> &'static [&'static str] {
         match self {
             Mode::Hosted => &["--mode=hosted"],
-            Mode::Vendored => &["--vendor", "--vendor-source", "service"],
+            Mode::Vendored => &["--mode", "vendored", "--vendor-source", "service"],
         }
     }
 }
