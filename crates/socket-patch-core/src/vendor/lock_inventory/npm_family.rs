@@ -11,7 +11,7 @@ use crate::formats::yarn::{grammar as yarn_grammar, YarnLockGrammar};
 use crate::utils::purl::npm_purl;
 use crate::vendor::npm_flavor::NpmLockFlavor;
 
-use super::bun::{bun_text_lock_present_in, inventory_bun_binary_in, inventory_bun_in};
+use super::bun::{bun_text_lock_drives, inventory_bun_binary_in, inventory_bun_in};
 use super::npm::inventory_package_lock_in;
 use super::pnpm::{
     inventory_pnpm_lock_in, inventory_pnpm_lock_rel_in, inventory_pnpm_member_locks_in,
@@ -172,7 +172,7 @@ pub(super) async fn inventory_npm_lock_raw_in(
         NpmLockFlavor::YarnClassic => inventory_yarn_classic_in(view).await,
         NpmLockFlavor::YarnBerry => inventory_yarn_berry_in(view).await,
         NpmLockFlavor::Bun => {
-            if bun_text_lock_present_in(view).await {
+            if bun_text_lock_drives(view) {
                 inventory_bun_in(view).await
             } else {
                 Some(inventory_bun_binary_in(view).await?)
@@ -196,9 +196,18 @@ pub(super) async fn inventory_npm_lock_raw_in(
 pub(super) async fn inventory_live_sibling_lock_in(
     view: &ProjectView<'_>,
 ) -> Option<(NpmLockFlavor, Vec<LockfileEntry>)> {
+    // A `bun.lock` that exists but can't be stat'd (dangling symlink,
+    // ELOOP, EACCES) still shadows `bun.lockb` for Bun, so its presence
+    // comes from the same predicate the router uses.
+    let bun_text = bun_text_lock_drives(view);
     let mut present = Vec::new();
     for file in npm_lock_files() {
-        if view.exists(file).await {
+        let here = if file == BUN_LOCK {
+            bun_text
+        } else {
+            view.exists(file).await
+        };
+        if here {
             present.push(file);
         }
     }
@@ -211,7 +220,7 @@ pub(super) async fn inventory_live_sibling_lock_in(
         // The router's bun step runs BEFORE its pnpm sniff, so when the
         // version refusal fired no bun lock can actually be present; kept
         // for the table's sake. The text lock wins over the binary one.
-        NpmLockFamily::Bun if present.contains(&BUN_LOCK) => (
+        NpmLockFamily::Bun if bun_text => (
             NpmLockFlavor::Bun,
             inventory_bun_in(view).await.unwrap_or_default(),
         ),

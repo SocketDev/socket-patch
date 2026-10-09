@@ -35,6 +35,10 @@
 //!      `vendor_bun_workspace_unsupported` BEFORE the takeover restores
 //!      anything, so the hosted wiring survives byte-for-byte; the v2 twin
 //!      still takes over.
+//!   6. A project with its own registries (bunfig `[install] registry` and
+//!      `[install.scopes]`, #992): `remove <purl>` and the takeover +
+//!      `vendor --revert` chain keep each registry's tarball URL in the
+//!      slot (`in_process_vendor_bun_takeover/registry.rs`).
 //!
 //! Every child process gets the ambient `SOCKET_*` vars scrubbed and
 //! telemetry hard-disabled; each test runs in its own tempdir.
@@ -53,6 +57,8 @@ use wiremock::{Mock, MockServer, ResponseTemplate};
 
 #[path = "vex_e2e_common/bun.rs"]
 mod bun_vex;
+#[path = "in_process_vendor_bun_takeover/registry.rs"]
+mod registry;
 #[path = "in_process_vendor_bun_takeover/vlt.rs"]
 mod vlt;
 #[path = "vlt_hosted_common/mod.rs"]
@@ -354,6 +360,15 @@ fn run_cli(cwd: &Path, args: &[&str]) -> (i32, String, String) {
             cmd.env_remove(key);
         }
     }
+    // A registry exported by npm (`npm_config_registry`) or Bun would
+    // steer the Bun restores off the fixtures' registries (#992).
+    for key in [
+        "BUN_CONFIG_REGISTRY",
+        "NPM_CONFIG_REGISTRY",
+        "npm_config_registry",
+    ] {
+        cmd.env_remove(key);
+    }
     cmd.env("SOCKET_TELEMETRY_DISABLED", "1")
         .env("SOCKET_NPM_REGISTRY", registry_uri());
     let _fixture = prebuilt_common::prepare_command(&mut cmd, cwd, args, &[]);
@@ -586,6 +601,9 @@ async fn bun_hosted_then_scan_vendored_takeover_round_trips_to_registry() {
         "bun.lock must be restored byte-identical to the pristine registry lock; got:\n{}",
         read(root, "bun.lock")
     );
+    // #764: the hoisted node_modules/left-pad keeps the vendored bytes
+    // through a plain `bun install`; the envelope names the forcing one.
+    assert_bun_reinstall_event(&env);
     assert!(
         !root.join(".socket/vendor").exists(),
         ".socket/vendor must be fully pruned after the revert"
@@ -1039,6 +1057,16 @@ fn bun_scoped_remove_of_one_of_two_hosted_records_unwinds_only_that_purl() {
         "no top-level error expected: {env:#}"
     );
     assert_only_left_pad_unwound(root, &pristine);
+    // #764: the restored pin's hoisted copy is kept by a plain `bun
+    // install`; the advisory names it, and not the still-hosted sibling.
+    let detail = run_warning(&env, "redirect_bun_reinstall_required")
+        .unwrap_or_else(|| panic!("remove must advise a forced reinstall: {env:#}"));
+    assert!(
+        detail.contains("left-pad@1.3.0")
+            && !detail.contains("other@")
+            && detail.contains("`bun install --force`"),
+        "{detail}"
+    );
 }
 
 // ─────────────────────────────────────────────────────────────────────
@@ -1279,4 +1307,170 @@ fn bun_vendor_over_hosted_v2_workspace_lock_still_takes_over() {
         "the workspace entry survives the takeover:\n{lock}"
     );
     assert!(lock.starts_with("{\n  \"lockfileVersion\": 2,\n"), "{lock}");
+}
+
+// ─────────────────────────────────────────────────────────────────────
+// 6. Bun keeps the vendored copy after an unwind (#764)
+// ─────────────────────────────────────────────────────────────────────
+// Bun's hoisted linker does not re-extract a package whose lock entry moves
+// back to the registry record of the same name@version, so every command
+// that unwinds a vendored bun.lock entry must name `bun install --force`.
+
+/// The `detail` of the run-level `warnings[]` entry with `code`.
+fn run_warning<'a>(env: &'a Value, code: &str) -> Option<&'a str> {
+    env["warnings"]
+        .as_array()?
+        .iter()
+        .find(|w| w["code"] == code)
+        .and_then(|w| w["detail"].as_str())
+}
+
+/// The envelope carries the per-entry `vendor_bun_reinstall_required`
+/// advisory for left-pad, naming the install that does reinstall.
+fn assert_bun_reinstall_event(env: &Value) {
+    let event = find_event(env, "skipped", Some("vendor_bun_reinstall_required"));
+    assert_eq!(event["purl"], PURL, "{env:#}");
+    let detail = event["reason"].as_str().unwrap_or_default();
+    assert!(
+        detail.contains("left-pad@1.3.0") && detail.contains("`bun install --force`"),
+        "{env:#}"
+    );
+}
+
+/// A hoisted bun project with left-pad vendored over its (v5) hosted pin
+/// by a plain `vendor` run; returns the pristine registry lock.
+fn write_vendored_project(root: &Path) -> String {
+    let pristine = pristine_lock();
+    write_bun_project(root, &pristine, &[(NAME, VERSION)]);
+    let hosted = pristine.replace(
+        LEFT_PAD_REGISTRY_LINE,
+        &hosted_line(NAME, NAME, HOSTED_URL, PATCHED_SHA512),
+    );
+    assert_ne!(hosted, pristine, "the hosted splice must hit");
+    std::fs::write(root.join("bun.lock"), &hosted).unwrap();
+    seed_manifest_and_blob(root);
+    let (code, env) = vendor_cli(root, &[]);
+    assert_eq!(code, 0, "vendor must succeed: {env:#}");
+    assert_eq!(env["summary"]["applied"], 1, "{env:#}");
+    assert_pure_vendored(root);
+    pristine
+}
+
+/// `remove <purl>` of a vendored bun.lock entry — manifest-backed and
+/// ledger-only alike — restores the registry line and carries the
+/// advisory in its envelope.
+#[test]
+fn bun_remove_of_a_vendored_entry_advises_a_forced_reinstall() {
+    for ledger_only in [false, true] {
+        let tmp = tempfile::tempdir().unwrap();
+        let root = tmp.path();
+        let pristine = write_vendored_project(root);
+        if ledger_only {
+            std::fs::remove_file(root.join(".socket/manifest.json")).unwrap();
+        }
+        let (code, env) = run_json(
+            root,
+            &[
+                "remove",
+                PURL,
+                "--yes",
+                "--json",
+                "--cwd",
+                root.to_str().unwrap(),
+            ],
+        );
+        assert_eq!(code, 0, "ledger_only={ledger_only}: {env:#}");
+        assert_eq!(
+            read(root, "bun.lock"),
+            pristine,
+            "ledger_only={ledger_only}"
+        );
+        assert_bun_reinstall_event(&env);
+    }
+}
+
+/// A pre-v5 ledger recorded the HOSTED line as left-pad's pre-vendor
+/// original, so `vendor --revert` re-wires it to the patch server and then
+/// restores its upstream registry entry. The vendored revert's per-entry
+/// advisory already names left-pad; the hosted unwind's run-level twin for
+/// the same package is dropped instead of repeating it.
+#[test]
+fn bun_pre_v5_revert_advises_a_forced_reinstall_once() {
+    let tmp = tempfile::tempdir().unwrap();
+    let root = tmp.path();
+    let pristine = write_vendored_project(root);
+    let state_path = root.join(".socket/vendor/state.json");
+    let mut state: Value = serde_json::from_str(&read(root, ".socket/vendor/state.json")).unwrap();
+    let wiring = state["entries"][PURL]["wiring"].as_array_mut().unwrap();
+    let record = wiring
+        .iter_mut()
+        .find(|w| w["kind"] == "bun_lock_package")
+        .unwrap();
+    record["original"] = json!(hosted_line(NAME, NAME, HOSTED_URL, PATCHED_SHA512));
+    std::fs::write(&state_path, serde_json::to_vec_pretty(&state).unwrap()).unwrap();
+
+    let (code, env) = vendor_cli(root, &["--revert"]);
+    assert_eq!(code, 0, "revert must succeed: {env:#}");
+    find_event(&env, "skipped", Some("vendor_revert_restored_upstream"));
+    assert_eq!(
+        read(root, "bun.lock"),
+        pristine,
+        "back to the registry line"
+    );
+    assert_bun_reinstall_event(&env);
+    assert_eq!(
+        events(&env)
+            .iter()
+            .filter(|e| e["errorCode"] == "vendor_bun_reinstall_required")
+            .count(),
+        1,
+        "{env:#}"
+    );
+    assert!(
+        run_warning(&env, "redirect_bun_reinstall_required").is_none(),
+        "the run-level twin repeats the per-entry advisory: {env:#}"
+    );
+}
+
+/// `scan --prune` reverts a `vendor`-tracked entry whose patch left the
+/// manifest (the GC's leg (a)). That revert restores left-pad's registry
+/// line under the same hoisted copy, so the `gc` sub-object carries the
+/// advisory too.
+#[tokio::test(flavor = "multi_thread")]
+async fn bun_scan_prune_revert_advises_a_forced_reinstall() {
+    let server = MockServer::start().await;
+    Mock::given(method("POST"))
+        .and(path(format!("/v0/orgs/{ORG}/patches/batch")))
+        .respond_with(ResponseTemplate::new(200).set_body_json(json!({
+            "packages": [],
+            "canAccessPaidPatches": false,
+        })))
+        .mount(&server)
+        .await;
+    let tmp = tempfile::tempdir().unwrap();
+    let root = tmp.path();
+    let pristine = write_vendored_project(root);
+    std::fs::write(root.join(".socket/manifest.json"), "{\"patches\": {}}\n").unwrap();
+
+    let (code, env) = scan_mode(root, &server.uri(), "vendored", &["--prune"]);
+    assert_eq!(code, 0, "{env:#}");
+    assert_eq!(
+        env["gc"]["revertedVendoredEntries"],
+        json!([PURL]),
+        "{env:#}"
+    );
+    assert_eq!(
+        read(root, "bun.lock"),
+        pristine,
+        "back to the registry line"
+    );
+    let advised = env["gc"]["warnings"].as_array().is_some_and(|ws| {
+        ws.iter().any(|w| {
+            w["code"] == "vendor_bun_reinstall_required"
+                && w["detail"].as_str().is_some_and(|d| {
+                    d.contains("left-pad@1.3.0") && d.contains("`bun install --force`")
+                })
+        })
+    });
+    assert!(advised, "{env:#}");
 }

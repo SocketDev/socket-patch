@@ -67,7 +67,7 @@ pub fn remove_module_prefix_lines(content: &str, module_prefix: &str) -> Option<
     if kept.is_empty() {
         return Some(String::new());
     }
-    let eol = super::common::detect_eol(content);
+    let eol = crate::utils::line_endings::terminator(content);
     let mut joined = kept.join(eol);
     joined.push_str(eol);
     Some(joined)
@@ -132,7 +132,7 @@ pub fn reinsert_lines(content: &str, removed: &str) -> Option<String> {
     if !changed {
         return None;
     }
-    let eol = super::common::detect_eol(content);
+    let eol = crate::utils::line_endings::terminator(content);
     let mut joined = lines.join(eol);
     joined.push_str(eol);
     Some(joined)
@@ -149,7 +149,7 @@ pub fn remove_lines(content: &str, added: &str) -> Option<String> {
     if kept.is_empty() {
         return Some(String::new());
     }
-    let eol = super::common::detect_eol(content);
+    let eol = crate::utils::line_endings::terminator(content);
     let mut joined = kept.join(eol);
     joined.push_str(eol);
     Some(joined)
@@ -163,7 +163,7 @@ pub fn remove_lines(content: &str, added: &str) -> Option<String> {
 /// The content is always exactly what applying the text transforms in the
 /// same order would give. Once a transform changes it, the file is held as
 /// its lines: every transform ends with `lines.join(eol) + eol`, whose
-/// `str::lines` are those lines again and whose `detect_eol` is `eol` again —
+/// `str::lines` are those lines again and whose `line_endings::terminator` is `eol` again —
 /// except when a line ends in a bare `\r` under an LF file (a joined `\r\n`
 /// would then split differently), which is kept as text instead.
 pub(crate) struct GoSumEditor {
@@ -191,7 +191,7 @@ impl GoSumEditor {
         match std::mem::replace(&mut self.state, GoSumState::Text(String::new())) {
             GoSumState::Text(text) => {
                 let lines = text.lines().map(str::to_string).collect();
-                let eol = super::common::detect_eol(&text);
+                let eol = crate::utils::line_endings::terminator(&text);
                 self.state = GoSumState::Text(text);
                 (lines, eol)
             }
@@ -622,17 +622,19 @@ mod tests {
     }
 
     /// Mixed and bare-`\r` line endings, a missing final newline and a
-    /// blank line: the outputs the text transforms gave before they were
-    /// folded into the editor.
+    /// blank line: the rewritten file takes `line_endings::terminator`'s
+    /// style, the majority of a mixed file's breaks (a tie is LF).
     #[test]
     fn odd_line_endings_give_the_recorded_outputs() {
+        // One LF and one CRLF break: a tie, so LF (the old any-CRLF rule
+        // re-spelled this whole file CRLF).
         let mixed = "a.com/x v1.0.0 h1:A=\nb.com/z v1.0.0 h1:B=\r\nc.com/q v1.0.0 h1:C=";
         assert_eq!(
             upsert_module_lines(mixed, "b.com/y", "v1.0.0", "h1:Z=", "h1:G=").as_deref(),
             Some(
-                "a.com/x v1.0.0 h1:A=\r\nb.com/y v1.0.0 h1:Z=\r\n\
-                 b.com/y v1.0.0/go.mod h1:G=\r\nb.com/z v1.0.0 h1:B=\r\n\
-                 c.com/q v1.0.0 h1:C=\r\n"
+                "a.com/x v1.0.0 h1:A=\nb.com/y v1.0.0 h1:Z=\n\
+                 b.com/y v1.0.0/go.mod h1:G=\nb.com/z v1.0.0 h1:B=\n\
+                 c.com/q v1.0.0 h1:C=\n"
             )
         );
         assert_eq!(
@@ -640,13 +642,25 @@ mod tests {
             None
         );
 
+        // A CRLF majority keeps the file CRLF.
+        let crlf_majority =
+            "a.com/x v1.0.0 h1:A=\r\nb.com/z v1.0.0 h1:B=\r\nc.com/q v1.0.0 h1:C=\n";
+        assert_eq!(
+            upsert_module_lines(crlf_majority, "b.com/y", "v1.0.0", "h1:Z=", "h1:G=").as_deref(),
+            Some(
+                "a.com/x v1.0.0 h1:A=\r\nb.com/y v1.0.0 h1:Z=\r\n\
+                 b.com/y v1.0.0/go.mod h1:G=\r\nb.com/z v1.0.0 h1:B=\r\n\
+                 c.com/q v1.0.0 h1:C=\r\n"
+            )
+        );
+
         let bare_cr = "a.com/x v1.0.0 h1:A=\r\rb.com/y v1.0.0 h1:Q=\nb.com/z v1.0.0 h1:B=\r\n";
         assert_eq!(
             upsert_module_lines(bare_cr, "b.com/y", "v1.0.0", "h1:Z=", "h1:G=").as_deref(),
             Some(
-                "a.com/x v1.0.0 h1:A=\r\rb.com/y v1.0.0 h1:Q=\r\n\
-                 b.com/y v1.0.0 h1:Z=\r\nb.com/y v1.0.0/go.mod h1:G=\r\n\
-                 b.com/z v1.0.0 h1:B=\r\n"
+                "a.com/x v1.0.0 h1:A=\r\rb.com/y v1.0.0 h1:Q=\n\
+                 b.com/y v1.0.0 h1:Z=\nb.com/y v1.0.0/go.mod h1:G=\n\
+                 b.com/z v1.0.0 h1:B=\n"
             )
         );
         assert!(!GoSumEditor::new(bare_cr.to_string()).has_module_version("b.com/y", "v1.0.0"));
@@ -655,17 +669,32 @@ mod tests {
         assert!(GoSumEditor::new(blank.to_string()).has_module_version("b.com/y", "v1.0.0"));
         assert_eq!(
             upsert_module_lines(blank, "b.com/y", "v1.0.0", "h1:Z=", "h1:G=").as_deref(),
-            Some("\r\nb.com/y v1.0.0 h1:Z=\r\nb.com/y v1.0.0/go.mod h1:G=\r\n")
+            Some("\nb.com/y v1.0.0 h1:Z=\nb.com/y v1.0.0/go.mod h1:G=\n")
         );
         assert_eq!(
             remove_exact_module_version_lines(blank, "b.com/y", "v1.0.0"),
             Some((
-                "\r\n".to_string(),
+                "\n".to_string(),
                 vec![
                     "b.com/y v1.0.0 h1:OLD=".to_string(),
                     "b.com/y v1.0.0/go.mod h1:OLDM=".to_string(),
                 ]
             ))
+        );
+    }
+
+    /// The forward upsert and its revert agree on a mixed file: once the
+    /// upsert has re-spelled it in the majority style, removing the added
+    /// lines hands back that file minus them, in the same style.
+    #[test]
+    fn mixed_upsert_then_remove_round_trips() {
+        let mixed = "a.com/x v1.0.0 h1:A=\r\nb.com/z v1.0.0 h1:B=\nc.com/q v1.0.0 h1:C=\n";
+        let wired = upsert_module_lines(mixed, "b.com/y", "v1.0.0", "h1:Z=", "h1:G=").unwrap();
+        assert_eq!(crate::utils::line_endings::terminator(&wired), "\n");
+        let added = "b.com/y v1.0.0 h1:Z=\nb.com/y v1.0.0/go.mod h1:G=\n";
+        assert_eq!(
+            remove_lines(&wired, added).as_deref(),
+            Some("a.com/x v1.0.0 h1:A=\nb.com/z v1.0.0 h1:B=\nc.com/q v1.0.0 h1:C=\n")
         );
     }
 

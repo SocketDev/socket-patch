@@ -2396,3 +2396,99 @@ async fn hosted_scan_from_npm_member_with_stray_lock_refuses() {
         }
     }
 }
+
+/// #1101 (Bun), #1134 (vlt): a workspace member holding a stray
+/// `bun.lock` / `bun.lockb` / `vlt-lock.json` of its own (one its manager
+/// never reads; members install from the root lock) used to skip the
+/// #884 / #942 refusal. `scan` and `get` pinned the ignored member lock
+/// and exited 0. They now refuse, name the root lock and the ignored
+/// member lock, and leave both untouched.
+#[tokio::test]
+#[serial]
+async fn hosted_scan_from_bun_or_vlt_member_with_stray_lock_refuses() {
+    let server = MockServer::start().await;
+    mock_discovery(&server).await;
+    mock_reference(&server).await;
+    mock_view(&server).await;
+    let bun_text = format!(
+        "{{\n  \"lockfileVersion\": 1,\n  \"workspaces\": {{ \"\": {{ \"name\": \"a\", \
+         \"dependencies\": {{ \"{NAME}\": \"{VERSION}\" }} }} }},\n  \"packages\": {{\n    \
+         \"{NAME}\": [\"{NAME}@{VERSION}\", \"\", {{}}, \"{UPSTREAM_SHA512}\"],\n  }}\n}}\n"
+    );
+    let vlt_text = format!(
+        "{{\"lockfileVersion\":1,\"options\":{{}},\"nodes\":{{\"~npm~{NAME}@{VERSION}\":\
+         [0,\"{NAME}\",\"{UPSTREAM_SHA512}\"]}},\"edges\":{{\"file~_d {NAME}\":\"prod {VERSION} \
+         ~npm~{NAME}@{VERSION}\"}}}}"
+    );
+    for (root_lock, vlt_json, member_lock, member_text) in [
+        ("bun.lock", None, "bun.lock", bun_text.as_str()),
+        ("bun.lock", None, "bun.lockb", "binary"),
+        ("bun.lockb", None, "bun.lock", bun_text.as_str()),
+        ("vlt-lock.json", None, "vlt-lock.json", vlt_text.as_str()),
+        (
+            "vlt-lock.json",
+            Some(r#"{"workspaces":"packages/*"}"#),
+            "vlt-lock.json",
+            vlt_text.as_str(),
+        ),
+    ] {
+        let tmp = tempfile::tempdir().unwrap();
+        let member = write_package_json_workspace(tmp.path(), root_lock, false);
+        if let Some(text) = vlt_json {
+            std::fs::write(tmp.path().join("vlt.json"), text).unwrap();
+        }
+        let stray = member.join(member_lock);
+        std::fs::write(&stray, member_text).unwrap();
+        let lock = tmp.path().join(root_lock);
+        let before = std::fs::read_to_string(&lock).unwrap();
+        let case = format!("root {root_lock} (vlt.json {vlt_json:?}), member {member_lock}");
+
+        for args in [
+            vec!["scan", "--mode", "hosted"],
+            vec!["get", UUID, "--mode", "hosted"],
+        ] {
+            let out = scrubbed_cli()
+                .args(&args)
+                .args([
+                    "--json",
+                    "--yes",
+                    "--cwd",
+                    member.to_str().unwrap(),
+                    "--api-url",
+                    &server.uri(),
+                    "--org",
+                    ORG,
+                    "--api-token",
+                    "fake",
+                ])
+                .output()
+                .expect("run socket-patch");
+            let doc: serde_json::Value = serde_json::from_slice(&out.stdout).unwrap_or_else(|e| {
+                panic!(
+                    "{case} {args:?}: output is not JSON ({e}):\n{}\n{}",
+                    String::from_utf8_lossy(&out.stdout),
+                    String::from_utf8_lossy(&out.stderr)
+                )
+            });
+            let case = format!("{case} {args:?}");
+            assert_refused_workspace_lock_elsewhere(
+                &case,
+                out.status.code(),
+                &doc,
+                &lock,
+                &before,
+                &member,
+            );
+            let message = doc["error"]["message"].as_str().unwrap_or_default();
+            assert!(
+                message.contains(member_lock) && message.contains("ignores"),
+                "{case}: {message}"
+            );
+            assert_eq!(
+                std::fs::read_to_string(&stray).unwrap(),
+                member_text,
+                "{case}: the stray member lock is untouched"
+            );
+        }
+    }
+}

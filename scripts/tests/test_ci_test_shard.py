@@ -1,11 +1,15 @@
-"""ci-test-shard.py: the `test` job's shards together run exactly the old
-single `cargo test --workspace` selection."""
+"""ci-test-shard.py: the debug/release shards preserve the workspace tests."""
 
 import importlib.util
 import json
+import os
+import re
+import shutil
 import subprocess
+import tempfile
 import unittest
 from pathlib import Path
+from unittest.mock import patch
 
 ROOT = Path(__file__).parents[2]
 spec = importlib.util.spec_from_file_location("ci_test_shard", ROOT / "scripts" / "ci-test-shard.py")
@@ -49,6 +53,24 @@ class Partition(unittest.TestCase):
             self.assertEqual(args[:4], ["cargo", "test", "--workspace", "--no-fail-fast"])
             self.assertIn("--locked", args)
 
+    def test_release_profile_is_kept_for_integration_unit_and_doc_tests(self):
+        for k in range(1, 4):
+            for args in shard.invocations(k, 3, self.NAMES, ["--locked", "--profile", "ci-release"]):
+                self.assertIn("--locked", args)
+                self.assertEqual(args[args.index("--profile") + 1], "ci-release")
+
+    def test_failed_unit_or_integration_run_still_runs_docs_and_fails_the_shard(self):
+        metadata = {"workspace_members": ["a"], "packages": [
+            {"id": "a", "targets": [{"name": "integration", "kind": ["test"]}]}]}
+        with patch.object(shard.subprocess, "run", side_effect=[
+            subprocess.CompletedProcess([], 0, stdout=json.dumps(metadata)),
+            subprocess.CompletedProcess([], 1),
+            subprocess.CompletedProcess([], 0),
+        ]) as run:
+            self.assertEqual(shard.main(["1", "3", "--locked", "--profile", "ci-release"]), 1)
+        self.assertEqual(run.call_count, 3)
+        self.assertIn("--doc", run.call_args_list[-1].args[0])
+
     def test_negative_bad_shard(self):
         with self.assertRaises(ValueError):
             shard.invocations(3, 2, self.NAMES)
@@ -74,6 +96,79 @@ class Partition(unittest.TestCase):
             self.skipTest("cargo not available")
         names = shard.integration_targets(json.loads(out))
         self.assertGreater(len(names), 100)
+
+
+class ReleaseWorkflow(unittest.TestCase):
+    def test_all_release_shards_are_required_and_use_the_matrix_size(self):
+        # Read the configured matrix, rather than assuming the workflow kept
+        # the same shard count as this test. A missing shard silently loses
+        # tests; an unguarded aggregate can turn a failed matrix green.
+        workflow = (ROOT / ".github/workflows/ci.yml").read_text(encoding="utf-8")
+        release = workflow.split("\n  test-release:\n")[1].split("\n  coverage:\n")[0]
+        count = json.loads(re.search(r"^        shard: (\[.*\])$", release, re.M)[1])
+        self.assertEqual(count, list(range(1, len(count) + 1)))
+        self.assertGreater(len(count), 1)
+        self.assertIn("TEST_SHARD: ${{ matrix.shard }}", release)
+        self.assertIn("TEST_SHARD_COUNT: ${{ strategy.job-total }}", release)
+        self.assertIn('python3 scripts/ci-test-shard.py "$TEST_SHARD" "$TEST_SHARD_COUNT" '
+                      '--locked --profile ci-release', release)
+        self.assertIn("fail-fast: false", release)
+        self.assertIn("github.event_name != 'merge_group'", release)
+        verdict = workflow.split("\n  ci-ok:\n")[1]
+        needs = re.search(r"^    needs: \[(.*)\]$", verdict, re.M)[1].split(", ")
+        self.assertIn("test-release", needs)
+        self.assertIn("if: always()", verdict)
+        self.assertIn('if v["result"] not in ("success", "skipped")', verdict)
+
+
+@unittest.skipUnless(shutil.which("cargo"), "cargo not available")
+class CargoSelection(unittest.TestCase):
+    def test_three_release_shards_run_the_same_tests_as_cargo_workspace(self):
+        # Exercise Cargo, including duplicate target names across packages,
+        # binary/library units, ignored tests and doctests. This catches
+        # selector interactions that argument-list assertions cannot prove.
+        with tempfile.TemporaryDirectory(prefix="ci-release-shards-") as directory:
+            root = Path(directory)
+            files = {
+                "Cargo.toml": '[workspace]\nmembers=["one","two"]\nresolver="2"\n'
+                              '[profile.ci-release]\ninherits="release"\nlto=false\n',
+                "one/Cargo.toml": '[package]\nname="one"\nversion="0.1.0"\nedition="2021"\n',
+                "one/src/lib.rs": '/// ```\n/// assert_eq!(one::answer(), 42);\n/// ```\n'
+                                  'pub fn answer() -> u8 { 42 }\n'
+                                  '#[test] fn release_semantics() {\n'
+                                  '    assert!(!cfg!(debug_assertions));\n'
+                                  '    let n = std::hint::black_box(u8::MAX);\n'
+                                  '    assert_eq!(n + 1, 0);\n}\n',
+                "one/src/main.rs": 'fn main() {}\n#[test] fn binary_unit() {}\n',
+                "one/tests/shared.rs": '#[test] fn first_shared() {}\n'
+                                       '#[test] #[ignore] fn ignored_case() {}\n',
+                "one/tests/tail.rs": '#[test] fn tail_case() {}\n',
+                "two/Cargo.toml": '[package]\nname="two"\nversion="0.1.0"\nedition="2021"\n'
+                                  '[lib]\ntest=false\ndoctest=false\n',
+                "two/src/lib.rs": 'pub fn value() -> u8 { 1 }\n',
+                "two/tests/shared.rs": '#[test] fn second_shared() {}\n',
+            }
+            for name, content in files.items():
+                path = root / name
+                path.parent.mkdir(parents=True, exist_ok=True)
+                path.write_text(content, encoding="utf-8")
+            env = dict(os.environ, CARGO_TARGET_DIR=str(root / "target"))
+
+            def run(args):
+                result = subprocess.run(args, cwd=root, env=env, capture_output=True, text=True)
+                self.assertEqual(result.returncode, 0, result.stdout + result.stderr)
+                return result.stdout
+
+            metadata = json.loads(run(["cargo", "metadata", "--offline", "--no-deps", "--format-version", "1"]))
+            run(["cargo", "generate-lockfile", "--offline"])
+            extra = ["--offline", "--locked", "--profile", "ci-release"]
+            baseline = run(["cargo", "test", "--workspace", *extra])
+            actual = "\n".join(run(args) for k in range(1, 4)
+                               for args in shard.invocations(k, 3, shard.integration_targets(metadata), extra))
+            pattern = re.compile(r"^test (.+) \.\.\. (ok|ignored)$", re.M)
+            expected = pattern.findall(baseline)
+            self.assertGreaterEqual(len(expected), 7)
+            self.assertCountEqual(pattern.findall(actual), expected)
 
 
 if __name__ == "__main__":

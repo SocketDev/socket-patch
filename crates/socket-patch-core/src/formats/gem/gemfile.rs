@@ -286,6 +286,43 @@ pub(crate) fn trailing_options(tail: &str) -> String {
         .unwrap_or_default()
 }
 
+/// The one exact version a `gem "name", …` tail pins: a single quoted
+/// constraint `"1.0.0"` or `"= 1.0.0"` (what the hosted rewriter writes
+/// into a patch-registry `source` block), followed by any options. `None`
+/// for anything else: no constraint, a range (`"~> 1.0"`, `">= 1", "< 2"`),
+/// a positional (`VERSION`), a dynamic option splat, or an unreadable tail.
+pub(crate) fn exact_version(tail: &str) -> Option<String> {
+    let tail = &without_statement_end(tail);
+    let code = code_of(tail)?;
+    let mut version = None;
+    for (_, arg) in args(tail)? {
+        match arg {
+            Arg::Version => {
+                if version.is_some() {
+                    return None;
+                }
+                version = Some(());
+            }
+            Arg::Option { .. } => {}
+            Arg::Dynamic(_) | Arg::Positional => return None,
+        }
+    }
+    version?;
+    // The Version arg is the first argument (`args` keeps file order and
+    // a version after an option is a Ruby syntax error).
+    let body = code.trim().strip_prefix(',')?.trim_start();
+    let (content, _) = leading_quoted(body)?;
+    let content = content.trim();
+    let v = content
+        .strip_prefix('=')
+        .map(str::trim_start)
+        .unwrap_or(content);
+    let exact = !v.is_empty()
+        && v.chars()
+            .all(|c| c.is_ascii_alphanumeric() || matches!(c, '.' | '-' | '_'));
+    exact.then(|| v.to_string())
+}
+
 /// `opts` minus a top-level `;` statement terminator (and any extra `;`s),
 /// keeping a trailing `#` comment. Both rewriters first refuse a tail where
 /// another statement follows the `;` (`gem_line_tail_blocks_edit`), so only
@@ -466,6 +503,41 @@ mod tests {
             (", require: false # x;", "require: false # x;"),
         ] {
             assert_eq!(trailing_options(tail), opts, "{tail:?}");
+        }
+    }
+
+    /// #1224: the exact pin the hosted rewriter writes into a patch-registry
+    /// `source` block is read back; anything that is not one exact version
+    /// is not.
+    #[test]
+    fn exact_version_reads_only_one_exact_pin() {
+        assert_eq!(exact_version(", \"1.0.0\""), Some("1.0.0".into()));
+        assert_eq!(exact_version(", '1.0.0'"), Some("1.0.0".into()));
+        assert_eq!(exact_version(", \"= 1.0.0\""), Some("1.0.0".into()));
+        assert_eq!(
+            exact_version(", \"1.0.0\", require: false # boot"),
+            Some("1.0.0".into())
+        );
+        assert_eq!(exact_version(", \"1.0.0\";"), Some("1.0.0".into()));
+        assert_eq!(
+            exact_version(", \"2.0.0.rc1\", \"group\" => :test"),
+            Some("2.0.0.rc1".into())
+        );
+        for tail in [
+            "",
+            ",",
+            ", require: false",
+            ", \"~> 1.0\"",
+            ", \">= 1.0.0\"",
+            ", \"!= 1.0.0\"",
+            ", \">= 1\", \"< 2\"",
+            ", \"1.0.0\", \"1.0.0\"",
+            ", VERSION",
+            ", \"1.0.0\", **opts",
+            ", \"1.0.0",
+            ", \"\"",
+        ] {
+            assert_eq!(exact_version(tail), None, "{tail}");
         }
     }
 }

@@ -1052,9 +1052,13 @@ mod tests {
                         "the diagnostic names the copy: {:?}",
                         diag_codes(&out)
                     );
+                    // Still a pin the lock records (#1195).
+                    let shadowed: Vec<_> = out.shadowed.iter().map(|r| r.uuid.as_str()).collect();
+                    assert_eq!(shadowed, [uuid], "{mode:?}");
                 } else {
                     assert_refs(&out, &[(PURL, uuid, mode)]);
                     assert_eq!(bundled_contests(&out), 0, "{:?}", diag_codes(&out));
+                    assert!(out.shadowed.is_empty(), "{mode:?}: {:?}", out.shadowed);
                 }
             }
         }

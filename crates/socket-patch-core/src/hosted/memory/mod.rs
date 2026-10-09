@@ -78,9 +78,9 @@ use crate::rollout::stage::{
     classify, lookup_incomplete, mark_pinned, offers_from_results, Offers, RecordedIndex, Row,
     Stage, ROLLOUT_DEFERRED,
 };
+use crate::utils::purl_key::PurlKey;
 use discover::Provider;
 use stages::{Planned, RewriteRefused, Rewritten, StageOptions};
-use crate::utils::purl_key::PurlKey;
 
 /// `"<crate version>+<git sha or 'unknown'>"`; the sha comes from the
 /// `SOCKET_PATCH_GIT_SHA` build-time variable.
@@ -580,18 +580,26 @@ async fn memory_recorded(project: &MemoryProject, root: &str, roots: &[String]) 
         .filter(|rel| rel != "/")
         .collect();
     let own = |file: &String| !nested.iter().any(|n| file.starts_with(n.as_str()));
-    // The same discovery `HostedPin::discover` runs, kept whole so its
-    // lockless pins (never refs) count as recorded too.
+    // The same discovery `HostedPin::discover_recorded` runs, kept whole so
+    // its lockless pins (never refs) count as recorded too.
     let discovery = crate::vex::discover::discover_patched_refs_view(
         ProjectView::Memory(project),
         &crate::vex::DiscoverOptions::default(),
     )
     .await;
-    let pins: Vec<(String, String)> = crate::patch::redirect::upstream::HostedPin::all(&discovery)
-        .into_iter()
-        .filter(|pin| pin.files.iter().any(own))
-        .map(|pin| (pin.purl, pin.uuid))
-        .collect();
+    let mut pins: Vec<(String, String)> =
+        crate::patch::redirect::upstream::HostedPin::recorded(&discovery)
+            .into_iter()
+            .filter(|pin| pin.files.iter().any(own))
+            .map(|pin| (pin.purl, pin.uuid))
+            .collect();
+    // A Gemfile-only gem pin (no lock ref until the next unfrozen `bundle
+    // install`) counts as recorded too (#1224).
+    for pin in crate::vex::discover::gem_manifest_source_pins(&ProjectView::Memory(project)).await {
+        if !pins.contains(&pin) {
+            pins.push(pin);
+        }
+    }
     let unlocked = discovery
         .unlocked_pins
         .into_iter()
@@ -1067,7 +1075,7 @@ async fn engine(
         if origins.is_empty() {
             continue;
         }
-        let pins = crate::patch::redirect::upstream::HostedPin::discover(
+        let pins = crate::patch::redirect::upstream::HostedPin::discover_recorded(
             ProjectView::Memory(&plan.project),
             &origins,
         )
