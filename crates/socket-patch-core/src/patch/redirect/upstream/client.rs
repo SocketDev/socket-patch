@@ -691,7 +691,9 @@ pub(crate) const DEFAULT_GOSUMDB: &str = "https://sum.golang.org";
 /// The checksum database go would consult for `module`, or `None` when go
 /// would not (`GOSUMDB=off`, or the module matches `GONOSUMDB` /
 /// `GOPRIVATE`) — the hashes are then computed from the module proxy's
-/// bytes instead. An explicit `SOCKET_GOSUMDB_URL` always wins.
+/// bytes instead. An explicit `SOCKET_GOSUMDB_URL` always wins. The Go
+/// settings resolve from the environment, then the `go env -w` file
+/// ([`crate::utils::go_env`]).
 fn gosumdb_base(module: &str) -> Option<String> {
     if let Ok(v) = std::env::var("SOCKET_GOSUMDB_URL") {
         let v = v.trim().trim_end_matches('/').to_string();
@@ -699,7 +701,7 @@ fn gosumdb_base(module: &str) -> Option<String> {
             return Some(v);
         }
     }
-    let nonempty = |key: &str| std::env::var(key).ok().filter(|v| !v.trim().is_empty());
+    let nonempty = |key: &str| crate::utils::go_env::go_env(key).filter(|v| !v.trim().is_empty());
     if nonempty("GOSUMDB").is_some_and(|v| v.trim() == "off") {
         return None;
     }
