@@ -88,7 +88,7 @@ HISTORICAL_INTEGRITY = Path(__file__).with_name('vlt-historical-integrity.json')
 VERSIONS = ['0.0.0-16', '0.0.0-32', '1.0.0-rc.14', '1.0.0-rc.32', '1.0.4', '1.0.10', '1.2.0']
 MODES = ['hosted', 'vendored', 'agent']
 PURL = 'pkg:npm/minimist@1.2.2'
-UUID = '80630680-4da6-45f9-bba8-b888e0ffd58c'
+UUID = '642d7f02-ebc1-4ab0-99e2-07f5dd8463cb'
 NAME = 'minimist'
 VERSION = '1.2.2'
 TARGET = f'{NAME}@{VERSION}'
@@ -1069,7 +1069,7 @@ class Cell:
         ok = True
         for copy_dir in self.copies(root, lock_text):
             for key, hashes in self.record['files'].items():
-                path = copy_dir / key.split('/', 1)[1]
+                path = copy_dir / key.removeprefix('package/')
                 digest = git_hash(path.read_bytes()) if path.is_file() else None
                 details[str(path.relative_to(root))] = digest
                 ok = ok and digest == hashes.get(f'{side}Hash')
