@@ -134,7 +134,9 @@ fn new_ledgers_compact_whole_file_snapshots_and_revert() {
         assert_eq!(code, 0, "{eco}: {stdout}\n{stderr}");
         let bytes = std::fs::read(f.root.join(".socket/vendor/state.json")).unwrap();
         let ledger: serde_json::Value = serde_json::from_slice(&bytes).unwrap();
-        let whole_file = ["maven", "nuget", "pylock"].contains(eco);
+        // Maven vendors through the JVM planner (#973), whose fragment
+        // records hold no whole-file snapshot.
+        let whole_file = ["nuget", "pylock"].contains(eco);
         assert_eq!(
             ledger["version"],
             if whole_file { 2 } else { 1 },
@@ -239,7 +241,9 @@ fn strip_sha256_hash_options(bytes: &[u8]) -> Vec<u8> {
 /// same entries the base's version-1 ledger loads to.
 #[tokio::test]
 async fn server_artifacts_preserve_legacy_wiring_shape_and_originals() {
-    for eco in fx::ALL {
+    // Maven now vendors through the suffixed JVM planner (#973); its
+    // legacy fixture is revert-only (`legacy_maven_ledger_is_refused_until_reverted`).
+    for eco in fx::ALL.iter().filter(|eco| **eco != "maven") {
         let mut base_wired = read_tree(&fixtures_dir().join(eco).join("wired"));
         if *eco == "pypi-requirements" {
             // The one intended difference: the base binary pinned its vendor
@@ -312,4 +316,39 @@ async fn server_artifacts_preserve_legacy_wiring_shape_and_originals() {
             );
         }
     }
+}
+
+/// #973: a project still holding the pre-v5 single-POM ledger (the base
+/// binary's `maven_pom_repository` wiring) is refused whole, with nothing
+/// written; `vendor --revert` restores it byte for byte, and the next
+/// vendor plans it through the suffixed JVM planner.
+#[test]
+fn legacy_maven_ledger_is_refused_until_reverted() {
+    let wired = read_tree(&fixtures_dir().join("maven/wired"));
+    let f = Fixture::new("maven");
+    let pristine = tree(&f.root);
+    write_tree(&f.root, &wired);
+    let before = tree(&f.root);
+
+    let (code, stdout, stderr) = f.vendor(&[], &[]);
+    assert_ne!(code, 0, "{stdout}\n{stderr}");
+    assert!(
+        stdout.contains("vendor_jvm_shape_unsupported")
+            && stdout.contains("reason: legacy_maven_root: "),
+        "{stdout}"
+    );
+    assert_eq!(tree(&f.root), before, "the refusal writes nothing");
+
+    let (code, stdout, stderr) = f.vendor(&["--revert"], &[]);
+    assert_eq!(code, 0, "{stdout}\n{stderr}");
+    assert_eq!(tree(&f.root), pristine, "byte-exact revert");
+
+    let (code, stdout, stderr) = f.vendor(&[], &[]);
+    assert_eq!(code, 0, "{stdout}\n{stderr}");
+    let ledger = std::fs::read_to_string(f.root.join(".socket/vendor/state.json")).unwrap();
+    assert!(ledger.contains("\"ecosystem\": \"jvm\""), "{ledger}");
+    assert!(!ledger.contains("maven_pom_repository"), "{ledger}");
+    assert!(std::fs::read_to_string(f.root.join("pom.xml"))
+        .unwrap()
+        .contains("1.0.0-socket.11111111"));
 }

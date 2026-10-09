@@ -602,8 +602,7 @@ async fn vendor(case: &Case, staged: &Staged) -> VendorOutcome {
         client: Some(ApiClient::new(ApiClientOptions {
             api_url: server.uri(),
             api_token: None,
-            org_slug: None,
-            use_public_proxy: true,
+            route: socket_patch_core::api::client::ApiRoute::Proxy,
         })),
         use_public_proxy: true,
         vendor_url: None,

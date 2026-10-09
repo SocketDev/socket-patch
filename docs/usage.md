@@ -110,12 +110,14 @@ Repair cannot reconstruct a lost vendor ledger. Restore it from version control.
 The N-API crate and in-memory patch engine remain available for hosted GitHub
 App workflows. Removing local vendoring builders does not remove those APIs.
 
-### Maven reactors and Gradle
+### Maven and Gradle
 
-Maven reactors use suffixed versions in `.socket/vendor/maven2`; Gradle 6.8+
-keeps its coordinates and lockfiles, with settings wiring and a configuration-time
-SHA-256 check. Existing Gradle verification files are updated. Single-POM Maven
-projects retain their existing vendoring behavior.
+Maven projects, single-module or reactor, use suffixed versions in
+`.socket/vendor/maven2`; Gradle 6.8+ keeps its coordinates and lockfiles, with
+settings wiring and a configuration-time SHA-256 check. Existing Gradle
+verification files are updated. A project vendored before v5 through the
+single-POM `<repository>` wiring must run `socket-patch vendor --revert` before
+vendoring again.
 
 ```sh
 socket-patch vendor --check                       # read-only offline artifact and wiring audit

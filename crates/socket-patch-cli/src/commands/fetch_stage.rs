@@ -327,8 +327,7 @@ mod tests {
         ApiClient::new(socket_patch_core::api::client::ApiClientOptions {
             api_url: "http://127.0.0.1:1".to_string(),
             api_token: None,
-            use_public_proxy: false,
-            org_slug: None,
+            route: socket_patch_core::api::client::ApiRoute::Proxy,
         })
     }
 

@@ -796,6 +796,41 @@ mod tests {
         );
     }
 
+    /// A credentialed registry URL (`https://user:token@host/`) that can't
+    /// be read never leaks its userinfo into the `upstream_registry_fallback`
+    /// detail: rollback and remove print it and persist it in `--json`
+    /// output, which lands in CI logs.
+    #[tokio::test]
+    #[serial_test::serial]
+    async fn registry_fallback_warning_drops_url_credentials() {
+        let server = registry(&[("left-pad", "1.3.0", Some(LP_UPSTREAM))]).await;
+        std::env::set_var("SOCKET_NPM_REGISTRY", server.uri());
+        let host = server.uri().replace("http://", "");
+        let mirror = format!("http://ci-user:s3cret-token@{host}/private/");
+        let text = format!(
+            "{{\n  \"lockfileVersion\": 1,\n  \"options\": {{\"registries\":{{\"npm\":\"{mirror}\"}}}},\n  \"nodes\": {{\n    \"~npm~left-pad@1.3.0\": [0,\"left-pad\",\"sha512-AA==\",\"{}\"]\n  }},\n  \"edges\": {{}}\n}}\n",
+            hosted(LP_UUID, "left-pad-1.3.0.tgz")
+        );
+        let (outcome, _) = run(&text, &[pin("pkg:npm/left-pad@1.3.0", LP_UUID)], false).await;
+        std::env::remove_var("SOCKET_NPM_REGISTRY");
+        assert!(refused(&outcome).is_empty(), "{:?}", refused(&outcome));
+        let fallback: Vec<&String> = outcome
+            .warnings
+            .iter()
+            .filter(|(code, _)| *code == "upstream_registry_fallback")
+            .map(|(_, detail)| detail)
+            .collect();
+        assert_eq!(fallback.len(), 1, "{:?}", outcome.warnings);
+        assert!(
+            fallback[0].contains(&format!("http://{host}/private")),
+            "{}",
+            fallback[0]
+        );
+        for secret in ["s3cret-token", "ci-user"] {
+            assert!(!fallback[0].contains(secret), "{}", fallback[0]);
+        }
+    }
+
     #[tokio::test]
     #[serial_test::serial]
     async fn missing_registry_integrity_refuses() {

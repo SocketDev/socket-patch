@@ -478,9 +478,11 @@ pub fn build_pnpm(t: &mut Tree, size: Size) -> std::io::Result<Fixture> {
             &format!("project/node_modules/{}", p.name),
         )?;
     }
+    // pnpm >= 11, so the scan still writes the `trustLockfile` scaffold (a
+    // pnpm 9.0-10.4 install record skips it, #734).
     t.write(
         "project/node_modules/.modules.yaml",
-        "layoutVersion: 5\nnodeLinker: isolated\npackageManager: pnpm@9.15.0\n",
+        "layoutVersion: 5\nnodeLinker: isolated\npackageManager: pnpm@11.0.0\n",
     )?;
     t.write("project/node_modules/.pnpm/lock.yaml", pnpm_lock(&g))?;
     t.mkdir("home")?;

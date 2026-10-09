@@ -150,8 +150,11 @@ fn client_with_read(uri: &str, proxy: bool, read: Duration) -> ApiClient {
     ApiClient::new(ApiClientOptions {
         api_url: uri.to_string(),
         api_token: (!proxy).then(|| "tok".to_string()),
-        use_public_proxy: proxy,
-        org_slug: (!proxy).then(|| "org".to_string()),
+        route: if proxy {
+            socket_patch_core::api::client::ApiRoute::Proxy
+        } else {
+            socket_patch_core::api::client::ApiRoute::org("org")
+        },
     })
     .with_api_retry(ApiRetryPolicy::none(), RetryHooks::default())
     .with_api_timeouts(ApiTimeouts {

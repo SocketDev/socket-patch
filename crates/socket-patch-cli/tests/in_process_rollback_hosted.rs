@@ -758,6 +758,27 @@ async fn pypi_requirements_hosted_round_trip() {
     pypi_requirements_round_trip("flask==2.0.1\nrequests==2.31.0\n", &[]).await;
 }
 
+/// REGRESSION (#1212): the same round trip when the file opens with a
+/// PEP 263 coding line naming a codec beyond UTF-8 / ASCII / Latin-1 /
+/// cp1252 (a header copied from a template; the bytes are plain ASCII).
+/// pip decodes it with that codec, so `get --mode hosted` must wire it,
+/// `vex` attest it and `rollback` restore it (they read it as absent:
+/// nothing wired, then exit 2 and `manifest_not_found`).
+#[tokio::test]
+#[serial]
+async fn pypi_requirements_hosted_round_trip_with_an_unmodelled_coding_line() {
+    pypi_requirements_round_trip(
+        "# -*- coding: iso-8859-15 -*-\nflask==2.0.1\nrequests==2.31.0\n",
+        &[],
+    )
+    .await;
+    pypi_requirements_round_trip(
+        "# deps\n# vim: set fileencoding=cp1250 :\nflask==2.0.1\nrequests==2.31.0\n",
+        &[],
+    )
+    .await;
+}
+
 /// REGRESSION (#1086): the same round trip when an in-root `-r` include
 /// pins the same `requests==2.31.0` (split base/dev files), with the `-r`
 /// line before and after the root pin. pip reads the root and its includes

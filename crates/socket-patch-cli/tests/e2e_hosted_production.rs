@@ -2697,8 +2697,7 @@ async fn public_reference_url(uuid: &str) -> String {
     let client = ApiClient::new(ApiClientOptions {
         api_url: PROXY.to_string(),
         api_token: None,
-        use_public_proxy: true,
-        org_slug: None,
+        route: socket_patch_core::api::client::ApiRoute::Proxy,
     });
     let references = client
         .fetch_registry_references(&[uuid.to_string()])

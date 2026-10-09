@@ -794,17 +794,8 @@ pub(crate) async fn lock_text_refusals_for(
     let cwd = params.cwd.as_path();
     let origins =
         crate::commands::hosted_unwind::patch_server_origins_of(params.patch_server_url.as_deref());
-    let pins = socket_patch_core::patch::redirect::upstream::HostedPin::all(
-        &socket_patch_core::vex::discover_patched_refs_with(
-            cwd,
-            &socket_patch_core::vex::DiscoverOptions {
-                patch_server_origins: origins.clone(),
-            },
-        )
-        .await,
-    );
-    let claimed: std::collections::HashSet<PurlKey> =
-        pins.iter().map(|pin| PurlKey::new(&pin.purl)).collect();
+    let pins = hosted_pins(cwd, origins.clone()).await;
+    let claimed = claimed_purls(&pins);
     let fetchable: Vec<&PatchSearchResult> = selected
         .iter()
         .filter(|sr| bun_refusal.filter(|r| r.applies_to(&sr.purl)).is_none())
@@ -848,6 +839,42 @@ pub(crate) async fn lock_text_refusals_for(
         .await,
     );
     refusals
+}
+
+/// The purl keys the project's lockfiles pin hosted (a patch-server
+/// tarball, Socket's own or one of `origins`): the purls whose vendored
+/// run is a hosted → vendored takeover.
+/// The fetch-phase gate ([`lock_text_refusals_for`]) and the scan preview
+/// (`scan/vendor_flow.rs`) both read the takeovers through here, so the dry
+/// run and the wet run agree on which purls they are.
+pub(crate) async fn hosted_claimed_purls(
+    cwd: &Path,
+    origins: Vec<String>,
+) -> std::collections::HashSet<PurlKey> {
+    claimed_purls(&hosted_pins(cwd, origins).await)
+}
+
+/// The project's hosted pins (see [`hosted_claimed_purls`]).
+async fn hosted_pins(
+    cwd: &Path,
+    origins: Vec<String>,
+) -> Vec<socket_patch_core::patch::redirect::upstream::HostedPin> {
+    socket_patch_core::patch::redirect::upstream::HostedPin::all(
+        &socket_patch_core::vex::discover_patched_refs_with(
+            cwd,
+            &socket_patch_core::vex::DiscoverOptions {
+                patch_server_origins: origins,
+            },
+        )
+        .await,
+    )
+}
+
+/// The purl keys of `pins`.
+fn claimed_purls(
+    pins: &[socket_patch_core::patch::redirect::upstream::HostedPin],
+) -> std::collections::HashSet<PurlKey> {
+    pins.iter().map(|pin| PurlKey::new(&pin.purl)).collect()
 }
 
 /// The record a detached ledger entry already carries for `purl` at

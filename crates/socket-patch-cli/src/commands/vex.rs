@@ -20,8 +20,9 @@ use std::collections::HashMap;
 use std::path::{Path, PathBuf};
 
 use clap::Args;
+use socket_patch_core::api::client::ApiClient;
 use socket_patch_core::manifest::schema::{PatchManifest, PatchRecord};
-use socket_patch_core::telemetry::{track_vex_failed, track_vex_generated};
+use socket_patch_core::telemetry::{track_vex_failed, track_vex_generated, TelemetryAuth};
 use socket_patch_core::vex::{
     build_document, detect_product, BuildOptions, Document, FailedPatch, VendorContext,
     VerifyOutcome,
@@ -29,8 +30,8 @@ use socket_patch_core::vex::{
 
 use crate::args::{apply_env_toggles, parse_bool_flag, GlobalArgs};
 use crate::commands::vex_sources::{
-    self, Plan, Sources, RECORD_MISMATCH, RECORD_UNAVAILABLE, REDIRECT_UNWIRED, VENDOR_UNWIRED,
-    WIRING_CONFLICT,
+    self, Plan, RunApiClient, Sources, RECORD_MISMATCH, RECORD_UNAVAILABLE, REDIRECT_UNWIRED,
+    VENDOR_UNWIRED, WIRING_CONFLICT,
 };
 use crate::ecosystem_dispatch::{find_manifest_package_copies_reusing, JvmScope};
 use crate::json_envelope::{Command, Envelope, EnvelopeError, PatchAction, PatchEvent, RunWarning};
@@ -156,8 +157,13 @@ impl VexEmbedArgs {
     /// Build the core [`VexBuildParams`] from the embedded flags. The
     /// output is always the `--vex` path (embedded VEX never writes to
     /// stdout). Caller must have checked `self.vex.is_some()`.
-    pub(crate) fn to_build_params(&self) -> VexBuildParams {
+    ///
+    /// `api_client` is the host run's client when it built one: the VEX
+    /// plan then fetches records and reports telemetry on the run's route
+    /// instead of resolving the org again. `None` builds one on first need.
+    pub(crate) fn to_build_params(&self, api_client: Option<&ApiClient>) -> VexBuildParams {
         VexBuildParams {
+            api_client: RunApiClient::new_with(api_client.cloned()),
             output: self.vex.clone(),
             product: self.vex_product.clone(),
             no_verify: self.vex_no_verify,
@@ -231,6 +237,22 @@ pub(crate) struct VexBuildParams {
     /// records (the post-install standalone `vex` fetches them from the
     /// API instead). Empty everywhere else.
     pub hosted_records: std::collections::BTreeMap<String, PatchRecord>,
+    /// The run's API client (see [`RunApiClient`]): seeded by a host
+    /// command, else built at most once when the plan must fetch records.
+    /// Telemetry reads its route when it exists.
+    pub api_client: RunApiClient,
+}
+
+impl VexBuildParams {
+    /// Where this run's `vex_*` telemetry goes: the run client's route when
+    /// one was built, else the no-client route from the credential chain
+    /// (flag / env / socket-cli config), with no network.
+    fn telemetry(&self, common: &GlobalArgs) -> TelemetryAuth {
+        match self.api_client.get() {
+            Some(client) => TelemetryAuth::for_client(client),
+            None => common.telemetry_auth(),
+        }
+    }
 }
 
 /// Successful result of [`generate_vex`].
@@ -351,6 +373,7 @@ pub async fn run(args: VexArgs) -> i32 {
         product_flag: "--product",
         npm_prior: None,
         hosted_records: Default::default(),
+        api_client: RunApiClient::new(),
     };
 
     let manifest_path = args.common.resolved_manifest_path();
@@ -537,7 +560,7 @@ async fn generate_vex(
     let redirected: &[String] = &plan.redirected;
     let product_id = match resolve_product_id(common, params.product.as_deref(), warnings).await {
         Ok(id) => id,
-        Err(reason) => return Err(fail(common, "product_undetected", reason).await),
+        Err(reason) => return Err(fail(common, params, "product_undetected", reason).await),
     };
 
     // The help text promises "PURL/identifier", so an arbitrary string is
@@ -864,8 +887,7 @@ async fn generate_vex(
     ) {
         Some(doc) => doc,
         None => {
-            let (token, org) = common.telemetry_credentials();
-            track_vex_failed("no_applicable_patches", token.as_deref(), org.as_deref()).await;
+            track_vex_failed("no_applicable_patches", &params.telemetry(common)).await;
             let message = "No applied patches with vulnerability metadata to attest.".to_string();
             return Err(VexGenError {
                 code: "no_applicable_patches",
@@ -882,7 +904,7 @@ async fn generate_vex(
         serde_json::to_string_pretty(&doc)
     } {
         Ok(s) => s,
-        Err(e) => return Err(fail(common, "serialize_failed", e.to_string()).await),
+        Err(e) => return Err(fail(common, params, "serialize_failed", e.to_string()).await),
     };
 
     // Write. The file gets the same trailing newline `println!` gives the
@@ -894,6 +916,7 @@ async fn generate_vex(
                 // The raw io::Error names neither the file nor the operation.
                 return Err(fail(
                     common,
+                    params,
                     "write_failed",
                     format!("Failed to write VEX document to {}: {e}", path.display()),
                 )
@@ -907,7 +930,6 @@ async fn generate_vex(
         }
     };
 
-    let (token, org) = common.telemetry_credentials();
     track_vex_generated(
         doc.statements.len(),
         "openvex-0.2.0",
@@ -916,8 +938,7 @@ async fn generate_vex(
         } else {
             "stdout"
         },
-        token.as_deref(),
-        org.as_deref(),
+        &params.telemetry(common),
     )
     .await;
 
@@ -1282,7 +1303,7 @@ async fn generate_vex_from_manifest_path_inner(
             // Core's text ("Failed to parse manifest JSON: ...") does not
             // say which file; in a workspace that matters.
             let message = format!("{e} (in {})", manifest_path.display());
-            return Err(fail(common, "manifest_unreadable", message).await);
+            return Err(fail(common, params, "manifest_unreadable", message).await);
         }
     };
     let had_manifest_file = manifest_file.is_some();
@@ -1319,7 +1340,7 @@ async fn generate_vex_from_manifest_path_inner(
                  view. Restore it from version control or re-run `socket-patch vendor`.",
                 socket_patch_core::vendor::VENDOR_STATE_REL
             );
-            return Err(fail(common, "vendor_ledger_corrupt", message).await);
+            return Err(fail(common, params, "vendor_ledger_corrupt", message).await);
         }
     };
     // Rooted where the ledgers are (`--cwd`), and run under `--global` /
@@ -1365,28 +1386,34 @@ async fn generate_vex_from_manifest_path_inner(
                     warnings: Vec::new(),
                 }
             } else {
-                fail(common, "manifest_not_found", message).await
+                fail(common, params, "manifest_not_found", message).await
             });
         }
         return Err(fail(
             common,
+            params,
             "no_patches",
             "Manifest is empty — nothing to attest.".to_string(),
         )
         .await);
     }
-    let plan = vex_sources::plan(common, sources, &params.assume_applied).await;
+    let plan = vex_sources::plan(common, sources, &params.assume_applied, &params.api_client).await;
     generate_vex(common, params, plan, warnings).await
 }
 
 /// Fire `vex_failed` telemetry and build the matching [`VexGenError`].
 /// Centralizes the "track then return error" pattern in [`generate_vex`].
-/// Attribution goes through the same layered credential chain as
-/// `list` (flag / env / socket-cli `config.json`), not the raw
-/// flags — a `socket login`-only user must not report anonymously.
-async fn fail(common: &GlobalArgs, code: &'static str, message: String) -> VexGenError {
-    let (token, org) = common.telemetry_credentials();
-    track_vex_failed(code, token.as_deref(), org.as_deref()).await;
+/// Attribution follows the run's client when one exists, else the same
+/// layered credential chain as `list` (flag / env / socket-cli
+/// `config.json`), not the raw flags — a `socket login`-only user must not
+/// report anonymously. See [`VexBuildParams::telemetry`].
+async fn fail(
+    common: &GlobalArgs,
+    params: &VexBuildParams,
+    code: &'static str,
+    message: String,
+) -> VexGenError {
+    track_vex_failed(code, &params.telemetry(common)).await;
     VexGenError {
         code,
         message,
@@ -2032,6 +2059,7 @@ mod npm_prior_tests {
             product_flag: "--vex-product",
             npm_prior: prior,
             hosted_records: Default::default(),
+            api_client: RunApiClient::new(),
         };
         let manifest_path = common.resolved_manifest_path();
         match generate_vex_from_manifest_path(common, &params, &manifest_path).await {
@@ -2166,7 +2194,7 @@ mod mirror_refusal_tests {
                     vex_no_verify: no_verify,
                     ..Default::default()
                 }
-                .to_build_params();
+                .to_build_params(None);
                 params.hosted_gem_mirror_refused = refused;
                 // Even a supplied assumption cannot revive the refused pin;
                 // qualifier-insensitive exemption matching remains intact.
@@ -2287,7 +2315,7 @@ mod mirror_refusal_tests {
                 vex_no_verify: true,
                 ..Default::default()
             }
-            .to_build_params();
+            .to_build_params(None);
             // No candidate refused anything this run: only the plan check.
             params.hosted_gem_mirror_check = check;
             let summary = generate_vex(&common, &params, plan, &mut Vec::new())

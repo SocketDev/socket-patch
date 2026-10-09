@@ -740,6 +740,78 @@ fn repair_deletes_lock_file_even_when_repair_fails() {
 // Online fetch path — exercises the network branch via mock server
 // ---------------------------------------------------------------------------
 
+/// #648: a token whose org cannot be resolved (`/v0/organizations` answers
+/// 500) puts repair's download on the public proxy. Stderr says so at client
+/// construction; `--json` must carry the same `api_auth_fallback` warning in
+/// `warnings[]`, as scan / get / apply / vendor do.
+#[tokio::test]
+async fn repair_json_reports_unresolved_org_fallback_in_warnings() {
+    let content = b"patched-content\n";
+    let after_hash = git_sha256(content);
+
+    let mock = MockServer::start().await;
+    Mock::given(method("GET"))
+        .and(path("/v0/organizations"))
+        .respond_with(ResponseTemplate::new(500).set_body_string("boom"))
+        .mount(&mock)
+        .await;
+    Mock::given(method("GET"))
+        .and(path(format!("/patch/blob/{after_hash}")))
+        .respond_with(ResponseTemplate::new(200).set_body_bytes(content.to_vec()))
+        .expect(1)
+        .mount(&mock)
+        .await;
+    Mock::given(method("POST"))
+        .and(path("/patch/telemetry"))
+        .respond_with(ResponseTemplate::new(201))
+        .mount(&mock)
+        .await;
+
+    let tmp = tempfile::tempdir().expect("tempdir");
+    let socket = tmp.path().join(".socket");
+    std::fs::create_dir_all(&socket).unwrap();
+    let manifest = MANIFEST_JSON.replace(REFERENCED_HASH, &after_hash);
+    std::fs::write(socket.join("manifest.json"), manifest).unwrap();
+
+    let token = format!("sktsec_{}_api", "x".repeat(44));
+    let out = socket_cmd(tmp.path())
+        .args([
+            "repair",
+            "--json",
+            "--download-mode",
+            "file",
+            "--download-only",
+            "--api-url",
+            &mock.uri(),
+            "--proxy-url",
+            &mock.uri(),
+            "--api-token",
+            &token,
+        ])
+        .env("SOCKET_NO_CONFIG", "1")
+        .output()
+        .expect("run socket-patch");
+    let stdout = String::from_utf8_lossy(&out.stdout).to_string();
+    let stderr = String::from_utf8_lossy(&out.stderr).to_string();
+    assert_eq!(
+        out.status.code(),
+        Some(0),
+        "the proxy serves the blob; stdout={stdout}; stderr={stderr}"
+    );
+    let v: serde_json::Value = serde_json::from_str(stdout.trim()).expect("valid JSON");
+    assert_eq!(v["summary"]["downloaded"], 1, "{v}");
+    let warnings = v["warnings"]
+        .as_array()
+        .unwrap_or_else(|| panic!("no warnings[]: {v}; stderr={stderr}"));
+    assert!(
+        warnings.iter().any(|w| w["code"] == "api_auth_fallback"
+            && w["detail"]
+                .as_str()
+                .is_some_and(|d| d.starts_with("Could not determine your organization"))),
+        "api_auth_fallback missing from repair's warnings[]: {v}; stderr={stderr}"
+    );
+}
+
 #[tokio::test]
 async fn repair_online_downloads_missing_blob() {
     // Manifest references a blob whose content we control. The blob is

@@ -27,7 +27,9 @@ use socket_patch_core::manifest::operations::{read_manifest, write_manifest};
 use socket_patch_core::manifest::schema::{PatchManifest, PatchRecord};
 use socket_patch_core::patch::apply::{verify_file_patch, PatchSources};
 use socket_patch_core::patch::redirect::upstream::HostedPin;
-use socket_patch_core::telemetry::{track_patch_vendor_failed, track_patch_vendored};
+use socket_patch_core::telemetry::{
+    track_patch_vendor_failed, track_patch_vendored, TelemetryAuth,
+};
 use socket_patch_core::utils::concurrent::ordered_concurrent;
 use socket_patch_core::utils::group_commit::{CommittedFile, GroupCommit};
 use socket_patch_core::utils::purl::{normalize_purl, strip_purl_qualifiers};
@@ -1004,7 +1006,7 @@ pub async fn run(args: VendorArgs) -> i32 {
         }
         let vex_result = match args.vex.vex.as_ref() {
             Some(_) if !args.common.dry_run => {
-                let params = args.vex.to_build_params();
+                let params = args.vex.to_build_params(None);
                 Some(generate_vex_without_manifest(&args.common, &params, &manifest_path).await)
             }
             _ => None,
@@ -1076,11 +1078,11 @@ pub async fn run(args: VendorArgs) -> i32 {
     } else {
         let (client, use_public_proxy) =
             get_api_client_with_overrides(args.common.api_client_overrides()).await;
-        let telemetry_ids = (client.api_token().cloned(), client.org_slug().cloned());
+        let telemetry = TelemetryAuth::for_client(&client);
         Some((
             args.common
                 .vendor_service_config(Some(client), use_public_proxy),
-            telemetry_ids,
+            telemetry,
         ))
     };
 
@@ -1107,6 +1109,17 @@ pub async fn run(args: VendorArgs) -> i32 {
 
     let mut env = Envelope::new(Command::Vendor);
     env.dry_run = args.common.dry_run;
+    // A token whose org could not be resolved put the run on the proxy
+    // (stderr already said so); the embedded `--vex` reuses this client and
+    // leaves reporting it to the host's `warnings[]`.
+    if args.common.json {
+        if let Some(client) = vendor_service.as_ref().and_then(|(s, _)| s.client.as_ref()) {
+            env.warnings
+                .extend(crate::commands::vex_sources::api_auth_fallback_warning(
+                    client,
+                ));
+        }
+    }
 
     let mut exit = match &vendor_service {
         None => run_revert(&args, &mut env).await,
@@ -1126,7 +1139,11 @@ pub async fn run(args: VendorArgs) -> i32 {
                     );
                 }
             } else {
-                let params = args.vex.to_build_params();
+                let params = args.vex.to_build_params(
+                    vendor_service
+                        .as_ref()
+                        .and_then(|(svc, _)| svc.client.as_ref()),
+                );
                 match generate_vex_from_manifest_path(&args.common, &params, &manifest_path).await {
                     Ok(summary) => {
                         env.vex = Some(VexSummary {
@@ -1166,15 +1183,8 @@ pub async fn run(args: VendorArgs) -> i32 {
         println!("{}", env.to_pretty_json());
     }
 
-    if let Some((_, (api_token, org_slug))) = &vendor_service {
-        track_outcomes_for_vendor(
-            exit != 0,
-            &env,
-            args.common.dry_run,
-            api_token.as_deref(),
-            org_slug.as_deref(),
-        )
-        .await;
+    if let Some((_, telemetry)) = &vendor_service {
+        track_outcomes_for_vendor(exit != 0, &env, args.common.dry_run, telemetry).await;
     }
 
     exit
@@ -1668,7 +1678,7 @@ async fn run_eject(args: &VendorArgs, pins: Vec<HostedPin>) -> i32 {
     let common = &args.common;
     let (client, use_public_proxy) =
         get_api_client_with_overrides(common.api_client_overrides()).await;
-    let (api_token, org_slug) = (client.api_token().cloned(), client.org_slug().cloned());
+    let telemetry = TelemetryAuth::for_client(&client);
     if !common.json && !common.silent {
         println!(
             "{} {} into .socket/vendor/...",
@@ -1722,6 +1732,12 @@ async fn run_eject(args: &VendorArgs, pins: Vec<HostedPin>) -> i32 {
     if !fetch_failures.is_empty() {
         let mut env = Envelope::new(Command::Vendor);
         env.dry_run = common.dry_run;
+        if common.json {
+            env.warnings
+                .extend(crate::commands::vex_sources::api_auth_fallback_warning(
+                    &client,
+                ));
+        }
         for (purl, detail) in &fetch_failures {
             report_vendor_failure(common, purl, detail);
             env.record(
@@ -1736,14 +1752,7 @@ async fn run_eject(args: &VendorArgs, pins: Vec<HostedPin>) -> i32 {
         if common.json {
             println!("{}", env.to_pretty_json());
         }
-        track_outcomes_for_vendor(
-            true,
-            &env,
-            common.dry_run,
-            api_token.as_deref(),
-            org_slug.as_deref(),
-        )
-        .await;
+        track_outcomes_for_vendor(true, &env, common.dry_run, &telemetry).await;
         return 1;
     }
 
@@ -1784,6 +1793,12 @@ async fn run_eject(args: &VendorArgs, pins: Vec<HostedPin>) -> i32 {
     if !refused.is_empty() {
         let mut env = Envelope::new(Command::Vendor);
         env.dry_run = common.dry_run;
+        if common.json {
+            env.warnings
+                .extend(crate::commands::vex_sources::api_auth_fallback_warning(
+                    &client,
+                ));
+        }
         for (purl, code, why) in &refused {
             report_vendor_failure(common, purl, why);
             env.record(
@@ -1798,14 +1813,7 @@ async fn run_eject(args: &VendorArgs, pins: Vec<HostedPin>) -> i32 {
         if common.json {
             println!("{}", env.to_pretty_json());
         }
-        track_outcomes_for_vendor(
-            true,
-            &env,
-            common.dry_run,
-            api_token.as_deref(),
-            org_slug.as_deref(),
-        )
-        .await;
+        track_outcomes_for_vendor(true, &env, common.dry_run, &telemetry).await;
         return 1;
     }
 
@@ -1814,6 +1822,12 @@ async fn run_eject(args: &VendorArgs, pins: Vec<HostedPin>) -> i32 {
     if common.dry_run {
         let mut env = Envelope::new(Command::Vendor);
         env.dry_run = true;
+        if common.json {
+            env.warnings
+                .extend(crate::commands::vex_sources::api_auth_fallback_warning(
+                    &client,
+                ));
+        }
         for pin in &pins {
             env.record(
                 PatchEvent::new(PatchAction::Applied, pin.purl.clone()).with_reason(
@@ -1841,8 +1855,7 @@ async fn run_eject(args: &VendorArgs, pins: Vec<HostedPin>) -> i32 {
         if common.json {
             println!("{}", env.to_pretty_json());
         }
-        track_outcomes_for_vendor(false, &env, true, api_token.as_deref(), org_slug.as_deref())
-            .await;
+        track_outcomes_for_vendor(false, &env, true, &telemetry).await;
         return 0;
     }
 
@@ -1878,6 +1891,12 @@ async fn run_eject(args: &VendorArgs, pins: Vec<HostedPin>) -> i32 {
         }
     };
     let mut env = Envelope::new(Command::Vendor);
+    if common.json {
+        env.warnings
+            .extend(crate::commands::vex_sources::api_auth_fallback_warning(
+                &client,
+            ));
+    }
     let restore = socket_patch_core::patch::redirect::upstream::restore_upstream(
         &common.cwd,
         &pins,
@@ -2022,7 +2041,7 @@ async fn run_eject(args: &VendorArgs, pins: Vec<HostedPin>) -> i32 {
                     );
                 }
             } else {
-                let params = args.vex.to_build_params();
+                let params = args.vex.to_build_params(Some(&client));
                 let manifest_path = common.resolved_manifest_path();
                 match generate_vex_without_manifest(common, &params, &manifest_path).await {
                     ManifestlessVex::Written(summary) => {
@@ -2055,14 +2074,7 @@ async fn run_eject(args: &VendorArgs, pins: Vec<HostedPin>) -> i32 {
     if common.json {
         println!("{}", env.to_pretty_json());
     }
-    track_outcomes_for_vendor(
-        exit != 0,
-        &env,
-        common.dry_run,
-        api_token.as_deref(),
-        org_slug.as_deref(),
-    )
-    .await;
+    track_outcomes_for_vendor(exit != 0, &env, common.dry_run, &telemetry).await;
     exit
 }
 
@@ -2098,13 +2110,12 @@ pub(crate) async fn track_outcomes_for_vendor(
     has_errors: bool,
     env: &Envelope,
     dry_run: bool,
-    token: Option<&str>,
-    org: Option<&str>,
+    telemetry: &TelemetryAuth,
 ) {
     if has_errors {
-        track_patch_vendor_failed("vendor completed with failures", dry_run, token, org).await;
+        track_patch_vendor_failed("vendor completed with failures", dry_run, telemetry).await;
     } else {
-        track_patch_vendored(env.summary.applied, dry_run, token, org).await;
+        track_patch_vendored(env.summary.applied, dry_run, telemetry).await;
     }
 }
 
@@ -3798,7 +3809,12 @@ fn print_vendor_closing(
         // package.json `pnpm.overrides` mirror is ignored), so pnpm-wired
         // runs must name that file among the committables: a checkout
         // that loses it silently unvendors on the next install.
-        let commit = commit_hint(wired_flavors);
+        // A project pinned to pnpm 9.0–10.4 gets no pnpm-workspace.yaml
+        // (#734), so the file is named only when it is there.
+        let commit = commit_hint(
+            wired_flavors,
+            common.cwd.join("pnpm-workspace.yaml").exists(),
+        );
         let mut installs: Vec<&str> = wired_flavors
             .iter()
             .filter_map(|f| flavor_install_command(f))
@@ -3911,10 +3927,17 @@ fn jvm_wiring_tool(wiring: &[vendor::state::WiringRecord]) -> Option<&'static st
 /// The "Commit …" next step for the flavors a run wired. sbt and scala-cli
 /// wire through a generated root file, never a lockfile: committing only
 /// `.socket/` would leave CI resolving the unpatched upstream silently.
-fn commit_hint(wired: &HashSet<String>) -> String {
-    if wired.contains("pnpm") {
+fn commit_hint(wired: &HashSet<String>, pnpm_workspace: bool) -> String {
+    if wired.contains("pnpm") && pnpm_workspace {
         return ".socket/vendor/, package.json, pnpm-lock.yaml, and pnpm-workspace.yaml to make \
                 the patches portable (pnpm >=11 reads the vendored override only from \
+                pnpm-workspace.yaml)"
+            .to_string();
+    }
+    if wired.contains("pnpm") {
+        return ".socket/vendor/, package.json, and pnpm-lock.yaml to make the patches \
+                portable (the project's pnpm 9.0–10.4 reads the override from package.json; \
+                after upgrading to pnpm >=11, re-run vendor so it also writes \
                 pnpm-workspace.yaml)"
             .to_string();
     }
@@ -6408,25 +6431,34 @@ mod scope_and_hint_tests {
     #[test]
     fn jvm_commit_hint_names_the_generated_root_file() {
         let set = |fs: &[&str]| fs.iter().map(|f| f.to_string()).collect::<HashSet<_>>();
-        let sbt = commit_hint(&set(&["sbt"]));
+        let sbt = commit_hint(&set(&["sbt"]), false);
         assert!(
             sbt.starts_with("socket-patch-vendor.sbt and .socket/vendor/"),
             "{sbt}"
         );
         assert!(!sbt.contains("lockfiles"), "{sbt}");
-        let cli = commit_hint(&set(&["scala-cli"]));
+        let cli = commit_hint(&set(&["scala-cli"]), false);
         assert!(
             cli.starts_with("socket-patch.scala and .socket/vendor/"),
             "{cli}"
         );
-        let both = commit_hint(&set(&["sbt", "package-lock"]));
+        let both = commit_hint(&set(&["sbt", "package-lock"]), false);
         assert!(
             both.contains("socket-patch-vendor.sbt") && both.contains("lockfiles"),
             "{both}"
         );
         assert_eq!(
-            commit_hint(&set(&[])),
+            commit_hint(&set(&[]), false),
             ".socket/vendor/ and the updated lockfiles to make the patches portable"
+        );
+        // pnpm names pnpm-workspace.yaml only when the run left one (#734).
+        let pnpm = commit_hint(&set(&["pnpm"]), true);
+        assert!(pnpm.contains("and pnpm-workspace.yaml"), "{pnpm}");
+        let pnpm = commit_hint(&set(&["pnpm"]), false);
+        assert!(
+            pnpm.starts_with(".socket/vendor/, package.json, and pnpm-lock.yaml")
+                && pnpm.contains("re-run vendor"),
+            "{pnpm}"
         );
         let wiring = |kind: &str| {
             vec![vendor::state::WiringRecord {

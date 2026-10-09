@@ -888,8 +888,7 @@ mod tests {
         let client = ApiClient::new(crate::api::client::ApiClientOptions {
             api_url: server.uri(),
             api_token: None,
-            use_public_proxy: true,
-            org_slug: None,
+            route: crate::api::client::ApiRoute::Proxy,
         });
         let body = client
             .fetch_blob(&"a".repeat(64))
@@ -923,8 +922,7 @@ mod tests {
         let client = ApiClient::new(crate::api::client::ApiClientOptions {
             api_url: server.uri(),
             api_token: None,
-            use_public_proxy: true,
-            org_slug: None,
+            route: crate::api::client::ApiRoute::Proxy,
         });
         let tmp = tempfile::tempdir().unwrap();
         let hashes: HashSet<String> = [hash.clone()].into_iter().collect();

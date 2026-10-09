@@ -403,8 +403,9 @@ pub(crate) fn is_pnpm_global_virtual_store_dir(dir: &Path) -> bool {
         && parent.is_some_and(|p| p.join("files").is_dir())
 }
 
-/// `v3`, `v10`, `v11`, …: the layout-version directory of a pnpm store.
-fn is_pnpm_store_version_dir(name: &str) -> bool {
+/// `v3`, `v10`, `v11`, …: the layout-version directory of a pnpm store
+/// (and of pnpm 11+'s global install dir, `$PNPM_HOME/global/v11`).
+pub(crate) fn is_pnpm_store_version_dir(name: &str) -> bool {
     name.strip_prefix('v')
         .is_some_and(|n| !n.is_empty() && n.bytes().all(|b| b.is_ascii_digit()))
 }

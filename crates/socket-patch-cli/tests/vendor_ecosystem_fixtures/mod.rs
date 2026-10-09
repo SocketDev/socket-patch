@@ -308,6 +308,10 @@ type Built = (Vec<(String, String)>, Vec<Patch>);
 
 const U1: &str = "11111111-1111-4111-8111-000000000001";
 const U2: &str = "11111111-1111-4111-8111-000000000002";
+/// Maven's second uuid: a vendored Maven pin is `<version>-socket.<first 8
+/// uuid hex>`, and two patches of the same version whose uuids share those 8
+/// hex digits pin the same string, which the revert cannot tell apart.
+const MAVEN_U2: &str = "22222222-2222-4222-8222-000000000002";
 
 fn npm_install(root: &Path, name: &str, index: &[u8]) {
     let pkg = root.join("node_modules").join(name);
@@ -747,7 +751,7 @@ fn maven(root: &Path, store: &Path) -> Built {
     let p = |name: &str| {
         patch(
             &format!("pkg:maven/org.fx/{name}@1.0.0"),
-            if name == "alpha" { U1 } else { U2 },
+            if name == "alpha" { U1 } else { MAVEN_U2 },
             "META-INF/NOTICE.txt",
             format!("{name} notice\n").as_bytes(),
             format!("{name} notice (patched)\n").as_bytes(),

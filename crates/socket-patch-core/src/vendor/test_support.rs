@@ -55,8 +55,7 @@ pub(crate) fn service_cfg(
             ApiClient::new(ApiClientOptions {
                 api_url: server_uri.to_string(),
                 api_token: Some("sktsec_placeholder_value_for_tests_api".into()),
-                use_public_proxy: false,
-                org_slug: Some("acme".into()),
+                route: crate::api::client::ApiRoute::org("acme"),
             })
             .with_vendor_retry(VendorRetryPolicy::none()),
         ),
@@ -458,8 +457,12 @@ pub(crate) fn tree_snapshot(root: &Path) -> std::collections::BTreeMap<String, V
             if p.is_dir() {
                 walk(base, &p, out);
             } else {
+                // `/`-separated keys on every OS, so a caller can name one.
                 out.insert(
-                    p.strip_prefix(base).unwrap().to_string_lossy().into_owned(),
+                    p.strip_prefix(base)
+                        .unwrap()
+                        .to_string_lossy()
+                        .replace('\\', "/"),
                     std::fs::read(&p).unwrap(),
                 );
             }

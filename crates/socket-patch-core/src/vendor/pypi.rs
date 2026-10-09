@@ -254,7 +254,9 @@ async fn requirements_pins_target(project_root: &Path, target: Option<(&str, &st
 /// one exists (a marker alone must not block the requirements wiring):
 /// 1. `uv.lock` → uv;
 /// 2. standalone `pylock*.toml` / `*.py.lock` locks containing this package
-///    → python-lock;
+///    → python-lock — except a pylock beside a `Pipfile`, which Pipenv
+///    reads: it loses to `Pipfile.lock` (#1122) and, with no
+///    `Pipfile.lock`, refuses `pypi_pipenv_pylock_unsupported` (#912);
 /// 3. `poetry.lock` → poetry;  4. `pdm.lock` → pdm;  5. `Pipfile.lock` → pipenv;
 /// 6. lock-less `[tool.uv]`/`[tool.poetry]`/`[tool.pdm]`/`Pipfile` →
 ///    `<tool>_no_lockfile` refusal unless requirements.txt exists;
@@ -304,6 +306,42 @@ async fn detect_pypi_flavor(
         .into_iter()
         .filter(|path| path != "uv.lock")
         .collect();
+    // #912 / #1122: a pylock beside a `Pipfile` belongs to Pipenv, not to a
+    // PEP 751 installer. With a `Pipfile.lock` Pipenv installs from that
+    // and ignores the pylock; without one it reads the pylock but drops the
+    // `archive` entry the wiring writes. Either way the pylock is not the
+    // file to wire. A higher-ranked tool lock still routes as before.
+    let (pipenv_pylocks, additional_locks): (Vec<String>, Vec<String>) =
+        if has_pipfile && matches!(governing, None | Some("Pipfile.lock")) {
+            additional_locks
+                .into_iter()
+                .partition(|path| crate::utils::python_lock::is_pep751_lock_name(path))
+        } else {
+            (Vec::new(), additional_locks)
+        };
+    let pipenv_pylock_matches = if pipenv_pylocks.is_empty() {
+        false
+    } else if let Some((name, version)) = target {
+        super::pypi_lock::contains_target(project_root, &pipenv_pylocks, name, version).await?
+    } else {
+        true
+    };
+    if pipenv_pylock_matches {
+        if governing.is_none() {
+            return Err((
+                "pypi_pipenv_pylock_unsupported",
+                format!(
+                    "{} is installed by Pipenv (a Pipfile sits beside it and there is no \
+                     Pipfile.lock), and Pipenv keeps only the version and hashes of a pylock \
+                     entry, so a vendored wheel would be dropped and the upstream release \
+                     installed; run `pipenv lock` to write a Pipfile.lock and re-run vendor, \
+                     or {SETUP_ALTERNATIVE}",
+                    pipenv_pylocks.join(", ")
+                ),
+            ));
+        }
+        present.extend(pipenv_pylocks.iter().map(String::as_str));
+    }
     let mut warnings = Vec::new();
     let matching_additional_lock = if has_uv_lock {
         false
@@ -2743,6 +2781,67 @@ mod tests {
         }
     }
 
+    /// A pylock `pipenv lock` writes with `[pipenv] use_pylock = true`.
+    const PIPENV_PYLOCK: &str = "lock-version = \"1.0\"\ncreated-by = \"pipenv\"\n\n[[packages]]\nname = \"six\"\nversion = \"1.16.0\"\nindex = \"https://pypi.org/simple\"\nwheels = [{ name = \"six-1.16.0-py2.py3-none-any.whl\", url = \"https://files.pythonhosted.org/packages/six-1.16.0-py2.py3-none-any.whl\", hashes = { sha256 = \"8abb2f1d86890a2dfb989f9a77cfcfd3e47c2a354b01111771326f8aa26e0254\" } }]\n\n[tool.pipenv]\ngenerated_from = \"Pipfile.lock\"\n";
+
+    /// #1122: with a `Pipfile` beside both locks, Pipenv installs from
+    /// `Pipfile.lock` and ignores the pylock, so `Pipfile.lock` is the one
+    /// wired — the pylock is named as a loud loser, not wired instead.
+    #[tokio::test]
+    async fn pipenv_pylock_beside_pipfile_lock_routes_to_pipenv() {
+        for lock in ["pylock.toml", "pylock.dev.toml"] {
+            let tmp = tempfile::tempdir().unwrap();
+            touch(
+                tmp.path(),
+                "Pipfile",
+                "[packages]\nsix = \"==1.16.0\"\n\n[pipenv]\nuse_pylock = true\n",
+            )
+            .await;
+            touch(tmp.path(), "Pipfile.lock", "{}").await;
+            touch(tmp.path(), lock, PIPENV_PYLOCK).await;
+            let (selected, warnings) = detect_pypi_flavor(tmp.path(), Some(("six", "1.16.0")))
+                .await
+                .unwrap();
+            assert_eq!(selected, PypiFlavor::Pipenv, "{lock}: {warnings:?}");
+            let loud: Vec<_> = warnings
+                .iter()
+                .filter(|w| w.code == "pypi_multiple_lockfiles")
+                .collect();
+            assert_eq!(loud.len(), 1, "{lock}: {warnings:?}");
+            assert!(
+                loud[0].detail.contains("wiring `Pipfile.lock`") && loud[0].detail.contains(lock),
+                "{lock}: {}",
+                loud[0].detail
+            );
+        }
+    }
+
+    /// #912: a pylock-only Pipenv checkout can't be vendored — Pipenv drops
+    /// the `archive` entry the wiring writes and installs the upstream
+    /// release — so it refuses with a `pipenv lock` pointer. Without a
+    /// `Pipfile` the same pylock still routes to the python-lock flavor.
+    #[tokio::test]
+    async fn pipenv_pylock_without_pipfile_lock_refuses() {
+        for lock in ["pylock.toml", "pylock.dev.toml"] {
+            let tmp = tempfile::tempdir().unwrap();
+            touch(tmp.path(), lock, PIPENV_PYLOCK).await;
+            let (selected, _) = detect_pypi_flavor(tmp.path(), Some(("six", "1.16.0")))
+                .await
+                .unwrap();
+            assert_eq!(selected, PypiFlavor::PythonLocks, "{lock}");
+
+            touch(tmp.path(), "Pipfile", "[packages]\nsix = \"==1.16.0\"\n").await;
+            let (code, detail) = detect_pypi_flavor(tmp.path(), Some(("six", "1.16.0")))
+                .await
+                .unwrap_err();
+            assert_eq!(code, "pypi_pipenv_pylock_unsupported", "{lock}: {detail}");
+            assert!(
+                detail.contains(lock) && detail.contains("pipenv lock"),
+                "{lock}: {detail}"
+            );
+        }
+    }
+
     /// #1120: a `requirements.txt` exported beside the governing lock in
     /// UTF-16 (`uv export > requirements.txt` in Windows PowerShell 5.1)
     /// is installed by pip and uv like its UTF-8 twin, so it is a loud
@@ -4031,8 +4130,7 @@ wheels = [
                 ApiClient::new(ApiClientOptions {
                     api_url: server_uri.to_string(),
                     api_token: Some("sktsec_placeholder_value_for_tests_api".into()),
-                    use_public_proxy: false,
-                    org_slug: Some("acme".into()),
+                    route: crate::api::client::ApiRoute::org("acme"),
                 })
                 .with_vendor_retry(crate::api::client::VendorRetryPolicy::none()),
             ),
@@ -6757,6 +6855,66 @@ wheels = [
             "pipenv_lock_entry",
         )
         .await;
+    }
+
+    /// #1122: a `use_pylock = true` Pipenv project carries `Pipfile`,
+    /// `Pipfile.lock` and `pylock.toml`; Pipenv installs from `Pipfile.lock`,
+    /// so vendoring wires `Pipfile.lock` (pipenv flavor), leaves the pylock
+    /// byte-identical, and reverts cleanly.
+    #[tokio::test]
+    async fn pipenv_use_pylock_project_vendors_into_pipfile_lock() {
+        let fx = e2e_fixture().await;
+        swap_to_lock_flavor(
+            &fx,
+            &[
+                (
+                    "Pipfile",
+                    "[packages]\nsix = \"==1.16.0\"\n\n[pipenv]\nuse_pylock = true\n",
+                ),
+                ("Pipfile.lock", PIPENV_LOCK_REGISTRY),
+                ("pylock.toml", PIPENV_PYLOCK),
+            ],
+        )
+        .await;
+        let sources = PatchSources::blobs_only(&fx.blobs);
+        let outcome = vendor_six(&fx, &sources, None).await;
+        let VendorOutcome::Done {
+            result,
+            entry,
+            warnings,
+        } = outcome
+        else {
+            panic!("expected Done, got {outcome:?}");
+        };
+        assert!(result.success, "{:?}", result.error);
+        let entry = entry.expect("entry on success");
+        assert_eq!(entry.flavor.as_deref(), Some("pipenv"));
+        assert_eq!(entry.wiring[0].file, "Pipfile.lock");
+        let wired = tokio::fs::read_to_string(fx.root.join("Pipfile.lock"))
+            .await
+            .unwrap();
+        assert!(wired.contains(&entry.artifact.path), "{wired}");
+        assert_eq!(
+            tokio::fs::read_to_string(fx.root.join("pylock.toml"))
+                .await
+                .unwrap(),
+            PIPENV_PYLOCK
+        );
+        assert!(
+            warnings
+                .iter()
+                .any(|w| w.code == "pypi_multiple_lockfiles" && w.detail.contains("pylock.toml")),
+            "{warnings:?}"
+        );
+
+        let reverted = revert_pypi(&entry, &fx.root, false).await;
+        assert!(reverted.success, "{:?}", reverted.error);
+        assert_eq!(
+            tokio::fs::read_to_string(fx.root.join("Pipfile.lock"))
+                .await
+                .unwrap(),
+            PIPENV_LOCK_REGISTRY
+        );
     }
 
     /// The `vendor_platform_locked` advisory names the file the platform

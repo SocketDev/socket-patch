@@ -47,10 +47,11 @@ use super::guidance::{
     npm_allow_remote_outer_set_detail, npm_allow_remote_unreadable_detail,
     npm_allow_remote_user_set_detail, npm_lock_url_needles, npm_replace_registry_host_detail,
     plan_workspace_trust, pnpm_heal_root, pnpm_is_shrinkwrap_lock, pnpm_lock_may_need_store_flag,
-    pnpm_lock_version_major, pnpm_trust_configured_detail, pnpm_trust_legacy_detail,
-    pnpm_trust_manual_guidance, pnpm_trust_policy_preamble, pnpm_trust_workspace_unreadable_detail,
+    pnpm_lock_version_major, pnpm_root_only_workspace_breaks_add, pnpm_trust_configured_detail,
+    pnpm_trust_legacy_detail, pnpm_trust_manual_guidance, pnpm_trust_not_needed_detail,
+    pnpm_trust_policy_preamble, pnpm_trust_rush_detail, pnpm_trust_workspace_unreadable_detail,
     pnpm_trust_workspace_unsupported_detail, read_npmrc_for_allow_remote, read_workspace_for_trust,
-    url_host, TrustPlan, NPM_LOCKS, NPM_REPLACE_REGISTRY_HOST_CODE,
+    url_host, TrustPlan, NPM_LOCKS, NPM_REPLACE_REGISTRY_HOST_CODE, PNPM_TRUST_RUSH_MIXED_NOTE,
     PNPM_TRUST_TRADEOFF_AND_CAUTION, PNPM_WORKSPACE_REL, REDIRECT_PNPM_WORKSPACE_TRUST_EDIT_KIND,
 };
 use super::vlt::bun_lockb_present;
@@ -348,6 +349,9 @@ pub struct CandidateFiles {
     pub files: BTreeMap<String, String>,
     /// The Rush locks among `files` (the repo-state warning keys on them).
     pub rush_lock_keys: Vec<String>,
+    /// The workspace members' own locks among `files`, read beside the
+    /// root's when the workspace turned the shared lock off (#492).
+    pub pnpm_member_lock_keys: Vec<String>,
     /// In memory only: candidate files the disk flow reads through a
     /// symbolic link. Their bytes are unknown here, so a project whose
     /// candidates could rewrite one is refused like the disk symlink guard
@@ -373,6 +377,13 @@ pub struct CandidateFiles {
     /// lock was left out of `files`, and the rewrite reports this instead
     /// of a redirect.
     pub gem_refusal: Option<RewriteWarning>,
+    /// Set when the root pnpm lock pins nothing pnpm installs: the
+    /// workspace keeps one lock per member but the members cannot be
+    /// listed (#492), or `gitBranchLockfile` installs the branch from a
+    /// `pnpm-lock.<branch>.yaml` (#556). The root lock was left out of
+    /// `files`, and the rewrite reports this instead of a redirect or a
+    /// "no lockfile" hint.
+    pub pnpm_refusal: Option<RewriteWarning>,
 }
 
 impl CandidateFiles {
@@ -482,7 +493,8 @@ async fn read_advisory(
 
 /// Read the project's candidate files: [`REDIRECT_CANDIDATE_FILES`], the
 /// Cargo workspace members (when a cargo candidate meets a root
-/// `Cargo.toml`), the Python locks and their scripts, and the Rush locks.
+/// `Cargo.toml`), the Python locks and their scripts, the Rush locks, and
+/// the pnpm workspace members' own locks.
 /// `unreadable` are the in-memory paths that exist without content.
 pub async fn read_candidate_files(
     view: &ProjectView<'_>,
@@ -629,6 +641,12 @@ pub async fn read_candidate_files(
                 }
             }
         }
+    } else if candidates.iter().any(|c| c.dep.ecosystem == "npm") {
+        if let Some(branch) = crate::utils::pnpm_workspace::git_branch_locks(view).await {
+            refuse_git_branch_locks(&mut out, &branch);
+        } else {
+            read_pnpm_member_locks(view, unreadable, &mut out).await;
+        }
     }
     if candidates.iter().any(|c| c.dep.ecosystem == "gem") {
         keep_bundler_loaded_gem_files(view, candidates, &mut out).await;
@@ -676,6 +694,110 @@ pub async fn read_candidate_files(
     out.undecodable_reads.dedup();
     out
 }
+
+/// A pnpm workspace with `sharedWorkspaceLockfile: false` installs each
+/// member from the member's own `pnpm-lock.yaml`; the root lock covers the
+/// root project alone (pnpm 7 writes none at all). Every member lock is a
+/// rewrite target, read strictly under its root-relative key: the pnpm
+/// rewriter is basename-generalized and the write-back path-generic, like
+/// the Rush locks above. Members whose list cannot be read leave the root
+/// lock out too and refuse (see [`CandidateFiles::pnpm_refusal`]).
+/// In memory too: the in-memory engine demotes each member lock into its
+/// workspace root once that root's files confirm it reads them
+/// (`confirm_pnpm_members` in [`super::memory`]),
+/// so the root reads them here as a disk run from it does; a member lock
+/// whose content was not provided refuses the project like an unreadable
+/// root lock.
+async fn read_pnpm_member_locks(
+    view: &ProjectView<'_>,
+    unreadable: &BTreeSet<String>,
+    out: &mut CandidateFiles,
+) {
+    use crate::utils::pnpm_workspace::{member_locks, MemberLocks};
+    match member_locks(view).await {
+        MemberLocks::Shared => {}
+        MemberLocks::PerMember(keys) => {
+            for key in keys {
+                if out.read(view, unreadable, &key).await {
+                    out.pnpm_member_lock_keys.push(key);
+                    continue;
+                }
+                // A member lock that exists but cannot be read (a FIFO, not
+                // UTF-8) still drives that member's install: pinning the
+                // others would confirm the dep while it stays upstream there.
+                for read in std::mem::take(&mut out.pnpm_member_lock_keys) {
+                    out.files.remove(&read);
+                }
+                refuse_pnpm_members(
+                    out,
+                    format!(
+                        "{key} (a workspace member's own lock under \
+                         sharedWorkspaceLockfile: false) cannot be read as text"
+                    ),
+                );
+                return;
+            }
+        }
+        MemberLocks::Unresolved(why) => refuse_pnpm_members(out, why),
+    }
+}
+
+/// Leave the root pnpm lock out and record why (see
+/// [`CandidateFiles::pnpm_refusal`]).
+fn refuse_pnpm_members(out: &mut CandidateFiles, why: String) {
+    out.files.remove("pnpm-lock.yaml");
+    out.pnpm_refusal = Some(RewriteWarning {
+        code: PNPM_MEMBER_LOCKS_UNRESOLVED.into(),
+        detail: format!(
+            "{why}; no pnpm lock was rewritten — make every member lock a readable \
+             file listed by plain `packages:` globs (or install the members) and re-run"
+        ),
+    });
+}
+
+/// `gitBranchLockfile` with a branch lock present (#556): pnpm installs
+/// the branch from that lock, which hosted mode cannot pin, so the root
+/// lock (stale on the branch) is left out and the run refuses every pnpm
+/// pin (see [`CandidateFiles::pnpm_refusal`]). In memory the root lock is
+/// dropped from the link and unreadable lists too: it is not written.
+fn refuse_git_branch_locks(
+    out: &mut CandidateFiles,
+    branch: &crate::utils::pnpm_workspace::GitBranchLocks,
+) {
+    const ROOT_LOCKS: [&str; 2] = ["pnpm-lock.yaml", "shrinkwrap.yaml"];
+    for lock in ROOT_LOCKS {
+        out.files.remove(lock);
+    }
+    out.symlinked_reads
+        .retain(|r| !ROOT_LOCKS.contains(&r.as_str()));
+    out.unreadable_reads
+        .retain(|r| !ROOT_LOCKS.contains(&r.as_str()));
+    out.pnpm_refusal = Some(git_branch_lock_refusal(branch));
+}
+
+/// The [`PNPM_GIT_BRANCH_LOCKFILE`] warning for `branch`: the hosted
+/// rewrite's, and the vendored→hosted takeover's (which keeps the vendored
+/// wiring rather than revert it into a lock pnpm does not install from).
+pub fn git_branch_lock_refusal(
+    branch: &crate::utils::pnpm_workspace::GitBranchLocks,
+) -> RewriteWarning {
+    RewriteWarning {
+        code: PNPM_GIT_BRANCH_LOCKFILE.into(),
+        detail: format!(
+            "{}; no pnpm lock was rewritten — {}",
+            branch.describe(),
+            crate::utils::pnpm_workspace::GitBranchLocks::REMEDY
+        ),
+    }
+}
+
+/// Refusal code for a `sharedWorkspaceLockfile: false` workspace whose
+/// member locks cannot be listed.
+pub const PNPM_MEMBER_LOCKS_UNRESOLVED: &str = "redirect_pnpm_member_locks_unresolved";
+
+/// Refusal code for a project whose `gitBranchLockfile` setting makes pnpm
+/// install from a `pnpm-lock.<branch>.yaml` (#556).
+pub const PNPM_GIT_BRANCH_LOCKFILE: &str = "redirect_pnpm_git_branch_lockfile";
 
 /// Read what the hosted Gradle planner needs into `out` (see
 /// [`crate::patch::redirect::gradle::GradleFiles`]): the script graph is
@@ -1178,14 +1300,25 @@ fn read_npmrc(view: &ProjectView<'_>) -> Result<Option<String>, String> {
     }
 }
 
-/// Whether Rush's repo-state file is present (disk: a regular file).
-fn rush_repo_state_present(view: &ProjectView<'_>) -> bool {
+/// The repo-state.json that carries the pnpmShrinkwrapHash of the Rush lock
+/// at `lock_key`: the file beside it. The common lock maps to
+/// [`RUSH_REPO_STATE_REL`]; with subspaces enabled each subspace keeps its
+/// own, at `common/config/subspaces/<name>/repo-state.json`.
+fn rush_repo_state_for_lock(lock_key: &str) -> String {
+    match lock_key.rsplit_once('/') {
+        Some((dir, _)) => format!("{dir}/repo-state.json"),
+        None => "repo-state.json".to_string(),
+    }
+}
+
+/// Whether the Rush repo-state file `rel` is present (disk: a regular file).
+fn rush_repo_state_present(view: &ProjectView<'_>, rel: &str) -> bool {
     match view {
         ProjectView::Disk(_) | ProjectView::Snapshot(_) => {
             let cwd = view.disk_root().expect("a disk view has a root");
-            cwd.join(RUSH_REPO_STATE_REL).is_file()
+            cwd.join(rel).is_file()
         }
-        ProjectView::Memory(project) => project.contains(RUSH_REPO_STATE_REL),
+        ProjectView::Memory(project) => project.contains(rel),
     }
 }
 
@@ -1542,11 +1675,13 @@ async fn rewrite_once(
     let CandidateFiles {
         files,
         rush_lock_keys,
+        pnpm_member_lock_keys,
         symlinked_reads,
         unreadable_reads,
         undecodable_reads,
         gradle_unreadable,
         gem_refusal,
+        pnpm_refusal,
     } = read;
     // The rewriters' override slice — materialized ONCE, after the last
     // candidate filter, so it can never disagree with `candidates`.
@@ -1630,6 +1765,14 @@ async fn rewrite_once(
             .retain(|w| w.code != "redirect_gem_no_gemfile");
         rewrite.warnings.push(warning);
     }
+    // The pnpm locks were withheld on purpose: say why, not "run `pnpm
+    // install`" (which never writes a root lock in either layout).
+    if let Some(warning) = pnpm_refusal {
+        rewrite.warnings.retain(|w| {
+            w.code != "redirect_pnpm_no_lockfile" && w.code != "redirect_npm_no_lockfile"
+        });
+        rewrite.warnings.push(warning);
+    }
     if let Some(content) = binary_content {
         rewrite
             .warnings
@@ -1679,12 +1822,14 @@ async fn rewrite_once(
     // refuses until `rush update` refreshes that hash — but the redirect
     // survives `rush update` (pnpm preserves locked resolutions for
     // unchanged specifiers). Warn only when the rewrite actually landed in
-    // a Rush lock and the repo-state file that carries the hash is present.
+    // a Rush lock and the repo-state file that carries THAT lock's hash is
+    // present: it sits beside the lock, so with subspaces enabled each
+    // subspace lock pairs with its own subspace's repo-state.json (#714).
     let mut rush_warnings: Vec<RewriteWarning> = Vec::new();
     if rush_lock_keys
         .iter()
-        .any(|key| rewrite.files.contains_key(key))
-        && rush_repo_state_present(view)
+        .filter(|key| rewrite.files.contains_key(*key))
+        .any(|key| rush_repo_state_present(view, &rush_repo_state_for_lock(key)))
     {
         rush_warnings.push(warning(
             "redirect_rush_repo_state_stale",
@@ -1695,8 +1840,15 @@ async fn rewrite_once(
         ));
     }
 
-    let (pnpm_warnings, trust_config_write, pnpm_rerun_only, workspace_symlinked) =
-        pnpm_trust(view, &files, &rewrite, &overrides, &options);
+    let (pnpm_warnings, trust_config_write, pnpm_rerun_only, workspace_symlinked) = pnpm_trust(
+        view,
+        &files,
+        &pnpm_member_lock_keys,
+        &rewrite,
+        &rush_lock_keys,
+        &overrides,
+        &options,
+    );
     let (npm_warnings, npmrc_config_write) =
         npm_allow_remote(view, &files, &rewrite, &overrides, &options);
     if let Some((text, edit)) = trust_config_write {
@@ -1752,22 +1904,33 @@ type ConfigWrite = Option<(String, FileEdit)>;
 /// `trustLockfile: true` key; the `.npmrc` `trust-lockfile=true` spelling
 /// is IGNORED by pnpm and must never be recommended.
 ///
-/// ZERO-TOUCH DEFAULT: when this run rewrote the ROOT pnpm-lock.yaml and
-/// its lockfileVersion is >= 9 (5.x/6.0 locks mean pnpm 7/8, which have
-/// neither the policy nor the flag and get their own guidance), the run
+/// ZERO-TOUCH DEFAULT: when this run rewrote a GOVERNING pnpm lock (the
+/// root pnpm-lock.yaml, or a workspace member's own lock under
+/// `sharedWorkspaceLockfile: false`, #492) and its lockfileVersion is >= 9
+/// (5.x/6.0 locks mean pnpm 7/8, which have neither the policy nor the
+/// flag and get their own guidance), the run
 /// auto-ensures `trustLockfile: true` in pnpm-workspace.yaml. The same
-/// auto-config re-engages on a run that spliced NOTHING when the root v9
-/// lock already carries a granted hosted artifact URL (HEAL-ON-RERUN).
+/// auto-config re-engages on a run that spliced NOTHING when a governing v9
+/// lock already carries a granted hosted artifact URL (HEAL-ON-RERUN). The
+/// key always goes to the root pnpm-workspace.yaml, the only one pnpm reads
+/// for every member.
 /// pnpm <=10 ignores the key; the per-entry sha512 pin still fails closed
 /// on tampered bytes. An explicit user `trustLockfile: <non-true>` is
 /// RESPECTED (never flipped), and `--no-trust-lockfile-config` opts out.
-/// Rush nested/subspace locks are excluded: rush runs pnpm in common/temp,
-/// which never reads the repo-root pnpm-workspace.yaml. The warning names
-/// the host(s) the lock now points at (they follow --api-url).
+/// Rush common/subspace locks (`rush_lock_keys`) are excluded from the
+/// write: rush runs pnpm in common/temp with a pnpm-workspace.yaml it
+/// generates, which never reads the repo-root one. When every spliced lock
+/// is a Rush lock the warning carries the Rush remedy instead of the
+/// pnpm-only one (#713); a run that also spliced a non-Rush pnpm lock keeps
+/// the generic text plus a Rush note. The warning names the host(s) the
+/// lock now points at (they follow --api-url).
+#[allow(clippy::too_many_arguments)]
 fn pnpm_trust(
     view: &ProjectView<'_>,
     files: &BTreeMap<String, String>,
+    member_lock_keys: &[String],
     rewrite: &RewriteResult,
+    rush_lock_keys: &[String],
     overrides: &[DepOverride],
     options: &RewriteOptions<'_>,
 ) -> (Vec<RewriteWarning>, ConfigWrite, bool, bool) {
@@ -1777,7 +1940,7 @@ fn pnpm_trust(
     let mut workspace_symlinked = false;
     // pnpm locks spliced THIS run (any depth — the rewriter is
     // basename-generalized).
-    let mut pnpm_lock_texts: Vec<&String> = rewrite
+    let (spliced_keys, mut pnpm_lock_texts): (Vec<&String>, Vec<&String>) = rewrite
         .files
         .iter()
         .filter(|(key, _)| {
@@ -1786,22 +1949,47 @@ fn pnpm_trust(
                 .and_then(|n| n.to_str())
                 .is_some_and(|name| matches!(name, "pnpm-lock.yaml" | "shrinkwrap.yaml"))
         })
-        .map(|(_, content)| content)
+        .unzip();
+    // Rush locks spliced this run. The heal and takeover roots below are
+    // only ever governing locks, never a Rush one.
+    let mut spliced_rush = spliced_keys
+        .iter()
+        .filter(|key| rush_lock_keys.contains(key))
+        .count();
+    // The locks pnpm installs the project from: the root lock, plus each
+    // member's own under `sharedWorkspaceLockfile: false` (#492). A Rush
+    // lock is never one: rush installs it from common/temp.
+    let governing: Vec<&str> = std::iter::once("pnpm-lock.yaml")
+        .chain(member_lock_keys.iter().map(String::as_str))
+        .filter(|key| !rush_lock_keys.iter().any(|rush| rush == key))
         .collect();
-    // HEAL-ON-RERUN: a root v9 lock that ALREADY carries a granted hosted
-    // artifact URL (spliced by an earlier run) still plans the trust config
-    // even though this run spliced nothing — so a project that missed the
-    // config once (opted-out first run, or a crash between the lock write
-    // and the workspace write) is healed by simply re-running the scan. An
-    // AlreadyTrue workspace keeps the re-run a byte-stable no-op.
-    let heal_root: Option<&String> = pnpm_heal_root(
-        rewrite.files.contains_key("pnpm-lock.yaml"),
-        files.get("pnpm-lock.yaml"),
-        overrides,
-    );
+    // HEAL-ON-RERUN: a governing v9 lock that ALREADY carries a granted
+    // hosted artifact URL (spliced by an earlier run) still plans the trust
+    // config even though this run spliced nothing — so a project that
+    // missed the config once (opted-out first run, or a crash between the
+    // lock write and the workspace write) is healed by simply re-running
+    // the scan. An AlreadyTrue workspace keeps the re-run a byte-stable
+    // no-op.
+    let heal_locks: Vec<&String> = governing
+        .iter()
+        .filter_map(|key| {
+            pnpm_heal_root(rewrite.files.contains_key(*key), files.get(*key), overrides)
+        })
+        .collect();
     let spliced_pnpm_locks = pnpm_lock_texts.len();
-    if let Some(text) = heal_root {
-        pnpm_lock_texts.push(text);
+    pnpm_lock_texts.extend(heal_locks.iter().copied());
+    // HEAL-ON-RERUN for Rush: a common/subspace v9 lock an earlier run
+    // already redirected splices nothing now, but its `rush install` still
+    // needs the Rush trust remedy (#713) — nothing persists it, so it is
+    // re-issued on every run. Same gate as the governing heal; never
+    // configured.
+    for key in rush_lock_keys {
+        if let Some(text) =
+            pnpm_heal_root(rewrite.files.contains_key(key), files.get(key), overrides)
+        {
+            pnpm_lock_texts.push(text);
+            spliced_rush += 1;
+        }
     }
     if pnpm_lock_texts.is_empty() {
         return (
@@ -1836,17 +2024,15 @@ fn pnpm_trust(
     } else {
         format!("the hosted patch server ({})", hosts.join(", "))
     };
-    // Root-lock gate: only the plain project lock at lockfileVersion >= 9
-    // gets the auto-config — spliced this run, or detected
-    // already-redirected (heal path).
-    let root_lock_v9 = heal_root
-        .and_then(|text| pnpm_lock_version_major(text))
-        .is_some_and(|major| major >= 9)
-        || rewrite
-            .files
-            .get("pnpm-lock.yaml")
-            .and_then(|text| pnpm_lock_version_major(text))
-            .is_some_and(|major| major >= 9);
+    // Governing-lock gate: only a governing lock (never a Rush one) at
+    // lockfileVersion >= 9 gets the auto-config — spliced this run, or
+    // detected already-redirected (heal path).
+    let is_v9 = |text: &String| pnpm_lock_version_major(text).is_some_and(|major| major >= 9);
+    let governing_lock_v9 = heal_locks.iter().copied().any(is_v9)
+        || governing
+            .iter()
+            .filter_map(|key| rewrite.files.get(*key))
+            .any(is_v9);
     // Every touched pnpm lock is a KNOWN legacy (5.x/6.0) format, where
     // `--trust-lockfile` is rejected as an unknown option. An unparseable
     // version stays on the manual guidance: never claim "no trust step
@@ -1855,9 +2041,12 @@ fn pnpm_trust(
         pnpm_lock_version_major(text).is_some_and(|major| major < 9)
             || pnpm_is_shrinkwrap_lock(text)
     });
+    let rush_only = spliced_rush > 0 && spliced_rush == pnpm_lock_texts.len();
     let detail = if all_locks_legacy {
         pnpm_trust_legacy_detail(&server)
-    } else if !root_lock_v9 || !options.trust_lockfile_config {
+    } else if rush_only {
+        pnpm_trust_rush_detail(&server)
+    } else if !governing_lock_v9 || !options.trust_lockfile_config {
         pnpm_trust_manual_guidance(&server)
     } else if let Some(root_file) = governing_workspace(view) {
         // A workspace member with its own lock: pnpm reads `trustLockfile`
@@ -1890,7 +2079,19 @@ fn pnpm_trust(
             original: None,
             new: Some(serde_json::json!("true")),
         };
+        // No workspace file and a project pinned to pnpm 9.0–10.4: creating
+        // one would make it a root-only workspace those releases refuse
+        // `pnpm add` in, for a key they never read (#734).
+        let pinned_pre_10_5 = match &workspace {
+            Ok(None) if !symlinked => root_only_workspace_breaks_add(view),
+            _ => None,
+        };
         match workspace {
+            Ok(None) if pinned_pre_10_5.is_some() => pnpm_trust_not_needed_detail(
+                &server,
+                pinned_pre_10_5.as_deref().unwrap_or_default(),
+                options.dry_run,
+            ),
             // Present but UNREADABLE: never plan a Create (it would
             // overwrite the user's workspace file) — fall back to
             // warning-only guidance naming the file and the error.
@@ -1906,7 +2107,18 @@ fn pnpm_trust(
                 }
                 TrustPlan::AlreadyTrue => {
                     pnpm_rerun_only = spliced_pnpm_locks == 0;
-                    pnpm_trust_already_true_detail(&server, PNPM_WORKSPACE_REL)
+                    let detail = pnpm_trust_already_true_detail(&server, PNPM_WORKSPACE_REL);
+                    // The root-only scaffold an earlier run created (4.x and
+                    // early v5 did so whatever the pnpm), in a project pinned
+                    // to a pnpm that refuses `pnpm add` there (#734).
+                    match ws_existing
+                        .as_deref()
+                        .filter(|text| is_trust_scaffold(text))
+                        .and_then(|_| root_only_workspace_breaks_add(view))
+                    {
+                        Some(pins) => format!("{detail} {}", pnpm_scaffold_breaks_add_note(&pins)),
+                        None => detail,
+                    }
                 }
                 TrustPlan::UserSet(value) => {
                     pnpm_trust_user_set_detail(&server, PNPM_WORKSPACE_REL, &value)
@@ -1927,8 +2139,17 @@ fn pnpm_trust(
     } else {
         ""
     };
-    pnpm_warnings.push(warning(
-        "redirect_pnpm_trust_lockfile",
+    // Rush keeps its own store under common/temp and the Rush detail
+    // carries its own reinstall advice; the legacy text is right for Rush on
+    // pnpm 7/8 as well, so it keeps the generic tail.
+    let message = if rush_only && !all_locks_legacy {
+        format!("{detail}.")
+    } else {
+        let rush_note = if spliced_rush > 0 && !all_locks_legacy {
+            format!(" {PNPM_TRUST_RUSH_MIXED_NOTE}.")
+        } else {
+            String::new()
+        };
         format!(
             "{}. After a lock-only change, existing node_modules or a warm pnpm store \
              can still contain upstream files. For a reliable reinstall, use a clean \
@@ -1936,10 +2157,11 @@ fn pnpm_trust(
              `pnpm install --frozen-lockfile --store-dir <new-empty-directory>`\
              {store_note}. Do not rely on `--force`: some versions re-resolve the \
              upstream artifact. Run `socket-patch vex` after installation to verify \
-             the patched files.",
+             the patched files.{rush_note}",
             detail.trim_end_matches('.')
-        ),
-    ));
+        )
+    };
+    pnpm_warnings.push(warning("redirect_pnpm_trust_lockfile", message));
     (
         pnpm_warnings,
         trust_config_write,
@@ -1959,6 +2181,29 @@ fn pnpm_trust_already_true_detail(server: &str, file: &str) -> String {
     )
 }
 
+/// Whether a pnpm-workspace.yaml is exactly the root-only scaffold the
+/// trust auto-config creates ([`plan_workspace_trust`] with no file), in
+/// either line ending.
+fn is_trust_scaffold(text: &str) -> bool {
+    let TrustPlan::Create(scaffold) = plan_workspace_trust(None) else {
+        return false;
+    };
+    text == scaffold || text == scaffold.replace('\n', "\r\n")
+}
+
+/// The note added when a project pinned to pnpm 9.0–10.4 (`pins`, as
+/// prose) still carries the root-only scaffold (#734).
+fn pnpm_scaffold_breaks_add_note(pins: &str) -> String {
+    format!(
+        "Note: {PNPM_WORKSPACE_REL} is the root-only file an earlier socket-patch run \
+         created, but the project's pnpm ({pins}) does not read `trustLockfile`, and \
+         in a root-only workspace pnpm 9.0–10.4 refuse `pnpm add <pkg>` \
+         (ERR_PNPM_ADDING_TO_ROOT). Delete {PNPM_WORKSPACE_REL} (re-run after \
+         upgrading to pnpm >= 11 to recreate it), or add dependencies with \
+         `pnpm add -w <pkg>`."
+    )
+}
+
 /// The trust detail for a settings file (`file`) whose explicit
 /// `trustLockfile: <value>` was respected.
 fn pnpm_trust_user_set_detail(server: &str, file: &str, value: &str) -> String {
@@ -1968,6 +2213,29 @@ fn pnpm_trust_user_set_detail(server: &str, file: &str, value: &str) -> String {
          `trustLockfile: true` yourself so every install accepts the patched \
          artifacts. {PNPM_TRUST_TRADEOFF_AND_CAUTION}",
         pnpm_trust_policy_preamble(server),
+    )
+}
+
+/// The pnpm pins of a project with no pnpm-workspace.yaml, when every one
+/// is a release that refuses `pnpm add` in a root-only workspace (see
+/// [`pnpm_root_only_workspace_breaks_add`]). Reads the root package.json
+/// and the installed `node_modules/.modules.yaml`, both advisory: FIFO-safe
+/// on disk, and an in-memory entry that is not text counts as absent.
+fn root_only_workspace_breaks_add(view: &ProjectView<'_>) -> Option<String> {
+    let read = |rel: &str| match view {
+        ProjectView::Disk(_) | ProjectView::Snapshot(_) => {
+            let cwd = view.disk_root().expect("a disk view has a root");
+            crate::utils::fs::read_regular_to_string_sync(&cwd.join(rel)).ok()
+        }
+        ProjectView::Memory(project) if !project.is_symlink(rel) => match project.get(rel) {
+            Some(MemoryEntry::Text(text)) => Some(text.to_string()),
+            _ => None,
+        },
+        ProjectView::Memory(_) => None,
+    };
+    pnpm_root_only_workspace_breaks_add(
+        read(crate::hosted::memory::select::NPM_MANIFEST_REL).as_deref(),
+        read("node_modules/.modules.yaml").as_deref(),
     )
 }
 
@@ -3006,6 +3274,116 @@ mod tests {
         std::fs::write(tmp.path().join("package.json"), OVERRIDING_MANIFEST).unwrap();
         let (_, done) = npm_rewrite(&ProjectView::Disk(tmp.path()), &BTreeSet::new()).await;
         assert!(redirected(&done), "{:?}", done.rewrite.warnings);
+    }
+
+    const LEFT_PAD_V9_LOCK: &str = "lockfileVersion: '9.0'
+
+importers:
+  .:
+    dependencies:
+      left-pad:
+        specifier: 1.3.0
+        version: 1.3.0
+
+packages:
+  left-pad@1.3.0:
+    resolution: {integrity: sha512-UPSTREAM==}
+
+snapshots:
+  left-pad@1.3.0: {}
+";
+
+    #[test]
+    fn rush_repo_state_pairs_with_the_lock_beside_it() {
+        assert_eq!(
+            rush_repo_state_for_lock(RUSH_COMMON_LOCK_REL),
+            RUSH_REPO_STATE_REL
+        );
+        assert_eq!(
+            rush_repo_state_for_lock("common/config/subspaces/tools/pnpm-lock.yaml"),
+            "common/config/subspaces/tools/repo-state.json"
+        );
+    }
+
+    fn pnpm_trust_detail(done: &Rewritten) -> &str {
+        done.pnpm_warnings
+            .iter()
+            .find(|w| w.code == "redirect_pnpm_trust_lockfile")
+            .map(|w| w.detail.as_str())
+            .expect("redirect_pnpm_trust_lockfile")
+    }
+
+    /// #713: a run that spliced only Rush locks gets the Rush remedy (the
+    /// env var rush forwards, the pnpm 11 experiment, `rush purge`), never
+    /// the pnpm-only one, and writes no workspace file. The same lock at the
+    /// repo root still plans the trustLockfile write, and a run that spliced
+    /// both keeps the generic text plus the Rush note.
+    #[tokio::test]
+    async fn issue_713_rush_locks_get_the_rush_trust_remedy() {
+        let mut rush = MemoryProject::new();
+        rush.insert_text("rush.json", r#"{ "rushVersion": "5.100.0" }"#);
+        rush.insert_text(RUSH_COMMON_LOCK_REL, LEFT_PAD_V9_LOCK);
+        let (read, done) = npm_rewrite(&ProjectView::Memory(&rush), &BTreeSet::new()).await;
+        assert_eq!(read.rush_lock_keys, [RUSH_COMMON_LOCK_REL]);
+        assert!(done.rewrite.files.contains_key(RUSH_COMMON_LOCK_REL));
+        assert!(!done.rewrite.files.contains_key(PNPM_WORKSPACE_REL));
+        let detail = pnpm_trust_detail(&done);
+        assert!(
+            detail.contains("pnpm_config_trust_lockfile=true rush install"),
+            "{detail}"
+        );
+        assert!(
+            detail.contains("usePnpmFrozenLockfileForRushInstall"),
+            "{detail}"
+        );
+        assert!(detail.contains("rush purge"), "{detail}");
+        assert!(
+            !detail.contains("pnpm install --trust-lockfile"),
+            "{detail}"
+        );
+        assert!(!detail.contains("--store-dir"), "{detail}");
+
+        let mut root = MemoryProject::new();
+        root.insert_text("pnpm-lock.yaml", LEFT_PAD_V9_LOCK);
+        let (_, done) = npm_rewrite(&ProjectView::Memory(&root), &BTreeSet::new()).await;
+        assert!(done.rewrite.files.contains_key(PNPM_WORKSPACE_REL));
+        assert!(!pnpm_trust_detail(&done).contains("rush"));
+
+        let mut mixed = rush.clone();
+        mixed.insert_text("pnpm-lock.yaml", LEFT_PAD_V9_LOCK);
+        let (_, done) = npm_rewrite(&ProjectView::Memory(&mixed), &BTreeSet::new()).await;
+        assert!(done.rewrite.files.contains_key(RUSH_COMMON_LOCK_REL));
+        let detail = pnpm_trust_detail(&done);
+        assert!(detail.contains("--store-dir"), "{detail}");
+        assert!(detail.contains(PNPM_TRUST_RUSH_MIXED_NOTE), "{detail}");
+    }
+
+    /// #713 HEAL-ON-RERUN: a Rush lock an earlier run already redirected
+    /// splices nothing on a re-run, yet its `rush install` still needs the
+    /// Rush remedy — the re-run re-issues it (and still writes nothing).
+    #[tokio::test]
+    async fn issue_713_rerun_on_a_redirected_rush_lock_keeps_the_rush_remedy() {
+        let mut first = MemoryProject::new();
+        first.insert_text("rush.json", r#"{ "rushVersion": "5.100.0" }"#);
+        first.insert_text(RUSH_COMMON_LOCK_REL, LEFT_PAD_V9_LOCK);
+        let (_, done) = npm_rewrite(&ProjectView::Memory(&first), &BTreeSet::new()).await;
+        let redirected = done.rewrite.files[RUSH_COMMON_LOCK_REL].clone();
+
+        let mut rerun = MemoryProject::new();
+        rerun.insert_text("rush.json", r#"{ "rushVersion": "5.100.0" }"#);
+        rerun.insert_text(RUSH_COMMON_LOCK_REL, redirected.as_str());
+        let (_, done) = npm_rewrite(&ProjectView::Memory(&rerun), &BTreeSet::new()).await;
+        assert!(done.rewrite.files.is_empty(), "{:?}", done.rewrite.files);
+        assert!(!done.pnpm_rerun_only);
+        let detail = pnpm_trust_detail(&done);
+        assert!(
+            detail.contains("pnpm_config_trust_lockfile=true rush install"),
+            "{detail}"
+        );
+        assert!(
+            !detail.contains("pnpm install --trust-lockfile"),
+            "{detail}"
+        );
     }
 
     /// REGRESSION (#367), binary lock: a `bun.lockb`-only project's root
@@ -4259,6 +4637,463 @@ mod tests {
         assert_eq!(file_ecosystem("crates/a/Cargo.toml"), Some("cargo"));
         assert_eq!(file_ecosystem("build.gradle"), None);
         assert_eq!(file_ecosystem("Pipfile"), None);
+    }
+
+    // ── #492: `sharedWorkspaceLockfile: false` member locks ──
+
+    const MEMBER_UUID: &str = "u-member";
+    const MEMBER_URL: &str =
+        "https://patch.example/patch/npm/is-number/7.0.0/tok/u-member/is-number-7.0.0.tgz";
+
+    fn is_number_candidates() -> Vec<Candidate> {
+        let mut refs: HashMap<String, PackageVendorResult> = HashMap::new();
+        refs.insert(
+            MEMBER_UUID.into(),
+            reference(serde_json::json!({
+                "status": "granted",
+                "url": MEMBER_URL,
+                "purl": "pkg:npm/is-number@7.0.0",
+                "artifacts": [{"kind": "tarball", "url": MEMBER_URL,
+                               "integrity": {"sha512": "sha512-PATCHED=="}}],
+                "registryOverride": null
+            })),
+        );
+        let selected = vec![(
+            "pkg:npm/is-number@7.0.0".to_string(),
+            MEMBER_UUID.to_string(),
+        )];
+        build_candidates(&selected, &refs, &mut Vec::new())
+    }
+
+    fn v9_member_lock(direct: bool) -> String {
+        let importer = if direct {
+            "      is-number:\n        specifier: 7.0.0\n        version: 7.0.0\n"
+        } else {
+            "      to-regex-range:\n        specifier: 5.0.1\n        version: 5.0.1\n"
+        };
+        format!(
+            "lockfileVersion: '9.0'\n\nimporters:\n\n  .:\n    dependencies:\n{importer}\n\
+             packages:\n\n  is-number@7.0.0:\n    resolution: {{integrity: sha512-UPSTREAM==}}\n\n\
+             snapshots:\n\n  is-number@7.0.0: {{}}\n"
+        )
+    }
+
+    const V5_MEMBER_LOCK: &str = "lockfileVersion: 5.4\n\nspecifiers:\n  is-number: 7.0.0\n\n\
+        dependencies:\n  is-number: 7.0.0\n\npackages:\n\n  /is-number/7.0.0:\n    \
+        resolution: {integrity: sha512-UPSTREAM==}\n    dev: false\n";
+
+    const ROOT_ONLY_LOCK: &str = "lockfileVersion: '9.0'\n\nimporters:\n\n  .: {}\n";
+
+    fn write_rel(root: &std::path::Path, rel: &str, text: &str) {
+        let path = root.join(rel);
+        std::fs::create_dir_all(path.parent().unwrap()).unwrap();
+        std::fs::write(path, text).unwrap();
+    }
+
+    /// The issue's layout: a root lock covering only `.` and one lock per
+    /// member (`a` direct, `b` transitive).
+    fn write_member_workspace(root: &std::path::Path, workspace: &str) {
+        write_rel(root, "package.json", r#"{"name":"root","private":true}"#);
+        write_rel(root, "pnpm-workspace.yaml", workspace);
+        write_rel(root, "pnpm-lock.yaml", ROOT_ONLY_LOCK);
+        write_rel(root, "packages/a/package.json", r#"{"name":"a"}"#);
+        write_rel(root, "packages/a/pnpm-lock.yaml", &v9_member_lock(true));
+        write_rel(root, "packages/b/package.json", r#"{"name":"b"}"#);
+        write_rel(root, "packages/b/pnpm-lock.yaml", &v9_member_lock(false));
+        // An installed copy's own lock is never a member's.
+        write_rel(
+            root,
+            "packages/a/node_modules/x/pnpm-lock.yaml",
+            &v9_member_lock(true),
+        );
+    }
+
+    async fn member_rewrite(root: &std::path::Path) -> (CandidateFiles, Rewritten) {
+        view_rewrite(&ProjectView::Disk(root)).await
+    }
+
+    async fn view_rewrite(view: &ProjectView<'_>) -> (CandidateFiles, Rewritten) {
+        let outer = OuterAllowRemote::default;
+        let options = RewriteOptions {
+            dry_run: false,
+            targets_pipenv_lock: false,
+            pipenv_major: None,
+            pipenv_unknown_detail: String::new(),
+            trust_lockfile_config: true,
+            npm_allow_remote_config: true,
+            npm_outer: &outer,
+            yarn_classic_outer: &OuterYarnMirror::default,
+            blocking: false,
+            takeover_uuids: Default::default(),
+            patch_server_origins: Vec::new(),
+            prior_discovery: None,
+        };
+        let candidates = is_number_candidates();
+        let read = read_candidate_files(view, &BTreeSet::new(), &candidates).await;
+        let done = rewrite(
+            view,
+            read.clone(),
+            &candidates,
+            BTreeMap::new(),
+            &BTreeSet::new(),
+            options,
+        )
+        .await;
+        (read, done)
+    }
+
+    const MEMBER_KEYS: [&str; 2] = ["packages/a/pnpm-lock.yaml", "packages/b/pnpm-lock.yaml"];
+
+    #[tokio::test]
+    async fn member_locks_are_pinned_when_the_shared_lock_is_off() {
+        let tmp = tempfile::tempdir().unwrap();
+        let ws = "packages:\n  - 'packages/*'\nsharedWorkspaceLockfile: false\n";
+        write_member_workspace(tmp.path(), ws);
+        let (read, done) = member_rewrite(tmp.path()).await;
+        assert_eq!(read.pnpm_member_lock_keys, MEMBER_KEYS);
+        for key in MEMBER_KEYS {
+            let text = done
+                .rewrite
+                .files
+                .get(key)
+                .unwrap_or_else(|| panic!("{key} must be pinned: {:?}", done.rewrite.warnings));
+            assert!(text.contains(&format!("tarball: {MEMBER_URL}")), "{text}");
+        }
+        assert!(!done.rewrite.files.contains_key("pnpm-lock.yaml"));
+        assert_eq!(done.confirmed.len(), 1, "{:?}", done.confirmed);
+        assert!(
+            !warning_codes(&done).contains(&"redirect_pnpm_entry_not_found"),
+            "{:?}",
+            warning_codes(&done)
+        );
+        // pnpm reads `trustLockfile` from the root file for every member.
+        assert_eq!(
+            done.rewrite
+                .files
+                .get(PNPM_WORKSPACE_REL)
+                .map(String::as_str),
+            Some(format!("{ws}trustLockfile: true\n").as_str())
+        );
+        assert_eq!(
+            done.rewrite.edits.last().map(|e| e.kind.as_str()),
+            Some(REDIRECT_PNPM_WORKSPACE_TRUST_EDIT_KIND)
+        );
+
+        // HEAL-ON-RERUN: the member locks already pinned, the trust key
+        // missing (an opted-out first run): a re-run plans it again.
+        for key in MEMBER_KEYS {
+            write_rel(tmp.path(), key, &done.rewrite.files[key]);
+        }
+        let (_, again) = member_rewrite(tmp.path()).await;
+        assert!(
+            MEMBER_KEYS
+                .iter()
+                .all(|k| !again.rewrite.files.contains_key(*k)),
+            "{:?}",
+            again.rewrite.files.keys()
+        );
+        assert_eq!(again.confirmed.len(), 1);
+        assert!(again.rewrite.files.contains_key(PNPM_WORKSPACE_REL));
+    }
+
+    #[tokio::test]
+    async fn member_locks_are_ignored_while_the_root_lock_is_shared() {
+        // The default shared lock: member locks are stale leftovers.
+        let tmp = tempfile::tempdir().unwrap();
+        write_member_workspace(tmp.path(), "packages:\n  - 'packages/*'\n");
+        let (read, done) = member_rewrite(tmp.path()).await;
+        assert!(read.pnpm_member_lock_keys.is_empty());
+        assert!(MEMBER_KEYS.iter().all(|k| !read.files.contains_key(*k)));
+        assert!(done.confirmed.is_empty());
+
+        // The setting says off, but the root lock lists member importers:
+        // pnpm installs from it, so the member locks are still stale.
+        let tmp = tempfile::tempdir().unwrap();
+        write_member_workspace(
+            tmp.path(),
+            "packages:\n  - 'packages/*'\nsharedWorkspaceLockfile: false\n",
+        );
+        write_rel(
+            tmp.path(),
+            "pnpm-lock.yaml",
+            "lockfileVersion: '9.0'\n\nimporters:\n\n  .: {}\n\n  packages/a: {}\n",
+        );
+        let (read, _) = member_rewrite(tmp.path()).await;
+        assert!(read.pnpm_member_lock_keys.is_empty());
+    }
+
+    /// pnpm 7 with `shared-workspace-lockfile=false` in `.npmrc` writes no
+    /// root lock at all, only the members' (lockfile 5.4).
+    #[tokio::test]
+    async fn npmrc_member_locks_without_a_root_lock_are_pinned() {
+        let tmp = tempfile::tempdir().unwrap();
+        let root = tmp.path();
+        write_rel(root, "package.json", r#"{"name":"root","private":true}"#);
+        write_rel(root, "pnpm-workspace.yaml", "packages:\n  - packages/*\n");
+        write_rel(root, ".npmrc", "shared-workspace-lockfile=false\n");
+        write_rel(root, "node_modules/.modules.yaml", "layoutVersion: 5\n");
+        write_rel(root, "packages/a/package.json", r#"{"name":"a"}"#);
+        write_rel(root, "packages/a/pnpm-lock.yaml", V5_MEMBER_LOCK);
+        let (read, done) = member_rewrite(root).await;
+        assert_eq!(
+            read.pnpm_member_lock_keys,
+            vec!["packages/a/pnpm-lock.yaml"]
+        );
+        let text = &done.rewrite.files["packages/a/pnpm-lock.yaml"];
+        assert!(text.contains(MEMBER_URL), "{text}");
+        assert_eq!(done.confirmed.len(), 1);
+        let codes = warning_codes(&done);
+        assert!(
+            !codes.contains(&"redirect_pnpm_no_lockfile")
+                && !codes.contains(&"redirect_npm_no_lockfile"),
+            "{codes:?}"
+        );
+        // A legacy lock gets no trust config.
+        assert!(!done.rewrite.files.contains_key(PNPM_WORKSPACE_REL));
+    }
+
+    /// Members that cannot be listed refuse instead of pinning the root
+    /// lock alone (which no member installs from) and reporting success.
+    #[tokio::test]
+    async fn unlisted_member_locks_refuse_every_pnpm_pin() {
+        let tmp = tempfile::tempdir().unwrap();
+        write_member_workspace(
+            tmp.path(),
+            "packages: *members\nsharedWorkspaceLockfile: false\n",
+        );
+        let (read, done) = member_rewrite(tmp.path()).await;
+        assert!(!read.files.contains_key("pnpm-lock.yaml"));
+        assert!(done.rewrite.files.is_empty(), "{:?}", done.rewrite.files);
+        assert!(done.confirmed.is_empty());
+        let codes = warning_codes(&done);
+        assert!(codes.contains(&PNPM_MEMBER_LOCKS_UNRESOLVED), "{codes:?}");
+        assert!(!codes.contains(&"redirect_npm_no_lockfile"), "{codes:?}");
+
+        // A member lock that cannot be read refuses the whole set.
+        let tmp = tempfile::tempdir().unwrap();
+        write_member_workspace(
+            tmp.path(),
+            "packages:\n  - 'packages/*'\nsharedWorkspaceLockfile: false\n",
+        );
+        std::fs::write(tmp.path().join("packages/b/pnpm-lock.yaml"), [0xff, 0xfe]).unwrap();
+        let (read, done) = member_rewrite(tmp.path()).await;
+        assert!(read.pnpm_member_lock_keys.is_empty());
+        assert!(MEMBER_KEYS.iter().all(|k| !read.files.contains_key(*k)));
+        assert!(done.rewrite.files.is_empty(), "{:?}", done.rewrite.files);
+        assert!(done.confirmed.is_empty());
+        assert!(warning_codes(&done).contains(&PNPM_MEMBER_LOCKS_UNRESOLVED));
+
+        // No member lock and no root lock: not "run `pnpm install`".
+        let tmp = tempfile::tempdir().unwrap();
+        let root = tmp.path();
+        write_rel(root, "pnpm-workspace.yaml", "packages:\n  - packages/*\n");
+        write_rel(root, ".npmrc", "shared-workspace-lockfile=false\n");
+        write_rel(root, "node_modules/.modules.yaml", "layoutVersion: 5\n");
+        write_rel(root, "packages/a/package.json", r#"{"name":"a"}"#);
+        let (_, done) = member_rewrite(root).await;
+        let codes = warning_codes(&done);
+        assert!(codes.contains(&PNPM_MEMBER_LOCKS_UNRESOLVED), "{codes:?}");
+        assert!(!codes.contains(&"redirect_pnpm_no_lockfile"), "{codes:?}");
+    }
+
+    const BRANCH_LOCK: &str = "pnpm-lock.feature.yaml";
+    const BRANCH_WS: &str = "packages:\n  - '.'\ngitBranchLockfile: true\n";
+
+    /// The issue's layout: `pnpm-lock.yaml` as committed on main, and the
+    /// lock pnpm writes for the `feature` branch under `gitBranchLockfile`.
+    fn write_branch_lock_project(root: &std::path::Path, workspace: &str, root_lock: bool) {
+        write_rel(
+            root,
+            "package.json",
+            r#"{"name":"app","dependencies":{"is-number":"7.0.0"}}"#,
+        );
+        write_rel(root, "pnpm-workspace.yaml", workspace);
+        write_rel(root, "node_modules/.modules.yaml", "layoutVersion: 5\n");
+        if root_lock {
+            write_rel(root, "pnpm-lock.yaml", &v9_member_lock(true));
+        }
+        write_rel(root, BRANCH_LOCK, &v9_member_lock(true));
+    }
+
+    fn assert_branch_lock_refused(read: &CandidateFiles, done: &Rewritten) {
+        assert!(!read.files.contains_key("pnpm-lock.yaml"));
+        assert!(done.rewrite.files.is_empty(), "{:?}", done.rewrite.files);
+        assert!(done.confirmed.is_empty(), "{:?}", done.confirmed);
+        let codes = warning_codes(done);
+        assert!(codes.contains(&PNPM_GIT_BRANCH_LOCKFILE), "{codes:?}");
+        assert!(
+            !codes.contains(&"redirect_pnpm_no_lockfile")
+                && !codes.contains(&"redirect_npm_no_lockfile"),
+            "{codes:?}"
+        );
+        let detail = &done
+            .rewrite
+            .warnings
+            .iter()
+            .find(|w| w.code == PNPM_GIT_BRANCH_LOCKFILE)
+            .unwrap()
+            .detail;
+        assert!(
+            detail.contains(BRANCH_LOCK) && detail.contains("--merge-git-branch-lockfiles"),
+            "{detail}"
+        );
+    }
+
+    /// `gitBranchLockfile` with a branch lock beside `pnpm-lock.yaml`: pnpm
+    /// installs the branch from the branch lock, so pinning the stale
+    /// `pnpm-lock.yaml` would confirm a pin nothing installs (#556).
+    #[tokio::test]
+    async fn a_git_branch_lock_refuses_the_stale_root_lock() {
+        let tmp = tempfile::tempdir().unwrap();
+        write_branch_lock_project(tmp.path(), BRANCH_WS, true);
+        let (read, done) = member_rewrite(tmp.path()).await;
+        assert_branch_lock_refused(&read, &done);
+
+        // pnpm 10 and older read the setting from `.npmrc`.
+        let tmp = tempfile::tempdir().unwrap();
+        write_branch_lock_project(tmp.path(), "packages:\n  - '.'\n", true);
+        write_rel(tmp.path(), ".npmrc", "git-branch-lockfile=true\n");
+        let (read, done) = member_rewrite(tmp.path()).await;
+        assert_branch_lock_refused(&read, &done);
+
+        // The in-memory engine refuses the same project.
+        let mut project = MemoryProject::new();
+        project.insert_text("package.json", r#"{"name":"app"}"#);
+        project.insert_text("pnpm-workspace.yaml", BRANCH_WS);
+        project.insert_text("pnpm-lock.yaml", v9_member_lock(true));
+        project.insert_text(BRANCH_LOCK, v9_member_lock(true));
+        let (read, done) = view_rewrite(&ProjectView::Memory(&project)).await;
+        assert_branch_lock_refused(&read, &done);
+    }
+
+    /// Only the branch lock: not "run `pnpm install`", which just rewrites
+    /// the branch lock again (#556).
+    #[tokio::test]
+    async fn a_lone_git_branch_lock_is_not_a_missing_lock() {
+        let tmp = tempfile::tempdir().unwrap();
+        write_branch_lock_project(tmp.path(), BRANCH_WS, false);
+        let (read, done) = member_rewrite(tmp.path()).await;
+        assert_branch_lock_refused(&read, &done);
+    }
+
+    /// Under `sharedWorkspaceLockfile: false` pnpm looks for the branch
+    /// lock in every member's directory too: a member whose deps changed on
+    /// the branch installs from `<member>/pnpm-lock.<branch>.yaml`, so its
+    /// `pnpm-lock.yaml` is stale and no member lock is pinned (#492 x #556).
+    #[tokio::test]
+    async fn a_member_git_branch_lock_refuses_the_stale_member_locks() {
+        // pnpm 8+: the settings in the YAML, a root lock covering `.` only,
+        // and no branch lock at the root.
+        let tmp = tempfile::tempdir().unwrap();
+        let ws = "packages:\n  - 'packages/*'\nsharedWorkspaceLockfile: false\n\
+                  gitBranchLockfile: true\n";
+        write_member_workspace(tmp.path(), ws);
+        write_rel(
+            tmp.path(),
+            &format!("packages/a/{BRANCH_LOCK}"),
+            &v9_member_lock(true),
+        );
+        let (read, done) = member_rewrite(tmp.path()).await;
+        assert_branch_lock_refused(&read, &done);
+        assert!(read.pnpm_member_lock_keys.is_empty());
+        for key in MEMBER_KEYS {
+            assert!(!read.files.contains_key(key), "{key}");
+        }
+
+        // pnpm 7: both settings in `.npmrc` and no root lock at all.
+        let tmp = tempfile::tempdir().unwrap();
+        write_member_workspace(tmp.path(), "packages:\n  - 'packages/*'\n");
+        std::fs::remove_file(tmp.path().join("pnpm-lock.yaml")).unwrap();
+        write_rel(
+            tmp.path(),
+            ".npmrc",
+            "shared-workspace-lockfile=false\ngit-branch-lockfile=true\n",
+        );
+        write_rel(
+            tmp.path(),
+            &format!("packages/a/{BRANCH_LOCK}"),
+            &v9_member_lock(true),
+        );
+        let (read, done) = member_rewrite(tmp.path()).await;
+        assert_branch_lock_refused(&read, &done);
+        assert!(read.pnpm_member_lock_keys.is_empty());
+
+        // The setting off: the member branch lock is a stray file.
+        let tmp = tempfile::tempdir().unwrap();
+        write_member_workspace(
+            tmp.path(),
+            "packages:\n  - 'packages/*'\nsharedWorkspaceLockfile: false\n",
+        );
+        write_rel(
+            tmp.path(),
+            &format!("packages/a/{BRANCH_LOCK}"),
+            &v9_member_lock(true),
+        );
+        let (read, done) = member_rewrite(tmp.path()).await;
+        assert_eq!(read.pnpm_member_lock_keys, MEMBER_KEYS);
+        assert!(!warning_codes(&done).contains(&PNPM_GIT_BRANCH_LOCKFILE));
+    }
+
+    /// Run from a member, the setting lives in the ancestor
+    /// `pnpm-workspace.yaml` pnpm reads it from, not in the member.
+    #[tokio::test]
+    async fn a_member_run_reads_the_setting_from_the_governing_workspace() {
+        let tmp = tempfile::tempdir().unwrap();
+        let ws = "packages:\n  - 'packages/*'\nsharedWorkspaceLockfile: false\n\
+                  gitBranchLockfile: true\n";
+        write_member_workspace(tmp.path(), ws);
+        let member = tmp.path().join("packages/a");
+        write_rel(&member, BRANCH_LOCK, &v9_member_lock(true));
+        let (read, done) = member_rewrite(&member).await;
+        assert_branch_lock_refused(&read, &done);
+        let detail = &done
+            .rewrite
+            .warnings
+            .iter()
+            .find(|w| w.code == PNPM_GIT_BRANCH_LOCKFILE)
+            .unwrap()
+            .detail;
+        assert!(detail.contains("gitBranchLockfile: true"), "{detail}");
+
+        // pnpm 10 and older: the `.npmrc` beside the ancestor file.
+        let tmp = tempfile::tempdir().unwrap();
+        write_member_workspace(
+            tmp.path(),
+            "packages:\n  - 'packages/*'\nsharedWorkspaceLockfile: false\n",
+        );
+        write_rel(tmp.path(), ".npmrc", "git-branch-lockfile=true\n");
+        let member = tmp.path().join("packages/a");
+        write_rel(&member, BRANCH_LOCK, &v9_member_lock(true));
+        let (read, done) = member_rewrite(&member).await;
+        assert_branch_lock_refused(&read, &done);
+    }
+
+    /// The setting alone (no branch lock: main, or a branch whose deps never
+    /// changed) installs from `pnpm-lock.yaml`, so it is pinned as usual; so
+    /// is a stray branch lock while the setting is off.
+    #[tokio::test]
+    async fn the_root_lock_is_pinned_without_a_live_git_branch_lock() {
+        for (workspace, branch_lock) in [
+            (BRANCH_WS, false),
+            ("packages:\n  - '.'\ngitBranchLockfile: false\n", true),
+            ("packages:\n  - '.'\n", true),
+        ] {
+            let tmp = tempfile::tempdir().unwrap();
+            write_branch_lock_project(tmp.path(), workspace, true);
+            if !branch_lock {
+                std::fs::remove_file(tmp.path().join(BRANCH_LOCK)).unwrap();
+            }
+            let (_, done) = member_rewrite(tmp.path()).await;
+            let text = done
+                .rewrite
+                .files
+                .get("pnpm-lock.yaml")
+                .unwrap_or_else(|| panic!("{workspace}: {:?}", done.rewrite.warnings));
+            assert!(text.contains(MEMBER_URL), "{text}");
+            assert_eq!(done.confirmed.len(), 1, "{workspace}");
+            assert!(!warning_codes(&done).contains(&PNPM_GIT_BRANCH_LOCKFILE));
+            assert!(!done.rewrite.files.contains_key(BRANCH_LOCK));
+        }
     }
 }
 
