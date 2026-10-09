@@ -187,16 +187,12 @@ CLI_TRANSPORT_FAILURE = re.compile(r'error sending request for url \(|API reques
 BUN_TRANSPORT_FAILURE = re.compile(
     r'^error: (?:Connection\w+|FailedToOpenSocket|Timeout|TLSHandshakeTimeout) downloading '
     r'|^error: GET \S+ - 5\d\d\b', re.M)
-# The harness's own urllib fetch of a hosted service (e.g. the patched
-# tarball `hosted_lockb_digest` reads from patch.socket.dev) failing with a
-# 5xx / 429 (`HTTP Error 503: Service Unavailable`) or no response at all
-# (`<urlopen error [Errno 104] Connection reset by peer>`).
-HARNESS_TRANSPORT_FAILURE = re.compile(r'\bHTTP Error (?:5\d\d|429)\b|<urlopen error ')
-
 # The harness's own fetches (published record, hosted tarball digest) that
 # still fail after their in-place retries surface as the cell's `error`:
-# `<urlopen error [Errno 104] Connection reset by peer>`.
-HARNESS_TRANSPORT_FAILURE = re.compile(r'^<urlopen error |^\[(?:Win)?Errno \d+\] Connection reset')
+# a 5xx / 429 (`HTTP Error 503: Service Unavailable`) or no response at all
+# (`<urlopen error [Errno 104] Connection reset by peer>`).
+HARNESS_TRANSPORT_FAILURE = re.compile(
+    r'\bHTTP Error (?:5\d\d|429)\b|^<urlopen error |^\[(?:Win)?Errno \d+\] Connection reset')
 
 
 def bun_transport_failures(output):
