@@ -1912,6 +1912,294 @@ async fn gem_get_uuid_hosted_fresh_checkout_bundle_install() {
     manifestless_vex_matrix(&fx, &fresh).await;
 }
 
+/// One patched gem a later patch generation serves: its uuid, the patched
+/// `.gem`, and the lib file's before/after bytes for the view record.
+struct GenerationGem {
+    name: &'static str,
+    uuid: &'static str,
+    deps: Vec<String>,
+    lib_file: &'static str,
+    orig: String,
+    patched: String,
+    gem: Vec<u8>,
+}
+
+/// Layer a new patch generation over the fixture's API mocks (wiremock
+/// serves the lowest `priority` first): the batch, by-package, reference and
+/// view routes answer with `gems`, and each uuid gets its own patch-registry
+/// compact index under the fixture's grant token.
+async fn mount_patch_generation(server: &MockServer, priority: u8, gems: &[GenerationGem]) {
+    let purl = |g: &GenerationGem| format!("pkg:gem/{}@{DEP_VERSION}", g.name);
+    for g in gems {
+        mount_compact_index(
+            server,
+            &format!("/patch-registry/gem/{TOKEN}/{}", g.uuid),
+            &[IndexGem {
+                name: g.name,
+                version: DEP_VERSION,
+                deps: g.deps.clone(),
+                gem: g.gem.clone(),
+            }],
+        )
+        .await;
+        Mock::given(method("GET"))
+            .and(path(format!("/v0/orgs/{ORG}/patches/view/{}", g.uuid)))
+            .respond_with(ResponseTemplate::new(200).set_body_json(serde_json::json!({
+                "uuid": g.uuid,
+                "purl": purl(g),
+                "publishedAt": "2026-02-01T00:00:00Z",
+                "files": {
+                    format!("lib/{}", g.lib_file): {
+                        "beforeHash": compute_git_sha256_from_bytes(g.orig.as_bytes()),
+                        "afterHash": compute_git_sha256_from_bytes(g.patched.as_bytes()),
+                    }
+                },
+                "vulnerabilities": {
+                    GHSA: {
+                        "cves": ["CVE-2026-3333"],
+                        "summary": "gem redirect capstone vuln",
+                        "severity": "high",
+                        "description": "d"
+                    }
+                },
+                "description": "x", "license": "MIT", "tier": "free"
+            })))
+            .with_priority(priority)
+            .mount(server)
+            .await;
+        Mock::given(method("GET"))
+            .and(path_regex(format!(
+                "^/v0/orgs/{ORG}/patches/by-package/.*{}.*$",
+                g.name
+            )))
+            .respond_with(ResponseTemplate::new(200).set_body_json(serde_json::json!({
+                "patches": [{
+                    "uuid": g.uuid, "purl": purl(g),
+                    "publishedAt": "2026-02-01T00:00:00Z",
+                    "description": "x", "license": "MIT", "tier": "free",
+                    "vulnerabilities": {}
+                }],
+                "canAccessPaidPatches": false,
+            })))
+            .with_priority(priority)
+            .mount(server)
+            .await;
+    }
+    let packages: Vec<serde_json::Value> = gems
+        .iter()
+        .map(|g| {
+            serde_json::json!({
+                "purl": purl(g),
+                "patches": [{
+                    "uuid": g.uuid, "purl": purl(g), "tier": "free",
+                    "cveIds": [], "ghsaIds": [], "severity": "high",
+                    "title": "gem redirect capstone fixture"
+                }]
+            })
+        })
+        .collect();
+    Mock::given(method("POST"))
+        .and(path(format!("/v0/orgs/{ORG}/patches/batch")))
+        .respond_with(ResponseTemplate::new(200).set_body_json(serde_json::json!({
+            "packages": packages,
+            "canAccessPaidPatches": false,
+        })))
+        .with_priority(priority)
+        .mount(server)
+        .await;
+    let results: serde_json::Map<String, serde_json::Value> = gems
+        .iter()
+        .map(|g| {
+            let sha = sha256_hex(&g.gem);
+            let hosted_url = format!(
+                "{}/patch/gem/{}/{DEP_VERSION}/{TOKEN}/{}/{}-{DEP_VERSION}.gem",
+                server.uri(),
+                g.name,
+                g.uuid,
+                g.name
+            );
+            let index_url = format!("{}/patch-registry/gem/{TOKEN}/{}/", server.uri(), g.uuid);
+            (
+                g.uuid.to_string(),
+                serde_json::json!({
+                    "status": "granted",
+                    "url": hosted_url,
+                    "purl": purl(g),
+                    "artifacts": [{
+                        "kind": "tarball",
+                        "url": hosted_url,
+                        "integrity": { "sha256": sha }
+                    }],
+                    "registryOverride": {
+                        "kind": "rubygems-compact-index",
+                        "indexUrl": index_url,
+                        "identifiers": {
+                            "name": g.name,
+                            "version": DEP_VERSION,
+                            "gemChecksumSha256": sha,
+                        }
+                    }
+                }),
+            )
+        })
+        .collect();
+    Mock::given(method("POST"))
+        .and(path(format!("/v0/orgs/{ORG}/patches/package")))
+        .respond_with(
+            ResponseTemplate::new(200).set_body_json(serde_json::json!({ "results": results })),
+        )
+        .with_priority(priority)
+        .mount(server)
+        .await;
+}
+
+/// The `remote:` URLs of a lock's `GEM` sections, in file order.
+fn gem_remotes(lock: &str) -> Vec<&str> {
+    let mut out = Vec::new();
+    let mut in_gem = false;
+    for line in lock.lines() {
+        if !line.starts_with(' ') && !line.is_empty() {
+            in_gem = line == "GEM";
+        } else if let Some(url) = line.strip_prefix("  remote: ").filter(|_| in_gem) {
+            out.push(url);
+        }
+    }
+    out
+}
+
+/// #1186: two gems hosted in their own patch-registry `GEM` sections, then a
+/// superseding patch for one of them whose new uuid sorts AFTER its
+/// sibling. The re-scan must move the refreshed section to where bundler
+/// writes it (sections sorted by remote URL): a converged CHECKSUMS lock
+/// that `bundle lock` leaves byte-identical and a cold frozen install
+/// accepts. An in-place refresh left the sections out of order, and every
+/// frozen install on bundler 4.0.19+ exited 16 ("Your lockfile needs to be
+/// updated, but it can't be because frozen mode is set").
+#[tokio::test(flavor = "multi_thread")]
+#[ignore = "host capstone: shells out to a real ruby/gem/bundler (>= 2.6 for the CHECKSUMS lock); \
+            the unpinned `test` job skips it, an e2e job with a pinned toolchain runs it via --ignored"]
+async fn gem_hosted_superseding_patch_keeps_gem_sections_in_bundler_order() {
+    let Some(fx) = redirect_scanned_project(
+        "supersede-section-order",
+        Spelling::Gemfile,
+        true,
+        true,
+        None,
+        Driver::ScanVex,
+    )
+    .await
+    else {
+        return;
+    };
+    const VULN_GEN2: &str = "10000000-1a2b-4a1b-8c2d-3e4f5a6b7c8d";
+    const TINY_GEN2: &str = "80000000-1a2b-4a1b-8c2d-3e4f5a6b7c8d";
+    const VULN_GEN3: &str = "9a9a9a9a-1a2b-4a1b-8c2d-3e4f5a6b7c8d";
+    let stage = fx.tmp.path().join("generation-stage");
+    let vuln = |uuid: &'static str, lib: String| {
+        let gem = build_gem(
+            &stage.join(uuid),
+            DEP,
+            DEP_VERSION,
+            "vuln_gem.rb",
+            &lib,
+            &[TRANSITIVE],
+        );
+        GenerationGem {
+            name: DEP,
+            uuid,
+            deps: vec![format!("{TRANSITIVE}:>= 0")],
+            lib_file: "vuln_gem.rb",
+            orig: orig_lib(),
+            patched: lib,
+            gem,
+        }
+    };
+    let tiny_patched = TINY_LIB.replace("tiny-ok", "tiny-patched");
+    let tiny = GenerationGem {
+        name: TRANSITIVE,
+        uuid: TINY_GEN2,
+        deps: vec![],
+        lib_file: "tiny_dep.rb",
+        orig: TINY_LIB.to_string(),
+        patched: tiny_patched.clone(),
+        gem: build_gem(
+            &stage.join(TINY_GEN2),
+            TRANSITIVE,
+            "1.0.0",
+            "tiny_dep.rb",
+            &tiny_patched,
+            &[],
+        ),
+    };
+    let server = fx._server.uri();
+    let registry = |uuid: &str| format!("{server}/patch-registry/gem/{TOKEN}/{uuid}/");
+    let upstream = format!("{server}/upstream/");
+    let lock_path = fx.proj.join(fx.lock_name);
+    let scan = |what: &str| {
+        let (code, stdout, stderr) = run_hosted_scan(&fx.proj, &server);
+        assert_eq!(
+            code, 0,
+            "{what} failed.\nstdout:\n{stdout}\nstderr:\n{stderr}"
+        );
+        std::fs::read_to_string(&lock_path).unwrap()
+    };
+
+    // Generation 2: both gems hosted, each in its own section, inserted
+    // sorted (the path that already worked).
+    let tiny_gem = tiny.gem.clone();
+    mount_patch_generation(&fx._server, 2, &[vuln(VULN_GEN2, patched_lib()), tiny]).await;
+    let lock = scan("generation-2 scan");
+    assert_eq!(
+        gem_remotes(&lock),
+        [registry(VULN_GEN2), registry(TINY_GEN2), upstream.clone()],
+        "generation 2 sections:\n{lock}"
+    );
+
+    // Generation 3: a superseding patch for vuln-gem only (same version,
+    // new bytes) whose uuid sorts after tiny-dep's section.
+    let gen3_lib = patched_lib().replace("PATCHED", "PATCHED-GEN3");
+    assert_ne!(gen3_lib, patched_lib(), "generation 3 must change bytes");
+    let tiny = GenerationGem {
+        name: TRANSITIVE,
+        uuid: TINY_GEN2,
+        deps: vec![],
+        lib_file: "tiny_dep.rb",
+        orig: TINY_LIB.to_string(),
+        patched: tiny_patched,
+        gem: tiny_gem,
+    };
+    mount_patch_generation(&fx._server, 1, &[vuln(VULN_GEN3, gen3_lib), tiny]).await;
+    let lock = scan("generation-3 scan");
+    assert_eq!(
+        gem_remotes(&lock),
+        [registry(TINY_GEN2), registry(VULN_GEN3), upstream.clone()],
+        "the superseded section must move to bundler's sorted position:\n{lock}"
+    );
+
+    // Bundler agrees: `bundle lock` re-renders the committed lock
+    // byte-identically, and a cold frozen install accepts it.
+    let relock = stage_fresh_checkout(&fx, "fresh-relock");
+    let out = bundle(&relock, &["lock"]);
+    assert!(
+        out.status.success(),
+        "bundle lock failed:\n{}",
+        String::from_utf8_lossy(&out.stderr)
+    );
+    assert_eq!(
+        std::fs::read_to_string(relock.join(fx.lock_name)).unwrap(),
+        lock,
+        "bundle lock must leave the converged lock byte-identical"
+    );
+    let fresh = stage_fresh_checkout(&fx, "fresh-frozen");
+    let install = bundle_env(&fresh, &["install"], &[("BUNDLE_FROZEN", "true")]);
+    let stderr = String::from_utf8_lossy(&install.stderr);
+    assert!(
+        install.status.success() && !stderr.contains("Cannot write a changed lockfile"),
+        "cold frozen install must accept the lock unchanged.\nstdout:\n{}\nstderr:\n{stderr}",
+        String::from_utf8_lossy(&install.stdout),
+    );
+}
+
 /// Bundler's modern `gems.rb`/`gems.locked` spelling, end to end: the
 /// candidate list must read the pair, the rewriter must key its edits to it,
 /// and the real bundler must install the patched gem from the redirected

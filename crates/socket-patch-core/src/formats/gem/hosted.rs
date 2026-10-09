@@ -32,6 +32,62 @@ struct GemLockSection {
     end: usize,
 }
 
+impl GemLockSection {
+    /// Bundler's source identifier for the section (its remote URLs) — the
+    /// key `SourceList#lock_rubygems_sources` sorts `GEM` sections by.
+    fn identifier(&self) -> String {
+        self.remotes
+            .iter()
+            .map(|(_, url)| url.as_str())
+            .collect::<Vec<_>>()
+            .join(", ")
+    }
+}
+
+/// Move `GEM` section `sec_idx` (whose remote now reads `index_url`) to
+/// where bundler writes it: before the first other section whose
+/// identifier sorts after `index_url`, else after the last one. The section
+/// moves whole, its lines keeping their own endings. Returns false (nothing
+/// touched) when it already sits there.
+fn place_gem_section_sorted(
+    lines: &mut Vec<String>,
+    sections: &[GemLockSection],
+    sec_idx: usize,
+    index_url: &str,
+    eol: &str,
+) -> bool {
+    let others = || (0..sections.len()).filter(|&k| k != sec_idx);
+    let before = others().find(|&k| sections[k].identifier().as_str() > index_url);
+    if before == others().find(|&k| k > sec_idx) {
+        return false;
+    }
+    let (start, end) = (sections[sec_idx].start, sections[sec_idx].end);
+    let mut block: Vec<String> = lines.drain(start..end).collect();
+    let n = block.len();
+    // The moved section needs its own blank separator (and a final newline
+    // if it was the file's last line).
+    if let Some(last) = block.last_mut() {
+        if !last.ends_with('\n') {
+            last.push_str(eol);
+        }
+        if !gem_lock_line_content(last).is_empty() {
+            block.push(eol.to_string());
+        }
+    }
+    let shifted = |at: usize| if at > start { at - n } else { at };
+    let at = match before {
+        Some(k) => shifted(sections[k].start),
+        None => {
+            let last = others()
+                .next_back()
+                .expect("a section sorts before this one");
+            shifted(sections[last].end)
+        }
+    };
+    lines.splice(at..at, block);
+    true
+}
+
 /// Converge the lock's source attribution for one redirected dep so the
 /// Gemfile + lock pair is what bundler itself would write after an install
 /// from the redirected Gemfile (verified frozen-installable on bundler 4):
@@ -46,8 +102,10 @@ struct GemLockSection {
 ///
 /// Idempotent and rotation-aware: a section whose remote matches the
 /// token-wildcard pattern is recognized as ours (never duplicated) and its
-/// remote is refreshed in place under a rotated grant
-/// (`redirect_gemfile_lock_source_url`, mirroring the Gemfile refresh).
+/// remote is refreshed under a rotated grant or superseding patch
+/// (`redirect_gemfile_lock_source_url`, mirroring the Gemfile refresh); the
+/// section then moves to bundler's sorted position if the new URL sorts
+/// elsewhere (`redirect_gemfile_lock_section_order`).
 ///
 /// Returns true when the lock ends converged (already, or via edits recorded
 /// into `result`); false when the dep cannot be attributed safely — spec
@@ -181,7 +239,8 @@ pub(crate) fn converge_gem_lock_source(
     }
 
     if socket_remote_re.is_match(&remote_url) {
-        // Already ours. Rotated grant: refresh the remote in place.
+        // Already ours. Rotated grant or superseding patch: refresh the
+        // remote.
         if remote_url != index_url {
             let ending =
                 lines[remote_idx][gem_lock_line_content(&lines[remote_idx]).len()..].to_string();
@@ -192,6 +251,22 @@ pub(crate) fn converge_gem_lock_source(
                 action: "rewritten".into(),
                 key: Some(dep.name.clone()),
                 original: Some(Value::String(remote_url)),
+                new: Some(Value::String(index_url.to_string())),
+            });
+            changed = true;
+        }
+        // The refreshed URL (a superseding patch uuid, a rotated grant) can
+        // sort past a sibling `GEM` section, and bundler writes the sections
+        // sorted by identifier — the same rule as the fresh insert below.
+        // Re-place the whole section; a lock an earlier run left out of
+        // order is healed the same way.
+        if place_gem_section_sorted(&mut lines, &sections, sec_idx, index_url, eol) {
+            result.edits.push(FileEdit {
+                path: lock_name.into(),
+                kind: "redirect_gemfile_lock_section_order".into(),
+                action: "moved".into(),
+                key: Some(dep.name.clone()),
+                original: None,
                 new: Some(Value::String(index_url.to_string())),
             });
             changed = true;
@@ -229,16 +304,8 @@ pub(crate) fn converge_gem_lock_source(
                 std::cmp::Ordering::Greater => (s.start - n, s.end - n),
             }
         };
-        let identifier = |k: usize| -> String {
-            sections[k]
-                .remotes
-                .iter()
-                .map(|(_, url)| url.as_str())
-                .collect::<Vec<_>>()
-                .join(", ")
-        };
         let insert_at = (0..sections.len())
-            .find(|&k| identifier(k).as_str() > index_url)
+            .find(|&k| sections[k].identifier().as_str() > index_url)
             .map(|k| bounds(k).0)
             .unwrap_or_else(|| bounds(sections.len() - 1).1);
         let mut block: Vec<String> = Vec::with_capacity(moved.len() + 4);

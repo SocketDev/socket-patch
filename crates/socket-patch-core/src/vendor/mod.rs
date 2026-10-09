@@ -622,6 +622,18 @@ fn harvest_zip_blobs(path: &Path, wanted: &[(String, String)]) -> HashMap<String
     out
 }
 
+/// Warning code on a failed npm-family [`VendorOutcome::Done`]: the patch
+/// service is still building the patch's prebuilt artifact. With
+/// [`VENDOR_PREBUILT_UNAVAILABLE`], it tells the vendor loop the patch is not
+/// served (yet), not broken: a package already vendored at an older patch
+/// keeps it and is reported as skipped (#954), the way hosted mode keeps
+/// its pin.
+pub const VENDOR_PREBUILT_PENDING: &str = "vendor_prebuilt_pending";
+/// Warning code on a failed npm-family [`VendorOutcome::Done`]: the patch
+/// service has no artifact for the patch (`build_failed`, `not_found`,
+/// `withdrawn`, …). See [`VENDOR_PREBUILT_PENDING`].
+pub const VENDOR_PREBUILT_UNAVAILABLE: &str = "vendor_prebuilt_unavailable";
+
 /// The result of one backend `vendor_*` call.
 //
 // `large_enum_variant`: `Done` is much bigger than `Refused` because it carries

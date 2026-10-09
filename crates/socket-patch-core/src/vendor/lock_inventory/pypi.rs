@@ -9,6 +9,7 @@ use serde_json::Value;
 use toml_edit::{DocumentMut, Item, TableLike};
 
 use crate::crawlers::python_crawler::canonicalize_pypi_name;
+use crate::formats::text::strip_bom;
 use crate::utils::purl::{percent_decode_purl_component, pypi_purl};
 use crate::utils::python_lock::{lock_package_collection, package_artifacts, UvSource};
 use crate::utils::requirements::archive_filename_coords;
@@ -77,11 +78,12 @@ impl<'a> PipfileLockEntry<'a> {
     }
 }
 
-/// Parse a `Pipfile.lock`. Leading UTF-8 BOMs (Windows editors) are not
-/// JSON and are skipped — the one BOM policy of every Pipfile.lock reader
+/// Parse a `Pipfile.lock`. A leading UTF-8 BOM (Windows editors) is not
+/// JSON and is skipped ([`strip_bom`]: one BOM is encoding, a second is
+/// content) — the one BOM policy of every Pipfile.lock reader
 /// (this inventory, the hosted Pipenv rewriter, lockfile discovery).
 pub(crate) fn parse_pipfile_lock(text: &str) -> serde_json::Result<Value> {
-    serde_json::from_str(text.trim_start_matches('\u{feff}'))
+    serde_json::from_str(strip_bom(text))
 }
 
 /// Every package entry of a parsed `Pipfile.lock` (pipfile-spec 6): each
@@ -759,6 +761,25 @@ async fn requirements_tree(view: &ProjectView<'_>) -> Option<Vec<String>> {
         files.push(text);
     }
     Some(files)
+}
+
+#[cfg(test)]
+mod tests {
+    use super::parse_pipfile_lock;
+
+    /// Every Pipfile.lock reader parses through here: one leading BOM is
+    /// encoding and skipped, a second is content (not JSON), as
+    /// `formats::text` rules for every reader.
+    #[test]
+    fn pipfile_lock_reads_past_one_bom_only() {
+        let lock = r#"{"default": {}}"#;
+        let plain = parse_pipfile_lock(lock).unwrap();
+        assert_eq!(
+            parse_pipfile_lock(&format!("\u{feff}{lock}")).unwrap(),
+            plain
+        );
+        assert!(parse_pipfile_lock(&format!("\u{feff}\u{feff}{lock}")).is_err());
+    }
 }
 
 #[cfg(test)]

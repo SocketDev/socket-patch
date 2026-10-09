@@ -40,8 +40,15 @@ The backticked slug in each row is the value `-e`/`--ecosystems` accepts (e.g.
 ## npm hosted-mode notes
 
 - **npm (package-lock.json / npm-shrinkwrap.json)** — every present npm lock is
-  rewritten (npm 12 installs from the package-lock.json twin it keeps beside a
-  committed shrinkwrap). npm 12 defaults `allow-remote=none` and refuses the
+  rewritten (npm <= 11 installs from a committed shrinkwrap, npm 12 only from
+  package-lock.json). npm 12 never reads npm-shrinkwrap.json: on a
+  shrinkwrap-only project it resolves the tree from the registry and writes a
+  fresh package-lock.json, so the patch reaches npm <= 11 only. Hosted and
+  vendored runs still rewire the shrinkwrap but warn
+  (`redirect_npm_shrinkwrap_only` / `vendor_npm_shrinkwrap_only`), and `vex`
+  omits those patches (`vex_npm_shrinkwrap_only`) while `list`, `rollback` and
+  `remove` still manage them; rename the lock to package-lock.json (or commit
+  a copy under that name) and re-run. npm 12 defaults `allow-remote=none` and refuses the
   redirected tarballs (EALLOWREMOTE) unless the project `.npmrc` sets
   `allow-remote=all`, so the hosted run writes it (new file, or one appended
   line; once `rollback` / `remove` / the vendored takeover has restored the last
@@ -53,8 +60,18 @@ The backticked slug in each row is the value `-e`/`--ecosystems` accepts (e.g.
   overridden) — in the project `.npmrc`, the user / global / builtin npm config,
   or an `npm_config_allow_remote` environment variable — and
   `--no-npm-allow-remote-config` opts out (install with
-  `npm ci --allow-remote=all`). Vendored `file:` tarballs are unaffected (npm
-  gates them by `allow-file`, default `all`). npm 6 ignores `resolved` for registry
+  `npm ci --allow-remote=all`). Vendored `file:` tarballs are unaffected by
+  `allow-remote`: npm >= 11.14 gates them by `allow-file` (default `all`). An
+  explicit `allow-file=none`, or `allow-file=root` while a vendored copy is
+  transitive, makes every install fail EALLOWFILE; the vendored run keeps the
+  setting, warns `vendor_npm_allow_file` with the remedy (`allow-file=all` in
+  `.npmrc`, or `npm ci --allow-file=all`), and `vendor --check` fails. npm >= 8's
+  `replace-registry-host` set to `always` (or to the hosted patch host) makes npm
+  rewrite the hosted pins to the configured registry, so every install fails
+  E404: the hosted run reads it from the same env / project / user / global /
+  builtin layers and warns `redirect_npm_replace_registry_host` (set
+  `replace-registry-host=npmjs` in the project `.npmrc`, or use vendored mode).
+  npm 6 ignores `resolved` for registry
   dependencies, so a redirected lockfileVersion 1 lock fails closed with
   EINTEGRITY under npm 6 (`redirect_npm_legacy_client`) and installs under npm
   >= 7. A lockfileVersion 2 lock's legacy `dependencies` mirror is rewired with
@@ -63,7 +80,11 @@ The backticked slug in each row is the value `-e`/`--ecosystems` accepts (e.g.
   whatever its `resolved` says, so under npm 6 an aliased hosted pin in a v2
   lock fails closed with EINTEGRITY too (`redirect_npm_legacy_alias_client`).
   Lockfile-only `vex` attests nothing for a package whose `packages` entry is
-  wired while the v2 mirror still resolves it from the registry. Vendoring
+  wired while the v2 mirror still resolves it from the registry. A mirror
+  node with no `resolved` but the patched `integrity` (what npm 7–12
+  `npm install` leaves on a vendored v2 lock, since npm never writes a
+  `file:` `resolved` there) still counts as wired for `vex` and
+  `vendor --check`: npm 6 fails closed on that pin. Vendoring
   needs a lockfileVersion 2/3 lock (npm 6 still installs a vendored v2 lock
   from its legacy mirror, alias nodes included) and rewires both locks in npm
   12's dual-lock state. Majors 6–12 are measured in
@@ -271,8 +292,10 @@ to first-party source: an npm, Yarn, pnpm or Bun workspace member, a
 `file:` or `link:` directory dependency, or an `npm link` target. That
 source is not an installed copy of the registry package, and no reinstall
 restores it, so it is never overwritten. Patch it directly instead (vendored
-mode refuses it the same way, with `vendor_workspace_member`). Links into a
-store inside a `node_modules` tree, including a workspace member's link
+mode refuses it the same way, with `vendor_workspace_member`; when an npm lock
+also holds a registry copy of the same `name@version`, that copy is still
+vendored and the local source is skipped with `vendor_workspace_member_skipped`).
+Links into a store inside a `node_modules` tree, including a workspace member's link
 into the root `node_modules/.pnpm`, are patched as usual. So are links into
 Yarn's pnpm-linker store relocated outside `node_modules`, but only for an
 active Yarn pnpm install (a `yarn.lock`, and `nodeLinker: pnpm` with

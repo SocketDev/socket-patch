@@ -2744,3 +2744,42 @@ async fn scan_agent_json_nested_apply_failure_reaches_the_apply_block() {
     );
     assert_eq!(std::fs::read(member.join("index.js")).unwrap(), b"before\n",);
 }
+
+/// `scan --mode agent --json` over an installed file a local edit changed
+/// (neither beforeHash nor afterHash): the default policy overwrites it,
+/// and the `apply` block's `warnings[]` must report that overwrite — the
+/// same `content_mismatch_overwritten` warning `apply --json` and the human
+/// scan print — instead of dropping it (#1004).
+#[tokio::test]
+async fn scan_agent_json_mismatch_overwrite_reaches_the_apply_block() {
+    let mock = MockServer::start().await;
+    let purl = "pkg:npm/locally-edited@1.0.0";
+    mount_one_patch_api(&mock, purl, b"before\n").await;
+
+    let tmp = tempfile::tempdir().unwrap();
+    write_root_package_json(tmp.path());
+    write_npm_package(
+        tmp.path(),
+        "locally-edited",
+        "1.0.0",
+        b"before\n// local edit\n",
+    );
+
+    let (code, stdout, stderr) = run_scan_agent(tmp.path(), &mock.uri(), &["--json"]);
+    assert_eq!(code, 0, "stdout={stdout}\nstderr={stderr}");
+    let v: serde_json::Value = serde_json::from_str(stdout.trim()).expect("one JSON envelope");
+    let apply = &v["apply"];
+    assert_eq!(apply["applied"], 1, "{v}");
+    let warned = apply["warnings"].as_array().is_some_and(|ws| {
+        ws.iter().filter_map(|w| w.as_str()).any(|w| {
+            w.starts_with("(content_mismatch_overwritten) ")
+                && w.contains(purl)
+                && w.contains("package/index.js")
+        })
+    });
+    assert!(warned, "the overwrite must be reported: {v}");
+    assert_eq!(
+        std::fs::read(tmp.path().join("node_modules/locally-edited/index.js")).unwrap(),
+        b"after\n"
+    );
+}
