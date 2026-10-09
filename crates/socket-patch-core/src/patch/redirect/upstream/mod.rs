@@ -917,7 +917,10 @@ mod tests {
     fn bun_lock_remedies_name_the_forced_reinstall() {
         for file in ["bun.lockb", "bun.lock", "packages/app/bun.lockb"] {
             let remedy = checkout_remedy(&[file.to_string()]);
-            assert!(remedy.contains(&format!("`git checkout -- {file}`")), "{remedy}");
+            assert!(
+                remedy.contains(&format!("`git checkout -- {file}`")),
+                "{remedy}"
+            );
             assert!(remedy.ends_with(
                 ", then run `bun install --force` (a plain `bun install` keeps the patched copy)"
             ), "{remedy}");

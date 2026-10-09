@@ -43,6 +43,8 @@ on:
       - 'scripts/vlt-historical-integrity.json'
       - 'scripts/gen-vlt-collation-golden.mjs'
       - 'scripts/ci-vlt-proof-suites.py'
+      - 'scripts/vlt-compat-gate.py'
+      - 'scripts/tests/test_vlt_compat_gate.py'
       - '.github/workflows/ci.yml'
       - 'scripts/tests/test_ci_vlt_rows.py'
   push:
@@ -84,6 +86,8 @@ on:
       - 'scripts/vlt-historical-integrity.json'
       - 'scripts/gen-vlt-collation-golden.mjs'
       - 'scripts/ci-vlt-proof-suites.py'
+      - 'scripts/vlt-compat-gate.py'
+      - 'scripts/tests/test_vlt_compat_gate.py'
       - '.github/workflows/ci.yml'
       - 'scripts/tests/test_ci_vlt_rows.py'
   schedule:
@@ -136,8 +140,41 @@ jobs:
       - name: Every era, suite and OS is covered
         run: python3 -B -m unittest scripts/tests/test_ci_vlt_rows.py -v
 
-  build:
+  # Both filters list ci.yml for its vlt `e2e` rows, which install-proof
+  # leaves out. A PR or push whose only matching change is ci.yml, with
+  # those rows untouched, would rerun the matrix exactly as on the base:
+  # matrix-coverage above still checks it, the rest is skipped.
+  changes:
     if: github.event.pull_request.draft != true
+    runs-on: ubuntu-latest
+    timeout-minutes: 5
+    outputs:
+      matrix: ${{ steps.gate.outputs.matrix }}
+    steps:
+      - uses: actions/checkout@de0fac2e4500dabe0009e67214ff5f5447ce83dd # v6.0.2
+        with:
+          persist-credentials: false
+          # A PR's merge commit has the base it was merged onto as parent 1.
+          fetch-depth: 2
+      - id: gate
+        env:
+          EVENT_NAME: ${{ github.event_name }}
+          PUSH_BEFORE: ${{ github.event.before }}
+        run: |
+          set -euo pipefail
+          case "$EVENT_NAME" in
+            pull_request) base=HEAD^1 ;;
+            push) base="$PUSH_BEFORE" ;;
+            *) base='' ;;
+          esac
+          if [ -n "$base" ] && ! git rev-parse --verify --quiet "$base^{commit}" >/dev/null; then
+            git fetch --quiet --depth 1 origin "$base" || true
+          fi
+          python3 -B scripts/vlt-compat-gate.py --event "$EVENT_NAME" --base "$base" >> "$GITHUB_OUTPUT"
+
+  build:
+    needs: changes
+    if: needs.changes.outputs.matrix == 'true'
     strategy:
       fail-fast: false
       matrix:
@@ -373,7 +410,8 @@ jobs:
     steps: *install-proof-steps
 
   plan:
-    if: github.event.pull_request.draft != true
+    needs: changes
+    if: needs.changes.outputs.matrix == 'true'
     runs-on: ubuntu-latest
     timeout-minutes: 5
     outputs:
@@ -468,8 +506,8 @@ jobs:
           retention-days: 14
 
   lock-diff:
-    needs: native
-    if: ${{ !cancelled() }}
+    needs: [changes, native]
+    if: ${{ !cancelled() && needs.changes.outputs.matrix == 'true' }}
     runs-on: ubuntu-latest
     timeout-minutes: 10
     steps:
