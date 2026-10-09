@@ -240,6 +240,25 @@ fn remove_never_modifies_the_cwd_ledger() {
     assert!(!ledger(&f.b).exists(), "{}", r.out);
 }
 
+/// A manifest file outside any `.socket/` directory relocates only the
+/// manifest: the project, and so the ledger rollback reverts, stays `--cwd`.
+#[test]
+fn a_bare_manifest_file_keeps_the_cwd_project() {
+    let f = fixture();
+    write_entry(&f.a);
+    std::fs::create_dir_all(f.a.join("state")).unwrap();
+    let out = hermetic::binary_command()
+        .args(["rollback", "--json", "--offline", "--cwd"])
+        .arg(&f.a)
+        .args(["--manifest-path", "state/patches.json"])
+        .current_dir(&f.a)
+        .output()
+        .expect("run socket-patch");
+    let text = String::from_utf8_lossy(&out.stdout);
+    assert_eq!(out.status.code(), Some(0), "{text}");
+    assert!(!ledger(&f.a).exists(), "a's entry is reverted\n{text}");
+}
+
 /// Vendored and hosted modes write `--cwd`'s lockfiles: with a manifest in
 /// another project there is no single project to write, so they refuse
 /// before touching either (usage error, exit 2).

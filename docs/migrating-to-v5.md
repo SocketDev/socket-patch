@@ -31,6 +31,8 @@ existing scripts against the new CLI; the [changelog](../CHANGELOG.md) and
   vendored `scan` / `get` and `vendor` (other than `--check`) rewire `--cwd`'s
   lockfiles, so they refuse a manifest in another project with
   `manifest_path_foreign_project` (exit 2). Run them from the manifest's project.
+  A manifest file outside a `.socket/` directory (`--manifest-path
+  state/patches.json`) moves only the manifest; the project stays `--cwd`.
 - `list` succeeds on an empty project. Hosted results identify lockfiles instead
   of a hosted ledger. Scripts must use the updated
   [JSON shapes and exit codes](../crates/socket-patch-cli/CLI_CONTRACT.md#json-output-shapes).
