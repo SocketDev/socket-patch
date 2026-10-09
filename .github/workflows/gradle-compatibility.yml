@@ -112,7 +112,7 @@ jobs:
     # Whether this run needs the ubuntu `extras`: always off pull_request, and
     # on a PR only when it touches Gradle code.
     if: github.event.pull_request.draft != true
-    runs-on: ubuntu-latest
+    runs-on: ${{ vars.DISABLE_DEPOT_RUNNERS == 'true' && 'ubuntu-latest' || 'depot-ubuntu-24.04-4' }}
     timeout-minutes: 5
     outputs:
       gradle_core: ${{ steps.diff.outputs.gradle_core }}
@@ -160,7 +160,7 @@ jobs:
           - os: ${{ github.event_name == 'pull_request' && 'macos-latest' || '' }}
           # On a PR only the ubuntu `extras` use the ubuntu build.
           - os: ${{ github.event_name == 'pull_request' && needs.changes.outputs.gradle_core != 'true' && 'ubuntu-latest' || '' }}
-    runs-on: ${{ matrix.os }}
+    runs-on: ${{ vars.DISABLE_DEPOT_RUNNERS != 'true' && (matrix.os == 'ubuntu-latest' && 'depot-ubuntu-24.04-4' || matrix.os == 'ubuntu-22.04' && 'depot-ubuntu-22.04-4') || matrix.os }}
     timeout-minutes: 60
     env:
       CARGO_PROFILE_DEV_DEBUG: '0'
@@ -240,7 +240,7 @@ jobs:
           # Boundary lines retain every hosted test on Windows on PRs.
           - {os: "${{ github.event_name == 'pull_request' && 'windows-latest' || '' }}", gradle: '7.6.6', mode: hosted}
           - {os: "${{ github.event_name == 'pull_request' && 'windows-latest' || '' }}", gradle: '8.14.3', mode: hosted}
-    runs-on: ${{ matrix.os }}
+    runs-on: ${{ vars.DISABLE_DEPOT_RUNNERS != 'true' && (matrix.os == 'ubuntu-latest' && 'depot-ubuntu-24.04-4' || matrix.os == 'ubuntu-22.04' && 'depot-ubuntu-22.04-4') || matrix.os }}
     timeout-minutes: 60
     steps: &cell-steps
       - name: Checkout
@@ -428,7 +428,7 @@ jobs:
           # Only the suite that owns those tests: e2e_vendor_jvm_build has none,
           # and every landed suite a cell runs must run a test.
           - {os: ubuntu-latest, gradle: '8.14.3', java: '21', mode: vendor, label: real-central, real_central: '1', suites: 'e2e_vendor_gradle_build', test_filter: 'gradle_vendor_511 gradle_vendor_487'}
-    runs-on: ${{ matrix.os }}
+    runs-on: ${{ vars.DISABLE_DEPOT_RUNNERS != 'true' && (matrix.os == 'ubuntu-latest' && 'depot-ubuntu-24.04-4' || matrix.os == 'ubuntu-22.04' && 'depot-ubuntu-22.04-4') || matrix.os }}
     timeout-minutes: 60
     continue-on-error: ${{ matrix.record_only == 'true' }}
     steps: *cell-steps
