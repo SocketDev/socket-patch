@@ -1355,7 +1355,11 @@ mod tests {
         .await;
         let hits = stale_cache(&warnings);
         assert_eq!(hits.len(), 1, "{warnings:?}");
-        let path = tmp.path().join("vendor/cache").join("rails-7.0.0.gem");
+        let path = tmp
+            .path()
+            .join("vendor")
+            .join("cache")
+            .join("rails-7.0.0.gem");
         assert!(hits[0].contains(&path.display().to_string()), "{}", hits[0]);
         assert!(hits[0].contains("pkg:gem/rails@7.0.0"), "{}", hits[0]);
         assert!(hits[0].contains("non-upstream"), "{}", hits[0]);
@@ -1406,7 +1410,11 @@ mod tests {
         .await;
         let hits = stale_cache(&warnings);
         assert_eq!(hits.len(), 1, "{warnings:?}");
-        let path = tmp.path().join("gems/cache").join("rails-7.0.0.gem");
+        let path = tmp
+            .path()
+            .join("gems")
+            .join("cache")
+            .join("rails-7.0.0.gem");
         assert!(hits[0].contains(&path.display().to_string()), "{}", hits[0]);
     }
 
@@ -1457,7 +1465,11 @@ mod tests {
         .await;
         let hits = stale_cache(&warnings);
         assert_eq!(hits.len(), 1, "{warnings:?}");
-        let path = tmp.path().join("vendor/cache").join("rails-7.0.0.gem");
+        let path = tmp
+            .path()
+            .join("vendor")
+            .join("cache")
+            .join("rails-7.0.0.gem");
         assert!(hits[0].contains(&path.display().to_string()), "{}", hits[0]);
         assert!(hits[0].contains("could not be checked"), "{}", hits[0]);
     }

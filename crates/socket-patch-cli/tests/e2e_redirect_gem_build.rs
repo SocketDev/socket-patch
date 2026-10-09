@@ -3353,7 +3353,8 @@ fn unwind_names_the_patched_cached_archive(fx: &RedirectFixture, command: &str) 
         String::from_utf8_lossy(&cache.stderr)
     );
     let archive = dir
-        .join("vendor/cache")
+        .join("vendor")
+        .join("cache")
         .join(format!("{DEP}-{DEP_VERSION}.gem"));
     assert!(
         archive.is_file(),
