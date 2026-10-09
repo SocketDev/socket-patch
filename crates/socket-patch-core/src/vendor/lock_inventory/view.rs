@@ -1175,8 +1175,20 @@ mod tests {
         // Rewritten in place with the same length.
         std::fs::write(root.join("a.lock"), "two").unwrap();
         assert!(!set.unchanged(), "an in-place rewrite");
-        // Replaced (rename over) with the same bytes.
+        // Replaced (rename over) with the same bytes. Backdate the file
+        // first so its stats alone must vouch for it: on Windows a file's
+        // identity is only its creation time, so a replacement stamped in
+        // the same timestamp tick as the write it replaces would keep every
+        // stat (and the same bytes pass the racy content check).
+        std::fs::File::options()
+            .write(true)
+            .open(root.join("a.lock"))
+            .unwrap()
+            .set_modified(std::time::SystemTime::now() - std::time::Duration::from_secs(3600))
+            .unwrap();
         let set = recorded(root, read).await.unwrap();
+        assert!(set.racy.is_empty(), "backdated");
+        assert!(set.unchanged());
         std::fs::write(root.join("a.tmp"), "two").unwrap();
         std::fs::rename(root.join("a.tmp"), root.join("a.lock")).unwrap();
         assert!(!set.unchanged(), "a replacement");
