@@ -979,32 +979,26 @@ jobs:
           # hosted redirect must drop); 2.10 does not. The exact-release
           # matrix, 2.9.8 and macOS/Windows included, is
           # composer-compatibility.yml.
-          - {os: ubuntu-latest, suite: e2e_vendor_composer_build, composer: '2'}
-          - {os: ubuntu-latest, suite: e2e_vendor_composer_build, composer: '2.2'}
-          - {os: ubuntu-latest, suite: e2e_vendor_composer_build, composer: '1'}
-          - {os: ubuntu-latest, suite: e2e_redirect_composer_build, composer: '2'}
-          - {os: ubuntu-latest, suite: e2e_redirect_composer_build, composer: '2.2'}
-          - {os: ubuntu-latest, suite: e2e_redirect_composer_build, composer: '1'}
+          # Both capstones share one leg per composer line: the setup is
+          # identical and the run step loops over `suite`.
+          - {os: ubuntu-latest, suite: e2e_vendor_composer_build e2e_redirect_composer_build, composer: '2'}
+          - {os: ubuntu-latest, suite: e2e_vendor_composer_build e2e_redirect_composer_build, composer: '2.2'}
+          - {os: ubuntu-latest, suite: e2e_vendor_composer_build e2e_redirect_composer_build, composer: '1'}
           # Real-bundler gem capstones, one leg per bundler era. Boundaries:
           # 1.17/2.1 merged GEM section, 2.2 separate sections, 2.5 last
           # pre-CHECKSUMS, 2.6 CHECKSUMS, 4.0.15/4.0.21 before/after the
           # strict frozen check (rubygems#9750). bundler <= 2.2 needs
           # Ruby <= 3.3 and 1.17-2.1 need Ruby <= 3.1 (`untaint`). 2.7.2
           # (no boundary of its own) is in e2e-full.
-          - {os: ubuntu-latest, suite: e2e_redirect_gem_build, ruby: '3.1', bundler: '1.17.3'}
-          - {os: ubuntu-latest, suite: e2e_redirect_gem_build, ruby: '3.1', bundler: '2.1.4'}
-          - {os: ubuntu-latest, suite: e2e_redirect_gem_build, ruby: '3.1', bundler: '2.2.33'}
-          - {os: ubuntu-latest, suite: e2e_redirect_gem_build, ruby: '3.3', bundler: '2.5.23'}
-          - {os: ubuntu-latest, suite: e2e_redirect_gem_build, ruby: '3.3', bundler: '2.6.9'}
-          - {os: ubuntu-latest, suite: e2e_redirect_gem_build, ruby: '3.4', bundler: '4.0.15'}
-          - {os: ubuntu-latest, suite: e2e_redirect_gem_build, ruby: '3.4', bundler: '4.0.21'}
-          - {os: ubuntu-latest, suite: e2e_vendor_gem_build, ruby: '3.1', bundler: '1.17.3'}
-          - {os: ubuntu-latest, suite: e2e_vendor_gem_build, ruby: '3.1', bundler: '2.1.4'}
-          - {os: ubuntu-latest, suite: e2e_vendor_gem_build, ruby: '3.1', bundler: '2.2.33'}
-          - {os: ubuntu-latest, suite: e2e_vendor_gem_build, ruby: '3.3', bundler: '2.5.23'}
-          - {os: ubuntu-latest, suite: e2e_vendor_gem_build, ruby: '3.3', bundler: '2.6.9'}
-          - {os: ubuntu-latest, suite: e2e_vendor_gem_build, ruby: '3.4', bundler: '4.0.15'}
-          - {os: ubuntu-latest, suite: e2e_vendor_gem_build, ruby: '3.4', bundler: '4.0.21'}
+          # Hosted and vendored share each era's leg (one Ruby + bundler
+          # setup; the run step loops over `suite`).
+          - {os: ubuntu-latest, suite: e2e_redirect_gem_build e2e_vendor_gem_build, ruby: '3.1', bundler: '1.17.3'}
+          - {os: ubuntu-latest, suite: e2e_redirect_gem_build e2e_vendor_gem_build, ruby: '3.1', bundler: '2.1.4'}
+          - {os: ubuntu-latest, suite: e2e_redirect_gem_build e2e_vendor_gem_build, ruby: '3.1', bundler: '2.2.33'}
+          - {os: ubuntu-latest, suite: e2e_redirect_gem_build e2e_vendor_gem_build, ruby: '3.3', bundler: '2.5.23'}
+          - {os: ubuntu-latest, suite: e2e_redirect_gem_build e2e_vendor_gem_build, ruby: '3.3', bundler: '2.6.9'}
+          - {os: ubuntu-latest, suite: e2e_redirect_gem_build e2e_vendor_gem_build, ruby: '3.4', bundler: '4.0.15'}
+          - {os: ubuntu-latest, suite: e2e_redirect_gem_build e2e_vendor_gem_build, ruby: '3.4', bundler: '4.0.21'}
           # The live-API smoke suites (e2e_npm, e2e_pypi, e2e_gem,
           # e2e_scan) are intentionally NOT in the PR matrix — their
           # `#[ignore]`-gated tests hit the real public proxy at
@@ -1083,47 +1077,29 @@ jobs:
           # latest release alone cannot prove the rewrite + fresh install
           # round-trip on the locks real projects commit. 1.1.45 = last v0
           # writer, 1.2.23 = v1, 1.3.14 = last pre-v2 default, 1.4.2 = v2.
+          #
+          # One leg per bun release runs all three suites (the run step
+          # loops over `suite`); e2e_bun_lockb keeps its own legs because
+          # the SOCKET_PATCH_BUN_LOCKB_* gates key on the row's suite.
           - os: ubuntu-latest
-            suite: e2e_redirect_bun_build
+            suite: e2e_redirect_bun_build e2e_vendor_bun_build mode_migration_bun
             bun: '1.4.2'
             test_filter: --include-ignored
           - os: ubuntu-latest
-            suite: e2e_redirect_bun_build
+            suite: e2e_redirect_bun_build e2e_vendor_bun_build mode_migration_bun
             bun: '1.1.45'
             test_filter: --include-ignored
           - os: ubuntu-latest
-            suite: e2e_redirect_bun_build
+            suite: e2e_redirect_bun_build e2e_vendor_bun_build mode_migration_bun
             bun: '1.2.23'
             test_filter: --include-ignored
           - os: ubuntu-latest
-            suite: e2e_vendor_bun_build
-            bun: '1.4.2'
-            test_filter: --include-ignored
-          - os: ubuntu-latest
-            suite: e2e_vendor_bun_build
-            bun: '1.1.45'
-            test_filter: --include-ignored
-          - os: ubuntu-latest
-            suite: e2e_vendor_bun_build
-            bun: '1.2.23'
-            test_filter: --include-ignored
-          - os: ubuntu-latest
-            suite: mode_migration_bun
-            bun: '1.4.2'
-            test_filter: --include-ignored
-          - os: ubuntu-latest
-            suite: mode_migration_bun
+            suite: e2e_redirect_bun_build e2e_vendor_bun_build mode_migration_bun
             bun: '1.3.14'
             test_filter: --include-ignored
-          # Manifest-less VEX era legs: the last pre-v2 text-lock writer for
-          # the hosted/vendored capstones, the v0/v1 writers for the takeover
-          # suite, and the binary bun.lockb era (1.0 / 1.1 lines) through
-          # e2e_bun_lockb, which reads the SOCKET_PATCH_BUN_LOCKB_* gates
-          # exported for it below.
-          - {os: ubuntu-latest, suite: e2e_redirect_bun_build, bun: '1.3.14', test_filter: --include-ignored}
-          - {os: ubuntu-latest, suite: e2e_vendor_bun_build, bun: '1.3.14', test_filter: --include-ignored}
-          - {os: ubuntu-latest, suite: mode_migration_bun, bun: '1.1.45', test_filter: --include-ignored}
-          - {os: ubuntu-latest, suite: mode_migration_bun, bun: '1.2.23', test_filter: --include-ignored}
+          # The binary bun.lockb era (1.0 / 1.1 lines) through e2e_bun_lockb,
+          # which reads the SOCKET_PATCH_BUN_LOCKB_* gates exported for it
+          # below.
           - {os: ubuntu-latest, suite: e2e_bun_lockb, bun: '1.0.36', test_filter: --include-ignored}
           - {os: ubuntu-latest, suite: e2e_bun_lockb, bun: '1.1.45', test_filter: --include-ignored}
           # Bun >= 1.4 migrating a hosted workspace bun.lockb to bun.lock
@@ -1227,16 +1203,14 @@ jobs:
           # 3.9 (trusted checksums), 4.0 rc. Hosted also runs both sides of
           # the trusted-checksums floor: 3.9.3 (last release that ignores
           # the .mvn/checksums pin) and 3.9.4 (first that enforces it).
-          - {os: ubuntu-latest, suite: e2e_redirect_maven_build, jvm_tool: maven, maven: '3.6.3'}
-          - {os: ubuntu-latest, suite: e2e_redirect_maven_build, jvm_tool: maven, maven: '3.8.9'}
+          # Lines that run both capstones run them in one leg (one Maven
+          # install; the run step loops over `suite`).
+          - {os: ubuntu-latest, suite: e2e_redirect_maven_build e2e_vendor_maven_build, jvm_tool: maven, maven: '3.6.3'}
+          - {os: ubuntu-latest, suite: e2e_redirect_maven_build e2e_vendor_maven_build, jvm_tool: maven, maven: '3.8.9'}
+          - {os: ubuntu-latest, suite: e2e_redirect_maven_build e2e_vendor_maven_build, jvm_tool: maven, maven: '3.9.16'}
+          - {os: ubuntu-latest, suite: e2e_redirect_maven_build e2e_vendor_maven_build, jvm_tool: maven, maven: '4.0.0-rc-6'}
           - {os: ubuntu-latest, suite: e2e_redirect_maven_build, jvm_tool: maven, maven: '3.9.3'}
           - {os: ubuntu-latest, suite: e2e_redirect_maven_build, jvm_tool: maven, maven: '3.9.4'}
-          - {os: ubuntu-latest, suite: e2e_redirect_maven_build, jvm_tool: maven, maven: '3.9.16'}
-          - {os: ubuntu-latest, suite: e2e_redirect_maven_build, jvm_tool: maven, maven: '4.0.0-rc-6'}
-          - {os: ubuntu-latest, suite: e2e_vendor_maven_build, jvm_tool: maven, maven: '3.6.3'}
-          - {os: ubuntu-latest, suite: e2e_vendor_maven_build, jvm_tool: maven, maven: '3.8.9'}
-          - {os: ubuntu-latest, suite: e2e_vendor_maven_build, jvm_tool: maven, maven: '3.9.16'}
-          - {os: ubuntu-latest, suite: e2e_vendor_maven_build, jvm_tool: maven, maven: '4.0.0-rc-6'}
           - {os: ubuntu-latest, suite: e2e_vendor_jvm_build, jvm_tool: maven, maven: '3.6.3', test_filter: '--ignored maven_reactor'}
           - {os: ubuntu-latest, suite: e2e_vendor_jvm_build, jvm_tool: maven, maven: '3.8.9', test_filter: '--ignored maven_reactor'}
           - {os: ubuntu-latest, suite: e2e_vendor_jvm_build, jvm_tool: maven, maven: '3.9.2', test_filter: '--ignored maven_reactor'}
@@ -1771,15 +1745,7 @@ jobs:
           - os: windows-latest
             suite: e2e_redirect_rush_sim
           - os: windows-latest
-            suite: e2e_redirect_bun_build
-            bun: '1.4.2'
-            test_filter: --include-ignored
-          - os: windows-latest
-            suite: e2e_vendor_bun_build
-            bun: '1.4.2'
-            test_filter: --include-ignored
-          - os: windows-latest
-            suite: mode_migration_bun
+            suite: e2e_redirect_bun_build e2e_vendor_bun_build mode_migration_bun
             bun: '1.4.2'
             test_filter: --include-ignored
           - {os: windows-latest, suite: e2e_redirect_vlt_build, vlt: '1.2.0', test_filter: --include-ignored vlt_pinned_matrix}
@@ -1866,8 +1832,7 @@ jobs:
       fail-fast: false
       matrix:
         include:
-          - {os: ubuntu-latest, suite: e2e_redirect_gem_build, ruby: '3.3', bundler: '2.7.2'}
-          - {os: ubuntu-latest, suite: e2e_vendor_gem_build, ruby: '3.3', bundler: '2.7.2'}
+          - {os: ubuntu-latest, suite: e2e_redirect_gem_build e2e_vendor_gem_build, ruby: '3.3', bundler: '2.7.2'}
           - {os: ubuntu-latest, suite: e2e_redirect_uv_build, uv: '0.2.37'}
           - {os: ubuntu-latest, suite: e2e_redirect_uv_build, uv: '0.3.5'}
           - {os: ubuntu-latest, suite: e2e_redirect_uv_build, uv: '0.4.30'}
