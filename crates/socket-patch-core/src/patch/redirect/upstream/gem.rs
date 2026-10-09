@@ -619,6 +619,7 @@ pub(crate) async fn restore(
         let mut lock: Option<String> = lock_raw.as_deref().map(|t| to_lf(t).into_owned());
         let mut manifest = manifest_raw.clone();
         let globals = manifest.as_deref().map(global_sources).unwrap_or_default();
+        let handled_before = result.handled.clone();
         for pin in pins {
             if result.refused.contains_key(&pin.uuid) {
                 continue;
@@ -658,8 +659,13 @@ pub(crate) async fn restore(
                 Err(why) => result.refuse(&pin.uuid, why),
             }
         }
+        // The pins this pair restored, each judged once against its own
+        // restored lock.
         for pin in pins {
-            if !result.handled.contains(&pin.uuid) || result.refused.contains_key(&pin.uuid) {
+            if !result.handled.contains(&pin.uuid)
+                || handled_before.contains(&pin.uuid)
+                || result.refused.contains_key(&pin.uuid)
+            {
                 continue;
             }
             if let Some(warning) = stale_cache_warning(view.root(), pin, lock.as_deref(), ctx).await
@@ -1454,6 +1460,41 @@ mod tests {
         let path = tmp.path().join("vendor/cache").join("rails-7.0.0.gem");
         assert!(hits[0].contains(&path.display().to_string()), "{}", hits[0]);
         assert!(hits[0].contains("could not be checked"), "{}", hits[0]);
+    }
+
+    /// A gem restored in both a `Gemfile` and a `gems.rb` pair shares one
+    /// cache dir: one warning, not one per pair.
+    #[tokio::test]
+    async fn restore_warns_once_for_both_lock_spellings() {
+        let upstream_sha = sha_hex(b"upstream gem");
+        let client = super::super::UpstreamClient::new(true);
+        client
+            .seed_rubygems_sha256("rails", "7.0.0", &upstream_sha)
+            .await;
+        let tmp = tempfile::tempdir().unwrap();
+        let root = tmp.path();
+        let pair = hosted_pair(true, &upstream_sha);
+        std::fs::write(root.join("Gemfile"), &pair["Gemfile"]).unwrap();
+        std::fs::write(root.join("Gemfile.lock"), &pair["Gemfile.lock"]).unwrap();
+        std::fs::write(root.join("gems.rb"), &pair["Gemfile"]).unwrap();
+        std::fs::write(root.join("gems.locked"), &pair["Gemfile.lock"]).unwrap();
+        std::fs::create_dir_all(root.join("vendor/cache")).unwrap();
+        std::fs::write(root.join("vendor/cache/rails-7.0.0.gem"), b"patched gem").unwrap();
+        let pin = HostedPin {
+            purl: "pkg:gem/rails@7.0.0".into(),
+            uuid: UUID.into(),
+            files: vec![
+                "Gemfile".into(),
+                "Gemfile.lock".into(),
+                "gems.locked".into(),
+                "gems.rb".into(),
+            ],
+        };
+        let ctx = ctx_with(&client);
+        let mut view = View::new(root);
+        let r = restore(&mut view, &[&pin], &pin.files, &ctx).await;
+        assert!(r.refused.is_empty(), "{:?}", r.refused);
+        assert_eq!(stale_cache(&r.warnings).len(), 1, "{:?}", r.warnings);
     }
 
     #[test]
