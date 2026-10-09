@@ -77,9 +77,9 @@ use crate::formats::yarn::patterns::{
 use crate::formats::yarn::source::{classic_copy_source, CopySource};
 use crate::formats::yarn::stanzas::{stanza_key, BerryStanzas};
 #[cfg(test)]
-mod pnpm_equivalence_tests;
-#[cfg(test)]
 mod platform_wheel_tests;
+#[cfg(test)]
+mod pnpm_equivalence_tests;
 mod poetry;
 mod pypi_takeover;
 pub use pypi_takeover::preflight_pypi_takeover;
@@ -565,7 +565,7 @@ pub fn rewrite_registry_redirect_with_pipenv_version(
         bun_lockb_present,
         &std::collections::BTreeSet::new(),
         &std::collections::BTreeSet::new(),
-     &yarnrc::OuterYarnMirror::default(),
+        &yarnrc::OuterYarnMirror::default(),
     )
 }
 
@@ -6773,8 +6773,10 @@ fn rewrite_maven_pom(
     // One pass over the pom's repositories: `(id, url)` of each, which also
     // answers the per-dep URL-refresh check below while the pom is still
     // unchanged (a no-op rescan then never re-scans the pom per dep).
-    let original_repos: Vec<(String, Option<String>)> =
-        pom.as_deref().map(maven_repository_ids_and_urls).unwrap_or_default();
+    let original_repos: Vec<(String, Option<String>)> = pom
+        .as_deref()
+        .map(maven_repository_ids_and_urls)
+        .unwrap_or_default();
     let hosted_repo_generations: std::collections::BTreeSet<String> = original_repos
         .iter()
         .filter_map(|(id, _)| generation::pin_name_uuid(id, false).map(str::to_string))
@@ -10846,7 +10848,10 @@ mod tests {
             &[(YARNRC_REL, "yarn-offline-mirror: false\n")],
             &[(YARNRC_REL, "yarn-offline-mirror:\n")],
             &[(YARNRC_REL, "yarn-offline-mirror \"\"\n")],
-            &[(YARNRC_REL, "yarn-offline-mirror-pruning true\n# yarn-offline-mirror ./m\n")],
+            &[(
+                YARNRC_REL,
+                "yarn-offline-mirror-pruning true\n# yarn-offline-mirror ./m\n",
+            )],
             &[(npmrc::NPMRC_REL, "[scope]\nyarn-offline-mirror=./m\n")],
             &[
                 (YARNRC_REL, "yarn-offline-mirror false\n"),
@@ -10862,7 +10867,10 @@ mod tests {
             let mut r = RewriteResult::default();
             rewrite_yarn_classic(&files, std::slice::from_ref(&ovr), &mut r);
             assert!(r.warnings.is_empty(), "{rcs:?}: {:?}", r.warnings);
-            assert!(r.files["yarn.lock"].contains("http://p.test/lp.tgz"), "{rcs:?}");
+            assert!(
+                r.files["yarn.lock"].contains("http://p.test/lp.tgz"),
+                "{rcs:?}"
+            );
             assert!(r.refused_yarn_classic_uuids.is_empty(), "{rcs:?}");
         }
     }
@@ -10887,7 +10895,10 @@ mod tests {
         rewrite_yarn_classic(&files, std::slice::from_ref(&other), &mut r);
         assert!(r.refused_yarn_classic_uuids.is_empty());
         assert_eq!(
-            r.warnings.iter().map(|w| w.code.as_str()).collect::<Vec<_>>(),
+            r.warnings
+                .iter()
+                .map(|w| w.code.as_str())
+                .collect::<Vec<_>>(),
             ["redirect_yarn_classic_entry_not_found"]
         );
     }

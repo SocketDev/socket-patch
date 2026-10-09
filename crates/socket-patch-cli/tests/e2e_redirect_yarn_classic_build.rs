@@ -900,7 +900,10 @@ async fn classic_offline_mirror_refuses_hosted_and_keeps_installs_working() {
         return;
     };
     assert!(
-        fx.proj.join("mirror").join(format!("{DEP}-{DEP_VERSION}.tgz")).is_file(),
+        fx.proj
+            .join("mirror")
+            .join(format!("{DEP}-{DEP_VERSION}.tgz"))
+            .is_file(),
         "the fixture install must populate the offline mirror"
     );
     let fresh = fx.tmp.path().join("fresh");
@@ -926,7 +929,11 @@ async fn classic_offline_mirror_refuses_hosted_and_keeps_installs_working() {
             String::from_utf8_lossy(&ci.stderr)
         );
         assert!(
-            !fresh.join("node_modules").join(DEP).join("index.js").exists(),
+            !fresh
+                .join("node_modules")
+                .join(DEP)
+                .join("index.js")
+                .exists(),
             "yarn < 1.7 is expected to install nothing from the mirror"
         );
         return;
@@ -948,7 +955,10 @@ async fn classic_offline_mirror_refuses_hosted_and_keeps_installs_working() {
         );
         let installed =
             std::fs::read(fresh.join("node_modules").join(DEP).join("index.js")).unwrap();
-        assert_eq!(installed, fx.orig, "the untouched lock installs the upstream bytes");
+        assert_eq!(
+            installed, fx.orig,
+            "the untouched lock installs the upstream bytes"
+        );
         std::fs::remove_dir_all(fresh.join("node_modules")).unwrap();
     }
 }

@@ -66,9 +66,9 @@ use crate::rollout::stage::{
     classify, lookup_incomplete, mark_pinned, offers_from_results, Offers, RecordedIndex, Row,
     Stage, ROLLOUT_DEFERRED,
 };
+use crate::utils::purl_key::PurlKey;
 use discover::Provider;
 use stages::{Planned, RewriteRefused, Rewritten, StageOptions};
-use crate::utils::purl_key::PurlKey;
 
 /// `"<crate version>+<git sha or 'unknown'>"`; the sha comes from the
 /// `SOCKET_PATCH_GIT_SHA` build-time variable.

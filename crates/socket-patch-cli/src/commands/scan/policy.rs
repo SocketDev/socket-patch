@@ -237,7 +237,9 @@ impl ScanPolicy {
     }
 
     fn recorded_uuid(&self, purl: &str) -> Option<&str> {
-        self.recorded.get(&PurlKey::new(purl).into_string()).map(String::as_str)
+        self.recorded
+            .get(&PurlKey::new(purl).into_string())
+            .map(String::as_str)
     }
 
     /// Step 3: the root, ecosystem and package filters. Returns whether the
@@ -269,7 +271,10 @@ impl ScanPolicy {
         }
         if self.root_verdict.is_err() {
             // Already reported as the root's one entry.
-        } else if report.filtered_purls.insert(PurlKey::new(purl).into_string()) {
+        } else if report
+            .filtered_purls
+            .insert(PurlKey::new(purl).into_string())
+        {
             report.filtered.push(FilteredEntry {
                 purl: Some(PurlKey::new(purl).into_string()),
                 uuid: None,
@@ -284,7 +289,10 @@ impl ScanPolicy {
     /// Record the purls with a newer patch (`updates[]`), for
     /// `retained[].upgradeAvailable`.
     pub(crate) fn set_update_purls<'a>(&self, purls: impl IntoIterator<Item = &'a str>) {
-        self.report().update_purls = purls.into_iter().map(|p| PurlKey::new(p).into_string()).collect();
+        self.report().update_purls = purls
+            .into_iter()
+            .map(|p| PurlKey::new(p).into_string())
+            .collect();
     }
 
     /// Steps 5-6: group the tier-accessible offers, keep retained packages
@@ -298,7 +306,10 @@ impl ScanPolicy {
         {
             let report = self.report();
             for offer in accessible {
-                if report.retained_purls.contains(&PurlKey::new(&offer.purl).into_string()) {
+                if report
+                    .retained_purls
+                    .contains(&PurlKey::new(&offer.purl).into_string())
+                {
                     continue;
                 }
                 grouped.entry(offer.purl.clone()).or_default().push(offer);

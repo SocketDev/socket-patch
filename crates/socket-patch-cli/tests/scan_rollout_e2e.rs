@@ -1061,3 +1061,119 @@ async fn a_failed_detail_lookup_for_an_applied_package_does_not_freeze_new_rows(
         "the pin stays"
     );
 }
+
+/// Add `node_modules/<alias>` to `lock` as an `npm:` alias of `name@1.0.0`
+/// resolved from the registry (what `npm install <alias>@npm:<name>@1.0.0`
+/// writes), with the matching `package.json` dependency and installed dir.
+fn add_registry_alias(dir: &Path, lock: &str, alias: &str, name: &str) {
+    let spec = format!("npm:{name}@1.0.0");
+    let path = dir.join(lock);
+    let mut v: Value = serde_json::from_slice(&std::fs::read(&path).unwrap()).unwrap();
+    v["packages"][""]["dependencies"][alias] = json!(spec);
+    v["packages"][format!("node_modules/{alias}")] = json!({
+        "name": name,
+        "version": "1.0.0",
+        "resolved": format!("https://registry.npmjs.org/{name}/-/{name}-1.0.0.tgz"),
+        "integrity": "sha512-UPSTREAMupstream==",
+        "license": "MIT"
+    });
+    let mut bytes = serde_json::to_vec_pretty(&v).unwrap();
+    bytes.push(b'\n');
+    std::fs::write(&path, bytes).unwrap();
+    let manifest = dir.join("package.json");
+    let mut m: Value = serde_json::from_slice(&std::fs::read(&manifest).unwrap()).unwrap();
+    m["dependencies"][alias] = json!(spec);
+    std::fs::write(&manifest, serde_json::to_vec_pretty(&m).unwrap()).unwrap();
+    let pkg = dir.join("node_modules").join(alias);
+    std::fs::create_dir_all(&pkg).unwrap();
+    std::fs::write(
+        pkg.join("package.json"),
+        format!(r#"{{"name":"{name}","version":"1.0.0"}}"#),
+    )
+    .unwrap();
+    std::fs::write(pkg.join("index.js"), before(name)).unwrap();
+}
+
+/// REGRESSION (#1195): a pinned patch whose lock gains a second, unpinned
+/// copy of the same `name@version` (an `npm:` alias added after the pin)
+/// is still recorded in the project. Discovery withholds the pin from
+/// attestation (the copy installs unpatched), but a capped re-scan must
+/// read the row as ALREADY, not NEW: `--max-new-patches 0` must not defer
+/// it, and the re-scan rewires the new copy (the remedy `vex` names).
+#[tokio::test]
+async fn issue_1195_a_capped_rescan_rewires_an_unpinned_alias_copy() {
+    let mock = MockServer::start().await;
+    mount_api(&mock, |_| Grant::Granted).await;
+    let tmp = tempfile::tempdir().unwrap();
+    write_project(tmp.path(), &["roll-b"]);
+    let args = ["--mode", "hosted", "--patch-server-url", HOST];
+    run_json(tmp.path(), &mock, &args);
+    assert_eq!(pinned(tmp.path()), names(&["roll-b"]));
+
+    add_registry_alias(tmp.path(), "package-lock.json", "mz", "roll-b");
+    let v = run_json(
+        tmp.path(),
+        &mock,
+        &[
+            "--mode",
+            "hosted",
+            "--max-new-patches",
+            "0",
+            "--patch-server-url",
+            HOST,
+        ],
+    );
+    assert_eq!(counts(&v), (0, 0, 0, 1), "{v}");
+    assert!(deferred_names(&v).is_empty(), "{v}");
+    let lock = std::fs::read_to_string(tmp.path().join("package-lock.json")).unwrap();
+    assert_eq!(
+        lock.matches(&hosted_url("roll-b")).count(),
+        2,
+        "both copies are pinned: {lock}"
+    );
+}
+
+/// REGRESSION (#1195), dual-lock shape: with `npm-shrinkwrap.json` beside
+/// `package-lock.json`, a shrinkwrap restored to its unpinned version
+/// contests the package-lock pin. The pin is still recorded, so a capped
+/// re-scan reads ALREADY and rewires the shrinkwrap (npm <= 11 installs
+/// from it).
+#[tokio::test]
+async fn issue_1195_a_capped_rescan_rewires_an_unpinned_twin_lock() {
+    let mock = MockServer::start().await;
+    mount_api(&mock, |_| Grant::Granted).await;
+    let tmp = tempfile::tempdir().unwrap();
+    write_project(tmp.path(), &["roll-b"]);
+    let original = std::fs::read(tmp.path().join("package-lock.json")).unwrap();
+    std::fs::write(tmp.path().join("npm-shrinkwrap.json"), &original).unwrap();
+    let args = ["--mode", "hosted", "--patch-server-url", HOST];
+    run_json(tmp.path(), &mock, &args);
+    let shrinkwrap = || std::fs::read_to_string(tmp.path().join("npm-shrinkwrap.json")).unwrap();
+    assert!(
+        shrinkwrap().contains(&hosted_url("roll-b")),
+        "{}",
+        shrinkwrap()
+    );
+    assert_eq!(pinned(tmp.path()), names(&["roll-b"]));
+
+    std::fs::write(tmp.path().join("npm-shrinkwrap.json"), &original).unwrap();
+    let v = run_json(
+        tmp.path(),
+        &mock,
+        &[
+            "--mode",
+            "hosted",
+            "--max-new-patches",
+            "0",
+            "--patch-server-url",
+            HOST,
+        ],
+    );
+    assert_eq!(counts(&v), (0, 0, 0, 1), "{v}");
+    assert!(deferred_names(&v).is_empty(), "{v}");
+    assert!(
+        shrinkwrap().contains(&hosted_url("roll-b")),
+        "the shrinkwrap is rewired: {}",
+        shrinkwrap()
+    );
+}
