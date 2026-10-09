@@ -1,6 +1,6 @@
 [agent] Progress ledger for the scheduled Yarn classic (1.x) bug-hunt routine (label pm:yarn-classic).
 
-Last updated: 2026-10-08 (run 33), main `cf8b164`, latest release v4.0.0. Runs 5–33 added the cells in "Run 5 cells" through "Run 33 cells" below. Run 33 checked #1039 (the staged, atomic vendored→hosted takeover) and #1117 (BOM handling); the only new fail is #1158 (a takeover un-patches a vendored `npm:` alias copy beside a pinned direct copy). Run 32 checked #1057 (the yarn grammar refactor; it fixes the hosted half of #467), #1050 and #1029 with no regressions. #1013 / #1078 / #519 are closed by #1083 / #1033; run 31 verified the mirror fix cross-OS. Since run 28, #364, #921, #857, #884, #831, #974, #938 (#940) and #907 (#917) are closed by merged fixes, and #1071 (#1073) and #975 (#978) have landed too; the old `fail #364` cells now mean a project-level mirror is refused (pass), and #1115 (a mirror in a workspace member's `.yarnrc`) is the remaining mirror gap. The project-mode matrix below was measured on `f6b7fb9` (v4); cells marked "(v5)", the global matrix and the "v5 project-mode cells" list were re-run on v5.
+Last updated: 2026-10-09 (run 34), main `03b9418`, latest release v4.0.0. Run 34 re-ran the hosted / vendored / agent batteries after #1058 / #1147 / #1160 with no new yarn-only bug. On main a hosted scan with an `npm:` alias beside a direct copy now pins nothing (`redirect_unattributable`); open PR #1180 fixes that, #1158 and #1081 (verified at `46f1bc0`). Previously: Runs 5–33 added the cells in "Run 5 cells" through "Run 33 cells" below. Run 33 checked #1039 (the staged, atomic vendored→hosted takeover) and #1117 (BOM handling); the only new fail is #1158 (a takeover un-patches a vendored `npm:` alias copy beside a pinned direct copy). Run 32 checked #1057 (the yarn grammar refactor; it fixes the hosted half of #467), #1050 and #1029 with no regressions. #1013 / #1078 / #519 are closed by #1083 / #1033; run 31 verified the mirror fix cross-OS. Since run 28, #364, #921, #857, #884, #831, #974, #938 (#940) and #907 (#917) are closed by merged fixes, and #1071 (#1073) and #975 (#978) have landed too; the old `fail #364` cells now mean a project-level mirror is refused (pass), and #1115 (a mirror in a workspace member's `.yarnrc`) is the remaining mirror gap. The project-mode matrix below was measured on `f6b7fb9` (v4); cells marked "(v5)", the global matrix and the "v5 project-mode cells" list were re-run on v5.
 
 ## Coverage matrix
 
@@ -236,9 +236,16 @@ Other cells that pass on Linux 1.22.22 (some also on older releases; see the ent
 - **Alias + direct copy (two blocks, 1.22.22) V→H takeover: the alias copy is un-patched and the takeover isn't retracted: fail #1158** (v4.0.0 does the same).
 - #1117 BOM: BOM `package.json` + BOM lock, H/V + frozen install + VEX + rollback; BOM+CRLF lock V→H→V chain (endings and BOM kept, every hop patched): pass.
 
+### Run 34 cells (Linux, `03b9418`)
+
+- Hosted battery + frozen install + VEX: base (1.0.2 / 1.7.0 / 1.22.22), merged workspace key (1.10.1 / 1.22.22), multi-version workspace, CRLF, `resolutions`, `--modules-folder`, 1.10.1 merged alias block: pass. **Alias + direct (1.22.22): pins nothing, `redirect_unattributable` (#1058 gate; fixed by PR #1180, verified).**
+- Vendored battery + check + rollback (base / merged ws key / CRLF / 1.7.0 / 1.10.1 ws; after another dep's add / upgrade; after `yarn remove` / upgrade of the patched dep): pass. #692 still fails (now labelled `vendor_lock_entry_removed`).
+- BOM / CRLF `.yarnrc` + BOM `.npmrc` mirror refusal: pass. Agent workspace + alias + nested copies, re-run, VEX, rollback: pass.
+- V→H takeover with a member-`.yarnrc` mirror: not retracted (#1115, commented).
+
 ## Backlog
 
-0000. #1158 follow-ups: scoped alias and workspace-member alias takeover shapes; ask yarn-berry about the same partial-pin takeover gap with `redirect_yarn_berry_alias_skipped`. #1115 in the now-staged V→H takeover.
+0000. After PR #1180 merges: re-run the alias battery on main and close-check #1158 / #1081 (scoped / member shapes verified on the PR in run 34). Ask yarn-berry whether the #1058 gate refuses a berry alias + direct project, and about the same partial-pin takeover gap with `redirect_yarn_berry_alias_skipped`. (#1115 in the staged V→H takeover: done in run 34, commented.)
 000. #1115 follow-ups (member `.npmrc` done in run 32): `yarn workspace <m> add`, V→H takeover in that shape; macOS / Windows.
 00. #1097 follow-ups (`get` done in run 31): the same `!` / extglob member shapes from `get` and on yarn berry / npm / bun roots (hand over npm extglob if it reproduces; npm supports negation, so only extglob applies there). Dot-dir members (`packages/.x`, which minimatch `*` skips).
 0. #1013 / #1078 follow-ups: the vendored→hosted takeover preflight with a user-level mirror; macOS / Windows home config paths; a BOM `.yarnrc` on a Windows probe (PowerShell 5 `Set-Content -Encoding utf8`). Re-check #1081 on berry aliases (hand over to yarn-berry if `redirect_yarn_berry_alias_skipped` also attests in-run), and on npm / pnpm alias skips.
@@ -362,3 +369,6 @@ Other cells that pass on Linux 1.22.22 (some also on older releases; see the ent
 - An API purl that lowercases an uppercase npm name (`pkg:npm/jsonstream`) fails closed in every mode. It can't be checked against the real service, so it's not filed. A case-preserving purl works.
 - Leftover probe branch (deletion blocked): `bughunt/yarn-classic/20261008-grammar-xos`.
 - Run-32 harness: `battery.sh <yarnfn> <name> <deps> [resolutions]` (H/V, `MUTATE` hook), `prune.sh`, `agent.sh`, and a parameterised mock (`MNAME` / `MVER` env). The probe script is in the run-32 workflow commit `43a8c51`.
+- `scan --vex <PATH>` takes the output path; there's no `--vex-output`. `get`/`scan` `--apply` / `--vendor` / `--no-apply` were removed in #1031: use `--mode agent|vendored` / `--save-only`.
+- Member-dir cold-cache installs of a vendored yarn workspace fail whether or not there's a mirror (#691). With a mirror, yarn falls back to the mirror's same-named upstream tarball, so the error reads `Integrity check failed` instead of "Tarball is not in network". Don't file it as a mirror bug.
+- Run-34 harness: `hb.sh` (hosted) / `vb.sh` (vendored, with `POST` / `MUT` hooks) / `t1158.sh` / `tws.sh` / `tmir.sh`, with the run-32 `mock.py` extracted from probe branch `20261008-grammar-xos`. yarn 1.22.22 lives at `/opt/node-tools/node_modules/yarn/bin/yarn.js` in the sandbox.
