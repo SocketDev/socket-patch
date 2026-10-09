@@ -12,7 +12,7 @@ _Last updated 2026-10-09T12:45Z · main @ a80b89e_
 - [#1126](https://github.com/SocketDev/socket-patch/pull/1126): 7 inline purl-type checks through `Ecosystem::from_purl` + guard. Issue #747 (C20, slice 1). `state: ready`.
 - Maintainer draft: #1049 (#792).
 
-**Merged:** #1227 (E16 slice 2, +25/−44 prod), #1221 (E19 hosted gem sections, +213/−140 prod), #1230 (E93 `PurlKey`, +37/−7 prod), #1217 (E05 Deno crawl, +108/−43 prod), #1209 (E05 Go crawl, +132/−44 prod), #1205 (E05 cargo crawl), #1183 (E05 NuGet crawl); 32 earlier PRs (#572 … #1191, see `entries/refactor/`). Leftovers: `blob_hash_matches` (#1163), dead `eco == "maven2"` arm in `commands/vendor.rs` (#1015).
+**Merged:** #1227 (E16 slice 2), #1221 (E19 hosted gem), #1230 (E93 `PurlKey`), #1217/#1209/#1205/#1183 (E05 Deno, Go, cargo, NuGet crawls); 32 earlier PRs (#572 … #1191, see `entries/refactor/`). Leftovers: `blob_hash_matches` (#1163), dead `eco == "maven2"` arm in `commands/vendor.rs` (#1015).
 
 **Queue** (B bugs closed, U unblocks, D duplication removed, R risk; score = 3B + 2U + 2D + S − risk). Since the 2026-10-08 backlog review, standalone refactor issues are closed as `not_planned` and kept as checklist items of their tracker; rank the tracker's next unchecked item.
 
