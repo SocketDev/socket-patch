@@ -469,7 +469,7 @@ pub(super) fn is_public_pypi_url(url: &str) -> bool {
 /// `[./].socket/vendor/pypi/<uuid>/<wheel>` (coordinates from the shared
 /// vendored-leaf table, [`crate::vendor::path::leaf_to_purl`]). `None` for
 /// a user's own file/path reference.
-pub(super) fn socket_reference_coords(reference: &str) -> Option<(String, String)> {
+pub(crate) fn socket_reference_coords(reference: &str) -> Option<(String, String)> {
     if reference.contains("://") {
         let url = hosted_artifact_url(reference).ok()?;
         url.uuid_level.as_ref()?;
