@@ -49,6 +49,57 @@ existing scripts against the new CLI; the [changelog](../CHANGELOG.md) and
   `SOCKET_ORG_SLUG` to get org patches. The org is resolved once per run, so an
   embedded `--vex` no longer resolves it again.
 
+## Package targeting
+
+`get <name>` now selects an exact package name instead of automatically choosing
+the nearest fuzzy match. For example, `get yaml` never selects `yaml-ast-parser`;
+near names are suggestions only. It queries every installed version of the
+selected package, including older nested copies. If a script should select only
+one release, use a versioned PURL such as `pkg:npm/lodash@4.17.20`.
+
+`get`, `remove`, and `rollback` share these package/patch target forms:
+
+| Target | Meaning |
+| --- | --- |
+| Package name, such as `lodash` or `@babel/core` | Every installed version for `get`; every recorded version for `remove` / `rollback`, including vendor records and hosted pins |
+| Versionless PURL, such as `pkg:npm/lodash` | Select the package across versions, with an explicit ecosystem |
+| Versioned PURL, such as `pkg:npm/lodash@4.17.20` | Select that release; an unqualified PURL covers its release variants, while a qualified PURL selects one variant |
+| Patch UUID | Select one patch; `socket-patch <UUID>` is shorthand for `get <UUID>`, including after root flags such as `--json` |
+| CVE or GHSA ID | Search by advisory with `get`; these IDs do not select records for `remove` / `rollback`, so use the package PURL or patch UUID there |
+
+Name matching uses the same case-insensitive rules as `scan --package`, including
+PyPI normalization of `.`, `_`, and `-`. A full-name match takes precedence:
+`get lodash` selects `lodash` when both it and `@types/lodash` are installed. A
+last-segment name such as `core` is accepted only when it identifies one package.
+If it reaches both `@angular/core` and `@babel/core`, `get`, `remove`, and `rollback`
+refuse it with exit 1 and `error.code: "ambiguous_target"` under `--json`, before
+changing any patches. The message lists exact versionless PURLs to use instead.
+The same name in two ecosystems also needs a PURL to disambiguate it. Multiple
+versions of one package are not ambiguous. `scan --package` and `socket.yml`
+continue to select every package a name matches. Go major-version suffixes such
+as `v2` alone do not select modules; use the full module path or PURL.
+
+`get --ecosystems` now scopes package-name discovery and filters every search
+result and UUID selection before any patch is written, in every mode. A UUID
+outside the selected ecosystems returns `status: "not_found"` with exit 0. A
+name absent from a nonempty package inventory returns `status: "no_match"` with
+exit 0, without searching for or applying a suggested package. An empty inventory
+returns `status: "no_packages"`. Scripts should inspect these statuses instead of
+assuming exit 0 means a patch was selected.
+
+`rollback` also accepts path globs. An npm scoped name such as `@babel/core` is
+always a package target. A slash-containing name such as `monolog/monolog` is a
+package target when it selects a recorded patch or hosted pin; otherwise it is
+treated as a path glob. Use an explicit path such as `./monolog/monolog` or a
+quoted glob such as `'node_modules/**'` to select installed copies by location.
+
+```sh
+socket-patch get yaml --ecosystems npm --dry-run
+socket-patch get pkg:npm/lodash@4.17.20 --dry-run
+socket-patch remove pkg:npm/@babel/core --dry-run
+socket-patch rollback pkg:composer/monolog/monolog --dry-run
+```
+
 ## Service-only vendoring
 
 v4 could build patched artifacts locally, with `auto` as the default acquisition
