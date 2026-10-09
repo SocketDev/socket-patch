@@ -28,7 +28,9 @@
 //!      scannable JSR-shaped trees, and (b) any future Deno that
 //!      adopts a stable scope/name/version layout (or a third-party
 //!      tool that materializes JSR packages this way) gets picked
-//!      up automatically.
+//!      up automatically. In a project with a `deno.lock`, only the
+//!      lock's `jsr` entries are looked up in that layout; the cache is
+//!      not walked.
 //!
 //!      In the meantime, `socket-patch scan --global --ecosystems
 //!      deno --global-prefix <path>` is what real users would invoke
@@ -84,16 +86,44 @@ impl DenoCrawler {
         }
     }
 
-    /// Crawl JSR cache(s) and return every `pkg:jsr/...` package
-    /// present. JSR cache layout is
+    /// Crawl JSR cache(s) and return the `pkg:jsr/...` packages present.
+    /// JSR cache layout is
     /// `<root>/@<scope>/<name>/<version>/<package contents>`.
+    ///
+    /// A local project with a `deno.lock` only gets the JSR packages its
+    /// lock records, each looked up in the cache ([`jsr_lock_scope`],
+    /// [`locate`]), so a package another project left in the cache is
+    /// never crawled and the cache tree is not walked. Everything else
+    /// (`--global`, `--global-prefix`, no or unreadable `deno.lock`) walks
+    /// the whole cache.
     pub async fn crawl_all(&self, options: &CrawlerOptions) -> Vec<CrawledPackage> {
         let mut packages = Vec::new();
         let mut seen = HashSet::new();
 
         let cache_paths = self.get_jsr_cache_paths(options).await.unwrap_or_default();
+        if cache_paths.is_empty() {
+            return packages;
+        }
+        let scope = if options.global || options.global_prefix.is_some() {
+            None
+        } else {
+            jsr_lock_scope(&options.cwd).await
+        };
         for cache_path in &cache_paths {
-            scan_jsr_cache(cache_path, &mut seen, &mut packages).await;
+            match &scope {
+                Some(locked) => {
+                    for purl in locked {
+                        if seen.contains(purl) {
+                            continue;
+                        }
+                        if let Some(pkg) = locate(cache_path, purl).await {
+                            seen.insert(pkg.purl.clone());
+                            packages.push(pkg);
+                        }
+                    }
+                }
+                None => scan_jsr_cache(cache_path, &mut seen, &mut packages).await,
+            }
         }
 
         packages
@@ -126,13 +156,13 @@ impl Default for DenoCrawler {
 }
 
 /// The cache directory of JSR `purl` under `jsr_cache_path`, reported
-/// under `purl`: the lookup behind [`DenoCrawler::find_by_purls`]. `None`
-/// for a non-`pkg:jsr/` purl, an unsafe coordinate, or a version directory
-/// that is not there.
+/// under `purl`: the one lookup behind [`DenoCrawler::find_by_purls`] and
+/// the `deno.lock`-scoped crawl. `None` for a non-`pkg:jsr/` purl, an
+/// unsafe coordinate, or a version directory that is not there.
 async fn locate(jsr_cache_path: &Path, purl: &str) -> Option<CrawledPackage> {
     let ((scope, name), version) = crate::utils::purl::parse_jsr_purl(purl)?;
     // SECURITY: scope/name/version come straight from the (untrusted)
-    // manifest PURL and are joined onto the cache
+    // manifest PURL or project `deno.lock` and are joined onto the cache
     // root below. A real JSR coordinate is a single path segment, so reject
     // any that could traverse out of the cache (`..`/`.`, a separator,
     // NUL). The parser percent-decodes components, so these guards see the
@@ -157,6 +187,24 @@ async fn locate(jsr_cache_path: &Path, purl: &str) -> Option<CrawledPackage> {
         purl: purl.to_string(),
         path: pkg_dir,
     })
+}
+
+/// The `pkg:jsr/` purl of every key of `<cwd>/deno.lock`'s `jsr` section
+/// (`@<scope>/<name>@<version>`), in lock order. A lock without a `jsr`
+/// section records no JSR package (`Some` of nothing). `None` when there
+/// is no readable `deno.lock`, it is not JSON, or it carries no `version`
+/// (not a lock Deno wrote); the crawl then walks the whole cache.
+async fn jsr_lock_scope(cwd: &Path) -> Option<Vec<String>> {
+    let text = crate::utils::fs::read_regular_to_string(&cwd.join("deno.lock"))
+        .await
+        .ok()?;
+    let lock: Value = serde_json::from_str(&text).ok()?;
+    lock.get("version")?;
+    Some(
+        lock_section(&lock, "jsr")
+            .map(|jsr| jsr.keys().map(|key| format!("pkg:jsr/{key}")).collect())
+            .unwrap_or_default(),
+    )
 }
 
 /// The `section` (`npm` or `jsr`) package map of a parsed `deno.lock`, in
@@ -519,6 +567,122 @@ mod tests {
             global_prefix: None,
         };
         assert!(crawler.crawl_all(&opts).await.is_empty());
+    }
+
+    // ── deno.lock-scoped project crawl ─────────────────────────────
+
+    /// A project at a fresh tempdir with `deno.lock` = `lock`, and a
+    /// `DENO_DIR` whose JSR cache holds `@std/path@0.220.0` (locked in the
+    /// fixtures below) plus `@std/fs@1.0.0` and `@other/x@2.0.0` (never
+    /// locked). Returns the purls `crawl_all` reports, sorted.
+    async fn crawl_project_with_lock(lock: &str, global: bool) -> Vec<String> {
+        let project = tempfile::tempdir().unwrap();
+        tokio::fs::write(project.path().join("deno.lock"), lock)
+            .await
+            .unwrap();
+        let deno_home = tempfile::tempdir().unwrap();
+        let jsr = deno_home.path().join("npm").join("jsr.io");
+        stage(&jsr, "@std", "path", "0.220.0").await;
+        stage(&jsr, "@std", "fs", "1.0.0").await;
+        stage(&jsr, "@other", "x", "2.0.0").await;
+        let _g = EnvGuard::set("DENO_DIR", deno_home.path().to_str().unwrap());
+
+        let opts = CrawlerOptions {
+            cwd: project.path().to_path_buf(),
+            global,
+            global_prefix: None,
+        };
+        let mut purls: Vec<String> = DenoCrawler
+            .crawl_all(&opts)
+            .await
+            .into_iter()
+            .map(|p| p.purl)
+            .collect();
+        purls.sort();
+        purls
+    }
+
+    const WHOLE_CACHE: [&str; 3] = [
+        "pkg:jsr/@other/x@2.0.0",
+        "pkg:jsr/@std/fs@1.0.0",
+        "pkg:jsr/@std/path@0.220.0",
+    ];
+
+    #[tokio::test]
+    #[serial_test::serial]
+    async fn crawl_all_local_lock_scopes_to_locked_jsr_packages() {
+        // v4/v5 (top-level `jsr`) and v3 (`packages.jsr`): only the locked
+        // package is reported; the other cached packages are not.
+        for lock in [
+            r#"{"version":"5","jsr":{"@std/path@0.220.0":{"integrity":"a"}}}"#,
+            r#"{"version":"4","jsr":{"@std/path@0.220.0":{"integrity":"a"}}}"#,
+            r#"{"version":"3","packages":{"jsr":{"@std/path@0.220.0":{"integrity":"a"}}}}"#,
+        ] {
+            assert_eq!(
+                crawl_project_with_lock(lock, false).await,
+                vec!["pkg:jsr/@std/path@0.220.0"],
+                "{lock}"
+            );
+        }
+    }
+
+    #[tokio::test]
+    #[serial_test::serial]
+    async fn crawl_all_local_lock_without_jsr_reports_nothing() {
+        // An npm-only project resolves no JSR package at all.
+        let lock = r#"{"version":"4","npm":{"left-pad@1.3.0":{"integrity":"x"}}}"#;
+        assert!(crawl_project_with_lock(lock, false).await.is_empty());
+    }
+
+    #[tokio::test]
+    #[serial_test::serial]
+    async fn crawl_all_local_lock_skips_uncached_and_unsafe_entries() {
+        // A locked package missing from the cache, and a key whose version
+        // would traverse out of it, are skipped; the cached one is found.
+        let lock = r#"{"version":"4","jsr":{
+            "@std/path@0.220.0":{},
+            "@std/path@9.9.9":{},
+            "@std/fs@../../@other/x/2.0.0":{}
+        }}"#;
+        assert_eq!(
+            crawl_project_with_lock(lock, false).await,
+            vec!["pkg:jsr/@std/path@0.220.0"]
+        );
+    }
+
+    #[tokio::test]
+    #[serial_test::serial]
+    async fn crawl_all_walks_without_a_usable_lock_or_in_global_mode() {
+        let scoped = r#"{"version":"4","jsr":{"@std/path@0.220.0":{}}}"#;
+        // `--global` ignores the project's lock.
+        assert_eq!(crawl_project_with_lock(scoped, true).await, WHOLE_CACHE);
+        // Not JSON, or JSON without a `version` (no lock Deno wrote): walk.
+        assert_eq!(
+            crawl_project_with_lock("not json", false).await,
+            WHOLE_CACHE
+        );
+        assert_eq!(crawl_project_with_lock("{}", false).await, WHOLE_CACHE);
+    }
+
+    #[tokio::test]
+    #[serial_test::serial]
+    async fn crawl_all_local_without_lock_walks_the_cache() {
+        // A `deno.json`-only project has no resolution to scope by.
+        let project = tempfile::tempdir().unwrap();
+        tokio::fs::write(project.path().join("deno.json"), b"{}")
+            .await
+            .unwrap();
+        let deno_home = tempfile::tempdir().unwrap();
+        let jsr = deno_home.path().join("npm").join("jsr.io");
+        stage(&jsr, "@std", "path", "0.220.0").await;
+        stage(&jsr, "@std", "fs", "1.0.0").await;
+        let _g = EnvGuard::set("DENO_DIR", deno_home.path().to_str().unwrap());
+        let opts = CrawlerOptions {
+            cwd: project.path().to_path_buf(),
+            global: false,
+            global_prefix: None,
+        };
+        assert_eq!(DenoCrawler.crawl_all(&opts).await.len(), 2);
     }
 
     /// The shared section reader answers every lockfile version for both
