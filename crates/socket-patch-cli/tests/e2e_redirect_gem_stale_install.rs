@@ -1542,35 +1542,24 @@ async fn gem_hosted_default_cwd_keeps_project_local_remedy() {
     }
 }
 
-/// #1109: Bundler also stops using system gems without an explicit `path`.
-/// `deployment` (local config or env) installs into `vendor/bundle`, and
-/// `simulate_version 5` (Bundler 4.x) or `default_install_uses_path`
-/// (Bundler 2.x) into `.bundle`. On a fresh checkout none of those stores
-/// exist yet, but `bundle install` still fetches into them and never reuses
-/// the `gem env` copy, so it is not stale: no warning, and the same run's
-/// `--vex` attests the purl.
+/// #1109: `deployment` (local config, env or global config) stops Bundler
+/// using system gems without an explicit `path`: it installs into
+/// `vendor/bundle`. On a fresh checkout that store doesn't exist yet, but
+/// `bundle install` still fetches into it and never reuses the `gem env`
+/// copy, so it is not stale: no warning, and the same run's `--vex`
+/// attests the purl.
 #[cfg(unix)]
 #[tokio::test(flavor = "multi_thread")]
-async fn gem_hosted_implicit_project_path_ignores_system_home_copy() {
+async fn gem_hosted_deployment_ignores_system_home_copy() {
     let server = MockServer::start().await;
     mount_api(&server, None).await;
     let cases: &[(&str, Option<&str>, &[(&str, &str)])] = &[
         ("local deployment", Some("BUNDLE_DEPLOYMENT: \"true\""), &[]),
         ("env deployment", None, &[("BUNDLE_DEPLOYMENT", "true")]),
         (
-            "local simulate_version 5",
-            Some("BUNDLE_SIMULATE_VERSION: \"5\""),
-            &[],
-        ),
-        (
-            "local default_install_uses_path",
-            Some("BUNDLE_DEFAULT_INSTALL_USES_PATH: \"true\""),
-            &[],
-        ),
-        (
-            "env default_install_uses_path",
+            "global deployment",
             None,
-            &[("BUNDLE_DEFAULT_INSTALL_USES_PATH", "true")],
+            &[("BUNDLE_USER_CONFIG", "../user-bundle-config")],
         ),
     ];
     for (case, local, extra) in cases {
@@ -1580,8 +1569,17 @@ async fn gem_hosted_implicit_project_path_ignores_system_home_copy() {
         write_manifest_pair(&proj);
         if let Some(line) = local {
             std::fs::create_dir_all(proj.join(".bundle")).unwrap();
-            std::fs::write(proj.join(".bundle").join("config"), format!("---\n{line}\n")).unwrap();
+            std::fs::write(
+                proj.join(".bundle").join("config"),
+                format!("---\n{line}\n"),
+            )
+            .unwrap();
         }
+        std::fs::write(
+            tmp.path().join("user-bundle-config"),
+            "---\nBUNDLE_DEPLOYMENT: \"true\"\n",
+        )
+        .unwrap();
         let bin_dir = tmp.path().join("fake-bin");
         let system_copy = stage_system_home_copy(&tmp.path().join("system-home"), &bin_dir);
 
@@ -1601,21 +1599,24 @@ async fn gem_hosted_implicit_project_path_ignores_system_home_copy() {
     }
 }
 
-/// #1109 controls: a falsy `deployment`, a `simulate_version` below 5, and
-/// a higher tier that turns system gems back on (`path.system`, or a falsy
-/// `disable_shared_gems`) all leave Bundler on the system gems, so the
-/// stale `gem env` copy still warns and stays out of the VEX.
+/// #1109 controls: a falsy `deployment`, or a higher tier that decides
+/// the path with system gems on (`path.system`, or a falsy
+/// `disable_shared_gems`), leaves Bundler on the system gems, so the stale
+/// `gem env` copy still warns and stays out of the VEX. So do the
+/// `.bundle`-default flags: Bundler 2.x honors only
+/// `default_install_uses_path` and Bundler 4.x only `simulate_version 5`,
+/// and a scan can't tell which Bundler runs, so it keeps judging the
+/// system home rather than risk skipping a copy Bundler loads.
 #[cfg(unix)]
 #[tokio::test(flavor = "multi_thread")]
 async fn gem_hosted_system_gems_settings_still_flag_system_home_copy() {
     let server = MockServer::start().await;
     mount_api(&server, None).await;
     let cases: &[(&str, Option<&str>, &[(&str, &str)])] = &[
-        ("local deployment false", Some("BUNDLE_DEPLOYMENT: \"false\""), &[]),
         (
-            "local simulate_version 4",
-            Some("BUNDLE_SIMULATE_VERSION: \"4\""),
-            &[],
+            "local deployment false over env deployment",
+            Some("BUNDLE_DEPLOYMENT: \"false\""),
+            &[("BUNDLE_DEPLOYMENT", "true")],
         ),
         (
             "local path.system over env deployment",
@@ -1623,9 +1624,19 @@ async fn gem_hosted_system_gems_settings_still_flag_system_home_copy() {
             &[("BUNDLE_DEPLOYMENT", "true")],
         ),
         (
-            "local disable_shared_gems false over env default_install_uses_path",
+            "local disable_shared_gems false over env deployment",
             Some("BUNDLE_DISABLE_SHARED_GEMS: \"false\""),
-            &[("BUNDLE_DEFAULT_INSTALL_USES_PATH", "true")],
+            &[("BUNDLE_DEPLOYMENT", "true")],
+        ),
+        (
+            "local simulate_version 5",
+            Some("BUNDLE_SIMULATE_VERSION: \"5\""),
+            &[],
+        ),
+        (
+            "local default_install_uses_path",
+            Some("BUNDLE_DEFAULT_INSTALL_USES_PATH: \"true\""),
+            &[],
         ),
     ];
     for (case, local, extra) in cases {
@@ -1635,7 +1646,11 @@ async fn gem_hosted_system_gems_settings_still_flag_system_home_copy() {
         write_manifest_pair(&proj);
         if let Some(line) = local {
             std::fs::create_dir_all(proj.join(".bundle")).unwrap();
-            std::fs::write(proj.join(".bundle").join("config"), format!("---\n{line}\n")).unwrap();
+            std::fs::write(
+                proj.join(".bundle").join("config"),
+                format!("---\n{line}\n"),
+            )
+            .unwrap();
         }
         let bin_dir = tmp.path().join("fake-bin");
         let system_copy = stage_system_home_copy(&tmp.path().join("system-home"), &bin_dir);
@@ -1747,8 +1762,11 @@ async fn gem_hosted_standalone_vex_ignores_unused_system_home_copy() {
             Config::None => {}
             Config::Local(line) => {
                 std::fs::create_dir_all(proj.join(".bundle")).unwrap();
-                std::fs::write(proj.join(".bundle").join("config"), format!("---\n{line}\n"))
-                    .unwrap();
+                std::fs::write(
+                    proj.join(".bundle").join("config"),
+                    format!("---\n{line}\n"),
+                )
+                .unwrap();
             }
             Config::Env(k, v) => envs.push(((*k).into(), (*v).into())),
             Config::Global(line) => {
