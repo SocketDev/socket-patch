@@ -921,16 +921,55 @@ impl MavenCrawler {
 
     /// Crawl all discovered Maven repository paths and return every
     /// package found.
+    ///
+    /// In project mode for a Maven build (a `pom.xml`, no Gradle or
+    /// Scala-tool build beside it), a Maven local repository is shared by
+    /// every project on the machine, so only the coordinates the project's
+    /// dependency graph reaches are kept ([`maven_scope`](super::maven_scope),
+    /// #265): another project's cached artifacts are not this project's
+    /// packages. A root pom that is not readable leaves the crawl unscoped.
     pub async fn crawl_all(&self, options: &CrawlerOptions) -> Vec<CrawledPackage> {
+        self.crawl_all_with(options, &JvmEnv::from_process()).await
+    }
+
+    /// [`Self::crawl_all`] under the caches `env` names.
+    pub async fn crawl_all_with(
+        &self,
+        options: &CrawlerOptions,
+        env: &JvmEnv,
+    ) -> Vec<CrawledPackage> {
         let mut packages = Vec::new();
         let mut seen = HashSet::new();
+        let scoped = options.global_prefix.is_none() && !options.global && {
+            let cwd = options.cwd.clone();
+            run_walk(move || {
+                layout::has_build(&cwd, BuildTool::Maven)
+                    && !layout::has_build(&cwd, BuildTool::Gradle)
+                    && !layout::is_scala_tool_build(&cwd)
+            })
+            .await
+        };
 
-        for root in self.get_jvm_cache_roots(options).await {
+        for root in self.get_jvm_cache_roots_with(options, env).await {
+            let scope_cwd =
+                (scoped && root.layout == JvmCacheLayout::Maven2 && !coursier_spelled(&root.path))
+                    .then(|| options.cwd.clone());
             // The walkdir walk and POM reads are blocking: run each repo
             // on the walk pool so concurrently crawled ecosystems keep
             // making progress (the dedup set rides along and comes back).
             let (found, returned_seen) = run_walk(move || {
-                let found = MavenCrawler.scan_cache_root(&root, &mut seen);
+                let scope =
+                    scope_cwd.and_then(|cwd| super::maven_scope::project_scope(&cwd, &root.path));
+                let mut found = MavenCrawler.scan_cache_root(&root, &mut seen);
+                if let Some(scope) = scope {
+                    found.retain(|p| {
+                        scope.admits(
+                            p.namespace.as_deref().unwrap_or_default(),
+                            &p.name,
+                            &p.version,
+                        )
+                    });
+                }
                 (found, seen)
             })
             .await;
@@ -2481,6 +2520,89 @@ mod tests {
         let purls: HashSet<_> = packages.iter().map(|p| p.purl.as_str()).collect();
         assert!(purls.contains("pkg:maven/org.apache.commons/commons-lang3@3.12.0"));
         assert!(purls.contains("pkg:maven/com.google.guava/guava@32.1.3-jre"));
+    }
+
+    /// #265: in project mode a Maven build's crawl keeps only what its
+    /// poms reach; the rest of the shared local repository (cached by other
+    /// projects) is not this project's. `--global` still lists everything.
+    #[tokio::test]
+    async fn project_mode_crawl_keeps_only_the_projects_graph() {
+        let dir = tempfile::tempdir().unwrap();
+        let (cwd, repo) = (dir.path().join("app"), dir.path().join("m2"));
+        let pom = |g: &str, a: &str, v: &str, deps: &str| {
+            format!(
+                "<project><modelVersion>4.0.0</modelVersion><groupId>{g}</groupId>\
+                 <artifactId>{a}</artifactId><version>{v}</version>\
+                 <dependencies>{deps}</dependencies></project>"
+            )
+        };
+        let dep = |g: &str, a: &str, v: &str, scope: &str| {
+            format!(
+                "<dependency><groupId>{g}</groupId><artifactId>{a}</artifactId>\
+                 <version>{v}</version><scope>{scope}</scope></dependency>"
+            )
+        };
+        std::fs::create_dir_all(&cwd).unwrap();
+        std::fs::write(
+            cwd.join("pom.xml"),
+            pom(
+                "com.example",
+                "unrelated-app",
+                "1.0.0",
+                &dep("junit", "junit", "4.13.2", "test"),
+            ),
+        )
+        .unwrap();
+        for (g, a, v, deps) in [
+            (
+                "junit",
+                "junit",
+                "4.13.2",
+                dep("org.hamcrest", "hamcrest-core", "1.3", "compile"),
+            ),
+            ("org.hamcrest", "hamcrest-core", "1.3", String::new()),
+            // Cached by another project.
+            (
+                "org.apache.commons",
+                "commons-lang3",
+                "3.12.0",
+                String::new(),
+            ),
+        ] {
+            let d = repo.join(g.replace('.', "/")).join(a).join(v);
+            std::fs::create_dir_all(&d).unwrap();
+            std::fs::write(d.join(format!("{a}-{v}.pom")), pom(g, a, v, &deps)).unwrap();
+        }
+        let env = JvmEnv {
+            m2_repo: Some(repo.clone()),
+            gradle: None,
+        };
+        let purls = |packages: Vec<CrawledPackage>| {
+            let mut p: Vec<String> = packages.into_iter().map(|p| p.purl).collect();
+            p.sort();
+            p
+        };
+        let local = CrawlerOptions {
+            cwd: cwd.clone(),
+            global: false,
+            global_prefix: None,
+        };
+        assert_eq!(
+            purls(MavenCrawler::new().crawl_all_with(&local, &env).await),
+            [
+                "pkg:maven/junit/junit@4.13.2",
+                "pkg:maven/org.hamcrest/hamcrest-core@1.3",
+            ]
+        );
+        let global = CrawlerOptions {
+            global: true,
+            ..local
+        };
+        assert_eq!(
+            purls(MavenCrawler::new().crawl_all_with(&global, &env).await).len(),
+            3,
+            "a global crawl is not scoped"
+        );
     }
 
     #[tokio::test]
