@@ -5,7 +5,7 @@ projects using text `bun.lock` or native binary `bun.lockb`. Real-Bun evidence b
 
 - **The native matrix** — `scripts/backtest-bun.py` runs real Bun releases
   against the public free Socket patch for `minimist@1.2.2`
-  (`80630680-4da6-45f9-bba8-b888e0ffd58c`) with the production CLI and patch
+  (`642d7f02-ebc1-4ab0-99e2-07f5dd8463cb`) with the production CLI and patch
   service, without a token or substitute service, and checks the INSTALLED
   bytes, lock stability, digest rejection and rollback on Linux, macOS and
   Windows ([workflow](../../.github/workflows/bun-compatibility.yml)).
