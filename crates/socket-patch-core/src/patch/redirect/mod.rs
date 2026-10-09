@@ -5760,11 +5760,13 @@ fn nuget_xml_attribute(value: &str) -> String {
         .replace('\r', "&#xD;")
 }
 
-/// The synthetic candidate key carrying why the engine could not list the
-/// project's NuGet locks (an unreadable directory or project file): the
-/// rewriter then skips the nuget redirect rather than leave a lock it never
-/// saw on its upstream hash. Never a path (see [`sbt::SYNTHETIC_KEY_PREFIX`]).
-pub const NUGET_LOCK_WALK_KEY: &str = "<socket-patch:nuget-lock-walk>";
+/// The synthetic candidate key carrying the locks the engine found every
+/// project under the root restoring into (#353, #514), one per line:
+/// `lock\t<rel>`, `unresolved\t<project>\t<why>` for a `NuGetLockFilePath`
+/// it cannot evaluate, or `error\t<why>` when it could not list the tree.
+/// Absent (the in-memory engine, unit tests), the root `packages.lock.json`
+/// is the one lock. Never a path (see [`sbt::SYNTHETIC_KEY_PREFIX`]).
+pub const NUGET_LOCKS_KEY: &str = "<socket-patch:nuget-locks>";
 
 fn rewrite_nuget(
     files: &BTreeMap<String, String>,
@@ -5808,41 +5810,45 @@ fn rewrite_nuget(
     // routes them all, so each is pinned with it (#353, #514). The engine
     // reads the project files and their locks; the same pure discovery
     // re-derives which keys are locks here.
-    if let Some(why) = files.get(NUGET_LOCK_WALK_KEY) {
-        result.warnings.push(RewriteWarning {
-            code: "redirect_nuget_lock_unreadable".into(),
-            detail: format!(
-                "cannot list the project's NuGet locks ({why}); nuget redirect skipped"
-            ),
-        });
-        return;
-    }
-    let projects: Vec<(String, String)> = files
-        .iter()
-        .filter(|(rel, _)| {
-            !sbt::is_synthetic_key(rel)
-                && crate::formats::nuget::lock::is_project_file(
-                    rel.rsplit('/').next().unwrap_or(rel),
-                )
-        })
-        .map(|(rel, text)| (rel.clone(), text.clone()))
-        .collect();
-    let governed =
-        crate::formats::nuget::lock::governed_locks(&projects, |rel| files.contains_key(rel));
-    if let Some((project, detail)) = governed.unresolved.first() {
-        result.warnings.push(RewriteWarning {
-            code: "redirect_nuget_lock_path_unresolved".into(),
-            detail: format!(
-                "{project}: {detail}; the lock it restores into cannot be pinned, so nuget \
-                 redirect is skipped (set a literal NuGetLockFilePath, or remove it)"
-            ),
-        });
-        return;
-    }
+    let lock_rels: Vec<String> = match files.get(NUGET_LOCKS_KEY) {
+        None => vec![crate::formats::nuget::lock::PACKAGES_LOCK.to_string()],
+        Some(found) => {
+            let mut rels = Vec::new();
+            for line in found.lines() {
+                let mut fields = line.splitn(3, '\t');
+                match (fields.next(), fields.next(), fields.next()) {
+                    (Some("lock"), Some(rel), None) => rels.push(rel.to_string()),
+                    (Some("unresolved"), Some(project), Some(detail)) => {
+                        result.warnings.push(RewriteWarning {
+                            code: "redirect_nuget_lock_path_unresolved".into(),
+                            detail: format!(
+                                "{project}: {detail}; the lock it restores into cannot be \
+                                 pinned, so nuget redirect is skipped (set a literal \
+                                 NuGetLockFilePath, or remove it)"
+                            ),
+                        });
+                        return;
+                    }
+                    (Some("error"), Some(why), _) => {
+                        result.warnings.push(RewriteWarning {
+                            code: "redirect_nuget_lock_unreadable".into(),
+                            detail: format!(
+                                "cannot list the project's NuGet locks ({why}); nuget redirect \
+                                 skipped"
+                            ),
+                        });
+                        return;
+                    }
+                    _ => {}
+                }
+            }
+            rels
+        }
+    };
     // Read past a UTF-8 BOM the way dotnet does (#623); the write below
     // keeps it.
     let mut locks: Vec<(String, &String, Value, bool)> = Vec::new();
-    for rel in governed.locks {
+    for rel in lock_rels {
         let Some(text) = files.get(&rel) else {
             continue;
         };
@@ -22644,20 +22650,23 @@ packages:
     }
 
     /// #353 / #514: member-project locks and named locks the root config
-    /// governs are re-pinned under their own paths with the config.
+    /// governs (the engine's walk, carried by [`NUGET_LOCKS_KEY`]) are
+    /// re-pinned under their own paths with the config.
     #[test]
     fn nuget_member_and_named_locks_are_repinned() {
         let mut files = BTreeMap::new();
         files.insert("nuget.config".to_string(), default_nuget_config());
-        files.insert("src/App/App.csproj".to_string(), "<Project />".to_string());
         files.insert(
             "src/App/packages.lock.json".to_string(),
             simple_lock("ORIGINALHASH=="),
         );
-        files.insert("src/Lib/Lib.csproj".to_string(), "<Project />".to_string());
         files.insert(
             "src/Lib/packages.Lib.lock.json".to_string(),
             simple_lock("ORIGINALHASH=="),
+        );
+        files.insert(
+            NUGET_LOCKS_KEY.to_string(),
+            "lock\tsrc/App/packages.lock.json\nlock\tsrc/Lib/packages.Lib.lock.json".to_string(),
         );
         let r = rewrite_registry_redirect(&files, &[nuget_override()]);
         assert!(r.warnings.is_empty(), "{:?}", r.warnings);
@@ -22671,7 +22680,6 @@ packages:
                 "{rel}"
             );
         }
-        assert!(!r.files.contains_key("src/App/App.csproj"));
         let lock_paths: Vec<&str> = r
             .edits
             .iter()
@@ -22685,35 +22693,31 @@ packages:
                 "src/Lib/packages.Lib.lock.json"
             ]
         );
+        // Without the walk (in memory, unit tests) only the root lock is one:
+        // a member lock is never mistaken for one.
+        files.remove(NUGET_LOCKS_KEY);
+        let r = rewrite_registry_redirect(&files, &[nuget_override()]);
+        assert!(!r.files.contains_key("src/App/packages.lock.json"));
     }
 
     /// #514: an unresolvable `NuGetLockFilePath`, or a project tree the
     /// engine could not list, skips the nuget redirect with nothing written.
     #[test]
     fn nuget_unknowable_locks_skip_the_redirect() {
-        let mut files = BTreeMap::new();
-        files.insert("nuget.config".to_string(), default_nuget_config());
-        files.insert(
-            "app.csproj".to_string(),
-            "<Project><PropertyGroup><NuGetLockFilePath>$(X)/l.json</NuGetLockFilePath></PropertyGroup></Project>"
-                .to_string(),
-        );
-        let r = rewrite_registry_redirect(&files, &[nuget_override()]);
-        assert!(r.files.is_empty() && r.edits.is_empty(), "{:?}", r.files);
-        assert_eq!(
-            warning_codes(&r),
-            vec!["redirect_nuget_lock_path_unresolved"]
-        );
-
-        let mut files = BTreeMap::new();
-        files.insert("nuget.config".to_string(), default_nuget_config());
-        files.insert(
-            NUGET_LOCK_WALK_KEY.to_string(),
-            "unreadable src".to_string(),
-        );
-        let r = rewrite_registry_redirect(&files, &[nuget_override()]);
-        assert!(r.files.is_empty() && r.edits.is_empty(), "{:?}", r.files);
-        assert_eq!(warning_codes(&r), vec!["redirect_nuget_lock_unreadable"]);
+        for (walk, code) in [
+            (
+                "lock\tpackages.lock.json\nunresolved\tapp.csproj\tNuGetLockFilePath `$(X)/l.json` references MSBuild properties or items",
+                "redirect_nuget_lock_path_unresolved",
+            ),
+            ("error\tunreadable src", "redirect_nuget_lock_unreadable"),
+        ] {
+            let mut files = BTreeMap::new();
+            files.insert("nuget.config".to_string(), default_nuget_config());
+            files.insert(NUGET_LOCKS_KEY.to_string(), walk.to_string());
+            let r = rewrite_registry_redirect(&files, &[nuget_override()]);
+            assert!(r.files.is_empty() && r.edits.is_empty(), "{:?}", r.files);
+            assert_eq!(warning_codes(&r), vec![code]);
+        }
     }
 
     /// #593: a multi-targeting lock resolving the patched id at another

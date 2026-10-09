@@ -444,6 +444,10 @@ pub async fn vendor_nuget(
             // re-attaches the untouched config records.
             let mut wiring: Vec<WiringRecord> = Vec::new();
             let new_hash = sha512_base64_of(&bytes);
+            // Locks already re-pinned, put back if a later one fails: the
+            // projects must agree on one nupkg (the rebuilt artifact stays,
+            // the config routes to it).
+            let mut written: Vec<(&LockFile, &str)> = Vec::new();
             for lock in &locks {
                 match edit_lock(&lock.text, name, &version_norm, &new_hash) {
                     Ok(Some(edit)) => {
@@ -452,10 +456,12 @@ pub async fn vendor_nuget(
                             atomic_write_bytes_preserving_mode(&lock.path, edit.text.as_bytes())
                                 .await
                         {
+                            unwind_locks(&written).await;
                             result.success = false;
                             result.error = Some(format!("failed to rewrite {}: {e}", lock.rel));
                             return done(result, None, warnings);
                         }
+                        written.push((lock, lock.text.as_str()));
                         wiring.push(WiringRecord {
                             file: lock.rel.clone(),
                             kind: LOCK_WIRING_KIND.to_string(),
@@ -467,6 +473,7 @@ pub async fn vendor_nuget(
                     }
                     Ok(None) => {}
                     Err(detail) => {
+                        unwind_locks(&written).await;
                         result.success = false;
                         result.error = Some(format!("{}: {detail}", lock.rel));
                         return done(result, None, warnings);
