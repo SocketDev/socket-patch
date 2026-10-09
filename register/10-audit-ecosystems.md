@@ -87,7 +87,7 @@ _Last updated 2026-10-09T00:58Z · main @ 03b9418_
 | E90 | 2 | Which gem homes Bundler loads has two answers: `vex` and agent `apply` use `get_gem_paths` (keeps `gem env` homes under an explicit `path`), only the stale guard uses `bundler_install_homes` (executed twice). | new finding | #1098 | filed #1098 |
 | E91 | 3 | PyPI tool-lock precedence is written twice since #1044: the inventory keys on "yielded entries", the vendored router on presence. A package-less `poetry.lock`/`pdm.lock` beside `requirements.txt` makes scan offer a package vendored refuses (`pypi_poetry_lock_package_missing`; executed twice). | new finding | #1114 | filed #1114 |
 | E92 | 3 | pnpm `modulesDir` is honored by the crawler but not by `pkg_managers`: `node-linker=pnp` + `modulesDir` is classified yarn PnP, so apply refuses (`yarn_pnp_unsupported`), vendored gives the yarn remedy and VEX reads the wrong loader (real pnpm 10.28, executed twice). | new finding | #1129 | filed #1129 |
-| E93 | 3 | NuGet version identity: vendor normalizes (`normalize_nuget_version`), `PurlKey`/crawler only lowercase; a vendored `@13.0.3.0` is judged unused, so `scan --prune` reverts it (executed 3×). | new finding | #1202 | filed #1202 |
+| E93 | 3 | NuGet version identity: vendor normalizes (`normalize_nuget_version`), `PurlKey`/crawler only lowercase; a vendored `@13.0.3.0` is judged unused, so `scan --prune` reverts it (executed 3×). | new finding | #1202 | in PR #1230 (`PurlKey` slice; crawler lookup and the move to `formats::nuget` remain) |
 
 **Handed off:** none yet.
 

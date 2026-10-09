@@ -1,7 +1,8 @@
 ### Refactor routine (`refactor`, hourly, highest leverage first)
-_Last updated 2026-10-09T05:45Z · main @ f3c6313_
+_Last updated 2026-10-09T06:40Z · main @ f3c6313_
 
 **In flight:**
+- [#1230](https://github.com/SocketDev/socket-patch/pull/1230): `PurlKey` keys NuGet versions through the one `normalize_nuget_version` (`13.0.3.0` = `13.0.3`), so a vendored 4-part entry stays live for VEX, `vendor --check` and `scan --prune`. #1202 slice (E93). +37/−7 prod, +242/−1 tests. `state: ready`.
 - [#1227](https://github.com/SocketDev/socket-patch/pull/1227): `common::detect_eol`, `pypi_uv::newline_of` and the `.npmrc` splice through `line_endings::terminator`. #815 slice 2 (E16). +25/−44 prod, +93 tests; golang golden re-blessed (mixed go.sum inputs only). `state: ready`.
 - [#1221](https://github.com/SocketDev/socket-patch/pull/1221): hosted `converge_gem_lock_source` reads `formats::gem` section spans, remote lines and DEPENDENCIES entries; `GemLockSection` + `gem_lock_dependency_name` deleted. #780 hosted slice (E19). +213/−140 prod, +325 tests; `CHECKSUMS` digests read lazily (bench gate). `state: ready`.
 - [#1217](https://github.com/SocketDev/socket-patch/pull/1217): Deno crawl scoped to `deno.lock` `jsr` keys; one `locate`, one `lock_section` (shared with VEX). #1216 (E05). +108/−43 prod, +142 tests; 48.1 → 7.5 ms (debug). `state: ready`.
@@ -13,10 +14,7 @@ _Last updated 2026-10-09T05:45Z · main @ f3c6313_
 **Merged:**
 - [#1205](https://github.com/SocketDev/socket-patch/pull/1205): cargo crawl scoped to `Cargo.lock` registry packages. #1204 (E05 partly fixed). +144/−49 prod, +226/−11 tests.
 - [#1183](https://github.com/SocketDev/socket-patch/pull/1183): NuGet crawl scoped to the restore's `libraries`. #427 (E05 partly fixed). +130 prod, +220 tests.
-- [#1191](https://github.com/SocketDev/socket-patch/pull/1191): 4 more files onto `formats::text`; `PENDING_INLINE_BOMS` 11. Issue #905 (E64 slice 3). +11/−13 production, +74 tests.
-- [#1103](https://github.com/SocketDev/socket-patch/pull/1103): `go.sum` edits through `GoSumEditor` only; oracle-only free helpers deleted. Issue #631 (E52 partly fixed; the move to `formats/golang/sum.rs` remains).
-- [#1185](https://github.com/SocketDev/socket-patch/pull/1185): one Poetry forward splicer (`utils::poetry_lock`); 2.x `files` multi-line in both modes. Issue #936 (E66 fixed). +37/−166 production.
-- Earlier: #1108 (E16 slice 1), #1163 (C41; `blob_hash_matches` remains), #1160, #1153, #1151, #1145, #1141, #1106, #1110, #1117, #1121, #1124, #1021, #1015 (E61; dead `eco == "maven2"` arm in `commands/vendor.rs` left), #889, #876, #886, #870, #865, #858, #850, #607, #602, #597, #587, #583, #581, #574, #572 (see `entries/refactor/`).
+- Earlier: #1191 (E64 slice 3), #1185 (E66), #1103 (E52), #1108 (E16 slice 1), #1163 (C41; `blob_hash_matches` remains), #1160, #1153, #1151, #1145, #1141, #1106, #1110, #1117, #1121, #1124, #1021, #1015 (E61; dead `eco == "maven2"` arm in `commands/vendor.rs` left), #889, #876, #886, #870, #865, #858, #850, #607, #602, #597, #587, #583, #581, #574, #572 (see `entries/refactor/`).
 
 **Queue** (B bugs closed, U unblocks, D duplication removed, R risk; score = 3B + 2U + 2D + S − risk). Since the 2026-10-08 backlog review, standalone refactor issues are closed as `not_planned` and kept as checklist items of their tracker; rank the tracker's next unchecked item.
 
@@ -25,10 +23,10 @@ _Last updated 2026-10-09T05:45Z · main @ f3c6313_
 | 1 | #989 item: one `vendor::revert::finish` for the 12 copied finish blocks | 0 | 1 | ≈12 | L | ≈26 | skipped: every backend file is in an open PR (#1007, #1009, #1026, #1036, #1041, #1161, #1187, #1193, #1211) |
 | 2 | #931 + #998 + #1063 + #1123: one manifest load + error mapper for every command | 4 | 1 | ≈6 | M | ≈24 | skipped: `apply.rs`, `vendor.rs`, `repair.rs`, `remove.rs`, `rollback.rs`, `scan/`, `ledgers.rs`, `args.rs` all in open PRs |
 | 3 | #717 (E10): hosted pom edits + restore through `formats::maven` | 3 | 1 | ≈4 | M | ≈17 | skipped: `redirect/mod.rs` (#1009, #1026, #1180, #1193, #1211) |
-| 4 | #815 (E16) slice 2: `detect_eol` + uv `newline_of` → `terminator` | 0 | 1 | ≈3 | L | ≈8 | **taken: #1227**; maven_reactor (#1036), `redirect/mod.rs`, upstream gem and the Gradle first-line rule remain |
-| 5 | #1220 (C78): bound upstream-restore fan-out through `utils::concurrent::registry_concurrency` | 1 | 0 | ≈4 | L | ≈11 | skipped: `upstream/{npm,pypi,cargo,composer,mod}.rs` and `concurrent.rs` in open PRs |
+| 4 | #1220 (C78): bound upstream-restore fan-out through `utils::concurrent::registry_concurrency` | 1 | 0 | ≈4 | L | ≈11 | skipped: `upstream/{npm,pypi,cargo,composer,mod}.rs` and `concurrent.rs` in open PRs |
+| 5 | #1202 (E93): `PurlKey` NuGet identity through `normalize_nuget_version` | 1 | 1 | ≈1 | L | ≈7 | **taken: #1230**; crawler directory lookup (`nuget_crawler.rs`, #1126) and the move to `formats::nuget` (`nuget_feed.rs`, #1041/#1126) remain |
 
-Re-ranked 2026-10-09T05:00Z at `f3c6313` against 19 `arch-refactor/*` / `agent/fix-*` / `arch-fix/*` PRs changing 346 files; #914 skipped (`jvm_jar.rs` in #1041), #1144 (`vex.rs` in #1041). Free but lower: E16 remainder (`detect_eol` caller in `yarn_classic_lock.rs`, #1211), #1202 (`nuget_feed.rs` in #1041), #1014 (`.mill-version` needs a decision), #265 Maven crawl (no lockfile to scope by: risk H), E37 (`composer_crawler::normalize_version` ≡ `strip_leading_v`, D 1).
+Re-ranked 2026-10-09T06:00Z at `f3c6313` against 25 `arch-refactor/*` / `agent/fix-*` / `arch-fix/*` PRs (and `ci*`) changing 645 files; #914 skipped (`jvm_jar.rs` in #1041), #1144 (`vex.rs` in #1041). Free but lower: #1014 (`.mill-version` needs a decision), #265 Maven crawl (no lockfile to scope by: risk H), E37 (`composer_crawler::normalize_version` ≡ `strip_leading_v`, D 1).
 
 **Notes:**
 - `bench.yml` gates +10% per scenario: time a per-dep reader (hosted converge) in release against `main` before pushing.
@@ -51,6 +49,7 @@ Re-ranked 2026-10-09T05:00Z at `f3c6313` against 19 `arch-refactor/*` / `agent/f
 - `redirect/pipenv.rs`, `vendor/pypi.rs` and `vendor/lock_inventory/vlt.rs` aren't rustfmt-clean on main: format only your own hunks there. Check `rustfmt --check` on the `main` copy before formatting a whole file.
 - `lock_inventory/mod.rs` `architecture_tests` forbid `hosted_patch_uuid*` in a format file's model section. Origin-policy helpers go after the `// ── registry view ──` marker.
 - 2026-10-08: ~40 refactor issues were closed `not_planned` into trackers ("Consolidated work"); that is scheduling, not rejection. Claim/`Fixes` the item's issue only if still open, else reference the tracker.
+- NuGet identity (#1230): `PurlKey` folds versions through `vendor::nuget_feed::normalize_nuget_version` (a utils→vendor import until `nuget_feed.rs` frees for the `formats::nuget` move). `test_support::service_fixture` builds its NuGet grant from `<id>.<purl version>.nupkg`, so a test vendoring a non-normalized version needs that file too.
 - Pushes need verified signatures: commit with the session's default git identity, never an overridden `user.email`.
 - Steering (2026-10-02, #569/#571): no size caps on trusted upstream data; stream, don't buffer.
 - `tests/spawn_env_hygiene.rs` allowlists (`PENDING_RAW_SPAWNS` / `PENDING_SCRUB_COPIES`) fail on new **and** stale entries: drop a file when you migrate it.
