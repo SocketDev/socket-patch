@@ -4,6 +4,7 @@ vlt-compatibility.yml. Parses the workflows with a small reader of the YAML
 subset they use (no PyYAML on the runners)."""
 
 import importlib.util
+import json
 import re
 import unittest
 from pathlib import Path
@@ -48,7 +49,7 @@ def indent(line):
 def scalar(text):
     text = text.strip()
     if len(text) >= 2 and text[0] == text[-1] and text[0] in "'\"":
-        return text[1:-1]
+        return json.loads(text) if text[0] == '"' else text[1:-1].replace("''", "'")
     return text
 
 
@@ -99,7 +100,7 @@ def jobs(text):
     return found
 
 
-def matrix_include(job_lines):
+def matrix_include(job_lines, expand=True):
     """The `strategy.matrix.include` rows of a job (flow or block style)."""
     lines = [strip_comment(l) for l in job_lines]
     at = next(i for i, l in enumerate(lines) if l.strip() == "include:")
@@ -123,13 +124,16 @@ def matrix_include(job_lines):
         elif current is not None and indent(line) > item_indent:
             key, _, value = stripped.partition(":")
             current[key.strip()] = scalar(value)
+    if expand:
+        return [{k: v for k, v in case.items() if k != "ci_group"}
+                for row in rows for case in (json.loads(row["cases"]) if row.get("cases") else [row])]
     return rows
 
 
 def job_rows(jobs_by_id, job):
     """All rows of a job family, including its independent OS siblings."""
     rows = matrix_include(jobs_by_id[job])
-    for os_name in ("windows", "macos"):
+    for os_name in ("windows", "macos", "gradle-mid"):
         sibling = f"{job}-{os_name}"
         if sibling in jobs_by_id:
             rows += matrix_include(jobs_by_id[sibling])
@@ -221,15 +225,13 @@ class CiE2eVltRows(unittest.TestCase):
             self.assertIn(exported, setup)
         node = step(self.ci["e2e"], "Setup Node.js 24 (vlt legs)")
         self.assertIn("node-version: '24.21.0'", node)
-        run = step(self.ci["e2e"], "Run vlt e2e tests")
-        self.assertIn("if: matrix.vlt != ''", run)
-        self.assertIn("SOCKET_PATCH_VLT_E2E_REQUIRED: ${{ matrix.vlt != '' && '1' || '' }}", run)
-        self.assertIn("scripts/check-vlt-legs.py", run)
-        self.assertIn('--binary "$VLT_SUITE"', run,
-                      "a directly run binary prints no cargo `Running` line to name it")
-        self.assertIn("vlt-leg-manifest.json", run)
-        other = step(self.ci["e2e"], "Run e2e tests")
-        self.assertIn("if: matrix.vlt == ''", other)
+        run = step(self.ci["e2e"], "Run e2e tests")
+        self.assertIn("E2E_ROW_JSON: ${{ toJSON(matrix) }}", run)
+        self.assertIn("scripts/ci-e2e-run.py", run)
+        runner = (ROOT / "scripts/ci-e2e-run.py").read_text()
+        self.assertIn("scripts/check-vlt-legs.py", runner)
+        self.assertIn('"--binary", suite', runner)
+        self.assertIn("vlt-leg-manifest.json", runner)
 
     def test_hosted_e2e_proves_vlt_against_production(self):
         hosted = self.ci["hosted-e2e"]

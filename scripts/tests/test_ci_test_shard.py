@@ -88,6 +88,20 @@ class Partition(unittest.TestCase):
         }
         self.assertEqual(shard.integration_targets(metadata), ["e2e_x", "zz"])
 
+    def test_timed_shards_cover_new_targets_and_balance_the_recorded_work(self):
+        timings = json.loads((ROOT / "scripts/ci-test-durations.json").read_text())
+        names = sorted(timings["targets"]) + ["a_new_test_target"]
+        partitions = shard.partition(names, 2, timings)
+        self.assertCountEqual([name for part in partitions for name in part], names)
+        loads = [timings["unit_seconds"], 0.0]
+        for i, part in enumerate(partitions):
+            loads[i] += sum(timings["compile_seconds"] + timings["targets"].get(n, timings["default_seconds"])
+                            for n in part)
+        self.assertLess(abs(loads[0] - loads[1]), 5)
+        actual = [args for k in (1, 2) for args in shard.invocations(k, 2, names, timings=timings)]
+        self.assertCountEqual(selected(actual), names)
+        self.assertEqual(sum("--doc" in args for args in actual), 1)
+
     def test_the_checkout_has_integration_targets(self):
         try:
             out = subprocess.run(["cargo", "metadata", "--no-deps", "--format-version", "1"],
@@ -140,7 +154,7 @@ class CargoSelection(unittest.TestCase):
                                   '    let n = std::hint::black_box(u8::MAX);\n'
                                   '    assert_eq!(n + 1, 0);\n}\n',
                 "one/src/main.rs": 'fn main() {}\n#[test] fn binary_unit() {}\n',
-                "one/tests/shared.rs": '#[test] fn first_shared() {}\n'
+                "one/tests/shared.rs": '#[test] fn first_shared() { assert!(std::path::Path::new(env!("CARGO_BIN_EXE_one")).is_file()); }\n'
                                        '#[test] #[ignore] fn ignored_case() {}\n',
                 "one/tests/tail.rs": '#[test] fn tail_case() {}\n',
                 "two/Cargo.toml": '[package]\nname="two"\nversion="0.1.0"\nedition="2021"\n'
@@ -152,7 +166,7 @@ class CargoSelection(unittest.TestCase):
                 path = root / name
                 path.parent.mkdir(parents=True, exist_ok=True)
                 path.write_text(content, encoding="utf-8")
-            env = dict(os.environ, CARGO_TARGET_DIR=str(root / "target"))
+            env = dict(os.environ, CARGO_TARGET_DIR=str(root / "target"), CARGO_PROFILE_DEV_DEBUG="line-tables-only")
 
             def run(args):
                 result = subprocess.run(args, cwd=root, env=env, capture_output=True, text=True)

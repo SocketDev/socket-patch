@@ -75,7 +75,45 @@ class Scheduling(unittest.TestCase):
         for family in ("e2e", "cargo-vex-matrix"):
             self.assertIn("pattern: e2e-bin-${{ matrix.os }}*", "\n".join(JOBS[family]))
         for job in ("e2e-build-macos", "e2e-macos", "cargo-vex-matrix-macos", "yarn-berry-e2e-macos"):
-            self.assertIn("    if: github.event_name != 'pull_request'", JOBS[job])
+            self.assertTrue(any(line.startswith("    if: github.event_name != 'pull_request'")
+                                for line in JOBS[job]))
+
+    def test_reused_push_keeps_cache_writers_and_full_tier(self):
+        for job in ("clippy", "node-addon", "test", "test-release", "coverage", "e2e-build",
+                    "e2e-build-windows", "e2e-build-macos", "cargo-old-toolchains",
+                    "e2e-full", "cargo-vex-matrix-full", "yarn-berry-full"):
+            with self.subTest(job=job):
+                condition = next((line for line in JOBS[job] if line.startswith("    if:")), "")
+                self.assertNotIn("outputs.reuse", condition)
+        for job in ("docker-base", "yarn-classic-matrix", "yarn-berry-e2e",
+                    "yarn-berry-e2e-macos", "hosted-e2e"):
+            self.assertIn("needs.clippy.outputs.reuse != 'true'", "\n".join(JOBS[job]))
+        for family in ("e2e", "cargo-vex-matrix"):
+            for suffix in ("", "-windows", "-macos"):
+                self.assertIn(f"needs.e2e-build{suffix}.outputs.reuse != 'true'",
+                              "\n".join(JOBS[family + suffix]))
+        for job in ("test", "coverage", "cargo-old-toolchains"):
+            warm = [body for name, body in reader.steps(JOBS[job]) if name.startswith("Warm ")]
+            self.assertEqual(len(warm), 1)
+            self.assertIn("if: needs.clippy.outputs.reuse == 'true'", warm[0])
+            self.assertIn("--no-run", warm[0])
+        self.assertIn("actions: read", "\n".join(JOBS["clippy"]))
+        self.assertIn("steps.merge-queue.outputs.reuse", "\n".join(JOBS["clippy"]))
+        self.assertNotIn("cargo build --workspace", "\n".join(JOBS["test"]))
+        addon = reader.step(JOBS["test"], "Build Node addon")
+        self.assertIn("if: matrix.shard == 1", addon)
+        self.assertIn("cargo build --locked -p socket-patch-node", addon)
+
+    def test_gradle_boundaries_run_on_prs_and_middle_lines_gate_the_queue(self):
+        pr = [r for r in reader.matrix_include(JOBS["e2e"]) if r.get("gradle")]
+        middle = reader.matrix_include(JOBS["e2e-gradle-mid"])
+        self.assertEqual({r["gradle"] for r in pr}, {"6.9.4", "9.8.0"})
+        self.assertEqual({r["gradle"] for r in middle}, {"7.6.6", "8.14.3"})
+        self.assertEqual(len(pr), 8)
+        self.assertEqual(len(middle), 8)
+        self.assertIn("e2e-gradle-mid", dependencies("ci-ok"))
+        self.assertIn("    if: github.event_name != 'pull_request' && needs.e2e-build.outputs.reuse != 'true'",
+                      JOBS["e2e-gradle-mid"])
 
     def test_row_reader_preserves_both_os_siblings(self):
         jobs = reader.jobs("""jobs:

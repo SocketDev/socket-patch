@@ -32,6 +32,11 @@ on:
 permissions:
   contents: read
 
+env:
+  # Keep backtrace file/line information without linking full debug symbols
+  # into every integration binary. Shared dev caches use the same setting.
+  CARGO_PROFILE_DEV_DEBUG: line-tables-only
+
 # A newer push to the same PR supersedes its older run; nothing else is
 # cancelled. Push runs are grouped per commit: a concurrency group holds only
 # ONE pending run, so a shared `refs/heads/main` group silently cancelled every
@@ -50,11 +55,25 @@ jobs:
     if: github.event.pull_request.draft != true
     runs-on: ubuntu-latest
     timeout-minutes: 20
+    permissions:
+      contents: read
+      actions: read
+    outputs:
+      reuse: ${{ steps.merge-queue.outputs.reuse }}
     steps:
       - name: Checkout
         uses: actions/checkout@de0fac2e4500dabe0009e67214ff5f5447ce83dd # v6.0.2
         with:
           persist-credentials: false
+
+      # Main remains the cache writer. Skip duplicate test execution only
+      # when this workflow passed in the merge queue on the identical SHA.
+      - name: Check merge-queue validation
+        id: merge-queue
+        if: github.event_name == 'push' && github.ref == 'refs/heads/main'
+        env:
+          GH_TOKEN: ${{ github.token }}
+        run: python3 scripts/ci-reuse-merge-group.py
 
       - name: Install Rust
         # rustup is pre-installed on GitHub-hosted runners. `rustup show`
@@ -119,6 +138,7 @@ jobs:
         run: node crates/socket-patch-node/npm/scripts/build-addon.mjs
 
       - name: Smoke-test addon
+        if: needs.clippy.outputs.reuse != 'true'
         run: node --test crates/socket-patch-node/npm/test/smoke.mjs
 
   # Check the standalone installer, release scripts, and native installer
@@ -265,17 +285,20 @@ jobs:
       matrix:
         os: [macos-latest, windows-latest]
         # Two legs per OS (scripts/ci-test-shard.py): one leg linked ~240
-        # test binaries and ran them serially for ~26 min, the merge queue's
-        # critical path. Shard 1 = unit tests + doctests + a third of the
-        # integration targets; shard 2 = the rest.
+        # test binaries and ran them serially for ~26 min. Windows balances
+        # measured runtime plus linking work; macOS keeps the count split.
+        # Shard 1 also owns unit tests and doctests.
         shard: [1, 2]
         exclude:
           # macOS legs run on main, the merge queue and nightly, not per PR push.
           - os: ${{ github.event_name == 'pull_request' && 'macos-latest' || '' }}
+          # One compile-only writer per OS is enough for an already tested SHA.
+          - shard: ${{ needs.clippy.outputs.reuse == 'true' && 2 || 0 }}
     runs-on: ${{ matrix.os }}
     timeout-minutes: 50
     env:
       VEXCTL_VERSION: v0.3.0
+      CI_TEST_TIMINGS: ${{ matrix.os == 'windows-latest' && 'scripts/ci-test-durations.json' || '' }}
     steps:
       - name: Checkout
         uses: actions/checkout@de0fac2e4500dabe0009e67214ff5f5447ce83dd # v6.0.2
@@ -297,10 +320,18 @@ jobs:
           shared-key: dev-${{ matrix.os }}
           save-if: ${{ github.ref == 'refs/heads/main' }}
 
-      - name: Build
-        run: cargo build --workspace
+      # cargo test builds the CLI/bench executables itself. The addon is a
+      # cdylib with test=false, so retain its platform link check once per OS.
+      - name: Build Node addon
+        if: matrix.shard == 1
+        run: cargo build --locked -p socket-patch-node
+
+      - name: Warm the test cache after merge-queue validation
+        if: needs.clippy.outputs.reuse == 'true'
+        run: cargo test --locked --workspace --no-run
 
       - name: Install Go (for vexctl)
+        if: needs.clippy.outputs.reuse != 'true'
         id: go
         # The `vex` subcommand emits OpenVEX documents; tests/e2e_vex.rs
         # validates the output with vexctl when it's on PATH. vexctl is
@@ -324,13 +355,14 @@ jobs:
         # version, the Go toolchain and the runner, so it is cached under
         # exactly those. Saved from main only, like the cargo cache.
         id: vexctl-cache
-        if: runner.os == 'macOS'
+        if: needs.clippy.outputs.reuse != 'true' && runner.os == 'macOS'
         uses: actions/cache/restore@caa296126883cff596d87d8935842f9db880ef25 # v5.1.0
         with:
           path: ${{ runner.temp }}/vexctl-bin
           key: vexctl-${{ env.VEXCTL_VERSION }}-go${{ steps.go.outputs.go-version }}-${{ runner.os }}-${{ runner.arch }}
 
       - name: Install vexctl
+        if: needs.clippy.outputs.reuse != 'true'
         # Linux / Windows: the v0.3.0 release binary, checked against the
         # sha256 pinned here (from the release's vexctl_checksums.txt).
         # Compiling it took ~80s on ubuntu and ~180s on windows, the
@@ -394,7 +426,8 @@ jobs:
 
       - name: Save vexctl (macOS)
         if: >-
-          runner.os == 'macOS'
+          needs.clippy.outputs.reuse != 'true'
+          && runner.os == 'macOS'
           && github.ref == 'refs/heads/main'
           && steps.vexctl-cache.outputs.cache-hit != 'true'
         uses: actions/cache/save@caa296126883cff596d87d8935842f9db880ef25 # v5.1.0
@@ -403,6 +436,7 @@ jobs:
           key: ${{ steps.vexctl-cache.outputs.cache-primary-key }}
 
       - name: Run tests
+        if: needs.clippy.outputs.reuse != 'true'
         # Default features only: `--all-features` would also RUN the
         # docker-e2e suites, which soft-skip as "ok" here (no images, and
         # macOS/Windows have no Docker) — fake greens hiding a broken
@@ -514,7 +548,15 @@ jobs:
         with:
           save-if: ${{ github.ref == 'refs/heads/main' }}
 
+      - name: Warm the coverage cache after merge-queue validation
+        if: needs.clippy.outputs.reuse == 'true'
+        run: |
+          cargo llvm-cov show-env --sh > "$RUNNER_TEMP/coverage-env.sh"
+          source "$RUNNER_TEMP/coverage-env.sh"
+          cargo test --locked --workspace --no-run
+
       - name: Install Go (for vexctl and the real-go suites)
+        if: needs.clippy.outputs.reuse != 'true'
         # This job is the Linux leg of `test` (see there): same Go pin.
         uses: actions/setup-go@4a3601121dd01d1626a1e23e37211e3254c1c06c # v6.4.0
         with:
@@ -522,6 +564,7 @@ jobs:
           cache: false
 
       - name: Install vexctl
+        if: needs.clippy.outputs.reuse != 'true'
         # The v0.3.0 Linux release binary, as in `test`'s vexctl step.
         env:
           VEXCTL_VERSION: v0.3.0
@@ -538,10 +581,11 @@ jobs:
           echo "$dir" >> "$GITHUB_PATH"
 
       - name: Run tests with coverage
+        if: needs.clippy.outputs.reuse != 'true'
         # Two-step pattern: `--no-report` runs instrumented tests and
-        # collects the raw profile data, then the two `report` calls
-        # emit lcov + summary from the same data. Avoids re-running
-        # tests twice. The output filename matches the `*.lcov`
+        # collects raw profiles, then one `report` exports LCOV. Derive
+        # line/function/branch totals from that file instead of merging
+        # profiles and scanning objects a second time. The filename matches the `*.lcov`
         # gitignore pattern so a stray local run can't accidentally
         # commit a 600 KB report.
         #
@@ -559,10 +603,11 @@ jobs:
           cargo llvm-cov --workspace --no-fail-fast \
             --no-report
           cargo llvm-cov report --lcov --output-path coverage-host.lcov
-          cargo llvm-cov report --summary-only | tee coverage-summary.txt
+          python3 scripts/ci-lcov-summary.py coverage-host.lcov > coverage-summary.txt
 
       - name: Publish coverage summary to job summary
-        # Render the per-file table cargo-llvm-cov prints as a fenced
+        if: needs.clippy.outputs.reuse != 'true'
+        # Render the per-file LCOV totals as a fenced
         # block in the GitHub Actions job summary so reviewers don't
         # need to crack open the artifact for a quick look.
         run: |
@@ -578,6 +623,7 @@ jobs:
           } >> "$GITHUB_STEP_SUMMARY"
 
       - name: Upload host LCOV artifact
+        if: needs.clippy.outputs.reuse != 'true'
         uses: ./.github/actions/upload-artifact
         with:
           name: coverage-host
@@ -588,7 +634,7 @@ jobs:
   # Dockerfile.base compiles the full-LTO release binary inside Docker, with
   # no cache. Build it once per run and hand the image to every docker leg.
   docker-base:
-    if: github.event.pull_request.draft != true
+    if: github.event.pull_request.draft != true && needs.clippy.outputs.reuse != 'true'
     needs: clippy
     runs-on: ubuntu-22.04
     timeout-minutes: 30
@@ -709,6 +755,11 @@ jobs:
           file: tests/docker/Dockerfile.${{ matrix.ecosystem }}
           tags: socket-patch-test-${{ matrix.ecosystem }}:latest
           load: true
+          # Match the blocking agent_sbt_ slice below. The nightly and
+          # compatibility workflows retain Dockerfile.sbt's full defaults.
+          build-args: |
+            ${{ matrix.ecosystem == 'sbt' && 'SBT_WARM_VERSIONS=1.2.8 1.13.0' || '' }}
+            ${{ matrix.ecosystem == 'sbt' && 'SBT_WARM_TOOLS=0' || '' }}
 
       - name: Configure docker-e2e coverage hooks
         # Mount the instrumented socket-patch that the test step's own
@@ -870,6 +921,8 @@ jobs:
   # test binaries directly from the same checkout path, so `CARGO_BIN_EXE_*`
   # and `CARGO_MANIFEST_DIR` resolve as they did under `cargo test`.
   e2e-build:
+    outputs:
+      reuse: ${{ needs.clippy.outputs.reuse }}
     if: github.event.pull_request.draft != true
     needs: clippy
     strategy:
@@ -903,12 +956,14 @@ jobs:
           cargo test --locked -p socket-patch-cli --all-features --tests --no-run --message-format=json-render-diagnostics > target-build.json
 
       - name: Bundle the binaries the legs run
+        if: needs.clippy.outputs.reuse != 'true' || matrix.os == 'ubuntu-latest'
         shell: bash
         env:
           BUNDLE_OS: ${{ matrix.os }}
         run: python3 scripts/ci-e2e-bundle.py --os "$BUNDLE_OS" --cargo-json target-build.json --dest target/e2e-bin
 
       - name: Compress the e2e binaries
+        if: needs.clippy.outputs.reuse != 'true' || matrix.os == 'ubuntu-latest'
         # Compress the bundle as one stream so identical Rust code across
         # test binaries shares a dictionary. Zstd is on every runner image.
         # The 128 MiB window cuts the Linux artifact from ~200 MB to ~94 MB;
@@ -919,6 +974,7 @@ jobs:
           tar -C target/e2e-bin -cf - . | zstd -q -f -10 --long=27 -o target/e2e-bin.tar.zst
 
       - uses: ./.github/actions/upload-artifact
+        if: needs.clippy.outputs.reuse != 'true' || matrix.os == 'ubuntu-latest'
         with:
           name: e2e-bin-${{ matrix.os }}
           path: target/e2e-bin.tar.zst
@@ -927,6 +983,8 @@ jobs:
           retention-days: 3
 
   e2e-build-windows:
+    outputs:
+      reuse: ${{ needs.clippy.outputs.reuse }}
     if: github.event.pull_request.draft != true
     needs: clippy
     strategy:
@@ -939,6 +997,8 @@ jobs:
     steps: *e2e-build-steps
 
   e2e-build-macos:
+    outputs:
+      reuse: ${{ needs.clippy.outputs.reuse }}
     if: github.event_name != 'pull_request'
     needs: clippy
     strategy:
@@ -950,325 +1010,74 @@ jobs:
     env: *e2e-build-env
     steps: *e2e-build-steps
 
+  # Short cases share setup and artifact downloads. `cases` preserves each
+  # original suite/filter/toolchain row; ci-e2e-run.py isolates its environment
+  # and checks every result. Repack with scripts/ci-e2e-groups.py --write.
   e2e:
+    name: e2e (${{ matrix.os }}, ${{ matrix.ci_group }})
+    if: needs.e2e-build.outputs.reuse != 'true'
     # These jobs consume e2e-build's binaries and can run alongside unit tests.
     needs: [e2e-build]
     strategy:
       fail-fast: false
       matrix:
         include:
-          # (No e2e_cargo / e2e_golang rows: neither suite has an
-          # `#[ignore]`-gated test or needs a real toolchain, so the `test`
-          # job already runs all of them. No e2e_maven / e2e_nuget /
-          # e2e_composer rows either: their tests are hermetic and not
-          # `#[ignore]`d, so `test` runs them on every OS.)
-          # Host build-proof capstones: fresh-checkout install + revert
-          # against the REAL composer/bundler toolchains, each ending in the
-          # manifest-less VEX matrix. `#[ignore]`-gated (the unpinned `test`
-          # job skips them); `composer:` / `bundler:` install that exact
-          # toolchain below, runs them via `--ignored`, and exports the
-          # suites' `_REQUIRED` + `_VERSION` gates so a leg hard-fails
-          # instead of skipping on a missing or wrong toolchain.
-          # ubuntu-latest only — they need the pinned toolchain, not per-OS
-          # coverage.
-          #
-          # composer: 1 (packagist stopped serving composer 1 on 2025-09-01,
-          # so the fixture resolves from an inline repository), 2.2 LTS and
-          # current 2. Every release from 1.x through 2.9 falls back to the
-          # git `source` when the dist download fails (the fallback the
-          # hosted redirect must drop); 2.10 does not. The exact-release
-          # matrix, 2.9.8 and macOS/Windows included, is
-          # composer-compatibility.yml.
-          # Both capstones share one leg per composer line: the setup is
-          # identical and the run step loops over `suite`.
-          - {os: ubuntu-latest, suite: e2e_vendor_composer_build e2e_redirect_composer_build, composer: '2'}
-          - {os: ubuntu-latest, suite: e2e_vendor_composer_build e2e_redirect_composer_build, composer: '2.2'}
-          - {os: ubuntu-latest, suite: e2e_vendor_composer_build e2e_redirect_composer_build, composer: '1'}
-          # Real-bundler gem capstones, one leg per bundler era. Boundaries:
-          # 1.17/2.1 merged GEM section, 2.2 separate sections, 2.5 last
-          # pre-CHECKSUMS, 2.6 CHECKSUMS, 4.0.15/4.0.21 before/after the
-          # strict frozen check (rubygems#9750). bundler <= 2.2 needs
-          # Ruby <= 3.3 and 1.17-2.1 need Ruby <= 3.1 (`untaint`). 2.7.2
-          # (no boundary of its own) is in e2e-full.
-          # Hosted and vendored share each era's leg (one Ruby + bundler
-          # setup; the run step loops over `suite`).
-          - {os: ubuntu-latest, suite: e2e_redirect_gem_build e2e_vendor_gem_build, ruby: '3.1', bundler: '1.17.3'}
-          - {os: ubuntu-latest, suite: e2e_redirect_gem_build e2e_vendor_gem_build, ruby: '3.1', bundler: '2.1.4'}
-          - {os: ubuntu-latest, suite: e2e_redirect_gem_build e2e_vendor_gem_build, ruby: '3.1', bundler: '2.2.33'}
-          - {os: ubuntu-latest, suite: e2e_redirect_gem_build e2e_vendor_gem_build, ruby: '3.3', bundler: '2.5.23'}
-          - {os: ubuntu-latest, suite: e2e_redirect_gem_build e2e_vendor_gem_build, ruby: '3.3', bundler: '2.6.9'}
-          - {os: ubuntu-latest, suite: e2e_redirect_gem_build e2e_vendor_gem_build, ruby: '3.4', bundler: '4.0.15'}
-          - {os: ubuntu-latest, suite: e2e_redirect_gem_build e2e_vendor_gem_build, ruby: '3.4', bundler: '4.0.21'}
-          # The live-API smoke suites (e2e_npm, e2e_pypi, e2e_gem,
-          # e2e_scan) are intentionally NOT in the PR matrix — their
-          # `#[ignore]`-gated tests hit the real public proxy at
-          # patches-api.socket.dev, which intermittently returns
-          # 503 "Service temporarily over capacity" outside this
-          # repo's control. Run on demand:
-          #
-          #   cargo test -p socket-patch-cli --test e2e_npm  -- --ignored
-          #   cargo test -p socket-patch-cli --test e2e_pypi -- --ignored
-          #   cargo test -p socket-patch-cli --test e2e_gem  -- --ignored
-          #   cargo test -p socket-patch-cli --test e2e_scan -- --ignored
-          #
-          # Same policy for the self-update live smoke (hits real
-          # github.com releases; catches asset-naming/redirect/SUMS
-          # drift against the published pipeline — most useful right
-          # after a release):
-          #
-          #   cargo test -p socket-patch-cli --test self_update_e2e -- --ignored
-          #
-          # PR-time coverage for the same code paths comes from the
-          # `e2e-docker` matrix below, which runs the same flow
-          # against a hermetic wiremock fixture.
-          # Safety-hardening e2e suites. The fast non-ignored ones
-          # (e2e_safety_lock, e2e_safety_yarn_pnp) run via the
-          # standard `test` job above on all three platforms, so no
-          # matrix entry is needed for them. e2e_safety_pnpm below needs a
-          # real pnpm and is #[ignore]-gated; e2e_safety_cargo_build runs in
-          # every cargo-vex-matrix leg (ubuntu, macOS and Windows).
-          - os: ubuntu-latest
-            suite: e2e_safety_pnpm
-          # pnpm-on-Windows uses junctions for symlinks and copies
-          # (not hardlinks) by default, so the CoW invariant holds
-          # vacuously. Test still runs to verify apply doesn't error
-          # on Windows — semantic Windows nlink coverage is a
-          # follow-up (`std::fs::Metadata` doesn't expose nlink on
-          # Windows; needs `GetFileInformationByHandle` via
-          # `windows-sys`).
-          # Wall-bound real-package-manager redirect capstones (~150s and
-          # ~70s of network installs + bootstrap resolutions — profile-
-          # insensitive, measured identical in debug and release). They ran
-          # inside the serial `test` job on every OS; #[ignore]-gated out of
-          # it and relocated here so they still run on every PR and every
-          # OS, but in parallel off the critical path. They use the runner's
-          # default node/corepack, exactly as they did inside `test` — no
-          # setup-node step, no version change.
-          #
-          # `npm_required` turns the npm suites' "npm not installed" soft-skip
-          # into a hard failure, on every OS: the suite resolves npm through
-          # PATHEXT, so Windows finds the `npm.cmd` shim instead of skipping.
-          - os: ubuntu-latest
-            suite: e2e_redirect_npm_build
-            npm_required: '1'
-          - os: ubuntu-latest
-            suite: e2e_redirect_rush_sim
-          # Hermetic real-bun capstones (wiremock patch service, real `bun
-          # install`): hosted (`e2e_redirect_bun_build`), vendored
-          # (`e2e_vendor_bun_build`) and the hosted⇄vendored takeover /
-          # scoped-rollback suite (`mode_migration_bun`). They are NOT
-          # `#[ignore]`-gated, so `test_filter: --include-ignored` is
-          # mandatory — the job default `-- --ignored` would select zero
-          # tests and pass vacuously (the e2e_composer trap above). The
-          # runner images ship no bun, so without the `bun:` key below the
-          # suites soft-skip; `bun:` installs that exact release via
-          # setup-bun and exports SOCKET_PATCH_BUN_E2E_REQUIRED=1 (+ the
-          # pinned version), under which the suites hard-fail instead of
-          # skipping when bun is missing, the wrong version, or the fixture
-          # install produces no text lock.
-          #
-          # Lock-era legs (ubuntu only): bun's text lock has three
-          # grammars — lockfileVersion 0 (opt-in `--save-text-lockfile`,
-          # 1.1.39–1.1.45; 2-tuple workspace entries), 1 (default from
-          # 1.2.0 through 1.3.x) and 2 (1.4.0+). Registry 4-tuples are
-          # identical across them but the workspace grammar, the lockb
-          # migration recipe and tarball digest enforcement (URL/local
-          # tarball sha512 checked only from 1.3.10) all differ, so the
-          # latest release alone cannot prove the rewrite + fresh install
-          # round-trip on the locks real projects commit. 1.1.45 = last v0
-          # writer, 1.2.23 = v1, 1.3.14 = last pre-v2 default, 1.4.2 = v2.
-          #
-          # One leg per bun release runs all three suites (the run step
-          # loops over `suite`); e2e_bun_lockb keeps its own legs because
-          # the SOCKET_PATCH_BUN_LOCKB_* gates key on the row's suite.
-          - os: ubuntu-latest
-            suite: e2e_redirect_bun_build e2e_vendor_bun_build mode_migration_bun
-            bun: '1.4.2'
-            test_filter: --include-ignored
-          - os: ubuntu-latest
-            suite: e2e_redirect_bun_build e2e_vendor_bun_build mode_migration_bun
-            bun: '1.1.45'
-            test_filter: --include-ignored
-          - os: ubuntu-latest
-            suite: e2e_redirect_bun_build e2e_vendor_bun_build mode_migration_bun
-            bun: '1.2.23'
-            test_filter: --include-ignored
-          - os: ubuntu-latest
-            suite: e2e_redirect_bun_build e2e_vendor_bun_build mode_migration_bun
-            bun: '1.3.14'
-            test_filter: --include-ignored
-          # The binary bun.lockb era (1.0 / 1.1 lines) through e2e_bun_lockb,
-          # which reads the SOCKET_PATCH_BUN_LOCKB_* gates exported for it
-          # below.
-          - {os: ubuntu-latest, suite: e2e_bun_lockb, bun: '1.0.36', test_filter: --include-ignored}
-          - {os: ubuntu-latest, suite: e2e_bun_lockb, bun: '1.1.45', test_filter: --include-ignored}
-          # Bun >= 1.4 migrating a hosted workspace bun.lockb to bun.lock
-          # (#803; its reader must be 1.4+) and a vendored one, then
-          # reverting it (#784; skipped by the < 1.2 readers above). Both
-          # 1.4.2 and 1.3.14 also run the isolated-linker vendored re-run
-          # after a late dependent (#861); 1.3 re-hoists a frozen binary lock
-          # and refuses one whose trees changed.
-          - {os: ubuntu-latest, suite: e2e_bun_lockb, bun: '1.4.2', test_filter: --include-ignored text_migration workspace_late_dependent}
-          - {os: ubuntu-latest, suite: e2e_bun_lockb, bun: '1.3.14', test_filter: --include-ignored workspace_late_dependent}
-          # Real-vlt capstones (DESIGN §8.4): wiremock patch service and a local
-          # npm registry fed from npmjs, driven by the pinned vlt release
-          # (`node vlt.js`, installed below from a sha512-checked `npm pack`).
-          # Every test is `#[ignore]`d and named `vlt_pinned_matrix_*`, so the
-          # filter must be `--include-ignored vlt_pinned_matrix` (the job
-          # default `--ignored` selects nothing). The run pipes through
-          # scripts/check-vlt-legs.py, which fails on `0 passed` or any leg
-          # line the manifest does not predict. The eras: A0 0.0.0-16, A
-          # 0.0.0-32, B rc.12/rc.14 (rc.14 legs reach public npm), C rc.32,
-          # D 1.0.4/1.0.7, E 1.1.1, F 1.2.0.
-          - {os: ubuntu-latest, suite: e2e_redirect_vlt_build, vlt: '1.2.0', test_filter: --include-ignored vlt_pinned_matrix}
-          - {os: ubuntu-latest, suite: e2e_redirect_vlt_build, vlt: '0.0.0-16', test_filter: --include-ignored vlt_pinned_matrix}
-          - {os: ubuntu-latest, suite: e2e_redirect_vlt_build, vlt: '0.0.0-32', test_filter: --include-ignored vlt_pinned_matrix}
-          - {os: ubuntu-latest, suite: e2e_redirect_vlt_build, vlt: '1.0.0-rc.14', test_filter: --include-ignored vlt_pinned_matrix}
-          - {os: ubuntu-latest, suite: e2e_redirect_vlt_build, vlt: '1.0.0-rc.32', test_filter: --include-ignored vlt_pinned_matrix}
-          - {os: ubuntu-latest, suite: e2e_redirect_vlt_build, vlt: '1.0.4', test_filter: --include-ignored vlt_pinned_matrix}
-          - {os: ubuntu-latest, suite: e2e_redirect_vlt_build, vlt: '1.1.1', test_filter: --include-ignored vlt_pinned_matrix}
-          - {os: ubuntu-latest, suite: e2e_vendor_vlt_build, vlt: '1.2.0', test_filter: --include-ignored vlt_pinned_matrix}
-          - {os: ubuntu-latest, suite: e2e_vendor_vlt_build, vlt: '0.0.0-32', test_filter: --include-ignored vlt_pinned_matrix}
-          - {os: ubuntu-latest, suite: e2e_vendor_vlt_build, vlt: '1.0.0-rc.14', test_filter: --include-ignored vlt_pinned_matrix}
-          - {os: ubuntu-latest, suite: e2e_vendor_vlt_build, vlt: '1.0.0-rc.32', test_filter: --include-ignored vlt_pinned_matrix}
-          - {os: ubuntu-latest, suite: e2e_vendor_vlt_build, vlt: '1.0.4', test_filter: --include-ignored vlt_pinned_matrix}
-          - {os: ubuntu-latest, suite: mode_migration_vlt, vlt: '1.2.0', test_filter: --include-ignored vlt_pinned_matrix}
-          - {os: ubuntu-latest, suite: mode_migration_vlt, vlt: '0.0.0-32', test_filter: --include-ignored vlt_pinned_matrix}
-          - {os: ubuntu-latest, suite: mode_migration_vlt, vlt: '1.0.0-rc.14', test_filter: --include-ignored vlt_pinned_matrix, vlt_upgrade: '1.2.0'}
-          # Linux `auto` hardlinks from the global store; every OS gets the
-          # explicit hardlink linker.
-          - {os: ubuntu-latest, suite: e2e_safety_vlt, vlt: '1.2.0', test_filter: --include-ignored vlt_pinned_matrix}
-          - {os: ubuntu-latest, suite: e2e_safety_vlt, vlt: '1.2.0', test_filter: --include-ignored vlt_pinned_matrix, vlt_store_linker: 'hardlink'}
-          # rc.12 gets the definite no-hook advisory; windows rc.14 runs the
-          # legacy DepIDs on NTFS with pre-junction symlinks.
-          - {os: ubuntu-latest, suite: e2e_vlt, vlt: '1.2.0', test_filter: --include-ignored vlt_pinned_matrix}
-          - {os: ubuntu-latest, suite: e2e_vlt, vlt: '0.0.0-32', test_filter: --include-ignored vlt_pinned_matrix}
-          - {os: ubuntu-latest, suite: e2e_vlt, vlt: '1.0.0-rc.12', test_filter: --include-ignored vlt_pinned_matrix}
-          - {os: ubuntu-latest, suite: e2e_vlt, vlt: '1.0.0-rc.32', test_filter: --include-ignored vlt_pinned_matrix}
-          - {os: ubuntu-latest, suite: e2e_vlt, vlt: '1.0.7', test_filter: --include-ignored vlt_pinned_matrix}
-          # The named corepack pnpm hosted legs (pnpm 7-11, get-uuid,
-          # zero-touch, --trust-lockfile). `#[ignore]`d; the pinned matrix
-          # inside the same suite runs in pnpm-compatibility.yml, hence the
-          # skip. Node 24 (step below): the
-          # corepack pnpm@10/11 legs require it.
-          - {os: ubuntu-latest, suite: e2e_redirect_pnpm_build, test_filter: '--ignored --skip pnpm_pinned_matrix'}
-          # Real-uv hosted/vendored capstones ending in manifest-less VEX:
-          # the oldest and newest line + the 0.5.x boundary (0.5.4 still
-          # re-resolves a transitive override / rejects a repointed
-          # constraint under --locked; 0.5.5 keeps both). The other 0.N
-          # lines and 0.5.3/0.5.6 are in e2e-full.
-          - {os: ubuntu-latest, suite: e2e_redirect_uv_build, uv: '0.1.45'}
-          - {os: ubuntu-latest, suite: e2e_redirect_uv_build, uv: '0.5.4'}
-          - {os: ubuntu-latest, suite: e2e_redirect_uv_build, uv: '0.5.5'}
-          - {os: ubuntu-latest, suite: e2e_redirect_uv_build, uv: '0.12.17'}
-          - {os: ubuntu-latest, suite: e2e_vendor_pypi_build, uv: '0.1.45', test_filter: --include-ignored}
-          - {os: ubuntu-latest, suite: e2e_vendor_pypi_build, uv: '0.5.4', test_filter: --include-ignored}
-          - {os: ubuntu-latest, suite: e2e_vendor_pypi_build, uv: '0.5.5', test_filter: --include-ignored}
-          - {os: ubuntu-latest, suite: e2e_vendor_pypi_build, uv: '0.12.17', test_filter: --include-ignored}
-          # The Poetry / PDM / Hatch / Pipenv / pip / deno manifest-less VEX
-          # capstones share ONE test binary (`e2e_vex_build`, a module per
-          # tool — one optimized link in test-release instead of six), so
-          # each leg's `test_filter` names its tool's module and keeps
-          # `--ignored`.
-          # Real-Poetry hosted + vendored capstones (#[ignore]-gated,
-          # unix-only). One leg per major / lock format: 1.0 (lock 1.0),
-          # 1.1 (lock 1.1), 1.8 (lock 2.0), 2.0 (first lock 2.1 writer),
-          # current.
-          - {os: ubuntu-latest, suite: e2e_vex_build, test_filter: 'poetry:: --ignored', poetry: '1.0.10'}
-          - {os: ubuntu-latest, suite: e2e_vex_build, test_filter: 'poetry:: --ignored', poetry: '1.1.15'}
-          - {os: ubuntu-latest, suite: e2e_vex_build, test_filter: 'poetry:: --ignored', poetry: '1.8.5'}
-          - {os: ubuntu-latest, suite: e2e_vex_build, test_filter: 'poetry:: --ignored', poetry: '2.0.1'}
-          - {os: ubuntu-latest, suite: e2e_vex_build, test_filter: 'poetry:: --ignored', poetry: '2.4.3'}
-          # Real PDM / Hatch capstones (wiremock Socket API that also serves
-          # the hosted wheel; PyPI for the tool bootstrap + six).
-          # PDM: lock 2 (1.4), refused 3.1 (1.15) and 4.2 (2.7), 4.3 (2.8),
-          # the hishel<1 bootstrap window (2.25) and current.
-          - {os: ubuntu-latest, suite: e2e_vex_build, test_filter: 'pdm:: --ignored', pdm: '1.4.5'}
-          - {os: ubuntu-latest, suite: e2e_vex_build, test_filter: 'pdm:: --ignored', pdm: '1.15.5'}
-          - {os: ubuntu-latest, suite: e2e_vex_build, test_filter: 'pdm:: --ignored', pdm: '2.7.4'}
-          - {os: ubuntu-latest, suite: e2e_vex_build, test_filter: 'pdm:: --ignored', pdm: '2.8.2'}
-          - {os: ubuntu-latest, suite: e2e_vex_build, test_filter: 'pdm:: --ignored', pdm: '2.25.9'}
-          - {os: ubuntu-latest, suite: e2e_vex_build, test_filter: 'pdm:: --ignored', pdm: '2.29.2'}
-          # Hatch: 1.0 (hatch.toml env vendoring refused, needs >= 1.2),
-          # 1.2, the virtualenv<21 window (1.9, 1.14) and current.
-          - {os: ubuntu-latest, suite: e2e_vex_build, test_filter: 'hatch:: --ignored', hatch: '1.0.0'}
-          - {os: ubuntu-latest, suite: e2e_vex_build, test_filter: 'hatch:: --ignored', hatch: '1.2.1'}
-          - {os: ubuntu-latest, suite: e2e_vex_build, test_filter: 'hatch:: --ignored', hatch: '1.9.7'}
-          - {os: ubuntu-latest, suite: e2e_vex_build, test_filter: 'hatch:: --ignored', hatch: '1.14.2'}
-          - {os: ubuntu-latest, suite: e2e_vex_build, test_filter: 'hatch:: --ignored', hatch: '1.18.1'}
-          # Real Pipenv / pip capstones (mock patch server; the tools are
-          # bootstrapped from PyPI). `pipenv:` / `pip:` hold one or more
-          # space-separated releases the suite loops over. The middle
-          # Pipenv releases are in e2e-full.
-          - {os: ubuntu-latest, suite: e2e_vex_build, test_filter: 'pipenv:: --ignored', pipenv: '2022.12.19'}
-          - {os: ubuntu-latest, suite: e2e_vex_build, test_filter: 'pipenv:: --ignored', pipenv: '2026.8.0'}
-          - {os: ubuntu-latest, suite: e2e_vex_build, test_filter: 'pip:: --ignored', pip: '22 23 24 25 26'}
-          # Real-Maven hosted + vendored capstones, one leg per Maven line:
-          # 3.6 (pre http-blocker), 3.8 (resolver 1.6: no trusted checksums),
-          # 3.9 (trusted checksums), 4.0 rc. Hosted also runs both sides of
-          # the trusted-checksums floor: 3.9.3 (last release that ignores
-          # the .mvn/checksums pin) and 3.9.4 (first that enforces it).
-          # Lines that run both capstones run them in one leg (one Maven
-          # install; the run step loops over `suite`).
-          - {os: ubuntu-latest, suite: e2e_redirect_maven_build e2e_vendor_maven_build, jvm_tool: maven, maven: '3.6.3'}
-          - {os: ubuntu-latest, suite: e2e_redirect_maven_build e2e_vendor_maven_build, jvm_tool: maven, maven: '3.8.9'}
-          - {os: ubuntu-latest, suite: e2e_redirect_maven_build e2e_vendor_maven_build, jvm_tool: maven, maven: '3.9.16'}
-          - {os: ubuntu-latest, suite: e2e_redirect_maven_build e2e_vendor_maven_build, jvm_tool: maven, maven: '4.0.0-rc-6'}
-          - {os: ubuntu-latest, suite: e2e_redirect_maven_build, jvm_tool: maven, maven: '3.9.3'}
-          - {os: ubuntu-latest, suite: e2e_redirect_maven_build, jvm_tool: maven, maven: '3.9.4'}
-          - {os: ubuntu-latest, suite: e2e_vendor_jvm_build, jvm_tool: maven, maven: '3.6.3', test_filter: '--ignored maven_reactor'}
-          - {os: ubuntu-latest, suite: e2e_vendor_jvm_build, jvm_tool: maven, maven: '3.8.9', test_filter: '--ignored maven_reactor'}
-          - {os: ubuntu-latest, suite: e2e_vendor_jvm_build, jvm_tool: maven, maven: '3.9.2', test_filter: '--ignored maven_reactor'}
-          - {os: ubuntu-latest, suite: e2e_vendor_jvm_build, jvm_tool: maven, maven: '3.9.16', test_filter: '--ignored maven_reactor'}
-          - {os: ubuntu-latest, suite: e2e_vendor_jvm_build, jvm_tool: maven, maven: '4.0.0-rc-6', test_filter: '--ignored maven_reactor'}
-          # Real-Gradle capstones, PR tier: one leg per Gradle line x {agent +
-          # hosted, vendor + multi-project} on ubuntu, each on its line's LTS
-          # JDK. Every other OS x line x mode cell (and the JDK-ceiling,
-          # configuration-cache, Isolated Projects and real-Central rows) runs
-          # in gradle-compatibility.yml. `suite` lists every binary the leg
-          # runs (space-separated); the libtest filters select by the prefix
-          # contract ci-e2e-bundle.py enforces. Every suite has landed, so no
-          # row sets `allow_empty` (test_ci_gradle_prefixes.py keeps it that
-          # way): a missing suite fails the leg, and every suite must run at
-          # least one test on its own. Maven is installed only where a
-          # selected test needs it (gradle_vendor_395's mixed root).
-          # The hosted suite (~43 real-Gradle builds, ~31 min serially) is
-          # split into three legs per line so it stops being the merge-queue
-          # critical path: the agent suites plus `gradle_hosted_[345]`, the
-          # `gradle_hosted_[b-p]` names, and a catch-all that `--skip`s
-          # exactly those words, so a new test always lands in some leg
-          # (test_ci_gradle_prefixes.py keeps the skip list in sync).
-          - {os: ubuntu-latest, suite: 'e2e_gradle_discovery_build e2e_gradle_agent_build e2e_redirect_gradle_build', jvm_tool: gradle, gradle: '6.9.4', java: '11', test_filter: '--ignored gradle_agent_ gradle_hosted_3 gradle_hosted_4 gradle_hosted_5'}
-          - {os: ubuntu-latest, suite: e2e_redirect_gradle_build, jvm_tool: gradle, gradle: '6.9.4', java: '11', test_filter: '--ignored gradle_hosted_b gradle_hosted_c gradle_hosted_d gradle_hosted_e gradle_hosted_f gradle_hosted_l gradle_hosted_m gradle_hosted_n gradle_hosted_o gradle_hosted_p'}
-          - {os: ubuntu-latest, suite: e2e_redirect_gradle_build, jvm_tool: gradle, gradle: '6.9.4', java: '11', test_filter: '--ignored gradle_hosted_ --skip gradle_hosted_3 --skip gradle_hosted_4 --skip gradle_hosted_5 --skip gradle_hosted_b --skip gradle_hosted_c --skip gradle_hosted_d --skip gradle_hosted_e --skip gradle_hosted_f --skip gradle_hosted_l --skip gradle_hosted_m --skip gradle_hosted_n --skip gradle_hosted_o --skip gradle_hosted_p'}
-          - {os: ubuntu-latest, suite: 'e2e_vendor_gradle_build e2e_vendor_jvm_build', jvm_tool: gradle, gradle: '6.9.4', java: '11', test_filter: '--ignored gradle_vendor_ gradle_multi_project'}
-          - {os: ubuntu-latest, suite: 'e2e_gradle_discovery_build e2e_gradle_agent_build e2e_redirect_gradle_build', jvm_tool: gradle, gradle: '7.6.6', java: '17', test_filter: '--ignored gradle_agent_ gradle_hosted_3 gradle_hosted_4 gradle_hosted_5'}
-          - {os: ubuntu-latest, suite: e2e_redirect_gradle_build, jvm_tool: gradle, gradle: '7.6.6', java: '17', test_filter: '--ignored gradle_hosted_b gradle_hosted_c gradle_hosted_d gradle_hosted_e gradle_hosted_f gradle_hosted_l gradle_hosted_m gradle_hosted_n gradle_hosted_o gradle_hosted_p'}
-          - {os: ubuntu-latest, suite: e2e_redirect_gradle_build, jvm_tool: gradle, gradle: '7.6.6', java: '17', test_filter: '--ignored gradle_hosted_ --skip gradle_hosted_3 --skip gradle_hosted_4 --skip gradle_hosted_5 --skip gradle_hosted_b --skip gradle_hosted_c --skip gradle_hosted_d --skip gradle_hosted_e --skip gradle_hosted_f --skip gradle_hosted_l --skip gradle_hosted_m --skip gradle_hosted_n --skip gradle_hosted_o --skip gradle_hosted_p'}
-          - {os: ubuntu-latest, suite: 'e2e_vendor_gradle_build e2e_vendor_jvm_build', jvm_tool: gradle, gradle: '7.6.6', java: '17', test_filter: '--ignored gradle_vendor_ gradle_multi_project'}
-          - {os: ubuntu-latest, suite: 'e2e_gradle_discovery_build e2e_gradle_agent_build e2e_redirect_gradle_build', jvm_tool: gradle, gradle: '8.14.3', java: '21', test_filter: '--ignored gradle_agent_ gradle_hosted_3 gradle_hosted_4 gradle_hosted_5'}
-          - {os: ubuntu-latest, suite: e2e_redirect_gradle_build, jvm_tool: gradle, gradle: '8.14.3', java: '21', test_filter: '--ignored gradle_hosted_b gradle_hosted_c gradle_hosted_d gradle_hosted_e gradle_hosted_f gradle_hosted_l gradle_hosted_m gradle_hosted_n gradle_hosted_o gradle_hosted_p'}
-          - {os: ubuntu-latest, suite: e2e_redirect_gradle_build, jvm_tool: gradle, gradle: '8.14.3', java: '21', test_filter: '--ignored gradle_hosted_ --skip gradle_hosted_3 --skip gradle_hosted_4 --skip gradle_hosted_5 --skip gradle_hosted_b --skip gradle_hosted_c --skip gradle_hosted_d --skip gradle_hosted_e --skip gradle_hosted_f --skip gradle_hosted_l --skip gradle_hosted_m --skip gradle_hosted_n --skip gradle_hosted_o --skip gradle_hosted_p'}
-          - {os: ubuntu-latest, suite: 'e2e_vendor_gradle_build e2e_vendor_jvm_build', jvm_tool: gradle, gradle: '8.14.3', java: '21', test_filter: '--ignored gradle_vendor_ gradle_multi_project'}
-          - {os: ubuntu-latest, suite: 'e2e_gradle_discovery_build e2e_gradle_agent_build e2e_redirect_gradle_build', jvm_tool: gradle, gradle: '9.8.0', java: '21', test_filter: '--ignored gradle_agent_ gradle_hosted_3 gradle_hosted_4 gradle_hosted_5'}
-          - {os: ubuntu-latest, suite: e2e_redirect_gradle_build, jvm_tool: gradle, gradle: '9.8.0', java: '21', test_filter: '--ignored gradle_hosted_b gradle_hosted_c gradle_hosted_d gradle_hosted_e gradle_hosted_f gradle_hosted_l gradle_hosted_m gradle_hosted_n gradle_hosted_o gradle_hosted_p'}
-          - {os: ubuntu-latest, suite: e2e_redirect_gradle_build, jvm_tool: gradle, gradle: '9.8.0', java: '21', test_filter: '--ignored gradle_hosted_ --skip gradle_hosted_3 --skip gradle_hosted_4 --skip gradle_hosted_5 --skip gradle_hosted_b --skip gradle_hosted_c --skip gradle_hosted_d --skip gradle_hosted_e --skip gradle_hosted_f --skip gradle_hosted_l --skip gradle_hosted_m --skip gradle_hosted_n --skip gradle_hosted_o --skip gradle_hosted_p'}
-          - {os: ubuntu-latest, suite: 'e2e_vendor_gradle_build e2e_vendor_jvm_build', jvm_tool: gradle, gradle: '9.8.0', java: '21', test_filter: '--ignored gradle_vendor_ gradle_multi_project'}
-          # Real-sbt hosted (socket-patch.sbt) + vendored
-          # (socket-patch-vendor.sbt) capstones on the current 1.x line. The
-          # other sbt lines, JDK 21, the agent cells beyond coverage-docker's,
-          # Mill, scala-cli and macOS / Windows are sbt-compatibility.yml.
-          - {os: ubuntu-latest, suite: e2e_sbt_build, jvm_tool: sbt, sbt: '1.13.0', test_filter: '--ignored --test-threads=1'}
-          - {os: ubuntu-latest, suite: e2e_sbt_vendor_build, jvm_tool: sbt, sbt: '1.13.0', test_filter: '--ignored --test-threads=1'}
-          # Real .NET SDK capstones: hosted + vendored nuget, one leg per SDK
-          # major (the suite pins the major through a sandbox global.json):
-          # the oldest and newest here, 7-9 on ubuntu in e2e-full.
-          - {os: ubuntu-latest, suite: e2e_nuget_dotnet_build, dotnet: '6'}
-          - {os: ubuntu-latest, suite: e2e_nuget_dotnet_build, dotnet: '10'}
-          # Real deno negative capstone (no hosted/vendored wiring exists for
-          # deno; VEX must attest nothing), one leg per major.
-          - {os: ubuntu-latest, suite: e2e_vex_build, test_filter: 'deno:: --ignored', deno: '1.46.3'}
-          - {os: ubuntu-latest, suite: e2e_vex_build, test_filter: 'deno:: --ignored', deno: '2.9.7'}
+          - {os: 'ubuntu-latest', suite: 'e2e_vendor_composer_build e2e_redirect_composer_build', composer: '2', ci_group: 'e2e_vendor_composer_build e2e_redirect_composer_build-2-1'}
+          - {os: 'ubuntu-latest', suite: 'e2e_vendor_composer_build e2e_redirect_composer_build', composer: '2.2', ci_group: 'e2e_vendor_composer_build e2e_redirect_composer_build-2.2-2'}
+          - {os: 'ubuntu-latest', suite: 'e2e_vendor_composer_build e2e_redirect_composer_build', composer: '1', ci_group: 'e2e_vendor_composer_build e2e_redirect_composer_build-1-3'}
+          - {os: 'ubuntu-latest', suite: 'e2e_redirect_gem_build e2e_vendor_gem_build', ruby: '3.1', bundler: '1.17.3', ci_group: 'e2e_redirect_gem_build e2e_vendor_gem_build-3.1-1.17.3-4'}
+          - {os: 'ubuntu-latest', suite: 'e2e_redirect_gem_build e2e_vendor_gem_build', ruby: '3.1', bundler: '2.1.4', ci_group: 'e2e_redirect_gem_build e2e_vendor_gem_build-3.1-2.1.4-5'}
+          - {os: 'ubuntu-latest', suite: 'e2e_redirect_gem_build e2e_vendor_gem_build', ruby: '3.1', bundler: '2.2.33', ci_group: 'e2e_redirect_gem_build e2e_vendor_gem_build-3.1-2.2.33-6'}
+          - {os: 'ubuntu-latest', suite: 'e2e_redirect_gem_build e2e_vendor_gem_build', ruby: '3.3', bundler: '2.5.23', ci_group: 'e2e_redirect_gem_build e2e_vendor_gem_build-3.3-2.5.23-7'}
+          - {os: 'ubuntu-latest', suite: 'e2e_redirect_gem_build e2e_vendor_gem_build', ruby: '3.3', bundler: '2.6.9', ci_group: 'e2e_redirect_gem_build e2e_vendor_gem_build-3.3-2.6.9-8'}
+          - {os: 'ubuntu-latest', suite: 'e2e_redirect_gem_build e2e_vendor_gem_build', ruby: '3.4', bundler: '4.0.15', ci_group: 'e2e_redirect_gem_build e2e_vendor_gem_build-3.4-4.0.15-9'}
+          - {os: 'ubuntu-latest', suite: 'e2e_redirect_gem_build e2e_vendor_gem_build', ruby: '3.4', bundler: '4.0.21', ci_group: 'e2e_redirect_gem_build e2e_vendor_gem_build-3.4-4.0.21-10'}
+          - {os: 'ubuntu-latest', bun: '1.4.2', suite: 'e2e_safety_pnpm e2e_redirect_npm_build e2e_redirect_rush_sim e2e_redirect_bun_build e2e_vendor_bun_build mode_migration_bun', cases: '[{"os":"ubuntu-latest","suite":"e2e_safety_pnpm"},{"os":"ubuntu-latest","suite":"e2e_redirect_npm_build","npm_required":"1"},{"os":"ubuntu-latest","suite":"e2e_redirect_rush_sim"},{"os":"ubuntu-latest","suite":"e2e_redirect_bun_build e2e_vendor_bun_build mode_migration_bun","bun":"1.4.2","test_filter":"--include-ignored"}]', ci_group: 'node20-1.4.2-11'}
+          - {os: 'ubuntu-latest', bun: '1.1.45', suite: 'e2e_redirect_bun_build e2e_vendor_bun_build mode_migration_bun e2e_bun_lockb', cases: '[{"os":"ubuntu-latest","suite":"e2e_redirect_bun_build e2e_vendor_bun_build mode_migration_bun","bun":"1.1.45","test_filter":"--include-ignored"},{"os":"ubuntu-latest","suite":"e2e_bun_lockb","bun":"1.1.45","test_filter":"--include-ignored"}]', ci_group: 'node20-1.1.45-12'}
+          - {os: 'ubuntu-latest', suite: 'e2e_redirect_bun_build e2e_vendor_bun_build mode_migration_bun', bun: '1.2.23', test_filter: '--include-ignored', ci_group: 'node20-1.2.23-13'}
+          - {os: 'ubuntu-latest', bun: '1.3.14', suite: 'e2e_redirect_bun_build e2e_vendor_bun_build mode_migration_bun e2e_bun_lockb', cases: '[{"os":"ubuntu-latest","suite":"e2e_redirect_bun_build e2e_vendor_bun_build mode_migration_bun","bun":"1.3.14","test_filter":"--include-ignored"},{"os":"ubuntu-latest","suite":"e2e_bun_lockb","bun":"1.3.14","test_filter":"--include-ignored workspace_late_dependent"}]', ci_group: 'node20-1.3.14-14'}
+          - {os: 'ubuntu-latest', suite: 'e2e_bun_lockb', bun: '1.0.36', test_filter: '--include-ignored', ci_group: 'node20-1.0.36-15'}
+          - {os: 'ubuntu-latest', suite: 'e2e_bun_lockb', bun: '1.4.2', test_filter: '--include-ignored text_migration workspace_late_dependent', ci_group: 'node20-1.4.2-16'}
+          - {os: 'ubuntu-latest', vlt: '1.2.0', suite: 'e2e_redirect_vlt_build e2e_vendor_vlt_build mode_migration_vlt e2e_safety_vlt e2e_vlt e2e_redirect_pnpm_build', cases: '[{"os":"ubuntu-latest","suite":"e2e_redirect_vlt_build","vlt":"1.2.0","test_filter":"--include-ignored vlt_pinned_matrix"},{"os":"ubuntu-latest","suite":"e2e_vendor_vlt_build","vlt":"1.2.0","test_filter":"--include-ignored vlt_pinned_matrix"},{"os":"ubuntu-latest","suite":"mode_migration_vlt","vlt":"1.2.0","test_filter":"--include-ignored vlt_pinned_matrix"},{"os":"ubuntu-latest","suite":"e2e_safety_vlt","vlt":"1.2.0","test_filter":"--include-ignored vlt_pinned_matrix"},{"os":"ubuntu-latest","suite":"e2e_safety_vlt","vlt":"1.2.0","test_filter":"--include-ignored vlt_pinned_matrix","vlt_store_linker":"hardlink"},{"os":"ubuntu-latest","suite":"e2e_vlt","vlt":"1.2.0","test_filter":"--include-ignored vlt_pinned_matrix"},{"os":"ubuntu-latest","suite":"e2e_redirect_pnpm_build","test_filter":"--ignored --skip pnpm_pinned_matrix"}]', ci_group: 'node24-1.2.0-17'}
+          - {os: 'ubuntu-latest', suite: 'e2e_redirect_vlt_build', vlt: '0.0.0-16', test_filter: '--include-ignored vlt_pinned_matrix', ci_group: 'node24-0.0.0-16-18'}
+          - {os: 'ubuntu-latest', vlt: '0.0.0-32', suite: 'e2e_redirect_vlt_build e2e_vendor_vlt_build mode_migration_vlt e2e_vlt', cases: '[{"os":"ubuntu-latest","suite":"e2e_redirect_vlt_build","vlt":"0.0.0-32","test_filter":"--include-ignored vlt_pinned_matrix"},{"os":"ubuntu-latest","suite":"e2e_vendor_vlt_build","vlt":"0.0.0-32","test_filter":"--include-ignored vlt_pinned_matrix"},{"os":"ubuntu-latest","suite":"mode_migration_vlt","vlt":"0.0.0-32","test_filter":"--include-ignored vlt_pinned_matrix"},{"os":"ubuntu-latest","suite":"e2e_vlt","vlt":"0.0.0-32","test_filter":"--include-ignored vlt_pinned_matrix"}]', ci_group: 'node24-0.0.0-32-19'}
+          - {os: 'ubuntu-latest', vlt: '1.0.0-rc.14', vlt_upgrade: '1.2.0', suite: 'e2e_redirect_vlt_build e2e_vendor_vlt_build mode_migration_vlt', cases: '[{"os":"ubuntu-latest","suite":"e2e_redirect_vlt_build","vlt":"1.0.0-rc.14","test_filter":"--include-ignored vlt_pinned_matrix"},{"os":"ubuntu-latest","suite":"e2e_vendor_vlt_build","vlt":"1.0.0-rc.14","test_filter":"--include-ignored vlt_pinned_matrix"},{"os":"ubuntu-latest","suite":"mode_migration_vlt","vlt":"1.0.0-rc.14","test_filter":"--include-ignored vlt_pinned_matrix","vlt_upgrade":"1.2.0"}]', ci_group: 'node24-1.0.0-rc.14-1.2.0-20'}
+          - {os: 'ubuntu-latest', vlt: '1.0.0-rc.32', suite: 'e2e_redirect_vlt_build e2e_vendor_vlt_build e2e_vlt', cases: '[{"os":"ubuntu-latest","suite":"e2e_redirect_vlt_build","vlt":"1.0.0-rc.32","test_filter":"--include-ignored vlt_pinned_matrix"},{"os":"ubuntu-latest","suite":"e2e_vendor_vlt_build","vlt":"1.0.0-rc.32","test_filter":"--include-ignored vlt_pinned_matrix"},{"os":"ubuntu-latest","suite":"e2e_vlt","vlt":"1.0.0-rc.32","test_filter":"--include-ignored vlt_pinned_matrix"}]', ci_group: 'node24-1.0.0-rc.32-21'}
+          - {os: 'ubuntu-latest', vlt: '1.0.4', suite: 'e2e_redirect_vlt_build e2e_vendor_vlt_build', cases: '[{"os":"ubuntu-latest","suite":"e2e_redirect_vlt_build","vlt":"1.0.4","test_filter":"--include-ignored vlt_pinned_matrix"},{"os":"ubuntu-latest","suite":"e2e_vendor_vlt_build","vlt":"1.0.4","test_filter":"--include-ignored vlt_pinned_matrix"}]', ci_group: 'node24-1.0.4-22'}
+          - {os: 'ubuntu-latest', suite: 'e2e_redirect_vlt_build', vlt: '1.1.1', test_filter: '--include-ignored vlt_pinned_matrix', ci_group: 'node24-1.1.1-23'}
+          - {os: 'ubuntu-latest', suite: 'e2e_vlt', vlt: '1.0.0-rc.12', test_filter: '--include-ignored vlt_pinned_matrix', ci_group: 'node24-1.0.0-rc.12-24'}
+          - {os: 'ubuntu-latest', suite: 'e2e_vlt', vlt: '1.0.7', test_filter: '--include-ignored vlt_pinned_matrix', ci_group: 'node24-1.0.7-25'}
+          - {os: 'ubuntu-latest', uv: '0.1.45', suite: 'e2e_redirect_uv_build e2e_vendor_pypi_build', cases: '[{"os":"ubuntu-latest","suite":"e2e_redirect_uv_build","uv":"0.1.45"},{"os":"ubuntu-latest","suite":"e2e_vendor_pypi_build","uv":"0.1.45","test_filter":"--include-ignored"}]', ci_group: 'uv-0.1.45-26'}
+          - {os: 'ubuntu-latest', uv: '0.5.4', suite: 'e2e_redirect_uv_build e2e_vendor_pypi_build', cases: '[{"os":"ubuntu-latest","suite":"e2e_redirect_uv_build","uv":"0.5.4"},{"os":"ubuntu-latest","suite":"e2e_vendor_pypi_build","uv":"0.5.4","test_filter":"--include-ignored"}]', ci_group: 'uv-0.5.4-27'}
+          - {os: 'ubuntu-latest', uv: '0.5.5', suite: 'e2e_redirect_uv_build e2e_vendor_pypi_build', cases: '[{"os":"ubuntu-latest","suite":"e2e_redirect_uv_build","uv":"0.5.5"},{"os":"ubuntu-latest","suite":"e2e_vendor_pypi_build","uv":"0.5.5","test_filter":"--include-ignored"}]', ci_group: 'uv-0.5.5-28'}
+          - {os: 'ubuntu-latest', uv: '0.12.17', suite: 'e2e_redirect_uv_build e2e_vendor_pypi_build', cases: '[{"os":"ubuntu-latest","suite":"e2e_redirect_uv_build","uv":"0.12.17"},{"os":"ubuntu-latest","suite":"e2e_vendor_pypi_build","uv":"0.12.17","test_filter":"--include-ignored"}]', ci_group: 'uv-0.12.17-29'}
+          - {os: 'ubuntu-latest', poetry: '1.0.10', pdm: '1.4.5', hatch: '1.0.0', suite: 'e2e_vex_build', cases: '[{"os":"ubuntu-latest","suite":"e2e_vex_build","test_filter":"poetry:: --ignored","poetry":"1.0.10"},{"os":"ubuntu-latest","suite":"e2e_vex_build","test_filter":"pdm:: --ignored","pdm":"1.4.5"},{"os":"ubuntu-latest","suite":"e2e_vex_build","test_filter":"hatch:: --ignored","hatch":"1.0.0"}]', ci_group: 'python-1.0.10-1.4.5-1.0.0-30'}
+          - {os: 'ubuntu-latest', pipenv: '2022.12.19', pip: '22 23 24 25 26', suite: 'e2e_vex_build', cases: '[{"os":"ubuntu-latest","suite":"e2e_vex_build","test_filter":"pipenv:: --ignored","pipenv":"2022.12.19"},{"os":"ubuntu-latest","suite":"e2e_vex_build","test_filter":"pip:: --ignored","pip":"22 23 24 25 26"}]', ci_group: 'python-installers-2022.12.19-22 23 24 25 26-31'}
+          - {os: 'ubuntu-latest', poetry: '1.1.15', pdm: '1.15.5', hatch: '1.2.1', suite: 'e2e_vex_build', cases: '[{"os":"ubuntu-latest","suite":"e2e_vex_build","test_filter":"poetry:: --ignored","poetry":"1.1.15"},{"os":"ubuntu-latest","suite":"e2e_vex_build","test_filter":"pdm:: --ignored","pdm":"1.15.5"},{"os":"ubuntu-latest","suite":"e2e_vex_build","test_filter":"hatch:: --ignored","hatch":"1.2.1"}]', ci_group: 'python-1.1.15-1.15.5-1.2.1-32'}
+          - {os: 'ubuntu-latest', suite: 'e2e_vex_build', test_filter: 'pipenv:: --ignored', pipenv: '2026.8.0', ci_group: 'python-installers-2026.8.0-33'}
+          - {os: 'ubuntu-latest', poetry: '1.8.5', pdm: '2.7.4', hatch: '1.9.7', suite: 'e2e_vex_build', cases: '[{"os":"ubuntu-latest","suite":"e2e_vex_build","test_filter":"poetry:: --ignored","poetry":"1.8.5"},{"os":"ubuntu-latest","suite":"e2e_vex_build","test_filter":"pdm:: --ignored","pdm":"2.7.4"},{"os":"ubuntu-latest","suite":"e2e_vex_build","test_filter":"hatch:: --ignored","hatch":"1.9.7"}]', ci_group: 'python-1.8.5-2.7.4-1.9.7-34'}
+          - {os: 'ubuntu-latest', poetry: '2.0.1', pdm: '2.8.2', hatch: '1.14.2', suite: 'e2e_vex_build', cases: '[{"os":"ubuntu-latest","suite":"e2e_vex_build","test_filter":"poetry:: --ignored","poetry":"2.0.1"},{"os":"ubuntu-latest","suite":"e2e_vex_build","test_filter":"pdm:: --ignored","pdm":"2.8.2"},{"os":"ubuntu-latest","suite":"e2e_vex_build","test_filter":"hatch:: --ignored","hatch":"1.14.2"}]', ci_group: 'python-2.0.1-2.8.2-1.14.2-35'}
+          - {os: 'ubuntu-latest', poetry: '2.4.3', pdm: '2.25.9', hatch: '1.18.1', suite: 'e2e_vex_build', cases: '[{"os":"ubuntu-latest","suite":"e2e_vex_build","test_filter":"poetry:: --ignored","poetry":"2.4.3"},{"os":"ubuntu-latest","suite":"e2e_vex_build","test_filter":"pdm:: --ignored","pdm":"2.25.9"},{"os":"ubuntu-latest","suite":"e2e_vex_build","test_filter":"hatch:: --ignored","hatch":"1.18.1"}]', ci_group: 'python-2.4.3-2.25.9-1.18.1-36'}
+          - {os: 'ubuntu-latest', suite: 'e2e_vex_build', test_filter: 'pdm:: --ignored', pdm: '2.29.2', ci_group: 'python-2.29.2-37'}
+          - {os: 'ubuntu-latest', jvm_tool: 'maven', maven: '3.6.3', dotnet: '6', suite: 'e2e_redirect_maven_build e2e_vendor_maven_build e2e_vendor_jvm_build e2e_nuget_dotnet_build', cases: '[{"os":"ubuntu-latest","suite":"e2e_redirect_maven_build e2e_vendor_maven_build","jvm_tool":"maven","maven":"3.6.3"},{"os":"ubuntu-latest","suite":"e2e_vendor_jvm_build","jvm_tool":"maven","maven":"3.6.3","test_filter":"--ignored maven_reactor"},{"os":"ubuntu-latest","suite":"e2e_nuget_dotnet_build","dotnet":"6"}]', ci_group: 'jvm-dotnet-3.6.3-6-38'}
+          - {os: 'ubuntu-latest', jvm_tool: 'maven', maven: '3.8.9', dotnet: '10', suite: 'e2e_redirect_maven_build e2e_vendor_maven_build e2e_vendor_jvm_build e2e_nuget_dotnet_build', cases: '[{"os":"ubuntu-latest","suite":"e2e_redirect_maven_build e2e_vendor_maven_build","jvm_tool":"maven","maven":"3.8.9"},{"os":"ubuntu-latest","suite":"e2e_vendor_jvm_build","jvm_tool":"maven","maven":"3.8.9","test_filter":"--ignored maven_reactor"},{"os":"ubuntu-latest","suite":"e2e_nuget_dotnet_build","dotnet":"10"}]', ci_group: 'jvm-dotnet-3.8.9-10-39'}
+          - {os: 'ubuntu-latest', jvm_tool: 'maven', maven: '3.9.16', suite: 'e2e_redirect_maven_build e2e_vendor_maven_build e2e_vendor_jvm_build', cases: '[{"os":"ubuntu-latest","suite":"e2e_redirect_maven_build e2e_vendor_maven_build","jvm_tool":"maven","maven":"3.9.16"},{"os":"ubuntu-latest","suite":"e2e_vendor_jvm_build","jvm_tool":"maven","maven":"3.9.16","test_filter":"--ignored maven_reactor"}]', ci_group: 'jvm-dotnet-3.9.16-40'}
+          - {os: 'ubuntu-latest', jvm_tool: 'maven', maven: '4.0.0-rc-6', suite: 'e2e_redirect_maven_build e2e_vendor_maven_build e2e_vendor_jvm_build', cases: '[{"os":"ubuntu-latest","suite":"e2e_redirect_maven_build e2e_vendor_maven_build","jvm_tool":"maven","maven":"4.0.0-rc-6"},{"os":"ubuntu-latest","suite":"e2e_vendor_jvm_build","jvm_tool":"maven","maven":"4.0.0-rc-6","test_filter":"--ignored maven_reactor"}]', ci_group: 'jvm-dotnet-4.0.0-rc-6-41'}
+          - {os: 'ubuntu-latest', suite: 'e2e_redirect_maven_build', jvm_tool: 'maven', maven: '3.9.3', ci_group: 'jvm-dotnet-3.9.3-42'}
+          - {os: 'ubuntu-latest', suite: 'e2e_redirect_maven_build', jvm_tool: 'maven', maven: '3.9.4', ci_group: 'jvm-dotnet-3.9.4-43'}
+          - {os: 'ubuntu-latest', suite: 'e2e_vendor_jvm_build', jvm_tool: 'maven', maven: '3.9.2', test_filter: '--ignored maven_reactor', ci_group: 'jvm-dotnet-3.9.2-44'}
+          - {os: 'ubuntu-latest', suite: 'e2e_gradle_discovery_build e2e_gradle_agent_build e2e_redirect_gradle_build', jvm_tool: 'gradle', gradle: '6.9.4', java: '11', test_filter: '--ignored gradle_agent_ gradle_hosted_3 gradle_hosted_4 gradle_hosted_5', ci_group: '6.9.4-6.9.4-45'}
+          - {os: 'ubuntu-latest', suite: 'e2e_redirect_gradle_build', jvm_tool: 'gradle', gradle: '6.9.4', java: '11', test_filter: '--ignored gradle_hosted_b gradle_hosted_c gradle_hosted_d gradle_hosted_e gradle_hosted_f gradle_hosted_l gradle_hosted_m gradle_hosted_n gradle_hosted_o gradle_hosted_p --skip gradle_hosted_config_cache_second_row --skip gradle_hosted_fallback_snippet_compiles_kotlin', ci_group: '6.9.4-6.9.4-46'}
+          - {os: 'ubuntu-latest', suite: 'e2e_redirect_gradle_build', jvm_tool: 'gradle', gradle: '6.9.4', java: '11', test_filter: '--ignored gradle_hosted_ --skip gradle_hosted_3 --skip gradle_hosted_4 --skip gradle_hosted_5 --skip gradle_hosted_b --skip gradle_hosted_c --skip gradle_hosted_d --skip gradle_hosted_e --skip gradle_hosted_f --skip gradle_hosted_l --skip gradle_hosted_m --skip gradle_hosted_n --skip gradle_hosted_o --skip gradle_hosted_p --skip gradle_hosted_config_cache_second_row --skip gradle_hosted_fallback_snippet_compiles_kotlin --skip gradle_hosted_vendored_takeover_and_eject', ci_group: '6.9.4-6.9.4-47'}
+          - {os: 'ubuntu-latest', suite: 'e2e_vendor_gradle_build e2e_vendor_jvm_build e2e_redirect_gradle_build', jvm_tool: 'gradle', gradle: '6.9.4', java: '11', test_filter: '--ignored gradle_vendor_ gradle_multi_project gradle_hosted_config_cache_second_row gradle_hosted_fallback_snippet_compiles_kotlin gradle_hosted_vendored_takeover_and_eject', ci_group: '6.9.4-6.9.4-48'}
+          - {os: 'ubuntu-latest', suite: 'e2e_gradle_discovery_build e2e_gradle_agent_build e2e_redirect_gradle_build', jvm_tool: 'gradle', gradle: '9.8.0', java: '21', test_filter: '--ignored gradle_agent_ gradle_hosted_3 gradle_hosted_4 gradle_hosted_5', ci_group: '9.8.0-9.8.0-49'}
+          - {os: 'ubuntu-latest', suite: 'e2e_redirect_gradle_build', jvm_tool: 'gradle', gradle: '9.8.0', java: '21', test_filter: '--ignored gradle_hosted_b gradle_hosted_c gradle_hosted_d gradle_hosted_e gradle_hosted_f gradle_hosted_l gradle_hosted_m gradle_hosted_n gradle_hosted_o gradle_hosted_p --skip gradle_hosted_config_cache_second_row --skip gradle_hosted_fallback_snippet_compiles_kotlin', ci_group: '9.8.0-9.8.0-50'}
+          - {os: 'ubuntu-latest', suite: 'e2e_redirect_gradle_build', jvm_tool: 'gradle', gradle: '9.8.0', java: '21', test_filter: '--ignored gradle_hosted_ --skip gradle_hosted_3 --skip gradle_hosted_4 --skip gradle_hosted_5 --skip gradle_hosted_b --skip gradle_hosted_c --skip gradle_hosted_d --skip gradle_hosted_e --skip gradle_hosted_f --skip gradle_hosted_l --skip gradle_hosted_m --skip gradle_hosted_n --skip gradle_hosted_o --skip gradle_hosted_p --skip gradle_hosted_config_cache_second_row --skip gradle_hosted_fallback_snippet_compiles_kotlin --skip gradle_hosted_vendored_takeover_and_eject', ci_group: '9.8.0-9.8.0-51'}
+          - {os: 'ubuntu-latest', suite: 'e2e_vendor_gradle_build e2e_vendor_jvm_build e2e_redirect_gradle_build', jvm_tool: 'gradle', gradle: '9.8.0', java: '21', test_filter: '--ignored gradle_vendor_ gradle_multi_project gradle_hosted_config_cache_second_row gradle_hosted_fallback_snippet_compiles_kotlin gradle_hosted_vendored_takeover_and_eject', ci_group: '9.8.0-9.8.0-52'}
+          - {os: 'ubuntu-latest', suite: 'e2e_sbt_build', jvm_tool: 'sbt', sbt: '1.13.0', test_filter: '--ignored --test-threads=1', ci_group: 'e2e_sbt_build-1.13.0-53'}
+          - {os: 'ubuntu-latest', suite: 'e2e_sbt_vendor_build', jvm_tool: 'sbt', sbt: '1.13.0', test_filter: '--ignored --test-threads=1', ci_group: 'e2e_sbt_vendor_build-1.13.0-54'}
+          - {os: 'ubuntu-latest', suite: 'e2e_vex_build', test_filter: 'deno:: --ignored', deno: '1.46.3', ci_group: 'e2e_vex_build-1.46.3-55'}
+          - {os: 'ubuntu-latest', suite: 'e2e_vex_build', test_filter: 'deno:: --ignored', deno: '2.9.7', ci_group: 'e2e_vex_build-2.9.7-56'}
     runs-on: ${{ matrix.os }}
     # The real-toolchain capstones loop several releases per leg (pip,
     # pipenv) or bootstrap a tool from PyPI before the suite (poetry, pdm,
@@ -1320,13 +1129,13 @@ jobs:
           cp "target/e2e-bin/socket-patch$exe" "target/debug/socket-patch$exe"
 
       - name: Setup Node.js
-        if: matrix.suite == 'e2e_npm' || matrix.suite == 'e2e_scan' || matrix.suite == 'e2e_safety_pnpm'
+        if: contains(format(' {0} ', matrix.suite), ' e2e_npm ') || contains(format(' {0} ', matrix.suite), ' e2e_scan ') || contains(format(' {0} ', matrix.suite), ' e2e_safety_pnpm ')
         uses: actions/setup-node@49933ea5288caeca8642d1e84afbd3f7d6820020 # v4
         with:
           node-version: '20.20.2'
 
       - name: Setup pnpm
-        if: matrix.suite == 'e2e_safety_pnpm'
+        if: contains(format(' {0} ', matrix.suite), ' e2e_safety_pnpm ')
         # Pin the major version so the store layout the test
         # asserts on stays stable. `npm install -g` is the simplest
         # cross-platform install path (works on ubuntu, macos,
@@ -1335,13 +1144,13 @@ jobs:
         run: npm install -g pnpm@10
 
       - name: Setup Node.js 24 (named pnpm legs)
-        if: matrix.suite == 'e2e_redirect_pnpm_build'
+        if: contains(format(' {0} ', matrix.suite), ' e2e_redirect_pnpm_build ') && matrix.vlt == ''
         uses: actions/setup-node@49933ea5288caeca8642d1e84afbd3f7d6820020 # v4
         with:
           node-version: '24.x'
 
       - name: Setup Python
-        if: matrix.suite == 'e2e_pypi' || matrix.uv != '' || matrix.poetry != '' || matrix.pdm != '' || matrix.hatch != ''
+        if: contains(format(' {0} ', matrix.suite), ' e2e_pypi ') || matrix.uv != '' || matrix.poetry != '' || matrix.pdm != '' || matrix.hatch != ''
         uses: actions/setup-python@a26af69be951a213d495a4c3e4e4022e16d87065 # v5
         with:
           python-version: '3.12.x'
@@ -1390,7 +1199,7 @@ jobs:
         run: uv python install 3.8 3.11 3.12
 
       - name: Setup Ruby
-        if: matrix.suite == 'e2e_gem' || matrix.bundler != ''
+        if: contains(format(' {0} ', matrix.suite), ' e2e_gem ') || matrix.bundler != ''
         uses: ruby/setup-ruby@319994f95fa847cf3fb3cd3dbe89f6dcde9f178f # v1.295.0
         with:
           # setup-ruby does NOT support `3.2.x` wildcard pinning the
@@ -1616,92 +1425,12 @@ jobs:
           node --version
 
       - name: Run e2e tests
-        if: matrix.vlt == ''
-        # Suites are `#[ignore]`-gated out of the unpinned `test` job by
-        # default, hence `--ignored`; an entry that sets `test_filter`
-        # overrides the selector for itself only.
+        # Every grouped member retains its own filters and required-tool
+        # guards; vlt members additionally pass the leg-manifest checker.
+        # The runner reports each failure and continues through later suites.
         env:
-          # Bun legs only: turn the bun suites' "bun not installed / no text
-          # lock" soft-skips into hard failures and make them assert the
-          # pinned release, so a leg can never report green on an
-          # unexercised toolchain. Both are the EMPTY string on non-bun legs,
-          # which the suites treat as unset.
-          SOCKET_PATCH_BUN_E2E_REQUIRED: ${{ matrix.bun != '' && '1' || '' }}
-          SOCKET_PATCH_BUN_E2E_VERSION: ${{ matrix.bun }}
-          # e2e_bun_lockb only. SOCKET_PATCH_BUN_LOCKB_VERSION is checked with
-          # `var().is_ok()`, so it must stay EMPTY on every other leg.
-          SOCKET_PATCH_BUN_LOCKB_REQUIRED: ${{ matrix.suite == 'e2e_bun_lockb' && '1' || '' }}
-          SOCKET_PATCH_BUN_LOCKB_VERSION: ${{ matrix.suite == 'e2e_bun_lockb' && matrix.bun || '' }}
-          SOCKET_PATCH_BUN_LOCKB_EXTENDED: ${{ matrix.suite == 'e2e_bun_lockb' && '1' || '' }}
-          SOCKET_PATCH_BUN_LOCKB_PRODUCTION: ${{ matrix.suite == 'e2e_bun_lockb' && '1' || '' }}
-          # The same fail-instead-of-skip + pinned-release gates for every
-          # other real-toolchain capstone. All EMPTY on legs that do not set
-          # the matching matrix key, which the suites treat as unset.
-          SOCKET_PATCH_NPM_E2E_REQUIRED: ${{ matrix.npm_required || '' }}
-          SOCKET_PATCH_CARGO_E2E_REQUIRED: ${{ matrix.suite == 'e2e_safety_cargo_build' && '1' || '' }}
-          SOCKET_PATCH_UV_E2E_REQUIRED: ${{ matrix.uv != '' && '1' || '' }}
-          SOCKET_PATCH_UV_E2E_VERSION: ${{ matrix.uv }}
-          SOCKET_PATCH_POETRY_E2E_REQUIRED: ${{ matrix.poetry != '' && '1' || '' }}
-          SOCKET_PATCH_POETRY_E2E_VERSION: ${{ matrix.poetry }}
-          SOCKET_PATCH_PDM_E2E_REQUIRED: ${{ matrix.pdm != '' && '1' || '' }}
-          SOCKET_PATCH_PDM_E2E_VERSION: ${{ matrix.pdm }}
-          SOCKET_PATCH_HATCH_E2E_REQUIRED: ${{ matrix.hatch != '' && '1' || '' }}
-          SOCKET_PATCH_HATCH_E2E_VERSION: ${{ matrix.hatch }}
-          SOCKET_PATCH_PIPENV_E2E_REQUIRED: ${{ matrix.pipenv != '' && '1' || '' }}
-          SOCKET_PATCH_PIPENV_E2E_VERSIONS: ${{ matrix.pipenv }}
-          SOCKET_PATCH_PIP_E2E_REQUIRED: ${{ matrix.pip != '' && '1' || '' }}
-          SOCKET_PATCH_PIP_E2E_VERSIONS: ${{ matrix.pip }}
-          SOCKET_PATCH_BUNDLER_E2E_REQUIRED: ${{ matrix.bundler != '' && '1' || '' }}
-          SOCKET_PATCH_BUNDLER_E2E_VERSION: ${{ matrix.bundler }}
-          SOCKET_PATCH_COMPOSER_E2E_REQUIRED: ${{ matrix.composer != '' && '1' || '' }}
-          SOCKET_PATCH_COMPOSER_E2E_VERSION: ${{ matrix.composer }}
-          SOCKET_PATCH_MAVEN_E2E_REQUIRED: ${{ steps.jvm.outputs.maven == 'true' && '1' || '' }}
-          SOCKET_PATCH_MAVEN_E2E_VERSION: ${{ steps.jvm.outputs.maven == 'true' && (matrix.maven || '3.9.16') || '' }}
-          SOCKET_PATCH_GRADLE_E2E_REQUIRED: ${{ matrix.gradle != '' && '1' || '' }}
-          SOCKET_PATCH_GRADLE_E2E_VERSION: ${{ matrix.gradle }}
-          SOCKET_PATCH_GRADLE_E2E_PROBE_DIR: ${{ matrix.gradle != '' && format('{0}/target/gradle-probe', github.workspace) || '' }}
-          SOCKET_PATCH_DOTNET_E2E_REQUIRED: ${{ matrix.dotnet != '' && '1' || '' }}
-          SOCKET_PATCH_DOTNET_E2E_VERSION: ${{ matrix.dotnet }}
-          SOCKET_PATCH_DENO_E2E_REQUIRED: ${{ matrix.deno != '' && '1' || '' }}
-          SOCKET_PATCH_DENO_E2E_VERSION: ${{ matrix.deno }}
-          SOCKET_PATCH_SBT_E2E_REQUIRED: ${{ matrix.sbt != '' && '1' || '' }}
-          SOCKET_PATCH_SBT_E2E_VERSION: ${{ matrix.sbt }}
-          E2E_SUITE: ${{ matrix.suite }}
-          E2E_TEST_FILTER: ${{ matrix.test_filter || '--ignored' }}
-          E2E_ALLOW_EMPTY: ${{ matrix.allow_empty }}
-        shell: bash
-        # Runs from the package root with CARGO_MANIFEST_DIR set, as
-        # `cargo test` would. `suite` may name several binaries; an
-        # `allow_empty` row skips the ones whose test file has not landed.
-        # Every suite a leg runs must run at least one test (per suite, so
-        # one suite's tests never hide another's empty filter): a renamed
-        # module, a dropped `#[ignore]` under the default `--ignored`
-        # selector or a stale `test_filter` would otherwise pass as 0/0.
-        run: |
-          set -uo pipefail
-          exe=''
-          if [ "$RUNNER_OS" = Windows ]; then exe=.exe; fi
-          cd crates/socket-patch-cli
-          export CARGO_MANIFEST_DIR="$PWD"
-          status=0
-          for suite in $E2E_SUITE; do
-            if [ "$E2E_ALLOW_EMPTY" = true ] && [ ! -f "tests/$suite.rs" ] && [ ! -f "tests/$suite/main.rs" ]; then
-              echo "::notice::$suite has not landed yet; skipped (allow_empty)"
-              continue
-            fi
-            log="../../target/e2e-$suite.log"
-            # shellcheck disable=SC2086 # the filter is several libtest arguments
-            if ! "../../target/e2e-bin/$suite$exe" $E2E_TEST_FILTER 2>&1 | tee "$log"; then
-              status=1
-              continue
-            fi
-            passed=$(sed -n 's/^test result: .* \([0-9][0-9]*\) passed;.*/\1/p' "$log" | head -n 1)
-            if [ "${passed:-0}" = 0 ]; then
-              echo "::error::$suite ran no test in this leg (filter: $E2E_TEST_FILTER). Fix the row's suite or test_filter so it selects the tests it is meant to run."
-              status=1
-            fi
-          done
-          exit "$status"
+          E2E_ROW_JSON: ${{ toJSON(matrix) }}
+        run: python3 scripts/ci-e2e-run.py
 
       - name: Upload the Gradle probe reports
         if: always() && matrix.gradle != ''
@@ -1712,32 +1441,6 @@ jobs:
           if-no-files-found: ignore
           retention-days: 14
 
-      - name: Run vlt e2e tests
-        if: matrix.vlt != ''
-        # One capstone binary per row, through the leg checker: it fails on
-        # `0 passed`, a crashed binary, a missing `ran`, an unexpected skip or
-        # an unknown leg (crates/socket-patch-cli/tests/vlt-leg-manifest.json).
-        shell: bash
-        env:
-          SOCKET_PATCH_VLT_E2E_REQUIRED: ${{ matrix.vlt != '' && '1' || '' }}
-          VLT_SUITE: ${{ matrix.suite }}
-          VLT_TEST_FILTER: ${{ matrix.test_filter }}
-        run: |
-          set -uo pipefail
-          status=0
-          exe=''
-          if [ "$RUNNER_OS" = Windows ]; then exe=.exe; fi
-          (
-            cd crates/socket-patch-cli
-            export CARGO_MANIFEST_DIR="$PWD"
-            # shellcheck disable=SC2086 # the filter is several libtest arguments
-            "../../target/e2e-bin/$VLT_SUITE$exe" $VLT_TEST_FILTER
-          ) 2>&1 | tee vlt-leg.log || status=1
-          py=$(command -v python3 || command -v python)
-          # No cargo `Running` line when the binary runs directly: name it.
-          "$py" scripts/check-vlt-legs.py --binary "$VLT_SUITE" --manifest crates/socket-patch-cli/tests/vlt-leg-manifest.json vlt-leg.log || status=1
-          exit "$status"
-
   # The PM-version legs with no boundary of their own: the middle uv lines,
   # Pipenv releases and .NET SDK majors, and bundler 2.7. Skipped
   # on pull_request (the `e2e` rows keep every named boundary, the oldest
@@ -1747,34 +1450,42 @@ jobs:
 
   # Each OS consumes only its own build. A queued macOS runner must not
   # delay Linux or Windows, and a Windows compile must not delay Gradle.
+  # Middle Gradle lines are required in the merge queue; every PR still
+  # runs every suite on the oldest/newest line. Main reuses the queue verdict.
+  e2e-gradle-mid:
+    name: e2e-gradle-mid (${{ matrix.os }}, ${{ matrix.ci_group }})
+    if: github.event_name != 'pull_request' && needs.e2e-build.outputs.reuse != 'true'
+    needs: [e2e-build]
+    strategy:
+      fail-fast: false
+      matrix:
+        include:
+          - {os: 'ubuntu-latest', suite: 'e2e_gradle_discovery_build e2e_gradle_agent_build e2e_redirect_gradle_build', jvm_tool: 'gradle', gradle: '7.6.6', java: '17', test_filter: '--ignored gradle_agent_ gradle_hosted_3 gradle_hosted_4 gradle_hosted_5', ci_group: '7.6.6-7.6.6-1'}
+          - {os: 'ubuntu-latest', suite: 'e2e_redirect_gradle_build', jvm_tool: 'gradle', gradle: '7.6.6', java: '17', test_filter: '--ignored gradle_hosted_b gradle_hosted_c gradle_hosted_d gradle_hosted_e gradle_hosted_f gradle_hosted_l gradle_hosted_m gradle_hosted_n gradle_hosted_o gradle_hosted_p --skip gradle_hosted_config_cache_second_row --skip gradle_hosted_fallback_snippet_compiles_kotlin', ci_group: '7.6.6-7.6.6-2'}
+          - {os: 'ubuntu-latest', suite: 'e2e_redirect_gradle_build', jvm_tool: 'gradle', gradle: '7.6.6', java: '17', test_filter: '--ignored gradle_hosted_ --skip gradle_hosted_3 --skip gradle_hosted_4 --skip gradle_hosted_5 --skip gradle_hosted_b --skip gradle_hosted_c --skip gradle_hosted_d --skip gradle_hosted_e --skip gradle_hosted_f --skip gradle_hosted_l --skip gradle_hosted_m --skip gradle_hosted_n --skip gradle_hosted_o --skip gradle_hosted_p --skip gradle_hosted_config_cache_second_row --skip gradle_hosted_fallback_snippet_compiles_kotlin --skip gradle_hosted_vendored_takeover_and_eject', ci_group: '7.6.6-7.6.6-3'}
+          - {os: 'ubuntu-latest', suite: 'e2e_vendor_gradle_build e2e_vendor_jvm_build e2e_redirect_gradle_build', jvm_tool: 'gradle', gradle: '7.6.6', java: '17', test_filter: '--ignored gradle_vendor_ gradle_multi_project gradle_hosted_config_cache_second_row gradle_hosted_fallback_snippet_compiles_kotlin gradle_hosted_vendored_takeover_and_eject', ci_group: '7.6.6-7.6.6-4'}
+          - {os: 'ubuntu-latest', suite: 'e2e_gradle_discovery_build e2e_gradle_agent_build e2e_redirect_gradle_build', jvm_tool: 'gradle', gradle: '8.14.3', java: '21', test_filter: '--ignored gradle_agent_ gradle_hosted_3 gradle_hosted_4 gradle_hosted_5', ci_group: '8.14.3-8.14.3-5'}
+          - {os: 'ubuntu-latest', suite: 'e2e_redirect_gradle_build', jvm_tool: 'gradle', gradle: '8.14.3', java: '21', test_filter: '--ignored gradle_hosted_b gradle_hosted_c gradle_hosted_d gradle_hosted_e gradle_hosted_f gradle_hosted_l gradle_hosted_m gradle_hosted_n gradle_hosted_o gradle_hosted_p --skip gradle_hosted_config_cache_second_row --skip gradle_hosted_fallback_snippet_compiles_kotlin', ci_group: '8.14.3-8.14.3-6'}
+          - {os: 'ubuntu-latest', suite: 'e2e_redirect_gradle_build', jvm_tool: 'gradle', gradle: '8.14.3', java: '21', test_filter: '--ignored gradle_hosted_ --skip gradle_hosted_3 --skip gradle_hosted_4 --skip gradle_hosted_5 --skip gradle_hosted_b --skip gradle_hosted_c --skip gradle_hosted_d --skip gradle_hosted_e --skip gradle_hosted_f --skip gradle_hosted_l --skip gradle_hosted_m --skip gradle_hosted_n --skip gradle_hosted_o --skip gradle_hosted_p --skip gradle_hosted_config_cache_second_row --skip gradle_hosted_fallback_snippet_compiles_kotlin --skip gradle_hosted_vendored_takeover_and_eject', ci_group: '8.14.3-8.14.3-7'}
+          - {os: 'ubuntu-latest', suite: 'e2e_vendor_gradle_build e2e_vendor_jvm_build e2e_redirect_gradle_build', jvm_tool: 'gradle', gradle: '8.14.3', java: '21', test_filter: '--ignored gradle_vendor_ gradle_multi_project gradle_hosted_config_cache_second_row gradle_hosted_fallback_snippet_compiles_kotlin gradle_hosted_vendored_takeover_and_eject', ci_group: '8.14.3-8.14.3-8'}
+    runs-on: ${{ matrix.os }}
+    timeout-minutes: 40
+    env: *e2e-env
+    steps: *e2e-steps
+
   e2e-windows:
+    name: e2e-windows (${{ matrix.os }}, ${{ matrix.ci_group }})
+    if: needs.e2e-build-windows.outputs.reuse != 'true'
     needs: [e2e-build-windows]
     strategy:
       fail-fast: false
       matrix:
         include:
-          - os: windows-latest
-            suite: e2e_safety_pnpm
-          - os: windows-latest
-            suite: e2e_redirect_npm_build
-            npm_required: '1'
-          - os: windows-latest
-            suite: e2e_redirect_rush_sim
-          - os: windows-latest
-            suite: e2e_redirect_bun_build e2e_vendor_bun_build mode_migration_bun
-            bun: '1.4.2'
-            test_filter: --include-ignored
-          - {os: windows-latest, suite: e2e_redirect_vlt_build, vlt: '1.2.0', test_filter: --include-ignored vlt_pinned_matrix}
-          - {os: windows-latest, suite: e2e_vendor_vlt_build, vlt: '1.2.0', test_filter: --include-ignored vlt_pinned_matrix}
-          - {os: windows-latest, suite: e2e_vendor_vlt_build, vlt: '1.0.0-rc.14', test_filter: --include-ignored vlt_pinned_matrix}
-          - {os: windows-latest, suite: mode_migration_vlt, vlt: '1.2.0', test_filter: --include-ignored vlt_pinned_matrix}
-          - {os: windows-latest, suite: mode_migration_vlt, vlt: '1.0.0-rc.14', test_filter: --include-ignored vlt_pinned_matrix}
-          - {os: windows-latest, suite: e2e_safety_vlt, vlt: '1.2.0', test_filter: --include-ignored vlt_pinned_matrix, vlt_store_linker: 'hardlink'}
-          - {os: windows-latest, suite: e2e_vlt, vlt: '1.2.0', test_filter: --include-ignored vlt_pinned_matrix}
-          - {os: windows-latest, suite: e2e_vlt, vlt: '1.0.0-rc.14', test_filter: --include-ignored vlt_pinned_matrix}
-          - {os: windows-latest, suite: e2e_redirect_pnpm_build, test_filter: '--ignored --skip pnpm_pinned_matrix'}
-          - {os: windows-latest, suite: e2e_vendor_jvm_build, jvm_tool: maven, maven: '3.9.16', test_filter: '--ignored maven_reactor'}
-          - {os: windows-latest, suite: e2e_vendor_jvm_build, jvm_tool: gradle, gradle: '8.14.3', java: '17', test_filter: '--ignored gradle_multi_project'}
+          - {os: 'windows-latest', bun: '1.4.2', suite: 'e2e_safety_pnpm e2e_redirect_npm_build e2e_redirect_rush_sim e2e_redirect_bun_build e2e_vendor_bun_build mode_migration_bun', cases: '[{"os":"windows-latest","suite":"e2e_safety_pnpm"},{"os":"windows-latest","suite":"e2e_redirect_npm_build","npm_required":"1"},{"os":"windows-latest","suite":"e2e_redirect_rush_sim"},{"os":"windows-latest","suite":"e2e_redirect_bun_build e2e_vendor_bun_build mode_migration_bun","bun":"1.4.2","test_filter":"--include-ignored"}]', ci_group: 'node20-1.4.2-1'}
+          - {os: 'windows-latest', vlt: '1.2.0', suite: 'e2e_redirect_vlt_build e2e_vendor_vlt_build mode_migration_vlt e2e_safety_vlt e2e_vlt e2e_redirect_pnpm_build', cases: '[{"os":"windows-latest","suite":"e2e_redirect_vlt_build","vlt":"1.2.0","test_filter":"--include-ignored vlt_pinned_matrix"},{"os":"windows-latest","suite":"e2e_vendor_vlt_build","vlt":"1.2.0","test_filter":"--include-ignored vlt_pinned_matrix"},{"os":"windows-latest","suite":"mode_migration_vlt","vlt":"1.2.0","test_filter":"--include-ignored vlt_pinned_matrix"},{"os":"windows-latest","suite":"e2e_safety_vlt","vlt":"1.2.0","test_filter":"--include-ignored vlt_pinned_matrix","vlt_store_linker":"hardlink"},{"os":"windows-latest","suite":"e2e_vlt","vlt":"1.2.0","test_filter":"--include-ignored vlt_pinned_matrix"},{"os":"windows-latest","suite":"e2e_redirect_pnpm_build","test_filter":"--ignored --skip pnpm_pinned_matrix"}]', ci_group: 'node24-1.2.0-2'}
+          - {os: 'windows-latest', vlt: '1.0.0-rc.14', suite: 'e2e_vendor_vlt_build mode_migration_vlt e2e_vlt', cases: '[{"os":"windows-latest","suite":"e2e_vendor_vlt_build","vlt":"1.0.0-rc.14","test_filter":"--include-ignored vlt_pinned_matrix"},{"os":"windows-latest","suite":"mode_migration_vlt","vlt":"1.0.0-rc.14","test_filter":"--include-ignored vlt_pinned_matrix"},{"os":"windows-latest","suite":"e2e_vlt","vlt":"1.0.0-rc.14","test_filter":"--include-ignored vlt_pinned_matrix"}]', ci_group: 'node24-1.0.0-rc.14-3'}
+          - {os: 'windows-latest', suite: 'e2e_vendor_jvm_build', jvm_tool: 'maven', maven: '3.9.16', test_filter: '--ignored maven_reactor', ci_group: 'jvm-dotnet-3.9.16-4'}
+          - {os: 'windows-latest', suite: 'e2e_vendor_jvm_build', jvm_tool: 'gradle', gradle: '8.14.3', java: '17', test_filter: '--ignored gradle_multi_project', ci_group: '8.14.3-8.14.3-5'}
     runs-on: ${{ matrix.os }}
     timeout-minutes: 40
     env: *e2e-env
@@ -1783,49 +1494,20 @@ jobs:
   # The macOS rows run on main, the merge queue and nightly, not on every
   # PR push, so PRs stop queueing on the small macOS runner pool.
   e2e-macos:
-    if: github.event_name != 'pull_request'
+    name: e2e-macos (${{ matrix.os }}, ${{ matrix.ci_group }})
+    if: github.event_name != 'pull_request' && needs.e2e-build-macos.outputs.reuse != 'true'
     # These jobs consume e2e-build's binaries and can run alongside unit tests.
     needs: [e2e-build-macos]
     strategy:
       fail-fast: false
       matrix:
         include:
-          - os: macos-latest
-            suite: e2e_safety_pnpm
-          - os: macos-latest
-            suite: e2e_redirect_npm_build
-            npm_required: '1'
-          - os: macos-latest
-            suite: e2e_redirect_rush_sim
-          - os: macos-latest
-            suite: e2e_redirect_bun_build
-            bun: '1.4.2'
-            test_filter: --include-ignored
-          - os: macos-latest
-            suite: e2e_vendor_bun_build
-            bun: '1.4.2'
-            test_filter: --include-ignored
-          - os: macos-latest
-            suite: mode_migration_bun
-            bun: '1.4.2'
-            test_filter: --include-ignored
-          - {os: macos-latest, suite: e2e_redirect_vlt_build, vlt: '1.2.0', test_filter: --include-ignored vlt_pinned_matrix}
-          - {os: macos-latest, suite: e2e_vendor_vlt_build, vlt: '1.2.0', test_filter: --include-ignored vlt_pinned_matrix}
-          - {os: macos-latest, suite: mode_migration_vlt, vlt: '1.2.0', test_filter: --include-ignored vlt_pinned_matrix}
-          - {os: macos-latest, suite: e2e_safety_vlt, vlt: '1.2.0', test_filter: --include-ignored vlt_pinned_matrix, vlt_store_linker: 'hardlink'}
-          - {os: macos-latest, suite: e2e_vlt, vlt: '1.2.0', test_filter: --include-ignored vlt_pinned_matrix}
-          - {os: macos-latest, suite: e2e_redirect_pnpm_build, test_filter: '--ignored --skip pnpm_pinned_matrix'}
-          - {os: macos-latest, suite: e2e_redirect_uv_build, uv: '0.12.17'}
-          - {os: macos-latest, suite: e2e_vendor_pypi_build, uv: '0.12.17', test_filter: --include-ignored}
-          - {os: macos-latest, suite: e2e_vex_build, test_filter: 'poetry:: --ignored', poetry: '2.4.3'}
-          - {os: macos-latest, suite: e2e_vex_build, test_filter: 'pdm:: --ignored', pdm: '2.29.2'}
-          - {os: macos-latest, suite: e2e_vex_build, test_filter: 'hatch:: --ignored', hatch: '1.18.1'}
-          - {os: macos-latest, suite: e2e_vex_build, test_filter: 'pipenv:: --ignored', pipenv: '2022.12.19 2026.8.0'}
-          - {os: macos-latest, suite: e2e_vex_build, test_filter: 'pip:: --ignored', pip: '22 26'}
-          - {os: macos-latest, suite: e2e_redirect_maven_build, jvm_tool: maven, maven: '3.9.16'}
-          - {os: macos-latest, suite: e2e_vendor_maven_build, jvm_tool: maven, maven: '3.9.16'}
-          - {os: macos-latest, suite: e2e_vendor_jvm_build, jvm_tool: maven, maven: '3.9.16', test_filter: '--ignored maven_reactor'}
-          - {os: macos-latest, suite: e2e_nuget_dotnet_build, dotnet: '8'}
+          - {os: 'macos-latest', bun: '1.4.2', suite: 'e2e_safety_pnpm e2e_redirect_npm_build e2e_redirect_rush_sim e2e_redirect_bun_build e2e_vendor_bun_build mode_migration_bun', cases: '[{"os":"macos-latest","suite":"e2e_safety_pnpm"},{"os":"macos-latest","suite":"e2e_redirect_npm_build","npm_required":"1"},{"os":"macos-latest","suite":"e2e_redirect_rush_sim"},{"os":"macos-latest","suite":"e2e_redirect_bun_build","bun":"1.4.2","test_filter":"--include-ignored"},{"os":"macos-latest","suite":"e2e_vendor_bun_build","bun":"1.4.2","test_filter":"--include-ignored"},{"os":"macos-latest","suite":"mode_migration_bun","bun":"1.4.2","test_filter":"--include-ignored"}]', ci_group: 'node20-1.4.2-1'}
+          - {os: 'macos-latest', vlt: '1.2.0', suite: 'e2e_redirect_vlt_build e2e_vendor_vlt_build mode_migration_vlt e2e_safety_vlt e2e_vlt e2e_redirect_pnpm_build', cases: '[{"os":"macos-latest","suite":"e2e_redirect_vlt_build","vlt":"1.2.0","test_filter":"--include-ignored vlt_pinned_matrix"},{"os":"macos-latest","suite":"e2e_vendor_vlt_build","vlt":"1.2.0","test_filter":"--include-ignored vlt_pinned_matrix"},{"os":"macos-latest","suite":"mode_migration_vlt","vlt":"1.2.0","test_filter":"--include-ignored vlt_pinned_matrix"},{"os":"macos-latest","suite":"e2e_safety_vlt","vlt":"1.2.0","test_filter":"--include-ignored vlt_pinned_matrix","vlt_store_linker":"hardlink"},{"os":"macos-latest","suite":"e2e_vlt","vlt":"1.2.0","test_filter":"--include-ignored vlt_pinned_matrix"},{"os":"macos-latest","suite":"e2e_redirect_pnpm_build","test_filter":"--ignored --skip pnpm_pinned_matrix"}]', ci_group: 'node24-1.2.0-2'}
+          - {os: 'macos-latest', uv: '0.12.17', suite: 'e2e_redirect_uv_build e2e_vendor_pypi_build', cases: '[{"os":"macos-latest","suite":"e2e_redirect_uv_build","uv":"0.12.17"},{"os":"macos-latest","suite":"e2e_vendor_pypi_build","uv":"0.12.17","test_filter":"--include-ignored"}]', ci_group: 'uv-0.12.17-3'}
+          - {os: 'macos-latest', poetry: '2.4.3', pdm: '2.29.2', hatch: '1.18.1', suite: 'e2e_vex_build', cases: '[{"os":"macos-latest","suite":"e2e_vex_build","test_filter":"poetry:: --ignored","poetry":"2.4.3"},{"os":"macos-latest","suite":"e2e_vex_build","test_filter":"pdm:: --ignored","pdm":"2.29.2"},{"os":"macos-latest","suite":"e2e_vex_build","test_filter":"hatch:: --ignored","hatch":"1.18.1"}]', ci_group: 'python-2.4.3-2.29.2-1.18.1-4'}
+          - {os: 'macos-latest', pipenv: '2022.12.19 2026.8.0', pip: '22 26', suite: 'e2e_vex_build', cases: '[{"os":"macos-latest","suite":"e2e_vex_build","test_filter":"pipenv:: --ignored","pipenv":"2022.12.19 2026.8.0"},{"os":"macos-latest","suite":"e2e_vex_build","test_filter":"pip:: --ignored","pip":"22 26"}]', ci_group: 'python-installers-2022.12.19 2026.8.0-22 26-5'}
+          - {os: 'macos-latest', jvm_tool: 'maven', maven: '3.9.16', dotnet: '8', suite: 'e2e_redirect_maven_build e2e_vendor_maven_build e2e_vendor_jvm_build e2e_nuget_dotnet_build', cases: '[{"os":"macos-latest","suite":"e2e_redirect_maven_build","jvm_tool":"maven","maven":"3.9.16"},{"os":"macos-latest","suite":"e2e_vendor_maven_build","jvm_tool":"maven","maven":"3.9.16"},{"os":"macos-latest","suite":"e2e_vendor_jvm_build","jvm_tool":"maven","maven":"3.9.16","test_filter":"--ignored maven_reactor"},{"os":"macos-latest","suite":"e2e_nuget_dotnet_build","dotnet":"8"}]', ci_group: 'jvm-dotnet-3.9.16-8-6'}
     runs-on: ${{ matrix.os }}
     # The real-toolchain capstones loop several releases per leg (pip,
     # pipenv) or bootstrap a tool from PyPI before the suite (poetry, pdm,
@@ -1841,6 +1523,7 @@ jobs:
     steps: *e2e-steps
 
   e2e-full:
+    name: e2e-full (${{ matrix.os }}, ${{ matrix.ci_group }})
     # merge_group runs the pull_request tier: the queue gates on ci-ok.
     if: (github.event_name != 'pull_request' && github.event_name != 'merge_group') || github.head_ref == 'release/v5-prerelease'
     needs: [e2e-build]
@@ -1848,35 +1531,24 @@ jobs:
       fail-fast: false
       matrix:
         include:
-          - {os: ubuntu-latest, suite: e2e_redirect_gem_build e2e_vendor_gem_build, ruby: '3.3', bundler: '2.7.2'}
-          - {os: ubuntu-latest, suite: e2e_redirect_uv_build, uv: '0.2.37'}
-          - {os: ubuntu-latest, suite: e2e_redirect_uv_build, uv: '0.3.5'}
-          - {os: ubuntu-latest, suite: e2e_redirect_uv_build, uv: '0.4.30'}
-          - {os: ubuntu-latest, suite: e2e_redirect_uv_build, uv: '0.5.3'}
-          - {os: ubuntu-latest, suite: e2e_redirect_uv_build, uv: '0.5.6'}
-          - {os: ubuntu-latest, suite: e2e_redirect_uv_build, uv: '0.6.17'}
-          - {os: ubuntu-latest, suite: e2e_redirect_uv_build, uv: '0.7.22'}
-          - {os: ubuntu-latest, suite: e2e_redirect_uv_build, uv: '0.8.24'}
-          - {os: ubuntu-latest, suite: e2e_redirect_uv_build, uv: '0.9.30'}
-          - {os: ubuntu-latest, suite: e2e_redirect_uv_build, uv: '0.10.12'}
-          - {os: ubuntu-latest, suite: e2e_redirect_uv_build, uv: '0.11.33'}
-          - {os: ubuntu-latest, suite: e2e_vendor_pypi_build, uv: '0.2.37', test_filter: --include-ignored}
-          - {os: ubuntu-latest, suite: e2e_vendor_pypi_build, uv: '0.3.5', test_filter: --include-ignored}
-          - {os: ubuntu-latest, suite: e2e_vendor_pypi_build, uv: '0.4.30', test_filter: --include-ignored}
-          - {os: ubuntu-latest, suite: e2e_vendor_pypi_build, uv: '0.5.3', test_filter: --include-ignored}
-          - {os: ubuntu-latest, suite: e2e_vendor_pypi_build, uv: '0.5.6', test_filter: --include-ignored}
-          - {os: ubuntu-latest, suite: e2e_vendor_pypi_build, uv: '0.6.17', test_filter: --include-ignored}
-          - {os: ubuntu-latest, suite: e2e_vendor_pypi_build, uv: '0.7.22', test_filter: --include-ignored}
-          - {os: ubuntu-latest, suite: e2e_vendor_pypi_build, uv: '0.8.24', test_filter: --include-ignored}
-          - {os: ubuntu-latest, suite: e2e_vendor_pypi_build, uv: '0.9.30', test_filter: --include-ignored}
-          - {os: ubuntu-latest, suite: e2e_vendor_pypi_build, uv: '0.10.12', test_filter: --include-ignored}
-          - {os: ubuntu-latest, suite: e2e_vendor_pypi_build, uv: '0.11.33', test_filter: --include-ignored}
-          - {os: ubuntu-latest, suite: e2e_vex_build, test_filter: 'pipenv:: --ignored', pipenv: '2023.12.1'}
-          - {os: ubuntu-latest, suite: e2e_vex_build, test_filter: 'pipenv:: --ignored', pipenv: '2024.4.1'}
-          - {os: ubuntu-latest, suite: e2e_vex_build, test_filter: 'pipenv:: --ignored', pipenv: '2025.1.3'}
-          - {os: ubuntu-latest, suite: e2e_nuget_dotnet_build, dotnet: '7'}
-          - {os: ubuntu-latest, suite: e2e_nuget_dotnet_build, dotnet: '8'}
-          - {os: ubuntu-latest, suite: e2e_nuget_dotnet_build, dotnet: '9'}
+          - {os: 'ubuntu-latest', suite: 'e2e_redirect_gem_build e2e_vendor_gem_build', ruby: '3.3', bundler: '2.7.2', ci_group: 'e2e_redirect_gem_build e2e_vendor_gem_build-3.3-2.7.2-1'}
+          - {os: 'ubuntu-latest', uv: '0.2.37', suite: 'e2e_redirect_uv_build e2e_vendor_pypi_build', cases: '[{"os":"ubuntu-latest","suite":"e2e_redirect_uv_build","uv":"0.2.37"},{"os":"ubuntu-latest","suite":"e2e_vendor_pypi_build","uv":"0.2.37","test_filter":"--include-ignored"}]', ci_group: 'uv-0.2.37-2'}
+          - {os: 'ubuntu-latest', uv: '0.3.5', suite: 'e2e_redirect_uv_build e2e_vendor_pypi_build', cases: '[{"os":"ubuntu-latest","suite":"e2e_redirect_uv_build","uv":"0.3.5"},{"os":"ubuntu-latest","suite":"e2e_vendor_pypi_build","uv":"0.3.5","test_filter":"--include-ignored"}]', ci_group: 'uv-0.3.5-3'}
+          - {os: 'ubuntu-latest', uv: '0.4.30', suite: 'e2e_redirect_uv_build e2e_vendor_pypi_build', cases: '[{"os":"ubuntu-latest","suite":"e2e_redirect_uv_build","uv":"0.4.30"},{"os":"ubuntu-latest","suite":"e2e_vendor_pypi_build","uv":"0.4.30","test_filter":"--include-ignored"}]', ci_group: 'uv-0.4.30-4'}
+          - {os: 'ubuntu-latest', uv: '0.5.3', suite: 'e2e_redirect_uv_build e2e_vendor_pypi_build', cases: '[{"os":"ubuntu-latest","suite":"e2e_redirect_uv_build","uv":"0.5.3"},{"os":"ubuntu-latest","suite":"e2e_vendor_pypi_build","uv":"0.5.3","test_filter":"--include-ignored"}]', ci_group: 'uv-0.5.3-5'}
+          - {os: 'ubuntu-latest', uv: '0.5.6', suite: 'e2e_redirect_uv_build e2e_vendor_pypi_build', cases: '[{"os":"ubuntu-latest","suite":"e2e_redirect_uv_build","uv":"0.5.6"},{"os":"ubuntu-latest","suite":"e2e_vendor_pypi_build","uv":"0.5.6","test_filter":"--include-ignored"}]', ci_group: 'uv-0.5.6-6'}
+          - {os: 'ubuntu-latest', uv: '0.6.17', suite: 'e2e_redirect_uv_build e2e_vendor_pypi_build', cases: '[{"os":"ubuntu-latest","suite":"e2e_redirect_uv_build","uv":"0.6.17"},{"os":"ubuntu-latest","suite":"e2e_vendor_pypi_build","uv":"0.6.17","test_filter":"--include-ignored"}]', ci_group: 'uv-0.6.17-7'}
+          - {os: 'ubuntu-latest', uv: '0.7.22', suite: 'e2e_redirect_uv_build e2e_vendor_pypi_build', cases: '[{"os":"ubuntu-latest","suite":"e2e_redirect_uv_build","uv":"0.7.22"},{"os":"ubuntu-latest","suite":"e2e_vendor_pypi_build","uv":"0.7.22","test_filter":"--include-ignored"}]', ci_group: 'uv-0.7.22-8'}
+          - {os: 'ubuntu-latest', uv: '0.8.24', suite: 'e2e_redirect_uv_build e2e_vendor_pypi_build', cases: '[{"os":"ubuntu-latest","suite":"e2e_redirect_uv_build","uv":"0.8.24"},{"os":"ubuntu-latest","suite":"e2e_vendor_pypi_build","uv":"0.8.24","test_filter":"--include-ignored"}]', ci_group: 'uv-0.8.24-9'}
+          - {os: 'ubuntu-latest', uv: '0.9.30', suite: 'e2e_redirect_uv_build e2e_vendor_pypi_build', cases: '[{"os":"ubuntu-latest","suite":"e2e_redirect_uv_build","uv":"0.9.30"},{"os":"ubuntu-latest","suite":"e2e_vendor_pypi_build","uv":"0.9.30","test_filter":"--include-ignored"}]', ci_group: 'uv-0.9.30-10'}
+          - {os: 'ubuntu-latest', uv: '0.10.12', suite: 'e2e_redirect_uv_build e2e_vendor_pypi_build', cases: '[{"os":"ubuntu-latest","suite":"e2e_redirect_uv_build","uv":"0.10.12"},{"os":"ubuntu-latest","suite":"e2e_vendor_pypi_build","uv":"0.10.12","test_filter":"--include-ignored"}]', ci_group: 'uv-0.10.12-11'}
+          - {os: 'ubuntu-latest', uv: '0.11.33', suite: 'e2e_redirect_uv_build e2e_vendor_pypi_build', cases: '[{"os":"ubuntu-latest","suite":"e2e_redirect_uv_build","uv":"0.11.33"},{"os":"ubuntu-latest","suite":"e2e_vendor_pypi_build","uv":"0.11.33","test_filter":"--include-ignored"}]', ci_group: 'uv-0.11.33-12'}
+          - {os: 'ubuntu-latest', suite: 'e2e_vex_build', test_filter: 'pipenv:: --ignored', pipenv: '2023.12.1', ci_group: 'python-installers-2023.12.1-13'}
+          - {os: 'ubuntu-latest', suite: 'e2e_vex_build', test_filter: 'pipenv:: --ignored', pipenv: '2024.4.1', ci_group: 'python-installers-2024.4.1-14'}
+          - {os: 'ubuntu-latest', suite: 'e2e_vex_build', test_filter: 'pipenv:: --ignored', pipenv: '2025.1.3', ci_group: 'python-installers-2025.1.3-15'}
+          - {os: 'ubuntu-latest', suite: 'e2e_nuget_dotnet_build', dotnet: '7', ci_group: 'jvm-dotnet-7-16'}
+          - {os: 'ubuntu-latest', suite: 'e2e_nuget_dotnet_build', dotnet: '8', ci_group: 'jvm-dotnet-8-17'}
+          - {os: 'ubuntu-latest', suite: 'e2e_nuget_dotnet_build', dotnet: '9', ci_group: 'jvm-dotnet-9-18'}
     runs-on: ${{ matrix.os }}
     timeout-minutes: 40
     # What .cargo/config.toml's [env] gives processes cargo launches; these
@@ -1993,7 +1665,7 @@ jobs:
     # Dropping that `needs` also dropped the draft skip it inherited, so
     # gate on draft here directly (push/merge_group/schedule still run).
     # Only wait for the clippy preflight.
-    if: github.event.pull_request.draft != true
+    if: github.event.pull_request.draft != true && needs.clippy.outputs.reuse != 'true'
     needs: clippy
     runs-on: ubuntu-latest
     timeout-minutes: 40
@@ -2036,7 +1708,7 @@ jobs:
     # Dropping that `needs` also dropped the draft skip it inherited, so
     # gate on draft here directly (push/merge_group/schedule still run).
     # Only wait for the clippy preflight.
-    if: github.event.pull_request.draft != true
+    if: github.event.pull_request.draft != true && needs.clippy.outputs.reuse != 'true'
     needs: clippy
     strategy:
       fail-fast: false
@@ -2079,7 +1751,7 @@ jobs:
   # nightly, not on every PR push, so PRs stop queueing on the small
   # macOS runner pool.
   yarn-berry-e2e-macos:
-    if: github.event_name != 'pull_request'
+    if: github.event_name != 'pull_request' && needs.clippy.outputs.reuse != 'true'
     name: yarn-berry ${{ matrix.yarn }} (${{ matrix.os }})
     needs: clippy
     strategy:
@@ -2118,6 +1790,7 @@ jobs:
   # toolchain x lock cross off pull_request. Each leg also runs
   # e2e_safety_cargo_build (its headline test honours the knobs).
   cargo-vex-matrix:
+    if: needs.e2e-build.outputs.reuse != 'true'
     name: cargo ${{ matrix.toolchain }} lock-v${{ matrix.lock || 'own' }} (${{ matrix.os }})
     # e2e-build only (its binaries; only the matching OS build is needed);
     # see yarn-classic-matrix on test/coverage.
@@ -2199,6 +1872,7 @@ jobs:
           exit "$status"
 
   cargo-vex-matrix-windows:
+    if: needs.e2e-build-windows.outputs.reuse != 'true'
     name: cargo ${{ matrix.toolchain }} lock-v${{ matrix.lock || 'own' }} (${{ matrix.os }})
     needs: [e2e-build-windows]
     runs-on: ${{ matrix.os }}
@@ -2214,7 +1888,7 @@ jobs:
 
   # The macOS rows run on main, the merge queue and nightly, not per PR push.
   cargo-vex-matrix-macos:
-    if: github.event_name != 'pull_request'
+    if: github.event_name != 'pull_request' && needs.e2e-build-macos.outputs.reuse != 'true'
     name: cargo ${{ matrix.toolchain }} lock-v${{ matrix.lock || 'own' }} (${{ matrix.os }})
     needs: [e2e-build-macos]
     runs-on: ${{ matrix.os }}
@@ -2288,6 +1962,7 @@ jobs:
       - name: Install Rust
         run: rustup show
       - name: Pull the old cargos under test
+        if: needs.clippy.outputs.reuse != 'true'
         run: |
           docker pull rust:1.41-slim
           docker pull rust:1.56-slim
@@ -2296,7 +1971,12 @@ jobs:
         with:
           shared-key: dev-ubuntu-latest
           save-if: ${{ github.ref == 'refs/heads/main' }}
+      - name: Warm the shared Linux dev cache after merge-queue validation
+        if: needs.clippy.outputs.reuse == 'true'
+        run: cargo test --locked -p socket-patch-cli --test e2e_vendor_cargo_build --no-run
+
       - name: Vendored manifest [patch] on old cargo
+        if: needs.clippy.outputs.reuse != 'true'
         shell: bash
         env:
           SOCKET_PATCH_CARGO_E2E_REQUIRED: '1'
@@ -2340,7 +2020,7 @@ jobs:
   # ----------------------------------------------------------------------
   hosted-e2e:
     name: hosted-e2e            # may be a required check; do not rename
-    if: github.event.pull_request.draft != true
+    if: github.event.pull_request.draft != true && needs.clippy.outputs.reuse != 'true'
     needs: clippy
     runs-on: ubuntu-latest
     permissions:
@@ -2546,7 +2226,7 @@ jobs:
   ci-ok:
     name: ci-ok                 # registered as a required check; do not rename
     if: always()
-    needs: [clippy, node-addon, lint-ecosystems, release-readiness, test, test-release, coverage, docker-base, coverage-docker, coverage-merge, dispatch-tests, e2e-build, e2e-build-windows, e2e-build-macos, e2e, e2e-windows, e2e-full, e2e-docker, yarn-classic-matrix, yarn-berry-e2e, yarn-berry-full, cargo-vex-matrix, cargo-vex-matrix-windows, cargo-vex-matrix-full, cargo-old-toolchains, hosted-e2e, e2e-macos, yarn-berry-e2e-macos, cargo-vex-matrix-macos]
+    needs: [clippy, node-addon, lint-ecosystems, release-readiness, test, test-release, coverage, docker-base, coverage-docker, coverage-merge, dispatch-tests, e2e-build, e2e-build-windows, e2e-build-macos, e2e, e2e-gradle-mid, e2e-windows, e2e-full, e2e-docker, yarn-classic-matrix, yarn-berry-e2e, yarn-berry-full, cargo-vex-matrix, cargo-vex-matrix-windows, cargo-vex-matrix-full, cargo-old-toolchains, hosted-e2e, e2e-macos, yarn-berry-e2e-macos, cargo-vex-matrix-macos]
     runs-on: ubuntu-latest
     timeout-minutes: 5
     steps:

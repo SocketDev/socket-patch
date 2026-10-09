@@ -39,10 +39,12 @@ name: Gradle patch compatibility
 # and sha256, hash-dir naming, refresh / RO-cache / transform canaries).
 #
 # On pull_request the ubuntu `cells` are skipped: ci.yml's `e2e` PR tier runs
-# the same suites, filters, Gradle lines and JDKs on ubuntu on every PR and
-# in the merge queue. The ubuntu `extras` run on a PR only when it touches
+# the same suites and JDKs on ubuntu (boundary lines on PRs, all four lines
+# in the merge queue). The ubuntu `extras` run on a PR only when it touches
 # Gradle code (`changes` below); every other PR gets them from the nightly
-# (#1177). Windows cells run on every PR that matches `paths:`.
+# (#1177). Matching PRs run Windows agent/vendor on all four Gradle lines
+# and hosted on the oldest/newest lines. The middle hosted lines run nightly
+# and on workflow_dispatch (#1300).
 
 on:
   pull_request:
@@ -233,8 +235,11 @@ jobs:
         exclude:
           # macOS legs run on push to main (and nightly where scheduled), not per PR push.
           - os: ${{ github.event_name == 'pull_request' && 'macos-latest' || '' }}
-          # ci.yml's `e2e` runs these ubuntu cells on every PR (#1177).
+          # ci.yml covers ubuntu: boundary lines on PRs, middle lines in the queue.
           - os: ${{ github.event_name == 'pull_request' && 'ubuntu-latest' || '' }}
+          # Boundary lines retain every hosted test on Windows on PRs.
+          - {os: "${{ github.event_name == 'pull_request' && 'windows-latest' || '' }}", gradle: '7.6.6', mode: hosted}
+          - {os: "${{ github.event_name == 'pull_request' && 'windows-latest' || '' }}", gradle: '8.14.3', mode: hosted}
     runs-on: ${{ matrix.os }}
     timeout-minutes: 60
     steps: &cell-steps

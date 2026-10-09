@@ -126,14 +126,17 @@ GRADLE_LINES = {"6.9.4": "11", "7.6.6": "17", "8.14.3": "21", "9.8.0": "21"}
 # HostedShards checks every hosted test runs in exactly one of them).
 HOSTED_SHARD_1 = ["gradle_hosted_3", "gradle_hosted_4", "gradle_hosted_5"]
 HOSTED_SHARD_2 = ["gradle_hosted_" + c for c in "bcdeflmnop"]
+VENDOR_HOSTED = ["gradle_hosted_config_cache_second_row", "gradle_hosted_fallback_snippet_compiles_kotlin",
+                 "gradle_hosted_vendored_takeover_and_eject"]
 AGENT_HOSTED = (
     ("e2e_gradle_discovery_build e2e_gradle_agent_build e2e_redirect_gradle_build",
      " ".join(["--ignored", "gradle_agent_", *HOSTED_SHARD_1])),
-    ("e2e_redirect_gradle_build", " ".join(["--ignored", *HOSTED_SHARD_2])),
+    ("e2e_redirect_gradle_build", " ".join(["--ignored", *HOSTED_SHARD_2] + [w for p in VENDOR_HOSTED[:2] for w in ("--skip", p)])),
     ("e2e_redirect_gradle_build",
-     " ".join(["--ignored", "gradle_hosted_"] + [w for p in HOSTED_SHARD_1 + HOSTED_SHARD_2 for w in ("--skip", p)])),
+     " ".join(["--ignored", "gradle_hosted_"] + [w for p in HOSTED_SHARD_1 + HOSTED_SHARD_2 + VENDOR_HOSTED for w in ("--skip", p)])),
 )
-VENDOR = ("e2e_vendor_gradle_build e2e_vendor_jvm_build", "--ignored gradle_vendor_ gradle_multi_project")
+VENDOR = ("e2e_vendor_gradle_build e2e_vendor_jvm_build e2e_redirect_gradle_build",
+          " ".join(["--ignored", "gradle_vendor_", "gradle_multi_project", *VENDOR_HOSTED]))
 
 
 def matrix_axes(job_lines):
@@ -210,10 +213,8 @@ class GradleRows(unittest.TestCase):
                       steps["Setup Java (JDK not on the runner image)"])
         self.assertIn("if: steps.jvm.outputs.maven == 'true'", steps["Install Maven ${{ matrix.maven || '3.9.16' }}"])
         run = steps["Run e2e tests"]
-        self.assertIn("SOCKET_PATCH_MAVEN_E2E_REQUIRED: ${{ steps.jvm.outputs.maven == 'true' && '1' || '' }}", run)
-        self.assertIn("SOCKET_PATCH_MAVEN_E2E_VERSION: ${{ steps.jvm.outputs.maven == 'true' && "
-                      "(matrix.maven || '3.9.16') || '' }}", run)
-        self.assertNotIn("matrix.gradle != '') && '1'", run)
+        self.assertIn("scripts/ci-e2e-run.py", run)
+        self.assertIn("E2E_ROW_JSON: ${{ toJSON(matrix) }}", run)
 
     def test_maven_seeding_follows_the_filter(self):
         def needs_maven(row):
@@ -225,7 +226,7 @@ class GradleRows(unittest.TestCase):
         gradle = [r for r in rows("e2e") if r.get("jvm_tool") == "gradle"]
         self.assertEqual(sum(needs_maven(r) for r in gradle), 5, "the vendor legs + the windows multi-project leg")
         for row in gradle:
-            self.assertEqual(needs_maven(row), "gradle_hosted_" not in row["test_filter"], row)
+            self.assertEqual(needs_maven(row), "gradle_vendor_" in row["test_filter"] or "gradle_multi_project" in row["test_filter"], row)
 
     def test_compat_grid_expands_to_36_cells_plus_extras(self):
         compat = rows_mod.jobs(GRADLE_COMPAT.read_text(encoding="utf-8"))
@@ -250,6 +251,28 @@ class GradleRows(unittest.TestCase):
         self.assertEqual([(r["gradle"], r["real_central"]) for r in labels["real-central"]], [("8.14.3", "1")])
         self.assertEqual(set(GRADLE_LINES), {r["gradle"] for r in rows("e2e") if r.get("jvm_tool") == "gradle"},
                          "both tiers run the same Gradle lines")
+
+    def test_compat_pr_keeps_windows_boundaries_and_all_agent_vendor_cells(self):
+        compat = rows_mod.jobs(GRADLE_COMPAT.read_text(encoding="utf-8"))
+        cells = expand(compat["cells"])
+        exclude_block = "\n".join(compat["cells"]).split("        exclude:", 1)[1]
+        excludes = rows_mod.matrix_include(("        include:" + exclude_block).splitlines())
+        for event in ("pull_request", "schedule", "workflow_dispatch"):
+            resolved = []
+            for row in excludes:
+                row = dict(row)
+                match = re.fullmatch(r"\$\{\{ github.event_name == 'pull_request' && '([^']+)' \|\| '' \}\}", row["os"])
+                self.assertIsNotNone(match, row)
+                row["os"] = match[1] if event == "pull_request" else ""
+                resolved.append(row)
+            remaining = [c for c in cells if not any(all(c[k] == v for k, v in r.items()) for r in resolved)]
+            with self.subTest(event=event):
+                if event == "pull_request":
+                    want = {("windows-latest", g, m) for g in GRADLE_LINES for m in ("agent", "vendor")}
+                    want |= {("windows-latest", g, "hosted") for g in ("6.9.4", "9.8.0")}
+                    self.assertEqual({(c["os"], c["gradle"], c["mode"]) for c in remaining}, want)
+                else:
+                    self.assertEqual(remaining, cells, "nightly and dispatch keep the full grid")
 
     def test_compat_workflow_builds_its_own_binaries(self):
         text = GRADLE_COMPAT.read_text(encoding="utf-8")
