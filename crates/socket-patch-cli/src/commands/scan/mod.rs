@@ -2791,15 +2791,18 @@ async fn run_scan(
     let silent = args.common.silent;
 
     // Every human-path exit that did not fail: the `--prune` GC first
-    // (not vendored, which runs its own, nor hosted, which runs none), then
-    // the embedded VEX. An early "nothing to apply" exit still runs the GC.
+    // (not hosted, which runs none), then the embedded VEX. An early
+    // "nothing to apply" exit still runs the GC, vendored mode included:
+    // its wet vendor step runs its own GC and never reaches this closure,
+    // but the early exits (nothing patched, paid-only, nothing selected,
+    // `--dry-run`) must reconcile the ledger like the JSON arm (#1127).
     let (args_ref, manifest_ref, socket_ref) = (&args, &manifest_path, &socket_dir);
     let client_ref: &ApiClient = &api_client;
     let (scanned_ref, vendored_ref) = (&scanned_purls, &vendored_purls);
     let policy_ref: &ScanPolicy = &policy;
     let finish_human = move |code: i32| async move {
         policy_ref.print_human(silent, verbose);
-        if prune && !vendor && !hosted && code == 0 {
+        if prune && !hosted && code == 0 {
             gc::run_human_gc(
                 &args_ref.common,
                 manifest_ref,
