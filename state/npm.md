@@ -1,6 +1,6 @@
 [agent] Progress ledger for the scheduled npm bug-hunt routine (label pm:npm).
 
-Last updated: 2026-10-09T00Z (run 34 with a ledger), main `16106b1` (past `c4235a2`; includes #1095 (#1094 fix), #1058 (pinned decided by lockfile discovery alone), #1108, #1160, #1147, #1031, #1027). main's history is grafted, so bisects use worktree builds of named commits (e.g. `ef48495`, #1058's parent). Latest release v4.0.0 (previous v3.3.0, both from npm `@socketsecurity/socket-patch`). v5 makes hosted the default, removes `setup`, and makes hosted `rollback` re-resolve upstream registry entries. Cells marked (v4) were last verified on `f6b7fb9`. #432 (closed by #813), #798 (closed by #799), #852 (closed by #987), #884 (closed by #901), #1071 (closed by #1073), #900 (closed by #970), #933 (closed by #934) and #1094 (closed by #1095, verified 2026-10-09T00Z) are fixed; their old `fail` marks below are historical. Extglob workspace patterns still fail (#1097). The #688 takeover half is fixed by #963; its refusal half is still open. #1155 still reproduces on `16106b1` (draft fix #1187). New this run: **#1195** (regression from #1058: under `--max-new-patches 0`, a hosted pin with an unpinned twin entry is deferred as NEW, so the copy is never rewired) and **#1196** (a CRLF `.npmrc` with no final newline gets `\nallow-remote=all\r`).
+Last updated: 2026-10-09T06Z (run 35 with a ledger), main `f3c6313` (past `16106b1`; includes #1008 "Fix open npm issues", which closed #433, #554, #688, #711, #753, #812, #828, #879, #898, #899, #954, #969, #993, #1004 and #1005). main's history is grafted, so bisects use worktree builds of named commits (e.g. `16106b1`, #1008's parent). Latest release v4.0.0 (previous v3.3.0, both from npm `@socketsecurity/socket-patch`). v5 makes hosted the default, removes `setup`, and makes hosted `rollback` re-resolve upstream registry entries. Cells marked (v4) were last verified on `f6b7fb9`. Fixed issues whose old `fail` marks below are now historical: #432 (#813), #798 (#799), #852 (#987), #884 (#901), #1071 (#1073), #900 (#970), #933 (#934), #1094 (#1095), and via #1008 #433, #554, #688, #711, #753, #812, #828, #879, #899, #969. Verified on `f3c6313` this run: #688, #711, #753, #812, #828, #879, #899, #969, #554. Extglob workspace patterns still fail (#1097). #1155 (draft fix #1187), #1195 and #1196 still reproduce on `f3c6313`. New this run: **#1232** (`vendor --check` gives a false "wiring missing" reason and a no-op remedy for a vendored package with a bundled duplicate) and **#1233** (#812 warning misses `replace-registry-host=${VAR}`).
 ## Coverage matrix
 
 Cells are "pass", "fail #N" or "untested". Every cell uses a real npm install. Hosted cells use a local mock of the patch API with `--patch-server-url` pointed at it. Agent and vendored cells use the same mock or a hand-staged `.socket/`. "Cycle" means scan → fresh `npm ci` → `vex` → `rollback` byte-exact. "Suites" means `e2e_redirect_npm_build` + `e2e_vendor_npm_build` with `SOCKET_PATCH_NPM_E2E_REQUIRED=1`.
@@ -20,6 +20,13 @@ Cells are "pass", "fail #N" or "untested". Every cell uses a real npm install. H
 | Windows | 10.9.7 | pass: linked `.store` apply/vex/rollback (main). fail #403 (v4) | pass: cycle + `--omit=dev`, revert (main) | pass: cycle, linked cycle (probe) | **fail #434** (default and custom prefix; `--global-prefix` works) |
 | Windows | 12.1.0 / 12.2.0 | pass: linked `.store` apply/vex/rollback (main). fail #356, #403 (v4) | pass: cycle + `--omit=dev`, revert (main) | pass: cycle, linked cycle (probe) | **fail #434** |
 | Windows 2022 | 10.9.7 / 12.2.0 | pass: linked `.store` apply/vex/rollback (main) | pass: cycle + `--omit=dev`, revert (main) | pass: linked cycle (probe) | **fail #434** |
+
+## Run 35 (2026-10-09T06Z, main `f3c6313`)
+
+- #1008 fixes verified on Linux: #688 (namesake `file:` dir skipped, registry copy vendored), #711 (npm 12.2.0 `npm patch` → hosted skips, `npm ci` OK), #753 (`hasShrinkwrap` nested copy skipped / refused), #812 (project / env / user layers warn), #828 (bundled-copy rollback byte-exact, takeover restores), #879 (npm 8 re-saved v2 lock: `vex` + `vendor --check` pass), #899 (shrinkwrap-only warnings + `vex` omission), #969 (`allow-file=root` workspace + alias: no false warning, npm 12 installs), #554 (nested `tests/` roots skipped; shared copies patched everywhere).
+- **fail #1232** (pre-existing, `16106b1` same): vendored package + bundled duplicate → `vendor --check` "wiring missing: no lockfile … references" (false); `vendor` / re-scan / `repair` no-ops. npm 8.19.4 / 10.9.4 / 12.2.0.
+- **fail #1233** (#812 fix gap): `replace-registry-host=${RRH}` (project or user `.npmrc`) → no warning, `npm ci` E404 (npm 10.9.4).
+- Re-triage: #1195 and #1196 still reproduce on `f3c6313`.
 
 ## Run 34 (2026-10-09T00Z, main `16106b1`)
 
@@ -142,6 +149,7 @@ The same `name@version` gets a new patch UUID with different bytes. Mock: left-p
 
 ## Backlog
 
+- **New 2026-10-09T06Z:** #1232 siblings (a git / URL / override duplicate of a vendored name@version: same generic `vendor --check` reason?); #969 under `install-strategy=linked` and `overrides`-only declarations; #711 range / alias `patchedDependencies` selectors on a lock without a `patched` record, and a pin that predates `npm patch`; re-check #1155 / #1195 / #1196 on the next main; verify #433 (`remove --preserve-state`) on `f3c6313`.
 - **New 2026-10-09T00Z:** #1195 siblings (the #828 bundled copy under a cap, the in-memory engine with partial pins, a cap N>0 competing for a slot); re-check #1155 when #1187 lands; #1031 removed flags in npm docs and remedy texts; #1027 `{code, message}` errors on npm refusal paths; re-check #325 / #433 / #490 / #828 on `16106b1`.
 - **New 2026-10-08T18Z:** #1039 takeover with hosted-side refusals that aren't a service status (#828 bundled copy, linked alias, a one-sided dual lock, a mixed retract + take-over run); #1155 in a workspace member, a nested copy and an alias; re-check #325 / #433 / #490 / #828 on `c4235a2`.
 - **New 2026-10-08T12Z:** #1127 on other vendored PMs (hand over if unseen); `apply --check` (#1029) on npm 6 v1 locks, `inBundle` copies, and a hosted-pinned package that still has a manifest record; re-check #325 / #433 / #490 / #828 on `e2d9633`.
@@ -185,6 +193,9 @@ The same `name@version` gets a new patch UUID with different bytes. Mock: left-p
 
 ## Known non-bugs
 
+- Shrinkwrap-only vendored project: `vex` omits (`vex_npm_shrinkwrap_only`) while `vendor --check` passes. That's the documented "Unattested references" rule (liveness gates keep treating the wiring as live) (2026-10-09T06Z).
+- A raw `allow-file=${AF}` is treated as a non-`all` value, so it warns `vendor_npm_allow_file` and `vendor --check` fails even when `AF=all`. Fails safe. The silent direction for `replace-registry-host` is #1233 (2026-10-09T06Z).
+- Mock tip (2026-10-09T06Z): `npm pack <spec>` plus a Python tar rewrite gives a real patched tarball. The org routes are matched on path suffixes as before; `/patch/package` returns `results[uuid]` for every known uuid in the request body.
 - Mock tip (2026-10-09T00Z): org routes work with `--api-url <mock> --org o --api-token fake --patch-server-url <mock>`, routing on path suffixes `/batch`, `/by-package/<purl>`, `/view/<uuid>`, `/blob/<hash>`, `/package` and the tarball URL `/patch/npm/<name>/<ver>/<tok>/<uuid>/<name>-<ver>.tgz`. Hosted `rollback` worked without `SOCKET_NPM_REGISTRY` this run.
 - A CR-only `.npmrc` is refused loudly ("not set automatically") and left untouched (documented). Only the splice that produces a bare CR is a bug (#1196).
 - Mock tip (2026-10-08T18Z): `POST /patch/package` answering `pending_build` / `forbidden` during a vendored → hosted takeover keeps the vendored wiring byte-identical and exits 0 ("No patches could be switched to hosted"). That's #1039's intended retraction, not a silent no-op.
