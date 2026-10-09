@@ -953,6 +953,13 @@ crate that means the **shared** `$CARGO_HOME/registry` cache: the patch affects 
 project on the machine, and is silently reset by `cargo clean` or a cache prune. Use
 `--mode vendored` for a project-local, committable patch.
 
+Run `cargo fetch` before `apply` on a fresh checkout or CI runner. Cargo unpacks a
+locked crate into `registry/src` only when it fetches or builds, so on a cold or pruned
+cache there is nothing to patch, and the next `cargo build` would compile the pristine
+crate. `apply` therefore treats a crate that `Cargo.lock` resolves but that is not
+unpacked as not installed, not as a calm lockfile-only skip: a run where no targeted
+patch matched exits 1 and names `cargo fetch` as the remedy.
+
 ## Cargo: vendored wiring in Cargo.toml
 
 Vendored mode (v5+) wires a patched crate with a `[patch.crates-io]` path

@@ -1015,9 +1015,9 @@ fn collect_apply_failures(
     }
     for purl in unresolved_purls(unmatched, lockfile_only) {
         failures.push(ApplyFailure {
-            purl,
             code: "package_not_installed".to_string(),
-            error: "No installed package matches this PURL".to_string(),
+            error: not_installed_detail(&purl).to_string(),
+            purl,
         });
     }
     failures
@@ -1284,7 +1284,7 @@ pub(crate) async fn run_locked(
                     let detail = if lockfile_only.contains(purl) {
                         LOCKFILE_ONLY_DETAIL
                     } else {
-                        "No installed package matches this PURL"
+                        not_installed_detail(purl)
                     };
                     env.record(
                         PatchEvent::new(PatchAction::Skipped, purl.clone())
@@ -2453,6 +2453,9 @@ async fn apply_patches_inner(
         for purl in &unresolved {
             eprintln!("  - {}", normalize_purl(purl));
         }
+        if let Some(line) = cargo_fetch_hint(&unresolved) {
+            eprintln!("{line}");
+        }
     }
     print_lockfile_only_note(args, &unmatched, &lockfile_only);
 
@@ -2999,7 +3002,8 @@ const LOCKFILE_ONLY_DETAIL: &str =
 /// `@esbuild/<os>-<cpu>`), a devDependency under `npm ci --omit=dev`. The
 /// tree is in its correct end state, so they are calm skips, as `scan
 /// --mode agent` treats lockfile-only packages. Global runs have no project
-/// lock, so nothing is lockfile-resolved there.
+/// lock, so nothing is lockfile-resolved there, and neither is a Cargo
+/// crate ([`lock_resolution_is_calm`]).
 async fn lockfile_resolved(common: &GlobalArgs, unmatched: &[String]) -> HashSet<String> {
     if unmatched.is_empty() || common.is_global() {
         return HashSet::new();
@@ -3009,10 +3013,35 @@ async fn lockfile_resolved(common: &GlobalArgs, unmatched: &[String]) -> HashSet
     let lock_purls: HashSet<PurlKey> = entries.iter().map(|e| PurlKey::new(&e.purl)).collect();
     unmatched
         .iter()
-        .filter(|p| lock_purls.contains(&PurlKey::new(p)))
+        .filter(|p| lock_resolution_is_calm(p) && lock_purls.contains(&PurlKey::new(p)))
         .cloned()
         .collect()
 }
+
+/// Whether a lock-resolved but uninstalled `purl` can be a calm skip.
+/// Not for Cargo (#616): cargo leaves no locked crate out on purpose —
+/// `cargo fetch` unpacks every `Cargo.lock` entry, target-gated ones
+/// included — so a locked crate missing from `$CARGO_HOME/registry/src`
+/// was just not fetched yet (a cold CI cache, a pruned `registry/src`),
+/// and the next `cargo build` downloads or re-extracts it UNPATCHED.
+fn lock_resolution_is_calm(purl: &str) -> bool {
+    Ecosystem::from_purl(purl) != Some(Ecosystem::Cargo)
+}
+
+/// The `package_not_installed` detail of an unmatched purl the lock does
+/// not calmly account for: Cargo's carries the `cargo fetch` remedy.
+fn not_installed_detail(purl: &str) -> &'static str {
+    if Ecosystem::from_purl(purl) == Some(Ecosystem::Cargo) {
+        CARGO_NOT_FETCHED_DETAIL
+    } else {
+        "No installed package matches this PURL"
+    }
+}
+
+/// [`not_installed_detail`] for a Cargo crate.
+const CARGO_NOT_FETCHED_DETAIL: &str =
+    "No unpacked crate source matches this PURL; run `cargo fetch` first so the crate is in \
+     the Cargo registry cache, then re-run apply";
 
 /// The `unmatched` purls with no lock evidence (sorted input, sorted
 /// output): the ones that can still fail an all-miss run.
@@ -3074,7 +3103,22 @@ fn format_none_installed_error(unmatched: &[String]) -> Vec<String> {
         "Check that the packages are installed and --cwd points to the right directory."
             .to_string(),
     );
+    if let Some(line) = cargo_fetch_hint(unmatched) {
+        lines.push(line.to_string());
+    }
     lines
+}
+
+/// The `cargo fetch` remedy line when any of `unmatched` is a Cargo crate
+/// (#616): cargo unpacks locked crates only when it fetches or builds.
+fn cargo_fetch_hint(unmatched: &[String]) -> Option<&'static str> {
+    unmatched
+        .iter()
+        .any(|p| Ecosystem::from_purl(p) == Some(Ecosystem::Cargo))
+        .then_some(
+            "Cargo crates are patched in the registry cache: run `cargo fetch` first so every \
+             locked crate is unpacked there, then re-run apply.",
+        )
 }
 
 #[cfg(test)]
